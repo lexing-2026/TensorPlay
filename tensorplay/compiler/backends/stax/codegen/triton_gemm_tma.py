@@ -52,112 +52,32 @@ __all__ = [
 
 #: Salt for a persisted decision: bumped when the kernel body changes, so a
 #: stored choice cannot outlive the kernel it named.
-TMA_TUNING_VERSION = "persistent-tma-1"
+TMA_TUNING_VERSION = "persistent-tma-2"
+
+#: How much room one mapping takes in a workspace, when the toolkit builds it
+#: there rather than in the kernel's own registers.  The size is fixed by the
+#: mapping's own layout rather than chosen here.
+TMA_SIZE = 128
+
+
+def experimental_descriptor_api() -> bool:
+    """Whether the toolkit has only the earlier name for building a mapping.
+
+    A toolkit that has only the earlier one cannot have the mapping made in the
+    kernel's registers, so the body that suits it also has to be told which of
+    the two it is writing.
+    """
+
+    return not hasattr(tl, "make_tensor_descriptor")
 
 #: One memo entry per (geometry, orientation, accumulation form) so repeated
 #: candidate launches reuse a compiled binary.
 _KERNEL_MEMO: dict[str, Any] = {}
 
 
-_KERNEL_SOURCE = '''
-import triton
-import triton.language as tl
-
-
-@triton.jit
-def _tma_persistent_gemm(
-    a_ptr, b_ptr, c_ptr, ws_ptr,
-    M, N, K,
-    NUM_SMS: tl.constexpr, GROUP_M: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    A_ROW_MAJOR: tl.constexpr, B_ROW_MAJOR: tl.constexpr,
-    HAS_WORKSPACE: tl.constexpr,
-    ALLOW_TF32: tl.constexpr, FAST_ACCUM: tl.constexpr,
-):
-    """One program's share of the tiles, fetched by coordinate.
-
-    The descriptors are built on the host and handed in as arguments rather
-    than made here, because a descriptor is a host-side object: the kernel
-    receives the mapping and asks it for tiles, and the address arithmetic that
-    a non-descriptor kernel would do per tile was done once, outside.
-    """
-    if M == 0 or N == 0:
-        # Nothing to produce.  A grid built from zero extents has no tiles, and
-        # a program that finds itself here would be dividing by a width of
-        # zero two lines down.
-        return
-
-    start_pid = tl.program_id(0).to(tl.int32)
-    grid_m = tl.cdiv(M, BLOCK_M)
-    grid_n = tl.cdiv(N, BLOCK_N)
-    num_tiles = grid_m * grid_n
-    # The width of one group of rows, in tiles.  Decoding the flat index by
-    # group rather than by row is what makes the programs running together
-    # share their operand tiles: a run of GROUP_M tiles down a column reads
-    # the same columns of the right operand and adjacent rows of the left.
-    width = GROUP_M * grid_n
-
-    a_desc = triton.language.make_tensor_descriptor(
-        base=a_ptr,
-        shape=[M, K] if A_ROW_MAJOR else [K, M],
-        strides=[K, 1] if A_ROW_MAJOR else [1, K],
-        block_shape=[BLOCK_M, BLOCK_K] if A_ROW_MAJOR else [BLOCK_K, BLOCK_M],
-    )
-    b_desc = triton.language.make_tensor_descriptor(
-        base=b_ptr,
-        shape=[K, N] if B_ROW_MAJOR else [N, K],
-        strides=[N, 1] if B_ROW_MAJOR else [1, N],
-        block_shape=[BLOCK_K, BLOCK_N] if B_ROW_MAJOR else [BLOCK_N, BLOCK_K],
-    )
-
-    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS):
-        group_id = tile_id // width
-        group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
-        pid_m = group_id * GROUP_M + (tile_id % group_size)
-        pid_n = (tile_id % width) // group_size
-
-        rm = pid_m * BLOCK_M
-        rn = pid_n * BLOCK_N
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-        for rk in tl.range(0, K, BLOCK_K):
-            a = tl.load_tensor_descriptor(
-                a_desc, [rm, rk] if A_ROW_MAJOR else [rk, rm]
-            )
-            b = tl.load_tensor_descriptor(
-                b_desc, [rk, rn] if B_ROW_MAJOR else [rn, rk]
-            )
-            left = a if A_ROW_MAJOR else a.T
-            right = b if B_ROW_MAJOR else b.T
-            if FAST_ACCUM:
-                acc = tl.dot(left, right, acc, allow_tf32=ALLOW_TF32)
-            else:
-                acc += tl.dot(left, right, allow_tf32=ALLOW_TF32)
-
-        # The origins are recomputed rather than carried: they are two scalars
-        # that would otherwise occupy registers across the whole contraction,
-        # and the tile is finished with them the moment the accumulator is.
-        rm = pid_m * BLOCK_M
-        rn = pid_n * BLOCK_N
-        rcm = rm + tl.arange(0, BLOCK_M)
-        rcn = rn + tl.arange(0, BLOCK_N)
-        mask = (rcm[:, None] < M) & (rcn[None, :] < N)
-        if HAS_WORKSPACE:
-            # The partial goes through the workspace rather than straight to the
-            # result: a program that has finished a tile can start the next one
-            # while this write is still in flight, which is the whole reason the
-            # later form needs scratch space at all.
-            slot = start_pid * 2 * (BLOCK_M * BLOCK_N) + tl.arange(0, BLOCK_M)[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
-            tl.store(ws_ptr + slot, acc)
-            tl.debug_barrier()
-            acc = tl.load(ws_ptr + slot)
-        tl.store(c_ptr + rcm[:, None] * N + rcn[None, :], acc, mask=mask)
-'''
-
-
 def tma_kernel(block_m: int, block_n: int, block_k: int, group_m: int,
                a_row_major: bool, b_row_major: bool, fast_accum: bool,
-               has_workspace: bool):
+               has_workspace: bool, experimental_api: bool):
     """The descriptor-driven kernel for one form, built once and remembered."""
 
     key = hashlib.sha256(
@@ -166,13 +86,49 @@ def tma_kernel(block_m: int, block_n: int, block_k: int, group_m: int,
             for v in (
                 TMA_TUNING_VERSION, block_m, block_n, block_k, group_m,
                 a_row_major, b_row_major, fast_accum, has_workspace,
+                experimental_api,
             )
         ).encode()
     ).hexdigest()[:16]
     cached = _KERNEL_MEMO.get(key)
     if cached is not None:
         return cached
-    source = _KERNEL_SOURCE
+    # The extents are placeholders: the signature only needs each operand's
+    # rank, and the launch passes the call's real extents and strides.  The
+    # scratch is declared so that the kernel that uses it has it as a parameter
+    # rather than as a global, and its extent and stride are never read -- a
+    # slot's offset is computed from the tile, not from the buffer's shape.
+    plane = (0, 0)
+    from ..templates.select_algorithm import KernelArgs, TritonTemplate
+
+    source = TritonTemplate.from_file(
+        "blackwell_ws_persistent_device_tma_mm" if has_workspace
+        else "persistent_tma_mm",
+        file=("triton_blackwell_ws_persistent_device_tma_mm" if has_workspace
+              else "triton_persistent_tma_mm"),
+        symbol="_tma_persistent_gemm",
+    ).render_with(
+        KernelArgs(
+            {
+                "A": {"shape": plane, "stride": plane},
+                "B": {"shape": plane, "stride": plane},
+                "WS": {"shape": (0,), "stride": (1,)},
+            },
+            {"C": {"shape": plane, "stride": plane}},
+            {
+                "NUM_SMS": 1, "GROUP_M": int(group_m),
+                "BLOCK_M": int(block_m), "BLOCK_N": int(block_n),
+                "BLOCK_K": int(block_k),
+                "A_ROW_MAJOR": bool(a_row_major),
+                "B_ROW_MAJOR": bool(b_row_major),
+                "HAS_WORKSPACE": bool(has_workspace),
+                "ALLOW_TF32": False, "FAST_ACCUM": bool(fast_accum),
+                "TMA_SIZE": int(TMA_SIZE), "MAPPING_BASE": 0,
+            },
+        ),
+        TMA_EXPERIMENTAL_API=bool(
+            experimental_descriptor_api() and not has_workspace),
+    )
     fake_file = f"<tensorplay-stax-tma-{key}>"
     linecache.cache[fake_file] = (
         len(source), None, source.splitlines(True), fake_file,
@@ -235,10 +191,22 @@ def tma_gemm_launch(
     a_row_major = _standard_2d(geometry["a_shape"], geometry["a_stride"])
     b_row_major = _standard_2d(geometry["b_shape"], geometry["b_stride"])
     has_workspace = bool(geometry.get("has_workspace", False))
+    experimental = experimental_descriptor_api()
+    if has_workspace and experimental:
+        # The later form builds its mappings in the kernel's own registers, and
+        # a toolkit that has only the earlier call cannot: it would have to
+        # build them in the very workspace this form spends on partials.
+        return base_launch
     kernel = tma_kernel(
         block_m, block_n, block_k, group_m, a_row_major, b_row_major,
-        fast_accum, has_workspace,
+        fast_accum, has_workspace, experimental,
     )
+    # The mapping region and the partial region are one buffer, with the mapping
+    # after the partials: each is indexed from the origin it is declared with,
+    # and a mapping is a fixed number of bytes per program rather than a count
+    # of results.
+    mapping_base = num_sms * 2 * block_m * block_n if has_workspace else 0
+    mapping_elements = -(-num_sms * 2 * TMA_SIZE // 4) if experimental else 0
 
     def operand(feed: list, spec) -> Any:
         position, literal = spec
@@ -257,18 +225,24 @@ def tma_gemm_launch(
             return base_launch(feed)
         out = tp.empty((m, n), dtype=a.dtype, device=a.device)
         scratch = out
-        if has_workspace:
-            scratch = tp.empty(workspace_bytes(num_sms, block_m, block_n),
+        if has_workspace or experimental:
+            scratch = tp.empty(mapping_base + mapping_elements,
                                dtype=tp.float32, device=a.device)
         grid = (min(num_sms, -(-m // block_m) * -(-n // block_n)), 1, 1)
+        # The order is the signature's: the operands, then their extents, then
+        # their strides, then the block extents.  The scratch's own extent and
+        # stride are one and one because the body computes a slot's offset
+        # rather than reading them.
         kernel[grid](
-            a, b, out, scratch,
-            m, n, k,
-            NUM_SMS=num_sms, GROUP_M=group_m,
-            BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
-            A_ROW_MAJOR=a_row_major, B_ROW_MAJOR=b_row_major,
-            HAS_WORKSPACE=has_workspace,
-            ALLOW_TF32=allow_tf32, FAST_ACCUM=fast_accum,
+            a, b, scratch, out,
+            *(int(v) for v in a.shape), *(int(v) for v in b.shape), 1,
+            *(int(v) for v in out.shape),
+            *(int(v) for v in a.stride()),
+            *(int(v) for v in b.stride()), 1,
+            *(int(v) for v in out.stride()),
+            num_sms, group_m, block_m, block_n, block_k,
+            a_row_major, b_row_major, has_workspace, allow_tf32, fast_accum,
+            TMA_SIZE, mapping_base,
             num_warps=num_warps, num_stages=num_stages,
         )
         return out

@@ -1,0 +1,89 @@
+{#-
+  A depthwise convolution, which is not a product and does not use one.
+
+  No output channel is a sum over input channels here, so there is nothing to
+  contract and nothing for a matrix multiply to do.  What there is instead is
+  a multiply-accumulate per channel, so the tile is over the three things the
+  work steps over -- images, positions along the axis, and channels -- and each
+  lane keeps its own accumulator.
+
+  The layout is channels-last because a channel's positions are then
+  contiguous, which is what makes the innermost block worth having.
+
+  The bias is declared whether or not the call has one, because a signature
+  that changes shape with the call is a signature that has to be rendered
+  twice; whether it is read is a flag instead.
+-#}
+import triton
+import triton.language as tl
+
+
+{{ def_kernel("X", "W", "B", outputs=("O",)) }}
+    n = {{ size("X", 0) }}
+    length = {{ size("X", 1) }}
+    channels = {{ size("X", 2) }}
+    out_length = {{ size("O", 1) }}
+
+    stride_xn = {{ stride("X", 0) }}
+    stride_xl = {{ stride("X", 1) }}
+    stride_xc = {{ stride("X", 2) }}
+
+    stride_wc = {{ stride("W", 0) }}
+    stride_wn = {{ stride("W", 1) }}
+
+    stride_on = {{ stride("O", 0) }}
+    stride_ol = {{ stride("O", 1) }}
+    stride_oc = {{ stride("O", 2) }}
+
+    stride_bn = {{ stride("B", 0) }}
+
+    pid_n = tl.program_id(0)
+    pid_l = tl.program_id(1)
+    pid_c = tl.program_id(2)
+
+    idx_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    idx_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    lane = tl.arange(0, BLOCK_L)
+    # The output position is counted in output steps, and the input position it
+    # reads is solved for from it -- so a call that advances by more than one
+    # reads the input at the spaced positions rather than at a whole stride's
+    # worth of output that was never asked for.
+    out_l = pid_l * BLOCK_L + lane
+
+    acc = tl.zeros([BLOCK_N, BLOCK_L, BLOCK_C], dtype=tl.float32)
+    for k in range(0, KERNEL):
+        idx_l = out_l * STRIDE - PADDING + k * DILATION
+        mask_l = (idx_l >= 0) & (idx_l < length)
+        mask = (
+            (idx_n < n)[:, None, None]
+            & (idx_c < channels)[None, None, :]
+            & mask_l[None, :, None]
+        )
+        offset = (
+            (idx_n * stride_xn)[:, None, None]
+            + (idx_l * stride_xl)[None, :, None]
+            + (idx_c * stride_xc)[None, None, :]
+        )
+        value = tl.load(X_ptr + offset, mask=mask, other=0.0)
+        tap = tl.load(
+            W_ptr + idx_c * stride_wc + k * stride_wn,
+            mask=idx_c < channels, other=0.0,
+        )
+        acc += value * tap[None, None, :]
+
+    if HAS_BIAS:
+        acc += tl.load(B_ptr + idx_c * stride_bn, mask=idx_c < channels, other=0.0)[None, None, :]
+
+    out_mask = (
+        (idx_n < n)[:, None, None]
+        & (idx_c < channels)[None, None, :]
+        & (out_l < out_length)[None, :, None]
+    )
+    tl.store(
+        O_ptr
+        + (idx_n * stride_on)[:, None, None]
+        + (out_l * stride_ol)[None, :, None]
+        + (idx_c * stride_oc)[None, None, :],
+        acc,
+        mask=out_mask,
+    )

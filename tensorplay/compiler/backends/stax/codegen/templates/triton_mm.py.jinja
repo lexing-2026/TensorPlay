@@ -1,0 +1,64 @@
+{#-
+  The product with its epilogue folded in, so the accumulator never leaves
+  registers between the last multiply and the store.
+
+  Rendered, not written out per configuration: what varies between two
+  configurations is which of the two multiply precisions is wanted, whether a
+  bias column exists, and what the store should apply -- three facts, all of
+  which are decisions rather than code.  An undefined one is an error rather
+  than a blank, because a kernel silently missing its bias store is a wrong
+  answer that measures fine.
+-#}
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _gemm_epi_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    EVEN_K: tl.constexpr, ALLOW_TF32: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    """Bias-and-epilogue fused C = chain(A @ B) with fp32 accumulation.
+
+    TF32 shortens the multiplier datapath when ``ALLOW_TF32`` is set (the
+    caller's global matmul switch); the accumulated sum stays fp32 either
+    way.  Output rows/cols wrap with ``% M``/``% N`` so the store needs no
+    separate bounds mask (wrapped lanes recompute identical values); loads
+    guard the k tail unless ``EVEN_K``.  ``HAS_BIAS`` adds the length-N
+    column bias to every row of the accumulator tile.
+    """
+
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    off_m = (pid_m * BM + tl.arange(0, BM)) % M
+    off_n = (pid_n * BN + tl.arange(0, BN)) % N
+    off_k = tl.arange(0, BK)
+    a_ptrs = a_ptr + off_m[:, None] * stride_am + off_k[None, :] * stride_ak
+    b_ptrs = b_ptr + off_k[:, None] * stride_bk + off_n[None, :] * stride_bn
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BK)):
+        if EVEN_K:
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
+        else:
+            k_tail = K - k * BK
+            a = tl.load(a_ptrs, mask=off_k[None, :] < k_tail, other=0.0)
+            b = tl.load(b_ptrs, mask=off_k[:, None] < k_tail, other=0.0)
+{% if allow_tf32 %}
+        acc = tl.dot(a, b, acc, input_precision="tf32")
+{% else %}
+        acc = tl.dot(a, b, acc, input_precision="ieee")
+{% endif %}
+        a_ptrs += BK * stride_ak
+        b_ptrs += BK * stride_bk
+{% if has_bias %}
+    acc = acc + tl.load(bias_ptr + off_n)[None, :]
+{% endif %}
+    c_ptrs = c_ptr + off_m[:, None] * stride_cm + off_n[None, :] * stride_cn
+    tl.store(c_ptrs, {{ store_source }})

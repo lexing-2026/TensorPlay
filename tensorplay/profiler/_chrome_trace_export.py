@@ -35,8 +35,8 @@ def _device_properties():
                     "computeMinor": getattr(item, "minor", 0),
                     "maxThreadsPerBlock": getattr(item, "max_threads_per_block", 0),
                     "maxThreadsPerMultiprocessor": getattr(item, "multi_processor_count", 0),
-                    "regsPerMultiprocessor": getattr(item, "regs_per_multiprocessor", 0),
-                    "warpSize": getattr(item, "warp_size", 32),
+                    "regsPerMultiprocessor": item.regs_per_multiprocessor,
+                    "warpSize": item.warp_size,
                 }
             )
     except Exception:

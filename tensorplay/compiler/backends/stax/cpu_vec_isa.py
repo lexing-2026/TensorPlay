@@ -23,7 +23,7 @@ import subprocess
 import tempfile
 from typing import Any, Optional
 
-from .codecache import default_cache
+from .kernel_cache import default_cache
 
 # Lane counts per element width for each SIMD tier (used by codegen to size
 # the per-chunk element tile).
@@ -34,7 +34,6 @@ class VecISA:
     """Description of one SIMD tier and its toolchain feasibility."""
 
     name = "invalid"
-    bit_width = 0
     macros: tuple[str, ...] = ()
     arch_flags: tuple[str, ...] = ()
 
@@ -45,8 +44,28 @@ class VecISA:
         self._dirs = runtime_dirs
         self._feasible: Optional[bool] = None
 
-    def nelements(self) -> int:
-        return _NELEMENTS_F32.get(self.name, 4)
+    @property
+    def bit_width(self) -> int:
+        """How many bits one vector of this tier is wide."""
+
+        return 0
+
+    def nelements(self, dtype=None) -> int:
+        """How many values of this type one vector of the machine's width holds.
+
+        The answer depends on the type: a machine whose vector is 512 bits wide
+        holds sixteen single-precision values in it and thirty-two half-width
+        ones, so a caller that is told the width in values rather than in bits
+        has to say which type it meant.
+        """
+
+        import tensorplay as tp
+
+        n = _NELEMENTS_F32.get(self.name, 4)
+        if dtype is None:
+            return n
+        itemsize = getattr(dtype, "itemsize", 4) or 4
+        return max(1, n * 4 // int(itemsize))
 
     def definitions(self) -> list[str]:
         macros = list(self.macros)
@@ -119,7 +138,7 @@ class VecISA:
         if os.path.exists(marker):
             return True
 
-        from .codecache import file_lock
+        from .kernel_cache import file_lock
 
         source_path = cache.path_for(key, "cpp")
         output_path = cache.path_for(key, "so")
@@ -216,7 +235,10 @@ def _package_version() -> str:
 
 class VecAVX512(VecISA):
     name = "avx512"
-    bit_width = 512
+    @property
+    def bit_width(self) -> int:
+        return 512
+
     macros = (
         "CPU_CAPABILITY_AVX512",
         "HAVE_AVX512_CPU_DEFINITION",
@@ -227,7 +249,10 @@ class VecAVX512(VecISA):
 
 class VecAVX2(VecISA):
     name = "avx2"
-    bit_width = 256
+    @property
+    def bit_width(self) -> int:
+        return 256
+
     macros = (
         "CPU_CAPABILITY_AVX2",
         "HAVE_AVX2_CPU_DEFINITION",
@@ -237,7 +262,10 @@ class VecAVX2(VecISA):
 
 class VecDefault(VecISA):
     name = "default"
-    bit_width = 256
+    @property
+    def bit_width(self) -> int:
+        return 256
+
     macros = ("CPU_CAPABILITY_DEFAULT", "HAVE_AVX2_CPU_DEFINITION")
     arch_flags = ()
 

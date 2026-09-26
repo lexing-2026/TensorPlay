@@ -48,149 +48,39 @@ CONV_TUNING_VERSION = "conv-tile-1"
 _KERNEL_MEMO: dict[str, Any] = {}
 
 
-_KERNEL_SOURCE = '''
-import triton
-import triton.language as tl
-
-
-@triton.jit
-def _conv_tile_kernel(
-    x_ptr, w_ptr, o_ptr, b_ptr,
-    n, c, h, width, out_c, out_h, out_width,
-    stride_xn, stride_xc, stride_xh, stride_xw,
-    stride_wo, stride_wi, stride_wkh, stride_wkw,
-    stride_on, stride_oc, stride_oh, stride_ow,
-    stride_bn,
-    KERNEL_H: tl.constexpr, KERNEL_W: tl.constexpr,
-    STRIDE_H: tl.constexpr, STRIDE_W: tl.constexpr,
-    PADDING_H: tl.constexpr, PADDING_W: tl.constexpr,
-    DILATION_H: tl.constexpr, DILATION_W: tl.constexpr,
-    GROUPS: tl.constexpr, GROUP_IN_C: tl.constexpr, GROUP_OUT_C: tl.constexpr,
-    HAS_BIAS: tl.constexpr, ALLOW_TF32: tl.constexpr, UNROLL: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    EVEN_K: tl.constexpr,
-):
-    """One tile of output positions against one tile of output channels."""
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    pid_g = tl.program_id(2)
-
-    # The rows are positions: which image, and where in it.  A position that
-    # runs past the end of the image is masked off below.
-    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    spatial = out_h * out_width
-    idx_n = rows // spatial
-    within = rows % spatial
-    idx_y_h = within // out_width
-    idx_y_w = within % out_width
-
-    # The columns are output channels, counted within the group.
-    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    out_channel = pid_g * GROUP_OUT_C + cols
-
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-    # The weight, addressed the other way round: the tile is the contraction
-    # against the output channels, and the weight is stored output-major, so
-    # the load carries the transpose rather than the product.  It is reloaded
-    # per step of the contraction, because the contraction is exactly what
-    # steps.
-    # The channel index already carries the group, and the weight is stored
-    # with all the groups' output channels in one run, so the group must not
-    # be added to the base as well.
-    w_ptrs = w_ptr + (out_channel * stride_wo)[None, :]
-    mask_w = (tl.arange(0, BLOCK_K) < GROUP_IN_C)[:, None] & (cols < GROUP_OUT_C)[None, :]
-
-    # Each group reduces over its own channels, so the contraction is counted
-    # from the start of the group rather than from the start of the tensor.
-    x_base = x_ptr + idx_n[:, None] * stride_xn + pid_g * GROUP_IN_C * stride_xc
-    for k in range(0, tl.cdiv(GROUP_IN_C, BLOCK_K)):
-        idx_x_c = k * BLOCK_K + tl.arange(0, BLOCK_K)
-        if UNROLL:
-            for ky in tl.static_range(KERNEL_H):
-                idx_x_h = (
-                    idx_y_h - PADDING_H + ky * DILATION_H
-                ) * STRIDE_H
-                for kx in tl.static_range(KERNEL_W):
-                    idx_x_w = (
-                        idx_y_w - PADDING_W + kx * DILATION_W
-                    ) * STRIDE_W
-                    # The tap selects a plane of the weight as well as an
-                    # offset into the input: the two are the same tap, and a
-                    # kernel that moved one without the other would read every
-                    # tap against a single plane.
-                    tap = ky * stride_wkh + kx * stride_wkw
-                    matrix_w = tl.load(
-                        w_ptrs + (idx_x_c * stride_wi)[:, None] + tap,
-                        mask=mask_w, other=0.0,
-                    )
-                    x_ptrs = x_base + (
-                        (idx_x_c * stride_xc)[None, :]
-                        + (idx_x_h * stride_xh)[:, None]
-                        + (idx_x_w * stride_xw)[:, None]
-                    )
-                    mask_x = (
-                        (idx_n < n)[:, None]
-                        & (idx_x_h >= 0)[:, None]
-                        & (idx_x_h < h)[:, None]
-                        & (idx_x_w >= 0)[:, None]
-                        & (idx_x_w < width)[:, None]
-                        & (idx_x_c < GROUP_IN_C)[None, :]
-                    )
-                    matrix_x = tl.load(x_ptrs, mask=mask_x, other=0.0)
-                    acc += tl.dot(matrix_x, matrix_w, allow_tf32=ALLOW_TF32)
-        else:
-            # The kernel extent folded into the contraction: one lane per tap,
-            # so a kernel wider than the contraction block is stepped once.
-            for ky in range(KERNEL_H):
-                idx_x_h = (idx_y_h - PADDING_H + ky * DILATION_H) * STRIDE_H
-                for kx in range(KERNEL_W):
-                    idx_x_w = (idx_y_w - PADDING_W + kx * DILATION_W) * STRIDE_W
-                    matrix_w = tl.load(
-                        w_ptrs + (idx_x_c * stride_wi)[:, None]
-                        + ky * stride_wkh + kx * stride_wkw,
-                        mask=mask_w, other=0.0,
-                    )
-                    x_ptrs = x_base + (
-                        (idx_x_c * stride_xc)[None, :]
-                        + (idx_x_h * stride_xh)[:, None]
-                        + (idx_x_w * stride_xw)[:, None]
-                    )
-                    mask_x = (
-                        (idx_n < n)[:, None]
-                        & (idx_x_h >= 0)[:, None]
-                        & (idx_x_h < h)[:, None]
-                        & (idx_x_w >= 0)[:, None]
-                        & (idx_x_w < width)[:, None]
-                        & (idx_x_c < GROUP_IN_C)[None, :]
-                    )
-                    matrix_x = tl.load(x_ptrs, mask=mask_x, other=0.0)
-                    acc += tl.dot(matrix_x, matrix_w, allow_tf32=ALLOW_TF32)
-
-    if HAS_BIAS:
-        acc += tl.load(b_ptr + out_channel * stride_bn, mask=cols < GROUP_OUT_C,
-                       other=0.0)[None, :]
-
-    o_ptrs = o_ptr + (
-        (idx_n * stride_on)[:, None]
-        + (out_channel * stride_oc)[None, :]
-        + (idx_y_h * stride_oh)[:, None]
-        + (idx_y_w * stride_ow)[:, None]
-    )
-    mask_o = (
-        (idx_n < n)[:, None]
-        & (cols < GROUP_OUT_C)[None, :]
-        & (idx_y_h < out_h)[:, None]
-        & (idx_y_w < out_width)[:, None]
-    )
-    tl.store(o_ptrs, acc, mask=mask_o)
-'''
-
-
 #: The smallest contraction a tiled product can have.  A block-per-lane
 #: multiply-accumulate is defined from sixteen lanes up; below that there is no
 #: tile to speak of, and the only honest answer is to decline the call.
 MIN_CONTRACTION = 16
+
+
+#: The three bodies, each a file rather than a string: a kernel is long enough
+#: that keeping it inline makes the code and the parts that vary hard to tell
+#: apart, and a file lets the varying parts be marked as varying.
+_CONV_TILE = ("triton_conv_tile", "_conv_tile_kernel")
+_DEPTHWISE = ("triton_depthwise_conv", "_depthwise_conv1d_kernel")
+_BWD_INPUT = ("triton_conv2d_bwd_input", "_conv2d_bwd_input_kernel")
+_BWD_WEIGHT = ("triton_conv2d_bwd_weight", "_conv2d_bwd_weight_kernel")
+
+
+def _render(which: Tuple[str, str], operands: dict, outputs: dict,
+            constexprs: dict, **flags: Any) -> str:
+    """One body, rendered against the operands and the block extents.
+
+    The signature is emitted from the names in ``operands`` and ``outputs``, so
+    the parameters a body may refer to and the parameters it is given are the
+    same list read twice; the launch then passes the real tensors' extents and
+    strides in that order.  A decision the body branches on rather than reads --
+    how many groups there are, say -- is a rendering question and is passed as
+    one, so it is not a parameter the launch has to supply a value for.
+    """
+
+    from ..templates.select_algorithm import KernelArgs, TritonTemplate
+
+    name, symbol = which
+    return TritonTemplate.from_file(name, symbol=symbol).render_with(
+        KernelArgs(operands, outputs, constexprs), **flags
+    )
 
 
 def _build(source: str, fake_file: str, symbol: str):
@@ -236,7 +126,31 @@ def conv_kernel(block_m: int, block_n: int, block_k: int, kernel_h: int,
     cached = _KERNEL_MEMO.get(key)
     if cached is not None:
         return cached
-    kernel = _build(_KERNEL_SOURCE, f"<tensorplay-stax-conv-{key}>", "_conv_tile_kernel")
+    # The extents are placeholders: the signature only needs each operand's
+    # rank, and the launch passes the call's real extents and strides.  What the
+    # rank cannot be is anything but four -- a one-dimensional convolution has
+    # no second spatial axis for the body to address.
+    plane = (0, 0, 0, 0)
+    source = _render(
+        _CONV_TILE,
+        {
+            "X": {"shape": plane, "stride": plane},
+            "W": {"shape": plane, "stride": plane},
+            "B": {"shape": (0,), "stride": (1,)},
+        },
+        {"O": {"shape": plane, "stride": plane}},
+        {
+            "KERNEL_H": int(kernel_h), "KERNEL_W": int(kernel_w),
+            "STRIDE_H": 1, "STRIDE_W": 1,
+            "PADDING_H": 0, "PADDING_W": 0,
+            "DILATION_H": 1, "DILATION_W": 1,
+            "GROUP_IN_C": 0, "GROUP_OUT_C": 0,
+            "HAS_BIAS": False, "ALLOW_TF32": False, "UNROLL": bool(unroll),
+            "BLOCK_M": int(block_m), "BLOCK_N": int(block_n),
+            "BLOCK_K": int(block_k),
+        },
+    )
+    kernel = _build(source, f"<tensorplay-stax-conv-{key}>", _CONV_TILE[1])
     _KERNEL_MEMO[key] = kernel
     return kernel
 
@@ -317,7 +231,7 @@ def conv_launch(
         x = operand(feed, x_spec)
         w = operand(feed, w_spec)
         bias = operand(feed, bias_spec) if has_bias else x
-        batch, in_c, in_h, in_w = (int(v) for v in x.shape)
+        batch, in_c = (int(v) for v in x.shape[:2])
         out_c, in_c_g, *_ = (int(v) for v in w.shape)
         out_h, out_w = geometry["out_size"]
         if not (
@@ -339,21 +253,23 @@ def conv_launch(
             triton.cdiv(group_out_c, block_n),
             groups,
         )
+        # The order is the signature's: every operand, then every operand's
+        # extents, then every operand's strides, then the block extents -- the
+        # order the body was rendered against, so the two cannot drift apart.
+        # The bias's extent and stride are passed even when the call has no
+        # bias, because the operand is declared either way; a stand-in is
+        # bound in its place and the flag says it is not read.
         kernel[grid](
-            x, w, out, bias,
-            batch, in_c, in_h, in_w, out_c, out_h, out_w,
-            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
-            w.stride(0), w.stride(1), w.stride(2), w.stride(3),
-            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-            1 if not has_bias else int(bias.stride(0)),
-            KERNEL_H=kernel_h, KERNEL_W=kernel_w,
-            STRIDE_H=stride_h, STRIDE_W=stride_w,
-            PADDING_H=pad_h, PADDING_W=pad_w,
-            DILATION_H=dil_h, DILATION_W=dil_w,
-            GROUPS=groups, GROUP_IN_C=group_in_c, GROUP_OUT_C=group_out_c,
-            HAS_BIAS=has_bias, ALLOW_TF32=allow_tf32, UNROLL=unroll,
-            BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
-            EVEN_K=(group_in_c % block_k == 0),
+            x, w, bias, out,
+            *(int(v) for v in x.shape),
+            *(int(v) for v in w.shape), int(bias.shape[0]),
+            *(int(v) for v in out.shape),
+            *(int(v) for v in x.stride()),
+            *(int(v) for v in w.stride()), int(bias.stride(0)),
+            *(int(v) for v in out.stride()),
+            kernel_h, kernel_w, stride_h, stride_w, pad_h, pad_w,
+            dil_h, dil_w, group_in_c, group_out_c,
+            has_bias, allow_tf32, unroll, block_m, block_n, block_k,
             num_warps=num_warps, num_stages=num_stages,
         )
         return out
@@ -365,84 +281,6 @@ def conv_launch(
 # depthwise
 # ---------------------------------------------------------------------------
 
-_DEPTHWISE_SOURCE = '''
-import triton
-import triton.language as tl
-
-
-@triton.jit
-def _depthwise_conv1d_kernel(
-    x_ptr, w_ptr, o_ptr, b_ptr,
-    n, length, channels, out_length,
-    stride_xn, stride_xl, stride_xc,
-    stride_wn, stride_wc,
-    stride_on, stride_ol, stride_oc,
-    stride_bn,
-    KERNEL: tl.constexpr, STRIDE: tl.constexpr, PADDING: tl.constexpr,
-    DILATION: tl.constexpr, HAS_BIAS: tl.constexpr,
-    BLOCK_N: tl.constexpr, BLOCK_L: tl.constexpr, BLOCK_C: tl.constexpr,
-):
-    """Each channel of each position, reduced on its own.
-
-    A depthwise convolution is not a product: no output channel is a sum over
-    input channels, so there is nothing to contract and nothing for a matrix
-    multiply to do.  What it is instead is a multiply-accumulate per channel,
-    so the tile is over the three things the work steps over -- images,
-    positions along the axis, and channels -- and each lane keeps its own
-    accumulator.
-
-    The layout is channels-last because a channel's positions are then
-    contiguous, which is what makes the innermost block worth having.
-    """
-    pid_n = tl.program_id(0)
-    pid_l = tl.program_id(1)
-    pid_c = tl.program_id(2)
-
-    idx_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    idx_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
-    lane = tl.arange(0, BLOCK_L)
-
-    acc = tl.zeros([BLOCK_N, BLOCK_L, BLOCK_C], dtype=tl.float32)
-    for k in range(0, KERNEL):
-        idx_l = (pid_l * BLOCK_L + lane - PADDING + k * DILATION) * STRIDE
-        mask_l = (idx_l >= 0) & (idx_l < length)
-        mask = (
-            (idx_n < n)[:, None, None]
-            & (idx_c < channels)[None, None, :]
-            & mask_l[None, :, None]
-        )
-        offset = (
-            (idx_n * stride_xn)[:, None, None]
-            + (idx_l * stride_xl)[None, :, None]
-            + (idx_c * stride_xc)[None, None, :]
-        )
-        value = tl.load(x_ptr + offset, mask=mask, other=0.0)
-        tap = tl.load(
-            w_ptr + idx_c * stride_wc + k * stride_wn,
-            mask=idx_c < channels, other=0.0,
-        )
-        acc += value * tap[None, None, :]
-
-    if HAS_BIAS:
-        acc += tl.load(b_ptr + idx_c * stride_bn, mask=idx_c < channels, other=0.0)[None, None, :]
-
-    out_l = (pid_l * BLOCK_L + lane) * STRIDE
-    out_mask = (
-        (idx_n < n)[:, None, None]
-        & (idx_c < channels)[None, None, :]
-        & (out_l < out_length)[None, :, None]
-    )
-    tl.store(
-        o_ptr
-        + (idx_n * stride_on)[:, None, None]
-        + (out_l * stride_ol)[None, :, None]
-        + (idx_c * stride_oc)[None, None, :],
-        acc,
-        mask=out_mask,
-    )
-'''
-
-
 def depthwise_kernel(block_n: int, block_l: int, block_c: int):
     """The depthwise kernel for one tiling, built once and remembered."""
 
@@ -452,9 +290,25 @@ def depthwise_kernel(block_n: int, block_l: int, block_c: int):
     cached = _KERNEL_MEMO.get(key)
     if cached is not None:
         return cached
-    kernel = _build(
-        _DEPTHWISE_SOURCE, f"<tensorplay-stax-depthwise-{key}>", "_depthwise_conv1d_kernel"
+    # The geometry is a flag rather than an argument for the same reason the
+    # taps are: the body has one axis, so the counts are folded in.
+    plane = (0, 0, 0)
+    source = _render(
+        _DEPTHWISE,
+        {
+            "X": {"shape": plane, "stride": plane},
+            "W": {"shape": (0, 0), "stride": (0, 1)},
+            "B": {"shape": (0,), "stride": (1,)},
+        },
+        {"O": {"shape": plane, "stride": plane}},
+        {
+            "KERNEL": 1, "STRIDE": 1, "PADDING": 0, "DILATION": 1,
+            "HAS_BIAS": False,
+            "BLOCK_N": int(block_n), "BLOCK_L": int(block_l),
+            "BLOCK_C": int(block_c),
+        },
     )
+    kernel = _build(source, f"<tensorplay-stax-depthwise-{key}>", _DEPTHWISE[1])
     _KERNEL_MEMO[key] = kernel
     return kernel
 
@@ -496,16 +350,20 @@ def depthwise_launch(x_spec, w_spec, bias_spec, geometry: dict, config: dict,
             triton.cdiv(out_length, block_l),
             triton.cdiv(channels, block_c),
         )
+        # The order is the signature's, as in the forward: the operands, then
+        # their extents, then their strides, then the block extents.  The bias
+        # is declared whether or not the call has one, so its extent and stride
+        # are passed either way and the flag says it is not read.
         kernel[grid](
-            x, w, out, bias,
-            n, length, channels, out_length,
-            x.stride(0), x.stride(1), x.stride(2),
-            w.stride(0), w.stride(1),
-            out.stride(0), out.stride(1), out.stride(2),
-            1 if not has_bias else int(bias.stride(0)),
-            KERNEL=kernel_w, STRIDE=stride_w, PADDING=pad_w, DILATION=dil_w,
-            HAS_BIAS=has_bias,
-            BLOCK_N=block_n, BLOCK_L=block_l, BLOCK_C=block_c,
+            x, w, bias, out,
+            n, length, channels,
+            *(int(v) for v in w.shape), int(bias.shape[0]),
+            n, out_length, channels,
+            *(int(v) for v in x.stride()),
+            *(int(v) for v in w.stride()), int(bias.stride(0)),
+            *(int(v) for v in out.stride()),
+            kernel_w, stride_w, pad_w, dil_w, has_bias,
+            block_n, block_l, block_c,
             num_warps=num_warps, num_stages=num_stages,
         )
         return out
@@ -517,209 +375,53 @@ def depthwise_launch(x_spec, w_spec, bias_spec, geometry: dict, config: dict,
 # the gradients
 # ---------------------------------------------------------------------------
 
-_BWD_SOURCE = '''
-import triton
-import triton.language as tl
+def bwd_kernel(kind: str, block_m: int, block_n: int, block_k: int, groups: int):
+    """One gradient kernel for one tiling, built once and remembered.
 
-
-@triton.jit
-def _tap_origin(coord, offset, out_extent, stride):
-    """Where a tap lands in the output, and whether it lands at all.
-
-    A tap reaches an input position only when the distance back to the origin
-    divides by the stride exactly.  The distance is clamped before the
-    division rather than after, because a negative dividend and a truncating
-    division disagree about the sign, and a kernel that guesses there is wrong
-    only along the padded border -- which is exactly the part nobody checks.
+    The two directions are two bodies rather than one with a flag: they contract
+    over different extents, address their operands in opposite orders, and only
+    one of them has to invert the forward's window.  A flag would leave both
+    shapes of work in one function and pick between them at every step.
     """
-    distance = coord + offset
-    positive = distance >= 0
-    safe = tl.maximum(distance, 0)
-    origin = safe // stride
-    return origin, positive & (origin < out_extent) & ((safe % stride) == 0)
-
-
-@triton.jit
-def _conv2d_bwd_input_kernel(
-    dy_ptr, w_ptr, dx_ptr,
-    n, h, width, in_c, out_c, out_h, out_width,
-    stride_dyn, stride_dyc, stride_dyh, stride_dyw,
-    stride_wo, stride_wi, stride_wkh, stride_wkw,
-    stride_dxn, stride_dxc, stride_dxh, stride_dxw,
-    KERNEL_H: tl.constexpr, KERNEL_W: tl.constexpr,
-    STRIDE_H: tl.constexpr, STRIDE_W: tl.constexpr,
-    PADDING_H: tl.constexpr, PADDING_W: tl.constexpr,
-    DILATION_H: tl.constexpr, DILATION_W: tl.constexpr,
-    GROUPS: tl.constexpr, GROUP_IN_C: tl.constexpr, GROUP_OUT_C: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-):
-    """The input's gradient: the sum of the windows that read each position.
-
-    Rows are input positions and columns are input channels, so this is the
-    forward's product with the contraction moved: the forward contracted over
-    input channels, and this contracts over output channels instead, once per
-    tap.  For a given tap the output position a row was read at is solved for
-    rather than stepped to, which is the whole difference between the two
-    directions -- one of them walks the window, the other has to invert it.
-    """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    pid_g = tl.program_id(2)
-
-    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    spatial = h * width
-    idx_n = rows // spatial
-    within = rows % spatial
-    idx_h = within // width
-    idx_w = within % width
-    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    in_channel = pid_g * GROUP_IN_C + cols
-    mask_col = cols < GROUP_IN_C
-
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    for k in range(0, tl.cdiv(GROUP_OUT_C, BLOCK_K)):
-        lane = tl.arange(0, BLOCK_K)
-        out_channel = pid_g * GROUP_OUT_C + k * BLOCK_K + lane
-        mask_k = lane < GROUP_OUT_C - k * BLOCK_K
-        w_ptrs = (
-            w_ptr
-            + (lane * stride_wo)[:, None]
-            + (in_channel * stride_wi)[None, :]
-        )
-        mask_w = mask_k[:, None] & mask_col[None, :]
-        for ky in tl.static_range(KERNEL_H):
-            oh, ok_h = _tap_origin(
-                idx_h, PADDING_H - ky * DILATION_H, out_h, STRIDE_H
-            )
-            for kx in tl.static_range(KERNEL_W):
-                ow, ok_w = _tap_origin(
-                    idx_w, PADDING_W - kx * DILATION_W, out_width, STRIDE_W
-                )
-                matrix_w = tl.load(
-                    w_ptrs + ky * stride_wkh + kx * stride_wkw,
-                    mask=mask_w, other=0.0,
-                )
-                keep = (idx_n < n) & ok_h & ok_w
-                dy_ptrs = dy_ptr + (
-                    (idx_n * stride_dyn)[:, None]
-                    + (oh * stride_dyh)[:, None]
-                    + (ow * stride_dyw)[:, None]
-                    + (out_channel * stride_dyc)[None, :]
-                )
-                matrix_dy = tl.load(
-                    dy_ptrs, mask=keep[:, None] & mask_k[None, :], other=0.0
-                )
-                acc += tl.dot(matrix_dy, matrix_w)
-    tl.store(
-        dx_ptr + (
-            (idx_n * stride_dxn)[:, None]
-            + (idx_h * stride_dxh)[:, None]
-            + (idx_w * stride_dxw)[:, None]
-            + (in_channel * stride_dxc)[None, :]
-        ),
-        acc,
-        mask=(idx_n < n)[:, None] & mask_col[None, :],
-    )
-
-
-@triton.jit
-def _conv2d_bwd_weight_kernel(
-    dy_ptr, x_ptr, dw_ptr,
-    n, h, width, in_c, out_c, out_h, out_width,
-    stride_dyn, stride_dyc, stride_dyh, stride_dyw,
-    stride_xn, stride_xc, stride_xh, stride_xw,
-    stride_dwon, stride_dwoc, stride_dwoi, stride_dwoh,
-    KERNEL_H: tl.constexpr, KERNEL_W: tl.constexpr,
-    STRIDE_H: tl.constexpr, STRIDE_W: tl.constexpr,
-    PADDING_H: tl.constexpr, PADDING_W: tl.constexpr,
-    DILATION_H: tl.constexpr, DILATION_W: tl.constexpr,
-    GROUPS: tl.constexpr, GROUP_IN_C: tl.constexpr, GROUP_OUT_C: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-):
-    """The weight's gradient: one product per tap, over the output's positions.
-
-    Every tap is a separate product contracting the output's positions, and
-    they differ only in which input position each output position read -- which
-    is known here without inverting anything, because the forward's window is
-    walked forwards here.  So the tap indexes the weight rather than the
-    accumulation: one accumulator is reused per tap and stored per tap, because
-    a kernel-wide tile per tap would need a register per tap and the number of
-    taps is the kernel's area.
-    """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    pid_g = tl.program_id(2)
-
-    lane_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    lane_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    out_channel = pid_g * GROUP_OUT_C + lane_m
-    in_channel = pid_g * GROUP_IN_C + lane_n
-    mask_m = lane_m < GROUP_OUT_C
-    mask_n = lane_n < GROUP_IN_C
-    positions = n * out_h * out_width
-
-    for ky in tl.static_range(KERNEL_H):
-        for kx in tl.static_range(KERNEL_W):
-            acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-            for k in range(0, tl.cdiv(positions, BLOCK_K)):
-                flat = k * BLOCK_K + tl.arange(0, BLOCK_K)
-                idx_n = flat // (out_h * out_width)
-                rest = flat % (out_h * out_width)
-                oh = rest // out_width
-                ow = rest % out_width
-                idx_h = oh * STRIDE_H - PADDING_H + ky * DILATION_H
-                idx_w = ow * STRIDE_W - PADDING_W + kx * DILATION_W
-                keep = (
-                    (flat < positions)
-                    & (idx_n < n)
-                    & (idx_h >= 0) & (idx_h < h)
-                    & (idx_w >= 0) & (idx_w < width)
-                )
-                dy_ptrs = dy_ptr + (
-                    (idx_n * stride_dyn)[:, None]
-                    + (oh * stride_dyh)[:, None]
-                    + (ow * stride_dyw)[:, None]
-                    + (out_channel * stride_dyc)[None, :]
-                )
-                matrix_dy = tl.load(
-                    dy_ptrs, mask=keep[:, None] & mask_m[None, :], other=0.0
-                )
-                x_ptrs = x_ptr + (
-                    (idx_n * stride_xn)[:, None]
-                    + (idx_h * stride_xh)[:, None]
-                    + (idx_w * stride_xw)[:, None]
-                    + (in_channel * stride_xc)[None, :]
-                )
-                matrix_x = tl.load(
-                    x_ptrs, mask=keep[:, None] & mask_n[None, :], other=0.0
-                )
-                acc += tl.dot(matrix_dy, tl.trans(matrix_x))
-            tl.store(
-                dw_ptr + (
-                    out_channel * stride_dwon
-                    + in_channel * stride_dwoc
-                    + ky * stride_dwoi
-                    + kx * stride_dwoh
-                ),
-                acc,
-                mask=mask_m & mask_n,
-            )
-'''
-
-
-def bwd_kernel(kind: str, block_m: int, block_n: int, block_k: int):
-    """One gradient kernel for one tiling, built once and remembered."""
 
     key = hashlib.sha256(
-        f"{CONV_TUNING_VERSION}|{kind}|{block_m}|{block_n}|{block_k}".encode()
+        f"{CONV_TUNING_VERSION}|{kind}|{block_m}|{block_n}|{block_k}"
+        f"|{groups}".encode()
     ).hexdigest()[:16]
     cached = _KERNEL_MEMO.get(key)
     if cached is not None:
         return cached
-    symbol = (
-        "_conv2d_bwd_input_kernel" if kind == "input" else "_conv2d_bwd_weight_kernel"
+    if kind == "input":
+        which = _BWD_INPUT
+        operands = {
+            "DY": {"shape": (0, 0, 0, 0), "stride": (0, 0, 0, 0)},
+            "W": {"shape": (0, 0, 0, 0), "stride": (0, 0, 0, 0)},
+        }
+        outputs = {"DX": {"shape": (0, 0, 0, 0), "stride": (0, 0, 0, 0)}}
+    else:
+        which = _BWD_WEIGHT
+        operands = {
+            "DY": {"shape": (0, 0, 0, 0), "stride": (0, 0, 0, 0)},
+            "X": {"shape": (0, 0, 0, 0), "stride": (0, 0, 0, 0)},
+        }
+        outputs = {"DW": {"shape": (0, 0, 0, 0), "stride": (0, 0, 0, 0)}}
+    source = _render(
+        which,
+        operands,
+        outputs,
+        {
+            "KERNEL_H": 1, "KERNEL_W": 1,
+            "STRIDE_H": 1, "STRIDE_W": 1,
+            "PADDING_H": 0, "PADDING_W": 0,
+            "DILATION_H": 1, "DILATION_W": 1,
+            "GROUP_IN_C": 0, "GROUP_OUT_C": 0,
+            "BLOCK_M": int(block_m), "BLOCK_N": int(block_n),
+            "BLOCK_K": int(block_k),
+            "ALLOW_TF32": False,
+        },
+        GROUPS=int(groups),
     )
-    kernel = _build(_BWD_SOURCE, f"<tensorplay-stax-convbwd-{key}>", symbol)
+    kernel = _build(source, f"<tensorplay-stax-convbwd-{key}>", which[1])
     _KERNEL_MEMO[key] = kernel
     return kernel
 
@@ -744,7 +446,9 @@ def _grad_geometry(meta_geometry: dict, in_size, out_c: int, in_c: int):
     }
 
 
-def conv_bwd_input_launch(dy_spec, w_spec, config, geometry, base_launch):
+def conv_bwd_input_launch(
+    dy_spec, w_spec, config, geometry, base_launch, allow_tf32: bool = False
+):
     """Build a launcher for the input's gradient."""
 
     if tuple(int(v) for v in geometry["stride"]) != (1,) * len(geometry["kernel"]):
@@ -759,9 +463,8 @@ def conv_bwd_input_launch(dy_spec, w_spec, config, geometry, base_launch):
     dil_h, dil_w = (int(v) for v in geometry["dilation"])
     groups = int(geometry["groups"])
     in_h, in_w = geometry["in_size"]
-    out_h, out_w = geometry["out_size"]
     out_c, in_c = geometry["out_channels"], geometry["in_channels"]
-    kernel = bwd_kernel("input", block_m, block_n, block_k)
+    kernel = bwd_kernel("input", block_m, block_n, block_k, groups)
 
     def operand(feed: list, spec) -> Any:
         position, literal = spec
@@ -779,20 +482,23 @@ def conv_bwd_input_launch(dy_spec, w_spec, config, geometry, base_launch):
         grid = (
             triton.cdiv(conv_rows(batch, in_h, in_w), block_m),
             triton.cdiv(group_in_c, block_n),
-            groups,
+            # One group is walked by no program axis: the body does not read it.
+            1 if groups == 1 else groups,
         )
+        # The order is the signature's: the operands, then their extents, then
+        # their strides, then the block extents -- the order the body was
+        # rendered against, so the two cannot drift apart.
         kernel[grid](
             dy, w, dx,
-            batch, in_h, in_w, in_c, out_c, out_h, out_w,
-            dy.stride(0), dy.stride(1), dy.stride(2), dy.stride(3),
-            w.stride(0), w.stride(1), w.stride(2), w.stride(3),
-            dx.stride(0), dx.stride(1), dx.stride(2), dx.stride(3),
-            KERNEL_H=kernel_h, KERNEL_W=kernel_w,
-            STRIDE_H=stride_h, STRIDE_W=stride_w,
-            PADDING_H=pad_h, PADDING_W=pad_w,
-            DILATION_H=dil_h, DILATION_W=dil_w,
-            GROUPS=groups, GROUP_IN_C=group_in_c, GROUP_OUT_C=group_out_c,
-            BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
+            *(int(v) for v in dy.shape),
+            *(int(v) for v in w.shape),
+            *(int(v) for v in dx.shape),
+            *(int(v) for v in dy.stride()),
+            *(int(v) for v in w.stride()),
+            *(int(v) for v in dx.stride()),
+            kernel_h, kernel_w, stride_h, stride_w, pad_h, pad_w,
+            dil_h, dil_w, group_in_c, group_out_c,
+            block_m, block_n, block_k, allow_tf32,
             num_warps=int(config["num_warps"]), num_stages=int(config["num_stages"]),
         )
         return dx
@@ -800,7 +506,9 @@ def conv_bwd_input_launch(dy_spec, w_spec, config, geometry, base_launch):
     return launch
 
 
-def conv_bwd_weight_launch(dy_spec, x_spec, config, geometry, base_launch):
+def conv_bwd_weight_launch(
+    dy_spec, x_spec, config, geometry, base_launch, allow_tf32: bool = False
+):
     """Build a launcher for the weight's gradient."""
 
     if tuple(int(v) for v in geometry["stride"]) != (1,) * len(geometry["kernel"]):
@@ -814,10 +522,8 @@ def conv_bwd_weight_launch(dy_spec, x_spec, config, geometry, base_launch):
     pad_h, pad_w = (int(v) for v in geometry["padding"])
     dil_h, dil_w = (int(v) for v in geometry["dilation"])
     groups = int(geometry["groups"])
-    in_h, in_w = geometry["in_size"]
-    out_h, out_w = geometry["out_size"]
     out_c, in_c = geometry["out_channels"], geometry["in_channels"]
-    kernel = bwd_kernel("weight", block_m, block_n, block_k)
+    kernel = bwd_kernel("weight", block_m, block_n, block_k, groups)
 
     def operand(feed: list, spec) -> Any:
         position, literal = spec
@@ -827,24 +533,26 @@ def conv_bwd_weight_launch(dy_spec, x_spec, config, geometry, base_launch):
         import tensorplay as tp
 
         dy, x = operand(feed, dy_spec), operand(feed, x_spec)
-        batch = int(dy.shape[0])
         if int(x.shape[1]) != in_c or int(dy.shape[1]) != out_c:
             return base_launch(feed)
         dw = tp.empty((out_c, in_c // groups, kernel_h, kernel_w), dtype=dy.dtype, device=dy.device)
         group_in_c, group_out_c = in_c // groups, out_c // groups
-        grid = (triton.cdiv(group_out_c, block_m), triton.cdiv(group_in_c, block_n), groups)
+        grid = (triton.cdiv(group_out_c, block_m), triton.cdiv(group_in_c, block_n),
+                1 if groups == 1 else groups)
+        # The order is the signature's, as in the input's gradient: the
+        # operands, then their extents, then their strides, then the block
+        # extents.
         kernel[grid](
             dy, x, dw,
-            batch, in_h, in_w, in_c, out_c, out_h, out_w,
-            dy.stride(0), dy.stride(1), dy.stride(2), dy.stride(3),
-            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
-            dw.stride(0), dw.stride(1), dw.stride(2), dw.stride(3),
-            KERNEL_H=kernel_h, KERNEL_W=kernel_w,
-            STRIDE_H=stride_h, STRIDE_W=stride_w,
-            PADDING_H=pad_h, PADDING_W=pad_w,
-            DILATION_H=dil_h, DILATION_W=dil_w,
-            GROUPS=groups, GROUP_IN_C=group_in_c, GROUP_OUT_C=group_out_c,
-            BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
+            *(int(v) for v in dy.shape),
+            *(int(v) for v in x.shape),
+            *(int(v) for v in dw.shape),
+            *(int(v) for v in dy.stride()),
+            *(int(v) for v in x.stride()),
+            *(int(v) for v in dw.stride()),
+            kernel_h, kernel_w, stride_h, stride_w, pad_h, pad_w,
+            dil_h, dil_w, group_in_c, group_out_c,
+            block_m, block_n, block_k, allow_tf32,
             num_warps=int(config["num_warps"]), num_stages=int(config["num_stages"]),
         )
         return dw

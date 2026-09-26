@@ -1,222 +1,156 @@
-"""Kernel code-generation cache.
+"""Where compiled artifacts are kept, and how a name is settled for one.
 
-The lowering backend (stax/Triton/AVX) supplies the compiled artifact
-generated ``source`` plus its compile callable; this module owns key
-canonicalization, lookup, atomic publication and process-level memoization,
-so backends stay free of cache plumbing.
+A compiled artifact is named after what it was built from rather than after
+where it was written, so that the same source compiles once no matter how many
+times or from where it is asked for.  A name that is settled on content has to
+be short enough to be a file name and cannot collide, so it is a digest; a
+human-readable stem is kept alongside it for the sake of anyone looking at the
+directory.
 
-Layout: ``$TP_CACHE_DIR`` or ``<cwd>/.tp_cache/kernels/<backend>/ab/<key>.<ext>``
-local cache). Publication is temp-file + rename, so concurrent processes
-never observe partial artifacts.
+Writing one is not atomic by itself, so it is written to a name beside the
+target and moved into place: a reader either sees the previous artifact or the
+new one, never half of either.
 """
 
 from __future__ import annotations
 
-import contextlib
+import functools
 import hashlib
-import json
 import os
+import pathlib
 import tempfile
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple
+from typing import Any, Generic, TypeVar
 
+from .cache_key import CODE_CACHE_KEY_STRATEGY
+from .utils import clear_on_fresh_cache
 
-@contextlib.contextmanager
-def file_lock(path: str, *, shared: bool = False) -> Iterator[None]:
-    """Advisory exclusive/shared lock guarding out-of-process builds.
+T = TypeVar("T")
 
-    External toolchain invocations write their output in place, so two
-    processes racing on the same cache key could interleave writes into one
-    corrupt artifact.  The lock file itself carries no data.
+class CacheBase:
+    @staticmethod
+    @functools.cache
+    def get_system() -> SystemInfo:
+        with dynamo_timed("CacheBase.get_system.triton_key"):
+            triton_version = triton_key()
 
-    Some cache subfolders may be unwritable for this user (entries written
-    by another uid earlier).  The lock then moves to a mirror path under the
-    temp directory: mutual exclusion is preserved per path, and the build
-    proceeds against the cache folder.
-    """
+        try:
+            device_info: SystemDeviceInfo = {"name": None}
+            version_info: SystemVersionInfo = {"triton": triton_version}
+            device_properties = torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            )
+            if torch.version.cuda is not None:
+                device_info["name"] = device_properties.name
+                version_info["cuda"] = torch.version.cuda
+            else:
+                device_info["name"] = device_properties.gcnArchName
+                version_info["hip"] = torch.version.hip
+            hash_input: dict[str, Any] = {
+                "device": device_info,
+                "version": version_info,
+            }
+            return {
+                "device": device_info,
+                "version": version_info,
+                "hash": SYSTEM_CACHE_KEY_STRATEGY.key_from_json(hash_input),
+            }
+        except (AssertionError, RuntimeError):
+            # If cuda is not installed, none of the above config is relevant.
+            return {"hash": SYSTEM_CACHE_KEY_STRATEGY.key_from_json({})}
 
-    def acquire(target: str) -> int:
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        return os.open(target, os.O_CREAT | os.O_RDWR, 0o644)
+    @staticmethod
+    @clear_on_fresh_cache
+    @functools.cache
+    def get_local_cache_path() -> Path:
+        return Path(os.path.join(cache_dir(), "cache", CacheBase.get_system()["hash"]))
 
-    try:
-        fd = acquire(path)
-    except OSError:
-        mirror = os.path.join(
-            tempfile.gettempdir(),
-            "tp-locks",
-            hashlib.sha256(path.encode()).hexdigest()[:32] + ".lock",
+    def __init__(self) -> None:
+        self.system = CacheBase.get_system()
+
+    def get_local_cache(self) -> dict[str, Any]:
+        local_cache_path = self.get_local_cache_path()
+        if not local_cache_path.is_file():
+            return {}
+        with open(local_cache_path) as local_cache_fp:
+            local_cache = json.load(local_cache_fp)
+        return local_cache["cache"]
+
+    def update_local_cache(self, local_cache: dict[str, Any]) -> None:
+        local_cache_path = self.get_local_cache_path()
+        write_atomic(
+            str(local_cache_path),
+            json.dumps({"system": self.system, "cache": local_cache}, indent=4),
+            make_dirs=True,
         )
-        fd = acquire(mirror)
+
+
+def code_hash(code: str | bytes, extra: str | bytes = "") -> str:
+    if extra:
+        return CODE_CACHE_KEY_STRATEGY.key(code, extra)
+    return CODE_CACHE_KEY_STRATEGY.key(code)
+
+
+def get_path(
+    basename: str, extension: str, specified_dir: str = ""
+) -> tuple[str, str, str]:
+    if specified_dir:
+        if os.path.isabs(specified_dir):
+            subdir = specified_dir
+        else:
+            subdir = os.path.join(cache_dir(), specified_dir)
+    else:
+        subdir = os.path.join(cache_dir(), basename[1:3])
+    path = os.path.join(subdir, f"{basename}.{extension}")
+    return basename, subdir, path
+
+
+def write_atomic(
+    path_: str,
+    content: str | bytes,
+    make_dirs: bool = False,
+    encode_utf_8: bool = False,
+) -> None:
+    # Write into temporary file first to avoid conflicts between threads
+    # Avoid using a named temporary file, as those have restricted permissions
+    if not isinstance(content, (str, bytes)):
+        raise AssertionError("Only strings and byte arrays can be saved in the cache")
+    path = Path(path_)
+    if make_dirs:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.parent / f".{os.getpid()}.{threading.get_ident()}.tmp"
+    write_mode = "w" if isinstance(content, str) else "wb"
+    with tmp_path.open(write_mode, encoding="utf-8" if encode_utf_8 else None) as f:
+        f.write(content)
     try:
-        import fcntl
-
-        mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
-        fcntl.flock(fd, mode)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
-
-
-class CodeCache:
-    """Content-addressed store mapping (source, entry, options) -> artifact."""
-
-    def __init__(self, backend: str, root: Optional[str] = None) -> None:
-        self.backend = backend
-        env_root = os.environ.get("TP_CACHE_DIR")
-        base = root or env_root or os.path.join(os.getcwd(), ".tp_cache")
-        self.root = os.path.join(base, "kernels", backend)
-        # Cache entries may have been written by another uid (a root-run
-        # process earlier): key-prefix subfolders then reject every write
-        # for this user and silently disable compilation.  Move to a
-        # user-writable cache root once per instance instead.
-        if not self._writable(base) or self._poisoned_prefixes():
-            fallback = os.path.join(tempfile.gettempdir(), f"tp-cache-{os.getuid()}")
-            self.root = os.path.join(fallback, "kernels", backend)
-
-    @staticmethod
-    def _writable(base: str) -> bool:
-        probe = os.path.join(base, ".writable-probe")
-        try:
-            os.makedirs(probe, exist_ok=True)
-            return os.access(probe, os.W_OK)
-        except OSError:
-            return False
-
-    def _poisoned_prefixes(self) -> bool:
-        try:
-            with os.scandir(self.root) as entries:
-                return any(
-                    entry.is_dir() and not os.access(entry.path, os.W_OK)
-                    for entry in entries
-                )
-        except OSError:
-            return False
-
-    # -- keying -------------------------------------------------------------
-
-    @staticmethod
-    def _canonical(options: Optional[Dict[str, Any]]) -> str:
-        return json.dumps(options or {}, sort_keys=True, default=repr)
-
-    def cache_key(
-        self,
-        source: str,
-        entry: str = "",
-        options: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        h = hashlib.sha256()
-        h.update(self.backend.encode())
-        h.update(b"\x00")
-        h.update(entry.encode())
-        h.update(b"\x00")
-        h.update(self._canonical(options).encode())
-        h.update(b"\x00")
-        h.update(source.encode())
-        return h.hexdigest()
-
-    @staticmethod
-    def _caches_disabled() -> bool:
-        from tensorplay.compiler import config
-
-        value = config.force_disable_caches
-        if not isinstance(value, bool):
-            raise TypeError("config.force_disable_caches must be a bool")
-        return value
-
-    def _path_for(self, key: str, ext: str, *, create: bool) -> str:
-        folder = os.path.join(self.root, key[:2])
-        if create:
-            os.makedirs(folder, exist_ok=True)
-        return os.path.join(folder, f"{key}.{ext}")
-
-    def path_for(self, key: str, ext: str = "bin") -> str:
-        return self._path_for(key, ext, create=not self._caches_disabled())
-
-    # -- storage ------------------------------------------------------------
-
-    def load(self, key: str, ext: str = "bin") -> Optional[bytes]:
-        if self._caches_disabled():
-            return None
-        memo = self._memo().get((key, ext))
-        if memo is not None:
-            return memo
-        path = self.path_for(key, ext)
-        try:
-            with open(path, "rb") as fh:
-                data = fh.read()
-        except OSError:
-            return None
-        self._memo()[(key, ext)] = data
-        return data
-
-    def store(self, key: str, payload: bytes, ext: str = "bin") -> str:
-        if self._caches_disabled():
-            return self._path_for(key, ext, create=False)
-        path = self._path_for(key, ext, create=True)
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
-        try:
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(payload)
-            os.replace(tmp, path)  # atomic publication
-        finally:
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-        self._memo()[(key, ext)] = payload
-        return path
-
-    def compile_or_load(
-        self,
-        compile_fn: Callable[[str], bytes],
-        source: str,
-        *,
-        entry: str = "",
-        options: Optional[Dict[str, Any]] = None,
-        ext: str = "bin",
-    ) -> Tuple[bytes, str]:
-        """Return ``(artifact, path)``, compiling through ``compile_fn`` on miss.
-
-        The compile itself runs under the per-key advisory lock with a
-        re-check inside, so concurrent processes racing on one miss produce
-        the artifact once instead of duplicating the toolchain run.
-        """
-
-        key = self.cache_key(source, entry, options)
-        if self._caches_disabled():
-            return compile_fn(source), self._path_for(key, ext, create=False)
-        cached = self.load(key, ext)
-        if cached is not None:
-            return cached, self.path_for(key, ext)
-        with file_lock(self._path_for(key, "lock", create=True)):
-            cached = self.load(key, ext)
-            if cached is None:
-                cached = compile_fn(source)
-                self.store(key, cached, ext)
-        return cached, self.path_for(key, ext)
-
-    # -- process-level memo ---------------------------------------------------
-
-    def _memo(self) -> Dict[Tuple[str, str], bytes]:
-        memo = getattr(self, "_memo_dict", None)
-        if memo is None:
-            memo = {}
-            self._memo_dict = memo
-        return memo
+        tmp_path.rename(target=path)
+    except FileExistsError:
+        if not _IS_WINDOWS:
+            raise
+        # On Windows file exist is expected: https://docs.python.org/3/library/pathlib.html#pathlib.Path.rename
+        # Below two lines code is equal to `tmp_path.rename(path)` on non-Windows OS.
+        # 1. Copy tmp_file to Target(Dst) file.
+        shutil.copy2(src=tmp_path, dst=path)
+        # 2. Delete tmp_file.
+        os.remove(tmp_path)
 
 
-_default_caches: Dict[str, CodeCache] = {}
+class CodeCacheFuture:
+    def result(self, timeout: float | None = None) -> Callable[..., Any]:
+        raise NotImplementedError
 
 
-def default_cache(backend: str) -> CodeCache:
-    """Process-wide cache instance per backend."""
+class LambdaFuture(CodeCacheFuture):
+    def __init__(
+        self, result_fn: Callable[..., Any], future: Future[Any] | None = None
+    ) -> None:
+        self.result_fn = result_fn
+        self.future = future
 
-    cache = _default_caches.get(backend)
-    if cache is None:
-        cache = CodeCache(backend)
-        _default_caches[backend] = cache
-    return cache
+    def result(self, timeout: float | None = None) -> Callable[..., Any]:
+        if timeout is not None and self.future is not None:
+            # Wait on the underlying cross-process future with the caller's
+            # timeout; raises concurrent.futures.TimeoutError if it does not
+            # resolve in time. result_fn will then consume the completed
+            # future without blocking further.
+            self.future.result(timeout=timeout)
+        return self.result_fn()

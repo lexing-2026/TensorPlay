@@ -20,10 +20,14 @@ from __future__ import annotations
 from contextlib import nullcontext
 from typing import Any
 
-from ..loops import Const, Loops, Pointwise, Reduction, Value, record_body, set_graph
+from ..ir import Loops, Pointwise, Reduction
+from ..loops import Value, record_body, set_graph
+from .index_expr import Const
 
-#: Dtype codes the host emitter reads off an instruction.
-_DTYPE_CODES = {"float32": 0, "float64": 1, "float16": 2, "bfloat16": 3}
+#: The element types the host emitter prints.  Its kernels run in one
+#: arithmetic width, so a body of any other width is declined rather than
+#: printed in a width it does not have.
+_HOST_DTYPES = ("float32",)
 
 
 class HostPlanError(Exception):
@@ -118,11 +122,12 @@ class _Numberer:
             name, lhs, rhs = value.op, args[0], args[1]
         else:
             raise HostPlanError(f"no host form for a {len(args)}-operand value")
-        code = _DTYPE_CODES.get(value.dtype)
-        if code is None:
+        if value.dtype not in _HOST_DTYPES:
             raise HostPlanError(f"no host form for element type {value.dtype!r}")
+        # The slot the result is stored at is the last field, so the emitter
+        # can address the value by the same number everywhere else.
         ref = self.temp(f"$v{len(self.instructions)}", value.dtype)
-        self.instructions.append((name, lhs, rhs, code))
+        self.instructions.append((name, lhs, rhs, ref))
         self._emitted[value] = ref
         return ref
 
@@ -144,7 +149,10 @@ def flatten(group, buffers: dict, stored: set, graph=None) -> dict:
         # path takes its extent and its body separately; that is its own
         # renderer, not this walk.
         raise HostPlanError("a reduction reaches the host emitter")
-    inputs = [name for name in group.names if name not in stored]
+    # The group's inputs are what it reads from outside itself: a name it also
+    # writes is an intermediate it computes in a slot, not an operand.  Sorted
+    # so the numbering the emitter sees is the same on every run of the group.
+    inputs = sorted(name for name in group.reads if name not in stored)
     numberer = _Numberer(len(inputs))
     for position, name in enumerate(inputs):
         numberer.by_name[name] = position

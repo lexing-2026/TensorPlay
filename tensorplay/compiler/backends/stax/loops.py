@@ -23,33 +23,77 @@ import functools
 import itertools
 import math
 import threading
-from enum import Enum, auto
+
+import sympy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
+from tensorplay.graph.experimental.sympy_functions import OrderedSet
+from . import config, metrics
+from .utils import (
+    argsort,
+    argsort_sym,
+    cache_on_self_and_args,
+    ceildiv,
+    get_free_symbols,
+)
 from .codegen.index_expr import (
-    Const,
-    Expr,
-    Symbol,
     ValueRange,
     affine_coeff,
-    floordiv,
     free_symbols,
-    modular_indexing,
-    render_python,
-    simplify,
-    substitute,
 )
 
 
-def as_index(value) -> Expr:
-    """Lift a Python integer into the index algebra."""
+def as_index(value):
+    """A Python integer lifted into the symbolic value language.
 
-    return value if isinstance(value, Expr) else Const(int(value))
+    An expression that is already symbolic is returned as it is, so an index
+    built from loop variables stays one expression rather than being rebuilt
+    out of its parts.
+    """
+
+    import sympy
+
+    if isinstance(value, sympy.Expr):
+        return value
+    return sympy.Integer(value)
 
 
-def simplify_index(expr, ranges: dict) -> Expr:
+def substitute(expr, mapping):
+    """This expression with some axes written as other expressions."""
+
+    from .utils import sympy_subs
+
+    return sympy_subs(expr, mapping)
+
+
+def floordiv(a, b):
+    """How many whole times ``b`` goes into ``a``."""
+
+    from tensorplay.graph.experimental.sympy_functions import FloorDiv
+
+    return FloorDiv(a, b)
+
+
+def modular_indexing(flat, stride, extent):
+    """Which element of an axis a flat position falls on.
+
+    A flat position is the sum of the position along each axis times how far
+    that axis is from the start, so one axis's position is what is left after
+    the stride has been taken off and the axis's own extent has wrapped.
+    """
+
+    from tensorplay.graph.experimental.sympy_functions import ModularIndexing
+
+    return ModularIndexing(flat, stride, extent)
+
+
+def simplify_index(expr, ranges: dict):
     """Fold exact divisions given each symbol's extent."""
+
+    import sympy
+
+    from .codegen.index_expr import simplify
 
     return simplify(
         as_index(expr),
@@ -58,6 +102,14 @@ def simplify_index(expr, ranges: dict) -> Expr:
 
 
 def pexpr(expr) -> str:
+    """An index expression written the way a kernel body would write it."""
+
+    import sympy
+
+    from .codegen.index_expr import render_python
+
+    if isinstance(expr, sympy.Expr):
+        return sympy.sstr(expr)
     return render_python(as_index(expr))
 
 
@@ -66,10 +118,114 @@ def pexpr(expr) -> str:
 # ---------------------------------------------------------------------------
 
 
+class _KernelState:
+    """What is known about the kernel being emitted, before one is chosen.
+
+    A name is looked up in two places -- the region's and the kernel's -- and
+    the kernel's is asked even when no kernel has been entered, so the answer
+    has to exist before one does.  The same is true of asking for a fresh name
+    for an expression: the emitter asks the kernel rather than keeping a count
+    of its own, so that every name in a kernel comes from one place.
+    """
+
+    def __init__(self, create_cse_var=None):
+        self.removed_buffers: set = set()
+        self.inplaced_to_remove: set = set()
+        self.current_node = None
+        self.itervars: set = set()
+        self.cse = None
+        self._create_cse_var = create_cse_var
+
+    def create_cse_var(self, name, bounds=None, dtype=None, shape=None):
+        """A fresh name for an expression, of the kind this kernel makes.
+
+        A kernel whose names carry more than a name -- a host kernel's know
+        whether they are vectors and which loop variables they were built from
+        -- hands that kind in when the kernel is entered, and the plain kind is
+        what a caller that has not chosen gets.
+        """
+
+        if self._create_cse_var is not None:
+            return self._create_cse_var(name, bounds, dtype, shape)
+        from .codegen.common import CSEVariable
+
+        return CSEVariable(name, bounds, dtype, shape)
+
+
+class NullKernel(_KernelState):
+    """The kernel that is there when no kernel is being emitted.
+
+    Code written outside a kernel -- the part of a compiled program that
+    allocates and calls -- still asks what the kernel dropped and what it wrote
+    in place, and outside a kernel the answer is that nothing was dropped,
+    which is what these two empty tables say.
+    """
+
+
+class _ReachableHandler:
+    """One of the operation handlers, resolved when it is first asked for.
+
+    The handlers and this object refer to each other, so neither can be
+    imported while the other is still being set up.  Naming the handler here
+    and looking it up on use lets either side be imported first.
+    """
+
+    def __init__(self, name: str):
+        self._name = name
+
+    def __get__(self, obj, objtype=None):
+        from . import ops_handler
+
+        return getattr(ops_handler, self._name)
+
+
 class _Virtual(threading.local):
+    """What is current while code is being emitted, reached from anywhere.
+
+    An operation is answered by whatever is current when it is asked rather
+    than by what is passed to it, so the current things are held here and the
+    setters below are how they are put in place.  The setters are on the class
+    rather than the instance so that a handler can be installed without holding
+    a reference to this object first.
+    """
+
     def __init__(self):
         self.ops = None
         self.graph = None
+        self.sizevars = None
+        self.current_node = None
+        self.kernel = NullKernel()
+        self.interpreter = None
+        self.debug = None
+        self.aot_compilation = False
+        self.extern_kernel_nodes = None
+        self.real_inputs = None
+        self.fake_mode = None
+        self.local_buffer_context = None
+
+    #: The handlers a node reaches for itself rather than being handed: the
+    #: one that writes a body out as source, and the one that answers an
+    #: operation without computing it.
+    KernelFormatterHandler = _ReachableHandler("KernelFormatterHandler")
+    MockHandler = _ReachableHandler("MockHandler")
+    DefaultHandler = _ReachableHandler("DefaultHandler")
+    WrapperHandler = _ReachableHandler("WrapperHandler")
+
+    set_ops_handler = None  # 由下方模块级函数填入
+    get_ops_handler = None
+    set_local_buffer_context = None
+    set_graph_handler = None
+    set_kernel_handler = None
+    set_debug_handler = None
+    set_interpreter_handler = None
+    set_aot_compilation = None
+    get_aot_compilation = None
+    set_current_node = None
+    set_extern_kernel_nodes = None
+    set_real_inputs = None
+    get_real_inputs = None
+    set_fake_mode = None
+    get_fake_mode = None
 
 
 V = _Virtual()
@@ -86,13 +242,223 @@ def set_ops_handler(handler):
 
 
 @contextlib.contextmanager
+def set_kernel_handler(kernel):
+    """Make a kernel the one being emitted, and put back the previous one.
+
+    An operator is answered by the kernel it is being emitted for, so the
+    kernel has to be reachable from the operator rather than passed to it: a
+    handler is entered once and then every operation it sees goes to that
+    kernel.
+    """
+
+    previous = V.kernel
+    V.kernel = kernel
+    try:
+        yield kernel
+    finally:
+        V.kernel = previous
+
+
+@contextlib.contextmanager
+def set_local_buffer_context(local_buffer_context):
+    """Make a set of function-local buffers the ones in scope, then put back the previous set.
+
+    A local buffer belongs to one compiled function and is invisible outside
+    it, so while that function is being written the operators have to be able
+    to name these buffers and find their extents.  Publishing the set on the
+    region is what lets an operator reach it without being handed a second
+    argument, and putting the previous one back on the way out is what keeps
+    the next function from seeing buffers that are not its own.
+    """
+
+    previous = V.local_buffer_context
+    V.local_buffer_context = local_buffer_context
+    try:
+        yield local_buffer_context
+    finally:
+        V.local_buffer_context = previous
+
+
+@contextlib.contextmanager
 def set_graph(graph):
+    """Make a region the one being compiled, and put back the previous one.
+
+    The size variables of the region are published alongside it, since what
+    is known about the extents belongs to the region they came from and a
+    generator that is handed the region has to be able to ask about them
+    without being handed the region a second time.
+    """
+
     previous = V.graph
+    previous_sizevars = V.sizevars
     V.graph = graph
+    V.sizevars = getattr(graph, "sizevars", None)
     try:
         yield graph
     finally:
         V.graph = previous
+        V.sizevars = previous_sizevars
+
+
+@contextlib.contextmanager
+def set_current_node(node):
+    """Publish the node being processed, for a generator that asks about it.
+
+    A generator decides about a layout partly from what the region knows about
+    the node it is emitting for -- a view that should not be padded, for
+    instance -- and the node is not threaded through those calls, so it is
+    published here and taken back afterwards.
+    """
+
+    previous = V.current_node
+    V.current_node = node
+    try:
+        yield node
+    finally:
+        V.current_node = previous
+
+
+def get_ops_handler():
+    """The handler operations are being answered by, or nothing."""
+
+    return V.ops
+
+
+@contextlib.contextmanager
+def set_interpreter_handler(handler):
+    """Make an interpreter current, and put back the previous one.
+
+    A handler that records what a body did may need to know which node of the
+    graph it is looking at, so the interpreter driving the graph publishes
+    itself while it runs.
+    """
+
+    previous = V.interpreter
+    V.interpreter = handler
+    try:
+        yield handler
+    finally:
+        V.interpreter = previous
+
+
+@contextlib.contextmanager
+def set_debug_handler(handler):
+    """Make a recorder of what was emitted current, and put back the previous."""
+
+    previous = V.debug
+    V.debug = handler
+    try:
+        yield handler
+    finally:
+        V.debug = previous
+
+
+@contextlib.contextmanager
+def set_aot_compilation(value: bool):
+    """Record whether the code is being emitted ahead of time, and restore it."""
+
+    previous = V.aot_compilation
+    V.aot_compilation = value
+    try:
+        yield value
+    finally:
+        V.aot_compilation = previous
+
+
+def get_aot_compilation() -> bool:
+    """Whether the code is being emitted ahead of time."""
+
+    return V.aot_compilation
+
+
+@contextlib.contextmanager
+def set_current_node_handler(node):
+    """Make a node current for a generator that asks about it."""
+
+    previous = V.current_node
+    V.current_node = node
+    try:
+        yield node
+    finally:
+        V.current_node = previous
+
+
+@contextlib.contextmanager
+def set_extern_kernel_nodes(nodes):
+    """Make a set of nodes that must stay separate current, and restore it."""
+
+    previous = V.extern_kernel_nodes
+    V.extern_kernel_nodes = nodes
+    try:
+        yield nodes
+    finally:
+        V.extern_kernel_nodes = previous
+
+
+@contextlib.contextmanager
+def set_real_inputs(real_inputs):
+    """Make the real tensors behind the graph's inputs current, and restore them.
+
+    A layout decision sometimes has to be made against the values rather than
+    the shapes, and the values live on the tensors rather than in the graph, so
+    they are published here for the duration of the decision.
+    """
+
+    previous = V.real_inputs
+    V.real_inputs = real_inputs
+    try:
+        yield real_inputs
+    finally:
+        V.real_inputs = previous
+
+
+def get_real_inputs():
+    """The real tensors behind the graph's inputs, if they are known."""
+
+    return V.real_inputs
+
+
+@contextlib.contextmanager
+def set_fake_mode(mode):
+    """Make a tensor mode current, and put back the previous one."""
+
+    previous = V.fake_mode
+    V.fake_mode = mode
+    try:
+        yield mode
+    finally:
+        V.fake_mode = previous
+
+
+def get_fake_mode():
+    """The tensor mode current, if one is."""
+
+    return V.fake_mode
+
+
+# The handlers are reachable from the object that holds what is current, so
+# that code holding only that object can install one.
+_Virtual.set_ops_handler = staticmethod(set_ops_handler)
+_Virtual.get_ops_handler = staticmethod(get_ops_handler)
+_Virtual.set_local_buffer_context = staticmethod(set_local_buffer_context)
+_Virtual.set_graph_handler = staticmethod(set_graph)
+_Virtual.set_kernel_handler = staticmethod(set_kernel_handler)
+_Virtual.set_current_node = staticmethod(set_current_node)
+_Virtual.set_interpreter_handler = staticmethod(set_interpreter_handler)
+_Virtual.set_debug_handler = staticmethod(set_debug_handler)
+_Virtual.set_aot_compilation = staticmethod(set_aot_compilation)
+_Virtual.get_aot_compilation = staticmethod(get_aot_compilation)
+_Virtual.set_extern_kernel_nodes = staticmethod(set_extern_kernel_nodes)
+_Virtual.set_real_inputs = staticmethod(set_real_inputs)
+_Virtual.get_real_inputs = staticmethod(get_real_inputs)
+_Virtual.set_fake_mode = staticmethod(set_fake_mode)
+_Virtual.get_fake_mode = staticmethod(get_fake_mode)
+
+
+def get_current_node():
+    """The node being processed, or nothing when none is."""
+
+    return V.current_node
 
 
 class _OpsProxy:
@@ -135,371 +501,50 @@ class DeferredOps:
 FLOAT_RANK = {"float16": 1, "bfloat16": 1, "float32": 2, "float64": 3}
 
 
-def dtype_name(dtype) -> str:
-    return str(dtype).rsplit(".", 1)[-1]
+class LibraryKernel:
+    """A call to something written elsewhere, on values that are already in memory.
 
+    The operation is named once, here, and what it takes is the call as it was
+    written: the arguments in the order given, the keywords as they were named,
+    and the traced result of the call, which is what says what shape and type
+    comes back.  Nothing about the call is lowered; the job here is to know
+    which buffers it reads, so that it can be ordered against them.
 
-def compute_dtype(*names: str) -> str:
-    """Arithmetic element type: reduced floats compute in float32."""
-
-    best = "float32"
-    for name in names:
-        if name == "float64":
-            best = "float64"
-    return best
-
-
-class BackendFeature(Enum):
-    """What a program emitter can express.
-
-    A value in this vocabulary is a property of an emitter, not of a region:
-    the emitters differ in what a program may ask of them, so the difference
-    is declared once here and read by the lowering that picks one.
+    This is the bridge to code that was not written for this compiler, and it
+    is deliberately thin: the more it decides, the more there is that could
+    disagree with the thing being called.
     """
-
-    #: Reads an input through an arbitrary stride, so a view needs no copy.
-    STRIDED_INPUTS = auto()
-    #: Accepts inputs whose element types differ from one another.
-    MIXED_INPUT_DTYPES = auto()
-    #: Reads inputs whose element type is narrower than the arithmetic width.
-    PROMOTED_INPUTS = auto()
-    #: Carries a reduction inside the program instead of beside it.
-    IN_PROGRAM_REDUCTION = auto()
-    #: Emits more than one result from one program.
-    MULTI_OUTPUT = auto()
-    #: Picks its launch tile from measured candidates instead of a constant.
-    AUTOTUNED_TILE = auto()
-    #: Accepts an input that carries a gradient.
-    GRAD_INPUTS = auto()
-    #: A tail predicate covers the partial tile, so one guarded access serves
-    #: every element a thread owns.
-    TILE_MASKED_ACCESS = auto()
-
-
-#: What each emitter declares.  Order is the preference order: the first
-#: emitter whose declared set covers what the program needs is the one that
-#: runs, and a program no emitter covers is a lowering miss rather than a
-#: silent hop to a weaker emitter.  Elementwise work has one emitter; a
-#: program it cannot express is a miss to report, not a second codegen path
-#: with different semantics to fall into.
-BACKEND_FEATURES: dict[str, frozenset] = {
-    "triton": frozenset({
-        BackendFeature.STRIDED_INPUTS,
-        BackendFeature.MIXED_INPUT_DTYPES,
-        BackendFeature.PROMOTED_INPUTS,
-        BackendFeature.IN_PROGRAM_REDUCTION,
-        BackendFeature.MULTI_OUTPUT,
-        BackendFeature.AUTOTUNED_TILE,
-        BackendFeature.GRAD_INPUTS,
-        BackendFeature.TILE_MASKED_ACCESS,
-    }),
-    "interpreter": frozenset({
-        BackendFeature.MULTI_OUTPUT,
-    }),
-}
-
-#: Preference order among the emitters.
-BACKEND_ORDER: tuple[str, ...] = ("triton", "interpreter")
-
-
-def required_features(
-    *,
-    strided_inputs: bool = False,
-    mixed_dtypes: bool = False,
-    promoted_inputs: bool = False,
-    reduction: bool = False,
-    outputs: int = 1,
-    grad_inputs: bool = False,
-) -> frozenset:
-    """What one program needs from an emitter, read off its own properties."""
-    needed = set()
-    if strided_inputs:
-        needed.add(BackendFeature.STRIDED_INPUTS)
-    if mixed_dtypes:
-        needed.add(BackendFeature.MIXED_INPUT_DTYPES)
-    if promoted_inputs:
-        needed.add(BackendFeature.PROMOTED_INPUTS)
-    if reduction:
-        needed.add(BackendFeature.IN_PROGRAM_REDUCTION)
-    if outputs > 1:
-        needed.add(BackendFeature.MULTI_OUTPUT)
-    if grad_inputs:
-        needed.add(BackendFeature.GRAD_INPUTS)
-    return frozenset(needed)
-
-
-def select_backend(needed: frozenset) -> str | None:
-    """The first emitter that declares everything the program needs."""
-    for name in BACKEND_ORDER:
-        if needed <= BACKEND_FEATURES[name]:
-            return name
-    return None
-
-
-def backend_supports(name: str, needed: frozenset) -> bool:
-    return needed <= BACKEND_FEATURES.get(name, frozenset())
-
-
-#: Storage types whose value the arithmetic width lifts on load.  A consumer
-#: that declares one arithmetic type reads these through the same buffer and
-#: converts after loading, so asking it for a wider value costs no pass.
-PROMOTED_ON_LOAD = frozenset({"float16", "bfloat16"})
-
-
-def promotes_on_load(storage_dtype) -> bool:
-    """Whether a load of ``storage_dtype`` is converted to float32."""
-    return dtype_name(storage_dtype) in PROMOTED_ON_LOAD
-
-
-@dataclass(eq=False)
-class Value:
-    """One node of a recorded loop body."""
-
-    op: str
-    args: tuple
-    dtype: str
-
-    def __repr__(self) -> str:
-        return f"Value({self.op}, {self.dtype})"
-
-
-class RecordingOps:
-    """Ops handler that records a loop body as an expression DAG."""
-
-    def __init__(self):
-        self.loads: list[Value] = []
-        self._masks: list[Value] = []
-
-    # memory ---------------------------------------------------------------
-    def load(self, name: str, index) -> Value:
-        buffer = V.graph.get_buffer(name)
-        mask = self._masks[-1] if self._masks else None
-        v = Value("load", (name, index, mask), dtype_name(buffer.get_dtype()))
-        self.loads.append(v)
-        return v
-
-    def masked(self, mask: Value, body: Callable[[], Value], other) -> Value:
-        """Evaluate ``body`` only where ``mask`` holds; ``other`` elsewhere."""
-
-        combined = mask if not self._masks else self.and_(self._masks[-1], mask)
-        self._masks.append(combined)
-        try:
-            value = body()
-        finally:
-            self._masks.pop()
-        fill = other if isinstance(other, Value) else self.constant(other, "float32")
-        return self.where(mask, value, fill)
-
-    def and_(self, a: Value, b: Value) -> Value:
-        return Value("and_", (a, b), "bool")
-
-    # values ---------------------------------------------------------------
-    def constant(self, value, dtype) -> Value:
-        return Value("constant", (value,), dtype_name(dtype))
-
-    def index_expr(self, expr, dtype) -> Value:
-        return Value("index_expr", (expr,), dtype_name(dtype))
-
-    def to_dtype(self, x: Value, dtype) -> Value:
-        return Value("to_dtype", (x,), dtype_name(dtype))
-
-    def where(self, cond, a, b) -> Value:
-        return Value("where", (cond, a, b), compute_dtype(a.dtype, b.dtype))
-
-    def _binary(self, op, a, b):
-        return Value(op, (a, b), compute_dtype(a.dtype, b.dtype))
-
-    def _unary(self, op, a):
-        return Value(op, (a,), compute_dtype(a.dtype))
-
-    def __getattr__(self, name):
-        if name in _BINARY_OPS:
-            return functools.partial(self._binary, name)
-        if name in _UNARY_OPS:
-            return functools.partial(self._unary, name)
-        if name in _COMPARE_OPS:
-            return lambda a, b, _n=name: Value(_n, (a, b), "bool")
-        raise AttributeError(name)
-
-
-_BINARY_OPS = frozenset(
-    {"add", "sub", "mul", "truediv", "maximum", "minimum", "pow"}
-)
-_UNARY_OPS = frozenset(
-    {"neg", "exp", "log", "sigmoid", "rsqrt", "sqrt", "reciprocal", "abs",
-     "sin", "cos", "tanh", "relu", "square"}
-)
-_COMPARE_OPS = frozenset({"lt", "le", "gt", "ge", "eq", "ne"})
-
-
-# ---------------------------------------------------------------------------
-# Layouts and IR nodes
-# ---------------------------------------------------------------------------
-
-
-def contiguous_strides(size: Sequence[int]) -> tuple[int, ...]:
-    strides = []
-    running = 1
-    for extent in reversed(size):
-        strides.append(running)
-        running *= max(int(extent), 1)
-    return tuple(reversed(strides))
-
-
-def prod(values) -> int:
-    out = 1
-    for v in values:
-        out *= int(v)
-    return out
-
-
-@dataclass
-class Layout:
-    device: Any
-    dtype: Any
-    size: tuple
-    stride: tuple
-    offset: int = 0
-
-    def indexer(self, index):
-        expr: Expr = Const(self.offset)
-        for i, s, extent in zip(index, self.stride, self.size):
-            if extent != 1 and s != 0:
-                expr = expr + as_index(i) * int(s)
-        return expr
-
-    def is_contiguous(self) -> bool:
-        return all(
-            extent == 1 or st == cst
-            for extent, st, cst in zip(self.size, self.stride, contiguous_strides(self.size))
-        )
-
-
-class IRNode:
-    def get_size(self) -> tuple:
-        raise NotImplementedError
-
-    def get_dtype(self):
-        raise NotImplementedError
-
-    def get_device(self):
-        raise NotImplementedError
-
-    def make_loader(self) -> Callable:
-        raise NotImplementedError
-
-
-class Buffer(IRNode):
-    def __init__(self, name: str, layout: Layout):
-        self.name = name
-        self.layout = layout
-
-    def get_size(self):
-        return self.layout.size
-
-    def get_dtype(self):
-        return self.layout.dtype
-
-    def get_device(self):
-        return self.layout.device
-
-    def make_loader(self):
-        name = self.name
-        indexer = self.layout.indexer
-
-        def loader(index):
-            return ops.load(name, indexer(index))
-
-        return loader
-
-    def __repr__(self):
-        return f"{type(self).__name__}({self.name}, {self.layout.size}, {dtype_name(self.layout.dtype)})"
-
-
-class InputBuffer(Buffer):
-    pass
-
-
-class ConstantBuffer(Buffer):
-    """A tensor the graph closes over (lifted as an extra kernel argument)."""
-
-    def __init__(self, name, layout, value):
-        super().__init__(name, layout)
-        self.value = value
-
-
-class Loops(IRNode):
-    def __init__(self, device, dtype, inner_fn, ranges):
-        self.device = device
-        self.dtype = dtype
-        self.inner_fn = inner_fn
-        self.ranges = tuple(int(r) for r in ranges)
-
-    def get_size(self):
-        return self.ranges
-
-    def get_dtype(self):
-        return self.dtype
-
-    def get_device(self):
-        return self.device
-
-
-class Pointwise(Loops):
-    def make_loader(self):
-        return self.inner_fn
-
-    def num_reads(self) -> int:
-        return len(record_body(self).loads)
-
-
-class Reduction(Loops):
-    """``reduction_type`` over ``reduction_ranges``: sum, max, min or welford."""
-
-    def __init__(self, device, dtype, inner_fn, ranges, reduction_ranges, reduction_type):
-        super().__init__(device, dtype, inner_fn, ranges)
-        self.reduction_ranges = tuple(int(r) for r in reduction_ranges)
-        self.reduction_type = reduction_type
-
-    def make_loader(self):
-        raise RuntimeError("a reduction is read only after it is realized")
-
-
-class ComputedBuffer(Buffer):
-    def __init__(self, name, layout, data: Loops):
-        super().__init__(name, layout)
-        self.data = data
-        # Set for the extra outputs of a multi-output reduction (welford):
-        # they share one loop nest with the first buffer.
-        self.welford_parent: ComputedBuffer | None = None
-        self.welford_index = 0
-        self.welford_siblings: list[ComputedBuffer] = []
-
-    def is_reduction(self) -> bool:
-        return isinstance(self.data, Reduction)
-
-
-class ExternKernel(IRNode):
-    """A library call: runs ``target`` on realized inputs."""
 
     def __init__(self, name, target, args, kwargs, meta_values, call_method=False):
         self.name = name
         self.target = target
         self.args = args
         self.kwargs = kwargs
-        # A method call names its operation with a string and receives the
-        # object it is called on as the first argument.
+        # A method call names its operation with a string and is handed the
+        # object it is called on as its first argument.
         self.call_method = call_method
-        # Traced output value(s): shapes/dtypes of what the call returns.
+        # What the call returned, as traced: the shapes and types of it, which
+        # is all that is known before it runs.
         self.meta_values = meta_values
-        self.outputs: list[ExternOutput] = []
+        self.outputs: list = []
 
-    def input_buffers(self) -> list[Buffer]:
+    def input_buffers(self) -> list:
+        """Every buffer this call reads, however deeply nested the arguments are.
+
+        What counts as an operand that reads memory is asked of the operand
+        rather than listed here: a call whose argument names a buffer reads
+        that buffer, and a window onto one reads the buffer underneath it.
+        """
+
+        from .ir import Buffer
+
         found = []
 
         def visit(a):
-            if isinstance(a, (Buffer, ReinterpretView)):
-                found.append(a.buffer if isinstance(a, ReinterpretView) else a)
+            if isinstance(a, ReinterpretView) and hasattr(a, "buffer"):
+                found.append(a.buffer)
+            elif isinstance(a, (Buffer, ExternOutput)):
+                found.append(a)
             elif isinstance(a, (list, tuple)):
                 for item in a:
                     visit(item)
@@ -512,172 +557,183 @@ class ExternKernel(IRNode):
         return found
 
 
-class TemplateKernel(ExternKernel):
-    """A library call whose implementation is chosen from a config space.
+class TemplateKernel(LibraryKernel):
+    """A call whose implementation is chosen from a space of candidates.
 
-    The operation is named once, in a template, instead of at every call
-    site: the template owns the candidates and the choice, and the compiled
-    step records which one it settled on.
+    The operation is named once in a template rather than at every call site:
+    the template owns the candidates and the choice between them, and the
+    compiled step records which one it settled on.  The call is still dispatched
+    as itself -- the template only decides how it is carried out.
     """
 
-    def __init__(self, name, target, template, args, kwargs, meta_values,
-                 call_method=False):
-        # The operation is still dispatched as itself; the template only owns
-        # the choice of implementation for it.
-        super().__init__(name, target, args, kwargs, meta_values,
-                         call_method=call_method)
+    def __init__(
+        self, name, target, template, args, kwargs, meta_values, call_method=False
+    ):
+        super().__init__(name, target, args, kwargs, meta_values, call_method=call_method)
         self.template = template
         self.config = None
         self.template_meta: dict = {}
 
 
-class ExternOutput(Buffer):
-    def __init__(self, name, layout, kernel: ExternKernel, path: tuple):
-        super().__init__(name, layout)
+class ExternOutput:
+    """One value a library call produced, at a position inside what it returned.
+
+    A call that returns several things is indexed by where each sits among
+    them, since a nested result is a tree and a path into it is what names one
+    value rather than a pair of brackets.
+    """
+
+    def __init__(self, name, layout, kernel: LibraryKernel, path: tuple):
+        self.name = name
+        self.layout = layout
         self.kernel = kernel
-        self.path = path  # position inside the call's (nested) result
+        # Where among the call's results this one sits.
+        self.path = path
+
+    def get_name(self) -> str:
+        return self.name
+
+    def get_origin_node(self):
+        """The graph node whose call produced this value, if it was traced."""
+
+        return getattr(self.kernel, "origin_node", None)
+
+    @property
+    def dtype(self):
+        """The element type, as a buffer reports it.
+
+        A value is asked for its type the same way whichever way it was
+        arrived at, so that a box holding one does not have to know.
+        """
+
+        return self.layout.dtype
+
+    def get_size(self):
+        return self.layout.size
+
+    def get_dtype(self):
+        return self.layout.dtype
+
+    def get_device(self):
+        return self.layout.device
+
+    def get_stride(self):
+        return self.layout.stride
+
+    def get_offset(self):
+        return self.layout.offset
+
+    def get_layout(self):
+        return self.layout
+
+    # The rest of what a buffer answers.  A value a call produced is already
+    # where the call put it, so these say so rather than declining: its layout
+    # is settled, it is not a graph input or a stored constant, and nothing is
+    # read out of it by anything other than the call that wrote it.
+
+    def freeze_layout(self):
+        """Settle the layout, which is already settled.
+
+        The call was handed this shape, stride and offset, so there is nothing
+        left to choose and nothing to change.
+        """
+
+    def freeze_layout_with_stride_order(self, order, allow_padding=False):
+        self.freeze_layout()
+
+    def freeze_layout_with_fill_order(self, order):
+        self.freeze_layout()
+
+    def freeze_layout_with_same_order(self, stride):
+        self.freeze_layout()
+
+    def freeze_layout_with_exact_strides(self, exact_strides, allow_padding=False):
+        self.freeze_layout()
+
+    def is_input_buffer(self):
+        return False
+
+    def is_module_buffer(self):
+        return False
+
+    def should_allocate(self):
+        return False
+
+    def num_reads(self):
+        return 0
+
+    def get_reads(self):
+        return []
+
+    def get_read_names(self):
+        return set()
+
+    def get_free_symbol_uses(self, unbacked_only=False):
+        return set()
+
+    def make_indexer(self):
+        return self.layout.make_indexer()
+
+    def make_loader(self):
+        """The function that reads one element of this value.
+
+        The call fills this value where it is named, so a read of it is a read
+        of that name at the position the layout says the element sits.
+        """
+
+        indexer = self.make_indexer()
+
+        def loader(index):
+            return ops.load(self.name or "unnamed", indexer(index))
+
+        return loader
 
 
 @dataclass
 class ReinterpretView:
-    """A strided view of a realized buffer, handed to library calls."""
+    """A strided window onto a buffer that already exists.
 
-    buffer: Buffer
+    Nothing is copied: the window names an offset, a shape and a stride, and
+    the elements are read through the buffer it names.  This is what is handed
+    to a library call that was written in terms of a shape, a stride and an
+    offset rather than in terms of this compiler's own values.
+    """
+
+    buffer: "Buffer"
     size: tuple
     stride: tuple
     offset: int
 
-
-class View(IRNode):
-    """Re-address ``source`` through ``reindex`` (new index -> source index)."""
-
-    def __init__(self, source: "TensorBox", size, reindex):
-        self.source = source
-        self.size = tuple(int(s) for s in size)
-        self.reindex = reindex
+    def get_name(self) -> str:
+        return self.buffer.get_name()
 
     def get_size(self):
         return self.size
 
     def get_dtype(self):
-        return self.source.get_dtype()
+        return self.buffer.get_dtype()
 
     def get_device(self):
-        return self.source.get_device()
+        return self.buffer.get_device()
 
-    def make_loader(self):
-        inner = self.source.make_loader()
-        reindex = self.reindex
+    def get_stride(self):
+        return self.stride
 
-        def loader(index):
-            return inner(reindex(index))
+    def get_offset(self):
+        return self.offset
 
-        return loader
+    def get_layout(self):
+        return self.buffer.get_layout()
 
+    def make_indexer(self):
+        return self.buffer.get_layout().make_indexer()
 
-class TensorBox:
-    """Lowering-time handle for a tensor value (possibly not materialized)."""
-
-    def __init__(self, node: IRNode):
-        self.node = node
-
-    def get_size(self):
-        return self.node.get_size()
-
-    def get_dtype(self):
-        return self.node.get_dtype()
-
-    def get_device(self):
-        return self.node.get_device()
-
-    def numel(self):
-        return prod(self.get_size())
-
-    def make_loader(self):
-        return self.node.make_loader()
-
-    def realize(self) -> Buffer | None:
-        """Materialize a loop nest into a buffer; views realize their source."""
-
-        node = self.node
-        if isinstance(node, Buffer):
-            return node
-        if isinstance(node, Loops):
-            buffer = V.graph.register_computed(node)
-            self.node = buffer
-            return buffer
-        if isinstance(node, View):
-            node.source.realize()
-            return None
-        return None
-
-    def __repr__(self):
-        return f"TensorBox({self.node!r})"
+    def is_input_buffer(self) -> bool:
+        return self.buffer.is_input_buffer()
 
 
-# ---------------------------------------------------------------------------
-# Recording loop bodies
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class LoopBody:
-    """A recorded loop nest: variables, their extents and the value(s)."""
-
-    vars: list
-    sizes: list
-    rvars: list
-    rsizes: list
-    root: Value | tuple
-    loads: list = field(default_factory=list)
-    # buffer name -> index its value is stored at (in terms of ``vars``)
-    stores: dict = field(default_factory=dict)
-
-
-_symbol_counter = itertools.count()
-
-
-def fresh_symbols(prefix: str, n: int) -> list:
-    return [Symbol(f"{prefix}{next(_symbol_counter)}") for _ in range(n)]
-
-
-def record_body(loops: Loops) -> LoopBody:
-    handler = RecordingOps()
-    vars_ = fresh_symbols("i", len(loops.ranges))
-    with set_ops_handler(handler):
-        if isinstance(loops, Reduction):
-            rvars = fresh_symbols("r", len(loops.reduction_ranges))
-            root = loops.inner_fn(vars_, rvars)
-            return LoopBody(vars_, list(loops.ranges), rvars, list(loops.reduction_ranges), root, handler.loads)
-        root = loops.inner_fn(vars_)
-    return LoopBody(vars_, list(loops.ranges), [], [], root, handler.loads)
-
-
-def _rewrite_body(body: LoopBody, mapping: dict) -> LoopBody:
-    """Substitute loop variables in every index the body touches."""
-
-    memo: dict[int, Value] = {}
-
-    def visit(v):
-        if not isinstance(v, Value):
-            return v
-        hit = memo.get(id(v))
-        if hit is not None:
-            return hit
-        if v.op == "load":
-            name, index, mask = v.args
-            out = Value("load", (name, substitute(as_index(index), mapping), visit(mask)), v.dtype)
-        elif v.op == "index_expr":
-            out = Value("index_expr", (substitute(as_index(v.args[0]), mapping),), v.dtype)
-        else:
-            out = Value(v.op, tuple(visit(a) for a in v.args), v.dtype)
-        memo[id(v)] = out
-        return out
-
-    root = tuple(visit(r) for r in body.root) if isinstance(body.root, tuple) else visit(body.root)
-    loads = [memo[id(v)] for v in body.loads if id(v) in memo]
-    stores = {name: substitute(as_index(e), mapping) for name, e in body.stores.items()}
-    return LoopBody(body.vars, body.sizes, body.rvars, body.rsizes, root, loads, stores)
+#: The call this compiler makes to code it did not write.
+ExternKernel = LibraryKernel
 
 
 def _index_exprs(body: LoopBody) -> list:
@@ -784,39 +840,354 @@ def simplify_loops(body: LoopBody) -> LoopBody:
     return body
 
 
-def iter_values(root) -> list[Value]:
-    """Nodes of a recorded body in dependency order."""
+#: Hands out a number for each symbol asked for, so that two bodies captured at
+#: different times never name a loop the same.
+_symbol_counter = itertools.count()
 
-    order: list[Value] = []
-    seen: set[int] = set()
-    stack = list(root) if isinstance(root, tuple) else [root]
-    stack = [(v, False) for v in stack]
+
+def fresh_symbols(prefix: str, n: int) -> list:
+    """``n`` loop variables of one kind, none of them named before.
+
+    They are symbols in the symbolic value language, so an index built from
+    them can be simplified against the extents they are known to range over
+    rather than only pattern-matched.
+    """
+
+    import sympy
+
+    return [
+        sympy.Symbol(
+            f"{prefix}{next(_symbol_counter)}", integer=True, nonnegative=True
+        )
+        for _ in range(n)
+    ]
+
+
+def iter_values(value):
+    """Every recorded value inside this one, however deeply nested.
+
+    A recorded body is a tree of values, and a question about what it computes
+    is a question about all of them rather than about the root.
+    """
+
+    seen = set()
+    stack = [value]
     while stack:
-        v, expanded = stack.pop()
-        if not isinstance(v, Value) or (id(v) in seen and not expanded):
+        v = stack.pop()
+        if not isinstance(v, Value) or id(v) in seen:
             continue
-        if expanded:
-            if id(v) not in seen:
-                seen.add(id(v))
-                order.append(v)
-            continue
-        stack.append((v, True))
-        for a in v.args:
-            if isinstance(a, Value) and id(a) not in seen:
-                stack.append((a, False))
-    return order
+        seen.add(id(v))
+        yield v
+        stack.extend(a for a in v.args if isinstance(a, (Value, list, tuple)))
+        if isinstance(v.args, (list, tuple)):
+            stack.extend(a for a in v.args if isinstance(a, (Value, list, tuple)))
 
 
-__all__ = [
-    "BACKEND_FEATURES", "BACKEND_ORDER", "BackendFeature", "Buffer", "ComputedBuffer",
-    "Const", "ConstantBuffer", "DeferredOps", "Expr",
-    "ExternKernel", "ExternOutput", "InputBuffer", "TemplateKernel", "IRNode", "Layout",
-    "LoopBody", "Loops", "Pointwise", "Reduction", "ReinterpretView", "Symbol",
-    "TensorBox", "V", "Value", "View", "affine_coeff", "as_index",
-    "PROMOTED_ON_LOAD", "compute_dtype", "contiguous_strides", "dtype_name",
-    "floordiv", "promotes_on_load",
-    "free_symbols", "fresh_symbols", "iter_values", "modular_indexing", "ops",
-    "pexpr", "prod", "record_body", "set_graph", "set_ops_handler",
-    "backend_supports", "required_features", "select_backend",
-    "simplify_index", "simplify_loops", "substitute",
-]
+@dataclass(eq=False)
+class LoopBody:
+    """A body captured as a tree of values, with the loops it runs over.
+
+    This is the shape the program path works in, where a body is recorded by
+    running it and then read back.  The shape used elsewhere records a body as a
+    graph instead, which says more and costs more to take apart.
+    """
+
+    vars: list
+    sizes: list
+    rvars: list
+    rsizes: list
+    root: object
+    loads: list = field(default_factory=list)
+    stores: dict = field(default_factory=dict)
+
+
+def record_body(loops: Loops) -> LoopBody:
+    """Run a body once with a handler in place of the code, and record what it did.
+
+    The loops are given names to run under, and what comes back is which
+    positions were read and what the result was -- which is everything the
+    program path needs to write a body out by hand.
+    """
+
+    handler = RecordingOps()
+    vars_ = fresh_symbols("i", len(loops.ranges))
+    # Imported here rather than at module scope: the body classes live in the
+    # layer above this one, which imports this module, so a top-level import
+    # would be a cycle.
+    from .ir import Reduction
+
+    with set_ops_handler(handler):
+        if isinstance(loops, Reduction):
+            rvars = fresh_symbols("r", len(loops.reduction_ranges))
+            root = loops.inner_fn(vars_, rvars)
+            return LoopBody(
+                vars_,
+                list(loops.ranges),
+                rvars,
+                list(loops.reduction_ranges),
+                root,
+                handler.loads,
+            )
+        root = loops.inner_fn(vars_)
+    return LoopBody(vars_, list(loops.ranges), [], [], root, handler.loads)
+
+
+
+def dtype_name(dtype) -> str:
+    return str(dtype).rsplit(".", 1)[-1]
+
+
+def compute_dtype(*names: str) -> str:
+    """Arithmetic element type: reduced floats compute in float32."""
+
+    best = "float32"
+    for name in names:
+        if name == "float64":
+            best = "float64"
+    return best
+
+
+
+
+#: Storage types whose value the arithmetic width lifts on load.  A consumer
+#: that declares one arithmetic type reads these through the same buffer and
+#: converts after loading, so asking it for a wider value costs no pass.
+PROMOTED_ON_LOAD = frozenset({"float16", "bfloat16"})
+
+
+def promotes_on_load(storage_dtype) -> bool:
+    """Whether a load of ``storage_dtype`` is converted to float32."""
+    return dtype_name(storage_dtype) in PROMOTED_ON_LOAD
+
+
+@dataclass(eq=False)
+class Value:
+    """One node of a recorded loop body."""
+
+    op: str
+    args: tuple
+    dtype: str
+
+    def __repr__(self) -> str:
+        return f"Value({self.op}, {self.dtype})"
+
+
+class RecordingOps:
+    """Ops handler that records a loop body as an expression DAG."""
+
+    def __init__(self):
+        self.loads: list[Value] = []
+        self._masks: list[Value] = []
+
+    # memory ---------------------------------------------------------------
+    def load(self, name: str, index) -> Value:
+        buffer = V.graph.get_buffer(name)
+        mask = self._masks[-1] if self._masks else None
+        v = Value("load", (name, index, mask), dtype_name(buffer.get_dtype()))
+        self.loads.append(v)
+        return v
+
+    def masked(self, mask: Value, body: Callable[[], Value], other) -> Value:
+        """Evaluate ``body`` only where ``mask`` holds; ``other`` elsewhere."""
+
+        combined = mask if not self._masks else self.and_(self._masks[-1], mask)
+        self._masks.append(combined)
+        try:
+            value = body()
+        finally:
+            self._masks.pop()
+        fill = other if isinstance(other, Value) else self.constant(other, "float32")
+        return self.where(mask, value, fill)
+
+    def and_(self, a: Value, b: Value) -> Value:
+        return Value("and_", (a, b), "bool")
+
+    # values ---------------------------------------------------------------
+    def constant(self, value, dtype) -> Value:
+        return Value("constant", (value,), dtype_name(dtype))
+
+    def index_expr(self, expr, dtype) -> Value:
+        return Value("index_expr", (expr,), dtype_name(dtype))
+
+    def to_dtype(self, x: Value, dtype) -> Value:
+        return Value("to_dtype", (x,), dtype_name(dtype))
+
+    def where(self, cond, a, b) -> Value:
+        return Value("where", (cond, a, b), compute_dtype(a.dtype, b.dtype))
+
+    def _binary(self, op, a, b):
+        return Value(op, (a, b), compute_dtype(a.dtype, b.dtype))
+
+    def _unary(self, op, a):
+        return Value(op, (a,), compute_dtype(a.dtype))
+
+    def __getattr__(self, name):
+        if name in _BINARY_OPS:
+            return functools.partial(self._binary, name)
+        if name in _UNARY_OPS:
+            return functools.partial(self._unary, name)
+        if name in _COMPARE_OPS:
+            return lambda a, b, _n=name: Value(_n, (a, b), "bool")
+        raise AttributeError(name)
+
+
+_BINARY_OPS = frozenset(
+    {"add", "sub", "mul", "truediv", "maximum", "minimum", "pow"}
+)
+_UNARY_OPS = frozenset(
+    {"neg", "exp", "log", "sigmoid", "rsqrt", "sqrt", "reciprocal", "abs",
+     "sin", "cos", "tanh", "relu", "square"}
+)
+_COMPARE_OPS = frozenset({"lt", "le", "gt", "ge", "eq", "ne"})
+
+
+# ---------------------------------------------------------------------------
+# Layouts and IR nodes
+# ---------------------------------------------------------------------------
+
+
+#: The stride order a tensor with its channels outermost has: the channel
+#: dimension moves furthest, the outermost dimension next, and the rest in
+#: between, so that walking channels walks memory.
+NHWC_STRIDE_ORDER = [3, 0, 2, 1]
+NHWDC_STRIDE_ORDER = [4, 0, 3, 2, 1]
+
+
+def contiguous_strides(size: Sequence[int]) -> tuple[int, ...]:
+    strides = []
+    running = 1
+    for extent in reversed(size):
+        strides.append(running)
+        running *= max(int(extent), 1)
+    return tuple(reversed(strides))
+
+
+def get_fill_order(
+    seq: Sequence, shape_env=None
+) -> Sequence[int]:
+    """The order the dimensions are filled in, which is the strides sorted.
+
+    Sorting is over the values, so the innermost dimension is the one with the
+    smallest stride.  When the strides are symbolic the comparison may not be
+    settled, and the order that comes back is then one to optimize with rather
+    than one to decide anything with.
+    """
+
+    import sympy
+
+    if shape_env is None or all(isinstance(s, (int, sympy.Integer)) for s in seq):
+        sorted_idx = argsort(seq)
+    else:
+        sorted_idx = argsort_sym(shape_env, seq)
+    return sorted_idx
+
+
+def stride_order2fill_order(order: Sequence) -> Sequence[int]:
+    """The fill order that a stride order describes.
+
+    A stride order says which dimension has the first stride, the second
+    stride, and so on; the fill order says which dimension is filled first, and
+    the two are inverses of each other.  Channels last, a stride order of
+    ``[3, 0, 2, 1]``, is a fill order of ``[1, 3, 2, 0]``.
+    """
+
+    lookup = {pos: idx for idx, pos in enumerate(order)}
+    fill_order = [lookup[i] for i in range(len(order))]
+    return fill_order
+
+
+def get_stride_order(
+    seq: Sequence, shape_env=None
+) -> Sequence[int]:
+    """The stride order of a sequence of strides."""
+
+    sorted_idx = get_fill_order(seq, shape_env)
+    out = [0 for _ in range(len(seq))]
+    for i, elem in enumerate(sorted_idx):
+        out[elem] = i
+    return out
+
+
+def is_contiguous_strides_for_shape(
+    stride: Sequence, shape: Sequence
+) -> bool:
+    """Whether these strides address a shape as one unbroken run.
+
+    An extent of one is skipped, since it addresses a single element however
+    it is strided, and a stride is accepted either as the running product of
+    the extents inside it or as the running product without the extents of
+    one, because both describe the same addresses.
+    """
+
+    import sympy
+
+    from tensorplay.graph.experimental.sympy_functions import Max
+
+    expected_stride = 1
+    expected_stride_max = 1
+    for x, y in reversed(tuple(zip(shape, stride))):
+        if x == 1:
+            continue
+
+        if not V.graph.sizevars.statically_known_equals(
+            y, expected_stride
+        ) and not V.graph.sizevars.statically_known_equals(y, expected_stride_max):
+            return False
+
+        expected_stride_max *= Max(1, x)
+        expected_stride *= x
+
+    return True
+
+
+def get_align_for_dtype(dtype) -> int:
+    """How many elements of this type make up one aligned access."""
+
+    return config.padding_alignment_bytes // dtype.itemsize
+
+
+def compute_required_storage_length(shape, strides, storage_offset):
+    """How many elements of storage a tensor of this geometry occupies."""
+
+    from .utils import compute_required_storage_length as _impl
+
+    return _impl(shape, strides, storage_offset)
+
+
+def make_channels_last_strides_for(shape):
+    """The strides of a tensor whose channels are outermost, whatever its rank."""
+
+    from .utils import make_channels_last_strides_for as _impl
+
+    return _impl(shape)
+
+
+def _fixed_indexer(size: Sequence, stride: Sequence, offset=0):
+    """A closure holding the arithmetic that reads one element of a layout.
+
+    The arithmetic is built once and then applied to an index per access, so a
+    kernel that reads many elements of the same buffer pays for the address
+    computation once rather than once per element.
+    """
+
+    def indexer(index: Sequence):
+        if not (stride is not None and len(index) == len(stride)):
+            raise AssertionError(
+                "Expected stride is not None and len(index) == len(stride)"
+            )
+        if len(index) != len(size):
+            raise AssertionError("Expected len(index) == len(size)")
+        result = offset
+        for idx, st, sz in zip(index, stride, size):
+            if sz != 1:
+                result = result + idx * st
+        return result
+
+    return indexer
+
+
+def prod(values) -> int:
+    out = 1
+    for v in values:
+        out *= int(v)
+    return out

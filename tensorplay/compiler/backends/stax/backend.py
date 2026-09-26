@@ -48,6 +48,19 @@ _STAX_OPTIONS = (
     "stax.coordinate_descent_tuning",
 )
 
+def _is_scalar(value: Any) -> bool:
+    """Whether a captured graph argument is a plain Python number.
+
+    A graph walk has to tell a constant apart from a produced value before it
+    can emit one: a constant becomes a literal inside the kernel body, while a
+    produced value becomes a load.  Booleans count as numbers here because a
+    captured ``True``/``False`` is written into the body as 1.0/0.0, and
+    complex is excluded because a kernel body has no complex literal form.
+    """
+
+    return isinstance(value, (bool, int, float))
+
+
 def list_mode_options(mode: str | None = None) -> dict[str, Any]:
     """Return the optimization options each compile ``mode`` selects.
 
@@ -199,6 +212,12 @@ def _lower_stax_region(
         # machine must not import Triton or its compiler toolchain.
         def build_loop_region():
             from ..._core.aot_autograd import aot_module_simplified
+            from .codegen.common import required_features, select_backend
+            from .loops import promotes_on_load
+
+            def contiguous(value):
+                is_contiguous = getattr(value, "is_contiguous", None)
+                return True if is_contiguous is None else bool(is_contiguous())
             from .loop_compile import (
                 NotLowerable,
                 compile_half,
@@ -208,15 +227,41 @@ def _lower_stax_region(
             def compile_half_or_none(half, half_inputs, **_ignored):
                 # The half arrives with the values it reads; what they are is
                 # the boundary's decision, and this only compiles the half.
-                # Which printer runs is the device's: the same IR, printed as
-                # Triton for an accelerator and as a host kernel otherwise.
-                if on_cuda:
-                    return compile_half(
-                        half, half_inputs,
-                        max_autotune=max_autotune,
-                        coordinate_descent_tuning=coordinate_descent_tuning,
+                # Which printer runs is read off what the half needs and what
+                # each emitter declares, not off which device the tensors
+                # happen to live on: the device only says where to start when
+                # a half needs nothing in particular.
+                needed = required_features(
+                    strided_inputs=any(
+                        not contiguous(value) for value in half_inputs
+                    ),
+                    mixed_dtypes=len({
+                        str(getattr(value, "dtype", "")) for value in half_inputs
+                    }) > 1,
+                    promoted_inputs=any(
+                        promotes_on_load(getattr(value, "dtype", None))
+                        for value in half_inputs
+                    ),
+                    grad_inputs=any(
+                        getattr(value, "requires_grad", False)
+                        for value in half_inputs
+                    ),
+                )
+                printer = select_backend(needed, "cuda" if on_cuda else "cpu")
+                if printer is None:
+                    # Nothing this device declares can print the half: the
+                    # region runs as the framework wrote it, which is what the
+                    # caller's own fallback is for.
+                    raise NotLowerable(
+                        f"no emitter for {needed} on this device"
                     )
-                return compile_half_host(half, half_inputs)
+                if printer == "cpp":
+                    return compile_half_host(half, half_inputs)
+                return compile_half(
+                    half, half_inputs,
+                    max_autotune=max_autotune,
+                    coordinate_descent_tuning=coordinate_descent_tuning,
+                )
 
             try:
                 # One boundary owns the region: it traces the joint graph,
@@ -230,13 +275,15 @@ def _lower_stax_region(
                     bw_compiler=compile_half_or_none,
                 )
             except (NotLowerable, NotImplementedError) as exc:
-                # An operator or a form this lowering does not cover: the next
-                # route is the answer, and only for that reason.  Saying which
-                # form is what lets the coverage of this route be measured
+                # A form the device's emitter cannot print.  Which emitter
+                # runs is read from what it declares before anything is
+                # attempted, so what arrives here is a form no emitter on this
+                # device covers, and the region runs as the framework wrote it.
+                # Saying which form is what lets that coverage be measured
                 # instead of guessed.
                 if os.environ.get("TP_LOOP_ROUTE_DEBUG"):
                     print(
-                        f"[stax-loops] declined: {type(exc).__name__}: {exc}",
+                        f"[stax-loops] unprinted: {type(exc).__name__}: {exc}",
                         file=sys.stderr,
                     )
                 return None

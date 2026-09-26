@@ -1,1793 +1,7158 @@
-"""Runtime C++ code generation for fused CPU pointwise programs.
-
-The captured program — a flat, topologically ordered instruction list —
-is rendered as straight-line C++ that runs explicit ``Vectorized`` SIMD
-operations (SLEEF-backed transcendentals included) inside the in-tree
-OpenMP worksharing bridge, compiled once by the system compiler, cached
-by content hash, and loaded as a Python callable.
-
-Code structure per kernel:
-
-* a four-vector unrolled main loop (independent chains give the scheduler
-  instructions to interleave) used when the program is short enough to keep
-  register pressure sane;
-* a single-vector loop covering the mid body;
-* a scalar tail handling the final partial vector through the partial-width
-  ``loadu``/``store`` overloads.
-
-Layouts the flat emitter cannot prove contiguous (column broadcasts,
-per-row scalars, strided rows, row-broadcast widths no vector peel can
-align) switch the loop nest to a row-structured plan instead: an outer
-row loop carries per-row base pointers and hoisted per-row scalars while
-the same three loop phases run along the row.  Layouts the row plan
-cannot address either -- inputs whose element address is contiguous along
-the outer axis (the transposed family) -- switch to the tile plan: the
-parallel range counts row tiles of the vector width, and each such input's
-W-by-W tile is staged through a transposed buffer once per tile so the
-vector loads along the column stay contiguous.
-
-Every data pointer is ``__restrict__``-qualified and the hot loops carry
-``#pragma GCC ivdep`` so the compiler can reorder loads and stores freely.
-Constants are materialized once per body, outside all loops.
-
-The supported operation surface covers the pointwise fused set plus the
-comparison/``where``/order-relation extension: comparisons yield 0.0f/1.0f
-lanes (the same boolean value domain the program interpreter uses), and
-``where`` selects through ``blendv`` driven by the raw comparison mask.
-
-Compilation uses the same multi-tier capability scheme as the in-tree
-kernels: a dry-compile probe selects the SIMD tier, and the tier's
-compiler definitions and architecture flags are applied verbatim.  All
-vector math therefore matches the interpreter path bit-for-bit.
-
-The module degrades gracefully: without a system compiler, without the
-development headers, on unsupported programs, or on any build/load failure
-it returns ``None`` and callers keep the generic kernel path.
-``TP_STAX_CPU_NATIVE=0`` disables the path outright.
-"""
-
 from __future__ import annotations
 
-import ctypes
-import hashlib
+import contextlib
+import dataclasses
+import functools
+import itertools
+import logging
 import math
+import operator
 import os
-from typing import Any, Callable, Optional
+import re
+import sys
+import warnings
+from collections.abc import Callable, Sequence
+from enum import Enum
+from typing import Any, cast, ClassVar, Literal, Optional
 
-from ..codecache import default_cache, file_lock
-from ..cpp_builder import (
-    CppBuilder,
-    CppOptions,
-    get_compiler_version_info,
-    get_cpp_compiler,
-    package_paths,
+import sympy
+
+import tensorplay as tp
+from tensorplay.graph import Graph, Node
+from tensorplay.graph.experimental.sympy_functions import (
+    CeilDiv,
+    FloorDiv,
+    ModularIndexing,
+    OrderedSet,
+    SymT,
+    free_symbol_is_type,
+    symbol_is_type,
 )
-from ..cpu_vec_isa import VecISA, pick_vec_isa
-from .index_expr import (
-    Const as _IxC,
-    Symbol as _IxS,
-    affine_coeff as _ix_affine,
-    modular_indexing as _ix_mod,
-    render as _ix_render,
+from tensorplay.primitives.common import is_float_dtype, is_integer_dtype
+
+from .. import config, cpp_builder, cpu_vec_isa, dependencies, ir, metrics
+from ..loops import ops, V
+from ..ops_handler import NullKernelHandler, OpsValue
+from ..loop_body import LoopBody
+from ..kernel_scheduler import (
+    BaseSchedulerNode,
+    BaseScheduling,
+    ExternKernelSchedulerNode,
+    ForeachKernelSchedulerNode,
+    FusedSchedulerNode,
+    Scheduler,
+    SchedulerNode,
+)
+from ..sizevars import stride_at_vec_range
+from ..utils import (
+    cache_on_self,
+    get_bounds_index_expr,
+    get_fused_kernel_name,
+    get_num_threads,
+    has_free_symbols,
+    is_multi_outputs_template,
+    is_welford_reduction,
+    parallel_num_threads,
+    Placeholder,
+    sympy_index_symbol,
+    sympy_index_symbol_with_prefix,
+    sympy_product,
+    sympy_subs,
+)
+from .common import (
+    BackendFeature,
+    BracesBuffer,
+    CSE,
+    CSEVariable,
+    DataTypePropagation,
+    DeferredLine,
+    DTYPE_TO_COMPUTATION_DTYPE,
+    IndentedBuffer,
+    Kernel,
+    KernelArgs,
+    OpOverrides,
+    OptimizationContext,
+)
+from .cpp_utils import (
+    _get_dtype_from_loopbodies,
+    _get_loop_body,
+    cexpr,
+    cexpr_index,
+    codegen_rand,
+    CppCSEVariable,
+    DTYPE_TO_CPP,
+    get_promote_dtype,
+    INDEX_TYPE,
+    LocalBufferContext,
+    may_unify_binary_op_mask_type,
+    promote_args,
+    template_fusion_with_epilogues_supported,
+    unify_mask_base_type,
+    value_to_cpp,
 )
 
-# The four-way unrolled loop is emitted only when replicating the program
-# four times keeps live temporaries within reason; longer programs use the
-# single-vector loop (the compiler still schedules within one vector).
-_UNROLL_MAX_STEPS = 16
 
-_MAX_INPUTS = 16
+_IS_WINDOWS = sys.platform == "win32"
 
-# Instruction surface, keyed by the program's op names.  ``{a}``/``{b}``
-# are the operand placeholders; every expression is a single C++ rvalue.
-_BINARY_EXPR: dict[str, str] = {
-    "add": "({a} + {b})",
-    "sub": "({a} - {b})",
-    "mul": "({a} * {b})",
-    "div": "({a} / {b})",
-    "pow": "{a}.pow({b})",
-}
-_COMPARE_EXPR: dict[str, str] = {
-    "lt": "{a}.lt({b})",
-    "le": "{a}.le({b})",
-    "gt": "{a}.gt({b})",
-    "ge": "{a}.ge({b})",
-    "eq": "{a}.eq({b})",
-    "ne": "{a}.ne({b})",
-}
-_ORDER_EXPR: dict[str, str] = {
-    "minimum": "tensorplay::vec::minimum({a}, {b})",
-    "maximum": "tensorplay::vec::maximum({a}, {b})",
-    "clamp_min": "tensorplay::vec::maximum({a}, {b})",
-    "clamp_max": "tensorplay::vec::minimum({a}, {b})",
-}
-_UNARY_EXPR: dict[str, str] = {
-    "neg": "(-{a})",
-    "pos": "{a}",
-    "abs": "{a}.abs()",
-    "sin": "{a}.sin()",
-    "cos": "{a}.cos()",
-    "exp": "{a}.exp()",
-    "log": "{a}.log()",
-    "sigmoid": "(V(1.0f) / (V(1.0f) + (-{a}).exp()))",
-    "sqrt": "{a}.sqrt()",
-    "square": "({a} * {a})",
-    "tanh": "{a}.tanh()",
-    "relu": "tensorplay::vec::maximum({a}, V(0.0f))",
-    "relu_grad": "{a}.gt(V(0.0f))",
-    "abs_grad": "({a}.gt(V(0.0f)) - {a}.lt(V(0.0f)))",
-    "rsqrt": "{a}.rsqrt()",
-    "exp2": "{a}.exp2()",
-    "erf": "{a}.erf()",
-}
-_BINARY_OPS = frozenset(_BINARY_EXPR) | frozenset(_COMPARE_EXPR) | frozenset(_ORDER_EXPR)
-_UNARY_OPS = frozenset(_UNARY_EXPR)
 
-# float32 identity is the only cast the float-domain kernel can express;
-# other targets keep the graph on the interpreter/Triton paths.
-_F32_CAST_ID = 3
+@functools.cache
+def get_export_declaration():
+    return "__declspec(dllexport)" if _IS_WINDOWS else ""
+
+
+schedule_log = logging.getLogger(__name__)
+
+NATIVE_OMP_RTYPES = OrderedSet(["+", "*", "^", "||", "min", "max"])
+RTYPE_TO_CPP = {
+    "sum": "+",
+    "prod": "*",
+    "xor_sum": "^",
+    "min": "min",
+    "max": "max",
+    "argmin": "argmin",
+    "argmax": "argmax",
+    "any": "||",
+    "welford_reduce": "welford",
+    "welford_combine": "welford",
+}
+VECTORIZABLE_RTYPES = OrderedSet(
+    [
+        "max",
+        "min",
+        "sum",
+        "prod",
+        "xor_sum",
+        "welford_reduce",
+        "welford_combine",
+        "argmin",
+        "argmax",
+        "any",
+    ]
+)
+
+PYTHON_TO_CPP = {
+    "Tensor": "tensorplay::Tensor",
+    "int": "long",
+    "float": "double",
+    "bool": "bool",
+    "str": "std::string",
+    "ScalarType": "tensorplay::ScalarType",
+    "MemoryFormat": "tensorplay::MemoryFormat",
+    "Layout": "tensorplay::Layout",
+    "Device": "tensorplay::Device",
+    "number": "tensorplay::Scalar",
+}
+
+CONTAINER_PYTHON_TO_CPP = {
+    "List": "std::vector",
+    "Optional": "std::optional",
+}
+
+DTYPE_LOWP_FP = [
+    tp.bfloat16,
+    tp.float16,
+]
+
+VECTORIZABLE_DTYPES: list[tp.dtype] = [
+    tp.float64,
+    tp.float,
+    tp.bfloat16,
+    tp.float16,
+    tp.bool,
+    tp.uint8,
+    tp.int8,
+    tp.int32,
+    tp.int64,
+    tp.float8_e4m3fn,
+    tp.float8_e5m2,
+]
+
+
+def reduction_init(reduction_type, dtype):
+    if dtype in DTYPE_LOWP_FP:
+        # Since load promotes all half-precision inputs to float, the initial
+        # constant for reduction must be promoted as well
+        dtype = tp.float32
+    if reduction_type in ("xor_sum", "sum", "any"):
+        return 0
+    if reduction_type == "prod":
+        return 1
+    if reduction_type in ("max", "argmax", "min", "argmin"):
+        cdtype = DTYPE_TO_CPP[dtype]
+        if dtype == tp.bool and reduction_type in ("argmin", "argmax"):
+            cdtype = DTYPE_TO_CPP[tp.float]
+        min_var = (
+            f"-std::numeric_limits<{cdtype}>::infinity()"
+            if is_float_dtype(dtype)
+            else f"std::numeric_limits<{cdtype}>::min()"
+        )
+        max_var = (
+            f"std::numeric_limits<{cdtype}>::infinity()"
+            if is_float_dtype(dtype)
+            else f"std::numeric_limits<{cdtype}>::max()"
+        )
+        init_var = min_var if reduction_type in ("max", "argmax") else max_var
+        return (
+            init_var
+            if reduction_type in ("max", "min")
+            else f"IndexValue<{cdtype}>{{0, {init_var}}}"
+        )
+    if is_welford_reduction(reduction_type):
+        return f"Welford<{DTYPE_TO_CPP[dtype]}>()"
+    raise AssertionError(reduction_type)
+
+
+def reduction_acc_type(reduction_type, dtype):
+    scalar_type = DTYPE_TO_CPP[DTYPE_TO_COMPUTATION_DTYPE[dtype]]
+    if is_welford_reduction(reduction_type):
+        return f"Welford<{scalar_type}>"
+    if reduction_type in ("argmin", "argmax"):
+        if dtype == tp.bool:
+            scalar_type = DTYPE_TO_CPP[tp.float]
+        return f"IndexValue<{scalar_type}>"
+    return scalar_type
+
+
+def reduction_combine(
+    reduction_type,
+    var,
+    next_value,
+    helper_val=None,
+    index: sympy.Expr | CSEVariable | None = None,
+    src_dtype=None,
+):
+    is_bool = src_dtype == tp.bool
+    if reduction_type == "sum":
+        if helper_val:
+            return f"cascade_sum_combine({next_value}, &{helper_val})"
+        else:
+            conjunction = "|" if is_bool else "+"
+            return f"{var} {conjunction} {next_value}"
+    if reduction_type == "prod":
+        return f"{var} * {next_value}"
+    if reduction_type == "xor_sum":
+        return f"{var} ^ {next_value}"
+    if reduction_type == "any":
+        return f"{var} || {next_value}"
+    if reduction_type in ("min", "max"):
+        return f"{reduction_type}_propagate_nan({var}, {next_value})"
+    if reduction_type == "welford_reduce":
+        if helper_val:
+            return f"welford_combine({var}, {next_value}, &{helper_val})"
+        else:
+            return f"welford_combine({var}, {next_value})"
+    if reduction_type == "welford_combine":
+        if isinstance(next_value, tuple):
+            mean, m2, weight = next_value
+        else:
+            mean, m2, weight = reduction_project(reduction_type, next_value)
+        return f"welford_combine({var}, {{{mean}, {m2}, {weight}}})"
+    if reduction_type in ("argmin", "argmax"):
+        if (
+            hasattr(next_value, "dtype")
+            and next_value.dtype == tp.bool
+            and not next_value.is_vec
+        ):
+            if index is not None:
+                return f"{reduction_type}_combine({var}, static_cast<float>({next_value}), {index})"
+            else:
+                return (
+                    f"{reduction_type}_combine({var}, static_cast<float>({next_value}))"
+                )
+        if index is not None:
+            return f"{reduction_type}_combine({var}, {next_value}, {index})"
+        else:
+            return f"{reduction_type}_combine({var}, {next_value})"
+    raise AssertionError(reduction_type)
+
+
+def reduction_project(reduction_type, acc):
+    if is_welford_reduction(reduction_type):
+        return f"{acc}.mean", f"{acc}.m2", f"{acc}.weight"
+    elif reduction_type in ("argmin", "argmax"):
+        return f"{acc}.index"
+    return acc
+
+
+def move_code_under_inner_loop(
+    code: IndentedBuffer,
+    iter_var: sympy.Expr,
+    new_iter_var: str,
+    loop_start: sympy.Expr,
+    loop_end: sympy.Expr,
+) -> BracesBuffer:
+    r"""
+    f(iter_var) is transformed to f(new_iter_var) under the inner loop
+      \/
+    for (new_iter_var = loop_start; new_iter_var < loop_end; new_iter_var++) {
+        f(new_iter_var)
+    }
+    Please be careful while using this function,
+    as the variable defined in f(iter_var) will be invalid outside the for loop.
+    For example:
+    auto tmp0 = in_ptr[x0]; ->
+    for (new_x0 = start; new_x0 < end; new_x0++){
+        auto tmp0 = in_ptr[new_x0];
+    }
+    The tmp0 is invalid outside the loop.
+    """
+    transformed_code = BracesBuffer()
+    with contextlib.ExitStack() as stack:
+        transformed_code.writeline(
+            f"for ({INDEX_TYPE} {new_iter_var} = {cexpr_index(loop_start)};"
+            + f"{new_iter_var} < {cexpr_index(loop_end)}; {new_iter_var}++)"
+        )
+        stack.enter_context(transformed_code.indent())
+        for _, line in enumerate(code._lines):
+            if not (
+                isinstance(
+                    line,
+                    (
+                        str,
+                        DeferredLine,
+                    ),
+                )
+            ):
+                raise AssertionError(
+                    "expected isinstance( line, ( str, DeferredLine, ), )"
+                )
+            deferred_name = None
+            if isinstance(line, DeferredLine):
+                deferred_name = line.name
+                line = line.line
+            new_line = re.sub(r"\b" + f"{iter_var}" + r"\b", f"{new_iter_var}", line)
+            if deferred_name:
+                new_line = DeferredLine(deferred_name, new_line)  # type: ignore[assignment]
+            transformed_code.writeline(new_line)
+    return transformed_code
+
+
+def reduction_prefix_array(
+    acc_var: str | CSEVariable,
+    acc_type: str,
+    reduction_type: str,
+    dtype: tp.dtype,
+    len: str | int,
+    init_fn,
+):
+    """
+    MSVC don't support dynamic array(VLA). So we use std::unique_ptr here.
+    Ref: https://stackoverflow.com/questions/56555406/creating-dynamic-sized-array-using-msvc-c-compiler
+    MSVC is the only one compiler without VLA. support. Since MSVC can't get good performance here.
+    We just use unique_ptr make it works on MSVC.
+    For other compilers, we continue to use VLA to get best performance.
+    """
+    code_buffer = IndentedBuffer()
+    acc_decl = (
+        f"auto {acc_var}_arr = std::make_unique<{acc_type}[]>({len});"
+        if cpp_builder.is_msvc_cl()
+        else f"{acc_type} {acc_var}_arr[{len}];"
+    )
+    code_buffer.writeline(f"{acc_decl}")
+    code_buffer.writelines(
+        [
+            f"for (int i = 0; i < {len}; i++)",
+            "{",
+            f"    {acc_var}_arr[i] = {init_fn(reduction_type, dtype)};",
+            "}",
+        ],
+    )
+    return code_buffer
+
+
+def replace_acc_name(buffer: IndentedBuffer, name: str, new_name: str):
+    for i, line in enumerate(buffer._lines):
+        if not (
+            isinstance(
+                line,
+                (
+                    str,
+                    DeferredLine,
+                ),
+            )
+        ):
+            raise AssertionError("expected isinstance( line, ( str, DeferredLine, ), )")
+        if isinstance(line, DeferredLine):
+            line.line = re.sub(r"\b" + f"{name}" + r"\b", f"{new_name}", line.line)
+        else:
+            buffer._lines[i] = re.sub(r"\b" + f"{name}" + r"\b", f"{new_name}", line)
+
+
+def replace_cascade_sum_with_add(buffer: IndentedBuffer):
+    """
+    Replaces `acc = cascade_sum_combine(value, ...)` with `acc = acc + value;`
+    """
+
+    pattern = r"(.*?)\s*=\s*cascade_sum_combine\(([^,]+),.*?\);"
+    for i, line in enumerate(buffer._lines):
+        if not (
+            isinstance(
+                line,
+                (
+                    str,
+                    DeferredLine,
+                ),
+            )
+        ):
+            raise AssertionError("expected isinstance( line, ( str, DeferredLine, ), )")
+        content = line.line if isinstance(line, DeferredLine) else line
+        match = re.search(pattern, content)
+        if match:
+            acc, value = match.groups()
+            new_content = re.sub(pattern, f"{acc} = {acc} + {value};", content)
+            if isinstance(line, DeferredLine):
+                line.line = new_content
+            else:
+                buffer._lines[i] = new_content
+
+
+@dataclasses.dataclass
+class ParallelDepth:
+    """
+    A class representing parallel depth.
+    Includes the starting depth of parallelism and the depth of parallelism.
+    """
+
+    parallel_depth: int
+    start_depth: int
+
+
+class OuterLoopFusedSchedulerNode(FusedSchedulerNode):
+    @classmethod
+    def fuse(  # type: ignore[override]
+        cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode, outer_loop_fusion_depth
+    ):
+        if node1.scheduler is not node2.scheduler:
+            raise AssertionError("expected node1.scheduler is node2.scheduler")
+        if not (
+            all(
+                type(node)
+                in (
+                    OuterLoopFusedSchedulerNode,
+                    SchedulerNode,
+                    FusedSchedulerNode,
+                )
+                for node in (node1, node2)
+            )
+        ):
+            raise AssertionError(
+                "expected all nodes to be OuterLoopFusedSchedulerNode, "
+                "SchedulerNode, or FusedSchedulerNode"
+            )
+        if any(type(node) is OuterLoopFusedSchedulerNode for node in (node1, node2)):
+            return cls(
+                node1.scheduler,
+                # pyrefly: ignore [bad-argument-type]
+                (
+                    list(node1.get_outer_nodes())
+                    if type(node1) is OuterLoopFusedSchedulerNode
+                    else [
+                        node1,
+                    ]
+                )
+                + (
+                    list(node2.get_outer_nodes())
+                    if type(node2) is OuterLoopFusedSchedulerNode
+                    else [
+                        node2,
+                    ]
+                ),
+                outer_loop_fusion_depth,
+            )
+        else:
+            return cls(node1.scheduler, [node1, node2], outer_loop_fusion_depth)  # type: ignore[list-item]
+
+    def __init__(
+        self,
+        scheduler: "Scheduler",
+        outer_fused_nodes: list[FusedSchedulerNode | SchedulerNode],
+        outer_loop_fusion_depth,
+    ):
+        self.outer_fused_nodes: list[FusedSchedulerNode | SchedulerNode] = (
+            outer_fused_nodes
+        )
+        self.outer_loop_fusion_depth = outer_loop_fusion_depth
+        flatten_snodes = []
+        for _node in self.outer_fused_nodes:
+            if not isinstance(_node, (SchedulerNode, FusedSchedulerNode)):
+                raise AssertionError(
+                    "expected isinstance(_node, (SchedulerNode, FusedSchedulerNode))"
+                )
+            flatten_snodes.extend(list(_node.get_nodes()))
+        super().__init__(scheduler, flatten_snodes)  # type: ignore[arg-type]
+
+    def get_outer_nodes(self):
+        return self.outer_fused_nodes
+
+    def check_outer_fusion_loop_level_attr(
+        self, cpp_kernel_proxy_list, outer_loop_fusion_depth
+    ):
+        # This function ensures that the same tiling split is applied at each loop level within the outer loop fusion depth.
+        # In the fusion stage, we only examine nodes with same vars and reduce.
+        # However, for nodes with same vars and reduce, the loops may still have different tile splits.
+        # For example (test_expr_vec_non_contiguous in test_cpu_repro.py):
+        #   * buf0 tiling along the 2nd loop level, buf1 tiling along the 3rd loop level.
+        # If the check failed, we should fall back to standard loop codegen.
+        def _inner(
+            left_loop_nest: LoopNest,
+            right_loop_nest: LoopNest,
+            loop_fusion_depth: int,
+            current_checking_depth: int,
+        ) -> bool:
+            if not left_loop_nest.loops:
+                raise AssertionError("expected left_loop_nest.loops")
+            if not right_loop_nest.loops:
+                raise AssertionError("expected right_loop_nest.loops")
+            left_loop_level = left_loop_nest.loops[current_checking_depth]
+            right_loop_level = right_loop_nest.loops[current_checking_depth]
+            # Check if same loop level attr
+            outer_loops_attr_compare_list = [
+                "var",
+                "size",
+                "offset",
+                "steps",
+            ]
+            if not (
+                all(
+                    getattr(left_loop_level, attr_compare)
+                    == getattr(right_loop_level, attr_compare)
+                    for attr_compare in outer_loops_attr_compare_list
+                )
+            ):
+                return False
+
+            if loop_fusion_depth < 1:
+                raise AssertionError("expected loop_fusion_depth >= 1")
+            if (loop_fusion_depth := loop_fusion_depth - 1) > 0:
+                # Check next loop level attr
+                current_checking_depth = current_checking_depth + 1
+                if current_checking_depth >= len(left_loop_nest.loops):
+                    raise AssertionError(
+                        "expected current_checking_depth < len(left_loop_nest.loops)"
+                    )
+                if current_checking_depth >= len(right_loop_nest.loops):
+                    raise AssertionError(
+                        "expected current_checking_depth < len(right_loop_nest.loops)"
+                    )
+                if not _inner(
+                    left_loop_nest,
+                    right_loop_nest,
+                    loop_fusion_depth,
+                    current_checking_depth,
+                ):
+                    return False
+
+            return True
+
+        for idx in range(len(cpp_kernel_proxy_list) - 1):
+            left_loop_nest = cpp_kernel_proxy_list[idx].loop_nest
+            right_loop_nest = cpp_kernel_proxy_list[idx + 1].loop_nest
+            if not _inner(
+                left_loop_nest,
+                right_loop_nest,
+                outer_loop_fusion_depth,
+                0,
+            ):
+                return False
+
+        for cpp_kernel_proxy in cpp_kernel_proxy_list:
+            outer_ranges = functools.reduce(
+                operator.mul,
+                cpp_kernel_proxy.ranges[:outer_loop_fusion_depth],
+            )
+            # When the range of the first inner loop is much larger than the range of
+            # all outer loops, do not fuse outer loop and fallback to standard loop codegen,
+            # so that the inner loops with larger range have a chance to be parallelized.
+            # We set a conservative threshold here:
+            # First inner loop range / all outer loops range > 300.
+            if (
+                len(cpp_kernel_proxy.ranges) > outer_loop_fusion_depth
+                and isinstance(outer_ranges, sympy.Integer)
+                and isinstance(
+                    cpp_kernel_proxy.ranges[outer_loop_fusion_depth],
+                    sympy.Integer,
+                )
+                and outer_ranges * 300
+                < cpp_kernel_proxy.ranges[outer_loop_fusion_depth]
+            ):
+                return False
+
+        return True
+
+    def merge_outer_fusion_kernels(
+        self,
+        cpp_kernel_proxy_list,
+    ):
+        kernel_group = cpp_kernel_proxy_list[0].kernel_group
+        outer_loop_fused_kernel = OuterLoopFusedKernel(kernel_group)
+        outer_loop_fused_kernel.inner = [
+            proxy.loop_nest.from_loop_level(self.outer_loop_fusion_depth)
+            for proxy in cpp_kernel_proxy_list
+        ]
+        outer_fused_proxy = cpp_kernel_proxy_list[0]
+        outer_fused_proxy.loop_nest.kernel = outer_loop_fused_kernel
+        outer_fused_proxy.loop_nest.loops = outer_fused_proxy.loop_nest.loops[
+            : self.outer_loop_fusion_depth
+        ]
+        return outer_fused_proxy
+
+
+class RecordOptimizationContext:
+    def __init__(self, func_name: str = ""):
+        self.func_name = func_name
+        self.current_node: Node | None = None
+        self.opt_ctx: OptimizationContext | None = None
+
+    def __enter__(self):
+        if not V.interpreter:
+            raise AssertionError("expected V.interpreter")
+        if not V.interpreter.current_node:
+            raise AssertionError("expected V.interpreter.current_node")
+
+        self.current_node = V.interpreter.current_node
+        if self.current_node is None:
+            raise AssertionError("expected self.current_node is not None")
+        if OptimizationContext.key in self.current_node.meta:
+            self.opt_ctx = self.current_node.meta[OptimizationContext.key]
+        else:
+            self.opt_ctx = OptimizationContext()
+        if self.opt_ctx is None:
+            raise AssertionError("expected self.opt_ctx is not None")
+        self.opt_ctx.ops_name = self.func_name
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self.current_node:
+            raise AssertionError("expected self.current_node")
+        if not self.opt_ctx:
+            raise AssertionError("expected self.opt_ctx")
+        self.current_node.meta[OptimizationContext.key] = self.opt_ctx
+
+    def get_opt_ctx(self):
+        return self.opt_ctx
+
+    def get_fx_node(self):
+        if not self.current_node:
+            raise AssertionError("expected self.current_node")
+        return self.current_node
+
+
+def arith_promoted(op, a, b):
+    args = (a, b)
+    if any(isinstance(arg, CppCSEVariable) and arg.is_vec for arg in args):
+        raise AssertionError("Promotion of vector types is not supported")
+
+    dtype = get_promote_dtype(args)
+    cpp_type = DTYPE_TO_CPP[dtype] if dtype is not None else f"decltype({a})"
+    if dtype in (tp.int32, tp.int64):
+        # signed overflow is UB in C++; int8/int16 promote to int and cannot overflow
+        cast = f"static_cast<std::make_unsigned_t<{cpp_type}>>"
+        return f"{cpp_type}({cast}({a}) {op} {cast}({b}))"
+    return f"{cpp_type}({a} {op} {b})"
+
+
+class CppOverrides(OpOverrides):
+    """Map element-wise ops to C++"""
+
+    @staticmethod
+    def add(a, b):
+        return arith_promoted("+", a, b)
+
+    @staticmethod
+    def sub(a, b):
+        return arith_promoted("-", a, b)
+
+    @staticmethod
+    def mul(a, b):
+        return arith_promoted("*", a, b)
+
+    @staticmethod
+    def to_dtype(x, dtype, src_dtype=None, use_compute_types=True):
+        if not isinstance(x, CppCSEVariable):
+            raise AssertionError("expected isinstance(x, CppCSEVariable)")
+        if src_dtype is None:
+            src_dtype = x.dtype
+        expr = V.kernel.get_to_dtype_expr(x, dtype, src_dtype)
+        csevar = V.kernel.cse.generate(V.kernel.compute, expr)
+        csevar.update_on_args("to_dtype", (x, dtype), {"src_dtype": src_dtype})
+        if (
+            use_compute_types
+            and dtype in DTYPE_LOWP_FP
+            and src_dtype == tp.float
+            and not config.emulate_precision_casts
+        ):
+            """
+            For FusedSchedulerNode[node1, node2], the node2 loads what node1 stores and the buffer is
+            in low-precision floating point data type. When the output of node1 also serves as the output of the
+            kernel, the result of nodes would be different from the case when output of node1 is not the output
+            of the kernel (where we don't need to insert `to_dtype` for legalization). To address the problem, on
+            storing the lowp node1 output, we also add the inverse dtype conversion to high precision data type
+            to the cse cache.
+
+            Example (pseudo code):
+                node1_output = ...
+                node1_output_lowp = to_dtype(node1_output, dtype=tp.bfloat16)
+                store(buf, node1_output_lowp)
+                node2_input_lowp = load(buf)
+                node2_input = to_dtype(node2_input_lowp, dtype=tp.float)
+
+            Without cse cache trick:
+                node1_output = ...
+                node1_output_lowp = to_dtype(node1_output, dtype=tp.bfloat16)
+                store(buf, node1_output_lowp)
+                node2_input_lowp = node_output_lowp # hit store cache
+                node2_input = to_dtype(node2_input_lowp, dtype=tp.float)
+
+            With cse cache trick:
+                node1_output = ...
+                node1_output_lowp = to_dtype(node1_output, dtype=tp.bfloat16)
+                # also add `to_dtype(node1_input_lowp, dtype=tp.float)` -> `node1_output` to cse cache
+                store(buf, node1_output_lowp)
+                node2_input_lowp = node_output_lowp # hit store cache
+                node2_input = node1_output # hit cse cache
+
+            This cache trick skips the lowp->fp32 round-trip rounding, so it is
+            disabled under emulate_precision_casts, where that rounding must be
+            preserved (e.g. an explicit fp32->fp16->fp32 user cast). See #185337.
+            """
+            V.kernel.cache_dtype_convert(x, src_dtype, csevar, dtype)
+        return csevar
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def round_to_int(x, dtype, src_dtype=None, use_compute_types=True):
+        if not isinstance(x, CppCSEVariable):
+            raise AssertionError("expected isinstance(x, CppCSEVariable)")
+        if src_dtype is None:
+            src_dtype = x.dtype
+        expr = V.kernel.get_to_dtype_expr(x, dtype, src_dtype, rounding=True)
+        csevar = V.kernel.cse.generate(V.kernel.compute, expr)
+        csevar.update_on_args("round_to_int", (x, dtype), {"src_dtype": src_dtype})
+        if (
+            dtype in DTYPE_LOWP_FP
+            and src_dtype == tp.float
+            and not config.emulate_precision_casts
+        ):
+            V.kernel.cache_dtype_convert(x, src_dtype, csevar, dtype)
+        return csevar
+
+    @staticmethod
+    def to_dtype_bitcast(x, dtype, src_dtype):
+        if dtype not in DTYPE_TO_CPP:
+            raise AssertionError(f"{dtype} missing from {__name__}.DTYPE_TO_CPP")
+        return f"tensorplay::bit_cast<{DTYPE_TO_CPP[dtype]}>({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def abs(x):
+        if isinstance(x, CppCSEVariable) and x.dtype in (
+            tp.uint8,
+            tp.uint16,
+            tp.uint32,
+            tp.uint64,
+        ):
+            # abs(x) == x for unsigned types; return identity to avoid
+            # -Wtautological-compare and unsigned unary minus warnings.
+            return f"{x}"
+        return f"std::abs({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def sin(x):
+        return f"std::sin({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def cos(x):
+        return f"std::cos({x})"
+
+    @staticmethod
+    def neg(x):
+        return f"decltype({x})(-{x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def exp(x):
+        # return f"Sleef_expf_u10({x})"
+        return f"std::exp({x})"
+
+    @staticmethod
+    def exp2(x):
+        return f"std::exp2({x})"
+
+    @staticmethod
+    def expm1(x):
+        return f"std::expm1({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def erf(x):
+        return f"std::erf({x})"
+
+    @staticmethod
+    def erfc(x):
+        return f"std::erfc({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def erfinv(x):
+        return f"calc_erfinv({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def sqrt(x):
+        return f"std::sqrt({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def rsqrt(x):
+        return f"1 / std::sqrt({x})"
+
+    @staticmethod
+    def log1p(x):
+        bug = config.cpp.inject_log1p_bug_TESTING_ONLY
+        if bug == "accuracy":
+            return f"{x} + decltype({x})(1)"
+        elif bug is None:
+            return f"std::log1p({x})"
+        else:
+            raise AssertionError(
+                f"unrecognized config cpp.inject_log1p_bug_TESTING_ONLY = {bug!r}"
+            )
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def tan(x):
+        return f"std::tan({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def tanh(x):
+        return f"std::tanh({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def signbit(x):
+        """
+        On windows std::signbit only support float type.
+        Ref: https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/signbit?view=msvc-170
+        """
+        return (
+            f"std::signbit(static_cast<float>({x}))"
+            if _IS_WINDOWS
+            else f"std::signbit({x})"
+        )
+
+    @staticmethod
+    def pow(a, b):
+        return f"std::pow({a}, {b})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def log(x):
+        return f"std::log({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def round(x):
+        return f"std::nearbyint({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def floor(x):
+        return f"std::floor({x})"
+
+    @staticmethod
+    def floordiv(a, b):
+        # a and b are integer type
+        return f"floor_divide_integral({a}, {b})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def ceil(x):
+        return f"std::ceil({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def trunc(x):
+        return f"std::trunc({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def truncdiv(a, b):
+        # a and b are integer type
+        return f"{a} / {b}"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def fmod(a, b):
+        return f"std::fmod({a}, {b})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def isinf(x):
+        return f"std::isinf({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def isnan(x):
+        return f"std::isnan({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def lgamma(x):
+        return f"std::lgamma({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def acos(x):
+        return f"std::acos({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def acosh(x):
+        return f"std::acosh({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def cosh(x):
+        return f"std::cosh({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def sinh(x):
+        return f"std::sinh({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def asin(x):
+        return f"std::asin({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def asinh(x):
+        return f"std::asinh({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def atan2(x, y):
+        return f"std::atan2({x}, {y})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def atan(x):
+        return f"std::atan({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def atanh(x):
+        return f"std::atanh({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def copysign(x, y):
+        return f"std::copysign({x}, {y})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def frexp(x):
+        cache_keys = f"frexp({x})[0]", f"frexp({x})[1]"
+        if all(V.kernel.cse.try_get(cache_key) is not None for cache_key in cache_keys):
+            return tuple(V.kernel.cse.try_get(cache_key) for cache_key in cache_keys)
+
+        code = BracesBuffer()
+        exponent = V.kernel.cse.newvar(dtype=tp.int32, shape=x.shape)
+        mantissa = V.kernel.cse.newvar(dtype=x.dtype, shape=x.shape)
+        code.writeline(f"int32_t {exponent};")
+        code.writeline(f"auto {mantissa} = std::frexp({x}, &{exponent});")
+        V.kernel.compute.splice(code)
+        cse_vars = (mantissa, exponent)
+        for cache_key, cse_var in zip(cache_keys, cse_vars):
+            V.kernel.cse.put(cache_key, cse_var)
+        return mantissa, exponent
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def hypot(x, y):
+        return f"std::hypot({x}, {y})"
+
+    @staticmethod
+    def log10(x):
+        return f"std::log10({x})"
+
+    @staticmethod
+    def log2(x):
+        return f"std::log2({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def ldexp(x, n):
+        return f"std::ldexp({x}, {n})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def nextafter(x, y):
+        return f"std::nextafter({x}, {y})"
+
+    @staticmethod
+    def relu(x):
+        bug = config.cpp.inject_relu_bug_TESTING_ONLY
+        if bug == "compile_error":
+            return "compile error!"
+        elif bug == "runtime_error":
+            return f"{x}; throw 1"
+        elif bug == "accuracy":
+            return f"{x} + decltype({x})(1)"
+        elif bug is None:
+            return f"std::max({x}, decltype({x})(0))"
+        else:
+            raise AssertionError(
+                f"unrecognized config cpp.inject_relu_bug_TESTING_ONLY = {bug!r}"
+            )
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def minimum(a, b):
+        return f"min_propagate_nan({a}, {b})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def maximum(a, b):
+        return f"max_propagate_nan({a}, {b})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def fmaximum(a, b):
+        return f"std::max({a}, {b})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def where(a, b, c):
+        return f"{a} ? {b} : {c}"
+
+    @staticmethod
+    def mod(a, b):
+        return f"mod({a}, {b})"
+
+    @staticmethod
+    def constant(val, dtype):
+        return value_to_cpp(val, DTYPE_TO_CPP[dtype])
+
+    @staticmethod
+    def index_expr(expr, dtype):
+        idx_str = cexpr(V.kernel.rename_indexing(expr))
+        var = V.kernel.cse.generate(
+            V.kernel.compute, idx_str, bounds=get_bounds_index_expr(expr)
+        )
+        return ops.to_dtype(var, dtype)
+
+    @staticmethod
+    def value_expr(expr, dtype):
+        # C++ index_expr already emits the requested dtype, so value_expr has
+        # the same lowering here.
+        return CppOverrides.index_expr(expr, dtype)
+
+    @staticmethod
+    def masked(mask, body, other):
+        code = BracesBuffer()
+
+        # Write masked operation into a lambda
+        body_var = V.kernel.cse.newvar()
+        code.writeline(f"auto {body_var} = [&]")
+        with V.kernel.swap_buffers(code), code.indent():
+            result = body()
+            code.writeline(f"return {result};")
+        code.writeline(";")
+        V.kernel.compute.splice(code)
+
+        # Use the lambda's return type as the type of other
+        other_code = value_to_cpp(other, f"decltype({body_var}())")
+        return f"{mask} ? {body_var}() : {other_code}"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def logical_and(a, b):
+        return f"{a} && {b}"
+
+    @staticmethod
+    def logical_not(a):
+        return f"!{a}"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def logical_or(a, b):
+        return f"{a} || {b}"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def logical_xor(a, b):
+        return f"{a} != {b}"
+
+    @staticmethod
+    def bitwise_and(a, b):
+        return f"decltype({a})({a} & {b})"
+
+    @staticmethod
+    def bitwise_not(a):
+        return f"decltype({a})(~{a})"
+
+    @staticmethod
+    def bitwise_or(a, b):
+        return f"decltype({a})({a} | {b})"
+
+    @staticmethod
+    def bitwise_xor(a, b):
+        return f"decltype({a})({a} ^ {b})"
+
+    @staticmethod
+    def bitwise_left_shift(a, b):
+        code = BracesBuffer()
+        code.writeline("[&]()")
+        with code.indent():
+            scalar_t = DTYPE_TO_CPP[a.dtype]
+            code.writeline(
+                f"constexpr decltype({b}) max_shift = sizeof({scalar_t}) * CHAR_BIT;"
+            )
+            code.writeline(
+                f"if ((static_cast<std::make_signed_t<{scalar_t}>>({b}) < 0) || ({b} >= max_shift))"
+            )
+            with code.indent():
+                code.writeline(f"return decltype({a})(0);")
+            code.writeline(
+                f"return decltype({a})(static_cast<std::make_unsigned_t<{scalar_t}>>({a}) << {b});"
+            )
+        code.writeline("()")
+        return code
+
+    @staticmethod
+    def bitwise_right_shift(a, b):
+        code = BracesBuffer()
+        code.writeline("[&]()")
+        with code.indent():
+            scalar_t = DTYPE_TO_CPP[a.dtype]
+            code.writeline(
+                f"constexpr decltype({b}) max_shift = sizeof({scalar_t}) * CHAR_BIT - std::is_signed_v<{scalar_t}>;"
+            )
+            code.writeline(
+                f"if ((static_cast<std::make_signed_t<{scalar_t}>>({b}) < 0) || ({b} >= max_shift))"
+            )
+            with code.indent():
+                code.writeline(f"return decltype({a})({a} >> max_shift);")
+            code.writeline(f"return decltype({a})({a} >> {b});")
+        code.writeline("()")
+        return code
+
+    @staticmethod
+    def rand(seed: sympy.Expr, offset: sympy.Expr):
+        return f"normalized_rand_cpu({seed}, {offset})"
+
+    @staticmethod
+    def rand_eager(
+        seed: sympy.Expr,
+        base_offset: sympy.Expr,
+        threads_per_round: sympy.Expr,
+        tid: sympy.Expr,
+        vec: sympy.Expr,
+    ):
+        # NOTE: This is a codegen fallback used by the C++ backend for eager random.
+        # The accuracy this is held to is eager against compiled on the
+        # accelerator.  Keep this hook so the codegen paths that expect it
+        # still resolve.
+        return f"normalized_rand_cpu({seed}, {base_offset})"
+
+    @staticmethod
+    def randn(seed: sympy.Expr, offset: sympy.Expr):
+        return f"randn_cpu({seed}, {offset})"
+
+    @staticmethod
+    def randint64(seed: sympy.Expr, offset: sympy.Expr, low, high):
+        return f"randint64_cpu({seed}, {offset}, {low}, {high})"
+
+    @staticmethod
+    def sigmoid(x):
+        return f"decltype({x})(1) / (decltype({x})(1) + std::exp(-{x}))"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def sign(x):
+        code = BracesBuffer()
+        scalar_zero = f"decltype({x})(0)"
+        scalar_one = f"decltype({x})(1)"
+        code.writeline("[&]()")
+        with code.indent():
+            code.writeline(f"auto left = {x} > 0 ? {scalar_one} : {scalar_zero};")
+            code.writeline(f"auto right = {x} < 0 ? {scalar_one} : {scalar_zero};")
+            code.writeline("return left - right;")
+        code.writeline("()")
+        return code
+
+    def partial_accumulate(
+        self,
+        name: str,
+        reduction_type: str,
+        value: CSEVariable,
+        extra_meta: dict[str, Any],
+    ) -> None:
+        raise NotImplementedError
+
+
+CppOverrides._initialize_pointwise_overrides("cpp")
+
+
+class CppVecOverrides(CppOverrides):
+    """Map element-wise ops to vectorized C++"""
+
+    def __new__(cls, *args, **kargs):
+        self = super().__new__(cls)
+
+        def wrap(func):
+            # `CppVecKernel` generates both scalar ops and vector ops according to
+            # whether the inputs are scalars or vectors while all ops in `CppVecOverrides`
+            # (except for some ops explained below) assume the inputs are vectors. We wrap the ops in
+            # `CppVecOverrides` to broadcast scalar inputs to vectors if needed or fallback to
+            # `CppOverrides` when all inputs are scalars.
+            #
+            # Notes on ops handled separately in their own functions:
+            # `ops.masked`:
+            #     needs recursive handling of masked body.
+            # `ops.index_expr`:
+            #     needs to further analyze the dependency of the index expression on
+            #     the tiling itervar.
+            def wrapper(*args, **kwargs):
+                scalars = [
+                    arg
+                    for arg in args
+                    if isinstance(arg, (int, sympy.Expr))
+                    or (isinstance(arg, CppCSEVariable) and not arg.is_vec)
+                ]
+                vectors = [
+                    arg
+                    for arg in args
+                    if isinstance(arg, CppCSEVariable) and arg.is_vec
+                ]
+                new_args = list(args)
+                if scalars and vectors:
+                    new_args = []
+                    for arg in args:
+                        if isinstance(arg, (int, sympy.Expr)):
+                            if isinstance(arg, sympy.Expr) and not arg.is_number:
+                                arg = ops.index_expr(arg, tp.int64)
+                            else:
+                                arg = ops.constant(arg, tp.int64)
+                            arg = arg.value if isinstance(arg, OpsValue) else arg
+                        new_args.append(arg)
+
+                # DType Promotion
+                if vectors:
+                    # We have saw several data type mismatch issues related with index_expr in
+                    # the lowering phase of tp.int8. tp.int32, tp.int64.
+                    # 1. int32 and int64 in test_torchinductor.py::test_max_pool2d_with_indices_backward3_cpu
+                    # 2. int8 and int32 in test_torchinductor.py::test_max_pool2d5_cpu
+                    # 3. int32 and fp32 in test_torchinductor_dynamic_shapes.py::test_avg_pool2d8_dynamic_shapes_cpu
+                    if len(new_args) == 2:
+                        new_args = promote_args(new_args)
+                    elif func is CppVecOverrides.where:
+                        new_args[1:] = promote_args(new_args[1:])
+
+                # Broadcast scalar args to vector
+                if scalars and vectors:
+                    if not isinstance(V.kernel, CppVecKernel):
+                        raise AssertionError(
+                            "expected isinstance(V.kernel, CppVecKernel)"
+                        )
+                    new_args = [
+                        (
+                            V.kernel.broadcast(new_arg)
+                            if (
+                                isinstance(new_arg, CppCSEVariable)
+                                and not new_arg.is_vec
+                                and func
+                                not in [
+                                    CppVecOverrides.rand,
+                                    CppVecOverrides.randn,
+                                    CppVecOverrides.randint64,
+                                ]
+                            )
+                            else new_arg
+                        )
+                        for new_arg in new_args
+                    ]
+
+                if vectors:
+                    return func(*new_args, **kwargs)
+                else:
+                    # fallback to scalar ops
+                    scalar_ops = super(CppVecOverrides, self)
+                    scalar_func = getattr(scalar_ops, func.__name__)
+                    if scalar_func is None:
+                        raise AssertionError("expected scalar_func is not None")
+                    return scalar_func(*args, **kwargs)
+
+            return wrapper
+
+        for name, method in vars(CppVecOverrides).items():
+            if getattr(method, "__class__", None) is staticmethod and name not in [
+                "masked",
+                "index_expr",
+                "value_expr",
+            ]:
+                setattr(self, name, wrap(method.__func__))
+
+        return self
+
+    @staticmethod
+    def add(a, b):
+        return f"{a} + {b}"
+
+    @staticmethod
+    def sub(a, b):
+        return f"{a} - {b}"
+
+    @staticmethod
+    def mul(a, b):
+        return f"{a} * {b}"
+
+    @staticmethod
+    def truediv(a, b):
+        return f"{a} / {b}"
+
+    @staticmethod
+    def abs(x):
+        if isinstance(x, CppCSEVariable) and x.dtype in (
+            tp.uint8,
+            tp.uint16,
+            tp.uint32,
+            tp.uint64,
+        ):
+            # Unsigned identity bypass for vectorized path
+            return f"{x}"
+        return f"{x}.abs()"
+
+    @staticmethod
+    def sin(x):
+        return f"{x}.sin()"
+
+    @staticmethod
+    def cos(x):
+        return f"{x}.cos()"
+
+    @staticmethod
+    def exp(x):
+        return f"{x}.exp()"
+
+    @staticmethod
+    def exp2(x):
+        return f"{x}.exp2()"
+
+    @staticmethod
+    def expm1(x):
+        return f"{x}.expm1()"
+
+    @staticmethod
+    def erf(x):
+        return f"{x}.erf()"
+
+    @staticmethod
+    def erfc(x):
+        return f"{x}.erfc()"
+
+    @staticmethod
+    def erfinv(x):
+        return f"{x}.erfinv()"
+
+    @staticmethod
+    def sqrt(x):
+        return f"{x}.sqrt()"
+
+    @staticmethod
+    def eq(x, y):
+        if not isinstance(V.kernel, CppVecKernel):
+            raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
+        if not isinstance(x, CppCSEVariable):
+            raise AssertionError("expected isinstance(x, CppCSEVariable)")
+        if x.dtype is None:
+            raise AssertionError("expected x.dtype is not None")
+        return f"{V.kernel._get_mask_type(x.dtype)}({x} == {y})"
+
+    @staticmethod
+    def ne(x, y):
+        if not isinstance(V.kernel, CppVecKernel):
+            raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
+        if not isinstance(x, CppCSEVariable):
+            raise AssertionError("expected isinstance(x, CppCSEVariable)")
+        if x.dtype == tp.bool:
+            if y.dtype != tp.bool:
+                raise AssertionError("expected y.dtype == tp.bool")
+            x_cast, y_cast = unify_mask_base_type(V.kernel.compute, (x, y))
+            return f"{x_cast} != {y_cast}"
+        else:
+            if x.dtype is None:
+                raise AssertionError("expected x.dtype is not None")
+            return f"{V.kernel._get_mask_type(x.dtype)}({x} != {y})"
+
+    @staticmethod
+    def lt(x, y):
+        if not isinstance(V.kernel, CppVecKernel):
+            raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
+        if not isinstance(x, CppCSEVariable):
+            raise AssertionError("expected isinstance(x, CppCSEVariable)")
+        if x.dtype is None:
+            raise AssertionError("expected x.dtype is not None")
+        return f"{V.kernel._get_mask_type(x.dtype)}({x} < {y})"
+
+    @staticmethod
+    def gt(x, y):
+        if not isinstance(V.kernel, CppVecKernel):
+            raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
+        if not isinstance(x, CppCSEVariable):
+            raise AssertionError("expected isinstance(x, CppCSEVariable)")
+        if x.dtype is None:
+            raise AssertionError("expected x.dtype is not None")
+        return f"{V.kernel._get_mask_type(x.dtype)}({x} > {y})"
+
+    @staticmethod
+    def le(x, y):
+        if not isinstance(V.kernel, CppVecKernel):
+            raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
+        if not isinstance(x, CppCSEVariable):
+            raise AssertionError("expected isinstance(x, CppCSEVariable)")
+        if x.dtype is None:
+            raise AssertionError("expected x.dtype is not None")
+        return f"{V.kernel._get_mask_type(x.dtype)}({x} <= {y})"
+
+    @staticmethod
+    def ge(x, y):
+        if not isinstance(V.kernel, CppVecKernel):
+            raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
+        if not isinstance(x, CppCSEVariable):
+            raise AssertionError("expected isinstance(x, CppCSEVariable)")
+        if x.dtype is None:
+            raise AssertionError("expected x.dtype is not None")
+        return f"{V.kernel._get_mask_type(x.dtype)}({x} >= {y})"
+
+    @staticmethod
+    def and_(x, y):
+        return f"{x} & {y}"
+
+    @staticmethod
+    def rsqrt(x):
+        return f"{x}.rsqrt()"
+
+    @staticmethod
+    def pow(a, b):
+        return f"{a}.pow({b})"
+
+    @staticmethod
+    def log(x):
+        return f"{x}.log()"
+
+    @staticmethod
+    def round(x):
+        return f"{x}.round()"
+
+    @staticmethod
+    def floor(x):
+        return f"{x}.floor()"
+
+    @staticmethod
+    def ceil(x):
+        return f"{x}.ceil()"
+
+    @staticmethod
+    def trunc(x):
+        return f"{x}.trunc()"
+
+    @staticmethod
+    def fmod(a, b):
+        return f"{a}.fmod({b})"
+
+    @staticmethod
+    def lgamma(x):
+        return f"{x}.lgamma()"
+
+    @staticmethod
+    def logical_and(a, b):
+        a, b = may_unify_binary_op_mask_type(a, b)
+        return f"{a} & {b}"
+
+    @staticmethod
+    def logical_not(a):
+        return f"~{a}"
+
+    @staticmethod
+    def logical_or(a, b):
+        a, b = may_unify_binary_op_mask_type(a, b)
+        return f"{a} | {b}"
+
+    @staticmethod
+    def logical_xor(a, b):
+        a, b = may_unify_binary_op_mask_type(a, b)
+        return f"{a} ^ {b}"
+
+    @staticmethod
+    def bitwise_and(a, b):
+        a, b = may_unify_binary_op_mask_type(a, b)
+        return f"{a} & {b}"
+
+    @staticmethod
+    def bitwise_not(a):
+        return f"~{a}"
+
+    @staticmethod
+    def bitwise_or(a, b):
+        a, b = may_unify_binary_op_mask_type(a, b)
+        return f"{a} | {b}"
+
+    @staticmethod
+    def bitwise_xor(a, b):
+        a, b = may_unify_binary_op_mask_type(a, b)
+        return f"{a} ^ {b}"
+
+    @staticmethod
+    def bitwise_left_shift(a, b):
+        return f"{a} << {b}"
+
+    @staticmethod
+    def bitwise_right_shift(a, b):
+        return f"{a} >> {b}"
+
+    @staticmethod
+    def load_seed(name, offset):
+        if not isinstance(V.kernel, CppVecKernel):
+            raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
+        return f"{V.kernel.load(name, offset)}"
+
+    @staticmethod
+    def rand(seed, offset):
+        if not isinstance(V.kernel, CppVecKernel):
+            raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
+        code = BracesBuffer()
+        rand_function = (
+            f"result[offset_idx] = normalized_rand_cpu({seed}, offset[offset_idx]);"
+        )
+        return codegen_rand(offset, code, rand_function)
+
+    @staticmethod
+    def randn(seed, offset):
+        if not isinstance(V.kernel, CppVecKernel):
+            raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
+        code = BracesBuffer()
+        rand_function = f"result[offset_idx] = randn_cpu({seed}, offset[offset_idx]);"
+        return codegen_rand(offset, code, rand_function)
+
+    @staticmethod
+    def randint64(seed, offset, low, high):
+        if not isinstance(V.kernel, CppVecKernel):
+            raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
+        code = BracesBuffer()
+        rand_function = f"result[offset_idx] = randint64_cpu({seed}, offset[offset_idx], {low}, {high});"
+        return codegen_rand(offset, code, rand_function, tp.int64)
+
+    @staticmethod
+    def remainder(a, b):
+        if a.dtype != b.dtype:
+            raise AssertionError(
+                "remainder vec implementation expect the same inputs' dtype."
+            )
+        if is_integer_dtype(a.dtype):
+            # Doing blend to set the remaining bits of b to non-zero
+            _t = f"decltype({a})"
+            if V.kernel._get_raw_num_vectors(b.dtype) < 1:
+                b = f"{_t}::blend<{(1 << V.kernel.tiling_factor) - 1}>({_t}(1), {b})"
+            return f"remainder_integral({a}, {b})"
+        return f"{a} - ({CppVecOverrides.floordiv(a, b)}) * {b}"
+
+    @staticmethod
+    def tan(a):
+        return f"{a}.tan()"
+
+    @staticmethod
+    def tanh(a):
+        if config.cpp.use_decompose_tanh:
+            vec_one = f"decltype({a})(1)"
+            vec_two = f"decltype({a})(2)"
+            vec_minus_two = f"decltype({a})(-2)"
+            return (
+                f"{vec_two} / ({vec_one} + ({vec_minus_two} * {a}).exp()) - {vec_one}"
+            )
+        else:
+            return f"{a}.tanh()"
+
+    @staticmethod
+    def reciprocal(a):
+        return f"{a}.reciprocal()"
+
+    @staticmethod
+    def atan(x):
+        return f"{x}.atan()"
+
+    @staticmethod
+    def acos(x):
+        return f"{x}.acos()"
+
+    @staticmethod
+    def asin(x):
+        return f"{x}.asin()"
+
+    @staticmethod
+    def cosh(x):
+        return f"{x}.cosh()"
+
+    @staticmethod
+    def sinh(x):
+        return f"{x}.sinh()"
+
+    @staticmethod
+    def log10(x):
+        return f"{x}.log10()"
+
+    @staticmethod
+    def log2(x):
+        return f"{x}.log2()"
+
+    @staticmethod
+    def nextafter(x, y):
+        return f"{x}.nextafter({y})"
+
+    @staticmethod
+    def copysign(a, b):
+        return f"{a}.copysign({b})"
+
+    @staticmethod
+    def atan2(a, b):
+        return f"{a}.atan2({b})"
+
+    @staticmethod
+    def hypot(a, b):
+        return f"{a}.hypot({b})"
+
+    @staticmethod
+    def atanh(x):
+        # For real x, atanh(x) = 1/2 * log((1+x)/(1-x))
+        vec_one = f"decltype({x})(1)"
+        vec_one_half = f"decltype({x})(0.5)"
+        return f"{vec_one_half} * (({vec_one} + {x})/({vec_one} - {x})).log()"
+
+    @staticmethod
+    def asinh(x):
+        vec_t = f"decltype({x})"
+        code = BracesBuffer()
+        code.writeline("[&]()")
+        with code.indent():
+            # Avoid Vectorized::asinh/SLEEF here: it overflows internally for
+            # large finite fp32 inputs where eager std::asinh remains finite.
+            # This is asinh(x) = sign(x) * log(abs(x) + sqrt(abs(x)^2 + 1)),
+            # rewritten with 1 / abs(x) to avoid squaring large values.
+            code.writeline(f"auto abs_x = {x}.abs();")
+            code.writeline(f"auto one = {vec_t}(1);")
+            code.writeline("auto inv_abs_x = one / abs_x;")
+            code.writeline(
+                "auto correction = "
+                "(one / (one + inv_abs_x)) / "
+                "((one + inv_abs_x * inv_abs_x).sqrt() + inv_abs_x);"
+            )
+            code.writeline("auto result = abs_x.log1p() + correction.log1p();")
+            code.writeline(f"return result.copysign({x});")
+        code.writeline("()")
+        return code
+
+    @staticmethod
+    def acosh(x):
+        return f"{x}.acosh()"
+
+    @staticmethod
+    def relu(x):
+        bug = config.cpp.inject_relu_bug_TESTING_ONLY
+        if bug == "compile_error":
+            return "compile error!"
+        elif bug == "runtime_error":
+            return f"{x}; throw 1"
+        elif bug == "accuracy":
+            return f"{x} + decltype({x})(1)"
+        elif bug is None:
+            return f"tensorplay::vec::clamp_min({x}, decltype({x})(0))"
+        else:
+            raise AssertionError(
+                f"unrecognized config cpp.inject_relu_bug_TESTING_ONLY = {bug!r}"
+            )
+
+    # TODO: this seems to be dead
+    @staticmethod
+    def sigmoid(x):
+        return f"decltype({x})(1)/(decltype({x})(1) + {x}.neg().exp())"
+
+    @staticmethod
+    def neg(x):
+        return f"{x}.neg()"
+
+    @staticmethod
+    def floordiv(a, b):
+        if is_float_dtype(a.dtype):
+            if a.dtype != b.dtype:
+                raise AssertionError(
+                    "div_floor_floating_vec implementation expect the same inputs' dtype."
+                )
+            return f"div_floor_floating_vec({a}, {b})"
+        else:
+            if not (all(is_integer_dtype(item.dtype) for item in [a, b])):
+                raise AssertionError(
+                    "expected all(is_integer_dtype(item.dtype) for item in [a, b])"
+                )
+            # a and b are integer type
+            _t = f"decltype({b})"
+            b = f"{_t}::set({_t}(1), {b}, {cexpr_index(V.kernel.num_elems)})"
+            return f"floor_divide_integral({a}, {b})"
+
+    @staticmethod
+    def truncdiv(a, b):
+        # a and b are integer type
+        _t = f"decltype({b})"
+        b = f"{_t}::set({_t}(1), {b}, {cexpr_index(V.kernel.num_elems)})"
+        return f"{a} / {b}"
+
+    @staticmethod
+    def minimum(a, b):
+        if a.dtype == tp.bool:
+            if b.dtype != tp.bool:
+                raise AssertionError("expected b.dtype == tp.bool")
+            a_cast, b_cast = unify_mask_base_type(V.kernel.compute, (a, b))
+            return f"{a_cast} & {b_cast}"
+        else:
+            return f"tensorplay::vec::minimum({a}, {b})"
+
+    @staticmethod
+    def maximum(a, b):
+        if a.dtype == tp.bool:
+            if b.dtype != tp.bool:
+                raise AssertionError("expected b.dtype == tp.bool")
+            a_cast, b_cast = unify_mask_base_type(V.kernel.compute, (a, b))
+            return f"{a_cast} | {b_cast}"
+        else:
+            return f"tensorplay::vec::maximum({a}, {b})"
+
+    @staticmethod
+    def fmaximum(a, b):
+        return f"decltype({a})::blendv({a}, {b}, {a} < {b})"
+
+    @staticmethod
+    def square(a):
+        return f"{a} * {a}"
+
+    @staticmethod
+    def where(a, b, c):
+        if not isinstance(V.kernel, CppVecKernel):
+            raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
+        if b.dtype == tp.bool:
+            if c.dtype != tp.bool:
+                raise AssertionError("expected c.dtype == tp.bool")
+            blendv_a, blendv_b, blendv_c = unify_mask_base_type(
+                V.kernel.compute, (a, b, c)
+            )
+            return f"decltype({blendv_b})::blendv({blendv_c}, {blendv_b}, {blendv_a})"
+        else:
+            return f"decltype({b})::blendv({c}, {b}, {V.kernel._get_mask_cast(a, b.dtype)})"
+
+    @staticmethod
+    def sign(x):
+        code = BracesBuffer()
+        vec_zero = f"decltype({x})(0)"
+        vec_one = f"decltype({x})(1)"
+        blendv_l = f"decltype({x})::blendv({vec_zero}, {vec_one}, {vec_zero} < {x})"
+        blendv_r = f"decltype({x})::blendv({vec_zero}, {vec_one}, {x} < {vec_zero})"
+        code.writeline("[&]()")
+        with code.indent():
+            code.writeline(f"auto left = {blendv_l};")
+            code.writeline(f"auto right = {blendv_r};")
+            code.writeline("return left - right;")
+        code.writeline("()")
+        return code
+
+    @staticmethod
+    def to_dtype(x, dtype, src_dtype=None, use_compute_types=True):
+        if dtype not in [
+            tp.bool,
+            tp.float64,
+            tp.float,
+            tp.bfloat16,
+            tp.float16,
+            tp.uint8,
+            tp.int8,
+            tp.int32,
+            tp.int64,
+            tp.float8_e4m3fn,
+            tp.float8_e5m2,
+        ]:
+            raise AssertionError(f"{__name__} does not support {dtype}")
+        if not isinstance(x, CppCSEVariable):
+            raise AssertionError("expected isinstance(x, CppCSEVariable)")
+        src_dtype = x.dtype
+        expr = V.kernel.get_to_dtype_expr(x, dtype, src_dtype)
+        csevar = V.kernel.cse.generate(V.kernel.compute, expr)
+        csevar.update_on_args("to_dtype", (x, dtype), {"src_dtype": src_dtype})
+        if (
+            use_compute_types
+            and dtype in DTYPE_LOWP_FP
+            and src_dtype == tp.float
+            and not config.emulate_precision_casts
+        ):
+            V.kernel.cache_dtype_convert(x, src_dtype, csevar, dtype)
+        return csevar
+
+    @staticmethod
+    def round_to_int(x, dtype, src_dtype=None, use_compute_types=True):
+        if dtype not in [
+            tp.uint8,
+            tp.int8,
+            tp.int32,
+        ]:
+            raise AssertionError(f"{__name__} does not support {dtype}")
+        if not isinstance(x, CppCSEVariable):
+            raise AssertionError("expected isinstance(x, CppCSEVariable)")
+        src_dtype = x.dtype
+        expr = V.kernel.get_to_dtype_expr(x, dtype, src_dtype, rounding=True)
+        csevar = V.kernel.cse.generate(V.kernel.compute, expr)
+        csevar.update_on_args("round_to_int", (x, dtype), {"src_dtype": src_dtype})
+        if (
+            dtype in DTYPE_LOWP_FP
+            and src_dtype == tp.float
+            and not config.emulate_precision_casts
+        ):
+            V.kernel.cache_dtype_convert(x, src_dtype, csevar, dtype)
+        return csevar
+
+    @staticmethod
+    def log1p(x):
+        bug = config.cpp.inject_log1p_bug_TESTING_ONLY
+        if bug == "accuracy":
+            return f"{x} + decltype({x})(1)"
+        elif bug is None:
+            return f"{x}.log1p()"
+        else:
+            raise AssertionError(
+                f"unrecognized config cpp.inject_log1p_bug_TESTING_ONLY = {bug!r}"
+            )
+
+    @staticmethod
+    def masked(mask, body, other):
+        if not isinstance(V.kernel, CppVecKernel):
+            raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
+        code = BracesBuffer()
+        var = V.kernel.cse.newvar()
+        with V.kernel.masked(mask) as new_mask:
+            code.writeline(f"auto {var} = [&]")
+            with V.kernel.swap_buffers(code), code.indent():
+                result = body()
+                code.writeline(f"return {result};")
+        code.writeline(";")
+        V.kernel.compute.splice(code)
+
+        dtype = result.dtype
+        body_code = f"{var}()"
+
+        def maskify_or_vecify(code):
+            return (
+                f"{V.kernel._get_mask_type()}::from({code})"
+                if dtype == tp.bool
+                else f"{V.kernel._get_vec_type(dtype)}({code})"
+            )
+
+        if result.is_vec:
+            body_code_vec = body_code
+        else:
+            body_code_vec = maskify_or_vecify(body_code)
+        other_code = value_to_cpp(other, DTYPE_TO_CPP[dtype])
+        # loading bool as VecMask<float, N>
+        other_code_vec = maskify_or_vecify(other_code)
+        if not isinstance(new_mask, CppCSEVariable):
+            raise AssertionError(new_mask)
+        if new_mask.is_vec:
+            code = BracesBuffer()
+            code.writeline("[&]")
+            with V.kernel.swap_buffers(code), code.indent():
+                code.writeline(f"if ({new_mask}.all_zero())")
+                with code.indent():
+                    code.writeline(f"return {other_code_vec};")
+                code.writeline("else")
+                with code.indent():
+                    # Create cse variable to reuse kernel.overrides.where
+                    body_vec_var = V.kernel.cse.generate(
+                        V.kernel.compute,
+                        body_code_vec,
+                    )
+                    other_vec_var = V.kernel.cse.generate(
+                        V.kernel.compute,
+                        other_code_vec,
+                    )
+                    if not isinstance(body_vec_var, CppCSEVariable):
+                        raise AssertionError(body_vec_var)
+                    if not isinstance(other_vec_var, CppCSEVariable):
+                        raise AssertionError(other_vec_var)
+                    body_vec_var.dtype = dtype
+                    other_vec_var.dtype = dtype
+                    overrides: type[CppOverrides | CppVecOverrides] = (
+                        # pyrefly: ignore [bad-assignment]
+                        V.kernel.overrides
+                    )  # type: ignore[has-type]
+                    code.writeline(
+                        f"return {overrides.where(new_mask, body_vec_var, other_vec_var)};"
+                    )
+            code.writeline("()")
+            csevar = V.kernel.cse.generate(
+                V.kernel.compute,
+                code,
+            )
+            if not isinstance(csevar, CppCSEVariable):
+                raise AssertionError("expected isinstance(csevar, CppCSEVariable)")
+            csevar.is_vec = True
+        elif result.is_vec:
+            csevar = V.kernel.cse.generate(
+                V.kernel.compute, f"{mask} ? {body_code_vec} : {other_code_vec}"
+            )
+        else:
+            csevar = V.kernel.cse.generate(
+                V.kernel.compute, f"{mask} ? {body_code} : {other_code}"
+            )
+        # `result` is explicitly added to the args for correct propagation
+        # of relevant itervars and vectorization status.
+        csevar.update_on_args("masked", (mask, body, other, result), {})
+        return csevar
+
+    @staticmethod
+    def index_expr(expr, dtype):
+        if not isinstance(V.kernel, CppVecKernel):
+            raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
+        index = V.kernel.rename_indexing(expr)
+        tiling_var = V.kernel.itervars[V.kernel.tiling_idx]
+        stride = V.kernel._try_get_const_stride(index, tiling_var)
+        if stride == 0:
+            return CppOverrides.index_expr(expr, dtype)
+        elif stride is not None:
+            idx = V.kernel.cse.generate(
+                V.kernel.compute, cexpr(index), bounds=get_bounds_index_expr(expr)
+            )
+            value = ops.to_dtype(idx, dtype)
+            if isinstance(value, OpsValue):
+                value = value.value
+            csevar = V.kernel.arange(value, stride)
+        else:
+            csevar = V.kernel._load_or_store_non_contiguous(  # type: ignore[assignment]
+                None, index, dtype, V.kernel.compute
+            )
+        # pyrefly: ignore [missing-attribute]
+        csevar.update_on_args("index_expr", (expr, dtype), {})
+        return csevar
+
+    @staticmethod
+    def value_expr(expr, dtype):
+        # C++ index_expr already emits the requested dtype, so value_expr has
+        # the same lowering here.
+        return CppVecOverrides.index_expr(expr, dtype)
+
+    @staticmethod
+    def frexp(x):
+        cache_keys = f"frexp({x})[0]", f"frexp({x})[1]"
+        if all(V.kernel.cse.try_get(cache_key) is not None for cache_key in cache_keys):
+            return tuple(V.kernel.cse.try_get(cache_key) for cache_key in cache_keys)
+
+        cdtype = DTYPE_TO_CPP[x.dtype]
+        size = V.kernel.tail_size if V.kernel.tail_size else V.kernel.tiling_factor
+        code = BracesBuffer()
+        exponent = V.kernel.cse.newvar(dtype=tp.int32)
+        mantissa = V.kernel.cse.newvar(dtype=x.dtype)
+        exponent.update_on_args("frexp", (x,), kwargs={})
+        mantissa.update_on_args("frexp", (x,), kwargs={})
+        n_vec = V.kernel._get_num_vectors(x.dtype)
+        mantissa_t = (
+            f"tensorplay::vec::Vectorized<{cdtype}>"
+            if n_vec == 1
+            else f"tensorplay::vec::VectorizedN<{cdtype}, {n_vec}>"
+        )
+        code.writeline(
+            f"tensorplay::vec::Vectorized<int32_t> {exponent};"
+            if n_vec == 1
+            else f"tensorplay::vec::VectorizedN<int32_t, {n_vec}> {exponent};"
+        )
+        code.writeline(f"{mantissa_t} {mantissa};")
+        code.writeline("[&]()")
+        with code.indent():
+            code.writeline(
+                f"__at_align__ std::array<{cdtype}, {V.kernel.tiling_factor}> tmpbuf;"
+            )
+            code.writeline(f"{x}.store(tmpbuf.data(), {cexpr_index(size)});")
+            code.writeline(
+                f"__at_align__ std::array<int32_t, {V.kernel.tiling_factor}> tmpbuf_exponent;"
+            )
+            code.writeline(
+                f"__at_align__ std::array<{cdtype}, {V.kernel.tiling_factor}> tmpbuf_mantissa;"
+            )
+            code.writeline(f"for (int i = 0; i < {cexpr_index(size)}; i++)")
+            with code.indent():
+                code.writeline(
+                    "tmpbuf_mantissa[i] = std::frexp(tmpbuf[i], &tmpbuf_exponent[i]);"
+                )
+            code.writeline(
+                f"{exponent} = tensorplay::vec::Vectorized<int32_t>::loadu(tmpbuf_exponent.data(), {cexpr_index(size)});"
+                if n_vec == 1
+                else f"{exponent} = tensorplay::vec::VectorizedN<int32_t, {n_vec}>::loadu(tmpbuf_exponent.data(), {cexpr_index(size)});"
+            )
+            code.writeline(
+                f"{mantissa} = {mantissa_t}::loadu(tmpbuf_mantissa.data(), {cexpr_index(size)});"
+            )
+        code.writeline("();")
+        V.kernel.compute.splice(code)
+        cse_vars = (mantissa, exponent)
+        for cache_key, cse_var in zip(cache_keys, cse_vars):
+            V.kernel.cse.put(cache_key, cse_var)
+        return mantissa, exponent
+
+    @classmethod
+    def _scalarize(cls, scalar_func):
+        def inner(*args, **kwargs):
+            if kwargs:
+                raise AssertionError("expected not kwargs")
+            kernel = V.kernel
+            if not isinstance(kernel, CppVecKernel):
+                raise AssertionError("expected isinstance(kernel, CppVecKernel)")
+            code = BracesBuffer()
+            code.writeline("[&]()")
+            vec_dtype = args[0].dtype
+            n_vec = kernel._get_num_vectors(vec_dtype)
+            size = kernel.tail_size if kernel.tail_size else kernel.tiling_factor
+            scalar_args = []
+            cdtype = DTYPE_TO_CPP[vec_dtype]
+            output_mask = scalar_func.__name__ in (
+                "isinf",
+                "isnan",
+                "signbit",
+            )
+            octype = "bool" if output_mask else cdtype
+            octype = (
+                DTYPE_TO_CPP[args[-2]]
+                if (scalar_func.__name__ == "to_dtype_bitcast")
+                else octype
+            )
+            with code.indent():
+                for argidx, arg in enumerate(args):
+                    if isinstance(arg, CppCSEVariable):
+                        if not arg.is_vec:
+                            raise AssertionError("expected arg.is_vec")
+                        if arg.dtype != vec_dtype:
+                            raise AssertionError("expected arg.dtype == vec_dtype")
+                        code.writeline(
+                            f"__at_align__ std::array<{cdtype}, {kernel.tiling_factor}> tmpbuf{argidx};"
+                        )
+                        code.writeline(
+                            f"{arg}.store(tmpbuf{argidx}.data(), {cexpr_index(size)});"
+                        )
+                        scalar_args.append(f"tmpbuf{argidx}[i]")
+                    else:
+                        scalar_args.append(arg)
+                code.writeline(
+                    f"__at_align__ std::array<{octype}, {kernel.tiling_factor}> tmpbuf_out;"
+                )
+                res = scalar_func(*scalar_args)
+                code.writeline(f"for (int i = 0; i < {cexpr_index(size)}; i++)")
+                with code.indent():
+                    code.writeline(f"tmpbuf_out[i] = {res};")
+                load_args = f"tmpbuf_out.data(), {cexpr_index(size)}"
+                if output_mask:
+                    load_fn = f"tensorplay::vec::VecMask<{cdtype},{n_vec}>::from"
+                elif n_vec == 1:
+                    load_fn = f"tensorplay::vec::Vectorized<{octype}>::loadu"
+                else:
+                    load_fn = f" tensorplay::vec::VectorizedN<{octype}, {n_vec}>::loadu"
+                code.writeline(f"return {load_fn}({load_args});")
+            code.writeline("()")
+            return code
+
+        return inner
+
+    @classmethod
+    def _initialize_scalarize(cls):
+        vec_vars = vars(CppVecOverrides)
+        for name, method in vars(CppOverrides).items():
+            if isinstance(method, staticmethod) and name not in vec_vars:
+                func = cls._scalarize(method.__func__)
+                func.__name__ = name
+                setattr(cls, name, staticmethod(func))
+
+
+CppVecOverrides._initialize_pointwise_overrides("cppvec")
+CppVecOverrides._initialize_scalarize()
+
+
+class CppTile2DOverrides(CppVecOverrides):
+    @staticmethod
+    def index_expr(expr, dtype):
+        if not isinstance(V.kernel, CppTile2DKernel):
+            raise AssertionError("expected isinstance(V.kernel, CppTile2DKernel)")
+        expr = V.kernel.transform_indexing(expr)
+        return CppVecOverrides.index_expr(expr, dtype)
+
+    @staticmethod
+    def value_expr(expr, dtype):
+        # C++ index_expr already emits the requested dtype, so value_expr has
+        # the same lowering here.
+        return CppTile2DOverrides.index_expr(expr, dtype)
+
+
+class CppKernel(Kernel):
+    """
+    Base class for C++ kernel code generation.
+    This class is responsible for generating C++ code from the intermediate representation.
+
+    Args:
+        args: Kernel arguments used for code generation
+        num_threads: Number of threads for parallel execution
+    """
+
+    overrides = CppOverrides  # type: ignore[assignment]
+    sexpr = cexpr
+    newvar_prefix = "auto "
+    suffix = ";"
+
+    def __init__(self, args, num_threads):
+        super().__init__(args)
+        # Indicate when this kernel is active, for example
+        # {x0, {24, 26}} -> this kernel is active when x0 >= 24 and x0 < 26
+        self.active_ranges: dict[sympy.Expr, tuple[sympy.Expr, ...]] = {}
+        # Indicate this kernel will be moved under the inner for-loop
+        # See move_code_under_inner_loop
+        self.inner_itervars: list[sympy.Symbol] = []
+        self.call_ranges: tuple[sympy.Expr, ...] | None = None
+        self.ranges: list[sympy.Expr] = []
+        self.itervars: list[sympy.Symbol] = []
+        self.reduction_depth = None
+        self.reduction_prefix = IndentedBuffer()
+        # We need this because when we run "reduction" nodes here, we lack
+        # "loop" information to decide whether we need a scalar init or an array init
+        # in the reduction prefix. Meanwhile, we have other information like
+        # reduction types and dtype to generate the reduction prefix. We record the information
+        # with a callable lambda function, and when we have enough information to finalize
+        # the reduction prefix, we can invoke the functions here with additional information.
+        self.reduction_prefix_generators: list[Callable] = []  # type: ignore[type-arg]
+        self.reduction_suffix = IndentedBuffer()
+        self.parallel_reduction_prefix = IndentedBuffer()
+        self.parallel_reduction_suffix = IndentedBuffer()
+        self.local_reduction_init = IndentedBuffer()
+        self.local_reduction_stores = IndentedBuffer()
+        self.is_reduction = False
+        self.non_parallel_reduction_prefix = IndentedBuffer()
+        self.non_parallel_reduction_suffix = IndentedBuffer()
+        self.reduction_cse = CSE(self.newvar_prefix, self.suffix, name_prefix="tmp_acc")
+        self.welford_helper_cse = CSE(
+            self.newvar_prefix, self.suffix, name_prefix="welford_helper"
+        )
+        self.cascade_helper_cse = CSE(
+            self.newvar_prefix, self.suffix, name_prefix="cascade_helper"
+        )
+        self.preloads = IndentedBuffer()
+        self.poststores = IndentedBuffer()
+        self.num_threads = num_threads  # num_threads the kernel specialized for
+        self.reduction_omp_dec: dict[tuple[str, str], str] = {}
+        self.reduction_var_names: list[str] = []
+
+    def _gen_parallel_reduction_buffers(
+        self,
+        acc,
+        acc_type,
+        reduction_type,
+        dtype,
+        reduction_combine_fn=reduction_combine,
+        reduction_init_fn=reduction_init,
+    ):
+        if config.cpp.dynamic_threads and not self.parallel_reduction_prefix:
+            self.parallel_reduction_prefix.writeline(
+                "int max_threads = omp_get_max_threads();"
+            )
+        acc_local = f"{acc}_local"
+        num_threads = (
+            "max_threads" if config.cpp.dynamic_threads else parallel_num_threads()
+        )
+        acc_local_in_array = f"{acc}_arr[tid]"
+        self.local_reduction_init.writeline(
+            f"{acc_type} {acc_local} = {reduction_init_fn(reduction_type, dtype)};"
+        )
+        self.parallel_reduction_prefix.splice(
+            reduction_prefix_array(
+                acc,
+                acc_type,
+                reduction_type,
+                dtype,
+                num_threads,
+                reduction_init_fn,
+            )
+        )
+        self.local_reduction_stores.writeline(f"{acc_local_in_array} = {acc_local};")
+        self.parallel_reduction_suffix.writelines(
+            [
+                f"for (int tid = 0; tid < {num_threads}; tid++)",
+                "{",
+                f"    {acc} = {reduction_combine_fn(reduction_type, acc, acc_local_in_array, src_dtype=dtype)};",
+                "}",
+            ],
+        )
+
+    def update_stores_with_parallel_reduction(self):
+        for var_name in self.reduction_var_names:
+            replace_acc_name(self.stores, var_name, f"{var_name}_local")
+
+    def gen_body(self, code: BracesBuffer | None = None):
+        if code is not None:
+            raise AssertionError("expected code is None")
+        code = BracesBuffer()
+        with contextlib.ExitStack() as stack:
+            if hasattr(self, "codegen_inner_loops"):
+                code.splice(self.preloads)
+                self.codegen_inner_loops(code)
+                stack.enter_context(code.indent())
+            code.splice(self.loads)
+            code.splice(self.compute)
+            code.splice(self.stores)
+        if hasattr(self, "codegen_inner_loops"):
+            code.splice(self.poststores)
+
+        if self.inner_itervars:
+            for idx in self.inner_itervars:
+                start, end = self.active_ranges[idx]
+                code = move_code_under_inner_loop(code, idx, f"{idx}_tail", start, end)
+        return code
+
+    @contextlib.contextmanager
+    def masked(self, mask):
+        """Context manager to add an additional mask to loads and stores."""
+        prior = self._load_mask
+        if prior:
+            mask = ops.and_(mask, prior)
+            if isinstance(mask, OpsValue):
+                mask = mask.value
+                if not isinstance(mask, CppCSEVariable):
+                    raise AssertionError("expected isinstance(mask, CppCSEVariable)")
+                # see NOTE [dtype of CppCSEVariable]
+                # mask's dtype should be bool
+                mask.dtype = tp.bool
+
+        self._load_mask = mask
+        try:
+            yield mask
+        finally:
+            self._load_mask = prior
+
+    def scale_index_with_offset(
+        self, index: sympy.Expr, scale=1, itervar_idx=-1, offset=0
+    ):
+        var = self.itervars[itervar_idx]
+        replacement = {var: var * scale + offset}
+        new_index = sympy_subs(index, replacement)
+        return new_index
+
+    def index_to_str(self, index: sympy.Expr) -> str:
+        """
+        Convert an index expr to a string that can be used in cpp code.
+        e.g. a sympy expression "s2" may actually appear as "ks1" in the cpp kernel.
+        """
+        return cexpr(self.rename_indexing(index))
+
+    def index_indirect_depends_on(self, index: sympy.Expr, itervar: sympy.Symbol):
+        """
+        Check if an index has free symbol CppCSEVariable that depends on `itervar`.
+        """
+        return any(
+            self.cse.varname_map[s.name].depends_on(itervar)  # type: ignore[attr-defined]
+            for s in index.free_symbols
+            if s.name in self.cse.varname_map  # type: ignore[attr-defined]
+            and isinstance(self.cse.varname_map[s.name], CppCSEVariable)  # type: ignore[attr-defined]
+        )
+
+    def index_depends_on(self, index: sympy.Expr, itervar: sympy.Symbol):
+        return itervar in index.free_symbols or self.index_indirect_depends_on(
+            index, itervar
+        )
+
+    def var_ranges(self):
+        return dict(zip(self.itervars, self.ranges))
+
+    def check_bounds(
+        self,
+        expr: sympy.Expr,
+        size: sympy.Expr,
+        lower: bool,
+        upper: bool,
+    ):
+        if not (lower or upper):
+            return
+
+        indirect = free_symbol_is_type(expr, SymT.TMP)
+        if indirect:
+            # indexing in compute
+            csevar = ops.index_expr(expr, tp.int64).value
+            buffer = V.kernel.compute
+        else:
+            # Prefer to put the assert in loads so it runs before the actual
+            # memory access.  However, if the index expression may have already
+            # been CSE'd into compute by a prior ops.index_expr call, placing a
+            # reference to it in loads would be a forward reference (loads are
+            # emitted before compute in the kernel body).  In that case fall
+            # back to compute.
+            idx_str = cexpr(self.rename_indexing(expr))
+            if self.cse.try_get(idx_str) is not None:
+                csevar = ops.index_expr(expr, tp.int64).value
+                buffer = V.kernel.compute
+            else:
+                prior_compute = V.kernel.compute
+                try:
+                    V.kernel.compute = self.loads
+                    csevar = ops.index_expr(expr, tp.int64).value
+                finally:
+                    V.kernel.compute = prior_compute
+                buffer = self.loads
+
+        size_str = V.kernel.sexpr(self.rename_indexing(size)) if upper else None
+
+        line = self.indirect_assert(
+            csevar, "0" if lower else None, size_str, self._load_mask
+        )
+        self.cse.generate(buffer, line, assignment=False)
+
+    def load(self, name: str, index: sympy.Expr):
+        var = self.args.input(name)
+        index = self.rename_indexing(index)
+        line = f"{var}[{cexpr_index(index)}]"
+        csevar = self.cse.generate(self.loads, line, dtype=V.graph.get_dtype(name))
+        csevar.update_on_args("load", (self, name, index), {})
+        return csevar
+
+    def _use_parallel_atomic_add(self):
+        return config.cpp.dynamic_threads or self.num_threads != 1
+
+    def store(self, name, index, value, mode=None):
+        if "buf" not in name:
+            raise AssertionError('expected "buf" in name')
+        var = self.args.output(name)
+        index = self.rename_indexing(index)
+        if mode is None:
+            line = f"{var}[{cexpr_index(index)}] = {value};"
+        elif mode == "atomic_add":
+            if not self._use_parallel_atomic_add():
+                line = f"{var}[{cexpr_index(index)}] += {value};"
+            else:
+                dtype = V.graph.get_dtype(name)
+                # mirroring static_cast<float>(...) in load:
+                value = f"static_cast<{DTYPE_TO_CPP[dtype]}>({value})"
+                line = f"atomic_add(&{var}[{cexpr_index(index)}], {value});"
+        else:
+            raise NotImplementedError(f"store mode={mode}")
+        self.stores.writeline(DeferredLine(name, line))
+
+    def device_assert_async(self, cond, msg):
+        self.compute.writeline(
+            f'({cond} ? 0 : (throw std::runtime_error("{msg}"), 0));'
+        )
+
+    def _gen_reduction_prefix(
+        self,
+        acc: CSEVariable | str,
+        acc_type: str,
+        rtype: str,
+        dtype: tp.dtype,
+        init_fn,
+    ):
+        # Generate reduction prefix
+        # If size is None, we will define and initialize a single reduction variable
+        # => float tmp_acc0 = 0;
+        # Otherwise, we will define and initialize a reduction array
+        # => float tmp_acc0_arr[size];
+        # => for (int i = 0; i < size; i++) tmp_acc0_arr[i] = 0;
+        def inner(size: int | None = None):
+            if size is None:
+                return f"{acc_type} {acc} = {init_fn(rtype, dtype)};"
+            else:
+                return reduction_prefix_array(
+                    acc,
+                    acc_type,
+                    rtype,
+                    dtype,
+                    size,
+                    init_fn,
+                )
+
+        return inner
+
+    def finalize_reduction_prefix(self, size: int | None = None):
+        for gen_fn in self.reduction_prefix_generators:
+            self.reduction_prefix.splice(gen_fn(size))
+
+    def need_use_acc_helper(self, reduction_type, dtype, use_scalar):
+        # Check if we need accumulate helper for the reduction operation.
+        # using accumulate helper generates the necessary code to improve precision for
+        # sum and welford
+        # Note: using helper has non-negligible impact on performance
+
+        if reduction_type == "welford_reduce":
+            return True
+
+        # TODO add supports for more data types when needed
+        if reduction_type == "sum" and dtype == tp.float:
+            if self.call_ranges is None:
+                raise AssertionError("expected self.call_ranges is not None")
+            reduction_size = functools.reduce(
+                operator.mul, self.call_ranges[self.reduction_depth :]
+            )
+
+            # chunk size to balance accuracy and performance
+            chunk_size = 4096
+
+            return V.graph.sizevars.guard_or_false(sympy.Gt(reduction_size, chunk_size))
+        return False
+
+    def _acc_helper_init(
+        self,
+        reduction_type,
+        helper_val,
+        helper_range,
+        dtype,
+        num_threads=None,
+        use_scalar=False,
+    ):
+        num_range_thread = (
+            CeilDiv(helper_range, num_threads) if num_threads else helper_range
+        )
+        num_range_thread_expr = cexpr_index(num_range_thread)
+        if reduction_type not in ["welford_reduce", "sum"]:
+            raise AssertionError('expected reduction_type in ["welford_reduce", "sum"]')
+        chunk_size = 4096
+        num_chunks = CeilDiv(num_range_thread, chunk_size)
+        helper_type = (
+            "WelfordHelper"
+            if reduction_type == "welford_reduce"
+            else "CascadeSumHelper"
+        )
+        if use_scalar:
+            h_type = DTYPE_TO_CPP[dtype]
+        else:
+            h_type = (
+                self._get_vec_type(dtype)
+                if hasattr(self, "_get_vec_type")
+                else DTYPE_TO_CPP[dtype]
+            )
+        helper_init_line = (
+            f"{helper_type}<{h_type}, {chunk_size}> {helper_val}"
+            f"("
+            f"{num_range_thread_expr}"
+            f");"
+        )
+        if reduction_type == "sum":
+            return helper_init_line
+        if isinstance(num_chunks, sympy.Integer) and num_chunks <= 1:
+            # When the number of chunks <= 1, there is no need to use cascade summation to improve
+            # reduction accuracy. We can initialize a static WelfordHelper to improve performance.
+            return f"static {helper_init_line}"
+        else:
+            return helper_init_line
+
+    def _use_acc_helper(
+        self, reduction_type, acc, helper_val, helper_range, dtype, use_scalar=False
+    ):
+        num_threads = (
+            "max_threads" if config.cpp.dynamic_threads else parallel_num_threads()
+        )
+        self.non_parallel_reduction_prefix.writeline(
+            self._acc_helper_init(
+                reduction_type, helper_val, helper_range, dtype, None, use_scalar
+            )
+        )
+        self.local_reduction_init.writeline(
+            self._acc_helper_init(
+                reduction_type, helper_val, helper_range, dtype, num_threads, use_scalar
+            )
+        )
+        result = acc if use_scalar else f"{acc}_vec"
+        if reduction_type == "welford_reduce":
+            self.non_parallel_reduction_suffix.writeline(
+                f"{result} = welford_combine({result}, &{helper_val});"
+            )
+            self.local_reduction_stores.writeline(
+                f"{result}_local = welford_combine({result}_local, &{helper_val});"
+            )
+        else:
+            self.non_parallel_reduction_suffix.writeline(
+                f"{result} = cascade_sum_final(&{helper_val});"
+            )
+            self.local_reduction_stores.writeline(
+                f"{result}_local = cascade_sum_final(&{helper_val});"
+            )
+
+    def reduction(self, dtype, src_dtype, reduction_type, value):
+        argmax_or_argmin = reduction_type in ("argmax", "argmin")
+        logical_index = None
+        if argmax_or_argmin and isinstance(value, tuple):
+            value, logical_index = value
+
+        if logical_index is not None:
+            logical_index_key = cast(CSEVariable, logical_index)
+            reduction_key = src_dtype, reduction_type, (value, logical_index_key)
+        else:
+            reduction_key = src_dtype, reduction_type, value
+        if reduction_key in self.reduction_cse.reduction_cache:
+            return self.reduction_cse.reduction_cache[reduction_key]
+
+        acc = self.reduction_cse.generate(
+            self.loads, f"reduction {reduction_key}", write=False
+        )
+        self.reduction_var_names.append(f"{acc}")
+        self.is_reduction = True
+        init_dtype = src_dtype if argmax_or_argmin else dtype
+        acc_type = reduction_acc_type(reduction_type, init_dtype)
+        self.reduction_prefix_generators.append(
+            self._gen_reduction_prefix(
+                acc, acc_type, reduction_type, init_dtype, reduction_init
+            )
+        )
+
+        if self.need_use_acc_helper(reduction_type, dtype, True):
+            # use cascade_helper for vec kernel
+            reduction_size = functools.reduce(
+                operator.mul, self.ranges[self.reduction_depth :]
+            )
+            # use welford_helper/cascade_helper for vec kernel
+            if reduction_type == "welford_reduce":
+                helper_val = self.welford_helper_cse.generate(
+                    self.compute, f"reduction {reduction_key}", write=False
+                )
+            else:
+                helper_val = self.cascade_helper_cse.generate(
+                    self.compute, f"reduction {reduction_key}", write=False
+                )
+            # rename the helper variable to distinguish it from vectorized version
+            scalar_helper_val = f"scalar_{helper_val}"
+            self._use_acc_helper(
+                reduction_type,
+                acc,
+                scalar_helper_val,
+                reduction_size,
+                dtype,
+                use_scalar=True,
+            )
+            self.stores.writeline(
+                f"{acc} = {reduction_combine(reduction_type, acc, value, scalar_helper_val)};"
+            )
+        else:
+            if logical_index is not None:
+                index = logical_index
+            else:
+                if self.reduction_depth is None:
+                    raise AssertionError("expected self.reduction_depth is not None")
+                index = self.itervars[self.reduction_depth]
+                for i in range(self.reduction_depth + 1, len(self.itervars)):
+                    index = index * self.ranges[i] + self.itervars[i]
+            self.stores.writeline(
+                f"{acc} = {reduction_combine(reduction_type, acc, value, index=index)};"
+            )
+
+        self._gen_parallel_reduction_buffers(acc, acc_type, reduction_type, init_dtype)
+        result = reduction_project(reduction_type, acc)
+        self.reduction_cse.reduction_cache[reduction_key] = result
+        return result
+
+    def store_reduction(self, name, index, value):
+        index = self.rename_indexing(index)
+        var = self.args.output(name)
+        self.reduction_suffix.writeline(
+            DeferredLine(name, f"{var}[{cexpr_index(index)}] = {value};")
+        )
+
+    def set_ranges(self, lengths, reduction_lengths):
+        if self.call_ranges:
+            if self.call_ranges != tuple(lengths) + tuple(reduction_lengths):
+                raise AssertionError(
+                    f"{self.call_ranges} == {tuple(lengths)} + {tuple(reduction_lengths)}"
+                )
+            if self.reduction_depth != len(lengths):
+                raise AssertionError("expected self.reduction_depth == len(lengths)")
+        else:
+            self.call_ranges = tuple(lengths) + tuple(reduction_lengths)
+            self.ranges = [self.rename_indexing(x) for x in self.call_ranges]
+            self.itervars = [
+                sympy_index_symbol_with_prefix(SymT.XBLOCK, n)
+                for n in range(len(self.ranges))
+            ]
+            # pyrefly: ignore [bad-assignment]
+            self.reduction_depth = len(lengths)
+        return (
+            self.itervars[: self.reduction_depth],
+            self.itervars[self.reduction_depth :],
+        )
+
+    def size_hint(self):
+        if self.call_ranges is None:
+            raise AssertionError("expected self.call_ranges is not None")
+        expr = sympy_product(self.call_ranges)
+        return V.graph.sizevars.optimization_hint(expr)
+
+    def codegen_loops_impl(self, loop_nest, code, worksharing):
+        if not isinstance(self, CppKernelProxy):
+            raise AssertionError("expected isinstance(self, CppKernelProxy)")
+        threads = parallel_num_threads()
+        if self.call_ranges is None:
+            raise AssertionError("expected self.call_ranges is not None")
+        if isinstance(loop_nest.kernel, OuterLoopFusedKernel):
+            par_depth = loop_nest.kernel.decide_parallel_depth(
+                loop_nest.max_parallel_depth(), threads
+            )
+        else:
+            par_depth = self.decide_parallel_depth(
+                loop_nest.max_parallel_depth(), threads
+            )
+
+        is_reduction_loop = (
+            loop_nest.loops is not None
+            and loop_nest.loops[par_depth.start_depth].is_reduction
+        )
+        with contextlib.ExitStack() as stack:
+            if par_depth.parallel_depth:
+                if is_reduction_loop:
+                    # need to close the worksharing scope to define reduction vars outside it
+                    worksharing.close()
+                else:
+                    worksharing.parallel(threads)
+                loop_nest.mark_parallel(par_depth)
+            elif threads > 1:
+                if worksharing.single():
+                    stack.enter_context(code.indent())
+
+            def gen_kernel(_loop_nest: LoopNest):
+                def is_parallel_reduction():
+                    if not _loop_nest.loops:
+                        raise AssertionError("expected _loop_nest.loops")
+                    root = _loop_nest.loops[par_depth.start_depth]
+                    return root.is_reduction and root.parallel
+
+                kernel = _loop_nest.get_kernel()
+                if isinstance(kernel, OuterLoopFusedKernel):
+                    for _loop_nest in kernel.inner:
+                        gen_loop_nest(_loop_nest)
+                else:
+                    if not isinstance(kernel, CppKernelProxy):
+                        raise AssertionError(
+                            "expected isinstance(kernel, CppKernelProxy)"
+                        )
+                    if _loop_nest.loops is not None and is_parallel_reduction():
+                        kernel.update_stores_with_parallel_reduction()
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(code.indent())
+                        kernel.gen_body(code)
+
+            def get_reduction_prefix_suffix(kernel, parallel=False, is_suffix=False):
+                if is_suffix:
+                    suffix = kernel.reduction_suffix
+                    if parallel:
+                        suffix = kernel.parallel_reduction_suffix + suffix
+                    else:
+                        suffix = kernel.non_parallel_reduction_suffix + suffix
+                    return suffix
+                else:
+                    prefix = kernel.reduction_prefix
+                    if parallel:
+                        prefix = prefix + kernel.parallel_reduction_prefix
+                    else:
+                        prefix = prefix + kernel.non_parallel_reduction_prefix
+                    return prefix
+
+            def gen_loop_with_reduction(
+                _loop_nest: LoopNest, depth: int = 0, in_reduction=False
+            ):
+                kernel = _loop_nest.get_kernel()
+                if not _loop_nest.loops:
+                    raise AssertionError("expected _loop_nest.loops")
+                loop = _loop_nest.loops[depth]
+                with contextlib.ExitStack() as stack_outer:
+                    if loop.is_reduction and not in_reduction:
+                        reduction_prefix = get_reduction_prefix_suffix(
+                            kernel, loop.parallel, is_suffix=False
+                        )
+                        if reduction_prefix:
+                            stack_outer.enter_context(code.indent())
+                        code.splice(reduction_prefix)
+                    if is_reduction_loop and loop.parallel:
+                        worksharing.parallel(threads)
+                        if kernel.local_reduction_init:
+                            if not kernel.local_reduction_stores:
+                                raise AssertionError(
+                                    "expected kernel.local_reduction_stores"
+                                )
+                            code.splice(kernel.local_reduction_init)
+
+                    gen_loop_at(_loop_nest, depth)
+
+                    if is_reduction_loop and loop.parallel:
+                        if kernel.local_reduction_stores:
+                            code.splice(kernel.local_reduction_stores)
+                        worksharing.close()
+                    if loop.is_reduction and not in_reduction:
+                        code.splice(
+                            get_reduction_prefix_suffix(
+                                kernel, loop.parallel, is_suffix=True
+                            )
+                        )
+
+            def gen_loop_at(_loop_nest: LoopNest, depth: int = 0):
+                with contextlib.ExitStack() as stack:
+                    if not _loop_nest.loops:
+                        raise AssertionError("expected _loop_nest.loops")
+                    loop = _loop_nest.loops[depth]
+                    loop_lines = loop.lines()
+                    if loop_lines is None:
+                        return
+                    code.writelines(loop_lines)
+                    stack.enter_context(code.indent())
+                    gen_loop_nest(_loop_nest, depth + 1, loop.is_reduction)
+
+            def gen_loop_nest(
+                _loop_nest: LoopNest,
+                depth: int = 0,
+                in_reduction: bool = False,
+            ):
+                if _loop_nest.loops is None or depth == len(_loop_nest.loops):  # type: ignore[arg-type]
+                    gen_kernel(_loop_nest)
+                else:
+                    gen_loop_with_reduction(_loop_nest, depth, in_reduction)
+
+            stack.enter_context(code.indent())
+
+            if (
+                isinstance(loop_nest.kernel, OuterLoopFusedKernel)
+                and isinstance(V.local_buffer_context, LocalBufferContext)
+                and V.local_buffer_context.local_buffers
+            ):
+                # Allocate local buffer
+                local_buffers = V.local_buffer_context.local_buffers
+                for local_buffer in local_buffers.values():
+                    # For dynamic size, rename s to ks
+                    local_buf_size = sympy_product(
+                        [
+                            self.rename_indexing(size_val)
+                            for size_val in local_buffer.get_layout().size
+                        ]
+                    )
+                    local_buf_dtype = DTYPE_TO_CPP[local_buffer.get_layout().dtype]
+                    allocate = f"std::make_unique<{local_buf_dtype} []>({cexpr(local_buf_size)})"
+                    local_buffer_name = local_buffer.get_name()
+                    code.splice(
+                        f"std::unique_ptr<{local_buf_dtype} []> buf_{local_buffer_name} = {allocate};"
+                    )
+                    code.splice(
+                        f"{local_buf_dtype}* {local_buffer_name} = buf_{local_buffer_name}.get();"
+                    )
+            gen_loop_nest(loop_nest)
+
+    def codegen_loops(self, code, worksharing):
+        loop_nest = LoopNest.build(self)
+        self.codegen_loops_impl(loop_nest, code, worksharing)
+
+    @property
+    def assert_function(self) -> str:
+        if V.graph.aot_mode:
+            return "AOTI_TORCH_CHECK"
+        else:
+            return "TORCH_CHECK"
+
+    def decide_parallel_depth(self, max_parallel_depth, threads):
+        if self.call_ranges is None:
+            raise AssertionError("expected self.call_ranges is not None")
+        ranges = self.call_ranges[
+            max_parallel_depth.start_depth : (
+                max_parallel_depth.start_depth + max_parallel_depth.parallel_depth
+            )
+        ]
+        seq = self.size_hint()
+        par = 1
+        depth = 0
+        for expr in ranges:
+            hint = V.graph.sizevars.optimization_hint(expr, fallback=8192)
+            if par >= 2 * threads or par == threads:
+                break
+            if seq // threads < config.cpp.min_chunk_size:
+                # not enough work
+                break
+            depth += 1
+            par *= hint
+            seq /= hint
+        # if we assume thread number is dynamic, make sure we
+        # have at least one parallel scope and let OMP runtime
+        # to manage the serial vs. parallel.
+        if config.cpp.dynamic_threads and depth == 0 and len(ranges) > 0:
+            depth = 1
+        return ParallelDepth(
+            parallel_depth=depth, start_depth=max_parallel_depth.start_depth
+        )
+
+    @contextlib.contextmanager
+    def write_to_suffix(self):
+        prior = (self.loads, self.compute, self.stores, self.cse)
+        self.loads = IndentedBuffer()
+        self.compute = IndentedBuffer()
+        self.stores = IndentedBuffer()
+        self.cse = self.cse.clone()
+        yield
+        self.reduction_suffix.splice(self.loads)
+        self.reduction_suffix.splice(self.compute)
+        self.reduction_suffix.splice(self.stores)
+        (self.loads, self.compute, self.stores, self.cse) = prior
+
+    def create_cse_var(self, *args, **kwargs):
+        return CppCSEVariable(*args, **kwargs)
+
+    def get_to_dtype_expr(self, src, dtype, src_dtype, rounding=False):
+        if (
+            rounding
+            and dtype in [tp.int8, tp.uint8]
+            and src_dtype in [tp.float, tp.double]
+        ):
+            return f"tensorplay::convert<{DTYPE_TO_CPP[dtype]}>(std::round({src}))"
+        return f"tensorplay::convert<{DTYPE_TO_CPP[dtype]}>({src})"
+
+    def cache_dtype_convert(self, dst, dst_dtype, src, src_dtype):
+        expr = self.get_to_dtype_expr(src, dst_dtype, src_dtype)
+        self.cse.put(expr, dst)
+
+    def codegen_conditions(
+        self,
+        code: BracesBuffer,
+        prefix: str | None = None,
+        var: sympy.Symbol | None = None,
+    ):
+        if prefix is None:
+            prefix = ""
+        if not self.active_ranges:
+            return True
+        conditions = []
+
+        def gen(start, end, var):
+            if start == end:
+                return False
+            var_id = None
+            for i, _var in enumerate(self.itervars):
+                if var == _var:
+                    var_id = i
+                    break
+            if (
+                type(self) is CppKernel
+                and var_id
+                and start == 0
+                and end == self.ranges[var_id]
+            ):
+                end = 1
+            # pyrefly: ignore [bad-argument-type]
+            conditions.append(f"{var} >= {cexpr_index(start)}")
+            # pyrefly: ignore [bad-argument-type]
+            conditions.append(f"{var} < {cexpr_index(end)}")
+            return True
+
+        if var is not None:
+            if var not in self.active_ranges:
+                raise AssertionError("expected var in self.active_ranges")
+            start, end = self.active_ranges[var]
+            if not gen(start, end, var):
+                return False
+        else:
+            for _var, _range in self.active_ranges.items():
+                start, end = _range
+                if not gen(start, end, _var):
+                    return False
+        joined_conditions = " && ".join(conditions)
+        if joined_conditions:
+            code.writeline(f"if({prefix}({joined_conditions}))")
+            return True
+        else:
+            return False
+
+
+class CppVecKernel(CppKernel):
+    overrides = CppVecOverrides  # type: ignore[assignment]
+
+    def __init__(
+        self,
+        args,
+        num_threads,
+        tiling_factor,
+        tiling_idx,
+        tail_size=None,
+    ):
+        super().__init__(args, num_threads)
+        self.vec_isa = cpu_vec_isa.pick_vec_isa()
+        if not self.vec_isa:
+            raise AssertionError("expected self.vec_isa")
+        if tiling_factor <= 0:
+            raise AssertionError("Expect pass in Non-Zero tiling_factor explicitly")
+        self.tiling_factor = tiling_factor
+        self.tiling_idx = tiling_idx
+        self.tail_size = tail_size
+        self.num_elems = tail_size if tail_size else tiling_factor
+
+    def _try_get_const_stride(self, index: sympy.Expr, itervar: sympy.Symbol):
+        if self.index_indirect_depends_on(index, itervar):
+            return None
+        for indirect_var in (
+            self.cse.varname_map[s.name]  # type: ignore[attr-defined]
+            for s in index.free_symbols
+            if symbol_is_type(s, SymT.TMP)
+        ):
+            if not isinstance(indirect_var, CppCSEVariable):
+                raise AssertionError(
+                    "expected isinstance(indirect_var, CppCSEVariable)"
+                )
+            if indirect_var.is_vec:
+                return None
+        stride = stride_at_vec_range(index, itervar, self.tiling_factor)
+        return stride if stride.is_number else None
+
+    def _get_num_vectors(self, dtype: tp.dtype) -> int:
+        num_vectors = math.ceil(
+            self.tiling_factor * dtype.itemsize * 8 / self.vec_isa.bit_width
+        )
+        if num_vectors < 1:
+            raise AssertionError("expected num_vectors >= 1")
+        return num_vectors
+
+    def _get_raw_num_vectors(self, dtype: tp.dtype) -> float:
+        # This utility function is used to check if the vector lanes has been
+        # fully utilized. For example, uint8 will only use 1/4 of the vector lanes.
+        return self.tiling_factor * dtype.itemsize * 8 / self.vec_isa.bit_width
+
+    def _get_vec_type(self, dtype: tp.dtype) -> str:
+        num_vectors = self._get_num_vectors(dtype)
+        if num_vectors == 1:
+            return f"tensorplay::vec::Vectorized<{DTYPE_TO_CPP[dtype]}>"
+        else:
+            return f"tensorplay::vec::VectorizedN<{DTYPE_TO_CPP[dtype]},{num_vectors}>"
+
+    def _get_mask_type(self, dtype: tp.dtype = tp.float) -> str:
+        if dtype == tp.bool:
+            return ""
+        num_vectors = self._get_num_vectors(dtype)
+        return f"tensorplay::vec::VecMask<{DTYPE_TO_CPP[dtype]},{num_vectors}>"
+
+    def _get_mask_cast(self, mask: CppCSEVariable, dtype: tp.dtype) -> str:
+        if mask.dtype != tp.bool:
+            raise AssertionError(repr(mask))
+        num_vectors = self._get_num_vectors(dtype)
+        return f"{mask}.template cast<{DTYPE_TO_CPP[dtype]},{num_vectors}>()"
+
+    def _get_vec_load_line(
+        self,
+        var: str,
+        index: sympy.Expr,
+        dtype: tp.dtype,
+        load_mask: CppCSEVariable | None = None,
+    ):
+        """
+        Get a load line str that loads a vector from `var` at `index` of type `dtype`.
+        If `load_mask` is not None, we do a masked load accordingly.
+        Notes on the `dtype`:
+        1. We always load `self.tiling_factor` number of elements regardless of the `dtype`.
+           It means we load half of the vector lanes for 16-bit data types and quarter of the
+           vector lanes for 8-bit data types.
+        2. `tp.bool` and `tp.uint8` could mean masks and we load them as float mask vectors.
+        """
+        cpp_type = DTYPE_TO_CPP[dtype]
+        num_vectors = self._get_num_vectors(dtype)
+        load_mask_str = None
+        if load_mask:
+            if not load_mask.is_vec:
+                # TODO: avoid hard-code tp.float
+                load_mask_str = f"{self._get_mask_type(tp.float)}::from({load_mask})"
+            else:
+                load_mask_str = f"{self._get_mask_cast(load_mask, tp.float)}"
+        loadbuf = f"{var} + {cexpr_index(index)}" if index != 0 else var
+        if dtype == tp.bool:
+            # TODO: should we consider load mask here?
+            line = f"{self._get_mask_type()}::from({loadbuf}, {cexpr_index(self.num_elems)})"
+        else:
+            line = (
+                f"{load_mask_str}.template loadu<{cpp_type},{num_vectors}>({loadbuf})"
+                if load_mask_str
+                else f"{self._get_vec_type(dtype)}::loadu({loadbuf}, {cexpr_index(self.num_elems)})"
+            )
+        return line
+
+    def _load_or_store_non_contiguous(
+        self,
+        var: str | None,
+        index: sympy.Expr,
+        dtype: tp.dtype,
+        buffer: IndentedBuffer | None = None,
+        store_value: str | CppCSEVariable | None = None,
+        accu_store: bool = False,
+    ) -> CppCSEVariable | None:
+        """
+        Load or store a vector in a non-contiguous way. The vector is initialized from an array that is
+        filled in an inner loop over the tiling factor.
+        :param var: buffer to load from or store to, i.e. `var[transformed(index)]`. If None, we load the index
+                    as index expression, i.e. `transformed(index)`.
+        :param index: index into the `var` or the index expression by its own if `var` is None.
+                      The `index` could contain indirect indexing or the tiling itervar. When used in
+                      the inner loop, the index is transformed as follows:
+                      1. the index is linearized along the tiling dim.
+                      2. the indirect indexing vector variables are transformed into arrays over the tiling dim.
+        :param dtype: data type of `var` or `index` if `var` is None.
+        :param buffer: the code buffer to write the generated code to. If None, we write to `self.loads`.
+        :param store_value: the value to store. If None, we load the vector.
+        :param accu_store: whether accumulate the store_value to store_ptr. If True, a store_value should be provided
+        :return: a CppCSEVariable that represents the loaded vector or None if it is a store.
+        """
+        if store_value and var is None:
+            raise AssertionError("store var must be provided")
+        if accu_store:
+            if not store_value:
+                raise AssertionError("expected store_value")
+        if buffer is None:
+            buffer = self.loads
+
+        def get_result_size(dtype: tp.dtype) -> int:
+            if dtype.itemsize < 4:
+                return self.num_elems * (4 // dtype.itemsize)
+            else:
+                return self.num_elems
+
+        def get_tiling_size(dtype: tp.dtype) -> int:
+            if dtype.itemsize < 4:
+                return self.tiling_factor * (4 // dtype.itemsize)
+            else:
+                return self.tiling_factor
+
+        def vec_to_array(vec_var: CppCSEVariable) -> CppCSEVariable:
+            if not vec_var.is_vec:
+                raise AssertionError("expected vec_var.is_vec")
+            code = BracesBuffer()
+            code.writeline("[&]")
+            with code.indent():
+                vec_dtype = vec_var.dtype
+                if vec_dtype is None:
+                    raise AssertionError("expected vec_dtype is not None")
+                if vec_dtype == tp.bool:
+                    vec_dtype = tp.float
+                result_size = get_result_size(vec_dtype)
+                tiling_size = get_tiling_size(vec_dtype)
+                code.writeline(
+                    f"__at_align__ std::array<{DTYPE_TO_CPP[vec_dtype]}, {tiling_size}> tmpbuf;"
+                )
+                line = f"{vec_var}.store(tmpbuf.data(), {cexpr_index(result_size)});"
+                code.writeline(line)
+                code.writeline("return tmpbuf;")
+            code.writeline("()")
+            csevar = self.cse.generate(buffer, code)
+            if not isinstance(csevar, CppCSEVariable):
+                raise AssertionError("expected isinstance(csevar, CppCSEVariable)")
+            return csevar
+
+        code = BracesBuffer()
+        code.writeline("[&]")
+        with code.indent():
+            result_size = get_result_size(dtype)
+            tiling_size = get_tiling_size(dtype)
+            result_declare = (
+                f"__at_align__ std::array<{DTYPE_TO_CPP[dtype]}, {tiling_size}> tmpbuf;"
+            )
+            code.writeline(result_declare)
+            if store_value:
+                code.writeline(
+                    f"{store_value}.store(tmpbuf.data(), {cexpr_index(result_size)});"
+                )
+            itervar_inner = sympy_index_symbol(
+                f"{self.itervars[self.tiling_idx]}_inner"
+            )
+            replacements = {}
+            for indirect_var in (
+                self.cse.varname_map[s.name]  # type: ignore[attr-defined]
+                for s in index.free_symbols
+                if symbol_is_type(s, SymT.TMP)
+            ):
+                if not isinstance(indirect_var, CppCSEVariable):
+                    raise AssertionError(
+                        "expected isinstance(indirect_var, CppCSEVariable)"
+                    )
+                if indirect_var.is_vec:
+                    array_var = vec_to_array(indirect_var)
+                    replacements[indirect_var] = f"{array_var}[{itervar_inner}]"
+            index = self.scale_index_with_offset(
+                index, itervar_idx=self.tiling_idx, offset=itervar_inner
+            )
+            load_mask = None
+            if self._load_mask is not None:
+                if store_value:
+                    raise AssertionError("unexpected store with load mask")
+                if not isinstance(self._load_mask, CppCSEVariable):
+                    raise AssertionError(self._load_mask)
+                if self._load_mask.is_vec:
+                    load_mask = f"{self._load_mask}.is_masked({itervar_inner})"
+                else:
+                    load_mask = f"{self._load_mask} != 0"
+            if cpp_builder.is_gcc():
+                code.writeline(f"#pragma GCC unroll {self.tiling_factor}")
+            else:
+                code.writeline(f"#pragma unroll {self.tiling_factor}")
+            code.writeline(
+                f"for (long {itervar_inner} = 0; "
+                + f"{itervar_inner} < {cexpr_index(self.num_elems)}; "
+                + f"{itervar_inner}++)"
+            )
+            with code.indent(), contextlib.ExitStack() as stack:
+                index_c = cexpr_index(index)
+                # pyrefly: ignore [bad-assignment]
+                for indirect_var in replacements:
+                    index_c = re.sub(
+                        r"\b" + f"{indirect_var}" + r"\b",
+                        replacements[indirect_var],
+                        index_c,
+                    )
+                rhs = f"{var}[{index_c}]" if var is not None else f"{index_c}"
+                if load_mask:
+                    code.writeline(f"if ({load_mask})")
+                    stack.enter_context(code.indent())
+                if store_value:
+                    conjunction = "+=" if accu_store else "="
+                    code.writeline(f"{rhs} {conjunction} tmpbuf[{itervar_inner}];")
+                else:
+                    code.writeline(f"tmpbuf[{itervar_inner}] = {rhs};")
+            if not store_value:
+                load_line = self._get_vec_load_line("tmpbuf.data()", 0, dtype)  # type: ignore[arg-type]
+                code.writeline(f"return {load_line};")
+        code.writeline("()")
+        if store_value:
+            code.writeline(";")
+            buffer.splice(code)
+            return None
+        else:
+            csevar = self.cse.generate(buffer, code, dtype=dtype)
+            if not isinstance(csevar, CppCSEVariable):
+                raise AssertionError("expected isinstance(csevar, CppCSEVariable)")
+            csevar.is_vec = True
+            return csevar
+
+    def load(self, name: str, index: sympy.Expr):
+        var = self.args.input(name)
+        index = self.rename_indexing(index)
+        dtype = V.graph.get_dtype(name)
+        tiling_var = self.itervars[self.tiling_idx]
+        stride = self._try_get_const_stride(index, tiling_var)
+        if stride == 0:
+            # load scalar and lazily broadcast it on demand
+            return super().load(name, index)
+        elif stride == 1:
+            # load contiguously
+            line = self._get_vec_load_line(var, index, dtype, self._load_mask)  # type: ignore[arg-type]
+            csevar = self.cse.generate(self.loads, line, dtype=dtype)  # type: ignore[assignment]
+        else:
+            csevar = self._load_or_store_non_contiguous(var, index, dtype)  # type: ignore[assignment]
+        if not isinstance(csevar, CppCSEVariable):
+            raise AssertionError("expected isinstance(csevar, CppCSEVariable)")
+        csevar.update_on_args("load", (self, name, index), {})
+        csevar.is_vec = True
+        return csevar
+
+    def _get_store_line(
+        self,
+        value: str | CppCSEVariable,
+        var: str,
+        index: sympy.Expr,
+        dtype: tp.dtype,
+        accu_store: bool = False,
+    ):
+        """
+        Get a store line buffer that stores `value` into `var` at `index` of `dtype`. It handles
+        both contiguous and non-contiguous store cases.
+        :param value: Vectorized type templaterized on `dtype`.
+        :param var: buffer to store into.
+        :index: index into the `var`.
+        """
+        # when value's type is str (e.g., welford reduction), caller should make sure
+        # it is a vector
+        if not (
+            isinstance(value, str)
+            or (isinstance(value, CppCSEVariable) and value.is_vec)
+        ):
+            raise AssertionError(value)
+        tiling_var = self.itervars[self.tiling_idx]
+        var_expr = f"{var} + {cexpr_index(index)}"
+        stride = self._try_get_const_stride(index, tiling_var)
+        code = IndentedBuffer()
+        if stride == 1:
+            if accu_store:
+                load = (
+                    f"{self._get_vec_type(dtype)}::loadu({var_expr})"
+                    if dtype == tp.float and self.tail_size is None
+                    else f"{self._get_vec_type(dtype)}::loadu({var_expr}, {cexpr_index(self.num_elems)})"
+                )
+                value = f"({value} + {load})"
+            if dtype == tp.float and self.tail_size is None:
+                code.writeline(f"{value}.store({var_expr});")
+            else:
+                code.writeline(
+                    f"{value}.store({var_expr}, {cexpr_index(self.num_elems)});"
+                )
+        else:
+            self._load_or_store_non_contiguous(
+                var, index, dtype, buffer=code, store_value=value, accu_store=accu_store
+            )
+        return code
+
+    def store(self, name, index, value, mode=None):
+        if "buf" not in name:
+            raise AssertionError('expected "buf" in name')
+        if not isinstance(value, CppCSEVariable):
+            raise AssertionError(value)
+        if not value.is_vec:
+            # this happens when we store a scalar into a vectorized buffer like "fill"
+            value = self.broadcast(value)
+        var = self.args.output(name)
+        index = self.rename_indexing(index)
+        dtype = V.graph.get_dtype(name)
+        if mode is None:
+            code = self._get_store_line(value, var, index, dtype)
+            self.stores.splice(code.map(lambda x: DeferredLine(name, x)))
+        elif mode == "atomic_add":
+            if not self._use_parallel_atomic_add():
+                code = self._get_store_line(
+                    f"{value}",
+                    var,
+                    index,
+                    dtype,
+                    accu_store=True,
+                )
+                self.stores.splice(code.map(lambda x: DeferredLine(name, x)))
+            else:
+                n_src = self._get_num_vectors(dtype)
+                n_idx = self._get_num_vectors(tp.int64)
+                cdtype = DTYPE_TO_CPP[dtype]
+                # ops.index_expr re-applies subclass index transforms, so a caller
+                # that already transformed must pass the untransformed index
+                index = ops.index_expr(index, tp.int64).value
+                if isinstance(index, CppCSEVariable) and not index.is_vec:
+                    index = self.broadcast(index)
+                if not (isinstance(index, CppCSEVariable) and index.is_vec):
+                    raise AssertionError(
+                        "expected isinstance(index, CppCSEVariable) and index.is_vec"
+                    )
+                if self.tail_size:
+                    line = f"atomic_add_vec<{cdtype}, {n_idx}, {n_src}>({var}, {index}, {value}, {cexpr_index(self.tail_size)});"
+                else:
+                    line = f"atomic_add_vec<{cdtype}, {n_idx}, {n_src}>({var}, {index}, {value});"
+                self.stores.writeline(DeferredLine(name, line))
+        else:
+            raise NotImplementedError(f"store mode={mode}")
+
+    def _adjust_argreduce_index(self, index: sympy.Expr) -> sympy.Expr:
+        return index
+
+    def reduction(self, dtype, src_dtype, reduction_type, value):
+        """
+        Perform vectorized reduction operation.
+
+        This method handles vectorized reduction for different reduction types.
+        It manages special cases for low-precision floating point types and
+        employs precision improvement techniques for certain reduction operations.
+
+        Args:
+            dtype: The output data type for the reduction result
+            src_dtype: The source data type of the input value
+            reduction_type: Type of reduction operation (sum, min, max, etc.)
+            value: The input value to reduce
+
+        Returns:
+            The result of the reduction operation
+        """
+        # Note: For argmax and argmin on bool type, we always convert bool to
+        # float, because a bool lane has no ordering to pick a maximum from.
+        if reduction_type not in VECTORIZABLE_RTYPES:
+            raise AssertionError("expected reduction_type in VECTORIZABLE_RTYPES")
+        argmax_or_argmin = reduction_type in ("argmax", "argmin")
+        logical_index = None
+        if argmax_or_argmin and isinstance(value, tuple):
+            value, logical_index = value
+
+        horizontal_reduction = self.tiling_idx >= self.reduction_depth
+        init_dtype = src_dtype if argmax_or_argmin else dtype
+        if not isinstance(value, CppCSEVariable):
+            raise AssertionError(value)
+        if not isinstance(logical_index, (CppCSEVariable, type(None))):
+            raise AssertionError(logical_index)
+
+        if not value.is_vec:
+            value = self.broadcast(value)
+
+        if logical_index is not None:
+            logical_index_key = cast(CppCSEVariable, logical_index)
+            reduction_key = src_dtype, reduction_type, (value, logical_index_key)
+        else:
+            reduction_key = src_dtype, reduction_type, value
+        if reduction_key in self.reduction_cse.reduction_cache:
+            return self.reduction_cse.reduction_cache[reduction_key]
+
+        vec_ns = "tensorplay::vec"
+        vec = f"{vec_ns}::Vectorized<{DTYPE_TO_CPP[dtype]}>"
+        acc_type = reduction_acc_type(reduction_type, init_dtype)
+        acc_type_vec = self.reduction_acc_type_vec(reduction_type, init_dtype)
+
+        acc = self.reduction_cse.generate(
+            self.loads, f"reduction {reduction_key}", write=False
+        )
+        if not isinstance(acc, CppCSEVariable):
+            raise AssertionError("expected isinstance(acc, CppCSEVariable)")
+        acc_vec = f"{acc}_vec"
+        masked_acc = f"masked_{acc}"
+        masked_acc_vec = f"masked_{acc_vec}"
+        self.reduction_var_names += [f"{acc}", acc_vec, masked_acc_vec]
+        self.is_reduction = True
+        self.reduction_prefix_generators.append(
+            self._gen_reduction_prefix(
+                acc, acc_type, reduction_type, init_dtype, reduction_init
+            )
+        )
+        self.reduction_prefix_generators.append(
+            self._gen_reduction_prefix(
+                acc_vec,
+                acc_type_vec,
+                reduction_type,
+                init_dtype,
+                self.reduction_init_vec,
+            )
+        )
+
+        use_acc_helper = self.need_use_acc_helper(reduction_type, dtype, False)
+        if use_acc_helper:
+            if logical_index is not None:
+                raise AssertionError(logical_index)
+            # use masked acc_vec for tail vec kernel
+            self.reduction_prefix_generators.append(
+                self._gen_reduction_prefix(
+                    masked_acc_vec,
+                    acc_type_vec,
+                    reduction_type,
+                    dtype,
+                    self.reduction_init_vec,
+                )
+            )
+
+            # use welford_helper/cascade_helper for vec kernel
+            if self.reduction_depth is None:
+                raise AssertionError("expected self.reduction_depth is not None")
+            reduction_size = functools.reduce(
+                operator.mul, self.ranges[self.reduction_depth :]
+            )
+            if reduction_type == "welford_reduce":
+                helper_val = self.welford_helper_cse.generate(
+                    self.compute, f"reduction {reduction_key}", write=False
+                )
+            else:
+                helper_val = self.cascade_helper_cse.generate(
+                    self.compute, f"reduction {reduction_key}", write=False
+                )
+            masked_helper_val = f"masked_{helper_val}"
+            helper_vec_range = (
+                (
+                    FloorDiv(reduction_size, self.ranges[self.tiling_idx])
+                    * FloorDiv(self.ranges[self.tiling_idx], self.tiling_factor)
+                    if self.tiling_idx >= self.reduction_depth
+                    else reduction_size
+                )
+                if FloorDiv(self.ranges[self.tiling_idx], self.tiling_factor)
+                else sympy.Integer(0)
+            )
+            masked_helper_vec_range = (
+                (
+                    FloorDiv(reduction_size, self.ranges[self.tiling_idx])
+                    if self.tiling_idx >= self.reduction_depth
+                    else reduction_size
+                )
+                if self.ranges[self.tiling_idx] % self.tiling_factor
+                else sympy.Integer(0)
+            )
+            # scalar helper for scalar welford_reduce/sum is also needed when vec kernel is included
+            scalar_helper_val = f"scalar_{helper_val}"
+            self._use_acc_helper(
+                reduction_type,
+                acc,
+                scalar_helper_val,
+                reduction_size,
+                dtype,
+                use_scalar=True,
+            )
+            self._use_acc_helper(
+                reduction_type, acc, helper_val, helper_vec_range, dtype
+            )
+            self._use_acc_helper(
+                reduction_type,
+                masked_acc,
+                masked_helper_val,
+                masked_helper_vec_range,
+                dtype,
+            )
+
+            # use masked acc_vec for tail vec kernel
+            acc_vec_ = masked_acc_vec if self.tail_size else acc_vec
+            helper_val_ = masked_helper_val if self.tail_size else helper_val
+            if reduction_type == "sum":
+                self.stores.writeline(
+                    f"{acc_vec_} = {self.reduction_combine_vec(reduction_type, acc_vec_, value, helper_val_)};"
+                )
+            else:
+                self.stores.writeline(
+                    f"{acc_vec_} = {self.reduction_combine_vec(reduction_type, acc_vec_, value, helper_val_)};"
+                )
+        else:
+            if logical_index is not None:
+                index = logical_index
+                index_horizontal_reduction = False
+            else:
+                if self.reduction_depth is None:
+                    raise AssertionError("expected self.reduction_depth is not None")
+                index = self.itervars[self.reduction_depth]
+                for i in range(self.reduction_depth + 1, len(self.itervars)):
+                    index = index * self.ranges[i] + self.itervars[i]
+                index_horizontal_reduction = horizontal_reduction
+            kwargs = {
+                "next_value": value,
+                "index": index,
+                "horizontal_reduction": index_horizontal_reduction,
+                "src_dtype": src_dtype,
+            }
+            self.stores.writeline(
+                f"{acc_vec} = {self.reduction_combine_vec(reduction_type, acc_vec, **kwargs)};"
+            )
+        self._gen_parallel_reduction_buffers(
+            acc_vec,
+            acc_type_vec,
+            reduction_type,
+            init_dtype,
+            reduction_combine_fn=self.reduction_combine_vec,
+            reduction_init_fn=self.reduction_init_vec,
+        )
+        self._gen_parallel_reduction_buffers(
+            acc,
+            acc_type,
+            reduction_type,
+            init_dtype,
+            reduction_combine_fn=reduction_combine,
+            reduction_init_fn=reduction_init,
+        )
+        if use_acc_helper:
+            # use masked acc_vec for tail vec kernel
+            self._gen_parallel_reduction_buffers(
+                masked_acc_vec,
+                acc_type_vec,
+                reduction_type,
+                dtype,
+                reduction_combine_fn=self.reduction_combine_vec,
+                reduction_init_fn=self.reduction_init_vec,
+            )
+        tmpvar: str | CSEVariable
+        is_bool = dtype == tp.bool
+        if horizontal_reduction:
+            # Horizontal reduction
+            if is_welford_reduction(reduction_type):
+                if self._get_num_vectors(dtype) not in [
+                    1,
+                    2,
+                ]:
+                    raise AssertionError(
+                        "Welford reduction does not support VectorizedN (N>2)"
+                    )
+                next_value = f"welford_vec_reduce_all({acc_vec})"
+                masked_next_value = f"welford_vec_reduce_all({masked_acc_vec})"
+                self.reduction_suffix.writeline(
+                    f"{acc} = {reduction_combine(reduction_type, acc, masked_next_value)};"
+                )
+            elif argmax_or_argmin:
+                next_value = f"{reduction_type}_vec_reduce_all({acc_vec})"
+            elif is_bool:
+                if reduction_type in (
+                    "any",
+                    "sum",
+                    "max",
+                ):
+                    next_value = f"!{acc_vec}.all_zero()"
+                else:
+                    if reduction_type != "min":
+                        raise AssertionError('expected reduction_type == "min"')
+                    next_value = f"{acc_vec}.all_masked()"
+            else:
+                reduce_all_body = (
+                    "{ return "
+                    + self.reduction_combine_vec(reduction_type, "x", "y")
+                    + "; }"
+                )
+                is_bool = dtype == tp.bool
+                # we are using tensorplay::vec::VecMask<float, N> for bool
+                vec_dtype = tp.float if is_bool else dtype
+                vec = f"tensorplay::vec::Vectorized<{DTYPE_TO_CPP[vec_dtype]}>"
+                vec_reduce_all_func = f"tensorplay::vec::vec_reduce_all<{DTYPE_TO_CPP[vec_dtype]}, {self._get_num_vectors(vec_dtype)}>"
+                result_vec = f"{acc_vec}"
+                if use_acc_helper:
+                    if reduction_type != "sum":
+                        raise AssertionError('expected reduction_type == "sum"')
+                    result_vec = f"{acc_vec} + {masked_acc_vec}"
+                next_value = f"{vec_reduce_all_func}([]({vec}& x, {vec}& y) {reduce_all_body}, {result_vec})"
+
+            self.reduction_suffix.writeline(
+                f"{acc} = {reduction_combine(reduction_type, acc, next_value, src_dtype=src_dtype)};"
+            )
+            tmpvar = acc
+        else:
+            tmpvar = acc_vec
+            if is_welford_reduction(reduction_type):
+                masked_tmpvar = f"masked_{tmpvar}"
+                self.reduction_suffix.writeline(
+                    f"{tmpvar} = {reduction_combine(reduction_type, tmpvar, masked_tmpvar)};"
+                )
+            elif use_acc_helper:
+                if reduction_type != "sum":
+                    raise AssertionError('expected reduction_type == "sum"')
+                masked_tmpvar = f"masked_{tmpvar}"
+                self.reduction_suffix.writeline(
+                    f"{tmpvar} = {tmpvar} + {masked_tmpvar};"
+                )
+
+        result = reduction_project(reduction_type, tmpvar)
+        self.reduction_cse.reduction_cache[reduction_key] = result
+        return result
+
+    def store_reduction(self, name, index, value):
+        index = self.rename_indexing(index)
+        var = self.args.output(name)
+        out_dtype = V.graph.get_dtype(name)
+        if out_dtype.is_floating_point and out_dtype != tp.double:
+            dtype = tp.float
+        else:
+            dtype = out_dtype
+        out_num_vectors = V.kernel._get_num_vectors(out_dtype)
+        src_num_vectors = V.kernel._get_num_vectors(dtype)
+        code = IndentedBuffer()
+        if self.tiling_idx >= self.reduction_depth:
+            # Horizontal reduction
+            code.writeline(
+                f"{var}[{cexpr_index(index)}] = static_cast<{DTYPE_TO_CPP[out_dtype]}>({value});"
+            )
+        else:
+            # Vertical reduction
+            if out_dtype != dtype:
+                converted_value = (
+                    f"{DTYPE_TO_CPP[out_dtype].replace('::', '_')}_{value}"
+                )
+                if out_dtype == tp.bool:
+                    convert = f"{value}.template cast<bool,{self._get_num_vectors(tp.bool)}>()"
+                else:
+                    if src_num_vectors == out_num_vectors == 1:
+                        convert = (
+                            f"tensorplay::vec::convert<{DTYPE_TO_CPP[out_dtype]}>({value})"
+                        )
+                    else:
+                        convert = (
+                            f"tensorplay::vec::convert<{DTYPE_TO_CPP[out_dtype]},"
+                            f"{out_num_vectors},{DTYPE_TO_CPP[dtype]},{src_num_vectors}>({value})"
+                        )
+                code.writeline(f"auto {converted_value} = {convert};")
+                value = converted_value
+            code.splice(self._get_store_line(value, var, index, out_dtype))
+        self.reduction_suffix.splice(code.map(lambda x: DeferredLine(name, x)))
+
+    def broadcast(self, scalar_var: CppCSEVariable) -> CppCSEVariable:
+        if scalar_var.is_vec:
+            raise AssertionError("expected not scalar_var.is_vec")
+        if scalar_var.dtype == tp.bool:
+            vec_var = self.cse.generate(
+                self.compute, f"{self._get_mask_type()}::from({scalar_var.name})"
+            )
+        else:
+            if scalar_var.dtype is None:
+                raise AssertionError("expected scalar_var.dtype is not None")
+            vec_var = self.cse.generate(
+                self.compute,
+                f"{self._get_vec_type(scalar_var.dtype)}({scalar_var.name})",
+            )
+        if not isinstance(vec_var, CppCSEVariable):
+            raise AssertionError("expected isinstance(vec_var, CppCSEVariable)")
+        vec_var.dtype = scalar_var.dtype
+        vec_var.dependent_itervars = scalar_var.dependent_itervars
+        vec_var.is_vec = True
+        return vec_var
+
+    def arange(self, index: CppCSEVariable, stride: sympy.Symbol) -> CppCSEVariable:
+        if index.is_vec:
+            raise AssertionError("expected not index.is_vec")
+        if index.dtype is None:
+            raise AssertionError("expected index.dtype is not None")
+        csevar = self.cse.generate(
+            self.compute,
+            f"{self._get_vec_type(index.dtype)}::arange({index}, {stride})",
+        )
+        if not isinstance(csevar, CppCSEVariable):
+            raise AssertionError("expected isinstance(csevar, CppCSEVariable)")
+        csevar.dtype = index.dtype
+        csevar.is_vec = True
+        return csevar
+
+    def reduction_init_vec(self, reduction_type, dtype):
+        scalar_type = DTYPE_TO_COMPUTATION_DTYPE[dtype]
+        vec_type = self._get_vec_type(scalar_type)
+
+        if is_welford_reduction(reduction_type):
+            return f"Welford<{vec_type}>()"
+
+        if reduction_type in ("argmin", "argmax"):
+            # For bool argmin/argmax, we use float for computations
+            compute_dtype = tp.float if dtype == tp.bool else scalar_type
+            cdtype = DTYPE_TO_CPP[compute_dtype]
+            acc_type = self.reduction_acc_type_vec(reduction_type, dtype)
+            if reduction_type == "argmin":
+                val = (
+                    f"std::numeric_limits<{cdtype}>::infinity()"
+                    if is_float_dtype(dtype) or dtype == tp.bool
+                    else f"std::numeric_limits<{cdtype}>::max()"
+                )
+            else:
+                val = (
+                    f"-std::numeric_limits<{cdtype}>::infinity()"
+                    if is_float_dtype(dtype) or dtype == tp.bool
+                    else f"std::numeric_limits<{cdtype}>::min()"
+                )
+            return f"{acc_type}({val})"
+
+        if reduction_type == "any":
+            return f"{self._get_mask_type()}::from(0)"
+
+        scalar_init = reduction_init(reduction_type, dtype)
+        vec_init = f"{vec_type}({scalar_init})"
+        if dtype == tp.bool:
+            if reduction_type not in ("min", "max", "sum"):
+                raise AssertionError('expected reduction_type in ("min", "max", "sum")')
+            return f"{self._get_mask_type()}::from({scalar_init})"
+        return vec_init
+
+    def reduction_acc_type_vec(self, reduction_type, dtype):
+        scalar_type = DTYPE_TO_COMPUTATION_DTYPE[dtype]
+        vec_type = self._get_vec_type(scalar_type)
+        if is_welford_reduction(reduction_type):
+            return f"Welford<{vec_type}>"
+        if reduction_type in ("argmin", "argmax"):
+            n_idx = self._get_num_vectors(tp.int64)
+            if dtype == tp.bool:
+                # For bool argmin/argmax, we use float for computations
+                # so n_src must be computed from float, not bool
+                n_src = self._get_num_vectors(tp.float)
+                return f"IndexValueVec<{DTYPE_TO_CPP[tp.float]}, {n_src}, {n_idx}>"
+            n_src = self._get_num_vectors(scalar_type)
+            return f"IndexValueVec<{DTYPE_TO_CPP[scalar_type]}, {n_src}, {n_idx}>"
+        if dtype == tp.bool:
+            if reduction_type not in ("min", "max", "any", "sum"):
+                raise AssertionError(
+                    'expected reduction_type in ("min", "max", "any", "sum")'
+                )
+            return f"{self._get_mask_type()}"
+        return vec_type
+
+    def reduction_combine_vec(
+        self,
+        reduction_type,
+        var,
+        next_value,
+        helper_val=None,
+        index: sympy.Expr | CppCSEVariable | None = None,
+        horizontal_reduction: bool | None = None,
+        src_dtype: tp.dtype | None = tp.float32,
+    ):
+        """Emit the C++ expression for combining vector reduction values."""
+        is_bool = src_dtype == tp.bool
+        if reduction_type == "max":
+            if self.tail_size:
+                return f"max_masked_reduce({var}, {next_value}, {cexpr_index(self.tail_size)})"
+            else:
+                return (
+                    f"{var} | {next_value}"
+                    if is_bool
+                    else f"tensorplay::vec::maximum({var}, {next_value})"
+                )
+        elif reduction_type == "min":
+            if self.tail_size:
+                return f"min_masked_reduce({var}, {next_value}, {cexpr_index(self.tail_size)})"
+            else:
+                return (
+                    f"{var} & {next_value}"
+                    if is_bool
+                    else f"tensorplay::vec::minimum({var}, {next_value})"
+                )
+        elif reduction_type == "sum":
+            if helper_val:
+                if self.tail_size:
+                    return f"cascade_sum_combine({next_value}, {cexpr_index(self.tail_size)}, &{helper_val})"
+                else:
+                    return f"cascade_sum_combine({next_value}, &{helper_val})"
+            else:
+                if self.tail_size:
+                    return f"sum_masked_reduce({var}, {next_value}, {cexpr_index(self.tail_size)})"
+                else:
+                    conjunction = "|" if is_bool else "+"
+                    return f"{var} {conjunction} {next_value}"
+        elif reduction_type == "prod":
+            if self.tail_size:
+                return f"prod_masked_reduce({var}, {next_value}, {cexpr_index(self.tail_size)})"
+            else:
+                return f"{var} * {next_value}"
+        elif reduction_type == "xor_sum":
+            if self.tail_size:
+                return f"xor_sum_masked_reduce({var}, {next_value}, {cexpr_index(self.tail_size)})"
+            else:
+                return f"{var} ^ {next_value}"
+        elif reduction_type == "welford_reduce":
+            if helper_val:
+                if self.tail_size:
+                    return f"welford_combine({var}, {next_value}, {cexpr_index(self.tail_size)}, &{helper_val})"
+                else:
+                    return f"welford_combine({var}, {next_value}, &{helper_val})"
+            else:
+                if self.tail_size:
+                    return f"welford_combine({var}, {next_value}, {cexpr_index(self.tail_size)})"
+                else:
+                    return f"welford_combine({var}, {next_value})"
+        elif reduction_type == "welford_combine":
+            if isinstance(next_value, tuple):
+                # When reading a value from Inductor IR we have a tuple of variable names
+                mean, m2, weight = next_value
+            else:
+                # When combining intermediate accumulators we have a Welford<T> struct
+                mean, m2, weight = reduction_project(reduction_type, next_value)
+            if self.tail_size:
+                return f"welford_combine({var}, {{{mean}, {m2}, {weight}}}, {cexpr_index(self.tail_size)})"
+            else:
+                return f"welford_combine({var}, {{{mean}, {m2}, {weight}}})"
+        elif reduction_type in ("argmin", "argmax"):
+            if src_dtype is None:
+                raise AssertionError("expected src_dtype is not None")
+            cdtype = DTYPE_TO_CPP[src_dtype]
+            compute_dtype = src_dtype
+            if src_dtype == tp.bool:
+                # For bool argmin/argmax, we use float for computations
+                cdtype = DTYPE_TO_CPP[tp.float]
+                compute_dtype = tp.float
+                # Convert bool VecMask to float vector for argmax_combine_vec
+                if isinstance(next_value, CppCSEVariable) and next_value.is_vec:
+                    (next_value,) = unify_mask_base_type(self.compute, (next_value,))
+            n_src = self._get_num_vectors(compute_dtype)
+            n_idx = self._get_num_vectors(tp.int64)
+            t_extra = ""
+            arg_extra = ""
+            if index is not None:
+                if isinstance(index, CppCSEVariable):
+                    if index.is_vec:
+                        arg_extra = f", {index}"
+                    else:
+                        t_extra = ", false"
+                        arg_extra = f", {index}"
+                else:
+                    if horizontal_reduction is None:
+                        raise AssertionError(
+                            "expected horizontal_reduction is not None"
+                        )
+                    t_extra = f", {str(horizontal_reduction).lower()}"
+                    arg_extra = f", {self._adjust_argreduce_index(index)}"
+            if self.tail_size:
+                return (
+                    f"{reduction_type}_combine_vec<{cdtype}, {n_src}, {n_idx}{t_extra}>"
+                    f"({var}, {next_value}{arg_extra}, {cexpr_index(self.tail_size)})"
+                )
+            else:
+                return f"{reduction_type}_combine_vec<{cdtype}, {n_src}, {n_idx}{t_extra}>({var}, {next_value}{arg_extra})"
+        elif reduction_type == "any":
+            if isinstance(next_value, CppCSEVariable):
+                if next_value.dtype != tp.bool:
+                    raise AssertionError("expected next_value.dtype == tp.bool")
+                (next_value,) = unify_mask_base_type(V.kernel.compute, (next_value,))
+            if self.tail_size:
+                return f"any_masked_reduce({var}, {next_value}, {cexpr_index(self.tail_size)})"
+            else:
+                return f"{var} | {next_value}"
+        else:
+            raise NotImplementedError
+
+    def indirect_assert(self, var, lower, upper, mask=None):
+        if not isinstance(var, CppCSEVariable):
+            raise AssertionError("expected isinstance(var, CppCSEVariable)")
+        if var.dtype is None:
+            raise AssertionError("expected var.dtype is not None")
+        if not var.is_vec:
+            if isinstance(mask, CppCSEVariable) and mask.is_vec:
+                mask = f"({mask}).all_masked()"
+            return super().indirect_assert(var, lower, upper, mask)
+        lower_scalar = lower
+        upper_scalar = upper
+        if lower:
+            lower = f"{self._get_vec_type(var.dtype)}({lower})"
+        if upper:
+            upper = f"{self._get_vec_type(var.dtype)}({upper})"
+        if lower and upper:
+            cond = f"({lower} <= {var}) & ({var} < {upper})"
+            cond_print = f"{lower_scalar} <= {var} < {upper_scalar}"
+        elif lower:
+            cond = f"{lower} <= {var}"
+            cond_print = f"{lower_scalar} <= {var}"
+        else:
+            if not upper:
+                raise AssertionError("expected upper")
+            cond = f"{var} < {upper}"
+            cond_print = f"{var} < {upper_scalar}"
+        cond = f"{self._get_mask_type(var.dtype)}({cond})"
+        if mask:
+            if not mask.is_vec:
+                mask = f"{self._get_mask_type(var.dtype)}::from({mask})"
+            # We need not check when the mask is False
+            cond = f"({cond}) | ~({mask})"
+        if self.tail_size:
+            cond = (
+                f"{self._get_mask_type(var.dtype)}::set({self._get_mask_type(var.dtype)}::from(1)"
+                f", ({cond}), {cexpr_index(self.tail_size)})"
+            )
+        cond = f"({cond}).all_masked()"
+        return f'{self.assert_function}({cond}, "index out of bounds: {cond_print}")'
+
+    def get_to_dtype_expr(self, src, dtype, src_dtype, rounding=False):
+        if not isinstance(src, CppCSEVariable):
+            raise AssertionError("expected isinstance(src, CppCSEVariable)")
+        if not src.is_vec:
+            return super().get_to_dtype_expr(src, dtype, src_dtype, rounding)
+        src_cpp_type = DTYPE_TO_CPP[src_dtype]
+        src_num_vectors = self._get_num_vectors(src_dtype)
+        dst_cpp_type = DTYPE_TO_CPP[dtype]
+        dst_num_vectors = self._get_num_vectors(dtype)
+        expr = f"({src})"
+        if src_dtype != tp.bool and dtype == tp.bool:
+            expr = f"{self._get_mask_type(src_dtype)}::from<{src_cpp_type},{src_num_vectors}>({src})"
+        elif src_dtype == tp.bool and dtype != tp.bool:
+            expr = f"{src}.to<{dst_cpp_type},{dst_num_vectors}>()"
+        elif src_dtype != dtype:
+            expr = ""
+            if (
+                rounding
+                and src_dtype in [tp.float, tp.double]
+                and dtype in [tp.int8, tp.uint8]
+            ):
+                expr = "tensorplay::vec::round_convert"
+            else:
+                expr = "tensorplay::vec::convert"
+            if src_num_vectors == dst_num_vectors == 1:
+                expr = expr + f"<{dst_cpp_type}>({src})"
+            else:
+                expr = (
+                    expr
+                    + f"<{dst_cpp_type},{dst_num_vectors},{src_cpp_type},{src_num_vectors}>({src})"
+                )
+        return expr
+
+
+class CppTile2DKernel(CppVecKernel):
+    """
+    A vector kernel that handles the 2d tiles with the tile size defined in `tiling_factor` on
+    the inner-most loop level and one of the outer loop level (`outer_tiling_idx`). When the data
+    tile is accessed in a contiguous way from the outer loop axis, a transposition is applied on the
+    tile to make the access contiguous from the inner-most loop axis. Then, the same vectorization
+    logic from its parent `CppVecKernel` is leveraged for load/store/compute. The transposed tile load
+    and store are generated into kernel.preloads and kernel.poststores buffers.
+
+    The loop structure looks like below:
+    for ...
+      for i_outer ...
+        for ...
+          for inner_most ...
+            // generated by CppTile2DKernel
+            float tmp0[16*16]; tensorplay::vec::transpose_mxn<...>(tmp0, in_ptr0 + ..., ...); // into kernel.preloads
+            float tmp1[16*16]; // into kernel.preloads
+            for i_inner ... { // the kernel inner loop
+              vectorized loads/compute/stores (e.g., load tmp0, store tmp1) // into kernel.loads/compute/stores
+            }
+            tensorplay::vec::transpose_mxn(out_ptr0 + ..., tmp1, ...) // into kernel.poststores
+          for inner_most ... (tail)
+            // generated by CppVecKernel
+            ...
+      for i_outer ... (tail)
+        for ...
+          for ...
+            // generated by CppKernel
+            ...
+    """
+
+    overrides = CppTile2DOverrides  # type: ignore[assignment]
+
+    def __init__(
+        self,
+        args,
+        num_threads,
+        tiling_factor,
+        tiling_indices,
+        inner_tail_size=None,
+        outer_tail_size=None,
+    ):
+        super().__init__(
+            args,
+            num_threads,
+            tiling_factor,
+            tiling_indices[1],
+            inner_tail_size,
+        )
+        self.tiling_indices = tiling_indices
+        self.inner_tail_size = inner_tail_size
+        self.outer_tail_size = outer_tail_size
+        self.inner_num_elems = inner_tail_size if inner_tail_size else tiling_factor
+        self.outer_num_elems = outer_tail_size if outer_tail_size else tiling_factor
+        self.inner_is_tiling_idx = True
+
+    def inner_itervar(self):
+        return sympy_index_symbol(f"{self.itervars[self.outer_idx]}_inner")
+
+    def need_vec_transpose(self, index):
+        outer_var = self.itervars[self.outer_idx]
+        inner_var = self.itervars[self.tiling_idx]
+        # Indirect indexing (SymT.TMP) variables are declared inside the inner
+        # loop, but transpose_mxn is emitted into preloads (before the loop).
+        if free_symbol_is_type(index, SymT.TMP):
+            return False
+        outer_stride = stride_at_vec_range(index, outer_var, self.tiling_factor)
+        inner_stride = stride_at_vec_range(index, inner_var, self.tiling_factor)
+        return (
+            self._load_mask is None  # TODO: support transposition with mask
+            and outer_stride == 1
+            and index.has(inner_var)
+            and not inner_stride.has(inner_var)
+            and not inner_stride.has(outer_var)
+        )
+
+    def gen_transposed_tile_load_store(
+        self, name, var, index, is_store, store_mode=None
+    ):
+        # transposed tile load/store outside the kernel inner loop
+        dtype = V.graph.get_dtype(name)
+        factor = self.tiling_factor
+        src = f"{var} + {cexpr_index(index)}"
+        dst = "__place_holder__"
+        ld_src = f"{cexpr_index(stride_at_vec_range(index, self.itervars[self.tiling_idx], self.tiling_factor))}"
+        ld_dst = f"{cexpr_index(self.num_elems)}"
+        if is_store:
+            src, dst = dst, src
+            ld_src, ld_dst = ld_dst, ld_src
+
+        need_define = True
+        if self.inner_is_tiling_idx ^ is_store:
+            M, N = self.inner_num_elems, self.outer_num_elems
+        else:
+            M, N = (
+                self.outer_num_elems,
+                self.inner_num_elems,
+            )
+        atomic_add = "true" if (is_store and (store_mode == "atomic_add")) else "false"
+        if (isinstance(M, sympy.Expr) and not M.is_number) or (
+            isinstance(N, sympy.Expr) and not N.is_number
+        ):
+            load_or_store = (
+                f"transpose_mxn<{DTYPE_TO_CPP[dtype]},{atomic_add}>"
+                f"({src}, {ld_src}, {dst}, {ld_dst}, {cexpr_index(M)}, {cexpr_index(N)});"
+            )
+        else:
+            load_or_store = (
+                f"transpose_mxn<{DTYPE_TO_CPP[dtype]},{cexpr_index(M)},{cexpr_index(N)},{atomic_add}>"
+                f"({src}, {ld_src}, {dst}, {ld_dst});"
+            )
+        if is_store:
+            tile_var = self.cse.newvar()
+        elif not self.cse.contains(load_or_store):
+            tile_var = self.cse.generate(self.preloads, load_or_store, write=False)
+        else:
+            need_define = False
+            tile_var = self.cse.get(load_or_store)
+
+        if need_define:
+            cpp_dtype = DTYPE_TO_CPP[dtype]
+            # tiling_factor might be smaller than the alignment of cpp_dtype, such as
+            # with a vector that only holds 4 elements due to NEON 128-bit vectors and
+            # cpp_dtype being a 64-bit integer.
+            alignas = f"alignas(std::max(std::size_t({factor}), alignof({cpp_dtype})))"
+            define_line = f"{alignas} {cpp_dtype} {tile_var}[{factor}*{factor}];"
+            self.preloads.writeline(define_line)
+
+        load_or_store = load_or_store.replace("__place_holder__", str(tile_var))
+        if is_store:
+            self.poststores.writeline(DeferredLine(name, load_or_store))
+        else:
+            self.preloads.writeline(load_or_store)
+
+        return tile_var
+
+    def load(self, name: str, index: sympy.Expr):
+        var = self.args.input(name)
+        index = self.rename_indexing(index)
+
+        inner = self.inner_itervar()
+        if self.need_vec_transpose(index):
+            tile_var = self.gen_transposed_tile_load_store(
+                name, var, index, is_store=False
+            )
+            # vector load inside the kernel inner loop
+            loadbuf = f"{tile_var} + {cexpr_index(inner * self.num_elems)}"
+            dtype = V.graph.get_dtype(name)
+            line = self._get_vec_load_line(loadbuf, 0, dtype)  # type: ignore[arg-type]
+            csevar = self.cse.generate(self.loads, line, dtype=dtype)
+            csevar.update_on_args("load", (self, name, index), {})
+            if not isinstance(csevar, CppCSEVariable):
+                raise AssertionError("expected isinstance(csevar, CppCSEVariable)")
+            csevar.is_vec = True
+            return csevar
+        else:
+            new_index = self.transform_indexing(index)
+            return super().load(name, new_index)
+
+    def store(self, name, index, value, mode=None):
+        if "buf" not in name:
+            raise AssertionError('expected "buf" in name')
+        if not isinstance(value, CppCSEVariable):
+            raise AssertionError(value)
+        if not value.is_vec:
+            # this happens when we store a scalar into a vectorized buffer like "fill"
+            value = self.broadcast(value)
+
+        var = self.args.output(name)
+
+        inner = self.inner_itervar()
+        index = self.rename_indexing(index)
+        if self.need_vec_transpose(index):
+            tile_var = self.gen_transposed_tile_load_store(
+                name, var, index, is_store=True, store_mode=mode
+            )
+            # vector store inside the kernel inner loop
+            storebuf = f"{tile_var} + {cexpr_index(inner * self.num_elems)}"
+            if self.tail_size or V.graph.get_dtype(name) in DTYPE_LOWP_FP + [
+                tp.uint8,
+                tp.int8,
+                tp.float8_e4m3fn,
+                tp.float8_e5m2,
+            ]:
+                line = f"{value}.store({storebuf}, {cexpr_index(self.num_elems)});"
+            else:
+                line = f"{value}.store({storebuf});"
+            self.stores.writeline(DeferredLine(name, line))
+        else:
+            # the parallel atomic_add path re-applies transform_indexing via ops.index_expr
+            vec_atomic_add = mode == "atomic_add" and self._use_parallel_atomic_add()
+            new_index = index if vec_atomic_add else self.transform_indexing(index)
+            super().store(name, new_index, value, mode)
+
+    def codegen_inner_loops(self, code):
+        inner = self.inner_itervar()
+        if self.inner_is_tiling_idx:
+            code.writeline(
+                f"for (long {inner} = 0; {inner} < {cexpr_index(self.outer_num_elems)}; {inner}++)"
+            )
+        else:
+            code.writeline(
+                f"for (long {inner} = 0; {inner} < {cexpr_index(self.inner_num_elems)}; {inner}++)"
+            )
+
+    def set_ranges(self, group, reduction_group):
+        vars = super().set_ranges(group, reduction_group)
+        # do vertical reduction as the tail loop
+        self.outer_idx, self.tiling_idx = (
+            self.tiling_indices
+            if self.tiling_indices[1] < self.reduction_depth
+            else reversed(self.tiling_indices)
+        )
+        if self.tiling_idx == self.tiling_indices[0]:
+            self.tail_size = self.outer_tail_size
+            self.num_elems = self.outer_num_elems
+            self.inner_is_tiling_idx = False
+        else:
+            self.tail_size = self.inner_tail_size
+            self.num_elems = self.inner_num_elems
+            self.inner_is_tiling_idx = True
+        return vars
+
+    def transform_indexing(self, index: sympy.Expr) -> sympy.Expr:
+        return self.scale_index_with_offset(
+            index,
+            itervar_idx=self.outer_idx,
+            offset=self.inner_itervar(),
+        )
+
+    def _adjust_argreduce_index(self, index: sympy.Expr) -> sympy.Expr:
+        return self.transform_indexing(index)
+
+
+def get_loop_body_lowp_fp(_body: LoopBody) -> tuple[tp.dtype | None, bool]:
+    """
+    Returns the low precision data type (tp.float16/tp.bfloat16) contained in the nodes
+    and if all the nodes can codegen with this data type without converting to float.
+    Otherwise returns None and True.
+    """
+    sub_blocks = [_body.root_block] + list(_body.subblocks.values())
+
+    _lowp_fp_type: tp.dtype | None = None
+    _use_fp32 = False
+    for sub_block in sub_blocks:
+        for _node in sub_block.graph.nodes:
+            if _node.op == "placeholder" or _node.target in (
+                "get_index",
+                "index_expr",
+                "value_expr",
+            ):
+                continue
+
+            # Fast path if all operations can support bf16/fp16 without converting to fp32
+            if _node.target not in [
+                "load",
+                "store",
+                "abs",
+                "neg",
+                "output",
+            ]:
+                _use_fp32 = True
+
+            if hasattr(_node, "meta") and _node.meta:
+                if OptimizationContext.key not in _node.meta:
+                    raise AssertionError(
+                        "expected OptimizationContext.key in _node.meta"
+                    )
+                opt_ctx: OptimizationContext = _node.meta[OptimizationContext.key]
+                if not opt_ctx.dtype or opt_ctx.dtype not in DTYPE_LOWP_FP:
+                    _use_fp32 = True
+                elif _lowp_fp_type is not None:
+                    if _lowp_fp_type != opt_ctx.dtype:
+                        warnings.warn("bf16 and fp16 are mixed in the scheduler node.")
+                else:
+                    _lowp_fp_type = opt_ctx.dtype
+            else:
+                _use_fp32 = True
+
+    return _lowp_fp_type, _use_fp32
+
+
+@dataclasses.dataclass
+class KernelOpStats:
+    """Op statistics collected during tiling selection."""
+
+    # Ratio of non-contiguous/mask ops to total ops above which vectorization
+    # is considered unprofitable (used both for disabling vectorization entirely
+    # and for deciding whether tail vectorization is worthwhile).
+    OVERHEAD_RATIO_THRESHOLD: ClassVar[float] = 0.12
+
+    op_counter: dict[str, int] = dataclasses.field(default_factory=dict)
+    non_contig_indexing_op_counter: dict[str, int] = dataclasses.field(
+        default_factory=dict
+    )
+    mask_op_count: int = 0
+
+
+class TilingSelect:
+    """
+    Implement the heuristic to select the tiling factors and tiling indices.
+    In the future, we can implement advanced heuristic in a subclass.
+    """
+
+    def select_tiling(
+        self,
+        fn_list,
+        var_sizes_list,
+    ) -> tuple[list[int], list[int], KernelOpStats]:
+        # TODO(jgong5): support alternative tiling factors and data types
+        loop_bodies = _get_loop_body(fn_list)
+        all_dtypes = _get_dtype_from_loopbodies(loop_bodies)
+        if not all_dtypes:
+            raise AssertionError("expected all_dtypes")
+        if any(dtype not in VECTORIZABLE_DTYPES for dtype in all_dtypes):
+            return [], [], KernelOpStats()
+        dtype = tp.float
+        _lowp_fp_dtype = get_loop_body_lowp_fp(loop_bodies[0])[0]
+        if _lowp_fp_dtype and all(
+            (get_loop_body_lowp_fp(loop_body)[0] == _lowp_fp_dtype)
+            for loop_body in loop_bodies[1:]
+        ):
+            dtype = _lowp_fp_dtype
+
+        tiling_factor = cpu_vec_isa.pick_vec_isa().nelements(dtype=dtype)
+        tiling_indices = self._select_tiling_indices(
+            fn_list, var_sizes_list, tiling_factor
+        )
+
+        if tiling_indices:
+            group, reduction_group = max(
+                var_sizes_list, key=lambda sizes: len(sizes[1])
+            )
+            call_ranges = tuple(group) + tuple(reduction_group)
+
+            stats = KernelOpStats()
+            if config.cpp.enable_tiling_heuristics:
+
+                def _try_get_stride(
+                    index,
+                    itervars,
+                    tiling_factor,
+                    tiling_indices,
+                ):
+                    itervar = itervars[tiling_indices[0]]
+                    stride = stride_at_vec_range(index, itervar, tiling_factor)
+                    return stride if stride.is_number else None
+
+                def _update_negative_op_count(
+                    node_name, non_contig_indexing_op_counter
+                ):
+                    if node_name not in non_contig_indexing_op_counter:
+                        non_contig_indexing_op_counter[node_name] = 1
+                    else:
+                        non_contig_indexing_op_counter[node_name] += 1
+
+                def _is_valid_indices(
+                    itervars,
+                    tiling_indices,
+                ):
+                    return (
+                        len(tiling_indices) == 1
+                        and len(itervars) > 0
+                        and (
+                            tiling_indices[0]
+                            if tiling_indices[0] >= 0
+                            else tiling_indices[0] + len(itervars)
+                        )
+                        < len(itervars)
+                    )
+
+                itervars = [
+                    sympy_index_symbol_with_prefix(SymT.XBLOCK, n)
+                    for n in range(len(call_ranges))
+                ]
+                reduction_depth = len(group)
+                vars, reduction_vars = (
+                    itervars[:reduction_depth],
+                    itervars[reduction_depth:],
+                )
+                for _body in loop_bodies:
+                    sub_blocks = [_body.root_block] + list(_body.subblocks.values())
+                    for sub_block in sub_blocks:
+                        for _node in sub_block.graph.nodes:
+                            if _node.target in [
+                                "index_expr",
+                                "value_expr",
+                                "load",
+                                "store",
+                            ]:
+                                # get the index and replace prefix from z to x
+                                arg_idx = (
+                                    1
+                                    if _node.target in ("index_expr", "value_expr")
+                                    else 2
+                                )
+                                index = sub_block.body.indexing_from_args(
+                                    (vars, reduction_vars)
+                                )[_node.args[arg_idx].args[0]]
+                                if _is_valid_indices(itervars, tiling_indices):
+                                    stride = _try_get_stride(
+                                        index, itervars, tiling_factor, tiling_indices
+                                    )
+                                    if (
+                                        stride is None
+                                        if _node.target in ("index_expr", "value_expr")
+                                        else stride not in [0, 1]
+                                    ):
+                                        _update_negative_op_count(
+                                            _node.target,
+                                            stats.non_contig_indexing_op_counter,
+                                        )
+                            if isinstance(_node.target, str):
+                                # Only count "where" and "masked" as mask ops —
+                                # they generate actual mask/blend instructions.
+                                if _node.target in ("where", "masked"):
+                                    stats.mask_op_count += 1
+                                if not (
+                                    _node.target.startswith("masked_subblock")
+                                    or _node.target
+                                    in ["ops", "output", "constant", "get_index"]
+                                ):
+                                    if _node.target not in stats.op_counter:
+                                        stats.op_counter[_node.target] = 1
+                                    else:
+                                        stats.op_counter[_node.target] += 1
+
+                op_num = sum(stats.op_counter.values())
+                non_contig_indexing_op_num = sum(
+                    stats.non_contig_indexing_op_counter.values()
+                )
+                quantity_threshold = 35
+                if non_contig_indexing_op_num >= quantity_threshold or (
+                    op_num > 0
+                    and non_contig_indexing_op_num / op_num
+                    >= stats.OVERHEAD_RATIO_THRESHOLD
+                ):
+                    # Too many non-contiguous load/store/index/value_expr which hurts the
+                    # vectorization performance. Disable vectorization when exceeding
+                    # the thresholds.
+                    return [], [], stats
+
+                if (
+                    not reduction_group
+                    and group
+                    and len(tiling_indices) == 1
+                    and not has_free_symbols(
+                        [
+                            group[tiling_indices[0]],
+                        ]
+                    )
+                    and group[tiling_indices[0]] < tiling_factor / 4
+                    and op_num < 10
+                ):
+                    # We found that when the number of elements in the inner loop range is
+                    # relatively small(< tiling_factor / 4) and the number of operations is
+                    # not large(< 10), vectorization is not efficient.
+                    # And found that `#pragma GCC ivdep` has better performance than
+                    # `#pragma omp simd simdlen(8)` for these cases.
+                    return [], [], stats
+
+            if dtype in DTYPE_LOWP_FP:
+                # For lower precision data type, if the call_range is not long enough,
+                # use tiling_factor // 2 for better performance
+                factor_lowp = cpu_vec_isa.pick_vec_isa().nelements(dtype=dtype)
+                for tiling_indice in tiling_indices:
+                    if tiling_indice < 0:
+                        tiling_indice = tiling_indice + len(call_ranges)
+                    if tiling_indice < 0 or tiling_indice >= len(call_ranges):
+                        continue
+                    if has_free_symbols(call_ranges):
+                        call_range = V.graph.sizevars.optimization_hint(
+                            call_ranges[tiling_indice], fallback=0
+                        )
+                        if call_range < factor_lowp:
+                            V.graph.sizevars.check_lt(call_range, factor_lowp)  # type: ignore[arg-type]
+                            tiling_factor = factor_lowp // 2
+                            break
+                    elif call_ranges[tiling_indice] < factor_lowp:
+                        tiling_factor = factor_lowp // 2
+                        break
+
+            if len(tiling_indices) == 1:
+                return [tiling_factor], tiling_indices, stats
+            if len(tiling_indices) == 2:
+                return [tiling_factor, tiling_factor], tiling_indices, stats
+        return [], [], KernelOpStats()
+
+    def _select_tiling_indices(
+        self,
+        fn_list,
+        var_sizes_list,
+        tiling_factor,
+    ):
+        all_index = []
+        for fn, var_sizes in zip(fn_list, var_sizes_list):
+            rw = dependencies.extract_read_writes(fn, *var_sizes)
+            all_index += [dep.index for dep in itertools.chain(rw.reads, rw.writes)]
+        contig_vars = OrderedSet[int]()
+        contig_vars_list = []
+        non_contig_stride_const = OrderedSet[int]()
+        non_contig_stride_other = OrderedSet[int]()
+        for index in all_index:
+            for var in index.free_symbols:
+                if not re.search(r"^d\d+$", var.name):
+                    continue
+                stride = stride_at_vec_range(index, var, tiling_factor)
+                if stride == 0:
+                    continue
+                elif stride == 1:
+                    contig_vars.add(int(var.name[1:]))
+                    contig_vars_list.append(int(var.name[1:]))
+                elif all(symbol_is_type(s, SymT.SIZE) for s in stride.free_symbols):
+                    non_contig_stride_const.add(int(var.name[1:]))
+                else:
+                    non_contig_stride_other.add(int(var.name[1:]))
+        contig_only = contig_vars - non_contig_stride_const - non_contig_stride_other
+        group, reduction_group = max(var_sizes_list, key=lambda sizes: len(sizes[1]))
+        num_itervars = len(group) + len(reduction_group)
+        if len(contig_vars) == 0:
+            # no contiguous vars
+            return [num_itervars - 1]
+        if contig_only:
+            return sorted(contig_only)[-1:]
+        contig_and_const_stride = (
+            contig_vars & non_contig_stride_const
+        ) - non_contig_stride_other
+        contig_vars_sorted = sorted(contig_vars)
+        if (
+            len(contig_vars_sorted) == 2
+            and contig_vars_sorted[-1] in contig_and_const_stride
+            and contig_vars_sorted[-1] == num_itervars - 1
+        ):
+            return contig_vars_sorted
+        return sorted(contig_vars_sorted, key=contig_vars_list.count)[-1:]
+
+
+class CppKernelProxy(CppKernel):
+    # Subclass CppKernel, CppVecKernel, etc., to customize code generation.
+    # Override CppOverrides or CppVecOverrides to emit custom ops.
+    # Earlier, this meant copying codegen_functions() to use your subclasses.
+    # Now, use kernel_cls and vec_kernel_cls class attributes instead.
+    # This lets CppKernelProxy subclasses inject custom behavior cleanly.
+    # No need to duplicate codegen_functions() just to swap kernel classes.
+    kernel_cls: type[CppKernel] = CppKernel
+    vec_kernel_cls: type[CppVecKernel] = CppVecKernel
+    tile2d_kernel_cls: type[CppTile2DKernel] = CppTile2DKernel
+
+    def __init__(self, kernel_group):
+        super().__init__(kernel_group.args, kernel_group.ws.num_threads)
+        self.kernel_group = kernel_group
+        self.loop_nest = None
+        self.call_ranges = None
+        self.picked_vec_isa: cpu_vec_isa.VecISA = cpu_vec_isa.pick_vec_isa()
+        self.kernels: list[CppKernel] = []
+
+    def data_type_propagation(self, nodes):
+        for _node in nodes:
+            if not isinstance(_node, SchedulerNode):
+                raise AssertionError("expected isinstance(_node, SchedulerNode)")
+            DataTypePropagation.propagate_scheduler_node(_node)
+
+    # Check if all the nodes of a given fx graph can support BF16/FP16
+    def is_lowp_fp_scheduler(self, scheduler_node: SchedulerNode):
+        if not isinstance(scheduler_node._body, LoopBody):
+            return True
+        # Propagate the dtype to check if all the fx node is bf16/fp16
+        DataTypePropagation.propagate_scheduler_node(scheduler_node)
+        return (
+            get_loop_body_lowp_fp(scheduler_node._body)[0] is not None
+            and not get_loop_body_lowp_fp(scheduler_node._body)[1]
+        )
+
+    def legalize_lowp_fp_dtype_loopbody(self, loop_body: LoopBody):
+        def add_to_dtype(sub_graph: Graph):
+            def get_input_dtype(node: Node) -> tp.dtype | None:
+                """Get input dtype for nodes that may consumes lowp fp dt"""
+                if node.target == "store":
+                    return V.graph.get_dtype(node.args[1])  # type: ignore[arg-type]
+                elif node.target == "to_dtype_bitcast":
+                    return node.args[-1]  # type: ignore[return-value]
+                elif node.target == "to_dtype":
+                    if len(node.args) > 3:
+                        return node.args[3]  # type: ignore[return-value]
+                    else:
+                        return node.kwargs.get("src_dtype", None)  # type: ignore[return-value]
+                else:
+                    return None
+
+            def get_output_dtype(node: Node) -> tp.dtype | None:
+                """Get output dtype for nodes that may produce lowp fp dt"""
+                if node.target == "load":
+                    if len(node.args) != 3:
+                        raise AssertionError("expected len(node.args) == 3")
+                    return V.graph.get_dtype(node.args[1])  # type: ignore[arg-type]
+                elif node.target in [
+                    "to_dtype",
+                    "constant",
+                    "index_expr",
+                    "value_expr",
+                ]:
+                    return node.args[-1]  # type: ignore[return-value]
+                elif node.target == "to_dtype_bitcast":
+                    return node.args[2]  # type: ignore[return-value]
+                else:
+                    return None
+
+            def is_lowp_fp_source(node: Node, dt: tp.dtype):
+                """Check if the given node produces output with expected low precision floating point data type."""
+                if dt not in DTYPE_LOWP_FP:
+                    raise AssertionError("expected dt in DTYPE_LOWP_FP")
+                return get_output_dtype(node) == dt
+
+            def is_lowp_fp_sink(node: Node, dt: tp.dtype):
+                """Check if the given node accept input with expected low precision floating point data type."""
+                if dt not in DTYPE_LOWP_FP:
+                    raise AssertionError("expected dt in DTYPE_LOWP_FP")
+                if input_dtype := get_input_dtype(node):
+                    return input_dtype == dt
+                elif node.target == "to_dtype":
+                    # The `src_dtype` of a `to_dtype` node might miss, in which case the node accept any input dtype.
+                    return True
+                else:
+                    return False
+
+            def is_lowp_fp_source_no_promote(node: Node, dt: tp.dtype):
+                """Check if the node is a lowp fp sources which are all directly fed to ops that accepts lowp fp input
+                thus no need to promote to float
+                """
+                return is_lowp_fp_source(node, dt) and all(
+                    is_lowp_fp_sink(user, dt) for user in node.users
+                )
+
+            sub_graph_nodes = list(sub_graph.nodes)
+            to_lowp_fp_legalized_nodes = []
+            for _node in sub_graph_nodes:
+                if (
+                    _node.target in ["load", "index_expr", "value_expr"]
+                    and (dt := get_output_dtype(_node)) in DTYPE_LOWP_FP
+                ):
+                    # No need to promote to float if all users are ops that accepts lowp fp input
+                    # pyrefly: ignore [bad-argument-type]
+                    if all(is_lowp_fp_sink(user, dt) for user in _node.users):
+                        continue
+                    ops = _node.args[0]
+                    with sub_graph.inserting_after(_node):
+                        to_type_node = sub_graph.call_method(
+                            "to_dtype", args=(ops, _node, tp.float)
+                        )
+                        _node.replace_all_uses_with(
+                            to_type_node, lambda n: n is not to_type_node
+                        )
+                        # pyrefly: ignore [bad-assignment]
+                        metrics.cpp_to_dtype_count += 1
+                elif (
+                    _node.target == "store"
+                    and (dt := get_input_dtype(_node)) in DTYPE_LOWP_FP
+                ):
+                    ops, name, _, value_var, _ = _node.args
+                    # pyrefly: ignore [bad-argument-type]
+                    if is_lowp_fp_source_no_promote(value_var, dt):
+                        continue
+                    dtype = V.graph.get_dtype(name)
+                    with sub_graph.inserting_before(_node):
+                        to_type_node = sub_graph.call_method(
+                            "to_dtype", args=(ops, value_var, dtype)
+                        )
+                        _node.replace_input_with(value_var, to_type_node)
+                        # pyrefly: ignore [bad-assignment]
+                        metrics.cpp_to_dtype_count += 1
+                elif _node.target == "reduction":
+                    (
+                        ops,
+                        dtype,
+                        src_dtype,
+                        reduction_type,
+                        value,
+                    ) = _node.args
+                    if src_dtype in DTYPE_LOWP_FP:
+                        # Since we always convert the load/store value to float if the tensor is bfloat16/float16.
+                        # Therefore, the reduction should never work with bfloat16/float16 value. Hence, we update
+                        # the bfloat16/float16 reduction by
+                        #     1) updating the src_dtype to float
+                        # and 2) updating the dtype to float if it is bfloat16/float16.
+                        if dtype not in [
+                            tp.float,
+                            tp.bfloat16,
+                            tp.float16,
+                            tp.int64,
+                        ]:
+                            raise AssertionError(
+                                "expected dtype in [ tp.float, tp.bfloat16, tp.float16, to..."
+                            )
+                        _node.args = (
+                            ops,
+                            tp.float if dtype in DTYPE_LOWP_FP else dtype,
+                            tp.float,
+                            reduction_type,
+                            value,
+                        )
+                elif _node.target == "constant" and _node.args[-1] in DTYPE_LOWP_FP:
+                    # No need to promote to float if all users are ops that accepts lowp fp input
+                    (ops, value, dt) = _node.args
+                    if all(is_lowp_fp_sink(user, dt) for user in _node.users):  # type: ignore[arg-type]
+                        continue
+                    _node.args = (ops, value, tp.float)
+                elif _node.target == "to_dtype" and _node.args[-1] in DTYPE_LOWP_FP:
+                    # No need to promote to float if all users are ops that accepts lowp fp input
+                    (ops, x, dt) = _node.args
+                    if all(is_lowp_fp_sink(user, dt) for user in _node.users):  # type: ignore[arg-type]
+                        continue
+                    # The legalization always loads the BF16/FP16 tensor as FP32 for computation
+                    # and converts back to BF16/FP16 after the computation.
+                    # Hence, there should be no computation w/ BF16/FP16.
+                    # Therefore, we update the to_dtype by replacing the bf16/fp16 dtype with fp32.
+                    # Save the legalized to_dtype node for the elimination(eliminate_to_dtype step):
+                    #  1) Eliminate the redundant to_dtype node if we have a pattern as follows:
+                    #     graph():
+                    #       %lowp_fp_legalized = call_method[target=to_dtype](args = (%ops, %input, tp.float))
+                    #       %to_dtype2 = call_method[target=to_dtype](args = (%ops, %lowp_fp_legalized, tp.bfloat16/float16))
+                    # Regarding the first to_dtype, it is redundant because
+                    # the second to_type also converts to the tp.bfloat16/tp.float16.
+                    # Hence, we remove the first to_type.
+                    to_lowp_fp_legalized_nodes.append(_node)
+                    _node.args = (ops, x, tp.float)
+                elif _node.target == "to_dtype_bitcast":
+                    (ops, value_var, dtype, src_dtype) = _node.args
+
+                    # to_dtype_bitcast act as a lowp fp sink:
+                    # A bit-level reinterpret requires the source and target to have the same bitwidth. Because the input tensor's
+                    # dtype could be promoted, e.g. from float16 to float, we have to cast the tensor to its original
+                    # source dtype before invoking bit_cast.
+                    if src_dtype in DTYPE_LOWP_FP:
+                        # No need to promote to float if it is a user of a lowp fp sources
+                        # which are all directly fed to ops that accepts lowp fp input
+                        if not is_lowp_fp_source_no_promote(value_var, src_dtype):
+                            with sub_graph.inserting_before(_node):
+                                to_type_node = sub_graph.call_method(
+                                    "to_dtype", args=(ops, value_var, src_dtype)
+                                )
+                                _node.replace_input_with(value_var, to_type_node)
+                                # pyrefly: ignore [bad-assignment]
+                                metrics.cpp_to_dtype_count += 1
+
+                    # to_dtype_bitcast act as a lowp fp source:
+                    # We also need to convert the bit-casted tensor back to float to make sure we keep using higher
+                    # precision values for the rest of the computation.
+                    if dtype in DTYPE_LOWP_FP:
+                        # No need to promote to float if all users are ops that accepts lowp fp input
+                        if not (
+                            all(is_lowp_fp_sink(user, dtype) for user in _node.users)
+                        ):
+                            ops = _node.args[0]
+                            with sub_graph.inserting_after(_node):
+                                to_type_node = sub_graph.call_method(
+                                    "to_dtype", args=(ops, _node, tp.float)
+                                )
+                                _node.replace_all_uses_with(
+                                    to_type_node, lambda n: n is not to_type_node
+                                )
+                                # pyrefly: ignore [bad-assignment]
+                                metrics.cpp_to_dtype_count += 1
+
+            def eliminate_to_dtype(sub_graph: Graph):
+                def _eliminate_duplicate_to_node(sub_graph: Graph):
+                    # Eliminate the redundant to_dtype node. Let's consider a pattern as follows:
+                    #   graph():
+                    #     %to_dtype1 = call_method[target=to_dtype](args = (%ops, %input, tp.float), kwargs = {})
+                    #     %to_dtype2 = call_method[target=to_dtype](args = (%ops, %to_dtype1, tp.float), kwargs = {})
+                    # Regarding the first to_dtype, it is redundant because the second to_type also converts to the
+                    # tp.float. Hence, we remove the first to_type
+                    def _used_by_to(to_node: Node):
+                        return all(usr.target == "to_dtype" for usr in to_node.users)
+
+                    all_to_nodes = [
+                        node for node in sub_graph.nodes if node.target == "to_dtype"
+                    ]
+                    all_to_nodes_and_users = [
+                        {node: node.users} for node in all_to_nodes if _used_by_to(node)
+                    ]
+                    for node_users in all_to_nodes_and_users:
+                        for node, users in node_users.items():
+                            if node in sub_graph.nodes and (
+                                all(usr.args[-1] == node.args[-1] for usr in users)
+                                or (
+                                    node in to_lowp_fp_legalized_nodes
+                                    and all(
+                                        usr.args[-1] in DTYPE_LOWP_FP for usr in users
+                                    )
+                                )
+                            ):
+                                val_node = node.all_input_nodes[-1]
+                                node.replace_all_uses_with(val_node)
+                                sub_graph.erase_node(node)
+
+                    # For debug mode, the graph of LoopBody will attach a new GraphModule as
+                    # owning_module for debugging while the release mode will not. The lint will
+                    # check whether the graph has owning_module to decide if it needs to check
+                    # call_module. LoopBody might contain get_index as a module call. But it
+                    # is just a function. Hence, it cannot pass the lint check for debug mode.
+                    # We bypass the check if the owning_module is None. Eventually, we should call
+                    # get_index via call_function but not call_module.
+                    if sub_graph.owning_module is None:
+                        sub_graph.lint()
+
+                _eliminate_duplicate_to_node(sub_graph)
+
+            eliminate_to_dtype(sub_graph)
+
+        sub_blocks = [loop_body.root_block] + list(loop_body.subblocks.values())
+        for sub_block in sub_blocks:
+            add_to_dtype(sub_block.graph)
+
+    def legalize_lowp_fp_dtype(self, nodes):
+        if all(
+            isinstance(_node, SchedulerNode) and self.is_lowp_fp_scheduler(_node)
+            for _node in nodes
+        ):
+            # Mark the load node to load bf16/fp16
+            for _node in nodes:
+                sub_blocks = [_node._body.root_block] + list(
+                    _node._body.subblocks.values()
+                )
+                for sub_block in sub_blocks:
+                    for fx_node in sub_block.graph.nodes:
+                        if fx_node.target in ["load", "store"]:
+                            if not fx_node.meta:
+                                raise AssertionError("expected fx_node.meta")
+                            if OptimizationContext.key not in fx_node.meta:
+                                raise AssertionError(
+                                    "expected OptimizationContext.key in fx_node.meta"
+                                )
+                            opt_ctx: OptimizationContext = fx_node.meta[
+                                OptimizationContext.key
+                            ]
+                            if opt_ctx.dtype not in DTYPE_LOWP_FP:
+                                raise AssertionError(
+                                    "expected opt_ctx.dtype in DTYPE_LOWP_FP"
+                                )
+
+            # Bypass the legalization as the kernel can run with bf16/fp16 directly
+            return
+
+        for _node in nodes:
+            if not isinstance(_node, SchedulerNode):
+                raise AssertionError("expected isinstance(_node, SchedulerNode)")
+            if not isinstance(_node._body, LoopBody):
+                raise AssertionError("expected isinstance(_node._body, LoopBody)")
+            body: LoopBody = _node._body
+            if not body.is_memory_copy():
+                self.legalize_lowp_fp_dtype_loopbody(body)
+
+    def codegen_functions(self, fn_list, var_sizes_list):
+        """Generate scalar and vectorized C++ kernels with tiling for the given functions."""
+        if len(fn_list) != len(var_sizes_list):
+            raise AssertionError("expected len(fn_list) == len(var_sizes_list)")
+        kernel_group = self.kernel_group
+        group, reduction_group = max(var_sizes_list, key=lambda sizes: len(sizes[1]))
+
+        self.set_ranges(group, reduction_group)
+
+        def codegen_kernel(cls, *args):
+            with kernel_group.new_kernel(cls, *args) as kernel:
+                # Ugly hack to maintain the metrics kernel count since
+                # we only count in CppKernelProxy, not those contained in it
+                # pyrefly: ignore [bad-assignment]
+                metrics.generated_kernel_count -= 1
+
+                run(kernel)
+                return kernel
+
+        def run(kernel):
+            vars, reduction_vars = kernel.set_ranges(group, reduction_group)
+            in_suffix = False
+            for fn, var_sizes in zip(fn_list, var_sizes_list):
+                if var_sizes in [
+                    (group, reduction_group),
+                    (tuple(itertools.chain(group, reduction_group)), ()),
+                ]:
+                    if in_suffix:
+                        raise AssertionError("expected not in_suffix")
+                    fn(vars, reduction_vars)
+                else:
+                    in_suffix = True
+                    if not (
+                        var_sizes
+                        == (
+                            group,
+                            (),
+                        )
+                    ):
+                        raise AssertionError(
+                            f"unexpected group: {var_sizes} != {group}, {reduction_group}"
+                        )
+                    # we can fuse in some extra pointwise into the suffix
+                    with kernel.write_to_suffix():
+                        fn(vars, ())
+
+        scalar_kernel = codegen_kernel(self.kernel_cls)
+        V.graph.removed_buffers |= scalar_kernel.removed_buffers
+        V.graph.inplaced_to_remove |= scalar_kernel.inplaced_to_remove
+        self.loop_nest = LoopNest.build(scalar_kernel)
+
+        if not self.picked_vec_isa or not self.itervars:
+            self.kernels = [scalar_kernel]
+            self.aggregate_reduction_buffers(False, None)
+            self.loop_nest.set_kernel(self)
+            return
+
+        # Kernels share the same global contexts like V.graph.wrapper_code, V.kernel.args.
+        # But the generated scalar kernel has updated these global contexts. Hence, the other kernels
+        # should not do this again to avoid context conflict. By now, we only control the
+        # config.inplace_buffers. In the future, we could maintain more contexts.
+        with config.patch(inplace_buffers=False):
+            tiling_select = TilingSelect()
+            tiling_factors, tiling_indices, tiling_stats = tiling_select.select_tiling(
+                fn_list, var_sizes_list
+            )
+
+            def _tail_vec_worthwhile(tail_size, tiling_factor) -> bool:
+                # Tail vectorization has non-trivial mask/cast/blend overhead.
+                # Only vectorize tail when it is large enough to amortize overhead.
+                op_num = sum(tiling_stats.op_counter.values())
+                if (
+                    op_num > 0
+                    and (
+                        tiling_stats.mask_op_count
+                        + sum(tiling_stats.non_contig_indexing_op_counter.values())
+                    )
+                    / op_num
+                    > tiling_stats.OVERHEAD_RATIO_THRESHOLD
+                ):
+                    hint_tail_size = V.graph.sizevars.optimization_hint(tail_size)
+                    return 2 * hint_tail_size > tiling_factor
+                return True
+
+            if len(tiling_factors) != len(tiling_indices):
+                raise AssertionError(
+                    "expected len(tiling_factors) == len(tiling_indices)"
+                )
+            _inner_loop_reduction_outer_not = False
+            _tiled_loop_reduction_descendant = False
+            _outer_loop = None
+            if tiling_indices:
+                inner_loop_reduction = False
+                outer_loop_level = tiling_indices[0]
+                inner_loop_level = outer_loop_level + 1
+                if len(self.loop_nest.loops) > inner_loop_level:
+                    inner_loop_reduction = self.loop_nest.loops[
+                        inner_loop_level
+                    ].is_reduction
+                    outer_loop_reduction = self.loop_nest.loops[
+                        outer_loop_level
+                    ].is_reduction
+                    _inner_loop_reduction_outer_not = (
+                        inner_loop_reduction and not outer_loop_reduction
+                    )
+                    _tiled_loop_reduction_descendant = not outer_loop_reduction and any(
+                        loop.is_reduction
+                        for loop in self.loop_nest.loops[inner_loop_level:]
+                    )
+
+            if len(tiling_indices) == 1:
+                # pyrefly: ignore [bad-assignment]
+                metrics.generated_cpp_vec_kernel_count += 1
+                loop = self.loop_nest.tile(tiling_indices[0], factor=tiling_factors[0])
+                vec_kernel = codegen_kernel(
+                    self.vec_kernel_cls, tiling_factors[0], tiling_indices[0]
+                )
+                tail_size = loop.size - loop.tiled_size
+                vec_kernel.active_ranges = {loop.var: (0, loop.tiled_size)}
+                if config.cpp.enable_loop_tail_vec and _tail_vec_worthwhile(
+                    tail_size, tiling_factors[0]
+                ):
+                    tail_kernel = codegen_kernel(
+                        self.vec_kernel_cls,
+                        tiling_factors[0],
+                        tiling_indices[0],
+                        tail_size,
+                    )
+                else:
+                    tail_kernel = scalar_kernel
+                    scalar_kernel.inner_itervars = [loop.var]
+                tail_kernel.active_ranges = {loop.var: (loop.tiled_size, loop.size)}
+                self.kernels = [vec_kernel, tail_kernel]
+                _outer_loop = loop
+            elif len(tiling_indices) == 2:
+                if not (
+                    tiling_indices[1] == len(self.itervars) - 1
+                    and tiling_factors[0] == tiling_factors[1]
+                ):
+                    raise AssertionError(
+                        "expected tiling_indices[1] == len(self.itervars) - 1 and tiling_fa..."
+                    )
+
+                # pyrefly: ignore [bad-assignment]
+                metrics.generated_cpp_vec_kernel_count += 2
+                outer_loop = self.loop_nest.tile(
+                    tiling_indices[0], factor=tiling_factors[0]
+                )
+                outer_ranges = {
+                    "main": (0, outer_loop.tiled_size),
+                    "tail": (outer_loop.tiled_size, outer_loop.size),
+                }
+                outer_tail_size = outer_loop.size - outer_loop.tiled_size
+                inner_loop = self.loop_nest.tile(
+                    tiling_indices[1], factor=tiling_factors[0]
+                )
+                inner_ranges = {
+                    "main": (0, inner_loop.tiled_size),
+                    "tail": (inner_loop.tiled_size, inner_loop.size),
+                }
+                inner_tail_size = inner_loop.size - inner_loop.tiled_size
+                tile2d_kernel = codegen_kernel(
+                    self.tile2d_kernel_cls,
+                    tiling_factors[0],
+                    tiling_indices,
+                )
+                tile2d_kernel.active_ranges = {
+                    outer_loop.var: outer_ranges["main"],
+                    inner_loop.var: inner_ranges["main"],
+                }
+                tail_kernel = []
+                if config.cpp.enable_loop_tail_vec and _tail_vec_worthwhile(
+                    inner_tail_size, tiling_factors[0]
+                ):
+                    for outer_r, inner_r in (
+                        ("main", "tail"),
+                        ("tail", "main"),
+                        ("tail", "tail"),
+                    ):
+                        _inner_tail_size = (
+                            inner_tail_size if inner_r == "tail" else None
+                        )
+                        _outer_tail_size = (
+                            outer_tail_size if outer_r == "tail" else None
+                        )
+                        kernel = codegen_kernel(
+                            self.tile2d_kernel_cls,
+                            tiling_factors[0],
+                            tiling_indices,
+                            _inner_tail_size,
+                            _outer_tail_size,
+                        )
+                        kernel.active_ranges = {
+                            outer_loop.var: outer_ranges[outer_r],
+                            inner_loop.var: inner_ranges[inner_r],
+                        }
+                        tail_kernel.append(kernel)
+                else:
+                    vec_kernel = codegen_kernel(
+                        self.vec_kernel_cls, tiling_factors[0], tiling_indices[0]
+                    )
+                    vec_kernel.active_ranges = {
+                        outer_loop.var: outer_ranges["main"],
+                        inner_loop.var: inner_ranges["tail"],
+                    }
+                    vec_kernel.inner_itervars = [inner_loop.var]
+                    tail_kernel.append(vec_kernel)
+                    scalar_kernel.active_ranges = {
+                        outer_loop.var: outer_ranges["tail"],
+                        inner_loop.var: (0, inner_loop.size),
+                    }
+                    scalar_kernel.inner_itervars = [inner_loop.var, outer_loop.var]
+                    tail_kernel.append(scalar_kernel)
+                self.kernels = [tile2d_kernel] + tail_kernel
+                _outer_loop = outer_loop
+            else:
+                self.kernels = [scalar_kernel]
+            # A non-reduction tiled loop with a nested reduction needs its
+            # reduction suffix selected by the same main/tail active range.
+            self.aggregate_reduction_buffers(
+                _inner_loop_reduction_outer_not
+                or (len(tiling_indices) == 1 and _tiled_loop_reduction_descendant),
+                _outer_loop,
+            )
+            self.loop_nest.set_kernel(self)
+
+    def codegen_loop_bodies(self, loop_bodies, var_sizes_list):
+        for body in loop_bodies:
+            self.legalize_lowp_fp_dtype_loopbody(body)
+            DataTypePropagation.propagate_loopbody(body)
+        self.codegen_functions(loop_bodies, var_sizes_list)
+
+    def codegen_nodes(self, nodes: list[SchedulerNode]):
+        # Legalize BF16 node by adding to_dtype explicitly
+        self.legalize_lowp_fp_dtype(nodes)
+        self.data_type_propagation(nodes)
+        if len(nodes) < 1:
+            raise AssertionError("expected len(nodes) >= 1")
+
+        def fn(node, *index_vars):
+            node.decide_inplace_update()
+            node.mark_run()
+            if isinstance(V.kernel, NullKernelHandler):
+                return node._body(*index_vars)
+            else:
+                return node.codegen(index_vars)
+
+        fn_list = [functools.partial(fn, node) for node in nodes]
+
+        if (
+            isinstance(V.local_buffer_context, LocalBufferContext)
+            and V.local_buffer_context.local_buffers
+        ):
+
+            def wrap_fn(fn):
+                wrapped_fn = V.local_buffer_context.localize_function(
+                    fn,
+                )
+                wrapped_fn.original_fn = fn
+                return wrapped_fn
+
+            fn_list = [wrap_fn(fn) for fn in fn_list]
+
+        var_sizes_list = [node.group[1] for node in nodes]
+        self.codegen_functions(fn_list, var_sizes_list)
+
+    def codegen_loops(self, code, worksharing):
+        self.codegen_loops_impl(self.loop_nest, code, worksharing)
+
+    def update_stores_with_parallel_reduction(self):
+        for kernel in self.kernels:
+            kernel.update_stores_with_parallel_reduction()
+
+    def gen_body(self, code: BracesBuffer | None = None):
+        if code is None:
+            raise AssertionError("expected code is not None")
+        if_prefix = "C10_LIKELY"
+        for kernel in self.kernels:
+            with contextlib.ExitStack() as stack:
+                if kernel.codegen_conditions(code, if_prefix):
+                    if_prefix = "C10_UNLIKELY"
+                    stack.enter_context(code.indent())
+                    code.splice(kernel.gen_body())
+
+    def aggregate_reduction_buffers(
+        self, inner_loop_reduction_outer_not: bool, outer_loop: Optional["LoopLevel"]
+    ):
+        """
+        CppKernel/CppVecKernel/CppTile2dKernel have reduction buffers themselves.
+        Here, we decide how to aggregate them together and place new reduction buffers
+        under CppKernelProxy.
+        """
+
+        def aggregate_reduction_prefix_suffix(outer_loop: "LoopLevel"):
+            if len(self.kernels) < 2:
+                raise AssertionError("expected len(self.kernels) >= 2")
+            main_loop_kernel = self.kernels[0]
+            tail_loop_kernel = self.kernels[-1]
+            if not isinstance(main_loop_kernel, self.vec_kernel_cls):
+                raise AssertionError(
+                    "expected isinstance(main_loop_kernel, self.vec_kernel_cls)"
+                )
+
+            # Prefix
+            if type(tail_loop_kernel) is self.kernel_cls:
+                # if tail loop kernel is a scalar kernel, we need to extend tmp_acc -> tmp_acc_arr[] to
+                # hold the temporary inner loop acc result for outer tail loop
+                tail_loop_kernel.finalize_reduction_prefix(
+                    main_loop_kernel.tiling_factor
+                )
+                main_loop_kernel.finalize_reduction_prefix()
+                self.reduction_prefix.splice(
+                    tail_loop_kernel.reduction_prefix
+                    + main_loop_kernel.reduction_prefix
+                )
+            else:
+                main_loop_kernel.finalize_reduction_prefix()
+                self.reduction_prefix.splice(main_loop_kernel.reduction_prefix)
+
+            # Suffix
+            suffix_buf = BracesBuffer()
+            with contextlib.ExitStack() as stack:
+                if main_loop_kernel.codegen_conditions(
+                    suffix_buf, "C10_LIKELY", outer_loop.var
+                ):
+                    stack.enter_context(suffix_buf.indent())
+                    suffix_buf.splice(main_loop_kernel.reduction_suffix)
+            with contextlib.ExitStack() as stack:
+                if tail_loop_kernel.codegen_conditions(
+                    suffix_buf, "C10_UNLIKELY", outer_loop.var
+                ):
+                    stack.enter_context(suffix_buf.indent())
+                    if type(tail_loop_kernel) is self.kernel_cls:
+                        reduction_vars = tail_loop_kernel.reduction_var_names
+                        for name in reduction_vars:
+                            new_name = f"{name}_arr[{outer_loop.var}_tail - {cexpr_index(outer_loop.tiled_size)}]"
+                            replace_acc_name(tail_loop_kernel.stores, name, new_name)
+                            replace_acc_name(
+                                tail_loop_kernel.reduction_suffix, name, new_name
+                            )
+                        # If tail loop kernel is a scalar kernel, use direct sum instead of cascade_sum_combine
+                        # as the reduction vars are extended: tmp_acc -> tmp_acc_arr[].
+                        replace_cascade_sum_with_add(tail_loop_kernel.stores)
+                        suffix_buf.splice(
+                            move_code_under_inner_loop(
+                                tail_loop_kernel.reduction_suffix,
+                                outer_loop.var,
+                                f"{outer_loop.var}_tail",
+                                outer_loop.tiled_size,
+                                outer_loop.size,
+                            )
+                        )
+                    else:
+                        suffix_buf.splice(tail_loop_kernel.reduction_suffix)
+            self.reduction_suffix = suffix_buf
+
+        main_kernel = self.kernels[0]
+        if inner_loop_reduction_outer_not:
+            if not outer_loop:
+                raise AssertionError("expected outer_loop")
+            aggregate_reduction_prefix_suffix(outer_loop)
+        else:
+            main_kernel.finalize_reduction_prefix()
+            self.reduction_prefix.splice(main_kernel.reduction_prefix)
+            self.reduction_suffix.splice(main_kernel.reduction_suffix)
+        self.parallel_reduction_prefix.splice(main_kernel.parallel_reduction_prefix)
+        self.parallel_reduction_suffix.splice(main_kernel.parallel_reduction_suffix)
+        self.local_reduction_init.splice(main_kernel.local_reduction_init)
+        self.local_reduction_stores.splice(main_kernel.local_reduction_stores)
+        self.non_parallel_reduction_prefix.splice(
+            main_kernel.non_parallel_reduction_prefix
+        )
+        self.non_parallel_reduction_suffix.splice(
+            main_kernel.non_parallel_reduction_suffix
+        )
+
+
+class OuterLoopFusedKernel(CppKernel):
+    def __init__(self, kernel_group):
+        super().__init__(kernel_group.args, kernel_group.ws.num_threads)
+        self.inner: list[LoopNest] = []
+
+    def decide_parallel_depth(self, max_parallel_depth, threads):
+        kernels_parallel_depth = []
+        nested_kernels: list[CppKernel] = [
+            loop_nest.get_kernel() for loop_nest in self.inner
+        ]
+        # TODO(leslie-fang-intel): only enable parallel within all outer loop levels.
+        for kernel in nested_kernels:
+            # For any ScalarKernel, VecKernel, or Tile2DKernel,
+            # they should all have the same call_ranges
+            call_ranges = kernel.call_ranges
+            if call_ranges is None:
+                raise AssertionError("expected call_ranges is not None")
+            kernels_parallel_depth.append(
+                kernel.decide_parallel_depth(
+                    ParallelDepth(
+                        parallel_depth=(
+                            len(call_ranges) - max_parallel_depth.start_depth
+                        ),
+                        start_depth=max_parallel_depth.start_depth,
+                    ),
+                    threads,
+                ).parallel_depth
+            )
+        return ParallelDepth(
+            parallel_depth=min(
+                max_parallel_depth.parallel_depth, max(kernels_parallel_depth)
+            ),
+            start_depth=max_parallel_depth.start_depth,
+        )
+
+
+class ReasonFusedNodes(Enum):
+    SAME_VARS_REDUCE = "same_vars_reduce"
+    COMPATIBLE_REDUCTION = "compatible_reduction"
+    COMPATIBLE_RANGES_NO_REDUCTION = "compatible_ranges_no_reduction"
+
+
+class CppScheduling(BaseScheduling):
+    # Subclass CppKernelProxy to customize codegen without copying codegen_node().
+    # Use kernel_proxy_cls to inject custom proxies in CppScheduling subclasses.
+    # Avoid duplicating codegen_node() just to swap in a custom kernel proxy class.
+    kernel_proxy_cls: type[CppKernelProxy] = CppKernelProxy
+    # ctypes limits the number of args to 1024, refer to:
+    # https://github.com/python/cpython/commit/a285af7e626d1b81cf09f8b2bf7656f100bc1237
+    # We set a conservative threshold here.
+    MAX_FUSED_KERNEL_ARGS_NUM = 500
+    backend_features = OrderedSet(
+        [
+            BackendFeature.INPLACE_BUFFERS,
+            BackendFeature.REDUCE_TO_SINGLE_ELEMENT,
+        ]
+    )
+
+    @classmethod
+    def get_backend_features(cls, device: tp.device) -> OrderedSet[BackendFeature]:
+        return cls.backend_features
+
+    def __init__(self, scheduler):
+        super().__init__(scheduler)
+        if scheduler:
+            self.reset_kernel_group()
+        self._ready_to_flush = False
+
+    def _set_flush_status(self, status: bool):
+        self._ready_to_flush = status
+
+    def group_fn(self, sizes):
+        return tuple(tuple(map(V.graph.sizevars.simplify, s)) for s in sizes)
+
+    def reset_kernel_group(self):
+        self.kernel_group = KernelGroup()
+
+    def _get_indexing_ranges_exprs(self, node) -> ir.ExtraIndexingConstraints:
+        if isinstance(node, FusedSchedulerNode):
+            if len(node.snodes) <= 0:
+                raise AssertionError(node.snodes)
+            var_ranges = None
+            indexing_exprs = OrderedSet[Any]()
+            for snode in node.snodes:
+                constraints = self._get_indexing_ranges_exprs(snode)
+                if var_ranges is None:
+                    var_ranges = constraints.ranges
+                if var_ranges != constraints.ranges:
+                    raise AssertionError((var_ranges, constraints.ranges, node.snodes))
+                indexing_exprs.update(constraints.exprs)
+            if var_ranges is None:
+                raise AssertionError("expected at least one snode to set var_ranges")
+            return ir.ExtraIndexingConstraints(var_ranges, list(indexing_exprs))
+
+        if not isinstance(node, SchedulerNode):
+            raise AssertionError("expected isinstance(node, SchedulerNode)")
+        comp_buffer = node.node
+        if not isinstance(comp_buffer, ir.ComputedBuffer):
+            raise AssertionError("expected isinstance(comp_buffer, ir.ComputedBuffer)")
+        _, body, _ = comp_buffer.get_default_sizes_body()
+        return ir.ExtraIndexingConstraints(
+            body.var_ranges, list(body.indexing_exprs.values())
+        )
+
+    def _snapshot_node_loop_states(self, node):
+        if isinstance(node, SchedulerNode):
+            return [(node, node.snapshot_loop_state())]
+
+        if not isinstance(node, FusedSchedulerNode):
+            raise AssertionError("expected isinstance(node, FusedSchedulerNode)")
+        snapshots = []
+        for snode in node.snodes:
+            if not isinstance(snode, SchedulerNode):
+                raise AssertionError("expected isinstance(snode, SchedulerNode)")
+            snapshots.append((snode, snode.snapshot_loop_state()))
+        return snapshots
+
+    def _align_compatible_range_nodes(self, node1, node2):
+        if not isinstance(node1, (SchedulerNode, FusedSchedulerNode)):
+            raise AssertionError(
+                "expected isinstance(node1, (SchedulerNode, FusedSchedulerNode))"
+            )
+        if not isinstance(node2, (SchedulerNode, FusedSchedulerNode)):
+            raise AssertionError(
+                "expected isinstance(node2, (SchedulerNode, FusedSchedulerNode))"
+            )
+
+        _, (vars1, reduce1) = node1.group
+        _, (vars2, reduce2) = node2.group
+        if not (reduce1 == () and reduce2 == ()):
+            raise AssertionError((reduce1, reduce2))
+
+        node_to_recomp = node1 if len(vars1) < len(vars2) else node2
+        ref_node = node2 if len(vars1) < len(vars2) else node1
+        if not isinstance(node_to_recomp, SchedulerNode):
+            raise AssertionError("expected isinstance(node_to_recomp, SchedulerNode)")
+
+        ref_indexing_constraints = self._get_indexing_ranges_exprs(ref_node)
+        node_to_recomp.recompute_size_and_body(
+            extra_indexing_constraints=ref_indexing_constraints
+        )
+
+        _, (vars1, _) = node1.group
+        _, (vars2, _) = node2.group
+        if vars1 == vars2:
+            return True
+
+        node_to_recomp_indexing_constraints = self._get_indexing_ranges_exprs(
+            node_to_recomp
+        )
+        if isinstance(ref_node, SchedulerNode):
+            ref_node.recompute_size_and_body(
+                extra_indexing_constraints=node_to_recomp_indexing_constraints
+            )
+        else:
+            if not isinstance(ref_node, FusedSchedulerNode):
+                raise AssertionError(
+                    "expected isinstance(ref_node, FusedSchedulerNode)"
+                )
+            for snode in ref_node.snodes:
+                if not isinstance(snode, SchedulerNode):
+                    raise AssertionError("expected isinstance(snode, SchedulerNode)")
+                snode.recompute_size_and_body(
+                    extra_indexing_constraints=node_to_recomp_indexing_constraints
+                )
+
+        _, (vars1, _) = node1.group
+        _, (vars2, _) = node2.group
+        return vars1 == vars2
+
+    def fuse(self, node1, node2):
+        if node1.is_foreach() or node2.is_foreach():
+            return ForeachKernelSchedulerNode.fuse(node1, node2)
+        elif node1.is_template():
+            if node2.is_template():
+                raise AssertionError("expected not node2.is_template()")
+            return FusedSchedulerNode.fuse(node1, node2)
+        else:
+            if (
+                self._why_fuse_nodes(node1, node2)
+                == ReasonFusedNodes.COMPATIBLE_RANGES_NO_REDUCTION
+            ):
+                if not (self._align_compatible_range_nodes(node1, node2)):
+                    raise AssertionError(
+                        (
+                            node1.group,
+                            node2.group,
+                        )
+                    )
+                return FusedSchedulerNode.fuse(node1, node2)
+            elif self.can_fuse_vertical_outer_loop(node1, node2):
+                return OuterLoopFusedSchedulerNode.fuse(
+                    node1, node2, self._get_outer_loop_fusion_depth(node1, node2)
+                )
+            else:
+                return FusedSchedulerNode.fuse(node1, node2)
+
+    def _why_fuse_nodes(self, node1, node2) -> ReasonFusedNodes | None:
+        _, (vars1, reduce1) = node1.group
+        _, (vars2, reduce2) = node2.group
+
+        if vars1 == vars2 and reduce1 == reduce2:
+            return ReasonFusedNodes.SAME_VARS_REDUCE
+        if reduce1 == () and vars1 == vars2 + reduce2:
+            return ReasonFusedNodes.COMPATIBLE_REDUCTION
+        if self._can_fuse_nodes_with_compatible_ranges(node1, node2):
+            return ReasonFusedNodes.COMPATIBLE_RANGES_NO_REDUCTION
+        # TODO(jansel): allow fusion pointwise (vars1, ()) suffix?
+        return None
+
+    def _can_fuse_nodes_with_compatible_ranges(self, node1, node2):
+        # Here we try to fuse SchedulerNode/FusedSchedulerNode with compatible ranges
+        # e.g. (s0, s1, s2) and (s0 * s1 * s2)
+        _, (vars1, reduce1) = node1.group
+        _, (vars2, reduce2) = node2.group
+
+        c1 = reduce1 == () and reduce2 == ()
+        c2 = math.prod(vars1) == math.prod(vars2)
+        c3 = len(vars1) == 1 or len(vars2) == 1
+        if not (c1 and c2 and c3):
+            return False
+
+        node_to_recomp = node1 if len(vars1) < len(vars2) else node2
+        ref_node = node2 if len(vars1) < len(vars2) else node1
+
+        # We can not recompute sizes and body for nodes other than SchedulerNode
+        # TODO: we can extend fusion support with compatible ranges for FusedSchedulerNode
+        if isinstance(node_to_recomp, FusedSchedulerNode):
+            return False
+
+        # It may happen that node1 and node2 compatible number of elements
+        # but different original ranges, for example:
+        # {d0: s0, d1: s1, d2: s2} vs {d0: s0*s1*s2}
+        # Fixable if it lets us CSE at least one of the variables.
+
+        if not isinstance(node_to_recomp, SchedulerNode):
+            raise AssertionError("expected isinstance(node_to_recomp, SchedulerNode)")
+        if isinstance(node_to_recomp.node, ir.TemplateBuffer):
+            return False
+        if not isinstance(node_to_recomp.node, ir.ComputedBuffer):
+            raise AssertionError(
+                "expected isinstance(node_to_recomp.node, ir.ComputedBuffer)"
+            )
+        # node.data.get_size() is a cheaper version of node.get_read_writes().var_ranges
+        # but without variable name
+        ranges2 = node_to_recomp.node.data.get_size()
+        ranges1 = None
+        if isinstance(ref_node, FusedSchedulerNode):
+            ranges_set = OrderedSet[tuple[Any, ...]]()
+            for snode in ref_node.snodes:
+                if not isinstance(snode, SchedulerNode):
+                    raise AssertionError("expected isinstance(snode, SchedulerNode)")
+                if isinstance(snode.node, ir.TemplateBuffer):
+                    break
+                if not isinstance(snode.node, ir.ComputedBuffer):
+                    raise AssertionError(
+                        "expected isinstance(snode.node, ir.ComputedBuffer)"
+                    )
+                ranges_set.add(tuple(snode.node.data.get_size()))
+
+            if len(ranges_set) != 1:
+                return False
+
+            ranges1 = list(next(iter(ranges_set)))
+        else:
+            if not isinstance(ref_node, SchedulerNode):
+                raise AssertionError("expected isinstance(ref_node, SchedulerNode)")
+            if not isinstance(ref_node.node, ir.ComputedBuffer):
+                raise AssertionError(
+                    "expected isinstance(ref_node.node, ir.ComputedBuffer)"
+                )
+            ranges1 = ref_node.node.data.get_size()  # type: ignore[assignment]
+
+        if ranges1 != ranges2:
+            return False
+
+        snapshots = self._snapshot_node_loop_states(node_to_recomp)
+        snapshots.extend(self._snapshot_node_loop_states(ref_node))
+        try:
+            return self._align_compatible_range_nodes(node1, node2)
+        finally:
+            for node, state in reversed(snapshots):
+                node.restore_loop_state(state)
+
+    def _can_fuse_horizontal_impl(self, node1, node2):
+        if not (
+            isinstance(
+                node1, (FusedSchedulerNode, SchedulerNode, ExternKernelSchedulerNode)
+            )
+        ):
+            raise AssertionError(
+                "expected isinstance( node1, (FusedSchedulerNode, SchedulerNode, Ex..."
+            )
+        if not isinstance(node2, (FusedSchedulerNode, SchedulerNode)):
+            raise AssertionError(
+                "expected isinstance(node2, (FusedSchedulerNode, SchedulerNode))"
+            )
+        if any(
+            isinstance(node, (OuterLoopFusedSchedulerNode, ExternKernelSchedulerNode))
+            for node in (node1, node2)
+        ):
+            return False
+        return self._why_fuse_nodes(node1, node2) is not None
+
+    def can_fuse_horizontal(self, node1, node2):
+        if node1.is_template() or node2.is_template():
+            return False
+        if (
+            len(node1.get_nodes()) + len(node2.get_nodes())
+            > config.cpp.max_horizontal_fusion_size
+        ):
+            return False
+
+        return self._can_fuse_horizontal_impl(node1, node2)
+
+    def can_fuse_multi_outputs_template(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> bool:
+        if template_buf := node1.get_template_node():
+            return (
+                isinstance(template_buf.layout, ir.MultiOutputLayout)
+                and isinstance(node2.node, ir.MultiOutput)
+                and len(node2.node.inputs) == 1
+                and node2.node.inputs[0].get_name() == template_buf.name  # type: ignore[union-attr]
+            )
+        return False
+
+    def _get_outer_loop_fusion_depth(self, node1, node2):
+        DISABLE_OUTER_LOOP_FUSION = 0
+        if not all(
+            type(node)
+            in (OuterLoopFusedSchedulerNode, FusedSchedulerNode, SchedulerNode)
+            for node in (node1, node2)
+        ):
+            return DISABLE_OUTER_LOOP_FUSION
+
+        _node1 = (
+            node1.get_outer_nodes()[-1]
+            if isinstance(node1, OuterLoopFusedSchedulerNode)
+            else node1
+        )
+        if not isinstance(_node1, (FusedSchedulerNode, SchedulerNode)):
+            raise AssertionError(
+                "expected isinstance(_node1, (FusedSchedulerNode, SchedulerNode))"
+            )
+        _node2 = (
+            node2.get_outer_nodes()[0]
+            if isinstance(node2, OuterLoopFusedSchedulerNode)
+            else node2
+        )
+        if not isinstance(_node2, (FusedSchedulerNode, SchedulerNode)):
+            raise AssertionError(
+                "expected isinstance(_node2, (FusedSchedulerNode, SchedulerNode))"
+            )
+
+        _, (vars1, reduce1) = _node1.group
+        _, (vars2, reduce2) = _node2.group
+        if vars1 == () and vars2 == () and reduce1 != () and reduce2 != ():
+            # Reduction only
+            return DISABLE_OUTER_LOOP_FUSION
+        if all(type(node) is OuterLoopFusedSchedulerNode for node in (node1, node2)):
+            return (
+                node1.outer_loop_fusion_depth
+                if node1.outer_loop_fusion_depth == node2.outer_loop_fusion_depth
+                else DISABLE_OUTER_LOOP_FUSION
+            )
+        outer_loop_fusion_depth = min(len(vars1), len(vars2))
+        if (
+            outer_loop_fusion_depth >= 1
+            and vars1[:outer_loop_fusion_depth] == vars2[:outer_loop_fusion_depth]
+        ):
+            if any(
+                type(node) is OuterLoopFusedSchedulerNode for node in (node1, node2)
+            ):
+                _compare_node = (
+                    node1 if type(node1) is OuterLoopFusedSchedulerNode else node2
+                )
+                if _compare_node.outer_loop_fusion_depth == outer_loop_fusion_depth:
+                    # Same outer loop fusion depth as prev nodes in OuterLoopFusedSchedulerNode
+                    return outer_loop_fusion_depth
+                else:
+                    return DISABLE_OUTER_LOOP_FUSION
+            else:
+                # First 2 nodes to generate OuterLoopFusedSchedulerNode
+                return outer_loop_fusion_depth
+        return DISABLE_OUTER_LOOP_FUSION
+
+    def can_fuse_vertical_outer_loop(self, node1, node2):
+        return (
+            not node1.is_template()
+            and not node2.is_template()
+            and node1.get_operation_names() & node2.ancestors
+            and not (
+                self._can_fuse_horizontal_impl(node1, node2)
+                and not node1.is_reduction()
+            )
+            and self._get_outer_loop_fusion_depth(node1, node2) >= 1
+        )
+
+    def get_fusion_pair_priority(self, node1, node2):
+        if self.can_fuse_vertical_outer_loop(node1, node2):
+            # Outer loop fusion with lower priority
+            return 1
+        else:
+            return 0
+
+    def can_fuse_vertical(self, node1, node2):
+        if node2.is_template():
+            # TODO(jgong5): support pre-op fusion with template
+            return False
+        if node1.is_template():
+            template_fusion_supported, _ = template_fusion_with_epilogues_supported(
+                node1, [node2]
+            )
+            return not node2.is_reduction() and template_fusion_supported
+        return (
+            self._can_fuse_horizontal_impl(node1, node2) and not node1.is_reduction()
+        ) or self.can_fuse_vertical_outer_loop(node1, node2)
+
+    def try_loop_split(self, nodes: list[SchedulerNode]):
+        """
+        Apply loop split optimization.
+        When one of the indexing_exprs contains a division, we eliminate the division by splitting the loop
+        to avoid non-contiguous loads, subject to the following conditions:
+            1. No reduction and no mudular index for all nodes.
+            2. The indexing_exprs of all nodes contain only one (or more, but all the same) division,
+               where the divisor is an integer and not too small (the divisor > 8), the dividend is
+               one of the iter_vars, and this var, i.e. the dimension that needs to be split, is
+               contiguous in all other indexing_exprs.
+
+        For example, if the node's var_ranges: {z0: 2, z1: 9216, z2: 960} and indexing_exprs:
+        {'index0': 8847360*z0 + 960*z1 + z2, 'index1': 32*z0 + (z2//30), 'index2': z2},
+        we will split z2 -> 30*z2 + z3, then the node's var_ranges will be changed to
+        {z0: 2, z1: 9216, z2: 32, z3: 30} and indexing_exprs will be changed to
+        {'index0': 8847360*z0 + 960*z1 + 30*z2 + z3, 'index1': 32*z0 + z2, 'index2': 30*z2 + z3}.
+        """
+
+        # No reduction and no mudular
+        if any(
+            len(node.group[1][1]) != 0
+            or any(
+                expr.has(ModularIndexing) for expr in node._body.indexing_exprs.values()
+            )
+            for node in nodes
+        ):
+            return nodes
+
+        split_var = None
+        split_number = None
+        num_div = 0
+        div_expr_ = None
+        match_div = False
+        matched_index_size = None
+
+        # Collect node info for later compatibility check
+        node_bodies: list[tuple[Any, Any]] = []
+
+        for node in nodes:
+            if not isinstance(node.node, ir.ComputedBuffer):
+                raise AssertionError(
+                    "expected isinstance(node.node, ir.ComputedBuffer)"
+                )
+            sizes_body = node.node.get_default_sizes_body()
+            node_bodies.append((node, sizes_body))
+            (index_size, _), original_body, _ = sizes_body
+            for name, expr in original_body.indexing_exprs.items():
+                if not isinstance(expr, sympy.Expr):
+                    continue
+                for div_expr in expr.find(FloorDiv):
+                    if (
+                        any(div_expr.has(var) for var in original_body.iter_vars)
+                        and div_expr != div_expr_
+                    ):
+                        div_expr_ = div_expr
+                        num_div += 1
+                    if num_div > 1:
+                        return nodes
+                    if (
+                        isinstance(div_expr.args[1], sympy.core.numbers.Integer)
+                        and div_expr.args[0] in original_body.iter_vars
+                        and name is not None
+                        and all(
+                            stride_at_vec_range(expr_, div_expr.args[0]) in (0, 1)
+                            for name_, expr_ in original_body.indexing_exprs.items()
+                            if name_ != name
+                        )
+                        and div_expr.args[1] > 8
+                    ):
+                        split_var = div_expr.args[0]
+                        split_number = div_expr.args[1]
+                        match_div = True
+                        matched_index_size = index_size
+
+        # Only one node contains a division, and the split dimension is contiguous in all other indexing_exprs.
+        if not match_div:
+            return nodes
+
+        # Check if all nodes have split_var in their iter_vars and have compatible sizes
+        # (same number of index dimensions). If not, bail out to avoid incompatible
+        # var_ranges after loop split which would cause assertion failures in
+        # simplify_and_reorder or codegen_functions.
+        if matched_index_size is None:
+            raise AssertionError("expected matched_index_size is not None")
+        matched_num_dims = len(matched_index_size)
+
+        for node, ((index_size, _), original_body, _) in node_bodies:
+            if split_var not in original_body.iter_vars:
+                return nodes
+            if len(index_size) != matched_num_dims:
+                return nodes
+
+        def loop_split(sizes, body, vars):
+            index_size, reduce_size = sizes
+            index_vars, reduce_vars = vars
+            split_idx = index_vars.index(split_var)
+            new_index_size = index_size.copy()
+            new_index_size[split_idx] = index_size[split_idx] // split_number
+            new_index_size.insert(split_idx + 1, split_number)
+            (new_index_vars, _), var_ranges = dependencies.index_vars_no_squeeze(
+                new_index_size, reduce_size, prefix="y"
+            )
+            iter_vars = new_index_vars.copy()
+            divisor_var = iter_vars.pop(split_idx + 1)
+            iter_vars[split_idx] = split_number * iter_vars[split_idx] + divisor_var
+            body = ir.LoopBody(
+                body, [iter_vars, reduce_vars], var_ranges, new_index_vars, reduce_vars
+            )
+            return (
+                (new_index_size, reduce_size),
+                body,
+                (new_index_vars, reduce_vars),
+            )
+
+        extra_indexing_ranges = None
+        extra_indexing_exprs = OrderedSet[Any]()
+        for _, sizes_body in node_bodies:
+            _, split_body, _ = loop_split(*sizes_body)
+            if extra_indexing_ranges is None:
+                extra_indexing_ranges = split_body.var_ranges
+            if extra_indexing_ranges != split_body.var_ranges:
+                raise AssertionError(
+                    (
+                        extra_indexing_ranges,
+                        split_body.var_ranges,
+                    )
+                )
+            extra_indexing_exprs.update(split_body.indexing_exprs.values())
+
+        if extra_indexing_ranges is None:
+            raise AssertionError("extra_indexing_ranges is None")
+        extra_indexing_constraints = ir.ExtraIndexingConstraints(
+            extra_indexing_ranges,
+            list(extra_indexing_exprs),
+        )
+
+        snapshots = [(node, node.snapshot_loop_state()) for node in nodes]
+        for node in nodes:
+            node.recompute_size_and_body(
+                extra_indexing_constraints=extra_indexing_constraints,
+                recompute_sizes_body_func=loop_split,
+            )
+
+        # Keep the post-split leaves compatible with CppKernelProxy.codegen_functions.
+        # If simplification still picks different loop factorizations, skip this
+        # optional optimization and codegen the original fused pointwise group.
+        group = nodes[0].group[1]
+        if any(node.group[1] != group for node in nodes[1:]):
+            for node, state in reversed(snapshots):
+                node.restore_loop_state(state)
+
+        return nodes
+
+    def codegen_outer_loop_node(
+        self,
+        node: OuterLoopFusedSchedulerNode,
+    ):
+        """
+        Generate the code for the outer loop fused scheduler node.
+        1. Codegen with fused outer loop: depends on the analysis of
+            the outer loop fused scheduler node, with or without the local buffer.
+        2. If failed, fallback to standard codegen.
+        """
+        kernel_group = self.kernel_group
+        generated_cpp_vec_kernel_count = metrics.generated_cpp_vec_kernel_count
+        cpp_kernel_proxy_list: list[self.kernel_proxy_cls] = []  # type: ignore[name-defined]
+        nodes_list: list[list[SchedulerNode]] = []
+        if not isinstance(node, OuterLoopFusedSchedulerNode):
+            raise AssertionError(
+                "expected isinstance(node, OuterLoopFusedSchedulerNode)"
+            )
+
+        def try_outer_loop_fusion_with_local_buf(node: OuterLoopFusedSchedulerNode):
+            """
+            Codegen code with fused outer loop and local Buffer.
+            """
+            if not isinstance(node, OuterLoopFusedSchedulerNode):
+                raise AssertionError(
+                    "expected isinstance(node, OuterLoopFusedSchedulerNode)"
+                )
+            cpp_kernel_proxy_list.clear()
+            nodes_list.clear()
+
+            def get_call_ranges(node: BaseSchedulerNode):
+                if not isinstance(node, (SchedulerNode, FusedSchedulerNode)):
+                    raise AssertionError(
+                        "expected isinstance(node, (SchedulerNode, FusedSchedulerNode))"
+                    )
+                nodes: list[SchedulerNode] = node.get_nodes()  # type: ignore[assignment]
+                _, (group, reduction_group) = max(
+                    nodes, key=lambda x: int(x.is_reduction())
+                ).group
+                call_ranges = tuple(group) + tuple(reduction_group)
+                return call_ranges
+
+            local_buffers: list[ir.Buffer] = []
+            # Map local buffer name to a list of global buffers
+            local_to_global_buffers: dict[str, list[ir.Buffer]] = {}
+            if all(
+                len(get_call_ranges(_node)) == node.outer_loop_fusion_depth + 1
+                for _node in node.get_outer_nodes()
+            ):
+                # The typical case of a local buffer: sized by the last
+                # dimension and contiguous.
+                # Only support this typical case at first.
+                visited_scheduler_nodes: OrderedSet[str] = OrderedSet()
+                for scheduler_node in node.get_nodes():
+                    # all users inside same OuterLoopFusedSchedulerNode
+                    if not isinstance(scheduler_node, SchedulerNode):
+                        raise AssertionError(
+                            "expected isinstance(scheduler_node, SchedulerNode)"
+                        )
+                    visited_scheduler_nodes.add(scheduler_node.get_name())
+                    if (
+                        scheduler_node.is_reduction()
+                        or len(scheduler_node.get_outputs()) != 1
+                    ):
+                        continue
+
+                    scheduler_buffer = scheduler_node.get_outputs()[0]
+                    if all(
+                        user.node in node.get_nodes() for user in scheduler_buffer.users
+                    ):
+                        global_buffer = scheduler_buffer.node
+                        if not isinstance(global_buffer, ir.ComputedBuffer):
+                            raise AssertionError(
+                                "expected isinstance(global_buffer, ir.ComputedBuffer)"
+                            )
+                        global_buffer_layout = global_buffer.get_layout()
+                        size_offset = node.outer_loop_fusion_depth - len(
+                            get_call_ranges(scheduler_node)
+                        )
+
+                        def is_all_write_read_contiguous():
+                            contiguous_index_expr = 0
+                            stride = 1
+                            for var, range in reversed(
+                                # pyrefly: ignore [missing-attribute]
+                                scheduler_node._body.var_ranges.items()
+                            ):
+                                contiguous_index_expr += stride * var
+                                stride *= range
+                            # pyrefly: ignore [missing-attribute]
+                            write_index_expr = scheduler_node._body.get_write_expr(
+                                scheduler_buffer.get_name()
+                            )
+
+                            def is_contiguous_index(x):
+                                return x == contiguous_index_expr
+
+                            return is_contiguous_index(write_index_expr) and all(
+                                isinstance(user.node, SchedulerNode)
+                                and is_contiguous_index(
+                                    user.node._body.get_read_expr(
+                                        scheduler_buffer.get_name()
+                                    ),
+                                )
+                                for user in scheduler_buffer.users
+                            )
+
+                        if not (
+                            global_buffer_layout.is_contiguous()
+                            and is_all_write_read_contiguous()
+                        ):
+                            continue
+                        # Local Buffer is a view of global buffer
+                        local_buffer_stride: list[int] = []
+                        stride = global_buffer_layout.stride[-1]
+                        local_buffer_size = get_call_ranges(scheduler_node)[
+                            size_offset:
+                        ]
+                        for sz in reversed(local_buffer_size):
+                            local_buffer_stride.insert(0, stride)
+                            stride *= sz
+                        local_buffer_layout = ir.FixedLayout(
+                            global_buffer_layout.device,
+                            global_buffer_layout.dtype,
+                            local_buffer_size,
+                            local_buffer_stride,
+                        )
+
+                        def try_share_local_buffer(local_buffer_layout, local_buffers):
+                            for local_buf in local_buffers:
+                                if local_buffer_layout == local_buf.layout and all(
+                                    all(
+                                        user.node.get_name() in visited_scheduler_nodes
+                                        for user in V.graph.scheduler.name_to_buf[
+                                            global_buffer.name
+                                        ].users
+                                    )
+                                    for global_buffer in local_to_global_buffers[
+                                        local_buf.name
+                                    ]
+                                    if global_buffer.name is not None
+                                ):
+                                    return local_buf
+                            return None
+
+                        local_buf_prefix = "local_buffer_data"
+                        # Share existing local buffer
+                        local_buffer_used = try_share_local_buffer(
+                            local_buffer_layout, local_buffers
+                        )
+                        if not local_buffer_used:
+                            # Create new local buffer
+                            local_buffer_used = ir.Buffer(
+                                name=f"{local_buf_prefix}_{len(local_buffers)}",
+                                layout=local_buffer_layout,
+                            )
+                            local_buffers.append(local_buffer_used)
+                            local_to_global_buffers[local_buffer_used.name] = []  # type: ignore[index]
+
+                        local_to_global_buffers[local_buffer_used.name].append(
+                            global_buffer,
+                        )
+
+            with LocalBufferContext(kernel_group.args) as scope:
+                if len(local_buffers) > 0:
+                    for local_buffer in local_buffers:
+                        if local_buffer.name is None:
+                            raise AssertionError(
+                                "expected local_buffer.name is not None"
+                            )
+                        scope.add_local_buffer(
+                            local_buffer, local_to_global_buffers[local_buffer.name]
+                        )
+                for _node in node.get_outer_nodes():
+                    if not isinstance(_node, (FusedSchedulerNode, SchedulerNode)):
+                        raise AssertionError(
+                            "expected isinstance(_node, (FusedSchedulerNode, SchedulerNode))"
+                        )
+                    cpp_kernel_proxy = self.kernel_proxy_cls(kernel_group)
+                    cpp_kernel_proxy.codegen_nodes(_node.get_nodes())  # type: ignore[arg-type]
+                    cpp_kernel_proxy_list.append(cpp_kernel_proxy)
+                    nodes_list.append(_node.get_nodes())  # type: ignore[arg-type]
+
+                def fallback_without_local_buffers() -> Literal[False]:
+                    for removed_buffer in scope.removed_buffers:
+                        # Restore the removed buffers by this context before
+                        # fallback to codegen without using Local Buffer.
+                        V.graph.removed_buffers.remove(removed_buffer)
+                    return False
+
+                # Local buffers omit fused outer dimensions.  If an omitted
+                # outer loop is tiled, one local buffer slot would be reused for
+                # multiple outer elements in the same loop iteration.
+                def has_tiled_fused_outer_loop() -> bool:
+                    for cpp_kernel_proxy in cpp_kernel_proxy_list:
+                        loop_nest = cpp_kernel_proxy.loop_nest
+                        if loop_nest is None:
+                            raise AssertionError("expected loop_nest is not None")
+                        loops = loop_nest.loops
+                        if loops is None:
+                            raise AssertionError("expected loops is not None")
+                        for loop in loops[: node.outer_loop_fusion_depth]:
+                            if loop.steps != sympy.S.One:
+                                return True
+                    return False
+
+                if len(local_buffers) > 0 and has_tiled_fused_outer_loop():
+                    return fallback_without_local_buffers()
+
+                if not node.check_outer_fusion_loop_level_attr(
+                    cpp_kernel_proxy_list, node.outer_loop_fusion_depth
+                ):
+                    return fallback_without_local_buffers()
+                metrics.cpp_outer_loop_fused_inner_counts.append(
+                    metrics.CppOuterLoopFusedCount(
+                        len(cpp_kernel_proxy_list),
+                        local_buffer_number=len(scope.local_buffers),
+                    )
+                )
+                outer_fusion_cpp_kernel_proxy = node.merge_outer_fusion_kernels(
+                    cpp_kernel_proxy_list,
+                )
+                kernel_group.finalize_kernel(
+                    outer_fusion_cpp_kernel_proxy,
+                    [*itertools.chain.from_iterable(nodes_list)],
+                )
+
+            return True
+
+        if not try_outer_loop_fusion_with_local_buf(node):
+            # Reset generated_cpp_vec_kernel_count to codegen again
+            metrics.generated_cpp_vec_kernel_count = generated_cpp_vec_kernel_count
+            cpp_kernel_proxy_list.clear()
+            nodes_list.clear()
+            # Kernels share the same global contexts, V.graph.wrapper_code
+            # and V.kernel.args among them.
+            with config.patch(inplace_buffers=False):
+                for _node in node.get_outer_nodes():
+                    if not isinstance(_node, (FusedSchedulerNode, SchedulerNode)):
+                        raise AssertionError(
+                            "expected isinstance(_node, (FusedSchedulerNode, SchedulerNode))"
+                        )
+                    _nodes: list[SchedulerNode] = _node.get_nodes()  # type: ignore[assignment]
+                    cpp_kernel_proxy = self.kernel_proxy_cls(kernel_group)
+                    cpp_kernel_proxy.codegen_nodes(_nodes)
+                    kernel_group.finalize_kernel(cpp_kernel_proxy, _nodes)
+
+    def codegen_node(
+        self,
+        node: OuterLoopFusedSchedulerNode | FusedSchedulerNode | SchedulerNode,
+    ):
+        """
+        Turn a set of pre-fused nodes into a C++ kernel.
+        """
+        kernel_group = self.kernel_group
+
+        if isinstance(node, OuterLoopFusedSchedulerNode):
+            self.codegen_outer_loop_node(node)
+        else:
+            nodes: list[SchedulerNode] = node.get_nodes()  # type: ignore[assignment]
+            nodes = self.try_loop_split(nodes)
+            cpp_kernel_proxy = self.kernel_proxy_cls(kernel_group)
+            cpp_kernel_proxy.codegen_nodes(nodes)
+            kernel_group.finalize_kernel(cpp_kernel_proxy, nodes)
+
+        args_num = self._get_scheduled_num_args()
+        if args_num > CppScheduling.MAX_FUSED_KERNEL_ARGS_NUM:
+            self._set_flush_status(True)
+
+    def is_cpp_template(self, node: BaseSchedulerNode) -> bool:
+        return isinstance(node, SchedulerNode) and isinstance(
+            node.node, ir.CppTemplateBuffer
+        )
+
+    def codegen_template(
+        self,
+        template_node: BaseSchedulerNode,
+        epilogue_nodes: Sequence[BaseSchedulerNode],
+        prologue_nodes: Sequence[BaseSchedulerNode],
+    ):
+        """
+        Codegen a CPP template, possibly with fused epilogues
+        """
+        if prologue_nodes:
+            raise AssertionError("expected not prologue_nodes")
+
+        # remove MultiOutput from epilogue_nodes
+        epilogue_nodes = [
+            epilogue_node
+            for epilogue_node in epilogue_nodes
+            if isinstance(epilogue_node, (SchedulerNode, FusedSchedulerNode))
+        ]
+        # The counter cpp_templated_kernel_counter is used for verifying if a
+        # a templated kernel was successfully compiled in a UT
+        counters["inductor"]["cpp_templated_kernel_counter"] += 1
+        counters["inductor"]["cpp_epilogue_fusion_counter"] += len(epilogue_nodes)
+        if not (self.is_cpp_template(template_node)):
+            raise AssertionError(
+                "Template node passed to CppScheduler.codegen_template must be a SchedulerNode that wraps a CppTemplateBuffer"
+            )
+        template_node = cast(SchedulerNode, template_node)
+        _, (_, rnumel) = template_node.group
+        if rnumel != ():
+            raise AssertionError("expected rnumel == ()")
+        ctb: ir.CppTemplateBuffer = cast(ir.CppTemplateBuffer, template_node.node)
+        epilogue_ir_nodes: list[ir.Operation | None] = [n.node for n in epilogue_nodes]
+        if not (all(isinstance(n, ir.ComputedBuffer) for n in epilogue_ir_nodes)):
+            raise AssertionError(
+                "Epilogue nodes must all be instances of ir.ComputedBuffer"
+            )
+
+        def template_buffer_has_other_users(
+            template_buffer, outputs_by_name, epilogue_nodes
+        ):
+            if not epilogue_nodes:
+                return False
+
+            if template_buffer.get_name() not in outputs_by_name:
+                raise AssertionError(
+                    "expected template_buffer.get_name() in outputs_by_name"
+                )
+            users = outputs_by_name[template_buffer.get_name()].users
+            return not all(
+                isinstance(user.node, BaseSchedulerNode)
+                and user.node.node in epilogue_nodes
+                for user in users
+            )
+
+        flag_template_buffer_has_other_users = template_buffer_has_other_users(
+            ctb, template_node.outputs_by_name, epilogue_ir_nodes
+        )
+        kernel, render = ctb.make_kernel_render(  # type: ignore[misc]
+            ctb,
+            flag_template_buffer_has_other_users=flag_template_buffer_has_other_users,
+            epilogue_nodes=epilogue_ir_nodes,
+        )
+        with kernel:
+            if not is_multi_outputs_template(template_node.node):
+                template_node.mark_run()  # type: ignore[attr-defined]
+            for node in epilogue_nodes:
+                node.mark_run()  # type: ignore[attr-defined]
+            src_code = render()
+
+        with V.set_kernel_handler(kernel):
+            node_schedule = [template_node, *epilogue_nodes]
+            kernel_name = self.define_kernel(src_code, node_schedule, kernel.args)
+
+        if is_multi_outputs_template(template_node.node):
+            # For multi outputs template, allocate buffers for each output after the epilogue
+            # codegen to which determines if the buffer has been removed.
+            if len(template_node.outputs) != 1:
+                raise AssertionError(
+                    "Multi outputs template should be with 1 output template buffer of MultiOutputLayout"
+                )
+            for user in template_node.outputs[0].users:
+                if not isinstance(user.node, ExternKernelSchedulerNode):
+                    raise AssertionError(
+                        "Multi outputs template should be with ExternKernelSchedulerNode"
+                    )
+                if not isinstance(user.node.node, ir.MultiOutput):
+                    raise AssertionError(
+                        "Multi outputs template has multi users with MultiOutput"
+                    )
+                user.node.mark_run()
+
+        self.codegen_comment(node_schedule, kernel_name)
+        kernel.call_kernel(kernel_name, ctb)
+        V.graph.removed_buffers |= kernel.removed_buffers
+        self.free_buffers_in_scheduler()
+
+    def _get_scheduled_num_args(self):
+        return self.kernel_group.get_num_args()
+
+    def ready_to_flush(self):
+        return self._ready_to_flush
+
+    def codegen_sync(self):
+        pass
+
+    def define_kernel(self, src_code, nodes, kernel_args=None):
+        wrapper = V.graph.wrapper_code
+        if src_code in wrapper.src_to_kernel:
+            kernel_name = wrapper.src_to_kernel[src_code]
+        else:
+            fused_name = (
+                get_fused_kernel_name(nodes, config.cpp.descriptive_names)
+                if config.cpp.descriptive_names
+                else ""
+            )
+            kernel_name = "_".join(["cpp", fused_name, wrapper.next_kernel_suffix()])
+            wrapper.src_to_kernel[src_code] = kernel_name
+            kernel_decl_name = kernel_name if V.graph.cpp_wrapper else "kernel"
+            src_code = src_code.replace(str(Placeholder.KERNEL_NAME), kernel_decl_name)
+            src_code = src_code.replace(str(Placeholder.DESCRIPTIVE_NAME), kernel_name)
+            # TODO(voz): Ostensibly, we should not need this. But there are cases where C++ codegen does
+            # not use BracesBuffer, so we have no good indicator of a C++ buffer atm.
+            src_code = src_code.replace("#pragma CMT", "//")
+
+            # Get the lines in the source code representing the function definition,
+            # excluding the first line including cpp_prefix.h.
+            first_char = src_code.rfind('extern "C"')
+            last_char = src_code.find(")", first_char)
+            if _IS_WINDOWS:
+                # get_export_declaration introduced one more ')' in Windows
+                last_char = src_code.find(")", last_char + 1)
+            kernel_definition = f"{src_code[first_char : last_char + 1]};\n"
+
+            compile_wrapper = IndentedBuffer()
+            args = self.kernel_group.args if kernel_args is None else kernel_args
+            _, _, arg_types = args.cpp_argdefs()
+            if not V.graph.cpp_wrapper:
+                compile_wrapper.writeline(
+                    f"async_compile.cpp_pybinding({arg_types!r}, r'''"
+                )
+            compile_wrapper.splice(src_code, strip=True)
+            if not V.graph.cpp_wrapper:
+                compile_wrapper.writeline("''')")
+            wrapper.define_kernel(
+                kernel_name,
+                compile_wrapper.getvalue(),
+                gpu=False,
+                cpp_definition=kernel_definition,
+            )
+        return kernel_name
+
+    def flush(self):
+        src_code = self.kernel_group.codegen_group()
+        if src_code:
+            kernel_name = self.define_kernel(
+                src_code, self.kernel_group.scheduled_nodes
+            )
+            self.codegen_comment(self.kernel_group.scheduled_nodes, kernel_name)
+            if config.cpp.enable_kernel_profile:
+                V.graph.wrapper_code.write_kernel_context_guard_begin()
+            if (
+                config.cpp.enable_kernel_profile
+                and config.cpp.enable_kernel_context_guard
+            ):
+                V.graph.wrapper_code.write_kernel_context_guard(
+                    kernel_name,
+                    self.kernel_group.scheduled_nodes,  # type: ignore[arg-type]
+                )
+            self.kernel_group.call_kernel(V.graph.wrapper_code, kernel_name)
+            if config.cpp.enable_kernel_profile:
+                V.graph.wrapper_code.write_kernel_context_guard_end()
+
+        self.reset_kernel_group()
+        self._set_flush_status(False)
+
+    def codegen_comment(self, node_schedule, kernel_name=None):
+        # below add provenance tracing info for cpu CppKernel types
+        wrapper = V.graph.wrapper_code
+        debug_handle = set_kernel_post_grad_provenance_tracing(
+            node_schedule,  # type: ignore[arg-type]
+            # pyrefly: ignore [bad-argument-type]
+            kernel_name,
+        )
+        wrapper.write_provenance_debug_handle(kernel_name, debug_handle)
+
+
+class KernelGroup:
+    def __init__(self):
+        super().__init__()
+        self.args = KernelArgs()
+        self.loops_code = BracesBuffer()
+        self.ws = WorkSharing(self.loops_code)
+        self.stack = contextlib.ExitStack()
+        self.stack.enter_context(self.ws)
+        self.scheduled_nodes = []
+
+    def new_kernel(self, cls, *args):
+        return cls(self.args, parallel_num_threads(), *args)
+
+    def finalize_kernel(self, new_kernel, nodes):
+        self.scheduled_nodes += nodes
+        code = self.loops_code
+        ws = self.ws
+        new_kernel.codegen_loops(code, ws)
+
+    def get_num_args(self):
+        arg_defs, _call_args, _arg_types = self.args.cpp_argdefs()
+        args_num = len(arg_defs)
+        return args_num
+
+    def codegen_group(self, name=None) -> str:
+        self.stack.close()
+        if not self.scheduled_nodes:
+            return ""
+        code = BracesBuffer()
+        # 1. Include header files
+        # TODO: support kernel profile on other platforms
+        enable_kernel_profile = config.cpp.enable_kernel_profile and sys.platform in [
+            "linux",
+            "win32",
+        ]
+        if enable_kernel_profile:
+            code.writelines(["#include <torch/csrc/inductor/aoti_runtime/utils.h>"])
+        code.writeline("#include <torch/csrc/inductor/cpp_prefix.h>")
+
+        # 2. Function definition
+        kernel_decl_name = str(Placeholder.KERNEL_NAME) if name is None else name
+        kernel_name = str(Placeholder.DESCRIPTIVE_NAME) if name is None else name
+        arg_defs, _, _ = self.args.cpp_argdefs()
+        arg_defs = ",\n".ljust(25).join(arg_defs)
+        func_export_decl = get_export_declaration()
+        inline_attr = (
+            "C10_ALWAYS_INLINE_ATTRIBUTE" if config.cpp.force_inline_kernel else ""
+        )
+        code.writeline(
+            f'extern "C" {func_export_decl} void {inline_attr} {kernel_decl_name}({arg_defs})'
+        )
+
+        # 3. Function body
+        with code.indent():
+            code.writeline("std::atomic<int> inductor_cpu_integer_div_error{0};")
+            code.writeline(
+                "inductor_cpu_integer_div_error_flag = &inductor_cpu_integer_div_error;"
+            )
+            if enable_kernel_profile:
+                graph_id = V.graph.graph_id
+                prefix = "graph_" + str(graph_id) + "_" if graph_id is not None else ""
+                code.writelines(
+                    [
+                        (
+                            "torch::aot_inductor::RAIIAtenRecordFunctionHandle "
+                            f'record_{prefix + kernel_name}_("{prefix + kernel_name}", nullptr);'
+                        )
+                    ]
+                )
+            for old, new in self.args.aliases():
+                code.writeline(f"auto {old} = {new};")
+            code.splice(self.loops_code)
+            code.writeline("inductor_cpu_integer_div_error_flag = nullptr;")
+            code.writeline(
+                "inductor_cpu_throw_if_integer_div_error(inductor_cpu_integer_div_error);"
+            )
+        return code.getvalue()
+
+    def call_kernel(self, wrapper, kernel_name):
+        _, call_args, arg_types = self.args.cpp_argdefs()
+        wrapper.generate_kernel_call(
+            kernel_name,
+            call_args,
+            triton=False,
+            arg_types=arg_types,
+        )
+
+
+class WorkSharing:
+    def __init__(self, code):
+        self.code = code
+        self.in_parallel = False
+        self.num_threads = None
+        self.stack = contextlib.ExitStack()
+
+    def parallel(self, threads):
+        if self.in_parallel and threads != self.num_threads:
+            # wrong number of threads
+            self.close()
+        if not self.in_parallel:
+            self.num_threads = threads
+            self.in_parallel = True
+            # Decide whether to use dynamic threading
+            use_dynamic = False
+            if config.cpp.threads >= 1:
+                # User explicitly set config.cpp.threads (hardcode it)
+                use_dynamic = False
+            elif threads == os.cpu_count():
+                # Thread count matches system CPU count (most likely default, use dynamic)
+                use_dynamic = True
+            else:
+                # Thread count differs from system (user probably set it so hardcode)
+                use_dynamic = False
+
+            if use_dynamic or config.cpp.dynamic_threads:
+                self.code.writeline("#pragma omp parallel")
+            else:
+                self.code.writeline(f"#pragma omp parallel num_threads({threads})")
+            self.stack.enter_context(self.code.indent())
+            self.code.writeline(
+                "int tid = omp_get_thread_num();",
+            )
+
+    def single(self):
+        if self.in_parallel:
+            self.code.writeline("#pragma omp single")
+        return self.in_parallel
+
+    def close(self):
+        self.stack.close()
+        self.in_parallel = False
+
+    def __enter__(self):
+        self.stack.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stack.__exit__(exc_type, exc_val, exc_tb)
+
+
+@dataclasses.dataclass
+class LoopLevel:
+    var: sympy.Expr | None = None
+    size: sympy.Expr | None = None
+    offset: sympy.Expr = sympy.S.Zero
+    # Note [tiled_size]
+    # We may do loop-tiling at this loop level.
+    # When var is in [offset, tiled_size), we will perform the vectorization kernel.
+    # When var is in [tiled_size, size), we will perform the scalar or masked vectorization kernel.
+    # for (var = offset; var < size; var += steps) {
+    #     if (var >= offset && var < tiled_size) vec_loop_body();
+    #     if (var >= tiled_size && var < size) scalar_or_maskvec_loop_body();
+    # }
+    tiled_size: sympy.Expr = sympy.S.Zero
+    steps: sympy.Expr = sympy.S.One
+    parallel: int = 0
+    simd_omp: bool = False
+    simd_vec: bool = False
+    collapsed: bool = False
+    is_reduction: bool = False
+
+    def __post_init__(self):
+        # Regarding the C++/OpenMP backend, `cpu_vec_isa.pick_vec_isa()` to check
+        # vectorization ISA is a time-consuming and one-shot operation. It leads
+        # to taking a longer time to import `codegen.cpp` package because the
+        # `LoopLevel` of the package is decorated by `@dataclasses.dataclass` while
+        # the decorator will invoke `cpu_vec_isa.pick_vec_isa()` to initialize the
+        # `simd_nelements` of the `LoopLevel`. It might introduce additional compilation
+        # overhead to the Triton backend. Therefore, we moved the `simd_nelements` to
+        # `__post_init__`
+        picked_vec_isa: cpu_vec_isa.VecISA = cpu_vec_isa.pick_vec_isa()
+        self.simd_nelements: int = picked_vec_isa.nelements() if picked_vec_isa else 0
+
+    def tile(self, factor):
+        sympy_factor = sympy.Integer(factor)
+        loop = LoopLevel(self.var, self.size)
+        loop.steps = sympy_factor
+        loop.simd_vec = True
+        loop.tiled_size = FloorDiv(loop.size, sympy_factor) * sympy_factor
+        loop.parallel = self.parallel
+        loop.collapsed = False
+        loop.is_reduction = self.is_reduction
+        return loop
+
+    def lines(self):
+        offset_expr = cexpr_index(self.offset)
+        size_expr = cexpr_index(self.size)
+        if config.cpp.no_redundant_loops and offset_expr == size_expr:
+            return None
+        simd = (
+            f"simd simdlen({self.simd_nelements}) "
+            if self.simd_omp and self.simd_nelements > 1
+            else ""
+        )
+        if self.parallel:
+            # TODO(jansel): look into chunk size and other schedules
+            line1 = "#pragma omp for"
+            if self.parallel > 1:
+                line1 += f" collapse({self.parallel})"
+            if self.simd_omp:
+                line1 = line1.replace(" for ", f" for {simd}")
+        elif self.simd_vec:
+            line1 = ""
+        elif self.simd_omp:
+            line1 = f"#pragma omp {simd}"
+        elif not self.is_reduction and cpp_builder.is_gcc():
+            line1 = "#pragma GCC ivdep"
+        else:
+            line1 = ""
+        offset_str = f"{INDEX_TYPE} {self.var}={offset_expr}"
+        size_str = f"{self.var}<{size_expr}"
+        if self.steps.is_number:
+            steps_str = f"{self.var}+={cexpr_index(self.steps)}"
+        else:
+            # If the step size is 0, change it to 1 because a step size of 0
+            # will cause floating point exception (core dump) during parallelization.
+            steps_str = (
+                f"{self.var}+=({cexpr_index(self.steps)} == 0 ? "
+                f"1 : {cexpr_index(self.steps)})"
+            )
+        line2 = f"for({offset_str}; {size_str}; {steps_str})"
+        if self.collapsed or not line1:
+            return [line2]
+        return [line1, line2]
+
+
+@dataclasses.dataclass
+class LoopNest:
+    """
+    A loop-nest-like structure. It is built with the `build` method
+    as a loop nest and then will perform loop-tiling at some depth.
+
+    A typical case is for vectorization, where we typically do loop-tiling
+    at the innermost loop level. A more complicated case is when we do
+    2D tiling at both the innermost and outer levels.
+    """
+
+    loops: list[LoopLevel] | None = None
+    kernel: CppKernel | None = None
+
+    @staticmethod
+    def build(kernel: CppKernel):
+        """Build a LoopNest with the given `kernel` as the leaf"""
+        itervars = kernel.itervars
+        ranges = kernel.ranges
+        reduction_depth = kernel.reduction_depth
+        if reduction_depth is None:
+            raise AssertionError("expected reduction_depth is not None")
+
+        loops: list[LoopLevel] | None = None
+        for loop_idx, (var, size) in enumerate(zip(itervars, ranges)):
+            loop = LoopLevel(var, size)
+            if not loops:
+                loops = [loop]
+            else:
+                loops.append(loop)
+            if loop_idx >= reduction_depth:
+                loop.is_reduction = kernel.is_reduction
+
+        loop_nest = LoopNest(loops)
+        return loop_nest
+
+    def __bool__(self):
+        return bool(self.loops)
+
+    @cache_on_self
+    def max_parallel_depth(self):
+        """
+        Maximal allowed depth for parallelism: All reduction or non-reduction levels.
+        When the range of the first inner loop beyond the maximum parallel depth is much
+        larger than the range of all outer loops within the maximum parallel depth,
+        change the starting depth of parallelism to the first inner loop and recalculate
+        the maximum parallel depth.
+        """
+        if self.loops is None:
+            return ParallelDepth(parallel_depth=0, start_depth=0)
+
+        start_depth = 0
+        max_depth = 0
+        is_reduction = self.loops[0].is_reduction
+        num_steps = sympy.Integer(1)
+        for loop in self.loops:
+            if loop.is_reduction != is_reduction:
+                break
+            # Trip count of `for (var = 0; var < size; var += steps)`. The bound
+            # is `size` and the increment is `steps`, so a loop with size < steps
+            # (a vectorized loop narrower than the vector width) still runs one
+            # iteration. Use CeilDiv, not FloorDiv, which would count 0 and zero
+            # out the whole product.
+            num_steps = num_steps * CeilDiv(loop.size, loop.steps)
+            max_depth += 1
+
+        def get_simd_vec_depth(loops):
+            # Return the first loop level which is simd_vec
+            for i, loop in enumerate(loops):
+                if loop.simd_vec:
+                    return i
+            return None
+
+        simd_vec_depth = get_simd_vec_depth(self.loops)
+
+        def has_scalar_kernel(loop_nest: LoopNest):
+            if not isinstance(loop_nest.kernel, CppKernelProxy):
+                raise AssertionError(
+                    "expected isinstance(loop_nest.kernel, CppKernelProxy)"
+                )
+            return any(
+                not isinstance(kernel, CppVecKernel)
+                for kernel in loop_nest.kernel.kernels
+            )
+
+        # When the number of steps of the first inner loop is much larger than the number of steps of
+        # all outer loops, change `start_depth` to the first inner loop and recalculate `max_depth`.
+        if (
+            max_depth < len(self.loops)
+            and isinstance(num_steps, sympy.Integer)
+            and isinstance(self.loops[max_depth].size, sympy.Integer)
+            and num_steps * 300
+            < FloorDiv(self.loops[max_depth].size, self.loops[max_depth].steps)
+            and not (
+                # Disable parallel reduction under the vec loop
+                simd_vec_depth is not None
+                and max_depth > simd_vec_depth
+                and self.loops[max_depth].is_reduction
+                and has_scalar_kernel(self)
+            )
+        ):
+            start_depth = max_depth
+            max_depth = 0
+            is_reduction = self.loops[start_depth].is_reduction
+            for i in range(start_depth, len(self.loops)):
+                if self.loops[i].is_reduction != is_reduction:
+                    break
+                max_depth += 1
+        return ParallelDepth(parallel_depth=max_depth, start_depth=start_depth)
+
+    def mark_parallel(self, par_depth):
+        if par_depth.parallel_depth > self.max_parallel_depth().parallel_depth:
+            raise AssertionError(
+                "Parallel depth cannot exceed the maximal allowed parallel depth"
+            )
+        if self.loops is None:
+            raise AssertionError("expected self.loops is not None")
+        if len(self.loops) < par_depth.parallel_depth:
+            raise AssertionError("expected len(self.loops) >= par_depth.parallel_depth")
+        loop = self.loops[par_depth.start_depth]
+        loop.parallel = par_depth.parallel_depth
+        if loop.is_reduction:
+            # pyrefly: ignore [bad-assignment]
+            metrics.parallel_reduction_count += 1
+        for i in range(par_depth.start_depth + 1, par_depth.parallel_depth):
+            self.loops[i].collapsed = True
+
+    def tile(self, depth, factor):
+        """
+        Do loop-tiling at the `depth` level with `factor`.
+            for (x0 = 0; x0 < x0_end; x0++)
+            ->
+            for (x0 = 0; x0 < x0_end; x0 += factor)
+        See details in Note [tiled_size].
+        """
+        if not self.loops:
+            raise AssertionError("expected self.loops")
+        self.loops[depth] = self.loops[depth].tile(factor)
+        return self.loops[depth]
+
+    def get_kernel(self) -> CppKernel:
+        if not self.kernel:
+            raise AssertionError("expected self.kernel")
+        return self.kernel
+
+    def set_kernel(self, kernel):
+        self.kernel = kernel
+
+    def from_loop_level(self, level: int):
+        if not self.loops:
+            raise AssertionError("expected self.loops")
+        if len(self.loops) < level:
+            raise AssertionError("expected len(self.loops) >= level")
+        loops = None if level == len(self.loops) else self.loops[level:]
+        return LoopNest(loops, self.kernel)
+
+
+
+# ---------------------------------------------------------------------------
+# The host pointwise program
+#
+# A fused pointwise region is a straight-line expression over its inputs: no
+# loop carries a value from one iteration to the next, so the whole region is
+# one function body run over the elements.  What is printed below is that body
+# in three phases over the same range -- whole vectors while a whole vector
+# fits, one more vector for what that leaves, and scalars for the final
+# partial vector -- which is the shape a vectorized loop has to have to be
+# worth reading.
+#
+# The program is a list of ``(op, lhs, rhs, out)`` steps.  A reference is a
+# slot number: a non-negative one is an input or an earlier step's result,
+# numbered in the order the values are produced, and a negative one is a
+# literal counted back from the end, so no literal is confused with a slot.
 
 
 class _ProgramError(Exception):
-    """Raised when an instruction list cannot be rendered."""
+    """A program this emitter cannot print.
 
-
-def _const_text(value: float) -> str:
-    text = f"{value:.17g}"
-    if not any(ch in text for ch in ".eE"):
-        text += ".0"
-    return f"V({text}f)"
-
-
-_I_i = _IxS("i")
-_I_W = _IxS("W")
-
-
-def _lane_offset(lane: int) -> str:
-    """Address of one unroll lane, derived and verified in the index algebra.
-
-    Lane ``k`` reads element ``i + k*W``; the algebra confirms the address is
-    unit-stride in the induction variable (any ``W``-bearing terms are
-    loop-invariant constants at kernel time), which is the precondition for
-    the contiguous ``V::loadu`` path.
+    Raised for the shape of a program rather than for a build that failed: a
+    form outside what is printed here is a form the caller routes elsewhere.
     """
 
-    expr = _I_i if lane == 0 else _I_i + _IxC(lane) * _I_W
-    coeff = _ix_affine(expr, _I_i)
-    if coeff != 1:
-        raise _ProgramError(f"non-unit-stride lane addressing (stride {coeff})")
-    return _ix_render(expr)
+
+#: Vectors handled per iteration of the main loop.  Running four of them per
+#: iteration gives the scheduler four independent chains to overlap, which is
+#: what the unrolled form buys.
+_UNROLL = 4
+
+#: A program at least this long is printed without the unrolled main loop: the
+#: unrolled body holds every intermediate of every step live at once, so past
+#: this length the registers it costs exceed what the overlap returns.
+_UNROLL_MAX_STEPS = 12
+
+#: Elements one thread takes.  Long enough to make the hand-off worth its
+#: bookkeeping, short enough that the end of a range is not left to one thread
+#: while the rest have finished.
+_CHUNK = 512
+
+#: One-operand operations, written once for a vector register and once for a
+#: scalar.  A form in neither table is not printed.
+_NATIVE_UNARY = {
+    "neg": ("-({0})", "-({0})"),
+    "abs": ("tensorplay::vec::abs({0})", "std::fabs({0})"),
+    "relu": (
+        "tensorplay::vec::maximum({0}, V(0.0f))",
+        "(({0}) > 0.0f ? ({0}) : 0.0f)",
+    ),
+    "exp": ("({0}).exp()", "std::exp({0})"),
+    "log": ("({0}).log()", "std::log({0})"),
+    "sqrt": ("({0}).sqrt()", "std::sqrt({0})"),
+    "tanh": ("({0}).tanh()", "std::tanh({0})"),
+    "erf": ("({0}).erf()", "std::erf({0})"),
+    "floor": ("({0}).floor()", "std::floor({0})"),
+    "ceil": ("({0}).ceil()", "std::ceil({0})"),
+    "round": ("({0}).round()", "std::nearbyint({0})"),
+    "sigmoid": (
+        "V(1.0f) / (V(1.0f) + (-({0})).exp())",
+        "(1.0f / (1.0f + std::exp(-({0}))))",
+    ),
+    "sin": ("({0}).sin()", "std::sin({0})"),
+    "cos": ("({0}).cos()", "std::cos({0})"),
+    "asin": ("({0}).asin()", "std::asin({0})"),
+    "acos": ("({0}).acos()", "std::acos({0})"),
+    "atan": ("({0}).atan()", "std::atan({0})"),
+    "sinh": ("({0}).sinh()", "std::sinh({0})"),
+    "cosh": ("({0}).cosh()", "std::cosh({0})"),
+    "asinh": ("({0}).asinh()", "std::asinh({0})"),
+    "acosh": ("({0}).acosh()", "std::acosh({0})"),
+    "atanh": ("({0}).atanh()", "std::atanh({0})"),
+    "exp2": ("({0}).exp2()", "std::exp2({0})"),
+    "expm1": ("({0}).expm1()", "std::expm1({0})"),
+    "log10": ("({0}).log10()", "std::log10({0})"),
+    "log2": ("({0}).log2()", "std::log2({0})"),
+    "log1p": ("({0}).log1p()", "std::log1p({0})"),
+    "reciprocal": ("V(1.0f) / ({0})", "(1.0f / ({0}))"),
+    "square": ("({0}) * ({0})", "(({0}) * ({0}))"),
+    "rsqrt": ("V(1.0f) / ({0}).sqrt()", "(1.0f / std::sqrt({0}))"),
+    "sign": ("({0}) / ({0}).abs()", "std::copysign(1.0f, {0})"),
+    "trunc": ("({0}).trunc()", "std::trunc({0})"),
+    "isnan": ("({0}) != ({0})", "(std::isnan({0}) ? 1.0f : 0.0f)"),
+}
+
+#: Two-operand operations.  A clamp's two bounds are the maximum and the
+#: minimum they are, so they are spelled as those.
+_NATIVE_BINARY = {
+    "add": ("({0}) + ({1})", "({0}) + ({1})"),
+    "sub": ("({0}) - ({1})", "({0}) - ({1})"),
+    "mul": ("({0}) * ({1})", "({0}) * ({1})"),
+    "div": ("({0}) / ({1})", "({0}) / ({1})"),
+    "maximum": (
+        "tensorplay::vec::maximum({0}, {1})",
+        "(({0}) > ({1}) ? ({0}) : ({1}))",
+    ),
+    "minimum": (
+        "tensorplay::vec::minimum({0}, {1})",
+        "(({0}) < ({1}) ? ({0}) : ({1}))",
+    ),
+    "clamp_min": (
+        "tensorplay::vec::maximum({0}, {1})",
+        "(({0}) < ({1}) ? ({0}) : ({1}))",
+    ),
+    "clamp_max": (
+        "tensorplay::vec::minimum({0}, {1})",
+        "(({0}) > ({1}) ? ({0}) : ({1}))",
+    ),
+    "gt": ("{0}.gt({1})", "(({0}) > ({1}) ? 1.0f : 0.0f)"),
+    "lt": ("{0}.lt({1})", "(({0}) < ({1}) ? 1.0f : 0.0f)"),
+    "ge": ("{0}.ge({1})", "(({0}) >= ({1}) ? 1.0f : 0.0f)"),
+    "le": ("{0}.le({1})", "(({0}) <= ({1}) ? 1.0f : 0.0f)"),
+    "eq": ("{0}.eq({1})", "(({0}) == ({1}) ? 1.0f : 0.0f)"),
+    "ne": ("{0}.ne({1})", "(({0}) != ({1}) ? 1.0f : 0.0f)"),
+    "pow": ("({0}).pow({1})", "std::pow({0}, {1})"),
+    "fmax": (
+        "tensorplay::vec::maximum({0}, {1})",
+        "(({0}) > ({1}) ? ({0}) : ({1}))",
+    ),
+    "fmin": (
+        "tensorplay::vec::minimum({0}, {1})",
+        "(({0}) < ({1}) ? ({0}) : ({1}))",
+    ),
+    "atan2": ("({0}).atan2({1})", "std::atan2({0}, {1})"),
+    "hypot": ("({0}).hypot({1})", "std::hypot({0}, {1})"),
+    "fmod": ("({0}).fmod({1})", "std::fmod({0}, {1})"),
+    "remainder": ("({0}).remainder({1})", "std::remainder({0}, {1})"),
+    "copysign": ("({0}).copysign({1})", "std::copysign({0}, {1})"),
+    "nextafter": ("({0}).nextafter({1})", "std::nextafter({0}, {1})"),
+    "maximum_with_nan": (
+        "tensorplay::vec::maximum({0}, {1})",
+        "(({0}) > ({1}) ? ({0}) : ({1}))",
+    ),
+}
 
 
-# Per-input addressing modes, one per program input.
-#
-# flat       -- address is the flat output index; contiguous ``loadu`` per lane.
-# splat      -- the input has one element (any broadcast scalar); a single
-#               ``V(in[0])`` splat is hoisted out of every loop.
-# colmod     -- the input's only non-unit dim is the output's last dim of width
-#               ``S`` (a row broadcast, e.g. a bias vector): address ``i % S``.
-#               Every vector stays inside one row because ``W`` (the lane count)
-#               divides ``S`` and the induction variable is peeled to a ``W``
-#               boundary first, so each ``loadu`` is still contiguous.
-# rowstrided -- address ``a*r + c``: row-contiguous, arbitrary row stride.
-# rowscalar  -- address ``a*r``: one element per row, hoisted per row.
-# transposed -- address ``r + c*a``: contiguous along the outer axis; the tile
-#               plan stages a column-major tile into a transposed buffer so the
-#               vector loop along the column reads the buffer instead of a
-#               strided walk.
-# rowval     -- `rowscalar` reborn inside the emitted loop: the hoisted ``s``.
-# rowptr     -- `rowstrided` reborn inside the emitted loop: the per-row
-#               base pointer ``p``.
-# tbuf       -- `transposed` reborn inside the emitted loop: the per-row
-#               base pointer ``q`` into the transposed tile buffer.
-InputMode = tuple[str, int]
+class _NativeProgram:
+    """A validated step list, resolved into the names the printer writes in."""
 
+    def __init__(self, steps, constants, n_inputs, output_ref):
+        self.steps = list(steps)
+        self.constants = [float(value) for value in constants]
+        self.n_inputs = int(n_inputs)
+        self.output_ref = int(output_ref)
+        # A select is one blend of its two sides, so the halves are matched
+        # here and the printer is handed a single three-operand step.
+        self.selects: dict[int, tuple[int, int, int]] = {}
+        self._validate()
 
-def analyze_input_modes(
-    input_shapes: tuple[tuple[int, ...], ...],
-    input_strides: tuple[tuple[int, ...], ...],
-    out_shape: tuple[int, ...],
-    lane_count: int,
-) -> tuple[InputMode, ...] | None:
-    """Classify how each input is addressed from the flat output index.
+    def value_slots(self) -> int:
+        return self.n_inputs + len(self.steps)
 
-    Returns one mode per input, or ``None`` when any input uses an addressing
-    pattern the emitter cannot prove contiguous within a vector (strided
-    walks, column broadcasts, nested rearrangements): those keep the generic
-    fallback instead of risking wrong addresses.
-    """
+    def is_input(self, ref: int) -> bool:
+        return 0 <= ref < self.n_inputs
 
-    if len(input_shapes) != len(input_strides) or not input_shapes:
-        return None
-    rank = len(out_shape)
-    modes: list[InputMode] = []
-    for shape, strides in zip(input_shapes, input_strides):
-        if len(shape) != len(strides) or len(shape) > rank:
-            return None
-        # Left-align broadcast dims: leading dims the input lacks are size-1.
-        pad = rank - len(shape)
-        aligned_shape = (1,) * pad + tuple(int(d) for d in shape)
-        aligned_strides = (0,) * pad + tuple(int(s) for s in strides)
-        # Dims that contribute nothing to the address: size-1 (broadcast) or
-        # stride-0 (``expand`` of any extent -- every element along the dim
-        # aliases the same address).
-        live = [
-            (d, aligned_strides[d])
-            for d in range(rank)
-            if aligned_shape[d] != 1 and aligned_strides[d] != 0
-        ]
-        if not live:
-            modes.append(("splat", 0))
-            continue
-        if len(live) == 1:
-            dim, stride = live[0]
-            if (
-                dim == rank - 1
-                and stride == 1
-                and aligned_shape[dim] == out_shape[dim]
-                and rank >= 2
-                and out_shape[dim] > 0
-                and out_shape[dim] % lane_count == 0
-            ):
-                modes.append(("colmod", int(out_shape[dim])))
-                continue
-            if (
-                rank == 1
-                and dim == 0
-                and aligned_shape[0] == out_shape[0]
-            ):
-                # Rank-1 output: a matching trailing dim is the flat index
-                # itself; the vector path needs unit stride.
-                if stride == 1:
-                    modes.append(("flat", 0))
-                    continue
-                return None
-            return None
-        if len(live) == rank:
-            # Full-rank input: only the unit-stride flat layout is provably
-            # row-contiguous; any stride permutation is rejected.
-            expected = 1
-            flat_contiguous = True
-            for d in range(rank - 1, -1, -1):
-                if aligned_strides[d] != expected:
-                    flat_contiguous = False
-                    break
-                expected *= aligned_shape[d]
-            if flat_contiguous:
-                modes.append(("flat", 0))
-                continue
-        return None
-    return tuple(modes)
+    def is_literal(self, ref: int) -> bool:
+        return ref < 0 and -ref - 1 < len(self.constants)
 
+    def check_ref(self, ref, what: str) -> None:
+        if self.is_input(ref) or 0 <= ref < self.value_slots() or self.is_literal(ref):
+            return
+        raise _ProgramError(f"{what} names a reference that does not exist: {ref}")
 
-def _row_tiling_enabled() -> bool:
-    """Whether row-structured kernels may rescue declined flat layouts."""
-
-    try:
-        from ....config import cpu_row_tiling
-    except ImportError:  # pragma: no cover - package layout is fixed
-        return True
-    return bool(cpu_row_tiling)
-
-
-def analyze_input_rows(
-    input_shapes: tuple[tuple[int, ...], ...],
-    input_strides: tuple[tuple[int, ...], ...],
-    out_shape: tuple[int, ...],
-) -> tuple[InputMode, ...] | None:
-    """Classify each input as an affine address over (row, column).
-
-    The row view flattens every output dimension but the last into the row
-    index ``r`` and keeps the last dimension as the column ``c``, which is
-    how the freshly allocated contiguous output is addressed.  An input is
-    row-addressable when its element address is exactly ``a*r + c`` (any row
-    stride, contiguous inside the row) or ``a*r`` (one element per row,
-    hoisted as a per-row broadcast) -- the two shapes a row loop can serve
-    with plain induction variables.  Transpositions, inner strides other
-    than one, and broadcasts that repeat an inner block across a varying
-    outer axis are not functions of the flat row index and keep the generic
-    fallback.
-
-    Returns one mode per input, or ``None`` when any input is outside that
-    surface.
-    """
-
-    if len(input_shapes) != len(input_strides) or not input_shapes:
-        return None
-    rank = len(out_shape)
-    if rank < 2:
-        return None
-    # Radix weight of each outer dimension over the dimensions that actually
-    # vary: the flat row index is sum(m_d * weight_d) with size-1 dimensions
-    # contributing nothing.
-    weights = [1] * rank
-    radix = 1
-    for d in range(rank - 2, -1, -1):
-        weights[d] = radix
-        if int(out_shape[d]) != 1:
-            radix *= int(out_shape[d])
-    varying = [d for d in range(rank - 1) if int(out_shape[d]) != 1]
-
-    modes: list[InputMode] = []
-    for shape, strides in zip(input_shapes, input_strides):
-        if len(shape) != len(strides) or len(shape) > rank:
-            return None
-        pad = rank - len(shape)
-        aligned_shape = (1,) * pad + tuple(int(d) for d in shape)
-        aligned_strides = (0,) * pad + tuple(int(s) for s in strides)
-        # Dims that contribute nothing to the address: size-1 (broadcast) or
-        # stride-0 (``expand`` of any extent).
-        live = {
-            d
-            for d in range(rank)
-            if aligned_shape[d] != 1 and aligned_strides[d] != 0
-        }
-        if not live:
-            modes.append(("splat", 0))
-            continue
-        if any(aligned_shape[d] != int(out_shape[d]) for d in live):
-            # A live dim must cover the full output extent; anything else is
-            # not a broadcast this view can serve.
-            return None
-        live_varying = [d for d in varying if d in live]
-        if live_varying:
-            if len(live_varying) != len(varying):
-                # A varying outer axis this input broadcasts along repeats
-                # its inner block across rows: the address stops being a
-                # function of the flat row index.
-                return None
-            row_stride: int | None = None
-            for d in varying:
-                stride = aligned_strides[d]
-                weight = weights[d]
-                if stride < 0 or stride % weight != 0:
-                    return None
-                candidate = stride // weight
-                if row_stride is None:
-                    row_stride = candidate
-                elif row_stride != candidate:
-                    return None
-        else:
-            # No live outer contribution: the address is column-only.
-            row_stride = 0
-        if rank - 1 in live:
-            if aligned_strides[rank - 1] != 1:
-                return None
-            modes.append(("rowstrided", int(row_stride)))
-        else:
-            modes.append(("rowscalar", int(row_stride)))
-    return tuple(modes)
-
-
-def analyze_input_tiles(
-    input_shapes: tuple[tuple[int, ...], ...],
-    input_strides: tuple[tuple[int, ...], ...],
-    out_shape: tuple[int, ...],
-) -> tuple[InputMode, ...] | None:
-    """Classify each input for the tile plan (transposed-tile staging).
-
-    The tile plan serves the layouts the row plan must reject: an input
-    whose element address is ``r + c*a`` is contiguous along the outer axis
-    (the transposed family -- e.g. a column-major view of the output).  Its
-    W-by-W tile is staged through a small transposed buffer once per tile,
-    so the vector loop along the column reads the buffer contiguously while
-    every other input is addressed the same way the row plan addresses it.
-
-    Returns one mode per input -- ``splat``/``rowscalar``/``rowstrided``
-    (as in :func:`analyze_input_rows`) or ``transposed`` -- or ``None``
-    when any input is outside that surface.
-    """
-
-    if len(input_shapes) != len(input_strides) or not input_shapes:
-        return None
-    rank = len(out_shape)
-    if rank < 2:
-        return None
-    weights = [1] * rank
-    radix = 1
-    for d in range(rank - 2, -1, -1):
-        weights[d] = radix
-        if int(out_shape[d]) != 1:
-            radix *= int(out_shape[d])
-    varying = [d for d in range(rank - 1) if int(out_shape[d]) != 1]
-
-    modes: list[InputMode] = []
-    for shape, strides in zip(input_shapes, input_strides):
-        if len(shape) != len(strides) or len(shape) > rank:
-            return None
-        pad = rank - len(shape)
-        aligned_shape = (1,) * pad + tuple(int(d) for d in shape)
-        aligned_strides = (0,) * pad + tuple(int(s) for s in strides)
-        live = {
-            d
-            for d in range(rank)
-            if aligned_shape[d] != 1 and aligned_strides[d] != 0
-        }
-        if not live:
-            modes.append(("splat", 0))
-            continue
-        if any(aligned_shape[d] != int(out_shape[d]) for d in live):
-            return None
-        live_varying = [d for d in varying if d in live]
-        row_stride: int | None = None
-        if live_varying:
-            if len(live_varying) != len(varying):
-                return None
-            for d in varying:
-                stride = aligned_strides[d]
-                weight = weights[d]
-                if stride < 0 or stride % weight != 0:
-                    return None
-                candidate = stride // weight
-                if row_stride is None:
-                    row_stride = candidate
-                elif row_stride != candidate:
-                    return None
-        else:
-            row_stride = 0
-        if rank - 1 not in live:
-            modes.append(("rowscalar", int(row_stride)))
-            continue
-        inner_stride = int(aligned_strides[rank - 1])
-        if inner_stride <= 0:
-            return None
-        if inner_stride == 1:
-            modes.append(("rowstrided", int(row_stride)))
-            continue
-        # Transposed family: the outer axis is the contiguous one.  It is
-        # only a tile-transposable layout when every varying outer dim
-        # contributes unit-per-row-step (``row_stride == 1``); anything
-        # else mixes two non-unit strides and the buffer cannot serve it.
-        if row_stride != 1:
-            return None
-        modes.append(("transposed", inner_stride))
-    return tuple(modes)
-
-
-def _classify_pinned_layouts(
-    input_shapes: tuple[tuple[int, ...], ...],
-    input_strides: tuple[tuple[int, ...], ...],
-    out_shape: tuple[int, ...],
-    lane_count: int,
-) -> tuple[tuple[InputMode, ...] | None, tuple[InputMode, ...] | None, tuple[InputMode, ...] | None]:
-    """Pick the addressing plan for a pinned specialization.
-
-    Returns ``(flat_modes, row_modes, tile_modes)``; with the plans ordered
-    by preference, at most the chosen one (and nothing after it) is
-    non-``None``.  Flat addressing wins whenever it can express every
-    input -- including row broadcasts through the aligned modulo path,
-    whose generated kernels stay byte-for-byte what they were.  The
-    row-structured plan only rescues layouts the flat emitter must reject
-    (column broadcasts, per-row scalars, strided rows, unaligned
-    row-broadcast widths); the tile plan rescues the transposed family the
-    row plan must reject (outer-axis-contiguous inputs), which no other
-    emitter can address without a pathological strided walk.
-    """
-
-    try:
-        flat_modes = analyze_input_modes(
-            input_shapes, input_strides, out_shape, lane_count
-        )
-    except (TypeError, ValueError):
-        flat_modes = None
-    if flat_modes is not None:
-        return flat_modes, None, None
-    if not _row_tiling_enabled():
-        return None, None, None
-    try:
-        row_modes = analyze_input_rows(input_shapes, input_strides, out_shape)
-    except (TypeError, ValueError):
-        row_modes = None
-    if row_modes is not None:
-        return None, row_modes, None
-    try:
-        tile_modes = analyze_input_tiles(input_shapes, input_strides, out_shape)
-    except (TypeError, ValueError):
-        tile_modes = None
-    return None, None, tile_modes
-
-
-def layouts_addressable(
-    input_shapes: tuple[tuple[int, ...], ...],
-    input_strides: tuple[tuple[int, ...], ...],
-    out_shape: tuple[int, ...],
-    lane_count: int,
-) -> bool:
-    """Whether the CPU generators can address these exact input layouts."""
-
-    flat_modes, row_modes, tile_modes = _classify_pinned_layouts(
-        input_shapes, input_strides, out_shape, lane_count
-    )
-    return flat_modes is not None or row_modes is not None or tile_modes is not None
-
-
-def _check_ref(
-    ref: int, constants: list[float], input_count: int, temp_count: int
-) -> None:
-    if ref >= 0:
-        if ref >= input_count + temp_count:
-            raise _ProgramError("reference beyond program surface")
-        return
-    index = -ref - 1
-    if index < 0 or index >= len(constants):
-        raise _ProgramError("constant reference out of range")
-    if not math.isfinite(constants[index]):
-        # An infinity or NaN has no literal the emitter can spell, so the
-        # program stays uncompiled instead of producing a unit that would
-        # only fail to build.
-        raise _ProgramError("non-finite program constant")
-
-
-def _analyze_instructions(
-    instructions: list[tuple[str, int, int, int]],
-    constants: list[float],
-    input_count: int,
-    output_ref: int | None = None,
-    *,
-    allow_empty: bool = False,
-) -> set[int]:
-    """Validate the instruction list and return the referenced input set.
-
-    Ref layout matches the program encoding: ``0..input_count-1`` are
-    inputs, ``input_count + i`` is the result of instruction ``i``, and
-    negative refs index ``constants``.  ``where``/``where_rest`` must
-    appear as an adjacent pair sharing the condition ref.
-    """
-
-    if input_count <= 0 or input_count > _MAX_INPUTS:
-        raise _ProgramError("degenerate program")
-    if not instructions and not allow_empty:
-        # A pointwise kernel with no instruction would only copy an input;
-        # reduction kernels legitimately reduce a raw input, so they opt in.
-        raise _ProgramError("degenerate program")
-    temp_count = len(instructions)
-    used: set[int] = set()
-    skip_where_rest = False
-    for i, (op, lhs, rhs, result) in enumerate(instructions):
-        if skip_where_rest:
-            if op != "where_rest" or result != input_count + i:
-                raise _ProgramError("where/where_rest pairing broken")
-            _check_ref(rhs, constants, input_count, temp_count)
-            if 0 <= rhs < input_count:
-                used.add(rhs)
-            skip_where_rest = False
-            continue
-        if result != input_count + i:
-            raise _ProgramError("instruction result refs must be sequential")
-        if op == "where":
-            if i + 1 >= temp_count:
-                raise _ProgramError("where without where_rest")
-            nxt = instructions[i + 1]
-            if nxt[0] != "where_rest" or nxt[1] != lhs:
-                raise _ProgramError("where/where_rest pairing broken")
-            _check_ref(lhs, constants, input_count, temp_count)
-            _check_ref(rhs, constants, input_count, temp_count)
-            used.update(ref for ref in (lhs, rhs) if 0 <= ref < input_count)
-            skip_where_rest = True
-            continue
-        if op == "where_rest":
-            raise _ProgramError("where_rest without where")
-        if op in _BINARY_OPS:
-            _check_ref(lhs, constants, input_count, temp_count)
-            _check_ref(rhs, constants, input_count, temp_count)
-            used.update(ref for ref in (lhs, rhs) if 0 <= ref < input_count)
-        elif op in _UNARY_OPS:
-            _check_ref(lhs, constants, input_count, temp_count)
-            if rhs != -1:
-                raise _ProgramError("unary op with rhs operand")
-            if 0 <= lhs < input_count:
-                used.add(lhs)
-        elif op == "cast":
-            _check_ref(lhs, constants, input_count, temp_count)
-            if rhs != _F32_CAST_ID:
-                raise _ProgramError("unsupported cast target")
-            if 0 <= lhs < input_count:
-                used.add(lhs)
-        else:
-            raise _ProgramError(f"unsupported op: {op}")
-    if output_ref is not None and 0 <= output_ref < input_count:
-        used.add(output_ref)
-    return used
-
-
-def _operand_expr(
-    ref: int,
-    constants: list[float],
-    input_count: int,
-    names: Callable[[int], str],
-) -> str:
-    if ref >= 0:
-        return names(ref)
-    index = -ref - 1
-    return _const_text(constants[index])
-
-
-def _expr_for(
-    op: str,
-    lhs: int,
-    rhs: int,
-    constants: list[float],
-    input_count: int,
-    names: Callable[[int], str],
-) -> str:
-    if op in _BINARY_OPS:
-        template = (
-            _BINARY_EXPR.get(op)
-            or _COMPARE_EXPR.get(op)
-            or _ORDER_EXPR.get(op)
-        )
-        return template.format(
-            a=_operand_expr(lhs, constants, input_count, names),
-            b=_operand_expr(rhs, constants, input_count, names),
-        )
-    if op in _UNARY_OPS:
-        return _UNARY_EXPR[op].format(
-            a=_operand_expr(lhs, constants, input_count, names)
-        )
-    if op == "cast":
-        return _operand_expr(lhs, constants, input_count, names)
-    raise _ProgramError(f"unsupported op: {op}")  # pragma: no cover
-
-
-def _emit_body(
-    instructions: list[tuple[str, int, int, int]],
-    constants: list[float],
-    input_count: int,
-    output_ref: int,
-    used_inputs: set[int],
-    indent: str,
-    *,
-    unrolled: bool,
-    partial: bool,
-    input_modes: tuple[InputMode, ...] | None = None,
-) -> str:
-    """Emit one loop body for a given variable-naming scheme.
-
-    ``unrolled`` suffixes every variable with the unroll lane index and
-    loads/stores four vectors; ``partial`` switches loads/stores to the
-    partial-width ``count`` overloads (scalar tail).  ``input_modes`` maps
-    each input to its addressing mode: ``flat`` keeps the flat index, and
-    ``colmod`` addresses through ``i % S`` (the peel in the rendered kernel
-    guarantees the lane never straddles a row).  ``splat`` inputs are hoisted
-    before all loops and referenced without a lane suffix.
-    """
-
-    if input_modes is None:
-        input_modes = (("flat", 0),) * input_count
-
-    def name(ref: int, lane: int = 0) -> str:
-        if ref < input_count:
-            if input_modes[ref][0] == "splat":
-                return f"h{ref}"
-            base = f"x{ref}"
-        else:
-            base = f"t{ref - input_count}"
-        return f"{base}{lane}" if unrolled else base
-
-    count_expr = "count" if partial else "W"
-    lines: list[str] = []
-    used_temps = {
-        ref
-        for op, lhs, rhs, _ in instructions
-        for ref in ((lhs,) if (op in _UNARY_OPS or op == "cast") else (lhs, rhs))
-        if ref >= input_count
-    }
-
-    def lane_offset(mode: str, width: int, lane: int) -> str:
-        if mode == "colmod":
-            expr = _I_i if lane == 0 else _I_i + _IxC(lane) * _I_W
-            return _ix_render(_ix_mod(expr, 1, width))
-        return "i" if lane == 0 else _lane_offset(lane)
-
-    def emit_loads(lane: int) -> None:
-        for ref in sorted(used_inputs):
-            if input_modes[ref][0] == "splat":
-                continue
-            var = name(ref, lane)
-            mode, width = input_modes[ref]
-            lines.append(
-                f"{indent}V {var} = V::loadu(in{ref} + {lane_offset(mode, width, lane)}, {count_expr});"
-            )
-
-    def emit_steps(lane: int) -> None:
-        pending_where: tuple[int, str] | None = None
-        for op, lhs, rhs, result in instructions:
-            if op == "where":
-                pending_where = (
-                    result,
-                    _operand_expr(
-                        rhs, constants, input_count, lambda r: name(r, lane)
-                    ),
+    def _validate(self) -> None:
+        if self.n_inputs < 0:
+            raise _ProgramError(f"input count cannot be negative: {self.n_inputs}")
+        pending: dict[int, int] = {}
+        for index, step in enumerate(self.steps):
+            if len(step) != 4:
+                raise _ProgramError(f"step {index} is not a four-field step: {step!r}")
+            op, lhs, rhs, out = step
+            # A value is addressable only once every step before it has run,
+            # so results are numbered from the first slot after the inputs in
+            # the order the steps produce them.
+            expected = self.n_inputs + index
+            if out != expected:
+                raise _ProgramError(
+                    f"step {index} writes {out}, where the numbering puts it at {expected}"
                 )
+            if op == "where":
+                self.check_ref(lhs, f"step {index}")
+                self.check_ref(rhs, f"step {index}")
+                pending[lhs] = rhs
                 continue
             if op == "where_rest":
-                assert pending_where is not None
-                where_result, a_expr = pending_where
-                cond_expr = _operand_expr(
-                    lhs, constants, input_count, lambda r: name(r, lane)
-                )
-                b_expr = _operand_expr(
-                    rhs, constants, input_count, lambda r: name(r, lane)
-                )
-                lines.append(f"{indent}V {name(where_result, lane)} = {a_expr};")
-                lines.append(
-                    f"{indent}V {name(result, lane)} = V::blendv("
-                    f"{b_expr}, {a_expr}, ({cond_expr} > V(0.0f)));"
-                )
-                pending_where = None
+                self.check_ref(lhs, f"step {index}")
+                self.check_ref(rhs, f"step {index}")
+                if lhs not in pending:
+                    raise _ProgramError(
+                        f"step {index} takes the other side of a condition no step set"
+                    )
+                self.selects[out] = (lhs, pending.pop(lhs), rhs)
                 continue
-            expr = _expr_for(
-                op, lhs, rhs, constants, input_count, lambda r: name(r, lane)
-            )
-            lines.append(f"{indent}V {name(result, lane)} = {expr};")
-        if pending_where is not None:  # pragma: no cover - guarded by analysis
-            raise _ProgramError("where without where_rest")
-
-    def emit_store(lane: int) -> None:
-        var = name(output_ref, lane)
-        lines.append(f"{indent}{var}.store(out + {lane_offset('flat', 0, lane)}, {count_expr});")
-
-    if unrolled:
-        for lane in range(4):
-            emit_loads(lane)
-        for lane in range(4):
-            emit_steps(lane)
-        for lane in range(4):
-            emit_store(lane)
-    else:
-        emit_loads(0)
-        emit_steps(0)
-        emit_store(0)
-    return "\n".join(lines)
+            if op in _NATIVE_UNARY:
+                self.check_ref(lhs, f"step {index}")
+                continue
+            if op in _NATIVE_BINARY:
+                self.check_ref(lhs, f"step {index}")
+                self.check_ref(rhs, f"step {index}")
+                continue
+            raise _ProgramError(f"no host form for step {index}: {op!r}")
+        self.check_ref(self.output_ref, "the output")
 
 
-def emit_value_program(
-    instructions: list[tuple[str, int, int, int]],
-    constants: list[float],
-    input_count: int,
-    output_ref: int,
-    used_inputs: set[int],
-    *,
-    indent: str,
-    offset: str,
-    count_expr: str,
-    suffix: str,
-    input_modes: tuple[InputMode, ...],
-    row_offset: str | None = None,
-) -> tuple[list[str], str]:
-    """Emit one vector evaluation of the program and name its result.
+#: What every generated unit starts with: the vector type the phases are
+#: written in, and the two things the phases need that are not part of any
+#: one of them -- the hand-off to the pool, and the arguments' addresses.
+_NATIVE_PROLOGUE = """#include "cpu/vec/vec.h"
 
-    ``offset`` is a C expression for the flat element index addressed by lane
-    0 of this vector; ``count_expr`` is the active lane count (``W`` for a
-    full vector, a runtime ``count`` for a masked tail).  ``suffix``
-    disambiguates the temporaries of independent evaluations that coexist in
-    one scope, which is how the unrolled accumulator groups keep separate
-    dependency chains.  ``splat`` inputs resolve to the hoisted broadcast
-    and ``rowval`` inputs to the enclosing loop's per-row value; neither
-    is reloaded.  ``staged`` inputs read a value an earlier pass over this
-    row already wrote, addressed by ``row_offset`` -- the position inside
-    the row rather than the flat index.  ``rowptr`` inputs read through a
-    per-row base pointer ``p{ref}`` the enclosing row loop maintains, which
-    keeps the offset column-only regardless of the input's row stride.
+#include <cmath>
+#include <cstdint>
+#include <thread>
+#include <vector>
 
-    Returns the emitted lines and the identifier holding the program result,
-    so a caller can feed it straight into an accumulator combine instead of
-    storing it.
+using V = tensorplay::vec::Vectorized<float>;
+
+namespace {
+
+constexpr long W = V::size();
+
+// Hand contiguous runs of a range to the pool.  The runs follow from a static
+// schedule, so a run's bounds follow from where it starts and two threads
+// never compute the same element.
+template <typename Body>
+void tp_parallel_for_c(long begin, long end, long chunk, Body body, void* ctx) {
+  const long total = end - begin;
+  if (total <= 0) {
+    return;
+  }
+  const unsigned reported = std::thread::hardware_concurrency();
+  long workers = reported < 1u ? 1 : static_cast<long>(reported);
+  // Never more threads than there are chunks to hand out.
+  const long by_chunk = (total + chunk - 1) / chunk;
+  if (workers > by_chunk) {
+    workers = by_chunk;
+  }
+  if (workers <= 1) {
+    body(ctx, begin, end);
+    return;
+  }
+  // Round the per-thread run up to a whole number of chunks, so every run but
+  // the last is the same length.
+  const long per = ((total + workers - 1) / workers + chunk - 1) / chunk * chunk;
+  std::vector<std::thread> pool;
+  pool.reserve(static_cast<size_t>(workers - 1));
+  long at = begin;
+  for (long t = 1; t < workers; ++t) {
+    long stop = at + per;
+    if (stop > end) {
+      stop = end;
+    }
+    if (stop <= at) {
+      break;
+    }
+    pool.emplace_back([=]() { body(ctx, at, stop); });
+    at = stop;
+  }
+  body(ctx, at, end);
+  for (auto& thread : pool) {
+    thread.join();
+  }
+}
+
+struct TpCtx {
+  const float* const* ins;
+  float* out;
+};
+
+}  // namespace
+"""
+
+
+def _native_names(program: _NativeProgram, suffix=None):
+    """The name each reference is written under in one phase.
+
+    ``suffix`` is the unroll step the phase runs, or nothing for the phases
+    that hold one value per element.  The same reference is named once per
+    phase because a name is what a step's expression is written in terms of.
     """
+
+    def value(ref):
+        return f"x{ref}" if suffix is None else f"x{ref}_{suffix}"
+
+    names = {ref: value(ref) for ref in range(program.n_inputs)}
+    for index in range(len(program.steps)):
+        names[program.n_inputs + index] = value(program.n_inputs + index)
+    for index in range(len(program.constants)):
+        ref = -index - 1
+        names[ref] = f"c{index}" if suffix is None else f"c{index}_{suffix}"
+    return names
+
+
+def _native_body(program: _NativeProgram, suffix, scalar: bool) -> list[str]:
+    """The statements computing the program, for one phase.
+
+    ``scalar`` picks the form each operation is written in, not which
+    operations run: the phases compute one program, so a difference between
+    them would be a difference in the answer.
+    """
+
+    names = _native_names(program, suffix)
+    column = 1 if scalar else 0
+    decl = "const float" if scalar else "V"
+    lines: list[str] = []
+    for index, value in enumerate(program.constants):
+        literal = names[-index - 1]
+        # A literal is written as the constant it is in the phase's own type:
+        # a scalar holds the number, a register holds the whole vector of it.
+        if scalar:
+            lines.append(f"const float {literal} = {value!r}f;")
+        else:
+            lines.append(f"V {literal} = V({value!r}f);")
+    for index, step in enumerate(program.steps):
+        op, lhs, rhs, _out = step
+        target = names[program.n_inputs + index]
+        selected = program.selects.get(program.n_inputs + index)
+        if selected is not None:
+            cond, when_true, when_false = selected
+            mask, pick_true, pick_false = (
+                names[cond], names[when_true], names[when_false]
+            )
+            if scalar:
+                lines.append(
+                    f"const float {target} = ({mask} != 0.0f) ? {pick_true} : {pick_false};"
+                )
+            else:
+                # A comparison holds one or zero per lane, while a blend reads
+                # its mask a bit at a time.  Comparing that against zero is
+                # what turns the two representations into each other: the
+                # operator is the one each instruction set spells as a mask.
+                lines.append(
+                    f"V {target} = V::blendv({pick_false}, {pick_true}, {mask} > V(0.0f));"
+                )
+            continue
+        if op == "where":
+            # Printed together with the step that takes the other side.
+            continue
+        if op in _NATIVE_UNARY:
+            expression = _NATIVE_UNARY[op][column].format(names[lhs])
+        else:
+            expression = _NATIVE_BINARY[op][column].format(names[lhs], names[rhs])
+        lines.append(f"{decl} {target} = {expression};")
+    return lines
+
+
+def _native_phase(program: _NativeProgram, begin: str, scalar: bool) -> list[str]:
+    """The loads, the body and the store of one phase, over ``begin``."""
 
     lines: list[str] = []
-
-    def name(ref: int) -> str:
-        if ref < input_count:
-            mode, slot = input_modes[ref]
-            if mode == "splat":
-                return f"h{ref}"
-            if mode == "rowval":
-                # A value the enclosing loop already reduced to one number per
-                # row; it enters the expression as a broadcast, never a load.
-                return f"s{slot}"
-            return f"x{ref}{suffix}"
-        return f"t{ref - input_count}{suffix}"
-
-    for ref in sorted(used_inputs):
-        mode, width = input_modes[ref]
-        if mode in ("splat", "rowval"):
-            continue
-        if mode == "staged":
-            address = f"sc{width} + ({row_offset if row_offset else offset})"
-        elif mode == "colmod":
-            address = f"in{ref} + (({offset}) % {width})"
-        elif mode == "rowptr":
-            address = f"p{ref} + ({offset})"
-        elif mode == "tbuf":
-            # ``tbuf`` inputs arrive pre-transposed into a W-by-W buffer; the
-            # per-row base pointer ``q{width}`` (slot = ref) starts at the
-            # tile row, so the offset here is the within-row column.
-            address = f"q{width} + ({offset})"
-        else:
-            address = f"in{ref} + ({offset})"
-        lines.append(f"{indent}V {name(ref)} = V::loadu({address}, {count_expr});")
-
-    pending_where: tuple[int, str] | None = None
-    for op, lhs, rhs, result in instructions:
-        if op == "where":
-            pending_where = (
-                result,
-                _operand_expr(rhs, constants, input_count, name),
-            )
-            continue
-        if op == "where_rest":
-            if pending_where is None:  # pragma: no cover - guarded by analysis
-                raise _ProgramError("where_rest without where")
-            where_result, a_expr = pending_where
-            cond_expr = _operand_expr(lhs, constants, input_count, name)
-            b_expr = _operand_expr(rhs, constants, input_count, name)
-            lines.append(f"{indent}V {name(where_result)} = {a_expr};")
-            lines.append(
-                f"{indent}V {name(result)} = V::blendv("
-                f"{b_expr}, {a_expr}, ({cond_expr} > V(0.0f)));"
-            )
-            pending_where = None
-            continue
-        expr = _expr_for(op, lhs, rhs, constants, input_count, name)
-        lines.append(f"{indent}V {name(result)} = {expr};")
-    if pending_where is not None:  # pragma: no cover - guarded by analysis
-        raise _ProgramError("where without where_rest")
-    return lines, name(output_ref)
+    if scalar:
+        for ref in range(program.n_inputs):
+            lines.append(f"const float x{ref} = in{ref}[{begin}];")
+    else:
+        for ref in range(program.n_inputs):
+            lines.append(f"V x{ref} = V::loadu(in{ref} + {begin}, W);")
+    lines.extend(_native_body(program, None, scalar))
+    if scalar:
+        lines.append(f"out[{begin}] = x{program.output_ref};")
+    else:
+        lines.append(f"x{program.output_ref}.store(out + {begin}, W);")
+    return lines
 
 
-def render_kernel_source(
-    instructions: list[tuple[str, int, int, int]],
-    constants: list[float],
-    input_count: int,
-    output_ref: int,
-    entry: str,
-    *,
-    out_shape: tuple[int, ...] | None = None,
-    out_device: tuple[int, int] | None = None,
-    input_shapes: tuple[tuple[int, ...], ...] | None = None,
-    input_strides: tuple[tuple[int, ...], ...] | None = None,
-    lane_count: int | None = None,
-) -> str:
-    """Render the full translation unit for one fused CPU kernel.
+def _native_unrolled_phase(program: _NativeProgram, offset: str, step_index: int):
+    """One vector of the unrolled main loop, named apart from the others.
 
-    ``out_shape``/``out_device`` (DeviceType ordinal, device index) pin the
-    specialization; when both are given the unit also emits a METH_FASTCALL
-    runner that receives the input tensor list, extracts the data pointers
-    in C, allocates the output in C, calls the kernel, and wraps the result
-    — the steady-state call never re-enters Python.
-
-    ``input_shapes``/``input_strides`` (when given) select per-input
-    addressing modes: broadcast scalars become hoisted splats and row
-    broadcasts become ``i % S`` addresses under an alignment peel.  Layouts
-    the flat emitter cannot prove contiguous switch to the row-structured
-    plan instead: an outer row loop carries per-row base pointers and
-    hoisted per-row scalars while the same vector lanes run along the row,
-    which also covers column broadcasts, strided rows, and row-broadcast
-    widths no vector peel can align.  Layouts even the row plan must reject
-    (outer-axis-contiguous inputs) switch to the tile plan: row tiles of the
-    vector width carry transposed W-by-W buffers staged before the vector
-    loop.  Layouts no plan can address raise, so the caller declines instead
-    of trusting flat addresses against differently shaped buffers.  Passing
-    them without ``out_shape`` has no effect -- the modes are only valid for
-    a pinned specialization.
+    The four vectors a main-loop iteration handles are independent, so each is
+    named for the step it belongs to rather than reusing one name four times.
     """
 
-    used_inputs = _analyze_instructions(
-        instructions, constants, input_count, output_ref
-    )
-    if output_ref < 0 or output_ref >= input_count + len(instructions):
-        raise _ProgramError("output reference out of range")
-
-    const_decls = (
-        "\n".join(
-            f"    const V c{index} = {_const_text(value)};"
-            for index, value in enumerate(constants)
-        )
-        or "    (void)0;"
-    )
-
-    # ``lane_count`` comes from the picked SIMD tier (the same one that will
-    # compile the unit).  Without it the analysis falls back to the widest
-    # tier width, which is conservative in the safe direction: a ``colmod``
-    # width divisible by 16 is divisible by every smaller lane count.
-    tier_width = lane_count if lane_count is not None else 16
-    layouts_given = (
-        out_shape is not None
-        and input_shapes is not None
-        and input_strides is not None
-    )
-    input_modes: tuple[InputMode, ...] | None = None
-    row_modes: tuple[InputMode, ...] | None = None
-    tile_modes: tuple[InputMode, ...] | None = None
-    if layouts_given:
-        pinned_out_shape = tuple(int(d) for d in out_shape)
-        input_modes, row_modes, tile_modes = _classify_pinned_layouts(
-            input_shapes, input_strides, pinned_out_shape, tier_width
-        )
-        if (
-            input_modes is None
-            and row_modes is None
-            and tile_modes is None
-        ):
-            # The pinned route trusts these layouts: an input outside the
-            # generators' addressing surface must decline the kernel here
-            # instead of emitting flat addresses into a differently shaped
-            # buffer.
-            raise _ProgramError("input layouts outside the CPU addressing surface")
-    if input_modes is None and row_modes is None and tile_modes is None:
-        input_modes = (("flat", 0),) * input_count
-    active_modes = (
-        row_modes
-        if row_modes is not None
-        else tile_modes
-        if tile_modes is not None
-        else input_modes
-    )
-    splat_refs = [
-        ref for ref in sorted(used_inputs) if active_modes[ref][0] == "splat"
-    ]
-    splat_decls = "\n".join(
-        f"    const V h{ref} = V(in{ref}[0]);" for ref in splat_refs
-    )
-
-    input_params = ", ".join(
-        f"const float* __restrict__ in{i}" for i in range(input_count)
-    )
-    ctx_fields = "".join(f"    const float* in{i};\n" for i in range(input_count))
-    ctx_init = ", ".join(f"in{i}" for i in range(input_count)) + ", out"
-    ctx_loads = "".join(
-        f"    const float* __restrict__ in{i} = c->in{i};\n"
-        for i in range(input_count)
-    )
-
-    # Worksharing policy follows the parallel-depth decision of the
-    # CPU kernels: a region runs on the shared pool only when each
-    # thread would still receive at least one minimum chunk (otherwise the
-    # body runs inline, serially), and the chunk size is an even static
-    # split of the trip count.  ``min_chunk`` matches the in-tree kernel
-    # grain floor.
-    min_chunk = 512
-    threads = _pool_threads()
-    serial_cutoff = threads * min_chunk
-
-    splat_hoists = ""
-    if splat_refs:
-        splat_hoists = f"{splat_decls}\n"
-
-    # Tile-plan defaults: the transpose helper, the W-by-W buffers and the
-    # constexpr ``W`` only appear when the tile plan is actually used; the
-    # other plans keep their byte-identical templates.
-    tile_helper = ""
-    buffer_decls = ""
-    w_decl = "const long W = V::size();"
-    body_fn = "tp_body"
-
-    if row_modes is not None:
-        # Row-structured plan: the parallel range counts rows, each row's
-        # base pointers and per-row scalars are set up once, and the vector
-        # lanes (plus the same four-way unroll and masked tail) run along
-        # the row.  Broadcast widths need no modulo here -- the column
-        # index is the broadcast index directly.
-        body_range_params = "long long rb, long long re"
-        element_count = 1
-        for d in out_shape:
-            element_count *= int(d)
-        cols = int(out_shape[-1])
-        row_count = element_count // cols if cols else 0
-        emit_modes = tuple(
-            ("splat", 0)
-            if mode == "splat"
-            else ("rowval", ref)
-            if mode == "rowscalar"
-            else ("rowptr", 0)
-            for ref, (mode, _param) in enumerate(row_modes)
-        )
-
-        def row_section(offset: str, count_expr: str, suffix: str) -> str:
-            section_lines, result = emit_value_program(
-                instructions,
-                constants,
-                input_count,
-                output_ref,
-                used_inputs,
-                indent="            ",
-                offset=offset,
-                count_expr=count_expr,
-                suffix=suffix,
-                input_modes=emit_modes,
-            )
-            section_lines.append(
-                f"            {result}.store(orow + ({offset}), {count_expr});"
-            )
-            return "\n".join(section_lines)
-
-        preamble_lines: list[str] = []
-        for ref in sorted(used_inputs):
-            mode, param = row_modes[ref]
-            if mode == "rowstrided":
-                preamble_lines.append(
-                    f"        const float* __restrict__ p{ref} = in{ref} + r * {param}LL;"
-                )
-            elif mode == "rowscalar":
-                preamble_lines.append(
-                    f"        const V s{ref} = V(in{ref}[r * {param}LL]);"
-                )
-        preamble_lines.append(
-            f"        float* __restrict__ orow = out + r * {cols}LL;"
-        )
-        preamble = "\n".join(preamble_lines)
-
-        unrolled_src = ""
-        if len(instructions) <= _UNROLL_MAX_STEPS:
-            lanes = [
-                row_section(
-                    "col" if lane == 0 else f"col + {lane} * W", "W", str(lane)
-                )
-                for lane in range(4)
-            ]
-            unrolled_src = (
-                "        #pragma GCC ivdep\n"
-                f"        for (; col + 4 * W <= {cols}LL; col += 4 * W) {{\n"
-                + "\n".join(lanes)
-                + "\n        }\n"
-            )
-        single_src = row_section("col", "W", "")
-        tail_src = row_section("col", "count", "")
-        grain_rows = max(1, min_chunk // cols) if cols else 1
-        body_loops = (
-            "    for (long long r = rb; r < re; ++r) {\n"
-            f"{preamble}\n"
-            "        long long col = 0;\n"
-            f"{unrolled_src}"
-            "        #pragma GCC ivdep\n"
-            f"        for (; col + W <= {cols}LL; col += W) {{\n"
-            f"{single_src}\n"
-            "        }\n"
-            f"        if (col < {cols}LL) {{\n"
-            f"            const long count = {cols}LL - col;\n"
-            f"{tail_src}\n"
-            "        }\n"
-            "    }"
-        )
-        entry_dispatch = (
-            f"        tp_body(&ctx, 0, {row_count}LL);\n"
-            "    } else {\n"
-            f"        tp_parallel_for_c(0, {row_count}LL, {grain_rows}LL, tp_body, &ctx);\n"
-            "    }"
-        )
-    elif tile_modes is not None:
-        # Tile plan: the parallel range counts row tiles of W rows; each
-        # tile row runs one vector along the column, and transposed inputs
-        # are staged into W-by-W transposed buffers once per tile so the
-        # vector loads along the column stay contiguous.  A full tile gives
-        # every row exactly W lanes; a partial tile trims the same bodies
-        # with a runtime lane count, so there is no scalar fallback.
-        body_range_params = "long long tb, long long te"
-        element_count = 1
-        for d in out_shape:
-            element_count *= int(d)
-        cols = int(out_shape[-1])
-        row_count = element_count // cols if cols else 0
-        tile_w = lane_count if lane_count is not None else 16
-        row_tiles = (row_count + tile_w - 1) // tile_w
-        emit_modes = tuple(
-            ("splat", 0)
-            if mode == "splat"
-            else ("rowval", ref)
-            if mode == "rowscalar"
-            else ("rowptr", 0)
-            if mode == "rowstrided"
-            else ("tbuf", ref)
-            for ref, (mode, _param) in enumerate(tile_modes)
-        )
-        transposed = [
-            (ref, param)
-            for ref, (mode, param) in enumerate(tile_modes)
-            if mode == "transposed"
-        ]
-        buffer_decls = "\n".join(
-            f"        alignas(16) float buf{ref}[W * W];\n"
-            for ref, _param in transposed
-        )
-        preloads = "\n".join(
-            f"            tp_transpose_mxn<float>(in{ref} + mt + nt * {param}LL, "
-            f"{param}LL, buf{ref}, W, cols_t, rows_t);\n"
-            for ref, param in transposed
-        )
-        tile_row, tile_result = emit_value_program(
-            instructions,
-            constants,
-            input_count,
-            output_ref,
-            used_inputs,
-            indent="                ",
-            offset="0",
-            count_expr="cols_t",
-            suffix="",
-            input_modes=emit_modes,
-        )
-        tile_row_text = "\n".join(tile_row) + "\n" + (
-            f"                {tile_result}.store(orow, cols_t);"
-        )
-
-        row_preamble_lines: list[str] = []
-        for ref in sorted(used_inputs):
-            mode, param = tile_modes[ref]
-            if mode == "rowstrided":
-                row_preamble_lines.append(
-                    f"                const float* __restrict__ p{ref} = "
-                    f"in{ref} + row * {param}LL + nt;"
-                )
-            elif mode == "rowscalar":
-                row_preamble_lines.append(
-                    f"                const V s{ref} = V(in{ref}[row * {param}LL]);"
-                )
-            elif mode == "transposed":
-                row_preamble_lines.append(
-                    f"                const float* __restrict__ q{ref} = "
-                    f"buf{ref} + br * W;"
-                )
-        row_preamble_lines.append(
-            f"                float* __restrict__ orow = out + row * {cols}LL + nt;"
-        )
-        row_preamble = "\n".join(row_preamble_lines) + "\n"
-
-        tile_grain = max(1, min_chunk // max(1, tile_w * cols))
-        body_loops = (
-            "    for (long long mt = tb * W; mt < te * W; mt += W) {\n"
-            f"        const long rows_t = ({row_count}LL - mt < (long long)W)\n"
-            f"            ? (long)({row_count}LL - mt) : W;\n"
-            f"        for (long long nt = 0; nt < {cols}LL; nt += W) {{\n"
-            f"            const long cols_t = ({cols}LL - nt < (long long)W)\n"
-            f"                ? (long)({cols}LL - nt) : W;\n"
-            f"{preloads}"
-            "            for (long br = 0; br < rows_t; ++br) {\n"
-            "                const long long row = mt + br;\n"
-            f"{row_preamble}"
-            f"{tile_row_text}\n"
-            "            }\n"
-            "        }\n"
-            "    }"
-        )
-        tile_helper = (
-            "\n"
-            "template <typename T>\n"
-            "static inline void tp_transpose_mxn(\n"
-            "    const T* __restrict__ src, long ld_src,\n"
-            "    T* __restrict__ dst, long ld_dst, long M, long N) {\n"
-            "    for (long i = 0; i < M; ++i)\n"
-            "        for (long j = 0; j < N; ++j)\n"
-            "            dst[j * ld_dst + i] = src[i * ld_src + j];\n"
-            "}\n"
-        )
-        w_decl = "constexpr long W = V::size();"
-        body_fn = "tp_tile_body"
-        entry_dispatch = (
-            f"        {body_fn}(&ctx, 0, {row_tiles}LL);\n"
-            "    } else {\n"
-            f"        tp_parallel_for_c(0, {row_tiles}LL, {tile_grain}LL, "
-            f"{body_fn}, &ctx);\n"
-            "    }"
-        )
-    else:
-        body_range_params = "long long b, long long e"
-        unrolled_body = ""
-        if len(instructions) <= _UNROLL_MAX_STEPS:
-            unrolled_body = _emit_body(
-                instructions,
-                constants,
-                input_count,
-                output_ref,
-                used_inputs,
-                "        ",
-                unrolled=True,
-                partial=False,
-                input_modes=input_modes,
-            )
-        single_body = _emit_body(
-            instructions,
-            constants,
-            input_count,
-            output_ref,
-            used_inputs,
-            "        ",
-            unrolled=False,
-            partial=False,
-            input_modes=input_modes,
-        )
-        tail_body = _emit_body(
-            instructions,
-            constants,
-            input_count,
-            output_ref,
-            used_inputs,
-            "        ",
-            unrolled=False,
-            partial=True,
-            input_modes=input_modes,
-        )
-
-        # Alignment peel for ``colmod`` inputs: every vector must start at a
-        # flat index congruent to 0 mod the vector width so, together with the
-        # row width being a multiple of the widest tier width, the whole vector
-        # stays inside one row.  Advance from the chunk start to the next
-        # boundary with scalar steps; interior iterations are then fully
-        # vectorized row-interior loads.
-        peel_needed = any(mode == "colmod" for mode, _ in input_modes)
-        peel_loop = ""
-        if peel_needed:
-            peel_loop = (
-                "    for (; i % W != 0 && i < e; ++i) {\n"
-                "        const long count = 1;\n"
-                f"{tail_body}\n"
-                "    }\n"
-            )
-
-        unrolled_loop = ""
-        if unrolled_body:
-            unrolled_loop = (
-                "    #pragma GCC ivdep\n"
-                "    for (; i + 4 * W <= e; i += 4 * W) {\n"
-                f"{unrolled_body}\n"
-                "    }\n"
-            )
-        body_loops = (
-            "    long i = b;\n"
-            f"{peel_loop}"
-            f"{unrolled_loop}"
-            "    #pragma GCC ivdep\n"
-            "    for (; i + W <= e; i += W) {\n"
-            f"{single_body}\n"
-            "    }\n"
-            "    if (i < e) {\n"
-            "        const long count = e - i;\n"
-            f"{tail_body}\n"
-            "    }"
-        )
-        entry_dispatch = (
-            "        tp_body(&ctx, 0, n);\n"
-            "    } else {\n"
-            f"        tp_parallel_for_c(0, n, {min_chunk}LL, tp_body, &ctx);\n"
-            "    }"
-        )
-
-    runner_section = ""
-    direct_section = ""
-    extra_includes = ""
-    if out_shape is not None and out_device is not None:
-        shape_init = ", ".join(f"{int(d)}LL" for d in out_shape)
-        dev_ordinal, dev_index = out_device
-        dev_name = {0: "CPU", 1: "CUDA"}[dev_ordinal]
-        ptr_args = "".join(f", in[{i}]" for i in range(input_count))
-        numel = 1
-        for d in out_shape:
-            numel *= int(d)
-        runner_section = (
-            "\n"
-            "static PyObject* tp_runner(PyObject*, PyObject* const* args, "
-            "Py_ssize_t nargs) {\n"
-            "    try {\n"
-            "        if (nargs != 1)\n"
-            "            throw std::runtime_error(\"runner expects the input list\");\n"
-            "        PyObject* inputs = args[0];\n"
-            f"        if (!PyList_CheckExact(inputs) ||\n"
-            f"            PyList_GET_SIZE(inputs) != {input_count})\n"
-            "            throw std::runtime_error(\"runner input list mismatch\");\n"
-            f"        const float* in[{input_count}];\n"
-            f"        for (long i = 0; i < {input_count}; ++i) {{\n"
-            "            in[i] = static_cast<const float*>(\n"
-            "                tensorplay::python_c::tpx_py_tensor_cref(\n"
-            "                    PyList_GET_ITEM(inputs, i)).data_ptr());\n"
-            "        }\n"
-            "        tensorplay::Tensor out = tensorplay::Tensor::empty(\n"
-            f"            std::vector<int64_t>{{{shape_init}}},\n"
-            "            tensorplay::ScalarType::Float32,\n"
-            f"            tensorplay::Device(tensorplay::DeviceType::{dev_name}, "
-            f"{int(dev_index)}LL), false);\n"
-            f"        {entry}({numel}LL{ptr_args}, out.data_ptr<float>());\n"
-            "        return tensorplay::python_c::tpx_py_wrap(out);\n"
-            "    } catch (const std::exception& e) {\n"
-            "        PyErr_SetString(PyExc_RuntimeError, e.what());\n"
-            "        return nullptr;\n"
-            "    } catch (...) {\n"
-            "        PyErr_SetString(PyExc_RuntimeError, \"unhandled kernel runner error\");\n"
-            "        return nullptr;\n"
-            "    }\n"
-            "}\n"
-            "\n"
-            "static PyMethodDef tp_runner_def = {\n"
-            "    \"runner\", (PyCFunction)(void (*)(void))tp_runner,\n"
-            "    METH_FASTCALL, nullptr};\n"
-            "\n"
-            'extern "C" PyObject* tp_make_runner(void) {\n'
-            "// The factory may be invoked through a GIL-releasing foreign-call\n"
-            "// bridge; object creation needs the interpreter held.\n"
-            "    PyGILState_STATE gil = PyGILState_Ensure();\n"
-            "    PyObject* runner = PyCFunction_New(&tp_runner_def, nullptr);\n"
-            "    PyGILState_Release(gil);\n"
-            "    return runner;\n"
-            "}\n"
-        )
-        # Direct entry for the compiled-call trampoline: takes the C array
-        # of data pointers the steady-state guard has already validated,
-        # allocates the pinned output, runs the kernel, and returns the
-        # wrapped result.  No Python containers cross this boundary in
-        # either direction.
-        direct_section = (
-            'extern "C" PyObject* tp_direct(const void* const* ins) {\n'
-            "    try {\n"
-            f"        const float* in[{input_count}];\n"
-            f"        for (int i = 0; i < {input_count}; ++i)\n"
-            "            in[i] = static_cast<const float*>(ins[i]);\n"
-            "        tensorplay::Tensor out = tensorplay::Tensor::empty(\n"
-            f"            std::vector<int64_t>{{{shape_init}}},\n"
-            "            tensorplay::ScalarType::Float32,\n"
-            f"            tensorplay::Device(tensorplay::DeviceType::{dev_name}, "
-            f"{int(dev_index)}LL), false);\n"
-            f"        {entry}({numel}LL"
-            + "".join(f", in[{i}]" for i in range(input_count))
-            + ", out.data_ptr<float>());\n"
-            "        return tensorplay::python_c::tpx_py_wrap(out);\n"
-            "    } catch (const std::exception& e) {\n"
-            "        PyErr_SetString(PyExc_RuntimeError, e.what());\n"
-            "        return nullptr;\n"
-            "    } catch (...) {\n"
-            "        PyErr_SetString(PyExc_RuntimeError, \"unhandled kernel error\");\n"
-            "        return nullptr;\n"
-            "    }\n"
-            "}\n"
-        )
-        extra_includes = (
-            "#include <Python.h>\n"
-            "#include <vector>\n"
-            "#include \"Tensor.h\"\n"
-            "\n"
-            "namespace tensorplay { namespace python_c {\n"
-            "const Tensor& tpx_py_tensor_cref(PyObject* obj);\n"
-            "PyObject* tpx_py_wrap(const Tensor& t);\n"
-            "}}  // namespace tensorplay::python_c\n"
-            "\n"
-        )
-
-    return (
-        '#include "cpu/vec/vec.h"\n'
-        "using V = tensorplay::vec::Vectorized<float>;\n"
-        "\n"
-        f"{extra_includes}"
-        "typedef void (*tp_parallel_body_c)(void* ctx, long long b, long long e);\n"
-        'extern "C" void tp_parallel_for_c('
-        "long long begin, long long end, long long grain, "
-        "tp_parallel_body_c body, void* ctx);\n"
-        f"{tile_helper}"
-        "\n"
-        "typedef struct TP_Ctx {\n"
-        f"{ctx_fields}"
-        "    float* out;\n"
-        "} TP_Ctx;\n"
-        "\n"
-        f"static void {body_fn}(void* ctxp, {body_range_params}) {{\n"
-        "    const TP_Ctx* c = (const TP_Ctx*)ctxp;\n"
-        f"{ctx_loads}"
-        "    float* __restrict__ out = c->out;\n"
-        f"    {w_decl}\n"
-        f"{const_decls}\n"
-        f"{splat_hoists}"
-        f"{buffer_decls}"
-        f"{body_loops}\n"
-        "}\n"
-        "\n"
-        f'extern "C" void {entry}(long n, {input_params}, float* __restrict__ out) {{\n'
-        f"    TP_Ctx ctx{{{ctx_init}}};\n"
-        f"    if (n < {serial_cutoff}LL) {{\n"
-        f"{entry_dispatch}\n"
-        "}\n"
-        f"{runner_section}"
-        f"{direct_section}"
-    )
+    names = _native_names(program, step_index)
+    lines: list[str] = []
+    for ref in range(program.n_inputs):
+        lines.append(f"V {names[ref]} = V::loadu(in{ref} + ({offset}), W);")
+    lines.extend(_native_body(program, step_index, scalar=False))
+    lines.append(f"{names[program.output_ref]}.store(out + ({offset}), W);")
+    return lines
 
 
-def _pool_threads() -> int:
-    """Intra-op pool size at codegen time (baked into the entry check)."""
+def render_kernel_source(steps, constants, n_inputs, output_ref, entry_name: str) -> str:
+    """Print one fused pointwise program as a compilable translation unit.
 
-    try:
-        import tensorplay
+    What comes out is a shared object with one entry point, taking the element
+    count, an array of input addresses and the output address, so the caller
+    hands it addresses and nothing else.
+    """
 
-        threads = int(tensorplay.get_num_threads())
-    except Exception:
-        threads = 0
-    if threads < 1:
-        threads = (os.cpu_count() or 2) // 2
-    return max(1, threads)
+    program = _NativeProgram(steps, constants, n_inputs, output_ref)
+    unrolled = len(program.steps) <= _UNROLL_MAX_STEPS
+
+    lines: list[str] = ["auto tp_body = [](void* raw, long tp_begin, long tp_end) {"]
+    lines.append("  TpCtx& g = *static_cast<TpCtx*>(raw);")
+    lines.append("  const long e = tp_end - tp_begin;")
+    for ref in range(program.n_inputs):
+        lines.append(f"  const float* __restrict__ in{ref} = g.ins[{ref}] + tp_begin;")
+    lines.append("  float* __restrict__ out = g.out + tp_begin;")
+    lines.append("  long i = 0;")
+
+    if unrolled:
+        lines.append("  #pragma GCC ivdep")
+        lines.append(f"  for (; i + {_UNROLL} * W <= e; i += {_UNROLL} * W) {{")
+        for step_index in range(_UNROLL):
+            offset = f"i + {step_index} * W" if step_index else "i"
+            for statement in _native_unrolled_phase(program, offset, step_index):
+                lines.append("    " + statement)
+        lines.append("  }")
+    lines.append("  #pragma GCC ivdep")
+    lines.append("  for (; i + W <= e; i += W) {")
+    for statement in _native_phase(program, "i", scalar=False):
+        lines.append("    " + statement)
+    lines.append("  }")
+    lines.append("  {")
+    lines.append("    const long count = e - i;")
+    lines.append("    #pragma GCC ivdep")
+    lines.append("    for (long j = 0; j < count; ++j) {")
+    for statement in _native_phase(program, "i + j", scalar=True):
+        lines.append("      " + statement)
+    lines.append("    }")
+    lines.append("  }")
+    lines.append("};")
+
+    serial_limit = get_num_threads() * _CHUNK
+    entry = f"""
+extern "C" void {entry_name}(long n, const float* const* ins, float* out) {{
+  TpCtx ctx{{ins, out}};
+{chr(10).join(lines)}
+  if (n < {serial_limit}LL) {{
+    tp_body(&ctx, 0, n);
+  }} else {{
+    tp_parallel_for_c(0, n, {_CHUNK}LL, tp_body, &ctx);
+  }}
+}}
+"""
+    return _NATIVE_PROLOGUE + entry
 
 
-# ---------------------------------------------------------------------------
-# Compile + load
-# ---------------------------------------------------------------------------
-
-_LIBS_STATE: dict[str, dict[str, Any]] = {"libs": {}}
-
-
-def _kill_switch() -> bool:
-    return os.environ.get("TP_STAX_CPU_NATIVE", "") == "0"
-
-
+#: What a generated unit holds of the library it was built against.  The unit
+#: inlines the library's vector arithmetic through its headers, so its own text
+#: says nothing about which version that was: the key has to carry it, or a
+#: unit built before the library changed is reused afterwards still holding
+#: whatever those headers said back then.
 _RUNTIME_FINGERPRINTS: dict[str, str] = {}
 
 
-def _runtime_fingerprint(lib_dir: str) -> str:
-    """Identity of the runtime libraries a generated unit builds against.
+def _runtime_fingerprint(directory: str) -> str:
+    """A short key for the runtime a generated unit inlines.
 
-    A generated unit inlines the runtime's vector math through its headers,
-    and its own text says nothing about which version that was.  Without this
-    in the key, a kernel built before the library changed would be reused
-    afterwards, still carrying whatever the headers held when it was built.
-    Taken once per process: the libraries do not change under a running one.
+    Taken once per process: a running process cannot have its libraries
+    swapped under it, so asking again could only cost a stat to learn the same
+    answer.
     """
 
-    known = _RUNTIME_FINGERPRINTS.get(lib_dir)
-    if known is not None:
-        return known
+    cached = _RUNTIME_FINGERPRINTS.get(directory)
+    if cached is not None:
+        return cached
     parts: list[str] = []
-    for name in ("libp10.so", "libtpx.so", "libtp_python.so"):
+    try:
+        entries = sorted(os.listdir(directory))
+    except OSError:
+        entries = []
+    for entry in entries:
+        if not entry.startswith("lib") or ".so" not in entry:
+            continue
+        path = os.path.join(directory, entry)
         try:
-            info = os.stat(os.path.join(lib_dir, name))
+            info = os.stat(path)
         except OSError:
             continue
-        parts.append(f"{name}:{info.st_size}:{int(info.st_mtime)}")
-    digest = hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
-    _RUNTIME_FINGERPRINTS[lib_dir] = digest
-    return digest
+        parts.append(f"{entry}:{info.st_size}")
+    value = "|".join(parts) if parts else "no-runtime"
+    _RUNTIME_FINGERPRINTS[directory] = value
+    return value
 
 
-def compile_translation_unit(
-    source: str,
-    entry: str,
-    *,
-    isa: VecISA,
-    paths: tuple[str, str, str],
-    compiler: str,
-    version_info: str,
-    pinned: bool,
-    bind_tag: str,
-) -> Any:
-    """Build one generated translation unit and return the loaded library.
+def _native_entry_name() -> str:
+    return "tp_cpu_native_entry"
 
-    The unit is keyed by its own text plus the toolchain fingerprint, written
-    once under the shared kernel cache, and loaded through a process-level
-    handle table so repeated lowerings of the same program reuse one
-    ``dlopen``.  ``pinned`` selects the link set: units that allocate their
-    own output tensor and wrap it for the interpreter additionally need the
-    Python bridge library.  Returns ``None`` when the toolchain, the build,
-    or the load fails -- every caller keeps a working non-generated route.
+
+def _contiguous_flat(shape, strides) -> bool:
+    """Whether a shape and its strides address one run of memory in order."""
+
+    if shape is None or strides is None:
+        return True
+    shape = tuple(int(item) for item in shape)
+    strides = tuple(int(item) for item in strides)
+    if not shape:
+        return True
+    if len(shape) != len(strides):
+        return False
+    expected = 1
+    for extent, stride in zip(reversed(shape), reversed(strides)):
+        if extent == 1:
+            continue
+        if stride != expected:
+            return False
+        expected *= extent
+    return True
+
+
+def _elements(shape) -> int:
+    total = 1
+    for extent in shape or ():
+        total *= int(extent)
+    return total
+
+
+def _native_output_shape(input_shapes, shape) -> tuple | None:
+    """The shape the result has, or ``None`` to read it off the inputs.
+
+    A program reads its inputs in lockstep, so inputs of different extents are
+    a broadcast, and a broadcast is not one run of memory this prints.  When
+    the caller states no shape at all the extent is taken from the tensors the
+    runner is handed, which is the only place it is finally known.
     """
 
-    include_dir, generated_include_dir, lib_dir = paths
+    if shape is not None:
+        return tuple(int(item) for item in shape)
+    if not input_shapes:
+        return None
+    first = tuple(int(item) for item in input_shapes[0])
+    for other in input_shapes[1:]:
+        if tuple(int(item) for item in other) != first:
+            return None
+    return first
+
+
+def build_cpu_native_kernel(
+    instructions,
+    constants,
+    n_inputs,
+    output_ref,
+    *,
+    shape=None,
+    device=None,
+    input_shapes=None,
+    input_strides=None,
+):
+    """Build one fused pointwise program into a callable, or decline it.
+
+    ``None`` comes back for a layout this emitter does not address -- an input
+    that is not one contiguous run, or inputs that do not agree on an extent --
+    which is the caller's cue to route the region somewhere else.  A program
+    whose shape is wrong is a different thing and raises.
+    """
+
+    import ctypes
+
+    import tensorplay as tp
+
+    from ..cpp_builder import CppBuilder, CppOptions, get_cpp_compiler, package_paths
+    from ..cpu_vec_isa import InvalidVecISA, pick_vec_isa
+    from ..kernel_cache import default_cache, file_lock
+
+    program = _NativeProgram(instructions, constants, n_inputs, output_ref)
+    n_inputs = program.n_inputs
+
+    # The phases address their inputs as one contiguous run each, so anything
+    # else is declined rather than printed wrongly.
+    if input_shapes is not None and input_strides is not None:
+        for one_shape, one_stride in zip(input_shapes, input_strides):
+            if not _contiguous_flat(one_shape, one_stride):
+                return None
+    out_shape = _native_output_shape(input_shapes, shape)
+    if out_shape is None and input_shapes:
+        # The inputs state extents that do not agree: a broadcast, which is
+        # not one run of memory this prints.
+        return None
+    # A shape nobody stated is read off the tensors at run time, so the count
+    # is only fixed here when one was stated.
+    count = _elements(out_shape) if out_shape is not None else 0
+
+    isa = pick_vec_isa()
+    if isinstance(isa, InvalidVecISA) or not isa.is_feasible():
+        return None
+
+    source = render_kernel_source(
+        program.steps, program.constants, n_inputs, output_ref, _native_entry_name()
+    )
+    dirs = package_paths()
+    if dirs is None:
+        return None
+    include_dir, generated_include_dir, lib_dir = dirs
+
     cache = default_cache("stax-cpu-native")
-    key_options = {
-        "tier": isa.name,
-        "flags": " ".join(isa.build_arch_flags()),
-        "ver": version_info[:32],
-        "entry": entry,
-        "bind": bind_tag,
-        "runtime": _runtime_fingerprint(lib_dir),
-    }
-    key = cache.cache_key(source, entry, key_options)
+    key = cache.cache_key(
+        source,
+        entry=_native_entry_name(),
+        options={
+            "isa": isa.fingerprint(),
+            "runtime": _runtime_fingerprint(lib_dir),
+            "threads": parallel_num_threads(),
+        },
+    )
     source_path = cache.path_for(key, "cpp")
     output_path = cache.path_for(key, "so")
 
     if not os.path.exists(output_path):
-        try:
-            import sysconfig
-
-            python_include = sysconfig.get_paths()["include"]
-            # Tensor.h pulls the generated op declarations when the runtime
-            # headers are present.  The directory that carries them depends
-            # on the layout: a development tree keeps them under the build
-            # directory beside the generated sleef.h, an installed wheel
-            # under a sibling of the shipped include tree.
-            generated_ops_include = ""
-            for candidate in (
-                os.path.join(
-                    os.path.dirname(generated_include_dir), "generated"
-                ),
-                os.path.join(
-                    os.path.dirname(generated_include_dir), "generated_ops"
-                ),
-                generated_include_dir,
-            ):
-                if os.path.isfile(
-                    os.path.join(
-                        candidate, "tensorplay", "ops", "TensorGenerated.h"
-                    )
-                ):
-                    generated_ops_include = candidate
-                    break
-            os.makedirs(os.path.dirname(source_path), exist_ok=True)
-            with file_lock(output_path + ".lock"):
-                if not os.path.exists(output_path):
-                    with open(source_path, "w") as fh:
-                        fh.write(source)
-                    include_dirs = [
-                        include_dir,
-                        generated_include_dir,
-                        python_include,
-                    ]
-                    if generated_ops_include:
-                        include_dirs.append(generated_ops_include)
-                    options = CppOptions(
-                        compiler=compiler,
-                        definitions=isa.definitions(),
-                        include_dirs=include_dirs,
-                        cflags=[
-                            "-std=c++20",
-                            "-O3",
-                            "-fno-math-errno",
-                            "-fPIC",
-                            "-shared",
-                            *isa.build_arch_flags(),
-                        ],
-                        library_dirs=[lib_dir],
-                        # ``tpx`` is a header-only interface target: its ops
-                        # namespace is compiled into libp10, so there is no
-                        # libtpx artifact to link and naming it fails every
-                        # kernel build (which then silently loses the
-                        # compiled route to the interpreter fallback).
-                        libraries=["p10", "tp_python"]
-                        if pinned
-                        else ["p10"],
-                        ldflags=[f"-Wl,-rpath,{lib_dir}"],
-                    )
-                    builder = CppBuilder(
-                        name=os.path.basename(output_path),
-                        sources=[source_path],
-                        options=options,
-                        output_dir=os.path.dirname(source_path),
-                    )
-                    builder.build()
-        except Exception:
-            if not os.path.exists(output_path):
-                return None
-
-    libs = _LIBS_STATE.setdefault("libs", {})
-    lib = libs.get(output_path)
-    if lib is None:
-        try:
-            lib = ctypes.CDLL(output_path)
-        except Exception:
+        compiler = get_cpp_compiler()
+        if not compiler:
             return None
-        libs[output_path] = lib
-    return lib
+        os.makedirs(os.path.dirname(source_path), exist_ok=True)
+        with file_lock(output_path + ".lock"):
+            if not os.path.exists(output_path):
+                with open(source_path, "w") as handle:
+                    handle.write(source)
+                # The vector transcendentals resolve to symbols the runtime
+                # library exports, so a unit is linked against it.
+                options = CppOptions(
+                    compiler=compiler,
+                    include_dirs=[include_dir, generated_include_dir],
+                    cflags=[
+                        "-std=c++20",
+                        "-O2",
+                        "-fPIC",
+                        "-shared",
+                        *isa.build_arch_flags(),
+                    ],
+                    definitions=isa.definitions(),
+                    library_dirs=[lib_dir],
+                    libraries=["p10"],
+                    ldflags=[f"-Wl,-rpath,{lib_dir}"],
+                )
+                builder = CppBuilder(
+                    name=os.path.basename(output_path),
+                    sources=[source_path],
+                    options=options,
+                    output_dir=os.path.dirname(source_path),
+                )
+                try:
+                    builder.build()
+                except Exception:
+                    return None
 
-
-def _digest_entry_key(
-    instructions,
-    constants,
-    input_count,
-    output_ref,
-    tier,
-    version_info,
-    pinned_shape=None,
-    layout_key=None,
-    tiling=None,
-) -> str:
-    # The pinned shape and per-input layouts are baked into the generated
-    # unit (output allocation, addressing modes), so they belong in the
-    # entry symbol: two specializations sharing one program must never
-    # collide on a cached artifact.  The tiling plan follows from the same
-    # layouts and the row-tiling switch, so it is named explicitly rather
-    # than left implicit in the layout key.
-    return hashlib.sha256(
-        repr(
-            (
-                tuple(instructions),
-                tuple(constants),
-                input_count,
-                output_ref,
-                tier,
-                version_info,
-                pinned_shape,
-                layout_key,
-                tiling,
-            )
-        ).encode()
-    ).hexdigest()[:16]
-
-
-def build_cpu_native_kernel(
-    instructions: list[tuple[str, int, int, int]],
-    constants: list[float],
-    input_count: int,
-    output_ref: int | None = None,
-    *,
-    shape: Any = None,
-    device: Any = None,
-    input_shapes: tuple[tuple[int, ...], ...] | None = None,
-    input_strides: tuple[tuple[int, ...], ...] | None = None,
-) -> Optional[Callable[[list[Any]], Any]]:
-    """Compile the program once and return ``run(inputs) -> Tensor``.
-
-    Returns ``None`` when the path is disabled, the development headers are
-    missing, the program cannot be rendered, or the build/load fails.
-
-    ``shape``/``device`` pin the specialization: the lowering route already
-    verified every input against them, so with both present the unit emits
-    a METH_FASTCALL runner that keeps the steady-state call entirely in C
-    (pointer extraction, output allocation, result wrapping), matching the
-    binding pattern of the in-tree kernel loader.
-
-    ``input_shapes``/``input_strides`` describe each input's layout at
-    compile time (the pinned route guarantees they hold for every call);
-    together with ``shape`` they enable broadcast-splat hoisting and
-    row-broadcast ``i % S`` addressing.  The caller remains responsible for
-    the route check -- the generated unit trusts these layouts.
-    """
-
-    if _kill_switch():
-        return None
-    if output_ref is None:
-        output_ref = input_count + len(instructions) - 1
     try:
-        _analyze_instructions(instructions, constants, input_count, output_ref)
-    except _ProgramError:
+        library = ctypes.CDLL(output_path)
+    except OSError:
         return None
-    paths = package_paths()
-    if paths is None:
-        return None
-    compiler = get_cpp_compiler()
-    if not compiler:
-        return None
-    include_dir, generated_include_dir, lib_dir = paths
+    entry = getattr(library, _native_entry_name())
+    entry.restype = None
+    entry.argtypes = [
+        ctypes.c_long,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+    ]
 
-    isa: VecISA = pick_vec_isa(paths)
-    if not isa:
-        return None
-
-    version_info = get_compiler_version_info(compiler)
-
-    pinned_shape: tuple[int, ...] | None = None
-    out_device_code: tuple[int, int] | None = None
-    if shape is not None:
-        try:
-            pinned_shape = tuple(int(item) for item in shape)
-        except (TypeError, ValueError):
-            pinned_shape = None
-    if pinned_shape is not None and device is not None:
-        device_ordinals = {"cpu": 0, "cuda": 1}
-        try:
-            out_device_code = (
-                device_ordinals[str(device.type)],
-                int(device.index) if device.index is not None else -1,
-            )
-        except (KeyError, TypeError, ValueError, AttributeError):
-            out_device_code = None
-    if out_device_code is None:
-        pinned_shape = None
-
-    layout_key: Any = None
-    if (
-        pinned_shape is not None
-        and input_shapes is not None
-        and input_strides is not None
-    ):
-        layout_key = (
-            tuple(tuple(int(d) for d in s) for s in input_shapes),
-            tuple(tuple(int(s) for s in st) for st in input_strides),
+    def run(inputs):
+        if out_shape is None:
+            # No shape was stated, so the extent is whatever the tensors the
+            # runner was handed say it is.
+            run_shape = tuple(inputs[0].shape)
+            run_count = _elements(run_shape)
+        else:
+            run_shape, run_count = out_shape, count
+        handles = (ctypes.c_void_p * n_inputs)()
+        for position, value in enumerate(inputs):
+            handles[position] = ctypes.c_void_p(value.data_ptr())
+        result = tp.empty(run_shape, dtype=tp.float32, device=device)
+        entry(
+            ctypes.c_long(run_count),
+            ctypes.cast(handles, ctypes.POINTER(ctypes.c_void_p)),
+            ctypes.c_void_p(result.data_ptr()),
         )
-
-    entry_key_tiling = None
-    if layout_key is not None:
-        _flat_modes, plan_rows, plan_tiles = _classify_pinned_layouts(
-            input_shapes, input_strides, pinned_shape, isa.nelements()
-        )
-        entry_key_tiling = (
-            "tile" if plan_tiles is not None else "row" if plan_rows is not None else None
-        )
-
-    entry = f"tp_native_{_digest_entry_key(instructions, constants, input_count, output_ref, isa.name, version_info, pinned_shape, layout_key, entry_key_tiling)}"
-    try:
-        source = render_kernel_source(
-            instructions,
-            constants,
-            input_count,
-            output_ref,
-            entry,
-            out_shape=pinned_shape,
-            out_device=out_device_code,
-            input_shapes=input_shapes if layout_key is not None else None,
-            input_strides=input_strides if layout_key is not None else None,
-            lane_count=isa.nelements(),
-        )
-    except _ProgramError:
-        return None
-    pinned = pinned_shape is not None and out_device_code is not None
-
-    lib = compile_translation_unit(
-        source,
-        entry,
-        isa=isa,
-        paths=paths,
-        compiler=compiler,
-        version_info=version_info,
-        pinned=pinned,
-        bind_tag="plan-v2" if pinned else "py",
-    )
-    if lib is None:
-        return None
-    fn = getattr(lib, entry, None)
-    if fn is None:
-        return None
-    fn.restype = None
-    fn.argtypes = (
-        [ctypes.c_long] + [ctypes.c_void_p] * input_count + [ctypes.c_void_p]
-    )
-
-    import tensorplay
-
-    runner: Any = None
-    direct_addr = 0
-    if pinned:
-        # The generated unit carries a METH_FASTCALL runner: it receives the
-        # input tensor list, extracts the data pointers in C, allocates the
-        # output in C, and wraps the result — the steady-state call never
-        # re-enters Python.  The ``tp_direct`` export additionally hands the
-        # compiled-call trampoline a pointer-level entry, skipping the list
-        # hop entirely.
-        make_runner = getattr(lib, "tp_make_runner", None)
-        if make_runner is not None:
-            make_runner.restype = ctypes.py_object
-            make_runner.argtypes = []
-            try:
-                runner = make_runner()
-            except Exception:
-                return None
-        direct_fn = getattr(lib, "tp_direct", None)
-        if direct_fn is not None:
-            try:
-                direct_addr = ctypes.cast(direct_fn, ctypes.c_void_p).value or 0
-            except (ValueError, TypeError, OSError):
-                direct_addr = 0
-        if runner is not None:
-            return (runner, direct_addr)
-        return None
-
-    if pinned_shape is None:
-        # Unpinned builds keep the runtime shape read; the route check
-        # still guarantees all inputs match, so reading input 0 once per
-        # call is faithful.
-        def run(inputs: list[Any]) -> Any:
-            out = tensorplay.empty(
-                tuple(int(item) for item in inputs[0].shape),
-                dtype=tensorplay.float32,
-                device=inputs[0].device,
-            )
-            fn(
-                inputs[0].numel(),
-                *[t.data_ptr() for t in inputs],
-                out.data_ptr(),
-            )
-            return out
-
-        return run
-
-    empty = tensorplay.empty
-    f32 = tensorplay.float32
-    numel = 1
-    for item in pinned_shape:
-        numel *= item
-    pinned_device = device
-
-    def run(inputs: list[Any]) -> Any:
-        out = empty(
-            pinned_shape,
-            dtype=f32,
-            device=pinned_device,
-        )
-        fn(
-            numel,
-            *[t.data_ptr() for t in inputs],
-            out.data_ptr(),
-        )
-        return out
+        return result
 
     return run

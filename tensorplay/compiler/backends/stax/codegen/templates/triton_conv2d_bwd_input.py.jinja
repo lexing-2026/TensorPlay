@@ -1,0 +1,124 @@
+{#-
+  The input's gradient: the sum of the windows that read each position.
+
+  Rows are input positions and columns are input channels, so this is the
+  forward's product with the contraction moved: the forward contracted over
+  input channels, and this contracts over output channels instead, once per
+  tap.  For a given tap the output position a row was read at is solved for
+  rather than stepped to, which is the whole difference between the two
+  directions -- one of them walks the window, the other has to invert it.
+
+  Inverting a window means dividing, and dividing a distance that can be
+  negative is where this goes wrong: a truncating division and a negative
+  dividend disagree about the sign, and a kernel that guesses there is wrong
+  only along the padded border, which is exactly the part nobody checks.  So
+  the distance is clamped before the division and the sign is carried
+  alongside it.
+-#}
+import triton
+import triton.language as tl
+
+{#- The index type travels with the launch rather than with the body: it is a
+    property of the call, and a body that narrows an index has to name the type
+    it narrows to. #}
+INDEX_DTYPE = {{ index_dtype }}
+
+
+@triton.jit
+def _tap_origin(coord, offset, out_extent, stride):
+    """Where a tap lands in the output, and whether it lands at all."""
+    distance = coord + offset
+    positive = distance >= 0
+    safe = tl.maximum(distance, 0)
+    origin = safe // stride
+    return origin, positive & (origin < out_extent) & ((safe % stride) == 0)
+
+
+{{ def_kernel("DY", "W", outputs=("DX",)) }}
+    n = {{ size("DY", 0) }}
+    h = {{ size("DY", 2) }}
+    width = {{ size("DY", 3) }}
+    in_c = {{ size("DX", 1) }}
+    out_c = {{ size("DY", 1) }}
+    out_h = {{ size("DY", 2) }}
+    out_width = {{ size("DY", 3) }}
+
+    stride_dyn = {{ stride("DY", 0) }}
+    stride_dyc = {{ stride("DY", 1) }}
+    stride_dyh = {{ stride("DY", 2) }}
+    stride_dyw = {{ stride("DY", 3) }}
+
+    stride_wo = {{ stride("W", 0) }}
+    stride_wi = {{ stride("W", 1) }}
+    stride_wkh = {{ stride("W", 2) }}
+    stride_wkw = {{ stride("W", 3) }}
+
+    stride_dxn = {{ stride("DX", 0) }}
+    stride_dxc = {{ stride("DX", 1) }}
+    stride_dxh = {{ stride("DX", 2) }}
+    stride_dxw = {{ stride("DX", 3) }}
+
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+{#- One group is not a group: the whole of an operand belongs to it, so the
+    program axis that walks the groups has nothing to walk and is not read. -#}
+{% if GROUPS == 1 %}
+    group = 0
+{% else %}
+    group = tl.program_id(2).to(INDEX_DTYPE)
+{% endif %}
+
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    spatial = h * width
+    idx_n = rows // spatial
+    within = rows % spatial
+    idx_h = within // width
+    idx_w = within % width
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    in_channel = group * GROUP_IN_C + cols
+    mask_col = cols < GROUP_IN_C
+
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    for k in range(0, tl.cdiv(GROUP_OUT_C, BLOCK_K)):
+        lane = tl.arange(0, BLOCK_K)
+        out_channel = group * GROUP_OUT_C + k * BLOCK_K + lane
+        mask_k = lane < GROUP_OUT_C - k * BLOCK_K
+        w_ptrs = (
+            W_ptr
+            + (out_channel * stride_wo)[:, None]
+            + (cols * stride_wi)[None, :]
+        )
+        mask_w = mask_k[:, None] & mask_col[None, :]
+        for ky in tl.static_range(KERNEL_H):
+            oh, ok_h = _tap_origin(
+                idx_h, PADDING_H - ky * DILATION_H, out_h, STRIDE_H
+            )
+            for kx in tl.static_range(KERNEL_W):
+                ow, ok_w = _tap_origin(
+                    idx_w, PADDING_W - kx * DILATION_W, out_width, STRIDE_W
+                )
+                matrix_w = tl.load(
+                    w_ptrs + ky * stride_wkh + kx * stride_wkw,
+                    mask=mask_w, other=0.0,
+                )
+                keep = (idx_n < n) & ok_h & ok_w
+                dy_ptrs = DY_ptr + (
+                    (idx_n * stride_dyn)[:, None]
+                    + (oh * stride_dyh)[:, None]
+                    + (ow * stride_dyw)[:, None]
+                    + (out_channel * stride_dyc)[None, :]
+                )
+                matrix_dy = tl.load(
+                    dy_ptrs, mask=keep[:, None] & mask_k[None, :], other=0.0
+                )
+                acc += tl.dot(matrix_dy, matrix_w, allow_tf32=ALLOW_TF32)
+    tl.store(
+        DX_ptr + (
+            (idx_n * stride_dxn)[:, None]
+            + (idx_h * stride_dxh)[:, None]
+            + (idx_w * stride_dxw)[:, None]
+            + (in_channel * stride_dxc)[None, :]
+        ),
+        acc,
+        mask=(idx_n < n)[:, None] & mask_col[None, :],
+    )

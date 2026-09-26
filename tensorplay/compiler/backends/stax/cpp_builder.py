@@ -11,14 +11,17 @@ loadable shared object:
 
 The builder is deliberately small: it renders one command line, runs it in
 a temporary directory, and returns the output path.  Content-addressed
-storage and process-level memoization live in :mod:`.codecache`.
+storage and process-level memoization live in :mod:`.kernel_cache`.
 """
 
 from __future__ import annotations
 
+import functools
 import os
 import shutil
+import re
 import subprocess
+import sys
 import tempfile
 from typing import Optional, Sequence
 
@@ -110,6 +113,78 @@ def get_compiler_version_info(compiler: str) -> str:
     info = _compiler_version_first_line(compiler)
     cached[compiler] = info
     return info
+
+
+#: Whether the compiler is one of the Microsoft ones.  It is decided from the
+#: platform rather than from the compiler's name, because on that platform the
+#: compiler is the one the platform ships.
+_IS_WINDOWS = sys.platform == "win32"
+
+
+@functools.cache
+def _is_clang(cpp_compiler: str) -> bool:
+    """Whether this compiler is one of the clang family.
+
+    The answer comes from the version line rather than from the command's name,
+    because a command called ``clang++`` is a clang and a command called
+    ``g++`` may still be one wearing the other name.  It is also asked once per
+    compiler, because asking the compiler what it is costs a process.
+    """
+
+    if _IS_WINDOWS:
+        # Only the command-line form of clang is usable there.
+        if re.search(r"((clang$)|(clang\+\+$))", cpp_compiler):
+            raise RuntimeError(
+                "only the command-line form of clang is supported on this platform"
+            )
+        return bool(re.search(r"(clang-cl)", cpp_compiler))
+
+    first_line = _compiler_version_first_line(cpp_compiler)
+    if re.search(r"clang version", first_line):
+        return True
+    if re.search(r"Apple LLVM version", first_line):
+        return True
+    return False
+
+
+@functools.cache
+def _is_gcc(cpp_compiler: str) -> bool:
+    """Whether this compiler is the GNU one.
+
+    The command's own name is not enough, because a command called ``clang++``
+    ends in ``g++`` and would match, so the version line decides.
+    """
+
+    if _is_clang(cpp_compiler):
+        return False
+
+    first_line = _compiler_version_first_line(cpp_compiler)
+    if re.search(
+        r"(^|[\s/-])(gcc|g\+\+|gnu-c\+\+)(?=[\s(-]|$)",
+        first_line,
+        re.IGNORECASE,
+    ):
+        return True
+    return False
+
+
+@functools.cache
+def is_clang() -> bool:
+    return _is_clang(get_cpp_compiler())
+
+
+@functools.cache
+def is_gcc() -> bool:
+    return _is_gcc(get_cpp_compiler())
+
+
+@functools.cache
+def is_msvc_cl() -> bool:
+    """Whether the compiler needs an array whose size is only known at run time
+    to be on the heap, because it has no array whose size is only known at run
+    time at all."""
+
+    return _IS_WINDOWS and not is_clang()
 
 
 class CppOptions:

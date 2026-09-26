@@ -1,0 +1,110 @@
+{#-
+  One program's share of the tiles, fetched by coordinate, with the partial
+  result handed on through a scratch.
+
+  What this form carries between tiles is the difference from its predecessor.
+  A program that has finished a tile can start the next one while the earlier
+  write is still in flight, which is what the scratch is for: the partial goes
+  to memory, the tile's store is issued, and the accumulator is free again
+  before the store has landed.  Without the scratch the accumulator has to stay
+  live until its store retires, which is what the earlier form cannot escape.
+
+  The scratch is a property of the device rather than of the call, so the
+  template that offers this body refuses the machines whose limits it does not
+  have.
+
+  A descriptor states the mapping from a tile's coordinates to its elements once
+  and is then asked for tiles, so the address arithmetic a kernel without one
+  repeats per tile is not repeated.  Only the toolkit that can build one in the
+  kernel's own registers has this body: the one that has only the earlier call
+  has to build it in a workspace, and that is the earlier body.
+
+  Whether the accumulator is passed into the multiply or added to afterwards is a
+  code-generation choice rather than a numerical one -- passing it in lets the
+  multiply accumulate in place, adding afterwards needs a temporary -- and which
+  one is available is a property of the toolkit, so both are here and the caller
+  says which.
+-#}
+import triton
+import triton.language as tl
+
+
+{{ def_kernel("A", "B", "WS", outputs=("C",)) }}
+    M = {{ size("A", 0) }}
+    N = {{ size("B", 1) }}
+    K = {{ size("A", 1) }}
+    if M == 0 or N == 0:
+        # Nothing to produce.  A grid built from zero extents has no tiles, and
+        # a program that finds itself here would be dividing by a width of
+        # zero two lines down.
+        return
+
+    start_pid = tl.program_id(0).to(tl.int32)
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
+    num_tiles = grid_m * grid_n
+    # The width of one group of rows, in tiles.  Decoding the flat index by
+    # group rather than by row is what makes the programs running together
+    # share their operand tiles: a run of GROUP_M tiles down a column reads
+    # the same columns of the right operand and adjacent rows of the left.
+    width = GROUP_M * grid_n
+
+    a_desc = triton.language.make_tensor_descriptor(
+        base=A_ptr,
+        shape=[M, K] if A_ROW_MAJOR else [K, M],
+        strides=[K, 1] if A_ROW_MAJOR else [1, K],
+        block_shape=[BLOCK_M, BLOCK_K] if A_ROW_MAJOR else [BLOCK_K, BLOCK_M],
+    )
+    b_desc = triton.language.make_tensor_descriptor(
+        base=B_ptr,
+        shape=[K, N] if B_ROW_MAJOR else [N, K],
+        strides=[N, 1] if B_ROW_MAJOR else [1, N],
+        block_shape=[BLOCK_K, BLOCK_N] if B_ROW_MAJOR else [BLOCK_N, BLOCK_K],
+    )
+
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS):
+        group_id = tile_id // width
+        group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+        pid_m = group_id * GROUP_M + (tile_id % group_size)
+        pid_n = (tile_id % width) // group_size
+
+        rm = pid_m * BLOCK_M
+        rn = pid_n * BLOCK_N
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for rk in tl.range(0, K, BLOCK_K):
+            a = tl.load_tensor_descriptor(
+                a_desc, [rm, rk] if A_ROW_MAJOR else [rk, rm]
+            )
+            b = tl.load_tensor_descriptor(
+                b_desc, [rk, rn] if B_ROW_MAJOR else [rn, rk]
+            )
+            left = a if A_ROW_MAJOR else a.T
+            right = b if B_ROW_MAJOR else b.T
+            if FAST_ACCUM:
+                acc = tl.dot(left, right, acc, allow_tf32=ALLOW_TF32)
+            else:
+                acc += tl.dot(left, right, allow_tf32=ALLOW_TF32)
+
+        # The partial goes through the scratch rather than straight to the
+        # result, so the store below is issued and the accumulator is free again
+        # before that store has landed.  A slot per program and per half-tile is
+        # what lets a program be two tiles ahead of its own writes.
+        slot = (start_pid * 2 * (BLOCK_M * BLOCK_N)
+                + tl.arange(0, BLOCK_M)[:, None] * BLOCK_N
+                + tl.arange(0, BLOCK_N)[None, :])
+        tl.store(WS_ptr + slot, acc)
+        tl.debug_barrier()
+        acc = tl.load(WS_ptr + slot)
+
+        # The origins are recomputed rather than carried: they are two scalars
+        # that would otherwise occupy registers across the whole contraction,
+        # and the tile is finished with them the moment the accumulator is.
+        rm = pid_m * BLOCK_M
+        rn = pid_n * BLOCK_N
+        rcm = rm + tl.arange(0, BLOCK_M)
+        rcn = rn + tl.arange(0, BLOCK_N)
+        tl.store(
+            C_ptr + rcm[:, None] * {{ stride("C", 0) }} + rcn[None, :] * {{ stride("C", 1) }},
+            acc, mask=(rcm[:, None] < M) & (rcn[None, :] < N),
+        )

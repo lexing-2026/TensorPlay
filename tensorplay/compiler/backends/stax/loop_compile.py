@@ -19,9 +19,15 @@ from .codegen.loop_triton import (
 )
 
 #: What "this route cannot express this region" looks like from outside.
+#:
+#: One name for the whole route rather than one per stage: a plan this route
+#: declines is a plan it declines, whichever stage declined it, so a caller
+#: that keeps its other routes catches this and nothing has to know which
+#: stage was reached.  Anything else that goes wrong is a bug and is left to
+#: surface, rather than being read as "unsupported".
 NotLowerable = PlanError
 from .graph_lowering import GraphLowering
-from .kernel_scheduler import ExternNode, FusedGroup, KernelScheduler
+from .loop_fusion import ExternNode, FusedGroup, KernelScheduler
 from .loop_runtime import ExternStep, FusedStep, LoopProgram
 
 
@@ -43,9 +49,12 @@ def stored_names(scheduler: KernelScheduler, group: FusedGroup) -> set:
     return out
 
 
+_tp_debug_plans = __import__('os').environ.get('TP_DEBUG_PLANS') == '1'
+
+
 def _steps_for(graph, groups) -> list:
     scheduler: KernelScheduler = graph.scheduler
-    buffers = graph.buffers
+    buffers = graph.name_to_buffer
     steps = []
     for group in groups:
         if isinstance(group, ExternNode):
@@ -57,9 +66,13 @@ def _steps_for(graph, groups) -> list:
         ptr_names: list = []
         for config in candidates:
             try:
-                launcher, ptr_names = compile_group(group, buffers, stored, config)
+                launcher, ptr_names = compile_group(
+                    group, buffers, stored, config, graph.sizevars
+                )
                 break
-            except PlanError:
+            except PlanError as exc:
+                if __debug__ and _tp_debug_plans:
+                    print(f"[stax] candidate declined: {exc}")
                 continue
         if launcher is None:
             raise PlanError(
@@ -102,19 +115,21 @@ def compile_half_host(graph_module, example_inputs, **options):
     graph.scheduler = plan
     steps = []
     for group in plan.fuse():
-        if not hasattr(group, "data"):
-            steps.append(ExternStep(group))
+        if isinstance(group, ExternNode):
+            steps.append(ExternStep(group.kernel))
             continue
         stored = stored_names(plan, group)
         try:
-            program = loop_cpp.flatten(group, graph.buffers, stored, graph)
+            program = loop_cpp.flatten(group, graph.name_to_buffer, stored, graph)
         except loop_cpp.HostPlanError as exc:
             raise PlanError(str(exc)) from exc
         shapes, strides = [], []
         for name in program["inputs"]:
-            buffer = graph.buffers[name]
+            buffer = graph.name_to_buffer[name]
             shapes.append(tuple(int(s) for s in buffer.get_size()))
             strides.append(tuple(int(s) for s in buffer.layout.stride))
+        # The layouts pin the specialization, so a call whose operands do not
+        # match them is not this kernel.
         launch = build_cpu_native_kernel(
             program["instructions"], program["constants"],
             program["input_count"], program["output_ref"],
@@ -137,15 +152,6 @@ def _stored_name(stored) -> str:
 
 
 __all__ = ["compile_graph", "compile_half", "compile_half_host", "stored_names"]
-
-
-
-class NotLowerable(Exception):
-    """This region is not one the loop IR can express.
-
-    The caller keeps its other routes.  Anything else that goes wrong is a
-    bug and is left to surface, rather than being read as "unsupported".
-    """
 
 
 def compile_half(graph_module, example_inputs, **options):

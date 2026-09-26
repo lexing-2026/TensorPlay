@@ -1,0 +1,99 @@
+{#-
+  The same product, swept by a fixed number of programs.
+
+  One program per tile launches more programs than the device can have
+  resident, so most of them wait.  Here there are as many programs as there are
+  multiprocessors and each walks a share of the tiles, which turns the
+  launcher's scheduling problem into the kernel's loop -- and the cap is the
+  whole point, since a grid larger than the machine is exactly what this
+  avoids.
+
+  The tile order is the kernel's to choose.  Decoding the flat index by group of
+  rows before advancing a column makes the programs running at the same moment
+  read the same columns of the right operand and adjacent rows of the left,
+  which is what the group is for.
+
+  A row of an operand that the last tile only partly covers is wrapped round to
+  the start rather than masked off, so the loads need no mask; the write is
+  masked instead, because a wrapped write would land on a row that belongs to
+  another tile.  Whether the contraction divides by the block is a property of
+  the call, so it is a flag rather than a test in the loop.
+-#}
+import triton
+import triton.language as tl
+
+{#- The index type travels with the launch rather than with the body: it is a
+    property of the call, and a body that narrows an index has to name the type
+    it narrows to. #}
+INDEX_DTYPE = {{ index_dtype }}
+
+
+{{ def_kernel("A", "B", outputs=("C",)) }}
+    M = {{ size("A", 0) }}
+    N = {{ size("B", 1) }}
+    K = {{ size("A", 1) }}
+    if M * N == 0:
+        # Nothing to produce.  A grid built from zero extents has no tiles, and
+        # a program that finds itself here would be dividing by a width of zero
+        # a few lines down.
+        return
+
+    stride_am = {{ stride("A", 0) }}
+    stride_ak = {{ stride("A", 1) }}
+    stride_bk = {{ stride("B", 0) }}
+    stride_bn = {{ stride("B", 1) }}
+    stride_cm = {{ stride("C", 0) }}
+    stride_cn = {{ stride("C", 1) }}
+
+    start_pid = tl.program_id(0).to(INDEX_DTYPE)
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
+    num_tiles = grid_m * grid_n
+    width = GROUP_M * grid_n
+
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS):
+        group_id = tile_id // width
+        group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+        pid_m = group_id * GROUP_M + (tile_id % group_size)
+        pid_n = (tile_id % width) // group_size
+        tl.assume(pid_m >= 0)
+        tl.assume(pid_n >= 0)
+
+        off_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+        off_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+        off_k = tl.arange(0, BLOCK_K)
+        a_ptrs = A_ptr + off_m[:, None] * stride_am + off_k[None, :] * stride_ak
+        b_ptrs = B_ptr + off_k[:, None] * stride_bk + off_n[None, :] * stride_bn
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k in range(0, tl.cdiv(K, BLOCK_K)):
+            k_tail = K - k * BLOCK_K
+            if EVEN_K:
+                a = tl.load(a_ptrs)
+                b = tl.load(b_ptrs)
+            else:
+                a = tl.load(
+                    a_ptrs, mask=off_k[None, :] < k_tail,
+                    other=tl.zeros((), dtype=A_ptr.dtype.element_ty),
+                )
+                b = tl.load(
+                    b_ptrs, mask=off_k[:, None] < k_tail,
+                    other=tl.zeros((), dtype=B_ptr.dtype.element_ty),
+                )
+{%- if USE_FAST_ACCUM %}
+            acc = tl.dot(a, b, acc, input_precision="{{ precision }}")
+{%- else %}
+            acc += tl.dot(a, b, input_precision="{{ precision }}")
+{%- endif %}
+            a_ptrs += BLOCK_K * stride_ak
+            b_ptrs += BLOCK_K * stride_bk
+
+        # The origins are recomputed rather than carried: they are two vectors
+        # that would otherwise occupy registers across the whole contraction,
+        # and the tile is finished with them the moment the accumulator is.
+        rcm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        rcn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        tl.store(
+            C_ptr + rcm[:, None] * stride_cm + rcn[None, :] * stride_cn,
+            acc,
+            mask=(rcm[:, None] < M) & (rcn[None, :] < N),
+        )

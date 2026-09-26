@@ -1,0 +1,156 @@
+{#-
+  One tile of output positions against one tile of output channels.
+
+  The rows are positions, counted across the batch and the image together,
+  because a tile does not care which image a position came from; the columns
+  are output channels counted within the group; the contraction is the input
+  channels of that group.  Groups are the third axis of the grid rather than a
+  term in the extents, because each group is an independent product over its
+  own channels and a tile belongs to one of them.
+
+  The weight is addressed the other way round from the input: the tile is the
+  contraction against the output channels and the weight is stored
+  output-major, so the load carries the transpose rather than the product.  It
+  is re-read once per step of the contraction, because the contraction is
+  exactly what steps.
+
+  The bias is declared whether or not the call has one, because a signature
+  that changes shape with the call is a signature that has to be rendered
+  twice; whether it is read is a flag instead.
+-#}
+import triton
+import triton.language as tl
+
+
+{{ def_kernel("X", "W", "B", outputs=("O",)) }}
+    """One tile of output positions against one tile of output channels."""
+    n = {{ size("X", 0) }}
+    c = {{ size("X", 1) }}
+    h = {{ size("X", 2) }}
+    width = {{ size("X", 3) }}
+    out_c = {{ size("O", 1) }}
+    out_h = {{ size("O", 2) }}
+    out_width = {{ size("O", 3) }}
+
+    stride_xn = {{ stride("X", 0) }}
+    stride_xc = {{ stride("X", 1) }}
+    stride_xh = {{ stride("X", 2) }}
+    stride_xw = {{ stride("X", 3) }}
+
+    stride_wo = {{ stride("W", 0) }}
+    stride_wi = {{ stride("W", 1) }}
+    stride_wkh = {{ stride("W", 2) }}
+    stride_wkw = {{ stride("W", 3) }}
+
+    stride_on = {{ stride("O", 0) }}
+    stride_oc = {{ stride("O", 1) }}
+    stride_oh = {{ stride("O", 2) }}
+    stride_ow = {{ stride("O", 3) }}
+
+    stride_bn = {{ stride("B", 0) }}
+
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_g = tl.program_id(2)
+
+    # The rows are positions: which image, and where in it.  A position that
+    # runs past the end of the image is masked off below.
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    spatial = out_h * out_width
+    idx_n = rows // spatial
+    within = rows % spatial
+    idx_y_h = within // out_width
+    idx_y_w = within % out_width
+
+    # The columns are output channels, counted within the group.
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    out_channel = pid_g * GROUP_OUT_C + cols
+
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+    w_ptrs = W_ptr + (out_channel * stride_wo)[None, :]
+    mask_w = (tl.arange(0, BLOCK_K) < GROUP_IN_C)[:, None] & (cols < GROUP_OUT_C)[None, :]
+
+    # Each group reduces over its own channels, so the contraction is counted
+    # from the start of the group rather than from the start of the tensor.
+    x_base = X_ptr + idx_n[:, None] * stride_xn + pid_g * GROUP_IN_C * stride_xc
+    for k in range(0, tl.cdiv(GROUP_IN_C, BLOCK_K)):
+        idx_x_c = k * BLOCK_K + tl.arange(0, BLOCK_K)
+        if UNROLL:
+            for ky in tl.static_range(KERNEL_H):
+                idx_x_h = (
+                    idx_y_h - PADDING_H + ky * DILATION_H
+                ) * STRIDE_H
+                for kx in tl.static_range(KERNEL_W):
+                    idx_x_w = (
+                        idx_y_w - PADDING_W + kx * DILATION_W
+                    ) * STRIDE_W
+                    # The tap selects a plane of the weight as well as an
+                    # offset into the input: the two are the same tap, and a
+                    # kernel that moved one without the other would read every
+                    # tap against a single plane.
+                    tap = ky * stride_wkh + kx * stride_wkw
+                    matrix_w = tl.load(
+                        w_ptrs + (idx_x_c * stride_wi)[:, None] + tap,
+                        mask=mask_w, other=0.0,
+                    )
+                    x_ptrs = x_base + (
+                        (idx_x_c * stride_xc)[None, :]
+                        + (idx_x_h * stride_xh)[:, None]
+                        + (idx_x_w * stride_xw)[:, None]
+                    )
+                    mask_x = (
+                        (idx_n < n)[:, None]
+                        & (idx_x_h >= 0)[:, None]
+                        & (idx_x_h < h)[:, None]
+                        & (idx_x_w >= 0)[:, None]
+                        & (idx_x_w < width)[:, None]
+                        & (idx_x_c < GROUP_IN_C)[None, :]
+                    )
+                    matrix_x = tl.load(x_ptrs, mask=mask_x, other=0.0)
+                    acc += tl.dot(matrix_x, matrix_w, allow_tf32=ALLOW_TF32)
+        else:
+            # The kernel extent folded into the contraction: one lane per tap,
+            # so a kernel wider than the contraction block is stepped once.
+            for ky in range(KERNEL_H):
+                idx_x_h = (idx_y_h - PADDING_H + ky * DILATION_H) * STRIDE_H
+                for kx in range(KERNEL_W):
+                    idx_x_w = (idx_y_w - PADDING_W + kx * DILATION_W) * STRIDE_W
+                    matrix_w = tl.load(
+                        w_ptrs + (idx_x_c * stride_wi)[:, None]
+                        + ky * stride_wkh + kx * stride_wkw,
+                        mask=mask_w, other=0.0,
+                    )
+                    x_ptrs = x_base + (
+                        (idx_x_c * stride_xc)[None, :]
+                        + (idx_x_h * stride_xh)[:, None]
+                        + (idx_x_w * stride_xw)[:, None]
+                    )
+                    mask_x = (
+                        (idx_n < n)[:, None]
+                        & (idx_x_h >= 0)[:, None]
+                        & (idx_x_h < h)[:, None]
+                        & (idx_x_w >= 0)[:, None]
+                        & (idx_x_w < width)[:, None]
+                        & (idx_x_c < GROUP_IN_C)[None, :]
+                    )
+                    matrix_x = tl.load(x_ptrs, mask=mask_x, other=0.0)
+                    acc += tl.dot(matrix_x, matrix_w, allow_tf32=ALLOW_TF32)
+
+    if HAS_BIAS:
+        acc += tl.load(B_ptr + out_channel * stride_bn, mask=cols < GROUP_OUT_C,
+                       other=0.0)[None, :]
+
+    o_ptrs = O_ptr + (
+        (idx_n * stride_on)[:, None]
+        + (out_channel * stride_oc)[None, :]
+        + (idx_y_h * stride_oh)[:, None]
+        + (idx_y_w * stride_ow)[:, None]
+    )
+    mask_o = (
+        (idx_n < n)[:, None]
+        & (cols < GROUP_OUT_C)[None, :]
+        & (idx_y_h < out_h)[:, None]
+        & (idx_y_w < out_width)[:, None]
+    )
+    tl.store(o_ptrs, acc, mask=mask_o)

@@ -24,6 +24,10 @@ from .recording import (
     shape_env_check_state_equal,
 )
 from .sym_node import SymBool, SymFloat, SymInt, SymNode, sym_ite
+# The range of values a bound may take is the one the symbolic layer
+# defines; everything that reasons about shapes reaches for it through this
+# module, so it is re-exported here rather than defined twice.
+from .sympy_functions import ValueRanges  # noqa: E402
 
 Int: TypeAlias = SymInt | int
 Scalar: TypeAlias = SymInt | SymFloat | SymBool | int | float | bool
@@ -147,27 +151,6 @@ class ShapeGuard:
 @dataclass(frozen=True, slots=True)
 class _ShapeGuardsHelper:
     exprs: list[str]
-
-
-@dataclass(frozen=True, slots=True)
-class ValueRanges:
-    lower: Any
-    upper: Any
-
-    @classmethod
-    def unknown(cls) -> "ValueRanges":
-        return cls(-sympy.oo, sympy.oo)
-
-    @property
-    def is_int(self) -> bool:
-        return all(isinstance(value, (int, sympy.Integer)) for value in (self.lower, self.upper))
-
-    @property
-    def is_float(self) -> bool:
-        return not self.is_int
-
-    def is_singleton(self) -> bool:
-        return self.lower == self.upper
 
 
 @dataclass(slots=True)
@@ -410,6 +393,16 @@ def _expr(value: Any) -> sympy.Basic:
     return sympy.sympify(value)
 
 
+class _Unspecified:
+    """Stands for the absence of a value, which ``None`` cannot."""
+
+    def __repr__(self) -> str:
+        return "<unspecified>"
+
+
+_unspecified = _Unspecified()
+
+
 def _primitive(value: Any) -> Any:
     if value in (sympy.true, sympy.false):
         return bool(value)
@@ -498,6 +491,23 @@ def create_contiguous(shape: Sequence[Int]) -> list[Int]:
     for dim in reversed(shape[:-1]):
         result.append(dim * result[-1])
     return list(reversed(result))
+
+
+def is_unbacked_symbol(symbol: sympy.Symbol) -> bool:
+    """Whether a symbol stands for a value no input can pin down.
+
+    A symbol is unbacked when it was created for a value that was read out of
+    the data rather than out of a shape, which is what the leading letter of
+    its name records.
+    """
+
+    return symbol.name.startswith("u")
+
+
+def free_unbacked_symbols(value: Any) -> set[sympy.Symbol]:
+    """The free symbols of a value that no input can pin down."""
+
+    return {s for s in free_symbols(value) if is_unbacked_symbol(s)}
 
 
 def free_symbols(value: Any) -> set[sympy.Symbol]:
@@ -802,6 +812,59 @@ SYMPY_INTERP: dict[str, Any] = {
     "sym_ite": sym_ite,
     "cast_symbool_to_symint_guardless": cast_symbool_to_symint_guardless,
 }
+
+
+def _all_le(lower: ValueRanges, upper: ValueRanges) -> bool:
+    """Whether every value of one range is at or below every value of another."""
+
+    return _endpoints_ordered(lower, upper, strict=False)
+
+
+def _all_lt(lower: ValueRanges, upper: ValueRanges) -> bool:
+    """Whether every value of one range is strictly below every value of another."""
+
+    return _endpoints_ordered(lower, upper, strict=True)
+
+
+def _endpoints_ordered(lower: ValueRanges, upper: ValueRanges, strict: bool) -> bool:
+    """Whether the top of one range stays under the bottom of the other.
+
+    Only the two endpoints that matter are compared: the largest value of the
+    lower range against the smallest of the upper one.  A missing or unbounded
+    endpoint is an unknown, not an ordering, and is reported as undecided.
+    """
+
+    from .sympy_functions import int_oo
+
+    if lower.upper is None or upper.lower is None:
+        return False
+    if upper.lower in (sympy.oo, int_oo):
+        return True
+    if lower.upper in (-sympy.oo, -int_oo):
+        return False
+    try:
+        if strict:
+            return bool(lower.upper < upper.lower)
+        return bool(lower.upper <= upper.lower)
+    except TypeError:
+        return False
+
+
+def _is_strictly_below(lower: ValueRanges, upper: ValueRanges) -> bool:
+    """Whether every value in one range is below every value in another."""
+
+    from .sympy_functions import int_oo
+
+    if lower.upper is None or upper.lower is None:
+        return False
+    if upper.lower in (sympy.oo, int_oo):
+        return True
+    if lower.upper in (-sympy.oo, -int_oo):
+        return False
+    try:
+        return bool(lower.upper < upper.lower)
+    except TypeError:
+        return False
 
 
 class ShapeEnv:
@@ -1248,26 +1311,199 @@ class ShapeEnv:
             result = updated
         return result
 
-    def _maybe_evaluate_static(self, expr: Any, *, compute_hint: bool = False, axioms: Iterable[Any] = (), size_oblivious: bool = False) -> Any:
-        del compute_hint, axioms, size_oblivious
-        result = self.replace(expr).subs(self.backed_var_to_val)
+    def _maybe_evaluate_static(
+        self,
+        expr: Any,
+        *,
+        unbacked_only: bool = False,
+        compute_hint: bool = False,
+        size_oblivious: bool = False,
+        axioms: tuple | None = None,
+        var_to_range: tuple | None = None,
+    ) -> Any:
+        """Settle an expression if what is already known settles it, guarding on nothing.
+
+        A relation is settled by asking what values each side can take: two
+        sides whose ranges do not overlap decide the relation outright, and one
+        side that can only be a single value decides it too.  Anything the
+        ranges do not decide is left alone, because the whole point is not to
+        add a guard here.
+        """
+
+        if compute_hint and axioms:
+            raise AssertionError("compute_hint and axioms cannot both be set")
+        if not isinstance(expr, sympy.Basic):
+            expr = sympy.sympify(expr)
+
+        result = self.replace(expr)
+        if unbacked_only:
+            result = result.xreplace(
+                {
+                    k: v
+                    for k, v in self.backed_var_to_val.items()
+                    if k not in self.unbacked_var_to_val
+                }
+            )
+        if compute_hint:
+            result = result.xreplace(self.backed_var_to_val)
+        else:
+            result = result.subs(self.backed_var_to_val)
+
         if not result.free_symbols:
-            return _primitive(result)
+            if result.is_number or result.is_Boolean:
+                return _primitive(result)
+            return None
+
+        # The bounds are those the caller supplied, and where it supplied none
+        # the ones this region already has.
+        ranges = dict(var_to_range) if var_to_range is not None else self.var_to_range
+        if axioms:
+            for axiom in axioms:
+                bound = self._bound_from_axiom(axiom)
+                if bound is None:
+                    continue
+                for sym, value_range in bound.items():
+                    known = ranges.get(sym)
+                    ranges[sym] = (
+                        value_range
+                        if known is None
+                        else known.intersection(value_range)
+                        if hasattr(known, "intersection")
+                        else value_range
+                    )
+        for sym in result.free_symbols:
+            if sym not in ranges:
+                ranges[sym] = None
+
+        return self._decide_from_ranges(result, ranges, size_oblivious)
+
+    def _bound_from_axiom(self, axiom) -> dict | None:
+        """What one stated fact says about a symbol's range, if it says anything.
+
+        A fact of the form ``s < n`` over integers bounds the symbol from above
+        at one less, and one of the form ``0 <= s`` bounds it from below; any
+        other form is not read here, because reading it wrongly would be worse
+        than not reading it.
+        """
+
+        if not isinstance(axiom, sympy.Basic):
+            return None
+        if isinstance(axiom, sympy.And):
+            bounds: dict = {}
+            for part in axiom.args:
+                one = self._bound_from_axiom(part)
+                if one:
+                    bounds.update(one)
+            return bounds or None
+        if isinstance(axiom, sympy.Lt) and len(axiom.args) == 2:
+            left, right = axiom.args
+            if isinstance(left, sympy.Symbol) and right.is_number:
+                return {left: ValueRanges(0, int(right) - 1)}
+        if isinstance(axiom, sympy.Le) and len(axiom.args) == 2:
+            left, right = axiom.args
+            if isinstance(left, sympy.Symbol) and right.is_number:
+                return {left: ValueRanges(0, int(right))}
+        if isinstance(axiom, sympy.Ge) and len(axiom.args) == 2:
+            left, right = axiom.args
+            if isinstance(left, sympy.Symbol) and right.is_number:
+                return {left: ValueRanges(int(right), sympy.oo)}
+        return None
+
+    def _decide_from_ranges(self, expr, ranges, size_oblivious: bool = False):
+        """A relation, decided by what its two sides can be, or left undecided."""
+
+        from .sympy_functions import bound_sympy as _bound_sympy, int_oo
+
+        if size_oblivious:
+            ranges = {
+                x: (
+                    ValueRanges(2, int_oo)
+                    if x in self.size_like and r is not None
+                    else r
+                )
+                for x, r in ranges.items()
+            }
+
+        if isinstance(expr, sympy.core.relational.Relational):
+            left, right = expr.args
+            try:
+                lhs = _bound_sympy(self.replace(left), ranges)
+                rhs = _bound_sympy(self.replace(right), ranges)
+            except Exception:
+                return None
+            # What the two ranges allow decides the relation; a question they
+            # leave open is left open.  A relation is only settled false when
+            # one side lies wholly on the far side of the other, since ranges
+            # that merely touch still allow either answer.
+            if expr.func is sympy.Lt:
+                if _all_lt(lhs, rhs):
+                    return sympy.true
+                if _all_le(rhs, lhs):
+                    return sympy.false
+                return None
+            if expr.func is sympy.Le:
+                if _all_le(lhs, rhs):
+                    return sympy.true
+                if _all_lt(rhs, lhs):
+                    return sympy.false
+                return None
+            if expr.func is sympy.Gt:
+                if _all_lt(rhs, lhs):
+                    return sympy.true
+                if _all_le(lhs, rhs):
+                    return sympy.false
+                return None
+            if expr.func is sympy.Ge:
+                if _all_le(rhs, lhs):
+                    return sympy.true
+                if _all_lt(lhs, rhs):
+                    return sympy.false
+                return None
+            if isinstance(expr, sympy.Equality):
+                if _all_lt(lhs, rhs) or _all_lt(rhs, lhs):
+                    return sympy.false
+                return None
+            if lhs == rhs and lhs.lower == lhs.upper and lhs.lower is not None:
+                if isinstance(expr, sympy.Equality):
+                    return sympy.true
+            return None
+
+        # A number whose bounds are a single value is that value.
+        try:
+            bound = _bound_sympy(self.replace(expr), ranges)
+        except Exception:
+            return None
+        if bound.lower == bound.upper and bound.lower not in (None,):
+            if bound.lower in (sympy.oo, -sympy.oo, int_oo, -int_oo):
+                return None
+            if getattr(bound.lower, "is_number", False):
+                return _primitive(bound.lower)
         return None
 
     def simplify(self, expr: Any, **_: Any) -> sympy.Expr:
         return sympy.simplify(self.replace(expr))
 
     def bound_sympy(self, expr: sympy.Expr, size_oblivious: bool = False) -> ValueRanges:
-        del size_oblivious
-        result = self.replace(expr)
-        if not result.free_symbols:
-            value = _primitive(result)
-            return ValueRanges(value, value)
-        lower, upper = -sympy.oo, sympy.oo
-        if isinstance(result, sympy.Symbol) and result in self.var_to_range:
-            return self.var_to_range[result]
-        return ValueRanges(lower, upper)
+        """What values an expression over this region's symbols can take.
+
+        The bound is computed from what the region already knows about each
+        symbol, so a bound here is as tight as the region can make it -- and a
+        caller that wants a different set of bounds has to say so rather than
+        have them guessed.
+        """
+
+        from .sympy_functions import bound_sympy as _bound_sympy, int_oo
+
+        if not isinstance(expr, sympy.Basic):
+            expr = sympy.sympify(expr)
+        var_to_range = {x: self.var_to_range.get(x, None) for x in expr.free_symbols}
+        if size_oblivious:
+            # A value that stands for an extent is at least two, and its upper
+            # bound is not what is being asked about here, so it is dropped.
+            for x in self.size_like & var_to_range.keys():
+                if var_to_range[x] is not None:
+                    var_to_range[x] = ValueRanges(2, int_oo)
+        return _bound_sympy(self.replace(expr), var_to_range)
 
     def guarding_hint_or_throw(self, expr: sympy.Expr | int) -> int | bool:
         value = self._maybe_evaluate_static(expr)
@@ -1299,12 +1535,33 @@ class ShapeEnv:
     def evaluate_sym_node(self, node: SymNode, **_: Any) -> Any:
         return self.guarding_hint_or_throw(node.expr)
 
-    def evaluate_expr(self, expr: Any, values: Mapping[Any, Any] | None = None) -> Any:
+    def evaluate_expr(
+        self,
+        expr: Any,
+        values: Mapping[Any, Any] | None = None,
+        size_oblivious: bool = False,
+        fallback_value: Any = _unspecified,
+    ) -> Any:
+        """The value of an expression, or what to answer when it has none.
+
+        A value the environment does not know is not an error on its own: a
+        caller asking a yes-or-no question about an extent wants an answer
+        either way, and says which answer to give when the question cannot be
+        settled.  A caller that needs the value itself gets the refusal, since
+        substituting a stand-in for a value would be a number it never had.
+        """
+
         substitutions = dict(self.backed_var_to_val)
         if values:
             substitutions.update({sympy.Symbol(str(key)): value for key, value in values.items()})
+        if size_oblivious:
+            static_val = self._maybe_evaluate_static(expr, size_oblivious=True)
+            if static_val is not None:
+                return static_val
         result = self.replace(expr).subs(substitutions)
         if result.free_symbols:
+            if fallback_value is not _unspecified:
+                return fallback_value
             raise GuardOnDataDependentSymNode(result, f"cannot evaluate {result}")
         return _primitive(result)
 

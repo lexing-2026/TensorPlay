@@ -26,6 +26,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
+import sympy
+
 
 class Expr:
     """Base class: immutable, structural equality, canonical repr."""
@@ -181,6 +183,11 @@ def _lift(value: Any) -> Expr:
         return Const(int(value))
     if isinstance(value, int):
         return Const(value)
+    # Extents and strides reach an index expression as exact integers carried
+    # in the symbolic value language, so a settled constant arrives here in
+    # that form rather than as a Python int.
+    if isinstance(value, sympy.Integer):
+        return Const(int(value))
     raise TypeError(f"index expression expected, got {type(value)!r}")
 
 

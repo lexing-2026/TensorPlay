@@ -1,0 +1,237 @@
+{#-
+  The factors applied to every tile as it arrives.
+
+  The accumulator only ever holds unscaled products, and a factor is paid for
+  once per tile rather than once per element of the result -- which is what
+  makes the block-shaped recipes available here at all: a factor per
+  128-by-128 block is expanded onto the tile's shape before it multiplies
+  anything, and a factor per block one row wide is expanded the same way.  The
+  expansion is a broadcast followed by a reshape: the load is small and the
+  multiply is not, and doing the expansion once per tile rather than once per
+  element of it is the point of doing it here at all.
+
+  The tiles are walked by a fixed number of programs rather than one program per
+  tile, so whatever runs together reads the same rows of the left operand: the
+  walk is what decides which programs run at the same time, and a factor block
+  is shared by everything running together.
+
+  A tile is read either by address or through a descriptor, and which one is not
+  a tuning knob.  A descriptor states the mapping once and is then asked for
+  tiles by coordinate, so the address arithmetic is not repeated per tile; what
+  it costs is a 32-bit coordinate and a hardware feature, so the caller decides
+  it after asking whether the extents and the furthest address fit in 32 bits at
+  all.  A toolkit that has only the earlier name for building one needs a
+  workspace to build it in, and says so once per program before the first tile
+  is asked for.
+-#}
+import triton
+import triton.language as tl
+
+{#- The index type travels with the launch rather than with the body: it is a
+    property of the call, and a body that narrows an index has to name the type
+    it narrows to. #}
+INDEX_DTYPE = {{ index_dtype }}
+
+
+@triton.jit
+def _scale_rows(scale, rows, extent, stride):
+    """One factor per row, gathered for the rows this tile covers."""
+
+    return tl.load(scale + rows * stride, mask=rows < extent, other=0.0)
+
+
+@triton.jit
+def _scale_block_128(scale, block, step, row_blocks, inner_blocks,
+                     BLOCK_ROWS, BLOCK_INNER):
+    """One factor per 128-by-128 block, laid over the tile that covers it.
+
+    A tile narrower than the block has no whole number of blocks in it, so the
+    block is counted in units of the tile rather than in units of the block, and
+    the block's own width is what each gathered value is repeated across.
+    """
+
+    rows = block * tl.cdiv(BLOCK_ROWS, 128) + tl.arange(0, (BLOCK_ROWS + 127) // 128)
+    inner = step * tl.cdiv(BLOCK_INNER, 128) + tl.arange(0, (BLOCK_INNER + 127) // 128)
+    factors = tl.load(
+        scale + rows[:, None] * inner_blocks + inner[None, :],
+        mask=(rows[:, None] < row_blocks) & (inner[None, :] < inner_blocks),
+        other=1.0,
+    )
+    return tl.broadcast_to(
+        factors[:, :, None, None],
+        ((BLOCK_ROWS + 127) // 128, (BLOCK_INNER + 127) // 128, 128, 128),
+    ).reshape(BLOCK_ROWS, BLOCK_INNER)
+
+
+@triton.jit
+def _scale_block_1xtile(scale, block, step, extent, inner_blocks,
+                        BLOCK_ROWS, BLOCK_INNER, TILE_INNER):
+    """One factor per block one row wide, laid over the tile that covers it."""
+
+    rows = block * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    inner = step * (BLOCK_INNER // TILE_INNER) + tl.arange(0, BLOCK_INNER // TILE_INNER)
+    factors = tl.load(
+        scale + rows[:, None] * inner_blocks + inner[None, :],
+        mask=(rows[:, None] < extent) & (inner[None, :] < inner_blocks),
+        other=1.0,
+    )
+    return tl.broadcast_to(factors[:, :, None], (BLOCK_ROWS, BLOCK_INNER // TILE_INNER, TILE_INNER)) \
+        .reshape(BLOCK_ROWS, BLOCK_INNER)
+
+
+{#- A workspace to build the mappings in is a parameter of its own, and only
+    the toolkit that needs one has it. -#}
+{%- if USE_EXPERIMENTAL_MAKE_TENSOR_DESCRIPTOR %}
+{{ def_kernel("A", "B", "SA", "SB", "ws", outputs=("C",)) }}
+{%- else %}
+{{ def_kernel("A", "B", "SA", "SB", outputs=("C",)) }}
+{%- endif %}
+    M = {{ size("A", 0) }}
+    N = {{ size("B", 1) }}
+    K = {{ size("A", 1) }}
+
+    stride_am = {{ stride("A", 0) }}
+    stride_ak = {{ stride("A", 1) }}
+    stride_bk = {{ stride("B", 0) }}
+    stride_bn = {{ stride("B", 1) }}
+    stride_cm = {{ stride("C", 0) }}
+    stride_cn = {{ stride("C", 1) }}
+
+    if M * N == 0:
+        return
+    start_pid = tl.program_id(axis=0).to(INDEX_DTYPE)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    k_tiles = tl.cdiv(K, BLOCK_K)
+    num_tiles = num_pid_m * num_pid_n
+
+{%- if USE_TMA_LOAD %}
+{%- if USE_EXPERIMENTAL_MAKE_TENSOR_DESCRIPTOR %}
+    # The mapping is stated once per program and once per operand, in a
+    # workspace this program owns, and no tile is asked for before the device
+    # can see the mapping.
+    workspace_base = ws_ptr + start_pid.to(tl.int64) * 2 * TMA_SIZE
+    a_desc_ptr = workspace_base
+    b_desc_ptr = workspace_base + TMA_SIZE
+    triton.language.extra.cuda.experimental_device_tensormap_create2d(
+        desc_ptr=a_desc_ptr,
+        global_address=A_ptr,
+        load_size=[BLOCK_M, BLOCK_K],
+        global_size=[M, K],
+        element_ty=A_ptr.dtype.element_ty,
+    )
+    triton.language.extra.cuda.experimental_device_tensormap_create2d(
+        desc_ptr=b_desc_ptr,
+        global_address=B_ptr,
+        load_size=[BLOCK_N, BLOCK_K],
+        global_size=[N, K],
+        element_ty=B_ptr.dtype.element_ty,
+    )
+    tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(a_desc_ptr)
+    tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(b_desc_ptr)
+{%- else %}
+    a_desc = triton.language.make_tensor_descriptor(
+        base=A_ptr,
+        shape=[M, K],
+        strides=[stride_am, 1],
+        block_shape=[BLOCK_M, BLOCK_K],
+    )
+    b_desc = triton.language.make_tensor_descriptor(
+        base=B_ptr,
+        shape=[N, K],
+        strides=[stride_bn, 1],
+        block_shape=[BLOCK_N, BLOCK_K],
+    )
+{%- endif %}
+{%- endif %}
+
+    # The group is what makes the programs running together share a factor
+    # block, for the same reason the persistent walk reorders its tiles.
+    num_pid_in_group = GROUP_M * num_pid_n
+    # A block-shaped factor is a grid of blocks, so it is counted in the width
+    # of a block rather than in the width of a tile; the row-shaped one is
+    # counted in rows.
+    row_blocks = tl.cdiv(M, 128)
+    inner_blocks = tl.cdiv(K, 128)
+    narrow_inner = tl.cdiv(K, TILE_INNER)
+
+    for tile_id in range(start_pid, num_tiles, NUM_SMS):
+        group_id = tile_id // num_pid_in_group
+        first_pid_m = group_id * GROUP_M
+        group_rows = min(num_pid_m - first_pid_m, GROUP_M)
+        pid_m = first_pid_m + (tile_id % group_rows)
+        pid_n = (tile_id % num_pid_in_group) // group_rows
+
+        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for rk in tl.range(0, K, BLOCK_K):
+            rk_idx = rk // BLOCK_K
+            inner = rk_idx * BLOCK_K + tl.arange(0, BLOCK_K)
+{%- if USE_TMA_LOAD %}
+            # The right tile is asked for as it is stored -- columns then the
+            # contraction -- and turned here, so that everything below reads a
+            # tile laid out the one way whichever way it was fetched.
+            a = tl.load_tensor_descriptor(
+                a_desc,
+                [(pid_m * BLOCK_M).to(tl.int32), (rk_idx * BLOCK_K).to(tl.int32)],
+            )
+            b = tl.load_tensor_descriptor(
+                b_desc,
+                [(pid_n * BLOCK_N).to(tl.int32), (rk_idx * BLOCK_K).to(tl.int32)],
+            ).T
+{%- else %}
+            a = tl.load(
+                A_ptr + rm[:, None] * stride_am + inner[None, :],
+                mask=(rm[:, None] < M) & (inner[None, :] < K),
+                other=tl.zeros((), dtype=A_ptr.dtype.element_ty),
+            )
+            b = tl.load(
+                B_ptr + inner[:, None] * stride_bk + rn[None, :],
+                mask=(inner[:, None] < K) & (rn[None, :] < N),
+                other=tl.zeros((), dtype=B_ptr.dtype.element_ty),
+            )
+{%- endif %}
+            # The recipe is dispatched here rather than inside a helper because the
+            # branches produce differently shaped things -- a number, a column, a
+            # full block -- and a helper that returned any of them would have to
+            # agree on one shape for branches only one of which ever runs.
+            if RECIPE_A == 0:
+                a_scaled = a * tl.load(SA_ptr)
+            elif RECIPE_A == 1:
+                a_scaled = a * _scale_rows(SA_ptr, rm, M, 1)[:, None]
+            elif RECIPE_A == 2:
+                a_scaled = a * _scale_block_128(
+                    SA_ptr, pid_m, rk_idx, row_blocks, inner_blocks,
+                    BLOCK_M, BLOCK_K,
+                )
+            else:
+                a_scaled = a * _scale_block_1xtile(
+                    SA_ptr, pid_m, rk_idx, M, narrow_inner,
+                    BLOCK_M, BLOCK_K, TILE_INNER,
+                )
+            if RECIPE_B == 0:
+                b_scaled = b * tl.load(SB_ptr)
+            elif RECIPE_B == 1:
+                b_scaled = b * _scale_rows(SB_ptr, rn, N, 1)[None, :]
+            elif RECIPE_B == 2:
+                # The expansion comes out with the right operand's own two axes --
+                # a block of columns and a block of the contraction -- and the
+                # multiply wants them the other way round, because the right tile is
+                # held as [BLOCK_K, BLOCK_N].  So it is transposed here rather than
+                # gathered a second time in the order the multiply wants.
+                b_scaled = b * tl.trans(_scale_block_128(
+                    SB_ptr, pid_n, rk_idx, tl.cdiv(N, 128), inner_blocks,
+                    BLOCK_N, BLOCK_K,
+                ))
+            else:
+                b_scaled = b * tl.trans(_scale_block_1xtile(
+                    SB_ptr, pid_n, rk_idx, N, narrow_inner,
+                    BLOCK_N, BLOCK_K, TILE_INNER,
+                ))
+            acc += tl.dot(a_scaled, b_scaled, allow_tf32=ALLOW_TF32)
+        tl.store(
+            C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn,
+            acc,
+            mask=(rm[:, None] < M) & (rn[None, :] < N),
+        )

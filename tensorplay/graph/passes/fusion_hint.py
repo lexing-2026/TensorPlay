@@ -60,6 +60,9 @@ POINTWISE_FUSED_OP_NAMES = frozenset(
         "rsqrt",
         "exp2",
         "erf",
+        # composite activations the program builders expand into the
+        # primitives above (silu(x) = x * sigmoid(x))
+        "silu",
         # dtype casts (float dtypes only; the program builder validates)
         "to",
         "float",

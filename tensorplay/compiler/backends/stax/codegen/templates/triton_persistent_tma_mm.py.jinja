@@ -1,0 +1,136 @@
+{#-
+  One program's share of the tiles, fetched by coordinate.
+
+  A descriptor states the mapping from a tile's coordinates to its elements once
+  and is then asked for tiles, so the address arithmetic a kernel without one
+  repeats per tile is not repeated.  Where the mapping is built is a property of
+  the toolkit: one that has the newer call builds it in the kernel's own
+  registers, and one that has only the earlier call builds it in a workspace
+  this program owns, which is why the body that suits it is a different one.
+
+  Whether the accumulator is passed into the multiply or added to afterwards is a
+  code-generation choice rather than a numerical one -- passing it in lets the
+  multiply accumulate in place, adding afterwards needs a temporary -- and which
+  one is available is a property of the toolkit, so both are here and the caller
+  says which.
+
+  The scratch is declared but not read here: a tile's partial going through it
+  is the later generation's difference, and that difference has its own body
+  rather than a flag in this one.
+-#}
+import triton
+import triton.language as tl
+
+
+{{ def_kernel("A", "B", "WS", outputs=("C",)) }}
+    M = {{ size("A", 0) }}
+    N = {{ size("B", 1) }}
+    K = {{ size("A", 1) }}
+    if M == 0 or N == 0:
+        # Nothing to produce.  A grid built from zero extents has no tiles, and
+        # a program that finds itself here would be dividing by a width of
+        # zero two lines down.
+        return
+
+    start_pid = tl.program_id(0).to(tl.int32)
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
+    num_tiles = grid_m * grid_n
+    # The width of one group of rows, in tiles.  Decoding the flat index by
+    # group rather than by row is what makes the programs running together
+    # share their operand tiles: a run of GROUP_M tiles down a column reads
+    # the same columns of the right operand and adjacent rows of the left.
+    width = GROUP_M * grid_n
+
+{%- if TMA_EXPERIMENTAL_API %}
+    # A toolkit that has only the earlier name builds the mapping in a workspace
+    # this program owns, once per operand, and no tile is asked for before the
+    # device can see the mapping.
+    mapping_base = WS_ptr + (start_pid.to(tl.int64) * 2 * TMA_SIZE + MAPPING_BASE) * WS_ptr.dtype.element_primitive_bitwidth // 8
+    a_desc_ptr = mapping_base
+    b_desc_ptr = mapping_base + TMA_SIZE
+    triton.language.extra.cuda.experimental_device_tensormap_create2d(
+        desc_ptr=a_desc_ptr,
+        global_address=A_ptr,
+        load_size=[BLOCK_M, BLOCK_K] if A_ROW_MAJOR else [BLOCK_K, BLOCK_M],
+        global_size=[M, K] if A_ROW_MAJOR else [K, M],
+        element_ty=A_ptr.dtype.element_ty,
+    )
+    triton.language.extra.cuda.experimental_device_tensormap_create2d(
+        desc_ptr=b_desc_ptr,
+        global_address=B_ptr,
+        load_size=[BLOCK_K, BLOCK_N] if B_ROW_MAJOR else [BLOCK_N, BLOCK_K],
+        global_size=[K, N] if B_ROW_MAJOR else [N, K],
+        element_ty=B_ptr.dtype.element_ty,
+    )
+    tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(a_desc_ptr)
+    tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(b_desc_ptr)
+{%- else %}
+    a_desc = triton.language.make_tensor_descriptor(
+        base=A_ptr,
+        shape=[M, K] if A_ROW_MAJOR else [K, M],
+        strides=[K, 1] if A_ROW_MAJOR else [1, K],
+        block_shape=[BLOCK_M, BLOCK_K] if A_ROW_MAJOR else [BLOCK_K, BLOCK_M],
+    )
+    b_desc = triton.language.make_tensor_descriptor(
+        base=B_ptr,
+        shape=[K, N] if B_ROW_MAJOR else [N, K],
+        strides=[N, 1] if B_ROW_MAJOR else [1, N],
+        block_shape=[BLOCK_K, BLOCK_N] if B_ROW_MAJOR else [BLOCK_N, BLOCK_K],
+    )
+{%- endif %}
+
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS):
+        group_id = tile_id // width
+        group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+        pid_m = group_id * GROUP_M + (tile_id % group_size)
+        pid_n = (tile_id % width) // group_size
+
+        rm = pid_m * BLOCK_M
+        rn = pid_n * BLOCK_N
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for rk in tl.range(0, K, BLOCK_K):
+            rm_desc = rm.to(tl.int32)
+            rn_desc = rn.to(tl.int32)
+            rk_desc = rk.to(tl.int32)
+{%- if TMA_EXPERIMENTAL_API %}
+            a = tl._experimental_descriptor_load(
+                a_desc_ptr,
+                [rm_desc, rk_desc] if A_ROW_MAJOR else [rk_desc, rm_desc],
+                [BLOCK_M, BLOCK_K] if A_ROW_MAJOR else [BLOCK_K, BLOCK_M],
+                A_ptr.dtype.element_ty,
+            )
+            b = tl._experimental_descriptor_load(
+                b_desc_ptr,
+                [rk_desc, rn_desc] if B_ROW_MAJOR else [rn_desc, rk_desc],
+                [BLOCK_K, BLOCK_N] if B_ROW_MAJOR else [BLOCK_N, BLOCK_K],
+                B_ptr.dtype.element_ty,
+            )
+{%- else %}
+            a = tl.load_tensor_descriptor(
+                a_desc, [rm_desc, rk_desc] if A_ROW_MAJOR else [rk_desc, rm_desc]
+            )
+            b = tl.load_tensor_descriptor(
+                b_desc, [rk_desc, rn_desc] if B_ROW_MAJOR else [rn_desc, rk_desc]
+            )
+{%- endif %}
+            left = a if A_ROW_MAJOR else a.T
+            right = b if B_ROW_MAJOR else b.T
+            if FAST_ACCUM:
+                acc = tl.dot(left, right, acc, allow_tf32=ALLOW_TF32)
+            else:
+                acc += tl.dot(left, right, allow_tf32=ALLOW_TF32)
+
+        # The origins are recomputed rather than carried: they are two scalars
+        # that would otherwise occupy registers across the whole contraction,
+        # and the tile is finished with them the moment the accumulator is.
+        rm = pid_m * BLOCK_M
+        rn = pid_n * BLOCK_N
+        rcm = rm + tl.arange(0, BLOCK_M)
+        rcn = rn + tl.arange(0, BLOCK_N)
+        mask = (rcm[:, None] < M) & (rcn[None, :] < N)
+        tl.store(
+            C_ptr + rcm[:, None] * {{ stride("C", 0) }} + rcn[None, :] * {{ stride("C", 1) }},
+            acc, mask=mask,
+        )

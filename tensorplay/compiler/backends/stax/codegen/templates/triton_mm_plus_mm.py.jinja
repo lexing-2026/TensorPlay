@@ -1,0 +1,115 @@
+{#-
+  Two products of the same shape into one result: the two contractions are
+  walked by the same program into the same accumulator, and the result is
+  stored once.
+
+  What this is for is a call where the two products are already independent
+  tensors -- the case the compiler could not see through is two products of the
+  same extents in one region, and running them as two kernels makes each of them
+  read and write the result it could have kept.  Measured as one choice, the
+  form is compared against being two launches of the plain product and is free
+  to lose; what it cannot do is be right and slow, since the arithmetic is the
+  arithmetic.
+
+  The two contractions are the same length because the kernel indexes both with
+  one loop counter.  A call whose two contractions differ is two products and
+  not this kernel, and the caller says so before it gets here.
+-#}
+import triton
+import triton.language as tl
+
+
+{{ def_kernel("A", "B", "C", "D", outputs=("E",)) }}
+    M = {{ size("A", 0) }}
+    N = {{ size("B", 1) }}
+    K1 = {{ size("A", 1) }}
+    K2 = {{ size("C", 1) }}
+    if M * N == 0:
+        # Nothing to write, and the tiling arithmetic below would divide by
+        # zero for a grid that is empty anyway.
+        return
+
+    stride_am = {{ stride("A", 0) }}
+    stride_ak = {{ stride("A", 1) }}
+    stride_bk = {{ stride("B", 0) }}
+    stride_bn = {{ stride("B", 1) }}
+    stride_cm = {{ stride("C", 0) }}
+    stride_ck = {{ stride("C", 1) }}
+    stride_dk = {{ stride("D", 0) }}
+    stride_dn = {{ stride("D", 1) }}
+
+    pid = tl.program_id(0)
+    grid_m = (M + BLOCK_M - 1) // BLOCK_M
+    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+
+    # Programs are visited a column-block at a time within a group of rows, so
+    # that the programs running at the same moment are reading the same rows of
+    # both operands.  Shared rows are what a cache can hold on to; a flat order
+    # walks the whole first operand before coming back to the second.
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + (pid % group_size)
+    pid_n = (pid % width) // group_size
+
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    if (
+        ((stride_am == 1 and stride_ak == M) or (stride_am == K1 and stride_ak == 1))
+        and ((stride_cm == 1 and stride_ck == M) or (stride_cm == K1 and stride_ck == 1))
+    ):
+        ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+    else:
+        ram = rm % M
+    if (
+        ((stride_bk == 1 and stride_bn == K1) or (stride_bk == N and stride_bn == 1))
+        and ((stride_dk == 1 and stride_dn == K1) or (stride_dk == N and stride_dn == 1))
+    ):
+        rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+    else:
+        rbn = rn % N
+
+    rk = tl.arange(0, BLOCK_K)
+    a_ptrs = A_ptr + ram[:, None] * stride_am + rk[None, :] * stride_ak
+    b_ptrs = B_ptr + rk[:, None] * stride_bk + rbn[None, :] * stride_bn
+    c_ptrs = C_ptr + ram[:, None] * stride_cm + rk[None, :] * stride_ck
+    d_ptrs = D_ptr + rk[:, None] * stride_dk + rbn[None, :] * stride_dn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k_remaining in range(K1, 0, -BLOCK_K):
+        if EVEN_K:
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
+        else:
+            a = tl.load(a_ptrs, mask=rk[None, :] < k_remaining, other=0.0)
+            b = tl.load(b_ptrs, mask=rk[:, None] < k_remaining, other=0.0)
+{% if allow_tf32 %}
+        acc = tl.dot(a, b, acc, input_precision="tf32")
+{% else %}
+        acc = tl.dot(a, b, acc, input_precision="ieee")
+{% endif %}
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    for k_remaining in range(K2, 0, -BLOCK_K):
+        if EVEN_K:
+            c = tl.load(c_ptrs)
+            d = tl.load(d_ptrs)
+        else:
+            c = tl.load(c_ptrs, mask=rk[None, :] < k_remaining, other=0.0)
+            d = tl.load(d_ptrs, mask=rk[:, None] < k_remaining, other=0.0)
+{% if allow_tf32 %}
+        acc = tl.dot(c, d, acc, input_precision="tf32")
+{% else %}
+        acc = tl.dot(c, d, acc, input_precision="ieee")
+{% endif %}
+        c_ptrs += BLOCK_K * stride_ck
+        d_ptrs += BLOCK_K * stride_dk
+
+    c_mask = (rm[:, None] < M) & (rn[None, :] < N)
+    e = acc.to(E_ptr.dtype.element_ty)
+    tl.store(
+        E_ptr + rm[:, None] * {{ stride("E", 0) }} + rn[None, :] * {{ stride("E", 1) }},
+        e,
+        mask=c_mask,
+    )

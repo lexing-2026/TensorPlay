@@ -31,7 +31,7 @@ from .index_expr import (
     Where,
     free_symbols,
 )
-from ..kernel_scheduler import (
+from ..loop_fusion import (
     BODY as _BODY,
     EPILOGUE as _EPILOGUE,
     PROLOGUE as _PROLOGUE,
@@ -42,7 +42,9 @@ from ..kernel_scheduler import (
     emission_regions,
     placement,
 )
-from ..loops import Buffer, Value, dtype_name
+from ..ir import Buffer
+from ..loops import Value, dtype_name, promotes_on_load
+from .common import BasicMathOpsMixin, OpOverrides
 
 try:  # pragma: no cover - availability is a runtime condition
     import triton
@@ -297,63 +299,230 @@ def _is_inner_reduction(node: LoopNode, buffers: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def render_index(expr: Expr, xvar: str, rvar: str | None) -> str:
+def render_index(expr, xvar: str, rvar: str | None) -> str:
     """Render kernel index arithmetic.
 
-    Loop indices are non-negative, so the algebra's floor division is the
-    truncating one.  The piecewise form only appears when a division could
-    not be folded away against the loop extents.
+    The two loop variables are written under the names the kernel body gives
+    them, and everything else is the arithmetic between them.  A division and
+    a strided walk are written with the integer operators the body already
+    uses, so what the arithmetic looks like in the source is what it evaluates
+    to.  A reduction index outside a reduction loop has no name to be written
+    under, which is a form the body cannot express.
     """
 
-    if isinstance(expr, Const):
-        return str(expr.value)
-    if isinstance(expr, Symbol):
-        if expr is XINDEX:
-            return xvar
-        if expr is RINDEX:
-            if rvar is None:
-                raise PlanError("a reduction index outside a reduction loop")
-            return rvar
-        return expr.name
-    if isinstance(expr, Add):
-        parts = []
-        for term, coeff in expr.terms.items():
-            rendered = render_index(term, xvar, rvar)
-            if coeff == 1:
-                parts.append(rendered)
-            elif coeff == -1:
-                parts.append(f"-({rendered})")
-            else:
-                parts.append(f"{coeff}*({rendered})")
-        if expr.offset:
-            parts.append(str(expr.offset))
-        return "(" + " + ".join(parts) + ")" if parts else "0"
-    if isinstance(expr, Mul):
-        return f"{expr.scalar}*({render_index(expr.operand, xvar, rvar)})"
-    if isinstance(expr, FloorDiv):
-        numerator = render_index(expr.numerator, xvar, rvar)
-        if expr.divisor == 1:
-            return numerator
-        return f"(({numerator}) // {expr.divisor})"
+    import sympy
+    from tensorplay.graph.experimental.sympy_functions import (
+        FloorDiv,
+        ModularIndexing,
+    )
+
+    if rvar is None and RINDEX in sympy.sympify(expr).free_symbols:
+        raise PlanError("a reduction index outside a reduction loop")
+
     if isinstance(expr, ModularIndexing):
-        base = render_index(expr.base, xvar, rvar)
-        if expr.divisor != 1:
-            base = f"(({base}) // {expr.divisor})"
-        return f"(({base}) % {expr.modulus})"
-    if isinstance(expr, Where):
-        return (
-            f"tl.where({render_index(expr.condition, xvar, rvar)}, "
-            f"{render_index(expr.left, xvar, rvar)}, "
-            f"{render_index(expr.right, xvar, rvar)})"
-        )
-    raise PlanError(f"unrenderable index expression: {expr!r}")
+        base, divisor, modulus = expr.args
+        rendered = render_index(base, xvar, rvar)
+        if divisor != 1:
+            rendered = f"(({rendered}) // {render_index(divisor, xvar, rvar)})"
+        return f"(({rendered}) % {render_index(modulus, xvar, rvar)})"
+    if isinstance(expr, sympy.Mod):
+        left, right = expr.args
+        return f"(({render_index(left, xvar, rvar)}) % {render_index(right, xvar, rvar)})"
+    if isinstance(expr, sympy.Add):
+        parts = [render_index(a, xvar, rvar) for a in expr.args]
+        return "(" + " + ".join(parts) + ")"
+    if isinstance(expr, sympy.Mul):
+        parts = []
+        for a in expr.args:
+            if isinstance(a, sympy.Integer) and a < 0:
+                parts.append(f"-({render_index(-a, xvar, rvar)})")
+            else:
+                parts.append(render_index(a, xvar, rvar))
+        return " * ".join(f"({p})" for p in parts)
+    if isinstance(expr, (FloorDiv, sympy.floor)):
+        left, right = expr.args
+        return f"(({render_index(left, xvar, rvar)}) // {render_index(right, xvar, rvar)})"
+    if expr == XINDEX:
+        return xvar
+    if expr == RINDEX:
+        return rvar or ""
+    if isinstance(expr, sympy.Integer):
+        return str(int(expr))
+    if isinstance(expr, sympy.Symbol):
+        return expr.name
+    return sympy.sstr(sympy.sympify(expr))
+
+
+_COMPARISON_OPS = frozenset({"lt", "le", "gt", "ge", "eq", "ne"})
+
+
+class TritonOverrides(OpOverrides):
+    """How the accelerator spells each operator.
+
+    Context-free spellings only: an operator whose text depends on where in
+    the tile it is written -- a load, an index, a select -- is the emitter's
+    own, and this says so by not answering for it.  The arithmetic and the
+    comparisons are the same text wherever they appear, so they are written
+    once here and every kernel prints them the same way.
+    """
+
+    #: The two-operand operators, including the ones the mixin spells: the
+    #: set is what says how many operands a method takes.
+    BINARY = frozenset({
+        "add", "sub", "mul", "truediv", "div", "maximum", "minimum", "pow",
+        "lt", "le", "gt", "ge", "eq", "ne", "and_",
+    })
+
+    _COMPARE_SYMBOL = {"lt": "<", "le": "<=", "gt": ">", "ge": ">=",
+                       "eq": "==", "ne": "!="}
+
+    div = BasicMathOpsMixin.truediv
+
+    def maximum(self, a, b):
+        return f"tl.maximum({a}, {b})"
+
+    def minimum(self, a, b):
+        return f"tl.minimum({a}, {b})"
+
+    def pow(self, a, b):
+        return f"libdevice.pow({a}, {b})"
+
+    def lt(self, a, b):
+        return f"({a} < {b})"
+
+    def le(self, a, b):
+        return f"({a} <= {b})"
+
+    def gt(self, a, b):
+        return f"({a} > {b})"
+
+    def ge(self, a, b):
+        return f"({a} >= {b})"
+
+    def eq(self, a, b):
+        return f"({a} == {b})"
+
+    def ne(self, a, b):
+        return f"({a} != {b})"
+
+    def to_dtype(self, a):
+        return f"{a}"
+
+    def constant(self, value):
+        return repr(value)
+
+    # The element-wise forms the generic table reaches for.  Each is written
+    # here in the accelerator's own terms, because the generic form is a
+    # recorded operation rather than text, and text is what a printed body is
+    # made of.
+
+    def relu(self, x):
+        return f"tl.maximum({x}, 0)"
+
+    def sigmoid(self, x):
+        return f"tl.sigmoid({x})"
+
+    def abs(self, x):
+        return f"libdevice.abs({x})"
+
+    def exp(self, x):
+        return f"libdevice.exp({x})"
+
+    def exp2(self, x):
+        return f"libdevice.exp2({x})"
+
+    def expm1(self, x):
+        return f"libdevice.expm1({x})"
+
+    def log(self, x):
+        return f"libdevice.log({x})"
+
+    def log2(self, x):
+        return f"libdevice.log2({x})"
+
+    def log10(self, x):
+        return f"libdevice.log10({x})"
+
+    def log1p(self, x):
+        return f"libdevice.log1p({x})"
+
+    def sqrt(self, x):
+        return f"tl.sqrt_rn({x})"
+
+    def rsqrt(self, x):
+        return f"libdevice.rsqrt({x})"
+
+    def floor(self, x):
+        return f"libdevice.floor({x})"
+
+    def ceil(self, x):
+        return f"libdevice.ceil({x})"
+
+    def trunc(self, x):
+        return f"libdevice.trunc({x})"
+
+    def sin(self, x):
+        return f"libdevice.sin({x})"
+
+    def cos(self, x):
+        return f"libdevice.cos({x})"
+
+    def tan(self, x):
+        return f"libdevice.tan({x})"
+
+    def sinh(self, x):
+        return f"libdevice.sinh({x})"
+
+    def cosh(self, x):
+        return f"libdevice.cosh({x})"
+
+    def tanh(self, x):
+        return f"libdevice.tanh({x})"
+
+    def erf(self, x):
+        return f"libdevice.erf({x})"
+
+    def erfc(self, x):
+        return f"libdevice.erfc({x})"
+
+    def erfcx(self, x):
+        return f"libdevice.erfcx({x})"
+
+    def square(self, x):
+        return f"({x} * {x})"
+
+    def reciprocal(self, x):
+        return f"(1 / {x})"
+
+    def isnan(self, x):
+        return f"libdevice.isnan({x}).to(tl.int1)"
+
+    def isinf(self, x):
+        return f"libdevice.isinf({x}).to(tl.int1)"
+
+    def bitwise_and(self, a, b):
+        return f"({a} & {b})"
+
+    def bitwise_or(self, a, b):
+        return f"({a} | {b})"
+
+    def bitwise_xor(self, a, b):
+        return f"({a} ^ {b})"
+
+    def bitwise_not(self, a):
+        return f"(~{a})"
+
+
+#: The accelerator's operator table.
+OVERRIDES = TritonOverrides()
 
 
 class _Group:
     """Emits the source of one fused kernel."""
 
-    def __init__(self, group: FusedGroup, buffers: dict, stored: set, config: LaunchConfig):
+    def __init__(self, group: FusedGroup, buffers: dict, stored: set, config: LaunchConfig, sizevars=None):
         self.group = group
+        self.sizevars = sizevars
         self.buffers = buffers
         self.stored = stored
         self.config = config
@@ -364,7 +533,7 @@ class _Group:
         self.ptr_order: list = []
         self.placements = {}
         for node in group.nodes:
-            place = placement(node, group.xnumel, group.rnumel)
+            place = placement(node, group.xnumel, group.rnumel, self.sizevars)
             if place is None:
                 raise PlanError("a fused node does not fit the kernel iteration space")
             self.placements[id(node)] = place
@@ -534,28 +703,17 @@ class _Group:
                 f"({self.value(args[0], node, dim)} & "
                 f"{self.value(args[1], node, dim)})"
             )
-        if op in ("add", "sub", "mul", "truediv", "maximum", "minimum", "pow"):
-            left = self.operand(args[0], node, dim, value.dtype)
-            right = self.operand(args[1], node, dim, value.dtype)
-            if op == "add":
-                return f"({left} + {right})"
-            if op == "sub":
-                return f"({left} - {right})"
-            if op == "mul":
-                return f"({left} * {right})"
-            if op == "truediv":
-                return f"({left} / {right})"
-            if op == "maximum":
-                return f"tl.maximum({left}, {right})"
-            if op == "minimum":
-                return f"tl.minimum({left}, {right})"
-            return f"libdevice.pow({left}, {right})"
-        if op in ("lt", "le", "gt", "ge", "eq", "ne"):
-            symbol = {"lt": "<", "le": "<=", "gt": ">", "ge": ">=", "eq": "==", "ne": "!="}[op]
-            # A comparison keeps its operand types; only its result is boolean.
-            left = self.value(args[0], node, dim)
-            right = self.value(args[1], node, dim)
-            return f"({left} {symbol} {right})"
+        if OVERRIDES.knows(op):
+            if op in OVERRIDES.BINARY:
+                # A comparison keeps its operand types; only its result is
+                # boolean, so its operands are spelled without a cast.
+                spelled = (self.value(args[0], node, dim) if op in _COMPARISON_OPS
+                           else self.operand(args[0], node, dim, value.dtype),
+                           self.value(args[1], node, dim) if op in _COMPARISON_OPS
+                           else self.operand(args[1], node, dim, value.dtype))
+            else:
+                spelled = (self.operand(args[0], node, dim, value.dtype),)
+            return OVERRIDES.expression(op, *spelled)
         return self.unary(value, node, dim)
 
     def unary(self, value: Value, node: LoopNode, dim: int) -> str:
@@ -612,14 +770,21 @@ class _Group:
         if shared is not None:
             return shared
         variable = self.tmp("in")
+        stored = dtype_name(buffer.get_dtype())
         if cond is None:
-            self.emit(f"{variable} = tl.load({self.ptr(name)} + {address})")
+            source = f"tl.load({self.ptr(name)} + {address})"
         else:
-            other = _zero(dtype_name(buffer.get_dtype()))
-            self.emit(
-                f"{variable} = tl.load({self.ptr(name)} + {address}, "
-                f"mask={cond}, other={other})"
+            source = (
+                f"tl.load({self.ptr(name)} + {address}, "
+                f"mask={cond}, other={_zero(stored)})"
             )
+        # A program evaluates at one arithmetic width.  Narrow storage is
+        # lifted when it is read, which is the one place the width is decided:
+        # whether a storage kind is lifted at all is asked of the same
+        # declaration every other lowering asks.
+        if promotes_on_load(stored):
+            source = f"({source}).to(tl.float32)"
+        self.emit(f"{variable} = {source}")
         self.loads[key] = variable
         return variable
 
@@ -797,10 +962,10 @@ _PREAMBLE = (
 )
 
 
-def emit_group_source(group: FusedGroup, buffers: dict, stored: set, config: LaunchConfig) -> tuple:
+def emit_group_source(group: FusedGroup, buffers: dict, stored: set, config: LaunchConfig, sizevars=None) -> tuple:
     """Return ``(kernel_name, source, pointer_names)`` for one fused group."""
 
-    g = _Group(group, buffers, stored, config)
+    g = _Group(group, buffers, stored, config, sizevars)
     g.run()
     xnumel = int(group.xnumel)
     rnumel = int(group.rnumel)
@@ -929,19 +1094,20 @@ def compile_group(
     buffers: dict,
     stored: set,
     config: LaunchConfig,
+    sizevars=None,
 ) -> tuple:
     """Emit, cache and exec one kernel; returns ``(launcher, pointer_names)``."""
 
     if not HAS_TRITON:
         raise PlanError("Triton is not available")
-    kernel_name, source, ptr_names = emit_group_source(group, buffers, stored, config)
+    kernel_name, source, ptr_names = emit_group_source(group, buffers, stored, config, sizevars)
     # The name is a digest of the body, the config and the pointers, so a
     # cached launcher can only ever be reused for an identical kernel.
     hit = _launch_memo.get(kernel_name)
     if hit is not None:
         return hit
     try:
-        from ..codecache import default_cache
+        from ..kernel_cache import default_cache
 
         cache = default_cache("triton")
         cache_key = cache.cache_key(source)
@@ -969,29 +1135,6 @@ def compile_group(
 # Reductions whose entire space fits one tile skip the r-loop entirely
 # (persistent-reduction shape): no loop-carried acc, one reduce.
 _PERSISTENT_RNUMEL_MAX = 512
-
-
-def emit_tile_epilogue_lines(
-    program: list[int], constants: list[float], esrc: int, source_reg: str
-) -> tuple[list[str], str]:
-    """Emit a pointwise chain applied to one tile register.
-
-    The store-time epilogue renderer shared by reduction tails and the GEMM
-    tile: ``esrc`` names the chain's single tensor input (mapped onto
-    ``source_reg``, the register already holding the pre-epilogue value);
-    negatives index epilogue constants; other positive refs are temporaries
-    numbered from 1.  Returns the source lines and the final register
-    holding the chain result.
-    """
-
-    if len(program) % 3:
-        raise ValueError("epilogue program must contain triples")
-    # The instance only carries the payload the shared instruction renderer
-    # reads (``_epilogue_lines`` touches nothing else); no kernel is
-    # generated from it.
-    emitter = object.__new__(TritonProgramCodegen)
-    emitter.epilogue = (program, constants, esrc)
-    return emitter._epilogue_lines(source_reg)
 
 
 #: The accelerator's own spelling of the helper the tile pass shares.

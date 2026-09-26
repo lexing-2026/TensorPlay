@@ -1,0 +1,114 @@
+{#-
+  The weight's gradient: one product per tap, over the output's positions.
+
+  Every tap is a separate product contracting the output's positions, and they
+  differ only in which input position each output position read -- which is
+  known here without inverting anything, because the forward's window is
+  walked forwards here.  So the tap indexes the weight rather than the
+  accumulation: one accumulator is reused per tap and stored per tap, because a
+  kernel-wide tile per tap would need a register per tap and the number of taps
+  is the kernel's area.
+
+  The rows are therefore output channels, the columns input channels, and the
+  contraction is every position in the batch and the image -- which is why the
+  positions are numbered flat and decoded inside the loop rather than tiled
+  over: a tile over positions would have to be gathered, and the gather is what
+  this direction is avoiding.
+-#}
+import triton
+import triton.language as tl
+
+{#- The index type travels with the launch rather than with the body: it is a
+    property of the call, and a body that narrows an index has to name the type
+    it narrows to. #}
+INDEX_DTYPE = {{ index_dtype }}
+
+
+{{ def_kernel("DY", "X", outputs=("DW",)) }}
+    n = {{ size("DY", 0) }}
+    h = {{ size("X", 2) }}
+    width = {{ size("X", 3) }}
+    in_c = {{ size("X", 1) }}
+    out_c = {{ size("DY", 1) }}
+    out_h = {{ size("DY", 2) }}
+    out_width = {{ size("DY", 3) }}
+
+    stride_dyn = {{ stride("DY", 0) }}
+    stride_dyc = {{ stride("DY", 1) }}
+    stride_dyh = {{ stride("DY", 2) }}
+    stride_dyw = {{ stride("DY", 3) }}
+
+    stride_xn = {{ stride("X", 0) }}
+    stride_xc = {{ stride("X", 1) }}
+    stride_xh = {{ stride("X", 2) }}
+    stride_xw = {{ stride("X", 3) }}
+
+    stride_dwon = {{ stride("DW", 0) }}
+    stride_dwoc = {{ stride("DW", 1) }}
+    stride_dwoi = {{ stride("DW", 2) }}
+    stride_dwoh = {{ stride("DW", 3) }}
+
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+{#- One group is not a group: the whole of an operand belongs to it, so the
+    program axis that walks the groups has nothing to walk and is not read. -#}
+{% if GROUPS == 1 %}
+    group = 0
+{% else %}
+    group = tl.program_id(2).to(INDEX_DTYPE)
+{% endif %}
+
+    lane_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    lane_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    out_channel = group * GROUP_OUT_C + lane_m
+    in_channel = group * GROUP_IN_C + lane_n
+    mask_m = lane_m < GROUP_OUT_C
+    mask_n = lane_n < GROUP_IN_C
+    positions = n * out_h * out_width
+
+    for ky in tl.static_range(KERNEL_H):
+        for kx in tl.static_range(KERNEL_W):
+            acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+            for k in range(0, tl.cdiv(positions, BLOCK_K)):
+                flat = k * BLOCK_K + tl.arange(0, BLOCK_K)
+                idx_n = flat // (out_h * out_width)
+                rest = flat % (out_h * out_width)
+                oh = rest // out_width
+                ow = rest % out_width
+                idx_h = oh * STRIDE_H - PADDING_H + ky * DILATION_H
+                idx_w = ow * STRIDE_W - PADDING_W + kx * DILATION_W
+                keep = (
+                    (flat < positions)
+                    & (idx_n < n)
+                    & (idx_h >= 0) & (idx_h < h)
+                    & (idx_w >= 0) & (idx_w < width)
+                )
+                dy_ptrs = DY_ptr + (
+                    (idx_n * stride_dyn)[:, None]
+                    + (oh * stride_dyh)[:, None]
+                    + (ow * stride_dyw)[:, None]
+                    + (out_channel * stride_dyc)[None, :]
+                )
+                matrix_dy = tl.load(
+                    dy_ptrs, mask=keep[:, None] & mask_m[None, :], other=0.0
+                )
+                x_ptrs = X_ptr + (
+                    (idx_n * stride_xn)[:, None]
+                    + (idx_h * stride_xh)[:, None]
+                    + (idx_w * stride_xw)[:, None]
+                    + (in_channel * stride_xc)[None, :]
+                )
+                matrix_x = tl.load(
+                    x_ptrs, mask=keep[:, None] & mask_n[None, :], other=0.0
+                )
+                acc += tl.dot(tl.trans(matrix_dy), matrix_x, allow_tf32=ALLOW_TF32)
+            tl.store(
+                DW_ptr + (
+                    (out_channel * stride_dwon)[:, None]
+                    + (lane_n * stride_dwoc)[None, :]
+                    + ky * stride_dwoi
+                    + kx * stride_dwoh
+                ),
+                acc,
+                mask=mask_m[:, None] & mask_n[None, :],
+            )

@@ -1,5 +1,6 @@
 """Functional interface."""
 
+import enum
 import math
 import os
 import warnings
@@ -4398,3 +4399,39 @@ def max_unpool3d(
     padding = _triple(padding)
     output_size = _unpool_output_size(input, kernel_size, _stride, padding, output_size)
     return _C.max_unpool3d(input, indices, list(output_size), list(_stride), list(padding))
+
+
+class ScalingType(enum.Enum):
+    """How a scale is spread across the values it scales.
+
+    A scale is not one thing: one number for a whole tile, one per row, one per
+    row of blocks, and one per square block are four different scales, and a
+    kernel that reads one of them reads the others wrongly rather than not at
+    all.  So the shape a scale has is named, and a kernel is told which name it
+    is being handed.
+
+    The names are the shapes' own rather than the algorithms' -- ``BlockWise1x128``
+    says one scale per row of blocks with 128 in the other direction, and says
+    nothing about how a kernel is to read it.  That is deliberate: a fifth shape
+    would be a fifth name here and a fifth branch in every kernel that reads one.
+    """
+
+    #: One number for the whole tile.
+    TensorWise = "tensorwise"
+    #: One number per row of the side being scaled.
+    RowWise = "rowwise"
+    #: One number per row of blocks, and 128 within a row.
+    BlockWise1x128 = "blockwise1x128"
+    #: One number per 128 by 128 block.
+    BlockWise128x128 = "blockwise128x128"
+    #: One number per row of blocks, and 32 within a row.
+    #:
+    #: The narrow block is what a format with a scale per group of values uses,
+    #: where the group's own scale is itself a value of that format rather than a
+    #: number.  It is named here so that a call using it is *recognised* as using
+    #: it -- which is what lets the call be handed to the operation that can
+    #: compute it, rather than to a template that would read the group scale as
+    #: if it were the only one.
+    BlockWise1x32 = "blockwise1x32"
+    #: One number per row of blocks, and 16 within a row.
+    BlockWise1x16 = "blockwise1x16"

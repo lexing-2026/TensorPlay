@@ -15,18 +15,42 @@ a lowering runs as a library call on realized inputs.
 
 from __future__ import annotations
 
+import functools
+import itertools
+import logging
 import math
 import operator
+from numbers import Number
 from typing import Any, Callable
 
-from .loops import (
+import sympy
+
+import tensorplay as tp
+
+from .utils import register_op_dtype_propagation_rules
+
+from tensorplay.primitives.common import ELEMENTWISE_TYPE_PROMOTION_KIND
+from .dtype_propagation import get_promoted_dtype
+from tensorplay.utils._pytree import tree_map
+
+from .ir import (
     Buffer,
-    Const,
+    Constant as ir_Constant,
+    DeviceCopy,
+    ExpandView,
+    FixedLayout,
+    FallbackKernel,
+    IRNode,
     Pointwise,
     Reduction,
+    ReinterpretView,
+    StorageBox,
     TensorBox,
-    V,
     View,
+    has_free_unbacked_symbols,
+)
+from .loops import (
+    V,
     as_index,
     contiguous_strides,
     dtype_name,
@@ -36,16 +60,418 @@ from .loops import (
     prod,
 )
 
+log = logging.getLogger(__name__)
+
 LOWERINGS: dict[str, Callable[..., Any]] = {}
+
+#: Lowerings a program supplied for its own operations, by the operation rather
+#: than by the name it is called under.  Kept apart from the built-in lowerings
+#: because it is consulted first: an operation a program wrote a lowering for is
+#: that program's own, and the built-in lowering of a name it happens to share
+#: describes a different operation that goes by the same name.
+user_lowerings: dict[Any, Callable[..., Any]] = {}
+
+
+#: The promotion each operation's operands go through, for the operations whose
+#: result is the promotion of what they were given.  An operation that is not
+#: here either says what it produces or is one of the special functions, whose
+#: promotion is recorded beside the spelling of each of them.
+POINTWISE_TYPE_PROMOTION_KIND: dict = {}
+
+
+#: The operations that have no lowering of their own and are computed by the
+#: framework instead.  A call to one of these reaches the framework whole, which
+#: is slower than a kernel and correct, and the point of recording it is that the
+#: set is what a caller checks before deciding something can be done here.
+FALLBACKS: set = set()
+
+
+def select_decomp_table() -> dict:
+    """The decompositions a captured graph may be written in terms of.
+
+    Asked for rather than imported, because which decompositions are available
+    depends on how the program was configured, and a graph captured against one
+    set and compiled against another would have operations in it that no longer
+    have a meaning.  So the set is chosen at the moment of capture and travels
+    with the capture.
+    """
+
+    from tensorplay._decomp import decomposition_table
+
+    return dict(decomposition_table)
+
+
+def in_namespace(op: Any, namespace: str) -> bool:
+    """Whether an operation belongs to a namespace.
+
+    Asked by name rather than by where it was found, because the same operation
+    is reached from several places and only its own name says where it lives.
+    """
+
+    qualified = getattr(op, "_qualified_op_name", None)
+    if qualified is not None:
+        return namespace in qualified
+    name = getattr(op, "name", None)
+    if callable(name):
+        return namespace in name()
+    return False
+
+
+def fallback_handler(kernel, add_to_fallback_set: bool = True):
+    """A way to compute an operation by handing the whole call to the framework.
+
+    Returned rather than registered, because whether an operation should be
+    computed this way is a decision made where the operation is lowered, not one
+    made for the operation: the same operation is a fallback in one place and a
+    kernel in another, and only the place that knows which can say.
+
+    The arguments are wrapped first, because a lowered value is not the value
+    itself and the framework wants the value -- so a call that is only being
+    handed over still has to give the framework something it can read.
+    """
+
+    if add_to_fallback_set:
+        FALLBACKS.add(kernel)
+
+    def handler(*args, **kwargs):
+        def wrap_tensors(x):
+            return x.wrap_for_lowering() if isinstance(x, IRNode) else x
+
+        return tree_map(
+            wrap_tensors, FallbackKernel.create(kernel, *args, **kwargs)
+        )
+
+    return handler
+
+
+def broadcast_symbolic_shapes(a, b):
+    """The shape two shapes broadcast to, said as far as it can be said exactly.
+
+    A shape of zero or one takes the other side's extent, whichever it is, because
+    a value repeated once is that value and a value repeated never is nothing.
+    Beyond that the two extents have to agree, and of the two ways of saying they
+    agree the shorter formula is kept -- which is not a preference but a fact
+    about what a kernel can be checked against.
+    """
+
+    b = tuple(b)
+    if not a or a == b:
+        return b
+
+    output = []
+    for x, y in itertools.zip_longest(
+        reversed(a), reversed(b), fillvalue=sympy.S.One
+    ):
+        if V.graph.sizevars.is_size_one_or_false(y):
+            output.append(x)
+        elif V.graph.sizevars.is_size_one_or_false(x):
+            output.append(y)
+        else:
+            V.graph.sizevars.check_equals(x, y)
+            if len(sympy.expand(y).free_symbols) < len(sympy.expand(x).free_symbols):
+                output.append(y)  # prefer shorter formula
+            else:
+                output.append(x)
+    return tuple(reversed(output))
+
+
+def broadcast_tensors(*inputs):
+    """The values, each seen in the space all of them share.
+
+    A value whose shape is already the shared one is left alone; one that is not
+    is viewed into the shared shape, which is free when the value has one element
+    to repeat and a copy when it does not.  Deciding which happens per value is
+    why this returns the values and not just the shape.
+    """
+
+    if len(inputs) == 1:
+        if isinstance(inputs[0], (list, tuple)):
+            return broadcast_tensors(*inputs[0])
+        return inputs
+    target: list[sympy.Expr] = functools.reduce(
+        broadcast_symbolic_shapes, (x.get_size() for x in inputs), ()
+    )
+    outputs = []
+    for x in inputs:
+        if (sizes := tuple(x.get_size())) == target:
+            pass
+        elif len(sizes) != len(target) or any(
+            V.graph.sizevars.is_size_one_or_false(a)
+            != V.graph.sizevars.is_size_one_or_false(b)
+            for a, b in zip(sizes, target)
+        ):
+            x = ExpandView.create(x, target)
+        outputs.append(x)
+    return outputs
+
+
+def maybe_copy_cpu_scalar(x: TensorBox, device: Any) -> TensorBox:
+    """A value of no elements, or of one, moved onto the device it is used on.
+
+    Only a value with nothing to iterate is worth moving: anything larger is read
+    where it is anyway, and a copy of it would cost more than the read.  A view
+    rather than a value is left alone, because what a view holds is not what was
+    read and copying it would copy something else.
+    """
+
+    if not isinstance(x.data, ReinterpretView) or has_free_unbacked_symbols(
+        x.get_size()
+    ):
+        return x
+    size = V.graph.sizevars.guarding_hints_or_throw(x.get_size())
+    cur_device = x.get_device()
+    if (
+        cur_device is not None
+        and getattr(cur_device, "type", None) == "cpu"
+        and cur_device != device
+        and (len(size) == 0 or (len(size) == 1 and size[0] == 1))
+    ):
+        return TensorBox(StorageBox(DeviceCopy.create(x, cur_device, False)))
+    return x
+
+
+def transform_args(
+    args: list[Any],
+    kwargs: dict[str, Any],
+    broadcast: bool,
+    type_promotion_kind: Any = None,
+    convert_input_to_bool: bool = False,
+) -> tuple[list[Any], dict[str, Any]]:
+    """The arguments of a call, made to be computed together.
+
+    Three things have to be settled before a call can be computed, and all three
+    are settled here rather than in each lowering: the values have to be of one
+    type, or the result is of a type nobody asked for; they have to be seen in
+    one shape, or the result is of a shape nobody asked for; and a value of no
+    elements has to be on the device the others are on, or the call is a copy per
+    use.
+    """
+
+    args_indices = [i for i, x in enumerate(args) if isinstance(x, TensorBox)]
+    kwargs_indices = [k for k, v in kwargs.items() if isinstance(v, TensorBox)]
+    if not args_indices and (not kwargs_indices):
+        return (args, kwargs)
+    if type_promotion_kind or convert_input_to_bool:
+        if convert_input_to_bool:
+            dtype = tp.bool
+        else:
+            promoting_args = [
+                a
+                for a in args
+                if isinstance(a, (Number, sympy.Basic)) or hasattr(a, "dtype")
+            ]
+            promoting_args.extend(
+                (a for a in kwargs.values() if hasattr(a, "dtype"))
+            )
+            dtype = get_promoted_dtype(*promoting_args, type_promotion_kind=type_promotion_kind)
+        device = (
+            args[args_indices[0]] if args_indices else kwargs[kwargs_indices[0]]
+        ).get_device()
+        for i in args_indices:
+            args[i] = maybe_copy_cpu_scalar(args[i], device)
+        for k in kwargs_indices:
+            kwargs[k] = maybe_copy_cpu_scalar(kwargs[k], device)
+
+        def promote(arg: Any) -> Any:
+            if isinstance(arg, TensorBox):
+                return cast_to(arg, dtype)
+            elif isinstance(arg, ir_Constant):
+                return ir_Constant(value=arg.value, dtype=dtype, device=device)
+            else:
+                return arg
+
+        args = [promote(a) for a in args]
+        kwargs = {k: promote(v) for k, v in kwargs.items()}
+    if broadcast:
+        broadcasted = broadcast_tensors(
+            *list(
+                itertools.chain(
+                    (args[i] for i in args_indices), (kwargs[k] for k in kwargs_indices)
+                )
+            )
+        )
+        size = list(broadcasted[0].get_size())
+        for i, x in zip(args_indices, broadcasted[: len(args_indices)]):
+            args[i] = x
+        for k, x in zip(kwargs_indices, broadcasted[len(args_indices) :]):
+            kwargs[k] = x
+        for i in range(len(args)):
+            if isinstance(args[i], ir_Constant):
+                args[i] = ExpandView.create(args[i], size)
+        for k in kwargs:
+            if isinstance(kwargs[k], ir_Constant):
+                kwargs[k] = ExpandView.create(kwargs[k], size)
+    return (args, kwargs)
+
+
+def _register_lowering(
+    op: Any,
+    decomp_fn: Callable[..., Any],
+    broadcast: bool,
+    type_promotion_kind: Any,
+    convert_input_to_bool: bool,
+    lowering_dict: dict,
+):
+    """Put one operation's lowering into the table, wrapped so it is called right.
+
+    The wrapping is what makes every lowering callable the same way: a caller
+    hands over arguments as they were written, and this settles their types and
+    shapes before the lowering sees them.  A lowering that had to do that itself
+    would do it differently from every other one.
+    """
+
+    @functools.wraps(decomp_fn)
+    def wrapped(*args, **kwargs):
+        args: list[Any] = list(args)
+        kwargs: dict[str, Any] = dict(kwargs)
+        unpacked = False
+        if len(args) == 1 and isinstance(args[0], (list, tuple)):
+            unpacked = True
+            args = list(args[0])
+
+        if not all(
+            (fn in FALLBACKS or in_namespace(fn, "_collective_functional"))
+            for fn in (op if isinstance(op, (tuple, list)) else (op,))
+        ):
+            # an out= call has no lowering here, and saying so plainly beats
+            # letting it fail later as something unrelated
+            if any(x == "out" for x in kwargs):
+                raise AssertionError("out= ops aren't yet supported")
+
+        args, kwargs = transform_args(
+            args, kwargs, broadcast, type_promotion_kind, convert_input_to_bool
+        )
+
+        if unpacked:
+            args = [args]
+
+        return decomp_fn(*args, **kwargs)
+
+    lowering_dict.update(dict.fromkeys(get_overloads(op), wrapped))
+    return wrapped
+
+
+def get_overloads(op: Any) -> list[Any]:
+    """The table's keys for an operation, one for each of its forms.
+
+    A whole operation names its forms itself, and registering the operation means
+    registering every form of it -- a caller who asks for the operation has not
+    said which form it meant, and the forms differ enough that answering for the
+    wrong one would compute a different thing.  A form already in the table is
+    left out, so a form registered on its own keeps the lowering it was given.
+    """
+
+    if not isinstance(op, (list, tuple)):
+        op = [op]
+    else:
+        op = list(op)
+
+    for fn in list(op):
+        overloads = getattr(fn, "overloads", None)
+        if not callable(overloads):
+            continue
+        for other_name in overloads():
+            other_fn = getattr(fn, other_name, None)
+            if other_fn is not None and _lowering_key(other_fn) not in LOWERINGS:
+                op.append(other_fn)
+
+    return [_lowering_key(fn) for fn in op]
+
+
+def _lowering_key(op: Any) -> str:
+    """The table's key for one form of an operation.
+
+    The operation and which of its forms, because two forms of one operation are
+    two lowerings -- a call that writes its result somewhere and a call that
+    returns it are not the same call, and a table that could not tell them apart
+    could not answer either.
+    """
+
+    name = getattr(op, "__name__", None)
+    if name:
+        return name
+    overload = getattr(op, "default", None)
+    if overload is not None and getattr(overload, "__name__", None):
+        return overload.__name__
+    return str(op)
+
+
+def register_lowering(
+    op: Any,
+    broadcast: bool = False,
+    type_promotion_kind: Any = ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
+    convert_input_to_bool: bool = False,
+    lowering_dict: dict = None,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Register a lowering of one operation, to be used as a decorator.
+
+    ``broadcast`` says the operation's values are made to share a shape first,
+    and ``type_promotion_kind`` says what the result's type is -- ``None`` for an
+    operation whose result is not the promotion of what it was given, which is
+    most of the products.
+    """
+
+    return functools.partial(
+        _register_lowering,
+        op,
+        broadcast=broadcast,
+        type_promotion_kind=type_promotion_kind,
+        convert_input_to_bool=convert_input_to_bool,
+        lowering_dict=LOWERINGS if lowering_dict is None else lowering_dict,
+    )
 
 
 def register(*names: str):
+    """Register the lowering of one or more operations by name."""
+
     def wrap(fn):
         for name in names:
             LOWERINGS[name] = fn
         return fn
 
     return wrap
+
+
+def register_pointwise(
+    *names: str,
+    type_promotion_kind=None,
+    override_return_dtype=None,
+):
+    """Register a lowering that operates on one element at a time.
+
+    Registering it also states what the operation's result type is, because a
+    lowering and the type of the value it produces are two facts about the same
+    operation and are declared together: an operation registered without a
+    promotion would leave the type of its result unstated, which is caught where
+    the types of all operations are collected rather than at the point of use.
+
+    An operation that reads a number and produces a number is declared with the
+    promotion that turns a number into a number, so an integer argument does not
+    silently produce an integer where the operation means a real one.
+    """
+
+    kind = (
+        type_promotion_kind
+        if type_promotion_kind is not None
+        else ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT
+    )
+    for name in names:
+        POINTWISE_TYPE_PROMOTION_KIND[name] = kind
+        register_op_dtype_propagation_rules(name, kind, override_return_dtype)
+    return names
+
+
+def register_pointwise_numeric(*names: str):
+    """Register an operation that takes a number and produces a real number.
+
+    An integer argument does not make the result an integer: a reciprocal of an
+    integer is not an integer, and an operation that took one as such would
+    answer with a value nobody asked for.
+    """
+
+    return register_pointwise(
+        *names, type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT
+    )
 
 
 def target_name(target) -> str:
@@ -98,7 +524,7 @@ def broadcast_loader(x, out_size):
 
     def load(index):
         return loader(
-            [Const(0) if int(size[k]) == 1 else index[k + offset] for k in range(len(size))]
+            [sympy.Integer(0) if int(size[k]) == 1 else index[k + offset] for k in range(len(size))]
         )
 
     return load
@@ -112,7 +538,7 @@ def pointwise(node, fn, *inputs, val=None):
     def inner(index):
         return fn(*[load(index) for load in loaders])
 
-    return TensorBox(Pointwise(device, dtype, inner, size))
+    return Pointwise.create(device=device, dtype=dtype, inner_fn=inner, ranges=size)
 
 
 def cast_to(value, dtype):
@@ -217,11 +643,33 @@ def lower_clone(node, x, *args, **kwargs):
 
 
 def make_view(x: TensorBox, size, reindex) -> TensorBox:
-    return TensorBox(View(x, size, reindex))
+    # A view reads the value it looks at, not the box that value happens to be
+    # held in, so the box is unwrapped here.
+    if reindex is None:
+        return View.create(x, size)
+    return View(data=_underlying(x), size=size, reindex=reindex)
+
+
+def _underlying(box):
+    """The node a box holds, with the boxes themselves peeled off.
+
+    A box says what may still be written into a value; what is inside it is
+    the value.  A question about the value is a question about the node, so
+    the boxes are walked through rather than answered from.
+    """
+
+    from .ir import BaseView, MutableBox, StorageBox
+
+    node = box.data if isinstance(box, TensorBox) else box
+    while not isinstance(node, StorageBox) and isinstance(node, (BaseView, MutableBox)):
+        node = node.data
+    if isinstance(node, StorageBox):
+        node = node.data
+    return node
 
 
 def _flat_index(index, size):
-    expr = Const(0)
+    expr = sympy.Integer(0)
     for i, extent in zip(index, size):
         expr = expr * int(extent) + as_index(i)
     return expr
@@ -233,41 +681,44 @@ def _unflatten_index(flat, size):
     for extent in size:
         stride //= max(int(extent), 1)
         if int(extent) == 1:
-            out.append(Const(0))
+            out.append(sympy.Integer(0))
         elif stride == 1:
             out.append(modular_indexing(flat, 1, int(extent)) if out else flat)
         else:
-            out.append(modular_indexing(flat, stride, int(extent)) if out else floordiv(flat, Const(stride)))
+            out.append(modular_indexing(flat, stride, int(extent)) if out else floordiv(flat, sympy.Integer(stride)))
     return out
 
 
 def reshape(x: TensorBox, new_size) -> TensorBox:
+    """This value under a different shape, without moving anything if it can be.
+
+    Memory that already lies in consecutive elements is described by the new
+    shape rather than copied: the elements are where they were, and a shape, a
+    stride and an offset say how to read them as the new shape.  Memory that
+    does not lie that way has to be walked, which is a view over an index.
+    """
+
     old_size = tuple(int(s) for s in x.get_size())
     new_size = tuple(int(s) for s in new_size)
     if old_size == new_size:
         return x
-    node = x.node
+    node = _underlying(x)
     if isinstance(node, Buffer) and node.layout.is_contiguous():
-        # A contiguous buffer is addressed by the flat element index.
-        name = node.name
-        offset = node.layout.offset
-
-        def loader_reindex(index):
-            return _flat_index(index, new_size)
-
-        class _FlatView(View):
-            def make_loader(self):
-                def loader(index):
-                    return ops.load(name, offset + loader_reindex(index))
-
-                return loader
-
-        return TensorBox(_FlatView(x, new_size, loader_reindex))
-
-    def reindex(index):
-        return _unflatten_index(_flat_index(index, new_size), old_size)
-
-    return make_view(x, new_size, reindex)
+        settled = node.layout.as_fixed()
+        return TensorBox(
+            ReinterpretView(
+                data=node,
+                layout=FixedLayout(
+                    settled.device,
+                    settled.dtype,
+                    new_size,
+                    contiguous_strides(new_size),
+                    settled.offset,
+                    settled.is_pinned,
+                ),
+            )
+        )
+    return View.create(x, new_size)
 
 
 def _resolve_size(size, numel):
@@ -280,7 +731,7 @@ def _resolve_size(size, numel):
 
 @register("view.default", "reshape.default", "_unsafe_view.default", "view.dtype_unused")
 def lower_view(node, x, size):
-    return reshape(x, _resolve_size(size, x.numel()))
+    return reshape(x, _resolve_size(size, x.get_numel()))
 
 
 @register("permute.default")
@@ -351,7 +802,7 @@ def lower_squeeze(node, x, dim=None):
 
     def reindex(index):
         it = iter(index)
-        return [Const(0) if d in dims else next(it) for d in range(rank)]
+        return [sympy.Integer(0) if d in dims else next(it) for d in range(rank)]
 
     return make_view(x, new_size, reindex)
 
@@ -364,7 +815,7 @@ def lower_expand(node, x, size, *args, **kwargs):
     size = [old[d - offset] if s == -1 else s for d, s in enumerate(size)]
 
     def reindex(index):
-        return [Const(0) if old[k] == 1 else index[k + offset] for k in range(len(old))]
+        return [sympy.Integer(0) if old[k] == 1 else index[k + offset] for k in range(len(old))]
 
     return make_view(x, size, reindex)
 
@@ -479,7 +930,7 @@ def lower_cat(node, tensors, dim=0):
             value = loaded if value is None else ops.where(cond, loaded, value)
         return value
 
-    return TensorBox(Pointwise(device, dtype, inner, size))
+    return Pointwise.create(device=device, dtype=dtype, inner_fn=inner, ranges=size)
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +939,7 @@ def lower_cat(node, tensors, dim=0):
 
 
 def make_reduction(x: TensorBox, dims, keepdim, dtype, device, rtype="sum", prologue=None) -> TensorBox:
+    src_dtype = x.get_dtype()
     size = list(x.get_size())
     rank = len(size)
     dims = sorted({normalize_dim(d, rank) for d in dims})
@@ -504,7 +956,15 @@ def make_reduction(x: TensorBox, dims, keepdim, dtype, device, rtype="sum", prol
             value = prologue(value, full)
         return value
 
-    box = TensorBox(Reduction(device, dtype, inner, out_ranges, red_ranges, rtype))
+    box = Reduction.create(
+        device=device,
+        dst_dtype=dtype,
+        src_dtype=src_dtype,
+        inner_fn=inner,
+        ranges=out_ranges,
+        reduction_ranges=red_ranges,
+        reduction_type=rtype,
+    )
     box.realize()
     if keepdim:
         kept = [1 if d in dims else size[d] for d in range(rank)]
@@ -581,10 +1041,16 @@ def lower_native_group_norm(node, x, weight, bias, n, c, hxw, groups, eps):
     def welford_inner(index, rindex):
         return ops.to_dtype(rows_loader([index[0], index[1], rindex[0]]), "float32")
 
-    stats = TensorBox(
-        Reduction(device, stat_dtype, welford_inner, (n, groups), (row,), "welford")
+    stats = Reduction.create(
+        device=device,
+        dst_dtype=stat_dtype,
+        src_dtype=stat_dtype,
+        inner_fn=welford_inner,
+        ranges=(n, groups),
+        reduction_ranges=(row,),
+        reduction_type='welford',
     )
-    mean_buf, m2_buf = V.graph.register_welford(stats.node)
+    mean_buf, m2_buf = V.graph.register_welford(_underlying(stats))
     mean_box = TensorBox(mean_buf)
     m2_loader = TensorBox(m2_buf).make_loader()
     mean_loader = mean_box.make_loader()
@@ -593,9 +1059,12 @@ def lower_native_group_norm(node, x, weight, bias, n, c, hxw, groups, eps):
         var = ops.truediv(m2_loader(ng), ops.constant(float(row), "float32"))
         return ops.rsqrt(ops.add(var, ops.constant(float(eps), "float32")))
 
-    rstd_box = TensorBox(
-        Pointwise(device, stat_dtype, lambda idx: rstd_at(idx), (n, groups))
-    )
+    rstd_box = Pointwise.create(
+            device=device,
+            dtype=stat_dtype,
+            inner_fn=lambda idx: rstd_at(idx),
+            ranges=(n, groups),
+        )
     x_loader = x.make_loader()
     w_loader = weight.make_loader() if is_tensor_box(weight) else None
     b_loader = bias.make_loader() if is_tensor_box(bias) else None
@@ -603,7 +1072,7 @@ def lower_native_group_norm(node, x, weight, bias, n, c, hxw, groups, eps):
 
     def out_inner(index):
         channel = index[1]
-        group = floordiv(as_index(channel), Const(cpg))
+        group = floordiv(as_index(channel), sympy.Integer(cpg))
         ng = [index[0], group]
         value = ops.to_dtype(x_loader(index), "float32")
         value = ops.mul(ops.sub(value, mean_loader(ng)), rstd_at(ng))
@@ -613,7 +1082,7 @@ def lower_native_group_norm(node, x, weight, bias, n, c, hxw, groups, eps):
             value = ops.add(value, b_loader([channel]))
         return value
 
-    out = TensorBox(Pointwise(device, out_dtype, out_inner, out_size))
+    out = Pointwise.create(device=device, dtype=out_dtype, inner_fn=out_inner, ranges=out_size)
     return (out, mean_box, rstd_box)
 
 
@@ -643,8 +1112,22 @@ def lower_native_group_norm_backward(node, grad_out, x, mean, rstd, gamma, n, c,
     def db_inner(index, rindex):
         return ops.to_dtype(dy_loader(full_index(index, rindex)), f32)
 
-    ds = TensorBox(Reduction(device, "float32", ds_inner, (n, c), (hxw,), "sum"))
-    db = TensorBox(Reduction(device, "float32", db_inner, (n, c), (hxw,), "sum"))
+    ds = Reduction.create(
+        device=device,
+        dtype='float32',
+        inner_fn=ds_inner,
+        ranges=(n, c),
+        reduction_ranges=(hxw,),
+        reduction_type='sum',
+    )
+    db = Reduction.create(
+        device=device,
+        dtype='float32',
+        inner_fn=db_inner,
+        ranges=(n, c),
+        reduction_ranges=(hxw,),
+        reduction_type='sum',
+    )
     ds.realize()
     db.realize()
     ds_loader = ds.make_loader()
@@ -664,8 +1147,22 @@ def lower_native_group_norm_backward(node, grad_out, x, mean, rstd, gamma, n, c,
             ch = index[1] * cpg + rindex[0]
             return ops.mul(db_loader([index[0], ch]), gamma_at(ch))
 
-        ds_val = TensorBox(Reduction(device, "float32", dsv_inner, (n, groups), (cpg,), "sum"))
-        db_val = TensorBox(Reduction(device, "float32", dbv_inner, (n, groups), (cpg,), "sum"))
+        ds_val = Reduction.create(
+        device=device,
+        dtype='float32',
+        inner_fn=dsv_inner,
+        ranges=(n, groups),
+        reduction_ranges=(cpg,),
+        reduction_type='sum',
+    )
+        db_val = Reduction.create(
+        device=device,
+        dtype='float32',
+        inner_fn=dbv_inner,
+        ranges=(n, groups),
+        reduction_ranges=(cpg,),
+        reduction_type='sum',
+    )
         ds_val.realize()
         db_val.realize()
         dsv = ds_val.make_loader()
@@ -684,8 +1181,12 @@ def lower_native_group_norm_backward(node, grad_out, x, mean, rstd, gamma, n, c,
             right = ops.mul(ops.mul(dbv(ng), r), ops.constant(s, f32))
             return ops.sub(left, right)
 
-        c2 = TensorBox(Pointwise(device, "float32", c2_at, (n, groups)))
-        c3 = TensorBox(Pointwise(device, "float32", c3_at, (n, groups)))
+        c2 = Pointwise.create(
+                device=device, dtype="float32", inner_fn=c2_at, ranges=(n, groups)
+        )
+        c3 = Pointwise.create(
+                device=device, dtype="float32", inner_fn=c3_at, ranges=(n, groups)
+        )
         c2.realize()
         c3.realize()
         c2_loader = c2.make_loader()
@@ -694,25 +1195,33 @@ def lower_native_group_norm_backward(node, grad_out, x, mean, rstd, gamma, n, c,
 
         def dx_inner(index):
             ch = index[1]
-            ng = [index[0], floordiv(as_index(ch), Const(cpg))]
+            ng = [index[0], floordiv(as_index(ch), sympy.Integer(cpg))]
             c1 = ops.mul(ops.to_dtype(rstd_loader(ng), f32), gamma_at(ch))
             dy = ops.to_dtype(dy_loader(index), f32)
             xv = ops.to_dtype(x_loader(index), f32)
             return ops.add(ops.add(ops.mul(dy, c1), ops.mul(xv, c2_loader(ng))), c3_loader(ng))
 
-        results[0] = TensorBox(Pointwise(device, dx_dtype, dx_inner, dx_size))
+        results[0] = Pointwise.create(device=device, dtype=dx_dtype, inner_fn=dx_inner, ranges=dx_size)
     if output_mask[1]:
         dg_size, dg_dtype, _ = val_info(vals[1])
 
         def dgamma_inner(index, rindex):
             ch = index[0]
-            ng = [rindex[0], floordiv(as_index(ch), Const(cpg))]
+            ng = [rindex[0], floordiv(as_index(ch), sympy.Integer(cpg))]
             m = ops.to_dtype(mean_loader(ng), f32)
             r = ops.to_dtype(rstd_loader(ng), f32)
             nc = [rindex[0], ch]
             return ops.mul(ops.sub(ds_loader(nc), ops.mul(db_loader(nc), m)), r)
 
-        results[1] = TensorBox(Reduction(device, dg_dtype, dgamma_inner, (c,), (n,), "sum"))
+        results[1] = Reduction.create(
+        device=device,
+        dst_dtype=dg_dtype,
+        src_dtype=dg_dtype,
+        inner_fn=dgamma_inner,
+        ranges=(c,),
+        reduction_ranges=(n,),
+        reduction_type='sum',
+    )
         results[1].realize()
     if output_mask[2]:
         db_size, db_dtype, _ = val_info(vals[2])
@@ -720,12 +1229,32 @@ def lower_native_group_norm_backward(node, grad_out, x, mean, rstd, gamma, n, c,
         def dbeta_inner(index, rindex):
             return db_loader([rindex[0], index[0]])
 
-        results[2] = TensorBox(Reduction(device, db_dtype, dbeta_inner, (c,), (n,), "sum"))
+        results[2] = Reduction.create(
+        device=device,
+        dst_dtype=db_dtype,
+        src_dtype=db_dtype,
+        inner_fn=dbeta_inner,
+        ranges=(c,),
+        reduction_ranges=(n,),
+        reduction_type='sum',
+    )
         results[2].realize()
     return tuple(results)
 
 
-__all__ = ["LOWERINGS", "broadcast_loader", "make_reduction", "pointwise", "register", "reshape", "target_name"]
+__all__ = [
+    "FALLBACKS",
+    "user_lowerings",
+    "select_decomp_table",
+    "LOWERINGS",
+    "broadcast_loader",
+    "fallback_handler",
+    "make_reduction",
+    "pointwise",
+    "register",
+    "reshape",
+    "target_name",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -777,7 +1306,7 @@ def lower_upsample_nearestnd(node, x, output_size, scales_h=None, scales_w=None,
             *index[: len(prefix)],
             *[
                 floordiv(
-                    as_index(index[len(prefix) + axis]) * i, Const(o)
+                    as_index(index[len(prefix) + axis]) * i, sympy.Integer(o)
                 )
                 for axis, (i, o) in enumerate(zip(in_spatial, out_spatial))
             ],
@@ -839,10 +1368,14 @@ def lower_avg_poolnd(node, x, kernel_size, stride=(), padding=0, ceil_mode=False
             outside = inside if outside is None else ops.and_(outside, inside)
         return ops.masked(outside, lambda: loader(full), ops.constant(0.0, f32))
 
-    total = TensorBox(
-        Reduction(
-            device, f32, inner, (*prefix, *spatial_out), tuple(kernel), "sum"
-        )
+    total = Reduction.create(
+        device=device,
+        dst_dtype=f32,
+        src_dtype=f32,
+        inner_fn=inner,
+        ranges=(*prefix, *spatial_out),
+        reduction_ranges=tuple(kernel),
+        reduction_type='sum',
     )
     total.realize()
     if divisor_override is not None:
@@ -885,10 +1418,14 @@ def _pool_with_masked_divisor(node, total, prefix, spatial_out, kernel, stride,
         return ops.masked(inside, lambda: ops.constant(1.0, f32),
                           ops.constant(0.0, f32))
 
-    counted = TensorBox(
-        Reduction(
-            device, f32, inner, (*prefix, *spatial_out), tuple(kernel), "sum",
-        )
+    counted = Reduction.create(
+        device=device,
+        dst_dtype=f32,
+        src_dtype=f32,
+        inner_fn=inner,
+        ranges=(*prefix, *spatial_out),
+        reduction_ranges=tuple(kernel),
+        reduction_type='sum',
     )
     counted.realize()
     return pointwise(
@@ -939,8 +1476,14 @@ def lower_index_add(node, base, dim, index_box, addend, alpha=None, **kwargs):
             value = ops.mul(value, ops.constant(scale, f32))
         return ops.masked(here, lambda: value, ops.constant(0.0, f32))
 
-    landed = TensorBox(
-        Reduction(device, dtype, inner, tuple(out_size), tuple(addend_size), "sum")
+    landed = Reduction.create(
+        device=device,
+        dst_dtype=dtype,
+        src_dtype=src_dtype,
+        inner_fn=inner,
+        ranges=tuple(out_size),
+        reduction_ranges=tuple(addend_size),
+        reduction_type='sum',
     )
     landed.realize()
     if all(int(s) == 0 for s in out_size) or not any(addend_size):
@@ -1024,10 +1567,14 @@ def lower_avg_poolnd_backward(node, grad, _input, kernel_size, stride=(), paddin
         )
         return ops.masked(inside, lambda: loader(full), ops.constant(0.0, f32))
 
-    total = TensorBox(
-        Reduction(
-            device, f32, summed, (*prefix, *spatial_in), tuple(spatial_out), "sum"
-        )
+    total = Reduction.create(
+        device=device,
+        dst_dtype=f32,
+        src_dtype=f32,
+        inner_fn=summed,
+        ranges=(*prefix, *spatial_in),
+        reduction_ranges=tuple(spatial_out),
+        reduction_type='sum',
     )
     total.realize()
     if divisor_override is not None:
@@ -1064,10 +1611,14 @@ def _pool_backward_with_masked_divisor(node, total, prefix, spatial_in, spatial_
         return ops.masked(inside, lambda: ops.constant(1.0, f32),
                           ops.constant(0.0, f32))
 
-    count = TensorBox(
-        Reduction(
-            device, f32, counted, (*prefix, *spatial_in), tuple(spatial_out), "sum"
-        )
+    count = Reduction.create(
+        device=device,
+        dst_dtype=f32,
+        src_dtype=f32,
+        inner_fn=counted,
+        ranges=(*prefix, *spatial_in),
+        reduction_ranges=tuple(spatial_out),
+        reduction_type='sum',
     )
     count.realize()
     return pointwise(
@@ -1076,3 +1627,133 @@ def _pool_backward_with_masked_divisor(node, total, prefix, spatial_in, spatial_
         total,
         count,
     )
+
+# The pointwise operations, declared with the promotion each one applies.
+#
+# Registering a lowering and stating the promotion together is what keeps the
+# two from drifting apart: an operation whose result is the promotion of its
+# operands says so here, so the type of its result is known without asking the
+# operation, and an operation that is not declared here either says what it
+# produces or is caught where the types are collected.
+#
+# The ones declared as numeric read a number and produce a real number, so an
+# integer argument does not make the result an integer.
+register_pointwise(
+    "add",
+    "rsub",
+    "sub",
+    "mul",
+    "div",
+    "truediv",
+    "floordiv",
+    "floordiv_tensor",
+    "mod",
+    "pow",
+    "lshift",
+    "rshift",
+    "and_",
+    "or_",
+    "xor",
+    "bitwise_and",
+    "bitwise_or",
+    "bitwise_xor",
+    "bitwise_not",
+    "bitwise_left_shift",
+    "bitwise_right_shift",
+    "maximum",
+    "minimum",
+    "fmaximum",
+    "clamp_min",
+    "clamp_max",
+    "where",
+    "logical_and",
+    "logical_or",
+    "logical_xor",
+    "remainder",
+    "fmod",
+    "aten_add",
+    "sum",
+    "exp",
+    "exp2",
+    "expm1",
+    "log",
+    "log2",
+    "log10",
+    "log1p",
+    "sqrt",
+    "rsqrt",
+    "erf",
+    "erfc",
+    "erfinv",
+    "lgamma",
+    "sigmoid",
+    "tanh",
+    "cosh",
+    "sinh",
+    "acos",
+    "asin",
+    "atan",
+    "atan2",
+    "atanh",
+    "asinh",
+    "acosh",
+    "cos",
+    "sin",
+    "tan",
+    "sign",
+    "signbit",
+    "abs",
+    "neg",
+    "square",
+    "ceil",
+    "floor",
+    "round",
+    "trunc",
+    "isnan",
+    "isinf",
+    "nan_to_num",
+    "nextafter",
+    "hypot",
+    "copysign",
+    "ldexp",
+    "logical_not",
+    "sigmoid_backward",
+    "relu",
+    "lu",
+    "index",
+)
+register_pointwise_numeric(
+    "reciprocal",
+    "sigmoid",
+    "softplus",
+    "elu",
+    "gelu",
+    "hardsigmoid",
+    "hardswish",
+    "silu",
+    "mish",
+    "tanh",
+    "softsign",
+    "selu",
+)
+register_op_dtype_propagation_rules(
+    "ldexp",
+    type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+    override_return_dtype=None,
+)
+register_op_dtype_propagation_rules(
+    "fmaximum",
+    type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
+    override_return_dtype=None,
+)
+register_op_dtype_propagation_rules(
+    "remainder",
+    type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
+    override_return_dtype=None,
+)
+# The operations that produce no value, and so have no result type at all.
+for _name in ("output", "placeholder", "device_assert_async", "check_bounds"):
+    register_op_dtype_propagation_rules(
+        _name, type_promotion_kind=None, override_return_dtype=None
+    )
+

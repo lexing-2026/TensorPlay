@@ -93,262 +93,184 @@ SCALED_TUNING_VERSION = "scaled-gemm-1"
 _KERNEL_MEMO: dict[str, Any] = {}
 
 
-_KERNEL_SOURCE = '''
-import triton
-import triton.language as tl
+#: The two sites: the body each of them runs, and the block extents and other
+#: constants that body declares, in the order it declares them.  The launch
+#: reads the tail off this list rather than writing its own, because a tail the
+#: launch guesses and a signature the render emits are two lists to keep in
+#: step, and a kernel that is one argument short is a kernel that cannot run.
+_SITES = {
+    "main_loop": (
+        "main_loop_scaled_mm", "triton_main_loop_scaled_mm",
+        "_scaled_main_loop_gemm",
+        ("RECIPE_A", "RECIPE_B", "TILE_INNER", "ALLOW_TF32",
+         "BLOCK_M", "BLOCK_N", "BLOCK_K", "GROUP_M", "NUM_SMS",
+         "USE_TMA_LOAD", "USE_EXPERIMENTAL_MAKE_TENSOR_DESCRIPTOR", "TMA_SIZE"),
+    ),
+    "epilogue": (
+        "epilogue_scaled_mm", "triton_epilogue_scaled_mm",
+        "_scaled_epilogue_gemm",
+        ("RECIPE_A", "RECIPE_B", "ALLOW_TF32",
+         "BLOCK_M", "BLOCK_N", "BLOCK_K", "GROUP_M", "NUM_SMS",
+         "USE_TMA_LOAD", "USE_EXPERIMENTAL_MAKE_TENSOR_DESCRIPTOR", "TMA_SIZE"),
+    ),
+}
 
-TENSOR_WISE: tl.constexpr = 0
-ROW_WISE: tl.constexpr = 1
-BLOCK_128: tl.constexpr = 2
-BLOCK_1xTILE: tl.constexpr = 3
+#: How much room one mapping takes in a workspace, when the toolkit builds it
+#: there rather than in the kernel's own registers.  The size is fixed by the
+#: mapping's own layout rather than chosen here.
+TMA_SIZE = 128
 
-
-@triton.jit
-def _scale_rows(scale, rows, extent, stride):
-    """One factor per row, gathered for the rows this tile covers."""
-
-    return tl.load(scale + rows * stride, mask=rows < extent, other=0.0)
-
-
-@triton.jit
-def _scale_block_128(scale, pid, step, row_blocks, inner_blocks,
-                     BLOCK_ROWS: tl.constexpr, BLOCK_INNER: tl.constexpr):
-    """A 128-by-128 block of factors, expanded to the tile's shape.
-
-    The load is one factor per 128 in each direction; the multiply is one per
-    element.  So the small thing is read once and then broadcast across the
-    large thing, which is the only order in which this is worth doing at all.
-    """
-
-    row_off = pid * tl.cdiv(BLOCK_ROWS, 128) + tl.arange(0, (BLOCK_ROWS + 127) // 128)
-    col_off = step * tl.cdiv(BLOCK_INNER, 128) + tl.arange(0, (BLOCK_INNER + 127) // 128)
-    ptrs = scale + row_off[:, None] * inner_blocks + col_off[None, :]
-    block = tl.load(
-        ptrs,
-        mask=(row_off[:, None] < row_blocks) & (col_off[None, :] < inner_blocks),
-        other=1.0,
-    )
-    # A block is 128 wide, so it covers 128 rows of the tile however many rows
-    # the tile has: a 256-row tile is two blocks, a 128-row tile is one, and a
-    # tile narrower than a block has no such split -- which is why the launcher
-    # refuses that pairing rather than rounding it.
-    rows_per_block: tl.constexpr = BLOCK_ROWS // ((BLOCK_ROWS + 127) // 128)
-    inner_per_block: tl.constexpr = BLOCK_INNER // ((BLOCK_INNER + 127) // 128)
-    wide = block[:, :, None, None]
-    wide = tl.broadcast_to(
-        wide,
-        (
-            (BLOCK_ROWS + 127) // 128,
-            (BLOCK_INNER + 127) // 128,
-            rows_per_block,
-            inner_per_block,
-        ),
-    )
-    return wide.reshape(
-        ((BLOCK_ROWS + 127) // 128) * rows_per_block,
-        ((BLOCK_INNER + 127) // 128) * inner_per_block,
-    )
+#: How wide a factor is, per recipe: one number, one per row, or one per block
+#: of rows and of the contraction.  The rank is what tells a factor of one
+#: recipe from a factor of another that happens to hold the same numbers.
+_FACTOR_RANK = {
+    SCALE_RECIPES.TENSOR_WISE: 0,
+    SCALE_RECIPES.ROW_WISE: 1,
+    SCALE_RECIPES.BLOCK_128: 2,
+    SCALE_RECIPES.BLOCK_1xTILE: 2,
+}
 
 
-@triton.jit
-def _scale_block_1xtile(scale, pid, step, row_blocks, inner_blocks,
-                        BLOCK_ROWS: tl.constexpr, BLOCK_INNER: tl.constexpr,
-                        TILE_INNER: tl.constexpr):
-    """A factor per row and per tile-width of the contraction, expanded.
+def factor_rank(recipe: int) -> int:
+    """How many dimensions a factor of this recipe has."""
 
-    The same shape of work as the 128-by-128 recipe with one extent collapsed:
-    the row direction has one factor per row, and the contraction direction has
-    one per tile rather than per 128.
-    """
-
-    row_off = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    col_off = step * tl.cdiv(BLOCK_INNER, TILE_INNER) + tl.arange(
-        0, (BLOCK_INNER + TILE_INNER - 1) // TILE_INNER
-    )
-    ptrs = scale + row_off[:, None] * inner_blocks + col_off[None, :]
-    block = tl.load(
-        ptrs,
-        mask=(row_off[:, None] < row_blocks) & (col_off[None, :] < inner_blocks),
-        other=1.0,
-    )
-    wide = block[:, :, None]
-    wide = tl.broadcast_to(
-        wide, (BLOCK_ROWS, (BLOCK_INNER + TILE_INNER - 1) // TILE_INNER, TILE_INNER)
-    )
-    return wide.reshape(
-        BLOCK_ROWS, ((BLOCK_INNER + TILE_INNER - 1) // TILE_INNER) * TILE_INNER
-    )
-
-
-@triton.jit
-def _scaled_main_loop_gemm(
-    a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr,
-    M, N, K,
-    RECIPE_A: tl.constexpr, RECIPE_B: tl.constexpr,
-    TILE_INNER: tl.constexpr,
-    ALLOW_TF32: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
-):
-    """The factors are applied to each tile as it arrives.
-
-    So the accumulator only ever holds unscaled products: every element of the
-    result is multiplied once, by the factors of the tile it came from, and the
-    accumulator's width never has to hold a scaled value.
-    """
-    if M == 0 or N == 0:
-        return
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    # The group is what makes the programs running together share a factor
-    # block, for the same reason the persistent form reorders its tiles.
-    width = GROUP_M * tl.cdiv(N, BLOCK_N)
-    tile_id = pid_m + pid_n * tl.cdiv(M, BLOCK_M)
-    group_id = tile_id // width
-    group_rows = min(tl.cdiv(M, BLOCK_M) - group_id * GROUP_M, GROUP_M)
-    pid_m = group_id * GROUP_M + (tile_id % group_rows)
-    pid_n = (tile_id % width) // group_rows
-
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    row_blocks = tl.cdiv(M, BLOCK_M)
-    inner_blocks = tl.cdiv(K, BLOCK_K)
-    step = 0
-    for rk in tl.range(0, K, BLOCK_K):
-        rk_idx = rk // BLOCK_K
-        inner = rk_idx * BLOCK_K + tl.arange(0, BLOCK_K)
-        a = tl.load(
-            a_ptr + rm[:, None] * K + inner[None, :],
-            mask=(rm[:, None] < M) & (inner[None, :] < K), other=0.0,
-        )
-        b = tl.load(
-            b_ptr + inner[:, None] * N + rn[None, :],
-            mask=(inner[:, None] < K) & (rn[None, :] < N), other=0.0,
-        )
-        # The recipe is dispatched here rather than inside a helper because the
-        # branches produce differently shaped things -- a number, a column, a
-        # full block -- and a helper that returned any of them would have to
-        # agree on one shape for branches only one of which ever runs.
-        if RECIPE_A == 0:
-            a_scaled = a * tl.load(a_scale_ptr)
-        elif RECIPE_A == 1:
-            a_scaled = a * _scale_rows(a_scale_ptr, rm, M, 1)[:, None]
-        elif RECIPE_A == 2:
-            a_scaled = a * _scale_block_128(
-                a_scale_ptr, pid_m, rk_idx, row_blocks, inner_blocks,
-                BLOCK_M, BLOCK_K,
-            )
-        else:
-            a_scaled = a * _scale_block_1xtile(
-                a_scale_ptr, pid_m, rk_idx, row_blocks, inner_blocks,
-                BLOCK_M, BLOCK_K, TILE_INNER,
-            )
-        if RECIPE_B == 0:
-            b_scaled = b * tl.load(b_scale_ptr)
-        elif RECIPE_B == 1:
-            b_scaled = b * _scale_rows(b_scale_ptr, rn, N, 1)[None, :]
-        elif RECIPE_B == 2:
-            b_scaled = b * _scale_block_128(
-                b_scale_ptr, pid_n, rk_idx, tl.cdiv(N, BLOCK_N), inner_blocks,
-                BLOCK_N, BLOCK_K,
-            )
-        else:
-            b_scaled = b * _scale_block_1xtile(
-                b_scale_ptr, pid_n, rk_idx, tl.cdiv(N, BLOCK_N), inner_blocks,
-                BLOCK_N, BLOCK_K, TILE_INNER,
-            )
-        acc += tl.dot(a_scaled, b_scaled, allow_tf32=ALLOW_TF32)
-        step += 1
-    tl.store(
-        c_ptr + rm[:, None] * N + rn[None, :],
-        acc,
-        mask=(rm[:, None] < M) & (rn[None, :] < N),
-    )
-
-
-@triton.jit
-def _scaled_epilogue_gemm(
-    a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr,
-    M, N, K,
-    RECIPE_A: tl.constexpr, RECIPE_B: tl.constexpr,
-    ALLOW_TF32: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
-):
-    """The factors are applied once, to the finished accumulator.
-
-    Fewer operations than scaling each tile, and the only thing that can go
-    wrong is a factor that would have had to be held at the accumulator's
-    width -- which is why the block-shaped recipes are not offered here.
-    """
-    if M == 0 or N == 0:
-        return
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    width = GROUP_M * tl.cdiv(N, BLOCK_N)
-    tile_id = pid_m + pid_n * tl.cdiv(M, BLOCK_M)
-    group_id = tile_id // width
-    group_rows = min(tl.cdiv(M, BLOCK_M) - group_id * GROUP_M, GROUP_M)
-    pid_m = group_id * GROUP_M + (tile_id % group_rows)
-    pid_n = (tile_id % width) // group_rows
-
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for rk in tl.range(0, K, BLOCK_K):
-        inner = rk + tl.arange(0, BLOCK_K)
-        a = tl.load(
-            a_ptr + rm[:, None] * K + inner[None, :],
-            mask=(rm[:, None] < M) & (inner[None, :] < K), other=0.0,
-        )
-        b = tl.load(
-            b_ptr + inner[:, None] * N + rn[None, :],
-            mask=(inner[:, None] < K) & (rn[None, :] < N), other=0.0,
-        )
-        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
-
-    # One factor per row on each side multiplies into the accumulator from
-    # opposite axes, so it is a rank-one product; anything else is one number
-    # per tensor and multiplies in as a scalar.
-    if RECIPE_A == 1 and RECIPE_B == 1:
-        by_row = _scale_rows(a_scale_ptr, rm, M, 1)[:, None]
-        by_column = _scale_rows(b_scale_ptr, rn, N, 1)[None, :]
-        acc = acc * (by_row * by_column)
-    else:
-        acc = acc * (tl.load(a_scale_ptr) * tl.load(b_scale_ptr))
-    tl.store(
-        c_ptr + rm[:, None] * N + rn[None, :],
-        acc,
-        mask=(rm[:, None] < M) & (rn[None, :] < N),
-    )
-'''
+    if recipe not in _FACTOR_RANK:
+        raise AssertionError(f"unknown factor recipe {recipe!r}")
+    return _FACTOR_RANK[recipe]
 
 
 def scaled_kernel(site: str, recipe_a: int, recipe_b: int, tile_inner: int,
-                  block_m: int, block_n: int, block_k: int, group_m: int):
-    """The scaled kernel for one site and one pair of recipes, built once."""
+                  block_m: int, block_n: int, block_k: int, group_m: int,
+                  num_sms: int, fetch: dict):
+    """The scaled kernel for one site and one pair of recipes, built once.
+
+    The two sites are two bodies rather than one with a flag, because the work
+    is in a different place: one multiplies each tile as it arrives, the other
+    multiplies the finished accumulator, and only the second can carry a factor
+    per row.  A flag would leave both shapes of work in one function.
+    """
 
     key = hashlib.sha256(
         "|".join(
             str(v)
             for v in (
                 SCALED_TUNING_VERSION, site, recipe_a, recipe_b, tile_inner,
-                block_m, block_n, block_k, group_m,
+                block_m, block_n, block_k, group_m, num_sms,
+                *sorted(fetch.items()),
             )
         ).encode()
     ).hexdigest()[:16]
     cached = _KERNEL_MEMO.get(key)
     if cached is not None:
         return cached
-    kernel = _build(
-        _KERNEL_SOURCE,
-        f"<tensorplay-stax-scaled-{key}>",
-        "_scaled_main_loop_gemm" if site == "main_loop"
-        else "_scaled_epilogue_gemm",
+    if site not in _SITES:
+        raise AssertionError(f"unknown scaling site {site!r}")
+    name, file_name, symbol, _tail = _SITES[site]
+    # The extents are placeholders: the signature only needs each operand's
+    # rank, and the launch passes the call's real extents and strides.  A
+    # factor's rank is the one its recipe says it has, which is what tells a
+    # factor of one recipe from a factor of another holding the same numbers.
+    from ..templates.select_algorithm import KernelArgs, TritonTemplate
+
+    plane = (0, 0)
+    factor_a = (0,) * factor_rank(recipe_a)
+    factor_b = (0,) * factor_rank(recipe_b)
+    inputs = {
+        "A": {"shape": plane, "stride": plane},
+        "B": {"shape": plane, "stride": plane},
+        "SA": {"shape": factor_a, "stride": (1,) * len(factor_a)},
+        "SB": {"shape": factor_b, "stride": (1,) * len(factor_b)},
+    }
+    if fetch["USE_EXPERIMENTAL_MAKE_TENSOR_DESCRIPTOR"]:
+        # The workspace the mappings are built in is an operand of the body that
+        # builds them, so it is declared the way every other operand is.
+        inputs["ws"] = {"shape": (num_sms * 2 * TMA_SIZE,), "stride": (1,)}
+    source = TritonTemplate.from_file(name, file=file_name, symbol=symbol).render_with(
+        KernelArgs(
+            inputs,
+            {"C": {"shape": plane, "stride": plane}},
+            {
+                "RECIPE_A": int(recipe_a), "RECIPE_B": int(recipe_b),
+                "TILE_INNER": int(tile_inner), "ALLOW_TF32": False,
+                "BLOCK_M": int(block_m), "BLOCK_N": int(block_n),
+                "BLOCK_K": int(block_k), "GROUP_M": int(group_m),
+                "NUM_SMS": int(num_sms), "TMA_SIZE": int(TMA_SIZE),
+                "USE_TMA_LOAD": bool(fetch["USE_TMA_LOAD"]),
+                "USE_EXPERIMENTAL_MAKE_TENSOR_DESCRIPTOR": bool(
+                    fetch["USE_EXPERIMENTAL_MAKE_TENSOR_DESCRIPTOR"]),
+            } if site == "main_loop" else {
+                "RECIPE_A": int(recipe_a), "RECIPE_B": int(recipe_b),
+                "ALLOW_TF32": False,
+                "BLOCK_M": int(block_m), "BLOCK_N": int(block_n),
+                "BLOCK_K": int(block_k), "GROUP_M": int(group_m),
+                "NUM_SMS": int(num_sms), "TMA_SIZE": int(TMA_SIZE),
+                "USE_TMA_LOAD": bool(fetch["USE_TMA_LOAD"]),
+                "USE_EXPERIMENTAL_MAKE_TENSOR_DESCRIPTOR": bool(
+                    fetch["USE_EXPERIMENTAL_MAKE_TENSOR_DESCRIPTOR"]),
+            },
+        ),
+        # Which of the two a tile is fetched by is decided by rendering rather
+        # than by an argument: one body reads by address and the other states a
+        # mapping, and a body that read both would carry both.
+        USE_TMA_LOAD=bool(fetch["USE_TMA_LOAD"]),
+        USE_EXPERIMENTAL_MAKE_TENSOR_DESCRIPTOR=bool(
+            fetch["USE_EXPERIMENTAL_MAKE_TENSOR_DESCRIPTOR"]),
     )
+    kernel = _build(source, f"<tensorplay-stax-scaled-{key}>", symbol)
     _KERNEL_MEMO[key] = kernel
     return kernel
+
+
+def _multiprocessor_count(device) -> int:
+    """How many programs to walk the tiles with.
+
+    A tile is walked rather than handed out, so the count of programs is the
+    machine's count of multiprocessors: that is how many can be resident at
+    once, and walking means the run is longer rather than differently shaped.
+    """
+
+    from ..templates.mm_common import num_sms
+
+    return num_sms(device)
+
+
+def _descriptor_form(a_extents, b_extents, device) -> dict:
+    """How this call's tiles may be fetched by descriptor, or by address.
+
+    A descriptor addresses in 32 bits and needs a hardware feature, so it is
+    asked about rather than assumed: an operand it cannot name is one it cannot
+    describe, and a machine without the feature has no such form to offer.
+    Which of the two a descriptor is asked for is not a choice either -- it is
+    the layout the operand has.
+    """
+
+    from ..templates.mm_common import (
+        descriptor_extents_fit, descriptor_offset_fits, device_capability,
+    )
+
+    flags = {
+        "USE_TMA_LOAD": False,
+        "USE_EXPERIMENTAL_MAKE_TENSOR_DESCRIPTOR": False,
+    }
+    if not (hasattr(tl, "make_tensor_descriptor")
+            or hasattr(tl, "_experimental_make_tensor_descriptor")):
+        return flags
+    major, _minor = device_capability(device)
+    if major < 9:
+        return flags
+    for extents in (a_extents, b_extents):
+        rows, inner, block_rows, block_inner = extents
+        if not descriptor_extents_fit((rows, inner)):
+            return flags
+        if not descriptor_offset_fits((rows, inner), (inner, 1)):
+            return flags
+        if block_rows > rows or block_inner > inner:
+            return flags
+    flags["USE_TMA_LOAD"] = True
+    flags["USE_EXPERIMENTAL_MAKE_TENSOR_DESCRIPTOR"] = not hasattr(
+        tl, "make_tensor_descriptor"
+    )
+    return flags
 
 
 def _standard_2d(shape, stride) -> bool:
@@ -398,10 +320,6 @@ def scaled_gemm_launch(
             return base_launch
         if recipe == SCALE_RECIPES.BLOCK_1xTILE and extent[0] % tile_inner:
             return base_launch
-    kernel = scaled_kernel(
-        site, recipe_a, recipe_b, tile_inner, block_m, block_n, block_k, group_m
-    )
-
     def operand(feed: list, spec) -> Any:
         position, literal = spec
         return feed[position] if position is not None else literal
@@ -418,24 +336,60 @@ def scaled_gemm_launch(
             and _standard_2d(b.shape, b.stride())
         ):
             return base_launch(feed)
+        # A factor's rank is what its recipe says it is, and a factor that
+        # arrives with a different number of dimensions is a different factor
+        # rather than the same numbers: the body would gather it as something
+        # it is not.
+        if any(
+            int(t.dim()) != factor_rank(recipe)
+            for t, recipe in ((a_scale, recipe_a), (b_scale, recipe_b))
+        ):
+            return base_launch(feed)
+        # What the tiles may be fetched by, and how many programs walk them, are
+        # properties of the machine and the call rather than of the
+        # configuration, so they are asked about per call; the body they select
+        # is built once and kept.
+        num_sms = _multiprocessor_count(a.device)
+        fetch = _descriptor_form(
+            (m, k, block_m, block_k), (n, k, block_n, block_k), a.device
+        )
+        kernel = scaled_kernel(
+            site, recipe_a, recipe_b, tile_inner, block_m, block_n, block_k,
+            group_m, num_sms, fetch,
+        )
         out = tp.empty((m, n), dtype=a.dtype, device=a.device)
-        grid = (-(-m // block_m), -(-n // block_n), 1)
-        args = [a, b, out, a_scale, b_scale, m, n, k]
-        if site == "main_loop":
-            kernel[grid](
-                *args,
-                RECIPE_A=recipe_a, RECIPE_B=recipe_b, TILE_INNER=tile_inner,
-                ALLOW_TF32=allow_tf32,
-                BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, GROUP_M=group_m,
-                num_warps=int(config["num_warps"]), num_stages=int(config["num_stages"]),
-            )
-        else:
-            kernel[grid](
-                *args,
-                RECIPE_A=recipe_a, RECIPE_B=recipe_b, ALLOW_TF32=allow_tf32,
-                BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, GROUP_M=group_m,
-                num_warps=int(config["num_warps"]), num_stages=int(config["num_stages"]),
-            )
+        # The walk is persistent: a fixed number of programs each take every
+        # NUM_SMS'th tile, rather than one program per tile.
+        grid = (num_sms, 1, 1)
+        # The order is the signature's: the operands, then their extents, then
+        # their strides, then the block extents -- the order the body was
+        # rendered against, so the two cannot drift apart.
+        args = [a, b, a_scale, b_scale]
+        if fetch["USE_EXPERIMENTAL_MAKE_TENSOR_DESCRIPTOR"]:
+            # One mapping per program and per operand, so the workspace is
+            # asked for at the size the body indexes it at.
+            args.append(tp.empty(
+                num_sms * 2 * TMA_SIZE, dtype=tp.uint8, device=a.device))
+        args.append(out)
+        extents = [int(v) for v in a.shape] + [int(v) for v in b.shape]
+        extents += [int(v) for v in a_scale.shape] + [int(v) for v in b_scale.shape]
+        extents += [int(v) for v in out.shape]
+        strides = [int(v) for v in a.stride()] + [int(v) for v in b.stride()]
+        strides += [int(v) for v in a_scale.stride()]
+        strides += [int(v) for v in b_scale.stride()]
+        strides += [int(v) for v in out.stride()]
+        values = {
+            "RECIPE_A": recipe_a, "RECIPE_B": recipe_b,
+            "TILE_INNER": tile_inner, "ALLOW_TF32": allow_tf32,
+            "BLOCK_M": block_m, "BLOCK_N": block_n, "BLOCK_K": block_k,
+            "GROUP_M": group_m, "NUM_SMS": num_sms, "TMA_SIZE": TMA_SIZE,
+            **fetch,
+        }
+        tail = [values[name] for name in _SITES[site][3]]
+        kernel[grid](
+            *args, *extents, *strides, *tail,
+            num_warps=int(config["num_warps"]), num_stages=int(config["num_stages"]),
+        )
         return out
 
     return launch

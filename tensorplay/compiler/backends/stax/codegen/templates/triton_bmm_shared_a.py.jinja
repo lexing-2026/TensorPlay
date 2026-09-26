@@ -1,0 +1,117 @@
+{#-
+  The batched product whose left operand is one matrix spread over the batch.
+
+  The plain batched template re-fetches that same left tile once per batch,
+  which is the whole of the traffic a shared left operand does not have to pay.
+  This one loads it once and reuses it across BLOCK_Q batches, so the batch
+  becomes a factor in the accumulator's width rather than in the number of
+  programs: the right operand is gathered as [BLOCK_K, BLOCK_Q, BLOCK_N] -- one
+  index vector per axis, so the innermost axis is still unit-stride and the
+  gather still vectorises -- and then reshaped to [BLOCK_K, BLOCK_Q*BLOCK_N] for
+  a single multiply.  Writing that gather as one combined index instead of
+  three scalarises the load, which is several times slower than the arithmetic
+  it saves.
+
+  The cost of the form is the accumulator: it is BLOCK_M x BLOCK_Q*BLOCK_N
+  floats instead of BLOCK_M x BLOCK_N, so the table of tilings is bounded by
+  the register file rather than by the plain table's shape, and it is only
+  worth offering when there are enough batches to group -- with a handful the
+  grouping spends the parallelism it was meant to recover.
+-#}
+import triton
+import triton.language as tl
+
+
+{{ def_kernel("A", "B", outputs=("C",)) }}
+    M = {{ size("A", -2) }}
+    N = {{ size("B", -1) }}
+    K = {{ size("A", -1) }}
+    BATCH = {{ size("B", 0) }}
+
+    stride_am = {{ stride("A", 1) }}
+    stride_ak = {{ stride("A", 2) }}
+
+    stride_bq = {{ stride("B", 0) }}
+    stride_bk = {{ stride("B", 1) }}
+    stride_bn = {{ stride("B", 2) }}
+
+    # The left operand's batch stride is zero, so it contributes no term: only
+    # the right operand's batch axis is read here.
+    pid = tl.program_id(0)
+    qid = tl.program_id(1)
+    grid_m = (M + BLOCK_M - 1) // BLOCK_M
+    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+
+    # Programs are visited a column-block at a time within a group of rows, so
+    # that the programs running at the same moment are reading the same rows of
+    # both operands.  Shared rows are what a cache can hold on to; a flat order
+    # walks the whole first operand before coming back to the second.
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + (pid % group_size)
+    pid_n = (pid % width) // group_size
+
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    if ((stride_am == 1 and stride_ak == M) or (stride_am == K and stride_ak == 1)) and (M >= BLOCK_M and K > 1):
+        ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+    else:
+        ram = rm % M
+    if ((stride_bk == 1 and stride_bn == K) or (stride_bk == N and stride_bn == 1)) and (N >= BLOCK_N and K > 1):
+        rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+    else:
+        rbn = rn % N
+
+    rk = tl.arange(0, BLOCK_K)
+    rq = qid * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    # A trailing group of batches that does not fill BLOCK_Q still has to form
+    # legal addresses, so the batch index is held inside the range and the
+    # lanes that are past the end are dropped at the store instead of here.
+    rq_safe = tl.minimum(rq, BATCH - 1)
+
+    a_ptrs = A_ptr + ram[:, None] * stride_am + rk[None, :] * stride_ak
+    b_ptrs = B_ptr + rk[:, None, None] * stride_bk + rq_safe[None, :, None] * stride_bq + rbn[None, None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_Q * BLOCK_N), dtype=tl.float32)
+    # The steps that divide the contraction are peeled off so the loop loads
+    # without a mask; the step that does not divide it is the only one that
+    # pays for a mask, and it runs once.
+    k_full = (K // BLOCK_K) * BLOCK_K
+    for _k in range(0, k_full, BLOCK_K):
+        a = tl.load(a_ptrs)
+        b = tl.reshape(tl.load(b_ptrs), (BLOCK_K, BLOCK_Q * BLOCK_N))
+{% if allow_tf32 %}
+        acc = tl.dot(a, b, acc, input_precision="tf32")
+{% else %}
+        acc = tl.dot(a, b, acc, input_precision="ieee")
+{% endif %}
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    if k_full < K:
+        k_mask = rk < (K - k_full)
+        a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
+        b = tl.reshape(tl.load(b_ptrs, mask=k_mask[:, None, None], other=0.0), (BLOCK_K, BLOCK_Q * BLOCK_N))
+{% if allow_tf32 %}
+        acc = tl.dot(a, b, acc, input_precision="tf32")
+{% else %}
+        acc = tl.dot(a, b, acc, input_precision="ieee")
+{% endif %}
+
+    # The accumulator's columns are the grouped batches laid side by side, so
+    # recovering which batch and which output column a column is costs a
+    # division and a remainder -- once per program, here, rather than inside
+    # the loop that runs thousands of times.
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rj = tl.arange(0, BLOCK_Q * BLOCK_N)
+    idx_m = rm[:, None]
+    idx_q = (qid * BLOCK_Q + rj // BLOCK_N)[None, :]
+    idx_n = (pid_n * BLOCK_N + rj % BLOCK_N)[None, :]
+    c_mask = (idx_m < M) & (idx_n < N) & (idx_q < BATCH)
+
+    c = acc.to(C_ptr.dtype.element_ty)
+    tl.store(
+        C_ptr + idx_q * {{ stride("C", 0) }} + idx_m * {{ stride("C", 1) }} + idx_n * {{ stride("C", 2) }},
+        c,
+        mask=c_mask,
+    )

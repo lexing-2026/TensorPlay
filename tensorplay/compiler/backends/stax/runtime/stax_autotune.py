@@ -3,7 +3,7 @@
 Instead of emitting ``@triton.autotune`` — which benchmarks candidate configs
 at every new runtime key with per-launch overhead and keeps no persistent
 record — this module benchmarks candidates once at compile time, picks the winner,
-and emit a fixed-config kernel.  Decisions are stored in the kernel codecache
+and emit a fixed-config kernel.  Decisions are stored in the kernel cache
 keyed by ``(program digest, xnumel bucket, device)``, so later processes skip
 benchmarking entirely.
 
@@ -101,7 +101,7 @@ def xnumel_bucket(xnumel: int) -> int:
 
 
 def _decision_cache():
-    from ..codecache import default_cache
+    from ..kernel_cache import default_cache
 
     return default_cache("triton-autotune")
 
