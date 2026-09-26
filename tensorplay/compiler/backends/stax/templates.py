@@ -43,6 +43,10 @@ from typing import Any, Callable, Iterator, Sequence
 
 __all__ = [
     "BaseConfig",
+    "CONV_TEMPLATES",
+    "conv1x1_via_mm",
+    "conv1x1_via_product",
+    "framework_convolution",
     "CONV",
     "Choices",
     "ChoiceCaller",
@@ -50,6 +54,8 @@ __all__ = [
     "ConvTemplate",
     "DepthwiseConvConfig",
     "DictKernelTemplateParams",
+    "ExternChoiceCaller",
+    "ExternKernelChoice",
     "GEMM",
     "GemmConfig",
     "GemmTemplate",
@@ -755,6 +761,105 @@ class SubgraphChoiceCaller(ChoiceCaller):
         return "subgraph"
 
 
+class ExternKernelChoice:
+    """An operation that can hold its own against a kernel, as a choice.
+
+    The operation every template is measured against is not a fallback taken
+    when measurement fails -- it is one of the things being measured, and it
+    wins whenever no kernel beats it.  So it is registered here, beside the
+    templates, under a name codegen can refer to, and it answers the same
+    questions they do; a caller can hand a list of either to the same
+    enumeration without caring which is which.
+
+    Each instance registers once under its name.  Registering the same
+    callable twice is tolerated, because a module can be initialised twice in
+    one process; registering a *different* callable under a name already taken
+    is refused, because that is a collision rather than a re-registration.
+    """
+
+    _registry: dict[str, "ExternKernelChoice"] = {}
+
+    def __init__(
+        self,
+        kernel: Callable[..., Any],
+        name: str | None = None,
+        *,
+        has_out_variant: bool = True,
+        op_overload: Any = None,
+        use_fallback_kernel: bool = False,
+        kernel_creator: Callable[..., Any] | None = None,
+    ):
+        name = name or getattr(kernel, "__name__", None) or "extern"
+        if kernel is not None and not callable(kernel):
+            raise AssertionError("an extern choice must wrap something callable")
+        # ``None`` means the kernel is the framework's own and is resolved by
+        # whatever launches it, which is the case for an operation the compiler
+        # calls by name rather than by function.  The name is still the identity
+        # that matters here, so the collision check below stands either way.
+        existing = ExternKernelChoice._registry.get(name)
+        if existing is not None and existing.kernel is not kernel:
+            raise AssertionError(f"duplicate extern choice: {name}")
+        self.name = name
+        self.kernel = kernel
+        self.has_out_variant = has_out_variant
+        self.op_overload = op_overload
+        self.use_fallback_kernel = use_fallback_kernel
+        self.kernel_creator = kernel_creator
+        ExternKernelChoice._registry[name] = self
+
+    # -- the part that makes it usable wherever a template is ------------
+    @property
+    def uid(self) -> str:
+        return self.name
+
+    @property
+    def src_hash(self) -> str | None:
+        return None
+
+    def choice_or_none(self, **kwargs: Any) -> ChoiceCaller | None:
+        """The operation itself, as the choice it always is."""
+
+        return ExternChoiceCaller(
+            name=self.name,
+            layout=kwargs.get("layout"),
+            description="the operation itself",
+            launcher=self.kernel,
+        )
+
+    def maybe_append_choice(self, choices: list, **kwargs: Any):
+        choices.append(self.choice_or_none(**kwargs))
+        return None
+
+    def generate(self, **kwargs: Any) -> ChoiceCaller:
+        return self.choice_or_none(**kwargs)
+
+    @classmethod
+    def lookup(cls, name: str) -> "ExternKernelChoice | None":
+        return cls._registry.get(name)
+
+    def __repr__(self) -> str:
+        return f"ExternKernelChoice({self.name})"
+
+
+class ExternChoiceCaller(ChoiceCaller):
+    """The choice that runs the operation as one library call.
+
+    There is no source to hash and no region to carry: the kernel is a name
+    the runtime already knows how to launch, which is the whole reason this
+    choice is in the list.
+    """
+
+    def __init__(self, name, input_nodes=(), layout=None, description="",
+                 launcher=None):
+        super().__init__(name, input_nodes, layout, description)
+        self.launcher = launcher
+        if launcher is not None:
+            self.bind(launcher)
+
+    def autoheuristic_id(self) -> str:
+        return "extern"
+
+
 class KernelTemplate:
     """One operation, implemented by kernels chosen from a configuration space.
 
@@ -1356,6 +1461,88 @@ class ConvTemplate(LoopTemplate):
             description="a 1x1 convolution measured as the product it is",
         )
         return caller.bind(launcher)
+
+
+# ---------------------------------------------------------------------------
+# the convolution family
+# ---------------------------------------------------------------------------
+
+
+def conv1x1_via_mm(x, w, *, out=None):
+    """A one-by-one convolution, written as the product it is.
+
+    The weight's two trailing extents are one, so squeezing them is a view; the
+    contraction is over the channels, which means the input has to be read
+    with its channels last and the weight with its output channels first.  The
+    result therefore lands in a permuted layout, and un-permuting it is part
+    of the same work rather than something the caller does afterwards.
+    """
+
+    import tensorplay as tp
+
+    w = w.reshape(w.shape[0], w.shape[1])
+    moved = x.permute(0, 2, 3, 1) if x.dim() == 4 else x.permute(0, 2, 1)
+    product = tp.matmul(moved, w.permute(1, 0), out=out)
+    return product.permute(0, 3, 1, 2) if x.dim() == 4 else product.permute(0, 2, 1)
+
+
+#: The convolution the framework runs, as a choice rather than a fallback.
+framework_convolution = ExternKernelChoice(
+    None, "framework_convolution", has_out_variant=False
+)
+#: The one-by-one case, as the product it is, including the layout it needs.
+conv1x1_via_product = ExternKernelChoice(conv1x1_via_mm, "conv1x1_via_mm")
+
+
+def _conv_forward_grid(rows, cols, groups, block_m, block_n, cdiv):
+    return (cdiv(rows, block_m), cdiv(cols, block_n), groups)
+
+
+def _conv_bwd_input_grid(rows, cols, groups, block_m, block_n, cdiv):
+    return (cdiv(rows, block_m), cdiv(cols, block_n), groups)
+
+
+def _conv_bwd_weight_grid(groups, block_m, block_n, block_k, cdiv):
+    return (cdiv(1, block_m), cdiv(1, block_n), groups)
+
+
+#: The convolution templates, by what each one emits and what it tiles over.
+#:
+#: Each entry is a kernel that does not exist here yet, so each is registered as
+#: a name with the geometry it would use rather than as a choice that pretends
+#: to be measurable.  A template whose kernel is missing must not appear in a
+#: candidate list: the list is a measurement plan, and a plan that names a
+#: kernel that cannot be built is a lie told to whoever reads the result.
+CONV_TEMPLATES: dict[str, dict[str, Any]] = {
+    "convolution2d": {
+        "grid": _conv_forward_grid,
+        "rows": "batch times the output's spatial extent",
+        "cols": "output channels per group",
+        "contraction": "input channels per group",
+    },
+    "convolution3d": {
+        "grid": _conv_forward_grid,
+        "rows": "batch times the output's spatial extent",
+        "cols": "output channels per group",
+        "contraction": "input channels per group",
+    },
+    "depthwise_conv1d": {
+        "grid": None,
+        "tiling": "output positions, positions along the axis, channels",
+        "not": "a product: each channel is reduced on its own",
+    },
+    "convolution2d_bwd_input": {
+        "grid": _conv_bwd_input_grid,
+        "rows": "batch times the input's spatial extent",
+        "cols": "input channels per group",
+    },
+    "convolution2d_bwd_weight": {
+        "grid": _conv_bwd_weight_grid,
+        "rows": "output channels per group",
+        "cols": "input channels per group",
+        "contraction": "batch times the input's spatial extent",
+    },
+}
 
 
 CONV = ConvTemplate()
