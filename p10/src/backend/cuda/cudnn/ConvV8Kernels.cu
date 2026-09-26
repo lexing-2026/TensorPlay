@@ -22,6 +22,8 @@ namespace fe = cudnn_frontend;
 #include <memory>
 #include <cstdint>
 #include <optional>
+#include <algorithm>
+#include <cudnn_frontend_find_plan.h>
 
 namespace tensorplay {
 namespace cuda {
@@ -375,6 +377,9 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
 
     // Picks an execution plan for the graph.  Normally the first heuristic
     // config is used; in benchmark mode several configs are timed instead.
+    // Cap on how many candidate plans the timer profiles.
+    constexpr uint64_t kConvBenchmarkPlanLimit = 10000;
+
     auto pick_plan = [&](fe::OperationGraph& op_graph) -> std::shared_ptr<fe::ExecutionPlan> {
         const bool autotune = conv_autotune_enabled();
         const bool deterministic = tensorplay::globalContext().deterministicAlgorithms();
@@ -430,30 +435,44 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
         }
         if (candidates.size() == 1) return candidates[0];
 
-        cudaEvent_t ev_begin = nullptr, ev_end = nullptr;
-        TP_CONV_CUDA_CHECK(cudaEventCreate(&ev_begin));
-        TP_CONV_CUDA_CHECK(cudaEventCreate(&ev_end));
-        cudaStream_t stream = getCurrentCUDAStream().stream();
-        std::shared_ptr<fe::ExecutionPlan> best;
-        float best_ms = 0.0f;
+        // Hand the candidates to the library timer, which warms each plan up
+        // once, times a single run, and returns them ordered by that time.
+        // A home-grown timing loop is not equivalent: with one sample per
+        // candidate the ordering follows the sample, and a loop that keeps
+        // only the minimum of a few back-to-back runs ranks candidates by a
+        // different statistic than the one the sorted result is built from.
+        int64_t max_ws = 0;
         for (auto& cand : candidates) {
-            size_t ws = cand->getWorkspaceSize();
-            auto ws_buf = getAllocator(DeviceType::CUDA)->allocate(ws ? ws : 1);
-            run_plan(*cand, ws_buf.get(), ws);  // warmup
-            TP_CONV_CUDA_CHECK(cudaEventRecord(ev_begin, stream));
-            for (int rep = 0; rep < 3; ++rep) run_plan(*cand, ws_buf.get(), ws);
-            TP_CONV_CUDA_CHECK(cudaEventRecord(ev_end, stream));
-            TP_CONV_CUDA_CHECK(cudaEventSynchronize(ev_end));
-            float ms = 0.0f;
-            TP_CONV_CUDA_CHECK(cudaEventElapsedTime(&ms, ev_begin, ev_end));
-            if (!best || ms < best_ms) {
-                best = cand;
-                best_ms = ms;
-            }
+            max_ws = std::max(max_ws, cand->getWorkspaceSize());
         }
-        cudaEventDestroy(ev_begin);
-        cudaEventDestroy(ev_end);
-        return best;
+        auto ws_buf = getAllocator(DeviceType::CUDA)->allocate(max_ws ? max_ws : 1);
+        fe::executionPlans_t plans;
+        plans.reserve(candidates.size());
+        for (auto& cand : candidates) plans.push_back(std::move(*cand));
+        std::optional<fe::VariantPack> variant_pack;
+        if (key.has_bias) {
+            void* data_ptrs[4] = {input.data_ptr(), weight.data_ptr(), bias.data_ptr(), out.data_ptr()};
+            int64_t uids[4] = {'x', 'w', 'b', 'y'};
+            variant_pack.emplace(fe::VariantPackBuilder()
+                               .setWorkspacePointer(max_ws ? ws_buf.get() : nullptr)
+                               .setDataPointers(4, data_ptrs)
+                               .setUids(4, uids)
+                               .build());
+        } else {
+            void* data_ptrs[3] = {input.data_ptr(), weight.data_ptr(), out.data_ptr()};
+            int64_t uids[3] = {'x', 'w', 'y'};
+            variant_pack.emplace(fe::VariantPackBuilder()
+                               .setWorkspacePointer(max_ws ? ws_buf.get() : nullptr)
+                               .setDataPointers(3, data_ptrs)
+                               .setUids(3, uids)
+                               .build());
+        }
+        auto timed = fe::time_sorted_plan<fe::CudnnFindSamplingTechnique::CUDNN_FIND_SAMPLE_ONCE>(
+            handle, std::move(plans), *variant_pack, kConvBenchmarkPlanLimit);
+        if (timed.empty()) {
+            TP_THROW(RuntimeError, "cuDNN: no candidate plan could be timed");
+        }
+        return std::make_shared<fe::ExecutionPlan>(std::move(timed.front()));
     };
 
     const int64_t x_align = alignment_of(input.data_ptr());
