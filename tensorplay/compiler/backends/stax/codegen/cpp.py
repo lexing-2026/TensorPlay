@@ -6583,6 +6583,10 @@ _NATIVE_BINARY = {
     "add": ("({0}) + ({1})", "({0}) + ({1})"),
     "sub": ("({0}) - ({1})", "({0}) - ({1})"),
     "mul": ("({0}) * ({1})", "({0}) * ({1})"),
+    # True division arrives under either spelling: the arithmetic names it
+    # ``truediv`` and a program written out by hand calls it ``div``.  Both are
+    # the same operation, so both are printed the same way.
+    "truediv": ("({0}) / ({1})", "({0}) / ({1})"),
     "div": ("({0}) / ({1})", "({0}) / ({1})"),
     "maximum": (
         "tensorplay::vec::maximum({0}, {1})",
