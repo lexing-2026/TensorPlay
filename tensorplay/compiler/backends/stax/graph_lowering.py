@@ -12,9 +12,12 @@ from __future__ import annotations
 
 import contextlib
 import collections
+import functools
 import itertools
+import logging
 import operator
 import re
+from collections import defaultdict
 from typing import Any
 
 import sympy
@@ -22,9 +25,15 @@ import tensorplay as tp
 from tensorplay.utils import _pytree as pytree
 
 from . import config
+from .fx_utils import count_flops_fx
 from .loops import compute_required_storage_length, contiguous_strides
-from .utils import get_sympy_Expr_dtype
+from .utils import (
+    get_sympy_Expr_dtype,
+    has_free_symbols,
+    SUPPORTED_MKLDNN_DEVICES,
+)
 from .sizevars import SizeVarAllocator
+from .virtualized import V
 from .ir import (
     Buffer,
     BaseView,
@@ -378,6 +387,30 @@ def mark_nodes_dislike_padding(g, user_visible_output_strides: dict) -> None:
             cur.meta["dislike_padding"] = True
 
 
+log = logging.getLogger(__name__)
+
+
+def is_mkldnn_conv(node) -> bool:
+    # When mkldnn_fusion is enabled, conv will be replaced by the lowering pattern function.
+    # See _register_unary_fusion_lowering in tp/compiler/backends/stax/fx_passes/mkldnn_fusion.py.
+    if (
+        getattr(tp.ops, "mkldnn", None) is not None
+        and getattr(tp.ops.mkldnn, "_convolution_pointwise", None) is not None
+        and isinstance(node.target, functools.partial)
+        and len(node.target.args) > 0
+        and hasattr(node.target.args[0], "targets")
+    ):
+        for target in node.target.args[0].targets:
+            if target.fns[0] in [
+                tp.ops.mkldnn._convolution_pointwise.default,
+                tp.ops.mkldnn._convolution_pointwise.binary,
+                tp.ops.mkldnn._convolution_pointwise_.binary,
+            ]:
+                return True
+
+    return False
+
+
 class GraphLowering:
     def __init__(
         self,
@@ -390,6 +423,7 @@ class GraphLowering:
         extern_node_serializer: Any = None,
         is_inference: bool = False,
         is_backward: bool = False,
+        layout_opt: bool | None = None,
         name: str | None = None,
     ):
         # Which shape the values are described against, kept rather than taken
@@ -459,6 +493,16 @@ class GraphLowering:
         self.graph_outputs: list[Any] = []
         # The shape environment of the region, and the questions asked of it.
         self.sizevars = SizeVarAllocator()
+        # Whether the layouts here may be chosen rather than taken as they are
+        # given, which is what makes a call of the kind that gains from a
+        # particular layout be laid out for it.
+        self.layout_opt = (
+            layout_opt
+            if layout_opt is not None
+            else self.decide_layout_opt(
+                graph_module, is_inference=is_inference
+            )
+        )
         # How many calls were laid out with their channels last because the
         # layouts were being chosen.  Read afterwards to see how much of the
         # program's traffic that choice accounted for, which is the only way to
@@ -579,6 +623,177 @@ class GraphLowering:
             self.device_idxs.add(device.index)
         if V.graph.current_node and device not in self.device_node_mapping:
             self.device_node_mapping[device] = V.graph.current_node
+
+    @staticmethod
+    def decide_layout_opt(gm, *, is_inference: bool) -> bool:
+        """Whether this region's layouts are ours to choose.
+
+        A region holding no call of the kind that gains from a particular
+        layout is not one where choosing would pay, so the question is asked of
+        the region rather than answered once for the process.  What the answer
+        turns on is the shape of those calls: how many there are against how
+        much work the region holds, whether the shapes are known, and the
+        proportions of each call -- grouped calls and calls whose incoming
+        channels exceed their outgoing ones are the two that a layout of this
+        kind is measured to hurt, and calls with few channels are the one it
+        does not help.
+        """
+        if not config.layout_optimization:
+            return False
+
+        if config.force_layout_optimization:
+            return True
+
+        conv_nodes = [
+            n for n in gm.graph.nodes if n.target is tp.ops.tp.convolution.default
+        ]
+
+        for n in gm.graph.nodes:
+            if is_mkldnn_conv(n):
+                conv_nodes.append(n)
+
+        nconv = len(conv_nodes)
+
+        if nconv == 0:
+            return False
+
+        # For cpu backend and mkldnn enabled, we always use channels_last for better performance.
+        if (
+            tp.backends.mkldnn.enabled
+            and tp.backends.mkldnn.is_available()
+            and all(
+                n.args[idx].meta["val"].device.type in SUPPORTED_MKLDNN_DEVICES
+                for n in conv_nodes
+                for idx in [0, 1]
+            )
+        ):
+            return True
+
+        # A region holding little besides these calls is one where the layout
+        # is not what the time goes on, so it is not chosen.
+        if len(list(gm.graph.nodes)) >= 300 * nconv:
+            log.debug("Skipped layout opt because only a few conv")
+            return False
+
+        if any(
+            has_free_symbols(n.args[idx].meta["val"])
+            for n in conv_nodes
+            for idx in [0, 1]
+        ):
+            log.debug(
+                "Skipped layout opt because the extents are not all known"
+            )
+            return False
+
+        def is_grouped(n: Any) -> bool:
+            meta_val = n.args[1].meta["val"]  # type: ignore[union-attr, operator]
+            if not isinstance(meta_val, tp.Tensor):
+                raise AssertionError(f"Expected tp.Tensor, got {type(meta_val)}")
+            return n.args[-1] > 1 and meta_val.size(1) > 1  # type: ignore[union-attr, operator]
+
+        def is_in_out_channel(n) -> bool:
+            return (
+                n.args[1].meta["val"].size(0) * 2 <= n.args[1].meta["val"].size(1)  # type: ignore[union-attr, operator]
+                and n.args[1].meta["val"].size(2) > 1  # type: ignore[union-attr, operator]
+            )
+
+        def is_small_channel(n: Any) -> bool:
+            return (
+                n.args[1].meta["val"].size(0) <= 64  # type: ignore[union-attr, operator]
+                and n.args[1].meta["val"].size(1) <= 64  # type: ignore[union-attr, operator]
+            )
+
+        # only grouped convolutions benchmarked as slower in conv samples for inference only
+        if is_inference:
+            flop_counts: dict[str, float] = defaultdict(float)
+            for node in conv_nodes:
+                counted_flops = count_flops_fx(node)
+                if counted_flops is None:
+                    continue
+
+                if is_grouped(node):
+                    node_type = "grouped"
+                elif is_small_channel(node):
+                    node_type = "small"
+                elif is_in_out_channel(node):
+                    node_type = "in_out"
+                else:
+                    node_type = "default"
+
+                flop_counts[node_type] += counted_flops
+            else:
+                log.debug("Conv inputs meta not found")
+
+            # Average measured cost of the channels-last layout against the
+            # default one, per kind of call; below one is a speedup.  A whole
+            # region's work is weighed by how much of it is each kind, so a
+            # region that is mostly calls the layout helps is taken, and one
+            # that is mostly calls it hurts is not.
+            GROUPED_MULTIPLIER = 1.358
+            DEFAULT_MULTIPLIER = 0.823
+            IN_OUT_MULTIPLIER = 0.725
+            SMALL_MULTIPLIER = 0.783
+
+            total_flops = sum(flop_counts.values())
+            # TODO - get different values per hardware
+            weighted_flops = (
+                flop_counts["grouped"] * GROUPED_MULTIPLIER
+                + flop_counts["small"] * SMALL_MULTIPLIER
+                + flop_counts["in_out"] * IN_OUT_MULTIPLIER
+                + flop_counts["default"] * DEFAULT_MULTIPLIER
+            )
+            do_layout_opt = weighted_flops <= total_flops
+            if not do_layout_opt:
+                log.debug(
+                    "Skipped layout opt in inference because weighted flops indicate slowdown, default: %d, channels last: %d",
+                    total_flops,
+                    weighted_flops,
+                )
+            return do_layout_opt
+
+        # Channels last layout can dramatically hurt grouped conv perf. E.g.
+        # Conv with arguments like
+        #   {"input_shape": [32, 224, 112, 112], "weight_shape": [224, 112, 3, 3],
+        #    "stride": [2, 2], "padding": [1, 1], "groups": 2}
+        # slows down 31x using channels last..
+
+        # But a lot of timm models use depthwise separable convolution which will
+        # result in grouped convolution with in-channel size == 1.
+        # For those grouped convolution, channels last still helps a lot.
+        # E.g.
+        # Conv with arguments
+        #   {"input_shape": [128, 58, 56, 56], "weight_shape": [58, 1, 3, 3],
+        #    "stride": [2, 2], "padding": [1, 1], "groups": 58}
+        # get 1.86x speedup with channels last layout.
+        #
+        # The following heuristics skip using channels-last if the model contains
+        # grouped convolution with in-channels > 1.
+        if any(map(is_grouped, conv_nodes)):
+            log.debug(
+                "Skip layout opt because found grouped convolution with >1 in_channels!"
+            )
+            return False
+
+        # For some models that contain convolution with larger in-channel than out-channel, applying
+        # channels last hurts performance.
+        # A call whose incoming channels exceed its outgoing ones is one this
+        # layout is measured to hurt, however few of them there are.
+        if any(map(is_in_out_channel, conv_nodes)):
+            log.debug(
+                "Skip layout opt because some convolutions have smaller out_channel"
+            )
+            return False
+
+        # Calls this narrow throughout are ones the layout does not help.
+        if all(map(is_small_channel, conv_nodes)):
+            log.debug("Skip layout opt because all convolution channels are too small")
+            return False
+
+        return True
+
+    @property
+    def fake_mode(self):
+        return V.fake_mode
 
     def qualify_name(self, name: str) -> str:
         """Put this region's own name in front of a name of a thing inside it.
@@ -1032,6 +1247,7 @@ class GraphLowering:
             tensor_args=tuple(tensor_args),
             nontensor_args=tuple(other_args),
             unflatten_args=unflatten,
+            constant_args=list(other_args),
             kwargs=realized_kwargs,
         )
         kernel.origin_node = node

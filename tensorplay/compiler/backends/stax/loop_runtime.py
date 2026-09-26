@@ -126,7 +126,19 @@ class ExternStep(Step):
             args, kwargs = kernel.unflatten_args(*described)
             return target(*args, **kwargs)
         inputs, constants = described
-        operands = [*inputs, *constants, *kernel.kwargs.values()]
+        # The values the call is given after its inputs are the ones the
+        # operation declared, in the order it declared them.  The mapping it
+        # was described through is not ordered that way -- it is a mapping, and
+        # what order it reads in is its own business -- so the declared order
+        # is what says which value belongs at which position, and taking the
+        # values in the order the mapping happens to hold would put them at
+        # positions the operation never asked for.
+        tail = [
+            kernel.kwargs[name]
+            for name in (kernel.ordered_kwargs_for_cpp_kernel or ())
+            if name in kernel.kwargs
+        ]
+        operands = [*inputs, *constants, *tail]
         if isinstance(kernel, ExternKernelOut):
             # The result is written into memory this graph already holds, so
             # that memory is made here if nobody has made it: an operation that

@@ -30,7 +30,7 @@ import tensorplay as tp
 from .utils import register_op_dtype_propagation_rules
 
 from tensorplay.primitives.common import ELEMENTWISE_TYPE_PROMOTION_KIND
-from .dtype_propagation import get_promoted_dtype
+from .dtype_propagation import promoted_dtype_of_values
 from tensorplay.utils._pytree import tree_map
 
 from . import ir
@@ -277,7 +277,9 @@ def transform_args(
             promoting_args.extend(
                 (a for a in kwargs.values() if hasattr(a, "dtype"))
             )
-            dtype = get_promoted_dtype(*promoting_args, type_promotion_kind=type_promotion_kind)
+            dtype = promoted_dtype_of_values(
+                *promoting_args, type_promotion_kind=type_promotion_kind
+            )
         device = (
             args[args_indices[0]] if args_indices else kwargs[kwargs_indices[0]]
         ).get_device()
@@ -563,6 +565,15 @@ def pointwise(fn, *inputs, val=None):
 
 
 def cast_to(value, dtype):
+    """The value read as this type, unchanged when it already is.
+
+    A value already of the type is returned as it is rather than converted to
+    itself: a conversion to the type a value already has is a no-op that still
+    costs a kernel, and for a value that is not a loop nest there is no loop to
+    put it in.
+    """
+    if is_tensor_box(value) and value.get_dtype() == dtype:
+        return value
     return ops.to_dtype(value, dtype)
 
 
@@ -581,7 +592,11 @@ def _alpha(args, kwargs, position):
     return kwargs.get("alpha", 1)
 
 
-@register("add.Tensor", "add.Scalar")
+@register_lowering(
+    ["add.Tensor", "add.Scalar"],
+    broadcast=True,
+    type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
+)
 def lower_add(a, b, *rest, **kwargs):
     alpha = _alpha((a, b, *rest), kwargs, 2)
     if alpha == 1:

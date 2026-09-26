@@ -933,8 +933,8 @@ class SizeVarAllocator:
         if not isinstance(x, (tuple, list, Expr)):
             raise AssertionError(f"expected tuple, list, or Expr but got {x}")
         if isinstance(x, Expr):
-            return (self.guard_int(x),)
-        return (self.guard_int(xi) for xi in x)
+            return [self.guard_int(x)]
+        return [self.guard_int(xi) for xi in x]
 
     def to_symint_or_int(self, x):
         """The value of a shape, as a plain number where it is one.

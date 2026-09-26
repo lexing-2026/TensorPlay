@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable, Sequence
+from numbers import Number
 from typing import Any, Optional, Protocol
 
 import sympy
@@ -59,6 +60,39 @@ class DTypeVar(Protocol):
 
 
 DTypeArg = Any
+
+
+def promoted_dtype_of_values(
+    *args: Any,
+    type_promotion_kind=None,
+    return_compute_dtype: bool = False,
+):
+    """The type the promotion of these values comes to.
+
+    Asked of the values themselves rather than of a list of types, because a
+    lowering is handed values and should not have to take them apart first: a
+    value knows its own type and its own rank, and a number is already a type
+    as far as the promotion is concerned.  The promotion is settled on a value
+    of the right type and rank standing in for each, since what decides a
+    promotion is the types involved and not how many elements there are.
+    """
+
+    def construct_input(inp):
+        if isinstance(inp, (Number, sympy.Basic)):
+            return inp
+        dim = len(inp.get_size())
+        return tp.zeros([1] * dim, dtype=inp.get_dtype())
+
+    inps = [construct_input(arg) for arg in args]
+    compute_dtype, result_dtype = elementwise_dtypes(
+        *inps,
+        type_promotion_kind=(
+            type_promotion_kind
+            if type_promotion_kind
+            else ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT
+        ),
+    )
+    return compute_dtype if return_compute_dtype else result_dtype
 
 
 @functools.cache

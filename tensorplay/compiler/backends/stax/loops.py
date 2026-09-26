@@ -287,17 +287,24 @@ def set_graph(graph):
     is known about the extents belongs to the region they came from and a
     generator that is handed the region has to be able to ask about them
     without being handed the region a second time.
+
+    The region is published on the shared virtualized state as well as on the
+    local one, because a template asks the region for its size variables
+    through that state and would otherwise be told there is no region at all.
     """
+
+    from . import virtualized
 
     previous = V.graph
     previous_sizevars = V.sizevars
     V.graph = graph
     V.sizevars = getattr(graph, "sizevars", None)
-    try:
-        yield graph
-    finally:
-        V.graph = previous
-        V.sizevars = previous_sizevars
+    with virtualized.V.set_graph_handler(graph):
+        try:
+            yield graph
+        finally:
+            V.graph = previous
+            V.sizevars = previous_sizevars
 
 
 @contextlib.contextmanager

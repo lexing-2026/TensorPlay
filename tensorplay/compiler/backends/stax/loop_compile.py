@@ -8,6 +8,8 @@ separate kernels rather than failing the whole program.
 
 from __future__ import annotations
 
+from tensorplay._higher_order_ops._hop_base import FakeTensorMode
+
 import typing
 from typing import Any, Callable
 
@@ -85,7 +87,12 @@ def _steps_for(graph, groups) -> list:
 def compile_graph(graph_module, example_inputs, *, scheduler: KernelScheduler | None = None) -> LoopProgram:
     """Lower, schedule and compile ``graph_module``; returns a callable."""
 
-    graph = GraphLowering(graph_module, list(example_inputs)).run()
+    from .loops import set_fake_mode
+    from .virtualized import V as shared_V
+
+    with set_fake_mode(FakeTensorMode(allow_non_fake_inputs=True)), \
+            shared_V.set_fake_mode(FakeTensorMode(allow_non_fake_inputs=True)):
+        graph = GraphLowering(graph_module, list(example_inputs)).run()
     plan = scheduler if scheduler is not None else KernelScheduler(graph)
     graph.scheduler = plan
     groups = plan.fuse()
@@ -158,8 +165,12 @@ def compile_half_host(graph_module, example_inputs, **options):
 
     del options
     from .loop_runtime import ExternStep, HostStep, LoopProgram
+    from .loops import set_fake_mode
+    from .virtualized import V as shared_V
 
-    graph = GraphLowering(graph_module, list(example_inputs)).run()
+    with set_fake_mode(FakeTensorMode(allow_non_fake_inputs=True)), \
+            shared_V.set_fake_mode(FakeTensorMode(allow_non_fake_inputs=True)):
+        graph = GraphLowering(graph_module, list(example_inputs)).run()
     plan = KernelScheduler(graph)
     graph.scheduler = plan
     # Fusing is asked once and the groups are kept: fusing walks the region and

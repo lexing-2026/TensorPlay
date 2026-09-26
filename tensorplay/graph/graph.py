@@ -359,17 +359,61 @@ class _NodeList(list[Node]):
     def _mutated(self, old: Iterable[Node]) -> None:
         self.graph._sync_nodes(self, old)
 
+    def _added(self, values: Iterable[Node]) -> None:
+        """Book-keeping for nodes just put on the end, one at a time.
+
+        Adding to the end is the overwhelmingly common way a list of nodes
+        grows, and re-reading the whole list to record where each of them now
+        sits makes that cost grow with the square of the size -- a graph of a
+        few hundred nodes spends most of a compile being counted.  The counts
+        are kept the same way they would be if the whole list were re-read, so
+        nothing downstream can tell the two apart.
+        """
+
+        graph = self.graph
+        index = len(self)
+        for node in values:
+            node.graph = graph
+            node._erased = False
+            graph._index[node] = index
+            node._sort_key = graph._next_sort_key
+            graph._next_sort_key += 1
+            graph._live_names.add(node.name)
+            if hasattr(graph, "_find_nodes_lookup_table"):
+                graph._find_nodes_lookup_table.insert(node)
+            index += 1
+
+    def _removed(self, values: Iterable[Node]) -> None:
+        """Book-keeping for nodes just taken off, one at a time."""
+
+        graph = self.graph
+        for node in values:
+            if node.graph is not graph:
+                continue
+            node.graph = None
+            node._erased = True
+            graph._index.pop(node, None)
+            graph._live_names.discard(node.name)
+            if hasattr(graph, "_find_nodes_lookup_table"):
+                graph._find_nodes_lookup_table.remove(node)
+
     def append(self, node: Node) -> None:
-        old = tuple(self)
         super().append(node)
-        self._mutated(old)
+        self._added((node,))
 
     def extend(self, values: Iterable[Node]) -> None:
-        old = tuple(self)
+        values = tuple(values)
         super().extend(values)
-        self._mutated(old)
+        self._added(values)
 
     def insert(self, index: int, node: Node) -> None:
+        # A node put anywhere but the end shifts everything after it, so the
+        # positions of those have to be re-read.  Putting one on the end, which
+        # is what a graph being built does, does not.
+        if index >= len(self):
+            super().append(node)
+            self._added((node,))
+            return
         old = tuple(self)
         super().insert(index, node)
         self._mutated(old)
@@ -377,18 +421,17 @@ class _NodeList(list[Node]):
     def remove(self, node: Node) -> None:
         old = tuple(self)
         super().remove(node)
-        self._mutated(old)
+        self._removed((node,))
 
     def pop(self, index: int = -1) -> Node:
-        old = tuple(self)
-        result = super().pop(index)
-        self._mutated(old)
-        return result
+        node = self[index]
+        del self[index]
+        return node
 
     def clear(self) -> None:
         old = tuple(self)
         super().clear()
-        self._mutated(old)
+        self._removed(old)
 
     def reverse(self) -> None:
         old = tuple(self)
@@ -406,14 +449,19 @@ class _NodeList(list[Node]):
         self._mutated(old)
 
     def __delitem__(self, index: int | slice) -> None:
-        old = tuple(self)
+        if isinstance(index, slice):
+            old = tuple(self)[index]
+            super().__delitem__(index)
+            self._removed(old)
+            return
+        node = self[index]
         super().__delitem__(index)
-        self._mutated(old)
+        self._removed((node,))
 
     def __iadd__(self, values: Iterable[Node]) -> "_NodeList":
-        old = tuple(self)
+        values = tuple(values)
         super().__iadd__(values)
-        self._mutated(old)
+        self._added(values)
         return self
 
     def __imul__(self, count: int) -> "_NodeList":

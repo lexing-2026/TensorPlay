@@ -36,7 +36,7 @@ from ..kernel_inputs import ConvKernelInputs, KernelInputs
 from .select_algorithm import call_operation, TritonChoiceCaller
 
 from .. import config
-from ..op_lowerings import register, register_lowering
+from ..op_lowerings import LOWERINGS, register, register_lowering
 from .mm import GEMM, tuned_addmm, tuned_mm
 from .mm_common import load_kernel_template, use_triton_template
 
@@ -112,8 +112,8 @@ def channels_last_order(rank: int) -> tuple:
     return tuple(order)
 
 
-def conv_layout(x, weight, bias, params: ConvLayoutParams, device=None,
-                dtype=None) -> Layout:
+def conv_layout(x, weight, bias, stride, padding, dilation, transposed,
+                output_padding, groups, device=None, dtype=None) -> Layout:
     """Where a convolution's result lands, asked rather than derived.
 
     The extent and stride of a convolution's result are not a formula over the
@@ -130,15 +130,33 @@ def conv_layout(x, weight, bias, params: ConvLayoutParams, device=None,
 
     import tensorplay as tp
 
-    output = tp.convolution(
-        x, weight, bias, params.stride, params.padding, params.dilation,
-        params.transposed, params.output_padding, params.groups,
-    )
+    from ..ir import convert_shape_to_inductor, ir_node_to_tensor
+
+    # We use guard_int_seq rather than size_hints because the output shape
+    # depends on these values — if they ever contained symbols, size_hints
+    # would silently substitute a hint that could be wrong, producing an
+    # incorrect layout. guard_int_seq will install a proper guard instead.
+    guard = V.graph.sizevars.guard_int_seq
+    with V.graph.fake_mode:
+        output = tp.ops.tp.convolution(
+            ir_node_to_tensor(x),
+            ir_node_to_tensor(weight),
+            ir_node_to_tensor(bias),
+            guard(stride),
+            guard(padding),
+            guard(dilation),
+            transposed,
+            guard(output_padding),
+            groups,
+        )
+        sizes = convert_shape_to_inductor(output.shape)
+        out_stride = convert_shape_to_inductor(output.stride())  # type: ignore[assignment]
+
     return FixedLayout(
         device if device is not None else output.device,
         dtype if dtype is not None else output.dtype,
-        tuple(int(v) for v in output.shape),
-        tuple(int(v) for v in output.stride()),
+        sizes,
+        out_stride,
     )
 
 class ConvConfigHeuristics(TemplateConfigHeuristics):
@@ -244,9 +262,11 @@ class DepthwiseConvTemplate(KernelTemplate):
         if bias_spec is not None and len(feed) > 3:
             bias = operand(bias_spec[0], bias_spec[1])
         try:
+            params = ConvLayoutParams.from_meta(meta)
             return conv_layout(
                 operand(*specs[0]), operand(*specs[1]), bias,
-                ConvLayoutParams.from_meta(meta),
+                params.stride, params.padding, params.dilation,
+                params.transposed, params.output_padding, params.groups,
                 device=meta.get("device"), dtype=meta.get("out_dtype"),
             )
         except Exception:  # noqa: BLE001 - an unaskable call falls back
@@ -386,9 +406,11 @@ class ConvTemplate(KernelTemplate):
         if bias_spec is not None and len(feed) > 3:
             bias = operand(bias_spec[0], bias_spec[1])
         try:
+            params = ConvLayoutParams.from_meta(meta)
             return conv_layout(
                 operand(*specs[0]), operand(*specs[1]), bias,
-                ConvLayoutParams.from_meta(meta),
+                params.stride, params.padding, params.dilation,
+                params.transposed, params.output_padding, params.groups,
                 device=meta.get("device"), dtype=meta.get("out_dtype"),
             )
         except Exception:  # noqa: BLE001 - an unaskable call falls back
@@ -1387,7 +1409,10 @@ def convolution(
         result = convolution(x, weight, None, **kwargs)
         if V.graph.sizevars.statically_known_equals(result.get_size()[1], 0):
             return result
-        return result + bias.view([result.get_size()[1]] + ndim * [1])
+        return LOWERINGS["add.Tensor"](
+            result,
+            LOWERINGS["view.default"](bias, [result.get_size()[1]] + ndim * [1]),
+        )
 
     x.realize()
     weight.realize()
