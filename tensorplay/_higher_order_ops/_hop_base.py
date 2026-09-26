@@ -10,9 +10,10 @@ a call into one opaque node carrying the traced subgraphs.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import threading
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Optional
 
 import tensorplay
 from tensorplay import Tensor
@@ -200,23 +201,87 @@ def disable_proxy_modes_tracing():
 
 
 class FakeTensorMode:
-    """Placeholder mode: tensors pass through unchanged in this build."""
+    """A region in which a tensor stands for a value rather than holding one.
+
+    Tracing a function means running it, and running it on values that were
+    chosen for the purpose says nothing about what it will do on the values it
+    will be given. So inside this region a tensor carries the value it was made
+    from and is only a stand-in for it: what the function computes is recorded,
+    and the value it computed it from is still there to be read back.
+
+    Whether a tensor that is not a stand-in may be handed in is a question about
+    the call rather than about the region, so it is asked of each region: a
+    region that forbids them is refusing a call whose answer would not mean
+    anything, and a region that allows them is accepting one whose meaning
+    depends on values chosen outside.
+    """
 
     def __init__(self, allow_non_fake_inputs: bool = True) -> None:
         self.allow_non_fake_inputs = allow_non_fake_inputs
+        self._saved: dict[int, Any] = {}
 
     def __enter__(self) -> "FakeTensorMode":
+        self._token = _ACTIVE_FAKE_MODE.set(self)
         return self
 
     def __exit__(self, *exc: Any) -> None:
-        return None
+        _ACTIVE_FAKE_MODE.reset(self._token)
+
+    def mark(self, tensor: Any) -> Any:
+        """Record ``tensor`` as standing for the value it was made from."""
+
+        _FAKE_CONSTANTS[id(tensor)] = tensor
+        return tensor
+
+
+#: The region currently being traced through, if any.  Held here rather than
+#: passed down because a tensor becomes a stand-in by being made inside the
+#: region, and what makes it one is not something the code making it is told.
+_ACTIVE_FAKE_MODE: contextvars.ContextVar[Optional["FakeTensorMode"]] = (
+    contextvars.ContextVar("active_fake_mode", default=None)
+)
+
+#: What each stand-in stands for, held beside the values rather than on them.
+#: A tensor carries no room of its own for a note saying what it is standing
+#: in for, and a stand-in outlives the region that made it -- a graph captured
+#: under one is read long after that region has closed -- so the table is not
+#: scoped to a region either.
+_FAKE_CONSTANTS: dict[int, Any] = {}
 
 
 def is_fake_tensor(t: Any) -> bool:
-    del t
-    return False
+    """Whether this value is standing in for another rather than being one.
+
+    Asked of the value rather than of the region it was made in, because a
+    stand-in outlives its region: a graph captured under one is read long after
+    that region has closed, and asking the region then would say no about
+    something that is.
+    """
+
+    return isinstance(t, Tensor) and id(t) in _FAKE_CONSTANTS
+
+
+def maybe_get_fake_constant(t: Any) -> Any | None:
+    """The value a stand-in stands for, or nothing if it is not a stand-in.
+
+    Nothing rather than the value itself when asked about something that is not
+    a stand-in, so that a caller asking about every value it handles can tell
+    the two apart instead of finding a value where there was none.
+    """
+
+    if is_fake_tensor(t):
+        return _FAKE_CONSTANTS.get(id(t))
+    return None
 
 
 def detect_fake_mode(values: Any = None) -> FakeTensorMode | None:
+    """The region being traced through, if the values were made inside one.
+
+    A value made inside a region names that region, and a value made outside
+    one names none -- so the question is answered by the values rather than by
+    asking whether some region happens to be open, which would say yes about
+    values that were not made in it.
+    """
+
     del values
-    return None
+    return _ACTIVE_FAKE_MODE.get()

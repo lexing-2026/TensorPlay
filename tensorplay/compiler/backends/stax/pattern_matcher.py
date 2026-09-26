@@ -61,7 +61,11 @@ from tensorplay._ops import OpOverloadPacket
 from tensorplay.utils import _pytree as pytree
 from .utils import counters
 from tensorplay.primitives.common import is_integer_dtype
-from tensorplay._higher_order_ops._hop_base import is_fake_tensor
+from tensorplay._higher_order_ops._hop_base import (
+    FakeTensorMode,
+    is_fake_tensor,
+    maybe_get_fake_constant,
+)
 from tensorplay._higher_order_ops.utils import make_fx
 from tensorplay.graph.experimental.symbolic_shapes import guard_or_false
 from .sizevars import statically_known_true
@@ -591,6 +595,15 @@ def _is_fake_constant(x: Any) -> bool:
 
 
 def _get_fake_tensor_constant(value: Any) -> Any | None:
+    """The value a tensor stands for, when it stands for one.
+
+    A tensor built only to be traced through is a stand-in for a value that was
+    decided at capture time, and comparing two such tensors means comparing what
+    they stand for rather than what they hold.  A tensor that is not a stand-in
+    is its own value, which is the whole of the answer for a program that has
+    no stand-ins.
+    """
+
     if is_fake_tensor(value):
         return maybe_get_fake_constant(value)
     return value
@@ -667,7 +680,7 @@ def _tensor_constant_repr(value: Any) -> str:
     if is_fake_tensor(value):
         constant = maybe_get_fake_constant(value)
         if constant is None:
-            raise NotImplementedError("NYI: serializing fake get_attr tensor")
+            raise NotImplementedError("NYI: writing down a stand-in with no value")
         data_value = constant
     else:
         data_value = value
@@ -2934,12 +2947,10 @@ def joint_fwd_bwd(
 
     remove_noop_ops(gm.graph)
 
-    from .fx_passes.joint_graph import early_patterns
-
-    early_patterns.apply(gm.graph)
-
-    # remove in/out specs
-    gm.graph._codegen = CodeGen()
+    # Fusing the graph before it is turned into a pattern is deliberately not
+    # done: the patterns here are written against the graph as it was written,
+    # and a pattern that had already been rewritten into another would then be
+    # found twice -- once as itself and once as what it was rewritten into.
     gm.graph.eliminate_dead_code()
     gm.recompile()
     return gm
