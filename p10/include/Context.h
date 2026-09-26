@@ -181,7 +181,9 @@ private:
     Float32MatmulPrecision float32_matmul_precision_ = Float32MatmulPrecision::HIGHEST;
     bool allow_tf32_cudnn_ = true;
     bool allow_fp16_acc_cublas_ = true;
-    bool cudnn_benchmark_ = true;
+    // Off by default: the plain heuristic pick is the fast path, and turning
+    // this on makes every new shape time several candidate plans first.
+    bool cudnn_benchmark_ = false;
     bool enabled_mkldnn_ = true;
     bool enabled_nnpack_ = true;
     LinalgBackend linalg_preferred_backend_ = LinalgBackend::Default;

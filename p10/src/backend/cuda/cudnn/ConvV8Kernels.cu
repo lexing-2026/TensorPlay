@@ -285,6 +285,19 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
     static std::unordered_map<ConvKey, std::shared_ptr<fe::ExecutionPlan>, ConvKeyHash> g_conv_plan_cache;
     static std::mutex g_conv_cache_mutex;
 
+    // Byte alignment of a tensor's storage, as the engine selection is
+    // sensitive to it: an engine that requires a wider alignment than the
+    // one declared here is not offered.  Doubling stops at 32 bytes, which
+    // is the widest alignment the engine configurations are built around.
+    auto alignment_of = [](const void* ptr) -> int64_t {
+        int64_t alignment = 1;
+        auto address = reinterpret_cast<uintptr_t>(ptr);
+        for (; alignment < 32; alignment *= 2) {
+            if (address % static_cast<uintptr_t>(alignment * 2)) return alignment;
+        }
+        return alignment;
+    };
+
     const bool use_channels_last = is_channels_last_4d(input);
     const bool post_bias_add =
         bias.defined() && bias.numel() != 0 && !fused_relu &&
@@ -439,6 +452,12 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
         return best;
     };
 
+    const int64_t x_align = alignment_of(input.data_ptr());
+    const int64_t w_align = alignment_of(weight.data_ptr());
+    const int64_t y_align = alignment_of(out.data_ptr());
+    const int64_t bias_align =
+        bias.defined() ? alignment_of(bias.data_ptr()) : y_align;
+
     std::shared_ptr<fe::ExecutionPlan> plan;
     {
         std::lock_guard<std::mutex> lock(g_conv_cache_mutex);
@@ -450,21 +469,21 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
                               .setDim(4, std::array<int64_t, 4>{N, C, H, W}.data())
                               .setStrides(4, x_stride.data())
                               .setId('x')
-                              .setAlignment(16)
+                              .setAlignment(x_align)
                               .setDataType(dtype)
                               .build();
             auto w_desc = fe::TensorBuilder()
                               .setDim(4, std::array<int64_t, 4>{K, C / groups, R, S}.data())
                               .setStrides(4, w_stride.data())
                               .setId('w')
-                              .setAlignment(16)
+                              .setAlignment(w_align)
                               .setDataType(dtype)
                               .build();
             auto y_desc = fe::TensorBuilder()
                               .setDim(4, std::array<int64_t, 4>{N, K, OH, OW}.data())
                               .setStrides(4, y_stride.data())
                               .setId('y')
-                              .setAlignment(16)
+                              .setAlignment(y_align)
                               .setDataType(dtype)
                               .build();
 
@@ -498,7 +517,7 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
                                          .setDim(4, std::array<int64_t, 4>{N, K, OH, OW}.data())
                                          .setStrides(4, y_stride.data())
                                          .setId('C')
-                                         .setAlignment(16)
+                                         .setAlignment(y_align)
                                          .setDataType(compute)
                                          .setVirtual(true)
                                          .build();
@@ -506,7 +525,7 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
                                   .setDim(4, std::array<int64_t, 4>{1, K, 1, 1}.data())
                                   .setStrides(4, std::array<int64_t, 4>{K, 1, 1, 1}.data())
                                   .setId('b')
-                                  .setAlignment(16)
+                                  .setAlignment(bias_align)
                                   .setDataType(dtype)
                                   .build();
                 auto bias_add_desc = fe::PointWiseDescBuilder()
@@ -526,7 +545,7 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
                                         .setDim(4, std::array<int64_t, 4>{N, K, OH, OW}.data())
                                         .setStrides(4, y_stride.data())
                                         .setId('B')
-                                        .setAlignment(16)
+                                        .setAlignment(y_align)
                                         .setDataType(compute)
                                         .setVirtual(true)
                                         .build();
@@ -578,7 +597,7 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
                                          .setDim(4, std::array<int64_t, 4>{N, K, OH, OW}.data())
                                          .setStrides(4, y_stride.data())
                                          .setId('C')
-                                         .setAlignment(16)
+                                         .setAlignment(y_align)
                                          .setDataType(compute)
                                          .setVirtual(true)
                                          .build();
