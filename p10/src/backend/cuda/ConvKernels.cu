@@ -947,6 +947,10 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
         bool has_bias;
         bool fused_relu;
         bool autotune;
+        // Numeric switches are part of the plan identity: flipping either one
+        // changes which engines are legal, so a cached plan must not be reused.
+        bool allow_tf32;
+        bool deterministic;
         std::array<int64_t, 4> x_stride;
         std::array<int64_t, 4> w_stride;
         std::array<int64_t, 4> y_stride;
@@ -956,6 +960,7 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
                    ph == o.ph && pw == o.pw && sh == o.sh && sw == o.sw &&
                    dh == o.dh && dw == o.dw && device == o.device &&
                    has_bias == o.has_bias && fused_relu == o.fused_relu &&
+                   allow_tf32 == o.allow_tf32 && deterministic == o.deterministic &&
                    autotune == o.autotune &&
                    x_stride == o.x_stride && w_stride == o.w_stride &&
                    y_stride == o.y_stride;
@@ -999,6 +1004,8 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
                 padding[0], padding[1], stride[0], stride[1], dilation[0], dilation[1],
                 static_cast<int>(input.device().index()),
                 bias.defined() && !post_bias_add, fused_relu, conv_autotune_enabled(),
+                tensorplay::globalContext().allowTF32CuDNN(),
+                tensorplay::globalContext().deterministicAlgorithms(),
                 x_stride, w_stride, y_stride};
 
     cudnnHandle_t handle = CUDAContext::getCudnnHandle();
@@ -1027,10 +1034,38 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
         }
     };
 
+    // Numerical-note based engine filter: an engine is unusable when it is
+    // non-deterministic (in deterministic mode), when it down-converts the
+    // inputs, or when it relies on tensor cores while TF32 is off for float32.
+    auto usable_engine_configs = [](fe::EngineConfigList& from,
+                                     bool deterministic,
+                                     bool allow_tf32,
+                                     cudnnDataType_t scalar_type) {
+        fe::EngineConfigList kept;
+        auto drop = [=](cudnnBackendDescriptor_t c) {
+            if (deterministic &&
+                fe::hasNumericalNote<CUDNN_NUMERICAL_NOTE_NONDETERMINISTIC>(c)) {
+                return true;
+            }
+            if (fe::hasNumericalNote<CUDNN_NUMERICAL_NOTE_DOWN_CONVERT_INPUTS>(c)) {
+                return true;
+            }
+            if (scalar_type == CUDNN_DATA_FLOAT && !allow_tf32 &&
+                fe::hasNumericalNote<CUDNN_NUMERICAL_NOTE_TENSOR_CORE>(c)) {
+                return true;
+            }
+            return false;
+        };
+        fe::filter(from, kept, drop);
+        return kept;
+    };
+
     // Picks an execution plan for the graph.  Normally the first heuristic
-    // fallback heuristics are asked for several configs and the fastest is
+    // config is used; in benchmark mode several configs are timed instead.
     auto pick_plan = [&](fe::OperationGraph& op_graph) -> std::shared_ptr<fe::ExecutionPlan> {
         const bool autotune = conv_autotune_enabled();
+        const bool deterministic = tensorplay::globalContext().deterministicAlgorithms();
+        const bool allow_tf32 = tensorplay::globalContext().allowTF32CuDNN();
         auto heuristics = fe::EngineHeuristicsBuilder()
                               .setOperationGraph(op_graph)
                               .setHeurMode(autotune ? CUDNN_HEUR_MODE_FALLBACK
@@ -1040,15 +1075,32 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
         if (engine_configs.empty()) {
             TP_THROW(RuntimeError, "cuDNN: no engine configs for conv2d");
         }
-        if (!autotune || engine_configs.size() == 1) {
-            return std::make_shared<fe::ExecutionPlan>(
-                fe::ExecutionPlanBuilder()
-                    .setHandle(handle)
-                    .setEngineConfig(engine_configs[0])
-                    .build());
+        auto filtered = usable_engine_configs(engine_configs, deterministic,
+                                              allow_tf32, dtype);
+        if (filtered.empty()) {
+            // The top configs are all unusable; fall back to the full
+            // heuristic list before giving up on filtering.
+            engine_configs = heuristics.getEngineConfig(heuristics.getEngineConfigCount());
+            filtered = usable_engine_configs(engine_configs, deterministic,
+                                             allow_tf32, dtype);
+        }
+        if (filtered.empty()) filtered = engine_configs;
+        if (!autotune || filtered.size() == 1) {
+            for (auto& ec : filtered) {
+                try {
+                    return std::make_shared<fe::ExecutionPlan>(
+                        fe::ExecutionPlanBuilder()
+                            .setHandle(handle)
+                            .setEngineConfig(ec)
+                            .build());
+                } catch (...) {
+                    // Config cannot be realized on this device; try the next.
+                }
+            }
+            TP_THROW(RuntimeError, "cuDNN: no executable engine configs for conv2d");
         }
         std::vector<std::shared_ptr<fe::ExecutionPlan>> candidates;
-        for (auto& ec : engine_configs) {
+        for (auto& ec : filtered) {
             try {
                 candidates.push_back(std::make_shared<fe::ExecutionPlan>(
                     fe::ExecutionPlanBuilder().setHandle(handle).setEngineConfig(ec).build()));
