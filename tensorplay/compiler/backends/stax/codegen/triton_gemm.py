@@ -321,6 +321,28 @@ def _fused_gemm_kernel(
     return kernel
 
 
+def _as_tile_config(config) -> Optional[Tuple[int, int, int, int, int]]:
+    """A tile shape, whether it was written as a tuple or as block names.
+
+    A template names a tile by the blocks it is made of, because that is how a
+    configuration is written down; the kernel wants them in the order it walks
+    them.
+    """
+
+    if config is None:
+        return None
+    if isinstance(config, dict):
+        try:
+            return (
+                int(config["BLOCK_M"]), int(config["BLOCK_N"]), int(config["BLOCK_K"]),
+                int(config["num_warps"]), int(config["num_stages"]),
+            )
+        except KeyError:
+            return None
+    values = tuple(int(v) for v in config)
+    return values if len(values) == 5 else None
+
+
 def _triton_launch_factory(
     a_spec: Tuple[Optional[int], Any],
     b_spec: Tuple[Optional[int], Any],
@@ -421,6 +443,7 @@ def tuned_matmul_launch(
     epilogue_launch: Optional[Callable[[list], Any]] = None,
     bias_spec: Optional[Tuple[Optional[int], Any]] = None,
     b_transposed: bool = False,
+    config=None,
 ) -> Optional[Callable[[list], Any]]:
     """Benchmark native vs Triton GEMM for one matmul-family extern segment.
 
@@ -507,6 +530,20 @@ def tuned_matmul_launch(
 
     device_key = repr(a.device)
     allow_tf32 = _matmul_allow_tf32()
+    # A caller that has already chosen names the tile it wants.  Building it as
+    # it stands is the whole job then: there is nothing left to measure here,
+    # because the comparison against the operator is what the caller's own
+    # candidates are for.
+    tile = _as_tile_config(config)
+    if tile is not None:
+        return _triton_launch_factory(
+            operand_specs[0], operand_specs[1],
+            M, N, K, tile, native_launch,
+            allow_tf32=allow_tf32,
+            epilogue=epilogue,
+            bias_spec=bias_spec,
+            b_transposed=b_transposed,
+        )
     cache_key = _decision_key(
         M, N, K, str(a.dtype), device_key, allow_tf32,
         epilogue, bias_spec is not None, b_transposed,
