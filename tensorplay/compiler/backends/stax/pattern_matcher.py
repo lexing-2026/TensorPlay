@@ -56,6 +56,8 @@ from typing import Any, NoReturn, Protocol, TypeVar
 from typing_extensions import Self, TypeIs
 
 import tensorplay as tp
+from tensorplay._ops import OpOverload
+from tensorplay._ops import OpOverloadPacket
 from tensorplay.utils import _pytree as pytree
 from .utils import counters
 from tensorplay.primitives.common import is_integer_dtype
