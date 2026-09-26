@@ -17,6 +17,7 @@ import tensorplay as tp
 
 from .ir import Buffer, ComputedBuffer, ConstantBuffer, StorageBox, TensorBox
 from .ir import ReinterpretView
+from .ir import FallbackKernel as IrFallbackKernel
 from .loops import ExternKernel, ExternOutput
 
 
@@ -63,14 +64,42 @@ class HostStep(Step):
 
 
 class ExternStep(Step):
-    def __init__(self, kernel: ExternKernel):
-        super().__init__(
-            {b.name for b in kernel.input_buffers()}, {o.name for o in kernel.outputs}
-        )
+    def __init__(self, kernel):
+        if isinstance(kernel, IrFallbackKernel):
+            # What a described call reads is what it depends on, and what it
+            # produces is either the call's own buffer or the buffers naming
+            # where each of several results sits.
+            super().__init__(
+                {d.name for d in kernel.get_reads()},
+                {o.get_name() for o in kernel.get_outputs()},
+            )
+        else:
+            super().__init__(
+                {b.name for b in kernel.input_buffers()},
+                {o.name for o in kernel.outputs},
+            )
         self.kernel = kernel
         self._baked = None
 
+    def _described_args(self, env):
+        """The arguments of a described call, with each input read by name.
+
+        The inputs are whole buffers, so they are taken whole rather than by
+        position, and the constants beside them are passed as they were given.
+        """
+
+        return (
+            [_resolve(i, env) for i in self.kernel.inputs],
+            list(self.kernel.constant_args),
+        )
+
     def run(self, env: dict) -> None:
+        if isinstance(self.kernel, IrFallbackKernel):
+            args, kwargs = self._described_args(env)
+            result = self.kernel.unflatten_args(*args)
+            for out in self.kernel.get_outputs():
+                env[out.get_name()] = _dig(result, getattr(out, "indices", ()))
+            return
         args = _resolve(self.kernel.args, env)
         kwargs = _resolve(self.kernel.kwargs, env)
         if getattr(self.kernel, "template", None) is not None:

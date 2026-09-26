@@ -25,6 +25,7 @@ import sympy
 from sympy import Expr
 
 import tensorplay as tp
+from tensorplay._ops import OpOverload
 from tensorplay.utils import _pytree
 from tensorplay.primitives.common import is_boolean_dtype, is_float_dtype
 
@@ -6082,18 +6083,21 @@ class ExternKernel(InputsKernel):
 
         Left unset, the name is worked out from the operation's own, with the
         namespace and the dots replaced, because that is how such a name is
-        spelled where a C++ call can reach it.
+        spelled where a C++ call can reach it.  Working it out needs both a C++
+        wrapper to be called through and an operation declared with a name, and
+        without either there is no such name to spell.
         """
 
         self.cpp_kernel_name = cpp_kernel_name
-        if cpp_kernel_name is not None:
+        if not V.graph.cpp_wrapper or not isinstance(
+            self.op_overload, OpOverload
+        ):
             return
 
         kernel = self.op_overload
-        if kernel is None:
-            return
-        name = getattr(kernel, "name", None) or str(kernel)
-        self.cpp_kernel_name = name.replace("::", "_").replace(".", "_")
+        if self.cpp_kernel_name is None:
+            name = getattr(kernel, "name", None) or str(kernel)
+            self.cpp_kernel_name = name.replace("::", "_").replace(".", "_")
 
     def set_python_kernel_name(self, python_kernel_name: str | None) -> None:
         """Settle the name the generated Python calls this under."""
@@ -9545,6 +9549,11 @@ class FallbackKernel(ExternKernelAlloc):
 
         self.use_runtime_dispatch = False
         self.unbacked_bindings = unbacked_bindings or {}
+        self.op_overload = kernel
+        # How the arguments are put back the way the call was written, which is
+        # what says which position each input and each constant goes back to.
+        self.unflatten_args = unflatten_args
+        self.kwargs = {} if kwargs is None else kwargs
 
         if self.python_kernel_name is None:
             raise AssertionError("Expected self.python_kernel_name is not None")
@@ -10925,18 +10934,28 @@ def zip_schema(schema, args, kwargs):
 
     The contract lists its arguments by name while the call may pass them
     positionally, by keyword, or not at all, so what is wanted here is the
-    declared argument together with the value that went to it.
+    declared argument together with the value that went to it.  An argument
+    given only a keyword is filled from there even when the positional
+    arguments stop short of it, and an argument left at its default is left
+    unfilled rather than filled with the default, since a caller that did not
+    mention it has said nothing about it.
     """
 
-    values = list(args)
-    names = [a.name for a in schema.arguments]
-    for key, value in kwargs.items():
-        if key in names:
-            values[names.index(key)] = value
-        else:
-            values.append(value)
+    if len(schema.arguments) < len(args) + len(kwargs):
+        raise AssertionError(
+            f"schema has {len(schema.arguments)} arguments but got "
+            f"{len(args)} args and {len(kwargs)} kwargs"
+        )
     for i, info in enumerate(schema.arguments):
-        yield info, (values[i] if i < len(values) else None)
+        if info.kwarg_only:
+            if info.name in kwargs:
+                yield info, kwargs[info.name]
+            continue
+        if i >= len(args):
+            if info.name in kwargs:
+                yield info, kwargs[info.name]
+            continue
+        yield info, args[i]
 
 
 def handle_aliasing_and_mutation(kernel, info, arg) -> None:

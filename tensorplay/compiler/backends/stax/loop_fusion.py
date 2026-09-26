@@ -30,6 +30,7 @@ from .ir import (
     Pointwise,
     Reduction,
     ReinterpretView,
+    FallbackKernel as IrFallbackKernel,
 )
 from .loops import (
     V,
@@ -91,9 +92,13 @@ class ExternNode:
     index: int
     kernel: ExternKernel
     reads: set = field(default_factory=set)
+    #: What this call produces, when the names do not come off the kernel.
+    outputs: list | None = None
 
     @property
     def names(self):
+        if self.outputs is not None:
+            return self.outputs
         return [o.name for o in self.kernel.outputs]
 
 
@@ -294,7 +299,14 @@ class KernelScheduler:
 
     def _build(self):
         for position, op in enumerate(self.graph.operations):
-            if isinstance(op, ExternKernel):
+            if isinstance(op, IrFallbackKernel):
+                node = ExternNode(
+                    position,
+                    op,
+                    {d.name for d in op.get_reads()},
+                    [o.get_name() for o in op.get_outputs()],
+                )
+            elif isinstance(op, ExternKernel):
                 node = ExternNode(position, op, {b.name for b in op.input_buffers()})
             else:
                 body = record_body(op.data)

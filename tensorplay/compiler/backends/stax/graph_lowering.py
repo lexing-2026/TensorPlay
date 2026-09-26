@@ -19,6 +19,7 @@ from typing import Any
 
 import sympy
 import tensorplay as tp
+from tensorplay.utils import _pytree as pytree
 
 from .loops import compute_required_storage_length, contiguous_strides
 from .sizevars import SizeVarAllocator
@@ -37,6 +38,9 @@ from .ir import (
     # memory.  Distinct from the ``ExternKernel`` below, which is the
     # schedulable node standing for a call to something written elsewhere.
     ExternKernel as IrExternKernel,
+    FallbackKernel as IrFallbackKernel,
+    MultiOutput,
+    MultiOutputLayout,
     InputBuffer,
     IRNode,
     NonTensorObj,
@@ -749,6 +753,124 @@ class GraphLowering:
             meta["bias_spec"] = (2, None)
         return meta
 
+    @staticmethod
+    def _layout_of(val):
+        """Where the elements of a traced result sit."""
+
+        return FixedLayout(
+            val.device, val.dtype,
+            tuple(int(s) for s in val.shape),
+            tuple(int(s) for s in val.stride()),
+            int(val.storage_offset()) if hasattr(val, "storage_offset") else 0,
+        )
+
+    def _make_fallback(self, node, kernel_name, realized_args, kwargs):
+        """Describe a call that is run rather than written out.
+
+        What the call is given is split the way a call written later expects
+        it: the arguments that name memory are inputs, and the rest travel as
+        constants beside them, so that regenerating the call puts each argument
+        back in the position it was given in.  A method call names its
+        operation with a string and takes the object it is called on first, so
+        the receiver leads the inputs and the name is all there is to call by.
+        """
+
+        args = list(realized_args)
+        call_method = node.op == "call_method"
+        if call_method:
+            receiver, args = args[0], args[1:]
+        else:
+            receiver = None
+        realized_kwargs = {
+            k: self.realize_input(v) if isinstance(v, (TensorBox, IRNode)) else v
+            for k, v in (kwargs or {}).items()
+        }
+        # The arguments are flattened into one list in the order they were
+        # given, and which of them name memory is recorded alongside, so that
+        # the call can be put back together from the two streams it is
+        # described by without anything having to remember the shape of the
+        # call's own signature.
+        flat, spec = pytree.tree_flatten({"args": args, "kwargs": realized_kwargs})
+        is_tensor = [isinstance(a, IRNode) for a in flat]
+        tensor_args = [a for a in flat if isinstance(a, IRNode)]
+        other_args = [a for a in flat if not isinstance(a, IRNode)]
+
+        def unflatten(new_tensor_args, new_non_tensor_args):
+            """Put the arguments back the way the call was written."""
+
+            rebuilt = []
+            from_tensors = iter(new_tensor_args)
+            from_others = iter(new_non_tensor_args)
+            for flag in is_tensor:
+                rebuilt.append(next(from_tensors) if flag else next(from_others))
+            bound = pytree.tree_unflatten(rebuilt, spec)
+            if call_method:
+                return [receiver, *bound["args"]], bound["kwargs"]
+            return bound["args"], bound["kwargs"]
+
+        val = node.meta.get("val")
+        outputs = val if isinstance(val, (list, tuple)) else (val,)
+        tensor_outputs = [v for v in outputs if _is_tensor(v)]
+        if not tensor_outputs:
+            # A call whose result is not known cannot be described: there is
+            # nothing to say where the result would sit, and a kernel declared
+            # without a layout would be declared without a size.  Which call it
+            # was is worth reporting, because a call reaching here with no result
+            # is a call whose result was never worked out, and that is a question
+            # about how it was traced rather than about this function.
+            raise NotImplementedError(
+                f"cannot run {getattr(node.target, '__name__', node.target)!r}: "
+                f"the call's result is not known, so there is nowhere to put it"
+            )
+        if len(tensor_outputs) > 1:
+            # Several results cannot all be the call itself, so the call is
+            # given no result of its own and each result is a buffer naming the
+            # path through the returned structure at which it sits.
+            layout = MultiOutputLayout(
+                device=tensor_outputs[0].device,
+                size=tuple(int(s) for s in val.shape) if _is_tensor(val) else (),
+            )
+        else:
+            layout = self._layout_of(tensor_outputs[0])
+
+        kernel = IrFallbackKernel(
+            layout=layout,
+            kernel=node.target,
+            tensor_args=tuple(tensor_args),
+            nontensor_args=tuple(other_args),
+            unflatten_args=unflatten,
+            kwargs=realized_kwargs,
+        )
+        kernel.origin_node = node
+        self.operations.append(kernel)
+        return kernel
+
+    def _wrap_fallback(self, node, kernel):
+        """The values a described call produced, as things a body can read.
+
+        A call that produced one thing is that thing's own buffer, so there is
+        nothing to name separately; a call that produced several has one
+        buffer per result, each saying where among the results it sits.
+        """
+
+        val = node.meta.get("val")
+
+        def wrap(item, path):
+            if _is_tensor(item):
+                if not kernel.outputs and len(kernel.get_outputs()) == 1:
+                    # Boxed the way every value is, so that what holds this
+                    # result is a place memory can be given.
+                    return TensorBox.create(kernel)
+                out = MultiOutput(self._layout_of(item), kernel, path)
+                out.origin_node = node
+                kernel.outputs.append(out)
+                return TensorBox.create(out)
+            if isinstance(item, (list, tuple)):
+                return tuple(wrap(v, path + (i,)) for i, v in enumerate(item))
+            return item
+
+        return wrap(val, ())
+
     def make_extern(self, node, args, kwargs):
         def realize_args(value):
             # Anything that names memory is put in memory before the call sees
@@ -781,14 +903,8 @@ class GraphLowering:
                 node, realized_args, realize_args(kwargs), template.name
             )
         else:
-            kernel = ExternKernel(
-                kernel_name,
-                node.target,
-                realized_args,
-                realize_args(kwargs),
-                node.meta.get("val"),
-                call_method=node.op == "call_method",
-            )
+            kernel = self._make_fallback(node, kernel_name, realized_args, kwargs)
+            return self._wrap_fallback(node, kernel)
         # Which graph node asked for this call, so that a result of it can say
         # where it came from the way a computed value does.
         kernel.origin_node = node
