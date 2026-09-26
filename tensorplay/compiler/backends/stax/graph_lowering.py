@@ -17,15 +17,22 @@ import operator
 import re
 from typing import Any
 
+import sympy
 import tensorplay as tp
 
 from .loops import compute_required_storage_length, contiguous_strides
 from .sizevars import SizeVarAllocator
 from .ir import (
     Buffer,
+    BaseView,
     ComputedBuffer,
     StorageBox,
+    Constant,
     ConstantBuffer,
+    EffectfulKernel,
+    ShapeAsConstantBuffer,
+    OpaqueMultiOutput,
+    OpaqueObjectState,
     # The IR-level external-kernel helper, which owns putting a value in
     # memory.  Distinct from the ``ExternKernel`` below, which is the
     # schedulable node standing for a call to something written elsewhere.
@@ -130,6 +137,28 @@ def _body_stats(loops: Loops) -> tuple[int, int]:
 #: What a graph yields before it has been asked, so that a graph which
 #: yields nothing is told apart from a graph that has not been run.
 _MISSING = object()
+
+#: What a graph is allowed to yield.  A value is a place memory can be given,
+#: something already known without computing it, a shape, a non-tensor, or
+#: nothing at all.  A node of any other kind is one this walk has no way to
+#: account for, and the cheaper place to be told is where the yield happens.
+_allowed_output_types = (
+    TensorBox,
+    # A view is a window onto memory someone else holds rather than a buffer
+    # of its own, and is put in memory by whoever reads it out.
+    BaseView,
+    Constant,
+    type(None),
+    ConstantBuffer,
+    sympy.Expr,
+    sympy.logic.boolalg.Boolean,
+    int,
+    EffectfulKernel,
+    ShapeAsConstantBuffer,
+    NonTensorObj,
+    OpaqueMultiOutput,
+    OpaqueObjectState,
+)
 
 
 class GraphLowering:
@@ -951,6 +980,17 @@ class GraphLowering:
                 # one value still stores it in a one-element sequence.
                 self.single_output = len(outputs) == 1
                 for value in self.lower_node(list(outputs)):
+                    # What an output is allowed to be.  A value is a place
+                    # memory can be given, something already known without
+                    # computing it, a non-tensor, or a shape; anything else is
+                    # a node type this walk cannot account for, and being told
+                    # here is far cheaper than being told much later by a
+                    # kernel that cannot read what it was handed.
+                    if not isinstance(value, _allowed_output_types):
+                        raise AssertionError(
+                            f"Unexpected output types: {[type(value)]}, "
+                            f"full result: {value}"
+                        )
                     # A caller reads an output out of memory, so however the
                     # value was arrived at -- still held in a box, or already a
                     # bare view -- it is put in memory before it is recorded.
