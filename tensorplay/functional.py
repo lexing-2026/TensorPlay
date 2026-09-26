@@ -2677,23 +2677,31 @@ def any(input, dim=None, keepdim=False):
         return _C.any(input)
     return _C.any(input, dim, keepdim)
 
-def var(input, correction=1, dim=None, keepdim=False):
+def var(input, dim=None, unbiased=None, keepdim=False, *, correction=None):
     if _capturing():
-        _captured = _capture_call(var, (input, correction, dim, keepdim), {})
+        _captured = _capture_call(var, (input, dim, unbiased, keepdim), {"correction": correction})
         if _captured is not None:
             return _captured
+    if correction is None:
+        correction = 1 if (unbiased is None or unbiased) else 0
     if dim is None:
-        return _C.var(input, correction)
-    return _C.var(input, dim, correction, keepdim)
+        return _C.var(input, correction=correction, keepdim=keepdim)
+    if isinstance(dim, int) and not isinstance(dim, bool):
+        dim = [dim]
+    return _C.var(input, list(dim), correction, keepdim)
 
-def std(input, correction=1, dim=None, keepdim=False):
+def std(input, dim=None, unbiased=None, keepdim=False, *, correction=None):
     if _capturing():
-        _captured = _capture_call(std, (input, correction, dim, keepdim), {})
+        _captured = _capture_call(std, (input, dim, unbiased, keepdim), {"correction": correction})
         if _captured is not None:
             return _captured
+    if correction is None:
+        correction = 1 if (unbiased is None or unbiased) else 0
     if dim is None:
-        return _C.std(input, correction)
-    return _C.std(input, dim, correction, keepdim)
+        return _C.std(input, correction=correction, keepdim=keepdim)
+    if isinstance(dim, int) and not isinstance(dim, bool):
+        dim = [dim]
+    return _C.std(input, list(dim), correction, keepdim)
 
 def median(input, dim=None, keepdim=False):
     if _capturing():

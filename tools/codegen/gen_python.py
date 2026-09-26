@@ -430,6 +430,32 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
             ]
             continue
 
+        if name in ('var', 'std') and 'function' in f.variants:
+            seen.add(name)
+            # The reduced axes come second and the correction is keyword-only,
+            # so var(x, 1) reduces along axis 1.  Unioning the full-reduction
+            # overload with the axis-list one leaves the correction in the
+            # first positional slot instead, where that same call reduces every
+            # axis with correction 1 and returns a scalar.
+            lines += [
+                f'def {name}(input, dim=None, unbiased=None, keepdim=False, *, correction=None):',
+                '    if _capturing():',
+                f'        _captured = _capture_call({name}, (input, dim, unbiased, keepdim), {{\"correction\": correction}})',
+                '        if _captured is not None:',
+                '            return _captured',
+                '    if correction is None:',
+                '        correction = 1 if (unbiased is None or unbiased) else 0',
+                '    if dim is None:',
+                # The full-reduction overload takes no axis list, so keepdim
+                # goes through the keyword-only form of the same op.
+                f'        return _C.{name}(input, correction=correction, keepdim=keepdim)',
+                '    if isinstance(dim, int) and not isinstance(dim, bool):',
+                '        dim = [dim]',
+                f'    return _C.{name}(input, list(dim), correction, keepdim)',
+                '',
+            ]
+            continue
+
         if name == 'squeeze_copy' and 'function' in f.variants:
             seen.add(name)
             # routes to the base overload, an int to .dim, a sequence to
