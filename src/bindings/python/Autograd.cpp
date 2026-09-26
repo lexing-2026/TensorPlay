@@ -1281,6 +1281,27 @@ public:
         return label.cast<std::string>();
     }
 
+    // A context holds what its backward pass will read, and that pass is the
+    // last reader.  The engine releases a node's variables once the graph is
+    // no longer kept; a context's saved tensors are the node's variables for
+    // a function-backed node, so they are released here rather than left for
+    // the context to be collected -- which a caller holding an output keeps
+    // alive for as long as the graph is reachable.
+    void release_variables() override {
+        if (py_ctx_ && !py_ctx_.is_none()) {
+            py::gil_scoped_acquire gil;
+            py::object release = py::getattr(py_ctx_, "release_saved", py::none());
+            if (!release.is_none()) {
+                try {
+                    release();
+                } catch (const py::error_already_set&) {
+                    PyErr_Clear();
+                }
+            }
+        }
+        tensorplay::tpx::Node::release_variables();
+    }
+
     py::object py_ctx_;
 public:
     py::object ctx() const { return py_ctx_; }

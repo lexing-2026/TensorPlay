@@ -378,14 +378,14 @@ def aot_function(
                 compiled_bw_box.append(bw_compiler(bw_module, inputs))
             grads = iter(_call(compiled_bw_box[0], inputs))
             out = tuple(next(grads) if needed else None for needed in grad_mask)
-            # A saved forward value is the bulk of a region's memory and the
-            # backward pass is its last reader.  Nothing on this side of the
-            # boundary releases what the context holds once the pass is done,
-            # so the pass drops what it has just bound: the backward program
-            # has taken what it needs by now, and a step's saved activations
-            # are most of what a region needs to fit in memory.
-            ctx.release_saved()
+            # What this pass kept for itself is its own bookkeeping, and the
+            # forward's outputs are its largest entry: they are read only to
+            # decide which incoming gradients matter, which is now decided.
+            # The values the context holds for its backward are released by
+            # the engine, which knows whether the graph is kept for another
+            # pass.
             ctx.saved_plain = ()
+            ctx.run_outputs = None
             ctx.run_primals = None
             return out
 
