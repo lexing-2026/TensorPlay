@@ -25,7 +25,7 @@ from enum import Enum, auto
 from abc import ABC, abstractmethod
 from itertools import chain
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Generic, NamedTuple, TypeVar
 
 import sympy
 from sympy.printing.python import PythonPrinter as _PythonPrinter
@@ -2075,7 +2075,15 @@ class CSEProxy(DefaultHandler):
         )
 
 
-class Kernel(CodeGen):
+#: What a kernel is written in terms of: the value a common subexpression
+#: is named by.  A kernel that writes for one backend narrows this, and one
+#: that does not leaves it at the value every backend starts from.
+CSEVariableType = TypeVar(
+    "CSEVariableType", bound=CSEVariable, default=CSEVariable
+)
+
+
+class Kernel(CodeGen, Generic[CSEVariableType]):
     """A kernel being written, and the three places its text goes.
 
     A kernel is read, computed on, and written, and the three are separate

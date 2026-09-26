@@ -1537,8 +1537,17 @@ def _check(cond, msg=None):
     Under eager execution a plain check: a false condition raises
     ``RuntimeError`` carrying ``msg``.  Symbolic backends may turn the check
     into a deferred assertion instead of an immediate failure.
+
+    ``msg`` may be given as something to be called rather than as the message
+    itself, so that a caller whose message costs something to write does not
+    pay for it on the way to a check that holds.  A message that is a callable
+    is called only once the check has failed, and what it returns is the
+    message.
     """
+
     if not cond:
+        if callable(msg):
+            msg = msg()
         raise RuntimeError(msg if msg is not None else "Expected cond to be true")
 
 
