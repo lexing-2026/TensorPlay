@@ -34,6 +34,14 @@ from sympy.printing.precedence import PRECEDENCE
 from sympy.logic.boolalg import Boolean as SympyBoolean
 from sympy.logic.boolalg import BooleanAtom
 from sympy.core.expr import Expr
+from sympy.core import sympify
+from sympy.core.function import Application
+from sympy.core.logic import _torf, fuzzy_and, fuzzy_or
+from sympy.core.numbers import equal_valued
+from sympy.core.operations import LatticeOp, ShortCircuit
+from sympy.core.sorting import ordered
+from sympy.core.traversal import walk
+from sympy.utilities.iterables import sift
 from sympy.logic.boolalg import Boolean
 from sympy.printing.str import StrPrinter
 
@@ -3048,3 +3056,463 @@ class ModularIndexing(sympy.Function):
 #: implementation already does.
 Max = sympy.Max
 Min = sympy.Min
+
+
+def _is_symbols_binary_summation(expr: sympy.Expr) -> bool:
+    # No need to check that two args are not the same, since expr is pre-optimized but we do it anyway.
+    return (
+        isinstance(expr, sympy.Expr)
+        and expr.is_Add
+        and len(expr._args) == 2
+        and expr._args[0].is_symbol
+        and expr._args[1].is_symbol
+        and expr._args[0] is not expr._args[1]
+    )
+
+class MinMaxBase(Expr, LatticeOp):  # type: ignore[misc]
+    def __new__(cls, *original_args: sympy.Expr, **assumptions: bool) -> sympy.Basic:
+        from sympy.core.parameters import global_parameters
+
+        evaluate = assumptions.pop("evaluate", global_parameters.evaluate)
+        args = (sympify(arg) for arg in original_args)
+
+        # See the comment in _satisfy_unique_summations_symbols.
+        unique_summations_symbols = (
+            None
+            if not evaluate
+            else cls._satisfy_unique_summations_symbols(original_args)
+        )
+
+        if evaluate:
+            try:
+                # first standard filter, for cls.zero and cls.identity
+                # also reshape Max(a, Max(b, c)) to Max(a, b, c)
+                args = frozenset(cls._new_args_filter(args))  # type: ignore[assignment]
+            except ShortCircuit:
+                return cls.zero  # type: ignore[attr-defined]
+
+            # No need to run _collapse_arguments and _find_localzeros, see the comment
+            # in _satisfy_unique_summations_symbols.
+            if unique_summations_symbols is None:
+                # remove redundant args that are easily identified
+                args = cls._collapse_arguments(args, **assumptions)
+
+                # find local zeros
+                args = cls._find_localzeros(args, **assumptions)
+
+        args = frozenset(args)
+
+        if not args:
+            return cls.identity  # type: ignore[attr-defined]
+
+        if len(args) == 1:
+            return list(args).pop()
+
+        # base creation
+        obj = Expr.__new__(cls, *ordered(args), **assumptions)
+        obj._argset = args
+
+        obj.unique_summations_symbols = unique_summations_symbols
+        return obj
+
+    @classmethod
+    def _collapse_known_multiplicative_terms(
+        cls, values: set[sympy.Expr]
+    ) -> sympy.Expr | None:
+        if len(values) != 2:
+            return None
+
+        a, b = values
+        a_coeff, a_term = a.as_coeff_Mul()
+        b_coeff, b_term = b.as_coeff_Mul()
+        if a_term != b_term:
+            return None
+
+        if not (a_coeff.is_comparable and b_coeff.is_comparable):
+            return None
+
+        if a_coeff == b_coeff:
+            return a
+
+        if a_term.is_nonnegative:
+            a_is_smaller = a_coeff < b_coeff
+        elif a_term.is_nonpositive:
+            a_is_smaller = a_coeff > b_coeff
+        else:
+            return None
+
+        if cls is Min:
+            return a if a_is_smaller else b
+        if cls is Max:
+            return b if a_is_smaller else a
+
+        raise AssertionError(f"impossible {cls}")
+
+    @classmethod
+    def _satisfy_unique_summations_symbols(
+        cls, args: Any
+    ) -> set[sympy.core.symbol.Symbol] | None:
+        """
+        One common case in some models is building expressions of the form
+        max(max(max(a+b...), c+d), e+f) which is simplified to max(a+b, c+d, e+f, ...).
+        For such expressions, we call the Max constructor X times (once for each nested
+        max) and the expression gets flattened.
+
+        An expensive cost in constructing those expressions is running _collapse_arguments
+        and _find_localzeros. However, those two optimizations are unnecessary when the args
+        to max are all of the form a+b, c+d, ..etc where each term uses a unique set of symbols.
+
+        This function is used to detect such properties of the expressions we are building
+        and if so inform that we do not need to run those optimizations. To detect those,
+        we store a property in the expression that tells that this expression is a min/max
+        operation over terms that use unique symbols "unique_summations_symbols". This property
+        also memoize the set of symbols used in all the terms to make it faster to detect this
+        property inductively.
+
+        When we apply max to add a new term, all we need to do is check if the new term uses
+        unique symbols (with respect to existing terms and itself).
+        Example:
+        t = Max(a+b, c+d) ==> satisfies the property
+        Max(t, h+j)       ==> h,j not in [a,b,c,d] => satisfy the property.
+
+        The function returns None if the new expression does not satisfy the unique_summations_symbols
+        property. Otherwise, it returns a new set of unique symbols.
+        """
+        if len(args) != 2:
+            return None
+
+        (lhs, rhs) = (
+            (args[1], args[0])
+            if isinstance(args[1], MinMaxBase)
+            else (args[0], args[1])
+        )
+
+        if not _is_symbols_binary_summation(rhs):
+            return None
+
+        # base case max(a+b, c+d) ==> satisfies the property if a+b and c+d use unique symbols.
+        if _is_symbols_binary_summation(lhs):
+            return cls._unique_symbols(args)
+
+        # inductive case max(t, h+j) ==> satisfies the property if h, j not in t.unique_summations_symbols
+        if isinstance(lhs, MinMaxBase):
+            lhs_unique_summations_symbols = getattr(
+                lhs, "unique_summations_symbols", None
+            )
+            if lhs_unique_summations_symbols is not None:
+                return cls._unique_symbols([rhs], lhs_unique_summations_symbols)
+
+        return None
+
+    @classmethod
+    def _unique_symbols(
+        cls,
+        args: "Iterable[sympy.Expr]",
+        initial_set: set[sympy.core.symbol.Symbol] | None = None,
+    ) -> set[sympy.core.symbol.Symbol] | None:
+        """
+        Return seen_symbols if all atoms in all args are all unique symbols,
+        else returns None. initial_set can be used to represent initial value for seen_symbols
+        """
+        seen_symbols = set() if initial_set is None else initial_set.copy()
+        for arg in args:
+            for element in arg.atoms():
+                if not isinstance(element, sympy.core.symbol.Symbol):
+                    return None
+                elif element in seen_symbols:
+                    return None
+                else:
+                    seen_symbols.add(element)
+        return seen_symbols
+
+    @classmethod
+    def _collapse_arguments(
+        cls, args: "Iterable[sympy.Expr]", **assumptions: bool
+    ) -> "Iterable[sympy.Expr]":
+        """Remove redundant args.
+
+        Examples
+        ========
+
+        >>> from sympy import Min, Max
+        >>> from sympy.abc import a, b, c, d, e
+
+        Any arg in parent that appears in any
+        parent-like function in any of the flat args
+        of parent can be removed from that sub-arg:
+
+        >>> Min(a, Max(b, Min(a, c, d)))
+        Min(a, Max(b, Min(c, d)))
+
+        If the arg of parent appears in an opposite-than parent
+        function in any of the flat args of parent that function
+        can be replaced with the arg:
+
+        >>> Min(a, Max(b, Min(c, d, Max(a, e))))
+        Min(a, Max(b, Min(a, c, d)))
+        """
+        if not args:
+            return args
+        args = list(ordered(args))
+        if cls is Min:
+            other = Max
+        else:
+            other = Min  # type: ignore[assignment]
+
+        # find global comparable max of Max and min of Min if a new
+        # value is being introduced in these args at position 0 of
+        # the ordered args
+        if args[0].is_number:
+            sifted = mins, maxs = [], []  # type: ignore[var-annotated]
+            for i in args:
+                for v in walk(i, Min, Max):
+                    if v.args[0].is_comparable:
+                        sifted[isinstance(v, Max)].append(v)
+            small = Min.identity
+            for i in mins:
+                v = i.args[0]
+                if v.is_number and (v < small) == True:  # noqa: E712
+                    small = v
+            big = Max.identity
+            for i in maxs:
+                v = i.args[0]
+                if v.is_number and (v > big) == True:  # noqa: E712
+                    big = v
+            # at the point when this function is called from __new__,
+            # there may be more than one numeric arg present since
+            # local zeros have not been handled yet, so look through
+            # more than the first arg
+            if cls is Min:
+                for arg in args:
+                    if not arg.is_number:
+                        break
+                    if (arg < small) == True:  # noqa: E712
+                        small = arg
+            elif cls == Max:
+                for arg in args:
+                    if not arg.is_number:
+                        break
+                    if (arg > big) == True:  # noqa: E712
+                        big = arg
+            T = None
+            if cls is Min:
+                if small != Min.identity:
+                    other = Max
+                    T = small
+            elif big != Max.identity:
+                other = Min  # type: ignore[assignment]
+                T = big
+            if T is not None:
+                # remove numerical redundancy
+                for i in range(len(args)):
+                    a = args[i]
+                    if isinstance(a, other):
+                        a0 = a.args[0]
+                        if (  # noqa: E712
+                            (a0 > T) if other == Max else (a0 < T)
+                        ) == True:
+                            args[i] = cls.identity  # type: ignore[attr-defined]
+
+        # remove redundant symbolic args
+        def do(ai: sympy.Expr, a: sympy.Expr) -> sympy.Expr:
+            if not isinstance(ai, (Min, Max)):
+                return ai
+            cond = a in ai.args
+            if not cond:
+                return ai.func(*[do(i, a) for i in ai.args], evaluate=False)
+            if isinstance(ai, cls):
+                return ai.func(*[do(i, a) for i in ai.args if i != a], evaluate=False)
+            return a
+
+        for i, a in enumerate(args):
+            args[i + 1 :] = [do(ai, a) for ai in args[i + 1 :]]
+
+        # factor out common elements as for
+        # Min(Max(x, y), Max(x, z)) -> Max(x, Min(y, z))
+        # and vice versa when swapping Min/Max -- do this only for the
+        # easy case where all functions contain something in common;
+        # trying to find some optimal subset of args to modify takes
+        # too long
+
+        def factor_minmax(args: list[sympy.Expr]) -> list[sympy.Expr]:
+            is_other = lambda arg: isinstance(arg, other)  # noqa: E731
+            other_args, remaining_args = sift(args, is_other, binary=True)
+            if not other_args:
+                return args
+
+            # Min(Max(x, y, z), Max(x, y, u, v)) -> {x,y}, ({z}, {u,v})
+            arg_sets = [set(arg.args) for arg in other_args]
+            common = set.intersection(*arg_sets)
+            if not common:
+                return args
+
+            new_other_args = list(common)
+            arg_sets_diff = [arg_set - common for arg_set in arg_sets]
+
+            # If any set is empty after removing common then all can be
+            # discarded e.g. Min(Max(a, b, c), Max(a, b)) -> Max(a, b)
+            if all(arg_sets_diff):
+                other_args_diff = [other(*s, evaluate=False) for s in arg_sets_diff]
+                new_other_args.append(cls(*other_args_diff, evaluate=False))
+
+            other_args_factored = other(*new_other_args, evaluate=False)
+            return remaining_args + [other_args_factored]
+
+        if len(args) > 1:
+            args = factor_minmax(args)
+
+        return args
+
+    @classmethod
+    def _new_args_filter(
+        cls, arg_sequence: "Iterable[sympy.Expr]"
+    ) -> "Iterator[sympy.Expr]":
+        """
+        Generator filtering args.
+
+        first standard filter, for cls.zero and cls.identity.
+        Also reshape ``Max(a, Max(b, c))`` to ``Max(a, b, c)``,
+        and check arguments for comparability
+        """
+        for arg in arg_sequence:
+            # pre-filter, checking comparability of arguments
+            if (
+                not isinstance(arg, Expr)
+                or arg.is_extended_real is False
+                or (arg.is_number and not arg.is_comparable)
+            ):
+                raise ValueError(f"The argument '{arg}' is not comparable.")
+
+            if arg == cls.zero:  # type: ignore[attr-defined]
+                raise ShortCircuit(arg)
+            elif arg == cls.identity:  # type: ignore[attr-defined]
+                continue
+            elif arg.func == cls:
+                yield from arg.args
+            else:
+                yield arg
+
+    @classmethod
+    def _find_localzeros(
+        cls, values: "Iterable[sympy.Expr]", **options: bool
+    ) -> set[sympy.Expr]:
+        """
+        Sequentially allocate values to localzeros.
+
+        When a value is identified as being more extreme than another member it
+        replaces that member; if this is never true, then the value is simply
+        appended to the localzeros.
+
+        Unlike the sympy implementation, we only look for zero and one, we don't
+        do generic is connected test pairwise which is slow
+        """
+
+        # First, collapse all numeric arguments
+        other_values = set()
+        num_value = None
+        for arg in values:
+            if arg.is_Number:
+                if num_value is None:
+                    num_value = arg
+                else:
+                    if cls is Max:
+                        num_value = max(num_value, arg)
+                    elif cls is Min:
+                        num_value = min(num_value, arg)
+                    else:
+                        raise AssertionError(f"impossible {cls}")
+            else:
+                other_values.add(arg)
+
+        # Special cases when there is only one symbolic value
+        if num_value is None:
+            collapsed_value = cls._collapse_known_multiplicative_terms(other_values)
+            if collapsed_value is not None:
+                return {collapsed_value}
+            return other_values
+
+        if len(other_values) == 0:
+            return {num_value}
+
+        if len(other_values) == 1:
+            other_value = next(iter(other_values))
+            if num_value in (0.0, 0) and other_value.is_nonnegative:
+                return other_values if cls is Max else {num_value}
+            if num_value == 1 and other_value.is_positive:
+                return other_values if cls is Max else {num_value}
+
+        other_values.add(num_value)
+        return other_values
+
+    _eval_is_algebraic = lambda s: _torf(i.is_algebraic for i in s.args)  # noqa: E731
+    _eval_is_antihermitian = lambda s: _torf(  # noqa: E731
+        i.is_antihermitian for i in s.args
+    )
+    _eval_is_commutative = lambda s: _torf(  # noqa: E731
+        i.is_commutative for i in s.args
+    )
+    _eval_is_complex = lambda s: _torf(i.is_complex for i in s.args)  # noqa: E731
+    _eval_is_composite = lambda s: _torf(i.is_composite for i in s.args)  # noqa: E731
+    _eval_is_even = lambda s: _torf(i.is_even for i in s.args)  # noqa: E731
+    _eval_is_finite = lambda s: _torf(i.is_finite for i in s.args)  # noqa: E731
+    _eval_is_hermitian = lambda s: _torf(i.is_hermitian for i in s.args)  # noqa: E731
+    _eval_is_imaginary = lambda s: _torf(i.is_imaginary for i in s.args)  # noqa: E731
+    _eval_is_infinite = lambda s: _torf(i.is_infinite for i in s.args)  # noqa: E731
+    _eval_is_integer = lambda s: _torf(i.is_integer for i in s.args)  # noqa: E731
+    _eval_is_irrational = lambda s: _torf(i.is_irrational for i in s.args)  # noqa: E731
+    _eval_is_negative = lambda s: _torf(i.is_negative for i in s.args)  # noqa: E731
+    _eval_is_noninteger = lambda s: _torf(i.is_noninteger for i in s.args)  # noqa: E731
+    _eval_is_nonnegative = lambda s: _torf(  # noqa: E731
+        i.is_nonnegative for i in s.args
+    )
+    _eval_is_nonpositive = lambda s: _torf(  # noqa: E731
+        i.is_nonpositive for i in s.args
+    )
+    _eval_is_nonzero = lambda s: _torf(i.is_nonzero for i in s.args)  # noqa: E731
+    _eval_is_odd = lambda s: _torf(i.is_odd for i in s.args)  # noqa: E731
+    _eval_is_polar = lambda s: _torf(i.is_polar for i in s.args)  # noqa: E731
+    _eval_is_positive = lambda s: _torf(i.is_positive for i in s.args)  # noqa: E731
+    _eval_is_prime = lambda s: _torf(i.is_prime for i in s.args)  # noqa: E731
+    _eval_is_rational = lambda s: _torf(i.is_rational for i in s.args)  # noqa: E731
+    _eval_is_real = lambda s: _torf(i.is_real for i in s.args)  # noqa: E731
+    _eval_is_extended_real = lambda s: _torf(  # noqa: E731
+        i.is_extended_real for i in s.args
+    )
+    _eval_is_transcendental = lambda s: _torf(  # noqa: E731
+        i.is_transcendental for i in s.args
+    )
+    _eval_is_zero = lambda s: _torf(i.is_zero for i in s.args)  # noqa: E731
+
+class Max(MinMaxBase, Application):  # type: ignore[misc]
+    r"""
+    Return, if possible, the maximum value of the list.
+    """
+
+    zero = S.Infinity
+    identity = S.NegativeInfinity
+
+    def _eval_is_positive(self):  # type:ignore[override]
+        return fuzzy_or(a.is_positive for a in self.args)  # type: ignore[attr-defined]
+
+    def _eval_is_nonnegative(self):  # type:ignore[override]
+        return fuzzy_or(a.is_nonnegative for a in self.args)  # type: ignore[attr-defined]
+
+    def _eval_is_negative(self):  # type:ignore[override]
+        return fuzzy_and(a.is_negative for a in self.args)
+
+class Min(MinMaxBase, Application):  # type: ignore[misc]
+    """
+    Return, if possible, the minimum value of the list.
+    """
+
+    zero = S.NegativeInfinity
+    identity = S.Infinity
+
+    def _eval_is_positive(self):  # type:ignore[override]
+        return fuzzy_and(a.is_positive for a in self.args)  # type: ignore[attr-defined]
+
+    def _eval_is_nonnegative(self):  # type:ignore[override]
+        return fuzzy_and(a.is_nonnegative for a in self.args)  # type: ignore[attr-defined]
+
+    def _eval_is_negative(self):  # type:ignore[override]
+        return fuzzy_or(a.is_negative for a in self.args)
