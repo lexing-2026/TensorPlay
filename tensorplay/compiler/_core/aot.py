@@ -582,10 +582,15 @@ def partition_min_cut(
         # Only the explicit input list (saved values + tangent) becomes
         # placeholders; every
         # other reachable node -- including backward-internal ones -- is
-        # cloned recursively into the extracted graph.
+        # cloned recursively into the extracted graph.  A placeholder has no
+        # producer to clone from, so it is an input of this half whatever the
+        # saved set holds: without it a tangent read here is recreated as a
+        # node named like an input, which the half does not declare and the
+        # lowering cannot resolve.
         external = (
             node.op in _LEAF_OPS
             or node in saved_set
+            or node.op == "placeholder"
         )
         if external:
             clone = bw_graph.placeholder(node.name)
@@ -603,11 +608,21 @@ def partition_min_cut(
                 input_kinds.append("saved")
                 input_keys.append(node.name)
             return clone
-        new_args = tuple(ensure(a) if isinstance(a, Node) else a for a in node.args)
-        new_kwargs = {
-            k: ensure(v) if isinstance(v, Node) else v
-            for k, v in node.kwargs.items()
-        }
+        # Nested arguments carry nodes too -- a multi-output call hands back a
+        # tuple, an indexing takes one -- and a node reached inside a
+        # container is cloned and mapped like any other, or it crosses over as
+        # a reference to a node this half does not hold.
+        def remap(value):
+            if isinstance(value, Node):
+                return ensure(value)
+            if isinstance(value, (list, tuple)):
+                return type(value)(remap(v) for v in value)
+            if isinstance(value, dict):
+                return {k: remap(v) for k, v in value.items()}
+            return value
+
+        new_args = tuple(remap(a) for a in node.args)
+        new_kwargs = {k: remap(v) for k, v in node.kwargs.items()}
         clone = bw_graph.create_node(node.op, node.target, new_args, new_kwargs, name=node.name)
         clone.meta.update(node.meta)
         bw_map[node] = clone

@@ -156,7 +156,16 @@ def compile_region(module, example_inputs, **options):
         # Nothing here differentiates, so there is no joint graph to split:
         # the region is its own forward.
         return _compile_half(module, example_inputs)
-    joint, out_spec, flat_out, num_fwd, trace_primals, tangents = _trace_joint(
+    (
+        joint,
+        out_spec,
+        flat_out,
+        num_fwd,
+        trace_primals,
+        tangents,
+        traced_tangent_names,
+        diff_outputs,
+    ) = _trace_joint(
         flat_fn, primals, options.get("decompositions")
     )
     joint = _functionalize(
@@ -172,9 +181,11 @@ def compile_region(module, example_inputs, **options):
         for node in joint.graph.placeholders
         if not node.meta.get("is_backward")
     ]
-    tangent_names = [
-        node.name for node in joint.graph.placeholders if node.meta.get("is_backward")
-    ]
+    # The names the tracer gave its tangent placeholders, paired with the very
+    # outputs those placeholders stand for.  Re-deriving the set from the
+    # returned outputs would read requires_grad off proxies whose graph the
+    # functionalization pass has already rebuilt.
+    tangent_names = traced_tangent_names
     fw_order = [primal_names.index(node.name) for node in fw_module.graph.placeholders]
     fw_inputs = [trace_primals[i] for i in fw_order]
     compiled_fw = _compile_half(fw_module, fw_inputs)
@@ -183,9 +194,7 @@ def compile_region(module, example_inputs, **options):
     # when it runs, so the traced values stand in for the saved ones here.
     saved_pairs = [(name, _traced_value_of(joint, name)) for name in saved_names]
     grad_pairs = [
-        (tangent_names[i], flat_out[i].detach())
-        for i in range(num_fwd)
-        if flat_out[i].requires_grad
+        (name, value.detach()) for name, value in zip(tangent_names, diff_outputs)
     ]
     bw_inputs = _joint_example(
         bw_module, input_kinds, input_keys, saved_pairs, grad_pairs, trace_primals, primal_names

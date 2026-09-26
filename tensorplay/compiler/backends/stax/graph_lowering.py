@@ -26,6 +26,7 @@ from .loops import (
     Pointwise,
     Reduction,
     ReinterpretView,
+    TemplateKernel,
     TensorBox,
     Const,
     Value,
@@ -47,6 +48,19 @@ REALIZE_READS_THRESHOLD = 4
 REALIZE_ACC_READS_THRESHOLD = 8
 #: ... or once its inlined body holds more operations than this.
 REALIZE_OPCOUNT_THRESHOLD = 30
+
+
+#: Operators a template owns, keyed by the name the graph gives them.
+_TEMPLATE_OPERATORS = {
+    "mm.default": "gemm",
+    "addmm.default": "gemm",
+    "bmm.default": "gemm",
+    "baddbmm.default": "gemm",
+    "linear.default": "gemm",
+    "matmul.default": "gemm",
+    "addmv.default": "gemm",
+}
+_LINEAR_OPERATOR = "linear.default"
 
 
 class _IndexCapture:
@@ -172,6 +186,43 @@ class GraphLowering:
         return ReinterpretView(self.buffers[name], tuple(size), tuple(strides), int(remaining))
 
     # -- library calls ----------------------------------------------------
+    def _template_for(self, node, realized_args):
+        """The template that owns this operator, if any."""
+
+        from .templates import template_for
+
+        name = target_name(node.target)
+        if template_for(_TEMPLATE_OPERATORS.get(name, "")) is None:
+            return None
+        return template_for(_TEMPLATE_OPERATORS[name])
+
+    def _template_meta(self, node, realized_args):
+        """What the template needs to know about this call's operands.
+
+        The tuner reads its operands as positions in a feed list, so which
+        argument is which operand is recorded here, once, where the operation
+        is lowered.
+        """
+
+        name = target_name(node.target)
+        tensors = [a for a in realized_args if isinstance(a, Buffer)]
+        out_val = node.meta.get("val")
+        out_shape = tuple(int(s) for s in out_val.shape) if _is_tensor(out_val) else ()
+        meta: dict[str, Any] = {"out_shape": out_shape}
+        if name == _LINEAR_OPERATOR:
+            # A linear layer's weight arrives as (out, in); the template reads
+            # the operand pair the other way round.
+            meta["b_transposed"] = True
+            meta["operand_specs"] = ((0, None), (1, None))
+            if len(tensors) > 2:
+                meta["bias_spec"] = (2, None)
+        else:
+            meta["operand_specs"] = ((0, None), (1, None))
+        meta["operand_positions"] = tuple(
+            i for i, a in enumerate(realized_args) if isinstance(a, Buffer)
+        )
+        return meta
+
     def make_extern(self, node, args, kwargs):
         def realize_args(value):
             if isinstance(value, TensorBox):
@@ -182,14 +233,31 @@ class GraphLowering:
                 return {k: realize_args(v) for k, v in value.items()}
             return value
 
-        kernel = ExternKernel(
-            self.new_name("extern"),
-            node.target,
-            realize_args(args),
-            realize_args(kwargs),
-            node.meta.get("val"),
-            call_method=node.op == "call_method",
-        )
+        realized_args = realize_args(args)
+        # An operator a template owns is built as that template's kernel, so
+        # the operation is named in one place and its implementation is chosen
+        # from the template's candidates rather than at the call site.
+        template = self._template_for(node, realized_args)
+        if template is not None:
+            kernel = TemplateKernel(
+                self.new_name("extern"),
+                node.target,
+                template,
+                realized_args,
+                realize_args(kwargs),
+                node.meta.get("val"),
+                call_method=node.op == "call_method",
+            )
+            kernel.template_meta = self._template_meta(node, realized_args)
+        else:
+            kernel = ExternKernel(
+                self.new_name("extern"),
+                node.target,
+                realized_args,
+                realize_args(kwargs),
+                node.meta.get("val"),
+                call_method=node.op == "call_method",
+            )
         self.operations.append(kernel)
 
         def wrap(val, path):
@@ -259,6 +327,16 @@ class GraphLowering:
             if key in produced:
                 return produced[key]
             if value.op == "placeholder":
+                if value not in env:
+                    # A half that was partitioned out rebuilds its own
+                    # placeholders, and a node that kept a reference to an
+                    # earlier one names an input the half does not declare.
+                    # Report the name: the caller has to hand this half a
+                    # value for it, and a bare lookup failure would not say
+                    # which input is missing.
+                    raise NotImplementedError(
+                        f"placeholder {value.name!r} is referenced but not declared"
+                    )
                 return env[value]
             if value.op == "get_attr":
                 tensor = self.graph_module._get_attr(value.target)

@@ -140,9 +140,14 @@ def _trace_forward(fn: Callable[..., Any], primals: Sequence[Any], decomposition
 def _trace_joint(fn: Callable[..., Any], primals: Sequence[Any], decompositions):
     """Trace forward + backward into one tagged joint graph.
 
-    Returns ``(joint, out_spec, flat_out, num_fwd_outputs, tangent_examples)``.
-    Tangent placeholders are created once the forward outputs are known and
-    placed ahead of every operator node.
+    Returns ``(joint, out_spec, flat_out, num_fwd_outputs, trace_primals,
+    tangent_examples, tangent_names, diff_outputs)``.  Tangent placeholders
+    are created once the forward outputs are known and placed ahead of every
+    operator node.  Their names and the outputs they stand for travel back
+    with the graph: a caller that re-derived the set from the returned
+    outputs would be reading ``requires_grad`` off proxies whose graph has
+    since been rebuilt, and would come back with a different answer than the
+    one the placeholders were created from.
     """
 
     from tensorplay.utils._dispatch import _disable_current_modes
@@ -163,7 +168,9 @@ def _trace_joint(fn: Callable[..., Any], primals: Sequence[Any], decompositions)
                 (n for n in tracer.graph.nodes if n.op != "placeholder"), None
             )
             with tracer.graph.inserting_before(anchor):
-                _placeholders(tracer, tangents, "tangents", backward=True)
+                tangent_nodes = _placeholders(
+                    tracer, tangents, "tangents", backward=True
+                )
             tracer.backward = True
             grads = (
                 tensorplay.autograd.grad(
@@ -178,7 +185,16 @@ def _trace_joint(fn: Callable[..., Any], primals: Sequence[Any], decompositions)
     bwd_values = [None if g is None else tracer.map_value(g) for g in grads]
     tracer.graph.output(tuple(fwd_values + bwd_values))
     joint = GraphModule(tracer.root, tracer.graph)
-    return joint, out_spec, flat_out, len(fwd_values), trace_primals, tangents
+    return (
+        joint,
+        out_spec,
+        flat_out,
+        len(fwd_values),
+        trace_primals,
+        tangents,
+        [node.name for node in tangent_nodes],
+        diff_outputs,
+    )
 
 
 def _functionalize(gm: GraphModule, example_inputs: Sequence[Any]) -> GraphModule:
@@ -215,11 +231,18 @@ def _call(compiled: Callable[..., Any], args: Sequence[Any]) -> tuple[Any, ...]:
 def _bind_backward_inputs(bw_module, input_kinds, input_keys, saved, grad_outputs, primals, primal_names):
     saved_by_name = dict(saved)
     primal_by_name = dict(zip(primal_names, primals))
-    tangent_by_name = dict(grad_outputs)
+    tangent_values = [value for _, value in grad_outputs]
     values = []
+    tangent_position = 0
     for placeholder, kind, key in zip(bw_module.graph.placeholders, input_kinds, input_keys):
         if kind == "tangent":
-            values.append(tangent_by_name[placeholder.name])
+            # Paired by position.  A half that was partitioned out builds its
+            # own placeholders and names them again, so the name a tangent
+            # carried when it was created is not a key anything holds; the
+            # order the tangents were created in is the order the half reads
+            # them in.
+            values.append(tangent_values[tangent_position])
+            tangent_position += 1
         elif kind == "saved":
             values.append(saved_by_name[key])
         elif key in primal_by_name:
@@ -265,7 +288,16 @@ def aot_function(
         run_inference._tensorplay_aot_graphs = (fw_module,)  # type: ignore[attr-defined]
         return run_inference
 
-    joint, out_spec, flat_out, num_fwd, trace_primals, tangents = _trace_joint(
+    (
+        joint,
+        out_spec,
+        flat_out,
+        num_fwd,
+        trace_primals,
+        tangents,
+        _tangent_names,
+        _diff_outputs,
+    ) = _trace_joint(
         fn, primals, decompositions
     )
     joint = _functionalize(
