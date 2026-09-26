@@ -13,9 +13,56 @@ written anywhere else would have to be told that.
 
 from __future__ import annotations
 
+import functools
+import operator
 from typing import Any
 
+import sympy
+
 import tensorplay as tp
+
+
+def conditional_product(*args: int) -> int:
+    """The product of the arguments that are not zero.
+
+    A zero would make the whole product zero, so an argument that is zero is
+    left out rather than multiplied in: what is wanted is the size of what is
+    actually there.
+    """
+
+    return functools.reduce(operator.mul, [x for x in args if x])
+
+
+def ceildiv(number: int, denom: int) -> int:
+    """The number of steps of ``denom`` needed to reach ``number``."""
+
+    return -(number // -denom)
+
+
+def is_power_of_2(n: int) -> bool:
+    """Whether ``n`` is a power of two."""
+
+    return n > 0 and n & n - 1 == 0
+
+
+def next_power_of_2(n: int) -> int:
+    """The smallest power of two that is at least ``n``."""
+
+    if isinstance(n, sympy.Integer):
+        n = int(n)
+    if n <= 0:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+def last_power_of_2(n: int) -> int:
+    """The largest power of two that is at most ``n``."""
+
+    if isinstance(n, sympy.Integer):
+        n = int(n)
+    if n <= 0:
+        return 1
+    return 1 << ((n - 1).bit_length() - 1)
 
 
 def _describe(value: Any) -> str:
