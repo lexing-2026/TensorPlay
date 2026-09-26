@@ -23,6 +23,7 @@ from tensorplay.utils import _pytree as pytree
 
 from . import config
 from .loops import compute_required_storage_length, contiguous_strides
+from .utils import get_sympy_Expr_dtype
 from .sizevars import SizeVarAllocator
 from .ir import (
     Buffer,
@@ -229,6 +230,57 @@ def _op_packet_name(node) -> str | None:
     if not isinstance(name, str):
         return None
     return name.split(".")[0]
+
+
+def may_get_constant_buffer_dtype(constant_buffer) -> Any | None:
+    """The element type a shape held in a buffer would have, if it has one.
+
+    A shape is a whole number, so a buffer holding one holds whole numbers; a
+    value that is a number but not a whole one is a real number.  What comes
+    back is nothing when the expression is a number of some other kind, because
+    there is then no type to say.
+    """
+
+    import sympy
+
+    if not isinstance(
+        constant_buffer, (sympy.Symbol, sympy.Expr, sympy.core.numbers.Integer)
+    ):
+        raise AssertionError(
+            "may_get_constant_buffer_dtype only supports a symbol, an "
+            "expression or a whole number"
+        )
+    if isinstance(constant_buffer, sympy.core.numbers.Integer):
+        return tp.int64
+
+    if isinstance(constant_buffer, sympy.Expr):
+        return get_sympy_Expr_dtype(constant_buffer)
+
+    if constant_buffer.is_integer:
+        return tp.int64
+    if constant_buffer.is_float:
+        return tp.float32
+    return None
+
+
+def getattr_recursive(obj, target: str):
+    """What a dotted path names on a module, saying where the path stops.
+
+    A node names a constant by the path at which the module holds it, and the
+    path is several attributes deep, so reading it is walking.  When the walk
+    cannot go on, saying how far it got turns a question about a name into a
+    question about a prefix that can be looked at.
+    """
+
+    target_atoms = target.split(".")
+    attr_itr = obj
+    for i, atom in enumerate(target_atoms):
+        if not hasattr(attr_itr, atom):
+            raise RuntimeError(
+                f"Node referenced nonexistent target {'.'.join(target_atoms[:i])}"
+            )
+        attr_itr = getattr(attr_itr, atom)
+    return attr_itr
 
 
 def get_user_visible_output_strides(g) -> dict:
@@ -1252,7 +1304,9 @@ class GraphLowering:
                 )
             return self.env[value]
         if value.op == "get_attr":
-            tensor = (self.module or self.graph_module)._get_attr(value.target)
+            # Read by the path the node gives rather than by the module's own
+            # lookup, so that a path that does not resolve says how far it got.
+            tensor = getattr_recursive(self.module or self.graph_module, value.target)
             name = self.allocate_non_dup_const_name(None, tensor)
             layout = FixedLayout(tensor.device, tensor.dtype,
                             tuple(int(s) for s in tensor.shape),

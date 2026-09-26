@@ -1648,19 +1648,20 @@ def _get_do_bench_profile_result(
 
     device_time_us = 0.0
     for event in kineto_events:
-        linked_correlation_id = event.linked_correlation_id()
-        correlation_id = event.correlation_id()
         activity_type = event.activity_type()
+        # Membership is decided by which operation the work belongs to, not by
+        # whether the launch that issued it was recorded.  Deciding it by the
+        # launch would need a second chance for a work whose launch was not
+        # recorded, matched on the correlation id, and that second chance cannot
+        # be taken here: the collector numbers launches from one and operations
+        # are numbered from the same low range, so a launch id and an operation
+        # id are the same numbers and matching one against the other finds
+        # coincidences.  An operation this collector could not name is left out,
+        # which undercounts rather than charging one operation's time to another.
         if (
             event.device_type() == expected_device_type
             and activity_type != "gpu_user_annotation"
-            and (
-                linked_correlation_id in benchmark_event_ids
-                or (
-                    linked_correlation_id == 0
-                    and correlation_id in benchmark_event_ids
-                )
-            )
+            and event.op_slot() in benchmark_event_ids
             and event.name() != "Context Sync"
         ):
             device_time_us += (event.end_ns() - event.start_ns()) / 1000.0
@@ -1672,6 +1673,38 @@ def _get_do_bench_profile_result(
         )
 
     return device_time_us / 1000.0 / n_repeat
+
+
+def _prime_device_collector() -> None:
+    """Make the device collector ready to report, if it is not already.
+
+    The collector allocates its record buffers the first time it is asked for
+    them, and the work it is asked to record while it is doing that is not
+    recorded.  A session started in a process that has never run one therefore
+    reports no device work at all, which is indistinguishable from a session in
+    which the device did nothing -- and a measurement that reads as the second
+    is a measurement of the collector rather than of what was measured.
+
+    So the first session in a process is spent on a throwaway call, whose
+    records are the ones lost, and the measured session is the second one.  Only
+    the first pays for this, and a process that has already run a session pays
+    nothing.
+    """
+
+    import tensorplay.profiler as _profiler
+
+    if _profiler.device_activity_ready():
+        return
+    activities = [tp.profiler.ProfilerActivity.CPU]
+    for name in ("CUDA", "XPU", "MTIA"):
+        activity = getattr(tp.profiler.ProfilerActivity, name, None)
+        if activity is not None:
+            activities.append(activity)
+            break
+    with tp.profiler.profile(activities=activities):
+        pass
+    # A session with no work in it still has to have asked the device for its
+    # buffers, which is what starting and stopping one does.
 
 
 def _do_bench_using_profiling(
@@ -1697,6 +1730,8 @@ def _do_bench_using_profiling(
 
     if not is_vetted_benchmarking:
         may_ban_benchmarking()
+
+    _prime_device_collector()
 
     device_module = _gpu_device_module()
     device_type = device_module.__name__.rsplit(".", 1)[-1]
@@ -1743,7 +1778,7 @@ def _do_bench_using_profiling(
         )
 
     result = _get_do_bench_profile_result(
-        profile.profiler.kineto_results.events(),
+        profile.kineto_results(),
         profile.events(),
         n_repeat,
         getattr(tp.DeviceType, device_type_upper),
@@ -1795,6 +1830,38 @@ def get_layout_symints(node) -> OrderedSet:
     return found
 
 
+#: The width a memory access is aligned to, in bytes.  A load of several
+#: elements at once has to start at an address the hardware can address that
+#: way, and this is the narrowest width that is enough for any of the widths
+#: used, so a value that is aligned to it is aligned for all of them.
+ALIGNMENT = 16
+
+#: The width an offset into a buffer must be a multiple of for a view of it to
+#: be addressable element by element.  Settled rather than derived: it is the
+#: width the widest vector load wants, and a wider one would rule out views that
+#: are perfectly addressable.
+GPU_ALIGN_BYTES = 16
+
+
+def get_sympy_Expr_dtype(val) -> Any:
+    """The element type an expression has, as far as its own kind says.
+
+    A whole number is a whole number however it was arrived at, and anything
+    else that is a number at all is a real number, so the kind of the expression
+    is what decides the type rather than anything about how it was written.
+    """
+
+    import sympy
+
+    if not isinstance(val, sympy.Expr):
+        raise AssertionError(
+            "only support sympy.Expr as input to get_sympy_Expr_dtype"
+        )
+    if val.is_integer:
+        return tp.int64
+    return tp.float64
+
+
 def dominated_nodes(initial_queue, skip_filter=None) -> "OrderedSet":
     """The values that depend on the ones named, and the ones named.
 
@@ -1821,3 +1888,70 @@ def dominated_nodes(initial_queue, skip_filter=None) -> "OrderedSet":
                 dominated.add(user)
                 queue.append(user)
     return dominated
+
+
+def snode_args_kwargs(snode) -> tuple[list[Any], dict[str, Any]]:
+    """The arguments a piece's call takes, with each one in the form a caller wants.
+
+    A call is recorded as two streams -- the arguments that name memory and the
+    ones that do not -- because a scheduler has to know which is which.  A
+    caller that is going to *make* the call wants the opposite: one flat list,
+    with anything that is not a piece of the graph turned into a real value it
+    can pass.
+
+    That is what this does, and the order it does it in matters. The arguments
+    a schema declares as positional are removed from the keyword half, so that
+    filling in the schema's defaults cannot add one the caller already gave
+    positionally -- the same argument twice is a call that either fails or, worse,
+    means something else.
+    """
+
+    from tensorplay._ops import OpOverload
+    from tensorplay.utils import _pytree as pytree
+
+    from . import ir as _ir
+
+    node = snode.node
+    if isinstance(node, _ir.FallbackKernel):
+        args, kwargs = node.unflatten_args(node.inputs, node.constant_args)
+    else:
+        args = [*node.inputs, *node.constant_args]
+        kwargs = node.kwargs
+
+    args = node.fill_non_provided_args(args, kwargs)
+    kwargs = dict(kwargs)
+
+    op_overload = getattr(node, "op_overload", None)
+    if isinstance(op_overload, OpOverload):
+        positional_names = [
+            argument.name
+            for argument in op_overload._schema.arguments
+            if not argument.kwarg_only
+        ]
+        for name in positional_names[: len(args)]:
+            kwargs.pop(name, None)
+
+    flat_args, spec = pytree.tree_flatten((args, kwargs))
+
+    def is_tensor_arg(value) -> bool:
+        # A generator's state and an opaque value are graph values with no
+        # tensor behind them, so they are passed as they are.
+        return isinstance(value, _ir.IRNode) and not isinstance(
+            value, (_ir.GeneratorState, _ir.OpaqueObjectState)
+        )
+
+    flat_args = [
+        _ir.ir_node_to_tensor(arg, replace_symbols_with_hints=True)
+        if is_tensor_arg(arg)
+        else arg
+        for arg in flat_args
+    ]
+    # A piece of the graph becomes a real tensor of the right shape, so that a
+    # caller can hand it to something that is not this compiler.
+    flat_args = [
+        tp.empty(value.size(), dtype=value.dtype, device=value.device)
+        if isinstance(value, tp.Tensor)
+        else value
+        for value in flat_args
+    ]
+    return pytree.tree_unflatten(flat_args, spec)
