@@ -15,11 +15,67 @@ from __future__ import annotations
 
 import functools
 import operator
-from typing import Any
+from typing import Any, Hashable
 
 import sympy
 
 import tensorplay as tp
+
+
+#: Whether output may carry colour.  Off when the module that provides it is
+#: absent, and off when output is not a terminal, so that a message piped
+#: somewhere carries no escape sequences.
+HAS_COLORAMA = False
+
+try:  # noqa: SIM105
+    import colorama
+
+    HAS_COLORAMA = True
+except ImportError:
+    pass
+
+
+if HAS_COLORAMA:
+
+    def _color_text(msg: str, color: str) -> str:
+        return getattr(colorama.Fore, color.upper()) + msg + colorama.Fore.RESET
+
+else:
+
+    def _color_text(msg: str, color: str) -> str:
+        return msg
+
+
+def green_text(msg: str) -> str:
+    """``msg`` in green, where colour is available."""
+
+    return _color_text(msg, "green")
+
+
+def yellow_text(msg: str) -> str:
+    """``msg`` in yellow, where colour is available."""
+
+    return _color_text(msg, "yellow")
+
+
+def red_text(msg: str) -> str:
+    """``msg`` in red, where colour is available."""
+
+    return _color_text(msg, "red")
+
+
+def triton_config_to_hashable(cfg) -> "Hashable":
+    """A configuration reduced to something that can key a dictionary.
+
+    What identifies a configuration is every number in it, so the reduction
+    keeps them all and orders them, which makes two configurations that
+    differ in any of them unequal and two that do not equal.
+    """
+
+    items = sorted(cfg.kwargs.items())
+    items.append(("num_warps", cfg.num_warps))
+    items.append(("num_stages", cfg.num_stages))
+    return tuple(items)
 
 
 def conditional_product(*args: int) -> int:

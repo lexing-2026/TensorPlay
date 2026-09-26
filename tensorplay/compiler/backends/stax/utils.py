@@ -1862,6 +1862,27 @@ def get_sympy_Expr_dtype(val) -> Any:
     return tp.float64
 
 
+def get_max_numwarps() -> int:
+    """How many warps fit in one block on the device being compiled for.
+
+    A block holds a whole number of warps, so the answer is the most threads a
+    block may hold divided by how wide a warp is on this device -- and both of
+    those are properties of the device rather than numbers to assume.
+    """
+
+    from .runtime.hints import DeviceProperties
+
+    if tp.cuda.is_available():
+        device = tp.device("cuda", tp.cuda.current_device())
+        props = DeviceProperties.create(device)
+        warp_size = props.warp_size_or_default
+        max_threads_per_block = props.max_threads_per_block
+        if max_threads_per_block is None:
+            raise AssertionError("expected max_threads_per_block to be set")
+        return max_threads_per_block // warp_size
+    return 32
+
+
 def dominated_nodes(initial_queue, skip_filter=None) -> "OrderedSet":
     """The values that depend on the ones named, and the ones named.
 
