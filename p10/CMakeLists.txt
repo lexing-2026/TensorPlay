@@ -259,7 +259,9 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/norm/InstanceNormKernels.cu
         src/backend/cuda/LossFillKernels.cu
         src/backend/cuda/LossCTC.cu
-        src/backend/cuda/ConvKernels.cu
+    src/backend/cuda/cudnn/ConvShared.cu
+    src/backend/cuda/cudnn/ConvV7Kernels.cu
+    src/backend/cuda/cudnn/ConvV8Kernels.cu
         src/backend/cuda/ConvTransposeKernels.cu
         src/backend/cuda/Conv1dKernels.cu
         src/backend/cuda/Conv3dKernels.cu
