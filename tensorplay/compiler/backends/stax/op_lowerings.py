@@ -726,3 +726,174 @@ def lower_native_group_norm_backward(node, grad_out, x, mean, rstd, gamma, n, c,
 
 
 __all__ = ["LOWERINGS", "broadcast_loader", "make_reduction", "pointwise", "register", "reshape", "target_name"]
+
+
+# ---------------------------------------------------------------------------
+# sampling operators
+# ---------------------------------------------------------------------------
+
+
+def _pair(value, count: int) -> list:
+    """A kernel/stride/padding argument as one entry per spatial axis."""
+
+    if isinstance(value, int):
+        return [int(value)] * count
+    items = [int(v) for v in value]
+    if len(items) == 1:
+        return items * count
+    return items
+
+
+def _pool_output_size(extent: int, kernel: int, stride: int, padding: int,
+                      ceil_mode: bool) -> int:
+    """Output extent of one pooling axis."""
+
+    if ceil_mode:
+        return -((-(extent + 2 * padding - kernel)) // stride) + 1
+    return (extent + 2 * padding - kernel) // stride + 1
+
+
+@register("upsample_nearest2d.default", "_upsample_nearest_exact2d.default",
+          "upsample_nearest3d.default", "_upsample_nearest_exact3d.default")
+def lower_upsample_nearestnd(node, x, output_size, scales_h=None, scales_w=None,
+                             **kwargs):
+    """Nearest upsampling as an index remap of the source.
+
+    Each output element reads the input element the scale maps it to, so the
+    operator is a view with a remapped address rather than a call: it fuses
+    with whatever consumes it instead of standing on its own.
+    """
+
+    size, dtype, device = val_info(node_val(node))
+    in_size = list(x.get_size())
+    ndim = 3 if "3d" in target_name(node.target) else 2
+    out_spatial = [int(s) for s in output_size][-ndim:]
+    in_spatial = in_size[-ndim:]
+    prefix = in_size[:-ndim]
+
+    def reindex(index):
+        # Nearest maps output position i to floor(i / scale) of the input.
+        return [
+            *index[: len(prefix)],
+            *[
+                floordiv(
+                    as_index(index[len(prefix) + axis]) * i, Const(o)
+                )
+                for axis, (i, o) in enumerate(zip(in_spatial, out_spatial))
+            ],
+        ]
+
+    return make_view(x, size, reindex)
+
+
+@register("avg_pool2d.default", "avg_pool3d.default")
+def lower_avg_poolnd(node, x, kernel_size, stride=(), padding=0, ceil_mode=False,
+                     count_include_pad=True, divisor_override=None, **kwargs):
+    """Average pooling as a window sum followed by the window's divisor.
+
+    A window that is both large and overlapping is left to the operator: the
+    decomposition reads the input once per window, which stops paying once
+    the windows overlap heavily.
+    """
+
+    size, dtype, device = val_info(node_val(node))
+    in_size = list(x.get_size())
+    ndim = 3 if "3d" in target_name(node.target) else 2
+    kernel = _pair(kernel_size, ndim)
+    stride = _pair(stride, ndim) if stride else list(kernel)
+    padding = _pair(padding, ndim) if padding else [0] * ndim
+    window = 1
+    for extent in kernel:
+        window *= extent
+    if window > 25 and any(k != s for k, s in zip(kernel, stride)):
+        raise NotImplementedError(
+            f"average pooling with an overlapping {window}-element window"
+        )
+    spatial_in = in_size[-ndim:]
+    spatial_out = [
+        _pool_output_size(extent, k, s, p, bool(ceil_mode))
+        for extent, k, s, p in zip(spatial_in, kernel, stride, padding)
+    ]
+    prefix = in_size[: len(in_size) - ndim]
+    loader = x.make_loader()
+    boundary = any(padding)
+    f32 = "float32"
+
+    def inner(index, rindex):
+        full = list(index[: len(prefix)])
+        for axis in range(ndim):
+            base = index[len(prefix) + axis]
+            full.append(base * stride[axis] - padding[axis] + rindex[axis])
+        if not boundary:
+            return loader(full)
+        # A padded window reads zero outside the source, so the sum skips it.
+        outside = None
+        for axis in range(ndim):
+            # The address is index arithmetic; a bound test needs it as a value.
+            position = ops.index_expr(full[len(prefix) + axis], "int64")
+            low = ops.ge(position, ops.constant(0, "int64"))
+            high = ops.lt(
+                position, ops.constant(spatial_in[axis], "int64")
+            )
+            inside = ops.and_(low, high)
+            outside = inside if outside is None else ops.and_(outside, inside)
+        return ops.masked(outside, lambda: loader(full), ops.constant(0.0, f32))
+
+    total = TensorBox(
+        Reduction(
+            device, f32, inner, (*prefix, *spatial_out), tuple(kernel), "sum"
+        )
+    )
+    total.realize()
+    if divisor_override is not None:
+        divisor = float(divisor_override)
+    elif count_include_pad or not any(padding):
+        divisor = float(window)
+    else:
+        # Only the positions inside the source contribute to the divisor.
+        divisor = None
+    if divisor is None:
+        return _pool_with_masked_divisor(
+            node, total, prefix, spatial_out, kernel, stride, padding,
+            spatial_in, f32, device,
+        )
+    return pointwise(
+        node,
+        lambda value: ops.truediv(value, ops.constant(divisor, f32)),
+        total,
+    )
+
+
+def _pool_with_masked_divisor(node, total, prefix, spatial_out, kernel, stride,
+                              padding, spatial_in, f32, device):
+    """Average pooling whose divisor counts only the positions inside."""
+
+    def inner(index, rindex):
+        full = list(index[: len(prefix)])
+        for axis in range(len(kernel)):
+            full.append(
+                index[len(prefix) + axis] * stride[axis] - padding[axis] + rindex[axis]
+            )
+        inside = None
+        for axis in range(len(kernel)):
+            position = ops.index_expr(full[len(prefix) + axis], "int64")
+            term = ops.and_(
+                ops.ge(position, ops.constant(0, "int64")),
+                ops.lt(position, ops.constant(spatial_in[axis], "int64")),
+            )
+            inside = term if inside is None else ops.and_(inside, term)
+        return ops.masked(inside, lambda: ops.constant(1.0, f32),
+                          ops.constant(0.0, f32))
+
+    counted = TensorBox(
+        Reduction(
+            device, f32, inner, (*prefix, *spatial_out), tuple(kernel), "sum",
+        )
+    )
+    counted.realize()
+    return pointwise(
+        node,
+        lambda value, count: ops.truediv(value, count),
+        total,
+        counted,
+    )

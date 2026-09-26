@@ -53,10 +53,14 @@ class ExternStep(Step):
             {b.name for b in kernel.input_buffers()}, {o.name for o in kernel.outputs}
         )
         self.kernel = kernel
+        self._baked = None
 
     def run(self, env: dict) -> None:
         args = _resolve(self.kernel.args, env)
         kwargs = _resolve(self.kernel.kwargs, env)
+        if getattr(self.kernel, "template", None) is not None:
+            self._run_template(args, kwargs, env)
+            return
         if self.kernel.call_method:
             # A method call names the operation with a string and receives the
             # object it is called on first.
@@ -70,6 +74,47 @@ class ExternStep(Step):
         for output in self.kernel.outputs:
             env[output.name] = _dig(result, output.path)
 
+    def _run_template(self, args, kwargs, env) -> None:
+        """Run a templated operator through the launcher its template chose.
+
+        The choice needs the real operands, so it is made on the first call and
+        kept on the step: afterwards the baked launcher is replayed, and the
+        template's own cache means the measurement happens once per shape even
+        across processes.
+        """
+
+        feed = _template_feed(self.kernel, args)
+        launch = self._baked
+        if launch is None:
+            measured = self._bake(feed, args, kwargs)
+            launch = measured if measured is not None else self._plain_launch(args, kwargs)
+            self._baked = launch
+        result = launch(feed)
+        for output in self.kernel.outputs:
+            env[output.name] = _dig(result, output.path)
+
+    def _bake(self, feed, args, kwargs):
+        try:
+            return self.kernel.template.resolve(
+                self._plain_launch(args, kwargs), feed, dict(self.kernel.template_meta)
+            )
+        except Exception:  # noqa: BLE001 - a template never breaks the region
+            return None
+
+    def _plain_launch(self, args, kwargs):
+        """The operator as the framework runs it: the floor a template keeps."""
+
+        return lambda values: self._call_target(args, kwargs)
+
+    def _call_target(self, args, kwargs):
+        if self.kernel.call_method:
+            receiver, *rest = args
+            return getattr(receiver, self.kernel.target)(*rest, **kwargs)
+        target = self.kernel.target
+        if not callable(target) and hasattr(target, "default"):
+            target = target.default
+        return target(*args, **kwargs)
+
 
 def _dtype_of(layout_dtype: Any):
     """The framework element type for a layout.
@@ -82,6 +127,13 @@ def _dtype_of(layout_dtype: Any):
     if isinstance(layout_dtype, str):
         return getattr(tp, layout_dtype)
     return layout_dtype
+
+
+def _template_feed(kernel, args) -> list:
+    """The operand list a template's launcher consumes, in recorded order."""
+
+    positions = getattr(kernel, "template_meta", {}).get("operand_positions") or ()
+    return [args[i] for i in positions]
 
 
 def _resolve(value: Any, env: dict) -> Any:

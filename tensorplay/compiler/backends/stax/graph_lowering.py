@@ -353,10 +353,12 @@ class GraphLowering:
             args = lower(value.args)
             kwargs = lower(value.kwargs or {})
             name = target_name(value.target)
-            if name == "getitem":
-                # A value that is already computed is addressed, not
-                # recomputed.  The spelling is matched by name because the
-                # same operation reaches the graph as more than one callable.
+            if name == "getitem" and isinstance(args[0], (list, tuple)):
+                # Indexing a result tuple is resolved here, not called out to:
+                # a value that is already computed is addressed, not recomputed.
+                # The spelling is matched by name because the same operation
+                # reaches the graph as more than one callable.  Indexing a
+                # tensor selects along an axis instead, which is a view.
                 result = args[0][args[1]]
             else:
                 lowering = LOWERINGS.get(name)

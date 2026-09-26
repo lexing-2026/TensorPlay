@@ -512,6 +512,25 @@ class ExternKernel(IRNode):
         return found
 
 
+class TemplateKernel(ExternKernel):
+    """A library call whose implementation is chosen from a config space.
+
+    The operation is named once, in a template, instead of at every call
+    site: the template owns the candidates and the choice, and the compiled
+    step records which one it settled on.
+    """
+
+    def __init__(self, name, target, template, args, kwargs, meta_values,
+                 call_method=False):
+        # The operation is still dispatched as itself; the template only owns
+        # the choice of implementation for it.
+        super().__init__(name, target, args, kwargs, meta_values,
+                         call_method=call_method)
+        self.template = template
+        self.config = None
+        self.template_meta: dict = {}
+
+
 class ExternOutput(Buffer):
     def __init__(self, name, layout, kernel: ExternKernel, path: tuple):
         super().__init__(name, layout)
@@ -791,7 +810,7 @@ def iter_values(root) -> list[Value]:
 __all__ = [
     "BACKEND_FEATURES", "BACKEND_ORDER", "BackendFeature", "Buffer", "ComputedBuffer",
     "Const", "ConstantBuffer", "DeferredOps", "Expr",
-    "ExternKernel", "ExternOutput", "InputBuffer", "IRNode", "Layout",
+    "ExternKernel", "ExternOutput", "InputBuffer", "TemplateKernel", "IRNode", "Layout",
     "LoopBody", "Loops", "Pointwise", "Reduction", "ReinterpretView", "Symbol",
     "TensorBox", "V", "Value", "View", "affine_coeff", "as_index",
     "PROMOTED_ON_LOAD", "compute_dtype", "contiguous_strides", "dtype_name",

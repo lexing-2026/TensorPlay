@@ -9,6 +9,9 @@ surface for the code generators and the tests.
 """
 from __future__ import annotations
 
+import os
+import sys
+
 from typing import Any
 
 from ....graph import GraphModule
@@ -152,6 +155,17 @@ def stax(
         return compiled
     return wrapped
 
+def _keep_native_graph(graph_module, compiled):
+    """Publish the native graph a region lowered to, when it built one."""
+
+    if compiled is None:
+        return None
+    native_graph = getattr(compiled, "graph", None)
+    if native_graph is not None and hasattr(native_graph, "execute"):
+        graph_module._stax_native_graph = native_graph
+    return compiled
+
+
 def _lower_stax_region(
     graph_module: GraphModule,
     example_inputs: list[Any],
@@ -173,149 +187,174 @@ def _lower_stax_region(
     compiler error, so a benchmark can never report the Python GraphModule
     executor as compiled performance.
     """
+    strict = bool(strict_native)
+    dynamic_shapes = bool(dynamic is True)
+    training = getattr(graph_module.root, "training", False) or any(
+        getattr(value, "requires_grad", False) for value in example_inputs
+    )
+    try:
+        on_cuda = example_inputs[0].device.is_cuda()
+    except (AttributeError, IndexError):
+        on_cuda = False
+
+    routes = []
+
+    def route(tag, enabled, build):
+        """Register one lowering: it answers whether it claims the region."""
+
+        if enabled:
+            routes.append((tag, build))
+
     if use_native and use_fusion:
-        fused_cpu_graph = _lower_cpu_fused_pointwise(
-            graph_module,
-            example_inputs,
-            strict_native=strict_native,
-            dynamic=bool(dynamic is True),
+        route(
+            "stax-fused-cpu",
+            True,
+            lambda: _keep_native_graph(
+                graph_module,
+                _lower_cpu_fused_pointwise(
+                    graph_module, example_inputs,
+                    strict_native=strict, dynamic=dynamic_shapes,
+                ),
+            ),
         )
-        if fused_cpu_graph is not None:
-            graph_module._stax_native_graph = fused_cpu_graph.graph
-            return fused_cpu_graph
         # A region whose tail is a reduction folds the whole expression into
         # the reduction loop: one pass over the input, no intermediate.
-        fused_cpu_reduction = _lower_cpu_fused_reduction(
-            graph_module,
-            example_inputs,
-            strict_native=strict_native,
-            dynamic=bool(dynamic is True),
+        route(
+            "stax-fused-cpu-reduce",
+            True,
+            lambda: _lower_cpu_fused_reduction(
+                graph_module, example_inputs,
+                strict_native=strict, dynamic=dynamic_shapes,
+            ),
         )
-        if fused_cpu_reduction is not None:
-            graph_module._stax_codegen = "stax-fused-cpu-reduce"
-            return fused_cpu_reduction
         # A region whose reductions sit in the middle stages per row: each
         # reduction folds the row to one value that the following work reads
         # as a broadcast, so the region still reads its inputs once.
-        row_fused_cpu = _lower_cpu_row_fusion(
-            graph_module,
-            example_inputs,
-            strict_native=strict_native,
-            dynamic=bool(dynamic is True),
+        route(
+            "stax-fused-cpu-rowfuse",
+            True,
+            lambda: _lower_cpu_row_fusion(
+                graph_module, example_inputs,
+                strict_native=strict, dynamic=dynamic_shapes,
+            ),
         )
-        if row_fused_cpu is not None:
-            graph_module._stax_codegen = "stax-fused-cpu-rowfuse"
-            return row_fused_cpu
     if use_native and use_fusion and use_cuda_codegen:
-        fused_cuda_graph = _lower_cuda_fused_pointwise(
-            graph_module,
-            example_inputs,
-            strict_native=strict_native,
-            dynamic=bool(dynamic is True),
+        route(
+            "stax-cuda",
+            True,
+            lambda: _lower_cuda_fused_pointwise(
+                graph_module, example_inputs,
+                strict_native=strict, dynamic=dynamic_shapes,
+            ),
         )
-        if fused_cuda_graph is not None:
-            graph_module._stax_codegen = "stax-cuda"
-            return fused_cuda_graph
     if use_native and use_triton:
         # Keep Triton optional and lazy.  Importing tensorplay on a CPU-only
         # machine must not import Triton or its compiler toolchain.
-        try:
-            first = example_inputs[0]
-            is_cuda = first.device.is_cuda()
-        except (AttributeError, IndexError):
-            is_cuda = False
-        if is_cuda:
-            # One codegen setting, one lowering: the loop IR.  Nests become
-            # loop nests, the scheduler groups them and the emitter writes the
-            # kernels.  A region this cannot express keeps the non-Triton
-            # routes below rather than a second Triton IR.
-            from .loop_compile import NotLowerable, compile_region
+        def build_loop_region():
+            from ..._core.aot_autograd import aot_module_simplified
+            from .loop_compile import NotLowerable, compile_half
 
-            try:
-                loop_region = compile_region(
-                    graph_module,
-                    list(example_inputs),
+            def compile_half_or_none(half, half_inputs, **_ignored):
+                # The half arrives with the values it reads; what they are is
+                # the boundary's decision, and this only compiles the half.
+                return compile_half(
+                    half, half_inputs,
                     max_autotune=max_autotune,
                     coordinate_descent_tuning=coordinate_descent_tuning,
                 )
-            except (NotLowerable, NotImplementedError):
-                # An operator or a form this lowering does not cover: the
-                # remaining routes are the answer, and only for that reason.
-                loop_region = None
-            if loop_region is not None:
-                graph_module._stax_codegen = "stax-loops"
-                return loop_region
-            if use_fusion:
-                row_fused_cuda = _lower_cuda_row_fusion(
+
+            try:
+                # One boundary owns the region: it traces the joint graph,
+                # splits it, hands each half to the compiler here, and keeps
+                # the saved values and the gradients.  A compiler that cannot
+                # express a half says so from inside that walk.
+                return aot_module_simplified(
                     graph_module,
-                    example_inputs,
-                    strict_native=strict_native,
-                    dynamic=bool(dynamic is True),
+                    list(example_inputs),
+                    fw_compiler=compile_half_or_none,
+                    bw_compiler=compile_half_or_none,
                 )
-                if row_fused_cuda is not None:
-                    graph_module._stax_codegen = "stax-fused-cuda-rowfuse"
-                    return row_fused_cuda
-    if use_native and use_fusion and not use_cuda_codegen:
-        fused_cuda_graph = _lower_cuda_fused_pointwise(
-            graph_module,
-            example_inputs,
-            strict_native=strict_native,
-            dynamic=bool(dynamic is True),
+            except (NotLowerable, NotImplementedError) as exc:
+                # An operator or a form this lowering does not cover: the next
+                # route is the answer, and only for that reason.  Saying which
+                # form is what lets the coverage of this route be measured
+                # instead of guessed.
+                if os.environ.get("TP_LOOP_ROUTE_DEBUG"):
+                    print(
+                        f"[stax-loops] declined: {type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+                return None
+
+        route("stax-loops", on_cuda, build_loop_region)
+        route(
+            "stax-fused-cuda-rowfuse",
+            use_fusion,
+            lambda: _lower_cuda_row_fusion(
+                graph_module, example_inputs,
+                strict_native=strict, dynamic=dynamic_shapes,
+            ),
         )
-        if fused_cuda_graph is not None:
-            graph_module._stax_codegen = "stax-cuda"
-            return fused_cuda_graph
+    if use_native and use_fusion and not use_cuda_codegen:
+        route(
+            "stax-cuda",
+            True,
+            lambda: _lower_cuda_fused_pointwise(
+                graph_module, example_inputs,
+                strict_native=strict, dynamic=dynamic_shapes,
+            ),
+        )
     # The AOT boundary is a property of the graph's gradient surface, not of
     # the callable's shape: bare functions carry no training flag, so a
     # grad-carrying input list must select the split forward/backward route
     # exactly as a training module does.  The builder re-checks grad mode and
-    # returns None for inference calls, leaving the routes below untouched.
-    if use_native and (
-        getattr(graph_module.root, "training", False)
-        or any(
-            getattr(value, "requires_grad", False) for value in example_inputs
-        )
-    ):
-        aot_graph = _lower_aot_native(
-            graph_module, example_inputs, use_fusion=use_fusion
-        )
-        if aot_graph is not None:
-            graph_module._stax_native_graph = aot_graph.forward_graph
-            return aot_graph
-        if strict_native and any(
-            getattr(graph_module._get_attr(node.target), "requires_grad", False)
-            for node in graph_module.graph.nodes
-            if node.op == "get_attr"
-        ):
-            raise RuntimeError(
-                "AOT backward graph for the captured training region"
-            )
+    # returns None for inference calls, leaving the other routes untouched.
+    route(
+        "stax-aot-native",
+        use_native and training,
+        lambda: _keep_native_graph(
+            graph_module,
+            _lower_aot_native(graph_module, example_inputs, use_fusion=use_fusion),
+        ),
+    )
     if use_native and use_fusion:
         # Nothing claimed the region whole.  Its fusible runs are still worth
         # compiling: each becomes one kernel, and the operators between them
         # run as captured instead of the region losing every compiled route.
-        segmented = _lower_cpu_segmented(
-            graph_module,
-            example_inputs,
-            strict_native=strict_native,
-            dynamic=bool(dynamic is True),
+        route(
+            "stax-fused-cpu-segments",
+            True,
+            lambda: _lower_cpu_segmented(
+                graph_module, example_inputs,
+                strict_native=strict, dynamic=dynamic_shapes,
+            ),
         )
-        if segmented is not None:
-            graph_module._stax_codegen = "stax-fused-cpu-segments"
-            return segmented
     # Fused native pointwise nodes are forward execution primitives.  A
     # training graph that reaches this fallback did not obtain an AOT reverse
     # graph, so keep ordinary tensor operators here to preserve autograd
     # recording for every parameter.
-    native_fusion = use_fusion and not getattr(graph_module.root, "training", False)
-    native_graph = (
-        _lower_native(graph_module, example_inputs, use_fusion=native_fusion)
-        if use_native
-        else None
+    native_fusion = use_fusion and not training
+    route(
+        "stax-native",
+        use_native,
+        lambda: _keep_native_graph(
+            graph_module,
+            _lower_native(graph_module, example_inputs, use_fusion=native_fusion),
+        ),
     )
-    if native_graph is not None:
-        graph_module._stax_native_graph = native_graph.graph
-        return native_graph
+
+    for tag, build in routes:
+        compiled = build()
+        if compiled is None:
+            continue
+        graph_module._stax_codegen = tag
+        return compiled
+    if strict and training and any(
+        getattr(graph_module._get_attr(node.target), "requires_grad", False)
+        for node in graph_module.graph.nodes
+        if node.op == "get_attr"
+    ):
+        raise RuntimeError("AOT backward graph for the captured training region")
     if strict_native:
         raise RuntimeError(
             "strict_native Stax lowering failed: captured graph has no native executable"
