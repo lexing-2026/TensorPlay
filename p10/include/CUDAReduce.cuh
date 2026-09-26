@@ -222,17 +222,21 @@ __device__ __forceinline__ ArgPair<T> reduce_warp_shuffle_down(
         reduce_warp_shuffle_down(value.index, mask, offset)};
 }
 
-template <typename T>
+// The count rides along every shuffle and every shared-memory staging step, so
+// its width matters: a 32-bit count keeps the float accumulator at four words
+// (mean, m2, n, nf) instead of five, which is what the shuffle tree and the
+// block staging move.  Callers pick the width from the reduction extent.
+template <typename T, typename IndexT = int64_t>
 struct WelfordData {
     T mean;
     T m2;
-    int64_t n;
+    IndexT n;
     T nf;
 };
 
-template <typename T>
-__device__ __forceinline__ WelfordData<T> reduce_warp_shuffle_down(
-        WelfordData<T> value, unsigned long long mask, int offset) {
+template <typename T, typename IndexT>
+__device__ __forceinline__ WelfordData<T, IndexT> reduce_warp_shuffle_down(
+        WelfordData<T, IndexT> value, unsigned long long mask, int offset) {
     return {
         reduce_warp_shuffle_down(value.mean, mask, offset),
         reduce_warp_shuffle_down(value.m2, mask, offset),
@@ -1325,14 +1329,14 @@ struct NormTwoOps {
     }
 };
 
-template <typename AccT, typename OutputT>
+template <typename AccT, typename OutputT, typename IndexT = int64_t>
 struct WelfordOps {
     AccT correction;
     bool take_sqrt;
-    using acc_type = WelfordData<AccT>;
+    using acc_type = WelfordData<AccT, IndexT>;
 
     __device__ acc_type reduce(acc_type acc, AccT value, int64_t) const {
-        const int64_t new_n = acc.n + 1;
+        const IndexT new_n = static_cast<IndexT>(acc.n + 1);
         const AccT new_nf = static_cast<AccT>(new_n);
         const AccT delta = value - acc.mean;
         const AccT new_mean = acc.mean + delta / new_nf;

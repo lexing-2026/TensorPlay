@@ -393,13 +393,13 @@ Tensor norm_same_dtype(
         AccT(0));
 }
 
-template <typename T>
+template <typename T, typename IndexT>
 Tensor welford_same_dtype(
         const Tensor& input, const ReductionSpec& spec, bool keepdim,
         int64_t correction, bool take_sqrt) {
     using AccT = same_dtype_acc_t<T>;
-    using StateT = WelfordData<AccT>;
-    using Ops = WelfordOps<AccT, T>;
+    using StateT = WelfordData<AccT, IndexT>;
+    using Ops = WelfordOps<AccT, T, IndexT>;
     if (input.numel() == 0) {
         return Tensor::full(
             reduction_output_shape(input, spec, keepdim),
@@ -1060,6 +1060,18 @@ Tensor any_kernel(const Tensor& self) {
 }
 
 // Var / Std
+// 32-bit counts whenever the reduction extent allows: the count rides along
+// every shuffle and staging step, and a narrower count shrinks both.
+template <typename T>
+Tensor welford_dispatch(
+        const Tensor& input, const ReductionSpec& spec, bool keepdim,
+        int64_t correction, bool take_sqrt) {
+    if (spec.reduced_numel <= static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+        return welford_same_dtype<T, int32_t>(input, spec, keepdim, correction, take_sqrt);
+    }
+    return welford_same_dtype<T, int64_t>(input, spec, keepdim, correction, take_sqrt);
+}
+
 Tensor var_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, int64_t correction, bool keepdim) {
     if (isComplexType(self.dtype())) {
         Tensor real = tensorplay::tpx::ops::real(self);
@@ -1068,7 +1080,7 @@ Tensor var_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, int64
                var_dim_kernel(imag, dim, correction, keepdim);
     }
     const ReductionSpec spec = make_reduction_spec(self, dim);
-    TP_DISPATCH_FLOAT_REDUCTION(welford_same_dtype, self.dtype(), self, spec,
+    TP_DISPATCH_FLOAT_REDUCTION(welford_dispatch, self.dtype(), self, spec,
                                 keepdim, correction, false);
 }
 
@@ -1081,7 +1093,7 @@ Tensor std_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, int64
         return var_dim_kernel(self, dim, correction, keepdim).sqrt();
     }
     const ReductionSpec spec = make_reduction_spec(self, dim);
-    TP_DISPATCH_FLOAT_REDUCTION(welford_same_dtype, self.dtype(), self, spec,
+    TP_DISPATCH_FLOAT_REDUCTION(welford_dispatch, self.dtype(), self, spec,
                                 keepdim, correction, true);
 }
 
