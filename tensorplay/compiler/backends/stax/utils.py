@@ -1404,6 +1404,178 @@ def get_benchmark_name() -> str | None:
     return None
 
 
+#: The types a tile descriptor can be built for.  A descriptor names a region
+#: of memory by its type as well as its shape, and the type has to be one the
+#: hardware can encode; a type that is not here cannot be described however well
+#: its extents line up.
+TMA_SUPPORTED_DTYPES = OrderedSet([
+    tp.uint8,
+    tp.int8,
+    tp.uint16,
+    tp.int16,
+    tp.uint32,
+    tp.int32,
+    tp.int64,
+    tp.float16,
+    tp.bfloat16,
+    tp.float32,
+    tp.float64,
+    tp.float8_e4m3fn,
+    tp.float8_e4m3fnuz,
+    tp.float8_e5m2,
+    tp.float8_e5m2fnuz,
+])
+
+
+@functools.cache
+def ensure_cute_available() -> bool:
+    """Whether the kernels written in the device dialect can be written at all.
+
+    Asked once and remembered, because the answer is whether a library is
+    installed and that does not change while a program runs.  Nothing rather
+    than an error when it is not there: a program that does not use that
+    dialect should not fail because it is absent, and the paths that do use it
+    ask this first.
+    """
+
+    try:
+        return importlib.util.find_spec("cutlass") is not None
+    except ImportError:
+        return False
+
+
+def use_blackwell_cutedsl_grouped_mm(
+    mat_a, mat_b, layout, a_is_2d, b_is_2d, offs, bias, scale_result
+) -> bool:
+    """Whether a batched product of that shape may be written in the device dialect.
+
+    Every condition here is one that would make the kernel wrong rather than
+    slow, so each is checked rather than assumed:
+
+    - the dialect's library has to be there, and the search has to have been
+      asked for, since a kernel nobody measures is not worth offering;
+    - the device has to be the generation this kernel is written for, and on a
+      device, and the result has to be a type that generation handles;
+    - the operands have to be fetchable by descriptor, and settled, since a
+      descriptor cannot describe an extent that is still undecided;
+    - the left operand is one matrix and the right a stack, which is the shape
+      this kernel is written for, and the batches have to be named -- a stack
+      of equal-sized ones with no offsets to say where each begins cannot be
+      written at all;
+    - and nothing is added to the result afterwards, because the kernel as
+      written produces the result and has nowhere to put an addition or a scale.
+    """
+
+    from .codegen.cuda.cuda_env import is_datacenter_blackwell_arch
+
+    if not ensure_cute_available():
+        return False
+    if not _use_autotune_backend("CUTEDSL"):
+        return False
+    if not is_gpu(layout.device.type):
+        return False
+    if not is_datacenter_blackwell_arch():
+        return False
+    if not _use_template_for_gpu(layout, [tp.bfloat16]):
+        return False
+    if not (config.max_autotune or config.max_autotune_gemm):
+        return False
+    if not can_use_tma(mat_a, mat_b, output_layout=layout):
+        return False
+    if any(is_dynamic(x) for x in [mat_a, mat_b]):
+        return False
+    if not a_is_2d or b_is_2d:
+        return False
+    if offs is None:
+        return False
+    if bias is not None or scale_result is not None:
+        return False
+    return True
+
+
+def can_use_tma(*matrices, output_layout=None, add_guards: bool = False) -> bool:
+    """Whether every one of these can be fetched by a tile descriptor.
+
+    A descriptor is built once and then asked for tiles by coordinate, which
+    takes the address arithmetic a program would otherwise repeat per tile off
+    it. What it costs is that the region has to be sayable in the form the
+    hardware encodes, and a region that is not is refused here rather than
+    producing a descriptor that reads somewhere else:
+
+    - between one and five extents, which is what the encoding takes;
+    - a type the encoding has a form for;
+    - exactly one extent whose stride is one, since that is the one the
+      encoding walks;
+    - every other stride, and the starting offset, a whole number of sixteen
+      bytes, which is the width the encoding addresses in;
+    - the contiguous extent itself a whole number of sixteen bytes wide;
+    - and for a type one byte wide, at least thirty-two elements of it, which
+      is what the wider units of work need to line up.
+
+    The extents are asked about under the guard the caller asked for. With a
+    guard, what is not yet decided is decided now and remembered, so that a
+    later measurement of the same call sees the same numbers; without one, the
+    best guess for anything undecided is used, which is a decision about what to
+    measure rather than about what the answer is.
+    """
+
+    from .loops import V
+
+    def aligned(expr_bytes):
+        return V.graph.sizevars.statically_known_multiple_of(expr_bytes, TMA_ALIGNMENT)
+
+    def settled(exprs):
+        if add_guards:
+            return list(V.graph.sizevars.guard_int_seq(exprs))
+        return [
+            V.graph.sizevars.replace_backed_symbols_with_hints(e) for e in exprs
+        ]
+
+    def compatible(sizes, strides, dtype):
+        if not 1 <= len(sizes) <= 5:
+            return False
+        if dtype not in TMA_SUPPORTED_DTYPES:
+            return False
+        sizes_i = settled(sizes)
+        strides_i = settled(strides)
+        itemsize = dtype.itemsize
+        inner = [
+            i
+            for i, st in enumerate(strides_i)
+            if V.graph.sizevars.statically_known_equals(st, 1)
+        ]
+        if len(inner) != 1:
+            return False
+        inner_idx = inner[0]
+        for i, st in enumerate(strides_i):
+            if i == inner_idx:
+                continue
+            if not aligned(st * itemsize):
+                return False
+        inner_dim = sizes_i[inner_idx]
+        if not aligned(inner_dim * itemsize):
+            return False
+        if itemsize == 1 and not V.graph.sizevars.statically_known_geq(inner_dim, 32):
+            return False
+        return True
+
+    def compatible_matrix(m):
+        if m.get_name() in V.graph.unaligned_buffers:
+            return False
+        return compatible(m.get_size(), m.get_stride(), m.get_dtype())
+
+    def compatible_layout(layout):
+        if layout is None:
+            return True
+        if not aligned(layout.offset):
+            return False
+        return compatible(layout.size, layout.stride, layout.dtype)
+
+    return compatible_layout(output_layout) and all(
+        compatible_matrix(m) for m in matrices
+    )
+
+
 def is_dynamic(*args) -> bool:
     """Whether any of these values has a shape or a stride not yet settled.
 

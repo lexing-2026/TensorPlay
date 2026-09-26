@@ -1226,3 +1226,28 @@ pre_grad_fusion_options: dict[str, dict[str, Any]] = {}
 #: backward graph is built.  Empty applies none of them; the keys are the
 #: names the rules are registered under.
 post_grad_fusion_options: dict[str, dict[str, Any]] = {}
+
+
+class _CudaConfig:
+    """Which architecture and toolkit a kernel is compiled for.
+
+    A program can be run on a machine other than the one it is built on, and a
+    kernel written for one architecture will not run on another. So the
+    architecture is something that can be said rather than something read off
+    whatever device happens to be present, and saying nothing means the device
+    decides.
+    """
+
+    #: The architecture to compile for, as the two digits the device reports
+    #: them: "80" for one generation, "90" for the next.  Nothing means the
+    #: device that will run it decides.
+    arch: str | None = None
+    #: The toolkit to compile against, as its version: "12.1" and so on.
+    #: Nothing means the toolkit that is installed decides.
+    version: str | None = None
+    #: Where the compiler driver is, when it is not on the path.
+    cuda_cxx: str | None = os.environ.get("TP_CUDA_CXX")
+
+
+cuda = _CudaConfig()
+

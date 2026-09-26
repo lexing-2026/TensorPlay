@@ -994,8 +994,13 @@ class SizeVarAllocator:
         """The expression with each known shape replaced by the value it has.
 
         A shape that has no value yet is left as it is, since there is nothing
-        to replace it with.
+        to replace it with.  A plain number is handed back as it is: there is
+        nothing in it to replace, and a caller holding a number already has the
+        value this would have substituted.
         """
+
+        if isinstance(expr, int):
+            return expr
 
         replacements = {}
         for symbol in free_symbols_of(expr):

@@ -48,7 +48,7 @@ from .select_algorithm import (
 from .triton import CHOICES, dtype_size
 from ..heuristics.template.cutedsl import get_groupgemm_configs
 from ..runtime.triton_compat import tl
-from ..utils import get_gpu_shared_memory, get_max_num_sms, get_num_sms, has_free_symbols
+from ..utils import get_gpu_shared_memory, get_max_num_sms, get_num_sms, has_free_symbols, use_blackwell_cutedsl_grouped_mm
 from ..virtualized import V
 from .mm import (
     GemmConfigHeuristics,
