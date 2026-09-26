@@ -25,6 +25,7 @@ import math
 import threading
 
 import sympy
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
@@ -39,7 +40,6 @@ from .utils import (
 )
 from .codegen.index_expr import (
     ValueRange,
-    affine_coeff,
     free_symbols,
 )
 
@@ -553,62 +553,70 @@ def _index_exprs(body: LoopBody) -> list:
 
 
 def _merge_group(body: LoopBody, reduction: bool) -> LoopBody:
-    """Merge adjacent dims of one loop group where every access is contiguous."""
+    """Merge the loops of one group, and renumber the body for what is left.
 
-    while True:
-        vars_ = body.rvars if reduction else body.vars
-        sizes = body.rsizes if reduction else body.sizes
-        exprs = _index_exprs(body)
-        merged = False
-        # drop unit dims first: they index nothing
-        for k, extent in enumerate(sizes):
-            if extent == 1 and len(sizes) > 1:
-                zero = {vars_[k]: sympy.Integer(0)}
-                body = _rewrite_body(body, zero)
-                new_vars = vars_[:k] + vars_[k + 1 :]
-                new_sizes = sizes[:k] + sizes[k + 1 :]
-                body = _with_group(body, reduction, new_vars, new_sizes)
-                merged = True
-                break
-        if merged:
-            continue
-        for k in range(len(sizes) - 1):
-            a, b = vars_[k], vars_[k + 1]
-            inner = sizes[k + 1]
-            ok = True
-            for e in exprs:
-                ca = affine_coeff(e, a)
-                cb = affine_coeff(e, b)
-                if ca is None or cb is None or ca != cb * inner:
-                    ok = False
-                    break
-            if not ok:
-                continue
-            fused = sympy.Symbol(f"{a.name}m")
-            # affine in both: e = rest + cb*(a*inner + b) = rest + cb*fused
-            mapping_rest = {a: sympy.Integer(0), b: sympy.Integer(0)}
-            new_body = _rewrite_affine(body, a, b, inner, fused)
-            new_vars = vars_[:k] + [fused] + vars_[k + 2 :]
-            new_sizes = sizes[:k] + [sizes[k] * inner] + sizes[k + 2 :]
-            body = _with_group(new_body, reduction, new_vars, new_sizes)
-            merged = True
-            break
-        if not merged:
-            return body
+    Which loops may be merged is not decided here: it is asked of the part of
+    the project that already knows how an index can be renumbered for a set of
+    loops that is smaller than the one it was written for.  That part answers
+    with the new extents and a way of renumbering into them, or with the same
+    extents when nothing may be merged -- so the two decisions here are whether
+    to take the answer, and which of the body's two groups to ask about.
+    """
+
+    from .codegen.common import index_prevent_reordering
+
+    vars_ = body.rvars if reduction else body.vars
+    sizes = list(body.rsizes if reduction else body.sizes)
+    if len(sizes) < 2:
+        return body
+    formulas = index_prevent_reordering(_index_exprs(body), vars_, sizes)
+    new_sizes, reindex, _prune = V.graph.sizevars._simplify_loops(
+        vars_, sizes, formulas
+    )
+    if list(new_sizes) == sizes:
+        return body
+    new_vars = fresh_symbols("p", len(new_sizes))
+    renumbered = _renumber(body, vars_, new_vars, reindex)
+    if reduction:
+        return dataclasses.replace(
+            renumbered, rvars=new_vars, rsizes=list(new_sizes)
+        )
+    return dataclasses.replace(renumbered, vars=new_vars, sizes=list(new_sizes))
 
 
-def _rewrite_affine(body: LoopBody, a, b, inner: int, fused) -> LoopBody:
-    """Rewrite exprs affine in ``a``/``b`` (with a's coeff = inner * b's)."""
 
-    def fix(expr):
-        expr = as_index(expr)
-        cb = affine_coeff(expr, b)
-        if cb is None:
-            return expr
-        rest = substitute(expr, {a: sympy.Integer(0), b: sympy.Integer(0)})
-        return rest + fused * cb if cb else rest
+
+
+
+def _renumber(body: LoopBody, old_vars, new_vars, reindex) -> LoopBody:
+    """The same recorded body, numbered for the loops that are left.
+
+    A merge changes which loops a body runs over and not what it computes, so
+    the values are kept and each recorded access is given again in terms of the
+    loops that remain.  The tree is walked once and each value is rebuilt once,
+    so a value used in two places stays one value -- which is what lets a later
+    read see that the two uses are the same.
+
+    The rewrite goes through the recorded tree rather than substituting into it
+    as a whole, because what is recorded is not an expression: it is a tree of
+    operations whose arguments are expressions, and only those are substituted.
+    """
+
+    # Which loop each old one became.  The renumbering answers in terms of the
+    # loops that are left -- one entry per axis the body used to have, with a
+    # zero where two axes were folded into one -- so handing it the new loops
+    # and reading the answer back against the old ones gives the substitution
+    # the recorded indexes need.
+    replacement = dict(zip(old_vars, reindex(list(new_vars))))
 
     memo: dict[int, Value] = {}
+
+    def fix(expr):
+        if not replacement:
+            return expr
+        if isinstance(expr, int):
+            return int(substitute(sympy.Integer(expr), replacement))
+        return substitute(expr, replacement)
 
     def visit(v):
         if not isinstance(v, Value):
@@ -626,16 +634,14 @@ def _rewrite_affine(body: LoopBody, a, b, inner: int, fused) -> LoopBody:
         memo[id(v)] = out
         return out
 
-    root = tuple(visit(r) for r in body.root) if isinstance(body.root, tuple) else visit(body.root)
+    root = (
+        tuple(visit(r) for r in body.root)
+        if isinstance(body.root, tuple)
+        else visit(body.root)
+    )
     loads = [memo[id(v)] for v in body.loads if id(v) in memo]
     stores = {name: fix(e) for name, e in body.stores.items()}
     return LoopBody(body.vars, body.sizes, body.rvars, body.rsizes, root, loads, stores)
-
-
-def _with_group(body: LoopBody, reduction: bool, vars_, sizes) -> LoopBody:
-    if reduction:
-        return LoopBody(body.vars, body.sizes, list(vars_), list(sizes), body.root, body.loads, body.stores)
-    return LoopBody(list(vars_), list(sizes), body.rvars, body.rsizes, body.root, body.loads, body.stores)
 
 
 def simplify_loops(body: LoopBody) -> LoopBody:
