@@ -194,7 +194,7 @@ class PointwiseSubgraphLowering:
     def run(self, *args: Any) -> None:
         """Walk the subgraph, lowering each of its calls as it is reached."""
 
-        from .graph import Interpreter
+        from ....graph import Interpreter
 
         interpreter = Interpreter(self.gm, self)
         interpreter.run(*args)
@@ -292,7 +292,7 @@ def lower_pointwise_subgraph(
 
     # One body for all of it: traced by asking for each output, with the
     # computation behind each asked for only once.
-    from .graph import Graph, GraphModule, Tracer
+    from ....graph import Graph, GraphModule, Tracer
 
     tracer = Tracer()
     tracer.graph = Graph(tracer_cls=tracer.__class__)

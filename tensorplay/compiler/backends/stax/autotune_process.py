@@ -327,7 +327,7 @@ class GPUDeviceBenchmarkMixin:
     ) -> float:
         import tensorplay as tp
 
-        from .benchmarking import benchmarker, get_interface_for_device
+        from .runtime.benchmarking import benchmarker, get_interface_for_device
 
         # One device, or the measurement is of nothing: a candidate that reads
         # from two devices is two candidates, and timing them together times the

@@ -218,7 +218,8 @@ class MemoryDep(Dep):
         ):
             return None
 
-        from .codegen.simd import CantSplit, SIMDKernel
+        from ..tiling_utils import CantSplit
+        from .codegen.simd import SIMDKernel
 
         def split_values(
             *new_ranges: Sequence[sympy.Expr],
