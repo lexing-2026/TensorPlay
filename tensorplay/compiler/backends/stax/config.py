@@ -252,8 +252,13 @@ class _CppConfig:
     #: Whether a kernel is named after what it computes rather than after the
     #: loop nest it came from.  A report that says what was computed is easier to
     #: read; a cached kernel is easier to find when it is named after where it
-    #: was written.
-    descriptive_names = False
+    #: was written.  Off, which is the same as naming it after neither.
+    #:
+    #: On, this says which operation the name is built from: ``"tp"`` for the
+    #: one this project's namespace spells, ``"original_aten"`` for the one the
+    #: graph was captured with before it was decomposed, and
+    #: ``"inductor_node"`` for the graph node's own name.
+    descriptive_names: bool | str = False
 
     #: Whether a reduction whose extent is past a threshold accumulates through
     #: a helper that keeps the running sum in a wider type.  The result is

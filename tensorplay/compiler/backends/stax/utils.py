@@ -873,7 +873,8 @@ def get_fused_kernel_name(node_schedule, descriptive_names) -> str:
 
     Which operation the name is built from is a choice the configuration makes:
     the pre-decomposition operation, the post-capture one, the graph node, or
-    none at all.  Whichever is chosen, the name has to identify the kernel, so
+    none at all.  The names compared here are this project's own: a value of
+    "tp" means the operation as this project's namespace spells it.  Whichever is chosen, the name has to identify the kernel, so
     on a platform with a short path limit an over-long name is cut and
     disambiguated by a digest of what it was.
     """
@@ -897,7 +898,7 @@ def get_fused_kernel_name(node_schedule, descriptive_names) -> str:
             and origin.meta.get("original_aten") is not None
         ]
         sources = sorted(OrderedSet(sources))
-    elif descriptive_names == "torch":
+    elif descriptive_names == "tp":
         sources = []
         for origin in all_origins:
             if origin.op == "call_function":
@@ -1916,6 +1917,48 @@ def prefix_is_reduction(prefix: str) -> bool:
     return prefix[0] == "r"
 
 
+def get_max_num_sms() -> int:
+    """How many multiprocessors the device has, which is how many it can run at once.
+
+    Asked of the device rather than configured anywhere, because a program that
+    wants one persistent program per multiprocessor has to agree with the
+    hardware about how many those are.
+    """
+
+    import tensorplay as tp
+
+    if not tp.cuda.is_available():
+        return 0
+    return tp.cuda.get_device_properties("cuda").multi_processor_count
+
+
+def get_num_sms() -> int:
+    """How many multiprocessors a program may actually keep resident.
+
+    A carveout reserves part of the device for something else, and the
+    multiprocessors in it are not this program's to keep resident; so the count
+    is the device's count less whatever has been set aside. A carveout that was
+    never set aside is not the same as one set to nothing, and is not subtracted.
+    """
+
+    carveout = tp._C._get_sm_carveout_experimental()
+    return get_max_num_sms() - (carveout if carveout is not None else 0)
+
+
+def get_gpu_shared_memory() -> int:
+    """How much memory one program may hold in registers and shared memory together.
+
+    A tile is chosen partly by what fits in that budget, so a number of zero --
+    which is what a driver that will not say returns -- makes every tile look
+    like it fits rather than making the question unanswerable. It is read from
+    the driver that is present and zero is left to mean what it says.
+    """
+
+    from triton.runtime import driver
+
+    return driver.active.utils.get_device_properties(0).get("max_shared_mem", 0)
+
+
 def get_max_numwarps() -> int:
     """How many warps fit in one block on the device being compiled for.
 
@@ -2081,3 +2124,22 @@ def dtype_to_type(dtype) -> type:
         return complex
 
     raise ValueError("not a type a number can be held in")
+
+
+def is_node_meta_valid(node: Any) -> bool:
+    """Whether a node carries a value that stands in for what it will produce.
+
+    A node without one cannot be reasoned about: the passes that look at
+    what a node holds have nothing to look at, and the passes that rewrite
+    a node need the value to know what the rewrite must produce.
+    """
+    return node is None or "example_value" in node.meta or "val" in node.meta
+
+
+#: Passes that must not be applied after the backward graph is built.  Each
+#: either needs a value only the forward graph has, or rewrites a node the
+#: backward graph has already consumed.
+OPTIMUS_EXCLUDE_POST_GRAD = [
+    "activation_quantization_aten_pass",
+    "inductor_autotune_lookup_table",
+]
