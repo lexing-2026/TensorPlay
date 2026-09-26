@@ -22,7 +22,7 @@ import itertools
 from enum import Enum, auto
 from typing import overload
 from collections.abc import Iterable, MutableSet, Reversible
-from typing import Any, SupportsFloat, TypeVar
+from typing import Any, Generic, SupportsFloat, TypeVar
 
 import sympy
 
@@ -69,6 +69,7 @@ __all__ = [
 ]
 
 T = TypeVar("T")
+_T = TypeVar("_T")
 
 #: Above this many terms an addition is not handed to the polynomial gcd,
 #: which is where the cost of a wide sum stops being acceptable.
@@ -175,7 +176,7 @@ def vr_is_expr(vr) -> bool:
     return not vr.is_bool
 
 
-class ValueRanges:
+class ValueRanges(Generic[_T]):
     # Although the type signature here suggests you can pass any
     # sympy expression, in practice the analysis here only works
     # with constant sympy expressions
