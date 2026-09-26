@@ -7,8 +7,8 @@ import operator
 from typing import TYPE_CHECKING
 
 import tensorplay as tp
-from tensorplay import Tensor
-from tensorplay.utils import _get_device_index
+from tensorplay import Tensor, primitives as _prims
+from tensorplay.cuda._utils import _get_device_index
 
 
 if TYPE_CHECKING:
@@ -87,7 +87,7 @@ lookup_seed = make_prim(
 # even if the default dtype is set to something else.
 random = make_prim(
     "inductor_random(SymInt[] size, Tensor seed, str mode, *, ScalarType? align_dtype=None) -> Tensor",
-    lambda size, seed, mode, *, align_dtype=None: getattr(torch, mode)(
+    lambda size, seed, mode, *, align_dtype=None: getattr(tp, mode)(
         size, device=seed.device, dtype=tp.float32
     ),
     doc="Uniform and normal draws using the generator that can be fused",
@@ -153,7 +153,7 @@ def _rand_eager_offsets_impl(offsets, device: tp.device) -> Tensor:
     bases = [b for _, b in states]
 
     def _to_i64(x):
-        if isinstance(x, Any):
+        if isinstance(x, Tensor):
             return x
         return tp.as_tensor(x, device=device, dtype=tp.int64)
 
@@ -253,9 +253,9 @@ tp.library.register_autograd(
 # rather than where the strategies live, because the operations do not exist
 # until they are declared above.
 if tp.distributed.is_available():
-    from tensorplay.distributed.tensor._ops._pointwise_ops import register_inductor_prims
+    from tensorplay.distributed.tensor._ops._pointwise_ops import register_pointwise_ops
 
-    register_inductor_prims()
+    register_pointwise_ops()
 
 prepare_softmax_online = make_prim(
     "prepare_softmax_online(Tensor a, int dim) -> (Tensor, Tensor)",
