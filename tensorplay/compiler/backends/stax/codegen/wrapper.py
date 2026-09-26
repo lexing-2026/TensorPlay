@@ -22,6 +22,7 @@ import sympy
 from sympy import Expr
 
 import tensorplay as tp
+from tensorplay._ops import OpOverload
 
 from .. import config, ir, metrics
 from .. import loops, sympy_utils
@@ -65,7 +66,17 @@ from ..coor import (
     _coor_current_accelerator,
     _coor_enabled,
 )
+from .. import debug as inductor_debug
+from ..compile_log import (
+    dynamo_timed,
+    get_debug_dir,
+    output_code_log,
+    trace_structured,
+)
+from ..runtime.cache_dir_utils import cache_dir
 from ..runtime.hints import DeviceProperties, TritonMeta
+from ..runtime.pooled_allocator import itemsize
+from ..runtime.storage_ref import StorageWeakRef
 from ..sympy_utils import sympy_str
 from tensorplay.utils import _pytree as pytree
 from tensorplay.graph.experimental.sym_node import SymTypes
@@ -82,6 +93,8 @@ from tensorplay.graph.experimental.symbolic_shapes import (
     ConvertIntKey,
     DivideByKey,
 )
+from tensorplay._opaque_object import get_opaque_obj_repr, is_opaque_constant_type
+from tensorplay.graph.experimental.sympy_singleton_int import SingletonInt
 from tensorplay.graph.node import _get_qualified_name
 from .common import (
     ArgName,
@@ -91,6 +104,10 @@ from .common import (
     WorkspaceZeroMode,
 )
 from .cpp_utils import cexpr
+from .custom_extern_kernel_codegen import CUSTOM_EXTERN_KERNEL_CODEGEN
+from .debug_utils import DebugPrinterManager
+from .multi_kernel import MultiKernelState
+from .triton_utils import config_of, should_unwrap_unspec_arg, signature_to_meta
 from .debug_utils import DebugPrinterManager
 from .multi_kernel import MultiKernelState
 from .triton_utils import config_of, should_unwrap_unspec_arg, signature_to_meta
@@ -1601,72 +1618,48 @@ class PythonWrapperCodegen(CodeGen):
         self.header.writeline(f"{name} = None  # {hashed}")
 
     def write_header(self) -> None:
-        """Write the header section of the generated Python wrapper code."""
-        context = torch._guards.TracingContext.try_get()
-        aot_config_comment = ""
-        if context is not None and context.aot_graph_name is not None:
-            aot_config_comment = f"# AOT ID: {context.aot_graph_name}"
-        inductor_debug_utils = ""
+        """Write the header section of the generated Python wrapper code.
+
+        The header is what the rest of the generated source is written against,
+        so it names the things that source uses and nothing else: a name bound
+        to nothing is a line of generated code that cannot be read, and a name
+        the source needs but the header does not bind is a failure at the first
+        call rather than at build time.
+        """
+        debug_utils_import = ""
         if int(config.aot_inductor.debug_intermediate_value_printer) > 0:
-            inductor_debug_utils = "from torch._inductor.codegen.debug_utils import _print_debugging_tensor_value_info"
-        elif torch._inductor.config.test_configs.track_memory_lifecycle:
-            inductor_debug_utils = "from torch._inductor.runtime.debug_utils import tracked_empty_strided\n"
+            debug_utils_import = (
+                "from tensorplay.compiler.backends.stax.codegen.debug_utils "
+                "import _print_debugging_tensor_value_info"
+            )
 
         self.imports.splice(
             f"""
-                {aot_config_comment}
                 from ctypes import c_void_p, c_long, c_int
-                import torch
+                import tensorplay as tp
                 import math
                 import random
                 import os
                 import tempfile
                 from math import inf, nan
                 from cmath import nanj
-                from torch._inductor.hooks import run_intermediate_hooks
-                from torch._inductor.utils import maybe_profile
-                from torch._inductor.codegen.memory_planning import _align as align
-                from torch import device, empty_strided
-                from {async_compile.__name__} import AsyncCompile
-                from torch._inductor.select_algorithm import extern_kernels
-                {inductor_debug_utils}
+                from tensorplay.compiler.backends.stax.runtime.hooks import run_intermediate_hooks
+                from tensorplay.compiler.backends.stax.runtime.pooled_allocator import alloc_from_pool
+                from tensorplay.compiler.backends.stax.utils import _align as align
+                from tensorplay import device, empty_strided
+                {debug_utils_import}
             """,
             strip=True,
         )
         self.header.splice(
             """
-                aten = torch.ops.aten
-                inductor_ops = torch.ops.inductor
-                _quantized = torch.ops._quantized
-                assert_size_stride = torch._C._dynamo.guards.assert_size_stride
-                assert_size_stride_grouped = torch._C._dynamo.guards.assert_size_stride_grouped
-                assert_alignment = torch._C._dynamo.guards.assert_alignment
-                empty_strided_cpu = torch._C._dynamo.guards._empty_strided_cpu
-                empty_strided_cpu_pinned = torch._C._dynamo.guards._empty_strided_cpu_pinned
-                empty_strided_cuda = torch._C._dynamo.guards._empty_strided_cuda
-                empty_strided_xpu = torch._C._dynamo.guards._empty_strided_xpu
-                empty_strided_mtia = torch._C._dynamo.guards._empty_strided_mtia
-                reinterpret_tensor = torch._C._dynamo.guards._reinterpret_tensor
-                alloc_from_pool = torch.ops.inductor._alloc_from_pool
-                async_compile = AsyncCompile()
+                aten = tp.ops.aten
+                inductor_ops = tp.ops.inductor
             """,
             strip=True,
         )
-        try:
-            # Only add empty_strided_p2p() if distributed and SymmetricMemory
-            # is available
-            from torch._C._distributed_c10d import _SymmetricMemory  # noqa: F401
-
-            self.header.splice(
-                """
-                empty_strided_p2p = torch._C._distributed_c10d._SymmetricMemory.empty_strided_p2p
-                """,
-                strip=True,
-            )
-        except (AttributeError, ImportError):
-            pass
         if config.annotate_training:
-            self.header.writeline("from torch.cuda import nvtx")
+            self.header.writeline("from tensorplay.cuda import nvtx")
         if config.triton.proton_profiling:
             self.header.writeline("import triton.profiler as proton")
             self.header.writeline("import triton.profiler.language as pl")
@@ -1678,7 +1671,7 @@ class PythonWrapperCodegen(CodeGen):
             self.header.writeline("import os")
             self.header.writeline(
                 "triton.set_allocator(lambda size, align, stream: "
-                "torch.empty(size, dtype=tp.uint8, device='cuda'))"
+                "tp.empty(size, dtype=tp.uint8, device='cuda'))"
             )
             output_dir = config.triton.proton_output_dir or os.path.join(
                 get_debug_dir(), "proton"
@@ -1690,7 +1683,7 @@ class PythonWrapperCodegen(CodeGen):
             split_invocations = config.triton.proton_split_invocations
             per_cta_occupancy = config.triton.proton_per_cta_occupancy
             self.header.writeline(
-                "from torch._inductor.runtime.proton_utils import process_proton_trace as _proton_process_trace"
+                "from tensorplay.compiler.backends.stax.runtime.proton_utils import process_proton_trace as _proton_process_trace"
             )
             self.header.splice(
                 f"""
@@ -1718,28 +1711,37 @@ class PythonWrapperCodegen(CodeGen):
         pass
 
     def write_kernel_autotune_defs_header(self) -> None:
+        # The preamble the autotuner runs in: what it draws its example values
+        # with, what it puts the generator back with, and how it asks for the
+        # value a template would produce.  Each name is one this project's
+        # runtime provides, because this text is executed here and not beside
+        # its own sources.
         self.kernel_autotune_defs.splice(
             f"""
-                import torch
+                import tensorplay as tp
                 from math import inf, nan
-                from torch._dynamo.testing import rand_strided
-                from torch._dynamo.utils import preserve_rng_state
-                from torch._inductor.select_algorithm import AlgorithmSelectorCache
+                from tensorplay.compiler.backends.stax.runtime.example_values import (
+                    preserve_rng_state,
+                    rand_strided,
+                )
+                from tensorplay.compiler.backends.stax.templates.select_algorithm import (
+                    AlgorithmSelectorCache,
+                )
                 from {async_compile.__name__} import AsyncCompile
 
                 async_compile = AsyncCompile()
                 generate_example_value = AlgorithmSelectorCache.generate_example_value
-                empty_strided_cuda = torch._C._dynamo.guards._empty_strided_cuda
-                empty_strided_xpu = torch._C._dynamo.guards._empty_strided_xpu
+                empty_strided_cuda = lambda *args, **kwargs: tp.empty_strided(*args, device="cuda", **kwargs)
+                empty_strided_xpu = lambda *args, **kwargs: tp.empty_strided(*args, device="xpu", **kwargs)
             """
         )
 
         try:
-            from torch._C import _cuda_getCurrentRawStream  # noqa: F401
+            from tensorplay._C import _cuda_getCurrentRawStream  # noqa: F401
 
             self.kernel_autotune_defs.splice(
                 """
-                get_raw_stream = torch._C._cuda_getCurrentRawStream
+                get_raw_stream = tp._C._cuda_getCurrentRawStream
                 """,
                 strip=True,
             )
@@ -1970,7 +1972,7 @@ class PythonWrapperCodegen(CodeGen):
             code.writeline(f"assert_size_stride({name}, {size}, {stride}, {op_name!r})")
         else:
             self.add_import_once(
-                "from torch._inductor.runtime.runtime_utils import assert_tensor_metadata"
+                "from tensorplay.compiler.backends.stax.runtime.runtime_utils import assert_tensor_metadata"
             )
             code.writeline(
                 f"assert_tensor_metadata({name}, {size}, {stride}, {dtype}, {op_name!r})"
@@ -2030,7 +2032,7 @@ class PythonWrapperCodegen(CodeGen):
         if self._pending_alignment_copies:
             V.graph._defers_input_alignment = True
             self.imports.writeline(
-                "from torch._C._dynamo.guards import copy_if_misaligned"
+                "from tensorplay.compiler.backends.stax.runtime.alignment import copy_if_misaligned"
             )
 
     def codegen_deferred_alignment_copies(
@@ -2134,7 +2136,7 @@ class PythonWrapperCodegen(CodeGen):
                 raise AssertionError("expected stream_idx_to_user_obj_idx to be set")
             if not V.graph.cpp_wrapper:
                 import_line = (
-                    "from torch._dynamo.variables.streams import _get_stream_by_index"
+                    "from tensorplay.compiler.backends.stax.stream_utils import get_raw_stream_name as _get_stream_by_index"
                 )
                 if not self.imports.contains(import_line):
                     self.imports.writeline(import_line)
@@ -2236,8 +2238,7 @@ class PythonWrapperCodegen(CodeGen):
         if V.graph.cpp_wrapper:
             raise AssertionError("CUDA MemPool contexts require Python wrapper")
         import_line = (
-            "from torch._dynamo.graph_bytecode_inputs import "
-            "get_external_object_by_index"
+            "from tensorplay.graph.capture_inputs import get_external_object_by_index"
         )
         if not self.imports.contains(import_line):
             self.imports.writeline(import_line)
@@ -2258,7 +2259,7 @@ class PythonWrapperCodegen(CodeGen):
                 )
                 self.wrapper_call.writeline("for var in return_vars:")
                 self.wrapper_call.do_indent()
-                self.wrapper_call.writeline("if isinstance(var, torch.Tensor):")
+                self.wrapper_call.writeline("if isinstance(var, tp.Tensor):")
                 self.wrapper_call.do_indent()
                 self.wrapper_call.writeline("assert not var.isnan().any().item()")
                 self.wrapper_call.writeline("assert not var.isinf().any().item()")
@@ -2493,7 +2494,7 @@ class PythonWrapperCodegen(CodeGen):
         buf_name: str,
         python_kernel_name: str,
         get_args: Callable[[], Sequence[str]],
-        op_overload: torch._ops.OpOverload | torch._ops.HigherOrderOperator,
+        op_overload: Any,
         raw_args: Sequence[Any],
         outputs: Sequence[ir.Buffer],
     ) -> None:
@@ -2809,7 +2810,7 @@ class PythonWrapperCodegen(CodeGen):
         ):
             return
         else:
-            if torch._inductor.config.graph_partition:
+            if config.graph_partition:
                 pass
             else:
                 raise AssertionError(f"Unknown value type: {type(value)}")
@@ -2912,7 +2913,7 @@ class PythonWrapperCodegen(CodeGen):
                     deferred_symbol_assignments.append(retry)
                 return False
 
-            from torch.utils._sympy.solve import try_solve
+            from tensorplay.graph.experimental.sympy_solve import try_solve
 
             free_symbol = undefined_symbols.pop()
             base_name = name_fn(input_name)
@@ -3134,7 +3135,7 @@ class PythonWrapperCodegen(CodeGen):
 
     def sync_d2h_copy(self, buffer_name: str) -> None:
         event_var = f"_d2h_event_{buffer_name}"
-        self.writeline(f"{event_var} = torch.Event()")
+        self.writeline(f"{event_var} = tp.cuda.Event()")
         self.writeline(f"{event_var}.record()")
         self.writeline(f"{event_var}.synchronize()")
 
@@ -3253,7 +3254,7 @@ class PythonWrapperCodegen(CodeGen):
 
         if example_inputs is not None:
             for name, ex in zip(V.graph.graph_inputs.keys(), example_inputs):
-                if not isinstance(ex, torch.Tensor):
+                if not isinstance(ex, tp.Tensor):
                     continue
                 storage = ex.untyped_storage()
                 nbytes = storage.nbytes()
@@ -3276,7 +3277,7 @@ class PythonWrapperCodegen(CodeGen):
         with output.indent():
             output.splice(
                 """
-                from torch._dynamo.testing import rand_strided
+                from tensorplay.compiler.backends.stax.runtime.example_values import rand_strided
                 """,
                 strip=True,
             )
@@ -3301,7 +3302,7 @@ class PythonWrapperCodegen(CodeGen):
             for group in storage_groups.values():
                 if len(group.inputs) < 2:
                     continue
-                numel = group.nbytes // torch._utils._element_size(group.dtype)
+                numel = group.nbytes // itemsize(group.dtype)
                 output.writeline(
                     f"{group.buffer_name} = rand_strided(({numel},), (1,), device='{self._coor_device_type_str(group.device)}', dtype={group.dtype})"
                 )
@@ -3341,14 +3342,14 @@ class PythonWrapperCodegen(CodeGen):
                     )
                     add_expr_input(
                         name,
-                        f"torch.cuda.default_generators[{gen_idx}].graphsafe_get_state()",
+                        f"tp.cuda.default_generators[{gen_idx}].graphsafe_get_state()",
                     )
                 elif isinstance(value, ir.OpaqueObjectState):
                     output.writeline(f"{name} = None")
                 elif name in aliased_input_specs:
                     buf_name, shape, stride = aliased_input_specs[name]
                     output.writeline(
-                        f"{name} = torch.as_strided({buf_name}, "
+                        f"{name} = tp.as_strided({buf_name}, "
                         f"{self.codegen_python_shape_tuple(shape)}, "
                         f"{self.codegen_python_shape_tuple(stride)})"
                     )
@@ -3377,7 +3378,7 @@ class PythonWrapperCodegen(CodeGen):
         with output.indent():
             output.splice(
                 f"""
-                from torch._inductor.utils import print_performance
+                from tensorplay.compiler.backends.stax.runtime.benchmark_report import print_performance
                 fn = lambda: call(list(args))
                 return print_performance(fn, times=times, repeat=repeat, device='{V.graph.device_type}')
                 """,
@@ -3397,7 +3398,7 @@ class PythonWrapperCodegen(CodeGen):
         with output.indent():
             output.writelines(
                 [
-                    "from torch._inductor.wrapper_benchmark import compiled_module_main",
+                    "from tensorplay.compiler.backends.stax.runtime.benchmark_report import compiled_module_main",
                     "args = get_args()",
                     (
                         f"compiled_module_main('{get_benchmark_name()}', "
@@ -3492,7 +3493,7 @@ class PythonWrapperCodegen(CodeGen):
         inductor_meta, extra_launcher_call_args)``; subsequent calls with the
         same ``cache_key`` reuse the previously assigned name.
         """
-        from torch._dynamo.device_interface import get_interface_for_device
+        from .benchmarking import get_interface_for_device
 
         from ..runtime.triton_compat import GPUTarget
         from ..runtime.triton_helpers import try_filter_backend_options_for_target
@@ -3899,7 +3900,7 @@ class PythonWrapperCodegen(CodeGen):
         buffer.writeline(V.graph.device_ops.synchronize())
 
     def generate_profiler_mark_wrapper_call(self, stack):
-        self.wrapper_call.writeline("from torch.profiler import record_function")
+        self.wrapper_call.writeline("from tensorplay.profiler import record_function")
         self.wrapper_call.writeline(
             f"with record_function('graph_{V.graph.graph_id}_inductor_wrapper_call'):"
         )
@@ -4327,7 +4328,7 @@ class PythonWrapperCodegen(CodeGen):
         self.lines.append(LineContext(ctx))
 
     def val_to_arg_str(self, s, type_=None):
-        from torch.utils._triton import has_triton_package
+        from ..runtime.device_compiler import has_triton_package
 
         if has_triton_package():
             import triton
@@ -4349,7 +4350,7 @@ class PythonWrapperCodegen(CodeGen):
             return repr(
                 type(s)(Shim(PythonWrapperCodegen.val_to_arg_str(self, a)) for a in s)
             )
-        elif isinstance(s, torch._ops.OpOverload):
+        elif isinstance(s, OpOverload):
             return _get_qualified_name(s)
         elif isinstance(s, (ir.Buffer, ir.MutableBox, ReinterpretView)):
             return s.codegen_reference()
@@ -4386,7 +4387,7 @@ class PythonWrapperCodegen(CodeGen):
     @cache_on_self
     def write_memory_track_allocation_once(self):
         import_str = """
-            from torch._inductor.runtime.debug_utils import check_memory_step, track_tensor
+            from ..runtime.debug_memory import check_memory_step, track_tensor
             """
         if not V.graph.cpp_wrapper:
             self.imports.splice(import_str, strip=True)
@@ -4402,7 +4403,7 @@ class PythonWrapperCodegen(CodeGen):
             allocation_shape
         )
         codegen_stride_tuple = self.codegen_python_shape_tuple(stride)
-        if torch._inductor.config.test_configs.track_memory_lifecycle:
+        if config.test_configs.track_memory_lifecycle:
             out = (
                 f"{name} = tracked_empty_strided("
                 f"{codegen_allocation_shape_tuple}, "
@@ -5040,7 +5041,7 @@ class PythonWrapperCodegen(CodeGen):
                 self.writeline(f"if len({name}[{i + ckp_offset}]) > 0:")
                 self.writeline(EnterSubgraphLine(self, while_loop.body_subgraph.graph))
                 self.writeline(
-                    f"{name}[{i}] = torch.stack({name}[{i + ckp_offset}], dim=0)"
+                    f"{name}[{i}] = tp.stack({name}[{i + ckp_offset}], dim=0)"
                 )
                 self.writeline(ExitSubgraphLine(self))
 
@@ -5234,11 +5235,11 @@ class SubgraphPythonWrapperCodegen(PythonWrapperCodegen):
 
     def codegen_graph_nvtx_range_push(self, post_grad_graph_id: int) -> None:
         """Generate NVTX range push for graph."""
-        self.writeline(f"torch.cuda.nvtx.range_push('graph {post_grad_graph_id}')")
+        self.writeline(f"tp.cuda.nvtx.range_push('graph {post_grad_graph_id}')")
 
     def codegen_graph_nvtx_range_pop(self) -> None:
         """Generate NVTX range pop for graph."""
-        self.writeline("torch.cuda.nvtx.range_pop()")
+        self.writeline("tp.cuda.nvtx.range_pop()")
 
     @cache_on_self
     def write_triton_header_once(self) -> None:

@@ -45,6 +45,7 @@ from .ir import (
     Pointwise,
     Reduction,
     ReinterpretView,
+    SliceView,
     StorageBox,
     TensorBox,
     View,

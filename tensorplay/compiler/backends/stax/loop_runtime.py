@@ -341,8 +341,15 @@ def _output_tensor(out: Any, env: dict):
 
     if isinstance(out, ReinterpretView):
         layout = out.get_layout()
+        # A layout's extents and steps are whatever the lowering settled them
+        # as, which may be a symbolic or a plain sequence; what addresses memory
+        # wants them as integers, and an extent that is not one is settled by
+        # the time a value is handed back.
         return tp.as_strided(
-            env[out.data.get_name()], layout.size, layout.stride, layout.offset
+            env[out.data.get_name()],
+            [int(extent) for extent in layout.size],
+            [int(step) for step in layout.stride],
+            int(layout.offset),
         )
     if isinstance(out, (Buffer, ExternOutput)):
         return env[out.name]

@@ -212,6 +212,21 @@ class CodeCache:
 _default_caches: Dict[str, CodeCache] = {}
 
 
+def clear_caches() -> None:
+    """Drop what every cache is holding in this process.
+
+    The artifacts on disk stay: they are named after what they were built from,
+    so they are still what a later build of the same source wants.  What goes is
+    the in-process answer to "have I already loaded this", which is only wrong
+    once something has changed underneath it -- a cache directory moved, or an
+    artifact replaced by a build that had not finished writing.
+    """
+
+    for cache in _default_caches.values():
+        cache._memo_dict = None
+    _default_caches.clear()
+
+
 def default_cache(backend: str) -> CodeCache:
     """Process-wide cache instance per backend."""
 

@@ -88,7 +88,12 @@ class Symbol(Expr):
 
 
 class Const(Expr):
-    """An integer literal."""
+    """An integer literal.
+
+    Reads as the integer it is, so that a caller holding a settled extent can
+    use it as one -- as an allocation size, as a bound, as a slice -- without
+    having to ask which of the two forms it was handed.
+    """
 
     __slots__ = ("value",)
 
@@ -97,6 +102,12 @@ class Const(Expr):
 
     def _key(self) -> Any:
         return ("C", self.value)
+
+    def __int__(self) -> int:
+        return self.value
+
+    def __index__(self) -> int:
+        return self.value
 
 
 _Zero = Const(0)
