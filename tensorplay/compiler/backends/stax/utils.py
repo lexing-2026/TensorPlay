@@ -2922,3 +2922,68 @@ def get_gpu_dram_gbps() -> float:
     return 0.0
 
 
+
+
+def is_cudagraph_unsafe_op(node: Any) -> bool:
+    """Whether work for this value cannot be recorded once and replayed.
+
+    Recording a region and replaying it means running the same work again
+    with nothing to re-decide, so anything whose result or size depends on
+    the data, or that has to be read back to the host, cannot be inside one.
+    A wait on the host is the obvious case; a boolean mask index is the
+    subtle one, because its output size is computed from the mask and so is
+    different on every replay with different data.
+
+    Four things make a value unsafe, and they are asked in that order because
+    the first is the cheapest.  A control-flow node, whose decisions are
+    exactly what a recording cannot make again.  A tagged operation, which
+    says so about itself.  An operation in the list of ones that read back
+    to the host or allocate in a way a recording cannot repeat.  And an
+    output that is sparse, because a sparse result is described by indices
+    whose count comes from the data.
+
+    The tags and the list are the ones this project already uses to decide
+    whether a whole graph can be recorded, so that a region refused here is
+    refused for the same reason and with the same words as the region that
+    contains it.
+    """
+    from ..cudagraphs import _data_dependent_node
+    from ..cudagraphs import _UNSAFE_OPS, _target_name
+
+    from . import ir
+
+    if isinstance(node, (ir.Switch, ir.WhileLoop)):
+        return True
+
+    if not isinstance(node, (ir.FallbackKernel, ir.ExternKernel)):
+        return False
+
+    fx_node = getattr(node, "fx_node", None)
+    if fx_node is None:
+        return False
+
+    if _data_dependent_node(fx_node):
+        return True
+
+    if _target_name(fx_node).rsplit(".", 1)[-1] in _UNSAFE_OPS:
+        return True
+
+    val = fx_node.meta.get("val")
+    if val is not None:
+        vals = [val] if not isinstance(val, (list, tuple)) else val
+        for v in vals:
+            if _is_sparse(v):
+                return True
+    return False
+
+
+def _is_sparse(value: Any) -> bool:
+    """Whether a value is sparse, which is to say described by its own indices.
+
+    Asked of the value rather than of the operation that made it, because
+    whether a result is sparse is a property of the result: an operation can
+    produce one kind or the other depending on what it was given.
+    """
+    from ..cudagraphs import _is_tensor
+
+    return _is_tensor(value) and bool(getattr(value, "is_sparse", False))
