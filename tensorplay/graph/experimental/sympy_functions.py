@@ -2592,6 +2592,17 @@ class NegativeIntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.single
 #: A value larger than every integer.
 int_oo = sympy.S.IntInfinity
 
+def make_symbol(prefix, idx, **kwargs):
+    """A symbol of the kind named, numbered.
+
+    What a symbol stands for is carried in its name, so making one of a kind is
+    naming it with that kind's letters and a number that tells it apart from
+    the others of its kind.
+    """
+
+    return sympy.Symbol(f"{_PREFIX_STR[prefix]}{idx}", **kwargs)
+
+
 def symbol_is_type(sym, prefix) -> bool:
     """Whether a symbol is of the kind, or one of the kinds, named."""
 

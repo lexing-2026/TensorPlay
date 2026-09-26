@@ -19,7 +19,7 @@ import sympy
 
 import tensorplay as tp
 
-from tensorplay.graph.experimental.sympy_functions import OrderedSet, SymT
+from tensorplay.graph.experimental.sympy_functions import OrderedSet, SymT, make_symbol
 from tensorplay.graph.experimental.symbolic_shapes import (
     free_symbols,
     free_unbacked_symbols,
@@ -794,8 +794,6 @@ def extract_read_writes(
     from .loop_body import LoopBody
 
     if isinstance(fn, LoopBody):
-        from .loop_body import extract_loop_body_with_args
-
         inner = extract_loop_body_with_args(
             fn,
             [*args, *hidden_args],
@@ -848,6 +846,115 @@ class FreeSymbolsOpsHandler(DefaultHandler):
         return expr
 
 
+def extract_loop_body_with_args(
+    fn: Any,
+    args: list[list[Any]],
+    var_ranges: Any,
+    normalize: bool = False,
+) -> "_RecordLoadStoreInner":
+    """The body of a nest, as a recording, without tracing it to get one.
+
+    A nest already says what it loads, stores and indexes, and by which index
+    expression; asking it again by running its body would walk the whole thing
+    a second time to arrive at what it wrote down the first time.  So the
+    recording is filled in from what the nest recorded, and the only thing that
+    has to be worked out is which index expression each entry stands for.
+    """
+
+    from .loop_body import MemoryUsageType
+
+    inner = _RecordLoadStoreInner(var_ranges=var_ranges, normalize=normalize)
+    name_to_index = fn.indexing_from_args(args)
+    if fn.indirect_vars:
+        # The names a trace would have given the values it introduced.
+        repl = {v: make_symbol(SymT.TMP, i) for i, v in enumerate(fn.indirect_vars)}
+        name_to_index = {
+            k: sympy_subs(v, repl) for k, v in name_to_index.items()
+        }
+    for entry in fn.memory_usage[MemoryUsageType.LOAD]:
+        inner.load(entry.buffer_name, name_to_index[entry.index_name])
+    for entry in fn.memory_usage[MemoryUsageType.LOAD_SEED]:
+        inner.load_seed(entry.buffer_name, int(name_to_index[entry.index_name]))
+    for entry in fn.memory_usage[MemoryUsageType.STORE]:
+        inner.store(entry.buffer_name, name_to_index[entry.index_name], None, entry.mode)
+    for entry in fn.memory_usage[MemoryUsageType.STORE_REDUCTION]:
+        inner.store_reduction(
+            entry.buffer_name, name_to_index[entry.index_name], None
+        )
+    for entry in fn.memory_usage[MemoryUsageType.INDEX_EXPR]:
+        inner.index_expr(name_to_index[entry.index_name], None)
+    for entry in fn.memory_usage[MemoryUsageType.BUCKETIZE]:
+        # Only the buffer's name matters here, and the name position is where a
+        # name is recorded, so that is the position it is put in.
+        inner.bucketize(
+            None, (entry.buffer_name, None, None, None), None, None, None
+        )
+    return inner
+
+
+def extract_input_node_reduction_ranges(
+    input_node: Any,
+) -> tuple[list[Any] | None, list[Any] | None]:
+    """The size and the reduction size of a node's inputs, when they agree.
+
+    A node may have several inputs, some reducing and some not, and what is
+    wanted is the reduction size they share so that a nest reading all of them
+    can be given one.  Where the inputs disagree there is no single answer, and
+    the sizes are not reported at all rather than reported for some of them.
+    """
+
+    from .ir import ComputedBuffer, ExternKernel, Loops
+
+    size: list[Any] | None
+    reduction_size: list[Any] | None
+
+    if isinstance(input_node.get_defining_op(), ComputedBuffer):
+        # Already in memory, so its own description is the answer.
+        size = [*input_node.get_size()]
+        reduction_size = [*input_node.get_reduction_size()]
+        if len(reduction_size) > 0:
+            return (size, reduction_size)
+        return (None, None)
+
+    if not isinstance(input_node.data.data, Loops):
+        # Nothing else carries a reduction size.
+        return (None, None)
+
+    reads = input_node.get_reads()
+    reduction_size = None
+    size = None
+    while reduction_size is None and len(reads) > 0:
+        seen: OrderedSet[str] = OrderedSet()
+        new_reads: list = []
+        for read in reads:
+            if not isinstance(read, MemoryDep):
+                continue
+            if read.name in seen:
+                continue
+            seen.add(read.name)
+            buffer = V.graph.try_get_buffer(read.name)
+            if buffer is None:
+                continue
+            op = buffer.get_defining_op()
+            if op is None or isinstance(op, ExternKernel):
+                continue
+
+            if isinstance(op, ComputedBuffer) and len(op.get_reduction_size()) > 0:
+                if reduction_size is None:
+                    reduction_size = [*op.get_reduction_size()]
+                    size = [*op.get_size()]
+                elif reduction_size != [*op.get_reduction_size()] or size != [
+                    *op.get_size()
+                ]:
+                    return (None, None)
+            else:
+                new_reads.extend(op.get_reads())
+        if reads == new_reads:
+            return (size, reduction_size)
+        reads = OrderedSet(new_reads)
+    return (size, reduction_size)
+
+
 def extract_free_symbols(*args) -> OrderedSet:
     """Every shape symbol mentioned anywhere inside these arguments."""
 
@@ -876,3 +983,74 @@ class SymbolUsageCollectorOpsHandler(_WrapperHandler):
         if used_here:
             self.usages.add(name)
         return getattr(self._inner, name)(*args, **kwargs)
+
+
+def extract_loop_body_with_args(
+    fn,
+    args,
+    var_ranges,
+    normalize: bool = False,
+):
+    """What a recorded body reads and writes, without running it again.
+
+    A body that has already been traced has its accesses written down, so the
+    accesses can be read off that record rather than produced by running the
+    body under a handler.  The saving is the whole cost of tracing, which for a
+    body traced more than once -- once to record it and once to compile it -- is
+    half of what the recording costs.
+
+    The positions are rewritten into the caller's variables first, because the
+    record was written in the body's own.
+    """
+
+    from .loop_body import MemoryUsageType
+
+    inner = _RecordLoadStoreInner(var_ranges=var_ranges, normalize=normalize)
+    name_to_index = fn.indexing_from_args(args)
+    if fn.indirect_vars:
+        # The record named the body's own temporaries; the caller's are named
+        # the same way, so the names line up position by position.
+        from .codegen.index_expr import Symbol
+        from .utils import sympy_subs
+
+        replacement = {
+            var: Symbol(f"tmp{position}")
+            for position, var in enumerate(fn.indirect_vars)
+        }
+        name_to_index = {
+            key: sympy_subs(value, replacement)
+            for key, value in name_to_index.items()
+        }
+
+    for entry in fn.memory_usage[MemoryUsageType.LOAD]:
+        inner.load(entry.buffer_name, name_to_index[entry.index_name])
+    for entry in fn.memory_usage[MemoryUsageType.LOAD_SEED]:
+        inner.load_seed(entry.buffer_name, int(name_to_index[entry.index_name]))
+    for entry in fn.memory_usage[MemoryUsageType.STORE]:
+        inner.store(
+            entry.buffer_name,
+            name_to_index[entry.index_name],
+            None,
+            entry.mode,
+        )
+    for entry in fn.memory_usage.get(MemoryUsageType.STORE_REDUCTION, ()):
+        inner.store_reduction(
+            entry.buffer_name,
+            name_to_index[entry.index_name],
+            None,
+        )
+    for entry in fn.memory_usage.get(MemoryUsageType.INDEX_EXPR, ()):
+        inner.index_expr(name_to_index[entry.index_name], None)
+    for entry in fn.memory_usage.get(MemoryUsageType.BUCKETIZE, ()):
+        # Only the buffer's name matters here, so it goes in the position the
+        # boundary names go in, which is the one that is recorded.
+        inner.bucketize(
+            None,
+            (entry.buffer_name, None, None, None),
+            None,
+            None,
+        )
+    # The bounds check is deliberately not read: it records that a check was
+    # wanted, not what was read, and reading it would add a dependency on
+    # memory that nothing here loads.
+    return inner

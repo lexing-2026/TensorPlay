@@ -53,6 +53,11 @@ pad_channels_last = False
 # Whether strides are padded when the extents they belong to are symbolic.
 pad_dynamic_shapes = False
 
+# Whether a result is padded even where it would not be padded on its own.  Off
+# because a result is measured against the strides it was given, and padding one
+# produces strides the caller was not promised.
+pad_outputs = False
+
 # The width a padded access is aligned to, in bytes.  A warp's largest memory
 # transaction is 128 bytes, so aligning to that is the finest alignment that
 # can still be reached by one transaction.
@@ -93,8 +98,13 @@ class _TestConfigs:
     runtime_triton_shape_assert = False
     #: Make a measured time deliberately wrong, to check that a decision which
     #: rests on a measurement actually does rest on it.  Which way it is
-    #: distorted, and by how much, is written here rather than derived.
-    distort_benchmarking_result = None
+    #: distorted, and by how much, is written here rather than derived.  Empty
+    #: means do not distort, which is a value of its own rather than the absence
+    #: of one: whether a measurement may be faked is a question with two answers,
+    #: and the answer to it is this.
+    distort_benchmarking_result = os.environ.get(
+        "TP_DISTORT_BENCHMARKING_RESULT", ""
+    )
 
     #: Write an assertion into the generated code for every value whose memory
     #: the wrapper hands out, so that a use after free is caught where it
@@ -363,6 +373,22 @@ max_autotune = os.environ.get("TP_MAX_AUTOTUNE", "0") == "1"
 # product is the one call worth spending a measurement on: it runs inside every
 # layer, so what it costs is paid by the whole model rather than by one line.
 max_autotune_gemm = os.environ.get("TP_MAX_AUTOTUNE_GEMM", "0") == "1"
+
+# Whether a product is compiled as soon as it is chosen, so that the measuring
+# of the candidates overlaps with the measuring of the next thing.  Off because
+# compiling a product needs a graph of its own, which is work done whether or not
+# the product is ever chosen.
+pipeline_max_autotune_gemm = (
+    os.environ.get("TP_PIPELINE_GEMM_AUTOTUNING") == "1"
+)
+
+# Whether the time a candidate takes is read off a profiler trace rather than off
+# a clock around it.  A trace says how long the device was busy, which is not the
+# same as how long the launch took, and for a candidate that waits its two are far
+# apart.  Off because a trace costs more to read than a clock costs to read.
+profile_bandwidth_with_do_bench_using_profiling = (
+    os.environ.get("TP_PROFILE_WITH_DO_BENCH_USING_PROFILING") == "1"
+)
 
 # Whether the answer must be the same on every machine.  On means nothing is
 # measured and the operation's own kernel is used, because the only candidate

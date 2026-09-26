@@ -128,7 +128,11 @@ class ExternStep(Step):
         across processes.
         """
 
-        feed = _template_feed(self.kernel, described)
+        # What the template is handed is the call's operands in the order the
+        # call was written, which is what the positions recorded against it
+        # were counted in.
+        written, _ = self.kernel.unflatten_args(*described)
+        feed = _template_feed(self.kernel, written)
         launch = self._baked
         if launch is None and self.kernel.template is not None:
             # A template is measured once, on the operands of the call that

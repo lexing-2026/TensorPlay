@@ -21,6 +21,7 @@ import sympy
 import tensorplay as tp
 from tensorplay.utils import _pytree as pytree
 
+from . import config
 from .loops import compute_required_storage_length, contiguous_strides
 from .sizevars import SizeVarAllocator
 from .ir import (
@@ -163,9 +164,219 @@ _allowed_output_types = (
 )
 
 
+class _ModuleOfSteps:
+    """Several built steps, entered as one.
+
+    A region may print as more than one kernel, and a caller that asks the region
+    for one artifact should not have to know how many kernels that was.  So the
+    steps are held together and the result of the region is the result of the
+    step that produced it, which is the last one to have run.
+    """
+
+    def __init__(self, launches) -> None:
+        self._launches = list(launches)
+        self.key = "-".join(getattr(l, "key", "") for l in self._launches)
+        self.__file__ = getattr(self._launches[-1], "__file__", None)
+
+    def call(self, args: list) -> Any:
+        """Run every step over the same arguments, and hand back what came out."""
+
+        result = None
+        for launch in self._launches:
+            result = launch.call(args)
+        return result
+
+    def __call__(self, args: list) -> Any:
+        return self.call(args)
+
+
+#: Operators whose inputs are wanted dense, so padding one of them buys
+#: nothing and costs a copy.
+_DISLIKE_PADDING = frozenset(
+    {
+        "convolution",
+        "convolution_backward",
+        "_scaled_mm",
+        "_scaled_mm_v2",
+    }
+)
+
+#: Operators that produce a fresh buffer, where padding the result rather than
+#: the input is what helps.
+_LIKE_PADDING = frozenset(
+    {
+        "var_mean",
+        "sum",
+        "mean",
+        "prod",
+        "any",
+        "amin",
+        "amax",
+        "min",
+        "max",
+        "argmin",
+        "argmax",
+        "scatter_reduce",
+    }
+)
+
+
+def _op_packet_name(node) -> str | None:
+    """An operation's name without the form it was called in, if it has one."""
+
+    target = getattr(node, "target", None)
+    name = getattr(target, "__name__", None)
+    if not isinstance(name, str):
+        return None
+    return name.split(".")[0]
+
+
+def get_user_visible_output_strides(g) -> dict:
+    """The strides each output a caller reads is recorded as having had.
+
+    A graph says which of its results a caller reads and what strides those
+    had before anything was computed for them, and those strides are what a
+    compiled result is measured against: a result that came back with
+    different strides is a different result, even where the elements are the
+    same.
+    """
+
+    ret: dict = {}
+    output_nodes = g.find_nodes(op="output")
+    if not output_nodes:
+        return ret
+    output_node = output_nodes[0]
+    if "user_visible_output_idxs" not in output_node.meta:
+        return ret
+
+    if not hasattr(output_node.args[0], "op"):
+        output_node_args = output_node.args[0]
+    else:
+        output_node_args = output_node.args
+
+    for idx, node in enumerate(output_node_args):
+        if idx in output_node.meta["user_visible_output_idxs"]:
+            ret[node] = output_node.meta["original_output_strides"][idx]
+    return ret
+
+
+def extend_user_visible_output_strides(user_visible_outputs: dict) -> dict:
+    """The outputs a caller reads, plus the views leading up to them.
+
+    A caller reads a result, not the chain of windows that produced it, but
+    whether the chain may be padded is decided per node, so the nodes on the
+    way there are marked as read too.
+    """
+
+    result: dict = {**user_visible_outputs}
+    queue = [*result.keys()]
+    visited = set(queue)
+    while queue:
+        current = queue.pop()
+        if _op_packet_name(current) in _VIEW_PACKETS and current.args:
+            base = current.args[0]
+            if hasattr(base, "op") and base not in visited:
+                result.setdefault(base, None)
+                visited.add(base)
+                queue.append(base)
+    return result
+
+
+#: Operations that hand back a window onto memory rather than a buffer.
+_VIEW_PACKETS = frozenset(
+    {
+        "view",
+        "reshape",
+        "permute",
+        "transpose",
+        "expand",
+        "squeeze",
+        "unsqueeze",
+        "slice",
+        "select",
+        "flatten",
+        "unflatten",
+        "t",
+    }
+)
+
+
+def mark_nodes_dislike_padding(g, user_visible_output_strides: dict) -> None:
+    """Say which nodes must not have their inputs padded.
+
+    A convolution and its backward want their input dense, so padding one costs
+    a copy and gains nothing, while padding usually helps a reduction.  Which
+    nodes those are is found by walking the graph backwards: a node that dislikes
+    padding passes it to everything it reads, except to a reduction, which is
+    the thing padding is for.
+    """
+
+    if not config.comprehensive_padding:
+        return
+
+    extended = extend_user_visible_output_strides(user_visible_output_strides)
+    for cur in reversed(g.nodes):
+        name = _op_packet_name(cur)
+        if name in _DISLIKE_PADDING:
+            cur.meta["dislike_padding"] = True
+        if cur.meta.get("dislike_padding", False):
+            for prior in cur.all_input_nodes:
+                prior_name = _op_packet_name(prior)
+                if prior_name is None:
+                    continue
+                if prior_name not in _LIKE_PADDING:
+                    prior.meta["dislike_padding"] = True
+        # Only a node someone reads is decided this way.  A reduction writes a
+        # fresh buffer whose strides are already settled, so marking it would
+        # stop its inputs being padded for a reason that does not apply to it.
+        if not config.pad_outputs and cur in extended and name not in _LIKE_PADDING:
+            cur.meta["dislike_padding"] = True
+
+
 class GraphLowering:
-    def __init__(self, graph_module, example_inputs):
+    def __init__(
+        self,
+        graph_module,
+        example_inputs,
+        *,
+        shape_env=None,
+        cpp_wrapper: bool = False,
+        aot_mode: Any = None,
+        extern_node_serializer: Any = None,
+        is_inference: bool = False,
+        is_backward: bool = False,
+        name: str | None = None,
+    ):
+        # Which shape the values are described against, kept rather than taken
+        # from whichever graph happens to be current: a region compiled on its
+        # own is asked about shapes that the region it came from already knows,
+        # and asking the current graph would answer for that one instead.
+        self.shape_env = shape_env
+        # Whether the region is being compiled to stand on its own rather than to
+        # be part of something larger, which decides what it may assume about
+        # what surrounds it.
+        self.aot_mode = aot_mode
+        self.extern_node_serializer = extern_node_serializer
+        self.is_inference = is_inference
+        self.is_backward = is_backward
+        # The name this region is known by in a log or an artifact, standing in
+        # for the position in a program that a region compiled on its own does
+        # not have.
+        self.name = name
+        # The name of each value the region is handed, in the order it is handed
+        # them.  A caller that compiled symbols knows them by name and a compiled
+        # artifact is called with them by position, so the two have to be able to
+        # say which is which.
+        self.graph_input_names: list[str] = []
         self.graph_module = graph_module
+        # What strides each output a caller reads is recorded as having had, and
+        # which nodes must not have their inputs padded because of it.
+        self.user_visible_output_strides = get_user_visible_output_strides(
+            graph_module.graph
+        )
+        mark_nodes_dislike_padding(
+            graph_module.graph, self.user_visible_output_strides
+        )
         # The module whose constants a constant node reads, which is this region's
         # own while it is being lowered and the subgraph's while a subgraph's
         # nodes are being lowered into it.  A node names a constant as an
@@ -194,7 +405,7 @@ class GraphLowering:
         # about over and over while deciding what to materialize.
         self.dep_size_hint_cache: dict = {}
         # This region's own name, which every name inside it is qualified with.
-        self.name = None
+        # Set from the constructor argument above when one was given.
         # Which devices this region computes on, and which of each, and which
         # node each device was first needed for.
         self.device_types: set = set()
@@ -277,6 +488,9 @@ class GraphLowering:
         # installed by the walk; a caller that lowers nodes itself needs it
         # before the walk has run.
         self._lower_node = None
+        # Whether the walk has run, so that a second request for a built form
+        # does not walk an already settled region again.
+        self._walked = False
 
     def current_node(self):
         """The graph node being lowered right now, or nothing.
@@ -896,7 +1110,65 @@ class GraphLowering:
     # -- walk -------------------------------------------------------------
     def run(self):
         with set_ops_handler(DeferredOps()), set_graph(self):
-            return self._run()
+            result = self._run()
+        self._walked = True
+        return result
+
+    def compile_to_module(self):
+        """This region as something built, named, and callable on its own.
+
+        What comes back is a built artifact rather than a program object: it knows
+        the key it was built under and the file it was written to, so the same
+        region asked for again is recognised as the same region and the built
+        file is reached rather than rebuilt.  That is what makes a region
+        compiled once and then called many times -- across a measurement, or
+        across a process -- the same work each time rather than a rebuild that
+        happens to agree.
+
+        Declines rather than returning something partial: a region whose printed
+        form the host emitter does not address has no artifact, and an artifact
+        that cannot be entered is worse than none, because the failure would
+        arrive at the first call rather than here.
+        """
+
+        from .codegen.common import select_backend
+        from .loop_compile import host_launches
+
+        needed = frozenset(self.used_features)
+        device = self.device.type if self.device is not None else "cpu"
+        if select_backend(needed, device) != "cpp":
+            raise NotImplementedError(
+                f"this region needs {sorted(str(f) for f in needed)}, which the "
+                f"host emitter does not address on {device}, so it has no built form"
+            )
+
+        # The values the region was handed are its arguments, and a caller that
+        # compiled it with symbols knows some of them by name; a built artifact
+        # is called with them by position, so the names it was given are kept in
+        # that order and a name for one that was not given is made up here.
+        given = list(self.graph_input_names)
+        placeholders = list(self.graph_module.graph.placeholders)
+        self.graph_input_names = [
+            given[position] if position < len(given) else f"in{position}"
+            for position in range(len(placeholders))
+        ]
+
+        # The region is walked here rather than expected to have been walked,
+        # because a built form is asked for after the decision of what to build
+        # rather than instead of it -- and walked exactly once, because walking
+        # settles layouts and a second walk would be a walk of an already
+        # settled region.
+        if not self._walked:
+            self.run()
+            self._walked = True
+
+        launches = host_launches(self)
+        if not launches:
+            raise NotImplementedError(
+                "the region produced no built step, so there is nothing to call"
+            )
+        built = [launch for launch, _inputs, _output in launches]
+        return built[0] if len(built) == 1 else _ModuleOfSteps(built)
 
     def finalize(self) -> None:
         """Settle every buffer's layout, now that the region is all known.
