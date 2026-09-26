@@ -22,6 +22,7 @@ from . import config
 from .compile_worker.timer import Timer
 from .utils import apply_subprocess_env, clear_caches
 import atexit
+import contextvars
 import ctypes
 import functools
 import logging
@@ -30,7 +31,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Iterable, Sequence
-from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -757,4 +758,76 @@ class AutotuneProcessPool:
             with cls._lock:
                 if cls._instance is not None:
                     cls._instance._shutdown()
+                    cls._instance = None
+
+
+def use_pipelined_autotuning() -> bool:
+    """Whether measuring a candidate may be overlapped with the next thing.
+
+    Pipelined means a worker starts measuring the next candidate while the
+    one it is on is still running, which is worth doing when measuring is
+    the thing being waited on and not when a pool has already given up on
+    its own -- a pool that has stopped will not be handed more work, so
+    asking it to overlap says nothing.
+    """
+    return (
+        config.pipeline_max_autotune_gemm
+        and not AutotuneProcessPool._shutdown_for_inactivity
+    )
+
+
+class PrecompileThreadPool:
+    """Where a choice's candidates are built while the choice is being made.
+
+    Building a candidate is most of what trying it costs, and the candidates
+    for one choice do not depend on what any other choice did.  So a machine
+    with more than one core is leaving most of the time idle by building them
+    one after another.  Handing them to a pool instead lets the next one
+    start while the previous one is still being built, and the caller waits
+    only for the one it wanted.
+
+    The pool is one per process, brought up on first use and taken down when
+    the compiling that wanted it is over -- threads that outlive the work
+    that asked for them would be a pool of nothing.
+
+    What a thread runs is run with the settings the asking thread had at the
+    moment it asked, not the settings that happen to be current when the
+    thread gets to it: the settings decide what gets built, so a candidate
+    built under different ones would be a different candidate than the one
+    asked for.  Context is how those settings travel, and it is copied at the
+    moment of asking for exactly that reason.
+    """
+
+    _instance: PrecompileThreadPool | None = None
+    _lock = threading.Lock()
+
+    def __init__(self, max_workers: int = 4):
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+
+    @classmethod
+    def get_instance(cls) -> PrecompileThreadPool:
+        from .async_compile import get_compile_threads
+
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls(get_compile_threads())
+        return cls._instance
+
+    def submit(self, fn, *args, **kwargs):
+        ctx = contextvars.copy_context()
+        # The copy is what carries the settings, and it can only be entered
+        # once -- so the entry has to be bound now, before the thread runs.
+        fn = functools.partial(ctx.run, fn)
+        return self._executor.submit(fn, *args, **kwargs)
+
+    def _shutdown(self, wait: bool = False):
+        return self._executor.shutdown(wait=wait)
+
+    @classmethod
+    def shutdown_instance(cls) -> None:
+        if cls._instance is not None:
+            with cls._lock:
+                if cls._instance is not None:
+                    cls._instance._shutdown(wait=False)
                     cls._instance = None

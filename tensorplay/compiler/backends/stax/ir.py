@@ -10902,7 +10902,13 @@ class MemoryCheckKernel(FallbackKernel):
 
     def codegen(self, wrapper) -> None:
         wrapper.write_memory_track_allocation_once()
-        alive_list, dead_list, is_final_step = self.constant_args
+        # The three things said about this step -- what it brings up, what it
+        # lets go of, and whether it is the last one -- are what the caller
+        # passed as the step's own arguments.  They are read from there rather
+        # than from the constants slot, which is empty for a kernel of this
+        # shape: nothing here is a constant folded out of the call, it is all
+        # said about this particular step.
+        alive_list, dead_list, is_final_step = self.nontensor_args
 
         alive_repr = repr(alive_list)
         dead_repr = repr(dead_list)

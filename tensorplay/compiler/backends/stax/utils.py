@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+import dataclasses
 import contextlib
 import enum
 import functools
@@ -61,6 +62,11 @@ from . import config
 
 _T = TypeVar("_T")
 _FN_TYPE = TypeVar("_FN_TYPE", bound=Callable[..., Any])
+
+#: A size or an index: either a plain number, when it is known now, or an
+#: expression standing for one that is not.
+_IntLike = int | Expr
+
 
 __all__ = [
     "DeferredLineBase",
@@ -3015,3 +3021,83 @@ def is_output_of_multi_outputs_template(node: Any) -> bool:
     return isinstance(node, ir.MultiOutput) and is_multi_outputs_template(
         getattr(node, "layout", None)
     )
+
+
+@dataclasses.dataclass
+class GraphPartitionMap:
+    """How the inputs and outputs of one recorded piece line up with the graph's.
+
+    A graph is recorded as several pieces rather than as one, because a
+    recording has to be entered and left at points where the device is
+    idle, and a graph that never is cannot be recorded at all.  Each piece is
+    entered and left on its own, and each piece's inputs and outputs are its
+    own rather than the graph's -- so something has to say which of the
+    graph's inputs a piece reads and which of the graph's outputs it writes,
+    and that is what this says.
+
+    The mappings are by position because that is how a piece is entered: it
+    is handed its inputs in the order it declared them and it hands back its
+    outputs in the order it produces them.
+    """
+
+    #: Which piece this is, so that a piece can be told apart from another
+    #: that reads and writes the same things.
+    id: int
+
+    #: Which of the graph's inputs each of this piece's inputs is, in the
+    #: order this piece declared them.  Nothing means this input is not one of
+    #: the graph's -- a value the piece computed for itself, or a constant.
+    input_index_mapping: list[int | None]
+
+    #: Which of the graph's outputs each of this piece's outputs writes, in
+    #: the order this piece produces them.  An empty list means this output
+    #: is not one of the graph's.  Several may be listed for one output
+    #: because the graph can hand the same buffer out more than once, and
+    #: those are the same value under two names.
+    output_index_mapping: list[list[int]]
+
+    #: The names of the constants this piece reads or writes, so that
+    #: entering and leaving it can save and restore them.
+    constant_names: list[str]
+
+
+class PartitionFnWrapper:
+    """The slot an outside caller fills to wrap the graph's partition functions.
+
+    A recorded graph is entered and left at points where the device is idle,
+    and each of those entry and exit pairs is a function.  How many there are
+    and what each one has to do -- hold the inputs still, restore the shapes
+    they had, put back what was written -- depends on what the recording
+    turned out to need, so the functions are generated rather than written
+    down.
+
+    A caller outside this project may need each of those functions wrapped in
+    something of its own, and cannot predict how many there will be or what
+    each is for.  So the wrapping is a slot rather than a call: a caller
+    fills the slot with a function that takes a generated partition function
+    and its description and returns one, and every partition function is put
+    through it.  Until then the slot is empty, which is the ordinary case
+    and says so rather than being indistinguishable from a wrapper that
+    happens to do nothing.
+    """
+
+    wrapper: Any | None = None
+
+
+#: The slot, named for being an extension point that may change.
+#:
+#: Unstable on purpose: what a partition function has to be given, and what
+#: it may be wrapped in, follows from how a recording is entered and left,
+#: and both of those are still moving.
+_unstable_customized_partition_wrapper = PartitionFnWrapper()
+
+
+def set_customized_partition_wrappers(wrapper: Any) -> None:
+    """Have every graph partition function wrapped by ``wrapper``.
+
+    A wrapper is handed the function and a description of what it is for, and
+    returns the function to use in its place.  Replaces whatever was there
+    rather than composing with it, so that a caller that wraps twice gets
+    what it last asked for instead of both.
+    """
+    _unstable_customized_partition_wrapper.wrapper = wrapper

@@ -32,12 +32,17 @@ _HISTORY_LIMIT = 10000
 
 _recording = False
 
+#: Names some step has already accounted for, so a later step is not asked
+#: about them again.
+_claimed: set[str] = set()
+
 
 def set_recording(enabled: bool) -> None:
     """Turn the record on or off."""
 
     global _recording
     _recording = bool(enabled)
+    _claimed.clear()
     if not enabled:
         _history.clear()
 
@@ -96,37 +101,78 @@ def history() -> list[tuple[str, str, str]]:
 
 
 def check_memory_step(
-    step_name: str,
+    step_name: Any = None,
     expected_live: Any = None,
+    *,
+    allocated: Any = None,
+    freed: Any = None,
+    is_final_step: bool = False,
 ) -> None:
-    """Raise unless what is alive is what the region said would be.
+    """Raise unless what is alive is what was said it would be.
 
-    ``expected_live`` is the set of names the region believes it holds.  Passing
-    nothing checks only that nothing is alive that was freed, which is the half
-    of the check that needs no knowledge of the region -- a use-after-free shows
-    up there, and shows up as a name that was freed and is still being read.
+    Asked which names a whole region should be holding, by giving
+    ``expected_live``: what is alive then is compared against that set as a
+    whole.  Passing nothing for it checks only that nothing is alive that was
+    freed, which is the half of the check that needs no knowledge of the region
+    -- a use-after-free shows up there, and shows up as a name that was freed and
+    is still being read.
+
+    Asked what changed during one step, by giving ``allocated`` and ``freed``:
+    the names that came alive and the names that went away are compared against
+    what changed, which is what a program laid out in steps can say and is a
+    claim about the step rather than about the region.  This is the form the
+    generated code asks in, because the step it is asking about is written into
+    that code next to the call.
+
+    The last step is the one place the two claims cannot both be made: a name
+    that is handed back as a result is not freed, and nothing here can tell that
+    apart from a name that was simply forgotten.  So a name said to be freed at
+    the last step is not required to have gone -- the check would report a leak
+    as a fault and would be wrong more often than not.
     """
 
     if not _recording:
         return
-    alive = set(live_names())
-    if expected_live is None:
-        expected_live = {name for kind, name, _ in _history if kind == "alloc"}
-    expected = {str(name) for name in expected_live}
-    unexpected = alive - expected
-    missing = expected - alive
-    if unexpected or missing:
-        problems = []
+    problems: list[str] = []
+    if allocated is not None or freed is not None:
+        expected_alloc = {str(name) for name in (allocated or ())}
+        expected_free = {str(name) for name in (freed or ())}
+        # What should be alive once this step has run: what earlier steps left
+        # behind, plus what this step brings up, less what it lets go of.  The
+        # running expectation is carried rather than recounted, so a name is
+        # accounted for at the step that dealt with it and not asked about
+        # again at every step after.
+        expected_after = (_claimed | expected_alloc) - expected_free
+        actually_live = set(live_names())
+        if is_final_step:
+            # A name handed back as a result has not been freed, and nothing
+            # here can tell that from one that was forgotten.  Insisting would
+            # report a leak as a fault, and would be wrong more often than not.
+            expected_after |= expected_free & actually_live
+        extra = actually_live - expected_after
+        missing = expected_after - actually_live
+        if extra:
+            problems.append(f"alive but not accounted for: {sorted(extra)}")
+        if missing:
+            problems.append(f"accounted for but not alive: {sorted(missing)}")
+        _claimed.clear()
+        _claimed.update(expected_after)
+    else:
+        alive = set(live_names())
+        if expected_live is None:
+            expected_live = {name for kind, name, _ in _history if kind == "alloc"}
+        expected = {str(name) for name in expected_live}
+        unexpected = alive - expected
+        missing = expected - alive
         if unexpected:
             problems.append(f"still alive but not expected: {sorted(unexpected)}")
         if missing:
             problems.append(f"expected but gone: {sorted(missing)}")
+    if problems:
+        where = f" at step {step_name!r}" if step_name is not None else ""
         raise AssertionError(
-            f"at step {step_name!r} the live allocations do not match: "
-            + "; ".join(problems)
+            f"the live allocations do not match{where}: " + "; ".join(problems)
         )
-
-
 @contextlib.contextmanager
 def tracking_memory() -> Iterator[None]:
     """Record allocations and frees for the length of the block.
@@ -139,6 +185,7 @@ def tracking_memory() -> Iterator[None]:
     set_recording(True)
     _live.clear()
     _history.clear()
+    _claimed.clear()
     try:
         yield
     finally:

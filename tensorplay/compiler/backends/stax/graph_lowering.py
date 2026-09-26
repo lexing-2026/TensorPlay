@@ -1247,7 +1247,6 @@ class GraphLowering:
             tensor_args=tuple(tensor_args),
             nontensor_args=tuple(other_args),
             unflatten_args=unflatten,
-            constant_args=list(other_args),
             kwargs=realized_kwargs,
         )
         kernel.origin_node = node
