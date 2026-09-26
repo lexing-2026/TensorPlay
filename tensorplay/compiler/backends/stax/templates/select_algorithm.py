@@ -24,7 +24,11 @@ from ..kernel_inputs import KernelInputs
 from ..ir import BaseView, Buffer as _Buffer, Layout, compute_required_storage_length
 from ..loops import V
 from .ir import ChoiceCaller, CutedslChoiceCaller
-from .params import DictKernelTemplateParams, KernelTemplateParams
+from ..loops import contiguous_strides, dtype_name
+from ..heuristics.template.params import DictKernelTemplateParams, KernelTemplateParams
+from ..heuristics.registry import (
+    get_template_heuristic as registry_get_template_heuristic,
+)
 from .triton import CHOICES
 from ..codegen.subgraph import SubgraphChoiceCaller
 
@@ -176,11 +180,11 @@ class KernelTemplateChoice:
         if not hasattr(self, "_resolved"):
             self._resolved = True
             try:
-                self._choice = self.template.generate(
-                    self.params,
-                    (self.layout,) if self.layout else (),
-                    self.inputs.extra,
-                    plain_launch,
+                self._choice = self.template.choice_or_none(
+                    **self.params.to_kwargs(),
+                    **self.extra_kwargs,
+                    layout=self.layout,
+                    input_nodes=self.inputs.nodes(),
                 )
             except NotImplementedError:
                 self._choice = None
@@ -223,12 +227,49 @@ class ExternChoiceCaller(ChoiceCaller):
     """
 
     def __init__(self, name, input_nodes=(), layout=None, description="",
-                 launcher=None):
+                 launcher=None, has_out_variant=True, op_overload=None,
+                 kwargs=None):
         super().__init__(name, input_nodes, layout, description)
         self.launcher = launcher
         self.launcher_name = getattr(launcher, "__name__", None)
+        # Whether the call writes into memory the caller named or memory it
+        # allocates is a property of the operation, and it decides what kind of
+        # node describing this call turns out to be.
+        self.has_out_variant = has_out_variant
+        self.op_overload = op_overload
+        self.kwargs = kwargs or {}
         if launcher is not None:
             self.bind(launcher)
+
+    def output_node(self):
+        """The result of making this choice, as a value the rest can read.
+
+        A choice that is a library call has no source to render, so asking it
+        for its result is asking it to describe the call: what is written, what
+        is passed, and where the answer goes.  The node that comes back is a
+        description rather than a number, and becomes a number when the region
+        is finally written out -- which is why it can be made now and measured
+        later without being measured twice.
+        """
+
+        from .. import ir
+
+        if self.launcher is not None and not isinstance(
+            self.launcher, str
+        ) and getattr(self.launcher, "produces_ir", False):
+            inner = self.launcher(*self.input_nodes)
+        else:
+            cls = ir.ExternKernelOut if self.has_out_variant else ir.ExternKernelAlloc
+            inner = cls(
+                layout=self.layout,
+                inputs=self.input_nodes,
+                python_kernel_name=self.call_name(),
+                kwargs=getattr(self, "kwargs", None),
+                op_overload=getattr(self, "op_overload", None),
+            )
+        if "ktc" in self.annotations:
+            inner.annotations["ktc"] = self.annotations["ktc"]
+        return ir.TensorBox.create(inner)
 
     def call_name(self) -> str:
         """What a log line should call this, which is the library's own name.
@@ -326,20 +367,33 @@ class ExternKernelChoice(ExternChoiceCaller):
     # -- the part that makes it usable wherever a template is ------------
     @property
     def uid(self) -> str:
-        return self.name
+        """Namespaced by kind, so two kinds may share a name."""
+
+        return f"framework::{self.name}"
 
     @property
     def src_hash(self) -> str | None:
         return None
 
     def choice_or_none(self, **kwargs: Any) -> ChoiceCaller | None:
-        """The operation itself, as the choice it always is."""
+        """The operation itself, as the choice it always is.
+
+        Carries across what the call needs in order to be described rather than
+        merely named: the values it is handed, and whether the framework writes
+        into a buffer the caller supplied or one it allocates.  The second is a
+        property of the operation rather than of this call, and it decides what
+        kind of node the call becomes.
+        """
 
         return ExternChoiceCaller(
             name=self.name,
+            input_nodes=kwargs.get("input_nodes", ()),
             layout=kwargs.get("layout"),
             description="the operation itself",
             launcher=self.kernel,
+            has_out_variant=self.has_out_variant,
+            op_overload=self.op_overload,
+            kwargs=kwargs,
         )
 
     def maybe_append_choice(self, choices: list, **kwargs: Any):
@@ -436,7 +490,23 @@ class TritonTemplateKernel:
         return self._fn
 
     def __call__(self, *args, **kwargs):
+        """Launch, computing the grid first when this kernel was given a way to.
+
+        A kernel that knows how many programs to start is asked; one that was
+        handed the count launches with it.  The two are told apart by whether a
+        way to compute it was supplied at all, rather than by a flag, because a
+        kernel given no way has nothing to compute and a kernel given one has
+        nothing to be told.
+        """
+
+        if self.grid is None:
+            return self.build()(None, *args, **kwargs)
         grid = self.grid(*args, **kwargs) if callable(self.grid) else self.grid
+        return self.build()[grid](*args, **kwargs)
+
+    def launch_with(self, grid, *args, **kwargs):
+        """Launch with the grid already counted, for a caller that counted it."""
+
         return self.build()[grid](*args, **kwargs)
 
     def __repr__(self) -> str:
@@ -607,15 +677,76 @@ class TritonTemplate(KernelTemplate):
 
         if self.source == "":
             return None
-        kernel = self.template
+        grid_fn = self.grid
+        layout = kwargs.get("layout")
+        input_nodes = kwargs.get("input_nodes") or ()
+        if layout is not None:
+            meta = {k: v for k, v in kwargs.items()
+                    if k not in ("layout", "input_nodes")}
+            meta.setdefault("out_size", tuple(int(s) for s in layout.size))
+            names = ["A", "B"][:len(input_nodes)] or ["A"]
+            operands = {}
+            for name, node in zip(names, input_nodes):
+                # A lowered value knows its own extents and strides; something
+                # handed over from outside knows only its shape, and a value
+                # that knows neither is recorded as knowing nothing so that a
+                # body asking about it fails at render rather than at launch.
+                shape = node.get_size() if hasattr(node, "get_size") else getattr(node, "shape", ())
+                if hasattr(node, "get_stride"):
+                    stride = node.get_stride()
+                else:
+                    stride = contiguous_strides(tuple(int(v) for v in shape))
+                dt = node.get_dtype() if hasattr(node, "get_dtype") else getattr(node, "dtype", "float32")
+                operands[name] = {
+                    "shape": tuple(int(v) for v in shape),
+                    "stride": tuple(int(v) for v in stride),
+                    "dtype": str(dtype_name(dt)),
+                }
+            outputs = {
+                "C": {
+                    "shape": tuple(int(s) for s in layout.size),
+                    "stride": tuple(int(s) for s in layout.stride),
+                    "dtype": str(dtype_name(layout.dtype)),
+                }
+            }
+            meta.update(kwargs)
+            rendered = self.render_with(
+                KernelArgs(operands, outputs, meta), **meta
+            )
+        else:
+            meta = {k: v for k, v in kwargs.items()
+                    if k not in ("layout", "input_nodes")}
+            rendered = self.render(**meta)
+        kernel = self.template.__class__(
+            kernel_name=self.name, source=rendered, symbol=self.symbol,
+        )
         caller = TritonChoiceCaller(
             name=self.uid,
-            layout=kwargs.get("layout"),
+            input_nodes=input_nodes,
+            layout=layout,
             description=repr(sorted((k, repr(v)) for k, v in kwargs.items())),
             source=self.source,
             src_hash=self.src_hash,
         )
-        return caller.bind(lambda feed, _k=kernel: _k(*feed))
+        # A grid is a function of the extents being computed and of the tile
+        # they were split into, so both are computed once here rather than
+        # asked of the kernel at every launch: the kernel takes operands, and
+        # how many programs to start is not something an operand can say.
+        return caller.bind(kernel)
+
+    def choice_or_none(self, **kwargs: Any):
+        """This template's choice for one configuration, or nothing if it does not fit.
+
+        The question is asked the same way of every candidate in a list, whether
+        it is a template the compiler could write or an operation the framework
+        already has, so that a list is offered as a whole and the entries that
+        do not apply to this call are dropped without unwinding the rest.
+        """
+
+        try:
+            return self.generate(**kwargs)
+        except NotImplementedError:
+            return None
 
     def maybe_append_choice(self, choices: list, **kwargs: Any):
         """Add this template's choice to a list, or report why there is none."""
@@ -675,6 +806,21 @@ class KernelArgs:
         self.index_dtype = index_dtype
         #: The entry point's name, supplied by whatever renders this.
         self.symbol = ""
+
+    def call_sizes(self) -> tuple:
+        """The extents a launch is sized by, and the configuration it was given.
+
+        A grid is a function of what is being computed and of the tile the
+        computation was split into, so both are handed together: a grid asked
+        for the extents alone would have to guess the tile, and one asked for
+        the tile alone would have to guess the extents.  The extents come first
+        because that is the order a grid function declares them in.
+        """
+
+        meta = {k: v for k, v in self.constexprs.items()}
+        for name, spec in self.outputs.items():
+            meta.setdefault(name, spec)
+        return tuple(spec["shape"] for name, spec in self.outputs.items()), meta
 
     def _operand(self, name: str) -> dict:
         if name in self.inputs:
@@ -1554,16 +1700,14 @@ def get_ktc(
 def get_template_heuristic(template: Any, device_type: str, op_name: str):
     """The rule that says which configurations of a template are worth trying.
 
-    A template carries its own rule when it has one, because a rule written for
-    one template says nothing about another; the table by device is the fallback
-    for the ones that do not, so that a template without a rule of its own still
-    gets the device's numbers rather than nothing.
+    Asked for by what a template calls itself, not by the template, so that a
+    rule lives in the table beside every other rule rather than hanging off the
+    thing it is a rule about.  A template and an operation's own kernel can then
+    be told apart by name alone, which is what lets both go through the same
+    question and the same answer.
     """
 
-    heuristic = getattr(template, "heuristics", None)
-    if heuristic is not None:
-        return heuristic
-    return CHOICES.get_config_heuristics(device_type)
+    return registry_get_template_heuristic(template.uid, device_type, op_name)
 
 
 def get_template_configs(

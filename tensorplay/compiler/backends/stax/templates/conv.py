@@ -20,7 +20,7 @@ import tensorplay as tp
 from .triton import CHOICES, dtype_size
 
 from ..codegen.common import KernelTemplate
-from .base import SymbolicGridFn, TemplateConfigHeuristics
+from ..heuristics.template.base import SymbolicGridFn, TemplateConfigHeuristics
 
 from .ir import contiguous_stride
 from .. import ir
@@ -38,7 +38,7 @@ from ..op_lowerings import register_lowering
 from .mm import GEMM, tuned_addmm, tuned_mm
 from .mm_common import load_kernel_template, use_triton_template
 
-from .params import DictKernelTemplateParams, KernelTemplateParams
+from ..heuristics.template.params import DictKernelTemplateParams, KernelTemplateParams
 
 from .select_algorithm import ExternKernelChoice
 
@@ -830,12 +830,15 @@ def conv1x1_via_mm(x, w, *, out=None):
     product = tp.matmul(moved, w.permute(1, 0), out=out)
     return product.permute(0, 3, 1, 2) if x.dim() == 4 else product.permute(0, 2, 1)
 
+@SymbolicGridFn
 def _conv_forward_grid(rows, cols, groups, block_m, block_n, cdiv):
     return (cdiv(rows, block_m), cdiv(cols, block_n), groups)
 
+@SymbolicGridFn
 def _conv_bwd_input_grid(rows, cols, groups, block_m, block_n, cdiv):
     return (cdiv(rows, block_m), cdiv(cols, block_n), groups)
 
+@SymbolicGridFn
 def _conv_bwd_weight_grid(groups, block_m, block_n, block_k, cdiv):
     return (cdiv(1, block_m), cdiv(1, block_n), groups)
 
@@ -848,7 +851,7 @@ CONV_BWD_INPUT = ConvBwdInputTemplate()
 CONV_BWD_WEIGHT = ConvBwdWeightTemplate()
 
 framework_convolution = ExternKernelChoice(
-    None, "framework_convolution", has_out_variant=False
+    None, "convolution", has_out_variant=False
 )
 
 def conv1x1_launch(feed: list):
@@ -862,7 +865,7 @@ def conv1x1_launch(feed: list):
     return conv1x1_via_mm(feed[0], feed[1])
 
 
-conv1x1_via_product = ExternKernelChoice(conv1x1_via_mm, "conv1x1_via_mm")
+framework_conv1x1_via_mm = ExternKernelChoice(conv1x1_via_mm, "conv1x1_via_mm")
 
 CONV_TEMPLATES: dict[str, dict[str, Any]] = {
     "convolution2d": {
@@ -922,7 +925,6 @@ conv2d_bwd_weight_template = CONV_BWD_WEIGHT
 #: A call whose kernel is one element wide, computed as a product.  A choice
 #: of its own because it is a different computation rather than a different
 #: way of the same one, and a measurement against it is measuring that.
-framework_conv1x1_via_mm = ExternKernelChoice(None, "framework_conv1x1_via_mm")
 
 #: The primitive namespace, for the same reason and by the same argument.
 prims = tp.ops.prims
@@ -1472,16 +1474,16 @@ def convolution(
 #: its own because the weight is a placeholder in it -- the operation reads the
 #: weight for the gradient's shape and never uses its values -- which is a
 #: different call from the one that reads a real weight.
-framework_dw = ExternKernelChoice(None, "framework_dw")
+framework_dw = ExternKernelChoice(None, "dw")
 
 #: An input gradient, likewise: the input is the placeholder here.
-framework_dx = ExternKernelChoice(None, "framework_dx")
+framework_dx = ExternKernelChoice(None, "dx")
 
 #: Both gradients at once, as the operation computes them.  The floor for a call
 #: that asked for two gradients, and the only candidate for one whose shape no
 #: template here is written for.
 framework_convolution_backward = ExternKernelChoice(
-    None, "framework_convolution_backward", has_out_variant=False
+    None, "convolution_backward", has_out_variant=False
 )
 
 

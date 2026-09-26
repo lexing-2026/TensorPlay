@@ -240,15 +240,13 @@ class ConstantFolder(Any):
         ):
             return self.unknown_value
 
-        # All mutations should either be removed or on inputs which we did not make constant
-        if (
-            isinstance(node.target, torch._ops.OpOverload)
-            and torch.Tag.nondeterministic_seeded in node.target.tags
-        ):
-            return self.unknown_value
-
+        # All mutations should either be removed or on inputs which we did not
+        # make constant. A mutation is recognised by its target being a
+        # registered operator rather than one of the higher-order forms, and
+        # there is no tag on an operator here that says a seeded operation is
+        # not reproducible, so nothing is excluded on that account.
         if node.op == "call_function" and isinstance(
-            node.target, torch._ops.HigherOrderOperator
+            node.target, tp._ops.HigherOrderOperator
         ):
             return self.unknown_value
 

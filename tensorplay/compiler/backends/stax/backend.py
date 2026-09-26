@@ -212,6 +212,7 @@ def _lower_stax_region(
         # machine must not import Triton or its compiler toolchain.
         def build_loop_region():
             from ..._core.aot_autograd import aot_module_simplified
+            from .op_lowerings import select_decomp_table
             from .codegen.common import required_features, select_backend
             from .loops import promotes_on_load
 
@@ -273,6 +274,14 @@ def _lower_stax_region(
                     list(example_inputs),
                     fw_compiler=compile_half_or_none,
                     bw_compiler=compile_half_or_none,
+                    # What the graph is captured with decides which operations
+                    # reach this point at all: an operation the capture
+                    # decomposed is one fewer thing to lower, and the products
+                    # are the case that matters, because a product arrives as one
+                    # operation covering seven shapes and has to become the
+                    # product that matches the shape before anything can choose
+                    # how to compute it.
+                    decompositions=select_decomp_table(),
                 )
             except (NotLowerable, NotImplementedError) as exc:
                 # A form the device's emitter cannot print.  Which emitter

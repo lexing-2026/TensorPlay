@@ -101,6 +101,23 @@ def is_power_of_2(n: int) -> bool:
     return n > 0 and n & n - 1 == 0
 
 
+def get_max_y_grid() -> int:
+    """How many blocks the second grid axis will hold.
+
+    A launch whose batch is spread over the second axis alone fails once the
+    batch outgrows what that axis accepts, so the axis is given a stated limit
+    and the batch is split across two axes to stay under it.
+
+    The limit is the one the driver documents rather than one read back from the
+    device, because it is a property of the launch interface every device
+    implements rather than of any one device, and a device that reported a
+    smaller number would be a reason to be more careful rather than a different
+    answer to give.
+    """
+
+    return 65535
+
+
 def next_power_of_2(n: int) -> int:
     """The smallest power of two that is at least ``n``."""
 

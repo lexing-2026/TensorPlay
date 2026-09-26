@@ -24,6 +24,12 @@ from __future__ import annotations
 
 from .select_algorithm import KernelTemplateChoice, make_ktc_generator
 from ..codegen.common import KernelTemplate
+
+# The rules about which configurations are worth trying are registered by being
+# imported, and a rule that is not imported has not been said.  So the modules
+# that hold them are pulled in here, where anything that has templates has also
+# got the rules that say what to do with them.
+from ..heuristics.template import bmm, gemm, tp  # noqa: F401
 from .conv import (
     CONV,
     CONV_BWD_INPUT,
@@ -38,7 +44,7 @@ from .conv import (
     DepthwiseConvConfigHeuristics,
     DepthwiseConvTemplate,
     conv1x1_via_mm,
-    conv1x1_via_product,
+    framework_conv1x1_via_mm,
     framework_convolution,
 )
 from .mm import (
@@ -59,10 +65,6 @@ from .bmm import (
     BMM,
     BMM_SHARED_A,
     BMM_TEMPLATES,
-    BmmConfigHeuristics,
-    BmmSharedAConfigHeuristics,
-    BmmSharedATemplate,
-    BMMTemplate,
     bmm_grid,
     bmm_shared_a_grid,
 )
@@ -81,7 +83,7 @@ from .mm_plus_mm import (
     MmPlusMmTemplate,
 )
 from .mm_common import num_sms
-from .params import (
+from ..heuristics.template.params import (
     DictKernelTemplateParams,
     GemmTemplateParams,
     KernelTemplateParams,
@@ -162,10 +164,6 @@ __all__ = [
     "GemmConfigHeuristics",
     "GemmTemplate",
     "PersistentGemmTemplate",
-    "BmmConfigHeuristics",
-    "BmmSharedAConfigHeuristics",
-    "BmmSharedATemplate",
-    "BMMTemplate",
     "GroupedMmConfigHeuristics",
     "GroupedMmTemplate",
     "MmPlusMmConfigHeuristics",
@@ -188,7 +186,7 @@ __all__ = [
     "subgraph_template",
     "assert_uids_unique",
     "conv1x1_via_mm",
-    "conv1x1_via_product",
+    "framework_conv1x1_via_mm",
     "framework_convolution",
     "template_for",
 ]

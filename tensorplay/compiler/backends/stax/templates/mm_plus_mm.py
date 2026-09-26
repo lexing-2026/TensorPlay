@@ -225,7 +225,7 @@ framework = tp.ops.tp
 #: it is one call to the framework and not two: a caller who asked for
 #: the sum of two products did not ask to have them summed afterwards, and
 #: a kernel for it can keep the second product in registers.
-framework_mm_plus_mm = ExternKernelChoice(None, "framework_mm_plus_mm")
+framework_mm_plus_mm = ExternKernelChoice(None, "mm_plus_mm")
 
 MM_PLUS_MM_TEMPLATES = (
     MM_PLUS_MM,

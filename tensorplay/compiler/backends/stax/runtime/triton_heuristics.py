@@ -15,12 +15,14 @@ launch finds the entry that is its own.
 from __future__ import annotations
 
 import dataclasses
+import enum
 import functools
 import math
 from typing import Any, Callable, Literal
 
 from ..utils import ceildiv
 from .triton_compat import HAS_WARP_SPEC, Config
+from .runtime_utils import get_max_y_grid
 
 
 def config_to_dict(config: Config) -> dict[str, Any]:
@@ -49,6 +51,43 @@ def config_to_dict(config: Config) -> dict[str, Any]:
 
 
 @dataclasses.dataclass
+class BenchmarkFailureReason(enum.Enum):
+    """Why measuring one configuration of a kernel did not produce a time.
+
+    A configuration that cannot be measured is not the same as one that measured
+    slow, and treating the two alike would let a kernel that cannot run at all
+    look like the slowest one -- which is a decision rather than a measurement.
+    So a configuration that spills its registers, or that the compiler refused,
+    reports why instead of reporting a time.
+    """
+
+    REGISTER_SPILLING = "register_spilling"
+    INVALID_CONFIG = "invalid_config"
+
+
+class InductorConfig(Config):
+    """A configuration with this project's own switches alongside the tuning.
+
+    A configuration says how to run a kernel; the switches here say how much
+    latitude to give the compiler over the schedule, which is a choice about the
+    measurement rather than about the kernel and so travels beside it.
+    """
+
+    def __init__(self, *args, dynamic_scale_rblock=True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dynamic_scale_rblock = dynamic_scale_rblock
+
+
+class NoTritonConfigsError(RuntimeError):
+    """No configuration of this kernel could be offered at all.
+
+    Raised rather than returning nothing, because a kernel with no
+    configurations is not a kernel that measured badly -- it is a kernel nobody
+    wrote a tile for, and a caller that treated it as the former would go
+    looking for a faster tile rather than for the tile that is missing.
+    """
+
+
 class GridExpr:
     """The grid a launch runs with, worked out from the tuning it was given.
 
@@ -156,6 +195,25 @@ class GridExpr:
         raise AssertionError(f"invalid mode {self.mode}")
 
     @staticmethod
+    def from_meta(inductor_meta, cfg, mode="python"):
+        """The grid a launch recorded asking for, built from the name it recorded.
+
+        A launch says which kind of grid it wants by name rather than by being
+        handed one, because the launch is written out as text and rebuilt on the
+        other side; a name survives that and an object does not.  So the name is
+        looked up here, and a name that is not a grid is refused rather than
+        quietly treated as a one-block grid.
+        """
+
+        grid_cls = globals()[inductor_meta["grid_type"]]
+        if not (isinstance(grid_cls, type) and issubclass(grid_cls, GridExpr)):
+            raise AssertionError(f"Expected GridExpr subclass, got {grid_cls}")
+        grid = grid_cls(inductor_meta=inductor_meta, mode=mode)
+        if isinstance(cfg, dict):
+            grid.generate(cfg)
+        return grid
+
+    @staticmethod
     def resolve_dict(
         val: dict[str, int] | Literal["empty"],
         default: int | None = None,
@@ -214,3 +272,65 @@ class PrecomputedGrid(GridExpr):
             f"no recorded grid for {meta} among "
             f"{self.inductor_meta['precomputed_grids']}"
         )
+
+
+class Grid1D(GridExpr):
+    def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
+        self.x_grid = self.ceildiv("xnumel", meta.get("XBLOCK"))
+
+
+class Grid2D(GridExpr):
+    def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
+        self.x_grid = self.ceildiv("xnumel", meta.get("XBLOCK"))
+        self.y_grid = self.ceildiv("ynumel", meta.get("YBLOCK"))
+
+
+class Grid3D(GridExpr):
+    def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
+        self.x_grid = self.ceildiv("xnumel", meta.get("XBLOCK"))
+        self.y_grid = self.ceildiv("ynumel", meta.get("YBLOCK"))
+        self.z_grid = self.ceildiv("znumel", meta.get("ZBLOCK"))
+
+
+class BatchMatmulGrid3D(GridExpr):
+    """A batched product, whose three extents arrive in the third axis first.
+
+    The batch is the outermost thing being iterated and so is handed to the
+    outermost axis, which is what lets a batch that does not fit one axis be
+    spread over two without the tiles being renumbered to make room.
+    """
+
+    def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
+        self.z_grid = self.ceildiv("xnumel", meta.get("XBLOCK"))
+        self.y_grid = self.ceildiv("ynumel", meta.get("YBLOCK"))
+        self.x_grid = self.ceildiv("znumel", meta.get("ZBLOCK"))
+
+
+class Grid2DWithYZOverflow(GridExpr):
+    """Two nominal axes, where the second may not fit the one it was given.
+
+    A launch whose second axis outgrows what that axis accepts fails rather than
+    growing, so the extent is divided by the limit first and the quotient becomes
+    a third axis.  The division is guarded because a count of zero would
+    otherwise ask for a grid of zero blocks on an axis that has to be at least
+    one.
+    """
+
+    def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
+        self.x_grid = self.ceildiv("xnumel", meta.get("XBLOCK"))
+        self.prefix.extend(
+            [
+                self.assign_tmp(
+                    "y_grid_raw_", self.ceildiv("ynumel", meta.get("YBLOCK"))
+                ),
+                self.assign_tmp(
+                    "y_grid_div_", self.ceildiv("y_grid_raw_", get_max_y_grid())
+                ),
+            ]
+        )
+        ceildiv_expr = self.ceildiv("y_grid_raw_", "y_grid_div_")
+        if self.mode == "python":
+            self.y_grid = f"(0 if y_grid_div_ == 0 else {ceildiv_expr})"
+        else:
+            self.y_grid = f"(y_grid_div_ == 0 ? 0 : {ceildiv_expr})"
+        self.z_grid = "y_grid_div_"

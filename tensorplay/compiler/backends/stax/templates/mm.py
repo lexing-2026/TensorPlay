@@ -22,7 +22,7 @@ from typing import Any, Iterator, Sequence
 from .triton import CHOICES, dtype_size
 
 from ..codegen.common import KernelTemplate
-from .base import SymbolicGridFn, TemplateConfigHeuristics
+from ..heuristics.template.base import SymbolicGridFn, TemplateConfigHeuristics
 from ..codegen.subgraph import SubgraphTemplate
 from tensorplay.graph.experimental.proxy_tensor import make_graph
 
@@ -46,7 +46,7 @@ from ..ir import Buffer
 from tensorplay.nn.functional import ScalingType
 from ..kernel_inputs import KernelInputs, MMKernelInputs
 from ..ir import Layout
-from .params import DictKernelTemplateParams, KernelTemplateParams
+from ..heuristics.template.params import DictKernelTemplateParams, KernelTemplateParams
 from ..op_lowerings import (
     fallback_handler,
     register_lowering,
@@ -77,6 +77,7 @@ from .select_algorithm import (
 
 
 
+@SymbolicGridFn
 def persistent_mm_grid(m, n, meta, *, cdiv, min):
     """The grid for a product's tiles, swept by a fixed number of programs.
 
@@ -328,9 +329,9 @@ GEMM_PERSISTENT = PersistentGemmTemplate()
 
 
 
-framework_scaled_mm = ExternKernelChoice(None, "framework_scaled_mm")
+framework_scaled_mm = ExternKernelChoice(None, "scaled_mm")
 
-framework_fp8_mm = ExternKernelChoice(None, "framework_fp8_mm")
+framework_fp8_mm = ExternKernelChoice(None, "fp8_mm")
 
 #: The operation namespace, under a name of this project's own.  A product that
 #: defers to the framework's own multiply is measured against it, so the
@@ -649,10 +650,14 @@ class ScaledGemmTemplate(PersistentGemmTemplate):
         self.scale_site = scale_site
         self.heuristics = ScaledGemmConfigHeuristics()
 
-    def generate(self, params, out_specs, meta, plain_launch=None):
-        if not meta.get("has_scales"):
+    def generate(self, **kwargs):
+        # A template that is only offered when the operands carry their own
+        # scales: without them there is nothing here that the unscaled kernel
+        # does not already do, and offering it would put a second candidate in
+        # a list that a measurement would then have to spend time on to reject.
+        if not kwargs.get("has_scales"):
             return None
-        return super().generate(params, out_specs, meta, plain_launch)
+        return super().generate(**kwargs)
 
     def launcher(self, kwargs, meta, layout, plain_launch):
         """The scaled kernel, for the site this form scales at.
@@ -882,30 +887,30 @@ blackwell_ws_persistent_device_tma_mm_template = BLACKWELL_WS_PERSISTENT_TMA
 #: A product of whole-number tiles, measured against the framework's own.  The
 #: integer kernels accumulate in a wider type on purpose, so this is a product
 #: with its own way of being done rather than the same way done faster.
-framework_mm = ExternKernelChoice(None, "framework_mm")
+framework_mm = ExternKernelChoice(None, "mm")
 
 #: A product whose result is asked for in a type of its own.
-framework_mm_dtype = ExternKernelChoice(None, "framework_mm_dtype")
+framework_mm_dtype = ExternKernelChoice(None, "mm_dtype")
 
 #: A product with a bias added to it.
-framework_addmm = ExternKernelChoice(None, "framework_addmm")
+framework_addmm = ExternKernelChoice(None, "addmm")
 
 #: A product with a bias that may be one value rather than a row of them, which
 #: is why it is a choice of its own: the shape decides which kernel the framework
 #: would reach for, and the shape is not known until the call is.
-framework_bias_addmm = ExternKernelChoice(bias_addmm, "framework_bias_addmm")
+framework_bias_addmm = ExternKernelChoice(bias_addmm, "bias_addmm")
 
 #: A product of whole-number tiles into a whole-number result, which cannot be
 #: written as an out-variant because the result's type is fixed by its inputs.
 framework__int_mm = ExternKernelChoice(
-    None, "framework__int_mm", has_out_variant=False
+    None, "_int_mm", has_out_variant=False
 )
 
 #: A product of two sparse tiles that are mostly not there, whose result is
 #: sparse and so has no out-variant to be written into.
 framework__sparse_semi_structured_mm = ExternKernelChoice(
     None,
-    "framework__sparse_semi_structured_mm",
+    "_sparse_semi_structured_mm",
     has_out_variant=False,
 )
 

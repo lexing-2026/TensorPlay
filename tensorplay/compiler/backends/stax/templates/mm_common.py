@@ -33,6 +33,7 @@ import tensorplay as tp
 from .. import config
 from ..ir import Layout
 from ..loops import V
+from ..heuristics.template.base import SymbolicGridFn
 
 __all__ = [
     "acc_type",
@@ -120,34 +121,41 @@ def device_capability(device=None) -> tuple:
 
 
 def _is_static_problem(layout) -> tuple:
-    """Whether a problem's extents are all numbers, and whether its strides are.
+    """Whether a result's extents are all numbers, and whether any of them is zero.
 
     A product whose extents are all known can be measured once and the answer
     kept; one whose extents are not has to be measured per shape, because a tile
-    fitted to one number is not a tile fitted to another.  The strides are asked
-    separately because a layout may be settled -- and so no longer changeable --
-    while the extents are still symbols.
+    fitted to one number is not a tile fitted to another.  The two answers are
+    kept apart because they are asked apart: a product with a zero extent is
+    known and empty, which is a different thing from a product whose extent is
+    not yet known, and the two are not treated the same way by what follows.
     """
+
+    from ..codegen.wrapper import PythonWrapperCodegen
 
     if layout is None:
         return False, False
-    try:
-        static_size = all(
-            not hasattr(int(v), "free_symbols") or not int(v).free_symbols
-            for v in layout.get_size()
-        )
-    except Exception:  # noqa: BLE001 - a layout that will not say is not static
-        return False, False
-    try:
-        static_stride = all(
-            not hasattr(int(v), "free_symbols") or not int(v).free_symbols
-            for v in layout.get_size()
-        )
-    except Exception:  # noqa: BLE001
-        static_stride = False
-    return bool(static_size), bool(static_stride)
+    static_size = PythonWrapperCodegen.statically_known_list_of_ints_or_none(
+        layout.size
+    )
+    if static_size is None:
+        # An extent that is not known is not an extent of zero: it is an extent
+        # nobody has worked out yet, and a product with one is not an empty
+        # product, it is a product whose shape is still open.
+        nonzero = True
+        for extent in layout.size:
+            size = PythonWrapperCodegen.statically_known_int_or_none(extent)
+            if size is not None and size == 0:
+                nonzero = False
+                break
+        return False, nonzero
+    numel = 1
+    for extent in static_size:
+        numel *= extent
+    return True, numel > 0
 
 
+@SymbolicGridFn
 def mm_grid(m, n, meta, *, cdiv):
     """The grid for a product's tiles: one program per tile, flattened.
 
@@ -161,6 +169,7 @@ def mm_grid(m, n, meta, *, cdiv):
     return (cdiv(m, meta["BLOCK_M"]) * cdiv(n, meta["BLOCK_N"]), 1, 1)
 
 
+@SymbolicGridFn
 def persistent_mm_grid(M: int, N: int, meta: dict, *, cdiv, min):
     """The grid for the swept product: as many programs as the device has.
 
@@ -250,7 +259,7 @@ def mm_args(
         k2 = k2 * 2
     k = k1 if k1 == k2 else min(k1, k2)
     if layout is None:
-        from ...loops import contiguous_strides
+        from ..loops import contiguous_strides
         from ..ir import Layout
         from ..loops import V
 
@@ -334,18 +343,32 @@ def _use_small_mm_pointwise(
     device_type: str = "cuda",
     statically_known_true=None,
 ) -> bool:
-    """Whether a product is small enough to be worth a pointwise path.
+    """Whether a product is better computed a piece at a time than by a product.
 
-    Below a size, what a product spends is what any kernel spends: the launch
-    and the write.  A product that small has more to gain from a cheap body than
-    from a wide tile.
+    Only for a product whose inner dimensions are both tiny: at that size what
+    the product spends is mostly the launch, and a body that computes a piece
+    without launching anything per piece spends much less.  A long side is what
+    keeps it worth it, because a short one has too few pieces for the saving to
+    cover a second launch, and an inner dimension of five is where the printed
+    form stops being as good as the library's.
+
+    Asked of the shape rather than of its value, so that a shape not yet known
+    is answered as unknown rather than as a number: a guess either way would
+    decide which of two paths a shape that may be either would take.  The caller
+    may say what it knows, for the cases that run before there is a region to ask.
+
+    Not while measuring: a measurement exists to choose between the ways, and a
+    shape quietly routed to one of them is a choice the measurement did not make.
     """
 
-    statically_known = statically_known_true or (lambda expr: bool(expr))
-    m_ = statically_known(m)
-    k_ = statically_known(k)
-    n_ = statically_known(n)
-    return bool(m_ * n_ * k_ <= 1024)
+    if config.max_autotune or config.max_autotune_gemm:
+        return False
+    if device_type in ("cpu", "mps"):
+        return False
+    from ..loops import V
+
+    known = statically_known_true or V.graph.sizevars.statically_known_true
+    return known(m >= 64) and known(k < 5) and known(n < 5)
 
 
 def check_supported_striding(mat_a, mat_b) -> None:
@@ -503,6 +526,33 @@ def use_aten_gemm_kernels() -> bool:
     return "EAGER" in config.max_autotune_backends
 
 
+def _use_autotune_backend(backend: str) -> bool:
+    """Whether a measurement may choose ``backend`` as one of its candidates.
+
+    Asked by name because which backends are on offer is a property of the
+    configuration rather than of the call: a template that is not on offer must
+    not appear as a candidate, because a candidate that is never the fastest is
+    still a candidate that was measured.
+    """
+
+    return backend.upper() in [
+        x.strip() for x in config.max_autotune_gemm_backends.upper().split(",")
+    ]
+
+
+def _use_conv_autotune_backend(backend: str) -> bool:
+    """Whether a measurement may choose ``backend`` for a convolution.
+
+    A separate list from a product's because the two are measured against
+    different things, and a configuration that names the tiles worth measuring
+    for one has not said anything about the other.
+    """
+
+    return backend.upper() in [
+        x.strip() for x in config.max_autotune_conv_backends.upper().split(",")
+    ]
+
+
 def use_triton_template(
     layout: Layout,
     *,
@@ -526,7 +576,9 @@ def use_triton_template(
     return (
         use_template_for_gpu(layout, layout_dtypes)
         or (layout.device.type == "cpu" and layout.dtype in layout_dtypes)
-    ) and (config.max_autotune or config.max_autotune_gemm or (not check_max_autotune))
+    ) and (
+        config.max_autotune or config.max_autotune_gemm or (not check_max_autotune)
+    ) and _use_autotune_backend("TRITON")
 
 
 def use_triton_tma_template(

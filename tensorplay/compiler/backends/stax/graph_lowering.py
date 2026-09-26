@@ -64,6 +64,7 @@ from .loops import (
     substitute,
     fresh_symbols,
     record_body,
+    set_current_node,
     set_graph,
     set_ops_handler,
 )
@@ -540,6 +541,10 @@ class GraphLowering:
         # installed by the walk; a caller that lowers nodes itself needs it
         # before the walk has run.
         self._lower_node = None
+        # The node being lowered right now, published for the duration of a
+        # lowering call so that anything below it can ask which one without it
+        # being passed down through every call that might want to.
+        self._current_node = None
         # Whether the walk has run, so that a second request for a built form
         # does not walk an already settled region again.
         self._walked = False
@@ -1340,10 +1345,17 @@ class GraphLowering:
                 or user_lowerings.get(value.target)
                 or LOWERINGS.get(name)
             )
-            if lowering is not None:
-                result = lowering(value, *args, **kwargs)
-            else:
-                result = self.make_extern(value, args, kwargs)
+            # The node being lowered is published for the duration of the
+            # call rather than handed to it, so that a lowering is written
+            # against the same signature whatever it happens to need the node
+            # for: one that does not need it says nothing, and one that does
+            # asks.  Two places publish it, because a generator reaches for
+            # whichever it was given.
+            with self.set_current_node(value), set_current_node(value):
+                if lowering is not None:
+                    result = lowering(*args, **kwargs)
+                else:
+                    result = self.make_extern(value, args, kwargs)
         if isinstance(result, TensorBox):
             # A value several consumers read is stored rather than
             # recomputed per consumer, but only when the body is worth

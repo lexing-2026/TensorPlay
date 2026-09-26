@@ -7,10 +7,16 @@ each configuration is narrowed to the shape it will actually run against.
 
 from __future__ import annotations
 
+import inspect
+
+import sympy
+
+from ......graph.experimental.sympy_functions import CeilDiv
+
 import functools
 from typing import Any, Callable, Iterator, Sequence
 
-from .ir import next_power_of_2
+from ...runtime.runtime_utils import ceildiv, next_power_of_2
 from .params import DictKernelTemplateParams
 
 class SymbolicGridFn:
@@ -31,9 +37,25 @@ class SymbolicGridFn:
         self.fn = fn
         self.symbolic = True
         functools.update_wrapper(self, fn)
+        # Which of the rounding and clamping helpers the body asked for, and
+        # what each becomes once the extents are known.  A grid is written once
+        # and used both ways -- asked for expressions while a template is being
+        # offered, and for numbers when it finally launches -- so the body names
+        # what it needs and the two forms are supplied from the same signature.
+        params = inspect.signature(fn).parameters
+        self.kwargs_int = {}
+        self.kwargs_sym = {}
+        for name, fn_sym, fn_int in (
+            ("cdiv", CeilDiv, ceildiv),
+            ("min", sympy.Min, min),
+            ("max", sympy.Max, max),
+        ):
+            if name in params:
+                self.kwargs_int[name] = fn_int
+                self.kwargs_sym[name] = fn_sym
 
     def __call__(self, *args, **kwargs):
-        return self.fn(*args, **kwargs)
+        return self.fn(*args, **kwargs, **self.kwargs_int)
 
     def __get__(self, instance, owner=None):
         return self

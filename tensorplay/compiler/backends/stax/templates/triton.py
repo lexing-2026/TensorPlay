@@ -11,7 +11,7 @@ which table a device reads is declared beside the tables themselves.
 from __future__ import annotations
 
 from .ir import next_power_of_2
-from .base import TemplateConfigHeuristics
+from ..heuristics.template.base import TemplateConfigHeuristics
 
 from dataclasses import dataclass, field
 

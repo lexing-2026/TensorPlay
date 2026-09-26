@@ -59,9 +59,9 @@ from .mm_common import (
 #: A grouped product, and the same with a scale, as candidates in their own
 #: right: each is a computation the framework does in one call, and a caller
 #: who asked for it is asking for that call rather than for a product.
-framework__grouped_mm = ExternKernelChoice(None, "framework__grouped_mm")
+framework__grouped_mm = ExternKernelChoice(None, "_grouped_mm")
 framework__scaled_grouped_mm = ExternKernelChoice(
-    None, "framework__scaled_grouped_mm"
+    None, "_scaled_grouped_mm"
 )
 
 def grouped_mm_grid(*args):

@@ -27,6 +27,7 @@ import sympy
 import tensorplay as tp
 
 from .. import config
+from .common import KernelTemplate
 from ..ir import (
     Buffer,
     FixedLayout,
@@ -460,7 +461,7 @@ class SubgraphChoiceCaller(_choice_caller_base()):
         return lambda *args: run([*sizes, *args])
 
 
-class SubgraphTemplate:
+class SubgraphTemplate(KernelTemplate):
     """A way of turning a computation into the candidates to choose between.
 
     A template is asked for candidates rather than being one, so that a
@@ -471,7 +472,7 @@ class SubgraphTemplate:
     index_counter = itertools.count()
 
     def __init__(self, name: str) -> None:
-        self.name = name
+        super().__init__(name=name)
 
     def generate(
         self,

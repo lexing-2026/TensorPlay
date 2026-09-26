@@ -49,7 +49,7 @@ class KernelInputs:
         self.shapes = tuple(shapes)
         self.strides = tuple(strides)
         self.dtypes = tuple(dtypes)
-        self.device = device
+        self._device = device
         self.operands = tuple(operands)
         self.feed = tuple(feed)
         self.probe_feed = tuple(probe_feed)
@@ -65,10 +65,32 @@ class KernelInputs:
 
         A heuristic branches on this -- a tile table is not a tile table on a
         host -- so it is the first thing asked and it is asked by name.
+
+        Read from the operands rather than from what the caller said, because a
+        caller that describes a call it has only partly seen can name a device
+        that is not the one the call will run on, and a heuristic given the wrong
+        one chooses a tile table for hardware that is not there.
         """
 
-        device = self.device
+        from .ir import get_device_type
+
+        if self._input_nodes:
+            return get_device_type(self._input_nodes[0])
+        device = self._device
         return None if device is None else getattr(device, "type", None)
+
+    @property
+    def device(self):
+        """Where the first operand is.
+
+        Read from the operands for the same reason the kind of device is: what a
+        caller said about a call it has not fully seen is not what the call will
+        run on.
+        """
+
+        if self._input_nodes:
+            return self._input_nodes[0].get_device()
+        return self._device
 
     def device_name(self) -> str | None:
         """The device's own name, asked of the device rather than assumed.
@@ -108,14 +130,22 @@ class KernelInputs:
         return tuple(tuple(sizevars.optimization_hints(e) for e in extents) for extents in extents)
 
     def shapes_symbolic(self) -> tuple:
-        """The operands' extents as declared, expressions and all."""
+        """The operands' extents as declared, expressions and all.
 
+        Asked of the operands rather than of what the caller said, because a
+        caller that was handed extents separately from the operands can hand
+        over extents of something else, and every question about a product is a
+        question about the operands' extents.
+        """
+
+        if self._input_nodes:
+            return tuple(tuple(node.get_size()) for node in self._input_nodes)
         return self.shapes
 
     def shapes_hinted(self) -> tuple:
         """The operands' extents with every symbol resolved to its value."""
 
-        return self._hinted(self.shapes)
+        return self._hinted(self.shapes_symbolic())
 
     def strides_symbolic(self) -> tuple:
         """The operands' strides as declared, expressions and all."""
@@ -254,7 +284,10 @@ class MMKernelInputs(KernelInputs):
         of what was asked for and the arithmetic about it stay separate.
         """
 
-        count = len(self.shapes)
+        # Counted over the operands rather than over what the caller declared,
+        # because a position is a position among the operands and a count of
+        # something else would resolve it against the wrong list.
+        count = len(self.shapes_symbolic())
         if count < 2:
             raise AssertionError("a product needs two operands")
         first, second = self._mat1_idx, self._mat2_idx
@@ -272,7 +305,8 @@ class MMKernelInputs(KernelInputs):
         """The two matrices, by the positions the call gave them."""
 
         first, second = self.matrix_indices()
-        return self.shapes[first], self.shapes[second]
+        shapes = self.shapes_symbolic()
+        return shapes[first], shapes[second]
 
     def matrix_dtypes(self) -> tuple:
         first, second = self.matrix_indices()
