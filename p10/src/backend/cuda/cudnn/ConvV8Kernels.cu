@@ -381,10 +381,14 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
         const bool allow_tf32 = tensorplay::globalContext().allowTF32CuDNN();
         auto heuristics = fe::EngineHeuristicsBuilder()
                               .setOperationGraph(op_graph)
-                              .setHeurMode(autotune ? CUDNN_HEUR_MODE_FALLBACK
-                                                    : CUDNN_HEUR_MODE_INSTANT)
+                              .setHeurMode(CUDNN_HEUR_MODE_INSTANT)
                               .build();
-        auto& engine_configs = heuristics.getEngineConfig(autotune ? 8 : 1);
+        // Benchmarking times the candidates of the same heuristic list the
+        // plain path ranks; switching to the fallback list instead loses the
+        // leading engines and ends up measurably slower than just taking the
+        // first entry.
+        auto& engine_configs = heuristics.getEngineConfig(
+            autotune ? heuristics.getEngineConfigCount() : 1);
         if (engine_configs.empty()) {
             TP_THROW(RuntimeError, "cuDNN: no engine configs for conv2d");
         }
