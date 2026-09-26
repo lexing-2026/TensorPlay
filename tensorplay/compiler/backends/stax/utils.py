@@ -1464,35 +1464,70 @@ def device_supports_fp64(device: tp.device | None) -> bool:
     return True
 
 
-#: The operations whose value is the same on every device in a group, and which
-#: therefore cannot be measured on one of them and used on another.  A candidate
-#: that performs one of these is a candidate whose time says nothing about how it
-#: will run in a program, so it is recognised rather than measured.
+#: The operations that move data between the ranks of a group, and whose value
+#: is therefore the same on every rank rather than computed on one.  A candidate
+#: that performs one of these is a candidate whose time says nothing about how
+#: it will run in a program -- the time is the group's, not the kernel's -- so
+#: it is recognised rather than measured.
+#:
+#: Named by the function a graph node's target carries, which is how both
+#: callers reach this: one asks the target for its name, the other for its
+#: printed form.  Setup and query calls are not here: they are not part of what
+#: a kernel computes, so how long they take says nothing about a candidate.
 COLLECTIVE_OPS = OrderedSet(
     (
-        "torch.ops._c10d_functional.all_reduce.default",
-        "torch.ops._c10d_functional.all_reduce_.default",
-        "torch.ops._c10d_functional.all_gather_into_tensor.default",
-        "torch.ops._c10d_functional.reduce_scatter_tensor.default",
-        "torch.ops._c10d_functional.all_to_all_single.default",
-        "torch.ops._c10d_functional_autograd.all_reduce.default",
-        "torch.ops._c10d_functional_autograd.all_gather_into_tensor.default",
-        "torch.ops._c10d_functional_autograd.reduce_scatter_tensor.default",
-        "torch.ops._c10d_functional_autograd.all_to_all_single.default",
-        "torch.ops._c10d_functional.isend.default",
-        "torch.ops._c10d_functional.irecv.default",
-        "torch.ops._c10d_functional.batch_p2p_ops.default",
-
+        "all_gather",
+        "all_gather_into_tensor",
+        "all_gather_object",
+        "all_reduce",
+        "all_to_all",
+        "all_to_all_single",
+        "barrier",
+        "batch_isend_irecv",
+        "broadcast",
+        "broadcast_object_list",
+        "gather",
+        "gather_into_tensor",
+        "gather_object",
+        "irecv",
+        "isend",
+        "recv",
+        "recv_object_list",
+        "reduce_scatter",
+        "reduce_scatter_tensor",
+        "scatter",
+        "scatter_object_list",
+        "send",
+        "send_object_list",
     )
 )
 
 
-def is_collective_op(op_name: str) -> bool:
-    """Whether an operation is one whose value is shared across devices."""
+def is_collective_op(op_name: Any) -> bool:
+    """Whether an operation is one whose value is shared across the ranks.
 
-    return op_name in COLLECTIVE_OPS
+    Takes whatever a caller happens to be holding: the target itself, its name,
+    or its printed form.  A printed target reads as ``<function all_reduce at
+    0x...>``, so the name is taken out of that rather than compared whole --
+    otherwise the comparison would be against an address and never match.
+    """
 
-
+    if op_name is None:
+        return False
+    if not isinstance(op_name, str):
+        name = getattr(op_name, "__name__", None)
+        if name is None:
+            return False
+    else:
+        name = op_name
+        if name.startswith("<") and " " in name:
+            # A printed target: "<function all_reduce at 0x...>" -> all_reduce
+            parts = name.split()
+            if len(parts) >= 2 and parts[1] != "at":
+                name = parts[1]
+            else:
+                return False
+    return name in COLLECTIVE_OPS
 class _Counter(int):
     """A number that can be asked to count.
 
