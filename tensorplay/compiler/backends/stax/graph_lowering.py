@@ -238,14 +238,58 @@ class GraphLowering:
             if self.device is None and value.device.is_cuda():
                 self.device = value.device
 
-        def resolve(value):
-            if hasattr(value, "op") and hasattr(value, "users") and value in env:
-                return env[value]
+        # Values are produced on demand from what the region returns, not by
+        # walking the graph's node table.  A table can hold a node whose
+        # arguments name values no entry in it stands for -- a region rebuilt
+        # in place leaves such references behind -- and a walk that trusts the
+        # table hands such an argument to a kernel body as a bare node.
+        # Starting from the returned values and producing what they name makes
+        # the table advisory: a value nothing returns is never produced, and
+        # a value that is produced is produced once.
+        produced: dict[int, Any] = {}
+
+        def lower(value):
             if isinstance(value, (list, tuple)):
-                return type(value)(resolve(v) for v in value)
+                return type(value)(lower(v) for v in value)
             if isinstance(value, dict):
-                return {k: resolve(v) for k, v in value.items()}
-            return value
+                return {k: lower(v) for k, v in value.items()}
+            if not (hasattr(value, "op") and hasattr(value, "users")):
+                return value
+            key = id(value)
+            if key in produced:
+                return produced[key]
+            if value.op == "placeholder":
+                return env[value]
+            if value.op == "get_attr":
+                tensor = self.graph_module._get_attr(value.target)
+                name = self.new_name("const")
+                layout = Layout(tensor.device, tensor.dtype,
+                                tuple(int(s) for s in tensor.shape),
+                                tuple(int(s) for s in tensor.stride()), 0)
+                buffer = ConstantBuffer(name, layout, tensor)
+                self.buffers[name] = buffer
+                self.constants[name] = tensor
+                produced[key] = TensorBox(buffer)
+                return produced[key]
+            produced[key] = None
+            args = lower(value.args)
+            kwargs = lower(value.kwargs or {})
+            name = target_name(value.target)
+            if name == "getitem":
+                # A value that is already computed is addressed, not
+                # recomputed.  The spelling is matched by name because the
+                # same operation reaches the graph as more than one callable.
+                result = args[0][args[1]]
+            else:
+                lowering = LOWERINGS.get(name)
+                if lowering is not None:
+                    result = lowering(value, *args, **kwargs)
+                else:
+                    result = self.make_extern(value, args, kwargs)
+            if isinstance(result, TensorBox):
+                self.mark_reuse(result, len(value.users))
+            produced[key] = result
+            return result
 
         for node in graph.nodes:
             if node.op == "placeholder":
@@ -256,42 +300,12 @@ class GraphLowering:
                 # The output node wraps its arguments, so a region that yields
                 # one value still stores it in a one-element sequence.
                 self.single_output = len(outputs) == 1
-                for value in resolve(list(outputs)):
+                for value in lower(list(outputs)):
                     if isinstance(value, TensorBox):
                         self.graph_outputs.append(self.realize_input(value))
                     else:
                         self.graph_outputs.append(value)
                 continue
-            if node.op == "get_attr":
-                tensor = self.graph_module._get_attr(node.target)
-                name = self.new_name("const")
-                layout = Layout(tensor.device, tensor.dtype, tuple(int(s) for s in tensor.shape), tuple(int(s) for s in tensor.stride()), 0)
-                buffer = ConstantBuffer(name, layout, tensor)
-                self.buffers[name] = buffer
-                self.constants[name] = tensor
-                env[node] = TensorBox(buffer)
-                continue
-            if not node.users:
-                # Functional graph: an unread result has no effect.
-                continue
-            args = resolve(node.args)
-            kwargs = resolve(node.kwargs or {})
-            name = target_name(node.target)
-            if name == "getitem":
-                # Indexing is resolved here, not called out to: a value that is
-                # already computed is addressed, not recomputed.  The spelling
-                # is matched by name because the same operation reaches the
-                # graph as more than one callable.
-                env[node] = args[0][args[1]]
-                continue
-            lowering = LOWERINGS.get(name)
-            if lowering is not None:
-                result = lowering(node, *args, **kwargs)
-            else:
-                result = self.make_extern(node, args, kwargs)
-            if isinstance(result, TensorBox):
-                self.mark_reuse(result, len(node.users))
-            env[node] = result
         return self
 
 
