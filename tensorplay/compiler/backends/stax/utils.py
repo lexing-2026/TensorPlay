@@ -2143,3 +2143,58 @@ OPTIMUS_EXCLUDE_POST_GRAD = [
     "activation_quantization_aten_pass",
     "inductor_autotune_lookup_table",
 ]
+
+
+#: The device kinds a compiled region can be placed on and given a kernel for.
+GPU_TYPES = ["cuda", "mps", "xpu", "mtia"]
+
+
+def get_gpu_type() -> str:
+    """The one kind of device this process can actually run on.
+
+    More than one at a time is refused rather than picked between: which one
+    a region goes on has to be decided before anything is generated for it,
+    and a process that can see two kinds of device has not said which it
+    meant.  None available is reported as the common device rather than as
+    an error, since a region can still be generated for a machine that has
+    one.
+    """
+    avail = [
+        x
+        for x in GPU_TYPES
+        if getattr(getattr(tp, x, None), "is_available", None) is not None
+        and getattr(tp, x).is_available()
+    ]
+    if len(avail) > 1:
+        raise AssertionError(
+            f"Expected at most 1 available GPU type, got {len(avail)}: {avail}"
+        )
+    return "cuda" if not avail else avail[0]
+
+
+class StorageWeakRef:
+    """A name for a storage that does not keep the storage alive.
+
+    Two places in compilation need to say "these two tensors are held in the
+    same place" without holding on to the data: which constants are the same
+    constant, and which are counted more than once.  Holding the storage
+    would keep it alive for as long as the answer is remembered, and the
+    answer outlives the compilation that produced it.
+
+    The name is the integer the storage's own pointer is held as.  The
+    storage frees that pointer when the last reference to the storage goes,
+    which is what a weak reference is for; nothing here has to release it.
+    """
+
+    __slots__ = ["cdata"]
+
+    def __init__(self, storage: Any) -> None:
+        self.cdata = storage._cdata
+
+    def __hash__(self) -> int:
+        return self.cdata
+
+    def __eq__(self, other: Any) -> bool:
+        if id(self) == id(other):
+            return True
+        return self.cdata == other.cdata
