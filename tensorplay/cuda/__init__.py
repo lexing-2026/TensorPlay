@@ -525,6 +525,24 @@ def get_device_capability(device: Any = None) -> tuple[int, int]:
     return prop.major, prop.minor
 
 
+def get_compute_capability(device: Any = None) -> int | str:
+    """The compute capability of a device, as a single comparable number.
+
+    On a processor whose capability is written as two numbers, the two are
+    joined into the one number a comparison is written against, so that asking
+    "is this at least 89" is one comparison rather than a pair of them.  On an
+    accelerator whose architecture is named rather than numbered, the name is
+    what there is, and it is what a caller compares.
+    """
+
+    import tensorplay.version
+
+    if tensorplay.version.hip is None:
+        major, minor = get_device_capability(device)
+        return major * 10 + minor
+    return get_device_properties(device).gcnArchName.split(":", 1)[0]
+
+
 def get_device_properties(device: Any = None) -> "_CudaDeviceProperties":
     r"""Get the properties of a device.
 
