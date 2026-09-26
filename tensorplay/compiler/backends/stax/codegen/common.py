@@ -14,6 +14,7 @@ answer instead of carrying a table each.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import enum
 import operator
 import functools
@@ -433,6 +434,142 @@ def is_buffer_removed(name: str) -> bool:
             V.kernel.inplaced_to_remove,
         )
     )
+
+
+@dataclasses.dataclass
+class DeviceCodegen:
+    """What a device is written through, and where its results are handed back.
+
+    Which of these a device has depends on what it can do: a device whose work
+    is all done by a host program has no separate C++ wrapper, and one whose
+    scheduling is not a decision at compile time may have none either.
+    """
+
+    scheduling: Any
+    wrapper_codegen: Any
+    cpp_wrapper_codegen: Any = None
+    fx_wrapper_codegen: Any = None
+
+
+#: What each device is written through, filled in by the registration below.
+device_codegens: dict[str, DeviceCodegen] = {}
+
+#: A pass a device wants run over a region before it is lowered, where the
+#: device needs one and the common path does not.
+custom_backend_passes: dict[str, Any] = {}
+
+#: A device's own settings, where the device has settings of its own.
+custom_backend_codegen_configs: dict[str, Any] = {}
+
+
+def register_backend_for_device(
+    device: str,
+    device_scheduling: Any,
+    device_wrapper_codegen: Any,
+    device_cpp_wrapper_codegen: Any = None,
+    device_fx_wrapper_codegen: Any = None,
+    device_custom_pass: Any = None,
+    device_custom_config: Any = None,
+) -> None:
+    """Equip a device with what its work is written through.
+
+    Called once per device, and again for a device that asks to be equipped
+    differently.  A device's own settings cannot be the common ones -- a device
+    that was handed the common settings would be indistinguishable from not
+    having any, which is why that is refused rather than ignored.
+    """
+
+    device_codegens[device] = DeviceCodegen(
+        device_scheduling,
+        device_wrapper_codegen,
+        device_cpp_wrapper_codegen,
+        device_fx_wrapper_codegen,
+    )
+    custom_backend_passes[device] = device_custom_pass
+    if device_custom_config:
+        from . import config as _config
+
+        if not (isinstance(device_custom_config, type(_config)) and _config):
+            raise AssertionError(
+                f"device_custom_config={device_custom_config} cannot be the "
+                f"same as the default config"
+            )
+    custom_backend_codegen_configs[device] = device_custom_config
+
+
+def get_backend_features(device) -> "OrderedSet":
+    """What a program emitter on this device can express.
+
+    A property of the emitter rather than of a region, so it is asked of the
+    emitter: the scheduling is asked what it can do rather than told.
+    """
+
+    if device is None:
+        return OrderedSet()
+    init_backend_registration()
+    device_type = device.type if hasattr(device, "type") else device
+    scheduling_ctor = get_scheduling_for_device(device_type)
+    if not scheduling_ctor:
+        raise AssertionError(f"no scheduling registered for device {device_type}")
+    scheduling = scheduling_ctor(None)
+    return scheduling.get_backend_features(device)
+
+
+def init_backend_registration() -> None:
+    """Equip each device this compiler writes for, once.
+
+    A device already equipped is left alone, so that a caller which equipped it
+    differently keeps what it chose.
+    """
+
+    if get_scheduling_for_device("cpu") is not None:
+        return
+    from .cpp import CppScheduling
+    from .wrapper import PythonWrapperCodegen
+
+    register_backend_for_device(
+        "cpu",
+        lambda scheduling: CppScheduling(scheduling),
+        PythonWrapperCodegen,
+    )
+
+
+def get_scheduling_for_device(device: str) -> Any:
+    """What a device's work is scheduled by, where one is registered."""
+
+    return device_codegens[device].scheduling if device in device_codegens else None
+
+
+def get_wrapper_codegen_for_device(
+    device: str, cpp_wrapper: bool = False, fx_wrapper: bool = False
+) -> Any:
+    """What a device's results are handed back through.
+
+    Which of the three answers is wanted is said by which flag is set, because
+    a device may have more than one way of handing results back and the caller
+    is the one that knows which it needs.
+    """
+
+    if device in device_codegens:
+        entry = device_codegens[device]
+        if fx_wrapper:
+            return entry.fx_wrapper_codegen
+        if cpp_wrapper:
+            return entry.cpp_wrapper_codegen
+        return entry.wrapper_codegen
+    return None
+
+
+def get_custom_backend_pass_for_device(device: str) -> Any:
+    """The pass a device wants over a region, where it wants one."""
+
+    return custom_backend_passes.get(device)
+
+
+def get_custom_backend_config_for_device(device: str) -> Any:
+    """A device's own settings, where it has settings of its own."""
+
+    return custom_backend_codegen_configs.get(device)
 
 
 class BackendFeature(Enum):
