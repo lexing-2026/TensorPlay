@@ -8,9 +8,9 @@ namespace {
 
 std::tuple<Tensor, Tensor> var_mean_cuda(const Tensor& self, const std::vector<int64_t>& dim,
                                          bool unbiased, bool keepdim) {
-    Tensor var = var_dim_kernel(self, dim, unbiased ? 1 : 0, keepdim);
-    Tensor mean = mean_dim_kernel(self, dim, keepdim, DType::Undefined);
-    return {std::move(var), std::move(mean)};
+    // One Welford pass yields both; a separate mean pass would re-read the
+    // whole input for a value the accumulator already holds.
+    return var_mean_dim_kernel(self, dim, unbiased ? 1 : 0, keepdim);
 }
 
 std::tuple<Tensor, Tensor> std_mean_cuda(const Tensor& self, const std::vector<int64_t>& dim,

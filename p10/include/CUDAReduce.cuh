@@ -35,7 +35,7 @@ constexpr int kDefaultValuesPerThread = 4;
 constexpr int kMaxCachedReduceDevices = 64;
 // Bump when the header-only launch path changes; this also keeps generated
 // CUDA objects from silently reusing an older reduction implementation.
-constexpr int kReductionEngineRevision = 5;
+constexpr int kReductionEngineRevision = 6;
 
 // Per-device launch geometry, queried once via cudaDeviceGetAttribute and
 // cached: cudaGetDeviceProperties costs ~1ms per call on the target GPU and
@@ -721,12 +721,23 @@ __device__ __forceinline__ AccT block_y_reduce(
     return value;
 }
 
+// Ops that can hand back a companion value (the Welford mean rides along with
+// the variance) define project_second; every other reduction leaves it out and
+// the companion write is compiled away.
+template <typename Ops, typename = void>
+struct has_second_project : std::false_type {};
+template <typename Ops>
+struct has_second_project<Ops, std::void_t<decltype(
+    std::declval<const Ops&>().project_second(
+        std::declval<typename Ops::acc_type>()))>> : std::true_type {};
+
 template <typename InputT, typename AccT, typename OutputT, typename Ops,
           int ValuesPerThread, int InputVecSize>
 struct ReduceOp {
     ReduceConfig config;
     const InputT* input;
     OutputT* output;
+    OutputT* output2;
     AccT* partials;
     unsigned long long* counters;
     unsigned long long* flags;
@@ -999,11 +1010,23 @@ struct ReduceOp {
                 final_value = block_y_reduce(final_value, config, ops, shared);
                 final_value = block_x_reduce(final_value, identity, config, ops, shared);
                 if (block_leader) {
-                    output[config.output_offset(output_index)] = ops.project(final_value);
+                    const int64_t off = config.output_offset(output_index);
+                    output[off] = ops.project(final_value);
+                    if (output2 != nullptr) {
+                        if constexpr (has_second_project<Ops>::value) {
+                            output2[off] = ops.project_second(final_value);
+                        }
+                    }
                 }
             }
         } else if (config.should_store(output_index)) {
-            output[config.output_offset(output_index)] = ops.project(value);
+            const int64_t off = config.output_offset(output_index);
+            output[off] = ops.project(value);
+            if (output2 != nullptr) {
+                if constexpr (has_second_project<Ops>::value) {
+                    output2[off] = ops.project_second(value);
+                }
+            }
         }
     }
 };
@@ -1018,7 +1041,7 @@ __global__ void reduce_kernel(ReduceOp<InputT, AccT, OutputT, Ops,
 template <typename InputT, typename AccT, typename OutputT, typename Ops,
           int ValuesPerThread, int InputVecSize>
 inline void launch_reduce(
-        TensorIterator& iter, Ops ops, AccT identity) {
+        TensorIterator& iter, Ops ops, AccT identity, OutputT* output2 = nullptr) {
     ReduceConfig config = make_reduce_config<InputT, AccT, OutputT>(iter);
     if (config.num_outputs == 0 || config.num_inputs == 0) return;
     if (!iter.can_use_32bit_indexing()) {
@@ -1045,6 +1068,7 @@ inline void launch_reduce(
         config,
         static_cast<const InputT*>(iter.data_ptr(1)),
         static_cast<OutputT*>(iter.data_ptr(0)),
+        output2,
         nullptr,
         nullptr,
         nullptr,
@@ -1358,6 +1382,11 @@ struct WelfordOps {
             a.m2 + b.m2 + delta * delta * a.nf * b_over_n,
             -1,
             new_count};
+    }
+    // Companion output for a fused var/mean reduction: the accumulator already
+    // carries the mean, so the second write costs one extra store per output.
+    __device__ OutputT project_second(acc_type acc) const {
+        return static_cast<OutputT>(acc.mean);
     }
     __device__ OutputT project(acc_type acc) const {
         const AccT divisor = acc.nf > correction ? acc.nf - correction : AccT(0);

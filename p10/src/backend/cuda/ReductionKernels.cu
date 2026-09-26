@@ -236,8 +236,8 @@ template <typename InputT, typename AccT, typename OutputT, typename Ops,
           int ValuesPerThread = reduction::kDefaultValuesPerThread>
 Tensor run_reduction_typed(
         const Tensor& input, const ReductionSpec& spec, bool keepdim,
-        DType output_dtype, Ops ops, AccT identity) {
-    static_assert(reduction::kReductionEngineRevision == 5);
+        DType output_dtype, Ops ops, AccT identity, Tensor* second_output = nullptr) {
+    static_assert(reduction::kReductionEngineRevision == 6);
     Tensor result = Tensor::empty(
         reduction_output_shape(input, spec, keepdim), output_dtype, input.device());
     if (input.numel() == 0 || result.numel() == 0) return result;
@@ -245,12 +245,14 @@ Tensor run_reduction_typed(
     Tensor viewed = reduction_view(result, input, spec, keepdim);
     TensorIterator iter = TensorIterator::reduce_op(viewed, input);
     const auto config = reduction::make_reduce_config<InputT, AccT, OutputT>(iter);
+    OutputT* second_ptr =
+        second_output == nullptr ? nullptr : second_output->data_ptr<OutputT>();
     if (config.input_vec_size == 4) {
         reduction::launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, 4>(
-            iter, ops, identity);
+            iter, ops, identity, second_ptr);
     } else {
         reduction::launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, 1>(
-            iter, ops, identity);
+            iter, ops, identity, second_ptr);
     }
     return result;
 }
@@ -408,6 +410,44 @@ Tensor welford_same_dtype(
     return run_reduction_typed<T, StateT, T, Ops, 2>(
         input, spec, keepdim, input.dtype(),
         Ops{static_cast<AccT>(correction), take_sqrt}, StateT{AccT(0), AccT(0), 0, AccT(0)});
+}
+
+// var and mean out of one Welford pass: the accumulator already carries both,
+// so the mean rides along instead of re-reading the whole input.
+template <typename T, typename IndexT>
+std::tuple<Tensor, Tensor> welford_var_mean_same_dtype(
+        const Tensor& input, const ReductionSpec& spec, bool keepdim,
+        int64_t correction) {
+    using AccT = same_dtype_acc_t<T>;
+    using StateT = WelfordData<AccT, IndexT>;
+    using Ops = WelfordOps<AccT, T, IndexT>;
+    const auto shape = reduction_output_shape(input, spec, keepdim);
+    if (input.numel() == 0) {
+        const Scalar nan(Scalar(std::numeric_limits<float>::quiet_NaN()));
+        return {Tensor::full(shape, nan, input.dtype(), input.device()),
+                Tensor::full(shape, nan, input.dtype(), input.device())};
+    }
+    Tensor mean = Tensor::empty(shape, input.dtype(), input.device());
+    Tensor var = run_reduction_typed<T, StateT, T>(
+        input, spec, keepdim, input.dtype(),
+        Ops{static_cast<AccT>(correction), false},
+        StateT{AccT(0), AccT(0), 0, AccT(0)}, &mean);
+    return {var, mean};
+}
+
+// The dtype dispatch macro fixes the first template argument, so the count
+// width is chosen here.
+template <typename T>
+std::tuple<Tensor, Tensor> welford_var_mean_dispatch(
+        const Tensor& input, const ReductionSpec& spec, bool keepdim,
+        int64_t correction) {
+    if (spec.reduced_numel <=
+        static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+        return welford_var_mean_same_dtype<T, int32_t>(
+            input, spec, keepdim, correction);
+    }
+    return welford_var_mean_same_dtype<T, int64_t>(
+        input, spec, keepdim, correction);
 }
 
 template <typename T>
@@ -1082,6 +1122,20 @@ Tensor var_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, int64
     const ReductionSpec spec = make_reduction_spec(self, dim);
     TP_DISPATCH_FLOAT_REDUCTION(welford_dispatch, self.dtype(), self, spec,
                                 keepdim, correction, false);
+}
+
+std::tuple<Tensor, Tensor> var_mean_dim_kernel(
+        const Tensor& self, const std::vector<int64_t>& dim,
+        int64_t correction, bool keepdim) {
+    if (isComplexType(self.dtype())) {
+        // Complex keeps the two-pass form: the variance adds over the
+        // components while the mean has to be rebuilt as a complex value.
+        return {var_dim_kernel(self, dim, correction, keepdim),
+                mean_dim_kernel(self, dim, keepdim, DType::Undefined)};
+    }
+    const ReductionSpec spec = make_reduction_spec(self, dim);
+    TP_DISPATCH_FLOAT_REDUCTION(welford_var_mean_dispatch, self.dtype(), self, spec,
+                                keepdim, correction);
 }
 
 Tensor var_kernel(const Tensor& self, int64_t correction) {

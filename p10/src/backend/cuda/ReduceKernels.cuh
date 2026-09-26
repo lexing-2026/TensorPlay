@@ -32,6 +32,9 @@ namespace ops = tensorplay::tpx::ops;
 
 extern std::tuple<Tensor, Tensor> sort_cuda(const Tensor& self, int64_t dim,
                                             bool descending);
+extern std::tuple<Tensor, Tensor> var_mean_dim_kernel(
+    const Tensor& self, const std::vector<int64_t>& dim,
+    int64_t correction, bool keepdim);
 extern Tensor mean_dim_kernel(const Tensor& self,
                               const std::vector<int64_t>& dim,
                               bool keepdim, DType dtype);
