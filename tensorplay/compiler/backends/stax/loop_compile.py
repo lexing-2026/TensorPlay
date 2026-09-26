@@ -77,4 +77,32 @@ def compile_graph(graph_module, example_inputs, *, scheduler: KernelScheduler | 
     return LoopProgram(graph, steps)
 
 
-__all__ = ["compile_graph", "stored_names"]
+__all__ = ["compile_graph", "compile_region", "stored_names"]
+
+
+def compile_region(module, example_inputs, **options):
+    """Compile one captured region with loop-IR kernels; returns a callable.
+
+    The training region is wrapped ahead of time: the joint forward and
+    backward graph is split by the min-cut partitioner and each half is
+    lowered into loop IR, scheduled into kernels and compiled.  A region that
+    needs no gradient compiles the forward half alone.
+    """
+
+    from ..._core.aot_autograd import (
+        aot_module_simplified,
+        min_cut_rematerialization_partition,
+    )
+
+    return aot_module_simplified(
+        module,
+        example_inputs,
+        fw_compiler=_compile_half,
+        bw_compiler=_compile_half,
+        partition_fn=min_cut_rematerialization_partition,
+        **options,
+    )
+
+
+def _compile_half(graph_module, example_inputs):
+    return compile_graph(graph_module, list(example_inputs))

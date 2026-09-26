@@ -57,6 +57,7 @@ _MODE_OPTIONS: dict[str, dict[str, bool]] = {
 # Every backend option key accepted by ``stax`` (and therefore by explicit
 # ``options`` dicts and mode patches alike).
 _STAX_OPTIONS = (
+    "stax.loops",
     "stax.native",
     "stax.fusion",
     "stax.cuda_codegen",
@@ -119,6 +120,7 @@ def stax(
         if any(not isinstance(value, bool) for value in options.values()):
             raise RuntimeError("Stax optimization options must be bool values")
         resolved.update(options)
+    use_loops = resolved.get("stax.loops", False)
     use_native = resolved.get("stax.native", True)
     use_fusion = resolved.get("stax.fusion", True)
     use_cuda_codegen = resolved.get("stax.cuda_codegen", False)
@@ -131,6 +133,7 @@ def stax(
     compiled = _lower_stax_region(
         graph_module,
         example_inputs,
+        use_loops=use_loops,
         use_native=use_native,
         use_fusion=use_fusion,
         use_cuda_codegen=use_cuda_codegen,
@@ -156,6 +159,7 @@ def _lower_stax_region(
     graph_module: GraphModule,
     example_inputs: list[Any],
     *,
+    use_loops: bool,
     use_native: bool,
     use_fusion: bool,
     use_cuda_codegen: bool,
@@ -277,6 +281,19 @@ def _lower_stax_region(
     # grad-carrying input list must select the split forward/backward route
     # exactly as a training module does.  The builder re-checks grad mode and
     # returns None for inference calls, leaving the routes below untouched.
+    if use_loops:
+        # The loop route is a lowering of this region, not a separate
+        # compiler: anything it cannot express falls through to the routes
+        # below unchanged.
+        from .loop_compile import compile_region
+
+        try:
+            compiled = compile_region(graph_module, list(example_inputs))
+        except Exception:  # noqa: BLE001 - fall back, never fail the region
+            compiled = None
+        if compiled is not None:
+            graph_module._stax_codegen = "stax-loops"
+            return compiled
     if use_native and (
         getattr(graph_module.root, "training", False)
         or any(

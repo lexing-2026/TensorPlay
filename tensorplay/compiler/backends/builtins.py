@@ -9,10 +9,6 @@ def register() -> None:
     from .stax import stax
 
     register_backend(stax, name="stax")
-
-    from .stax.loop_backend import compile_module
-
-    register_backend(compile_module, name="stax_loops")
     # Importing the module registers the debug-tagged backends.
     from . import debugging  # noqa: F401
 
