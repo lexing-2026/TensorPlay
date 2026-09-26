@@ -15,8 +15,39 @@ except ImportError:
 
 if triton is not None:
     import triton.language as tl
+    from triton import Config
     from triton.compiler import CompiledKernel
     from triton.runtime.jit import JITFunction, KernelInterface
+
+    #: Whether a launch can be split across producer and consumer warp groups.
+    #: The scheduling knobs for it are read from the runtime's own knob table,
+    #: and where that table lives has moved, so it is looked for in both places
+    #: and the capability is reported off when neither has it.
+    knobs = None
+    for _knobs_module in ("triton.runtime.knobs", "triton.knobs"):
+        try:
+            knobs = __import__(_knobs_module, fromlist=["knobs"])
+            break
+        except ImportError:
+            continue
+    HAS_WARP_SPEC = knobs is not None and hasattr(knobs, "warp_specialize")
+
+    try:
+        from triton.runtime.cache import triton_key
+    except ImportError:
+        try:
+            from triton.compiler.compiler import triton_key
+        except ImportError:
+
+            def triton_key(*args, **kwargs):
+                raise RuntimeError("the kernel-writing runtime has no cache key")
+
+    try:
+        from triton.runtime.errors import IntelGPUError
+    except ImportError:
+
+        class IntelGPUError(Exception):
+            pass
 
     try:
         from triton.backends.compiler import GPUTarget
@@ -43,9 +74,17 @@ if triton is not None:
 else:  # pragma: no cover - the kernel-writing runtime is absent
     tl = None
     CompiledKernel = None
+    Config = object
     GPUTarget = None
     OutOfResources = None
     PTXASError = None
     ASTSource = None
     JITFunction = None
     KernelInterface = None
+    knobs = None
+    HAS_WARP_SPEC = False
+    IntelGPUError = None
+
+    def triton_key(*args, **kwargs):
+        raise RuntimeError("the kernel-writing runtime is not installed")
+
