@@ -6144,9 +6144,11 @@ class KernelGroup:
             "linux",
             "win32",
         ]
-        if enable_kernel_profile:
-            code.writelines(["#include <torch/csrc/inductor/aoti_runtime/utils.h>"])
-        code.writeline("#include <torch/csrc/inductor/cpp_prefix.h>")
+        # What the generated unit needs before its own code: the inline hint,
+        # the division guard, and the record a profile reads. All of it is in
+        # one header of this project's own, so the unit is compiled against
+        # this tree and nothing else.
+        code.writeline('#include "tensorplay/GeneratedCode.h"')
 
         # 2. Function definition
         kernel_decl_name = str(Placeholder.KERNEL_NAME) if name is None else name
@@ -6155,7 +6157,7 @@ class KernelGroup:
         arg_defs = ",\n".ljust(25).join(arg_defs)
         func_export_decl = get_export_declaration()
         inline_attr = (
-            "C10_ALWAYS_INLINE_ATTRIBUTE" if config.cpp.force_inline_kernel else ""
+            "TP_ALWAYS_INLINE" if config.cpp.force_inline_kernel else ""
         )
         code.writeline(
             f'extern "C" {func_export_decl} void {inline_attr} {kernel_decl_name}({arg_defs})'
@@ -6163,9 +6165,9 @@ class KernelGroup:
 
         # 3. Function body
         with code.indent():
-            code.writeline("std::atomic<int> inductor_cpu_integer_div_error{0};")
             code.writeline(
-                "inductor_cpu_integer_div_error_flag = &inductor_cpu_integer_div_error;"
+                "tensorplay::generated::integer_div_error_flag() ="
+                " &tensorplay::generated::integer_div_error();"
             )
             if enable_kernel_profile:
                 graph_id = V.graph.graph_id
@@ -6173,18 +6175,16 @@ class KernelGroup:
                 code.writelines(
                     [
                         (
-                            "torch::aot_inductor::RAIIAtenRecordFunctionHandle "
-                            f'record_{prefix + kernel_name}_("{prefix + kernel_name}", nullptr);'
+                            "tensorplay::prof::OpRecord "
+                            f'record_{prefix + kernel_name}_("{prefix + kernel_name}");'
                         )
                     ]
                 )
             for old, new in self.args.aliases():
                 code.writeline(f"auto {old} = {new};")
             code.splice(self.loops_code)
-            code.writeline("inductor_cpu_integer_div_error_flag = nullptr;")
-            code.writeline(
-                "inductor_cpu_throw_if_integer_div_error(inductor_cpu_integer_div_error);"
-            )
+            code.writeline("tensorplay::generated::integer_div_error_flag() = nullptr;")
+            code.writeline("tensorplay::generated::throw_if_integer_div_error(0);")
         return code.getvalue()
 
     def call_kernel(self, wrapper, kernel_name):
