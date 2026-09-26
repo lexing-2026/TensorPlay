@@ -8,6 +8,7 @@
 #include "Dispatcher.h"
 #include "Utils.h"
 #include "CUDAGenerator.h"
+#include "CUDALoops.cuh"
 #include <curand_kernel.h>
 #include <algorithm>
 #include <limits>
@@ -107,6 +108,44 @@ Tensor one_hot_cuda(const Tensor& self, int64_t num_classes) {
     return eq_kernel_cuda(self.view(sizes), index).to(DType::Int64);
 }
 
+namespace {
+
+// out[i] = a * sigmoid(b) with a and b read from the two halves of one axis.
+__device__ __forceinline__ float glu_exp(float v) { return ::expf(v); }
+__device__ __forceinline__ double glu_exp(double v) { return ::exp(v); }
+
+template <typename T, typename acc_t, typename index_t>
+__global__ void glu_fused_kernel(index_t n, index_t block, const T* src, T* out) {
+    const index_t li = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (li >= n) return;
+    const index_t a_off = li + (li / block) * block;
+    const acc_t a = static_cast<acc_t>(src[a_off]);
+    const acc_t b = static_cast<acc_t>(src[a_off + block]);
+    const acc_t one = acc_t(1);
+    out[li] = static_cast<T>(a * (one / (one + glu_exp(-b))));
+}
+
+// One pass for both halves of the gradient: the first half gets the gate
+// gradient, the second half the value gradient, and both are read from the
+// same pair of input offsets.
+template <typename T, typename acc_t, typename index_t>
+__global__ void glu_backward_fused_kernel(index_t n, index_t block,
+                                          const T* grad, const T* src,
+                                          T* out) {
+    const index_t li = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (li >= n) return;
+    const index_t a_off = li + (li / block) * block;
+    const acc_t a = static_cast<acc_t>(src[a_off]);
+    const acc_t b = static_cast<acc_t>(src[a_off + block]);
+    const acc_t g = static_cast<acc_t>(grad[li]);
+    const acc_t one = acc_t(1);
+    const acc_t sig = one / (one + glu_exp(-b));
+    out[a_off] = static_cast<T>(g * sig);
+    out[a_off + block] = static_cast<T>(g * a * sig * (one - sig));
+}
+
+}  // namespace
+
 Tensor glu_cuda(const Tensor& self, int64_t dim) {
     if (self.dim() == 0) TP_THROW(RuntimeError, "glu does not support 0-dimensional tensors");
     const int64_t d = wrap_dim_local(dim, self.dim());
@@ -116,6 +155,55 @@ Tensor glu_cuda(const Tensor& self, int64_t dim) {
                                    " is size " + std::to_string(nIn));
     }
     const int64_t half = nIn / 2;
+    // A contiguous input lets one pass do the whole thing: the output index is
+    // the same offset in both halves, so each element is read once and written
+    // once.  Splitting it into a sigmoid pass and a multiply pass moves the
+    // data three times instead of once.
+    if (self.is_contiguous() &&
+        (self.dtype() == DType::Float32 || self.dtype() == DType::Float64 ||
+         self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16)) {
+        int64_t inner = 1;
+        for (int64_t k = d + 1; k < self.dim(); ++k) inner *= self.size(k);
+        // Distance between the two halves of one split axis, which is also the
+        // length of an output row.  Splitting an inner axis interleaves the
+        // halves, so the input offset of the first half is the output offset
+        // plus one whole block for every preceding output row.
+        const int64_t block_len = half * inner;
+        auto out_shape = static_cast<std::vector<int64_t>>(self.shape());
+        out_shape[static_cast<size_t>(d)] = half;
+        Tensor out = Tensor::empty(out_shape, self.dtype(), self.device());
+        const int64_t n = out.numel();
+        if (n == 0) return out;
+        const auto stream = getCurrentCUDAStream().stream();
+        constexpr int64_t kGluThreads = 256;
+        const unsigned blocks = static_cast<unsigned>((n + kGluThreads - 1) / kGluThreads);
+        const dim3 block(kGluThreads);
+#define TP_GLU(name_, ctype, acc_) \
+    case DType::name_: { \
+        const ctype* source = self.data_ptr<ctype>(); \
+        ctype* dest = out.data_ptr<ctype>(); \
+        if (n <= static_cast<int64_t>(std::numeric_limits<int32_t>::max()) && \
+            block_len <= static_cast<int64_t>(std::numeric_limits<int32_t>::max())) { \
+            glu_fused_kernel<ctype, acc_, int32_t><<<blocks, block, 0, stream>>>( \
+                static_cast<int32_t>(n), static_cast<int32_t>(block_len), \
+                source, dest); \
+        } else { \
+            glu_fused_kernel<ctype, acc_, int64_t><<<blocks, block, 0, stream>>>( \
+                n, block_len, source, dest); \
+        } \
+        break; \
+    }
+        switch (self.dtype()) {
+            TP_GLU(Float32, float, float)
+            TP_GLU(Float64, double, double)
+            TP_GLU(Float16, Half, float)
+            TP_GLU(BFloat16, BFloat16, float)
+            default: break;
+        }
+#undef TP_GLU
+        checkCuda(cudaGetLastError(), "glu fused kernel");
+        return out;
+    }
     Tensor firstHalf = self.slice(d, 0, half);
     Tensor secondHalf = self.slice(d, half, nIn);
     return firstHalf * secondHalf.sigmoid();
@@ -130,6 +218,50 @@ Tensor glu_backward_cuda(const Tensor& grad_output, const Tensor& self, int64_t 
                                    " is size " + std::to_string(nIn));
     }
     const int64_t inputSize = nIn / 2;
+    if (self.is_contiguous() && grad_output.is_contiguous() &&
+        (self.dtype() == DType::Float32 || self.dtype() == DType::Float64 ||
+         self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16) &&
+        grad_output.dtype() == self.dtype()) {
+        int64_t inner = 1;
+        for (int64_t k = d + 1; k < self.dim(); ++k) inner *= self.size(k);
+        const int64_t block_len = inputSize * inner;
+        Tensor out = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()),
+                                   self.dtype(), self.device());
+        const int64_t n = inputSize * inner *
+                          (self.numel() / (nIn * inner));
+        if (n == 0) return out;
+        const auto stream = getCurrentCUDAStream().stream();
+        constexpr int64_t kGluThreads = 256;
+        const unsigned blocks = static_cast<unsigned>((n + kGluThreads - 1) / kGluThreads);
+        const dim3 block(kGluThreads);
+#define TP_GLU_BWD(name_, ctype, acc_) \
+    case DType::name_: { \
+        if (n <= static_cast<int64_t>(std::numeric_limits<int32_t>::max()) && \
+            block_len <= static_cast<int64_t>(std::numeric_limits<int32_t>::max())) { \
+            glu_backward_fused_kernel<ctype, acc_, int32_t> \
+                <<<blocks, block, 0, stream>>>( \
+                    static_cast<int32_t>(n), static_cast<int32_t>(block_len), \
+                    grad_output.data_ptr<ctype>(), self.data_ptr<ctype>(), \
+                    out.data_ptr<ctype>()); \
+        } else { \
+            glu_backward_fused_kernel<ctype, acc_, int64_t> \
+                <<<blocks, block, 0, stream>>>( \
+                    n, block_len, grad_output.data_ptr<ctype>(), \
+                    self.data_ptr<ctype>(), out.data_ptr<ctype>()); \
+        } \
+        break; \
+    }
+        switch (self.dtype()) {
+            TP_GLU_BWD(Float32, float, float)
+            TP_GLU_BWD(Float64, double, double)
+            TP_GLU_BWD(Float16, Half, float)
+            TP_GLU_BWD(BFloat16, BFloat16, float)
+            default: break;
+        }
+#undef TP_GLU_BWD
+        checkCuda(cudaGetLastError(), "glu backward fused kernel");
+        return out;
+    }
     Tensor firstHalf = self.slice(d, 0, inputSize);
     Tensor secondHalf = self.slice(d, inputSize, nIn);
     Tensor sig_second = secondHalf.sigmoid();
