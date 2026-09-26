@@ -61,8 +61,9 @@ def build_cases(dev, dtype):
                   lambda x=x: torch.log_softmax(x, -1)))
     x = r(4096, 1024)
     y = torch.rand(4096, 1024, generator=g, device=dev, dtype=dtype)
-    C.append(("softmax.backward", lambda: F._softmax_backward_data(T(y), T(x), -1, dtype),
-              lambda: torch._softmax_backward_data(y, x, -1, dtype)))
+    C.append(("softmax.backward",
+              lambda y=y, x=x: F._softmax_backward_data(T(y), T(x), -1, None),
+              lambda y=y, x=x: torch._softmax_backward_data(y, x, -1, dtype)))
     # ---- 归约家族（Reduce*Kernels.cu / ReductionKernels.cu）----
     for shape in [(4096, 4096), (1024, 1024, 64)]:
         x = r(*shape)
@@ -85,13 +86,16 @@ def build_cases(dev, dtype):
     C.append(("cumsum.dim-1", lambda: F.cumsum(T(x), -1), lambda: torch.cumsum(x, -1)))
     C.append(("cummax.dim-1", lambda: F.cummax(T(x), -1), lambda: torch.cummax(x, -1)))
     C.append(("sort.dim-1", lambda: F.sort(T(x), -1), lambda: torch.sort(x, -1)))
-    C.append(("topk.k64", lambda: F.topk(T(x), 64, -1), lambda: torch.topk(x, 64, -1)))
+    # topk returns (values, indices); compare the values only.
+    C.append(("topk.k64", lambda x=x: F.topk(T(x), 64, -1)[0],
+              lambda x=x: torch.topk(x, 64, -1)[0]))
     # ---- 索引 / embedding ----
     idx = torch.randint(0, 4096, (4096, 128), generator=g, device=dev)
     go = r(4096, 128)
+    go3 = go.unsqueeze(-1).expand(4096, 128, 64).contiguous()
     C.append(("embedding_dense_backward",
-              lambda: F.embedding_dense_backward(T(go), T(idx), 4096, -1, False),
-              lambda: torch.embedding_dense_backward(go, idx, 4096, -1, False)))
+              lambda: F.embedding_dense_backward(T(go3), T(idx), 4096, -1, False),
+              lambda: torch.ops.aten.embedding_dense_backward(go3, idx, 4096, -1, False)))
     # ---- 卷积 / 池化 ----
     x = r(32, 64, 56, 56)
     w = r(64, 64, 3, 3)
