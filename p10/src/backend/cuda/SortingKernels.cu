@@ -376,7 +376,7 @@ __global__ void sort_radix_pack_kernel(int64_t n, int64_t d_size, int64_t inner,
         const int64_t in2 = slice - o * inner;
         const int64_t src = (o * d_size + j) * inner + in2;
         keys[i] = SortRadixTraits<T>::encode(in[src]);
-        pos[i] = j;
+        if (pos != nullptr) pos[i] = j;
     }
 }
 
@@ -393,7 +393,7 @@ __global__ void sort_radix_unpack_kernel(int64_t n, int64_t d_size, int64_t inne
         const int64_t in2 = slice - o * inner;
         const int64_t dst = (o * d_size + j) * inner + in2;
         vals[dst] = SortRadixTraits<T>::deconvert(keys[i]);
-        idxs[dst] = pos[i];
+        if (idxs != nullptr) idxs[dst] = pos[i];
     }
 }
 
@@ -482,6 +482,40 @@ void sort_radix_impl(const Tensor& self_c, Tensor& values, Tensor& indices,
     sort_radix_unpack_kernel<T><<<blocks, kThreads, 0, stream>>>(
         n, d_size, inner, key_buf.Current(), pos_buf.Current(),
         static_cast<T*>(values.data_ptr()), indices.data_ptr<int64_t>());
+}
+
+// Keys-only radix sort for callers that never look at the permutation:
+// carrying an int64 position through every radix pass doubles the traffic of
+// the sort itself, and the sorted values are all such callers want.
+template <typename T>
+void sort_keys_radix_impl(const Tensor& self_c, Tensor& values,
+                          int64_t d_size, int64_t inner, int64_t slices) {
+    using Key = typename SortRadixTraits<T>::key_type;
+    const int64_t n = self_c.numel();
+    const auto device = self_c.device();
+    const DType key_dtype = sizeof(Key) == 8 ? DType::UInt64 : DType::UInt32;
+    Tensor keys_a = Tensor::empty({n}, key_dtype, device);
+    Tensor keys_b = Tensor::empty({n}, key_dtype, device);
+    auto stream = getCurrentCUDAStream().stream();
+    const int blocks = static_cast<int>((n + kThreads - 1) / kThreads);
+    sort_radix_pack_kernel<T><<<blocks, kThreads, 0, stream>>>(
+        n, d_size, inner, static_cast<const T*>(self_c.data_ptr()),
+        keys_a.data_ptr<Key>(), static_cast<int64_t*>(nullptr));
+    cub::DoubleBuffer<Key> key_buf(keys_a.data_ptr<Key>(), keys_b.data_ptr<Key>());
+    const int n_items = static_cast<int>(n);
+    const int bits = SortRadixTraits<T>::bit_count;
+    size_t tmp_bytes = 0;
+    CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
+        nullptr, tmp_bytes, key_buf, n_items, 0, bits, stream));
+    Tensor tmp = Tensor::empty(
+        {static_cast<int64_t>(std::max<size_t>(tmp_bytes, 1))}, DType::UInt8,
+        device);
+    CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
+        tmp.data_ptr(), tmp_bytes, key_buf, n_items, 0, bits, stream));
+    sort_radix_unpack_kernel<T><<<blocks, kThreads, 0, stream>>>(
+        n, d_size, inner, key_buf.Current(), static_cast<const int64_t*>(nullptr),
+        static_cast<T*>(values.data_ptr()), static_cast<int64_t*>(nullptr));
+    (void)slices;
 }
 
 void radix_sort_impl(const Tensor& self_c, Tensor& values, Tensor& indices,
@@ -630,6 +664,35 @@ Tensor argsort_cuda(const Tensor& self, int64_t dim, bool descending) {
     return std::get<1>(sort_cuda(self, dim, descending));
 }
 
+// Sorts along `dim` and returns only the values.  The permutation is never
+// materialised, so the radix passes move half the bytes.
+static Tensor sort_values_only_cuda(const Tensor& self, int64_t dim) {
+    const int64_t nd = self.dim();
+    dim = wrap_dim(dim, nd);
+    Tensor self_c = self.contiguous();
+    Tensor values = Tensor::empty(
+        static_cast<std::vector<int64_t>>(self_c.shape()), self_c.dtype(),
+        self_c.device());
+    int64_t d_size = self_c.size(dim);
+    int64_t outer = 1, inner = 1;
+    outer_inner(static_cast<std::vector<int64_t>>(self_c.shape()), dim, outer, inner);
+    const int64_t slices = outer * inner;
+    if (slices == 0 || d_size == 0) return values;
+    TP_CHECK(self_c.numel() <= std::numeric_limits<int>::max(),
+             "sort: input is too large for the radix sort");
+    switch (self_c.dtype()) {
+#define TP_SORT_KEYS_CASE(ctype, name) \
+    case DType::name: \
+        sort_keys_radix_impl<ctype>(self_c, values, d_size, inner, slices); \
+        break;
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_SORT_KEYS_CASE)
+#undef TP_SORT_KEYS_CASE
+        default: TP_THROW(TypeError, "sort: unsupported dtype");
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return values;
+}
+
 std::tuple<Tensor, Tensor, Tensor> unique_cuda(const Tensor& self, bool sorted,
                                                bool return_inverse,
                                                bool return_counts) {
@@ -646,35 +709,70 @@ std::tuple<Tensor, Tensor, Tensor> unique_cuda(const Tensor& self, bool sorted,
                                   : Tensor();
     if (n == 0) return std::make_tuple(values, inverse, counts);
 
-    auto [sorted_vals, order] = sort_cuda(flat, 0, false);
+    // The permutation is only needed to place the inverse indices; without it
+    // the sort carries no values and moves half the bytes per pass.
+    Tensor sorted_vals;
+    Tensor order;
+    if (return_inverse) {
+        auto sorted_pair = sort_cuda(flat, 0, false);
+        sorted_vals = std::get<0>(sorted_pair);
+        order = std::get<1>(sorted_pair);
+    } else {
+        sorted_vals = sort_values_only_cuda(flat, 0);
+    }
 
-    // One pass over the sorted values yields everything the rest needs: the
-    // distinct values themselves, where each run starts, and how many runs
-    // there are.  Deriving the run boundaries this way keeps the flags and the
-    // prefix sum over the whole input out of the picture -- both are as large
-    // as the input, while the run table is as small as the output.
+    // One pass over the sorted values yields the distinct values themselves and
+    // how many there are; the run starts come along only when the counts need
+    // them.  Deriving the boundaries this way keeps a flags array and a prefix
+    // sum over the whole input out of the picture -- both are as large as the
+    // input, while the run table is as small as the output.
     Tensor values_buffer = Tensor::empty({n}, self.dtype(), self.device());
-    Tensor run_starts = Tensor::empty({n}, DType::Int64, self.device());
+    // The run table serves both the counts and the inverse mapping.
+    Tensor run_starts = (return_counts || return_inverse)
+                            ? Tensor::empty({n}, DType::Int64, self.device())
+                            : Tensor();
     Tensor num_selected = Tensor::empty({}, DType::Int64, self.device());
     const auto stream = getCurrentCUDAStream().stream();
     thrust::counting_iterator<int64_t> positions(0);
     size_t temp_bytes = 0;
     bool launched = false;
+    // Without the counts there is nothing to gain from the run boundaries, and
+    // the plain unique pass writes half as many outputs.
 #define TP_UNIQUE_SPLIT_CASE(ctype, name)                                     \
     case DType::name: {                                                       \
         ctype* sorted_ptr = sorted_vals.data_ptr<ctype>();                    \
         size_t bytes = 0;                                                     \
-        CUDA_CHECK(cub::DeviceSelect::UniqueByKey(                            \
-            nullptr, bytes, sorted_ptr, positions,                            \
-            values_buffer.data_ptr<ctype>(), run_starts.data_ptr<int64_t>(),   \
-            num_selected.data_ptr<int64_t>(), static_cast<int>(n), stream));  \
+        if (run_starts.defined()) {                                           \
+            CUDA_CHECK(cub::DeviceSelect::UniqueByKey(                        \
+                nullptr, bytes, sorted_ptr, positions,                        \
+                values_buffer.data_ptr<ctype>(),                              \
+                run_starts.data_ptr<int64_t>(),                               \
+                num_selected.data_ptr<int64_t>(), static_cast<int>(n),        \
+                stream));                                                     \
+        } else {                                                              \
+            CUDA_CHECK(cub::DeviceSelect::Unique(                             \
+                nullptr, bytes, sorted_ptr,                                   \
+                values_buffer.data_ptr<ctype>(),                              \
+                num_selected.data_ptr<int64_t>(), static_cast<int>(n),        \
+                stream));                                                     \
+        }                                                                     \
         Tensor temp = Tensor::empty(                                          \
             {static_cast<int64_t>(std::max<size_t>(bytes, 1))},               \
             DType::UInt8, self.device());                                     \
-        CUDA_CHECK(cub::DeviceSelect::UniqueByKey(                            \
-            temp.data_ptr(), bytes, sorted_ptr, positions,                    \
-            values_buffer.data_ptr<ctype>(), run_starts.data_ptr<int64_t>(),   \
-            num_selected.data_ptr<int64_t>(), static_cast<int>(n), stream));  \
+        if (run_starts.defined()) {                                           \
+            CUDA_CHECK(cub::DeviceSelect::UniqueByKey(                        \
+                temp.data_ptr(), bytes, sorted_ptr, positions,                \
+                values_buffer.data_ptr<ctype>(),                              \
+                run_starts.data_ptr<int64_t>(),                               \
+                num_selected.data_ptr<int64_t>(), static_cast<int>(n),        \
+                stream));                                                     \
+        } else {                                                              \
+            CUDA_CHECK(cub::DeviceSelect::Unique(                             \
+                temp.data_ptr(), bytes, sorted_ptr,                           \
+                values_buffer.data_ptr<ctype>(),                              \
+                num_selected.data_ptr<int64_t>(), static_cast<int>(n),        \
+                stream));                                                     \
+        }                                                                     \
         temp_bytes = bytes;                                                   \
         launched = true;                                                      \
         break;                                                                \

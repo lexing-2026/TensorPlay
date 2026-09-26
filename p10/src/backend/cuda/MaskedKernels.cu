@@ -49,18 +49,52 @@ inline std::vector<int64_t> broadcast_shapes(const std::vector<int64_t>& a,
     return out;
 }
 
+// One block per (batch, row) and one thread per column: the mask only depends
+// on the column, so the row can stay block-wide and the whole grid runs at
+// element granularity.  A thread per row instead would leave the machine idle
+// on all but as many blocks as there are rows, and every column a serial
+// per-thread loop.
 template <typename T, bool Lower>
 __global__ void triangular_mask_kernel(int64_t batch_rows, int64_t rows, int64_t cols,
                                        const T* in, T* out, int64_t diagonal) {
+    const int64_t br = static_cast<int64_t>(blockIdx.x);
+    const int64_t bi = br / rows;
+    const int64_t row = br - bi * rows;
+    const int64_t base = bi * rows * cols + row * cols;
+    const int64_t limit = row + diagonal;
+    const int64_t step = static_cast<int64_t>(gridDim.y) * blockDim.x;
+    for (int64_t c = static_cast<int64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
+         c < cols; c += step) {
+        // A masked-out element is a pure store: branching keeps the load out
+        // of the fully masked half of the matrix, which is half the traffic.
+        if (Lower ? (c > limit) : (c < limit)) {
+            out[base + c] = static_cast<T>(0);
+        } else {
+            out[base + c] = in[base + c];
+        }
+    }
+}
+
+// Short rows: one thread per row walking its few columns.  Handing a whole row
+// to a block would leave most of its threads idle when the row is narrower than
+// the block, and the parallelism is already there in the row count.
+template <typename T, bool Lower>
+__global__ void triangular_mask_rows_kernel(int64_t batch_rows, int64_t rows,
+                                            int64_t cols, const T* in, T* out,
+                                            int64_t diagonal) {
     int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; t < batch_rows; t += stride) {
-        int64_t bi = t / rows, r = t % rows;
-        const T* sp = in + bi * rows * cols + r * cols;
-        T* dp = out + bi * rows * cols + r * cols;
+        const int64_t bi = t / rows;
+        const int64_t row = t - bi * rows;
+        const int64_t base = bi * rows * cols + row * cols;
+        const int64_t limit = row + diagonal;
         for (int64_t c = 0; c < cols; ++c) {
-            bool keep = Lower ? (c <= r + diagonal) : (c >= r + diagonal);
-            dp[c] = keep ? sp[c] : static_cast<T>(0);
+            if (Lower ? (c > limit) : (c < limit)) {
+                out[base + c] = static_cast<T>(0);
+            } else {
+                out[base + c] = in[base + c];
+            }
         }
     }
 }
@@ -134,9 +168,37 @@ Tensor triangular_mask_entry(const Tensor& self, int64_t diagonal) {
     if (batch == 0 || rows == 0 || cols == 0) return result;
     auto stream = getCurrentCUDAStream().stream();
     int64_t work = batch * rows;
+    // A row narrower than a wave is cheaper with one thread per row; wider rows
+    // hand the columns to the threads of a block so every element gets its own
+    // lane.
+    // A row narrower than a wave cannot keep a block busy anyway; past that
+    // the block-per-row shape pays off and stays the better mapping.
+    constexpr int64_t kRowPerThreadMax = 32;
+    if (cols <= kRowPerThreadMax) {
+        const dim3 grid(static_cast<unsigned>((work + kThreads - 1) / kThreads));
+#define TP_TRI_ROW_CASE(ctype, name) \
+        case DType::name: \
+            triangular_mask_rows_kernel<ctype, Lower><<<grid, kThreads, 0, stream>>>( \
+                work, rows, cols, self_c.data_ptr<ctype>(), result.data_ptr<ctype>(), \
+                diagonal); \
+            break;
+        switch (self.dtype()) {
+            TENSORPLAY_FORALL_SCALAR_TYPES(TP_TRI_ROW_CASE)
+            default: TP_THROW(TypeError, "tril/triu: unsupported dtype");
+        }
+#undef TP_TRI_ROW_CASE
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
+    // Rows across grid.x, column tiles across grid.y (the y extent is the
+    // smaller hardware limit, and a wide row simply loops).
+    const unsigned column_tiles = static_cast<unsigned>(std::min<int64_t>(
+        (cols + kThreads - 1) / kThreads, 65535));
+    const dim3 grid(static_cast<unsigned>(work), column_tiles);
+    const dim3 block(kThreads);
 #define TP_TRI_CASE(ctype, name) \
     case DType::name: \
-        triangular_mask_kernel<ctype, Lower><<<(work + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
+        triangular_mask_kernel<ctype, Lower><<<grid, block, 0, stream>>>( \
             work, rows, cols, self_c.data_ptr<ctype>(), result.data_ptr<ctype>(), diagonal); \
         break;
     switch (self.dtype()) {

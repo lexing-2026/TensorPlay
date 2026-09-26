@@ -451,13 +451,14 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
 
         if name == 'unique' and 'function' in f.variants:
             seen.add(name)
-            # dim form routes to unique_dim; the flat form always computes
-            # all three outputs and trims them in Python, matching the
-            # reference contract of returning 1/2/3 tensors by flags.
+            # dim form routes to unique_dim.  The flags go down to the
+            # kernel: the return shape is trimmed in Python, but asking for
+            # only the values must also skip the inverse mapping and the run
+            # lengths, which each cost a pass over the whole input.
             lines += [
                 'def unique(input, sorted=True, return_inverse=False, return_counts=False, dim=None):',
                 '    if dim is not None:',
-                '        values, inverse, counts = unique_dim(input, dim, sorted, True, True)',
+                '        values, inverse, counts = unique_dim(input, dim, sorted, return_inverse, return_counts)',
                 '        outs = [values]',
                 '        if return_inverse:',
                 '            outs.append(inverse)',
@@ -468,7 +469,7 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                 '        _captured = _capture_call(unique, (input, sorted, return_inverse, return_counts), {})',
                 '        if _captured is not None:',
                 '            return _captured',
-                '    values, inverse, counts = _C.unique(input, sorted, True, True)',
+                '    values, inverse, counts = _C.unique(input, sorted, return_inverse, return_counts)',
                 '    outs = [values]',
                 '    if return_inverse:',
                 '        outs.append(inverse)',

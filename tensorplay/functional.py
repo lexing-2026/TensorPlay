@@ -3802,7 +3802,7 @@ def nonzero(input, *, out=None):
 
 def unique(input, sorted=True, return_inverse=False, return_counts=False, dim=None):
     if dim is not None:
-        values, inverse, counts = unique_dim(input, dim, sorted, True, True)
+        values, inverse, counts = unique_dim(input, dim, sorted, return_inverse, return_counts)
         outs = [values]
         if return_inverse:
             outs.append(inverse)
@@ -3813,7 +3813,7 @@ def unique(input, sorted=True, return_inverse=False, return_counts=False, dim=No
         _captured = _capture_call(unique, (input, sorted, return_inverse, return_counts), {})
         if _captured is not None:
             return _captured
-    values, inverse, counts = _C.unique(input, sorted, True, True)
+    values, inverse, counts = _C.unique(input, sorted, return_inverse, return_counts)
     outs = [values]
     if return_inverse:
         outs.append(inverse)
