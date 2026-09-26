@@ -562,34 +562,60 @@ class GraphModule:
             f"{key!r}: {self._expr(value)}" for key, value in kwargs.items()
         ) + "}"
 
+    def _bind_call(self, args: tuple, kwargs: dict) -> dict:
+        """Pair a call's arguments with the names the graph knows them by.
+
+        A graph is handed its values by the order its placeholders were
+        created, and by name where the caller gave a name.  Which of the two a
+        value arrives by depends on what the caller could tell: a parameter
+        declared keyword-only, or one that has a default, becomes a placeholder
+        like any other, so a value for it is a positional value whether or not
+        the declared signature would have allowed it to be placed there.
+
+        So the graph's own placeholder list is what decides, and a declared
+        signature is consulted only where it can: where there is no signature,
+        and where the signature can hold everything that was passed.  A name the
+        graph does not know is an error either way, because a value nobody
+        reads is a value the caller believes was used.
+        """
+
+        placeholders = list(self.graph.placeholders)
+        names = [node.target if isinstance(node.target, str) else node.name for node in placeholders]
+
+        if self.signature is not None:
+            try:
+                bound = self.signature.bind(*args, **kwargs)
+            except TypeError:
+                # The signature cannot hold what was passed. That is expected
+                # when the graph's placeholder list is wider than the declared
+                # parameters, which is what a keyword-only parameter with a
+                # default produces; it is not expected for any other reason, so
+                # fall through to the placeholder order and let the checks
+                # below say whether the call makes sense.
+                pass
+            else:
+                bound.apply_defaults()
+                return dict(bound.arguments)
+
+        bound_arguments: dict = {}
+        for index, node in enumerate(placeholders):
+            parameter_name = names[index]
+            if index < len(args):
+                bound_arguments[parameter_name] = args[index]
+            elif parameter_name in kwargs:
+                bound_arguments[parameter_name] = kwargs[parameter_name]
+            elif node.args:
+                bound_arguments[parameter_name] = node.args[0]
+            else:
+                raise TypeError(f"missing required graph input: {parameter_name}")
+        unknown = set(kwargs) - set(names)
+        if unknown:
+            raise TypeError(f"unexpected graph inputs: {', '.join(sorted(unknown))}")
+        return bound_arguments
+
     def _interpret(self, *args: Any, _record_meta: bool = False, **kwargs: Any) -> Any:
         try:
-            if self.signature is None:
-                bound_arguments = {}
-                for index, node in enumerate(self.graph.placeholders):
-                    parameter_name = node.target if isinstance(node.target, str) else node.name
-                    if index < len(args):
-                        bound_arguments[parameter_name] = args[index]
-                    elif parameter_name in kwargs:
-                        bound_arguments[parameter_name] = kwargs[parameter_name]
-                    elif node.args:
-                        bound_arguments[parameter_name] = node.args[0]
-                    else:
-                        raise TypeError(
-                            f"missing required graph input: {parameter_name}"
-                        )
-                unknown = set(kwargs) - {
-                    node.target if isinstance(node.target, str) else node.name
-                    for node in self.graph.placeholders
-                }
-                if unknown:
-                    raise TypeError(
-                        f"unexpected graph inputs: {', '.join(sorted(unknown))}"
-                    )
-            else:
-                bound = self.signature.bind_partial(*args, **kwargs)
-                bound.apply_defaults()
-                bound_arguments = bound.arguments
+            bound_arguments = self._bind_call(args, kwargs)
         except TypeError:
             raise
 
@@ -1479,21 +1505,19 @@ class GraphModule:
         if self.signature is not None and not self._boxed_call:
             @functools.wraps(implementation)
             def checked_forward(*args: Any, **kwargs: Any) -> Any:
-                try:
-                    bound = self.signature.bind(*args, **kwargs)
-                except TypeError:
-                    # The graph's own values arrive in placeholder order, and
-                    # that order can be wider than the public signature takes
-                    # positionally: a keyword-only parameter with a default is
-                    # still a placeholder, so it is still a positional value
-                    # here. The public signature cannot place it, so it is not
-                    # the one to place it -- hand the call to the generated
-                    # forward, which is written in placeholder order and is
-                    # the thing that says whether a call fits. A call that is
-                    # genuinely wrong still raises from there.
-                    return bound_implementation(*args, **kwargs)
-                bound.apply_defaults()
-                return bound_implementation(*bound.args, **bound.kwargs)
+                # Bound the same way the interpreted path binds, so that a
+                # region behaves the same whether or not it has been compiled.
+                # The compiled forward is written in the graph's placeholder
+                # order, so that is the order the values are passed on in.
+                bound_arguments = self._bind_call(args, kwargs)
+                return bound_implementation(
+                    *[
+                        bound_arguments[
+                            node.target if isinstance(node.target, str) else node.name
+                        ]
+                        for node in self.graph.placeholders
+                    ]
+                )
 
             checked_forward.__signature__ = self.signature  # type: ignore[attr-defined]
             forward = checked_forward
