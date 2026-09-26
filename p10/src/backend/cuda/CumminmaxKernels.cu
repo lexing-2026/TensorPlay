@@ -18,22 +18,24 @@ inline int64_t wrap_scan_dim(int64_t dim, int64_t ndim) {
 }
 
 
-template <typename T>
+// The direction is a template parameter rather than a kernel argument: the
+// comparison sits in the innermost loop of the shared-memory scan, where a
+// runtime flag costs a select per step.
+template <typename T, bool kIsMax>
 __device__ inline void cum_extremum_update(const T lhs, T& rhs,
-                                           int64_t lhs_idx, int64_t& rhs_idx,
-                                           bool is_max) {
+                                           int64_t lhs_idx, int64_t& rhs_idx) {
     const bool lhs_nan = reduce_value_is_nan(lhs);
     const bool rhs_nan = reduce_value_is_nan(rhs);
-    if (!rhs_nan && (lhs_nan || (is_max ? lhs > rhs : lhs < rhs))) {
+    if (!rhs_nan && (lhs_nan || (kIsMax ? lhs > rhs : lhs < rhs))) {
         rhs = lhs;
         rhs_idx = lhs_idx;
     }
 }
 
 
-template <typename T>
+template <typename T, bool kIsMax>
 __global__ void cummaxmin_scan_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
-                                      const T* in, T* vals, int64_t* idxs, bool is_max) {
+                                      const T* in, T* vals, int64_t* idxs) {
     int64_t si = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; si < n_slices; si += stride) {
@@ -50,7 +52,7 @@ __global__ void cummaxmin_scan_kernel(int64_t n_slices, int64_t d_size, int64_t 
             double cur = static_cast<double>(current);
             double b = static_cast<double>(best);
             if (cur != cur || (b == b &&
-                ((is_max && cur >= b) || (!is_max && cur <= b)))) {
+                (kIsMax ? cur >= b : cur <= b))) {
                 best = current;
                 bi = j;
             }
@@ -70,10 +72,10 @@ inline int scan_log_num_threads_x(int64_t num_rows, int64_t row_size) {
 }
 
 
-template <typename T>
+template <typename T, bool kIsMax>
 __global__ void cummaxmin_innermost_scan_kernel(
     int64_t num_rows, int64_t row_size, const T* in, T* vals, int64_t* idxs,
-    T init, bool is_max) {
+    T init) {
     alignas(sizeof(double)) extern __shared__ char buffer[];
     T* value_buffer = reinterpret_cast<T*>(buffer);
     int64_t* index_buffer = reinterpret_cast<int64_t*>(
@@ -101,8 +103,8 @@ __global__ void cummaxmin_innermost_scan_kernel(
             row_indices[threadIdx.x] = col1 < row_size ? col1 : 0;
             row_indices[blockDim.x + threadIdx.x] = col2 < row_size ? col2 : 0;
             if (row_exists && threadIdx.x == 0) {
-                cum_extremum_update(block_total, row_values[0], block_index,
-                                    row_indices[0], is_max);
+                cum_extremum_update<T, kIsMax>(block_total, row_values[0],
+                                               block_index, row_indices[0]);
             }
             __syncthreads();
 
@@ -110,8 +112,8 @@ __global__ void cummaxmin_innermost_scan_kernel(
                 const int base = (threadIdx.x / stride) * (2 * stride) + stride;
                 const int target = base + (threadIdx.x % stride);
                 const int source = base - 1;
-                cum_extremum_update(row_values[source], row_values[target],
-                                    row_indices[source], row_indices[target], is_max);
+                cum_extremum_update<T, kIsMax>(row_values[source], row_values[target],
+                                               row_indices[source], row_indices[target]);
                 __syncthreads();
             }
 
@@ -151,10 +153,10 @@ inline T cum_extremum_identity(bool is_max) {
 }
 
 
-template <typename T>
+template <typename T, bool kIsMax>
 void launch_cummaxmin_innermost(const Tensor& input, Tensor& values, Tensor& indices,
                                 int64_t num_rows, int64_t row_size,
-                                bool is_max, cudaStream_t stream) {
+                                cudaStream_t stream) {
     const int log_num_threads_x = scan_log_num_threads_x(num_rows, row_size);
     const int num_threads_x = 1 << log_num_threads_x;
     const int num_threads_y = 512 / num_threads_x;
@@ -163,9 +165,9 @@ void launch_cummaxmin_innermost(const Tensor& input, Tensor& values, Tensor& ind
     const dim3 grid(static_cast<unsigned>(std::min<int64_t>(
         (num_rows + num_threads_y - 1) / num_threads_y, 65535)));
     const size_t shared_bytes = 2 * 512 * (sizeof(T) + sizeof(int64_t));
-    cummaxmin_innermost_scan_kernel<T><<<grid, block, shared_bytes, stream>>>(
+    cummaxmin_innermost_scan_kernel<T, kIsMax><<<grid, block, shared_bytes, stream>>>(
         num_rows, row_size, input.data_ptr<T>(), values.data_ptr<T>(),
-        indices.data_ptr<int64_t>(), cum_extremum_identity<T>(is_max), is_max);
+        indices.data_ptr<int64_t>(), cum_extremum_identity<T>(kIsMax));
 }
 
 
@@ -174,8 +176,13 @@ void launch_cummaxmin_innermost(const Tensor& input, Tensor& values, Tensor& ind
                                 bool is_max, cudaStream_t stream) {
 #define TP_CUM_INNER_CASE(ctype, name_) \
     case DType::name_: \
-        launch_cummaxmin_innermost<ctype>(input, values, indices, num_rows, row_size, \
-                                          is_max, stream); \
+        if (is_max) { \
+            launch_cummaxmin_innermost<ctype, true>( \
+                input, values, indices, num_rows, row_size, stream); \
+        } else { \
+            launch_cummaxmin_innermost<ctype, false>( \
+                input, values, indices, num_rows, row_size, stream); \
+        } \
         break;
     switch (input.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_CUM_INNER_CASE)
@@ -208,9 +215,9 @@ std::tuple<Tensor, Tensor> cummax_cuda(const Tensor& self, int64_t dim) {
             dim3 grid = make_grid(slices), block(kThreads);
 #define TP_CM(ctype, name_) \
     case DType::name_: \
-        cummaxmin_scan_kernel<ctype><<<grid, block, 0, stream>>>( \
+        cummaxmin_scan_kernel<ctype, true><<<grid, block, 0, stream>>>( \
             slices, d_size, inner, sc.data_ptr<ctype>(), vals.data_ptr<ctype>(), \
-            idxs.data_ptr<int64_t>(), true); \
+            idxs.data_ptr<int64_t>()); \
         break;
         switch (sc.dtype()) {
             TENSORPLAY_FORALL_SCALAR_TYPES(TP_CM)
@@ -246,9 +253,9 @@ std::tuple<Tensor, Tensor> cummin_cuda(const Tensor& self, int64_t dim) {
             dim3 grid = make_grid(slices), block(kThreads);
 #define TP_CMIN(ctype, name_) \
     case DType::name_: \
-    cummaxmin_scan_kernel<ctype><<<grid, block, 0, stream>>>( \
+    cummaxmin_scan_kernel<ctype, false><<<grid, block, 0, stream>>>( \
             slices, d_size, inner, sc.data_ptr<ctype>(), vals.data_ptr<ctype>(), \
-            idxs.data_ptr<int64_t>(), false); \
+            idxs.data_ptr<int64_t>()); \
         break;
         switch (sc.dtype()) {
             TENSORPLAY_FORALL_SCALAR_TYPES(TP_CMIN)
