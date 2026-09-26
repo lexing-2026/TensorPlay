@@ -225,47 +225,26 @@ def _lower_stax_region(
         except (AttributeError, IndexError):
             is_cuda = False
         if is_cuda:
-            # Generating Triton kernels from this region means the loop IR:
-            # nests become loop nests, the scheduler groups them and the
-            # emitter writes the kernels.  A region that lowering cannot
-            # express falls through to the program emitter below.
-            from .loop_compile import compile_region
+            # One codegen setting, one lowering: the loop IR.  Nests become
+            # loop nests, the scheduler groups them and the emitter writes the
+            # kernels.  A region this cannot express keeps the non-Triton
+            # routes below rather than a second Triton IR.
+            from .loop_compile import NotLowerable, compile_region
 
             try:
-                loop_region = compile_region(graph_module, list(example_inputs))
-            except Exception:  # noqa: BLE001 - fall back, never fail a region
+                loop_region = compile_region(
+                    graph_module,
+                    list(example_inputs),
+                    max_autotune=max_autotune,
+                    coordinate_descent_tuning=coordinate_descent_tuning,
+                )
+            except (NotLowerable, NotImplementedError):
+                # An operator or a form this lowering does not cover: the
+                # remaining routes are the answer, and only for that reason.
                 loop_region = None
             if loop_region is not None:
                 graph_module._stax_codegen = "stax-loops"
                 return loop_region
-
-            from .codegen.triton import (
-                compile_graph_module as compile_triton_graph,
-            )
-
-            # The per-segment emitter is the source of fusion truth for the
-            # shapes it accepts: one trailing reduction per segment plus a
-            # store-time epilogue.  The row-staged kernel answers only for
-            # what that form cannot express -- a reduction whose result
-            # feeds elementwise work feeding another reduction (softmax,
-            # normalization) -- so it claims the region last.
-            try:
-                triton_graph = compile_triton_graph(
-                    graph_module,
-                    example_inputs,
-                    max_autotune=max_autotune,
-                    coordinate_descent_tuning=coordinate_descent_tuning,
-                    strict_native=strict_native,
-                )
-            except Exception:
-                # Unsupported constants or shape forms belong on the native
-                # graph path and must not abort compilation; generated-kernel
-                # build failures (toolchain, unsupported op) degrade the same
-                # way.
-                triton_graph = None
-            if triton_graph is not None:
-                graph_module._stax_codegen = "triton"
-                return triton_graph
             if use_fusion:
                 row_fused_cuda = _lower_cuda_row_fusion(
                     graph_module,

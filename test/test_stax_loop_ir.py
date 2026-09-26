@@ -15,20 +15,20 @@ from tensorplay.graph.experimental._dispatch_trace import dispatch_make_graph
 GPU = pytest.mark.skipif(not tp.cuda.is_available(), reason="CUDA is unavailable")
 
 
+def _as_tuple(value):
+    return tuple(value) if isinstance(value, (list, tuple)) else (value,)
+
+
 def _run(fn, inputs, tol=1e-4):
     graph_module = dispatch_make_graph(fn)(*inputs)
     program = compile_graph(graph_module, list(inputs))
-    got = program(*inputs)
-    want = fn(*inputs)
-    if isinstance(want, (list, tuple)):
-        for one_got, one_want in zip(got, want):
-            assert one_got.shape == one_want.shape
-            torch_free = (one_got - one_want).abs().max().item()
-            assert torch_free <= tol * max(1.0, one_want.abs().max().item()), torch_free
-    else:
-        assert got[0].shape == want.shape
-        error = (got[0] - want).abs().max().item()
-        assert error <= tol * max(1.0, want.abs().max().item()), error
+    got = _as_tuple(program(*inputs))
+    want = _as_tuple(fn(*inputs))
+    assert len(got) == len(want), (len(got), len(want))
+    for one_got, one_want in zip(got, want):
+        assert one_got.shape == one_want.shape, (one_got.shape, one_want.shape)
+        error = (one_got - one_want).abs().max().item()
+        assert error <= tol * max(1.0, one_want.abs().max().item()), error
     return got
 
 
@@ -188,7 +188,7 @@ def test_half_precision_inputs_round_trip():
 
     graph_module = dispatch_make_graph(fn)(x, y)
     program = compile_graph(graph_module, [x, y])
-    got = program(x, y)[0]
+    got = program(x, y)
     assert got.dtype == tp.float16
     error = (got.float() - fn(x, y).float()).abs().max().item()
     assert error <= 1e-2 * max(1.0, fn(x, y).float().abs().max().item()), error

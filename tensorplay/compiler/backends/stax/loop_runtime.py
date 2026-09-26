@@ -57,10 +57,16 @@ class ExternStep(Step):
     def run(self, env: dict) -> None:
         args = _resolve(self.kernel.args, env)
         kwargs = _resolve(self.kernel.kwargs, env)
-        target = self.kernel.target
-        if not callable(target) and hasattr(target, "default"):
-            target = target.default
-        result = target(*args, **kwargs)
+        if self.kernel.call_method:
+            # A method call names the operation with a string and receives the
+            # object it is called on first.
+            receiver, *rest = args
+            result = getattr(receiver, self.kernel.target)(*rest, **kwargs)
+        else:
+            target = self.kernel.target
+            if not callable(target) and hasattr(target, "default"):
+                target = target.default
+            result = target(*args, **kwargs)
         for output in self.kernel.outputs:
             env[output.name] = _dig(result, output.path)
 
@@ -137,7 +143,10 @@ class LoopProgram:
             step.run(env)
             for name in step.frees:
                 env.pop(name, None)
-        return [_output_tensor(out, env) for out in self.graph.graph_outputs]
+        results = [_output_tensor(out, env) for out in self.graph.graph_outputs]
+        if getattr(self.graph, "single_output", False) and len(results) == 1:
+            return results[0]
+        return results
 
 
 def _input_tensor(buffer: Buffer, value):

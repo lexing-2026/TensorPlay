@@ -80,6 +80,9 @@ class GraphLowering:
         self.graph_inputs: list[InputBuffer] = []
         self.constants: dict[str, Any] = {}
         self.graph_outputs: list[Any] = []
+        # A region whose output node holds one value returns that value, not a
+        # one-element sequence, so the compiled region matches its capture.
+        self.single_output = True
         self._counter = 0
         self.device = None
 
@@ -179,7 +182,14 @@ class GraphLowering:
                 return {k: realize_args(v) for k, v in value.items()}
             return value
 
-        kernel = ExternKernel(self.new_name("extern"), node.target, realize_args(args), realize_args(kwargs), node.meta.get("val"))
+        kernel = ExternKernel(
+            self.new_name("extern"),
+            node.target,
+            realize_args(args),
+            realize_args(kwargs),
+            node.meta.get("val"),
+            call_method=node.op == "call_method",
+        )
         self.operations.append(kernel)
 
         def wrap(val, path):
@@ -243,6 +253,9 @@ class GraphLowering:
             if node.op == "output":
                 outputs = node.args[0]
                 outputs = outputs if isinstance(outputs, (list, tuple)) else (outputs,)
+                # The output node wraps its arguments, so a region that yields
+                # one value still stores it in a one-element sequence.
+                self.single_output = len(outputs) == 1
                 for value in resolve(list(outputs)):
                     if isinstance(value, TensorBox):
                         self.graph_outputs.append(self.realize_input(value))
@@ -263,10 +276,15 @@ class GraphLowering:
                 continue
             args = resolve(node.args)
             kwargs = resolve(node.kwargs or {})
-            if node.target is operator.getitem:
+            name = target_name(node.target)
+            if name == "getitem":
+                # Indexing is resolved here, not called out to: a value that is
+                # already computed is addressed, not recomputed.  The spelling
+                # is matched by name because the same operation reaches the
+                # graph as more than one callable.
                 env[node] = args[0][args[1]]
                 continue
-            lowering = LOWERINGS.get(target_name(node.target))
+            lowering = LOWERINGS.get(name)
             if lowering is not None:
                 result = lowering(node, *args, **kwargs)
             else:

@@ -17,6 +17,9 @@ from .codegen.loop_triton import (
     compile_group,
     config_candidates,
 )
+
+#: What "this route cannot express this region" looks like from outside.
+NotLowerable = PlanError
 from .graph_lowering import GraphLowering
 from .kernel_scheduler import ExternNode, FusedGroup, KernelScheduler
 from .loop_runtime import ExternStep, FusedStep, LoopProgram
@@ -74,11 +77,23 @@ def compile_graph(graph_module, example_inputs, *, scheduler: KernelScheduler | 
     graph.scheduler = plan
     groups = plan.fuse()
     steps = _steps_for(graph, groups)
-    return LoopProgram(graph, steps)
+    program = LoopProgram(graph, steps)
+    # This artifact runs generated kernels, and it carries no reverse pass.
+    program._tensorplay_codegen = "triton"  # type: ignore[attr-defined]
+    program._tensorplay_backward_codegen = None  # type: ignore[attr-defined]
+    return program
 
 
 __all__ = ["compile_graph", "compile_region", "stored_names"]
 
+
+
+class NotLowerable(Exception):
+    """This region is not one the loop IR can express.
+
+    The caller keeps its other routes.  Anything else that goes wrong is a
+    bug and is left to surface, rather than being read as "unsupported".
+    """
 
 
 def _compile_half(graph_module, example_inputs):
@@ -116,7 +131,7 @@ def compile_region(module, example_inputs, **options):
     from tensorplay.autograd import Function
     from tensorplay.graph._pytree import tree_unflatten
 
-    from ..._core.aot import partition_min_cut
+    from ..._core.aot_autograd import min_cut_rematerialization_partition
     from ..._core.aot_autograd import (
         _call,
         _functionalize,
@@ -135,14 +150,22 @@ def compile_region(module, example_inputs, **options):
             return module(*flat[count:])
 
     primals = read_state() + list(example_inputs)
+    if not tensorplay.is_grad_enabled() or not any(
+        tensorplay.is_tensor(value) and value.requires_grad for value in primals
+    ):
+        # Nothing here differentiates, so there is no joint graph to split:
+        # the region is its own forward.
+        return _compile_half(module, example_inputs)
     joint, out_spec, flat_out, num_fwd, trace_primals, tangents = _trace_joint(
         flat_fn, primals, options.get("decompositions")
     )
     joint = _functionalize(
         joint, _trace_inputs(trace_primals) + [t.clone() for t in tangents]
     )
-    fw_module, bw_module, input_kinds, input_keys, saved_names = partition_min_cut(
-        joint, trace_primals + tangents, num_fwd_outputs=num_fwd
+    fw_module, bw_module, input_kinds, input_keys, saved_names = (
+        min_cut_rematerialization_partition(
+            joint, trace_primals + tangents, num_fwd_outputs=num_fwd
+        )
     )
     primal_names = [
         node.name
@@ -221,6 +244,9 @@ def compile_region(module, example_inputs, **options):
             user = (user,)
         return tree_unflatten(list(user), out_spec)
 
+    # Both halves are generated kernels, which is what the tag reports.
+    call._tensorplay_codegen = "triton"  # type: ignore[attr-defined]
+    call._tensorplay_backward_codegen = "triton"  # type: ignore[attr-defined]
     return call
 
 

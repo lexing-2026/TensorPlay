@@ -481,13 +481,29 @@ class _Group:
         """An operand at the type the operation is declared to compute in.
 
         Arithmetic runs in the wider float type of the pair, so a half input
-        is widened here instead of silently computing in half precision.
+        is widened here instead of silently computing in half precision.  A
+        literal is already exact, so it is written in the wanted type instead
+        of being converted.
         """
 
+        if value.op == "constant":
+            (number,) = value.args
+            return self.literal(number, want)
         source = self.value(value, node, dim)
         if value.dtype == want:
             return source
         return f"{source}.to({_tl_dtype(want)})"
+
+    def literal(self, number, want: str) -> str:
+        """A constant written in the type the surrounding arithmetic uses."""
+
+        if isinstance(number, bool):
+            return "True" if number else "False"
+        if isinstance(number, int) and _is_float(want):
+            return f"{number}.0" if want == "float32" else f"{number}.0"
+        if isinstance(number, int):
+            return str(number)
+        return repr(float(number))
 
     def value(self, value: Value, node: LoopNode, dim: int) -> str:
         if not isinstance(value, Value):
@@ -502,11 +518,7 @@ class _Group:
             return self.load(value, node, dim)
         if op == "constant":
             (number,) = args
-            if isinstance(number, bool):
-                return "True" if number else "False"
-            if isinstance(number, int):
-                return str(number)
-            return repr(float(number))
+            return self.literal(number, value.dtype)
         if op == "index_expr":
             return self.index(node, args[0], dim)
         if op == "to_dtype":
