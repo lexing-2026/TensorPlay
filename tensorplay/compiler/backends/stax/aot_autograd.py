@@ -28,6 +28,7 @@ from .ir import (
     _target_name,
     _traced_value,
 )
+from .loops import dtype_name, promotes_on_load
 from .lowering import _lower_native
 from .pointwise import _register_stax_cuda_pointwise_op
 
@@ -528,21 +529,15 @@ class _AotNativeGraphBuilder:
     def _deferrable_widening(self, from_dtype: Any, to_dtype: Any) -> bool:
         """Whether a conversion can ride the consumer's load-time promotion.
 
-        A program evaluates its operands at one arithmetic width and widens a
-        half-precision input after loading it, so asking such a consumer for
-        a wider value costs nothing: it is the same input, read through the
-        same buffer.  Only the two half-precision types fold into the
-        single-precision value space; every other pair is a real change of
-        storage, and a consumer that names a storage type instead of an
+        Which storage kinds a load lifts into the arithmetic width is decided
+        once, next to that width; a request is deferrable when it asks for
+        exactly the width the lift produces.  Every other pair is a real change
+        of storage, and a consumer that names a storage type instead of an
         arithmetic width has no load step to fold it into.
         """
         if from_dtype is None or to_dtype is None:
             return False
-        low = {"float16", "bfloat16"}
-        return (
-            str(from_dtype).rsplit(".", 1)[-1].lower() in low
-            and str(to_dtype).rsplit(".", 1)[-1].lower() == "float32"
-        )
+        return promotes_on_load(from_dtype) and dtype_name(to_dtype) == "float32"
 
     def _force_cast(self, symbol: _AotNativeSymbol) -> _AotNativeSymbol:
         """Give a load-widened value real storage of its declared width.

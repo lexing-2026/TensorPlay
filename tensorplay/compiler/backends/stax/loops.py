@@ -148,6 +148,17 @@ def compute_dtype(*names: str) -> str:
     return best
 
 
+#: Storage types whose value the arithmetic width lifts on load.  A consumer
+#: that declares one arithmetic type reads these through the same buffer and
+#: converts after loading, so asking it for a wider value costs no pass.
+PROMOTED_ON_LOAD = frozenset({"float16", "bfloat16"})
+
+
+def promotes_on_load(storage_dtype) -> bool:
+    """Whether a load of ``storage_dtype`` is converted to float32."""
+    return dtype_name(storage_dtype) in PROMOTED_ON_LOAD
+
+
 @dataclass(eq=False)
 class Value:
     """One node of a recorded loop body."""
@@ -379,11 +390,14 @@ class ComputedBuffer(Buffer):
 class ExternKernel(IRNode):
     """A library call: runs ``target`` on realized inputs."""
 
-    def __init__(self, name, target, args, kwargs, meta_values):
+    def __init__(self, name, target, args, kwargs, meta_values, call_method=False):
         self.name = name
         self.target = target
         self.args = args
         self.kwargs = kwargs
+        # A method call names its operation with a string and receives the
+        # object it is called on as the first argument.
+        self.call_method = call_method
         # Traced output value(s): shapes/dtypes of what the call returns.
         self.meta_values = meta_values
         self.outputs: list[ExternOutput] = []
@@ -687,7 +701,8 @@ __all__ = [
     "ExternKernel", "ExternOutput", "InputBuffer", "IRNode", "Layout",
     "LoopBody", "Loops", "Pointwise", "Reduction", "ReinterpretView", "Symbol",
     "TensorBox", "V", "Value", "View", "affine_coeff", "as_index",
-    "compute_dtype", "contiguous_strides", "dtype_name", "floordiv",
+    "PROMOTED_ON_LOAD", "compute_dtype", "contiguous_strides", "dtype_name",
+    "floordiv", "promotes_on_load",
     "free_symbols", "fresh_symbols", "iter_values", "modular_indexing", "ops",
     "pexpr", "prod", "record_body", "set_graph", "set_ops_handler",
     "simplify_index", "simplify_loops", "substitute",

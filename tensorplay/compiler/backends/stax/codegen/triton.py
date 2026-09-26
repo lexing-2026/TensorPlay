@@ -52,6 +52,7 @@ from ..ir import (
     _normalize_pointwise_grad_output,
     _target_name,
 )
+from ..loops import PROMOTED_ON_LOAD, dtype_name
 from ..pointwise import (
     _CPU_FUSED_AUTOGRAD_OPS,
     _CPU_FUSED_OPS,
@@ -783,9 +784,9 @@ class TritonProgramCodegen:
     # the load so chained arithmetic keeps full-precision intermediates, the
     # same envelope the fused interpreters and the eager kernels use.  Wide
     # storage kinds compute natively and skip the convert.
-    _PROMOTE_SOURCES = frozenset(
-        {"tensorplay.float16", "tensorplay.bfloat16"}
-    )
+    # Which storage kinds those are is decided once, next to the arithmetic
+    # width every lowering shares.
+    _PROMOTE_SOURCES = PROMOTED_ON_LOAD
 
     def _load_lines(self, use_mask: bool = True) -> list[str]:
         """Per-input load lines honouring broadcast offsets.
@@ -803,7 +804,7 @@ class TritonProgramCodegen:
             source = f"tl.load(in_ptr{index} + {address}{suffix})"
             if (
                 self.input_dtypes is not None
-                and self.input_dtypes[index] in self._PROMOTE_SOURCES
+                and dtype_name(self.input_dtypes[index]) in self._PROMOTE_SOURCES
             ):
                 return f"({source}).to(tl.float32)"
             return source
