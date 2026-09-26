@@ -3251,9 +3251,23 @@ def is_contiguous_strides_for_shape(stride: Sequence, shape: Sequence) -> bool:
 
 
 def get_align_for_dtype(dtype) -> int:
-    """The width a load of this type has to be aligned to."""
+    """The width a load of this type has to be aligned to.
 
-    return config.padding_alignment_bytes // dtype.itemsize
+    A dtype arrives here under whichever name the caller had it: the loops
+    arithmetic carries element types as names, while a tensor carries the type
+    itself.  Both say the same thing about the width, so both are read the same
+    way -- a name is looked up to get at the type and its width, and a type is
+    asked for its width directly.
+
+    A width of zero would make this a division by zero, so a type whose width
+    is not known is measured as one byte: the alignment it gets is then the
+    whole padding budget, which pads more than needed rather than crashing.
+    """
+
+    itemsize = getattr(dtype, "itemsize", None)
+    if itemsize is None:
+        itemsize = getattr(getattr(tp, str(dtype), None), "itemsize", 1)
+    return config.padding_alignment_bytes // (itemsize or 1)
 
 
 @ir_dataclass

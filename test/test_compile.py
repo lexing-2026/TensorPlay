@@ -451,8 +451,11 @@ def test_operator_coverage_table_is_honest():
     # An operator nobody has named is not covered, and saying so is the point.
     assert not coverage.is_covered("no_such_operator.default")
     assert coverage.coverage_of("conv2d.default") is coverage.Coverage.TEMPLATE
+    # Pooling backward is a reduction over the input driven by the output's
+    # windows, and it is lowered, so the table says lowered.  Naming it as
+    # covered is only allowed while that stays true.
     assert coverage.coverage_of("avg_pool2d_backward.default") is (
-        coverage.Coverage.NOT_COVERED
+        coverage.Coverage.LOWERED
     )
     assert coverage.summary(["conv2d.default", "add.default"]).get("not_covered", 0) >= 1
     names = [name for name, _ in coverage.work_list()]
