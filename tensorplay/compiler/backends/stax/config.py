@@ -776,6 +776,57 @@ class _TritonConfig:
         os.environ.get("TP_TRITON_PROTON_PER_CTA_OCCUPANCY", "1") == "1"
     )
 
+    #: Measure each pointwise launch's tuning, rather than only the tunings
+    #: of the launches that are worth the measurement.
+    autotune_pointwise = True
+
+    #: Read a position as one number per element rather than as an offset into
+    #: a flat range.  Off because a dense read is only shorter where the whole
+    #: range is read, and it is longer everywhere else.
+    dense_indexing = False
+
+    #: Do not overlap a load with the arithmetic that consumes it when the
+    #: sizes are not known until the launch runs.  On because overlapping
+    #: needs the sizes.
+    dynamic_disable_pipelining = True
+
+    #: Write a pointer's range as a 32-bit number.  Off because a buffer
+    #: larger than that addresses would be written to the wrong place.
+    emit_pointer_range_32 = (
+        os.environ.get("TP_EMIT_POINTER_RANGE_32", "1") == "1"
+    )
+
+    #: Build the descriptor for a block on the host rather than in the launch,
+    #: which takes the descriptor's construction off the critical path.
+    enable_host_side_tma = os.environ.get("TP_ENABLE_HOST_SIDE_TMA", "0") == "1"
+
+    #: Let a launch start before the one it depends on has finished, which
+    #: overlaps them.  Off because the overlap is only correct when the two
+    #: write and read in a stated order.
+    enable_pdl = os.environ.get("TP_ENABLE_PDL", "0") == "1"
+
+    #: The smallest reduction block a scan may be given, below which the scan
+    #: is not worth splitting.
+    min_split_scan_rblock = 256
+
+    #: Let a mix-order reduction use more than one stage, which shares memory
+    #: between the stages and so can run out of it.
+    mix_order_reduction_allow_multi_stages = (
+        os.environ.get("TP_MIX_ORDER_REDUCTION_ALLOW_MULTI_STAGES", "1") == "1"
+    )
+
+    #: Keep a load out of the first-level cache.  Off because a launch that
+    #: reads the same place twice wants it there.
+    skip_l1_cache = os.environ.get("TP_SKIP_L1", "0") == "1"
+
+    #: How much a tuning may spill before it is not worth using.  A launch
+    #: that spills spills on every run, so a small allowance is right.
+    spill_threshold: int = 16
+
+    #: Transpose a descriptor whose layout disagrees with the block it
+    #: describes, rather than reading the block the layout says.
+    transpose_discontiguous_tensor_descriptor = True
+
     #: How many kernels one launch may hold.  Above one, several kernels share
     #: a launch and are told apart inside it, which is worth doing when a
     #: launch's fixed cost is a large part of what it costs.
@@ -1037,3 +1088,102 @@ def patch(*args, **kwargs):
         # patches of the same setting nest the way they were written.
         for target, leaf, value in reversed(saved):
             setattr(target, leaf, value)
+
+
+# ---------------------------------------------------------------------------
+# How a launch is tuned, and what a measurement may assume
+# ---------------------------------------------------------------------------
+
+#: Keep the tunings that were measured, so a second run of the same shape
+#: tunes nothing.  On because measuring is the expensive part.
+autotune_local_cache: bool = True
+
+#: Keep the tunings where another process can read them.  Left unset, the
+#: answer is whatever the runtime's own remote cache decides, which is why it
+#: is unset rather than off.
+autotune_remote_cache: bool | None = None
+
+#: Tune each launch the first time it is seen and keep the answer, rather than
+#: tuning it again for every new shape.
+incremental_autotune: bool | None = False
+
+#: Spend the slow passes on the tuning, including for launches that are only
+#: pointwise.
+max_autotune_pointwise = os.environ.get("TP_MAX_AUTOTUNE_POINTWISE") == "1"
+
+#: Make a sum give the same answer whatever order it was computed in, and
+#: make the answer not depend on how the work was split across threads.  Off
+#: because both cost arithmetic the fast path would not otherwise do.
+batch_invariant = os.environ.get("TP_BATCH_INVARIANT") == "1"
+
+#: Measure a tuning against every direction it could move, rather than
+#: accepting the first that improves.  Off because it multiplies the number of
+#: measurements.
+coordinate_descent_check_all_directions = (
+    os.environ.get("TP_COORDINATE_DESCENT_CHECK_ALL_DIRECTIONS") == "1"
+)
+
+#: How far one tuning step may move a block size.
+coordinate_descent_search_radius = int(
+    os.environ.get("TP_COORDINATE_DESCENT_RADIUS", "1")
+)
+
+#: Widen the reduction block as the number of blocks shrinks, so a launch with
+#: few blocks still has enough work per block to be worth launching.
+dynamic_scale_rblock = os.environ.get("TP_DYNAMIC_SCALE_RBLOCK", "1") == "1"
+
+#: Write the reduction in the order that gives the same answer for a signed
+#: zero whatever order it is computed in, which is slower than the order that
+## does not.
+strict_signed_zero = False
+
+#: Let the arithmetic be reorganised freely, which lets a multiply be folded
+#: into an addition and a division become a reciprocal.  Off because the answer
+#: is then not the answer the arithmetic says.
+use_fast_math = os.environ.get("TP_USE_FAST_MATH") == "1"
+
+#: Write into the launch that a run asked for deterministic arithmetic, so
+#: that the record says the run wanted it rather than the launch assuming it.
+write_are_deterministic_algorithms_enabled = (
+    os.environ.get("TP_WRITE_ARE_DETERMINISTIC_ALGORITHMS_ENABLED", "1") == "1"
+)
+
+#: Which launches the bandwidth figures are written for, as a pattern.  Empty
+#: means every launch.
+profile_bandwidth_regex = ""
+
+#: Whether the tuning is walked by hand rather than searched.
+coordinate_descent_tuning = False
+
+#: Whether the tuning is benchmarked at all.
+benchmark_kernel = False
+
+#: Whether a launch of several kernels is benchmarked as a whole.
+benchmark_combo_kernel = False
+
+
+def is_fbcode() -> bool:
+    """Whether this build is one where the internal defaults do not apply.
+
+    The defaults are chosen for a general build.  A build with its own
+    conventions answers false here, so that the defaults stand rather than
+    being second-guessed.
+    """
+
+    return False
+
+
+class _EagerNumerics:
+    """What the arithmetic does at the edges of what a type can hold.
+
+    A value too large for its type becomes an infinity and a value too small
+    becomes a denormal, and the two are the arithmetic's business rather than
+    the hardware's.  These say whether they are written as the arithmetic
+    would do them or as the hardware happens to.
+    """
+
+    #: A denormal is written as a zero instead of being kept.
+    disable_ftz = False
+
+
+eager_numerics = _EagerNumerics()
