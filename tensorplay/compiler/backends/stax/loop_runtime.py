@@ -85,26 +85,47 @@ class ExternStep(Step):
 
         feed = _template_feed(self.kernel, args)
         launch = self._baked
-        if launch is None:
-            measured = self._bake(feed, args, kwargs)
-            launch = measured if measured is not None else self._plain_launch(args, kwargs)
-            self._baked = launch
-        result = launch(feed)
+        if launch is None and self.kernel.template is not None:
+            # A template is measured once, on the operands of the call that
+            # found it, and what it hands back is a launcher over the operands
+            # it is handed -- so the measurement pins nothing.
+            self._baked = self._bake(feed, args, kwargs)
+            launch = self._baked
+        if launch is not None:
+            result = launch(feed)
+        else:
+            # No template claimed this operator, so the call runs the operator
+            # as the framework runs it, on the operands of this call.  Holding
+            # a launcher here instead would pin one call's operands on the
+            # step, and the program reuses that step for every call it runs.
+            result = self._call_target(args, kwargs)
         for output in self.kernel.outputs:
             env[output.name] = _dig(result, output.path)
 
     def _bake(self, feed, args, kwargs):
+        """Ask the template which of its configurations fits this call."""
+
+        template = self.kernel.template
+        meta = dict(self.kernel.template_meta)
+        meta["feed"] = list(feed)
+        meta.setdefault("qualifies", True)
+        # The floor a template is measured against: it replays the call being
+        # measured, because that is the only call whose result is known to be
+        # right.  It is transient -- the measurement keeps the winner, not this.
+        plain = lambda values: self._call_target(args, kwargs)
         try:
-            return self.kernel.template.resolve(
-                self._plain_launch(args, kwargs), feed, dict(self.kernel.template_meta)
-            )
+            specs = template.out_specs(meta)
+            for params in template.configurations(specs, meta):
+                from .templates import TemplateChoice
+
+                choice = TemplateChoice(template, params, specs, meta)
+                launch = choice.resolve(plain)
+                if launch is not None:
+                    self.kernel.config = params
+                    return launch
         except Exception:  # noqa: BLE001 - a template never breaks the region
             return None
-
-    def _plain_launch(self, args, kwargs):
-        """The operator as the framework runs it: the floor a template keeps."""
-
-        return lambda values: self._call_target(args, kwargs)
+        return None
 
     def _call_target(self, args, kwargs):
         if self.kernel.call_method:
