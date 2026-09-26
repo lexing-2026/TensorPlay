@@ -20,6 +20,7 @@ set(P10_SOURCES
     src/SymFloat.cpp
     src/SizesAndStrides.cpp
     src/Stacktrace.cpp
+    src/CrashHandler.cpp
     src/TensorImpl.cpp
     src/TransformDispatch.cpp
     src/Unicode.cpp

@@ -92,10 +92,11 @@ std::string get_stacktrace() {
 
 #if defined(__linux__) || defined(__APPLE__)
 
-std::string get_stacktrace() {
-    if (!stacktrace_enabled()) {
-        return "";
-    }
+// The capture itself, with no switch on it.  The switch exists so that
+// ordinary code does not pay for symbolization nobody asked for; a process
+// that is already dying has nothing left to protect, and a trace it declines
+// to print is the one thing that cannot be recovered afterwards.
+static std::string capture_stacktrace() {
     void* frames[64];
     int n = ::backtrace(frames, 64);
     if (n <= 0) {
@@ -141,12 +142,27 @@ std::string get_stacktrace() {
     return ss.str();
 }
 
+std::string get_stacktrace() {
+    if (!stacktrace_enabled()) {
+        return "";
+    }
+    return capture_stacktrace();
+}
+
+std::string capture_stacktrace_unconditional() {
+    return capture_stacktrace();
+}
+
 #else
 
 std::string get_stacktrace() {
     if (!stacktrace_enabled()) {
         return "";
     }
+    return "Stack trace not implemented for this platform yet.";
+}
+
+std::string capture_stacktrace_unconditional() {
     return "Stack trace not implemented for this platform yet.";
 }
 

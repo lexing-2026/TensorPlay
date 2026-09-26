@@ -10,7 +10,10 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, TYPE_CHECKING
 
-from ..utils import apply_subprocess_env, clear_caches
+import tensorplay as tp
+
+from ..codecache import package_key
+from ..utils import GPU_TYPES, apply_subprocess_env, clear_caches
 
 
 if TYPE_CHECKING:
@@ -230,3 +233,31 @@ def _worker_compile_triton(
         # We can release this memory in the compile subprocesses:
         linecache.clearcache()
         return kernel, elapsed_ns // 1000
+
+
+def pre_fork_setup() -> None:
+    """Warm what a worker would otherwise have to compute for itself.
+
+    A worker that inherits an already-warm parent does not repeat work that
+    is the same for every worker: what a device is, and what the code
+    generator's own identity is.  Both are asked once here, in the parent,
+    and a worker that did not inherit them would otherwise ask again per
+    worker -- and the second one is a walk over the generator's source.
+
+    Asked before the workers exist rather than in them, which is the whole
+    point: a worker cannot answer a question that needs something only the
+    parent has.
+    """
+    for kind in GPU_TYPES:
+        device = getattr(tp, kind, None)
+        available = getattr(device, "is_available", None)
+        if available is None or not available():
+            continue
+        count = getattr(device, "device_count", None)
+        index = 0 if count is None or count() > 0 else None
+        if index is not None:
+            device.get_device_properties(index)
+
+    # The code generator's key is a walk over its source tree, which is the
+    # same answer for every worker and is not cheap.
+    package_key()

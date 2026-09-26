@@ -1,3 +1,4 @@
+#include "Stacktrace.h"
 #include "python_bindings.h"
 #include <algorithm>
 #include <queue>
@@ -644,6 +645,7 @@ PYBIND11_MODULE(_C, m) {
 
     // Config
     m.def("_show_config", &tensorplay::show_config);
+    m.def("_initCrashHandler", &tensorplay::init_crash_handler);
     m.def("_cxx_flags", &tensorplay::_cxx_flags);
     m.def("_parallel_info", &tensorplay::_parallel_info);
     m.def("_get_build_info", &tensorplay::get_build_info);
