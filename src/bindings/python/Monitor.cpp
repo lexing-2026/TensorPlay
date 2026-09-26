@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -281,6 +282,31 @@ struct WaitCounter {
     }
 };
 
+// A span of time attributed to a counter, which may never have been entered.
+// The counter is held rather than referred to, so a span can outlive the
+// expression that named it.
+struct WaitCounterTracker {
+  std::shared_ptr<WaitCounter> counter;
+  bool active = false;
+
+  explicit WaitCounterTracker(std::shared_ptr<WaitCounter> counter_)
+      : counter(std::move(counter_)) {}
+
+  void enter() {
+    if (!active) {
+      counter->enter();
+      active = true;
+    }
+  }
+
+  void exit() {
+    if (active) {
+      counter->exit();
+      active = false;
+    }
+  }
+};
+
 int64_t registerEventHandler(py::function fn) {
     auto& r = Registry::instance();
     std::lock_guard<std::mutex> guard(r.mu);
@@ -348,16 +374,39 @@ void init_monitor(py::module_& m) {
         .def("get", &Stat::get, py::call_guard<py::gil_scoped_release>())
         .def_readonly("name", &Stat::name);
 
-    py::class_<WaitCounter>(mon, "_WaitCounter")
+    // Held by shared_ptr so that a tracker can own the counter it measures.
+    // A caller usually writes `_WaitCounter(name).guard()` and keeps only the
+    // tracker, so the counter has to outlive the expression that made it.
+    py::class_<WaitCounter, std::shared_ptr<WaitCounter>>(mon, "_WaitCounter")
         .def(py::init<std::string>())
-        .def("__enter__", [](WaitCounter& self) {
-            self.enter();
-            return &self;
+        .def("__enter__", [](std::shared_ptr<WaitCounter> self) {
+            self->enter();
+            return self;
         })
         .def("__exit__",
-             [](WaitCounter& self, const py::object&, const py::object&,
-                const py::object&) {
-                 self.exit();
+             [](std::shared_ptr<WaitCounter> self, const py::object&,
+                const py::object&, const py::object&) {
+                 self->exit();
+                 return false;
+             })
+        .def(
+            "guard",
+            [](std::shared_ptr<WaitCounter> self) {
+                return WaitCounterTracker(std::move(self));
+            },
+            py::return_value_policy::take_ownership);
+
+    // Enters on first use and leaves on the first leave after that, so that a
+    // span which was never entered can still be left: a caller that gave up
+    // before the work started has nothing to record, and saying so by raising
+    // would turn an ordinary early return into a failure.
+    py::class_<WaitCounterTracker, std::shared_ptr<WaitCounterTracker>>(
+        mon, "_WaitCounterTracker")
+        .def("__enter__",
+             [](std::shared_ptr<WaitCounterTracker> self) { self->enter(); })
+        .def("__exit__",
+             [](std::shared_ptr<WaitCounterTracker> self, const py::args&) {
+                 self->exit();
                  return false;
              });
 
