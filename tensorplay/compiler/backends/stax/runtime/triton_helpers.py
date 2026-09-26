@@ -19,6 +19,8 @@ import tensorplay as tp
 
 from .triton_compat import libdevice, math, triton
 
+from .triton_compat import JITFunction
+
 
 def get_backend_options_for_target(target, options=None):
     """Every option name the backend for ``target`` recognizes."""
@@ -94,3 +96,14 @@ def try_filter_backend_options_for_target(target, options, kernel_arg_names=()):
             f"backend options must be values, not expressions: {sorted(dynamic_options)!r}"
         )
     return filtered_options
+
+def get_constexprs(kernel: JITFunction) -> list[int]:
+    """Which of a kernel's parameters were fixed when it was written.
+
+    Returned as positions rather than names, because that is what a launch needs
+    to decide: a parameter at one of these positions is not a value the caller
+    passes, whatever the launch is called and whatever order the names are
+    written in.
+    """
+
+    return [p.num for p in kernel.params if p.is_constexpr]

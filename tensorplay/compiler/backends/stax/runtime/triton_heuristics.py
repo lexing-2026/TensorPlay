@@ -17,12 +17,25 @@ from __future__ import annotations
 import dataclasses
 import enum
 import functools
+import logging
 import math
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Generic, Literal, TypeVar
 
-from ..utils import ceildiv
+from ..utils import TMA_ALIGNMENT, ceildiv, triton_version_uses_attrs_dict
 from .triton_compat import HAS_WARP_SPEC, Config
-from .runtime_utils import get_max_y_grid
+from .runtime_utils import get_first_attr, get_max_y_grid, triton_hash_to_path_key
+from .....graph.experimental.sympy_functions import OrderedSet
+
+#: What a compiled kernel is launched through: a function of the same values,
+#: written out at the point the kernel was compiled rather than assembled at
+#: each call, because assembling it per call is the cost the writing avoids.
+LauncherType = Callable[..., Any]
+
+#: What a compiled kernel is: the runtime's own compiled form, whose shape the
+#: runtime decides and which this module only carries.
+_T = TypeVar("_T")
+
+log = logging.getLogger(__name__)
 
 
 def config_to_dict(config: Config) -> dict[str, Any]:
@@ -50,7 +63,6 @@ def config_to_dict(config: Config) -> dict[str, Any]:
     return config_dict
 
 
-@dataclasses.dataclass
 class BenchmarkFailureReason(enum.Enum):
     """Why measuring one configuration of a kernel did not produce a time.
 
@@ -88,6 +100,7 @@ class NoTritonConfigsError(RuntimeError):
     """
 
 
+@dataclasses.dataclass
 class GridExpr:
     """The grid a launch runs with, worked out from the tuning it was given.
 
@@ -209,9 +222,27 @@ class GridExpr:
         if not (isinstance(grid_cls, type) and issubclass(grid_cls, GridExpr)):
             raise AssertionError(f"Expected GridExpr subclass, got {grid_cls}")
         grid = grid_cls(inductor_meta=inductor_meta, mode=mode)
-        if isinstance(cfg, dict):
-            grid.generate(cfg)
+        if isinstance(cfg, Config):
+            cfg = config_to_dict(cfg)
+        grid.generate(cfg)
         return grid
+
+    def eval_slow(self, meta: dict[str, int]):
+        """The three extents as numbers, worked out here rather than at launch.
+
+        A caller that wants to know how large the grid would be -- to decide
+        whether a shape is worth measuring, or to report what a decision cost
+        -- asks here.  The same text the launcher runs is run here, so the two
+        cannot report different sizes for the same launch.
+        """
+
+        scope = {**meta}
+        for line in self.prefix:
+            exec(line, scope)
+        exec(f"grid_0 = {self.x_grid}", scope)
+        exec(f"grid_1 = {self.y_grid}", scope)
+        exec(f"grid_2 = {self.z_grid}", scope)
+        return scope["grid_0"], scope["grid_1"], scope["grid_2"]
 
     @staticmethod
     def resolve_dict(
@@ -274,17 +305,20 @@ class PrecomputedGrid(GridExpr):
         )
 
 
+@dataclasses.dataclass
 class Grid1D(GridExpr):
     def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
         self.x_grid = self.ceildiv("xnumel", meta.get("XBLOCK"))
 
 
+@dataclasses.dataclass
 class Grid2D(GridExpr):
     def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
         self.x_grid = self.ceildiv("xnumel", meta.get("XBLOCK"))
         self.y_grid = self.ceildiv("ynumel", meta.get("YBLOCK"))
 
 
+@dataclasses.dataclass
 class Grid3D(GridExpr):
     def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
         self.x_grid = self.ceildiv("xnumel", meta.get("XBLOCK"))
@@ -292,6 +326,7 @@ class Grid3D(GridExpr):
         self.z_grid = self.ceildiv("znumel", meta.get("ZBLOCK"))
 
 
+@dataclasses.dataclass
 class BatchMatmulGrid3D(GridExpr):
     """A batched product, whose three extents arrive in the third axis first.
 
@@ -306,6 +341,7 @@ class BatchMatmulGrid3D(GridExpr):
         self.x_grid = self.ceildiv("znumel", meta.get("ZBLOCK"))
 
 
+@dataclasses.dataclass
 class Grid2DWithYZOverflow(GridExpr):
     """Two nominal axes, where the second may not fit the one it was given.
 
@@ -334,3 +370,214 @@ class Grid2DWithYZOverflow(GridExpr):
         else:
             self.y_grid = f"(y_grid_div_ == 0 ? 0 : {ceildiv_expr})"
         self.z_grid = "y_grid_div_"
+
+
+@functools.lru_cache(None)
+def _warn_host_tma_clone(name: str) -> None:
+    log.warning(
+        "host-side TMA: input %s is not %d-byte aligned; cloning it (an extra "
+        "copy per launch). Pass aligned inputs to avoid this.",
+        name,
+        TMA_ALIGNMENT,
+    )
+
+
+def _host_tma_aligned(tensor, name):
+    """A view of ``tensor`` that starts where a descriptor has to start.
+
+    A descriptor describes memory by its address, and the device requires that
+    address to be on a boundary.  A view that already is costs nothing; one that
+    is not has to be copied into memory that is, and the copy is worth saying out
+    loud once rather than paying for silently on every launch.
+    """
+
+    if tensor.data_ptr() % TMA_ALIGNMENT == 0:
+        return tensor
+    _warn_host_tma_clone(name)
+    return tensor.clone()
+
+
+def _resolve_dims(dims, cfg_kwargs, constants):
+    """The extents of a descriptor, as numbers, or nothing if one is not known.
+
+    A descriptor is described in terms of the tiling it was chosen under, so its
+    extents are only numbers once that tiling is.  An extent that cannot be
+    resolved is not guessed at: a descriptor built from a wrong extent would
+    describe memory that is not the memory the kernel reads, which is worse than
+    having no descriptor and falling back.
+    """
+
+    result = []
+    for s in dims:
+        if isinstance(s, int):
+            result.append(s)
+        elif isinstance(s, str) and s in constants:
+            result.append(int(constants[s]))
+        elif isinstance(s, str) and s in cfg_kwargs:
+            result.append(int(cfg_kwargs[s]))
+        else:
+            log.debug("host-side TMA: unresolved descriptor dim %r; skipping", s)
+            return None
+    return result
+
+
+class CompileResult(Generic[_T]):
+    """A kernel that has been compiled, together with what it was compiled for.
+
+    The compiled form on its own is not enough to launch: which tuning it was
+    compiled for decides the grid, and what the compiler folded away decides
+    which arguments the launch still passes.  So all three travel together, and
+    a launch is written from this rather than from the compiled form alone.
+
+    The launcher is written out as text and defined here rather than assembled
+    at each call, because assembling it is most of what a launch does and doing
+    it once per call is most of what a launch costs.
+    """
+
+    def __init__(self, kernel, config, compile_meta, inductor_meta):
+        self.kernel = kernel
+        self.config = config
+        self.compile_meta = compile_meta
+        self.inductor_meta = inductor_meta
+
+    def make_launcher(self) -> LauncherType: ...
+
+    def _host_tma_pre_runner_lines(self, runner_args, call_args):
+        """Build the descriptors inside the launcher, in place of the tensors.
+
+        A descriptor is made from the storage a tensor is in, and the storage has
+        to be there when the launch happens rather than before it, so this is
+        written into the launcher instead of being built by the caller.  The
+        tensor names are then replaced by the descriptors, which is why the
+        arguments come back as well as the lines.
+        """
+
+        host_tma_args = self.inductor_meta.get("host_tma_descriptor_args")
+        pre_runner_lines: list[str] = []
+        if not host_tma_args:
+            return pre_runner_lines, runner_args
+        cfg_kwargs = self.config.kwargs
+        all_constants = self.compile_meta["constants"]
+        for inner_name, desc_info in host_tma_args.items():
+            if inner_name not in call_args or not isinstance(desc_info, dict):
+                continue
+            block_shape_vals = _resolve_dims(
+                desc_info["block_shape"], cfg_kwargs, all_constants
+            )
+            shape_vals = _resolve_dims(desc_info["shape"], cfg_kwargs, all_constants)
+            stride_vals = _resolve_dims(desc_info["strides"], cfg_kwargs, all_constants)
+            if block_shape_vals is None or shape_vals is None or stride_vals is None:
+                continue
+            desc_var = f"{inner_name}_host_tma_desc"
+            aligned_var = f"{inner_name}_aligned"
+            pre_runner_lines.append(
+                f'{aligned_var} = _host_tma_aligned({inner_name}, "{inner_name}")'
+            )
+            pre_runner_lines.append(
+                f"{desc_var} = TensorDescriptor({aligned_var}, {shape_vals},"
+                f" {stride_vals}, {block_shape_vals})"
+            )
+            runner_args = [desc_var if a == inner_name else a for a in runner_args]
+        return pre_runner_lines, runner_args
+
+    def _gen_launcher_code(
+        self, scope, def_args, runner_args, pre_runner_lines=None
+    ) -> LauncherType:
+        """Write the function a launch goes through, and define it.
+
+        The grid is computed inside the launcher rather than passed to it,
+        because the grid depends on values that are not known until the launch
+        happens: a template offered against several shapes is compiled once and
+        launched once per shape, and the number of programs is a different
+        number each time.
+        """
+
+        grid = GridExpr.from_meta(self.inductor_meta, self.config)
+        lines = [
+            f"def launcher({', '.join(def_args)}, stream):",
+            *[f"    {line}" for line in grid.prefix],
+            f"    grid_0 = {grid.x_grid}",
+            f"    grid_1 = {grid.y_grid}",
+            f"    grid_2 = {grid.z_grid}",
+            *(f"    {l}" for l in (pre_runner_lines or [])),
+            f"    runner({', '.join(runner_args)})",
+        ]
+        launcher_code = "\n".join(lines)
+        exec(launcher_code, scope)
+        launcher = scope["launcher"]
+        # How many values the launcher takes is known here and is written onto
+        # it, so that a caller passing the wrong number is told without having
+        # to read the launcher back and count.
+        launcher._expected_positional_count = len(def_args)
+        return launcher
+
+    def _get_arg_lists(self, arg_names, constexprs):
+        """The names to pass, the names to accept, and the ones to drop.
+
+        Three lists rather than one, because the three answer different
+        questions: what the compiled kernel is called with, what the launcher
+        is handed, and what neither wants because the compiler folded it away.
+        A value the compiler folded is still something the caller has, so it is
+        dropped from the call rather than from the interface.
+        """
+
+        compile_meta = self.compile_meta
+        cfg = self.config
+        known_constants = OrderedSet(
+            arg for i, arg in enumerate(arg_names) if i in constexprs
+        )
+
+        # A constant of nothing is not the same as a constant of some value, and
+        # a signature that has dropped it cannot be called with it.  A name is
+        # dropped only when the compiler recorded it as nothing, it was not
+        # already known to be a constant, and the signature does not have it --
+        # anything else would drop a value the kernel still reads.
+        none_args = OrderedSet(
+            k
+            for k, v in compile_meta["constants"].items()
+            if v is None and k not in known_constants
+        )
+        none_args = none_args.difference(OrderedSet(compile_meta["signature"].keys()))
+
+        def _convert_constant(constant):
+            if isinstance(constant, str):
+                return "r'" + constant + "'"
+            else:
+                return repr(constant)
+
+        if triton_version_uses_attrs_dict():
+            call_args = arg_names
+            def_args = arg_names
+            implicit_constants = OrderedSet(
+                ("num_warps", "num_stages")
+            ).union(OrderedSet(k for k in known_constants))
+            if implicit_constants := implicit_constants & OrderedSet(
+                compile_meta["constants"].keys()
+            ):
+                # The warp and stage counts are the runtime's to read rather
+                # than the caller's to pass, so they are taken out of what the
+                # launcher accepts and put back as the values recorded for them.
+                def_args = [arg for arg in def_args if arg not in implicit_constants]
+                repl = {
+                    k: _convert_constant(compile_meta["constants"].get(k))
+                    for k in implicit_constants
+                }
+                call_args = [repl.get(arg, arg) for arg in call_args]
+        else:
+            call_args = [
+                arg
+                for i, arg in enumerate(arg_names)
+                if i not in constexprs and arg not in none_args
+            ]
+            cfg_dict = config_to_dict(cfg)
+            def_args = [
+                name
+                for name in arg_names
+                if name not in cfg_dict and name not in none_args
+            ]
+
+        if "extra_launcher_args" in self.inductor_meta:
+            def_args = [*def_args, *self.inductor_meta["extra_launcher_args"]]
+
+        return call_args, def_args, none_args
+

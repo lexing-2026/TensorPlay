@@ -1836,6 +1836,14 @@ def get_layout_symints(node) -> OrderedSet:
 #: used, so a value that is aligned to it is aligned for all of them.
 ALIGNMENT = 16
 
+#: The alignment a descriptor of device memory must start at, and the size one
+#: occupies.  Both are properties of the hardware's descriptor rather than of
+#: anything written here: a view of memory that does not start on that boundary
+#: cannot be described to the device at all, which is why a calculation of an
+#: offset has to be able to say whether it lands on one.
+TMA_ALIGNMENT = 16
+TMA_DESCRIPTOR_SIZE = 128
+
 #: The width an offset into a buffer must be a multiple of for a view of it to
 #: be addressable element by element.  Settled rather than derived: it is the
 #: width the widest vector load wants, and a wider one would rule out views that

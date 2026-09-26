@@ -101,6 +101,47 @@ def is_power_of_2(n: int) -> bool:
     return n > 0 and n & n - 1 == 0
 
 
+def get_first_attr(obj, *attrs):
+    """The first of several names that this object answers to.
+
+    A runtime renames what it calls things between versions, and a caller that
+    has to know which version it is talking about in order to read one value is
+    a caller that breaks on a version bump.  So the names are offered in order
+    and the first one present is taken; a value that is under none of them is
+    refused, because a default would be a value nobody chose.
+    """
+
+    for attr in attrs:
+        if hasattr(obj, attr):
+            return getattr(obj, attr)
+
+    raise AssertionError(f"{obj} does not has any of the attributes: {attrs}")
+
+
+def triton_hash_to_path_key(key: str) -> str:
+    """A kernel's identity, spelled the way a file may hold it.
+
+    What a hash looks like inside the runtime and what may appear in a path name
+    have not always been the same: the hash was used directly, then encoded one
+    way, then another.  So the encoding is asked of the runtime that is present
+    and a key no encoding is offered for is used as it is, which keeps a kernel
+    findable under a runtime that offers no help rather than under a name this
+    code invented.
+    """
+
+    try:
+        from triton.runtime.cache import _base64
+
+        return _base64(key)
+    except Exception:
+        try:
+            from triton.runtime.cache import _base32
+
+            return _base32(key)
+        except Exception:
+            return key
+
+
 def get_max_y_grid() -> int:
     """How many blocks the second grid axis will hold.
 
