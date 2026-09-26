@@ -311,23 +311,185 @@ class ExternChoiceCaller(ChoiceCaller):
 
     def autoheuristic_id(self) -> str:
         return "extern"
-@dataclass(frozen=True)
-class ReductionKernelInputs(KernelInputs):
-    """The operands of a reduction: one value stream, and what is kept of it.
 
-    Which kinds of reduction are available depends on what the call keeps. An
-    index reduction needs an extent to reduce over and an element type it can
-    order; a pair writes two results, so the caller has to have somewhere to
-    put both; a pair of accumulators needs at least two elements to mean
-    anything, and a single one divides by zero on the way to its own answer.
+
+class ChoiceCaller:
+    """A built choice: where its result lands, and how to run and measure it.
+
+    This is the last step of a template, and the only thing a caller needs to
+    hold afterwards: everything above it was a description of a possibility,
+    and this is the possibility that was built.
     """
 
-    extra: dict = field(default_factory=dict)
+    def __init__(
+        self,
+        name: str,
+        input_nodes: tuple = (),
+        layout: Layout | None = None,
+        description: str = "",
+    ):
+        self.name = name
+        self.input_nodes = tuple(input_nodes)
+        self.layout = layout
+        self.description = description
+        #: Set when a measurement showed this choice does not work here.
+        self.failed = False
+        #: A place for information that only the measurement needs to carry.
+        self.annotations: dict[str, Any] = {}
+        #: Geometry substitutions a measurement decided on, for the record.
+        self.config_patches: dict[str, Any] = {}
+        self._callable = None
 
-    def kinds(self) -> tuple:
-        """The reduction kinds that apply here, as kernel-side names."""
+    def bind(self, launcher: Callable[..., Any]) -> "ChoiceCaller":
+        """Attach the thing that actually runs this choice."""
 
-        available = []
-        for kind in self.extra.get("kinds") or ("value",):
-            available.append(kind)
-        return tuple(available)
+        self._callable = launcher
+        return self
+
+    def call_name(self) -> str:
+        return self.name
+
+    def to_callable(self) -> Callable[..., Any]:
+        if self._callable is None:
+            raise NotImplementedError(f"{self.name} has no kernel bound to it")
+        return self._callable
+
+    def kernel_hash_key(self) -> str:
+        """What identifies the kernel itself, for a binary cache."""
+
+        return self.hash_key()
+
+    def hash_key(self) -> str:
+        """What identifies this choice, geometry and layout included."""
+
+        parts = [self.name, self.description]
+        if self.layout is not None:
+            parts.append(repr(self.layout))
+        return ":".join(parts)
+
+    def benchmark(self, *args: Any, out: Any = None) -> float:
+        """How long one run of this choice takes."""
+
+        from ..runtime.stax_autotune import bench_launch
+
+        algo = self.to_callable()
+        operands = list(args)
+        if out is not None:
+            operands.append(out)
+        return bench_launch(algo, operands)
+
+    def info_dict(self) -> dict[str, Any]:
+        """What is worth writing down about this choice."""
+
+        return {
+            "name": self.name,
+            "description": self.description,
+            "hash_key": self.hash_key(),
+        }
+
+    def autoheuristic_id(self) -> str:
+        return "unsupported_choice"
+
+    def mark_failed(self) -> None:
+        """Record that this choice does not work here, so it is not offered."""
+
+        self.failed = True
+
+    def __repr__(self) -> str:
+        return f"ChoiceCaller({self.name}, {self.description})"
+class TritonChoiceCaller(ChoiceCaller):
+    """A choice whose kernel is emitted as source for a streaming backend.
+
+    What makes it a separate kind rather than a flag is the hash key: a kernel
+    emitted as source is recognised in a cache by the source itself, so a
+    change to the emitter invalidates every stored decision that named it,
+    with no separate version to keep in step.
+    """
+
+    def __init__(self, name, input_nodes=(), layout=None, description="",
+                 source: str = "", src_hash: str | None = None):
+        super().__init__(name, input_nodes, layout, description)
+        self.source = source
+        self._src_hash = src_hash
+
+    def hash_key(self) -> str:
+        parts = [self.name, self.description]
+        if self.layout is not None:
+            parts.append(repr(self.layout))
+        digest = self._src_hash
+        if digest is None and self.source:
+            digest = hashlib.sha1(self.source.encode()).hexdigest()[:16]
+        if digest is not None:
+            parts.append(digest)
+        return ":".join(parts)
+
+    def autoheuristic_id(self) -> str:
+        return "triton_template"
+class CutedslChoiceCaller(ChoiceCaller):
+    """A choice whose kernel is emitted for the device-side dialect.
+
+    It is a separate kind for the same reason the other two are: the kernel is
+    written in a different language, so the source that identifies it in a
+    cache is not interchangeable with the streaming dialect's, and a change to
+    one emitter must not look like a change to the other.
+    """
+
+    def __init__(self, name, input_nodes=(), layout=None, description="",
+                 source: str = "", src_hash: str | None = None):
+        super().__init__(name, input_nodes, layout, description)
+        self.source = source
+        self._src_hash = src_hash
+
+    def hash_key(self) -> str:
+        parts = [self.name, self.description]
+        if self.layout is not None:
+            parts.append(repr(self.layout))
+        digest = self._src_hash
+        if digest is None and self.source:
+            digest = hashlib.sha1(self.source.encode()).hexdigest()[:16]
+        if digest is not None:
+            parts.append(digest)
+        return ":".join(parts)
+
+    def autoheuristic_id(self) -> str:
+        return "cutedsl_template"
+def caller_for(backend: str):
+    """The caller kind that identifies a kernel emitted for this backend."""
+
+    return BACKEND_CALLERS.get(backend, TritonChoiceCaller)
+class SubgraphChoiceCaller(ChoiceCaller):
+    """A choice whose kernel is a whole region, emitted and kept as one.
+
+    The region travels with the choice because a template that fuses several
+    operations has to carry them: the graph is the thing that was chosen, so
+    dropping it would leave a caller holding a name and nothing to run.
+    """
+
+    def __init__(self, name, input_nodes=(), layout=None, description="",
+                 graph=None, decomposition=None, decomposition_kwargs=None):
+        super().__init__(name, input_nodes, layout, description)
+        self.gm = graph
+        self.decomposition = decomposition
+        self.decomposition_kwargs = dict(decomposition_kwargs or {})
+
+    def autoheuristic_id(self) -> str:
+        return "subgraph"
+class ExternChoiceCaller(ChoiceCaller):
+    """The choice that runs the operation as one library call.
+
+    There is no source to hash and no region to carry: the kernel is a name
+    the runtime already knows how to launch, which is the whole reason this
+    choice is in the list.
+    """
+
+    def __init__(self, name, input_nodes=(), layout=None, description="",
+                 launcher=None):
+        super().__init__(name, input_nodes, layout, description)
+        self.launcher = launcher
+        if launcher is not None:
+            self.bind(launcher)
+
+    def autoheuristic_id(self) -> str:
+        return "extern"
+
+

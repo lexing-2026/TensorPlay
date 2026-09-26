@@ -18,7 +18,6 @@ Each module here answers to one upstream module, and the split is the split:
   bridge        the layer only a loop region needs
   mm            products
   conv          convolutions, forward and both ways back
-  reduce        reductions
   subgraph      a region of the graph, kept as a unit
 """
 
@@ -44,7 +43,6 @@ from .conv import (
     framework_convolution,
 )
 from .mm import GEMM, GemmConfigHeuristics, GemmTemplate
-from .reduce import REDUCTION, ReductionConfigHeuristics, ReductionTemplate
 from .select import ExternKernelChoice
 from .subgraph import SubgraphTemplate
 
@@ -55,7 +53,6 @@ TEMPLATES: dict[str, KernelTemplate] = {
     DEPTHWISE_CONV.name: DEPTHWISE_CONV,
     CONV_BWD_INPUT.name: CONV_BWD_INPUT,
     CONV_BWD_WEIGHT.name: CONV_BWD_WEIGHT,
-    REDUCTION.name: REDUCTION,
 }
 
 
@@ -87,7 +84,6 @@ __all__ = [
     "CONV_TEMPLATES",
     "DEPTHWISE_CONV",
     "GEMM",
-    "REDUCTION",
     "TEMPLATES",
     "ConvBwdInputTemplate",
     "ConvBwdWeightTemplate",
@@ -101,8 +97,6 @@ __all__ = [
     "GemmTemplate",
     "KernelTemplate",
     "LoopTemplate",
-    "ReductionConfigHeuristics",
-    "ReductionTemplate",
     "SubgraphTemplate",
     "assert_uids_unique",
     "conv1x1_via_mm",
