@@ -129,6 +129,32 @@ def try_match_insignificant_strides(tensor: "IRNode", strides) -> "IRNode":
     return TensorBox(ReinterpretView(data=storage, layout=new_layout))
 
 
+def _is_static(x) -> bool:
+    """Whether a value is already known, rather than being worked out later.
+
+    A whole number written down is known wherever it appears; a symbol standing
+    for one is a question that has not been answered yet, and the two are not
+    interchangeable where a layout or a size is being written out.
+    """
+
+    return isinstance(x, (int, sympy.Integer))
+
+
+def may_convert_to_optional(value):
+    """A list of arguments as an optional one, so that an empty one is written.
+
+    An empty list and a list holding nothing are not the same thing to a caller
+    that has to decide whether to pass anything at all, so an empty list becomes
+    a one-element list holding nothing: it is written where a caller can see
+    that something was meant, and a list that already has something in it is
+    left as it is.
+    """
+
+    if isinstance(value, list) and not value:
+        return [None]
+    return value
+
+
 def is_nonfreeable_buffers(dep) -> bool:
     """Whether this buffer is one the graph did not produce and cannot reuse.
 
@@ -1764,19 +1790,29 @@ class Loops(IRNode):
             self.inner_fn(index)
         return handler.usages
 
-    def get_reads(self) -> OrderedSet:
+    def get_read_writes(self) -> "dependencies.ReadWrites":
+        """Everything this body reads, writes, and computes a position for.
+
+        Found by running the body with a handler that records what it asks for,
+        which is the only way to know what a body reads: the reads are whatever
+        the arithmetic turns out to ask for, and a body is written as arithmetic
+        rather than as a list.  A body that reduces reads a different shape of
+        thing from one that does not, because what it reads is spread over the
+        reduction rather than over the result, and the two are read differently
+        so that the same answer comes out either way.
+        """
+
         with patch.object(FlexibleLayout, "allow_indexing", True):
             if self.get_reduction_type():
                 return extract_read_writes(
                     self.make_loader(),
                     self.get_size(),
                     self.get_reduction_size(),
-                ).reads
-            else:
-                return extract_read_writes(
-                    self.make_loader(),
-                    self.get_size(),
-                ).reads
+                )
+            return extract_read_writes(self.make_loader(), self.get_size())
+
+    def get_reads(self) -> OrderedSet:
+        return self.get_read_writes().reads
 
     def get_read_names(self) -> OrderedSet:
         return OrderedSet(self.inner_fn_opcount().read_buffers)
@@ -10749,6 +10785,20 @@ class ComplexView(FallbackKernel):
             kwargs=kwargs,
             unbacked_bindings=unbacked_bindings,
         )
+
+
+def _make_out_variant_kernel_name(out_op) -> str:
+    """The fully qualified name of an operation that writes into memory given.
+
+    Which operation it is, and which of its forms, are both part of the name a
+    call is written under, so the name is built from what the operation
+    declares rather than from the object it was handed as.
+    """
+
+    ns = out_op.namespace
+    op_name = out_op._schema.name.split("::")[1]
+    overload = out_op._overloadname
+    return f"tp.ops.{ns}.{op_name}.{overload}"
 
 
 class ExternKernelMultiOut(FallbackKernel):
