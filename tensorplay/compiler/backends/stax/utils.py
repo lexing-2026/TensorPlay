@@ -2864,3 +2864,61 @@ def get_op_names(op: Any) -> tuple[str, str]:
     if isinstance(op, OpOverload):
         return (packet, overload)
     return (joined, "")
+
+
+def get_device_tflops(dtype: Any) -> float:
+    """How much arithmetic this device does in a second, for one type.
+
+    From the table of what devices do, which is the vendor's own figure and
+    not a tuning knob.  Asked rather than told, because the answer differs by
+    device and by type: half precision runs on different hardware from
+    single, and whether single runs on the tensor cores or the ordinary
+    units is a setting rather than a property.
+
+    A device the table does not name answers zero, and that is a shape this
+    answer is allowed to have rather than a failure: a roofline estimate
+    that knows the memory side and not the arithmetic side still says which
+    of the two a region is bound by, because a region that moves more than
+    it computes is bound by memory whichever way round the arithmetic is.
+    The alternative -- refusing, or measuring -- is not available here: the
+    only thing that could measure it is the kernel-writing runtime, and it
+    recognises a set of types that is not the set this project uses.
+    """
+    from .analysis.device_info import datasheet_tops
+
+    # Whether single-precision matmul goes to the tensor cores is a setting
+    # rather than a property, and a schedule that ignored it would be
+    # ordering for a machine nobody is running.
+    is_tf32 = tp.backends.cuda.matmul.allow_tf32
+    ds_tops = datasheet_tops(dtype, is_tf32=is_tf32)
+    if ds_tops is not None:
+        return ds_tops
+
+    log.warning(
+        "get_device_tflops: this device is not in the table. "
+        "Returning 0.0; roofline estimates will use memory bandwidth only."
+    )
+    return 0.0
+
+
+@functools.cache
+def get_gpu_dram_gbps() -> float:
+    """How much data this device moves in a second.
+
+    From the table, for the same reason and with the same answer as the
+    arithmetic above: a device the table does not name answers zero, and a
+    roofline estimate that knows no bandwidth is not one that can be made.
+    """
+    from .analysis.device_info import datasheet_dram_bw_gbs
+
+    ds_bw = datasheet_dram_bw_gbs()
+    if ds_bw is not None:
+        return ds_bw
+
+    log.warning(
+        "get_gpu_dram_gbps: this device is not in the table. Returning 0.0; "
+        "roofline estimates will not be available."
+    )
+    return 0.0
+
+
