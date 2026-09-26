@@ -19,6 +19,23 @@ if triton is not None:
     from triton.compiler import CompiledKernel
     from triton.runtime.jit import JITFunction, KernelInterface
 
+    def statically_launched_kernel_by_device(kernel, device_type: str = "cuda"):
+        """The form of a compiled kernel that launches from its binary alone.
+
+        A kernel compiled to a binary can be loaded onto the device once and
+        launched by calling it directly, which is a much smaller thing to carry
+        than everything the runtime keeps alongside a kernel it launches itself.
+        Whether that is available is a property of the runtime: where the
+        loader for it is not built in, there is nothing to hand back, and the
+        caller is told so rather than being given something that would fail
+        later.
+        """
+
+        raise NotImplementedError(
+            f"this runtime has no loader for a {device_type} binary, so a "
+            f"compiled kernel cannot be launched from one"
+        )
+
     #: Whether a launch can be split across producer and consumer warp groups.
     #: The scheduling knobs for it are read from the runtime's own knob table,
     #: and where that table lives has moved, so it is looked for in both places

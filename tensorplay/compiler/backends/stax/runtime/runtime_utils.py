@@ -70,6 +70,20 @@ def red_text(msg: str) -> str:
     return _color_text(msg, "red")
 
 
+def validate_triton_config(cfg) -> None:
+    """Refuse a configuration that would not survive being written down.
+
+    A configuration may carry a hook to run before the launch.  A hook is a
+    function, and a function is not written down with a configuration, so a
+    configuration carrying one would come back from a cache without it -- and
+    the launch would then differ from the one that was measured.  Rather than
+    discover that later, it is refused here.
+    """
+
+    if getattr(cfg, "pre_hook", None) is not None:
+        raise AssertionError("a configuration carrying a pre-launch hook cannot be kept")
+
+
 def triton_config_to_hashable(cfg) -> "Hashable":
     """A configuration reduced to something that can key a dictionary.
 

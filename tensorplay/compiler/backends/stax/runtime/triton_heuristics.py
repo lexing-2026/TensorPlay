@@ -14,22 +14,48 @@ launch finds the entry that is its own.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import enum
 import functools
 import logging
 import math
+import os
+import threading
 from typing import Any, Callable, Generic, Literal, TypeVar
 
-from ..utils import TMA_ALIGNMENT, ceildiv, triton_version_uses_attrs_dict
+import tensorplay as tp
+
+from ..utils import (
+    GPU_KERNEL_BIN_EXTS,
+    TMA_ALIGNMENT,
+    XPU_KERNEL_FORMAT,
+    ceildiv,
+    tlx_only_cuda_options,
+    triton_version_uses_attrs_dict,
+)
+from .hints import HeuristicType
+from ..triton_bundler import TritonBundler
+from .cache_dir_utils import triton_cache_dir
 from .triton_compat import (
+    ASTSource,
+    GPUTarget,
     HAS_WARP_SPEC,
     CompiledKernel,
     Config,
+    KernelInterface,
     knobs,
+    statically_launched_kernel_by_device,
+    triton,
 )
 from .triton_helpers import get_constexprs
-from .runtime_utils import get_first_attr, get_max_y_grid, triton_hash_to_path_key
+from .runtime_utils import (
+    get_first_attr,
+    get_max_y_grid,
+    triton_hash_to_path_key,
+    validate_triton_config,
+)
+from .coordinate_descent_tuner import CoordescTuner
 from .....graph.experimental.sympy_functions import OrderedSet
 
 #: What a compiled kernel is launched through: a function of the same values,
@@ -619,6 +645,458 @@ class CompileResult(Generic[_T]):
 
         return call_args, def_args, none_args
 
+
+class CachingAutotuner(KernelInterface):
+    """A kernel with several configurations, each compiled, the best one kept.
+
+    The configurations here are not chosen by a rule: every one of them is
+    compiled and measured, and the one that measured fastest is what a launch
+    goes through.  Nothing is invalidated when the process is restarted -- a
+    configuration that won once is written down and used without measuring
+    again -- and every configuration is compiled ahead of the first launch
+    rather than on it, so a launch is a launch and not a compile.
+
+    What is kept is the compiled form and the launcher built from it, not the
+    text: the text is what produced them, and a launch needs the two former.
+    """
+
+    def __init__(
+        self,
+        fn,
+        triton_meta,
+        configs,
+        save_cache_hook,
+        mutated_arg_names: list,
+        optimize_mem,
+        heuristic_type,
+        size_hints=None,
+        inductor_meta=None,
+        custom_kernel: bool = False,
+        filename: str | None = None,
+        reset_to_zero_arg_names: list | None = None,
+        autotune_cache_info: dict | None = None,
+    ):
+        super().__init__()
+
+        if len(configs) == 0:
+            raise AssertionError("a kernel with no configuration has nothing to run")
+        for cfg in configs:
+            validate_triton_config(cfg)
+
+        self.fn = fn
+        # The device is asked for here and named by index, because everything
+        # downstream -- where a binary is written, which target a kernel is
+        # compiled for -- wants an index rather than a description of a device.
+        self.device_props = triton_meta["device"]
+        self.triton_meta = {
+            **triton_meta,
+            "device": self.device_props.index,
+            "device_type": self.device_props.type,
+        }
+        self.inductor_meta = {} if inductor_meta is None else inductor_meta
+        # What the coordinate-descent tuner needs to know about the device it
+        # is tuning for, put where it looks.
+        self.inductor_meta["warp_size"] = self.device_props.warp_size
+        self.inductor_meta["max_threads_per_block"] = (
+            self.device_props.max_threads_per_block
+        )
+        self.deterministic_mode = self.inductor_meta.get("deterministic", False)
+
+        self.save_cache_hook = save_cache_hook
+        # Arguments this kernel writes rather than reads.  A measurement runs
+        # the kernel many times, so an argument it writes has to start from a
+        # known value or the second run is not the first run repeated.
+        self.mutated_arg_names = mutated_arg_names
+        self.reset_to_zero_arg_names = (
+            reset_to_zero_arg_names
+            if reset_to_zero_arg_names is not None
+            else mutated_arg_names
+        )
+        self.optimize_mem = optimize_mem
+        self.configs = list(configs)
+        self.heuristic_type = heuristic_type
+        self.custom_kernel = custom_kernel
+        self.autotune_cache_info = autotune_cache_info
+        self.lock = threading.Lock()
+        self.size_hints = size_hints
+        self.is_mix_order_reduction = self.inductor_meta.get("RSPLIT_SIZE") is not None
+        self.coordesc_tuner = CoordescTuner(
+            is_mm=inductor_meta.get("is_mm", False) if inductor_meta else False,
+            is_mix_order_reduction=self.is_mix_order_reduction,
+            size_hints=size_hints,
+            inductor_meta=inductor_meta,
+        )
+        self.filename = filename
+        self.kernel_hash: str | None = None
+        if filename is not None:
+            self.kernel_hash = os.path.splitext(os.path.basename(filename))[0]
+        self.precompile_time_taken_ns = 0
+        self.autotune_time_taken_ns = 0
+        self.triton_interpret = os.environ.get("TRITON_INTERPRET", "0") == "1"
+        self.is_backward = False
+        self.launchers: list = []
+        self.compile_results: list = []
+        self._cached_launcher = None
+
+    def _create_compile_meta(self, cfg) -> dict:
+        """What this configuration is compiled with, and what it is not.
+
+        The runtime is given a signature -- the name and type of every
+        argument -- and constants, which are the values fixed before the
+        kernel runs.  A configuration is mostly constants, so most of it
+        belongs there rather than among the options.  The exception is a name
+        the runtime reads as an option but which the kernel declares as a
+        constant: the warp and stage counts are such names, and when the kernel
+        declares them the value is taken from the configuration and put among
+        the constants, since a constant the kernel declares is not read as an
+        option.
+        """
+
+        compile_meta = copy.deepcopy(self.triton_meta)
+        compile_meta["num_warps"] = cfg.num_warps
+        compile_meta["num_stages"] = cfg.num_stages
+
+        cfg_kwargs = {**cfg.kwargs}
+        compile_meta["constants"].update(cfg_kwargs)
+
+        for i in get_constexprs(self.fn):
+            arg_name = self.fn.arg_names[i]
+            if arg_name not in compile_meta["constants"] and arg_name in (
+                "num_warps",
+                "num_stages",
+            ):
+                compile_meta["constants"][arg_name] = getattr(cfg, arg_name)
+        if HAS_WARP_SPEC:
+            compile_meta["num_consumer_groups"] = getattr(cfg, "num_consumer_groups", 0)
+            compile_meta["num_buffers_warp_spec"] = getattr(
+                cfg, "num_buffers_warp_spec", 0
+            )
+
+        # A descriptor written before the configuration is known names its
+        # extents rather than giving them.  Now that the configuration is
+        # known they can be said, and the signature entry for a descriptor is
+        # the shape it describes.
+        host_tma_args = self.inductor_meta.get("host_tma_descriptor_args")
+        if host_tma_args:
+            all_constants = compile_meta["constants"]
+            for key in list(compile_meta["signature"]):
+                desc_info = host_tma_args.get(key)
+                if desc_info is None or not isinstance(desc_info, dict):
+                    continue
+                block_shape_vals = _resolve_dims(
+                    desc_info["block_shape"], cfg_kwargs, all_constants
+                )
+                shape_vals = _resolve_dims(
+                    desc_info["shape"], cfg_kwargs, all_constants
+                )
+                stride_vals = _resolve_dims(
+                    desc_info["strides"], cfg_kwargs, all_constants
+                )
+                if (
+                    block_shape_vals is None
+                    or shape_vals is None
+                    or stride_vals is None
+                    or any(v <= 0 for v in block_shape_vals)
+                ):
+                    continue
+                ty = compile_meta["signature"][key]
+                if isinstance(ty, str) and ty.startswith("*"):
+                    dtype_str = ty[1:]
+                elif isinstance(ty, str) and ty.startswith("tensordesc<"):
+                    dtype_str = ty.split("<")[1].split("[")[0]
+                else:
+                    continue
+                compile_meta["signature"][key] = (
+                    f"tensordesc<{dtype_str}{list(block_shape_vals)}>"
+                )
+
+        compile_meta["debug"] = _should_enable_triton_debug_asserts(self.inductor_meta)
+        compile_meta["device_type"] = self.device_props.type
+        compile_meta["cc"] = self.device_props.cc
+
+        for k in tlx_only_cuda_options():
+            if v := getattr(cfg, k, None):
+                compile_meta[k] = v
+
+        return compile_meta
+
+    def _create_compile_options(self, cfg, compile_meta: dict) -> dict:
+        """What the runtime is told about how to compile, beyond the signature.
+
+        These are the runtime's own switches rather than the kernel's: how
+        many warps and stages, whether to check the compiled code, and the
+        handful of scheduling options that only some backends have.  A backend
+        option is passed out of band from the signature, which is why a name
+        the kernel does not declare belongs here rather than among the
+        constants.
+        """
+
+        options = {
+            "num_warps": compile_meta["num_warps"],
+            "num_stages": compile_meta["num_stages"],
+            "debug": compile_meta["debug"],
+            # The runtime's own overflow checks are off: a kernel that indexes
+            # out of range is caught by the shape guards above it, and the
+            # extra assertions cost on every launch.
+            "sanitize_overflow": False,
+        }
+        if "enable_fp_fusion" in compile_meta:
+            options["enable_fp_fusion"] = compile_meta["enable_fp_fusion"]
+        if HAS_WARP_SPEC:
+            options.update(
+                {
+                    "num_consumer_groups": compile_meta.get("num_consumer_groups", 0),
+                    "num_buffers_warp_spec": compile_meta.get(
+                        "num_buffers_warp_spec", 0
+                    ),
+                }
+            )
+        if self.device_props.type == "cuda":
+            options.update(
+                {
+                    "launch_cooperative_grid": compile_meta.get(
+                        "launch_cooperative_grid", False
+                    ),
+                    "launch_pdl": compile_meta.get("launch_pdl", False),
+                }
+            )
+            if compile_meta.get("disable_ftz", False):
+                options["enable_reflect_ftz"] = False
+            for k in tlx_only_cuda_options():
+                if v := getattr(cfg, k, None):
+                    options[k] = v
+        options.update(compile_meta.get("backend_options", {}))
+
+        if self.device_props.type == "xpu" and XPU_KERNEL_FORMAT == "zebin":
+            options["generate_native_code"] = True
+
+        return options
+
+    def _precompile_config(self, cfg, *, cc_override=None):
+        """Compile one configuration now, and keep what it compiled to."""
+
+        from .triton_helpers import set_driver_to_gpu
+
+        compile_meta = self._create_compile_meta(cfg)
+        if cc_override is not None:
+            compile_meta["cc"] = cc_override
+
+        if not ASTSource:
+            raise RuntimeError("the kernel-writing runtime is too old to compile with")
+
+        set_driver_to_gpu()
+
+        # Where the signature names a type, and where it names a constant
+        # instead, are the two halves of what the runtime is told: a type says
+        # how to read an argument, a constant says the argument is not read.
+        compile_args = (
+            ASTSource(
+                self.fn,
+                compile_meta["signature"],
+                compile_meta["constants"],
+            ),
+        )
+
+        target = GPUTarget(
+            compile_meta["device_type"],
+            compile_meta["cc"],
+            self.device_props.warp_size_or_default,
+        )
+        options = self._create_compile_options(cfg, compile_meta)
+        compile_kwargs = {"target": target, "options": options}
+
+        try:
+            binary = triton.compile(*compile_args, **compile_kwargs)
+        except Exception:
+            log.exception(
+                "could not compile %s\n%s\nmetadata: %s",
+                self.inductor_meta.get("kernel_name", "triton_"),
+                self.fn.src,
+                compile_meta,
+            )
+            raise
+
+        TritonBundler.put(
+            triton_hash_to_path_key(binary.hash),
+            int(self.triton_meta.get("device", 0)),
+        )
+        static_launcher = StaticTritonCompileResult.can_statically_launch(
+            binary, self.inductor_meta, self.triton_meta, self.heuristic_type
+        )
+        if static_launcher is not None:
+            return StaticTritonCompileResult(
+                static_launcher, cfg, compile_meta, self.inductor_meta
+            )
+        return TritonCompileResult(binary, cfg, compile_meta, self.inductor_meta)
+
+    def make_launcher(self):
+        """Write the launcher, with the binary already loaded onto the device."""
+
+        if not self.kernel.cubin_path:
+            self.reload_cubin_path()
+        # A kernel compiled without naming a device is the same binary for
+        # every device, so the loaded handles are kept per device rather than
+        # once.
+        self.kernel.device_agnostic = self.compile_meta.get("device") is None
+        device = _resolve_load_device(
+            self.compile_meta.get("device"),
+            self.compile_meta.get("device_type", "cuda"),
+        )
+        self.kernel.load_kernel(device)
+        scope = {"runner": self.kernel.run}
+
+        # A kernel has two kinds of constant: the ones it declares, and the
+        # ones the compiler finds constant on its own, such as an argument it
+        # never reads.  The binary has both folded away, so neither is passed
+        # -- and which arguments the runtime hands over depends on the version
+        # it is, so they are worked out the same way the ordinary result works
+        # them out, and the ones to pass are then chosen here.
+        _, def_args, none_args = self._get_arg_lists(
+            self.kernel.arg_names, self.kernel.declared_constexprs
+        )
+        call_args = [
+            arg
+            for i, arg in enumerate(self.kernel.arg_names)
+            if i not in self.kernel.full_constexprs and arg not in none_args
+        ]
+
+        runner_args = ["grid_0", "grid_1", "grid_2", "stream", *call_args]
+        pre_runner_lines, runner_args = self._host_tma_pre_runner_lines(
+            runner_args, call_args
+        )
+        launcher = self._gen_launcher_code(
+            scope, def_args, runner_args, pre_runner_lines=pre_runner_lines
+        )
+        launcher.config = self.config
+        launcher.n_regs = self.kernel.n_regs
+        launcher.n_spills = self.kernel.n_spills
+        launcher.shared = self.kernel.shared
+        launcher.cache_hash = triton_hash_to_path_key(self.kernel.hash)
+        launcher.store_cubin = False
+        launcher._is_static = True
+        return launcher
+
+
+class CannotStaticallyLaunchKernel(Exception):
+    """Why a compiled kernel cannot be launched from its binary alone."""
+
+
+class StaticTritonCompileResult(CompileResult[_T]):
+    """A compiled kernel launched from the binary already on disk.
+
+    A compiled kernel can normally be launched through the runtime, which
+    keeps what the launch needs alongside it.  Launched from the binary
+    instead, the kernel is loaded onto the device once and the launch becomes
+    a call with the arguments the binary expects -- and the setup that call
+    needs is far smaller, because none of the compile-time state travels with
+    it.
+
+    Whether a given kernel can be launched this way is asked rather than
+    assumed: several things can make it impossible, and each of them raises
+    :class:`CannotStaticallyLaunchKernel` naming which.  The question is asked
+    only when static launching is switched on, since a kernel that cannot be
+    launched this way is still perfectly launchable the ordinary way.
+    """
+
+    @staticmethod
+    def can_statically_launch(kernel, inductor_meta, triton_meta, heuristic_type):
+        """The form of this kernel that launches from its binary, if there is one."""
+
+        from .. import config
+
+        if not config.use_static_triton_launcher:
+            return None
+
+        def check_can_launch():
+            if triton_meta.get("device_type") not in ("cuda", "xpu", "hip"):
+                raise CannotStaticallyLaunchKernel("not a device that loads a binary")
+
+            if triton_meta.get("device_type") == "xpu" and XPU_KERNEL_FORMAT == "spv":
+                raise CannotStaticallyLaunchKernel(
+                    "the host device takes its kernels in a form that cannot be "
+                    "launched this way"
+                )
+
+            if config.cpp_wrapper:
+                # A wrapper is written and compiled for this call anyway, so
+                # there is nothing left for this to save.
+                raise CannotStaticallyLaunchKernel("the wrapper is written out")
+
+            if (
+                heuristic_type == HeuristicType.USER_AUTOTUNE
+                and not config.static_launch_user_defined_triton_kernels
+            ):
+                raise CannotStaticallyLaunchKernel("a user-written kernel")
+
+            if inductor_meta.get("store_cubin"):
+                # The whole binary has to be kept, which is what this avoids.
+                raise CannotStaticallyLaunchKernel("the binary is being kept")
+
+            if getattr(kernel.metadata, "launch_pdl", False) or getattr(
+                kernel.metadata, "launch_cooperative_grid", False
+            ):
+                raise CannotStaticallyLaunchKernel(
+                    "the launch carries attributes this does not pass"
+                )
+
+            device_type = triton_meta.get("device_type")
+            binary_ext = GPU_KERNEL_BIN_EXTS.get(device_type, ".cubin")
+            cubin_location = os.path.join(
+                triton_cache_dir(int(triton_meta.get("device", 0))),
+                triton_hash_to_path_key(kernel.hash),
+                f"{kernel.src.fn.__name__}{binary_ext}",
+            )
+            if not os.path.exists(cubin_location):
+                raise CannotStaticallyLaunchKernel(
+                    f"the binary is not where it was left: {cubin_location}"
+                )
+            kernel._cubin_path = cubin_location
+
+            try:
+                return statically_launched_kernel_by_device(kernel, device_type)
+            except NotImplementedError as e:
+                raise CannotStaticallyLaunchKernel(f"not implemented: {e}") from e
+
+        try:
+            return check_can_launch()
+        except CannotStaticallyLaunchKernel as e:
+            log.info("cannot launch %s statically: %s", kernel, e)
+            return None
+        except Exception:
+            log.info(
+                "cannot launch %s statically", kernel, exc_info=True
+            )
+            return None
+
+    def reload_cubin_path(self):
+        """Point the kernel at its binary, putting it back if it was only held.
+
+        A binary that travelled inside a cache entry is held as bytes rather
+        than left on disk, so a kernel read back from one has to be written
+        out again before it can be loaded.  A binary that is neither on disk
+        nor in hand is a cache entry that cannot be used, and saying so is
+        better than launching nothing.
+        """
+
+        device_type = (
+            "hip" if tp.version.hip else self.compile_meta.get("device_type", "cuda")
+        )
+        binary_ext = GPU_KERNEL_BIN_EXTS.get(device_type, "cubin")
+        cubin_location = os.path.join(
+            triton_cache_dir(
+                _resolve_load_device(self.compile_meta.get("device"), device_type)
+            ),
+            triton_hash_to_path_key(self.kernel.hash),
+            f"{self.kernel.name}{binary_ext}",
+        )
+        if not os.path.exists(cubin_location):
+            if self.kernel.cubin_raw is not None:
+                self.kernel.reload_cubin_from_raw(cubin_location)
+            else:
+                raise RuntimeError(
+                    "the binary the entry referred to is not at %s", cubin_location
+                )
+        self.kernel.cubin_path = cubin_location
 
 class TritonCompileResult(CompileResult[CompiledKernel]):
     """
