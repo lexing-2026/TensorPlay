@@ -17,7 +17,9 @@ twice.
 
 from __future__ import annotations
 
+import collections
 import dataclasses
+import itertools
 import re
 import sympy
 from typing import Any
@@ -32,7 +34,7 @@ from .....graph.experimental.sympy_functions import (
 )
 from .. import config
 from ..shape_propagation import get_broadcasted_shape
-from .common import CSEVariable
+from .common import CSE, CSEVariable
 from ..utils import IndentedBuffer
 
 
@@ -634,3 +636,149 @@ class BlockPtrOptions(BlockDescriptorOptions):
             - self.replace_offset(offset, sympy.S.Zero, symt)
             for offset in self.params.offsets
         ]
+
+
+@dataclasses.dataclass
+class FixedTritonConfig:
+    """Block sizes that were settled in advance and are not chosen again.
+
+    A launch whose tuning was given rather than searched has its block sizes
+    already decided, and the emitter has to measure its blocks against those
+    rather than against whatever would be convenient.  So the given sizes are
+    held as a mapping that can be read by name, and a name that was never given
+    is absent rather than defaulted -- defaulting it would quietly measure
+    against a size the launch will not use.
+    """
+
+    config: dict
+
+    def __getitem__(self, item):
+        return self.config[item]
+
+    def __contains__(self, item):
+        return item in self.config
+
+
+@dataclasses.dataclass
+class TritonOpTraceEntry:
+    """One operation a launch performed, recorded for tracing.
+
+    Which operation, what it was given and what it produced.  The arguments are
+    held as a pair rather than a mapping so that a call written with the same
+    argument twice reads the same way here as it did at the call.
+    """
+
+    name: str
+    args: tuple
+    kwargs: tuple
+    result: object
+
+
+class HelperFunctions:
+    """The helper functions a launch defines for itself, in the order defined.
+
+    A launch often needs a function of its own -- a reduction written out, a
+    comparison against a bound.  Each is defined once and named, and the same
+    text asked for twice is one function rather than two, because a launch that
+    defined both would carry the body twice and the runtime would compile both.
+
+    The order is kept because a launch's helpers may call each other, and a
+    function has to be defined before it is called.
+    """
+
+    _templates_seen: dict
+    finalized_helpers: list
+
+    def __init__(self) -> None:
+        self._templates_seen = {}
+        self.finalized_helpers = []
+
+    def add(self, template_code: str, *, base_name: str = "_triton_helper_fn") -> str:
+        """Define a helper from text whose name is left to be filled in.
+
+        The text is a function definition with the name written as a format
+        specifier.  The name given is the nth helper, so two different bodies
+        get two different names, and the same body asked for twice gets the
+        name it already has.
+        """
+
+        existing_name = self._templates_seen.get(template_code)
+        if existing_name is not None:
+            return existing_name
+
+        name = f"{base_name}{len(self.finalized_helpers)}"
+        self._templates_seen[template_code] = name
+        self.finalized_helpers.append(template_code.format(name=name))
+        return name
+
+    def __iter__(self):
+        return iter(self.finalized_helpers)
+
+    def __getitem__(self, idx):
+        return self.finalized_helpers[idx]
+
+
+#: What a value held for reuse is filed under.  A plain name, unless the read
+#: it came from was written under a guard, in which case the guard is part of
+#: the name: the same arithmetic under two different guards is two different
+#: values, and reusing one for the other would drop a guard.
+TritonCSEKey = "str | tuple[str, str]"
+
+#: The dimensions a read's index was split along, innermost last.  A read of a
+#: discontiguous value is written as a read of each contiguous run in it, and
+#: the runs are the bases a later read of the same value may reuse.
+LoadIndexBasis = "tuple[IterationRangesEntry, ...]"
+LoadIndexBases = "tuple[LoadIndexBasis | None, ...]"
+
+
+@dataclasses.dataclass(frozen=True)
+class _UnresolvedLoadIndexState:
+    """The first live read of a value, recorded without analysing the ranges.
+
+    Whether a read's result can be reused is a question about the ranges, and
+    answering it costs more than the read does.  So the first read of a value
+    is recorded as it stands, and a later read of the same value is what
+    decides whether the first one's answer can be reused.
+    """
+
+    index: sympy.Expr
+    result: sympy.Expr
+
+
+@dataclasses.dataclass(frozen=True)
+class _ResolvedLoadIndexState:
+    """A read's result, together with the split bases a later read may reuse."""
+
+    index: sympy.Expr
+    result: sympy.Expr
+    bases: LoadIndexBases
+
+
+LoadIndexState = "_UnresolvedLoadIndexState | _ResolvedLoadIndexState"
+
+
+class TritonCSE(CSE):
+    """Reuse of values, keyed so that a value is not reused across guards.
+
+    The shared machinery files a value under the text it was computed from, so
+    the same arithmetic computed twice is computed once.  That is right for
+    arithmetic and wrong for a read: a read is written under whatever guard
+    covers the positions it covers, so the same text under two guards reads
+    two different things and one of them would be wrong.  So the guard is part
+    of the name.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._load_index_states: dict = {}
+
+    def invalidate(self, keep_vars) -> None:
+        super().invalidate(keep_vars)
+        self._load_index_states.clear()
+
+    def augment_key(self, cache_key: str):
+        from ..loops import V
+
+        if mask := getattr(V.kernel, "_load_mask", None):
+            return (cache_key, mask.name)
+        return cache_key
