@@ -155,6 +155,21 @@ def stax(
         return compiled
     return wrapped
 
+def _publish_codegen(compiled, tag: str, *, backward: bool) -> None:
+    """Report on the artifact itself which route produced it.
+
+    One place, so every route's answer is visible the same way, and a caller
+    can tell a compiled region from an interpreted one without knowing which
+    route claimed it.
+    """
+
+    try:
+        compiled._tensorplay_codegen = tag  # type: ignore[attr-defined]
+        compiled._tensorplay_backward_codegen = tag if backward else None  # type: ignore[attr-defined]
+    except AttributeError:  # noqa: BLE001 - an artifact that cannot carry it
+        pass
+
+
 def _keep_native_graph(graph_module, compiled):
     """Publish the native graph a region lowered to, when it built one."""
 
@@ -199,11 +214,17 @@ def _lower_stax_region(
 
     routes = []
 
-    def route(tag, enabled, build):
-        """Register one lowering: it answers whether it claims the region."""
+    def route(tag, enabled, build, codegen=None):
+        """Register one lowering: it answers whether it claims the region.
+
+        ``tag`` names the route, which is an internal identity.  ``codegen``
+        names what the region ends up running -- generated kernels, a native
+        graph, the interpreted executor -- and is what the artifact reports,
+        because that is the part a caller can act on.
+        """
 
         if enabled:
-            routes.append((tag, build))
+            routes.append((tag, build, codegen or tag))
 
     if use_native and use_fusion:
         route(
@@ -286,7 +307,7 @@ def _lower_stax_region(
                     )
                 return None
 
-        route("stax-loops", on_cuda, build_loop_region)
+        route("stax-loops", on_cuda, build_loop_region, codegen="triton")
         route(
             "stax-fused-cuda-rowfuse",
             use_fusion,
@@ -343,11 +364,12 @@ def _lower_stax_region(
         ),
     )
 
-    for tag, build in routes:
+    for tag, build, codegen in routes:
         compiled = build()
         if compiled is None:
             continue
         graph_module._stax_codegen = tag
+        _publish_codegen(compiled, codegen, backward=training)
         return compiled
     if strict and training and any(
         getattr(graph_module._get_attr(node.target), "requires_grad", False)

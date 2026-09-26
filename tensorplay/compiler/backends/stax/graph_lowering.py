@@ -18,6 +18,7 @@ from .loops import (
     ComputedBuffer,
     ConstantBuffer,
     DeferredOps,
+    dtype_name,
     ExternKernel,
     ExternOutput,
     InputBuffer,
@@ -197,30 +198,45 @@ class GraphLowering:
         return template_for(_TEMPLATE_OPERATORS[name])
 
     def _template_meta(self, node, realized_args):
-        """What the template needs to know about this call's operands.
+        """What the template needs to know about this call.
 
-        The tuner reads its operands as positions in a feed list, so which
-        argument is which operand is recorded here, once, where the operation
-        is lowered.
+        The template owns its result and its validity, so what is recorded here
+        is the call's operands and the properties a configuration is matched
+        against -- not an inferred output.
         """
 
         name = target_name(node.target)
-        tensors = [a for a in realized_args if isinstance(a, Buffer)]
         out_val = node.meta.get("val")
-        out_shape = tuple(int(s) for s in out_val.shape) if _is_tensor(out_val) else ()
-        meta: dict[str, Any] = {"out_shape": out_shape}
-        if name == _LINEAR_OPERATOR:
-            # A linear layer's weight arrives as (out, in); the template reads
-            # the operand pair the other way round.
-            meta["b_transposed"] = True
-            meta["operand_specs"] = ((0, None), (1, None))
-            if len(tensors) > 2:
-                meta["bias_spec"] = (2, None)
-        else:
-            meta["operand_specs"] = ((0, None), (1, None))
-        meta["operand_positions"] = tuple(
-            i for i, a in enumerate(realized_args) if isinstance(a, Buffer)
+        meta: dict[str, Any] = {
+            "operator": name,
+            "out_size": tuple(int(s) for s in out_val.shape) if _is_tensor(out_val) else (),
+            "out_dtype": getattr(out_val, "dtype", None),
+            "device": getattr(out_val, "device", None),
+            "requires_grad": bool(getattr(out_val, "requires_grad", False)),
+            "operand_positions": tuple(
+                i for i, a in enumerate(realized_args) if isinstance(a, Buffer)
+            ),
+        }
+        operands = [
+            realized_args[i]
+            for i in meta["operand_positions"]
+            if i < len(realized_args)
+        ]
+        if operands:
+            first = operands[0]
+            meta["operand_dtype"] = dtype_name(first.get_dtype())
+            meta["operand_sizes"] = tuple(
+                tuple(int(s) for s in buffer.get_size()) for buffer in operands
+            )
+        # Which feed position holds which operand, and whether the second one
+        # arrives the way a linear layer's weight does.
+        meta["operand_specs"] = tuple(
+            (position, None) for position in range(len(operands))
         )
+        if name == _LINEAR_OPERATOR:
+            meta["b_transposed"] = True
+        if len(operands) > 2:
+            meta["bias_spec"] = (2, None)
         return meta
 
     def make_extern(self, node, args, kwargs):
