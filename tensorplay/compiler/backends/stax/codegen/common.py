@@ -2685,7 +2685,7 @@ pointwise_overrides_data: dict = dict(
         type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
         cpp=lambda x, y: f"({x}) * ({y})",  # C++ doesn't need special handling
         triton=lambda x, y: f"({x}) * ({y})"
-        if torch.version.hip
+        if tp.version.hip
         else f"libdevice.mul_rn({x}, {y})",
         name="mul_rn",
     ),
@@ -3222,7 +3222,7 @@ class TMADescriptorArg:
     name: str
     api_type: str  # "experimental" or "stable"
     block_shape: list[sympy.Expr] | None  # only needed for "stable"
-    dtype: torch.dtype | None  # only needed for "stable"
+    dtype: tp.dtype | None  # only needed for "stable"
 
 
 #: What a launch may be handed.  Every case is a value the launch's own

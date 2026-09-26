@@ -4,6 +4,8 @@ from collections.abc import Callable
 from typing import Any
 
 import tensorplay as tp
+
+from tensorplay.utils._dispatch import _disable_current_modes
 from tensorplay.utils import _pytree as pytree
 from .freezing_utils import maybe_set_is_frozen_param
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
@@ -242,23 +244,12 @@ class ConstantFolder(Any):
 
         # All mutations should either be removed or on inputs which we did not
         # make constant. A mutation is recognised by its target being a
-        # registered operator rather than one of the higher-order forms, and
-        # there is no tag on an operator here that says a seeded operation is
-        # not reproducible, so nothing is excluded on that account.
-        if node.op == "call_function" and isinstance(
-            node.target, tp._ops.HigherOrderOperator
-        ):
-            return self.unknown_value
-
+        # registered operator. There is no tag on an operator here that says a
+        # seeded operation is not reproducible, and no higher-order operator
+        # form to recognise, so nothing further is excluded on that account.
         out = self._deduce_value(node)
 
-        if isinstance(
-            out,
-            (
-                Any,
-                torch._library.fake_class_registry.FakeScriptObject,
-            ),
-        ):
+        if isinstance(out, Any):
             return out
 
         if out is self.unknown_value:
@@ -322,7 +313,7 @@ def constant_fold(
     gm: Any,
     constraint_fn: Callable[[Any], bool] | None = None,
 ) -> None:
-    with torch.utils._python_dispatch._disable_current_modes():
+    with _disable_current_modes():
         cf = ConstantFolder(gm, skip_constructors=True)
         cf.run()
 
@@ -352,7 +343,7 @@ def constant_graph_tag(
     lifted_constant_names: list[str] | None = None,
     skip_folding_node_fn: Callable[[Any], bool] | None = None,
 ) -> None:
-    with torch.utils._python_dispatch._disable_current_modes():
+    with _disable_current_modes():
         cf = ConstantFolder(
             gm,
             skip_constructors=skip_constructors,

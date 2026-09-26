@@ -1231,7 +1231,7 @@ class align(sympy.Function):
             return value
 
 
-def convert_to_symint(i: int | sympy.Expr) -> int | torch.SymInt:
+def convert_to_symint(i: int | sympy.Expr) -> int | tp.SymInt:
     """
     Like convert_shape_to_symint, but operates on a single expression.
     """
@@ -1339,7 +1339,7 @@ def triton_version_uses_attrs_dict() -> bool:
 
 
 def is_codegen_graph_partition_subgraph(wrapper: PythonWrapperCodegen) -> bool:
-    from torch._inductor.codegen.wrapper import SubgraphPythonWrapperCodegen
+    from .codegen.wrapper import SubgraphPythonWrapperCodegen
 
     return (
         isinstance(wrapper, SubgraphPythonWrapperCodegen)
@@ -1349,9 +1349,9 @@ def is_codegen_graph_partition_subgraph(wrapper: PythonWrapperCodegen) -> bool:
 
 def is_using_cudagraph_partition() -> bool:
     return (
-        torch._inductor.config.triton.cudagraphs
+        config.triton.cudagraphs
         or _unstable_customized_partition_wrapper.wrapper is not None
-    ) and torch._inductor.config.graph_partition
+    ) and config.graph_partition
 
 
 #: Caches registered for clearing when the process decides the cached answers
@@ -1372,7 +1372,7 @@ def clear_on_fresh_cache(obj: Any) -> Any:
     return obj
 
 
-def _type_of(key: torch.dtype | None) -> str:
+def _type_of(key: tp.dtype | None) -> str:
     # Use the function here to get rid of dependencies on the Triton during the codegen.
     # Refer to Triton implementation here:
     # https://github.com/triton-lang/triton/blob/98b5945d2aef679e00ebca8e07c35c3658ec76de/python/triton/runtime/jit.py#L238
@@ -1421,7 +1421,7 @@ def expr_fits_within_32bit(e: sympy.Expr) -> bool:
     """
     from .loops import V
 
-    int_max = torch.iinfo(torch.int32).max
+    int_max = tp.iinfo(tp.int32).max
     guarding_hint_or_throw = V.graph.sizevars.guarding_hint_or_throw
     has_guarding_hint = V.graph.sizevars.shape_env.has_guarding_hint
 
@@ -1457,10 +1457,10 @@ def expr_fits_within_32bit(e: sympy.Expr) -> bool:
     return has_guarding_hint(e) and guarding_hint_or_throw(e) <= int_max
 
 
-def device_supports_fp64(device: torch.device | None) -> bool:
+def device_supports_fp64(device: tp.device | None) -> bool:
     """Check if the given device supports float64."""
     if device is not None and device.type == "xpu":
-        return torch.xpu.get_device_properties(device).has_fp64
+        return tp.cuda.get_device_properties(device).has_fp64
     return True
 
 

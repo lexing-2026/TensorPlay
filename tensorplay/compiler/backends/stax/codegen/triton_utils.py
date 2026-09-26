@@ -76,7 +76,7 @@ def use_uint8_triton_storage_for_cuda_float8_e4m3fn(
 ) -> bool:
     # Triton rejects fp8e4nv pointer types before sm89, but eager CUDA can
     # still dequantize float8_e4m3fn values by treating storage as raw bytes.
-    if dtype != tp.float8_e4m3fn or torch.version.hip is not None:
+    if dtype != tp.float8_e4m3fn or tp.version.hip is not None:
         return False
     if arg_name is not None and not arg_name.startswith("in_ptr"):
         return False
@@ -161,7 +161,7 @@ def signature_of(
             return "i64"
         elif size_dtype is None:
             # no hint: we'll see if we know that this is a 32-bit int, and guard if possible.
-            int_max = torch.iinfo(tp.int32).max
+            int_max = tp.iinfo(tp.int32).max
             if expr_fits_within_32bit(arg.expr):
                 V.graph.sizevars.check_leq(arg.expr, int_max)
                 return "i32"
@@ -230,7 +230,7 @@ def signature_to_meta(
     def _decide_tl_dtype(arg):
         # Even if the ks0 symbol itself is within tl.int32 range, it's
         # risky to use tl.int32 dtype since we may have ks0*ks1 later
-        # for kernels like torch.mean when dynamic shape is enabled.
+        # for kernels like a mean when theic shape is enabled.
         #
         # Block pointers do not support 64-bit indexing, so keep ks indices in
         # tl.int32 whenever the (deprecated) block-pointer path is actually
@@ -420,7 +420,7 @@ def config_of(
     # can use 32-bit pointer offsets and emit buffer load/store ops.
     if pointer_range_override is not None:
         pointer_range_32 = pointer_range_override
-    elif torch.version.hip is not None:
+    elif tp.version.hip is not None:
         pointer_range_32 = tuple(
             i
             for i, arg in zip(indices, args)

@@ -36,8 +36,8 @@ def _print_debugging_tensor_value_info(msg, arg):
     print("Size: ", arg.size())
     print("Dtype: ", arg.dtype)
     arg_f = arg.float()
-    std, mean = torch.std_mean(arg_f)
-    amin, amax = torch.aminmax(arg_f)
+    std, mean = tp.std_mean(arg_f)
+    amin, amax = tp.aminmax(arg_f)
     print("Mean: ", mean.item())
     print("Min: ", amin.item())
     print("Max: ", amax.item())
@@ -226,7 +226,7 @@ class DebugPrinterManager:
                     kernel_name,
                     saved_path,
                 )
-                line = f"torch.save({arg}, '{saved_path}')"
+                line = f"tp.save({arg}, '{saved_path}')"
                 V.graph.wrapper_code.writeline(line)
 
     def codegen_intermediate_tensor_value_print(

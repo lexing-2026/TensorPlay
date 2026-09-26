@@ -81,7 +81,7 @@ from .op_lowerings import select_decomp_table
 
 
 log = logging.getLogger(__name__)
-aten = tp.ops.aten
+operator_set = tp.ops.aten
 prims = tp.ops.prims
 
 Constant = Any
@@ -825,7 +825,7 @@ class _TargetExpr(PatternExpr):
 
         if len(self.fns) > 1:
             return f"[{first_repr}, ...]"
-        elif self.fns[0] is getattr(torch, first_repr, None):
+        elif self.fns[0] is getattr(tp, first_repr, None):
             return f"tp.{first_repr}"
         elif self.fns[0] is getattr(operator, first_repr, None):
             return f"operator.{first_repr}"
@@ -2118,7 +2118,7 @@ def _serialize_pattern(
             import operator
             import tensorplay
 
-            aten = tp.ops.aten
+            operator_set = tp.ops.aten
             prims = tp.ops.prims
 
             """

@@ -3320,15 +3320,14 @@ class PythonWrapperCodegen(CodeGen):
                 if isinstance(value, ir.TorchBindObject):
                     output.writeline(f"{name} = None")
                 elif isinstance(value, sympy.Expr):  # Don't need to add symbolic
-                    # TODO: this fallback and those below actually will generate possibly
-                    # invalid benchmark code, because it's not guaranteed 42
-                    # is actually a valid value for the kernel in question.
-                    # See https://github.com/pytorch/pytorch/issues/124686
+                    # The fallback and those below can produce benchmark code
+                    # that would not run, because the fallback is not
+                    # guaranteed to be a value the kernel in question accepts.
                     add_expr_input(
                         name, V.graph.sizevars.optimization_hint(value, fallback=42)
                     )
                 elif isinstance(value, sympy.Basic):
-                    # sympy.Boolean (e.g. StrictLessThan from torch.cond predicates)
+                    # a comparison the caller wrote as a conditional
                     # is not a sympy.Expr so optimization_hint cannot handle it.
                     # Use False as a fallback for benchmark harness purposes.
                     add_expr_input(name, False)
@@ -3632,11 +3631,8 @@ class PythonWrapperCodegen(CodeGen):
             "device": device_props,
             # Triton compiler includes equal_to_1 args into constants even
             # when they are not constexpr. otherwise there may be a segfault
-            # during launching the Inductor-compiled Triton kernel.
-            # TODO(aakhundov): add None args to constants, too. currently, this
-            # causes CUDA errors in test_aot_inductor.test_triton_kernel_with_none_input.
-            # https://github.com/pytorch/pytorch/issues/120478#issuecomment-1962822307
-            # https://github.com/triton-lang/triton/blob/231efe9ed2d200be0f69a07c298e4342b08efe3d/python/triton/runtime/jit.py#L384
+            # during launching the kernel. An argument that is none is left out
+            # of the constants, which the runtime then reads as unset.
             "constants": {
                 **constants,
                 **dict.fromkeys(equal_to_1_args, 1),
@@ -3762,7 +3758,7 @@ class PythonWrapperCodegen(CodeGen):
         name = f"{original_name}_{len(self.user_defined_kernel_cache)}"
         # Prevent Python class-based name mangling (``__x`` -> ``_Class__x``)
         # when the generated call site is inside a class body.
-        # See https://github.com/pytorch/pytorch/issues/170398
+        # the name is a class body local, not a module-level one.
         if name.startswith("__") and not name.endswith("__"):
             name = name[1:]
 
@@ -4365,7 +4361,7 @@ class PythonWrapperCodegen(CodeGen):
             return obj_repr
         elif isinstance(s, tp.device) and _coor_enabled() and s.index is not None:
             # compile-on-one-rank: repr() of an indexed device would bake this rank's
-            # index into the wrapper (e.g. an aten fallback's device= arg renders as
+            # index into the wrapper (e.g. a fallback's device= arg renders as
             # device(type='cuda', index=0)), which the "cuda:N" checks do not catch.
             # Emit the bare type so the value follows the enclosing runtime device guard.
             return repr(tp.device(s.type))

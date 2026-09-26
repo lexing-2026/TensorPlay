@@ -294,7 +294,7 @@ def may_unify_binary_op_mask_type(a, b):
 
     if a.dtype == tp.bool:
         if b.dtype != tp.bool:
-            raise AssertionError(f"expected b.dtype == torch.bool, got {b.dtype}")
+            raise AssertionError(f"expected b.dtype == tp.bool, got {b.dtype}")
         mask_dtype = tp.int32
         return unify_mask_base_type(V.kernel.compute, (a, b), mask_dtype)
     return a, b
@@ -614,7 +614,7 @@ def _get_dtype_from_loopbodies(loop_bodies):
     one that has to be held in a register.
     """
 
-    dtypes = OrderedSet[torch.dtype]()
+    dtypes = OrderedSet[tp.dtype]()
     for loop_body in loop_bodies:
         graphs = [loop_body.root_block.graph] + [
             body.graph for body in list(loop_body.subblocks.values())
