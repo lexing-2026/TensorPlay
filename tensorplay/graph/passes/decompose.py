@@ -59,33 +59,12 @@ def _binop(graph: Graph, op: Any, lhs: Any, rhs: Any) -> Node:
 # --- existing core rules ----------------------------------------------------
 
 
-@_method("sigmoid")
-def _sigmoid(graph: Graph, node: Node) -> Node:
-    """sigmoid(x) -> 1 / (1 + exp(-x))"""
-    x = node.args[0]
-    neg_x = graph.create_node("call_function", operator.neg, (x,))
-    exp_x = _unop(graph, "exp", neg_x)
-    one = _binop(graph, operator.add, exp_x, 1)
-    return _binop(graph, operator.truediv, 1, one)
-
-
-@_method("silu")
-def _silu(graph: Graph, node: Node) -> Node:
-    """silu(x) -> x * sigmoid(x)"""
-    if node.kwargs.get("inplace", False):
-        return node
-    x = node.args[0]
-    sig = _DECOMP_METHODS["sigmoid"](graph, node)
-    return _binop(graph, operator.mul, x, sig)
-
-
-_DECOMP_METHODS["swish"] = _silu
-
-
-@_method("reciprocal")
-def _reciprocal(graph: Graph, node: Node) -> Node:
-    x = node.args[0]
-    return _binop(graph, operator.truediv, 1, x)
+# sigmoid, silu, swish and reciprocal are deliberately absent.  Each has a
+# lowering of its own that computes it one element at a time, which is both
+# shorter to read and one pass over memory rather than the three or four a
+# rewrite into exponentials and a division would cost.  Rewriting them here
+# would also hand the element-wise lowering a number where a tensor was
+# written, and a value with no axes cannot be read at an index that has some.
 
 
 @_method("square")
