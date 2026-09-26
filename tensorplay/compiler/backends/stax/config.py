@@ -797,6 +797,12 @@ class _TritonConfig:
     #: Read through a block pointer rather than through a row of offsets.
     use_block_ptr = False
 
+    #: Hand a block to the runtime as a descriptor it builds once, rather than
+    #: as a pointer it walks per access.  Worth it for a block read many times
+    #: and not worth the setup for one read once, so this leaves the choice to
+    #: the code that knows how often the block is moved.
+    use_tensor_descriptor = False
+
     #: Compute a narrower-than-float value in float and narrow it at the end,
     #: rather than computing it in its own type throughout.
     codegen_upcast_to_fp32 = True
@@ -936,6 +942,12 @@ else:
 # ---------------------------------------------------------------------------
 # What a fused program is allowed to assume
 # ---------------------------------------------------------------------------
+
+#: Assume an input's memory is aligned to the width of a wide load, and write
+#: the generated code on that assumption, copying an input that is not aligned
+#: rather than writing a narrower load for it.  Most inputs are aligned, so the
+#: narrow load is the rarer case and the copy is the rarer cost.
+assume_aligned_inputs: bool = False
 
 #: Assume every index fits in 32 bits, which lets a generated kernel use
 #: narrower arithmetic throughout.  A program with an index that does not fit
