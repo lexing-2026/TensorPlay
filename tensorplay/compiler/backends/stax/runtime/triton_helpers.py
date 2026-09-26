@@ -17,7 +17,7 @@ import sympy
 
 import tensorplay as tp
 
-from .triton_compat import triton
+from .triton_compat import libdevice, math, triton
 
 
 def get_backend_options_for_target(target, options=None):

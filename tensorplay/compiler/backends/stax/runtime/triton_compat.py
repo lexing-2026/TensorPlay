@@ -50,6 +50,22 @@ if triton is not None:
             pass
 
     try:
+        from triton.language.extra import libdevice
+
+        libdevice = tl.extra.libdevice  # noqa: F811
+        math = tl.math
+    except ImportError:
+        if hasattr(tl.extra, "cuda") and hasattr(tl.extra.cuda, "libdevice"):
+            libdevice = tl.extra.cuda.libdevice
+            math = tl.math
+        elif hasattr(tl.extra, "intel") and hasattr(tl.extra.intel, "libdevice"):
+            libdevice = tl.extra.intel.libdevice
+            math = tl.math
+        else:
+            libdevice = tl.math
+            math = tl
+
+    try:
         from triton.backends.compiler import GPUTarget
     except ImportError:
         GPUTarget = None
@@ -84,6 +100,8 @@ else:  # pragma: no cover - the kernel-writing runtime is absent
     knobs = None
     HAS_WARP_SPEC = False
     IntelGPUError = None
+    libdevice = None
+    math = None
 
     def triton_key(*args, **kwargs):
         raise RuntimeError("the kernel-writing runtime is not installed")
