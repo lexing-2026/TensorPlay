@@ -384,13 +384,7 @@ def aot_function(
             # so the pass drops what it has just bound: the backward program
             # has taken what it needs by now, and a step's saved activations
             # are most of what a region needs to fit in memory.
-            # The saved values live in the context's own storage, which is
-            # what ``saved_tensors`` reads; emptying it there is what actually
-            # lets go of them.
-            for name in ("_saved_tensors", "_saved_versions"):
-                stored = getattr(ctx, name, None)
-                if isinstance(stored, tuple):
-                    setattr(ctx, name, ())
+            ctx.release_saved()
             ctx.saved_plain = ()
             ctx.run_primals = None
             return out

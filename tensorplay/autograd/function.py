@@ -189,6 +189,21 @@ class _Context:
     def non_differentiable(self):
         return self._non_differentiable
 
+    def release_saved(self) -> None:
+        """Let go of the tensors saved for backward.
+
+        A saved tensor is held for the backward pass that reads it, and that
+        pass is its last reader: once it has run, the value is the graph's
+        memory for nothing.  The engine knows when a graph is being kept for
+        another pass, so this is one call at the point where the engine stops
+        needing them, and a function whose backward may run again does not
+        make it.
+        """
+        self._saved_tensors = ()
+        for name in ("_saved_versions", "_saved_native_tokens", "_saved_pack"):
+            if isinstance(getattr(self, name, None), tuple):
+                setattr(self, name, ())
+
     @property
     def to_save(self):
         return self._saved_tensors
