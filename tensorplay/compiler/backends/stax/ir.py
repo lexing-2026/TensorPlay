@@ -9515,7 +9515,7 @@ class WhileLoop(ExternKernel):
             return OrderedSet()
 
 
-class FallbackKernel(ExternKernel):
+class FallbackKernel(ExternKernelAlloc):
     """A result produced by handing the operation to a prepared kernel as a whole.
 
     Some operations are not worth writing out as a loop -- a sort, a gather, an
