@@ -173,23 +173,124 @@ __global__ void row_copy_kernel(int64_t total_rows, int64_t inner,
     }
 }
 
-template <typename T>
-__global__ void flip_map_kernel(int64_t n, int64_t nd, const T* src, T* dst,
-                                const int64_t* sizes, const int64_t* flips,
-                                const int64_t* out_strides) {
-    int64_t li = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+// Shape of a flip, carried in the launch parameters: every thread reads the
+// same entries, and from parameter space that is a broadcast constant rather
+// than a load per dimension per element.
+// Exact log2 of a power of two, single instruction on the device.
+template <typename I>
+__device__ __forceinline__ int flip_log2(I value) {
+    return static_cast<int>(__ffsll(static_cast<unsigned long long>(value))) - 1;
+}
+
+template <int kMaxDims>
+struct FlipShape {
+    int64_t sizes[kMaxDims];
+    int64_t flips[kMaxDims];
+};
+
+// The thread index walks the output and the mirrored index reaches into the
+// input, so the stores stay contiguous.  Mirroring the other way round would
+// scatter the stores instead, and a partial-sector write costs far more than a
+// scattered read.
+// Every axis costs one integer division, and a 64-bit division is a software
+// routine, so a tensor that fits in 32 bits walks its axes in 32-bit
+// arithmetic.  The template rank keeps the axis table in registers and the
+// traversal unrolled.  The thread index walks the output and the mirrored index
+// reaches into the input, so the stores stay contiguous: mirroring the other
+// way round scatters the stores instead, and a partial-sector write costs far
+// more than a scattered read.
+template <typename T, int kMaxDims, int kRank, typename index_t>
+__global__ void flip_map_kernel(index_t n, const T* src, T* dst,
+                                const FlipShape<kMaxDims> shape) {
+    index_t li = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const index_t stride = static_cast<index_t>(blockDim.x) * gridDim.x;
     for (; li < n; li += stride) {
-        int64_t r2 = li, src_off = 0, dst_off = 0, mult = 1;
-        for (int64_t d2 = nd - 1; d2 >= 0; --d2) {
-            int64_t c = r2 % sizes[d2];
-            r2 /= sizes[d2];
-            int64_t sc3 = flips[d2] ? (sizes[d2] - 1 - c) : c;
-            src_off += sc3 * mult;
-            dst_off += c * out_strides[d2];
-            mult *= sizes[d2];
+        // The element's own offset already carries every coordinate, so a
+        // flipped axis only has to move it by the mirror distance
+        // (size - 1 - c) - c, and unflipped axes are free.
+        index_t rest = li, src_off = li, mult = 1;
+        for (int d = kRank - 1; d >= 0; --d) {
+            const index_t size = static_cast<index_t>(shape.sizes[d]);
+            index_t c, inner;
+            if (d == 0) {
+                // The outermost coordinate is what is left of the offset once
+                // the inner axes are peeled off, so it needs no division.
+                c = rest;
+                inner = 0;
+            } else if ((size & (size - 1)) == 0) {
+                // Power-of-two axis: a shift and a mask.
+                const int shift = flip_log2(size);
+                c = rest & (size - 1);
+                inner = static_cast<index_t>(rest >> shift);
+            } else {
+                inner = rest / size;
+                c = rest - inner * size;
+            }
+            rest = inner;
+            if (shape.flips[d]) src_off += (size - 1 - 2 * c) * mult;
+            mult *= size;
         }
-        dst[dst_off] = src[src_off];
+        dst[li] = src[src_off];
+    }
+}
+
+template <typename T, int kMaxDims, typename index_t>
+__global__ void flip_map_kernel(index_t n, int nd, const T* src, T* dst,
+                                const FlipShape<kMaxDims> shape) {
+    index_t li = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const index_t stride = static_cast<index_t>(blockDim.x) * gridDim.x;
+    for (; li < n; li += stride) {
+        index_t rest = li, src_off = li, mult = 1;
+        for (int d = kMaxDims - 1; d >= 0; --d) {
+            if (d >= nd) continue;
+            const index_t size = static_cast<index_t>(shape.sizes[d]);
+            index_t c, inner;
+            if (d == 0) {
+                c = rest;
+                inner = 0;
+            } else if ((size & (size - 1)) == 0) {
+                const int shift = flip_log2(size);
+                c = rest & (size - 1);
+                inner = static_cast<index_t>(rest >> shift);
+            } else {
+                inner = rest / size;
+                c = rest - inner * size;
+            }
+            rest = inner;
+            if (shape.flips[d]) src_off += (size - 1 - 2 * c) * mult;
+            mult *= size;
+        }
+        dst[li] = src[src_off];
+    }
+}
+
+template <typename T, typename index_t>
+__global__ void flip_tall_map_kernel(index_t n, int nd, const T* src, T* dst,
+                                     const int64_t* sizes,
+                                     const int64_t* flips) {
+    index_t li = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const index_t stride = static_cast<index_t>(blockDim.x) * gridDim.x;
+    for (; li < n; li += stride) {
+        index_t rest = li, src_off = li, mult = 1;
+        for (int d = nd - 1; d >= 0; --d) {
+            const index_t size = static_cast<index_t>(sizes[d]);
+            index_t c, inner;
+            if (d == 0) {
+                c = rest;
+                inner = 0;
+            } else if ((size & (size - 1)) == 0) {
+                const int shift = flip_log2(size);
+                c = rest & (size - 1);
+                inner = static_cast<index_t>(rest >> shift);
+            } else {
+                inner = rest / size;
+                c = rest - inner * size;
+            }
+            rest = inner;
+            if (flips[d]) src_off += (size - 1 - 2 * c) * mult;
+            mult *= size;
+        }
+        dst[li] = src[src_off];
     }
 }
 
@@ -409,10 +510,14 @@ Tensor flip_cuda(const Tensor& self, const std::vector<int64_t>& dims) {
         }
     }
     Tensor sc = self.contiguous();
-    Tensor out = ::tensorplay::detail::clone_impl(self);
+    // The result of a flip is a contiguous tensor of the same shape; seeding it
+    // with a copy of the input would add a full read and write that the kernel
+    // below overwrites element for element.
+    Tensor out = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()),
+                               self.dtype(), self.device());
     int64_t n = sc.numel();
     if (n == 0) return out;
-    if (dims.size() == 1 && nd > 0 && out.is_contiguous()) {
+    if (dims.size() == 1 && nd > 0) {
         const int64_t dim = wrap_dim_scalar(dims[0], nd);
         const int64_t size = sc.size(dim);
         const int64_t stride = sc.stride(dim);
@@ -436,25 +541,85 @@ Tensor flip_cuda(const Tensor& self, const std::vector<int64_t>& dims) {
         CUDA_CHECK(cudaGetLastError());
         return out;
     }
-    Tensor d_sizes = pack_i64(shape_of(sc), sc.device());
-    Tensor d_flips = pack_i64(h_flips, sc.device());
-    Tensor d_out_strides = pack_i64(
-        static_cast<std::vector<int64_t>>(out.strides()), sc.device());
     auto stream = getCurrentCUDAStream().stream();
     dim3 grid = make_grid(n), block(kThreads);
+    // Ranks up to kFlipMaxInlineDims travel in the launch parameters; anything
+    // taller keeps the table on the device.
+    constexpr int kFlipMaxInlineDims = 8;
+    if (nd <= kFlipMaxInlineDims) {
+        const auto shape = static_cast<std::vector<int64_t>>(sc.shape());
+        FlipShape<kFlipMaxInlineDims> packed{};
+        for (int64_t d = 0; d < nd; ++d) {
+            packed.sizes[d] = shape[static_cast<size_t>(d)];
+            packed.flips[d] = h_flips[static_cast<size_t>(d)];
+        }
 #define TP_FL2(ctype, name_) \
     case DType::name_: \
-        flip_map_kernel<ctype><<<grid, block, 0, stream>>>( \
-            n, nd, sc.data_ptr<ctype>(), out.data_ptr<ctype>(), \
-            d_sizes.data_ptr<int64_t>(), d_flips.data_ptr<int64_t>(), \
-            d_out_strides.data_ptr<int64_t>()); \
+        if (n <= static_cast<int64_t>(std::numeric_limits<int32_t>::max())) { \
+            const int32_t n32 = static_cast<int32_t>(n); \
+            switch (nd) { \
+            case 2: \
+                flip_map_kernel<ctype, kFlipMaxInlineDims, 2, int32_t> \
+                    <<<grid, block, 0, stream>>>( \
+                        n32, sc.data_ptr<ctype>(), out.data_ptr<ctype>(), \
+                        packed); \
+                break; \
+            case 3: \
+                flip_map_kernel<ctype, kFlipMaxInlineDims, 3, int32_t> \
+                    <<<grid, block, 0, stream>>>( \
+                        n32, sc.data_ptr<ctype>(), out.data_ptr<ctype>(), \
+                        packed); \
+                break; \
+            case 4: \
+                flip_map_kernel<ctype, kFlipMaxInlineDims, 4, int32_t> \
+                    <<<grid, block, 0, stream>>>( \
+                        n32, sc.data_ptr<ctype>(), out.data_ptr<ctype>(), \
+                        packed); \
+                break; \
+            default: \
+                flip_map_kernel<ctype, kFlipMaxInlineDims, int32_t> \
+                    <<<grid, block, 0, stream>>>( \
+                        n32, nd, sc.data_ptr<ctype>(), out.data_ptr<ctype>(), \
+                        packed); \
+                break; \
+            } \
+        } else { \
+            flip_map_kernel<ctype, kFlipMaxInlineDims, int64_t> \
+                <<<grid, block, 0, stream>>>( \
+                    n, nd, sc.data_ptr<ctype>(), out.data_ptr<ctype>(), \
+                    packed); \
+        } \
         break;
-    switch (sc.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_FL2)
-        TENSORPLAY_FORALL_QINT_TYPES(TP_FL2)
-        default: TP_THROW(TypeError, "flip: unsupported dtype");
-    }
+        switch (sc.dtype()) {
+            TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_FL2)
+            TENSORPLAY_FORALL_QINT_TYPES(TP_FL2)
+            default: TP_THROW(TypeError, "flip: unsupported dtype");
+        }
 #undef TP_FL2
+    } else {
+        Tensor d_sizes = pack_i64(shape_of(sc), sc.device());
+        Tensor d_flips = pack_i64(h_flips, sc.device());
+        const int64_t* sizes_ptr = d_sizes.data_ptr<int64_t>();
+        const int64_t* flips_ptr = d_flips.data_ptr<int64_t>();
+#define TP_FL2_TALL(ctype, name_) \
+    case DType::name_: \
+        if (n <= static_cast<int64_t>(std::numeric_limits<int32_t>::max())) { \
+            flip_tall_map_kernel<ctype, int32_t><<<grid, block, 0, stream>>>( \
+                static_cast<int32_t>(n), nd, sc.data_ptr<ctype>(), \
+                out.data_ptr<ctype>(), sizes_ptr, flips_ptr); \
+        } else { \
+            flip_tall_map_kernel<ctype, int64_t><<<grid, block, 0, stream>>>( \
+                n, nd, sc.data_ptr<ctype>(), out.data_ptr<ctype>(), sizes_ptr, \
+                flips_ptr); \
+        } \
+        break;
+        switch (sc.dtype()) {
+            TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_FL2_TALL)
+            TENSORPLAY_FORALL_QINT_TYPES(TP_FL2_TALL)
+            default: TP_THROW(TypeError, "flip: unsupported dtype");
+        }
+#undef TP_FL2_TALL
+    }
     CUDA_CHECK(cudaGetLastError());
     return out;
 }
