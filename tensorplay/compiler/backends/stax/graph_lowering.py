@@ -32,7 +32,9 @@ from .utils import (
     get_sympy_Expr_dtype,
     has_free_symbols,
     SUPPORTED_MKLDNN_DEVICES,
+    ValueWithLineMap,
 )
+from .codegen.common import FileBackedGraphModule
 from .sizevars import SizeVarAllocator
 from .virtualized import V
 from .ir import (
@@ -580,6 +582,11 @@ class GraphLowering:
         #: The names every kernel printed under, kept as they are printed so
         #: that a kernel can be found by the name it actually has.
         self.all_codegen_kernel_names: OrderedSet[str] = OrderedSet()
+        #: Values carried alongside the region that the printed program is
+        #: handed as module attributes, so that the printed program does not
+        #: have to be handed them again by whoever called it.
+        self.torchbind_constants: dict[str, Any] = {}
+        self.opaque_value_type_classes: dict[str, Any] = {}
         self.mutation_real_name: dict = {}
         # A region whose output node holds one value returns that value, not a
         # one-element sequence, so the compiled region matches its capture.
@@ -1407,6 +1414,62 @@ class GraphLowering:
         result = self.wrapper_code.generate(self.is_inference)
         self.wrapper_code.pop_codegened_graph()
         return result
+
+    def _compile_to_module_lines(self, wrapper_code):
+        """Write what was printed, and load it back as something callable.
+
+        The text is written to a file under a key derived from it, and the file
+        is found again by that key, so a region printed twice is loaded once.
+        Which source line each part of the wrapper came from is carried along
+        with it, so that a failure inside the wrapper can be reported against
+        the line of this region that produced it rather than against the line of
+        the wrapper it was printed into.
+        """
+
+        from .codecache import PyCodeCache
+
+        output_code_log.debug("Output code: \n%s", wrapper_code.value)
+
+        linemap = [
+            (line_no, node.stack_trace)
+            for line_no, node in wrapper_code.line_map
+        ]
+        key, path = PyCodeCache.write(wrapper_code.value)
+        output_code_log.debug("Output code written to: %s", path)
+
+        mod = PyCodeCache.load_by_key_path(
+            key,
+            path,
+            linemap=linemap,
+            attrs={
+                **self.constants,
+                **self.torchbind_constants,
+                **self.opaque_value_type_classes,
+            },
+        )
+        self.cache_key = key
+        self.cache_path = path
+        self.cache_linemap = linemap
+        return mod
+
+    def compile_to_module(self):
+        """This region as something built, named, and callable on its own.
+
+        What comes back is a built artifact rather than a program object: it
+        knows the key it was built under and the file it was written to, so the
+        same region asked for again is recognised as the same region and the
+        built file is reached rather than rebuilt.
+        """
+
+        wrapper_code, _ = self.codegen()
+
+        if isinstance(wrapper_code, ValueWithLineMap):
+            return self._compile_to_module_lines(wrapper_code)
+        if isinstance(wrapper_code, FileBackedGraphModule):
+            return wrapper_code
+        raise NotImplementedError(
+            f"Unrecognized wrapper code type: {type(wrapper_code)}"
+        )
 
     def compile_to_module(self):
         """This region as something built, named, and callable on its own.
