@@ -289,7 +289,15 @@ def select_decomp_table() -> dict:
     # of this file because a table of decompositions is only wanted by a capture
     # and a program that never captures should not pay for reading them.
     import tensorplay._decomp.decompositions  # noqa: F401
+    import tensorplay._decomp.decompositions_for_rng  # noqa: F401
     from tensorplay._decomp import decomposition_table
+
+    # Read at the moment the table is read rather than at import, so that a
+    # program which never captures does not pay for reading them -- and asked
+    # for rather than assumed, because whether randomness is a read at a
+    # position or a call that consults a generator is a question about how the
+    # program was configured.
+    tensorplay._decomp.decompositions_for_rng.register_rng_decompositions()
 
     return dict(decomposition_table)
 
