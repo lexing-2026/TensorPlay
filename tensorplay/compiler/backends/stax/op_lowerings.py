@@ -3987,3 +3987,163 @@ def slice_scatter(
         inner_fn=inner_fn,
         ranges=list(x.get_size()),
     )
+
+
+@register("argmax.default")
+def reduce_argmax(x: Any, dim: Any = None, keepdim: Any = False) -> Any:
+    """Where the largest value along an axis is, counted from the front.
+
+    A position rather than a value, and counted from the front of the axis
+    rather than from wherever the value happened to be found -- so two equal
+    values give the same answer however the walk that found them was ordered.
+    """
+
+    # This is reached while some other node is being lowered, and that
+    # node's result is named by which of its results is wanted rather
+    # than being the whole of them.
+    size, dtype, device = val_info(node_val(index=0))
+    if dim is None:
+        dim = list(range(len(x.get_size())))
+    return make_reduction(x, [dim], keepdim, tp.int64, device, "argmax")
+
+
+@register("argmin.default")
+def reduce_argmin(x: Any, dim: Any = None, keepdim: Any = False) -> Any:
+    """Where the smallest value along an axis is, counted from the front.
+
+    The mirror of the largest, and the same in every respect but which end of
+    the comparison is taken.
+    """
+
+    # This is reached while some other node is being lowered, and that
+    # node's result is named by which of its results is wanted rather
+    # than being the whole of them.
+    size, dtype, device = val_info(node_val(index=0))
+    if dim is None:
+        dim = list(range(len(x.get_size())))
+    return make_reduction(x, [dim], keepdim, tp.int64, device, "argmin")
+
+
+@register_lowering(aten.mode.default, type_promotion_kind=None)
+def mode_default(self: Any, dim: Any = -1, keepdim: Any = False) -> Any:
+    """The value that occurs most often along an axis, and where it was.
+
+    A sorted axis groups equal values together, so the most frequent value is
+    the longest run of equal values in it -- and the run is found by asking each
+    position whether it starts one and then carrying the last such position
+    forward, which is what turns "this position starts a run" into "this position
+    is in a run" without counting anything.
+
+    Where two runs are the same length, the one that starts first is taken: the
+    last starting position carried forward is the earliest of the longest runs,
+    and the position with the longest run behind it is that run's end.  Ties
+    among equal values are broken by position rather than by which came first in
+    memory, so the answer does not depend on the order the values happened to be
+    read in.
+    """
+
+    if not config.triton.decompose_sort_ops:
+        return mode_fallback(self, dim, keepdim)
+    shape = self.get_size()
+    ndim = len(shape)
+    device = self.get_device()
+    if ndim == 0:
+        return clone(self), _full(0, device, tp.int64, shape)
+    dim = canonicalize_dim(ndim, dim)
+    sorted_vals, sorted_idxs = sort_stable(self, stable=True, dim=dim)
+    n = shape[dim]
+
+    positions = iota(
+        n, start=0, step=1, dtype=tp.int64, device=device, requires_grad=False
+    )
+    pos_view_shape = [sympy.Integer(1)] * ndim
+    pos_view_shape[dim] = n
+    positions = view(positions, pos_view_shape)
+    positions = lower_expand(positions, shape)
+
+    positions_loader0 = positions.make_loader()
+
+    def prev_pos_fn(idx: Any) -> Any:
+        return ops.maximum(
+            ops.sub(positions_loader0(idx), ops.constant(1, tp.int64)),
+            ops.constant(0, tp.int64),
+        )
+
+    prev_positions = Pointwise.create(
+        device=decode_device(device),
+        dtype=tp.int64,
+        inner_fn=prev_pos_fn,
+        ranges=shape,
+    )
+
+    shifted_vals = gather(sorted_vals, dim, prev_positions)
+
+    sorted_loader = sorted_vals.make_loader()
+    shifted_loader = shifted_vals.make_loader()
+    positions_loader = positions.make_loader()
+
+    def is_boundary_fn(idx: Any) -> Any:
+        return ops.or_(
+            ops.ne(sorted_loader(idx), shifted_loader(idx)),
+            ops.eq(positions_loader(idx), ops.constant(0, tp.int64)),
+        )
+
+    is_boundary = Pointwise.create(
+        device=decode_device(device),
+        dtype=tp.bool,
+        inner_fn=is_boundary_fn,
+        ranges=shape,
+    )
+
+    is_boundary_loader = is_boundary.make_loader()
+    positions_loader2 = positions.make_loader()
+
+    def boundary_pos_fn(idx: Any) -> Any:
+        return ops.where(
+            is_boundary_loader(idx),
+            positions_loader2(idx),
+            ops.constant(-1, tp.int64),
+        )
+
+    boundary_pos = Pointwise.create(
+        device=decode_device(device),
+        dtype=tp.int64,
+        inner_fn=boundary_pos_fn,
+        ranges=shape,
+    )
+
+    last_boundary, _ = cummax(boundary_pos, dim)
+
+    positions_loader3 = positions.make_loader()
+    last_boundary_loader = last_boundary.make_loader()
+
+    def run_len_fn(idx: Any) -> Any:
+        return ops.add(
+            ops.sub(positions_loader3(idx), last_boundary_loader(idx)),
+            ops.constant(1, tp.int64),
+        )
+
+    run_len = Pointwise.create(
+        device=decode_device(device),
+        dtype=tp.int64,
+        inner_fn=run_len_fn,
+        ranges=shape,
+    )
+
+    max_pos = reduce_argmax(run_len, dim, True)
+    mode_vals = gather(sorted_vals, dim, max_pos)
+    mode_idxs = gather(sorted_idxs, dim, max_pos)
+
+    if not keepdim:
+        # Reshaped rather than squeezed: what came back is a walk rather than a
+        # view of something, and a view says which bytes it reads -- which is a
+        # question about where the values came from rather than about the shape
+        # the answer has.
+        def _drop_axis(value: Any, axis: Any) -> Any:
+            new_shape = [s for d, s in enumerate(value.get_size()) if d != axis]
+            return view(value, new_shape)
+
+        mode_vals = _drop_axis(mode_vals, dim)
+        mode_idxs = _drop_axis(mode_idxs, dim)
+
+    return mode_vals, mode_idxs
