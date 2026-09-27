@@ -3299,3 +3299,22 @@ class FakeIndentedBuffer(IndentedBuffer):
             "writes to the body without explicitly specifying the body with"
             "`TritonTemplateKernel.set_subgraph_body(name)`"
         )
+
+
+@contextlib.contextmanager
+def restore_stdout_stderr() -> Iterator[None]:
+    """Put the two output streams back as they were on the way in.
+
+    Threads inherit the streams that were current when they started, and a
+    build running on several threads will therefore have left them pointing
+    somewhere else by the time it is done.  Anything after that -- a report, a
+    progress line, another build's output -- would go to a stream nobody is
+    reading, so they are put back rather than left as the last thread left
+    them.
+    """
+
+    initial_stdout, initial_stderr = sys.stdout, sys.stderr
+    try:
+        yield
+    finally:
+        sys.stdout, sys.stderr = initial_stdout, initial_stderr

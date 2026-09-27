@@ -77,6 +77,12 @@ from ..utils import do_bench_using_profiling
 from pathlib import Path
 from tensorplay.utils._filelock import FileLock
 from ..compile_log import timed_block, trace_structured
+from ..codecache import PersistentCache
+from ..utils import counters, restore_stdout_stderr
+from ..autotune_process import PrecompileThreadPool, use_pipelined_autotuning
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
+import time
 from tensorplay.testing import assert_close
 
 #: Whether a candidate's result is checked against what the operation's own
@@ -3675,6 +3681,25 @@ def create_inputs_key(input_nodes) -> str:
     return repr([AlgorithmSelectorCache.key_of(x) for x in input_nodes])
 
 
+def create_precompile_key(name: str, inputs_key: str, choices: list) -> str:
+    """What a set of candidates was built for, as one string.
+
+    The operation, the inputs, the precision and every candidate's own key.
+    All four are in it because a build is only reusable for the same question:
+    the same candidates asked about different inputs are different kernels,
+    and the same ones measured at another precision are not comparable.
+    """
+
+    return ":".join(
+        [
+            name,
+            inputs_key,
+            tp.get_float32_matmul_precision(),
+        ]
+        + [choice.kernel_hash_key() for choice in choices]
+    )
+
+
 def should_use_layout_constraints(x: Any) -> bool:
     """Whether a value's layout was pinned rather than left to be inferred.
 
@@ -3976,7 +4001,64 @@ def _classify_kernel_operation(
     return "other"
 
 
-class AlgorithmSelectorCache:
+@dataclasses.dataclass(frozen=True, slots=True)
+class PrecompileFunction:
+    """A precompile that can be found again, and can be thrown away.
+
+    Two lowerings of the same operation reach the same candidates, and
+    building them twice costs the most expensive thing a build does.  So the
+    build is kept under a key that says what it was for -- which also means a
+    build can be dropped when what it was for stops being wanted, rather than
+    being kept for a process that will never ask again.
+    """
+
+    fn: Callable[[], dict]
+    precompile_key: str | None = None
+
+    def __call__(self) -> dict:
+        """Build, and say what it cost -- callable so a caller need not unwrap it.
+
+        What the key is for is bookkeeping; a caller that wants the build does
+        not have a reason to know there is a key at all.
+        """
+
+        return self.fn()
+
+
+def get_num_workers() -> int:
+    """How many candidates may be built at once."""
+    return config.compile_threads
+
+
+def _log_autotune_exceptions(exceptions: list) -> None:
+    """Say which candidates could not be built, and why.
+
+    A candidate that could not be built is not a candidate, and the search
+    carries on without it -- so the only way to know one was dropped is this
+    record.  What went wrong is reduced to its type and its first line: the
+    rest of a failure is usually the same failure repeated per thread, and a
+    record that grows with the thread count is one nobody reads.
+    """
+
+    if not exceptions:
+        return
+
+    for choice, exc in exceptions:
+        data = {
+            "choice_type": "triton" if isinstance(choice, TritonTemplateCaller) else "other",
+            "choice": getattr(choice, "description", None),
+            "exception_message": str(exc),
+        }
+        exc_type_match = re.search(r"(\w+):", str(exc))
+        if exc_type_match:
+            data["exception"] = exc_type_match.group(1)
+        trace_structured("autotune_exception", data)
+        log.warning(
+            "Exception %s for benchmark choice %s", exc, choice, exc_info=exc
+        )
+
+
+class AlgorithmSelectorCache(PersistentCache):
     """Which candidate ran, remembered from one call to the next.
 
     A measurement is expensive and a call is not, so what was measured is kept
@@ -4037,6 +4119,7 @@ class AlgorithmSelectorCache:
         # of inputs, so the record of what was precompiled for those inputs is
         # shared by every lowering that reaches them.
         self.prescreening_cache: dict[str, list] = {}
+        self.precompile_cache: dict[str, PrecompileFunction] = {}
         self.feedback_saver_fns: list = []
         self.preprocessing_fns: list = [
             filter_choices_by_name_regex,
@@ -4955,6 +5038,204 @@ class AlgorithmSelectorCache:
             "choices": choices_with_shapes,
         }
         append_to_log(omni_attention_filename, out_dict)
+
+    def make_precompile_fn(
+        self,
+        choices,
+        name: str,
+        inputs_key: str,
+        precompilation_timeout_seconds: int | None = 60 * 60,
+    ) -> Callable[[], dict]:
+        """Build the candidates ahead of being measured, and say what it cost.
+
+        Building a candidate is most of what a search costs, and it is worth
+        doing before the measuring rather than during it: a search that
+        measures candidates one at a time spends its time waiting on a single
+        build while the rest of the machine is idle.  So they are built
+        together first, and the time each took is what the search reports
+        rather than the time the build appeared to cost.
+
+        Several answers to "do this need doing" come back as doing nothing,
+        each for its own reason: a search that is not timed at all, a set of
+        candidates already timed on another machine, a set already built for
+        these inputs by another lowering, and a machine with no spare workers.
+        Building twice is the one outcome worth spending effort to avoid, and
+        a candidate that differs only in what it will be handed at run time
+        builds to the same thing -- so those are built once.
+        """
+
+        log.debug("Starting precompilation")
+
+        def no_op(*args, **kwargs) -> dict:
+            return {}
+
+        if (
+            precompilation_timeout_seconds is None
+            or precompilation_timeout_seconds <= 0
+        ):
+            log.debug("Precompilation timeout is None or <= 0, returning no_op")
+            return no_op
+
+        num_workers = min(get_num_workers(), len(choices))
+
+        if num_workers <= 0:
+            return no_op
+
+        # check local and global cache before precompiling
+        timings = self.lookup(
+            choices,
+            name,
+            inputs_key,
+            benchmark=None,
+        )
+
+        if timings and len(timings) == len(choices):
+            # compilation in precompile stage is much cheaper than that in
+            # autotuning stage
+            log.debug("Found all %d timings in cache, returning no_op", len(timings))
+            return no_op
+
+        precompile_key = create_precompile_key(name, inputs_key, choices)
+        if precompile_func := self.precompile_cache.get(precompile_key):
+            log.debug("Precompile function found in cache, returning it")
+            return precompile_func
+
+        log.info(
+            "Multithreaded precompilation for %d choices using %d worker threads",
+            len(choices),
+            num_workers,
+        )
+
+        # Because threads inherit global state, a pool can race and leave the
+        # output streams somewhere other than where it found them; so each
+        # build puts them back rather than assuming they were left alone.
+        def precompile_with_captured_stdout(choice):
+            log.debug("Precompiling choice with captured stdout: %s", choice)
+            start_ns = time.time_ns()
+            with restore_stdout_stderr():
+                choice.precompile()
+            elapsed_ns = time.time_ns() - start_ns
+            return None, elapsed_ns // 1000
+
+        def on_complete(future):
+            if not future.exception():
+                _, precompile_elapsed_us = future.result()
+                elapsed_seconds = precompile_elapsed_us / 1e6
+                elapsed_times[future] = elapsed_seconds
+                log.debug(
+                    "Precompilation complete for future: %s, elapsed time: %.02fs",
+                    future,
+                    elapsed_seconds,
+                )
+
+        if use_pipelined_autotuning():
+            executor = PrecompileThreadPool.get_instance()
+        else:
+            executor = ThreadPoolExecutor(max_workers=num_workers)
+
+        futures: dict = {}
+        elapsed_times: dict = {}
+
+        # Some choices only differ in runtime arguments, so we
+        # skip a choice if it has the same hash as a previously seen choice
+        seen_choices: OrderedSet = OrderedSet()
+
+        for c in choices:
+            # Skip choices which we have already issued a precompile
+            if c.kernel_hash_key() in seen_choices:
+                log.debug("Skipping already seen choice: %s", c)
+                continue
+            else:
+                seen_choices.add(c.kernel_hash_key())
+
+            if hasattr(c, "precompile"):
+                future = executor.submit(precompile_with_captured_stdout, c)
+                log.debug("Submitted precompile for choice: %s", c)
+
+                future.add_done_callback(on_complete)
+                futures[future] = c
+
+        @functools.cache
+        @restore_stdout_stderr()
+        def wait_on_futures() -> dict:
+            """Wait for every build, and return what each one cost.
+
+            Waiting twice returns the same answer rather than building twice,
+            which is why this is remembered: a search that asks how long its
+            candidates took, and then asks again, is asking the same question.
+            """
+            log.debug("Waiting on futures")
+            counters["inductor"]["select_algorithm_precompile"] += 1
+            exceptions: list = []
+            try:
+                for future in as_completed(
+                    futures,
+                    timeout=precompilation_timeout_seconds,
+                ):
+                    if e := future.exception():
+                        counters["inductor"][
+                            "select_algorithm_num_precompilation_exceptions"
+                        ] += 1
+                        exceptions.append((futures[future], e))
+                        log.exception(
+                            "Exception %s for benchmark choice %s",
+                            e,
+                            futures[future],
+                            exc_info=e,
+                        )
+                        futures[future].mark_failed()
+                    else:
+                        counters["inductor"]["select_algorithm_num_precompiles"] += 1
+                        log.info(
+                            "Precompiling benchmark choice %s took %.02fs",
+                            futures.get(future),
+                            elapsed_times.get(future),
+                        )
+            except TimeoutError:
+                # A build that has not finished in an hour is a build that is
+                # not going to; the whole build is not abandoned for it, and
+                # the candidates still building are treated as candidates that
+                # could not be built.
+                completed_futures = OrderedSet([f for f in futures if f.done()])
+                remaining_futures = OrderedSet(futures.keys()) - completed_futures
+
+                log.warning(
+                    "Precompilation timeout after %ds: %d of %d futures did not complete",
+                    precompilation_timeout_seconds,
+                    len(remaining_futures),
+                    len(futures),
+                )
+
+                # Mark remaining futures as failed and log them
+                for future in remaining_futures:
+                    choice = futures[future]
+                    log.warning(
+                        "Marking choice as failed due to timeout: %s",
+                        choice,
+                    )
+                    choice.mark_failed()
+                    # Add timeout exception to the exceptions list
+                    timeout_exc = TimeoutError(
+                        f"Precompilation timed out after {precompilation_timeout_seconds}s"
+                    )
+                    exceptions.append((choice, timeout_exc))
+            if exceptions:
+                _log_autotune_exceptions(exceptions)
+
+            if not use_pipelined_autotuning():
+                executor.shutdown(wait=True)
+
+            # Build and return dict mapping choices to their precompilation times
+            precompile_times: dict = {}
+            for future, choice in futures.items():
+                if future in elapsed_times:
+                    precompile_times[choice] = elapsed_times[future]
+            return precompile_times
+
+        precompile_fn = PrecompileFunction(wait_on_futures, precompile_key)
+        self.precompile_cache[precompile_key] = precompile_fn
+
+        return precompile_fn
 
     def autotune(
         self,

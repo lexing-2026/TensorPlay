@@ -58,6 +58,7 @@ from .runtime.cache_artifacts import CacheArtifact, CacheArtifactFactory
 from .runtime.cache_dir_utils import cache_dir
 from .runtime.device_compiler import compiler_module
 from .utils import clear_on_fresh_cache
+from . import config
 from tensorplay.graph.experimental.symbolic_shapes import has_guarding_hint
 
 #: What a guarded cache holds: an entry of its own kind, opaque here.
@@ -371,6 +372,78 @@ class CacheBase:
             json.dumps({"system": self.system, "cache": local_cache}, indent=4),
             make_dirs=True,
         )
+
+
+class PersistentCache(CacheBase):
+    """A cache of measurements that outlives the process that took them.
+
+    A measurement is expensive enough that taking it twice is a waste, and it
+    is a measurement of the machine rather than of the build -- so it is worth
+    keeping, and worth keeping next to what it was measured on.
+    """
+
+    def lookup(
+        self,
+        choices: list,
+        op: str,
+        inputs: str,
+        benchmark,
+        hint_override: int | None = None,
+    ) -> dict:
+        """The times already measured for these choices on these inputs, if any.
+
+        A stored time is only usable if it was measured on this machine under
+        this precision: a time from a machine that reads the same numbers
+        differently is not a slower answer but a different question.  So the
+        precision is part of the key rather than assumed.
+
+        When something is missing, whether to measure it is a question about
+        what was asked for.  Asked to measure, everything is measured again
+        rather than only what was missing -- mixing times from different runs
+        would make the set incomparable, and the whole point of comparing them
+        is what was being asked.  Asked only to look, a partial answer is
+        returned as far as it goes, and the rest is left unsaid rather than
+        filled with a number nobody measured.
+        """
+
+        precision = tp.get_float32_matmul_precision()
+        cache_key = f"{inputs}_{hint_override}" if hint_override is not None else inputs
+
+        timings = {}
+
+        def check_cache(cache: dict) -> bool:
+            """Whether `cache` holds a time for every one of the choices."""
+            hit = True
+            for choice in choices:
+                choice_hash = choice.hash_key()
+                if choice_hash in cache.get(op, {}).get(cache_key, {}).get(
+                    precision, {}
+                ):
+                    # cache hit
+                    timings[choice] = cache[op][cache_key][precision][choice_hash]
+                else:
+                    # cache miss
+                    hit = False
+                    break
+            return hit
+
+        local_cache = self.get_local_cache() if config.autotune_local_cache else {}
+        if (not check_cache(local_cache)) and (benchmark is not None):
+            # re-benchmark everything to try to get consistent numbers from the same machine
+            timings = benchmark(choices)
+            if not all(choice in timings for choice in choices):
+                missing = [c for c in choices if c not in timings]
+                raise AssertionError(
+                    f"Benchmark results missing for choices: {missing}"
+                )
+            local_cache.setdefault(op, {})
+            local_cache[op].setdefault(cache_key, {}).setdefault(precision, {})
+            for choice, timing in timings.items():
+                local_cache[op][cache_key][precision][choice.hash_key()] = timing
+
+            self.update_local_cache(local_cache)
+
+        return timings
 
 
 class LocalCache(CacheBase):
