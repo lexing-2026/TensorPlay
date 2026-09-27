@@ -32,7 +32,6 @@ from typing_extensions import override
 
 from tensorplay._C._monitor import _WaitCounter
 
-from . import config
 from .compile_log import timed_block
 
 
@@ -45,14 +44,9 @@ except ImportError:
 log = logging.getLogger(__name__)
 
 
-if config.is_fbcode():
-    from rfe.scubadata.scubadata_py3 import (  # type: ignore[import-not-found]
-        Sample as Sample_,
-    )
-
-    Sample: TypeAlias = Sample_
-else:
-    Sample: TypeAlias = type[object]  # type: ignore[misc,no-redef]
+#: The record a cache read or write leaves behind for whatever is watching.
+#: Nothing watches by default, so it is the most general type there is.
+Sample: TypeAlias = type[object]
 
 
 _T = TypeVar("_T")
@@ -403,8 +397,6 @@ class RemoteDynamoPGOCache(RedisRemoteCache):
 
 def create_cache(
     key: str,
-    is_fbcode: bool = False,
-    fb_cache_cls: str | None = None,
     oss_cache_cls: str | None = None,
     *,
     local_cache_cls: str | None = None,
@@ -420,15 +412,6 @@ def create_cache(
         this_module = sys.modules[__name__]
         if local_cache_cls is not None:
             cache_cls = getattr(this_module, local_cache_cls)
-            return cache_cls(key)
-        elif is_fbcode:
-            if fb_cache_cls is None:
-                raise AssertionError("fb_cache_cls must not be None in fbcode")
-            import tensorplay.compiler.backends.stax.fb.remote_cache
-
-            cache_cls = getattr(
-                tensorplay.compiler.backends.stax.fb.remote_cache, fb_cache_cls
-            )
             return cache_cls(key)
         else:
             if oss_cache_cls is None:
