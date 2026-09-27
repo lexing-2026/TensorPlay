@@ -30,12 +30,15 @@ from ..kernel_inputs import KernelInputs
 from ..ir import (
     BaseView,
     Buffer as _Buffer,
+    ExternKernel,
     FlexibleLayout,
     Layout,
+    ReinterpretView,
     compute_required_storage_length,
 )
 from ..loops import V
 from .ir import ChoiceCaller, CutedslChoiceCaller
+from .mm_common import use_aten_gemm_kernels
 from ..loops import contiguous_strides, dtype_name
 from ..heuristics.template.params import DictKernelTemplateParams, KernelTemplateParams
 from ..runtime.triton_helpers import get_constexprs
@@ -1331,6 +1334,50 @@ class TritonTemplateKernel:
         if self.body.getvalue() != "":
             raise AssertionError("Body should be clear before adding a modification")
         return self.subgraphs[subgraph_number]
+
+    def get_stride_and_maybe_freeze_layout(self, node) -> list[int]:
+        """The strides a body should see for one of the kernel's operands.
+
+        An operand whose layout is still open could be given any strides, so a
+        body that hard-codes them is only correct if the layout is settled
+        first.  Where there is a call into the framework to fall back on, the
+        strides are computed as if it were settled and written down as a
+        constraint instead -- so a second template that wants different strides
+        is caught here rather than by a kernel that quietly reads the wrong
+        elements.
+
+        A view is left alone: its strides are already decided by the layout it
+        is a view of, and a view does not have a name of its own to record a
+        constraint against.
+        """
+
+        # realizing for safety
+        ExternKernel.realize_input(node)
+        layout = node.data.layout
+        node_name = node.get_name()
+
+        if isinstance(layout, FlexibleLayout) and not isinstance(
+            node, ReinterpretView
+        ):
+            if not use_aten_gemm_kernels() or self.always_freeze_layout:
+                # No framework fallback available, or the caller has said to
+                # always freeze, so settle it now.
+                node.data.freeze_layout()
+            else:
+                # Compute what the strides WOULD be if frozen, without freezing.
+                fixed_layout_copy = layout.get_fixed_layout_without_freezing()
+                existing = V.graph.buffer_layout_constraints.get(node_name)
+                if existing is not None and existing != fixed_layout_copy:
+                    raise AssertionError(
+                        f"Layout constraint mismatch for {node_name}: "
+                        f"existing {existing} vs new {fixed_layout_copy}"
+                    )
+                else:
+                    V.graph.buffer_layout_constraints[node_name] = fixed_layout_copy
+
+                return list(fixed_layout_copy.stride)
+        # Already frozen or not an open layout, just return current strides
+        return node.get_stride()
 
     def _generate_index_from_tma_index(
         self,
