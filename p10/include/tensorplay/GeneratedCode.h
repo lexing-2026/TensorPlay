@@ -17,7 +17,10 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <thread>
+#include <vector>
 
+#include "Allocator.h"
 #include "Exception.h"
 #include "Macros.h"
 #include "Profiler.h"
@@ -25,6 +28,100 @@
 
 namespace tensorplay {
 namespace generated {
+
+// Which worker of a launch this is, counted from zero.
+//
+// A kernel that gives each worker its own scratch needs to name that scratch, and
+// the name has to be different per worker and the same on every run -- so it is
+// a thread's own number rather than anything about where it was scheduled.  Zero
+// is the thread that started the launch, which is also the one doing the last
+// piece of the work itself.
+inline int& thread_num_slot() {
+    static thread_local int num = 0;
+    return num;
+}
+
+TP_ALWAYS_INLINE int get_thread_num() {
+    return thread_num_slot();
+}
+
+// Hand a range to the pool, in pieces, and call back with each piece's bounds.
+//
+// The pieces follow from a static schedule rather than from a queue, so a piece's
+// bounds follow from where it starts: two workers cannot be handed the same
+// element, and what one gets does not depend on what the others finished.  The
+// calling thread takes a piece too, rather than only waiting -- otherwise a
+// launch of one piece would spawn nothing and pay for the pool to find that out.
+//
+// A grain of zero or less means the caller has no opinion, so the pieces are as
+// wide as they can be while there are still as many of them as there are
+// workers: any wider and some worker has nothing to do, and any narrower and the
+// cost of handing out a piece starts to show.
+template <typename Body>
+void parallel_for(int64_t begin, int64_t end, int64_t grain, Body body) {
+    const int64_t total = end - begin;
+    if (total <= 0) {
+        return;
+    }
+    const unsigned reported = std::thread::hardware_concurrency();
+    int64_t workers = reported < 1u ? 1 : static_cast<int64_t>(reported);
+
+    int64_t chunk = grain;
+    if (chunk <= 0) {
+        // As many pieces as there are workers, so none is left with nothing and
+        // none is handed out more than once.
+        chunk = (total + workers - 1) / workers;
+        if (chunk < 1) {
+            chunk = 1;
+        }
+    }
+
+    const int64_t by_chunk = (total + chunk - 1) / chunk;
+    if (workers > by_chunk) {
+        workers = by_chunk;
+    }
+    if (workers <= 1) {
+        body(begin, end);
+        return;
+    }
+    // Each worker's run is a whole number of pieces, so every run but the last is
+    // the same length and a worker can tell where it ends without asking anyone.
+    const int64_t per = ((total + workers - 1) / workers + chunk - 1) / chunk * chunk;
+
+    std::vector<std::thread> pool;
+    pool.reserve(static_cast<size_t>(workers - 1));
+    int64_t at = begin;
+    for (int64_t t = 1; t < workers; ++t) {
+        int64_t stop = at + per;
+        if (stop > end) {
+            stop = end;
+        }
+        if (stop <= at) {
+            break;
+        }
+        const int64_t num = static_cast<int64_t>(t);
+        pool.emplace_back([=]() {
+            thread_num_slot() = static_cast<int>(num);
+            body(at, stop);
+        });
+        at = stop;
+    }
+    thread_num_slot() = 0;
+    body(at, end);
+    for (auto& thread : pool) {
+        thread.join();
+    }
+}
+
+// Where host memory comes from.
+//
+// A kernel that allocates -- a scratch buffer whose size the body worked out, or
+// a packed copy of weights -- asks the runtime rather than the operating system,
+// because the runtime is what knows how much of it is already held and what would
+// have to be faulted in for more.
+inline Allocator* getCPUAllocator() {
+    return tensorplay::getCPUAllocator();
+}
 
 // The width a reduced-precision value is carried out in.
 //
