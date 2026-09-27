@@ -1633,3 +1633,89 @@ class _AtenDistributedOptimizationsConfig:
 
 
 aten_distributed_optimizations = _AtenDistributedOptimizationsConfig()
+
+
+#: Whether a program of the graph's own has been given a pass to run before
+#: the graph is cut, and one to run after it has been cut.
+_pre_fusion_custom_pass = None
+_post_fusion_custom_pass = None
+
+#: Whether a program of the graph's own has been given a pass to run over the
+#: graph as a whole, and one to run over each piece of it.
+joint_custom_pre_pass = None
+joint_custom_post_pass = None
+
+#: Whether constants that are the same in two pieces of a graph are folded
+#: once for both rather than once for each.
+joint_graph_constant_folding = True
+
+#: Whether the pattern that recognises a sequence of operations is applied.
+pattern_matcher = True
+
+#: Whether a piece of a graph is written out as it is, which is what lets a
+#: fusion be seen rather than inferred.
+debug_fusion: bool = os.environ.get("TP_DEBUG_FUSION") == "1"
+
+#: Whether work is started as soon as it is chosen, and whether starting it
+#: is ordered so the longest is first.
+reorder_for_compute_comm_overlap = False
+reorder_for_compute_comm_overlap_passes: list = []
+
+#: How much of a device a graph must keep busy before overlapping its
+#: communication with its computation is worth the ordering it costs.
+min_overlap_ratio = 1.1
+
+#: How far apart two operations may be and still be written as one kernel, and
+#: how much memory writing them together may cost over writing them apart.
+combo_kernel_max_distance: int = 64
+combo_kernel_peak_memory_pct_threshold: float | None = 0.05
+combo_kernel_peak_memory_increase_gb: float | None = None
+
+#: Whether a scatter into a tensor whose contents are known is rewritten as
+#: what it amounts to, which is cheaper than the scatter itself.
+optimize_scatter_upon_const_tensor = (
+    os.environ.get("TP_OPTIMIZE_SCATTER_UPON_CONST_TENSOR", "1") == "1"
+)
+
+#: Whether work that is written but not needed is left out.
+use_dce: bool = True
+
+#: Whether a candidate is written out on its own so that a program may name
+#: the class that chooses for it.
+inductor_choices_class: Callable[[], Any] | None = None
+
+#: Whether a candidate is benchmarked across devices rather than on one.
+distributed_max_autotune_gemm = (
+    os.environ.get("TP_DISTRIBUTED_MAX_AUTOTUNE_GEMM") == "1"
+)
+
+
+def decide_compile_threads() -> int:
+    """How many candidates may be chosen at once.
+
+    A number the environment names is that number, because a program that
+    names one has a reason for it that nothing here can see.  Failing that, a
+    single thread on a platform where starting threads is unreliable, and
+    otherwise however many the machine has.
+    """
+
+    import logging
+
+    from .utils import get_num_threads
+
+    log = logging.getLogger(__name__)
+
+    if "TP_COMPILE_THREADS" in os.environ:
+        compile_threads = int(os.environ["TP_COMPILE_THREADS"])
+        log.info("compile_threads set to %d via env", compile_threads)
+    elif sys.platform == "win32":
+        compile_threads = 1
+        log.info("compile_threads set to 1 for win32")
+    else:
+        cpu_count = get_num_threads()
+        if not cpu_count:
+            raise AssertionError(f"expected nonzero cpu_count, got {cpu_count}")
+        compile_threads = min(32, cpu_count)
+        log.info("compile_threads set to %d", compile_threads)
+
+    return compile_threads
