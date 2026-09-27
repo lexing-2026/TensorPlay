@@ -471,6 +471,15 @@ use_launch_metadata_schema: bool = (
     os.environ.get("TP_USE_LAUNCH_METADATA_SCHEMA", "1") == "1"
 )
 
+# Whether a tuning reports how its candidates ranked, rather than only which
+# one won.  The ranking is what says whether the search found something close
+# to the winner or barely improved on the first thing tried -- a question the
+# winning time alone cannot answer, and one worth asking whenever a tuning
+# turns out to be slow.
+max_autotune_report_choices_stats: bool = (
+    os.environ.get("TP_MAX_AUTOTUNE_REPORT_CHOICES_STATS", "1") == "1"
+)
+
 # Whether the product's candidates are searched exhaustively or by the table.
 # Exhaustive costs far more to compile and finds configurations the table does
 # not have, which is worth it for a shape that runs for a long time.

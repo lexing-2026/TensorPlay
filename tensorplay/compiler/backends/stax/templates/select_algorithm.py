@@ -12,6 +12,8 @@ import contextlib
 import dataclasses
 from collections import defaultdict
 import functools
+import json
+import sys
 import hashlib
 import itertools
 import logging
@@ -72,6 +74,8 @@ from ..codegen.wrapper import pexpr
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
 from ..autotune_process import TritonBenchmarkRequest
 from ..utils import do_bench_using_profiling
+from ..compile_log import timed_block, trace_structured
+from tensorplay.testing import assert_close
 
 #: Whether a candidate's result is checked against what the operation's own
 #: kernel produced.  On by default because a template that computes the wrong
@@ -3635,6 +3639,16 @@ class AutotuneArgs(NamedTuple):
     out_extern: Any
     expected: Any = None
 
+    def verify(self, **kwargs):
+        """Check the answer, not only how fast it arrived.
+
+        A candidate that is fastest and wrong is not a candidate, and a timing
+        cannot tell the two apart -- so what was produced is compared with what
+        was expected, and the comparison is the one a reader would make.
+        """
+
+        assert_close(self.out_extern, self.expected, **kwargs)
+
     @staticmethod
     def from_choice_args(
         example_inputs, example_inputs_extern, out, out_extern, expected
@@ -3707,6 +3721,96 @@ def filter_choices_by_desc_regex(choices: list) -> list:
         return choices
     matcher = re.compile(regex)
     return [choice for choice in choices if matcher.search(choice.description)]
+
+
+def _autotune_metadata(input_nodes) -> dict[str, str]:
+    """Say what the values being tuned for look like, in words.
+
+    Two searches that timed the same kernel on differently-shaped values are
+    not comparable, and neither are two records of the same search.  So the
+    shape, the layout and the strides go into the record of the search itself,
+    both as they are and as the size solver would eventually settle them --
+    because which of the two a search actually ran under is itself worth
+    knowing.
+    """
+
+    return {
+        "autotune_strides": ", ".join([str(n.get_stride()) for n in input_nodes]),
+        "autotune_dtypes": ", ".join([str(n.get_dtype()) for n in input_nodes]),
+        "autotune_shape": ", ".join(
+            ["x".join(map(str, n.get_size())) for n in input_nodes]
+        ),
+        "autotune_offset": ", ".join([str(n.get_layout().offset) for n in input_nodes]),
+        "autotune_strides_hinted": ", ".join(
+            [
+                str(V.graph.sizevars.optimization_hints(n.get_stride()))
+                for n in input_nodes
+            ]
+        ),
+        "autotune_shape_hinted": ", ".join(
+            [
+                "x".join(
+                    map(
+                        str,
+                        V.graph.sizevars.optimization_hints(n.get_size()),
+                    )
+                )
+                for n in input_nodes
+            ]
+        ),
+    }
+
+
+def _log_autotune_choices_stats(
+    event_name: str, timings: dict
+) -> None:
+    """Report how the candidates ranked, not only which one won.
+
+    The winning time says what was chosen and nothing about whether the search
+    earned it: a search that barely improved on the first candidate it tried
+    and one that ruled out nine near-misses look identical from the winner
+    alone.  So where the best template candidate sat in the ranking is recorded
+    alongside it, together with the time it would have taken had it been
+    chosen -- which is the number that says what the search was worth.
+    """
+
+    if not timings:
+        return None
+
+    metadata: dict = {
+        "num_choices": len(timings),
+        "num_triton_choices": len(
+            [c for c in timings if isinstance(c, TritonTemplateCaller)]
+        ),
+    }
+
+    sorted_choices = sorted(timings, key=timings.__getitem__)
+    best_choice = sorted_choices[0]
+    metadata["best_kernel"] = best_choice.name
+    if best_choice.description:
+        metadata["best_kernel_desc"] = best_choice.description
+    metadata["best_time"] = timings[best_choice]
+
+    best_triton_pos = next(
+        (
+            i
+            for i, choice in enumerate(sorted_choices)
+            if isinstance(choice, TritonTemplateCaller)
+        ),
+        None,
+    )
+    if best_triton_pos is not None:
+        metadata["best_triton_pos"] = best_triton_pos
+        best_triton_kernel = sorted_choices[best_triton_pos]
+        if best_triton_pos != 0:
+            metadata["best_triton_time"] = timings[best_triton_kernel]
+            metadata["best_triton_kernel"] = best_triton_kernel.name
+            if best_triton_kernel.description:
+                metadata["best_triton_kernel_desc"] = best_triton_kernel.description
+
+    payload = json.dumps(metadata, default=str)
+    trace_structured(event_name, metadata)
+    sys.stderr.write(f"Autotune Choices Stats:\n{payload}\n")
 
 
 class AlgorithmSelectorCache:
@@ -4266,6 +4370,56 @@ class AlgorithmSelectorCache:
 
     def add_preprocessing_fn(self, fn) -> None:
         self.preprocessing_fns.append(fn)
+
+    def _register_default_preprocessing_fns(self) -> None:
+        """Put back the two filters that every search starts from.
+
+        Kept apart from whatever a caller added so that clearing the caller's
+        can leave these in place; a search with neither filter would time
+        candidates that were never going to be chosen.
+        """
+
+        self.add_preprocessing_fn(filter_choices_by_name_regex)
+        self.add_preprocessing_fn(filter_choices_by_desc_regex)
+
+    def autotune(
+        self,
+        name,
+        input_nodes,
+        layout,
+        input_gen_fns,
+        choices,
+        hint_override: int | None = None,
+        is_collective=False,
+        precompile_key: str | None = None,
+    ):
+        """Time every candidate and keep the fastest answer.
+
+        The search is timed as a whole, because a search that takes longer than
+        the kernel it is choosing for has cost more than it saved -- and that
+        is only visible if the search is measured rather than the candidates
+        alone.  What it was measured on is recorded with it, since two
+        searches over differently-shaped values are not comparable.
+        """
+
+        log.debug("Starting autotuning")
+
+        with timed_block(f"{name}_template_autotuning"):
+            trace_structured(f"{name}_template_autotuning", _autotune_metadata(input_nodes))
+            benchmark_results = self.benchmark(
+                choices,
+                input_nodes,
+                layout,
+                input_gen_fns,
+                hint_override=hint_override,
+                is_collective=is_collective,
+                precompile_key=precompile_key,
+            )
+            if config.max_autotune_report_choices_stats:
+                _log_autotune_choices_stats(
+                    f"{name}_template_autotuning", benchmark_results
+                )
+            return benchmark_results
 
     def clear_preprocessing_fns(self) -> None:
         """The candidates are filtered by name and by description before they are
