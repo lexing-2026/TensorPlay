@@ -84,7 +84,11 @@ class ExternStep(Step):
 
         return (
             [_resolve(i, env) for i in self.kernel.inputs],
-            list(self.kernel.constant_args),
+            # A call out to a named operation is handed constants beside its
+            # inputs; a written kernel is handed none, everything it needs being
+            # in the tile it was chosen with.  So this is asked of the kernel
+            # and a kernel that has none is passed none.
+            list(getattr(self.kernel, "constant_args", ())),
         )
 
     def run(self, env: dict) -> None:

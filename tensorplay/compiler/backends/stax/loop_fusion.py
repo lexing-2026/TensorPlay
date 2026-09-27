@@ -298,20 +298,24 @@ class KernelScheduler:
 
     def _build(self):
         for position, op in enumerate(self.graph.operations):
-            # These are calls out to something already written rather than a
-            # nest of loops this compiler is laying out: one is named by its
-            # overload, the others by the name they are launched under. None of
-            # them has a body to record, and asking one for its body is asking
-            # for something it does not have.
-            if isinstance(
-                op,
-                (
-                    IrFallbackKernel,
-                    ExternKernelOut,
-                    ExternKernelAlloc,
-                    TritonTemplateBuffer,
-                ),
-            ):
+            # Both kinds are a call out to something already written rather
+            # than a nest of loops this compiler is laying out: one is named by
+            # its overload, the other by the name it is launched under. Neither
+            # has a body to record, and asking one for its body is asking for
+            # something it does not have.
+            if isinstance(op, TritonTemplateBuffer):
+                # A written template's kernel is already a kernel: there is no
+                # nest here to lay out and no call described by a name to make
+                # either.  Laying this route out around it would mean deciding
+                # where a kernel someone else already wrote goes, which is not
+                # this route's question to answer.
+                from .codegen.loop_triton import PlanError
+
+                raise PlanError(
+                    "a region holding a written template's kernel is not laid "
+                    "out by this route"
+                )
+            if isinstance(op, (IrFallbackKernel, ExternKernelOut, ExternKernelAlloc)):
                 node = ExternNode(
                     position,
                     op,

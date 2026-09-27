@@ -87,17 +87,23 @@ def _steps_for(graph, groups) -> list:
 def compile_graph(graph_module, example_inputs, *, scheduler: KernelScheduler | None = None) -> LoopProgram:
     """Lower, schedule and compile ``graph_module``; returns a callable."""
 
-    from .loops import set_fake_mode
+    from .loops import set_fake_mode, set_graph
     from .virtualized import V as shared_V
 
     with set_fake_mode(FakeTensorMode(allow_non_fake_inputs=True)), \
             shared_V.set_fake_mode(FakeTensorMode(allow_non_fake_inputs=True)):
         graph = GraphLowering(graph_module, list(example_inputs)).run()
-    plan = scheduler if scheduler is not None else KernelScheduler(graph)
-    graph.scheduler = plan
-    groups = plan.fuse()
-    steps = _steps_for(graph, groups)
-    program = LoopProgram(graph, steps)
+    # Everything from here on is being done about this region, and anything
+    # asked along the way -- what a kernel reads, what a store writes, how big
+    # an extent is -- is answered by the region those answers belong to.  So
+    # the region is published for all of it and not only for the part that
+    # builds the schedule.
+    with set_graph(graph):
+        plan = scheduler if scheduler is not None else KernelScheduler(graph)
+        graph.scheduler = plan
+        groups = plan.fuse()
+        steps = _steps_for(graph, groups)
+        program = LoopProgram(graph, steps)
     # This artifact runs generated kernels, and it carries no reverse pass.
     program._tensorplay_codegen = "triton"  # type: ignore[attr-defined]
     program._tensorplay_backward_codegen = None  # type: ignore[attr-defined]
