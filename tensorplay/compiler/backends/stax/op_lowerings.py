@@ -73,6 +73,18 @@ from .ir import (
     ops_wrapper,
     validate_ir,
 )
+# Divisions and index arithmetic as symbolic expressions rather than as
+# arithmetic on numbers not yet known: what a boundary or a position
+# works out to is a function of numbers the program has not produced
+# yet, and a shape written before then is a guess.
+from tensorplay.graph.experimental.sympy_functions import (
+    CeilDiv,
+    FloorDiv,
+    Max,
+    Min,
+    Mod,
+    ModularIndexing,
+)
 from .loops import (
     V,
     as_index,
@@ -3765,3 +3777,213 @@ def cummin(x: Any, dim: Any = 0) -> Any:
     if values is None:
         return fallback_cummin(x, dim=dim)
     return values, indices
+
+
+def _compute_slice_index(index: Any, size: Any, default: Any = None) -> Any:
+    """Where a slice boundary lands, counted the way a slice counts it.
+
+    A boundary can be named from the back, clamped to the axis, or left out
+    entirely, and which of those it is may not be known until the program runs.
+    So the cases are asked in the order they can be settled, and each one that
+    can be settled says what the boundary is: inside the axis as written, wrapped
+    around from the back, clamped to either end, or -- when only the sign is
+    known -- the boundary clamped and wrapped.  The two clamping cases are
+    separated because clamping a name from the back and clamping a name from the
+    front are different operations on the same number.
+
+    Returns nothing when the boundary is a number whose value is not known
+    until the program runs: the index it stands for cannot be written down
+    before the program does, and a guess would be a guess about which elements
+    are read.
+    """
+
+    if index is None:
+        return default
+
+    guard = V.graph.sizevars.guard_or_false
+    index = sympy.expand(index)
+    size = sympy.expand(size)
+    if guard(sympy.And(sympy.Ge(index, 0), sympy.Le(index, size))):
+        return index
+    elif guard(sympy.And(sympy.Lt(index, 0), sympy.Ge(index, -size))):
+        return index + size
+    elif guard(sympy.Gt(index, size)):
+        return size
+    elif guard(sympy.Lt(index, -size)):
+        return 0
+    elif guard(sympy.Ge(index, 0)):
+        return Min(index, size)
+    elif guard(sympy.Lt(index, 0)):
+        return Max(index + size, 0)
+    return None
+
+
+def _clamp_slice_end_to_start(end: Any, start: Any) -> Any:
+    """A slice's end, never before its start.
+
+    An end before the start describes no positions at all, which is a slice of
+    nothing rather than an error -- so the end is raised to the start, and where
+    the two are not known to be in either order the smaller of them is taken,
+    which is the only answer that holds either way.
+    """
+
+    if V.graph.sizevars.statically_known_geq(end, start):
+        return end
+    if V.graph.sizevars.statically_known_leq(end, start):
+        return start
+    return Max(end, start)
+
+
+@register_lowering(aten.select_scatter, type_promotion_kind=None)
+def select_scatter(x: Any, src: Any, dim: Any, index: Any) -> Any:
+    """One position of an axis replaced, the rest kept.
+
+    Every position of the axis asks whether it is the one being replaced, and
+    answers with the replacement or with what was there -- so the whole value is
+    written, and what makes it a scatter is the one position that reads
+    elsewhere.  The replacement is lined up against the whole shape first, since
+    it is asked at every position and a value of fewer dimensions would be lined
+    up by its innermost axes.
+
+    A position whose value is not known until the program runs is left to the
+    framework: which position is replaced would be a guess, and a guess here is
+    a guess about which value is written.
+    """
+
+    src = to_dtype(src, x.get_dtype())
+    x_loader = x.make_loader()
+    dim = _validate_dim(x, dim, 0)
+    if V.graph.sizevars.guard_or_false(sympy.Lt(index, 0)):
+        index = index + x.get_size()[dim]
+    elif V.graph.sizevars.guard_or_false(sympy.Ge(index, 0)):
+        pass
+    else:
+        return fallback_handler(aten.select_scatter.default)(x, src, dim, index)
+
+    V.graph.sizevars.check_leq(0, index)
+    V.graph.sizevars.check_lt(index, x.get_size()[dim])
+    src = lower_expand(unsqueeze(src, dim), x.get_size())
+    src_loader = src.make_loader()
+
+    def inner_fn(idx: Any) -> Any:
+        return ops.where(
+            ops.eq(
+                ops.index_expr(idx[dim], tp.int32),
+                ops.index_expr(index, tp.int32),
+            ),
+            src_loader(idx),
+            x_loader(idx),
+        )
+
+    return Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=list(x.get_size()),
+    )
+
+
+@register_lowering(aten.slice_scatter, type_promotion_kind=None)
+def slice_scatter(
+    x: Any, src: Any, dim: Any = 0, start: Any = None, end: Any = None, step: Any = 1
+) -> Any:
+    """A run of positions along an axis replaced, the rest kept.
+
+    Which positions are replaced is a run described by its two boundaries, and
+    the boundaries can be named from the back, clamped, or left out -- so they
+    are resolved to positions first, and how many positions that is decides how
+    far along the axis the replacement is read.  Every position then asks whether
+    it falls in the run, and answers with the replacement or with what was there.
+
+    The two boundaries are checked against each other rather than trusted: a run
+    whose end is before its start is a run of no positions, not a run running
+    backwards.
+    """
+
+    src = to_dtype(src, x.get_dtype())
+    x_loader = x.make_loader()
+    dim = _validate_dim(x, dim, 0)
+    dim_size = x.get_size()[dim]
+
+    if any(has_free_unbacked_symbols(v) for v in (start, end, dim_size)):
+        start_index = _compute_slice_index(start, dim_size, 0)
+        if end is not None and V.graph.sizevars.statically_known_equals(
+            end, sys.maxsize
+        ):
+            end_index = dim_size
+        else:
+            end_index = _compute_slice_index(end, dim_size, dim_size)
+
+        if start_index is None or end_index is None:
+            return fallback_handler(aten.slice_scatter.default)(
+                x, src, dim, start, end, step
+            )
+
+        start = start_index
+        end = _clamp_slice_end_to_start(end_index, start)
+    else:
+        start, end = ir.SliceView.normalize_start_end(x, dim, start, end)
+
+    src_size = list(x.get_size())
+    src_size[dim] = FloorDiv(end - start + (step - 1), step)
+    if len(src.get_size()) != len(src_size):
+        raise AssertionError("expected src and slice to have the same rank")
+    for actual, expected in zip(src.get_size(), src_size):
+        V.graph.sizevars.check_equals(actual, expected)
+    src = lower_expand(src, src_size)
+    src_loader = src.make_loader()
+
+    def inner_fn(idx: Any) -> Any:
+        if start == 0 and end == dim_size and step == 1:
+            # A run covering the whole axis at every position is the
+            # replacement and nothing else, so there is nothing to choose.
+            return src_loader(idx)
+
+        idx_dim = ops.index_expr(idx[dim], tp.int64)
+        src_idx = list(idx)
+        src_idx[dim] = FloorDiv(idx[dim] - start, step)
+
+        mask = []
+        if start != 0:
+            mask.append(
+                ops.ge(
+                    idx_dim,
+                    ops.index_expr(sympy.expand(start), tp.int64),
+                )
+            )
+        if end != dim_size:
+            mask.append(
+                ops.lt(
+                    idx_dim,
+                    ops.index_expr(sympy.expand(end), tp.int64),
+                )
+            )
+        if step != 1:
+            mask.append(
+                ops.eq(
+                    ops.index_expr(
+                        ModularIndexing(idx[dim] - start, 1, step), tp.int64
+                    ),
+                    ops.constant(0, tp.int64),
+                )
+            )
+        if not (mask):
+            raise AssertionError("expected: mask")
+        mask = functools.reduce(ops.and_, mask)
+        src_val = ops.masked(
+            mask,
+            lambda: src_loader(src_idx),
+            0 if is_integer_type(x) else 0.0,
+        )
+        return ops.where(
+            mask,
+            src_val,
+            x_loader(idx),
+        )
+
+    return Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=list(x.get_size()),
+    )
