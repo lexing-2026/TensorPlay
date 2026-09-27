@@ -31,8 +31,10 @@ from ..kernel_inputs import KernelInputs
 from ..ir import (
     BaseView,
     Buffer as _Buffer,
+    ComputedBuffer,
     ExternKernel,
     FlexibleLayout,
+    InputBuffer,
     Layout,
     ReinterpretView,
     compute_required_storage_length,
@@ -50,16 +52,18 @@ from .triton import CHOICES
 from ..codegen.subgraph import SubgraphChoiceCaller
 from ..codegen.simd import IterationRangesEntry, IterationRangesRoot
 from ..codegen.common import CSE, IndentedBuffer, OpOverrides
-from ..codegen.triton import IndexingOptions, texpr
+from ..codegen.triton import IndexingOptions, texpr, TritonSymbols
 from ..utils import (
     get_dtype_size,
     sympy_dot,
+    sympy_index_symbol,
     sympy_product,
     triton_type,
     triton_type_to_torch,
     unique,
 )
 from ..kernel_scheduler import count_flops_fx
+from ..ops_handler import StoreMode
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
 
 #: Whether a candidate's result is checked against what the operation's own
@@ -447,6 +451,171 @@ def template_subgraph_index_dtype_nodes(
                 nodes.append(buffer)
                 seen_names.add(dep.name)
     return tuple(nodes)
+
+
+class ModificationWrapper(V.WrapperHandler):
+    """Stands in for the graph's own operations while a subgraph is rewritten.
+
+    A subgraph that a template asks to have modified is not lowered as it was
+    written: some of its inputs are the caller's own values rather than the
+    kernel's operands, and one of its results is wanted as a value rather than
+    as a store.  Lowering it through this wrapper turns those into the reads
+    and the assignment the modified form needs, and leaves everything else to
+    be lowered as usual.
+    """
+
+    def __init__(
+        self,
+        kernel,
+        subgraph_number: int,
+        fixed_inputs: dict[str, Any],
+        mask: str | None,
+        input_shapes: dict[str, tuple[str, ...]] | None = None,
+        input_dtypes=None,
+    ):
+        super().__init__(V.ops)
+        self.name = f"PlaceholderSubstitution_{subgraph_number}"
+        self.kernel = kernel
+        self.fixed_inputs = fixed_inputs
+        self.mask = mask
+        self.input_shapes = input_shapes or {}
+        self.input_dtypes = input_dtypes or {}
+        extra_input_shapes = self.input_shapes.keys() - self.fixed_inputs.keys()
+        extra_input_dtypes = self.input_dtypes.keys() - self.fixed_inputs.keys()
+        if extra_input_shapes:
+            raise AssertionError(
+                f"input_shapes keys must match fixed inputs: {extra_input_shapes}"
+            )
+        if extra_input_dtypes:
+            raise AssertionError(
+                f"input_dtypes keys must match fixed inputs: {extra_input_dtypes}"
+            )
+
+    def load(self, name: str, index: sympy.Expr):
+        """Read something the subgraph wanted: an operand, or the caller's value."""
+
+        if name not in self.fixed_inputs:
+            index_str = self._process_indexing(index)
+            var = self._add_kernel_input(name)
+            buffer = V.graph.get_buffer(name)
+            var_dtype = buffer.dtype
+            line = f"tl.load({var} + {index_str})"
+
+            if (
+                var_dtype in (tp.float16, tp.bfloat16)
+                and config.triton.codegen_upcast_to_fp32
+            ):
+                line += ".to(tl.float32)"
+                var_dtype = tp.float32
+
+            out = self.kernel.cse.generate(
+                self.kernel.compute,
+                line,
+                dtype=var_dtype,
+                shape=TritonSymbols.get_block_shape(index),
+            )
+            return out
+
+        shape = self.input_shapes.get(name, ())
+        return self.kernel.cse.generate(
+            self.kernel.compute,
+            f"({self.fixed_inputs[name]})",
+            dtype=self._fixed_input_dtype(name),
+            shape=shape,
+        )
+
+    def _index_dtype(self) -> tp.dtype:
+        return tp.int64 if self.kernel.index_dtype == "tl.int64" else tp.int32
+
+    def _normalize_input_dtype(self, dtype):
+        if isinstance(dtype, tp.dtype):
+            return dtype
+        if dtype == "index":
+            return self._index_dtype()
+        raise AssertionError(f"Unexpected fixed input dtype: {dtype}")
+
+    def _fixed_input_dtype(self, name: str) -> tp.dtype:
+        """What type a caller-supplied value is, worked out from whatever it is.
+
+        The caller may name the type, or hand over a value whose type is
+        already known, or hand over a plain Python value -- and a plain bool is
+        not a one-byte integer as far as a kernel is concerned.
+        """
+
+        if name in self.input_dtypes:
+            return self._normalize_input_dtype(self.input_dtypes[name])
+
+        value = self.fixed_inputs[name]
+        if isinstance(value, CSEVariable) and value.dtype is not None:
+            return value.dtype
+        if isinstance(value, str):
+            cse_value = self.kernel.cse.varname_map.get(value)
+            if cse_value is not None and cse_value.dtype is not None:
+                return cse_value.dtype
+        if isinstance(value, bool):
+            return tp.bool
+        if isinstance(value, float):
+            return tp.float32
+        return tp.float32
+
+    def indirect_indexing(self, index_var: str, size, check, wrap_neg=True):
+        """An index that was named rather than computed."""
+
+        return sympy_index_symbol(str(index_var))
+
+    def store(
+        self, name: str, index: sympy.Expr, value: "CSEVariable", mode: StoreMode = None
+    ) -> str:
+        """An accumulation into a buffer, which is the only store allowed here.
+
+        Everything else in a subgraph is a read or a result; a store would be
+        a write the caller did not ask for and cannot see.  An accumulation is
+        different -- it is how a subgraph contributes to something the caller
+        already owns -- but it is still only allowed where the caller said
+        which of the elements are really there.
+        """
+
+        if self.mask is None:
+            raise AssertionError("Mask is required for inner stores in modifications")
+        if mode != "atomic_add":
+            raise AssertionError("Only atomic_add is supported for inner stores")
+
+        buf_name = self._add_kernel_input(name)
+        index_str = self._broadcast_index(index, f"{value}.shape")
+        return f"tl.atomic_add({buf_name} + {index_str}, {value}, {self.mask}, sem='relaxed')"
+
+    def _add_kernel_input(self, name: str) -> str:
+        return self.kernel.args.input(name)
+
+    def _process_indexing(self, index: sympy.Expr) -> str:
+        return self.kernel.kexpr(self.kernel.rename_indexing(index))
+
+    def _broadcast_index(self, index: sympy.Expr, shape: str) -> str:
+        """An index written so it has the shape of what it indexes into.
+
+        A single index and a number are both one element, and neither of them
+        has a shape the runtime can broadcast on its own, so each is given one.
+        """
+
+        index = sympy.sympify(index)
+        index_str = self._process_indexing(index)
+        index_shape = TritonSymbols.get_block_shape(index)
+        if (
+            index_shape
+            and len(index_shape) == 1
+            and all(
+                V.graph.sizevars.statically_known_equals(sympy.sympify(d), 1)
+                for d in index_shape
+            )
+        ):
+            return f"tl.broadcast_to(tl.reshape({index_str}, []), {shape})"
+        if not index_shape and len(index.free_symbols) == 0:
+            return f"tl.full({shape}, {index_str}, INDEX_DTYPE)"
+        return f"tl.broadcast_to({index_str}, {shape})"
+
+
+# Function name, followed by args and kwargs.
+RecordedEventsType = list[tuple[str, list[Any], dict[str, Any]]]
 
 
 @dataclasses.dataclass()
@@ -1311,6 +1480,166 @@ class TritonTemplateKernel:
             template.render(**template_env, **kwargs),
             self.render_hooks,
         )
+
+    def _handle_scatter_graph(self, scatter_graph):
+        """One scatter's contribution, as an assignment rather than a store.
+
+        A scatter writes into a gradient the caller allocated for it, and that
+        gradient is laid out contiguously whatever the scatter's own layout is,
+        so the position of an element is worked out against the caller's
+        strides rather than the scatter's.
+        """
+
+        if not isinstance(scatter_graph, ComputedBuffer):
+            raise AssertionError(
+                f"scatter_graph must be an instance of ComputeBuffer but got "
+                f"{type(scatter_graph)}"
+            )
+
+        def contiguous_strides(x):
+            # We always create a fresh contiguous grad for scattering into
+            return sum(
+                x_i * stride for x_i, stride in zip(x, scatter_graph.get_stride())
+            )
+
+        return scatter_graph.data.store_output(  # type: ignore[attr-defined]
+            scatter_graph.name, contiguous_strides, []
+        )
+
+    def make_load(self, name, indices, mask):
+        """A read a body writes out itself, for a body doing its own arithmetic.
+
+        `load_input` leaves a placeholder and has the read worked out for it,
+        which is right for most bodies.  A body that is computing its own
+        index -- one that is gathering, or indexing a tensor it did not read
+        elementwise -- needs the read as text it can put inside its own
+        expression, so this hands it over.
+        """
+
+        if not isinstance(indices, (list, tuple)):
+            raise AssertionError(
+                f"expected indices to be list or tuple, got {type(indices)}"
+            )
+        if not isinstance(name, str):
+            raise AssertionError(f"expected name to be str, got {type(name)}")
+        if not isinstance(mask, str):
+            raise AssertionError(f"expected mask to be str, got {type(mask)}")
+        stride = self.get_stride_and_maybe_freeze_layout(self.named_input_nodes[name])
+        indices = list(map(OpOverrides.paren, indices))
+        if len(indices) != len(stride):
+            raise AssertionError(
+                f"expected len(indices) == len(stride), got {len(indices)} and {len(stride)}"
+            )
+        index = " + ".join(
+            f"{texpr(self.rename_indexing(s))} * {i}" for s, i in zip(stride, indices)
+        )
+        return f"tl.load({name} + ({index}), {mask}, other=0.0)"
+
+    def indexing(
+        self,
+        index: sympy.Expr,
+        *,
+        dense_indexing=False,
+        copy_shape=None,
+        override_mask=None,
+        block_ptr=False,
+        tma_compatibility_checker=None,
+        mask_constant_index=False,
+        allow_reduction_invariant_indexing=False,
+    ):
+        """Index as this kernel indexes, rather than as a kernel normally would.
+
+        A body's own mask and the shape it wants broadcast to are the ones the
+        surrounding read or write established, so those are what an index
+        inside the body has to agree with.
+        """
+
+        return super().indexing(
+            index,
+            dense_indexing=False,
+            # We pass template_out as the shape to broadcast the indexing to as
+            # the mask might be broadcast to the output shape
+            copy_shape=self.template_out_shape,
+            override_mask=self.template_mask,
+            block_ptr=block_ptr,
+            tma_compatibility_checker=tma_compatibility_checker,
+            mask_constant_index=mask_constant_index,
+            allow_reduction_invariant_indexing=allow_reduction_invariant_indexing,
+        )
+
+    def codegen_range_tree(self):
+        pass  # ignore default codegen
+
+    def modification(
+        self,
+        subgraph_number: int,
+        output_name: str | None,
+        mask: str | None = None,
+        input_shapes: dict[str, tuple[str, ...]] | None = None,
+        input_dtypes=None,
+        **fixed_inputs,
+    ) -> str:
+        """Lower one subgraph, with the caller's values standing in for its inputs.
+
+        A template asks for this where it wants part of itself rewritten: the
+        subgraph named is lowered as usual, except that the values passed here
+        are what it reads instead of the kernel's operands, and its result is
+        assigned to `output_name` rather than stored.
+
+        Passing no output name means the subgraph only contributes stores -- a
+        scatter into something the caller owns -- and passing a name when it
+        produced nothing, or nothing when it produced something, is a mistake
+        in the template rather than something to guess at.
+        """
+
+        num = 0
+        out = None
+        scatters = []
+        while f"mod_{subgraph_number}_{num}" in self.subgraph_bodies:
+            num += 1
+        with self.create_subgraph_body(f"mod_{subgraph_number}_{num}"):
+            subgraph = self._get_subgraph(subgraph_number)
+            modification_handler = ModificationWrapper(
+                self,
+                subgraph_number,
+                fixed_inputs,
+                mask,
+                input_shapes,
+                input_dtypes,
+            )
+            with V.set_ops_handler(modification_handler):
+                if not isinstance(subgraph, (ComputedBuffer, list)):
+                    raise AssertionError(
+                        f"Expected the subgraph to be a ComputedBuffer or a "
+                        f"List[ComputedBuffer], got {type(subgraph)}"
+                    )
+                # Handle scatter stores
+                if isinstance(subgraph, list):
+                    for scatter_graph in subgraph:
+                        scatters.append(self._handle_scatter_graph(scatter_graph))
+                elif isinstance(subgraph.data, InputBuffer):
+                    out = subgraph.data.make_loader()(())
+                else:
+                    out = subgraph.data.inner_fn(())
+
+            self.codegen_body()
+            if output_name is not None:
+                if not isinstance(output_name, str):
+                    raise AssertionError(
+                        f"expected output_name to be str, got {type(output_name)}"
+                    )
+                if out is None:
+                    raise AssertionError("out must not be None")
+                self.body.writeline(f"{output_name} = {out.value}")
+            else:
+                if out is not None:
+                    raise AssertionError("out must be None when output_name is None")
+                for scatter in scatters:
+                    self.body.writeline(str(scatter))
+
+            body_val = self.body.getvalue()
+            self.cse.invalidate(OrderedSet())
+            return body_val
 
     def _get_subgraph(self, subgraph_number: int):
         """The subgraph a hook was asked about, checked that it is there.
