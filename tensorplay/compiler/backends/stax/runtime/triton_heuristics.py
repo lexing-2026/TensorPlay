@@ -761,6 +761,84 @@ class CachingAutotuner(KernelInterface):
         self.launchers: list = []
         self.compile_results: list = []
         self._cached_launcher = None
+        # Why each configuration could not be measured, keyed by the
+        # configuration.  Kept apart from a time so that "could not run" is
+        # never mistaken for "ran slowly".
+        self.benchmark_failure_reasons: dict = {}
+        self._debug_call = None
+        self.compile_id = None
+
+    @staticmethod
+    def _close_compiled_kernel(kernel) -> None:
+        """Let go of a compiled kernel's device resources, if it can be let go.
+
+        A kernel holds a loaded binary and a module, and holding either across
+        a measurement that has finished is what makes a long series of
+        measurements run out of memory.  Not every version of the runtime
+        offers a way to release one, so the older route is kept as a fallback;
+        it is safe to reach more than once because the module is already gone
+        by then.
+        """
+
+        if kernel is None:
+            return
+        close = getattr(kernel, "close", None)
+        if close is not None:
+            close()
+            return
+        module = getattr(kernel, "module", None)
+        if module is not None:
+            delete = getattr(kernel, "__del__", None)
+            if delete is not None:
+                delete()
+
+    def release_benchmark_artifacts(self) -> None:
+        """Let go of everything a measurement was holding.
+
+        A measurement compiles kernels and loads them, and the point of
+        measuring is to throw most of them away.  Doing that explicitly is
+        what keeps a sweep over many configurations from growing without
+        bound, and it is also what lets the same kernel be measured again
+        afterwards.
+        """
+
+        for launcher in self.launchers:
+            kernel = getattr(launcher, "__self__", None)
+            self._close_compiled_kernel(kernel)
+
+        for result in self.compile_results:
+            self._close_compiled_kernel(getattr(result, "kernel", None))
+
+        self.launchers = []
+        self.compile_results = []
+        self.benchmark_failure_reasons.clear()
+        self._cached_launcher = None
+        self._debug_call = None
+
+    def is_statically_launchable(self):
+        """Whether every compiled form can be started without going through
+        the runtime's own launcher machinery.
+
+        Such a kernel can be written down whole and started again later, which
+        is what makes it worth keeping across runs -- so this is asked before
+        deciding whether a measurement is worth keeping at all.
+        """
+
+        if not self.compile_results:
+            return False
+        return all(
+            isinstance(x, StaticTritonCompileResult) for x in self.compile_results
+        )
+
+    def set_compile_info(self, compile_id, is_backward: bool) -> None:
+        """Note which build this is, and whether it is the backward one.
+
+        The backward pass is timed separately from the forward one, so a
+        measurement has to know which of the two it is measuring.
+        """
+
+        self.compile_id = compile_id
+        self.is_backward = is_backward
 
     def _create_compile_meta(self, cfg) -> dict:
         """What this configuration is compiled with, and what it is not.
