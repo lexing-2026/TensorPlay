@@ -704,6 +704,12 @@ memory_pool = os.environ.get("TP_MEMORY_POOL", "intermediates")
 #: costs a step and buys only the ability to look at the code on its own.
 cpp_wrapper = os.environ.get("TP_CPP_WRAPPER", "0") == "1"
 
+#: Which scheduling an accelerator's work is written by, by the name that
+#: scheduling is registered under.  Said here rather than chosen at the call
+#: site so that a program can be run through another one to see what the other
+#: one makes of it.
+cuda_backend: str = os.environ.get("TP_CUDA_BACKEND", "triton")
+
 #: Whether a measured call may keep a result geometry that is still open.
 #:
 #: A candidate that has to be told the exact geometry cannot be measured
@@ -1015,6 +1021,11 @@ class _TritonConfig:
         os.environ.get("TP_COOPERATIVE_REDUCTIONS", "0") == "1"
     )
 
+    #: A reduction that could be spread across ranks must be, rather than
+    #: being asked whether spreading it is worth it.  Said here so that a
+    #: program that wanted it does not have to say it per call.
+    force_cooperative_reductions = False
+
     #: Choose among the tunings while the graph is being built, rather than at
     #: the first launch.  Left unset, the choice is made at the first launch.
     autotune_at_compile_time: bool | None = (
@@ -1113,6 +1124,9 @@ class _TraceConfig:
     )
 
 
+trace = _TraceConfig()
+
+
 def effective_provenance_tracking_level() -> int:
     """The level actually in force, which a timeline record raises to one.
 
@@ -1124,8 +1138,6 @@ def effective_provenance_tracking_level() -> int:
         return max(trace.provenance_tracking_level, 1)
     return trace.provenance_tracking_level
 
-
-trace = _TraceConfig()
 
 
 # ---------------------------------------------------------------------------

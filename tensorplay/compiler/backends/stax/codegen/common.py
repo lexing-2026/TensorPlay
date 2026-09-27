@@ -555,8 +555,15 @@ def init_backend_registration() -> None:
     if get_scheduling_for_device("cpu") is not None:
         return
     from .cpp import CppScheduling
-    from .simd import SIMDScheduling
+    from .cuda_combined_scheduling import CUDACombinedScheduling
     from .wrapper import PythonWrapperCodegen
+
+    #: An accelerator's work may be written by more than one printer, and which
+    #: one is named rather than fixed, so that the choice is a setting and not a
+    #: branch in every method that writes a kernel.
+    cuda_backends = {
+        "triton": CUDACombinedScheduling,
+    }
 
     register_backend_for_device(
         "cpu",
@@ -565,7 +572,7 @@ def init_backend_registration() -> None:
     )
     register_backend_for_device(
         "cuda",
-        lambda scheduling: SIMDScheduling(scheduling),
+        lambda scheduling: cuda_backends[config.cuda_backend](scheduling),
         PythonWrapperCodegen,
     )
 
