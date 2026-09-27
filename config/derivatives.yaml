@@ -430,10 +430,10 @@
   self: grad.reshape(self.shape())
 
 - name: log_softmax(Tensor self, int dim, ScalarType dtype=Undefined) -> Tensor
-  self: _log_softmax_backward_data(grad, result, dim, dtype)
+  self: _log_softmax_backward_data(grad, result, dim, self.dtype())
 
 - name: softmax(Tensor self, int dim, ScalarType dtype=Undefined) -> Tensor
-  self: _softmax_backward_data(grad, result, dim, dtype)
+  self: _softmax_backward_data(grad, result, dim, self.dtype())
 
 - name: nll_loss(Tensor self, Tensor target, Tensor? weight=None, int reduction=1, int ignore_index=-100) -> (Tensor output, Tensor total_weight)
   self: nll_loss_backward(grad, self, target, weight, reduction, ignore_index, total_weight)
