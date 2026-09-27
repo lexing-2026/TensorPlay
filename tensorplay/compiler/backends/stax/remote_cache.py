@@ -1,0 +1,506 @@
+"""Caches that are not the local filesystem, and the counting of every cache.
+
+A cache that outlives the process is a cache whose cost is paid once and whose
+benefit is kept, so what goes in it and what comes back out has to survive
+being written down and read by something that is not the process that wrote
+it.  That is what the two halves here are for: a backend that deals in bytes
+and knows where they go, and a serializer that turns the thing being cached
+into bytes and back.
+
+Which of them is used is decided by a name rather than by an import, so that a
+caller naming a cache does not have to know which of these exists.
+
+A cache that cannot be reached is not an error.  A build that would have been
+faster with one is not worse, only not faster, so every failure to reach a
+backend is counted and stepped over.
+"""
+
+from __future__ import annotations
+
+import atexit
+import collections
+import dataclasses
+import functools
+import json
+import logging
+import os
+import sys
+import typing
+from abc import abstractmethod
+from typing import Any, Callable, Generic, TypeAlias, TypeVar, Union
+from typing_extensions import override
+
+from tensorplay._C._monitor import _WaitCounter
+
+from . import config
+from .compile_log import timed_block
+
+
+try:
+    import redis
+except ImportError:
+    redis = None  # type: ignore[assignment]
+
+
+log = logging.getLogger(__name__)
+
+
+if config.is_fbcode():
+    from rfe.scubadata.scubadata_py3 import (  # type: ignore[import-not-found]
+        Sample as Sample_,
+    )
+
+    Sample: TypeAlias = Sample_
+else:
+    Sample: TypeAlias = type[object]  # type: ignore[misc,no-redef]
+
+
+_T = TypeVar("_T")
+_U = TypeVar("_U")
+
+
+remote_fx_cache_get_timed = functools.partial(
+    timed_block,
+    "FbRemoteFxGraphCache.get",
+)
+remote_fx_cache_put_timed = functools.partial(
+    timed_block,
+    "FbRemoteFxGraphCache.put",
+)
+
+
+class RemoteCacheBackend(Generic[_T]):
+    """Where bytes are actually kept.
+
+    Most of these are somewhere else entirely, but a backend on the local
+    filesystem is behind the same interface, so a caller does not have to care
+    which it has.  A caller that wants to cache something structured should use
+    a `RemoteCache` rather than coming here directly.
+    """
+
+    def __init__(self) -> None:
+        self._name = f"backend:{type(self).__name__}"
+
+    @abstractmethod
+    def _get(self, key: str) -> _T | None:
+        pass
+
+    @abstractmethod
+    def _put(self, key: str, data: _T) -> None:
+        pass
+
+    def get(self, key: str) -> _T | None:
+        try:
+            value = self._get(key)
+            cache_stats.get(self._name, value)
+        except Exception:
+            cache_stats.exception(self._name)
+            raise
+        return value
+
+    def put(self, key: str, data: _T) -> None:
+        try:
+            self._put(key, data)
+            cache_stats.put(self._name)
+        except Exception:
+            cache_stats.exception(self._name)
+            raise
+
+
+# Serde that encodes from _T to _U and decodes from _U to _T.
+class RemoteCacheSerde(Generic[_T, _U]):
+    @abstractmethod
+    def encode(self, data: _T) -> _U:
+        pass
+
+    @abstractmethod
+    def decode(self, data: _U) -> _T:
+        pass
+
+
+JsonDataTy: TypeAlias = Union[  # noqa: UP007
+    int, float, str, bool, dict[str, "JsonDataTy"], list["JsonDataTy"], None
+]
+
+
+class RemoteCacheJsonSerde(RemoteCacheSerde[JsonDataTy, bytes]):
+    def encode(self, data: JsonDataTy) -> bytes:
+        return bytes(json.dumps(data), "ascii")
+
+    def decode(self, data: bytes) -> JsonDataTy:
+        return json.loads(data)
+
+
+class RemoteCachePassthroughSerde(RemoteCacheSerde[_T, _T]):
+    def encode(self, data: _T) -> _T:
+        return data
+
+    def decode(self, data: _T) -> _T:
+        return data
+
+
+class LocalCacheBackend(RemoteCacheBackend[bytes]):
+    """A backend on the filesystem, where the key is the path."""
+
+    @override
+    def _get(self, key: str) -> bytes | None:
+        try:
+            with open(key, "rb") as fd:
+                return fd.read()
+        except FileNotFoundError:
+            return None
+
+    @override
+    def _put(self, key: str, data: bytes) -> None:
+        os.makedirs(os.path.dirname(key), exist_ok=True)
+        from . import codecache
+
+        codecache.write_atomic(key, data)
+
+
+# This class is the top of a RemoteCache. A RemoteCache is fundamentally made of
+# three parts:
+#
+# 1. The controller (this class).
+# 2. A serializer/deserializer (instance of RemoteCacheSerde).
+# 3. A backend (instance of RemoteCacheBackend).
+#
+# To write (`put`), the RemoteCache takes data, uses the RemoteCacheSerde to
+# convert it for the backend and passes it to the backend.
+#
+# Conversely when reading (`get`), the RemoteCache takes data from the backend,
+# uses the RemoteCacheSerde to convert it and returns it.
+#
+# The RemoteCacheBackend is generic on _U - which is the type of data the
+# backend can directly cache (usually `bytes`).
+#
+# The RemoteCacheSerde is responsible for converting between _T (the type of
+# data the RemoteCache accepts in `put` and returns in `get`) and _U.
+#
+# When instantiating a RemoteCache you should subclass, not directly create a
+# RemoteCache: the reported cache is the concrete type, so which one it is has
+# to be visible.
+class RemoteCache(Generic[_T]):
+    backend_override_cls: Callable[[], RemoteCacheBackend[Any]] | None = None
+
+    def __init__(
+        self, backend: RemoteCacheBackend[_U], serde: RemoteCacheSerde[_T, _U]
+    ) -> None:
+        # Support for testing to mock out the backend on a class-by-class basis.
+        if (override_cls := self.__class__.backend_override_cls) is not None:
+            self.backend = override_cls()
+        else:
+            self.backend = backend
+        self.serde = serde
+
+    # See if the cache contains `key`. Returns `None` if the value is not
+    # present in the cache.
+    def get(self, key: str) -> _T | None:
+        with _WaitCounter("tensorplay.remote_cache.get").guard():
+            sample = self._create_sample()
+            try:
+                result = self._get(key, sample)
+                cache_stats.get(type(self).__name__, result)
+            except Exception as e:
+                cache_stats.exception(type(self).__name__)
+                if sample:
+                    sample.fail_reason = str(e)
+                raise
+            finally:
+                self._log_sample(sample)
+            return result
+
+    # Add `value` to the cache with the key `key`. Note that `None` is not a
+    # valid value even if _T supports it (because you can't tell the difference
+    # between `None` and a missing cache entry).
+    def put(self, key: str, value: _T) -> None:
+        with _WaitCounter("tensorplay.remote_cache.put").guard():
+            if value is None:
+                raise AssertionError("cannot put None into the cache")
+            sample = self._create_sample()
+            try:
+                self._put(key, value, sample)
+                cache_stats.put(type(self).__name__)
+            except Exception as e:
+                cache_stats.exception(type(self).__name__)
+                if sample:
+                    sample.fail_reason = str(e)
+                raise
+            finally:
+                self._log_sample(sample)
+
+    # Used to convert data from the cache into structured data.
+    def _decode(self, data: _U, sample: Sample | None) -> _T:  # type: ignore[override]
+        return self.serde.decode(data)  # type: ignore[arg-type]
+
+    # Used to convert structured data into data for the cache.
+    def _encode(self, value: _T, sample: Sample | None) -> object:  # returns _U
+        return self.serde.encode(value)
+
+    # Get structured data from the cache.
+    # Separate from `get` so that it can be overridden.
+    def _get(self, key: str, sample: Sample | None) -> _T | None:
+        if data := self._backend_get(key):
+            return self._decode(data, sample)
+        return None
+
+    # Get unstructured data from the cache.
+    # Separate from `get` so that it can be overridden.
+    # Returns _U - but we aren't actually generic on _U
+    def _backend_get(self, key: str) -> object:
+        return self.backend.get(key)
+
+    # Put structured data into the cache.
+    # Separate from `put` so that it can be overridden.
+    def _put(self, key: str, value: _T, sample: Sample | None) -> None:
+        data = self._encode(value, sample)
+        self._backend_put(key, data)
+
+    # Put unstructured data into the cache.
+    # Separate from `put` so that it can be overridden.
+    # Takes data: _U - but we aren't actually generic on _U
+    def _backend_put(self, key: str, data: object) -> None:
+        self.backend.put(key, data)
+
+    # Create a logging Sample - used with internal loggers to monitor cache
+    # effectiveness.
+    def _create_sample(self) -> Sample | None:
+        return None
+
+    # Write the logging Sample to the logger.
+    def _log_sample(self, sample: Sample | None) -> None:
+        pass
+
+
+class RedisRemoteCacheBackend(RemoteCacheBackend[bytes]):
+    """A backend on a shared store, which is what makes a cache outlive a build."""
+
+    _redis: Any | None = None
+
+    def __init__(self, cache_id: str) -> None:
+        super().__init__()
+        if not redis:
+            raise RuntimeError("redis not available but required for remote cache")
+
+        if "TP_REDIS_URL" in os.environ:
+            self._redis = redis.Redis.from_url(os.environ["TP_REDIS_URL"])
+        else:
+            self._redis = redis.Redis(
+                host=os.environ.get("TP_REDIS_HOST", "localhost"),
+                port=int(os.environ.get("TP_REDIS_PORT", 6379)),
+            )
+
+    @override
+    def _get(self, key: str) -> bytes | None:
+        if not self._redis:
+            # Either redis wasn't found or we already had some trouble...
+            return None
+
+        try:
+            value = self._redis.get(key)
+        except redis.exceptions.ConnectionError:
+            # Redis is lazy and doesn't actually attempt to connect until the
+            # first use. Mark it as unavailable now.
+            self._redis = None
+            return None
+
+        # In theory redis.get() can return an Awaitable as well...
+        if not (value is None or isinstance(value, bytes)):
+            raise AssertionError(f"expected bytes or None, got {type(value)}")
+        return value
+
+    @override
+    def _put(self, key: str, data: bytes) -> None:
+        if not self._redis:
+            # Either redis wasn't found or we already had some trouble...
+            return
+
+        try:
+            self._redis.set(key, data)
+        except redis.exceptions.ConnectionError:
+            # Redis is lazy and doesn't actually attempt to connect until the
+            # first use. Mark it as unavailable now.
+            self._redis = None
+
+
+class RedisRemoteCache(RemoteCache[JsonDataTy]):
+    def __init__(self, cache_id: str) -> None:
+        # Special test handling: If we're just going to override the backend
+        # anyway don't require redis
+        if self.__class__.backend_override_cls:
+            backend = typing.cast(RemoteCacheBackend[bytes], None)
+        else:
+            backend = RedisRemoteCacheBackend(cache_id)
+        serde = RemoteCacheJsonSerde()
+        super().__init__(backend, serde)
+        version = 1  # consistency between various types of keys
+        self._key_fmt = f"pt2:{cache_id}::{{key}}:c{version}"
+
+    def _get_key(self, key: str) -> str:
+        return self._key_fmt.format(key=key)
+
+    @override
+    def _get(self, key: str, sample: Sample | None) -> JsonDataTy | None:
+        key = self._get_key(key)
+        return super()._get(key, sample)
+
+    @override
+    def _put(self, key: str, value: JsonDataTy, sample: Sample | None) -> None:
+        key = self._get_key(key)
+        super()._put(key, value, sample)
+
+
+class LocalCache(RemoteCache[JsonDataTy]):
+    def __init__(self, cache_id: str) -> None:
+        # Local caches use the per-operation key as the filesystem path. Accept
+        # cache_id so they can be constructed through create_cache like remote
+        # caches.
+        backend = LocalCacheBackend()
+        serde = RemoteCacheJsonSerde()
+        super().__init__(backend, serde)
+
+    @override
+    def _get(self, key: str, sample: Sample | None) -> JsonDataTy | None:
+        try:
+            return super()._get(key, sample)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            # An entry that cannot be read is an entry that was never written
+            # usefully -- a build that is half-finished can leave one behind.
+            # Reading it must not fail the build.
+            log.warning(
+                "Ignoring corrupt local cache entry %s: %s: %s",
+                key,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+
+class LocalAutotuneCache(LocalCache):
+    # Keep a distinct cache type for cache stats and test backend overrides.
+    pass
+
+
+class RemoteAutotuneCache(RedisRemoteCache):
+    pass
+
+
+class RemoteBundledAutotuneCache(RedisRemoteCache):
+    pass
+
+
+class RemoteFxGraphCache(RedisRemoteCache):
+    pass
+
+
+class RemoteAOTAutogradCache(RedisRemoteCache):
+    pass
+
+
+class RemoteDynamoPGOCache(RedisRemoteCache):
+    pass
+
+
+def create_cache(
+    key: str,
+    is_fbcode: bool = False,
+    fb_cache_cls: str | None = None,
+    oss_cache_cls: str | None = None,
+    *,
+    local_cache_cls: str | None = None,
+) -> RemoteCache[JsonDataTy] | None:
+    """The cache named by a name, or nothing if there is not one to be had.
+
+    Named rather than imported, so that a caller naming a cache does not have
+    to know which of these exist -- and so that a build without a given cache
+    still runs, which is the whole point of a cache.
+    """
+
+    try:
+        this_module = sys.modules[__name__]
+        if local_cache_cls is not None:
+            cache_cls = getattr(this_module, local_cache_cls)
+            return cache_cls(key)
+        elif is_fbcode:
+            if fb_cache_cls is None:
+                raise AssertionError("fb_cache_cls must not be None in fbcode")
+            import tensorplay.compiler.backends.stax.fb.remote_cache
+
+            cache_cls = getattr(
+                tensorplay.compiler.backends.stax.fb.remote_cache, fb_cache_cls
+            )
+            return cache_cls(key)
+        else:
+            if oss_cache_cls is None:
+                raise AssertionError("oss_cache_cls must not be None")
+            cache_cls = getattr(this_module, oss_cache_cls)
+            return cache_cls(key)
+
+    except Exception:
+        log.warning("Unable to create cache", exc_info=True)
+        return None
+
+
+# Some simple stat capture
+@dataclasses.dataclass
+class _CacheStat:
+    miss: int = 0
+    hit: int = 0
+    put: int = 0
+    exception: int = 0
+
+    def __str__(self) -> str:
+        return f"{{hit: {self.hit}, miss: {self.miss}, put: {self.put}, exception: {self.exception}}}"
+
+
+class _CacheStats:
+    """What every cache was asked for and what it gave back.
+
+    A cache that is never read from is not a cache, it is a cost, and this is
+    what says which of the two a given one turned out to be.
+    """
+
+    _stats: dict[str, _CacheStat]
+
+    def __init__(self) -> None:
+        self._stats = collections.defaultdict(_CacheStat)
+
+    def miss(self, name: str, count: int = 1) -> None:
+        self._stats[name].miss += count
+
+    def hit(self, name: str, count: int = 1) -> None:
+        self._stats[name].hit += count
+
+    def get(self, name: str, value: object | None) -> None:
+        if value is None:
+            self.miss(name)
+        else:
+            self.hit(name)
+
+    def put(self, name: str, count: int = 1) -> None:
+        self._stats[name].put += count
+
+    def exception(self, name: str, count: int = 1) -> None:
+        self._stats[name].exception += count
+
+
+cache_stats = _CacheStats()
+
+
+@atexit.register
+def dump_cache_stats() -> None:
+    if not log.isEnabledFor(logging.INFO):
+        return
+
+    import io
+
+    out = io.StringIO()
+
+    if not cache_stats._stats:
+        print(" None", file=out)
+    else:
+        print(file=out)
+        for k, v in sorted(cache_stats._stats.items()):
+            print(f"  {k}: {v}", file=out)
+
+    log.info("Cache Metrics:%s", out.getvalue())
