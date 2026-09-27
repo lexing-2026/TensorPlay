@@ -49,6 +49,7 @@ __all__ = [
     "AsyncAutotuner",
     "CuteDSLBenchmarkRequest",
     "ExternKernelBenchmarkRequest",
+    "get_visible_devices_env_var",
     "ExternKernelCPUBenchmarkRequest",
     "ExternKernelGPUBenchmarkRequest",
     "TritonBenchmarkRequest",
@@ -964,6 +965,53 @@ AUTOTUNE_POOL_INACTIVITY_TIMEOUT = int(
 autotuning_log = tp.getArtifactLogger(__name__, "autotuning")
 
 
+#: Which environment variable says which devices this process may use, per kind
+#: of device.  What it is called and what it takes are the driver's business, not
+#: this one's, so which one to set is asked rather than assumed.
+_visible_device_env_var_maps = {
+    "cuda": "CUDA_VISIBLE_DEVICES",
+    "xpu": "ZE_AFFINITY_MASK",
+}
+
+
+def get_visible_devices_env_var(gpu_type: str | None = None) -> str:
+    """The setting that limits this process to some of the devices.
+
+    A process that is measuring a candidate wants one device and no other: two
+    of them on one device are not two measurements, they are one measurement
+    competing with itself.  Which setting says that depends on the driver, so
+    this is the one place that knows.
+    """
+
+    if gpu_type is None:
+        from .runtime.benchmarking import get_gpu_type
+
+        gpu_type = get_gpu_type()
+    if gpu_type not in _visible_device_env_var_maps:
+        raise ValueError(f"Unsupported gpu_type: {gpu_type}")
+    return _visible_device_env_var_maps[gpu_type]
+
+
+def _device_count_for_pool() -> int:
+    """How many candidates may be measured at once without measuring each other.
+
+    One per device, and no more: a second worker on a device already in use does
+    not make the measurement faster, it makes the number wrong.  A machine whose
+    device count cannot be asked for gets one, which is right if slow and not
+    wrong.
+    """
+
+    try:
+        import tensorplay as tp
+
+        from .runtime.benchmarking import get_gpu_type
+
+        count = tp.get_device_module(get_gpu_type()).device_count()
+    except Exception:
+        return 1
+    return max(1, int(count))
+
+
 def _cache_env_for_subprocess() -> dict[str, str | None]:
     env_vars = [
         "TP_CACHE_DIR",
@@ -1200,8 +1248,11 @@ class AutotuneProcessPool:
         # Use 'spawn' context to avoid CUDA fork issues
         # Workers are spawned lazily on first submit(), not here
         ctx = mp.get_context("spawn")
+        # One worker per device: a second worker on a device that is already in
+        # use does not measure anything twice as fast, it measures two candidates
+        # competing with each other and reports both numbers as wrong.
         pool = ProcessPoolExecutor(
-            max_workers=1,
+            max_workers=_device_count_for_pool(),
             mp_context=ctx,
         )
         atexit.register(self._shutdown)
