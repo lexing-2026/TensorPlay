@@ -46,6 +46,7 @@ __all__ = [
     "CppBenchmarkRequest",
     "NonzeroWorkspaceNotSupportedError",
     "TensorMeta",
+    "CuteDSLBenchmarkRequest",
     "ExternKernelBenchmarkRequest",
     "ExternKernelCPUBenchmarkRequest",
     "ExternKernelGPUBenchmarkRequest",
@@ -445,9 +446,7 @@ class TritonBenchmarkRequest(BenchmarkRequest):
         is current at the time.
         """
 
-        from .codecache import load_by_key_path
-
-        mod = load_by_key_path(
+        mod = PyCodeCache.load_by_key_path(
             self.module_cache_key,
             self.module_path,
             set_sys_modules=False,
@@ -595,9 +594,7 @@ class TritonBenchmarkRequest(BenchmarkRequest):
         """
 
         try:
-            from .codecache import load_by_key_path
-
-            mod = load_by_key_path(
+            mod = PyCodeCache.load_by_key_path(
                 self.module_cache_key,
                 self.module_path,
                 set_sys_modules=False,
@@ -733,6 +730,72 @@ class ExternKernelCPUBenchmarkRequest(
     CPUDeviceBenchmarkMixin, ExternKernelBenchmarkRequest
 ):
     pass
+
+
+class CuteDSLBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest):
+    """A request to measure a kernel written in a Python kernel dialect.
+
+    The same shape as a request for a compiled kernel, and for the same reason:
+    what crosses into the process that measures is a name and a description of
+    what the kernel reads and writes, never the tensors.  What differs is where
+    the kernel lives -- a module written out and loaded there, as one written in
+    a language the compiler reads at run time has to be, rather than a binary.
+    """
+
+    def __init__(
+        self,
+        kernel_name: str,
+        input_tensor_meta: TensorMeta | list[TensorMeta],
+        output_tensor_meta: TensorMeta | list[TensorMeta],
+        extra_args: tuple[Any, ...],
+        source_code: Any,
+    ) -> None:
+        super().__init__(kernel_name, input_tensor_meta, output_tensor_meta, extra_args)
+
+        # The source is finished here rather than where it is run: a template
+        # renders parts of it, and a request cannot carry parts.
+        self.source_code = source_code.finalize_all()
+        self.module_cache_key, self.module_path = PyCodeCache.write(self.source_code)
+
+    def make_run_fn(
+        self, *input_tensors: Any, out: Any
+    ) -> Callable[[], None]:
+        """The closure that runs this kernel once, wherever the request landed.
+
+        The kernel is a function the module defines under a name derived from
+        the kernel's, so that name is where it is looked for -- and a module
+        that does not define it is worth saying what it does define, because
+        that is the difference between a name that moved and a module that is
+        not what was written.
+        """
+
+        mod = PyCodeCache.load_by_key_path(
+            self.module_cache_key,
+            self.module_path,
+            set_sys_modules=False,
+        )
+
+        from .codegen.cutedsl.cutedsl_kernel import MAIN_SUFFIX
+
+        main_func_name = f"{self.kernel_name}_{MAIN_SUFFIX}"
+
+        if not hasattr(mod, main_func_name):
+            available = [name for name in dir(mod) if callable(getattr(mod, name))]
+            raise RuntimeError(
+                f"Could not find the main kernel function '{main_func_name}'. "
+                f"Available callables: {available}"
+            )
+
+        kernel_func = getattr(mod, main_func_name)
+
+        def run_kernel():
+            from .runtime.benchmarking import get_interface_for_device
+
+            device_interface = get_interface_for_device("cuda")
+            stream = device_interface.get_raw_stream(out.device.index)
+            return kernel_func(*input_tensors, out, *self.extra_args, stream=stream)
+
+        return run_kernel
 
 
 class SubgraphBenchmarkRequest(BenchmarkRequest):

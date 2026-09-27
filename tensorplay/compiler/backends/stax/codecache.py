@@ -20,7 +20,10 @@ import hashlib
 import logging
 import os
 import pickle
+import sys
 from functools import lru_cache
+
+from .compile_worker.utils import in_toplevel_process
 
 import functools
 import hashlib
@@ -528,6 +531,63 @@ class PyCodeCache:
     @classmethod
     def write(cls, source_code: str, extra: str = "") -> tuple[str, str]:
         return write(source_code, "py", extra=extra)
+
+    @classmethod
+    def load_by_key_path(
+        cls,
+        key: str,
+        path: str,
+        linemap: list[tuple[int, str]] | None = None,
+        attrs: dict[str, Any] | None = None,
+        *,
+        set_sys_modules: bool | None = None,
+    ):
+        """The module written to ``path`` under ``key``, built if not already here.
+
+        Asking by key and path rather than by source is how a module written in
+        one process is reached from another: what travels is where it was
+        written and what it was written from, and the source itself need not
+        travel at all -- it is already on disk, which is the same place for both
+        processes.
+
+        ``set_sys_modules`` registers the module under its own name, which is
+        what makes it reachable by name from a module that loads this one.  Left
+        unset, registration follows whether this is the process's own top
+        level, since that is the case in which nothing else will register it.
+
+        ``attrs`` are set on the module once it is built, and a module carrying
+        them is one this cache does not keep: a module with something bound into
+        it belongs to whoever bound it.
+        """
+
+        if linemap is None:
+            linemap = []
+
+        in_toplevel = in_toplevel_process()
+        set_sys_modules = in_toplevel if set_sys_modules is None else set_sys_modules
+
+        # Only a module with nothing bound into it is kept.
+        if attrs is None and path in cls.modules_no_attr:
+            mod = cls.modules_no_attr[path]
+            if set_sys_modules:
+                sys.modules.setdefault(mod.__name__, mod)
+            return mod
+
+        mod = _load_python_module(key, path)
+
+        if set_sys_modules:
+            cls.linemaps[path] = list(zip(*linemap))
+
+        if attrs is not None:
+            for k, v in attrs.items():
+                setattr(mod, k, v)
+
+        if in_toplevel:
+            if attrs is None:
+                cls.modules_no_attr[path] = mod
+
+            cls.modules.append(mod)
+        return mod
 
     @classmethod
     def load(
