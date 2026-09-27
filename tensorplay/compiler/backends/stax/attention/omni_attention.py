@@ -624,16 +624,41 @@ def writing_with_omni_indexer() -> Any:
         yield
 
 
-def generate_omni_flash_choice(template: Any, **kwargs: Any) -> Any:
-    """Write one way of the kernel, with positions naming dimensions.
+def wrap_choice_render_with_omni_indexer(choice: Any) -> None:
+    """Have one choice's kernel written with positions naming dimensions.
 
-    A failure is passed back rather than raised, because a way of writing a
-    kernel that this device cannot run is not an error -- it is one fewer thing
-    to measure among several, and the rest may still be the one that wins.
+    A choice is written twice, and only the second time is this device's work:
+    building the choice is a question of shapes, and rendering it is a question
+    of how the device reads them.  So the patch belongs around the second, and
+    the choice is left holding a renderer that applies it -- not a choice built
+    under it, which by the time anyone renders would have been built under
+    nothing.
+
+    The renderer a choice hands back is a pair, and only the part that actually
+    writes the kernel is wrapped.  What the other part builds -- the kernel's
+    own description of itself -- is asked before any of this is known, and does
+    not read a position.
     """
 
-    with patch_fixed_layout_indexer_for_cutedsl():
-        return template.generate(**kwargs)
+    original_make_kernel_render = choice.make_kernel_render
+
+    def make_kernel_render_with_patch(*args: Any, **kwargs: Any) -> Any:
+        render_kernel, render = original_make_kernel_render(*args, **kwargs)
+
+        def render_with_patch() -> Any:
+            with patch_fixed_layout_indexer_for_cutedsl():
+                return render()
+
+        return render_kernel, render_with_patch
+
+    choice.make_kernel_render = make_kernel_render_with_patch
+
+
+def wrap_choices_render_with_omni_indexer(choices: Any) -> None:
+    """The same, for every way of writing the kernel that was offered."""
+
+    for choice in choices:
+        wrap_choice_render_with_omni_indexer(choice)
 
 
 # ---------------------------------------------------------------------------
@@ -1657,8 +1682,7 @@ def create_omni_flash_attention_kernel(
     )
     error: Any = None
     for conf in configs:
-        error = generate_omni_flash_choice(
-            omni_flash_attention_cutedsl_template,
+        error = omni_flash_attention_cutedsl_template.maybe_append_choice(
             choices,
             input_nodes=input_nodes,
             layout=output_layout,
@@ -1682,6 +1706,10 @@ def create_omni_flash_attention_kernel(
 
     if not choices:
         raise RuntimeError(f"CuteDSL template failed: {error}")
+
+    # A choice is written when it is rendered, which is after this point, so
+    # the patch goes on the choice rather than on anything done here.
+    wrap_choices_render_with_omni_indexer(choices)
 
     input_gen_fns: Any = None
     if needs_block_mask:
@@ -1943,34 +1971,39 @@ def create_omni_flash_attention_backward_kernel(
 
     error: Any = None
     for conf in configs:
-        error = generate_omni_flash_choice(
-            omni_flash_attention_backward_cutedsl_template,
-            choices,
-            input_nodes=input_nodes,
-            layout=output_layout,
-            mutated_inputs=[grad_key, grad_value],
-            subgraphs=subgraphs or None,
-            SM_SCALE=scale,
-            HAS_SCORE_MOD=has_score_mod,
-            SCORE_MOD_VEC_SIZE=conf.score_mod_vec_size,
-            HAS_BLOCK_MASK=has_block_mask,
-            HAS_DQ_WRITE_ORDER=has_dq_write_order,
-            HAS_DQ_WRITE_ORDER_FULL=dq_write_order_full is not None,
-            HAS_DQ_KV_ORDER=has_dq_kv_order,
-            DQ_KV_ORDER_SPT=dq_kv_order_spt_for_flash,
-            HAS_DLSE=has_dlse,
-            AUX_SCALAR_SYMBOLS=aux_scalar_symbols,
-            SUPPORTS_DQ_KV_ORDER=supports_dq_kv_order,
-            SUPPORTS_SPT=supports_spt,
-            DETERMINISTIC_BACKWARD_ENABLED=deterministic_backward_enabled,
-            SPARSE_Q_BLOCK_SIZE=sparse_q_block_size,
-            SPARSE_KV_BLOCK_SIZE=sparse_kv_block_size,
+        error = (
+            omni_flash_attention_backward_cutedsl_template.maybe_append_choice(
+                choices,
+                input_nodes=input_nodes,
+                layout=output_layout,
+                mutated_inputs=[grad_key, grad_value],
+                subgraphs=subgraphs or None,
+                SM_SCALE=scale,
+                HAS_SCORE_MOD=has_score_mod,
+                SCORE_MOD_VEC_SIZE=conf.score_mod_vec_size,
+                HAS_BLOCK_MASK=has_block_mask,
+                HAS_DQ_WRITE_ORDER=has_dq_write_order,
+                HAS_DQ_WRITE_ORDER_FULL=dq_write_order_full is not None,
+                HAS_DQ_KV_ORDER=has_dq_kv_order,
+                DQ_KV_ORDER_SPT=dq_kv_order_spt_for_flash,
+                HAS_DLSE=has_dlse,
+                AUX_SCALAR_SYMBOLS=aux_scalar_symbols,
+                SUPPORTS_DQ_KV_ORDER=supports_dq_kv_order,
+                SUPPORTS_SPT=supports_spt,
+                DETERMINISTIC_BACKWARD_ENABLED=deterministic_backward_enabled,
+                SPARSE_Q_BLOCK_SIZE=sparse_q_block_size,
+                SPARSE_KV_BLOCK_SIZE=sparse_kv_block_size,
+            )
         )
         if error is not None and len(configs) == 1:
             raise RuntimeError(f"CuteDSL template failed: {error}")
 
     if not choices:
         raise RuntimeError(f"CuteDSL template failed: {error}")
+
+    # A choice is written when it is rendered, which is after this point, so
+    # the patch goes on the choice rather than on anything done here.
+    wrap_choices_render_with_omni_indexer(choices)
 
     input_gen_fns: Any = None
     if has_block_mask:
