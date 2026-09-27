@@ -6096,3 +6096,106 @@ class PartialRender:
         for key in self.replacement_hooks:
             self.finalize_hook(key)
         return self.code
+
+
+class DataProcessorChoiceCallerWrapper:
+    """A built choice whose inputs and outputs are adjusted around the kernel.
+
+    A kernel may want its arguments in an order or a shape the caller did not
+    hand over, and may produce a result the caller has to have adjusted back
+    before reading.  Both are said here rather than left to the kernel, so that
+    what the kernel is handed is what it asked for and what the caller gets back
+    is what it expected -- and neither the reordering nor the adjusting appears
+    in the kernel at all.
+    """
+
+    def __init__(self, wrapped: Any, preprocessor: Any, postprocessor: Any) -> None:
+        self._wrapped = wrapped
+        if preprocessor is not None:
+            self._preprocessor = preprocessor
+        else:
+            self._preprocessor = lambda x, y: (x, y)
+        if postprocessor is not None:
+            self._postprocessor = postprocessor
+        else:
+            self._postprocessor = lambda x: x
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped, name)
+
+    def benchmark(self, *args: Any, out: Any) -> float:
+        """Measure the kernel on what it wants, and give the caller back what it had.
+
+        The two are not the same buffers: the kernel may have been handed a
+        reordered copy, and its answer may be in a shape the caller did not ask
+        for.  So the caller's buffer is written from the answer rather than
+        replaced by it -- a caller that handed over a buffer of its own would
+        otherwise find it unchanged.
+        """
+
+        new_args, new_out = self._preprocessor(args, out)
+        result = self._wrapped.benchmark(*new_args, out=new_out)
+        new_out = self._postprocessor(new_out)
+        if out is not new_out:
+            out.copy_(new_out)
+        return result
+
+    def output_node(self) -> Any:
+        result = self._wrapped.output_node()
+        return self._postprocessor(result)
+
+    def __repr__(self) -> str:
+        return f"DataProcessorChoiceCallerWrapper({self._wrapped})"
+
+
+class DataProcessorTemplateWrapper:
+    """A template whose arguments are adjusted before the kernel sees them.
+
+    The adjustment is on the inputs and the outputs rather than inside the
+    kernel, so a kernel that is handed a reordered copy of its arguments is a
+    kernel written for the order it wants -- and the reordering is one thing in
+    one place rather than something every kernel that wants it repeats.
+    """
+
+    def __init__(
+        self,
+        wrapped_template_cls: Any,
+        preprocessor: Any,
+        postprocessor: Any,
+        **kwargs: Any,
+    ) -> None:
+        if preprocessor is not None:
+            self._preprocessor = preprocessor
+        else:
+            self._preprocessor = lambda x, y: (x, y)
+        if postprocessor is not None:
+            self._postprocessor = postprocessor
+        else:
+            self._postprocessor = lambda x: x
+        if "input_nodes" not in kwargs:
+            raise AssertionError("input_nodes argument required")
+        if "layout" not in kwargs:
+            raise AssertionError("layout argument required")
+
+        # Adjusted before the template is even built: a template that decides
+        # what it is from the arguments it was given has to be given the ones it
+        # is meant to decide from.
+        kwargs["input_nodes"], kwargs["layout"] = self._preprocessor(
+            kwargs["input_nodes"], kwargs["layout"]
+        )
+        self._wrapped = wrapped_template_cls(**kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped, name)
+
+    def maybe_append_choice(self, choices: list, **kwargs: Any) -> Any:
+        return type(self._wrapped).maybe_append_choice(self, choices, **kwargs)
+
+    def generate(self, **kwargs: Any) -> Any:
+        choice_caller = self._wrapped.generate(**kwargs)
+        return DataProcessorChoiceCallerWrapper(
+            choice_caller, self._preprocessor, self._postprocessor
+        )
+
+    def __repr__(self) -> str:
+        return f"DataProcessorTemplateWrapper({self._wrapped})"

@@ -10,6 +10,7 @@ computes the wrong thing, which is worse than one that does not compile.
 
 from __future__ import annotations
 
+from collections import namedtuple
 from typing import Any, Callable, Sequence
 from unittest.mock import patch
 
@@ -67,6 +68,12 @@ DTYPE_TO_CPP = {
 #: values, so an index computed at 32 bits would be wrong for a tensor larger
 #: than it can address.
 INDEX_TYPE = "int64_t"
+
+#: The three extents of a product, named.  Which is which matters and a tuple of
+#: three numbers does not say, so a product is described by name rather than by
+#: position -- and the name is what the kernels that were written for one shape
+#: of this are looking for.
+GemmBlocking = namedtuple("GemmBlocking", ["block_m", "block_n", "block_k"])
 
 
 class CppCSEVariable(CSEVariable):
