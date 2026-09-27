@@ -3070,3 +3070,175 @@ def _register_div_writing_forms() -> None:
 
 
 _register_div_writing_forms()
+
+
+def to_dtype(x: Any, dtype: Any, copy: bool = False) -> Any:
+    """The same values, read as another element type.
+
+    Whether the values are moved is a separate question from how they are read,
+    and asking for the same type again is the one case where they are the same
+    value rather than two: a conversion that produces no change is only a copy
+    if a copy was asked for.  Low-precision types are computed in a wider one
+    and converted back, so that what a consumer reads is a value it can do
+    arithmetic on without narrowing first.
+    """
+
+    src_dtype = x.get_dtype()
+    if src_dtype == dtype:
+        return clone(x) if copy else x
+
+    def _to_dtype(value: Any) -> Any:
+        result = ops.to_dtype(value, dtype, src_dtype=src_dtype)
+        if dtype in (torch.bfloat16, torch.float16):
+            result = ops.to_dtype(result, "float32")
+        return result
+
+    return pointwise(_to_dtype, x)
+
+
+#: An axis that cannot be walked by the loop this compiler generates is walked
+#: by the framework instead.  Both are the same computation; which one runs is
+#: decided per call, because whether an axis can be walked is a fact about its
+#: size that is not known until the program runs.
+fallback_cumsum = fallback_handler(aten.cumsum.default)
+fallback_cumprod = fallback_handler(aten.cumprod.default)
+fallback_logcumsumexp = fallback_handler(aten.logcumsumexp.default)
+fallback_cummax = fallback_handler(aten.cummax.default)
+fallback_cummin = fallback_handler(aten.cummin.default)
+
+
+def _validate_dim(x: Any, dim: Any, offset: int = 0) -> Any:
+    """A dimension named the way it will be counted from the front.
+
+    A dimension can be named from the back -- the last one is -1 -- and which
+    one that is cannot be answered until the shape is known, so a negative name
+    is turned into a positive one here rather than being carried as a negative
+    number into the code that walks the shape.
+    """
+
+    ndim = len(x.get_size())
+    if dim < 0:
+        dim += ndim + offset
+    if not (0 <= dim < ndim + offset):
+        raise AssertionError(f"expected: 0 <= dim < ndim + offset, got {dim}")
+    return dim
+
+
+def _make_scan_inner(x: Any, *, axis: Any, dtype: Any) -> dict:
+    """The description every cumulative operation shares.
+
+    Walking an axis and carrying a value along it is the same walk whichever
+    value is carried, so what describes the walk is written once here: which
+    device, what type the carried value has, what to read at each step, how big
+    the whole thing is, and which axis to walk.  Only the way two running
+    values become one differs between them, and that is left out because it is
+    the part that differs.
+    """
+
+    if dtype is not None:
+        x = to_dtype(x, dtype)
+    axis = _validate_dim(x, axis)
+
+    return dict(
+        device=x.get_device(),
+        dtypes=(x.get_dtype(),),
+        inner_fns=(x.make_loader(),),
+        size=x.get_size(),
+        axis=axis,
+    )
+
+
+@register_lowering(aten.cumsum)
+def cumsum(x: Any, axis: Any = None, dtype: Any = None) -> Any:
+    """Running totals along one axis.
+
+    A total of whole numbers is not a whole number until it is asked to be, and
+    counting through a list of them is not a sum of them either, so a running
+    total of whole numbers widens unless the caller said otherwise.
+    """
+
+    if (
+        is_integer_dtype(x.get_dtype()) or is_boolean_dtype(x.get_dtype())
+    ) and dtype is None:
+        dtype = torch.int64
+
+    if len(x.get_size()) == 0:
+        if axis not in [0, -1]:
+            raise AssertionError("expected: axis in [0, -1]")
+        dtype = dtype or x.get_dtype()
+        return to_dtype(x, dtype, copy=True)
+
+    def combine_fn(a_tuple: Any, b_tuple: Any) -> Any:
+        (a,) = a_tuple
+        (b,) = b_tuple
+        return (ops.add(a, b),)
+
+    kwargs = _make_scan_inner(x, axis=axis, dtype=dtype)
+    (result,) = ir.Scan.create(**kwargs, combine_fn=combine_fn)
+    if result is None:
+        return fallback_cumsum(x, dim=axis, dtype=dtype)
+    return result
+
+
+@register_lowering(aten.cumprod)
+def cumprod(x: Any, axis: Any = None, dtype: Any = None) -> Any:
+    """Running products along one axis.
+
+    Widens for whole numbers for the same reason a running total does: a product
+    of whole numbers is not a whole number until it is asked to be.
+    """
+
+    if (
+        is_integer_dtype(x.get_dtype()) or is_boolean_dtype(x.get_dtype())
+    ) and dtype is None:
+        dtype = torch.int64
+
+    if len(x.get_size()) == 0:
+        if axis not in [0, -1]:
+            raise AssertionError("expected: axis in [0, -1]")
+        dtype = dtype or x.get_dtype()
+        return to_dtype(x, dtype, copy=True)
+
+    def combine_fn(a_tuple: Any, b_tuple: Any) -> Any:
+        (a,) = a_tuple
+        (b,) = b_tuple
+        return (ops.mul(a, b),)
+
+    kwargs = _make_scan_inner(x, axis=axis, dtype=dtype)
+    (result,) = ir.Scan.create(**kwargs, combine_fn=combine_fn)
+    if result is None:
+        return fallback_cumprod(x, dim=axis, dtype=dtype)
+    return result
+
+
+@register_lowering(aten.logcumsumexp)
+def logcumsumexp(x: Any, dim: Any) -> Any:
+    """Running totals of exponents, kept in their logarithm.
+
+    Adding two exponents overflows once either is large, so what is added is
+    their logarithms: the larger value, and the smaller one folded into it
+    after being scaled by the difference between them.  Where the two are equal
+    the smaller is the larger, and adding a number to itself is what the caller
+    asked for -- so the folding is skipped there, which is also what keeps an
+    infinite value from being turned into a number.
+    """
+
+    def log_add_exp_helper(a_tuple: Any, b_tuple: Any) -> Any:
+        (a,) = a_tuple
+        (b,) = b_tuple
+        min_v = ops.minimum(a, b)
+        max_v = ops.maximum(a, b)
+        mask = (min_v != max_v) | (~ops.isinf(min_v))
+        return (ops.where(mask, ops.log1p(ops.exp(min_v - max_v)) + max_v, a),)
+
+    dtype = x.get_dtype()
+    if len(x.get_size()) == 0:
+        if dim not in [0, -1]:
+            raise AssertionError("expected: dim in [0, -1]")
+        return clone(x)
+
+    kwargs = _make_scan_inner(x, axis=dim, dtype=dtype)
+    (result,) = ir.Scan.create(**kwargs, combine_fn=log_add_exp_helper)
+    if result is None:
+        return fallback_logcumsumexp(x, dim=dim)
+    return result
