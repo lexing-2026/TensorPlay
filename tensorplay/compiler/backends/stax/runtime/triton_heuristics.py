@@ -1112,10 +1112,6 @@ class CachingAutotuner(KernelInterface):
 
         self._profiler_ctx = None
 
-    def _post_launch(self) -> None:
-        """What is settled after a launch, whether or not it raised."""
-
-        self._profiler_ctx = None
 
     def run(
         self,
@@ -1209,34 +1205,6 @@ class CachingAutotuner(KernelInterface):
         ):
             self._cached_launcher = launcher
         return result
-    def get_profiler_kwargs(self, stream, launcher) -> dict[str, Any]:
-        """What to record about a launch, so a profile can attribute it.
-
-        A profile says a kernel took some time; what is wanted is which kernel,
-        compiled how, from what, run on what -- because a number with none of
-        that is a number nobody can act on.
-        """
-
-        kernel_kwargs_str = ",".join(
-            f"{k}={v}" for (k, v) in launcher.config.kwargs.items()
-        )
-
-        ret = {
-            "kernel_file": (self.filename or ""),
-            "kernel_hash": self.kernel_hash,
-            "kernel_backend": "triton",
-            "stream": stream,
-            "num_warps": launcher.config.num_warps,
-            "num_stages": launcher.config.num_stages,
-            "kernel_kwargs": kernel_kwargs_str,
-        }
-        if "kernel_name" in self.inductor_meta:
-            ret["kernel_name"] = self.inductor_meta["kernel_name"]
-        if "kernel_flop" in self.inductor_meta:
-            ret["kernel_flop"] = self.inductor_meta["kernel_flop"]
-        if "kernel_num_gb" in self.inductor_meta:
-            ret["kernel_num_gb"] = self.inductor_meta["kernel_num_gb"]
-        return ret
 
     @property
     def _should_coordesc_tune(self) -> bool:
@@ -2097,51 +2065,7 @@ class CachingAutotuner(KernelInterface):
         self.compile_results = [result]
         return result.make_launcher()
 
-    def get_profiler_kwargs(self, stream, launcher):
-        """What a profiler is told about the kernel being launched.
 
-        Enough to find the launch again in a trace and to say what it was
-        doing: which file it came from, what it is called, the shape of the
-        configuration, and the stream it ran on.  The optional entries are only
-        present when the build knew them, so a trace does not carry empty
-        fields for things nobody measured.
-        """
-
-        kernel_kwargs_str = ",".join(
-            f"{k}={v}" for (k, v) in launcher.config.kwargs.items()
-        )
-
-        ret = {
-            "kernel_file": (self.filename or ""),
-            "kernel_hash": self.kernel_hash,
-            "kernel_backend": "triton",
-            "stream": stream,
-            "num_warps": launcher.config.num_warps,
-            "num_stages": launcher.config.num_stages,
-            "kernel_kwargs": kernel_kwargs_str,
-        }
-        if "kernel_name" in self.inductor_meta:
-            ret["kernel_name"] = self.inductor_meta["kernel_name"]
-        if "kernel_flop" in self.inductor_meta:
-            ret["kernel_flop"] = self.inductor_meta["kernel_flop"]
-        if "kernel_num_gb" in self.inductor_meta:
-            ret["kernel_num_gb"] = self.inductor_meta["kernel_num_gb"]
-        return ret
-
-    def _post_launch(self) -> None:
-        """Close whatever the launch opened, whether or not it succeeded.
-
-        A profiler range that is entered and not left is a range that never
-        ends, which is worse than not having recorded the launch at all.  So
-        this is what the caller runs after the launch whatever the launch did.
-        """
-
-        if (profiler_ctx := self._profiler_ctx) is not None:
-            self._profiler_ctx = None
-            profiler_ctx.__exit__(None, None, None)
-        if (debug_call := self._debug_call) is not None:
-            self._debug_call = None
-            debug_call.finalize(self.get_device_interface())
 
     def precompile(
         self,
@@ -2733,103 +2657,51 @@ class CachingAutotuner(KernelInterface):
             )
         return TritonCompileResult(binary, cfg, compile_meta, self.inductor_meta)
 
-    def can_statically_launch(kernel, inductor_meta, triton_meta, heuristic_type):
-        """The form of this kernel that launches from its binary, if there is one."""
 
-        from .. import config
+    def _post_launch(self) -> None:
+        """Close whatever the launch opened, whether or not it succeeded.
 
-        if not config.use_static_triton_launcher:
-            return None
-
-        def check_can_launch():
-            if triton_meta.get("device_type") not in ("cuda", "xpu", "hip"):
-                raise CannotStaticallyLaunchKernel("not a device that loads a binary")
-
-            if triton_meta.get("device_type") == "xpu" and XPU_KERNEL_FORMAT == "spv":
-                raise CannotStaticallyLaunchKernel(
-                    "the host device takes its kernels in a form that cannot be "
-                    "launched this way"
-                )
-
-            if config.cpp_wrapper:
-                # A wrapper is written and compiled for this call anyway, so
-                # there is nothing left for this to save.
-                raise CannotStaticallyLaunchKernel("the wrapper is written out")
-
-            if (
-                heuristic_type == HeuristicType.USER_AUTOTUNE
-                and not config.static_launch_user_defined_triton_kernels
-            ):
-                raise CannotStaticallyLaunchKernel("a user-written kernel")
-
-            if inductor_meta.get("store_cubin"):
-                # The whole binary has to be kept, which is what this avoids.
-                raise CannotStaticallyLaunchKernel("the binary is being kept")
-
-            if getattr(kernel.metadata, "launch_pdl", False) or getattr(
-                kernel.metadata, "launch_cooperative_grid", False
-            ):
-                raise CannotStaticallyLaunchKernel(
-                    "the launch carries attributes this does not pass"
-                )
-
-            device_type = triton_meta.get("device_type")
-            binary_ext = GPU_KERNEL_BIN_EXTS.get(device_type, ".cubin")
-            cubin_location = os.path.join(
-                triton_cache_dir(int(triton_meta.get("device", 0))),
-                triton_hash_to_path_key(kernel.hash),
-                f"{kernel.src.fn.__name__}{binary_ext}",
-            )
-            if not os.path.exists(cubin_location):
-                raise CannotStaticallyLaunchKernel(
-                    f"the binary is not where it was left: {cubin_location}"
-                )
-            kernel._cubin_path = cubin_location
-
-            try:
-                return statically_launched_kernel_by_device(kernel, device_type)
-            except NotImplementedError as e:
-                raise CannotStaticallyLaunchKernel(f"not implemented: {e}") from e
-
-        try:
-            return check_can_launch()
-        except CannotStaticallyLaunchKernel as e:
-            log.info("cannot launch %s statically: %s", kernel, e)
-            return None
-        except Exception:
-            log.info(
-                "cannot launch %s statically", kernel, exc_info=True
-            )
-            return None
-
-    def reload_cubin_path(self):
-        """Point the kernel at its binary, putting it back if it was only held.
-
-        A binary that travelled inside a cache entry is held as bytes rather
-        than left on disk, so a kernel read back from one has to be written
-        out again before it can be loaded.  A binary that is neither on disk
-        nor in hand is a cache entry that cannot be used, and saying so is
-        better than launching nothing.
+        A profiler range that is entered and not left is a range that never
+        ends, which is worse than not having recorded the launch at all.  So
+        this is what the caller runs after the launch whatever the launch did.
         """
 
-        device_type = (
-            "hip" if tp.version.hip else self.compile_meta.get("device_type", "cuda")
+        if (profiler_ctx := self._profiler_ctx) is not None:
+            self._profiler_ctx = None
+            profiler_ctx.__exit__(None, None, None)
+        if (debug_call := self._debug_call) is not None:
+            self._debug_call = None
+            debug_call.finalize(self.get_device_interface())
+    def get_profiler_kwargs(self, stream, launcher):
+        """What a profiler is told about the kernel being launched.
+
+        Enough to find the launch again in a trace and to say what it was
+        doing: which file it came from, what it is called, the shape of the
+        configuration, and the stream it ran on.  The optional entries are only
+        present when the build knew them, so a trace does not carry empty
+        fields for things nobody measured.
+        """
+
+        kernel_kwargs_str = ",".join(
+            f"{k}={v}" for (k, v) in launcher.config.kwargs.items()
         )
-        binary_ext = GPU_KERNEL_BIN_EXTS.get(device_type, "cubin")
-        cubin_location = os.path.join(
-            triton_cache_dir(
-                _resolve_load_device(self.compile_meta.get("device"), device_type)
-            ),
-            triton_hash_to_path_key(self.kernel.hash),
-            f"{self.kernel.name}{binary_ext}",
-        )
-        if not os.path.exists(cubin_location):
-            if self.kernel.cubin_raw is not None:
-                self.kernel.reload_cubin_from_raw(cubin_location)
-            else:
-                raise RuntimeError(
-                    "the binary the entry referred to is not at %s", cubin_location
-                )
+
+        ret = {
+            "kernel_file": (self.filename or ""),
+            "kernel_hash": self.kernel_hash,
+            "kernel_backend": "triton",
+            "stream": stream,
+            "num_warps": launcher.config.num_warps,
+            "num_stages": launcher.config.num_stages,
+            "kernel_kwargs": kernel_kwargs_str,
+        }
+        if "kernel_name" in self.inductor_meta:
+            ret["kernel_name"] = self.inductor_meta["kernel_name"]
+        if "kernel_flop" in self.inductor_meta:
+            ret["kernel_flop"] = self.inductor_meta["kernel_flop"]
+        if "kernel_num_gb" in self.inductor_meta:
+            ret["kernel_num_gb"] = self.inductor_meta["kernel_num_gb"]
+        return ret
         self.kernel.cubin_path = cubin_location
 
 class CannotStaticallyLaunchKernel(Exception):
