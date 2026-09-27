@@ -1166,8 +1166,50 @@ for _name, _op in {
     "sigmoid.default": "sigmoid", "rsqrt.default": "rsqrt", "sqrt.default": "sqrt",
     "reciprocal.default": "reciprocal", "abs.default": "abs", "sin.default": "sin",
     "cos.default": "cos", "tanh.default": "tanh", "relu.default": "relu",
+    "sign.default": "sign",
 }.items():
     LOWERINGS[_name] = _unary(_op)
+
+
+def _binary(_op: str):
+    """A lowering of a two-argument operation, one element at a time.
+
+    What the operation is called is decided by the table above rather than
+    written here, so that one name means one operation everywhere it is asked
+    for -- including from a whole list of tensors at once, which is the same
+    operation applied to each of them.
+    """
+
+    fn = ops_wrapper(_op)
+
+    def lower(x, y):
+        return pointwise(fn, x, y)
+
+    return lower
+
+
+for _name, _op in {
+    "maximum.default": "maximum", "minimum.default": "minimum",
+}.items():
+    LOWERINGS[_name] = _binary(_op)
+
+
+@register("clamp.default")
+def lower_clamp(x, min=None, max=None):
+    """A value held between two others.
+
+    Written as the two operations it is rather than as one, because there is no
+    operation for holding a value between two others: it is a lower one and an
+    upper one, and saying which is which is the whole of what clamping is.
+    """
+
+    if min is None and max is None:
+        return x
+    if min is None:
+        return pointwise(lambda v: ops.minimum(v, max), x)
+    if max is None:
+        return pointwise(lambda v: ops.maximum(v, min), x)
+    return pointwise(lambda v: ops.maximum(min, ops.minimum(max, v)), x)
 
 
 @register("silu.default")
@@ -2345,3 +2387,109 @@ for _name in ("output", "placeholder", "device_assert_async", "check_bounds"):
         _name, type_promotion_kind=None, override_return_dtype=None
     )
 
+
+def _per_tensor(key: str) -> Callable[..., Any]:
+    """The one-tensor-at-a-time lowering behind an operation, without its wrapper.
+
+    What a registered lowering carries around it is the promotion and
+    broadcasting its arguments need when one caller passes a number and another
+    passes a tensor.  A list operation hands each of its entries values that are
+    already alike -- that is what a list of alike operations means -- so what is
+    wanted here is the arithmetic itself, and asking for the wrapped form would
+    do that work once per entry to arrive at the same answer.
+    """
+
+    fn = LOWERINGS[key]
+    return getattr(fn, "__wrapped__", fn)
+
+
+def _register_foreach_all() -> None:
+    """The list form of every operation whose one-tensor form already exists.
+
+    Each entry says which list operations are this operation applied to a list,
+    and which is the one-tensor lowering they all share.  The scalar an
+    operation carries is named where it arrives, because the schema decides that
+    per operation and a guess would be a wrong guess.
+    """
+
+    table: list[tuple] = [
+        # (per-tensor key, allow_alpha, scalar_kwarg, [(foreach names)])
+        ("add.Tensor", True, "alpha", [
+            ("_foreach_add.List",), ("_foreach_add.Scalar",), ("_foreach_add.Tensor",),
+        ]),
+        ("mul.Tensor", False, "alpha", [
+            ("_foreach_mul.List",), ("_foreach_mul.Tensor",), ("_foreach_mul.Scalar",),
+        ]),
+        ("sub.Tensor", True, "alpha", [
+            ("_foreach_sub.List",), ("_foreach_sub.Scalar",),
+        ]),
+        ("div.Tensor", False, "alpha", [
+            ("_foreach_div.List",), ("_foreach_div.Tensor",), ("_foreach_div.Scalar",),
+        ]),
+        ("neg.default", False, "alpha", [("_foreach_neg.default",)]),
+        ("abs.default", False, "alpha", [("_foreach_abs.default",)]),
+        ("sqrt.default", False, "alpha", [("_foreach_sqrt.default",)]),
+        ("rsqrt.default", False, "alpha", [("_foreach_rsqrt.default",)]),
+        ("reciprocal.default", False, "alpha", [("_foreach_reciprocal.default",)]),
+        ("clone.default", False, "alpha", [("_foreach_clone.default",)]),
+        ("sign.default", False, "alpha", [("_foreach_sign.default",)]),
+        ("maximum.default", False, "alpha", [
+            ("_foreach_maximum.List",), ("_foreach_maximum.Scalar",),
+        ]),
+        ("minimum.default", False, "alpha", [
+            ("_foreach_minimum.List",), ("_foreach_minimum.Scalar",),
+        ]),
+    ]
+    for key, allow_alpha, scalar_kwarg, groups in table:
+        pw = _per_tensor(key)
+        for names in groups:
+            register_foreach_pointwise(
+                pw, allow_alpha=allow_alpha, scalar_kwarg=scalar_kwarg, names=names
+            )
+
+    # A clamp is a lower bound and an upper bound, so its list form is whichever
+    # of the two it is named for; the arithmetic is the same either way.
+    for lo, hi, suffix in (("minimum.default", "maximum.default", "clamp_min"),
+                           ("maximum.default", "minimum.default", "clamp_max")):
+        pw = _per_tensor(lo if suffix == "clamp_min" else hi)
+        for names in ((f"_foreach_{suffix}.List",), (f"_foreach_{suffix}.Scalar",)):
+            register_foreach_pointwise(pw, allow_alpha=False, scalar_kwarg="alpha", names=names)
+
+
+def _registered_foreach(name: str) -> Callable[..., Any]:
+    """The list form already registered under a name.
+
+    The writing form of a list operation is the non-writing one's result made
+    to be its input, so it is registered from that rather than from the
+    one-tensor form again -- which is what keeps the two answering alike.
+    """
+
+    return LOWERINGS[name]
+
+
+def _register_foreach_inplace_all() -> None:
+    """The writing form of every list operation that has one.
+
+    Each entry pairs a writing form with the non-writing form it is made from,
+    because the difference between them is where the result goes and nothing
+    else: the arithmetic is the non-writing operation's.
+    """
+
+    for inplace_name, outplace_name in (
+        ("_foreach_add_.List", "_foreach_add.List"),
+        ("_foreach_add_.Scalar", "_foreach_add.Scalar"),
+        ("_foreach_mul_.List", "_foreach_mul.List"),
+        ("_foreach_mul_.Scalar", "_foreach_mul.Scalar"),
+        ("_foreach_div_.List", "_foreach_div.List"),
+        ("_foreach_div_.Scalar", "_foreach_div.Scalar"),
+    ):
+        register_foreach_inplace(
+            names=(inplace_name,),
+            outplace_names=(outplace_name,),
+            outplace_op=_registered_foreach(outplace_name),
+        )
+
+
+_register_foreach_all()
+_register_foreach_inplace_all()
+_register_foreach_all()
