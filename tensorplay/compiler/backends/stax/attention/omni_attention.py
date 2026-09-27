@@ -1016,6 +1016,63 @@ def has_unsupported_cpu_scalar_tensor_captures(
     return False
 
 
+def _can_use_omni_flash_attention(
+    subgraph: Any,
+    mask_graph: Any,
+    num_score_mod_placeholders: int,
+) -> tuple:
+    """Whether this device and this score can be given to the flash kernel.
+
+    Answered as a question rather than as a refusal, because there are two
+    callers and they want the two answers differently: one asks whether to go
+    this way and quietly goes the other way if the answer is no, and the other
+    was told to go this way and has to be told why it cannot.  So the reason
+    comes back with the answer, and what is done with it is the caller's.
+    """
+
+    if not ensure_flash_available():
+        return False, _flash_attention_unavailable_message()
+
+    if input_buffers_require_grads(subgraph.graph_module, num_score_mod_placeholders):
+        return (
+            False,
+            "Input buffers require gradients (not supported by flash attention)",
+        )
+
+    return True, ""
+
+
+def _use_omni_flash_attention(
+    subgraph: Any,
+    mask_graph: Any,
+    kernel_options: Any,
+    num_score_mod_placeholders: int,
+    backend: Any,
+) -> bool:
+    """Whether the flash kernel is what this call should be given to.
+
+    Only when it was asked for by name.  A program that names no backend is
+    asking for whichever is measured to be fastest, and answering that by
+    reaching for the newest one is not the same as answering it.
+    """
+
+    if backend != "FLASH":
+        return False
+
+    can_use, reason = _can_use_omni_flash_attention(
+        subgraph,
+        mask_graph,
+        num_score_mod_placeholders,
+    )
+
+    if not can_use:
+        raise RuntimeError(
+            f"BACKEND='FLASH' but flash attention cannot be used: {reason}"
+        )
+
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Shapes these kernels assume
 # ---------------------------------------------------------------------------
@@ -1735,6 +1792,81 @@ def create_omni_flash_attention_kernel(
     )
 
     return (template_output, lse)
+
+
+def _can_use_omni_flash_attention_backward(
+    fw_subgraph: Any,
+    mask_graph: Any,
+    joint_outputs: Any = None,
+    score_mod_other_buffers: Any = None,
+    num_score_mod_placeholders: int = 5,
+) -> tuple:
+    """Whether this device and this score can be given to the backward kernel.
+
+    The same question as the forward one, with two more things to rule out that
+    only the backward has.  Both are about gradients: this kernel reads the
+    gradients the forward pass accumulated, and it computes the gradient of the
+    score itself.  A gradient it is given rather than asked to compute, and one
+    that was written in place rather than returned, are two different shapes of
+    input, and neither is the shape this kernel takes.
+    """
+
+    if not ensure_flash_available():
+        return False, _flash_attention_unavailable_message()
+
+    if input_buffers_require_grads(
+        fw_subgraph.graph_module, num_score_mod_placeholders
+    ):
+        return (
+            False,
+            "Input buffers require gradients (not supported by flash attention backward)",
+        )
+
+    if joint_outputs is not None:
+        if joint_outputs.captured_grads_compute:
+            return (
+                False,
+                "NYI: Omni Flash Attention bwd doesn't support captured grads yet.",
+            )
+        if joint_outputs.mutated_grads:
+            return (
+                False,
+                "NYI: Omni Flash Attention bwd doesn't support mutated grads yet.",
+            )
+
+    return True, ""
+
+
+def _use_omni_flash_attention_backward(
+    fw_subgraph: Any,
+    mask_graph: Any,
+    backend: Any,
+    joint_outputs: Any = None,
+    score_mod_other_buffers: Any = None,
+) -> bool:
+    """Whether the backward kernel is what this call should be given to.
+
+    Named rather than measured, for the same reason the forward one is: a
+    program that names no backend is asking which is fastest, and the fastest of
+    them is not settled until something has been measured.
+    """
+
+    if backend != "FLASH":
+        return False
+
+    can_use, reason = _can_use_omni_flash_attention_backward(
+        fw_subgraph,
+        mask_graph,
+        joint_outputs,
+        score_mod_other_buffers,
+    )
+
+    if not can_use:
+        raise RuntimeError(
+            f"BACKEND='FLASH' but flash attention cannot be used: {reason}"
+        )
+
+    return True
 
 
 def create_omni_flash_attention_backward_kernel(
