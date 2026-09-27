@@ -79,6 +79,18 @@ from tensorplay.utils._filelock import FileLock
 from ..compile_log import timed_block, trace_structured
 from ..codecache import PersistentCache
 from ..utils import counters, restore_stdout_stderr
+from ..runtime.triton_compat import HAS_WARP_SPEC
+from collections.abc import Sequence
+from io import StringIO
+from types import ModuleType
+from ..autotune_process import (
+    TensorMeta,
+    TritonCPUBenchmarkRequest,
+    TritonGPUBenchmarkRequest,
+)
+from ..codecache import PyCodeCache
+from ..utils import Placeholder
+from ..codegen.common import WorkspaceZeroMode
 from ..codegen.triton import TritonKernel
 from ..codegen.simd_kernel_features import SIMDKernelFeatures
 from ..codegen.common import WorkspaceArg
@@ -104,6 +116,23 @@ VERIFY = os.environ.get("TP_AUTOTUNE_VERIFY", "1") == "1"
 DEBUG = False
 
 log = logging.getLogger(__name__)
+
+
+class GenerateAndLoadResult(NamedTuple):
+    """What writing a template out and loading it back produced.
+
+    The module and the extra it was loaded with are the kernel; the rest is
+    what a launch needs and cannot work out for itself -- which arguments the
+    kernel reads, which of them it may read before the body runs, and which
+    symbolic extents it was written against.
+    """
+
+    mod: ModuleType
+    extra: str
+    input_call_args: tuple[str, ...]
+    prologue_supported_inputs: OrderedSet
+    kernel_args_sizevars_keys: tuple
+    kernel_options: dict[str, Any]
 
 
 class GeneratedCodeCacheEntry(NamedTuple):
@@ -1263,14 +1292,6 @@ class TritonTemplateKernel(TritonKernel):
 
         # Tracking for intermediate variables
         self.tmp_var_ctr = itertools.count()
-
-    @property
-
-    @classmethod
-
-
-
-
 
     @property
     def index_dtype(self) -> str:
@@ -3081,45 +3102,53 @@ class TritonTemplate(KernelTemplate):
             index_dtype=kernel_args.index_dtype, **params
         )
 
+    #: The kind of kernel this template writes out.  A subclass that writes
+    #: something other than a template kernel names its own here.
+    #: Every template registered under a name, so a name claimed twice is
+    #: refused rather than silently taken over.
+    all_templates: dict[str, "TritonTemplate"] = {}
+
+    kernel_type: Any = TritonTemplateKernel
+
     def __init__(
         self,
         name: str,
-        grid=None,
-        source: str = "",
-        symbol: str = "",
-        debug: bool = False,
-        cache_codegen_enabled_for_template: bool = False,
-        prologue_loads_all_inputs: bool = False,
+        grid: Any,
+        source: str,
+        debug=False,
+        cache_codegen_enabled_for_template=False,
+        prologue_loads_all_inputs=False,
         always_freeze_layout: bool = False,
+        symbol: str = "",
     ) -> None:
         super().__init__(name, hash=hashlib.sha256(source.encode("utf-8")).hexdigest())
         self.grid = grid
+        #: The text it was made from and the name its entry point answers to,
+        #: kept for the path that renders a template and runs the result
+        #: directly rather than lowering it.  A lowered kernel takes its name
+        #: from the launch instead.
         self.source = source
-        #: The name the source defines its entry point under.  Named rather
-        #: than assumed, because the symbol is part of the text: a source that
-        #: defines something else needs no rewriting to be used here.
-        self.symbol = symbol or name
-        self.debug = debug
-        self._cache_codegen_enabled_for_template = cache_codegen_enabled_for_template
-        self._generated_code_cache: GeneratedCodeCache = clear_on_fresh_cache(
-            GeneratedCodeCache()
-        )
-        self.prologue_loads_all_inputs = prologue_loads_all_inputs
-        self.always_freeze_layout = always_freeze_layout
-        #: The operands the last rendering was written against, by name, with
-        #: the geometry and the type of each.  Filled in when a rendering
-        #: happens and read when that rendering is compiled.
-        self.operands: dict = {}
-        #: The width an index is narrowed to, as the language spells it.  It is
-        #: a property of the launch rather than of the text, and the compiled
-        #: form has to be given it as well as the text.
-        self.index_dtype: str = "tl.int64"
+        self.symbol = symbol
+        self.template = self._template_from_string(source)
+        # A module that registers templates can be initialized more than once in
+        # a single process (e.g. a double-import path). Tolerate re-registration
+        # under an existing name as long as the template source matches, but
+        # reject a genuine name collision between different templates.
         existing = self.all_templates.get(name)
         if existing is not None and existing.src_hash != self.src_hash:
-            raise AssertionError(
-                f"two different kernels are both called {name}"
-            )
-        self.all_templates[name] = self
+            raise AssertionError("duplicate template name")
+        TritonTemplate.all_templates[name] = self
+        self.debug = debug
+        self._cache_codegen_enabled_for_template = cache_codegen_enabled_for_template
+        self._generated_code_cache: GeneratedCodeCache = GeneratedCodeCache()
+        clear_on_fresh_cache(self._generated_code_cache)
+        # When prologue_loads_all_inputs is true, prologue_supported_inputs is populated during def_kernel
+        # by adding all inputs.
+        self.prologue_loads_all_inputs = prologue_loads_all_inputs
+        # When always_freeze_layout is True, the kernel will always freeze layouts
+        # immediately instead of using layout constraints. This is used by
+        # FlexAttention templates which require frozen layouts.
+        self.always_freeze_layout = always_freeze_layout
 
     @property
     def uid(self) -> str:
@@ -3127,219 +3156,251 @@ class TritonTemplate(KernelTemplate):
 
         return f"triton::{self.name}"
 
-    @property
-    def template(self) -> "TritonTemplateKernel":
-        """This template's source in the form that can be run.
+    def generate(  # type: ignore[override]
+        self,
+        input_nodes: tuple[ir.IRNode, ...],
+        layout: ir.Layout,
+        num_stages: int,
+        num_warps: int,
+        num_consumer_groups: int = 0,
+        num_buffers_warp_spec: int = 0,
+        prefix_args: int = 0,
+        suffix_args: int = 0,
+        epilogue_fn: Callable[..., Any] | None = identity,
+        epilogue_fn_hash: str | None = None,
+        subgraphs: list[ir.Buffer] | None = None,
+        mutated_inputs: list[ir.IRNode] | None = None,
+        call_sizes: Sequence[sympy.core.symbol.Symbol] | None = None,
+        workspace_arg: WorkspaceArg | None = None,
+        generate_with_caching=False,
+        hint_override: int | None = None,
+        tma_store: bool = False,
+        tma_load_for_template_epilogue: bool = False,
+        transpose_discontiguous_tensor_descriptors_override: bool | None = None,
+        triton_meta: TritonMeta | None = None,
+        **kwargs,
+    ):
+        """This function generates a TritonTemplateCaller
 
-        What a caller wants from a template that owns source text is the thing
-        the text becomes, and that is the same for every configuration of this
-        template -- so it is made once here and every configuration shares it.
-        That sharing is the point: two configurations that wrote the same text
-        are the same kernel, and a cache that could tell them apart would be
-        keeping two of something there is only one of.
+        Args:
+            input_nodes: List of input nodes
+            layout: Output layout
+            num_stages: Number of stages for triton launch
+            num_warps: Number of warps for triton launch
+            prefix_args: Number of input nodes to be passed as arguments
+            suffix_args: Number of input nodes to be passed as arguments
+            epilogue_fn: Optional epilogue function to be called on the output
+            subgraphs: Optional subgraphs to be passed as arguments, these will be inlined
+                into the triton template string
+            mutated_inputs: Optional list of input nodes that are mutated by the kernel, this is helpful
+                if you need to return multiple outputs. You can pass them as inputs and mark them as
+                being mutated by the kernel.
         """
+        # HACK: Triton currently breaks if TF32 floats are requested, but the CUDA
+        # capability doesn't support them.  This is a bug in Triton, but for now we'll
+        # patch around it here.  See https://github.com/triton-lang/triton/issues/3011
+        # for one example issue with this problem.
+        if tp.cuda.is_available() and not tp.cuda.is_tf32_supported():
+            kwargs["ALLOW_TF32"] = "False"
 
-        return self.kernel_type.get(self.name, self.source, self.symbol, self.grid)
+        if call_sizes is None:
+            call_sizes = layout.size
 
-    def argnames(self) -> list[str]:
-        """The operand names the body asked for, in the order it asked for them.
-
-        A body names its operands in the kernel it writes, and those names are
-        what the rest of the template has to call them by: a body that asks for
-        a name no operand was given fails here rather than producing a kernel
-        that reads the wrong buffer.  Read out of the source rather than
-        declared beside it, because a name written in the body and a name
-        recorded elsewhere can disagree and then the disagreement is invisible.
-        """
-
-        import re
-
-        found = re.search(r"def_kernel\(([^)]*)\)", self.source)
-        if found is None:
-            return ["A"]
-        names = re.findall(r"[A-Za-z_][A-Za-z_0-9]*", found.group(1))
-        return names or ["A"]
-
-    def generate(self, **kwargs: Any):
-        """The choice this template makes for one set of arguments.
-
-        Refuses rather than raising when the arguments do not describe a launch
-        this template can perform, so that a whole table can be offered at once
-        and the entries that do not apply dropped without unwinding the rest.
-        """
-
-        if self.source == "":
-            return None
-        grid_fn = self.grid
-        layout = kwargs.get("layout")
-        input_nodes = kwargs.get("input_nodes") or ()
-        if layout is not None:
-            meta = {k: v for k, v in kwargs.items()
-                    if k not in ("layout", "input_nodes")}
-            meta.setdefault("out_size", tuple(int(s) for s in layout.size))
-            names = self.argnames()[:len(input_nodes)] or list(self.argnames())[:1]
-            operands = {}
-            for name, node in zip(names, input_nodes):
-                # A lowered value knows its own extents and strides; something
-                # handed over from outside knows only its shape, and a value
-                # that knows neither is recorded as knowing nothing so that a
-                # body asking about it fails at render rather than at launch.
-                shape = node.get_size() if hasattr(node, "get_size") else getattr(node, "shape", ())
-                if hasattr(node, "get_stride"):
-                    stride = node.get_stride()
-                else:
-                    stride = contiguous_strides(tuple(int(v) for v in shape))
-                dt = node.get_dtype() if hasattr(node, "get_dtype") else getattr(node, "dtype", "float32")
-                operands[name] = {
-                    "shape": tuple(int(v) for v in shape),
-                    "stride": tuple(int(v) for v in stride),
-                    "dtype": str(dtype_name(dt)),
-                }
-            outputs = {
-                "C": {
-                    "shape": tuple(int(s) for s in layout.size),
-                    "stride": tuple(int(s) for s in layout.stride),
-                    # The result's own type, and the type of what it is read
-                    # from: a product reads two operands and writes their type.
-                    "dtype": str(
-                        dtype_name(
-                            layout.dtype
-                            if layout.dtype is not None
-                            else next(
-                                (
-                                    node.get_dtype()
-                                    for node in input_nodes
-                                    if hasattr(node, "get_dtype")
-                                ),
-                                None,
-                            )
-                        )
-                    ),
-                }
-            }
-            meta.update(kwargs)
-            # What the kernel is written against and what the launch is written
-            # against are two different lists.  A body names a tile, an
-            # accumulation type, a bound: values chosen when the text was
-            # written, which are parameters of the kernel because they cannot
-            # change while it runs.  Everything else -- how the result is laid
-            # out, what it is called, how many programs to start -- describes
-            # the launch and is handed to the launch instead, because putting
-            # it in the signature would make the kernel take an argument it
-            # never reads, and a launch option the runtime also wants would be
-            # asked for twice under the same name.
-            # A configuration is what the kernel was written for; what the call
-            # is about -- where its result goes, which values it was handed --
-            # is what the launch is for.  The first is a constant of the module
-            # the kernel is defined in; the second is the launch's own business
-            # and would be a name the body could read but has no meaning for.
-            constexprs = {
-                k: v for k, v in kwargs.items()
-                if k not in ("layout", "input_nodes", "out_size")
-            }
-            # Kept on the template for the compile that follows: what each
-            # operand is decides the type of the argument the kernel takes for
-            # it, and the operands are settled here rather than asked again.
-            self.operands = {**operands, **outputs}
-            rendered = self.render_with(
-                KernelArgs(operands, outputs, constexprs), **meta
-            )
-        else:
-            meta = {k: v for k, v in kwargs.items()
-                    if k not in ("layout", "input_nodes")}
-            rendered = self.render(**meta)
-        # The rendered text has to be compiled before it can be launched, and
-        # the compiled form cannot be called directly: what the runtime hands
-        # back is only callable from inside a launch it has set up itself, with
-        # the grid worked out, the arguments put in the order its signature
-        # declares, and the stream passed along.  So the launch is written out
-        # from the compiled form together with what it was compiled for, and
-        # that is what the choice is bound to.
-        # How many programs to start is a function of the extents being
-        # computed and of the tile they are split into, so it is worked out
-        # here, once, rather than asked of the kernel at every launch.  The
-        # kernel takes operands; how many programs to start is not something an
-        # operand can say.
-        # The configuration as the grid function takes it: the values chosen
-        # for this call, and nothing about the call itself -- a grid is a
-        # function of what is being computed and of the tile it is split into,
-        # and where the result lands is neither.
-        extents = self.grid(
-            *_call_sizes(layout, input_nodes, constexprs),
-            {
-                k: v
-                for k, v in constexprs.items()
-                if k not in ("layout", "input_nodes", "out_size")
-            },
+        result = self.generate_and_load(
+            input_nodes,
+            num_stages,
+            num_warps,
+            call_sizes,
+            prefix_args,
+            suffix_args,
+            epilogue_fn,
+            epilogue_fn_hash,
+            subgraphs,
+            workspace_arg,
+            num_consumer_groups,
+            num_buffers_warp_spec,
+            layout,
+            kwargs,
+            generate_with_caching and self._cache_codegen_enabled_for_template,
+            hint_override=hint_override,
+            tma_store=tma_store,
+            tma_load_for_template_epilogue=tma_load_for_template_epilogue,
+            transpose_discontiguous_tensor_descriptors_override=transpose_discontiguous_tensor_descriptors_override,
+            triton_meta=triton_meta,
         )
-        # What the launch is written against, kept so that a retry with one
-        # thing changed can be compiled from the same record rather than
-        # worked out again.
-        inductor_meta = {
-            "kernel_name": self.uid,
-            "device": layout.device if layout is not None else "cuda",
-            "grid_type": "FixedGrid",
-            "fixed_grid": tuple(int(v) for v in extents),
-        }
-        result = _compile_rendered(
-            self,
-            rendered,
-            config={
-                k: v for k, v in kwargs.items()
-                if k not in ("layout", "input_nodes", "out_size")
-            },
-            constants=dict(constexprs),
-            inductor_meta={
-                "kernel_name": self.uid,
-                "device": layout.device if layout is not None else "cuda",
-                "grid_type": "FixedGrid",
-                "fixed_grid": tuple(int(v) for v in extents),
-            },
-        )
+
+        # May happen as result of dev by 0.
         if result is None:
             return None
-        try:
-            # Loading the binary is where a kernel that does not fit the device
-            # says so -- a tile whose working set is larger than the shared
-            # memory there is, or a register count the device cannot hold.  A
-            # configuration that does not fit is one that cannot be measured,
-            # not a failure of the table: the other candidates are still
-            # answers, so it is dropped and the caller moves on.
-            result.kernel._init_handles()
-            launcher = result.make_launcher()
-        except Exception:
-            log.info(
-                "could not load %s at this configuration", self.uid, exc_info=True
+
+        # We expect the input_buffer order to be [*input_nodes, *captured_buffers]
+        expected_input_args = tuple(unique(x.get_name() for x in input_nodes))
+        if result.input_call_args[: len(expected_input_args)] != expected_input_args:
+            raise AssertionError(
+                (
+                    result.input_call_args,
+                    expected_input_args,
+                )
             )
-            return None
-        launcher.__name__ = self.uid
-        # What a launcher written from this kernel is handed after the
-        # operands: the extents and strides it declares, in that order, and the
-        # stream it is launched on.  Written once here, where the signature is
-        # known, rather than at each measurement.
-        launcher_args = _launcher_tail(
-                layout, input_nodes, result.kernel.src.fn.arg_names
-            )
-        caller = TritonChoiceCaller(
-            name=self.uid,
-            input_nodes=input_nodes,
-            layout=layout,
-            description=repr(sorted((k, repr(v)) for k, v in kwargs.items())),
-            source=self.source,
-            src_hash=self.src_hash,
-            launcher_args=launcher_args,
-            num_stages=int(kwargs.get("num_stages", 2)),
-            num_warps=int(kwargs.get("num_warps", 4)),
-            config={k: v for k, v in kwargs.items()},
-            operands=dict(self.operands),
-            inductor_meta=inductor_meta,
-            template=self,
+
+        # `kernel_input_nodes` are the actual inputs that will be passed to the kernel,
+        # so e.g. views of the same input are not included. `codegen_input_nodes`
+        # includes views of inputs to preserve the kernel semantics. The shape and
+        # strides of `codegen_input_nodes` will be used to infer read/writes in
+        # TemplateBuffer.extract_read_writes
+        kernel_input_nodes = tuple(
+            [V.graph.get_buffer(k) for k in result.input_call_args]
         )
-        # A grid is a function of the extents being computed and of the tile
-        # they were split into, so both are computed once here rather than
-        # asked of the kernel at every launch: the kernel takes operands, and
-        # how many programs to start is not something an operand can say.
-        return caller.bind(launcher)
+        # Here we have (*input_nodes, *captured_buffers)
+        codegen_input_nodes = (
+            tuple(input_nodes) + kernel_input_nodes[len(expected_input_args) :]
+        )
+
+        extra_args = tuple(
+            V.graph.sizevars.optimization_hint_with_override(
+                sympy.expand(e),
+                hint_override=hint_override,
+            )
+            for e in result.kernel_args_sizevars_keys
+        )
+
+        kernel_hash_name = f"triton_{self.name}_{next(self.index_counter)}"
+
+        # Extract workspace metadata for async autotuning (don't create tensor here
+        # as it can't be pickled for subprocess communication)
+        workspace_size_bytes: int | None = None
+        workspace_zero_fill = False
+        workspace_args = []
+        if workspace_arg is not None:
+            ws_count = V.graph.sizevars.optimization_hint(workspace_arg.count)
+            workspace_size_bytes = ws_count * get_dtype_size(workspace_arg.dtype)
+            workspace_zero_fill = (
+                workspace_arg.zero_mode != WorkspaceZeroMode.UNINITIALIZED
+            )
+
+            workspace_args.append(WORKSPACE_ARG_PLACEHOLDER)
+
+        options = result.kernel_options
+
+        def make_kernel_render(out_node, hint_override: int | None = None):
+            if result is None:
+                raise AssertionError("result must not be None")
+            # Create a new unique name for the workspace arg buffer for each render
+            # to prevent buffer reuse of the same workspace arg
+            kernel_workspace_arg = workspace_arg
+            if workspace_arg is not None:
+                kernel_workspace_arg = WorkspaceArg(
+                    count=workspace_arg.count,
+                    zero_mode=workspace_arg.zero_mode,
+                    device=workspace_arg.device,
+                    outer_name=WorkspaceArg.unique_name(),
+                    inner_name=workspace_arg.inner_name,
+                    dtype=workspace_arg.dtype,
+                )
+            kernel = self.kernel_type(
+                kernel_name=str(Placeholder.KERNEL_NAME),
+                output_node=out_node,
+                workspace_arg=kernel_workspace_arg,
+                use_jit=False,
+                hint_override=hint_override,
+                tma_store=tma_store,
+                tma_load_for_template_epilogue=tma_load_for_template_epilogue,
+                transpose_discontiguous_tensor_descriptors_override=transpose_discontiguous_tensor_descriptors_override,
+                triton_meta=triton_meta,
+                **options,
+            )
+            render = functools.partial(
+                kernel.render,
+                self.template,
+                kwargs,
+            )
+            return kernel, render
+
+        # create the BenchmarkRequest
+        if result.mod.__file__ is None:
+            raise AssertionError("result.mod.__file__ must not be None")
+
+        grid = self.grid(
+            *V.graph.sizevars.optimization_hints_with_override(
+                call_sizes,
+                hint_override=hint_override,
+            ),
+            kwargs,
+        )
+        bmreq_cls: type[TritonBenchmarkRequest]
+        if layout.device.type == "cpu":
+            bmreq_cls = TritonCPUBenchmarkRequest
+        else:
+            bmreq_cls = TritonGPUBenchmarkRequest
+        bmreq = bmreq_cls(
+            module_path=result.mod.__file__,
+            module_cache_key=result.mod.key,
+            kernel_name=f"triton_{self.name}",
+            extra_args=[*extra_args, *workspace_args, *grid],
+            num_stages=num_stages,
+            num_warps=num_warps,
+            num_consumer_groups=num_consumer_groups,
+            num_buffers_warp_spec=num_buffers_warp_spec,
+            matrix_instr_nonkdim=kwargs.get("matrix_instr_nonkdim", 0),
+            waves_per_eu=kwargs.get("waves_per_eu", 0),
+            kpack=kwargs.get("kpack", 2),
+            workspace_size=workspace_size_bytes,
+            workspace_zero_fill=workspace_zero_fill,
+            input_tensor_meta=TensorMeta.from_irnodes(kernel_input_nodes),  # type: ignore[arg-type]
+            output_tensor_meta=TensorMeta.from_irnodes(layout),
+        )
+
+        # Convolution-specific parameters to include in logging
+        CONV_TUNABLE_KEYS = [
+            "KERNEL_H",
+            "KERNEL_W",
+            "KERNEL_D",
+            "STRIDE_H",
+            "STRIDE_W",
+            "STRIDE_D",
+            "PADDING_H",
+            "PADDING_W",
+            "PADDING_D",
+            "GROUPS",
+            "UNROLL",
+        ]
+
+        return TritonTemplateCaller(
+            kernel_hash_name,
+            codegen_input_nodes,
+            layout,
+            make_kernel_render,
+            result.extra.strip("-").replace("-", ", "),
+            bmreq,
+            log_info={
+                "tile_shape": str(
+                    (
+                        kwargs.get("BLOCK_M", -1),
+                        kwargs.get("BLOCK_K", -1),
+                        kwargs.get("BLOCK_N", -1),
+                    )
+                ),
+                "num_stages": num_stages,
+                "num_warps": num_warps,
+                "GROUP_M": kwargs.get("GROUP_M", -1),
+                "allow_tf32": str(kwargs.get("ALLOW_TF32")),
+                "acc_type": str(kwargs.get("ACC_TYPE")),
+                "matrix_instr_nonkdim": kwargs.get("matrix_instr_nonkdim", 0),
+                "waves_per_eu": kwargs.get("waves_per_eu", 0),
+                "kpack": kwargs.get("kpack", 2),
+                "epilogue_subtile": kwargs.get("EPILOGUE_SUBTILE", 0),
+                **{
+                    k: kwargs[k]
+                    for k in AlgorithmSelectorCache.FLEX_ATTENTION_TUNABLE_KEYS
+                    if k in kwargs
+                },
+                **{k: kwargs[k] for k in CONV_TUNABLE_KEYS if k in kwargs},
+            },
+            mutated_inputs=mutated_inputs,
+            workspace_arg=workspace_arg,
+            allowed_prologue_inps=result.prologue_supported_inputs,
+            hint_override=hint_override,
+        )
 
     def choice_or_none(self, **kwargs: Any):
         """This template's choice for one configuration, or nothing if it does not fit.
@@ -3366,28 +3427,228 @@ class TritonTemplate(KernelTemplate):
         except NotImplementedError as e:
             return e
 
-    def generate_and_load(self, generate_with_caching: bool = True, **kwargs: Any):
-        """Write this configuration's kernel and load it.
+    def generate_and_load(
+        self,
+        input_nodes: tuple[ir.IRNode, ...],
+        num_stages: int,
+        num_warps: int,
+        call_sizes: Sequence[sympy.core.symbol.Symbol],
+        prefix_args: int,
+        suffix_args: int,
+        epilogue_fn: Callable[..., Any] | None,
+        epilogue_fn_hash: str | None,
+        subgraphs: list[ir.Buffer] | None,
+        workspace_arg: WorkspaceArg | None,
+        num_consumer_groups: int,
+        num_buffers_warp_spec: int,
+        layout: ir.Layout,
+        kwargs: dict[str, Any],
+        generate_with_caching,
+        hint_override: int | None = None,
+        tma_store: bool = False,
+        tma_load_for_template_epilogue: bool = False,
+        transpose_discontiguous_tensor_descriptors_override: bool | None = None,
+        triton_meta: TritonMeta | None = None,
+    ) -> GenerateAndLoadResult | None:
+        from .. import ir
+        from ..codegen.simd import SIMDScheduling
+        """Generate the python code and load it into the current process"""
+        caching_enabled = (
+            generate_with_caching
+            and config.enable_caching_generated_triton_templates
+        )
 
-        Generating and loading are one step here rather than two, because the
-        load is what the generate is for.  Whether the written form is kept at
-        all is the caller's decision: a caller enumerating a table wants every
-        entry written, because it is about to measure them, while a caller
-        measuring a second time would rather have a fresh one.
-        """
+        cache_key = None
+        if caching_enabled:
+            cache_key = self._generated_code_cache.make_key(
+                input_nodes,
+                num_stages,
+                num_warps,
+                call_sizes,
+                prefix_args,
+                suffix_args,
+                epilogue_fn,
+                epilogue_fn_hash,
+                tma_store,
+                tma_load_for_template_epilogue,
+                transpose_discontiguous_tensor_descriptors_override,
+                subgraphs,
+                workspace_arg,
+                layout,
+                num_consumer_groups,
+                num_buffers_warp_spec,
+                kwargs,
+                hint_override,
+                triton_meta,
+            )
 
-        built = self.generate(**kwargs)
-        if self.test_cache and built is not None:
-            # A cache that hands back something different from what it was
-            # given is worse than no cache, because the difference is invisible
-            # until a number is wrong.  So with the switch on, the same call is
-            # made twice and the two answers compared.
-            again = self.generate(**kwargs)
-            if getattr(again, "src_hash", None) != getattr(built, "src_hash", None):
-                raise AssertionError(
-                    f"{self.name} built two different ways from one source"
+        if not self.template:
+            raise AssertionError("requires jinja2")
+        defines = StringIO()
+
+        for name, val in kwargs.items():
+            defines.write(f"{name} : tl.constexpr = {val}\n")
+
+        fake_out = ir.Buffer(name="buf_out", layout=layout)
+        kernel_name = f"triton_{self.name}"
+
+        numel = sympy_product(layout.size)
+        buffers = itertools.chain(
+            input_nodes,
+            template_subgraph_index_dtype_nodes(subgraphs),
+            (fake_out,),
+        )
+
+        if SIMDScheduling.can_use_32bit_indexing(numel, buffers):
+            index_dtype = "tl.int32"
+        else:
+            index_dtype = "tl.int64"
+
+        # Add index dtype to defines so it's available in the template
+        defines.write(f"INDEX_DTYPE : tl.constexpr = {index_dtype}\n")
+        defines = defines.getvalue()
+
+        kernel_options = {
+            "input_nodes": input_nodes,
+            "defines": defines,
+            "num_stages": num_stages,
+            "num_warps": num_warps,
+            "grid_fn": self.grid,
+            "meta": kwargs,
+            "call_sizes": call_sizes,
+            "prefix_args": prefix_args,
+            "suffix_args": suffix_args,
+            "epilogue_fn": epilogue_fn,
+            "subgraphs": subgraphs,
+            "prologue_loads_all_inputs": self.prologue_loads_all_inputs,
+            "always_freeze_layout": self.always_freeze_layout,
+            "index_dtype_override": index_dtype,
+        }
+
+        if HAS_WARP_SPEC:
+            kernel_options.update(
+                {
+                    "num_consumer_groups": num_consumer_groups,
+                    "num_buffers_warp_spec": num_buffers_warp_spec,
+                }
+            )
+
+        def make_kernel():
+            return self.kernel_type(
+                kernel_name=kernel_name,
+                output_node=fake_out,
+                workspace_arg=workspace_arg,
+                use_jit=False,
+                hint_override=hint_override,
+                tma_store=tma_store,
+                tma_load_for_template_epilogue=tma_load_for_template_epilogue,
+                transpose_discontiguous_tensor_descriptors_override=transpose_discontiguous_tensor_descriptors_override,
+                triton_meta=triton_meta,
+                **kernel_options,
+            )
+
+        def generate_code(kernel) -> tuple[str, str] | None:
+            def make_extra() -> str:
+                extra_parts = [
+                    f"{kwarg}={repr(kwargs[kwarg])}" for kwarg in sorted(kwargs.keys())
+                ]
+
+                extra_parts.extend(
+                    [
+                        f"num_stages={num_stages}",
+                        f"num_warps={num_warps}",
+                    ]
                 )
-        return built
+                if HAS_WARP_SPEC:
+                    extra_parts.extend(
+                        [
+                            f"num_consumer_groups={num_consumer_groups}",
+                            f"num_buffers_warp_spec={num_buffers_warp_spec}",
+                        ]
+                    )
+                extra = "-".join(extra_parts) + "-"
+                return extra
+
+            try:
+                template = kernel.render(self.template, kwargs, caching_enabled)
+                code = template.finalize_all()
+            except ZeroDivisionError:
+                # TODO(nmacchioni): fix sympy division by zero
+                return None
+            if self.debug:
+                print("Generated Code:\n", code)
+
+            extra = make_extra()
+            return code, extra
+
+        def maybe_test_cache(code: str, extra: str, kernel):
+            if self.test_cache or self.debug:
+                with (
+                    patch.object(V.graph, "get_dtype", self._fake_get_dtype(fake_out)),
+                    V.graph.set_current_device(layout.device),
+                    make_kernel() as kernel_test,
+                ):
+                    result2 = generate_code(kernel_test)
+                    if result2 is None:
+                        raise AssertionError("result2 must not be None")
+                    code_test, extra_test = result2
+                    if not (
+                        code == code_test
+                        and extra == extra_test
+                        and kernel.args.input_buffers == kernel_test.args.input_buffers
+                        and kernel.prologue_supported_inputs
+                        == kernel_test.prologue_supported_inputs
+                        and kernel.args.sizevars == kernel_test.args.sizevars
+                    ):
+                        raise AssertionError(
+                            "Generated code cache results in wrong output"
+                        )
+
+        # Generate code, extra.
+        code: str | None = None
+        extra: str | None = None
+        with (
+            patch.object(V.graph, "get_dtype", self._fake_get_dtype(fake_out)),
+            V.graph.set_current_device(layout.device),
+            make_kernel() as kernel,
+        ):
+            cache_entry = self._generated_code_cache.get_entry(cache_key)
+            cache_hit = False
+
+            if cache_entry is not None:
+                code, extra, events = cache_entry
+                kernel.replay_cached_events(events)
+                cache_hit = True
+
+            else:
+                result = generate_code(kernel)
+                if result is None:  # happens at ZeroDivisionError:
+                    return None
+                code, extra = result
+                self._generated_code_cache.put_entry(
+                    cache_key, code, extra, kernel.cached_replay_events
+                )
+
+        if not (code is not None and extra is not None):
+            raise AssertionError("code and extra must not be None")
+
+        mod = PyCodeCache.load(code, extra, set_sys_modules=False)
+
+        input_call_args = tuple(kernel.args.input_buffers.keys())
+        prologue_supported_inputs = kernel.prologue_supported_inputs.copy()
+        kernel_args_sizevars_keys = tuple(kernel.args.sizevars.keys())
+
+        if cache_hit:
+            maybe_test_cache(code, extra, kernel)
+
+        return GenerateAndLoadResult(
+            mod,
+            extra,
+            input_call_args,
+            prologue_supported_inputs,
+            kernel_args_sizevars_keys,
+            kernel_options,
+        )
 
 
 class TritonTemplateCaller(TritonTemplateCallerBase):
