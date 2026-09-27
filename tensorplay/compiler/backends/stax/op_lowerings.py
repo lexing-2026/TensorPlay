@@ -4147,3 +4147,71 @@ def mode_default(self: Any, dim: Any = -1, keepdim: Any = False) -> Any:
         mode_idxs = _drop_axis(mode_idxs, dim)
 
     return mode_vals, mode_idxs
+
+
+def tensor(
+    data: Any,
+    *,
+    dtype: Any = None,
+    device: Any = None,
+    layout: Any = None,
+    pin_memory: Any = False,
+) -> Any:
+    """One number, or a short run of them, written into the code itself.
+
+    A value known before the program runs is a constant rather than a
+    computation, and the type of a number is int where it came from an integer
+    and the program's own default where it came as a real number -- asking
+    which of a handful of representations was meant is not the same as asking
+    what the program defaults to.
+
+    A short run of numbers is searched rather than indexed, because a search
+    over a handful of positions needs no storage and no load: the position asks
+    which half it is in, and each half asks the same of the one below it.  That
+    is why the length is bounded here -- the walk is as long as the run, and a
+    long run is better off being stored.
+    """
+
+    if isinstance(data, int) and not isinstance(data, bool):
+        dtype = dtype or tp.int64
+    else:
+        dtype = dtype or tp.float32
+
+    ranges: list = []
+
+    _truncate_fp = dtype in (tp.bfloat16, tp.float16)
+
+    if isinstance(data, sympy.Basic):
+
+        def inner_fn(index: Any) -> Any:
+            result = ops.index_expr(data, dtype)
+            if _truncate_fp:
+                result = ops.to_dtype(result, "float32")
+                result = ops.to_dtype(result, dtype)
+            return result
+
+    elif isinstance(data, (float, int, bool)):
+        # A real number that will not fit the type it is written as would be
+        # rounded on the way in, so it is rounded here instead -- where the
+        # rounding is a fact about the constant rather than about the code
+        # generated from it.
+        if _truncate_fp and isinstance(data, float):
+            data = tp.tensor(data, dtype=dtype).item()
+
+        def inner_fn(index: Any) -> Any:
+            return ops.constant(data, dtype)
+
+    else:
+        # A run of numbers too long to search is a value that has to be stored,
+        # and this has no way to put one in the graph -- so it is refused here
+        # rather than silently becoming a walk of the wrong length.
+        raise AssertionError(
+            f"expected a number or an expression, got {type(data).__name__}"
+        )
+
+    return Pointwise.create(
+        device=decode_device(device),
+        dtype=dtype,
+        inner_fn=inner_fn,
+        ranges=ranges,
+    )
