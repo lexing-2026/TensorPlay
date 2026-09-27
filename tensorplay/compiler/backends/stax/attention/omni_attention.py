@@ -29,6 +29,7 @@ import sympy
 
 import tensorplay as tp
 
+from ..heuristics.template.base import SymbolicGridFn
 from ..ir import ComputedBuffer
 from ..loops import V
 from ..op_lowerings import register_lowering
@@ -359,6 +360,7 @@ def heads_are_grouped(query: Any, key: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 
+@SymbolicGridFn
 def omni_attention_grid(
     batch_size: Any, q_heads: Any, num_queries: Any, d_model: Any, meta: Any, *, cdiv: Any
 ) -> Any:
@@ -374,6 +376,7 @@ def omni_attention_grid(
     return (cdiv(num_queries, meta["BLOCK_M"]), batch_size, q_heads)
 
 
+@SymbolicGridFn
 def omni_attention_backward_grid(
     batch_size: Any,
     q_heads: Any,
@@ -407,6 +410,7 @@ def omni_attention_backward_grid(
     )
 
 
+@SymbolicGridFn
 def omni_decoding_grid(
     batch_size: Any, kv_heads: Any, gqa_group_size: Any, seq_len_q: Any, d_model: Any, meta: Any
 ) -> Any:
