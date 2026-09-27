@@ -1994,7 +1994,11 @@ class GraphLowering(Interpreter):
 
         value = getattr_recursive(self.module, target)
 
-        if hasattr(value, "graph") and hasattr(value, "named_modules"):
+        # A graph is recognised by what reading a node from it needs, not by
+        # merely carrying one: a module that happens to hold a graph of its own
+        # is still a value this region can hold, and refusing to read it as a
+        # region is what keeps a weight from being mistaken for one.
+        if hasattr(value, "graph") and hasattr(value, "code"):
             if target in self.seen_subgraphs:
                 return self.seen_subgraphs[target]
             out = Subgraph(name=target, graph_module=value)
