@@ -27,6 +27,7 @@ import hashlib
 import json
 import os
 import pathlib
+import pkgutil
 import shutil
 import sys
 import tempfile
@@ -40,8 +41,11 @@ import tensorplay as tp
 if TYPE_CHECKING:
     from .runtime.remote_cache import JsonDataTy, RemoteCache
 
+from tensorplay.utils._functools import prefetchable_cache as torch_key_cache
+
 from .cache_key import CODE_CACHE_KEY_STRATEGY, SYSTEM_CACHE_KEY_STRATEGY
 from .compile_log import timed_block
+from .cpp_builder import _TORCH_PATH
 from tensorplay._subclasses.fake_tensor import (
     extract_tensor_metadata,
     TensorMetadata,
@@ -410,6 +414,65 @@ class LocalCache(CacheBase):
             found = nested
         found[keys[-1]] = value
         self.update_local_cache(cache)
+
+
+def build_code_hash(
+    roots: list[str] | None, prefix: str, hasher
+) -> None:
+    """Fold the source of a package, and everything under it, into a hash.
+
+    Sorted by name so that the same source produces the same hash whatever
+    order the modules happen to be listed in, and recursing into packages so
+    that a change in a submodule shows up.
+    """
+
+    for lib in sorted(pkgutil.iter_modules(roots, prefix), key=lambda x: x.name):
+        spec = lib.module_finder.find_spec(lib.name, None)
+        if spec is None:
+            raise AssertionError(f"Failed to find spec for module {lib.name}")
+        module = spec.origin
+        if module is None:
+            raise AssertionError(f"Module spec for {lib.name} has no origin")
+        with open(module, "rb") as f:
+            hasher.update(spec.name.encode("utf-8"))
+            hasher.update(f.read())
+        if lib.ispkg:
+            # need to also hash submodules
+            build_code_hash(spec.submodule_search_locations, f"{spec.name}.", hasher)
+
+
+@torch_key_cache
+def torch_key() -> bytes:
+    """A hash of the source this build was made from.
+
+    Written into every cache entry, because an answer found by an earlier build
+    is only an answer about the source that build was made from.  So a change
+    anywhere in the sources has to change this, and a change anywhere else must
+    not -- otherwise every entry is invalidated by an edit that could not have
+    affected any of them.
+    """
+
+    def get_code_hash(root: str) -> bytes:
+        # A helper rather than inlining this, so that the one thing a caller
+        # should reach for is the function above and not the walk underneath.
+        extra_files = (
+            "codegen/aoti_runtime/interface.cpp",
+            "codegen/aoti_runtime/streams.h",
+            "script.ld",
+        )
+        inductor_root = os.path.dirname(__file__)
+        extra_files = [os.path.join(inductor_root, x) for x in extra_files]
+        hasher = hashlib.sha256()
+        hasher.update(tp.__version__.encode("utf-8"))
+        build_code_hash([root], "", hasher)
+        for path in extra_files:
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    hasher.update(f.read())
+        return hasher.digest()
+
+    with timed_block("inductor_codecache_torch_key"):
+        return get_code_hash(_TORCH_PATH)
 
 
 def code_hash(code: str | bytes, extra: str | bytes = "") -> str:

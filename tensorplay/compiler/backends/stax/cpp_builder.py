@@ -18,6 +18,14 @@ from __future__ import annotations
 
 import functools
 import os
+
+#: This file's own path, and the root of the package above it.  A build that
+#: writes something next to the sources has to say where the sources are, and
+#: four levels up from here is that root.
+_HERE = os.path.abspath(__file__)
+_TORCH_PATH = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.dirname(_HERE)))
+)
 import shutil
 import re
 import subprocess
