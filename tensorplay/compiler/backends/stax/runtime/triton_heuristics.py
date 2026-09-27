@@ -41,6 +41,7 @@ from ..utils import (
 from .hints import HeuristicType
 from ..triton_bundler import TritonBundler
 from .benchmarking import benchmarker
+from .. import config
 from .cache_dir_utils import triton_cache_dir
 from .runtime_utils import triton_config_to_hashable
 from .triton_compat import IntelGPUError, OutOfResources, PTXASError
@@ -827,6 +828,23 @@ def _could_dynamic_scale_rblock(
 #: value would do, and one that could be produced by accident would not mean
 #: what it says.
 DEFER: Final[object] = object()
+
+
+class _ConstRepr:
+    """Something whose text is fixed, answering as though it were computed.
+
+    A function that prints itself is how the kernel runtime names a compiled
+    form in a message.  When the function itself is not travelling to another
+    process, that name still has to, so it is carried as this instead: it
+    answers the same question with the same text, without needing the thing it
+    was printed from.
+    """
+
+    def __init__(self, value: str):
+        self.value = value
+
+    def __call__(self, _=None) -> str:
+        return self.value
 
 
 class CachingAutotunerPlugin:
@@ -1851,6 +1869,98 @@ class CachingAutotuner(KernelInterface):
             if not callable(self._reload_kernel):
                 raise AssertionError("_reload_kernel must be callable")
             self.fn = self._reload_kernel().fn
+
+    def prepare_for_pickle(self) -> tuple[Any, ...]:
+        """Let go of what cannot travel to another process, keeping it aside.
+
+        A compiled form is a device binary; it does not go into a pickle, and
+        the function it came from holds a great deal of state that does not
+        either.  So both are set aside here and the old values handed back, for
+        whoever is holding this to be restored into -- and what is left behind
+        in their place still answers the questions that are asked of it, so a
+        form that was compiled here and is being sent elsewhere can still say
+        what it is.
+
+        The launchers go too: they hold the loaded binary, and the process that
+        receives this will load its own.
+        """
+
+        old_values = (
+            self.fn.fn,
+            self.fn.__globals__,
+            self.fn.used_global_vals,
+            self.fn.repr,
+            self.launchers,
+            getattr(self.fn, "_hash_lock", None),
+            self.benchmark_failure_reasons,
+        )
+        self.fn.fn = None
+        self.fn.__globals__ = None
+        self.fn.used_global_vals = None
+        self.fn.repr = _ConstRepr(self.fn.repr(self.fn))
+        self.launchers = []
+        self._cached_launcher = None
+        self.benchmark_failure_reasons = {}
+        self.fn._hash_lock = None
+        return old_values
+
+    def restore_after_unpickle(self, old_values: tuple[Any, ...] | None) -> None:
+        """Put back what was set aside, in the process that has the originals.
+
+        Where there are no originals -- because the forms were not compiled
+        here to begin with -- the lock still has to be a usable one, because
+        something will take it whether or not there is anything to protect.
+        """
+
+        self._cached_launcher = None
+        if old_values:
+            (
+                self.fn.fn,
+                self.fn.__globals__,
+                self.fn.used_global_vals,
+                self.fn.repr,
+                self.launchers,
+                self.fn._hash_lock,
+                self.benchmark_failure_reasons,
+            ) = old_values
+        else:
+            # even if we don't need/have specific values, we do need the
+            # _hash_lock to be a valid RLock
+            self.fn._hash_lock = threading.RLock()
+
+    def prepare_for_caching(self) -> None:
+        """Let go of the raw binary before this is written to a cache.
+
+        A form that is started without the runtime's launcher holds its binary
+        as bytes, and those bytes are large -- much larger than the entry that
+        refers to them.  Whether they are kept is a trade: keeping them means a
+        cold load does not have to recompile, at the cost of every cache entry
+        carrying them.
+        """
+
+        # Only cubin_raw must be retained: __getstate__ already nulls cubin_path
+        # on every serialize, so a cold-container load rehydrates the cubin from
+        # cubin_raw rather than pointing at a missing file.
+        if config.keep_static_cubin_raw:
+            return
+        for result in self.compile_results:
+            if isinstance(result, StaticTritonCompileResult):
+                # Don't save this in the inductor cache, as it is very large
+                result.kernel.cubin_raw = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        if self.launchers:
+            raise AssertionError("pickle should not be called after make_launchers()")
+        return {
+            **self.__dict__,
+            "lock": None,
+            "_plugins": [],
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self.lock = threading.Lock()
+        self._plugins = get_caching_autotuner_plugins(self)
 
     def get_device_interface(self):
         # What a device is called here and what it is called by the module that

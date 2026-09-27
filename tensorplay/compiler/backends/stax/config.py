@@ -1163,6 +1163,14 @@ autotune_local_cache: bool = True
 #: is unset rather than off.
 autotune_remote_cache: bool | None = None
 
+#: Keep the raw binary of a kernel that is started without going through the
+#: runtime's own launcher.  A cold load can then rehydrate from those bytes
+#: instead of compiling again -- at the cost of carrying them in every cache
+#: entry, which is why it is off.
+keep_static_cubin_raw: bool = (
+    os.environ.get("TP_KEEP_STATIC_CUBIN_RAW", "0") == "1"
+)
+
 #: Keep the measured answers together, as one entry, rather than one entry per
 #: kernel -- which on a model of any size is a great many small files.  Only
 #: available when the local cache is on, because the gathered answers are fed
