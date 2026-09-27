@@ -8,10 +8,13 @@ fails, which is why it is registered here beside the rest.
 """
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import hashlib
 import itertools
 import logging
 import os
+import sympy
 from typing import NamedTuple
 
 from typing import Any, Callable, Iterator
@@ -32,6 +35,8 @@ from ..heuristics.registry import (
 )
 from .triton import CHOICES
 from ..codegen.subgraph import SubgraphChoiceCaller
+from ..codegen.simd import IterationRangesEntry, IterationRangesRoot
+from ..codegen.common import CSE, IndentedBuffer
 
 #: Whether a candidate's result is checked against what the operation's own
 #: kernel produced.  On by default because a template that computes the wrong
@@ -388,6 +393,50 @@ class ExternKernelCaller(ChoiceCaller):
         return f"extern_{self.choice.name}"
 
 
+@dataclasses.dataclass()
+class SubgraphInfo:
+    """What is needed to lower one subgraph of a kernel written as a template.
+
+    The template's text is written once and then rendered once, but the parts
+    of it that belong to a subgraph are worked out while that subgraph is
+    lowered.  So each subgraph keeps its own text and its own bookkeeping, and
+    a kernel swaps those in while it works on one subgraph and swaps them back
+    when it is done.
+    """
+
+    body: IndentedBuffer
+    template_mask: str | None = None
+    template_out_shape: str | tuple[str] | None = None
+    compute: IndentedBuffer = dataclasses.field(default_factory=IndentedBuffer)
+    indexing_code: IndentedBuffer = dataclasses.field(default_factory=IndentedBuffer)
+    loads: IndentedBuffer = dataclasses.field(default_factory=IndentedBuffer)
+    stores: IndentedBuffer = dataclasses.field(default_factory=IndentedBuffer)
+    ops_handler: V.WrapperHandler | None = None
+    cse: CSE[Any, str] | None = None
+
+    # Only carried over when they were made, because a subgraph that made
+    # none of them shares the kernel's rather than replacing it with nothing.
+    range_trees: list[IterationRangesRoot] | None = None
+    range_tree_nodes: dict[sympy.Symbol, IterationRangesEntry] | None = None
+    numels: dict[str, sympy.Expr] | None = None
+
+    # Maps a range-tree root's name to the name the prologue gave it.
+    root_var_renames: dict[str, str] = dataclasses.field(default_factory=dict)
+
+    def __post_init__(self):
+        self.only_copy_if_non_none_fields = (
+            "range_trees",
+            "range_tree_nodes",
+            "numels",
+            "cse",
+        )
+
+    def to_dict(self):
+        return {
+            field.name: getattr(self, field.name) for field in dataclasses.fields(self)
+        }
+
+
 class ExternKernelChoice:
     """An operation that can hold its own against a kernel, as a choice.
 
@@ -558,10 +607,26 @@ class TritonChoiceCaller(ChoiceCaller):
 
     def __init__(self, name, input_nodes=(), layout=None, description="",
                  source: str = "", src_hash: str | None = None,
-                 launcher_args: tuple | None = None):
+                 launcher_args: tuple | None = None,
+                 num_stages: int = 2, num_warps: int = 4,
+                 config: dict | None = None, operands: dict | None = None,
+                 inductor_meta: dict | None = None, template: Any = None):
         super().__init__(name, input_nodes, layout, description)
         self.source = source
         self._src_hash = src_hash
+        #: How many steps of the contraction are held at once, and how many
+        #: programs run.  How many are live at once is what decides how much
+        #: memory the kernel needs, so a configuration that does not fit the
+        #: device is tried again with fewer of them.
+        self.stages = num_stages
+        self.warps = num_warps
+        #: The configuration this was built from, and what it was written
+        #: against, kept so that the same text can be compiled again with one
+        #: thing changed rather than guessed at again from the shape.
+        self.config = dict(config or {})
+        self.operands = dict(operands or {})
+        self.inductor_meta = dict(inductor_meta or {})
+        self.template = template
         #: What a launcher written from this kernel is handed, in the order it
         #: declares: the operands of the call, then the extents and strides the
         #: kernel was written to be given, then the stream.  A measurement is
@@ -581,6 +646,53 @@ class TritonChoiceCaller(ChoiceCaller):
             parts.append(digest)
         return ":".join(parts)
 
+    def _with_fewer_stages(self) -> "TritonChoiceCaller":
+        """The same configuration, holding fewer steps at once.
+
+        What a kernel needs in memory is what it is working on at once, so the
+        same tile with fewer steps live is the same computation with a smaller
+        working set.  It is a different kernel and therefore a different
+        configuration, and it is measured as one rather than folded into the
+        first one's answer.
+        """
+
+        config = {**self.config, "num_stages": max(1, int(self.stages) - 1)}
+        meta = {**self.inductor_meta}
+        result = _compile_rendered(
+            self.template,
+            self.source,
+            config={k: v for k, v in config.items() if k != "num_stages"},
+            constants={
+                k: v
+                for k, v in config.items()
+                if k not in ("num_stages", "num_warps", "layout",
+                             "input_nodes", "out_size")
+            },
+            inductor_meta=meta,
+        )
+        if result is None:
+            raise NotImplementedError(
+                "this configuration does not fit even with a single step"
+            )
+        result.kernel._init_handles()
+        launcher = result.make_launcher()
+        launcher.__name__ = self.name
+        return TritonChoiceCaller(
+            name=self.name,
+            input_nodes=self.input_nodes,
+            layout=self.layout,
+            description=self.description,
+            source=self.source,
+            src_hash=self._src_hash,
+            launcher_args=self.launcher_args,
+            num_stages=int(config["num_stages"]),
+            num_warps=int(self.warps),
+            config=config,
+            operands=self.operands,
+            inductor_meta=meta,
+            template=self.template,
+        ).bind(launcher)
+
     def benchmark(self, *args: Any, out: Any = None) -> float:
         """How long one run of this choice takes.
 
@@ -593,6 +705,8 @@ class TritonChoiceCaller(ChoiceCaller):
 
         from ..runtime.stax_autotune import bench_launch
 
+        from ..runtime.triton_compat import OutOfResources
+
         algo = self.to_callable()
         # The result is written into a buffer the caller named, and in the
         # signature that buffer is among the pointers -- so it goes with the
@@ -601,7 +715,24 @@ class TritonChoiceCaller(ChoiceCaller):
         # order it declares them.
         operands = [*args, *([out] if out is not None else []),
                     *(self.launcher_args or ())]
-        return bench_launch(algo, operands)
+        def launch(these, _algo=algo):
+            return _algo(*these)
+
+        try:
+            return bench_launch(launch, operands)
+        except OutOfResources:
+            # The kernel is too large for the shared memory this device has.
+            # A tile that is too large is a configuration that cannot be
+            # measured here, which is an answer about this machine rather than
+            # a failure: the other candidates are still answers.  The only
+            # thing worth trying is the same tile with fewer steps held at
+            # once, since that is what decides how much memory is live.
+            if int(self.stages) > 1:
+                return self._with_fewer_stages().benchmark(*args, out=out)
+            raise NotImplementedError(
+                "this configuration does not fit the shared memory on this "
+                "device, even with a single step"
+            )
 
     def autoheuristic_id(self) -> str:
         return "triton_template"
@@ -849,12 +980,16 @@ def _launcher_tail(layout, input_nodes, arg_names) -> tuple:
             # digit it ends with.  The operand is named by the parameter, so
             # whichever spelling the operands were declared under is the one
             # looked for.
+            # The name is the operand's own name with its pointer's suffix and
+            # the index of the extent, so the operand is what is left once
+            # those are taken off -- in whichever of the two spellings the
+            # operands were declared.
             stem = name[len("size_"):-1]
             operand = next(
                 (
                     letter
                     for letter in by_name
-                    if letter.lower() == stem.lower() or letter.lower() + "_ptr" == stem.lower()
+                    if stem.lower() in (letter.lower(), letter.lower() + "_ptr")
                 ),
                 None,
             )
@@ -872,7 +1007,7 @@ def _launcher_tail(layout, input_nodes, arg_names) -> tuple:
                 (
                     letter
                     for letter in by_name
-                    if letter.lower() == stem.lower() or letter.lower() + "_ptr" == stem.lower()
+                    if stem.lower() in (letter.lower(), letter.lower() + "_ptr")
                 ),
                 None,
             )
@@ -1274,6 +1409,15 @@ class TritonTemplate(KernelTemplate):
                 if k not in ("layout", "input_nodes", "out_size")
             },
         )
+        # What the launch is written against, kept so that a retry with one
+        # thing changed can be compiled from the same record rather than
+        # worked out again.
+        inductor_meta = {
+            "kernel_name": self.uid,
+            "device": layout.device if layout is not None else "cuda",
+            "grid_type": "FixedGrid",
+            "fixed_grid": tuple(int(v) for v in extents),
+        }
         result = _compile_rendered(
             self,
             rendered,
@@ -1321,6 +1465,12 @@ class TritonTemplate(KernelTemplate):
             source=self.source,
             src_hash=self.src_hash,
             launcher_args=launcher_args,
+            num_stages=int(kwargs.get("num_stages", 2)),
+            num_warps=int(kwargs.get("num_warps", 4)),
+            config={k: v for k, v in kwargs.items()},
+            operands=dict(self.operands),
+            inductor_meta=inductor_meta,
+            template=self,
         )
         # A grid is a function of the extents being computed and of the tile
         # they were split into, so both are computed once here rather than
