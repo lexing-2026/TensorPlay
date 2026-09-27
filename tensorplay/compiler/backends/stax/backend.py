@@ -2,7 +2,6 @@
 
 The layers below hold the work: :mod:`loops` for the IR every device is
 lowered to, :mod:`graph_lowering` for the captured-graph walk, and
-:mod:`loop_compile` for scheduling and printing.  This module drives them
 and re-exports their names, so ``backend`` stays the single import
 surface for the code generators and the tests.
 """
@@ -39,7 +38,6 @@ _MODE_OPTIONS: dict[str, dict[str, bool]] = {
 # Every backend option key accepted by ``stax`` (and therefore by explicit
 # ``options`` dicts and mode patches alike).
 _STAX_OPTIONS = (
-    "stax.native",
     "stax.fusion",
     "stax.cuda_codegen",
     "stax.triton",
@@ -114,7 +112,6 @@ def stax(
         if any(not isinstance(value, bool) for value in options.values()):
             raise RuntimeError("Stax optimization options must be bool values")
         resolved.update(options)
-    use_native = resolved.get("stax.native", True)
     use_fusion = resolved.get("stax.fusion", True)
     use_cuda_codegen = resolved.get("stax.cuda_codegen", False)
     use_triton = resolved.get("stax.triton", True)
@@ -126,7 +123,6 @@ def stax(
     compiled = _lower_stax_region(
         graph_module,
         example_inputs,
-        use_native=use_native,
         use_fusion=use_fusion,
         use_cuda_codegen=use_cuda_codegen,
         use_triton=use_triton,
@@ -166,7 +162,6 @@ def _lower_stax_region(
     graph_module: GraphModule,
     example_inputs: list[Any],
     *,
-    use_native: bool,
     use_fusion: bool,
     use_cuda_codegen: bool,
     use_triton: bool,
@@ -193,131 +188,6 @@ def _lower_stax_region(
     except (AttributeError, IndexError):
         on_cuda = False
 
-    routes = []
-
-    def route(tag, enabled, build, codegen=None):
-        """Register one lowering: it answers whether it claims the region.
-
-        ``tag`` names the route, which is an internal identity.  ``codegen``
-        names what the region ends up running -- generated kernels, a native
-        graph, the interpreted executor -- and is what the artifact reports,
-        because that is the part a caller can act on.
-        """
-
-        if enabled:
-            routes.append((tag, build, codegen or tag))
-
-    if use_native:
-        # Keep Triton optional and lazy.  Importing tensorplay on a CPU-only
-        # machine must not import Triton or its compiler toolchain.
-        def build_loop_region():
-            from ..._core.aot_autograd import aot_module_simplified
-            from .op_lowerings import select_decomp_table
-            from .codegen.common import required_features, select_backend
-            from .loops import promotes_on_load
-
-            def contiguous(value):
-                is_contiguous = getattr(value, "is_contiguous", None)
-                return True if is_contiguous is None else bool(is_contiguous())
-            from .loop_compile import (
-                NotLowerable,
-                compile_half,
-                compile_half_host,
-            )
-
-            def compile_half_or_none(half, half_inputs, **_ignored):
-                # The half arrives with the values it reads; what they are is
-                # the boundary's decision, and this only compiles the half.
-                # Which printer runs is read off what the half needs and what
-                # each emitter declares, not off which device the tensors
-                # happen to live on: the device only says where to start when
-                # a half needs nothing in particular.
-                needed = required_features(
-                    strided_inputs=any(
-                        not contiguous(value) for value in half_inputs
-                    ),
-                    mixed_dtypes=len({
-                        str(getattr(value, "dtype", "")) for value in half_inputs
-                    }) > 1,
-                    promoted_inputs=any(
-                        promotes_on_load(getattr(value, "dtype", None))
-                        for value in half_inputs
-                    ),
-                    grad_inputs=any(
-                        getattr(value, "requires_grad", False)
-                        for value in half_inputs
-                    ),
-                )
-                printer = select_backend(needed, "cuda" if on_cuda else "cpu")
-                if printer is None:
-                    # Nothing this device declares can print the half: the
-                    # region runs as the framework wrote it, which is what the
-                    # caller's own fallback is for.
-                    raise NotLowerable(
-                        f"no emitter for {needed} on this device"
-                    )
-                if printer == "cpp":
-                    return compile_half_host(half, half_inputs)
-                return compile_half(
-                    half, half_inputs,
-                    max_autotune=max_autotune,
-                    coordinate_descent_tuning=coordinate_descent_tuning,
-                )
-
-            try:
-                # One boundary owns the region: it traces the joint graph,
-                # splits it, hands each half to the compiler here, and keeps
-                # the saved values and the gradients.  A compiler that cannot
-                # express a half says so from inside that walk.
-                return aot_module_simplified(
-                    graph_module,
-                    list(example_inputs),
-                    fw_compiler=compile_half_or_none,
-                    bw_compiler=compile_half_or_none,
-                    # What the graph is captured with decides which operations
-                    # reach this point at all: an operation the capture
-                    # decomposed is one fewer thing to lower, and the products
-                    # are the case that matters, because a product arrives as one
-                    # operation covering seven shapes and has to become the
-                    # product that matches the shape before anything can choose
-                    # how to compute it.
-                    decompositions=select_decomp_table(),
-                )
-            except (NotLowerable, NotImplementedError) as exc:
-                # A form the device's emitter cannot print.  Which emitter
-                # runs is read from what it declares before anything is
-                # attempted, so what arrives here is a form no emitter on this
-                # device covers, and the region runs as the framework wrote it.
-                # Saying which form is what lets that coverage be measured
-                # instead of guessed.
-                if os.environ.get("TP_LOOP_ROUTE_DEBUG"):
-                    print(
-                        f"[stax-loops] unprinted: {type(exc).__name__}: {exc}",
-                        file=sys.stderr,
-                    )
-                return None
-
-        # One lowering per device.  On an accelerator the loop IR is it: the
-        # boundary traces the region, splits it and hands each half to the
-        # compiler above.  The routes below are the host backend, chosen by
-        # the device the tensors live on rather than by which one answers
-        # first, so a form this device's lowering does not cover is a form the
-        # framework runs itself -- not a hop to a second emitter for the same
-        # device.
-        route("stax-loops", True, build_loop_region, codegen="triton")
-
-    # One lowering per device, and it is the one above: a region it cannot
-    # print is a region the framework runs itself, which is what a fall back to
-    # the framework is for.  It is not answered by a second program
-    # representation for the same device -- that is the branch this replaced.
-
-    for tag, build, codegen in routes:
-        compiled = build()
-        if compiled is None:
-            continue
-        graph_module._stax_codegen = tag
-        _publish_codegen(compiled, codegen, backward=training)
-        return compiled
     if strict and training and any(
         getattr(graph_module._get_attr(node.target), "requires_grad", False)
         for node in graph_module.graph.nodes
