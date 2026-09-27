@@ -30,6 +30,7 @@ from ..ir import (
     StorageBox,
     FixedLayout,
     FlexibleLayout,
+    ReinterpretView,
     InputBuffer,
     IRNode,
     TensorBox,
@@ -769,3 +770,82 @@ def build_subgraph_buffer(args: Any, subgraph: Any) -> Any:
     """The same, for a body that is already a graph of its own."""
 
     return build_subgraph_module_buffer(args, subgraph.graph_module)
+
+
+def realize_captures_for_cutedsl(buffers: Any) -> Any:
+    """Write down the values a kernel was handed that are not already written.
+
+    A kernel is handed physical values, so a captured value that was a
+    computation has to be somewhere before it can be handed over.  A value that
+    was already a graph input is left as it is: copying it would be a copy of
+    the whole value to satisfy a property it already has.
+
+    A captured view is the case that needs a name of its own.  Two views of the
+    same value are two arguments with different shapes, offsets and strides, and
+    a kernel told about one of them and given the other would read the wrong
+    bytes.  So each is given a name, and the name stands for the view rather
+    than for what it is a view of.
+    """
+
+    from ..ir import (
+        ExternKernel,
+        FixedLayout,
+        InputBuffer,
+        ReinterpretView,
+        StorageBox,
+    )
+
+    view_captures: dict = {}
+
+    def _add_alignment_check_for_input(input_buffer: Any) -> None:
+        # A captured value can be read several at a time, so it has to be
+        # aligned whichever way of reading it is used -- and it was not a direct
+        # argument of the kernel when the arguments that need checking were
+        # chosen, so it is added here rather than there.
+        name = input_buffer.get_name()
+        graph_input_names = list(getattr(V.graph, "graph_input_names", ()) or ())
+        if name in graph_input_names:
+            idx = graph_input_names.index(name)
+            inputs_to_check = list(V.graph.inputs_to_check or ())
+            if idx not in inputs_to_check:
+                V.graph.inputs_to_check = [*inputs_to_check, idx]
+
+    def _realize(x: Any) -> Any:
+        if x is None or isinstance(x, sympy.Expr):
+            return x
+        realized = ExternKernel.realize_input(x)
+        if isinstance(realized, StorageBox) and realized.is_input_buffer():
+            realized = realized.data
+        if isinstance(realized, ReinterpretView):
+            layout = realized.get_layout()
+            capture_index = len(V.graph._cutedsl_capture_nodes) + len(view_captures)
+            name = f"cutedsl_capture{capture_index}"
+            view_captures[name] = realized
+            # Each captured view gets a name of its own, so two views of the
+            # same value do not collapse into one argument.
+            return InputBuffer(
+                name=name,
+                layout=FixedLayout(
+                    layout.device,
+                    layout.dtype,
+                    layout.size,
+                    layout.stride,
+                    is_pinned=layout.is_pinned,
+                ),
+            )
+        if isinstance(realized, InputBuffer):
+            _add_alignment_check_for_input(realized)
+            return realized
+        return ExternKernel.copy_input(realized)
+
+    buffers = tree_map(_realize, buffers)
+    freeze_irnodes(buffers)
+
+    for buf in (tree_map_only(IRNode, lambda x: x, buffers) if buffers else []):
+        if isinstance(buf, IRNode) and (name := buf.maybe_get_name()):
+            V.graph._cutedsl_capture_nodes[name] = buf
+    # The views are kept as they were, because the call site reads them through
+    # the view rather than through the value.
+    V.graph._cutedsl_capture_nodes.update(view_captures)
+
+    return buffers

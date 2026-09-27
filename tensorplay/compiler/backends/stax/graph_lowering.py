@@ -458,6 +458,18 @@ class GraphLowering:
         # artifact is called with them by position, so the two have to be able to
         # say which is which.
         self.graph_input_names: list[str] = []
+        # Which inputs must be checked for the alignment a wide read needs.
+        # Named by position rather than left to every caller, because a value
+        # that is read several at a time has to be aligned whichever of the
+        # ways of reading it is used, and which ways are used is not known when
+        # the inputs are first seen.
+        self.inputs_to_check: list[int] = []
+        # A value a kernel was handed that the kernel reads as a view of
+        # something else.  Kept beside the graph rather than passed to the
+        # kernel, because the kernel is written against the value and the view
+        # is how that value was reached -- and a view that has been flattened
+        # into the value is a view of the wrong bytes.
+        self._cutedsl_capture_nodes: dict = {}
         self.graph_module = graph_module
         # What strides each output a caller reads is recorded as having had, and
         # which nodes must not have their inputs padded because of it.
