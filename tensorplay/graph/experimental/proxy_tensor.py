@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+import operator
+
+from tensorplay.graph.node import Node
+
+from ._dispatch_trace import (
+    _ConstantHolder,
+    _is_tensor,
+    _tensor_meta,
+    ProxyTensorDispatchMode,
+)
+
+
 import contextvars
 import functools
 import inspect
@@ -195,7 +207,7 @@ def track_tensor(value: Any, proxy: Proxy, *, constant: Any = None, tracer: Any 
         tracker = {}
         setattr(owner, "tensor_tracker", tracker)
     try:
-        tracker[id(value)] = proxy
+        tracker[value._impl_id] = proxy
     except TypeError:
         pass
     return value
@@ -239,8 +251,138 @@ class PythonKeyTracer(Tracer):
     ) -> None:
         super().__init__(*args, **kwargs)
         self.decomposition_table = dict(decomposition_table or {})
-        self.tensor_tracker: dict[int, Proxy] = {}
+        self.tensor_tracker: dict[int, Any] = {}
         self.proxy_mode = ProxyMode(self)
+
+    # -- recording operations as they are performed ------------------------
+    #
+    # The methods below are what lets an operation be recorded as it happens
+    # rather than as the call that led to it.  A method called on a stand-in
+    # is the method; an operation performed on a value is the operation, and
+    # only the second names the work to be done.  So a trace that watches
+    # operations needs the values themselves in the body, and these are how
+    # a value that was passed in is found again when an operation consumes it.
+
+    def track(self, tensor: Any, node: Node) -> None:
+        """Say which node produced this value, so a later use finds it."""
+
+        self.tensor_tracker[tensor._impl_id] = node
+        node.meta["val"] = tensor
+        node.meta["tensor_meta"] = _tensor_meta(tensor)
+
+    def node_for(self, tensor: Any) -> Node:
+        entry = self.tensor_tracker.get(tensor._impl_id)
+        if entry is not None:
+            return entry if isinstance(entry, Node) else entry.node
+        return self._constant(tensor)
+
+    def _constant(self, tensor: Any) -> Node:
+        """A node holding a value nothing in the graph accounts for.
+
+        A value the body was handed but that no placeholder stands for -- a
+        closure's capture, or an argument the caller specialized -- has to be
+        held somewhere, since the operation that made it is not in the graph
+        and nothing else refers to it.  It is held on the root, so it is
+        found again by the same name the next time.
+        """
+
+        name = f"_tensor_constant{self._constant_count}"
+        self._constant_count += 1
+        if self.root is None:
+            self.root = _ConstantHolder()
+        setattr(self.root, name, tensor)
+        node = self.graph.get_attr(name)
+        self.track(tensor, node)
+        return node
+
+    def map_value(self, value: Any) -> Any:
+        """The node for a value, or the value itself where it is not a tensor."""
+
+        if _is_tensor(value):
+            return self.node_for(value)
+        if isinstance(value, tuple):
+            return tuple(self.map_value(item) for item in value)
+        if isinstance(value, list):
+            return [self.map_value(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self.map_value(item) for key, item in value.items()}
+        return value
+
+    def record(self, func: Any, args: tuple[Any, ...], kwargs: Mapping[str, Any], out: Any) -> Node:
+        """Put an operation into the graph, and say what it produced.
+
+        An operation that produced several values is one node, and each value
+        is reached from it by position -- so a caller that takes the first
+        result gets the node it came from rather than a second copy of the
+        operation.
+        """
+
+        node = self.graph.create_node(
+            "call_function",
+            func,
+            self.map_value(tuple(args)),
+            self.map_value(dict(kwargs)),
+            name=getattr(func, "_opname", None),
+        )
+        if _is_tensor(out):
+            self.track(out, node)
+        elif isinstance(out, (tuple, list)):
+            node.meta["val"] = out
+            for index, item in enumerate(out):
+                if _is_tensor(item):
+                    element = self.graph.create_node(
+                        "call_function", operator.getitem, (node, index), {}
+                    )
+                    self.track(item, element)
+                elif isinstance(item, (tuple, list)) and any(_is_tensor(v) for v in item):
+                    element = self.graph.create_node(
+                        "call_function", operator.getitem, (node, index), {}
+                    )
+                    element.meta["val"] = item
+                    for inner_index, inner in enumerate(item):
+                        if _is_tensor(inner):
+                            leaf = self.graph.create_node(
+                                "call_function", operator.getitem, (element, inner_index), {}
+                            )
+                            self.track(inner, leaf)
+        else:
+            node.meta["val"] = out
+        return node
+
+    def map_output(self, value: Any) -> Any:
+        """Say what stands for each value the body returned.
+
+        The body computed on real values, so what it returned is a value;
+        the graph stores nodes, and each of these is the node of the
+        operation that produced it.
+        """
+
+        return self.map_value(value)
+
+    def body_value(self, node: Node, sample: Any) -> Any:
+        """Hand the body the value itself, and remember which node it came from.
+
+        The value is what the caller passed, and the node is what stands for
+        it in the graph.  Both are needed: the value is what the body
+        operates on, so the operations it performs are the ones that get
+        recorded, and the node is how an operation that consumes this value is
+        found to take it as an argument rather than as something the graph has
+        never seen.
+
+        A value that is not a tensor is passed on as itself too, and this is
+        not a special case: a length or a scale is part of what the program
+        does, and a stand-in for one would be read as a graph value by
+        whatever asks about it -- a function that captures a call when one of
+        its arguments is a graph value would then capture a call whose scale
+        is a stand-in, and the result would be a stand-in where the caller
+        expects the value.
+        """
+
+        if sample is None:
+            return super().body_value(node, sample)
+        if _is_tensor(sample):
+            self.track(sample, node)
+        return sample
 
     def create_proxy(
         self, kind: str, target: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
@@ -280,11 +422,12 @@ def dispatch_trace(
         samples = {}
         if concrete_args is not None:
             samples = _bind_sample_inputs(root, tuple(concrete_args), {})
-    token = _CURRENT_MODE.set(tracer.proxy_mode)
-    try:
+    # The mode that watches the operations is what turns a run of the program
+    # into a graph of what it did.  Underneath it the state the decomposition
+    # helpers read stays the same either way, so both are entered: the one
+    # that watches, and the one that is consulted.
+    with tracer.proxy_mode, ProxyTensorDispatchMode(tracer, tracer.decomposition_table):
         return tracer.trace(root, sample_inputs=samples)
-    finally:
-        _CURRENT_MODE.reset(token)
 
 
 def make_graph(

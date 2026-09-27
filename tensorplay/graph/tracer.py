@@ -269,6 +269,32 @@ class Tracer:
 
         return Proxy(node, self)
 
+    def map_output(self, value: Any) -> Any:
+        """What the graph's output node is given for what the body returned.
+
+        Whatever the body returned is left as it is: a stand-in already names
+        a node, and a value that is not a node cannot be stored in a graph
+        anyway.  A tracer whose body computes on real values has to say what
+        stands for each of them, and says so by overriding this.
+        """
+
+        return value
+
+    def body_value(self, node: Node, sample: Any) -> Any:
+        """What the traced body is handed for one of its parameters.
+
+        A stand-in for the value, so that everything the body computes with it
+        becomes part of the graph.  That is right when the graph is built by
+        computing with stand-ins, and wrong when the graph is built by
+        watching what the body actually does -- a method called on a stand-in
+        is the method, where an operation performed on a value is the
+        operation, and only the second names the work.  A tracer that watches
+        says so by overriding this; ``sample`` is the value for this
+        parameter, which is what it would hand the body.
+        """
+
+        return self.proxy(node)
+
     def trace(
         self, root: Any, sample_inputs: Optional[Dict[str, Any]] = None
     ) -> "GraphModule":
@@ -349,7 +375,9 @@ class Tracer:
                     # different callable recompiles.
                     values[parameter.name] = sample
                 else:
-                    values[parameter.name] = self.proxy(placeholder_node)
+                    values[parameter.name] = self.body_value(
+                        placeholder_node, sample
+                    )
 
         with compiler_context():
             if _is_module(root):
@@ -357,7 +385,7 @@ class Tracer:
             else:
                 output = self._invoke(function, parameters, values)
 
-        self.graph.output(output)
+        self.graph.output(self.map_output(output))
         self.graph.lint()
         # Specialized (concrete) parameters disappear from the graph contract
         # together with their placeholders; every other parameter keeps its
