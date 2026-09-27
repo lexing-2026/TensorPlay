@@ -3474,7 +3474,7 @@ class TritonTemplate(KernelTemplate):
                 "epilogue_subtile": kwargs.get("EPILOGUE_SUBTILE", 0),
                 **{
                     k: kwargs[k]
-                    for k in AlgorithmSelectorCache.FLEX_ATTENTION_TUNABLE_KEYS
+                    for k in AlgorithmSelectorCache.OMNI_ATTENTION_TUNABLE_KEYS
                     if k in kwargs
                 },
                 **{k: kwargs[k] for k in CONV_TUNABLE_KEYS if k in kwargs},

@@ -163,7 +163,7 @@ class TensorMeta:
         from .loops import V
 
         if isinstance(node, Layout):
-            node = Buffer("fake", node)
+            node = Buffer(name="fake", layout=node)
 
         dtype = node.get_dtype()
         if dtype is None:

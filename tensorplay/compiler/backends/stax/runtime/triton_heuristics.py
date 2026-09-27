@@ -27,7 +27,7 @@ import os
 import re
 import threading
 import time
-from typing import Any, Callable, Container, Final, Generic, Literal, TypeVar
+from typing import Any, Callable, Container, Final, Generic, Literal, TypeVar, cast
 
 import tensorplay as tp
 
@@ -42,7 +42,7 @@ from ..utils import (
     tlx_only_cuda_options,
     triton_version_uses_attrs_dict,
 )
-from .hints import HeuristicType
+from .hints import HeuristicType, DeviceProperties, TritonMeta
 from ..triton_bundler import TritonBundler
 from .benchmarking import benchmarker
 from .. import config
@@ -3417,3 +3417,225 @@ class RoundRobinComboKernelGrid(ComboKernelGrid):
         if xnumels_x_dim:
             exprs.append(self.ceildiv(self.maximum(xnumels_x_dim), meta.get("XBLOCK")))
         return f"({self.maximum(exprs)}) * {num_kernels}"
+
+
+def _enforce_reduction_config_block_minimums(
+    configs: list[Config],
+    size_hints: dict[str, int],
+    inductor_meta: InductorMeta,
+) -> list[Config]:
+    min_xblock = inductor_meta.get("min_xblock")
+    min_rblock = inductor_meta.get("min_rblock")
+    if min_xblock is None and min_rblock is None:
+        return configs
+
+    for cfg in configs:
+        if frozenset(("YBLOCK", "ZBLOCK", "R1_BLOCK")) & cfg.kwargs.keys():
+            raise AssertionError(
+                f"min_xblock/min_rblock only support 2D X/R0 configs: {cfg}"
+            )
+        has_xblock = "XBLOCK" in cfg.kwargs
+        has_rblock = "R0_BLOCK" in cfg.kwargs
+        if not (has_xblock or has_rblock):
+            continue
+
+        x_floor = min_xblock if min_xblock is not None else 1
+        r_floor = min_rblock if min_rblock is not None else 1
+        target_tile_product = (cfg.kwargs["XBLOCK"] if has_xblock else 1) * (
+            cfg.kwargs["R0_BLOCK"] if has_rblock else 1
+        )
+
+        if has_xblock:
+            cfg.kwargs["XBLOCK"] = max(cfg.kwargs["XBLOCK"], x_floor)
+        if has_rblock:
+            cfg.kwargs["R0_BLOCK"] = max(cfg.kwargs["R0_BLOCK"], r_floor)
+
+        def current_tile_product() -> int:
+            return (cfg.kwargs["XBLOCK"] if has_xblock else 1) * (
+                cfg.kwargs["R0_BLOCK"] if has_rblock else 1
+            )
+
+        def shrink_to_budget(name: str, floor: int) -> None:
+            while (
+                name in cfg.kwargs
+                and current_tile_product() > target_tile_product
+                and cfg.kwargs[name] > floor
+            ):
+                cfg.kwargs[name] //= 2
+
+        # Preserve the autotuner's original tile-size budget where possible:
+        # raising one block to satisfy a floor should shrink the other block.
+        shrink_to_budget("R0_BLOCK", r_floor)
+        shrink_to_budget("XBLOCK", x_floor)
+
+        check_max_block(cfg.kwargs)
+        check_config(
+            cfg.kwargs,
+            xnumel=size_hints.get("x") if "XBLOCK" in cfg.kwargs else None,
+            ynumel=size_hints.get("y") if "YBLOCK" in cfg.kwargs else None,
+            znumel=size_hints.get("z") if "ZBLOCK" in cfg.kwargs else None,
+        )
+
+    return configs
+
+
+def unique_configs(configs: list[Config]):
+    """Remove duplicate configurations"""
+    seen: OrderedSet[Hashable] = OrderedSet()
+    pruned_configs = []
+
+    for cfg in configs:
+        key = triton_config_to_hashable(cfg)
+        if key not in seen:
+            seen.add(key)
+            pruned_configs.append(cfg)
+    return pruned_configs
+
+
+def cached_autotune(
+    size_hints: list[int] | None,
+    configs: list[Config],
+    triton_meta: TritonMeta,
+    heuristic_type,
+    filename=None,
+    inductor_meta: InductorMeta | None = None,
+    custom_kernel=False,
+    caching_autotuner_cls: type[CachingAutotuner] = CachingAutotuner,
+    debug_autotuner_cls: type[DebugAutotuner] = DebugAutotuner,
+):
+    """
+    A copy of triton.autotune that calls our subclass.  Our subclass
+    has additional debugging, error handling, and on-disk caching.
+    """
+    inductor_meta = {} if inductor_meta is None else inductor_meta
+    if size_hints is not None and heuristic_type in (
+        HeuristicType.REDUCTION,
+        HeuristicType.PERSISTENT_REDUCTION,
+    ):
+        configs = _enforce_reduction_config_block_minimums(
+            configs, size_hints, inductor_meta
+        )
+    configs = unique_configs(configs)
+    if len(configs) != 1 and not filename:
+        raise AssertionError("filename required when multiple configs are provided")
+
+    device_prop = triton_meta.get("device")
+    if not isinstance(device_prop, DeviceProperties):
+        device_prop = None
+    dynamic_scale_rblock_eligible = _could_dynamic_scale_rblock(
+        size_hints=size_hints,
+        heuristic_type=heuristic_type,
+        device_prop=device_prop,
+        inductor_meta=inductor_meta,
+    )
+    configs, autotune_cache, autotune_cache_info = check_autotune_cache(
+        configs,
+        filename,
+        inductor_meta,
+        dynamic_scale_rblock_eligible=dynamic_scale_rblock_eligible,
+    )
+    mutated_arg_names = cast("list[str]", inductor_meta.pop("mutated_arg_names", ()))
+    optimize_mem = inductor_meta.pop("optimize_mem", True)
+
+    if "restore_value" in triton_meta:
+        mutated_arg_names += triton_meta.pop("restore_value")
+
+    reset_to_zero_arg_names: list[str] = []
+    if "reset_to_zero" in triton_meta:
+        reset_to_zero_arg_names.extend(triton_meta.pop("reset_to_zero"))
+
+    def decorator(fn):
+        # Remove XBLOCK from config if it's not a function argument.
+        # This way, coordinate descent tuning will not try to tune it.
+        #
+        # Context: When TritonKernel.no_x_dim is True, we hardcode XBLOCK to 1.
+        import inspect
+
+        if "XBLOCK" not in inspect.signature(fn.fn).parameters:
+            for tconfig in configs:
+                if "XBLOCK" in tconfig.kwargs:
+                    if tconfig.kwargs["XBLOCK"] != 1:
+                        raise AssertionError(
+                            f"Expected XBLOCK == 1 when not in fn params, got {tconfig.kwargs['XBLOCK']}"
+                        )
+                    tconfig.kwargs.pop("XBLOCK")
+
+        if inductor_meta.get("profile_bandwidth"):
+            return debug_autotuner_cls(
+                fn,
+                triton_meta=triton_meta,
+                inductor_meta=inductor_meta,
+                regex_filter=inductor_meta["profile_bandwidth_regex"],
+                with_profiler=inductor_meta[
+                    "profile_bandwidth_with_do_bench_using_profiling"
+                ],
+                configs=configs,
+                save_cache_hook=autotune_cache and autotune_cache.save,
+                mutated_arg_names=mutated_arg_names,
+                reset_to_zero_arg_names=reset_to_zero_arg_names,
+                optimize_mem=optimize_mem,
+                heuristic_type=heuristic_type,
+                size_hints=size_hints,
+                custom_kernel=custom_kernel,
+                filename=filename,
+                with_bandwidth_info=True,
+            )
+        return caching_autotuner_cls(
+            fn,
+            triton_meta=triton_meta,
+            inductor_meta=inductor_meta,
+            configs=configs,
+            save_cache_hook=autotune_cache and autotune_cache.save,
+            mutated_arg_names=mutated_arg_names,
+            reset_to_zero_arg_names=reset_to_zero_arg_names,
+            optimize_mem=optimize_mem,
+            heuristic_type=heuristic_type,
+            size_hints=size_hints,
+            custom_kernel=custom_kernel,
+            filename=filename,
+            autotune_cache_info=autotune_cache_info,
+        )
+
+    return decorator
+
+
+def template(
+    num_stages,
+    num_warps,
+    triton_meta: TritonMeta,
+    num_consumer_groups=0,
+    num_buffers_warp_spec=0,
+    filename=None,
+    inductor_meta: InductorMeta | None = None,
+    **kwargs,
+):
+    """
+    Compile a triton template
+    """
+    # Prepare the base configuration
+    config_args = {
+        "num_stages": num_stages,
+        "num_warps": num_warps,
+    }
+
+    # Conditionally add arguments based on HAS_WARP_SPEC
+    if HAS_WARP_SPEC:
+        config_args.update(
+            {
+                "num_consumer_groups": num_consumer_groups,
+                "num_buffers_warp_spec": num_buffers_warp_spec,
+            }
+        )
+
+    for k in tlx_only_cuda_options():
+        if v := triton_meta.get(k, None):
+            config_args[k] = v
+
+    return cached_autotune(
+        None,
+        [triton.Config({}, **config_args)],
+        triton_meta=triton_meta,
+        inductor_meta=inductor_meta,
+        heuristic_type=HeuristicType.TEMPLATE,
+        filename=filename,
+    )
