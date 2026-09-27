@@ -840,6 +840,136 @@ def wrap_choice_render_with_cutedsl_indexer(choice: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Whether this kernel may be used here
+# ---------------------------------------------------------------------------
+
+
+def _can_use_flex_flash_attention(
+    subgraph: Any, mask_graph: Any, num_score_mod_placeholders: int
+) -> Any:
+    """Whether this kernel can be written for what it was handed, and why not.
+
+    The reason is returned alongside the answer rather than raised, because
+    whether the kernel can be used is asked in order to choose a different one --
+    and a choice cannot be made from an error.
+    """
+
+    if not ensure_flash_available():
+        return False, _flash_attention_unavailable_message()
+
+    if input_buffers_require_grads(subgraph.graph_module, num_score_mod_placeholders):
+        return (
+            False,
+            "Input buffers require gradients (not supported by flash attention)",
+        )
+
+    return True, ""
+
+
+def _use_flex_flash_attention(
+    subgraph: Any,
+    mask_graph: Any,
+    kernel_options: Any,
+    num_score_mod_placeholders: int,
+    backend: Any,
+) -> bool:
+    """Whether to write this kernel rather than the other one.
+
+    Only when it was asked for by name.  A kernel that is faster is not the same
+    as a kernel that may be used instead: this one is new enough that using it
+    where nobody asked would mean answering a question nobody posed.
+
+    Asked for and not usable is an error rather than a fallback, because a
+    caller that named this one and silently got the other has been told
+    something false about how their program was compiled.
+    """
+
+    if backend != "FLASH":
+        return False
+
+    can_use, reason = _can_use_flex_flash_attention(
+        subgraph,
+        mask_graph,
+        num_score_mod_placeholders,
+    )
+
+    if not can_use:
+        raise RuntimeError(
+            f"BACKEND='FLASH' but flash attention cannot be used: {reason}"
+        )
+
+    return True
+
+
+def _can_use_flex_flash_attention_backward(
+    fw_subgraph: Any,
+    mask_graph: Any,
+    joint_outputs: Any = None,
+    score_mod_other_buffers: Any = None,
+    num_score_mod_placeholders: int = 5,
+) -> Any:
+    """Whether the backward pass can be written for what it was handed.
+
+    The backward pass reads the forward one's values, so it is refused for the
+    same reasons the forward one is -- and refused for two more, because a
+    gradient that was captured or that changed something is a gradient whose
+    origin this pass cannot yet account for.
+    """
+
+    if not ensure_flash_available():
+        return False, _flash_attention_unavailable_message()
+
+    if input_buffers_require_grads(
+        fw_subgraph.graph_module, num_score_mod_placeholders
+    ):
+        return (
+            False,
+            "Input buffers require gradients (not supported by flash attention backward)",
+        )
+
+    if joint_outputs is not None:
+        if joint_outputs.captured_grads_compute:
+            return (
+                False,
+                "NYI: Flex Flash Attention bwd doesn't support captured grads yet.",
+            )
+        if joint_outputs.mutated_grads:
+            return (
+                False,
+                "NYI: Flex Flash Attention bwd doesn't support mutated grads yet.",
+            )
+
+    return True, ""
+
+
+def _use_flex_flash_attention_backward(
+    fw_subgraph: Any,
+    mask_graph: Any,
+    backend: Any,
+    joint_outputs: Any = None,
+    score_mod_other_buffers: Any = None,
+) -> bool:
+    """Whether to write the backward pass of this kernel rather than the other one."""
+
+    if backend != "FLASH":
+        return False
+
+    can_use, reason = _can_use_flex_flash_attention_backward(
+        fw_subgraph,
+        mask_graph,
+        joint_outputs,
+        score_mod_other_buffers,
+    )
+
+    if not can_use:
+        raise RuntimeError(
+            f"BACKEND='FLASH' but flash attention cannot be used: {reason}"
+        )
+
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Reading a body written as a graph
 # ---------------------------------------------------------------------------
 
