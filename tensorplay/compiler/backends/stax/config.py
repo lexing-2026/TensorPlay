@@ -1006,10 +1006,6 @@ class _TritonConfig:
     #: kernel, so a kernel can be read back as the operations it stands for.
     debug_fusion = os.environ.get("TP_DEBUG_FUSION") == "1"
 
-    draw_orig_fx_graph = (
-        os.environ.get("TP_ORIG_FX_SVG", "0") == "1"
-        or os.environ.get("TP_ORIG_FX_GRAPH", "0") == "1"
-    )
 
     #: Launch a captured graph rather than calling into it, so the launches
     #: themselves are what a profiler sees.
@@ -1719,3 +1715,26 @@ def decide_compile_threads() -> int:
         log.info("compile_threads set to %d", compile_threads)
 
     return compile_threads
+
+#: Whether the region is drawn as it was written, annotated with what each of
+#: its nodes became, which is what shows where a value stopped being what the
+#: program said it was.
+draw_orig_fx_graph = (
+    os.environ.get("TP_ORIG_FX_SVG", "0") == "1"
+    or os.environ.get("TP_ORIG_FX_GRAPH", "0") == "1"
+)
+
+#: Whether the choice of a candidate is timed, which is what tells a slow
+#: choice from a fast one when nothing is measured directly.
+estimate_op_runtime = "default"
+#: Which parts of a graph a program has said must not be cut apart.
+custom_should_partition_ops: list[str] = []
+#: Which parts of a graph are computed together when the choice is made.
+multi_kernel_hints: list[int] = []
+#: How much of a kernel's memory access has to be small before an access is
+#: worth being careful about.
+small_memory_access_threshold: int = 16777216
+#: Whether a candidate that would make the dependency graph cyclic is refused,
+#: which is what tells a fusion that cannot be scheduled from one that merely
+#: schedules badly.
+check_stack_no_cycles_TESTING_ONLY: bool = False
