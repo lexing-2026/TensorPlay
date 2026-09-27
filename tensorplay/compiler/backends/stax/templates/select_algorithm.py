@@ -42,7 +42,7 @@ from ..ir import (
     compute_required_storage_length,
 )
 from ..loops import V
-from .ir import ChoiceCaller
+from ..ir import ChoiceCaller
 from .mm_common import use_aten_gemm_kernels
 from ..loops import contiguous_strides, dtype_name
 from ..heuristics.template.params import DictKernelTemplateParams, KernelTemplateParams

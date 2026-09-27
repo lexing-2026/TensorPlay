@@ -80,43 +80,13 @@ class _AutotuneChoice(Protocol):
         """What identifies this choice, for the log and for the cache."""
 
 
-def _choice_caller_base():
-    """The class every built choice answers through.
+#: The class every built choice answers through.  It lives with the values it
+#: describes rather than with the templates that build them, so it is imported
+#: by name: what a choice is does not depend on which template made it, and a
+#: class reachable by two routes would be two classes to one kind.
+from ..ir import ChoiceCaller
 
-    Read from the file rather than imported by name, because the file lives in a
-    package whose own import reaches this one: importing it the ordinary way runs
-    that package's import first, which asks for this module, which is not yet
-    finished.  Loading the file on its own gets the class without running the
-    package, and the class is here only for what it is rather than for what that
-    package is for.
-    """
-
-    import importlib.util
-    import os
-    import sys
-
-    here = os.path.dirname(__file__)
-    path = os.path.join(here, os.pardir, "templates", "ir.py")
-    # Under the name the module really has, so that a module loaded here and a
-    # module imported ordinarily are one module: two would be two copies of one
-    # class, and a class that answers whether something is an instance of it
-    # would answer no for the copy it was not asked about.
-    name = "tensorplay.compiler.backends.stax.templates.ir"
-    existing = sys.modules.get(name)
-    if existing is not None:
-        return existing.ChoiceCaller
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        del sys.modules[name]
-        raise
-    return module.ChoiceCaller
-
-
-class SubgraphChoiceCaller(_choice_caller_base()):
+class SubgraphChoiceCaller(ChoiceCaller):
     """One candidate that is a whole program, measured as one thing.
 
     A candidate here is not a kernel but a graph: anything a program can be

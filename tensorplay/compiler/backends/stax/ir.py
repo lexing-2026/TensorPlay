@@ -8489,62 +8489,73 @@ PrimitiveInfoType = int | float | bool | str | list[int | str | float | bool]
 
 
 class ChoiceCaller:
-    """One of the ways a piece of work could be done, before choosing between them.
+    """One way of doing a thing, built and ready to be measured or used.
 
-    When a computation could be carried out in more than one way -- a different
-    block shape, a different prepared kernel -- each way is one of these.  They
-    are measured against each other, and the one that was chosen is then asked
-    what it actually produces, since that is the piece of the graph the rest of
-    the work is written against.
+    A choice is measured first and turned into a value only if it is the one
+    that was chosen, so the two questions are answered by the same object and
+    in that order: what it costs to run, and -- only for the winner -- what
+    running it produced.  A caller of this class holds a choice that has
+    already been built; everything above it was a description of a possibility,
+    and this is the possibility.
 
-    A way that turns out not to work is marked as failed rather than removed, so
-    that the same thing is not tried again.
+    What a particular kind of choice is called, how it is run, what identifies
+    it and what it produces are all left to the kind: what is held here is what
+    is the same whichever kind it is.
     """
 
     def __init__(
         self,
         name: str,
-        input_nodes: list,
-        layout: "Layout",
-        description: str,
+        input_nodes=(),
+        layout: "Layout | None" = None,
+        description: str = "",
     ) -> None:
-        super().__init__()
         self.name = name
         self.layout = layout
         self.input_nodes = input_nodes
-        # An account of what this way is, for the log of what was measured.
+        #: An additional description, for telling two choices apart when their
+        #: names alone do not say which is which.
         self.description = description
+        #: Set when a measurement showed this choice does not work here.
         self.failed: bool = False
+        #: When true, measure by capturing the launch and replaying it, which
+        #: leaves out the cost of launching and is only right where what is
+        #: being compared is the kernel rather than the launch.
         self._benchmark_with_cudagraphs: bool = False
-        # What was learned while measuring, to be read afterwards.
-        self.annotations: dict = {}
-        # What a way that is a piece of a graph rather than a prepared kernel
-        # carries, so that it can be compiled and called.
+        #: Where information travels from a choice being generated to the end
+        #: of it being measured, for the two to be read by code that is
+        #: neither of them.
+        self.annotations: dict[str, object] = {}
+        #: What a subgraph-based choice stands for, filled in by the kinds that
+        #: are one.
         self.gm: Any = None
-        self.decomposition: Any = None
-        self.decomposition_kwargs: dict = {}
-        self.config_patches: dict = {}
+        self.decomposition: Callable[..., Any] | None = None
+        self.decomposition_kwargs: dict[str, object] = {}
+        #: Geometry substitutions a measurement decided on, for the record.
+        self.config_patches: dict[str, Any] = {}
+        #: What a measurement hands this choice to run it, where the kind
+        #: supplies one.
+        self._callable: Callable[..., Any] | None = None
 
-    def benchmark(self, *args, out):
-        """How long this way takes, measured the same way as every other."""
+    def benchmark(self, *args: Any, out: Any) -> float:
+        """How long one run of this choice takes."""
 
-        from .runtime.benchmarking import benchmarker
+        from .runtime.stax_autotune import bench_launch
 
         algo = self.to_callable()
-        return benchmarker.benchmark(algo, args, {"out": out}, device=None)
+        return bench_launch(lambda these: algo(*these), list(args))
 
     def call_name(self) -> str:
         raise NotImplementedError
 
-    def to_callable(self):
+    def to_callable(self) -> Callable[..., Any]:
         raise NotImplementedError
 
     def kernel_hash_key(self) -> str:
-        """What identifies the work this way does, for reuse across runs.
+        """What identifies the kernel itself, for a binary cache.
 
-        Two ways that do the same work with the same parameters are the same
-        measurement, so where a way takes no parameters at run time this is the
-        same as identifying the way itself.
+        By default a choice has no runtime parameters of its own, so what
+        identifies the choice identifies the kernel.
         """
 
         return self.hash_key()
@@ -8552,11 +8563,11 @@ class ChoiceCaller:
     def hash_key(self) -> str:
         raise NotImplementedError
 
-    def output_node(self) -> "TensorBox":
+    def output_node(self) -> Any:
         raise NotImplementedError
 
     def info_dict(self) -> dict:
-        """What is worth recording about this way alongside the measurement."""
+        """What is worth writing down about this choice."""
 
         return {}
 
@@ -8564,7 +8575,11 @@ class ChoiceCaller:
         return "unsupported_choice"
 
     def mark_failed(self) -> None:
-        """Note that this way does not work, so it is not chosen again."""
+        """Record that this choice does not work here, so it is not offered.
+
+        Useful where measuring is separate from choosing: a choice found not
+        to work is not offered again.
+        """
 
         self.failed = True
 
