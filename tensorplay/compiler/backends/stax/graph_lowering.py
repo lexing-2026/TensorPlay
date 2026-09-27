@@ -32,6 +32,7 @@ from .utils import (
     gather_origins,
     get_sympy_Expr_dtype,
     has_free_symbols,
+    normalize_name,
     SUPPORTED_MKLDNN_DEVICES,
     ValueWithLineMap,
 )
@@ -45,6 +46,7 @@ from .ir import (
     BaseView,
     ComputedBuffer,
     StorageBox,
+    Subgraph,
     Constant,
     ConstantBuffer,
     EffectfulKernel,
@@ -496,7 +498,18 @@ class GraphLowering(Interpreter):
         # is how that value was reached -- and a view that has been flattened
         # into the value is a view of the wrong bytes.
         self._cutedsl_capture_nodes: dict = {}
+        #: The graphs read off the program, by the name they were read under.
+        #: Kept so that the same graph read twice is lowered once -- two copies
+        #: would be two regions computing the same thing, and nothing else in
+        #: the region would know they were the same.
+        self.seen_subgraphs: dict = {}
         self.graph_module = graph_module
+        # The module a constant is read out of.  A node names a constant as an
+        # attribute path, and that path means nothing without the module it is
+        # relative to -- which is this region's own while this region is being
+        # read, and the subgraph's while a subgraph's nodes are being read into
+        # this one.
+        self.module = graph_module
         # What strides each output a caller reads is recorded as having had, and
         # which nodes must not have their inputs padded because of it.
         self.user_visible_output_strides = get_user_visible_output_strides(
@@ -519,6 +532,14 @@ class GraphLowering(Interpreter):
         self.operations: list[Any] = []
         self.graph_inputs: dict = {}
         self.constants: dict[str, Any] = {}
+        #: What each constant is, described without reading it -- so that two
+        #: compilations can be compared without holding the values, and so that
+        #: a constant can be recognised as one already compiled.
+        self.constant_reprs: dict[str, str] = {}
+        #: The name the program gave each constant, by the name it was given
+        #: here.  Kept so that a report about a constant can name it the way
+        #: the program named it rather than the way this compiler spells it.
+        self.allocated_constant_name: dict[str, str] = {}
         # Names of the buffers whose contents are overwritten after the fact,
         # and who reads each.
         self.mutated_buffers: set[str] = set()
@@ -657,6 +678,43 @@ class GraphLowering(Interpreter):
             if buf is not None and getattr(buf, "name", None) == name:
                 return buf
         return None
+
+    def try_get_buffer(self, buffer_name: str):
+        """What a name refers to, or nothing if it refers to nothing.
+
+        Three kinds of thing can be named here and all three are asked: a
+        buffer this region made, a value it was given, and a constant lifted
+        out of the program.  A constant is described on the spot rather than
+        looked up, because the value it stands for is what describes it and
+        asking for that value is cheaper than keeping a second description.
+        """
+
+        if buffer_name in self.name_to_buffer:
+            return self.name_to_buffer[buffer_name]
+        if buffer_name in self.graph_inputs:
+            return self.graph_inputs[buffer_name]
+        if buffer_name in self.constants:
+            data = self.constants[buffer_name]
+            return ConstantBuffer(
+                name=buffer_name,
+                layout=FixedLayout(
+                    data.device, data.dtype, *self.static_sizes_strides(data)
+                ),
+            )
+        return None
+
+    def get_buffer(self, buffer_name: str):
+        """What a name refers to, and a refusal when it refers to nothing.
+
+        A caller holding a name is about to read through it, so a name that
+        names nothing is reported here rather than answered with something
+        that would fail further along.
+        """
+
+        buf = self.try_get_buffer(buffer_name)
+        if buf is not None:
+            return buf
+        raise RuntimeError(f"Failed to find buffer matching name {buffer_name}")
 
     def is_unspec_arg(self, name: str) -> bool:
         """Whether this input stands in for a value rather than holding one.
@@ -1051,19 +1109,6 @@ class GraphLowering(Interpreter):
                 pass
             self.dep_size_hint_cache[(dep, count_bytes)] = res
         return self.dep_size_hint_cache[(dep, count_bytes)]
-
-    def get_buffer(self, name):
-        return self.name_to_buffer[name]
-
-    def try_get_buffer(self, name):
-        """The buffer a name refers to, or nothing if there is no such name.
-
-        A caller asking whether something is there must not have to catch an
-        error to find out, since "not there" is an answer rather than a
-        mistake.
-        """
-
-        return self.name_to_buffer.get(name, None)
 
     def get_allocation_size(self, node):
         """The extents a buffer is allocated with.
@@ -1901,21 +1946,109 @@ class GraphLowering(Interpreter):
             raise RuntimeError("No output node found in graph")
         return output
 
+    @staticmethod
+    def can_inline_constant(t) -> bool:
+        """Whether a constant is small enough to be written into the body.
+
+        A handful of numbers, or one short row of them, is cheaper written
+        where it is used than carried as a value of its own -- there is no
+        buffer to allocate, and no name to keep.  Anything larger is worth a
+        buffer, because then it is computed once rather than read out of the
+        program text at every use.
+        """
+
+        return len(t.shape) == 1 and t.shape[0] <= 8
+
+    def add_tensor_constant(self, data, name: str | None = None):
+        """A value held by the program rather than computed, as a buffer.
+
+        It is given a buffer like anything else so that reading it costs the
+        same as reading anything else.  The value is recorded under the name
+        the buffer got -- which :meth:`allocate_non_dup_const_name` has already
+        done, since it is the one that decides the name and the wrapper needs
+        the value under exactly that name to fill the buffer in.
+        """
+
+        new_name = self.allocate_non_dup_const_name(name, data)
+        return TensorBox.create(
+            ConstantBuffer(
+                name=new_name,
+                layout=FixedLayout(
+                    data.device,
+                    data.dtype,
+                    *self.static_sizes_strides(data),
+                ),
+            )
+        )
+
+    def get_attr(self, target: str, args, kwargs):
+        """What a name the program read off itself stands for.
+
+        A weight is the common case: a value that is already there before
+        anything runs, so nothing computes it and it is simply carried.  A
+        value small enough to write into the body is written there instead,
+        since a buffer it can fit in would cost more to allocate than the value
+        occupies.  A graph read off the program is a region in its own right
+        and is lowered as one.
+        """
+
+        value = getattr_recursive(self.module, target)
+
+        if hasattr(value, "graph") and hasattr(value, "named_modules"):
+            if target in self.seen_subgraphs:
+                return self.seen_subgraphs[target]
+            out = Subgraph(name=target, graph_module=value)
+            self.seen_subgraphs[target] = out
+            return out
+
+        if not isinstance(value, tp.Tensor):
+            raise AssertionError(f"Expected a tensor, got {type(value)}")
+
+        if self.can_inline_constant(value):
+            from .op_lowerings import tensor
+
+            return tensor(
+                value.tolist(),
+                dtype=value.dtype,
+                device=value.device,
+            )
+
+        return self.add_tensor_constant(value, target)
+
     def allocate_non_dup_const_name(self, name, data) -> str:
         """A name for a constant that no other constant is already using.
 
-        Two constants with the same name would be one constant as far as
-        anything reading by name can tell, so a name already taken gets
-        another one.
+        The name a program gave is not usable as it stands: it may hold a dot,
+        and it says nothing about which region of which program it came from.
+        So it is given this region's prefix, anything a name cannot hold becomes
+        an underscore, and a name already taken gets a number -- because two
+        constants under one name would be one constant as far as anything
+        reading by name can tell.
+
+        The value itself is recorded under the name decided on here, along with
+        a description of it that does not depend on reading the value, and the
+        name the program gave, so that a later step can tell which is which.
         """
 
         if name is None:
-            name = f"constant_{len(self.constants)}"
-        base_name = name
+            name = f"constant{len(self.constants)}"
+        orig_name = name
+        if name[0].isdigit():
+            # A name may not begin with a digit where it is written as a name.
+            name = f"constant_{name}"
+        name = normalize_name(self.qualify_name(name))
+        prefix = name
         counter = 0
         while name in self.constants:
+            name = f"{prefix}_{counter}"
             counter += 1
-            name = f"{base_name}_{counter}"
+        self.constants[name] = data
+        self.constant_reprs[name] = (
+            f"{data.device!r} {data.dtype!r} "
+            f"{tuple(data.size())!r} {tuple(data.stride())!r} "
+            f"{hash(data):x}"
+        )
+        self.allocated_constant_name[name] = orig_name
         return name
 
     @contextlib.contextmanager

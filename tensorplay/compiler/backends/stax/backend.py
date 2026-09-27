@@ -252,8 +252,30 @@ def _lower_stax_region(
         if strict:
             raise
         return graph_module.recompile()
-    compiled = compiled_module.call
-    _publish_codegen(compiled_module, "triton", backward=training)
+    # The generated entry point takes the region's arguments as one sequence,
+    # because that is how the written-out code receives them, and it hands back
+    # a sequence of results for the same reason.  Everything that calls a
+    # compiled region passes ordinary arguments and expects an ordinary result,
+    # so the two conventions are met here rather than making every caller know
+    # which one this one happens to use -- and a region that produced one result
+    # produces that result, rather than a sequence holding it.
+    module_call = compiled_module.call
+    single_output = bool(getattr(graph, "single_output", False))
+
+    def compiled(*args):
+        # A list rather than a tuple, because the written-out code empties what
+        # it is given once it has taken it -- which is how a caller that holds
+        # the same values does not keep them alive for the call.
+        result = module_call(list(args))
+        if single_output and isinstance(result, tuple) and len(result) == 1:
+            return result[0]
+        return result
+
+    compiled._tensorplay_module_call = module_call  # type: ignore[attr-defined]
+    # The report is on what the caller actually receives, which is this and not
+    # the module behind it -- a caller asking which route produced its callable
+    # would otherwise be told nothing, since the module is not what it holds.
+    _publish_codegen(compiled, "triton", backward=training)
     return compiled
 
 

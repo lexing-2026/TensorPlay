@@ -1648,7 +1648,12 @@ class PythonWrapperCodegen(CodeGen):
                 from tensorplay.compiler.backends.stax.runtime.hooks import run_intermediate_hooks
                 from tensorplay.compiler.backends.stax.runtime.pooled_allocator import alloc_from_pool
                 from tensorplay.compiler.backends.stax.utils import _align as align
+                from tensorplay.compiler.backends.stax.runtime.runtime_utils import (
+                    assert_size_stride,
+                )
                 from tensorplay import device, empty_strided
+                from {async_compile.__name__} import AsyncCompile
+                async_compile = AsyncCompile()
                 {debug_utils_import}
             """,
             strip=True,

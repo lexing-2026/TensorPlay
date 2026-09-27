@@ -6211,7 +6211,14 @@ class ExternKernel(InputsKernel):
             self.cpp_kernel_name = name.replace("::", "_").replace(".", "_")
 
     def set_python_kernel_name(self, python_kernel_name: str | None) -> None:
-        """Settle the name the generated Python calls this under."""
+        """Settle the name the generated Python calls this under.
+
+        The name written is one the generated program can actually resolve: its
+        header imports the framework under a short name, so a name spelled
+        with the framework's own path would name something that is not there.
+        An operation reached through the operation table is written the way
+        that table is reached.
+        """
 
         self.python_kernel_name = python_kernel_name
         if python_kernel_name is not None:
@@ -6221,10 +6228,15 @@ class ExternKernel(InputsKernel):
         if kernel is None:
             return
         module = getattr(kernel, "__module__", None)
+        name = getattr(kernel, "__name__", str(kernel))
         if module is None:
-            self.python_kernel_name = getattr(kernel, "__name__", str(kernel))
+            self.python_kernel_name = name
+        elif module.startswith("tensorplay."):
+            self.python_kernel_name = f"tp.{module[len('tensorplay.'):]}.{name}"
+        elif module.startswith("tensorplay"):
+            self.python_kernel_name = f"{module}.{name}"
         else:
-            self.python_kernel_name = f"{module}.{getattr(kernel, '__name__', kernel)}"
+            self.python_kernel_name = f"{module}.{name}"
 
     def try_get_kernel_name(self) -> str | None:
         """The name this is called by in the code being generated, if it is known.

@@ -25,6 +25,8 @@ from concurrent.futures import (
 from concurrent.futures.process import BrokenProcessPool
 from typing import Any
 
+from .codecache import CodeCacheFuture
+
 import tensorplay as tp
 
 from . import config
@@ -296,6 +298,35 @@ class AsyncCompile:
         if isinstance(pool, SubprocPool):
             pool.wakeup()
 
+    def _wait_futures(self, scope: dict) -> None:
+        """Replace each thing that was only started with the thing itself.
+
+        A kernel handed to a worker comes back as something that will produce
+        the kernel once it is asked; a caller who wants to call the kernel
+        cannot wait on that at the call site, so it is waited for here and the
+        result put back under the same name.  A name that is not a started
+        kernel is left alone, since it is already what it is.
+        """
+
+        kernels = {
+            key: value
+            for key, value in scope.items()
+            if isinstance(value, (Future, CodeCacheFuture))
+        }
+        for key, result in kernels.items():
+            scope[key] = result.result()
+
+    def wait(self, scope: dict) -> None:
+        """Wait for every kernel in this scope that was only started.
+
+        Nothing to wait for when only one thread is compiling, since then each
+        kernel was compiled as it was reached and there is nothing outstanding.
+        """
+
+        if config.compile_threads <= 1:
+            return
+        self._wait_futures(scope)
+
 
 def maybe_warm_pool() -> None:
     if (
@@ -313,4 +344,6 @@ def maybe_warm_pool() -> None:
     # TODO: This starts the SubprocPool's internal process pool as early as possible at
     # the expense of creating a bunch of worker processes that might not be needed. We
     # could start them lazily if we're willing to lose a small amount of compile time.
+    from .utils import has_triton_package
+
     AsyncCompile.wakeup()
