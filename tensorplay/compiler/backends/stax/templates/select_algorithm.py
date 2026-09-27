@@ -85,6 +85,10 @@ VERIFY = os.environ.get("TP_AUTOTUNE_VERIFY", "1") == "1"
 #: Where this module's messages go.  A measurement is worth a line and a
 #: measurement that was thrown away is worth none, so the numbers are here
 #: rather than printed.
+# A verbosity switch for the tuning itself, kept beside the tuning rather than
+# in the settings, because it is read only here and only while tuning.
+DEBUG = False
+
 log = logging.getLogger(__name__)
 
 
@@ -4381,6 +4385,108 @@ class AlgorithmSelectorCache:
 
         self.add_preprocessing_fn(filter_choices_by_name_regex)
         self.add_preprocessing_fn(filter_choices_by_desc_regex)
+
+    @classmethod
+    def benchmark_in_sub_process(
+        cls,
+        choices,
+        input_nodes,
+        layout,
+        input_gen_fns,
+        hint_override: int | None = None,
+    ):
+        """Measure the candidates that could take this process with them.
+
+        A candidate that reads what it should not does not raise; it corrupts
+        memory, and the process stops.  So a candidate whose failure would be
+        silent is measured in a process of its own, and comes back as a time
+        or as no time at all -- and a candidate that is already known to be
+        safe is measured here, because paying for a process to measure
+        something that cannot fail is not worth it.
+
+        The ones that cannot fail here are measured first, so that a process
+        lost to a bad candidate does not also cost the times of the good ones.
+        """
+
+        from ..autotune_process import AsyncAutotuner
+        from ..codegen.cutedsl.cutedsl_template import CuteDSLTemplateCaller
+
+        # A candidate that calls straight into the library cannot corrupt
+        # anything, so measuring it here costs nothing to be safe about.
+        extern = [c for c in choices if cls._is_extern(c)]
+        non_cutlass = [
+            c
+            for c in choices
+            if not cls._is_extern(c) and not isinstance(c, CuteDSLTemplateCaller)
+        ]
+        cutlass = [c for c in choices if isinstance(c, CuteDSLTemplateCaller)]
+
+        timings = cls.benchmark_in_current_process(
+            extern, input_nodes, layout, input_gen_fns, hint_override=hint_override
+        )
+        # Order the ones measured elsewhere so that valid timings are collected
+        # before any candidate that can crash its process has a chance to.
+        remote = non_cutlass + cutlass
+        if remote:
+            inputs_key = str(
+                [getattr(n, "get_size", lambda: None)() for n in input_nodes]
+            )
+            AsyncAutotuner.start(remote, inputs_key)
+            timings.update(AsyncAutotuner.get_results(remote, inputs_key))
+        return timings
+
+    @classmethod
+    def make_benchmark_fn(
+        cls,
+        choices,
+        input_nodes,
+        layout,
+        input_gen_fns,
+        hint_override: int | None = None,
+        is_collective=False,
+    ):
+        """Say how this batch of candidates should be measured, without measuring it.
+
+        Whether a candidate is measured here or elsewhere is decided before any
+        of them runs, because the answer is a property of what the candidates
+        are rather than of what happened when one of them ran.
+        """
+
+        from ..codegen.cutedsl.cutedsl_template import CuteDSLTemplateCaller
+
+        if DEBUG:
+            print(f"{len(choices)} tuning requests:")
+
+        has_cutlass = any(isinstance(c, CuteDSLTemplateCaller) for c in choices)
+
+        # Collective ops must use current process
+        if is_collective:
+            return functools.partial(
+                cls.benchmark_in_current_process,
+                input_nodes=input_nodes,
+                layout=layout,
+                input_gen_fns=input_gen_fns,
+                hint_override=hint_override,
+                is_collective=is_collective,
+            )
+        # A candidate that can leave the device unusable is always measured
+        # elsewhere, whether or not measuring elsewhere was asked for.
+        elif config.autotune_in_subproc or has_cutlass:
+            return functools.partial(
+                cls.benchmark_in_sub_process,
+                input_nodes=input_nodes,
+                layout=layout,
+                input_gen_fns=input_gen_fns,
+                hint_override=hint_override,
+            )
+        else:
+            return functools.partial(
+                cls.benchmark_in_current_process,
+                input_nodes=input_nodes,
+                layout=layout,
+                input_gen_fns=input_gen_fns,
+                hint_override=hint_override,
+            )
 
     def autotune(
         self,
