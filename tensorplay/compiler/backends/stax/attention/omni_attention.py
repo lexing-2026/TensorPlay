@@ -15,7 +15,11 @@ and a tuple of coordinates to the one place that asks.
 
 from __future__ import annotations
 
+import dataclasses
+from typing import Any
+
 import sympy
+from tensorplay.graph.experimental.sympy_functions import FloorDiv
 
 
 class HierarchicalIndex(sympy.Function):
@@ -35,3 +39,155 @@ class HierarchicalIndex(sympy.Function):
     @classmethod
     def eval(cls, *args):
         return None
+
+
+# ---------------------------------------------------------------------------
+# A mask written as a range of lanes
+# ---------------------------------------------------------------------------
+
+
+def _simplify_expr(expr: Any) -> Any:
+    """The expression as something a pattern can be read off.
+
+    Simplified first because the pattern below reads a shape rather than a
+    spelling: the same range written two ways is one range, and recognising it
+    as one is the whole of what this is for.
+    """
+
+    if isinstance(expr, sympy.Expr):
+        return sympy.sympify(expr).simplify()
+    return expr
+
+
+def render_sympy_args(
+    args: Any, symbol_codes: Any = None
+) -> Any:
+    """Every argument as code, or nothing if any of them cannot be.
+
+    All or nothing rather than the ones that could be: an operation with one
+    argument missing is not that operation with a hole in it, and a half-written
+    one would be read as a smaller number rather than as nothing.
+    """
+
+    rendered = []
+    for arg in args:
+        code = sympy_to_cute_index(arg, symbol_codes)
+        if code is None:
+            return None
+        rendered.append(code)
+    return rendered
+
+
+def sympy_to_cute_index(expr: Any, symbol_codes: Any = None) -> Any:
+    """A whole-number expression as the code that computes it.
+
+    Only the forms these masks are made of are answered, and anything else
+    answers with nothing rather than with a guess: a mask written as a shape
+    that was rendered wrongly would read memory that belongs to a different
+    lane, which is a wrong answer with no sign that it is one.
+    """
+
+    expr = _simplify_expr(expr)
+    if isinstance(expr, sympy.Integer):
+        return f"cutlass.Int32({int(expr)})"
+    if isinstance(expr, sympy.Symbol):
+        if symbol_codes is not None and expr in symbol_codes:
+            return symbol_codes[expr]
+        # The two positions a mask is written against are read as the first
+        # element of their own index, because that is how they arrive.
+        if expr.name == "q_idx":
+            return "q_idx[0]"
+        if expr.name == "kv_idx":
+            return "kv_idx[0]"
+        return None
+    if isinstance(expr, sympy.Add) or isinstance(expr, sympy.Mul):
+        args = render_sympy_args(expr.args, symbol_codes)
+        if args is None:
+            return None
+        separator = " + " if isinstance(expr, sympy.Add) else " * "
+        return "(" + separator.join(args) + ")"
+    if isinstance(expr, (sympy.Min, sympy.Max)):
+        args = render_sympy_args(expr.args, symbol_codes)
+        if args is None:
+            return None
+        op = "min" if isinstance(expr, sympy.Min) else "max"
+        return f"{op}(" + ", ".join(args) + ")"
+    if isinstance(expr, FloorDiv):
+        args = render_sympy_args(expr.args, symbol_codes)
+        if args is None:
+            return None
+        return f"({args[0]} // {args[1]})"
+    return None
+
+
+@dataclasses.dataclass(frozen=True)
+class PackedMaskInterval:
+    """The lanes a mask keeps: from one up to but not including another.
+
+    A mask that says which lanes of a group are kept can be evaluated one lane
+    at a time, or -- when the answer is a range -- as one number describing the
+    range.  The second is a whole group of answers in one value, and is what
+    makes a mask over a group of lanes cost the same as a mask over one.
+
+    A mask over a window of lanes starting at the window's own position is the
+    common case: "the query's position is at or past this one's" keeps every
+    lane from the start of the window up to the difference between them.
+    """
+
+    lower_lane: Any
+    upper_lane_exclusive: Any
+    #: The code for symbols standing in for values that are the same across a
+    #: group of lanes.  Kept apart from the range because a range says which
+    #: lanes and this says how to name what they are read against, and the two
+    #: are not the same question.
+    symbol_codes: Any = dataclasses.field(default_factory=dict, compare=False, repr=False)
+
+    @classmethod
+    def full(cls) -> "PackedMaskInterval":
+        """Every lane kept, which is the mask that keeps everything."""
+
+        return cls(sympy.Integer(0), sympy.Integer(32))
+
+    def is_full(self) -> bool:
+        return self.lower_lane == 0 and self.upper_lane_exclusive == 32
+
+    def with_symbol_codes(self, symbol_codes: Any) -> "PackedMaskInterval":
+        return dataclasses.replace(self, symbol_codes=dict(symbol_codes))
+
+    def render_lower(self) -> str:
+        return self._render(self.lower_lane)
+
+    def render_upper(self) -> str:
+        return self._render(self.upper_lane_exclusive)
+
+    def keep_mask_expr(self) -> str:
+        """The group of lanes kept, as one number rather than as a comparison.
+
+        A run of lanes is a run of bits, and a run of bits is two shifted
+        bounds: everything above the lower bound, and everything below the
+        upper one, with the two overlapping.  Both bounds are clamped into the
+        group first, because a run that starts before the group or ends after
+        it is the same run as one that starts at its edge or ends at its edge --
+        and the group is what there is.
+        """
+
+        lower = self.render_lower()
+        upper = self.render_upper()
+        return (
+            "(utils.shr_u32(cutlass.Uint32(0xFFFFFFFF), "
+            "cutlass.Uint32(min(max(cutlass.Int32(32) - "
+            f"{upper}, cutlass.Int32(0)), cutlass.Int32(32)))) & "
+            "utils.shl_u32(cutlass.Uint32(0xFFFFFFFF), "
+            "cutlass.Uint32(min(max("
+            f"{lower}, cutlass.Int32(0)), cutlass.Int32(32)))))"
+        )
+
+    def _render(self, expr: Any) -> str:
+        rendered = sympy_to_cute_index(expr, self.symbol_codes)
+        if rendered is None:
+            raise AssertionError(f"failed to render expr to cute index: {expr}")
+        return rendered
+
+
+IntervalSet = tuple
+MaybeIntervalSet = Any
