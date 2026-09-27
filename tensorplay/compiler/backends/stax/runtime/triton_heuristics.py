@@ -1100,101 +1100,6 @@ class CachingAutotuner(KernelInterface):
             isinstance(x, StaticTritonCompileResult) for x in self.compile_results
         )
 
-    def _build_fast_launcher(self, launcher: Any) -> Any | None:
-        """A launcher that skips the work every launch would otherwise repeat.
-
-        A launcher is a generated function that reads the kernel's arguments,
-        works out what to hand the driver, and hands it over.  In the steady
-        state all of that is the same work on every launch, for one kernel and
-        one set of arguments, so it can be done once and the result called
-        directly.
-
-        This is only a saving when the kernel is a compiled binary called
-        through a single function pointer, and where the arguments are not
-        variable in number.  A binary whose handles are kept per device is not
-        one function pointer, a kernel that expands a variable-length descriptor
-        does the expansion in the launcher, and a device that stores its kernels
-        differently is not reachable this way at all.  Where any of that holds
-        the ordinary launcher is correct and this declines to make anything.
-        """
-
-        import types
-
-        if not self.inductor_meta.get("use_fast_triton_launcher", False):
-            return None
-        # The arguments are expanded by the ordinary launcher, so a launcher
-        # that skips it would hand the driver an argument it never built.
-        if self.inductor_meta.get("host_tma_descriptor_args"):
-            return None
-        if self.device_props.type not in ("cuda", "hip"):
-            return None
-        try:
-            from tensorplay._C import _FastCudaLauncher
-        except ImportError:
-            return None
-
-        try:
-            if not getattr(launcher, "_is_static", False):
-                return None
-            runner = launcher.__globals__.get("runner")
-            if not callable(runner):
-                return None
-            kernel = runner.__self__
-            # Handles kept per device means there is no single function pointer
-            # to bind, so the per-device launcher is the one to use.
-            if getattr(kernel, "device_agnostic", False):
-                return None
-            if getattr(kernel, "global_scratch_size", 0):
-                return None
-            cu_function = kernel.function
-            num_warps = kernel.num_warps
-            shared = kernel.shared
-            arg_tys = kernel.arg_tys
-            if cu_function is None or num_warps is None:
-                return None
-
-            new_launcher = _FastCudaLauncher(
-                cu_function,
-                arg_tys,
-                num_warps,
-                shared,
-                self.fn,
-            )
-            scope = dict(launcher.__globals__)
-            scope["runner"] = new_launcher
-            new_launcher = types.FunctionType(
-                launcher.__code__,
-                scope,
-                launcher.__name__,
-                launcher.__defaults__,
-                launcher.__closure__,
-            )
-            # Everything the ordinary launcher carried, and the one thing it does
-            # not carry: the kernel itself.  The fast launcher binds a function
-            # pointer and never reads it again, so without something holding the
-            # kernel, the kernel can be closed while this is still cached and
-            # callable, and the pointer it holds becomes a pointer to nothing.
-            for attr in (
-                "config",
-                "n_regs",
-                "n_spills",
-                "shared",
-                "cache_hash",
-                "store_cubin",
-                "_is_static",
-                "_expected_positional_count",
-            ):
-                val = getattr(launcher, attr, None)
-                if val is not None:
-                    setattr(new_launcher, attr, val)
-            new_launcher._static_kernel_owner = kernel
-            return new_launcher
-        except (AttributeError, TypeError, KeyError, ValueError):
-            return None
-        except Exception:
-            log.warning("Unexpected error building fast launcher", exc_info=True)
-            return None
-
     def _pre_launch(self, launcher, *args: Any, stream: Any, **kwargs: Any) -> None:
         """What is settled before a launch happens.
 
@@ -1302,7 +1207,7 @@ class CachingAutotuner(KernelInterface):
             and not self.triton_interpret
             and len(self.launchers) == 1
         ):
-            self._cached_launcher = self._build_fast_launcher(launcher) or launcher
+            self._cached_launcher = launcher
         return result
     def get_profiler_kwargs(self, stream, launcher) -> dict[str, Any]:
         """What to record about a launch, so a profile can attribute it.
