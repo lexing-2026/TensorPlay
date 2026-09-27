@@ -25,14 +25,34 @@ from __future__ import annotations
 
 from typing import Any
 
+import sympy
+
+import tensorplay as tp
+
+from ..ir import ComputedBuffer
+from ..loops import V
+from ..op_lowerings import register_lowering
 from ..runtime.runtime_utils import ceildiv
 from ..templates.mm_common import load_kernel_template
 from ..templates.select_algorithm import TritonTemplate
 from .omni_flash_attention import (
     _omni_kernel_options_example,
     _omni_kernel_tuning_options,
+    build_subgraph_buffer,
+    create_placeholder,
+    freeze_irnodes,
     has_unsupported_cpu_scalar_tensor_captures,
+    realize_captures_for_cutedsl,
 )
+
+#: What capturing a score or a mask produced: a body to run, or several of them
+#: because the mask is applied after the score and so is a second thing, or
+#: nothing at all because the program did not change either.
+#:
+#: A list rather than a fixed pair, because a program may change only the score,
+#: only the mask, or both, and how many bodies that comes to is a fact about the
+#: program rather than something the caller gets to decide.
+SubgraphResults = list[ComputedBuffer | None] | ComputedBuffer | None
 
 #: Which of the ways of writing attention a program asked for.
 #:
@@ -154,6 +174,184 @@ def check_flash_supported_scalar_captures(
             "Workarounds: use BACKEND='TRITON' or pass the value as a tensor "
             "on device instead of capturing a CPU scalar tensor."
         )
+
+
+# ---------------------------------------------------------------------------
+# Taking a call apart before a kernel is chosen
+# ---------------------------------------------------------------------------
+
+
+def check_embedding_is_wide_enough(query: Any, value: Any) -> None:
+    """Refuse an embedding too narrow for the product the kernels do.
+
+    A product of two very narrow rows is not a smaller version of a wider one:
+    below a width the device's units have nothing to work with, and the shape of
+    the answer stops being the shape of a product and becomes a sum over whatever
+    fitted.  So this is refused with both widths named rather than computed
+    differently from the wide case, because a program that got a different
+    answer for a narrower embedding would have no way of knowing.
+    """
+
+    small_dqk = V.graph.sizevars.evaluate_expr(
+        sympy.Lt(query.get_size()[-1], 16)
+    )
+    small_dv = V.graph.sizevars.evaluate_expr(sympy.Lt(value.get_size()[-1], 16))
+    if small_dqk or small_dv:
+        raise NotImplementedError(
+            f"NYI: embedding dimension of the query, key, and value must be "
+            f"at least 16 but got E={query.get_size()[-1]} and Ev={value.get_size()[-1]}"
+        )
+
+
+def unpack_block_mask(block_mask: Any) -> Any:
+    """The seventeen things a mask carries, each under its own name.
+
+    A mask is not one thing.  It says how long each axis is, which blocks of
+    keys exist and which do not, which of those are full rather than partial,
+    the same four things again for the other direction because the backward pass
+    walks queries as blocks, an order to write in so the backward pass does not
+    depend on scheduling, and the two block widths everything above is counted
+    in.  Sixteen of those are values and the seventeenth is the program that
+    decides which blocks are allowed.
+
+    They are named rather than indexed because there are seventeen and a kernel
+    handed the wrong one is wrong rather than broken -- and a mask that gained a
+    field would otherwise be unpacked into the names of the wrong fields.
+    """
+
+    (
+        _,  # q_length
+        _,  # kv_length
+        kv_num_blocks,
+        kv_indices,
+        full_kv_num_blocks,
+        full_kv_indices,
+        q_num_blocks,
+        q_indices,
+        full_q_num_blocks,
+        full_q_indices,
+        _,  # dq_write_order (backward-only)
+        _,  # dq_write_order_full (backward-only)
+        _,  # dq_kv_order (backward-only)
+        _,  # dq_kv_order_spt (backward-only)
+        sparse_q_block_size,
+        sparse_kv_block_size,
+        mask_graph,
+    ) = block_mask
+
+    return {
+        "kv_num_blocks": kv_num_blocks,
+        "kv_indices": kv_indices,
+        "full_kv_num_blocks": full_kv_num_blocks,
+        "full_kv_indices": full_kv_indices,
+        "q_num_blocks": q_num_blocks,
+        "q_indices": q_indices,
+        "full_q_num_blocks": full_q_num_blocks,
+        "full_q_indices": full_q_indices,
+        "sparse_q_block_size": sparse_q_block_size,
+        "sparse_kv_block_size": sparse_kv_block_size,
+        "mask_graph": mask_graph,
+    }
+
+
+def capture_score_and_mask(
+    query: Any,
+    subgraph: Any,
+    mask_graph: Any,
+    score_mod_other_buffers: Any,
+    mask_mod_other_buffers: Any,
+) -> Any:
+    """Turn the two programs a caller passed into two bodies a kernel can run.
+
+    A caller changes attention by passing a function, not a number: a score can
+    be biased, a mask can depend on distance, and both are programs.  A kernel
+    cannot take a function, so each is captured -- recorded as the sequence of
+    operations it performs -- and the sequence becomes a body the kernel runs
+    per position.
+
+    The score's body is handed the value it produces as well as the four numbers
+    that say which position it is at, because a score is a function of the
+    position and of nothing else.  The mask's body is handed the four numbers
+    and not the score: a mask is applied to a score that has already been
+    produced, and a body that could see the score would be able to change it,
+    which is a different thing from masking it.
+    """
+
+    # Which of the two bodies is written at all is a fact about the program: a
+    # caller who changed nothing has no body to run, and one who changed only the
+    # score has one.  Building a body for a program that is the identity would be
+    # a kernel paying for a comparison it was told to make against itself.
+    if subgraph is not None:
+        placeholder_inps = [
+            create_placeholder(name, dtype, query.get_device())
+            for name, dtype in [
+                ("score", query.get_dtype()),
+                ("b", tp.int32),
+                ("h", tp.int32),
+                ("m", tp.int32),
+                ("n", tp.int32),
+            ]
+        ]
+        subgraph_buffer: SubgraphResults = build_subgraph_buffer(
+            placeholder_inps + list(score_mod_other_buffers), subgraph
+        )
+        freeze_irnodes(subgraph_buffer)
+    else:
+        subgraph_buffer = None
+
+    if mask_graph is not None:
+        mask_graph_placeholder_inps = [
+            create_placeholder(name, dtype, query.get_device())
+            for name, dtype in [
+                ("b", tp.int32),
+                ("h", tp.int32),
+                ("m", tp.int32),
+                ("n", tp.int32),
+            ]
+        ]
+        mask_graph_buffer: SubgraphResults = build_subgraph_buffer(
+            mask_graph_placeholder_inps + list(mask_mod_other_buffers), mask_graph
+        )
+        freeze_irnodes(mask_graph_buffer)
+    else:
+        mask_graph_buffer = None
+
+    return subgraph_buffer, mask_graph_buffer
+
+
+def guard_kernel_options(kernel_options: Any) -> Any:
+    """Pin the sizes a program named, and say how wide a product is to be.
+
+    A size a program wrote as a symbol is not yet a number, and a kernel cannot
+    be written against a symbol -- it is written against the number the symbol
+    will be.  So each one is pinned here, and pinning is what makes the pinning
+    safe: a program whose symbol turns out to be two different numbers in two
+    places gets two kernels rather than one kernel written for neither.
+
+    The width of a product of 32-bit floats is added rather than asked for,
+    because a program that set it has said something and a program that did not
+    has said nothing -- and nothing is not the same as the default.
+    """
+
+    guarded = {
+        k: V.graph.sizevars.guard_int(v) if isinstance(v, sympy.Symbol) else v
+        for k, v in kernel_options.items()
+    }
+    guarded.setdefault("FLOAT32_PRECISION", get_float32_precision())
+    return guarded
+
+
+def heads_are_grouped(query: Any, key: Any) -> bool:
+    """Whether the query has more heads than the key, so the two are shared.
+
+    A question about the shapes and not about the values, and asked as one
+    because every kernel that cares has to answer it the same way: whether the
+    query's heads are in groups over the key's, or one to each.
+    """
+
+    return V.graph.sizevars.evaluate_expr(
+        sympy.Ne(query.get_size()[1], key.get_size()[1]),
+    )
 
 
 # ---------------------------------------------------------------------------
