@@ -28,6 +28,133 @@ from typing import Any
 from ..runtime.runtime_utils import ceildiv
 from ..templates.mm_common import load_kernel_template
 from ..templates.select_algorithm import TritonTemplate
+from .omni_flash_attention import (
+    _omni_kernel_options_example,
+    _omni_kernel_tuning_options,
+    has_unsupported_cpu_scalar_tensor_captures,
+)
+
+#: Which of the ways of writing attention a program asked for.
+#:
+#: Not an enum, because the value travels as a string in the options a program
+#: wrote, and turning it into something closed here would mean a program naming
+#: a way this does not know about is refused rather than answered.
+_BACKEND_AUTO = "AUTO"
+_BACKEND_TRITON = "TRITON"
+_BACKEND_FLASH = "FLASH"
+_BACKEND_TRITON_DECODE = "TRITON_DECODE"
+
+
+# ---------------------------------------------------------------------------
+# What a program asked for
+# ---------------------------------------------------------------------------
+
+
+def sanitize_kernel_options_for_triton(kernel_options: Any) -> Any:
+    """Take the backend out of the options, and hand back which one it was.
+
+    The backend is not an option a kernel can be handed: it says which kernel to
+    hand it to, so it is answered here and not carried the rest of the way.  The
+    rest is a copy rather than the original, because a program that is asked
+    twice for the same thing should get the same answer both times, and a default
+    written into its own dictionary would not.
+    """
+
+    sanitized = dict(kernel_options)
+    backend = sanitized.pop("BACKEND", _BACKEND_AUTO)
+    return sanitized, backend
+
+
+def get_float32_precision() -> str:
+    """How a product of 32-bit floats is to be carried out, as a kernel says it.
+
+    Answered as the text a kernel is written with rather than as a setting,
+    because that is what the kernel takes.
+
+    Exact unless the device has been told to trade accuracy for speed.  There are
+    two ways to have told it, one of which supersedes the other, and which is
+    which is not something this decides by asking which is set -- it is a fact
+    about the program, not about the current state.  So the older answer is used
+    when the newer one is not there, and the newer one is a plain yes or no
+    about trading accuracy away, which is what it has always meant here.
+
+    A device whose products are not carried out by the same units as everything
+    else answers exact regardless, because there is nothing there to trade
+    accuracy for speed with.
+    """
+
+    import tensorplay as tp
+
+    newer = getattr(tp.backends.cuda.matmul, "fp32_precision", None)
+    if newer is not None and newer != "none":
+        exact = newer == "ieee"
+    elif getattr(tp.backends.cuda.matmul, "allow_tf32", None) is not None:
+        exact = not tp.backends.cuda.matmul.allow_tf32
+    else:
+        exact = tp.get_float32_matmul_precision() == "highest"
+
+    if exact or tp.version.hip or (hasattr(tp, "mtia") and tp.mtia.is_available()):
+        return "'ieee'"
+    else:
+        return "'tf32'"
+
+
+def raise_omni_kernel_options_error(
+    kernel_name: str,
+    kernel_options: Any,
+    option_names: Any,
+    sparse_q_block_size: int,
+    sparse_kv_block_size: int,
+) -> None:
+    """Say which options cannot both be true, and what would be.
+
+    A tile has to divide the block it walks, so two options that name a tile
+    and a block can be given that do not.  Which two, and what the numbers were,
+    is the whole of what is wrong -- so all of it is said, along with a set that
+    would have worked, because a caller who cannot see the two that clash cannot
+    change either of them.
+    """
+
+    option_values = ", ".join(f"{name}={kernel_options[name]}" for name in option_names)
+    raise ValueError(
+        f"Invalid attention {kernel_name} kernel options: Q and KV block sizes "
+        f"must be divisible by the selected tile sizes. Got "
+        f"SPARSE_Q_BLOCK_SIZE={sparse_q_block_size}, "
+        f"SPARSE_KV_BLOCK_SIZE={sparse_kv_block_size}, and {option_values}. "
+        f"Pass compatible values with kernel_options. Available {kernel_name} "
+        f"tuning options are {_omni_kernel_tuning_options(kernel_name)}. For example: "
+        f"{_omni_kernel_options_example(kernel_name)}. If you did not pin "
+        f"these options, and the default choice errors, compiling with "
+        f"mode='max-autotune-no-cudagraphs' can also fix this by trying more "
+        f"attention configs."
+    )
+
+
+def check_flash_supported_scalar_captures(
+    score_mod_other_buffers: Any,
+    mask_mod_other_buffers: Any,
+    *,
+    backward: bool = False,
+) -> None:
+    """Refuse a capture the flash kernels cannot be handed, before they are built.
+
+    Said here rather than where it is discovered because the discovering is
+    inside a kernel body: by then the answer is a kernel that failed to write
+    itself, and the reason is a sentence about a device rather than about the
+    program that asked for something this device cannot do.
+    """
+
+    if has_unsupported_cpu_scalar_tensor_captures(
+        score_mod_other_buffers, mask_mod_other_buffers
+    ):
+        direction = " backward" if backward else ""
+        raise RuntimeError(
+            f"BACKEND='FLASH' but flash attention{direction} cannot be used: "
+            "NYI: score_mod or mask_mod captures a 0-dim CPU tensor scalar. "
+            "Workarounds: use BACKEND='TRITON' or pass the value as a tensor "
+            "on device instead of capturing a CPU scalar tensor."
+        )
+
 
 # ---------------------------------------------------------------------------
 # How the work is spread over the device
