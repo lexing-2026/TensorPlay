@@ -17,6 +17,7 @@ import math
 from typing import Any, TYPE_CHECKING
 
 import tensorplay as tp
+from tensorplay._ops import OpOverload
 from tensorplay.utils._pytree import tree_all, tree_map
 
 from . import _utils
