@@ -15,104 +15,213 @@
 // needs no state in the runtime library.
 
 #include <atomic>
+#include <cstdint>
+#include <functional>
 
 #include "Exception.h"
 #include "Macros.h"
 #include "Profiler.h"
+#include "cpu/vec/vec.h"
 
 namespace tensorplay {
 namespace generated {
 
-// Set while a kernel is between its first division and its end, and read by
-// the division itself. A kernel that divides by zero is not aborted where it
-// happens: the result is whatever the hardware produced, the flag is raised,
-// and the kernel finishes -- so one bad element does not cost the whole
-// launch's other work, and the error is reported once at the end with the
-// value that caused it.
-inline std::atomic<int>& integer_div_error() {
-    static std::atomic<int> flag{0};
-    return flag;
-}
-
-// Non-null exactly while a kernel is running. The generated divisions test
-// this before touching the flag, so the common path -- no division by zero --
-// costs a load and a branch and nothing else.
-inline std::atomic<int>*& integer_div_error_flag() {
-    static std::atomic<int>* flag = nullptr;
-    return flag;
-}
-
-// Make a divisor safe, raising the flag if it was zero.
+// The width a reduced-precision value is carried out in.
 //
-// The check is on the divisor rather than on the result because a division by
-// zero traps: there is no result to look at afterwards, and on a machine that
-// traps the whole launch is lost rather than one element of it. So the divisor
-// is replaced by one, the division produces a number, and the flag is what
-// says the number is not the answer.
+// A type that is stored narrower than it is computed in has to be widened before
+// it is multiplied, or the product is a product of the stored widths and the
+// extra bits are lost at the first operation rather than at the last.  A type
+// with no narrower form is its own.
 template <typename T>
-TP_ALWAYS_INLINE T guard_divisor(T divisor) {
-    if (divisor == T(0)) {
-        integer_div_error().store(1, std::memory_order_relaxed);
-        return T(1);
-    }
-    return divisor;
+struct opmath_type {
+    using type = T;
+};
+template <>
+struct opmath_type<Half> {
+    using type = float;
+};
+template <>
+struct opmath_type<BFloat16> {
+    using type = float;
+};
+
+// One value out of a whole vector of them, by adding the lanes.
+//
+// A reduction over a vector is a fold, and a fold has to end somewhere: there is
+// no vector left to hand back, so the lanes are combined and the one that remains
+// is the answer.  Summing is the only fold offered here because it is the one a
+// kernel's running total needs, and because the specialised vectors expose a sum
+// and a maximum and a minimum but not an arbitrary fold -- a general one would
+// have to be written out lane by lane, and the point of a vector is that it is
+// not.
+//
+// The order the lanes are combined in is fixed by the vector, not chosen here:
+// a tree of pairwise combinations sums in a different order at different widths,
+// and a kernel that has to give the same answer on every one of them cannot be
+// picking the order.
+template <typename V>
+TP_ALWAYS_INLINE typename V::value_type vec_reduce_all(V v) {
+    return v.reduce_add();
 }
 
-// Report a division by zero that was raised earlier, and clear the flag.
-//
-// Returns whether one was raised, so a caller that wants to choose can ask;
-// a caller that does not care can ignore it. The divisor is reported rather
-// than a bare flag, because "divided by zero" and "divided by a value that is
-// zero this time" are the same event and the value is what a reader needs.
-//
-// Reporting is not aborting: the division already produced a value and the
-// rest of the kernel already ran, so the error is raised here, at the end,
-// where the cost is one message rather than the whole launch.
-TP_ALWAYS_INLINE bool throw_if_integer_div_error(int divisor) {
-    if (integer_div_error().exchange(0, std::memory_order_relaxed) == 0) {
-        return false;
+// A range walked with an index that advances by a step, which is what walking
+// a strided tensor's memory is.  The index is the element's position, not its
+// address: a strided view's elements are not next to each other, so the position
+// is stepped and the offset is computed from it.
+template <typename T>
+class Irange {
+   public:
+    TP_ALWAYS_INLINE Irange(T end, T step)
+        : begin_(T(0)), end_(end), step_(step) {}
+
+    TP_ALWAYS_INLINE T operator*() const { return begin_; }
+    TP_ALWAYS_INLINE Irange& operator++() {
+        begin_ += step_;
+        return *this;
     }
-    TP_CHECK(false, "integer division by zero: divisor was ", divisor);
-    return true;
+    TP_ALWAYS_INLINE bool operator!=(const Irange& other) const {
+        return step_ > 0 ? begin_ < other.end_ : begin_ > other.end_;
+    }
+
+   private:
+    T begin_;
+    T end_;
+    T step_;
+};
+
+template <typename T>
+TP_ALWAYS_INLINE Irange<T> irange(T end, T step) {
+    return Irange<T>(end, step);
 }
 
-// Floor division for integers.
+// Take a flat position apart into one coordinate per axis.
 //
-// C++ division truncates toward zero, so -7 / 2 is -3 there and -4 here. Which
-// one is right depends on the arithmetic being mirrored, not on the language:
-// a shape computed by rounding down has to round down the same way on both
-// sides or the two disagree about a size. So this is written out rather than
-// left to the operator.
+// A loop over a range of positions and a tensor whose elements are laid out by
+// several axes are two different things, and the kernel that wants both spends
+// most of its body converting between them.  So the conversion is here once: hand
+// it a position and, per axis, a variable to write the coordinate into and the
+// length of that axis.  The last axis given varies fastest, so a position and the
+// coordinates are two accounts of the same place rather than two different
+// places.
 //
-// The divisor goes through the guard, because floor division by zero is still
-// a division by zero.
-template <typename A, typename B>
-TP_ALWAYS_INLINE auto floor_divide_integral(A a, B b) -> decltype(a / b) {
-    // One screened divisor for both operations below. Screening only the
-    // division would leave the remainder to divide by the original zero, and
-    // a remainder by zero traps just as a quotient does.
-    auto d = guard_divisor(b);
-    auto q = a / d;
-    // Truncation rounds toward zero; flooring rounds toward negative infinity.
-    // They differ exactly when the remainder is nonzero and the signs of the
-    // operands differ, which is when the division was not exact.
-    if ((a % d != 0) && ((a < 0) != (d < 0))) {
-        q -= 1;
-    }
-    return q;
+// The coordinate is written to and the length is read, which is why the two are
+// taken differently: a caller writes the length as a value, because a length is
+// a fact, and names the coordinate as a variable, because that is what the
+// conversion is for.
+// Take a flat position apart into one coordinate per axis.
+//
+// A loop over a range of positions and a tensor whose elements are laid out by
+// several axes are two different things, and the kernel that wants both spends
+// most of its body converting between them.  So the conversion is here once: hand
+// it a position and, per axis, a variable to write the coordinate into and the
+// length of that axis.  The last axis given varies fastest, so a position and the
+// coordinates are two accounts of the same place rather than two different
+// places.
+//
+// The coordinate is written to and the length is read, which is why the two are
+// taken differently: a caller writes the length as a value, because a length is
+// a fact, and names the coordinate as a variable, because that is what the
+// conversion is for.
+//
+// One form per axis count rather than one form that counts.  A pack cannot be
+// indexed where the call is written, so a general form would walk the pack on
+// every call to work out which argument is the length and which is the
+// coordinate -- and a conversion that costs a walk is a conversion not worth
+// having.  One, two, three and four are the shapes a kernel walks; a fifth axis
+// is a tensor laid out more ways than anything here has a name for.
+template <typename C0, typename L0>
+TP_ALWAYS_INLINE void data_index_init(int64_t index, C0& c0, L0 l0) {
+    c0 = static_cast<C0>(index % l0);
 }
 
-// Floor division for a whole vector of floats at once, which is the form a
-// generated kernel wants: one operation over the block rather than a loop over
-// it, so that the block's lanes stay in registers.
+template <typename C0, typename L0, typename C1, typename L1>
+TP_ALWAYS_INLINE void data_index_init(
+    int64_t index, C0& c0, L0 l0, C1& c1, L1 l1) {
+    c1 = static_cast<C1>((index / l0) % l1);
+    c0 = static_cast<C0>(index % l0);
+}
+
+template <typename C0, typename L0, typename C1, typename L1, typename C2, typename L2>
+TP_ALWAYS_INLINE void data_index_init(
+    int64_t index, C0& c0, L0 l0, C1& c1, L1 l1, C2& c2, L2 l2) {
+    c2 = static_cast<C2>((index / l0 / l1) % l2);
+    c1 = static_cast<C1>((index / l0) % l1);
+    c0 = static_cast<C0>(index % l0);
+}
+
+template <typename C0, typename L0, typename C1, typename L1, typename C2, typename L2,
+          typename C3, typename L3>
+TP_ALWAYS_INLINE void data_index_init(
+    int64_t index, C0& c0, L0 l0, C1& c1, L1 l1, C2& c2, L2 l2, C3& c3, L3 l3) {
+    c3 = static_cast<C3>((index / l0 / l1 / l2) % l3);
+    c2 = static_cast<C2>((index / l0 / l1) % l2);
+    c1 = static_cast<C1>((index / l0) % l1);
+    c0 = static_cast<C0>(index % l0);
+}
+
+// One step along the axes, resetting those that have run out.
 //
-// `floor` of a quotient is not the same as a quotient of floors, so the
-// quotient is taken first and then floored lane by lane. The divisor is
-// screened lane by lane for the same reason as above: a lane whose divisor is
-// zero would otherwise take the whole block with it.
-template <typename V, typename S>
-TP_ALWAYS_INLINE V div_floor_floating_vec(V a, S b) {
-    return (a / V(b)).floor();
+// Every axis inside the one being stepped restarts, because a position that has
+// run past the end of an axis comes back to the start of it rather than
+// continuing into the next.
+//
+// The outermost axis is the caller's to move: it is walking the range the others
+// are nested inside, so stepping it here would step it twice.  So the form for a
+// given number of axes moves the axes inside the last and leaves that one alone.
+template <typename C0, typename L0>
+TP_ALWAYS_INLINE void data_index_step(C0& c0, L0 l0) {
+    c0 += 1;
+    if (c0 >= static_cast<C0>(l0)) {
+        c0 = 0;
+    }
+}
+
+template <typename C0, typename L0, typename C1, typename L1>
+TP_ALWAYS_INLINE void data_index_step(C0& c0, L0 l0, C1& c1, L1 l1) {
+    c0 += 1;
+    if (c0 < static_cast<C0>(l0)) {
+        return;
+    }
+    c0 = 0;
+    c1 += 1;
+}
+
+template <typename C0, typename L0, typename C1, typename L1, typename C2, typename L2>
+TP_ALWAYS_INLINE void data_index_step(
+    C0& c0, L0 l0, C1& c1, L1 l1, C2& c2, L2 l2) {
+    c0 += 1;
+    if (c0 < static_cast<C0>(l0)) {
+        return;
+    }
+    c0 = 0;
+    c1 += 1;
+    if (c1 < static_cast<C1>(l1)) {
+        return;
+    }
+    c1 = 0;
+    c2 += 1;
+}
+
+template <typename C0, typename L0, typename C1, typename L1, typename C2, typename L2,
+          typename C3, typename L3>
+TP_ALWAYS_INLINE void data_index_step(
+    C0& c0, L0 l0, C1& c1, L1 l1, C2& c2, L2 l2, C3& c3, L3 l3) {
+    c0 += 1;
+    if (c0 < static_cast<C0>(l0)) {
+        return;
+    }
+    c0 = 0;
+    c1 += 1;
+    if (c1 < static_cast<C1>(l1)) {
+        return;
+    }
+    c1 = 0;
+    c2 += 1;
+    if (c2 < static_cast<C2>(l2)) {
+        return;
+    }
+    c2 = 0;
+    c3 += 1;
 }
 
 }  // namespace generated
