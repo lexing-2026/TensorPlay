@@ -558,3 +558,61 @@ def infer_dense_strides(size: Any, orig_strides: Any) -> Any:
         strides = construct_strides(size, fill_order)
 
     return strides
+
+
+def get_fwd_subgraph_outputs(subgraph_buffer: Any, mask_graph_buffer: Any) -> Any:
+    """What the forward pass produces: the score's outputs, then the mask's.
+
+    In that order because the mask is applied to what the score produced, and a
+    caller that took them the other way round would be applying a mask to
+    something that has not been computed.
+    """
+
+    subgraph_buffer = (
+        subgraph_buffer if isinstance(subgraph_buffer, (list, tuple)) else [subgraph_buffer]
+    )
+    mask_graph_buffer = (
+        mask_graph_buffer if isinstance(mask_graph_buffer, (list, tuple)) else [mask_graph_buffer]
+    )
+    return [*subgraph_buffer, *mask_graph_buffer]
+
+
+def create_indices_fake(x: Any) -> Any:
+    """A stand-in for an index, for measuring a kernel with.
+
+    Every position named, rather than the first one or none: an index that
+    named only some positions would make the kernel look cheaper than it is,
+    because the work of following an index is not the same as the work of
+    reading a position.
+    """
+
+    size = V.graph.sizevars.optimization_hints(x.get_size())
+    indices = tp.arange(0, size[-1], dtype=x.get_dtype(), device=x.get_device())
+    indices = indices.expand(size).contiguous()
+    return indices
+
+
+def create_num_blocks_fake_generator(sparse_indices: Any) -> Any:
+    """A stand-in for a count of blocks, for measuring a kernel with.
+
+    A count has to be one the kernel would really do that much work for, or the
+    measurement is of a different kernel than the one that will run.  A count
+    of no blocks would measure a kernel that reads nothing; a count of every
+    block would measure a kernel that takes far longer than any real one would,
+    for no better answer.  So a count in between: enough that reading ahead
+    would help if it were going to, few enough that measuring is quick.
+    """
+
+    def create_num_blocks_fake(x: Any) -> Any:
+        num_blocks_for_autotuning = V.graph.sizevars.optimization_hint(
+            sparse_indices.shape[-1]
+        )
+        size = V.graph.sizevars.optimization_hints(x.get_size())
+        return tp.full(
+            size,
+            num_blocks_for_autotuning,
+            dtype=x.get_dtype(),
+            device=x.get_device(),
+        )
+
+    return create_num_blocks_fake
