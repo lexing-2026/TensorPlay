@@ -23,7 +23,7 @@ import logging
 import math
 import os
 import threading
-from typing import Any, Callable, Generic, Literal, TypeVar
+from typing import Any, Callable, Final, Generic, Literal, TypeVar
 
 import tensorplay as tp
 
@@ -688,6 +688,70 @@ def _find_names(obj):
 collected_calls: list = []
 
 
+#: What a plugin hook returns to say it has no opinion, so the next plugin is
+#: asked and failing all of them the ordinary behaviour happens.  Compared
+#: against by identity, so it is a particular object rather than a value: any
+#: value would do, and one that could be produced by accident would not mean
+#: what it says.
+DEFER: Final[object] = object()
+
+
+class CachingAutotunerPlugin:
+    """Something that gets to answer for an autotuner before it acts.
+
+    A hook returns :data:`DEFER` to say it has no opinion, and anything else to
+    answer instead of the ordinary behaviour.  Which hooks there are, and what
+    answering one obliges a plugin to do itself, is written on each of them: a
+    hook that answers early owns everything that would have followed it.
+    """
+
+    def pre_compile(self, autotuner: CachingAutotuner) -> object:
+        """Fires at the top of a compile, before anything is compiled.
+
+        Deferring runs the ordinary compile: every configuration is compiled and
+        a launcher is made of each.  Answering takes compilation and launcher
+        creation over entirely, including what would be recorded about them,
+        which is why a plugin that only wants to watch cannot answer here.
+        """
+
+        return DEFER
+
+    def pre_dispatch(self, autotuner: CachingAutotuner, *args: Any, stream: Any, **kwargs: Any) -> object:
+        """Fires before a kernel is dispatched, ahead of compiling and measuring.
+
+        A kernel that has settled on one launcher answers later launches straight
+        from it, past this hook, so a plugin that must see every launch cannot
+        count on this one alone.
+        """
+
+        return DEFER
+
+    def pre_autotune(self, autotuner: CachingAutotuner, *args: Any, stream: Any, **kwargs: Any) -> object:
+        """Fires once there is more than one launcher, in place of measuring them.
+
+        Deferring measures them.  Answering takes over the whole remainder of the
+        dispatch: the plugin measures, launches, records the winner, saves the
+        binary, applies whatever comes after measuring, and returns what the
+        launch returned.  A plugin that only wants to affect which launcher is
+        chosen can say so by changing the launchers and deferring.
+        """
+
+        return DEFER
+
+
+def get_caching_autotuner_plugins(autotuner: CachingAutotuner) -> list[CachingAutotunerPlugin]:
+    """The plugins that apply to this kernel, in the order they are asked.
+
+    A plugin is added here, and only here, so that what is in force for a
+    kernel is decided in one place.  Each is behind its own setting, and what a
+    plugin needs to be imported is imported inside the branch that wants it, so
+    a kernel pays for a plugin only when that plugin is in force.
+    """
+
+    plugins: list[CachingAutotunerPlugin] = []
+    return plugins
+
+
 def _resolve_load_device(device: int | None, device_type: str) -> int | None:
     """The device a binary should be loaded onto, when it was not pinned to one.
 
@@ -806,6 +870,12 @@ class CachingAutotuner(KernelInterface):
         self.benchmark_failure_reasons: dict = {}
         self._debug_call = None
         self.compile_id = None
+        # Whether a launch works out its grid in this language or in the one the
+        # launcher is written in.  Settled here because it is a property of the
+        # kernel rather than of a launch, and read on every launch.
+        self.grid_mode: Literal["python", "cpp"] = "python"
+        # What gets to answer for this kernel before it acts, asked in order.
+        self._plugins = get_caching_autotuner_plugins(self)
 
     @staticmethod
     def _close_compiled_kernel(kernel) -> None:
@@ -868,6 +938,23 @@ class CachingAutotuner(KernelInterface):
         return all(
             isinstance(x, StaticTritonCompileResult) for x in self.compile_results
         )
+
+    def __getstate__(self) -> dict[str, Any]:
+        # A launcher holds a binary that belongs to this process's device, and a
+        # plugin is this process's business, so neither travels.  What travels is
+        # the kernel: the function, the configurations, and what has been worked
+        # out from them so far -- which is everything, because nothing may have
+        # been worked out yet.
+        if self.launchers:
+            raise AssertionError(
+                "a kernel that has launchers must not be sent to another process"
+            )
+        return {**self.__dict__, "lock": None, "_plugins": []}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self.lock = threading.Lock()
+        self._plugins = get_caching_autotuner_plugins(self)
 
     def set_compile_info(self, compile_id, is_backward: bool) -> None:
         """Note which build this is, and whether it is the backward one.
