@@ -2073,41 +2073,37 @@ def register_replacement(
         if tp.is_inference_mode_enabled():
             return False
 
-    # TODO: Revisit the functionalize_rng_ops for lowmem dropout
-    with functorch_config.patch(functionalize_rng_ops=False):
-        if search_fn_pattern is None:
-            pattern, gm = gen_pattern_and_search_gm(
-                search_fn,
-                example_inputs,
-                trace_fn,
-                scalar_workaround,
-                exclusive_arg_names,
-                get_decomp_fn=get_decomp_fn,
-            )
-        else:
-            pattern = search_fn_pattern
-            gm = None
-
-        for pattern_matcher_pass in (
-            pass_dicts if isinstance(pass_dicts, Sequence) else [pass_dicts]
-        ):
-            if isinstance(pattern_matcher_pass, PatternMatcherPass):
-                if check_and_add_duplicate_pattern(
-                    pattern,
-                    gm.graph if gm else None,
-                    pattern_matcher_pass.seen_patterns,
-                    skip_duplicates=skip_duplicates,
-                ):
-                    return False
-
-        pattern = ReplacementPatternEntry(
-            pattern=pattern,
-            extra_check=check_fn,
-            normalize_args=normalize_args,
-            pattern_name=pattern_name,
+    if search_fn_pattern is None:
+        pattern, gm = gen_pattern_and_search_gm(
+            search_fn,
+            example_inputs,
+            trace_fn,
+            scalar_workaround,
+            exclusive_arg_names,
+            get_decomp_fn=get_decomp_fn,
         )
-        pattern.register(pass_dicts)
-        return pattern.pattern  # type: ignore[return-value]
+    else:
+        pattern = search_fn_pattern
+        gm = None
+    for pattern_matcher_pass in (
+        pass_dicts if isinstance(pass_dicts, Sequence) else [pass_dicts]
+    ):
+        if isinstance(pattern_matcher_pass, PatternMatcherPass):
+            if check_and_add_duplicate_pattern(
+                pattern,
+                gm.graph if gm else None,
+                pattern_matcher_pass.seen_patterns,
+                skip_duplicates=skip_duplicates,
+            ):
+                return False
+    pattern = ReplacementPatternEntry(
+        pattern=pattern,
+        extra_check=check_fn,
+        normalize_args=normalize_args,
+        pattern_name=pattern_name,
+    )
+    pattern.register(pass_dicts)
+    return pattern.pattern  # type: ignore[return-value]
 
 
 _serialized_patterns: OrderedSet[str] = OrderedSet()
@@ -2163,10 +2159,7 @@ def _serialize_pattern(
 
     pattern_name = search_fn.__name__
 
-    from . import config as functorch_config
-
-    with functorch_config.patch(functionalize_rng_ops=False):
-        pattern = gen_pattern(search_fn, example_inputs, trace_fn, scalar_workaround)
+    pattern = gen_pattern(search_fn, example_inputs, trace_fn, scalar_workaround)
 
     serialized_pattern = PatternPrettyPrinter.run(pattern, output_name=unique_name)
     if pattern_name not in _serialized_patterns:
@@ -2188,7 +2181,7 @@ def _serialize_pattern(
     return pattern
 
 
-SERIALIZED_PATTERN_PATH = Path(__file__).parent / "fx_passes" / "serialized_patterns"
+SERIALIZED_PATTERN_PATH = Path(__file__).parent / "graph_passes" / "serialized_patterns"
 
 
 # This is the set of serialized patterns that we've registered.  Used by
@@ -2266,7 +2259,6 @@ def gen_register_replacement(
     )
 
 
-@functorch_config.patch(functionalize_rng_ops=False)  # type: ignore[misc]
 def gen_pattern_and_search_gm(
     search_fn: SearchFn,
     example_inputs: Sequence[Any],
@@ -2883,12 +2875,11 @@ def fwd_only(
     """Build a normalized inference graph, for use with fx_to_pattern"""
     from . import config as compiler_config
 
-    # Patterns are device-agnostic templates traced with fixed example tensors; keep the
-    # compile-on-one-rank device handling out of pattern tracing so make_fx's single-device
-    # check only validates real user graphs, not these internal fixed-device templates.
+    # Patterns are device-agnostic templates traced with fixed example tensors, so the
+    # proxy modes and the node metadata are put back around the trace rather than left
+    # to whatever the caller happened to have set.
     # TODO - look into using aot autograd, asserting no mutating ops here
     with (
-        compiler_config.patch(compile_on_one_rank=False),
         disable_proxy_modes_tracing(),
         preserve_node_meta(),
     ):
@@ -2930,18 +2921,20 @@ def joint_fwd_bwd(
         gm = clone_graph(joint_graph)
         return default_partition(joint_graph, inputs, **kwargs)
 
-    from . import config as compiler_config
+    from ..._core.aot_autograd import aot_function
 
-    # Keep compile-on-one-rank device handling out of pattern tracing (see fwd_only).
-    with compiler_config.patch(compile_on_one_rank=False):
-        aot_function(
-            fn,
-            lambda gm, example_inputs: make_boxed_func(gm),
-            partition_fn=record_joint_graph,
-            decompositions=get_decomp_fn(),
-            keep_inference_input_mutations=True,
-            enable_log=False,
-        )(*args)
+    # The graph is wanted as traced, before anything has replaced it, so the
+    # compiler hands the module back rather than a callable around it: what
+    # is wanted is the module, and the caller of a compiler's result accepts
+    # either shape.
+    aot_function(
+        fn,
+        args,
+        fw_compiler=lambda gm, example_inputs: gm,
+        partition_fn=record_joint_graph,
+        decompositions=get_decomp_fn(),
+        keep_inference_input_mutations=True,
+    )(*args)
     if not gm:
         raise AssertionError("gm was not set")
 
