@@ -46,6 +46,9 @@ __all__ = [
     "CppBenchmarkRequest",
     "NonzeroWorkspaceNotSupportedError",
     "TensorMeta",
+    "ExternKernelBenchmarkRequest",
+    "ExternKernelCPUBenchmarkRequest",
+    "ExternKernelGPUBenchmarkRequest",
     "TritonBenchmarkRequest",
     "TritonCPUBenchmarkRequest",
     "TritonGPUBenchmarkRequest",
@@ -616,6 +619,119 @@ class TritonGPUBenchmarkRequest(GPUDeviceBenchmarkMixin, TritonBenchmarkRequest)
 
 
 class TritonCPUBenchmarkRequest(CPUDeviceBenchmarkMixin, TritonBenchmarkRequest):
+    pass
+
+
+class ExternKernelBenchmarkRequest(BenchmarkRequest):
+    """A request to measure a kernel that already exists.
+
+    A kernel that already exists needs none of what a kernel written here needs:
+    there is nothing to compile, and where it lives is not a path but a name it
+    is bound to.  So what this carries is that name, and how to call it -- which
+    is what makes it measurable the same way a written one is, in a process of
+    its own that may die with it.
+
+    Which of two shapes the call has matters and is carried rather than worked
+    out: one writes into a buffer it is handed, the other returns a new one, and
+    measuring the second has to account for the allocation and the copy that
+    asking for a result costs and a caller that already had a buffer does not.
+    """
+
+    def __init__(
+        self,
+        kernel_name: str,
+        input_tensor_meta: TensorMeta | list[TensorMeta],
+        output_tensor_meta: TensorMeta | list[TensorMeta],
+        extra_args: Iterable[Any],
+        callable_path: str,  # Module path to the callable (e.g., "extern_kernels.mm")
+        kwargs: dict[str, Any] | None = None,
+        has_out_variant: bool = True,
+    ) -> None:
+        super().__init__(kernel_name, input_tensor_meta, output_tensor_meta, extra_args)
+        self.callable_path = callable_path
+        self.kwargs = kwargs or {}
+        self.has_out_variant = has_out_variant
+
+    def make_run_fn(
+        self, *input_tensors: Any, out: Any
+    ) -> Callable[[], None]:
+        fn = self.to_callable()
+        if self.has_out_variant:
+            # Where the kernel writes into a buffer it is handed, the buffer is
+            # named rather than positional: which of the arguments that is
+            # depends on how the kernel was written, and the caller knows.
+            return functools.partial(fn, *input_tensors, out=out)
+        else:
+            return functools.partial(fn, *input_tensors)
+
+    def benchmark(self, *input_tensors: Any, out: Any | None = None):
+        if out is not None and out.numel() == 0:
+            # There is nothing to write, so there is nothing to time: a kernel
+            # over no elements does no work, and timing it would time the
+            # launching of it.
+            return 0.0
+        if self.has_out_variant or len(input_tensors) == 0:
+            return super().benchmark(*input_tensors, out=out)
+        else:
+            # A kernel that returns its result allocates one, and the caller
+            # usually already had a buffer: the result is copied into it so the
+            # caller's answer is what was measured, and the copy is not part of
+            # what is timed -- the copy is what makes the answer checkable.
+            algo = self.to_callable()
+            out_new = algo(*input_tensors)
+            if out is not None:
+                from .runtime.runtime_utils import assert_size_stride
+
+                assert_size_stride(
+                    out_new, tuple(out.size()), tuple(out.stride())
+                )
+                out.copy_(out_new)
+            from .runtime.benchmarking import benchmarker
+
+            if self.benchmark_with_cudagraphs:
+                return benchmarker.benchmark_gpu_with_cuda_graph(
+                    lambda: algo(*input_tensors)
+                )
+            if config.profile_bandwidth_with_do_bench_using_profiling:
+                from .utils import do_bench_using_profiling
+
+                return do_bench_using_profiling(lambda: algo(*input_tensors))
+            return benchmarker.benchmark(algo, input_tensors, {})
+
+    def precompile(self) -> None:
+        # A kernel that already exists is already compiled, so there is nothing
+        # to do before measuring it.
+        pass
+
+    def to_callable(self):
+        """The thing to call, reached by the name it is bound to.
+
+        Reached from the namespace rather than from the choice that described
+        it, because a choice is not something that can be sent to another
+        process and a name is.
+        """
+
+        from .templates.select_algorithm import extern_kernels
+
+        fn = getattr(extern_kernels, self.kernel_name)
+        if self.kwargs:
+            return functools.partial(fn, **self.kwargs)
+
+        return fn
+
+    def __str__(self) -> str:
+        return f"ExternKernelBenchmarkRequest({self.callable_path})"
+
+
+class ExternKernelGPUBenchmarkRequest(
+    GPUDeviceBenchmarkMixin, ExternKernelBenchmarkRequest
+):
+    pass
+
+
+class ExternKernelCPUBenchmarkRequest(
+    CPUDeviceBenchmarkMixin, ExternKernelBenchmarkRequest
+):
     pass
 
 
