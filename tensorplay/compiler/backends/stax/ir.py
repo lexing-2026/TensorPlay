@@ -8538,12 +8538,27 @@ class ChoiceCaller:
         self._callable: Callable[..., Any] | None = None
 
     def benchmark(self, *args: Any, out: Any) -> float:
-        """How long one run of this choice takes."""
+        """How long one run of this choice takes.
 
-        from .runtime.stax_autotune import bench_launch
+        The result is named rather than appended: the choice was written to be
+        handed where its result goes, and which of its arguments that is is
+        part of how it was written rather than a matter of order.  Where a
+        measurement is meant to compare the kernel and not the launch, the
+        launch is captured once and replayed, which is the only difference
+        between the two measurements; and where a profile is being taken
+        anyway, its own timings are used rather than timed twice.
+        """
+
+        from .config import profile_bandwidth_with_do_bench_using_profiling
+        from .runtime.benchmarking import benchmarker
+        from .utils import do_bench_using_profiling
 
         algo = self.to_callable()
-        return bench_launch(lambda these: algo(*these), list(args))
+        if self._benchmark_with_cudagraphs:
+            return benchmarker.benchmark_gpu_with_cuda_graph(lambda: algo(*args))
+        if profile_bandwidth_with_do_bench_using_profiling:
+            return do_bench_using_profiling(lambda: algo(*args))
+        return benchmarker.benchmark(algo, args, {"out": out}, device=None)
 
     def call_name(self) -> str:
         raise NotImplementedError
