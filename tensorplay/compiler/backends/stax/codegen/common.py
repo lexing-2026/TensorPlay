@@ -17,10 +17,13 @@ import contextlib
 import dataclasses
 import enum
 import operator
+import atexit
 import functools
 import math
 import itertools
 import logging
+import os
+import tempfile
 
 import re
 from enum import Enum, auto
@@ -603,6 +606,38 @@ def get_custom_backend_config_for_device(device: str) -> Any:
     """A device's own settings, where it has settings of its own."""
 
     return custom_backend_codegen_configs.get(device)
+
+
+class FileBackedGraphModule:
+    """What a printed region is: a callable with the source it was printed from.
+
+    Exposes what a module exposes, and maps back to the graph rather than to
+    Python source: the region is printed as text and run as text, so the text
+    is what there is, and a debugging tool that wants to read it wants a file.
+    The file goes away with the process.
+    """
+
+    gm: Any
+    compiled_fn: Callable[..., Any]
+
+    def __post_init__(self) -> None:
+        self.tempfile = tempfile.NamedTemporaryFile(
+            mode="w+", suffix=".py", delete=False
+        )
+        atexit.register(os.remove, self.tempfile.name)
+        with self.tempfile as f:
+            f.write(self.value)
+
+    @property
+    def __file__(self) -> str:
+        return self.tempfile.name
+
+    def call(self, args: list) -> Any:
+        return self.compiled_fn(*args)
+
+    @property
+    def value(self) -> str:
+        return self.gm.code
 
 
 class BackendFeature(Enum):

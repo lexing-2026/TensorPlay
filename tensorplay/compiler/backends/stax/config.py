@@ -966,6 +966,13 @@ class _TritonConfig:
     #: out wrong is traced back to the node that made it wrong.
     debug_sync_graph = False
 
+    #: Write the region as it arrived, beside the graph it was scheduled into,
+    #: so the two can be read against each other.
+    draw_orig_fx_graph = (
+        os.environ.get("TP_ORIG_FX_SVG", "0") == "1"
+        or os.environ.get("TP_ORIG_FX_GRAPH", "0") == "1"
+    )
+
     #: Launch a captured graph rather than calling into it, so the launches
     #: themselves are what a profiler sees.
     cudagraphs = os.environ.get("TP_CUDAGRAPHS") == "1"

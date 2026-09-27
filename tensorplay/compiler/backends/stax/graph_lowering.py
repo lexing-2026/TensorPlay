@@ -577,6 +577,9 @@ class GraphLowering:
         # place stands for the buffer that was really written, and the mapping
         # is the scheduler's to answer.
         self.scheduler = None
+        #: The names every kernel printed under, kept as they are printed so
+        #: that a kernel can be found by the name it actually has.
+        self.all_codegen_kernel_names: OrderedSet[str] = OrderedSet()
         self.mutation_real_name: dict = {}
         # A region whose output node holds one value returns that value, not a
         # one-element sequence, so the compiled region matches its capture.
@@ -1368,6 +1371,41 @@ class GraphLowering:
         with set_ops_handler(DeferredOps()), set_graph(self):
             result = self._run()
         self._walked = True
+        return result
+
+    def _update_scheduler(self) -> None:
+        """(Re)build the scheduler for this region.
+
+        Built with storing of compiled device code switched off: a measurement
+        that had already written some would be measuring a program that had
+        already paid for writing it, and the schedule it chose would be chosen
+        against that rather than against the work.
+        """
+
+        from .scheduler import Scheduler
+
+        with config.patch({"store_cubin": False}):
+            self.scheduler = Scheduler(self.operations)
+
+    def codegen(self):
+        """Print this region: the kernels, and the program that calls them."""
+
+        self.init_wrapper_code()
+
+        self._update_scheduler()
+        if config.draw_orig_fx_graph:
+            V.debug.draw_orig_fx_graph(self.orig_gm, self.scheduler.nodes)
+
+        self.wrapper_code.push_codegened_graph(self)
+        self.scheduler.codegen()
+
+        log.debug(
+            "Finished codegen for all nodes. The list of kernel names available: %s",
+            V.graph.all_codegen_kernel_names,
+        )
+
+        result = self.wrapper_code.generate(self.is_inference)
+        self.wrapper_code.pop_codegened_graph()
         return result
 
     def compile_to_module(self):
