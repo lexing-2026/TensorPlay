@@ -371,7 +371,11 @@ def partition_default(
                 input_kinds.append("saved")
                 input_keys.append(old.name)
 
-    mapped_bwd_outs = [bw_map[a] for a in bwd_out_args]
+    # An input that does not take a gradient has none, and the joint graph
+    # says so by having nothing there.  There is no node to carry, so it is
+    # not carried: the backward graph produces what it does produce, and the
+    # input that wanted no gradient wanted none.
+    mapped_bwd_outs = [bw_map[a] for a in bwd_out_args if a is not None]
     bw_graph.output(
         mapped_bwd_outs[0] if len(mapped_bwd_outs) == 1 else tuple(mapped_bwd_outs)
     )
@@ -630,7 +634,11 @@ def partition_min_cut(
 
     for node in bwd_nodes:
         ensure(node)
-    mapped_bwd_outs = [bw_map[a] for a in bwd_out_args]
+    # An input that does not take a gradient has none, and the joint graph
+    # says so by having nothing there.  There is no node to carry, so it is
+    # not carried: the backward graph produces what it does produce, and the
+    # input that wanted no gradient wanted none.
+    mapped_bwd_outs = [bw_map[a] for a in bwd_out_args if a is not None]
     bw_graph.output(
         mapped_bwd_outs[0] if len(mapped_bwd_outs) == 1 else tuple(mapped_bwd_outs)
     )

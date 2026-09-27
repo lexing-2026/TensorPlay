@@ -1339,7 +1339,7 @@ class PatternPrettyPrinter:
                 return memoized_name
             else:
                 return self.memoize(obj)
-        if isinstance(obj, _TargetArgsExpr):
+        if isinstance(obj, tp.Tensor):
             return _tensor_constant_repr(obj)
         if hasattr(obj, "pretty_print"):
             return obj.pretty_print(self)
