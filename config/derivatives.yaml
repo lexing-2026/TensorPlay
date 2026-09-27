@@ -435,6 +435,14 @@
 - name: softmax(Tensor self, int dim, ScalarType dtype=Undefined) -> Tensor
   self: _softmax_backward_data(grad, result, dim, self.dtype())
 
+# The softmax that first brings its input to the type the accumulation is done
+# in, so that a half-precision input does not lose the range the sum needs.
+# Where the sum is done in the wider type, the gradient is taken with respect to
+# the input as it was before the widening, which is what the backward formula
+# is handed.
+- name: _safe_softmax(Tensor self, int dim, ScalarType? dtype=None) -> Tensor
+  self: _softmax_backward_data(grad, result, dim, self.dtype())
+
 - name: nll_loss(Tensor self, Tensor target, Tensor? weight=None, int reduction=1, int ignore_index=-100) -> (Tensor output, Tensor total_weight)
   self: nll_loss_backward(grad, self, target, weight, reduction, ignore_index, total_weight)
 
