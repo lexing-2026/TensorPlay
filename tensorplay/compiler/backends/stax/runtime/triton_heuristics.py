@@ -756,7 +756,29 @@ class CachingAutotuner(KernelInterface):
         compile_meta["num_warps"] = cfg.num_warps
         compile_meta["num_stages"] = cfg.num_stages
 
-        cfg_kwargs = {**cfg.kwargs}
+        # A configuration names two different kinds of thing.  A name the
+        # kernel declares is a value the kernel was compiled with and belongs
+        # among the constants.  A name the kernel does not declare is not an
+        # argument of it at all -- here it is a value the text was written with,
+        # which lives in the module the kernel is defined in -- and passing it
+        # to the runtime as though it were an argument would be naming
+        # something the kernel has no parameter for.
+        kernel_arg_names = set(compile_meta["signature"])
+        cfg_kwargs = {
+            key: value
+            for key, value in cfg.kwargs.items()
+            if key in kernel_arg_names
+        }
+        backend_options = {
+            key: value
+            for key, value in cfg.kwargs.items()
+            if key not in kernel_arg_names
+        }
+        if backend_options:
+            compile_meta["backend_options"] = {
+                **compile_meta.get("backend_options", {}),
+                **backend_options,
+            }
         compile_meta["constants"].update(cfg_kwargs)
 
         for i in get_constexprs(self.fn):

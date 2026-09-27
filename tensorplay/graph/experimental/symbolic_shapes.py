@@ -7,6 +7,7 @@ import operator
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, NamedTuple, TypeAlias
@@ -411,6 +412,51 @@ def _primitive(value: Any) -> Any:
     if isinstance(value, sympy.Float):
         return float(value)
     return value
+
+
+#: Per-thread state about symbols that were created on purpose and are meant
+#: to be thrown away.  A tracing path that builds temporary values without
+#: owning the environment they are built in must not leave their symbols
+#: behind for the surrounding trace to pick up, and this is what says so.
+_IGNORE_FRESH_UNBACKED_SYMBOLS: ContextVar[bool] = ContextVar(
+    "ignore_fresh_unbacked_symbols", default=False
+)
+
+
+
+def _ignore_fresh_unbacked_symbols_tls() -> bool:
+    """Whether symbols created right now are meant to be discarded."""
+
+    return _IGNORE_FRESH_UNBACKED_SYMBOLS.get()
+
+
+def _ignore_fresh_unbacked_symbols_set(b: bool) -> bool:
+    """Set it, and hand back what it was so the caller can put it back.
+
+    What is handed back is the value from before, not the value now set, so a
+    caller saves it, sets what it wants, and puts the saved one back when it is
+    done -- which is what the context manager below does with a token.
+    """
+
+    prev = _IGNORE_FRESH_UNBACKED_SYMBOLS.get()
+    _IGNORE_FRESH_UNBACKED_SYMBOLS.set(b)
+    return prev
+
+
+@contextmanager
+def _ignore_fresh_unbacked_symbols_tls_context() -> Iterator[None]:
+    """Say that symbols created in here are intentionally discarded.
+
+    Used by tracing-only paths that do not own a shape environment but still
+    build temporary values, whose symbols would otherwise be bound into the
+    surrounding trace.
+    """
+
+    token = _IGNORE_FRESH_UNBACKED_SYMBOLS.set(True)
+    try:
+        yield
+    finally:
+        _IGNORE_FRESH_UNBACKED_SYMBOLS.reset(token)
 
 
 def guarding_hint_or_throw(value: SymNode | int | bool) -> int | bool:
@@ -1514,6 +1560,20 @@ class ShapeEnv:
             raise GuardOnDataDependentSymNode(expression, f"cannot guard {expression}")
         self.guards.append(ShapeGuard(sympy.Eq(self.replace(expr), value)))
         return value
+
+    def _ignore_fresh_unbacked_symbols_tls(self) -> bool:
+        """Whether symbols created right now are meant to be discarded."""
+
+        return _ignore_fresh_unbacked_symbols_tls()
+
+    def _ignore_fresh_unbacked_symbols_set(self, b: bool) -> bool:
+        """Set it on this thread, and hand back what it was.
+
+        Handed back is the value from before, so a caller saves it, sets what
+        it wants, and puts the saved one back when it is done.
+        """
+
+        return _ignore_fresh_unbacked_symbols_set(b)
 
     def has_guarding_hint(self, expr: sympy.Expr) -> bool:
         return self._maybe_evaluate_static(expr) is not None or self.replace(expr) in self.var_to_hint_override

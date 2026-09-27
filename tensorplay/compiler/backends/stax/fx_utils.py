@@ -30,6 +30,9 @@ from tensorplay.graph.experimental.symbolic_shapes import (
     statically_known_true,
     sym_eq,
 )
+from tensorplay.compiler.backends.stax.runtime.triton_compat import (
+    enable_python_dispatcher,
+)
 from tensorplay.utils import _pytree as pytree
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
 from tensorplay.utils._pytree import tree_map

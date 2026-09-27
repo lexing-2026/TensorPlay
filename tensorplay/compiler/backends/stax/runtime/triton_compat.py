@@ -8,6 +8,8 @@ for where it might be and re-exported under one name, or the re-export is
 
 from __future__ import annotations
 
+import tensorplay._C as _C
+
 try:
     import triton
 except ImportError:
@@ -48,6 +50,14 @@ if triton is not None:
         except ImportError:
             continue
     HAS_WARP_SPEC = knobs is not None and hasattr(knobs, "warp_specialize")
+
+    #: Holds the language's dispatch key in the thread's key set while entered.
+    #: An operator then reaches the Python layer rather than stopping at a
+    #: compiled path, which is what lets a mode that intercepts operators see
+    #: every one of them -- including the ones a hand-written shortcut would
+    #: otherwise answer before anything asked.  Leaving the block puts back
+    #: what was there before it.
+    enable_python_dispatcher = _C._IncludePythonDispatcher
 
     def has_triton_block_ptr() -> bool:
         """Whether the runtime can address a tile by a pointer into it.
@@ -132,6 +142,10 @@ else:  # pragma: no cover - the kernel-writing runtime is absent
     KernelInterface = None
     knobs = None
     HAS_WARP_SPEC = False
+
+    #: No runtime, so no dispatch key to hold open: a mode that intercepts
+    #: operators has nothing to intercept with.
+    enable_python_dispatcher = None
 
     def has_triton_block_ptr() -> bool:
         """No kernel-writing runtime, so no way to point at a tile."""

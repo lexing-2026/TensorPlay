@@ -31,6 +31,8 @@ from .ir import (
     Reduction,
     ReinterpretView,
     FallbackKernel as IrFallbackKernel,
+    ExternKernelAlloc,
+    ExternKernelOut,
 )
 from .loops import (
     V,
@@ -295,7 +297,12 @@ class KernelScheduler:
 
     def _build(self):
         for position, op in enumerate(self.graph.operations):
-            if isinstance(op, IrFallbackKernel):
+            # Both kinds are a call out to something already written rather
+            # than a nest of loops this compiler is laying out: one is named by
+            # its overload, the other by the name it is launched under. Neither
+            # has a body to record, and asking one for its body is asking for
+            # something it does not have.
+            if isinstance(op, (IrFallbackKernel, ExternKernelOut, ExternKernelAlloc)):
                 node = ExternNode(
                     position,
                     op,

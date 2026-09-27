@@ -5920,6 +5920,37 @@ class ConcatKernel(NopKernel):
         return True
 
 
+@contextlib.contextmanager
+def _track_fresh_unbacked_symbols(shape_env):
+    """Say that symbols created in here are to be bound, not discarded.
+
+    The counterpart of discarding them: a caller that discards them while it
+    builds a result would lose the symbols that result's extents depend on, so
+    a caller that is about to ask an operation what it produces says the
+    opposite for the length of the ask.
+    """
+
+    prev = shape_env._ignore_fresh_unbacked_symbols_set(False)
+    try:
+        yield
+    finally:
+        shape_env._ignore_fresh_unbacked_symbols_set(prev)
+
+
+def _fallback_kernel_symbol_tracking_context(shape_env):
+    """Whether symbols created while asking a call what it produces are kept.
+
+    Kept only where the surrounding path had said otherwise: a path that is
+    already binding them needs nothing said, and a path that is discarding them
+    on purpose -- a probe of the shape, say -- is not the place to start
+    binding them.
+    """
+
+    if shape_env is not None and shape_env._ignore_fresh_unbacked_symbols_tls():
+        return _track_fresh_unbacked_symbols(shape_env)
+    return contextlib.nullcontext()
+
+
 @dataclasses.dataclass
 class ProcessKernelResult:
     """The arguments of a call, sorted, and what the call would produce.
@@ -6201,6 +6232,8 @@ class ExternKernel(InputsKernel):
 
         from tensorplay.utils import _pytree as pytree
 
+        from .runtime.triton_compat import enable_python_dispatcher
+
         binded_args = {"args": args, "kwargs": kwargs}
         args_flat, args_spec = pytree.tree_flatten(binded_args)
 
@@ -6253,7 +6286,17 @@ class ExternKernel(InputsKernel):
                 example_args.append(ir_node_to_tensor(x))
 
         new_args, new_kwargs = unflatten_args(example_args, real_non_tensor_args)
-        example_output = kernel(*new_args, **new_kwargs)
+        # The result is worked out with the language's dispatch key held open,
+        # so that the operation is asked rather than answered by a shortcut
+        # written for the case where nothing is watching.  A mode that
+        # intercepts operators has to see this one too, or the result recorded
+        # here is not the result that will be produced.
+        shape_env = V.fake_mode.shape_env if V.fake_mode is not None else None
+        with (
+            enable_python_dispatcher(),
+            _fallback_kernel_symbol_tracking_context(shape_env),
+        ):
+            example_output = kernel(*new_args, **new_kwargs)
 
         unbacked_bindings: dict | None = None
         if V.fake_mode is not None and V.fake_mode.shape_env is not None:

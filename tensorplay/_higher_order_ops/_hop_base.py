@@ -219,12 +219,31 @@ class FakeTensorMode:
     def __init__(self, allow_non_fake_inputs: bool = True) -> None:
         self.allow_non_fake_inputs = allow_non_fake_inputs
         self._saved: dict[int, Any] = {}
+        #: What the extents in here are worked out against.  A value inside the
+        #: region describes a shape, and a shape that is not yet a number has
+        #: to be something: the environment is what holds the difference
+        #: between the part that is settled and the part that is not, and it is
+        #: what a guard about the settled part is written in terms of.
+        from tensorplay.graph.experimental.symbolic_shapes import ShapeEnv
+
+        self.shape_env = ShapeEnv()
 
     def __enter__(self) -> "FakeTensorMode":
+        # Pushed as well as remembered: a tensor is only a stand-in while this
+        # is on the stack of modes the dispatcher consults, and an operator
+        # called with the language's key held open reaches whatever is on that
+        # stack and pops it as it goes.  A region that was entered but not
+        # pushed would answer nothing to the operation it exists to trace.
+        from tensorplay import _C
+
+        self._dispatch_token = _C._push_dispatch_mode(self)
         self._token = _ACTIVE_FAKE_MODE.set(self)
         return self
 
     def __exit__(self, *exc: Any) -> None:
+        from tensorplay import _C
+
+        _C._pop_dispatch_mode()
         _ACTIVE_FAKE_MODE.reset(self._token)
 
     def mark(self, tensor: Any) -> Any:
@@ -232,6 +251,28 @@ class FakeTensorMode:
 
         _FAKE_CONSTANTS[id(tensor)] = tensor
         return tensor
+
+    def __tensorplay_dispatch__(self, func, types, args=(), kwargs=None):
+        """Run the operation here, and record what it made.
+
+        A tensor inside the region is a stand-in rather than a value, so the
+        operation is run on stand-ins and whatever it returns is one too. What
+        is being recorded is the value it was computed from, so a stand-in
+        that outlives the region still says what it stands for.
+
+        The extents it comes back with are the ones the operation would produce
+        on the values it was given, which is why it is asked rather than taken
+        from what was handed in: an operation whose result depends on its input
+        values produces a shape that is not in the inputs.
+        """
+
+        kwargs = {} if kwargs is None else kwargs
+        result = func(*args, **kwargs)
+        if isinstance(result, (Tensor, tuple, list)) and all(
+            isinstance(r, Tensor) for r in (result if isinstance(result, (tuple, list)) else (result,))
+        ):
+            return self.mark(result)
+        return result
 
 
 #: The region currently being traced through, if any.  Held here rather than
