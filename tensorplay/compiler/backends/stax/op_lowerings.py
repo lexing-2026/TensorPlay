@@ -20,6 +20,7 @@ import itertools
 import logging
 import math
 import operator
+import warnings
 from numbers import Number
 from typing import Any, Callable
 
@@ -27,11 +28,17 @@ import sympy
 
 import tensorplay as tp
 
-from .utils import register_op_dtype_propagation_rules
+from . import config
+from .utils import (
+    is_triton_fp8_dtype_supported,
+    is_view,
+    register_op_dtype_propagation_rules,
+)
 
 from tensorplay.primitives.common import ELEMENTWISE_TYPE_PROMOTION_KIND
 from .dtype_propagation import promoted_dtype_of_values
-from tensorplay.utils._pytree import tree_map
+from tensorplay.graph import Node
+from tensorplay.utils._pytree import arg_tree_leaves, tree_leaves, tree_map
 
 from . import ir
 from .ir import (
@@ -68,6 +75,156 @@ from .loops import (
 )
 
 log = logging.getLogger(__name__)
+
+aten = tp.ops.tp
+prims = tp.ops.prims
+
+#: A change of element type.  A conversion is what a traced graph holds rather
+#: than the operation it was asked for, so this is the one a node's target is
+#: compared against.
+_CONVERT_ELEMENT_TYPE = tp.ops.tp.to.dtype
+
+#: The dtypes a value in the e8m0 scale format is read as, being the dtypes
+#: that format is a multiple of.
+_FLOAT8_E8M0FNU_TO_FLOAT_DTYPES = (
+    tp.float32,
+    tp.float64,
+    tp.float16,
+    tp.bfloat16,
+)
+
+
+def _warn_complex_not_supported():
+    warnings.warn(
+        "This compiler does not support code generation for complex operators. "
+        "Performance may be worse than eager."
+    )
+
+
+# There are some types (CPU) which we accept as input but not as
+# output.
+def unsupported_input_tensor(t: tp.Tensor, node=None):
+    "Do not support reading or writing to this tensor"
+    if t.is_complex():
+        # Complex views are supported with IR ComplexView
+        _warn_complex_not_supported()
+        return True
+
+    if t.is_meta:
+        return True
+
+    if t.is_sparse:
+        return True
+
+    if not is_triton_fp8_dtype_supported(t.dtype, t.device):
+        from .codegen.triton_utils import (
+            use_uint8_triton_storage_for_cuda_float8_e4m3fn,
+        )
+
+        if not use_uint8_triton_storage_for_cuda_float8_e4m3fn(
+            t.dtype, device=t.device
+        ):
+            return True
+
+        # uint8 storage reinterprets fp8 bytes: allow bitcast, views, memory
+        # movement, and dequant (convert out of fp8)
+        if not node:
+            return True
+        return not (
+            isinstance(node.target, tp.ops.OpOverload)
+            and node.target
+            in (
+                aten.view.dtype,
+                aten.cat.default,
+                aten.clone.default,
+                aten._scaled_mm.default,
+                aten._scaled_mm_v2.default,
+                _CONVERT_ELEMENT_TYPE,
+            )
+            or (isinstance(node.target, tp.ops.OpOverload) and is_view(node.target))
+        )
+
+    if t.dtype == tp.float8_e8m0fnu:
+        if not node:
+            return True
+
+        # Allow bitcasts, views, memory movement, and supported conversions,
+        # but not arithmetic.
+        if not isinstance(node.target, tp.ops.OpOverload):
+            return True
+        if node.target in (
+            aten.view.dtype,
+            aten.cat.default,
+            aten.clone.default,
+            aten._scaled_mm.default,
+            aten._scaled_mm_v2.default,
+        ) or is_view(node.target):
+            return False
+        if node.target == _CONVERT_ELEMENT_TYPE:
+            return not (
+                len(node.args) >= 2 and node.args[1] in _FLOAT8_E8M0FNU_TO_FLOAT_DTYPES
+            )
+        return True
+
+    return False
+
+
+def unsupported_output_tensor(t: tp.Tensor, node=None):
+    "Do not support writing tensor but can read from it"
+    supported_complex_views = (
+        aten.view.dtype,
+        _CONVERT_ELEMENT_TYPE,
+    )
+    if node is not None and node.target in supported_complex_views and t.is_complex():
+        return False
+    if unsupported_input_tensor(t, node):
+        return True
+    if not is_triton_fp8_dtype_supported(t.dtype, t.device):
+        return True
+    return t.is_cpu and config.disable_cpp_codegen
+
+
+def fallback_node_due_to_unsupported_type(node, allow_cpu_inputs=True):
+    # Custom fallback lowering
+    if node.target is aten.view_as_complex.default:
+        return False
+
+    if node.op == "placeholder":
+        return False
+
+    # We should be able to remove this special case once `disable_cpp_codegen` is killed.
+    if node.target is aten.lift_fresh_copy.default:
+        return False
+
+    def check_skip_condition(inp_out_node, is_output):
+        if not isinstance(inp_out_node, Node):
+            return False
+
+        if "val" not in inp_out_node.meta:
+            return False
+
+        for meta in tree_leaves(inp_out_node.meta["val"]):
+            # The value recorded on a node is what a lowering reads the type
+            # from, and only a tensor carries a type; anything else in the
+            # position says nothing about what the node holds.
+            if not isinstance(meta, tp.Tensor):
+                continue
+
+            if is_output:
+                if unsupported_output_tensor(meta, node):
+                    return True
+            else:
+                if unsupported_input_tensor(meta, node):
+                    return True
+
+        return False
+
+    # only skip codegen if there is a cpu output, not input
+    for arg in arg_tree_leaves(*node.args, **node.kwargs):
+        if check_skip_condition(arg, is_output=False):
+            return True
+
+    return check_skip_condition(node, is_output=True)
 
 LOWERINGS: dict[str, Callable[..., Any]] = {}
 

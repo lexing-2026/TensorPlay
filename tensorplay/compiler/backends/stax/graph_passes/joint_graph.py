@@ -46,6 +46,11 @@ PatternMatcherPass = functools.partial(
 )
 
 log = logging.getLogger(__name__)
+
+#: The key under which a graph records that a matmul standing in for a grouped
+#: matmul is to be left as it is.  Nothing here sets it, so the check that
+#: reads it is the answer "no" the key not being there already gives.
+_PRESERVE_FLEX_GEMM_GEMM_OP = "preserve_flex_gemm_gemm_op"
 early_patterns = PatternMatcherPass()
 patterns = PatternMatcherPass()
 aten = tp.ops.tp

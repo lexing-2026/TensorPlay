@@ -1935,9 +1935,14 @@ def register_replacement(
         )
 
         sym_args: list[Any] = []
+        # The recheck works out the extents the first match ignored, and an
+        # extent that is not yet a number has to be worked out against
+        # something.  A region in which a tensor stands for a value is that
+        # something: the one already open is the region the values were made
+        # in, and where there is none, one opened here does the same work.
         fake_mode = detect_fake_mode(args)
         if fake_mode is None:
-            raise AssertionError("fake_mode is None")
+            fake_mode = FakeTensorMode()
         with fake_mode:
             invalid_args = False
             requires_grad_values = iter(pytree.tree_leaves(requires_grad))
@@ -1957,8 +1962,7 @@ def register_replacement(
                     arg.stride(),
                     dtype=arg.dtype,
                     device=arg.device,
-                    requires_grad=grad,
-                )
+                ).requires_grad_(grad)
                 for v in itertools.chain(refreshed_arg.shape, refreshed_arg.stride()):
                     if isinstance(v, tp.SymInt) and all(
                         statically_known_true(v != a) for a in sym_args

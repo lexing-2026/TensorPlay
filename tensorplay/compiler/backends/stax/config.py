@@ -1410,3 +1410,9 @@ worker_start_method: str = decide_worker_start_method()
 quiesce_async_compile_pool: bool = (
     os.environ.get("TP_QUIESCE_ASYNC_COMPILE_POOL", "1") == "1"
 )
+
+
+#: Whether a computation the host is able to run is written for the host rather
+#: than for the device, which decides whether a node holding a value the device
+#: cannot read is skipped rather than lowered.
+disable_cpp_codegen: bool = False

@@ -7,6 +7,11 @@ from typing import Any
 
 import tensorplay as tp
 from tensorplay.primitives.common import is_contiguous as _is_contiguous
+from tensorplay.utils._dispatch import _disable_current_modes
+
+#: Run the block with no dispatch mode active.  Reading what a value is made
+#: of is not a computation, and a mode that is recording would record it.
+no_dispatch = _disable_current_modes
 
 #: The tensor type, named as the signatures here name it.
 Tensor = tp.Tensor
