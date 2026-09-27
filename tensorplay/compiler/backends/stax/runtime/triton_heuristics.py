@@ -1015,6 +1015,8 @@ class CachingAutotuner(KernelInterface):
         self.launchers: list = []
         self.compile_results: list = []
         self._cached_launcher = None
+        # The profiler range covering the launch in progress, if one is open.
+        self._profiler_ctx = None
         # Why each configuration could not be measured, keyed by the
         # configuration.  Kept apart from a time so that "could not run" is
         # never mistaken for "ran slowly".
@@ -1552,6 +1554,52 @@ class CachingAutotuner(KernelInterface):
         result = self._precompile_config(cfg)
         self.compile_results = [result]
         return result.make_launcher()
+
+    def get_profiler_kwargs(self, stream, launcher):
+        """What a profiler is told about the kernel being launched.
+
+        Enough to find the launch again in a trace and to say what it was
+        doing: which file it came from, what it is called, the shape of the
+        configuration, and the stream it ran on.  The optional entries are only
+        present when the build knew them, so a trace does not carry empty
+        fields for things nobody measured.
+        """
+
+        kernel_kwargs_str = ",".join(
+            f"{k}={v}" for (k, v) in launcher.config.kwargs.items()
+        )
+
+        ret = {
+            "kernel_file": (self.filename or ""),
+            "kernel_hash": self.kernel_hash,
+            "kernel_backend": "triton",
+            "stream": stream,
+            "num_warps": launcher.config.num_warps,
+            "num_stages": launcher.config.num_stages,
+            "kernel_kwargs": kernel_kwargs_str,
+        }
+        if "kernel_name" in self.inductor_meta:
+            ret["kernel_name"] = self.inductor_meta["kernel_name"]
+        if "kernel_flop" in self.inductor_meta:
+            ret["kernel_flop"] = self.inductor_meta["kernel_flop"]
+        if "kernel_num_gb" in self.inductor_meta:
+            ret["kernel_num_gb"] = self.inductor_meta["kernel_num_gb"]
+        return ret
+
+    def _post_launch(self) -> None:
+        """Close whatever the launch opened, whether or not it succeeded.
+
+        A profiler range that is entered and not left is a range that never
+        ends, which is worse than not having recorded the launch at all.  So
+        this is what the caller runs after the launch whatever the launch did.
+        """
+
+        if (profiler_ctx := self._profiler_ctx) is not None:
+            self._profiler_ctx = None
+            profiler_ctx.__exit__(None, None, None)
+        if (debug_call := self._debug_call) is not None:
+            self._debug_call = None
+            debug_call.finalize(self.get_device_interface())
 
     def precompile(
         self,
