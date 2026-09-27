@@ -33,6 +33,7 @@ import tensorplay as tp
 from .. import metrics
 from ..utils import (
     compute_required_storage_length,
+    counters,
     GPU_KERNEL_BIN_EXTS,
     TMA_ALIGNMENT,
     XPU_KERNEL_FORMAT,
@@ -1098,6 +1099,352 @@ class CachingAutotuner(KernelInterface):
         return all(
             isinstance(x, StaticTritonCompileResult) for x in self.compile_results
         )
+
+    def _build_fast_launcher(self, launcher: Any) -> Any | None:
+        """A launcher that skips the work every launch would otherwise repeat.
+
+        A launcher is a generated function that reads the kernel's arguments,
+        works out what to hand the driver, and hands it over.  In the steady
+        state all of that is the same work on every launch, for one kernel and
+        one set of arguments, so it can be done once and the result called
+        directly.
+
+        This is only a saving when the kernel is a compiled binary called
+        through a single function pointer, and where the arguments are not
+        variable in number.  A binary whose handles are kept per device is not
+        one function pointer, a kernel that expands a variable-length descriptor
+        does the expansion in the launcher, and a device that stores its kernels
+        differently is not reachable this way at all.  Where any of that holds
+        the ordinary launcher is correct and this declines to make anything.
+        """
+
+        import types
+
+        if not self.inductor_meta.get("use_fast_triton_launcher", False):
+            return None
+        # The arguments are expanded by the ordinary launcher, so a launcher
+        # that skips it would hand the driver an argument it never built.
+        if self.inductor_meta.get("host_tma_descriptor_args"):
+            return None
+        if self.device_props.type not in ("cuda", "hip"):
+            return None
+        try:
+            from tensorplay._C import _FastCudaLauncher
+        except ImportError:
+            return None
+
+        try:
+            if not getattr(launcher, "_is_static", False):
+                return None
+            runner = launcher.__globals__.get("runner")
+            if not callable(runner):
+                return None
+            kernel = runner.__self__
+            # Handles kept per device means there is no single function pointer
+            # to bind, so the per-device launcher is the one to use.
+            if getattr(kernel, "device_agnostic", False):
+                return None
+            if getattr(kernel, "global_scratch_size", 0):
+                return None
+            cu_function = kernel.function
+            num_warps = kernel.num_warps
+            shared = kernel.shared
+            arg_tys = kernel.arg_tys
+            if cu_function is None or num_warps is None:
+                return None
+
+            new_launcher = _FastCudaLauncher(
+                cu_function,
+                arg_tys,
+                num_warps,
+                shared,
+                self.fn,
+            )
+            scope = dict(launcher.__globals__)
+            scope["runner"] = new_launcher
+            new_launcher = types.FunctionType(
+                launcher.__code__,
+                scope,
+                launcher.__name__,
+                launcher.__defaults__,
+                launcher.__closure__,
+            )
+            # Everything the ordinary launcher carried, and the one thing it does
+            # not carry: the kernel itself.  The fast launcher binds a function
+            # pointer and never reads it again, so without something holding the
+            # kernel, the kernel can be closed while this is still cached and
+            # callable, and the pointer it holds becomes a pointer to nothing.
+            for attr in (
+                "config",
+                "n_regs",
+                "n_spills",
+                "shared",
+                "cache_hash",
+                "store_cubin",
+                "_is_static",
+                "_expected_positional_count",
+            ):
+                val = getattr(launcher, attr, None)
+                if val is not None:
+                    setattr(new_launcher, attr, val)
+            new_launcher._static_kernel_owner = kernel
+            return new_launcher
+        except (AttributeError, TypeError, KeyError, ValueError):
+            return None
+        except Exception:
+            log.warning("Unexpected error building fast launcher", exc_info=True)
+            return None
+
+    def _pre_launch(self, launcher, *args: Any, stream: Any, **kwargs: Any) -> None:
+        """What is settled before a launch happens.
+
+        A launch is a thing that can be timed, and a measurement is worth being
+        able to point at afterwards.  What is held open here is what would be
+        said about this launch, and nothing that could stop the launch: a launch
+        that raised still has to have whatever was held open settled, which is
+        what the other half is for.
+        """
+
+        self._profiler_ctx = None
+
+    def _post_launch(self) -> None:
+        """What is settled after a launch, whether or not it raised."""
+
+        self._profiler_ctx = None
+
+    def run(
+        self,
+        *args: Any,
+        stream: Any,
+        benchmark_run: bool = False,
+        **kwargs: Any,
+    ):
+        """Launch the kernel, compiling and measuring first if that has not been done.
+
+        In the steady state this is a launch and nothing else: once there is one
+        launcher there is no question left to answer, and re-asking it on every
+        launch is a cost on the path where a launch is timed.  What is checked
+        every time is only what can change at run time, so that turning any of
+        it on later falls back to the slower path rather than being ignored.
+        """
+
+        fast = self._cached_launcher
+        if (
+            fast is not None
+            and not benchmark_run
+            and not kwargs
+            and not self.triton_interpret
+        ):
+            return fast(*args, stream=stream)
+
+        if self.triton_interpret:
+            args, grid = self._interpret_args_grid(args, self.configs[0])
+            return self.fn[grid](
+                *args,
+                **kwargs,
+                **self.configs[0].kwargs,
+            )
+
+        for plugin in self._plugins:
+            if (
+                result := plugin.pre_dispatch(self, *args, stream=stream, **kwargs)
+            ) is not DEFER:
+                return result
+
+        if len(self.launchers) != 1:
+            if len(self.launchers) == 0:
+                start_time = time.time_ns()
+                self.precompile()
+                self.precompile_time_taken_ns = time.time_ns() - start_time
+            if len(self.launchers) > 1:
+                for plugin in self._plugins:
+                    if (
+                        result := plugin.pre_autotune(
+                            self, *args, stream=stream, **kwargs
+                        )
+                    ) is not DEFER:
+                        return result
+                # Asked again, because a plugin is free to have left exactly one.
+                if len(self.launchers) > 1:
+                    self.autotune_to_one_config(*args, **kwargs)
+
+        if not getattr(
+            self.launchers[0].config, "found_by_coordesc", False
+        ) and self.inductor_meta.get("coordinate_descent_tuning", False):
+            self.launchers = [
+                self.coordinate_descent_tuning(self.launchers[0], *args, **kwargs)
+            ]
+
+        (launcher,) = self.launchers
+        # Recorded here as well as where the launcher was chosen, because for a
+        # kernel with one configuration there is no choosing to do: this is the
+        # only place that knows which one it was.
+        TritonBundler.put_winner(launcher.cache_hash)
+
+        try:
+            self._pre_launch(launcher, *args, stream=stream, **kwargs)
+            try:
+                result = launcher(*args, **kwargs, stream=stream)
+            except Exception as e:
+                if isinstance(e, TypeError):
+                    self._check_launcher_call_args(launcher, args)
+                raise
+        finally:
+            self._post_launch()
+
+        # The launcher is remembered only where nothing about the launch can
+        # change what should happen: a measurement, arguments this path has not
+        # been asked about, anything being recorded about the arguments, and
+        # more than one launcher all mean the question is still open.
+        if (
+            self._cached_launcher is None
+            and not benchmark_run
+            and not self.triton_interpret
+            and len(self.launchers) == 1
+        ):
+            self._cached_launcher = self._build_fast_launcher(launcher) or launcher
+        return result
+    def get_profiler_kwargs(self, stream, launcher) -> dict[str, Any]:
+        """What to record about a launch, so a profile can attribute it.
+
+        A profile says a kernel took some time; what is wanted is which kernel,
+        compiled how, from what, run on what -- because a number with none of
+        that is a number nobody can act on.
+        """
+
+        kernel_kwargs_str = ",".join(
+            f"{k}={v}" for (k, v) in launcher.config.kwargs.items()
+        )
+
+        ret = {
+            "kernel_file": (self.filename or ""),
+            "kernel_hash": self.kernel_hash,
+            "kernel_backend": "triton",
+            "stream": stream,
+            "num_warps": launcher.config.num_warps,
+            "num_stages": launcher.config.num_stages,
+            "kernel_kwargs": kernel_kwargs_str,
+        }
+        if "kernel_name" in self.inductor_meta:
+            ret["kernel_name"] = self.inductor_meta["kernel_name"]
+        if "kernel_flop" in self.inductor_meta:
+            ret["kernel_flop"] = self.inductor_meta["kernel_flop"]
+        if "kernel_num_gb" in self.inductor_meta:
+            ret["kernel_num_gb"] = self.inductor_meta["kernel_num_gb"]
+        return ret
+
+    @property
+    def _should_coordesc_tune(self) -> bool:
+        """Whether this kernel's configuration may be tuned one knob at a time.
+
+        Not for a kernel whose configuration was chosen rather than searched
+        for: a template's configuration says what the template's text asks for,
+        and a kernel the user wrote is theirs to tune.  And not where the
+        answer has to be a particular number, because the knobs here are block
+        sizes and warp counts, and both change the order a sum is taken in.
+        """
+
+        if self.heuristic_type in (
+            HeuristicType.TEMPLATE,
+            HeuristicType.USER_AUTOTUNE,
+            HeuristicType.FIXED,
+        ):
+            return False
+        if (
+            self.deterministic_mode or "strict_reduction_rblock" in self.inductor_meta
+        ) and self.heuristic_type in (
+            HeuristicType.REDUCTION,
+            HeuristicType.PERSISTENT_REDUCTION,
+            HeuristicType.SPLIT_SCAN,
+        ):
+            return False
+        return True
+
+    def coordinate_descent_tuning(self, launcher, *args, **kwargs):
+        """Tune the configuration one knob at a time, starting from this one.
+
+        Which knob is tried first depends on where this starts, and where it
+        starts depends on whether everything was measured first: with the whole
+        set measured there is a measured best to start from, and without one
+        there is only the configuration that was chosen to begin with.  Both are
+        the same descent from a different place, which is why the difference is
+        only where it starts.
+        """
+
+        if not self._should_coordesc_tune:
+            return launcher
+
+        from .runtime_utils import timed_block
+
+        with timed_block(
+            "CachingAutotuner.coordinate_descent_tuning", log_pt2_compile_event=False
+        ):
+            return self._coordinate_descent_tuning(launcher, *args, **kwargs)
+
+    def _coordinate_descent_tuning(self, launcher, *args, **kwargs):
+        """The descent itself: change one thing, measure, keep it only if it won.
+
+        A configuration is compiled and measured here rather than reused, because
+        a configuration that has never been run on these arguments has not been
+        measured -- and the descent is about what happens on these arguments.
+        The launchers are kept by configuration so that a configuration the
+        descent arrives at twice is not compiled twice.
+        """
+
+        config2launcher = {launcher.config: launcher}
+
+        self._ensure_kernel_loaded()
+
+        def benchmark_one_config(config):
+            with self.lock:
+                launcher = self._precompile_config(config).make_launcher()
+            config2launcher[config] = launcher
+
+            out = self.bench(launcher, *args, **kwargs)
+            counters["inductor"]["coordesc_tuning_bench"] += 1
+            log.debug(
+                "COORDESC: %s: %f, nreg %d, nspill %d, #shared-mem %d",
+                launcher.config,
+                out,
+                launcher.n_regs,
+                launcher.n_spills,
+                launcher.shared,
+            )
+            return out
+
+        if (
+            self.heuristic_type == HeuristicType.PERSISTENT_REDUCTION
+            and "R0_BLOCK" in launcher.config.kwargs
+        ):
+            raise AssertionError(
+                "the tuner here relies on a persistent reduction's configuration "
+                "having no reducing block of its own"
+            )
+        start_time = time.time_ns()
+        best_config = self.coordesc_tuner.autotune(
+            benchmark_one_config, launcher.config, None
+        )
+        coordesc_time_taken_ns = time.time_ns() - start_time
+        best_config.found_by_coordesc = True
+
+        if self.save_cache_hook:
+            self.save_cache_hook(
+                best_config,
+                self.autotune_time_taken_ns + coordesc_time_taken_ns,
+                found_by_coordesc=True,
+            )
+
+        if best_config not in config2launcher:
+            # An answer read back from a cache names a configuration whose
+            # launcher may never have been built in this process: what was kept
+            # is the answer, and the thing that runs was not kept with it.
+            config2launcher[best_config] = self._precompile_config(
+                best_config
+            ).make_launcher()
+
+        winner = config2launcher[best_config]
+        TritonBundler.put_winner(winner.cache_hash)
+        return winner
 
     @staticmethod
     def _close_static_launcher(launcher: Any) -> None:
