@@ -49,7 +49,10 @@ def get_interface_for_device(device_type: str | tp.device | None = None) -> Any:
         device_type = get_gpu_type()
     elif isinstance(device_type, tp.device):
         device_type = device_type.type
-    return tp.get_device_module(device_type)
+
+    from .device_interface import get_device_interface
+
+    return get_device_interface(device_type)
 
 
 GPU_BENCHMARK_DEVICE_TYPES = ("cuda", "xpu", "mtia")

@@ -326,6 +326,20 @@ void init_device(py::module_& m) {
 #endif
     });
 
+    // The stream a device is currently running on, as the number a kernel
+    // launch is given.  Generated code asks for this by name rather than going
+    // through the stream object, because a launch is handed the number and
+    // building a stream object only to take it apart again is work on the path
+    // where a launch is timed.
+    m.def("_cuda_getCurrentRawStream", [](int64_t device_index) -> int64_t {
+#ifdef USE_CUDA
+        return static_cast<int64_t>(
+            tensorplay::cuda::getCurrentCUDAStream(device_index).id());
+#else
+        throw std::runtime_error("CUDA is not available");
+#endif
+    });
+
     cuda.def("set_device", [](int device) {
 #ifdef USE_CUDA
         cudaError_t err = cudaSetDevice(device);
