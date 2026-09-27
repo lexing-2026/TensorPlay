@@ -1158,14 +1158,62 @@ def alert_not_deterministic(caller: str) -> None:
     )
 
 
+def _device_index(device) -> int:
+    """Which device an index refers to, with nothing meaning the current one."""
+
+    if device is None:
+        return tensorplay.cuda.current_device()
+    index = getattr(device, "index", device)
+    return -1 if index is None else int(index)
+
+
 class CUDARngStateHelper:
-    """Register-scope helper capturing the RNG offset context for kernels."""
+    """Reading and writing where a device's stream of random values is.
 
-    def __enter__(self):
-        return self
+    A position in that stream is a number too large for one value, so it is
+    two: which stream, and how far along it.  The device keeps the two as one
+    piece of state, and these are the three things one asks of it -- where it
+    is, what it should be, and how far to skip -- which is the whole of what
+    making a graph of random operations reproducible needs: the same position
+    read twice gives the same values, and a position is reachable from another
+    one by adding how many values were read in between.
+    """
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        return False
+    @staticmethod
+    def get_torch_state_as_tuple(device=None):
+        """The (seed, offset) the device is at, as two whole numbers."""
+
+        if not tensorplay._C._cuda.is_available():
+            raise RuntimeError("CUDA not available")
+
+        seed = int(tensorplay._C._cuda.current_seed(_device_index(device)))
+        offset = int(tensorplay._C._cuda._get_rng_state_offset(_device_index(device)))
+        return seed, offset
+
+    @staticmethod
+    def set_torch_state_tensor(seed, offset):
+        """Put the device at the position a (seed, offset) pair names.
+
+        The pair is two values and the device keeps one piece of state, so they
+        are joined end to end and taken apart again on the way in: the state is
+        a run of bytes, and which bytes are the seed and which are how far along
+        is a matter of where each value starts.
+        """
+
+        # The state is a 64-bit seed followed by a 64-bit offset.  Each is
+        # turned into its bytes on the host first: the state the device reads is
+        # a run of bytes, and a value has to be somewhere it can be read from
+        # before it can be one of them.
+        seed_portion = seed.reshape([1]).cpu().view(tensorplay.uint8)
+        offset_portion = offset.reshape([1]).cpu().view(tensorplay.uint8)
+        new_state = tensorplay.cat([seed_portion, offset_portion])
+        tensorplay._C._cuda.set_rng_state(new_state, _device_index(seed.device))
+
+    @staticmethod
+    def set_new_offset(relative_offset):
+        """Skip forward by a number of values read."""
+
+        tensorplay._C._cuda._set_rng_state_offset(int(relative_offset), _device_index(relative_offset.device))
 
 
 def get_tensorplay_op(fn, name: str):

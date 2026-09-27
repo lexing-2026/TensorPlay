@@ -524,6 +524,33 @@ void init_device(py::module_& m) {
 #endif
     }, "device"_a = -1);
 
+    // Where the stream of random values was left off, and the ability to say
+    // where it starts.  Both are needed to make a graph of random operations
+    // reproducible: the same seed read at the same position gives the same
+    // values, and a position is a seed together with how far the stream was
+    // already read.  Setting the offset is what lets one operation's answer be
+    // folded into the next one's position instead of both reading the same one.
+    cuda.def("_get_rng_state_offset", [](int device) {
+#ifdef USE_CUDA
+        tensorplay::cuda::CUDAGuard guard(device);
+        return tensorplay::cuda::current_offset();
+#else
+        (void)device;
+        throw std::runtime_error("CUDA is not available");
+#endif
+    }, "device"_a = -1);
+
+    cuda.def("_set_rng_state_offset", [](uint64_t offset, int device) {
+#ifdef USE_CUDA
+        tensorplay::cuda::CUDAGuard guard(device);
+        tensorplay::cuda::set_offset(offset);
+#else
+        (void)offset;
+        (void)device;
+        throw std::runtime_error("CUDA is not available");
+#endif
+    }, "offset"_a, "device"_a = -1);
+
 #ifdef USE_CUDA
     cuda.def("current_stream", [](int device) {
         return tensorplay::cuda::getCurrentCUDAStream(device);
