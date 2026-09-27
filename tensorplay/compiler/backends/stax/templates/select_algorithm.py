@@ -18,6 +18,7 @@ import operator
 import os
 import sympy
 import textwrap
+from unittest.mock import patch
 from typing import NamedTuple
 
 from typing import Any, Callable, Iterator
@@ -49,11 +50,12 @@ from .triton import CHOICES
 from ..codegen.subgraph import SubgraphChoiceCaller
 from ..codegen.simd import IterationRangesEntry, IterationRangesRoot
 from ..codegen.common import CSE, IndentedBuffer, OpOverrides
-from ..codegen.triton import texpr
+from ..codegen.triton import IndexingOptions, texpr
 from ..utils import (
     get_dtype_size,
     sympy_dot,
     sympy_product,
+    triton_type,
     triton_type_to_torch,
     unique,
 )
@@ -1334,6 +1336,201 @@ class TritonTemplateKernel:
         if self.body.getvalue() != "":
             raise AssertionError("Body should be clear before adding a modification")
         return self.subgraphs[subgraph_number]
+
+    def load_input(
+        self,
+        input_name: str,
+        output_name: str,
+        indices: list[Any] | tuple[Any],
+        mask: str | None = None,
+        other: float | int | None = 0.0,
+        indent_width: int = 4,
+        index_shape: tuple[str] | None = None,
+    ) -> str:
+        """Read one of the kernel's operands, and leave a placeholder for it.
+
+        The body cannot say where to read from, because the body does not know
+        the operand's layout -- the kernel does.  So the body names the operand
+        and one thing per dimension, and the read itself is left as a
+        placeholder and filled in once the layout is known.
+
+        A `mask` says which of those are really there.  `other` is what the
+        ones that are not read as, which is not the same as zero once
+        something has been folded into this operand: a prologue that adds a
+        bias would otherwise add it to the padding too, so the mask is applied
+        again after the fold.
+
+        A body whose indices wrap around rather than run off the end (the
+        matrix-multiply templates do) passes no mask, and that is not the same
+        as passing one that says everything is there -- so "no mask" is
+        recorded as its own value rather than as nothing.
+        """
+
+        input_node = self.named_input_nodes[input_name]
+        if not self.prologue_loads_all_inputs:
+            self.prologue_supported_inputs.add(input_node.get_name())
+
+        tilings = (sympy_product(input_node.get_size()), sympy.Integer(1))
+        groups = {
+            "x": tilings[0],
+            "r0_": tilings[1],
+        }
+
+        range_trees = self.construct_range_trees(
+            pid_cache=None,
+            inside_reduction=False,
+            is_reduction=False,
+            numels=groups,
+            no_x_dim=False,
+        )
+        load_code = None
+
+        with self.create_subgraph_body(f"<LOAD_INPUT_{input_name}>"):
+            if not isinstance(indices, (list, tuple)):
+                raise AssertionError(
+                    f"expected indices to be list or tuple, got {type(indices)}"
+                )
+            if not isinstance(output_name, str):
+                raise AssertionError(
+                    f"expected output_name to be str, got {type(output_name)}"
+                )
+            if not isinstance(mask, (str, type(None))):
+                raise AssertionError(
+                    f"expected mask to be str or None, got {type(mask)}"
+                )
+            self.range_trees = range_trees
+            self.numels = {k: V.graph.sizevars.simplify(v) for k, v in groups.items()}
+            indices = list(map(OpOverrides.paren, indices))
+            index_symbols = [sympy.Symbol(x, integer=True) for x in indices]
+
+            lengths = [V.graph.sizevars.simplify(s) for s in input_node.get_size()]
+            if len(indices) != len(lengths):
+                raise AssertionError(
+                    f"expected len(indices) == len(lengths), got {len(indices)} and {len(lengths)}"
+                )
+
+            # MM templates use out-of-bounds wrapping (e.g. `rm % M`) so no mask
+            # is needed on the load.  Pass "None" when mask is unset to override
+            # the mask that would otherwise be inherited.
+            contiguous_index = self._setup_contiguous_index_state(
+                indices,
+                index_symbols,
+                lengths,
+                mask=mask if mask is not None else "None",
+            )
+            self.template_out_shape = index_shape if index_shape else "xindex"
+            self.cse.invalidate(OrderedSet())
+
+            template_mask = self.template_mask
+
+            class StoreOutputSubstitution(V.WrapperHandler):
+                """Stands in for a store while this load is being read.
+
+                A prologue is lowered as a store into the operand it reads, and
+                that is not a store to memory -- it is the value this load is
+                supposed to produce.  So the store is caught here and turned
+                into an assignment, reapplying the mask, because what was read
+                as zero for the elements past the end is not zero once
+                something has been folded in.
+                """
+
+                name = "StoreOutputSubstitution"
+
+                def store(
+                    self,
+                    name: str,
+                    index: sympy.Expr,
+                    value: "CSEVariable",
+                    mode=None,
+                ):
+                    V.kernel.store_buffer_names.add(name)
+                    V.kernel.cse.store_cache[name] = value
+                    if name in V.kernel.prologue_fused_inputs:
+                        # We load masked out values with 0, then apply a prologue.
+                        # The masked out values may not necessarily be 0 any more
+                        # so we need to reapply the mask.
+                        value_dtype = value.dtype
+                        value_str = str(value)
+                        if template_mask != "None" and (
+                            name not in V.kernel.prologue_fused_inputs_preserve_zero
+                            or other != 0
+                        ):
+                            value_str = (
+                                f"tl.where({template_mask}, {value_str}, {other})"
+                            )
+
+                        if value_dtype != V.graph.get_buffer(name).dtype:
+                            value_str = f"{value_str}.to({triton_type(V.graph.get_buffer(name).dtype)})"
+
+                        V.kernel.compute.writeline(
+                            f"{output_name} = {value_str}.broadcast_to(xindex.shape)"
+                        )
+
+            self.ops_handler = StoreOutputSubstitution
+
+            input_node = self.named_input_nodes[input_name]
+            if isinstance(input_node.layout, FlexibleLayout):
+                # This will set a layout constraint on the template
+                self.get_stride_and_maybe_freeze_layout(input_node)
+                with patch.object(FlexibleLayout, "allow_indexing", True):
+                    output_index = input_node.make_indexer()(index_symbols)
+            else:
+                output_index = input_node.make_indexer()(index_symbols)
+
+            # in def_kernel above we define the inputs with the storage offset adjusted
+            # creating the load in input_node.make_indexer() will also adjust by storage offset
+            # so subtract here to not double increment
+            if not V.graph.sizevars.statically_known_equals(
+                input_node.layout.offset, 0
+            ):
+                output_index = output_index - self.rename_indexing(
+                    input_node.get_layout().offset
+                )
+
+            output_index = self.rename_indexing(output_index)
+
+            if output_index == contiguous_index:
+                output_index_str = "xindex"
+            else:
+                out_indexing = self.indexing(
+                    output_index,
+                    copy_shape=self.template_out_shape,
+                    override_mask=self.template_mask,
+                )
+                if not isinstance(out_indexing, IndexingOptions):
+                    raise AssertionError(
+                        f"expected out_indexing to be IndexingOptions, got {type(out_indexing)}"
+                    )
+                output_index_str = (
+                    f"({out_indexing.index_str}).broadcast_to(xindex.shape)"
+                )
+
+            # Generate load code
+            load_code = f"{output_name} = tl.load({input_name} + ({output_index_str})"
+
+            if mask:
+                load_code += f", mask={mask}, other={other})"
+            else:
+                load_code += ")"
+
+        hook_key = f"<LOAD_INPUT_{input_name}>"
+
+        def hook():
+            with self.set_subgraph_body(hook_key):
+                self.cse.invalidate(OrderedSet())
+                self.codegen_body()
+                self.cse.invalidate(OrderedSet())
+                if input_node.get_name() not in self.prologue_fused_inputs:
+                    if load_code is None:
+                        raise AssertionError("load_code must not be None")
+                    self.body.writeline(load_code)
+
+                result = self.body.getvalue()
+                if indent_width:
+                    result = textwrap.indent(result, " " * indent_width)
+                return result.strip()
+
+        return self._register_hook(hook_key, hook)
 
     def get_stride_and_maybe_freeze_layout(self, node) -> list[int]:
         """The strides a body should see for one of the kernel's operands.

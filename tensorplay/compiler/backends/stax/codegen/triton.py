@@ -52,6 +52,25 @@ except ImportError:  # pragma: no cover - until that machinery is here
     SIMDKernel = object
 
 
+@dataclasses.dataclass
+class IndexingOptions:
+    """An index worked out for one load or one store.
+
+    An index is more than a number: it may need a mask saying which elements
+    are really there, and it may be broadcast to a shape wider than the thing
+    it indexes.  So the number comes back with those two, rather than having
+    them worked out again by whoever uses it.
+    """
+
+    index_str: str
+    mask_vars: OrderedSet[str]
+    expand_str: str | None
+    _has_rindex: bool
+    index: sympy.Expr
+    expand_shape: Sequence[int | str] | None
+    reduction_axes_omitted: bool = False
+
+
 class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
     """A launch written for the kernel-writing runtime.
 
