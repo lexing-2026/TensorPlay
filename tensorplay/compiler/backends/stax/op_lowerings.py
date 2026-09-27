@@ -3089,7 +3089,7 @@ def to_dtype(x: Any, dtype: Any, copy: bool = False) -> Any:
 
     def _to_dtype(value: Any) -> Any:
         result = ops.to_dtype(value, dtype, src_dtype=src_dtype)
-        if dtype in (torch.bfloat16, torch.float16):
+        if dtype in (tp.bfloat16, tp.float16):
             result = ops.to_dtype(result, "float32")
         return result
 
@@ -3149,7 +3149,7 @@ def _make_scan_inner(x: Any, *, axis: Any, dtype: Any) -> dict:
 
 
 @register_lowering(aten.cumsum)
-def cumsum(x: Any, axis: Any = None, dtype: Any = None) -> Any:
+def cumsum(x: Any, dim: Any = 0, dtype: Any = None) -> Any:
     """Running totals along one axis.
 
     A total of whole numbers is not a whole number until it is asked to be, and
@@ -3160,10 +3160,10 @@ def cumsum(x: Any, axis: Any = None, dtype: Any = None) -> Any:
     if (
         is_integer_dtype(x.get_dtype()) or is_boolean_dtype(x.get_dtype())
     ) and dtype is None:
-        dtype = torch.int64
+        dtype = tp.int64
 
     if len(x.get_size()) == 0:
-        if axis not in [0, -1]:
+        if dim not in [0, -1]:
             raise AssertionError("expected: axis in [0, -1]")
         dtype = dtype or x.get_dtype()
         return to_dtype(x, dtype, copy=True)
@@ -3173,15 +3173,15 @@ def cumsum(x: Any, axis: Any = None, dtype: Any = None) -> Any:
         (b,) = b_tuple
         return (ops.add(a, b),)
 
-    kwargs = _make_scan_inner(x, axis=axis, dtype=dtype)
+    kwargs = _make_scan_inner(x, axis=dim, dtype=dtype)
     (result,) = ir.Scan.create(**kwargs, combine_fn=combine_fn)
     if result is None:
-        return fallback_cumsum(x, dim=axis, dtype=dtype)
+        return fallback_cumsum(x, dim=dim, dtype=dtype)
     return result
 
 
 @register_lowering(aten.cumprod)
-def cumprod(x: Any, axis: Any = None, dtype: Any = None) -> Any:
+def cumprod(x: Any, dim: Any = 0, dtype: Any = None) -> Any:
     """Running products along one axis.
 
     Widens for whole numbers for the same reason a running total does: a product
@@ -3191,10 +3191,10 @@ def cumprod(x: Any, axis: Any = None, dtype: Any = None) -> Any:
     if (
         is_integer_dtype(x.get_dtype()) or is_boolean_dtype(x.get_dtype())
     ) and dtype is None:
-        dtype = torch.int64
+        dtype = tp.int64
 
     if len(x.get_size()) == 0:
-        if axis not in [0, -1]:
+        if dim not in [0, -1]:
             raise AssertionError("expected: axis in [0, -1]")
         dtype = dtype or x.get_dtype()
         return to_dtype(x, dtype, copy=True)
@@ -3204,15 +3204,15 @@ def cumprod(x: Any, axis: Any = None, dtype: Any = None) -> Any:
         (b,) = b_tuple
         return (ops.mul(a, b),)
 
-    kwargs = _make_scan_inner(x, axis=axis, dtype=dtype)
+    kwargs = _make_scan_inner(x, axis=dim, dtype=dtype)
     (result,) = ir.Scan.create(**kwargs, combine_fn=combine_fn)
     if result is None:
-        return fallback_cumprod(x, dim=axis, dtype=dtype)
+        return fallback_cumprod(x, dim=dim, dtype=dtype)
     return result
 
 
 @register_lowering(aten.logcumsumexp)
-def logcumsumexp(x: Any, dim: Any) -> Any:
+def logcumsumexp(x: Any, dim: Any, dtype: Any = None) -> Any:
     """Running totals of exponents, kept in their logarithm.
 
     Adding two exponents overflows once either is large, so what is added is

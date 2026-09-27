@@ -72,7 +72,33 @@ class PythonPrinter(_PythonPrinter):
             return super().parenthesize(item, level, strict)
 
 from ..ops_handler import DefaultHandler, OpsHandler
-from ..loops import NullKernel, ops, set_kernel_handler, V
+from ..loops import NullKernel, set_kernel_handler, V
+from ..ops_handler import DefaultHandler as _DefaultHandler
+
+
+class _PrinterOps:
+    """The operators a printer spells, taken from the handler that spells them.
+
+    A decomposition says what an operation is in terms of operations the
+    language has, and spelling those is the handler's work rather than the
+    printer's -- reaching for the graph-walking handler here instead asked
+    for a running graph, which at printing time there is not: a decomposition
+    is reached precisely when one operation is written as another, and by
+    then the graph it came from has been walked already.
+    """
+
+    def __getattr__(self, name):
+        # The mixin is asked first: it spells the operations that need no
+        # context, as a function of their operands alone, while the handler's
+        # own methods take the handler.  Both know how to spell a division, and
+        # only one of them can be called with two values.
+        spelled = getattr(BasicMathOpsMixin, name, None)
+        if spelled is not None:
+            return spelled
+        return getattr(_DefaultHandler, name)
+
+
+ops = _PrinterOps()
 from ..utils import (
     DeferredLineBase,
     boolean_ops,
