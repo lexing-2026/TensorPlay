@@ -42,10 +42,12 @@ from tensorplay.utils._pytree import arg_tree_leaves, tree_leaves, tree_map
 
 from . import ir
 from .ir import (
+    BaseView,
     Buffer,
     Constant,
     IndexingConstant,
     DeviceCopy,
+    MutationLayoutSHOULDREMOVE,
     ExpandView,
     FixedLayout,
     FallbackKernel,
@@ -56,6 +58,7 @@ from .ir import (
     ReinterpretView,
     SliceView,
     SqueezeView,
+    MutableBox,
     StorageBox,
     TensorBox,
     View,
@@ -526,6 +529,114 @@ def _register_lowering(
 
     lowering_dict.update(dict.fromkeys(get_overloads(op), wrapped))
     return wrapped
+
+
+def decode_device(device: Any) -> Any:
+    """The device a value is on, as a device rather than as a description of one.
+
+    A device named without saying which one means whichever is current, and a
+    device that is not a processor is always a particular one even when the
+    description left the number out.  So this is where a description becomes
+    something a value can be on.
+    """
+
+    if device is None:
+        return tp.device("cuda", 0)
+    if isinstance(device, str):
+        device = tp.device(device)
+    if device.type not in ("cpu", "meta") and device.index is None:
+        from .runtime.benchmarking import get_interface_for_device
+
+        device_interface = get_interface_for_device(device.type)
+        return tp.device(device.type, index=device_interface.current_device())
+    return device
+
+
+def to_device(x: TensorBox, device: Any, *, copy: bool = False, non_blocking: bool = False):
+    """The same value, on another device.
+
+    A value that is already there is left alone, or copied if the caller asked
+    for a copy rather than a move -- which is a different request, because a move
+    that turned out to be a no-op would not have produced a second value.
+    """
+
+    device = decode_device(device)
+    if x.get_device() == device:
+        return clone(x) if copy else x
+    return TensorBox.create(ir.DeviceCopy.create(x, device, non_blocking))
+
+
+def clone(x: TensorBox, *, memory_format: Any = None):
+    """A second value with the same contents.
+
+    The layout is deliberately not settled here: what shape of memory the copy
+    has is the scheduler's to decide, and deciding it now would take that
+    choice away.  The loader carries whatever strides the value had, and what
+    comes after sorts it out.
+    """
+
+    return Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=x.make_loader(),
+        ranges=list(x.get_size()),
+    )
+
+
+def mutate_to(changed: Any, val: Any, unsafe_alias: bool = False):
+    """Make one value's contents become another's, in the memory the other already has.
+
+    Writing into a buffer that already exists is not a new value: it is the old
+    one, changed.  Which is why this hands back the buffer it was given rather
+    than what was written into it -- a caller that got a new value back would
+    have to be told to write it, and the whole point is that it does not.
+
+    Where the value to write is a view of something, it is first copied into
+    memory of its own, because what is being promised is that the destination
+    holds these contents afterwards, and a view would stop holding them the
+    moment its source changed.
+    """
+
+    if isinstance(changed, TensorBox):
+        changed_data = changed.data
+    else:
+        changed_data = changed
+    if isinstance(val, TensorBox):
+        val = val.data
+
+    if not isinstance(val, ir.StorageBox):
+        # A view cannot be written through, so give the value memory of its own
+        # to be written into.
+        node = Pointwise.create(
+            device=changed.get_device(),
+            dtype=changed.get_dtype(),
+            inner_fn=val.make_loader(),
+            ranges=changed.get_size(),
+        )
+        if not (isinstance(node, (BaseView, MutableBox))):
+            raise AssertionError("expected: isinstance(node, (BaseView, MutableBox))")
+        val = node.data
+        if not (isinstance(val, ir.StorageBox)):
+            raise AssertionError("expected: isinstance(val, ir.StorageBox)")
+
+    if isinstance(changed_data, ir.StorageBox) and not (
+        changed_data.is_input_buffer()
+        # A parameter or a buffer of a module is not an input to the graph, and
+        # swapping what a node points at is how a module's own value would be
+        # replaced rather than written to.
+        or changed_data.is_module_buffer()
+        or isinstance(changed_data.data, ir.NopKernel)
+    ):
+        # Nothing else holds this memory, so the data pointer can simply be
+        # moved across.
+        val.realize()
+        changed_data.data = val.data
+        return changed
+
+    ir.MutationLayoutSHOULDREMOVE.realize_into(
+        val, changed_data, unsafe_alias=unsafe_alias
+    )
+    return changed
 
 
 def get_overloads(op: Any) -> list[Any]:
