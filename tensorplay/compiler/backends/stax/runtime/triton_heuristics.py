@@ -688,6 +688,60 @@ def _find_names(obj):
 collected_calls: list = []
 
 
+def _combo_has_reduction_subkernel(inductor_meta: dict) -> bool:
+    """Whether a kernel of several has one of them reducing.
+
+    A kernel of several is told how big each of its parts is rather than being
+    handed one set of extents, so it arrives here with no extents of its own to
+    reason from; the per-part figures are in the record of which parts there
+    are.  A kernel whose parts were stitched together has its reducing parts
+    pinned when the text was written, so there is nothing to scale there
+    either.
+    """
+
+    combo_meta = inductor_meta.get("combo_grid_meta")
+    if combo_meta is None or "heuristic_0" not in combo_meta:
+        return False
+    if "stitched_num_warps" in combo_meta or "stitched_launch_candidates" in combo_meta:
+        return False
+    return any(
+        combo_meta.get(f"heuristic_{i}") == "reduction"
+        for i in range(combo_meta["num_kernels"])
+    )
+
+
+def _could_dynamic_scale_rblock(
+    *,
+    size_hints: list[int] | None,
+    heuristic_type: Any,
+    device_prop: Any,
+    inductor_meta: dict,
+) -> bool:
+    """Whether a reducing kernel's block could be halved to fit more of them.
+
+    A block is how much one thread works on at once, and how many such blocks
+    fit on a device at once decides how much of the device is busy.  When a
+    block is large enough that fewer of them fit than there is room for, a
+    smaller one is a way of using the device better.  That is a question about
+    the device and about the kind of kernel, and it is worth asking only where
+    the answer would be acted on.
+    """
+
+    return (
+        device_prop is not None
+        and not inductor_meta.get("deterministic", False)
+        and inductor_meta.get("dynamic_scale_rblock", True)
+        and not inductor_meta.get("persistent_reduction")
+        and heuristic_type == HeuristicType.REDUCTION
+        and (size_hints is not None or _combo_has_reduction_subkernel(inductor_meta))
+        and device_prop.type in ["cuda", "hip"]
+        and bool(device_prop.major)
+        and (device_prop.major >= 8 or tp.version.hip)
+        and device_prop.regs_per_multiprocessor is not None
+        and device_prop.warp_size is not None
+    )
+
+
 #: What a plugin hook returns to say it has no opinion, so the next plugin is
 #: asked and failing all of them the ordinary behaviour happens.  Compared
 #: against by identity, so it is a particular object rather than a value: any
@@ -938,6 +992,442 @@ class CachingAutotuner(KernelInterface):
         return all(
             isinstance(x, StaticTritonCompileResult) for x in self.compile_results
         )
+
+    def _could_rblock_scale(self) -> bool:
+        """Whether a block worth halving is worth looking for here.
+
+        Where the answer must be a particular number, halving it changes the
+        order the sum is taken in, so it is not offered at all.
+        """
+
+        if "strict_reduction_rblock" in self.inductor_meta:
+            return False
+        return _could_dynamic_scale_rblock(
+            size_hints=self.size_hints,
+            heuristic_type=self.heuristic_type,
+            device_prop=self.device_props,
+            inductor_meta=self.inductor_meta,
+        )
+
+    @functools.cached_property
+    def _combo_has_reduction_subkernel(self) -> bool:
+        """Whether a kernel of several has one of them reducing.
+
+        Such a kernel arrives with no extents of its own, which is what the
+        extents of a kernel usually are for; the per-part figures are in the
+        record of which parts there are.
+        """
+
+        return _combo_has_reduction_subkernel(self.inductor_meta)
+
+    def _iter_rblock_scale_candidates(self):
+        """Yield each configuration that halves a reducing block.
+
+        Whether any of these is worth having is settled by the caller: what is
+        settled here is which halvings would actually be an improvement, which
+        is a question about how many blocks fit on the device at once and how
+        many the kernel would like to have there.
+        """
+
+        device_prop = self.device_props
+        if not device_prop.regs_per_multiprocessor:
+            raise AssertionError("the device does not say how many registers it has")
+        if not device_prop.max_threads_per_multi_processor:
+            raise AssertionError("the device does not say how many threads it runs")
+        if not device_prop.multi_processor_count:
+            raise AssertionError("the device does not say how many processors it has")
+        if device_prop.warp_size is None:
+            raise AssertionError("the device does not say how wide a warp is")
+        seen_config_hashes: OrderedSet | None = None
+        warp_size = device_prop.warp_size
+        # A kernel of several is told how big each part is rather than being
+        # handed extents, so it has none to count blocks from; how many blocks
+        # it wants is the sum over its parts.  Which parts reduce is shared
+        # between the two kinds of kernel.
+        combo_meta = (
+            self.inductor_meta.get("combo_grid_meta")
+            if self.size_hints is None
+            else None
+        )
+        for result in self.compile_results:
+            triton_config = result.config
+            compiled_binary = result.kernel
+            if combo_meta is not None:
+                # A kernel of several runs its parts one after another over a
+                # flattened range, so how many blocks it wants is the sum of
+                # what its parts want.  A part whose extent is not a number --
+                # a shape only known when the program runs -- contributes none.
+                total_block = 0
+                for i in range(combo_meta["num_kernels"]):
+                    xnumel = combo_meta.get(f"xnumel_{i}")
+                    if isinstance(xnumel, int):
+                        xblock = triton_config.kwargs.get(f"XBLOCK_{i}", 1)
+                        total_block += (xnumel + xblock - 1) // xblock
+            else:
+                if len(self.size_hints) < 2:
+                    raise AssertionError(
+                        f"Expected at least 2 size_hints, got {len(self.size_hints)}"
+                    )
+                xblock = triton_config.kwargs.get("XBLOCK", 1)
+                total_block = (self.size_hints["x"] + xblock - 1) // xblock
+            # Which of the blocks are the ones a reduction is done in.  A
+            # kernel of several has one per reducing part, distinguished by a
+            # suffix; a part that does not reduce has none, and drops out here
+            # by having nothing to name.
+            reduction_kwargs = [
+                kwarg for kwarg in triton_config.kwargs if kwarg.startswith("R")
+            ]
+            if not reduction_kwargs:
+                continue
+            rblocks = [triton_config.kwargs[kwarg] for kwarg in reduction_kwargs]
+            nreg = getattr(compiled_binary, "n_regs", None)
+            if nreg is None:
+                continue
+            # A block already this small is not a block that was too large.
+            if conditional_product(*rblocks) <= 64:
+                continue
+            # A processor has a fixed number of registers and a fixed number of
+            # threads it can run, so there is a number of registers per thread
+            # past which not all of the threads fit at once.  A thread using
+            # more than that is using registers that another thread would have
+            # used, which is what halving the block gives back.
+            if (
+                nreg
+                <= device_prop.regs_per_multiprocessor
+                // device_prop.max_threads_per_multi_processor
+            ):
+                continue
+            nreg_per_warp = nreg * warp_size
+            nreg_per_block = nreg_per_warp * triton_config.num_warps
+            # How many blocks of this size fit on one processor at once: the
+            # registers a block needs, against the registers a processor has.
+            # Reaching one means registers rather than blocks are what limits
+            # how many threads run together, which is the case worth acting on
+            # and which a looser bound would not have revealed.
+            max_blocks_per_sm = max(
+                device_prop.regs_per_multiprocessor // nreg_per_block, 1
+            )
+            if total_block <= max_blocks_per_sm * device_prop.multi_processor_count:
+                # There is already a processor for every block the kernel wants.
+                continue
+            # Halve the largest reducing block, which is the one contributing
+            # the most registers to a thread.
+            largest_rkwarg: str = max(
+                reduction_kwargs, key=triton_config.kwargs.__getitem__
+            )
+            new_rblock = triton_config.kwargs[largest_rkwarg] // 2
+            min_rblock = self.inductor_meta.get("min_rblock")
+            if (
+                min_rblock is not None
+                and largest_rkwarg.startswith("R0_BLOCK")
+                and new_rblock < min_rblock
+            ):
+                continue
+            new_config = copy.deepcopy(triton_config)
+            new_config.kwargs[largest_rkwarg] = new_rblock
+
+            if seen_config_hashes is None:
+                seen_config_hashes = OrderedSet(
+                    [triton_config_to_hashable(x.config) for x in self.compile_results]
+                )
+            new_config_hash = triton_config_to_hashable(new_config)
+            if new_config_hash in seen_config_hashes:
+                continue
+            seen_config_hashes.add(new_config_hash)
+            log.debug(
+                "halving %s from %s gives %s",
+                largest_rkwarg,
+                triton_config,
+                new_config,
+            )
+            self._ensure_kernel_loaded()
+            yield new_config
+
+            # A kernel of several reports the registers of its largest part, so
+            # halving only the largest part brings the number down no further
+            # when the parts are of similar size.  Halving all of them is the
+            # same candidate for such a kernel, and a different one.
+            if combo_meta is not None and len(reduction_kwargs) > 1:
+                all_halved = copy.deepcopy(triton_config)
+                too_small = False
+                for kwarg in reduction_kwargs:
+                    halved = triton_config.kwargs[kwarg] // 2
+                    # A block of one halved is zero, and a kernel cannot be
+                    # given a block of zero, so this candidate is not offered
+                    # rather than offered as something that cannot be compiled.
+                    if halved < 1 or (
+                        min_rblock is not None
+                        and kwarg.startswith("R0_BLOCK")
+                        and halved < min_rblock
+                    ):
+                        too_small = True
+                        break
+                    all_halved.kwargs[kwarg] = halved
+                if not too_small:
+                    all_hash = triton_config_to_hashable(all_halved)
+                    if all_hash not in seen_config_hashes:
+                        seen_config_hashes.add(all_hash)
+                        self._ensure_kernel_loaded()
+                        yield all_halved
+
+    def _dynamic_scale_rblock(self):
+        # A configuration that was read back from a cache was already chosen
+        # with all of this in mind; scaling again would be measuring a question
+        # that has an answer.
+        if (
+            self.autotune_cache_info
+            and self.autotune_cache_info.get("autotune_cache_state") == "hit"
+        ):
+            return
+        if not self._could_rblock_scale:
+            return
+        for new_config in self._iter_rblock_scale_candidates():
+            self.compile_results.append(self._precompile_config(new_config))
+        self._make_launchers()
+
+    def compile_by_disabling_pipelining(self, config):
+        """The same tile, compiled so that it holds one step at a time.
+
+        A tile too large for the memory this device has is a tile that cannot
+        be measured here, and the parts of it that are the memory are the
+        steps it holds at once: fewer steps, less memory, the same arithmetic.
+        """
+
+        self._ensure_kernel_loaded()
+        cfg = copy.deepcopy(config)
+        cfg.num_stages = 1
+        if "NUM_STAGES" in cfg.kwargs:
+            cfg.kwargs["NUM_STAGES"] = 1
+        result = self._precompile_config(cfg)
+        self.compile_results = [result]
+        return result.make_launcher()
+
+    def precompile(
+        self,
+        warm_cache_only: bool = False,
+        reload_kernel: Callable[[], CachingAutotuner] | None = None,
+        static_triton_bundle_key: str | None = None,
+    ):
+        """Compile every configuration and make a launcher of each.
+
+        Nothing is measured here.  What this does is make a launch a launch
+        rather than a compile, and it is a separate step from the launch so
+        that the compiling can happen before anything is run and be paid for
+        once, wherever it happens.
+        """
+
+        if warm_cache_only:
+            self._precompile_worker()
+            return
+        with self.lock:
+            # A kernel compiled in another process has to be compiled again in
+            # this one before anything here can compile it, which is what
+            # holding on to how to do that is for.
+            if reload_kernel is not None:
+                self._reload_kernel = reload_kernel
+            # A plugin that answers here owns compiling and making launchers
+            # from here on, including recording what it built, which is why the
+            # ordinary flow below is not run at all.
+            for plugin in self._plugins:
+                if plugin.pre_compile(self) is not DEFER:
+                    return
+            self._precompile_worker()
+            if static_triton_bundle_key is not None and self.is_statically_launchable():
+                TritonBundler.put_static_autotuner(static_triton_bundle_key, self)
+            self._make_launchers()
+            self._dynamic_scale_rblock()
+
+    def _precompile_worker(self):
+        if self.compile_results:
+            for result in self.compile_results:
+                TritonBundler.put(
+                    triton_hash_to_path_key(result.kernel.hash),
+                    int(self.triton_meta.get("device", 0)),
+                )
+            return
+        if self.launchers:
+            raise AssertionError("there are launchers before anything was compiled")
+        if not self.configs:
+            raise NoTritonConfigsError("there is no configuration to compile")
+
+        compile_results = []
+        exc = None
+        for c in self.configs:
+            try:
+                compile_results.append(self._precompile_config(c))
+            except (OutOfResources, PTXASError, IntelGPUError) as e:
+                exc = e
+        if len(compile_results) == 0:
+            raise NoTritonConfigsError(
+                f"No valid triton configs. {type(exc).__name__}: {exc}"
+            )
+        self.compile_results = compile_results
+        # The configurations are now what was compiled, and reading them again
+        # would be reading a list that is no longer what it was.
+        self.configs = None
+
+    def _make_launcher(
+        self, compile_result: Any
+    ) -> tuple[Any, None] | tuple[None, Exception]:
+        """Make the launcher for one compiled configuration.
+
+        The caller is holding the device this is loaded onto, which is what
+        makes the binary land on the right one.  A configuration that cannot be
+        given a launcher is returned as the reason rather than raised, so that
+        the other configurations are still tried.
+        """
+
+        try:
+            return compile_result.make_launcher(), None
+        except (
+            OutOfResources,
+            PTXASError,
+            tp.cuda.OutOfMemoryError,
+            IntelGPUError,
+        ) as e:
+            return None, e
+
+    def _make_launchers(self):
+        if len(self.launchers) == len(self.compile_results):
+            return
+
+        device_interface = self.get_device_interface()
+        launchers = []
+        exc = None
+        try:
+            load_device = _resolve_load_device(
+                self.triton_meta["device"], self.device_props.type
+            )
+            # Each binary is loaded while the device it belongs to is current,
+            # or a binary compiled for one device lands on whichever is current.
+            with device_interface.device(load_device):
+                for result in self.compile_results:
+                    launcher, exc = self._make_launcher(result)
+                    if launcher is not None:
+                        launchers.append(launcher)
+                if len(launchers) == 0:
+                    result = self.compile_results[-1]
+                    config = result.config
+                    if (
+                        isinstance(exc, (OutOfResources, tp.cuda.OutOfMemoryError))
+                        and (
+                            config.num_stages > 1
+                            or config.kwargs.get("NUM_STAGES", 1) > 1
+                        )
+                        and self.inductor_meta.get("dynamic_disable_pipelining", True)
+                    ):
+                        self.launchers = [self.compile_by_disabling_pipelining(config)]
+                        return
+                    raise RuntimeError(
+                        f"No valid triton configs. {type(exc).__name__}: {exc}"
+                    )
+            self.launchers = launchers
+        finally:
+            # The reason a configuration failed is read above and nowhere
+            # else, and holding it holds its whole stack with it, which under
+            # a collector that is switched off is a buffer per measured kernel
+            # that is never released.  What was wanted was its kind and its
+            # message, and both have been read.
+            exc = None
+
+    def _prune_compile_results_to_launcher(self, launcher: Any) -> None:
+        """Keep only what the chosen launcher was made from.
+
+        Everything that was compiled and not chosen is what the rest of the
+        program would hold on to, and none of it can be launched, so what is
+        left is the one thing that can be.
+        """
+
+        if not self.compile_results:
+            return
+
+        launcher_config = launcher.config
+        for result in self.compile_results:
+            if result.config is launcher_config:
+                self.compile_results = [result]
+                return
+
+        launcher_config_hash = triton_config_to_hashable(launcher_config)
+        for result in self.compile_results:
+            if triton_config_to_hashable(result.config) == launcher_config_hash:
+                self.compile_results = [result]
+                return
+
+        raise AssertionError(
+            f"Autotuned launcher config does not match any compile result: {launcher_config}"
+        )
+
+    def _ensure_kernel_loaded(self) -> None:
+        """Bring the kernel's own text back into this process if it went away.
+
+        A kernel compiled in another process crosses into this one without the
+        compiled form of its text, so that anything here which needs to compile
+        it again has to ask for it to be brought back.  A kernel that never left
+        has it, and there is nothing to do.
+        """
+
+        if self.fn.fn is None:
+            if not hasattr(self, "_reload_kernel"):
+                raise AssertionError("_reload_kernel attribute not set")
+            if not callable(self._reload_kernel):
+                raise AssertionError("_reload_kernel must be callable")
+            self.fn = self._reload_kernel().fn
+
+    def get_device_interface(self):
+        # What a device is called here and what it is called by the module that
+        # talks to it are not always the same, and what is wanted is the latter.
+        from .benchmarking import get_interface_for_device
+
+        return get_interface_for_device(self.device_props.type.replace("hip", "cuda"))
+
+    def _interpret_args_grid(
+        self, args: tuple[Any, ...], cfg: Any
+    ) -> tuple[tuple[Any, ...], tuple[int, int, int]]:
+        """The arguments a kernel is given, and the grid it is run over.
+
+        A value the text names as constant is folded into the binary and is not
+        handed over at all, so what to hand over is worked out from the
+        signature and what it declares rather than from the arguments as they
+        are given -- and a kernel written by hand may declare no
+        configurations at all, which is why the declaration is asked rather than
+        the configurations.
+        """
+
+        if triton_version_uses_attrs_dict():
+
+            def filtered_signature() -> list[str]:
+                new_signature: list[str] = []
+                from triton.runtime.interpreter import InterpretedFunction
+
+                for i, x in enumerate(self.triton_meta["signature"].keys()):
+                    if isinstance(self.fn, InterpretedFunction):
+                        if x not in cfg.kwargs:
+                            new_signature.append(x)
+                    elif i not in get_constexprs(self.fn):
+                        new_signature.append(x)
+                return new_signature
+
+        else:
+
+            def filtered_signature() -> list[str]:
+                return list(self.triton_meta["signature"].keys())
+
+        grid = GridExpr.from_meta(
+            self.inductor_meta, cfg, mode=self.grid_mode
+        ).eval_slow(
+            dict(
+                zip(
+                    [
+                        *filtered_signature(),
+                        *self.inductor_meta.get("extra_launcher_args", ()),
+                    ],
+                    args,
+                )
+            )
+        )
+        if self.inductor_meta.get("extra_launcher_args"):
+            args = args[: -len(self.inductor_meta["extra_launcher_args"])]
+        return args, grid
 
     def __getstate__(self) -> dict[str, Any]:
         # A launcher holds a binary that belongs to this process's device, and a
