@@ -24,6 +24,7 @@ import hashlib
 import logging
 import math
 import os
+import re
 import threading
 import time
 from typing import Any, Callable, Container, Final, Generic, Literal, TypeVar
@@ -62,8 +63,10 @@ from .triton_compat import (
 )
 from .triton_helpers import get_constexprs
 from .runtime_utils import (
+    create_bandwidth_info_str,
     get_first_attr,
     get_max_y_grid,
+    get_num_bytes,
     triton_hash_to_path_key,
     validate_triton_config,
 )
@@ -2672,6 +2675,7 @@ class CachingAutotuner(KernelInterface):
         if (debug_call := self._debug_call) is not None:
             self._debug_call = None
             debug_call.finalize(self.get_device_interface())
+
     def get_profiler_kwargs(self, stream, launcher):
         """What a profiler is told about the kernel being launched.
 
@@ -2702,7 +2706,7 @@ class CachingAutotuner(KernelInterface):
         if "kernel_num_gb" in self.inductor_meta:
             ret["kernel_num_gb"] = self.inductor_meta["kernel_num_gb"]
         return ret
-        self.kernel.cubin_path = cubin_location
+
 
 class CannotStaticallyLaunchKernel(Exception):
     """Why a compiled kernel cannot be launched from its binary alone."""
@@ -3072,3 +3076,84 @@ class TritonCompileResult(CompileResult[CompiledKernel]):
             launcher.global_scratch = global_scratch
             launcher.profile_scratch = profile_scratch
         return launcher
+
+
+class DebugAutotuner(CachingAutotuner):
+    """A tuner that launches the winner and then says what it cost.
+
+    The point of tuning is to pick well, and picking well is not the same as
+    knowing why the winner won.  So this launches the chosen configuration for
+    real and reports the time it took, how much data it moved to do it, and
+    what that works out to as a rate -- because a kernel that is slow because
+    it moved a great deal is a different problem from one that is slow because
+    it moved little, and the time alone does not say which.
+
+    The measurement is kept: an ahead-of-time export may launch the same kernel
+    again in a process that cannot measure it, and reporting a number that was
+    measured elsewhere is the only number it can report.
+    """
+
+    def __init__(
+        self,
+        *args,
+        regex_filter="",
+        with_profiler=False,
+        with_bandwidth_info=True,
+        **kwargs,
+    ):
+        self.regex_filter = regex_filter
+        self.with_profiler = with_profiler
+        self.with_bandwidth_info = with_bandwidth_info
+        super().__init__(*args, **kwargs)
+        self.cached = None
+
+    def run(self, *args, stream, **kwargs):
+        if not self.with_bandwidth_info:
+            super().run(*args, stream=stream, **kwargs, benchmark_run=True)
+            return
+        else:
+            possible_names = _find_names(self)
+            if possible_names:
+                kernel_name = f"{max(possible_names, key=len)}"
+            else:
+                # A tuner that is not bound to a name at module level finds
+                # none; fall back to the name the compilation recorded, and
+                # then to the function's own, so that a filter still has
+                # something to match against.
+                kernel_name = self.inductor_meta.get("kernel_name") or self.fn.__name__
+            if not re.match(self.regex_filter, kernel_name):
+                return
+            if len(self.launchers) != 1:
+                if len(self.launchers) == 0:
+                    start_time = time.time_ns()
+                    self.precompile()
+                    self.precompile_time_taken_ns = time.time_ns() - start_time
+                if len(self.launchers) > 1:
+                    self.autotune_to_one_config(*args, **kwargs)
+            (launcher,) = self.launchers
+
+            if self.cached is None:
+                ms = self.bench(launcher, *args, with_profiler=self.with_profiler)
+                num_in_out_ptrs = len(
+                    [
+                        arg_name
+                        for arg_name in self.fn.arg_names
+                        if arg_name.startswith("in_out_ptr")
+                    ]
+                )
+                num_gb = self.inductor_meta.get("kernel_num_gb", None)
+                if num_gb is None:
+                    num_gb = get_num_bytes(*args, num_in_out_args=num_in_out_ptrs) / 1e9
+                gb_per_s = num_gb / (ms / 1e3)
+                self.cached = ms, num_gb, gb_per_s, kernel_name
+                collected_calls.append((ms, num_gb, gb_per_s, kernel_name))
+                log.info(
+                    "%s",
+                    create_bandwidth_info_str(
+                        ms, num_gb, gb_per_s, suffix=f" \t {kernel_name}"
+                    ),
+                )
+            else:
+                # An ahead-of-time run calls the kernel, and its timing was
+                # measured where the kernel was chosen.
+                collected_calls.append(self.cached)
