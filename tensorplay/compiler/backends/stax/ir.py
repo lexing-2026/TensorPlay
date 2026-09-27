@@ -457,6 +457,33 @@ def get_stride_order(seq: Sequence, shape_env=None) -> Sequence[int]:
     return out
 
 
+def is_triton(x) -> bool:
+    """Whether a thing is written by the printer that writes device kernels.
+
+    Asked of a device, a node, or a device named as a string.  For the three
+    devices whose printer is named by a setting, the setting is the answer --
+    deciding it any other way would mean building a printer to ask it, and the
+    printer is not free to build.  For anything else it is asked of the
+    scheduling registered for that device.
+    """
+
+    device = get_device_type(x)
+    if device in ["cpu", "cuda", "xpu"]:
+        if getattr(config, f"{device}_backend") == "triton":
+            return True
+        return False
+    if (
+        device is None
+        or (device_scheduling := get_scheduling_for_device(device)) is None
+    ):
+        return False
+    from .codegen.triton import TritonScheduling
+
+    if not isinstance(device_scheduling, type):
+        raise AssertionError(type(device_scheduling))
+    return issubclass(device_scheduling, TritonScheduling)
+
+
 def get_device_type(x):
     """The kind of device something is on, as a name."""
 

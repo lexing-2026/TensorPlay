@@ -194,15 +194,49 @@ def _lower_stax_region(
         if node.op == "get_attr"
     ):
         raise RuntimeError("AOT backward graph for the captured training region")
-    if strict_native:
-        raise RuntimeError(
-            "strict_native Stax lowering failed: captured graph has no native executable"
-        )
-    # No native executable exists for this graph (scalar placeholders,
-    # factory-only regions, unsupported surface).  Fall back to the
-    # generated Python executor so the region still runs with captured
-    # semantics instead of failing to compile.
-    return graph_module.recompile()
+    # The region is lowered, scheduled and printed, and what that produces is
+    # what the caller calls.  A region that cannot be lowered is a region the
+    # framework runs itself, which is what falling back is for.
+    from .graph_lowering import GraphLowering
+
+    graph = GraphLowering(
+        graph_module,
+        example_inputs,
+        shape_env=None,
+        cpp_wrapper=use_cuda_codegen,
+        aot_mode=training,
+        extern_node_serializer=None,
+        is_inference=not training,
+        is_backward=False,
+    )
+    # Everything from here on is being done about this region, and anything
+    # asked along the way -- what a kernel reads, how big an extent is, what a
+    # buffer is written into -- is answered by the region it belongs to.  So
+    # the region is the one that is current for all of it.
+    from .loops import set_graph
+
+    try:
+        with set_graph(graph):
+            graph.run()
+            compiled_module = graph.compile_to_module()
+    except (NotImplementedError, NotImplementedError.__base__) as exc:
+        # A region whose printed form this compiler does not cover has no built
+        # artifact, and an artifact that cannot be entered is worse than none:
+        # the failure would arrive at the first call rather than here.  So a
+        # caller that did not ask for a built form gets the region run as it was
+        # written, and a caller that did asks for the failure instead.
+        if strict:
+            raise RuntimeError(
+                "strict_native Stax lowering failed: captured graph has no built form"
+            ) from exc
+        return graph_module.recompile()
+    except Exception as exc:
+        if strict:
+            raise
+        return graph_module.recompile()
+    compiled = compiled_module.call
+    _publish_codegen(compiled_module, "triton", backward=training)
+    return compiled
 
 
 #: Everything the layers own, re-exported under one name so the
