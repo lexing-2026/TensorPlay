@@ -4479,3 +4479,152 @@ def _functional_assert_async(t: Any, msg: Any) -> None:
     """
 
     return None
+
+
+#: A backward pass written as a walk over the forward pass's own choices is the
+#: framework's rather than this one's: which of several equally valid ways to
+#: spread a gradient over the positions that produced one is a question about
+#: the operation's meaning rather than about how to walk it, and the answers
+#: differ between the two sides in ways a single walk would have to know about.
+#: These are therefore computed by handing the call over, and the ones whose
+#: result has to be dense say so, because a sparse result is a different shape
+#: of answer rather than a sparser one.
+for _name, _warn in (
+    ("_adaptive_avg_pool2d_backward", False),
+    ("_adaptive_avg_pool3d_backward", False),
+    ("adaptive_max_pool2d_backward", False),
+    ("adaptive_max_pool3d_backward", False),
+    ("fractional_max_pool2d_backward", False),
+    ("fractional_max_pool3d_backward", False),
+    ("replication_pad1d_backward", False),
+    ("replication_pad2d_backward", False),
+    ("upsample_linear1d_backward", False),
+    ("upsample_bicubic2d_backward", False),
+    ("upsample_trilinear3d_backward", False),
+    ("grid_sampler_2d_backward", False),
+    ("_pdist_backward", False),
+    ("max_pool2d_with_indices_backward", False),
+    ("max_pool3d_with_indices_backward", False),
+    ("avg_pool2d_backward", False),
+    ("upsample_nearest2d_backward", False),
+    ("adaptive_avg_pool2d_backward", False),
+    ("adaptive_avg_pool3d_backward", False),
+):
+    _op = getattr(aten, _name, None)
+    if _op is not None:
+        make_fallback(_op, warn=_warn)
+
+
+#: Operations whose own walk would have to know something the framework already
+#: knows: which distribution a set of values came from, how a recurrent layer
+#: carries its state from one step to the next, how a group of matrices is laid
+#: out, and how a distance is counted.  Each of those is a meaning rather than
+#: a computation, and a walk written here would be a second answer to the same
+#: question rather than the one.  Handing the call over is what keeps the two
+#: from existing at once.
+#
+#: The random ones are here rather than written as a read at a position because
+#: they are the eager forms: they consult a generator rather than a position,
+#: and which stream a generator is on is a fact about the call rather than
+#: about the graph.  The read at a position is what the decompositions use, and
+#: these are what a call that has not been decomposed reaches.
+for _name, _warn in (
+    ("randint", False),
+    ("rand_like", False),
+    ("randn_like", False),
+    ("randint_like", False),
+    ("normal", False),
+    ("_pdist_forward", False),
+    ("soft_margin_loss_backward", False),
+    ("_fused_rms_norm", False),
+    ("_cdist_forward", False),
+    ("_cdist_backward", False),
+    ("_trilinear", False),
+    ("segment_reduce", False),
+    ("_segment_reduce_backward", False),
+    ("histc", False),
+    ("_histogramdd_bin_edges", False),
+    ("_histogramdd_from_bin_cts", False),
+    ("addbmm", False),
+    ("_addmm_activation", False),
+    ("_grouped_mm", False),
+    ("_cudnn_rnn", False),
+    ("_cudnn_rnn_backward", False),
+    ("_embedding_bag", False),
+    ("_embedding_bag_forward_only", False),
+    ("_adaptive_avg_pool3d", False),
+    ("adaptive_max_pool3d", False),
+):
+    _op = getattr(aten, _name, None)
+    if _op is not None:
+        make_fallback(_op, warn=_warn)
+
+#: A histogram whose edges are given rather than counted is a different
+#: operation from one that counts them: where the edges are is a fact about the
+#: call, and which bin a value falls in follows from them.
+_histogram = getattr(aten, "histogram", None)
+if _histogram is not None:
+    for _ov in _histogram.overloads():
+        make_fallback(getattr(_histogram, _ov), warn=False)
+
+
+#: Operations whose answer has a size nothing here knows in advance: how many
+#: distinct values there are, which positions are not zero, how many fall in
+#: each bin.  The shape of the answer is the answer, so it cannot be written as
+#: a walk over a range of known length -- and a walk that could be would have
+#: to guess the length first, which is the one thing that cannot be guessed.
+for _name, _warn in (
+    ("bincount", False),
+    ("_unique2", False),
+    ("unique_dim", False),
+    ("unique_dim_consecutive", False),
+    ("unique_consecutive", False),
+    ("nonzero", True),
+    ("nonzero_static", True),
+):
+    _op = getattr(aten, _name, None)
+    if _op is None:
+        continue
+    _overloads = (
+        [_op] if not hasattr(_op, "overloads") else
+        [getattr(_op, _ov) for _ov in _op.overloads()]
+    )
+    for _ov in _overloads:
+        make_fallback(_ov, warn=_warn)
+
+#: A gather that does not check its indices is a gather whose answer is only
+#: defined when every index is in range, and a scatter that accumulates into
+#: positions several indices name is one where the order of the additions is
+#: part of the answer.  Both are asked for where the check or the order is
+#: known rather than assumed.
+for _name in (
+    "_unsafe_masked_index",
+    "_unsafe_masked_index_put_accumulate",
+):
+    _op = getattr(aten, _name, None)
+    if _op is not None:
+        make_fallback(_op, warn=False)
+
+#: Reducing a list of values into a smaller one, and the pass that puts the
+#: gradient back, are a question about which of several ways of splitting the
+#: work is meant -- and the two halves have to agree on which, which is why they
+#: are asked of the framework together rather than written here separately.
+for _name in ("segment_reduce", "_segment_reduce_backward"):
+    _op = getattr(aten, _name, None)
+    if _op is not None:
+        make_fallback(_op, warn=False)
+
+#: A search for where values would fall among ordered boundaries answers a
+#: question about a list this cannot read, and a scatter that reduces says which
+#: of several values landing on the same position wins -- which is a meaning
+#: rather than a walk.
+for _name in ("searchsorted", "scatter_reduce_", "index"):
+    _op = getattr(aten, _name, None)
+    if _op is None:
+        continue
+    _overloads = (
+        [_op] if not hasattr(_op, "overloads") else
+        [getattr(_op, _ov) for _ov in _op.overloads()]
+    )
+    for _ov in _overloads:
+        make_fallback(_ov, warn=False)
