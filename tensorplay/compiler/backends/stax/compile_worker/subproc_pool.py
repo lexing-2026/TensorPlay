@@ -64,9 +64,9 @@ class MsgHeader(IntEnum):
 def _current_compile_id() -> Any:
     # Snapshotted at submit so a later watchdog STATUS report (handled on the
     # read thread, which has no ambient compile context) can be attributed to the
-    # right compile in tlparse.
+    # right compile in the trace it is written to.
     try:
-        from tp._guards import CompileContext
+        from tensorplay._guards import CompileContext
 
         return CompileContext.current_compile_id()
     except Exception:
