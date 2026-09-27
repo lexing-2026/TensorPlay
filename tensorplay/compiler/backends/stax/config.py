@@ -557,9 +557,10 @@ def use_autoheuristic(name: str) -> bool:
 
 
 # Whether a call whose kernel is one element wide is computed as a product.
-# On by default because it has more ways of being computed than a call does; off
-# for a program that wants every call to be a call.
-conv_1x1_as_mm = os.environ.get("TP_CONV_1X1_AS_MM", "1") == "1"
+# Off by default: measuring a program this size found the product no faster
+# than the call it replaces, and leaving the call alone means one fewer way for
+# the two to disagree.
+conv_1x1_as_mm = os.environ.get("TP_CONV_1X1_AS_MM", "0") == "1"
 
 # Which ways of computing a call are measured.  Empty means the operation's own
 # kernel only, which is correct everywhere and fast nowhere in particular; naming
