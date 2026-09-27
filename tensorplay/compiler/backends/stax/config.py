@@ -854,6 +854,16 @@ class _TritonConfig:
     generated module or about where the runtime should put what it produces.
     """
 
+    #: How a fused kernel names the operations it stands for.  Which one is
+    #: right depends on who is reading the name: a person reading a profile
+    #: wants the operations, a cache key wants something short.
+    descriptive_names: str = "original_aten"
+
+    #: Whether each kernel is written under a name of its own, or under one
+    #: name shared by every kernel written the same way, which is what lets two
+    #: identical kernels share one compiled artifact.
+    unique_kernel_names = os.environ.get("TP_UNIQUE_KERNEL_NAMES", "1") == "1"
+
     #: Give a user's kernel a name of its own rather than the name it was
     #: written under, so that two kernels written under one name do not collide
     #: in the runtime's cache.
@@ -968,6 +978,10 @@ class _TritonConfig:
 
     #: Write the region as it arrived, beside the graph it was scheduled into,
     #: so the two can be read against each other.
+    #: Say inside the printed program which operations were fused into which
+    #: kernel, so a kernel can be read back as the operations it stands for.
+    debug_fusion = os.environ.get("TP_DEBUG_FUSION") == "1"
+
     draw_orig_fx_graph = (
         os.environ.get("TP_ORIG_FX_SVG", "0") == "1"
         or os.environ.get("TP_ORIG_FX_GRAPH", "0") == "1"
@@ -1086,6 +1100,29 @@ class _TraceConfig:
     provenance_tracking_to_timeline = (
         os.environ.get("TP_COMPILE_DEBUG_EXTEND", "0") == "1"
     )
+
+    #: How much of where each value came from is kept.  Zero keeps none, one
+    #: keeps the record as it is rewritten, and more keeps it at every step.
+    #: Asking for a record at all turns the ordinary debug flag into one, and
+    #: asking for it on the timeline does the same, so that either way says
+    #: yes without having to name a level.
+    provenance_tracking_level: int = int(
+        os.environ.get(
+            "TP_INDUCTOR_PROVENANCE", os.environ.get("TP_COMPILE_DEBUG", "0")
+        )
+    )
+
+
+def effective_provenance_tracking_level() -> int:
+    """The level actually in force, which a timeline record raises to one.
+
+    A record kept on the timeline is kept whether or not a level was named,
+    so asking for that raises the level to the one that records it.
+    """
+
+    if trace.provenance_tracking_to_timeline:
+        return max(trace.provenance_tracking_level, 1)
+    return trace.provenance_tracking_level
 
 
 trace = _TraceConfig()

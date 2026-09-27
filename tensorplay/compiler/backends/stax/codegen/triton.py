@@ -71,6 +71,7 @@ from ..runtime.hints import (
 from ..shape_propagation import get_broadcasted_shape
 from .common import (
     ArgName,
+    BackendFeature,
     CSE,
     CSEProxy,
     CSEVariable,
@@ -367,6 +368,7 @@ except ImportError:  # pragma: no cover - until that machinery is here
     SIMDKernel = object
 
 from .simd import (
+    SIMDScheduling,
     DerivedIterationRangesRoot,
     IterationRangesEntry,
     IterationRangesRoot,
@@ -8647,3 +8649,164 @@ TritonKernel.tma_compatibility_checker_cls = TMACompatibilityChecker
 texpr = TritonPrinter().doprint
 
 TritonKernel.kexpr = texpr
+
+class TritonScheduling(SIMDScheduling):
+    """Scheduling backend for Triton kernel code generation."""
+
+    supports_sub_parent_epilogue = True
+    kernel_type: type = TritonKernel
+    backend_features = OrderedSet(
+        [
+            BackendFeature.FOREACH,
+            BackendFeature.INPLACE_BUFFERS,
+            BackendFeature.MASKED_SCATTER_WITH_INDEX,
+            BackendFeature.SCAN,
+            BackendFeature.SORT,
+            BackendFeature.TUPLE_REDUCTION,
+            BackendFeature.PREFER_STORE_LOOP_ORDER,
+            BackendFeature.TRITON_TEMPLATES,
+        ]
+    )
+
+    def __init__(self, scheduler=None) -> None:
+        super().__init__(scheduler)
+        if scheduler is None or not hasattr(scheduler, "nodes"):
+            return
+        for node in scheduler.nodes:
+            if isinstance(node, (SchedulerNode, FusedSchedulerNode)):
+                node.debug_device_str = debug_triton_code
+
+    @classmethod
+    def get_backend_features(cls, device):
+        if (
+            config.triton.cooperative_reductions
+            or config.triton.force_cooperative_reductions
+        ):
+            return OrderedSet(
+                [*cls.backend_features, BackendFeature.REDUCE_TO_SINGLE_ELEMENT]
+            )
+        return cls.backend_features
+
+    def codegen_comment(self, node_schedule, kernel_name=None):
+        wrapper = V.graph.wrapper_code
+        origins, _detailed_origins = get_kernel_metadata(node_schedule, wrapper)
+        if origins:
+            wrapper.make_comment(origins)
+
+        if config.debug_fusion:
+            if not any(
+                isinstance(n, ForeachKernelSchedulerNode) for n in node_schedule
+            ):
+                node_names = [
+                    n.get_name()
+                    for n in node_schedule
+                    if isinstance(n, BaseSchedulerNode)
+                ]
+                wrapper.make_comment(
+                    f"{wrapper.comment} Fused node name list: {', '.join(node_names)}"
+                )
+
+        if kernel_name:
+            debug_handle = set_kernel_post_grad_provenance_tracing(
+                node_schedule,
+                kernel_name,
+            )
+            wrapper.write_provenance_debug_handle(kernel_name, debug_handle)
+
+    def _emit_kernel_to_wrapper(
+        self,
+        wrapper,
+        kernel,
+        src_code,
+        kernel_name,
+        subs_name,
+        node_schedule,
+        kernel_path,
+    ):
+        """Write a kernel into the wrapper, and say where it came from.
+
+        The kernel is written as source inside a call that compiles it, rather
+        than being compiled here, so that a kernel which is written but never
+        reached costs nothing to compile.  The file it will be cached in is
+        written into the source as a comment, because a kernel that misbehaves
+        is looked for by the artifact rather than by the source that made it.
+        """
+
+        if kernel.emit_kernel_override(
+            wrapper,
+            src_code,
+            kernel_name,
+            node_schedule,
+            kernel_path,
+            get_kernel_metadata,
+        ):
+            return
+
+        compile_wrapper = IndentedBuffer()
+
+        if async_compile.use_process_pool():
+            # The pool is already warm, so the kernel can be handed to a worker
+            # now: the second time this call is reached there is nothing to do.
+            async_compile.triton(subs_name, src_code)
+
+        compile_wrapper.writeline(f"async_compile.triton({subs_name!r}, '''")
+        compile_wrapper.splice(src_code, strip=True)
+        current_device = V.graph.get_current_device_or_throw()
+        compile_wrapper.writeline(f"''', device_str='{current_device.type}')")
+
+        metadata_comment = f"# kernel path: {kernel_path}"
+        origins, detailed_origins = get_kernel_metadata(node_schedule, wrapper)
+        metadata_comment += "\n" + origins + "\n" + detailed_origins
+        wrapper.define_kernel(kernel_name, compile_wrapper.getvalue(), metadata_comment)
+
+    def define_kernel(self, src_code, node_schedule, kernel):
+        """The name a kernel written from this source is known by.
+
+        The same source is the same kernel however many times it is written, so
+        the name is looked up by the source and only made when it is not
+        already there.  What the name is made of is what the source is: what
+        kind of kernel it is, the operations fused into it, and a suffix that
+        keeps two kernels of the same kind and the same operations apart.
+        """
+
+        from .common import get_path
+        from ..utils import code_hash, get_fused_kernel_name
+
+        wrapper = V.graph.wrapper_code
+        if src_code in wrapper.src_to_kernel:
+            kernel_name = wrapper.src_to_kernel[src_code]
+        else:
+            fused_name = (
+                get_fused_kernel_name(node_schedule, config.triton.descriptive_names)
+                if config.triton.descriptive_names
+                else ""
+            )
+            kernel_category = get_kernel_category_by_source_code(src_code)[:3]
+            kernel_name = "_".join(
+                ["triton", kernel_category, fused_name, wrapper.next_kernel_suffix()]
+            )
+
+            wrapper.src_to_kernel[src_code] = kernel_name
+            subs_name = kernel_name if config.triton.unique_kernel_names else "triton_"
+
+            # The name a kernel is written under in the source is the name it
+            # has; the name it is compiled under may be shared with every other
+            # kernel written the same way, which is what lets two identical
+            # kernels share one compiled artifact.
+            src_code = src_code.replace(str(Placeholder.DESCRIPTIVE_NAME), kernel_name)
+            src_code = src_code.replace(str(Placeholder.KERNEL_NAME), subs_name)
+            src_code = src_code.replace("#pragma CMT", "#")
+
+            _basename, _, kernel_path = get_path(code_hash(src_code.strip()), "py")
+
+            self._emit_kernel_to_wrapper(
+                wrapper,
+                kernel,
+                src_code,
+                kernel_name,
+                subs_name,
+                node_schedule,
+                kernel_path,
+            )
+
+        return kernel_name
