@@ -3440,3 +3440,185 @@ def sort_stable(x: Any, *, stable: Any = None, dim: Any = -1, descending: Any = 
 @register_lowering(aten.sort.default, type_promotion_kind=None)
 def sort(x: Any, dim: Any = -1, descending: Any = False) -> Any:
     return sort_stable(x, stable=False, dim=dim, descending=descending)
+
+
+select_fallback = fallback_handler(aten.select.int, add_to_fallback_set=False)
+
+
+def unsqueeze(x: Any, dim: Any) -> Any:
+    """The same values with a dimension of one added.
+
+    A dimension of one holds the single value that was there before, so adding
+    it moves nothing; what changes is which position that value is read at,
+    because a value of more dimensions is lined up by its innermost axes.
+    """
+
+    dim = _validate_dim(x, dim, 1)
+    new_shape = list(x.get_size())
+    new_shape.insert(dim, sympy.S.One)
+    return view(x, new_shape)
+
+
+def select(x: Any, dim: Any, idx: Any) -> Any:
+    """One position along one axis, with that axis gone.
+
+    Taking a position out is a slice of one followed by a shape that no longer
+    has room for it, and both halves matter: the slice says which value, the
+    shape says that the axis is not there any more.  An index named from the
+    back is the same position, and which one it is cannot be answered until the
+    axis length is known, so a negative index is resolved here rather than being
+    carried into the slice.
+
+    A position whose value is not known until the program runs cannot be turned
+    into either half here -- the shape would be a guess -- so it is left to the
+    framework rather than being written down as though it were known.
+    """
+
+    idx = sympy.expand(idx)
+    size = sympy.expand(x.get_size()[dim])
+    actual_index = None
+
+    if V.graph.sizevars.guard_or_false(sympy.Lt(idx, 0)):
+        actual_index = idx + size
+    elif V.graph.sizevars.guard_or_false(sympy.Ge(idx, 0)):
+        actual_index = idx
+
+    if actual_index is not None:
+        if has_free_unbacked_symbols(idx):
+            # A shape written down before the program runs would be a guess,
+            # and a guess about which position is read is a guess about the
+            # values themselves.  So the position is resolved where it is read.
+            return fallback_select(x, dim, idx)
+
+        slice_result = _slice(x, dim, actual_index, actual_index + 1, 1)
+        return lower_squeeze(slice_result, dim)
+
+    return fallback_select(x, dim, idx)
+
+
+#: These are one sort and a read from it, and are written as such when the sort
+#: is written.  When it is not, they are the same computation done by the
+#: framework -- which is not a second way of doing it but the first way, reached
+#: differently, and the choice is made per call because whether the sort will be
+#: written is not known until the shapes are.
+topk_fallback = fallback_handler(aten.topk.default, add_to_fallback_set=False)
+kthvalue_fallback = fallback_handler(aten.kthvalue.default, add_to_fallback_set=False)
+median_fallback = fallback_handler(aten.median.default, add_to_fallback_set=False)
+median_dim_fallback = fallback_handler(aten.median.dim, add_to_fallback_set=False)
+mode_fallback = fallback_handler(aten.mode.default, add_to_fallback_set=False)
+
+
+@register_lowering(aten.median.default, type_promotion_kind=None)
+def median_default(self: Any) -> Any:
+    """The middle value of all of them, with no axis to speak of.
+
+    A value with no axis is flattened first, because "the middle" is only a
+    question once everything is in one line, and sorting a flat list is the same
+    walk as sorting any other.
+    """
+
+    if not config.triton.decompose_sort_ops:
+        return median_fallback(self)
+    size = self.get_size()
+    numel = functools.reduce(operator.mul, size, sympy.Integer(1))
+    flat = view(self, [numel])
+    sorted_vals, _ = sort_stable(flat, dim=0)
+    k = (numel - 1) // 2
+    return select(sorted_vals, 0, k)
+
+
+@register_lowering(aten.median.dim, type_promotion_kind=None)
+def median_dim(self: Any, dim: Any, keepdim: Any = False) -> Any:
+    """The middle value along one axis, and which position it was at.
+
+    Two answers rather than one because the position is not recoverable from
+    the value: two equal values are the same value and are not the same
+    position, and which one a caller means is the question being asked.
+
+    Even length leaves no single middle, so the smaller of the two is taken --
+    the one at ``(n-1)//2`` -- which is the same one a sort-based decomposition
+    gives however the ties fell.
+    """
+
+    if not config.triton.decompose_sort_ops:
+        return median_dim_fallback(self, dim, keepdim)
+    shape = self.get_size()
+    ndim = len(shape)
+    if ndim == 0:
+        return clone(self), _full(0, self.get_device(), tp.int64, shape)
+    dim = canonicalize_dim(ndim, dim)
+    sorted_vals, sorted_idxs = sort_stable(self, stable=True, dim=dim)
+    n = shape[dim]
+    k = (n - 1) // 2
+    values = select(sorted_vals, dim, k)
+    indices = select(sorted_idxs, dim, k)
+    if keepdim:
+        values = unsqueeze(values, dim)
+        indices = unsqueeze(indices, dim)
+    return values, indices
+
+
+@register_lowering(aten.topk.default, type_promotion_kind=None)
+def topk(
+    self: Any,
+    k: Any,
+    dim: Any = -1,
+    largest: Any = True,
+    sorted: Any = True,
+    impl: Any = 0,
+) -> Any:
+    """The k largest or smallest values along one axis, and where they were.
+
+    Which end counts as large is part of what was asked rather than something
+    applied to the result, so it goes to the sort: a descending sort and a
+    prefix of it is the whole of this, and the positions come along because the
+    sort produces them anyway.
+
+    The order the caller asked to be sorted is the sort's own stability: values
+    that compare equal keep the order they were in, which is what makes the
+    answer the same however the ties fell.
+    """
+
+    # Which implementation to use is a choice between ways of doing this, and
+    # this is the one way it is done here -- so the choice is not a parameter.
+    del impl
+
+    if not config.triton.decompose_sort_ops:
+        return topk_fallback(self, k, dim, largest, sorted)
+    shape = self.get_size()
+    ndim = len(shape)
+    if ndim == 0:
+        return clone(self), _full(0, self.get_device(), tp.int64, shape)
+    dim = canonicalize_dim(ndim, dim)
+    sorted_vals, sorted_idxs = sort_stable(
+        self, stable=True, dim=dim, descending=largest
+    )
+    values = _slice(sorted_vals, dim, 0, k, 1)
+    indices = _slice(sorted_idxs, dim, 0, k, 1)
+    return values, indices
+
+
+@register_lowering(aten.kthvalue.default, type_promotion_kind=None)
+def kthvalue(self: Any, k: Any, dim: Any = -1, keepdim: Any = False) -> Any:
+    """The kth smallest value along one axis, and where it was.
+
+    Only the values and their positions are wanted, not the order they came out
+    in, so this reads one position out of a sort rather than keeping a prefix
+    of it.  Which position is the kth is counted from one, as it is named here,
+    and one is subtracted because a position in a sorted list is not.
+    """
+
+    if not config.triton.decompose_sort_ops:
+        return kthvalue_fallback(self, k, dim, keepdim)
+    shape = self.get_size()
+    ndim = len(shape)
+    if ndim == 0:
+        return clone(self), _full(0, self.get_device(), tp.int64, shape)
+    dim = canonicalize_dim(ndim, dim)
+    sorted_vals, sorted_idxs = sort_stable(self, stable=True, dim=dim)
+    values = select(sorted_vals, dim, k - 1)
+    indices = select(sorted_idxs, dim, k - 1)
+    if keepdim:
+        values = unsqueeze(values, dim)
+        indices = unsqueeze(indices, dim)
+    return values, indices
