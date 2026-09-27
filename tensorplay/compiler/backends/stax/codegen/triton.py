@@ -8713,6 +8713,107 @@ class TritonScheduling(SIMDScheduling):
             )
             wrapper.write_provenance_debug_handle(kernel_name, debug_handle)
 
+    def create_kernel_choices(
+        self,
+        kernel_features,
+        kernel_args,
+        kernel_kwargs,
+    ):
+        """The kernels a set of fused nodes may be printed as, most likely first.
+
+        A scan is not printed the same way as everything else, and a scan that
+        was split into several passes is printed as a different kernel again;
+        which one applies is a fact about the nodes, so it is read off them
+        rather than asked of the caller.  What the nodes require is then applied
+        to the kernel, and the kernel is built.
+        """
+
+        is_scan = kernel_features.contains_op("scan")
+        is_split_scan = is_scan and any(
+            node.is_split_scan() for node in kernel_features.scheduler_nodes()
+        )
+        kernel_type = self.kernel_type
+        if is_split_scan:
+            from .triton_split_scan import TritonSplitScanKernel
+
+            kernel_type = TritonSplitScanKernel
+
+        if is_scan:
+            # A scan is carried inside the kernel, so a reduction that has to
+            # land in one place cannot be spread across ranks.
+            kernel_kwargs["override_cooperative_reduction"] = False
+
+        kernel_type.apply_feature_required_overrides(kernel_features, kernel_kwargs)
+
+        kernel = kernel_type(*kernel_args, **kernel_kwargs)
+        return self.add_multi_kernel_choices(kernel, kernel_args, kernel_kwargs)
+
+    def add_multi_kernel_choices(
+        self,
+        kernel,
+        kernel_args,
+        kernel_kwargs,
+    ):
+        """The same work printed more than one way, where more than one way pays.
+
+        A reduction that has to be carried inside the kernel and one that has to
+        be written down are both correct, and which is faster depends on the
+        size of the reduction: small enough that the reduction fits in what one
+        program already holds, and the write-down is the slower way.  So the
+        alternatives are offered rather than chosen, up to a size past which
+        the carried form stops paying.
+        """
+
+        kernels = [kernel]
+        if not config.triton.multi_kernel:
+            return kernels
+
+        optional_persistent = kernel.persistent_reduction and not kernel_kwargs.get(
+            "override_persistent_reduction"
+        )
+        optional_cooperative = kernel.cooperative_reduction and not kernel_kwargs.get(
+            "override_cooperative_reduction"
+        )
+        if optional_persistent:
+            kernels.append(
+                self.kernel_type(
+                    *kernel_args,
+                    **kernel_kwargs,
+                    override_persistent_reduction=False,
+                )
+            )
+        if optional_cooperative:
+            rnumel = kernel.features.reduction_numel
+            if V.graph.sizevars.statically_known_leq(rnumel, 65536):
+                kernels.append(
+                    other := self.kernel_type(
+                        *kernel_args,
+                        **kernel_kwargs,
+                        override_cooperative_reduction=False,
+                    )
+                )
+                if optional_persistent and other.persistent_reduction:
+                    kernels.append(
+                        self.kernel_type(
+                            *kernel_args,
+                            **kernel_kwargs,
+                            override_cooperative_reduction=False,
+                            override_persistent_reduction=False,
+                        )
+                    )
+
+        if len(kernels) > 1:
+            for kernel2 in kernels[1:]:
+                # A kernel that keeps its reduction in registers still has to
+                # be handed the buffers that form would have needed, so that
+                # every alternative is called with the same arguments.
+                kernel2.must_keep_buffers = kernel.must_keep_buffers
+            # A kernel that keeps its reduction has to be printed last, because
+            # that is what decides which buffers the earlier ones must keep.
+            kernels.sort(key=lambda k: k.persistent_reduction)
+
+        return kernels
+
     def _emit_kernel_to_wrapper(
         self,
         wrapper,
