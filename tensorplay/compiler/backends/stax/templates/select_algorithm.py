@@ -79,6 +79,12 @@ from tensorplay.utils._filelock import FileLock
 from ..compile_log import timed_block, trace_structured
 from ..codecache import PersistentCache
 from ..utils import counters, restore_stdout_stderr
+from ..codegen.triton import TritonKernel
+from ..codegen.simd_kernel_features import SIMDKernelFeatures
+from ..codegen.common import WorkspaceArg
+from ..loop_body import identity
+from ..utils import FakeIndentedBuffer, sympy_product
+from ..runtime.hints import TritonMeta
 from ..autotune_process import PrecompileThreadPool, use_pipelined_autotuning
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
@@ -1077,7 +1083,7 @@ class TritonChoiceCaller(ChoiceCaller):
     def autoheuristic_id(self) -> str:
         return "triton_template"
 
-class TritonTemplateKernel:
+class TritonTemplateKernel(TritonKernel):
     """One built kernel: its source, the symbol it defines, and how to launch.
 
     Kept apart from the template that describes it because the two have
@@ -1091,63 +1097,180 @@ class TritonTemplateKernel:
     #: One kernel per distinct source, however many templates asked for it.
     _memo: dict = {}
 
-    def __init__(self, kernel_name: str, source: str, symbol: str, grid=None,
-                 meta: dict | None = None):
+    def __init__(
+        self,
+        kernel_name,
+        input_nodes: tuple[ir.IRNode, ...],
+        output_node,
+        defines,
+        num_stages,
+        num_warps,
+        grid_fn,
+        meta,
+        call_sizes,
+        num_consumer_groups=0,
+        num_buffers_warp_spec=0,
+        use_jit=False,
+        tma_store=False,
+        tma_load_for_template_epilogue=False,
+        transpose_discontiguous_tensor_descriptors_override=None,
+        prefix_args=0,
+        suffix_args=0,
+        epilogue_fn=identity,
+        subgraphs: list[ir.ComputedBuffer] | None = None,
+        workspace_arg: WorkspaceArg | None = None,
+        prologue_loads_all_inputs=False,
+        hint_override: int | None = None,
+        triton_meta: TritonMeta | None = None,
+        always_freeze_layout: bool = False,
+        index_dtype_override: str | None = None,
+    ) -> None:
+        tma_2d = tma_store or tma_load_for_template_epilogue
+        if tma_store:
+            pass
+        numel = sympy_product(output_node.get_size())
+        if tma_2d:
+            if len(output_node.get_size()) != 2:
+                raise AssertionError(
+                    "TMA load/store only supported for 2D with templates"
+                )
+            tiling = {
+                "x": output_node.get_size()[0],
+                "y": output_node.get_size()[1],
+                "r0_": sympy.S.One,
+            }
+        else:
+            tiling = {
+                "x": numel,
+                "r0_": sympy.S.One,
+            }
+        super().__init__(
+            tiling,
+            features=SIMDKernelFeatures([], numel),
+            hint_override=hint_override,
+        )
+        if tma_2d:
+            # By default `construct_range_trees` will return the range_trees in the order
+            # ["z", "y", "x", "r0_", "r1_"] (see simd.py:all_prefixes)
+            # and this order defines what the kernel block shape will be. So if the template
+            # input / output has requested e.g. ["x", "y"], `construct_range_trees` will still return the
+            # trees in the order ["y", "x"]. This would mean that the template would need to transpose
+            # the loaded value.
+            # The below sorts the range trees according to that required by the caller
+            prefix_to_range_tree = {rt.prefix: rt for rt in self.range_trees}
+            pw_sorted_range_trees = []
+            reduction_idx = None
+            for i, prefix in enumerate(tiling):
+                rt = prefix_to_range_tree[prefix]
+
+                if rt.is_reduction:
+                    reduction_idx = i
+                    break
+                rt.index = i
+                rt.grid_dim = i
+                rt.tensor_dim = i
+                pw_sorted_range_trees.append(rt)
+            self.range_trees = pw_sorted_range_trees + self.range_trees[reduction_idx:]
+
+        self.input_nodes = input_nodes
+        self.output_node = output_node
+        self.named_input_nodes = {}  # type: ignore[var-annotated]
+        self.defines = defines
         self.kernel_name = kernel_name
-        self.source = source
-        self.symbol = symbol
-        self.grid = grid
-        self.meta = dict(meta or {})
-        self._fn = None
+        self.use_jit = use_jit
+        self.tma_store = tma_store
+        self.tma_load_for_template_epilogue = tma_load_for_template_epilogue
+        self.transpose_discontiguous_tensor_descriptors_override = (
+            transpose_discontiguous_tensor_descriptors_override
+        )
+        self.num_stages = num_stages
+        self.num_warps = num_warps
+        self.num_consumer_groups = num_consumer_groups
+        self.num_buffers_warp_spec = num_buffers_warp_spec
+        self.grid_fn = grid_fn
+        self.meta = meta
+        self.call_sizes = call_sizes
+        # for templates with fixed epilogues
+        self.prefix_args = prefix_args
+        self.suffix_args = suffix_args
+        # pyrefly: ignore [invalid-type-var]
+        self.epilogue_fn = epilogue_fn
+        self.render_hooks = {}  # type: ignore[var-annotated]
+        self.triton_meta: TritonMeta | None = triton_meta
+        self._index_dtype_override = index_dtype_override
+        # For Templated Attention this can be a list of ir.Subgraph
+        self.subgraphs: list[ir.ComputedBuffer] | None = subgraphs
+
+        # Some templates use extra global memory as a workspace
+        self.workspace_arg = workspace_arg
+        if workspace_arg is not None:
+            self.args.workspace_args.append(workspace_arg)
+
+        # The following attributes (body, template_mask, output_val) are all
+        # used for triton kernel codegen.
+        # They are swapped onto the TritonTemplateKernel object by
+        # `set_subgraph_body`
+        self.subgraph_bodies: dict[str, SubgraphInfo] = {}
+
+        # input buffers which we are allowed to prologue fuse into
+        self.prologue_supported_inputs: OrderedSet[str] = OrderedSet()
+
+        # input buffers which we are fusing into
+        self.prologue_fused_inputs: OrderedSet[str] = OrderedSet()
+        # input buffers which we are fusing into, which preserve a zero mask
+        self.prologue_fused_inputs_preserve_zero: OrderedSet[str] = OrderedSet()
+
+        # The following attributes are all used for triton kernel codegen.
+        # They are swapped onto the TritonTemplateKernel object by
+        # `set_subgraph_body`
+        # NB: the names here must match the fields in SubgraphInfo
+        self.body: IndentedBuffer = FakeIndentedBuffer()
+        self.compute: IndentedBuffer = FakeIndentedBuffer()
+        self.indexing_code: IndentedBuffer = FakeIndentedBuffer()
+        self.loads: IndentedBuffer = FakeIndentedBuffer()
+        self.stores: IndentedBuffer = FakeIndentedBuffer()
+        self.template_mask: str | None = None
+        self.template_out_shape: str | tuple[str] | None = None
+        self.ops_handler: V.WrapperHandler | None = None  # type: ignore[name-defined]
+        self.root_var_renames: dict[str, str] = {}
+
+        # When caching is enabled, the generated code is not dependent on the input nodes names, or
+        # symbolic sizes names.
+        # However, some of the variables returned by generate_and_load that are computed during the
+        # triton template expansions (code generation) are dependent on those.
+        # In order to cache the code generation and avoid redoing it for similar inputs that varies only by
+        # input names or symbol names, we do a record and replay method.
+        # During template expansions we record all function calls that change input_dependent_preserved_state
+        # and replay them on a cache hit to regenerate them.
+        self.cached_replay_events: RecordedEventsType | None = None
+
+        # Update each time an input is marked frozen, used to replay the freezing of inputs on a cache hit.
+        self.frozen_layouts_cnt = 0
+
+        # When prologue_loads_all_inputs is true, prologue_supported_inputs is populated during def_kernel
+        # by adding all inputs.
+        self.prologue_loads_all_inputs = prologue_loads_all_inputs
+
+        # When always_freeze_layout is True, get_stride_and_maybe_freeze_layout will
+        # always freeze the layout immediately, bypassing layout constraints.
+        # Set by templates that need the layout settled before anything is
+        # loaded, which the attention templates do because a descriptor is
+        # written against a layout rather than against a shape.
+        self.always_freeze_layout = always_freeze_layout
+
+        # Extra functions to be exposed during partial template rendering.
+        self.extra_template_env_fns: list[Callable[..., Any]] = []
+
+        # Tracking for intermediate variables
+        self.tmp_var_ctr = itertools.count()
 
     @property
-    def key(self) -> str:
-        return hashlib.sha256(self.source.encode("utf-8")).hexdigest()[:24]
 
     @classmethod
-    def get(cls, kernel_name: str, source: str, symbol: str, grid=None,
-            meta: dict | None = None) -> "TritonTemplateKernel":
-        """The kernel for this source, built once and shared from then on."""
 
-        key = hashlib.sha256(source.encode("utf-8")).hexdigest()[:24]
-        found = cls._memo.get(key)
-        if found is not None:
-            return found
-        kernel = cls(kernel_name, source, symbol, grid, meta)
-        cls._memo[key] = kernel
-        return kernel
 
-    def build(self):
-        """The compiled function, made on the first ask and kept afterwards."""
 
-        if self._fn is None:
-            from ..codegen.triton_conv import _build
 
-            self._fn = _build(self.source, f"<tensorplay-stax-{self.key}>", self.symbol)
-        return self._fn
-
-    def __call__(self, *args, **kwargs):
-        """Launch, computing the grid first when this kernel was given a way to.
-
-        A kernel that knows how many programs to start is asked; one that was
-        handed the count launches with it.  The two are told apart by whether a
-        way to compute it was supplied at all, rather than by a flag, because a
-        kernel given no way has nothing to compute and a kernel given one has
-        nothing to be told.
-        """
-
-        if self.grid is None:
-            return self.build()(None, *args, **kwargs)
-        grid = self.grid(*args, **kwargs) if callable(self.grid) else self.grid
-        return self.build()[grid](*args, **kwargs)
-
-    def launch_with(self, grid, *args, **kwargs):
-        """Launch with the grid already counted, for a caller that counted it."""
-
-        return self.build()[grid](*args, **kwargs)
-
-    def __repr__(self) -> str:
-        return f"TritonTemplateKernel({self.kernel_name})"
 
     @property
     def index_dtype(self) -> str:
