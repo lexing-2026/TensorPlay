@@ -45,9 +45,15 @@ from ..heuristics.registry import (
 from .triton import CHOICES
 from ..codegen.subgraph import SubgraphChoiceCaller
 from ..codegen.simd import IterationRangesEntry, IterationRangesRoot
-from ..codegen.common import CSE, IndentedBuffer
+from ..codegen.common import CSE, IndentedBuffer, OpOverrides
 from ..codegen.triton import texpr
-from ..utils import get_dtype_size, sympy_dot, sympy_product, unique
+from ..utils import (
+    get_dtype_size,
+    sympy_dot,
+    sympy_product,
+    triton_type_to_torch,
+    unique,
+)
 from ..kernel_scheduler import count_flops_fx
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
 
@@ -1325,6 +1331,303 @@ class TritonTemplateKernel:
         if self.body.getvalue() != "":
             raise AssertionError("Body should be clear before adding a modification")
         return self.subgraphs[subgraph_number]
+
+    def _generate_index_from_tma_index(
+        self,
+        output_name: str,
+        offset_name: str,
+        tma_index: sympy.Symbol,
+        block_size: str,
+        dim: int,
+        num_dims: int,
+        block_name: str | None = None,
+    ) -> list[str]:
+        """Turn a block descriptor's offset back into an index a load can use.
+
+        A block descriptor is handed an offset and works out the addresses
+        itself, which is efficient but leaves nothing to do arithmetic on.  So
+        the offset is written out as well, and a body that needs to fuse into
+        what the descriptor loaded gets the index the descriptor implies.
+
+        The name given for the block is fixed for the whole kernel rather than
+        per call, because it has to be a constant declared once at the top.
+        """
+
+        if block_name:
+            if block_name in self.prologue_cache:
+                if self.prologue_cache[block_name] != block_size:
+                    raise AssertionError(
+                        f"Constant {block_name} must be used for all stores"
+                    )
+            else:
+                self.prologue_cache[block_name] = block_size
+                self.prologue.writeline(f"{block_name}: tl.constexpr = {block_size}")
+        else:
+            block_name = block_size
+        line0 = f"{offset_name} = {texpr(tma_index)}"
+        expr = f"({offset_name} + tl.arange(0, {block_name}))"
+        prefix_none = "".join(["None, "] * dim)
+        suffix_none = ", ".join(["None"] * (num_dims - (dim + 1)))
+        line1 = f"{output_name} = {expr}[{prefix_none}:, {suffix_none}]"
+        return [line0, line1]
+
+    def _generated_mask_for_tma(
+        self,
+        index_name: str,
+        shape_val: str,
+        output_name: str,
+    ) -> str:
+        """The line that says which of a block's elements are really there.
+
+        A block is a fixed number of elements whichever way it is addressed,
+        so the ones past the end of the tensor have to be told apart from the
+        ones inside it.  A body that fuses on the loaded value needs that
+        distinction as a value, not as the descriptor's own handling of it.
+        """
+
+        return f"{output_name} = {index_name} < {shape_val}"
+
+    def store_output(
+        self,
+        indices: list[Any] | tuple[Any],
+        val: str,
+        mask: str | None = None,
+        indent_width: int = 4,
+        val_shape: tuple[str] | None = None,
+        block_indexing: bool = False,
+    ) -> str:
+        """Write the result out, and fuse anything that was folded into it.
+
+        The body's text cannot say where the result is written, because the
+        body does not know the result's layout -- the kernel does, and decides
+        it while the subgraph is being lowered.  So this leaves a placeholder
+        where the write goes and fills it in after.
+
+        `indices` names one thing per dimension of the result.  `val` is what
+        is written, and writing it at those indices is what "the result"
+        means.  A `mask` says which of those are really there, for a result
+        whose extent is not a multiple of the block.
+
+        `val_shape` is the shape of `val` when the body is working in blocks,
+        which is not the result's own shape.  `block_indexing` says the
+        indices are offsets into a block rather than the indices themselves.
+        """
+
+        subgraph_idx = next(self.store_output_ctr)
+        subgraph_name = self._get_store_output_subgraph_name(subgraph_idx)
+        with self.create_subgraph_body(subgraph_name, clear_cse=True):
+            if not isinstance(indices, (list, tuple)):
+                raise AssertionError(
+                    f"expected indices to be list or tuple, got {type(indices)}"
+                )
+            if not isinstance(val, str):
+                raise AssertionError(f"expected val to be str, got {type(val)}")
+            if not isinstance(mask, (str, type(None))):
+                raise AssertionError(
+                    f"expected mask to be str or None, got {type(mask)}"
+                )
+            if not isinstance(val_shape, (tuple, type(None))):
+                raise AssertionError(
+                    f"expected val_shape to be tuple or None, got {type(val_shape)}"
+                )
+            if not isinstance(block_indexing, bool):
+                raise AssertionError(
+                    f"expected block_indexing to be bool, got {type(block_indexing)}"
+                )
+            if self.template_mask is not None:
+                raise AssertionError("template_mask must be None")
+            indices = list(map(OpOverrides.paren, indices))
+            index_symbols = [sympy.Symbol(x, integer=True) for x in indices]
+            lengths = [
+                V.graph.sizevars.simplify(s) for s in self.output_node.get_size()
+            ]
+            if len(indices) != len(lengths):
+                raise AssertionError(
+                    f"expected len(indices) == len(lengths), got {len(indices)} and {len(lengths)}"
+                )
+
+            output_layout = self.output_node.get_layout()
+            self.template_out = val
+            if block_indexing:
+                if not val_shape:
+                    raise AssertionError(
+                        "Blocking indexing requires passing in val_shape"
+                    )
+                if len(val_shape) != 2:
+                    raise AssertionError(
+                        "Blocking indexing only supports 2D data at this time"
+                    )
+                if mask:
+                    raise AssertionError("Mask is not supported with blocking indexing")
+                intermediate_lines: list[str] = []
+                epilogue_index_symbols: list[sympy.Symbol] = []
+                if self.tma_store or self.tma_load_for_template_epilogue:
+                    val_shape_copy = list(val_shape)
+                    for i, range_tree in enumerate(self.range_trees[:-1]):
+                        name = range_tree.name
+                        symbol = range_tree.symbol()
+                        epilogue_index_symbols.append(symbol)
+                        lookup_output = range_tree.lookup(sympy.S.One, lengths[i])
+                        old_symbol = lookup_output.symbol()
+                        lookup_output.set_name(name)
+                        # Update var_list and var_range
+                        range_tree.var_list[range_tree.var_list.index(old_symbol)] = (
+                            symbol
+                        )
+                        range_val = range_tree.var_ranges[old_symbol]
+                        del range_tree.var_ranges[old_symbol]
+                        range_tree.var_ranges[symbol] = range_val
+                        # Keep block-shape inference metadata in sync with the
+                        # renamed epilogue range symbols used below.
+                        if self.range_tree_nodes.get(old_symbol) is lookup_output:
+                            del self.range_tree_nodes[old_symbol]
+                        self.range_tree_nodes[symbol] = lookup_output
+                        intermediate_lines.extend(
+                            self._generate_index_from_tma_index(
+                                name,
+                                "xoffset" if name == "xindex" else "yoffset",
+                                index_symbols[i],
+                                val_shape[i],
+                                i,
+                                len(val_shape),
+                                block_name=range_tree.symt.name,
+                            )
+                        )
+                        # Generate the xmask and ymask
+                        intermediate_lines.append(
+                            self._generated_mask_for_tma(
+                                name,
+                                self.size(None, i),
+                                "xmask" if name == "xindex" else "ymask",
+                            )
+                        )
+                        # Update the val_shape information to use consistent naming
+                        # after the remapping.
+                        val_shape_copy[i] = range_tree.symt.name
+                    val_shape = tuple(val_shape_copy)
+                else:
+                    mask_vars: list[str] = []
+                    for i, (index, shape) in enumerate(zip(index_symbols, val_shape)):
+                        index_name = self._gen_tmp_var()
+                        offset_name = self._gen_tmp_var()
+                        intermediate_lines.extend(
+                            self._generate_index_from_tma_index(
+                                index_name,
+                                offset_name,
+                                index,
+                                shape,
+                                i,
+                                len(index_symbols),
+                            )
+                        )
+                        epilogue_index_symbols.append(
+                            sympy.Symbol(index_name, integer=True)
+                        )
+                        mask_name = self._gen_tmp_var()
+                        intermediate_lines.append(
+                            self._generated_mask_for_tma(
+                                index_name,
+                                self.size(None, i),
+                                mask_name,
+                            )
+                        )
+                        mask_vars.append(mask_name)
+                    final_mask_var = self._gen_tmp_var()
+                    final_mask_rhs = " & ".join(
+                        f"{mask_name}" for mask_name in mask_vars
+                    )
+                    intermediate_lines.append(f"{final_mask_var} = {final_mask_rhs}")
+                    self.template_mask = final_mask_var
+                index_symbols = epilogue_index_symbols
+                contiguous_index = sympy_dot(output_layout.stride, index_symbols)
+                if not (self.tma_store or self.tma_load_for_template_epilogue):
+                    # Convert to just use xindex.
+                    contiguous_index = self.rename_indexing(contiguous_index)
+                    intermediate_lines.append(f"xindex = {texpr(contiguous_index)}")
+                    self.range_trees[0].lookup(
+                        sympy.S.One, sympy_product(lengths)
+                    ).set_name("xindex")
+                index_symbols = epilogue_index_symbols
+                output_index = contiguous_index
+                # Write out the intermediate lines
+                for line in intermediate_lines:
+                    self.body.writeline(line)
+            else:
+                if self.tma_store:
+                    raise AssertionError("TMA store requires block indexing")
+                contiguous_index = self._setup_contiguous_index_state(
+                    indices, index_symbols, lengths, mask
+                )
+                output_index = self.output_node.get_layout().make_indexer()(
+                    index_symbols
+                )
+                output_index = self.rename_indexing(output_index)
+                if output_index == contiguous_index:
+                    output_index = sympy.Symbol("xindex", integer=True)
+
+            self.template_out_shape = val_shape if val_shape else val
+            acc_dtype = (
+                triton_type_to_torch(self.meta["ACC_TYPE"])
+                if "ACC_TYPE" in self.meta
+                else tp.float32
+            )
+            output_dtype = self.output_node.get_dtype()
+
+            epilogue_args = [
+                V.kernel.cse.namedvar(val, dtype=acc_dtype, shape=val_shape)
+            ]
+            epilogue_nodes_by_subgraph = getattr(
+                self, "_epilogue_nodes_by_subgraph", None
+            )
+            has_epilogue_fusion = bool(
+                epilogue_nodes_by_subgraph[subgraph_idx]
+                if epilogue_nodes_by_subgraph is not None
+                else False
+            )
+            for input_node in itertools.chain(
+                self.input_nodes[: self.prefix_args],
+                self.input_nodes[len(self.input_nodes) - self.suffix_args :],
+            ):
+                input_node.freeze_layout()
+                epilogue_arg = V.kernel.cse.generate(
+                    self.compute,
+                    input_node.make_loader()(index_symbols),
+                    dtype=acc_dtype,
+                    shape=input_node.get_size(),
+                )
+                epilogue_args.append(epilogue_arg)
+                # We update frozen_layouts_cnt in order to replay this function
+                # on a cache hit.
+                self.frozen_layouts_cnt += 1
+
+            # Apply the template's manual epilogue (e.g., bias add for addmm)
+            epilogue_result = self.epilogue_fn(*epilogue_args)
+
+            # When acc_dtype differs from output_dtype and there are fused
+            # epilogue ops, emulate unfused numerics by truncating AFTER the
+            # manual epilogue (so bias add happens in full precision)
+            if acc_dtype != output_dtype and has_epilogue_fusion:
+                epilogue_result = V.ops.to_dtype(
+                    epilogue_result,
+                    output_dtype,
+                    src_dtype=acc_dtype,
+                    use_compute_types=False,
+                )
+                epilogue_result = V.ops.to_dtype(
+                    epilogue_result, acc_dtype, src_dtype=output_dtype
+                )
+
+            V.ops.store(
+                self.output_node.get_name(),
+                output_index,
+                epilogue_result,
+                mode="tma" if self.tma_store else None,
+            )
+            self.codegen_body()
+
+        return self._register_hook(
+            subgraph_name, self._make_codegen_hook(subgraph_name, indent_width)
+        )
 
 
 def _compile_rendered(template, source: str, config: dict, constants: dict,
