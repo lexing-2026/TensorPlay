@@ -36,6 +36,7 @@ successful match or a `FailedMatch` object for a failure to match.
 from __future__ import annotations
 
 import contextlib
+import sys
 import dataclasses
 import functools
 import importlib
@@ -63,6 +64,7 @@ from .utils import counters
 from tensorplay.primitives.common import is_integer_dtype
 from tensorplay._higher_order_ops._hop_base import (
     FakeTensorMode,
+    HigherOrderOperator,
     disable_functional_mode,
     disable_proxy_modes_tracing,
     is_fake_tensor,
@@ -71,9 +73,11 @@ from tensorplay._higher_order_ops._hop_base import (
 from tensorplay._higher_order_ops.utils import make_fx
 from tensorplay.graph.experimental.symbolic_shapes import guard_or_false
 from .sizevars import statically_known_true
+from tensorplay.graph.graph import _Namespace
 from tensorplay.graph.graph_module import _get_attr
 from tensorplay.graph.immutable_collections import immutable_dict, immutable_list
-from tensorplay.graph.node import map_arg, map_aggregate
+from tensorplay.graph import Graph, GraphModule, Interpreter, Node
+from tensorplay.graph.node import Target, map_arg, map_aggregate
 from tensorplay.graph.proxy import Proxy, _PRESERVED_NODE_META_FIELDS
 from tensorplay._ops import OpOverload
 from tensorplay._higher_order_ops._hop_base import detect_fake_mode
@@ -147,7 +151,7 @@ class TraceFn(Protocol):
 T = TypeVar("T")
 
 # What's a better name for this?
-FnsType = Any | str
+FnsType = Target | str
 
 
 class Multiple:
@@ -374,8 +378,8 @@ class Match:
                 fake_kwargs = {**fake_kwargs}
                 match_args, match_kwargs = tuple(self.args), self.kwargs
 
-                def record(node: Any, val: Any) -> None:
-                    if isinstance(node, Any):
+                def record(node: Node, val: Any) -> None:
+                    if isinstance(node, Node):
                         node_to_val[node] = val
 
                 pytree.tree_map(
@@ -624,8 +628,8 @@ def _tensor_values_equal(a: Any, b: Any) -> bool:
 
 
 def _constant_values_equal(a: Any, b: Any) -> bool:
-    if isinstance(a, Any) or isinstance(b, Any):
-        if not isinstance(a, Any) or not isinstance(b, Any):
+    if isinstance(a, tp.Tensor) or isinstance(b, tp.Tensor):
+        if not isinstance(a, tp.Tensor) or not isinstance(b, tp.Tensor):
             return False
         if (
             a.dtype != b.dtype
@@ -635,7 +639,7 @@ def _constant_values_equal(a: Any, b: Any) -> bool:
             or a.requires_grad != b.requires_grad
         ):
             return False
-        if a.layout == Any and (
+        if a.layout == tp.strided and (
             a.stride() != b.stride() or a.storage_offset() != b.storage_offset()
         ):
             return False
@@ -673,7 +677,7 @@ def _python_constant_repr(value: Any) -> str:
 
 
 def _tensor_constant_repr(value: Any) -> str:
-    if value.layout != Any:
+    if value.layout != tp.strided:
         raise NotImplementedError(
             f"NYI: serializing get_attr tensor with layout {value.layout}"
         )
@@ -728,7 +732,7 @@ class GetAttr(PatternExpr):
         return isinstance(self.users, Multiple) or self.users > 1
 
     def _match(self, node: NodeOrConstant, ctx: MatchContext) -> MatchResult:
-        if not isinstance(node, Any) or node.op != "get_attr":
+        if not isinstance(node, Node) or node.op != "get_attr":
             return FailedMatch("get_attr_mismatch: node={}, pattern={}", node, self)
         if (
             self not in ctx.outputs
@@ -870,7 +874,7 @@ class _TargetExpr(PatternExpr):
 
     def _match_fns(self, node: Any) -> bool:
         return (
-            isinstance(node, Any)
+            isinstance(node, Node)
             and node.op == self.op
             and extract_target(node) in self.fns_set
         )
@@ -1029,7 +1033,7 @@ class _TargetArgsExpr(_TargetExpr):
                 if not is_match(child_match):
                     return child_match
                 m.extend(child_match)
-            elif isinstance(child_node, Any) or child_node != pattern:
+            elif isinstance(child_node, Node) or child_node != pattern:
                 return FailedMatch(
                     "constant_args: {} {!r}!={pattern!r}",
                     node,
@@ -1057,7 +1061,7 @@ class _TargetArgsExpr(_TargetExpr):
         for pattern in self.flat_args_kwargs[0]:
             if isinstance(pattern, PatternExpr):
                 for other_node in pattern.find_anchor_nodes(ctx, searched):
-                    if not isinstance(other_node, Any):
+                    if not isinstance(other_node, Node):
                         continue
                     for node in other_node.users:
                         if node not in searched:
@@ -1335,7 +1339,7 @@ class PatternPrettyPrinter:
                 return memoized_name
             else:
                 return self.memoize(obj)
-        if isinstance(obj, Any):
+        if isinstance(obj, _TargetArgsExpr):
             return _tensor_constant_repr(obj)
         if hasattr(obj, "pretty_print"):
             return obj.pretty_print(self)
@@ -1444,7 +1448,7 @@ class ReplacementPatternEntry(PatternEntry):
         added_replacement_nodes: list[Any] = []
         custom_context = _common_custom_context(match.nodes)
 
-        class Replacer(Any):
+        class Replacer(Interpreter):
             call_method = None  # type: ignore[assignment]
             call_module = None  # type: ignore[assignment]
             get_attr = None  # type: ignore[assignment]
@@ -1480,7 +1484,7 @@ class ReplacementPatternEntry(PatternEntry):
                     )
 
                     sub_gm = super().get_attr(target, args, kwargs)
-                    if not isinstance(sub_gm, Any):
+                    if not isinstance(sub_gm, GraphModule):
                         raise NotImplementedError(
                             f"NYI: replacement_graph.{target} is not a graph module. Got {sub_gm}."
                         )
@@ -1518,7 +1522,7 @@ class ReplacementPatternEntry(PatternEntry):
             indices = [
                 (nodes.index(n), n)
                 for n in output_nodes
-                if isinstance(n, Any)
+                if isinstance(n, Node)
             ]
             last_node = min(indices, key=operator.itemgetter(0))[1]
 
@@ -1543,12 +1547,12 @@ class ReplacementPatternEntry(PatternEntry):
                     queue.extend(arg.all_input_nodes)
 
         with graph.inserting_before(last_node):
-            if not isinstance(replacement_graph, Any):
+            if not isinstance(replacement_graph, GraphModule):
                 raise AssertionError(
                     f"expected GraphModule, got {type(replacement_graph)}"
                 )
             replacement = Replacer(replacement_graph).run(*args)
-            if isinstance(replacement, Any):
+            if isinstance(replacement, Node):
                 replacement = [replacement]
 
             def maybe_getitem(node: Any) -> Any:
@@ -1573,7 +1577,7 @@ class ReplacementPatternEntry(PatternEntry):
                     if new is not None:
                         raise AssertionError("expected new to be None when old is None")
                     return
-                if not isinstance(old, Any):
+                if not isinstance(old, Node):
                     raise AssertionError(f"expected Any, got {type(old)}")
                 if new is None:
                     old.replace_all_uses_with(
@@ -1583,7 +1587,7 @@ class ReplacementPatternEntry(PatternEntry):
                     if len(old.users) == 0:
                         graph.erase_node(old)
                     return
-                if isinstance(new, Any):
+                if isinstance(new, Node):
                     _transfer_meta(new.meta, old, pass_name=pass_name or "")
 
                     # Preserve the recompute tags in the replacement graph. We
@@ -1663,7 +1667,7 @@ class ReplacementPatternEntry(PatternEntry):
             if (
                 not node.users
                 and not node.is_impure()
-                and not isinstance(node.target, Any)
+                and not isinstance(node.target, HigherOrderOperator)
             ):
                 graph.erase_node(node)
 
@@ -1889,7 +1893,7 @@ def register_replacement(
     )
     initial_arg_info = _trace_arg_info(argnames_static, initial_trace_args)
     requires_grad = pytree.tree_map(
-        lambda x: isinstance(x, Any) and x.requires_grad,
+        lambda x: isinstance(x, tp.Tensor) and x.requires_grad,
         initial_trace_args,
     )
 
@@ -1922,7 +1926,7 @@ def register_replacement(
             def refresh_arg(arg: Any) -> Any:
                 nonlocal invalid_args
                 grad = next(requires_grad_values)
-                if not isinstance(arg, Any):
+                if not isinstance(arg, tp.Tensor):
                     return arg
 
                 if grad and is_integer_dtype(arg.dtype):
@@ -1937,7 +1941,7 @@ def register_replacement(
                     requires_grad=grad,
                 )
                 for v in itertools.chain(refreshed_arg.shape, refreshed_arg.stride()):
-                    if isinstance(v, Any) and all(
+                    if isinstance(v, tp.SymInt) and all(
                         statically_known_true(v != a) for a in sym_args
                     ):
                         sym_args.append(v)
@@ -2129,7 +2133,7 @@ def _serialize_pattern(
             # noqa: F401, E501
             {msg}
             import operator
-            import tensorplay
+            import tensorplay as tp
 
             operator_set = tp.ops.tp
             prims = tp.ops.prims
@@ -2137,9 +2141,13 @@ def _serialize_pattern(
             """
         ).format(msg=auto_generated_msg)
 
+        # The names a generated file has to import are the expression types
+        # defined here, so it is this module that has to be looked at -- which
+        # it cannot be by name, since it is still being defined.
+        this_module = sys.modules[__name__]
         pattern_matcher_imports = []
-        for name in dir(pattern_matcher):
-            attr = getattr(pattern_matcher, name)
+        for name in dir(this_module):
+            attr = getattr(this_module, name)
             try:
                 if isinstance(attr, type) and issubclass(
                     attr, (PatternExpr, _TargetExpr)
@@ -2149,7 +2157,10 @@ def _serialize_pattern(
                 pass
 
         formatted_imports = ",\n   ".join(pattern_matcher_imports)
-        formatted_imports = f"from pattern_matcher import (\n   {formatted_imports},\n)\n"
+        formatted_imports = (
+            "from tensorplay.compiler.backends.stax.pattern_matcher import (\n   "
+            f"{formatted_imports},\n)\n"
+        )
         return f"{file_template}{formatted_imports}"
 
     if not SERIALIZED_PATTERN_PATH.is_dir():
@@ -2617,9 +2628,9 @@ class PatternMatcherPass:
         """Apply all registered patterns to the graph, returning the number of matches."""
         if not self.patterns:
             return 0
-        if isinstance(gm, Any):
+        if isinstance(gm, GraphModule):
             graph = gm.graph
-        elif isinstance(gm, Any):
+        elif isinstance(gm, Graph):
             graph = gm
             gm = graph.owning_module  # type: ignore[assignment]
         else:
@@ -2642,7 +2653,7 @@ class PatternMatcherPass:
         if has_call_module:
             nodes.append(graph.find_nodes(op="call_module", sort=False))
         pass_name = self.pass_name if self.pass_name is not None else "pattern_matcher"
-        if not isinstance(gm, Any):
+        if not isinstance(gm, GraphModule):
             raise AssertionError(f"expected GraphModule, got {type(gm)}")
         with GraphTransformObserver(gm, pass_name, self.subsystem):
             for node in sorted(itertools.chain.from_iterable(nodes), reverse=True):
@@ -2778,7 +2789,7 @@ def fx_to_pattern(
 
     argnum = itertools.count()
 
-    class Converter(Any):
+    class Converter(Interpreter):
         call_method = _not_implemented
         call_module = _not_implemented
 
@@ -2856,7 +2867,7 @@ def fx_to_pattern(
                 rv.users = len(n.users)
             return rv
 
-    if not isinstance(gm, Any):
+    if not isinstance(gm, GraphModule):
         raise AssertionError(f"expected GraphModule, got {type(gm)}")
     pattern = Converter(gm).run()
     if not isinstance(pattern, PatternExpr):
@@ -2885,7 +2896,7 @@ def fwd_only(
     ):
         gm = make_fx(fn, get_decomp_fn(), tracing_mode="real")(*args)
 
-    from .fx_passes.post_grad import remove_noop_ops
+    from .graph_passes.post_grad import remove_noop_ops
 
     if run_functional_passes:
         remove_noop_ops(gm.graph)
@@ -2938,7 +2949,7 @@ def joint_fwd_bwd(
     if not gm:
         raise AssertionError("gm was not set")
 
-    from .fx_passes.post_grad import remove_noop_ops
+    from .graph_passes.post_grad import remove_noop_ops
 
     remove_noop_ops(gm.graph)
 
