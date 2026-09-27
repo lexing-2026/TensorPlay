@@ -1,5 +1,6 @@
 #include "PythonDispatch.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -10,6 +11,17 @@
 
 namespace tensorplay {
 namespace python_dispatch {
+// One included dispatch key, for the length of a block.  Holding the guard by
+// pointer is what lets it be destroyed on demand: the guard is neither
+// copyable nor movable, and this has to be movable to be handed to Python.
+struct PythonDispatcherGuard {
+    explicit PythonDispatcherGuard(DispatchKey key)
+        : guard_(std::make_unique<impl::IncludeDispatchKeyGuard>(key)) {}
+    void release() { guard_.reset(); }
+
+    std::unique_ptr<impl::IncludeDispatchKeyGuard> guard_;
+};
+
 namespace {
 
 void release_pyobject(void* object) {
@@ -350,6 +362,31 @@ void init_python_dispatch(py::module_& m) {
         }
         return out;
     });
+    m.def("_python_dispatch_key_included", []() {
+        return tensorplay::impl::tls_local_dispatch_key_set().included.has(
+            tensorplay::DispatchKey::Python);
+    });
+    // Holds the Python key in this thread's dispatch key set while it is
+    // entered, and puts back what was there when it is left.  While it is
+    // held, an operator reaches the Python layer rather than stopping at the
+    // compiled path, which is what lets a mode that intercepts operators see
+    // every one of them -- including the ones a hand-written shortcut would
+    // otherwise answer before anything asked.
+    //
+    // Leaving the block ends it by letting the guard go, since the
+    // restoration is the guard's own destruction.  That is what the release is
+    // for: a guard held by a value would not be destroyed on leaving.
+    using Guard = tensorplay::python_dispatch::PythonDispatcherGuard;
+    py::class_<Guard>(m, "_IncludePythonDispatcher")
+        .def(py::init([]() { return Guard{tensorplay::DispatchKey::Python}; }))
+        .def("__enter__", [](Guard&) -> void {})
+        .def(
+            "__exit__",
+            [](Guard& self, const py::object&, const py::object&,
+               const py::object&) -> bool {
+                self.release();
+                return false;
+            });
     m.def("_python_dispatch_key_included", []() {
         return tensorplay::impl::tls_local_dispatch_key_set().included.has(
             tensorplay::DispatchKey::Python);
