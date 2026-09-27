@@ -13,6 +13,7 @@ than growing their own flatteners.
 """
 from collections import OrderedDict, defaultdict, deque, namedtuple
 from dataclasses import dataclass, field
+from collections.abc import Iterator
 from typing import Any, Callable, Iterable, Optional, TypeVar, Union
 
 __all__ = [
@@ -234,11 +235,57 @@ def _unflatten(leaves: Any, spec: TreeSpec) -> PyTree:
     return SUPPORTED_NODES[spec.type].unflatten_fn(children, spec.context)
 
 
+def tree_iter(
+    tree: PyTree, is_leaf: Optional[Callable[[PyTree], bool]] = None
+) -> Iterator[Any]:
+    """The leaves of ``tree``, one at a time.
+
+    Same order as :func:`tree_flatten`, without building the list of them or
+    the description of how to put them back -- which is what a caller that
+    only wants to look at each one in turn should not pay for.
+    """
+
+    if tree_is_leaf(tree, is_leaf):
+        yield tree
+        return
+    for child in _children_of(tree):
+        yield from tree_iter(child, is_leaf)
+
+
+def _children_of(tree: PyTree) -> list[Any]:
+    """The sub-structures of a container, in the order they are flattened.
+
+    Taken from the same place :func:`tree_flatten` takes them, so that a walk
+    over the leaves of a tree and a flatten of it agree on what the leaves
+    are and in what order -- which is the whole of what this is for.
+    """
+
+    flatten_fn = SUPPORTED_NODES[_get_node_type(tree)].flatten_fn
+    return list(flatten_fn(tree)[0])
+
+
 def tree_leaves(
     tree: PyTree, is_leaf: Optional[Callable[[PyTree], bool]] = None
 ) -> list[Any]:
     """The leaves of ``tree``, in flatten order."""
     return tree_flatten(tree, is_leaf)[0]
+
+
+def arg_tree_leaves(*args: PyTree, **kwargs: PyTree) -> list[Any]:
+    """The leaves of a call's arguments, in the order they were passed.
+
+    Same answer as ``tree_leaves((args, kwargs))``, reached without building
+    the pair and taking it apart again -- which is the whole of the
+    difference, and is worth having on the paths that ask this question about
+    every call they look at.
+    """
+
+    leaves: list[Any] = []
+    for value in args:
+        leaves.extend(tree_flatten(value)[0])
+    for value in kwargs.values():
+        leaves.extend(tree_flatten(value)[0])
+    return leaves
 
 
 def tree_structure(

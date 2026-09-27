@@ -109,7 +109,14 @@ def register_decomposition(
             for overload in _overloads_of(op):
                 if overload in table:
                     raise RuntimeError(f"duplicate decomposition registered for {overload}")
-                table[overload] = _without_out(fn, overload)
+                # A registry the caller supplied holds whatever that caller
+                # reads back out of it, which need not be a function that
+                # produces a result -- an entry can be a question about the
+                # arguments together with which of them is the value.  Only a
+                # table of decompositions gets the out-variant wrapping.
+                table[overload] = (
+                    fn if registry is not None else _without_out(fn, overload)
+                )
         return fn
 
     return decorator
