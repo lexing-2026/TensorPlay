@@ -461,6 +461,16 @@ deterministic = os.environ.get("TP_DETERMINISTIC", "0") == "1"
 # it, which is the trade when a candidate is suspected of misbehaving.
 autotune_in_subproc = os.environ.get("TP_AUTOTUNE_IN_SUBPROC", "0") == "1"
 
+# Whether a launch tells the runtime what it is launching from a table that
+# says what the fields mean, rather than from whatever fields happen to be
+# readable off the compiled object.  The table is the contract; the readable
+# fields are whichever ones this build of the kernel runtime happens to have,
+# so reading them works until it grows or loses one.  On, so that a build that
+# can be described is described the same way everywhere.
+use_launch_metadata_schema: bool = (
+    os.environ.get("TP_USE_LAUNCH_METADATA_SCHEMA", "1") == "1"
+)
+
 # Whether the product's candidates are searched exhaustively or by the table.
 # Exhaustive costs far more to compile and finds configurations the table does
 # not have, which is worth it for a shape that runs for a long time.
@@ -788,6 +798,28 @@ class _AotIConfigs:
     #: cheaper to fold once, and a graph run once is not.
     use_runtime_constant_folding: bool = False
 
+    #: Where the exported graph and the binaries it launches are written.  A
+    #: relative path is taken as a subdirectory of the cache; unset, a
+    #: directory is made under the cache for this export alone.  A path that
+    #: ends in a module extension names the library to produce, so that a
+    #: caller who asked for a particular name gets one.
+    output_path: str = os.environ.get("TP_AOT_INDUCTOR_OUTPUT_PATH", "")
+
+    #: Package only the C++ side, leaving each kernel to be compiled where it
+    #: will run.  Unset rather than off, because it is not a preference: it
+    #: changes what the export is, and leaving it unset is what says the
+    #: export was not asked to make that choice.
+    package_cpp_only: bool | None = (
+        os.environ.get("TP_PACKAGE_CPP_ONLY", "0") == "1"
+    )
+
+    #: Emit a kernel that runs on more than one architecture, so that one
+    #: build can be deployed to machines that differ.  Unset for the same
+    #: reason as above: it is a statement about what is being produced.
+    emit_multi_arch_kernel: bool | None = (
+        os.environ.get("TP_EMIT_MULTI_ARCH_KERNEL", "0") == "1"
+    )
+
 
 aot_inductor = _AotIConfigs()
 
@@ -806,6 +838,12 @@ class _TritonConfig:
     unique_user_kernel_names = (
         os.environ.get("TP_UNIQUE_USER_KERNEL_NAMES", "0") == "1"
     )
+
+    #: Give every kernel written for an export a name of its own, so that two
+    #: exports that each wrote a kernel under the same name do not collide in
+    #: the runtime's cache.  On, because the collision shows up as one export
+    #: running another's kernel, which is very hard to trace back to here.
+    unique_kernel_names = os.environ.get("TP_UNIQUE_KERNEL_NAMES", "1") == "1"
 
     #: Keep the machine code the runtime produced beside the cache entry, which
     #: is what a reader needs when the entry itself will not load.
