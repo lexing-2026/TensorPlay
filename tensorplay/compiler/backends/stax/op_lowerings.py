@@ -15,6 +15,7 @@ a lowering runs as a library call on realized inputs.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 from collections import defaultdict
 import itertools
@@ -3705,6 +3706,59 @@ def new_empty(x: Any, size: Any, *, dtype: Any = None, device: Any = None) -> An
     # a walk of zeros does -- at the cost of writing them, which for a shape
     # with no positions costs nothing at all.
     return _full(0, device, dtype, list(size))
+
+
+def empty_strided(
+    size: Any, stride: Any, *, dtype: Any = None, device: Any = None
+) -> Any:
+    """A place to write, at a shape and at distances between positions.
+
+    A shape on its own does not say where an element sits: that is the strides'
+    job, and for most values the compiler is free to pick them, which is what
+    ``new_empty`` lets it do by leaving them out.  Some values are not free to
+    pick them.  A kernel handed two buffers has to agree with the caller about
+    how the second one is laid out before either of them reads it, and a value
+    that is also written by a kernel that is not the one computing it cannot be
+    re-laid out afterwards without the two disagreeing.  So the distances are
+    part of what is asked for here, and given, not chosen.
+
+    What the shape is for is the caller to say; what is in the buffer is not the
+    caller's business, which is why this writes a walk of zeros like
+    ``new_empty`` rather than leaving it unset.  That walk is also what gives
+    the buffer a name and a place in the graph, which is what a buffer a kernel
+    fills needs to have before the kernel is written.
+    """
+
+    if not isinstance(size, (list, tuple)):
+        raise AssertionError("expected: isinstance(size, (list, tuple))")
+    if not isinstance(stride, (list, tuple, type(None))):
+        raise AssertionError("expected: isinstance(stride, (list, tuple, None))")
+    if device is None:
+        raise AssertionError("a place to write has to be somewhere to write to")
+
+    pointwise = _full(0, device, dtype, list(size))
+    pointwise.realize()
+    buffer = pointwise.data.data
+    if not isinstance(buffer, ir.ComputedBuffer):
+        raise AssertionError("expected: isinstance(buffer, ir.ComputedBuffer)")
+    # Every position is a zero-length range, so the walk that wrote the zeros
+    # has nothing left to do by the time a kernel writes over it.  Saying so
+    # here is what keeps a buffer nobody reads from being written twice.
+    buffer.data = dataclasses.replace(buffer.data, ranges=[0] * len(size))
+    size = [sympy.expand(s) for s in size]
+    stride = (
+        [sympy.expand(s) for s in stride]
+        if stride
+        else ir.FlexibleLayout.contiguous_strides(size)
+    )
+    buffer.layout = ir.FixedLayout(
+        device=device,
+        dtype=dtype,
+        size=size,
+        stride=stride,
+        is_pinned=False,
+    )
+    return pointwise
 
 
 def gather(x: Any, dim: Any, index: Any, sparse_grad: Any = False) -> Any:
