@@ -430,11 +430,6 @@ max_autotune_gemm_backends = os.environ.get(
     "TP_MAX_AUTOTUNE_GEMM_BACKENDS", "FRAMEWORK,TRITON,CPP"
 ).upper()
 
-# Which backends a measured convolution may be chosen from, for the same reason.
-max_autotune_conv_backends = os.environ.get(
-    "TP_MAX_AUTOTUNE_CONV_BACKENDS", "FRAMEWORK,TRITON,CPP"
-).upper()
-
 # Whether a product is compiled as soon as it is chosen, so that the measuring
 # of the candidates overlaps with the measuring of the next thing.  Off because
 # compiling a product needs a graph of its own, which is work done whether or not
