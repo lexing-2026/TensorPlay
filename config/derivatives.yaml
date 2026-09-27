@@ -57,8 +57,9 @@
 
 # backward node and the scale folds in here. F.dropout rejects p == 1
 # the denominator is never zero, so 1 - p is never zero.
-- name: native_dropout(Tensor input, float p) -> (Tensor output, Tensor mask)
-  input: native_dropout_backward(grad, mask, 1.0 / (1.0 - p))
+- name: native_dropout(Tensor input, float p, bool? train) -> (Tensor, Tensor)
+  output_differentiability: [True, False]
+  input: native_dropout_backward(grad, ret1, 1.0 / (1.0 - p))
 
 # Alpha dropout keeps the kept-elements slope at `a`; the affine offset b
 # contributes no gradient. a = 1/sqrt((alpha^2 p + 1)(1 - p)) is recomputed

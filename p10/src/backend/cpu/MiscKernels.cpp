@@ -36,7 +36,8 @@ Tensor eq_tensor_kernel(const Tensor& self, const Tensor& other);
 
 // Defined below the registration table.
 Tensor& resize__cpu(Tensor& self, const std::vector<int64_t>& size);
-std::tuple<Tensor, Tensor> native_dropout_cpu(const Tensor& input, double p);
+std::tuple<Tensor, Tensor> native_dropout_cpu(const Tensor& input, double p,
+                                             std::optional<bool> train);
 Tensor native_dropout_backward_cpu(const Tensor& grad_output, const Tensor& mask, double scale);
 std::tuple<Tensor, Tensor> native_alpha_dropout_cpu(const Tensor& input, double p);
 Tensor alpha_dropout_backward_cpu(const Tensor& grad, const Tensor& mask, double p);
@@ -587,9 +588,27 @@ Tensor& resize__cpu(Tensor& self, const std::vector<int64_t>& size) {
 // the bool mask consumed by native_dropout's generated backward node
 // (grad * mask / (1 - p)). p == 1 is rejected here because its scale is
 // undefined; F.dropout gates that case in Python.
-std::tuple<Tensor, Tensor> native_dropout_cpu(const Tensor& input, double p) {
-    if (p < 0 || p >= 1) {
-        TP_THROW(ValueError, "native_dropout: p must be in [0, 1)");
+std::tuple<Tensor, Tensor> native_dropout_cpu(const Tensor& input, double p,
+                                             std::optional<bool> train) {
+    if (input.numel() == 0) {
+        return std::make_tuple(input, Tensor::empty_like(input));
+    }
+    if (p < 0 || p > 1) {
+        TP_THROW(ValueError, "native_dropout: p must be in [0, 1]");
+    }
+    if (train.has_value() && !train.value()) {
+        // Not training is not a probability of zero: nothing is dropped, so
+        // everything that was there is still there, and the mask says every
+        // element was kept.
+        return std::make_tuple(input.clone(),
+                               Tensor::ones_like(input, DType::Bool));
+    }
+    if (p == 1) {
+        // Every element is dropped, and the scale that would undo the
+        // dropping is undefined; the weights are all zero and the mask says
+        // so, which is what a backward reading the mask needs.
+        return std::make_tuple(Tensor::zeros_like(input),
+                               Tensor::zeros_like(input, DType::Bool));
     }
     Tensor mask(static_cast<std::vector<int64_t>>(input.shape()), DType::Bool,
                 input.device());

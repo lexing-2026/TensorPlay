@@ -2130,13 +2130,13 @@ def _fused_rms_norm_backward(grad_out, input, normalized_shape, rstd, weight, ou
 @register_decomposition(ops.dropout.default)
 def dropout(input, p: float, train: bool | None = None):
     if train and p != 0:
-        return ops.native_dropout.default(input, p)[0]
+        return ops.native_dropout.default(input, p, train)[0]
     return input
 
 
 @register_decomposition(ops.native_dropout.default)
-def native_dropout(input, p: float):
-    if p != 0:
+def native_dropout(input, p: float, train: bool | None = None):
+    if train and p != 0:
         if p == 1:
             return (tp.zeros_like(input), tp.zeros_like(input, dtype=tp.bool))
         if not input.dtype.is_floating_point:

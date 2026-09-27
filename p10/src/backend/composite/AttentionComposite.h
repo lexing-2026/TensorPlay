@@ -189,7 +189,7 @@ inline std::tuple<Tensor, Tensor> sdpa_math_composite(
       probs = where(*dropout_mask, Scalar(0), probs);
       probs = mul(probs, Scalar(1.0 / (1.0 - dropout_p)));
     } else {
-      probs = std::get<0>(ops::native_dropout(probs, dropout_p));
+      probs = std::get<0>(ops::native_dropout(probs, dropout_p, true));
     }
   }
 

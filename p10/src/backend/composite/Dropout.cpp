@@ -36,7 +36,7 @@ Tensor dropout_native(const Tensor& input, double p, bool train) {
     check_dropout_p(p);
     if (p == 0 || !train || input.numel() == 0) return input;
     if (p == 1) return zero_like_mul(input);
-    return std::get<0>(ops::native_dropout(input, p));
+    return std::get<0>(ops::native_dropout(input, p, train));
 }
 
 Tensor alpha_dropout_native(const Tensor& input, double p, bool train) {

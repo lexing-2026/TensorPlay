@@ -1525,7 +1525,7 @@
 # and the bool keep-mask. The public F.dropout gates training/p==0/p==1 and
 # calls this; autograd flows through the generated node whose formula is
 # grad * mask / (1 - p).
-- func: native_dropout(Tensor input, float p) -> (Tensor output, Tensor mask)
+- func: native_dropout(Tensor input, float p, bool? train) -> (Tensor, Tensor)
   variants: function
   dispatch:
     CPU: native_dropout_cpu
