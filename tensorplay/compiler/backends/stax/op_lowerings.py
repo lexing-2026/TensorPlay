@@ -2774,3 +2774,132 @@ def _register_foreach_remaining() -> None:
 _register_foreach_all()
 _register_foreach_inplace_all()
 _register_foreach_remaining()
+
+
+#: The operations that are computed by handing the whole call to the framework
+#: rather than by compiling them.  Kept apart from the lowering table, because
+#: "how this is computed" and "what this is" are two different facts about the
+#: same operation, and code that asks one of them is not asking the other.
+fallbacks: set = set()
+
+#: The operations whose arguments must be written down before they are handed
+#: over, because the framework is handed the values rather than a description
+#: of how to compute them.
+needs_realized_inputs: set = set()
+
+#: What each operation's arguments must look like for the operation to be
+#: computed at all -- asked before the operation is chosen, not after.
+_maybe_layout_constraints: dict = {}
+
+
+def add_needs_realized_inputs(fn: Any) -> None:
+    """Say that an operation's arguments have to exist as values already.
+
+    An operation computed by handing the call over is given what the operation
+    was called with, not a description of how to produce it, so an argument that
+    is only ever described has to be written down first.
+    """
+
+    if isinstance(fn, (list, set, tuple)):
+        return [add_needs_realized_inputs(x) for x in fn]
+    needs_realized_inputs.add(fn)
+
+
+def add_layout_constraint(fn: Any, constraint: Callable[..., Any]) -> None:
+    """Say what an operation's arguments must look like for it to be computable.
+
+    Some operations are only defined for arguments of a particular shape, and
+    finding that out by trying is how a program ends up failing rather than
+    taking a different path.  The constraint is asked instead, before the
+    operation is committed to.
+    """
+
+    _maybe_layout_constraints[fn] = constraint
+
+
+def get_constraint_for_op(fn: Any) -> Callable[..., Any] | None:
+    """What this operation's arguments must look like, if anything was said."""
+
+    return _maybe_layout_constraints.get(fn)
+
+
+def make_fallback(
+    op: Any,
+    layout_constraint: Callable[..., Any] | None = None,
+    warn: bool = True,
+) -> Callable[..., Any]:
+    """Register an operation as computed by handing the call to the framework.
+
+    Whether an operation should be computed this way is a decision made where
+    the operation is lowered rather than made for the operation, which is why
+    this returns what to call instead of being the call.  What it registers is
+    the operation in the table, in the set of operations handled this way, and
+    -- where one was given -- the constraint that says whether it can be.
+    """
+
+    def register_fallback(op_overload: Any) -> None:
+        add_needs_realized_inputs(op_overload)
+        if layout_constraint is not None:
+            add_layout_constraint(op_overload, layout_constraint)
+        handler = fallback_handler(op_overload, add_to_fallback_set=False)
+        fallbacks.add(op_overload)
+        # Through the table's own registration, which is what turns an
+        # operation into the name the table is keyed by; going in directly
+        # would file it under the operation rather than under its name, and the
+        # two would then be two entries for one operation.
+        register_lowering(op_overload, type_promotion_kind=None)(handler)
+
+    if callable(getattr(op, "overloads", None)):
+        # What an operation names are its forms; each is reached by name on the
+        # operation itself, and a form is what a graph node can be.
+        for op_overload in op.overloads():
+            register_fallback(getattr(op, op_overload))
+    else:
+        register_fallback(op)
+    return fallback_handler
+
+
+def _register_attention_fallbacks() -> None:
+    """Every way of asking for attention that is computed by handing it over.
+
+    Each of these is one operation the framework already has a fused kernel
+    for, in a form the compiler does not decompose and would not improve on by
+    trying.  What registering them says is that they are computed that way, so
+    that a graph containing one has somewhere to go for it -- and so that
+    whatever walks the graph afterwards can tell a value that exists from one
+    that is only a description of a call.
+
+    They are grouped by which of the framework's own attention operations they
+    are, because that is what decides which one is used: they are the same
+    attention under different names, and a program picks one.
+    """
+
+    for name in (
+        # The fused attention the framework provides, and its gradients.
+        "_scaled_dot_product_efficient_attention",
+        "_scaled_dot_product_efficient_attention_backward",
+        "_scaled_dot_product_flash_attention",
+        "_scaled_dot_product_flash_attention_backward",
+        "_scaled_dot_product_cudnn_attention",
+        "_scaled_dot_product_cudnn_attention_backward",
+        "_scaled_dot_product_flash_attention_for_cpu",
+        "_scaled_dot_product_flash_attention_for_cpu_backward",
+        "_scaled_dot_product_fused_attention_overrideable",
+        "_scaled_dot_product_fused_attention_overrideable_backward",
+        # The same attention named directly rather than through the scaled form.
+        "_flash_attention_forward",
+        "_flash_attention_backward",
+        "_efficient_attention_forward",
+        "_efficient_attention_backward",
+    ):
+        packet = getattr(aten, name, None)
+        if packet is None:
+            continue
+        # A name bound to a plain function is an adapter rather than a set of
+        # overloads, and an adapter is not something a graph node can be.
+        if not callable(getattr(packet, "overloads", None)):
+            continue
+        make_fallback(packet, warn=False)
+
+
+_register_attention_fallbacks()
