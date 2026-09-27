@@ -14,20 +14,23 @@ launch finds the entry that is its own.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
 import enum
 import functools
+import itertools
 import hashlib
 import logging
 import math
 import os
 import threading
-from typing import Any, Callable, Final, Generic, Literal, TypeVar
+from typing import Any, Callable, Container, Final, Generic, Literal, TypeVar
 
 import tensorplay as tp
 
 from ..utils import (
+    compute_required_storage_length,
     GPU_KERNEL_BIN_EXTS,
     TMA_ALIGNMENT,
     XPU_KERNEL_FORMAT,
@@ -37,8 +40,10 @@ from ..utils import (
 )
 from .hints import HeuristicType
 from ..triton_bundler import TritonBundler
+from .benchmarking import benchmarker
 from .cache_dir_utils import triton_cache_dir
 from .runtime_utils import triton_config_to_hashable
+from .triton_compat import IntelGPUError, OutOfResources, PTXASError
 from ..compile_log import timed_block
 from .triton_compat import (
     ASTSource,
@@ -1067,6 +1072,260 @@ class CachingAutotuner(KernelInterface):
             isinstance(x, StaticTritonCompileResult) for x in self.compile_results
         )
 
+    def copy_args_to_cpu_if_needed(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Keep a copy of what a measurement is about to overwrite, off the device.
+
+        A measurement runs a kernel many times, and a kernel that writes an
+        argument must be handed that argument as it was, or the second run is
+        not the first run repeated and what is measured is not the kernel.  The
+        usual answer is to hand it a copy, which costs device memory that the
+        program may not have -- so a copy is only made while there is room, and
+        once there is not, the value is kept somewhere that has room and put
+        back after each run instead.
+        """
+
+        if not self.optimize_mem:
+            return {}
+
+        copies = {}
+        try:
+            if tp.accelerator.current_accelerator() is None:
+                # Nothing is running, so there is no device to be sparing.
+                return {}
+            budget = (
+                tp.accelerator.max_memory_allocated()
+                - tp.accelerator.memory_allocated()
+            )
+        except RuntimeError:
+            # A custom allocator need not answer this, and not answering means
+            # there is no budget to be sparing within.
+            return {}
+
+        def maybe_copy(name, arg):
+            if name in self.mutated_arg_names and arg.device.type in (
+                "cuda",
+                "xpu",
+            ):
+                nonlocal budget
+                if not isinstance(arg, tp.Tensor):
+                    raise AssertionError(
+                        f"Expected a tensor for mutated arg, got {type(arg)}"
+                    )
+                required_storage_length = compute_required_storage_length(
+                    arg.size(),
+                    arg.stride(),
+                    0,
+                )
+                size = required_storage_length * arg.element_size()
+                if size > budget:
+                    cpu_arg = tp.empty_strided(
+                        (required_storage_length,),
+                        (1,),
+                        dtype=arg.dtype,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                    cpu_arg.copy_(
+                        arg.as_strided((required_storage_length,), (1,)),
+                        non_blocking=True,
+                    )
+                    copies[name] = (arg, cpu_arg)
+                else:
+                    budget -= size
+
+        for name, arg in zip(self.fn.arg_names, args):
+            maybe_copy(name, arg)
+
+        for name, arg in kwargs.items():
+            maybe_copy(name, arg)
+
+        return copies
+
+    def restore_args_from_cpu(self, cpu_copies: dict[str, Any]) -> None:
+        for pair in cpu_copies.values():
+            arg, cpu_arg = pair
+            required_storage_length = compute_required_storage_length(
+                arg.size(),
+                arg.stride(),
+                0,
+            )
+            arg.as_strided((required_storage_length,), (1,)).copy_(
+                cpu_arg, non_blocking=True
+            )
+
+    def reset_to_zero_args(self, *args: Any, **kwargs: Any) -> None:
+        """Put back to what they were the arguments this kernel writes.
+
+        A kernel that writes an argument is handed one whose earlier contents it
+        is meant to add to, and a measurement runs it again and again: without
+        this, what accumulates is the kernel's output over every run so far
+        rather than over one.
+        """
+
+        if not self.reset_to_zero_arg_names:
+            return
+        for i, arg in enumerate(args):
+            if self.fn.arg_names[i] in self.reset_to_zero_arg_names:
+                if not isinstance(arg, tp.Tensor):
+                    raise AssertionError(
+                        "only arguments that are tensors can be reset to zero"
+                    )
+                arg.zero_()
+
+        for name, arg in kwargs.items():
+            if name in self.reset_to_zero_arg_names:
+                if not isinstance(arg, tp.Tensor):
+                    raise AssertionError(
+                        "only arguments that are tensors can be reset to zero"
+                    )
+                arg.zero_()
+
+    def maybe_clone_args(
+        self, exclude: Container[str], *args: Any, **kwargs: Any
+    ) -> tuple[list[Any], dict[str, Any]]:
+        """Hand the kernel copies of the arguments it writes, and the rest as they are.
+
+        Only what the kernel writes has to be a copy: what it only reads is not
+        changed by running it, and copying it would cost device memory for
+        nothing.  What has been kept elsewhere is passed in ``exclude``, because
+        that value is being restored after each run and copying it would defeat
+        the point of having kept it.
+        """
+
+        from ..._higher_order_ops.auto_functionalize import clone_preserve_strides
+
+        def prepare_arg(name, arg):
+            if name in self.mutated_arg_names and name not in exclude:
+                if not isinstance(arg, tp.Tensor):
+                    raise AssertionError(
+                        f"Expected a tensor for mutated arg '{name}', got {type(arg)}"
+                    )
+                return clone_preserve_strides(arg)
+            else:
+                return arg
+
+        cloned_args = [
+            prepare_arg(name, arg)
+            for name, arg in itertools.zip_longest(self.fn.arg_names[: len(args)], args)
+        ]
+        cloned_kwargs = {name: prepare_arg(name, arg) for name, arg in kwargs.items()}
+        return cloned_args, cloned_kwargs
+
+    def clone_args(self, *args: Any, **kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return self.maybe_clone_args(OrderedSet(), *args, **kwargs)
+
+    def _check_launcher_call_args(self, launcher: Any, args: tuple[Any, ...]) -> None:
+        """Say what was wrong with a call, when the error does not.
+
+        A launcher that rejects its arguments raises about a type it was handed,
+        which says nothing about the call that produced them.  What is worth
+        saying is how many the launcher wanted, and that the stream is not one
+        of them: a stream passed in place is the mistake that produces this.
+        """
+
+        expected = getattr(launcher, "_expected_positional_count", None)
+        if expected is None:
+            return
+
+        if len(args) > expected:
+            kernel_name = self.inductor_meta.get("kernel_name", "triton kernel")
+            raise TypeError(
+                f"{kernel_name}: too many positional arguments - "
+                f"expected {expected}, got {len(args)}. "
+                "'stream' must be passed as a keyword argument."
+            ) from None
+
+    def bench(self, launcher, *args: Any, with_profiler: bool = False, **kwargs: Any) -> float:
+        """How long one launch of this configuration takes.
+
+        A configuration whose registers spilled is one that used more registers
+        than the device had room for and wrote them out to memory, which is
+        slower than not using it at all -- so it is reported as a time no
+        configuration can reach rather than as a failure, which is what keeps
+        it from being chosen.  A kernel written by hand is excepted: nothing here
+        knows what it does, and a complicated kernel can genuinely be faster
+        with the registers spilled.
+        """
+
+        if (
+            not self.custom_kernel
+            and launcher.n_spills is not None
+            and launcher.n_spills
+            > self.inductor_meta.get("spill_threshold", 32 if tp.version.hip else 16)
+        ):
+            log.debug(
+                "Skip config %s because of register spilling: %d",
+                launcher.config,
+                launcher.n_spills,
+            )
+            self.benchmark_failure_reasons[launcher] = (
+                BenchmarkFailureReason.REGISTER_SPILLING
+            )
+            return float("inf")
+
+        device_interface = self.get_device_interface()
+
+        cpu_copies = self.copy_args_to_cpu_if_needed(*args, **kwargs)
+
+        def kernel_call():
+            # The stream is asked for as the kernel is about to run rather than
+            # when this was written, so that capturing a launch onto another
+            # stream launches it onto that stream.
+            stream = device_interface.get_raw_stream(device_interface.current_device())
+            cloned_args, cloned_kwargs = self.maybe_clone_args(
+                cpu_copies, *args, **kwargs
+            )
+            kernel_name = self.inductor_meta.get("kernel_name", "triton kernel")
+            # Each configuration is measured from the same starting values, or
+            # the first one measured would be measuring more work than the rest.
+            self.reset_to_zero_args(*args, **kwargs)
+            try:
+                launcher(
+                    *cloned_args,
+                    **cloned_kwargs,
+                    stream=stream,
+                )
+            except Exception as e:
+                if isinstance(e, TypeError):
+                    self._check_launcher_call_args(launcher, cloned_args)
+                log.error(
+                    "Failed during launch %s with config: %s (num_warps=%s, num_stages=%s, kwargs=%s)",
+                    kernel_name,
+                    launcher.config,
+                    launcher.config.num_warps,
+                    launcher.config.num_stages,
+                    launcher.config.kwargs,
+                )
+                raise
+            self.restore_args_from_cpu(cpu_copies)
+
+        # A profile is only taken when nothing else is already profiling, since
+        # two profilers cannot both be the one that is running.
+        if with_profiler:
+            from ..utils import do_bench_using_profiling
+
+            return do_bench_using_profiling(kernel_call, warmup=10, rep=40)
+
+        benchmark_kwargs = (
+            {}
+            if self.device_props.type == "cpu"
+            else {"rep": 40, "is_vetted_benchmarking": True}
+        )
+        result = benchmarker.benchmark(
+            fn=kernel_call,
+            device=self.device_props.type,
+            **benchmark_kwargs,
+        )
+        # The timing reports an unreachable time in exactly one case: a
+        # configuration the device would not accept.  Everything else is raised,
+        # so a time that no configuration can reach here is that, and not
+        # something that ran slowly.
+        if result == float("inf"):
+            self.benchmark_failure_reasons[launcher] = (
+                BenchmarkFailureReason.INVALID_CONFIG
+            )
+        return result
+
     def _could_rblock_scale(self) -> bool:
         """Whether a block worth halving is worth looking for here.
 
@@ -1438,6 +1697,152 @@ class CachingAutotuner(KernelInterface):
         compiled form of its text, so that anything here which needs to compile
         it again has to ask for it to be brought back.  A kernel that never left
         has it, and there is nothing to do.
+        """
+
+        if self.fn.fn is None:
+            if not hasattr(self, "_reload_kernel"):
+                raise AssertionError("_reload_kernel attribute not set")
+            if not callable(self._reload_kernel):
+                raise AssertionError("_reload_kernel must be callable")
+            self.fn = self._reload_kernel().fn
+
+    def compile_by_disabling_pipelining(self, config):
+        """Compile this configuration with no pipelining, as a last resort.
+
+        A configuration can fail for want of shared memory, and the part of it
+        that wants the most is the pipeline: it holds several steps live at
+        once.  With one step there is nothing to overlap, so this is the same
+        computation with a much smaller working set -- a different kernel, but
+        one that is far more likely to fit, and correct if it does.
+        """
+
+        self._ensure_kernel_loaded()
+        cfg = copy.deepcopy(config)
+        cfg.num_stages = 1
+        if "NUM_STAGES" in cfg.kwargs:
+            cfg.kwargs["NUM_STAGES"] = 1
+        result = self._precompile_config(cfg)
+        self.compile_results = [result]
+        return result.make_launcher()
+
+    def _make_launcher(self, compile_result):
+        """The launcher for one compiled form, or the reason there is none.
+
+        Which failures are expected is spelled out, because a launcher that
+        cannot be built is not a failure of the measurement -- it is one
+        candidate ruled out, and the caller has to be able to tell that from
+        something that went wrong.
+        """
+
+        try:
+            return compile_result.make_launcher(), None
+        except (
+            OutOfResources,
+            PTXASError,
+            tp.cuda.OutOfMemoryError,
+            IntelGPUError,
+        ) as e:
+            return None, e
+
+    def _make_launchers(self):
+        """A launcher for every compiled form that can have one.
+
+        Each launcher's binary is loaded while the device it is for is selected,
+        so that a machine with more than one does not end up with a form
+        resident on the wrong one.
+
+        If none of them can be built and the reason was not enough memory for
+        the pipeline, the whole set is retried with the pipeline turned off --
+        one configuration rather than none, which is the difference between a
+        slower kernel and no kernel.
+        """
+
+        if len(self.launchers) == len(self.compile_results):
+            return
+
+        launchers = []
+        exc = None
+        try:
+            load_device = _resolve_load_device(
+                self.triton_meta["device"], self.device_props.type
+            )
+            if load_device is None:
+                guard = contextlib.nullcontext()
+            else:
+                guard = tp.cuda._DeviceGuard(int(load_device))
+            # Selecting the device ensures each launcher's binary loads onto
+            # the right device.
+            with guard:
+                for result in self.compile_results:
+                    launcher, exc = self._make_launcher(result)
+                    if launcher is not None:
+                        launchers.append(launcher)
+                if len(launchers) == 0:
+                    result = self.compile_results[-1]
+                    config = result.config
+                    if (
+                        isinstance(exc, (OutOfResources, tp.cuda.OutOfMemoryError))
+                        and (
+                            config.num_stages > 1
+                            or config.kwargs.get("NUM_STAGES", 1) > 1
+                        )
+                        and self.inductor_meta.get("dynamic_disable_pipelining", True)
+                    ):
+                        self.launchers = [self.compile_by_disabling_pipelining(config)]
+                        return
+                    raise RuntimeError(
+                        f"No valid triton configs. {type(exc).__name__}: {exc}"
+                    )
+            self.launchers = launchers
+        finally:
+            # Drop the retained failed-config exception. Holding it keeps its
+            # traceback (and thus the whole benchmarking frame chain) alive, and
+            # the timing buffer would then leak one per autotuned kernel until
+            # a collection that never comes under collection being disabled.
+            # Only the type and message were needed above.
+            exc = None
+
+    def _prune_compile_results_to_launcher(self, launcher) -> None:
+        """Keep only the compiled form this launcher came from.
+
+        A launcher is built from one compiled form, so the rest were only ever
+        candidates and keeping them means keeping their memory.  Matched by
+        identity first, because two configurations can be equal and belong to
+        different forms.
+
+        A launcher that matches nothing means the two have drifted apart, which
+        is a bug rather than a state to recover from.
+        """
+
+        if not self.compile_results:
+            return
+
+        launcher_config = launcher.config  # type: ignore[attr-defined]
+        for result in self.compile_results:
+            if result.config is launcher_config:
+                self.compile_results = [result]
+                return
+
+        launcher_config_hash = triton_config_to_hashable(launcher_config)
+        for result in self.compile_results:
+            if triton_config_to_hashable(result.config) == launcher_config_hash:
+                self.compile_results = [result]
+                return
+
+        raise AssertionError(
+            f"Autotuned launcher config does not match any compile result: {launcher_config}"
+        )
+
+    def _ensure_kernel_loaded(self) -> None:
+        """Bring the live function back, if this kernel was loaded elsewhere.
+
+        A kernel compiled in a worker and unpickled into this process has no
+        live function: the worker's would not have travelled with the pickle,
+        and carrying it would have dragged the worker's state along.  So
+        anything that needs the real function here -- tuning that moves away
+        from the starting list, counting what was measured -- has to ask for
+        it back first.  Doing nothing when it is already here is the common
+        case.
         """
 
         if self.fn.fn is None:
@@ -1889,6 +2294,128 @@ class CachingAutotuner(KernelInterface):
                     "the binary the entry referred to is not at %s", cubin_location
                 )
         self.kernel.cubin_path = cubin_location
+
+class CannotStaticallyLaunchKernel(Exception):
+    """Why a compiled kernel cannot be launched from its binary alone."""
+
+
+class StaticTritonCompileResult(CompileResult[_T]):
+    """A compiled kernel launched from the binary already on disk.
+
+    A compiled kernel can normally be launched through the runtime, which
+    keeps what the launch needs alongside it.  Launched from the binary
+    instead, the kernel is loaded onto the device once and the launch becomes
+    a call with the arguments the binary expects -- and the setup that call
+    needs is far smaller, because none of the compile-time state travels with
+    it.
+
+    Whether a given kernel can be launched this way is asked rather than
+    assumed: several things can make it impossible, and each of them raises
+    :class:`CannotStaticallyLaunchKernel` naming which.  The question is asked
+    only when static launching is switched on, since a kernel that cannot be
+    launched this way is still perfectly launchable the ordinary way.
+    """
+
+    @staticmethod
+    def can_statically_launch(kernel, inductor_meta, triton_meta, heuristic_type):
+        """The form of this kernel that launches from its binary, if there is one."""
+
+        from .. import config
+
+        if not config.use_static_triton_launcher:
+            return None
+
+        def check_can_launch():
+            if triton_meta.get("device_type") not in ("cuda", "xpu", "hip"):
+                raise CannotStaticallyLaunchKernel("not a device that loads a binary")
+
+            if triton_meta.get("device_type") == "xpu" and XPU_KERNEL_FORMAT == "spv":
+                raise CannotStaticallyLaunchKernel(
+                    "the host device takes its kernels in a form that cannot be "
+                    "launched this way"
+                )
+
+            if config.cpp_wrapper:
+                # A wrapper is written and compiled for this call anyway, so
+                # there is nothing left for this to save.
+                raise CannotStaticallyLaunchKernel("the wrapper is written out")
+
+            if (
+                heuristic_type == HeuristicType.USER_AUTOTUNE
+                and not config.static_launch_user_defined_triton_kernels
+            ):
+                raise CannotStaticallyLaunchKernel("a user-written kernel")
+
+            if inductor_meta.get("store_cubin"):
+                # The whole binary has to be kept, which is what this avoids.
+                raise CannotStaticallyLaunchKernel("the binary is being kept")
+
+            if getattr(kernel.metadata, "launch_pdl", False) or getattr(
+                kernel.metadata, "launch_cooperative_grid", False
+            ):
+                raise CannotStaticallyLaunchKernel(
+                    "the launch carries attributes this does not pass"
+                )
+
+            device_type = triton_meta.get("device_type")
+            binary_ext = GPU_KERNEL_BIN_EXTS.get(device_type, ".cubin")
+            cubin_location = os.path.join(
+                triton_cache_dir(int(triton_meta.get("device", 0))),
+                triton_hash_to_path_key(kernel.hash),
+                f"{kernel.src.fn.__name__}{binary_ext}",
+            )
+            if not os.path.exists(cubin_location):
+                raise CannotStaticallyLaunchKernel(
+                    f"the binary is not where it was left: {cubin_location}"
+                )
+            kernel._cubin_path = cubin_location
+
+            try:
+                return statically_launched_kernel_by_device(kernel, device_type)
+            except NotImplementedError as e:
+                raise CannotStaticallyLaunchKernel(f"not implemented: {e}") from e
+
+        try:
+            return check_can_launch()
+        except CannotStaticallyLaunchKernel as e:
+            log.info("cannot launch %s statically: %s", kernel, e)
+            return None
+        except Exception:
+            log.info(
+                "cannot launch %s statically", kernel, exc_info=True
+            )
+            return None
+
+    def reload_cubin_path(self):
+        """Point the kernel at its binary, putting it back if it was only held.
+
+        A binary that travelled inside a cache entry is held as bytes rather
+        than left on disk, so a kernel read back from one has to be written
+        out again before it can be loaded.  A binary that is neither on disk
+        nor in hand is a cache entry that cannot be used, and saying so is
+        better than launching nothing.
+        """
+
+        device_type = (
+            "hip" if tp.version.hip else self.compile_meta.get("device_type", "cuda")
+        )
+        binary_ext = GPU_KERNEL_BIN_EXTS.get(device_type, "cubin")
+        cubin_location = os.path.join(
+            triton_cache_dir(
+                _resolve_load_device(self.compile_meta.get("device"), device_type)
+            ),
+            triton_hash_to_path_key(self.kernel.hash),
+            f"{self.kernel.name}{binary_ext}",
+        )
+        if not os.path.exists(cubin_location):
+            if self.kernel.cubin_raw is not None:
+                self.kernel.reload_cubin_from_raw(cubin_location)
+            else:
+                raise RuntimeError(
+                    "the binary the entry referred to is not at %s", cubin_location
+                )
+        self.kernel.cubin_path = cubin_location
+
 
 class TritonCompileResult(CompileResult[CompiledKernel]):
     """
