@@ -9,10 +9,50 @@ from tensorplay.primitives.common import is_integer_dtype
 
 from .. import config
 from ..fx_utils import get_fake_args_kwargs, get_node_storage
+from ..pattern_matcher import (
+    CallFunction,
+    Ignored,
+    KeywordArg,
+    Match,
+    MULTIPLE,
+    PatternMatcherPass,
+    register_graph_pattern,
+    register_lowering_pattern as _register_lowering_pattern,
+)
 
 
 aten = tp.ops.tp
 prims = tp.ops.prims
+
+#: The pattern tables the passes draw from, applied in order: a match found by
+#: an earlier table is taken, so a table written later has the first say on
+#: which of two ways of writing the same computation is used.
+pass_patterns = [
+    PatternMatcherPass(),
+    PatternMatcherPass(),
+    PatternMatcherPass(),
+]
+
+
+def register_lowering_pattern(
+    pattern,
+    extra_check=lambda match: True,
+    pass_number=1,
+    *,
+    output_metadata_ignores_input_storage: bool = True,
+    output_metadata_is_input: int | str | None = None,
+    output_metadata_fn=None,
+):
+    """Register a replacement of one way of writing a computation by another."""
+
+    return _register_lowering_pattern(
+        pattern,
+        extra_check,
+        pass_dict=pass_patterns[pass_number],
+        output_metadata_ignores_input_storage=output_metadata_ignores_input_storage,
+        output_metadata_is_input=output_metadata_is_input,
+        output_metadata_fn=output_metadata_fn,
+    )
 
 
 def same_meta(node1: Node, node2: Node):

@@ -2031,6 +2031,16 @@ class Counters:
             group = self._counts[key] = _CounterGroup()
         return group
 
+    def __setitem__(self, key, value) -> None:
+        """Put a name's whole group back, as a group already collected.
+
+        A pass that counts things as it traces them puts the counts it
+        collected back when it is done, so that what a trace is worth is
+        decided by the pass rather than accumulated by whoever asked for it.
+        """
+
+        self._counts[key] = value
+
     def to_dict(self) -> dict:
         return {key: dict(group) for key, group in self._counts.items()}
 
