@@ -46,7 +46,7 @@ permute_default_2 = CallFunction(operator_set.permute.default, KeywordArg('value
 broadcast_to_default_2 = CallFunction(operator_set.broadcast_to.default, permute_default_2, Ignored())
 reshape_default_3 = CallFunction(operator_set.reshape.default, broadcast_to_default_2, Ignored())
 bmm_default_0 = CallFunction(operator_set.bmm.default, reshape_default_2, reshape_default_3)
-_sfdp_pattern_21_inference = CallFunction(operator_set.reshape.default, bmm_default_0, Ignored())
+_sfdp_pattern_21_inference = CallFunction(operator_set.reshape.default, bmm_default_0, Ignored(), _users=0)
 
 
 permute_default = CallFunction(operator_set.permute.default, KeywordArg('query'), Ignored())
@@ -67,7 +67,7 @@ permute_default_2 = CallFunction(operator_set.permute.default, KeywordArg('value
 broadcast_to_default_2 = CallFunction(operator_set.broadcast_to.default, permute_default_2, Ignored())
 reshape_default_3 = CallFunction(operator_set.reshape.default, broadcast_to_default_2, Ignored())
 bmm_default_0 = CallFunction(operator_set.bmm.default, reshape_default_2, reshape_default_3)
-_sfdp_pattern_21_bs1_inference = CallFunction(operator_set.reshape.default, bmm_default_0, Ignored())
+_sfdp_pattern_21_bs1_inference = CallFunction(operator_set.reshape.default, bmm_default_0, Ignored(), _users=0)
 
 
 permute_default = CallFunction(operator_set.permute.default, KeywordArg('query'), Ignored())
@@ -90,7 +90,7 @@ permute_default_2 = CallFunction(operator_set.permute.default, KeywordArg('value
 broadcast_to_default_2 = CallFunction(operator_set.broadcast_to.default, permute_default_2, Ignored())
 reshape_default_3 = CallFunction(operator_set.reshape.default, broadcast_to_default_2, Ignored())
 bmm_default_0 = CallFunction(operator_set.bmm.default, reshape_default_2, reshape_default_3)
-_sfdp_pattern_21_half_inference = CallFunction(operator_set.reshape.default, bmm_default_0, Ignored())
+_sfdp_pattern_21_half_inference = CallFunction(operator_set.reshape.default, bmm_default_0, Ignored(), _users=0)
 
 
 permute_default = CallFunction(operator_set.permute.default, KeywordArg('query'), Ignored())
@@ -113,4 +113,4 @@ permute_default_2 = CallFunction(operator_set.permute.default, KeywordArg('value
 broadcast_to_default_2 = CallFunction(operator_set.broadcast_to.default, permute_default_2, Ignored())
 reshape_default_3 = CallFunction(operator_set.reshape.default, broadcast_to_default_2, Ignored())
 bmm_default_0 = CallFunction(operator_set.bmm.default, reshape_default_2, reshape_default_3)
-_sfdp_pattern_21_half_bs1_inference = CallFunction(operator_set.reshape.default, bmm_default_0, Ignored())
+_sfdp_pattern_21_half_bs1_inference = CallFunction(operator_set.reshape.default, bmm_default_0, Ignored(), _users=0)

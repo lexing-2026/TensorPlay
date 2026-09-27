@@ -45,4 +45,4 @@ addmm_pattern_training = MultiOutputPattern([addmm_default,
 ])
 
 
-addmm_pattern_inference = CallFunction(operator_set.addmm.default, KeywordArg('input'), KeywordArg('mat1'), KeywordArg('mat2'), beta=KeywordArg('beta'), alpha=KeywordArg('alpha'))
+addmm_pattern_inference = CallFunction(operator_set.addmm.default, KeywordArg('input'), KeywordArg('mat1'), KeywordArg('mat2'), beta=KeywordArg('beta'), alpha=KeywordArg('alpha'), _users=0)

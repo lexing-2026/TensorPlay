@@ -47,7 +47,7 @@ reshape_default_2 = CallFunction(operator_set.reshape.default, broadcast_to_defa
 broadcast_to_default_2 = CallFunction(operator_set.broadcast_to.default, KeywordArg('value'), Ignored())
 reshape_default_3 = CallFunction(operator_set.reshape.default, broadcast_to_default_2, Ignored())
 bmm_default_0 = CallFunction(operator_set.bmm.default, reshape_default_2, reshape_default_3)
-_sfdp_pattern_19_inference = CallFunction(operator_set.reshape.default, bmm_default_0, Ignored())
+_sfdp_pattern_19_inference = CallFunction(operator_set.reshape.default, bmm_default_0, Ignored(), _users=0)
 
 
 broadcast_to_default = CallFunction(operator_set.broadcast_to.default, KeywordArg('query'), Ignored())
@@ -69,4 +69,4 @@ reshape_default_2 = CallFunction(operator_set.reshape.default, broadcast_to_defa
 broadcast_to_default_2 = CallFunction(operator_set.broadcast_to.default, KeywordArg('value'), Ignored())
 reshape_default_3 = CallFunction(operator_set.reshape.default, broadcast_to_default_2, Ignored())
 bmm_default_0 = CallFunction(operator_set.bmm.default, reshape_default_2, reshape_default_3)
-_sfdp_pattern_19_half_inference = CallFunction(operator_set.reshape.default, bmm_default_0, Ignored())
+_sfdp_pattern_19_half_inference = CallFunction(operator_set.reshape.default, bmm_default_0, Ignored(), _users=0)

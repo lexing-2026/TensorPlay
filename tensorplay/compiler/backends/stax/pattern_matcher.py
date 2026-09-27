@@ -2886,14 +2886,14 @@ def fx_to_pattern(
                 if len(rv) != len(args):
                     raise AssertionError("rv and args length mismatch")
                 for r, arg in zip(rv, args):
-                    # A gradient slot for an input the output does not depend on
-                    # traces to nothing at all, and there is no pattern node to
-                    # count users for.  Slots that did trace carry the count,
-                    # the way a slot that did trace always has.
-                    if isinstance(r, Node) and isinstance(arg, Node):
+                    # A gradient slot for an input the output does not depend
+                    # on traces to nothing at all, and a slot holding a plain
+                    # value rather than a node has no users to count.  A slot
+                    # that did trace carries the count of the node it came from.
+                    if r is not None and isinstance(arg, Node):
                         r.users = len(arg.users)
             else:
-                if isinstance(rv, Node):
+                if rv is not None:
                     rv.users = len(n.users)
             return rv
 

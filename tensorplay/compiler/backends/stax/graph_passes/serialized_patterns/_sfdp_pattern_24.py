@@ -38,7 +38,7 @@ view_default_1 = CallFunction(operator_set.view.default, add_Tensor, Ignored())
 softmax_default = CallFunction(operator_set.softmax.default, view_default_1, Ignored(), Ignored())
 reshape_default_0 = CallFunction(operator_set.reshape.default, KeywordArg('value'), Ignored())
 bmm_default_0 = CallFunction(operator_set.bmm.default, softmax_default, reshape_default_0)
-_sfdp_pattern_24_inference = CallFunction(operator_set.view.default, bmm_default_0, Ignored())
+_sfdp_pattern_24_inference = CallFunction(operator_set.view.default, bmm_default_0, Ignored(), _users=0)
 
 
 view_default = CallFunction(operator_set.view.default, KeywordArg('query'), Ignored())
@@ -52,4 +52,4 @@ softmax_default = CallFunction(operator_set.softmax.default, view_default_1, Ign
 to_dtype = CallFunction(operator_set.to.dtype, softmax_default, Ignored(), False, False, None)
 reshape_default_0 = CallFunction(operator_set.reshape.default, KeywordArg('value'), Ignored())
 bmm_default_0 = CallFunction(operator_set.bmm.default, to_dtype, reshape_default_0)
-_sfdp_pattern_24_half_inference = CallFunction(operator_set.view.default, bmm_default_0, Ignored())
+_sfdp_pattern_24_half_inference = CallFunction(operator_set.view.default, bmm_default_0, Ignored(), _users=0)
