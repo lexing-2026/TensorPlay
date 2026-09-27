@@ -7906,3 +7906,13 @@ OpDtypeSupport.register_upcast(TritonOverrides.pow, True)
 TritonOverrides._initialize_pointwise_overrides("triton")
 
 
+# The names a kernel needs to write an expression, check whether the device
+# supports a descriptor, and reduce the operations it was written for are the
+# classes above rather than the code, so that a different backend can name its
+# own.  They are attached here rather than in the class body because this file
+# declares the kernel before the classes it would refer to.
+TritonKernel.overrides = TritonKernelOverrides
+TritonKernel.allow_block_ptr = True
+TritonKernel.block_ptr_options_cls = BlockPtrOptions
+TritonKernel.tensor_descriptor_options_cls = TensorDescriptorOptions
+TritonKernel.transpose_discontiguous_tensor_descriptors_override = None
