@@ -405,6 +405,78 @@ class Grid2DWithYZOverflow(GridExpr):
         self.z_grid = "y_grid_div_"
 
 
+def check_autotune_cache(
+    configs: list,
+    filename: str | None,
+    inductor_meta,
+    dynamic_scale_rblock_eligible: bool = False,
+):
+    """The configurations to measure, narrowed to one if an answer is already known.
+
+    A recorded answer is only worth reading when there is something to record
+    it against, so the lookup is skipped entirely when there is one
+    configuration, when caching is off, or when the answer would have been
+    produced by interpreting rather than compiling.
+
+    What the lookup found is written into the metadata either way -- hit or
+    miss -- because "it looked and there was nothing" is the answer to a
+    different question from "it did not look".
+    """
+
+    from ..cache_key import AUTOTUNE_CACHE_KEY_STRATEGY  # noqa: F401
+    from .autotune_cache import AutotuneCache
+    from .runtime_utils import triton_config_to_hashable
+    from ..compile_worker import watchdog
+
+    autotune_cache = None
+    autotune_cache_info = {}
+    disabled = inductor_meta.get("force_disable_caches", False)
+    if (
+        not disabled
+        and filename is not None
+        and (
+            len(configs) > 1
+            or inductor_meta.get("coordinate_descent_tuning")
+            or dynamic_scale_rblock_eligible
+        )
+        and os.environ.get("TRITON_INTERPRET", "0") != "1"
+    ):
+        configs_hash = hash_configs(configs)
+
+        watchdog.report_phase(watchdog.Phase.QUERYING_CACHE)
+        autotune_cache = AutotuneCache.create(inductor_meta, filename, configs_hash)
+        if autotune_cache:
+            if best_config := autotune_cache.read_best(inductor_meta, configs):
+                configs = [best_config]
+                autotune_cache_info["best_config"] = triton_config_to_hashable(
+                    best_config
+                )
+                autotune_cache_info["autotune_cache_state"] = "hit"
+
+            else:
+                autotune_cache_info["autotune_cache_state"] = "miss"
+                autotune_cache_info["num_configs"] = len(configs)
+                if inductor_meta.get("coordinate_descent_tuning"):
+                    autotune_cache_info["coordesc_tuning"] = True
+                    if len(configs) == 1:
+                        # This is the config that coordinate descent tuning started at,
+                        # which is not the same as the final config chosen (i.e.
+                        # only_config, best_config)
+                        autotune_cache_info["coordesc_tuning_start_config"] = (
+                            triton_config_to_hashable(configs[0])
+                        )
+    else:
+        if len(configs) == 1:
+            autotune_cache_info["autotune_cache_state"] = "only 1 config"
+            autotune_cache_info["only_config"] = triton_config_to_hashable(configs[0])
+
+        if disabled:
+            autotune_cache_info["autotune_cache_state"] = "force_disabled"
+            log.debug("autotune caching is disabled by config.force_disable_caches")
+
+    return configs, autotune_cache, autotune_cache_info
+
+
 def hash_configs(configs: list):
     """A name for a set of configurations, so a change to any of them shows up.
 
