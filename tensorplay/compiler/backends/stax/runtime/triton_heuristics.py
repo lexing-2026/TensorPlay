@@ -25,10 +25,12 @@ import logging
 import math
 import os
 import threading
+import time
 from typing import Any, Callable, Container, Final, Generic, Literal, TypeVar
 
 import tensorplay as tp
 
+from .. import metrics
 from ..utils import (
     compute_required_storage_length,
     GPU_KERNEL_BIN_EXTS,
@@ -77,6 +79,11 @@ LauncherType = Callable[..., Any]
 _T = TypeVar("_T")
 
 log = logging.getLogger(__name__)
+
+#: What was measured, kept apart from the rest of the log because it is only
+#: wanted when a measurement is being questioned, and there is a great deal of
+#: it.
+autotuning_inputs_log = tp.getArtifactLogger(__name__, "autotuning_inputs")
 
 
 def config_to_dict(config: Config) -> dict[str, Any]:
@@ -1092,6 +1099,288 @@ class CachingAutotuner(KernelInterface):
             isinstance(x, StaticTritonCompileResult) for x in self.compile_results
         )
 
+    @staticmethod
+    def _close_static_launcher(launcher: Any) -> None:
+        """Let go of a binary that was loaded to be measured, if it was.
+
+        A binary loaded to be measured was loaded for that measurement.  Where a
+        launcher does not name a binary there is nothing to let go of, which is
+        most launchers and is not worth a check any further than this.
+        """
+
+        if not getattr(launcher, "_is_static", False):
+            return
+        runner = getattr(launcher, "__globals__", {}).get("runner")
+        kernel = getattr(runner, "__self__", None)
+        close = getattr(kernel, "close", None)
+        if close is not None:
+            close()
+
+    def _release_static_launchers_except(self, keep_launcher: Any) -> None:
+        """Let go of every binary except the one that was chosen.
+
+        What is kept is what can still be launched.  The chosen binary is found
+        by what it was built from rather than by which object it is, because
+        what is being asked is which of the compiled forms is the winner, and
+        two launchers can be the same form.
+        """
+
+        for launcher in self.launchers:
+            if launcher is not keep_launcher:
+                self._close_static_launcher(launcher)
+        if not getattr(keep_launcher, "_is_static", False):
+            return
+        keep_hash = getattr(keep_launcher, "cache_hash", None)
+        if keep_hash is None:
+            return
+        keep_results = [
+            result
+            for result in self.compile_results
+            if isinstance(result, StaticTritonCompileResult)
+            and triton_hash_to_path_key(result.kernel.hash) == keep_hash
+        ]
+        if len(keep_results) == 1:
+            for result in self.compile_results:
+                if result is not keep_results[0] and isinstance(
+                    result, StaticTritonCompileResult
+                ):
+                    close = getattr(result.kernel, "close", None)
+                    if close is not None:
+                        close()
+            self.compile_results = keep_results
+
+    def _log_autotune_inputs(self, args, kwargs) -> None:
+        """What was measured, in enough detail to reproduce the measurement.
+
+        A measurement whose inputs are not written down is a number that cannot
+        be questioned afterwards, and a kernel measured on one shape and used on
+        another is the usual way for that to matter.  What is logged is the
+        shape, the type and the layout of every argument, and the number it
+        carried, which is everything the measurement depended on.
+        """
+
+        kernel_name = self.inductor_meta.get("kernel_name", self.fn.__name__)
+        signature = self.triton_meta.get("signature", {})
+        arg_names = list(signature.keys())
+
+        autotuning_inputs_log.debug("=" * 60)
+        autotuning_inputs_log.debug("Autotuning inputs for kernel: %s", kernel_name)
+        autotuning_inputs_log.debug("=" * 60)
+        autotuning_inputs_log.debug("  Heuristic type: %s", self.heuristic_type)
+        autotuning_inputs_log.debug("  Size hints: %s", self.size_hints)
+        autotuning_inputs_log.debug(
+            "  Num configs to benchmark: %d", len(self.launchers)
+        )
+        autotuning_inputs_log.debug(
+            "  Device: %s (index=%s)", self.device_props.type, self.device_props.index
+        )
+        autotuning_inputs_log.debug("-" * 60)
+        autotuning_inputs_log.debug("Arguments:")
+
+        for i, arg in enumerate(args):
+            arg_name = arg_names[i] if i < len(arg_names) else f"arg_{i}"
+            arg_signature = signature.get(arg_name, "unknown")
+            if isinstance(arg, tp.Tensor):
+                autotuning_inputs_log.debug(
+                    "  [%d] %s (%s): Tensor(shape=%s, dtype=%s, device=%s, stride=%s, contiguous=%s)",
+                    i,
+                    arg_name,
+                    arg_signature,
+                    tuple(arg.shape),
+                    arg.dtype,
+                    arg.device,
+                    arg.stride(),
+                    arg.is_contiguous(),
+                )
+            elif isinstance(arg, (int, float, bool)):
+                autotuning_inputs_log.debug(
+                    "  [%d] %s (%s): %s (type=%s)",
+                    i,
+                    arg_name,
+                    arg_signature,
+                    arg,
+                    type(arg).__name__,
+                )
+            else:
+                autotuning_inputs_log.debug(
+                    "  [%d] %s (%s): %s (type=%s)",
+                    i,
+                    arg_name,
+                    arg_signature,
+                    repr(arg)[:100],
+                    type(arg).__name__,
+                )
+
+        if kwargs:
+            autotuning_inputs_log.debug("-" * 60)
+            autotuning_inputs_log.debug("Keyword arguments:")
+            for k, v in kwargs.items():
+                if isinstance(v, tp.Tensor):
+                    autotuning_inputs_log.debug(
+                        "  %s: Tensor(shape=%s, dtype=%s, device=%s)",
+                        k,
+                        tuple(v.shape),
+                        v.dtype,
+                        v.device,
+                    )
+                else:
+                    autotuning_inputs_log.debug(
+                        "  %s: %s (type=%s)", k, v, type(v).__name__
+                    )
+
+        autotuning_inputs_log.debug("=" * 60)
+
+    def benchmark_all_configs(self, *args: Any, **kwargs: Any):
+        """How long every launcher takes, each on the same inputs.
+
+        Each measurement is one run of a whole batch of launches, so what is
+        compared is the same work each time -- which is why the arguments are
+        put back to what they were between them, and why a launcher that is no
+        longer in the running is let go of as soon as it is not: a set of
+        measurements that all of them are kept alive for is a set of measurements
+        that all of them pay for.
+        """
+
+        from .runtime_utils import timed_block
+
+        with timed_block(
+            "CachingAutotuner.benchmark_all_configs", log_pt2_compile_event=True
+        ):
+            timings = {}
+            best_launcher = None
+            best_timing = float("inf")
+            for launcher in self.launchers:
+                timing = self.bench(launcher, *args, **kwargs)
+                timings[launcher] = timing
+                # A launcher that has been beaten is let go of now rather than
+                # after the whole set, so that an exhaustive measurement keeps
+                # only the winner and the one still being measured loaded.
+                if best_launcher is None or timing < best_timing:
+                    if best_launcher is not None:
+                        self._close_static_launcher(best_launcher)
+                    best_launcher = launcher
+                    best_timing = timing
+                else:
+                    self._close_static_launcher(launcher)
+
+            for k, v in timings.items():
+                self.coordesc_tuner.cache_benchmark_result(k.config, v)
+
+            if log.isEnabledFor(logging.DEBUG):
+                log.debug("Benchmark all input configs for %s, get:", self.fn.__name__)
+                for k, v in timings.items():
+                    log.debug(
+                        "%s: %f, nreg %d, nspill %d, #shared-mem %s",
+                        k.config,
+                        v,
+                        k.n_regs,
+                        k.n_spills,
+                        k.shared,
+                    )
+
+            if metrics.is_metric_table_enabled("kernel_autotune"):
+                self._ensure_kernel_loaded()
+
+                kernel_path = self.fn.fn.__code__.co_filename
+                kernel_name = self.fn.__name__
+
+                for k, v in timings.items():
+                    metrics.log_kernel_autotune_result(
+                        kernel_path, kernel_name, k.config, v
+                    )
+
+            self.reset_to_zero_args(*args, **kwargs)
+            return timings
+
+    def autotune_to_one_config(self, *args: Any, **kwargs: Any):
+        """Measure every launcher and keep the one that measured best.
+
+        A launcher that could not be measured is not a slow launcher, and the
+        two are kept apart throughout: the reason is recorded per launcher, and
+        a launcher with no reason is one that really was slower than the others.
+        """
+
+        if autotuning_inputs_log.isEnabledFor(logging.DEBUG):
+            self._log_autotune_inputs(args, kwargs)
+
+        start_time = time.time_ns()
+        timings = self.benchmark_all_configs(*args, **kwargs)
+        benchmark_time_taken_ns = time.time_ns() - start_time
+
+        # Which configurations could not be measured, and why, is worth saying
+        # out loud: a set of configurations that is mostly unmeasurable is a
+        # different problem from one where every configuration lost.
+        failed_launchers = [
+            launcher for launcher, timing in timings.items() if timing == float("inf")
+        ]
+        if failed_launchers:
+            valid_timings = [(k, v) for k, v in timings.items() if v != float("inf")]
+            if valid_timings:
+                best_launcher, best_time = min(valid_timings, key=lambda x: x[1])
+
+                # Count failures by reason
+                spill_count = sum(
+                    1
+                    for launcher in failed_launchers
+                    if self.benchmark_failure_reasons.get(launcher)
+                    == BenchmarkFailureReason.REGISTER_SPILLING
+                )
+                invalid_config_count = sum(
+                    1
+                    for launcher in failed_launchers
+                    if self.benchmark_failure_reasons.get(launcher)
+                    == BenchmarkFailureReason.INVALID_CONFIG
+                )
+
+                reason_parts = []
+                if spill_count > 0:
+                    reason_parts.append(f"{spill_count} register spilling")
+                if invalid_config_count > 0:
+                    reason_parts.append(f"{invalid_config_count} invalid config")
+                reason_str = ", ".join(reason_parts) if reason_parts else "unknown"
+
+                log.info(
+                    "Skipped %d/%d configs for %s (%s). Selected: %s (%.4f ms)",
+                    len(failed_launchers),
+                    len(timings),
+                    self.fn.__name__,
+                    reason_str,
+                    best_launcher.config,
+                    best_time,
+                )
+
+        best_launcher = min(timings, key=timings.get)
+        self._release_static_launchers_except(best_launcher)
+        self.launchers = [best_launcher]
+        self._prune_compile_results_to_launcher(best_launcher)
+        self.autotune_time_taken_ns = (
+            self.precompile_time_taken_ns + benchmark_time_taken_ns
+        )
+
+        # log the best config
+        launcher = self.launchers[0]
+        log.debug(
+            "Best config for %s: %s: %f, nreg %d, nspill %d, #shared-mem %s",
+            self.fn.__name__,
+            launcher.config,
+            timings[launcher],
+            launcher.n_regs,
+            launcher.n_spills,
+            launcher.shared,
+        )
+
+        TritonBundler.put_winner(launcher.cache_hash)
+
+        if self.save_cache_hook:
+            self.save_cache_hook(
+                launcher.config,
+                self.autotune_time_taken_ns,
+                found_by_coordesc=self.inductor_meta.get(
+                    "coordinate_descent_tuning", False
+                ),
+                triton_cache_hash=launcher.cache_hash,
+            )
+
     def copy_args_to_cpu_if_needed(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """Keep a copy of what a measurement is about to overwrite, off the device.
 
@@ -1212,7 +1501,7 @@ class CachingAutotuner(KernelInterface):
         the point of having kept it.
         """
 
-        from ..._higher_order_ops.auto_functionalize import clone_preserve_strides
+        from tensorplay._higher_order_ops.auto_functionalize import clone_preserve_strides
 
         def prepare_arg(name, arg):
             if name in self.mutated_arg_names and name not in exclude:
@@ -1346,6 +1635,7 @@ class CachingAutotuner(KernelInterface):
             )
         return result
 
+    @functools.cached_property
     def _could_rblock_scale(self) -> bool:
         """Whether a block worth halving is worth looking for here.
 

@@ -53,7 +53,7 @@ class DeviceInterface:
         raise NotImplementedError
 
     @staticmethod
-    def get_compute_capability(device: Any = None) -> str:
+    def get_compute_capability(device: Any = None) -> Any:
         raise NotImplementedError
 
     @staticmethod
@@ -105,8 +105,17 @@ class CudaInterface(DeviceInterface):
         return tp.cuda._maybe_exchange_device(device_idx)
 
     @staticmethod
-    def get_compute_capability(device: Any = None) -> str:
-        return tp.cuda.get_device_capability(device)
+    def get_compute_capability(device: Any = None) -> Any:
+        # A device says what it is as two numbers, and what a kernel is compiled
+        # for is one: the two are written as one number here so that a caller
+        # asking what a device is gets something it can hand on rather than
+        # something it has to take apart first.  Where the two numbers are not
+        # the answer at all -- a device named by what it is built for rather than
+        # by numbers -- the name is the answer.
+        if not tp.version.hip:
+            major, minor = tp.cuda.get_device_capability(device)
+            return major * 10 + minor
+        return tp.cuda.get_device_properties(device).gcnArchName.split(":", 1)[0]
 
     @staticmethod
     def synchronize(device: Any = None) -> None:
@@ -183,7 +192,7 @@ class MtiaInterface(DeviceInterface):
         return tp.mtia._maybe_exchange_device(device_idx)
 
     @staticmethod
-    def get_compute_capability(device: Any = None) -> str:
+    def get_compute_capability(device: Any = None) -> Any:
         return ""
 
     @staticmethod
@@ -230,7 +239,7 @@ class CpuInterface(DeviceInterface):
         return -1
 
     @staticmethod
-    def get_compute_capability(device: Any = None) -> str:
+    def get_compute_capability(device: Any = None) -> Any:
         return ""
 
     @staticmethod
