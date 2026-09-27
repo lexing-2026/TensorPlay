@@ -29,11 +29,13 @@ from . import config
 from .fx_utils import count_flops_fx
 from .loops import compute_required_storage_length, contiguous_strides
 from .utils import (
+    gather_origins,
     get_sympy_Expr_dtype,
     has_free_symbols,
     SUPPORTED_MKLDNN_DEVICES,
     ValueWithLineMap,
 )
+from ....graph.interpreter import Interpreter
 from .codegen.common import FileBackedGraphModule
 from .sizevars import SizeVarAllocator
 from .virtualized import V
@@ -422,7 +424,7 @@ def is_mkldnn_conv(node) -> bool:
     return False
 
 
-class GraphLowering:
+class GraphLowering(Interpreter):
     def __init__(
         self,
         graph_module,
@@ -437,19 +439,38 @@ class GraphLowering:
         layout_opt: bool | None = None,
         name: str | None = None,
     ):
+        # The walk this region is read by is the ordinary one: a node at a
+        # time, each handed to the method named by what it is.  Everything the
+        # region's own values need from the walk -- the graph, the module the
+        # constants are read out of, where the values so far are kept -- is
+        # therefore set up before anything of the region's own is recorded,
+        # since a value recorded against a walk that is not this one would be
+        # recorded against nothing.
+        super().__init__(graph_module)
+        self.name = "GraphLowering" if name is None else name
+        #: The operations a node in the region named is computed by the
+        #: framework rather than by a kernel, recorded by the name it is called
+        #: under so that a later step can ask whether a given name is one.
+        #: Which input has been reached, counting from zero.  What a donated
+        #: input is decided by where it falls, so the count is kept rather
+        #: than recomputed from the node table each time it is asked for.
+        #: The node being lowered right now, or nothing.  A generator that
+        #: writes code for a node asks about the region rather than being
+        #: handed the node, and a few of its decisions are about the node: a
+        #: view the program wrote should not be padded, and a call that came
+        #: from a particular place should say so in what is generated.
+        self.current_node: Any = None
+        self.placeholder_idx = 0
+        self.removed_operations: OrderedSet = OrderedSet()
+        #: Which input a shape expression was read from, so a wrapper can bind
+        #: that expression to the element it was read out of.  Recorded by
+        #: expression rather than by input, because the same expression read
+        #: from two inputs needs only one of them bound.
+        self.symbolic_input_sources: dict = {}
         # Which shape the values are described against, kept rather than taken
         # from whichever graph happens to be current: a region compiled on its
         # own is asked about shapes that the region it came from already knows,
         # and asking the current graph would answer for that one instead.
-        # Which input a shape expression was read from, so a wrapper can bind
-        # that expression to the element it was read out of.  Recorded by
-        # expression rather than by input, because the same expression read
-        # from two inputs needs only one of them bound.
-        #: The operations a node in the region named is computed by the
-        #: framework rather than by a kernel, recorded by the name it is called
-        #: under so that a later step can ask whether a given name is one.
-        self.removed_operations: OrderedSet = OrderedSet()
-        self.symbolic_input_sources: dict = {}
         self.shape_env = shape_env
         # Whether the region is being compiled to stand on its own rather than to
         # be part of something larger, which decides what it may assume about
@@ -458,10 +479,6 @@ class GraphLowering:
         self.extern_node_serializer = extern_node_serializer
         self.is_inference = is_inference
         self.is_backward = is_backward
-        # The name this region is known by in a log or an artifact, standing in
-        # for the position in a program that a region compiled on its own does
-        # not have.
-        self.name = name
         # The name of each value the region is handed, in the order it is handed
         # them.  A caller that compiled symbols knows them by name and a compiled
         # artifact is called with them by position, so the two have to be able to
@@ -493,7 +510,6 @@ class GraphLowering:
         # nodes are being lowered into it.  A node names a constant as an
         # attribute path, and the path means nothing without the module it is
         # relative to.
-        self.module = graph_module
         self.example_inputs = list(example_inputs)
         # The buffers in the order they were made, and the same ones by name.
         # Both are kept because one question asks which order things were made
@@ -623,11 +639,9 @@ class GraphLowering:
         # Produces a node's value from the values its arguments name, and is
         # installed by the walk; a caller that lowers nodes itself needs it
         # before the walk has run.
-        self._lower_node = None
         # The node being lowered right now, published for the duration of a
         # lowering call so that anything below it can ask which one without it
         # being passed down through every call that might want to.
-        self._current_node = None
         # Whether the walk has run, so that a second request for a built form
         # does not walk an already settled region again.
         self._walked = False
@@ -659,27 +673,17 @@ class GraphLowering:
         return name in self.zero_dim_cpu_tensor_list
 
 
-    def current_node(self):
-        """The graph node being lowered right now, or nothing.
-
-        A generator that writes code for a node asks about the region rather
-        than being handed the node, and a few of its decisions are about the
-        node: a view the user wrote should not be padded, and a call that came
-        from a particular place should say so in what is generated.
-        """
-
-        return getattr(self, "_current_node", None)
 
     @contextlib.contextmanager
     def set_current_node(self, node):
         """Say which node is being lowered, and go back to saying none."""
 
-        previous = self._current_node
-        self._current_node = node
+        previous = self.current_node
+        self.current_node = node
         try:
             yield node
         finally:
-            self._current_node = previous
+            self.current_node = previous
 
     # -- registry ---------------------------------------------------------
     def add_device_info(self, device) -> None:
@@ -697,6 +701,19 @@ class GraphLowering:
             self.device_idxs.add(device.index)
         if V.graph.current_node and device not in self.device_node_mapping:
             self.device_node_mapping[device] = V.graph.current_node
+
+    def static_sizes_strides(self, ex):
+        """The shape and the strides of a value, as whole numbers.
+
+        A value whose shape is already known is described by whole numbers
+        rather than by expressions, which is what lets a kernel be written
+        against a shape that can be read at compile time.  Chiefly what the
+        weights of a region are described by.
+        """
+
+        size = [sympy.Integer(i) for i in ex.size()]
+        stride = [sympy.Integer(i) for i in ex.stride()]
+        return size, stride
 
     def get_training_phase(self) -> str:
         """Which of the three passes over a region this is.
@@ -1351,7 +1368,6 @@ class GraphLowering:
             kwargs=realized_kwargs,
         )
         kernel.origin_node = node
-        self.operations.append(kernel)
         return kernel
 
     def _wrap_fallback(self, node, kernel):
@@ -1410,11 +1426,217 @@ class GraphLowering:
         return self._wrap_fallback(node, kernel)
 
     # -- walk -------------------------------------------------------------
-    def run(self):
-        with set_ops_handler(DeferredOps()), set_graph(self):
-            result = self._run()
-        self._walked = True
+    @staticmethod
+    def _get_node_stream(n):
+        """Which stream the program asked this node to run on, if it said."""
+
+        return n.meta.get("custom", {}).get("stream")
+
+    @staticmethod
+    def _get_node_mempool(n):
+        """Which memory pool the program asked this node to allocate from."""
+
+        custom = n.meta.get("custom", {})
+        if "mempool" not in custom:
+            return None
+        return custom["mempool"], custom["mempool_device"]
+
+    def _realize_inputs_at_context_boundaries(self, n) -> None:
+        """Put in memory the inputs this node reads under a different context.
+
+        Two values read under different streams, or with memory taken from
+        different pools, cannot be folded into one kernel: what that kernel
+        would run on is one stream and one pool, and the other reads would have
+        to be moved there, which is not a rewrite this compiler does.  So a
+        value whose context differs from the node reading it is put in memory
+        first, and the two are then separate kernels.  Nothing recorded means
+        the default, so it is compared like any other value.
+        """
+
+        node_stream = self._get_node_stream(n)
+        node_mempool = self._get_node_mempool(n)
+        for input_node in n.all_input_nodes:
+            if (
+                self._get_node_stream(input_node) == node_stream
+                and self._get_node_mempool(input_node) == node_mempool
+            ):
+                continue
+            ir_value = self.env.get(input_node)
+            if isinstance(ir_value, TensorBox):
+                ir_value.realize()
+
+    def run_node(self, n):
+        """The value one node stands for, read under the context it was read in.
+
+        What a node is computed against -- which stream it runs on, which pool
+        its memory comes from, which graph nodes it came from -- is decided here
+        rather than inside whatever the node happens to be, because a value may
+        be reused by a later node read under a different context, and what that
+        reuse means can only be said where both contexts are in hand.  The node
+        being read is also published for the duration, so that anything written
+        while it is read can ask which node it is written for.
+        """
+
+        # The nodes this one was made from, gathered before the node is read:
+        # afterwards the values it was handed may have been put in memory, and
+        # a value in memory no longer says what it came from.
+        origins: OrderedSet = OrderedSet([n])
+        args = kwargs = None
+        if n.op == "call_function":
+            args, kwargs = self.fetch_args_kwargs_from_env(n)
+            origins |= gather_origins(args, kwargs)
+            self._realize_inputs_at_context_boundaries(n)
+        node_mempool = self._get_node_mempool(n)
+
+        with (
+            IRNode.current_origins(origins),
+            IRNode.current_stream_idx(self._get_node_stream(n)),
+            IRNode.current_mempool(node_mempool),
+            self.set_current_node(n),
+            V.set_current_node(n),
+        ):
+            if n.op == "call_function":
+                result = self.call_function(n.target, args, kwargs)
+            else:
+                result = super().run_node(n)
+        self.env[n] = result
         return result
+
+    def run(self, *args):
+        """Read the region, one node at a time, and record what each stands for.
+
+        A node is handed to the method named by what it is -- a placeholder to
+        the method that gives it a buffer, a call to the method that knows what
+        the operation computes -- and the value that method returns is what the
+        node stands for from then on.  The order is the region's own order,
+        which is the order in which one value can be computed from another.
+        """
+
+        with set_ops_handler(DeferredOps()), set_graph(self):
+            return super().run(*args)
+
+    def placeholder(self, target, args, kwargs):
+        """The value a named input of the region stands for.
+
+        A tensor input becomes a buffer laid out as the value it stands for,
+        held in a box, and recorded twice over: once as the value a later step
+        asks about by name, and once as the buffer the bytes are read out of.
+        Anything that is not a tensor is recorded as itself, since there are no
+        bytes to lay out.
+        """
+
+        self.placeholder_idx += 1
+        example = super().placeholder(target, args, kwargs)
+        name = self.qualify_name(target)
+
+        if not _is_tensor(example):
+            # A value rather than a tensor: recorded so that a step which asks
+            # what this input is learns that it is not a tensor, and returned
+            # unchanged so that whatever asked for it can use it.
+            self.graph_inputs[name] = example
+            self.graph_input_names.append(name)
+            return example
+
+        sizes, strides = self.static_sizes_strides(example)
+        buffer = InputBuffer(name=name, layout=FixedLayout(example.device, example.dtype, sizes, strides))
+        tensor = TensorBox(buffer)
+
+        self.name_to_buffer[buffer.name] = buffer
+        self.buffers.append(buffer)
+        self.graph_inputs[name] = tensor
+        self.graph_inputs_original[name] = buffer
+        self.graph_input_names.append(name)
+        if self.device is None and example.device.is_cuda():
+            self.device = example.device
+        return tensor
+
+    def call_module(self, target, args, kwargs):
+        """A region is never a call to another region."""
+
+        raise AssertionError
+
+    def call_method(self, target, args, kwargs):
+        """A region is never a call to a method of a value."""
+
+        raise AssertionError
+
+    def call_function(self, target, args, kwargs):
+        """What the region means by a call, as a value the rest can be written
+        against.
+
+        A lowering the program wrote for this operation itself is asked before
+        the built-in one for the name the operation happens to be called under,
+        because those two describe different operations that share a spelling.
+        With neither, the call is handed to the framework whole: slower than a
+        kernel and correct, and the only thing left to say.
+        """
+
+        node = V.graph.current_node
+        name = target_name(target)
+        if name == "getitem" and args and isinstance(args[0], (list, tuple)):
+            # Indexing a result tuple is answered here rather than called out
+            # to: a value that is already computed is addressed, not recomputed.
+            return args[0][args[1]]
+
+        lowering = (
+            user_lowerings.get(node)
+            or user_lowerings.get(target)
+            or LOWERINGS.get(name)
+        )
+        with self.set_current_node(node), set_current_node(node):
+            if lowering is not None:
+                result = lowering(*args, **kwargs)
+            else:
+                result = self.make_extern(node, args, kwargs)
+
+        if isinstance(result, TensorBox):
+            # A value several consumers read is stored rather than recomputed
+            # per consumer, but only when the body is worth storing: cheap
+            # index arithmetic stays inline so a shared constant does not
+            # inflate every downstream read count.  The decision belongs to the
+            # box, the only thing that knows what it holds and how it got its
+            # reads.
+            storage = result.data
+            while not isinstance(storage, StorageBox) and isinstance(storage, (View, TensorBox)):
+                storage = storage.data
+            if isinstance(storage, StorageBox):
+                storage.mark_reuse(len(node.users))
+        # Which node of the region this value was made by, so that a report
+        # about it can name where it came from.
+        assign_origin_node(result, node)
+        return result
+
+    def output(self, target, args, kwargs):
+        """What the region hands back, put in memory before it is recorded.
+
+        A caller reads an output out of memory, so however the value was
+        arrived at -- still held in a box, or already a bare view -- it is put
+        in memory first, and a stride a caller does not read is matched back to
+        the stride the region said it had so that the two descriptions of the
+        same value agree.
+        """
+
+        result = super().output(target, args, kwargs)
+        if not isinstance(result, (tuple, list)):
+            # A subgraph may hand back a single value without wrapping it.
+            result = (result,)
+
+        for value in result:
+            # What an output is allowed to be.  A value is somewhere memory
+            # can be given, something already known without computing it, or a
+            # shape; anything else is a node type this walk cannot account
+            # for, and being told here is far cheaper than being told much
+            # later by a kernel that cannot read what it was handed.
+            if not isinstance(value, _allowed_output_types):
+                raise AssertionError(
+                    f"Unexpected output types: {[type(value)]}, full result: {value}"
+                )
+            self.graph_outputs.append(
+                self.realize_input(value) if isinstance(value, IRNode) else value
+            )
+        self.single_output = len(self.graph_outputs) == 1
+        self.finalize()
+
 
     def _update_scheduler(self) -> None:
         """(Re)build the scheduler for this region.
@@ -1579,230 +1801,12 @@ class GraphLowering:
         for buf in self.buffers:
             buf.decide_layout()
 
-    def _run(self):
-        graph = self.graph_module.graph
-        env = self.env
-        placeholders = list(graph.placeholders)
-        for position, node in enumerate(placeholders):
-            value = self.example_inputs[position]
-            if not _is_tensor(value):
-                env[node] = value
-                self.graph_inputs[node.target] = None
-                continue
-            layout = FixedLayout(
-                value.device, value.dtype,
-                tuple(int(s) for s in value.shape),
-                tuple(int(s) for s in value.stride()),
-                0,
-            )
-            buffer = InputBuffer(name=node.target, layout=layout)
-            self.name_to_buffer[buffer.name] = buffer
-            self.buffers.append(buffer)
-            tensor = TensorBox(buffer)
-            self.graph_inputs[node.target] = tensor
-            self.graph_inputs_original[node.target] = buffer
-            env[node] = tensor
-            if self.device is None and value.device.is_cuda():
-                self.device = value.device
 
-        # Values are produced on demand from what the region returns, not by
-        # walking the graph's node table.  A table can hold a node whose
-        # arguments name values no entry in it stands for -- a region rebuilt
-        # in place leaves such references behind -- and a walk that trusts the
-        # table hands such an argument to a kernel body as a bare node.
-        # Starting from the returned values and producing what they name makes
-        # the table advisory: a value nothing returns is never produced, and
-        # a value that is produced is produced once.
-        result = self._run_outputs(graph)
-        self.finalize()
-        return result
 
-    def lower_node(self, value):
-        """A value, or a node naming one, as the value it stands for.
 
-        A node is lowered the first time it is asked for rather than by
-        walking the node table, so a node nothing reads costs nothing and a
-        node several things read is lowered once.  A value that is not a node
-        is already what it stands for and is returned as it is, which is what
-        makes a list of arguments lowerable by the same walk as a node's.
-        """
-
-        if isinstance(value, (list, tuple)):
-            return type(value)(self.lower_node(v) for v in value)
-        if isinstance(value, dict):
-            return {k: self.lower_node(v) for k, v in value.items()}
-        if not (hasattr(value, "op") and hasattr(value, "users")):
-            return value
-        key = id(value)
-        if key in self.produced:
-            return self.produced[key]
-        if value.op == "placeholder":
-            if value not in self.env:
-                # A half that was partitioned out rebuilds its own
-                # placeholders, and a node that kept a reference to an
-                # earlier one names an input the half does not declare.
-                # Report the name: the caller has to hand this half a
-                # value for it, and a bare lookup failure would not say
-                # which input is missing.
-                raise NotImplementedError(
-                    f"placeholder {value.name!r} is referenced but not declared"
-                )
-            return self.env[value]
-        if value.op == "get_attr":
-            # Read by the path the node gives rather than by the module's own
-            # lookup, so that a path that does not resolve says how far it got.
-            tensor = getattr_recursive(self.module or self.graph_module, value.target)
-            name = self.allocate_non_dup_const_name(None, tensor)
-            layout = FixedLayout(tensor.device, tensor.dtype,
-                            tuple(int(s) for s in tensor.shape),
-                            tuple(int(s) for s in tensor.stride()), 0)
-            buffer = ConstantBuffer(name=name, layout=layout)
-            self.name_to_buffer[name] = buffer
-            self.buffers.append(buffer)
-            self.constants[name] = tensor
-            self.produced[key] = TensorBox(buffer)
-            return self.produced[key]
-        self.produced[key] = None
-        args = self.lower_node(value.args)
-        kwargs = self.lower_node(value.kwargs or {})
-        name = target_name(value.target)
-        if name == "getitem" and isinstance(args[0], (list, tuple)):
-            # Indexing a result tuple is resolved here, not called out to:
-            # a value that is already computed is addressed, not recomputed.
-            # The spelling is matched by name because the same operation
-            # reaches the graph as more than one callable.  Indexing a
-            # tensor selects along an axis instead, which is a view.
-            result = args[0][args[1]]
-        else:
-            # A lowering the program wrote for this operation itself comes
-            # before the built-in one for the name it happens to be called
-            # under, and the node names both, so both are asked before one
-            # is used.  Keyed by the node as well as its target because the
-            # two are what a program registers under and what it looks up
-            # by, and which one is present is not something to guess.
-            lowering = (
-                user_lowerings.get(value)
-                or user_lowerings.get(value.target)
-                or LOWERINGS.get(name)
-            )
-            # The node being lowered is published for the duration of the
-            # call rather than handed to it, so that a lowering is written
-            # against the same signature whatever it happens to need the node
-            # for: one that does not need it says nothing, and one that does
-            # asks.  Two places publish it, because a generator reaches for
-            # whichever it was given.
-            with self.set_current_node(value), set_current_node(value):
-                if lowering is not None:
-                    result = lowering(*args, **kwargs)
-                else:
-                    result = self.make_extern(value, args, kwargs)
-        if isinstance(result, TensorBox):
-            # A value several consumers read is stored rather than
-            # recomputed per consumer, but only when the body is worth
-            # storing: cheap index arithmetic stays inline so a shared
-            # constant does not inflate every downstream read count.  The
-            # decision itself belongs to the box, which is the only thing
-            # that knows what it is holding and how it got its reads.
-            storage = result.data
-            while not isinstance(storage, StorageBox) and isinstance(
-                storage, (View, TensorBox)
-            ):
-                storage = storage.data
-            if isinstance(storage, StorageBox):
-                storage.mark_reuse(len(value.users))
-        # Which node of the graph this value was made by, so that a report
-        # about it can name where it came from.
-        assign_origin_node(result, value)
-        self.produced[key] = result
-        return result
-
-    def _install_lowering(self):
-        """Publish the way to lower a node, and the tables it records into.
-
-        Both are installed rather than used directly so that a caller lowering a
-        node of its own goes through the same table the region's own walk does:
-        two tables would be two answers to which value a node stands for.
-        """
-
-        if not hasattr(self, "produced"):
-            self.produced = {}
-        self._lower_node = self.lower_node
-
-    def _run_outputs(self, graph):
-        self._install_lowering()
-        for node in graph.nodes:
-            if node.op == "placeholder":
-                continue
-            if node.op == "output":
-                outputs = node.args[0]
-                outputs = outputs if isinstance(outputs, (list, tuple)) else (outputs,)
-                # The output node wraps its arguments, so a region that yields
-                # one value still stores it in a one-element sequence.
-                self.single_output = len(outputs) == 1
-                for value in self.lower_node(list(outputs)):
-                    # What an output is allowed to be.  A value is a place
-                    # memory can be given, something already known without
-                    # computing it, a non-tensor, or a shape; anything else is
-                    # a node type this walk cannot account for, and being told
-                    # here is far cheaper than being told much later by a
-                    # kernel that cannot read what it was handed.
-                    if not isinstance(value, _allowed_output_types):
-                        raise AssertionError(
-                            f"Unexpected output types: {[type(value)]}, "
-                            f"full result: {value}"
-                        )
-                    # A caller reads an output out of memory, so however the
-                    # value was arrived at -- still held in a box, or already a
-                    # bare view -- it is put in memory before it is recorded.
-                    if isinstance(value, IRNode):
-                        self.graph_outputs.append(self.realize_input(value))
-                    else:
-                        self.graph_outputs.append(value)
-                continue
-        return self
 
     # -- one node ---------------------------------------------------------
-    def fetch_args_kwargs_from_env(self, node):
-        """A node's arguments, with each value that names a node replaced by it.
 
-        A node's arguments are written as the nodes they came from, so they have
-        to be read before the node can be lowered: what a lowering wants is the
-        value, and what a graph holds is the name of the value.
-        """
-
-        if self._lower_node is None:
-            self._install_lowering()
-        args = self.lower_node(node.args)
-        kwargs = self.lower_node(node.kwargs or {})
-        return args, kwargs
-
-    def run_node(self, node):
-        """The value one node stands for, lowering it if it has not been.
-
-        Lowering on first use rather than by walking the node table means a node
-        that nothing reads is never lowered, and a node that several things read
-        is lowered once, which is what makes a subgraph's nodes cost what they
-        cost rather than what the table says they might.
-        """
-
-        if node in self.env:
-            return self.env[node]
-        if self._lower_node is None:
-            # a node may be lowered before the region's own walk has run, which
-            # is what a subgraph inlined into a region that has not been walked
-            # yet looks like; the way to lower it does not depend on the walk
-            self._install_lowering()
-        # The node being lowered right now, restored afterwards, because lowering
-        # one node may lower another and the one that asked is the one a failure
-        # has to name.
-        saved = self.current_node
-        try:
-            self._current_node = node
-            value = self._lower_node(node)
-            self.env[node] = value
-            return value
-        finally:
-            self._current_node = saved
 
     def process_subgraph_nodes(self, graph_module, args):
         """The value a subgraph yields, with its nodes lowered into this region.

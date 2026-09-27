@@ -215,9 +215,17 @@ def _lower_stax_region(
     # the region is the one that is current for all of it.
     from .loops import set_graph
 
+    from .loops import Debug
+    from .virtualized import V as VirtualMachine
+
     try:
-        with set_graph(graph):
-            graph.run()
+        # A recorder of what was emitted is current for the whole of the
+        # compilation, because both the schedule and the region's own picture
+        # are asked of it by name while they are being decided, and neither can
+        # say where to write unless something has already said that it wants to
+        # be written at all.
+        with set_graph(graph), VirtualMachine.set_debug_handler(Debug()):
+            graph.run(*example_inputs)
             compiled_module = graph.compile_to_module()
     except (NotImplementedError, NotImplementedError.__base__) as exc:
         # A region whose printed form this compiler does not cover has no built
@@ -225,6 +233,11 @@ def _lower_stax_region(
         # the failure would arrive at the first call rather than here.  So a
         # caller that did not ask for a built form gets the region run as it was
         # written, and a caller that did asks for the failure instead.
+        if os.environ.get("TP_STAX_LOWER_DEBUG"):
+            print(
+                f"[stax-lower] uncovered: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
         if strict:
             raise RuntimeError(
                 "strict_native Stax lowering failed: captured graph has no built form"

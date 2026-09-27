@@ -25,6 +25,7 @@ import tensorplay as tp
 from tensorplay._ops import OpOverload
 
 from .. import async_compile, config, ir, metrics
+from ..codegen.common import PythonPrinter
 from .. import loops, sympy_utils
 from ..loops import V
 from ..ir import (
@@ -122,7 +123,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-pexpr = sympy_utils.sympy_str
+pexpr = PythonPrinter().doprint
 
 
 def _rewrite_symbol_solution_for_int_codegen(expr: sympy.Expr) -> sympy.Expr:

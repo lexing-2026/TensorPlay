@@ -117,6 +117,7 @@ def get_metric_fields() -> list[str]:
     return [field.name for field in dataclasses.fields(CachedMetricsDeltas)]
 
 
+@dataclasses.dataclass
 class MetricTable:
     table_name: str
     column_names: list[str]
@@ -258,3 +259,92 @@ def log_kernel_autotune_result(
             "latency_ms": latency,
         }
     )
+
+
+MetricTable.register_table(
+    "slow_fusion",
+    [
+        "kernel1_path",
+        "kernel1_latency",
+        "kernel2_path",
+        "kernel2_latency",
+        "fused_kernel_path",
+        "fused_kernel_latency",
+        "slow_down_ratio",
+    ],
+)
+
+MetricTable.register_table(
+    "graph_stats",
+    [
+        "graph_id",
+        "num_nodes_before_fusion",
+        "num_nodes_after_fusion",
+    ],
+)
+
+MetricTable.register_table(
+    "persistent_red_perf",
+    [
+        "kernel0_path",
+        "kernel1_path",
+        "kernel2_path",
+        "kernel3_path",
+        "kernel0_latency",
+        "kernel1_latency",
+        "kernel2_latency",
+        "kernel3_latency",
+        "size_hints",
+        "reduction_hint",
+    ],
+)
+
+MetricTable.register_table(
+    "fusion_failure_due_to_indexing_mismatch",
+    [
+        "pre_grad_graph_id",
+        "post_grad_graph_id",
+        "node1_name",
+        "node2_name",
+        "node1_debug_str",
+        "node2_debug_str",
+        "common_buffer_names",
+        "failure_reason",
+    ],
+)
+
+MetricTable.register_table(
+    "kernel_metadata",
+    [
+        "kernel_name",
+        "kernel_path",
+        "kernel_category",  # pointwise/reduction/foreach etc.
+        "size_hints",
+        "reduction_hint",
+        "line_of_code",
+        "num_load",
+        "num_store",
+        "num_for_loop",
+        "num_atomic_add",
+        "num_args",
+        # xyz numel can be different to size_hints since size_hints are rounded
+        # up to the nearest power of 2.
+        # Inductor kernel will burn in the xyz numel in kernel code for static
+        # shape kernels.
+        # Logging them will be helpful to find unaligned shape for reduction
+        "xnumel",
+        "ynumel",
+        "rnumel",
+        "kernel_args_num_gb",
+    ],
+)
+
+MetricTable.register_table(
+    "kernel_autotune",
+    [
+        "kernel_path",
+        "kernel_name",
+        "triton_config",
+        "latency_ms",
+    ],
+)

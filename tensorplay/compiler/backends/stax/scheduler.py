@@ -55,6 +55,7 @@ from tensorplay.graph.experimental.sympy_functions import (
 )
 from .runtime.triton_compat import triton as _triton
 
+from .metrics import get_metric_table, is_metric_table_enabled
 from . import comms, config, config_comms, dependencies, ir, metrics
 from .compile_log import timed_block, trace_structured
 from .analyze_preserves_zero_mask import can_codegen_without_upcasts

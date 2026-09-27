@@ -17,6 +17,7 @@ contiguous cases.
 """
 
 from __future__ import annotations
+import os
 
 import contextlib
 import functools
@@ -152,6 +153,65 @@ class _KernelState:
         return CSEVariable(name, bounds, dtype, shape)
 
 
+class Debug:
+    """Where a run's pictures of itself are written, when anything asked for one.
+
+    The scheduler and the graph both offer to draw what they decided, and both
+    are asked on every compilation.  So this is always an object rather than
+    nothing, and what it offers to draw is written only when a directory has
+    been named for this run -- a build nobody asked to look at should not pay
+    for drawing itself, and should not leave a directory behind either.
+    """
+
+    def __init__(self) -> None:
+        self._path: str | None = None
+
+    def set_path(self, path: str | None) -> None:
+        """Name where pictures go, or take the naming back."""
+
+        self._path = path
+
+    def _target(self, suffix: str) -> str | None:
+        if self._path is None:
+            return None
+        return os.path.join(self._path, suffix)
+
+    def graph_diagram(self, nodes) -> None:
+        """Draw the schedule: which node reads and writes which buffer."""
+
+        target = self._target("graph_diagram.txt")
+        if target is None:
+            return
+        import io
+
+        buf = io.StringIO()
+        for node in nodes:
+            buf.write(node.debug_str())
+            buf.write("\n\n\n")
+        _write_debug_file(target, buf.getvalue())
+
+    def draw_orig_fx_graph(self, gm, nodes) -> None:
+        """Draw the region as it was written, annotated with what it became.
+
+        The picture is only the region's own nodes and the schedule node each
+        became, written as text beside the run's other output: a picture needs
+        a renderer this build does not require, and the correspondence between
+        what was written and what it turned into is what such a picture is for.
+        """
+
+        target = self._target("orig_fx_graph.txt")
+        if target is None:
+            return
+        lines = [str(node) for node in gm.graph.nodes]
+        _write_debug_file(target, "\n".join(lines) + "\n")
+
+
+def _write_debug_file(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
 class NullKernel(_KernelState):
     """The kernel that is there when no kernel is being emitted.
 
@@ -196,7 +256,7 @@ class _Virtual(threading.local):
         self.current_node = None
         self.kernel = NullKernel()
         self.interpreter = None
-        self.debug = None
+        self.debug = Debug()
         self.aot_compilation = False
         self.extern_kernel_nodes = None
         self.real_inputs = None
