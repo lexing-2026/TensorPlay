@@ -118,6 +118,14 @@ class _TestConfigs:
     #: believes a value has, as an assertion in the generated code.
     runtime_triton_dtype_assert = False
 
+    #: How many ways an attention kernel may be written before the search stops
+    #: offering more.  A cap rather than a rule because each of these is a
+    #: measurement: past a point the search costs more time than the best of
+    #: them is worth, and which point that is depends on the machine.
+    max_flex_configs: int = int(
+        os.environ.get("TP_MAX_FLEX_CONFIGS", "0")
+    ) or None
+
     #: Have the host emitter state the element type it believes a value has,
     #: as a compile-time assertion in the generated code.
     static_cpp_dtype_assert = False
@@ -321,6 +329,12 @@ class _CppConfig:
     #: Whether the decomposition of the hyperbolic tangent is used where the
     #: language has one of its own.
     use_decompose_tanh = False
+    #: The compiler to build a wrapper with, and where to get it if it is not
+    #: already on the path.
+    cxx: tuple[None, str] = (
+        None,
+        os.environ.get("CXX", "clang++" if sys.platform == "darwin" else "g++"),
+    )
 
 
 cpp = _CppConfig()
@@ -1094,6 +1108,32 @@ class _TritonConfig:
 
     #: How many separate reads a mix-order reduction may make.  Zero says not
     #: to check, which leaves the number of reads unbounded.
+    #: Whether a partition is reordered for the sake of reducing how many
+    #: partitions there are, which is what makes the partitions share kernels.
+    reorder_for_reducing_graph_partitions: bool = True
+
+    #: Testing only: which operation has the activation fused into it that
+    #: would otherwise be a separate kernel.
+    inject_relu_bug_TESTING_ONLY: str | None = None
+
+    #: Testing only: whether a candidate that fails to run is counted as
+    #: failing rather than as a reason to stop benchmarking.
+    disallow_failing_autotune_kernels_TESTING_ONLY = False
+
+    #: Whether each kernel is waited on before the next is launched, so that
+    #: what runs is observable in the order it was asked for.
+    debug_sync_kernel = False
+
+    #: Whether a graph whose shapes are not all known is left out of capture,
+    #: since what to capture cannot be said before the shapes are.
+    cudagraph_skip_dynamic_graphs = False
+
+    #: How much more memory a partition may take than it saves, as a multiple,
+    #: for capture to be worth what it costs.
+    cudagraph_partition_memory_budget: float = 1.1
+
+    #: Below this many nodes in a partition, capture costs more than it saves.
+    cudagraph_min_partition_size = 0
     mix_order_reduction_max_reads = 10
 
 
@@ -1407,6 +1447,12 @@ class _EagerNumerics:
     #: Take a float64 operation from the device library rather than from
     #: arithmetic.  Off because the arithmetic is faster where it exists, and
     #: the two are not always the same answer.
+    #: Whether a division of integers is rounded the way the hardware rounds
+    #: it rather than the way the arithmetic defines it, so that what a kernel
+    #: computes agrees with what the framework would have computed.
+    division_rounding: bool = (
+        os.environ.get("TORCHINDUCTOR_EMULATE_DIVISION_ROUNDING", "0") == "1"
+    )
     use_project_libdevice = False
 
 
@@ -1560,3 +1606,34 @@ quiesce_async_compile_pool: bool = (
 #: than for the device, which decides whether a node holding a value the device
 #: cannot read is skipped rather than lowered.
 disable_cpp_codegen: bool = False
+
+
+class _AutoChunkerConfig:
+    """Whether the graph is cut into pieces that are each worth compiling."""
+
+    #: Whether the chunking is done at all.
+    enable: bool = os.environ.get("TORCHINDUCTOR_AUTO_CHUNKER") == "1"
+
+
+auto_chunker = _AutoChunkerConfig()
+
+
+class _AtenDistributedOptimizationsConfig:
+    """How work is spread over devices, and when it is started."""
+
+    #: Whether a candidate is started as soon as it is chosen rather than
+    #: after the whole choice is made.
+    enable_simple_overlap: bool = True
+
+    #: Whether starting candidates is ordered so that the longest is started
+    #: first, which is what keeps the devices from waiting on one another.
+    enable_overlap_scheduling: bool = False
+
+    #: How work is grouped before it is spread, or None for the natural
+    #: grouping.
+    bucket_mode: (
+        Literal["default", "custom_ops", "custom_ops_multidtype", "coalesced"] | None
+    ) = None
+
+
+aten_distributed_optimizations = _AtenDistributedOptimizationsConfig()

@@ -17,6 +17,10 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import functools
+import importlib
+import importlib.util
+import inspect
 import math
 from itertools import product
 from typing import Any
@@ -50,6 +54,7 @@ from ..ir import (
     IRNode,
     TensorBox,
 )
+from .. import config
 from ..loops import V, get_fill_order
 from tensorplay.utils._pytree import tree_map, tree_map_only
 from tensorplay.graph.experimental.sympy_functions import FloorDiv
@@ -584,6 +589,163 @@ def select_aux_mod_vec_size(
             found_vectorizable_load = True
 
     return selected_vec_size if found_vectorizable_load else 1
+
+
+# ---------------------------------------------------------------------------
+# Configurations
+# ---------------------------------------------------------------------------
+
+
+def get_flex_flash_fwd_configs(
+    has_score_mod: bool,
+    has_aux_tensors: bool,
+    device: Any = None,
+    score_mod_graph_module: Any = None,
+    score_mod_other_buffers: Any = (),
+    has_mask_mod: bool = False,
+    has_mask_aux_tensors: bool = False,
+    mask_mod_graph_module: Any = None,
+    mask_mod_other_buffers: Any = (),
+    aux_scalar_symbols: Any = (),
+) -> Any:
+    """The ways the forward kernel may be written, widest mask last.
+
+    Whether a mask can be read several positions at a time is a property of the
+    device as well as of the mask: the wide reads it needs are not written on
+    every device.  So the device is asked before the width is chosen, rather
+    than the width being chosen and then found not to be readable.
+
+    A mask that could be written as ranges of positions is written that way
+    whatever else was decided about its width, because that is the width the
+    ranges are written at -- the two are the same decision, and asking about
+    them separately is how they come to disagree.
+
+    A score that reads nothing captured is not held to any width, and when the
+    search is measuring it is offered every width the kernel supports: nothing
+    in the graph says which is best, and that is what a measurement is for.
+    """
+
+    from ..codegen.cutedsl.aux_scalars import CuteDSLAuxScalarBindings
+
+    cuda_major = None
+    if tp.cuda.is_available() and (
+        has_mask_mod or (has_score_mod and has_aux_tensors)
+    ):
+        device_index = None if device is None else device.index
+        cuda_major = tp.cuda.get_device_capability(device_index)[0]
+    mask_mod_vec_size = select_mask_mod_vec_size(
+        has_mask_mod=has_mask_mod,
+        has_mask_aux_tensors=has_mask_aux_tensors,
+        supports_mask_mod_vec=cuda_major in (10, 11),
+        graph_module=mask_mod_graph_module,
+        other_buffers=mask_mod_other_buffers,
+    )
+    score_mod_vec_size = select_score_mod_vec_size(
+        has_score_mod=has_score_mod,
+        has_aux_tensors=has_aux_tensors,
+        is_sm100_or_later=cuda_major is not None and cuda_major >= 10,
+        graph_module=score_mod_graph_module,
+        other_buffers=score_mod_other_buffers,
+    )
+    mask_mod_packed_intervals = None
+    if has_mask_mod and cuda_major in (10, 11) and mask_mod_graph_module is not None:
+        mask_mod_packed_intervals = select_packed_mask_intervals(
+            mask_mod_graph_module,
+            mask_mod_other_buffers,
+            CuteDSLAuxScalarBindings(tuple(aux_scalar_symbols)).symbol_codes(),
+        )
+    if mask_mod_packed_intervals is not None:
+        mask_mod_vec_size = DEFAULT_MASK_MOD_VEC_SIZE
+
+    if (
+        has_score_mod
+        and score_mod_vec_size is None
+        and config.max_autotune
+    ):
+        # Nothing captured held the score's width, and a captured number is the
+        # same for every position -- so every width the kernel supports is
+        # allowed, and which is best is what the search is for.
+        score_mod_vec_sizes = (1, 2, 4, 8, 16, 32, 64, 128)
+    else:
+        score_mod_vec_sizes = (score_mod_vec_size,)
+    configs = [
+        FlexFlashConfig(
+            score_mod_vec_size=v,
+            mask_mod_vec_size=mask_mod_vec_size,
+            mask_mod_packed_intervals=mask_mod_packed_intervals,
+        )
+        for v in score_mod_vec_sizes
+    ]
+    max_configs = config.test_configs.max_flex_configs
+    if max_configs is not None and len(configs) > max_configs:
+        configs = configs[:max_configs]
+    return configs
+
+
+def _get_flex_flash_bwd_configs() -> Any:
+    """The backward kernel has only the one way of being written.
+
+    Not measured, because there is nothing to choose: a score that is more than
+    itself is not yet accounted for in the backward pass, so the score is the
+    score and the kernel has one shape.
+    """
+
+    return [FlexFlashConfig()]
+
+
+# ---------------------------------------------------------------------------
+# Whether the kernel can be written at all
+# ---------------------------------------------------------------------------
+
+
+FLASH_ATTENTION_INSTALL_MESSAGE = (
+    "Install a compatible Flash Attention package, for example "
+    '`pip install --pre flash-attn-4` (`pip install --pre "flash-attn-4[cu13]"` '
+    "for CUDA 13), and see https://pypi.org/project/flash-attn-4/ "
+    "for PyPI packaging details."
+)
+
+
+def _flash_attention_unavailable_message() -> str:
+    return (
+        "CUTE flash attention library is not available. "
+        f"{FLASH_ATTENTION_INSTALL_MESSAGE}"
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def ensure_flash_available() -> bool:
+    """Whether the attention library this kernel is written against is here.
+
+    Asked once and remembered, because it is a fact about what is installed and
+    does not change while the program runs.  Asked by looking rather than by
+    importing, so that a missing library is a missing library rather than an
+    error from something that was never there.
+    """
+
+    try:
+        return importlib.util.find_spec("flash_attn.cute") is not None
+    except ImportError:
+        return False
+
+
+@functools.lru_cache(maxsize=1)
+def flash_supports_aux_scalars() -> bool:
+    """Whether the installed library can be handed a number beside the values.
+
+    Asked by looking at what the entry points accept rather than by trying one,
+    because trying one would produce values rather than an answer, and the values
+    would then be the ones the answer was about.
+    """
+
+    try:
+        interface = importlib.import_module("flash_attn.cute.interface")
+    except ImportError:
+        return False
+    return (
+        "aux_scalars" in inspect.signature(interface._flash_attn_fwd).parameters
+        and "aux_scalars" in inspect.signature(interface._flash_attn_bwd).parameters
+    )
 
 
 # ---------------------------------------------------------------------------
