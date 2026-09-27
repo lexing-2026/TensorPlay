@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .op_lowerings import ceildiv
+from ..runtime.runtime_utils import ceildiv
 from ..templates.mm_common import load_kernel_template
 from ..templates.select_algorithm import TritonTemplate
 
