@@ -74,6 +74,8 @@ from ..codegen.wrapper import pexpr
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
 from ..autotune_process import TritonBenchmarkRequest
 from ..utils import do_bench_using_profiling
+from pathlib import Path
+from tensorplay.utils._filelock import FileLock
 from ..compile_log import timed_block, trace_structured
 from tensorplay.testing import assert_close
 
@@ -3817,6 +3819,163 @@ def _log_autotune_choices_stats(
     sys.stderr.write(f"Autotune Choices Stats:\n{payload}\n")
 
 
+@functools.cache
+def get_mm_log_filename() -> str | None:
+    """Where matrix-multiplication tunings are recorded, if they are being."""
+    mm_file_name = os.environ.get("TP_MM_LOGGING_FILE", None)
+    if not mm_file_name:
+        return None
+
+    if "json" not in mm_file_name:
+        mm_file_name = f"{mm_file_name}.json"
+
+    return mm_file_name
+
+
+@functools.cache
+def get_omni_attention_log_filename() -> str | None:
+    """Where omni-attention tunings are recorded, if they are being."""
+    file_name = os.environ.get("TP_OMNI_ATTENTION_LOGGING_FILE", None)
+    if not file_name:
+        return None
+
+    return str(Path(file_name).with_suffix(".json"))
+
+
+@functools.cache
+def get_conv_log_filename() -> str | None:
+    """Where convolution tunings are recorded, if they are being."""
+    conv_file_name = os.environ.get("TP_CONV_LOGGING_FILE", None)
+    if not conv_file_name:
+        return None
+
+    return str(Path(conv_file_name).with_suffix(".json"))
+
+
+def append_to_log(filename, data):
+    """Add one record to a log of tunings, without losing another's.
+
+    Several builds can be writing at once -- one per process on a machine, and
+    a machine can be building for several -- so the read and the write are
+    taken together under a lock, and a file that is not there yet or is not
+    readable as a list starts as an empty list rather than failing the build
+    that happened to run second.
+    """
+
+    lock_file = filename.replace(".json", ".lock")
+    lock = FileLock(lock_file)
+    with lock:
+        try:
+            with open(filename) as f:
+                log_data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            log_data = []
+
+        log_data.append(data)
+
+        with open(filename, "w") as f:
+            json.dump(log_data, f, indent=4)
+
+
+def _classify_kernel_operation(
+    name: str, choices: list, input_nodes
+) -> str:
+    """Say which kind of operation a set of candidates is for.
+
+    Returns one of: "mm", "conv", "omni", or "other".
+
+    A tuning is told to record itself under one of these names, and being
+    wrong about which would file a convolution's timings under matrix
+    multiplication -- so this is worked out from what the candidates are where
+    that is possible, from the shapes where it is not, and from the name only
+    as a last resort.  The name is matched in full rather than by substring,
+    because a name that happens to contain "mm" is not a matrix
+    multiplication.
+    """
+    # First, try to classify from choice types
+    if choices:
+        for choice in choices:
+            if isinstance(choice, TritonTemplateCaller):
+                # Extract template name (e.g., "mm" from "mm_1", "convolution2d" from "convolution2d_3")
+                template_name = choice.name.rsplit("_", 1)[0]
+
+                # Check known template patterns
+                if template_name in (
+                    "mm",
+                    "bmm",
+                    "mm_persistent_tma",
+                    "grouped_mm",
+                    "scaled_grouped_mm",
+                    "mm_plus_mm",
+                    "blackwell_ws_persistent_device_tma",
+                    "scaled_mm_device_tma_main_loop_scaling",
+                ):
+                    return "mm"
+                elif template_name in ("convolution2d", "convolution3d"):
+                    return "conv"
+                elif template_name.startswith("omni_"):
+                    return "omni"
+
+            elif isinstance(choice, ExternKernelCaller):
+                # Check extern kernel names
+                choice_name = choice.name
+                if choice_name in (
+                    "mm",
+                    "bmm",
+                    "addmm",
+                    "baddbmm",
+                    "_int_mm",
+                    "_scaled_mm",
+                ):
+                    return "mm"
+                elif "conv" in choice_name:
+                    return "conv"
+
+    # Second, use input shape heuristics for additional validation
+    if len(input_nodes) >= 2:
+        try:
+            input_0_shape = input_nodes[0].get_size()
+            input_1_shape = input_nodes[1].get_size()
+
+            # Matrix multiplication patterns
+            if len(input_0_shape) == 2 and len(input_1_shape) == 2:
+                return "mm"
+            elif len(input_0_shape) == 3 and len(input_1_shape) == 3:
+                return "mm"  # bmm
+
+            # Convolution patterns: input NCHW/NCDHW, weight OIHW/OIDHW
+            elif len(input_0_shape) in (4, 5) and len(input_1_shape) in (4, 5):
+                # Could be conv or omni attention, prefer template name if available
+                if len(input_0_shape) == 4 and len(input_1_shape) == 4:
+                    # Check if it looks like conv (channel dims match)
+                    # Conv: input[N,C,H,W] @ weight[O,C,kH,kW] where input[1] == weight[1]
+                    try:
+                        if input_0_shape[1] == input_1_shape[1]:
+                            return "conv"
+                    except (IndexError, TypeError):
+                        pass
+
+        except (ValueError, IndexError, AttributeError):
+            pass
+
+    # Last resort: exact name matching (not substring to avoid false positives)
+    name_lower = name.lower()
+    if name_lower in ("mm", "bmm", "addmm", "baddbmm"):
+        return "mm"
+    elif name_lower in (
+        "convolution",
+        "convolution2d",
+        "convolution3d",
+        "conv2d",
+        "conv3d",
+    ):
+        return "conv"
+    elif name_lower.startswith("omni_"):
+        return "omni"
+
+    return "other"
+
+
 class AlgorithmSelectorCache:
     """Which candidate ran, remembered from one call to the next.
 
@@ -3832,6 +3991,46 @@ class AlgorithmSelectorCache:
     every template to find the best one would cost more than the compile it is
     meant to save.
     """
+
+    #: The parts of a convolution's description that say which convolution was
+    #: timed, as opposed to how the search happened to be run.  Recorded per
+    #: candidate so that two records of differently-shaped convolutions are
+    #: not read as two measurements of the same one.
+    CONV_TUNABLE_KEYS = [
+        "KERNEL_H",
+        "KERNEL_W",
+        "KERNEL_D",
+        "STRIDE_H",
+        "STRIDE_W",
+        "STRIDE_D",
+        "PADDING_H",
+        "PADDING_W",
+        "PADDING_D",
+        "GROUPS",
+        "UNROLL",
+    ]
+
+    #: The same idea for omni attention: the block sizes and launch shape that
+    #: say what was timed, kept in the order they are first written so that a
+    #: record reads the same whichever build wrote it.
+    OMNI_ATTENTION_TUNABLE_KEYS = tuple(
+        dict.fromkeys(
+            [
+                "num_warps",
+                "num_stages",
+                "BLOCK_M",
+                "BLOCK_N",
+                "BLOCK_M1",
+                "BLOCK_N1",
+                "BLOCK_M2",
+                "BLOCK_N2",
+                "USE_TMA",
+                "kpack",
+                "matrix_instr_nonkdim",
+                "waves_per_eu",
+            ]
+        )
+    )
 
     def __init__(self) -> None:
         # A lowering is not necessarily the first thing to ask about a given set
@@ -4487,6 +4686,275 @@ class AlgorithmSelectorCache:
                 input_gen_fns=input_gen_fns,
                 hint_override=hint_override,
             )
+
+    @staticmethod
+    def maybe_log_mm_results(
+        name: str, input_nodes: list, timings: dict
+    ) -> None:
+        """Record what a matrix-multiplication search found, if asked to.
+
+        The extents are the key rather than part of the record: the same three
+        numbers describe every measurement of the same operation, so a lookup
+        by them says how this one compared with the ones measured before.
+        """
+
+        mm_filename = get_mm_log_filename()
+        if not mm_filename:
+            return
+
+        # Classify operation to ensure it's actually an MM operation
+        choices_list = list(timings.keys())
+        operation_type = _classify_kernel_operation(name, choices_list, input_nodes)
+        if operation_type != "mm":
+            return
+
+        if len(input_nodes) < 2:
+            return
+
+        M, K = input_nodes[-2].get_size()[:2]
+        N = input_nodes[-1].get_size()[-1]
+
+        def get_choice_info(choice):
+            if isinstance(choice, ExternKernelCaller):
+                return {"type": "extern", "time": timings[choice]}
+
+            if isinstance(choice, TritonTemplateCaller):
+                info = choice.info_dict()
+                tile = info["tile_shape"]
+
+                tile_vals = eval(tile)
+                BLOCK_M = tile_vals[0]
+                BLOCK_K = tile_vals[1]
+                BLOCK_N = tile_vals[2]
+
+                return {
+                    "type": "triton",
+                    "time": timings[choice],
+                    "BLOCK_M": BLOCK_M,
+                    "BLOCK_K": BLOCK_K,
+                    "BLOCK_N": BLOCK_N,
+                    "num_stages": info["num_stages"],
+                    "num_warps": info["num_warps"],
+                    "waves_per_eu": info.get("waves_per_eu", 0),
+                    "matrix_instr_nonkdim": info.get("matrix_instr_nonkdim", 0),
+                    "kpack": info.get("kpack", 2),
+                }
+            return None
+
+        out_dict = {
+            str((M, K, N)): [get_choice_info(choice) for choice in timings],
+            "kernel_type": name,
+        }
+
+        append_to_log(mm_filename, out_dict)
+
+    @staticmethod
+    def maybe_log_conv_results(
+        name: str, input_nodes: list, timings: dict
+    ) -> None:
+        """Record what a convolution search found, if asked to.
+
+        Everything the candidate said about itself is kept, rather than a fixed
+        set of fields: what a convolution can be varied by is not a short list,
+        and a record that dropped the rest would not say which convolution was
+        measured.  A value that cannot be written as JSON is written as its
+        text rather than dropped, since a field as text still names what it was.
+        """
+
+        conv_filename = get_conv_log_filename()
+        if not conv_filename:
+            return
+
+        # Classify operation to ensure it's actually a conv operation
+        choices_list = list(timings.keys())
+        operation_type = _classify_kernel_operation(name, choices_list, input_nodes)
+        if operation_type != "conv":
+            return
+
+        if len(input_nodes) < 2:
+            return
+
+        x_size = input_nodes[0].get_size()
+        w_size = input_nodes[1].get_size()
+
+        def get_conv_choice_info(choice):
+            if choice not in timings:
+                return None
+            info = choice.info_dict()
+
+            # Start with timing and backend type
+            result = {
+                "time": timings[choice],
+                "backend": info.get("backend", "unknown"),
+            }
+
+            # Add all parameters from info_dict
+            for key, value in info.items():
+                if key != "backend":  # Already added
+                    try:
+                        json.dumps(value)  # Test if serializable
+                        result[key] = value
+                    except (TypeError, ValueError):
+                        result[key] = str(value)
+
+            return result
+
+        out_dict = {
+            "input_shape": str(x_size),
+            "weight_shape": str(w_size),
+            "choices": [
+                get_conv_choice_info(choice)
+                for choice in timings
+                if get_conv_choice_info(choice) is not None
+            ],
+            "kernel_type": name,
+        }
+
+        append_to_log(conv_filename, out_dict)
+
+    @staticmethod
+    def get_omni_attention_choice_info(choice, timings: dict) -> dict:
+        """What one candidate contributed to an omni-attention record."""
+
+        if isinstance(choice, ExternKernelCaller):
+            return {"type": "extern", "time": timings[choice]}
+
+        if not isinstance(choice, TritonTemplateCaller):
+            raise AssertionError(
+                f"expected choice to be TritonTemplateCaller, got {type(choice)}"
+            )
+
+        info = choice.info_dict()
+        result = {
+            "type": "triton",
+            "time": timings[choice],
+        }
+
+        for key in AlgorithmSelectorCache.OMNI_ATTENTION_TUNABLE_KEYS:
+            if key in info:
+                result[key] = info[key]
+
+        return result
+
+    @staticmethod
+    def _omni_attention_log_dim(dim) -> int:
+        """One extent as a number, settling a symbolic one if it can be.
+
+        A record is read by someone looking for two runs of the same shape, so
+        an extent that is still symbolic is resolved to what the solver settled
+        it to.  One that cannot be resolved is a shape this record cannot
+        describe, and saying so is better than writing an expression that will
+        not read back as a number.
+        """
+
+        if isinstance(dim, tp.SymInt):
+            dim = dim.node.expr
+
+        if type(dim) is int or isinstance(dim, sympy.Integer):
+            return int(dim)
+
+        if isinstance(dim, sympy.Expr):
+            return V.graph.sizevars.optimization_hint(dim)
+
+        raise TypeError(
+            f"Unexpected omni attention log dimension type {type(dim).__name__}: {dim}"
+        )
+
+    @staticmethod
+    def _omni_attention_log_shape(size) -> str:
+        """A whole shape as text, with every extent settled to a number."""
+
+        dims = [AlgorithmSelectorCache._omni_attention_log_dim(dim) for dim in size]
+        return f"[{', '.join(map(str, dims))}]"
+
+    @staticmethod
+    def maybe_log_omni_attention_results(
+        name: str, input_nodes: list, timings: dict
+    ) -> None:
+        """Record what an omni-attention search found, if asked to.
+
+        Which of the three passes a candidate belongs to is part of the record
+        rather than something a reader has to infer from its name, because the
+        three take different shapes: the backward pass is handed the scores it
+        produced, and the decoding pass has no sequence axis to speak of, so a
+        record without that would have shapes that cannot be compared.
+        """
+
+        omni_attention_filename = get_omni_attention_log_filename()
+        # Support both omni_attention and omni_decoding
+        if not omni_attention_filename or (
+            "omni_attention" not in name and "omni_decoding" not in name
+        ):
+            return
+
+        if len(input_nodes) < 3:
+            return
+
+        query_size = input_nodes[0].get_size()
+        key_size = input_nodes[1].get_size()
+        value_size = input_nodes[2].get_size()
+
+        # Handle both 4D (forward/backward) and 5D (decode) tensor formats
+        # 4D: [B, H, seq_len, head_dim]
+        # 5D: [B, H, 1, 1, head_dim] (decode mode has extra dimension)
+        if len(query_size) == 5:
+            # Decode mode with 5D tensors
+            B = query_size[0]
+            Hq = query_size[1]
+            # query_size[2] and query_size[3] are both 1 for decode
+            seq_len_q = query_size[2]  # This will be 1
+            qk_head_dim = query_size[4]  # Head dim is at index 4 for 5D
+            Hkv = key_size[1]
+            seq_len_kv = key_size[2]
+            v_head_dim = value_size[4] if len(value_size) == 5 else value_size[3]
+        else:
+            # Forward/backward mode with 4D tensors
+            B = query_size[0]
+            Hq = query_size[1]
+            seq_len_q = query_size[2]
+            qk_head_dim = query_size[3]
+            Hkv = key_size[1]
+            seq_len_kv = key_size[2]
+            v_head_dim = value_size[3]
+
+        kernel_type = (
+            "backward"
+            if "backward" in name
+            else ("decode" if "decoding" in name else "forward")
+        )
+
+        # Create shape info dictionary
+        shape_info = {
+            "kernel_type": kernel_type,
+            "B": AlgorithmSelectorCache._omni_attention_log_dim(B),
+            "Hq": AlgorithmSelectorCache._omni_attention_log_dim(Hq),
+            "Hkv": AlgorithmSelectorCache._omni_attention_log_dim(Hkv),
+            "seq_len_q": AlgorithmSelectorCache._omni_attention_log_dim(seq_len_q),
+            "seq_len_kv": AlgorithmSelectorCache._omni_attention_log_dim(seq_len_kv),
+            "qk_head_dim": AlgorithmSelectorCache._omni_attention_log_dim(qk_head_dim),
+            "v_head_dim": AlgorithmSelectorCache._omni_attention_log_dim(v_head_dim),
+        }
+
+        sorted_choices = sorted(timings, key=timings.__getitem__)
+
+        # Include shape info in each choice
+        choices_with_shapes = []
+        for choice in sorted_choices:
+            choice_info = AlgorithmSelectorCache.get_omni_attention_choice_info(
+                choice, timings
+            )
+            # Merge shape info with choice info
+            choice_info.update(shape_info)
+            choices_with_shapes.append(choice_info)
+
+        out_dict = {
+            "query_shape": AlgorithmSelectorCache._omni_attention_log_shape(query_size),
+            "key_shape": AlgorithmSelectorCache._omni_attention_log_shape(key_size),
+            "value_shape": AlgorithmSelectorCache._omni_attention_log_shape(value_size),
+            "kernel_type": kernel_type,
+            "choices": choices_with_shapes,
+        }
+        append_to_log(omni_attention_filename, out_dict)
 
     def autotune(
         self,
