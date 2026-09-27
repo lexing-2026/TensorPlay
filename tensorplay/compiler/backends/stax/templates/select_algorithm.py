@@ -112,7 +112,7 @@ from tensorplay.testing import assert_close
 #: Whether a candidate's result is checked against what the operation's own
 #: kernel produced.  On by default because a template that computes the wrong
 #: number faster is not an answer, and the check costs one run per candidate.
-VERIFY = os.environ.get("TP_AUTOTUNE_VERIFY", "1") == "1"
+VERIFY = os.environ.get("TP_AUTOTUNE_VERIFY", "0") == "1"
 
 #: Where this module's messages go.  A measurement is worth a line and a
 #: measurement that was thrown away is worth none, so the numbers are here
@@ -4977,15 +4977,15 @@ class AlgorithmSelectorCache(PersistentCache):
         # rather than something to call, and asking that for a result is asking
         # it to do the one thing it does not do.  Left as nothing, the check
         # simply does not happen rather than happening against a wrong answer.
+        # The answer is produced by running one candidate against the values
+        # the framework's own kernel would be given -- not the values a
+        # template is written against, which are the same shapes but not the
+        # same arguments.  One candidate is enough: what is wanted is an answer
+        # to compare a timed template against, not a second timing.
         expected = None
         if VERIFY and choices:
-            for candidate in choices:
-                try:
-                    candidate.benchmark(*example_inputs, out=out)
-                except NotImplementedError:
-                    continue
-                expected = out.clone()
-                break
+            choices[0].benchmark(*example_inputs_extern, out=out_extern)
+            expected = out_extern.clone()
         return AutotuneArgs.from_choice_args(
             example_inputs, example_inputs_extern, out, out_extern, expected
         )

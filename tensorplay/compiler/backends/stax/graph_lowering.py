@@ -533,6 +533,10 @@ class GraphLowering:
         #: Recorded by name as they are found, because whether one is such is
         #: asked again later and the answer is about the graph, not the call.
         self.zero_dim_cpu_tensor_list: OrderedSet[str] = OrderedSet()
+        #: A buffer's extents after it was padded, where something padded it.
+        #: A buffer is described by its own extents unless it was made bigger
+        #: than what it holds, and then the size asked about is the bigger one.
+        self.buffer_to_padded_size: dict[str, list[int]] = {}
         # Values bound from the surrounding program, which are referred to by
         # name rather than copied into the generated code.
         self.torchbind_constants: dict = {}
