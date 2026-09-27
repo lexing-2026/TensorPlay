@@ -1,0 +1,1051 @@
+import functools
+import itertools
+import operator
+import typing
+from collections.abc import Callable, Sequence
+from typing import Any
+
+import tensorplay as tp
+from tensorplay.primitives.common import is_contiguous as _is_contiguous
+
+#: The tensor type, named as the signatures here name it.
+Tensor = tp.Tensor
+
+from .. import config, utils
+from ..autoheuristic.autoheuristic import (
+    AHContext,
+    AutoHeuristic,
+    LocalFeedback,
+)
+from ..autoheuristic.autoheuristic_utils import (
+    context_add_strides,
+    context_add_using_tf32,
+    pad_mm_operations,
+    pad_mm_precondition,
+)
+from ..codecache import LocalCache
+from ..pattern_matcher import (
+    fwd_only,
+    gen_register_replacement,
+    joint_fwd_bwd,
+    Match,
+    ReplaceFn,
+    SearchFn,
+)
+from ..runtime.benchmarking import benchmarker
+from ..runtime.caching import encoders, memoizers
+from tensorplay.utils._dispatch import _disable_current_modes
+from ..fx_utils import get_fake_args_kwargs, get_node_storage
+from ..utils import counters
+from ..graph_passes.decompose_mem_bound_mm import check_device
+from ..virtualized import V
+from tensorplay.graph import GraphModule, Node
+from tensorplay.graph.experimental.symbolic_shapes import statically_known_true
+
+
+def is_contiguous_or_false(a):
+    """Whether a value is contiguous, or is not known to be.
+
+    An answer of no is the safe one for a caller that can carry on when the
+    answer is no: a layout decided by the data rather than by the shape is
+    not one that can be planned around, and asking whether it is raises
+    rather than answering.
+    """
+
+    return _is_contiguous(a, False)
+
+
+aten = tp.ops.tp
+
+
+# This flag is only used for testing purpose.
+# Changing it to True will ignore comparing do_bench times
+# between original pattern and padded one.
+_skip_do_bench_times = False
+
+
+def fetch_fake_tensors(match: Match, kwarg_names: Sequence[str]) -> list[Tensor]:
+    kwargs = match.kwargs
+    return [kwargs[name].meta["val"] for name in kwarg_names]
+
+
+def unwrap_fake_args(
+    *arg_names: str,
+) -> Callable[[Callable[..., Any]], Callable[[Match], Any]]:
+    def decorator(func: Callable[..., Any]) -> Callable[[Match], Any]:
+        def wrapper(match: Match) -> Any:
+            fake_tensors = fetch_fake_tensors(match, arg_names)
+            return func(*fake_tensors)
+
+        return wrapper
+
+    return decorator
+
+
+def get_alignment_size(x: tp.Tensor) -> int:
+    return get_alignment_size_dtype(x.dtype)
+
+
+def get_alignment_size_dtype(dtype: tp.dtype) -> int:
+    if dtype == tp.float16 or dtype == tp.half or dtype == tp.bfloat16:
+        return 8
+    elif dtype == tp.float32 or dtype == tp.float:
+        return 4
+    else:
+        return 0
+
+
+def check_device(a: tp.Tensor, b: tp.Tensor) -> bool:
+    return (a.is_cuda and b.is_cuda) or (a.is_xpu and b.is_xpu)
+
+
+def check_dtype(a: tp.Tensor, b: tp.Tensor) -> bool:
+    return a.is_floating_point() and b.is_floating_point()
+
+
+def hint_symbols(
+    ds: Sequence[int | tp.SymInt],
+) -> list[int]:
+    """Helper to convert symbolic dimensions to their concrete hint values."""
+    from tensorplay.graph.experimental.symbolic_shapes import optimization_hint
+
+    return [optimization_hint(d) for d in ds]
+
+
+def can_pad(
+    mat1: tp.Tensor,
+    mat2: tp.Tensor,
+    op: tp._ops.OpOverloadPacket,
+    input: tp.Tensor | None = None,
+) -> bool:
+    """
+    Determines if an operation CAN be padded (safety checks).
+    All logic related to whether it's safe to pad should be here.
+    """
+
+    # Can't pad if there is no static dims, we pad static dims only.
+    def has_one_static_dim(t: tp.Tensor) -> bool:
+        """Return False if all dimensions are symbolic — nothing concrete to pad."""
+        for x in t.size():
+            if isinstance(x, int):
+                return True
+            elif not isinstance(x, tp.SymInt):
+                raise RuntimeError("not expected size")
+        return False
+
+    # Basic safety checks
+    if not config.shape_padding:
+        return False
+
+    if not check_device(mat1, mat2):
+        return False
+
+    if not check_dtype(mat1, mat2):
+        return False
+
+    # For padding to be vaible each tensor should have at least one static dim.
+    tensors = [t for t in (mat1, mat2, input) if t is not None]
+    if not all(has_one_static_dim(t) for t in tensors):
+        return False
+
+    # Skip zero-sized dimensions — padding would be wasteful (mm on empty tensors)
+    from tensorplay.graph.experimental.symbolic_shapes import optimization_hint
+
+    if any(
+        optimization_hint(dim) == 0 for dim in itertools.chain(mat1.shape, mat2.shape)
+    ):
+        return False
+
+    # Calculate padding lengths to check if padding is needed
+    with no_dispatch():
+        if op is aten.mm or op is aten.addmm:
+            m = mat1.shape[0]
+            k = mat1.shape[1]
+            n = mat2.shape[1]
+        elif op is aten.bmm:
+            m = mat1.shape[1]
+            k = mat1.shape[2]
+            n = mat2.shape[2]
+        else:
+            return False
+
+        k_padded_length = get_padded_length(k, get_alignment_size(mat1))
+        n_padded_length = get_padded_length(n, get_alignment_size(mat2))
+        m_padded_length = get_padded_length(m, get_alignment_size(mat1))
+
+        # No padding needed - can't pad if there's nothing to pad
+        if m_padded_length == k_padded_length == n_padded_length == 0:
+            return False
+
+    # In deterministic mode, we can't safely benchmark - disallow padding
+    # Check this after other basic checks so force_shape_pad/autoheuristic can override
+    if (
+        config.deterministic
+        and not config.force_shape_pad
+        and not config.use_autoheuristic("pad_mm")
+    ):
+        return False
+
+    # Triton availability check - required for padding to work
+    if not has_triton():
+        return False
+
+    return True
+
+
+def get_padded_length(x: int | tp.SymInt, alignment_size: int) -> int:
+    # we don't pad x if it is symbolic
+    if isinstance(x, tp.SymInt) or alignment_size == 0 or x % alignment_size == 0:
+        return 0
+
+    # ignore dim that can be squeezed away
+    if x == 1:
+        return 0
+
+    return int((x // alignment_size + 1) * alignment_size) - x
+
+
+def pad_dim(x: tp.Tensor, padded_length: int, dim: int) -> Tensor:
+    if padded_length == 0:
+        return x
+    pad = x.new_zeros(*x.shape[:dim], padded_length, *x.shape[dim + 1 :])
+    return tp.cat([x, pad], dim=dim)
+
+
+def addmm_pattern(
+    input: tp.Tensor, mat1: tp.Tensor, mat2: tp.Tensor, beta: float, alpha: float
+) -> Tensor:
+    return aten.addmm(input, mat1, mat2, beta=beta, alpha=alpha)
+
+
+def _is_statically_expandable_to(shape: tp.Size, desired: Sequence[Any]) -> bool:
+    if len(shape) > len(desired):
+        return False
+    return all(
+        statically_known_true(dim == desired_dim) or statically_known_true(dim == 1)
+        for dim, desired_dim in zip(reversed(shape), reversed(desired))
+    )
+
+
+def should_pad_addmm(match: Match) -> bool:
+    mat1, mat2, input = fetch_fake_tensors(match, ("mat1", "mat2", "input"))
+    beta = match.kwargs["beta"]
+    if (
+        beta == 0
+        and input.is_cuda
+        and not _is_statically_expandable_to(
+            input.shape, (mat1.shape[0], mat2.shape[1])
+        )
+    ):
+        return False
+    return should_pad(match, mat1, mat2, aten.addmm, input=input)
+
+
+def pad_addmm(
+    input: tp.Tensor | None,
+    mat1: tp.Tensor,
+    mat2: tp.Tensor,
+    m_padded_length: int,
+    k_padded_length: int,
+    n_padded_length: int,
+    beta: float = 1.0,
+    alpha: float = 1.0,
+    mat1_pre_padded: bool = False,
+    mat2_pre_padded: bool = False,
+) -> Tensor:
+    # for paddings, dim order is reversed for some reasons
+    # and for every dim, we need to specify left and right padding
+    if not mat1_pre_padded:
+        mat1 = pad_mat1(
+            mat1, m_padded_length=m_padded_length, k_padded_length=k_padded_length
+        )
+    if not mat2_pre_padded:
+        mat2 = pad_mat2(
+            mat2, k_padded_length=k_padded_length, n_padded_length=n_padded_length
+        )
+
+    # the add broadcasts, so we only pad if the dimension != 1
+    if input is not None:
+        if n_padded_length != 0:
+            if input.dim() == 2 and input.shape[1] != 1:
+                input = pad_dim(input, n_padded_length, 1)
+            elif input.dim() == 1 and input.shape[0] != 1:
+                input = pad_dim(input, n_padded_length, 0)
+        if m_padded_length != 0 and input.dim() == 2 and input.shape[0] != 1:
+            input = pad_dim(input, m_padded_length, 0)
+
+    res = aten.addmm(input, mat1, mat2, beta=beta, alpha=alpha)
+
+    if m_padded_length != 0:
+        res = res[:-m_padded_length, :]
+    if n_padded_length != 0:
+        res = res[:, :-n_padded_length]
+    return res
+
+
+def addmm_replace(
+    input: tp.Tensor | None,
+    mat1: tp.Tensor,
+    mat2: tp.Tensor,
+    beta: float = 1.0,
+    alpha: float = 1.0,
+) -> Tensor:
+    k_padded_length = get_padded_length(mat1.shape[1], get_alignment_size(mat1))
+    n_padded_length = get_padded_length(mat2.shape[1], get_alignment_size(mat2))
+    m_padded_length = get_padded_length(mat1.shape[0], get_alignment_size(mat1))
+    return pad_addmm(
+        input,
+        mat1,
+        mat2,
+        m_padded_length,
+        k_padded_length,
+        n_padded_length,
+        beta,
+        alpha,
+    )
+
+
+def is_mm_compute_bound(M: int, K: int, N: int, dtype: tp.dtype) -> bool:
+    denominator = M * K + N * K + M * N
+    if denominator == 0:
+        return False
+    arithmetic_intensity = (M * N * K) / denominator
+
+    # we have experienced some large perf hits in this case, even in bandwidth bound regimes
+    if (
+        dtype is tp.bfloat16
+        and K > M
+        and K > N
+        and tp.cuda.get_device_capability() < (9, 0)
+    ):  # doesn't repro on h100s:
+        return True
+
+    # Fails with AMD
+    try:
+        machine_balance = (
+            1000 * utils.get_device_tflops(dtype)
+        ) / utils.get_gpu_dram_gbps()
+    except Exception:
+        return True
+
+    # dram_gbps might be underestimating bandwidth because of cache.
+    # if we estimate machine balance too low we might miss some speedups,
+    # if we estimate too high there will be unnecessary compilation time increase.
+    # TODO - finetune coefficient here. As a reference point, Triton mm model assumes
+    # 80% of reads are in cache and cache is 4x faster than dram_gbps
+    machine_balance = machine_balance * 0.5
+
+    return arithmetic_intensity > machine_balance
+
+
+@functools.cache
+def get_pad_cache() -> LocalCache:
+    return LocalCache()
+
+
+def get_cached_should_pad(key: str) -> bool:
+    return get_pad_cache().lookup(key)  # type: ignore[return-value]
+
+
+def set_cached_should_pad(key: str, value: bool) -> None:
+    return get_pad_cache().set_value(key, value=value)
+
+
+def get_cached_base_mm_benchmark_time(key: str) -> float:
+    return get_pad_cache().lookup(key)  # type: ignore[return-value]
+
+
+def set_cached_base_mm_benchmark_time(key: str, value: float) -> None:
+    return get_pad_cache().set_value(key, value=value)
+
+
+def should_pad_bench_key(
+    match: Match,
+    mat1: tp.Tensor,
+    mat2: tp.Tensor,
+    op: tp._ops.OpOverloadPacket,
+    input: tp.Tensor | None = None,
+    is_base_time_key: bool = False,
+) -> str:
+    def tensor_key(t: tp.Tensor) -> tuple[tp.Size, tuple[int, ...], tp.dtype]:
+        return (t.shape, t.stride(), t.dtype)
+
+    tf32_key = (
+        None
+        if mat1.dtype != tp.float32
+        else tp.backends.cuda.matmul.fp32_precision == "tf32"
+        or tp.backends.mkldnn.fp32_precision == "tf32"
+    )
+
+    def fmt_pad(name: str) -> str | None:
+        if is_base_time_key:
+            return None
+        return f"exclude_pad:{should_exclude_padding_time(match, name)}"
+
+    key = (
+        tensor_key(mat1),
+        tensor_key(mat2),
+        fmt_pad("mat1"),
+        fmt_pad("mat2"),
+        op,
+        input if input is None else tensor_key(input),
+        tf32_key,
+    )
+
+    key = str(key)
+    if is_base_time_key:
+        key = f"base mm time: {key}"
+    return key
+
+
+def get_non_view_def(node: Node) -> Node:
+    if node.op == "call_function" and node.target is operator.getitem:
+        return get_non_view_def(node.args[0])  # type: ignore[arg-type]
+
+    if (
+        node.op == "call_function"
+        and isinstance(node.target, tp._ops.OpOverload)
+        and utils.is_view(node.target)
+    ):
+        return get_non_view_def(node.all_input_nodes[0])
+
+    return node
+
+
+def should_exclude_padding_time(match: Match, arg_name: str) -> bool:
+    from tp._prims_common import is_contiguous_or_false
+
+    node_def = get_non_view_def(match.kwargs[arg_name])
+
+    # constant padding converts tensors to contiguous so even if the input tensor
+    # can be planned layout transform is not free. TODO - way to pad and preserve layout ?
+    # Use is_contiguous_or_false to avoid guarding on data-dependent expressions
+    # with unbacked symints - returns False instead of raising an error.
+    if not is_contiguous_or_false(fetch_fake_tensors(match, (arg_name,))[0]):
+        return False
+
+    # We would only able to completely plan these out if we were only doing
+    # first dimension padding. non-first we would still need a copy
+    # because these outputs are fixed dense.
+    cannot_plan_output = [
+        aten.mm.default,
+        aten.convolution.default,
+        aten.convolution_backward.default,
+        aten.bmm.default,
+        aten.addmm.default,
+        aten._scaled_dot_product_flash_attention.default,
+        aten._scaled_dot_product_efficient_attention.default,
+    ]
+
+    if node_def.target in cannot_plan_output:
+        return False
+
+    if (
+        node_def.target is aten.cat.default
+        and len(node_def.all_input_nodes)
+        > config.max_pointwise_cat_inputs
+    ):
+        return False
+
+    # optimistically assume we should be able to memory plan away
+    # all non inputs
+    return node_def.op != "placeholder"
+
+
+def is_padded_faster(key: str, ori_time: float, pad_time: float) -> bool:
+    """
+    Determines if padding is beneficial by comparing benchmark times.
+    Helper function that applies a multiplier to account for memory ops overhead.
+    """
+    multiplier = 1.1
+    # Shape padding introduces additional memory ops. Based on microbenchmarks, 1.1x represents a reasonable
+    # tradeoff between performance improvement from shape padding and overhead from additional memory ops
+    # TODO: Build a learned model which would be better than this heuristic
+    if "shape_padding_multiplier" in config.post_grad_fusion_options:
+        multiplier = config.post_grad_fusion_options[
+            "shape_padding_multiplier"
+        ].get("value", 1.1)
+        counters["inductor"]["shape_padding_multiplier"] += 1
+    padded_is_faster = _skip_do_bench_times or ori_time > pad_time * multiplier
+    set_cached_should_pad(key, padded_is_faster)
+    return padded_is_faster
+
+
+def should_pad_mm_bf16(dtype: tp.dtype, M: int, N: int, K: int) -> bool:
+    # always force pad for mm with bf16 when the following are satisfied to avoid perf regression
+    large_k_threshold_to_pad = config.post_grad_fusion_options[
+        "pad_aten_mm_pass"
+    ].get("k_threshold_to_pad", 8388608)
+    if (
+        dtype is tp.bfloat16
+        and K > M
+        and K > N
+        and N % 2 == 1
+        and K >= large_k_threshold_to_pad
+        and tp.cuda.get_device_capability() < (9, 0)
+    ):  # doesn't repro on h100s:
+        return True
+    return False
+
+
+def should_pad(
+    match: Match,
+    mat1: tp.Tensor,
+    mat2: tp.Tensor,
+    op: tp._ops.OpOverloadPacket,
+    input: tp.Tensor | None = None,
+) -> bool:
+    if not can_pad(mat1, mat2, op, input):
+        return False
+
+    # Force padding when explicitly requested - performance override
+    if config.force_shape_pad:
+        return True
+
+    # Small-K/N mm is lowered to a fused pointwise kernel in tuned_mm.
+    # Leave those shapes unpadded and let the pointwise lowering handle them.
+    if op is aten.mm:
+        from ..kernel.mm_common import _use_small_mm_pointwise
+
+        m, k, n = mat1.shape[0], mat1.shape[1], mat2.shape[1]
+        if _use_small_mm_pointwise(
+            m, k, n, mat1.device.type, statically_known_true=statically_known_true
+        ):
+            return False
+
+    # Note that if you're tempted to insert a dynamo_timed call here, this function can
+    # be called enough that the dynamo_timed overhead is not negligible.
+    return _should_pad(match, mat1, mat2, op, input)
+
+
+def get_do_bench() -> Callable[[Callable[[], Any]], float]:
+    return functools.partial(
+        # pyrefly: ignore [bad-argument-type]
+        benchmarker.benchmark_gpu,
+        warmup=5,
+    )
+
+
+@memoizers.should_pad_memoizer.memoize(
+    custom_params_encoder=encoders.should_pad_params_encoder
+)
+def _should_pad(
+    match: Match,
+    mat1: tp.Tensor,
+    mat2: tp.Tensor,
+    op: tp._ops.OpOverloadPacket,
+    input: tp.Tensor | None = None,
+) -> bool:
+    """
+    Determines if an operation SHOULD be padded (performance checks).
+    All logic related to whether padding would be performant should be here.
+    """
+    do_bench = get_do_bench()
+
+    with no_dispatch():
+        if op is aten.mm or op is aten.addmm:
+            m = mat1.shape[0]
+            k = mat1.shape[1]
+            n = mat2.shape[1]
+            k_padded_length = get_padded_length(k, get_alignment_size(mat1))
+            n_padded_length = get_padded_length(n, get_alignment_size(mat2))
+            m_padded_length = get_padded_length(m, get_alignment_size(mat1))
+        elif op is aten.bmm:
+            m = mat1.shape[1]
+            k = mat1.shape[2]
+            n = mat2.shape[2]
+            k_padded_length = get_padded_length(k, get_alignment_size(mat1))
+            m_padded_length = get_padded_length(m, get_alignment_size(mat1))
+            n_padded_length = get_padded_length(n, get_alignment_size(mat2))
+        else:
+            return False
+
+        # Resolve symbolic dims to concrete hints for heuristic checks below.
+        # These are performance decisions, not correctness — optimization_hint is safe.
+        m_concrete, k_concrete, n_concrete = hint_symbols((m, k, n))
+
+        # Performance heuristic for bf16 large K scenarios
+        if (
+            "pad_aten_mm_pass" in config.post_grad_fusion_options
+            and should_pad_mm_bf16(mat1.dtype, m_concrete, n_concrete, k_concrete)
+        ):
+            return True
+
+        # Check if operation is compute bound (performance check)
+        if not is_mm_compute_bound(m_concrete, k_concrete, n_concrete, mat1.dtype):
+            return False
+
+        # We don't want to look up the cache for cases that are trivially false
+        # since it does file io
+        key = should_pad_bench_key(match, mat1, mat2, op, input)
+
+        cached_pad = get_cached_should_pad(key)
+        if cached_pad is not None:
+            return cached_pad
+
+        def realize_tensor(t):
+            if is_fake_tensor(t):
+                size_hints = hint_symbols(t.size())
+                # pyrefly: ignore [bad-argument-type]
+                stride_hint = hint_symbols(t.stride())
+                real_size = (
+                    sum((d - 1) * s for d, s in zip(size_hints, stride_hint)) + 1
+                )
+                real_t = tp.randn(real_size, dtype=t.dtype, device=t.device)
+                return tp.as_strided(real_t, size_hints, stride_hint)
+            else:
+                return tp.randn_like(t)
+
+        mat1 = realize_tensor(mat1)
+        mat2 = realize_tensor(mat2)
+
+        # since we key on whether or not the inputs can be memory planned, set cache for the
+        # original time which is unaffected by whether or not the input can be planned
+        ori_time_key = should_pad_bench_key(
+            match, mat1, mat2, op, input, is_base_time_key=True
+        )
+        ori_time = get_cached_base_mm_benchmark_time(ori_time_key)
+        if ori_time is None and op is aten.addmm and input is not None:
+            # realize bias for addmm
+            input = realize_tensor(input)
+
+        mat1_pad = mat1
+        mat2_pad = mat2
+
+        is_bmm = op is aten.bmm
+
+        mat1_pre_padded = should_exclude_padding_time(match, "mat1")
+        fns = []
+        if mat1_pre_padded and (m_padded_length or k_padded_length):
+            mat1_pad = pad_mat1(
+                mat1_pad,
+                m_padded_length=m_padded_length,
+                k_padded_length=k_padded_length,
+                is_bmm=is_bmm,
+            )
+
+            def write_pad():
+                if is_bmm:
+                    mat1_pad[:, -m_padded_length:, -k_padded_length:].fill_(0)
+                else:
+                    mat1_pad[-m_padded_length:, -k_padded_length:].fill_(0)
+
+            fns.append(write_pad)
+
+        mat2_pre_padded = should_exclude_padding_time(match, "mat2")
+        if mat2_pre_padded and (k_padded_length or n_padded_length):
+            mat2_pad = pad_mat2(
+                mat2_pad,
+                k_padded_length=k_padded_length,
+                n_padded_length=n_padded_length,
+                is_bmm=is_bmm,
+            )
+
+            def write_pad():
+                if is_bmm:
+                    mat2_pad[:, -k_padded_length:, -n_padded_length:].fill_(0)
+                else:
+                    mat2_pad[-k_padded_length:, -n_padded_length:].fill_(0)
+
+            fns.append(write_pad)
+
+        if op is aten.addmm:
+            input_pad = None
+            if input is not None and (input.is_cuda or input.is_xpu):
+                input_pad = tp.randn_like(input)
+            fns.append(
+                lambda: pad_addmm(
+                    input_pad,
+                    mat1_pad,
+                    mat2_pad,
+                    m_padded_length,
+                    k_padded_length,
+                    n_padded_length,
+                    mat1_pre_padded=mat1_pre_padded,
+                    mat2_pre_padded=mat2_pre_padded,
+                )
+            )
+        elif op is aten.mm:
+            fns.append(
+                lambda: pad_mm(
+                    mat1_pad,
+                    mat2_pad,
+                    m_padded_length,
+                    k_padded_length,
+                    n_padded_length,
+                    mat1_pre_padded=mat1_pre_padded,
+                    mat2_pre_padded=mat2_pre_padded,
+                )
+            )
+        else:
+            fns.append(
+                lambda: pad_bmm(
+                    mat1_pad,
+                    mat2_pad,
+                    m_padded_length,
+                    k_padded_length,
+                    n_padded_length,
+                    mat1_pre_padded=mat1_pre_padded,
+                    mat2_pre_padded=mat2_pre_padded,
+                )
+            )
+
+        def orig_bench_fn():
+            if op is aten.bmm or op is aten.mm:
+                op(mat1, mat2)
+            else:
+                op(input, mat1, mat2)
+
+        def pad_bench_fn():
+            for fn in fns:
+                fn()
+
+        if (
+            config.run_autoheuristic("pad_mm")
+            and op is aten.mm
+        ):
+            ah_should_pad = run_autoheuristic(
+                mat1,
+                mat2,
+                orig_bench_fn,
+                pad_bench_fn,
+                m_padded_length,
+                k_padded_length,
+                n_padded_length,
+                do_bench,
+                mat1_pre_padded,
+                mat2_pre_padded,
+                ori_time,
+                ori_time_key,
+                key,
+            )
+            if ah_should_pad is not None:
+                return ah_should_pad
+
+        # AH didn't make a decision, so if we're in deterministic mode, we should return false
+        if config.deterministic:
+            return False
+
+        if ori_time is None:
+            ori_time = do_bench(orig_bench_fn)
+            set_cached_base_mm_benchmark_time(ori_time_key, ori_time)
+
+        pad_time = do_bench(pad_bench_fn)
+
+        counters["inductor"]["pad_mm_bench"] += 1
+        return is_padded_faster(key, ori_time, pad_time)
+
+
+def get_context(
+    mat1: tp.Tensor,
+    mat2: tp.Tensor,
+    mat1_pre_padded: bool,
+    mat2_pre_padded: bool,
+    m_padded_length: int,
+    k_padded_length: int,
+    n_padded_length: int,
+) -> AHContext:
+    context = AHContext()
+
+    context.add_feature("m", mat1.shape[0])
+    context.add_feature("k", mat1.shape[1])
+    context.add_feature("n", mat2.shape[1])
+
+    context_add_strides(context, "mat1", mat1.stride())
+    context_add_strides(context, "mat2", mat2.stride())
+
+    context.add_feature("m_padded_length", m_padded_length)
+    context.add_feature("k_padded_length", k_padded_length)
+    context.add_feature("n_padded_length", n_padded_length)
+
+    context.add_feature("mat1_align_size", get_alignment_size(mat1))
+    context.add_feature("mat2_align_size", get_alignment_size(mat2))
+
+    context.add_feature("mat1_dtype", mat1.dtype, is_categorical=True)
+    context.add_feature("mat2_dtype", mat2.dtype, is_categorical=True)
+
+    context.add_feature("prepadded_mat1", mat1_pre_padded, is_categorical=True)
+    context.add_feature("prepadded_mat2", mat2_pre_padded, is_categorical=True)
+
+    context_add_using_tf32(context, mat1.dtype)
+    return context
+
+
+def run_autoheuristic(
+    mat1: tp.Tensor,
+    mat2: tp.Tensor,
+    orig_bench_fn: Callable[[], None],
+    pad_bench_fn: Callable[[], None],
+    m_padded_length: int,
+    k_padded_length: int,
+    n_padded_length: int,
+    do_bench: Callable[[Callable[[], Any]], float],
+    mat1_pre_padded: bool,
+    mat2_pre_padded: bool,
+    ori_time: float,
+    ori_time_key: str,
+    key: str,
+) -> bool | None:
+    def feedback_fn(
+        choice: str,
+    ) -> float | None:
+        if choice == orig_choice:
+            return do_bench(orig_bench_fn)
+        elif choice == pad_choice:
+            return do_bench(pad_bench_fn)
+        return None
+
+    def fallback() -> str:
+        return "autotune"
+
+    orig_choice = "orig"
+    pad_choice = "pad"
+    choices = [orig_choice, pad_choice]
+    feedback = LocalFeedback(feedback_fn)  # type: ignore[arg-type]
+    context = get_context(
+        mat1,
+        mat2,
+        mat1_pre_padded,
+        mat2_pre_padded,
+        m_padded_length,
+        k_padded_length,
+        n_padded_length,
+    )
+    name = "pad_mm"
+    autoheuristic = AutoHeuristic(
+        fallback=fallback,
+        choices=choices,
+        feedback=feedback,
+        context=context,
+        name=name,
+        augment_context=pad_mm_operations(),
+        precondition=pad_mm_precondition,
+    )
+    choice = autoheuristic.get_choice()
+    choice2should_pad = {orig_choice: False, pad_choice: True, "autotune": None}
+    ah_should_pad = choice2should_pad.get(choice)
+
+    if config.collect_autoheuristic(name):
+        ah_ori_time = autoheuristic.get_collected_feedback(orig_choice)
+        ah_pad_time = autoheuristic.get_collected_feedback(pad_choice)
+
+        # if precondition is not satisfied, autoheuristic does not collect data
+        if ah_ori_time is not None and ah_pad_time is not None:
+            if ori_time is None:
+                set_cached_base_mm_benchmark_time(ori_time_key, ah_ori_time)
+            return is_padded_faster(key, ah_ori_time, ah_pad_time)
+    if ah_should_pad is not None:
+        set_cached_should_pad(key, ah_should_pad)
+    return ah_should_pad
+
+
+def mm_pattern(mat1: tp.Tensor, mat2: tp.Tensor) -> Tensor:
+    return aten.mm(mat1, mat2)
+
+
+def should_pad_mm(match: Match) -> bool:
+    mat1, mat2 = fetch_fake_tensors(match, ("mat1", "mat2"))
+    return should_pad(match, mat1, mat2, aten.mm)
+
+
+def pad_mat1(
+    mat1: tp.Tensor, *, m_padded_length: int, k_padded_length: int, is_bmm: bool = False
+) -> Tensor:
+    if k_padded_length != 0 or m_padded_length != 0:
+        # dim order is reversed for constant_pad_nd, for every dim we specify right and left padding
+        pad_arg = [0, k_padded_length, 0, m_padded_length]
+        if is_bmm:
+            pad_arg.extend((0, 0))
+        return aten.constant_pad_nd(mat1, pad_arg)
+    else:
+        return mat1
+
+
+def pad_mat2(
+    mat2: tp.Tensor, *, k_padded_length: int, n_padded_length: int, is_bmm: bool = False
+) -> Tensor:
+    if k_padded_length != 0 or n_padded_length != 0:
+        # dim order is reversed for constant_pad_nd, for every dim we specify right and left padding
+        pad_arg = [0, n_padded_length, 0, k_padded_length]
+        if is_bmm:
+            pad_arg.extend((0, 0))
+        return aten.constant_pad_nd(mat2, pad_arg)
+    else:
+        return mat2
+
+
+def pad_mm(
+    mat1: tp.Tensor,
+    mat2: tp.Tensor,
+    m_padded_length: int,
+    k_padded_length: int,
+    n_padded_length: int,
+    mat1_pre_padded: bool = False,
+    mat2_pre_padded: bool = False,
+) -> Tensor:
+    if not mat1_pre_padded:
+        mat1 = pad_mat1(
+            mat1, m_padded_length=m_padded_length, k_padded_length=k_padded_length
+        )
+    if not mat2_pre_padded:
+        mat2 = pad_mat2(
+            mat2, k_padded_length=k_padded_length, n_padded_length=n_padded_length
+        )
+    res = aten.mm(mat1, mat2)
+    if m_padded_length != 0:
+        res = res[:-m_padded_length, :]
+    if n_padded_length != 0:
+        res = res[:, :-n_padded_length]
+    return res
+
+
+def mm_replace(mat1: tp.Tensor, mat2: tp.Tensor) -> Tensor:
+    k_padded_length = get_padded_length(mat1.shape[1], get_alignment_size(mat1))
+    m_padded_length = get_padded_length(mat1.shape[0], get_alignment_size(mat1))
+    n_padded_length = get_padded_length(mat2.shape[1], get_alignment_size(mat2))
+    return pad_mm(
+        mat1,
+        mat2,
+        m_padded_length,
+        k_padded_length,
+        n_padded_length,
+    )
+
+
+def bmm_pattern(mat1: tp.Tensor, mat2: tp.Tensor) -> Tensor:
+    return aten.bmm(mat1, mat2)
+
+
+def should_pad_bmm(match: Match) -> bool:
+    mat1, mat2 = fetch_fake_tensors(match, ("mat1", "mat2"))
+    return should_pad(match, mat1, mat2, aten.bmm)
+
+
+def pad_bmm(
+    mat1: tp.Tensor,
+    mat2: tp.Tensor,
+    m_padded_length: int,
+    k_padded_length: int,
+    n_padded_length: int,
+    mat1_pre_padded: bool = False,
+    mat2_pre_padded: bool = False,
+) -> Tensor:
+    if not mat1_pre_padded:
+        mat1 = pad_mat1(
+            mat1,
+            m_padded_length=m_padded_length,
+            k_padded_length=k_padded_length,
+            is_bmm=True,
+        )
+    if not mat2_pre_padded:
+        mat2 = pad_mat2(
+            mat2,
+            k_padded_length=k_padded_length,
+            n_padded_length=n_padded_length,
+            is_bmm=True,
+        )
+    res = aten.bmm(mat1, mat2)
+    if m_padded_length != 0:
+        res = res[:, :-m_padded_length, :]
+    if n_padded_length != 0:
+        res = res[:, :, :-n_padded_length]
+    return res
+
+
+def bmm_replace(mat1: tp.Tensor, mat2: tp.Tensor) -> Tensor:
+    k_padded_length = get_padded_length(mat1.shape[2], get_alignment_size(mat1))
+    n_padded_length = get_padded_length(mat2.shape[2], get_alignment_size(mat2))
+    m_padded_length = get_padded_length(mat1.shape[1], get_alignment_size(mat1))
+    return pad_bmm(
+        mat1,
+        mat2,
+        m_padded_length,
+        k_padded_length,
+        n_padded_length,
+    )
+
+
+@functools.cache
+def _pad_mm_init(input_device: tp.device | None = None) -> None:
+    from .joint_graph import patterns
+
+    if input_device:
+        device = str(input_device)
+    else:
+        if tp.cuda.is_available():
+            device = "cuda"
+        else:
+            device = "cpu"
+
+    # sizes/values don't actually matter for initial trace
+    # once we get a possible match we re-trace with the actual values and verify the match still holds
+
+    dim2a = functools.partial(tp.empty, (4, 4), device=device, requires_grad=True)
+    dim2b = functools.partial(tp.empty, (4, 4), device=device, requires_grad=True)
+
+    dim3a = functools.partial(tp.empty, (4, 4, 4), device=device, requires_grad=True)
+    dim3b = functools.partial(tp.empty, (4, 4, 4), device=device, requires_grad=True)
+
+    dim1a = functools.partial(tp.empty, (4), device=device, requires_grad=True)
+
+    # 0.113377 is a "magic" value that lets us recover the lost input arg relationship
+    rep = {"beta": 0.213377, "alpha": 0.113377}
+
+    for pattern, replacement, args, workaround, extra_check in [
+        (
+            typing.cast(SearchFn, mm_pattern),
+            typing.cast(ReplaceFn, mm_replace),
+            [dim2a(), dim2b()],
+            {},
+            should_pad_mm,
+        ),
+        (
+            typing.cast(SearchFn, bmm_pattern),
+            typing.cast(ReplaceFn, bmm_replace),
+            [dim3a(), dim3b()],
+            {},
+            should_pad_bmm,
+        ),
+        (
+            typing.cast(SearchFn, addmm_pattern),
+            typing.cast(ReplaceFn, addmm_replace),
+            [dim1a(), dim2a(), dim2b()],
+            rep,
+            should_pad_addmm,
+        ),
+    ]:
+        if not isinstance(
+            workaround, dict
+        ):  # mypy is unable to infer the type properly
+            raise AssertionError(
+                f"expected workaround to be a dict, got {type(workaround)}"
+            )
+        name = pattern.__name__
+
+        gen_register_replacement(
+            f"{name}_training",
+            pattern,
+            replacement,
+            args,
+            # pyrefly: ignore [bad-argument-type]
+            joint_fwd_bwd,
+            # pyrefly: ignore [bad-argument-type]
+            patterns,
+            extra_check=extra_check,
+            scalar_workaround=workaround,
+            skip_duplicates=True,
+        )
+
+        gen_register_replacement(
+            f"{name}_inference",
+            pattern,
+            replacement,
+            args,
+            # pyrefly: ignore [bad-argument-type]
+            fwd_only,
+            # pyrefly: ignore [bad-argument-type]
+            patterns,
+            extra_check=extra_check,
+            scalar_workaround=workaround,
+            skip_duplicates=True,
+        )

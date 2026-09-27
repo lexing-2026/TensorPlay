@@ -24,6 +24,22 @@ import sys
 # undone later.
 comprehensive_padding = os.environ.get("TP_COMPREHENSIVE_PADDING", "1") == "1"
 
+# Whether the extents of a matrix product are rounded up to a multiple of a
+# transaction width, so that each row of one operand starts where a wide
+# access expects.  Costs work proportional to what the rounding adds and buys
+# the accesses being able to be wide, which is a trade worth making for a
+# product large enough to be limited by memory and not for a small one.
+shape_padding = os.environ.get("TP_SHAPE_PADDING", "1") == "1"
+
+# Whether to round the extents up whatever else was decided.  For reading the
+# effect of the rounding on its own, with the trade above not deciding it.
+force_shape_pad: bool = False
+
+# How many values a concatenation of pointwise work may hold before it is
+# worth doing as one operation over all of them rather than one per value.
+# Past this many the loop that walks them costs more than the operations.
+max_pointwise_cat_inputs = 8
+
 # Whether a reduction long enough to leave the machine idle is worth cutting
 # into pieces that are reduced independently.  Turning this off makes every
 # reduction a single walk, which is slower but makes the code easier to read.
@@ -497,6 +513,17 @@ def collect_autoheuristic(name: str) -> bool:
 
     enabled = _os.environ.get("TP_AUTOHEURISTIC_COLLECT", "DEFAULT")
     return enabled == "ALL" or name == enabled
+
+
+def run_autoheuristic(name: str) -> bool:
+    """Whether a call is answered by a rule, whether learned or being learned.
+
+    Both halves of the same question: whether to consult what has been
+    learned, and whether to learn from this call.  Learning and consulting
+    are asked separately because one is usually wanted without the other.
+    """
+
+    return collect_autoheuristic(name) or use_autoheuristic(name)
 
 
 def use_autoheuristic(name: str) -> bool:
