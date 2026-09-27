@@ -21,6 +21,7 @@ import hashlib
 import math
 import operator
 import os
+import re
 import sys
 import sysconfig
 import textwrap
@@ -3117,3 +3118,39 @@ def is_nvidia_sm100_or_later() -> bool:
         and not tp.version.hip
         and tp.cuda.get_device_capability() >= (10, 0)
     )
+
+
+#: The names a kernel's language spells a type by, where they differ from the
+#: names this library spells it by.  Both directions are needed: a type has to
+#: be written into a kernel in the kernel's own spelling, and read back out of
+#: one into this library's.
+_triton_type_mapping = {
+    "tl.bool": "tl.int1",
+    "tl.float8_e4m3fn": "tl.float8e4nv",
+    "tl.float8_e5m2": "tl.float8e5",
+    "tl.float8_e4m3fnuz": "tl.float8e4b8",
+    "tl.float8_e5m2fnuz": "tl.float8e5b16",
+    "tl.float8_e8m0fnu": "tl.uint8",
+    "tl.float4_e2m1fn_x2": "tl.uint8",
+}
+_torch_triton_mapping = {v: k for k, v in _triton_type_mapping.items()}
+
+_triton_type_re = re.compile(r"^.*[.]")
+
+
+def triton_type(dtype: tp.dtype) -> str:
+    """The name a kernel's language spells this type by."""
+
+    triton_type_name = _triton_type_re.sub("tl.", str(dtype))
+    return _triton_type_mapping.get(triton_type_name, triton_type_name)
+
+
+def triton_type_to_torch(dtype: str) -> tp.dtype:
+    """This library's spelling of a type a kernel's language named."""
+
+    adjusted_type = _torch_triton_mapping.get(dtype, dtype)
+    type_name = adjusted_type.replace("tl.", "")
+    out_dtype = getattr(tp, type_name, None)
+    if not isinstance(out_dtype, tp.dtype):
+        raise AssertionError(f"Expected tp.dtype, got {type(out_dtype)}")
+    return out_dtype

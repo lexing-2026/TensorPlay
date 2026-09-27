@@ -406,6 +406,38 @@ class ExternKernelCaller(ChoiceCaller):
         return f"extern_{self.choice.name}"
 
 
+def template_subgraph_index_dtype_nodes(
+    subgraphs,
+) -> tuple[Any, ...]:
+    """The buffers a set of subgraphs read or write, for choosing an index width.
+
+    A kernel that indexes any of its operands in 64 bits has to do all of it
+    in 64 bits, so the whole set has to be looked at before a width is chosen.
+    """
+
+    if subgraphs is None:
+        return ()
+
+    nodes: list[Any] = []
+    seen_names: OrderedSet[str] = OrderedSet()
+    pending: list[Any] = list(reversed(subgraphs))
+    while pending:
+        subgraph = pending.pop()
+        if isinstance(subgraph, (list, tuple)):
+            pending.extend(reversed(subgraph))
+            continue
+        if subgraph is None:
+            continue
+        for dep in subgraph.get_read_writes().reads_and_writes():
+            if dep.name in seen_names:
+                continue
+            buffer = V.graph.try_get_buffer(dep.name)
+            if buffer is not None:
+                nodes.append(buffer)
+                seen_names.add(dep.name)
+    return tuple(nodes)
+
+
 @dataclasses.dataclass()
 class SubgraphInfo:
     """What is needed to lower one subgraph of a kernel written as a template.
