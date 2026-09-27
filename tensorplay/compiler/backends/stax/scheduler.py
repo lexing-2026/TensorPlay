@@ -4812,8 +4812,6 @@ class Scheduler:
         if config.combo_kernels:
             with timed_block(
                 "Scheduler.create_combo_kernel_nodes",
-                log_pt2_compile_event=True,
-                log_waitcounter=True,
             ):
                 self.create_combo_kernel_nodes(num_ck_nodes=None)
             from .memory import assign_memory_planning_info_for_scheduler_buffers
@@ -4877,8 +4875,6 @@ class Scheduler:
                 )
             with timed_block(
                 "Scheduler.simple_overlap",
-                log_pt2_compile_event=True,
-                log_waitcounter=True,
             ):
                 self.nodes = comms.simple_overlap(self.nodes)
 
@@ -5763,7 +5759,7 @@ class Scheduler:
         Combine eligible nodes into FusedSchedulerNodes.
         """
         with timed_block(
-            "Scheduler.fused_nodes", log_pt2_compile_event=True, log_waitcounter=True
+            "Scheduler.fused_nodes"
         ):
             for i in range(10):
                 old_len = len(nodes)
@@ -5818,8 +5814,6 @@ class Scheduler:
         backend = self.get_backend(device)
         with timed_block(
             "benchmark_fused_nodes",
-            log_pt2_compile_event=True,
-            dynamo_compile_column_us="compile_time_autotune_time_us",
         ):
             return backend.benchmark_fused_nodes(nodes)
 

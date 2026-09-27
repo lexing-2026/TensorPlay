@@ -118,14 +118,6 @@ class _TestConfigs:
     #: believes a value has, as an assertion in the generated code.
     runtime_triton_dtype_assert = False
 
-    #: How many ways an attention kernel may be written before the search stops
-    #: offering more.  A cap rather than a rule because each of these is a
-    #: measurement: past a point the search costs more time than the best of
-    #: them is worth, and which point that is depends on the machine.
-    max_flex_configs: int = int(
-        os.environ.get("TP_MAX_FLEX_CONFIGS", "0")
-    ) or None
-
     #: Have the host emitter state the element type it believes a value has,
     #: as a compile-time assertion in the generated code.
     static_cpp_dtype_assert = False
@@ -153,7 +145,11 @@ class _TestConfigs:
     #: a limit is what keeps an exhaustive search from running all night.
     max_mm_configs = None
 
-    #: The same limit for the shapes a grouped matmul may be measured over.
+    #: The same limit for the shapes a grouped matmul may be measured over, and
+    #: for the ways an attention kernel may be written.  A cap rather than a rule
+    #: because each of these is a measurement: past a point the search costs more
+    #: time than the best of them is worth, and which point that is depends on
+    #: the machine.
     max_omni_configs = None
 
     #: Restrict which measured candidates may be chosen from, by name and by

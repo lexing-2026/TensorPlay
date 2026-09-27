@@ -46,13 +46,12 @@ from ..codegen.cutedsl.lane_analysis import (
 from ..ir import (
     ComputedBuffer,
     ExternKernel,
-    FlexibleLayout,
-    StorageBox,
     FixedLayout,
     FlexibleLayout,
-    ReinterpretView,
     InputBuffer,
     IRNode,
+    ReinterpretView,
+    StorageBox,
     TensorBox,
 )
 from .. import config
@@ -80,7 +79,7 @@ class HierarchicalIndex(sympy.Function):
         return None
 
 
-def _flex_kernel_options_example(kind: str) -> str:
+def _omni_kernel_options_example(kind: str) -> str:
     """A set of options to offer when an option was not understood.
 
     An example rather than a list of what is allowed, because the allowed set
@@ -103,7 +102,7 @@ def _flex_kernel_options_example(kind: str) -> str:
     )
 
 
-def _flex_kernel_tuning_options(kind: str) -> str:
+def _omni_kernel_tuning_options(kind: str) -> str:
     """Which options a kernel of this kind can be tuned over."""
 
     if kind == "backward":
@@ -597,7 +596,7 @@ def select_aux_mod_vec_size(
 # ---------------------------------------------------------------------------
 
 
-def get_flex_flash_fwd_configs(
+def get_omni_flash_fwd_configs(
     has_score_mod: bool,
     has_aux_tensors: bool,
     device: Any = None,
@@ -670,20 +669,20 @@ def get_flex_flash_fwd_configs(
     else:
         score_mod_vec_sizes = (score_mod_vec_size,)
     configs = [
-        FlexFlashConfig(
+        OmniFlashConfig(
             score_mod_vec_size=v,
             mask_mod_vec_size=mask_mod_vec_size,
             mask_mod_packed_intervals=mask_mod_packed_intervals,
         )
         for v in score_mod_vec_sizes
     ]
-    max_configs = config.test_configs.max_flex_configs
+    max_configs = config.test_configs.max_omni_configs
     if max_configs is not None and len(configs) > max_configs:
         configs = configs[:max_configs]
     return configs
 
 
-def _get_flex_flash_bwd_configs() -> Any:
+def _get_omni_flash_bwd_configs() -> Any:
     """The backward kernel has only the one way of being written.
 
     Not measured, because there is nothing to choose: a score that is more than
@@ -691,7 +690,7 @@ def _get_flex_flash_bwd_configs() -> Any:
     score and the kernel has one shape.
     """
 
-    return [FlexFlashConfig()]
+    return [OmniFlashConfig()]
 
 
 # ---------------------------------------------------------------------------
@@ -844,7 +843,7 @@ def wrap_choice_render_with_cutedsl_indexer(choice: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _can_use_flex_flash_attention(
+def _can_use_omni_flash_attention(
     subgraph: Any, mask_graph: Any, num_score_mod_placeholders: int
 ) -> Any:
     """Whether this kernel can be written for what it was handed, and why not.
@@ -866,7 +865,7 @@ def _can_use_flex_flash_attention(
     return True, ""
 
 
-def _use_flex_flash_attention(
+def _use_omni_flash_attention(
     subgraph: Any,
     mask_graph: Any,
     kernel_options: Any,
@@ -887,7 +886,7 @@ def _use_flex_flash_attention(
     if backend != "FLASH":
         return False
 
-    can_use, reason = _can_use_flex_flash_attention(
+    can_use, reason = _can_use_omni_flash_attention(
         subgraph,
         mask_graph,
         num_score_mod_placeholders,
@@ -901,7 +900,7 @@ def _use_flex_flash_attention(
     return True
 
 
-def _can_use_flex_flash_attention_backward(
+def _can_use_omni_flash_attention_backward(
     fw_subgraph: Any,
     mask_graph: Any,
     joint_outputs: Any = None,
@@ -931,18 +930,18 @@ def _can_use_flex_flash_attention_backward(
         if joint_outputs.captured_grads_compute:
             return (
                 False,
-                "NYI: Flex Flash Attention bwd doesn't support captured grads yet.",
+                "NYI: Omni Flash Attention bwd doesn't support captured grads yet.",
             )
         if joint_outputs.mutated_grads:
             return (
                 False,
-                "NYI: Flex Flash Attention bwd doesn't support mutated grads yet.",
+                "NYI: Omni Flash Attention bwd doesn't support mutated grads yet.",
             )
 
     return True, ""
 
 
-def _use_flex_flash_attention_backward(
+def _use_omni_flash_attention_backward(
     fw_subgraph: Any,
     mask_graph: Any,
     backend: Any,
@@ -954,7 +953,7 @@ def _use_flex_flash_attention_backward(
     if backend != "FLASH":
         return False
 
-    can_use, reason = _can_use_flex_flash_attention_backward(
+    can_use, reason = _can_use_omni_flash_attention_backward(
         fw_subgraph,
         mask_graph,
         joint_outputs,
@@ -1765,7 +1764,7 @@ MaybeIntervalSet = Any
 
 
 @dataclasses.dataclass
-class FlexFlashConfig:
+class OmniFlashConfig:
     """One way of writing the kernel, among the ways worth measuring.
 
     How many elements one pass over the kernel handles is a choice about what

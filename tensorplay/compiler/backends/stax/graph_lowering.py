@@ -445,6 +445,10 @@ class GraphLowering:
         # that expression to the element it was read out of.  Recorded by
         # expression rather than by input, because the same expression read
         # from two inputs needs only one of them bound.
+        #: The operations a node in the region named is computed by the
+        #: framework rather than by a kernel, recorded by the name it is called
+        #: under so that a later step can ask whether a given name is one.
+        self.removed_operations: OrderedSet = OrderedSet()
         self.symbolic_input_sources: dict = {}
         self.shape_env = shape_env
         # Whether the region is being compiled to stand on its own rather than to
@@ -1591,7 +1595,7 @@ class GraphLowering:
                 tuple(int(s) for s in value.stride()),
                 0,
             )
-            buffer = InputBuffer(name=f"arg{position}", layout=layout)
+            buffer = InputBuffer(name=node.target, layout=layout)
             self.name_to_buffer[buffer.name] = buffer
             self.buffers.append(buffer)
             tensor = TensorBox(buffer)

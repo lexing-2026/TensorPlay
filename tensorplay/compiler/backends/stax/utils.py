@@ -181,9 +181,14 @@ def cache_on_self_and_args(class_name: str):
             cache[args_kwargs] = result
             return result
 
+        def clear_cache(self) -> None:
+            if hasattr(self, key):
+                delattr(self, key)
+
         inner.__name__ = fn.__name__
         inner.__qualname__ = fn.__qualname__
         inner.__doc__ = fn.__doc__
+        inner.clear_cache = clear_cache
         return inner
 
     return wrapper
@@ -1174,9 +1179,14 @@ def cache_on_self(fn):
         cache[args_kwargs] = result
         return result
 
+    def clear_cache(self) -> None:
+        if hasattr(self, key):
+            delattr(self, key)
+
     inner.__name__ = fn.__name__
     inner.__qualname__ = fn.__qualname__
     inner.__doc__ = fn.__doc__
+    inner.clear_cache = clear_cache
     return inner
 
 

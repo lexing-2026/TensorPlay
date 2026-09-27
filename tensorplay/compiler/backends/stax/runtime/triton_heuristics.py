@@ -1347,8 +1347,7 @@ class CachingAutotuner(KernelInterface):
         from .runtime_utils import timed_block
 
         with timed_block(
-            "CachingAutotuner.coordinate_descent_tuning", log_pt2_compile_event=False
-        ):
+            "CachingAutotuner.coordinate_descent_tuning"):
             return self._coordinate_descent_tuning(launcher, *args, **kwargs)
 
     def _coordinate_descent_tuning(self, launcher, *args, **kwargs):
@@ -1561,8 +1560,7 @@ class CachingAutotuner(KernelInterface):
         from .runtime_utils import timed_block
 
         with timed_block(
-            "CachingAutotuner.benchmark_all_configs", log_pt2_compile_event=True
-        ):
+            "CachingAutotuner.benchmark_all_configs"):
             timings = {}
             best_launcher = None
             best_timing = float("inf")

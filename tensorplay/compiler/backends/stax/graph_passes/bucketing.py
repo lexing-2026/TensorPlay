@@ -1133,7 +1133,7 @@ def all_gather_merge_fn_to_trace_functional(
 
 
 def _trace(fn, inps) -> GraphModule:  # type: ignore[no-untyped-def]
-    with timed_block("fx.bucketing._trace", log_pt2_compile_event=True):
+    with timed_block("fx.bucketing._trace"):
         fake_mode = detect_fake_mode(inps)
         if fake_mode is None:
             raise AssertionError("expected a fake mode to be detected, got None")
@@ -1183,8 +1183,7 @@ def _insert_fn_trace_before_node(  # type: ignore[no-untyped-def]
         (replacements, new_nodes): Dictionary mapping old to new nodes, and list of all newly inserted nodes
     """
     with timed_block(
-        "fx.bucketing._insert_fn_trace_before_node", log_pt2_compile_event=True
-    ):
+        "fx.bucketing._insert_fn_trace_before_node"):
         fn_gm = _trace(
             fn_to_trace,
             inps,
@@ -1588,7 +1587,7 @@ def merge_reduce_scatter(
     Merges specified buckets of reduce_scatter to joint reduce_scatter.
     """
     mode = mode or _default_bucket_mode()
-    with timed_block("fx.bucketing.merge_reduce_scatter", log_pt2_compile_event=True):
+    with timed_block("fx.bucketing.merge_reduce_scatter"):
         trace_structured(
             "artifact",
             metadata_fn=lambda: {
@@ -1613,7 +1612,7 @@ def merge_all_gather(
     Merges specified buckets of all_gather to joint all_gather.
     """
     mode = mode or _default_bucket_mode()
-    with timed_block("fx.bucketing.merge_all_gather", log_pt2_compile_event=True):
+    with timed_block("fx.bucketing.merge_all_gather"):
         trace_structured(
             "artifact",
             metadata_fn=lambda: {

@@ -74,6 +74,26 @@ cpp_to_dtype_count = 0
 parallel_reduction_count = 0
 
 
+#: The tables that have been registered, by the name each is asked for.
+#: Recorded because a caller that asks for a table by a name that was never
+#: registered has to be told so rather than handed an empty one.
+REGISTERED_METRIC_TABLES: dict = {}
+
+#: How many operations the region held before any of them were fused together,
+#: so that the number that came out can be said against what went in.
+ir_nodes_pre_fusion = 0
+
+#: How many times a loop's order was changed to suit the machine, and how many
+#: times a fusion of a reduction in a different order was refused.
+num_loop_reordering = 0
+rejected_mix_order_reduction_fusion: int = 0
+
+#: How many reductions were written nested inside another reduction, and how
+#: many were written in an order the operations were not given in.
+codegen_nested_reduction: int = 0
+codegen_mix_order_reduction: int = 0
+
+
 def reset() -> None:
     """Zero every counter, so one run's numbers are not read as another's."""
 
