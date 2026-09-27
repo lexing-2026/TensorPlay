@@ -38,6 +38,7 @@ from tensorplay.graph.experimental.sympy_functions import (
     Mod,
 )
 
+from ..codegen.cutedsl.cutedsl_template import CuteDSLTemplate
 from ..codegen.cutedsl.lane_analysis import (
     classify_lane_expr as _classify_lane_expr,
     decompose_affine_lane_expr,
@@ -58,6 +59,23 @@ from .. import config
 from ..loops import V, get_fill_order
 from tensorplay.utils._pytree import tree_map, tree_map_only
 from tensorplay.graph.experimental.sympy_functions import FloorDiv
+from ..templates.mm_common import load_kernel_template
+from ..templates.select_algorithm import autotune_select_algorithm
+
+#: The two bodies these kernels are written from, named for what they compute.
+#:
+#: A body long enough to vary in a dozen places does not belong inside a string:
+#: the parts that vary and the parts that do not are indistinguishable when they
+#: are one piece of text.  So each is a file of its own, and this is where the
+#: two of them are handed to the machinery that renders one.
+omni_flash_attention_cutedsl_template = CuteDSLTemplate(
+    name="omni_flash_attention_cutedsl",
+    source=load_kernel_template("omni_flash_attention"),
+)
+omni_flash_attention_backward_cutedsl_template = CuteDSLTemplate(
+    name="omni_flash_attention_backward_cutedsl",
+    source=load_kernel_template("omni_flash_attention_backward"),
+)
 
 
 class HierarchicalIndex(sympy.Function):
@@ -1479,3 +1497,212 @@ def realize_captures_for_cutedsl(buffers: Any) -> Any:
     V.graph._cutedsl_capture_nodes.update(view_captures)
 
     return buffers
+
+
+# ---------------------------------------------------------------------------
+# Writing the kernel
+# ---------------------------------------------------------------------------
+
+
+def create_omni_flash_attention_kernel(
+    query: Any,
+    key: Any,
+    value: Any,
+    scale: float,
+    kernel_options: Any,
+    subgraph_buffer: Any,
+    mask_graph_buffer: Any,
+    score_mod_other_buffers: Any,
+    mask_mod_other_buffers: Any,
+    kv_num_blocks: Any,
+    kv_indices: Any,
+    full_kv_num_blocks: Any,
+    full_kv_indices: Any,
+    sparse_q_block_size: Any,
+    sparse_kv_block_size: Any,
+    mask_graph: Any,
+    subgraph: Any = None,
+) -> Any:
+    """Write the forward pass, and hand back what it produced and what it summed.
+
+    Two values rather than one, because the second is not derived from the
+    first: it is the running total the first was accumulated against, and a later
+    pass needs it to work out which rows of the first came from where.  So it is
+    kept at a width that does not lose the running total to rounding, whatever
+    width the values themselves are at.
+
+    The positions are given to the kernel as blocks rather than as a list of
+    them, because which blocks exist is a property of the mask and not of the
+    program: a program that asked for every block and one whose mask happens to
+    allow every block compute the same thing, and only the second should pay for
+    reading what the mask allows.
+    """
+
+    # Imported here rather than at the top because the module that hands out
+    # buffers is the one that imports this file's table, so importing it from up
+    # here would be a cycle rather than a dependency.
+    from ..op_lowerings import empty_strided
+
+    if query.dtype != key.dtype or query.dtype != value.dtype:
+        raise ValueError(
+            f"Mixed query, key, and value dtype is not supported on this platform, "
+            f"got query.dtype: {query.dtype}, key.dtype: {key.dtype}, "
+            f"and value.dtype: {value.dtype}."
+        )
+    if not ensure_flash_available():
+        raise RuntimeError(_flash_attention_unavailable_message())
+
+    batch_size, num_heads, seq_len_q, head_dim = query.get_size()
+    v_head_dim = value.get_size()[-1]
+    device = query.get_device()
+    dtype = query.dtype
+    if device is None:
+        raise AssertionError("Device must be specified")
+
+    # The answer is read the way the question was laid out, so its distances
+    # follow the question's rather than being chosen afresh.
+    q_strides = query.get_stride()
+    out_size = [batch_size, num_heads, seq_len_q, v_head_dim]
+    out_strides = infer_dense_strides(out_size, q_strides)
+
+    output = empty_strided(
+        size=out_size, stride=out_strides, dtype=dtype, device=device
+    )
+
+    lse = empty_strided(
+        size=[batch_size, num_heads, seq_len_q],
+        stride=None,
+        dtype=tp.float32,
+        device=device,
+    )
+
+    output_layout = FixedLayout(
+        device=device,
+        dtype=dtype,
+        size=out_size,
+        stride=[sympy.sympify(s) for s in out_strides],
+    )
+
+    mask_graph_is_trivial = is_trivial_mask_graph(mask_graph.graph_module)
+    score_graph_is_trivial = subgraph is None or is_trivial_score_graph(
+        subgraph.graph_module
+    )
+
+    if kv_num_blocks is None or kv_indices is None:
+        raise AssertionError("kv block metadata is required for the flash path")
+
+    has_score_mod = not score_graph_is_trivial
+    has_mask_mod = not mask_graph_is_trivial
+    has_full_blocks = full_kv_num_blocks is not None
+    if has_full_blocks and full_kv_indices is None:
+        raise AssertionError("full_kv_indices must be provided with full_kv_num_blocks")
+    # Blocks large enough to cover everything are the same as no blocks at all,
+    # and a kernel told about blocks that cover everything spends a read to learn
+    # there was nothing to read.
+    is_noop_block_mask = not has_full_blocks and V.graph.sizevars.statically_known_true(
+        sympy.And(
+            sympy.Eq(sparse_q_block_size, 1 << 30),
+            sympy.Eq(sparse_kv_block_size, 1 << 30),
+        )
+    )
+    needs_block_mask = not (mask_graph_is_trivial and is_noop_block_mask)
+    sparse_q_block_size = V.graph.sizevars.guard_int(sparse_q_block_size)
+    sparse_kv_block_size = V.graph.sizevars.guard_int(sparse_kv_block_size)
+
+    choices: list = []
+    if omni_flash_attention_cutedsl_template is None:
+        raise AssertionError("omni_flash_attention_cutedsl_template must not be None")
+
+    input_nodes = [query, key, value, lse]
+    if needs_block_mask:
+        input_nodes.extend([kv_num_blocks, kv_indices])
+        if has_full_blocks:
+            input_nodes.extend([full_kv_num_blocks, full_kv_indices])
+
+    subgraphs = []
+    if has_score_mod:
+        subgraphs.append(subgraph_buffer)
+    if has_mask_mod:
+        subgraphs.append(mask_graph_buffer)
+
+    aux_scalar_symbols = collect_aux_scalar_symbols(
+        score_mod_other_buffers, mask_mod_other_buffers
+    )
+    if aux_scalar_symbols and not flash_supports_aux_scalars():
+        raise RuntimeError(
+            "CUTE flash attention scalar captures require flash-attn-4>=4.0.0b17. "
+            f"{FLASH_ATTENTION_INSTALL_MESSAGE}"
+        )
+    has_score_aux_tensors = any(
+        not isinstance(buffer, sympy.Expr) for buffer in score_mod_other_buffers
+    )
+    has_mask_aux_tensors = any(
+        not isinstance(buffer, sympy.Expr) for buffer in mask_mod_other_buffers
+    )
+
+    configs = get_omni_flash_fwd_configs(
+        has_score_mod=has_score_mod,
+        has_aux_tensors=has_score_aux_tensors,
+        device=device,
+        score_mod_graph_module=(
+            subgraph.graph_module if has_score_mod and subgraph is not None else None
+        ),
+        score_mod_other_buffers=score_mod_other_buffers,
+        has_mask_mod=has_mask_mod,
+        has_mask_aux_tensors=has_mask_aux_tensors,
+        mask_mod_graph_module=mask_graph.graph_module,
+        mask_mod_other_buffers=mask_mod_other_buffers,
+        aux_scalar_symbols=aux_scalar_symbols,
+    )
+    error: Any = None
+    for conf in configs:
+        error = generate_omni_flash_choice(
+            omni_flash_attention_cutedsl_template,
+            choices,
+            input_nodes=input_nodes,
+            layout=output_layout,
+            mutated_inputs=[lse],
+            subgraphs=subgraphs,
+            SM_SCALE=scale,
+            HAS_SCORE_MOD=has_score_mod,
+            SCORE_MOD_VEC_SIZE=conf.score_mod_vec_size,
+            MASK_MOD_VEC_SIZE=conf.mask_mod_vec_size,
+            MASK_MOD_PACKED_INTERVALS=conf.mask_mod_packed_intervals,
+            MASK_MOD_OTHER_BUFFERS=mask_mod_other_buffers,
+            AUX_SCALAR_SYMBOLS=aux_scalar_symbols,
+            NEEDS_BLOCK_MASK=needs_block_mask,
+            HAS_MASK_MOD=has_mask_mod,
+            HAS_FULL_BLOCKS=has_full_blocks,
+            SPARSE_Q_BLOCK_SIZE=sparse_q_block_size,
+            SPARSE_KV_BLOCK_SIZE=sparse_kv_block_size,
+        )
+        if error is not None and len(configs) == 1:
+            raise RuntimeError(f"CuteDSL template failed: {error}")
+
+    if not choices:
+        raise RuntimeError(f"CuteDSL template failed: {error}")
+
+    input_gen_fns: Any = None
+    if needs_block_mask:
+        input_gen_fns = {
+            4: create_num_blocks_fake_generator(kv_indices),
+            5: create_indices_fake,
+        }
+        if has_full_blocks:
+            input_gen_fns.update(
+                {
+                    6: create_num_blocks_fake_generator(full_kv_indices),
+                    7: create_indices_fake,
+                }
+            )
+
+    template_output, _ = autotune_select_algorithm(
+        "omni_flash_attention",
+        choices,
+        input_nodes,
+        output_layout,
+        input_gen_fns=input_gen_fns,
+        return_multi_template=False,
+    )
+
+    return (template_output, lse)
