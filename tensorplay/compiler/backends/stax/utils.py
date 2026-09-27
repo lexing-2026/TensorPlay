@@ -3318,3 +3318,24 @@ def restore_stdout_stderr() -> Iterator[None]:
         yield
     finally:
         sys.stdout, sys.stderr = initial_stdout, initial_stderr
+
+
+#: The types a device-side descriptor can describe.  A descriptor names a
+#: tensor's type to the hardware in a fixed encoding, and a type with no
+#: encoding cannot be named that way however the kernel would like to treat it.
+_TMA_SUPPORTED_DTYPES: OrderedSet = OrderedSet(
+    [
+        tp.uint8,
+        tp.int8,
+        tp.uint16,
+        tp.int16,
+        tp.uint32,
+        tp.int32,
+        tp.int64,
+        tp.float16,
+        tp.bfloat16,
+        tp.float32,
+        tp.float64,
+        *TRITON_FLOAT8_DTYPES,
+    ]
+)

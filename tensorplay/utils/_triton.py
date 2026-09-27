@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import functools
 from typing import Any
 
 #: The message a runtime's loader gives when it cannot read a shared object it
@@ -102,3 +103,69 @@ def triton_hash_with_backend() -> str:
     key = f"{triton_key()}-{backend.hash()}-{_extern_libs_key(backend)}"
 
     return hashlib.sha256(key.encode("utf-8")).hexdigest().upper()
+
+
+def has_triton_package() -> bool:
+    """Whether the kernel-writing runtime is installed at all.
+
+    Asked before anything that reaches into it, because a program that has no
+    runtime installed is not a program with a broken one -- it is a program
+    that never needed it, and the difference decides what to say.
+    """
+
+    try:
+        import triton  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+@functools.cache
+def has_triton_cpu_backend() -> bool:
+    """Whether the runtime can write a kernel for the host rather than a device.
+
+    Asked of the runtime rather than of this package because whether it can is
+    a property of the version installed, and a version that cannot is not an
+    error -- it is a runtime that writes kernels somewhere else.
+    """
+
+    if has_triton_package():
+        import triton
+
+        return "cpu" in triton.backends.backends
+
+    return False
+
+
+@functools.lru_cache(None)
+def has_triton_stable_tma_api() -> bool:
+    """Whether the runtime can build a device-side descriptor.
+
+    A descriptor is how a kernel is told about a tensor's shape and strides
+    without being handed the tensor, and whether the runtime can be asked for
+    one is a property of its version and of what the device can do.  Both are
+    asked, and the ability is only claimed when the runtime actually offers it.
+    """
+
+    if has_triton_package():
+        import tensorplay as tp
+
+        if (
+            (
+                tp.cuda.is_available()
+                and tp.cuda.get_device_capability() >= (9, 0)
+                and not tp.version.hip
+            )
+            # Not every build has every device; a device this build does not
+            # offer is not one a descriptor could be used on.
+            or (getattr(tp, "xpu", None) is not None and tp.xpu.is_available())
+            or has_triton_cpu_backend()
+        ):
+            try:
+                from triton.language import make_tensor_descriptor  # noqa: F401
+
+                return True
+            except ImportError:
+                pass
+    return False
