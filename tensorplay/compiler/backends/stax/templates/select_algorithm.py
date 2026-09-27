@@ -22,7 +22,7 @@ import os
 import sympy
 import textwrap
 from unittest.mock import patch
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 from typing import Any, Callable, Iterator
 
@@ -89,7 +89,7 @@ from ..autotune_process import (
     TritonGPUBenchmarkRequest,
 )
 from ..codecache import PyCodeCache
-from ..utils import Placeholder
+from ..utils import Placeholder, tlx_only_cuda_options
 from ..codegen.common import WorkspaceZeroMode
 from ..codegen.triton import TritonKernel
 from ..codegen.triton_utils import (

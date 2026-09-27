@@ -419,6 +419,7 @@ class IndexingOptions:
             for mask in self.mask_vars
         )
 
+    @property
     def mask_str(self) -> str:
         # The sorted call is added to make sure the order is still
         # deterministic if self.mask_vars contains mix of string

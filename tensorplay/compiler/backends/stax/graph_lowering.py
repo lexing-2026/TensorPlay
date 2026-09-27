@@ -22,6 +22,7 @@ from typing import Any
 
 import sympy
 import tensorplay as tp
+from ....graph.experimental.sympy_functions import OrderedSet
 from tensorplay.utils import _pytree as pytree
 
 from . import config
@@ -35,6 +36,7 @@ from .utils import (
 from .sizevars import SizeVarAllocator
 from .virtualized import V
 from .ir import (
+    get_device_type,
     Buffer,
     BaseView,
     ComputedBuffer,
@@ -117,6 +119,8 @@ class _IndexCapture:
         #: whether anything can be done about them.
         self.disable_cudagraphs_reason: str | None = None
         self.loads = []
+
+
 
     def load(self, name, index):
         self.loads.append((name, index))
@@ -525,6 +529,10 @@ class GraphLowering:
         # program that hands over a value it is finished with is recorded that
         # way, and what it handed over is this.
         self.graph_inputs_original: dict = {}
+        #: The graph inputs that stand in for a value rather than holding one.
+        #: Recorded by name as they are found, because whether one is such is
+        #: asked again later and the answer is about the graph, not the call.
+        self.zero_dim_cpu_tensor_list: OrderedSet[str] = OrderedSet()
         # Values bound from the surrounding program, which are referred to by
         # name rather than copied into the generated code.
         self.torchbind_constants: dict = {}
@@ -589,6 +597,33 @@ class GraphLowering:
         # Whether the walk has run, so that a second request for a built form
         # does not walk an already settled region again.
         self._walked = False
+    def _graph_input_named(self, name: str):
+        """The input a name belongs to, if this graph has one by that name.
+
+        The inputs are kept in the order they were declared rather than by
+        name, so a name is looked for by walking them; a graph has a handful of
+        inputs, and a name that is not one of them was never declared.
+        """
+
+        for buf in self.graph_inputs:
+            if buf is not None and getattr(buf, "name", None) == name:
+                return buf
+        return None
+
+    def is_unspec_arg(self, name: str) -> bool:
+        """Whether this input stands in for a value rather than holding one.
+
+        Asked by name rather than told, because a caller holding a name is
+        deciding how to pass the value on, and a kernel handed a stand-in as
+        though it were a tensor would read a number out of a shape.
+        """
+
+        buf = self._graph_input_named(name)
+        if buf is not None and buf.get_numel() == 1 and len(buf.get_size()) == 0:
+            if get_device_type(buf) == "cpu":
+                return True
+        return name in self.zero_dim_cpu_tensor_list
+
 
     def current_node(self):
         """The graph node being lowered right now, or nothing.
