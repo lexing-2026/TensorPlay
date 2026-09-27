@@ -24,7 +24,10 @@ import sympy
 from sympy import Mod
 
 from ..ir import (
+    ComputedBuffer,
     ExternKernel,
+    FlexibleLayout,
+    StorageBox,
     FixedLayout,
     FlexibleLayout,
     InputBuffer,
@@ -695,3 +698,74 @@ def zeros_and_scatter_lowering(shape: Any, indices: Any, values: Any) -> Any:
         data=scatter,
     )
     return buffer
+
+
+def build_subgraph_module_buffer(args: Any, graph_module: Any) -> Any:
+    """What a captured body produces, as something a kernel can hold.
+
+    The body is run as a graph of its own rather than as part of the outer one,
+    because a kernel is written against a body and not against the graph around
+    it: what the body produces has to be something the kernel can be handed,
+    which is not what a node in the outer graph is.
+
+    The one operation the body is allowed to change something with is the one
+    that adds a gradient into a position, and it is given its own lowering
+    here -- so the body is lowered with that answer available rather than being
+    refused for using it.
+    """
+
+    from ..ir import ComputedBuffer, FlexibleLayout, StorageBox
+    from ..subgraph_lowering import PointwiseSubgraphLowering
+    from tensorplay.utils._ordered_set import OrderedSet
+
+    from . import zeros_and_scatter_lowering
+
+    # This one we gotta keep lazy
+    allowed = OrderedSet([tp.ops.omni.zeros_and_scatter.default])
+    pw_subgraph = PointwiseSubgraphLowering(
+        graph_module,
+        root_graph_lowering=V.graph,
+        allowed_mutations=allowed,
+        additional_lowerings={
+            tp.ops.omni.zeros_and_scatter.default: zeros_and_scatter_lowering
+        },
+    )
+    with V.set_graph_handler(pw_subgraph):
+        pw_subgraph.run(*args)
+
+    def convert_output_node_to_buffer(output_buffer: Any) -> Any:
+        if output_buffer is None:
+            return None
+        if isinstance(output_buffer, ComputedBuffer):
+            return output_buffer
+        if not isinstance(output_buffer, TensorBox):
+            raise AssertionError(
+                f"The output node for the attention subgraph must be a TensorBox, "
+                f"but got: {type(output_buffer)}"
+            )
+        if not isinstance(output_buffer.data, StorageBox):
+            raise AssertionError(
+                f"The output node for the attention subgraph must be a StorageBox, "
+                f"but got: {type(output_buffer.data)}"
+            )
+        device = output_buffer.data.get_device()
+        if device is None:
+            raise AssertionError("device must not be None for output buffer")
+        subgraph_buffer = ComputedBuffer(
+            name=None,
+            layout=FlexibleLayout(
+                device=device,
+                dtype=output_buffer.data.get_dtype(),
+                size=output_buffer.data.get_size(),
+            ),
+            data=output_buffer.data.data,
+        )
+        return subgraph_buffer
+
+    return tree_map(convert_output_node_to_buffer, pw_subgraph.graph_outputs)
+
+
+def build_subgraph_buffer(args: Any, subgraph: Any) -> Any:
+    """The same, for a body that is already a graph of its own."""
+
+    return build_subgraph_module_buffer(args, subgraph.graph_module)
