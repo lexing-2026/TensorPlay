@@ -35,6 +35,12 @@ from .....graph.experimental.sympy_functions import (
     SymT,
 )
 from .. import config
+from ..runtime.hints import (
+    AutotuneHint,
+    DeviceProperties,
+    ReductionHint,
+    TileHint,
+)
 from ..shape_propagation import get_broadcasted_shape
 from .common import CSE, CSEVariable, OpOverrides, PythonPrinter
 from ..utils import (
