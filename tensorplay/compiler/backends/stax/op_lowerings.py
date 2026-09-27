@@ -3709,7 +3709,13 @@ def new_empty(x: Any, size: Any, *, dtype: Any = None, device: Any = None) -> An
 
 
 def empty_strided(
-    size: Any, stride: Any, *, dtype: Any = None, device: Any = None
+    size: Any,
+    stride: Any,
+    *,
+    dtype: Any = None,
+    layout: Any = None,
+    device: Any = None,
+    pin_memory: Any = None,
 ) -> Any:
     """A place to write, at a shape and at distances between positions.
 
@@ -3727,14 +3733,23 @@ def empty_strided(
     ``new_empty`` rather than leaving it unset.  That walk is also what gives
     the buffer a name and a place in the graph, which is what a buffer a kernel
     fills needs to have before the kernel is written.
+
+    Asked for with no type and no device, the two are the ones a program gets by
+    not saying: its own default type, and the device this runs on.  A layout
+    other than the ordinary one is not something this can honour, and is said
+    out loud rather than quietly treated as the ordinary one.
     """
 
     if not isinstance(size, (list, tuple)):
         raise AssertionError("expected: isinstance(size, (list, tuple))")
     if not isinstance(stride, (list, tuple, type(None))):
         raise AssertionError("expected: isinstance(stride, (list, tuple, None))")
+    if layout is not None:
+        raise NotImplementedError(f"layout={layout}")
+    if dtype is None:
+        dtype = tp.get_default_dtype()
     if device is None:
-        raise AssertionError("a place to write has to be somewhere to write to")
+        device = tp.device("cuda" if tp.cuda.is_available() else "cpu")
 
     pointwise = _full(0, device, dtype, list(size))
     pointwise.realize()
@@ -3756,7 +3771,7 @@ def empty_strided(
         dtype=dtype,
         size=size,
         stride=stride,
-        is_pinned=False,
+        is_pinned=pin_memory or False,
     )
     return pointwise
 
