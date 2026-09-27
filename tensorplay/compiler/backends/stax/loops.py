@@ -851,13 +851,36 @@ class RecordingOps:
         raise AttributeError(name)
 
 
+#: The operations a recorded loop body can be built from, by how many values
+#: they read: two, one, or two whose result is a truth value.  A result's
+#: element type is the wider of what was read, so a name missing from here is an
+#: operation a body cannot be written with -- which is a different thing from an
+#: operation whose type is not known, and the two were previously the same list,
+#: so a body that used any of the hundred-odd operations outside it failed at the
+#: point of use rather than where it was written.
 _BINARY_OPS = frozenset(
-    {"add", "sub", "mul", "truediv", "maximum", "minimum", "pow"}
+    {
+        "add", "sub", "mul", "truediv", "floordiv", "truncdiv", "div_rn",
+        "maximum", "minimum", "pow", "mod", "fmod", "remainder", "atan2",
+        "lshift", "rshift", "and_", "or_", "xor", "bitwise_and",
+        "bitwise_or", "bitwise_xor", "bitwise_left_shift",
+        "bitwise_right_shift", "logical_and", "logical_or", "logical_xor",
+        "fmax", "fmin",
+    }
 )
+
 _UNARY_OPS = frozenset(
-    {"neg", "exp", "log", "sigmoid", "rsqrt", "sqrt", "reciprocal", "abs",
-     "sin", "cos", "tanh", "relu", "square"}
+    {
+        "neg", "exp", "log", "sigmoid", "rsqrt", "sqrt", "reciprocal", "abs",
+        "sin", "cos", "tanh", "relu", "square", "acos", "asin", "atan",
+        "sinh", "cosh", "asinh", "acosh", "atanh", "ceil", "floor", "trunc",
+        "round", "sign", "exp2", "expm1", "log2", "log10", "log1p", "erf",
+        "erfc", "erfinv", "isnan", "isinf", "signbit", "logical_not",
+        "bitwise_not", "ceil_to_int", "floor_to_int", "trunc_to_int",
+        "round_to_int",
+    }
 )
+
 _COMPARE_OPS = frozenset({"lt", "le", "gt", "ge", "eq", "ne"})
 
 

@@ -44,6 +44,7 @@ from ..loop_fusion import (
 )
 from ..ir import Buffer
 from ..loops import Value, dtype_name, promotes_on_load
+from ..loops import _BINARY_OPS, _COMPARE_OPS
 from .common import BasicMathOpsMixin, OpOverrides
 
 try:  # pragma: no cover - availability is a runtime condition
@@ -367,11 +368,12 @@ class TritonOverrides(OpOverrides):
     """
 
     #: The two-operand operators, including the ones the mixin spells: the
-    #: set is what says how many operands a method takes.
-    BINARY = frozenset({
-        "add", "sub", "mul", "truediv", "div", "maximum", "minimum", "pow",
-        "lt", "le", "gt", "ge", "eq", "ne", "and_",
-    })
+    #: set is what says how many operands a method takes.  Taken from where the
+    #: loop bodies are recorded rather than listed again, because a second list
+    #: of the same names is a second answer to how many operands an operation
+    #: reads -- and they disagreed, so an operation the recorder could build and
+    #: this class could not print was not reported until it reached the printer.
+    BINARY = _BINARY_OPS | _COMPARE_OPS | frozenset({"div", "and_"})
 
     _COMPARE_SYMBOL = {"lt": "<", "le": "<=", "gt": ">", "ge": ">=",
                        "eq": "==", "ne": "!="}

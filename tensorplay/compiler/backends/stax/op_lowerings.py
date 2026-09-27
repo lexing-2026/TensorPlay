@@ -2995,16 +2995,28 @@ def _div_rn(a: Any, b: Any) -> Any:
     return ops.div_rn(a, b)
 
 
-def _floor_div_floating(a: Any, b: Any) -> Any:
-    """The quotient rounded towards minus infinity, for values that are not whole.
+def _div_mode_body(a: Any, b: Any, rounding_mode: Any, both_integer: bool) -> Any:
+    """The quotient, rounded as asked, for one pair of values.
 
-    A floor of an approximate quotient can come out one too small, so the
-    quotient is rounded to nearest before it is floored -- which is then the same
-    floor as rounding the exact quotient would have given, wherever the two
-    round the same way.
+    This is what a device computes rather than what the graph is built from:
+    whether rounding down drops the fractional part or is a floor is a question
+    about the two values, and it cannot be answered until the graph has been
+    turned into a loop that produces them.
     """
 
-    return ops.floor(_div_rn(a, b))
+    if rounding_mode == "floor":
+        if both_integer:
+            return ops.floordiv(a, b)
+        # A floor of the reciprocal-rounded quotient can come out one too
+        # small, so the quotient is rounded to nearest first -- which is then
+        # the floor the exact quotient would have given, wherever the two round
+        # the same way.
+        return ops.floor(ops.div_rn(a, b))
+    if rounding_mode == "trunc":
+        if both_integer:
+            return ops.truncdiv(a, b)
+        return ops.trunc(ops.truediv(a, b))
+    return ops.truediv(a, b)
 
 
 def div_mode(a: Any, b: Any, rounding_mode: Any = None) -> Any:
@@ -3014,24 +3026,26 @@ def div_mode(a: Any, b: Any, rounding_mode: Any = None) -> Any:
     and for different reasons, and neither can be done by rounding a quotient
     the usual way: a floor of an approximate quotient can come out one too small,
     and a device's own division of whole numbers is not the floor of anything.
+
+    So which of the two comes out is decided here, from the dtypes, and the
+    arithmetic itself is left to the loop that will produce the values.
     """
 
     both_integer = is_integer_type(a) and is_integer_type(b)
     both_boolean = is_boolean_type(a) and is_boolean_type(b)
 
-    if rounding_mode == "floor":
-        if both_boolean:
-            raise AssertionError(
-                "floordiv operands can not be boolean at the same time"
-            )
-        return floordiv(a, b) if both_integer else _floor_div_floating(a, b)
-    if rounding_mode == "trunc":
-        if both_boolean:
-            raise AssertionError(
-                "truncdiv operands can not be boolean at the same time"
-            )
-        return truncdiv(a, b) if both_integer else ops.trunc(ops.div(a, b))
-    return LOWERINGS["div.Tensor"](a, b)
+    if rounding_mode in ("floor", "trunc") and both_boolean:
+        raise AssertionError(
+            f"{rounding_mode}div operands can not be boolean at the same time"
+        )
+    # ``pointwise`` loads every argument after the first as though it were a
+    # value to read at each index, so the two answers settled above are closed
+    # over rather than passed: they are the same for every element, and passing
+    # them would ask for a value at each index instead.
+    def body(x: Any, y: Any) -> Any:
+        return _div_mode_body(x, y, rounding_mode, both_integer)
+
+    return pointwise(body, a, b)
 
 
 def _register_div_writing_forms() -> None:
