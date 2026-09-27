@@ -1054,6 +1054,207 @@ class TritonTemplateKernel:
         if self.use_jit:
             return "@triton.jit"
 
+    def _register_hook(
+        self,
+        hook_name: str,
+        hook_fn,
+        *,
+        allow_overwriting: bool = False,
+    ) -> str:
+        """Remember what is to go where a placeholder stands.
+
+        The name is the string the rendered text will carry and the function is
+        what fills it in, so a name already in use means two different things
+        want the same place -- which is only ever meant if the caller said so.
+        """
+
+        if not allow_overwriting:
+            if hook_name in self.render_hooks:
+                raise AssertionError(
+                    f"Tried to register the hook {hook_name} multiple times. If "
+                    "desired, pass allow_overwriting=True to _register_hook"
+                )
+        self.render_hooks[hook_name] = hook_fn
+        return hook_name
+
+    def _register_extra_template_env_fns(self, *fns: Callable[..., Any]):
+        """Add more names to the template's rendering, beyond the usual ones.
+
+        A function added this way may itself register a hook, so a template can
+        carry a part of its text that nothing else knows how to produce.
+        """
+
+        self.extra_template_env_fns.extend(fns)
+
+    def gen_argdefs(self):
+        """The parameters the entry point takes, once the whole body is known.
+
+        A template can decide to ask for another argument while it renders, so
+        the list cannot be written until the whole body has been asked.
+        """
+
+        def hook():
+            arg_defs, *_ = self.args.python_argdefs()
+            return f"{', '.join(x.full_name() for x in arg_defs)}"
+
+        return self._register_hook("<ARGDEFS>", hook, allow_overwriting=True)
+
+    def gen_defines(self):
+        return self.defines
+
+    def def_kernel(self, *argnames):
+        """The entry point: its parameters, and the names the body calls them by.
+
+        The body names its operands, and those names are what it says.  Each
+        one is bound to the argument that carries the operand's storage, and
+        the binding is written out where the body can rely on it.
+
+        A name given here is the name the body uses; it is not looked for
+        among the kernel's arguments, because the kernel's arguments are in
+        the order the graph gave them and the body is free to name them as it
+        likes.
+        """
+
+        if not all(isinstance(x, str) for x in argnames):
+            raise AssertionError("all argnames must be str")
+        renames = IndentedBuffer(initial_indent=1)
+
+        named_args = self.input_nodes[
+            self.prefix_args : len(self.input_nodes) - self.suffix_args
+        ]
+
+        if len(argnames) != len(named_args):
+            raise AssertionError(
+                (
+                    len(argnames),
+                    len(named_args),
+                    self.prefix_args,
+                    len(self.input_nodes),
+                )
+            )
+
+        for input_node in self.input_nodes[: self.prefix_args]:
+            self.args.input(input_node.get_name())
+
+        for name, input_node in zip(argnames, named_args):
+            arg_name = f"arg_{name}"
+            self.named_input_nodes[name] = input_node
+            if input_node.get_name() in V.graph.removed_buffers:
+                continue
+            if input_node.get_name() in self.prologue_fused_inputs:
+                continue
+
+            self.args.input_buffers[input_node.get_name()] = arg_name
+
+        # The args may be duplicated, so renaming must be after args are
+        # de-duplicated.
+        for name in argnames:
+            input_node = self.named_input_nodes[name]
+            if self.prologue_loads_all_inputs:
+                self.prologue_supported_inputs.add(input_node.get_name())
+            if input_node.get_name() in V.graph.removed_buffers:
+                continue
+            if input_node.get_name() in self.prologue_fused_inputs:
+                continue
+
+            arg_name = self.args.input_buffers[input_node.get_name()]
+            if input_node.get_layout().offset == 0:
+                renames.writeline(f"{name} = {arg_name}")
+            else:
+                offset = texpr(self.rename_indexing(input_node.get_layout().offset))
+                renames.writeline(f"{name} = {arg_name} + {offset}")
+
+        for input_node in self.input_nodes[len(self.input_nodes) - self.suffix_args :]:
+            if input_node.get_name() in V.graph.removed_buffers:
+                continue
+            if input_node.get_name() in self.prologue_fused_inputs:
+                continue
+
+            self.args.input(input_node.get_name())
+
+        def hook():
+            arg_defs, *_ = self.args.python_argdefs()
+            code = IndentedBuffer()
+            code.splice(self.gen_common_triton_imports())
+            code.splice(self.jit_lines())
+            code.writeline(
+                f"def {self.kernel_name}({', '.join(x.full_name() for x in arg_defs)}):"
+            )
+            with code.indent():
+                code.splice(self.defines)
+                code.splice(renames.getvalue())
+                self.codegen_prologue(code)
+            return code.getvalue()
+
+        return self._register_hook("<DEF_KERNEL>", hook)
+
+    def size(self, name: str | None, index: int):
+        """The extent of a dimension, as the body should write it.
+
+        Asking with no name gives the result's own extent.  When the kernel
+        indexes in 64 bits the extent is widened on the way out, because an
+        extent computed in 32 bits can wrap around on a large tensor and turn
+        into a wrong answer rather than an error.
+        """
+
+        if not isinstance(index, int):
+            raise AssertionError(f"expected index to be int, got {type(index)}")
+        if name is None:
+            val = self.output_node.get_size()[index]
+        else:
+            if not isinstance(name, str):
+                raise AssertionError(f"expected name to be str, got {type(name)}")
+            val = self.named_input_nodes[name].get_size()[index]
+        result = texpr(self.rename_indexing(val))
+        if self.index_dtype == "tl.int64":
+            return f"tl.full([], {result}, dtype=INDEX_DTYPE)"
+        return result
+
+    def stride(self, name, index=None):
+        """The strides of a tensor, or one of them, as the body should write it.
+
+        Asking with no name gives the result's own strides.  Asking for one
+        dimension gives that dimension's stride, and asking for none of them
+        gives the whole list, which is what a body needs when it is doing its
+        own arithmetic over a tensor it did not load elementwise.
+        """
+
+        if name is None:
+            val = self.output_node.get_stride()
+        else:
+            if not isinstance(name, str):
+                raise AssertionError(f"expected name to be str, got {type(name)}")
+            val = self.get_stride_and_maybe_freeze_layout(self.named_input_nodes[name])
+
+        if isinstance(index, int):
+            return texpr(self.rename_indexing(val[index]))
+        return ", ".join([texpr(self.rename_indexing(i)) for i in val])
+
+    def _get_subgraph(self, subgraph_number: int):
+        """The subgraph a hook was asked about, checked that it is there.
+
+        The body is emptied of everything else, because what a modification
+        adds is the whole of what its subgraph contributes and text left over
+        from before would be added to it by accident.
+        """
+
+        if not isinstance(subgraph_number, int):
+            raise AssertionError(
+                f"expected subgraph_number to be int, got {type(subgraph_number)}"
+            )
+        if not isinstance(self.subgraphs, list):
+            raise AssertionError(
+                f"expected self.subgraphs to be list, got {type(self.subgraphs)}"
+            )
+        if subgraph_number >= len(self.subgraphs):
+            raise AssertionError(
+                f"Invalid subgraph number provided to create_modification, "
+                f"{subgraph_number} must be < {len(self.subgraphs)}"
+            )
+        if self.body.getvalue() != "":
+            raise AssertionError("Body should be clear before adding a modification")
+        return self.subgraphs[subgraph_number]
+
 
 def _compile_rendered(template, source: str, config: dict, constants: dict,
                       inductor_meta: dict):
