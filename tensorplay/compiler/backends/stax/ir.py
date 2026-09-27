@@ -56,7 +56,12 @@ from .dependencies import (
     extract_read_writes,
     SymbolUsageCollectorOpsHandler,
 )
-from .codegen.common import BackendFeature, CodegenSymbol
+from .loop_body import LoopBody
+from .codegen.common import (
+    BackendFeature,
+    CodegenSymbol,
+    index_prevent_reordering,
+)
 from .ops_handler import OpCounterCSE
 from .runtime.hints import ReductionHint, TileHint
 from .utils import (

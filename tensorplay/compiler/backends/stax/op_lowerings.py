@@ -318,6 +318,29 @@ def in_namespace(op: Any, namespace: str) -> bool:
     return False
 
 
+def _record_symbolic_input_source(tensor, dim, expr, kind) -> None:
+    """Which input a shape expression was read from, and at which element.
+
+    Only an expression that is a plain symbol read out of a region input is
+    worth recording: anything else is either not a symbol or not something a
+    wrapper could bind to a single element of an input.
+    """
+
+    if not isinstance(expr, sympy.Symbol) or not isinstance(tensor, TensorBox):
+        return
+
+    if not isinstance(tensor.data, StorageBox) or not isinstance(
+        tensor.data.data, InputBuffer
+    ):
+        return
+
+    name = tensor.get_name()
+    if name not in V.graph.graph_inputs:
+        return
+
+    V.graph.symbolic_input_sources.setdefault(expr, (name, kind, int(dim)))
+
+
 def fallback_handler(kernel, add_to_fallback_set: bool = True):
     """A way to compute an operation by handing the whole call to the framework.
 

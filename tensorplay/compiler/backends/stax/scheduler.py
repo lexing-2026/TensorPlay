@@ -56,7 +56,7 @@ from tensorplay.graph.experimental.sympy_functions import (
 from .runtime.triton_compat import triton as _triton
 
 from . import comms, config, config_comms, dependencies, ir, metrics
-from .compile_log import trace_structured
+from .compile_log import timed_block, trace_structured
 from .analyze_preserves_zero_mask import can_codegen_without_upcasts
 from .codegen.common import BackendFeature, get_scheduling_for_device, Kernel
 from .comm_analysis import (

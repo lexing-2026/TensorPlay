@@ -12,6 +12,7 @@ written anywhere else would have to be told that.
 """
 
 from __future__ import annotations
+from ..compile_log import timed_block
 
 import contextlib
 import logging

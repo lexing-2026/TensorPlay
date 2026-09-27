@@ -360,10 +360,9 @@ class LoopProgram:
 
     def __call__(self, *args):
         env: dict = {}
-        for position, value in enumerate(args):
-            if position >= len(self.graph.graph_inputs):
-                break
-            buffer = self.graph.graph_inputs[position]
+        for (_, buffer), value in zip(
+            self.graph.graph_inputs_original.items(), args
+        ):
             if buffer is None or value is None:
                 continue
             env[buffer.name] = _input_tensor(buffer, value)

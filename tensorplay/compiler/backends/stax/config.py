@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import contextlib
 import os
+from typing import Literal
+
 import sys
 
 # Whether a loop nest's strides are padded so that every access is aligned to
@@ -792,8 +794,14 @@ class _AotIConfigs:
     assume about its caller is narrower than what a directly-run one may.
     """
 
-    #: Print a value as it is produced, at a level above zero.
-    debug_intermediate_value_printer = 0
+    #: Print a value as it is produced, at a level above zero.  A level is
+    #: written as one of "0" (nothing), "1" (save values), "2" (print values),
+    #: "3" (print kernel names only) -- written as text because the level is
+    #: named by that text where the level is chosen, and read back as that text
+    #: where the level is acted on.
+    debug_intermediate_value_printer: Literal["0", "1", "2", "3"] = os.environ.get(
+        "AOT_INDUCTOR_DEBUG_INTERMEDIATE_VALUE_PRINTER", "0"
+    )
 
     #: Keep the launcher beside the graph rather than emitting it separately,
     #: so that a run may be inspected with the code that launches it.

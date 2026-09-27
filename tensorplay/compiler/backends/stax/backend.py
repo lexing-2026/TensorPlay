@@ -231,6 +231,11 @@ def _lower_stax_region(
             ) from exc
         return graph_module.recompile()
     except Exception as exc:
+        if os.environ.get("TP_STAX_LOWER_DEBUG"):
+            print(
+                f"[stax-lower] unbuilt: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
         if strict:
             raise
         return graph_module.recompile()

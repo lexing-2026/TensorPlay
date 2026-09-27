@@ -236,7 +236,7 @@ class SubgraphChoiceCaller(ChoiceCaller):
             name=f"benchmark_{self.name.replace('::', '_').replace('.', '_')}",
         )
         for symbol in self.sym_inputs:
-            region.graph_inputs.append(symbol)
+            region.graph_inputs[symbol.name] = symbol
             region.graph_input_names.append(str(symbol))
 
         with set_graph(region):

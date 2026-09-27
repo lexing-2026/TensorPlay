@@ -24,7 +24,7 @@ from sympy import Expr
 import tensorplay as tp
 from tensorplay._ops import OpOverload
 
-from .. import config, ir, metrics
+from .. import async_compile, config, ir, metrics
 from .. import loops, sympy_utils
 from ..loops import V
 from ..ir import (

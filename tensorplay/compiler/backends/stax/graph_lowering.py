@@ -441,6 +441,11 @@ class GraphLowering:
         # from whichever graph happens to be current: a region compiled on its
         # own is asked about shapes that the region it came from already knows,
         # and asking the current graph would answer for that one instead.
+        # Which input a shape expression was read from, so a wrapper can bind
+        # that expression to the element it was read out of.  Recorded by
+        # expression rather than by input, because the same expression read
+        # from two inputs needs only one of them bound.
+        self.symbolic_input_sources: dict = {}
         self.shape_env = shape_env
         # Whether the region is being compiled to stand on its own rather than to
         # be part of something larger, which decides what it may assume about
@@ -492,7 +497,7 @@ class GraphLowering:
         # often enough that answering one from the other would be wasteful.
         self.buffers: list[Any] = []
         self.operations: list[Any] = []
-        self.graph_inputs: list[InputBuffer] = []
+        self.graph_inputs: dict = {}
         self.constants: dict[str, Any] = {}
         # Names of the buffers whose contents are overwritten after the fact,
         # and who reads each.
@@ -630,7 +635,7 @@ class GraphLowering:
         inputs, and a name that is not one of them was never declared.
         """
 
-        for buf in self.graph_inputs:
+        for buf in self.graph_inputs_original.values():
             if buf is not None and getattr(buf, "name", None) == name:
                 return buf
         return None
@@ -688,6 +693,21 @@ class GraphLowering:
             self.device_idxs.add(device.index)
         if V.graph.current_node and device not in self.device_node_mapping:
             self.device_node_mapping[device] = V.graph.current_node
+
+    def get_training_phase(self) -> str:
+        """Which of the three passes over a region this is.
+
+        Said by the region rather than worked out where it is needed, because
+        what a printer writes depends on it: a region being run is written one
+        way, a region being trained is written with what it will be trained
+        from, and a region being trained from is written differently again.
+        """
+
+        if self.is_inference:
+            return "inference"
+        if self.is_backward:
+            return "backward"
+        return "forward"
 
     @staticmethod
     def decide_layout_opt(gm, *, is_inference: bool) -> bool:
@@ -1085,7 +1105,7 @@ class GraphLowering:
                 return self.graph_inputs[mutated_buf].get_dtype()
         if buffer_name in self.name_to_buffer:
             return self.name_to_buffer[buffer_name].get_dtype()
-        for buf in self.graph_inputs:
+        for buf in self.graph_inputs_original.values():
             if buf.get_name() == buffer_name:
                 return buf.get_dtype()
         m = re.match(r"(as_strided|reinterpret_tensor)\(([a-zA-Z0-9_]+),", buffer_name)
@@ -1403,8 +1423,66 @@ class GraphLowering:
 
         from .scheduler import Scheduler
 
-        with config.patch({"store_cubin": False}):
+        with config.patch("triton.store_cubin", False):
             self.scheduler = Scheduler(self.operations)
+
+    @property
+    def is_dual_wrapper_mode(self) -> bool:
+        """Whether both a just-in-time and an ahead-of-time form are written.
+
+        Written when the region is being built ahead of time and at least one
+        device in it is written by the kernel-writing printer, since that is the
+        case where the just-in-time form is what tunes the kernels.
+        """
+
+        from . import ir
+
+        if not self.aot_mode or config.triton.autotune_at_compile_time:
+            return False
+        return any(ir.is_triton(d) for d in self.device_types)
+
+    def init_wrapper_code(
+        self,
+        is_subgraph: bool = False,
+        subgraph_name: str | None = None,
+        parent_wrapper_code=None,
+        partition_signatures=None,
+    ) -> None:
+        """Prepare whatever the code for this region is written into.
+
+        A piece compiled on its own is written into a function of its own rather
+        than into the code around it, and what it needs is decided here: that it
+        is a piece, what it is called, and the code it will be called from.
+        Which printer writes it is the device's own, asked of the device -- and
+        a device answers only once it has been equipped, so it is equipped here,
+        before anything can ask.
+        """
+
+        from .codegen.common import get_wrapper_codegen_for_device, init_backend_registration
+
+        init_backend_registration()
+
+        device_types = self.device_types.copy()
+        device_types.discard("cpu")
+        device_types.discard("meta")
+        if len(device_types) > 1:
+            raise AssertionError(
+                "Does not support mixing {}".format("+".join(device_types))
+            )
+        only_cpu = len(device_types) == 0
+        self.device_type = "cpu" if only_cpu else device_types.pop()
+
+        wrapper_code_gen_cls = get_wrapper_codegen_for_device(
+            self.device_type, self.cpp_wrapper, self.fx_wrapper
+        )
+        if wrapper_code_gen_cls is None:
+            raise AssertionError(f"Device {self.device_type} not supported")
+        self.wrapper_code = wrapper_code_gen_cls.create(
+            is_subgraph,
+            subgraph_name,
+            parent_wrapper_code,
+            partition_signatures,
+        )
 
     def codegen(self):
         """Print this region: the kernels, and the program that calls them."""
@@ -1483,53 +1561,6 @@ class GraphLowering:
             f"Unrecognized wrapper code type: {type(wrapper_code)}"
         )
 
-    def compile_to_module(self):
-        """This region as something built, named, and callable on its own.
-
-        What comes back is a built artifact rather than a program object: it knows
-        the key it was built under and the file it was written to, so the same
-        region asked for again is recognised as the same region and the built
-        file is reached rather than rebuilt.  That is what makes a region
-        compiled once and then called many times -- across a measurement, or
-        across a process -- the same work each time rather than a rebuild that
-        happens to agree.
-
-        Declines rather than returning something partial: a region whose printed
-        form the host emitter does not address has no artifact, and an artifact
-        that cannot be entered is worse than none, because the failure would
-        arrive at the first call rather than here.
-        """
-
-        from .loop_compile import host_launches
-
-        # The values the region was handed are its arguments, and a caller that
-        # compiled it with symbols knows some of them by name; a built artifact
-        # is called with them by position, so the names it was given are kept in
-        # that order and a name for one that was not given is made up here.
-        given = list(self.graph_input_names)
-        placeholders = list(self.graph_module.graph.placeholders)
-        self.graph_input_names = [
-            given[position] if position < len(given) else f"in{position}"
-            for position in range(len(placeholders))
-        ]
-
-        # The region is walked here rather than expected to have been walked,
-        # because a built form is asked for after the decision of what to build
-        # rather than instead of it -- and walked exactly once, because walking
-        # settles layouts and a second walk would be a walk of an already
-        # settled region.
-        if not self._walked:
-            self.run()
-            self._walked = True
-
-        launches = host_launches(self)
-        if not launches:
-            raise NotImplementedError(
-                "the region produced no built step, so there is nothing to call"
-            )
-        built = [launch for launch, _inputs, _output in launches]
-        return built[0] if len(built) == 1 else _ModuleOfSteps(built)
-
     def finalize(self) -> None:
         """Settle every buffer's layout, now that the region is all known.
 
@@ -1552,7 +1583,7 @@ class GraphLowering:
             value = self.example_inputs[position]
             if not _is_tensor(value):
                 env[node] = value
-                self.graph_inputs.append(None)
+                self.graph_inputs[node.target] = None
                 continue
             layout = FixedLayout(
                 value.device, value.dtype,
@@ -1563,8 +1594,10 @@ class GraphLowering:
             buffer = InputBuffer(name=f"arg{position}", layout=layout)
             self.name_to_buffer[buffer.name] = buffer
             self.buffers.append(buffer)
-            self.graph_inputs.append(buffer)
-            env[node] = TensorBox(buffer)
+            tensor = TensorBox(buffer)
+            self.graph_inputs[node.target] = tensor
+            self.graph_inputs_original[node.target] = buffer
+            env[node] = tensor
             if self.device is None and value.device.is_cuda():
                 self.device = value.device
 
@@ -1839,25 +1872,6 @@ class GraphLowering:
             yield
         finally:
             self.wrapper_code = old
-
-    def init_wrapper_code(
-        self,
-        is_subgraph: bool = False,
-        subgraph_name: str | None = None,
-        parent_wrapper_code=None,
-        partition_signatures=None,
-    ) -> None:
-        """Prepare whatever the code for this region is written into.
-
-        A piece compiled on its own is written into a function of its own rather
-        than into the code around it, and what it needs is decided here: that it
-        is a piece, what it is called, and the code it will be called from.
-        """
-
-        if not is_subgraph:
-            self.wrapper_code = None
-            return
-        self.wrapper_code = None
 
     def make_subgraph(self, gm, example_inputs, subgraph_name: str):
         """A piece of this region, compiled on its own and called from here.
