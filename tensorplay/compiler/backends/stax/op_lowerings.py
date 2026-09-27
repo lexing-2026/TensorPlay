@@ -1219,6 +1219,23 @@ for _name, _op in {
 }.items():
     LOWERINGS[_name] = _unary(_op)
 
+#: Two raised to a power, and the base-two logarithm.  Not the same operations
+#: as the ones next to them: a kernel that has a device unit for squaring does
+#: not have one for doubling, and a logarithm is a division by a constant
+#: somewhere.  So they are named separately rather than written as the
+#: operations they resemble.
+register_pointwise_numeric("exp2.default", "log2.default")
+LOWERINGS["exp2.default"] = _unary("exp2")
+LOWERINGS["log2.default"] = _unary("log2")
+
+#: Whether two values are the same.  The answer is not a number: comparing two
+#: values is how one of them is chosen, and a value that could be chosen as one
+#: of two numbers is not a number.  So the type is stated here rather than
+#: worked out from the arguments, which is what a comparison of numbers would
+#: give.
+register_pointwise("eq.default", type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.ALWAYS_BOOL)
+LOWERINGS["eq.default"] = _unary("eq")
+
 
 def _binary(_op: str):
     """A lowering of a two-argument operation, one element at a time.
@@ -4458,6 +4475,7 @@ def _view_dtype(x: Any, dtype: Any) -> Any:
     return to_dtype_bitcast(x, dtype)
 
 
+@register("prims::convert_element_type")
 def _convert_element_type(x: Any, dtype: Any) -> Any:
     """The same values turned into another element type.
 
@@ -5209,3 +5227,136 @@ def index_tensor(x: Any, indices: Any) -> Any:
     """
 
     return index_impl(x, indices, check=True)
+
+
+@register_lowering("where.default", broadcast=False, type_promotion_kind=None)
+def lower_where(cond, a, b):
+    """One of two values, chosen by a third.
+
+    The two are promoted against each other and not against the condition,
+    because the condition does not become a value: it says which one to take,
+    and a value that says which to take is not one of the two.  That is why the
+    result is the type the two come to rather than anything the condition
+    brings.
+
+    A number given for either side is made into a value of the other's type
+    first, so that a program which chose between a tensor and a number does not
+    get a result whose type came from the number.
+    """
+
+    from .dtype_propagation import get_promoted_dtype
+
+    if isinstance(a, (float, int)):
+        a = ops.constant(a, b.get_dtype())
+    if isinstance(b, (float, int)):
+        b = ops.constant(b, a.get_dtype())
+
+    args = [cond, a, b]
+    dtype = get_promoted_dtype(
+        args[1], args[2], type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT
+    )
+    indices = [i for i, x in enumerate(args) if isinstance(x, TensorBox)]
+    for i, x in zip(indices, broadcast_tensors(*[args[i] for i in indices])):
+        args[i] = x
+    for i in range(len(args)):
+        if isinstance(args[i], ir.Constant):
+            args[i] = ExpandView.create(args[i], list(args[indices[0]].get_size()))
+    return pointwise(
+        ops.where, to_dtype(args[0], dtype), to_dtype(args[1], dtype), to_dtype(args[2], dtype)
+    )
+
+
+@register_lowering("max.default", type_promotion_kind=None)
+def lower_max(x, dim=None, keepdim=False):
+    """The largest of a set, and where it was.
+
+    Two values rather than one when an axis was named, because a program that
+    asked which is where is asking a different question from what the largest
+    is -- and a caller that only wants the value should not pay for the position.
+    Both are computed here rather than one derived from the other, because a
+    value and the position of a value are found by different means and finding
+    one does not find the other.
+
+    With no axis named it is the largest of everything, which is one value and
+    has no position to report.
+    """
+
+    if dim is not None:
+        return (
+            lower_amax(x, axis=dim, keepdims=keepdim),
+            reduce_argmax(x, axis=dim, keepdims=keepdim),
+        )
+    return lower_amax(x, axis=None, keepdims=keepdim)
+
+
+def convert_symint_to_expr(val: Any) -> Any:
+    """A size as an expression, leaving a number as a number.
+
+    Not the same as turning everything into an expression, which would make a
+    number into an expression that merely happens to be constant: the two are
+    used differently, and a layout that was given a number can be compared with a
+    number.
+    """
+
+    return getattr(val, "node", None) and val.node.expr or val
+
+
+@register_lowering("as_strided.default", type_promotion_kind=None)
+def lower_as_strided(
+    x: Any,
+    size: Any,
+    stride: Any,
+    storage_offset: Any = None,
+    *,
+    storage_offset_relative_to_input_storage: bool = True,
+) -> Any:
+    """The same memory read as a different shape.
+
+    A shape and a set of distances say which element is where without saying
+    where the memory is, so this is a way of reading what is already there rather
+    than a copy.  Which is why the value must already be in memory: there is
+    nothing to read from until it is, and a shape over memory that does not
+    exist is a shape over nothing.
+
+    When what comes in is itself a view, its shape and distances are replaced
+    rather than a second view being stacked on it -- two views of one buffer
+    would have to agree about both, and the outer one is the one being asked
+    for.  The type is carried across, because that is the one thing about the
+    old view that still holds.
+    """
+
+    explicit_storage_offset = (
+        storage_offset is not None and storage_offset_relative_to_input_storage
+    )
+    new_device = None
+    new_dtype = None
+    if isinstance(x, TensorBox) and isinstance(x.data, ir.BaseView):
+        new_device = x.get_device()
+        new_dtype = x.dtype
+        if storage_offset is None and x.maybe_get_layout() is not None:
+            storage_offset = x.get_layout().offset
+        x = x.data.unwrap_view()
+    x.realize()
+    if not ir.is_storage_and_layout(x):
+        raise NotImplementedError(f"unrealized as_strided({x}, ...)")
+    storage, old_layout = ir.as_storage_and_layout(x)
+    storage_offset = (
+        convert_symint_to_expr(storage_offset) if storage_offset is not None else 0
+    )
+    storage_data = storage.data if isinstance(storage, ir.StorageBox) else storage
+    if explicit_storage_offset and isinstance(storage_data, ir.InputBuffer):
+        # A pointer the graph was handed already includes the offset the input
+        # tensor was created with, while an offset named here is from the start
+        # of the storage -- so the one already counted has to come off.
+        storage_offset = sympy.expand(
+            storage_offset
+            - V.graph.graph_input_storage_offsets.get(storage_data.get_name(), 0)
+        )
+    new_layout = ir.FixedLayout(
+        new_device if new_device else old_layout.device,
+        new_dtype if new_dtype else old_layout.dtype,
+        [sympy.expand(s) for s in size],
+        [sympy.expand(s) for s in stride],
+        sympy.expand(storage_offset),
+    )
+    return TensorBox(ir.ReinterpretView(data=storage, layout=new_layout))
