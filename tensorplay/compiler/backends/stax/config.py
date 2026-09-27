@@ -144,7 +144,7 @@ class _TestConfigs:
     max_mm_configs = None
 
     #: The same limit for the shapes a grouped matmul may be measured over.
-    max_flex_configs = None
+    max_omni_configs = None
 
     #: Restrict which measured candidates may be chosen from, by name and by
     #: description.  Both are how a particular machine's answers are pinned

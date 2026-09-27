@@ -9,7 +9,7 @@ from tensorplay.graph import Node
 CuteDSL-specific operation overrides for pointwise operations.
 
 This module provides CuteDSL implementations of common operations used in
-template kernels, particularly for flex attention modifications.
+template kernels, particularly for omni attention modifications.
 """
 
 import dataclasses

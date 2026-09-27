@@ -674,7 +674,7 @@ class ModificationWrapperCuteDSL(WrapperHandler):  # type: ignore[name-defined]
 
     def load(self, name: str, index: sympy.Expr):
         """Handle loading from tensor or fixed(template args) input for CuteDSL."""
-        from ...attention.flex_attention import HierarchicalIndex
+        from ...attention.omni_attention import HierarchicalIndex
 
         if name not in self.fixed_inputs:
             cache_key = (name, index)

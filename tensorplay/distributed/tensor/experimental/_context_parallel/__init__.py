@@ -14,7 +14,7 @@ from ._attention import (
     context_parallel_unshard,
     set_rotate_method,
 )
-from ._cp_custom_ops import flex_cp_allgather, flex_cp_allgather_backward
+from ._cp_custom_ops import omni_cp_allgather, omni_cp_allgather_backward
 from ._load_balancer import (
     _HeadTailLoadBalancer,
     _LoadBalancer,
@@ -35,8 +35,8 @@ __all__ = [
     "context_parallel",
     "context_parallel_unshard",
     "set_rotate_method",
-    "flex_cp_allgather",
-    "flex_cp_allgather_backward",
+    "omni_cp_allgather",
+    "omni_cp_allgather_backward",
     "_HeadTailLoadBalancer",
     "_LoadBalancer",
     "_PerDocumentHeadTailLoadBalancer",

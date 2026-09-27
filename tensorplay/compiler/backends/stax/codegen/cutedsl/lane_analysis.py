@@ -21,7 +21,7 @@ class LaneExprInfo:
     mask/load, lane 0 is the first element in the group and lane 31 is the last.
 
     Attributes:
-        is_uniform: All lanes evaluate to the same value, e.g. for flex-flash``b_idx``.
+        is_uniform: All lanes evaluate to the same value, e.g. for omni-flash``b_idx``.
         is_contiguous: Lanes evaluate to consecutive aligned values for the
             requested width, e.g. ``kv_idx + lane`` when lane 0 is aligned.
         contiguous_width: Largest aligned contiguous power-of-two width proven,

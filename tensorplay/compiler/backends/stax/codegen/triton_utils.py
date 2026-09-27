@@ -237,7 +237,7 @@ def signature_to_meta(
         #
         # Block pointers do not support 64-bit indexing, so keep ks indices in
         # tl.int32 whenever the (deprecated) block-pointer path is actually
-        # active. Templates like flex attention/decoding likewise use
+        # active. Templates like omni attention/decoding likewise use
         # hand-written block pointers, so they also stay on 32-bit ks indexing.
         if (
             not is_template

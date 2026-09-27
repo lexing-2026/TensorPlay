@@ -28,7 +28,7 @@ from ...parallel import ParallelStyle
 from .... import distributed_core as dist
 from .... import _functional_collectives as ft_c
 from .....utils._pytree import tree_flatten, tree_unflatten
-from ._cp_custom_ops import flex_cp_allgather
+from ._cp_custom_ops import omni_cp_allgather
 from ._load_balancer import _LoadBalancer, _create_default_load_balancer
 
 __all__ = [
@@ -880,7 +880,7 @@ def _create_cp_block_mask(
 
 class _ContextParallel(ParallelStyle):
     class AttentionType(Enum):
-        FLEX = "omni_attention"
+        OMNI = "omni_attention"
         SDPA = "scaled_dot_product_attention"
 
     def __init__(self, seq_dim: int, attention_type: AttentionType) -> None:
@@ -889,7 +889,7 @@ class _ContextParallel(ParallelStyle):
         self.attention_type = attention_type
 
     def _apply(self, module: Any, mesh: DeviceMesh) -> Any:
-        if self.attention_type == self.AttentionType.FLEX:
+        if self.attention_type == self.AttentionType.OMNI:
             module.register_forward_pre_hook(partial(self.omni_input_fn, mesh=mesh), with_kwargs=True)
         elif self.attention_type == self.AttentionType.SDPA:
             module.register_forward_pre_hook(partial(self.sdpa_input_fn, mesh=mesh), with_kwargs=True)
@@ -910,7 +910,7 @@ class _ContextParallel(ParallelStyle):
         query, key, value = args_list[:3]
         if not isinstance(query, tp.Tensor) or not isinstance(key, tp.Tensor) or not isinstance(value, tp.Tensor):
             raise AssertionError
-        global_key, global_value = flex_cp_allgather(
+        global_key, global_value = omni_cp_allgather(
             key, value, self.seq_dim, mesh.get_group().group_name
         )
         args_list[1], args_list[2] = global_key, global_value

@@ -7,13 +7,13 @@ from tensorplay.distributed import _functional_collectives as funcol
 from tensorplay import library
 
 __all__ = [
-    "flex_cp_allgather",
-    "flex_cp_allgather_backward",
+    "omni_cp_allgather",
+    "omni_cp_allgather_backward",
 ]
 
 
-@library.custom_op("cplib::flex_cp_allgather", mutates_args=())
-def flex_cp_allgather(
+@library.custom_op("cplib::omni_cp_allgather", mutates_args=())
+def omni_cp_allgather(
     k: Any, v: Any, seq_dim: int, pg_name: Any
 ) -> tuple[Any, Any]:
     k = funcol.all_gather_single(k.contiguous(), seq_dim, group=pg_name)
@@ -26,8 +26,8 @@ def _group_size(pg_name: Any) -> int:
     return int(group.size())
 
 
-@flex_cp_allgather.register_fake
-def _flex_cp_allgather_fake(
+@omni_cp_allgather.register_fake
+def _omni_cp_allgather_fake(
     k: Any, v: Any, seq_dim: int, pg_name: Any
 ) -> tuple[Any, Any]:
     group_size = _group_size(pg_name)
@@ -41,8 +41,8 @@ def _flex_cp_allgather_fake(
     )
 
 
-@library.custom_op("cplib::flex_cp_allgather_backward", mutates_args=())
-def flex_cp_allgather_backward(
+@library.custom_op("cplib::omni_cp_allgather_backward", mutates_args=())
+def omni_cp_allgather_backward(
     grad_full_k: Any, grad_full_v: Any, seq_dim: int, pg_name: Any
 ) -> tuple[Any, Any]:
     grad_k = funcol.reduce_scatter_single(
@@ -54,8 +54,8 @@ def flex_cp_allgather_backward(
     return funcol.wait_tensor(grad_k), funcol.wait_tensor(grad_v)
 
 
-@flex_cp_allgather_backward.register_fake
-def _flex_cp_allgather_backward_fake(
+@omni_cp_allgather_backward.register_fake
+def _omni_cp_allgather_backward_fake(
     grad_full_k: Any, grad_full_v: Any, seq_dim: int, pg_name: Any
 ) -> tuple[Any, Any]:
     group_size = _group_size(pg_name)
@@ -69,23 +69,23 @@ def _flex_cp_allgather_backward_fake(
     )
 
 
-def _flex_cp_allgather_backward_autograd(
+def _omni_cp_allgather_backward_autograd(
     ctx: Any, grad_full_k: Any, grad_full_v: Any
 ) -> tuple[Any, Any, None, None]:
-    grad_k, grad_v = flex_cp_allgather_backward(
+    grad_k, grad_v = omni_cp_allgather_backward(
         grad_full_k, grad_full_v, ctx.seq_dim, ctx.pg_name
     )
     return grad_k, grad_v, None, None
 
 
-def _flex_cp_allgather_setup_context(
+def _omni_cp_allgather_setup_context(
     ctx: Any, inputs: tuple[Any, ...], output: Any
 ) -> None:
     del output
     _, _, ctx.seq_dim, ctx.pg_name = inputs
 
 
-flex_cp_allgather.register_autograd(
-    _flex_cp_allgather_backward_autograd,
-    setup_context=_flex_cp_allgather_setup_context,
+omni_cp_allgather.register_autograd(
+    _omni_cp_allgather_backward_autograd,
+    setup_context=_omni_cp_allgather_setup_context,
 )

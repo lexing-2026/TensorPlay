@@ -266,14 +266,14 @@ def _extract_subgraphs_and_args(
         subgraph_args = tuple(args[3])
         yield args[1], subgraph_args
         yield args[2], subgraph_args
-        # flex_attention currently yields two subgraphs.  The first (the score
+        # omni_attention currently yields two subgraphs.  The first (the score
         # calculation) has a signature starting with a scalar argument of the same dtype
         # as the query (args[0]), followed by four scalar integer arguments and optional
         # additional tensors.  The second (the mask calculation) looks similar, with
         # four scalar integer arguments and optional additional (different) tensors.  We
         # assume this format here (adding some defensive assertions), which means that
         # the only inputs we may need to update are the optional additional tensors. See
-        # tp._higher_order_ops.flex_attention._math_attention_inner for more details.
+        # tp._higher_order_ops.omni_attention._math_attention_inner for more details.
 
         score_subgraph: GraphModule = args[3]
         score_subgraph_args = get_subgraph_args(score_subgraph)
@@ -292,7 +292,7 @@ def _extract_subgraphs_and_args(
                 for a in chain(score_subgraph_args[:5], mask_subgraph_args[:4])
             )
         ):
-            raise AssertionError("flex_attention subgraph arg format has changed!")
+            raise AssertionError("omni_attention subgraph arg format has changed!")
 
         yield score_subgraph, (*score_subgraph_args[:5], *args[7])
         yield args[4][-1], (*mask_subgraph_args[:4], *args[8])
@@ -326,7 +326,7 @@ def _extract_subgraphs_and_args(
             )
         ):
             raise AssertionError(
-                "flex_attention_backward subgraph arg format has changed!"
+                "omni_attention_backward subgraph arg format has changed!"
             )
 
         if fw_subgraph in valid_subgraphs:
@@ -882,7 +882,7 @@ def count_flops_fx(node: Node) -> int | None:
         success, args, kwargs = get_fake_args_kwargs(node)
 
         if success:
-            # flex_attention HOPs have registered formulas, but invoking them
+            # omni_attention HOPs have registered formulas, but invoking them
             # here can require tracing-only context, e.g. TransformGetItemToIndex.
             if node.target in (
             ):
