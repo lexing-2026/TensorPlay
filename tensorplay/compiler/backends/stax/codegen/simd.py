@@ -74,7 +74,13 @@ from ..utils import (
 )
 from ..loops import ops, V
 from .block_analysis import BlockPatternMatcher
-from .common import CSEVariable, index_prevent_reordering, Kernel, PythonPrinter
+from .common import (
+    BackendFeature,
+    CSEVariable,
+    index_prevent_reordering,
+    Kernel,
+    PythonPrinter,
+)
 from .multi_kernel import MultiKernel, SizeHintMultiKernel
 from .simd_kernel_features import (
     DisableReduction,
@@ -2279,6 +2285,19 @@ class SIMDScheduling(BaseScheduling):
 
     kernel_type: type[Any] = SIMDKernel  # override in subclass
     supports_sub_parent_epilogue = False
+
+    #: What this emitter can express, asked of the emitter rather than of the
+    #: region being compiled, so that a lowering which depends on one of these
+    #: can find out whether it is available before relying on it.
+    backend_features = OrderedSet(
+        [
+            BackendFeature.INPLACE_BUFFERS,
+            BackendFeature.TRITON_TEMPLATES,
+        ]
+    )
+
+    def get_backend_features(self, device) -> "OrderedSet[BackendFeature]":
+        return self.backend_features
 
     def group_fn(self, sizes):
         return tuple(V.graph.sizevars.simplify(sympy_product(s)) for s in sizes)

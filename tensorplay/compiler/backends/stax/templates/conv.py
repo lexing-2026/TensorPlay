@@ -42,7 +42,11 @@ from .mm_common import load_kernel_template, use_triton_template
 
 from ..heuristics.template.params import DictKernelTemplateParams, KernelTemplateParams
 
-from .select_algorithm import ExternKernelChoice, autotune_select_algorithm
+from .select_algorithm import (
+    autotune_select_algorithm,
+    ExternKernelChoice,
+    TritonTemplate,
+)
 
 def _pair(value, count: int) -> list:
     if isinstance(value, int):
@@ -923,11 +927,9 @@ framework = tp.ops.tp
 #: The templates this module owns, named for what each computes.  A template is
 #: an object and a choice is a template with a configuration attached, so these
 #: are the templates: what a candidate list is built out of.
-conv2d_template = CONV
-
-#: The template for a call with a depth to it.  The same template as the
-#: two-dimensional one, because what a kernel is given is the kernel's extents
-#: and there is nothing about the third of them that changes the kernel's shape.
+#: The two-dimensional call written as a template: the kernel is written from
+#: the call's own geometry, so several shapes of it can be measured against one
+#: another and the one that runs fastest on this device is the one kept.
 conv3d_template = CONV
 
 #: The template for a call that reduces the contracted axis away.
@@ -959,6 +961,129 @@ def conv2d_grid(n, c, h, w, meta, *, cdiv):
     return (cdiv(n * h * w, meta["BLOCK_M"]), cdiv(c, meta["BLOCK_N"]), meta["GROUPS"])
 
 
+
+LOOP_BODY_2D = """
+        idx_x_h = i - PADDING_H + idx_y_h * STRIDE_H
+        idx_x_w = j - PADDING_W + idx_y_w * STRIDE_W
+        idx_x_c = tl.arange(0, BLOCK_K) + k
+
+        x_ptrs = x_base + (
+            (idx_x_h * stride_xh)[:, None]
+            + (idx_x_w * stride_xw)[:, None]
+            + (idx_x_c * stride_xc)[None, :]
+        )
+        mask_x = (
+            (idx_n < BATCH)[:, None]
+            & (idx_x_h >= 0)[:, None]
+            & (idx_x_h < IN_H)[:, None]
+            & (idx_x_w >= 0)[:, None]
+            & (idx_x_w < IN_W)[:, None]
+            & (idx_x_c < GROUP_IN_C)[None, :]
+        )
+        matrix_x = tl.load(x_ptrs, mask=mask_x, other=0.0)
+
+        w_ptrs = w_base + (
+            (idx_x_c * stride_wc_in)[:, None] + (i * stride_wh) + (j * stride_ww)
+        )
+        mask_w = (idx_x_c[:, None] < GROUP_IN_C) & (idx_y_c[None, :] < GROUP_OUT_C)
+        matrix_w = tl.load(w_ptrs, mask=mask_w, other=0.0)
+        acc += tl.dot(matrix_x, matrix_w, allow_tf32=ALLOW_TF32)
+"""
+
+conv2d_template = TritonTemplate(
+    name="convolution2d",
+    grid=conv2d_grid,
+    source=r"""
+{{def_kernel("X", "W")}}
+    # Tensor dimensions
+    BATCH = {{size("X", 0)}}
+    IN_C = {{size("X", 1)}}
+    IN_H = {{size("X", 2)}}
+    IN_W = {{size("X", 3)}}
+    OUT_C = {{size(None, 1)}}
+    OUT_H = {{size(None, 2)}}
+    OUT_W = {{size(None, 3)}}
+
+    # Strides:
+    stride_xn = {{stride("X", 0)}}
+    stride_xc = {{stride("X", 1)}}
+    stride_xh = {{stride("X", 2)}}
+    stride_xw = {{stride("X", 3)}}
+    stride_wc_out = {{stride("W", 0)}}
+    stride_wc_in = {{stride("W", 1)}}
+    stride_wh = {{stride("W", 2)}}
+    stride_ww = {{stride("W", 3)}}
+
+    nhw = tl.program_id(0).to(INDEX_DTYPE) * BLOCK_M + tl.arange(0, BLOCK_M)
+    idx_y_w = nhw % OUT_W
+    nh = nhw // OUT_W
+    idx_y_h = nh % OUT_H
+    idx_n = nh // OUT_H
+    idx_y_c = tl.program_id(1).to(INDEX_DTYPE) * BLOCK_N + tl.arange(0, BLOCK_N)
+
+{% if GROUPS == 1 %}
+    group = 0
+    GROUP_IN_C = IN_C
+    GROUP_OUT_C = OUT_C
+{% else %}
+    group = tl.program_id(2).to(INDEX_DTYPE)
+    GROUP_IN_C = IN_C // GROUPS
+    GROUP_OUT_C = OUT_C // GROUPS
+{% endif %}
+
+    x_base = X + (group * stride_xc * GROUP_IN_C + idx_n * stride_xn)[:, None]
+    w_base = (
+        W + (group * stride_wc_out * GROUP_OUT_C + idx_y_c * stride_wc_out)[None, :]
+    )
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+{% if UNROLL %}
+{% for i in range(KERNEL_H) %}
+{% for j in range(KERNEL_W) %}
+    i = {{i}}
+    j = {{j}}
+    for k in range(0, GROUP_IN_C, BLOCK_K):
+        """
+    + LOOP_BODY_2D
+    + """
+{% endfor %}
+{% endfor %}
+{% else %}
+    # Could be simplified, but slightly slower:
+    # for i in range(KERNEL_H):
+    #     for j in range(KERNEL_W):
+    #         for k in range(0, GROUP_IN_C, BLOCK_K):
+    BLOCK_K_COUNT = (GROUP_IN_C + BLOCK_K - 1) // BLOCK_K
+    for ijk in range(KERNEL_H * KERNEL_W * BLOCK_K_COUNT):
+        k = (ijk % BLOCK_K_COUNT) * BLOCK_K
+        ij = ijk // BLOCK_K_COUNT
+        i = ij // KERNEL_W
+        j = ij % KERNEL_W
+        """
+    + LOOP_BODY_2D
+    + """
+{% endif %}
+
+    mask = (
+        (idx_n < BATCH)[:, None]
+        & (idx_y_h < OUT_H)[:, None]
+        & (idx_y_w < OUT_W)[:, None]
+        & (idx_y_c < GROUP_OUT_C)[None, :]
+    )
+    idx_n = idx_n[:, None]
+    idx_c = idx_y_c[None, :] + group * GROUP_OUT_C
+    idx_h = idx_y_h[:, None]
+    idx_w = idx_y_w[:, None]
+
+    # A suffix is generated to keep this kernel's name apart.
+    {{store_output(("idx_n", "idx_c", "idx_h", "idx_w"), "acc", "mask", val_shape=("BLOCK_M", "BLOCK_N"))}}
+""",
+)
+
+#: The template for a call with a depth to it.  The same template as the
+#: two-dimensional one, because what a kernel is given is the kernel's extents
+#: and there is nothing about the third of them that changes the kernel's shape.
 @SymbolicGridFn
 def conv3d_grid(n, c, d, h, w, meta, *, cdiv):
     """The same, for a call with a depth to it."""

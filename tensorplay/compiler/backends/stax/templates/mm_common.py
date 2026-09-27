@@ -31,6 +31,17 @@ import sympy
 import tensorplay as tp
 
 from .. import config
+from ..codegen.common import BackendFeature, get_backend_features
+
+
+def has_backend_feature(device, feature) -> bool:
+    """Whether the emitter for this device can do this.
+
+    Asked of the emitter rather than of the region, so a lowering that depends
+    on one of these can find out whether it is there before relying on it.
+    """
+
+    return feature in get_backend_features(device)
 from ..ir import Layout
 from ..loops import V
 from ..heuristics.template.base import SymbolicGridFn
@@ -578,7 +589,9 @@ def use_triton_template(
         or (layout.device.type == "cpu" and layout.dtype in layout_dtypes)
     ) and (
         config.max_autotune or config.max_autotune_gemm or (not check_max_autotune)
-    ) and _use_autotune_backend("TRITON")
+    ) and _use_autotune_backend("TRITON") and has_backend_feature(
+        layout.device, BackendFeature.TRITON_TEMPLATES
+    )
 
 
 def use_triton_tma_template(

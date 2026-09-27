@@ -527,11 +527,17 @@ def init_backend_registration() -> None:
     if get_scheduling_for_device("cpu") is not None:
         return
     from .cpp import CppScheduling
+    from .simd import SIMDScheduling
     from .wrapper import PythonWrapperCodegen
 
     register_backend_for_device(
         "cpu",
         lambda scheduling: CppScheduling(scheduling),
+        PythonWrapperCodegen,
+    )
+    register_backend_for_device(
+        "cuda",
+        lambda scheduling: SIMDScheduling(scheduling),
         PythonWrapperCodegen,
     )
 
@@ -606,6 +612,10 @@ class BackendFeature(Enum):
     #: starts from an arbitrary value, rather than needing a separate value to
     #: start from.  Without this the starting value has to be materialized.
     REDUCE_TO_SINGLE_ELEMENT = auto()
+    #: A kernel is offered as a template, written from the geometry rather than
+    #: fixed, so that the same call can be measured over several shapes of it
+    #: and the one that runs fastest on this device is the one kept.
+    TRITON_TEMPLATES = auto()
 
 
 #: What each emitter declares.  Order is the preference order: the first
