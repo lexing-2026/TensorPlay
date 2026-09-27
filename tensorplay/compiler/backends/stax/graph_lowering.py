@@ -560,7 +560,6 @@ class GraphLowering:
         self.fallback_ops: list = []
         self.backend_features: set = set()
         # The pieces of this region that are compiled on their own.
-        self.used_features: set = set()
         # Whether values made only of constants are made by running the
         # operations rather than while the code is being written.
         self.use_runtime_constant_folding = False
@@ -1388,16 +1387,7 @@ class GraphLowering:
         arrive at the first call rather than here.
         """
 
-        from .codegen.common import select_backend
         from .loop_compile import host_launches
-
-        needed = frozenset(self.used_features)
-        device = self.device.type if self.device is not None else "cpu"
-        if select_backend(needed, device) != "cpp":
-            raise NotImplementedError(
-                f"this region needs {sorted(str(f) for f in needed)}, which the "
-                f"host emitter does not address on {device}, so it has no built form"
-            )
 
         # The values the region was handed are its arguments, and a caller that
         # compiled it with symbols knows some of them by name; a built artifact
