@@ -11,6 +11,7 @@ which table a device reads is declared beside the tables themselves.
 from __future__ import annotations
 
 from .ir import next_power_of_2
+from .. import config
 from ..heuristics.template.base import TemplateConfigHeuristics
 
 from dataclasses import dataclass, field
@@ -46,6 +47,22 @@ class BaseConfig:
             "BLOCK_N": self.block_n,
             "BLOCK_K": self.block_k,
         }
+
+
+@dataclass
+class FlexDecodeConfig:
+    """A tile for attention that asks one question at a time.
+
+    No contraction tile: there is no contraction here.  The query axis is one
+    row wide, so the only extent worth choosing is how far along the keys one
+    program walks, and the two things that go with it.
+    """
+
+    block_n: int
+    num_stages: int
+    num_warps: int
+
+
 @dataclass
 class GemmConfig(BaseConfig):
     """A product's tile shape, and how many tiles share their operands.
@@ -363,6 +380,52 @@ class _TileConfigHeuristic(TemplateConfigHeuristics):
             TritonConfig(c.tile(), c.num_stages, c.num_warps)
             for c in self.depthwise_conv_configs
         ]
+
+    def get_flex_decode_configs(
+        self, head_dim: int, dtype: Any
+    ) -> list[FlexDecodeConfig]:
+        """The tilings for attention that asks one question at a time.
+
+        Three when the widest search was asked for, and the one that is always
+        there otherwise.  The three are the same width walked at three different
+        depths: a narrow walk needs more steps to cross the keys and a wide one
+        wastes a row that is mostly masked away, and which is better is a fact
+        about how many keys there are -- so all three are offered and measured
+        rather than one being chosen here.
+
+        The one always offered is a walk of sixty-four at the shallowest depth,
+        because a kernel that is not measured at all has to be able to run.
+        """
+
+        flex_decode_configs: list[FlexDecodeConfig] = []
+
+        if config.max_autotune:
+            if config.max_autotune_flex_search_space == "EXHAUSTIVE":
+                return self.exhaustive_flex_decode_configs
+            flex_decode_configs += self.flex_decode_autotune_configs
+
+        default_config = FlexDecodeConfig(block_n=64, num_stages=1, num_warps=2)
+
+        if default_config not in flex_decode_configs:
+            flex_decode_configs.append(default_config)
+
+        return flex_decode_configs
+
+    #: The three tilings offered when the widest search was asked for, read as
+    #: (keys per program, stages, warps).
+    flex_decode_autotune_configs: tuple = (
+        FlexDecodeConfig(64, 3, 2),
+        FlexDecodeConfig(32, 3, 2),
+        FlexDecodeConfig(128, 3, 2),
+    )
+    #: Every tiling the table implies rather than names, for the exhaustive
+    #: search.
+    exhaustive_flex_decode_configs: tuple = tuple(
+        FlexDecodeConfig(block_n, num_stages, num_warps)
+        for block_n in (16, 32, 64, 128)
+        for num_stages in (1, 3, 4, 5)
+        for num_warps in (2, 4, 8)
+    )
 
     #: The product tilings.  Read as (M, N, K, stages, warps).
     mm_configs: tuple = ()

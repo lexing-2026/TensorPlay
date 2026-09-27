@@ -433,6 +433,15 @@ max_autotune = os.environ.get("TP_MAX_AUTOTUNE", "0") == "1"
 # layer, so what it costs is paid by the whole model rather than by one line.
 max_autotune_gemm = os.environ.get("TP_MAX_AUTOTUNE_GEMM", "0") == "1"
 
+# How wide the search for attention tiles is when everything is being measured.
+# Two answers rather than a number, because the two are not more and fewer: the
+# default offers the handful of tilings worth offering, and the exhaustive one
+# offers every combination of the extents -- which is a different question, not
+# a longer answer to the same one.
+max_autotune_flex_search_space = os.environ.get(
+    "TP_MAX_AUTOTUNE_FLEX_SEARCH_SPACE", "DEFAULT"
+).upper()
+
 # Which backends a measured product may be chosen from, as a list to add to or
 # take from rather than a switch.  Naming them is what makes a measurement
 # answerable: a product measured against the library's own kernel and a product
@@ -1039,6 +1048,14 @@ class _TritonConfig:
     #: being asked whether spreading it is worth it.  Said here so that a
     #: program that wanted it does not have to say it per call.
     force_cooperative_reductions = False
+
+    #: A reduction small enough to be finished by one launch may be, rather than
+    #: being stepped over in pieces and combined afterwards.  On by default: a
+    #: reduction that is not spread is the ordinary case, and a switch left off
+    #: would make the ordinary case the one that had to be asked for.
+    persistent_reductions = (
+        os.environ.get("TP_PERSISTENT_REDUCTIONS", "1") == "1"
+    )
 
     #: Choose among the tunings while the graph is being built, rather than at
     #: the first launch.  Left unset, the choice is made at the first launch.
