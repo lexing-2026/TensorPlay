@@ -11583,11 +11583,12 @@ class View(GenericView):
 
         old_stride = old_layout.stride
 
+        from .utils import _compute_stride
+
         old_size_symint = V.graph.sizevars.to_symints_or_ints(old_size)
         old_stride_symint = V.graph.sizevars.to_symints_or_ints(old_stride)
         new_size_symint = V.graph.sizevars.to_symints_or_ints(new_size)
 
-        from tensorplay._subclasses.fake_impls import _compute_stride
 
         # An extent that came out of the data is compared without a guard,
         # since there is nothing to guard on until it runs.

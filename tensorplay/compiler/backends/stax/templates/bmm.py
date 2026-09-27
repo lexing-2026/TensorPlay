@@ -214,7 +214,10 @@ def tuned_bmm(mat1, mat2, out_dtype=None, *, layout=None, plain=None):
 
     from .mm_common import mm_args
 
-    _m, n, k, out_layout = mm_args(mat1, mat2, layout=layout)
+    # What this needs of a product's two operands is the extents, the
+    # contraction, and the layout the result will have; the rest of the
+    # answer is the operands themselves, which are already in hand.
+    _m, n, k, out_layout = mm_args(mat1, mat2, layout=layout)[:4]
     template = bmm_shared_a_template if _use_bmm_shared_a(
         mat1, mat2, out_layout
     ) else bmm_template
@@ -224,8 +227,8 @@ def tuned_bmm(mat1, mat2, out_dtype=None, *, layout=None, plain=None):
         tuple(int(v) for v in mat2.get_size()),
     )
     meta = {
-        "out_size": tuple(int(v) for v in out_layout.get_size()),
-        "out_dtype": str(out_layout.get_dtype() if out_dtype is None else out_dtype),
+        "out_size": tuple(int(v) for v in out_layout.size),
+        "out_dtype": str(out_layout.dtype if out_dtype is None else out_dtype),
         "device": out_layout.get_device(),
         "operand_specs": specs,
         "operand_sizes": sizes,
