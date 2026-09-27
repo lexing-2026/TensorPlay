@@ -231,6 +231,24 @@ def _philox_seed_impl(
     return tensorplay.stack([seed_t, offset_t])
 
 
+def _read_at_position(size, device, dtype):
+    """Random values of a shape and type, read where the stream already is.
+
+    Asked of the framework with the recording modes set aside, because this is
+    one of the reads the table of decompositions writes the framework's own
+    random operations in terms of: going through the table would expand the
+    read into another read at a position, and that one into another, for as
+    long as the graph is traced.  Where a graph says where it reads from, the
+    read that follows is the framework's own rather than part of the graph,
+    which is where the position it was handed comes from.
+    """
+
+    from tensorplay.utils._dispatch import _disable_current_modes
+
+    with _disable_current_modes():
+        return tensorplay.rand(size, device=device, dtype=dtype)
+
+
 def _philox_rand_impl(
     size,
     seed: "tensorplay.Tensor",
@@ -264,9 +282,15 @@ def _philox_rand_impl(
             f"philox_rand is only written for a graphics device, got {device.type}"
         )
 
+    # The position to read at is already two values rather than a question
+    # for a generator, so reading at it is not the random operation a graph
+    # would otherwise be written in terms of: asking the framework for random
+    # values here would ask the question this call has already answered, and
+    # the answer is this call.  The read therefore goes to the framework's own
+    # rather than through the decomposition that would ask again.
     with tensorplay.random.fork_rng(devices=[]):
         CUDARngStateHelper.set_torch_state_tensor(seed, offset)
-        values = tensorplay.rand(size, device=device, dtype=dtype)
+        values = _read_at_position(size, device, dtype)
     # What comes back is how many values were read, not where the stream now
     # is: the count is what a caller adds to what it has already read, and a
     # position is not something two different readers could add to the same

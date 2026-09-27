@@ -31,6 +31,26 @@ class UnsupportedAliasMutationException(RuntimeError):
     reason: str
 
 
+def unique_graph_name_with_root(root, prefix: str) -> tuple[int, str]:
+    """The first name under ``prefix`` the module does not already answer to.
+
+    A sub-graph is given a name that is free, so that adding a second graph
+    beside a first does not have the second answer to the first's name.  The
+    number that goes with the name is how many names were already taken, which
+    is what the sub-graph is numbered from.
+    """
+
+    next_name = None
+    i = 0
+    while not next_name:
+        candidate = f"{prefix}_{i}"
+        if hasattr(root, candidate):
+            i += 1
+        else:
+            next_name = candidate
+    return i, next_name
+
+
 def autograd_not_implemented_inner(
     operator: Callable[..., Any], delayed_error: bool, *args: Any, **kwargs: Any
 ) -> Any:

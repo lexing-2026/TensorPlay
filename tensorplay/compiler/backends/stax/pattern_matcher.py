@@ -1465,6 +1465,7 @@ class ReplacementPatternEntry(PatternEntry):
         """
 
         added_replacement_nodes: list[Any] = []
+        replacement_constants: list[tuple[str, Any]] = []
         custom_context = _common_custom_context(match.nodes)
 
         class Replacer(Interpreter):
@@ -1504,9 +1505,16 @@ class ReplacementPatternEntry(PatternEntry):
 
                     sub_gm = super().get_attr(target, args, kwargs)
                     if not isinstance(sub_gm, GraphModule):
-                        raise NotImplementedError(
-                            f"NYI: replacement_graph.{target} is not a graph module. Got {sub_gm}."
-                        )
+                        # A value the traced body was handed that no
+                        # placeholder stands for -- a captured value, or one
+                        # the caller specialised -- is held on the root and
+                        # found by name.  Nothing computes it, so it cannot
+                        # become a node: it is an argument of the graph being
+                        # written, and the call is handed it.
+                        replacement_constants.append((target, sub_gm))
+                        const_node = graph.placeholder(target)
+                        added_replacement_nodes.append(const_node)
+                        return const_node
                     if graph.owning_module is None:
                         raise AssertionError("graph.owning_module is None")
                     graph_name = None
@@ -1570,7 +1578,8 @@ class ReplacementPatternEntry(PatternEntry):
                 raise AssertionError(
                     f"expected GraphModule, got {type(replacement_graph)}"
                 )
-            replacement = Replacer(replacement_graph).run(*args)
+            const_values = [value for _, value in replacement_constants]
+            replacement = Replacer(replacement_graph).run(*args, *const_values)
             if isinstance(replacement, Node):
                 replacement = [replacement]
 
