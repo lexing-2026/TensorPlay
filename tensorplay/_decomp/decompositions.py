@@ -2060,6 +2060,32 @@ def _fused_rms_norm_backward(grad_out, input, normalized_shape, rstd, weight, ou
     return d_input, d_weight
 
 
+# Dropout is one operation to the caller and two to the machine: the values
+# that were kept, and the record of which those were, which the backward needs
+# and which the caller has no use for.  So what the caller gets is written in
+# terms of the pair, and the pair is what the graph below records.
+@register_decomposition(ops.dropout.default)
+def dropout(input, p: float, train: bool | None = None):
+    if train and p != 0:
+        return ops.native_dropout.default(input, p)[0]
+    return input
+
+
+@register_decomposition(ops.native_dropout.default)
+def native_dropout(input, p: float):
+    if p != 0:
+        if p == 1:
+            return (tp.zeros_like(input), tp.zeros_like(input, dtype=tp.bool))
+        if not input.dtype.is_floating_point:
+            raise RuntimeError(
+                "result type Float can't be cast to the desired output type Long"
+            )
+        bool_mask = tp.rand_like(input) > p
+        res = bool_mask * input * float(1.0 / (1.0 - p))
+        return (res, bool_mask)
+    return (input, tp.ones_like(input, dtype=tp.bool))
+
+
 @register_decomposition(ops.native_dropout_backward.default)
 def native_dropout_backward(grad_output, mask, scale):
     return grad_output * (mask.to(grad_output.dtype) * scale)
