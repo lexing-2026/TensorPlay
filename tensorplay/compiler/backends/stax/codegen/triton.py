@@ -60,6 +60,9 @@ from .triton_utils import (
     use_block_ptr_enabled,
     use_uint8_triton_storage_for_cuda_float8_e4m3fn,
 )
+from ..codecache import PyCodeCache, write_atomic
+from ..runtime.benchmarking import benchmarker, get_interface_for_device
+from ..runtime.example_values import preserve_rng_state
 from ..runtime.hints import (
     TRITON_MAX_BLOCK,
     TRITON_MAX_RSPLIT,
@@ -8712,6 +8715,123 @@ class TritonScheduling(SIMDScheduling):
                 kernel_name,
             )
             wrapper.write_provenance_debug_handle(kernel_name, debug_handle)
+
+    def benchmark_fused_nodes(self, nodes, n_spills_threshold=8):
+        """Measure a set of fused nodes as one kernel, and say how long it took.
+
+        Measured on randomly generated inputs, because the point is how long the
+        work takes rather than what it produces, and inputs that were the ones
+        the region happened to be given would already be warm.
+        """
+
+        src_code = self.generate_kernel_code_from_nodes(nodes, benchmark_kernel=True)
+        mod = PyCodeCache.load(src_code)
+        return self.benchmark_codegened_module(
+            mod, n_spills_threshold, node_names=OrderedSet(n.get_name() for n in nodes)
+        )
+
+    def benchmark_codegened_module(
+        self,
+        mod,
+        n_spills_threshold=8,
+        node_names=None,
+        skip_perf_cache=False,
+    ):
+        """Measure a module that has already been compiled, and where it was written.
+
+        The answer is kept beside the file the module was written to, so a
+        measurement is made once however many times the module is loaded.  A
+        caller that needs the measurement's own effect -- which configuration the
+        measurement settled on, not only how long it took -- asks not to be
+        served from it, because being served returns before the measuring
+        happened at all.
+        """
+
+        device_interface = get_interface_for_device(V.graph.device_type)
+        with (
+            preserve_rng_state(),
+            device_interface.device(V.graph.get_current_device_or_throw()),
+        ):
+            ms = None
+
+            def cache_file_path():
+                if mod.__file__ is None:
+                    raise AssertionError("mod.__file__ must not be None")
+                return os.path.splitext(mod.__file__)[0] + ".kernel_perf"
+
+            def store_cache():
+                path = cache_file_path()
+                write_atomic(path, str(ms))
+
+            def load_cache():
+                path = cache_file_path()
+                if os.path.exists(path):
+                    with open(path) as fd:
+                        return float(fd.read())
+                return None
+
+            node_names = node_names if node_names is not None else OrderedSet(["unknown"])
+            log.debug(
+                "kernel src code for %s written to: %s",
+                node_names,
+                mod.__file__,
+            )
+            if not skip_perf_cache:
+                ms = load_cache()
+                if ms is not None:
+                    return ms, mod.__file__
+
+            args = mod.get_args()
+            call = mod.call
+            wrapped_jit_function = mod.triton_
+            # Called once before it is measured, so that the compilation is not
+            # part of what is being measured.
+            try:
+                call(wrapped_jit_function.clone_args(*args)[0])
+            except Exception as e:
+                if config.triton.disallow_failing_autotune_kernels_TESTING_ONLY:
+                    raise
+                log.debug(
+                    "Exception (%s) in compiling fused nodes %s",
+                    e,
+                    node_names,
+                )
+                ms = float("inf")
+                store_cache()
+                return ms, mod.__file__
+
+            launchers = wrapped_jit_function.launchers
+            if len(launchers) != 1:
+                raise AssertionError(f"expected 1 launcher, got {len(launchers)}")
+            # A kernel that spilled is not thereby unprofitable, and the count
+            # is not always right, so this is a reason to measure and not to
+            # decide.
+            if launchers[0].n_spills > n_spills_threshold:
+                ms = float("inf")
+            else:
+                device = V.graph.get_current_device_or_throw()
+                # The arguments are copied per call, so that an earlier call
+                # writing into one cannot leave a later call reading out of
+                # range.
+                ms = benchmarker.benchmark(
+                    lambda: call(wrapped_jit_function.clone_args(*args)[0]),
+                    device=device,
+                )
+                # Copying the arguments costs time, which would be charged to
+                # this kernel: so it is measured on its own and taken back off.
+                if len(wrapped_jit_function.mutated_arg_names) > 0:
+                    ms = ms - benchmarker.benchmark(
+                        lambda: wrapped_jit_function.clone_args(*args),
+                        device=str(device),
+                    )
+
+            log.debug(
+                "The fused kernel for %s took %.3f ms to run",
+                node_names,
+                ms,
+            )
+            store_cache()
+            return ms, mod.__file__
 
     def create_kernel_choices(
         self,
