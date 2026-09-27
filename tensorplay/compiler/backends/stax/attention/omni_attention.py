@@ -815,947 +815,254 @@ def patch_fixed_layout_indexer_for_cutedsl() -> Any:
         FixedLayout.make_indexer = original_make_indexer
 
 
-def wrap_choice_render_with_cutedsl_indexer(choice: Any) -> None:
-    """Have a kernel written with positions naming dimensions.
+@contextlib.contextmanager
+def writing_with_omni_indexer() -> Any:
+    """Have whatever is written inside name dimensions rather than offsets.
 
-    The change is around the writing rather than inside it, so that a choice
-    that was not wrapped is written the way every other kernel is -- which is
-    what makes this something to apply to the ones that need it rather than a
-    property of how kernels are written.
+    Around the writing rather than inside it, so that anything written outside is
+    written the way every other kernel is -- which is what makes this something
+    to apply to the kernels that need it rather than a property of how kernels
+    are written here.
     """
 
-    original_make_kernel_render = choice.make_kernel_render
+    with patch_fixed_layout_indexer_for_cutedsl():
+        yield
 
-    def make_kernel_render_with_patch(*args: Any, **kwargs: Any) -> Any:
-        render_kernel, render = original_make_kernel_render(*args, **kwargs)
 
-        def render_with_patch() -> Any:
-            with patch_fixed_layout_indexer_for_cutedsl():
-                return render()
+def generate_omni_flash_choice(template: Any, **kwargs: Any) -> Any:
+    """Write one way of the kernel, with positions naming dimensions.
 
-        return render_kernel, render_with_patch
+    A failure is passed back rather than raised, because a way of writing a
+    kernel that this device cannot run is not an error -- it is one fewer thing
+    to measure among several, and the rest may still be the one that wins.
+    """
 
-    choice.make_kernel_render = make_kernel_render_with_patch
+    with patch_fixed_layout_indexer_for_cutedsl():
+        return template.generate(**kwargs)
 
 
 # ---------------------------------------------------------------------------
-# Whether this kernel may be used here
+# Configurations
 # ---------------------------------------------------------------------------
 
 
-def _can_use_omni_flash_attention(
-    subgraph: Any, mask_graph: Any, num_score_mod_placeholders: int
+def get_omni_flash_fwd_configs(
+    has_score_mod: bool,
+    has_aux_tensors: bool,
+    device: Any = None,
+    score_mod_graph_module: Any = None,
+    score_mod_other_buffers: Any = (),
+    has_mask_mod: bool = False,
+    has_mask_aux_tensors: bool = False,
+    mask_mod_graph_module: Any = None,
+    mask_mod_other_buffers: Any = (),
+    aux_scalar_symbols: Any = (),
 ) -> Any:
-    """Whether this kernel can be written for what it was handed, and why not.
+    """The ways the forward kernel may be written, widest mask last.
 
-    The reason is returned alongside the answer rather than raised, because
-    whether the kernel can be used is asked in order to choose a different one --
-    and a choice cannot be made from an error.
+    Whether a mask can be read several positions at a time is a property of the
+    device as well as of the mask: the wide reads it needs are not written on
+    every device.  So the device is asked before the width is chosen, rather
+    than the width being chosen and then found not to be readable.
+
+    A mask that could be written as ranges of positions is written that way
+    whatever else was decided about its width, because that is the width the
+    ranges are written at -- the two are the same decision, and asking about
+    them separately is how they come to disagree.
+
+    A score that reads nothing captured is not held to any width, and when the
+    search is measuring it is offered every width the kernel supports: nothing
+    in the graph says which is best, and that is what a measurement is for.
     """
 
-    if not ensure_flash_available():
-        return False, _flash_attention_unavailable_message()
+    from ..codegen.cutedsl.aux_scalars import CuteDSLAuxScalarBindings
 
-    if input_buffers_require_grads(subgraph.graph_module, num_score_mod_placeholders):
-        return (
-            False,
-            "Input buffers require gradients (not supported by flash attention)",
-        )
-
-    return True, ""
-
-
-def _use_omni_flash_attention(
-    subgraph: Any,
-    mask_graph: Any,
-    kernel_options: Any,
-    num_score_mod_placeholders: int,
-    backend: Any,
-) -> bool:
-    """Whether to write this kernel rather than the other one.
-
-    Only when it was asked for by name.  A kernel that is faster is not the same
-    as a kernel that may be used instead: this one is new enough that using it
-    where nobody asked would mean answering a question nobody posed.
-
-    Asked for and not usable is an error rather than a fallback, because a
-    caller that named this one and silently got the other has been told
-    something false about how their program was compiled.
-    """
-
-    if backend != "FLASH":
-        return False
-
-    can_use, reason = _can_use_omni_flash_attention(
-        subgraph,
-        mask_graph,
-        num_score_mod_placeholders,
-    )
-
-    if not can_use:
-        raise RuntimeError(
-            f"BACKEND='FLASH' but flash attention cannot be used: {reason}"
-        )
-
-    return True
-
-
-def _can_use_omni_flash_attention_backward(
-    fw_subgraph: Any,
-    mask_graph: Any,
-    joint_outputs: Any = None,
-    score_mod_other_buffers: Any = None,
-    num_score_mod_placeholders: int = 5,
-) -> Any:
-    """Whether the backward pass can be written for what it was handed.
-
-    The backward pass reads the forward one's values, so it is refused for the
-    same reasons the forward one is -- and refused for two more, because a
-    gradient that was captured or that changed something is a gradient whose
-    origin this pass cannot yet account for.
-    """
-
-    if not ensure_flash_available():
-        return False, _flash_attention_unavailable_message()
-
-    if input_buffers_require_grads(
-        fw_subgraph.graph_module, num_score_mod_placeholders
+    cuda_major = None
+    if tp.cuda.is_available() and (
+        has_mask_mod or (has_score_mod and has_aux_tensors)
     ):
-        return (
-            False,
-            "Input buffers require gradients (not supported by flash attention backward)",
+        device_index = None if device is None else device.index
+        cuda_major = tp.cuda.get_device_capability(device_index)[0]
+    mask_mod_vec_size = select_mask_mod_vec_size(
+        has_mask_mod=has_mask_mod,
+        has_mask_aux_tensors=has_mask_aux_tensors,
+        supports_mask_mod_vec=cuda_major in (10, 11),
+        graph_module=mask_mod_graph_module,
+        other_buffers=mask_mod_other_buffers,
+    )
+    score_mod_vec_size = select_score_mod_vec_size(
+        has_score_mod=has_score_mod,
+        has_aux_tensors=has_aux_tensors,
+        is_sm100_or_later=cuda_major is not None and cuda_major >= 10,
+        graph_module=score_mod_graph_module,
+        other_buffers=score_mod_other_buffers,
+    )
+    mask_mod_packed_intervals = None
+    if has_mask_mod and cuda_major in (10, 11) and mask_mod_graph_module is not None:
+        mask_mod_packed_intervals = select_packed_mask_intervals(
+            mask_mod_graph_module,
+            mask_mod_other_buffers,
+            CuteDSLAuxScalarBindings(tuple(aux_scalar_symbols)).symbol_codes(),
         )
+    if mask_mod_packed_intervals is not None:
+        mask_mod_vec_size = DEFAULT_MASK_MOD_VEC_SIZE
 
-    if joint_outputs is not None:
-        if joint_outputs.captured_grads_compute:
-            return (
-                False,
-                "NYI: Omni Flash Attention bwd doesn't support captured grads yet.",
-            )
-        if joint_outputs.mutated_grads:
-            return (
-                False,
-                "NYI: Omni Flash Attention bwd doesn't support mutated grads yet.",
-            )
+    if (
+        has_score_mod
+        and score_mod_vec_size is None
+        and config.max_autotune
+    ):
+        # Nothing captured held the score's width, and a captured number is the
+        # same for every position -- so every width the kernel supports is
+        # allowed, and which is best is what the search is for.
+        score_mod_vec_sizes = (1, 2, 4, 8, 16, 32, 64, 128)
+    else:
+        score_mod_vec_sizes = (score_mod_vec_size,)
+    configs = [
+        OmniFlashConfig(
+            score_mod_vec_size=v,
+            mask_mod_vec_size=mask_mod_vec_size,
+            mask_mod_packed_intervals=mask_mod_packed_intervals,
+        )
+        for v in score_mod_vec_sizes
+    ]
+    max_configs = config.test_configs.max_omni_configs
+    if max_configs is not None and len(configs) > max_configs:
+        configs = configs[:max_configs]
+    return configs
 
-    return True, ""
+
+def _get_omni_flash_bwd_configs() -> Any:
+    """The backward kernel has only the one way of being written.
+
+    Not measured, because there is nothing to choose: a score that is more than
+    itself is not yet accounted for in the backward pass, so the score is the
+    score and the kernel has one shape.
+    """
+
+    return [OmniFlashConfig()]
 
 
-def _use_omni_flash_attention_backward(
-    fw_subgraph: Any,
-    mask_graph: Any,
-    backend: Any,
-    joint_outputs: Any = None,
-    score_mod_other_buffers: Any = None,
-) -> bool:
-    """Whether to write the backward pass of this kernel rather than the other one."""
+# ---------------------------------------------------------------------------
+# Whether the kernel can be written at all
+# ---------------------------------------------------------------------------
 
-    if backend != "FLASH":
+
+FLASH_ATTENTION_INSTALL_MESSAGE = (
+    "Install a compatible Flash Attention package, for example "
+    '`pip install --pre flash-attn-4` (`pip install --pre "flash-attn-4[cu13]"` '
+    "for CUDA 13), and see https://pypi.org/project/flash-attn-4/ "
+    "for PyPI packaging details."
+)
+
+
+def _flash_attention_unavailable_message() -> str:
+    return (
+        "CUTE flash attention library is not available. "
+        f"{FLASH_ATTENTION_INSTALL_MESSAGE}"
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def ensure_flash_available() -> bool:
+    """Whether the attention library this kernel is written against is here.
+
+    Asked once and remembered, because it is a fact about what is installed and
+    does not change while the program runs.  Asked by looking rather than by
+    importing, so that a missing library is a missing library rather than an
+    error from something that was never there.
+    """
+
+    try:
+        return importlib.util.find_spec("flash_attn.cute") is not None
+    except ImportError:
         return False
 
-    can_use, reason = _can_use_omni_flash_attention_backward(
-        fw_subgraph,
-        mask_graph,
-        joint_outputs,
-        score_mod_other_buffers,
-    )
 
-    if not can_use:
-        raise RuntimeError(
-            f"BACKEND='FLASH' but flash attention cannot be used: {reason}"
-        )
+@functools.lru_cache(maxsize=1)
+def flash_supports_aux_scalars() -> bool:
+    """Whether the installed library can be handed a number beside the values.
 
-    return True
-
-
-# ---------------------------------------------------------------------------
-# Reading a body written as a graph
-# ---------------------------------------------------------------------------
-
-
-@dataclasses.dataclass(frozen=True)
-class PackedMaskAuxPlaceholderMap:
-    """What each captured value in a mask is, once the kernel is running.
-
-    A value that is a number is written into the kernel as that number; one that
-    is a tensor is passed in beside the values the kernel was already given.  The
-    two are kept apart because a kernel is handed tensors and reads numbers, and
-    a tensor that was a number has to have been read before it can be used as
-    one.
+    Asked by looking at what the entry points accept rather than by trying one,
+    because trying one would produce values rather than an answer, and the values
+    would then be the ones the answer was about.
     """
 
-    codes: Any
-    exprs: Any
-
-    @classmethod
-    def from_placeholders(
-        cls, placeholders: Any, other_buffers: Any, symbol_codes: Any
-    ) -> Any:
-        """The names the kernel will know these by, or nothing if one has none.
-
-        The order matters: the values a kernel is handed are handed by position,
-        so a name that says which position is the whole of what a name is for.
-        """
-
-        codes: dict = {}
-        exprs: dict = {}
-        tensor_idx = 0
-        for placeholder, buffer in zip(placeholders, other_buffers):
-            if isinstance(buffer, sympy.Expr):
-                rendered = sympy_to_cute_index(buffer, symbol_codes)
-                if rendered is None:
-                    return None
-                codes[placeholder] = rendered
-                exprs[placeholder] = buffer
-            else:
-                codes[placeholder] = f"aux_tensors[{tensor_idx}]"
-                tensor_idx += 1
-        for placeholder in placeholders[len(other_buffers) :]:
-            codes[placeholder] = f"aux_tensors[{tensor_idx}]"
-            tensor_idx += 1
-        return cls(codes, exprs)
-
-
-def select_packed_mask_intervals(
-    graph_module: Any,
-    other_buffers: Any = (),
-    aux_scalar_symbol_codes: Any = None,
-) -> Any:
-    """The ranges of positions a mask keeps, or nothing if it is not ranges.
-
-    The four leading arguments are not the mask's: they are which batch, which
-    head, which query, and which window -- and they are the same in every mask,
-    which is why they are taken from the graph rather than passed.  A body with
-    fewer arguments, or with more than one answer, is not a mask this can read.
-
-    Nothing is answered when the mask keeps everything: a range that keeps
-    everything is the same as no mask at all, and a kernel carrying one is a
-    kernel with a mask in it that does nothing.
-    """
-
-    graph = graph_module.graph
-    nodes = list(graph.nodes)
-    placeholders = [node for node in nodes if node.op == "placeholder"]
-    output = [node for node in nodes if node.op == "output"]
-    if len(placeholders) < 4 or len(output) != 1:
-        return None
-    b_idx, h_idx, q_idx, kv_idx, *aux_placeholders = placeholders
-    output_val = output[0].args[0]
-    if not isinstance(output_val, FxNode):
-        return None
-
-    symbol_codes = dict(aux_scalar_symbol_codes or {})
-    placeholder_map = PackedMaskAuxPlaceholderMap.from_placeholders(
-        aux_placeholders, other_buffers, symbol_codes
-    )
-    if placeholder_map is None:
-        return None
-
-    analyzer = PackedMaskAnalyzer(
-        nonnegative_indices=(b_idx, h_idx, q_idx),
-        q_idx=q_idx,
-        kv_idx=kv_idx,
-        symbol_codes=symbol_codes,
-        placeholder_codes={
-            b_idx: "b_idx[0]",
-            h_idx: "h_idx[0]",
-            q_idx: "q_idx[0]",
-            **placeholder_map.codes,
-        },
-        placeholder_exprs=placeholder_map.exprs,
-    )
-    intervals = analyzer.node_to_intervals(output_val)
-    if intervals is None:
-        return None
-    if len(intervals) == 1 and intervals[0].is_full():
-        return None
-    return tuple(
-        interval.with_symbol_codes(analyzer.symbol_codes) for interval in intervals
-    )
-
-
-def is_bool_full_node(node: Any, value: bool) -> bool:
-    """Whether a node is the graph's way of writing a single fixed truth value.
-
-    Which is how a body says "the mask keeps everything" or "the mask keeps
-    nothing": there is no node for either, because a mask that keeps everything
-    is not a mask, and the body has to be able to say so.
-    """
-
+    try:
+        interface = importlib.import_module("flash_attn.cute.interface")
+    except ImportError:
+        return False
     return (
-        node.op == "call_function"
-        and node.target is tp.ops.tp.full.default
-        and len(node.args) >= 2
-        and node.args[0] == []
-        and node.args[1] is value
+        "aux_scalars" in inspect.signature(interface._flash_attn_fwd).parameters
+        and "aux_scalars" in inspect.signature(interface._flash_attn_bwd).parameters
     )
-
-
-def is_aten_index_node(node: Any) -> bool:
-    """Whether a node reads a value at an index of its own."""
-
-    return node.op == "call_function" and node.target is tp.ops.tp.index.Tensor
-
-
-def fx_node_dtype(expr: Any) -> Any:
-    """What type a node's value is, following an index back to what it read.
-
-    An index has the type of what it read, so a node that has not been given a
-    type of its own is asked what it read -- which is a question with an answer
-    only as long as the chain of reads reaches something that has a type.
-    """
-
-    tensor_meta = expr.meta.get("tensor_meta")
-    if tensor_meta is not None:
-        return tensor_meta.dtype
-    val = expr.meta.get("val")
-    if isinstance(val, tp.Tensor):
-        return val.dtype
-    if is_aten_index_node(expr):
-        base = expr.args[0]
-        if isinstance(base, FxNode):
-            return fx_node_dtype(base)
-    return None
-
-
-def fx_node_shape(expr: Any) -> Any:
-    """What shape a node's value is.
-
-    From the metadata a node was given, or from the value itself where there is
-    one.  Not followed back the way the type is: an index's shape is not the
-    shape of what it read -- the index chooses which elements, and the answer is
-    the shape of the choice -- so following the read would answer a different
-    question.
-    """
-
-    tensor_meta = expr.meta.get("tensor_meta")
-    if tensor_meta is not None:
-        return tuple(tensor_meta.shape)
-    val = expr.meta.get("val")
-    if isinstance(val, tp.Tensor):
-        return tuple(val.shape)
-    return None
-
-
-#: How many intervals a mask may be written as before the kernel stops being
-#: worth generating.  A mask written as a union grows as the pieces multiply, and
-#: a kernel that carries hundreds of intervals to avoid one comparison per
-#: position is a kernel that is worse than the one it replaced.
-MAX_PACKED_MASK_INTERVALS_FOR_CODE_SIZE = 8
-
-#: The operations a value that is the same across a group of positions may be
-#: written with.  The symbols are the operators the language spells these with,
-#: and are the same whichever of the two forms -- a value or a number -- was
-#: used, so that a body written either way produces the same kernel.
-LANE_UNIFORM_BINARY_OPS: Any = {
-    tp.ops.tp.add.Tensor: "+",
-    tp.ops.tp.add.Scalar: "+",
-    tp.ops.tp.sub.Tensor: "-",
-    tp.ops.tp.sub.Scalar: "-",
-    tp.ops.tp.mul.Tensor: "*",
-    tp.ops.tp.mul.Scalar: "*",
-    tp.ops.tp.remainder.Tensor: "%",
-    tp.ops.tp.remainder.Scalar: "%",
-}
-
-
-@dataclasses.dataclass
-class PackedMaskAnalyzer:
-    """Turn a mask written as a graph into the ranges of positions it keeps.
-
-    A packed mask is a window of positions, and the window is described by the
-    two bounds of the range it keeps rather than by asking about each position.
-    So the body is read as an expression over the window's first position and
-    the offset within the window, and what the body says about that expression
-    is turned into bounds.  A document mask that keeps everything from where a
-    document starts up to a fixed distance past the query becomes the range
-    between those two, with the window's own position subtracted out of both --
-    which is what makes them bounds on the offset rather than on the position.
-
-    A body that is not a range of positions -- one that keeps every third
-    position, say -- is not written as a range and is read a position at a time
-    instead.  That is the answer whenever the range cannot be had, so nothing
-    here is a failure: it is a narrower answer.
-    """
-
-    #: The positions that name a place counted from the front, and so need no
-    #: wrapping.  Recorded because a position that is not one of these has to be
-    #: wrapped before it can be used, and wrapping is only correct for a
-    #: position that really does count from the back.
-    nonnegative_indices: Any
-    q_idx: Any
-    kv_idx: Any
-    q_symbol: Any = dataclasses.field(
-        default_factory=lambda: sympy.Symbol("q_idx", integer=True, nonnegative=True)
-    )
-    kv_symbol: Any = dataclasses.field(
-        default_factory=lambda: sympy.Symbol("kv_idx", integer=True, nonnegative=True)
-    )
-    lane_symbol: Any = dataclasses.field(
-        default_factory=lambda: sympy.Symbol(
-            "mask_lane", integer=True, nonnegative=True
-        )
-    )
-    #: The code for the temporary names standing in for values read from a
-    #: captured value.  Kept here because a bound may mention one, and a bound
-    #: that mentions something it cannot write down is not a bound.
-    symbol_codes: Any = dataclasses.field(default_factory=dict)
-    placeholder_codes: Any = dataclasses.field(default_factory=dict)
-    placeholder_exprs: Any = dataclasses.field(default_factory=dict)
-    aux_load_symbols: Any = dataclasses.field(default_factory=dict)
-    next_symbol_id: int = 0
-
-    def node_to_intervals(self, node: Any) -> Any:
-        """The ranges a node keeps, or nothing if it is not a range."""
-
-        if is_bool_full_node(node, True):
-            return (PackedMaskInterval.full(),)
-        if is_bool_full_node(node, False):
-            return ()
-        if node.op != "call_function":
-            return None
-        target = node.target
-        if target in (tp.ops.tp.bitwise_and.Tensor, tp.ops.tp.logical_and.default):
-            return self.combine_binary_intervals(node, intersect=True)
-        if target in (tp.ops.tp.bitwise_or.Tensor, tp.ops.tp.logical_or.default):
-            return self.combine_binary_intervals(node, intersect=False)
-        if target in (tp.ops.tp.le.Tensor, tp.ops.tp.le.Scalar):
-            return self.comparison_to_intervals(
-                node.args[0], node.args[1], strict=False
-            )
-        if target in (tp.ops.tp.lt.Tensor, tp.ops.tp.lt.Scalar):
-            return self.comparison_to_intervals(
-                node.args[0], node.args[1], strict=True
-            )
-        if target in (tp.ops.tp.ge.Tensor, tp.ops.tp.ge.Scalar):
-            return self.comparison_to_intervals(
-                node.args[1], node.args[0], strict=False
-            )
-        if target in (tp.ops.tp.gt.Tensor, tp.ops.tp.gt.Scalar):
-            return self.comparison_to_intervals(
-                node.args[1], node.args[0], strict=True
-            )
-        if target in (tp.ops.tp.eq.Tensor, tp.ops.tp.eq.Scalar):
-            return self.equality_to_intervals(node.args[0], node.args[1])
-        if target in (tp.ops.tp.ne.Tensor, tp.ops.tp.ne.Scalar):
-            return self.complement_intervals(
-                self.equality_to_intervals(node.args[0], node.args[1])
-            )
-        if target in (
-            tp.ops.tp.logical_not.default,
-            tp.ops.tp.bitwise_not.default,
-        ):
-            child = node.args[0]
-            if not isinstance(child, FxNode):
-                return None
-            return self.complement_intervals(self.node_to_intervals(child))
-        return None
-
-    def combine_binary_intervals(self, node: Any, *, intersect: bool) -> Any:
-        """Both sides kept, or either side kept."""
-
-        lhs, rhs = node.args
-        if not isinstance(lhs, FxNode) or not isinstance(rhs, FxNode):
-            return None
-        lhs_intervals = self.node_to_intervals(lhs)
-        rhs_intervals = self.node_to_intervals(rhs)
-        if intersect:
-            return self.intersect_interval_sets(lhs_intervals, rhs_intervals)
-        return self.union_interval_sets(lhs_intervals, rhs_intervals)
-
-    def comparison_to_intervals(
-        self, lhs: Any, rhs: Any, *, strict: bool
-    ) -> Any:
-        """A comparison of two positions, as a range."""
-
-        exprs = self.mask_operands_to_sympy(lhs, rhs)
-        if exprs is None:
-            return None
-        return self.lane_comparison_to_intervals(*exprs, strict=strict)
-
-    def equality_to_intervals(self, lhs: Any, rhs: Any) -> Any:
-        """Two positions being equal, as a range."""
-
-        exprs = self.mask_operands_to_sympy(lhs, rhs)
-        if exprs is None:
-            return None
-        return self.lane_equality_to_intervals(*exprs)
-
-    def mask_operands_to_sympy(self, lhs: Any, rhs: Any) -> Any:
-        """Both sides as expressions over the window."""
-
-        lhs_expr = self.fx_mask_expr_to_sympy(lhs)
-        rhs_expr = self.fx_mask_expr_to_sympy(rhs)
-        if lhs_expr is None or rhs_expr is None:
-            return None
-        return lhs_expr, rhs_expr
-
-    def lane_comparison_to_intervals(
-        self, lhs_expr: Any, rhs_expr: Any, *, strict: bool
-    ) -> Any:
-        """One side being below the other, as a range of positions.
-
-        The two are subtracted so that there is one question rather than two,
-        and the question is whether the difference is negative.  What that
-        depends on is the offset within the window, and the difference is
-        decomposed into how much of it the offset accounts for and what is left
-        over -- and the coefficient says which shape the answer has.
-
-        A coefficient of zero means the answer does not depend on the position
-        at all, so the whole window is kept or none of it is; the answer is
-        written as an upper bound of thirty-two times whether it holds, because
-        a bound that is a positive multiple of thirty-two keeps every position
-        and one that is not keeps none.  A coefficient of one is a range from
-        the start of the window -- the shape a comparison against the query
-        takes.  A coefficient of minus one is a range to the end of the window,
-        which is the shape a comparison against where a document starts.  Any
-        other coefficient steps over positions rather than naming a range, and
-        is left to be asked about one position at a time.
-        """
-
-        diff = V.graph.sizevars.simplify(lhs_expr - rhs_expr)
-        affine = decompose_affine_lane_expr(diff, self.lane_symbol)
-        if affine is None:
-            return None
-        lane_coeff, rest = affine
-        if lane_coeff == 0:
-            keep = -rest if strict else 1 - rest
-            upper = V.graph.sizevars.simplify(sympy.Integer(32) * keep)
-            return self.interval_if_renderable(sympy.Integer(0), upper)
-        if lane_coeff == 1:
-            upper = V.graph.sizevars.simplify(-rest if strict else -rest + 1)
-            return self.interval_if_renderable(sympy.Integer(0), upper)
-        if lane_coeff == -1:
-            lower = V.graph.sizevars.simplify(rest + 1 if strict else rest)
-            return self.interval_if_renderable(lower, sympy.Integer(32))
-        return None
-
-    def lane_equality_to_intervals(self, lhs_expr: Any, rhs_expr: Any) -> Any:
-        """Two positions being equal, as a range of positions.
-
-        Two divisions naming the same block is a range rather than a single
-        position, and is recognised before the general case because a body
-        written that way means "the same block", which is a run rather than a
-        point.  Otherwise it is the same decomposition as a comparison, and a
-        coefficient of one or minus one means exactly one position can be equal
-        -- a run of one, which is a range of one.  Any other coefficient is
-        left to be asked about one position at a time.
-        """
-
-        if isinstance(lhs_expr, FloorDiv) and isinstance(rhs_expr, FloorDiv):
-            intervals = self._floor_div_equality_to_intervals(lhs_expr, rhs_expr)
-            if intervals is not None:
-                return intervals
-        diff = V.graph.sizevars.simplify(lhs_expr - rhs_expr)
-        affine = decompose_affine_lane_expr(diff, self.lane_symbol)
-        if affine is None:
-            return None
-        lane_coeff, rest = affine
-        if lane_coeff == 0:
-            scale = sympy.Integer(32)
-            upper = V.graph.sizevars.simplify(
-                Min(scale * (1 - rest), scale * (1 + rest))
-            )
-            return self.interval_if_renderable(sympy.Integer(0), upper)
-        if lane_coeff in (1, -1):
-            lane_value = -rest if lane_coeff == 1 else rest
-            lower = V.graph.sizevars.simplify(lane_value)
-            upper = V.graph.sizevars.simplify(lane_value + 1)
-            return self.interval_if_renderable(lower, upper)
-        return None
-
-    def _floor_div_equality_to_intervals(self, lhs_expr: Any, rhs_expr: Any) -> Any:
-        """Two divisions naming the same block, as the run of positions that is."""
-
-        lhs_base, lhs_divisor = lhs_expr.args
-        rhs_base, rhs_divisor = rhs_expr.args
-        if lhs_divisor != rhs_divisor:
-            return None
-        if lhs_base == self.q_symbol and rhs_base == self.kv_symbol + self.lane_symbol:
-            q_block = lhs_expr
-        elif (
-            rhs_base == self.q_symbol and lhs_base == self.kv_symbol + self.lane_symbol
-        ):
-            q_block = rhs_expr
-        else:
-            return None
-        block_start = V.graph.sizevars.simplify(q_block * lhs_divisor - self.kv_symbol)
-        block_end = V.graph.sizevars.simplify(block_start + lhs_divisor)
-        return self.interval_if_renderable(block_start, block_end)
-
-    def interval_if_renderable(self, lower: Any, upper: Any) -> Any:
-        """The range, if both of its bounds can be written down.
-
-        A bound that cannot is not a bound: the kernel would have to write
-        something, and what it wrote would be a different number.
-        """
-
-        if (
-            sympy_to_cute_index(lower, self.symbol_codes) is not None
-            and sympy_to_cute_index(upper, self.symbol_codes) is not None
-        ):
-            return (PackedMaskInterval(lower, upper),)
-        return None
-
-    def complement_intervals(self, intervals: Any) -> Any:
-        """The positions a set of ranges does not keep.
-
-        The complement of a union is the intersection of each range's two
-        complements -- what is before it and what is after it -- and that is
-        still a set of ranges, so the answer stays in the same form.  The bounds
-        may be numbers not yet known, so this composes bounds that can already
-        be written rather than sorting them, and the composition is capped.
-        """
-
-        if intervals is None:
-            return None
-        result: Any = (PackedMaskInterval.full(),)
-        for interval in intervals:
-            result = self.intersect_interval_sets(
-                result,
-                (
-                    PackedMaskInterval(sympy.Integer(0), interval.lower_lane),
-                    PackedMaskInterval(
-                        interval.upper_lane_exclusive, sympy.Integer(32)
-                    ),
-                ),
-            )
-        return result
-
-    def union_interval_sets(self, intervals: Any, new_intervals: Any) -> Any:
-        """Either set of ranges kept, if the result is still small enough to write."""
-
-        if intervals is None or new_intervals is None:
-            return None
-        if (
-            len(intervals) + len(new_intervals)
-            > MAX_PACKED_MASK_INTERVALS_FOR_CODE_SIZE
-        ):
-            return None
-        return intervals + new_intervals
-
-    def intersect_interval_sets(self, intervals: Any, new_intervals: Any) -> Any:
-        """Both sets of ranges kept, if the result is still small enough to write.
-
-        Every pair gives one range, so the result grows as the product -- which
-        is why there is a cap: past it, reading the mask a position at a time is
-        the smaller kernel.
-        """
-
-        if intervals is None or new_intervals is None:
-            return None
-        if (
-            len(intervals) * len(new_intervals)
-            > MAX_PACKED_MASK_INTERVALS_FOR_CODE_SIZE
-        ):
-            return None
-        return tuple(
-            PackedMaskInterval(
-                V.graph.sizevars.simplify(Max(lhs.lower_lane, rhs.lower_lane)),
-                V.graph.sizevars.simplify(
-                    Min(lhs.upper_lane_exclusive, rhs.upper_lane_exclusive)
-                ),
-            )
-            for lhs, rhs in product(intervals, new_intervals)
-        )
-
-    def fx_mask_expr_to_sympy(self, expr: Any) -> Any:
-        """A mask expression, over the window's first position plus the offset.
-
-        The window's position is written as the sum of the two because the
-        offsets are what the bounds are about: a bound that named a position
-        would have to be rewritten once per position, and one that names the
-        offset is the same for all of them.
-        """
-
-        index_symbols = {
-            self.q_idx: self.q_symbol,
-            self.kv_idx: self.kv_symbol + self.lane_symbol,
-        }
-        index_symbols.update(self.placeholder_exprs)
-        return fx_aux_index_to_sympy(expr, index_symbols, self.mask_aux_load_to_symbol)
-
-    def mask_aux_load_to_symbol(self, node: Any) -> Any:
-        """A name standing for a value read from a captured value.
-
-        Named rather than written out, because the read is the same for every
-        position in the window and writing it into each bound would write it once
-        per bound.  A read that is not the same for every position cannot be
-        named this way, and answers with nothing.
-        """
-
-        if not is_aten_index_node(node):
-            return None
-        if node in self.aux_load_symbols:
-            return self.aux_load_symbols[node]
-        lane_uniform_code = self.render_lane_uniform_scalar_expr(node)
-        if lane_uniform_code is None:
-            return None
-        symbol = sympy.Symbol(f"mask_bound_{self.next_symbol_id}", integer=True)
-        self.next_symbol_id += 1
-        self.symbol_codes[symbol] = lane_uniform_code
-        self.aux_load_symbols[node] = symbol
-        return symbol
-
-    def render_lane_uniform_scalar_expr(
-        self,
-        expr: Any,
-        *,
-        for_index: bool = False,
-        index_dim_size: Any = None,
-    ) -> Any:
-        """An expression that is the same for every position in the window.
-
-        The walked position is refused outright: it is the one thing in a mask
-        that is not the same for every position, and a bound that mentioned it
-        would not be a bound.
-        """
-
-        if isinstance(expr, (int, sympy.Integer)) and not isinstance(expr, bool):
-            index = int(expr)
-            if for_index and index < 0:
-                if index_dim_size is None:
-                    return None
-                index = V.graph.sizevars.guard_int(index + index_dim_size)
-            return f"cutlass.Int32({index})"
-        if not isinstance(expr, FxNode):
-            return None
-
-        if expr is self.kv_idx:
-            return None
-        if expr in self.placeholder_codes:
-            return self.placeholder_codes[expr]
-
-        if is_aten_index_node(expr):
-            return self._render_lane_uniform_index_expr(expr, for_index=for_index)
-        if expr.op != "call_function":
-            return None
-        if expr.target is tp.ops.tp.div.Tensor_mode:
-            if expr.kwargs.get("rounding_mode") != "floor":
-                return None
-            op = "//"
-        else:
-            op = LANE_UNIFORM_BINARY_OPS.get(expr.target)
-            if op is None:
-                return None
-        args = expr.args
-        if len(args) < 2:
-            return None
-        lhs = self.render_lane_uniform_scalar_expr(args[0])
-        rhs = self.render_lane_uniform_scalar_expr(args[1])
-        if lhs is None or rhs is None:
-            return None
-        return f"({lhs} {op} {rhs})"
-
-    def _render_lane_uniform_index_expr(self, expr: Any, *, for_index: bool) -> Any:
-        """A read of a single whole number from a captured value.
-
-        Only whole numbers, and only a read of one: a read of a vector would be
-        a different value for every position, and a read of a number that is not
-        whole cannot be a position at all.
-        """
-
-        if fx_node_dtype(expr) not in (
-            tp.int8,
-            tp.int16,
-            tp.int32,
-            tp.int64,
-            tp.uint8,
-        ):
-            return None
-        result_shape = fx_node_shape(expr)
-        if result_shape is not None and len(result_shape) != 0:
-            return None
-        base, indices = expr.args
-        base_code = self.render_lane_uniform_scalar_expr(base)
-        base_shape = fx_node_shape(base) if isinstance(base, FxNode) else None
-        if base_code is None or not isinstance(indices, (list, tuple)):
-            return None
-        if base_shape is None or len(indices) != len(base_shape):
-            return None
-        index_codes = []
-        for dim, index in enumerate(indices):
-            dim_size = base_shape[dim]
-            index_code = self.render_lane_uniform_scalar_expr(
-                index, for_index=True, index_dim_size=dim_size
-            )
-            if index_code is None:
-                return None
-            if (
-                dim_size is not None
-                and isinstance(index, FxNode)
-                and index not in self.nonnegative_indices
-            ):
-                # A position counted from the back has to be counted from the
-                # front before it can be used, and adding the axis's length is
-                # what does that.
-                if not isinstance(dim_size, (int, sympy.Integer)):
-                    return None
-                dtype = fx_node_dtype(index)
-                integer_type = "Int64" if dtype == tp.int64 else "Int32"
-                size_code = f"cutlass.{integer_type}({dim_size})"
-                zero_code = f"cutlass.{integer_type}(0)"
-                index_code = (
-                    f"({index_code} + {size_code} "
-                    f"if {index_code} < {zero_code} else {index_code})"
-                )
-            index_codes.append(index_code)
-        load = f"{base_code}[{', '.join(index_codes)}]"
-        if for_index and fx_node_dtype(expr) == tp.int64:
-            return load
-        return f"cutlass.Int32({load})"
 
 
 # ---------------------------------------------------------------------------
-# A mask written as a range of lanes
+# How a position becomes a place in memory
 # ---------------------------------------------------------------------------
 
 
-def _simplify_expr(expr: Any) -> Any:
-    """The expression as something a pattern can be read off.
-
-    Simplified first because the pattern below reads a shape rather than a
-    spelling: the same range written two ways is one range, and recognising it
-    as one is the whole of what this is for.
-    """
-
-    if isinstance(expr, sympy.Expr):
-        return sympy.sympify(expr).simplify()
-    return expr
-
-
-def render_sympy_args(
-    args: Any, symbol_codes: Any = None
+def _hierarchical_indexer_cute(
+    size: Any, stride: Any = None, offset: Any = None
 ) -> Any:
-    """Every argument as code, or nothing if any of them cannot be.
+    """Turn a position into the dimensions it names, rather than into an offset.
 
-    All or nothing rather than the ones that could be: an operation with one
-    argument missing is not that operation with a hole in it, and a half-written
-    one would be read as a smaller number rather than as nothing.
+    Everywhere else a position is one number: the distance from the start of the
+    buffer, because a read is at an offset and the offset is what the hardware
+    wants.  This kernel wants the opposite -- one number per dimension, so that
+    it can be written as ``tensor[i, j]`` and be answerable for strides itself.
+
+    A single dimension is passed through as itself, because there is nothing to
+    keep together: one number is already one number.  No position at all is
+    zero, which is what reading a value with no dimensions means.
     """
 
-    rendered = []
-    for arg in args:
-        code = sympy_to_cute_index(arg, symbol_codes)
-        if code is None:
-            return None
-        rendered.append(code)
-    return rendered
+    if offset is None:
+        offset = sympy.Integer(0)
+
+    def indexer(indices: Any) -> Any:
+        if offset != sympy.Integer(0):
+            raise AssertionError("Offset not supported for hierarchical indexing")
+        if len(indices) != len(size):
+            raise AssertionError(
+                f"Rank mismatch: got {len(indices)} indices for tensor of rank {len(size)}"
+            )
+        if not indices:
+            return sympy.Integer(0)
+        if len(indices) == 1:
+            return indices[0]
+        return HierarchicalIndex(*indices)
+
+    return indexer
 
 
-def sympy_to_cute_index(expr: Any, symbol_codes: Any = None) -> Any:
-    """A whole-number expression as the code that computes it.
+@contextlib.contextmanager
+def patch_fixed_layout_indexer_for_cutedsl() -> Any:
+    """Make positions name dimensions for as long as a kernel is being written.
 
-    Only the forms these masks are made of are answered, and anything else
-    answers with nothing rather than with a guess: a mask written as a shape
-    that was rendered wrongly would read memory that belongs to a different
-    lane, which is a wrong answer with no sign that it is one.
+    The layout knows how to turn a position into an offset and is written to do
+    that, because that is what a read is everywhere else.  This kernel wants the
+    dimensions instead, and it wants them only while it is being written -- so
+    the layout is changed for that time and changed back, rather than taught a
+    second way of doing something every other caller would then have to know
+    about.
+
+    These kernels read and compute but do not store, so the values whose layout
+    this changes are only ever read, and how a read is addressed is not part of
+    what is stored.
     """
 
-    expr = _simplify_expr(expr)
-    if isinstance(expr, sympy.Integer):
-        return f"cutlass.Int32({int(expr)})"
-    if isinstance(expr, sympy.Symbol):
-        if symbol_codes is not None and expr in symbol_codes:
-            return symbol_codes[expr]
-        # The two positions a mask is written against are read as the first
-        # element of their own index, because that is how they arrive.
-        if expr.name == "q_idx":
-            return "q_idx[0]"
-        if expr.name == "kv_idx":
-            return "kv_idx[0]"
-        return None
-    if isinstance(expr, sympy.Add) or isinstance(expr, sympy.Mul):
-        args = render_sympy_args(expr.args, symbol_codes)
-        if args is None:
-            return None
-        separator = " + " if isinstance(expr, sympy.Add) else " * "
-        return "(" + separator.join(args) + ")"
-    if isinstance(expr, (sympy.Min, sympy.Max)):
-        args = render_sympy_args(expr.args, symbol_codes)
-        if args is None:
-            return None
-        op = "min" if isinstance(expr, sympy.Min) else "max"
-        return f"{op}(" + ", ".join(args) + ")"
-    if isinstance(expr, FloorDiv):
-        args = render_sympy_args(expr.args, symbol_codes)
-        if args is None:
-            return None
-        return f"({args[0]} // {args[1]})"
-    return None
+    original_make_indexer = FixedLayout.make_indexer
 
+    def cutedsl_make_indexer(self: Any) -> Any:
+        return _hierarchical_indexer_cute(self.size, self.stride, self.offset)
 
-@dataclasses.dataclass(frozen=True)
-class PackedMaskInterval:
-    """The lanes a mask keeps: from one up to but not including another.
-
-    A mask that says which lanes of a group are kept can be evaluated one lane
-    at a time, or -- when the answer is a range -- as one number describing the
-    range.  The second is a whole group of answers in one value, and is what
-    makes a mask over a group of lanes cost the same as a mask over one.
-
-    A mask over a window of lanes starting at the window's own position is the
-    common case: "the query's position is at or past this one's" keeps every
-    lane from the start of the window up to the difference between them.
-    """
-
-    lower_lane: Any
-    upper_lane_exclusive: Any
-    #: The code for symbols standing in for values that are the same across a
-    #: group of lanes.  Kept apart from the range because a range says which
-    #: lanes and this says how to name what they are read against, and the two
-    #: are not the same question.
-    symbol_codes: Any = dataclasses.field(default_factory=dict, compare=False, repr=False)
-
-    @classmethod
-    def full(cls) -> "PackedMaskInterval":
-        """Every lane kept, which is the mask that keeps everything."""
-
-        return cls(sympy.Integer(0), sympy.Integer(32))
-
-    def is_full(self) -> bool:
-        return self.lower_lane == 0 and self.upper_lane_exclusive == 32
-
-    def with_symbol_codes(self, symbol_codes: Any) -> "PackedMaskInterval":
-        return dataclasses.replace(self, symbol_codes=dict(symbol_codes))
-
-    def render_lower(self) -> str:
-        return self._render(self.lower_lane)
-
-    def render_upper(self) -> str:
-        return self._render(self.upper_lane_exclusive)
-
-    def keep_mask_expr(self) -> str:
-        """The group of lanes kept, as one number rather than as a comparison.
-
-        A run of lanes is a run of bits, and a run of bits is two shifted
-        bounds: everything above the lower bound, and everything below the
-        upper one, with the two overlapping.  Both bounds are clamped into the
-        group first, because a run that starts before the group or ends after
-        it is the same run as one that starts at its edge or ends at its edge --
-        and the group is what there is.
-        """
-
-        lower = self.render_lower()
-        upper = self.render_upper()
-        return (
-            "(utils.shr_u32(cutlass.Uint32(0xFFFFFFFF), "
-            "cutlass.Uint32(min(max(cutlass.Int32(32) - "
-            f"{upper}, cutlass.Int32(0)), cutlass.Int32(32)))) & "
-            "utils.shl_u32(cutlass.Uint32(0xFFFFFFFF), "
-            "cutlass.Uint32(min(max("
-            f"{lower}, cutlass.Int32(0)), cutlass.Int32(32)))))"
-        )
-
-    def _render(self, expr: Any) -> str:
-        rendered = sympy_to_cute_index(expr, self.symbol_codes)
-        if rendered is None:
-            raise AssertionError(f"failed to render expr to cute index: {expr}")
-        return rendered
-
-
-IntervalSet = tuple
-MaybeIntervalSet = Any
+    FixedLayout.make_indexer = cutedsl_make_indexer
+    try:
+        yield
+    finally:
+        FixedLayout.make_indexer = original_make_indexer
 
 
 # ---------------------------------------------------------------------------
