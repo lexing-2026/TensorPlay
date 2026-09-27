@@ -2830,6 +2830,25 @@ def add_layout_constraint(fn: Any, constraint: Callable[..., Any]) -> None:
     _maybe_layout_constraints[fn] = constraint
 
 
+def require_dense(_, *args, **kwargs):
+    """Ask that every tensor argument already be laid out as it will be read.
+
+    An operation that reads its arguments through a kernel written for one
+    layout cannot be handed a value whose layout is merely describable, so the
+    arguments that are tensors are asked to be written down with the layout
+    they are to be read in.
+    """
+
+    args, kwargs = tree_map(_densify_argument, (args, kwargs))
+    return args, kwargs
+
+
+def _densify_argument(value: Any) -> Any:
+    if isinstance(value, TensorBox):
+        return ir.ExternKernel.require_stride1(value)
+    return value
+
+
 def get_constraint_for_op(fn: Any) -> Callable[..., Any] | None:
     """What this operation's arguments must look like, if anything was said."""
 
@@ -4628,3 +4647,270 @@ for _name in ("searchsorted", "scatter_reduce_", "index"):
     )
     for _ov in _overloads:
         make_fallback(_ov, warn=False)
+
+
+def ceildiv(number: Any, denom: Any) -> Any:
+    """The quotient rounded up.
+
+    Rounded up rather than to nearest because a range of whole positions from
+    here to there has to contain the end: a range that stopped one short would
+    be a range of the wrong length, and every position after it would be read
+    from the wrong place.
+    """
+
+    if isinstance(number, sympy.Expr) or isinstance(denom, sympy.Expr):
+        return CeilDiv(sympy.sympify(number), sympy.sympify(denom))
+    return -(-number // denom)
+
+
+@register_lowering(aten.arange.start_step, type_promotion_kind=None)
+def arange_start_step(
+    start: Any,
+    end: Any,
+    step: Any = 1,
+    *,
+    dtype: Any = None,
+    layout: Any = None,
+    device: Any = None,
+    pin_memory: Any = None,
+    requires_grad: Any = False,
+) -> Any:
+    """The numbers from here to there, by so much.
+
+    How many there are is the distance divided by the step and rounded up,
+    which is the smallest count that reaches the end: a count that stopped one
+    short would be a range of the wrong length.  A type is required because
+    which type these numbers are is not a question the numbers answer -- two
+    whole numbers and two real ones are the same sequence of values read
+    differently, and which one was asked for has to have been said.
+    """
+
+    if dtype is None:
+        raise AssertionError("expected: dtype is not None")
+    length = ceildiv(sympy.sympify(end) - sympy.sympify(start), sympy.sympify(step))
+    return iota(
+        length,
+        start=start,
+        step=step,
+        dtype=dtype,
+        device=device if device is not None else "cpu",
+        requires_grad=requires_grad,
+    )
+
+
+@register_lowering(aten.arange.end, type_promotion_kind=None)
+def arange_end(
+    end: Any,
+    *,
+    dtype: Any = None,
+    layout: Any = None,
+    device: Any = None,
+    pin_memory: Any = None,
+    requires_grad: Any = False,
+) -> Any:
+    """The numbers from zero to there, by one.
+
+    A form of its own rather than the general one with the start left out,
+    because a graph records which form was called: the same numbers written two
+    ways are two calls, and a graph that used one is not a graph that used the
+    other.
+    """
+
+    return arange_start_step(
+        0,
+        end,
+        1,
+        dtype=dtype,
+        layout=layout,
+        device=device,
+        pin_memory=pin_memory,
+        requires_grad=requires_grad,
+    )
+
+
+@register_lowering(aten.arange.start, type_promotion_kind=None)
+def arange_start(
+    start: Any,
+    end: Any,
+    *,
+    dtype: Any = None,
+    layout: Any = None,
+    device: Any = None,
+    pin_memory: Any = None,
+    requires_grad: Any = False,
+) -> Any:
+    """The numbers from here to there, by one."""
+
+    return arange_start_step(
+        start,
+        end,
+        1,
+        dtype=dtype,
+        layout=layout,
+        device=device,
+        pin_memory=pin_memory,
+        requires_grad=requires_grad,
+    )
+
+
+@register_lowering(aten.arange.default, type_promotion_kind=None)
+def arange_default(
+    end: Any,
+    *,
+    dtype: Any = None,
+    layout: Any = None,
+    device: Any = None,
+    pin_memory: Any = None,
+    requires_grad: Any = False,
+) -> Any:
+    """One number: the number asked for.
+
+    A range of one is the number itself, and treating it as a range rather than
+    as a value would make it a tensor where a number was asked for.
+    """
+
+    return arange_start_step(
+        0,
+        end,
+        1,
+        dtype=dtype,
+        layout=layout,
+        device=device,
+        pin_memory=pin_memory,
+        requires_grad=requires_grad,
+    )
+
+
+#: Padding with a value, where how much is added to each side is named from the
+#: last axis backwards.  Which positions the value ends up at is arithmetic on
+#: the shape rather than a walk, but the shape it is arithmetic on is the one
+#: the framework is better placed to work out -- and the answer is a value with
+#: room around it, which the framework already knows how to produce.
+_constant_pad = getattr(aten, "constant_pad_nd", None)
+if _constant_pad is not None:
+    make_fallback(_constant_pad, warn=False)
+
+
+#: Operations whose answer is a property of the framework's own state or of a
+#: library it holds: how far a scaling factor has grown, which positions a
+#: normalization was built from, which order a set of values came out in, and
+#: which values were drawn from which distribution.  Each of those is a fact
+#: about something outside the graph, and a walk written here would have to
+#: carry that something with it.
+for _name in (
+    "_amp_update_scale_",
+    "linalg_pinv",
+    "repeat_interleave",
+    "randperm",
+    "multinomial",
+    "_weight_norm_interface_backward",
+):
+    _op = getattr(aten, _name, None)
+    if _op is None:
+        continue
+    _overloads = (
+        [_op] if not hasattr(_op, "overloads") else
+        [getattr(_op, _ov) for _ov in _op.overloads()]
+    )
+    for _ov in _overloads:
+        make_fallback(_ov, warn=False)
+
+#: The scaled forms of a matrix multiply take a scale that is a value rather
+#: than a number, and which of several ways of applying it is meant is a
+#: meaning rather than a walk.  The writing forms of a fused add-and-multiply
+#: are here for the same reason as the non-writing ones: they differ only in
+#: where the result goes, and having one without the other is how the two come
+#: to compute different things.
+for _name in (
+    "_scaled_mm",
+    "_scaled_mm_v2",
+    "_scaled_dot_product_flash_attention",
+    "mm",
+    "addmm",
+    "prod",
+    "scatter_reduce_",
+    "_foreach_addcdiv_",
+    "_foreach_addcmul_",
+    "bucketize",
+    "embedding",
+    "avg_pool1d",
+):
+    _op = getattr(aten, _name, None)
+    if _op is None:
+        continue
+    _overloads = (
+        [_op] if not hasattr(_op, "overloads") else
+        [getattr(_op, _ov) for _ov in _op.overloads()]
+    )
+    for _ov in _overloads:
+        make_fallback(_ov, warn=False)
+
+
+def type_casts(
+    f: Any,
+    type_promotion: Any,
+    compute_dtype_only: bool = False,
+    include_non_tensor_args: bool = False,
+) -> Any:
+    """Run a decomposition in the type it should compute in, and answer in the type it should return.
+
+    A value of a narrow type is computed on in a wider one and converted back
+    afterwards.  Doing it any other way is how a sum of half-precision values
+    ends up with the rounding of a half-precision accumulator: the wider type
+    is where the arithmetic happens, and the narrow one is only how the answer
+    is written down.  Which of the two a given argument is comes from the
+    promotion, so the arguments are not all treated alike.
+
+    Numbers are widened too where the operation takes them, because a narrow
+    value added to a wide one is a wide one, and a narrow number standing for a
+    wide value would be the one place the arithmetic stayed narrow.
+    """
+
+    @functools.wraps(f)
+    def inner(*args: Any, **kwargs: Any) -> Any:
+        allowed_types = (int, float, complex, bool) if include_non_tensor_args else ()
+        flat_args = [
+            x
+            for x in arg_tree_leaves(*args, **kwargs)
+            if isinstance(x, (TensorBox, IRNode, *allowed_types))
+        ]
+        compute_dtype = promoted_dtype_of_values(
+            *flat_args,
+            type_promotion_kind=type_promotion,
+            return_compute_dtype=True,
+        )
+        result_dtype = promoted_dtype_of_values(
+            *flat_args, type_promotion_kind=type_promotion
+        )
+
+        def increase_prec(x: Any) -> Any:
+            if isinstance(x, (TensorBox, IRNode)):
+                return to_dtype(x, compute_dtype)
+            return x
+
+        def decrease_prec(x: Any) -> Any:
+            if isinstance(x, (TensorBox, IRNode)):
+                return to_dtype(x, result_dtype)
+            return x
+
+        r = f(*tree_map(increase_prec, args), **tree_map(increase_prec, kwargs))
+        if compute_dtype_only:
+            return r
+        return tree_map(decrease_prec, r)
+
+    return inner
+
+
+pw_cast_for_opmath = functools.partial(
+    type_casts, type_promotion=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT
+)
+compute_only_pw_cast_for_opmath = functools.partial(
+    type_casts,
+    type_promotion=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
+    compute_dtype_only=True,
+)
+pw_cast_for_opmath_non_tensor_args = functools.partial(
+    type_casts,
+    type_promotion=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
+    include_non_tensor_args=True,
+)
