@@ -8483,6 +8483,11 @@ class OrderingBarrier(NopKernel):
         return False
 
 
+#: What a candidate writes down about itself when it is asked to describe
+#: itself: numbers, a flag, a name, or a list of those.
+PrimitiveInfoType = int | float | bool | str | list[int | str | float | bool]
+
+
 class ChoiceCaller:
     """One of the ways a piece of work could be done, before choosing between them.
 
