@@ -19,6 +19,7 @@ import tensorplay as tp
 
 
 from . import config
+from .codecache import PyCodeCache
 from .compile_worker.timer import Timer
 from .utils import apply_subprocess_env, clear_caches
 import atexit
@@ -45,6 +46,9 @@ __all__ = [
     "CppBenchmarkRequest",
     "NonzeroWorkspaceNotSupportedError",
     "TensorMeta",
+    "TritonBenchmarkRequest",
+    "TritonCPUBenchmarkRequest",
+    "TritonGPUBenchmarkRequest",
 ]
 
 
@@ -380,6 +384,239 @@ def _is_gpu_device(device) -> bool:
     """Whether a device is one whose work is timed rather than waited for."""
 
     return getattr(device, "type", None) in {"cuda", "xpu", "mtia"}
+
+
+class TritonBenchmarkRequest(BenchmarkRequest):
+    """A request to measure one kernel of one configuration.
+
+    What a request carries is a name, the geometry of what it reads and writes,
+    and its extra arguments -- and nothing that belongs to a process, because a
+    request has to survive being sent to one.  Everything that is a process's
+    rather than the request's is worked out again on the other side: the module
+    is loaded there, the stream is read there, the place a kernel needs scratch
+    is built there.
+    """
+
+    def __init__(
+        self,
+        kernel_name: str,
+        input_tensor_meta: TensorMeta | list[TensorMeta],
+        output_tensor_meta: TensorMeta | list[TensorMeta],
+        extra_args: Iterable[Any],
+        module_path: str,  # the path of the module defining the triton kernel
+        module_cache_key: str,
+        num_stages: int,
+        num_warps: int,
+        num_consumer_groups: int = 0,
+        num_buffers_warp_spec: int = 0,
+        matrix_instr_nonkdim: int = 0,  # only used for hip to choose the shape of mfma instruction.
+        waves_per_eu: int = 0,  # only used for hip to schedule waves per execution unit
+        kpack: int = 0,  # ROCm specific gemm parameter
+        workspace_size: int | None = None,  # size of workspace buffer in bytes
+        workspace_zero_fill: bool = False,  # whether to zero-fill workspace
+    ) -> None:
+        super().__init__(kernel_name, input_tensor_meta, output_tensor_meta, extra_args)
+        self.module_path = module_path
+        self.module_cache_key = module_cache_key
+        self.num_stages = num_stages
+        self.num_warps = num_warps
+        self.num_consumer_groups = num_consumer_groups
+        self.num_buffers_warp_spec = num_buffers_warp_spec
+        self.matrix_instr_nonkdim = matrix_instr_nonkdim
+        self.waves_per_eu = waves_per_eu
+        self.kpack = kpack
+        self.workspace_size = workspace_size
+        self.workspace_zero_fill = workspace_zero_fill
+        self._benchmark_module: Any | None = None
+
+    def make_run_fn(
+        self, *input_tensors: Any, out: Any
+    ) -> Callable[[], None]:
+        """The closure that runs this kernel once, wherever the request landed.
+
+        The kernel is loaded from the path it was written to rather than sent,
+        because a compiled binary is not something that can be sent and the
+        module is what holds it.  The stream is read when the closure runs
+        rather than when the closure is made, because capturing a launch onto
+        one stream and replaying it onto another has to land on the stream that
+        is current at the time.
+        """
+
+        from .codecache import load_by_key_path
+
+        mod = load_by_key_path(
+            self.module_cache_key,
+            self.module_path,
+            set_sys_modules=False,
+        )
+        self._benchmark_module = mod
+        autotuning_log.debug(
+            "benchmark module key: %s, path: %s",
+            self.module_cache_key,
+            self.module_path,
+        )
+
+        run_method = getattr(mod, self.kernel_name).run
+        extra_args = list(self.extra_args)
+
+        # A place for the kernel to work in, rebuilt here because a request
+        # cannot carry one.  It goes where the text says it goes, which is
+        # before the grid -- the last three arguments.
+        if self.workspace_size is not None:
+            from .templates.select_algorithm import WORKSPACE_ARG_PLACEHOLDER
+
+            workspace_tensor = tp.empty(
+                (self.workspace_size,),
+                dtype=tp.uint8,
+                device=out.device,
+            )
+            if self.workspace_zero_fill:
+                workspace_tensor.zero_()
+            workspace_index = extra_args.index(WORKSPACE_ARG_PLACEHOLDER)
+            extra_args[workspace_index] = workspace_tensor
+
+        # Newer version of triton add warmup argument to JITFunction.run.
+        # This code handles backward-compatibility.
+        warmup_arg = {}
+        import inspect
+
+        if "warmup" in inspect.signature(run_method).parameters:
+            warmup_arg["warmup"] = False
+
+        if out.device.type == "cpu":
+            device_interface = None
+            device_index = 0
+        else:
+            device_type = out.device.type
+            device_interface = get_interface_for_device(device_type)
+            device_index = self.output_tensor_meta.device.index
+
+        # A kernel whose launcher reports what it measured rather than just
+        # running takes the launch without being told this is a measurement.
+        # Nothing builds one, so this is a shape of launcher rather than a
+        # shape of kernel, and it is asked about as one.
+        debug_autotuner_cls = getattr(
+            __import__(
+                "tensorplay.compiler.backends.stax.runtime.triton_heuristics",
+                fromlist=["DebugAutotuner"],
+            ),
+            "DebugAutotuner",
+            None,
+        )
+        is_debug_autotuner = debug_autotuner_cls is not None and isinstance(
+            getattr(mod, self.kernel_name), debug_autotuner_cls
+        )
+
+        def run_fn() -> None:
+            stream = (
+                0
+                if device_interface is None
+                else device_interface.get_raw_stream(device_index)
+            )
+            if is_debug_autotuner:
+                run_method(
+                    *input_tensors,
+                    out,
+                    *extra_args,
+                    **warmup_arg,
+                    stream=stream,
+                )
+            else:
+                run_method(
+                    *input_tensors,
+                    out,
+                    *extra_args,
+                    **warmup_arg,
+                    stream=stream,
+                    benchmark_run=True,
+                )
+
+        return run_fn
+
+    def cleanup_run_fn(self) -> None:
+        """Let go of what was loaded to be measured, however many times asked.
+
+        A module loaded to be measured is loaded for that measurement, and
+        everything reachable from it goes with it: the binary inside it, and any
+        launcher built from that binary.  Whoever loaded it is not the only
+        caller, so this has to be safe to call more than once.
+        """
+
+        mod = self._benchmark_module
+        self._benchmark_module = None
+
+        cached_mod = PyCodeCache.modules_no_attr.pop(self.module_path, None)
+        if mod is None:
+            mod = cached_mod
+
+        if mod is not None:
+            kernel = getattr(mod, self.kernel_name, None)
+            release_benchmark_artifacts = getattr(
+                kernel, "release_benchmark_artifacts", None
+            )
+            if release_benchmark_artifacts is not None:
+                release_benchmark_artifacts()
+            release_static_launchers = getattr(
+                kernel, "_release_static_launchers_except", None
+            )
+            if (
+                release_benchmark_artifacts is None
+                and release_static_launchers is not None
+            ):
+                release_static_launchers(None)
+            elif release_benchmark_artifacts is None:
+                for launcher in getattr(kernel, "launchers", ()) or ():
+                    close = getattr(getattr(launcher, "__self__", None), "close", None)
+                    if close is not None:
+                        close()
+                for compile_result in getattr(kernel, "compile_results", ()) or ():
+                    close = getattr(
+                        getattr(compile_result, "kernel", None), "close", None
+                    )
+                    if close is not None:
+                        close()
+
+        PyCodeCache.modules[:] = [
+            module
+            for module in PyCodeCache.modules
+            if getattr(module, "__file__", None) != self.module_path
+        ]
+        PyCodeCache.linemaps.pop(self.module_path, None)
+
+    def precompile(self):
+        """Compile and load, so that a measurement is not paying for a compile.
+
+        What is reported afterwards is how many registers the kernel used, which
+        is only known once it has been compiled -- and is wanted whether or not
+        anyone is about to time it.
+        """
+
+        try:
+            from .codecache import load_by_key_path
+
+            mod = load_by_key_path(
+                self.module_cache_key,
+                self.module_path,
+                set_sys_modules=False,
+            )
+            self._benchmark_module = mod
+            kernel = getattr(mod, self.kernel_name)
+            kernel.precompile()
+
+            self.n_regs = kernel.launchers[0].n_regs
+        finally:
+            self.cleanup_run_fn()
+
+    def __str__(self) -> str:
+        return f"{self.kernel_name=}, {self.module_path=}, {self.module_cache_key=}"
+
+
+class TritonGPUBenchmarkRequest(GPUDeviceBenchmarkMixin, TritonBenchmarkRequest):
+    pass
+
+
+class TritonCPUBenchmarkRequest(CPUDeviceBenchmarkMixin, TritonBenchmarkRequest):
+    pass
 
 
 class SubgraphBenchmarkRequest(BenchmarkRequest):
