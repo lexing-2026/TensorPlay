@@ -27,6 +27,7 @@ import sympy
 from typing import Any
 
 import logging
+import operator
 
 import tensorplay as tp
 
@@ -39,13 +40,23 @@ from .....graph.experimental.sympy_functions import (
     SymT,
 )
 from .. import config
+from ..loops import V
 from tensorplay.utils._triton import (
     has_triton_cpu_backend,
     has_triton_stable_tma_api,
 )
 from ..utils import _TMA_SUPPORTED_DTYPES
 from ..heuristics.template.base import next_power_of_2
-from .triton_utils import is_unaligned_buffer_name
+from .triton_utils import (
+    config_of,
+    equal_1_arg_indices,
+    is_unaligned_buffer_name,
+    select_tile_hint,
+    should_unwrap_unspec_arg,
+    signature_to_meta,
+    use_block_ptr_enabled,
+    use_uint8_triton_storage_for_cuda_float8_e4m3fn,
+)
 from ..runtime.hints import (
     AutotuneHint,
     DeviceProperties,
@@ -53,7 +64,24 @@ from ..runtime.hints import (
     TileHint,
 )
 from ..shape_propagation import get_broadcasted_shape
-from .common import CSE, CSEVariable, OpOverrides, PythonPrinter
+from .common import (
+    ArgName,
+    CSE,
+    CSEProxy,
+    CSEVariable,
+    ConstexprArg,
+    DeferredLine,
+    InplacedBuffer,
+    OpDecompositions,
+    OpOverrides,
+    PythonPrinter,
+    RemovedArg,
+    SizeArg,
+    TensorArg,
+    WorkspaceArg,
+    WorkspaceZeroMode,
+    is_buffer_removed,
+)
 from ..utils import (
     cache_on_self,
     dtype_to_type,
@@ -67,6 +95,19 @@ try:  # The shared kernel machinery this builds on.
     from .simd import SIMDKernel
 except ImportError:  # pragma: no cover - until that machinery is here
     SIMDKernel = object
+
+from .simd import (
+    DerivedIterationRangesRoot,
+    IterationRangesEntry,
+    IterationRangesRoot,
+    PartialAccumulate,
+    constant_repr,
+)
+from .simd_kernel_features import (
+    NodeScheduleMarker,
+    tiling_scores_suggest_inner_reduction,
+)
+from .wrapper import SymbolicCallArg
 
 
 @dataclasses.dataclass
@@ -8085,7 +8126,7 @@ class TritonKernelOverrides(TritonOverrides):
     def _setup_libdevice_routing(cls):
         """Set up routing to libdevice implementations for fp64 inputs."""
 
-        from common import OpDecompositions
+        from .common import OpDecompositions
 
         for fn_name in op_requires_libdevice_fp64:
             if not hasattr(cls, fn_name):
@@ -8296,6 +8337,7 @@ TritonKernel.allow_block_ptr = True
 TritonKernel.block_ptr_options_cls = BlockPtrOptions
 TritonKernel.tensor_descriptor_options_cls = TensorDescriptorOptions
 TritonKernel.transpose_discontiguous_tensor_descriptors_override = None
+TritonKernel.tma_compatibility_checker_cls = TMACompatibilityChecker
 
 
 #: A kernel writes its arithmetic by asking for it to be written out, so that

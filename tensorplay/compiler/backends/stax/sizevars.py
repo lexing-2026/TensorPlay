@@ -16,6 +16,7 @@ is emitting a guard wants the stronger question about the shape in hand.
 
 from __future__ import annotations
 
+import operator
 import dataclasses
 import functools
 import itertools
@@ -979,23 +980,138 @@ class SizeVarAllocator:
             return self.to_symint_or_int(x)
         raise AssertionError(f"expected list, tuple, or Expr but got {x}")
 
-    def expand_floor_div(self, expr):
-        """A division written out, so that the numerator and divisor are visible.
-
-        A division that has not been carried out is left alone, since there is
-        nothing to expand.
+    def expand_floor_div(
+        self,
+        index: sympy.Expr,
+        candidate_vars: Iterable[sympy.Symbol] | None = None,
+    ) -> bool | tuple[sympy.Expr, sympy.Expr]:
         """
+        Expand the FloorDiv to the entire expression so that the expression may
+        be simplified.
 
-        if isinstance(expr, sympy.Add):
-            return sympy.Add(*(self.expand_floor_div(x) for x in expr.args))
-        if not expr.has(FloorDiv):
-            return expr
-        return expr.xreplace(
-            {
-                f: f.args[0] / f.args[1]
-                for f in expr.atoms(FloorDiv)
-            }
+        E.g., for a 2D contiguous tensor with shape [a, 2 * b], and index variables
+        x1, x2, index expression 'x1 * 2b + x2' can be easily combined.
+        But index expression 'x1 * b + x2 // 2' can not.
+        By expanding the FloorDiv to the entire expression, we get
+        '(x1 * 2b + x2) // 2'. This transformation allows us to merge loops
+        for the numerator!
+
+        Return false if this optimization cannot be applied;
+        Return the new expression and the denominator otherwise.
+        The original expression will be equivalent to 'new_expression // denominator'
+        """
+        candidate_vars_set = (
+            OrderedSet(candidate_vars) if candidate_vars is not None else None
         )
+
+        def parse_static_term(
+            term: sympy.Expr,
+        ) -> tuple[sympy.Expr, sympy.Symbol] | None:
+            if not isinstance(term, sympy.Mul):
+                return None
+            # For dynamic shape, term like '2*s1*x1' has 3 child nodes.
+            # Without candidate loop vars we cannot tell shape and loop
+            # symbols apart, so preserve the historical conservative path.
+            if len(term.args) != 2:
+                return None
+            factor, var = term.args
+            if not isinstance(factor, sympy.Integer) or not isinstance(
+                var, sympy.Symbol
+            ):
+                return None
+            return factor, var
+
+        def parse_term(term: sympy.Expr) -> tuple[sympy.Expr, sympy.Symbol] | None:
+            if candidate_vars_set is None:
+                parsed = parse_static_term(term)
+                if parsed is None:
+                    return None
+                factor, var = parsed
+            else:
+                if isinstance(term, sympy.Symbol):
+                    factor = sympy.S.One
+                    var = term
+                elif isinstance(term, sympy.Mul):
+                    vars_in_term = [
+                        symbol
+                        for symbol in term.free_symbols
+                        if symbol in candidate_vars_set
+                    ]
+                    if len(vars_in_term) == 0:
+                        parsed = parse_static_term(term)
+                        if parsed is None:
+                            return None
+                        factor, var = parsed
+                    elif len(vars_in_term) == 1:
+                        var = vars_in_term[0]
+                        factor = sympy.cancel(term / var)
+                        if factor.has(*candidate_vars_set):
+                            return None
+                        if factor.is_integer is not True:
+                            return None
+                    else:
+                        return None
+                else:
+                    return None
+
+                if var not in candidate_vars_set:
+                    return None
+
+            # It's easier to reason about the correctness of the transformation
+            # for non-negative integers.
+            if not self.statically_known_geq(var, 0):
+                return None
+            return factor, var
+
+        if not isinstance(index, sympy.Add):
+            return False
+        terms = index.args
+
+        if len(terms) < 2:
+            return False
+        floor_div_index = -1
+        varlist = []
+        factorlist = []
+        for idx, term in enumerate(terms):
+            if parsed := parse_term(term):
+                factor, var = parsed
+                varlist.append(var)
+                factorlist.append(factor)
+            elif isinstance(term, FloorDiv):
+                var, factor = term.args
+                if not isinstance(factor, sympy.Integer) or not isinstance(
+                    var, sympy.Symbol
+                ):
+                    return False
+                if candidate_vars_set is not None and var not in candidate_vars_set:
+                    return False
+                if not self.statically_known_geq(var, 0):
+                    return False
+                if floor_div_index >= 0:
+                    # can not handle multi FloorDiv yet
+                    return False
+
+                floor_div_index = idx
+                varlist.append(var)
+                # this factor is denominator
+                factorlist.append(factor)
+            else:
+                return False
+
+        if floor_div_index < 0:
+            return False
+
+        # Construct the new expression and remember the denominator
+        denominator = factorlist[floor_div_index]
+        new_index = sympy.S.Zero
+
+        for var, factor, idx in zip(varlist, factorlist, itertools.count()):
+            if idx == floor_div_index:
+                new_index += var
+            else:
+                new_index += (factor * denominator) * var
+
+        return new_index, denominator
 
     def combine_modular_indexing_pairs(self, expr):
         """One position written two ways, put back into one.
