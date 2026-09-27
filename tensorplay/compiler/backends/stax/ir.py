@@ -1793,16 +1793,15 @@ class Loops(IRNode):
             self.inner_fn(index)
         return handler.usages
 
-    def get_read_writes(self) -> "dependencies.ReadWrites":
-        """Everything this body reads, writes, and computes a position for.
+    def get_reads(self) -> OrderedSet:
+        """Everything this body reads, found by running the body.
 
-        Found by running the body with a handler that records what it asks for,
-        which is the only way to know what a body reads: the reads are whatever
-        the arithmetic turns out to ask for, and a body is written as arithmetic
-        rather than as a list.  A body that reduces reads a different shape of
-        thing from one that does not, because what it reads is spread over the
-        reduction rather than over the result, and the two are read differently
-        so that the same answer comes out either way.
+        What a body reads is whatever its arithmetic turns out to ask for, and
+        a body is written as arithmetic rather than as a list of things, so the
+        only way to know is to run it with a handler that records each ask.  A
+        body that reduces is read over the reduction rather than over the
+        result, and the two are read differently so that the same answer comes
+        out either way.
         """
 
         with patch.object(FlexibleLayout, "allow_indexing", True):
@@ -1811,11 +1810,8 @@ class Loops(IRNode):
                     self.make_loader(),
                     self.get_size(),
                     self.get_reduction_size(),
-                )
-            return extract_read_writes(self.make_loader(), self.get_size())
-
-    def get_reads(self) -> OrderedSet:
-        return self.get_read_writes().reads
+                ).reads
+            return extract_read_writes(self.make_loader(), self.get_size()).reads
 
     def get_read_names(self) -> OrderedSet:
         return OrderedSet(self.inner_fn_opcount().read_buffers)
@@ -3716,7 +3712,24 @@ class ComputedBuffer(OperationBuffer):
         return OrderedSet(dep.name for dep in self.get_reads())
 
     def get_read_writes(self) -> "dependencies.ReadWrites":
-        return self.data.get_read_writes()
+        if not isinstance(self.data, (Reduction, Scan, Sort, Pointwise)):
+            return dependencies.ReadWrites(
+                reads=OrderedSet(),
+                writes=OrderedSet(),
+                index_exprs=OrderedSet(),
+            )
+
+        with patch.object(FlexibleLayout, "allow_indexing", True):
+            if self.data.get_reduction_type():
+                return extract_read_writes(
+                    self.get_store_function(),
+                    self.data.get_pointwise_size(),
+                    self.data.get_reduction_size(),
+                )
+            return extract_read_writes(
+                self.get_store_function(),
+                self.data.get_size(),
+            )
 
     @cache_on_self_and_args("ComputedBuffer")
     def get_free_symbol_uses(self, unbacked_only: bool = False) -> OrderedSet:
