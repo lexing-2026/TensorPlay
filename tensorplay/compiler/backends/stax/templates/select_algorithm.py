@@ -66,6 +66,9 @@ from ..utils import (
 )
 from ..kernel_scheduler import count_flops_fx
 from ..ops_handler import StoreMode
+from ..heuristics.template.base import SymbolicGridFn
+from ..runtime.triton_heuristics import FixedGrid
+from ..codegen.wrapper import pexpr
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
 
 #: Whether a candidate's result is checked against what the operation's own
@@ -1036,6 +1039,18 @@ class TritonTemplateKernel:
     def __repr__(self) -> str:
         return f"TritonTemplateKernel({self.kernel_name})"
 
+    @property
+    def index_dtype(self) -> str:
+        """How wide this kernel indexes, which the caller may have said.
+
+        A caller that knows the largest tensor this kernel will see can say so
+        and get narrower indexing than the default would pick.
+        """
+
+        if self._index_dtype_override is not None:
+            return self._index_dtype_override
+        return super().index_dtype
+
     def _gen_tmp_var(self) -> str:
         """A name nothing else in this kernel is using."""
 
@@ -1997,6 +2012,91 @@ class TritonTemplateKernel:
                 return result.strip()
 
         return self._register_hook(hook_key, hook)
+
+    def additional_call_args_and_types(self):
+        """What the launch has to work out before it can start.
+
+        How many programs to start is usually known only once the shapes are,
+        so the work is done by the launch rather than baked in.  When the count
+        cannot be worked out from the sizes alone, the grid is handed in as
+        arguments instead -- but a grid that reduces to a fixed number of
+        values has to be settled at compile time, so a kernel that only some of
+        its shapes can settle is asking for trouble.
+        """
+
+        if isinstance(self.grid_fn, SymbolicGridFn):
+            grid_args = self.grid_fn.sympy_call(*self.call_sizes, self.meta)
+            if len(grid_args) not in (0, 3):
+                raise AssertionError("grid_fn should return 3 values")
+            return (grid_args, map(type, grid_args))
+        elif all(isinstance(x, (int, sympy.Integer)) for x in self.call_sizes):
+            grid_args = self.grid_fn(*map(int, self.call_sizes), self.meta)
+            if len(grid_args) not in (0, 3):
+                raise AssertionError("grid_fn should return 3 values")
+            return (grid_args, map(type, grid_args))
+        return ((), ())
+
+    def call_kernel(self, name: str, node=None, deallocate_ws: bool = True):
+        """Write the line that starts this kernel."""
+
+        wrapper = V.graph.wrapper_code
+        _, call_args, _, arg_types = self.args.python_argdefs()
+
+        additional_call_args, additional_arg_types = (
+            self.additional_call_args_and_types()
+        )
+
+        if not additional_call_args:
+            if V.graph.cpp_wrapper:
+                raise AssertionError("cpp_wrapper requires SymbolicGridFn")
+            wrapper.add_import_once(f"import {self.grid_fn.__module__}")
+            meta = wrapper.add_meta_once(self.meta)
+            fn_name = f"{self.grid_fn.__module__}.{self.grid_fn.__name__}"
+            call_args.append(
+                f"*{fn_name}({', '.join(map(pexpr, self.call_sizes))}, {meta})"
+            )
+            arg_types.append(None)
+
+        call_args.extend(additional_call_args)
+        arg_types.extend(additional_arg_types)
+
+        if self.workspace_arg is not None:
+            wrapper.generate_workspace_allocation(self.workspace_arg)
+
+        # Use FixedGrid which properly handles grid values passed as arguments
+        inductor_meta = FixedGrid.setup_grid_as_args() if additional_call_args else None
+        wrapper.generate_kernel_call(
+            name,
+            call_args,
+            arg_types=arg_types,
+            triton_meta=self.triton_meta,
+            inductor_meta=inductor_meta,
+            triton=True,
+        )
+        self._emit_post_kernel_code(wrapper, name)
+        if self.workspace_arg is not None:
+            wrapper.generate_workspace_deallocation(self.workspace_arg)
+
+    def _emit_post_kernel_code(self, wrapper, kernel_name: str) -> None:
+        """Hook for subclasses to emit code after kernel call, before workspace dealloc."""
+
+        pass
+
+    def kernel_benchmark_extra_args(self) -> list[str]:
+        """The grid, for the sake of measuring the kernel.
+
+        How many programs to start does not affect what the kernel computes, so
+        it is settled here rather than being carried through as something the
+        measurement has to be told.
+        """
+
+        # Grid args are only used for benchmarking, not correctness
+        return [
+            str(x)
+            for x in self.grid_fn(
+                *V.graph.sizevars.optimization_hints(self.call_sizes), self.meta
+            )
+        ]
 
     def get_stride_and_maybe_freeze_layout(self, node) -> list[int]:
         """The strides a body should see for one of the kernel's operands.
