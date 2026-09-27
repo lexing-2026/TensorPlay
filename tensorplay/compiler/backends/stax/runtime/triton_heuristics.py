@@ -38,6 +38,8 @@ from ..utils import (
 from .hints import HeuristicType
 from ..triton_bundler import TritonBundler
 from .cache_dir_utils import triton_cache_dir
+from .runtime_utils import triton_config_to_hashable
+from ..compile_log import timed_block
 from .triton_compat import (
     ASTSource,
     GPUTarget,
@@ -1517,6 +1519,54 @@ class CachingAutotuner(KernelInterface):
         self.__dict__.update(state)
         self.lock = threading.Lock()
         self._plugins = get_caching_autotuner_plugins(self)
+
+    def recheck_autotune_cache(self, reload_kernel_from_src) -> None:
+        """Look again for an answer, now that this kernel has been compiled.
+
+        A kernel that was kept from an earlier run was kept before anything
+        here was measured, and the answer that would let it skip measuring may
+        have been written since.  So the lookup is done again against what is
+        now compiled.
+
+        An answer naming a configuration that is among the compiled ones means
+        everything else can be dropped -- the other forms were only ever
+        candidates.  An answer naming something that is not among them was
+        produced after the fact, by tuning that moved away from the starting
+        list, and so has to be compiled now.
+        """
+
+        if not self.is_statically_launchable():
+            raise AssertionError("Expected statically launchable kernel")
+
+        configs = [result.config for result in self.compile_results]
+
+        (cached_configs, _, autotune_cache_info) = check_autotune_cache(
+            configs,
+            self.filename,
+            self.inductor_meta,
+            dynamic_scale_rblock_eligible=self._could_rblock_scale,
+        )
+        self.autotune_cache_info = autotune_cache_info
+        # I.e. there was an autotune cache hit
+        if len(cached_configs) == 1:
+            best_config = cached_configs[0]
+            found_by_coordesc = getattr(best_config, "found_by_coordesc", False)
+            # Grab the best compiled config, if it's in the list of available ones
+            best_config_hash = triton_config_to_hashable(best_config)
+
+            for compile_result in self.compile_results:
+                if triton_config_to_hashable(compile_result.config) == best_config_hash:
+                    compile_result.config.found_by_coordesc = found_by_coordesc
+                    self.compile_results = [compile_result]
+                    return
+
+            # The best config isn't in our compile results -- it was
+            # found dynamically (coordesc tuning or _dynamic_scale_rblock)
+            # after the static autotuner was saved. Compile it now.
+            with timed_block("CachingAutotuner.slow_precompile_config"):
+                if self.fn.fn is None:
+                    self.fn = reload_kernel_from_src().fn
+                self.compile_results = [self._precompile_config(best_config)]
 
     def set_compile_info(self, compile_id, is_backward: bool) -> None:
         """Note which build this is, and whether it is the backward one.
