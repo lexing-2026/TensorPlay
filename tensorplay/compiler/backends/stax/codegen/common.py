@@ -116,7 +116,6 @@ if TYPE_CHECKING:
     from ..templates.select_algorithm import ChoiceCaller
 
 
-
 class WorkspaceZeroMode(enum.Enum):
     """How a scratch buffer has to be left.
 
@@ -617,109 +616,35 @@ class BackendFeature(Enum):
     #: Takes a whole list of tensors in one program, so that a lowering which
     #: received a list did not have to be unrolled into one program per tensor.
     FOREACH = auto()
-    #: Reads an input through an arbitrary stride, so a view needs no copy.
-    STRIDED_INPUTS = auto()
-    #: Accepts inputs whose element types differ from one another.
-    MIXED_INPUT_DTYPES = auto()
-    #: Reads inputs whose element type is narrower than the arithmetic width.
-    PROMOTED_INPUTS = auto()
-    #: Carries a reduction inside the program instead of beside it.
-    IN_PROGRAM_REDUCTION = auto()
-    #: Emits more than one result from one program.
-    MULTI_OUTPUT = auto()
-    #: Picks its launch tile from measured candidates instead of a constant.
-    AUTOTUNED_TILE = auto()
-    #: Accepts an input that carries a gradient.
-    GRAD_INPUTS = auto()
-    #: A tail predicate covers the partial tile, so one guarded access serves
-    #: every element a thread owns.
-    TILE_MASKED_ACCESS = auto()
+    #: Puts values into buckets by a computed position, rather than only
+    #: writing each result where its index already says.
+    BUCKETIZE = auto()
     #: Reads and writes one buffer in place, where nothing else wants it, so a
     #: value need never be copied to a second buffer before being overwritten.
     INPLACE_BUFFERS = auto()
-    #: A reduction down to a single element may be written as one pass that
-    #: starts from an arbitrary value, rather than needing a separate value to
-    #: start from.  Without this the starting value has to be materialized.
-    REDUCE_TO_SINGLE_ELEMENT = auto()
+    #: Scatters where the positions to write are given alongside the values,
+    #: rather than being a function of the value's own index.
+    MASKED_SCATTER_WITH_INDEX = auto()
+    #: Carries a running total across a program's positions, where each one
+    #: depends on the one before it rather than on the input alone.
+    SCAN = auto()
+    #: Orders the program's positions by a computed key, so a body may read
+    #: them in an order the input did not arrive in.
+    SORT = auto()
+    #: Reduces several values at one position to a value that is itself several
+    #: numbers, rather than to a single one.
+    TUPLE_REDUCTION = auto()
+    #: Writes in the order the program's loop already runs rather than in the
+    #: order the body produced, where the two differ and the first is right.
+    PREFER_STORE_LOOP_ORDER = auto()
     #: A kernel is offered as a template, written from the geometry rather than
     #: fixed, so that the same call can be measured over several shapes of it
     #: and the one that runs fastest on this device is the one kept.
     TRITON_TEMPLATES = auto()
-
-
-#: What each emitter declares.  Order is the preference order: the first
-#: emitter whose declared set covers what the program needs is the one that
-#: runs, and a program no emitter covers is a lowering miss rather than a
-#: silent hop to a weaker emitter.  Elementwise work has one emitter; a
-#: program it cannot express is a miss to report, not a second codegen path
-#: with different semantics to fall into.
-BACKEND_FEATURES: dict[str, frozenset] = {
-    "triton": frozenset({
-        BackendFeature.STRIDED_INPUTS,
-        BackendFeature.MIXED_INPUT_DTYPES,
-        BackendFeature.PROMOTED_INPUTS,
-        BackendFeature.IN_PROGRAM_REDUCTION,
-        BackendFeature.MULTI_OUTPUT,
-        BackendFeature.AUTOTUNED_TILE,
-        BackendFeature.GRAD_INPUTS,
-        BackendFeature.TILE_MASKED_ACCESS,
-    }),
-    "cpp": frozenset({
-        BackendFeature.PROMOTED_INPUTS,
-        BackendFeature.MULTI_OUTPUT,
-        BackendFeature.GRAD_INPUTS,
-    }),
-    "interpreter": frozenset({
-        BackendFeature.MULTI_OUTPUT,
-    }),
-}
-
-#: Emitters each device may use, best first.  A device's tensors are printed
-#: by an emitter that runs there, and the features a program needs decide
-#: within that set: asking for a reduction on the host is not answered by the
-#: accelerator's printer, it is declined.
-BACKEND_ORDER_BY_DEVICE: dict[str, tuple[str, ...]] = {
-    "cuda": ("triton", "interpreter"),
-    "cpu": ("cpp", "interpreter"),
-}
-
-
-def required_features(
-    *,
-    strided_inputs: bool = False,
-    mixed_dtypes: bool = False,
-    promoted_inputs: bool = False,
-    reduction: bool = False,
-    outputs: int = 1,
-    grad_inputs: bool = False,
-) -> frozenset:
-    """What one program needs from an emitter, read off its own properties."""
-    needed = set()
-    if strided_inputs:
-        needed.add(BackendFeature.STRIDED_INPUTS)
-    if mixed_dtypes:
-        needed.add(BackendFeature.MIXED_INPUT_DTYPES)
-    if promoted_inputs:
-        needed.add(BackendFeature.PROMOTED_INPUTS)
-    if reduction:
-        needed.add(BackendFeature.IN_PROGRAM_REDUCTION)
-    if outputs > 1:
-        needed.add(BackendFeature.MULTI_OUTPUT)
-    if grad_inputs:
-        needed.add(BackendFeature.GRAD_INPUTS)
-    return frozenset(needed)
-
-
-def select_backend(needed: frozenset, device: str = "cuda") -> str | None:
-    """The first emitter for ``device`` that declares what the program needs."""
-    for name in BACKEND_ORDER_BY_DEVICE.get(device, ("interpreter",)):
-        if needed <= BACKEND_FEATURES[name]:
-            return name
-    return None
-
-
-def backend_supports(name: str, needed: frozenset) -> bool:
-    return needed <= BACKEND_FEATURES.get(name, frozenset())
+    #: A reduction down to a single element may be written as one pass that
+    #: starts from an arbitrary value, rather than needing a separate value to
+    #: start from.  Without this the starting value has to be materialized.
+    REDUCE_TO_SINGLE_ELEMENT = auto()
 
 
 #: An operand already fully wrapped, or a single atom: no parentheses needed.
