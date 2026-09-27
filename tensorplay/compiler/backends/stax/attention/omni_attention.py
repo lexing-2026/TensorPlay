@@ -203,6 +203,120 @@ SCORE_MOD_AUX_VEC_POLICY = AuxVecPolicy(
 )
 
 
+#: How many positions a mask is evaluated at when nothing narrows it.  The same
+#: width a packed mask uses, because a mask evaluated that wide can be written
+#: as a range of positions -- and one that cannot be packed is one that has to
+#: be evaluated a position at a time whatever width the rest of the kernel uses.
+DEFAULT_MASK_MOD_VEC_SIZE = 32
+
+
+@dataclasses.dataclass(frozen=True)
+class AuxIndexedTensor:
+    """A captured value together with the part of its index already settled.
+
+    The part that is settled is the part that does not depend on which position
+    of the group is being read, so it can be worked out once and used for every
+    position rather than being worked out again each time.
+    """
+
+    buffer: Any
+    indices: Any
+
+
+def make_fx_index_symbols(
+    q_idx_node: Any,
+    kv_idx_node: Any,
+    non_lane_index_nodes: Any = (),
+    *,
+    kv_expr: Any = None,
+) -> Any:
+    """Symbols standing for the positions a body is read at.
+
+    One per position rather than the position itself, because the position is
+    not known while the body is being analysed -- only which positions there
+    are.  The query's position and the walked position are separate symbols
+    because a captured value read at one means something different from the
+    same value read at the other: read at the walked position it varies across
+    the group, and read anywhere else it does not.
+
+    A walked position given as an expression is used as given rather than made
+    into a symbol, because a caller that has already worked out where the walk
+    is has more to say than a bare name would.
+    """
+
+    q_idx = sympy.Symbol("q_idx", integer=True, nonnegative=True)
+    kv_idx = sympy.Symbol("kv_idx", integer=True, nonnegative=True)
+    index_symbols = {
+        node: sympy.Symbol(node.name, integer=True, nonnegative=True)
+        for node in non_lane_index_nodes
+    }
+    index_symbols[q_idx_node] = q_idx
+    index_symbols[kv_idx_node] = kv_idx if kv_expr is None else kv_expr
+    return q_idx, kv_idx, index_symbols
+
+
+def select_mask_mod_vec_size(
+    *,
+    has_mask_mod: bool,
+    has_mask_aux_tensors: bool,
+    supports_mask_mod_vec: bool,
+    graph_module: Any,
+    other_buffers: Any,
+) -> Any:
+    """How many positions a mask is evaluated at.
+
+    Nothing to say if there is no mask or if this kernel cannot evaluate one
+    that wide: a width nothing can be read at is not a width.
+
+    A mask that reads no captured value can be evaluated as wide as a packed
+    mask is, because that is how wide a mask is written when it is written as a
+    range of positions.  A mask that does read captured values is held to
+    whatever those reads allow, and a width of one is reported as no width --
+    which is not the same thing, and is how the caller is told that reading them
+    one at a time is the answer.
+    """
+
+    if not has_mask_mod or not supports_mask_mod_vec:
+        return None
+    if not has_mask_aux_tensors:
+        return DEFAULT_MASK_MOD_VEC_SIZE
+
+    vec_size = select_aux_mod_vec_size(
+        graph_module,
+        other_buffers,
+        MASK_MOD_AUX_VEC_POLICY,
+    )
+    return vec_size if vec_size > 1 else None
+
+
+def select_score_mod_vec_size(
+    *,
+    has_score_mod: bool,
+    has_aux_tensors: bool,
+    is_sm100_or_later: bool,
+    graph_module: Any,
+    other_buffers: Any,
+) -> Any:
+    """How many positions a score is applied at.
+
+    Nothing to say when there is no score or nothing captured to read, and a
+    width of one -- rather than nothing -- on a device whose wide reads of
+    captured values are not written: a score applied a position at a time is
+    the answer there, and saying so is different from saying nothing was
+    decided.
+    """
+
+    if not has_score_mod or not has_aux_tensors:
+        return None
+    if not is_sm100_or_later:
+        return 1
+    return select_aux_mod_vec_size(
+        graph_module,
+        other_buffers,
+        SCORE_MOD_AUX_VEC_POLICY,
+    )
+
+
 # ---------------------------------------------------------------------------
 # A mask written as a range of lanes
 # ---------------------------------------------------------------------------
