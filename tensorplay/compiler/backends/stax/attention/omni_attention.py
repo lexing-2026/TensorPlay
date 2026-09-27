@@ -23,6 +23,7 @@ import importlib
 import importlib.util
 import inspect
 import math
+import warnings
 from itertools import product
 from typing import Any
 
@@ -1706,3 +1707,287 @@ def create_omni_flash_attention_kernel(
     )
 
     return (template_output, lse)
+
+
+def create_omni_flash_attention_backward_kernel(
+    query: Any,
+    key: Any,
+    value: Any,
+    out: Any,
+    logsumexp: Any,
+    grad_out: Any,
+    grad_logsumexp: Any,
+    scale: float,
+    kernel_options: Any,
+    sparse_q_block_size: Any,
+    sparse_kv_block_size: Any,
+    fw_subgraph_buffer: Any = None,
+    joint_subgraph_buffer: Any = None,
+    score_mod_other_buffers: Any = None,
+    mask_graph_buffer: Any = None,
+    mask_mod_other_buffers: Any = None,
+    q_num_blocks: Any = None,
+    q_indices: Any = None,
+    full_q_num_blocks: Any = None,
+    full_q_indices: Any = None,
+    dq_write_order: Any = None,
+    dq_write_order_full: Any = None,
+    dq_kv_order: Any = None,
+    dq_kv_order_spt: Any = None,
+) -> Any:
+    """Write the pass that goes back the way the forward pass came.
+
+    Three values rather than one, and none of the three is derived from the
+    others here.  The gradient of the query is computed by the kernel; the
+    gradients of the key and the value are accumulated into, because both are
+    read by every block of queries and so neither can be finished by the block
+    that happens to reach it last.  Which one is accumulated and which is not is
+    therefore a property of the shape of the work, and is why two of the three
+    are handed over as buffers to write rather than asked for as results.
+    """
+
+    from ..op_lowerings import empty_strided
+
+    if not ensure_flash_available():
+        raise RuntimeError(_flash_attention_unavailable_message())
+
+    batch_size, num_heads, seq_len_q, head_dim = query.get_size()
+    _, num_heads_kv, seq_len_kv, v_head_dim = value.get_size()
+    device = query.get_device()
+    dtype = query.get_dtype()
+    if device is None:
+        raise AssertionError("Device must not be None")
+
+    grad_query_strides = infer_dense_strides(
+        [batch_size, num_heads, seq_len_q, head_dim], query.get_stride()
+    )
+    grad_query = empty_strided(
+        size=[batch_size, num_heads, seq_len_q, head_dim],
+        stride=grad_query_strides,
+        dtype=dtype,
+        device=device,
+    )
+
+    grad_key_strides = infer_dense_strides(
+        [batch_size, num_heads_kv, seq_len_kv, head_dim], key.get_stride()
+    )
+    grad_key = empty_strided(
+        size=[batch_size, num_heads_kv, seq_len_kv, head_dim],
+        stride=grad_key_strides,
+        dtype=dtype,
+        device=device,
+    )
+
+    grad_value_strides = infer_dense_strides(
+        [batch_size, num_heads_kv, seq_len_kv, v_head_dim], value.get_stride()
+    )
+    grad_value = empty_strided(
+        size=[batch_size, num_heads_kv, seq_len_kv, v_head_dim],
+        stride=grad_value_strides,
+        dtype=dtype,
+        device=device,
+    )
+
+    # What the kernel writes is the query's gradient, so that is what the
+    # distances it writes are chosen for.  The other two are written wherever
+    # their own inputs were laid out, and handed over with those distances.
+    output_layout = FixedLayout(
+        device=device,
+        dtype=dtype,
+        size=[batch_size, num_heads, seq_len_q, head_dim],
+        stride=[sympy.sympify(s) for s in grad_query.get_stride()],
+    )
+
+    sparse_q_block_size = V.graph.sizevars.guard_int(sparse_q_block_size)
+    sparse_kv_block_size = V.graph.sizevars.guard_int(sparse_kv_block_size)
+
+    has_dlse = grad_logsumexp is not None
+    if (
+        has_dlse
+        and V.graph.sizevars.statically_known_equals(head_dim, 256)
+        and V.graph.sizevars.statically_known_equals(v_head_dim, 256)
+        and tp.cuda.get_device_capability(device)[0] in (10, 11)
+    ):
+        raise NotImplementedError(
+            "FLASH backend dLSE is not supported by the SM100/SM110 dedicated "
+            "head_dim=256 FA4 backward kernel. Use BACKEND='TRITON' for this "
+            "configuration."
+        )
+
+    choices: list = []
+
+    input_nodes: list = [
+        query,
+        key,
+        value,
+        out,
+        grad_out,
+        logsumexp,
+        grad_key,
+        grad_value,
+    ]
+
+    has_block_mask = mask_graph_buffer is not None
+    if has_block_mask:
+        if q_indices is None:
+            raise AssertionError("q_indices required when block mask is present")
+        if full_q_num_blocks is None:
+            raise AssertionError(
+                "full_q_num_blocks required when block mask is present"
+            )
+        if full_q_indices is None:
+            raise AssertionError("full_q_indices required when block mask is present")
+        input_nodes.extend(
+            [
+                q_num_blocks,
+                q_indices,
+                full_q_num_blocks,
+                full_q_indices,
+            ]
+        )
+
+    has_dq_write_order = dq_write_order is not None
+    if has_dq_write_order:
+        input_nodes.append(dq_write_order)
+        if dq_write_order_full is not None:
+            input_nodes.append(dq_write_order_full)
+    has_dq_kv_order = dq_kv_order is not None and has_dq_write_order
+    dq_kv_order_spt_for_flash = dq_kv_order_spt if has_dq_write_order else None
+    if has_dq_kv_order:
+        input_nodes.append(dq_kv_order)
+    if has_dlse:
+        input_nodes.append(grad_logsumexp)
+
+    supports_dq_kv_order = False
+    supports_spt = False
+    if has_block_mask:
+        from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+
+        block_sparse_fields = getattr(BlockSparseTensorsTorch, "_fields", ())
+        supports_dq_kv_order = "dq_kv_order" in block_sparse_fields
+        supports_spt = "spt" in block_sparse_fields
+        if has_dq_kv_order and not supports_dq_kv_order:
+            raise NotImplementedError(
+                "Explicit tensor dq_kv_order requires flash-attn-4 with dq_kv_order support"
+            )
+        if dq_kv_order_spt_for_flash is not None and not (
+            supports_dq_kv_order or supports_spt
+        ):
+            raise NotImplementedError(
+                "Boolean dq_kv_order requires flash-attn-4 with dq_kv_order or spt support"
+            )
+
+    deterministic_requested = tp.are_deterministic_algorithms_enabled()
+    warn_only = tp.is_deterministic_algorithms_warn_only_enabled()
+    deterministic_backward_enabled = deterministic_requested
+    if deterministic_requested and has_block_mask:
+        major, _ = tp.cuda.get_device_capability(device)
+        missing_dq_write_order = dq_write_order is None or (
+            full_q_num_blocks is not None and dq_write_order_full is None
+        )
+        missing_dq_kv_order = not (
+            has_dq_kv_order or dq_kv_order_spt_for_flash is not None
+        )
+        if major < 10:
+            if warn_only:
+                deterministic_backward_enabled = False
+            else:
+                raise NotImplementedError(
+                    "Deterministic backward for attention with block_mask and BACKEND='FLASH' "
+                    "requires SM100+ (compute capability >= 10.0). "
+                    "Use BACKEND='TRITON' for deterministic backward on older architectures."
+                )
+        elif missing_dq_write_order:
+            if warn_only:
+                deterministic_backward_enabled = False
+            else:
+                raise ValueError(
+                    "Deterministic backward for attention with block_mask and BACKEND='FLASH' "
+                    "requires dQ write-order metadata. Create the block mask with "
+                    "create_block_mask(..., compute_dq_write_order=True)."
+                )
+        elif missing_dq_kv_order:
+            if warn_only:
+                deterministic_backward_enabled = False
+            else:
+                raise ValueError(
+                    "Deterministic backward for attention with block_mask and BACKEND='FLASH' "
+                    "requires dQ KV scheduler-order metadata. Create the block mask with "
+                    "create_block_mask(..., compute_dq_write_order=True)."
+                )
+    if deterministic_requested and not deterministic_backward_enabled:
+        warnings.warn(
+            "attention backward with block_mask and BACKEND='FLASH' does not have "
+            "a deterministic implementation for this configuration, but you set "
+            "'tp.use_deterministic_algorithms(True, warn_only=True)'. "
+            "Running non-deterministic backward.",
+        )
+
+    has_score_mod = fw_subgraph_buffer is not None and joint_subgraph_buffer is not None
+    subgraphs = []
+    if has_score_mod:
+        subgraphs.append(fw_subgraph_buffer)
+        subgraphs.append(joint_subgraph_buffer)
+    if has_block_mask:
+        subgraphs.append(mask_graph_buffer)
+
+    aux_scalar_symbols = collect_aux_scalar_symbols(
+        score_mod_other_buffers or (), mask_mod_other_buffers or ()
+    )
+    if aux_scalar_symbols and not flash_supports_aux_scalars():
+        raise RuntimeError(
+            "CUTE flash attention scalar captures require flash-attn-4>=4.0.0b17. "
+            f"{FLASH_ATTENTION_INSTALL_MESSAGE}"
+        )
+    configs = _get_omni_flash_bwd_configs()
+
+    error: Any = None
+    for conf in configs:
+        error = generate_omni_flash_choice(
+            omni_flash_attention_backward_cutedsl_template,
+            choices,
+            input_nodes=input_nodes,
+            layout=output_layout,
+            mutated_inputs=[grad_key, grad_value],
+            subgraphs=subgraphs or None,
+            SM_SCALE=scale,
+            HAS_SCORE_MOD=has_score_mod,
+            SCORE_MOD_VEC_SIZE=conf.score_mod_vec_size,
+            HAS_BLOCK_MASK=has_block_mask,
+            HAS_DQ_WRITE_ORDER=has_dq_write_order,
+            HAS_DQ_WRITE_ORDER_FULL=dq_write_order_full is not None,
+            HAS_DQ_KV_ORDER=has_dq_kv_order,
+            DQ_KV_ORDER_SPT=dq_kv_order_spt_for_flash,
+            HAS_DLSE=has_dlse,
+            AUX_SCALAR_SYMBOLS=aux_scalar_symbols,
+            SUPPORTS_DQ_KV_ORDER=supports_dq_kv_order,
+            SUPPORTS_SPT=supports_spt,
+            DETERMINISTIC_BACKWARD_ENABLED=deterministic_backward_enabled,
+            SPARSE_Q_BLOCK_SIZE=sparse_q_block_size,
+            SPARSE_KV_BLOCK_SIZE=sparse_kv_block_size,
+        )
+        if error is not None and len(configs) == 1:
+            raise RuntimeError(f"CuteDSL template failed: {error}")
+
+    if not choices:
+        raise RuntimeError(f"CuteDSL template failed: {error}")
+
+    input_gen_fns: Any = None
+    if has_block_mask:
+        input_gen_fns = {
+            8: create_num_blocks_fake_generator(q_indices),
+            9: create_indices_fake,
+            10: create_num_blocks_fake_generator(full_q_indices),
+            11: create_indices_fake,
+        }
+
+    template_output, _ = autotune_select_algorithm(
+        "omni_flash_attention_backward",
+        choices,
+        input_nodes,
+        output_layout,
+        input_gen_fns=input_gen_fns,
+        return_multi_template=False,
+    )
+
+    return (template_output, grad_key, grad_value, tuple())
