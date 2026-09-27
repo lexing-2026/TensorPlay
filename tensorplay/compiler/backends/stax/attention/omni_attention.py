@@ -18,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Any
 
+import tensorplay as tp
 import sympy
 from tensorplay.graph.experimental.sympy_functions import FloorDiv
 
@@ -191,3 +192,134 @@ class PackedMaskInterval:
 
 IntervalSet = tuple
 MaybeIntervalSet = Any
+
+
+# ---------------------------------------------------------------------------
+# Configurations
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class FlexFlashConfig:
+    """One way of writing the kernel, among the ways worth measuring.
+
+    How many elements one pass over the kernel handles is a choice about what
+    the hardware does with them rather than about what the kernel computes, and
+    the two are answered separately because they are: the width a mask is
+    evaluated at is a property of the mask, and the width a score is applied at
+    is a property of the score.
+    """
+
+    #: How many elements one pass applies the score to.  Left unset to take the
+    #: kernel's own width, which is the right answer when nothing has been
+    #: measured to say otherwise.
+    score_mod_vec_size: Any = None
+    #: How many consecutive lanes one pass evaluates the mask over.  The same
+    #: width as the mask is read at, so that a mask written as a range of lanes
+    #: is one value rather than a comparison per lane.
+    mask_mod_vec_size: Any = None
+    #: The ranges the mask keeps, worked out ahead of the kernel rather than in
+    #: it.  Only usable for a mask that is a range; unset leaves the kernel to
+    #: work it out per lane.
+    mask_mod_packed_intervals: Any = None
+
+
+def collect_aux_scalar_symbols(*buffer_groups: Any) -> tuple:
+    """The symbols every captured value is written in terms of, in one order.
+
+    Taken across all of a graph's captures rather than per capture, and in a
+    name order rather than an arrival order, because these are the arguments a
+    kernel is called with: a kernel's signature has to be the same whichever
+    order the values arrived in, or the same graph captured twice would produce
+    two kernels.
+    """
+
+    symbols: dict = {}
+    for buffers in buffer_groups:
+        for buffer in buffers:
+            if isinstance(buffer, sympy.Expr):
+                for symbol in sorted(buffer.free_symbols, key=lambda s: s.name):
+                    symbols.setdefault(symbol, None)
+    return tuple(symbols)
+
+
+# ---------------------------------------------------------------------------
+# What a graph is made of
+# ---------------------------------------------------------------------------
+
+
+def input_buffers_require_grads(graph_module: Any, num_score_mod_placeholders: int) -> bool:
+    """Whether any input beyond the score's own placeholders needs a gradient.
+
+    The placeholders the score was given are the score's business; what matters
+    here is whether the values the kernel was called with are ones a backward
+    pass has to be able to reach.
+    """
+
+    inputs = [node for node in graph_module.graph.nodes if node.op == "placeholder"]
+    if len(inputs) <= num_score_mod_placeholders:
+        return False
+
+    def requires_grad(n: Any) -> bool:
+        tensor_meta = n.meta.get("tensor_meta")
+        return tensor_meta.requires_grad if tensor_meta is not None else False
+
+    return any(requires_grad(n) for n in inputs[num_score_mod_placeholders:])
+
+
+def is_trivial_score_graph(graph_module: Any) -> bool:
+    """Whether the score is just the score, passed through.
+
+    Which is the case the backward pass can be written for: a score that is
+    more than itself changes the gradient in a way the backward pass does not
+    yet account for, and recognising it here is what keeps that from being
+    discovered as a wrong gradient rather than as an unsupported score.
+    """
+
+    graph = graph_module.graph
+    nodes = list(graph.nodes)
+    placeholders = [n for n in nodes if n.op == "placeholder"]
+    output = [n for n in nodes if n.op == "output"]
+    if len(output) != 1:
+        raise AssertionError("Got graph w/ multiple outputs")
+    output_val = output[0].args[0]
+    return output_val == placeholders[0]
+
+
+def is_trivial_mask_graph(graph_module: Any) -> bool:
+    """Whether the mask is the one that keeps everything.
+
+    A mask that keeps everything is not a mask, and recognising that is what
+    lets the kernel take the path that has no mask in it at all.
+    """
+
+    graph = graph_module.graph
+    nodes = list(graph.nodes)
+    placeholders = [n for n in nodes if n.op == "placeholder"]
+    output = [n for n in nodes if n.op == "output"]
+    if len(output) != 1:
+        raise AssertionError("Got graph w/ multiple outputs")
+    output_val = output[0].args[0]
+    return len(placeholders) == 4 and output_val.target is tp.ops.tp.full.default
+
+
+def has_unsupported_cpu_scalar_tensor_captures(
+    score_mod_other_buffers: Any, mask_mod_other_buffers: Any
+) -> bool:
+    """Whether a captured value is a lone number held on the host.
+
+    A kernel is handed numbers, not the values that happen to contain one, so a
+    capture that is a single value on the host has to be turned into a number
+    before it can be one -- and until it has been, the kernel cannot be told
+    what it would have been handed.
+    """
+
+    from ...ir import TensorBox
+
+    for buf in list(score_mod_other_buffers) + list(mask_mod_other_buffers):
+        if isinstance(buf, TensorBox):
+            device = buf.get_device()
+            size = buf.get_size()
+            if device is not None and getattr(device, "type", None) == "cpu" and len(size) == 0:
+                return True
+    return False
