@@ -1075,12 +1075,18 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                 throw std::runtime_error(
                     "Stax scaled_dot_product_attention expects query, key, and value");
             }
+            // The forward form takes a mask, a dropout rate, a scale and a
+            // grouped-query flag; the graph carries none of them here, so each
+            // is passed at the value that means "not asked for".
             result = tpx::ops::scaled_dot_product_attention(
                 value(node.inputs[0]),
                 value(node.inputs[1]),
                 value(node.inputs[2]),
+                std::nullopt,
+                0.0,
                 required_int_attr(node, "is_causal") != 0,
-                required_int_attr(node, "impl"));
+                std::nullopt,
+                false);
         } else if (node.op_type == "_scaled_dot_product_attention_with_lse") {
             // The fused forward also hands back the softmax normalizer, so a
             // gradient that needs it does not have to rebuild the score
