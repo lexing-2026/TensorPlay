@@ -22,7 +22,15 @@ from typing import Any
 
 import tensorplay as tp
 import sympy
-from sympy import Mod
+
+from tensorplay.graph import Node as FxNode
+from tensorplay.graph.experimental.sympy_functions import (
+    FloorDiv,
+    Max,
+    Min,
+    ModularIndexing,
+    Mod,
+)
 
 from ..ir import (
     ComputedBuffer,
@@ -315,6 +323,292 @@ def select_score_mod_vec_size(
         other_buffers,
         SCORE_MOD_AUX_VEC_POLICY,
     )
+
+
+def fx_aux_index_to_sympy(
+    index: Any, index_symbols: Any, node_to_sympy: Any = None
+) -> Any:
+    """An index expression written in a body, as something positions can be asked of.
+
+    Only the operations these masks are written in are answered, and anything
+    else answers with nothing.  That is not a limitation to be worked around:
+    whether an expression can be recognised is what decides whether the read it
+    belongs to can be done several positions at a time, and an expression
+    recognised as something it is not would make a read wide that is not.
+    """
+
+    if isinstance(index, (int, sympy.Integer)) and not isinstance(index, bool):
+        return sympy.Integer(index)
+    if not isinstance(index, FxNode):
+        return None
+    if index in index_symbols:
+        return index_symbols[index]
+    if node_to_sympy is not None:
+        expr = node_to_sympy(index)
+        if expr is not None:
+            return expr
+    if index.op != "call_function":
+        return None
+
+    args = index.args
+    target = index.target
+    if target is tp.ops.tp.abs.default:
+        operand = fx_aux_index_to_sympy(args[0], index_symbols, node_to_sympy)
+        return None if operand is None else sympy.Abs(operand)
+    if target is tp.ops.tp.neg.default:
+        operand = fx_aux_index_to_sympy(args[0], index_symbols, node_to_sympy)
+        return None if operand is None else -operand
+    if target is tp.ops.tp.clamp.default:
+        operand = fx_aux_index_to_sympy(args[0], index_symbols, node_to_sympy)
+        if operand is None:
+            return None
+        lo = args[1] if len(args) > 1 else index.kwargs.get("min")
+        hi = args[2] if len(args) > 2 else index.kwargs.get("max")
+        for bound, combine in ((lo, Max), (hi, Min)):
+            if bound is not None:
+                bound_expr = fx_aux_index_to_sympy(
+                    bound, index_symbols, node_to_sympy
+                )
+                if bound_expr is None:
+                    return None
+                operand = combine(operand, bound_expr)
+        return operand
+
+    if len(args) < 2:
+        return None
+    lhs = fx_aux_index_to_sympy(args[0], index_symbols, node_to_sympy)
+    rhs = fx_aux_index_to_sympy(args[1], index_symbols, node_to_sympy)
+    if lhs is None or rhs is None:
+        return None
+    if target in (tp.ops.tp.add.Tensor, tp.ops.tp.add.Scalar):
+        return V.graph.sizevars.simplify(lhs + rhs)
+    if target in (tp.ops.tp.sub.Tensor, tp.ops.tp.sub.Scalar):
+        return V.graph.sizevars.simplify(lhs - rhs)
+    if target in (tp.ops.tp.mul.Tensor, tp.ops.tp.mul.Scalar):
+        return V.graph.sizevars.simplify(lhs * rhs)
+    if target is tp.ops.tp.minimum.default:
+        return Min(lhs, rhs)
+    if target is tp.ops.tp.maximum.default:
+        return Max(lhs, rhs)
+    if target in (tp.ops.tp.remainder.Tensor, tp.ops.tp.remainder.Scalar):
+        return ModularIndexing(lhs, 1, rhs)
+    if (
+        target is tp.ops.tp.div.Tensor_mode
+        and index.kwargs.get("rounding_mode") == "floor"
+    ):
+        return FloorDiv(lhs, rhs)
+    return None
+
+
+def classify_lane_expr(last_expr: Any, kv_idx: Any, max_width: int = 32) -> Any:
+    """The widest group of consecutive positions an expression walks.
+
+    A read several positions at a time is only a read several positions at a
+    time if those positions are consecutive, so what has to be recognised is an
+    expression that steps by one -- or by something that is a whole number of
+    steps, once the width is known.  Anything else is not a wide read, however
+    many positions it names.
+    """
+
+    if last_expr == kv_idx:
+        return max_width, 1
+    if not isinstance(last_expr, sympy.Expr):
+        return None
+    if not last_expr.is_Add or not last_expr.args:
+        return None
+    base, *terms = last_expr.args
+    step = None
+    for t in terms:
+        coeff = t.as_coeff_Mul()[0]
+        if kv_idx in t.free_symbols:
+            if step is not None or coeff == 0:
+                return None
+            step = int(coeff) if coeff.is_Integer else None
+    if step is None or step == 0:
+        return None
+    if max_width % abs(step) != 0:
+        return None
+    if base.free_symbols & {kv_idx}:
+        return None
+    return max_width, abs(step)
+
+
+def is_safe_partial_aux_index(
+    indices: Any, q_idx_node: Any, kv_idx_node: Any, non_lane_index_nodes: Any
+) -> bool:
+    """Whether a partly-indexed value can be carried to the next step.
+
+    Carried only while the walked position is not among the indices: once it
+    is, the value read so far already depends on which position is being read,
+    and what it depends on cannot be carried forward.  A partly-indexed value
+    that does not depend on the walked position is the same for every position,
+    so it is settled once.
+    """
+
+    _, kv_idx, index_symbols = make_fx_index_symbols(
+        q_idx_node, kv_idx_node, non_lane_index_nodes
+    )
+    for index in indices:
+        expr = fx_aux_index_to_sympy(index, index_symbols)
+        if expr is None or kv_idx in expr.free_symbols:
+            return False
+    return True
+
+
+def direct_aux_load_vec_size_and_kind(
+    indices: Any,
+    buffer: Any,
+    q_idx_node: Any,
+    kv_idx_node: Any,
+    non_lane_index_nodes: Any = (),
+    max_vec_size: int = 8,
+    min_index_rank_for_contiguous_load: int = 1,
+) -> Any:
+    """How wide one read of a captured value can be, and what kind of read it is.
+
+    The same for every position if no index depends on the walked position.  If
+    one does, then only the last axis may depend on it -- a read that varies
+    across two axes is two reads, not one wider one -- and that axis has to be
+    stored adjacently, and the positions have to be consecutive, and the
+    elements have to divide evenly into the width chosen.
+
+    The width is narrowed from the largest on offer until every one of those
+    holds, because a width that does not divide the elements evenly would read
+    past the end of the value on the last position.
+    """
+
+    if not isinstance(indices, (list, tuple)) or not indices:
+        return AuxLoadVecInfo.gather()
+    if not (max_vec_size >= 2 and max_vec_size.bit_count() == 1):
+        raise AssertionError(
+            f"max_vec_size must be a power of two >= 2, got {max_vec_size}"
+        )
+
+    _, kv_idx, index_symbols = make_fx_index_symbols(
+        q_idx_node, kv_idx_node, non_lane_index_nodes
+    )
+    index_exprs = [fx_aux_index_to_sympy(index, index_symbols) for index in indices]
+    if any(expr is None for expr in index_exprs):
+        return AuxLoadVecInfo.gather()
+    if all(kv_idx not in expr.free_symbols for expr in index_exprs):
+        return AuxLoadVecInfo.lane_uniform()
+
+    last_expr = index_exprs[-1]
+    if kv_idx not in last_expr.free_symbols:
+        return AuxLoadVecInfo.gather()
+    if len(indices) < min_index_rank_for_contiguous_load:
+        return AuxLoadVecInfo.gather()
+
+    prefix_exprs = index_exprs[:-1]
+    if any(kv_idx in expr.free_symbols for expr in prefix_exprs):
+        return AuxLoadVecInfo.gather()
+
+    sizes = buffer.get_size()
+    strides = buffer.get_stride()
+    if not V.graph.sizevars.statically_known_equals(strides[-1], 1):
+        return AuxLoadVecInfo.gather()
+
+    offset = buffer.get_layout().offset
+    vec_size = max_vec_size
+    while vec_size >= 2:
+        lane_info = classify_lane_expr(last_expr, kv_idx, max_width=vec_size)
+        if lane_info is not None:
+            width, step = lane_info
+            if width == vec_size and (
+                V.graph.sizevars.statically_known_multiple_of(sizes[-1], vec_size)
+                and V.graph.sizevars.statically_known_multiple_of(offset, vec_size)
+                and all(
+                    V.graph.sizevars.statically_known_multiple_of(stride, vec_size)
+                    for stride in strides[:-1]
+                )
+            ):
+                return AuxLoadVecInfo.contiguous(vec_size)
+        vec_size //= 2
+    return AuxLoadVecInfo.gather()
+
+
+def select_aux_mod_vec_size(
+    graph_module: Any, other_buffers: Any, policy: Any
+) -> int:
+    """How wide the captured values in a body can be read.
+
+    Follows the indexing from each captured value to where it is finally read,
+    carrying along the part of the index that does not depend on the walked
+    position, and keeps the narrowest width any of the reads needs.  A read that
+    names places of its own is read one position at a time and does not narrow
+    the others -- it coexists with a wide read of something else.
+
+    One if nothing could be read wide, which is the honest answer rather than
+    the widest on offer: a width nothing is read at would let a kernel be
+    written for a read that is not happening.
+    """
+
+    if graph_module is None:
+        return 1
+
+    placeholders = [
+        node for node in graph_module.graph.nodes if node.op == "placeholder"
+    ]
+    num_fixed_placeholders = policy.kv_idx_placeholder + 1
+    if len(placeholders) < num_fixed_placeholders:
+        return 1
+
+    aux_indexed_tensors = {
+        placeholder: AuxIndexedTensor(buffer, ())
+        for placeholder, buffer in zip(
+            placeholders[num_fixed_placeholders:], other_buffers
+        )
+    }
+    non_lane_index_nodes = placeholders[
+        policy.non_lane_placeholder_start : policy.q_idx_placeholder
+    ]
+    selected_vec_size = policy.max_vec_size
+    found_vectorizable_load = False
+    for node in graph_module.graph.nodes:
+        if node.op != "call_function" or node.target is not tp.ops.tp.index.Tensor:
+            continue
+        buffer_node, indices = node.args
+        if buffer_node not in aux_indexed_tensors:
+            continue
+        indexed_tensor = aux_indexed_tensors[buffer_node]
+        if not isinstance(indices, (list, tuple)) or not indices:
+            continue
+        full_indices = indexed_tensor.indices + tuple(indices)
+        rank = len(indexed_tensor.buffer.get_size())
+        if len(full_indices) < rank:
+            if is_safe_partial_aux_index(
+                full_indices,
+                placeholders[policy.q_idx_placeholder],
+                placeholders[policy.kv_idx_placeholder],
+                non_lane_index_nodes,
+            ):
+                aux_indexed_tensors[node] = AuxIndexedTensor(
+                    indexed_tensor.buffer, full_indices
+                )
+            continue
+        if len(full_indices) > rank:
+            continue
+        aux_load_vec_info = direct_aux_load_vec_size_and_kind(
+            full_indices,
+            indexed_tensor.buffer,
+            placeholders[policy.q_idx_placeholder],
+            placeholders[policy.kv_idx_placeholder],
+            non_lane_index_nodes=non_lane_index_nodes,
+            max_vec_size=policy.max_vec_size,
+            min_index_rank_for_contiguous_load=policy.min_index_rank_for_contiguous_load,
+        )
+        if aux_load_vec_info.kind is LoadKind.LANE_UNIFORM:
+            found_vectorizable_load = True
+        elif aux_load_vec_info.kind is LoadKind.GATHER:
+            pass
+        elif aux_load_vec_info.kind is LoadKind.CONTIGUOUS:
+            contiguous_vec_size = aux_load_vec_info.vec_size
+            if contiguous_vec_size is None:
+                raise AssertionError("CONTIGUOUS load must have a vec_size")
+            selected_vec_size = min(selected_vec_size, contiguous_vec_size)
+            found_vectorizable_load = True
+
+    return selected_vec_size if found_vectorizable_load else 1
 
 
 # ---------------------------------------------------------------------------
