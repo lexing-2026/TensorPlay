@@ -30,6 +30,7 @@ from tensorplay.utils import _pytree
 from tensorplay.primitives.common import is_boolean_dtype, is_float_dtype
 
 from tensorplay.graph.experimental.symbolic_shapes import (
+    compute_unbacked_bindings,
     free_symbols,
     free_unbacked_symbols,
     GuardOnDataDependentSymNode,
@@ -5921,19 +5922,22 @@ class ConcatKernel(NopKernel):
 
 @dataclasses.dataclass
 class ProcessKernelResult:
-    """The arguments of an external call, sorted into what has to be done to them.
+    """The arguments of a call, sorted, and what the call would produce.
 
     A tensor argument has to be put in memory first, because the call reads
     memory rather than a value, and its strides have to be settled before the
     call can be written since the call is written in terms of them.  The other
     arguments are only passed along.  The two flat lists are in the order the
-    call takes them, and the specification is what puts the tree back together.
+    call takes them, and the unflattening is what puts the tree back together
+    once the two lists have been replaced -- which is what a call written later
+    needs, since by then each of them may be a different value.
     """
 
+    example_output: Any
     tensor_args: list
     non_tensor_args: list
-    spec: Any = None
-    indices: list | None = None
+    unflatten_args: Callable[[Any, Any], Any]
+    unbacked_bindings: dict | None = None
 
 
 class ExternKernel(InputsKernel):
@@ -6178,18 +6182,20 @@ class ExternKernel(InputsKernel):
 
     @classmethod
     def process_kernel(cls, kernel, *args, **kwargs) -> ProcessKernelResult:
-        """The arguments of a call, sorted, with the ones that are memory put there.
+        """The arguments of a call, sorted, and what the call would produce.
 
         Three things happen, and all three are needed before the call can be
-        written.  The arguments are sorted into the ones that are memory and the
-        ones that are only values.  Each of the first kind is given memory,
-        since the call reads memory rather than a value.  And since which memory
-        it reads is what the call is written in terms of, the traced result is
-        worked out again from the strides that resulted, rather than from the
-        ones the values had while they were still being computed.
+        written.  The arguments are sorted into the ones that are memory and
+        the ones that are only values.  Each of the first kind is given memory,
+        since the call reads memory rather than a value.  And since which
+        memory it reads is what the call is written in terms of, the traced
+        result is worked out again from the strides that resulted, rather than
+        from the ones the values had while they were still being computed --
+        which is also how a result whose extents were not known until the
+        inputs were settled is discovered at all.
 
         The flat lists keep the order the call takes its arguments in, and the
-        specification is what puts the original tree back together, since an
+        unflattening is what puts the original tree back together, since an
         argument may itself be a list of arguments.
         """
 
@@ -6198,28 +6204,84 @@ class ExternKernel(InputsKernel):
         binded_args = {"args": args, "kwargs": kwargs}
         args_flat, args_spec = pytree.tree_flatten(binded_args)
 
+        args_flat_is_tensor: list[bool] = []
         tensor_args: list = []
         non_tensor_args: list = []
-        indices: list = []
-        is_tensor: list = []
-
-        for i, arg in enumerate(args_flat):
+        real_non_tensor_args: list = []
+        for arg in args_flat:
             if isinstance(arg, IRNode):
-                is_tensor.append(True)
+                args_flat_is_tensor.append(True)
                 tensor_args.append(arg)
-                indices.append(i)
-                # The value has to be somewhere the call can read before the
-                # call is written, and its layout has to be settled first.
-                tensor_args[-1] = cls.realize_input(arg)
             else:
-                is_tensor.append(False)
+                args_flat_is_tensor.append(False)
                 non_tensor_args.append(arg)
+                real_non_tensor_args.append(arg)
+
+        def unflatten_args(new_tensor_args, new_non_tensor_args):
+            """The call's arguments as they were written, with new values.
+
+            Which of the two lists a position came from is recorded as the
+            arguments were sorted, so putting them back together is a walk of
+            that record rather than a search for what a position was.
+            """
+
+            result = []
+            it_tensors = iter(new_tensor_args)
+            it_non_tensors = iter(new_non_tensor_args)
+            for is_tensor in args_flat_is_tensor:
+                result.append(next(it_tensors) if is_tensor else next(it_non_tensors))
+            restored = pytree.tree_unflatten(result, args_spec)
+            return restored.get("args", []), restored.get("kwargs", {})
+
+        tensor_args = [cls.realize_input(x) for x in tensor_args]
+
+        # The layout is frozen here so that working out the result's strides
+        # cannot be moved by a later change to it.
+        for x in tensor_args:
+            if is_storage_and_layout(x):
+                as_storage_and_layout(x, freeze=True)
+
+        # The result is worked out again from the operands as they now are,
+        # because a call written in terms of strides has to be told the strides
+        # it will run with.  A value that is a view of a constant cannot be
+        # given to the call as a view, so the constant it views is used.
+        example_args: list = []
+        for x in tensor_args:
+            if not isinstance(x, BaseView) and x.get_name() in V.graph.constants:
+                example_args.append(V.graph.constants[x.get_name()])
+            else:
+                example_args.append(ir_node_to_tensor(x))
+
+        new_args, new_kwargs = unflatten_args(example_args, real_non_tensor_args)
+        example_output = kernel(*new_args, **new_kwargs)
+
+        unbacked_bindings: dict | None = None
+        if V.fake_mode is not None and V.fake_mode.shape_env is not None:
+            unbacked_bindings = compute_unbacked_bindings(
+                V.fake_mode.shape_env, example_output, V.current_node.meta.get("val")
+            )
+
+        example_out_li = (
+            [example_output]
+            if not isinstance(example_output, (list, tuple))
+            else example_output
+        )
+        for t in example_out_li:
+            if isinstance(t, tp.Tensor) and t.is_sparse and not config.graph_partition:
+                # A sparse result has no layout for a loop to be laid out in.
+                # Refusing it here says so plainly rather than failing later
+                # where the layout would have been wanted.
+                msg = "sparsity is not handled"
+                if stack_trace := V.graph.current_node.meta.get("stack_trace", None):
+                    msg = f"{msg}, raised from:\n {stack_trace}"
+                V.graph.disable_cudagraphs_reason = msg
 
         return ProcessKernelResult(
+            example_output=example_output,
             tensor_args=tensor_args,
             non_tensor_args=non_tensor_args,
-            spec=args_spec,
-            indices=indices,
+            unflatten_args=unflatten_args,
+            unbacked_bindings=unbacked_bindings,
         )
 
     #: What this was called when the sorting of arguments was all it did.

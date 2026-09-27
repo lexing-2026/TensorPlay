@@ -111,6 +111,11 @@ class _IndexCapture:
     """Ops handler that records the single load a view resolves to."""
 
     def __init__(self):
+        #: Why graphs stopped being captured into device graphs, when they
+        #: did.  Named rather than a bare flag because what a caller wants to
+        #: know is which of the reasons it was, and the reasons differ in
+        #: whether anything can be done about them.
+        self.disable_cudagraphs_reason: str | None = None
         self.loads = []
 
     def load(self, name, index):
