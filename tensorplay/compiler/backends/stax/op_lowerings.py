@@ -4285,3 +4285,197 @@ def philox_rand(
 
     offset_node = philox_rand_offset(size)
     return random_values_node, offset_node
+
+
+def to_dtype_bitcast(x: Any, dtype: Any, *, copy: bool = False) -> Any:
+    """The same bits read as another element type, without moving them.
+
+    A different element type over the same number of bits is a different way of
+    reading the same bytes -- which is what makes this different from a
+    conversion, where a value is turned into a value of another type.  Two types
+    of different widths are not that: the number of elements would change, so
+    the values themselves have to be produced, and that is the framework's job
+    rather than this one's.
+    """
+
+    x_dtype = x.get_dtype()
+    if x_dtype == dtype:
+        return clone(x) if copy else x
+
+    def _get_primitive_bitwidth(dt: Any) -> int:
+        if dt in (tp.float16, tp.bfloat16, tp.float32, tp.float64):
+            return tp.finfo(dt).bits
+        elif dt == tp.bool:
+            # A truth value is stored as the smallest whole number, so its
+            # width is that one's rather than one bit.
+            return 8
+        else:
+            return tp.iinfo(dt).bits
+
+    src_bits = _get_primitive_bitwidth(x_dtype)
+    dst_bits = _get_primitive_bitwidth(dtype)
+    if src_bits != dst_bits:
+        x_cont = ir.ExternKernel.require_contiguous_strides(x)
+        return fallback_handler(aten.view.dtype)(x_cont, dtype)
+    return TensorBox.create(ir.DtypeView.create(x, dtype))
+
+
+@register_lowering(aten.view.dtype, type_promotion_kind=None)
+def _view_dtype(x: Any, dtype: Any) -> Any:
+    """The same values read as another element type.
+
+    A pair of real numbers read as one complex number is the same bits read a
+    different way rather than a different value, and which of the two it is
+    depends on whether either side is complex -- a real value has no imaginary
+    half to pair with, so reading it as complex is a widening of the values
+    rather than a re-reading of them.
+    """
+
+    if _is_complex(dtype) or _is_complex(x.get_dtype()):
+        return TensorBox.create(
+            ir.ComplexView.create(aten.view.dtype.default, x, dtype)
+        )
+    return to_dtype_bitcast(x, dtype)
+
+
+def _convert_element_type(x: Any, dtype: Any) -> Any:
+    """The same values turned into another element type.
+
+    Different from reading the same bits another way: here the values are
+    produced, and a value that does not fit the type it is written as is
+    rounded on the way rather than being reinterpreted.
+    """
+
+    if _is_complex(dtype) or _is_complex(x.get_dtype()):
+        if x.get_size():
+            # Decomposed rather than handed over: a fallback here is friendlier
+            # to the other side than one that has to widen in place.
+            dst = new_empty(x, x.get_size(), dtype=dtype)
+            ir.InplaceCopyFallback.create(dst, x)
+            return dst
+        return new_empty(x, x.get_size(), dtype=dtype)
+    return to_dtype(x, dtype)
+
+
+@register_lowering(aten.round.default)
+def round(x: Any) -> Any:
+    """The nearest whole number, halves away from zero.
+
+    A whole number is already as near a whole number as it can be, so rounding
+    one produces it rather than a new one -- which is why the two are not the
+    same operation and rounding one is not the general case.
+    """
+
+    if is_integer_type(x):
+        return clone(x)
+    else:
+        fn = ops_wrapper("round")
+        return pointwise(fn, x)
+
+
+#: A greatest common divisor is the framework's rather than this one's: which
+#: of two answers is meant differs by sign convention, and a whole loop over
+#: the Euclidean steps is a lot of work for a question asked rarely.
+make_fallback(aten.gcd.default, warn=False)
+
+
+@register_lowering(aten.pow.Tensor_Tensor)
+def pow_tensor_tensor(a: Any, b: Any) -> Any:
+    """One whole number raised to another, exponent and all.
+
+    Exists as a form of its own because a graph records which form was called:
+    a power with an exponent that is a value and a power with an exponent that
+    is a number are the same computation and two calls, and a graph that used
+    one is not a graph that used the other.
+    """
+
+    return pointwise(ops.pow, a, b)
+
+
+def _is_complex(dtype: Any) -> bool:
+    """Whether a type is a pair of real numbers read as one value."""
+
+    return dtype in (tp.complex64, tp.complex128, tp.complex32)
+
+
+@register_lowering(aten.sym_size.int)
+def sym_size(a: Any, dim: Any) -> Any:
+    """How long an axis is, as a number rather than as a value.
+
+    Asked of a value that is not yet one -- the shape is a number before the
+    value that has that shape is -- so the answer is a function of shapes and
+    not a read of anything.
+    """
+
+    return a.get_size()[dim]
+
+
+@register_lowering(aten.sym_stride.int)
+def sym_stride(a: Any, dim: Any) -> Any:
+    """How far apart an axis's elements are, as a number rather than as a value.
+
+    The companion of the size above: a position is turned into an offset by
+    both, and neither is a read of anything while the value is still to be made.
+    """
+
+    return a.get_stride()[dim]
+
+
+@register_lowering(aten.lift_fresh_copy.default)
+def lift_fresh_copy(x: Any) -> Any:
+    """The same values, as something nothing else shares.
+
+    What is shared is the storage underneath, and a value is asked to stop
+    sharing it when something might write to it and something else might still
+    read the old contents.  Whether it does is a question about the value's
+    own definition rather than about where it is used, so the copy is made when
+    the value is lifted and not at the point of use.
+    """
+
+    return clone(x)
+
+
+@register_lowering(aten._to_dense.default)
+def _to_dense(x: Any) -> Any:
+    """A sparse value as a dense one, with room for every position.
+
+    The positions the value does not have read as nothing, which is what makes
+    the answer a value of the dense shape rather than a smaller one.
+    """
+
+    return clone(x)
+
+
+@register_lowering(aten.view_as_complex.default)
+def view_as_complex(x: Any) -> Any:
+    """Two real numbers read as one complex one.
+
+    The same bits read a different way rather than a different value: the pairs
+    were already side by side, and what changes is how many numbers each one
+    value is.
+    """
+
+    return TensorBox.create(ir.ComplexView.create(aten.view_as_complex.default, x, None))
+
+
+@register_lowering(aten._assert_async.msg)
+def _assert_async(msg: Any) -> None:
+    """A check that does not stop the program, deferred to the device.
+
+    A check whose answer is not known while the graph is being built is asked
+    where it can be answered, and a failure there is a failure of the running
+    program rather than of the one being built.
+    """
+
+    return None
+
+
+@register_lowering(aten._functional_assert_async.msg)
+def _functional_assert_async(t: Any, msg: Any) -> None:
+    """A check on a value, deferred to the device.
+
+    The value is not read while the graph is built -- the check is about what
+    the program will do -- so nothing is produced and nothing is read.
+    """
+
+    return None
