@@ -65,6 +65,19 @@ class GetAttrKey:
 
 
 @dataclass(frozen=True)
+class SequenceKey:
+    """Identifies one position of a flattened sequence."""
+
+    idx: int
+
+    def __str__(self) -> str:
+        return f"[{self.idx!r}]"
+
+    def get(self, sequence):
+        return sequence[self.idx]
+
+
+@dataclass(frozen=True)
 class NodeDef:
     """How one registered container type is taken apart and put back together."""
 
@@ -571,10 +584,130 @@ def _deque_unflatten(values, context):
     return deque(values, maxlen=context)
 
 
-register_pytree_node(tuple, _tuple_flatten, _tuple_unflatten)
-register_pytree_node(list, _list_flatten, _list_unflatten)
-register_pytree_node(dict, _dict_flatten, _dict_unflatten)
-register_pytree_node(OrderedDict, _ordereddict_flatten, _ordereddict_unflatten)
-register_pytree_node(defaultdict, _defaultdict_flatten, _defaultdict_unflatten)
-register_pytree_node(deque, _deque_flatten, _deque_unflatten)
-register_pytree_node(namedtuple, _namedtuple_flatten, _namedtuple_unflatten)
+def _tuple_flatten_with_keys(d):
+    values, context = _tuple_flatten(d)
+    return [(SequenceKey(i), v) for i, v in enumerate(values)], context
+
+
+def _list_flatten_with_keys(d):
+    values, context = _list_flatten(d)
+    return [(SequenceKey(i), v) for i, v in enumerate(values)], context
+
+
+def _dict_flatten_with_keys(d):
+    values, context = _dict_flatten(d)
+    return [(MappingKey(k), v) for k, v in zip(context, values)], context
+
+
+def _namedtuple_flatten_with_keys(d):
+    values, context = _namedtuple_flatten(d)
+    # The context carries the class rather than the field names, so the names
+    # come off the value; they are the keys that address its fields.
+    return [(GetAttrKey(f), v) for f, v in zip(d._fields, values)], context
+
+
+def _ordereddict_flatten_with_keys(d):
+    values, context = _ordereddict_flatten(d)
+    return [(MappingKey(k), v) for k, v in zip(context, values)], context
+
+
+def _defaultdict_flatten_with_keys(d):
+    values, context = _defaultdict_flatten(d)
+    _, dict_context = context
+    return [(MappingKey(k), v) for k, v in zip(dict_context, values)], context
+
+
+def _deque_flatten_with_keys(d):
+    values, context = _deque_flatten(d)
+    return [(SequenceKey(i), v) for i, v in enumerate(values)], context
+
+
+register_pytree_node(tuple, _tuple_flatten, _tuple_unflatten,
+                    flatten_with_keys_fn=_tuple_flatten_with_keys)
+register_pytree_node(list, _list_flatten, _list_unflatten,
+                    flatten_with_keys_fn=_list_flatten_with_keys)
+register_pytree_node(dict, _dict_flatten, _dict_unflatten,
+                    flatten_with_keys_fn=_dict_flatten_with_keys)
+register_pytree_node(OrderedDict, _ordereddict_flatten, _ordereddict_unflatten,
+                    flatten_with_keys_fn=_ordereddict_flatten_with_keys)
+register_pytree_node(defaultdict, _defaultdict_flatten, _defaultdict_unflatten,
+                    flatten_with_keys_fn=_defaultdict_flatten_with_keys)
+register_pytree_node(deque, _deque_flatten, _deque_unflatten,
+                    flatten_with_keys_fn=_deque_flatten_with_keys)
+register_pytree_node(namedtuple, _namedtuple_flatten, _namedtuple_unflatten,
+                    flatten_with_keys_fn=_namedtuple_flatten_with_keys)
+
+
+def keystr(kp) -> str:
+    """Given a key path, return a pretty-printed representation."""
+    return "".join([str(k) for k in kp])
+
+
+def _generate_key_paths(
+    key_path: tuple,
+    tree: PyTree,
+    is_leaf: Optional[Callable[[PyTree], bool]] = None,
+):
+    """Each leaf of a tree, with the keys that lead to it.
+
+    A tree flattened without keys says what the leaves are but not where
+    each one was, and "where" is what a reader comparing two trees needs: a
+    difference is only useful if it names the place it happened.
+    """
+
+    if is_leaf and is_leaf(tree):
+        yield key_path, tree
+        return
+
+    node_type = _get_node_type(tree)
+    handler = SUPPORTED_NODES.get(node_type)
+    if not handler:
+        # This is a leaf
+        yield key_path, tree
+        return
+
+    flatten_with_keys = handler.flatten_with_keys_fn
+    if flatten_with_keys:
+        key_children, _ = flatten_with_keys(tree)
+        for k, c in key_children:
+            yield from _generate_key_paths((*key_path, k), c, is_leaf)
+    else:
+        # We registered this pytree but didn't add a flatten_with_keys_fn, complain.
+        raise ValueError(
+            f"Did not find a flatten_with_keys_fn for type: {node_type}. "
+            "Please pass a flatten_with_keys_fn argument to register_pytree_node."
+        )
+
+
+def tree_flatten_with_path(
+    tree: PyTree,
+    is_leaf: Optional[Callable[[PyTree], bool]] = None,
+) -> tuple[list, TreeSpec]:
+    """Flattens a pytree like :func:`tree_flatten`, but also returns each leaf's key path."""
+
+    _, treespec = tree_flatten(tree, is_leaf)
+    return list(_generate_key_paths((), tree, is_leaf)), treespec
+
+
+def tree_map_with_path(
+    func: Callable[..., Any],
+    tree: PyTree,
+    *rests: PyTree,
+    is_leaf: Optional[Callable[[PyTree], bool]] = None,
+) -> PyTree:
+    """Like :func:`tree_map`, but the provided callable takes an additional key path argument.
+
+    The callable is given the keys that lead to the leaf before the leaf
+    itself, so that a value it produces can be labelled with where it came
+    from rather than only with what it is.
+    """
+
+    keypath_leaves, treespec = tree_flatten_with_path(tree, is_leaf)
+    keypath_leaves = list(zip(*keypath_leaves, strict=True))
+    # The rests are documented to have this tree's structure, so their leaves
+    # line up with its leaves by position; the tree is flattened only to find
+    # out how many there are.
+    all_keypath_leaves = keypath_leaves + [tree_flatten(r)[0] for r in rests]
+    return tree_unflatten(
+        (func(*xs) for xs in zip(*all_keypath_leaves, strict=True)), treespec
+    )
