@@ -16,10 +16,23 @@ and a tuple of coordinates to the one place that asks.
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import Any
 
 import tensorplay as tp
 import sympy
+from sympy import Mod
+
+from ..ir import (
+    ExternKernel,
+    FixedLayout,
+    FlexibleLayout,
+    InputBuffer,
+    IRNode,
+    TensorBox,
+)
+from ..loops import V, get_fill_order
+from tensorplay.utils._pytree import tree_map, tree_map_only
 from tensorplay.graph.experimental.sympy_functions import FloorDiv
 
 
@@ -323,3 +336,225 @@ def has_unsupported_cpu_scalar_tensor_captures(
             if device is not None and getattr(device, "type", None) == "cpu" and len(size) == 0:
                 return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Shapes these kernels assume
+# ---------------------------------------------------------------------------
+
+
+def is_power_of_2(n: Any) -> bool:
+    """Whether a number is a power of two.
+
+    A power of two is one bit set, so a number that is one has exactly one bit
+    that is not in the number below it.  Zero is not one however it is
+    written, and is the one value where the test would otherwise say yes.
+    """
+
+    return n != 0 and ((n & (n - 1)) == 0)
+
+
+def next_power_of_two(n: Any) -> Any:
+    """The smallest power of two at least as large.
+
+    A kernel that processes a number of elements at a time wants that number to
+    be one it can halve, because halving is how a range of work is split.  A
+    length that is not a power of two is rounded up rather than down, because
+    rounding down would leave positions with nobody to process them.
+    """
+
+    if n <= 0:
+        return 1
+    return 2 ** math.ceil(math.log2(n))
+
+
+def set_head_dim_values(
+    kernel_options: Any, qk_head_dim: Any, v_head_dim: Any, graph_sizevars: Any
+) -> None:
+    """Record the two head sizes a kernel is written for, and the rounded forms.
+
+    Two sizes rather than one, because the size the scores are computed at and
+    the size the values are combined at are not always the same, and a kernel
+    written for one of them cannot be used for the other.  Recorded rather than
+    read from the graph because the kernel is written before the graph is read
+    and has to agree with it.
+
+    The rounded forms are recorded alongside: a kernel works in whole groups of
+    a power of two, and a size that is not one is padded up to the next, which
+    is why the padding is the kernel's business and not the caller's.
+    """
+
+    qk_head_dim_static = graph_sizevars.guard_int(qk_head_dim)
+    kernel_options.setdefault("QK_HEAD_DIM", qk_head_dim_static)
+    kernel_options.setdefault(
+        "QK_HEAD_DIM_ROUNDED", next_power_of_two(qk_head_dim_static)
+    )
+
+    v_head_dim_static = graph_sizevars.guard_int(v_head_dim)
+    kernel_options.setdefault("V_HEAD_DIM", v_head_dim_static)
+    kernel_options.setdefault(
+        "V_HEAD_DIM_ROUNDED", next_power_of_two(v_head_dim_static)
+    )
+
+    # Whether either size is already a whole number of groups.  Recorded
+    # because a kernel can take a shorter path when both are, and a kernel
+    # that has to pad is a different kernel from one that does not -- so
+    # whether it does is part of what the kernel is.
+    kernel_options.setdefault(
+        "SAFE_HEAD_DIM",
+        is_power_of_2(qk_head_dim_static) and is_power_of_2(v_head_dim_static),
+    )
+
+
+def can_skip_boundary_checks(seq_len: Any, sparse_block_size: Any) -> bool:
+    """Whether an axis divides into whole tiles, so no tile runs off its end.
+
+    Asked before a configuration is chosen, and therefore against the largest
+    tile a candidate might use rather than against whichever one is chosen:
+    a kernel that skips the check must skip it for every shape it will see, not
+    for the one that happens to be measured first.
+    """
+
+    return V.graph.sizevars.statically_known_true(
+        sympy.And(
+            sympy.Eq(Mod(seq_len, 128), 0),
+            sympy.Or(
+                sympy.Eq(Mod(seq_len, sparse_block_size), 0),
+                sympy.Ge(sparse_block_size, seq_len),
+            ),
+        )
+    )
+
+
+def is_tensor_ir_node(node: Any) -> bool:
+    """Whether a node is a value rather than a number.
+
+    The two are told apart here because a value and a number are both things a
+    graph holds, and a list of them has to be taken apart before it can be
+    passed on -- which is only possible if which is which is known.
+    """
+
+    return isinstance(node, IRNode) and node.has_tensor_output()
+
+
+def contiguous_last_dim(x: Any) -> Any:
+    """A value whose innermost axis has no gaps between its elements.
+
+    Asked for by a kernel that reads along that axis one element after another,
+    which is only the same thing as walking positions when the elements are
+    adjacent.  Reordered rather than copied, because a copy here would be a
+    copy of the whole value to fix a property of one axis of it.
+    """
+
+    strides = x.maybe_get_stride()
+    if strides and strides[-1] != 1:
+        contiguous_stride_order = list(reversed(range(len(x.get_size()))))
+        return ExternKernel.require_stride_order(x, contiguous_stride_order)
+    return x
+
+
+def maybe_realize(args: Any) -> Any:
+    """Write down every value in a list that has not been written down yet.
+
+    Taken one at a time and asked of each, because what a kernel is handed is
+    a list of things of different kinds -- values, and numbers that stand for
+    shapes -- and only some of them are things that can be written down.
+    """
+
+    from ..op_lowerings import realize_inputs
+
+    return tree_map(
+        lambda x: (
+            realize_inputs(x) if x is not None and not isinstance(x, sympy.Expr) else x
+        ),
+        args,
+    )
+
+
+def freeze_irnodes(tree: Any) -> Any:
+    """Stop every value in a tree from being written anywhere else.
+
+    A kernel is handed values and decides for itself where they live, so a
+    value whose layout could still change after it was handed would be a value
+    the kernel and the graph disagree about.  A value that cannot be frozen is
+    one that is not a value -- a number standing for a shape -- and is left
+    alone rather than refused.
+    """
+
+    if tree is None:
+        return None
+
+    def _freeze(node: Any) -> Any:
+        try:
+            node.freeze_layout()
+        except (NotImplementedError, AttributeError):
+            pass
+        return node
+
+    return tree_map_only(IRNode, _freeze, tree)
+
+
+def create_placeholder(
+    name: str, dtype: Any, device: Any, size: Any = None
+) -> Any:
+    """A value the kernel is handed that nothing has produced yet.
+
+    A kernel is written against a signature, and the values in it are what the
+    kernel reads; the ones nothing has produced are the arguments, and they
+    are given a shape here so that the kernel can be written before anything
+    has been computed.
+    """
+
+    input_buffer = InputBuffer(
+        name=name,
+        layout=FixedLayout(
+            device,
+            dtype,
+            size if size else [],
+            FlexibleLayout.contiguous_strides(size) if size else [],
+        ),
+    )
+    return TensorBox.create(input_buffer)
+
+
+def construct_strides(sizes: Any, fill_order: Any) -> Any:
+    """The strides a shape has when its axes are filled in a given order.
+
+    Filled innermost-first because that is what makes the result dense: the
+    axis filled first has the smallest stride, and every axis after it moves
+    further.  The order is given rather than inferred because a kernel needs
+    the layout its own reads assume, and which one that is is a property of
+    how it reads rather than of the value it reads.
+    """
+
+    if len(sizes) != len(fill_order):
+        raise AssertionError("Length of sizes must match the length of the fill order")
+    strides = [0] * len(sizes)
+    current_stride: Any = 1
+    for dim in fill_order:
+        strides[dim] = current_stride
+        current_stride = current_stride * sizes[dim]
+    return strides
+
+
+def infer_dense_strides(size: Any, orig_strides: Any) -> Any:
+    """Dense strides that keep the layout the value already had.
+
+    A value is read in the order its layout says, and reordering the axes would
+    make every read wrong -- so the layout is kept and only the gaps are
+    removed.  The innermost axis is made adjacent whatever the layout said,
+    because these kernels read along it one element after another, and that is
+    only walking positions when the elements are next to each other.
+    """
+
+    fill_order = get_fill_order(orig_strides, V.graph.sizevars.shape_env)
+    strides = construct_strides(size, fill_order)
+
+    if strides[-1] != 1:
+        last_dim = len(size) - 1
+        fill_order = list(fill_order)
+        fill_order.remove(last_dim)
+        fill_order = [last_dim] + fill_order
+        strides = construct_strides(size, fill_order)
+
+    return strides
