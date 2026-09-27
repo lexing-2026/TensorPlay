@@ -3087,13 +3087,24 @@ def to_dtype(x: Any, dtype: Any, copy: bool = False) -> Any:
     if src_dtype == dtype:
         return clone(x) if copy else x
 
-    def _to_dtype(value: Any) -> Any:
-        result = ops.to_dtype(value, dtype, src_dtype=src_dtype)
+    loader = x.make_loader()
+    size, device = x.get_size(), x.get_device()
+
+    def _to_dtype(index: Any) -> Any:
+        result = ops.to_dtype(loader(index), dtype, src_dtype=src_dtype)
         if dtype in (tp.bfloat16, tp.float16):
             result = ops.to_dtype(result, "float32")
         return result
 
-    return pointwise(_to_dtype, x)
+    # Described from the value being converted rather than from whatever node
+    # is current: this runs while some other node is being lowered, and that
+    # node's shape and type are not this value's.
+    return Pointwise.create(
+        device=device,
+        dtype=dtype,
+        inner_fn=_to_dtype,
+        ranges=size,
+    )
 
 
 #: An axis that cannot be walked by the loop this compiler generates is walked
@@ -3242,3 +3253,190 @@ def logcumsumexp(x: Any, dim: Any, dtype: Any = None) -> Any:
     if result is None:
         return fallback_logcumsumexp(x, dim=dim)
     return result
+
+
+def canonicalize_dim(rank: int, idx: int, wrap_scalar: bool = True) -> int:
+    """A dimension named relative to the back, as one counted from the front.
+
+    The last dimension is -1 and the one before it -2, which is a naming that
+    needs the rank to resolve -- and a rank of zero has no last dimension, so a
+    single value is given one dimension to be the last of.  Every way of asking
+    for a dimension resolves to the same positive number here, so what walks a
+    shape never has to know which convention it was called with.
+    """
+
+    if rank < 0:
+        raise IndexError(f"Rank cannot be negative but got {rank}")
+
+    if rank == 0:
+        if not wrap_scalar:
+            raise IndexError(
+                f"Dimension specified as {idx} but tensor has no dimensions"
+            )
+        rank = 1
+
+    if idx >= 0 and idx < rank:
+        return idx
+
+    _idx = idx + rank if idx < 0 else idx
+
+    if _idx < 0 or _idx >= rank:
+        raise IndexError(
+            f"Dimension out of range (expected to be in range of "
+            f"[{-rank}, {rank - 1}], but got {idx})"
+        )
+
+    return _idx
+
+
+def iota(
+    length: Any,
+    *,
+    start: Any,
+    step: Any,
+    dtype: Any,
+    device: Any,
+    requires_grad: bool,
+) -> Any:
+    """The numbers from ``start`` by ``step``, as many as there are positions.
+
+    A walk that needs to know which position it is at asks for this rather than
+    being handed the numbers, because the numbers are a function of the
+    position: the same position is the same number in every walk, so producing
+    them is the same operation however many walks ask for it.
+    """
+
+    def fn(index: Any) -> Any:
+        return ops.index_expr(step * index[0] + start, dtype=dtype)
+
+    return Pointwise.create(
+        device=decode_device(device),
+        dtype=dtype,
+        inner_fn=fn,
+        ranges=[length],
+    )
+
+
+def _full(fill_value: Any, device: Any, dtype: Any, size: Any) -> Any:
+    """A tensor of one value, from a number or from a value that is not known yet.
+
+    What to fill with is one of three things -- a number, an expression of the
+    program, or a value of no dimensions -- and which one it is decides how the
+    fill is written, so it is asked here rather than assumed by the caller.
+    """
+
+    value = fill_value
+    if not isinstance(fill_value, (int, float)) and hasattr(value, "value"):
+        value = value.value
+
+    if isinstance(value, (int, float)):
+
+        def inner_fn(index: Any) -> Any:
+            return ops.constant(value, dtype)
+
+    elif isinstance(value, sympy.Basic):
+
+        def inner_fn(index: Any) -> Any:
+            return ops.index_expr(value, dtype)
+
+    else:
+        if len(value.get_size()) != 0:
+            raise AssertionError("expected: len(value.get_size()) == 0")
+        value_loader = value.make_loader()
+
+        def inner_fn(index: Any) -> Any:
+            return value_loader([])
+
+    return Pointwise.create(
+        device=device,
+        dtype=dtype,
+        inner_fn=inner_fn,
+        ranges=size,
+    )
+
+
+def view(x: Any, sizes: Any) -> Any:
+    """The same values read as a different shape.
+
+    A shape with the same elements in it is not a copy: what changes is how a
+    position is turned into an offset, and the values do not move.  A value that
+    is already a view of something keeps that view -- taking the underlying
+    buffer of a view of a view would throw away the view in between, and the
+    shape asked for here would then describe the wrong bytes.
+    """
+
+    data = x.data if isinstance(x, TensorBox) else x
+    return TensorBox(View.create(data, sizes))
+
+
+#: An axis too long to be sorted by the network this compiler generates is
+#: sorted by the framework instead.  Both are the same computation; which one
+#: runs is decided per call, because whether an axis can be sorted is a fact
+#: about its length that is not known until the program runs.
+sort_fallback = fallback_handler(aten.sort.stable, add_to_fallback_set=False)
+
+
+@register_lowering(aten.sort.stable, type_promotion_kind=None)
+def sort_stable(x: Any, *, stable: Any = None, dim: Any = -1, descending: Any = False) -> Any:
+    """The values of an axis in order, and which of them each one was.
+
+    The values and the positions are two halves of one answer and are produced
+    by one walk, so they are built together: the positions start as the numbers
+    of the axis and are carried alongside the values, which is what makes the
+    second half free.
+
+    Where the positions are kept decides how long an axis can be.  A network
+    that holds every position at once spends a register on each, so the narrower
+    type is worth its smaller range: an axis that fits in the narrow type is
+    sorted here, and one that does not is left to the framework rather than
+    risking a number that no longer fits.
+    """
+
+    if stable is None:
+        stable = False
+
+    shape = x.get_size()
+    device = x.get_device()
+    dim = canonicalize_dim(len(shape), dim)
+    if len(shape) == 0:
+        return clone(x), _full(0, device, tp.int64, shape)
+
+    dim_size = shape[dim] if len(shape) else 1
+    if config.triton.decompose_sort_ops:
+        idx_dtype = tp.int32
+    else:
+        idx_dtype = tp.int16
+    if not V.graph.sizevars.guard_or_false(
+        sympy.Lt(dim_size, tp.iinfo(idx_dtype).max)
+    ):
+        return sort_fallback(x, stable=stable, dim=dim, descending=descending)
+
+    indices = iota(
+        dim_size, start=0, step=1, dtype=idx_dtype, device=device, requires_grad=False
+    )
+    view_shape = [1] * len(shape)
+    if len(shape):
+        view_shape[dim] = dim_size
+    indices = view(indices, view_shape)
+    indices = lower_expand(indices, shape)
+
+    values, indices = ir.Sort.create(
+        device=device,
+        dtypes=(x.dtype, indices.dtype),
+        inner_fns=(x.make_loader(), indices.make_loader()),
+        size=shape,
+        axis=dim,
+        stable=stable,
+        descending=descending,
+    )
+    if values is None:
+        return sort_fallback(x, stable=stable, dim=dim, descending=descending)
+
+    if indices is None:
+        raise AssertionError("expected: indices is not None")
+    return values, to_dtype(indices, tp.int64)
+
+
+@register_lowering(aten.sort.default, type_promotion_kind=None)
+def sort(x: Any, dim: Any = -1, descending: Any = False) -> Any:
+    return sort_stable(x, stable=False, dim=dim, descending=descending)

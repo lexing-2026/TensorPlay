@@ -461,6 +461,14 @@ deterministic = os.environ.get("TP_DETERMINISTIC", "0") == "1"
 # it, which is the trade when a candidate is suspected of misbehaving.
 autotune_in_subproc = os.environ.get("TP_AUTOTUNE_IN_SUBPROC", "0") == "1"
 
+# Whether a written-out template may be kept and handed back rather than
+# written again.  Off by default here: the cache is keyed by what went into it,
+# and a key that is missing a piece of what the writing depended on returns a
+# kernel that was written for something else.
+enable_caching_generated_triton_templates: bool = (
+    os.environ.get("TP_ENABLE_CACHING_GENERATED_TRITON_TEMPLATES", "0") == "1"
+)
+
 # Whether a launch tells the runtime what it is launching from a table that
 # says what the fields mean, rather than from whatever fields happen to be
 # readable off the compiled object.  The table is the contract; the readable
@@ -857,6 +865,18 @@ class _TritonConfig:
     #: Keep the machine code the runtime produced beside the cache entry, which
     #: is what a reader needs when the entry itself will not load.
     store_cubin = False
+
+    #: Write the operations that only mean something as a sort out as a sort
+    #: plus whatever else they are, so that the sort is written once and reused
+    #: rather than each of them being written on its own.  It also decides the
+    #: width of the positions a sort carries, and so how long an axis can be
+    #: sorted here: a wider position sorts a longer axis and costs a register
+    #: per element, which is why it is not paid for by default.  Off, because
+    #: the wider positions are for axes long enough to need them and nothing
+    #: says in advance which those are.
+    decompose_sort_ops: bool = (
+        os.environ.get("TP_DECOMPOSE_SORT_OPS", "0") == "1"
+    )
 
     #: Write down a trace of each launch as it runs.
     proton_profiling: bool = (

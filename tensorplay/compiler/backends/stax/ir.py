@@ -4426,6 +4426,7 @@ class Sort(Loops):
     ranges: list
     sort_ranges: list
     stable: bool
+    descending: bool
     reindex: Any
     reduction_hint: Any
     output_index: int
@@ -4451,7 +4452,7 @@ class Sort(Loops):
     def store_reduction(self, output_name, indexer, vars, sort_vars):
         idx = self.reindex(vars, sort_vars)
         values = tuple(inner_fn(idx) for inner_fn in self.inner_fns)
-        result = ops.sort(self.dtypes, values, self.stable)
+        result = ops.sort(self.dtypes, values, self.stable, self.descending)
         return ops.store(
             output_name or "unnamed", indexer(idx), result[self.output_index]
         )
@@ -4492,10 +4493,17 @@ class Sort(Loops):
         size,
         axis,
         stable,
+        descending,
         reduction_hint=ReductionHint.DEFAULT,
         **kwargs,
     ):
-        """Build a sort over one axis, returning one realized value per result."""
+        """Build a sort over one axis, returning one realized value per result.
+
+        Which end the values go in is part of what a sort is rather than
+        something applied to its result, so it is settled where the sort is
+        built: the walk reads the order it has been given and extends it, and
+        an order has a direction.
+        """
 
         sort_ranges = []
         for i, s in enumerate(size):
@@ -4520,9 +4528,17 @@ class Sort(Loops):
                     inner_fn=inner_fns[output_index],
                     inner_fns=inner_fns,
                     size=size,
-                    ranges=[sympy_index_symbol(f"x{i}") for i in range(len(size))],
+                    # The axis being sorted is walked apart from the others and
+                    # put back by reindexing, so a range that also contained it
+                    # would walk it twice and the sizes would not add up.
+                    ranges=[
+                        sympy_index_symbol(f"x{i}")
+                        for i in range(len(size))
+                        if i != axis
+                    ],
                     sort_ranges=sort_ranges,
                     stable=stable,
+                    descending=descending,
                     reindex=reindex,
                     reduction_hint=reduction_hint,
                     output_index=output_index,
