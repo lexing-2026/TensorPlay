@@ -153,10 +153,28 @@ _EXTRA_RANDOM_NAMES = (
 )
 
 
-def register_rng_decompositions() -> None:
-    """Write the random operations as reads at a position."""
+_registered = False
 
+
+def register_rng_decompositions() -> None:
+    """Write the random operations as reads at a position.
+
+    Asked for each time the table of decompositions is read rather than once
+    at import, because a program that never captures should not pay for
+    reading them.  What it writes goes into a table that outlives the call, so
+    writing it twice is not writing it twice: only the first ask does.
+    """
+
+    # The prims are what the reads below go through, so they are set up every
+    # time: what a read means depends on which pass is running, and that is
+    # per pass rather than per registration.
     register_rng_prims()
+
+    global _registered
+    if _registered:
+        return
+    _registered = True
+
     register_decomposition(aten.rand)(rand)
     register_decomposition(aten.rand_like)(rand_like)
     register_decomposition(aten.bernoulli_)(bernoulli_)

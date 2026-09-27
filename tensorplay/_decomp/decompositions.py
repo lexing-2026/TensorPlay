@@ -1566,6 +1566,69 @@ def _safe_softmax(self, dim, dtype=None):
     return tp.where(all_masked, tp.zeros_like(softmax), softmax)
 
 
+def _sdpa_gqa_key_value(query, key, value, enable_gqa):
+    """Key and value heads repeated so each query head has one of its own.
+
+    With grouped-query attention several query heads read the same key and
+    value head, so the key and value are given as many heads as the query has
+    before the scores are taken.
+    """
+    if not enable_gqa or key.dim() < 3 or query.dim() < 3:
+        return key, value
+    hq, hk = query.shape[-3], key.shape[-3]
+    if hq == hk:
+        return key, value
+    if hq % hk != 0:
+        raise ValueError(
+            "sdpa: enable_gqa requires the query head count to be divisible "
+            f"by the key/value head count, got {hq} and {hk}"
+        )
+    repeats = [1] * key.dim()
+    repeats[-3] = hq // hk
+    return key.repeat(repeats), value.repeat(repeats)
+
+
+def _sdpa_math_attention(query, key, value, attn_mask, dropout_p, is_causal,
+                         scale, enable_gqa):
+    """Attention written out of the operations it is made of.
+
+    The scale folds into the query before the scores are taken rather than
+    dividing them after, which is what a caller asking for a scale means; the
+    mask is what is added to the scores, so a boolean mask selects and a
+    floating one offsets; and the causal mask is the upper triangle of the
+    score matrix set to nothing.
+    """
+    key, value = _sdpa_gqa_key_value(query, key, value, enable_gqa)
+    if scale is None:
+        scale = 1.0 / (query.shape[-1] ** 0.5)
+    scores = tp.matmul(query * scale, key.transpose(-2, -1))
+    if is_causal:
+        t_q, t_k = scores.shape[-2], scores.shape[-1]
+        keep = tp.ones([t_q, t_k], dtype=tp.bool, device=scores.device).tril(
+            diagonal=t_k - t_q
+        )
+        scores = tp.where(keep, scores, -math.inf)
+    if attn_mask is not None:
+        if attn_mask.dtype == tp.bool:
+            scores = tp.where(attn_mask, scores, -math.inf)
+        else:
+            scores = scores + attn_mask
+    probs = _safe_softmax(scores, -1)
+    if dropout_p:
+        # Dropping is written as the operation that keeps what it kept, which
+        # already rescales what it kept so that what survives averages to what
+        # was there.
+        probs = ops.native_dropout.default(probs, dropout_p, True)[0]
+    return tp.matmul(probs, value)
+
+
+@register_decomposition(ops.scaled_dot_product_attention.default)
+def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
+                                 is_causal=False, *, scale=None, enable_gqa=False):
+    return _sdpa_math_attention(query, key, value, attn_mask, dropout_p,
+                                is_causal, scale, enable_gqa)
+
+
 # ---------------------------------------------------------------------------
 # Losses (reduction: 0 none, 1 mean, 2 sum)
 # ---------------------------------------------------------------------------

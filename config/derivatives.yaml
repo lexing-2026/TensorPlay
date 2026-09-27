@@ -682,10 +682,10 @@
 - name: std(Tensor self, int correction=1) -> Tensor
   self: grad * (self - self.mean()) / (result * (self.numel() - correction))
 
-- name: scaled_dot_product_attention(Tensor query, Tensor key, Tensor value, bool is_causal=false, int impl=0) -> Tensor
-  query: std::get<0>(scaled_dot_product_attention_backward(grad, query, key, value, is_causal, impl))
-  key: std::get<1>(scaled_dot_product_attention_backward(grad, query, key, value, is_causal, impl))
-  value: std::get<2>(scaled_dot_product_attention_backward(grad, query, key, value, is_causal, impl))
+- name: scaled_dot_product_attention(Tensor query, Tensor key, Tensor value, Tensor? attn_mask=None, float dropout_p=0.0, bool is_causal=False, *, float? scale=None, bool enable_gqa=False) -> Tensor
+  query: std::get<0>(scaled_dot_product_attention_backward(grad, query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa))
+  key: std::get<1>(scaled_dot_product_attention_backward(grad, query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa))
+  value: std::get<2>(scaled_dot_product_attention_backward(grad, query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa))
 
 - name: _scaled_dot_product_attention_with_lse(Tensor query, Tensor key, Tensor value, bool is_causal=false, int impl=0) -> (Tensor output, Tensor logsumexp)
   output_differentiability: [True, False]

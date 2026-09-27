@@ -82,7 +82,7 @@ inline std::pair<Tensor, Tensor> expand_gqa(const Tensor& query,
                                             const Tensor& key,
                                             const Tensor& value,
                                             bool enable_gqa) {
-  using ops::view, ops::expand, ops::reshape;
+  using ops::view, ops::expand, ops::reshape, ops::unsqueeze;
   if (!enable_gqa) return {key, value};
   if (query.dim() < 3 || key.dim() < 3) {
     TP_THROW(ValueError, "sdpa math: enable_gqa requires 4D inputs");
@@ -97,19 +97,21 @@ inline std::pair<Tensor, Tensor> expand_gqa(const Tensor& query,
   }
   const int64_t g = hq / hk;
   auto expand_heads = [&](const Tensor& t) {
-    std::vector<int64_t> shape(static_cast<std::vector<int64_t>>(t.shape()));
-    const int64_t rank = t.dim();
-    // (..., Hk, S, D) -> (..., Hk, 1, S, D) -> (..., Hk, g, S, D)
-    shape.insert(shape.end() - 2, 1);
-    shape[rank - 2] = g;
-    Tensor t5 = view(t, shape);
-    Tensor t5e = expand(t5, shape);
-    // (..., Hk, g, S, D) -> (..., Hq, S, D) with Hq = Hk * g
-    std::vector<int64_t> out_shape(shape.begin(), shape.end() - 3);
-    out_shape.push_back(hq);
-    out_shape.push_back(t.size(-2));
-    out_shape.push_back(t.size(-1));
-    return reshape(t5e, out_shape);
+    // (..., Hk, S, D) -> (..., Hk, g, S, D) -> (..., Hq, S, D)
+    const auto extents = static_cast<std::vector<int64_t>>(t.shape());
+    const int64_t head_axis = static_cast<int64_t>(extents.size()) - 3;
+    // A group axis of one is added ahead of the head axis, and then expanded to
+    // g: adding an axis is what unsqueeze is for, and repeating along the new
+    // axis is what expand is for.  Reading the head and the group as one axis
+    // afterwards is a reshape, since both are there and no axis is added.
+    Tensor repeated = expand(unsqueeze(t, head_axis), [&] {
+      std::vector<int64_t> shape = extents;
+      shape.insert(shape.begin() + head_axis, g);
+      return shape;
+    }());
+    std::vector<int64_t> merged = extents;
+    merged[static_cast<size_t>(head_axis)] = hq;
+    return reshape(repeated, merged);
   };
   return {expand_heads(key), expand_heads(value)};
 }
@@ -392,5 +394,73 @@ inline std::vector<int64_t> lengths_to_vector(const Tensor& lengths) {
   TP_THROW(TypeError, "ctc_loss: lengths must be int32 or int64");
 }
 
+// The gradient of the attention above, in terms of the same operations the
+// attention itself is in.  Writing it this way rather than as a second set of
+// hand-rolled kernels is what keeps a masked, dropped, scaled or grouped call
+// differentiable by the same argument as a plain one: the scores are taken
+// again here, so whatever was added to them, and whatever was folded into the
+// query, is accounted for by the same arithmetic that produced them.
+//
+// With S = softmax(scores) and O = S @ V, the gradients are
+//   dS = grad_out @ V^T,  dV = S^T @ grad_out,
+//   d(scores) = S * (dS - rowsum(dS * S)),  scaled back onto the query by the
+//   same factor the scores were scaled by.
+inline std::tuple<Tensor, Tensor, Tensor> sdpa_math_backward_composite(
+    const Tensor& grad_output, const Tensor& query, const Tensor& key,
+    const Tensor& value, const std::optional<Tensor>& attn_mask,
+    double dropout_p, bool is_causal, const std::optional<double>& scale,
+    bool enable_gqa) {
+  using ops::matmul, ops::mul, ops::transpose, ops::sum, ops::where, ops::ones,
+      ops::tril, ops::to, ops::add, ops::reshape, ops::sub;
+
+  // The key and value are given as many heads as the query has, by the same
+  // expansion the forward does, so that both directions agree on which head
+  // each query head reads.
+  auto [k, v] = expand_gqa(query, key, value, enable_gqa);
+  const int64_t hk = key.dim() >= 3 ? key.size(-3) : 1;
+  const int64_t hq = query.dim() >= 3 ? query.size(-3) : 1;
+  const int64_t g = (enable_gqa && hq != hk) ? hq / hk : 1;
+
+  double s = math_scale_factor(scale, query.size(-1));
+  const bool half_to_float = query.dtype() == DType::Float16 ||
+                             query.dtype() == DType::BFloat16;
+  const DType compute = half_to_float ? DType::Float32 : query.dtype();
+  Tensor q = query.to(compute), kk = k.to(compute), vv = v.to(compute);
+  Tensor go = grad_output.to(compute);
+
+  Tensor scores = matmul(mul(q, Scalar(s)), transpose(kk, -2, -1));
+  if (is_causal) {
+    const int64_t t_q = scores.size(-2), t_k = scores.size(-1);
+    auto keep = tril(ones({t_q, t_k}, DType::Bool, scores.device()),
+                     /*diagonal=*/t_k - t_q);
+    scores = where(keep, scores, Scalar(kNegInf));
+  }
+  if (attn_mask.has_value() && attn_mask->defined()) {
+    const Tensor& m = *attn_mask;
+    scores = (m.dtype() == DType::Bool) ? where(m, scores, Scalar(kNegInf))
+                                         : add(scores, m.to(compute));
+  }
+  // The same all--inf handling the forward's softmax has, so a fully masked
+  // query row is a row of zeros here too rather than a number over nothing.
+  Tensor probs = safe_softmax_lastdim(scores);
+
+  Tensor d_probs = matmul(go, transpose(vv, -2, -1));
+  Tensor d_value = matmul(transpose(probs, -2, -1), go);
+  Tensor d_scores = mul(probs, sub(d_probs,
+                                   sum(mul(d_probs, probs), {-1}, /*keepdim=*/true)));
+  Tensor d_query = mul(matmul(d_scores, kk), Scalar(s));
+  Tensor d_key = matmul(transpose(d_scores, -2, -1), mul(q, Scalar(s)));
+
+  if (g > 1) {
+    // The key and value each served g query heads, so the gradients arriving
+    // at them are summed over the group axis they were expanded along.
+    d_key = sum(d_key.reshape({d_key.size(0), hk, g, d_key.size(-2), d_key.size(-1)}), {2});
+    d_value = sum(d_value.reshape({d_value.size(0), hk, g, d_value.size(-2), d_value.size(-1)}), {2});
+  }
+  return {d_query.to(query.dtype()), d_key.to(key.dtype()),
+          d_value.to(value.dtype())};
+}
+
 } // namespace composite
 } // namespace tensorplay
+

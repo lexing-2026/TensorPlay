@@ -150,12 +150,28 @@ def _trace_joint(fn: Callable[..., Any], primals: Sequence[Any], decompositions)
     one the placeholders were created from.
     """
 
+    from tensorplay.primitives.rng_prims import PhiloxStateTracker
+    from tensorplay.primitives.common import CUDARngStateHelper
     from tensorplay.utils._dispatch import _disable_current_modes
 
     tracer = _TaggingTracer()
     trace_primals = _trace_inputs(primals)
     primal_nodes = _placeholders(tracer, trace_primals, "primals")
     diff_inputs = [p for p in trace_primals if _is_tensor(p) and p.requires_grad]
+    # A traced program that reads a random value reads it at a position rather
+    # than from a generator, so the position each pass starts from is what the
+    # reads are written against: the forward and the backward each get their
+    # own, taken from where the generators stand now.
+    fwd_seed, fwd_base_offset = CUDARngStateHelper.get_torch_state_as_tuple()
+    bwd_seed, bwd_base_offset = CUDARngStateHelper.get_torch_state_as_tuple()
+    as_state = lambda pair: (
+        tensorplay.tensor(pair[0], dtype=tensorplay.int64),
+        tensorplay.tensor(pair[1], dtype=tensorplay.int64),
+    )
+    fwd_seed, fwd_base_offset = as_state((fwd_seed, fwd_base_offset))
+    bwd_seed, bwd_base_offset = as_state((bwd_seed, bwd_base_offset))
+    PhiloxStateTracker.record_state(fwd_seed, fwd_base_offset, "forward")
+    PhiloxStateTracker.record_state(bwd_seed, bwd_base_offset, "backward")
     with tensorplay.random.fork_rng(devices=_trace_devices(primals)):
         with ProxyTensorDispatchMode(tracer, decompositions):
             with tensorplay.enable_grad():

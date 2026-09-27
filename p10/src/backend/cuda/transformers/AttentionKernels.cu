@@ -1491,9 +1491,16 @@ std::tuple<Tensor, Tensor, Tensor> sdpa_backward_impl(
 
 std::tuple<Tensor, Tensor, Tensor> sdpa_backward_kernel_cuda(
     const Tensor& grad_output, const Tensor& query, const Tensor& key,
-    const Tensor& value, bool is_causal, int64_t impl) {
+    const Tensor& value, const std::optional<Tensor>& attn_mask, double dropout_p,
+    bool is_causal, std::optional<double> scale, bool enable_gqa) {
   if (query.dim() != 4 || key.dim() != 4 || value.dim() != 4 || grad_output.dim() != 4) {
     TP_THROW(RuntimeError, "sdpa backward: q/k/v/grad_output must be 4D");
+  }
+  if (attn_mask.has_value() || dropout_p != 0.0 || scale.has_value() ||
+      enable_gqa) {
+    return composite::sdpa_math_backward_composite(
+        grad_output, query, key, value, attn_mask, dropout_p, is_causal, scale,
+        enable_gqa);
   }
   if (query.size(0) != key.size(0) || query.size(1) != key.size(1) ||
       query.size(2) != key.size(2) || query.size(3) != key.size(3) ||
@@ -1511,9 +1518,9 @@ std::tuple<Tensor, Tensor, Tensor> sdpa_backward_kernel_cuda(
   if (grad_output_c.dtype() != compute_dtype) {
     grad_output_c = grad_output_c.to(compute_dtype);
   }
-  if (compute_dtype == DType::Float32) return sdpa_backward_impl<float>(grad_output_c, query_c, key_c, value_c, is_causal, impl);
-  if (compute_dtype == DType::Float16) return sdpa_backward_impl<tensorplay::Half>(grad_output_c, query_c, key_c, value_c, is_causal, impl);
-  if (compute_dtype == DType::BFloat16) return sdpa_backward_impl<tensorplay::BFloat16>(grad_output_c, query_c, key_c, value_c, is_causal, impl);
+  if (compute_dtype == DType::Float32) return sdpa_backward_impl<float>(grad_output_c, query_c, key_c, value_c, is_causal, /*impl=*/0);
+  if (compute_dtype == DType::Float16) return sdpa_backward_impl<tensorplay::Half>(grad_output_c, query_c, key_c, value_c, is_causal, /*impl=*/0);
+  if (compute_dtype == DType::BFloat16) return sdpa_backward_impl<tensorplay::BFloat16>(grad_output_c, query_c, key_c, value_c, is_causal, /*impl=*/0);
   TP_THROW(NotImplementedError, "sdpa backward: only float32/float16/bfloat16 supported");
 }
 
@@ -1740,14 +1747,20 @@ std::tuple<Tensor, Tensor, Tensor> sdpa_backward_kernel_cuda_with_lse(
 #endif
   }
   return sdpa_backward_kernel_cuda(
-      grad_output_c, query_c, key_c, value_c, is_causal, impl);
+      grad_output_c, query_c, key_c, value_c, /*attn_mask=*/std::nullopt,
+      /*dropout_p=*/0.0, is_causal, /*scale=*/std::nullopt,
+      /*enable_gqa=*/false);
 }
 
 // ---------------------------------------------------------------------------
 // Host wrapper
 // ---------------------------------------------------------------------------
 
-Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& value, bool is_causal, int64_t impl) {
+// The kernel family below is what a plain call is computed by: no mask, no
+// drop, no grouping, and the scale left at the one the head size implies.
+Tensor sdpa_kernel_cuda_plain(const Tensor& query, const Tensor& key,
+                                 const Tensor& value, bool is_causal,
+                                 int64_t impl) {
 #if defined(TP_HAS_NATIVE_CUTE_FLASH)
   const bool native_flash = impl == 5 || impl == 6 || impl == 7;
 #else
@@ -2037,6 +2050,26 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
   }
 }
 
+// The public attention call is answered by the composite that says what a
+// mask, a drop, a scale and grouped heads each mean, for every call alike: a
+// caller that named none of them is asking for the same attention, and
+// answering it by a different route would make two spellings of one
+// computation disagree.  The specialised kernels above stay reachable through
+// the fused call that names the normalizer it wants back.
+Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key,
+                        const Tensor& value,
+                        const std::optional<Tensor>& attn_mask, double dropout_p,
+                        bool is_causal, std::optional<double> scale,
+                        bool enable_gqa) {
+  // The composite answers with the attention and the normalizer it built along
+  // the way; only the attention is what was asked for.
+  auto [output, logsumexp] = composite::sdpa_math_composite(
+      query, key, value, attn_mask, dropout_p, is_causal,
+      /*dropout_mask=*/std::nullopt, scale, enable_gqa);
+  (void)logsumexp;
+  return output;
+}
+
 std::tuple<Tensor, Tensor> sdpa_kernel_cuda_with_lse(
     const Tensor& query, const Tensor& key, const Tensor& value,
     bool is_causal, int64_t impl) {
@@ -2072,7 +2105,7 @@ std::tuple<Tensor, Tensor> sdpa_kernel_cuda_with_lse(
     }
   }
 #endif
-  Tensor output = sdpa_kernel_cuda(query, key, value, is_causal, impl);
+  Tensor output = sdpa_kernel_cuda_plain(query, key, value, is_causal, /*impl=*/0);
   Tensor lse = Tensor::empty({0}, DType::Float32, query.device());
   return {output, lse};
 }
@@ -2081,6 +2114,7 @@ std::tuple<Tensor, Tensor> sdpa_kernel_cuda_with_lse(
 // TPXOpsGenerated.cpp; declared locally because tpx headers are not visible
 // below the p10 layer -- same pattern as Einsum.cpp).
 }  // namespace (anonymous kernels end here)
+
 
 // Reopen at global scope so the declarations land in the REAL
 // tensorplay::tpx::ops (defined in TPXOpsGenerated.cpp); declaring them

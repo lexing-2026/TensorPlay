@@ -186,6 +186,13 @@ class PhiloxStateTracker:
         return _philox_multiple_of_4(offset)
 
 
+# Which of the two positions is current is a question about the pass being run,
+# and a pass that has not been entered has not begun one; the positions are
+# therefore set here rather than left to the first pass to enter, so that
+# reading one outside a pass says where it is rather than failing.
+PhiloxStateTracker.reset()
+
+
 def _philox_multiple_of_4(offset) -> int:
     """The next count a device will accept.
 

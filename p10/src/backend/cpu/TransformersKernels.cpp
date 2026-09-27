@@ -71,334 +71,40 @@ void vexp_f32(const float* x, float* y, int64_t n) {
 
 } // namespace
 
+// The public entry point names what the caller wants -- a mask to add, a
+// proportion to drop, a scale to fold in, grouped query heads -- and the
+// attention those describe is computed once, for any device, by the composite
+// that expresses it.  Going through it rather than keeping a second copy of
+// the same arithmetic here is what keeps the two from disagreeing about what
+// the mask and the scale mean.
 Tensor sdpa_kernel_cpu(const Tensor& query, const Tensor& key,
-                       const Tensor& value, bool is_causal, int64_t impl) {
-  Tensor q = query.contiguous();
-  Tensor k = key.contiguous();
-  Tensor v = value.contiguous();
-  if (q.dim() != 4 || k.dim() != 4 || v.dim() != 4) {
-    TP_THROW(RuntimeError, "sdpa: query/key/value must be 4D [B, H, T, D]");
-  }
-  int64_t B = q.size(0), H = q.size(1), T = q.size(2), D = q.size(3);
-  // Cross-attention: query length may differ from key/value length
-  int64_t Tq = T;
-  int64_t Skv = k.size(2);
-  if (k.size(0) != B || k.size(1) != H || v.size(0) != B || v.size(1) != H ||
-      v.size(2) != Skv || k.size(3) != D || v.size(3) != D) {
-    TP_THROW(RuntimeError, "sdpa: key/value shapes must match [B, H, S, D]");
-  }
-  if (q.dtype() != DType::Float32 && q.dtype() != DType::Float64 &&
-      q.dtype() != DType::Float16 && q.dtype() != DType::BFloat16) {
-    TP_THROW(NotImplementedError,
-             "sdpa cpu: expected float32/float64/float16/bfloat16");
-  }
-  const DType original_dtype = q.dtype();
-
-  if (original_dtype == DType::Float64) {
-    // Serial double reference for validation.
-    Tensor out = Tensor::empty({B, H, Tq, D}, DType::Float64, q.device());
-    const double* qd = q.data_ptr<double>();
-    const double* kd = k.data_ptr<double>();
-    const double* vd = v.data_ptr<double>();
-    double* od = out.data_ptr<double>();
-    const double scale = 1.0 / std::sqrt(static_cast<double>(D));
-    for (int64_t b = 0; b < B; ++b) {
-      for (int64_t h = 0; h < H; ++h) {
-        const double* qh = qd + ((b * H + h) * Tq) * D;
-        const double* kh = kd + ((b * H + h) * Skv) * D;
-        const double* vh = vd + ((b * H + h) * Skv) * D;
-        double* oh = od + ((b * H + h) * Tq) * D;
-        std::vector<double> scores(Skv);
-        for (int64_t t = 0; t < Tq; ++t) {
-          const int64_t visible = is_causal ? std::min(t + 1, Skv) : Skv;
-          const double* qrow = qh + t * D;
-          double mx = -INFINITY;
-          for (int64_t kk = 0; kk < Skv; ++kk) {
-            double s = -INFINITY;
-            if (kk < visible) {
-              const double* krow = kh + kk * D;
-              s = 0.0;
-              for (int64_t d = 0; d < D; ++d) s += qrow[d] * krow[d];
-              s *= scale;
-            }
-            scores[kk] = s;
-            mx = std::max(mx, s);
-          }
-          double total = 0.0;
-          for (int64_t kk = 0; kk < Skv; ++kk) {
-            double e = std::exp(scores[kk] - mx);
-            scores[kk] = e;
-            total += e;
-          }
-          double* orow = oh + t * D;
-          for (int64_t d = 0; d < D; ++d) {
-            double acc = 0.0;
-            for (int64_t kk = 0; kk < Skv; ++kk)
-              acc += scores[kk] * vh[kk * D + d];
-            orow[d] = acc / total;
-          }
-        }
-      }
-    }
-    return out;
-  }
-
-  // ---- Fast f32 path ----
-#if !defined(USE_MKL) && !defined(USE_BLAS)
-  TP_THROW(NotImplementedError, "sdpa cpu fast path requires BLAS");
-#else
-  if (Tq <= 0 || Skv <= 0 || D <= 0 || B * H * Tq * D == 0) {
-    return Tensor::empty({B, H, Tq, D}, original_dtype, query.device());
-  }
-  if (Tq * Skv > static_cast<int64_t>(INT32_MAX) ||
-      Skv * D > static_cast<int64_t>(INT32_MAX)) {
-    TP_THROW(RuntimeError, "sdpa cpu: shape too large for BLAS ints");
-  }
-  Tensor qf = q.to(DType::Float32);
-  Tensor kf = k.to(DType::Float32);
-  Tensor vf = v.to(DType::Float32);
-  Tensor out = Tensor::empty({B, H, Tq, D}, DType::Float32, qf.device());
-  const float* qd = qf.data_ptr<float>();
-  const float* kd = kf.data_ptr<float>();
-  const float* vd = vf.data_ptr<float>();
-  float* od = out.data_ptr<float>();
-  const float scale = 1.0f / std::sqrt(static_cast<float>(D));
-  // Scores scratch reused across calls: a fresh 134MB allocation per prefill
-  // pays ~32k page faults before the first GEMM lane runs (measured as the
-  // concurrent GIL-released callers don't share.
-  static thread_local std::vector<float> scores_scratch;
-  if (scores_scratch.size() < static_cast<size_t>(B * H * Tq * Skv))
-    scores_scratch.resize(static_cast<size_t>(B * H * Tq * Skv));
-  float* sc = scores_scratch.data();
-  std::vector<float> shifted(Skv);
-
-  const int64_t bh_total = B * H;
-  const int64_t threads = parallel::get_num_threads();
-
-  if (Tq == 1) {
-    // Decode: one query row per head.  Per-head work is dot-products +
-    // softmax + a D-wide axpy accumulation -- pure SIMD loops beat 64 tiny
-    // before this path).  Heads parallelize across cores.
-    parallel::parallel_for(0, bh_total, 1, [&](int64_t b0, int64_t b1) {
-      std::vector<float> probs(Skv);
-      std::vector<float> acc(D);
-      for (int64_t m = b0; m < b1; ++m) {
-        const float* qh = qd + m * D;
-        const float* kh = kd + m * Skv * D;
-        const float* vh = vd + m * Skv * D;
-        float* oh = od + m * D;
-        for (int64_t j = 0; j < Skv; ++j) {
-          const float* krow = kh + j * D;
-          float s = 0.0f;
-          for (int64_t d = 0; d < D; ++d) s += qh[d] * krow[d];
-          probs[j] = s * scale;
-        }
-        float mx = probs[0];
-        for (int64_t j = 1; j < Skv; ++j) mx = std::max(mx, probs[j]);
-        vexp_f32(probs.data(), probs.data(), Skv);
-        float total = 0.0f;
-        for (int64_t j = 0; j < Skv; ++j) total += probs[j];
-        const float inv = 1.0f / total;
-        std::fill(acc.begin(), acc.end(), 0.0f);
-        for (int64_t j = 0; j < Skv; ++j) {
-          const float p = probs[j] * inv;
-          const float* vrow = vh + j * D;
-          for (int64_t d = 0; d < D; ++d) acc[d] += p * vrow[d];
-        }
-        for (int64_t d = 0; d < D; ++d) oh[d] = acc[d];
-      }
-    });
-    return out.to(original_dtype);
-  }
-
-  // Prefill: heads in parallel; each worker pins MKL to single-thread so the
-  // per-head sgemms don't nest OpenMP regions (same runtime -> serialized
-  // inner region, oversubscription-free).  Sequential when there's less
-  // parallelism than the gemms can use themselves.
-  auto run_heads = [&](int64_t mb, int64_t me) {
-#if defined(USE_MKL)
-    mkl_set_num_threads_local(mb >= 0 ? 1 : 0);
-#endif
-    std::vector<float> shifted_loc(Skv);
-    for (int64_t m = (mb >= 0 ? mb : 0); m < (me >= 0 ? me : bh_total); ++m) {
-      const float* qh = qd + m * Tq * D;
-      const float* kh = kd + m * Skv * D;
-      const float* vh = vd + m * Skv * D;
-      float* sh = sc + m * Tq * Skv;
-      float* oh = od + m * Tq * D;
-
-      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                  static_cast<int>(Tq), static_cast<int>(Skv),
-                  static_cast<int>(D), scale, qh, static_cast<int>(D), kh,
-                  static_cast<int>(D), 0.0f, sh, static_cast<int>(Skv));
-
-      for (int64_t t = 0; t < Tq; ++t) {
-        float* row = sh + t * Skv;
-        const int64_t nvis = is_causal ? std::min(t + 1, Skv) : Skv;
-        float mx = row[0];
-        for (int64_t j = 1; j < nvis; ++j) mx = std::max(mx, row[j]);
-        for (int64_t j = 0; j < nvis; ++j) shifted_loc[j] = row[j] - mx;
-        vexp_f32(shifted_loc.data(), row, nvis);
-        float total = 0.0f;
-        for (int64_t j = 0; j < nvis; ++j) total += row[j];
-        const float inv = 1.0f / total;
-        for (int64_t j = 0; j < nvis; ++j) row[j] *= inv;
-        if (nvis < Skv)
-          std::memset(row + nvis, 0,
-                      static_cast<size_t>(Skv - nvis) * sizeof(float));
-      }
-
-      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                  static_cast<int>(Tq), static_cast<int>(D),
-                  static_cast<int>(Skv), 1.0f, sh, static_cast<int>(Skv), vh,
-                  static_cast<int>(D), 0.0f, oh, static_cast<int>(D));
-    }
-#if defined(USE_MKL)
-    if (mb >= 0) mkl_set_num_threads_local(0);
-#endif
-  };
-
-  if (bh_total > threads && threads > 1) {
-    const int64_t grain = std::max<int64_t>(1, bh_total / (threads * 4));
-    parallel::parallel_for(0, bh_total, grain,
-                           [&](int64_t b0, int64_t b1) { run_heads(b0, b1); });
-  } else {
-    run_heads(-1, -1);
-  }
-  return out.to(original_dtype);
-#endif
+                       const Tensor& value,
+                       const std::optional<Tensor>& attn_mask, double dropout_p,
+                       bool is_causal, std::optional<double> scale,
+                       bool enable_gqa) {
+  auto [output, logsumexp] = composite::sdpa_math_composite(
+      query, key, value, attn_mask, dropout_p, is_causal,
+      /*dropout_mask=*/std::nullopt, scale, enable_gqa);
+  (void)logsumexp;
+  return output;
 }
 
+// The gradient of the attention above, asked for in the same terms it was
+// computed in.  Delegating to the composite that expresses it means a masked,
+// dropped, scaled or grouped call is differentiated by the same arithmetic
+// that produced it, rather than by a second path that knows only the plain
+// case.
 std::tuple<Tensor, Tensor, Tensor> sdpa_backward_kernel_cpu(
     const Tensor& grad_output, const Tensor& query, const Tensor& key,
-    const Tensor& value, bool is_causal, int64_t impl) {
-  (void)impl;
-  Tensor q = query.contiguous();
-  Tensor k = key.contiguous();
-  Tensor v = value.contiguous();
-  Tensor go = grad_output.contiguous();
-  if (q.dim() != 4 || k.dim() != 4 || v.dim() != 4 || go.dim() != 4) {
+    const Tensor& value, const std::optional<Tensor>& attn_mask, double dropout_p,
+    bool is_causal, std::optional<double> scale, bool enable_gqa) {
+  if (query.dim() != 4 || key.dim() != 4 || value.dim() != 4 ||
+      grad_output.dim() != 4) {
     TP_THROW(RuntimeError, "sdpa backward: q/k/v/grad_output must be 4D");
   }
-  const int64_t B = q.size(0), H = q.size(1), T = q.size(2), D = q.size(3);
-  if (k.size(0) != B || k.size(1) != H || k.size(2) != T || k.size(3) != D ||
-      v.size(0) != B || v.size(1) != H || v.size(2) != T || v.size(3) != D ||
-      go.size(0) != B || go.size(1) != H || go.size(2) != T ||
-      go.size(3) != D) {
-    TP_THROW(RuntimeError, "sdpa backward: q/k/v/grad_output shapes must match");
-  }
-  if (q.dtype() != DType::Float32 && q.dtype() != DType::Float64 &&
-      q.dtype() != DType::Float16 && q.dtype() != DType::BFloat16) {
-    TP_THROW(NotImplementedError,
-             "sdpa backward CPU: expected float32/float64/float16/bfloat16");
-  }
-  if (k.dtype() != q.dtype() || v.dtype() != q.dtype() ||
-      go.dtype() != q.dtype()) {
-    TP_THROW(RuntimeError,
-             "sdpa backward: q/k/v/grad_output dtypes must match");
-  }
-
-  const DType original_dtype = q.dtype();
-  // Serial double reference; backward shapes in practice are small. BLAS
-  // rewrite lands with the autograd-perf pass.
-  q = q.to(DType::Float64);
-  k = k.to(DType::Float64);
-  v = v.to(DType::Float64);
-  go = go.to(DType::Float64);
-  const double* qd = q.data_ptr<double>();
-  const double* kd = k.data_ptr<double>();
-  const double* vd = v.data_ptr<double>();
-  const double* god = go.data_ptr<double>();
-  const double scale = 1.0 / std::sqrt(static_cast<double>(D));
-  const int64_t rows = B * H;
-
-  Tensor probs = Tensor::empty({B, H, T, T}, DType::Float64, q.device());
-  Tensor dprob = Tensor::empty({B, H, T, T}, DType::Float64, q.device());
-  Tensor dscore = Tensor::empty({B, H, T, T}, DType::Float64, q.device());
-  double* pd = probs.data_ptr<double>();
-  double* dpd = dprob.data_ptr<double>();
-  double* dsd = dscore.data_ptr<double>();
-
-  for (int64_t bh = 0; bh < rows; ++bh) {
-    const double* qh = qd + bh * T * D;
-    const double* kh = kd + bh * T * D;
-    for (int64_t t = 0; t < T; ++t) {
-      double max_score = -INFINITY;
-      for (int64_t kk = 0; kk < T; ++kk) {
-        double score = -INFINITY;
-        if (!is_causal || kk <= t) {
-          score = 0.0;
-          for (int64_t d = 0; d < D; ++d)
-            score += qh[t * D + d] * kh[kk * D + d];
-          score *= scale;
-        }
-        pd[(bh * T + t) * T + kk] = score;
-        max_score = std::max(max_score, score);
-      }
-      double total = 0.0;
-      for (int64_t kk = 0; kk < T; ++kk) {
-        double p = (pd[(bh * T + t) * T + kk] == -INFINITY)
-                       ? 0.0
-                       : std::exp(pd[(bh * T + t) * T + kk] - max_score);
-        pd[(bh * T + t) * T + kk] = p;
-        total += p;
-      }
-      for (int64_t kk = 0; kk < T; ++kk) pd[(bh * T + t) * T + kk] /= total;
-    }
-  }
-
-  for (int64_t bh = 0; bh < rows; ++bh) {
-    const double* gh = god + bh * T * D;
-    const double* vh = vd + bh * T * D;
-    for (int64_t t = 0; t < T; ++t) {
-      for (int64_t kk = 0; kk < T; ++kk) {
-        double dot = 0.0;
-        for (int64_t d = 0; d < D; ++d) dot += gh[t * D + d] * vh[kk * D + d];
-        dpd[(bh * T + t) * T + kk] = dot;
-      }
-      double row_dot = 0.0;
-      for (int64_t kk = 0; kk < T; ++kk)
-        row_dot += dpd[(bh * T + t) * T + kk] * pd[(bh * T + t) * T + kk];
-      for (int64_t kk = 0; kk < T; ++kk)
-        dsd[(bh * T + t) * T + kk] =
-            pd[(bh * T + t) * T + kk] * (dpd[(bh * T + t) * T + kk] - row_dot) *
-            scale;
-    }
-  }
-
-  Tensor d_q = Tensor::zeros({B, H, T, D}, DType::Float64, q.device());
-  Tensor d_k = Tensor::zeros({B, H, T, D}, DType::Float64, q.device());
-  Tensor d_v = Tensor::zeros({B, H, T, D}, DType::Float64, q.device());
-  double* dqd = d_q.data_ptr<double>();
-  double* dkd = d_k.data_ptr<double>();
-  double* dvd = d_v.data_ptr<double>();
-  for (int64_t bh = 0; bh < rows; ++bh) {
-    const double* qh = qd + bh * T * D;
-    const double* kh = kd + bh * T * D;
-    const double* gh = god + bh * T * D;
-    const double* vh = vd + bh * T * D;
-    for (int64_t t = 0; t < T; ++t) {
-      for (int64_t d = 0; d < D; ++d) {
-        double q_acc = 0.0;
-        for (int64_t kk = 0; kk < T; ++kk)
-          q_acc += dsd[(bh * T + t) * T + kk] * kh[kk * D + d];
-        dqd[(bh * T + t) * D + d] = q_acc;
-      }
-    }
-    for (int64_t kk = 0; kk < T; ++kk) {
-      for (int64_t d = 0; d < D; ++d) {
-        double k_acc = 0.0, v_acc = 0.0;
-        for (int64_t t = 0; t < T; ++t) {
-          k_acc += dsd[(bh * T + t) * T + kk] * qh[t * D + d];
-          v_acc += pd[(bh * T + t) * T + kk] * gh[t * D + d];
-        }
-        dkd[(bh * T + kk) * D + d] = k_acc;
-        dvd[(bh * T + kk) * D + d] = v_acc;
-      }
-    }
-  }
-  return {d_q.to(original_dtype), d_k.to(original_dtype),
-          d_v.to(original_dtype)};
+  return composite::sdpa_math_backward_composite(
+      grad_output, query, key, value, attn_mask, dropout_p, is_causal, scale,
+      enable_gqa);
 }
 
 // ---------------------------------------------------------------------------
