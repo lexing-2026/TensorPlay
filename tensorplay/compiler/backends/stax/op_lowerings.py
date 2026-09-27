@@ -3622,3 +3622,146 @@ def kthvalue(self: Any, k: Any, dim: Any = -1, keepdim: Any = False) -> Any:
         values = unsqueeze(values, dim)
         indices = unsqueeze(indices, dim)
     return values, indices
+
+
+def new_empty(x: Any, size: Any, *, dtype: Any = None, device: Any = None) -> Any:
+    """A value of a shape and type, whose contents are not yet anything.
+
+    What comes back is a place to write rather than a value: nothing has been
+    put in it, so asking what is in it has no answer.  Its type and where it
+    lives come from what it will hold, and its type is the type asked for if one
+    was -- otherwise the type of the value it stands in for, since that is what
+    it is standing in for.
+    """
+
+    if dtype is None:
+        dtype = x.get_dtype()
+    if device is None:
+        device = x.get_device()
+    # Written as a walk of zeros rather than as storage nothing has been put
+    # in: a value whose contents are unset has no defined contents to read, and
+    # a walk of zeros does -- at the cost of writing them, which for a shape
+    # with no positions costs nothing at all.
+    return _full(0, device, dtype, list(size))
+
+
+def gather(x: Any, dim: Any, index: Any, sparse_grad: Any = False) -> Any:
+    """One value per position asked for, each read at an index of its own.
+
+    The result is shaped like what was asked for rather than like what was read:
+    the two are the same here, and saying so is what makes each output position
+    know which input position it corresponds to.  An index is clamped to the
+    axis rather than trusted, because an index past the end has no value to
+    read and returning the last one is a defined answer where reading nothing
+    is not.
+
+    Whether a gradient for this is sparse is not decided here: it is a fact
+    about the backward pass, and the forward pass is the same computation either
+    way.
+    """
+
+    # Whether a gradient for this is sparse changes only the backward pass, and
+    # the backward pass is not this.
+    del sparse_grad
+
+    if not (isinstance(x, TensorBox)):
+        raise AssertionError("expected: isinstance(x, TensorBox)")
+    if index.get_numel() == 0:
+        return new_empty(x, index.get_size())
+
+    size = x.get_size()
+    offset = len(size) == 0
+    dim = _validate_dim(x, dim, offset)
+
+    if offset:
+        x = lower_expand(x, [1])
+        size = [1]
+
+    x_loader = x.make_loader()
+    index_loader = index.make_loader()
+
+    def fn(idx: Any) -> Any:
+        idx = list(idx)
+        gather_idx = ops.indirect_indexing(
+            index_loader(idx), size[dim], wrap_neg=False
+        )
+        if len(idx) == 0:
+            idx = [gather_idx]
+        else:
+            idx[dim] = gather_idx
+        return x_loader(idx)
+
+    return Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=fn,
+        ranges=index.get_size(),
+    )
+
+
+@register_lowering(aten.cummax, type_promotion_kind=None)
+def cummax(x: Any, dim: Any = 0) -> Any:
+    """The largest value so far along one axis, and where it was.
+
+    Carrying the position along with the value is what makes the second answer
+    possible: the value alone cannot say where it was, because two equal values
+    are the same value and are not the same position.
+
+    Which of two equal values is kept is not decided here but by how two running
+    values are compared -- and it is not the same choice as the one a reduction
+    over the whole axis makes, so it is asked of that comparison rather than
+    assumed.  Taking the later of two equals is what makes this the running
+    maximum rather than the first one reached.
+    """
+
+    if len(x.get_size()) == 0:
+        if dim not in [0, -1]:
+            raise AssertionError("expected: dim in [0, -1]")
+        return clone(x), _full(0, x.get_device(), tp.int64, x.get_size())
+
+    dtype = x.get_dtype()
+    combine_fn = ir.get_reduction_combine_fn(
+        "argmax", dtype=dtype, arg_break_ties_left=False
+    )
+
+    kwargs = _make_scan_inner(x, axis=dim, dtype=dtype)
+    kwargs["dtypes"] = (dtype, tp.int64)
+    kwargs["inner_fns"] = (
+        x.make_loader(),
+        lambda idx: ops.index_expr(idx[dim], tp.int64),
+    )
+    values, indices = ir.Scan.create(**kwargs, combine_fn=combine_fn)
+    if values is None:
+        return fallback_cummax(x, dim=dim)
+    return values, indices
+
+
+@register_lowering(aten.cummin, type_promotion_kind=None)
+def cummin(x: Any, dim: Any = 0) -> Any:
+    """The smallest value so far along one axis, and where it was.
+
+    The mirror of the running maximum, and the same in every respect but which
+    end of the comparison is taken -- which is the whole difference, and is
+    asked of the comparison rather than written out again here.
+    """
+
+    if len(x.get_size()) == 0:
+        if dim not in [0, -1]:
+            raise AssertionError("expected: dim in [0, -1]")
+        return clone(x), _full(0, x.get_device(), tp.int64, x.get_size())
+
+    dtype = x.get_dtype()
+    combine_fn = ir.get_reduction_combine_fn(
+        "argmin", dtype=dtype, arg_break_ties_left=False
+    )
+
+    kwargs = _make_scan_inner(x, axis=dim, dtype=dtype)
+    kwargs["dtypes"] = (dtype, tp.int64)
+    kwargs["inner_fns"] = (
+        x.make_loader(),
+        lambda idx: ops.index_expr(idx[dim], tp.int64),
+    )
+    values, indices = ir.Scan.create(**kwargs, combine_fn=combine_fn)
+    if values is None:
+        return fallback_cummin(x, dim=dim)
+    return values, indices
