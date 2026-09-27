@@ -44,6 +44,7 @@ from tensorplay.utils import _pytree as pytree
 from .autotune_process import PrecompileThreadPool, use_pipelined_autotuning
 from .codecache import LambdaFuture, PyCodeCache
 from .ir import TritonTemplateCallerBase
+from .templates.select_algorithm import TritonTemplateCaller
 from .stream_utils import get_stream_name
 from tensorplay.graph.experimental.symbolic_shapes import free_symbols
 from tensorplay.graph.experimental.sympy_functions import FloorDiv, Identity

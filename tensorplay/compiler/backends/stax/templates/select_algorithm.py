@@ -42,7 +42,7 @@ from ..ir import (
     compute_required_storage_length,
 )
 from ..loops import V
-from ..ir import ChoiceCaller
+from ..ir import ChoiceCaller, TritonTemplateCallerBase
 from .mm_common import use_aten_gemm_kernels
 from ..loops import contiguous_strides, dtype_name
 from ..heuristics.template.params import DictKernelTemplateParams, KernelTemplateParams
@@ -70,6 +70,8 @@ from ..heuristics.template.base import SymbolicGridFn
 from ..runtime.triton_heuristics import FixedGrid
 from ..codegen.wrapper import pexpr
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
+from ..autotune_process import TritonBenchmarkRequest
+from ..utils import do_bench_using_profiling
 
 #: Whether a candidate's result is checked against what the operation's own
 #: kernel produced.  On by default because a template that computes the wrong
@@ -3247,6 +3249,152 @@ class TritonTemplate(KernelTemplate):
                     f"{self.name} built two different ways from one source"
                 )
         return built
+
+
+class TritonTemplateCaller(TritonTemplateCallerBase):
+    """A choice whose kernel is written from a template at launch time.
+
+    What it holds is not a callable but the two things a callable would have
+    been made of: the request that says how to build and time the kernel, and
+    the text that builds it.  Keeping them apart is what lets the same kernel
+    be timed more than once under different conditions, and then launched
+    without being timed again.
+
+    Its identity in a cache is the name of the kernel without its
+    configuration, joined to the key of the request -- so that two choices
+    differing only in configuration are recognised as the same kernel, and a
+    change to the request that builds it invalidates both.
+    """
+
+    def __init__(
+        self,
+        name,
+        input_nodes,
+        layout,
+        make_kernel_render,
+        description,
+        bmreq,
+        log_info: dict | None = None,
+        mutated_inputs=None,
+        workspace_arg=None,
+        allowed_prologue_inps: OrderedSet | None = None,
+        hint_override: int | None = None,
+    ) -> None:
+        super().__init__(name, input_nodes, layout, description)
+        self.make_kernel_render = make_kernel_render
+        self.bmreq: TritonBenchmarkRequest = bmreq
+        if log_info is None:
+            log_info = {}
+        self.log_info: dict = log_info
+        self.log_info.update(
+            {
+                "backend": "Triton",
+                "num_stages": self.bmreq.num_stages,
+                "num_warps": self.bmreq.num_warps,
+            }
+        )
+        self.mutated_inputs = mutated_inputs
+        self.workspace_arg = workspace_arg
+        self.allowed_prologue_inps = (
+            allowed_prologue_inps if allowed_prologue_inps is not None else OrderedSet()
+        )
+        self.hint_override = hint_override
+
+        self.n_regs = None
+
+    def benchmark(self, *args, out):
+        """Time this kernel on the arguments it will actually be given.
+
+        Timed through a profiler rather than by the clock when that is
+        configured, because a clock on the host cannot tell a kernel's own time
+        from the time the launch around it spent; but not when the launch is
+        being captured whole, where a profiler would measure the capture.
+        """
+        if self.bmreq is None:
+            raise AssertionError("self.bmreq must not be None")
+        if (
+            config.profile_bandwidth_with_do_bench_using_profiling
+            and not self._benchmark_with_cudagraphs
+        ):
+            algo = self.bmreq.make_run_fn(*args, out=out)
+            return do_bench_using_profiling(algo)
+        self.bmreq.benchmark_with_cudagraphs = self._benchmark_with_cudagraphs
+        return self.bmreq.benchmark(*args, out=out)
+
+    def precompile(self):
+        """Build the kernel without running it, and keep what the build said.
+
+        The register count is what the build reports and a run cannot: it is a
+        property of the machine code, which exists before the machine code is
+        asked to do anything.
+        """
+        if self.bmreq is None:
+            raise AssertionError("self.bmreq must not be None")
+        self.bmreq.precompile()
+
+        self.n_regs = self.bmreq.n_regs
+
+    def __str__(self) -> str:
+        return f"TritonTemplateCaller({self.bmreq.module_path}, {self.description})"
+
+    def call_name(self):
+        return f"template_kernels.{self.name}"
+
+    def hash_key(self):
+        return "-".join(
+            [
+                self.name.rsplit("_", 1)[0],
+                self.bmreq.module_cache_key,
+            ]
+        )
+
+    def output_node(self):
+        """The buffer this choice writes, rather than a value it returns.
+
+        A kernel written from a template produces its result by writing into
+        something, so what a choice offers the rest of the graph is that
+        something and the text that fills it -- not a value.
+        """
+
+        from .. import ir
+
+        buffer = ir.TritonTemplateBuffer(
+            layout=self.layout,
+            inputs=self.input_nodes,
+            make_kernel_render=self.make_kernel_render,
+            mutated_inputs=self.mutated_inputs,
+            allowed_prologue_inps=self.allowed_prologue_inps,
+        )
+        # Pass KTC annotation to the buffer for encoding
+        if "ktc" in self.annotations:
+            buffer.annotations["ktc"] = self.annotations["ktc"]
+        return ir.TensorBox.create(buffer)
+
+    def info_dict(self) -> dict:
+        """What the autotune log records about this candidate."""
+        return self.log_info
+
+    def get_make_kernel_render(self):
+        return self.make_kernel_render
+
+    def autoheuristic_id(self):
+        """A name that says the shape of the work, not the name it was given.
+
+        Two candidates that tile the same way and differ only in how many
+        steps are held at once are different tunings of the same work, and
+        naming them by the tiling is what lets a stored decision be found
+        again by a kernel that was written under a different name.
+        """
+        type_name = "triton"
+        info = self.info_dict()
+        tile = info["tile_shape"]
+        tile_vals = eval(tile)
+        BLOCK_M = tile_vals[0]
+        BLOCK_K = tile_vals[1]
+        BLOCK_N = tile_vals[2]
+        num_stages = info["num_stages"]
+        num_warps = info["num_warps"]
+        return f"type={type_name}_BLOCK-M={BLOCK_M}_BLOCK-K={BLOCK_K}_BLOCK-N={BLOCK_N}_numstages={num_stages}_numwarps={num_warps}"
 
 
 class KernelArgs:
