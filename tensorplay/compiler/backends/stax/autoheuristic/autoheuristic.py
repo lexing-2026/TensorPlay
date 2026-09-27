@@ -19,7 +19,7 @@ from .autoheuristic_utils import (
 from .learned_heuristic_controller import (
     LearnedHeuristicController,
 )
-from ..templates.ir import ChoiceCaller
+from ..ir import ChoiceCaller
 from ..kernel_cache import default_cache
 
 
