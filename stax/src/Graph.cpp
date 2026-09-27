@@ -1328,13 +1328,19 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                 throw std::runtime_error(
                     "Stax scaled_dot_product_attention_backward has invalid arity");
             }
+            // The gradient form takes a mask, a dropout rate, a scale and a
+            // grouped-query flag as well; the graph carries none of them, so
+            // each is passed at the value that means "not asked for".
             auto backward = tpx::ops::scaled_dot_product_attention_backward(
                 value(node.inputs[0]),
                 value(node.inputs[1]),
                 value(node.inputs[2]),
                 value(node.inputs[3]),
+                std::nullopt,
+                0.0,
                 required_int_attr(node, "is_causal") != 0,
-                required_int_attr(node, "impl"));
+                std::nullopt,
+                false);
             env[node.outputs[0]->id] = std::get<0>(backward);
             env[node.outputs[1]->id] = std::get<1>(backward);
             env[node.outputs[2]->id] = std::get<2>(backward);
