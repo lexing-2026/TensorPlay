@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+from collections import defaultdict
 import functools
 import hashlib
 import itertools
@@ -34,6 +35,7 @@ from ..ir import (
     ComputedBuffer,
     ExternKernel,
     FlexibleLayout,
+    IRNode,
     InputBuffer,
     Layout,
     ReinterpretView,
@@ -1569,6 +1571,141 @@ class TritonTemplateKernel:
 
     def codegen_range_tree(self):
         pass  # ignore default codegen
+
+    def _compute_fusion_metadata(
+        self, scheduling, epilogue_nodes, prologue_nodes, buf_name_to_prologue_group
+    ):
+        """Decide, before rendering, which fold goes with which write.
+
+        The default is the blunt one: every folded-in operation goes with every
+        write.  A subclass narrows that when it knows which output each fold
+        belongs to.
+        """
+
+        self._epilogue_nodes_by_subgraph: defaultdict[int, list[Any]] = defaultdict(
+            lambda: epilogue_nodes
+        )
+        self._unfused_epilogues: list[Any] = []
+        self._prologue_sources: dict[str, frozenset[str]] = {}
+
+    def codegen_template_body(
+        self,
+        scheduling,
+        template_node,
+        epilogue_nodes,
+        prologue_nodes,
+        buf_name_to_prologue_group,
+        prologue_preserves_zero_mask_fn,
+        render,
+    ) -> str:
+        """The whole kernel, as source.
+
+        Laying the template out and filling in what it left open are two
+        passes, and the folds go in between: a read that had something folded
+        into it is not finished until that fold is lowered into it, and a write
+        is not finished until the folds that end in it are.
+        """
+
+        self._compute_fusion_metadata(
+            scheduling, epilogue_nodes, prologue_nodes, buf_name_to_prologue_group
+        )
+        with self:
+            partial_code = render()
+
+            num_store_subgraphs = self.get_store_output_count()
+            for i in range(num_store_subgraphs):
+                subgraph_name = self._get_store_output_subgraph_name(i)
+                with self.set_subgraph_body(subgraph_name):
+                    for node in self._epilogue_nodes_by_subgraph[i]:
+                        node.codegen(self.split_and_set_ranges(node.get_ranges()))
+                    self.cse.invalidate(OrderedSet())
+
+            self.codegen_prologues_in_subgraphs(
+                buf_name_to_prologue_group, prologue_preserves_zero_mask_fn
+            )
+
+        partial_code = self._finalize_partial_render(partial_code)
+
+        # Template hooks must be finalised after kernel.remove_kernel_local_buffers
+        # is called (this is called when the kernel context is exited above), and when
+        # the kernel handler is set (as below). This is because the hooks may add
+        # DeferredLine type lines, which preclude lines involving buffers that have
+        # been removed
+
+        # finalize must be called after adding epilogue above
+        with V.set_kernel_handler(self):
+            if isinstance(partial_code, str):
+                src_code = partial_code
+            else:
+                # This is used to calculate flops in TritonTemplateKernels
+                with IRNode.current_origins(template_node.node.origins):
+                    partial_code.finalize_hook("<DEF_KERNEL>")
+                partial_code.finalize_hook("<ARGDEFS>", strict=False)
+
+                for input_name in self.named_input_nodes:
+                    subgraph_name = f"<LOAD_INPUT_{input_name}>"
+                    partial_code.finalize_hook(subgraph_name, strict=False)
+
+                num_store_subgraphs = self.get_store_output_count()
+                for i in range(num_store_subgraphs):
+                    subgraph_name = self._get_store_output_subgraph_name(i)
+                    partial_code.finalize_hook(subgraph_name)
+
+                # Ensure all hooks are finalized before the kernel is defined.
+                # Note: some of these hooks may have been registered by a kernel
+                # subclass
+                src_code = partial_code.finalize_remaining()
+
+        return src_code
+
+    def codegen_prologues_in_subgraphs(
+        self, buf_name_to_prologue_group, prologue_preserves_zero_mask_fn
+    ):
+        """Lower whatever was folded into each read, into that read.
+
+        A read whose operand had something folded into it is not the read the
+        body asked for -- it is that read with the fold applied -- so the fold
+        is lowered here, into the same subgraph the read was made in.
+
+        Whether the fold can be done without widening the operand to 32 bits
+        decides the widening, and the answer differs per operand, so the
+        setting is changed around each one.
+        """
+
+        for input_name, buffer in self.named_input_nodes.items():
+            subgraph_name = f"<LOAD_INPUT_{input_name}>"
+            prologue_group = buf_name_to_prologue_group.get(buffer.get_name(), [])
+            if not prologue_group:
+                continue
+            can_codegen_without_upcast = all(
+                p_n.can_codegen_without_upcasts() for p_n in prologue_group
+            )
+            with config.patch(
+                "triton.codegen_upcast_to_fp32", not can_codegen_without_upcast
+            ):
+                with self.set_subgraph_body(subgraph_name):
+                    for prologue_node in prologue_group:
+                        if (
+                            len(prologue_node.get_buffer_names()) == 1
+                            and len(prologue_group) == 1
+                        ):
+                            if prologue_preserves_zero_mask_fn(prologue_node):
+                                self.prologue_fused_inputs_preserve_zero |= (
+                                    prologue_node.get_buffer_names()
+                                )
+                        prologue_node.codegen(
+                            self.split_and_set_ranges(prologue_node.get_ranges())
+                        )
+                    self.cse.invalidate(OrderedSet())
+
+    def _finalize_partial_render(self, partial_code):
+        """A last look at the text before the placeholders are filled in.
+
+        A subclass that wants to supply the whole source itself -- rather than
+        have the placeholders filled in -- returns a replacement here.
+        """
+
+        return partial_code
 
     def modification(
         self,
