@@ -533,9 +533,14 @@ def matmul(tensor1, tensor2, *, is_out=False):
         tensor2_expanded = tensor2.broadcast_to(expand_batch_portion + [m2, p]) \
             if expand_batch_product > 1 else tensor2
 
-        return (tensor1_expanded.reshape(expand_batch_product, n, m1)
-                @ tensor2_expanded.reshape(expand_batch_product, m2, p)
-               ).reshape(expand_batch_portion + [n, p])
+        # The folded pair is a stack of matrices, so the product of it is a
+        # product of a stack -- a different operation from the one being
+        # decomposed.  Reaching for this operation here would ask the
+        # question that is being answered, and the answer would be asked
+        # again.
+        return tensor1_expanded.reshape(expand_batch_product, n, m1).bmm(
+            tensor2_expanded.reshape(expand_batch_product, m2, p)
+        ).reshape(expand_batch_portion + [n, p])
 
     raise RuntimeError(
         f"matmul: unable to compute the product of {dim_tensor1}-dimensional "
