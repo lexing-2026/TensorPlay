@@ -223,6 +223,47 @@ class InductorChoices:
         omni_heuristics = self.get_config_heuristics(device_type)
         return omni_heuristics.get_omni_decode_configs(head_dim, dtype)
 
+    def get_omni_attention_fwd_configs(
+        self,
+        head_dim: int,
+        seq_len: Any,
+        dtype: Any,
+        device_type: str | None = "cuda",
+    ) -> list:
+        """The tilings for the forward pass of attention."""
+
+        omni_heuristics = self.get_config_heuristics(device_type)
+        return omni_heuristics.get_omni_attn_fwd_configs(head_dim, seq_len, dtype)
+
+    def get_omni_attention_bwd_configs(
+        self, head_dim: int, dtype: Any, device_type: str | None = "cuda"
+    ) -> list:
+        """The tilings for the pass that goes back the way attention came."""
+
+        omni_heuristics = self.get_config_heuristics(device_type)
+        return omni_heuristics.get_omni_attn_bwd_configs(head_dim, dtype)
+
+    def append_omni_attention_choices(
+        self,
+        choices: list,
+        configs: list,
+        input_nodes: list,
+        subgraphs: list,
+        layout: Any,
+        kernel_options: dict,
+        sparse_q_block_size: int,
+        sparse_kv_block_size: int,
+    ) -> list:
+        """Add whatever candidates this policy has that the tables do not name.
+
+        Nothing by default.  A policy that knows of a way to write this kernel
+        that the tables here do not describe adds it, which is the only reason
+        this exists: the tables are one policy's opinion and a program may
+        replace it.
+        """
+
+        return choices
+
     can_fuse = staticmethod(can_fuse)
     can_fuse_vertical = staticmethod(can_fuse_vertical)
     can_fuse_horizontal = staticmethod(can_fuse_horizontal)

@@ -1005,7 +1005,7 @@ def has_unsupported_cpu_scalar_tensor_captures(
     what it would have been handed.
     """
 
-    from ...ir import TensorBox
+    from ..ir import TensorBox
 
     for buf in list(score_mod_other_buffers) + list(mask_mod_other_buffers):
         if isinstance(buf, TensorBox):

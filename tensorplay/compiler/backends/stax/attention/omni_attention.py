@@ -27,9 +27,12 @@ from typing import Any
 
 import sympy
 
+from tensorplay.graph.experimental.sympy_functions import FloorDiv
+
 import tensorplay as tp
 
 from ..heuristics.template.base import SymbolicGridFn
+from ....._higher_order_ops.omni_attention import omni_attention as omni_attention_hop
 from ..ir import ComputedBuffer
 from ..loops import V
 from ..op_lowerings import register_lowering
@@ -484,3 +487,445 @@ OMNI_DECODING = TritonTemplate(
     source=omni_decoding_source,
     always_freeze_layout=True,
 )
+
+
+def create_omni_attention_kernel(
+    query: Any,
+    key: Any,
+    value: Any,
+    scale: float,
+    kernel_options: Any,
+    subgraph_buffer: SubgraphResults,
+    mask_graph_buffer: SubgraphResults,
+    score_mod_other_buffers: Any,
+    mask_mod_other_buffers: Any,
+    mask_parts: Any,
+) -> Any:
+    """Write the pass for a query axis of any length.
+
+    Three values rather than one.  The answer is the first.  The second is the
+    total the answer was accumulated against, and a later pass needs it to work
+    out which rows came from where.  The third is the largest value any key in a
+    row produced, which the answer does not need but the second does: the total
+    is kept relative to a largest value so that adding it to another row's total
+    does not lose the small terms, and a largest value is what it is relative
+    to.  So the third is written out rather than recovered, because by the time a
+    later pass runs, the running total has already been reduced against it.
+
+    The two of the three that are not the answer are at full width whatever the
+    values' own width, because they are added to and compared against each other
+    across rows.
+    """
+
+    from .omni_flash_attention import (
+        can_skip_boundary_checks,
+        create_indices_fake,
+        create_num_blocks_fake_generator,
+        freeze_irnodes,
+        get_fwd_subgraph_outputs,
+        is_power_of_2,
+        is_tensor_ir_node,
+        maybe_realize,
+        set_head_dim_values,
+    )
+    from ..op_lowerings import empty_strided
+    from ..utils import can_use_tma
+
+    kv_num_blocks = mask_parts["kv_num_blocks"]
+    kv_indices = mask_parts["kv_indices"]
+    full_kv_num_blocks = mask_parts["full_kv_num_blocks"]
+    full_kv_indices = mask_parts["full_kv_indices"]
+    sparse_q_block_size = mask_parts["sparse_q_block_size"]
+    sparse_kv_block_size = mask_parts["sparse_kv_block_size"]
+
+    score_mod_other_buffers = maybe_realize(score_mod_other_buffers)
+    mask_mod_other_buffers = maybe_realize(mask_mod_other_buffers)
+
+    freeze_irnodes(score_mod_other_buffers)
+    freeze_irnodes(mask_mod_other_buffers)
+
+    bq, hq, seq_len_q, qk_head_dim = query.get_size()
+    bkv, hkv, seq_len_kv, v_head_dim = value.get_size()
+    if not V.graph.sizevars.evaluate_expr(sympy.Eq(bq, bkv) | sympy.Eq(bkv, 1)):
+        raise AssertionError(
+            f"Bq and Bkv must be broadcastable. Got Bq={bq} and Bkv={bkv}"
+        )
+    if not V.graph.sizevars.evaluate_expr(sympy.Gt(seq_len_q, 0)):
+        raise AssertionError("Query length must be greater than 0")
+    if not V.graph.sizevars.evaluate_expr(sympy.Gt(seq_len_kv, 0)):
+        raise AssertionError("Key length must be greater than 0")
+
+    b = bq
+
+    # A row or column that is not a whole number of tiles has to be masked off on
+    # the last one, and when both divide there is nothing to mask.
+    seq_q_divisible = can_skip_boundary_checks(seq_len_q, sparse_q_block_size)
+    seq_kv_divisible = can_skip_boundary_checks(seq_len_kv, sparse_kv_block_size)
+    kernel_options.setdefault(
+        "IS_DIVISIBLE", bool(seq_q_divisible and seq_kv_divisible)
+    )
+
+    # The answer is read the way the question was laid out, so its distances
+    # follow the question's.  The embedding is the one axis that may differ: it
+    # is the values that are being read, not the positions.
+    q_strides = query.get_stride()
+    out_size = [b, hq, seq_len_q, v_head_dim]
+    out_strides = infer_dense_strides(out_size, q_strides)
+
+    layout = FixedLayout(
+        query.get_device(),
+        query.get_dtype(),
+        [b, hq, seq_len_q, v_head_dim],
+        stride=[sympy.sympify(s) for s in out_strides],
+    )
+    logsumexp_shape = [b, hq, seq_len_q]
+    logsumexp = empty_strided(
+        logsumexp_shape,
+        None,
+        dtype=tp.float32,
+        device=query.get_device(),
+    )
+    max_scores = empty_strided(
+        logsumexp_shape,
+        None,
+        dtype=tp.float32,
+        device=query.get_device(),
+    )
+    kernel_options.setdefault("SM_SCALE", scale)
+
+    gqa_shared_heads = FloorDiv(hq, hkv)
+    kernel_options.setdefault("GQA_SHARED_HEADS", gqa_shared_heads)
+
+    # A block entirely inside the mask needs only the score applied to it, and
+    # asking whether a position is inside the mask is a comparison per position.
+    # So a mask that has both kinds of block says which are which.
+    has_full_blocks = full_kv_num_blocks is not None
+    kernel_options.setdefault("HAS_FULL_BLOCKS", has_full_blocks)
+    if not has_full_blocks:
+        full_kv_num_blocks, full_kv_indices = (
+            empty_strided([0], None, dtype=query.get_dtype(), device=query.get_device())
+            for _ in range(2)
+        )
+
+    set_head_dim_values(kernel_options, qk_head_dim, v_head_dim, V.graph.sizevars)
+
+    choices: list = []
+
+    dtype = query.get_dtype()
+    head_dim = V.graph.sizevars.guard_int(query.get_size()[-1])
+    configs = V.choices.get_omni_attention_fwd_configs(
+        head_dim, seq_len_q, dtype, query.get_device().type
+    )
+
+    sparse_kv_block_size = V.graph.sizevars.guard_int(sparse_kv_block_size)
+    sparse_q_block_size = V.graph.sizevars.guard_int(sparse_q_block_size)
+
+    original_kernel_options = kernel_options.copy()
+    invalid_block_options: Any = None
+
+    for conf in configs:
+        cur_kernel_options = original_kernel_options.copy()
+        # The prefix says which pass an option is for, and a kernel is only ever
+        # given options for its own pass.
+        for k in list(cur_kernel_options.keys()):
+            if k.startswith("fwd_"):
+                v = cur_kernel_options.pop(k)
+                cur_kernel_options[k[4:]] = v
+            if k.startswith("bwd_"):
+                cur_kernel_options.pop(k)
+        cur_kernel_options.setdefault("num_stages", conf.num_stages)
+        cur_kernel_options.setdefault("num_warps", conf.num_warps)
+
+        cur_kernel_options.setdefault("USE_TMA", False)
+        if cur_kernel_options["USE_TMA"] and not can_use_tma(query, key, value):
+            cur_kernel_options["USE_TMA"] = False
+
+        # A tile wider than the block it walks is wasted lanes and, worse, a
+        # boundary mask paid for on every step.  Narrowed only when there is
+        # exactly one candidate and both block sizes are whole powers of two --
+        # a program that pinned the tile keeps it, and gets told if it does not
+        # divide.
+        block_m, block_n = conf.block_m, conf.block_n
+        if len(configs) == 1 and all(
+            is_power_of_2(s) and s >= 16
+            for s in (sparse_q_block_size, sparse_kv_block_size)
+        ):
+            block_m = min(block_m, sparse_q_block_size)
+            block_n = min(block_n, sparse_kv_block_size)
+        cur_kernel_options.setdefault("BLOCK_M", block_m)
+        cur_kernel_options.setdefault("BLOCK_N", block_n)
+        cur_kernel_options.setdefault("SPARSE_Q_BLOCK_SIZE", sparse_q_block_size)
+        cur_kernel_options.setdefault("SPARSE_KV_BLOCK_SIZE", sparse_kv_block_size)
+
+        if (
+            cur_kernel_options["SPARSE_KV_BLOCK_SIZE"] % cur_kernel_options["BLOCK_N"]
+            != 0
+            or cur_kernel_options["SPARSE_Q_BLOCK_SIZE"] % cur_kernel_options["BLOCK_M"]
+            != 0
+        ):
+            invalid_block_options = cur_kernel_options
+            if len(configs) == 1:
+                raise_omni_kernel_options_error(
+                    "forward",
+                    cur_kernel_options,
+                    ("BLOCK_M", "BLOCK_N"),
+                    sparse_q_block_size,
+                    sparse_kv_block_size,
+                )
+            continue
+
+        for attrib in ("kpack", "matrix_instr_nonkdim", "waves_per_eu"):
+            if hasattr(conf, attrib):
+                cur_kernel_options[attrib] = getattr(conf, attrib)
+
+        error = OMNI_ATTENTION.maybe_append_choice(
+            choices=choices,
+            input_nodes=[
+                query,
+                key,
+                value,
+                logsumexp,
+                max_scores,
+                kv_num_blocks,
+                kv_indices,
+                full_kv_num_blocks,
+                full_kv_indices,
+            ],
+            layout=layout,
+            subgraphs=[
+                subgraph_buffer,
+                mask_graph_buffer,
+            ],
+            mutated_inputs=[
+                logsumexp,
+                max_scores,
+            ],
+            call_sizes=query.get_size(),
+            **cur_kernel_options,
+        )
+        if error is not None and len(configs) == 1:
+            raise error
+
+    choices = V.choices.append_omni_attention_choices(
+        choices,
+        configs,
+        [
+            query,
+            key,
+            value,
+            logsumexp,
+            max_scores,
+            kv_num_blocks,
+            kv_indices,
+            full_kv_num_blocks,
+            full_kv_indices,
+        ],
+        [subgraph_buffer, mask_graph_buffer],
+        layout,
+        original_kernel_options,
+        sparse_q_block_size,
+        sparse_kv_block_size,
+    )
+
+    if not choices and invalid_block_options is not None:
+        raise_omni_kernel_options_error(
+            "forward",
+            invalid_block_options,
+            ("BLOCK_M", "BLOCK_N"),
+            sparse_q_block_size,
+            sparse_kv_block_size,
+        )
+
+    inputs_for_autotuning = (
+        [
+            query,
+            key,
+            value,
+            logsumexp,
+            max_scores,
+            kv_num_blocks,
+            kv_indices,
+            full_kv_num_blocks,
+            full_kv_indices,
+        ]
+        + list(score_mod_other_buffers)
+        + list(mask_mod_other_buffers)
+    )
+    input_gen_fns = {
+        5: create_num_blocks_fake_generator(kv_indices),
+        6: create_indices_fake,
+        7: create_num_blocks_fake_generator(full_kv_indices),
+        8: create_indices_fake,
+    }
+
+    out, _ = autotune_select_algorithm(
+        "omni_attention",
+        choices,
+        [x for x in inputs_for_autotuning if is_tensor_ir_node(x)],
+        layout,
+        input_gen_fns=input_gen_fns,
+    )
+
+    out.data.data.subgraph_inps = list(score_mod_other_buffers) + list(
+        mask_mod_other_buffers
+    )
+    out.data.data.subgraph_outs = get_fwd_subgraph_outputs(
+        subgraph_buffer, mask_graph_buffer
+    )
+
+    return (out, logsumexp, max_scores)
+
+
+# ---------------------------------------------------------------------------
+# The entry
+# ---------------------------------------------------------------------------
+
+
+@register_lowering(omni_attention_hop, type_promotion_kind=None)
+def lower_omni_attention(
+    query: Any,
+    key: Any,
+    value: Any,
+    subgraph: Any,
+    block_mask: Any,
+    scale: float,
+    kernel_options: Any,
+    score_mod_other_buffers: Any,
+    mask_mod_other_buffers: Any,
+) -> Any:
+    """Write attention for a call, whichever way this device can be written to.
+
+    Four ways, and they are four rather than one with a switch because they are
+    not four tunings of one thing.  A device that cannot compare several
+    positions at once is handed the comparisons; a device that can is handed the
+    ranges and reads them several at a time; a device with neither is walked by
+    one program at a time.  Which is right is a fact about the device, not a
+    preference, so a program that named none of them is given the one that suits
+    it and a program that named one is told if that one cannot be had.
+
+    The two things that are asked of a device rather than of the program are
+    asked first: whether the embedding is wide enough for a product at all, and
+    which backend was named.  Both are cheaper to answer than to discover later,
+    and the first has to come first because a kernel that cannot be written is
+    not worth choosing.
+    """
+
+    kernel_options, backend = sanitize_kernel_options_for_triton(kernel_options)
+
+    device_type = query.get_device().type
+    if device_type in ("cpu", "mps"):
+        # These two are written as a shader rather than as tiles, so they do not
+        # go through anything below: there is no block to choose and no grid to
+        # spread, only a program the device compiles.  Said here rather than
+        # falling through to the tiled path, because falling through would
+        # produce a kernel for a device that cannot run one -- an answer that is
+        # wrong rather than one that is missing.
+        raise NotImplementedError(
+            f"attention on {device_type} needs a shader rather than tiles, and "
+            f"this compiler has none for that device yet. The tiled path below "
+            f"runs on a device that has blocks."
+        )
+
+    check_embedding_is_wide_enough(query, value)
+
+    mask_parts = unpack_block_mask(block_mask)
+    mask_graph = mask_parts["mask_graph"]
+
+    if backend == _BACKEND_FLASH:
+        check_flash_supported_scalar_captures(
+            score_mod_other_buffers, mask_mod_other_buffers
+        )
+        score_mod_other_buffers = realize_captures_for_cutedsl(score_mod_other_buffers)
+        mask_mod_other_buffers = realize_captures_for_cutedsl(mask_mod_other_buffers)
+
+    subgraph_buffer, mask_graph_buffer = capture_score_and_mask(
+        query,
+        subgraph,
+        mask_graph,
+        score_mod_other_buffers,
+        mask_mod_other_buffers,
+    )
+    kernel_options = guard_kernel_options(kernel_options)
+    enable_gqa = heads_are_grouped(query, key)
+
+    from .omni_decoding import (
+        create_omni_decoding_kernel,
+        use_omni_decoding,
+    )
+    from .omni_flash_attention import (
+        create_omni_flash_attention_kernel,
+        use_omni_flash_attention,
+    )
+
+    can_use_decode = use_omni_decoding(
+        query, mask_parts["kv_indices"], value, kernel_options, enable_gqa
+    )
+    use_decode = (backend == _BACKEND_TRITON_DECODE) or (
+        backend == _BACKEND_AUTO and can_use_decode
+    )
+
+    if backend == _BACKEND_TRITON_DECODE and not can_use_decode:
+        raise RuntimeError(
+            "BACKEND='TRITON_DECODE' was specified but attention decoding cannot be "
+            "used for this input. Decoding is only available for short sequence "
+            "lengths with specific configurations."
+        )
+
+    if use_decode:
+        return create_omni_decoding_kernel(
+            query,
+            key,
+            value,
+            scale,
+            kernel_options,
+            subgraph_buffer,
+            mask_graph_buffer,
+            score_mod_other_buffers,
+            mask_mod_other_buffers,
+            mask_parts["kv_num_blocks"],
+            mask_parts["kv_indices"],
+            mask_parts["full_kv_num_blocks"],
+            mask_parts["full_kv_indices"],
+            mask_parts["sparse_q_block_size"],
+            mask_parts["sparse_kv_block_size"],
+        )
+
+    if use_omni_flash_attention(
+        subgraph,
+        mask_graph,
+        kernel_options,
+        num_score_mod_placeholders=5,
+        backend=backend,
+    ):
+        return create_omni_flash_attention_kernel(
+            query,
+            key,
+            value,
+            scale,
+            kernel_options,
+            subgraph_buffer,
+            mask_graph_buffer,
+            score_mod_other_buffers,
+            mask_mod_other_buffers,
+            mask_parts["kv_num_blocks"],
+            mask_parts["kv_indices"],
+            mask_parts["full_kv_num_blocks"],
+            mask_parts["full_kv_indices"],
+            mask_parts["sparse_q_block_size"],
+            mask_parts["sparse_kv_block_size"],
+            mask_graph,
+            subgraph,
+        )
+
+    return create_omni_attention_kernel(
+        query,
+        key,
+        value,
+        scale,
+        kernel_options,
+        subgraph_buffer,
+        mask_graph_buffer,
+        score_mod_other_buffers,
+        mask_mod_other_buffers,
+        mask_parts,
+    )

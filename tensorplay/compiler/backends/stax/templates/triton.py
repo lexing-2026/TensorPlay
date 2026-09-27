@@ -11,6 +11,8 @@ which table a device reads is declared beside the tables themselves.
 from __future__ import annotations
 
 from .ir import next_power_of_2
+import tensorplay as tp
+
 from .. import config
 from ..heuristics.template.base import TemplateConfigHeuristics
 
@@ -47,6 +49,40 @@ class BaseConfig:
             "BLOCK_N": self.block_n,
             "BLOCK_K": self.block_k,
         }
+
+
+@dataclass
+class OmniAttentionConfig:
+    """A tile for attention that reads a mask a position at a time.
+
+    The backward pass reuses these two extents for four of its own, so a name
+    that means one tile here means two there.
+    """
+
+    block_m: int
+    block_n: int
+    num_stages: int
+    num_warps: int
+
+
+@dataclass
+class OmniAttentionBackwardConfig:
+    """Four tiles for the pass that goes back the way attention came.
+
+    Two of them are constrained against the other two, and the shape of the
+    constraint is why there are two ways to fill this in.  Pairing them
+    symmetrically -- one tile and its partner swapped -- needs only one of the
+    two constraints checked, because the other follows.  Setting all four
+    independently needs both, and buys the freedom that the paired form does
+    not have.
+    """
+
+    block_m1: int
+    block_n1: int
+    block_m2: int
+    block_n2: int
+    num_stages: int
+    num_warps: int
 
 
 @dataclass
@@ -410,6 +446,111 @@ class _TileConfigHeuristic(TemplateConfigHeuristics):
             omni_decode_configs.append(default_config)
 
         return omni_decode_configs
+
+    def get_omni_attn_fwd_configs(
+        self, head_dim: int, seq_len: Any, dtype: Any
+    ) -> list[OmniAttentionConfig]:
+        """The tilings for attention that reads a mask a position at a time.
+
+        The one always offered is narrower for a wider embedding and for a
+        32-bit one, because a tile that spans the embedding has to be held whole
+        and a 32-bit value held in a tile sized for a 16-bit one wastes half of
+        it.  Which is better is a fact about the shapes, so all of them are
+        offered and measured rather than one chosen here.
+        """
+
+        omni_attn_fwd_configs: list[OmniAttentionConfig] = []
+
+        if config.max_autotune:
+            if config.max_autotune_omni_search_space == "EXHAUSTIVE":
+                return self.exhaustive_omni_attn_fwd_configs
+            omni_attn_fwd_configs += self.omni_attn_fwd_autotune_configs
+
+        if head_dim <= 256:
+            if dtype == tp.float32:
+                default_config = OmniAttentionConfig(64, 64, 3, 4)
+            else:
+                default_config = OmniAttentionConfig(128, 64, 3, 4)
+        else:
+            if dtype == tp.float32:
+                default_config = OmniAttentionConfig(32, 16, 3, 4)
+            else:
+                default_config = OmniAttentionConfig(64, 32, 3, 4)
+
+        if default_config not in omni_attn_fwd_configs:
+            omni_attn_fwd_configs.append(default_config)
+
+        return omni_attn_fwd_configs
+
+    def get_omni_attn_bwd_configs(
+        self, head_dim: int, dtype: Any
+    ) -> list[OmniAttentionBackwardConfig]:
+        """The tilings for the pass that goes back the way attention came.
+
+        One always offered, and the same shape whatever the embedding or the
+        type: the backward pass does four walks rather than one, so a tile that
+        suits one of them does not necessarily suit the others, and the table
+        that would suit all four is not worth having by default.
+        """
+
+        omni_attn_bwd_configs: list[OmniAttentionBackwardConfig] = []
+
+        if config.max_autotune:
+            if config.max_autotune_omni_search_space == "EXHAUSTIVE":
+                return self.exhaustive_omni_attn_bwd_configs
+            omni_attn_bwd_configs += self.omni_attn_bwd_autotune_configs
+
+        default_config = OmniAttentionBackwardConfig(16, 16, 16, 16, 1, 4)
+
+        if default_config not in omni_attn_bwd_configs:
+            omni_attn_bwd_configs.append(default_config)
+
+        return omni_attn_bwd_configs
+
+    #: The forward tilings offered when the widest search was asked for, read as
+    #: (queries, keys, stages, warps).
+    omni_attn_fwd_autotune_configs: tuple = (
+        OmniAttentionConfig(128, 64, 3, 4),
+        OmniAttentionConfig(128, 128, 3, 4),
+        OmniAttentionConfig(128, 128, 2, 8),
+        OmniAttentionConfig(128, 128, 1, 8),
+        OmniAttentionConfig(64, 128, 3, 4),
+        OmniAttentionConfig(64, 64, 3, 4),
+    )
+    #: Every forward tiling the table implies rather than names.
+    exhaustive_omni_attn_fwd_configs: tuple = tuple(
+        OmniAttentionConfig(block_m, block_n, num_stages, num_warps)
+        for block_m in (16, 32, 64, 128)
+        for block_n in (32, 64, 128)
+        for num_stages in (1, 3, 4, 5)
+        for num_warps in (2, 4, 8)
+    )
+    #: The backward tilings offered when the widest search was asked for.  The
+    #: two tiles are paired rather than chosen independently: only half the
+    #: combinations satisfy both constraints, and pairing makes the second one
+    #: follow from the first.
+    omni_attn_bwd_autotune_configs: tuple = tuple(
+        OmniAttentionBackwardConfig(block_m, block_n, block_n, block_m, stages, warps)
+        for block_m in (32, 64)
+        for block_n in (32, 64, 128)
+        for stages in (1, 3, 4, 5)
+        for warps in ((4, 8) if block_m >= 128 or block_n >= 128 else (4,))
+        if block_n % block_m == 0
+    )
+    #: Every backward tiling the table implies rather than names: all four set
+    #: independently, so both constraints have to be checked.
+    exhaustive_omni_attn_bwd_configs: tuple = tuple(
+        OmniAttentionBackwardConfig(
+            block_m1, block_n1, block_m2, block_n2, num_stages, num_warps
+        )
+        for block_m1 in (16, 32, 64, 128)
+        for block_n1 in (16, 32, 64, 128)
+        for block_m2 in (16, 32, 64, 128)
+        for block_n2 in (16, 32, 64, 128)
+        for num_stages in (1, 3, 4)
+        for num_warps in (2, 4, 8)
+        if block_n1 % block_m1 == 0 and block_m2 % block_n2 == 0
+    )
 
     #: The three tilings offered when the widest search was asked for, read as
     #: (keys per program, stages, warps).
