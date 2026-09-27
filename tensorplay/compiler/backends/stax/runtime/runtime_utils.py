@@ -70,6 +70,42 @@ def red_text(msg: str) -> str:
     return _color_text(msg, "red")
 
 
+def get_num_bytes(*args, num_in_out_args: int = 0) -> int:
+    """How many bytes a kernel's arguments add up to.
+
+    A value that is both read and written is counted twice, because it is both
+    read and written -- which is what makes a kernel that updates in place look
+    like the traffic it actually causes.  The first `num_in_out_args` arguments
+    are the ones that are both.
+    """
+
+    return sum(
+        arg.numel() * arg.element_size() * (1 + int(i < num_in_out_args))
+        for i, arg in enumerate(args)
+        if isinstance(arg, tp.Tensor)
+    )
+
+
+def create_bandwidth_info_str(
+    ms: float,
+    num_gb: float,
+    gb_per_s: float,
+    prefix: str = "",
+    suffix: str = "",
+    color: bool = True,
+) -> str:
+    """One measured kernel as a line, with the slow ones marked.
+
+    A kernel that moves little and takes long is usually not limited by the
+    memory rather than by the arithmetic, and that is worth seeing at a glance
+    while reading a list of measurements.
+    """
+
+    info_str = f"{prefix}{ms:.3f}ms    \t{num_gb:.3f} GB \t {gb_per_s:7.2f}GB/s{suffix}"
+    slow = ms > 0.012 and gb_per_s < 650
+    return red_text(info_str) if color and slow else info_str
+
+
 def validate_triton_config(cfg) -> None:
     """Refuse a configuration that would not survive being written down.
 

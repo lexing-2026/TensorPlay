@@ -646,6 +646,30 @@ class CompileResult(Generic[_T]):
         return call_args, def_args, none_args
 
 
+def _find_names(obj):
+    """The names a kernel is bound to, which is the name it will be reported under.
+
+    Only dictionaries are searched, because a generated module binds its
+    kernels in its globals and that is where the real name lives.  Walking the
+    stack as well would only add the incidental names of whatever local
+    happened to be holding it, which are never the name it was generated under.
+    """
+
+    import gc
+
+    obj_names = []
+    for referrer in gc.get_referrers(obj):
+        if isinstance(referrer, dict):
+            for k, v in referrer.items():
+                if v is obj:
+                    obj_names.append(k)
+    return obj_names
+
+
+#: What every measured kernel reported, in the order they were measured.
+collected_calls: list = []
+
+
 class CachingAutotuner(KernelInterface):
     """A kernel with several configurations, each compiled, the best one kept.
 
