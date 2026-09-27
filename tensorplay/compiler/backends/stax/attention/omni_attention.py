@@ -15,6 +15,7 @@ and a tuple of coordinates to the one place that asks.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import enum
 import functools
@@ -746,6 +747,96 @@ def flash_supports_aux_scalars() -> bool:
         "aux_scalars" in inspect.signature(interface._flash_attn_fwd).parameters
         and "aux_scalars" in inspect.signature(interface._flash_attn_bwd).parameters
     )
+
+
+# ---------------------------------------------------------------------------
+# How a position becomes a place in memory
+# ---------------------------------------------------------------------------
+
+
+def _hierarchical_indexer_cute(
+    size: Any, stride: Any = None, offset: Any = None
+) -> Any:
+    """Turn a position into the dimensions it names, rather than into an offset.
+
+    Everywhere else a position is one number: the distance from the start of the
+    buffer, because a read is at an offset and the offset is what the hardware
+    wants.  This kernel wants the opposite -- one number per dimension, so that
+    it can be written as ``tensor[i, j]`` and be answerable for strides itself.
+
+    A single dimension is passed through as itself, because there is nothing to
+    keep together: one number is already one number.  No position at all is
+    zero, which is what reading a value with no dimensions means.
+    """
+
+    if offset is None:
+        offset = sympy.Integer(0)
+
+    def indexer(indices: Any) -> Any:
+        if offset != sympy.Integer(0):
+            raise AssertionError("Offset not supported for hierarchical indexing")
+        if len(indices) != len(size):
+            raise AssertionError(
+                f"Rank mismatch: got {len(indices)} indices for tensor of rank {len(size)}"
+            )
+        if not indices:
+            return sympy.Integer(0)
+        if len(indices) == 1:
+            return indices[0]
+        return HierarchicalIndex(*indices)
+
+    return indexer
+
+
+@contextlib.contextmanager
+def patch_fixed_layout_indexer_for_cutedsl() -> Any:
+    """Make positions name dimensions for as long as a kernel is being written.
+
+    The layout knows how to turn a position into an offset and is written to do
+    that, because that is what a read is everywhere else.  This kernel wants the
+    dimensions instead, and it wants them only while it is being written -- so
+    the layout is changed for that time and changed back, rather than taught a
+    second way of doing something every other caller would then have to know
+    about.
+
+    These kernels read and compute but do not store, so the values whose layout
+    this changes are only ever read, and how a read is addressed is not part of
+    what is stored.
+    """
+
+    original_make_indexer = FixedLayout.make_indexer
+
+    def cutedsl_make_indexer(self: Any) -> Any:
+        return _hierarchical_indexer_cute(self.size, self.stride, self.offset)
+
+    FixedLayout.make_indexer = cutedsl_make_indexer
+    try:
+        yield
+    finally:
+        FixedLayout.make_indexer = original_make_indexer
+
+
+def wrap_choice_render_with_cutedsl_indexer(choice: Any) -> None:
+    """Have a kernel written with positions naming dimensions.
+
+    The change is around the writing rather than inside it, so that a choice
+    that was not wrapped is written the way every other kernel is -- which is
+    what makes this something to apply to the ones that need it rather than a
+    property of how kernels are written.
+    """
+
+    original_make_kernel_render = choice.make_kernel_render
+
+    def make_kernel_render_with_patch(*args: Any, **kwargs: Any) -> Any:
+        render_kernel, render = original_make_kernel_render(*args, **kwargs)
+
+        def render_with_patch() -> Any:
+            with patch_fixed_layout_indexer_for_cutedsl():
+                return render()
+
+        return render_kernel, render_with_patch
+
+    choice.make_kernel_render = make_kernel_render_with_patch
 
 
 # ---------------------------------------------------------------------------
