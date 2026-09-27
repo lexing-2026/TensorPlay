@@ -18,6 +18,7 @@ import copy
 import dataclasses
 import enum
 import functools
+import hashlib
 import logging
 import math
 import os
@@ -402,6 +403,23 @@ class Grid2DWithYZOverflow(GridExpr):
         else:
             self.y_grid = f"(y_grid_div_ == 0 ? 0 : {ceildiv_expr})"
         self.z_grid = "y_grid_div_"
+
+
+def hash_configs(configs: list):
+    """A name for a set of configurations, so a change to any of them shows up.
+
+    What a kernel was measured with is written down against this, so a
+    configuration that has been changed must not find the old answer waiting
+    for it.  The settings are sorted because a configuration written in a
+    different order is the same configuration.
+    """
+
+    hasher = hashlib.sha256()
+    for cfg in configs:
+        hasher.update(
+            f"{sorted(cfg.kwargs.items())} {cfg.num_warps} {cfg.num_stages}\n".encode()
+        )
+    return hasher.hexdigest()
 
 
 @functools.lru_cache(None)
