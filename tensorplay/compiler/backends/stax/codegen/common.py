@@ -75,7 +75,8 @@ class PythonPrinter(_PythonPrinter):
             return super().parenthesize(item, level, strict)
 
 from ..ops_handler import DefaultHandler, OpsHandler
-from ..loops import NullKernel, set_kernel_handler, V
+from ..loops import NullKernel
+from ..virtualized import V
 from ..ops_handler import DefaultHandler as _DefaultHandler
 
 
@@ -2448,7 +2449,7 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
         self.exit_stack.enter_context(
             V.set_ops_handler(CSEProxy(self, self.overrides()))
         )
-        self.exit_stack.enter_context(set_kernel_handler(self))
+        self.exit_stack.enter_context(V.set_kernel_handler(self))
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:

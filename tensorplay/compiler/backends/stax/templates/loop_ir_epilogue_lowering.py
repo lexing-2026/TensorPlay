@@ -41,7 +41,8 @@ import tensorplay as _tp
 
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
 from ..ir import ComputedBuffer
-from ..ops_handler import DefaultHandler, V
+from ..loops import V
+from ..ops_handler import DefaultHandler
 from .gemm_epilogue import GemmReductionConfig
 
 __all__ = [

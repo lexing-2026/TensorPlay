@@ -31,7 +31,6 @@ import tensorplay as tp
 from tensorplay.utils import _pytree as pytree
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
 
-from .loops import V
 from .utils import IndentedBuffer
 
 
@@ -757,6 +756,8 @@ class KernelFormatterHandler(DefaultHandler):
                     ]
                 )
                 formatter._output.writeline(f"{lhs} = {name}")
+
+        from .loops import V
 
         with V.set_ops_handler(formatter):
             result = ir_fn(*args)

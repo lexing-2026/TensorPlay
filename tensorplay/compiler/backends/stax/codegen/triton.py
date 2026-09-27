@@ -48,7 +48,7 @@ from tensorplay.utils._triton import (
     has_triton_cpu_backend,
     has_triton_stable_tma_api,
 )
-from ..utils import _TMA_SUPPORTED_DTYPES, TMA_ALIGNMENT, TRITON_FLOAT8_DTYPES
+from ..utils import TMA_ALIGNMENT, TRITON_FLOAT8_DTYPES, _TMA_SUPPORTED_DTYPES, identity
 from ..heuristics.template.base import next_power_of_2
 from .triton_utils import (
     config_of,

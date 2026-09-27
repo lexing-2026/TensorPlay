@@ -192,6 +192,17 @@ def gather_origins(args, kwargs) -> OrderedSet:
     return OrderedSet(itertools.chain(*args_origins, *kwargs_origins))
 
 
+def identity(value):
+    """The value handed back unchanged.
+
+    Named rather than written as a lambda wherever a function is expected but
+    the value should pass through, so that a reader can tell at the point of
+    use that nothing is being done to it.
+    """
+
+    return value
+
+
 def cache_on_self_and_args(class_name: str):
     """Remember what a method returned for the arguments it was given.
 
@@ -1201,7 +1212,10 @@ def cache_on_self(fn):
     is attached past the attribute lookup that would otherwise refuse it.
     """
 
-    key = f"__{type(fn).__qualname__}_cache"
+    # The cache is named after the method rather than after the kind of thing
+    # a method is: two methods cached on one object must not answer for each
+    # other, and a name shared by every method would let them.
+    key = f"__{fn.__name__}_cache"
 
     def inner(self, *args, **kwargs):
         args_kwargs = (args, tuple(sorted(kwargs.items())))

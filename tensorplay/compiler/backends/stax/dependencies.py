@@ -10,6 +10,8 @@ of what is being compared.
 import abc
 import dataclasses
 import itertools
+from unittest import mock
+from unittest.mock import patch
 import logging
 import re
 from collections.abc import Callable, Iterable, Sequence
@@ -26,12 +28,12 @@ from tensorplay.graph.experimental.symbolic_shapes import (
 )
 
 from .codegen.common import index_prevent_reordering
+from .loops import V
 from .ops_handler import (
     DefaultHandler,
     WrapperHandler as _WrapperHandler,
     KernelFormatterHandler,
     MockHandler,
-    V,
 )
 from .utils import (
     decompose_index,
@@ -824,27 +826,81 @@ def extract_read_writes(
 
 
 class FreeSymbolsOpsHandler(DefaultHandler):
-    """Collects every shape symbol a body mentions, and where it mentions it."""
+    """Every shape symbol a body mentions, and whether it is known to be there.
 
-    def __init__(self):
-        self.symbols: OrderedSet = OrderedSet()
+    Which symbols are wanted depends on what is being asked: a body written to
+    be run again for a different shape needs the symbols whose value is not yet
+    settled, while a body being checked against a shape that is already known
+    needs every symbol it mentions.  So the narrower reading is the default and
+    the wider one is asked for.
+    """
 
-    def free_symbols(self, expr, hint: int | None = None):
-        result = (
-            OrderedSet(free_symbols(expr, hint))
-            if isinstance(expr, sympy.Expr)
-            else OrderedSet(*expr)
-        )
-        self.symbols |= result
-        return result
+    symbols: OrderedSet
 
-    def handle(self, expr):
-        if isinstance(expr, sympy.Expr):
-            self.free_symbols(expr)
-        elif isinstance(expr, (list, tuple)):
-            for e in expr:
-                self.handle(e)
-        return expr
+    def __init__(self, unbacked_only: bool = True) -> None:
+        self.symbols = OrderedSet()
+        self.get_symbols = free_unbacked_symbols if unbacked_only else free_symbols
+
+    def _default(self, name: str, args: tuple, kwargs: dict) -> Any:
+        for a in itertools.chain(args, kwargs.values()):
+            if isinstance(a, (sympy.Expr, sympy.logic.boolalg.Boolean)):
+                self.symbols |= self.get_symbols(a)
+
+    def indirect_indexing(
+        self,
+        index_var: Any,
+        size,
+        check: bool = True,
+        wrap_neg: bool = True,
+    ):
+        """An index read out of another value, and the shape it was read against.
+
+        The size is what carries the symbols: the index itself is a name this
+        reading invents, and what has to be remembered is the extent it will be
+        used against.  A size that is already an expression would mean the
+        index had been resolved before it got here, which cannot be undone.
+        """
+
+        if isinstance(index_var, (sympy.Expr, sympy.logic.boolalg.Boolean)):
+            raise AssertionError(
+                f"index_var must not be a sympy Expr or Boolean, got {type(index_var)}"
+            )
+        self.symbols |= self.get_symbols(size)
+        return sympy_index_symbol(f"({str(index_var)})")
+
+    def frexp(self, x: Any):
+        """A split into mantissa and exponent produces two values."""
+
+        return (None,) * 2
+
+    def scan(self, dtypes: Any, combine_fn: Any, values: Sequence):
+        """A scan produces one value per value it was handed."""
+
+        return (None,) * len(values)
+
+    def sort(self, dtypes: Any, values: Sequence, stable: Any, descending: Any):
+        """A sort produces one value per value it was handed."""
+
+        return (None,) * len(values)
+
+    def reduction(self, dtype, src_dtype, reduction_type, value):
+        """A reduction produces as many values as its kind of reduction says."""
+
+        num_values = reduction_num_outputs(reduction_type)
+        return (None,) * num_values if num_values > 1 else None
+
+    def masked(self, mask: Any, body, other: Any) -> None:
+        """A body under a mask is read by reading the body.
+
+        The mask is not arithmetic on shapes, and the other value is not read
+        through this handler, so what is left to hear about is what the body
+        itself mentions -- which may be more than what led to it, since a body
+        may read an index out of another value.
+        """
+
+        if not callable(body):
+            raise AssertionError("masked body must always be callable.")
+        body()
 
 
 def extract_loop_body_with_args(
@@ -956,11 +1012,31 @@ def extract_input_node_reduction_ranges(
     return (size, reduction_size)
 
 
-def extract_free_symbols(*args) -> OrderedSet:
-    """Every shape symbol mentioned anywhere inside these arguments."""
+def extract_free_symbols(
+    fn,
+    index: Sequence,
+    rindex: Sequence | None = None,
+    unbacked_only: bool = True,
+) -> OrderedSet:
+    """Every shape symbol a piece of index arithmetic mentions.
 
-    handler = FreeSymbolsOpsHandler()
-    V.op.handle(args)
+    The arithmetic is handed over as the function that computes it rather than
+    as its result, because what is wanted is what the arithmetic *says* about
+    shapes, and running it and reading the result would only report the
+    symbols that survived being computed with.  Indexing is allowed while it is
+    read, because an index that is not yet settled is exactly the case worth
+    hearing about.
+    """
+
+    from .ir import FlexibleLayout
+
+    args = [index, rindex] if rindex is not None else [index]
+    handler = FreeSymbolsOpsHandler(unbacked_only)
+    with (
+        V.set_ops_handler(handler),
+        patch.object(FlexibleLayout, "allow_indexing", True),
+    ):
+        fn(*args)
     return handler.symbols
 
 

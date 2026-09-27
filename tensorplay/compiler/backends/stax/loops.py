@@ -288,17 +288,40 @@ class _Virtual(threading.local):
     get_fake_mode = None
 
 
-V = _Virtual()
+#: What is current while a region is read: the region itself, the operations
+#: answered against it, and the kernel being written.  It is the same object
+#: the module that owns it publishes, because code that installs a handler and
+#: code that reads one must be talking about the same state -- two such objects
+#: would let a handler be installed on one and never be seen by the other.
+#: Resolved on first use rather than at import, because the module that owns
+#: it reaches this one while it is still being set up.
+_resolving_V = False
+
+
+def __getattr__(name):
+    if name != "V":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    global _resolving_V
+    if _resolving_V:
+        raise ImportError(f"{__name__}.V is being resolved already")
+    _resolving_V = True
+    try:
+        from . import virtualized
+
+        globals()["V"] = virtualized.V
+        return virtualized.V
+    finally:
+        _resolving_V = False
 
 
 @contextlib.contextmanager
 def set_ops_handler(handler):
     previous = V.ops
-    V.ops = handler
+    V.set_ops_handler(handler)
     try:
         yield handler
     finally:
-        V.ops = previous
+        V.set_ops_handler(previous)
 
 
 @contextlib.contextmanager
@@ -312,11 +335,11 @@ def set_kernel_handler(kernel):
     """
 
     previous = V.kernel
-    V.kernel = kernel
+    V.set_kernel_handler(kernel)
     try:
         yield kernel
     finally:
-        V.kernel = previous
+        V.set_kernel_handler(previous)
 
 
 @contextlib.contextmanager
@@ -332,11 +355,11 @@ def set_local_buffer_context(local_buffer_context):
     """
 
     previous = V.local_buffer_context
-    V.local_buffer_context = local_buffer_context
+    V.set_local_buffer_context(local_buffer_context)
     try:
         yield local_buffer_context
     finally:
-        V.local_buffer_context = previous
+        V.set_local_buffer_context(previous)
 
 
 @contextlib.contextmanager
@@ -355,16 +378,8 @@ def set_graph(graph):
 
     from . import virtualized
 
-    previous = V.graph
-    previous_sizevars = V.sizevars
-    V.graph = graph
-    V.sizevars = getattr(graph, "sizevars", None)
     with virtualized.V.set_graph_handler(graph):
-        try:
-            yield graph
-        finally:
-            V.graph = previous
-            V.sizevars = previous_sizevars
+        yield graph
 
 
 @contextlib.contextmanager
@@ -378,11 +393,11 @@ def set_current_node(node):
     """
 
     previous = V.current_node
-    V.current_node = node
+    V.set_current_node(node)
     try:
         yield node
     finally:
-        V.current_node = previous
+        V.set_current_node(previous)
 
 
 def get_ops_handler():
@@ -401,11 +416,11 @@ def set_interpreter_handler(handler):
     """
 
     previous = V.interpreter
-    V.interpreter = handler
+    V.set_interpreter_handler(handler)
     try:
         yield handler
     finally:
-        V.interpreter = previous
+        V.set_interpreter_handler(previous)
 
 
 @contextlib.contextmanager
@@ -413,11 +428,11 @@ def set_debug_handler(handler):
     """Make a recorder of what was emitted current, and put back the previous."""
 
     previous = V.debug
-    V.debug = handler
+    V.set_debug_handler(handler)
     try:
         yield handler
     finally:
-        V.debug = previous
+        V.set_debug_handler(previous)
 
 
 @contextlib.contextmanager
@@ -425,11 +440,11 @@ def set_aot_compilation(value: bool):
     """Record whether the code is being emitted ahead of time, and restore it."""
 
     previous = V.aot_compilation
-    V.aot_compilation = value
+    V.set_aot_compilation(value)
     try:
         yield value
     finally:
-        V.aot_compilation = previous
+        V.set_aot_compilation(previous)
 
 
 def get_aot_compilation() -> bool:
@@ -443,11 +458,11 @@ def set_current_node_handler(node):
     """Make a node current for a generator that asks about it."""
 
     previous = V.current_node
-    V.current_node = node
+    V.set_current_node(node)
     try:
         yield node
     finally:
-        V.current_node = previous
+        V.set_current_node(previous)
 
 
 @contextlib.contextmanager
@@ -455,11 +470,11 @@ def set_extern_kernel_nodes(nodes):
     """Make a set of nodes that must stay separate current, and restore it."""
 
     previous = V.extern_kernel_nodes
-    V.extern_kernel_nodes = nodes
+    V.set_extern_kernel_nodes(nodes)
     try:
         yield nodes
     finally:
-        V.extern_kernel_nodes = previous
+        V.set_extern_kernel_nodes(previous)
 
 
 @contextlib.contextmanager
@@ -472,11 +487,11 @@ def set_real_inputs(real_inputs):
     """
 
     previous = V.real_inputs
-    V.real_inputs = real_inputs
+    V.set_real_inputs(real_inputs)
     try:
         yield real_inputs
     finally:
-        V.real_inputs = previous
+        V.set_real_inputs(previous)
 
 
 def get_real_inputs():

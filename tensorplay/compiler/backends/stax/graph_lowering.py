@@ -75,7 +75,6 @@ from .loops import (
     DeferredOps,
     dtype_name,
     Value,
-    V,
     substitute,
     fresh_symbols,
     record_body,

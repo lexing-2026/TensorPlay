@@ -227,7 +227,7 @@ def _lower_stax_region(
         with set_graph(graph), VirtualMachine.set_debug_handler(Debug()):
             graph.run(*example_inputs)
             compiled_module = graph.compile_to_module()
-    except (NotImplementedError, NotImplementedError.__base__) as exc:
+    except NotImplementedError as exc:
         # A region whose printed form this compiler does not cover has no built
         # artifact, and an artifact that cannot be entered is worse than none:
         # the failure would arrive at the first call rather than here.  So a
