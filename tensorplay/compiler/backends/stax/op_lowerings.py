@@ -4215,3 +4215,73 @@ def tensor(
         inner_fn=inner_fn,
         ranges=ranges,
     )
+
+
+def philox_rand_offset(shape: Any) -> Any:
+    """How many values reading a shape of this size reads.
+
+    Deliberately not the number the eager generator would have counted: the two
+    read the stream differently -- one asks a device for values, the other asks
+    a device for values at a position -- so counting them the same way would
+    make two graphs that read the same amount land on the same position where
+    they do not.
+    """
+
+    numel = 1
+    for s in shape:
+        numel = numel * s
+    return tensor(numel, dtype=tp.int64)
+
+
+@register_lowering(prims.philox_rand, type_promotion_kind=None)
+def philox_rand(
+    size: Any, seed: Any, offset: Any, stride: Any, device: Any, dtype: Any
+) -> Any:
+    """Values read at a position, and how many of them there were.
+
+    The position asked for is where the stream was left off plus where in the
+    shape this element is, so two elements are two positions rather than the
+    same one twice -- which is what makes the values a function of the element
+    rather than of how many threads happened to read before it.
+
+    A stride would say the stream is shared across devices, which is a
+    distributed concern and not one this walks: a stream with a stride has
+    positions on it that are not this position.
+    """
+
+    # Which stream is a fact about the caller rather than about how one is read.
+    del stride
+
+    random_pos = ir.FixedLayout(
+        device,
+        dtype,
+        size,
+        ir.FlexibleLayout.contiguous_strides(size),
+    ).make_indexer()
+    seed_loader = seed.make_loader()
+    offset_loader = offset.make_loader()
+
+    def inner_fn(index: Any) -> Any:
+        # The seed and the offset are values rather than numbers, and a device
+        # reads a position as a number: so both are read and then read as
+        # numbers, which is the same conversion the values come back through.
+        seed_index_expr = ops.to_dtype(seed_loader([]), "int32")
+        offset_index_expr = ops.to_dtype(offset_loader([]), "int32")
+        rand_index_expr = ops.add(
+            ops.index_expr(random_pos(index), "int32"), offset_index_expr
+        )
+        result = ops.rand(
+            seed_index_expr,
+            rand_index_expr,
+        )
+        return ops.to_dtype(result, dtype)
+
+    random_values_node = Pointwise.create(
+        device=device,
+        dtype=dtype,
+        inner_fn=inner_fn,
+        ranges=list(size),
+    )
+
+    offset_node = philox_rand_offset(size)
+    return random_values_node, offset_node
