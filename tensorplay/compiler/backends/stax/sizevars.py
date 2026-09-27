@@ -704,6 +704,17 @@ class SizeVarAllocator:
         that is safe without a guard.
         """
 
+        # A claim that is already settled -- a comparison of two numbers
+        # rather than of two extents -- is answered with itself.  Only a
+        # claim about extents needs deciding against what is known about
+        # them, and treating a settled answer as one to be decided is how a
+        # plain true becomes a question with no answer.
+        if not isinstance(left, sympy.logic.boolalg.Boolean):
+            if not isinstance(left, bool):
+                raise AssertionError(f"Expected bool, got {type(left)}")
+            return left
+
+
         if backed_size_oblivious:
             static_val = self.shape_env._maybe_evaluate_static(left)
             if static_val is not None:
@@ -713,6 +724,17 @@ class SizeVarAllocator:
 
     def guard_or_true(self, left):
         """The truth of a relation, or true when it cannot be decided."""
+
+        # A claim that is already settled -- a comparison of two numbers
+        # rather than of two extents -- is answered with itself.  Only a
+        # claim about extents needs deciding against what is known about
+        # them, and treating a settled answer as one to be decided is how a
+        # plain true becomes a question with no answer.
+        if not isinstance(left, sympy.logic.boolalg.Boolean):
+            if not isinstance(left, bool):
+                raise AssertionError(f"Expected bool, got {type(left)}")
+            return left
+
 
         if backed_size_oblivious:
             static_val = self.shape_env._maybe_evaluate_static(left)
@@ -1259,6 +1281,17 @@ class SizeVarAllocator:
         hold, so a claim it cannot settle is answered no rather than refused.
         """
 
+        # A claim that is already settled -- a comparison of two numbers
+        # rather than of two extents -- is answered with itself.  Only a
+        # claim about extents needs deciding against what is known about
+        # them, and treating a settled answer as one to be decided is how a
+        # plain true becomes a question with no answer.
+        if not isinstance(left, sympy.logic.boolalg.Boolean):
+            if not isinstance(left, bool):
+                raise AssertionError(f"Expected bool, got {type(left)}")
+            return left
+
+
         if backed_size_oblivious:
             static_val = self.shape_env._maybe_evaluate_static(left)
             if static_val is not None:
@@ -1272,6 +1305,17 @@ class SizeVarAllocator:
         The mirror of the above, for the caller that carries on when the claim
         holds rather than when it does not.
         """
+
+        # A claim that is already settled -- a comparison of two numbers
+        # rather than of two extents -- is answered with itself.  Only a
+        # claim about extents needs deciding against what is known about
+        # them, and treating a settled answer as one to be decided is how a
+        # plain true becomes a question with no answer.
+        if not isinstance(left, sympy.logic.boolalg.Boolean):
+            if not isinstance(left, bool):
+                raise AssertionError(f"Expected bool, got {type(left)}")
+            return left
+
 
         if backed_size_oblivious:
             static_val = self.shape_env._maybe_evaluate_static(left)

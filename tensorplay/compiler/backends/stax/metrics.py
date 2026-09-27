@@ -29,6 +29,12 @@ generated_cpp_vec_kernel_count = 0
 num_load = 0
 num_store = 0
 
+#: How many times a write into a constant tensor was turned into a masked
+#: write over the whole of it.  Worth counting because it replaces a cheap
+#: write with an arithmetic one, which is a trade that only pays when the
+#: count of the writes it removes is large.
+num_matches_for_scatter_upon_const_tensor = 0
+
 #: How many times a kernel was emitted more than once for the same call.
 num_kernel_reuse = 0
 

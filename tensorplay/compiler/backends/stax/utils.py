@@ -3101,3 +3101,19 @@ def set_customized_partition_wrappers(wrapper: Any) -> None:
     what it last asked for instead of both.
     """
     _unstable_customized_partition_wrapper.wrapper = wrapper
+
+
+def is_nvidia_sm100_or_later() -> bool:
+    """Whether this is a CUDA device of compute capability 10.0 or above.
+
+    A question about a specific architecture, asked so that a choice made
+    differently there is only made there.  Asked of the device in hand rather
+    than of what was built for, because the two are not the same thing: what a
+    binary was built to include says nothing about what it is running on.
+    """
+
+    return (
+        tp.cuda.is_available()
+        and not tp.version.hip
+        and tp.cuda.get_device_capability() >= (10, 0)
+    )
