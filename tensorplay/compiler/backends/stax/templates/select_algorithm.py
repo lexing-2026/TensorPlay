@@ -270,6 +270,11 @@ class KernelNamespace:
 #: The operations a generated wrapper reaches by name.
 extern_kernels = KernelNamespace()
 
+#: Stands in for a kernel's workspace in an argument list that has to cross a
+#: process boundary, where a workspace cannot be sent.  The reader puts a real
+#: one in its place.
+WORKSPACE_ARG_PLACEHOLDER = "ws_placeholder"
+
 
 def call_operation(name, kernel, layout, kwargs=None, has_out_variant=True):
     """One call of an operation, registering the operation if it is new.
