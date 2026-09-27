@@ -16,6 +16,7 @@ a lowering runs as a library call on realized inputs.
 from __future__ import annotations
 
 import functools
+from collections import defaultdict
 import itertools
 import logging
 import math
@@ -30,6 +31,7 @@ import tensorplay as tp
 
 from . import config
 from .utils import (
+    is_dynamic,
     is_triton_fp8_dtype_supported,
     is_view,
     register_op_dtype_propagation_rules,
@@ -41,6 +43,7 @@ from tensorplay.graph import Node
 from tensorplay.utils._pytree import arg_tree_leaves, tree_leaves, tree_map
 
 from . import ir
+from .codegen.common import BackendFeature
 from .ir import (
     BaseView,
     Buffer,
@@ -639,6 +642,256 @@ def mutate_to(changed: Any, val: Any, unsafe_alias: bool = False):
     return changed
 
 
+#: The operations that take a list of tensors and do the same thing to each.
+#: Read to decide whether a value produced by one of them is still only wanted
+#: by other ones -- if something else wants it, fusing them together would
+#: change what that something else sees.
+foreach_ops: set = set()
+
+#: The ones that write into their input, and so cannot be reordered against
+#: anything else that reads it.
+inplace_foreach_ops: set = set()
+
+#: Which of them has a non-writing form to lower to, keyed by the writing one.
+inplaceable_foreach_ops: dict = {}
+
+
+def cur_node_has_non_foreach_users() -> bool:
+    """Whether anything other than a sibling list operation wants this result.
+
+    Fusing a list of same operations into one program is only sound while
+    nothing else reads the individual results, because a fused program produces
+    them together or not at all.  So this is asked before fusing, and a yes
+    means the results have to exist on their own.
+    """
+
+    for node in V.graph.current_node.users:
+        for user in node.users:
+            if not (user.op == "call_function" and (user.target in foreach_ops)):
+                return True
+
+    return False
+
+
+def group_foreach_args(arg_pairs: Iterable[Any]) -> dict:
+    """Sort the list's entries by where they run and whether they can be fused.
+
+    Two things decide it: the device, because one program covers one device,
+    and whether the shapes are known, because a program written for a shape can
+    only cover that shape.
+    """
+
+    out = defaultdict(list)
+    unpack_args = False
+    for i, args in enumerate(arg_pairs):
+        if not isinstance(args, Iterable):
+            unpack_args = True
+            args = (args,)
+        use_foreach = (
+            not is_dynamic(*args) or config.combo_kernel_foreach_dynamic_shapes
+        )
+        device = None
+        for t in args:
+            if isinstance(t, TensorBox):
+                device = t.data.get_device()
+                break
+        if device is None:
+            raise AssertionError("foreach op should have at least one tensor arg")
+        if unpack_args:
+            (args,) = args
+        out[(device, use_foreach)].append((i, args))
+    return out
+
+
+def _register_foreach_lowering(decomp_fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Register a lowering for one of the list-of-tensors operations.
+
+    The result is checked the way any lowering's is, because a list operation
+    produces a list and a list that is not a value is as wrong as a value that
+    is not.
+    """
+
+    @functools.wraps(decomp_fn)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        out = decomp_fn(*args, **kwargs)
+        validate_ir(out)
+        return out
+
+    return wrapped
+
+
+def make_foreach_pointwise(
+    pw_fn: Callable[..., Any],
+    allow_alpha: bool = False,
+    scalar_kwarg: str = "alpha",
+) -> Callable[..., list]:
+    """Turn a one-tensor-at-a-time lowering into one over a whole list.
+
+    The scalar an operation like add-and-multiply carries arrives in a different
+    place depending on the operation's shape, so where to look for it is said
+    here rather than guessed at each use.  A scalar that is not a list is
+    repeated to the length of the list that is, so that what the per-tensor
+    lowering receives is always one entry per tensor.
+    """
+
+    def inner(*inputs: list, alpha=1, value=1) -> list:
+        # For ops like addcmul/addcdiv, the scalar `value` arrives as a
+        # positional arg (not keyword) due to the schema. Extract it
+        # from the end of inputs if present.
+        inputs = list(inputs)
+        if (
+            scalar_kwarg == "value"
+            and inputs
+            and not isinstance(inputs[-1], (list, tuple))
+        ):
+            scalar_val = inputs.pop()
+        elif scalar_kwarg == "value":
+            scalar_val = value
+        else:
+            scalar_val = alpha
+
+        realize_outputs = (
+            len(V.graph.current_node.users) == 0
+            or V.graph.current_node.target in inplace_foreach_ops
+            or cur_node_has_non_foreach_users()
+        )
+
+        a_list_input = None
+        for input in inputs:
+            if isinstance(input, (list, tuple)):
+                a_list_input = input
+                break
+        if a_list_input is None:
+            raise AssertionError("at least one input must be a list to a foreach op")
+
+        # broadcast scalar inputs to match length of list inputs
+        broadcast_inputs = []
+        for input in inputs:
+            if not isinstance(input, (list, tuple)):
+                broadcast_inputs.append([input] * len(a_list_input))
+            else:
+                broadcast_inputs.append(input)
+
+        groups = group_foreach_args(zip(*broadcast_inputs))
+
+        def apply_fn(args) -> Any:
+            if allow_alpha:
+                return pw_fn(*args, **{scalar_kwarg: scalar_val})
+            else:
+                return pw_fn(*args)
+
+        return foreach_group_loop(groups, len(a_list_input), apply_fn, realize_outputs)
+
+    return inner
+
+
+def foreach_group_loop(
+    groups: dict,
+    num_outputs: int,
+    apply_fn: Callable[..., Any],
+    realize_outputs: bool,
+) -> list:
+    """Apply one operation across each group, and say which results may be fused.
+
+    A result is only offered for fusing once it has been written down: a fused
+    program produces its results at the point it runs, and a result that is
+    still only a description of a computation has nothing to fuse with yet.
+    """
+
+    outputs: list = [None] * num_outputs
+    for (device, use_foreach), group in groups.items():
+        operation_list: list[str] = []
+        for output_ind, args in group:
+            output = apply_fn(args)
+            outputs[output_ind] = output
+
+            if (
+                V.graph.has_feature(device, BackendFeature.FOREACH)
+                and use_foreach
+                and realize_outputs
+            ):
+                output.realize()
+                operation_list.append(output.get_operation_name())
+
+        if operation_list:
+            V.graph.register_operation_list(operation_list)
+
+    if not all(x is not None for x in outputs):
+        raise AssertionError("expected: all(x is not None for x in outputs)")
+
+    return outputs
+
+
+def register_foreach_pointwise(
+    pointwise_lowering_fn: Callable[..., Any],
+    allow_alpha: bool = False,
+    scalar_kwarg: str = "alpha",
+    *,
+    names: tuple[str, ...],
+):
+    """Register the list form of an operation, from the one-tensor form of it.
+
+    The names are the operation's own, without a namespace: the table is keyed
+    that way, and saying so here is what keeps a list operation from being
+    registered under a name nothing will look it up by.
+    """
+
+    fn = make_foreach_pointwise(
+        pointwise_lowering_fn, allow_alpha=allow_alpha, scalar_kwarg=scalar_kwarg
+    )
+    wrapped = _register_foreach_lowering(fn)
+    for name in names:
+        foreach_ops.add(name)
+        LOWERINGS[name] = wrapped
+    return wrapped
+
+
+def register_foreach_inplace(
+    names: tuple[str, ...],
+    outplace_names: tuple[str, ...],
+    outplace_op: Callable[..., Any],
+):
+    """Register the writing form of a list operation, from its non-writing one.
+
+    Writing into each input is the non-writing operation's result made to be
+    that input, and the aliasing is declared unsafe because a later write
+    through one of them would otherwise be seen by whoever still reads the
+    result.
+    """
+
+    for name in outplace_names:
+        inplaceable_foreach_ops[name] = names
+    for name in names:
+        inplace_foreach_ops.add(name)
+
+    def fn(*args: Any, **kwargs: Any) -> Any:
+        results = outplace_op(*args, **kwargs)
+        mut_results = []
+        for arg, result in zip(args[0], results):
+            mut_results.append(mutate_to(arg, result, unsafe_alias=True))
+
+        return mut_results
+
+    wrapped = _register_foreach_lowering(fn)
+    for name in names:
+        foreach_ops.add(name)
+        LOWERINGS[name] = wrapped
+
+
+def register_inplace(*names: str, outplace_op: Callable[..., Any]):
+    """Register the writing form of an operation, from its non-writing one.
+
+    What is written keeps the type of what was there, not the type the
+    non-writing form produced: the buffer is the caller's and its type was
+    chosen when it was allocated.
+    """
+
+    def fn(*args: Any, **kwargs: Any) -> Any:
+        result = outplace_op(*args, **kwargs)
+        result = ops.to_dtype(result, args[0].get_dtype())
+        return mutate_to(args[0], result)
+
+    return register(*names)(fn)
 def get_overloads(op: Any) -> list[Any]:
     """The table's keys for an operation, one for each of its forms.
 

@@ -588,6 +588,9 @@ class BackendFeature(Enum):
     is declared once here and read by the lowering that picks one.
     """
 
+    #: Takes a whole list of tensors in one program, so that a lowering which
+    #: received a list did not have to be unrolled into one program per tensor.
+    FOREACH = auto()
     #: Reads an input through an arbitrary stride, so a view needs no copy.
     STRIDED_INPUTS = auto()
     #: Accepts inputs whose element types differ from one another.

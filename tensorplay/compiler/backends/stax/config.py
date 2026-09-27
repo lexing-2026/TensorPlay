@@ -627,6 +627,14 @@ combo_kernel_per_subkernel_blocks = (
 combo_kernel_compile_time_autotune = (
     os.environ.get("TP_COMBO_KERNEL_COMPILE_TIME_AUTOTUNE", "0") == "1"
 )
+# Whether a whole list of same-shaped operations is fused even when the shapes
+# are only known while the program runs.  Fusing them needs one program covering
+# every shape, which is only possible when the shape is not what decides the
+# program's shape; a program written for a shape that turns out to be another
+# one is not a program that runs.
+combo_kernel_foreach_dynamic_shapes = (
+    os.environ.get("TP_COMBO_KERNEL_FOREACH_DYNAMIC_SHAPES", "1") == "1"
+)
 
 #: How many differently shaped blocks may share one kernel.  Mixing shapes lets
 #: a group with one awkward member still be launched as one kernel, at the cost
