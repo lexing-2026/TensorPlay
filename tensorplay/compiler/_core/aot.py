@@ -28,6 +28,43 @@ _LEAF_OPS = ("placeholder", "get_attr")
 # ---------------------------------------------------------------------------
 
 
+def _sum_to_size_op():
+    """The operation that reduces a gradient to the shape its value had.
+
+    Resolved when it is first needed rather than at import, because the
+    operation table is reached through the framework and this module is part of
+    what reaches it.
+    """
+
+    import tensorplay as tp
+
+    return tp.ops.tp.sum_to_size.default
+
+
+def _reshape_op():
+    """The operation that gives a gradient the shape its value had."""
+
+    import tensorplay as tp
+
+    return tp.ops.tp.reshape.default
+
+
+def _index_add_op():
+    """The operation that accumulates a gradient back where it came from."""
+
+    import tensorplay as tp
+
+    return tp.ops.tp.index_add.default
+
+
+def _scatter_add_op():
+    """The operation that accumulates a gradient back where it was read from."""
+
+    import tensorplay as tp
+
+    return tp.ops.tp.scatter_add.default
+
+
 def _emit(
     graph: Graph,
     op: str,
@@ -54,12 +91,26 @@ def _reduce_to_shape(
     if current_shape is None or target_shape is None:
         return grad
     extra = len(current_shape) - len(target_shape)
-    for _ in range(max(0, extra)):
-        grad = _emit(graph, "call_method", "sum", (grad,), {"dim": 0})
-        current_shape = current_shape[1:]
+    if extra > 0:
+        # Reducing a gradient down to the shape the value came from is one
+        # operation, not a loop of reductions: a call to a method of a value
+        # would be a call to a method of a value this compiler has not made,
+        # and the shape it reduces to is the only thing being asked for.
+        grad = _emit(
+            graph,
+            "call_function",
+            _sum_to_size_op(),
+            (grad, tuple(target_shape)),
+            {},
+        )
+        return grad
     if tuple(current_shape) != tuple(target_shape):
         grad = _emit(
-            graph, "call_method", "reshape", (grad,), {"shape": tuple(target_shape)}
+            graph,
+            "call_function",
+            _reshape_op(),
+            (grad, tuple(target_shape)),
+            {},
         )
     return grad
 
@@ -157,7 +208,7 @@ def _rule_index_select(b: _JointBuilder, node: Node, go: Node) -> Dict[Any, Node
     self_node, dim, index = node.args
     zeros = b.bwd("call_function", _zeros_like, (self_node,))
     grad = b.bwd(
-        "call_method", "index_add", (zeros, dim, index, go)
+        "call_function", _index_add_op(), (zeros, dim, index, go)
     )
     return {self_node: b.reduce_for(grad, node, self_node)}
 
@@ -166,7 +217,7 @@ def _rule_gather(b: _JointBuilder, node: Node, go: Node) -> Dict[Any, Node]:
     self_node, dim, index = node.args[:3]
     zeros = b.bwd("call_function", _zeros_like, (self_node,))
     grad = b.bwd(
-        "call_method", "scatter_add", (zeros, dim, index, go)
+        "call_function", _scatter_add_op(), (zeros, dim, index, go)
     )
     return {self_node: b.reduce_for(grad, node, self_node)}
 

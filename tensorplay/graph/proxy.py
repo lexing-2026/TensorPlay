@@ -770,6 +770,25 @@ class Attribute(Proxy):
         return self._node
 
     def __call__(self, *args: Any, **kwargs: Any) -> Proxy:
+        # A method the tensor type has is that type's operation, not a message
+        # sent to a value: writing it as a call to the operation the method *is*
+        # is what lets everything downstream -- the lowering, the schedule, the
+        # kernel -- treat it as the arithmetic it is rather than as a call it
+        # does not know how to make.  A name the tensor type does not have is
+        # something else entirely, and stays a call to that name.
+        import tensorplay as tp
+
+        tensor_type = tp.Tensor
+        samples = getattr(self.root.tracer, "_node_samples", None)
+        if samples:
+            sample = samples.get(self.root.node.name)
+            if sample is not None:
+                tensor_type = type(sample)
+        method = getattr(tensor_type, self.attr, None)
+        if method is not None:
+            return self.tracer.create_proxy(
+                "call_function", method, (self.root, *args), kwargs
+            )
         return self.tracer.create_proxy(
             "call_method", self.attr, (self.root, *args), kwargs
         )

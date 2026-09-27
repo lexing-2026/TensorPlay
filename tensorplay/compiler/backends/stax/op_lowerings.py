@@ -4310,13 +4310,16 @@ def tensor(
     """
 
     if isinstance(data, int) and not isinstance(data, bool):
-        dtype = dtype or tp.int64
+        dtype = dtype or "int64"
     else:
-        dtype = dtype or tp.float32
+        dtype = dtype or "float32"
 
     ranges: list = []
 
-    _truncate_fp = dtype in (tp.bfloat16, tp.float16)
+    # Narrower than a float is a type a real number is rounded to on the way in,
+    # so the rounding is done here -- where it is a fact about the constant
+    # rather than about the code generated from it.
+    _truncate_fp = dtype in ("bfloat16", "float16")
 
     if isinstance(data, sympy.Basic):
 
@@ -4337,6 +4340,36 @@ def tensor(
 
         def inner_fn(index: Any) -> Any:
             return ops.constant(data, dtype)
+
+    elif not len(data) or (
+        isinstance(data[0], (float, int)) and len(data) <= 8
+    ):
+        # A short run of numbers is written into the body by asking which
+        # number the position being written is, and halving the run to find
+        # out -- so there is no buffer to allocate and no name to keep.  A
+        # longer run is a value worth storing, because then it is searched for
+        # once rather than laid out again at every use.
+        ranges.append(sympy.Integer(len(data)))
+
+        def inner_fn(index: Any) -> Any:
+            def binary_search(start: int, end: int) -> Any:
+                if start >= end:
+                    raise AssertionError("expected: start < end")
+                if end - start == 1:
+                    return ops.constant(data[start], dtype)
+                mid = (end - start) // 2 + start
+                return ops.where(
+                    ops.lt(
+                        ops.index_expr(index[0], "int64"),
+                        ops.constant(mid, "int64"),
+                    ),
+                    binary_search(start, mid),
+                    binary_search(mid, end),
+                )
+
+            if len(data) == 0:
+                return ops.constant(0, dtype)
+            return binary_search(0, len(data))
 
     else:
         # A run of numbers too long to search is a value that has to be stored,

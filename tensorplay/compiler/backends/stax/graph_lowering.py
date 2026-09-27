@@ -2011,9 +2011,14 @@ class GraphLowering(Interpreter):
         if self.can_inline_constant(value):
             from .op_lowerings import tensor
 
+            # The value is written into the body as numbers, and a number is
+            # written with the name of its type -- which is what the arithmetic
+            # that reads it back is written in terms of.  A value's own type
+            # object is not that name, and passing it would leave the numbers
+            # untyped where every other number in the body is typed.
             return tensor(
                 value.tolist(),
-                dtype=value.dtype,
+                dtype=str(value.dtype).rsplit(".", 1)[-1],
                 device=value.device,
             )
 
