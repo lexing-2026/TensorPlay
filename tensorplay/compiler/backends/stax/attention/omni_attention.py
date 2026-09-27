@@ -32,6 +32,11 @@ from tensorplay.graph.experimental.sympy_functions import (
     Mod,
 )
 
+from ..codegen.cutedsl.lane_analysis import (
+    classify_lane_expr as _classify_lane_expr,
+    decompose_affine_lane_expr,
+    lane_group_start,
+)
 from ..ir import (
     ComputedBuffer,
     ExternKernel,
@@ -400,39 +405,6 @@ def fx_aux_index_to_sympy(
     return None
 
 
-def classify_lane_expr(last_expr: Any, kv_idx: Any, max_width: int = 32) -> Any:
-    """The widest group of consecutive positions an expression walks.
-
-    A read several positions at a time is only a read several positions at a
-    time if those positions are consecutive, so what has to be recognised is an
-    expression that steps by one -- or by something that is a whole number of
-    steps, once the width is known.  Anything else is not a wide read, however
-    many positions it names.
-    """
-
-    if last_expr == kv_idx:
-        return max_width, 1
-    if not isinstance(last_expr, sympy.Expr):
-        return None
-    if not last_expr.is_Add or not last_expr.args:
-        return None
-    base, *terms = last_expr.args
-    step = None
-    for t in terms:
-        coeff = t.as_coeff_Mul()[0]
-        if kv_idx in t.free_symbols:
-            if step is not None or coeff == 0:
-                return None
-            step = int(coeff) if coeff.is_Integer else None
-    if step is None or step == 0:
-        return None
-    if max_width % abs(step) != 0:
-        return None
-    if base.free_symbols & {kv_idx}:
-        return None
-    return max_width, abs(step)
-
-
 def is_safe_partial_aux_index(
     indices: Any, q_idx_node: Any, kv_idx_node: Any, non_lane_index_nodes: Any
 ) -> bool:
@@ -511,7 +483,9 @@ def direct_aux_load_vec_size_and_kind(
     offset = buffer.get_layout().offset
     vec_size = max_vec_size
     while vec_size >= 2:
-        lane_info = classify_lane_expr(last_expr, kv_idx, max_width=vec_size)
+        lane_info = _classify_lane_expr(
+            last_expr, kv_idx, max_width=vec_size
+        )
         if lane_info is not None:
             width, step = lane_info
             if width == vec_size and (
@@ -609,6 +583,74 @@ def select_aux_mod_vec_size(
             found_vectorizable_load = True
 
     return selected_vec_size if found_vectorizable_load else 1
+
+
+# ---------------------------------------------------------------------------
+# Reading a body written as a graph
+# ---------------------------------------------------------------------------
+
+
+def is_bool_full_node(node: Any, value: bool) -> bool:
+    """Whether a node is the graph's way of writing a single fixed truth value.
+
+    Which is how a body says "the mask keeps everything" or "the mask keeps
+    nothing": there is no node for either, because a mask that keeps everything
+    is not a mask, and the body has to be able to say so.
+    """
+
+    return (
+        node.op == "call_function"
+        and node.target is tp.ops.tp.full.default
+        and len(node.args) >= 2
+        and node.args[0] == []
+        and node.args[1] is value
+    )
+
+
+def is_aten_index_node(node: Any) -> bool:
+    """Whether a node reads a value at an index of its own."""
+
+    return node.op == "call_function" and node.target is tp.ops.tp.index.Tensor
+
+
+def fx_node_dtype(expr: Any) -> Any:
+    """What type a node's value is, following an index back to what it read.
+
+    An index has the type of what it read, so a node that has not been given a
+    type of its own is asked what it read -- which is a question with an answer
+    only as long as the chain of reads reaches something that has a type.
+    """
+
+    tensor_meta = expr.meta.get("tensor_meta")
+    if tensor_meta is not None:
+        return tensor_meta.dtype
+    val = expr.meta.get("val")
+    if isinstance(val, tp.Tensor):
+        return val.dtype
+    if is_aten_index_node(expr):
+        base = expr.args[0]
+        if isinstance(base, FxNode):
+            return fx_node_dtype(base)
+    return None
+
+
+def fx_node_shape(expr: Any) -> Any:
+    """What shape a node's value is.
+
+    From the metadata a node was given, or from the value itself where there is
+    one.  Not followed back the way the type is: an index's shape is not the
+    shape of what it read -- the index chooses which elements, and the answer is
+    the shape of the choice -- so following the read would answer a different
+    question.
+    """
+
+    tensor_meta = expr.meta.get("tensor_meta")
+    if tensor_meta is not None:
+        return tuple(tensor_meta.shape)
+    val = expr.meta.get("val")
+    if isinstance(val, tp.Tensor):
+        return tuple(val.shape)
+    return None
 
 
 # ---------------------------------------------------------------------------
