@@ -1262,6 +1262,45 @@ class TritonTemplateKernel:
             return texpr(self.rename_indexing(val[index]))
         return ", ".join([texpr(self.rename_indexing(i)) for i in val])
 
+    def render(self, template, kwargs, record_input_dependent_tracked_event=False):
+        """Lay out the template's text, and hand back what is still open.
+
+        Every part of the text that is not known yet is written down as a
+        placeholder by the hook that stands for it, so what comes back is text
+        with placeholders in it plus the list of what fills them.  The caller
+        fills them and asks again.
+
+        Asking to record what the shapes decided wraps each hook, so a kernel
+        remembered across shapes learns which decisions to make again.
+        """
+
+        if record_input_dependent_tracked_event:
+            self.cached_replay_events = []
+
+        template_env = {
+            fn.__name__: (
+                self.record_input_dependent_tracked_event()(fn)
+                if record_input_dependent_tracked_event
+                else fn
+            )
+            for fn in [
+                self.def_kernel,
+                self.size,
+                self.stride,
+                self.store_output,
+                self.load_input,
+                self.make_load,
+                self.modification,
+                self.gen_argdefs,
+                self.gen_defines,
+                *self.extra_template_env_fns,
+            ]
+        }
+        return PartialRender(
+            template.render(**template_env, **kwargs),
+            self.render_hooks,
+        )
+
     def _get_subgraph(self, subgraph_number: int):
         """The subgraph a hook was asked about, checked that it is there.
 
