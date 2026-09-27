@@ -874,12 +874,16 @@ NHWDC_STRIDE_ORDER = [4, 0, 3, 2, 1]
 
 
 def contiguous_strides(size: Sequence[int]) -> tuple[int, ...]:
-    strides = []
-    running = 1
-    for extent in reversed(size):
-        strides.append(running)
-        running *= max(int(extent), 1)
-    return tuple(reversed(strides))
+    """The strides of a shape stored as one unbroken run.
+
+    Asked of the layout that says what a contiguous layout is, rather than
+    worked out a second time here: two answers to the same question is one
+    too many, and only one of them is the layout's.
+    """
+
+    from .ir import FlexibleLayout
+
+    return tuple(FlexibleLayout.contiguous_strides(tuple(size)))
 
 
 def get_fill_order(
