@@ -5,6 +5,8 @@ from __future__ import annotations
 import collections
 from dataclasses import dataclass
 
+import tensorplay
+
 from ._utils import (
     event_gpu_us,
     nested_cuda_us,
@@ -112,6 +114,154 @@ class FunctionEventAvg:
             f"self_cpu_time={self.self_us:.2f}us "
             f"cpu_time={self.total_us:.2f}us count={self.count}>"
         )
+
+
+def _demangle_all(names):
+    """The same names with the code names in them undone, where that is possible.
+
+    A kernel this project's own code emits is compiled code, so what it is
+    called is a code name: hundreds of characters, mostly template arguments
+    nobody reading a profile is looking for.  Undoing that is worth doing, and
+    worth not failing over when the tool for it is not here: a name that cannot
+    be read is still a name, and a profile that raised would be worth less than
+    one that is merely hard to read.
+
+    Done for the whole recording at once, because the work is one call for any
+    number of names and a call each would cost more than the reading saves.
+    """
+
+    wanted = [n for n in dict.fromkeys(names) if isinstance(n, str) and n.startswith("_Z")]
+    if not wanted:
+        return {}
+    demangle = getattr(getattr(tensorplay, "_C", None), "_demangle", None)
+    out = {}
+    if demangle is not None:
+        for name in wanted:
+            try:
+                out[name] = demangle(name) or name
+            except Exception:
+                pass
+        if out:
+            return out
+    try:
+        import subprocess
+
+        done = subprocess.run(
+            ["c++filt"], input="\n".join(wanted), capture_output=True, text=True
+        ).stdout.splitlines()
+    except Exception:
+        return {}
+    if len(done) != len(wanted):
+        return {}
+    for name, readable in zip(wanted, done):
+        out[name] = readable.strip() or name
+    return out
+
+
+#: What the device did rather than what the host asked it to do.  A kernel is
+#: "k"; a copy between host and device or between devices is "m".
+_DEVICE_WORK_KINDS = frozenset({"k", "m"})
+
+
+class _DeviceKernelTable:
+    """One row per piece of work the device actually ran, with the time it took.
+
+    A row per operation answers which operation was dispatched.  It does not
+    answer what ran for it, and the two are not the same question: one
+    operation may run several kernels, and work may be launched without going
+    through any operation that is named after it -- a kernel this project's own
+    code emits, for one.  Joining device time to the operation that launched it
+    cannot answer that, so what the device recorded about its own work is kept
+    and offered here under its own names.
+
+    Only the device's own work is here -- kernels and copies.  A call the host
+    made to ask for that work is not itself work the device did, and one of
+    them can be the largest entry in a recording while saying nothing about
+    where the time went: a synchronisation waits for everything and is not
+    itself the reason anything took as long as it did.
+    """
+
+    def __init__(self, gpu_activities=(), sort_by=None):
+        self.has_gpu = True
+        self.with_flops = False
+        self.has_flops = False
+        aggregate = collections.OrderedDict()
+        for activity in gpu_activities or ():
+            if activity is None or len(activity) < 4:
+                continue
+            name, kind, start_ns, end_ns = activity[0], activity[1], activity[2], activity[3]
+            if kind not in _DEVICE_WORK_KINDS:
+                continue
+            if start_ns is None or end_ns is None or end_ns <= start_ns:
+                continue
+            row = aggregate.get((name, kind))
+            if row is None:
+                row = [0, 0, None, None]
+                aggregate[(name, kind)] = row
+            duration = end_ns - start_ns
+            row[0] += 1
+            row[1] += duration
+            row[2] = duration if row[2] is None else min(row[2], duration)
+            row[3] = duration if row[3] is None else max(row[3], duration)
+
+        total_ns = sum(row[1] for row in aggregate.values())
+        self.total_ns = total_ns
+        readable = _demangle_all(key[0] for key in aggregate)
+        self.rows = []
+        for (name, kind), values in sorted(aggregate.items(), key=lambda item: -item[1][1]):
+            count, total, minimum, maximum = values
+            self.rows.append(
+                FunctionEventAvg(
+                    readable.get(name, name),
+                    kind,
+                    count,
+                    total // count if count else 0,
+                    minimum,
+                    maximum,
+                    None,
+                    0,
+                    0.0,
+                    total / 1000.0,
+                    count,
+                    total / 1000.0,
+                )
+            )
+        self.total_cuda_us = sum(row.cuda_us for row in self.rows)
+        if sort_by is not None:
+            self.sort(sort_by)
+
+    def __iter__(self):
+        return iter(self.rows)
+
+    def __len__(self):
+        return len(self.rows)
+
+    def sort(self, sort_by):
+        self.rows.sort(key=lambda row: getattr(row, sort_by, 0), reverse=True)
+
+    def key_averages(self, sort_by=None, row_limit=None):
+        if sort_by is not None:
+            self.sort(sort_by)
+        return self.rows if row_limit is None else self.rows[:row_limit]
+
+    def total_average(self):
+        return self.total_cuda_us / 1000.0
+
+    def table(self, sort_by=None, row_limit=-1, **_kwargs):
+        if sort_by is not None:
+            self.sort(sort_by)
+        rows = self.rows if row_limit is None or row_limit < 0 else self.rows[:row_limit]
+        header = f"{'Name':<40}{'Kind':>5}{'Calls':>7}{'Total us':>12}{'Avg us':>11}{'Min us':>11}{'Max us':>11}"
+        lines = [header, "-" * len(header)]
+        for row in rows:
+            lines.append(
+                f"{row.name:<40}{row.kind:>5}{row.count:>7}"
+                f"{row.total_us:>12.2f}{row.avg_us / 1000.0:>11.2f}"
+                f"{row.min_ns / 1000.0:>11.2f}{row.max_ns / 1000.0:>11.2f}"
+            )
+        lines.append("-" * len(header))
+        lines.append(f"{'Total':<40}{'':>5}{len(self.rows):>7}{self.total_cuda_us:>12.2f}")
+        return "\n".join(lines)
 
 
 class _FunctionsTable:
@@ -636,6 +786,17 @@ class EventList(list):
             group_by_stack_n=group_by_stack_n,
             with_flops=bool(with_flops) or bool(self.with_flops),
         )
+
+    def device_kernels(self, sort_by=None):
+        """What the device ran, by the name the device knows it by.
+
+        Separate from the per-operation view because a kernel is not an
+        operation: work this project's own code launches belongs to whatever
+        operation happened to be in flight, and naming it is the only way to
+        find out it ran at all.
+        """
+
+        return _DeviceKernelTable(self.gpu_activities, sort_by=sort_by)
 
     def table(self, sort_by=None, row_limit=100, **kwargs):
         return self.key_averages().table(sort_by=sort_by, row_limit=row_limit, **kwargs)

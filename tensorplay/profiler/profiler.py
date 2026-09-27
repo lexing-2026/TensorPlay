@@ -365,6 +365,11 @@ class profile:
             table.sort(sort_by)
         return table
 
+    def device_kernels(self, sort_by=None):
+        """What the device ran, by the name the device knows it by."""
+
+        return self._ensure_events().device_kernels(sort_by=sort_by)
+
     def table(self, sort_by=None, row_limit=100, **kwargs):
         return self.key_averages().table(
             sort_by=sort_by,
