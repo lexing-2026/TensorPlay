@@ -2412,9 +2412,10 @@ def is_mutation_op(node: Any) -> bool:
         node.target, OpOverload
     ) and not fixme_incorrect_inductor_schema_op(node.target):
         return node.target._schema.is_mutable
-    elif isinstance(
-        node.target, tensorplay._higher_order_ops.auto_functionalize.AutoFunctionalized
-    ):
+    elif node.target is tp._higher_order_ops.auto_functionalized:
+        # A functionalized mutation is written as one node that runs the
+        # mutation itself, so the node reads as a call that changes something
+        # while standing for a call that only computes.  It is the second.
         return False
     if node.op == "call_function":
         if not callable(node.target):
