@@ -3154,3 +3154,27 @@ def triton_type_to_torch(dtype: str) -> tp.dtype:
     if not isinstance(out_dtype, tp.dtype):
         raise AssertionError(f"Expected tp.dtype, got {type(out_dtype)}")
     return out_dtype
+
+
+class FakeIndentedBuffer(IndentedBuffer):
+    """A buffer that refuses to be written to, so a write is a mistake said out loud.
+
+    A kernel swaps its text in and out while it works on one subgraph.  Between
+    those swaps the kernel still exists but is not working on anything, and a
+    write then would land in a buffer that will be thrown away -- producing a
+    kernel missing a line rather than an error.  So the text buffer in between
+    is this one, and it names the mistake instead of hiding it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def __getattribute__(self, name: str):
+        if name == "__class__":  # Allow access to the class attribute
+            return object.__getattribute__(self, name)
+        raise RuntimeError(
+            f"Tried to call self.{name} on FakeIndentedBuffer. This buffer"
+            "is currently used on TritonTemplateKernel to prevent actual"
+            "writes to the body without explicitly specifying the body with"
+            "`TritonTemplateKernel.set_subgraph_body(name)`"
+        )
