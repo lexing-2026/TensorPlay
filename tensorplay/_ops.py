@@ -131,6 +131,19 @@ class OpOverload:
         self.__module__ = f"tensorplay.ops.{schema.namespace}"
 
     def __call__(self, /, *args: Any, **kwargs: Any) -> Any:
+        # While a graph is being captured, an overload reached with a
+        # symbolic argument is recorded rather than run: the arguments are
+        # descriptions of values that do not exist yet, so there is nothing to
+        # compute, and running it would ask the operator for the type of
+        # something that has not been made.  ``capture_call`` is what already
+        # decides whether an argument is symbolic, so it is what decides this
+        # too -- asking it here rather than deciding again would be the same
+        # question with two answers.
+        from .graph import capture_call as _capture_call
+
+        captured = _capture_call(self, args, kwargs)
+        if captured is not None:
+            return captured
         return _C._call_overload(self._key, args, kwargs)
 
     @property
