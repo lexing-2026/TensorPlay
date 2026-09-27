@@ -814,6 +814,22 @@ class ExclusiveKeywordArg(PatternExpr):
         return super().pattern_eq(other) and self.name == other.name
 
 
+#: The name a generated pattern file binds each operator namespace to.  An
+#: operation written into such a file is written as the namespace it belongs
+#: to followed by its name, and the file has to bind that namespace to
+#: something the operation can be looked up in -- which for this project's
+#: operators is not the module they are named after.
+_GENERATED_OP_NAMESPACES = {"tp": "operator_set", "prims": "prims"}
+
+
+def _op_repr(op: OpOverload) -> str:
+    """How an operation is written into a generated pattern file."""
+
+    written = str(op)
+    namespace, _, name = written.partition(".")
+    return f"{_GENERATED_OP_NAMESPACES.get(namespace, namespace)}.{name}"
+
+
 class _TargetExpr(PatternExpr):
     """
     Base class for filtering match by node.target
@@ -851,7 +867,7 @@ class _TargetExpr(PatternExpr):
         elif self.fns[0] is getattr(operator, first_repr, None):
             return f"operator.{first_repr}"
         elif isinstance(self.fns[0], OpOverload):
-            return str(self.fns[0])
+            return _op_repr(self.fns[0])
         else:
             return first_repr
 
@@ -1348,9 +1364,12 @@ class PatternPrettyPrinter:
 
     def memoize(self, obj: _TargetArgsExpr) -> str:
         obj_str = obj.pretty_print(self)
-        # A name here is either this project's own spelling of a function or a
-        # list of them, and neither carries a namespace to take off.
         obj_name = obj.fns_repr()
+        # A name for the object takes the operation's own name without the
+        # namespace it is looked up under: the namespace is written where the
+        # operation is, and repeating it in the name would say it twice.
+        for prefix in (*_GENERATED_OP_NAMESPACES.values(), "operator."):
+            obj_name = obj_name.replace(f"{prefix}.", "")
 
         tmp_name = self.namespace.create_name(obj_name, None)
         self.memoized_objs_names[obj] = tmp_name
@@ -2862,9 +2881,15 @@ def fx_to_pattern(
                 if len(rv) != len(args):
                     raise AssertionError("rv and args length mismatch")
                 for r, arg in zip(rv, args):
-                    r.users = len(arg.users)
+                    # A gradient slot for an input the output does not depend on
+                    # traces to nothing at all, and there is no pattern node to
+                    # count users for.  Slots that did trace carry the count,
+                    # the way a slot that did trace always has.
+                    if isinstance(r, Node) and isinstance(arg, Node):
+                        r.users = len(arg.users)
             else:
-                rv.users = len(n.users)
+                if isinstance(rv, Node):
+                    rv.users = len(n.users)
             return rv
 
     if not isinstance(gm, GraphModule):

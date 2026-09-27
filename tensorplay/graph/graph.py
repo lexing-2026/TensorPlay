@@ -225,6 +225,34 @@ _illegal_names: dict[str, object] = {
 }
 
 
+class _CustomBuiltin(NamedTuple):
+    """A name generated source may use that Python does not define itself.
+
+    The source for a graph is written as text and run as code, so every name
+    it mentions has to resolve.  A non-finite float has no literal of its own:
+    the text ``-inf`` is a minus sign in front of a name, not a number, and
+    the text ``nan`` is a bare name.  Both are given a meaning here, by the
+    object they stand for, so the text a float is written as names something
+    real.
+    """
+
+    import_str: str
+    obj: object
+
+
+_custom_builtins: dict[str, _CustomBuiltin] = {}
+
+
+def _register_custom_builtin(name: str, import_str: str, obj: object) -> None:
+    _custom_builtins[name] = _CustomBuiltin(import_str, obj)
+    _illegal_names[name] = obj
+
+
+_register_custom_builtin("inf", "from math import inf", math.inf)
+_register_custom_builtin("nan", "from math import nan", math.nan)
+_register_custom_builtin("NoneType", "NoneType = type(None)", type(None))
+
+
 @compatibility(is_backward_compatible=True)
 class _Namespace:
     """Assign valid, unique names to local and external graph objects."""
@@ -763,6 +791,12 @@ class CodeGen:
             name = namespace.create_name(_snake_case(name_hint), value)
             globals_[name] = value
             return name
+
+        # The names a graph's own source may use for things Python has no
+        # literal for are bound before anything else, so that the text a value
+        # is written as already names the object it stands for.
+        for builtin_name, (_, builtin_obj) in _custom_builtins.items():
+            globals_.setdefault(builtin_name, builtin_obj)
 
         def node_ref(node: Node) -> str:
             existing = node_names.get(node)

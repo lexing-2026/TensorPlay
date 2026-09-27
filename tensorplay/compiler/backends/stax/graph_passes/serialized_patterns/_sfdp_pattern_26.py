@@ -1,0 +1,362 @@
+# noqa: F401, E501
+# This is an auto-generated file. Please do not modify it by hand.
+# To re-generate, run the generator named in the file it writes.
+
+import operator
+import tensorplay as tp
+
+operator_set = tp.ops.tp
+prims = tp.ops.prims
+
+from tensorplay.compiler.backends.stax.pattern_matcher import (
+   Arg,
+   CallFunction,
+   CallFunctionVarArgs,
+   CallMethod,
+   CallMethodVarArgs,
+   CallModule,
+   CallModuleVarArgs,
+   ExclusiveKeywordArg,
+   GetAttr,
+   Ignored,
+   KeywordArg,
+   ListOf,
+   MultiOutputPattern,
+   PatternExpr,
+   RepeatedExpr,
+   _TargetArgsExpr,
+   _TargetExpr,
+   _TargetExprVarArgs,
+)
+permute_default = CallFunction(operator_set.permute.default, KeywordArg('query'), Ignored())
+broadcast_to_default = CallFunction(operator_set.broadcast_to.default, permute_default, Ignored())
+reshape_default = CallFunction(operator_set.reshape.default, broadcast_to_default, Ignored())
+permute_default_0 = CallFunction(operator_set.permute.default, KeywordArg('key'), Ignored())
+permute_default_1 = CallFunction(operator_set.permute.default, permute_default_0, Ignored())
+broadcast_to_default_0 = CallFunction(operator_set.broadcast_to.default, permute_default_1, Ignored())
+reshape_default_0 = CallFunction(operator_set.reshape.default, broadcast_to_default_0, Ignored())
+bmm_default = CallFunction(operator_set.bmm.default, reshape_default, reshape_default_0)
+reshape_default_1 = CallFunction(operator_set.reshape.default, bmm_default, Ignored())
+add_Tensor = CallFunction(operator_set.add.Tensor, reshape_default_1, KeywordArg('attn_mask'), alpha=Ignored())
+to_dtype = CallFunction(operator_set.to.dtype, add_Tensor, Ignored(), False, False, None)
+softmax_default = CallFunction(operator_set.softmax.default, to_dtype, Ignored(), Ignored())
+rand_like_default = CallFunction(operator_set.rand_like.default, softmax_default, dtype=Ignored(), device=None)
+gt_Scalar = CallFunction(operator_set.gt.Scalar, rand_like_default, KeywordArg('dropout_p'))
+mul_Tensor = CallFunction(operator_set.mul.Tensor, gt_Scalar, softmax_default)
+mul_Scalar = CallFunction(operator_set.mul.Scalar, mul_Tensor, Ignored())
+broadcast_to_default_1 = CallFunction(operator_set.broadcast_to.default, mul_Scalar, Ignored())
+reshape_default_2 = CallFunction(operator_set.reshape.default, broadcast_to_default_1, Ignored())
+permute_default_2 = CallFunction(operator_set.permute.default, KeywordArg('value'), Ignored())
+broadcast_to_default_2 = CallFunction(operator_set.broadcast_to.default, permute_default_2, Ignored())
+reshape_default_3 = CallFunction(operator_set.reshape.default, broadcast_to_default_2, Ignored())
+bmm_default_0 = CallFunction(operator_set.bmm.default, reshape_default_2, reshape_default_3)
+reshape_default_4 = CallFunction(operator_set.reshape.default, bmm_default_0, Ignored())
+broadcast_to_default_3 = CallFunction(operator_set.broadcast_to.default, KeywordArg('tangents_1'), Ignored())
+reshape_default_5 = CallFunction(operator_set.reshape.default, broadcast_to_default_3, Ignored())
+permute_default_3 = CallFunction(operator_set.permute.default, permute_default_2, Ignored())
+broadcast_to_default_4 = CallFunction(operator_set.broadcast_to.default, permute_default_3, Ignored())
+reshape_default_6 = CallFunction(operator_set.reshape.default, broadcast_to_default_4, Ignored())
+bmm_default_1 = CallFunction(operator_set.bmm.default, reshape_default_5, reshape_default_6)
+reshape_default_7 = CallFunction(operator_set.reshape.default, bmm_default_1, Ignored())
+to_dtype_0 = CallFunction(operator_set.to.dtype, gt_Scalar, Ignored(), False, False, None)
+mul_Scalar_0 = CallFunction(operator_set.mul.Scalar, to_dtype_0, Ignored())
+mul_Tensor_0 = CallFunction(operator_set.mul.Tensor, reshape_default_7, mul_Scalar_0)
+mul_Tensor_1 = CallFunction(operator_set.mul.Tensor, mul_Tensor_0, softmax_default)
+sum_dim_IntList = CallFunction(operator_set.sum.dim_IntList, mul_Tensor_1, Ignored(), True, dtype=Ignored())
+mul_Tensor_2 = CallFunction(operator_set.mul.Tensor, softmax_default, sum_dim_IntList)
+sub_Tensor = CallFunction(operator_set.sub.Tensor, mul_Tensor_1, mul_Tensor_2, alpha=Ignored())
+broadcast_to_default_5 = CallFunction(operator_set.broadcast_to.default, sub_Tensor, Ignored())
+reshape_default_8 = CallFunction(operator_set.reshape.default, broadcast_to_default_5, Ignored())
+permute_default_4 = CallFunction(operator_set.permute.default, permute_default_1, Ignored())
+broadcast_to_default_6 = CallFunction(operator_set.broadcast_to.default, permute_default_4, Ignored())
+reshape_default_9 = CallFunction(operator_set.reshape.default, broadcast_to_default_6, Ignored())
+bmm_default_2 = CallFunction(operator_set.bmm.default, reshape_default_8, reshape_default_9)
+reshape_default_10 = CallFunction(operator_set.reshape.default, bmm_default_2, Ignored())
+permute_backward_default = CallFunction(operator_set.permute_backward.default, reshape_default_10, KeywordArg('query'), Ignored())
+permute_default_5 = CallFunction(operator_set.permute.default, permute_default, Ignored())
+broadcast_to_default_7 = CallFunction(operator_set.broadcast_to.default, permute_default_5, Ignored())
+reshape_default_11 = CallFunction(operator_set.reshape.default, broadcast_to_default_7, Ignored())
+broadcast_to_default_8 = CallFunction(operator_set.broadcast_to.default, sub_Tensor, Ignored())
+reshape_default_12 = CallFunction(operator_set.reshape.default, broadcast_to_default_8, Ignored())
+bmm_default_3 = CallFunction(operator_set.bmm.default, reshape_default_11, reshape_default_12)
+reshape_default_13 = CallFunction(operator_set.reshape.default, bmm_default_3, Ignored())
+permute_backward_default_0 = CallFunction(operator_set.permute_backward.default, reshape_default_13, permute_default_0, Ignored())
+add_Tensor_0 = CallFunction(operator_set.add.Tensor, KeywordArg('tangents_2'), permute_backward_default_0, alpha=Ignored())
+permute_backward_default_1 = CallFunction(operator_set.permute_backward.default, add_Tensor_0, KeywordArg('key'), Ignored())
+permute_default_6 = CallFunction(operator_set.permute.default, mul_Scalar, Ignored())
+broadcast_to_default_9 = CallFunction(operator_set.broadcast_to.default, permute_default_6, Ignored())
+reshape_default_14 = CallFunction(operator_set.reshape.default, broadcast_to_default_9, Ignored())
+broadcast_to_default_10 = CallFunction(operator_set.broadcast_to.default, KeywordArg('tangents_1'), Ignored())
+reshape_default_15 = CallFunction(operator_set.reshape.default, broadcast_to_default_10, Ignored())
+bmm_default_4 = CallFunction(operator_set.bmm.default, reshape_default_14, reshape_default_15)
+reshape_default_16 = CallFunction(operator_set.reshape.default, bmm_default_4, Ignored())
+add_Tensor_1 = CallFunction(operator_set.add.Tensor, KeywordArg('tangents_3'), reshape_default_16, alpha=Ignored())
+permute_backward_default_2 = CallFunction(operator_set.permute_backward.default, add_Tensor_1, KeywordArg('value'), Ignored())
+_sfdp_pattern_26_training = MultiOutputPattern([reshape_default_4,
+  permute_default_0,
+  permute_default_2,
+  permute_backward_default,
+  permute_backward_default_1,
+  permute_backward_default_2
+])
+
+
+permute_default = CallFunction(operator_set.permute.default, KeywordArg('query'), Ignored())
+broadcast_to_default = CallFunction(operator_set.broadcast_to.default, permute_default, Ignored())
+reshape_default = CallFunction(operator_set.reshape.default, broadcast_to_default, Ignored())
+permute_default_0 = CallFunction(operator_set.permute.default, KeywordArg('key'), Ignored())
+permute_default_1 = CallFunction(operator_set.permute.default, permute_default_0, Ignored())
+broadcast_to_default_0 = CallFunction(operator_set.broadcast_to.default, permute_default_1, Ignored())
+reshape_default_0 = CallFunction(operator_set.reshape.default, broadcast_to_default_0, Ignored())
+bmm_default = CallFunction(operator_set.bmm.default, reshape_default, reshape_default_0)
+reshape_default_1 = CallFunction(operator_set.reshape.default, bmm_default, Ignored())
+add_Tensor = CallFunction(operator_set.add.Tensor, reshape_default_1, KeywordArg('attn_mask'), alpha=Ignored())
+to_dtype = CallFunction(operator_set.to.dtype, add_Tensor, Ignored(), False, False, None)
+softmax_default = CallFunction(operator_set.softmax.default, to_dtype, Ignored(), Ignored())
+broadcast_to_default_1 = CallFunction(operator_set.broadcast_to.default, softmax_default, Ignored())
+reshape_default_2 = CallFunction(operator_set.reshape.default, broadcast_to_default_1, Ignored())
+permute_default_2 = CallFunction(operator_set.permute.default, KeywordArg('value'), Ignored())
+broadcast_to_default_2 = CallFunction(operator_set.broadcast_to.default, permute_default_2, Ignored())
+reshape_default_3 = CallFunction(operator_set.reshape.default, broadcast_to_default_2, Ignored())
+bmm_default_0 = CallFunction(operator_set.bmm.default, reshape_default_2, reshape_default_3)
+reshape_default_4 = CallFunction(operator_set.reshape.default, bmm_default_0, Ignored())
+_sfdp_pattern_26_inference = MultiOutputPattern([reshape_default_4,
+  permute_default_0,
+  permute_default_2
+])
+
+
+permute_default = CallFunction(operator_set.permute.default, KeywordArg('query'), Ignored())
+broadcast_to_default = CallFunction(operator_set.broadcast_to.default, permute_default, Ignored())
+reshape_default = CallFunction(operator_set.reshape.default, broadcast_to_default, Ignored())
+permute_default_0 = CallFunction(operator_set.permute.default, KeywordArg('key'), Ignored())
+permute_default_1 = CallFunction(operator_set.permute.default, permute_default_0, Ignored())
+broadcast_to_default_0 = CallFunction(operator_set.broadcast_to.default, permute_default_1, Ignored())
+reshape_default_0 = CallFunction(operator_set.reshape.default, broadcast_to_default_0, Ignored())
+bmm_default = CallFunction(operator_set.bmm.default, reshape_default, reshape_default_0)
+reshape_default_1 = CallFunction(operator_set.reshape.default, bmm_default, Ignored())
+add_Tensor = CallFunction(operator_set.add.Tensor, reshape_default_1, KeywordArg('attn_mask'), alpha=Ignored())
+to_dtype = CallFunction(operator_set.to.dtype, add_Tensor, Ignored(), False, False, None)
+softmax_default = CallFunction(operator_set.softmax.default, to_dtype, Ignored(), Ignored())
+rand_like_default = CallFunction(operator_set.rand_like.default, softmax_default, dtype=Ignored(), device=None)
+gt_Scalar = CallFunction(operator_set.gt.Scalar, rand_like_default, KeywordArg('dropout_p'))
+mul_Tensor = CallFunction(operator_set.mul.Tensor, gt_Scalar, softmax_default)
+mul_Scalar = CallFunction(operator_set.mul.Scalar, mul_Tensor, Ignored())
+broadcast_to_default_1 = CallFunction(operator_set.broadcast_to.default, mul_Scalar, Ignored())
+reshape_default_2 = CallFunction(operator_set.reshape.default, broadcast_to_default_1, Ignored())
+permute_default_2 = CallFunction(operator_set.permute.default, KeywordArg('value'), Ignored())
+broadcast_to_default_2 = CallFunction(operator_set.broadcast_to.default, permute_default_2, Ignored())
+reshape_default_3 = CallFunction(operator_set.reshape.default, broadcast_to_default_2, Ignored())
+bmm_default_0 = CallFunction(operator_set.bmm.default, reshape_default_2, reshape_default_3)
+reshape_default_4 = CallFunction(operator_set.reshape.default, bmm_default_0, Ignored())
+broadcast_to_default_3 = CallFunction(operator_set.broadcast_to.default, KeywordArg('tangents_1'), Ignored())
+reshape_default_5 = CallFunction(operator_set.reshape.default, broadcast_to_default_3, Ignored())
+permute_default_3 = CallFunction(operator_set.permute.default, permute_default_2, Ignored())
+broadcast_to_default_4 = CallFunction(operator_set.broadcast_to.default, permute_default_3, Ignored())
+reshape_default_6 = CallFunction(operator_set.reshape.default, broadcast_to_default_4, Ignored())
+bmm_default_1 = CallFunction(operator_set.bmm.default, reshape_default_5, reshape_default_6)
+reshape_default_7 = CallFunction(operator_set.reshape.default, bmm_default_1, Ignored())
+to_dtype_0 = CallFunction(operator_set.to.dtype, gt_Scalar, Ignored(), False, False, None)
+mul_Scalar_0 = CallFunction(operator_set.mul.Scalar, to_dtype_0, Ignored())
+mul_Tensor_0 = CallFunction(operator_set.mul.Tensor, reshape_default_7, mul_Scalar_0)
+mul_Tensor_1 = CallFunction(operator_set.mul.Tensor, mul_Tensor_0, softmax_default)
+sum_dim_IntList = CallFunction(operator_set.sum.dim_IntList, mul_Tensor_1, Ignored(), True, dtype=Ignored())
+mul_Tensor_2 = CallFunction(operator_set.mul.Tensor, softmax_default, sum_dim_IntList)
+sub_Tensor = CallFunction(operator_set.sub.Tensor, mul_Tensor_1, mul_Tensor_2, alpha=Ignored())
+broadcast_to_default_5 = CallFunction(operator_set.broadcast_to.default, sub_Tensor, Ignored())
+reshape_default_8 = CallFunction(operator_set.reshape.default, broadcast_to_default_5, Ignored())
+permute_default_4 = CallFunction(operator_set.permute.default, permute_default_1, Ignored())
+broadcast_to_default_6 = CallFunction(operator_set.broadcast_to.default, permute_default_4, Ignored())
+reshape_default_9 = CallFunction(operator_set.reshape.default, broadcast_to_default_6, Ignored())
+bmm_default_2 = CallFunction(operator_set.bmm.default, reshape_default_8, reshape_default_9)
+reshape_default_10 = CallFunction(operator_set.reshape.default, bmm_default_2, Ignored())
+permute_backward_default = CallFunction(operator_set.permute_backward.default, reshape_default_10, KeywordArg('query'), Ignored())
+permute_default_5 = CallFunction(operator_set.permute.default, permute_default, Ignored())
+broadcast_to_default_7 = CallFunction(operator_set.broadcast_to.default, permute_default_5, Ignored())
+reshape_default_11 = CallFunction(operator_set.reshape.default, broadcast_to_default_7, Ignored())
+broadcast_to_default_8 = CallFunction(operator_set.broadcast_to.default, sub_Tensor, Ignored())
+reshape_default_12 = CallFunction(operator_set.reshape.default, broadcast_to_default_8, Ignored())
+bmm_default_3 = CallFunction(operator_set.bmm.default, reshape_default_11, reshape_default_12)
+reshape_default_13 = CallFunction(operator_set.reshape.default, bmm_default_3, Ignored())
+permute_backward_default_0 = CallFunction(operator_set.permute_backward.default, reshape_default_13, permute_default_0, Ignored())
+add_Tensor_0 = CallFunction(operator_set.add.Tensor, KeywordArg('tangents_2'), permute_backward_default_0, alpha=Ignored())
+permute_backward_default_1 = CallFunction(operator_set.permute_backward.default, add_Tensor_0, KeywordArg('key'), Ignored())
+permute_default_6 = CallFunction(operator_set.permute.default, mul_Scalar, Ignored())
+broadcast_to_default_9 = CallFunction(operator_set.broadcast_to.default, permute_default_6, Ignored())
+reshape_default_14 = CallFunction(operator_set.reshape.default, broadcast_to_default_9, Ignored())
+broadcast_to_default_10 = CallFunction(operator_set.broadcast_to.default, KeywordArg('tangents_1'), Ignored())
+reshape_default_15 = CallFunction(operator_set.reshape.default, broadcast_to_default_10, Ignored())
+bmm_default_4 = CallFunction(operator_set.bmm.default, reshape_default_14, reshape_default_15)
+reshape_default_16 = CallFunction(operator_set.reshape.default, bmm_default_4, Ignored())
+add_Tensor_1 = CallFunction(operator_set.add.Tensor, KeywordArg('tangents_3'), reshape_default_16, alpha=Ignored())
+permute_backward_default_2 = CallFunction(operator_set.permute_backward.default, add_Tensor_1, KeywordArg('value'), Ignored())
+_sfdp_pattern_26_bs1_training = MultiOutputPattern([reshape_default_4,
+  permute_default_0,
+  permute_default_2,
+  permute_backward_default,
+  permute_backward_default_1,
+  permute_backward_default_2
+])
+
+
+permute_default = CallFunction(operator_set.permute.default, KeywordArg('query'), Ignored())
+broadcast_to_default = CallFunction(operator_set.broadcast_to.default, permute_default, Ignored())
+reshape_default = CallFunction(operator_set.reshape.default, broadcast_to_default, Ignored())
+permute_default_0 = CallFunction(operator_set.permute.default, KeywordArg('key'), Ignored())
+permute_default_1 = CallFunction(operator_set.permute.default, permute_default_0, Ignored())
+broadcast_to_default_0 = CallFunction(operator_set.broadcast_to.default, permute_default_1, Ignored())
+reshape_default_0 = CallFunction(operator_set.reshape.default, broadcast_to_default_0, Ignored())
+bmm_default = CallFunction(operator_set.bmm.default, reshape_default, reshape_default_0)
+reshape_default_1 = CallFunction(operator_set.reshape.default, bmm_default, Ignored())
+add_Tensor = CallFunction(operator_set.add.Tensor, reshape_default_1, KeywordArg('attn_mask'), alpha=Ignored())
+to_dtype = CallFunction(operator_set.to.dtype, add_Tensor, Ignored(), False, False, None)
+softmax_default = CallFunction(operator_set.softmax.default, to_dtype, Ignored(), Ignored())
+broadcast_to_default_1 = CallFunction(operator_set.broadcast_to.default, softmax_default, Ignored())
+reshape_default_2 = CallFunction(operator_set.reshape.default, broadcast_to_default_1, Ignored())
+permute_default_2 = CallFunction(operator_set.permute.default, KeywordArg('value'), Ignored())
+broadcast_to_default_2 = CallFunction(operator_set.broadcast_to.default, permute_default_2, Ignored())
+reshape_default_3 = CallFunction(operator_set.reshape.default, broadcast_to_default_2, Ignored())
+bmm_default_0 = CallFunction(operator_set.bmm.default, reshape_default_2, reshape_default_3)
+reshape_default_4 = CallFunction(operator_set.reshape.default, bmm_default_0, Ignored())
+_sfdp_pattern_26_bs1_inference = MultiOutputPattern([reshape_default_4,
+  permute_default_0,
+  permute_default_2
+])
+
+
+permute_default = CallFunction(operator_set.permute.default, KeywordArg('query'), Ignored())
+broadcast_to_default = CallFunction(operator_set.broadcast_to.default, permute_default, Ignored())
+reshape_default = CallFunction(operator_set.reshape.default, broadcast_to_default, Ignored())
+permute_default_0 = CallFunction(operator_set.permute.default, KeywordArg('key'), Ignored())
+permute_default_1 = CallFunction(operator_set.permute.default, permute_default_0, Ignored())
+broadcast_to_default_0 = CallFunction(operator_set.broadcast_to.default, permute_default_1, Ignored())
+reshape_default_0 = CallFunction(operator_set.reshape.default, broadcast_to_default_0, Ignored())
+bmm_default = CallFunction(operator_set.bmm.default, reshape_default, reshape_default_0)
+reshape_default_1 = CallFunction(operator_set.reshape.default, bmm_default, Ignored())
+add_Tensor = CallFunction(operator_set.add.Tensor, reshape_default_1, KeywordArg('attn_mask'), alpha=Ignored())
+to_dtype = CallFunction(operator_set.to.dtype, add_Tensor, Ignored(), False, False, None)
+softmax_default = CallFunction(operator_set.softmax.default, to_dtype, Ignored(), Ignored())
+to_dtype_0 = CallFunction(operator_set.to.dtype, softmax_default, Ignored(), False, False, None)
+rand_like_default = CallFunction(operator_set.rand_like.default, to_dtype_0, dtype=Ignored(), device=None)
+gt_Scalar = CallFunction(operator_set.gt.Scalar, rand_like_default, KeywordArg('dropout_p'))
+mul_Tensor = CallFunction(operator_set.mul.Tensor, gt_Scalar, to_dtype_0)
+mul_Scalar = CallFunction(operator_set.mul.Scalar, mul_Tensor, Ignored())
+broadcast_to_default_1 = CallFunction(operator_set.broadcast_to.default, mul_Scalar, Ignored())
+reshape_default_2 = CallFunction(operator_set.reshape.default, broadcast_to_default_1, Ignored())
+permute_default_2 = CallFunction(operator_set.permute.default, KeywordArg('value'), Ignored())
+broadcast_to_default_2 = CallFunction(operator_set.broadcast_to.default, permute_default_2, Ignored())
+reshape_default_3 = CallFunction(operator_set.reshape.default, broadcast_to_default_2, Ignored())
+bmm_default_0 = CallFunction(operator_set.bmm.default, reshape_default_2, reshape_default_3)
+reshape_default_4 = CallFunction(operator_set.reshape.default, bmm_default_0, Ignored())
+permute_backward_default = CallFunction(operator_set.permute_backward.default, KeywordArg('tangents_2'), KeywordArg('key'), Ignored())
+permute_default_3 = CallFunction(operator_set.permute.default, mul_Scalar, Ignored())
+broadcast_to_default_3 = CallFunction(operator_set.broadcast_to.default, permute_default_3, Ignored())
+reshape_default_5 = CallFunction(operator_set.reshape.default, broadcast_to_default_3, Ignored())
+broadcast_to_default_4 = CallFunction(operator_set.broadcast_to.default, KeywordArg('tangents_1'), Ignored())
+reshape_default_6 = CallFunction(operator_set.reshape.default, broadcast_to_default_4, Ignored())
+bmm_default_1 = CallFunction(operator_set.bmm.default, reshape_default_5, reshape_default_6)
+reshape_default_7 = CallFunction(operator_set.reshape.default, bmm_default_1, Ignored())
+add_Tensor_0 = CallFunction(operator_set.add.Tensor, KeywordArg('tangents_3'), reshape_default_7, alpha=Ignored())
+permute_backward_default_0 = CallFunction(operator_set.permute_backward.default, add_Tensor_0, KeywordArg('value'), Ignored())
+_sfdp_pattern_26_half_training = MultiOutputPattern([reshape_default_4,
+  permute_default_0,
+  permute_default_2,
+  None,
+  permute_backward_default,
+  permute_backward_default_0
+])
+
+
+permute_default = CallFunction(operator_set.permute.default, KeywordArg('query'), Ignored())
+broadcast_to_default = CallFunction(operator_set.broadcast_to.default, permute_default, Ignored())
+reshape_default = CallFunction(operator_set.reshape.default, broadcast_to_default, Ignored())
+permute_default_0 = CallFunction(operator_set.permute.default, KeywordArg('key'), Ignored())
+permute_default_1 = CallFunction(operator_set.permute.default, permute_default_0, Ignored())
+broadcast_to_default_0 = CallFunction(operator_set.broadcast_to.default, permute_default_1, Ignored())
+reshape_default_0 = CallFunction(operator_set.reshape.default, broadcast_to_default_0, Ignored())
+bmm_default = CallFunction(operator_set.bmm.default, reshape_default, reshape_default_0)
+reshape_default_1 = CallFunction(operator_set.reshape.default, bmm_default, Ignored())
+add_Tensor = CallFunction(operator_set.add.Tensor, reshape_default_1, KeywordArg('attn_mask'), alpha=Ignored())
+to_dtype = CallFunction(operator_set.to.dtype, add_Tensor, Ignored(), False, False, None)
+softmax_default = CallFunction(operator_set.softmax.default, to_dtype, Ignored(), Ignored())
+to_dtype_0 = CallFunction(operator_set.to.dtype, softmax_default, Ignored(), False, False, None)
+broadcast_to_default_1 = CallFunction(operator_set.broadcast_to.default, to_dtype_0, Ignored())
+reshape_default_2 = CallFunction(operator_set.reshape.default, broadcast_to_default_1, Ignored())
+permute_default_2 = CallFunction(operator_set.permute.default, KeywordArg('value'), Ignored())
+broadcast_to_default_2 = CallFunction(operator_set.broadcast_to.default, permute_default_2, Ignored())
+reshape_default_3 = CallFunction(operator_set.reshape.default, broadcast_to_default_2, Ignored())
+bmm_default_0 = CallFunction(operator_set.bmm.default, reshape_default_2, reshape_default_3)
+reshape_default_4 = CallFunction(operator_set.reshape.default, bmm_default_0, Ignored())
+_sfdp_pattern_26_half_inference = MultiOutputPattern([reshape_default_4,
+  permute_default_0,
+  permute_default_2
+])
+
+
+permute_default = CallFunction(operator_set.permute.default, KeywordArg('query'), Ignored())
+broadcast_to_default = CallFunction(operator_set.broadcast_to.default, permute_default, Ignored())
+reshape_default = CallFunction(operator_set.reshape.default, broadcast_to_default, Ignored())
+permute_default_0 = CallFunction(operator_set.permute.default, KeywordArg('key'), Ignored())
+permute_default_1 = CallFunction(operator_set.permute.default, permute_default_0, Ignored())
+broadcast_to_default_0 = CallFunction(operator_set.broadcast_to.default, permute_default_1, Ignored())
+reshape_default_0 = CallFunction(operator_set.reshape.default, broadcast_to_default_0, Ignored())
+bmm_default = CallFunction(operator_set.bmm.default, reshape_default, reshape_default_0)
+reshape_default_1 = CallFunction(operator_set.reshape.default, bmm_default, Ignored())
+add_Tensor = CallFunction(operator_set.add.Tensor, reshape_default_1, KeywordArg('attn_mask'), alpha=Ignored())
+to_dtype = CallFunction(operator_set.to.dtype, add_Tensor, Ignored(), False, False, None)
+softmax_default = CallFunction(operator_set.softmax.default, to_dtype, Ignored(), Ignored())
+to_dtype_0 = CallFunction(operator_set.to.dtype, softmax_default, Ignored(), False, False, None)
+rand_like_default = CallFunction(operator_set.rand_like.default, to_dtype_0, dtype=Ignored(), device=None)
+gt_Scalar = CallFunction(operator_set.gt.Scalar, rand_like_default, KeywordArg('dropout_p'))
+mul_Tensor = CallFunction(operator_set.mul.Tensor, gt_Scalar, to_dtype_0)
+mul_Scalar = CallFunction(operator_set.mul.Scalar, mul_Tensor, Ignored())
+broadcast_to_default_1 = CallFunction(operator_set.broadcast_to.default, mul_Scalar, Ignored())
+reshape_default_2 = CallFunction(operator_set.reshape.default, broadcast_to_default_1, Ignored())
+permute_default_2 = CallFunction(operator_set.permute.default, KeywordArg('value'), Ignored())
+broadcast_to_default_2 = CallFunction(operator_set.broadcast_to.default, permute_default_2, Ignored())
+reshape_default_3 = CallFunction(operator_set.reshape.default, broadcast_to_default_2, Ignored())
+bmm_default_0 = CallFunction(operator_set.bmm.default, reshape_default_2, reshape_default_3)
+reshape_default_4 = CallFunction(operator_set.reshape.default, bmm_default_0, Ignored())
+permute_backward_default = CallFunction(operator_set.permute_backward.default, KeywordArg('tangents_2'), KeywordArg('key'), Ignored())
+permute_default_3 = CallFunction(operator_set.permute.default, mul_Scalar, Ignored())
+broadcast_to_default_3 = CallFunction(operator_set.broadcast_to.default, permute_default_3, Ignored())
+reshape_default_5 = CallFunction(operator_set.reshape.default, broadcast_to_default_3, Ignored())
+broadcast_to_default_4 = CallFunction(operator_set.broadcast_to.default, KeywordArg('tangents_1'), Ignored())
+reshape_default_6 = CallFunction(operator_set.reshape.default, broadcast_to_default_4, Ignored())
+bmm_default_1 = CallFunction(operator_set.bmm.default, reshape_default_5, reshape_default_6)
+reshape_default_7 = CallFunction(operator_set.reshape.default, bmm_default_1, Ignored())
+add_Tensor_0 = CallFunction(operator_set.add.Tensor, KeywordArg('tangents_3'), reshape_default_7, alpha=Ignored())
+permute_backward_default_0 = CallFunction(operator_set.permute_backward.default, add_Tensor_0, KeywordArg('value'), Ignored())
+_sfdp_pattern_26_half_bs1_training = MultiOutputPattern([reshape_default_4,
+  permute_default_0,
+  permute_default_2,
+  None,
+  permute_backward_default,
+  permute_backward_default_0
+])
+
+
+permute_default = CallFunction(operator_set.permute.default, KeywordArg('query'), Ignored())
+broadcast_to_default = CallFunction(operator_set.broadcast_to.default, permute_default, Ignored())
+reshape_default = CallFunction(operator_set.reshape.default, broadcast_to_default, Ignored())
+permute_default_0 = CallFunction(operator_set.permute.default, KeywordArg('key'), Ignored())
+permute_default_1 = CallFunction(operator_set.permute.default, permute_default_0, Ignored())
+broadcast_to_default_0 = CallFunction(operator_set.broadcast_to.default, permute_default_1, Ignored())
+reshape_default_0 = CallFunction(operator_set.reshape.default, broadcast_to_default_0, Ignored())
+bmm_default = CallFunction(operator_set.bmm.default, reshape_default, reshape_default_0)
+reshape_default_1 = CallFunction(operator_set.reshape.default, bmm_default, Ignored())
+add_Tensor = CallFunction(operator_set.add.Tensor, reshape_default_1, KeywordArg('attn_mask'), alpha=Ignored())
+to_dtype = CallFunction(operator_set.to.dtype, add_Tensor, Ignored(), False, False, None)
+softmax_default = CallFunction(operator_set.softmax.default, to_dtype, Ignored(), Ignored())
+to_dtype_0 = CallFunction(operator_set.to.dtype, softmax_default, Ignored(), False, False, None)
+broadcast_to_default_1 = CallFunction(operator_set.broadcast_to.default, to_dtype_0, Ignored())
+reshape_default_2 = CallFunction(operator_set.reshape.default, broadcast_to_default_1, Ignored())
+permute_default_2 = CallFunction(operator_set.permute.default, KeywordArg('value'), Ignored())
+broadcast_to_default_2 = CallFunction(operator_set.broadcast_to.default, permute_default_2, Ignored())
+reshape_default_3 = CallFunction(operator_set.reshape.default, broadcast_to_default_2, Ignored())
+bmm_default_0 = CallFunction(operator_set.bmm.default, reshape_default_2, reshape_default_3)
+reshape_default_4 = CallFunction(operator_set.reshape.default, bmm_default_0, Ignored())
+_sfdp_pattern_26_half_bs1_inference = MultiOutputPattern([reshape_default_4,
+  permute_default_0,
+  permute_default_2
+])
