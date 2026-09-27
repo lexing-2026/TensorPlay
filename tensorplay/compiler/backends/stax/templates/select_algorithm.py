@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import hashlib
 import itertools
 import logging
+import operator
 import os
 import sympy
+import textwrap
 from typing import NamedTuple
 
 from typing import Any, Callable, Iterator
@@ -24,7 +27,13 @@ import tensorplay as tp
 from .. import config
 from ..codegen.common import KernelTemplate
 from ..kernel_inputs import KernelInputs
-from ..ir import BaseView, Buffer as _Buffer, Layout, compute_required_storage_length
+from ..ir import (
+    BaseView,
+    Buffer as _Buffer,
+    FlexibleLayout,
+    Layout,
+    compute_required_storage_length,
+)
 from ..loops import V
 from .ir import ChoiceCaller, CutedslChoiceCaller
 from ..loops import contiguous_strides, dtype_name
@@ -37,6 +46,10 @@ from .triton import CHOICES
 from ..codegen.subgraph import SubgraphChoiceCaller
 from ..codegen.simd import IterationRangesEntry, IterationRangesRoot
 from ..codegen.common import CSE, IndentedBuffer
+from ..codegen.triton import texpr
+from ..utils import get_dtype_size, sympy_dot, sympy_product, unique
+from ..kernel_scheduler import count_flops_fx
+from tensorplay.graph.experimental.sympy_functions import OrderedSet
 
 #: Whether a candidate's result is checked against what the operation's own
 #: kernel produced.  On by default because a template that computes the wrong
@@ -808,6 +821,238 @@ class TritonTemplateKernel:
 
     def __repr__(self) -> str:
         return f"TritonTemplateKernel({self.kernel_name})"
+
+    def _gen_tmp_var(self) -> str:
+        """A name nothing else in this kernel is using."""
+
+        return f"_tmp_var{next(self.tmp_var_ctr)}"
+
+    def input_dependent_preserved_state(self) -> str:
+        """The part of the kernel's state that a shape decides.
+
+        Everything here is a function of the shapes, so it does not have to be
+        written down again when a cached kernel is replayed against the same
+        shapes.  The output buffers are left out on purpose: nothing reads them
+        back, so carrying them would only make two runs of the same shapes look
+        different.
+        """
+
+        return repr(
+            [
+                self.args.input_buffers,
+                self.args.sizevars,
+                self.args.workspace_args,
+                self.prologue_supported_inputs,
+                self.frozen_layouts_cnt,
+            ]
+        )
+
+    def record_input_dependent_tracked_event(self) -> Callable[..., Any]:
+        """Note calls that changed a shape-dependent part of the state.
+
+        A kernel built once and run against several shapes is remembered by
+        what its shapes decided.  Wrapping the calls that make those decisions
+        is how a replay learns which of them to make again.
+        """
+
+        def decorator(fn) -> Callable[..., Any]:
+            def wrapper(*args, **kwargs) -> Any:
+                pre_state = self.input_dependent_preserved_state()
+                result = fn(*args, **kwargs)
+                post_state = self.input_dependent_preserved_state()
+                if pre_state != post_state:
+                    if self.cached_replay_events is None:
+                        raise AssertionError("cached_replay_events must not be None")
+                    self.cached_replay_events.append((fn.__name__, [*args], {**kwargs}))
+                return result
+
+            return wrapper
+
+        return decorator
+
+    def replay_cached_events(self, events) -> None:
+        """Make again the decisions that the shapes decided last time."""
+
+        for f, args, kwargs in events:
+            getattr(self, f)(*args, **kwargs)
+
+    @contextlib.contextmanager
+    def set_subgraph_body(self, body_name: str):
+        """Work on one subgraph's text, and put the rest back afterwards.
+
+        Everything a subgraph decides is decided against the text and the
+        bookkeeping it owns, so both are put in place for the length of the
+        work and taken back out after it.
+        """
+
+        if not all(
+            hasattr(self, field.name) for field in dataclasses.fields(SubgraphInfo)
+        ):
+            raise AssertionError("missing expected SubgraphInfo fields on self")
+        old_state = {
+            key.name: getattr(self, key.name)
+            for key in dataclasses.fields(SubgraphInfo)
+        }
+
+        if body_name not in self.subgraph_bodies:
+            raise AssertionError(body_name)
+
+        subgraph = self.subgraph_bodies[body_name]
+        for key, value in subgraph.to_dict().items():
+            if value is None and key in subgraph.only_copy_if_non_none_fields:
+                continue
+            setattr(self, key, value)
+
+        context = (
+            contextlib.nullcontext
+            if not self.ops_handler
+            else lambda: V.set_ops_handler(self.ops_handler(V.get_ops_handler()))
+        )
+        with context():
+            yield
+        self.subgraph_bodies[body_name] = SubgraphInfo(
+            **{
+                key.name: getattr(self, key.name)
+                for key in dataclasses.fields(SubgraphInfo)
+            }
+        )
+        for key, value in old_state.items():
+            setattr(self, key, value)
+
+    @contextlib.contextmanager
+    def create_subgraph_body(self, body_name: str, clear_cse: bool = False):
+        """A subgraph that has not been worked on yet gets its text here.
+
+        The name has to be new, because working on a subgraph that already has
+        text would put two lowerings in one place.
+        """
+
+        if body_name in self.subgraph_bodies:
+            raise AssertionError(f"subgraph body {body_name} already exists")
+        self.subgraph_bodies[body_name] = SubgraphInfo(
+            IndentedBuffer(), None, None, cse=self.cse.clone() if clear_cse else None
+        )
+        with self.set_subgraph_body(body_name):
+            yield
+
+    def _make_independent_subgraph(self, subgraph_name, numel, **extra_fields):
+        """A subgraph that ranges over its own numbers, not the kernel's.
+
+        Used by epilogue and prologue hooks that have to do their own
+        bookkeeping rather than share the kernel's.
+        """
+
+        groups = {"x": V.graph.sizevars.simplify(numel), "r0_": sympy.S.One}
+        self.subgraph_bodies[subgraph_name] = SubgraphInfo(
+            body=IndentedBuffer(),
+            cse=self.cse.clone(),
+            range_trees=self.construct_range_trees(
+                pid_cache=None,
+                inside_reduction=False,
+                is_reduction=False,
+                numels=groups,
+                no_x_dim=False,
+            ),
+            range_tree_nodes={},
+            numels=groups,
+            **extra_fields,
+        )
+
+    def _setup_contiguous_index_state(
+        self,
+        indices: list[str],
+        index_symbols: list[sympy.Symbol],
+        lengths: list[sympy.Expr],
+        mask: str | None,
+        xindex_name: str = "xindex",
+    ) -> sympy.Expr:
+        """Name the output's dimensions and give the whole output one number.
+
+        The result is one number per element of the result, and having one
+        means the load and the store of a whole kernel can be ordered by it.
+        Naming the dimensions is what lets the later text ask for a position
+        by dimension rather than by arithmetic.
+
+        Returns the expression for that one number.
+        """
+
+        for name, range_tree_entry in zip(
+            indices, self.range_trees[0].construct_entries(lengths)
+        ):
+            range_tree_entry.set_name(name)
+        contiguous_index = sympy_dot(
+            FlexibleLayout.contiguous_strides(lengths), index_symbols
+        )
+        contiguous_index = self.rename_indexing(contiguous_index)
+        self.body.writeline(f"{xindex_name} = " + texpr(contiguous_index))
+        xindex_entry = self.range_trees[0].lookup(sympy.S.One, sympy_product(lengths))
+        old_symbol = xindex_entry.symbol()
+        xindex_entry.set_name(xindex_name)
+        if self.range_tree_nodes.get(old_symbol) is xindex_entry:
+            del self.range_tree_nodes[old_symbol]
+        self.range_tree_nodes[xindex_entry.symbol()] = xindex_entry
+        self.template_mask = mask
+        self.template_indices = indices
+        return contiguous_index
+
+    def _make_codegen_hook(
+        self, subgraph_name: str, indent_width: int = 0
+    ) -> Callable[[], str]:
+        """A hook that lowers a subgraph when the template's text asks for it.
+
+        The text is laid out before the subgraphs in it are lowered, so where
+        each one goes is written down as a placeholder and this fills it in.
+        """
+
+        def hook():
+            with self.set_subgraph_body(subgraph_name):
+                self.codegen_body()
+                self.cse.invalidate(OrderedSet())
+                result = self.body.getvalue()
+                if indent_width:
+                    result = textwrap.indent(
+                        textwrap.dedent(result), " " * indent_width
+                    )
+                return result.strip()
+
+        return hook
+
+    def need_numel_args(self):
+        return False
+
+    def estimate_kernel_num_bytes(self):
+        """An upper bound on the bytes this kernel touches.
+
+        A value that is both read and written is counted twice, because it is
+        both read and written.
+        """
+
+        ninplace_args = len(unique(self.args.inplace_buffers.values()))
+        num_bytes = []
+        for i, inp in enumerate(itertools.chain(self.input_nodes, (self.output_node,))):
+            size = V.graph.sizevars.optimization_hints(inp.get_size(), fallback=0)
+            numel = functools.reduce(operator.mul, size, 1)
+            dtype_size = get_dtype_size(inp.get_dtype())
+            num_bytes.append(numel * dtype_size * (1 + int(i < ninplace_args)))
+        return sum(num_bytes)
+
+    def estimate_flops(self) -> int:
+        """How much arithmetic this kernel does, for weighing it against others."""
+
+        for node in self.input_nodes:
+            for fx_node in node._current_origins:
+                f = count_flops_fx(fx_node)
+                if f is not None:
+                    if isinstance(f, tp.SymInt):
+                        f = f.node.expr
+                    return V.graph.sizevars.optimization_hint(f, fallback=0)
+        return 0
+
+    def jit_lines(self):
+        """Render decorators and metadata for the generated Triton template."""
+
+        if self.use_jit:
+            return "@triton.jit"
 
 
 def _compile_rendered(template, source: str, config: dict, constants: dict,
