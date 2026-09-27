@@ -18,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import math
+from itertools import product
 from typing import Any
 
 import tensorplay as tp
@@ -651,6 +652,475 @@ def fx_node_shape(expr: Any) -> Any:
     if isinstance(val, tp.Tensor):
         return tuple(val.shape)
     return None
+
+
+#: How many intervals a mask may be written as before the kernel stops being
+#: worth generating.  A mask written as a union grows as the pieces multiply, and
+#: a kernel that carries hundreds of intervals to avoid one comparison per
+#: position is a kernel that is worse than the one it replaced.
+MAX_PACKED_MASK_INTERVALS_FOR_CODE_SIZE = 8
+
+#: The operations a value that is the same across a group of positions may be
+#: written with.  The symbols are the operators the language spells these with,
+#: and are the same whichever of the two forms -- a value or a number -- was
+#: used, so that a body written either way produces the same kernel.
+LANE_UNIFORM_BINARY_OPS: Any = {
+    tp.ops.tp.add.Tensor: "+",
+    tp.ops.tp.add.Scalar: "+",
+    tp.ops.tp.sub.Tensor: "-",
+    tp.ops.tp.sub.Scalar: "-",
+    tp.ops.tp.mul.Tensor: "*",
+    tp.ops.tp.mul.Scalar: "*",
+    tp.ops.tp.remainder.Tensor: "%",
+    tp.ops.tp.remainder.Scalar: "%",
+}
+
+
+@dataclasses.dataclass
+class PackedMaskAnalyzer:
+    """Turn a mask written as a graph into the ranges of positions it keeps.
+
+    A packed mask is a window of positions, and the window is described by the
+    two bounds of the range it keeps rather than by asking about each position.
+    So the body is read as an expression over the window's first position and
+    the offset within the window, and what the body says about that expression
+    is turned into bounds.  A document mask that keeps everything from where a
+    document starts up to a fixed distance past the query becomes the range
+    between those two, with the window's own position subtracted out of both --
+    which is what makes them bounds on the offset rather than on the position.
+
+    A body that is not a range of positions -- one that keeps every third
+    position, say -- is not written as a range and is read a position at a time
+    instead.  That is the answer whenever the range cannot be had, so nothing
+    here is a failure: it is a narrower answer.
+    """
+
+    #: The positions that name a place counted from the front, and so need no
+    #: wrapping.  Recorded because a position that is not one of these has to be
+    #: wrapped before it can be used, and wrapping is only correct for a
+    #: position that really does count from the back.
+    nonnegative_indices: Any
+    q_idx: Any
+    kv_idx: Any
+    q_symbol: Any = dataclasses.field(
+        default_factory=lambda: sympy.Symbol("q_idx", integer=True, nonnegative=True)
+    )
+    kv_symbol: Any = dataclasses.field(
+        default_factory=lambda: sympy.Symbol("kv_idx", integer=True, nonnegative=True)
+    )
+    lane_symbol: Any = dataclasses.field(
+        default_factory=lambda: sympy.Symbol(
+            "mask_lane", integer=True, nonnegative=True
+        )
+    )
+    #: The code for the temporary names standing in for values read from a
+    #: captured value.  Kept here because a bound may mention one, and a bound
+    #: that mentions something it cannot write down is not a bound.
+    symbol_codes: Any = dataclasses.field(default_factory=dict)
+    placeholder_codes: Any = dataclasses.field(default_factory=dict)
+    placeholder_exprs: Any = dataclasses.field(default_factory=dict)
+    aux_load_symbols: Any = dataclasses.field(default_factory=dict)
+    next_symbol_id: int = 0
+
+    def node_to_intervals(self, node: Any) -> Any:
+        """The ranges a node keeps, or nothing if it is not a range."""
+
+        if is_bool_full_node(node, True):
+            return (PackedMaskInterval.full(),)
+        if is_bool_full_node(node, False):
+            return ()
+        if node.op != "call_function":
+            return None
+        target = node.target
+        if target in (tp.ops.tp.bitwise_and.Tensor, tp.ops.tp.logical_and.default):
+            return self.combine_binary_intervals(node, intersect=True)
+        if target in (tp.ops.tp.bitwise_or.Tensor, tp.ops.tp.logical_or.default):
+            return self.combine_binary_intervals(node, intersect=False)
+        if target in (tp.ops.tp.le.Tensor, tp.ops.tp.le.Scalar):
+            return self.comparison_to_intervals(
+                node.args[0], node.args[1], strict=False
+            )
+        if target in (tp.ops.tp.lt.Tensor, tp.ops.tp.lt.Scalar):
+            return self.comparison_to_intervals(
+                node.args[0], node.args[1], strict=True
+            )
+        if target in (tp.ops.tp.ge.Tensor, tp.ops.tp.ge.Scalar):
+            return self.comparison_to_intervals(
+                node.args[1], node.args[0], strict=False
+            )
+        if target in (tp.ops.tp.gt.Tensor, tp.ops.tp.gt.Scalar):
+            return self.comparison_to_intervals(
+                node.args[1], node.args[0], strict=True
+            )
+        if target in (tp.ops.tp.eq.Tensor, tp.ops.tp.eq.Scalar):
+            return self.equality_to_intervals(node.args[0], node.args[1])
+        if target in (tp.ops.tp.ne.Tensor, tp.ops.tp.ne.Scalar):
+            return self.complement_intervals(
+                self.equality_to_intervals(node.args[0], node.args[1])
+            )
+        if target in (
+            tp.ops.tp.logical_not.default,
+            tp.ops.tp.bitwise_not.default,
+        ):
+            child = node.args[0]
+            if not isinstance(child, FxNode):
+                return None
+            return self.complement_intervals(self.node_to_intervals(child))
+        return None
+
+    def combine_binary_intervals(self, node: Any, *, intersect: bool) -> Any:
+        """Both sides kept, or either side kept."""
+
+        lhs, rhs = node.args
+        if not isinstance(lhs, FxNode) or not isinstance(rhs, FxNode):
+            return None
+        lhs_intervals = self.node_to_intervals(lhs)
+        rhs_intervals = self.node_to_intervals(rhs)
+        if intersect:
+            return self.intersect_interval_sets(lhs_intervals, rhs_intervals)
+        return self.union_interval_sets(lhs_intervals, rhs_intervals)
+
+    def comparison_to_intervals(
+        self, lhs: Any, rhs: Any, *, strict: bool
+    ) -> Any:
+        """A comparison of two positions, as a range."""
+
+        exprs = self.mask_operands_to_sympy(lhs, rhs)
+        if exprs is None:
+            return None
+        return self.lane_comparison_to_intervals(*exprs, strict=strict)
+
+    def equality_to_intervals(self, lhs: Any, rhs: Any) -> Any:
+        """Two positions being equal, as a range."""
+
+        exprs = self.mask_operands_to_sympy(lhs, rhs)
+        if exprs is None:
+            return None
+        return self.lane_equality_to_intervals(*exprs)
+
+    def mask_operands_to_sympy(self, lhs: Any, rhs: Any) -> Any:
+        """Both sides as expressions over the window."""
+
+        lhs_expr = self.fx_mask_expr_to_sympy(lhs)
+        rhs_expr = self.fx_mask_expr_to_sympy(rhs)
+        if lhs_expr is None or rhs_expr is None:
+            return None
+        return lhs_expr, rhs_expr
+
+    def lane_comparison_to_intervals(
+        self, lhs_expr: Any, rhs_expr: Any, *, strict: bool
+    ) -> Any:
+        """One side being below the other, as a range of positions.
+
+        The two are subtracted so that there is one question rather than two,
+        and the question is whether the difference is negative.  What that
+        depends on is the offset within the window, and the difference is
+        decomposed into how much of it the offset accounts for and what is left
+        over -- and the coefficient says which shape the answer has.
+
+        A coefficient of zero means the answer does not depend on the position
+        at all, so the whole window is kept or none of it is; the answer is
+        written as an upper bound of thirty-two times whether it holds, because
+        a bound that is a positive multiple of thirty-two keeps every position
+        and one that is not keeps none.  A coefficient of one is a range from
+        the start of the window -- the shape a comparison against the query
+        takes.  A coefficient of minus one is a range to the end of the window,
+        which is the shape a comparison against where a document starts.  Any
+        other coefficient steps over positions rather than naming a range, and
+        is left to be asked about one position at a time.
+        """
+
+        diff = V.graph.sizevars.simplify(lhs_expr - rhs_expr)
+        affine = decompose_affine_lane_expr(diff, self.lane_symbol)
+        if affine is None:
+            return None
+        lane_coeff, rest = affine
+        if lane_coeff == 0:
+            keep = -rest if strict else 1 - rest
+            upper = V.graph.sizevars.simplify(sympy.Integer(32) * keep)
+            return self.interval_if_renderable(sympy.Integer(0), upper)
+        if lane_coeff == 1:
+            upper = V.graph.sizevars.simplify(-rest if strict else -rest + 1)
+            return self.interval_if_renderable(sympy.Integer(0), upper)
+        if lane_coeff == -1:
+            lower = V.graph.sizevars.simplify(rest + 1 if strict else rest)
+            return self.interval_if_renderable(lower, sympy.Integer(32))
+        return None
+
+    def lane_equality_to_intervals(self, lhs_expr: Any, rhs_expr: Any) -> Any:
+        """Two positions being equal, as a range of positions.
+
+        Two divisions naming the same block is a range rather than a single
+        position, and is recognised before the general case because a body
+        written that way means "the same block", which is a run rather than a
+        point.  Otherwise it is the same decomposition as a comparison, and a
+        coefficient of one or minus one means exactly one position can be equal
+        -- a run of one, which is a range of one.  Any other coefficient is
+        left to be asked about one position at a time.
+        """
+
+        if isinstance(lhs_expr, FloorDiv) and isinstance(rhs_expr, FloorDiv):
+            intervals = self._floor_div_equality_to_intervals(lhs_expr, rhs_expr)
+            if intervals is not None:
+                return intervals
+        diff = V.graph.sizevars.simplify(lhs_expr - rhs_expr)
+        affine = decompose_affine_lane_expr(diff, self.lane_symbol)
+        if affine is None:
+            return None
+        lane_coeff, rest = affine
+        if lane_coeff == 0:
+            scale = sympy.Integer(32)
+            upper = V.graph.sizevars.simplify(
+                Min(scale * (1 - rest), scale * (1 + rest))
+            )
+            return self.interval_if_renderable(sympy.Integer(0), upper)
+        if lane_coeff in (1, -1):
+            lane_value = -rest if lane_coeff == 1 else rest
+            lower = V.graph.sizevars.simplify(lane_value)
+            upper = V.graph.sizevars.simplify(lane_value + 1)
+            return self.interval_if_renderable(lower, upper)
+        return None
+
+    def _floor_div_equality_to_intervals(self, lhs_expr: Any, rhs_expr: Any) -> Any:
+        """Two divisions naming the same block, as the run of positions that is."""
+
+        lhs_base, lhs_divisor = lhs_expr.args
+        rhs_base, rhs_divisor = rhs_expr.args
+        if lhs_divisor != rhs_divisor:
+            return None
+        if lhs_base == self.q_symbol and rhs_base == self.kv_symbol + self.lane_symbol:
+            q_block = lhs_expr
+        elif (
+            rhs_base == self.q_symbol and lhs_base == self.kv_symbol + self.lane_symbol
+        ):
+            q_block = rhs_expr
+        else:
+            return None
+        block_start = V.graph.sizevars.simplify(q_block * lhs_divisor - self.kv_symbol)
+        block_end = V.graph.sizevars.simplify(block_start + lhs_divisor)
+        return self.interval_if_renderable(block_start, block_end)
+
+    def interval_if_renderable(self, lower: Any, upper: Any) -> Any:
+        """The range, if both of its bounds can be written down.
+
+        A bound that cannot is not a bound: the kernel would have to write
+        something, and what it wrote would be a different number.
+        """
+
+        if (
+            sympy_to_cute_index(lower, self.symbol_codes) is not None
+            and sympy_to_cute_index(upper, self.symbol_codes) is not None
+        ):
+            return (PackedMaskInterval(lower, upper),)
+        return None
+
+    def complement_intervals(self, intervals: Any) -> Any:
+        """The positions a set of ranges does not keep.
+
+        The complement of a union is the intersection of each range's two
+        complements -- what is before it and what is after it -- and that is
+        still a set of ranges, so the answer stays in the same form.  The bounds
+        may be numbers not yet known, so this composes bounds that can already
+        be written rather than sorting them, and the composition is capped.
+        """
+
+        if intervals is None:
+            return None
+        result: Any = (PackedMaskInterval.full(),)
+        for interval in intervals:
+            result = self.intersect_interval_sets(
+                result,
+                (
+                    PackedMaskInterval(sympy.Integer(0), interval.lower_lane),
+                    PackedMaskInterval(
+                        interval.upper_lane_exclusive, sympy.Integer(32)
+                    ),
+                ),
+            )
+        return result
+
+    def union_interval_sets(self, intervals: Any, new_intervals: Any) -> Any:
+        """Either set of ranges kept, if the result is still small enough to write."""
+
+        if intervals is None or new_intervals is None:
+            return None
+        if (
+            len(intervals) + len(new_intervals)
+            > MAX_PACKED_MASK_INTERVALS_FOR_CODE_SIZE
+        ):
+            return None
+        return intervals + new_intervals
+
+    def intersect_interval_sets(self, intervals: Any, new_intervals: Any) -> Any:
+        """Both sets of ranges kept, if the result is still small enough to write.
+
+        Every pair gives one range, so the result grows as the product -- which
+        is why there is a cap: past it, reading the mask a position at a time is
+        the smaller kernel.
+        """
+
+        if intervals is None or new_intervals is None:
+            return None
+        if (
+            len(intervals) * len(new_intervals)
+            > MAX_PACKED_MASK_INTERVALS_FOR_CODE_SIZE
+        ):
+            return None
+        return tuple(
+            PackedMaskInterval(
+                V.graph.sizevars.simplify(Max(lhs.lower_lane, rhs.lower_lane)),
+                V.graph.sizevars.simplify(
+                    Min(lhs.upper_lane_exclusive, rhs.upper_lane_exclusive)
+                ),
+            )
+            for lhs, rhs in product(intervals, new_intervals)
+        )
+
+    def fx_mask_expr_to_sympy(self, expr: Any) -> Any:
+        """A mask expression, over the window's first position plus the offset.
+
+        The window's position is written as the sum of the two because the
+        offsets are what the bounds are about: a bound that named a position
+        would have to be rewritten once per position, and one that names the
+        offset is the same for all of them.
+        """
+
+        index_symbols = {
+            self.q_idx: self.q_symbol,
+            self.kv_idx: self.kv_symbol + self.lane_symbol,
+        }
+        index_symbols.update(self.placeholder_exprs)
+        return fx_aux_index_to_sympy(expr, index_symbols, self.mask_aux_load_to_symbol)
+
+    def mask_aux_load_to_symbol(self, node: Any) -> Any:
+        """A name standing for a value read from a captured value.
+
+        Named rather than written out, because the read is the same for every
+        position in the window and writing it into each bound would write it once
+        per bound.  A read that is not the same for every position cannot be
+        named this way, and answers with nothing.
+        """
+
+        if not is_aten_index_node(node):
+            return None
+        if node in self.aux_load_symbols:
+            return self.aux_load_symbols[node]
+        lane_uniform_code = self.render_lane_uniform_scalar_expr(node)
+        if lane_uniform_code is None:
+            return None
+        symbol = sympy.Symbol(f"mask_bound_{self.next_symbol_id}", integer=True)
+        self.next_symbol_id += 1
+        self.symbol_codes[symbol] = lane_uniform_code
+        self.aux_load_symbols[node] = symbol
+        return symbol
+
+    def render_lane_uniform_scalar_expr(
+        self,
+        expr: Any,
+        *,
+        for_index: bool = False,
+        index_dim_size: Any = None,
+    ) -> Any:
+        """An expression that is the same for every position in the window.
+
+        The walked position is refused outright: it is the one thing in a mask
+        that is not the same for every position, and a bound that mentioned it
+        would not be a bound.
+        """
+
+        if isinstance(expr, (int, sympy.Integer)) and not isinstance(expr, bool):
+            index = int(expr)
+            if for_index and index < 0:
+                if index_dim_size is None:
+                    return None
+                index = V.graph.sizevars.guard_int(index + index_dim_size)
+            return f"cutlass.Int32({index})"
+        if not isinstance(expr, FxNode):
+            return None
+
+        if expr is self.kv_idx:
+            return None
+        if expr in self.placeholder_codes:
+            return self.placeholder_codes[expr]
+
+        if is_aten_index_node(expr):
+            return self._render_lane_uniform_index_expr(expr, for_index=for_index)
+        if expr.op != "call_function":
+            return None
+        if expr.target is tp.ops.tp.div.Tensor_mode:
+            if expr.kwargs.get("rounding_mode") != "floor":
+                return None
+            op = "//"
+        else:
+            op = LANE_UNIFORM_BINARY_OPS.get(expr.target)
+            if op is None:
+                return None
+        args = expr.args
+        if len(args) < 2:
+            return None
+        lhs = self.render_lane_uniform_scalar_expr(args[0])
+        rhs = self.render_lane_uniform_scalar_expr(args[1])
+        if lhs is None or rhs is None:
+            return None
+        return f"({lhs} {op} {rhs})"
+
+    def _render_lane_uniform_index_expr(self, expr: Any, *, for_index: bool) -> Any:
+        """A read of a single whole number from a captured value.
+
+        Only whole numbers, and only a read of one: a read of a vector would be
+        a different value for every position, and a read of a number that is not
+        whole cannot be a position at all.
+        """
+
+        if fx_node_dtype(expr) not in (
+            tp.int8,
+            tp.int16,
+            tp.int32,
+            tp.int64,
+            tp.uint8,
+        ):
+            return None
+        result_shape = fx_node_shape(expr)
+        if result_shape is not None and len(result_shape) != 0:
+            return None
+        base, indices = expr.args
+        base_code = self.render_lane_uniform_scalar_expr(base)
+        base_shape = fx_node_shape(base) if isinstance(base, FxNode) else None
+        if base_code is None or not isinstance(indices, (list, tuple)):
+            return None
+        if base_shape is None or len(indices) != len(base_shape):
+            return None
+        index_codes = []
+        for dim, index in enumerate(indices):
+            dim_size = base_shape[dim]
+            index_code = self.render_lane_uniform_scalar_expr(
+                index, for_index=True, index_dim_size=dim_size
+            )
+            if index_code is None:
+                return None
+            if (
+                dim_size is not None
+                and isinstance(index, FxNode)
+                and index not in self.nonnegative_indices
+            ):
+                # A position counted from the back has to be counted from the
+                # front before it can be used, and adding the axis's length is
+                # what does that.
+                if not isinstance(dim_size, (int, sympy.Integer)):
+                    return None
+                dtype = fx_node_dtype(index)
+                integer_type = "Int64" if dtype == tp.int64 else "Int32"
+                size_code = f"cutlass.{integer_type}({dim_size})"
+                zero_code = f"cutlass.{integer_type}(0)"
+                index_code = (
+                    f"({index_code} + {size_code} "
+                    f"if {index_code} < {zero_code} else {index_code})"
+                )
+            index_codes.append(index_code)
+        load = f"{base_code}[{', '.join(index_codes)}]"
+        if for_index and fx_node_dtype(expr) == tp.int64:
+            return load
+        return f"cutlass.Int32({load})"
 
 
 # ---------------------------------------------------------------------------
