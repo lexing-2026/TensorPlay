@@ -192,6 +192,18 @@ def gather_origins(args, kwargs) -> OrderedSet:
     return OrderedSet(itertools.chain(*args_origins, *kwargs_origins))
 
 
+def normalize_name(name: str) -> str:
+    """A name spelled so that it can be a name in written-out code.
+
+    A name read off a program may hold a dot, and a dot in the middle of a
+    name is read as an attribute rather than as part of the name -- so the
+    name is given this region's own prefix first, and then whatever is left
+    that a name cannot hold becomes an underscore.
+    """
+
+    return re.sub(r"[^a-zA-Z0-9_]", "_", name)
+
+
 def identity(value):
     """The value handed back unchanged.
 
@@ -1564,6 +1576,7 @@ def use_blackwell_cutedsl_grouped_mm(
     if bias is not None or scale_result is not None:
         return False
     return True
+    from .templates.mm_common import _use_autotune_backend
 
 
 def can_use_tma(*matrices, output_layout=None, add_guards: bool = False) -> bool:
@@ -3139,8 +3152,8 @@ def is_cudagraph_unsafe_op(node: Any) -> bool:
     refused for the same reason and with the same words as the region that
     contains it.
     """
-    from ..cudagraphs import _data_dependent_node
-    from ..cudagraphs import _UNSAFE_OPS, _target_name
+    from .cudagraphs import _data_dependent_node
+    from .cudagraphs import _UNSAFE_OPS, _target_name
 
     from . import ir
 
@@ -3176,7 +3189,7 @@ def _is_sparse(value: Any) -> bool:
     whether a result is sparse is a property of the result: an operation can
     produce one kind or the other depending on what it was given.
     """
-    from ..cudagraphs import _is_tensor
+    from .graph_lowering import _is_tensor
 
     return _is_tensor(value) and bool(getattr(value, "is_sparse", False))
 
@@ -3403,3 +3416,94 @@ _TMA_SUPPORTED_DTYPES: OrderedSet = OrderedSet(
         *TRITON_FLOAT8_DTYPES,
     ]
 )
+
+
+def can_use_tma(*matrices: Any, output_layout: Any = None, add_guards: bool = False) -> bool:
+    """Whether every one of these can be described to the device as a tile.
+
+    A tile descriptor names a region of memory by its type and its extents, and
+    the hardware can only be told about regions of certain shapes: at most five
+    dimensions, exactly one of them walked one element at a time, every stride
+    between them a whole number of sixteen bytes, and the innermost row itself a
+    whole number of sixteen bytes.  A tensor that does not line up cannot be
+    described, however well its extents otherwise fit.
+
+    Every one of them, not any: a descriptor is built per tensor and one that
+    cannot be built makes the whole launch unable to use them.
+    """
+
+    def _aligned(expr_bytes: Any) -> bool:
+        return V.graph.sizevars.statically_known_multiple_of(expr_bytes, TMA_ALIGNMENT)
+
+    def _is_tma_compatible_layout(layout: Any) -> bool:
+        if layout is None:
+            return True
+        if not _aligned(layout.offset):
+            return False
+        return _is_tma_compatible(layout.size, layout.stride, layout.dtype)
+
+    def _is_tma_compatible_matrix(m: Any) -> bool:
+        sizes = m.get_size()
+        strides = m.get_stride()
+        dtype = m.get_dtype()
+
+        # A pointer handed in from outside has an alignment the graph was never
+        # told, so one known not to be aligned cannot be described.
+        if m.get_name() in V.graph.unaligned_buffers:
+            return False
+
+        return _is_tma_compatible(sizes, strides, dtype)
+
+    def _is_tma_compatible(sizes: Any, strides: Any, dtype: Any) -> bool:
+        rank = len(sizes)
+        itemsize = dtype.itemsize
+
+        if rank < 1 or rank > 5:
+            return False
+
+        if dtype not in TMA_SUPPORTED_DTYPES:
+            return False
+
+        if add_guards:
+            sizes_i = V.graph.sizevars.guard_int_seq(sizes)
+            strides_i = V.graph.sizevars.guard_int_seq(strides)
+        else:
+            sizes_i = [
+                V.graph.sizevars.replace_backed_symbols_with_hints(s) for s in sizes
+            ]
+            strides_i = [
+                V.graph.sizevars.replace_backed_symbols_with_hints(st) for st in strides
+            ]
+
+        # The axis walked one element at a time.  Exactly one, because a
+        # descriptor names one contiguous run and a tensor with two is two runs.
+        inner = [
+            i
+            for i, st in enumerate(strides_i)
+            if V.graph.sizevars.statically_known_equals(st, 1)
+        ]
+        if len(inner) != 1:
+            return False
+        inner_idx = inner[0]
+
+        for i, st in enumerate(strides_i):
+            if i == inner_idx:
+                continue
+            if not _aligned(st * itemsize):
+                return False
+
+        inner_dim = sizes_i[inner_idx]
+        if not _aligned(inner_dim * itemsize):
+            return False
+
+        # A single-byte type has to be walked at least thirty-two at a time or
+        # the unit that reads it cannot be given a whole row.
+        if itemsize == 1 and not V.graph.sizevars.statically_known_geq(inner_dim, 32):
+            return False
+
+        return True
+
+    ret = all(_is_tma_compatible_matrix(x) for x in matrices)
+    if output_layout is not None:
+        ret = ret and _is_tma_compatible_layout(output_layout)
+    return ret

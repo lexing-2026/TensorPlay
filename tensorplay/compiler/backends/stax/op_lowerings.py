@@ -1225,8 +1225,8 @@ for _name, _op in {
 #: somewhere.  So they are named separately rather than written as the
 #: operations they resemble.
 register_pointwise_numeric("exp2.default", "log2.default")
-LOWERINGS["exp2.default"] = _unary("exp2")
-LOWERINGS["log2.default"] = _unary("log2")
+LOWERINGS["exp2.default"] = lower_exp2 = _unary("exp2")
+LOWERINGS["log2.default"] = lower_log2 = _unary("log2")
 
 #: Whether two values are the same.  The answer is not a number: comparing two
 #: values is how one of them is chosen, and a value that could be chosen as one
@@ -1234,7 +1234,7 @@ LOWERINGS["log2.default"] = _unary("log2")
 #: worked out from the arguments, which is what a comparison of numbers would
 #: give.
 register_pointwise("eq.default", type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.ALWAYS_BOOL)
-LOWERINGS["eq.default"] = _unary("eq")
+LOWERINGS["eq.default"] = lower_eq = _unary("eq")
 
 
 def _binary(_op: str):

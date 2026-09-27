@@ -438,8 +438,8 @@ max_autotune_gemm = os.environ.get("TP_MAX_AUTOTUNE_GEMM", "0") == "1"
 # default offers the handful of tilings worth offering, and the exhaustive one
 # offers every combination of the extents -- which is a different question, not
 # a longer answer to the same one.
-max_autotune_flex_search_space = os.environ.get(
-    "TP_MAX_AUTOTUNE_FLEX_SEARCH_SPACE", "DEFAULT"
+max_autotune_omni_search_space = os.environ.get(
+    "TP_MAX_AUTOTUNE_OMNI_SEARCH_SPACE", "DEFAULT"
 ).upper()
 
 # Which backends a measured product may be chosen from, as a list to add to or

@@ -50,7 +50,7 @@ class BaseConfig:
 
 
 @dataclass
-class FlexDecodeConfig:
+class OmniDecodeConfig:
     """A tile for attention that asks one question at a time.
 
     No contraction tile: there is no contraction here.  The query axis is one
@@ -381,9 +381,9 @@ class _TileConfigHeuristic(TemplateConfigHeuristics):
             for c in self.depthwise_conv_configs
         ]
 
-    def get_flex_decode_configs(
+    def get_omni_decode_configs(
         self, head_dim: int, dtype: Any
-    ) -> list[FlexDecodeConfig]:
+    ) -> list[OmniDecodeConfig]:
         """The tilings for attention that asks one question at a time.
 
         Three when the widest search was asked for, and the one that is always
@@ -397,31 +397,31 @@ class _TileConfigHeuristic(TemplateConfigHeuristics):
         because a kernel that is not measured at all has to be able to run.
         """
 
-        flex_decode_configs: list[FlexDecodeConfig] = []
+        omni_decode_configs: list[OmniDecodeConfig] = []
 
         if config.max_autotune:
-            if config.max_autotune_flex_search_space == "EXHAUSTIVE":
-                return self.exhaustive_flex_decode_configs
-            flex_decode_configs += self.flex_decode_autotune_configs
+            if config.max_autotune_omni_search_space == "EXHAUSTIVE":
+                return self.exhaustive_omni_decode_configs
+            omni_decode_configs += self.omni_decode_autotune_configs
 
-        default_config = FlexDecodeConfig(block_n=64, num_stages=1, num_warps=2)
+        default_config = OmniDecodeConfig(block_n=64, num_stages=1, num_warps=2)
 
-        if default_config not in flex_decode_configs:
-            flex_decode_configs.append(default_config)
+        if default_config not in omni_decode_configs:
+            omni_decode_configs.append(default_config)
 
-        return flex_decode_configs
+        return omni_decode_configs
 
     #: The three tilings offered when the widest search was asked for, read as
     #: (keys per program, stages, warps).
-    flex_decode_autotune_configs: tuple = (
-        FlexDecodeConfig(64, 3, 2),
-        FlexDecodeConfig(32, 3, 2),
-        FlexDecodeConfig(128, 3, 2),
+    omni_decode_autotune_configs: tuple = (
+        OmniDecodeConfig(64, 3, 2),
+        OmniDecodeConfig(32, 3, 2),
+        OmniDecodeConfig(128, 3, 2),
     )
     #: Every tiling the table implies rather than names, for the exhaustive
     #: search.
-    exhaustive_flex_decode_configs: tuple = tuple(
-        FlexDecodeConfig(block_n, num_stages, num_warps)
+    exhaustive_omni_decode_configs: tuple = tuple(
+        OmniDecodeConfig(block_n, num_stages, num_warps)
         for block_n in (16, 32, 64, 128)
         for num_stages in (1, 3, 4, 5)
         for num_warps in (2, 4, 8)

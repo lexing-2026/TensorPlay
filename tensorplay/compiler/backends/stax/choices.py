@@ -215,13 +215,13 @@ class InductorChoices:
 
         return CHOICES.get_config_heuristics(device_type)
 
-    def get_flex_decode_configs(
+    def get_omni_decode_configs(
         self, head_dim: int, dtype: Any, device_type: str | None = "cuda"
     ) -> list:
         """The tilings for attention that asks one question at a time."""
 
-        flex_heuristics = self.get_config_heuristics(device_type)
-        return flex_heuristics.get_flex_decode_configs(head_dim, dtype)
+        omni_heuristics = self.get_config_heuristics(device_type)
+        return omni_heuristics.get_omni_decode_configs(head_dim, dtype)
 
     can_fuse = staticmethod(can_fuse)
     can_fuse_vertical = staticmethod(can_fuse_vertical)
