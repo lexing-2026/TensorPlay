@@ -282,6 +282,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/MarginLossKernels.cu
         src/backend/cuda/RandomKernels.cu
         src/backend/cuda/RandomSpecialKernels.cu
+        src/backend/cuda/PhiloxStatelessKernels.cu
         src/backend/cuda/ReductionKernels.cu
         src/backend/cuda/MedianKernels.cu
         src/backend/cuda/DistanceKernels.cu
