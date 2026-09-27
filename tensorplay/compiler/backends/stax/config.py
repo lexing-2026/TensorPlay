@@ -1163,6 +1163,13 @@ autotune_local_cache: bool = True
 #: is unset rather than off.
 autotune_remote_cache: bool | None = None
 
+#: Keep the measured answers together, as one entry, rather than one entry per
+#: kernel -- which on a model of any size is a great many small files.  Only
+#: available when the local cache is on, because the gathered answers are fed
+#: to it.  ``True`` turns it on, ``False`` turns it off, ``None`` leaves the
+#: decision to whatever the remote cache itself says.
+bundled_autotune_remote_cache: bool | None = None
+
 #: Tune each launch the first time it is seen and keep the answer, rather than
 #: tuning it again for every new shape.
 incremental_autotune: bool | None = False

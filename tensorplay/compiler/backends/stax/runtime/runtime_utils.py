@@ -27,6 +27,15 @@ import sympy
 
 import tensorplay as tp
 
+# Re-exported rather than used here: other modules reach for these through this
+# one, so that a caller asking where a cache lives does not have to know which
+# of these it is.
+from .cache_dir_utils import (  # noqa: F401
+    cache_dir,
+    default_cache_dir,
+    triton_cache_dir,
+)
+
 
 #: Whether output may carry colour.  Off when the module that provides it is
 #: absent, and off when output is not a terminal, so that a message piped

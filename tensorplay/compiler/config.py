@@ -20,6 +20,7 @@ __all__ = [
     "verbose",
     "fail_on_recompile_limit_hit",
     "force_disable_caches",
+    "cache_key_tag",
 ]
 
 
@@ -120,4 +121,15 @@ row-broadcast widths the vector peel cannot align compile as an outer row
 loop with inner vector lanes instead of losing the fused route entirely.
 ``False`` restores the legacy surface: those layouts decline the
 generated kernel and the region keeps its fallback execution.
+"""
+
+
+cache_key_tag: str = ""
+"""A tag folded into every cache key, so that caches can be told apart.
+
+The usual reason to set it is to break the caches on purpose: a run that
+should not be reusing anything an earlier run measured sets a tag, and
+every key that would have matched now names a different cache.  The value
+is part of the key rather than the cache's location, so setting it
+invalidates reuse without moving or deleting anything.
 """
