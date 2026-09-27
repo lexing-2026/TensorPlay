@@ -616,3 +616,82 @@ def create_num_blocks_fake_generator(sparse_indices: Any) -> Any:
         )
 
     return create_num_blocks_fake
+
+
+def zeros_and_scatter_lowering(shape: Any, indices: Any, values: Any) -> Any:
+    """A value of zeros with a value added into it at a position, for gradients.
+
+    The gradient a captured value contributes is a sum over every position that
+    was read, and a sum is not a walk -- several positions may be the same one,
+    and each has to be added to what the others put there.  So the addition is
+    an atomic one: two positions being the same has to be decided by the
+    hardware as they happen, because which of them gets there first is not
+    something that can be known beforehand.
+
+    Accumulated in single precision and converted after, because the order the
+    additions happen in is not fixed and a narrow accumulator would make the
+    answer depend on that order as well as on the values.
+    """
+
+    from ..ir import ComputedBuffer, MutationLayoutSHOULDREMOVE, Scatter
+    from ..op_lowerings import (
+        _full,
+        check_and_broadcast_indices,
+        index_output_size_and_inner_fn,
+        to_dtype,
+    )
+
+    # Always accumulate into fp32 then cast
+    grad = _full(0, values.get_device(), tp.float32, shape)
+    if not isinstance(grad, TensorBox):
+        grad = TensorBox.create(grad)
+    grad.realize()
+    x_size = grad.get_size()
+    values = to_dtype(values, grad.get_dtype())
+    device = grad.get_device()
+    if device is None:
+        raise AssertionError("device must not be None")
+    if not indices:
+        if shape:
+            raise AssertionError(
+                "zeros_and_scatter with no indices only supports scalar outputs"
+            )
+        expected_vals_size = values.get_size()
+
+        def inner_fn(index: Any) -> Any:
+            return []
+
+    else:
+        indices_loaders = [i.make_loader() if i is not None else None for i in indices]
+        indices, tensor_indices = check_and_broadcast_indices(
+            indices, grad.get_device()
+        )
+        tensor_size = list(indices[tensor_indices[0]].get_size())
+        indexed_size = [x_size[i] for i in range(len(indices))]
+
+        expected_vals_size, inner_fn = index_output_size_and_inner_fn(
+            x_size,
+            indices,
+            tensor_indices,
+            tensor_size,
+            indices_loaders,
+            indexed_size,
+            None,
+            check=True,
+        )
+        values = lower_expand(values, expected_vals_size)
+    scatter = Scatter(
+        device=device,
+        dtype=grad.get_dtype(),
+        inner_fn=values.make_loader(),
+        ranges=expected_vals_size,
+        output_indexer=inner_fn,
+        scatter_mode="atomic_add",
+    )
+
+    buffer = ComputedBuffer(
+        name=grad.data.data.name,
+        layout=MutationLayoutSHOULDREMOVE(grad),
+        data=scatter,
+    )
+    return buffer
