@@ -16,6 +16,7 @@ and a tuple of coordinates to the one place that asks.
 from __future__ import annotations
 
 import dataclasses
+import enum
 import math
 from typing import Any
 
@@ -57,6 +58,149 @@ class HierarchicalIndex(sympy.Function):
     @classmethod
     def eval(cls, *args):
         return None
+
+
+def _flex_kernel_options_example(kind: str) -> str:
+    """A set of options to offer when an option was not understood.
+
+    An example rather than a list of what is allowed, because the allowed set
+    is what the error is for and listing it would be a second place to keep
+    it up to date.  Backward and forward take different names for the same
+    thing -- the backward pass splits its work differently and so has more of
+    it to name -- and the two are told apart by the prefix rather than by the
+    position, because a kernel is handed both.
+    """
+
+    if kind == "backward":
+        return (
+            "kernel_options={'bwd_BLOCK_M1': 32, 'bwd_BLOCK_N1': 32, "
+            "'bwd_BLOCK_M2': 32, 'bwd_BLOCK_N2': 32, "
+            "'bwd_num_stages': 1, 'bwd_num_warps': 4}"
+        )
+    return (
+        "kernel_options={'fwd_BLOCK_M': 32, 'fwd_BLOCK_N': 64, "
+        "'fwd_num_stages': 1, 'fwd_num_warps': 4}"
+    )
+
+
+def _flex_kernel_tuning_options(kind: str) -> str:
+    """Which options a kernel of this kind can be tuned over."""
+
+    if kind == "backward":
+        return (
+            "BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2, num_warps, and "
+            "num_stages; use the bwd_ prefix to set backward-only options"
+        )
+    if kind == "decode":
+        return (
+            "BLOCK_M, BLOCK_N, num_warps, and num_stages; use the fwd_ "
+            "prefix to set decode-only options"
+        )
+    return (
+        "BLOCK_M, BLOCK_N, num_warps, and num_stages; use the fwd_ "
+        "prefix to set forward-only options"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reading a captured value several positions at a time
+# ---------------------------------------------------------------------------
+
+
+class LoadKind(enum.Enum):
+    """How a captured value behaves when read across a group of positions.
+
+    Three answers because there are three things that can be true.  The
+    positions can name places that are next to each other, in which case they
+    can be read as one wide read.  They can all name the same place, in which
+    case the value is read once and the group does not matter.  Or they can
+    name nothing in particular, in which case each is read on its own -- and
+    that is the answer that is always available, so it is the one a question
+    about this falls back to.
+    """
+
+    GATHER = enum.auto()
+    LANE_UNIFORM = enum.auto()
+    CONTIGUOUS = enum.auto()
+
+
+@dataclasses.dataclass(frozen=True)
+class AuxLoadVecInfo:
+    """How one captured value is read across a group of positions.
+
+    The width is carried rather than looked up, because a value that can be
+    read wide and a value read one position at a time are different reads and
+    a decision made once should not be made again -- and because the two are
+    mutually exclusive: a width on a read that is not a wide one would be a
+    number that means nothing.
+    """
+
+    kind: LoadKind
+    vec_size: Any = None
+
+    def __post_init__(self) -> None:
+        if self.kind is LoadKind.CONTIGUOUS:
+            if self.vec_size is None:
+                raise AssertionError("CONTIGUOUS load requires a vec_size")
+        else:
+            if self.vec_size is not None:
+                raise AssertionError(
+                    f"non-CONTIGUOUS load must not carry vec_size, got {self.vec_size}"
+                )
+
+    @classmethod
+    def gather(cls) -> "AuxLoadVecInfo":
+        """Each position names a place of its own."""
+
+        return cls(LoadKind.GATHER)
+
+    @classmethod
+    def lane_uniform(cls) -> "AuxLoadVecInfo":
+        """Every position names the same place, so it is read once."""
+
+        return cls(LoadKind.LANE_UNIFORM)
+
+    @classmethod
+    def contiguous(cls, vec_size: int) -> "AuxLoadVecInfo":
+        """Consecutive positions name consecutive places, so they read as one."""
+
+        return cls(LoadKind.CONTIGUOUS, vec_size)
+
+
+@dataclasses.dataclass(frozen=True)
+class AuxVecPolicy:
+    """The rules one kind of captured value is read under.
+
+    Which positions in a body are the query's and which are the position being
+    walked, because a captured value read at either of those means something
+    different from one read at any other: read at the walked position it varies
+    across the group, and read anywhere else it does not.
+
+    The smallest rank for a wide read is a separate rule because a short mask
+    read wide would be a wide read of very few elements -- and a mask that
+    short can be packed into a range of positions instead, which is cheaper
+    than reading it at all.
+    """
+
+    q_idx_placeholder: int
+    kv_idx_placeholder: int
+    max_vec_size: int
+    min_index_rank_for_contiguous_load: int = 1
+    non_lane_placeholder_start: int = 0
+
+
+MASK_MOD_AUX_VEC_POLICY = AuxVecPolicy(
+    q_idx_placeholder=2,
+    kv_idx_placeholder=3,
+    max_vec_size=32,
+    min_index_rank_for_contiguous_load=2,
+)
+SCORE_MOD_AUX_VEC_POLICY = AuxVecPolicy(
+    q_idx_placeholder=3,
+    kv_idx_placeholder=4,
+    max_vec_size=8,
+    non_lane_placeholder_start=1,
+)
 
 
 # ---------------------------------------------------------------------------
