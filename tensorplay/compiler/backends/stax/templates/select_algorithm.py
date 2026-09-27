@@ -42,7 +42,7 @@ from ..ir import (
     compute_required_storage_length,
 )
 from ..loops import V
-from .ir import ChoiceCaller, CutedslChoiceCaller
+from .ir import ChoiceCaller
 from .mm_common import use_aten_gemm_kernels
 from ..loops import contiguous_strides, dtype_name
 from ..heuristics.template.params import DictKernelTemplateParams, KernelTemplateParams
@@ -840,7 +840,10 @@ class TritonChoiceCaller(ChoiceCaller):
                  launcher_args: tuple | None = None,
                  num_stages: int = 2, num_warps: int = 4,
                  config: dict | None = None, operands: dict | None = None,
-                 inductor_meta: dict | None = None, template: Any = None):
+                 inductor_meta: dict | None = None, template: Any = None,
+                 make_kernel_render: Callable[[], Any] | None = None,
+                 mutated_inputs: tuple = (),
+                 allowed_prologue_inps: Any = None):
         super().__init__(name, input_nodes, layout, description)
         self.source = source
         self._src_hash = src_hash
@@ -857,6 +860,13 @@ class TritonChoiceCaller(ChoiceCaller):
         self.operands = dict(operands or {})
         self.inductor_meta = dict(inductor_meta or {})
         self.template = template
+        #: The text this kernel's body is written out by, the inputs it is
+        #: allowed to read, and the inputs it writes rather than reads.  Carried
+        #: because a kernel written from a template returns nothing: its result
+        #: is a buffer that will be written, and writing it needs the text.
+        self.make_kernel_render = make_kernel_render
+        self.mutated_inputs = mutated_inputs
+        self.allowed_prologue_inps = allowed_prologue_inps
         #: What a launcher written from this kernel is handed, in the order it
         #: declares: the operands of the call, then the extents and strides the
         #: kernel was written to be given, then the stream.  A measurement is
@@ -864,6 +874,83 @@ class TritonChoiceCaller(ChoiceCaller):
         #: rest if the caller settled it when the launcher was written -- which
         #: is the one place that knows the signature.
         self.launcher_args = launcher_args
+
+    def bind(self, launcher: Callable[..., Any]) -> "TritonChoiceCaller":
+        """Attach the launcher written from this kernel, and hand back the choice.
+
+        The launcher is what a measurement runs and what a launch runs, and it
+        is not the kernel: what a compile hands back cannot be called on its
+        own, being callable only from inside a launch it has set up itself --
+        with the grid worked out and the arguments in the order its signature
+        declares.
+        """
+
+        self._callable = launcher
+        return self
+
+    def call_name(self) -> str:
+        """The name a trace shows this kernel under."""
+
+        return self.name
+
+    def to_callable(self) -> Callable[..., Any]:
+        """The launcher, which is what this choice is run through."""
+
+        if self._callable is None:
+            raise NotImplementedError(f"{self.name} has no kernel bound to it")
+        return self._callable
+
+    def info_dict(self) -> dict:
+        """What is worth writing down about this choice.
+
+        A measurement that will be looked at later is worth reading later, and
+        a row of timings with no configuration beside it says only that
+        something was faster.  What the configuration was -- the tile, the
+        warps and stages, and the handful of values the body was told -- is
+        what turns a number back into a thing that can be chosen again.
+        """
+
+        config = self.config or {}
+        return {
+            "tile_shape": str(
+                (
+                    config.get("BLOCK_M", -1),
+                    config.get("BLOCK_K", -1),
+                    config.get("BLOCK_N", -1),
+                )
+            ),
+            "num_stages": self.stages,
+            "num_warps": self.warps,
+            "GROUP_M": config.get("GROUP_M", -1),
+            "allow_tf32": str(config.get("ALLOW_TF32")),
+            "acc_type": str(config.get("ACC_TYPE")),
+            "matrix_instr_nonkdim": config.get("matrix_instr_nonkdim", 0),
+            "waves_per_eu": config.get("waves_per_eu", 0),
+            "kpack": config.get("kpack", 2),
+            "epilogue_subtile": config.get("EPILOGUE_SUBTILE", 0),
+        }
+
+    def output_node(self) -> Any:
+        """The result this choice produced, as a value the rest can read.
+
+        A kernel written from a template returns nothing -- what it computed is
+        left in memory it was given -- so the result is a buffer that will be
+        written rather than a value that was returned, and the text that writes
+        it is carried alongside so that whoever writes the region out has it.
+        """
+
+        from .. import ir
+
+        buffer = ir.TritonTemplateBuffer(
+            layout=self.layout,
+            inputs=self.input_nodes,
+            make_kernel_render=self.make_kernel_render,
+            mutated_inputs=self.mutated_inputs,
+            allowed_prologue_inps=self.allowed_prologue_inps,
+        )
+        if "ktc" in self.annotations:
+            buffer.annotations["ktc"] = self.annotations["ktc"]
+        return ir.TensorBox.create(buffer)
 
     def hash_key(self) -> str:
         parts = [self.name, self.description]
