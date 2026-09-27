@@ -17,6 +17,7 @@
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <cuda_runtime.h>
+#include <cmath>
 #include <algorithm>
 #include <cstdint>
 #include <limits>
@@ -96,7 +97,7 @@ void check_key_shape(const Tensor& key, const char* name) {
              ": key must have shape (*batch, 2), got a shape whose last "
              "dimension is not 2");
   }
-  if (key.scalar_type() != kUInt64) {
+  if (key.dtype() != DType::UInt64) {
     TP_THROW(RuntimeError, std::string(name) +
              ": key must be 64-bit unsigned, got some other type");
   }
@@ -150,7 +151,7 @@ Tensor _philox_key_split_cuda(const Tensor& key, int64_t num_splits) {
 
 Tensor _philox_key_fold_in_cuda(const Tensor& key, int64_t data) {
   check_key_shape(key, "_philox_key_fold_in");
-  Tensor output = Tensor::empty(std::vector<int64_t>(key.shape().vec()),
+  Tensor output = Tensor::empty(static_cast<std::vector<int64_t>>(key.shape()),
                                  key.dtype(), key.device());
   int64_t num_keys = key.numel() / 2;
   if (num_keys == 0) {
@@ -175,7 +176,7 @@ Tensor _philox_key_fold_in_cuda(const Tensor& key, int64_t data) {
 
 Tensor _philox_key_fold_in_tensor_cuda(const Tensor& key, const Tensor& data) {
   check_key_shape(key, "_philox_key_fold_in");
-  if (data.scalar_type() != kUInt64) {
+  if (data.dtype() != DType::UInt64) {
     TP_THROW(RuntimeError,
              "_philox_key_fold_in: data must be 64-bit unsigned");
   }
@@ -183,7 +184,7 @@ Tensor _philox_key_fold_in_tensor_cuda(const Tensor& key, const Tensor& data) {
     TP_THROW(RuntimeError,
              "_philox_key_fold_in: data must be a single value");
   }
-  Tensor output = Tensor::empty(std::vector<int64_t>(key.shape().vec()),
+  Tensor output = Tensor::empty(static_cast<std::vector<int64_t>>(key.shape()),
                                  key.dtype(), key.device());
   int64_t num_keys = key.numel() / 2;
   if (num_keys == 0) {
@@ -198,7 +199,7 @@ Tensor _philox_key_fold_in_tensor_cuda(const Tensor& key, const Tensor& data) {
   philox_key_fold_in_tensor_kernel<<<num_blocks, block_size, 0,
                                     getCurrentCUDAStream().stream()>>>(
       key_contig.data_ptr<uint64_t>(), output.data_ptr<uint64_t>(), num_keys,
-      data.const_data_ptr<uint64_t>());
+      data.data_ptr<uint64_t>());
   check_launch(cudaGetLastError());
 
   return output;
@@ -211,8 +212,6 @@ Tensor _philox_key_fold_in_tensor_cuda(const Tensor& key, const Tensor& data) {
 // that comes out is in [0, 1) and can never be the top of the range, which is
 // what makes it safe to scale and shift afterwards without ever landing on the
 // end the caller said the values are less than.
-
-namespace {
 
 template <typename T, typename V>
 __device__ __forceinline__ T uniform_real(V val, T from, T to) {
@@ -263,9 +262,12 @@ __device__ __forceinline__ void box_muller_double(uint4 r, double* out) {
                   static_cast<double>(r.w) * kInvRange * kInvRange +
                       kInvRange * kInvRange * 0.5);
 
-  double radius = sqrt(-2.0 * log(u1));
-  out[0] = radius * cos(kTwoPi * u2);
-  out[1] = radius * sin(kTwoPi * u2);
+  // Named through the global scope: the enclosing namespace has a name for each
+  // of these for complex numbers, and an unqualified call finds that one rather
+  // than the one for real numbers.
+  double radius = ::sqrt(-2.0 * ::log(u1));
+  out[0] = radius * ::cos(kTwoPi * u2);
+  out[1] = radius * ::sin(kTwoPi * u2);
 }
 
 // One thread per group of drawn numbers.  A group of four is one read of the
@@ -273,14 +275,17 @@ __device__ __forceinline__ void box_muller_double(uint4 r, double* out) {
 // position the stream is read at is the element's position divided by the size
 // of a group -- a position a thread is not going to read must not be consumed,
 // or the values would depend on how many threads there were.
-template <typename scalar_t, int elems_per_call, typename sample_func_t,
-          typename param_func_t>
+//
+// The drawn numbers are turned into values by ``fill`` rather than handed back
+// to the caller: a group of them is a fixed number of values, so passing them
+// out means either a fixed-size type or a pointer to something local, and the
+// first is a type per width while the second stops being valid on return.
+template <typename scalar_t, int elems_per_call, typename fill_t>
 __global__ void philox_single_key_kernel(
     scalar_t* __restrict__ output,
     const uint64_t* __restrict__ key,
     int64_t numel,
-    sample_func_t sample_func,
-    param_func_t param_func) {
+    fill_t fill) {
   constexpr int64_t kGroup = elems_per_call;
   const int64_t group_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x +
                             threadIdx.x;
@@ -289,23 +294,13 @@ __global__ void philox_single_key_kernel(
     return;
   }
   uint4 r = philox_4x32(key[0], key[1] + static_cast<uint64_t>(group_idx) * kGroup);
-  auto sample = sample_func(r);
   const int64_t base = group_idx * kGroup;
-  #pragma unroll
-  for (int j = 0; j < kGroup; j++) {
-    if (base + j < numel) {
-      output[base + j] = param_func(sample[j]);
-    }
-  }
+  fill(r, output + base, numel - base);
 }
 
 void check_distribution_shapes(
     const Tensor& self, const Tensor& key, const char* name) {
-  if (!self.is_floating_point()) {
-    TP_THROW(RuntimeError, std::string(name) +
-             ": the destination must hold real numbers");
-  }
-  if (self.device() != key.device()) {
+  if (!(self.device() == key.device())) {
     TP_THROW(RuntimeError,
              std::string(name) + ": destination and key must be on one device");
   }
@@ -316,9 +311,7 @@ void check_distribution_shapes(
   }
 }
 
-} // anonymous namespace
-
-Tensor _philox_uniform_cuda_(Tensor& self, const Tensor& key, double low,
+Tensor& _philox_uniform_cuda_(Tensor& self, const Tensor& key, double low,
                               double high) {
   check_distribution_shapes(self, key, "_philox_uniform_");
   if (self.numel() == 0) {
@@ -332,39 +325,33 @@ Tensor _philox_uniform_cuda_(Tensor& self, const Tensor& key, double low,
   cudaStream_t stream = getCurrentCUDAStream().stream();
   const uint64_t* kp = key_contig.data_ptr<uint64_t>();
 
-  if (self.scalar_type() == kFloat) {
-    philox_single_key_kernel<float, 4>
-        <<<num_blocks, block_size, 0, stream>>>(
-            self.data_ptr<float>(), kp, n,
-            [] __device__(uint4 r) {
-              // The drawn numbers are handed on as they are: turning one into
-              // a real number here and back again inside the transform would
-              // round it twice.
-              uint32_t s[4];
-              #pragma unroll
-              for (int j = 0; j < 4; j++) s[j] = (&r.x)[j];
-              return s;
-            },
-            [low, high] __device__(uint32_t v) {
-              return uniform_real<float>(v, static_cast<float>(low),
-                                         static_cast<float>(high));
-            });
-  } else if (self.scalar_type() == kDouble) {
-    philox_single_key_kernel<double, 2>
-        <<<num_blocks, block_size, 0, stream>>>(
-            self.data_ptr<double>(), kp, n,
-            [] __device__(uint4 r) {
-              // A whole number carries more precision than a real number can
-              // keep, so each of the two is a pair of the four packed into one
-              // rather than one of them scaled.
-              uint64_t s[2];
-              s[0] = (static_cast<uint64_t>(r.x) << 32) | r.y;
-              s[1] = (static_cast<uint64_t>(r.z) << 32) | r.w;
-              return s;
-            },
-            [low, high] __device__(uint64_t v) {
-              return uniform_real<double>(v, low, high);
-            });
+  if (self.dtype() == DType::Float32) {
+    const float lo = static_cast<float>(low);
+    const float hi = static_cast<float>(high);
+    philox_single_key_kernel<float, 4><<<num_blocks, block_size, 0, stream>>>(
+        self.data_ptr<float>(), kp, n,
+        [lo, hi] __device__(uint4 r, float* out, int64_t remaining) {
+          const uint32_t* d = &r.x;
+          #pragma unroll
+          for (int j = 0; j < 4; j++) {
+            if (j < remaining) out[j] = uniform_real<float>(d[j], lo, hi);
+          }
+        });
+  } else if (self.dtype() == DType::Float64) {
+    philox_single_key_kernel<double, 2><<<num_blocks, block_size, 0, stream>>>(
+        self.data_ptr<double>(), kp, n,
+        [low, high] __device__(uint4 r, double* out, int64_t remaining) {
+          // A whole number carries more precision than a real number keeps, so
+          // each of the two values is a pair of the four packed into one
+          // rather than one of them scaled.
+          const uint64_t packed[2] = {
+              (static_cast<uint64_t>(r.x) << 32) | r.y,
+              (static_cast<uint64_t>(r.z) << 32) | r.w};
+          #pragma unroll
+          for (int j = 0; j < 2; j++) {
+            if (j < remaining) out[j] = uniform_real<double>(packed[j], low, high);
+          }
+        });
   } else {
     TP_THROW(RuntimeError,
              "_philox_uniform_: only single and double precision are written");
@@ -373,7 +360,7 @@ Tensor _philox_uniform_cuda_(Tensor& self, const Tensor& key, double low,
   return self;
 }
 
-Tensor _philox_normal_cuda_(Tensor& self, const Tensor& key, double mean,
+Tensor& _philox_normal_cuda_(Tensor& self, const Tensor& key, double mean,
                             double stddev) {
   check_distribution_shapes(self, key, "_philox_normal_");
   if (self.numel() == 0) {
@@ -387,27 +374,29 @@ Tensor _philox_normal_cuda_(Tensor& self, const Tensor& key, double mean,
   cudaStream_t stream = getCurrentCUDAStream().stream();
   const uint64_t* kp = key_contig.data_ptr<uint64_t>();
 
-  if (self.scalar_type() == kFloat) {
+  if (self.dtype() == DType::Float32) {
+    const float mu = static_cast<float>(mean);
+    const float sigma = static_cast<float>(stddev);
     philox_single_key_kernel<float, 4><<<num_blocks, block_size, 0, stream>>>(
         self.data_ptr<float>(), kp, n,
-        [] __device__(uint4 r) {
+        [mu, sigma] __device__(uint4 r, float* out, int64_t remaining) {
           float s[4];
           box_muller_float(r, s);
-          return s;
-        },
-        [mean, stddev] __device__(float v) {
-          return static_cast<float>(v * stddev + mean);
+          #pragma unroll
+          for (int j = 0; j < 4; j++) {
+            if (j < remaining) out[j] = s[j] * sigma + mu;
+          }
         });
-  } else if (self.scalar_type() == kDouble) {
+  } else if (self.dtype() == DType::Float64) {
     philox_single_key_kernel<double, 2><<<num_blocks, block_size, 0, stream>>>(
         self.data_ptr<double>(), kp, n,
-        [] __device__(uint4 r) {
+        [mean, stddev] __device__(uint4 r, double* out, int64_t remaining) {
           double s[2];
           box_muller_double(r, s);
-          return s;
-        },
-        [mean, stddev] __device__(double v) {
-          return v * stddev + mean;
+          #pragma unroll
+          for (int j = 0; j < 2; j++) {
+            if (j < remaining) out[j] = s[j] * stddev + mean;
+          }
         });
   } else {
     TP_THROW(RuntimeError,
@@ -415,6 +404,16 @@ Tensor _philox_normal_cuda_(Tensor& self, const Tensor& key, double mean,
   }
   check_launch(cudaGetLastError());
   return self;
+}
+
+// ===========================================================================
+
+TENSORPLAY_LIBRARY_IMPL(CUDA, PhiloxStatelessKernels) {
+    m.impl("_philox_key_split", _philox_key_split_cuda);
+    m.impl("_philox_key_fold_in", _philox_key_fold_in_cuda);
+    m.impl("_philox_key_fold_in.Tensor", _philox_key_fold_in_tensor_cuda);
+    m.impl("_philox_uniform_", _philox_uniform_cuda_);
+    m.impl("_philox_normal_", _philox_normal_cuda_);
 }
 
 } // namespace cuda
