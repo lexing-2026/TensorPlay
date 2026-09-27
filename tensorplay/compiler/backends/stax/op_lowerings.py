@@ -39,6 +39,7 @@ from .utils import (
 
 from tensorplay.primitives.common import (
     ELEMENTWISE_TYPE_PROMOTION_KIND,
+    is_boolean_dtype,
     is_integer_dtype,
 )
 from .dtype_propagation import promoted_dtype_of_values
@@ -2903,3 +2904,155 @@ def _register_attention_fallbacks() -> None:
 
 
 _register_attention_fallbacks()
+
+
+@register("set_.source_Tensor")
+def lower_set_source_tensor(self: Any, source_tensor: Any) -> Any:
+    """One value becomes another's, by taking over what the other reads.
+
+    Not a copy: the destination stops being what it was and starts being the
+    source, which is why both have to be written down first -- what the
+    destination was is still being read by whatever read it, and what the
+    source is has to exist before it can be what they read.
+    """
+
+    self.realize()
+    source_tensor.realize()
+    return TensorBox.create(ir.SetSourceTensorKernel(self, source_tensor))
+
+
+def _register_writing_forms() -> None:
+    """The operations that write into their first argument.
+
+    Each is the non-writing operation's result made to be that argument, so
+    registering it from the non-writing form is what keeps the two computing the
+    same thing -- the only difference between them is where the result goes.
+    """
+
+    for names, key in (
+        (("div_.Tensor", "div_.Scalar", "div_.Tensor_mode", "div_.Scalar_mode"), "div.Tensor"),
+        (("sub_.Tensor", "sub_.Scalar"), "sub.Tensor"),
+        (("mul_.Tensor", "mul_.Scalar"), "mul.Tensor"),
+        (("add_.Tensor", "add_.Scalar"), "add.Tensor"),
+    ):
+        if key not in LOWERINGS:
+            continue
+        fn = LOWERINGS[key]
+        register_inplace(*names, outplace_op=getattr(fn, "__wrapped__", fn))
+
+
+_register_writing_forms()
+
+
+def is_integer_type(x: Any) -> bool:
+    """Whether a value is a whole number, whatever kind of value it is.
+
+    A lowered value, a number that is only known while the program runs, and a
+    number that is already a number are three different things that can all be
+    whole numbers, and a question about whole numbers has to be able to ask it
+    of any of them.
+    """
+
+    if isinstance(x, (TensorBox, IRNode)):
+        return is_integer_dtype(x.get_dtype()) or is_boolean_dtype(x.get_dtype())
+    elif isinstance(x, sympy.Expr):
+        return x.is_integer is True
+    else:
+        return isinstance(x, int)
+
+
+def is_boolean_type(x: Any) -> bool:
+    """Whether a value is a truth value, whatever kind of value it is."""
+
+    if isinstance(x, (TensorBox, IRNode)):
+        return is_boolean_dtype(x.get_dtype())
+    else:
+        return isinstance(x, bool)
+
+
+def floordiv(a: Any, b: Any) -> Any:
+    """The quotient rounded towards minus infinity."""
+
+    return ops.floordiv(a, b)
+
+
+def truncdiv(a: Any, b: Any) -> Any:
+    """The quotient with its fractional part dropped."""
+
+    return ops.truncdiv(a, b)
+
+
+def _div_rn(a: Any, b: Any) -> Any:
+    """The quotient rounded to nearest, which is not what dividing usually does.
+
+    A device usually divides by multiplying by a reciprocal it worked out in
+    advance, which is one multiply away from the quotient.  Where the quotient
+    is about to be rounded again -- a floor of it, say -- that one bit is the
+    difference between the right answer and the one below it, so this asks for
+    the quotient itself.
+    """
+
+    return ops.div_rn(a, b)
+
+
+def _floor_div_floating(a: Any, b: Any) -> Any:
+    """The quotient rounded towards minus infinity, for values that are not whole.
+
+    A floor of an approximate quotient can come out one too small, so the
+    quotient is rounded to nearest before it is floored -- which is then the same
+    floor as rounding the exact quotient would have given, wherever the two
+    round the same way.
+    """
+
+    return ops.floor(_div_rn(a, b))
+
+
+def div_mode(a: Any, b: Any, rounding_mode: Any = None) -> Any:
+    """A quotient, rounded the way the caller said to round it.
+
+    Whole numbers and values that are not whole numbers are rounded differently
+    and for different reasons, and neither can be done by rounding a quotient
+    the usual way: a floor of an approximate quotient can come out one too small,
+    and a device's own division of whole numbers is not the floor of anything.
+    """
+
+    both_integer = is_integer_type(a) and is_integer_type(b)
+    both_boolean = is_boolean_type(a) and is_boolean_type(b)
+
+    if rounding_mode == "floor":
+        if both_boolean:
+            raise AssertionError(
+                "floordiv operands can not be boolean at the same time"
+            )
+        return floordiv(a, b) if both_integer else _floor_div_floating(a, b)
+    if rounding_mode == "trunc":
+        if both_boolean:
+            raise AssertionError(
+                "truncdiv operands can not be boolean at the same time"
+            )
+        return truncdiv(a, b) if both_integer else ops.trunc(ops.div(a, b))
+    return LOWERINGS["div.Tensor"](a, b)
+
+
+def _register_div_writing_forms() -> None:
+    """The dividing operations that write into their first argument.
+
+    Rounding is not an operation of its own here: it is a mode of dividing, and
+    whether it comes out as a floor or a truncation depends on whether the
+    operands are whole numbers.  That question cannot be asked of an operation
+    before the operation has been chosen, which is why it is settled by a
+    lowering of its own rather than while registering one.
+    """
+
+    fn = LOWERINGS["div.Tensor"]
+    bare = getattr(fn, "__wrapped__", fn)
+    register_lowering("div.Tensor_mode", type_promotion_kind=None)(div_mode)
+
+    register_inplace("div_.Tensor", "div_.Scalar", outplace_op=bare)
+    for name in ("div_.Tensor_mode", "div_.Scalar_mode"):
+        register(name)(
+            lambda a, b, rounding_mode=None: mutate_to(a, div_mode(a, b, rounding_mode))
+        )
+
+
+_register_div_writing_forms()
