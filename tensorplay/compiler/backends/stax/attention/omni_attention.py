@@ -591,6 +591,107 @@ def select_aux_mod_vec_size(
 # ---------------------------------------------------------------------------
 
 
+@dataclasses.dataclass(frozen=True)
+class PackedMaskAuxPlaceholderMap:
+    """What each captured value in a mask is, once the kernel is running.
+
+    A value that is a number is written into the kernel as that number; one that
+    is a tensor is passed in beside the values the kernel was already given.  The
+    two are kept apart because a kernel is handed tensors and reads numbers, and
+    a tensor that was a number has to have been read before it can be used as
+    one.
+    """
+
+    codes: Any
+    exprs: Any
+
+    @classmethod
+    def from_placeholders(
+        cls, placeholders: Any, other_buffers: Any, symbol_codes: Any
+    ) -> Any:
+        """The names the kernel will know these by, or nothing if one has none.
+
+        The order matters: the values a kernel is handed are handed by position,
+        so a name that says which position is the whole of what a name is for.
+        """
+
+        codes: dict = {}
+        exprs: dict = {}
+        tensor_idx = 0
+        for placeholder, buffer in zip(placeholders, other_buffers):
+            if isinstance(buffer, sympy.Expr):
+                rendered = sympy_to_cute_index(buffer, symbol_codes)
+                if rendered is None:
+                    return None
+                codes[placeholder] = rendered
+                exprs[placeholder] = buffer
+            else:
+                codes[placeholder] = f"aux_tensors[{tensor_idx}]"
+                tensor_idx += 1
+        for placeholder in placeholders[len(other_buffers) :]:
+            codes[placeholder] = f"aux_tensors[{tensor_idx}]"
+            tensor_idx += 1
+        return cls(codes, exprs)
+
+
+def select_packed_mask_intervals(
+    graph_module: Any,
+    other_buffers: Any = (),
+    aux_scalar_symbol_codes: Any = None,
+) -> Any:
+    """The ranges of positions a mask keeps, or nothing if it is not ranges.
+
+    The four leading arguments are not the mask's: they are which batch, which
+    head, which query, and which window -- and they are the same in every mask,
+    which is why they are taken from the graph rather than passed.  A body with
+    fewer arguments, or with more than one answer, is not a mask this can read.
+
+    Nothing is answered when the mask keeps everything: a range that keeps
+    everything is the same as no mask at all, and a kernel carrying one is a
+    kernel with a mask in it that does nothing.
+    """
+
+    graph = graph_module.graph
+    nodes = list(graph.nodes)
+    placeholders = [node for node in nodes if node.op == "placeholder"]
+    output = [node for node in nodes if node.op == "output"]
+    if len(placeholders) < 4 or len(output) != 1:
+        return None
+    b_idx, h_idx, q_idx, kv_idx, *aux_placeholders = placeholders
+    output_val = output[0].args[0]
+    if not isinstance(output_val, FxNode):
+        return None
+
+    symbol_codes = dict(aux_scalar_symbol_codes or {})
+    placeholder_map = PackedMaskAuxPlaceholderMap.from_placeholders(
+        aux_placeholders, other_buffers, symbol_codes
+    )
+    if placeholder_map is None:
+        return None
+
+    analyzer = PackedMaskAnalyzer(
+        nonnegative_indices=(b_idx, h_idx, q_idx),
+        q_idx=q_idx,
+        kv_idx=kv_idx,
+        symbol_codes=symbol_codes,
+        placeholder_codes={
+            b_idx: "b_idx[0]",
+            h_idx: "h_idx[0]",
+            q_idx: "q_idx[0]",
+            **placeholder_map.codes,
+        },
+        placeholder_exprs=placeholder_map.exprs,
+    )
+    intervals = analyzer.node_to_intervals(output_val)
+    if intervals is None:
+        return None
+    if len(intervals) == 1 and intervals[0].is_full():
+        return None
+    return tuple(
+        interval.with_symbol_codes(analyzer.symbol_codes) for interval in intervals
+    )
+
+
 def is_bool_full_node(node: Any, value: bool) -> bool:
     """Whether a node is the graph's way of writing a single fixed truth value.
 
