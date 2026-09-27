@@ -688,6 +688,27 @@ def _find_names(obj):
 collected_calls: list = []
 
 
+def _resolve_load_device(device: int | None, device_type: str) -> int | None:
+    """The device a binary should be loaded onto, when it was not pinned to one.
+
+    A binary compiled without naming a device is the same binary everywhere, so
+    which device it belongs to is settled when it is loaded rather than when it
+    was built: what it is loaded onto is the device this process is on.  That is
+    what makes one binary serve a machine with several devices.
+
+    A processor has no device to be on, and asking one for its current device
+    would ask it for something it does not have, so a device that was named, and
+    a processor, are both taken at what they were given.
+    """
+
+    if device is not None or device_type == "cpu":
+        return device
+
+    from .benchmarking import get_interface_for_device
+
+    return get_interface_for_device(device_type.replace("hip", "cuda")).current_device()
+
+
 class CachingAutotuner(KernelInterface):
     """A kernel with several configurations, each compiled, the best one kept.
 
@@ -1071,76 +1092,6 @@ class CachingAutotuner(KernelInterface):
             )
         return TritonCompileResult(binary, cfg, compile_meta, self.inductor_meta)
 
-    def make_launcher(self):
-        """Write the launcher, with the binary already loaded onto the device."""
-
-        if not self.kernel.cubin_path:
-            self.reload_cubin_path()
-        # A kernel compiled without naming a device is the same binary for
-        # every device, so the loaded handles are kept per device rather than
-        # once.
-        self.kernel.device_agnostic = self.compile_meta.get("device") is None
-        device = _resolve_load_device(
-            self.compile_meta.get("device"),
-            self.compile_meta.get("device_type", "cuda"),
-        )
-        self.kernel.load_kernel(device)
-        scope = {"runner": self.kernel.run}
-
-        # A kernel has two kinds of constant: the ones it declares, and the
-        # ones the compiler finds constant on its own, such as an argument it
-        # never reads.  The binary has both folded away, so neither is passed
-        # -- and which arguments the runtime hands over depends on the version
-        # it is, so they are worked out the same way the ordinary result works
-        # them out, and the ones to pass are then chosen here.
-        _, def_args, none_args = self._get_arg_lists(
-            self.kernel.arg_names, self.kernel.declared_constexprs
-        )
-        call_args = [
-            arg
-            for i, arg in enumerate(self.kernel.arg_names)
-            if i not in self.kernel.full_constexprs and arg not in none_args
-        ]
-
-        runner_args = ["grid_0", "grid_1", "grid_2", "stream", *call_args]
-        pre_runner_lines, runner_args = self._host_tma_pre_runner_lines(
-            runner_args, call_args
-        )
-        launcher = self._gen_launcher_code(
-            scope, def_args, runner_args, pre_runner_lines=pre_runner_lines
-        )
-        launcher.config = self.config
-        launcher.n_regs = self.kernel.n_regs
-        launcher.n_spills = self.kernel.n_spills
-        launcher.shared = self.kernel.shared
-        launcher.cache_hash = triton_hash_to_path_key(self.kernel.hash)
-        launcher.store_cubin = False
-        launcher._is_static = True
-        return launcher
-
-
-class CannotStaticallyLaunchKernel(Exception):
-    """Why a compiled kernel cannot be launched from its binary alone."""
-
-
-class StaticTritonCompileResult(CompileResult[_T]):
-    """A compiled kernel launched from the binary already on disk.
-
-    A compiled kernel can normally be launched through the runtime, which
-    keeps what the launch needs alongside it.  Launched from the binary
-    instead, the kernel is loaded onto the device once and the launch becomes
-    a call with the arguments the binary expects -- and the setup that call
-    needs is far smaller, because none of the compile-time state travels with
-    it.
-
-    Whether a given kernel can be launched this way is asked rather than
-    assumed: several things can make it impossible, and each of them raises
-    :class:`CannotStaticallyLaunchKernel` naming which.  The question is asked
-    only when static launching is switched on, since a kernel that cannot be
-    launched this way is still perfectly launchable the ordinary way.
-    """
-
-    @staticmethod
     def can_statically_launch(kernel, inductor_meta, triton_meta, heuristic_type):
         """The form of this kernel that launches from its binary, if there is one."""
 
