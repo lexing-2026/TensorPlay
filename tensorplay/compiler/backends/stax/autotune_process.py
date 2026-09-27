@@ -46,6 +46,7 @@ __all__ = [
     "CppBenchmarkRequest",
     "NonzeroWorkspaceNotSupportedError",
     "TensorMeta",
+    "AsyncAutotuner",
     "CuteDSLBenchmarkRequest",
     "ExternKernelBenchmarkRequest",
     "ExternKernelCPUBenchmarkRequest",
@@ -53,6 +54,7 @@ __all__ = [
     "TritonBenchmarkRequest",
     "TritonCPUBenchmarkRequest",
     "TritonGPUBenchmarkRequest",
+    "run_autotune_in_subprocess",
 ]
 
 
@@ -1018,6 +1020,109 @@ def _run_with_subprocess_env(
 ) -> Any:
     _apply_subprocess_env_and_clear_caches(extra_env)
     return fn(*args, **kwargs)
+
+
+def run_autotune_in_subprocess(
+    benchmark_request: BenchmarkRequest,
+) -> float:
+    """Measure one candidate where a candidate may take the process with it.
+
+    A candidate that reads what it should not does not raise; it corrupts memory
+    and the process stops.  So the measurement is submitted to a process of its
+    own, and what comes back is a time -- or, where nothing came back because
+    the process did not, a time no candidate can reach, which is how a
+    candidate that cannot run here loses without anything having to understand
+    why.
+    """
+
+    try:
+        # The request is already a description of what to measure, so measuring
+        # it is a method on it rather than a step here.
+        timing = benchmark_request.benchmark()
+
+        return timing
+
+    except Exception:
+        autotuning_log.warning(
+            "Failed to benchmark choice %s",
+            benchmark_request,
+            exc_info=True,
+        )
+        # A time no candidate can beat, so it is never chosen.
+        return float("inf")
+
+
+class AsyncAutotuner:
+    """Measuring several candidates elsewhere, while this process gets on with it.
+
+    Measuring a candidate is slow and mostly waiting on the device, and the
+    device is the same one the rest of the program is compiling for.  So each
+    candidate is described here, sent to a process that will do the waiting, and
+    the answer collected later -- by which time the thing being compiled has
+    moved on and the device is free again.
+
+    What a candidate is measured against is part of the description, so a
+    candidate measured for one set of inputs is not the answer for another: the
+    description and what it was measured against together name one measurement,
+    and asking twice for the same one gets the same answer rather than two.
+    """
+
+    choice_hash_to_future = {}
+
+    @staticmethod
+    def get_choice_hash(choice: Any, inputs_key: str) -> str:
+        return choice.hash_key() + inputs_key
+
+    @classmethod
+    def start(cls, choices: list[Any], inputs_key: str):
+        """Send each candidate to be measured, and return at once.
+
+        A candidate already being measured is left alone: two measurements of
+        one candidate answer the same question, and the second would cost a
+        device's time to produce nothing.
+        """
+
+        for choice in choices:
+            choice_hash = AsyncAutotuner.get_choice_hash(choice, inputs_key)
+
+            if choice_hash in AsyncAutotuner.choice_hash_to_future:
+                continue
+
+            if getattr(choice, "bmreq", None) is None:
+                raise AssertionError(
+                    "this candidate carries no description of what to measure"
+                )
+
+            autotune_future = AutotuneProcessPool.get_instance().submit(
+                run_autotune_in_subprocess,
+                choice.bmreq,
+            )
+
+            AsyncAutotuner.choice_hash_to_future[choice_hash] = autotune_future
+
+    @classmethod
+    def get_results(
+        cls, choices: list[Any], inputs_key: str
+    ) -> dict[Any, float]:
+        """The times, waiting for whichever have not been read yet.
+
+        A candidate that was never sent has no time, and is left out rather than
+        given one: a time that was not measured is not a slow measurement, and
+        reading it as one would let an unmeasured candidate be chosen.
+        """
+
+        timings = {}
+        for choice in choices:
+            choice_hash = AsyncAutotuner.get_choice_hash(choice, inputs_key)
+            future = AsyncAutotuner.choice_hash_to_future.get(choice_hash)
+            if future is None:
+                autotuning_log.debug(
+                    "Skipping choice without a scheduled autotuning Future: %s",
+                    choice_hash,
+                )
+                continue
+            timings[choice] = future.result()
+        return timings
 
 
 class AutotuneProcessPool:
