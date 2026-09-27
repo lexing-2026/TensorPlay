@@ -704,6 +704,15 @@ memory_pool = os.environ.get("TP_MEMORY_POOL", "intermediates")
 #: costs a step and buys only the ability to look at the code on its own.
 cpp_wrapper = os.environ.get("TP_CPP_WRAPPER", "0") == "1"
 
+#: Whether a measured call may keep a result geometry that is still open.
+#:
+#: A candidate that has to be told the exact geometry cannot be measured
+#: against one that is still being decided, so with this off a call that is not
+#: a plain product has its result geometry settled before it is measured.  A
+#: plain product was historically left open, which is what the exemption below
+#: is.
+max_autotune_allow_flexible_layouts = False
+
 #: Mark the regions of a model in the generated code, so a profile says which
 #: part of the model a launch came from.
 annotate_training = os.environ.get("TP_ANNOTATE_TRAINING", "0") == "1"

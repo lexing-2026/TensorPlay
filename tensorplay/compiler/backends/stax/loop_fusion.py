@@ -33,6 +33,7 @@ from .ir import (
     FallbackKernel as IrFallbackKernel,
     ExternKernelAlloc,
     ExternKernelOut,
+    TritonTemplateBuffer,
 )
 from .loops import (
     V,
@@ -297,12 +298,20 @@ class KernelScheduler:
 
     def _build(self):
         for position, op in enumerate(self.graph.operations):
-            # Both kinds are a call out to something already written rather
-            # than a nest of loops this compiler is laying out: one is named by
-            # its overload, the other by the name it is launched under. Neither
-            # has a body to record, and asking one for its body is asking for
-            # something it does not have.
-            if isinstance(op, (IrFallbackKernel, ExternKernelOut, ExternKernelAlloc)):
+            # These are calls out to something already written rather than a
+            # nest of loops this compiler is laying out: one is named by its
+            # overload, the others by the name they are launched under. None of
+            # them has a body to record, and asking one for its body is asking
+            # for something it does not have.
+            if isinstance(
+                op,
+                (
+                    IrFallbackKernel,
+                    ExternKernelOut,
+                    ExternKernelAlloc,
+                    TritonTemplateBuffer,
+                ),
+            ):
                 node = ExternNode(
                     position,
                     op,

@@ -355,12 +355,23 @@ class MMKernelInputs(KernelInputs):
         return int(batch[0]) if batch else 1
 
     def result_dtype(self) -> Any:
-        """The result's element type: the one asked for, or the first matrix's."""
+        """The result's element type: the one asked for, or the first matrix's.
+
+        Asked of the operands themselves rather than of a record kept beside
+        them, because a caller that hands over the operands and nothing else is
+        saying what it has, and a type read from a record that was never filled
+        in is a type nobody asked for.
+        """
 
         if self._out_dtype is not None:
             return self._out_dtype
         first, _second = self.matrix_indices()
-        return self.dtypes[first] if self.dtypes else None
+        if self.dtypes:
+            return self.dtypes[first]
+        operands = self.nodes()
+        if not operands:
+            return None
+        return operands[first].get_dtype() if first < len(operands) else operands[0].get_dtype()
 
     def output_layout(self, flexible: bool = True) -> Layout:
         """Where the result lands: the batch, then the two free extents.

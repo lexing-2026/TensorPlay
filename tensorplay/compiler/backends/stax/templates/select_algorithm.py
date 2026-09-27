@@ -5937,9 +5937,18 @@ def _need_to_fix_layout(adjusted_choices: list, op_name: str) -> bool:
         ):
             return True
     if not (config.max_autotune or config.max_autotune_gemm):
+        # Nothing but the framework's own call is on the table, so the question
+        # is only whether the framework's own call wanted a settled geometry.
+        if not config.max_autotune_allow_flexible_layouts and op_name not in (
+            "mm",
+            "addmm",
+        ):
+            return True
         return False
-    # a measured candidate is a built kernel, and a built kernel's geometry is
-    # part of what it was built for
+    if not config.max_autotune_allow_flexible_layouts:
+        # a measured candidate is a built kernel, and a built kernel's geometry
+        # is part of what it was built for
+        return True
     return any(
         (not isinstance(ktc.template, ExternKernelCaller) for ktc in adjusted_choices)
     )

@@ -1551,10 +1551,6 @@ def make_reduction(x: TensorBox, dims, keepdim, dtype, device, rtype="sum", prol
     dims = sorted({normalize_dim(d, rank) for d in dims})
     out_ranges = [size[d] for d in range(rank) if d not in dims]
     red_ranges = [size[d] for d in dims]
-    # A body is only ever recorded over a value that is settled: the loader
-    # reads memory through the value's layout, and a layout that may still
-    # change is not one to read through.  Realizing settles it.
-    x.realize()
     loader = x.make_loader()
 
     def inner(index, rindex):
@@ -1575,7 +1571,11 @@ def make_reduction(x: TensorBox, dims, keepdim, dtype, device, rtype="sum", prol
         reduction_ranges=red_ranges,
         reduction_type=rtype,
     )
-    box.realize()
+    if isinstance(box.data.data, Reduction):
+        # A body that was unrolled into a body of its own is already settled;
+        # one that stayed a reduction can still take more work, and realizing
+        # it is what ends that.
+        box.realize()
     if keepdim:
         kept = [1 if d in dims else size[d] for d in range(rank)]
 

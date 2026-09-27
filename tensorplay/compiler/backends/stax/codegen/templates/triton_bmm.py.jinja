@@ -1,72 +1,80 @@
-{#-
-  A batched product: the same product as the plain one, with a batch dimension
-  in front of both matrices and the result.
-
-  The batch is the only difference, and it is deliberately not a loop: a batch
-  is an independent product, so the programs that would run one after another
-  are run side by side instead, and the batch is a third grid axis.  A loop
-  would compute the same numbers more slowly and would make the batch a factor
-  in the tile count, which is the wrong place for it.
--#}
 import triton
 import triton.language as tl
 
+{{def_kernel("A", "B")}}
+    M = {{size("A", -2)}}
+    N = {{size("B", -1)}}
+    K = {{size("A", -1)}}
+    BATCH = {{size("A", 0)}}
 
-{{ def_kernel("A", "B", outputs=("C",)) }}
-    M = {{ size("A", -2) }}
-    N = {{ size("B", -1) }}
-    K = {{ size("A", -1) }}
-    BATCH = {{ size("A", 0) }}
+    stride_aq = {{stride("A", 0)}}
+    stride_am = {{stride("A", 1)}}
+    stride_ak = {{stride("A", 2)}}
 
-    stride_am = {{ stride("A", 1) }}
-    stride_ak = {{ stride("A", 2) }}
-    stride_bk = {{ stride("B", 1) }}
-    stride_bn = {{ stride("B", 2) }}
-    stride_cm = {{ stride("C", 1) }}
-    stride_cn = {{ stride("C", 2) }}
+    stride_bq = {{stride("B", 0)}}
+    stride_bk = {{stride("B", 1)}}
+    stride_bn = {{stride("B", 2)}}
 
-    batch_id = tl.program_id(2)
-    pid = tl.program_id(0)
+    # based on triton.ops.matmul
+    pid = tl.program_id(0).to(INDEX_DTYPE)
     grid_m = (M + BLOCK_M - 1) // BLOCK_M
     grid_n = (N + BLOCK_N - 1) // BLOCK_N
 
-    # Programs are visited a column-block at a time within a group of rows, so
-    # that the programs running at the same moment are reading the same rows of
-    # both operands.  Shared rows are what a cache can hold on to; a flat order
-    # walks the whole first operand before coming back to the second.
+    # re-order program ID for better L2 performance
     width = GROUP_M * grid_n
     group_id = pid // width
     group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
     pid_m = group_id * GROUP_M + (pid % group_size)
-    pid_n = (pid % width) // group_size
+    pid_n = (pid % width) // (group_size)
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
 
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
-    rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
-    rk = tl.arange(0, BLOCK_K)
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(INDEX_DTYPE)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(INDEX_DTYPE)
+    if ((stride_am == 1 and stride_ak == M) or (stride_am == K and stride_ak == 1)) and (M >= BLOCK_M and K > 1):
+        ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+    else:
+        ram = rm % M
+    if ((stride_bk == 1 and stride_bn == K) or (stride_bk == N and stride_bn == 1)) and (N >= BLOCK_N and K > 1):
+        rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+    else:
+        rbn = rn % N
 
-    a_ptrs = A_ptr + batch_id * {{ stride("A", 0) }} + ram[:, None] * stride_am + rk[None, :] * stride_ak
-    b_ptrs = B_ptr + batch_id * {{ stride("B", 0) }} + rk[:, None] * stride_bk + rbn[None, :] * stride_bn
+    rk = tl.arange(0, BLOCK_K).to(INDEX_DTYPE)
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
+    # Reconstruct batch index from grid_y/grid_z split (handles batch > 65535)
+    idx_q = (tl.program_id(1) + tl.program_id(2) * tl.num_programs(1)).to(INDEX_DTYPE)
+    # Clamp to valid range for safe pointer arithmetic; out-of-bounds CTAs are
+    # masked off at the store below.
+    idx_q_clamped = tl.minimum(idx_q, BATCH - 1)
+    A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak + idx_q_clamped*stride_aq)
+    B = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn + idx_q_clamped*stride_bq)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+    {% if ASCENDING_K|default(false) %}
+    # XPU renders the K loop ascending (see MMTemplateConfigMixin.ascending_k).
+    for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+        k_remaining = K - k_idx * BLOCK_K
+    {% else %}
+    for k_remaining in range(K, 0, -BLOCK_K):
+    {% endif %}
         if EVEN_K:
-            a = tl.load(a_ptrs)
-            b = tl.load(b_ptrs)
+            a = tl.load(A)
+            b = tl.load(B)
         else:
-            k_tail = K - k * BLOCK_K
-            a = tl.load(a_ptrs, mask=rk[None, :] < k_tail, other=0.0)
-            b = tl.load(b_ptrs, mask=rk[:, None] < k_tail, other=0.0)
-{% if allow_tf32 %}
-        acc = tl.dot(a, b, acc, input_precision="tf32")
-{% else %}
-        acc = tl.dot(a, b, acc, input_precision="ieee")
-{% endif %}
-        a_ptrs += BLOCK_K * stride_ak
-        b_ptrs += BLOCK_K * stride_bk
+            a = tl.load(A, mask=rk[None, :] < k_remaining, other=0.)
+            b = tl.load(B, mask=rk[:, None] < k_remaining, other=0.)
+        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
+        A += BLOCK_K * stride_ak
+        B += BLOCK_K * stride_bk
 
-    c = acc.to(C_ptr.dtype.element_ty)
-    c_ptrs = C_ptr + batch_id * {{ stride("C", 0) }} + ram[:, None] * stride_cm + rbn[None, :] * stride_cn
-    c_mask = (rm[:, None] < M) & (rn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
+    # rematerialize rm and rn to save registers
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(INDEX_DTYPE)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(INDEX_DTYPE)
+    idx_q = (tl.program_id(1) + tl.program_id(2) * tl.num_programs(1)).to(INDEX_DTYPE)
+    idx_m = rm[:, None]
+    idx_n = rn[None, :]
+    mask = (idx_m < M) & (idx_n < N) & (idx_q < BATCH)
+
+    # inductor generates a suffix
+    {{store_output(("idx_q", "idx_m", "idx_n"), "acc", "mask", val_shape=("BLOCK_M", "BLOCK_N"))}}

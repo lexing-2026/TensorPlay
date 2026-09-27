@@ -44,7 +44,14 @@ from .mm_common import load_kernel_template
 from ..runtime.runtime_utils import get_max_y_grid
 from ..kernel_inputs import KernelInputs, MMKernelInputs
 from ..heuristics.template.params import DictKernelTemplateParams, KernelTemplateParams
-from ..ir import Layout
+from ..ir import (
+    ExternKernel,
+    FlexibleLayout,
+    Layout,
+    as_storage_and_layout,
+    is_storage_and_layout,
+)
+from ..loops import V
 from .triton import CHOICES, dtype_size
 import itertools
 from .ir import contiguous_stride, next_power_of_2
@@ -99,6 +106,19 @@ BMM = TritonTemplate(
 #: The operation namespace, under a name of this project's own, reached by
 #: whatever name this project's operations are registered under.
 framework = tp.ops.tp
+
+#: The framework's own batched product, measured against the templates here so
+#: that a template is only chosen where it beats what the framework already does.
+framework_bmm = ExternKernelChoice(
+    tp.ops.tp.bmm, "bmm_out", op_overload=tp.ops.tp.bmm.out,
+)
+
+#: The same product asked for a result of a type the inputs do not already
+#: have, which is a different call and so is measured on its own.
+framework_bmm_dtype = ExternKernelChoice(
+    tp.ops.tp.bmm, "bmm_out", name="bmm_dtype",
+    op_overload=tp.ops.tp.bmm.out,
+)
 
 framework_int_mm = ExternKernelChoice(
     tp.ops.tp._int_mm, "int_mm_out", name="int_mm",
@@ -203,7 +223,7 @@ def _bmm_shared_a_configs(dtype):
 
 
 @register_lowering(framework.bmm)
-def tuned_bmm(mat1, mat2, out_dtype=None, *, layout=None, plain=None):
+def tuned_bmm(mat1, mat2, out_dtype=None, *, layout=None):
     """A product over a leading axis, and the candidates to measure it with.
 
     Which of the two forms it is offered is decided here rather than at the call
@@ -212,32 +232,66 @@ def tuned_bmm(mat1, mat2, out_dtype=None, *, layout=None, plain=None):
     operands rather than a choice anybody makes.
     """
 
-    from .mm_common import mm_args
-
-    # What this needs of a product's two operands is the extents, the
-    # contraction, and the layout the result will have; the rest of the
-    # answer is the operands themselves, which are already in hand.
-    _m, n, k, out_layout = mm_args(mat1, mat2, layout=layout)[:4]
-    template = bmm_shared_a_template if _use_bmm_shared_a(
-        mat1, mat2, out_layout
-    ) else bmm_template
-    specs = ((0, None), (1, None))
-    sizes = (
-        tuple(int(v) for v in mat1.get_size()),
-        tuple(int(v) for v in mat2.get_size()),
+    from .mm_common import (
+        mm_args,
+        use_aten_gemm_kernels,
+        use_native_matmul,
+        use_triton_template,
     )
-    meta = {
-        "out_size": tuple(int(v) for v in out_layout.size),
-        "out_dtype": str(out_layout.dtype if out_dtype is None else out_dtype),
-        "device": out_layout.get_device(),
-        "operand_specs": specs,
-        "operand_sizes": sizes,
-        "operand_dtype": str(mat1.get_dtype()),
-        "qualifies": True,
-        "arg_templates": (),
-        "call_method": False,
-    }
-    return template.configurations(template.out_specs(meta), meta), meta
+    from ..kernel_inputs import MMKernelInputs
+    from .select_algorithm import autotune_select_algorithm, get_template_configs
+
+    # A call the framework's own product is better at is not offered a template
+    # at all: the measurement would be comparing two answers to a different
+    # question, and reporting the faster one as this call's best.
+    if use_native_matmul(mat1, mat2):
+        return None
+
+    m, n, k, layout, mat1, mat2 = mm_args(
+        mat1, mat2, layout=layout, out_dtype=out_dtype
+    )
+    name = "bmm"
+    kernel_inputs = MMKernelInputs([mat1, mat2], out_dtype=out_dtype)
+    log.info(
+        "Tuned product over a leading axis: batch=%s, m=%s, n=%s, k=%s, left=%s, right=%s, result=%s",
+        mat1.get_size()[0], m, n, k,
+        mat1.get_dtype(), mat2.get_dtype(), layout,
+    )
+
+    framework_handler = framework_bmm
+    framework_extra_kwargs = {}
+    if out_dtype:
+        if mat1.get_device().type != "cuda":
+            raise AssertionError("out_dtype is only supported for CUDA")
+        framework_handler = framework_bmm_dtype
+        framework_extra_kwargs = {"out_dtype": out_dtype}
+
+    templates_to_use: list = []
+    kwarg_overrides = {}
+    if use_aten_gemm_kernels():
+        templates_to_use.append(framework_handler)
+        kwarg_overrides[framework_handler.uid] = framework_extra_kwargs
+    if use_triton_template(layout, check_max_autotune=False):
+        templates_to_use.append(bmm_template)
+    choices = get_template_configs(
+        kernel_inputs, templates_to_use, name, kwarg_overrides=kwarg_overrides,
+    )
+    if use_triton_template(layout, check_max_autotune=False) and _use_bmm_shared_a(
+        mat1, mat2, layout
+    ):
+        log.info(
+            "Shared-left form offered for batch=%s m=%s n=%s k=%s",
+            mat2.get_size()[0], m, n, k,
+        )
+        for config in _bmm_shared_a_configs(mat1.get_dtype()):
+            bmm_shared_a_template.maybe_append_choice(
+                choices,
+                input_nodes=(mat1, mat2),
+                layout=layout,
+                **config,
+            )
+    node, _ = autotune_select_algorithm(name, choices, kernel_inputs.nodes(), layout)
+    return node
 
 
 @register_lowering(framework.baddbmm)

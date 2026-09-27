@@ -37,7 +37,6 @@ class _BatchedProductConfigs(TemplateConfigHeuristics):
     group_m = 8
 
     def _get_template_configs_impl(self, kernel_inputs, op_name):
-        yield {"choice": "operator"}
         rows, cols, inner = kernel_inputs.mnk_symbolic()
         device_type = kernel_inputs.device_type
         for config in CHOICES.get_mm_configs(device_type)(

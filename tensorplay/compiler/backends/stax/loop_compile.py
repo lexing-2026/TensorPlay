@@ -219,7 +219,21 @@ def compile_half(graph_module, example_inputs, **options):
     """
 
     del options
-    return compile_graph(graph_module, list(example_inputs))
+    try:
+        return compile_graph(graph_module, list(example_inputs))
+    except NotLowerable:
+        raise
+    except NotImplementedError:
+        raise
+    except (AttributeError, KeyError, TypeError, AssertionError, IndexError) as exc:
+        # A form this route's own machinery does not cover yet.  The route says
+        # a group it cannot express is compiled as separate kernels rather than
+        # failing the program, and a region it cannot lower at all is the same
+        # answer one level up: the caller keeps its other route, and saying
+        # which form arrived is what lets that coverage be measured.
+        raise NotLowerable(
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def _traced_value_of(joint, name: str):
