@@ -170,4 +170,55 @@ std::string capture_stacktrace_unconditional() {
 
 #endif
 
+std::vector<StackFrame> get_stack_frames() {
+    std::vector<StackFrame> out;
+#if defined(_WIN32)
+    // The Windows capture above produces one string for the whole stack; there
+    // is no per-frame form to hand back, so an empty result says "nothing
+    // captured" rather than inventing frames.
+    (void)out;
+#elif defined(__linux__) || defined(__APPLE__)
+    void* frames[64];
+    int n = ::backtrace(frames, 64);
+    if (n <= 0) {
+        return out;
+    }
+    char** symbols = backtrace_symbols(frames, n);
+    if (!symbols) {
+        return out;
+    }
+    out.reserve(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        StackFrame f;
+        // backtrace_symbols format: "module(mangled_name+0xoffset) [addr]"
+        const std::string text = symbols[i];
+        const size_t begin = text.find('(');
+        const size_t end =
+            (begin == std::string::npos) ? std::string::npos : text.find(')', begin);
+        if (begin != std::string::npos && end != std::string::npos && end > begin) {
+            f.filename = text.substr(0, begin);
+            const size_t plus = text.find('+', begin + 1);
+            const size_t name_len = (plus != std::string::npos && plus < end)
+                                        ? plus - begin - 1
+                                        : end - begin - 1;
+            const std::string mangled = text.substr(begin + 1, name_len);
+            int status = -1;
+            char* demangled =
+                abi::__cxa_demangle(mangled.c_str(), nullptr, nullptr, &status);
+            if (status == 0 && demangled != nullptr) {
+                f.function = demangled;
+                std::free(demangled);
+            } else {
+                f.function = mangled;
+            }
+        } else {
+            f.function = text;
+        }
+        out.push_back(std::move(f));
+    }
+    std::free(symbols);
+#endif
+    return out;
+}
+
 } // namespace tensorplay

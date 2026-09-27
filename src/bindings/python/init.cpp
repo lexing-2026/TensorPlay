@@ -40,13 +40,9 @@ namespace python {
 // code) and hands plain bytes to the profiler; the next OpRecord on this
 // thread adopts it and clears the slot, so composite inner ops record no
 // stack instead of inheriting the outermost call's.
-void tpx_prof_capture_site() {
-    if (!tensorplay::prof::g_active.load(std::memory_order_acquire)) return;
-    if (!tensorplay::prof::g_capture_sites.load(std::memory_order_acquire)) {
-        return;
-    }
+std::vector<tensorplay::prof::ProfFrame> current_python_frames() {
     PyFrameObject* frame = PyEval_GetFrame();  // borrowed
-    if (frame == nullptr) return;
+    if (frame == nullptr) return {};
     std::vector<tensorplay::prof::ProfFrame> frames;
     frames.reserve(8);
     PyFrameObject* owned = nullptr;  // frame refs from PyFrame_GetBack
@@ -70,6 +66,15 @@ void tpx_prof_capture_site() {
         ++depth;
     }
     Py_XDECREF(owned);
+    return frames;
+}
+
+void tpx_prof_capture_site() {
+    if (!tensorplay::prof::g_active.load(std::memory_order_acquire)) return;
+    if (!tensorplay::prof::g_capture_sites.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::vector<tensorplay::prof::ProfFrame> frames = current_python_frames();
     if (frames.empty()) return;
     tensorplay::prof::set_python_stack(std::move(frames));
 }
@@ -1508,6 +1513,26 @@ PYBIND11_MODULE(_C, m) {
     });
     m.def("_profiler_user_end", []() {
         tensorplay::prof::user_span_end();
+    });
+    // On-demand capture of the caller's Python frames, for a caller that wants
+    // a call site recorded outside a profiling session -- the same walk the
+    // session hook does, asked for directly.
+    m.def("_gather_python_traceback", []() {
+        py::list out;
+        for (auto& f : tensorplay::python::current_python_frames()) {
+            out.append(py::make_tuple(f.file, f.line, f.func));
+        }
+        return out;
+    });
+    // The native frames of the current stack, as (file, line, function).  The
+    // line is zero where the runtime could not say it, which is the usual case
+    // for a frame that has already returned.
+    m.def("_gather_native_traceback", []() {
+        py::list out;
+        for (auto& f : tensorplay::get_stack_frames()) {
+            out.append(py::make_tuple(f.filename, f.lineno, f.function));
+        }
+        return out;
     });
     m.def("_profiler_emit_nvtx", [](bool on) {
         tensorplay::prof::g_emit_nvtx.store(on,
