@@ -279,6 +279,47 @@ class GridExpr:
         grid.generate(cfg)
         return grid
 
+    def generate_lazy(self, kernel_name: str) -> None:
+        """Build this grid for a kernel that will be configured later.
+
+        Which extents a launch runs with is not known when the launch is
+        written, only when it runs, so here the block sizes are named after
+        where the result will be found rather than given as values.  The
+        checks a real value would be checked against are left to that point:
+        what is being written now cannot fail, and a check that cannot fail
+        only says so.
+        """
+
+        meta: dict[str, Any] = {
+            "XBLOCK": f"{kernel_name}_result.xblocks[0]",
+            "YBLOCK": f"{kernel_name}_result.yblocks[0]",
+            "ZBLOCK": f"{kernel_name}_result.zblocks[0]",
+            "R0_BLOCK": f"{kernel_name}_result.r0blocks[0]",
+            "RSPLIT": f"{kernel_name}_result.rsplit",
+            "RSPLIT_SIZE": f"{kernel_name}_result.rsplit_size",
+        }
+        # assertions are done based on real values, so we can skip here
+        self.generate(meta, is_lazy=True)
+
+    @classmethod
+    def from_meta_lazy(
+        cls,
+        inductor_meta,
+        kernel_name: str,
+    ) -> "GridExpr":
+        """The grid a launch asked for by name, for a kernel configured later."""
+        if inductor_meta is None:
+            raise AssertionError("inductor_meta must be specified for lazy compile")
+        grid_type = inductor_meta.get("grid_type", None)
+        if grid_type is None:
+            raise AssertionError("grid_type must be specified for lazy compile")
+        grid_cls = globals()[grid_type]
+        if not issubclass(grid_cls, GridExpr):
+            raise AssertionError(f"Expected GridExpr subclass, got {grid_cls}")
+        grid = grid_cls(inductor_meta=inductor_meta, mode="cpp")
+        grid.generate_lazy(kernel_name)
+        return grid
+
     def eval_slow(self, meta: dict[str, int]):
         """The three extents as numbers, worked out here rather than at launch.
 
@@ -314,6 +355,59 @@ class GridExpr:
             return default
         assert isinstance(val, int)
         return val
+
+
+class MixOrderReductionGrid(GridExpr):
+    """A reduction whose partial sums are combined by a kernel of its own.
+
+    The split has to divide the work evenly, or the combine step waits on a
+    partial sum that is shorter than the others and the whole reduction waits
+    with it.  So the split is refused here rather than producing a launch that
+    is correct and slow.
+    """
+
+    def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
+        split_size = meta.get("RSPLIT_SIZE")
+        xblock = meta.get("XBLOCK")
+        if not is_lazy:
+            if not split_size:
+                raise AssertionError("Missing RSPLIT_SIZE")
+            if not xblock:
+                raise AssertionError("Missing XBLOCK")
+            if split_size % xblock != 0:
+                raise AssertionError(f"{split_size=}, {xblock=}")
+        self.x_grid = self.ceildiv("xnumel", split_size)
+
+
+class CooperativeReductionGrid(GridExpr):
+    """A reduction whose partial sums are combined by the blocks themselves.
+
+    Nothing is launched afterwards, so the second axis is the work and the
+    first is the split, and the two are not free to trade places: the number
+    of partial sums is what the first axis was chosen to be.
+    """
+
+    def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
+        self.x_grid = str(meta["RSPLIT"])
+        self.y_grid = self.ceildiv("xnumel", meta.get("XBLOCK"))
+
+
+class SplitScanGrid(GridExpr):
+    """A scan whose sequential part is carried by a kernel of its own.
+
+    One element per block along the sequential axis, because a block that
+    took two would have to order them itself, which is the work the separate
+    kernel is there to do.
+    """
+
+    def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
+        if not is_lazy:
+            if meta.get("XBLOCK", 1) != 1:
+                raise AssertionError(
+                    f"Expected XBLOCK == 1 for SplitScanGrid, got {meta.get('XBLOCK', 1)}"
+                )
+        self.x_grid = self.ceildiv("r0_numel", meta.get("R0_BLOCK"))
+        self.y_grid = "xnumel"
 
 
 class FixedGrid(GridExpr):
@@ -3157,3 +3251,169 @@ class DebugAutotuner(CachingAutotuner):
                 # An ahead-of-time run calls the kernel, and its timing was
                 # measured where the kernel was chosen.
                 collected_calls.append(self.cached)
+
+
+class ComboKernelGrid(GridExpr):
+    """Several kernels run as one launch, over a grid that covers all of them.
+
+    One launch for several kernels saves the launches but not the work, so the
+    grid has to be big enough for whichever of them has the most to do, and
+    every block has to be able to tell which kernel it belongs to -- hence a
+    per-kernel extent and a flag saying whether that kernel has one at all.
+    """
+
+    def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
+        combo_meta = self.inductor_meta["combo_grid_meta"]
+        if combo_meta["default_config"]:
+            meta = {**combo_meta["default_config"], **meta}
+        no_x_dims = []
+        xnumels = []
+        ynumels = []
+
+        for num in range(combo_meta["num_kernels"]):
+            if (
+                combo_meta[f"xnumel_{num}"] is not None
+                and combo_meta[f"xnumel_{num}"] <= 0
+            ):
+                raise AssertionError(
+                    f"xnumel_{num} must be None or positive, got {combo_meta[f'xnumel_{num}']}"
+                )
+            no_x_dims.append(combo_meta[f"no_x_dim_{num}"])
+            xnumels.append(combo_meta[f"xnumel_{num}"] or f"xnumel_{num}")
+            if f"ynumel_{num}" in combo_meta:
+                ynumels.append(combo_meta[f"ynumel_{num}"] or f"ynumel_{num}")
+
+        self.x_grid = self.combo_x_grid(xnumels, no_x_dims, meta)
+        if combo_meta["min_blocks"]:
+            self.x_grid = self.maximum([self.x_grid, combo_meta["min_blocks"]])
+        if ynumels:
+            self.prefix.extend(
+                [
+                    self.assign_tmp(
+                        "y_grid_raw_",
+                        self.ceildiv(self.maximum(ynumels), meta.get("YBLOCK")),
+                    ),
+                    self.assign_tmp(
+                        "y_grid_div_", self.ceildiv("y_grid_raw_", get_max_y_grid())
+                    ),
+                ]
+            )
+            ceildiv_expr = self.ceildiv("y_grid_raw_", "y_grid_div_")
+            if self.mode == "python":
+                self.y_grid = f"(0 if y_grid_div_ == 0 else {ceildiv_expr})"
+            else:
+                self.y_grid = f"(y_grid_div_ == 0 ? 0 : {ceildiv_expr})"
+            self.z_grid = "y_grid_div_"
+
+    def combo_x_grid(
+        self,
+        xnumels: list,
+        no_x_dims: list[bool],
+        meta: dict[str, int],
+    ):
+        raise NotImplementedError
+
+
+class SequentialComboKernelGrid(ComboKernelGrid):
+    """Kernels run one after another, so the grid is the sum of their blocks.
+
+    Sequential rather than interleaved, so a block that belongs to a later
+    kernel waits for an earlier one; the launch is one, and what it waits for
+    is inside it.
+    """
+
+    def combo_x_grid(
+        self,
+        xnumels: list,
+        no_x_dims: list[bool],
+        meta: dict[str, int],
+    ):
+        if len(xnumels) != len(no_x_dims):
+            raise AssertionError(
+                f"xnumels and no_x_dims length mismatch: {len(xnumels)} != {len(no_x_dims)}"
+            )
+        return self.summation(
+            [
+                self.ceildiv(x, 1 if no_x_dim else meta.get("XBLOCK"))
+                for x, no_x_dim in zip(xnumels, no_x_dims)
+            ]
+        )
+
+
+class SequentialFlattenComboKernelGrid(GridExpr):
+    """Kernels run one after another, with each one's two extents folded together.
+
+    Folding the two extents of each kernel into one makes the blocks of the
+    whole launch a single range, so a block can find its kernel by where it
+    falls rather than by a pair of coordinates that have to be taken apart
+    again.
+    """
+
+    def generate_lazy(self, kernel_name: str) -> None:
+        combo_meta = self.inductor_meta["combo_grid_meta"]
+        num_kernels = combo_meta["num_kernels"]
+        meta: dict[str, Any] = {}
+        for i in range(num_kernels):
+            meta[f"XBLOCK_{i}"] = f"{kernel_name}_result.xblocks[{i}]"
+            meta[f"YBLOCK_{i}"] = f"{kernel_name}_result.yblocks[{i}]"
+        self.generate(meta, is_lazy=True)
+
+    def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
+        combo_meta = self.inductor_meta["combo_grid_meta"]
+        if combo_meta["default_config"]:
+            meta = {**combo_meta["default_config"], **meta}
+
+        total_blocks_list = []
+        for num in range(combo_meta["num_kernels"]):
+            xnumel = combo_meta[f"xnumel_{num}"]
+            if xnumel is not None and xnumel <= 0:
+                raise AssertionError(
+                    f"xnumel_{num} must be None or positive, got {xnumel}"
+                )
+            xnumel = xnumel or f"xnumel_{num}"
+            x_blocks = self.ceildiv(
+                xnumel,
+                1 if combo_meta[f"no_x_dim_{num}"] else meta.get(f"XBLOCK_{num}"),
+            )
+            y_blocks = (
+                self.ceildiv(
+                    combo_meta[f"ynumel_{num}"] or f"ynumel_{num}",
+                    meta.get(f"YBLOCK_{num}"),
+                )
+                if f"ynumel_{num}" in combo_meta
+                else 1
+            )
+            total_blocks_list.append(self.product([x_blocks, y_blocks]))
+
+        self.x_grid = self.summation(total_blocks_list)
+        if combo_meta["min_blocks"]:
+            self.x_grid = self.maximum([self.x_grid, combo_meta["min_blocks"]])
+        self.y_grid = 1
+        self.z_grid = 1
+
+
+class RoundRobinComboKernelGrid(ComboKernelGrid):
+    """Kernels interleaved block by block, each kernel's blocks spread evenly.
+
+    Interleaved so that a kernel with much less to do does not finish early
+    and leave the rest of the launch idle; the grid is as large as the largest
+    kernel's, and every block is given a kernel, so no block is wasted on
+    work that is already done.
+    """
+
+    def combo_x_grid(
+        self,
+        xnumels: list,
+        no_x_dims: list[bool],
+        meta: dict[str, int],
+    ) -> str:
+        if len(xnumels) != len(no_x_dims):
+            raise AssertionError(
+                f"xnumels and no_x_dims length mismatch: {len(xnumels)} != {len(no_x_dims)}"
+            )
+        num_kernels = self.inductor_meta["combo_grid_meta"]["num_kernels"]
+        exprs = [x for x, no_x_dim in zip(xnumels, no_x_dims) if no_x_dim]
+        xnumels_x_dim = [x for x, no_x_dim in zip(xnumels, no_x_dims) if not no_x_dim]
+        if xnumels_x_dim:
+            exprs.append(self.ceildiv(self.maximum(xnumels_x_dim), meta.get("XBLOCK")))
+        return f"({self.maximum(exprs)}) * {num_kernels}"
