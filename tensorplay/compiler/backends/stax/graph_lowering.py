@@ -36,7 +36,7 @@ from .utils import (
     ValueWithLineMap,
 )
 from ....graph.interpreter import Interpreter
-from .codegen.common import FileBackedGraphModule
+from .codegen.common import FileBackedGraphModule, get_device_op_overrides
 from .sizevars import SizeVarAllocator
 from .virtualized import V
 from .ir import (
@@ -48,6 +48,7 @@ from .ir import (
     Constant,
     ConstantBuffer,
     EffectfulKernel,
+    NoneAsConstantBuffer,
     ShapeAsConstantBuffer,
     OpaqueMultiOutput,
     OpaqueObjectState,
@@ -1133,6 +1134,49 @@ class GraphLowering(Interpreter):
             return self.get_dtype(m.group(1))
         raise KeyError(f"could not find {buffer_name}")
 
+    def get_numel(self, buffer_name: str):
+        """How many elements a named buffer holds.
+
+        A buffer this region made is asked directly.  A constant is asked
+        through the value it stands for, which is known even where no buffer
+        was made for it.  A name that is none of those was never declared, and
+        saying so is better than answering zero and letting a kernel be shaped
+        to nothing.
+        """
+
+        if buffer_name in self.constants:
+            return self.constants[buffer_name].numel()
+        if buffer_name in self.name_to_buffer:
+            buf = self.name_to_buffer[buffer_name]
+            if not buf.has_tensor_output():
+                return 1
+            return buf.get_numel()
+        if buffer_name in self.graph_inputs:
+            return self.graph_inputs[buffer_name].get_numel()
+        raise KeyError(f"could not find {buffer_name}")
+
+    def _get_output_names(self, graph_outputs):
+        """What each of a region's outputs is called where it is handed back.
+
+        Most outputs are named after the buffer they were written into, which
+        is a name the whole compiler already agrees on.  Two kinds are not: an
+        output standing for the absence of a value, and one standing for a
+        shape, have no buffer behind them, so each is given a name of its own
+        -- counted, so that a region with two of either gives them two names.
+        """
+
+        names = []
+        shape_counter = itertools.count(0)
+        none_counter = itertools.count(0)
+        for node in graph_outputs:
+            if isinstance(node, NoneAsConstantBuffer):
+                names.append(f"{self.name}_none{next(none_counter)}")
+            elif isinstance(node, ShapeAsConstantBuffer):
+                names.append(f"{self.name}_shape{next(shape_counter)}")
+            else:
+                names.append(node.get_name())
+        return names
+
     def get_current_device_or_throw(self):
         """The device being emitted for, and a refusal when there is none.
 
@@ -1537,8 +1581,16 @@ class GraphLowering(Interpreter):
             return example
 
         sizes, strides = self.static_sizes_strides(example)
-        buffer = InputBuffer(name=name, layout=FixedLayout(example.device, example.dtype, sizes, strides))
-        tensor = TensorBox(buffer)
+        buffer = InputBuffer(
+            name=name,
+            layout=FixedLayout(example.device, example.dtype, sizes, strides),
+        )
+        # A value is made out of a box that decides what to do with it, over
+        # storage that decides where the bytes are.  An input is not computed,
+        # so its storage is a buffer that was handed to us rather than one this
+        # region made -- which is the fact that later frees a caller back to
+        # being able to go on holding it.
+        tensor = TensorBox.create(buffer)
 
         self.name_to_buffer[buffer.name] = buffer
         self.buffers.append(buffer)
@@ -1697,6 +1749,12 @@ class GraphLowering(Interpreter):
         only_cpu = len(device_types) == 0
         self.device_type = "cpu" if only_cpu else device_types.pop()
 
+        # The device this region's code is written for is asked how to spell
+        # the things a wrapper cannot spell for itself -- which device to make
+        # current, which stream to wait on -- before the wrapper is made, so
+        # that the wrapper is never written without them.
+        self.device_ops = get_device_op_overrides(self.device_type)
+
         wrapper_code_gen_cls = get_wrapper_codegen_for_device(
             self.device_type, self.cpp_wrapper, self.fx_wrapper
         )
@@ -1743,14 +1801,11 @@ class GraphLowering(Interpreter):
 
         from .codecache import PyCodeCache
 
-        output_code_log.debug("Output code: \n%s", wrapper_code.value)
-
         linemap = [
             (line_no, node.stack_trace)
             for line_no, node in wrapper_code.line_map
         ]
         key, path = PyCodeCache.write(wrapper_code.value)
-        output_code_log.debug("Output code written to: %s", path)
 
         mod = PyCodeCache.load_by_key_path(
             key,

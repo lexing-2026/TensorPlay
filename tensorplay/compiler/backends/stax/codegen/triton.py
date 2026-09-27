@@ -24,7 +24,7 @@ import itertools
 import math
 import re
 import sympy
-from typing import Any
+from typing import Any, Callable, Iterable, Sequence, TYPE_CHECKING, TypeVar, cast
 
 import contextlib
 from functools import lru_cache
@@ -34,6 +34,14 @@ import operator
 import tensorplay as tp
 
 log = logging.getLogger(__name__)
+
+#: The compiler that hands a written-out kernel to whoever will run it.  It is
+#: asked once here rather than made per call, because what it holds is the set
+#: of kernels already handed over, and a set held per call is a set that
+#: remembers nothing -- which is the whole of what a second call saves.
+from ..async_compile import AsyncCompile
+
+async_compile = AsyncCompile()
 
 from .....graph.experimental.sympy_functions import (
     OrderedSet,
@@ -48,7 +56,26 @@ from tensorplay.utils._triton import (
     has_triton_cpu_backend,
     has_triton_stable_tma_api,
 )
-from ..utils import TMA_ALIGNMENT, TRITON_FLOAT8_DTYPES, _TMA_SUPPORTED_DTYPES, identity
+from ..utils import (
+    _TMA_SUPPORTED_DTYPES,
+    DelayReplaceLine,
+    device_supports_fp64,
+    free_symbol_is_type,
+    get_bounds_index_expr,
+    get_triton_version,
+    has_triton_package,
+    identity,
+    is_welford_reduction,
+    Placeholder,
+    prefix_is_reduction,
+    sympy_dot,
+    sympy_product,
+    sympy_subs,
+    TMA_ALIGNMENT,
+    TRITON_FLOAT8_DTYPES,
+    triton_version_uses_attrs_dict,
+    upcast_compute_type,
+)
 from ..heuristics.template.base import next_power_of_2
 from .triton_utils import (
     config_of,
@@ -68,8 +95,16 @@ from ..runtime.hints import (
     TRITON_MAX_RSPLIT,
     AutotuneHint,
     DeviceProperties,
+    get_warp_size,
     ReductionHint,
     TileHint,
+    TritonMeta,
+)
+from ..scheduler import (
+    BaseSchedulerNode,
+    FusedExternTritonKernelSchedulerNode,
+    FusedSchedulerNode,
+    SchedulerNode,
 )
 from ..shape_propagation import get_broadcasted_shape
 from .common import (
@@ -383,6 +418,47 @@ from .simd_kernel_features import (
     tiling_scores_suggest_inner_reduction,
 )
 from .wrapper import SymbolicCallArg
+
+from ..runtime.runtime_utils import (
+    get_max_y_grid,
+)
+from ..runtime.benchmark_report import (
+    get_kernel_category_by_source_code,
+)
+from ..ir import (
+    IRNode,
+    get_kernel_metadata,
+)
+from ..loop_body import (
+    identity,
+)
+from ..ops_handler import (
+    DefaultHandler,
+    ReductionType,
+    StoreMode,
+)
+from ..codegen.block_analysis import (
+    BlockPatternMatcher,
+)
+from ..codegen.index_expr import (
+    FloorDiv,
+    ModularIndexing,
+)
+from ..stream_utils import (
+    coor_benchmark_device_idx,
+    coor_device_str,
+    get_raw_stream_name,
+)
+from ..debug import (
+    set_kernel_post_grad_provenance_tracing,
+)
+from ..runtime import (
+    triton_heuristics,
+)
+from ..codegen.simd_kernel_features import (
+    SIMDKernelFeatures,
+)
+
 
 
 @dataclasses.dataclass
@@ -8990,8 +9066,9 @@ class TritonScheduling(SIMDScheduling):
         keeps two kernels of the same kind and the same operations apart.
         """
 
-        from .common import get_path
-        from ..utils import code_hash, get_fused_kernel_name
+        from ..codecache import get_path
+        from ..codecache import code_hash
+        from ..utils import get_fused_kernel_name
 
         wrapper = V.graph.wrapper_code
         if src_code in wrapper.src_to_kernel:

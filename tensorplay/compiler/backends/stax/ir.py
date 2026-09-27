@@ -487,6 +487,7 @@ def is_triton(x) -> bool:
     if not isinstance(device_scheduling, type):
         raise AssertionError(type(device_scheduling))
     return issubclass(device_scheduling, TritonScheduling)
+    from .codegen.common import get_scheduling_for_device
 
 
 def get_device_type(x):
@@ -9925,9 +9926,17 @@ class FallbackKernel(ExternKernelAlloc):
             raise AssertionError("Expected len(self.mutation_names) <= 1")
         return self.mutation_names
 
-    @property
     def codegen_args(self) -> list:
-        """The tensor arguments, in the order the call is written."""
+        """The arguments of the call, each already written as the wrapper writes it.
+
+        The tensor arguments are asked how to refer to themselves, and what
+        comes back is held by a shim whose printed form is that reference -- so
+        that an argument which is a view of another, or a slice of one, is
+        written as the view rather than as the buffer behind it.  The named
+        arguments are then sorted back out of the flat list they arrive in, and
+        kept on this kernel for the call to read, since a call may be written
+        with some of its arguments named and some positional.
+        """
 
         @dataclasses.dataclass
         class Shim:
@@ -9940,9 +9949,10 @@ class FallbackKernel(ExternKernelAlloc):
             raise AssertionError("Expected is_node_sequence(self.inputs)")
         tensor_args = [Shim(x.codegen_reference()) for x in self.inputs]
         args, kwargs = self.unflatten_args(tensor_args, self.constant_args)
-        return self._codegen_args(args, kwargs)
+        args = [V.graph.wrapper_code.val_to_arg_str(x) for x in args]
+        self.kwargs.update(kwargs)
+        return args
 
-    @property
     def codegen(self, wrapper) -> None:
         """Ask the wrapper to write the call that runs this operation.
 
@@ -9955,7 +9965,7 @@ class FallbackKernel(ExternKernelAlloc):
         kernel = self.op_overload
         if kernel is None:
             raise AssertionError("Expected kernel is not None")
-        return wrapper.codegen_fallback_kernel(self)
+        return wrapper.generate_fallback_kernel(self)
 
     @classmethod
     def create(cls, kernel, *args, **kwargs):

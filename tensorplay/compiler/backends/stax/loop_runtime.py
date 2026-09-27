@@ -229,6 +229,7 @@ class ExternStep(Step):
             return launch
         except Exception:  # noqa: BLE001 - a template never breaks the region
             return None
+        from .op_lowerings import select
 
     def _probe_launcher(self):
         """The operator run on a probe feed instead of this call's tensors."""

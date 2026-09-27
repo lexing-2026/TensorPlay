@@ -44,7 +44,6 @@ from tensorplay.utils import _pytree as pytree
 from .autotune_process import PrecompileThreadPool, use_pipelined_autotuning
 from .codecache import LambdaFuture, PyCodeCache
 from .ir import TritonTemplateCallerBase
-from .templates.select_algorithm import TritonTemplateCaller
 from .stream_utils import get_stream_name
 from tensorplay.graph.experimental.symbolic_shapes import free_symbols
 from tensorplay.graph.experimental.sympy_functions import FloorDiv, Identity
@@ -2043,6 +2042,7 @@ class BaseSchedulerNode:
                             input_buf.get_name()
                         )
                         break
+        from .codegen.simd import SIMDKernel
 
     def codegen_originating_info(
         self, buffer: IndentedBuffer, only_once: bool = True
@@ -2276,6 +2276,8 @@ class BaseSchedulerNode:
         flops = count_flops_fx(fx_node)
         if flops is None:
             return None
+
+        from .utils import counters
 
         if isinstance(flops, tp.SymInt):
             flops = flops.node.expr
@@ -5889,6 +5891,7 @@ class Scheduler:
                 return True
 
         return False
+        from .templates.select_algorithm import should_use_layout_constraints
 
     def finalize_multi_template_buffers(self) -> None:
         """
@@ -5969,6 +5972,7 @@ class Scheduler:
 
                 out_buffer.layout = multi_node.layout
                 self._replace_node(out_buffer, multi_node, i, node)
+        from .templates.select_algorithm import ExternKernelCaller
 
     def _replace_node(
         self,
@@ -6278,6 +6282,7 @@ class Scheduler:
                     and hasattr(choice, "allowed_prologue_inps")
                     and choice.allowed_prologue_inps != multi_node.allowed_prologue_inps
                 )
+                from .templates.select_algorithm import TritonTemplateCaller
 
             def compile_without_benchmarking(
                 choice: TritonTemplateCaller,
@@ -6643,6 +6648,7 @@ class Scheduler:
             return FusionResult.from_callable(
                 callable_fn=benchmark_when_ready, future=future_and_mod_l1_fused[0]
             )
+        from .templates.select_algorithm import TritonTemplateCaller
 
     def get_fused_node(self, node: BaseSchedulerNode) -> BaseSchedulerNode:
         "Look up the node in Scheduler name_to_fused_node"
@@ -9854,6 +9860,8 @@ class Scheduler:
         # the current kernel from where 'allocate' retrieve those decisions.
         # We have to make sure there is a non-NULL kernel handler to store
         # those inplace update decisions.
+        from .utils import counters
+
         counters["inductor"]["extern_calls"] += 1
         with V.set_kernel_handler(Kernel(increase_kernel_count=False)):
             scheduler_node.decide_inplace_update()
@@ -10747,6 +10755,7 @@ class Scheduler:
                 raise AssertionError(
                     f"Expect {num_partitions} partition maps but got {len(V.graph.partition_maps)}"
                 )
+        from .utils import counters
 
     def _codegen(self, nodes: list[BaseSchedulerNode]) -> None:
         if config.check_stack_no_cycles_TESTING_ONLY:

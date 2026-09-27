@@ -16,7 +16,8 @@ from ......graph.experimental.sympy_functions import CeilDiv
 import functools
 from typing import Any, Callable, Iterator, Sequence
 
-from ...runtime.runtime_utils import ceildiv, next_power_of_2
+from ...op_lowerings import ceildiv
+from ...runtime.runtime_utils import next_power_of_2
 from .params import DictKernelTemplateParams
 
 class SymbolicGridFn:

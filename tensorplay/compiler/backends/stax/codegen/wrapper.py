@@ -25,6 +25,7 @@ import tensorplay as tp
 from tensorplay._ops import OpOverload
 
 from .. import async_compile, config, ir, metrics
+from ..runtime import triton_heuristics
 from ..codegen.common import PythonPrinter
 from .. import loops, sympy_utils
 from ..loops import V

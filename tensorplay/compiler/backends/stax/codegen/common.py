@@ -17,6 +17,7 @@ import contextlib
 import dataclasses
 import enum
 import operator
+import threading
 import atexit
 import functools
 import math
@@ -50,6 +51,161 @@ from .....primitives.common import ELEMENTWISE_TYPE_PROMOTION_KIND
 from .. import config, metrics
 
 log = logging.getLogger(__name__)
+
+
+class DeviceOpOverrides:
+    """The parts of a wrapper that are written in a device's own words.
+
+    A wrapper has to name the device it is running on -- say which device to
+    make current, which stream to run on, how to wait for that stream -- and
+    each device spells those differently.  So a device is asked for them rather
+    than the wrapper naming them itself, and a device that cannot answer one
+    says so rather than the wrapper writing a call that would not be there.
+    """
+
+    def import_get_raw_stream_as(self, name: str) -> str:
+        raise NotImplementedError
+
+    def set_device(self, device_idx) -> str:
+        raise NotImplementedError
+
+    def synchronize(self) -> str:
+        raise NotImplementedError
+
+    def device_guard(self, device_idx) -> str:
+        raise NotImplementedError
+
+    def current_device_idx_expr(self) -> str:
+        # A wrapper compiled once and run on any device has to read the device
+        # it is on when it runs, not the one it was compiled for.  A device that
+        # cannot say how to read that cannot have such a wrapper, and saying so
+        # is better than writing one that reads a number fixed at compile time.
+        raise RuntimeError(
+            f"a device given as a parameter is not supported on "
+            f"{type(self).__name__}: it cannot say which device it is on, so the "
+            f"generated wrapper would be tied to the device it was written for."
+        )
+
+    def current_stream(self) -> str:
+        raise NotImplementedError
+
+    def stream_handle(self, stream_name: str) -> str:
+        return f"{stream_name}.native_handle"
+
+    def kernel_header(self) -> str:
+        raise NotImplementedError
+
+    def kernel_driver(self) -> str:
+        raise NotImplementedError
+
+
+class CpuDeviceOpOverrides(DeviceOpOverrides):
+    """The device that is whatever the process is running on.
+
+    A wrapper for this device names no device, waits on nothing, and hands the
+    stream the runtime already has -- there is one of those, and it is the one
+    the wrapper is already using.
+    """
+
+    def import_get_raw_stream_as(self, name: str) -> str:
+        return ""
+
+    def set_device(self, device_idx) -> str:
+        return ""
+
+    def synchronize(self) -> str:
+        return ""
+
+    def device_guard(self, device_idx) -> str:
+        return ""
+
+    def current_device_idx_expr(self) -> str:
+        return "0"
+
+    def current_stream(self) -> str:
+        return "0"
+
+    def kernel_header(self) -> str:
+        return ""
+
+    def kernel_driver(self) -> str:
+        return ""
+
+
+class CudaDeviceOpOverrides(DeviceOpOverrides):
+    """The device whose streams and devices are named by handle."""
+
+    def import_get_raw_stream_as(self, name: str) -> str:
+        return f"from tensorplay._C import _cuda_getCurrentRawStream as {name}"
+
+    def set_device(self, device_idx) -> str:
+        return f"tp.cuda.set_device({device_idx})"
+
+    def synchronize(self) -> str:
+        return "tp.cuda.synchronize()"
+
+    def device_guard(self, device_idx) -> str:
+        return f"tp.cuda.device({device_idx})"
+
+    def current_device_idx_expr(self) -> str:
+        return "tp.cuda.current_device()"
+
+    def current_stream(self) -> str:
+        return "tp.cuda.current_stream()"
+
+    def kernel_header(self) -> str:
+        return "import triton"
+
+    def kernel_driver(self) -> str:
+        return "import triton"
+
+
+#: Which device's words a wrapper is written in, by device name.  Filled in by
+#: :func:`register_device_op_overrides`, and read by
+#: :func:`get_device_op_overrides`.
+device_op_overrides_lock = threading.RLock()
+device_op_overrides_dict: dict[str, DeviceOpOverrides] = {}
+_device_op_overrides_initialized = False
+
+
+def register_device_op_overrides(
+    device: str, device_op_overrides: DeviceOpOverrides
+) -> None:
+    """Say which words a device's wrappers are written in."""
+
+    with device_op_overrides_lock:
+        device_op_overrides_dict[device] = device_op_overrides
+
+
+def _initialize_device_op_overrides() -> None:
+    """Equip the devices that answer for themselves, once.
+
+    A flag rather than an emptiness test, because a caller may have equipped
+    one device before this runs and should not have it taken away.
+    """
+
+    global _device_op_overrides_initialized
+    if _device_op_overrides_initialized:
+        return
+
+    with device_op_overrides_lock:
+        if _device_op_overrides_initialized:
+            return
+
+        register_device_op_overrides("cpu", CpuDeviceOpOverrides())
+        register_device_op_overrides("cuda", CudaDeviceOpOverrides())
+        register_device_op_overrides("xpu", CudaDeviceOpOverrides())
+
+        _device_op_overrides_initialized = True
+
+
+def get_device_op_overrides(device: str) -> DeviceOpOverrides:
+    """The words one device's wrappers are written in."""
+
+    if not isinstance(device, str):
+        raise AssertionError(type(device))
+    _initialize_device_op_overrides()
+    return device_op_overrides_dict[device]
 
 
 class PythonPrinter(_PythonPrinter):
@@ -2006,7 +2162,7 @@ class CSEProxy(DefaultHandler):
 
             return csevar
 
-        from ....utils._pytree import tree_map
+        from ..utils._pytree import tree_map
 
         result = tree_map(do_cse, value)
         self.kernel.record_op_trace(name, args, kwargs, result)

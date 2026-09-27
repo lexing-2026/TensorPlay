@@ -213,7 +213,7 @@ class SubgraphChoiceCaller(ChoiceCaller):
         second call.
         """
 
-        from ...graph_lowering import GraphLowering
+        from ..graph_lowering import GraphLowering
         from ..loops import set_graph
 
         # Sizes that are symbols are passed as symbols, so the built form
@@ -514,7 +514,7 @@ class SubgraphTemplate(KernelTemplate):
                 decomp: Callable[..., Any] = decomp,
                 decomp_kwargs: dict[str, Any] = decomp_kwargs,
             ) -> Any:
-                from ...op_lowerings import select_decomp_table
+                from ..op_lowerings import select_decomp_table
                 from ....graph.experimental.proxy_tensor import make_graph as make_fx
 
                 decomposition_table = select_decomp_table()

@@ -209,7 +209,7 @@ def select_tile_hint(size_hints, signature):
     SQUARE applies when the kernel has exactly 2 size hints and 4 non-constexpr
     signature args (input, output, and 2 numel args -> a square 2D tile).
     """
-    from runtime.hints import TileHint
+    from ..runtime.hints import TileHint
 
     if len(size_hints) != 2:
         return None

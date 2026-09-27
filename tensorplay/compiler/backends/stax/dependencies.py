@@ -220,7 +220,7 @@ class MemoryDep(Dep):
         ):
             return None
 
-        from ..tiling_utils import CantSplit
+        from .tiling_utils import CantSplit
         from .codegen.simd import SIMDKernel
 
         def split_values(

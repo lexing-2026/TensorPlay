@@ -340,6 +340,7 @@ def _record_symbolic_input_source(tensor, dim, expr, kind) -> None:
         return
 
     V.graph.symbolic_input_sources.setdefault(expr, (name, kind, int(dim)))
+    from .ir import InputBuffer
 
 
 def fallback_handler(kernel, add_to_fallback_set: bool = True):
