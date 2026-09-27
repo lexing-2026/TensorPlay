@@ -26,6 +26,7 @@ import re
 import sympy
 from typing import Any
 
+import contextlib
 import logging
 import operator
 
@@ -40,12 +41,13 @@ from .....graph.experimental.sympy_functions import (
     SymT,
 )
 from .. import config
+from ..config import triton as triton_config
 from ..loops import V
 from tensorplay.utils._triton import (
     has_triton_cpu_backend,
     has_triton_stable_tma_api,
 )
-from ..utils import _TMA_SUPPORTED_DTYPES
+from ..utils import _TMA_SUPPORTED_DTYPES, TMA_ALIGNMENT, TRITON_FLOAT8_DTYPES
 from ..heuristics.template.base import next_power_of_2
 from .triton_utils import (
     config_of,
@@ -58,6 +60,8 @@ from .triton_utils import (
     use_uint8_triton_storage_for_cuda_float8_e4m3fn,
 )
 from ..runtime.hints import (
+    TRITON_MAX_BLOCK,
+    TRITON_MAX_RSPLIT,
     AutotuneHint,
     DeviceProperties,
     ReductionHint,
@@ -89,6 +93,132 @@ from ..utils import (
     Number,
     op_requires_libdevice_fp64,
 )
+
+
+def get_triton_reduction_function(reduction_type):
+    use_helper = reduction_type in ("any", "max", "min", "prod", "fmax")
+    module = "triton_helpers" if use_helper else "tl"
+    if reduction_type in ("max", "min", "fmax"):
+        strict = (
+            "_strict"
+            if config.strict_signed_zero and reduction_type in ("max", "min")
+            else ""
+        )
+        return f"{module}.{reduction_type}2{strict}"
+    else:
+        return f"{module}.{reduction_type}"
+
+
+def is_sympy_integer_like(expr: object):
+    """
+    Is this expression a Sympy Integer or is it an integer sympy Expr
+    containing no free symbols. The latter case can happen with Identity expr.
+    """
+    if not isinstance(expr, sympy.Expr):
+        return False
+    return isinstance(expr, sympy.Integer) or (
+        expr.is_integer and len(expr.free_symbols) == 0
+    )
+
+
+def triton_shape_dims(shape: Sequence[sympy.Expr | int | str]) -> list[str]:
+    """Format mixed symbolic and pre-rendered Triton shape dimensions.
+
+    Nested-reduction codegen builds reshape/broadcast shapes from both sympy
+    expressions and already-rendered block-size strings.
+    """
+    return [
+        dim if isinstance(dim, str) else V.kernel.index_to_str(dim) for dim in shape
+    ]
+
+
+def triton_shape_str(shape: Sequence[sympy.Expr | int | str]) -> str:
+    return f"[{', '.join(triton_shape_dims(shape))}]"
+
+
+def triton_reshape(
+    value: str,
+    old_shape: Sequence[sympy.Expr | int | str],
+    new_shape: Sequence[sympy.Expr | int | str],
+) -> str:
+    """Work around a kernel runtime that does not accept this form."""
+    if not (isinstance(old_shape, list) and isinstance(new_shape, list)):
+        raise AssertionError("old_shape and new_shape must both be lists")
+
+    old_shape_str = triton_shape_dims(old_shape)
+    new_shape_str = triton_shape_dims(new_shape)
+
+    if old_shape_str == new_shape_str:
+        return value
+    if [s for s in new_shape_str if s != "1"] != old_shape_str:
+        return f"tl.reshape({value}, [{', '.join(new_shape_str)}])"
+    # rewrite to [:, None] syntax, which is less buggy
+    idx = 0
+    expand = []
+    for size in new_shape_str:
+        if idx < len(old_shape_str) and size == old_shape_str[idx]:
+            expand.append(":")
+            idx += 1
+        else:
+            if size != "1":
+                raise AssertionError(f"expected size '1', got {size!r}")
+            expand.append("None")
+    if idx != len(old_shape_str):
+        raise AssertionError(
+            f"expected idx == len(old_shape_str), got {idx} != {len(old_shape_str)}"
+        )
+    return f"{value}[{', '.join(expand)}]"
+
+
+def triton_compute_type(dtype: tp.dtype) -> str:
+    """Convert tp.dtype to triton type and upcast [b]float16 to float32"""
+    return triton_type(upcast_compute_type(dtype))
+
+
+def upcast_acc_dtype(dtype: tp.dtype) -> tp.dtype:
+    """Implicit upcasts used for Triton reduction types"""
+    if is_integer_dtype(dtype) and dtype.is_signed and dtype.itemsize <= 4:
+        return tp.int32
+    return upcast_compute_type(dtype)
+
+
+def triton_acc_type(dtype: tp.dtype) -> str:
+    """Convert tp.dtype to triton type, with reduction upcasts"""
+    return triton_compute_type(upcast_acc_dtype(dtype))
+
+
+def low_precision_fp(dtype: tp.dtype) -> bool:
+    return dtype.itemsize <= 2 and dtype.is_floating_point
+
+
+def low_precision_fp_var(var: CSEVariable | Any) -> bool:
+    if not isinstance(var, CSEVariable):
+        return False
+
+    dtype = var.dtype
+    return low_precision_fp(dtype) if isinstance(dtype, tp.dtype) else False
+
+
+def triton_arg_dtype(arg: Any) -> tp.dtype | None:
+    if isinstance(arg, CSEVariable):
+        return arg.dtype
+    if isinstance(arg, tp._prims_common.Number):
+        return type_to_dtype(type(arg))
+    return None
+
+
+def needs_upcast_to_float32(arg: Any) -> bool:
+    return (
+        not config.triton.codegen_upcast_to_fp32
+        and isinstance(arg, CSEVariable)
+        and arg.dtype in (tp.float16, tp.bfloat16)
+    )
+
+
+def get_dtype_handler() -> DtypePropagationOpsHandler:
+    from tp._inductor.dtype_propagation import DtypePropagationOpsHandler
+
+    return DtypePropagationOpsHandler()
 
 
 try:  # The shared kernel machinery this builds on.
@@ -127,6 +257,35 @@ class IndexingOptions:
     index: sympy.Expr
     expand_shape: Sequence[int | str] | None
     reduction_axes_omitted: bool = False
+
+    def has_mask(self) -> bool:
+        return bool(self.mask_vars)
+
+    def has_indirect(self) -> bool:
+        return free_symbol_is_type(self.index, SymT.TMP)
+
+    def has_rindex(self) -> bool:
+        return self._has_rindex
+
+    def has_tmpmask(self) -> bool:
+        return any(str(mask).startswith("tmp") for mask in self.mask_vars)
+
+    def has_rmask(self) -> bool:
+        # Outside the reduction loop we ignore reduction-tree masks, matching
+        # the set of axes that indexing generation treats as active.
+        return any(
+            isinstance(mask, str) and tree.is_reduction and tree.owns_mask(mask)
+            for tree in V.kernel.active_range_trees()
+            for mask in self.mask_vars
+        )
+
+    def mask_str(self) -> str:
+        # The sorted call is added to make sure the order is still
+        # deterministic if self.mask_vars contains mix of string
+        # and TritonCSEVariable
+        return (
+            " & ".join(sorted(map(str, self.mask_vars))) if self.mask_vars else "None"
+        )
 
 
 class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
@@ -351,14 +510,14 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
 
     def _get_native_matmul_persistent_rblock(self) -> int | None:
         if (
-            not self.is_native_matmul
+            not triton_config.native_matmul
             or not self.persistent_reduction
             or self.cooperative_reduction
         ):
             return None
 
         rblocks = [
-            native_matmul_persistent_rblock(self._get_persistent_RBLOCK(tree.numel))
+            triton_config.native_matmul_persistent_rblock(self._get_persistent_RBLOCK(tree.numel))
             for tree in self.range_trees
             if tree.is_reduction
         ]
@@ -796,7 +955,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
         # For batched matmul, we intentionally remap program_id axes so that the
         # batch dimension is placed on CUDA gridDim.x (the fastest-varying launch axis).
         # - gridDim.x scales to much larger sizes than gridDim.z (limited to 65536 in CUDA)
-        if self.is_native_matmul and self.triton_tensor_ndim() == 4:
+        if triton_config.native_matmul and self.triton_tensor_ndim() == 4:
             reversed_pid_map = {0: 2, 1: 1, 2: 0}
             key = f"tl.program_id({reversed_pid_map[entry.grid_dim]})"
 
@@ -1304,7 +1463,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
                 "device": DeviceProperties.create(props_device),
                 "constants": {},
                 "native_matmul": (
-                    native_matmul
+                    triton_config.native_matmul
                     and ("tl.dot" in str(self.body) or "tl.dot" in str(self.compute))
                 ),
                 **self.triton_meta_common(),
@@ -1562,7 +1721,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
             and is_coalesced  # for indirect loads is_coalesced is False?
         )
         cachemod = ""
-        if skip_l1_cache:
+        if triton_config.skip_l1_cache:
             cachemod = ", cache_modifier='.cg'"
 
         append_broadcast = None
@@ -1893,7 +2052,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
         if not tree.supports_constant_mask():
             return False
 
-        if self.is_native_matmul:
+        if triton_config.native_matmul:
             # tl.dot requires the shape to be >= 16,
             # so when matmul shape is smaller than 16, we always keep the mask.
             if V.graph.sizevars.statically_known_lt(tree.numel, 16):
@@ -2266,7 +2425,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
                     val = f"triton_helpers.constexpr_next_power_of_2(({numel} + RSPLIT - 1) // RSPLIT)"
                 else:
                     val = self._get_persistent_reduction_block(tree.numel)
-                    if self.is_native_matmul:
+                    if triton_config.native_matmul:
                         # tl.dot only supports shapes >= 16
                         val = max(val, 16)
 
@@ -2339,7 +2498,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
         if self.cooperative_reduction:
             out["persistent_reduction"] = self.persistent_reduction
         if (rblock := self._get_native_matmul_persistent_rblock()) is not None:
-            out["native_matmul_persistent_rblock"] = rblock
+            out["triton_config.native_matmul_persistent_rblock"] = rblock
         if self.add_persistent_rblock:
             out["add_persistent_rblock"] = True
         if (rblock := self._strict_reduction_rblock()) is not None:
@@ -2369,7 +2528,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
                         if block_name not in sig_arg_names:
                             try:
                                 val = self._get_persistent_reduction_block(rt.numel)
-                                if self.is_native_matmul:
+                                if triton_config.native_matmul:
                                     val = max(val, 16)
                                 fixed_blocks[block_name] = val
                             except (TypeError, ValueError):
@@ -3211,7 +3370,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
 
         reduction_axes_omitted = False
         if need_dense and not have_dense:
-            if self.inside_reduction and self.is_native_matmul:
+            if self.inside_reduction and triton_config.native_matmul:
                 # This avoids full broadcasting (need_dense) when performing native matmul.
                 # For example, self._load_mask previously required tl.broadcast_to() in index_str.
                 # Due to the restrictions of tl.dot semantics, we only want to expand the block
@@ -3381,7 +3540,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
         # because 3d (Z,Y,X) tl.dot is somehow slower than 2d tl.dot.
         # Instead, we force ZBLOCK to be always 1 during autotune.
         dense_size_str: str
-        if self.is_native_matmul:
+        if triton_config.native_matmul:
             dense_sizes = self.dense_size_list()
             if len(dense_sizes) < 3:
                 raise AssertionError(
@@ -4219,7 +4378,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
 
     @staticmethod
     def _enable_pdl_codegen():
-        if not enable_pdl:
+        if not config.triton.enable_pdl:
             return False
         if isinstance(V.kernel, TritonTemplateKernel):
             return False
@@ -4265,7 +4424,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
                 return triton_heuristics.Grid2DWithYZOverflow
             return triton_heuristics.Grid2D
         elif n == 3:
-            if self.is_native_matmul:
+            if triton_config.native_matmul:
                 return triton_heuristics.BatchMatmulGrid3D
             return triton_heuristics.Grid3D
         raise ValueError(f"Unsupported number of dimensions: {n}")
@@ -4834,7 +4993,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
         # For batch matmul, we always set the ZBLOCK=1.
         # In this case, we found not broadcasting tl.arange(0, ZBLOCK) is faster.
         if (
-            self.is_native_matmul
+            triton_config.native_matmul
             and entry.tensor_dim == 0
             and self.triton_tensor_ndim() == 4
         ):
@@ -5162,7 +5321,7 @@ def triton_store_type(dtype) -> str:
                 return triton_heuristics.Grid2DWithYZOverflow
             return triton_heuristics.Grid2D
         elif n == 3:
-            if self.is_native_matmul:
+            if triton_config.native_matmul:
                 return triton_heuristics.BatchMatmulGrid3D
             return triton_heuristics.Grid3D
         raise ValueError(f"Unsupported number of dimensions: {n}")
@@ -5731,7 +5890,7 @@ def triton_store_type(dtype) -> str:
         # For batch matmul, we always set the ZBLOCK=1.
         # In this case, we found not broadcasting tl.arange(0, ZBLOCK) is faster.
         if (
-            self.is_native_matmul
+            triton_config.native_matmul
             and entry.tensor_dim == 0
             and self.triton_tensor_ndim() == 4
         ):
@@ -7345,7 +7504,7 @@ class TritonOverrides(OpOverrides):
            poor performance. During batched matmul (bmm), we keep ZBLOCK=1 and call
            the 2D dot kernel instead.
         """
-        if not V.kernel.is_native_matmul:
+        if not V.kernel.triton_config.native_matmul:
             raise AssertionError("expected native matmul kernel")
         orig_a, orig_b = a, b
 
