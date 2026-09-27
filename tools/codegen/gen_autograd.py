@@ -95,6 +95,18 @@ class BinOp(Expr):
     right: Expr
 
 @dataclass(frozen=True)
+class Not(Expr):
+    value: Expr
+
+
+@dataclass(frozen=True)
+class Ternary(Expr):
+    cond: Expr
+    then: Expr
+    other: Expr
+
+
+@dataclass(frozen=True)
 class Braced(Expr):
     """C++ braced-init-list argument, e.g. `{dim}` or `{0, 1}`."""
     items: tuple[Expr, ...]
@@ -117,6 +129,9 @@ _TOKEN_RE = re.compile(
       | (?P<str>"(?:[^"\\]|\\.)*")
       | (?P<bool>true|false)
       | (?P<cmp><=|>=|==|!=|<|>)
+      | (?P<logic>&&|\|\||!)
+      | (?P<quest>\?)
+      | (?P<colon>:)
       | (?P<punct>[().,\[\]{}])
       | (?P<op>[-+*/])
     )""",
@@ -133,7 +148,8 @@ def tokenize_expr(s: str):
                 break
             raise ValueError(f"Cannot tokenize derivative formula at: {s[pos:]!r}")
         pos = m.end()
-        for g in ("num", "ident", "str", "bool", "cmp", "punct", "op"):
+        for g in ("num", "ident", "str", "bool", "cmp", "logic", "quest",
+                  "colon", "punct", "op"):
             v = m.group(g)
             if v is not None:
                 toks.append((g, v))
@@ -162,9 +178,32 @@ class ExprParser:
             raise ValueError(f"Expected {val!r}, got {v!r}")
 
     def parse(self) -> Expr:
-        e = self.parse_cmp()
+        e = self.parse_ternary()
         if self.i != len(self.toks):
             raise ValueError(f"Trailing tokens in expression: {self.toks[self.i:]}")
+        return e
+
+    def parse_ternary(self) -> Expr:
+        cond = self.parse_or()
+        if self.peek()[1] == "?":
+            self.take()
+            then = self.parse_ternary()
+            self.expect(":")
+            return Ternary(cond, then, self.parse_ternary())
+        return cond
+
+    def parse_or(self) -> Expr:
+        e = self.parse_and()
+        while self.peek()[1] == "||":
+            self.take()
+            e = BinOp("||", e, self.parse_and())
+        return e
+
+    def parse_and(self) -> Expr:
+        e = self.parse_cmp()
+        while self.peek()[1] == "&&":
+            self.take()
+            e = BinOp("&&", e, self.parse_cmp())
         return e
 
     def parse_cmp(self) -> Expr:
@@ -192,6 +231,9 @@ class ExprParser:
         if self.peek()[1] == "-":
             self.take()
             return Neg(self.parse_unary())
+        if self.peek()[1] == "!":
+            self.take()
+            return Not(self.parse_unary())
         return self.parse_postfix()
 
     def parse_postfix(self) -> Expr:
@@ -211,10 +253,10 @@ class ExprParser:
         self.expect("(")
         out = []
         if self.peek()[1] != ")":
-            out.append(self.parse_add())
+            out.append(self.parse_ternary())
             while self.peek()[1] == ",":
                 self.take()
-                out.append(self.parse_add())
+                out.append(self.parse_ternary())
         self.expect(")")
         return out
 
@@ -231,16 +273,16 @@ class ExprParser:
                 return Call(val, tuple(self.parse_call_args()))
             return Var(val)
         if val == "(":
-            e = self.parse_add()
+            e = self.parse_ternary()
             self.expect(")")
             return Paren(e)
         if val == "{":
             items = []
             if self.peek()[1] != "}":
-                items.append(self.parse_add())
+                items.append(self.parse_ternary())
                 while self.peek()[1] == ",":
                     self.take()
-                    items.append(self.parse_add())
+                    items.append(self.parse_ternary())
             self.expect("}")
             return Braced(tuple(items))
         raise ValueError(f"Unexpected token {val!r}")
@@ -362,6 +404,11 @@ class Emitter:
             if self._looks_tensor(e.value):
                 return f"neg({inner})"
             return f"-{inner}"
+        if isinstance(e, Not):
+            return f"!{self.emit(e.value)}"
+        if isinstance(e, Ternary):
+            return (f"{self.emit(e.cond)} ? {self.emit(e.then)}"
+                    f" : {self.emit(e.other)}")
         if isinstance(e, Braced):
             return "{" + ", ".join(self.emit(a) for a in e.items) + "}"
         if isinstance(e, Paren):
@@ -439,6 +486,12 @@ def collect_vars(expr: Expr, out: set[str]) -> None:
         collect_vars(expr.value, out)
     elif isinstance(expr, Paren):
         collect_vars(expr.value, out)
+    elif isinstance(expr, Not):
+        collect_vars(expr.value, out)
+    elif isinstance(expr, Ternary):
+        collect_vars(expr.cond, out)
+        collect_vars(expr.then, out)
+        collect_vars(expr.other, out)
     elif isinstance(expr, Call):
         for a in expr.args:
             collect_vars(a, out)
