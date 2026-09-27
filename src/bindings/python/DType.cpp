@@ -33,6 +33,34 @@ const char* dtype_name(DType dtype) {
     }
 }
 
+const char* dtype_abbr(DType dtype) {
+    switch (dtype) {
+        case DType::Float64: return "f64";
+        case DType::Float32: return "f32";
+        case DType::Float16: return "f16";
+        case DType::BFloat16: return "bf16";
+        case DType::Float8_e4m3fn: return "f8e4m3fn";
+        case DType::Float8_e5m2: return "f8e5m2";
+        case DType::Float8_e4m3fnuz: return "f8e4m3fnuz";
+        case DType::Float8_e5m2fnuz: return "f8e5m2fnuz";
+        case DType::Float8_e8m0fnu: return "f8e8m0fnu";
+        case DType::ComplexHalf: return "c32";
+        case DType::BComplex32: return "bc32";
+        case DType::ComplexFloat: return "c64";
+        case DType::ComplexDouble: return "c128";
+        case DType::Int8: return "i8";
+        case DType::Int16: return "i16";
+        case DType::Int32: return "i32";
+        case DType::Int64: return "i64";
+        case DType::Bool: return "b8";
+        case DType::UInt8: return "u8";
+        case DType::UInt16: return "u16";
+        case DType::UInt32: return "u32";
+        case DType::UInt64: return "u64";
+        default: return dtype_name(dtype);
+    }
+}
+
 std::string dtype_repr(DType dtype) {
     return std::string("tensorplay.") + dtype_name(dtype);
 }
@@ -102,6 +130,11 @@ void init_dtype(py::module_& m) {
         })
         .def_property_readonly("itemsize", [](DType d) {
             return tensorplay::elementSize(d);
+        })
+        // A fixed-width spelling, for somewhere a dtype has to be written into
+        // a fixed amount of room: a log line, a table of results.
+        .def_property_readonly("abbr", [](DType d) {
+            return std::string(dtype_abbr(d));
         });
     // attr() rather than def(): the chained def() appends to the overload set
     // pybind installs for the enum, whose object-level fallback then shadows
@@ -147,4 +180,26 @@ void init_dtype(py::module_& m) {
     m.attr("cfloat") = DType::ComplexFloat;
     m.attr("cdouble") = DType::ComplexDouble;
     m.attr("chalf") = DType::ComplexHalf;
+
+    // Every dtype there is, so that a caller can walk the whole space rather
+    // than the subset it happens to know about -- a table of what was
+    // measured, a check that nothing is missing from a mapping.
+    m.def("_get_all_dtypes", []() {
+        static const DType kAll[] = {
+            DType::UInt8,    DType::Int8,     DType::Int16,    DType::Int32,
+            DType::Int64,    DType::UInt16,   DType::UInt32,   DType::UInt64,
+            DType::Float16,  DType::BFloat16, DType::Float32,  DType::Float64,
+            DType::ComplexHalf, DType::ComplexFloat, DType::ComplexDouble,
+            DType::BComplex32,
+            DType::Float8_e4m3fn,  DType::Float8_e4m3fnuz,
+            DType::Float8_e5m2,    DType::Float8_e5m2fnuz,
+            DType::Float8_e8m0fnu,
+            DType::QInt8,     DType::QUInt8,   DType::QInt32,   DType::Bool,
+        };
+        py::list out;
+        for (DType d : kAll) {
+            out.append(py::cast(d));
+        }
+        return out;
+    });
 }
