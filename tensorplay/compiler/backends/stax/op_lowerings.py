@@ -4645,7 +4645,7 @@ for _name in ("segment_reduce", "_segment_reduce_backward"):
 #: question about a list this cannot read, and a scatter that reduces says which
 #: of several values landing on the same position wins -- which is a meaning
 #: rather than a walk.
-for _name in ("searchsorted", "scatter_reduce_", "index"):
+for _name in ("searchsorted", "scatter_reduce_"):
     _op = getattr(aten, _name, None)
     if _op is None:
         continue
@@ -4922,3 +4922,197 @@ pw_cast_for_opmath_non_tensor_args = functools.partial(
     type_promotion=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
     include_non_tensor_args=True,
 )
+
+
+def check_and_broadcast_indices(indices: Any, device: Any) -> Any:
+    """The indices of a gather, made to share a shape, and which axes they name.
+
+    An index per axis, and an axis with no index keeps its whole length.  The
+    indices that are values are made to share a shape with each other because
+    they are read together -- one position of them names one element, and two
+    indices read at two different positions would name two different elements
+    from what was meant to be one.
+
+    A truth value or a byte names positions by whether they are set rather than
+    by what they are, which is a different question and is not answered here; a
+    value on a different device than the value being read is likewise refused
+    rather than moved, because moving it would be a copy this did not ask for.
+    """
+
+    if not (
+        all(
+            i.get_dtype() in (tp.int64, tp.int32, tp.bool, tp.uint8)
+            for i in indices
+            if i is not None
+        )
+    ):
+        raise AssertionError(
+            f"indices must be int64, byte or bool. Got "
+            f"{[i.get_dtype() for i in indices if i is not None]}"
+        )
+    if any(
+        i.get_dtype() in (tp.bool, tp.uint8) for i in indices if i is not None
+    ):
+        raise NotImplementedError("Fallback for bool indices")
+
+    valid_idxs = [i for i, x in enumerate(indices) if isinstance(x, TensorBox)]
+    if len(valid_idxs) <= 0:
+        raise AssertionError("requires at least 1 non-None index")
+    new_indices = [None] * len(indices)
+    for i, x in zip(valid_idxs, broadcast_tensors(*[indices[i] for i in valid_idxs])):
+        if x.get_device() != device:
+            raise NotImplementedError("Fallback when indices is on a different device")
+        new_indices[i] = x
+    return new_indices, valid_idxs
+
+
+def index_output_size_and_inner_fn(
+    x_size: Any,
+    indices: Any,
+    tensor_indices: Any,
+    tensor_size: Any,
+    indices_loaders: Any,
+    indexed_size: Any,
+    x_loader: Any,
+    check: Any,
+    wrap_neg: Any = True,
+) -> Any:
+    """The shape of a gather's answer, and how to turn a position into an index.
+
+    The answer's shape is not the indexed value's shape with some axes
+    shortened: it is the indexed value's shape with some axes *replaced*, and
+    the replacements have to go where the indices were rather than at the end.
+    Which is why the two cases are told apart here -- indices that are next to
+    each other take the positions they replaced, and indices that are not are
+    pulled to the front, because a value read with two indices that are not
+    next to each other has its answer's leading axes given by the indices rather
+    than by the axes between them.
+    """
+
+    non_consecutive_tensors = False
+    for previous, current in itertools.pairwise(tensor_indices):
+        if current - previous != 1:
+            non_consecutive_tensors = True
+
+    output_size = [x_size[i] for i, val in enumerate(indices) if val is None]
+    output_size = [*output_size, *x_size[len(output_size) + len(tensor_indices) :]]
+
+    first_tensor_index = tensor_indices[0]
+    if non_consecutive_tensors:
+        output_size = tensor_size + output_size
+    else:
+        output_size = (
+            output_size[:first_tensor_index]
+            + tensor_size
+            + output_size[first_tensor_index:]
+        )
+
+    def fn(idx: Any) -> Any:
+        if len(idx) != len(output_size):
+            raise AssertionError("expected: len(idx) == len(output_size)")
+        if len(indices_loaders) != len(indexed_size):
+            raise AssertionError("expected: len(indices_loaders) == len(indexed_size)")
+
+        rank = len(tensor_size)
+        new_index: list = []
+        first_tensor_index = tensor_indices[0]
+        start_offset = 0 if non_consecutive_tensors else first_tensor_index
+        next_idx = 0
+        for i in range(tensor_indices[-1] + 1):
+            if i == start_offset:
+                next_idx += rank
+            if indices[i] is None:
+                if next_idx >= len(idx):
+                    raise AssertionError("expected: next_idx < len(idx)")
+                new_index.append(idx[next_idx])
+                next_idx += 1
+            else:
+                loader = indices_loaders[i]
+                if loader is None:
+                    raise AssertionError("expected: loader is not None")
+                size = indexed_size[i]
+                new_index.append(
+                    ops.indirect_indexing(
+                        loader(idx[start_offset : start_offset + rank]),
+                        size,
+                        check=check,
+                        wrap_neg=wrap_neg,
+                    )
+                )
+        new_index = [*new_index, *idx[next_idx:]]
+        return new_index if x_loader is None else x_loader(new_index)
+
+    return output_size, fn
+
+
+def index_impl_helper(x: Any, indices: Any, check: Any, wrap_neg: Any = True) -> Any:
+    """The shape of a gather's answer, and how to read one of its positions.
+
+    Split from the walk that uses it because the shape and the read have to
+    agree, and asking for them together is what makes them agree.
+    """
+
+    if not (isinstance(indices, (list, tuple))):
+        raise AssertionError("expected: isinstance(indices, (list, tuple))")
+    x_loader = x.make_loader()
+    indices, tensor_indices = check_and_broadcast_indices(indices, x.get_device())
+    if len(tensor_indices) <= 0:
+        raise AssertionError("Must have at least one valid idx")
+
+    indices_loaders = [i.make_loader() if i is not None else None for i in indices]
+    tensor_size = list(indices[tensor_indices[0]].get_size())
+
+    x_size = x.get_size()
+
+    indexed_size = [x_size[i] for i in range(len(indices)) if indices[i] is not None]
+    if check and 0 in indexed_size and 0 not in tensor_size:
+        raise IndexError("index is out of bounds for dimension with size 0")
+
+    indexed_size = [x_size[i] for i in range(len(indices))]
+    output_size, index_inner_fn = index_output_size_and_inner_fn(
+        x_size,
+        indices,
+        tensor_indices,
+        tensor_size,
+        indices_loaders,
+        indexed_size,
+        None,
+        check=check,
+        wrap_neg=wrap_neg,
+    )
+
+    def inner_fn(idx: Any) -> Any:
+        return x_loader(index_inner_fn(idx))
+
+    return output_size, inner_fn, index_inner_fn
+
+
+def index_impl(x: Any, indices: Any, check: Any) -> Any:
+    """One element per position asked for, each read at an index of its own.
+
+    The answer is shaped like what was asked for rather than like what was read:
+    the two are the same here, and saying so is what makes each output position
+    know which input position it corresponds to.
+    """
+
+    output_size, inner_fn, _ = index_impl_helper(x, indices, check)
+
+    return Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=output_size,
+    )
+
+
+@register_lowering(aten.index.Tensor, type_promotion_kind=None)
+def index_tensor(x: Any, indices: Any) -> Any:
+    """One element per position asked for, each read at an index of its own.
+
+    Whether the index is checked is asked for rather than settled here: a
+    checked index refuses to read past the end of an axis, and an unchecked one
+    does not, and which of the two is wanted is a property of where the index
+    came from rather than of what an index is.
+    """
+
+    return index_impl(x, indices, check=True)
