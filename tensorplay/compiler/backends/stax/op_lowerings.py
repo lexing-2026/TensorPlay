@@ -37,7 +37,10 @@ from .utils import (
     register_op_dtype_propagation_rules,
 )
 
-from tensorplay.primitives.common import ELEMENTWISE_TYPE_PROMOTION_KIND
+from tensorplay.primitives.common import (
+    ELEMENTWISE_TYPE_PROMOTION_KIND,
+    is_integer_dtype,
+)
 from .dtype_propagation import promoted_dtype_of_values
 from tensorplay.graph import Node
 from tensorplay.utils._pytree import arg_tree_leaves, tree_leaves, tree_map
@@ -2491,5 +2494,283 @@ def _register_foreach_inplace_all() -> None:
 
 
 _register_foreach_all()
-_register_foreach_inplace_all()
+
+
+def pow_recursive(x: Any, y: int, dtype: Any) -> Any:
+    """A whole-number power by squaring, and the value is written out.
+
+    A power is not one operation but a number of them, and which number depends
+    on the power: squaring halves how many multiplications there are, and a
+    power of one is the value itself rather than a multiplication of it.  The
+    result is assembled from operations the loop body already has, so a power
+    costs no operation this compiler did not already have.
+    """
+
+    if y < 0:
+        return pow_recursive(ops.reciprocal(x), -y, dtype)
+    if y == 0:
+        return ops.constant(1, dtype)
+    if y == 1:
+        return x
+
+    result = pow_recursive(x, y // 2, dtype)
+    result = ops.mul(result, result)
+    if (y % 2) == 1:
+        result = ops.mul(result, x)
+    return result
+
+
+#: The whole-number power, handed to the framework.  The device's own power is
+#: for real numbers, so this is not a shortcut but the only answer for a
+#: whole-number power of whole numbers; and an exponent large enough to need it
+#: is one where writing out multiplications would cost more than the call.
+_fallback_pow = fallback_handler(tp.ops.tp.pow)
+
+
+@register("pow.Tensor_Scalar")
+@register("pow.Scalar")
+def lower_pow(a: Any, b: Any) -> Any:
+    """One value raised to a power.
+
+    The powers worth writing out are the ones a program actually asks for: a
+    square root is a square root, a power of one is the value, and a small whole
+    number is a number of multiplications rather than a call.  A power too large
+    to write out, and a whole-number power of whole numbers where the
+    arithmetic is not the one the device does, are handed to the framework --
+    which is a slower answer rather than a wrong one.
+    """
+
+    if isinstance(b, float) and b.is_integer():
+        return lower_pow(a, int(b))
+    elif isinstance(b, float) and b == 0.5:
+        return LOWERINGS["sqrt.default"](a)
+    elif isinstance(b, int) and b == 1:
+        return clone(a)
+
+    # The arguments have been made to agree on a type by now, so either will do.
+    dtype = next(x.get_dtype() for x in (a, b) if isinstance(x, ir.TensorBox))
+    is_integer_pow = is_integer_dtype(dtype)
+
+    embed_exponent = isinstance(b, int) and (
+        -32 < b < 32 or (is_integer_pow and b >= 0)
+    )
+    if embed_exponent:
+        loader = a.make_loader()
+
+        def fn(idx):
+            return pow_recursive(loader(idx), b, a.get_dtype())
+
+        return Pointwise.create(
+            device=a.get_device(),
+            dtype=a.get_dtype(),
+            inner_fn=fn,
+            ranges=a.get_size(),
+        )
+
+    if is_integer_pow:
+        # The device's own power is for real numbers; a whole-number power of
+        # whole numbers is not what it computes.
+        return _fallback_pow(a, b)
+
+    return pointwise(ops.pow, a, b)
+
+
+def _use_fma(dtype: Any, device: Any) -> bool:
+    """Whether a product and a sum of it should be done in one rounding.
+
+    A device that can multiply and add without rounding between the two does it
+    in one step, which is not the same answer as rounding the product first:
+    the product keeps digits the addition would have dropped.  Which is more
+    accurate is not the question -- the question is which one the program
+    expects, and whole numbers have no such step to take.
+    """
+
+    return (
+        dtype.is_floating_point
+        and device is not None
+        and device.type in ["cuda", "xpu"]
+    )
+
+
+@register("addcmul.default")
+def lower_addcmul(self: Any, tensor1: Any, tensor2: Any, *, value: Any = 1) -> Any:
+    """This, plus a scaled product of two others.
+
+    The order is the whole of it: the product is rounded before it is scaled and
+    added, because that is the order the answer is defined in, and a device that
+    would otherwise do the multiply and the add in one step is asked to round in
+    between so that it arrives at the same number.  Whole numbers have no such
+    step, so they are added the long way round.
+    """
+
+    dtype = promoted_dtype_of_values(
+        self, tensor1, tensor2, type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT
+    )
+
+    self_loader = self.make_loader()
+    t1_loader = tensor1.make_loader()
+    t2_loader = tensor2.make_loader()
+
+    device = self.get_device()
+    use_fma = _use_fma(dtype, device)
+
+    def inner_fn(idx):
+        self_val = self_loader(idx)
+        t1_val = t1_loader(idx)
+        t2_val = t2_loader(idx)
+
+        if value == 1 and use_fma:
+            return ops.fma(t1_val, t2_val, self_val)
+
+        # Round the product before it is scaled and added.
+        if use_fma:
+            t1_times_t2 = ops.mul_rn(t1_val, t2_val)
+        else:
+            t1_times_t2 = ops.mul(t1_val, t2_val)
+
+        # A power that came from a value only known while the program runs is an
+        # expression rather than a number, and is written as one.
+        if isinstance(value, sympy.Basic):
+            value_expr = ops.index_expr(value, dtype)
+        else:
+            value_expr = ops.constant(value, dtype)
+
+        if use_fma:
+            return ops.fma(value_expr, t1_times_t2, self_val)
+        else:
+            return ops.add(self_val, ops.mul(value_expr, t1_times_t2))
+
+    return Pointwise.create(
+        device=self.get_device(),
+        dtype=dtype,
+        inner_fn=inner_fn,
+        ranges=self.get_size(),
+    )
+
+
+@register("addcdiv.default")
+def lower_addcdiv(self: Any, tensor1: Any, tensor2: Any, *, value: Any = 1) -> Any:
+    """This, plus a scaled quotient of two others.
+
+    The quotient is rounded before it is scaled and added, for the same reason
+    and in the same order as the product above: the answer is defined as this
+    plus the scaled quotient, not as this plus a quotient of a scaled pair.
+    """
+
+    dtype = promoted_dtype_of_values(
+        self, tensor1, tensor2, type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT
+    )
+
+    self_loader = self.make_loader()
+    t1_loader = tensor1.make_loader()
+    t2_loader = tensor2.make_loader()
+
+    device = self.get_device()
+    use_fma = _use_fma(dtype, device)
+
+    def inner_fn(idx):
+        self_val = self_loader(idx)
+        t1_val = t1_loader(idx)
+        t2_val = t2_loader(idx)
+
+        # Round the quotient before it is scaled and added.
+        if use_fma:
+            quot = ops.div_rn(t1_val, t2_val)
+        else:
+            quot = ops.div(t1_val, t2_val)
+
+        if isinstance(value, sympy.Basic):
+            value_expr = ops.index_expr(value, dtype)
+        else:
+            value_expr = ops.constant(value, dtype)
+
+        if value == 1 and use_fma:
+            return ops.fma(quot, value_expr, self_val)
+        if use_fma:
+            return ops.fma(value_expr, quot, self_val)
+        return ops.add(self_val, ops.mul(value_expr, quot))
+
+    return Pointwise.create(
+        device=self.get_device(),
+        dtype=dtype,
+        inner_fn=inner_fn,
+        ranges=self.get_size(),
+    )
+
+
+@register("copy_.default")
+def lower_copy_(dst: Any, src: Any, non_blocking: Any = False) -> Any:
+    """One value's contents become another's, where the other already exists.
+
+    Everything about the source is made to match the destination first --
+    where it is, what type it is, how big it is -- because what is being
+    promised is that the destination holds these contents, and a copy that
+    changed any of those would be copying something else.  A copy onto itself is
+    not a copy, and is left alone rather than done.
+    """
+
+    if dst is src:
+        return dst
+    if not isinstance(src, ir.IRNode):
+        # A source that is a number rather than a value is a value of that
+        # number, shaped like the destination and held in it.
+        src = Pointwise.create(
+            device=dst.get_device(),
+            dtype=dst.get_dtype(),
+            inner_fn=lambda idx: ops.constant(src, dst.get_dtype()),
+            ranges=dst.get_size(),
+        )
+    x = src
+    if dst.get_device() != src.get_device():
+        x = to_device(x, dst.get_device())
+    if dst.get_dtype() != src.get_dtype():
+        x = ops.to_dtype(x, dst.get_dtype())
+
+    if list(dst.get_size()) != list(src.get_size()):
+        out = LOWERINGS["expand.default"](x, dst.get_size())
+        result = clone(out)
+    else:
+        result = clone(x)
+
+    return mutate_to(dst, result)
+
+
+def _register_foreach_remaining() -> None:
+    """The list forms of the operations whose single form has an argument of
+    its own.
+
+    A power, a scaled product and a scaled quotient each carry a number beside
+    their tensors, and where that number arrives is part of the operation's
+    shape rather than something to be guessed at here.  A copy is a list
+    operation too, and writing into the destination is a copy whose result is
+    made to be its source.
+    """
+
+    for allow_alpha, scalar_kwarg, key, names in (
+        (False, "alpha", "pow.Tensor_Scalar", (
+            "_foreach_pow.Scalar", "_foreach_pow.List", "_foreach_pow.ScalarAndTensor",
+        )),
+        (True, "value", "addcmul.default", ("_foreach_addcmul.Scalar",)),
+        (True, "value", "addcdiv.default", ("_foreach_addcdiv.Scalar",)),
+    ):
+        register_foreach_pointwise(
+            _per_tensor(key),
+            allow_alpha=allow_alpha,
+            scalar_kwarg=scalar_kwarg,
+            names=names,
+        )
+
+    register_foreach_pointwise(
+        _per_tensor("copy_.default"), names=("_foreach_copy.default",)
+    )
+
+    register_foreach_inplace(
+        names=("_foreach_copy_.default",),
+        outplace_names=("_foreach_copy.default",),
+        outplace_op=_registered_foreach("_foreach_copy.default"),
+    )
+
+
 _register_foreach_all()
+_register_foreach_inplace_all()
+_register_foreach_remaining()
