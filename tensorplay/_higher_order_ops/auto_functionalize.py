@@ -34,18 +34,27 @@ __all__ = [
 def get_mutable_args(op: Any) -> tuple[list[str], list[Any]]:
     """Names and schema types of the arguments ``op`` writes to."""
 
-    mutated = op._schema.mutated_arguments()
+    schema = op._schema
+    # A library operation a program defines for itself carries the text of its
+    # declaration where a dispatcher operation carries the parsed schema, and a
+    # declaration says nothing about which arguments are written to.
+    if isinstance(schema, str):
+        return [], []
+    mutated = schema.mutated_arguments()
     return [a.name for a in mutated], [a.type for a in mutated]
 
 
 def returns_without_aliases(op: Any) -> list[int]:
     """Indices of the returns that do not alias a mutated argument."""
 
+    schema = op._schema
+    if isinstance(schema, str):
+        return []
     written = set()
-    for argument in op._schema.mutated_arguments():
+    for argument in schema.mutated_arguments():
         written |= set(argument.alias_info.before_set)
     kept = []
-    for index, ret in enumerate(op._schema.returns):
+    for index, ret in enumerate(schema.returns):
         alias = ret.alias_info
         if alias is not None and alias.is_write and alias.before_set & written:
             continue

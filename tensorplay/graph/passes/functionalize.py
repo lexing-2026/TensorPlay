@@ -47,7 +47,20 @@ def _ops() -> Any:
 
 
 def _schema(target: Any) -> Any:
-    return getattr(target, "_schema", None)
+    """What the operation is, as a parsed schema, or nothing if it has none.
+
+    Two things carry a ``_schema`` and they are not the same kind: a
+    dispatcher operation carries it parsed, and a library operation a program
+    defines for itself carries the text it was declared with.  Only the parsed
+    one says which arguments are written to, so only that one is a schema here;
+    the other is a declaration, and a node carrying one is not a mutation this
+    pass can read.
+    """
+
+    schema = getattr(target, "_schema", None)
+    if schema is None or isinstance(schema, str):
+        return None
+    return schema
 
 
 _SELF = object()  # marks the aliased input inside a recorded view step

@@ -400,7 +400,7 @@ def _schema_written_arguments(node: Any) -> list[Any] | None:
     the target carries no schema."""
 
     schema = getattr(node.target, "_schema", None)
-    if schema is None:
+    if schema is None or isinstance(schema, str):
         return None
     written = []
     for index, argument in enumerate(schema.arguments):

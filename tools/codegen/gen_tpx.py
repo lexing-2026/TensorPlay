@@ -55,6 +55,20 @@ def _signature_args(f: NativeFunction) -> str:
     return ", ".join(args)
 
 
+def _declared_call_args(f: NativeFunction, self_name: str | None) -> list[str]:
+    """The arguments a call is made with, in order.
+
+    ``requires_grad`` is normally not one of them: a schema that returns a
+    differentiable tensor carries it as a note on the result rather than as
+    something the caller passes.  An operation named for that flag does take
+    it, though, and dropping it there would call it with nothing.
+    """
+
+    if f.cpp_name == 'requires_grad_':
+        return [a.name for a in f.args if a.name != self_name]
+    return [a.name for a in f.args if a.name != self_name and a.name != 'requires_grad']
+
+
 def _core_call_expr(f: NativeFunction) -> str:
     rd = _redispatch_name(f, f.variants[0])
     core_args = [call_arg_expr(f.base_name, a)
@@ -62,8 +76,7 @@ def _core_call_expr(f: NativeFunction) -> str:
     if f.manual_kernel_registration:
         if f.self_arg() is not None and 'method' in f.variants:
             self_arg = f.self_arg()
-            rest = [a.name for a in f.args
-                    if a.name != self_arg.name and a.name != 'requires_grad']
+            rest = _declared_call_args(f, self_arg.name)
             return f'{self_arg.name}.{f.cpp_name}({", ".join(rest)})'
         return f'Tensor::{f.cpp_name}({", ".join(core_args)})'
     return f'::tensorplay::detail::{rd}({", ".join(core_args)})'
