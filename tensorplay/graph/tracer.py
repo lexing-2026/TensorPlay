@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import inspect
+import os as _os
+import sys as _sys
 from typing import Any, Callable, Dict, Optional, Tuple
+
+import tensorplay as tp
 
 from . import _utils
 from ._utils import (
@@ -92,6 +96,31 @@ class Tracer:
         # executed twice produce distinct ``path_0``/``path_1`` style entries,
         self.node_to_qualname: Dict[Node, str] = {}
         self._recorded_qualnames: set[str] = set()
+        self._proxy_mode: Any = None
+
+    @property
+    def proxy_mode(self) -> Any:
+        """The state a decomposition helper reads while this trace runs.
+
+        An operator that stands for a region of the program rather than a
+        single operation -- one whose body is a whole schedule of work -- has to
+        decide whether to become a node or to run itself, and it decides by
+        asking whether a proxy trace is currently recording.  The question is
+        answered by what is on the dispatch stack, and the state read here is a
+        separate thing that has to be current for the same span, so a trace
+        entered directly has to establish both.
+
+        Built on first use so a trace that never asks costs nothing.  The
+        table starts empty because the dispatcher holds the decompositions that
+        were requested for the region; this is what a helper that enables its
+        own set reads and writes.
+        """
+
+        if self._proxy_mode is None:
+            from .experimental.proxy_tensor import ProxyMode
+
+            self._proxy_mode = ProxyMode(self)
+        return self._proxy_mode
 
     def is_leaf_module(self, module: Any, qualified_name: str) -> bool:
         """Return whether ``module`` should be traced as a single unit.
@@ -241,12 +270,27 @@ class Tracer:
                     value = _run()
         except Exception:
             # Advisory: an op that fails eagerly simply stays symbolic.
+            if _os.environ.get("TP_DEBUG_SAMPLE"):
+                import traceback as _tb
+
+                print(
+                    f"[sample] 节点 {node.name} 的示例执行失败: target={node.target!r} "
+                    f"参数个数={len(node.args)}",
+                    file=_sys.stderr,
+                )
+                _tb.print_exc(limit=3, file=_sys.stderr)
             return
         self._node_samples[node.name] = value
-        # Keep container results available to lowering passes.  Tensor
-        # metadata is reconstructed from shapes, but tuple-valued operators
-        # need their arity and per-item shapes to allocate native outputs.
+        # The example every node produced is kept on the node as well as in the
+        # tracer, because a later step asks the graph rather than the tracer:
+        # what shape a value had, and what a value that was a tuple contained.
+        # Shapes in particular are asked by the program itself -- to decide
+        # whether two values line up -- and an answer that had to come from
+        # re-running anything could not be asked while the program was still
+        # deciding it.
         if isinstance(value, (tuple, list)):
+            node.meta["val"] = value
+        elif isinstance(value, tp.Tensor):
             node.meta["val"] = value
 
     def create_proxy(

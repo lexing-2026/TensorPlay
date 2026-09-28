@@ -6229,6 +6229,12 @@ class ExternKernel(InputsKernel):
             return
         module = getattr(kernel, "__module__", None)
         name = getattr(kernel, "__name__", str(kernel))
+        # The in-place operator builtins carry a module name that is private to
+        # the interpreter.  It is the same module the public ``operator`` module
+        # re-exports, so a generated program imports the public one and every
+        # spelling of the call has to agree with that import.
+        if module == "_operator":
+            module = "operator"
         if module is None:
             self.python_kernel_name = name
         elif module.startswith("tensorplay."):

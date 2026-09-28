@@ -96,14 +96,22 @@ class ProxyMode:
         self.enable_thunkify = False
 
     def __enter__(self) -> "ProxyMode":
-        self._token = _CURRENT_MODE.set(self)
+        # Tokens are kept on a stack of their own rather than in one field,
+        # because a context can be entered more than once over the span it
+        # covers.  A single field would be overwritten by the inner entry, and
+        # the exit that belongs to the outer entry would then restore the state
+        # the inner one replaced -- leaving this mode installed after everything
+        # that entered it has left, which is a trace that reports itself as
+        # running long after it stopped.
+        if not hasattr(self, "_tokens"):
+            self._tokens: list[Any] = []
+        self._tokens.append(_CURRENT_MODE.set(self))
         return self
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        token = getattr(self, "_token", None)
-        if token is not None:
-            _CURRENT_MODE.reset(token)
-            self._token = None
+        tokens = getattr(self, "_tokens", None)
+        if tokens:
+            _CURRENT_MODE.reset(tokens.pop())
 
     @contextmanager
     def enable_decompositions(
@@ -603,10 +611,21 @@ def get_dispatch_modes() -> list[ProxyMode]:
 
 @contextmanager
 def disable_proxy_modes_tracing() -> Generator[ProxyMode | None, None, None]:
+    # Two stacks answer "is something being recorded right now", and a call that
+    # must not be recorded has to be off both of them.  The proxy state is the
+    # one an operator consults directly; the dispatch stack is the one every
+    # operator is routed through, and the mode that would record it sits on top
+    # of that.  Clearing only the first leaves the recording mode in place, and
+    # the call it makes is recorded as though it were part of the region -- which
+    # for an operator whose own body is the region means it records itself, and
+    # the region never gets recorded at all.
+    from tensorplay.utils._dispatch import _disable_current_modes
+
     previous = _CURRENT_MODE.get()
     token = _CURRENT_MODE.set(None)
     try:
-        yield previous
+        with _disable_current_modes():
+            yield previous
     finally:
         _CURRENT_MODE.reset(token)
 

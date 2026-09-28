@@ -57,4 +57,49 @@ def copy_if_misaligned(
     return tensor.clone().contiguous()
 
 
-__all__ = ["DEFAULT_ALIGNMENT", "copy_if_misaligned", "is_aligned"]
+def assert_size_stride_grouped(
+    items: Any,
+    sizes: Any,
+    strides: Any,
+    op_name: Any = None,
+) -> None:
+    """Check that each value still has the shape and distances it was given.
+
+    A compiled kernel is handed buffers by position, and the shapes it was
+    written against are numbers that were true when it was written.  If one of
+    them is no longer true then the kernel is reading a shape it was not written
+    for, and what comes out is not wrong in a way that shows -- it is a number
+    from somewhere else.  So the check is here, at the boundary, where the
+    answer can still be about the program rather than about the result.
+
+    Checked together rather than one at a time because that is how they were
+    written: the sizes and the distances of a whole group are one set of numbers
+    the caller promised together, and a partial check would pass a group that was
+    promised one way and delivered another.
+
+    Named by ``op_name`` because "a tensor was not the shape it was called with"
+    says nothing about which of several calls was wrong, and the caller of a
+    generated kernel cannot see which of its values became which.
+    """
+
+    for item, size, stride in zip(items, sizes, strides):
+        if tuple(item.shape) != tuple(size):
+            where = f" in {op_name}" if op_name else ""
+            raise AssertionError(
+                f"Tensor shape mismatch{where}: expected {tuple(size)}, "
+                f"got {tuple(item.shape)}"
+            )
+        if tuple(item.stride()) != tuple(stride):
+            where = f" in {op_name}" if op_name else ""
+            raise AssertionError(
+                f"Tensor stride mismatch{where}: expected {tuple(stride)}, "
+                f"got {tuple(item.stride())}"
+            )
+
+
+__all__ = [
+    "DEFAULT_ALIGNMENT",
+    "assert_size_stride_grouped",
+    "copy_if_misaligned",
+    "is_aligned",
+]

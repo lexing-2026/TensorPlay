@@ -1640,6 +1640,7 @@ class PythonWrapperCodegen(CodeGen):
                 from ctypes import c_void_p, c_long, c_int
                 import tensorplay as tp
                 import math
+                import operator
                 import random
                 import os
                 import tempfile
@@ -2008,7 +2009,18 @@ class PythonWrapperCodegen(CodeGen):
     def write_assert_size_stride_grouped(
         self, asserts: list[tuple[str, str, str]], op_name: str
     ) -> None:
-        """Queue a grouped assert_size_stride for emission during replay."""
+        """Queue a grouped assert_size_stride for emission during replay.
+
+        The check is named by a function the generated unit has to be able to
+        call, so the import is written where the call will be: an emitted unit
+        that names a function it never imported is a unit that fails on its first
+        call rather than on the shape that was wrong.
+        """
+
+        self.imports.writeline(
+            "from tensorplay.compiler.backends.stax.runtime.alignment import "
+            "assert_size_stride_grouped"
+        )
         self.writeline(GroupedAssertSizeStrideLine(self, asserts, op_name))
 
     def _codegen_assert_size_stride_grouped(

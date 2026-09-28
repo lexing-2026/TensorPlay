@@ -48,6 +48,31 @@ class DispatchTracer:
         # impl identity -> (tensor kept alive, node producing it)
         self._tracked: dict[int, tuple[Any, Node]] = {}
         self._constant_count = 0
+        self._proxy_mode: Any = None
+
+    @property
+    def proxy_mode(self) -> Any:
+        """The state a decomposition helper reads while this trace runs.
+
+        An operator that a trace is meant to keep whole -- one that stands for a
+        region of the program rather than a single operation -- decides whether
+        to record itself as a node by asking whether a proxy trace is currently
+        recording.  That question is answered by what is on the dispatch stack,
+        so a trace that is entered directly, without going through the entry
+        point that sets this up, would otherwise leave those operators unable to
+        tell that they are being traced and they would run themselves instead.
+
+        Built on first use, so a tracer that never runs a decomposition keeps no
+        extra state.  The table starts empty because the dispatcher mode holds
+        the decompositions that were asked for; this one is what a helper that
+        enables its own set reads and writes.
+        """
+
+        if self._proxy_mode is None:
+            from .proxy_tensor import ProxyMode
+
+            self._proxy_mode = ProxyMode(self)
+        return self._proxy_mode
 
     # -- tensor tracking ----------------------------------------------------
 
@@ -144,6 +169,34 @@ class ProxyTensorDispatchMode(TensorPlayDispatchMode):
     @classmethod
     def is_infra_mode(cls) -> bool:
         return True
+
+    def __enter__(self) -> "ProxyTensorDispatchMode":
+        super().__enter__()
+        # The dispatch stack is what an operator consults to decide whether it
+        # is being recorded, and the state a decomposition helper reads is a
+        # separate thing that has to be current for the same span.  Entering
+        # both together is what makes the two agree; entering only the stack
+        # leaves an operator that keeps itself whole unable to tell it is being
+        # traced, and it runs itself instead of becoming a node.
+        #
+        # The enter is re-entrant because recording a decomposed call steps
+        # inside this same mode to run the decomposition without recording it,
+        # so the depth of the stack and the number of times the state was
+        # entered have to be kept together.  Tokens are kept on a stack of
+        # their own for the same reason: a context that is entered twice has to
+        # be unwound in the reverse order, and the innermost token is the one
+        # that belongs to the innermost exit.
+        if not hasattr(self, "_proxy_mode_tokens"):
+            self._proxy_mode_tokens: list[Any] = []
+        self._proxy_mode_tokens.append(self.tracer.proxy_mode.__enter__())
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        tokens = getattr(self, "_proxy_mode_tokens", None)
+        if tokens:
+            tokens.pop()
+            self.tracer.proxy_mode.__exit__(exc_type, exc_value, traceback)
+        super().__exit__(exc_type, exc_value, traceback)
 
     def __tensorplay_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}

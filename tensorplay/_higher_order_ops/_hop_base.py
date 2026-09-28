@@ -195,9 +195,26 @@ def disable_functional_mode():
     yield
 
 
-@contextlib.contextmanager
 def disable_proxy_modes_tracing():
-    yield
+    """Run a block with no capture recording it.
+
+    An operator whose body is a whole region of the program is asked, before it
+    runs, whether a capture is recording.  A call made *by* that operator, to
+    find out what it returns, is not part of the region and must not be
+    recorded -- and it must not be recorded by the same rule that recorded the
+    operator, or the operator evaluates itself looking for the answer it was
+    supposed to be asked for, forever.
+
+    Imported where it is used rather than defined here, because the state it
+    suspends is the one the graph tracer owns, and a second copy of the answer
+    to "is a capture running" is a second thing to keep in step with the first.
+    """
+
+    from tensorplay.graph.experimental.proxy_tensor import (
+        disable_proxy_modes_tracing as _suspend,
+    )
+
+    return _suspend()
 
 
 class FakeTensorMode:

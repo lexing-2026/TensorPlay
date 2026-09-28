@@ -708,12 +708,24 @@ def _compile_region(
     else:
         try:
             with _compiler_context(), _preserve_module_state(model):
-                graph_module = Tracer(execute=True).trace(
-                    model,
-                    sample_inputs=_bind_sample_arguments(
-                        model, example_inputs, example_kwargs
-                    ),
-                )
+                tracer = Tracer(execute=True)
+                # An operator that stands for a region of the program -- rather
+                # than for one operation -- has to be told that a capture is
+                # running, or it runs itself and the region it stands for is
+                # inlined into the graph as the operations that implement it.
+                # That inlined form is correct, and it is exactly what a backend
+                # holding a schedule for that region can never be handed.  The
+                # state is entered around the trace alone: the passes that
+                # follow rewrite the graph that came out, and one of them
+                # evaluates values, which must not be recorded as part of the
+                # region.
+                with tracer.proxy_mode:
+                    graph_module = tracer.trace(
+                        model,
+                        sample_inputs=_bind_sample_arguments(
+                            model, example_inputs, example_kwargs
+                        ),
+                    )
                 # Default capture pipeline: canonicalize operators, then constant
                 # folding, then decomposition, common-subexpression elimination
                 # and dead code elimination; fusion hints are stamped last so
