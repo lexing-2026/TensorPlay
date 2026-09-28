@@ -260,7 +260,6 @@ class PythonKeyTracer(Tracer):
         super().__init__(*args, **kwargs)
         self.decomposition_table = dict(decomposition_table or {})
         self.tensor_tracker: dict[int, Any] = {}
-        self.proxy_mode = ProxyMode(self)
 
     # -- recording operations as they are performed ------------------------
     #
