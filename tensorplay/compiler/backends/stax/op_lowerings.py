@@ -300,7 +300,13 @@ def select_decomp_table() -> dict:
     # program was configured.
     tensorplay._decomp.decompositions_for_rng.register_rng_decompositions()
 
-    return dict(decomposition_table)
+    # The random table is merged in rather than kept apart, because a graph
+    # captured is meant to be written in terms of reads at a position.  It was
+    # kept apart while being written so that a read could ask the framework
+    # for values without the framework expanding the ask into another read.
+    table = dict(decomposition_table)
+    table.update(tensorplay._decomp.decompositions_for_rng.rng_decompositions)
+    return table
 
 
 def in_namespace(op: Any, namespace: str) -> bool:
@@ -3794,6 +3800,77 @@ def empty_strided(
     return pointwise
 
 
+register("empty_strided.default")(empty_strided)
+
+
+def _new_like(x: Any, size: Any, *, dtype: Any = None, device: Any = None) -> Any:
+    """A place to write, at a shape taken from another value.
+
+    What makes this a separate operation rather than a shape and a call to the
+    unfilled one is where the shape comes from: it is read off a value that
+    already exists, so a program can say what it wants without writing down how
+    big that is.  The extents and the distances of the value it is read from
+    are its own, so the result is at those extents and at those distances
+    unless the operation was told otherwise.
+    """
+
+    if size is None:
+        size = x.get_size()
+    device = device or x.get_device()
+    dtype = dtype or x.get_dtype()
+    return empty_strided(
+        size,
+        None,
+        dtype=dtype,
+        device=device,
+    )
+
+
+def _new_filled(x: Any, fill: Any, *, dtype: Any = None, device: Any = None) -> Any:
+    """A tensor of one value, shaped like another value.
+
+    The value is the one the operation was given and the shape is the one the
+    value it was given has, which is why this is a separate operation rather
+    than a shape and a call to the filled one: the shape is not written down
+    anywhere in the program, it is only referred to.
+    """
+
+    device = device or x.get_device()
+    dtype = dtype or x.get_dtype()
+    return _full(fill, device, dtype, x.get_size())
+
+
+register("new_empty.default")(_new_like)
+register("new_zeros.default")(functools.partial(_new_filled, fill=0))
+register("new_ones.default")(functools.partial(_new_filled, fill=1))
+
+
+def lower_full(size: Any, fill_value: Any, **kwargs: Any) -> Any:
+    """A tensor of one value, at a shape the program writes down."""
+
+    dtype = kwargs.get("dtype")
+    device = kwargs.get("device")
+    return _full(fill_value, device, dtype, size)
+
+
+def lower_zeros(size: Any, **kwargs: Any) -> Any:
+    """A tensor of zeros, at a shape the program writes down."""
+
+    return lower_full(size, 0, **kwargs)
+
+
+def lower_ones(size: Any, **kwargs: Any) -> Any:
+    """A tensor of ones, at a shape the program writes down."""
+
+    return lower_full(size, 1, **kwargs)
+
+
+register("full.default")(lower_full)
+register("zeros.default")(lower_zeros)
+register("ones.default")(lower_ones)
+
+
+
 def gather(x: Any, dim: Any, index: Any, sparse_grad: Any = False) -> Any:
     """One value per position asked for, each read at an index of its own.
 
@@ -4316,6 +4393,13 @@ def tensor(
 
     ranges: list = []
 
+    # An index is the type the kernel indexes by, and the index machinery asks
+    # the type of an index as a type -- to know what it can hold and what it can
+    # be arithmetic on -- rather than as a name to look up later. So the name a
+    # constant is written under is turned into the type here, once, where the
+    # name is still in hand, and every index written below is handed the type.
+    _index_dtype = getattr(tp, "int64", "int64")
+
     # Narrower than a float is a type a real number is rounded to on the way in,
     # so the rounding is done here -- where it is a fact about the constant
     # rather than about the code generated from it.
@@ -4324,7 +4408,7 @@ def tensor(
     if isinstance(data, sympy.Basic):
 
         def inner_fn(index: Any) -> Any:
-            result = ops.index_expr(data, dtype)
+            result = ops.index_expr(data, _index_dtype)
             if _truncate_fp:
                 result = ops.to_dtype(result, "float32")
                 result = ops.to_dtype(result, dtype)
@@ -4360,8 +4444,8 @@ def tensor(
                 mid = (end - start) // 2 + start
                 return ops.where(
                     ops.lt(
-                        ops.index_expr(index[0], "int64"),
-                        ops.constant(mid, "int64"),
+                        ops.index_expr(index[0], _index_dtype),
+                        ops.constant(mid, _index_dtype),
                     ),
                     binary_search(start, mid),
                     binary_search(mid, end),

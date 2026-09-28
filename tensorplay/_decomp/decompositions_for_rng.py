@@ -25,10 +25,25 @@ __all__ = [
     "PhiloxState",
     "PhiloxStateTracker",
     "register_rng_decompositions",
+    "rng_decompositions",
 ]
 
 aten = tensorplay.ops.tp
 rngprims = tensorplay.ops.prims
+
+# The reads go into a table of their own rather than into the table every other
+# decomposition shares.  The reason is the read at a position: it is written by
+# asking the framework for random values, and the framework's own answer to
+# that question is another read at a position, so the two would ask each other
+# for as long as a graph is traced.  Keeping them apart is what stops that --
+# a read expands in this table, and the operation it asks is not in it.
+rng_decompositions: dict[object, object] = {}
+
+
+def register_rng_decomposition(op: object):
+    """Register a decomposition in the random table rather than the shared one."""
+
+    return register_decomposition(op, registry=rng_decompositions)  # type: ignore[arg-type]
 
 # A device reads the stream four values at a time, so a count that is not a
 # multiple of four would leave the next read starting part-way through a group.
@@ -175,10 +190,10 @@ def register_rng_decompositions() -> None:
         return
     _registered = True
 
-    register_decomposition(aten.rand)(rand)
-    register_decomposition(aten.rand_like)(rand_like)
-    register_decomposition(aten.bernoulli_)(bernoulli_)
-    register_decomposition(aten.bernoulli.p)(bernoulli_p)
+    register_rng_decomposition(aten.rand)(rand)
+    register_rng_decomposition(aten.rand_like)(rand_like)
+    register_rng_decomposition(aten.bernoulli_)(bernoulli_)
+    register_rng_decomposition(aten.bernoulli.p)(bernoulli_p)
 
     # Collected after the four above, and handed on as their own table, so
     # that an operation reaching for a random value finds the read rather than
