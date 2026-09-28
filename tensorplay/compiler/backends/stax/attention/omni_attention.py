@@ -896,6 +896,48 @@ def create_omni_attention_kernel(
 
 
 @register_lowering(omni_attention_hop, type_promotion_kind=None)
+def _name_held_tensors(mask_parts: dict) -> dict:
+    """Give every tensor a mask holds a name the kernel can read it by.
+
+    A mask carries tensors that were built by the function that assembled the
+    mask, before this region was entered -- a kernel is written against what it
+    is handed, and a tensor nobody in this region computed is handed to it as
+    a tensor rather than as a value the region holds.  A value the region holds
+    is a buffer, and a buffer names where its memory is and what is in it;
+    what is in it is the tensor itself, which someone else still holds and
+    which therefore is not this region's to write.
+
+    Asking for the name of each one is what lets a kernel be written against
+    the mask: a kernel that reads a mask reads its four tensors by name, and a
+    name is what a buffer is read by.
+    """
+
+    from ..ir import FixedLayout, InputBuffer, TensorBox
+
+    named = {}
+    taken = {buffer.name for buffer in V.graph.buffers}
+    for key, value in mask_parts.items():
+        if not isinstance(value, tp.Tensor):
+            named[key] = value
+            continue
+        base = "omni_mask_" + str(value.dtype).rsplit(".", 1)[-1]
+        name = base
+        suffix = 0
+        while name in taken:
+            suffix += 1
+            name = f"{base}_{suffix}"
+        taken.add(name)
+        buffer = InputBuffer(
+            name=name,
+            layout=FixedLayout(value.device, value.dtype, value.shape),
+        )
+        tensor = TensorBox.create(buffer)
+        V.graph.name_to_buffer[buffer.name] = buffer
+        V.graph.buffers.append(buffer)
+        named[key] = tensor
+    return named
+
+
 def lower_omni_attention(
     query: Any,
     key: Any,
@@ -957,7 +999,7 @@ def lower_omni_attention(
 
     check_embedding_is_wide_enough(query, value)
 
-    mask_parts = unpack_block_mask(block_mask)
+    mask_parts = _name_held_tensors(unpack_block_mask(block_mask))
     mask_graph = mask_parts["mask_graph"]
 
     if backend == _BACKEND_FLASH:
@@ -1371,7 +1413,7 @@ def lower_omni_attention_backward(*args: Any, **kwargs: Any) -> Any:
             "for this one."
         )
 
-    mask_parts = unpack_block_mask(block_mask)
+    mask_parts = _name_held_tensors(unpack_block_mask(block_mask))
     mask_graph = mask_parts["mask_graph"]
 
     backend = kernel_options.get("BACKEND", _BACKEND_AUTO)
