@@ -185,18 +185,26 @@ class PointwiseSubgraphLowering:
             if self.additional_lowerings is not None and target in self.additional_lowerings:
                 return self.additional_lowerings[target](*args, **kwargs)
 
-            if target not in LOWERINGS:
+            # The table is written in terms of the name an operation goes by,
+            # and the thing a node holds is the operation itself.  The two are
+            # the same operation and they are not the same object: the name is
+            # what the table can be written and read in, and a lookup that used
+            # the object would find nothing for every operation in it.
+            from .op_lowerings import target_name
+
+            name = target_name(target)
+            if name not in LOWERINGS:
                 raise SubgraphLoweringException(
-                    f"{target} not supported in subgraph, (missing lowering)"
+                    f"{name} not supported in subgraph, (missing lowering)"
                 )
-            return LOWERINGS[target](*args, **kwargs)
+            return LOWERINGS[name](*args, **kwargs)
 
     def run(self, *args: Any) -> None:
         """Walk the subgraph, lowering each of its calls as it is reached."""
 
         from ....graph import Interpreter
 
-        interpreter = Interpreter(self.gm, self)
+        interpreter = Interpreter(self.gm, handler=self)
         interpreter.run(*args)
 
     def output(self, target: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:

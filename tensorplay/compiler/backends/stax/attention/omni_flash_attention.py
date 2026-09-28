@@ -1448,18 +1448,24 @@ def build_subgraph_module_buffer(args: Any, graph_module: Any) -> Any:
 
     from ..ir import ComputedBuffer, FlexibleLayout, StorageBox
     from ..subgraph_lowering import PointwiseSubgraphLowering
-    from tensorplay.utils._ordered_set import OrderedSet
-
-    from . import zeros_and_scatter_lowering
+    from tensorplay.graph.experimental.sympy_functions import OrderedSet
 
     # This one we gotta keep lazy
-    allowed = OrderedSet([tp.ops.omni.zeros_and_scatter.default])
+    # The operation is named by the identity it is registered under, and it is
+    # defined by this repository rather than by a library, so nothing else
+    # would have asked for it to exist: a program that never lowers a captured
+    # body never runs any of this.  Asking for it here -- at the point where it
+    # is named -- is what makes asking for the table below answer.
+    from tensorplay.primitives.omni_prims import register_omni_prims
+
+    register_omni_prims()
+    allowed = OrderedSet([tp.ops.omni.zeros_and_scatter])
     pw_subgraph = PointwiseSubgraphLowering(
         graph_module,
         root_graph_lowering=V.graph,
         allowed_mutations=allowed,
         additional_lowerings={
-            tp.ops.omni.zeros_and_scatter.default: zeros_and_scatter_lowering
+            tp.ops.omni.zeros_and_scatter: zeros_and_scatter_lowering
         },
     )
     with V.set_graph_handler(pw_subgraph):
@@ -1498,9 +1504,18 @@ def build_subgraph_module_buffer(args: Any, graph_module: Any) -> Any:
 
 
 def build_subgraph_buffer(args: Any, subgraph: Any) -> Any:
-    """The same, for a body that is already a graph of its own."""
+    """The same, for a body that is already a graph of its own.
 
-    return build_subgraph_module_buffer(args, subgraph.graph_module)
+    A body arrives either as the graph itself or wrapped with the guards that
+    were collected alongside it.  Only the graph is read here -- the guards say
+    when the body is still the body that was captured, which is a question
+    asked before the kernel is built, not while it is being built -- so both
+    spellings name the same graph and either may be handed in.
+    """
+
+    return build_subgraph_module_buffer(
+        args, getattr(subgraph, "graph_module", subgraph)
+    )
 
 
 def realize_captures_for_cutedsl(buffers: Any) -> Any:

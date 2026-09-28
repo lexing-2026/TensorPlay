@@ -4,6 +4,7 @@ import copy
 import dataclasses
 import dis
 import enum
+import operator
 import inspect
 import sys
 import types
@@ -484,22 +485,79 @@ class Proxy:
         return None
 
     def _property(self, name: str) -> Any:
-        """Resolve tensor metadata: concretely when a sample is available.
+        """Resolve tensor metadata: concretely whenever it can be settled.
 
-        Metadata (shape/dtype/device/...) is part of the compile signature,
-        so specializing on it adds no new recompile conditions; data reads
-        stay symbolic or raise.
+        Metadata (shape/dtype/device/...) is part of the compile signature, so
+        specializing on it adds no new recompile conditions -- which is why it
+        is read off the value rather than turned into a node. A node here would
+        be a value the program then branches on, and a branch on a node is a
+        branch the graph cannot record: what is behind it is not a value but a
+        promise, and a promise cannot be taken.
+
+        So the shape is settled from whatever is known about the value -- the
+        example, or the metadata the graph was captured with -- and only a shape
+        still carrying a free symbol becomes a node, because that one genuinely
+        is not known until the program runs with particular sizes.
         """
 
         sample = self._sample()
         self.tracer.metadata_touches.add((self.node.name, name))
         if sample is not None:
             return getattr(sample, name)
+        if name in ("shape", "size", "stride", "ndim", "dim", "numel", "nelement"):
+            meta = getattr(self.node, "meta", None) or {}
+            val = meta.get("val")
+            if val is not None:
+                return getattr(val, name)
         return self.tracer.create_proxy("call_function", getattr, (self, name), {})
 
     @property
     def shape(self) -> Any:
         return self._property("shape")
+
+    def size(self, *index: Any) -> Any:
+        """The extent of this value, or the number of them.
+
+        Answered from the value this stands for rather than recorded as a
+        computation, because an extent is a property of the value and not
+        something the program computed.  A program that reads it is reading a
+        fact about what it was handed, and a fact is answered by looking it up
+        -- recording it would put a node in the graph whose result was known
+        before the graph was asked anything.
+        """
+
+        if not index:
+            # Asked with no argument the question is "how many", and the number
+            # of extents is the answer -- the whole shape is a different
+            # question and is what the shape is for.
+            return len(self._property("shape"))
+        if len(index) > 1:
+            raise TypeError(f"size() takes at most 1 argument, got {len(index)}")
+        (position,) = index
+        shape = self._property("shape")
+        if isinstance(position, int):
+            return shape[position]
+        return self.tracer.create_proxy("call_function", operator.getitem, (shape, position), {})
+
+    def dim(self) -> Any:
+        """How many extents this value has."""
+
+        sample = self._sample()
+        if sample is not None:
+            return sample.dim()
+        return self._property("dim")
+
+    def numel(self) -> Any:
+        """How many values this value stands for."""
+
+        sample = self._sample()
+        if sample is not None:
+            return sample.numel()
+        return self._property("numel")
+
+    @property
+    def ndim(self) -> Any:
+        return self.dim()
 
     @property
     def dtype(self) -> "Proxy":
@@ -750,6 +808,40 @@ class MetaProxy(Proxy):
         return cls(result.node, result.tracer, meta_source.fake_mode)
 
 
+def _as_operation(method: Any) -> Any:
+    """The operation ``method`` names, in the form a graph can carry.
+
+    A graph holds operations and is asked about them constantly: whether one is
+    a particular operation worth rewriting, whether two nodes do the same thing
+    and may share a result, what to call the thing a node produced. Each of
+    those asks for the operation to be something that can be compared, put in a
+    table, and named -- none of which is required of a callable in general.
+
+    What a type hands out for a method is not always such an operation. Some
+    are given as a description of how to bind the method to a value, and that
+    description is only meaningful once a value is named, so it cannot be
+    compared with anything: two of them for the same method are as alike as
+    they can be and still not the same object to a table. What sits behind such
+    a description is the operation proper, which carries the same name, binds
+    the same way when the value is passed as the first argument, and compares
+    as one thing. So a method that cannot be carried is replaced by that, and
+    one that can is left as it is.
+    """
+
+    try:
+        hash(method)
+    except TypeError:
+        unbound = getattr(method, "__func__", None)
+        if unbound is not None:
+            try:
+                hash(unbound)
+            except TypeError:
+                pass
+            else:
+                return unbound
+    return method
+
+
 class Attribute(Proxy):
     """Lazy attribute access that becomes a method or attribute node on use."""
 
@@ -770,12 +862,21 @@ class Attribute(Proxy):
         return self._node
 
     def __call__(self, *args: Any, **kwargs: Any) -> Proxy:
-        # A method the tensor type has is that type's operation, not a message
-        # sent to a value: writing it as a call to the operation the method *is*
-        # is what lets everything downstream -- the lowering, the schedule, the
-        # kernel -- treat it as the arithmetic it is rather than as a call it
-        # does not know how to make.  A name the tensor type does not have is
-        # something else entirely, and stays a call to that name.
+        # A method the tensor type has -- add_, exp, sin -- is not a message
+        # sent to a value; it is that type's operation reached by a shorter
+        # name. Capturing it as a call to the name leaves the graph saying
+        # something the compiler does not know how to make, and the region
+        # falls back to being run as it was written. So a name the tensor type
+        # has is captured as a call to that operation, which is what everything
+        # downstream already expects: the lowering knows it, the schedule can
+        # fuse it, and the kernel can be written for it.
+        #
+        # The operation is taken off the type, not off the value, so that the
+        # graph holds the operation itself rather than one already bound to
+        # some particular value. A call is then written the same way however it
+        # arrived -- the value is the first argument -- and asking the graph to
+        # run the node on an example passes that example as the first
+        # argument, rather than binding it a second time.
         import tensorplay as tp
 
         tensor_type = tp.Tensor
@@ -787,7 +888,7 @@ class Attribute(Proxy):
         method = getattr(tensor_type, self.attr, None)
         if method is not None:
             return self.tracer.create_proxy(
-                "call_function", method, (self.root, *args), kwargs
+                "call_function", _as_operation(method), (self.root, *args), kwargs
             )
         return self.tracer.create_proxy(
             "call_method", self.attr, (self.root, *args), kwargs

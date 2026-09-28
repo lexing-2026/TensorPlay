@@ -408,10 +408,10 @@ def _math_attention_inner(
 
     scores = query.to(working_precision) @ key.to(working_precision).transpose(-2, -1)
 
-    b = tensorplay.arange(0, scores.size(0), device=scores.device)
-    h = tensorplay.arange(0, scores.size(1), device=scores.device)
-    m = tensorplay.arange(0, scores.size(2), device=scores.device)
-    n = tensorplay.arange(0, scores.size(3), device=scores.device)
+    b = tensorplay.arange(0, scores.shape[0], device=scores.device)
+    h = tensorplay.arange(0, scores.shape[1], device=scores.device)
+    m = tensorplay.arange(0, scores.shape[2], device=scores.device)
+    n = tensorplay.arange(0, scores.shape[3], device=scores.device)
     import os as _os
 
     captured_buffers_in_dim = (None,) * len(score_mod_other_buffers)
@@ -685,29 +685,49 @@ def trace_omni_attention(
     # and distances is what carries them and nothing else: it is filled with
     # nothing, so no number computed from it can be read, and every number
     # asked of it is the one the real value would have answered with.
+    def _contiguous_strides(size):
+        """The distances of a value whose extents are ``size``, laid end to end.
+
+        The innermost distance is one, because the values in a row are next to
+        each other; each one out from that is as many values as lie inside it,
+        because each step moves over exactly that many.
+        """
+
+        strides = [1] * len(size)
+        for axis in range(len(size) - 2, -1, -1):
+            strides[axis] = strides[axis + 1] * int(size[axis + 1])
+        return strides
+
     def _extents_of(value):
         if isinstance(value, Tensor):
-            size, stride = value.size(), value.stride()
+            # The distances are not asked for.  A stand-in only has to be able
+            # to be read the way the value it stands for is read, and what is
+            # read is the extents: the example is evaluated to find the shape
+            # of a result, and no number computed from it is ever looked at.
+            size = value.shape
             device, dtype = value.device, value.dtype
             needs_grad = value.requires_grad
         elif isinstance(value, _StandIn):
-            # A stand-in for a value knows the extents and distances of the
-            # value it stands for -- that is the whole of what is read off it
-            # here.  The extents it answers with are the ones the region was
-            # captured with and are already settled; the distances it answers
-            # with are still symbolic, so they are read off the sample the
-            # capture was given, which is the same value this stands for.
+            # The extents a stand-in answers with are the ones the region was
+            # captured with, and they are settled -- they are part of what the
+            # region was captured for.  The value behind them is the sample the
+            # capture was given, which is the value this stands for; it is read
+            # for its extents and nothing else, because nothing here reads a
+            # number out of it.
             sample = proxy_mode.tracer._samples.get(value.node.name)
             if sample is None:
                 return value
-            size, stride = sample.size(), sample.stride()
+            size = sample.shape
             device, dtype = value.device, value.dtype
             needs_grad = bool(sample.requires_grad)
         else:
             return value
         stand_in = tensorplay.empty_strided(
             size,
-            stride,
+            # The distances of a value whose extents are known and whose numbers
+            # are not read: the ones a value of this shape has, laid out one
+            # after another.
+            _contiguous_strides(size),
             device=device,
             dtype=dtype,
         )

@@ -1422,11 +1422,15 @@ def lower_omni_attention_backward(*args: Any, **kwargs: Any) -> Any:
         joint_outputs=joint_outputs,
         score_mod_other_buffers=score_mod_other_buffers,
     ):
-        needs_block_mask = not is_trivial_mask_graph(mask_graph.graph_module)
+        needs_block_mask = not is_trivial_mask_graph(
+            getattr(mask_graph, "graph_module", mask_graph)
+        )
         if grad_logsumexp is not None:
             (grad_logsumexp,) = maybe_realize([grad_logsumexp])
 
-        score_is_trivial = is_trivial_score_graph(fw_graph.graph_module)
+        score_is_trivial = is_trivial_score_graph(
+            getattr(fw_graph, "graph_module", fw_graph)
+        )
         return create_omni_flash_attention_backward_kernel(
             query,
             key,

@@ -41,6 +41,7 @@ class Interpreter:
         module: Any,
         garbage_collect_values: bool = True,
         graph: Graph | None = None,
+        handler: Any = None,
     ) -> None:
         self.module = module
         named_modules = getattr(module, "named_modules", None)
@@ -50,6 +51,13 @@ class Interpreter:
         self.name = "Interpreter"
         self.garbage_collect_values = garbage_collect_values
         self.extra_traceback = True
+        # A caller that wants a call answered rather than run supplies something
+        # that answers it.  A call is not always a call to be made: one that a
+        # region is going to lower is a description of work, and the region has
+        # to be the one that decides what that work is -- running it here would
+        # hand the operation values that belong to the region and not to this
+        # graph, and the failure would name a type rather than the mismatch.
+        self._handler = handler
         self.args_iter: Iterator[Any] = iter(())
         self._keyword_args: dict[str, Any] = {}
         self._placeholder_defaults: dict[str, Any] = {}
@@ -142,6 +150,15 @@ class Interpreter:
                 raise AssertionError(f"Expected args to be tuple, got {type(args)}")
             if not isinstance(kwargs, dict):
                 raise AssertionError(f"Expected kwargs to be dict, got {type(kwargs)}")
+            # A handler that answers for this kind of node answers it; one that
+            # has nothing to say about it leaves the question to the graph.  The
+            # question is asked of the handler first because a handler exists to
+            # take over the calls it was given, and a call it declines is one
+            # this graph is expected to be able to run itself.
+            if self._handler is not None:
+                answer = getattr(self._handler, node.op, None)
+                if answer is not None:
+                    return answer(node.target, args, kwargs)
             return getattr(self, node.op)(node.target, args, kwargs)
 
     @compatibility(is_backward_compatible=True)

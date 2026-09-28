@@ -2201,10 +2201,15 @@ def _apply_kernel_options(
 
 
 def _validate_embed_dim(query: Tensor, key: Tensor, value: Tensor) -> None:
-    if query.size(-1) != key.size(-1):
+    # Read through the shape rather than through the method form: while a
+    # region is being captured the extents a value stands for are settled --
+    # they are part of what the region was captured for -- so they can be
+    # compared here, where the method form would leave a value that has no
+    # answer until the graph is built, and a comparison cannot wait for that.
+    if query.shape[-1] != key.shape[-1]:
         raise ValueError(
             f"Expect query and key/value to have the same embedding dimension "
-            f"but got E={query.size(-1)} and E={key.size(-1)}."
+            f"but got E={query.shape[-1]} and E={key.shape[-1]}."
         )
 
 
@@ -2448,35 +2453,35 @@ def omni_attention(
     _validate_embed_dim(query, key, value)
     _validate_device(query, key, value)
     query, key, value = _enforce_mem_layouts(query, key, value)
-    if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
+    if len(query.shape) != 4 or len(key.shape) != 4 or len(value.shape) != 4:
         raise NotImplementedError("NYI: query, key, and value must be 4D tensors")
-    if (not enable_gqa) and query.size(-3) != key.size(-3):
+    if (not enable_gqa) and query.shape[-3] != key.shape[-3]:
         raise ValueError(
             f"Expect query and key/value to have the same number of heads "
-            f"but got Hq={query.size(-3)} and Hkv={key.size(-3)}. "
+            f"but got Hq={query.shape[-3]} and Hkv={key.shape[-3]}. "
             f"Try setting enable_gqa=True for GQA."
         )
     if enable_gqa:
-        Hq = query.size(1)
-        Hkv = key.size(1)
+        Hq = query.shape[1]
+        Hkv = key.shape[1]
         if Hq % Hkv != 0:
             raise ValueError(
                 f"Expect number of query heads to be a multiple of kv heads for GQA "
                 f"but got Hq={Hq} and Hkv={Hkv}."
             )
-    if query.size(0) != key.size(0):
+    if query.shape[0] != key.shape[0]:
         if block_mask is None:
             raise ValueError(
                 f"Expect query and key/value to have the same batch size, "
                 f"or non-none block_mask, "
-                f"but got block_mask=None, Bq={query.size(0)}, and Bkv={key.size(0)}."
+                f"but got block_mask=None, Bq={query.shape[0]}, and Bkv={key.shape[0]}."
             )
 
-        if block_mask.kv_num_blocks.size(0) != query.size(0):
+        if block_mask.kv_num_blocks.size(0) != query.shape[0]:
             raise ValueError(
                 f"Expect query and key/value to have the same batch size, "
                 f"or block_mask and query to have the same batch size, "
-                f"but got Bq={query.size(0)}, Bkv={key.size(0)}, B_block_mask={block_mask.kv_num_blocks.size(0)}."
+                f"but got Bq={query.shape[0]}, Bkv={key.shape[0]}, B_block_mask={block_mask.kv_num_blocks.size(0)}."
             )
 
     if score_mod is None:

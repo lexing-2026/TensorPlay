@@ -50,8 +50,10 @@ def _get_name(func: Callable[..., Any]) -> str:
 def _validate_and_get_batch_size(
     flat_in_dims: list[Optional[int]], flat_args: list[Any]
 ) -> int:
+    # Read the extent off the shape: asking a value how long it is takes the
+    # whole shape, and the one extent that is wanted is one of its positions.
     batch_sizes = [
-        arg.size(in_dim)
+        arg.shape[in_dim]
         for in_dim, arg in zip(flat_in_dims, flat_args)
         if in_dim is not None
     ]
