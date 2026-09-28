@@ -3812,18 +3812,15 @@ def _new_like(
     device: Any = None,
     pin_memory: Any = None,
 ) -> Any:
-    """A place to write, at a shape taken from another value.
+    """A place to write, at a shape the program writes down.
 
-    What makes this a separate operation rather than a shape and a call to the
-    unfilled one is where the shape comes from: it is read off a value that
-    already exists, so a program can say what it wants without writing down how
-    big that is.  The extents and the distances of the value it is read from
-    are its own, so the result is at those extents and at those distances
-    unless the operation was told otherwise.
+    The value this was called with is asked for its type and its device rather
+    than for its shape: what to write into is at a shape the program states,
+    and what the call gives is where and of what that shape is.  The distances
+    are worked out from the extents, because nothing here says the result is
+    laid out like anything.
     """
 
-    if size is None:
-        size = x.get_size()
     device = device or x.get_device()
     dtype = dtype or x.get_dtype()
     return empty_strided(
