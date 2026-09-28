@@ -6755,14 +6755,20 @@
 - func: output_nr(Tensor self) -> int
   variants: method
 - func: _version(Tensor self) -> int
+  manual_cpp_binding: true
+  manual_kernel_registration: true
   variants: method
 - func: requires_grad_(Tensor(a!) self, bool requires_grad=True) -> Tensor(a!)
+  manual_cpp_binding: true
+  manual_kernel_registration: true
   variants: method
 - func: retain_grad(Tensor(a!) self) -> ()
+  manual_cpp_binding: true
+  manual_kernel_registration: true
   variants: method
 - func: retains_grad(Tensor self) -> bool
-  variants: method
   manual_cpp_binding: true
+  variants: method
   manual_kernel_registration: true
 - func: _fw_primal(Tensor(a) self, int level) -> Tensor(a)
   variants: method
@@ -8111,9 +8117,16 @@
   tags: pointwise
 - func: detach(Tensor(a) self) -> Tensor(a)
   variants: function, method
+- func: size(Tensor self) -> int[]
+  device_check: NoCheck
+  variants: method
+  manual_cpp_binding: true
+  manual_kernel_registration: true
 - func: size.int(Tensor self, int dim) -> int
   device_check: NoCheck
-  variants: function
+  variants: method
+  manual_cpp_binding: true
+  manual_kernel_registration: true
 - func: sym_size.int(Tensor self, int dim) -> SymInt
   device_check: NoCheck
   variants: function
@@ -8190,9 +8203,16 @@
   variants: function
 - func: stft.center(Tensor self, int n_fft, int? hop_length=None, int? win_length=None, Tensor? window=None, bool center=True, str pad_mode="reflect", bool normalized=False, bool? onesided=None, bool? return_complex=None, bool? align_to_window=None) -> Tensor
   variants: function, method
+- func: stride(Tensor self) -> int[]
+  device_check: NoCheck
+  variants: method
+  manual_cpp_binding: true
+  manual_kernel_registration: true
 - func: stride.int(Tensor self, int dim) -> int
   device_check: NoCheck
-  variants: function
+  variants: method
+  manual_cpp_binding: true
+  manual_kernel_registration: true
 - func: sym_stride.int(Tensor self, int dim) -> SymInt
   device_check: NoCheck
   variants: function

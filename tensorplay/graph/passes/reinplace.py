@@ -84,8 +84,10 @@ def _inplace_target(node: Node) -> tuple[str, str] | None:
         if node.target in _VIEW_METHODS or node.target.endswith("_"):
             return None
         return "call_method", node.target + "_"
-    if node.op == "call_function" and node.target in _FUNCTION_METHODS:
-        return "call_method", _FUNCTION_METHODS[node.target] + "_"
+    if node.op == "call_function":
+        for known, name in _FUNCTION_METHODS.items():
+            if known is node.target:
+                return "call_method", name + "_"
     return None
 
 

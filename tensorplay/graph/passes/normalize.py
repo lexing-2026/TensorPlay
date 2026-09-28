@@ -45,6 +45,35 @@ _INPLACE_BINARY = {
 }
 
 
+def _lookup_by_identity(table: dict[Any, Any], target: Any) -> Any:
+    """The entry whose key *is* ``target``, or ``None`` if there is none.
+
+    Written as a walk rather than a lookup because the key must be found by
+    being the same object, and asking a dict for that would first demand the
+    key be hashable. A target naming an operation a type provides carries the
+    binding that class gave it, which need not be hashable, and a rewrite keyed
+    on a particular operation should not be put off by targets of another kind
+    appearing alongside it in the same graph.
+    """
+
+    for key, value in table.items():
+        if key is target:
+            return value
+    return None
+
+
+def _is_one_of(target: Any, candidates: frozenset) -> bool:
+    return any(target is candidate for candidate in candidates)
+
+
+def _inplace_binary_of(target: Any) -> Any:
+    return _lookup_by_identity(_INPLACE_BINARY, target)
+
+
+def _identity_right_of(target: Any) -> Any:
+    return _lookup_by_identity(_IDENTITY_RIGHT, target)
+
+
 def _is_scalar_literal(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
@@ -73,8 +102,15 @@ class NormalizeOperators(PassBase):
             if node.op != "call_function":
                 continue
             target = node.target
-
-            if target in _COMMUTATIVE and len(node.args) == 2:
+            # What is being asked here is whether the target is one of a short
+            # list of particular operations, so it is compared against them by
+            # identity rather than looked up. Looking a target up in a table
+            # requires it to be hashable, and a target that names an operation
+            # a type provides is not required to be: it can carry the binding
+            # its class gave it, and that makes it unfit to be a table key. A
+            # rewrite that is about a particular operation should not depend on
+            # the others being of a different kind.
+            if _is_one_of(target, _COMMUTATIVE) and len(node.args) == 2:
                 lhs, rhs = node.args
                 if _is_scalar_literal(lhs) and not _is_scalar_literal(rhs):
                     if _is_node_like(rhs):
@@ -82,14 +118,15 @@ class NormalizeOperators(PassBase):
                         modified = True
                         continue
 
-            if target in _INPLACE_BINARY and len(node.args) == 2:
+            inplace = _inplace_binary_of(target)
+            if inplace is not None and len(node.args) == 2:
                 lhs = node.args[0]
                 if (
                     _is_node_like(lhs)
                     and len(lhs.users) == 1
                     and next(iter(lhs.users)) is node
                 ):
-                    node.target = _INPLACE_BINARY[target]
+                    node.target = inplace
                     modified = True
                     continue
 
@@ -109,9 +146,10 @@ class NormalizeOperators(PassBase):
                     modified = True
                     continue
 
-            if target in _IDENTITY_RIGHT and len(node.args) == 2:
+            identity_right = _identity_right_of(target)
+            if identity_right is not None and len(node.args) == 2:
                 rhs = node.args[1]
-                if _is_scalar_literal(rhs) and rhs == _IDENTITY_RIGHT[target]:
+                if _is_scalar_literal(rhs) and rhs == identity_right:
                     replacement = node.args[0]
                     if _is_node_like(replacement):
                         _replace_node_everywhere(graph, node, replacement)

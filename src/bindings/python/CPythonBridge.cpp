@@ -18,6 +18,9 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <array>
+#include <atomic>
+#include <vector>
 
 namespace py = ::pybind11;
 
@@ -158,6 +161,13 @@ bool is_tensor_object(PyObject* value) {
     return g_tensor_type != nullptr && PyObject_TypeCheck(value, g_tensor_type);
 }
 
+// Whether any value has ever been found carrying a hook.  Until one is, the
+// hook layer has nothing to offer any call, and every operation would be
+// walked for one and found not to have it.  The flag flips the first time a
+// hook is actually found, so a call made before any hook exists skips the walk
+// and a call made after one exists takes it.
+std::atomic<bool> g_saw_any_hook{false};
+
 bool has_subclass_dispatch(PyObject* value) {
     PyObject* type = reinterpret_cast<PyObject*>(Py_TYPE(value));
     return has_attribute(type, "__tensorplay_dispatch__");
@@ -178,9 +188,50 @@ bool is_builtin_dispatch_free(PyObject* value) {
            type == Py_TYPE(Py_Ellipsis) || type == Py_TYPE(Py_NotImplemented);
 }
 
+// The candidate values a call might have to be handed to a hook, and the types
+// they are, held in order from the most derived outward.
+//
+// A call is asked about its candidates on the way in, and on the great
+// majority of calls there is nothing to ask: the values are of the one tensor
+// type, and a value of that type is never a candidate.  The list is therefore
+// built for a handful and thrown away before the call goes anywhere, which is
+// why it is not a container that asks the allocator for room on every call --
+// the asking is the whole of the cost when the list stays empty.
+template <typename T, std::size_t N>
+class SmallVector {
+public:
+    using iterator = T*;
+    using const_iterator = const T*;
+
+    iterator begin() { return data_.data(); }
+    iterator end() { return data_.data() + size_; }
+    const_iterator begin() const { return data_.data(); }
+    const_iterator end() const { return data_.data() + size_; }
+    std::size_t size() const { return size_; }
+    bool empty() const { return size_ == 0; }
+    T& operator[](std::size_t i) { return data_[i]; }
+    const T& operator[](std::size_t i) const { return data_[i]; }
+
+    void insert(iterator at, const T& value) {
+        iterator end_pos = data_.data() + size_;
+        for (iterator p = end_pos; p != at; --p) p[0] = p[-1];
+        *at = value;
+        ++size_;
+    }
+
+private:
+    std::array<T, N> data_{};
+    std::size_t size_ = 0;
+};
+
+// A receiver plus its arguments, which is how many candidates a call has
+// before anything is filtered out: one, and one per argument.
+using CandidateList = SmallVector<PyObject*, 4>;
+using CandidateTypeList = SmallVector<PyTypeObject*, 4>;
+
 bool insert_candidate(
-    PyObject* value, std::vector<PyObject*>& candidates,
-    std::vector<PyTypeObject*>& candidate_types, bool require_subclass) {
+    PyObject* value, CandidateList& candidates,
+    CandidateTypeList& candidate_types, bool require_subclass) {
     if (value == nullptr) return true;
     if (PyTuple_CheckExact(value) || PyList_CheckExact(value)) {
         const Py_ssize_t size = PySequence_Fast_GET_SIZE(value);
@@ -220,6 +271,7 @@ bool insert_candidate(
                                            : has_function_dispatch(value);
     if (PyErr_Occurred()) return false;
     if (!has_hook) return true;
+    g_saw_any_hook.store(true, std::memory_order_relaxed);
 
     auto* type = Py_TYPE(value);
     for (PyTypeObject* old_type : candidate_types) {
@@ -283,7 +335,43 @@ PyObject* call_dispatch_hook(
     return PyObject_Vectorcall(hook, hook_args, 4, nullptr);
 }
 
+// The public Python name an operation is reached by, kept per (name, method).
+//
+// Every call asks this: the hook layer is offered the operation under the name
+// the program wrote, so the name has to be resolved before the call can go
+// anywhere.  Resolving it means importing the module the name lives on and
+// reading the name off it, and doing that per call costs more than the
+// operation being called -- a query that answers an extent spends more time
+// looking up the name of the thing that would answer it than answering.
+//
+// So the name is resolved once and kept.  A name that was not there when it
+// was asked for is kept as absent too, so that a name which is not a public
+// one is not looked for again on every call either.
+struct PublicApiCacheEntry {
+    PyObject* api;   // borrowed-strong: a reference is held, or null if absent
+    bool looked;
+};
+
+inline PublicApiCacheEntry& public_api_cache_slot(
+    const char* op_name, bool is_method) {
+    static thread_local std::unordered_map<std::string,
+        std::array<PublicApiCacheEntry, 2>> cache;
+    std::string key = is_method ? std::string("m:") + op_name
+                                : std::string("f:") + op_name;
+    return cache[key][is_method ? 1 : 0];
+}
+
+PyObject* resolve_public_api(const char* op_name, bool is_method);
+
 PyObject* make_public_api(const char* op_name, bool is_method) {
+    PublicApiCacheEntry& slot = public_api_cache_slot(op_name, is_method);
+    if (slot.looked) return slot.api;
+    slot.looked = true;
+    slot.api = resolve_public_api(op_name, is_method);
+    return slot.api;
+}
+
+PyObject* resolve_public_api(const char* op_name, bool is_method) {
     PyObject* module = PyImport_ImportModule("tensorplay");
     if (module == nullptr) return nullptr;
 
@@ -376,8 +464,8 @@ void pop_active_function_hook(const char* op_name, PyTypeObject* type) {
 }
 
 bool collect_tensor_subclass_candidate(
-    PyObject* value, std::vector<PyObject*>& candidates,
-    std::vector<PyTypeObject*>& candidate_types) {
+    PyObject* value, CandidateList& candidates,
+    CandidateTypeList& candidate_types) {
     return insert_candidate(value, candidates, candidate_types, true);
 }
 
@@ -393,14 +481,15 @@ int tpx_py_try_tensor_function_dispatch(
         g_python_dispatch_tls.function_skip_next = false;
         return 0;
     }
-    if (g_python_dispatch_tls.function_state == TPX_ALL_DISABLED) {
+    if (g_python_dispatch_tls.function_state == TPX_ALL_DISABLED ||
+        g_saw_any_hook.load(std::memory_order_relaxed) == false) {
         return 0;
     }
 
     const Py_ssize_t nkw = kwnames == nullptr ? 0 : PyTuple_GET_SIZE(kwnames);
 
-    std::vector<PyObject*> candidates;
-    std::vector<PyTypeObject*> candidate_types;
+    CandidateList candidates;
+    CandidateTypeList candidate_types;
     if (is_method && !insert_candidate(receiver, candidates, candidate_types,
                                        false)) {
         return -1;
@@ -514,14 +603,15 @@ int tpx_py_try_tensor_subclass_dispatch(
         return 0;
     }
     if (g_python_dispatch_tls.function_state == TPX_ALL_DISABLED ||
-        g_python_dispatch_tls.function_state == TPX_SUBCLASSES_DISABLED) {
+        g_python_dispatch_tls.function_state == TPX_SUBCLASSES_DISABLED ||
+        g_saw_any_hook.load(std::memory_order_relaxed) == false) {
         return 0;
     }
 
     const Py_ssize_t nkw = kwnames == nullptr ? 0 : PyTuple_GET_SIZE(kwnames);
 
-    std::vector<PyObject*> candidates;
-    std::vector<PyTypeObject*> candidate_types;
+    CandidateList candidates;
+    CandidateTypeList candidate_types;
     if (is_method && !collect_tensor_subclass_candidate(
                          receiver, candidates, candidate_types)) {
         return -1;
@@ -700,7 +790,8 @@ int tpx_py_try_function_mode_dispatch(
         return 0;
     }
     if (g_python_dispatch_tls.function_state == TPX_ALL_DISABLED ||
-        g_python_dispatch_tls.function_modes.empty()) {
+        g_python_dispatch_tls.function_modes.empty() ||
+        g_saw_any_hook.load(std::memory_order_relaxed) == false) {
         return 0;
     }
 
@@ -712,8 +803,8 @@ int tpx_py_try_function_mode_dispatch(
         return -1;
     }
 
-    std::vector<PyObject*> candidates;
-    std::vector<PyTypeObject*> candidate_types;
+    CandidateList candidates;
+    CandidateTypeList candidate_types;
     if (is_method && !insert_candidate(receiver, candidates, candidate_types,
                                        false)) {
         Py_DECREF(call_kwargs);
@@ -911,6 +1002,41 @@ bool tpx_py_kwnames_has(PyObject* kwnames, const char* name) {
         }
     }
     return false;
+}
+
+bool tpx_py_kwnames_fill_holes(PyObject* kwnames, Py_ssize_t nargs,
+                               const char* const* kwlist, Py_ssize_t nkws) {
+    // Whether the keywords only fill holes, leaving the positionally given
+    // arguments exactly where the caller put them.
+    //
+    // Overload resolution reads the arguments that were passed positionally --
+    // what kind each one is, how many there are -- and that reading describes
+    // the call only while no keyword has claimed one of those positions.  A
+    // keyword naming a parameter at or past the number of positionals is
+    // filling a hole, so the reading still describes the call; a keyword naming
+    // one below it has taken an argument the reading already accounted for, and
+    // the call has to be resolved by trying the candidates instead.
+    //
+    // A keyword naming no parameter of this candidate at all is a call this
+    // candidate cannot serve, so it is reported as not filling holes and the
+    // candidate is settled by trying it.
+    if (kwnames == nullptr) return true;
+    const Py_ssize_t size = PyTuple_GET_SIZE(kwnames);
+    if (size == 0) return true;
+    for (Py_ssize_t i = 0; i < size; ++i) {
+        PyObject* key = PyTuple_GET_ITEM(kwnames, i);
+        if (!PyUnicode_Check(key)) return false;
+        Py_ssize_t slot = -1;
+        for (Py_ssize_t k = 0; k < nkws; ++k) {
+            if (kwlist[k] != nullptr &&
+                PyUnicode_CompareWithASCIIString(key, kwlist[k]) == 0) {
+                slot = k;
+                break;
+            }
+        }
+        if (slot < 0 || slot < nargs) return false;
+    }
+    return true;
 }
 
 ParsedArgs tpx_py_parse(PyObject* const* args, Py_ssize_t nargs,

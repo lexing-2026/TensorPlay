@@ -55,13 +55,25 @@ def _iter_flat(values: Tuple[Any, ...]):
         yield item
 
 
+def _is_foldable(target: Any) -> bool:
+    """Whether ``target`` is one of the operations worth folding.
+
+    Compared by identity rather than looked up: a target that names an
+    operation a type provides need not be hashable, and a fold keyed on a
+    particular operation should not be put off by the graph also carrying
+    targets of that kind.
+    """
+
+    return any(target is foldable for foldable in _FOLDABLE_TARGETS)
+
+
 class ConstFold(PassBase):
     """Fold whitelisted operations whose inputs are all ordinary values."""
 
     def __call__(self, graph_module) -> PassResult:
         modified = False
         for node in list(graph_module.graph.nodes):
-            if node.op != "call_function" or node.target not in _FOLDABLE_TARGETS:
+            if node.op != "call_function" or not _is_foldable(node.target):
                 continue
             if next(_iter_nodes(node.args), None) is not None:
                 continue

@@ -1442,7 +1442,6 @@ class GraphLowering(Interpreter):
             # path through the returned structure at which it sits.
             layout = MultiOutputLayout(
                 device=tensor_outputs[0].device,
-                size=tuple(int(s) for s in val.shape) if _is_tensor(val) else (),
             )
         else:
             layout = self._layout_of(tensor_outputs[0])

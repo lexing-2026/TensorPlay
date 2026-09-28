@@ -48,6 +48,17 @@ void tpx_py_parse_into(PyObject* const* args, Py_ssize_t nargs,
 // The tuple is supplied by the interpreter and is borrowed by the caller.
 bool tpx_py_kwnames_has(PyObject* kwnames, const char* name);
 
+// Whether the keywords only fill holes, so that the arguments the caller
+// passed positionally still stand exactly where they were put and can be read
+// as the shape of the call.  A keyword naming a parameter at or past the
+// number of positionals is filling a hole; one naming a parameter below it has
+// claimed an argument the positional reading already accounted for, and a
+// keyword naming no parameter of this overload at all is a call this overload
+// cannot serve.  Either way the answer is false.  kwlist is the parameter names
+// in order, as the overload's own argument parser is given them.
+bool tpx_py_kwnames_fill_holes(PyObject* kwnames, Py_ssize_t nargs,
+                               const char* const* kwlist, Py_ssize_t nkws);
+
 // Give Python Tensor subclasses the first chance to handle an operator.
 // Returns 1 when result is owned by the caller, 0 when native parsing should
 // continue, and -1 when Python has already set an exception.
