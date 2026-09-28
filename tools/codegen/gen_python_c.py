@@ -657,26 +657,31 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
     if nargs:
         body.append(f"        PyObject* slots[{nargs}];")
     if dispatch:
+        # The three layers are asked only when there is somewhere the call
+        # could be sent.  Asking them otherwise is three calls that can only
+        # answer "nothing here", and that is nearly every call.
+        recv = "self" if is_method else "nullptr"
+        meth = "true" if is_method else "false"
+        name = f.cpp_name
         body += [
+            "        if (tpx_py_hooks_active()) {",
             "        PyObject* tpx_dispatch_result = nullptr;",
             f'        const int tpx_mode_status = '
-            f'tpx_py_try_function_mode_dispatch("{f.cpp_name}", '
-            f' {"self" if is_method else "nullptr"}, '
-            f' {"true" if is_method else "false"}, args, nargs, kwnames, '
+            f'tpx_py_try_function_mode_dispatch("{name}", '
+            f" {recv}, {meth}, args, nargs, kwnames, "
             "&tpx_dispatch_result);",
             "        if (tpx_mode_status != 0) return tpx_dispatch_result;",
             f'        const int tpx_function_status = '
-            f'tpx_py_try_tensor_function_dispatch("{f.cpp_name}", '
-            f' {"self" if is_method else "nullptr"}, '
-            f' {"true" if is_method else "false"}, args, nargs, kwnames, '
+            f'tpx_py_try_tensor_function_dispatch("{name}", '
+            f" {recv}, {meth}, args, nargs, kwnames, "
             "&tpx_dispatch_result);",
             "        if (tpx_function_status != 0) return tpx_dispatch_result;",
             f'        const int tpx_dispatch_status = '
-            f'tpx_py_try_tensor_subclass_dispatch("{f.cpp_name}", '
-            f'{"self" if is_method else "nullptr"}, '
-            f'{"true" if is_method else "false"}, args, nargs, kwnames, '
+            f'tpx_py_try_tensor_subclass_dispatch("{name}", '
+            f"{recv}, {meth}, args, nargs, kwnames, "
             "&tpx_dispatch_result);",
             "        if (tpx_dispatch_status != 0) return tpx_dispatch_result;",
+            "        }",
         ]
 
     # Fold surplus positionals into a trailing IntList parameter
@@ -907,6 +912,9 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
             dispatch_method = "true" if variant == "method" else "false"
             out += [
                 "    try {",
+                # Asked only when there is somewhere the call could go; see the
+                # single-overload entry for why.
+                "        if (tpx_py_hooks_active()) {",
                 "        PyObject* tpx_dispatch_result = nullptr;",
                 f'        const int tpx_mode_status = '
                 f'tpx_py_try_function_mode_dispatch("{fs[0].cpp_name}", '
@@ -923,6 +931,7 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
                 f"{dispatch_self}, {dispatch_method}, args, nargs, kwnames, "
                 "&tpx_dispatch_result);",
                 "        if (tpx_dispatch_status != 0) return tpx_dispatch_result;",
+                "        }",
             ]
             # Kind-probe fast path: for positional-only calls, pick the single
             # compatible overload by argument kind instead of throwing on each

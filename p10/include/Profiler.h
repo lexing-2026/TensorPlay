@@ -139,6 +139,26 @@ TENSORPLAY_API extern std::atomic<bool> g_active;
 TENSORPLAY_API extern std::atomic<bool> g_capture_shapes;
 // When true AND g_active, binding entries capture the Python call site.
 TENSORPLAY_API extern std::atomic<bool> g_capture_sites;
+// Whether an annotation of this kind opens a range, which a session is not
+// required for: the range tools are told to mark are marked whether or not
+// anyone is collecting.  Declared up front because a record decides whether to
+// exist at all from these, and that decision is made where the call is.
+TENSORPLAY_API extern std::atomic<bool> g_emit_nvtx;
+TENSORPLAY_API extern std::atomic<bool> g_emit_itt;
+
+namespace prof {
+
+// Whether a record of this kind has anywhere to go.  An operation is recorded
+// into a session; a range is marked for whoever is watching marks, which is a
+// thing that can be wanted with no session running at all.
+inline bool is_recording(EventKind kind) {
+    if (g_active.load(std::memory_order_acquire)) return true;
+    if (kind != EventKind::kOp) return false;
+    return g_emit_nvtx.load(std::memory_order_relaxed) ||
+           g_emit_itt.load(std::memory_order_relaxed);
+}
+
+}  // namespace prof
 
 // Begins a session; clears any previously collected events.  Nesting
 TENSORPLAY_API void profiler_start();
@@ -150,10 +170,27 @@ TENSORPLAY_API std::vector<Event> profiler_stop();
 
 // RAII op/annotation record.  Name for kOp must be a static literal; user
 // annotations may pass any lifetime (an internal arena copies the bytes).
+//
+// Most calls are made with no session running, and those calls should cost
+// what it takes to find that out: an operation is recorded by writing down when
+// it started, which is work worth doing only while somewhere is keeping the
+// record.  So the question is asked here, where the answer can be had without
+// leaving the caller's translation unit, and the recording itself -- the slot,
+// the timestamp, the name -- stays out of line to be entered only when there
+// is something to record into.
 struct TENSORPLAY_API OpRecord {
-    explicit OpRecord(const char* name, EventKind kind = EventKind::kOp);
-    explicit OpRecord(const std::string& name, EventKind kind = EventKind::kUser);
-    ~OpRecord();
+    explicit OpRecord(const char* name, EventKind kind = EventKind::kOp) {
+        if (!prof::is_recording(kind)) return;
+        begin(name, nullptr, kind);
+    }
+    explicit OpRecord(const std::string& name, EventKind kind = EventKind::kUser) {
+        if (!prof::is_recording(EventKind::kUser)) return;
+        begin(nullptr, &name, kind);
+    }
+    ~OpRecord() {
+        if (!live_) return;
+        end();
+    }
     OpRecord(const OpRecord&) = delete;
     OpRecord& operator=(const OpRecord&) = delete;
 
@@ -171,6 +208,9 @@ private:
     friend struct GpuTimerPair;
     void begin(const char* static_name, const std::string* owned_name,
                EventKind kind);
+    // Closes the record.  Reached only from the destructor, and only when a
+    // record was actually opened.
+    void end();
     uint64_t start_ns_ = 0;
     size_t slot_ = 0;
     bool live_ = false;
@@ -296,7 +336,7 @@ TENSORPLAY_API void cupti_pop_ext();
 // also emits a matching NVTX range so nsight-systems timelines show
 // TensorPlay op names.  Raw passthroughs raise the historical stub error
 // when the library is unavailable (tensorplay.cuda.nvtx contract).
-TENSORPLAY_API extern std::atomic<bool> g_emit_nvtx;
+
 TENSORPLAY_API bool nvtx_available();
 TENSORPLAY_API int nvtx_range_push(const char* msg);
 TENSORPLAY_API int nvtx_range_pop();
@@ -310,7 +350,7 @@ TENSORPLAY_API void nvtx_span_end();
 // ---- ITT bridge (runtime-loaded libittnotify; VTune/Advisor) ------------
 // The ITT bridge emits task begin/end events onto
 // the "tensorplay" domain; silent no-op without the library.
-TENSORPLAY_API extern std::atomic<bool> g_emit_itt;
+
 TENSORPLAY_API bool itt_available();
 TENSORPLAY_API void itt_task_begin_name(const char* name);
 TENSORPLAY_API void itt_task_end();

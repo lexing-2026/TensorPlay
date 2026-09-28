@@ -340,15 +340,7 @@ void OpRecord::begin(const char* static_name, const std::string* owned_name,
     live_ = true;
 }
 
-OpRecord::OpRecord(const char* name, EventKind kind) {
-    begin(name, nullptr, kind);
-}
-
-OpRecord::OpRecord(const std::string& name, EventKind kind) {
-    begin(nullptr, &name, kind);
-}
-
-OpRecord::~OpRecord() {
+void OpRecord::end() {
     if (nvtx_open_) { nvtx_open_ = false; nvtx_span_end(); }
     if (itt_open_) { itt_open_ = false; itt_span_end(); }
     if (!live_) return;

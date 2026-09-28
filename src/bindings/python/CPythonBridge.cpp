@@ -781,6 +781,12 @@ Py_ssize_t tpx_py_function_mode_len() {
     return static_cast<Py_ssize_t>(g_python_dispatch_tls.function_modes.size());
 }
 
+bool tpx_py_hooks_active() {
+    if (g_python_dispatch_tls.function_skip_next) return true;
+    if (!g_python_dispatch_tls.function_modes.empty()) return true;
+    return g_saw_any_hook.load(std::memory_order_relaxed);
+}
+
 int tpx_py_try_function_mode_dispatch(
     const char* op_name, PyObject* receiver, bool is_method,
     PyObject* const* args, Py_ssize_t nargs, PyObject* kwnames,

@@ -78,6 +78,21 @@ enum tpx_py_function_state : unsigned char {
     TPX_ALL_DISABLED = 2,
 };
 
+// Whether any hook layer could have something to say about a call.
+//
+// Every operation offers the call to the function modes and to the values in it
+// before doing its own work, which is what lets a program watch or replace an
+// operation from outside.  Offering costs three calls, and on a call with
+// nothing watching -- which is nearly all of them -- each of those is a call
+// that can only answer "nothing here".
+//
+// So the question is asked once, where it can be had without leaving the
+// caller's translation unit: a function mode registered, or any value ever seen
+// carrying a hook.  Either means there is somewhere the call could be sent, and
+// the three are then asked as they should be.  Neither means there is not, and
+// three calls are not made only to be told so.
+bool tpx_py_hooks_active();
+
 int tpx_py_get_function_state();
 bool tpx_py_set_function_state(int state);
 bool tpx_py_exchange_skip_next(bool value);
