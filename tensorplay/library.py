@@ -709,7 +709,40 @@ class CustomOpDef:
             captured = _capture_call(self, args, kwargs)
             if captured is not None:
                 return captured
+        tracer = _recording_tracer()
+        if tracer is not None:
+            # A library operation is a node in a graph just as an operation
+            # reached through the dispatcher is, and the operation that reads
+            # randomness takes its position from a pair of tensors rather than
+            # from a proxy -- so the walk above finds nothing to record it
+            # from, and the values it produced would be held by name in the
+            # graph instead of being tied to the node that produced them.
+            #
+            # The recording is done here rather than by handing the call to a
+            # mode on the stack: a mode that stands values in for real ones
+            # answers a call by making it again, and that call is this one.
+            out = self._eager_call(args, kwargs)
+            tracer.record(self, args, kwargs, out)
+            return out
         return self._eager_call(args, kwargs)
+
+
+def _recording_tracer() -> Any:
+    """The tracer of a graph being traced, where there is one.
+
+    A mode on the stack is not by itself a recorder: a mode that stands values
+    in for real ones answers an operation by running it against the stand-ins,
+    and the tracer of a mode that records is the one that knows which graph is
+    being written.  Only a mode that carries such a tracer counts.
+    """
+
+    from .utils._dispatch import _get_current_dispatch_mode_stack
+
+    for mode in reversed(_get_current_dispatch_mode_stack()):
+        tracer = getattr(mode, "tracer", None)
+        if tracer is not None and hasattr(tracer, "record"):
+            return tracer
+    return None
 
 
 def _first_device_key(values: tuple[Any, ...]) -> str | None:

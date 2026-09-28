@@ -108,14 +108,36 @@ class DispatchTracer:
             return {key: self.map_value(item) for key, item in value.items()}
         return value
 
+    def map_operands(self, value: Any) -> Any:
+        """The value with the values a node stands for replaced by that node.
+
+        An operation's arguments are the values it was handed, and a value
+        nothing has computed is one of them whatever the graph is doing: it was
+        read, it is not something to be recomputed, and a graph that tried to
+        find a node for it would be looking for an operation that never
+        happened.  So a value a node already stands for becomes that node, and
+        any other value is left as it is.
+        """
+
+        if _is_tensor(value):
+            entry = self._tracked.get(value._impl_id)
+            return entry[1] if entry is not None else value
+        if isinstance(value, tuple):
+            return tuple(self.map_operands(item) for item in value)
+        if isinstance(value, list):
+            return [self.map_operands(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self.map_operands(item) for key, item in value.items()}
+        return value
+
     # -- operator nodes -----------------------------------------------------
 
     def record(self, func: Any, args: tuple[Any, ...], kwargs: Mapping[str, Any], out: Any) -> Node:
         node = self.graph.create_node(
             "call_function",
             func,
-            self.map_value(tuple(args)),
-            self.map_value(dict(kwargs)),
+            self.map_operands(tuple(args)),
+            self.map_operands(dict(kwargs)),
             name=getattr(func, "_opname", None),
         )
         if _is_tensor(out):
