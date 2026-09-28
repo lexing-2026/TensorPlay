@@ -1618,7 +1618,7 @@ def _sdpa_math_attention(query, key, value, attn_mask, dropout_p, is_causal,
         # Dropping is written as the operation that keeps what it kept, which
         # already rescales what it kept so that what survives averages to what
         # was there.
-        probs = ops.native_dropout.default(probs, dropout_p)[0]
+        probs = ops.native_dropout.default(probs, dropout_p, True)[0]
     return tp.matmul(probs, value)
 
 

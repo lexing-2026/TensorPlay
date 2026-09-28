@@ -61,6 +61,14 @@
   output_differentiability: [True, False]
   input: "native_dropout_backward(grad, ret1, (!train.has_value() || !train.value() ? 1.0 : (p == 1 ? 0.0 : 1.0 / (1.0 - p))))"
 
+# The backward of the fused dropout is a linear scaling of the incoming
+# gradient, so a second derivative taken through it is that scaling again.
+# The mask was read to decide what survived, not to decide what a change in
+# the mask would do, so only the gradient that arrives for the output is
+# answered.
+- name: native_dropout_backward(Tensor grad_output, Tensor mask, float scale) -> Tensor
+  grad_output: native_dropout_double_backward(grad, grad_output, mask, scale)
+
 # Alpha dropout keeps the kept-elements slope at `a`; the affine offset b
 # contributes no gradient. a = 1/sqrt((alpha^2 p + 1)(1 - p)) is recomputed
 # in the backward kernel from the scalar p.

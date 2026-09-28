@@ -334,8 +334,7 @@ def dropout(input, p=0.5, training=True, inplace=False):
         mask = (_C.rand(input.shape, device=input.device) > p).to(input.dtype)
         return input.mul_(mask).mul_(1.0 / (1.0 - p))
 
-    out, _mask = _C.native_dropout(input, p)
-    return out
+    return _C.dropout(input, p, training)
 
 def dropout2d(input, p=0.5, training=True, inplace=False):
     if p < 0 or p > 1:

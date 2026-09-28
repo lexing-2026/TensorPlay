@@ -39,6 +39,7 @@ Tensor& resize__cpu(Tensor& self, const std::vector<int64_t>& size);
 std::tuple<Tensor, Tensor> native_dropout_cpu(const Tensor& input, double p,
                                              std::optional<bool> train);
 Tensor native_dropout_backward_cpu(const Tensor& grad_output, const Tensor& mask, double scale);
+Tensor native_dropout_double_backward_cpu(const Tensor& ggI, const Tensor& grad, const Tensor& mask, double scale);
 std::tuple<Tensor, Tensor> native_alpha_dropout_cpu(const Tensor& input, double p);
 Tensor alpha_dropout_backward_cpu(const Tensor& grad, const Tensor& mask, double p);
 std::tuple<Tensor, Tensor> native_feature_dropout_cpu(const Tensor& input, double p);
@@ -520,6 +521,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, MiscKernels) {
     m.impl("resize_", resize__cpu);
     m.impl("native_dropout", native_dropout_cpu);
     m.impl("native_dropout_backward", native_dropout_backward_cpu);
+    m.impl("native_dropout_double_backward", native_dropout_double_backward_cpu);
     m.impl("native_alpha_dropout", native_alpha_dropout_cpu);
     m.impl("_alpha_dropout_backward", alpha_dropout_backward_cpu);
     m.impl("native_feature_dropout", native_feature_dropout_cpu);
@@ -678,6 +680,14 @@ std::tuple<Tensor, Tensor> native_dropout_cpu(const Tensor& input, double p,
 
 Tensor native_dropout_backward_cpu(const Tensor& grad_output, const Tensor& mask, double scale) {
     return grad_output * mask.to(grad_output.dtype()) * scale;
+}
+
+// The backward scales the incoming gradient by the kept-mask and the scale.
+// That product is linear in the incoming gradient, so differentiating it a
+// second time multiplies the incoming gradient by the same two factors; only
+// the gradient arriving is different, not the arithmetic.
+Tensor native_dropout_double_backward_cpu(const Tensor& ggI, const Tensor& grad, const Tensor& mask, double scale) {
+    return ggI * mask.to(ggI.dtype()) * scale;
 }
 
 // ---------------------------------------------------------------------------

@@ -23,6 +23,7 @@ Tensor& resize__cuda(Tensor& self, const std::vector<int64_t>& size);
 std::tuple<Tensor, Tensor> native_dropout_cuda(const Tensor& input, double p,
                                              std::optional<bool> train);
 Tensor native_dropout_backward_cuda(const Tensor& grad_output, const Tensor& mask, double scale);
+Tensor native_dropout_double_backward_cuda(const Tensor& ggI, const Tensor& grad, const Tensor& mask, double scale);
 std::tuple<Tensor, Tensor> native_alpha_dropout_cuda(const Tensor& input, double p);
 Tensor alpha_dropout_backward_cuda(const Tensor& grad, const Tensor& mask, double p);
 std::tuple<Tensor, Tensor> native_feature_dropout_cuda(const Tensor& input, double p);
@@ -300,6 +301,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, MiscKernels) {
     m.impl("resize_", resize__cuda);
     m.impl("native_dropout", native_dropout_cuda);
     m.impl("native_dropout_backward", native_dropout_backward_cuda);
+    m.impl("native_dropout_double_backward", native_dropout_double_backward_cuda);
     m.impl("native_alpha_dropout", native_alpha_dropout_cuda);
     m.impl("_alpha_dropout_backward", alpha_dropout_backward_cuda);
     m.impl("native_feature_dropout", native_feature_dropout_cuda);
@@ -612,6 +614,15 @@ Tensor native_dropout_backward_cuda(const Tensor& grad_output, const Tensor& mas
         default: break;
     }
     return out;
+}
+
+// The backward scales the incoming gradient by the kept-mask and the scale.
+// That product is linear in the incoming gradient, so differentiating it a
+// second time multiplies the incoming gradient by the same two factors: the
+// same arithmetic on the same kinds of mask, which is what the first backward
+// already writes.
+Tensor native_dropout_double_backward_cuda(const Tensor& ggI, const Tensor& grad, const Tensor& mask, double scale) {
+    return native_dropout_backward_cuda(ggI, mask, scale);
 }
 
 

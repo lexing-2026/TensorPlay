@@ -1539,6 +1539,19 @@
     CUDA: native_dropout_backward_cuda
   tags: pointwise
 
+# The second derivative of the fused dropout.  It takes the gradient that
+# arrived for the backward's own output as well as the values that backward
+# read, because those are what it differentiated: the backward multiplies the
+# incoming gradient by the mask and the scale, and that product is linear in
+# the incoming gradient, so the second derivative multiplies the arriving
+# gradient by the same two factors.
+- func: native_dropout_double_backward(Tensor ggI, Tensor grad, Tensor mask, float scale) -> Tensor
+  variants: function
+  dispatch:
+    CPU: native_dropout_double_backward_cpu
+    CUDA: native_dropout_double_backward_cuda
+  tags: pointwise
+
 # Alpha / feature dropout fused forward, same (output, mask) contract as
 # native_dropout so the backward can reapply the saved mask:
 #   alpha:   out = x * mask * a + b,  a = 1/sqrt((alpha^2 p + 1)(1 - p)),
