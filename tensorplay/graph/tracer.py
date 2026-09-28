@@ -34,6 +34,23 @@ def _is_module(value: Any) -> bool:
 _UNRESOLVED = object()
 
 
+def _is_higher_order(target: Any) -> bool:
+    """Whether ``target`` is an operator standing for a whole region.
+
+    Asked by what the target is rather than by where it was found, because the
+    same operator is reached from several places and only its own kind says
+    that running it would be recording rather than computing.  The kind is read
+    through the base class the operators share, and by that class's own name
+    rather than by importing it: a graph is captured from every kind of
+    program, and asking one of them whether an operator is an operator would
+    make capturing a graph depend on which one happened to be imported first.
+    """
+
+    return any(
+        base.__name__ == "HigherOrderOperator" for base in type(target).__mro__
+    )
+
+
 class Tracer:
     """Capture a callable into the canonical graph.
 
@@ -304,7 +321,13 @@ class Tracer:
             raise GraphCaptureError("graph capture is disabled for this operation")
         proxy = Proxy(self.graph.create_node(kind, target, args, kwargs), self)
         _apply_preserved_node_meta(proxy.node)
-        if self.execute and kind != "placeholder":
+        # An operator standing for a whole region brings the shape of what it
+        # returns with it, attached to the node it made.  Running it here would
+        # both re-enter the region being recorded and leave this node's sample
+        # naming values that came from that run -- so there is nothing to learn
+        # by running it, and the sample it would leave would be about the run
+        # rather than about the region.
+        if self.execute and kind != "placeholder" and not _is_higher_order(target):
             self._execute_node(proxy.node)
         return proxy
 

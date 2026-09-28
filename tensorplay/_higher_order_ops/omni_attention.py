@@ -412,6 +412,7 @@ def _math_attention_inner(
     h = tensorplay.arange(0, scores.size(1), device=scores.device)
     m = tensorplay.arange(0, scores.size(2), device=scores.device)
     n = tensorplay.arange(0, scores.size(3), device=scores.device)
+    import os as _os
 
     captured_buffers_in_dim = (None,) * len(score_mod_other_buffers)
 
@@ -661,31 +662,89 @@ def trace_omni_attention(
         track_tensor_tree,
         unwrap_proxy,
     )
+    from tensorplay.graph.proxy import Proxy as _StandIn
 
-    # The mode must not intercept its own implementation body: evaluate the
-    # example output with the capture suspended, then trace the subgraphs.
-    with disable_proxy_modes_tracing():
+    # The example is the shape of what this operator returns, not a record of
+    # work: nothing downstream reads its numbers, and the only thing wanted from
+    # it is the set of values and their shapes to hang off the node.  So it is
+    # evaluated where a tensor is a stand-in for a value, which makes the
+    # operators it runs describe themselves without running on data.  Evaluating
+    # it on real values instead would be running the implementation -- and the
+    # implementation is this operator, so the evaluation would come back here
+    # and there would be no shape at the end of it.
+    #
+    # The mode must also not intercept its own body, or the operators that
+    # describe the result would be recorded as part of the region being traced.
+    #
+    # A stand-in is not something the implementation can be run on.  What the
+    # implementation does with its operands is read from them -- their extents,
+    # their distances, their type -- and then used to decide the extents of
+    # what it returns, and a value that is only a stand-in for another one has
+    # to be replaced by a value that actually has those extents and distances
+    # before that reading means anything.  An empty tensor of the same extents
+    # and distances is what carries them and nothing else: it is filled with
+    # nothing, so no number computed from it can be read, and every number
+    # asked of it is the one the real value would have answered with.
+    def _extents_of(value):
+        if isinstance(value, Tensor):
+            size, stride = value.size(), value.stride()
+            device, dtype = value.device, value.dtype
+            needs_grad = value.requires_grad
+        elif isinstance(value, _StandIn):
+            # A stand-in for a value knows the extents and distances of the
+            # value it stands for -- that is the whole of what is read off it
+            # here.  The extents it answers with are the ones the region was
+            # captured with and are already settled; the distances it answers
+            # with are still symbolic, so they are read off the sample the
+            # capture was given, which is the same value this stands for.
+            sample = proxy_mode.tracer._samples.get(value.node.name)
+            if sample is None:
+                return value
+            size, stride = sample.size(), sample.stride()
+            device, dtype = value.device, value.dtype
+            needs_grad = bool(sample.requires_grad)
+        else:
+            return value
+        stand_in = tensorplay.empty_strided(
+            size,
+            stride,
+            device=device,
+            dtype=dtype,
+        )
+        if needs_grad:
+            stand_in.requires_grad_(True)
+        return stand_in
+
+    with disable_proxy_modes_tracing(), FakeTensorMode():
         example_out = omni_attention(
-            query,
-            key,
-            value,
+            _extents_of(query),
+            _extents_of(key),
+            _extents_of(value),
             score_mod,
-            block_mask,
+            tuple(_extents_of(part) for part in block_mask),
             scale,
             kernel_options,
             score_mod_other_buffers,
             mask_mod_other_buffers,
         )
-    example_vals = [query.new_zeros((), requires_grad=query.requires_grad)] + [
-        query.new_zeros((), dtype=tensorplay.int64) for _ in range(4)
-    ]
-    mask_example_vals = [query.new_zeros((), dtype=tensorplay.int64) for _ in range(4)]
+    # The modifiers are traced on stand-ins of their own: a zero-sized value
+    # for the score and an index for each of the four extents they are handed.
+    # They are made from the value rather than asked of it, because asking a
+    # stand-in for a value to make one is a way of recording that request, and
+    # what is wanted here is a shape to trace against rather than a node to
+    # appear in the graph.
+    _probe = tensorplay.empty_strided((), (), device=query.device, dtype=query.dtype)
+    _index_probe = tensorplay.empty_strided(
+        (), (), device=query.device, dtype=tensorplay.int64
+    )
+    example_vals = [_probe] + [_index_probe for _ in range(4)]
+    mask_example_vals = [_index_probe for _ in range(4)]
     mask_mod = block_mask[-1]
     with TransformGetItemToIndex():
-        score_graph = reenter_make_fx(score_mod)(
+        score_graph = _maybe_reenter_make_fx(score_mod)(
             *example_vals, *score_mod_other_buffers
         )
-        mask_graph = reenter_make_fx(mask_mod)(
+        mask_graph = _maybe_reenter_make_fx(mask_mod)(
             *mask_example_vals, *mask_mod_other_buffers
         )
     block_mask = block_mask[:-1] + (mask_graph,)

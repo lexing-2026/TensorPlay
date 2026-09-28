@@ -228,19 +228,42 @@ def track_tensor_tree(
     constant: Any = None,
     tracer: Any = None,
 ) -> Any:
+    # What comes back is the stand-in, not the value it stands for.  The value
+    # came from running something -- from an example computed to find the shape
+    # of a result -- and a graph can only name its own nodes, so handing the
+    # value on would leave the graph pointing at a region it does not contain.
+    # Handing back the stand-in leaves it naming the node that was made for it,
+    # which is the node the rest of the graph should be built on.
     if isinstance(proxy, Proxy):
-        return track_tensor(value, proxy, constant=constant, tracer=tracer)
+        # The value paired with a stand-in is whatever the run that made it
+        # returned, and a run can return a number, a name, or nothing at all --
+        # a modifier that returns a constant, for one.  Only a value with an
+        # identity of its own is worth remembering a stand-in for; the rest are
+        # recorded on the node as they are, which is all that is done with them.
+        if not hasattr(value, "_impl_id"):
+            set_meta(proxy, value)
+            if constant is not None:
+                proxy.node.meta["constant"] = constant
+            return proxy
+        track_tensor(value, proxy, constant=constant, tracer=tracer)
+        return proxy
     if isinstance(value, tuple) and isinstance(proxy, tuple):
-        for left, right in zip(value, proxy):
+        return tuple(
             track_tensor_tree(left, right, constant=constant, tracer=tracer)
-    elif isinstance(value, list) and isinstance(proxy, list):
-        for left, right in zip(value, proxy):
+            for left, right in zip(value, proxy)
+        )
+    if isinstance(value, list) and isinstance(proxy, list):
+        return [
             track_tensor_tree(left, right, constant=constant, tracer=tracer)
-    elif isinstance(value, dict) and isinstance(proxy, dict):
-        for key, left in value.items():
-            if key in proxy:
-                track_tensor_tree(left, proxy[key], constant=constant, tracer=tracer)
-    return value
+            for left, right in zip(value, proxy)
+        ]
+    if isinstance(value, dict) and isinstance(proxy, dict):
+        return {
+            key: track_tensor_tree(left, proxy[key], constant=constant, tracer=tracer)
+            for key, left in value.items()
+            if key in proxy
+        }
+    return proxy
 
 
 _CURRENT_MAKE_GRAPH_TRACER: contextvars.ContextVar["MakeGraphTracer | None"] = (
@@ -260,6 +283,7 @@ class PythonKeyTracer(Tracer):
         super().__init__(*args, **kwargs)
         self.decomposition_table = dict(decomposition_table or {})
         self.tensor_tracker: dict[int, Any] = {}
+        self._constant_count = 0
 
     # -- recording operations as they are performed ------------------------
     #
