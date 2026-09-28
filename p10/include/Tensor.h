@@ -158,6 +158,12 @@ public:
     IntArrayRef sizes() const;
     int64_t size(int64_t dim) const;
     int64_t stride(int64_t dim) const;
+    // The extent of every dimension, and the step of every dimension.  The
+    // singular forms answer about one dimension; these answer about all of
+    // them at once, which is what a caller that has not settled on a
+    // dimension yet asks.
+    IntArrayRef size() const { return sizes(); }
+    IntArrayRef stride() const;
     
     DType dtype() const;
     Device device() const;
@@ -229,6 +235,11 @@ public:
     // TensorImpl; the concrete implementation lives in the tpx library).
     bool requires_grad() const;
     void set_requires_grad(bool requires_grad);
+    // The mutation forms, as the operations that mutate the flag are spelled:
+    // each returns the tensor so that it can stand in a chain.
+    Tensor& requires_grad_(bool requires_grad = true);
+    void retain_grad();
+    uint32_t _version() const;
     Tensor grad() const;
     void set_grad(const Tensor& grad);
     bool retains_grad() const;

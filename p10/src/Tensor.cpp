@@ -396,6 +396,20 @@ std::vector<int64_t> Tensor::strides() const {
     if (is_sparse()) return std::vector<int64_t>(static_cast<size_t>(dim()), 0);
     return impl_ ? impl_->strides().vec() : std::vector<int64_t>();
 }
+IntArrayRef Tensor::stride() const {
+    // A view into the steps rather than a copy of them, for the same reason
+    // sizes() is: a caller reading the whole layout reads it once and does
+    // not need to own it.  The nested and sparse cases have no single dense
+    // step to point at, and are answered the way strides() answers them --
+    // by refusing, or by the step a sparse layout has at every extent.
+    if (impl_ && impl_->is_nested()) {
+        TP_THROW(RuntimeError,
+                 "nested tensors carry a stride per constituent; a single "
+                 "dense stride does not exist (use _nested_tensor_strides())");
+    }
+    if (is_sparse()) return IntArrayRef();
+    return impl_ ? impl_->strides() : IntArrayRef();
+}
 int64_t Tensor::size(int64_t dim) const {
     if (!impl_) return 0;
     if (dim < 0) dim += this->dim();
@@ -444,6 +458,29 @@ bool Tensor::requires_grad() const {
 void Tensor::set_requires_grad(bool requires_grad) {
     if (!impl_) return;
     impl_->set_requires_grad(requires_grad);
+}
+
+// Whether this value is to be differentiated is a property of the value, not
+// a computation over its data, so the operation that sets it is answered here
+// rather than by a kernel: there is nothing to compute.
+Tensor& Tensor::requires_grad_(bool requires_grad) {
+    set_requires_grad(requires_grad);
+    return *this;
+}
+
+// Asking that the gradient arriving for this value be kept is a request about
+// the value's history, and answering it is a change to the history rather than
+// a computation over the data.
+void Tensor::retain_grad() {
+    if (auto* meta = impl_ ? impl_->autograd_meta() : nullptr) {
+        meta->set_retains_grad(true);
+    }
+}
+
+// How many times the data behind this value has been written, which is what
+// tells a saved value whether it is still what was saved.
+uint32_t Tensor::_version() const {
+    return impl_ ? impl_->version() : 0;
 }
 
 Tensor Tensor::grad() const {

@@ -172,7 +172,8 @@ _VMAP_MEMBER_OPS = frozenset({
     "div.Tensor", "logical_or", "logical_xor", "add.Scalar", "sub.Scalar",
     "mul.Scalar", "div.Scalar",
     "add.Tensor", "sub.Tensor", "pow.Tensor_Scalar", "pow.Tensor_Tensor",
-    "sum", "sum.dim_IntList", "view", "permute", "transpose", "movedim",
+    "sum", "sum.dim_IntList", "size", "size.int", "stride", "stride.int",
+    "permute", "transpose", "movedim",
     "reshape", "expand", "squeeze", "squeeze.dim", "squeeze.dims", "unsqueeze",
     "contiguous", "slice", "narrow", "index_select",
     "mm", "matmul", "bmm",
@@ -436,7 +437,11 @@ def _probe_info(f, variant: str):
     if pos and pos[-1].type.is_list:
         return None                       # splat folding: nargs not comparable
     kinds = [_KIND_CONST.get(cpp_arg_type(a.type)) for a in pos]
-    if not kinds or any(k is None for k in kinds):
+    # A call that is only the receiver is a call of a definite arity, so it is
+    # probeable: there is nothing to read and nothing to fold.  A group whose
+    # shortest candidate takes nothing but the receiver is told apart from the
+    # ones that take arguments, which is what makes the choice.
+    if kinds and any(k is None for k in kinds):
         return None
     required = sum(1 for a in pos if a.default is None)
     return {"arity": len(pos), "required": required, "kinds": kinds}
@@ -571,7 +576,10 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
     )
     if use_member_entry:
         method_call = ", ".join("s_" + n for n, _, _ in slots[1:])
-        invoke_expr = f"s_self.{f.cpp_name}({method_call})"
+        # An overload name says which reading of the operation this is; the
+        # member it stands for is named without it.
+        member = f.base_name if f.overload_name else f.cpp_name
+        invoke_expr = f"s_self.{member}({method_call})"
     elif f.func_name in _VMAP_STATIC_OPS:
         invoke_expr = f"Tensor::{f.cpp_name}({call})"
     else:
@@ -946,8 +954,20 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
                     ])
                 out.append("    }")
             if all(p is not None for p in probes):
-                out.append(
-                    "    if (kwnames == nullptr || PyTuple_GET_SIZE(kwnames) == 0) {")
+                # The kind probes read the positionally given arguments, so
+                # they describe the call as long as no keyword has claimed one
+                # of those positions -- which is decided per candidate, since
+                # each candidate has its own parameter list.  A blanket "no
+                # keywords at all" test would send every call that spells an
+                # argument out to the candidate-by-candidate path below, where
+                # each rejection is a thrown exception; an argument passed by
+                # name is no reason to pay for that.
+                out.append("    {")
+                for k, f in enumerate(fs):
+                    names = ", ".join(f'"{a.name}"' for a in f.args)
+                    out.append(
+                        f'        static const char* tpx_kwlist_{k}[] = '
+                        f"{{{names}, nullptr}};")
                 out.append("        int pick = -1;")
                 out.append("        int matches = 0;")
                 for k, p in enumerate(probes):
@@ -957,6 +977,9 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
                         conds.append(
                             f"(nargs <= {i} || "
                             f"tpx_py_obj_matches_kind(args[{i}], {kc}))")
+                    conds.append(
+                        f"tpx_py_kwnames_fill_holes(kwnames, nargs, "
+                        f"tpx_kwlist_{k}, {len(fs[k].args)})")
                     out.append(f"        if ({' && '.join(conds)})"
                                f" {{ pick = {k}; ++matches; }}")
                 out.append("        if (matches == 1) {")
@@ -1100,7 +1123,17 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
         "    auto* type = reinterpret_cast<PyTypeObject*>(type_obj);",
         "    for (auto* def = generated_tensor_methods; def->ml_name != nullptr;",
         " ++def) {",
-        "        if (PyObject_HasAttrString(type_obj, def->ml_name)) continue;",
+        # A name already holding a method descriptor is already what this
+        # table would install, so it is left alone.  A name holding something
+        # else is left alone too: the wrapper a reflected binding leaves behind
+        # reaches the operation by a shorter route than this table does, and a
+        # query that only reads a fact about the value -- how many elements it
+        # has, which dimension it was asked about -- spends less time being
+        # called through it than being asked for the name of the operation it
+        # would answer with.  What this table owns is the names nothing else
+        # defined, and it serves those the same way.
+        "        PyObject* existing = PyDict_GetItemString(type->tp_dict, def->ml_name);",
+        "        if (existing != nullptr) continue;",
         "        PyObject* descr = PyDescr_NewMethod(type, def);",
         "        if (descr == nullptr) return -1;",
         "        int rc = PyObject_SetAttrString(type_obj, def->ml_name, descr);",
