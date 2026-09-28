@@ -3803,7 +3803,15 @@ def empty_strided(
 register("empty_strided.default")(empty_strided)
 
 
-def _new_like(x: Any, size: Any, *, dtype: Any = None, device: Any = None) -> Any:
+def _new_like(
+    x: Any,
+    size: Any,
+    *,
+    dtype: Any = None,
+    layout: Any = None,
+    device: Any = None,
+    pin_memory: Any = None,
+) -> Any:
     """A place to write, at a shape taken from another value.
 
     What makes this a separate operation rather than a shape and a call to the
@@ -3826,23 +3834,44 @@ def _new_like(x: Any, size: Any, *, dtype: Any = None, device: Any = None) -> An
     )
 
 
-def _new_filled(x: Any, fill: Any, *, dtype: Any = None, device: Any = None) -> Any:
-    """A tensor of one value, shaped like another value.
+def _new_filled(
+    x: Any,
+    size: Any,
+    fill: Any,
+    *,
+    dtype: Any = None,
+    layout: Any = None,
+    device: Any = None,
+    pin_memory: Any = None,
+) -> Any:
+    """A tensor of one value, shaped by another value.
 
-    The value is the one the operation was given and the shape is the one the
-    value it was given has, which is why this is a separate operation rather
-    than a shape and a call to the filled one: the shape is not written down
-    anywhere in the program, it is only referred to.
+    The shape is written down in the program rather than read off the value the
+    call was given, and the value fills it: the shape the program states and the
+    value the call names are two separate things, and either of them may be the
+    one that differs from what the value would have had.
     """
 
     device = device or x.get_device()
     dtype = dtype or x.get_dtype()
-    return _full(fill, device, dtype, x.get_size())
+    return _full(fill, device, dtype, size)
+
+
+def _new_zeros(x: Any, size: Any, **kwargs: Any) -> Any:
+    """A tensor of zeros, shaped by another value."""
+
+    return _new_filled(x, size, 0, **kwargs)
+
+
+def _new_ones(x: Any, size: Any, **kwargs: Any) -> Any:
+    """A tensor of ones, shaped by another value."""
+
+    return _new_filled(x, size, 1, **kwargs)
 
 
 register("new_empty.default")(_new_like)
-register("new_zeros.default")(functools.partial(_new_filled, fill=0))
-register("new_ones.default")(functools.partial(_new_filled, fill=1))
+register("new_zeros.default")(_new_zeros)
+register("new_ones.default")(_new_ones)
 
 
 def lower_full(size: Any, fill_value: Any, **kwargs: Any) -> Any:

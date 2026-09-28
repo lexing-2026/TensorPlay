@@ -983,7 +983,7 @@ def lower_omni_attention(
     )
     from .omni_flash_attention import (
         create_omni_flash_attention_kernel,
-        use_omni_flash_attention,
+        _use_omni_flash_attention,
     )
 
     can_use_decode = use_omni_decoding(
@@ -1019,7 +1019,7 @@ def lower_omni_attention(
             mask_parts["sparse_kv_block_size"],
         )
 
-    if use_omni_flash_attention(
+    if _use_omni_flash_attention(
         subgraph,
         mask_graph,
         kernel_options,
@@ -1344,7 +1344,7 @@ def lower_omni_attention_backward(*args: Any, **kwargs: Any) -> Any:
         maybe_realize,
         is_trivial_mask_graph,
         is_trivial_score_graph,
-        use_omni_flash_attention_backward,
+        _use_omni_flash_attention_backward,
     )
 
     (
@@ -1415,7 +1415,7 @@ def lower_omni_attention_backward(*args: Any, **kwargs: Any) -> Any:
     )
     freeze_irnodes(mask_graph_buffer)
 
-    if use_omni_flash_attention_backward(
+    if _use_omni_flash_attention_backward(
         fw_graph,
         mask_graph,
         backend=backend,

@@ -42,6 +42,7 @@ class Interpreter:
         garbage_collect_values: bool = True,
         graph: Graph | None = None,
         handler: Any = None,
+        handler_ops: tuple[str, ...] = ("call_function",),
     ) -> None:
         self.module = module
         named_modules = getattr(module, "named_modules", None)
@@ -52,12 +53,17 @@ class Interpreter:
         self.garbage_collect_values = garbage_collect_values
         self.extra_traceback = True
         # A caller that wants a call answered rather than run supplies something
-        # that answers it.  A call is not always a call to be made: one that a
-        # region is going to lower is a description of work, and the region has
-        # to be the one that decides what that work is -- running it here would
-        # hand the operation values that belong to the region and not to this
-        # graph, and the failure would name a type rather than the mismatch.
+        # that answers it, and says which kinds of node it answers for.  A call
+        # is not always a call to be made: one that a region is going to lower
+        # is a description of work, and the region has to be the one that
+        # decides what that work is -- running it here would hand the operation
+        # values that belong to the region and not to this graph, and the
+        # failure would name a type rather than the mismatch.  Saying which
+        # kinds is what keeps the rest of the walk this graph's own: a driver
+        # that is asked about the inputs it was given would answer them from
+        # its own inputs, and the values handed in here would never be reached.
         self._handler = handler
+        self._handler_ops = frozenset(handler_ops)
         self.args_iter: Iterator[Any] = iter(())
         self._keyword_args: dict[str, Any] = {}
         self._placeholder_defaults: dict[str, Any] = {}
@@ -155,7 +161,15 @@ class Interpreter:
             # question is asked of the handler first because a handler exists to
             # take over the calls it was given, and a call it declines is one
             # this graph is expected to be able to run itself.
-            if self._handler is not None:
+            #
+            # The handler is asked only about the kind it was given the chance
+            # to say something about.  A driver that lowers also has the other
+            # kinds -- a graph that supplies its own inputs is such a driver --
+            # and asking it about those would take away the work it delegates
+            # upwards: a driver that is asked for an input it was given would
+            # answer from its own inputs and the values the graph was given
+            # would never be reached.
+            if self._handler is not None and node.op in self._handler_ops:
                 answer = getattr(self._handler, node.op, None)
                 if answer is not None:
                     return answer(node.target, args, kwargs)
