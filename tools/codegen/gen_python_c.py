@@ -560,7 +560,12 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
 
     call = ", ".join("s_" + n for n, _, _ in slots)
     use_member_entry = (
-        f.func_name in _VMAP_MEMBER_OPS
+        # An operation whose registration is written out by hand has no
+        # generated kernel to reach through the dispatcher, and the wrapper
+        # generated for it is an inline that cannot be called through a
+        # function pointer; the call is made on the tensor instead.
+        (f.func_name in _VMAP_MEMBER_OPS
+         or f.manual_kernel_registration)
         and f.args
         and f.args[0].name == "self"
     )
