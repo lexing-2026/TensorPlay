@@ -813,17 +813,32 @@ def lower_omni_attention(
     kernel_options, backend = sanitize_kernel_options_for_triton(kernel_options)
 
     device_type = query.get_device().type
-    if device_type in ("cpu", "mps"):
-        # These two are written as a shader rather than as tiles, so they do not
-        # go through anything below: there is no block to choose and no grid to
-        # spread, only a program the device compiles.  Said here rather than
-        # falling through to the tiled path, because falling through would
-        # produce a kernel for a device that cannot run one -- an answer that is
-        # wrong rather than one that is missing.
+    if device_type == "cpu":
+        # A processor is handed a program rather than tiles: there is no block to
+        # choose and no grid to spread, only a program it runs.  Which is why
+        # this does not go through anything below.
+        from .omni_cpu import lower_omni_attention_cpu
+
+        return lower_omni_attention_cpu(
+            query,
+            key,
+            value,
+            subgraph,
+            block_mask,
+            scale,
+            kernel_options,
+            score_mod_other_buffers,
+            mask_mod_other_buffers,
+        )
+    if device_type == "mps":
+        # Also a shader rather than tiles, and this compiler has none for that
+        # device yet.  Said here rather than falling through to the tiled path,
+        # because falling through would produce a kernel that device cannot run
+        # -- an answer that is wrong rather than one that is missing.
         raise NotImplementedError(
-            f"attention on {device_type} needs a shader rather than tiles, and "
-            f"this compiler has none for that device yet. The tiled path below "
-            f"runs on a device that has blocks."
+            "attention on mps needs a shader rather than tiles, and this "
+            "compiler has none for that device yet. The tiled path below runs "
+            "on a device that has blocks."
         )
 
     check_embedding_is_wide_enough(query, value)

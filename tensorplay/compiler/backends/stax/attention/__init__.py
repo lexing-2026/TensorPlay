@@ -14,6 +14,8 @@ is given the one that suits the device it is on.
                    several positions at a time
   omni_decoding    a forward with the query axis short, for one question at a
                    time
+  omni_cpu         the same computation as a program the processor runs, with
+                   the mask read while it runs
 
 The modules here answer to one file each, and the split is the split: a device
 that cannot be written for is not in this list at all, because a kernel for a
@@ -41,6 +43,10 @@ from .omni_attention import (
     sanitize_kernel_options_for_triton,
     unpack_block_mask,
 )
+from .omni_cpu import (
+    check_cpu_supported,
+    lower_omni_attention_cpu,
+)
 from .omni_decoding import (
     OMNI_DECODING,
     create_omni_decoding_kernel,
@@ -62,6 +68,7 @@ __all__ = [
     "OMNI_DECODING",
     "OmniFlashConfig",
     "SubgraphResults",
+    "check_cpu_supported",
     "check_embedding_is_wide_enough",
     "check_flash_supported_scalar_captures",
     "create_omni_attention_kernel",
@@ -73,6 +80,7 @@ __all__ = [
     "guard_kernel_options",
     "heads_are_grouped",
     "lower_omni_attention",
+    "lower_omni_attention_cpu",
     "raise_omni_decoding_kernel_options_error",
     "raise_omni_kernel_options_error",
     "sanitize_kernel_options_for_triton",
