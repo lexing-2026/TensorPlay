@@ -25,6 +25,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import math
+
 import sympy
 
 from tensorplay.graph.experimental.sympy_functions import FloorDiv
@@ -32,7 +34,10 @@ from tensorplay.graph.experimental.sympy_functions import FloorDiv
 import tensorplay as tp
 
 from ..heuristics.template.base import SymbolicGridFn
-from ....._higher_order_ops.omni_attention import omni_attention as omni_attention_hop
+from ....._higher_order_ops.omni_attention import (
+    omni_attention as omni_attention_hop,
+    omni_attention_backward as omni_attention_backward_hop,
+)
 from ..ir import ComputedBuffer
 from ..loops import V
 from ..op_lowerings import register_lowering
@@ -67,6 +72,115 @@ _BACKEND_AUTO = "AUTO"
 _BACKEND_TRITON = "TRITON"
 _BACKEND_FLASH = "FLASH"
 _BACKEND_TRITON_DECODE = "TRITON_DECODE"
+
+
+# ---------------------------------------------------------------------------
+# Taking the backward pass apart
+# ---------------------------------------------------------------------------
+
+
+class JointOutputResult:
+    """What the backward pass produced, taken apart into the parts a kernel wants.
+
+    Four things rather than one, because the kernel wants them apart.  The
+    gradient of the query is the one value the kernel computes; the gradients of
+    everything the caller captured are values it reads, and are read as whatever
+    they were rather than as gradients; a gradient that was computed rather than
+    read is a different thing from one that was written into, because only the
+    second is somewhere the kernel can add to.
+    """
+
+    grad_input: Any
+    captured_grads_compute: list
+    captured_grads: list
+    mutated_grads: list
+
+
+def process_joint_outputs(all_joint_outputs: Any, num_placeholders: int) -> Any:
+    """Take the backward pass's own outputs and hand back what a kernel can read.
+
+    A caller can capture a value in a score, and then that value has a gradient.
+    Whether the backward pass computed that gradient or wrote it into something
+    it already had is not something the kernel should have to know: a gradient it
+    reads is a value, and one it is given as somewhere to add to is an
+    accumulator.  So the two are told apart here, where the backward pass's own
+    answer can still be read.
+
+    A captured value with no gradient is not in the list at all, rather than in
+    it as nothing -- because a kernel handed nothing for it would be a kernel
+    with an argument it cannot use, and the caller did not ask for one.
+    """
+
+    from ..ir import ComputedBuffer, TensorBox
+
+    # The first outputs are the ones the kernel produced; the rest are the
+    # gradients of what the caller captured, one per captured value, and nothing
+    # for a captured value that does not need one.
+    grad_input = all_joint_outputs[0]
+    if not isinstance(grad_input, ComputedBuffer):
+        raise AssertionError(
+            f"Expected ComputedBuffer for the query's gradient, got {type(grad_input)}"
+        )
+    if grad_input.name is None:
+        raise AssertionError("ComputedBuffer name must not be None")
+
+    other_grads = all_joint_outputs[num_placeholders:]
+
+    grads_compute = [buf for buf in other_grads if buf is not None]
+
+    def get_out(buf: Any) -> Any:
+        if buf is None:
+            return None
+        if not isinstance(buf, ComputedBuffer):
+            raise AssertionError(f"Expected ComputedBuffer, got {type(buf)}")
+        if buf.name is None:
+            raise AssertionError("ComputedBuffer name must not be None")
+        return TensorBox.create(V.graph.get_buffer(buf.name))
+
+    grads_out = [get_out(x) for x in other_grads]
+    mutated_grads = [buf for buf in grads_out if buf is not None]
+
+    return JointOutputResult(
+        grad_input=grad_input,
+        captured_grads_compute=grads_compute,
+        captured_grads=grads_out,
+        mutated_grads=mutated_grads,
+    )
+
+
+def get_bwd_subgraph_outputs(
+    subgraph_buffer: SubgraphResults,
+    mask_graph_buffer: SubgraphResults,
+    joint_outputs: Any,
+) -> list:
+    """Everything the backward pass's kernel reads, in the order it reads them.
+
+    The score's body, then the mask's -- the mask is applied to what the score
+    produced, so a caller that took them the other way round would be applying a
+    mask to something not yet computed.  Then the gradient it computes, then the
+    gradients it reads, then the ones it adds to.  Those last two are separate
+    because they are different things: one is a value the kernel reads and one is
+    somewhere the kernel writes, and a list that mixed them would say neither.
+    """
+
+    from collections.abc import Sequence
+
+    subgraph_buffer = (
+        subgraph_buffer if isinstance(subgraph_buffer, Sequence) else [subgraph_buffer]
+    )
+    mask_graph_buffer = (
+        mask_graph_buffer
+        if isinstance(mask_graph_buffer, Sequence)
+        else [mask_graph_buffer]
+    )
+    joint_output_buffers = [
+        joint_outputs.grad_input,
+        *joint_outputs.captured_grads_compute,
+        *joint_outputs.captured_grads,
+        *joint_outputs.mutated_grads,
+    ]
+
+    return [*subgraph_buffer, *mask_graph_buffer, *joint_output_buffers]
 
 
 # ---------------------------------------------------------------------------
@@ -943,4 +1057,418 @@ def lower_omni_attention(
         score_mod_other_buffers,
         mask_mod_other_buffers,
         mask_parts,
+    )
+
+
+def create_omni_attention_backward_kernel(
+    query: Any,
+    key: Any,
+    value: Any,
+    out: Any,
+    logsumexp: Any,
+    grad_out: Any,
+    grad_logsumexp: Any,
+    scale: float,
+    kernel_options: Any,
+    subgraph_buffer: SubgraphResults,
+    mask_graph_buffer: SubgraphResults,
+    joint_outputs: Any,
+    score_mod_other_buffers: Any,
+    mask_mod_other_buffers: Any,
+    sparse_q_block_size: int,
+    sparse_kv_block_size: int,
+) -> Any:
+    """Write the pass that goes back the way attention came.
+
+    Three values rather than one, and the difference is arithmetic rather than
+    bookkeeping.  The gradient of the query is computed.  The gradients of the key
+    and the value are accumulated into, because each is read by every query that
+    may see it -- so neither is finished by whichever program arrives last, and
+    the order they are added in is not something the hardware decides.
+
+    What makes that accumulation correct is the fourth thing computed here and
+    never handed back: how much each key contributed to the row it was read in.
+    The answer to a row is a weighted sum over the keys that were visible, and
+    the weight of a key depends on the total of the row -- so the key's gradient
+    cannot be formed until the total is known, and the total is the same for every
+    key in the row.  Computing it once per row is what turns the accumulation
+    from a sum of differently scaled numbers into a sum of numbers.
+    """
+
+    from ..ir import ExternKernel
+    from ..op_lowerings import (
+        _convert_element_type,
+        empty_strided,
+        lower_mul,
+        lower_sub,
+        lower_sum,
+    )
+    from ..utils import can_use_tma
+    from .omni_flash_attention import (
+        is_power_of_2,
+        is_tensor_ir_node,
+        maybe_realize,
+        set_head_dim_values,
+    )
+
+    bq, hq, seq_len_q, qk_head_dim = query.get_size()
+    bkv, hkv, seq_len_kv, v_head_dim = value.get_size()
+
+    key_size = [bq, hkv, seq_len_kv, qk_head_dim]
+    key_strides = infer_dense_strides(key_size, key.get_stride())
+
+    layout_broadcasted_k = FixedLayout(
+        key.get_device(),
+        key.get_dtype(),
+        key_size,
+        stride=[sympy.sympify(s) for s in key_strides],
+    )
+
+    # What each key was worth to the row it was read in, and what the row's
+    # weights came to.  The second is the same for every key in a row, which is
+    # the whole reason the first can be turned into a gradient at all.
+    mul_delta = lower_mul(out, grad_out)
+    delta = lower_sum(mul_delta, axis=-1)
+    delta = _convert_element_type(delta, tp.float32)
+    if grad_logsumexp is not None:
+        # A gradient of the running total says how much the total itself is worth
+        # moving, and the total was held in units of doubling -- so the amount is
+        # restated in the units the weight was computed in before it is taken
+        # off.
+        grad_lse_exp2 = lower_mul(grad_logsumexp, 1 / math.log(2))
+        grad_lse_exp2 = ExternKernel.require_contiguous(grad_lse_exp2)
+        delta = lower_sub(delta, grad_lse_exp2)
+        delta = ExternKernel.require_contiguous(delta)
+        delta, grad_lse_exp2 = maybe_realize([delta, grad_lse_exp2])
+    else:
+        delta = ExternKernel.require_contiguous(delta)
+        (delta,) = maybe_realize([delta])
+
+    query_size = [bq, hq, seq_len_q, qk_head_dim]
+    grad_query_strides = infer_dense_strides(query_size, query.get_stride())
+    grad_query = empty_strided(
+        query_size,
+        stride=[sympy.sympify(s) for s in grad_query_strides],
+        dtype=query.get_dtype(),
+        device=query.get_device(),
+    )
+
+    # The key's gradient is added into, and it is added into at the distances the
+    # value had -- because it is the value's positions that say which key each
+    # element belongs to.
+    value_size = [bq, hkv, seq_len_kv, v_head_dim]
+    value_strides = infer_dense_strides(value_size, value.get_stride())
+    grad_value = empty_strided(
+        value_size,
+        stride=[sympy.sympify(s) for s in value_strides],
+        dtype=value.get_dtype(),
+        device=value.get_device(),
+    )
+    grad_key = empty_strided(
+        key_size,
+        stride=[sympy.sympify(s) for s in key_strides],
+        dtype=key.get_dtype(),
+        device=key.get_device(),
+    )
+
+    kernel_options.setdefault("SM_SCALE", scale)
+
+    gqa_shared_heads = FloorDiv(hq, hkv)
+    kernel_options.setdefault("GQA_SHARED_HEADS", gqa_shared_heads)
+
+    has_full_blocks = True
+    kernel_options.setdefault("HAS_FULL_BLOCKS", has_full_blocks)
+
+    set_head_dim_values(kernel_options, qk_head_dim, v_head_dim, V.graph.sizevars)
+
+    sparse_q_block_size = V.graph.sizevars.guard_int(sparse_q_block_size)
+    sparse_kv_block_size = V.graph.sizevars.guard_int(sparse_kv_block_size)
+
+    choices: list = []
+    dtype = query.get_dtype()
+    head_dim = V.graph.sizevars.guard_int(query.get_size()[-1])
+    configs = V.choices.get_omni_attention_bwd_configs(
+        head_dim, dtype, query.get_device().type
+    )
+
+    invalid_block_options: Any = None
+    original_kernel_options = kernel_options.copy()
+
+    for conf in configs:
+        cur_kernel_options = original_kernel_options.copy()
+        # The prefix says which pass an option is for, and a kernel is only ever
+        # given options for its own pass.  The backward's own prefix is this one,
+        # so it comes off rather than being handed to a kernel that has never
+        # heard of it.
+        for k in list(cur_kernel_options.keys()):
+            if k.startswith("bwd_"):
+                v = cur_kernel_options.pop(k)
+                cur_kernel_options[k[4:]] = v
+            if k.startswith("fwd_"):
+                cur_kernel_options.pop(k)
+        cur_kernel_options.setdefault("num_warps", conf.num_warps)
+        cur_kernel_options.setdefault("num_stages", conf.num_stages)
+
+        cur_kernel_options.setdefault("USE_TMA", False)
+        if cur_kernel_options["USE_TMA"] and not can_use_tma(query, key, value):
+            cur_kernel_options["USE_TMA"] = False
+
+        # A tile wider than the block it walks is wasted lanes and a boundary mask
+        # paid for on every step.  Narrowed only when there is one candidate and
+        # both block sizes are whole powers of two -- a program that pinned the
+        # tile keeps it, and is told if it does not divide.
+        block_m1, block_n1 = conf.block_m1, conf.block_n1
+        block_m2, block_n2 = conf.block_m2, conf.block_n2
+        if len(configs) == 1 and all(
+            is_power_of_2(s) and s >= 16
+            for s in (sparse_q_block_size, sparse_kv_block_size)
+        ):
+            block_m1 = min(block_m1, sparse_q_block_size)
+            block_n1 = min(block_n1, sparse_kv_block_size)
+            block_m2 = min(block_m2, sparse_q_block_size)
+            block_n2 = min(block_n2, sparse_kv_block_size)
+        cur_kernel_options.setdefault("BLOCK_M1", block_m1)
+        cur_kernel_options.setdefault("BLOCK_N1", block_n1)
+        cur_kernel_options.setdefault("BLOCK_M2", block_m2)
+        cur_kernel_options.setdefault("BLOCK_N2", block_n2)
+        cur_kernel_options.setdefault("SPARSE_Q_BLOCK_SIZE", sparse_q_block_size)
+        cur_kernel_options.setdefault("SPARSE_KV_BLOCK_SIZE", sparse_kv_block_size)
+
+        # The two walks are paired rather than independent: one reads the keys
+        # for a block of queries and the other reads the queries for a block of
+        # keys, and each tile has to divide the other's -- so only half the
+        # combinations satisfy both and pairing is what makes one check enough.
+        if (
+            cur_kernel_options["BLOCK_N1"] % cur_kernel_options["BLOCK_M1"] != 0
+            or cur_kernel_options["BLOCK_M2"] % cur_kernel_options["BLOCK_N2"] != 0
+        ):
+            invalid_block_options = cur_kernel_options
+            if len(configs) == 1:
+                raise_omni_kernel_options_error(
+                    "backward",
+                    cur_kernel_options,
+                    ("BLOCK_M1", "BLOCK_N1", "BLOCK_M2", "BLOCK_N2"),
+                    sparse_q_block_size,
+                    sparse_kv_block_size,
+                )
+            continue
+
+        for attrib in ("kpack", "matrix_instr_nonkdim", "waves_per_eu"):
+            if hasattr(conf, attrib):
+                cur_kernel_options[attrib] = getattr(conf, attrib)
+
+        error = OMNI_ATTENTION_BACKWARD.maybe_append_choice(
+            choices=choices,
+            input_nodes=[
+                query,
+                key,
+                value,
+                out,
+                grad_out,
+                logsumexp,
+                delta,
+                grad_key,
+                grad_value,
+            ],
+            layout=layout_broadcasted_k,
+            subgraphs=[subgraph_buffer, mask_graph_buffer],
+            mutated_inputs=[grad_key, grad_value],
+            call_sizes=query.get_size(),
+            **cur_kernel_options,
+        )
+        if error is not None and len(configs) == 1:
+            raise error
+
+    if not choices and invalid_block_options is not None:
+        raise_omni_kernel_options_error(
+            "backward",
+            invalid_block_options,
+            ("BLOCK_M1", "BLOCK_N1", "BLOCK_M2", "BLOCK_N2"),
+            sparse_q_block_size,
+            sparse_kv_block_size,
+        )
+
+    inputs_for_autotuning = [
+        query,
+        key,
+        value,
+        out,
+        grad_out,
+        logsumexp,
+        delta,
+        grad_key,
+        grad_value,
+    ]
+    input_gen_fns: Any = None
+
+    grad_query, _ = autotune_select_algorithm(
+        "omni_attention_backward",
+        choices,
+        [x for x in inputs_for_autotuning if is_tensor_ir_node(x)],
+        layout_broadcasted_k,
+        input_gen_fns=input_gen_fns,
+    )
+
+    grad_query.data.data.subgraph_outs = get_bwd_subgraph_outputs(
+        subgraph_buffer, mask_graph_buffer, joint_outputs
+    )
+    grad_query.data.data.delta = delta
+    grad_query.data.data.subgraph_inps = list(score_mod_other_buffers) + list(
+        mask_mod_other_buffers
+    )
+
+    return (grad_query, grad_key, grad_value)
+
+
+@register_lowering(omni_attention_backward_hop, type_promotion_kind=None)
+def lower_omni_attention_backward(*args: Any, **kwargs: Any) -> Any:
+    """Write the pass that goes back the way attention came.
+
+    A backward pass is a forward pass and its own arithmetic.  The caller has
+    already differentiated the program it wrote, so what arrives here is that
+    program run backwards: it produces the gradient of the score, which is a value
+    like any other, and this turns that value into the gradients of the three
+    things that went in.
+
+    The two devices that are written as programs rather than as tiles are asked
+    first, and a device that has neither is refused by name -- because the tiled
+    path below would produce a kernel that device cannot run, which is an answer
+    that is wrong rather than one that is missing.
+    """
+
+    from .omni_flash_attention import (
+        build_subgraph_buffer,
+        create_omni_flash_attention_backward_kernel,
+        create_placeholder,
+        freeze_irnodes,
+        maybe_realize,
+        is_trivial_mask_graph,
+        is_trivial_score_graph,
+        use_omni_flash_attention_backward,
+    )
+
+    (
+        query,
+        key,
+        value,
+        out,
+        logsumexp,
+        grad_out,
+        grad_logsumexp,
+        fw_graph,
+        joint_graph,
+        block_mask,
+        scale,
+        kernel_options,
+        score_mod_other_buffers,
+        mask_mod_other_buffers,
+    ) = args
+
+    if query.get_device().type in ("mps", "cpu"):
+        raise NotImplementedError(
+            f"The backward pass on {query.get_device().type} is not written yet. "
+            "A program that only needs the forward pass should not be asking "
+            "for this one."
+        )
+
+    mask_parts = unpack_block_mask(block_mask)
+    mask_graph = mask_parts["mask_graph"]
+
+    backend = kernel_options.get("BACKEND", _BACKEND_AUTO)
+
+    # What the caller's program, run backwards, produced.  Taken apart before
+    # anything else, because whether a captured gradient is read or added to is
+    # something the kernel should not have to know.
+    joint_placeholder_inps = [
+        create_placeholder(name, dtype, query.get_device())
+        for name, dtype in [
+            ("delta", tp.float32),
+            ("b", tp.int32),
+            ("h", tp.int32),
+            ("m", tp.int32),
+            ("n", tp.int32),
+        ]
+    ]
+    joint_subgraph_buffer = build_subgraph_buffer(
+        joint_placeholder_inps + list(score_mod_other_buffers), joint_graph
+    )
+    freeze_irnodes(joint_subgraph_buffer)
+
+    all_joint_outputs = joint_subgraph_buffer
+    freeze_irnodes(all_joint_outputs)
+
+    joint_outputs = process_joint_outputs(
+        all_joint_outputs, len(joint_placeholder_inps)
+    )
+
+    mask_graph_placeholder_inps = [
+        create_placeholder(name, dtype, query.get_device())
+        for name, dtype in [
+            ("b", tp.int32),
+            ("h", tp.int32),
+            ("m", tp.int32),
+            ("n", tp.int32),
+        ]
+    ]
+    mask_graph_buffer = build_subgraph_buffer(
+        mask_graph_placeholder_inps + list(mask_mod_other_buffers), mask_graph
+    )
+    freeze_irnodes(mask_graph_buffer)
+
+    if use_omni_flash_attention_backward(
+        fw_graph,
+        mask_graph,
+        backend=backend,
+        joint_outputs=joint_outputs,
+        score_mod_other_buffers=score_mod_other_buffers,
+    ):
+        needs_block_mask = not is_trivial_mask_graph(mask_graph.graph_module)
+        if grad_logsumexp is not None:
+            (grad_logsumexp,) = maybe_realize([grad_logsumexp])
+
+        score_is_trivial = is_trivial_score_graph(fw_graph.graph_module)
+        return create_omni_flash_attention_backward_kernel(
+            query,
+            key,
+            value,
+            out,
+            logsumexp,
+            grad_out,
+            grad_logsumexp,
+            scale,
+            kernel_options,
+            mask_parts["sparse_q_block_size"],
+            mask_parts["sparse_kv_block_size"],
+            fw_subgraph_buffer=None if score_is_trivial else joint_subgraph_buffer,
+            joint_subgraph_buffer=None
+            if score_is_trivial
+            else joint_outputs.grad_input,
+            score_mod_other_buffers=list(score_mod_other_buffers),
+            mask_graph_buffer=mask_graph_buffer if needs_block_mask else None,
+            mask_mod_other_buffers=list(mask_mod_other_buffers),
+            q_num_blocks=mask_parts["q_num_blocks"] if needs_block_mask else None,
+            q_indices=mask_parts["q_indices"] if needs_block_mask else None,
+            full_q_num_blocks=mask_parts["full_q_num_blocks"]
+            if needs_block_mask
+            else None,
+            full_q_indices=mask_parts["full_q_indices"] if needs_block_mask else None,
+        )
+
+    return create_omni_attention_backward_kernel(
+        query,
+        key,
+        value,
+        out,
+        logsumexp,
+        grad_out,
+        grad_logsumexp,
+        scale,
+        kernel_options,
+        joint_subgraph_buffer,
+        mask_graph_buffer,
+        joint_outputs,
+        score_mod_other_buffers,
+        mask_mod_other_buffers,
+        mask_parts["sparse_q_block_size"],
+        mask_parts["sparse_kv_block_size"],
     )
