@@ -241,7 +241,7 @@ def lower_omni_attention_cpu(
 
         with graph.inserting_after(full_node):
             where_node = graph.call_function(
-                tp.ops.aten.where, args=(mask_node, qk_data_node, full_node)
+                tp.ops.tp.where, args=(mask_node, qk_data_node, full_node)
             )
 
         output_node.args = (where_node,)
