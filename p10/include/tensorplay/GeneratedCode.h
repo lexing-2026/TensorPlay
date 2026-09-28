@@ -123,6 +123,17 @@ inline Allocator* getCPUAllocator() {
     return tensorplay::getCPUAllocator();
 }
 
+// Write a whole vector's worth of values out to memory.
+//
+// A kernel that computed its answer a vector at a time wrote it out the same way,
+// and a lane written one at a time is a store per lane -- which is the cost the
+// vector was there to avoid.  The pointer is a raw one because what is being
+// written is a run of memory the kernel has already established is its own.
+template <typename Vec>
+TP_ALWAYS_INLINE void _tp_store(void* dst, Vec value) {
+    value.store(static_cast<char*>(dst));
+}
+
 // The width a reduced-precision value is carried out in.
 //
 // A type that is stored narrower than it is computed in has to be widened before
