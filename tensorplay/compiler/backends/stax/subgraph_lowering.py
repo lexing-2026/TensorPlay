@@ -204,7 +204,12 @@ class PointwiseSubgraphLowering:
 
         from ....graph import Interpreter
 
-        interpreter = Interpreter(self.gm, handler=self)
+        # The two kinds a lowering answers for: the calls it lowers, and the
+        # output it keeps.  The output is included because a body that lowers
+        # its calls still has to say what it produced -- a walk that hands the
+        # output back to the graph instead would leave the body with nothing
+        # recorded, and the buffers it made would be unreferenced.
+        interpreter = Interpreter(self.gm, handler=self, handler_ops=("call_function", "output"))
         interpreter.run(*args)
 
     def output(self, target: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
