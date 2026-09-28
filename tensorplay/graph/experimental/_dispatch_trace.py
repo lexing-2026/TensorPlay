@@ -205,7 +205,11 @@ class ProxyTensorDispatchMode(TensorPlayDispatchMode):
             # The decomposition's own operators are recorded instead of func.
             with self:
                 return decomposition(*args, **kwargs)
-        out = func(*args, **kwargs)
+        # An operation that carries its own way of being run hands it over, so
+        # that recording it does not ask it to be recorded again.  One that
+        # does not is simply called.
+        direct = getattr(func, "_eager_call", None)
+        out = direct(args, kwargs) if callable(direct) else func(*args, **kwargs)
         self.tracer.record(func, args, kwargs, out)
         return out
 

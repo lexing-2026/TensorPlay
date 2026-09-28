@@ -627,6 +627,12 @@ class CustomOpDef:
         return bridge(self._name, list(inputs), device_type)
 
     def _eager_call(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        """Run the kernel for real arguments, with no capture and no recording.
+
+        This is how a mode runs the operation it has been asked to record: the
+        recording happens around this call, and going through the public entry
+        would ask the same mode to record it a second time.
+        """
         """Dispatch real tensors with full eager semantics (no capture).
 
         Shared by :meth:`__call__` and the native re-entry below so compiled
@@ -709,6 +715,19 @@ class CustomOpDef:
             captured = _capture_call(self, args, kwargs)
             if captured is not None:
                 return captured
+        from .utils._dispatch import _get_current_dispatch_mode
+
+        mode = _get_current_dispatch_mode()
+        if mode is not None:
+            # A library operation is a node in a graph just as an operation
+            # reached through the dispatcher is, and it is the mode on the
+            # stack that knows which graph.  Handing the call to it is what
+            # puts the operation in that graph and ties the values it produced
+            # to the node that produced them; a call that read a value from
+            # outside the graph (a captured scalar, a stored position) would
+            # otherwise produce values nothing stands for, and the graph would
+            # have to hold them by name.
+            return mode.__tensorplay_dispatch__(self, None, args, kwargs)
         return self._eager_call(args, kwargs)
 
 
