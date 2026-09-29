@@ -3371,12 +3371,30 @@ def embedding_bag(
         per_sample_weights, include_last_offset, padding_idx)[0]
 
 
+# The widest head the fused attention tiles are shaped for.  A wider head has
+# no tile to land in and stays on the composed reference.
+_FUSED_MAX_HEAD_DIM = 128
+
+
 def _plain_scaled_dot_product_attention(query, key, value, is_causal):
+    # The fused entry point takes a square self-attention call with the default
+    # normaliser: one head count, one token count, and a head width inside the
+    # tiled range.  It is also the entry the matching fused backward hangs off,
+    # so a training call routed here keeps the fast backward rather than
+    # falling back to the composed one.  Everything else -- grouped heads, an
+    # explicit normaliser, a context of another length -- goes to the public
+    # call, whose backend hands it to the fused schedule that does model those.
     if (
         query.device.type == "cuda"
         and query.dim() == 4
-        and query.size(-1) == 32
-        and query.dtype in (DType.float16, DType.bfloat16)
+        and key.dim() == 4
+        and value.dim() == 4
+        and 0 < query.size(-1) <= _FUSED_MAX_HEAD_DIM
+        and key.dtype == query.dtype == value.dtype
+        and key.size(-1) == query.size(-1) == value.size(-1)
+        and key.size(0) == query.size(0) == value.size(0)
+        and key.size(1) == query.size(1) == value.size(1)
+        and key.size(-2) == query.size(-2) == value.size(-2)
     ):
         output, _ = _C._scaled_dot_product_attention_with_lse(
             query, key, value, is_causal=is_causal)
@@ -3518,18 +3536,20 @@ def scaled_dot_product_attention(
                 "the active sdpa_kernel context allows none of the "
                 "installed backends for these inputs")
 
-    out, _ = _C._scaled_dot_product_attention_math(
-        query,
-        key,
-        value,
-        attn_mask,
-        float(dropout_p),
-        bool(is_causal),
-        None,
-        scale=scale,
-        enable_gqa=enable_gqa,
-    )
-    return out
+    # Everything the fused entry point does not serve -- an explicit scale, an
+    # explicit mask, grouped heads, a shape the fused kernels cannot express --
+    # is answered by the public call.  It carries the derivative that gives
+    # this call its gradients, and it reaches the same composed reference from
+    # the inside, so a differentiated call and an undifferentiated one are
+    # answered by the same computation.  Calling the composed reference
+    # directly from here instead would answer an undifferentiated question: no
+    # derivative is registered for that entry point, so the result would come
+    # back detached and the caller's backward pass would have nothing to
+    # differentiate.
+    return tensorplay.scaled_dot_product_attention(
+        query, key, value, attn_mask=attn_mask,
+        dropout_p=dropout_p, is_causal=is_causal, scale=scale,
+        enable_gqa=enable_gqa)
 
 
 def linear_cross_entropy(
