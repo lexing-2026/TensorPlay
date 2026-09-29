@@ -589,6 +589,22 @@ def _register_lowering(
     return wrapped
 
 
+def realize_inputs(*args: Any) -> Any:
+    """The values as they must be handed to something outside this compiler.
+
+    Realized and made to run along their last axis, because a caller that is not
+    this compiler reads the values it is given and cannot be told what a stride
+    means.
+    """
+
+    if len(args) == 1:
+        realized = args[0]
+        if not realized.has_tensor_output():
+            return realized
+        return ir.ExternKernel.require_stride1(realized)
+    return [realize_inputs(x) for x in args]
+
+
 def decode_device(device: Any) -> Any:
     """The device a value is on, as a device rather than as a description of one.
 
@@ -1128,8 +1144,25 @@ def as_value_node(x, dtype, device):
 
 
 def pointwise(fn, *inputs, val=None):
-    val = node_val() if val is None else val
-    size, dtype, device = val_info(val)
+    # What the result is like is read from the inputs first: the first input's
+    # extents and the device they live on say what the operation runs over,
+    # and this is the one reading that holds whatever the call was handed --
+    # a region inside a region records its own calls without the node that
+    # holds the region being the node being lowered, so asking that one about
+    # this operation's result would answer with someone else's answer.  The
+    # recorded value is a fallback for a call whose inputs say nothing.
+    if val is None:
+        val = next((x for x in inputs if hasattr(x, "get_size")), None)
+    if val is None:
+        val = next((x for x in inputs if hasattr(x, "shape")), None)
+    if val is None:
+        val = node_val()
+    if hasattr(val, "get_size"):
+        size = tuple(int(s) for s in val.get_size())
+        dtype = val.get_dtype()
+        device = val.get_device()
+    else:
+        size, dtype, device = val_info(val)
     loaders = [
         as_value_node(x, dtype, device).make_loader() for x in inputs
     ]
@@ -1240,7 +1273,6 @@ LOWERINGS["log2.default"] = lower_log2 = _unary("log2")
 #: worked out from the arguments, which is what a comparison of numbers would
 #: give.
 register_pointwise("eq.default", type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.ALWAYS_BOOL)
-LOWERINGS["eq.default"] = lower_eq = _unary("eq")
 
 
 def _binary(_op: str):
@@ -1264,6 +1296,30 @@ for _name, _op in {
     "maximum.default": "maximum", "minimum.default": "minimum",
 }.items():
     LOWERINGS[_name] = _binary(_op)
+
+#: The ways two values are ordered against each other.  The answer is not a
+#: number: comparing two values is how one of them is chosen, and a value that
+#: could be chosen as one of two numbers is not a number.  So the type is
+#: stated rather than worked out from the arguments.
+register_pointwise("le.default", type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.ALWAYS_BOOL)
+register_pointwise("lt.default", type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.ALWAYS_BOOL)
+register_pointwise("ge.default", type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.ALWAYS_BOOL)
+register_pointwise("gt.default", type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.ALWAYS_BOOL)
+register_pointwise("ne.default", type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.ALWAYS_BOOL)
+LOWERINGS["le.default"] = lower_le = _binary("le")
+LOWERINGS["lt.default"] = lower_lt = _binary("lt")
+LOWERINGS["ge.default"] = lower_ge = _binary("ge")
+LOWERINGS["gt.default"] = lower_gt = _binary("gt")
+LOWERINGS["ne.default"] = lower_ne = _binary("ne")
+LOWERINGS["eq.default"] = lower_eq = _binary("eq")
+#: The forms where one side is a plain number: a value asked whether it is
+#: below a bound is answered by the same comparison, with the number on the
+#: other side of it.
+LOWERINGS["le.Scalar"] = _binary("le")
+LOWERINGS["lt.Scalar"] = _binary("lt")
+LOWERINGS["ge.Scalar"] = _binary("ge")
+LOWERINGS["gt.Scalar"] = _binary("gt")
+LOWERINGS["ne.Scalar"] = _binary("ne")
 
 
 @register("clamp.default")
@@ -1324,7 +1380,7 @@ def make_view(x: TensorBox, size, reindex) -> TensorBox:
     # held in, so the box is unwrapped here.
     if reindex is None:
         return View.create(x, size)
-    return View(data=_underlying(x), size=size, reindex=reindex)
+    return TensorBox(View(data=_underlying(x), size=size, reindex=reindex))
 
 
 def _underlying(box):
@@ -1643,35 +1699,47 @@ def make_reduction(x: TensorBox, dims, keepdim, dtype, device, rtype="sum", prol
 
 
 @register("sum.dim_IntList", "sum.default")
-def lower_sum(x, dims=None, keepdim=False, **kwargs):
-    size, dtype, device = val_info(node_val())
+def lower_sum(x, dims=None, keepdim=False, dtype=None, **kwargs):
     if not dims:
         dims = list(range(len(x.get_size())))
-    return make_reduction(x, dims, keepdim, dtype, device, "sum")
+    elif isinstance(dims, (int, sympy.Integer)):
+        dims = [dims]
+    return make_reduction(
+        x, dims, keepdim, dtype or x.get_dtype(), x.get_device(), "sum"
+    )
 
 
 @register("mean.dim")
-def lower_mean(x, dims, keepdim=False, **kwargs):
-    size, dtype, device = val_info(node_val())
+def lower_mean(x, dims, keepdim=False, dtype=None, **kwargs):
+    if isinstance(dims, (int, sympy.Integer)):
+        dims = [dims]
     count = prod(x.get_size()[normalize_dim(d, len(x.get_size()))] for d in dims)
-    total = make_reduction(x, dims, keepdim, dtype, device, "sum")
+    total = make_reduction(
+        x, dims, keepdim, dtype or x.get_dtype(), x.get_device(), "sum"
+    )
     return pointwise(lambda v: ops.truediv(v, ops.constant(float(count), "float32")), total)
 
 
 @register("amax.default")
-def lower_amax(x, dims=None, keepdim=False, **kwargs):
-    size, dtype, device = val_info(node_val())
+def lower_amax(x, dims=None, keepdim=False, dtype=None, **kwargs):
+    # What the reduction produces is read from the value it reduces: reducing
+    # over axes changes how many there are and leaves a value with the same
+    # element type.  A dtype the caller asked for is a different thing, and
+    # overrides what that would say.
     if not dims:
         dims = list(range(len(x.get_size())))
-    return make_reduction(x, dims, keepdim, dtype, device, "max")
+    elif isinstance(dims, (int, sympy.Integer)):
+        dims = [dims]
+    return make_reduction(x, dims, keepdim, dtype or x.get_dtype(), x.get_device(), "max")
 
 
 @register("amin.default")
-def lower_amin(x, dims=None, keepdim=False, **kwargs):
-    size, dtype, device = val_info(node_val())
+def lower_amin(x, dims=None, keepdim=False, dtype=None, **kwargs):
     if not dims:
         dims = list(range(len(x.get_size())))
-    return make_reduction(x, dims, keepdim, dtype, device, "min")
+    elif isinstance(dims, (int, sympy.Integer)):
+        dims = [dims]
+    return make_reduction(x, dims, keepdim, dtype or x.get_dtype(), x.get_device(), "min")
 
 
 @register("conv2d_grad_bias.default", "conv_grad_bias.default")
@@ -4241,10 +4309,14 @@ def reduce_argmax(x: Any, dim: Any = None, keepdim: Any = False) -> Any:
     # This is reached while some other node is being lowered, and that
     # node's result is named by which of its results is wanted rather
     # than being the whole of them.
-    size, dtype, device = val_info(node_val(index=0))
+    device = x.get_device()
     if dim is None:
-        dim = list(range(len(x.get_size())))
-    return make_reduction(x, [dim], keepdim, tp.int64, device, "argmax")
+        dims = list(range(len(x.get_size())))
+    elif isinstance(dim, (list, tuple)):
+        dims = list(dim)
+    else:
+        dims = [dim]
+    return make_reduction(x, dims, keepdim, tp.int64, device, "argmax")
 
 
 @register("argmin.default")
@@ -4258,10 +4330,14 @@ def reduce_argmin(x: Any, dim: Any = None, keepdim: Any = False) -> Any:
     # This is reached while some other node is being lowered, and that
     # node's result is named by which of its results is wanted rather
     # than being the whole of them.
-    size, dtype, device = val_info(node_val(index=0))
+    device = x.get_device()
     if dim is None:
-        dim = list(range(len(x.get_size())))
-    return make_reduction(x, [dim], keepdim, tp.int64, device, "argmin")
+        dims = list(range(len(x.get_size())))
+    elif isinstance(dim, (list, tuple)):
+        dims = list(dim)
+    else:
+        dims = [dim]
+    return make_reduction(x, dims, keepdim, tp.int64, device, "argmin")
 
 
 @register_lowering(aten.mode.default, type_promotion_kind=None)
@@ -5372,6 +5448,18 @@ def index_tensor(x: Any, indices: Any) -> Any:
     return index_impl(x, indices, check=True)
 
 
+def _promotion_input(value: Any) -> tuple:
+    """What an operand contributes to a promotion: its type, and whether it is a number.
+
+    A number promotes differently from a value of one dimension, so the two
+    facts travel together rather than being read apart at each lattice step.
+    """
+
+    if isinstance(value, (ir.Constant, int, float)):
+        return (value.get_dtype() if isinstance(value, ir.Constant) else None, True)
+    return (value.get_dtype(), len(value.get_size()) == 0)
+
+
 @register_lowering("where.default", broadcast=False, type_promotion_kind=None)
 def lower_where(cond, a, b):
     """One of two values, chosen by a third.
@@ -5390,13 +5478,15 @@ def lower_where(cond, a, b):
     from .dtype_propagation import get_promoted_dtype
 
     if isinstance(a, (float, int)):
-        a = ops.constant(a, b.get_dtype())
+        a = ir.Constant(value=a, dtype=b.get_dtype(), device=b.get_device())
     if isinstance(b, (float, int)):
-        b = ops.constant(b, a.get_dtype())
+        b = ir.Constant(value=b, dtype=a.get_dtype(), device=a.get_device())
 
     args = [cond, a, b]
     dtype = get_promoted_dtype(
-        args[1], args[2], type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT
+        _promotion_input(a),
+        _promotion_input(b),
+        type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
     )
     indices = [i for i, x in enumerate(args) if isinstance(x, TensorBox)]
     for i, x in zip(indices, broadcast_tensors(*[args[i] for i in indices])):
@@ -5426,10 +5516,10 @@ def lower_max(x, dim=None, keepdim=False):
 
     if dim is not None:
         return (
-            lower_amax(x, axis=dim, keepdims=keepdim),
-            reduce_argmax(x, axis=dim, keepdims=keepdim),
+            lower_amax(x, dims=dim, keepdim=keepdim),
+            reduce_argmax(x, dim, keepdim),
         )
-    return lower_amax(x, axis=None, keepdims=keepdim)
+    return lower_amax(x, dims=None, keepdim=keepdim)
 
 
 def convert_symint_to_expr(val: Any) -> Any:

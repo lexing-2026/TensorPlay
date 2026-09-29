@@ -45,6 +45,7 @@ from ..ir import (
 )
 from ..loops import V
 from ..ir import ChoiceCaller, TritonTemplateCallerBase
+from ..codegen.common import CSEVariable
 from .mm_common import use_aten_gemm_kernels
 from ..loops import contiguous_strides, dtype_name
 from ..heuristics.template.params import DictKernelTemplateParams, KernelTemplateParams
@@ -2119,7 +2120,7 @@ class TritonTemplateKernel(TritonKernel):
                     )
                 if out is None:
                     raise AssertionError("out must not be None")
-                self.body.writeline(f"{output_name} = {out.value}")
+                self.body.writeline(f"{output_name} = {out}")
             else:
                 if out is not None:
                     raise AssertionError("out must be None when output_name is None")

@@ -1561,6 +1561,17 @@ class ShapeEnv:
         self.guards.append(ShapeGuard(sympy.Eq(self.replace(expr), value)))
         return value
 
+    def guard_int(self, expr: sympy.Expr | int) -> int:
+        """Vouch for an expression being the whole number it stands for.
+
+        A plain number is its own answer; anything else is evaluated, the
+        evaluation's result recorded as a constraint, and the number handed
+        back -- so a caller that needs to index with it can.
+        """
+
+        value = self.guarding_hint_or_throw(expr)
+        return int(value)
+
     def _ignore_fresh_unbacked_symbols_tls(self) -> bool:
         """Whether symbols created right now are meant to be discarded."""
 

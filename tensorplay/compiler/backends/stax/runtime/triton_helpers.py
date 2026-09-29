@@ -17,9 +17,9 @@ import sympy
 
 import tensorplay as tp
 
-from .triton_compat import libdevice, math, triton
 
-from .triton_compat import JITFunction
+from .triton_compat import JITFunction, libdevice, math
+from .triton_compat import math as tl_math
 
 
 def set_driver_to_cpu():

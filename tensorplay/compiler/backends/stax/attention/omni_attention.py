@@ -895,7 +895,6 @@ def create_omni_attention_kernel(
 # ---------------------------------------------------------------------------
 
 
-@register_lowering(omni_attention_hop, type_promotion_kind=None)
 def _name_held_tensors(mask_parts: dict) -> dict:
     """Give every tensor a mask holds a name the kernel can read it by.
 
@@ -938,6 +937,7 @@ def _name_held_tensors(mask_parts: dict) -> dict:
     return named
 
 
+@register_lowering(omni_attention_hop, type_promotion_kind=None)
 def lower_omni_attention(
     query: Any,
     key: Any,

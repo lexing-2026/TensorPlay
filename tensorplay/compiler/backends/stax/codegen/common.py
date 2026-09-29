@@ -2081,19 +2081,22 @@ class CSEProxy(DefaultHandler):
         bounds = self._bound_variable(name, *args, **kwargs)
 
         value = getattr(self.parent_handler, name)(*args, **kwargs)
-        dtype_handler = getattr(V, "dtype_handler", None)
-        shape_handler = getattr(V, "shape_handler", None)
+        from ..dtype_propagation import DtypePropagationOpsHandler
+        from ..shape_propagation import ShapePropagationOpsHandler
+
+        dtype_handler = DtypePropagationOpsHandler()
+        shape_handler = ShapePropagationOpsHandler()
 
         backend = get_current_backend()
 
-        shape_op = getattr(shape_handler, name, None) if shape_handler else None
+        shape_op = getattr(shape_handler, name, None)
         output_dtype = None
         output_shape = None
 
         if name == "masked" and backend == "triton":
             output_dtype = getattr(value, "dtype", None)
             output_shape = getattr(value, "shape", None)
-        elif backend in ("triton", "cpp", "mps") and dtype_handler is not None:
+        elif backend in ("triton", "cpp", "mps"):
             dtype_op = getattr(dtype_handler, name, None)
             if dtype_op is not None:
                 output_dtype = dtype_op(*args, **kwargs)
@@ -2162,7 +2165,7 @@ class CSEProxy(DefaultHandler):
 
             return csevar
 
-        from ..utils._pytree import tree_map
+        from tensorplay.utils._pytree import tree_map
 
         result = tree_map(do_cse, value)
         self.kernel.record_op_trace(name, args, kwargs, result)

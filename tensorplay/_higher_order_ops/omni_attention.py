@@ -706,7 +706,6 @@ def trace_omni_attention(
             # of a result, and no number computed from it is ever looked at.
             size = value.shape
             device, dtype = value.device, value.dtype
-            needs_grad = value.requires_grad
         elif isinstance(value, _StandIn):
             # The extents a stand-in answers with are the ones the region was
             # captured with, and they are settled -- they are part of what the
@@ -719,10 +718,14 @@ def trace_omni_attention(
                 return value
             size = sample.shape
             device, dtype = value.device, value.dtype
-            needs_grad = bool(sample.requires_grad)
         else:
             return value
-        stand_in = tensorplay.empty_strided(
+        # Whether the example asks to be differentiated is not carried here.
+        # What this builds is a shape to trace against, and a shape has no
+        # gradient of its own: the region being traced decides that from the
+        # values it was captured with, not from a value made to stand in for
+        # one of them.
+        return tensorplay.empty_strided(
             size,
             # The distances of a value whose extents are known and whose numbers
             # are not read: the ones a value of this shape has, laid out one
@@ -731,11 +734,19 @@ def trace_omni_attention(
             device=device,
             dtype=dtype,
         )
-        if needs_grad:
-            stand_in.requires_grad_(True)
-        return stand_in
 
-    with disable_proxy_modes_tracing(), FakeTensorMode():
+    # The example runs below autograd.  What it exists for is the shapes of the
+    # outputs, and the region is traced with that alone in hand: the parts of a
+    # mask that are themselves values recorded in the region being traced are
+    # stand-ins rather than values here, so a pass that would save them for a
+    # later run has nothing real to save -- and the pass is not what this call
+    # is for anyway.  Going below it means the call answers as the operator's
+    # own formula, which is the only one that can read a stand-in for its shape.
+    with (
+        disable_proxy_modes_tracing(),
+        FakeTensorMode(),
+        _AutoDispatchBelowAutograd(),
+    ):
         example_out = omni_attention(
             _extents_of(query),
             _extents_of(key),
