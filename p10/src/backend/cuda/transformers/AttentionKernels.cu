@@ -25,8 +25,16 @@
 
 // Native aligned flash reference.  This is the standalone CUDA/CUTE kernel
 // source used for the schedule comparison; FLASHATTENTION_DISABLE_DROPOUT
+//
+// The kernel headers are the copy this tree keeps beside its launcher, not
+// the ones the registered submodule carries.  That is the single definition
+// of the launch parameters: the leaves under src/backend/cuda/transformers
+// compile against this copy through FlashFwdLauncher.h, so a second copy
+// reached from here would be a second definition of the same structure in the
+// same namespace, and the two would agree only for as long as someone kept
+// them edited together.
 #if !defined(USE_ROCM) && \
-    __has_include("../../../../third_party/flash-attention/csrc/flash_attn/src/flash.h") && \
+    __has_include("flash/flash_fwd_kernel.h") && \
     __has_include("../../../../third_party/cutlass/include/cute/tensor.hpp")
 #define TP_HAS_NATIVE_CUTE_FLASH 1
 #define FLASHATTENTION_DISABLE_DROPOUT
@@ -34,8 +42,8 @@
 #define FLASHATTENTION_DISABLE_LOCAL
 #define FLASHATTENTION_DISABLE_SOFTCAP
 #define FLASH_NAMESPACE tensorplay_native_flash
-#include "../../../../third_party/flash-attention/csrc/flash_attn/src/flash.h"
-#include "../../../../third_party/flash-attention/csrc/flash_attn/src/flash_fwd_kernel.h"
+#include "flash/flash.h"
+#include "flash/flash_fwd_kernel.h"
 // The forward launcher picks the kernel by element type, head width and causal
 // choice and is defined in a translation unit of its own, one leaf per file, so
 // that no file holds every instantiation at once.  It is declared here, inside
@@ -44,8 +52,8 @@ namespace tensorplay_native_flash {
 void run_mha_fwd(Flash_fwd_params& params, cudaStream_t stream,
                  bool force_split_kernel = false);
 }  // namespace tensorplay_native_flash
-#include "../../../../third_party/flash-attention/csrc/flash_attn/src/flash_bwd_preprocess_kernel.h"
-#include "../../../../third_party/flash-attention/csrc/flash_attn/src/flash_bwd_kernel.h"
+#include "flash/flash_bwd_preprocess_kernel.h"
+#include "flash/flash_bwd_kernel.h"
 #undef FLASH_NAMESPACE
 #undef FLASHATTENTION_DISABLE_SOFTCAP
 #undef FLASHATTENTION_DISABLE_LOCAL
@@ -1530,7 +1538,11 @@ std::tuple<Tensor, Tensor> sdpa_fused_forward_cuda(
   params.d = static_cast<int>(D);
   params.d_rounded = static_cast<int>(D);
   params.rotary_dim = 0;
-  params.total_q = static_cast<int>(Tq * grid_b);
+  // A packed call arrives as one buffer of every token in the batch, so its
+  // row extent is already the total and the sequence count does not multiply
+  // into it again.  A batched call has one extent per batch entry, and there
+  // the total is the product of the two.
+  params.total_q = static_cast<int>(packed ? Tq : Tq * grid_b);
   params.cu_seqlens_q = const_cast<int32_t*>(launch.cu_seqlens_q);
   params.cu_seqlens_k = const_cast<int32_t*>(
       launch.cu_seqlens_k != nullptr ? launch.cu_seqlens_k : launch.cu_seqlens_q);
@@ -1557,6 +1569,15 @@ std::tuple<Tensor, Tensor> sdpa_fused_forward_cuda(
   if (window_left >= 0 && window_right < 0) window_right = seqlen_k;
   params.window_size_left = static_cast<int>(window_left);
   params.window_size_right = static_cast<int>(window_right);
+  // The diagonal is held at the top left.  That is the alignment a causal call
+  // means, and it is what the composed reference and the public contract both
+  // use.  Deriving the diagonal from the two token counts instead would hold
+  // it at the bottom right, which on a call whose counts differ is a different
+  // function of the inputs: a one-row query over a long context would see one
+  // key under the top-left bound and all of them under the bottom-right one.
+  // Naming it here is the whole of that difference, and it is what lets such a
+  // call be answered by this schedule rather than declined.
+  params.causal_diagonal_offset = 0;
 
   // The score normaliser is the caller's scale when one was given, and the
   // head width's reciprocal square root otherwise.

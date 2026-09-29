@@ -39,7 +39,8 @@ template <bool HasWSLeft=true, typename Engine, typename Layout>
 __forceinline__ __device__ void apply_mask_local(Tensor<Engine, Layout> &tensor, const int col_idx_offset_,
                                         const int max_seqlen_k, const int row_idx_offset,
                                         const int max_seqlen_q, const int warp_row_stride,
-                                        const int window_size_left, const int window_size_right) {
+                                        const int window_size_left, const int window_size_right,
+                                        const int causal_diagonal_offset) {
     // tensor has shape (nrow=(2, MMA_M), ncol=(2, MMA_N))
     static_assert(Layout::rank == 2, "Only support 2D Tensor");
     const int lane_id = threadIdx.x % 32;
@@ -50,8 +51,8 @@ __forceinline__ __device__ void apply_mask_local(Tensor<Engine, Layout> &tensor,
         #pragma unroll
         for (int i = 0; i < size<0, 0>(tensor); ++i) {
             const int row_idx = row_idx_base + i * 8;
-            const int col_idx_limit_left = std::max(0, row_idx + max_seqlen_k - max_seqlen_q - window_size_left);
-            const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q + window_size_right);
+            const int col_idx_limit_left = std::max(0, row_idx + causal_diagonal_offset - window_size_left);
+            const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + causal_diagonal_offset + window_size_right);
             #pragma unroll
             for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
                 const int col_idx_base = col_idx_offset + nj * 8;
@@ -75,10 +76,12 @@ __forceinline__ __device__ void apply_mask_local(Tensor<Engine, Layout> &tensor,
 template <typename Engine, typename Layout>
 __forceinline__ __device__ void apply_mask_causal(Tensor<Engine, Layout> &tensor, const int col_idx_offset_,
                                          const int max_seqlen_k, const int row_idx_offset,
-                                         const int max_seqlen_q, const int warp_row_stride) {
+                                         const int max_seqlen_q, const int warp_row_stride,
+                                         const int causal_diagonal_offset) {
     // Causal masking is equivalent to local masking with window_size_left = infinity and window_size_right = 0
     apply_mask_local</*HasWSLeft=*/false>(tensor, col_idx_offset_, max_seqlen_k, row_idx_offset,
-                                          max_seqlen_q, warp_row_stride, -1, 0);
+                                          max_seqlen_q, warp_row_stride, -1, 0,
+                                          causal_diagonal_offset);
 }
 
 template <typename Engine0, typename Layout0, typename Engine1, typename Layout1>
@@ -113,15 +116,18 @@ struct Mask {
 
     const int max_seqlen_k, max_seqlen_q;
     const int window_size_left, window_size_right;
+    const int causal_diagonal_offset;
     const float alibi_slope;
 
     __forceinline__ __device__ Mask(const int max_seqlen_k, const int max_seqlen_q,
                                     const int window_size_left, const int window_size_right,
+                                    const int causal_diagonal_offset,
                                     const float alibi_slope=0.f)
         : max_seqlen_k(max_seqlen_k)
         , max_seqlen_q(max_seqlen_q)
         , window_size_left(window_size_left)
         , window_size_right(window_size_right)
+        , causal_diagonal_offset(causal_diagonal_offset)
         , alibi_slope(!Has_alibi ? 0.0 : alibi_slope) {
     };
 
@@ -169,8 +175,8 @@ struct Mask {
                     #pragma unroll
                     for (int i = 0; i < size<0, 0>(tensor); ++i) {
                         const int row_idx = row_idx_base + i * 8;
-                        const int col_idx_limit_left = std::max(0, row_idx + max_seqlen_k - max_seqlen_q - window_size_left);
-                        const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q + window_size_right);
+                        const int col_idx_limit_left = std::max(0, row_idx + causal_diagonal_offset - window_size_left);
+                        const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + causal_diagonal_offset + window_size_right);
                         #pragma unroll
                         for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
                             const int col_idx_base = col_idx_offset + nj * 8;
@@ -181,7 +187,7 @@ struct Mask {
                                     if constexpr (Is_causal) {
                                         tensor(make_coord(i, mi), make_coord(j, nj)) += alibi_slope * col_idx;
                                     } else {
-                                        tensor(make_coord(i, mi), make_coord(j, nj)) -= alibi_slope * abs(row_idx + max_seqlen_k - max_seqlen_q - col_idx);
+                                        tensor(make_coord(i, mi), make_coord(j, nj)) -= alibi_slope * abs(row_idx + causal_diagonal_offset - col_idx);
 
                                     }
                                 }

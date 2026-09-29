@@ -117,6 +117,17 @@ struct Flash_fwd_params : public Qkv_params {
     int window_size_left, window_size_right;
     float softcap;
 
+    // How far the causal diagonal sits from the query origin, in keys.  Query
+    // row t admits keys 0..t+offset, so the offset is what names the
+    // alignment: 0 holds the diagonal at the top left, and seqlen_k-seqlen_q
+    // holds it at the bottom right.  The two agree when the two token counts
+    // agree, which is why a square call needs no choice; on every other call
+    // they are different functions of the inputs rather than one function
+    // written twice, and a one-row query over a long context is where the
+    // difference is largest: the top-left bound lets that row see one key and
+    // the bottom-right one lets it see all of them.
+    int causal_diagonal_offset;
+
     // Random state, stored as an opaque buffer the launch fills in place.
     // We intentionally use an opaque buffer to allow the disabled dropout binary to stay
 

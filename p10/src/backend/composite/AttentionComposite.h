@@ -466,18 +466,12 @@ inline FusedSdpaSchedule fused_sdpa_schedule(
     const std::optional<Tensor>& attn_mask, double dropout_p,
     std::optional<double> scale, bool enable_gqa, bool is_causal) {
   if (attn_mask.has_value() || dropout_p != 0.0) return FusedSdpaSchedule::kNone;
-  // A causal call whose query and context differ in length is not a shape the
-  // fused schedule states.  Its causal bound is the one a window of zero right
-  // bound names, and that bound is stated against the context length, so on a
-  // non-square call it holds the diagonal at the bottom right.  The composed
-  // reference masks the other way, at the top left, and the two are different
-  // functions of the inputs.  So the fused schedule declines the shape rather
-  // than answering it as the other one, which leaves the composed reference to
-  // answer the question that was actually asked.
-  if (is_causal && query.dim() == 4 && key.dim() == 4 &&
-      query.size(2) != key.size(2)) {
-    return FusedSdpaSchedule::kNone;
-  }
+  // A causal call whose query and context differ in length is not declined.
+  // The fused schedule states its diagonal as a field and this path sets it to
+  // the top left, which is the alignment such a call means, so the answer it
+  // produces is the answer the composed path would produce for the same
+  // inputs.  Declining the shape was what left these calls to the composed
+  // path, and there they are 17x to 183x behind.
   if (query.dim() != 4 || key.dim() != 4 || value.dim() != 4) {
     return FusedSdpaSchedule::kNone;
   }
