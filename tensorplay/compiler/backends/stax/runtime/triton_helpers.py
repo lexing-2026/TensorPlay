@@ -13,6 +13,9 @@ is a launch that quietly does not do what it says.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+
 import sympy
 
 import tensorplay as tp
@@ -20,6 +23,19 @@ import tensorplay as tp
 
 from .triton_compat import JITFunction, libdevice, math, tl, triton
 from .triton_compat import math as tl_math
+
+_skip_gpu_driver_setup: ContextVar[bool] = ContextVar(
+    "_skip_gpu_driver_setup", default=False
+)
+
+
+@contextmanager
+def skip_gpu_driver_setup():
+    token = _skip_gpu_driver_setup.set(True)
+    try:
+        yield
+    finally:
+        _skip_gpu_driver_setup.reset(token)
 
 
 def _triton_jit(fn):
@@ -78,6 +94,9 @@ def set_driver_to_gpu():
     machine, so it is asked for rather than assumed -- and a backend already
     active is left alone, because setting one up again is not free.
     """
+
+    if _skip_gpu_driver_setup.get():
+        return
 
     import triton
     import triton.backends

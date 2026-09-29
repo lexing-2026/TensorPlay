@@ -28,6 +28,7 @@ import os
 import re
 import threading
 import time
+from collections import namedtuple
 from typing import Any, Callable, Container, Final, Generic, Literal, TypeVar, cast
 
 import tensorplay as tp
