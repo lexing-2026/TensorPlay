@@ -87,6 +87,14 @@ Tensor sdpa_gemm_native(
     int64_t B, int64_t Hq, int64_t Hkv, int64_t Tq, int64_t Tkv, int64_t D,
     bool is_causal);
 
+// The fused wide-precision schedule, defined in a translation unit of its own
+// because its tile shape and its register budget belong to it alone.  A wide
+// precision otherwise reaches a schedule that writes its score matrix out and
+// reads it back twice, which for a wide context costs more than the operands
+// themselves.
+Tensor sdpa_wide_tiled_cuda(const Tensor& query, const Tensor& key,
+                            const Tensor& value, bool is_causal);
+
 namespace {
 
 #define TP_CUDA_CHECK(condition) \
@@ -1498,7 +1506,15 @@ std::tuple<Tensor, Tensor> sdpa_fused_forward_cuda(
   // inside it, so an allocation sized per sequence would be as many times too
   // large and would leave the tail untouched.
   const int64_t grid_b = packed ? launch.num_seqs : B;
-  Tensor out = Tensor::empty({packed ? 1 : B, Hq, Tq, D}, q.dtype(), q.device());
+  // The output and the logsumexp are laid out the way the inputs are.  A
+  // packed call keeps the tokens on the row axis and the heads on the head
+  // axis; a batched call is the other way round, because the transpose above
+  // put the heads second for it.  Writing either result in the batched order
+  // would leave the kernel reading a row at one stride and writing it at
+  // another, which fills the buffer with plausible numbers in the wrong slots.
+  Tensor out = Tensor::empty(
+      {packed ? 1 : B, packed ? Tq : Hq, packed ? Hq : Tq, D}, q.dtype(),
+      q.device());
   Tensor lse = packed ? Tensor::empty({Hq, Tq}, DType::Float32, q.device())
                       : Tensor::empty({B, Hq, Tq}, DType::Float32, q.device());
 
@@ -1518,8 +1534,8 @@ std::tuple<Tensor, Tensor> sdpa_fused_forward_cuda(
   params.k_head_stride = k4.stride(head_axis);
   params.v_head_stride = v4.stride(head_axis);
   params.o_batch_stride = out.stride(0);
-  params.o_row_stride = out.stride(2);
-  params.o_head_stride = out.stride(1);
+  params.o_row_stride = out.stride(row_axis);
+  params.o_head_stride = out.stride(head_axis);
   // Grouped-query heads: the kernel reads the key head as bidh / ratio, so one
   // key head serves a contiguous block of ratio query heads.
   params.h = static_cast<int>(Hq);
@@ -2580,6 +2596,8 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key,
 #else
       break;
 #endif
+    case composite::FusedSdpaSchedule::kWideTiled:
+      return sdpa_wide_tiled_cuda(query, key, value, is_causal);
     case composite::FusedSdpaSchedule::kCrossGemm:
       // A context of another length in a precision the tiled schedule has no
       // tiles for.  The two reduced precisions have tiles, so they went to

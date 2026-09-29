@@ -299,6 +299,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/transformers/AttentionKernels.cu
         src/backend/cuda/transformers/AttentionGemmKernels.cu
         src/backend/cuda/transformers/AttentionRopeKernels.cu
+        src/backend/cuda/transformers/WideTiledAttention.cu
         # One file per leaf of the fused attention schedule.  They are listed
         # individually rather than globbed so that a leaf added to the
         # directory does not silently join the build without anyone deciding it

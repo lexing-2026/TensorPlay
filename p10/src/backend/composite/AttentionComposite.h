@@ -439,6 +439,12 @@ inline std::tuple<Tensor, Tensor> native_mha_composite(
 // The widest head the fused device tiles are shaped for.  A wider head has no
 // tile to land in, so it stays on the composed reference.
 inline constexpr int64_t kFusedMaxHeadDim = 128;
+// The head width the fused wide-precision schedule holds on the chip in one
+// tile.  A wider head would need a tile that does not fit a block's shared
+// memory, and a narrower one is left to the schedule that materialises its
+// scores, which reads the operands either way and so is not sensitive to
+// the width.
+inline constexpr int64_t kFusedWideTileD = 128;
 
 // Which device-side schedule answers a call, when one does.  Three are named
 // because they cover different shapes and precisions, and the caller has to
@@ -455,7 +461,7 @@ inline constexpr int64_t kFusedMaxHeadDim = 128;
 //                 have to model.  Materializes the score matrix, but it is the
 //                 only schedule that answers a wide precision on a shape the
 //                 square entry point cannot state.
-enum class FusedSdpaSchedule { kNone, kSquare, kTiled, kCrossGemm };
+enum class FusedSdpaSchedule { kNone, kSquare, kTiled, kWideTiled, kCrossGemm };
 
 // Which schedule can answer this call, as a shape predicate.  Every schedule
 // declines the two things none of them model -- an additive mask and a drop --
@@ -509,10 +515,20 @@ inline FusedSdpaSchedule fused_sdpa_schedule(
   // tiles -- which is the two reduced precisions.
   if (reduced) return FusedSdpaSchedule::kTiled;
   // A wide precision on a shape the tiled schedule has no tiles for.  The
-  // GEMM-backed schedule materializes the scores and answers it, but it names
-  // no normaliser, so a call that carries one stays on the composed path.
-  const bool wide = dt == DType::Float32 && !scale.has_value();
-  return wide ? FusedSdpaSchedule::kCrossGemm : FusedSdpaSchedule::kNone;
+  // fused wide schedule keeps its scores on the chip and answers it, but it
+  // takes the head width as a tile size and holds one of them on the chip, so
+  // it covers a width that tile admits.  The GEMM-backed schedule answers
+  // everything else the tiled ones decline, at the cost of writing the scores
+  // out and reading them back twice; it names no normaliser, so a call that
+  // carries one stays on the composed path.
+  if (dt == DType::Float32) {
+    if (head_dim == kFusedWideTileD) {
+      return FusedSdpaSchedule::kWideTiled;
+    }
+    if (scale.has_value()) return FusedSdpaSchedule::kNone;
+    return FusedSdpaSchedule::kCrossGemm;
+  }
+  return FusedSdpaSchedule::kNone;
 }
 
 // Backend selection shared with the nn.attention routing flags:
