@@ -57,18 +57,23 @@ __global__ void sdpa_transpose_k_kernel(
 
 template <typename DT>
 __global__ void sdpa_softmax_kernel(
-    DT* __restrict__ scores, int64_t rows, int64_t tokens,
+    DT* __restrict__ scores, int64_t groups, int64_t queries, int64_t keys,
     bool is_causal) {
   const int64_t row = static_cast<int64_t>(blockIdx.x);
-  if (row >= rows * tokens) return;
-  const int64_t token = row % tokens;
-  DT* values = scores + row * tokens;
+  if (row >= groups * queries) return;
+  const int64_t token = row % queries;
+  // The causal bound is the query row itself, which is the top-left alignment:
+  // query row t sees keys <= t.  The two lengths are independent, so this is the
+  // same bound the single-length form masked with, unchanged -- a context longer
+  // than the query does not shift the diagonal, it is bounded by the row.
+  const int64_t causal_limit = token;
+  DT* values = scores + row * keys;
   constexpr unsigned long long full_mask = 0xffffffffffffffffull;
 
   float maximum = -INFINITY;
-  for (int64_t j = threadIdx.x; j < tokens; j += 32) {
+  for (int64_t j = threadIdx.x; j < keys; j += 32) {
     float value = to_float(values[j]);
-    if (is_causal && j > token) value = -INFINITY;
+    if (is_causal && j > causal_limit) value = -INFINITY;
     values[j] = from_float<DT>(value);
     maximum = max(maximum, value);
   }
@@ -76,7 +81,7 @@ __global__ void sdpa_softmax_kernel(
   maximum = __shfl_sync(full_mask, maximum, 0);
 
   float total = 0.f;
-  for (int64_t j = threadIdx.x; j < tokens; j += 32) {
+  for (int64_t j = threadIdx.x; j < keys; j += 32) {
     const float value = to_float(values[j]);
     const float probability = isfinite(value) ? expf(value - maximum) : 0.f;
     values[j] = from_float<DT>(probability);
@@ -85,65 +90,76 @@ __global__ void sdpa_softmax_kernel(
   total = warpReduceSum(total);
   total = __shfl_sync(full_mask, total, 0);
   const float inverse = total > 0.f ? 1.f / total : 0.f;
-  for (int64_t j = threadIdx.x; j < tokens; j += 32)
+  for (int64_t j = threadIdx.x; j < keys; j += 32)
     values[j] = from_float<DT>(to_float(values[j]) * inverse);
 }
 
 }
 
+// GEMM-backed attention over a query and a context of independent lengths.  The
+// score matrix is materialized rather than tiled, so this is what serves a
+// precision the tiled schedule has no tiles for; within a precision the tiled
+// schedule is preferred wherever it applies, because it never writes the
+// scores out at all.
 template <typename DT>
 Tensor sdpa_gemm_native(
     const Tensor& q, const Tensor& k, const Tensor& v,
-    int64_t B, int64_t H, int64_t T, int64_t D, bool is_causal) {
+    int64_t B, int64_t H, int64_t Tq, int64_t Tkv, int64_t D, bool is_causal) {
   const DType dtype = q.dtype();
-  Tensor kt = Tensor::empty({B, H, D, T}, dtype, q.device());
+  // The score product reads the key transposed, so it is materialized once as
+  // (B, H, D, Tkv).
+  Tensor kt = Tensor::empty({B, H, D, Tkv}, dtype, q.device());
   dim3 transpose_grid(
-      static_cast<unsigned>((T + 31) / 32),
+      static_cast<unsigned>((Tkv + 31) / 32),
       static_cast<unsigned>((D + 31) / 32),
       static_cast<unsigned>(B * H));
   dim3 transpose_block(32, 8);
   sdpa_transpose_k_kernel<DT><<<
       transpose_grid, transpose_block, 0, getCurrentCUDAStream().stream()>>>(
-      k.data_ptr<DT>(), kt.data_ptr<DT>(), T, D);
+      k.data_ptr<DT>(), kt.data_ptr<DT>(), Tkv, D);
   TP_CUDA_CHECK(cudaGetLastError());
 
-  Tensor scores = Tensor::empty({B, H, T, T}, dtype, q.device());
-  Tensor q3 = q.reshape({B * H, T, D});
-  Tensor kt3 = kt.reshape({B * H, D, T});
-  Tensor scores3 = scores.reshape({B * H, T, T});
-  const long long q_stride = T * D;
-  const long long kt_stride = D * T;
-  const long long score_stride = T * T;
+  Tensor scores = Tensor::empty({B, H, Tq, Tkv}, dtype, q.device());
+  Tensor q3 = q.reshape({B * H, Tq, D});
+  Tensor kt3 = kt.reshape({B * H, D, Tkv});
+  Tensor scores3 = scores.reshape({B * H, Tq, Tkv});
+  const long long q_stride = Tq * D;
+  const long long kt_stride = D * Tkv;
+  const long long score_stride = Tq * Tkv;
   const float scale = 1.f / sqrtf(static_cast<float>(D));
   gemm_strided_batched_3d(
-      q3, kt3, scores3, B * H, T, T, D, q_stride, kt_stride, scale, 0.0);
+      q3, kt3, scores3, B * H, Tq, Tkv, D, q_stride, kt_stride, scale, 0.0);
 
-  const int64_t softmax_rows = B * H * T;
+  const int64_t softmax_rows = B * H * Tq;
   const unsigned softmax_blocks = static_cast<unsigned>(softmax_rows);
   sdpa_softmax_kernel<DT><<<
       softmax_blocks, 32, 0, getCurrentCUDAStream().stream()>>>(
-      scores.data_ptr<DT>(), B * H, T, is_causal);
+      scores.data_ptr<DT>(), B * H, Tq, Tkv, is_causal);
   TP_CUDA_CHECK(cudaGetLastError());
 
-  Tensor out = Tensor::empty({B, H, T, D}, dtype, q.device());
-  Tensor scores3_again = scores.reshape({B * H, T, T});
-  Tensor v3 = v.reshape({B * H, T, D});
-  Tensor out3 = out.reshape({B * H, T, D});
+  Tensor out = Tensor::empty({B, H, Tq, D}, dtype, q.device());
+  Tensor scores3_again = scores.reshape({B * H, Tq, Tkv});
+  Tensor v3 = v.reshape({B * H, Tkv, D});
+  Tensor out3 = out.reshape({B * H, Tq, D});
+  // The value is as long as the context, not as long as the query, so its batch
+  // stride is the context's -- sharing the query's would only be right while the
+  // two lengths agree.
+  const long long v_stride = Tkv * D;
   gemm_strided_batched_3d(
-      scores3_again, v3, out3, B * H, T, D, T, score_stride, q_stride,
+      scores3_again, v3, out3, B * H, Tq, D, Tkv, score_stride, v_stride,
       1.0, 0.0);
   return out;
 }
 
 template Tensor sdpa_gemm_native<float>(
     const Tensor&, const Tensor&, const Tensor&, int64_t, int64_t, int64_t,
-    int64_t, bool);
+    int64_t, int64_t, bool);
 template Tensor sdpa_gemm_native<tensorplay::Half>(
     const Tensor&, const Tensor&, const Tensor&, int64_t, int64_t, int64_t,
-    int64_t, bool);
+    int64_t, int64_t, bool);
 template Tensor sdpa_gemm_native<tensorplay::BFloat16>(
     const Tensor&, const Tensor&, const Tensor&, int64_t, int64_t, int64_t,
-    int64_t, bool);
+    int64_t, int64_t, bool);
 
 #undef TP_CUDA_CHECK
 

@@ -437,48 +437,73 @@ inline std::tuple<Tensor, Tensor> native_mha_composite(
 // tile to land in, so it stays on the composed reference.
 inline constexpr int64_t kFusedMaxHeadDim = 128;
 
-// Whether a device-side fused schedule can answer this call, as a shape
-// predicate.  Every schedule declines the two things none of them model -- an
-// additive mask and a drop -- and wants 4-D inputs, one head width shared by
-// query, key and value inside the tiled range, matching dtypes, one batch, and
-// a key and value of one length.  Two shapes then qualify, because two
-// schedules are written for them:
-//
-//   * the square self-attention shape with the head width's own normaliser,
-//     which the tensor-core, warp-per-row and GEMM-backed schedules between
-//     them cover in every precision each of them has a kernel for; and
-//   * the tiled schedule's shape, which additionally carries an explicit
-//     normaliser, grouped heads, and a context whose length differs from the
-//     query's.  All three are launch parameters there, not shape rewrites, and
-//     it comes in the two reduced precisions its tiles are cut for.
-inline bool fused_sdpa_serves(const Tensor& query, const Tensor& key,
-                              const Tensor& value,
-                              const std::optional<Tensor>& attn_mask,
-                              double dropout_p,
-                              const std::optional<double>& scale,
-                              bool enable_gqa) {
-  if (attn_mask.has_value() || dropout_p != 0.0) return false;
-  if (query.dim() != 4 || key.dim() != 4 || value.dim() != 4) return false;
-  const DType dt = query.dtype();
-  if (key.dtype() != dt || value.dtype() != dt) return false;
-  const int64_t head_dim = query.size(3);
-  if (head_dim == 0 || head_dim > kFusedMaxHeadDim) return false;
-  if (key.size(3) != head_dim || value.size(3) != head_dim) return false;
-  if (key.size(0) != query.size(0) || value.size(0) != query.size(0)) {
-    return false;
+// Which device-side schedule answers a call, when one does.  Three are named
+// because they cover different shapes and precisions, and the caller has to
+// pick between them:
+//   kSquare    -- one head count, one token count, the head width's own
+//                 normaliser: the tensor-core, warp-per-row and GEMM-backed
+//                 schedules between them, in every precision each has a kernel
+//                 for.  Also the entry the matching fused backward hangs off.
+//   kTiled     -- anything carrying an explicit normaliser, grouped heads, or
+//                 two lengths.  All three are launch parameters of the tiled
+//                 schedule rather than shape rewrites, and it comes in the two
+//                 reduced precisions its tiles are cut for.
+//   kCrossGemm -- two lengths and nothing else that the tiled schedule would
+//                 have to model.  Materializes the score matrix, but it is the
+//                 only schedule that answers a wide precision on a shape the
+//                 square entry point cannot state.
+enum class FusedSdpaSchedule { kNone, kSquare, kTiled, kCrossGemm };
+
+// Which schedule can answer this call, as a shape predicate.  Every schedule
+// declines the two things none of them model -- an additive mask and a drop --
+// and wants 4-D inputs, one head width shared by query, key and value inside the
+// tiled range, matching dtypes, one batch, and a key and value of one length.
+inline FusedSdpaSchedule fused_sdpa_schedule(
+    const Tensor& query, const Tensor& key, const Tensor& value,
+    const std::optional<Tensor>& attn_mask, double dropout_p,
+    const std::optional<double>& scale, bool enable_gqa) {
+  if (attn_mask.has_value() || dropout_p != 0.0) return FusedSdpaSchedule::kNone;
+  if (query.dim() != 4 || key.dim() != 4 || value.dim() != 4) {
+    return FusedSdpaSchedule::kNone;
   }
-  if (query.size(2) == 0 || key.size(2) == 0) return false;
-  if (key.size(2) != value.size(2)) return false;
+  const DType dt = query.dtype();
+  if (key.dtype() != dt || value.dtype() != dt) return FusedSdpaSchedule::kNone;
+  const int64_t head_dim = query.size(3);
+  if (head_dim == 0 || head_dim > kFusedMaxHeadDim) {
+    return FusedSdpaSchedule::kNone;
+  }
+  if (key.size(3) != head_dim || value.size(3) != head_dim) {
+    return FusedSdpaSchedule::kNone;
+  }
+  if (key.size(0) != query.size(0) || value.size(0) != query.size(0)) {
+    return FusedSdpaSchedule::kNone;
+  }
+  if (query.size(2) == 0 || key.size(2) == 0) {
+    return FusedSdpaSchedule::kNone;
+  }
+  if (key.size(2) != value.size(2)) return FusedSdpaSchedule::kNone;
   const int64_t hq = query.size(1), hk = key.size(1);
-  if (hq == 0 || hk == 0) return false;
+  if (hq == 0 || hk == 0) return FusedSdpaSchedule::kNone;
   const bool grouped = hq != hk;
   // Grouped heads that do not divide evenly are not a shape; leaving them out
-  // of the fused answer leaves the composed path to say so in its own terms.
-  if (enable_gqa ? (hq % hk != 0) : grouped) return false;
-  if (!grouped && query.size(2) == key.size(2) && !scale.has_value()) {
-    return dt == DType::Float32 || dt == DType::Float16 || dt == DType::BFloat16;
+  // of every schedule leaves the composed path to say so in its own terms.
+  if (enable_gqa ? (hq % hk != 0) : grouped) return FusedSdpaSchedule::kNone;
+
+  const bool square = !grouped && query.size(2) == key.size(2);
+  const bool reduced = dt == DType::Float16 || dt == DType::BFloat16;
+  if (square && !scale.has_value()) {
+    const bool any_precision = dt == DType::Float32 || reduced;
+    return any_precision ? FusedSdpaSchedule::kSquare : FusedSdpaSchedule::kNone;
   }
-  return dt == DType::Float16 || dt == DType::BFloat16;
+  // The tiled schedule takes the normaliser, the group ratio and the two
+  // lengths as launch parameters, so it covers every other shape that has
+  // tiles -- which is the two reduced precisions.
+  if (reduced) return FusedSdpaSchedule::kTiled;
+  // A wide precision on a shape the tiled schedule has no tiles for.  The
+  // GEMM-backed schedule materializes the scores and answers it, but it names
+  // neither a normaliser nor a group ratio, so those stay on the composed path.
+  const bool wide = dt == DType::Float32 && !scale.has_value() && !grouped;
+  return wide ? FusedSdpaSchedule::kCrossGemm : FusedSdpaSchedule::kNone;
 }
 
 // Backend selection shared with the nn.attention routing flags:
@@ -490,8 +515,8 @@ inline int64_t fused_sdp_choice_common(const Tensor& query, const Tensor& key,
                                        double dropout_p,
                                        std::optional<double> scale,
                                        bool enable_gqa) {
-  if (fused_sdpa_serves(query, key, value, attn_mask, dropout_p, scale,
-                        enable_gqa)) {
+  if (fused_sdpa_schedule(query, key, value, attn_mask, dropout_p, scale,
+                          enable_gqa) != FusedSdpaSchedule::kNone) {
     return 1;  // FLASH_ATTENTION
   }
   const DType dt = query.dtype();

@@ -68,7 +68,7 @@ namespace cuda {
 template <typename DT>
 Tensor sdpa_gemm_native(
     const Tensor& q, const Tensor& k, const Tensor& v,
-    int64_t B, int64_t H, int64_t T, int64_t D, bool is_causal);
+    int64_t B, int64_t H, int64_t Tq, int64_t Tkv, int64_t D, bool is_causal);
 
 namespace {
 
@@ -2155,17 +2155,43 @@ Tensor sdpa_kernel_cuda_plain(const Tensor& query, const Tensor& key,
 #endif
   } else if (impl == 2) {
     if (dtype == DType::Float32) {
-      return sdpa_gemm_native<float>(q, k, v, B, H, T, D, is_causal);
+      return sdpa_gemm_native<float>(q, k, v, B, H, T, T, D, is_causal);
     } else if (dtype == DType::Float16) {
       return sdpa_gemm_native<tensorplay::Half>(
-          q, k, v, B, H, T, D, is_causal);
+          q, k, v, B, H, T, T, D, is_causal);
     } else {
       return sdpa_gemm_native<tensorplay::BFloat16>(
-          q, k, v, B, H, T, D, is_causal);
+          q, k, v, B, H, T, T, D, is_causal);
     }
   } else {
     TP_THROW(RuntimeError, "sdpa: unknown impl " + std::to_string(impl));
   }
+}
+
+// The GEMM-backed schedule over a context whose length differs from the
+// query's.  It materializes the score matrix instead of tiling it, so it is what
+// answers a precision the tiled schedule has no tiles for; within a precision
+// the tiled schedule is preferred wherever it applies, because it never writes
+// the scores out at all.
+Tensor sdpa_gemm_cross_cuda(const Tensor& query, const Tensor& key,
+                            const Tensor& value, bool is_causal) {
+  const Tensor q = query.contiguous();
+  const Tensor k = key.contiguous();
+  const Tensor v = value.contiguous();
+  const int64_t B = q.size(0);
+  const int64_t H = q.size(1);
+  const int64_t Tq = q.size(2);
+  const int64_t Tkv = k.size(2);
+  const int64_t D = q.size(3);
+  if (q.dtype() == DType::Float32) {
+    return sdpa_gemm_native<float>(q, k, v, B, H, Tq, Tkv, D, is_causal);
+  }
+  if (q.dtype() == DType::Float16) {
+    return sdpa_gemm_native<tensorplay::Half>(
+        q, k, v, B, H, Tq, Tkv, D, is_causal);
+  }
+  return sdpa_gemm_native<tensorplay::BFloat16>(
+      q, k, v, B, H, Tq, Tkv, D, is_causal);
 }
 
 #if defined(TP_HAS_NATIVE_CUTE_FLASH)
@@ -2292,31 +2318,36 @@ Tensor sdpa_fused_extended_cuda(const Tensor& query, const Tensor& key,
 // the composite is what says what each of them means, for every call alike: a
 // caller that named none of them is asking for the same attention, and
 // answering it by a different route would make two spellings of one computation
-// disagree.  The exception is a call the fused kernels can state outright --
-// they take the scale, the group ratio and the two lengths as launch
-// parameters -- which the selector sends to them, so that a caller arriving
-// here directly is not left paying for a score matrix the fused schedule never
-// materialises.  The predicate is the selector's own, so the two cannot drift
-// apart.  The self-attention shape with the default normaliser goes to the
-// square entry point, which is also the one the matching fused backward hangs
-// off, so a training call keeps the fast backward.
+// disagree.  The exception is a call a device schedule can state outright, which
+// the selector names, so that a caller arriving here directly is not left paying
+// for a score matrix the tiled schedule never materialises.  The predicate is
+// the selector's own, so the two cannot drift apart.  The self-attention shape
+// with the default normaliser goes to the square entry point, which is also the
+// one the matching fused backward hangs off, so a training call keeps the fast
+// backward.
 Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key,
                         const Tensor& value,
                         const std::optional<Tensor>& attn_mask, double dropout_p,
                         bool is_causal, std::optional<double> scale,
                         bool enable_gqa) {
-  if (composite::fused_sdpa_serves(query, key, value, attn_mask, dropout_p,
-                                   scale, enable_gqa)) {
-    const bool square_self_attention =
-        !scale.has_value() && query.size(2) == key.size(2) &&
-        query.size(1) == key.size(1);
-    if (square_self_attention) {
+  switch (composite::fused_sdpa_schedule(query, key, value, attn_mask, dropout_p,
+                                        scale, enable_gqa)) {
+    case composite::FusedSdpaSchedule::kSquare:
       return sdpa_kernel_cuda_plain(query, key, value, is_causal, /*impl=*/0);
-    }
+    case composite::FusedSdpaSchedule::kTiled:
 #if defined(TP_HAS_NATIVE_CUTE_FLASH)
-    return sdpa_fused_extended_cuda(query, key, value, is_causal, scale,
-                                    enable_gqa);
+      return sdpa_fused_extended_cuda(query, key, value, is_causal, scale,
+                                      enable_gqa);
+#else
+      break;
 #endif
+    case composite::FusedSdpaSchedule::kCrossGemm:
+      // A context of another length in a precision the tiled schedule has no
+      // tiles for.  The two reduced precisions have tiles, so they went to
+      // kTiled instead and never reach this arm.
+      return sdpa_gemm_cross_cuda(query, key, value, is_causal);
+    case composite::FusedSdpaSchedule::kNone:
+      break;
   }
   // The composite answers with the attention and the normalizer it built along
   // the way; only the attention is what was asked for.
