@@ -2230,6 +2230,37 @@ std::tuple<Tensor, Tensor> sdpa_fused_launch_cuda(
   // An explicit normaliser replaces the head width's reciprocal square root.
   const double s = scale.has_value() ? *scale
                                      : 1.0 / std::sqrt(static_cast<double>(D));
+
+  // A single query row against a longer context, with grouped heads, is a
+  // decode step.  This schedule tiles 64 query rows, so one row per block walks
+  // the whole key context to produce one row of output -- and with grouped
+  // heads, once per query head rather than once per key head.  Every row of one
+  // group reads the same key head, so reading the group as the query's row axis
+  // puts g useful rows into a tile that loads the key once for the whole group.
+  // This is the same axis swap the schedule's own library makes, under the same
+  // conditions: one query row, more query heads than key heads, and no causal
+  // or window bound tying row i to key i.  A bounded decode keeps its own
+  // alignment and stays on the per-head path below.
+  if (!packed && launch.mask == SdpaMask::kNone && enable_gqa && Tq == 1 &&
+      Hq > Hkv) {
+    const int64_t g = Hq / Hkv;
+    // Reading the group as the row axis changes which axis is which, not the
+    // memory: q is already laid out (B, Hq, 1, D) = (B, Hk, g, D) in the order
+    // the batch, head, row and dim strides are read in, so the view below is
+    // free and the kernel addresses the group and head axes by the strides it
+    // already has.  Row s of key head hk is query head hk * g + s, which is the
+    // head its group names.
+    const Tensor q_grouped = tpx::ops::reshape(q4, {B, Hkv, g, D});
+    const Tensor out = sdpa_cute_flash_dispatch<SdpaMask::kNone>(
+        q_grouped, k4, v4, B, Hkv, Hkv, g, Tkv, D, s, launch);
+    // The result lands on query head hk * g + s already -- the group is the
+    // fastest-varying part of the merged head axis in this layout -- so the
+    // reshape back is a view too.  The normalizer the schedule wrote has one
+    // row per group rather than one per query head, so it is left undefined
+    // rather than handed back in a shape that would misread it.
+    return {tpx::ops::reshape(out, {B, Hq, Tq, D}), Tensor()};
+  }
+
   switch (launch.mask) {
     case SdpaMask::kCausal:
       return {sdpa_cute_flash_dispatch<SdpaMask::kCausal>(
