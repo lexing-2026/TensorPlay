@@ -915,6 +915,22 @@ void gemm_strided_batched_3d(const Tensor& self_3d, const Tensor& other_3d,
                              int64_t M, int64_t N, int64_t K,
                              long long stride_a, long long stride_b,
                              double alpha, double beta) {
+    gemm_strided_batched_3d_op(self_3d, other_3d, result_3d, batch_size, M, N,
+                               K, stride_a, stride_b, /*transpose_b=*/false,
+                               alpha, beta);
+}
+
+// The same product with the right operand read transposed rather than handed
+// over transposed.  A caller whose operand is stored the other way round would
+// otherwise have to write a transposed copy of the whole thing, which costs a
+// read and a write of the entire operand and can exceed the cost of the
+// product itself; naming the transposition here lets the library apply it while
+// it reads, so the operand is only ever read.
+void gemm_strided_batched_3d_op(const Tensor& self_3d, const Tensor& other_3d,
+                                Tensor& result_3d, int64_t batch_size,
+                                int64_t M, int64_t N, int64_t K,
+                                long long stride_a, long long stride_b,
+                                bool transpose_b, double alpha, double beta) {
     if (batch_size == 0 || M == 0 || N == 0) return;
     if (K == 0) {
         zero_matmul_output(result_3d);
@@ -930,12 +946,18 @@ void gemm_strided_batched_3d(const Tensor& self_3d, const Tensor& other_3d,
     const cublasGemmAlgo_t algorithm = isComplexType(dtype)
         ? CUBLAS_GEMM_DEFAULT
         : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+    // The leading dimension of an operand counts the rows of what is stored,
+    // whichever way the operand is read.  A right operand the caller holds as
+    // (N, K) and asks to be read transposed therefore has N stored rows, so its
+    // leading dimension is N; naming K instead would describe a matrix the
+    // caller does not have.
+    const int lda_b = static_cast<int>(N);
     CUBLAS_CHECK(cublasGemmStridedBatchedEx(
         CUDAContext::getCublasHandle(),
-        CUBLAS_OP_N, CUBLAS_OP_N,
+        CUBLAS_OP_N, transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N,
         static_cast<int>(N), static_cast<int>(M), static_cast<int>(K),
         alpha_ptr,
-        other_3d.data_ptr(), cuda_type, static_cast<int>(N), stride_b,
+        other_3d.data_ptr(), cuda_type, lda_b, stride_b,
         self_3d.data_ptr(), cuda_type, static_cast<int>(K), stride_a,
         beta_ptr,
         result_3d.data_ptr(), cuda_type, static_cast<int>(N), stride_c,

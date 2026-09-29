@@ -24,38 +24,6 @@ namespace cuda {
 namespace {
 
 template <typename DT>
-__global__ void sdpa_transpose_k_kernel(
-    const DT* __restrict__ input, DT* __restrict__ output,
-    int64_t tokens, int64_t head_dim) {
-  constexpr int tile = 32;
-  __shared__ DT smem[tile][tile + 1];
-  const int tx = threadIdx.x;
-  const int ty = threadIdx.y;
-  const int64_t head = static_cast<int64_t>(blockIdx.z);
-  const int64_t t0 = static_cast<int64_t>(blockIdx.x) * tile;
-  const int64_t d0 = static_cast<int64_t>(blockIdx.y) * tile;
-  const int64_t input_head = head * tokens * head_dim;
-  const int64_t output_head = head * head_dim * tokens;
-
-  for (int i = 0; i < 4; ++i) {
-    const int t = ty + i * 8;
-    const int64_t tg = t0 + t;
-    const int64_t dg = d0 + tx;
-    smem[t][tx] = (tg < tokens && dg < head_dim)
-        ? input[input_head + tg * head_dim + dg]
-        : from_float<DT>(0.f);
-  }
-  __syncthreads();
-  for (int i = 0; i < 4; ++i) {
-    const int d = ty + i * 8;
-    const int64_t dg = d0 + d;
-    const int64_t tg = t0 + tx;
-    if (dg < head_dim && tg < tokens)
-      output[output_head + dg * tokens + tg] = smem[tx][d];
-  }
-}
-
-template <typename DT>
 __global__ void sdpa_softmax_kernel(
     DT* __restrict__ scores, int64_t groups, int64_t rows_per_head,
     int64_t queries, int64_t keys, bool is_causal) {
@@ -96,7 +64,6 @@ __global__ void sdpa_softmax_kernel(
   const float inverse = total > 0.f ? 1.f / total : 0.f;
   for (int64_t j = threadIdx.x; j < keys; j += 32)
     values[j] = from_float<DT>(to_float(values[j]) * inverse);
-}
 
 }
 
@@ -105,7 +72,9 @@ __global__ void sdpa_softmax_kernel(
 // this is what serves a precision the tiled schedule has no tiles for; within a
 // precision the tiled schedule is preferred wherever it applies, because it never
 // writes the scores out at all.
-//
+
+}  // namespace
+
 // A group's query heads all read one key head, so the group stands in for the
 // query's row axis: every operand then has the same head count, which is what
 // lets one linear batch index address all three of them.  Row s of key head hk
@@ -121,30 +90,23 @@ Tensor sdpa_gemm_native(
   const int64_t rows = group * Tq;
   const Tensor q_packed = q.reshape({B, Hkv, rows, D});
 
-  // The score product reads the key transposed, so it is materialized once as
-  // (B, Hkv, D, Tkv).
-  Tensor kt = Tensor::empty({B, Hkv, D, Tkv}, dtype, q.device());
-  dim3 transpose_grid(
-      static_cast<unsigned>((Tkv + 31) / 32),
-      static_cast<unsigned>((D + 31) / 32),
-      static_cast<unsigned>(B * Hkv));
-  dim3 transpose_block(32, 8);
-  sdpa_transpose_k_kernel<DT><<<
-      transpose_grid, transpose_block, 0, getCurrentCUDAStream().stream()>>>(
-      k.data_ptr<DT>(), kt.data_ptr<DT>(), Tkv, D);
-  TP_CUDA_CHECK(cudaGetLastError());
-
   const int64_t batch = B * Hkv;
   Tensor scores = Tensor::empty({B, Hkv, rows, Tkv}, dtype, q.device());
   Tensor q3 = q_packed.reshape({batch, rows, D});
-  Tensor kt3 = kt.reshape({batch, D, Tkv});
+  // The score product reads the key transposed, and the key is stored the
+  // other way round.  Handing the transposition to the product reads the key
+  // once; transposing it into a tensor of its own reads it once and writes a
+  // second copy of it, and for a wide context that copy is the largest single
+  // cost in the call -- it was measured at three quarters of the whole thing.
+  Tensor k3 = k.reshape({batch, Tkv, D});
   Tensor scores3 = scores.reshape({batch, rows, Tkv});
   const long long q_stride = rows * D;
-  const long long kt_stride = D * Tkv;
+  const long long k_stride = Tkv * D;
   const long long score_stride = rows * Tkv;
   const float scale = 1.f / sqrtf(static_cast<float>(D));
-  gemm_strided_batched_3d(
-      q3, kt3, scores3, batch, rows, Tkv, D, q_stride, kt_stride, scale, 0.0);
+  gemm_strided_batched_3d_op(
+      q3, k3, scores3, batch, rows, Tkv, D, q_stride, k_stride,
+      /*transpose_b=*/true, scale, 0.0);
 
   // The reduction is one warp per row, and the causal bound it states is the
   // query's own index within a head, so the head's row count and the query
