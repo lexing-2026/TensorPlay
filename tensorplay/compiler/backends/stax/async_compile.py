@@ -12,6 +12,7 @@ interpreter down with it.
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import multiprocessing
 import os
@@ -24,6 +25,7 @@ from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
 from concurrent.futures.process import BrokenProcessPool
+from functools import partial
 from time import time, time_ns
 from typing import Any
 
@@ -41,7 +43,7 @@ from . import config
 from .compile_worker.subproc_pool import AnyPool, SubprocException, SubprocPool
 from .compile_worker.tracked_process_pool import TrackedProcessPoolExecutor
 from .compile_worker.utils import _async_compile_initializer
-from .runtime.compile_tasks import pre_fork_setup
+from .runtime.compile_tasks import _worker_compile_triton, pre_fork_setup
 # Whether the code generator this project falls back on is present.  The
 # module answers that by having its optional import be None when it is not.
 from .runtime.triton_compat import triton as _triton
