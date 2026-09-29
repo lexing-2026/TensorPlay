@@ -578,7 +578,7 @@ def create_omni_decoding_kernel(
     alpha = lower_exp2(adj_m)
 
     buf_l = lower_mul(buf_l, alpha)
-    g_l = lower_sum(buf_l, axis=1)
+    g_l = lower_sum(buf_l, dims=1)
     masked_rows_squeezed = lower_squeeze(masked_rows, dim=1)
     g_l = lower_where(masked_rows_squeezed, 1.0, g_l)
     logsumexp = lower_log2(g_l)
@@ -586,7 +586,7 @@ def create_omni_decoding_kernel(
 
     alpha_unseq = lower_unsqueeze(alpha, 4)
     buf_acc = lower_mul(buf_acc, alpha_unseq)
-    output = lower_sum(buf_acc, axis=1)
+    output = lower_sum(buf_acc, dims=1)
     l_unseq = lower_unsqueeze(g_l, 3)
     output = lower_div(output, l_unseq)
     output = _convert_element_type(output, query.get_dtype())

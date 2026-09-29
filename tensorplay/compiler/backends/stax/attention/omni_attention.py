@@ -1170,7 +1170,7 @@ def create_omni_attention_backward_kernel(
     # weights came to.  The second is the same for every key in a row, which is
     # the whole reason the first can be turned into a gradient at all.
     mul_delta = lower_mul(out, grad_out)
-    delta = lower_sum(mul_delta, axis=-1)
+    delta = lower_sum(mul_delta, dims=-1)
     delta = _convert_element_type(delta, tp.float32)
     if grad_logsumexp is not None:
         # A gradient of the running total says how much the total itself is worth
