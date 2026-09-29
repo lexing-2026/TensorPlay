@@ -125,7 +125,7 @@ def process_joint_outputs(all_joint_outputs: Any, num_placeholders: int) -> Any:
     if grad_input.name is None:
         raise AssertionError("ComputedBuffer name must not be None")
 
-    other_grads = all_joint_outputs[num_placeholders:]
+    other_grads = all_joint_outputs[num_placeholders - 1 :]
 
     grads_compute = [buf for buf in other_grads if buf is not None]
 

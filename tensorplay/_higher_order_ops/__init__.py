@@ -26,6 +26,8 @@ __all__ = [
     "while_loop",
     "while_loop_op",
     "while_loop_stack_output_op",
+    "omni_attention",
+    "omni_attention_backward",
 ]
 
 _LAZY_ATTRS = {
@@ -39,6 +41,8 @@ _LAZY_ATTRS = {
     "while_loop": "tensorplay._higher_order_ops.while_loop",
     "while_loop_op": "tensorplay._higher_order_ops.while_loop",
     "while_loop_stack_output_op": "tensorplay._higher_order_ops.while_loop",
+    "omni_attention": "tensorplay._higher_order_ops.omni_attention",
+    "omni_attention_backward": "tensorplay._higher_order_ops.omni_attention",
 }
 
 

@@ -22,7 +22,7 @@ namespace FLASH_NAMESPACE {
 #endif
 
 // Define a macro for unsupported architecture handling to centralize the error message
-#define FLASH_UNSUPPORTED_ARCH printf("FATAL: FlashAttention requires building with sm version sm80-sm90, but was built for < 8.0!");
+#define FLASH_UNSUPPORTED_ARCH printf("FATAL: this schedule requires a target of sm80 or newer, but was built for an older one!");
 
 // Use a macro to clean up kernel definitions
 #define DEFINE_FLASH_FORWARD_KERNEL(kernelName, ...) \
@@ -57,8 +57,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // printf("smem_size = %d\n", smem_size);
 
     // Work-around for gcc 7. It doesn't like nested BOOL_SWITCH.
-    // https://github.com/kokkos/kokkos-kernels/issues/349
-    // https://github.com/HazyResearch/flash-attention/issues/21
 
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
     dim3 grid(num_m_block, params.b, params.h);

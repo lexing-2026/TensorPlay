@@ -84,7 +84,7 @@ class HigherOrderOperator:
     def __init__(self, name: str, *, cacheable: bool = False) -> None:
         self._name = name
         self.__name__ = name
-        self.__module__ = "tensor.ops.higher_order"
+        self.__module__ = "tensorplay.ops.higher_order"
         self._cacheable = cacheable
         self._impls: dict[Any, Callable[..., Any]] = {}
         self._fake_impl: Callable[..., Any] | None = None

@@ -464,8 +464,20 @@ enum class FusedSdpaSchedule { kNone, kSquare, kTiled, kCrossGemm };
 inline FusedSdpaSchedule fused_sdpa_schedule(
     const Tensor& query, const Tensor& key, const Tensor& value,
     const std::optional<Tensor>& attn_mask, double dropout_p,
-    const std::optional<double>& scale, bool enable_gqa) {
+    std::optional<double> scale, bool enable_gqa, bool is_causal) {
   if (attn_mask.has_value() || dropout_p != 0.0) return FusedSdpaSchedule::kNone;
+  // A causal call whose query and context differ in length is not a shape the
+  // fused schedule states.  Its causal bound is the one a window of zero right
+  // bound names, and that bound is stated against the context length, so on a
+  // non-square call it holds the diagonal at the bottom right.  The composed
+  // reference masks the other way, at the top left, and the two are different
+  // functions of the inputs.  So the fused schedule declines the shape rather
+  // than answering it as the other one, which leaves the composed reference to
+  // answer the question that was actually asked.
+  if (is_causal && query.dim() == 4 && key.dim() == 4 &&
+      query.size(2) != key.size(2)) {
+    return FusedSdpaSchedule::kNone;
+  }
   if (query.dim() != 4 || key.dim() != 4 || value.dim() != 4) {
     return FusedSdpaSchedule::kNone;
   }
@@ -515,11 +527,11 @@ inline FusedSdpaSchedule fused_sdpa_schedule(
 inline int64_t fused_sdp_choice_common(const Tensor& query, const Tensor& key,
                                        const Tensor& value,
                                        const std::optional<Tensor>& attn_mask,
-                                       double dropout_p,
+                                       double dropout_p, bool is_causal,
                                        std::optional<double> scale,
                                        bool enable_gqa) {
   if (fused_sdpa_schedule(query, key, value, attn_mask, dropout_p, scale,
-                          enable_gqa) != FusedSdpaSchedule::kNone) {
+                          enable_gqa, is_causal) != FusedSdpaSchedule::kNone) {
     return 1;  // FLASH_ATTENTION
   }
   const DType dt = query.dtype();

@@ -481,41 +481,28 @@ def _flash_attention_forward_adapter(
     state, an unused scalar, and the debug mask.
     """
     if _native_kernel_serves("_flash_attention_forward", query.device.type):
-        return _prefer_native_kernel(
+        native = _native_attempt(
             "_flash_attention_forward",
-            _flash_attention_forward_adapter,
             query,
-            (query, key, value, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, return_debug_mask),
-            {
-                "scale": scale,
-                "window_size_left": window_size_left,
-                "window_size_right": window_size_right,
-                "seqused_k": seqused_k,
-                "alibi_slopes": alibi_slopes,
-                "block_table": block_table,
-                "num_splits": num_splits,
-            },
+            key,
+            value,
+            cum_seq_q,
+            cum_seq_k,
+            max_q,
+            max_k,
+            dropout_p,
+            is_causal,
+            return_debug_mask,
+            scale=scale,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            seqused_k=seqused_k,
+            alibi_slopes=alibi_slopes,
+            block_table=block_table,
+            num_splits=num_splits,
         )
-    if _native_kernel_serves("_efficient_attention_forward", query.device.type):
-        return _prefer_native_kernel(
-            "_efficient_attention_forward",
-            _efficient_attention_forward_adapter,
-            query,
-            (
-                query,
-                key,
-                value,
-                bias,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                dropout_p,
-                custom_mask_type,
-                compute_log_sumexp,
-            ),
-            {"scale": scale, "seqlen_k": seqlen_k, "window_size": window_size},
-        )
+        if native is not _NO_NATIVE_KERNEL:
+            return native
     del return_debug_mask, alibi_slopes, num_splits
     if dropout_p != 0.0:
         raise NotImplementedError("flash attention: dropout > 0 is not supported in this build")
@@ -642,26 +629,26 @@ def _cudnn_attention_forward_adapter(
     every caller in this tree and are reported as a fixed zero.
     """
     if _native_kernel_serves("_cudnn_attention_forward", query.device.type):
-        return _prefer_native_kernel(
+        native = _native_attempt(
             "_cudnn_attention_forward",
-            _cudnn_attention_forward_adapter,
             query,
-            (
-                query,
-                key,
-                value,
-                attn_bias,
-                cum_seq_q,
-                cum_seq_k,
-                max_q,
-                max_k,
-                compute_logsumexp,
-                dropout_p,
-                is_causal,
-                return_debug_mask,
-            ),
-            {"scale": scale, "seqused_k": seqused_k, "block_table": block_table},
+            key,
+            value,
+            attn_bias,
+            cum_seq_q,
+            cum_seq_k,
+            max_q,
+            max_k,
+            compute_logsumexp,
+            dropout_p,
+            is_causal,
+            return_debug_mask,
+            scale=scale,
+            seqused_k=seqused_k,
+            block_table=block_table,
         )
+        if native is not _NO_NATIVE_KERNEL:
+            return native
     del return_debug_mask
     if dropout_p != 0.0:
         raise NotImplementedError("cuDNN attention: dropout > 0 is not supported in this build")
@@ -705,6 +692,10 @@ def _cudnn_attention_forward_adapter(
 #: and the answer has to be the one for the tensors in hand.
 _DISPATCH_KEY_FOR_DEVICE = {"cpu": "CPU", "cuda": "CUDA"}
 
+#: Returned by :func:`_native_attempt` when no kernel of this build serves the
+#: op on the tensors' device, which tells the caller to compute the answer.
+_NO_NATIVE_KERNEL = object()
+
 
 def _native_kernel_serves(opname: str, device_type: str) -> bool:
     """Whether a kernel of this build answers ``opname`` on ``device_type``.
@@ -724,26 +715,31 @@ def _native_kernel_serves(opname: str, device_type: str) -> bool:
         return False
 
 
-def _prefer_native_kernel(opname: str, composite: Any, device_of: Any, args, kwargs):
-    """Hand the call to a registered kernel, or compose it here.
+def _native_attempt(opname: str, *args, **kwargs):
+    """Offer the call to a registered kernel; decline if there is none.
 
     The dispatcher is asked first because a kernel is the whole point of the
     contract: it answers in one pass without forming a score matrix, and it
     answers for the device the tensors are on rather than for whichever device
-    happens to be compiled in.  Only when nothing is registered does the
-    composite run, and then the answer is the same either way -- which is what
-    makes it safe for the composite to be the default.
+    happens to be compiled in.
+
+    This only ever calls a kernel.  It takes no composite to fall back on,
+    because the caller already is the composite: a fallback argument here
+    would be the very function that made the offer, and declining would hand
+    the call back to itself.  A caller that finds ``_NO_NATIVE_KERNEL`` here
+    computes the answer itself instead.
     """
     probe = None
     for candidate in args:
         if isinstance(candidate, tensorplay.Tensor):
             probe = candidate
             break
-    if probe is not None and _native_kernel_serves(opname, probe.device.type):
-        packet = _load_native_overloads().get(opname)
-        if packet is not None:
-            return packet(*args, **kwargs)
-    return composite(*args, **kwargs)
+    if probe is None or not _native_kernel_serves(opname, probe.device.type):
+        return _NO_NATIVE_KERNEL
+    packet = _load_native_overloads().get(opname)
+    if packet is None:
+        return _NO_NATIVE_KERNEL
+    return packet(*args, **kwargs)
 
 
 # Composite contracts declared in the op schema set that have no dedicated
@@ -955,6 +951,16 @@ class _OpNamespace(types.ModuleType):
         own = self.__dict__.get(opname)
         if own is not None:
             return own
+        if self.ns == "higher_order":
+            from tensorplay._higher_order_ops import __getattr__ as get_hop
+
+            try:
+                hop = get_hop(opname)
+            except AttributeError:
+                hop = None
+            if hop is not None:
+                setattr(self, opname, hop)
+                return hop
         if self.ns == NATIVE_NAMESPACE:
             # Composite fallbacks come first: they wrap the fused kernels of
             # this build for contracts without their own registration.

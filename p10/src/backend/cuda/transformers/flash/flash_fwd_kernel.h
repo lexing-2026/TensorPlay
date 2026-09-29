@@ -6,7 +6,6 @@
 
 #include "namespace_config.h"
 #ifndef FLASHATTENTION_DISABLE_DROPOUT
-#include "philox_unpack.cuh" // For at::cuda::philox::unpack
 #endif
 
 #include <tuple>
@@ -69,11 +68,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
     constexpr int kNWarps = Kernel_traits::kNWarps;
 
-#ifndef FLASHATTENTION_DISABLE_DROPOUT
-    auto seed_offset = at::cuda::philox::unpack(*reinterpret_cast<at::PhiloxCudaState const*>(params.philox_args));
-#else
+    // Dropout is not built into this schedule: every launch here passes a keep
+    // probability of one, so there is no random state to read and the seed and
+    // offset the dropout object wants are fixed at zero.  Turning dropout on
+    // would mean giving the launch a place to put a real random state and
+    // reading it back here, which is a change to the parameters rather than to
+    // this line.
     auto seed_offset = std::make_tuple(uint64_t(0), uint64_t(0));
-#endif
     FLASH_NAMESPACE::Dropout dropout(std::get<0>(seed_offset), std::get<1>(seed_offset), params.p_dropout_in_uint8_t,
                            bidb, bidh, tidx, params.h);
 

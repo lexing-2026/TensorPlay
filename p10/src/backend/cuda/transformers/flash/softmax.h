@@ -80,8 +80,6 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
             // max * log_2(e)) This allows the compiler to use the ffma
             // instruction instead of fadd and fmul separately.
             // The following macro will disable the use of fma.
-            // See: https://github.com/pytorch/pytorch/issues/121558 for more details
-            // This macro is set in PyTorch and not FlashAttention
             #ifdef UNFUSE_FMA
                 tensor(mi, ni) = exp2f(__fmul_rn(tensor(mi, ni), scale) - max_scaled);
             #else

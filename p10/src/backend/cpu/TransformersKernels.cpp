@@ -554,9 +554,9 @@ int64_t fused_sdp_choice_cpu(const Tensor& query, const Tensor& key,
                              const std::optional<Tensor>& attn_mask,
                              double dropout_p, bool is_causal,
                              std::optional<double> scale, bool enable_gqa) {
-  (void)is_causal;
   return composite::fused_sdp_choice_common(query, key, value, attn_mask,
-                                            dropout_p, scale, enable_gqa);
+                                            dropout_p, is_causal, scale,
+                                            enable_gqa);
 }
 
 // Fused flash-style kernel for the `_scaled_dot_product_attention_for_cpu`

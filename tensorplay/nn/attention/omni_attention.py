@@ -2614,26 +2614,13 @@ def omni_attention(
     if not hasattr(tensorplay.compiler, "compile"):
         raise RuntimeError("omni_attention requires graph tracer support")
 
-    block_mask_args = block_mask.as_tuple()
-    (
-        seq_q,
-        seq_kv,
-        _,
-        _,
-        _,
-        _,
-        _,
-        _,
-        _,
-        _,
-        _,
-        _,
-        _,
-        dq_kv_order_spt,
-        q_block_size,
-        kv_block_size,
-        mask_mod,
-    ) = block_mask_args
+    block_mask_tensors = tuple(
+        getattr(block_mask, name) for name in BlockMask._TENSOR_ATTRS
+    )
+    seq_q, seq_kv = block_mask.seq_lengths
+    dq_kv_order_spt = block_mask.dq_kv_order_spt
+    q_block_size, kv_block_size = block_mask.BLOCK_SIZE
+    mask_mod = block_mask.mask_mod
 
     def _omni_attention_hop_wrapper(
         query,
@@ -2692,7 +2679,7 @@ def omni_attention(
             query,
             key,
             value,
-            *block_mask_args[2:13],
+            *block_mask_tensors,
         )
     return _finalize_outputs(
         out,

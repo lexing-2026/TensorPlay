@@ -1,6 +1,4 @@
 // Inspired by
-// https://github.com/NVIDIA/DALI/blob/main/include/dali/core/static_switch.h
-// and https://github.com/pytorch/pytorch/blob/master/aten/src/ATen/Dispatch.h
 
 #pragma once
 

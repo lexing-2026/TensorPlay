@@ -282,7 +282,6 @@ __forceinline__ __device__ auto convert_type_relu(Tensor<Engine, Layout> const &
 // This differs from cute::cp_async_wait in that when N = 0 we don't call cp.async.wait_all
 // (which is equivalent to commit_group then wait_group 0).
 // Instead we just call cp.async.wait_group 0, which is slightly faster.
-// https://github.com/NVIDIA/cutlass/blob/master/include/cute/arch/copy_sm80.hpp#L113
 template <int N>
 CUTE_HOST_DEVICE
 void cp_async_wait() {

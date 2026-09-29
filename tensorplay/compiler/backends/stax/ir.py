@@ -6227,6 +6227,11 @@ class ExternKernel(InputsKernel):
         kernel = self.op_overload
         if kernel is None:
             return
+        from tensorplay._higher_order_ops._hop_base import HigherOrderOperator
+
+        if isinstance(kernel, HigherOrderOperator):
+            self.python_kernel_name = f"tp.ops.higher_order.{kernel.__name__}"
+            return
         module = getattr(kernel, "__module__", None)
         name = getattr(kernel, "__name__", str(kernel))
         # The in-place operator builtins carry a module name that is private to

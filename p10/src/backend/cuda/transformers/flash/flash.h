@@ -117,11 +117,10 @@ struct Flash_fwd_params : public Qkv_params {
     int window_size_left, window_size_right;
     float softcap;
 
-    // Random state, stored as an opaque buffer that will potentially hold at::PhiloxCudaState.
+    // Random state, stored as an opaque buffer the launch fills in place.
     // We intentionally use an opaque buffer to allow the disabled dropout binary to stay
-    // free of unnecessary headers like <ATen/cuda/CUDAGeneratorImpl.h>.
-    // flash_api.cpp will write into this buffer via placement-new of an at::PhiloxCudaState
-    // (guarded by FLASHATTENTION_DISABLE_DROPOUT) and the forward kernel (in flash_fwd_kernel.h)
+
+    // the launcher writes into this buffer by placement-new
     // will read it back via reinterpret_cast. Size validated by static_assert in flash_api.cpp.
     uint64_t philox_args[4];
 

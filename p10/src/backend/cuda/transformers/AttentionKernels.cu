@@ -146,6 +146,14 @@ constexpr int kSdpaFusedMaxTokens = 64;
 constexpr int kSdpaFusedMaxDim = 32;
 constexpr int kSdpaFusedThreads = 128;
 constexpr int kSdpaFusedTile = 4;
+// The pad after each staged row.  It is one tile, not one float, so a row of a
+// staged tile still begins on a sixteen-byte boundary -- which is what the
+// four-float staged moves require -- while still moving the bank a walk down
+// the feature axis of a fixed row off a single bank.  The host derives its
+// shared-memory request from this same value; if the two ever disagree the
+// kernel writes past the block's shared allocation, so there is exactly one
+// definition of the pad and both sides name it.
+constexpr int kSdpaFusedRowPad = kSdpaFusedTile;
 
 template <typename DT>
 __global__ void sdpa_fused_short_kernel(
@@ -157,7 +165,7 @@ __global__ void sdpa_fused_short_kernel(
   // score buffer by one float along the key axis, for the same reason.  The
   // tile pad is four floats rather than one so a row of the tile still starts
   // on a sixteen-byte boundary, which is what the four-float staged moves need.
-  const int dstride = static_cast<int>(D) + kSdpaFusedTile;
+  const int dstride = static_cast<int>(D) + kSdpaFusedRowPad;
   const int tstride = static_cast<int>(T) + 1;
   extern __shared__ float smem[];
   float* s_q = smem;
@@ -2202,7 +2210,7 @@ Tensor sdpa_kernel_cuda_plain(const Tensor& query, const Tensor& key,
       D > 0 && D <= kSdpaFusedMaxDim && (D % 4) == 0 &&
       q.is_contiguous() && k.is_contiguous() && v.is_contiguous() &&
       offset_aligned(q) && offset_aligned(k) && offset_aligned(v)) {
-    const int dstride = static_cast<int>(D) + 1;
+    const int dstride = static_cast<int>(D) + kSdpaFusedRowPad;
     const int tstride = static_cast<int>(T) + 1;
     const size_t smem = static_cast<size_t>(3 * T * dstride + T * tstride) *
                         sizeof(float);
@@ -2541,7 +2549,7 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key,
                         bool is_causal, std::optional<double> scale,
                         bool enable_gqa) {
   switch (composite::fused_sdpa_schedule(query, key, value, attn_mask, dropout_p,
-                                        scale, enable_gqa)) {
+                                        scale, enable_gqa, is_causal)) {
     case composite::FusedSdpaSchedule::kSquare:
       return sdpa_kernel_cuda_plain(query, key, value, is_causal, /*impl=*/0);
     case composite::FusedSdpaSchedule::kTiled:

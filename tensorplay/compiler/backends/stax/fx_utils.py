@@ -38,6 +38,13 @@ from tensorplay.graph.experimental.sympy_functions import OrderedSet
 from tensorplay.utils._pytree import tree_map
 from tensorplay.utils._typing_utils import not_none
 from tensorplay.utils.flop_counter import flop_registry
+from tensorplay._higher_order_ops import (
+    cond_op,
+    map_impl,
+    scan_op,
+    while_loop_op,
+    while_loop_stack_output_op,
+)
 
 from .virtualized import V
 
@@ -187,8 +194,6 @@ def _is_fake_tensor_same(
         for user in node.users:
             if not (
                 isinstance(user.target, tp._ops.OperatorBase)
-                or user.target
-                is _generalized_scatter
             ):
                 return True
 
@@ -335,8 +340,7 @@ def _extract_subgraphs_and_args(
             yield joint_subgraph, (*joint_subgraph_args[:6], *args[12])
         if mask_subgraph in valid_subgraphs:
             yield mask_subgraph, (*mask_subgraph_args[:4], *args[13])
-    elif node.target in (
-    ):
+    elif node.target is map_impl:
         yield args[0], tuple(args[1:])
         yield args[0], tuple(args[2:])
         # Map is applied over slices from the first dimension of each value in args[1].
@@ -882,9 +886,16 @@ def count_flops_fx(node: Node) -> int | None:
         success, args, kwargs = get_fake_args_kwargs(node)
 
         if success:
-            # omni_attention HOPs have registered formulas, but invoking them
+            # Attention HOPs have registered formulas, but invoking them
             # here can require tracing-only context, e.g. TransformGetItemToIndex.
+            from tensorplay._higher_order_ops.omni_attention import (
+                omni_attention,
+                omni_attention_backward,
+            )
+
             if node.target in (
+                omni_attention,
+                omni_attention_backward,
             ):
                 flop_formula = flop_registry.get(node.target)
                 if flop_formula is not None:
