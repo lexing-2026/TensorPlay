@@ -290,10 +290,13 @@ inline std::tuple<Tensor, Tensor> sdpa_math_composite_with_lse(
   Tensor total = sum(probs, {-1}, /*keepdim=*/true);
   Tensor empty = eq(total, Scalar(0));
   Tensor normalizer = where(empty, ops::ones_like(total), total);
-  Tensor lse = where(empty,
-                     ops::full({}, Scalar(std::numeric_limits<double>::infinity()),
-                               DType::Float32, query.device()),
-                     to(add(row_max, log(total)), DType::Float32));
+  // The reductions keep a trailing axis so they broadcast against the scores;
+  // the constant does not have one, or every caller would have to know which.
+  Tensor lse = where(
+      empty.squeeze(-1),
+      ops::full({}, Scalar(std::numeric_limits<double>::infinity()),
+                DType::Float32, query.device()),
+      to(add(row_max, log(total)).squeeze(-1), DType::Float32));
   Tensor out = matmul(div(probs, normalizer), v);
   return {reduce ? to(out, origin_dtype) : out, lse};
 }
@@ -501,8 +504,8 @@ inline FusedSdpaSchedule fused_sdpa_schedule(
   if (reduced) return FusedSdpaSchedule::kTiled;
   // A wide precision on a shape the tiled schedule has no tiles for.  The
   // GEMM-backed schedule materializes the scores and answers it, but it names
-  // neither a normaliser nor a group ratio, so those stay on the composed path.
-  const bool wide = dt == DType::Float32 && !scale.has_value() && !grouped;
+  // no normaliser, so a call that carries one stays on the composed path.
+  const bool wide = dt == DType::Float32 && !scale.has_value();
   return wide ? FusedSdpaSchedule::kCrossGemm : FusedSdpaSchedule::kNone;
 }
 

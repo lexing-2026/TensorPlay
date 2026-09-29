@@ -68,7 +68,8 @@ namespace cuda {
 template <typename DT>
 Tensor sdpa_gemm_native(
     const Tensor& q, const Tensor& k, const Tensor& v,
-    int64_t B, int64_t H, int64_t Tq, int64_t Tkv, int64_t D, bool is_causal);
+    int64_t B, int64_t Hq, int64_t Hkv, int64_t Tq, int64_t Tkv, int64_t D,
+    bool is_causal);
 
 namespace {
 
@@ -1202,15 +1203,16 @@ Tensor sdpa_native_cute_flash(
   // back in one tensor.  The tensor is then indexed by total tokens rather
   // than by a batch axis, and the constant is reported over the heads and the
   // total, which is the layout that indexing implies.
+  //
+  // The output is allocated for the whole run rather than for one such run per
+  // sequence: the kernel places each sequence's tokens at its own offset inside
+  // it, so an allocation sized per sequence would be as many times too large
+  // and would leave the tail untouched.
   const bool varlen = launch.cu_seqlens_q != nullptr;
-  if (varlen) {
-    // Packed callers hand over (total, heads, dim); the batch axis is
-    // synthesized as the number of sequences in the table.
-    TP_CHECK(B == 1, "sdpa fused varlen: expected a packed tensor, got batch ",
-             B);
-    B = launch.num_seqs;
-  }
-  Tensor out = Tensor::empty({B, Hq, Tq, D}, q.dtype(), q.device());
+  TP_CHECK(!varlen || B == 1,
+           "sdpa fused varlen: expected a packed tensor, got batch ", B);
+  const int64_t grid_b = varlen ? launch.num_seqs : B;
+  Tensor out = Tensor::empty({varlen ? 1 : B, Hq, Tq, D}, q.dtype(), q.device());
   // The standalone flash epilogue writes the constant whether or not the caller
   // asked for it, so it is always allocated; exposing it costs nothing and
   // saving it would mean a second pass over the scores.
@@ -1335,7 +1337,7 @@ Tensor sdpa_native_cute_flash(
   // returns before doing any work, so the tile extent here is the longest one
   // any sequence needs rather than each sequence's own.
   dim3 grid((static_cast<unsigned>(seqlen_q) + 63u) / 64u,
-            static_cast<unsigned>(B), static_cast<unsigned>(Hq));
+            static_cast<unsigned>(grid_b), static_cast<unsigned>(Hq));
   if (even_mn) {
     tp_native_flash_kernel<Mask, true, Headdim, ElementT><<<
         grid, Traits::kNThreads, Traits::kSmemSize,
@@ -2155,13 +2157,13 @@ Tensor sdpa_kernel_cuda_plain(const Tensor& query, const Tensor& key,
 #endif
   } else if (impl == 2) {
     if (dtype == DType::Float32) {
-      return sdpa_gemm_native<float>(q, k, v, B, H, T, T, D, is_causal);
+      return sdpa_gemm_native<float>(q, k, v, B, H, H, T, T, D, is_causal);
     } else if (dtype == DType::Float16) {
       return sdpa_gemm_native<tensorplay::Half>(
-          q, k, v, B, H, T, T, D, is_causal);
+          q, k, v, B, H, H, T, T, D, is_causal);
     } else {
       return sdpa_gemm_native<tensorplay::BFloat16>(
-          q, k, v, B, H, T, T, D, is_causal);
+          q, k, v, B, H, H, T, T, D, is_causal);
     }
   } else {
     TP_THROW(RuntimeError, "sdpa: unknown impl " + std::to_string(impl));
@@ -2169,29 +2171,31 @@ Tensor sdpa_kernel_cuda_plain(const Tensor& query, const Tensor& key,
 }
 
 // The GEMM-backed schedule over a context whose length differs from the
-// query's.  It materializes the score matrix instead of tiling it, so it is what
-// answers a precision the tiled schedule has no tiles for; within a precision
-// the tiled schedule is preferred wherever it applies, because it never writes
-// the scores out at all.
+// query's, or over grouped heads -- the two shapes the square entry point
+// cannot state.  It materializes the score matrix instead of tiling it, so it is
+// what answers a precision the tiled schedule has no tiles for; within a
+// precision the tiled schedule is preferred wherever it applies, because it
+// never writes the scores out at all.
 Tensor sdpa_gemm_cross_cuda(const Tensor& query, const Tensor& key,
                             const Tensor& value, bool is_causal) {
   const Tensor q = query.contiguous();
   const Tensor k = key.contiguous();
   const Tensor v = value.contiguous();
   const int64_t B = q.size(0);
-  const int64_t H = q.size(1);
+  const int64_t Hq = q.size(1);
+  const int64_t Hkv = k.size(1);
   const int64_t Tq = q.size(2);
   const int64_t Tkv = k.size(2);
   const int64_t D = q.size(3);
   if (q.dtype() == DType::Float32) {
-    return sdpa_gemm_native<float>(q, k, v, B, H, Tq, Tkv, D, is_causal);
+    return sdpa_gemm_native<float>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
   }
   if (q.dtype() == DType::Float16) {
     return sdpa_gemm_native<tensorplay::Half>(
-        q, k, v, B, H, Tq, Tkv, D, is_causal);
+        q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
   }
   return sdpa_gemm_native<tensorplay::BFloat16>(
-      q, k, v, B, H, Tq, Tkv, D, is_causal);
+      q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
 }
 
 #if defined(TP_HAS_NATIVE_CUTE_FLASH)
@@ -2247,11 +2251,16 @@ std::tuple<Tensor, Tensor> sdpa_fused_launch_cuda(
   const Tensor q4 = packed ? q.unsqueeze(0) : q;
   const Tensor k4 = packed ? k.unsqueeze(0) : k;
   const Tensor v4 = packed ? v.unsqueeze(0) : v;
+  // A packed tensor is (total, heads, dim) and only gains a leading axis to be
+  // read, so its heads sit one axis later than a batched tensor's; reading them
+  // by the batched positions would name the token count as the head count.
   const int64_t B = packed ? 1 : q4.size(0);
-  const int64_t Hq = q4.size(1);
-  const int64_t Hkv = enable_gqa ? k4.size(1) : Hq;
-  const int64_t Tq = q4.size(2);
-  const int64_t Tkv = k4.size(2);
+  const int64_t head_axis = packed ? 2 : 1;
+  const int64_t row_axis = packed ? 1 : 2;
+  const int64_t Hq = q4.size(head_axis);
+  const int64_t Hkv = enable_gqa ? k4.size(head_axis) : Hq;
+  const int64_t Tq = q4.size(row_axis);
+  const int64_t Tkv = k4.size(row_axis);
   const int64_t D = q4.size(3);
   // An explicit normaliser replaces the head width's reciprocal square root.
   const double s = scale.has_value() ? *scale
