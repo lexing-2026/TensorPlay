@@ -522,7 +522,13 @@ inline FusedSdpaSchedule fused_sdpa_schedule(
   // out and reading them back twice; it names no normaliser, so a call that
   // carries one stays on the composed path.
   if (dt == DType::Float32) {
-    if (head_dim == kFusedWideTileD) {
+    // The fused wide schedule holds its scores on the chip, which is what a wide
+    // context needs: there the materialising schedule pays three trips for
+    // something the operands dwarf.  A square call does not need that, and the
+    // materialising schedule reads a group as the row axis, which suits grouped
+    // heads better than a tile that walks one head at a time, so a square call
+    // stays with it.
+    if (head_dim == kFusedWideTileD && query.size(2) != key.size(2)) {
       return FusedSdpaSchedule::kWideTiled;
     }
     if (scale.has_value()) return FusedSdpaSchedule::kNone;
