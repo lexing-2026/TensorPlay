@@ -299,6 +299,83 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/transformers/AttentionKernels.cu
         src/backend/cuda/transformers/AttentionGemmKernels.cu
         src/backend/cuda/transformers/AttentionRopeKernels.cu
+        # One file per leaf of the fused attention schedule.  They are listed
+        # individually rather than globbed so that a leaf added to the
+        # directory does not silently join the build without anyone deciding it
+        # should; the list is what the generator writes.
+        src/backend/cuda/transformers/FlashFwdDispatch.cpp
+        src/backend/cuda/transformers/flash_fwd_hdim128_bf16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim128_bf16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim128_fp16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim128_fp16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim192_bf16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim192_bf16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim192_fp16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim192_fp16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim256_bf16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim256_bf16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim256_fp16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim256_fp16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim32_bf16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim32_bf16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim32_fp16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim32_fp16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim64_bf16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim64_bf16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim64_fp16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim64_fp16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim96_bf16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim96_bf16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim96_fp16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim96_fp16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim128_bf16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim128_bf16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim128_fp16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim128_fp16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim192_bf16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim192_bf16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim192_fp16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim192_fp16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim256_bf16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim256_bf16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim256_fp16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim256_fp16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim32_bf16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim32_bf16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim32_fp16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim32_fp16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim64_bf16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim64_bf16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim64_fp16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim64_fp16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim96_bf16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim96_bf16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim96_fp16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_align_hdim96_fp16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim128_bf16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim128_bf16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim128_fp16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim128_fp16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim192_bf16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim192_bf16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim192_fp16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim192_fp16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim256_bf16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim256_bf16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim256_fp16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim256_fp16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim32_bf16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim32_bf16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim32_fp16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim32_fp16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim64_bf16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim64_bf16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim64_fp16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim64_fp16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim96_bf16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim96_bf16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim96_fp16_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_split_hdim96_fp16_sm80.cu
         src/backend/cuda/GroupedGemmKernels.cu
         src/backend/cuda/IndexingKernels.cu
         src/backend/cuda/MaskedKernels.cu

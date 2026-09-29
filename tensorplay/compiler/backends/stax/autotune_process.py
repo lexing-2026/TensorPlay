@@ -537,6 +537,7 @@ class TritonBenchmarkRequest(BenchmarkRequest):
                 )
 
         return run_fn
+        from .runtime.benchmarking import get_interface_for_device
 
     def cleanup_run_fn(self) -> None:
         """Let go of what was loaded to be measured, however many times asked.
@@ -834,7 +835,7 @@ class SubgraphBenchmarkRequest(BenchmarkRequest):
         as much as the values are.
         """
 
-        from ..codecache import load_by_key_path
+        from .codecache import load_by_key_path
 
         module = load_by_key_path(
             self.module_cache_key, self.module_path, set_sys_modules=False
@@ -852,7 +853,7 @@ class SubgraphBenchmarkRequest(BenchmarkRequest):
         measuring the file system.
         """
 
-        from ..codecache import load_by_key_path
+        from .codecache import load_by_key_path
 
         load_by_key_path(
             self.module_cache_key, self.module_path, set_sys_modules=False

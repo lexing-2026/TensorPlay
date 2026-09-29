@@ -15,7 +15,7 @@ from .ops_handler import StoreMode
 
 
 if TYPE_CHECKING:
-    from kernel_scheduler import SchedulerNode
+    from .scheduler import SchedulerNode
 
 
 def construct_symbol(count: int, dtype: Any) -> sympy.Symbol:

@@ -637,6 +637,7 @@ class GraphLowering(Interpreter):
         # place stands for the buffer that was really written, and the mapping
         # is the scheduler's to answer.
         self.scheduler = None
+        self.no_fuse_buffer_names: OrderedSet[str] = OrderedSet()
         #: The names every kernel printed under, kept as they are printed so
         #: that a kernel can be found by the name it actually has.
         self.all_codegen_kernel_names: OrderedSet[str] = OrderedSet()
@@ -1991,7 +1992,8 @@ class GraphLowering(Interpreter):
         and is lowered as one.
         """
 
-        value = getattr_recursive(self.module, target)
+        getter = getattr(self.module, "_get_attr", None)
+        value = getter(target) if callable(getter) else getattr_recursive(self.module, target)
 
         # A graph is recognised by what reading a node from it needs, not by
         # merely carrying one: a module that happens to hold a graph of its own
@@ -2058,6 +2060,19 @@ class GraphLowering(Interpreter):
         )
         self.allocated_constant_name[name] = orig_name
         return name
+
+    def constant_name(self, name: str, device_override: Any) -> str:
+        if device_override is None or self.constants[name].device == device_override:
+            return name
+        non_dup_const_name = self.allocate_non_dup_const_name(
+            f"{name}_{device_override.type}{device_override.index or 0}",
+            self.constants[name].to(device_override),
+        )
+        if non_dup_const_name not in self.constants:
+            raise AssertionError(
+                f"{non_dup_const_name} should be in V.graph.constants already"
+            )
+        return non_dup_const_name
 
     @contextlib.contextmanager
     def set_current_wrapper_code(self):

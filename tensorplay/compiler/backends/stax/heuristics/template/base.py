@@ -58,6 +58,9 @@ class SymbolicGridFn:
     def __call__(self, *args, **kwargs):
         return self.fn(*args, **kwargs, **self.kwargs_int)
 
+    def sympy_call(self, *args, **kwargs):
+        return self.fn(*args, **kwargs, **self.kwargs_sym)
+
     def __get__(self, instance, owner=None):
         return self
 class TemplateConfigHeuristics:

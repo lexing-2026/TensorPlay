@@ -346,9 +346,6 @@ def register_module_full_backward_hook(
     return handle
 
 
-# Trick mypy into not applying contravariance rules to inputs by defining
-# forward as a value, rather than a function.  See also
-# https://github.com/python/mypy/issues/8795
 def _forward_unimplemented(self, *input: Any) -> None:
     r"""Define the computation performed at every call.
 
@@ -1222,17 +1219,11 @@ class Module:
                         non_blocking,
                         memory_format=convert_to_format,
                     )
-                if target_dtype is not None:
-                    return t.to(
-                        device,
-                        target_dtype,
-                        non_blocking,
-                    )
-                else:
-                    return t.to(
-                        device,
-                        non_blocking,
-                    )
+                return t.to(
+                    device,
+                    target_dtype,
+                    non_blocking,
+                )
             except NotImplementedError as e:
                 if str(e) == "Cannot copy out of meta tensor; no data!":
                     raise NotImplementedError(

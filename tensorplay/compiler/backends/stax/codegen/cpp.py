@@ -35,7 +35,7 @@ from ..debug import set_kernel_post_grad_provenance_tracing
 from ..loops import ops, V
 from ..ops_handler import NullKernelHandler, OpsValue
 from ..loop_body import LoopBody
-from ..kernel_scheduler import (
+from ..scheduler import (
     BaseSchedulerNode,
     BaseScheduling,
     ExternKernelSchedulerNode,

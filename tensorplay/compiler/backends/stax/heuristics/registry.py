@@ -161,10 +161,13 @@ class CodegenConfigHeuristics:
     compiled is a rule that will be written for one and not the others.
     """
 
+    def get_configs(self, *args: Any, **kwargs: Any) -> list[Any]:
+        raise NotImplementedError
+
 
 def register_codegen_heuristic(
     name: str,
-    device_type: str | None,
+    device_type: str | None = None,
     register: bool = True,
 ) -> Any:
     """Register a rule about how a generated kernel is configured on a device."""
@@ -195,9 +198,18 @@ def get_codegen_heuristic(name: str, device_type: str) -> CodegenConfigHeuristic
     heuristic_class = _lookup(name, device_type, None)
 
     if heuristic_class is None:
-        instance = CodegenConfigHeuristics()
-    else:
-        instance = heuristic_class()
+        from . import triton_codegen as _triton_codegen
+
+        del _triton_codegen
+        heuristic_class = _lookup(name, device_type, None)
+
+    if heuristic_class is None:
+        raise ValueError(
+            f"No codegen heuristic found - name={name}, device_type={device_type}. "
+            f"Available: {list(_HEURISTIC_REGISTRY.keys())}"
+        )
+
+    instance = heuristic_class()
     _HEURISTIC_CACHE[cache_key] = instance
     return instance
 

@@ -1620,12 +1620,12 @@ def bernoulli(input, p=_MISSING, *, generator=None, out=None):
             return _captured
     return _C.bernoulli(self=input, p=p, generator=generator)
 
-def native_dropout(input, p):
+def native_dropout(input, p, train):
     if _capturing():
-        _captured = _capture_call(native_dropout, (input, p), {})
+        _captured = _capture_call(native_dropout, (input, p, train), {})
         if _captured is not None:
             return _captured
-    return _C.native_dropout(input, p)
+    return _C.native_dropout(input, p, train)
 
 def native_dropout_backward(grad_output, mask, scale):
     if _capturing():
@@ -1633,6 +1633,13 @@ def native_dropout_backward(grad_output, mask, scale):
         if _captured is not None:
             return _captured
     return _C.native_dropout_backward(grad_output, mask, scale)
+
+def native_dropout_double_backward(ggI, grad, mask, scale):
+    if _capturing():
+        _captured = _capture_call(native_dropout_double_backward, (ggI, grad, mask, scale), {})
+        if _captured is not None:
+            return _captured
+    return _C.native_dropout_double_backward(ggI, grad, mask, scale)
 
 def native_alpha_dropout(input, p):
     if _capturing():
@@ -3380,12 +3387,12 @@ def sample(logits, temperature=1.0, top_k=0, top_p=1.0, impl=0):
             return _captured
     return _C.sample(logits, temperature, top_k, top_p, impl)
 
-def scaled_dot_product_attention(query, key, value, is_causal=False, impl=0):
+def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False):
     if _capturing():
-        _captured = _capture_call(scaled_dot_product_attention, (query, key, value, is_causal, impl), {})
+        _captured = _capture_call(scaled_dot_product_attention, (query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa), {})
         if _captured is not None:
             return _captured
-    return _C.scaled_dot_product_attention(query, key, value, is_causal, impl)
+    return _C.scaled_dot_product_attention(query, key, value, attn_mask, dropout_p, is_causal, scale=scale, enable_gqa=enable_gqa)
 
 def _scaled_dot_product_attention_with_lse(query, key, value, is_causal=False, impl=0):
     if _capturing():
@@ -3394,12 +3401,12 @@ def _scaled_dot_product_attention_with_lse(query, key, value, is_causal=False, i
             return _captured
     return _C._scaled_dot_product_attention_with_lse(query, key, value, is_causal, impl)
 
-def scaled_dot_product_attention_backward(grad_output, query, key, value, is_causal=False, impl=0):
+def scaled_dot_product_attention_backward(grad_output, query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False):
     if _capturing():
-        _captured = _capture_call(scaled_dot_product_attention_backward, (grad_output, query, key, value, is_causal, impl), {})
+        _captured = _capture_call(scaled_dot_product_attention_backward, (grad_output, query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa), {})
         if _captured is not None:
             return _captured
-    return _C.scaled_dot_product_attention_backward(grad_output, query, key, value, is_causal, impl)
+    return _C.scaled_dot_product_attention_backward(grad_output, query, key, value, attn_mask, dropout_p, is_causal, scale=scale, enable_gqa=enable_gqa)
 
 def _scaled_dot_product_attention_backward_with_lse(grad_output, query, key, value, output, logsumexp, is_causal=False, impl=0):
     if _capturing():
@@ -9149,6 +9156,13 @@ def set_data(input, new_data):
             return _captured
     return input.set_data(new_data=new_data)
 
+def shallow_copy_data(input, new_data):
+    if _capturing():
+        _captured = _capture_call(shallow_copy_data, (input, new_data), {})
+        if _captured is not None:
+            return _captured
+    return input.shallow_copy_data(new_data=new_data)
+
 def data(input):
     if _capturing():
         _captured = _capture_call(data, (input,), {})
@@ -11179,12 +11193,12 @@ def detach(input):
             return _captured
     return _C.detach(input)
 
-def size(input, dim):
+def size(input):
     if _capturing():
-        _captured = _capture_call(size, (input, dim), {})
+        _captured = _capture_call(size, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.size(input, dim)
+    return input.size()
 
 def sym_size(input, dim):
     if _capturing():
@@ -11314,12 +11328,12 @@ def _stack(tensors, dim=0, *, out=None):
             return _captured
     return _C._stack(tensors=tensors, dim=dim)
 
-def stride(input, dim):
+def stride(input):
     if _capturing():
-        _captured = _capture_call(stride, (input, dim), {})
+        _captured = _capture_call(stride, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.stride(input, dim)
+    return input.stride()
 
 def sym_stride(input, dim):
     if _capturing():

@@ -645,7 +645,7 @@ def dtype_to_type(dtype) -> type:
     """Computes the corresponding Python type ("type kind") for a dtype."""
     if not isinstance(dtype, tensorplay.dtype):
         raise AssertionError(f"Expected tensorplay.dtype, got {type(dtype)}")
-    if dtype is tensorplay.bool:
+    if dtype == tensorplay.bool:
         return bool
     if dtype in _integer_dtypes:
         return int
@@ -660,7 +660,7 @@ def dtype_to_type_ctor(dtype):
     """Computes the Python type constructor for a given dtype."""
     if not isinstance(dtype, tensorplay.dtype):
         raise AssertionError(f"Expected tensorplay.dtype, got {type(dtype)}")
-    if dtype is tensorplay.bool:
+    if dtype == tensorplay.bool:
         return bool
     if dtype in _integer_dtypes:
         return int

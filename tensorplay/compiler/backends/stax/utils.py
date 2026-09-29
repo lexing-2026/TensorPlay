@@ -2769,16 +2769,20 @@ def dtype_to_type(dtype) -> type:
     from whether the type counts, measures, or is neither.
     """
 
+    # A type is asked about by what it is rather than by where the asking came
+    # from: two descriptions that name the same widths are the same type, so the
+    # comparisons are by value -- an identity test would turn away a type that
+    # arrived from a separately loaded copy of the same module.
     if not isinstance(dtype, tp.dtype):
         raise AssertionError(f"expected an element type, got {type(dtype)}")
 
-    if dtype is tp.bool:
+    if dtype == tp.bool:
         return bool
-    if dtype in _INTEGER_DTYPES:
+    if dtype in _INTEGER_DTYPES or any(dtype == d for d in _INTEGER_DTYPES):
         return int
     if dtype.is_floating_point:
         return float
-    if dtype in _COMPLEX_DTYPES:
+    if dtype in _COMPLEX_DTYPES or any(dtype == d for d in _COMPLEX_DTYPES):
         return complex
 
     raise ValueError("not a type a number can be held in")

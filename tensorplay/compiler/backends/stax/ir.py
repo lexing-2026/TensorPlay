@@ -3855,7 +3855,7 @@ class ComputedBuffer(OperationBuffer):
                 stride_lengths = [
                     V.graph.sizevars.stride_hints(expr, indices) for expr in reads
                 ]
-                from .kernel_scheduler import pick_loop_order
+                from .scheduler import pick_loop_order
 
                 return pick_loop_order(stride_lengths, self.get_size())
 
@@ -4050,7 +4050,7 @@ class ComputedBuffer(OperationBuffer):
         as they are, which is the order the body was written in.
         """
 
-        from .kernel_scheduler import pick_loop_order
+        from .scheduler import pick_loop_order
 
         if priority_idx is None:
             priority_idx = []

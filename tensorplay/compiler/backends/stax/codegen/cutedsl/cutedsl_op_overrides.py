@@ -24,7 +24,7 @@ import tensorplay as tp
 from ..common import CSEVariable, OpOverrides
 from ...ops_handler import ReductionType
 
-from ...loops import V
+from ...virtualized import V
 from ...utils import get_bounds_index_expr
 from ...ops_handler import OpsValue
 from tensorplay.graph.experimental.sympy_functions import Max, Min

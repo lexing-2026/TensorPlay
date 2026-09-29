@@ -34,7 +34,7 @@ from tensorplay.graph.experimental.sympy_functions import (
 from ..utils import counters
 from .. import config, ir
 from ..virtualized import OpsValue
-from .. import kernel_scheduler as scheduler
+from .. import scheduler
 from ..analyze_preserves_zero_mask import prologue_preserves_zero_mask
 from ..codecache import code_hash, PyCodeCache
 from ..dependencies import MemoryDep, StarDep, WeakDep
@@ -58,7 +58,7 @@ from ..runtime.runtime_utils import (
     next_power_of_2,
     yellow_text,
 )
-from ..kernel_scheduler import BaseSchedulerNode, BaseScheduling, WhyNoFuse
+from ..scheduler import BaseSchedulerNode, BaseScheduling, WhyNoFuse
 from ..utils import (
     cache_property_on_self,
     decompose_index,
@@ -2329,7 +2329,7 @@ class SIMDScheduling(BaseScheduling):
         if node1.is_reduction() and node2.is_reduction():
             reduction_can_fuse = numel1 == numel2 and rnumel1 == rnumel2
             if not reduction_can_fuse:
-                from kernel_scheduler import MixOrderReduction
+                from ..scheduler import MixOrderReduction
 
                 reduction_can_fuse = MixOrderReduction.can_fuse(node1, node2)
 
@@ -2338,7 +2338,7 @@ class SIMDScheduling(BaseScheduling):
                 # still runs this backend fusion gate. The regular
                 # numel/rnumel checks reject nested reductions because the two
                 # reductions intentionally use different iteration spaces.
-                from kernel_scheduler import NestedReduction
+                from ..scheduler import NestedReduction
 
                 reduction_can_fuse = NestedReduction._is_dependent_reduction_pair(
                     node1, node2

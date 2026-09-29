@@ -147,10 +147,21 @@ Tensor avg_pool2d_backward_native_cuda(const Tensor& grad_output,
                                        bool ceil_mode, bool count_include_pad,
                                        std::optional<int64_t> divisor_override);
 
-Tensor avg_pool2d_cuda(const Tensor& input, const std::vector<int64_t>& kernel_size_arg, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, bool ceil_mode, bool count_include_pad, std::optional<int64_t> divisor_override) {
-    // The DNN library divides by the full window; an explicit divisor, and
-    // windows clipped by ceil_mode, go through the native kernel.
+// The DNN library takes float and double only, and takes the full window as
+// the divisor, so an explicit divisor, windows clipped by ceil_mode, and any
+// narrower element type all go through the native kernel instead.
+static inline bool avg_pool2d_prefers_native(const Tensor& input,
+                                             bool ceil_mode,
+                                             bool count_include_pad,
+                                             const std::optional<int64_t>& divisor_override) {
     if (divisor_override.has_value() || (ceil_mode && count_include_pad)) {
+        return true;
+    }
+    return !(input.dtype() == DType::Float32 || input.dtype() == DType::Float64);
+}
+
+Tensor avg_pool2d_cuda(const Tensor& input, const std::vector<int64_t>& kernel_size_arg, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, bool ceil_mode, bool count_include_pad, std::optional<int64_t> divisor_override) {
+    if (avg_pool2d_prefers_native(input, ceil_mode, count_include_pad, divisor_override)) {
         return avg_pool2d_native_cuda(input, kernel_size_arg, stride_arg, padding_arg,
                                       ceil_mode, count_include_pad, divisor_override);
     }
@@ -234,7 +245,7 @@ Tensor max_pool2d_backward_cuda(const Tensor& grad_output, const Tensor& input, 
 }
 
 Tensor avg_pool2d_backward_cuda(const Tensor& grad_output, const Tensor& input, const std::vector<int64_t>& kernel_size_arg, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, bool ceil_mode, bool count_include_pad, std::optional<int64_t> divisor_override) {
-    if (divisor_override.has_value() || (ceil_mode && count_include_pad)) {
+    if (avg_pool2d_prefers_native(input, ceil_mode, count_include_pad, divisor_override)) {
         return avg_pool2d_backward_native_cuda(grad_output, input, kernel_size_arg, stride_arg,
                                                padding_arg, ceil_mode, count_include_pad,
                                                divisor_override);

@@ -885,6 +885,7 @@ def _tuned_grouped_mm_common(operator_name: str, algorithm_name: str, extern_ker
         input_gen_fns[input_offs_idx] = lambda x: create_offsets(x, a_is_2d, b_is_2d, m, n, k, alignment)
     node, _ = autotune_select_algorithm(algorithm_name, choices, input_nodes, layout, input_gen_fns=input_gen_fns)
     return node
+    from ..templates.mm_common import _is_static_problem
 
 
 @register_lowering(framework._grouped_mm, type_promotion_kind=None)

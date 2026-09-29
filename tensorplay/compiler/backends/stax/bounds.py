@@ -201,7 +201,7 @@ class BoundVars:
             node
             for node in self.loop_body.get_nodes()
             if node.target in ("load", "reduction", operator.getitem)
-            or "masked_subblock" in node.target
+            or isinstance(node.target, str) and "masked_subblock" in node.target
         )
         self._bounds: dict[Any, ValueRanges] = {}
 

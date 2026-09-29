@@ -1114,6 +1114,6 @@ def analyze_memory_coalescing_for_nodes(nodes):
 def _scheduler_module():
     """The scheduler, which is imported here because the two refer to each other."""
 
-    from . import kernel_scheduler
+    from . import scheduler
 
-    return kernel_scheduler
+    return scheduler

@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any, Callable, ClassVar, Generic, NamedTuple, 
 
 import sympy
 from sympy.printing.python import PythonPrinter as _PythonPrinter
+from sympy.printing.precedence import PRECEDENCE
 import tensorplay as tp
 from tensorplay.graph import Graph
 
@@ -218,6 +219,18 @@ class PythonPrinter(_PythonPrinter):
     c`` means something different from ``a % (b * c)`` and a printer that guessed
     would be guessing which was meant.
     """
+
+    def _print_str(self, expr: str) -> str:
+        return expr
+
+    def _print_ModularIndexing(self, expr: sympy.Expr) -> str:
+        x, div, mod = (
+            self.parenthesize(arg, PRECEDENCE["Atom"] - 0.5)
+            for arg in expr.args
+        )
+        if div != "1":
+            x = f"({x} // {div})"
+        return f"({x} % {mod})"
 
     def doprint(self, expr: sympy.Expr, *, simplify: bool = True, p: bool = True) -> str:
         if simplify and isinstance(expr, sympy.Expr) and hasattr(V.graph, "sizevars"):
@@ -881,6 +894,30 @@ class BasicMathOpsMixin:
     @staticmethod
     def and_(a, b):
         return f"({a} & {b})"
+
+    @staticmethod
+    def eq(a, b):
+        return f"{a} == {b}"
+
+    @staticmethod
+    def ne(a, b):
+        return f"{a} != {b}"
+
+    @staticmethod
+    def lt(a, b):
+        return f"{a} < {b}"
+
+    @staticmethod
+    def gt(a, b):
+        return f"{a} > {b}"
+
+    @staticmethod
+    def le(a, b):
+        return f"{a} <= {b}"
+
+    @staticmethod
+    def ge(a, b):
+        return f"{a} >= {b}"
 
 
 class OperatorNotSupported(NotImplementedError):
@@ -3376,7 +3413,7 @@ class DataTypePropagation:
 
     @classmethod
     def propagate_scheduler_node(cls, node: "SchedulerNode") -> tp.dtype | None:
-        from ..kernel_scheduler import SchedulerNode
+        from ..scheduler import SchedulerNode
         from ..loop_body import LoopBody
 
         if not isinstance(node, SchedulerNode):

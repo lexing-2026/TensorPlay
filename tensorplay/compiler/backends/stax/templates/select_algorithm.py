@@ -67,7 +67,7 @@ from ..utils import (
     triton_type_to_torch,
     unique,
 )
-from ..kernel_scheduler import count_flops_fx
+from ..fx_utils import count_flops_fx
 from ..ops_handler import StoreMode
 from ..heuristics.template.base import SymbolicGridFn
 from ..runtime.triton_heuristics import FixedGrid

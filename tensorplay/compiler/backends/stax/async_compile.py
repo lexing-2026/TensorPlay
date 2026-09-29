@@ -16,6 +16,7 @@ import logging
 import multiprocessing
 import os
 import sys
+from collections.abc import Callable
 from concurrent.futures import (
     Future,
     ProcessPoolExecutor,
@@ -23,14 +24,21 @@ from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
 from concurrent.futures.process import BrokenProcessPool
+from time import time, time_ns
 from typing import Any
 
-from .codecache import CodeCacheFuture
+from .codecache import (
+    CodeCacheFuture,
+    LambdaFuture,
+    PyCodeCache,
+    code_hash,
+    torch_key,
+)
 
 import tensorplay as tp
 
 from . import config
-from .compile_worker.subproc_pool import AnyPool, SubprocPool
+from .compile_worker.subproc_pool import AnyPool, SubprocException, SubprocPool
 from .compile_worker.tracked_process_pool import TrackedProcessPoolExecutor
 from .compile_worker.utils import _async_compile_initializer
 from .runtime.compile_tasks import pre_fork_setup
@@ -39,10 +47,14 @@ from .runtime.compile_tasks import pre_fork_setup
 from .runtime.triton_compat import triton as _triton
 
 HAS_TRITON = _triton is not None
-from .utils import clear_on_fresh_cache
+from .utils import clear_on_fresh_cache, counters, has_triton_package
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
 
 log = logging.getLogger(__name__)
+
+_cumulative_compile_time = 0.0
+_t0: float | None = None
+_triton_kernel_metrics: dict[str, dict[str, Any]] | None = None
 
 #: The pools that exist, so that shutting down means all of them.  Held at
 #: module level rather than on the class because a module-level shutdown has
@@ -92,6 +104,37 @@ def _compile_end() -> None:
             payload_fn=lambda: json.dumps(sorted_info),
         )
         _triton_kernel_metrics = None
+
+
+def _load_triton_kernel_from_source(
+    kernel_name: str, source_code: str
+) -> Any:
+    return getattr(PyCodeCache.load(source_code), kernel_name)
+
+
+@clear_on_fresh_cache
+class CompiledTritonKernels:
+    _cache: dict[str, CodeCacheFuture] = {}
+
+    @staticmethod
+    def key(kernel_src: str) -> str:
+        return code_hash(kernel_src, extra=torch_key())
+
+    @staticmethod
+    def save(kernel_src: str, future: CodeCacheFuture) -> None:
+        CompiledTritonKernels._cache[CompiledTritonKernels.key(kernel_src)] = future
+
+    @staticmethod
+    def get(kernel_src: str) -> CodeCacheFuture | None:
+        return CompiledTritonKernels._cache.get(CompiledTritonKernels.key(kernel_src))
+
+    @staticmethod
+    def cache_clear() -> None:
+        CompiledTritonKernels._cache = {}
+
+    @staticmethod
+    def remove_future(kernel_src: str) -> None:
+        CompiledTritonKernels._cache.pop(CompiledTritonKernels.key(kernel_src), None)
 
 
 def shutdown_compile_workers() -> None:
@@ -297,6 +340,81 @@ class AsyncCompile:
         pool = cls.process_pool()
         if isinstance(pool, SubprocPool):
             pool.wakeup()
+
+    def triton(self, kernel_name: str, source_code: str, device_str: str = "cuda"):
+        load_kernel = functools.partial(
+            _load_triton_kernel_from_source, kernel_name, source_code
+        )
+
+        def reload_kernel_in_parent():
+            return load_kernel()
+
+        counters["inductor"]["async_compile_cache_miss"] += 1
+        _compile_start()
+
+        if os.environ.get("TRITON_INTERPRET", "0") == "1":
+            return load_kernel()
+
+        is_parallel = self.use_process_pool()
+        cached = CompiledTritonKernels.get(source_code)
+        if cached is not None:
+            counters["inductor"]["async_compile_cache_hit"] += 1
+            return cached if is_parallel else cached.result()
+
+        if is_parallel:
+            from .runtime.compile_tasks import _set_triton_libdevice_path
+
+            _set_triton_libdevice_path()
+            env_vars = (
+                "TP_CACHE_DIR",
+                "TP_TRITON_CACHE_DIR",
+                "TRITON_CACHE_DIR",
+                "TP_TRITON_LIBDEVICE_PATH",
+            )
+            extra_env = {name: os.environ.get(name) for name in env_vars}
+            extra_config = {
+                "use_static_triton_launcher": config.use_static_triton_launcher,
+            }
+            task = self.process_pool().submit(
+                _worker_compile_triton,
+                load_kernel,
+                extra_env,
+                extra_config,
+            )
+
+            def get_result() -> Any:
+                try:
+                    kernel, _elapsed_us = task.result()
+                except SubprocException as e:
+                    raise e.with_name(kernel_name) from e
+                CompiledTritonKernels.remove_future(source_code)
+                kernel.set_compile_info(None, False)
+                kernel.restore_after_unpickle(old_values=None)
+                kernel.precompile(
+                    warm_cache_only=False,
+                    reload_kernel=reload_kernel_in_parent,
+                    static_triton_bundle_key=CompiledTritonKernels.key(source_code),
+                )
+                return kernel
+
+            future = LambdaFuture(get_result, future=task)
+            CompiledTritonKernels.save(source_code, future)
+            return future
+
+        from .runtime.compile_tasks import (
+            _set_triton_libdevice_path,
+            _set_triton_ptxas_path,
+        )
+
+        _set_triton_ptxas_path()
+        _set_triton_libdevice_path()
+        kernel = load_kernel()
+        kernel.set_compile_info(None, False)
+        kernel.precompile(
+            warm_cache_only=False,
+            static_triton_bundle_key=CompiledTritonKernels.key(source_code),
+        )
+        return kernel
 
     def _wait_futures(self, scope: dict) -> None:
         """Replace each thing that was only started with the thing itself.

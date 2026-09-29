@@ -480,6 +480,42 @@ def _flash_attention_forward_adapter(
     Either way the result is the output, the per-query logsumexp, the dropout
     state, an unused scalar, and the debug mask.
     """
+    if _native_kernel_serves("_flash_attention_forward", query.device.type):
+        return _prefer_native_kernel(
+            "_flash_attention_forward",
+            _flash_attention_forward_adapter,
+            query,
+            (query, key, value, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, return_debug_mask),
+            {
+                "scale": scale,
+                "window_size_left": window_size_left,
+                "window_size_right": window_size_right,
+                "seqused_k": seqused_k,
+                "alibi_slopes": alibi_slopes,
+                "block_table": block_table,
+                "num_splits": num_splits,
+            },
+        )
+    if _native_kernel_serves("_efficient_attention_forward", query.device.type):
+        return _prefer_native_kernel(
+            "_efficient_attention_forward",
+            _efficient_attention_forward_adapter,
+            query,
+            (
+                query,
+                key,
+                value,
+                bias,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                custom_mask_type,
+                compute_log_sumexp,
+            ),
+            {"scale": scale, "seqlen_k": seqlen_k, "window_size": window_size},
+        )
     del return_debug_mask, alibi_slopes, num_splits
     if dropout_p != 0.0:
         raise NotImplementedError("flash attention: dropout > 0 is not supported in this build")
@@ -531,6 +567,29 @@ def _flash_attention_inplace_adapter(
     hand one buffer to step after step.  Only the logsumexp comes back as a
     value; the output is the buffer, which is what the caller already has.
     """
+    if _native_kernel_serves("_flash_attention_forward_no_dropout_inplace", out.device.type):
+        packet = _load_native_overloads().get("_flash_attention_forward_no_dropout_inplace")
+        if packet is not None:
+            return packet(
+                out,
+                query,
+                key,
+                value,
+                cum_seq_q,
+                cum_seq_k,
+                max_q,
+                max_k,
+                dropout_p,
+                is_causal,
+                return_debug_mask,
+                scale=scale,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
+                seqused_k=seqused_k,
+                alibi_slopes=alibi_slopes,
+                block_table=block_table,
+                num_splits=num_splits,
+            )
     result = _flash_attention_forward_adapter(
         query,
         key,
@@ -582,6 +641,27 @@ def _cudnn_attention_forward_adapter(
     tables it passed in are what describe it.  The two seed fields go unread by
     every caller in this tree and are reported as a fixed zero.
     """
+    if _native_kernel_serves("_cudnn_attention_forward", query.device.type):
+        return _prefer_native_kernel(
+            "_cudnn_attention_forward",
+            _cudnn_attention_forward_adapter,
+            query,
+            (
+                query,
+                key,
+                value,
+                attn_bias,
+                cum_seq_q,
+                cum_seq_k,
+                max_q,
+                max_k,
+                compute_logsumexp,
+                dropout_p,
+                is_causal,
+                return_debug_mask,
+            ),
+            {"scale": scale, "seqused_k": seqused_k, "block_table": block_table},
+        )
     del return_debug_mask
     if dropout_p != 0.0:
         raise NotImplementedError("cuDNN attention: dropout > 0 is not supported in this build")
@@ -618,6 +698,52 @@ def _cudnn_attention_forward_adapter(
         seed,
         empty_q,
     )
+
+
+#: The dispatch key a device's kernels register under.  A composite is chosen
+#: per call because a kernel may be registered for one device and not another,
+#: and the answer has to be the one for the tensors in hand.
+_DISPATCH_KEY_FOR_DEVICE = {"cpu": "CPU", "cuda": "CUDA"}
+
+
+def _native_kernel_serves(opname: str, device_type: str) -> bool:
+    """Whether a kernel of this build answers ``opname`` on ``device_type``.
+
+    An op the contract declares but no backend implements is served by the
+    composite below.  A backend that later grows one should take the call back
+    without the composite having to be told, so each entry asks this first and
+    only composes when the answer is no.
+    """
+    key = _DISPATCH_KEY_FOR_DEVICE.get(device_type)
+    if key is None:
+        return False
+    try:
+        return bool(_C._dispatch_has_kernel_for_dispatch_key(opname, key))
+    except Exception:
+        # An op the dispatch table has never heard of has no kernel anywhere.
+        return False
+
+
+def _prefer_native_kernel(opname: str, composite: Any, device_of: Any, args, kwargs):
+    """Hand the call to a registered kernel, or compose it here.
+
+    The dispatcher is asked first because a kernel is the whole point of the
+    contract: it answers in one pass without forming a score matrix, and it
+    answers for the device the tensors are on rather than for whichever device
+    happens to be compiled in.  Only when nothing is registered does the
+    composite run, and then the answer is the same either way -- which is what
+    makes it safe for the composite to be the default.
+    """
+    probe = None
+    for candidate in args:
+        if isinstance(candidate, tensorplay.Tensor):
+            probe = candidate
+            break
+    if probe is not None and _native_kernel_serves(opname, probe.device.type):
+        packet = _load_native_overloads().get(opname)
+        if packet is not None:
+            return packet(*args, **kwargs)
+    return composite(*args, **kwargs)
 
 
 # Composite contracts declared in the op schema set that have no dedicated

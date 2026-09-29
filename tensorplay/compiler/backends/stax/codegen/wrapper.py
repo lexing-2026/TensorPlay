@@ -77,7 +77,6 @@ from ..compile_log import (
 )
 from ..runtime.cache_dir_utils import cache_dir
 from ..runtime.hints import DeviceProperties, TritonMeta
-from ..runtime.pooled_allocator import itemsize
 from ..runtime.storage_ref import StorageWeakRef
 from ..sympy_utils import sympy_str
 from tensorplay.utils import _pytree as pytree
@@ -119,7 +118,7 @@ if TYPE_CHECKING:
 
     from ..graph_lowering import GraphLowering
     from ..ir import ExternKernel
-    from ..kernel_scheduler import BaseSchedulerNode
+    from ..scheduler import BaseSchedulerNode
 
 
 log = logging.getLogger(__name__)
@@ -1638,7 +1637,8 @@ class PythonWrapperCodegen(CodeGen):
         self.imports.splice(
             f"""
                 from ctypes import c_void_p, c_long, c_int
-                import tensorplay as tp
+                import tensorplay
+                tp = tensorplay
                 import math
                 import operator
                 import random
@@ -1663,6 +1663,11 @@ class PythonWrapperCodegen(CodeGen):
             """
                 operator_set = tp.ops.tp
                 inductor_ops = tp.ops.inductor
+                empty_strided_cpu = lambda *args, **kwargs: tp.empty_strided(*args, device="cpu", **kwargs)
+                empty_strided_cpu_pinned = lambda size, stride, dtype: tp.empty_strided(size, stride, dtype=dtype, device="cpu", pin_memory=True)
+                empty_strided_cuda = lambda *args, **kwargs: tp.empty_strided(*args, device="cuda", **kwargs)
+                empty_strided_xpu = lambda *args, **kwargs: tp.empty_strided(*args, device="xpu", **kwargs)
+                empty_strided_mtia = lambda *args, **kwargs: tp.empty_strided(*args, device="mtia", **kwargs)
             """,
             strip=True,
         )
@@ -1833,6 +1838,9 @@ class PythonWrapperCodegen(CodeGen):
             ):
                 continue
 
+            if not isinstance(buf, ir.IRNode) or not buf.has_tensor_output():
+                continue
+
             # a graph partition may take an IRNode output from a previous partition
             if name not in V.graph.graph_input_names:
                 continue
@@ -1847,7 +1855,11 @@ class PythonWrapperCodegen(CodeGen):
     def codegen_input_nan_asserts(self) -> None:
         self.prefix.writeline("# make sure graph inputs are not nan/inf")
         for name, buf in self.get_graph_inputs().items():
-            if isinstance(buf, (sympy.Basic, ir.TorchBindObject)):
+            if (
+                isinstance(buf, (sympy.Basic, ir.TorchBindObject))
+                or not isinstance(buf, ir.IRNode)
+                or not buf.has_tensor_output()
+            ):
                 continue
             line = f"assert not {name}.isnan().any().item()"
             self.prefix.writeline(line)
@@ -3321,7 +3333,7 @@ class PythonWrapperCodegen(CodeGen):
             for group in storage_groups.values():
                 if len(group.inputs) < 2:
                     continue
-                numel = group.nbytes // itemsize(group.dtype)
+                numel = group.nbytes // group.dtype.itemsize
                 output.writeline(
                     f"{group.buffer_name} = rand_strided(({numel},), (1,), device='{self._coor_device_type_str(group.device)}', dtype={group.dtype})"
                 )

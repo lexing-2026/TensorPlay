@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
     from .dependencies import Dep
-    from .kernel_scheduler import BaseSchedulerNode, SchedulerBuffer
+    from .scheduler import BaseSchedulerNode, SchedulerBuffer
 
 
 @dataclasses.dataclass
@@ -153,7 +153,7 @@ def compute_size_for_scheduler_buffer(name_to_buf) -> dict:
     """
 
     from .ir import MultiOutput
-    from .kernel_scheduler import OutputNode
+    from .scheduler import OutputNode
 
     sched_buf_to_size: dict = {}
 

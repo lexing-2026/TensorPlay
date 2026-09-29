@@ -1612,7 +1612,7 @@ def _sdpa_math_attention(query, key, value, attn_mask, dropout_p, is_causal,
         if attn_mask.dtype == tp.bool:
             scores = tp.where(attn_mask, scores, -math.inf)
         else:
-            scores = scores + attn_mask
+            scores = scores + attn_mask.to(dtype=scores.dtype)
     probs = _safe_softmax(scores, -1)
     if dropout_p:
         # Dropping is written as the operation that keeps what it kept, which

@@ -277,7 +277,7 @@ def _meta_arg(arg: object) -> object:
 
 def _same_tensor_metadata(lhs: tp.Tensor, rhs: tp.Tensor) -> bool:
     def same_dim(lhs_dim: object, rhs_dim: object) -> bool:
-        from .....graph.experimental.symbolic_shapes import statically_known_true
+        from ..sizevars import statically_known_true
 
         try:
             return statically_known_true(lhs_dim == rhs_dim)

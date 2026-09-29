@@ -2614,13 +2614,70 @@ def omni_attention(
     if not hasattr(tensorplay.compiler, "compile"):
         raise RuntimeError("omni_attention requires graph tracer support")
 
-    # The tracer is expecting a callable with "__code__" attribute.
-    # We cannot directly pass hop to it. So we wrap it in a dummy function.
-    # The wrapper spells out the hop's fixed parameter list: the compiler
-    # frontend traces the signature, and a varargs spelling is rejected.
-    def _omni_attention_hop_wrapper(query, key, value, score_mod, block_mask, scale, kernel_options):
+    block_mask_args = block_mask.as_tuple()
+    (
+        seq_q,
+        seq_kv,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        dq_kv_order_spt,
+        q_block_size,
+        kv_block_size,
+        mask_mod,
+    ) = block_mask_args
+
+    def _omni_attention_hop_wrapper(
+        query,
+        key,
+        value,
+        kv_num_blocks,
+        kv_indices,
+        full_kv_num_blocks,
+        full_kv_indices,
+        q_num_blocks,
+        q_indices,
+        full_q_num_blocks,
+        full_q_indices,
+        dq_write_order,
+        dq_write_order_full,
+        dq_kv_order,
+    ):
+        traced_block_mask = (
+            seq_q,
+            seq_kv,
+            kv_num_blocks,
+            kv_indices,
+            full_kv_num_blocks,
+            full_kv_indices,
+            q_num_blocks,
+            q_indices,
+            full_q_num_blocks,
+            full_q_indices,
+            dq_write_order,
+            dq_write_order_full,
+            dq_kv_order,
+            dq_kv_order_spt,
+            q_block_size,
+            kv_block_size,
+            mask_mod,
+        )
         return omni_attention_hop(
-            query, key, value, score_mod, block_mask, scale, kernel_options
+            query,
+            key,
+            value,
+            score_mod,
+            traced_block_mask,
+            scale,
+            kernel_options,
         )
 
     with setup_compilation_env() as backend:
@@ -2631,35 +2688,12 @@ def omni_attention(
                 _omni_attention_hop_wrapper, backend=backend, fullgraph=True
             )
 
-        try:
-            out, lse, max_scores = omni_fn(
-                query,
-                key,
-                value,
-                score_mod,
-                block_mask.as_tuple(),
-                scale,
-                kernel_options,
-            )
-        except Exception:
-            # The captured region is not always expressible yet (for one,
-            # the math path vmaps over indices that trace as graph values).
-            # Falling back to the eager hop keeps the results correct; any
-            # genuinely invalid input raises again from the eager re-run.
-            _warn_once(
-                "omni_attention_capture_fallback",
-                "omni_attention: the compiler could not capture this region; "
-                "running the unfused math implementation instead.",
-            )
-            out, lse, max_scores = _omni_attention_hop_wrapper(
-                query,
-                key,
-                value,
-                score_mod,
-                block_mask.as_tuple(),
-                scale,
-                kernel_options,
-            )
+        out, lse, max_scores = omni_fn(
+            query,
+            key,
+            value,
+            *block_mask_args[2:13],
+        )
     return _finalize_outputs(
         out,
         lse,

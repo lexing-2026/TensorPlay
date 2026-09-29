@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Sequence
 
-from ..kernel_scheduler import BaseScheduling
+from ..scheduler import BaseScheduling
 from .triton import TritonScheduling
 
 #: Where this module's messages go.

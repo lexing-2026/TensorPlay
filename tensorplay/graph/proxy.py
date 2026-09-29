@@ -13,6 +13,8 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
 from typing import Any
 
+from tensorplay._C import DType as _DType
+
 from ._utils import GraphCaptureError, _capture_disabled, capturing
 from .node import Node
 
@@ -213,6 +215,8 @@ class TracerBase:
         creator = getattr(value, "__tensorplay_create_arg__", None)
         if callable(creator):
             return creator(self)
+        if isinstance(value, _DType):
+            return value
         if isinstance(value, tuple):
             mapped = [self.create_arg(item) for item in value]
             if hasattr(value, "_fields"):
@@ -808,40 +812,6 @@ class MetaProxy(Proxy):
         return cls(result.node, result.tracer, meta_source.fake_mode)
 
 
-def _as_operation(method: Any) -> Any:
-    """The operation ``method`` names, in the form a graph can carry.
-
-    A graph holds operations and is asked about them constantly: whether one is
-    a particular operation worth rewriting, whether two nodes do the same thing
-    and may share a result, what to call the thing a node produced. Each of
-    those asks for the operation to be something that can be compared, put in a
-    table, and named -- none of which is required of a callable in general.
-
-    What a type hands out for a method is not always such an operation. Some
-    are given as a description of how to bind the method to a value, and that
-    description is only meaningful once a value is named, so it cannot be
-    compared with anything: two of them for the same method are as alike as
-    they can be and still not the same object to a table. What sits behind such
-    a description is the operation proper, which carries the same name, binds
-    the same way when the value is passed as the first argument, and compares
-    as one thing. So a method that cannot be carried is replaced by that, and
-    one that can is left as it is.
-    """
-
-    try:
-        hash(method)
-    except TypeError:
-        unbound = getattr(method, "__func__", None)
-        if unbound is not None:
-            try:
-                hash(unbound)
-            except TypeError:
-                pass
-            else:
-                return unbound
-    return method
-
-
 class Attribute(Proxy):
     """Lazy attribute access that becomes a method or attribute node on use."""
 
@@ -862,34 +832,6 @@ class Attribute(Proxy):
         return self._node
 
     def __call__(self, *args: Any, **kwargs: Any) -> Proxy:
-        # A method the tensor type has -- add_, exp, sin -- is not a message
-        # sent to a value; it is that type's operation reached by a shorter
-        # name. Capturing it as a call to the name leaves the graph saying
-        # something the compiler does not know how to make, and the region
-        # falls back to being run as it was written. So a name the tensor type
-        # has is captured as a call to that operation, which is what everything
-        # downstream already expects: the lowering knows it, the schedule can
-        # fuse it, and the kernel can be written for it.
-        #
-        # The operation is taken off the type, not off the value, so that the
-        # graph holds the operation itself rather than one already bound to
-        # some particular value. A call is then written the same way however it
-        # arrived -- the value is the first argument -- and asking the graph to
-        # run the node on an example passes that example as the first
-        # argument, rather than binding it a second time.
-        import tensorplay as tp
-
-        tensor_type = tp.Tensor
-        samples = getattr(self.root.tracer, "_node_samples", None)
-        if samples:
-            sample = samples.get(self.root.node.name)
-            if sample is not None:
-                tensor_type = type(sample)
-        method = getattr(tensor_type, self.attr, None)
-        if method is not None:
-            return self.tracer.create_proxy(
-                "call_function", _as_operation(method), (self.root, *args), kwargs
-            )
         return self.tracer.create_proxy(
             "call_method", self.attr, (self.root, *args), kwargs
         )

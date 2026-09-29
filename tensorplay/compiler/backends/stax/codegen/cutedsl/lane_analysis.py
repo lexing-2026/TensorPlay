@@ -10,7 +10,7 @@ import sympy
 
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
 
-from ...loops import V
+from ...virtualized import V
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

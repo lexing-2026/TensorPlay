@@ -18,8 +18,12 @@ import sympy
 import tensorplay as tp
 
 
-from .triton_compat import JITFunction, libdevice, math
+from .triton_compat import JITFunction, libdevice, math, tl, triton
 from .triton_compat import math as tl_math
+
+
+def _triton_jit(fn):
+    return fn if triton is None else triton.jit(fn)
 
 
 def set_driver_to_cpu():
@@ -181,3 +185,237 @@ def get_constexprs(kernel: JITFunction) -> list[int]:
     """
 
     return [p.num for p in kernel.params if p.is_constexpr]
+
+
+@_triton_jit
+def promote_to_tensor(x):
+    return x + tl.zeros((1,), tl.int1)
+
+
+@_triton_jit
+def fp8e4m3fn_to_float32(x):
+    x_u32 = x.to(tl.uint32)
+    sign = (x_u32 & 0x80) << 24
+    exp = (x_u32 >> 3) & 0xF
+    mant = x_u32 & 0x7
+
+    normal_bits = sign | ((exp + 120) << 23) | (mant << 20)
+    normal = normal_bits.to(tl.float32, bitcast=True)
+
+    subnormal_abs = mant.to(tl.float32) * 0.001953125
+    subnormal_bits = subnormal_abs.to(tl.uint32, bitcast=True) | sign
+    subnormal = subnormal_bits.to(tl.float32, bitcast=True)
+
+    nan = (sign | 0x7FF00000).to(tl.float32, bitcast=True)
+    result = tl.where(exp == 0, subnormal, normal)
+    return tl.where((exp == 0xF) & (mant == 0x7), nan, result)
+
+
+@_triton_jit
+def div_floor_integer(a, b):
+    quot = a // b
+    remainder = a % b
+    fixed = tl.where(remainder != 0, quot - 1, quot)
+    return tl.where((a < 0) != (b < 0), fixed, quot)
+
+
+@_triton_jit
+def remainder_integer(a, b):
+    remainder = a % b
+    return tl.where((remainder != 0) & ((a < 0) != (b < 0)), remainder + b, remainder)
+
+
+@_triton_jit
+def pow_integer(base, exponent):
+    exponent_dtype: tl.constexpr = tl.core.get_int_dtype(
+        exponent.dtype.primitive_bitwidth, signed=False
+    )
+    exp = exponent.to(exponent_dtype)
+    result = tl.full(base.shape, 1, base.dtype)
+    for _ in tl.static_range(exponent_dtype.primitive_bitwidth):
+        result = tl.where((exp & 1) != 0, result * base, result)
+        exp = exp >> 1
+        base = base * base
+    return result
+
+
+@_triton_jit
+def is_floating(x):
+    return promote_to_tensor(x).dtype.is_floating()
+
+
+@_triton_jit
+def _prod_accumulate(a, b):
+    return a * b
+
+
+@_triton_jit
+def prod(input, axis):
+    return tl.reduce(input, axis, _prod_accumulate)
+
+
+@_triton_jit
+def prod_inner_tree(input, axis, reduction_ordering: tl.constexpr):
+    return tl.reduce(input, axis, _prod_accumulate, reduction_ordering=reduction_ordering)
+
+
+@_triton_jit
+def minimum(a, b):
+    return tl.minimum(a, b, propagate_nan=tl.PropagateNan.ALL)
+
+
+@_triton_jit
+def maximum(a, b):
+    return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
+
+
+@_triton_jit
+def _minimum_reduce(a, b):
+    value = minimum(a, b)
+    if is_floating(a):
+        value = tl.where(a == b, b, value)
+    return value
+
+
+@_triton_jit
+def _maximum_reduce(a, b):
+    value = maximum(a, b)
+    if is_floating(a):
+        value = tl.where(a == b, b, value)
+    return value
+
+
+@_triton_jit
+def fmaximum(a, b):
+    return tl.maximum(a, b)
+
+
+@_triton_jit
+def min2(a, dim):
+    return tl.reduce(a, dim, minimum)
+
+
+@_triton_jit
+def max2(a, dim):
+    return tl.reduce(a, dim, maximum)
+
+
+@_triton_jit
+def min2_strict(a, dim):
+    return tl.reduce(a, dim, _minimum_reduce)
+
+
+@_triton_jit
+def max2_strict(a, dim):
+    return tl.reduce(a, dim, _maximum_reduce)
+
+
+@_triton_jit
+def fmax2(a, dim):
+    return tl.reduce(a, dim, fmaximum)
+
+
+@_triton_jit
+def minimum_with_index(a_value, a_index, b_value, b_index):
+    mask = a_value < b_value
+    equal = a_value == b_value
+    if is_floating(a_value):
+        a_isnan = a_value != a_value
+        b_isnan = b_value != b_value
+        mask |= a_isnan & (not b_isnan)
+        equal |= a_isnan & b_isnan
+    mask |= equal & (a_index < b_index)
+    return tl.where(mask, a_value, b_value), tl.where(mask, a_index, b_index)
+
+
+@_triton_jit
+def maximum_with_index(a_value, a_index, b_value, b_index):
+    mask = a_value > b_value
+    equal = a_value == b_value
+    if is_floating(a_value):
+        a_isnan = a_value != a_value
+        b_isnan = b_value != b_value
+        mask |= a_isnan & (not b_isnan)
+        equal |= a_isnan & b_isnan
+    mask |= equal & (a_index < b_index)
+    return tl.where(mask, a_value, b_value), tl.where(mask, a_index, b_index)
+
+
+@_triton_jit
+def min_with_index(value, index, dim):
+    return tl.reduce((value, index), dim, minimum_with_index)
+
+
+@_triton_jit
+def max_with_index(value, index, dim):
+    return tl.reduce((value, index), dim, maximum_with_index)
+
+
+@_triton_jit
+def exp(x, use_fast_math: tl.constexpr):
+    if use_fast_math:
+        return math.exp(x)
+    return libdevice.exp(x)
+
+
+@_triton_jit
+def online_softmax_reduce(
+    lhs_max,
+    lhs_sum,
+    dim,
+    use_fast_math: tl.constexpr,
+    strict_signed_zero: tl.constexpr,
+):
+    if strict_signed_zero:
+        out_max = max2_strict(lhs_max, dim)
+    else:
+        out_max = max2(lhs_max, dim)
+    out_max_keepdim = tl.expand_dims(out_max, dim)
+    delta = tl.where(out_max_keepdim == float("-inf"), 0, lhs_max - out_max_keepdim)
+    out_sum = tl.sum(lhs_sum * exp(delta, use_fast_math), dim)
+    return out_max, out_sum
+
+
+@_triton_jit
+def online_softmax_combine(
+    lhs_max,
+    lhs_sum,
+    rhs_max,
+    use_fast_math: tl.constexpr,
+    strict_signed_zero: tl.constexpr,
+):
+    if strict_signed_zero:
+        out_max = _maximum_reduce(lhs_max, rhs_max)
+    else:
+        out_max = maximum(lhs_max, rhs_max)
+    lhs_scale = tl.where(
+        out_max == float("-inf"), 1.0, exp(lhs_max - out_max, use_fast_math)
+    )
+    rhs_scale = tl.where(
+        out_max == float("-inf"), 1.0, exp(rhs_max - out_max, use_fast_math)
+    )
+    out_sum = lhs_sum * lhs_scale + rhs_scale
+    return out_max, out_sum
+
+
+@_triton_jit
+def online_softmax_combine_with_sum(
+    lhs_max,
+    lhs_sum,
+    rhs_max,
+    rhs_sum,
+    use_fast_math: tl.constexpr,
+    strict_signed_zero: tl.constexpr,
+):
+    if strict_signed_zero:
+        out_max = _maximum_reduce(lhs_max, rhs_max)
+    else:
+        out_max = maximum(lhs_max, rhs_max)
+    lhs_scale = tl.where(
+        out_max == float("-inf"), 1.0, exp(lhs_max - out_max, use_fast_math)
+    )
+    rhs_scale = tl.where(
+        out_max == float("-inf"), 1.0, exp(rhs_max - out_max, use_fast_math)
+    )
+    out_sum = lhs_sum * lhs_scale + rhs_sum * rhs_scale
+    return out_max, out_sum

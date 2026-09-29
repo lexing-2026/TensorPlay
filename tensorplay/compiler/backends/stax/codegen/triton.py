@@ -24,6 +24,7 @@ import itertools
 import math
 import re
 import sympy
+from sympy.printing.precedence import PRECEDENCE
 from typing import Any, Callable, Iterable, Sequence, TYPE_CHECKING, TypeVar, cast
 
 import contextlib
@@ -32,6 +33,8 @@ import logging
 import operator
 
 import tensorplay as tp
+from tensorplay.utils import _pytree as pytree
+from tensorplay.primitives.common import is_integer_dtype
 
 log = logging.getLogger(__name__)
 
@@ -49,7 +52,7 @@ from .....graph.experimental.sympy_functions import (
     symbol_is_type,
     SymT,
 )
-from .. import config
+from .. import config, ir
 from ..config import triton as triton_config
 from ..loops import V
 from tensorplay.utils._triton import (

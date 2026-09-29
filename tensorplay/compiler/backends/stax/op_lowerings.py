@@ -3227,7 +3227,12 @@ def _register_div_writing_forms() -> None:
 _register_div_writing_forms()
 
 
-def to_dtype(x: Any, dtype: Any, copy: bool = False) -> Any:
+def to_dtype(
+    x: Any,
+    dtype: Any,
+    copy: bool = False,
+    use_compute_types: bool = True,
+) -> Any:
     """The same values, read as another element type.
 
     Whether the values are moved is a separate question from how they are read,
@@ -3246,9 +3251,14 @@ def to_dtype(x: Any, dtype: Any, copy: bool = False) -> Any:
     size, device = x.get_size(), x.get_device()
 
     def _to_dtype(index: Any) -> Any:
-        result = ops.to_dtype(loader(index), dtype, src_dtype=src_dtype)
-        if dtype in (tp.bfloat16, tp.float16):
-            result = ops.to_dtype(result, "float32")
+        result = ops.to_dtype(
+            loader(index),
+            dtype,
+            src_dtype=src_dtype,
+            use_compute_types=use_compute_types,
+        )
+        if not use_compute_types and dtype in (tp.bfloat16, tp.float16):
+            result = ops.to_dtype(result, dtype)
         return result
 
     # Described from the value being converted rather than from whatever node

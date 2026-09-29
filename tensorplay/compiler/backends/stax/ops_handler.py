@@ -970,63 +970,83 @@ class OpsValue:
 
     def __add__(self, other):
         return ops.add(self, other)
+        from .loops import ops
 
     def __mul__(self, other):
         return ops.mul(self, other)
+        from .loops import ops
 
     def __sub__(self, other):
         return ops.sub(self, other)
+        from .loops import ops
 
     def __neg__(self):
         return ops.neg(self)
+        from .loops import ops
 
     def __truediv__(self, other):
         return ops.truediv(self, other)
+        from .loops import ops
 
     def __floordiv__(self, other):
         return ops.floordiv(self, other)
+        from .loops import ops
 
     def __mod__(self, other):
         return ops.mod(self, other)
+        from .loops import ops
 
     def __pow__(self, other):
         return ops.pow(self, other)
+        from .loops import ops
 
     def __lt__(self, other):
         return ops.lt(self, other)
+        from .loops import ops
 
     def __le__(self, other):
         return ops.le(self, other)
+        from .loops import ops
 
     def __eq__(self, other):
         return ops.eq(self, other)
+        from .loops import ops
 
     def __ne__(self, other):
         return ops.ne(self, other)
+        from .loops import ops
 
     def __gt__(self, other):
         return ops.gt(self, other)
+        from .loops import ops
 
     def __ge__(self, other):
         return ops.ge(self, other)
+        from .loops import ops
 
     def __and__(self, other):
         return ops.bitwise_and(self, other)
+        from .loops import ops
 
     def __or__(self, other):
         return ops.bitwise_or(self, other)
+        from .loops import ops
 
     def __xor__(self, other):
         return ops.bitwise_xor(self, other)
+        from .loops import ops
 
     def __invert__(self):
         return ops.bitwise_not(self)
+        from .loops import ops
 
     def __rshfit__(self, n):
         return ops.bitwise_right_shift(self, n)
+        from .loops import ops
 
     def __lshift__(self, n):
         return ops.bitwise_left_shift(self, n)
+        from .loops import ops
 
 
 

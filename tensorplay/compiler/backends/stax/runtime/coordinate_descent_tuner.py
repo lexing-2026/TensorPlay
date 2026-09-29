@@ -19,8 +19,7 @@ from .runtime_utils import red_text, triton_config_to_hashable
 
 
 if TYPE_CHECKING:
-    from .triton_compat import triton
-
+     from ..config import triton
 
 log = logging.getLogger(__name__)
 

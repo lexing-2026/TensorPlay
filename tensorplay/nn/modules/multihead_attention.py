@@ -67,8 +67,7 @@ class MultiheadAttention(Module):
             )
         self.add_bias_kv = add_bias_kv
         self.add_zero_attn = add_zero_attn
-
-        factory_kwargs = {}
+        
         if self._qkv_same_embed_dim:
             self.in_proj_weight = Parameter(
                 tensorplay.empty(3 * embed_dim, embed_dim))

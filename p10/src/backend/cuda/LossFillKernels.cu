@@ -19,6 +19,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <optional>
 #include <tuple>
 #include <type_traits>
@@ -63,6 +64,83 @@ __global__ void atomic_sum_kernel_t(int64_t n, const T* in, T* total) {
 template <typename T>
 __global__ void finalize_loss_scalar_kernel(const T* total, T* out, double scale) {
     out[0] = static_cast<T>(total[0] * scale);
+}
+
+// ---------------------------------------------------------------------------
+// Squared-difference reduction
+//
+// The reduced mean needs one scalar out of the whole tensor.  Folding every
+// element into a single address costs one contended atomic per element, which
+// on a batch-sized loss dominates the launch itself.  These two stages trade
+// that for a tree: each block reduces a fixed slice and writes one partial,
+// then a single block folds the partials.  Both stages accumulate in the loss
+// carry type, and the elementwise difference is folded into the first stage so
+// no per-element buffer is written or read back.
+//
+// The elements are read one at a time on purpose.  A packed load would need
+// the base address and the element count to be a multiple of four, and a loss
+// may sit on any offset of any shape; the scalar path reads the same bytes in
+// fully coalesced 32-wide transactions either way.
+
+// Upper bound on the first stage's block count, chosen so the partial buffer
+// stays small enough for the second stage to reduce in a single block.
+constexpr int64_t kLossReduceMaxBlocks = 1024;
+constexpr int kLossReduceBlock = 256;
+
+template <typename T>
+__global__ void loss_sq_diff_partial_kernel(int64_t n, const T* x, const T* t,
+                                            T* partials) {
+    __shared__ T warp_partials[kLossReduceBlock / 32];
+    const int64_t stride = static_cast<int64_t>(kLossReduceBlock) * gridDim.x;
+    T acc = T(0);
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * kLossReduceBlock +
+                     threadIdx.x;
+         i < n; i += stride) {
+        const T d = x[i] - t[i];
+        acc += d * d;
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_partials[warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        T total = (lane < kLossReduceBlock / 32) ? warp_partials[lane] : T(0);
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            total += __shfl_down_sync(0xffffffffu, total, offset);
+        }
+        if (lane == 0) partials[blockIdx.x] = total;
+    }
+}
+
+template <typename T>
+__global__ void loss_finish_partials_kernel(int64_t count, const T* partials,
+                                            T* out, double scale) {
+    __shared__ T warp_partials[kLossReduceBlock / 32];
+    T acc = T(0);
+    for (int64_t i = threadIdx.x; i < count; i += kLossReduceBlock) {
+        acc += partials[i];
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_partials[warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        T total = (lane < kLossReduceBlock / 32) ? warp_partials[lane] : T(0);
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            total += __shfl_down_sync(0xffffffffu, total, offset);
+        }
+        if (lane == 0) out[0] = static_cast<T>(total * static_cast<T>(scale));
+    }
 }
 
 // Host-side reduction for the loss families that still derive their scalar
@@ -478,8 +556,67 @@ Tensor mse_loss_cuda(const Tensor& input, const Tensor& target,
     }
     const DType acc = loss_accumulate_dtype(input.dtype());
     auto pr = pair_dev(input, target, acc);
+    const int64_t n = pr.first.numel();
+    if (reduction != 0) {
+        // A reduced loss wants one number, so the squared difference is never
+        // written out: the first stage folds it into a per-block partial and
+        // the second folds the partials.  A mean divides by the element count
+        // and a sum does not, which is the whole difference between the two.
+        const double scale =
+            (reduction == 1 && n) ? 1.0 / static_cast<double>(n) : 1.0;
+        Tensor result = Tensor::empty({}, acc, input.device());
+        if (!n) {
+            // Nothing to fold, so the answer is the zero the accumulator would
+            // have held.
+            Tensor total = Tensor::zeros({1}, acc, input.device());
+            if (acc == DType::Float64) {
+                finalize_loss_scalar_kernel<double><<<1, 1, 0,
+                    getCurrentCUDAStream().stream()>>>(
+                    total.data_ptr<double>(), result.data_ptr<double>(), scale);
+            } else {
+                finalize_loss_scalar_kernel<float><<<1, 1, 0,
+                    getCurrentCUDAStream().stream()>>>(
+                    total.data_ptr<float>(), result.data_ptr<float>(), scale);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return result.to(input.dtype());
+        }
+        {
+            const int64_t blocks = std::min<int64_t>(
+                (n + kLossReduceBlock - 1) / kLossReduceBlock,
+                kLossReduceMaxBlocks);
+            Tensor partials = Tensor::empty({blocks}, acc, input.device());
+            if (acc == DType::Float64) {
+                loss_sq_diff_partial_kernel<double>
+                    <<<static_cast<unsigned>(blocks), kLossReduceBlock, 0,
+                       getCurrentCUDAStream().stream()>>>(
+                        n, pr.first.data_ptr<double>(),
+                        pr.second.data_ptr<double>(),
+                        partials.data_ptr<double>());
+                CUDA_CHECK(cudaGetLastError());
+                loss_finish_partials_kernel<double>
+                    <<<1, kLossReduceBlock, 0,
+                       getCurrentCUDAStream().stream()>>>(
+                        blocks, partials.data_ptr<double>(),
+                        result.data_ptr<double>(), scale);
+            } else {
+                loss_sq_diff_partial_kernel<float>
+                    <<<static_cast<unsigned>(blocks), kLossReduceBlock, 0,
+                       getCurrentCUDAStream().stream()>>>(
+                        n, pr.first.data_ptr<float>(), pr.second.data_ptr<float>(),
+                        partials.data_ptr<float>());
+                CUDA_CHECK(cudaGetLastError());
+                loss_finish_partials_kernel<float>
+                    <<<1, kLossReduceBlock, 0,
+                       getCurrentCUDAStream().stream()>>>(
+                        blocks, partials.data_ptr<float>(),
+                        result.data_ptr<float>(), scale);
+            }
+            CUDA_CHECK(cudaGetLastError());
+        }
+        return result.to(input.dtype());
+    }
     Tensor elems = Tensor::empty(shape_of(pr.first), acc, input.device());
-    const int64_t n = elems.numel();
     if (n) {
         TensorIterator iter = TensorIteratorConfig()
             .check_all_same_dtype(true)
@@ -500,37 +637,7 @@ Tensor mse_loss_cuda(const Tensor& input, const Tensor& target,
         }
         CUDA_CHECK(cudaGetLastError());
     }
-    if (reduction == 0) {
-        return elems.to(input.dtype());
-    }
-    // Reduce and finalize on device; no device-to-host transfer.
-    Tensor total = Tensor::zeros({1}, acc, input.device());
-    if (n) {
-        if (acc == DType::Float64) {
-            atomic_sum_kernel_t<double><<<loss_grid(n), kThreads, 0,
-                                         getCurrentCUDAStream().stream()>>>(
-                n, elems.data_ptr<double>(), total.data_ptr<double>());
-        } else {
-            atomic_sum_kernel_t<float><<<loss_grid(n), kThreads, 0,
-                                        getCurrentCUDAStream().stream()>>>(
-                n, elems.data_ptr<float>(), total.data_ptr<float>());
-        }
-        CUDA_CHECK(cudaGetLastError());
-    }
-    const double scale =
-        (reduction == 1 && n) ? 1.0 / static_cast<double>(n) : 1.0;
-    Tensor result = Tensor::empty({}, acc, input.device());
-    if (acc == DType::Float64) {
-        finalize_loss_scalar_kernel<double><<<1, 1, 0,
-                                              getCurrentCUDAStream().stream()>>>(
-            total.data_ptr<double>(), result.data_ptr<double>(), scale);
-    } else {
-        finalize_loss_scalar_kernel<float><<<1, 1, 0,
-                                           getCurrentCUDAStream().stream()>>>(
-            total.data_ptr<float>(), result.data_ptr<float>(), scale);
-    }
-    CUDA_CHECK(cudaGetLastError());
-    return result.to(input.dtype());
+    return elems.to(input.dtype());
 }
 
 Tensor mse_loss_backward_cuda(const Tensor& grad_output, const Tensor& input,

@@ -615,6 +615,7 @@ max_epilogue_benchmarked_choices = int(
 # start of one.  Both change what the prepared kernel has to be able to do, so
 # both are off where nothing says otherwise.
 epilogue_fusion = os.environ.get("TP_EPILOGUE_FUSION", "1") == "1"
+epilogue_fusion_first = False
 prologue_fusion = os.environ.get("TP_PROLOGUE_FUSION", "1") == "1"
 
 # How many pieces one launch may hold.  Past this the code is too large to

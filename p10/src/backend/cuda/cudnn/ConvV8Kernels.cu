@@ -998,26 +998,51 @@ Tensor conv2d_grad_input_cuda(const Tensor& grad_output, const Tensor& input, co
                                                *dy_desc, grad_output_c.data_ptr(), *conv_desc,
                                                *dx_desc, grad_input.data_ptr(), input_c.device());
             } else {
+                // Ask for the single best candidate rather than the whole list.
+                // The list is in enumeration order, and the frequency-domain
+                // algorithms sit early in it, so taking the first entry that
+                // reports success out of the full list picks one of those over
+                // the cheaper implicit-gemm ones.  The top candidate is what
+                // the ranking is for; the full list is the fallback for when it
+                // cannot be built or run, and that pass starts after it so the
+                // candidate already tried is not tried twice.
                 cudnnConvolutionBwdDataAlgoPerf_t perf_results[CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT];
+                auto usable = [&](const cudnnConvolutionBwdDataAlgoPerf_t& p) {
+                    return p.status == CUDNN_STATUS_SUCCESS;
+                };
+                auto record = [&](int index) {
+                    size_t ws = 0;
+                    CUDNN_CHECK(cudnnGetConvolutionBackwardDataWorkspaceSize(
+                        handle, *w_desc, *dy_desc, *conv_desc, *dx_desc,
+                        perf_results[index].algo, &ws));
+                    entry = ConvBwdAlgo{static_cast<int>(perf_results[index].algo), ws};
+                };
+
                 int returned_algo_count = 0;
                 CUDNN_CHECK(cudnnGetConvolutionBackwardDataAlgorithm_v7(
                     handle, *w_desc, *dy_desc, *conv_desc, *dx_desc,
-                    CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT, &returned_algo_count,
-                    perf_results));
-                int chosen = -1;
-                for (int i = 0; i < returned_algo_count; ++i) {
-                    if (perf_results[i].status == CUDNN_STATUS_SUCCESS) {
-                        chosen = i;
-                        break;
+                    1, &returned_algo_count, perf_results));
+                bool found = false;
+                if (returned_algo_count > 0 && usable(perf_results[0])) {
+                    record(0);
+                    found = true;
+                }
+                if (!found) {
+                    CUDNN_CHECK(cudnnGetConvolutionBackwardDataAlgorithm_v7(
+                        handle, *w_desc, *dy_desc, *conv_desc, *dx_desc,
+                        CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT,
+                        &returned_algo_count, perf_results));
+                    for (int i = 0; i < returned_algo_count; ++i) {
+                        if (usable(perf_results[i])) {
+                            record(i);
+                            found = true;
+                            break;
+                        }
                     }
                 }
-                if (chosen < 0) {
+                if (!found) {
                     TP_THROW(RuntimeError, "cuDNN: no backward-data convolution algorithm");
                 }
-                size_t ws_size = 0;
-                CUDNN_CHECK(cudnnGetConvolutionBackwardDataWorkspaceSize(
-                    handle, *w_desc, *dy_desc, *conv_desc, *dx_desc, perf_results[chosen].algo, &ws_size));
-                entry = ConvBwdAlgo{static_cast<int>(perf_results[chosen].algo), ws_size};
             }
             {
                 std::lock_guard<std::mutex> lock(g_conv_bwd_cache_mutex);

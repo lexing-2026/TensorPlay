@@ -41,6 +41,8 @@ _LIST_VIEW_OPS = {
     'tensor_split': ('SplitBackward', 'TensorSplit', False),
 }
 
+_COMPOSITE_AUTOGRAD_WRAPPERS = frozenset({'dropout'})
+
 def _dedup_key(f: NativeFunction) -> str:
     return f.cpp_name + ':' + ','.join(cpp_arg_type(a.type) for a in f.args)
 
@@ -245,7 +247,11 @@ def _node_ctor_args(dv: OpDerivatives, f: NativeFunction,
 
 
 def _has_autograd(f: NativeFunction, derivatives: dict[str, OpDerivatives]) -> bool:
-    return f.func_name in derivatives or f.func_name == 'relu_'
+    return (
+        f.func_name in derivatives
+        or f.func_name == 'relu_'
+        or f.func_name in _COMPOSITE_AUTOGRAD_WRAPPERS
+    )
 
 
 def _emit_requires_grad_detection(lines, f):
@@ -440,6 +446,14 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
             )
 
         lines.append(f'{ret} {f.cpp_name}({", ".join(f"{t} {a.name}" for t, a in zip(arg_types, f.args))}) {{')
+
+        if f.func_name == 'dropout':
+            lines.append(
+                '    return std::get<0>(native_dropout(input, p, '
+                'std::optional<bool>(train)));')
+            lines.append('}')
+            lines.append('')
+            continue
 
         # ---- factory global-default resolution ------------------------------
         # Factory-style ops (no leading tensor receiver) honor the global

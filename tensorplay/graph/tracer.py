@@ -250,10 +250,13 @@ class Tracer:
         kwargs = node.kwargs
         if node.op == "get_attr":
             try:
-                value = self.root
-                for part in node.target.split("."):
-                    value = getattr(value, part)
-            except AttributeError:
+                if node.target in self._graph_attrs:
+                    value = self._graph_attrs[node.target]
+                else:
+                    value = self.root
+                    for part in node.target.split("."):
+                        value = getattr(value, part)
+            except (AttributeError, KeyError):
                 return
             self._node_samples[node.name] = value
             return
@@ -310,6 +313,44 @@ class Tracer:
         elif isinstance(value, tp.Tensor):
             node.meta["val"] = value
 
+    def create_arg(self, value: Any) -> Any:
+        if isinstance(value, Proxy):
+            return value.node
+        if isinstance(value, tp.Tensor):
+            for name, existing in self._graph_attrs.items():
+                if existing is value:
+                    return self.graph.get_attr(name)
+            name = f"_tensor_constant{len(self._graph_attrs)}"
+            while name in self._graph_attrs:
+                name = f"_tensor_constant{len(self._graph_attrs) + 1}"
+            self._graph_attrs[name] = value
+            return self.graph.get_attr(name)
+        if isinstance(value, tuple):
+            mapped = [self.create_arg(item) for item in value]
+            if hasattr(value, "_fields"):
+                return type(value)(*mapped)
+            try:
+                return type(value)(mapped)
+            except TypeError:
+                return tuple(mapped)
+        if isinstance(value, list):
+            return [self.create_arg(item) for item in value]
+        if isinstance(value, dict):
+            return {self.create_arg(key): self.create_arg(item) for key, item in value.items()}
+        if isinstance(value, slice):
+            return slice(
+                self.create_arg(value.start),
+                self.create_arg(value.stop),
+                self.create_arg(value.step),
+            )
+        if isinstance(value, range):
+            return range(
+                self.create_arg(value.start),
+                self.create_arg(value.stop),
+                self.create_arg(value.step),
+            )
+        return value
+
     def create_proxy(
         self,
         kind: str,
@@ -319,6 +360,8 @@ class Tracer:
     ) -> Proxy:
         if _capture_disabled.get():
             raise GraphCaptureError("graph capture is disabled for this operation")
+        args = self.create_arg(args)
+        kwargs = self.create_arg(kwargs)
         proxy = Proxy(self.graph.create_node(kind, target, args, kwargs), self)
         _apply_preserved_node_meta(proxy.node)
         # An operator standing for a whole region brings the shape of what it

@@ -28,7 +28,7 @@ from tensorplay.primitives.common import is_integer_dtype
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
 from .. import ir
 from ..dependencies import Dep
-from ..kernel_scheduler import BaseSchedulerNode, SchedulerBuffer
+from ..scheduler import BaseSchedulerNode, SchedulerBuffer
 from ..loops import ops, V
 from ..loop_body import LoopBody
 from ..utils import sympy_index_symbol_with_prefix, sympy_subs

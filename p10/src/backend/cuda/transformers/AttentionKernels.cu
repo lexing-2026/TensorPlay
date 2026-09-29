@@ -36,6 +36,14 @@
 #define FLASH_NAMESPACE tensorplay_native_flash
 #include "../../../../third_party/flash-attention/csrc/flash_attn/src/flash.h"
 #include "../../../../third_party/flash-attention/csrc/flash_attn/src/flash_fwd_kernel.h"
+// The forward launcher picks the kernel by element type, head width and causal
+// choice and is defined in a translation unit of its own, one leaf per file, so
+// that no file holds every instantiation at once.  It is declared here, inside
+// the namespace, because that is where the leaves it calls are declared.
+namespace tensorplay_native_flash {
+void run_mha_fwd(Flash_fwd_params& params, cudaStream_t stream,
+                 bool force_split_kernel = false);
+}  // namespace tensorplay_native_flash
 #include "../../../../third_party/flash-attention/csrc/flash_attn/src/flash_bwd_preprocess_kernel.h"
 #include "../../../../third_party/flash-attention/csrc/flash_attn/src/flash_bwd_kernel.h"
 #undef FLASH_NAMESPACE
@@ -107,6 +115,192 @@ __device__ inline T blockReduceSum(T val, T* smem) {
   if (threadIdx.x == 0) smem[0] = val;
   __syncthreads();
   return smem[0];
+}
+
+// ---------------------------------------------------------------------------
+// Fused short-sequence attention.
+//
+// One block owns one (batch, head) and keeps the whole score matrix in shared
+// memory, so the probabilities are never written out: the query tile, the
+// key tile and the value tile are staged, the scores are formed in place, the
+// row reduction runs on that buffer, and the product with the value tile
+// produces the output.  No part of a row is owned by a single lane, which is
+// what lets a short sequence cost a few microseconds rather than a few hundred.
+//
+// Two choices keep the shared reads cheap.  A row of each staged tile is
+// padded by one float, so a walk down the feature axis of a fixed row lands on
+// consecutive banks instead of one bank stride D times over.  Each thread then
+// holds a 4x4 patch of a product in registers, so an inner step costs eight
+// shared reads per sixteen multiply-adds rather than one read per
+// multiply-add.
+//
+// The host side admits a shape here only when the feature count is a multiple
+// of four, which is what lets the staged moves and the stores travel four
+// floats at a time, and only when the storage is a plain contiguous one, so the
+// base address is the allocator's and therefore aligned well past what a
+// four-float access needs.  Everything the gate declines keeps the kernel it
+// had.
+// ---------------------------------------------------------------------------
+
+constexpr int kSdpaFusedMaxTokens = 64;
+constexpr int kSdpaFusedMaxDim = 32;
+constexpr int kSdpaFusedThreads = 128;
+constexpr int kSdpaFusedTile = 4;
+
+template <typename DT>
+__global__ void sdpa_fused_short_kernel(
+    const DT* __restrict__ q, const DT* __restrict__ k,
+    const DT* __restrict__ v, DT* __restrict__ out,
+    float* __restrict__ lse_out, int64_t B, int64_t H, int64_t T, int64_t D,
+    float scale, bool is_causal) {
+  // The staged tiles are padded by one float along the feature axis and the
+  // score buffer by one float along the key axis, for the same reason.  The
+  // tile pad is four floats rather than one so a row of the tile still starts
+  // on a sixteen-byte boundary, which is what the four-float staged moves need.
+  const int dstride = static_cast<int>(D) + kSdpaFusedTile;
+  const int tstride = static_cast<int>(T) + 1;
+  extern __shared__ float smem[];
+  float* s_q = smem;
+  float* s_k = s_q + T * dstride;
+  float* s_v = s_k + T * dstride;
+  float* s_s = s_v + T * dstride;
+
+  const int64_t bh = static_cast<int64_t>(blockIdx.x);
+  const int64_t base = bh * T * D;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int nthreads = static_cast<int>(blockDim.x);
+
+  // Stage the three input tiles.  Their element count is a multiple of four
+  // because the feature count is, so a four-float move never straddles a row.
+  const int64_t count = T * D;
+  for (int64_t i = tid; i < count / 4; i += nthreads) {
+    const int64_t row = i / (D / 4);
+    const int64_t col = (i % (D / 4)) * 4;
+    const float4 qv = *reinterpret_cast<const float4*>(q + base + i * 4);
+    const float4 kv = *reinterpret_cast<const float4*>(k + base + i * 4);
+    const float4 vv = *reinterpret_cast<const float4*>(v + base + i * 4);
+    *reinterpret_cast<float4*>(s_q + row * dstride + col) = qv;
+    *reinterpret_cast<float4*>(s_k + row * dstride + col) = kv;
+    *reinterpret_cast<float4*>(s_v + row * dstride + col) = vv;
+  }
+  // The one-float pad after each row is never read, but leaving shared memory
+  // undefined is a trap for whoever reads the tile next, so clear it.
+  const int64_t padded = T * dstride;
+  for (int64_t i = count + tid; i < padded; i += nthreads) {
+    if (i % dstride >= D) {
+      s_q[i] = 0.f;
+      s_k[i] = 0.f;
+      s_v[i] = 0.f;
+    }
+  }
+  __syncthreads();
+  // Form the scores.  A thread owns a 4x4 patch, and the patch coordinates
+  // come from the flat patch index so every thread does the same work.
+  const int tiles = (static_cast<int>(T) + kSdpaFusedTile - 1) / kSdpaFusedTile;
+  const int ntiles = tiles * tiles;
+  for (int tile = tid; tile < ntiles; tile += nthreads) {
+    const int ti = tile / tiles;
+    const int tj = tile - ti * tiles;
+    const int i0 = ti * kSdpaFusedTile;
+    const int j0 = tj * kSdpaFusedTile;
+    float acc[kSdpaFusedTile][kSdpaFusedTile];
+#pragma unroll
+    for (int u = 0; u < kSdpaFusedTile; ++u)
+#pragma unroll
+      for (int w = 0; w < kSdpaFusedTile; ++w) acc[u][w] = 0.f;
+    for (int64_t d = 0; d < D; ++d) {
+      float a[kSdpaFusedTile];
+      float b[kSdpaFusedTile];
+#pragma unroll
+      for (int u = 0; u < kSdpaFusedTile; ++u)
+        a[u] = (i0 + u < T) ? s_q[(i0 + u) * dstride + d] : 0.f;
+#pragma unroll
+      for (int w = 0; w < kSdpaFusedTile; ++w)
+        b[w] = (j0 + w < T) ? s_k[(j0 + w) * dstride + d] : 0.f;
+#pragma unroll
+      for (int u = 0; u < kSdpaFusedTile; ++u)
+#pragma unroll
+        for (int w = 0; w < kSdpaFusedTile; ++w) acc[u][w] += a[u] * b[w];
+    }
+#pragma unroll
+    for (int u = 0; u < kSdpaFusedTile; ++u) {
+      if (i0 + u >= T) continue;
+      for (int w = 0; w < kSdpaFusedTile; ++w) {
+        const int j = j0 + w;
+        if (j >= T) continue;
+        // A causal call has no score past the query's own position.  Row zero
+        // always keeps its own key, so a row is never left without one and the
+        // normaliser is never taken from an empty row.
+        s_s[(i0 + u) * tstride + j] =
+            (is_causal && j > i0 + u) ? -INFINITY : acc[u][w] * scale;
+      }
+    }
+  }
+  __syncthreads();
+
+  // Row reduction over the staged scores.  One warp per row, so a row's
+  // maximum and its total are both tree reductions across the warp.  The
+  // shuffle reduction leaves the total in the first lane only, so it is passed
+  // back out to the whole warp before anyone uses it; a block-wide reduction
+  // cannot be used here, because warps on different rows reach it a different
+  // number of times.
+  const int warps = nthreads >> 5;
+  for (int64_t row = tid >> 5; row < T; row += warps) {
+    const int lane = tid & 31;
+    float mx = -INFINITY;
+    for (int j = lane; j < T; j += 32) mx = max(mx, s_s[row * tstride + j]);
+    mx = __shfl_sync(0xffffffffu, warpReduceMax(mx), 0);
+    float sum = 0.f;
+    for (int j = lane; j < T; j += 32) {
+      const float score = s_s[row * tstride + j];
+      const float p = isfinite(score) ? expf(score - mx) : 0.f;
+      s_s[row * tstride + j] = p;
+      sum += p;
+    }
+    sum = __shfl_sync(0xffffffffu, warpReduceSum(sum), 0);
+    const float inv = (sum > 0.f) ? (1.f / sum) : 0.f;
+    for (int j = lane; j < T; j += 32) s_s[row * tstride + j] *= inv;
+    if (lane == 0 && lse_out != nullptr) lse_out[bh * T + row] = mx + logf(sum);
+  }
+  __syncthreads();
+
+  // Product with the value tile, again a 4x4 patch per thread.
+  const int dtile_n = (static_cast<int>(D) + kSdpaFusedTile - 1) / kSdpaFusedTile;
+  const int dtiles = tiles * dtile_n;
+  for (int tile = tid; tile < dtiles; tile += nthreads) {
+    const int ti = tile / dtile_n;
+    const int tj = tile - ti * dtile_n;
+    const int i0 = ti * kSdpaFusedTile;
+    const int d0 = tj * kSdpaFusedTile;
+    float acc[kSdpaFusedTile][kSdpaFusedTile];
+#pragma unroll
+    for (int u = 0; u < kSdpaFusedTile; ++u)
+#pragma unroll
+      for (int w = 0; w < kSdpaFusedTile; ++w) acc[u][w] = 0.f;
+    for (int64_t j = 0; j < T; ++j) {
+      float p[kSdpaFusedTile];
+      float w[kSdpaFusedTile];
+#pragma unroll
+      for (int u = 0; u < kSdpaFusedTile; ++u)
+        p[u] = (i0 + u < T) ? s_s[(i0 + u) * tstride + j] : 0.f;
+#pragma unroll
+      for (int e = 0; e < kSdpaFusedTile; ++e)
+        w[e] = (d0 + e < D) ? s_v[j * dstride + d0 + e] : 0.f;
+#pragma unroll
+      for (int u = 0; u < kSdpaFusedTile; ++u)
+#pragma unroll
+        for (int e = 0; e < kSdpaFusedTile; ++e) acc[u][e] += p[u] * w[e];
+    }
+#pragma unroll
+    for (int u = 0; u < kSdpaFusedTile; ++u) {
+      if (i0 + u >= T) continue;
+#pragma unroll
+      for (int e = 0; e < kSdpaFusedTile; ++e) {
+        if (d0 + e >= D) continue;
+        out[base + (i0 + u) * D + d0 + e] = from_float<DT>(acc[u][e]);
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1100,256 +1294,303 @@ __global__ __launch_bounds__(256, 2) void sdpa_wmma_flash_half_aligned_kernel(
 #endif  // WMMA kernels require compute capability 7.0 or newer.
 
 #if defined(TP_HAS_NATIVE_CUTE_FLASH)
-// Which key positions a query may see.  Causal attention and a sliding window
-// are one mask with a different bound, but the kernel takes them as two
-// separate compile-time choices and refuses the combination, so the choice is
-// named here as the single thing it is rather than carried as two flags that
-// could be set in a way that contradicts each other.
-enum class SdpaMask { kNone, kCausal, kWindow };
-
-// Everything the fused schedule needs beyond the three tensors and their
-// shapes.  Grouped into one description because it is one launch: the mask and
-// its bounds, the packed-batch tables, and whether the caller wants the
+// What one launch needs beyond the three tensors: the two window bounds, the
+// sequence table when the batch is packed, and whether the caller wants the
 // normalizing constant handed back.
+//
+// The mask is not a field, because the reference does not carry one either: it
+// is what the two bounds say.  Causal is the window whose right bound is zero
+// with the left unbounded, and a window is anything else with a finite bound,
+// and the launcher below reads it off the bounds the way the reference does.
 struct SdpaFusedLaunch {
-  SdpaMask mask = SdpaMask::kNone;
-  // A negative bound leaves that side unbounded, which is the same value the
-  // kernel reads as "no bound".
-  int window_left = -1;
-  int window_right = -1;
-  // Non-null tables mean the sequences are packed back to back and the kernel
-  // finds each one's own extent from them; null means the tensors are already
-  // batched and the two lengths below are the only extents there are.
+  int64_t window_left = -1;
+  int64_t window_right = -1;
+  // A non-null table means the sequences sit back to back with nothing marking
+  // the joins, and the kernel finds each one's own extent from it.
   const int32_t* cu_seqlens_q = nullptr;
   const int32_t* cu_seqlens_k = nullptr;
   int64_t num_seqs = 1;
   int64_t max_seqlen_q = 0;
   int64_t max_seqlen_k = 0;
+  // How many key slices to cut the call into, or zero to let the split choice
+  // make it from the block count.  That is the same meaning the count carries
+  // on the call this schedule's entry point takes.
+  int num_splits = 0;
   Tensor* lse_out = nullptr;
 };
 
-// This is the exact native 64x64/4-warp schedule used by the aligned CUDA
-// path.  The wrapper only translates TensorPlay's [B,H,T,D] strides into the
-// boundary.  Head dimension and element type are compile-time parameters;
-// 96-wide heads and the bf16 element type share the fp16/128 schedule.
-template <SdpaMask Mask, bool IsEvenMN, int Headdim, typename ElementT>
-__global__ void tp_native_flash_kernel(
-    const ::tensorplay_native_flash::Flash_fwd_params params) {
-  // Flash_fwd_kernel_traits is intentionally a global layout type in the
-  // standalone source; only the executable helpers live in FLASH_NAMESPACE.
-  using Traits = Flash_fwd_kernel_traits<
-      Headdim, 64, 64, 4, false, false, ElementT>;
-  constexpr bool kCausal = Mask == SdpaMask::kCausal;
-  constexpr bool kLocal = Mask == SdpaMask::kWindow;
-  ::tensorplay_native_flash::compute_attn<
-      Traits, false, kCausal, kLocal, false, IsEvenMN, true, false, false>(
-      params);
+// Fill the reference's forward parameters from this tree's tensors and launch.
+//
+// The split schedule: a block covers a slice of the key axis rather than all of
+// it, which is what gives a short query against a long context enough blocks to
+// fill the device.  It needs a second pass, because each slice's softmax saw
+// only its own keys and so carries its own normalizer.
+//
+// The two pieces below are the reference's own split setup, transcribed because
+// the reference keeps them beside its tensor entry points rather than in a
+// header this layer reads: the choice of how many slices, and the buffers the
+// slices write for the reduction to read.
+
+// How many key slices to cut a call into.  Cutting costs a second pass over the
+// slices and extra writes, so a call that already fills the device is cut once.
+// Among the rest, the smallest cut that reaches 85% of the best occupancy the
+// cut sizes allow: a cut that divides the key blocks unevenly leaves a slice
+// short, and those sizes are skipped rather than scored.
+inline int sdpa_num_splits(int batch_nheads_mblocks, int num_sms,
+                           int num_n_blocks, int max_splits) {
+  if (batch_nheads_mblocks >= 0.8f * num_sms) return 1;
+  max_splits = std::min({max_splits, num_sms, num_n_blocks});
+  float max_efficiency = 0.f;
+  std::vector<float> efficiency;
+  efficiency.reserve(max_splits);
+  auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
+  auto is_split_eligible = [&ceildiv, &num_n_blocks](int n) {
+    return n == 1 || ceildiv(num_n_blocks, n) != ceildiv(num_n_blocks, n - 1);
+  };
+  for (int n = 1; n <= max_splits; n++) {
+    if (!is_split_eligible(n)) {
+      efficiency.push_back(0.f);
+      continue;
+    }
+    const float n_waves = float(batch_nheads_mblocks * n) / num_sms;
+    const float eff = n_waves / std::ceil(n_waves);
+    if (eff > max_efficiency) max_efficiency = eff;
+    efficiency.push_back(eff);
+  }
+  for (int n = 1; n <= max_splits; n++) {
+    if (!is_split_eligible(n)) continue;
+    if (efficiency[n - 1] >= 0.85f * max_efficiency) return n;
+  }
+  return 1;
 }
 
-template <SdpaMask Mask, int Headdim, typename ElementT>
-Tensor sdpa_native_cute_flash(
-    const Tensor& q, const Tensor& k, const Tensor& v,
-    int64_t B, int64_t Hq, int64_t Hkv, int64_t Tq, int64_t Tkv, int64_t D,
-    double scale, const SdpaFusedLaunch& launch);
+// The reference's split setup: the key block width here has to agree with the
+// one the split dispatch tiles by, and the two names it is written under are the
+// head width and the query's own length.  A caller that names no split count
+// gets the chosen one.  Returns the buffers the slices write, which the
+// reduction reads; they are handed back rather than kept local so that they
+// outlive the launches.
+struct SdpaSplitBuffers {
+  Tensor lse_accum;
+  Tensor out_accum;
+};
 
-template <SdpaMask Mask>
-Tensor sdpa_cute_flash_dispatch(
-    const Tensor& q, const Tensor& k, const Tensor& v,
-    int64_t B, int64_t Hq, int64_t Hkv, int64_t Tq, int64_t Tkv, int64_t D,
-    double scale, const SdpaFusedLaunch& launch) {
-  const DType dtype = q.dtype();
-  if (D == 32) {
-    if (dtype == DType::Float16) {
-      return sdpa_native_cute_flash<Mask, 32, cutlass::half_t>(
-          q, k, v, B, Hq, Hkv, Tq, Tkv, D, scale, launch);
-    }
-    return sdpa_native_cute_flash<Mask, 32, cutlass::bfloat16_t>(
-        q, k, v, B, Hq, Hkv, Tq, Tkv, D, scale, launch);
+SdpaSplitBuffers sdpa_set_params_splitkv(
+    ::tensorplay_native_flash::Flash_fwd_params& params, int64_t batch_size,
+    int64_t num_heads, int64_t head_size, int64_t max_seqlen_k,
+    int64_t max_seqlen_q, int64_t head_size_rounded, int num_splits,
+    const Device& device) {
+  // The key tile the split dispatch uses, spelled the same way so the two
+  // counts below are the same counts.
+  const int block_n =
+      head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
+  const int num_n_blocks = static_cast<int>((max_seqlen_k + block_n - 1) / block_n);
+  const int num_m_blocks = static_cast<int>((max_seqlen_q + 64 - 1) / 64);
+  params.num_splits = num_splits;
+  SdpaSplitBuffers buffers;
+  if (num_splits < 1) {
+    int num_sms = 0;
+    TP_CUDA_CHECK(cudaDeviceGetAttribute(
+        &num_sms, cudaDevAttrMultiProcessorCount,
+        getCurrentCUDAStream().device_index()));
+    // Twice the processor count is the occupancy budget, because a block here is
+    // 128 threads and two of them fit a processor.
+    params.num_splits = sdpa_num_splits(
+        static_cast<int>(batch_size * num_heads) * num_m_blocks, num_sms * 2,
+        num_n_blocks, 128);
   }
-  if (D == 128) {
-    if (dtype == DType::Float16) {
-      return sdpa_native_cute_flash<Mask, 128, cutlass::half_t>(
-          q, k, v, B, Hq, Hkv, Tq, Tkv, D, scale, launch);
-    }
-    return sdpa_native_cute_flash<Mask, 128, cutlass::bfloat16_t>(
-        q, k, v, B, Hq, Hkv, Tq, Tkv, D, scale, launch);
+  if (params.num_splits > 1) {
+    buffers.lse_accum = Tensor::empty(
+        {params.num_splits, batch_size, num_heads, max_seqlen_q},
+        DType::Float32, device);
+    buffers.out_accum = Tensor::empty(
+        {params.num_splits, batch_size, num_heads, max_seqlen_q,
+         head_size_rounded},
+        DType::Float32, device);
+    params.softmax_lseaccum_ptr = buffers.lse_accum.data_ptr<float>();
+    params.oaccum_ptr = buffers.out_accum.data_ptr<float>();
   }
-  if (D == 96) {
-    if (dtype == DType::Float16) {
-      return sdpa_native_cute_flash<Mask, 96, cutlass::half_t>(
-          q, k, v, B, Hq, Hkv, Tq, Tkv, D, scale, launch);
-    }
-    return sdpa_native_cute_flash<Mask, 96, cutlass::bfloat16_t>(
-        q, k, v, B, Hq, Hkv, Tq, Tkv, D, scale, launch);
+  if (params.num_splits > 128) {
+    TP_THROW(RuntimeError, "num_splits > 128 not supported");
   }
-  if (dtype == DType::Float16) {
-    return sdpa_native_cute_flash<Mask, 64, cutlass::half_t>(
-        q, k, v, B, Hq, Hkv, Tq, Tkv, D, scale, launch);
-  }
-  return sdpa_native_cute_flash<Mask, 64, cutlass::bfloat16_t>(
-      q, k, v, B, Hq, Hkv, Tq, Tkv, D, scale, launch);
+  return buffers;
 }
 
-template <SdpaMask Mask, int Headdim, typename ElementT>
-Tensor sdpa_native_cute_flash(
-    const Tensor& q, const Tensor& k, const Tensor& v,
-    int64_t B, int64_t Hq, int64_t Hkv, int64_t Tq, int64_t Tkv, int64_t D,
-    double scale, const SdpaFusedLaunch& launch) {
-  using Traits = Flash_fwd_kernel_traits<
-      Headdim, 64, 64, 4, false, false, ElementT>;
-  using Params = ::tensorplay_native_flash::Flash_fwd_params;
+// Every field is set here under the reference's own name, so what is set and
+// what the kernel reads are the same thing spelled once.  The three strides are
+// in the reference's logical order -- batch, then token, then head -- which is
+// not always the caller's own order: a packed tensor puts the token and head
+// axes the other way round from a batched one, so they are taken from the
+// layout at hand rather than assumed.
+//
+// A packed batch is not a separate call.  The kernels read the sequence table
+// out of these parameters, so the same call serves both layouts and the grid
+// is the one the reference computes: one block per query tile of the longest
+// sequence, per sequence, per query head.
+std::tuple<Tensor, Tensor> sdpa_fused_forward_cuda(
+    const Tensor& query, const Tensor& key, const Tensor& value,
+    const SdpaFusedLaunch& launch, std::optional<double> scale, bool enable_gqa) {
+  const bool packed = launch.cu_seqlens_q != nullptr;
+  const int64_t rank = query.dim();
+  TP_CHECK(packed ? rank == 3 : rank == 4, "sdpa fused: expected ",
+           packed ? "a packed (total, heads, dim) query" : "a 4-axis query",
+           ", got ", rank, " axes");
+  // The schedule vectorises its innermost dimension, so a head axis that is
+  // not the contiguous one is materialized; every other axis is addressed by
+  // the caller's real strides and is consumed as given.
+  auto head_contiguous = [](const Tensor& t) {
+    return t.stride(-1) == 1 ? t : t.contiguous();
+  };
+  const Tensor q = head_contiguous(query);
+  const Tensor k = head_contiguous(key);
+  const Tensor v = head_contiguous(value);
+  // A packed tensor is (total, heads, dim) and only gains a leading axis to be
+  // read, so its heads sit one axis later than a batched tensor's.
+  const Tensor q4 = packed ? q.unsqueeze(0) : q;
+  const Tensor k4 = packed ? k.unsqueeze(0) : k;
+  const Tensor v4 = packed ? v.unsqueeze(0) : v;
+  const int64_t B = packed ? 1 : q4.size(0);
+  const int64_t head_axis = packed ? 2 : 1;
+  const int64_t row_axis = packed ? 1 : 2;
+  const int64_t Hq = q4.size(head_axis);
+  const int64_t Hkv = enable_gqa ? k4.size(head_axis) : Hq;
+  const int64_t Tq = q4.size(row_axis);
+  const int64_t Tkv = k4.size(row_axis);
+  const int64_t D = q4.size(3);
 
-  // A table of sequence extents means the tokens of every sequence sit back to
-  // back in one tensor.  The tensor is then indexed by total tokens rather
-  // than by a batch axis, and the constant is reported over the heads and the
-  // total, which is the layout that indexing implies.
-  //
-  // The output is allocated for the whole run rather than for one such run per
-  // sequence: the kernel places each sequence's tokens at its own offset inside
-  // it, so an allocation sized per sequence would be as many times too large
-  // and would leave the tail untouched.
-  const bool varlen = launch.cu_seqlens_q != nullptr;
-  TP_CHECK(!varlen || B == 1,
-           "sdpa fused varlen: expected a packed tensor, got batch ", B);
-  const int64_t grid_b = varlen ? launch.num_seqs : B;
-  Tensor out = Tensor::empty({varlen ? 1 : B, Hq, Tq, D}, q.dtype(), q.device());
-  // The standalone flash epilogue writes the constant whether or not the caller
-  // asked for it, so it is always allocated; exposing it costs nothing and
-  // saving it would mean a second pass over the scores.
-  Tensor lse = varlen ? Tensor::empty({Hq, Tq}, DType::Float32, q.device())
+  // A decode step is one query row against a long context, and a block per
+  // query tile is then a block for the whole device.  Reading the group as the
+  // row axis puts several query heads in one tile, which is what the reference
+  // does for the same shape and under the same conditions: one query row, more
+  // query heads than key heads, and no bound tying row i to key i.
+  if (!packed && launch.window_left < 0 && launch.window_right < 0 &&
+      enable_gqa && Tq == 1 && Hq > Hkv) {
+    const int64_t group = Hq / Hkv;
+    SdpaFusedLaunch flat = launch;
+    Tensor q_grouped = tpx::ops::reshape(q4, {B, Hkv, group, D});
+    auto [out, lse] = sdpa_fused_forward_cuda(q_grouped, k4, v4, flat, scale,
+                                              /*enable_gqa=*/false);
+    // The result already lands on query head hk * group + s, so putting the
+    // group back is a view.  Its constant has one row per group rather than
+    // one per query head, so it is left empty rather than handed back in a
+    // shape that would be read wrongly.
+    return {tpx::ops::reshape(out, {B, Hq, Tq, D}), Tensor()};
+  }
+
+  // The output of a packed call is the whole run of tokens, not one such run
+  // per sequence: the kernel places each sequence's tokens at its own offset
+  // inside it, so an allocation sized per sequence would be as many times too
+  // large and would leave the tail untouched.
+  const int64_t grid_b = packed ? launch.num_seqs : B;
+  Tensor out = Tensor::empty({packed ? 1 : B, Hq, Tq, D}, q.dtype(), q.device());
+  Tensor lse = packed ? Tensor::empty({Hq, Tq}, DType::Float32, q.device())
                       : Tensor::empty({B, Hq, Tq}, DType::Float32, q.device());
 
-  Params params{};
+  ::tensorplay_native_flash::Flash_fwd_params params{};
   params.q_ptr = q.data_ptr();
   params.k_ptr = k.data_ptr();
   params.v_ptr = v.data_ptr();
   params.o_ptr = out.data_ptr();
-  // FlashAttention's logical coordinates are [batch, token, head, dim],
-  // while TensorPlay exposes [batch, head, token, dim].  Use the tensor's
-  // real strides for the first three coordinates; this lets the native
-  // kernel consume a transposed V view without a staging copy.
-  params.q_batch_stride = q.stride(0);
-  params.k_batch_stride = k.stride(0);
-  params.v_batch_stride = v.stride(0);
-  params.q_row_stride = q.stride(2);
-  params.k_row_stride = k.stride(2);
-  params.v_row_stride = v.stride(2);
-  params.q_head_stride = q.stride(1);
-  params.k_head_stride = k.stride(1);
-  params.v_head_stride = v.stride(1);
-  // Grouped-query heads: the kernel reads the key/value head as
-  // bidh / ratio, so one key head serves a contiguous block of ratio query
-  // heads -- the same block mapping the composed path expands to.
-  params.h = static_cast<int>(Hq);
-  params.h_k = static_cast<int>(Hkv);
-  params.h_h_k_ratio = static_cast<int>(Hq / Hkv);
+  params.softmax_lse_ptr = lse.data_ptr<float>();
+  params.q_batch_stride = q4.stride(0);
+  params.k_batch_stride = k4.stride(0);
+  params.v_batch_stride = v4.stride(0);
+  params.q_row_stride = q4.stride(row_axis);
+  params.k_row_stride = k4.stride(row_axis);
+  params.v_row_stride = v4.stride(row_axis);
+  params.q_head_stride = q4.stride(head_axis);
+  params.k_head_stride = k4.stride(head_axis);
+  params.v_head_stride = v4.stride(head_axis);
   params.o_batch_stride = out.stride(0);
   params.o_row_stride = out.stride(2);
   params.o_head_stride = out.stride(1);
-  params.p_ptr = nullptr;
-  params.softmax_lse_ptr = lse.data_ptr<float>();
-  params.b = static_cast<int>(B);
-  // The two lengths are carried separately, so a query shorter or longer than
-  // its context is a shape this expresses rather than one it approximates.
-  // A packed call reports the longest sequence in the batch here; each block
-  // then reads its own sequence's extent from the table, and the values here
-  // only bound the grid and the rounding.
-  const int64_t seqlen_q = varlen ? launch.max_seqlen_q : Tq;
-  const int64_t seqlen_k = varlen ? launch.max_seqlen_k : Tkv;
+  // Grouped-query heads: the kernel reads the key head as bidh / ratio, so one
+  // key head serves a contiguous block of ratio query heads.
+  params.h = static_cast<int>(Hq);
+  params.h_k = static_cast<int>(Hkv);
+  params.h_h_k_ratio = static_cast<int>(Hq / Hkv);
+  params.b = static_cast<int>(grid_b);
+  // A packed call reports the longest sequence here; each block reads its own
+  // sequence's extent from the table, and these values only bound the grid.
+  const int64_t seqlen_q = packed ? launch.max_seqlen_q : Tq;
+  const int64_t seqlen_k = packed ? launch.max_seqlen_k : Tkv;
   params.seqlen_q = static_cast<int>(seqlen_q);
   params.seqlen_k = static_cast<int>(seqlen_k);
-  params.seqlen_knew = 0;
-  params.d = static_cast<int>(D);
   params.seqlen_q_rounded = static_cast<int>((seqlen_q + 127) / 128 * 128);
   params.seqlen_k_rounded = static_cast<int>((seqlen_k + 127) / 128 * 128);
+  params.seqlen_knew = 0;
+  params.d = static_cast<int>(D);
   params.d_rounded = static_cast<int>(D);
   params.rotary_dim = 0;
-  params.total_q = static_cast<int>(Tq * B);
+  params.total_q = static_cast<int>(Tq * grid_b);
+  params.cu_seqlens_q = const_cast<int32_t*>(launch.cu_seqlens_q);
+  params.cu_seqlens_k = const_cast<int32_t*>(
+      launch.cu_seqlens_k != nullptr ? launch.cu_seqlens_k : launch.cu_seqlens_q);
+  // The tables hold running totals, so a block reads its own start and its own
+  // extent by differencing two entries.
+  params.is_seqlens_k_cumulative = packed;
+  // Over a packed batch the constant has no batch axis to sit on: the heads and
+  // the total token count are what index it, which is the layout the packed
+  // callers declare.
+  params.unpadded_lse = packed;
+  params.seqlenq_ngroups_swapped = false;
+
+  // Both window bounds are measured from the diagonal running from the top
+  // left corner to the bottom right one, which the kernel applies itself from
+  // the two lengths; what arrives here is how far either side reaches.  A
+  // negative bound is unbounded, and the kernel is given a reach rather than a
+  // sentinel: the reference rewrites such a bound to the key length, and this
+  // is that rewrite.  Causal is the case the reference names by the bounds
+  // alone -- right bound zero, left not -- and it is read that way here too.
+  int64_t window_left = launch.window_left;
+  int64_t window_right = launch.window_right;
+  params.is_causal = window_left < 0 && window_right == 0;
+  if (window_left < 0 && window_right >= 0) window_left = seqlen_k;
+  if (window_left >= 0 && window_right < 0) window_right = seqlen_k;
+  params.window_size_left = static_cast<int>(window_left);
+  params.window_size_right = static_cast<int>(window_right);
+
   // The score normaliser is the caller's scale when one was given, and the
   // head width's reciprocal square root otherwise.
-  params.scale_softmax = static_cast<float>(scale);
+  const double s =
+      scale.has_value() ? *scale : 1.0 / std::sqrt(static_cast<double>(D));
+  params.scale_softmax = static_cast<float>(s);
   params.scale_softmax_log2 = params.scale_softmax * 1.4426950408889634f;
-  // FlashAttention stores the keep probability (not the drop probability).
-  // Keep these fields identical to its no-dropout launch contract even though
-  // this translation unit instantiates Is_dropout=false.
+  // These carry the no-dropout launch contract; the schedule drops nothing.
   params.p_dropout = 1.f;
   params.p_dropout_in_uint8_t = 255;
   params.rp_dropout = 1.f;
   params.scale_softmax_rp_dropout = params.scale_softmax;
-  // Both window bounds are measured from the diagonal that runs from the top
-  // left corner to the bottom right one, which the kernel applies itself using
-  // the two lengths, so all that arrives here is how far either side reaches.
-  // Causal attention is the window with the right bound at zero and the left
-  // unbounded, and the composed path puts the diagonal at the top left; the
-  // two agree for equal lengths, and the composed path is what the caller
-  // compares against for unequal ones.
-  params.window_size_left =
-      Mask == SdpaMask::kWindow ? launch.window_left : -1;
-  params.window_size_right = Mask == SdpaMask::kWindow
-                                 ? launch.window_right
-                                 : (Mask == SdpaMask::kCausal
-                                        ? static_cast<int>(Tq - Tkv)
-                                        : -1);
-  params.cu_seqlens_q =
-      const_cast<int*>(launch.cu_seqlens_q);
-  params.cu_seqlens_k =
-      const_cast<int*>(launch.cu_seqlens_k != nullptr ? launch.cu_seqlens_k
-                                                      : launch.cu_seqlens_q);
-  // The tables hold running totals of the sequence lengths, so a block reads
-  // its own start and its own extent by differencing two entries.
-  params.is_seqlens_k_cumulative = varlen;
-  // Over a packed batch the constant has no batch axis to sit on: the heads
-  // and the total token count are what index it, which is also the layout the
-  // packed callers declare.
-  params.unpadded_lse = varlen;
   params.softcap = 0.f;
   params.rng_state = nullptr;
-  params.is_bf16 = std::is_same<ElementT, cutlass::bfloat16_t>::value;
-  params.is_causal = Mask == SdpaMask::kCausal;
-  params.is_seqlens_k_cumulative = false;
+  params.is_bf16 = q.dtype() == DType::BFloat16;
   params.is_rotary_interleaved = false;
-  params.num_splits = 1;
   params.alibi_slopes_ptr = nullptr;
   params.alibi_slopes_batch_stride = 0;
-  params.seqlenq_ngroups_swapped = false;
+  params.leftpad_k = nullptr;
+  params.seqused_k = nullptr;
+  params.knew_ptr = nullptr;
+  params.vnew_ptr = nullptr;
+  params.cache_batch_idx = nullptr;
+  params.block_table = nullptr;
+  params.page_block_size = 0;
+  // The block count is what decides the cut, not the shape: a call that already
+  // fills the device is cut once, however long its context is.  A packed batch
+  // is left alone because its extents come from a table rather than a length.
+  const SdpaSplitBuffers split = packed
+      ? SdpaSplitBuffers{}
+      : sdpa_set_params_splitkv(params, grid_b, Hq, D, Tkv, Tq, D,
+                                launch.num_splits, q.device());
 
-  // Whether the tile that is being computed ends exactly on a boundary is a
-  // property of the lengths, and over a packed batch it is a property of the
-  // longest sequence: any sequence shorter than that ends on a boundary only
-  // by accident, so one answer has to cover all of them and the safe answer is
-  // that none do.
-  const bool even_mn = !varlen && (seqlen_q & 63) == 0 && (seqlen_k & 63) == 0;
-
-  // Shared-memory headroom is a property of each instantiation, so the
-  // attribute is raised per call (the driver call is cheap next to the
-  // kernel launch it enables).
-  TP_CUDA_CHECK(cudaFuncSetAttribute(
-      tp_native_flash_kernel<Mask, true, Headdim, ElementT>,
-      cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemSize));
-  TP_CUDA_CHECK(cudaFuncSetAttribute(
-      tp_native_flash_kernel<Mask, false, Headdim, ElementT>,
-      cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemSize));
-
-  // One block per 64-query tile, per sequence, per query head.  The block
-  // count follows the query length and the query head count; the key/value
-  // side is reached through the ratio and the key length carried in the
-  // params.  A block whose tile starts past the end of its own sequence
-  // returns before doing any work, so the tile extent here is the longest one
-  // any sequence needs rather than each sequence's own.
-  dim3 grid((static_cast<unsigned>(seqlen_q) + 63u) / 64u,
-            static_cast<unsigned>(grid_b), static_cast<unsigned>(Hq));
-  if (even_mn) {
-    tp_native_flash_kernel<Mask, true, Headdim, ElementT><<<
-        grid, Traits::kNThreads, Traits::kSmemSize,
-        getCurrentCUDAStream().stream()>>>(params);
-  } else {
-    tp_native_flash_kernel<Mask, false, Headdim, ElementT><<<
-        grid, Traits::kNThreads, Traits::kSmemSize,
-        getCurrentCUDAStream().stream()>>>(params);
-  }
+  ::tensorplay_native_flash::run_mha_fwd(
+      params, getCurrentCUDAStream().stream(),
+      /*force_split_kernel=*/params.num_splits > 1);
   TP_CUDA_CHECK(cudaGetLastError());
   if (launch.lse_out) *launch.lse_out = lse;
-  return out;
+  // The schedule answers with the head on the second axis; each contract names
+  // its own order and restates it.  A packed result is already the whole token
+  // run, which is the order a packed contract names.
+  return {packed ? out.reshape({Tq, Hq, D}) : out, lse};
 }
 #endif
 
@@ -1407,6 +1648,8 @@ __global__ void sdpa_backward_probs_kernel(
   }
   __syncthreads();
 
+  // The scores this kernel wrote are normalized in place, so what leaves it is
+  // the probability row the two consumers below read.
   float local_max = -INFINITY;
   for (int64_t kk = threadIdx.x; kk < T; kk += blockDim.x)
     local_max = max(local_max, p_row[kk]);
@@ -1422,7 +1665,7 @@ __global__ void sdpa_backward_probs_kernel(
   const float total_exp = blockReduceSum(local_sum, reduce_smem);
 
   for (int64_t kk = threadIdx.x; kk < T; kk += blockDim.x)
-    p_row[kk] /= total_exp;
+    p_row[kk] = p_row[kk] / total_exp;
 }
 
 template <typename DT>
@@ -1450,9 +1693,31 @@ __global__ void sdpa_backward_dprob_kernel(
   dprob[idx] = dot;
 }
 
+// The row statistic that the score gradient subtracts.  Written once per query
+// row -- one value for every (batch, head, query) triple -- so the score
+// gradient is a single pass that reads it, rather than a pass that re-reduces
+// the whole row at every element of it.  A row is owned by one block, which is
+// what lets the reduction over it be a block reduction.
+__global__ void sdpa_backward_delta_kernel(
+    const float* __restrict__ probs, const float* __restrict__ dprob,
+    float* __restrict__ delta, int64_t num_query_rows, int64_t T) {
+  const int64_t r = static_cast<int64_t>(blockIdx.x);
+  if (r >= num_query_rows) return;
+  const float* p_row = probs + r * T;
+  const float* dp_row = dprob + r * T;
+  float local = 0.f;
+  for (int64_t j = threadIdx.x; j < T; j += blockDim.x)
+    local += p_row[j] * dp_row[j];
+  __shared__ float reduce_smem[32];
+  delta[r] = blockReduceSum(local, reduce_smem);
+}
+
+// dS[t, j] = P[t, j] * (dP[t, j] - delta[t]).  The row statistic arrives
+// already reduced, so this pass is the score matrix and nothing else.
 __global__ void sdpa_backward_dscore_kernel(
     const float* __restrict__ probs, const float* __restrict__ dprob,
-    float* __restrict__ dscore, int64_t rows, int64_t T, float scale) {
+    const float* __restrict__ delta, float* __restrict__ dscore, int64_t rows,
+    int64_t T, float scale) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t total = rows * T * T;
   if (idx >= total) return;
@@ -1462,9 +1727,7 @@ __global__ void sdpa_backward_dscore_kernel(
   const int64_t bh = tmp;
   const float* p_row = probs + (bh * T + t) * T;
   const float* dp_row = dprob + (bh * T + t) * T;
-  float row_dot = 0.f;
-  for (int64_t j = 0; j < T; ++j) row_dot += p_row[j] * dp_row[j];
-  dscore[idx] = p_row[kk] * (dp_row[kk] - row_dot) * scale;
+  dscore[idx] = p_row[kk] * (dp_row[kk] - delta[bh * T + t]) * scale;
 }
 
 template <typename DT>
@@ -1566,9 +1829,17 @@ std::tuple<Tensor, Tensor, Tensor> sdpa_backward_impl(
   sdpa_backward_dprob_kernel<DT><<<blocks(rows * T * T), threads, 0, stream>>>(
       grad_output.data_ptr<DT>(), value.data_ptr<DT>(), dprob.data_ptr<float>(),
       rows, H, T, D, go_strides, v_strides);
+  // `rows` counts (batch, head) pairs, so the score matrix holds rows * T query
+  // rows of T scores each, and the row statistic has one entry per query row.
+  const int64_t query_rows = rows * T;
+  Tensor delta = Tensor::empty({query_rows}, DType::Float32, query.device());
+  sdpa_backward_delta_kernel<<<
+      static_cast<unsigned>(query_rows), 128, 0, stream>>>(
+      probs.data_ptr<float>(), dprob.data_ptr<float>(),
+      delta.data_ptr<float>(), query_rows, T);
   sdpa_backward_dscore_kernel<<<blocks(rows * T * T), threads, 0, stream>>>(
-      probs.data_ptr<float>(), dprob.data_ptr<float>(), dscore.data_ptr<float>(),
-      rows, T, 1.f / sqrtf(static_cast<float>(D)));
+      probs.data_ptr<float>(), dprob.data_ptr<float>(), delta.data_ptr<float>(),
+      dscore.data_ptr<float>(), rows, T, 1.f / sqrtf(static_cast<float>(D)));
   sdpa_backward_dq_kernel<DT><<<blocks(rows * T * D), threads, 0, stream>>>(
       dscore.data_ptr<float>(), key.data_ptr<DT>(), d_q.data_ptr<DT>(),
       rows, H, T, D, k_strides);
@@ -1916,6 +2187,35 @@ Tensor sdpa_kernel_cuda_plain(const Tensor& query, const Tensor& key,
 
   constexpr int kThreads = 256;
 
+  // A short sequence with a narrow head is answered by the fused kernel: the
+  // whole score matrix fits in one block's shared memory, so it never reaches
+  // global memory and the row reduction is a tree instead of a single lane's
+  // serial pass.  The gate is the one a four-float access needs anyway: a
+  // feature count that is a multiple of four, a storage offset that keeps the
+  // base address on a sixteen-byte boundary, and contiguous storage so the base
+  // is the allocator's own.  A shape outside the gate is not slower for having
+  // been turned away; it keeps the kernel it had.
+  const auto offset_aligned = [](const Tensor& t) {
+    return (t.storage_offset() * static_cast<int64_t>(t.itemsize())) % 16 == 0;
+  };
+  if (impl == 0 && dtype == DType::Float32 && T > 0 && T <= kSdpaFusedMaxTokens &&
+      D > 0 && D <= kSdpaFusedMaxDim && (D % 4) == 0 &&
+      q.is_contiguous() && k.is_contiguous() && v.is_contiguous() &&
+      offset_aligned(q) && offset_aligned(k) && offset_aligned(v)) {
+    const int dstride = static_cast<int>(D) + 1;
+    const int tstride = static_cast<int>(T) + 1;
+    const size_t smem = static_cast<size_t>(3 * T * dstride + T * tstride) *
+                        sizeof(float);
+    Tensor out = Tensor::empty({B, H, T, D}, dtype, q.device());
+    sdpa_fused_short_kernel<float>
+        <<<static_cast<unsigned>(B * H), kSdpaFusedThreads, smem,
+           getCurrentCUDAStream().stream()>>>(
+            q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
+            out.data_ptr<float>(), nullptr, B, H, T, D, scale, is_causal);
+    TP_CUDA_CHECK(cudaGetLastError());
+    return out;
+  }
+
   // Default (impl=0) routing: fp16/bf16 with head_dim 32/64/96/128 takes the
   // tensor-core flash path, which beats the warp-per-row kernel on compact
   // GPUs; every other supported dtype at head_dim <= 128 keeps the
@@ -2083,12 +2383,11 @@ Tensor sdpa_kernel_cuda_plain(const Tensor& query, const Tensor& key,
     // its internal predicate schedule is also needed by autoregressive decode
     // once T grows past a multiple of 64.
     SdpaFusedLaunch launch;
-    if (is_causal) {
-      return sdpa_cute_flash_dispatch<SdpaMask::kCausal>(
-          q, k, v, B, H, H, T, T, D, scale, launch);
-    }
-    return sdpa_cute_flash_dispatch<SdpaMask::kNone>(
-        q, k, v, B, H, H, T, T, D, scale, launch);
+    // Causal is the window whose right bound is zero with the left unbounded;
+    // the launcher reads the mask off the bounds the same way.
+    launch.window_right = is_causal ? 0 : -1;
+    return std::get<0>(
+        sdpa_fused_forward_cuda(q, k, v, launch, scale, /*enable_gqa=*/false));
 #elif defined(USE_ROCM) || !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 700)
     Tensor out = Tensor::empty({B, H, T, D}, dtype, q.device());
     // The native 64x64 schedule deliberately requires the original aligned
@@ -2215,111 +2514,13 @@ Tensor sdpa_gemm_cross_cuda(const Tensor& query, const Tensor& key,
 //
 // A packed batch arrives as (total, heads, dim) with no batch axis at all, so
 // it is read as a batch of one whose single sequence is the whole packed run;
-// the launcher then replaces that one with the number of sequences the table
-// names, and each block finds its own sequence inside it.
-std::tuple<Tensor, Tensor> sdpa_fused_launch_cuda(
-    const Tensor& query, const Tensor& key, const Tensor& value,
-    const SdpaFusedLaunch& launch, std::optional<double> scale, bool enable_gqa) {
-  int major = 0;
-  TP_CUDA_CHECK(cudaDeviceGetAttribute(
-      &major, cudaDevAttrComputeCapabilityMajor,
-      getCurrentCUDAStream().device_index()));
-  if (major < 8) {
-    TP_THROW(NotImplementedError,
-             "sdpa: the fused attention schedule needs compute capability 8.0 "
-             "or newer");
-  }
-  const bool packed = launch.cu_seqlens_q != nullptr;
-  const int64_t rank = query.dim();
-  if (packed ? (rank != 3) : (rank != 4)) {
-    TP_THROW(ValueError, "sdpa fused: expected ",
-             packed ? "a packed (total, heads, dim) query" : "a 4-axis query",
-             ", got ", rank, " axes");
-  }
-  // The schedule vectorises its innermost dimension, so a head axis that is
-  // not the contiguous one is materialized; every other axis is addressed by
-  // the caller's real strides and is consumed as given.
-  auto head_contiguous = [](const Tensor& t) {
-    return t.stride(-1) == 1 ? t : t.contiguous();
-  };
-  const Tensor q = head_contiguous(query);
-  const Tensor k = head_contiguous(key);
-  const Tensor v = head_contiguous(value);
-  // Packed tensors are given a batch axis of one; the strides of the view are
-  // the real ones on the axes that exist, and the leading axis is never
-  // addressed because the kernel multiplies it by the sequence count.
-  const Tensor q4 = packed ? q.unsqueeze(0) : q;
-  const Tensor k4 = packed ? k.unsqueeze(0) : k;
-  const Tensor v4 = packed ? v.unsqueeze(0) : v;
-  // A packed tensor is (total, heads, dim) and only gains a leading axis to be
-  // read, so its heads sit one axis later than a batched tensor's; reading them
-  // by the batched positions would name the token count as the head count.
-  const int64_t B = packed ? 1 : q4.size(0);
-  const int64_t head_axis = packed ? 2 : 1;
-  const int64_t row_axis = packed ? 1 : 2;
-  const int64_t Hq = q4.size(head_axis);
-  const int64_t Hkv = enable_gqa ? k4.size(head_axis) : Hq;
-  const int64_t Tq = q4.size(row_axis);
-  const int64_t Tkv = k4.size(row_axis);
-  const int64_t D = q4.size(3);
-  // An explicit normaliser replaces the head width's reciprocal square root.
-  const double s = scale.has_value() ? *scale
-                                     : 1.0 / std::sqrt(static_cast<double>(D));
-
-  // A single query row against a longer context, with grouped heads, is a
-  // decode step.  This schedule tiles 64 query rows, so one row per block walks
-  // the whole key context to produce one row of output -- and with grouped
-  // heads, once per query head rather than once per key head.  Every row of one
-  // group reads the same key head, so reading the group as the query's row axis
-  // puts g useful rows into a tile that loads the key once for the whole group.
-  // This is the same axis swap the schedule's own library makes, under the same
-  // conditions: one query row, more query heads than key heads, and no causal
-  // or window bound tying row i to key i.  A bounded decode keeps its own
-  // alignment and stays on the per-head path below.
-  if (!packed && launch.mask == SdpaMask::kNone && enable_gqa && Tq == 1 &&
-      Hq > Hkv) {
-    const int64_t g = Hq / Hkv;
-    // Reading the group as the row axis changes which axis is which, not the
-    // memory: q is already laid out (B, Hq, 1, D) = (B, Hk, g, D) in the order
-    // the batch, head, row and dim strides are read in, so the view below is
-    // free and the kernel addresses the group and head axes by the strides it
-    // already has.  Row s of key head hk is query head hk * g + s, which is the
-    // head its group names.
-    const Tensor q_grouped = tpx::ops::reshape(q4, {B, Hkv, g, D});
-    const Tensor out = sdpa_cute_flash_dispatch<SdpaMask::kNone>(
-        q_grouped, k4, v4, B, Hkv, Hkv, g, Tkv, D, s, launch);
-    // The result lands on query head hk * g + s already -- the group is the
-    // fastest-varying part of the merged head axis in this layout -- so the
-    // reshape back is a view too.  The normalizer the schedule wrote has one
-    // row per group rather than one per query head, so it is left undefined
-    // rather than handed back in a shape that would misread it.
-    return {tpx::ops::reshape(out, {B, Hq, Tq, D}), Tensor()};
-  }
-
-  switch (launch.mask) {
-    case SdpaMask::kCausal:
-      return {sdpa_cute_flash_dispatch<SdpaMask::kCausal>(
-                  q4, k4, v4, B, Hq, Hkv, Tq, Tkv, D, s, launch),
-              launch.lse_out ? *launch.lse_out : Tensor()};
-    case SdpaMask::kWindow:
-      return {sdpa_cute_flash_dispatch<SdpaMask::kWindow>(
-                  q4, k4, v4, B, Hq, Hkv, Tq, Tkv, D, s, launch),
-              launch.lse_out ? *launch.lse_out : Tensor()};
-    case SdpaMask::kNone:
-    default:
-      return {sdpa_cute_flash_dispatch<SdpaMask::kNone>(
-                  q4, k4, v4, B, Hq, Hkv, Tq, Tkv, D, s, launch),
-              launch.lse_out ? *launch.lse_out : Tensor()};
-  }
-}
-
 Tensor sdpa_fused_extended_cuda(const Tensor& query, const Tensor& key,
                                 const Tensor& value, bool is_causal,
                                 std::optional<double> scale, bool enable_gqa) {
   SdpaFusedLaunch launch;
-  launch.mask = is_causal ? SdpaMask::kCausal : SdpaMask::kNone;
+  launch.window_right = is_causal ? 0 : -1;
   return std::get<0>(
-      sdpa_fused_launch_cuda(query, key, value, launch, scale, enable_gqa));
+      sdpa_fused_forward_cuda(query, key, value, launch, scale, enable_gqa));
 }
 #endif  // TP_HAS_NATIVE_CUTE_FLASH
 
@@ -2400,17 +2601,13 @@ std::tuple<Tensor, Tensor> sdpa_kernel_cuda_with_lse(
       Tensor lse;
       SdpaFusedLaunch launch;
       launch.lse_out = &lse;
-      Tensor output =
-          is_causal
-              ? sdpa_cute_flash_dispatch<SdpaMask::kCausal>(
-                    q, k, v, B, H, H, T, T, D, s, launch)
-              : sdpa_cute_flash_dispatch<SdpaMask::kNone>(
-                    q, k, v, B, H, H, T, T, D, s, launch);
-      return {output, lse};
+      launch.window_right = is_causal ? 0 : -1;
+      return sdpa_fused_forward_cuda(q, k, v, launch, s,
+                                     /*enable_gqa=*/false);
     }
   }
 #endif
-  Tensor output = sdpa_kernel_cuda_plain(query, key, value, is_causal, /*impl=*/0);
+  Tensor output = sdpa_kernel_cuda_plain(query, key, value, is_causal, impl);
   Tensor lse = Tensor::empty({0}, DType::Float32, query.device());
   return {output, lse};
 }
@@ -2424,11 +2621,6 @@ std::tuple<Tensor, Tensor> sdpa_kernel_cuda_with_lse(
 // A negative bound is unbounded, and the kernel decides which mask it is by
 // the same rule: unbounded on the left and zero on the right is causal, any
 // other pair of finite bounds is a window, and both unbounded is no mask.
-SdpaMask resolve_mask(int64_t left, int64_t right) {
-  if (left < 0 && right < 0) return SdpaMask::kNone;
-  if (left < 0 && right == 0) return SdpaMask::kCausal;
-  return SdpaMask::kWindow;
-}
 
 // The heads of a batched tensor are the second axis for the kernel and the
 // third for two of the three contracts, so a sequence-major caller is read
@@ -2459,7 +2651,38 @@ bool fused_schedule_serves(const Tensor& q, const Tensor& k, const Tensor& v,
   if (k.size(-1) != head_dim || v.size(-1) != head_dim) return false;
   if (v.size(-2) != k.size(-2)) return false;  // value and key share an extent
   if (q.size(-2) == 0 || k.size(-2) == 0) return false;
+  // Grouped heads are read as one key head serving a contiguous run of query
+  // heads, so the query head count has to be a whole number of runs.
+  const int64_t heads_q = q.size(-3);
+  const int64_t heads_k = k.size(-3);
+  if (heads_q == 0 || heads_k == 0) return false;
+  if (heads_q % heads_k != 0) return false;
   return true;
+}
+
+// The sequence table names where each sequence starts, and the composite needs
+// that on the host to hand the schedule one sequence at a time.  The kernel
+// never needs it there -- it reads the table itself -- so this copy is on the
+// path that only a non-schedulable call takes.
+std::vector<int64_t> read_bounds(const Tensor& table) {
+  const int64_t count = table.numel();
+  TP_CHECK(table.dtype() == DType::Int32,
+           "sdpa: a cumulative-length table must be int32, got ",
+           table.dtype());
+  std::vector<int32_t> host(static_cast<size_t>(count));
+  cudaStream_t stream = getCurrentCUDAStream().stream();
+  TP_CUDA_CHECK(cudaMemcpyAsync(host.data(), table.data_ptr(),
+                                host.size() * sizeof(int32_t),
+                                cudaMemcpyDeviceToHost, stream));
+  TP_CUDA_CHECK(cudaStreamSynchronize(stream));
+  return std::vector<int64_t>(host.begin(), host.end());
+}
+
+// Whether the keys and values carry fewer heads than the query.  None of these
+// three contracts names grouped heads, but the head counts say so plainly, and
+// reading it here keeps the schedule from being handed a shape it cannot use.
+bool heads_are_grouped(const Tensor& q, const Tensor& k) {
+  return q.size(-3) != k.size(-3);
 }
 
 Tensor flash_rng_state(const Tensor& like) {
@@ -2510,12 +2733,13 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> flash_attention_forward_cuda(
     const std::optional<Tensor>& seqused_k, const std::optional<Tensor>& alibi_slopes,
     const std::optional<Tensor>& block_table, std::optional<int64_t> num_splits) {
   (void)return_debug_mask;
-  (void)num_splits;
   const bool packed = cum_seq_q.has_value();
   const int64_t left = window_size_left.value_or(-1);
-  const int64_t right =
-      is_causal ? 0 : (window_size_right.value_or(-1));
-  const auto mask = resolve_mask(left, right);
+  int64_t right = is_causal ? 0 : window_size_right.value_or(-1);
+  // Causal is the window whose right bound is zero with the left unbounded;
+  // a caller that sets both has asked for the window, which is the more
+  // specific of the two.
+  if (is_causal) right = 0;
   const bool servable =
       dropout_p == 0.0 && !seqused_k.has_value() && !alibi_slopes.has_value() &&
       !block_table.has_value() && (cum_seq_q.has_value() == cum_seq_k.has_value()) &&
@@ -2526,7 +2750,6 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> flash_attention_forward_cuda(
     heads_second(key, !packed, &k);
     heads_second(value, !packed, &v);
     SdpaFusedLaunch launch;
-    launch.mask = mask;
     launch.window_left = static_cast<int>(left);
     launch.window_right = static_cast<int>(right);
     if (packed) {
@@ -2540,10 +2763,15 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> flash_attention_forward_cuda(
     }
     Tensor lse;
     launch.lse_out = &lse;
+    // The caller's own count, or none for the split choice to make from the
+    // block count.  A packed batch is answered without a cut, so the count is
+    // only read on the batched path below.
+    launch.num_splits = static_cast<int>(num_splits.value_or(0));
     Tensor out = std::get<0>(
-        sdpa_fused_launch_cuda(q, k, v, launch, scale, /*enable_gqa=*/false));
-    restore_layout(&out, &lse, packed, /*sequence_major=*/!packed, q.size(-2),
-                   q.size(-3), q.size(-1));
+        sdpa_fused_forward_cuda(q, k, v, launch, scale,
+                                heads_are_grouped(q, k)));
+    restore_layout(&out, &lse, packed, /*sequence_major=*/!packed, query.size(0),
+                   query.size(1), query.size(-1));
     return {out, lse, flash_rng_state(query), flash_empty_scalar(query),
             flash_debug_mask(query)};
   }
@@ -2555,17 +2783,74 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> flash_attention_forward_cuda(
   heads_second(query, sequence_major, &q4);
   heads_second(key, sequence_major, &k4);
   heads_second(value, sequence_major, &v4);
-  const int64_t length_q = packed ? query.size(0) : q4.size(2);
-  const int64_t length_k = packed ? key.size(0) : k4.size(2);
   std::optional<Tensor> mask_tensor;
-  if (mask != SdpaMask::kNone) {
+  if (packed) {
+    const std::vector<int64_t> bounds_q = read_bounds(*cum_seq_q);
+    const std::vector<int64_t> bounds_k =
+        cum_seq_k.has_value() ? read_bounds(*cum_seq_k) : bounds_q;
+    TP_CHECK(bounds_q.size() == bounds_k.size(),
+             "sdpa packed: the query and key tables disagree (", bounds_q.size(),
+             " vs ", bounds_k.size(), " entries)");
+    // The window is per sequence, so the mask cannot be built once for the
+    // whole run; each sequence's is built inside the loop below.
+    return [&] {
+      std::vector<Tensor> outs;
+      std::vector<Tensor> lses;
+      for (size_t seq = 0; seq + 1 < bounds_q.size(); ++seq) {
+        const int64_t start_q = bounds_q[seq], stop_q = bounds_q[seq + 1];
+        const int64_t start_k = bounds_k[seq], stop_k = bounds_k[seq + 1];
+        if (stop_q == start_q) continue;
+        TP_CHECK(stop_k > start_k, "sdpa packed: sequence ", seq, " has ",
+                 stop_q - start_q, " queries and no keys");
+        const int64_t length_q_seq = stop_q - start_q;
+        const int64_t length_k_seq = stop_k - start_k;
+        std::optional<Tensor> seq_mask;
+        if (left >= 0 || right >= 0) {
+          seq_mask = composite::window_additive_mask(
+              length_q_seq, length_k_seq, left, right, query.dtype(),
+              query.device());
+        }
+        // A packed slice is (tokens, heads, dim); the composite scores with
+        // the head on the second axis, so the view moves it there.  That is a
+        // view, so the sequence still reads the packed buffer as it is.
+        auto slice = [](const Tensor& x, int64_t a, int64_t b) {
+          return x.slice(0, a, b).unsqueeze(0).transpose(1, 2);
+        };
+        auto [out, lse] = composite::sdpa_math_composite_with_lse(
+            slice(query, start_q, stop_q), slice(key, start_k, stop_k),
+            slice(value, start_k, stop_k), seq_mask, dropout_p,
+            /*is_causal=*/false, /*dropout_mask=*/std::nullopt, scale,
+            /*enable_gqa=*/false);
+        outs.push_back(out);
+        lses.push_back(lse);
+      }
+      Tensor out, lse;
+      if (outs.empty()) {
+        out = Tensor::empty({query.size(0), query.size(1), value.size(-1)},
+                            query.dtype(), query.device());
+        lse = Tensor::empty({query.size(1), query.size(0)}, DType::Float32,
+                            query.device());
+      } else {
+        out = tpx::ops::cat(outs, 2).reshape({query.size(0), query.size(1), value.size(-1)});
+        lse = tpx::ops::cat(lses, 2);
+      }
+      return std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor>{
+          out, lse, flash_rng_state(query), flash_empty_scalar(query),
+          flash_debug_mask(query)};
+    }();
+  }
+  const int64_t length_q = q4.size(2);
+  const int64_t length_k = k4.size(2);
+  if (left >= 0 || right >= 0) {
     mask_tensor = composite::window_additive_mask(
         length_q, length_k, left, right, query.dtype(), query.device());
   }
   auto [out, lse] = composite::sdpa_math_composite_with_lse(
       q4, k4, v4, mask_tensor, dropout_p, /*is_causal=*/false,
-      /*dropout_mask=*/std::nullopt, scale, /*enable_gqa=*/false);
-  restore_layout(&out, &lse, packed, /*sequence_major=*/!packed);
+      /*dropout_mask=*/std::nullopt, scale,
+      heads_are_grouped(query, key));
+  restore_layout(&out, &lse, packed, /*sequence_major=*/!packed, length_q,
+                 q4.size(1), q4.size(-1));
   return {out, lse, flash_rng_state(query), flash_empty_scalar(query),
           flash_debug_mask(query)};
 }
@@ -2585,7 +2870,7 @@ cudnn_attention_forward_cuda(
     const std::optional<Tensor>& seqused_k, const std::optional<Tensor>& block_table) {
   (void)return_debug_mask;
   const bool packed = cum_seq_q.has_value();
-  const auto mask = is_causal ? SdpaMask::kCausal : SdpaMask::kNone;
+  const bool windowed = false;
   const bool servable =
       dropout_p == 0.0 && !attn_bias.has_value() && !seqused_k.has_value() &&
       !block_table.has_value() &&
@@ -2593,7 +2878,6 @@ cudnn_attention_forward_cuda(
       fused_schedule_serves(query, key, value, packed, query.dim());
   if (servable) {
     SdpaFusedLaunch launch;
-    launch.mask = mask;
     if (packed) {
       launch.cu_seqlens_q = cum_seq_q->data_ptr<int32_t>();
       launch.cu_seqlens_k = cum_seq_k.has_value()
@@ -2606,7 +2890,8 @@ cudnn_attention_forward_cuda(
     Tensor lse;
     if (compute_logsumexp) launch.lse_out = &lse;
     Tensor out = std::get<0>(
-        sdpa_fused_launch_cuda(query, key, value, launch, scale, /*enable_gqa=*/false));
+        sdpa_fused_forward_cuda(query, key, value, launch, scale,
+                                heads_are_grouped(query, key)));
     restore_layout(&out, &lse, packed, /*sequence_major=*/false, query.size(0),
                    query.size(1), query.size(-1));
     if (!compute_logsumexp) {
@@ -2666,13 +2951,14 @@ efficient_attention_forward_cuda(
   // the length difference is what moves it from one to the other.
   const int64_t align_shift = length_q - length_k;
   if (custom_mask_type == 1) {
-    launch.mask = SdpaMask::kWindow;
     launch.window_left = -1;
     launch.window_right = static_cast<int>(align_shift);
   } else if (custom_mask_type == 2) {
-    launch.mask = SdpaMask::kCausal;
+    launch.window_left = -1;
+    launch.window_right = 0;
   } else {
-    launch.mask = SdpaMask::kNone;
+    launch.window_left = -1;
+    launch.window_right = -1;
   }
   if (packed) {
     launch.cu_seqlens_q = cu_seqlens_q->data_ptr<int32_t>();
@@ -2696,9 +2982,9 @@ efficient_attention_forward_cuda(
     Tensor lse;
     if (compute_log_sumexp) launch.lse_out = &lse;
     Tensor out = std::get<0>(
-        sdpa_fused_launch_cuda(q, k, v, launch, scale, /*enable_gqa=*/true));
-    restore_layout(&out, &lse, packed, /*sequence_major=*/!packed, q.size(-2),
-                   q.size(-3), q.size(-1));
+        sdpa_fused_forward_cuda(q, k, v, launch, scale, /*enable_gqa=*/true));
+    restore_layout(&out, &lse, packed, /*sequence_major=*/!packed, query.size(0),
+                   query.size(1), query.size(-1));
     if (!compute_log_sumexp) {
       lse = Tensor::empty({0}, DType::Float32, query.device());
     }
@@ -2715,6 +3001,60 @@ efficient_attention_forward_cuda(
   } else if (custom_mask_type == 2) {
     mask_tensor = composite::window_additive_mask(
         length_q, length_k, /*left=*/-1, /*right=*/0, query.dtype(), query.device());
+  }
+  if (packed) {
+    // A packed tensor has no batch axis to score along, so the composite is
+    // asked one sequence at a time; the window each sequence sees is its own.
+    const std::vector<int64_t> bounds_q = read_bounds(*cu_seqlens_q);
+    const std::vector<int64_t> bounds_k =
+        cu_seqlens_k.has_value() ? read_bounds(*cu_seqlens_k) : bounds_q;
+    std::vector<Tensor> outs;
+    std::vector<Tensor> lses;
+    for (size_t seq = 0; seq + 1 < bounds_q.size(); ++seq) {
+      const int64_t start_q = bounds_q[seq], stop_q = bounds_q[seq + 1];
+      const int64_t start_k = bounds_k[seq], stop_k = bounds_k[seq + 1];
+      if (stop_q == start_q) continue;
+      TP_CHECK(stop_k > start_k, "sdpa packed: sequence ", seq, " has ",
+               stop_q - start_q, " queries and no keys");
+      std::optional<Tensor> seq_mask;
+      if (custom_mask_type == 1 || custom_mask_type == 2) {
+        const int64_t shift = custom_mask_type == 2
+                                  ? 0
+                                  : (stop_q - start_q) - (stop_k - start_k);
+        seq_mask = composite::window_additive_mask(
+            stop_q - start_q, stop_k - start_k, /*left=*/-1,
+            custom_mask_type == 2 ? 0 : shift, query.dtype(), query.device());
+      }
+      // A packed slice is (tokens, heads, dim); the composite scores with
+        // the head on the second axis, so the view moves it there.  That is a
+        // view, so the sequence still reads the packed buffer as it is.
+      auto slice = [](const Tensor& x, int64_t a, int64_t b) {
+        return x.slice(0, a, b).unsqueeze(0).transpose(1, 2);
+      };
+      auto [out, lse] = composite::sdpa_math_composite_with_lse(
+          slice(query, start_q, stop_q), slice(key, start_k, stop_k),
+          slice(value, start_k, stop_k), seq_mask, dropout_p,
+          /*is_causal=*/false, /*dropout_mask=*/std::nullopt, scale,
+          /*enable_gqa=*/false);
+      outs.push_back(out);
+      lses.push_back(lse);
+    }
+    Tensor out = outs.empty()
+                     ? Tensor::empty({query.size(0), query.size(1),
+                                      value.size(-1)},
+                                     query.dtype(), query.device())
+                     : tpx::ops::cat(outs, 2).reshape(
+                           {query.size(0), query.size(1), value.size(-1)});
+    Tensor lse = outs.empty()
+                     ? Tensor::empty({query.size(1), query.size(0)},
+                                     DType::Float32, query.device())
+                     : tpx::ops::cat(lses, 2);
+    if (!compute_log_sumexp) {
+      lse = Tensor::empty({0}, DType::Float32, query.device());
+    }
+    return {out, lse, Tensor::zeros({}, DType::Int64, query.device()),
+            Tensor::zeros({}, DType::Int64, query.device()), query.size(0),
+            key.size(0)};
   }
   auto [out, lse] = composite::sdpa_math_composite_with_lse(
       query, key, value, mask_tensor, dropout_p, /*is_causal=*/false,

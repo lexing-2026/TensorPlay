@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar
 import tensorplay as tp
 
 if TYPE_CHECKING:
-    from .runtime.remote_cache import JsonDataTy, RemoteCache
+    from .remote_cache import JsonDataTy, RemoteCache
 
 from tensorplay.utils._functools import prefetchable_cache as torch_key_cache
 

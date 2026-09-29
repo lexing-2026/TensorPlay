@@ -253,6 +253,7 @@ def main(argv=None) -> None:
     from .gen_autocast import autocast_registered_ops
     autograd_ops = {op: dv.node_name for op, dv in derivatives.items()}
     autograd_ops.setdefault("relu_", "ReluBackward")
+    autograd_ops.setdefault("dropout", "CompositeDropout")
 
     ctx = CodegenContext(
         funcs=funcs,

@@ -18,7 +18,7 @@ from .. import ir
 from ..dependencies import Dep, extract_loop_body_with_args, MemoryDep
 from ..runtime.hints import ReductionHint
 from ..runtime.runtime_utils import next_power_of_2
-from ..kernel_scheduler import SchedulerNode
+from ..scheduler import SchedulerNode
 from ..utils import cache_on_self
 from ..loops import V
 

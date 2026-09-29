@@ -319,10 +319,7 @@ class PythonKeyTracer(Tracer):
         """
 
         if _is_tensor(value):
-            entry = self.tensor_tracker.get(value._impl_id)
-            if entry is None:
-                return value
-            return entry if isinstance(entry, Node) else entry.node
+            return self.node_for(value)
         if isinstance(value, tuple):
             return tuple(self.map_operands(item) for item in value)
         if isinstance(value, list):

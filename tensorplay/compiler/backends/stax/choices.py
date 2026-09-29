@@ -108,7 +108,7 @@ def can_fuse_horizontal(
     fit in what a program may hold is worse than two that each fit.
     """
 
-    from .kernel_scheduler import MixOrderReduction
+    from .scheduler import MixOrderReduction
 
     if MixOrderReduction.can_fuse(node1, node2):
         # The two share every element of the value, so neither what they share
@@ -127,7 +127,7 @@ def can_fuse_horizontal(
 
 
 def _why(node1, node2):
-    from .kernel_scheduler import WhyNoFuse
+    from .scheduler import WhyNoFuse
 
     return WhyNoFuse(node1, node2)
 
