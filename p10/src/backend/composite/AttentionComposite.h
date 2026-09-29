@@ -66,6 +66,35 @@ inline Tensor causal_additive_mask(int64_t l, int64_t skv, DType dtype,
   return masked_fill(zeros, logical_not(keep), Scalar(kNegInf));
 }
 
+// Window additive mask.  Both bounds are measured from the diagonal running
+// from the top left corner to the bottom right one, so query row t sees the
+// keys from t + skv - l - left up to but not including t + skv - l + right + 1;
+// a negative bound leaves that side unbounded, which is why causal attention is
+// the special case (left unbounded, right zero) rather than a separate mask.
+inline Tensor window_additive_mask(int64_t l, int64_t skv, int64_t left,
+                                   int64_t right, DType dtype,
+                                   const Device& device) {
+  using ops::add, ops::arange, ops::full, ops::ge, ops::logical_and,
+      ops::logical_not, ops::lt, ops::masked_fill, ops::narrow, ops::sub,
+      ops::view;
+  if (left < 0 && right < 0) {
+    // Nothing is excluded, so there is no mask to add.
+    return Tensor();
+  }
+  Tensor idx = arange(Scalar(0), Scalar(std::max(l, skv)), Scalar(1),
+                      DType::Int64, device);
+  Tensor rows = add(view(narrow(idx, 0, 0, l), {l, 1}), Scalar(skv - l));
+  Tensor cols = view(narrow(idx, 0, 0, skv), {1, skv});
+  std::optional<Tensor> keep;
+  if (left >= 0) keep.emplace(ge(cols, sub(rows, Scalar(left))));
+  if (right >= 0) {
+    Tensor nearer = lt(cols, add(rows, Scalar(right + 1)));
+    keep = keep.has_value() ? logical_and(*keep, nearer) : nearer;
+  }
+  Tensor zeros = full({l, skv}, Scalar(0), dtype, device);
+  return masked_fill(zeros, logical_not(*keep), Scalar(kNegInf));
+}
+
 // Scale factor for the math backend: the query side carries sqrt(scale) and
 // the key side carries sqrt(scale) so the score product carries `scale`.
 inline double math_scale_factor(const std::optional<double>& scale,
@@ -100,13 +129,19 @@ inline std::pair<Tensor, Tensor> expand_gqa(const Tensor& query,
     // (..., Hk, S, D) -> (..., Hk, g, S, D) -> (..., Hq, S, D)
     const auto extents = static_cast<std::vector<int64_t>>(t.shape());
     const int64_t head_axis = static_cast<int64_t>(extents.size()) - 3;
-    // A group axis of one is added ahead of the head axis, and then expanded to
+    // A group axis of one is added behind the head axis, and then expanded to
     // g: adding an axis is what unsqueeze is for, and repeating along the new
     // axis is what expand is for.  Reading the head and the group as one axis
     // afterwards is a reshape, since both are there and no axis is added.
-    Tensor repeated = expand(unsqueeze(t, head_axis), [&] {
+    // Which side the group axis sits on decides the mapping, because the
+    // reshape reads the two as one axis: behind the head axis the merged axis
+    // orders as (Hk, g), so query head h reads key head h / g and one key head
+    // serves a contiguous block of g query heads.  Ahead of the head axis the
+    // merged axis orders as (g, Hk) and the same query head would instead read
+    // key head h % Hk, which is a different function of h.
+    Tensor repeated = expand(unsqueeze(t, head_axis + 1), [&] {
       std::vector<int64_t> shape = extents;
-      shape.insert(shape.begin() + head_axis, g);
+      shape.insert(shape.begin() + head_axis + 1, g);
       return shape;
     }());
     std::vector<int64_t> merged = extents;
@@ -198,6 +233,69 @@ inline std::tuple<Tensor, Tensor> sdpa_math_composite(
     return {to(out, origin_dtype), to(probs, origin_dtype)};
   }
   return {out, probs};
+}
+
+// The same composite, also reporting the softmax normalizing constant.  The
+// scores are already formed to weight the values, and the constant is a
+// reduction over that same tensor rather than a second product, so asking for
+// it costs one pass and cannot disagree with the probabilities.
+//
+// A row with no visible key has no softmax: dividing by its zero total would
+// put a NaN in the output, which `safe_softmax_lastdim` already avoids.  The
+// constant for such a row is reported as positive infinity, because a backward
+// pass that reuses it to reweight the scores then gets zeros out of
+// exp(score - inf) -- the right derivative for a row that contributes nothing,
+// where the opposite sign would hand back a NaN.
+inline std::tuple<Tensor, Tensor> sdpa_math_composite_with_lse(
+    const Tensor& query, const Tensor& key, const Tensor& value,
+    const std::optional<Tensor>& attn_mask, double dropout_p, bool is_causal,
+    const std::optional<Tensor>& dropout_mask, std::optional<double> scale,
+    bool enable_gqa) {
+  using ops::add, ops::amax, ops::div, ops::eq, ops::exp, ops::full, ops::log,
+      ops::matmul, ops::mul, ops::ones_like, ops::sub, ops::sum, ops::to,
+      ops::transpose, ops::where, ops::zeros_like;
+  const DType origin_dtype = query.dtype();
+  if (origin_dtype != DType::Float32 && origin_dtype != DType::Float64 &&
+      origin_dtype != DType::Float16 && origin_dtype != DType::BFloat16) {
+    TP_THROW(NotImplementedError,
+             "sdpa math: expected float32/float64/float16/bfloat16");
+  }
+  const bool reduce = origin_dtype == DType::Float16 ||
+                      origin_dtype == DType::BFloat16;
+  const DType working = reduce ? DType::Float32 : origin_dtype;
+  Tensor q = reduce ? to(query, working) : query;
+  Tensor k = reduce ? to(key, working) : key;
+  Tensor v = reduce ? to(value, working) : value;
+  std::tie(k, v) = expand_gqa(q, k, v, enable_gqa);
+  const int64_t head_dim = q.size(-1);
+  const double s = math_scale_factor(scale, head_dim);
+  const double sqrt_s = std::sqrt(std::abs(s));
+  Tensor scores = matmul(mul(q, Scalar(sqrt_s)), mul(transpose(k, -2, -1), Scalar(sqrt_s)));
+  if (is_causal) {
+    scores = add(scores, causal_additive_mask(q.size(-2), k.size(-2), q.dtype(), q.device()));
+  }
+  if (attn_mask.has_value()) {
+    const Tensor& m = *attn_mask;
+    scores = add(scores, m.dtype() == DType::Bool ? bool_mask_to_additive(m, q.dtype())
+                                                   : to(m, q.dtype()));
+  }
+  // A row whose largest score is minus infinity has nothing to exponentiate
+  // against; its reference point is zero and the masked entries still
+  // exponentiate to zero, which is what leaves the row's total at zero.
+  Tensor row_max = amax(scores, {-1}, /*keepdim=*/true);
+  row_max = where(eq(row_max, Scalar(-std::numeric_limits<double>::infinity())),
+                  ops::zeros_like(row_max), row_max);
+  Tensor shifted = sub(scores, row_max);
+  Tensor probs = exp(shifted);
+  Tensor total = sum(probs, {-1}, /*keepdim=*/true);
+  Tensor empty = eq(total, Scalar(0));
+  Tensor normalizer = where(empty, ops::ones_like(total), total);
+  Tensor lse = where(empty,
+                     ops::full({}, Scalar(std::numeric_limits<double>::infinity()),
+                               DType::Float32, query.device()),
+                     to(add(row_max, log(total)), DType::Float32));
+  Tensor out = matmul(div(probs, normalizer), v);
+  return {reduce ? to(out, origin_dtype) : out, lse};
 }
 
 // `_native_multi_head_attention`: packed input projection, per-head batched
@@ -335,15 +433,67 @@ inline std::tuple<Tensor, Tensor> native_mha_composite(
   return {out, weights};
 }
 
+// The widest head the fused device tiles are shaped for.  A wider head has no
+// tile to land in, so it stays on the composed reference.
+inline constexpr int64_t kFusedMaxHeadDim = 128;
+
+// Whether a device-side fused schedule can answer this call, as a shape
+// predicate.  Every schedule declines the two things none of them model -- an
+// additive mask and a drop -- and wants 4-D inputs, one head width shared by
+// query, key and value inside the tiled range, matching dtypes, one batch, and
+// a key and value of one length.  Two shapes then qualify, because two
+// schedules are written for them:
+//
+//   * the square self-attention shape with the head width's own normaliser,
+//     which the tensor-core, warp-per-row and GEMM-backed schedules between
+//     them cover in every precision each of them has a kernel for; and
+//   * the tiled schedule's shape, which additionally carries an explicit
+//     normaliser, grouped heads, and a context whose length differs from the
+//     query's.  All three are launch parameters there, not shape rewrites, and
+//     it comes in the two reduced precisions its tiles are cut for.
+inline bool fused_sdpa_serves(const Tensor& query, const Tensor& key,
+                              const Tensor& value,
+                              const std::optional<Tensor>& attn_mask,
+                              double dropout_p,
+                              const std::optional<double>& scale,
+                              bool enable_gqa) {
+  if (attn_mask.has_value() || dropout_p != 0.0) return false;
+  if (query.dim() != 4 || key.dim() != 4 || value.dim() != 4) return false;
+  const DType dt = query.dtype();
+  if (key.dtype() != dt || value.dtype() != dt) return false;
+  const int64_t head_dim = query.size(3);
+  if (head_dim == 0 || head_dim > kFusedMaxHeadDim) return false;
+  if (key.size(3) != head_dim || value.size(3) != head_dim) return false;
+  if (key.size(0) != query.size(0) || value.size(0) != query.size(0)) {
+    return false;
+  }
+  if (query.size(2) == 0 || key.size(2) == 0) return false;
+  if (key.size(2) != value.size(2)) return false;
+  const int64_t hq = query.size(1), hk = key.size(1);
+  if (hq == 0 || hk == 0) return false;
+  const bool grouped = hq != hk;
+  // Grouped heads that do not divide evenly are not a shape; leaving them out
+  // of the fused answer leaves the composed path to say so in its own terms.
+  if (enable_gqa ? (hq % hk != 0) : grouped) return false;
+  if (!grouped && query.size(2) == key.size(2) && !scale.has_value()) {
+    return dt == DType::Float32 || dt == DType::Float16 || dt == DType::BFloat16;
+  }
+  return dt == DType::Float16 || dt == DType::BFloat16;
+}
+
 // Backend selection shared with the nn.attention routing flags:
-// FLASH_ATTENTION(1) covers the plain fused case, MATH(0) the rest, ERROR(-1)
+// FLASH_ATTENTION(1) covers the fused case, MATH(0) the rest, ERROR(-1)
 // when nothing can run.
-inline int64_t fused_sdp_choice_common(const Tensor& query,
+inline int64_t fused_sdp_choice_common(const Tensor& query, const Tensor& key,
+                                       const Tensor& value,
                                        const std::optional<Tensor>& attn_mask,
-                                       double dropout_p, bool enable_gqa) {
-  const bool plain = !attn_mask.has_value() && dropout_p == 0.0 &&
-                     query.dim() == 4 && !enable_gqa && query.size(3) != 0;
-  if (plain) return 1;  // FLASH_ATTENTION
+                                       double dropout_p,
+                                       std::optional<double> scale,
+                                       bool enable_gqa) {
+  if (fused_sdpa_serves(query, key, value, attn_mask, dropout_p, scale,
+                        enable_gqa)) {
+    return 1;  // FLASH_ATTENTION
+  }
   const DType dt = query.dtype();
   const bool math_ok = dt == DType::Float32 || dt == DType::Float64 ||
                        dt == DType::Float16 || dt == DType::BFloat16;
@@ -410,8 +560,8 @@ inline std::tuple<Tensor, Tensor, Tensor> sdpa_math_backward_composite(
     const Tensor& value, const std::optional<Tensor>& attn_mask,
     double dropout_p, bool is_causal, const std::optional<double>& scale,
     bool enable_gqa) {
-  using ops::matmul, ops::mul, ops::transpose, ops::sum, ops::where, ops::ones,
-      ops::tril, ops::to, ops::add, ops::reshape, ops::sub;
+  using ops::matmul, ops::mul, ops::transpose, ops::sum, ops::where, ops::to,
+      ops::add, ops::reshape, ops::sub;
 
   // The key and value are given as many heads as the query has, by the same
   // expansion the forward does, so that both directions agree on which head
@@ -430,10 +580,12 @@ inline std::tuple<Tensor, Tensor, Tensor> sdpa_math_backward_composite(
 
   Tensor scores = matmul(mul(q, Scalar(s)), transpose(kk, -2, -1));
   if (is_causal) {
-    const int64_t t_q = scores.size(-2), t_k = scores.size(-1);
-    auto keep = tril(ones({t_q, t_k}, DType::Bool, scores.device()),
-                     /*diagonal=*/t_k - t_q);
-    scores = where(keep, scores, Scalar(kNegInf));
+    // The same top-left alignment the forward masks with: query row t sees
+    // keys <= t, whatever the two lengths are.  A gradient has to be
+    // differentiated through the mask the forward actually applied, so this
+    // one is built by that same helper rather than spelled out again here.
+    scores = add(scores, causal_additive_mask(scores.size(-2), scores.size(-1),
+                                              scores.dtype(), scores.device()));
   }
   if (attn_mask.has_value() && attn_mask->defined()) {
     const Tensor& m = *attn_mask;

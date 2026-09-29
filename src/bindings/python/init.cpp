@@ -608,8 +608,7 @@ PYBIND11_MODULE(_C, m) {
                     params.is_causal,
                     std::nullopt,
                     params.enable_gqa);
-                return static_cast<int64_t>(tensorplay::SDPBackend::flash_attention) == choice
-                    && !params.enable_gqa;
+                return static_cast<int64_t>(tensorplay::SDPBackend::flash_attention) == choice;
             } catch (const tensorplay::Exception&) {
                 if (debug) {
                     TP_WARN(
