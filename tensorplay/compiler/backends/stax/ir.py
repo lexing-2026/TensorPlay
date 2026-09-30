@@ -6484,7 +6484,12 @@ class ExternKernel(InputsKernel):
             ) from exc
         strides = []
         for var in range_vars:
-            poly = sympy.Poly(index, var)
+            try:
+                poly = sympy.Poly(index, var)
+            except sympy.PolynomialError:
+                raise NotImplementedError(
+                    "the view's index is not a fixed stride per axis"
+                ) from None
             if poly.total_degree() > 1 or (poly.free_symbols - {var}):
                 raise NotImplementedError(
                     "the view's index is not a fixed stride per axis"
