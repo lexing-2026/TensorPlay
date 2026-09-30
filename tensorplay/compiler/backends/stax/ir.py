@@ -7206,12 +7206,11 @@ class ExternKernelOut(ExternKernel):
             op_overload,
         )
         self.output_view = output_view
-        self.should_allocate_ = False
         self.name = V.graph.register_buffer(self)
         V.graph.register_operation(self)
 
     def should_allocate(self) -> bool:
-        return False
+        return True
 
 
 class RandomSeeds(ExternKernelOut):
