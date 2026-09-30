@@ -1365,21 +1365,23 @@ inline int sdpa_num_splits(int batch_nheads_mblocks, int num_sms,
   if (batch_nheads_mblocks >= 0.8f * num_sms) return 1;
   max_splits = std::min({max_splits, num_sms, num_n_blocks});
   float max_efficiency = 0.f;
-  std::vector<float> efficiency;
-  efficiency.reserve(max_splits);
+  // The split count is bounded by 128, so the efficiency table rides the
+  // stack; a heap allocation on every call is a cost a decode loop pays for
+  // a table that fits in a few cache lines.
+  float efficiency[128];
   auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
   auto is_split_eligible = [&ceildiv, &num_n_blocks](int n) {
     return n == 1 || ceildiv(num_n_blocks, n) != ceildiv(num_n_blocks, n - 1);
   };
   for (int n = 1; n <= max_splits; n++) {
     if (!is_split_eligible(n)) {
-      efficiency.push_back(0.f);
+      efficiency[n - 1] = 0.f;
       continue;
     }
     const float n_waves = float(batch_nheads_mblocks * n) / num_sms;
     const float eff = n_waves / std::ceil(n_waves);
     if (eff > max_efficiency) max_efficiency = eff;
-    efficiency.push_back(eff);
+    efficiency[n - 1] = eff;
   }
   for (int n = 1; n <= max_splits; n++) {
     if (!is_split_eligible(n)) continue;
@@ -1413,10 +1415,16 @@ SdpaSplitBuffers sdpa_set_params_splitkv(
   params.num_splits = num_splits;
   SdpaSplitBuffers buffers;
   if (num_splits < 1) {
-    int num_sms = 0;
-    TP_CUDA_CHECK(cudaDeviceGetAttribute(
-        &num_sms, cudaDevAttrMultiProcessorCount,
-        getCurrentCUDAStream().device_index()));
+    // The processor count is a property of the device, not of the call, so it
+    // is read once and kept; a hot decode loop would otherwise pay a runtime
+    // query on every step for a number that never changes.
+    static const int num_sms = []() {
+      int count = 0;
+      TP_CUDA_CHECK(cudaDeviceGetAttribute(
+          &count, cudaDevAttrMultiProcessorCount,
+          getCurrentCUDAStream().device_index()));
+      return count;
+    }();
     // Twice the processor count is the occupancy budget, because a block here is
     // 128 threads and two of them fit a processor.
     params.num_splits = sdpa_num_splits(
@@ -1610,13 +1618,21 @@ std::tuple<Tensor, Tensor> sdpa_fused_forward_cuda(
   params.cache_batch_idx = nullptr;
   params.block_table = nullptr;
   params.page_block_size = 0;
-  // The block count is what decides the cut, not the shape: a call that already
-  // fills the device is cut once, however long its context is.  A packed batch
-  // is left alone because its extents come from a table rather than a length.
-  const SdpaSplitBuffers split = packed
-      ? SdpaSplitBuffers{}
-      : sdpa_set_params_splitkv(params, grid_b, Hq, D, Tkv, Tq, D,
-                                launch.num_splits, q.device());
+   // The block count is what decides the cut, not the shape: a call that already
+   // fills the device is cut once, however long its context is.  A packed batch
+   // is left alone because its extents come from a table rather than a length.
+   // A causal call bounds the walk of the rows a split serves by the diagonal:
+   // the rows a block owns admit no key past their own index, so the context
+   // tiles past the last query row of the whole call are dead weight -- the
+   // split count is capped by the blocks the diagonal actually covers, which
+   // keeps a one-row decode step from paying for slices that read keys no row
+   // can reach and a combine pass over slices that hold nothing.
+   const int64_t split_seqlen_k =
+       params.is_causal && !packed ? std::min(Tkv, Tq) : Tkv;
+   const SdpaSplitBuffers split = packed
+       ? SdpaSplitBuffers{}
+       : sdpa_set_params_splitkv(params, grid_b, Hq, D, split_seqlen_k, Tq, D,
+                                 launch.num_splits, q.device());
 
   ::tensorplay_native_flash::run_mha_fwd(
       params, getCurrentCUDAStream().stream(),
