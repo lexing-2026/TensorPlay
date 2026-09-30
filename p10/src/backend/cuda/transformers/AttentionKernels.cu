@@ -2533,17 +2533,6 @@ Tensor sdpa_gemm_cross_cuda(const Tensor& query, const Tensor& key,
       q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
 }
 
-// The wide-precision tiled schedule.  Its leaves are not in this build, so the
-// call is answered by the schedule that is: the same reduced products over a
-// materialized score matrix, which is what that schedule does as well, so the
-// answer is the one the caller would have got.  This is here to give the
-// dispatch a definition rather than a dangling name; when the leaves land they
-// replace this body and the dispatch reaches them instead.
-Tensor sdpa_wide_tiled_cuda(const Tensor& query, const Tensor& key,
-                            const Tensor& value, bool is_causal) {
-  return sdpa_gemm_cross_cuda(query, key, value, is_causal);
-}
-
 #if defined(TP_HAS_NATIVE_CUTE_FLASH)
 // The fused schedule for a call that carries arguments the square self-
 // attention entry point does not take: an explicit score normaliser, grouped
@@ -2701,9 +2690,12 @@ bool fused_schedule_serves(const Tensor& q, const Tensor& k, const Tensor& v,
   if (v.size(-2) != k.size(-2)) return false;  // value and key share an extent
   if (q.size(-2) == 0 || k.size(-2) == 0) return false;
   // Grouped heads are read as one key head serving a contiguous run of query
-  // heads, so the query head count has to be a whole number of runs.
-  const int64_t heads_q = q.size(-3);
-  const int64_t heads_k = k.size(-3);
+  // heads, so the query head count has to be a whole number of runs.  On a
+  // packed run the head axis sits one place in from where a batched tensor
+  // carries it, and the outer axis is the token count, which has no reason to
+  // divide evenly and must not be read as a head count here.
+  const int64_t heads_q = packed ? q.size(1) : q.size(-3);
+  const int64_t heads_k = packed ? k.size(1) : k.size(-3);
   if (heads_q == 0 || heads_k == 0) return false;
   if (heads_q % heads_k != 0) return false;
   return true;
