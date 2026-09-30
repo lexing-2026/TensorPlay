@@ -779,54 +779,68 @@ def _compile_region(
             ) from exc
         store_region(region_key, graph_module)
 
-    # Backend failures are compiler failures, not graph breaks.  In
-    # particular, a Stax lowering error must not silently turn a requested
-    # compiled region into an uncompiled call.
-    # Registered backends receive graph inputs in placeholder order, including
-    # values supplied through keywords and defaults.  Passing only positional
-    # arguments makes a keyword-only/scalar placeholder appear to be missing
-    # and is especially harmful for native Stax lowering.
-    bound = graph_module.signature.bind_partial(*example_inputs, **example_kwargs)
-    bound.apply_defaults()
-    # Numeric-gate placeholders ride the contract as synthetic inputs; their
-    # trace-time values stand in at lowering so kernels see real 0-d tensors.
-    backend_inputs = []
-    for node in graph_module.graph.placeholders:
-        parameter_name = node.target if isinstance(node.target, str) else node.name
+    # Capture, propagation and lowering all execute the program to record or
+    # measure it.  The generator they advance belongs to the caller, so the
+    # whole region is compiled inside a forked RNG: the draws the graph reads
+    # at runtime start from where the caller left the generator, not from
+    # where the compiler's own sample pass stopped.
+    import tensorplay
+
+    devices = []
+    for value in example_inputs:
+        if isinstance(value, tensorplay.Tensor) and value.device.type == "cuda":
+            index = value.device.index or 0
+            if index not in devices:
+                devices.append(index)
+    with tensorplay.random.fork_rng(devices=devices):
+        # Backend failures are compiler failures, not graph breaks.  In
+        # particular, a Stax lowering error must not silently turn a requested
+        # compiled region into an uncompiled call.
+        # Registered backends receive graph inputs in placeholder order, including
+        # values supplied through keywords and defaults.  Passing only
+        # positional arguments makes a keyword-only/scalar placeholder appear
+        # to be missing and is especially harmful for native Stax lowering.
+        bound = graph_module.signature.bind_partial(*example_inputs, **example_kwargs)
+        bound.apply_defaults()
+        # Numeric-gate placeholders ride the contract as synthetic inputs; their
+        # trace-time values stand in at lowering so kernels see real 0-d tensors.
+        backend_inputs = []
+        for node in graph_module.graph.placeholders:
+            parameter_name = node.target if isinstance(node.target, str) else node.name
+            try:
+                backend_inputs.append(bound.arguments[parameter_name])
+            except KeyError:
+                if node.name not in bound.arguments:
+                    raise GraphCaptureError(
+                        f"missing sample value for graph placeholder {node.name!r}"
+                    ) from None
+                backend_inputs.append(bound.arguments[node.name])
+
+        # Advisory shape/value metadata for backends and visualization; never a
+        # reason to reject an otherwise compilable region.
+        # Propagation executes the graph: it must not count as a call either.
         try:
-            backend_inputs.append(bound.arguments[parameter_name])
-        except KeyError:
-            if node.name not in bound.arguments:
-                raise GraphCaptureError(
-                    f"missing sample value for graph placeholder {node.name!r}"
-                ) from None
-            backend_inputs.append(bound.arguments[node.name])
+            with _preserve_module_state(model):
+                ShapeProp(backend_inputs)(graph_module)
+        except (GraphCaptureError, RuntimeError):
+            pass
 
-    # Advisory shape/value metadata for backends and visualization; never a
-    # reason to reject an otherwise compilable region.
-    # Propagation executes the graph: it must not count as a call either.
-    try:
-        with _preserve_module_state(model):
-            ShapeProp(backend_inputs)(graph_module)
-    except (GraphCaptureError, RuntimeError):
-        pass
+        compiler_fn = _adapt_backend_to_region(
+            compiler_fn,
+            example_inputs,
+            example_kwargs,
+            graph_module,
+            backend_kwargs,
+        )
 
-    compiler_fn = _adapt_backend_to_region(
-        compiler_fn,
-        example_inputs,
-        example_kwargs,
-        graph_module,
-        backend_kwargs,
-    )
+        regional_compile_invoke_subgraph(
+            graph_module,
+            compiler=compiler_fn,
+            compiler_kwargs=backend_kwargs,
+        )
 
-    regional_compile_invoke_subgraph(
-        graph_module,
-        compiler=compiler_fn,
-        compiler_kwargs=backend_kwargs,
-    )
-
-    with _compiler_context():
-        compiled = compiler_fn(graph_module, backend_inputs, **backend_kwargs)
+        with _compiler_context():
+            compiled = compiler_fn(graph_module, backend_inputs, **backend_kwargs)
 
     if not callable(compiled):
         raise TypeError(

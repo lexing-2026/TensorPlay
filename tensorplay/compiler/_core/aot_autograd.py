@@ -162,17 +162,20 @@ def _trace_joint(fn: Callable[..., Any], primals: Sequence[Any], decompositions)
     # A traced program that reads a random value reads it at a position rather
     # than from a generator, so the position each pass starts from is what the
     # reads are written against: the forward and the backward each get their
-    # own, taken from where the generators stand now.
-    fwd_seed, fwd_base_offset = CUDARngStateHelper.get_torch_state_as_tuple()
-    bwd_seed, bwd_base_offset = CUDARngStateHelper.get_torch_state_as_tuple()
-    as_state = lambda pair: (
-        tensorplay.tensor(pair[0], dtype=tensorplay.int64),
-        tensorplay.tensor(pair[1], dtype=tensorplay.int64),
-    )
-    fwd_seed, fwd_base_offset = as_state((fwd_seed, fwd_base_offset))
-    bwd_seed, bwd_base_offset = as_state((bwd_seed, bwd_base_offset))
-    PhiloxStateTracker.record_state(fwd_seed, fwd_base_offset, "forward")
-    PhiloxStateTracker.record_state(bwd_seed, bwd_base_offset, "backward")
+    # own, taken from where the generators stand now.  Only device streams
+    # with a Philox/counter-based generator expose a readable position; a
+    # CPU-only trace keeps its native generator and leaves the state unset.
+    if tensorplay.cuda.is_available():
+        fwd_seed, fwd_base_offset = CUDARngStateHelper.get_torch_state_as_tuple()
+        bwd_seed, bwd_base_offset = CUDARngStateHelper.get_torch_state_as_tuple()
+        as_state = lambda pair: (
+            tensorplay.tensor(pair[0], dtype=tensorplay.int64),
+            tensorplay.tensor(pair[1], dtype=tensorplay.int64),
+        )
+        fwd_seed, fwd_base_offset = as_state((fwd_seed, fwd_base_offset))
+        bwd_seed, bwd_base_offset = as_state((bwd_seed, bwd_base_offset))
+        PhiloxStateTracker.record_state(fwd_seed, fwd_base_offset, "forward")
+        PhiloxStateTracker.record_state(bwd_seed, bwd_base_offset, "backward")
     with tensorplay.random.fork_rng(devices=_trace_devices(primals)):
         with ProxyTensorDispatchMode(tracer, decompositions):
             with tensorplay.enable_grad():
@@ -373,7 +376,19 @@ def aot_function(
                 value for _, value in saved if not _is_tensor(value)
             )
             ctx.run_primals = run_primals
-            ctx.run_outputs = user
+            # Record only the shapes and dtypes of the differentiable outputs.
+            # Holding the output tensors on the context would close a
+            # reference cycle (output -> grad_fn -> ctx -> output) that the
+            # Python collector cannot see through the C++ node, so a compiled
+            # forward called without a following backward would retain every
+            # saved activation forever.  The engine zero-fills a missing
+            # gradient from this metadata instead.
+            ctx.diff_output_metas = [
+                None if not (diff and _is_tensor(out)) else (
+                    out.shape, out.dtype, out.device
+                )
+                for out, diff in zip(user, diff_out_mask)
+            ]
             non_diff = [
                 out for out, diff in zip(user, diff_out_mask) if _is_tensor(out) and not diff
             ]
@@ -384,8 +399,10 @@ def aot_function(
         @staticmethod
         def backward(ctx, *grad_outputs):
             diff_grads = [
-                g if g is not None else tensorplay.zeros_like(out)
-                for g, out, diff in zip(grad_outputs, ctx.run_outputs, diff_out_mask)
+                tensorplay.zeros(meta[0], dtype=meta[1], device=meta[2]) if g is None else g
+                for g, diff, meta in zip(
+                    grad_outputs, diff_out_mask, ctx.diff_output_metas
+                )
                 if diff
             ]
             named = list(zip(tangent_names, diff_grads))
@@ -403,7 +420,7 @@ def aot_function(
             # the engine, which knows whether the graph is kept for another
             # pass.
             ctx.saved_plain = ()
-            ctx.run_outputs = None
+            ctx.diff_output_metas = None
             ctx.run_primals = None
             return out
 
@@ -412,6 +429,11 @@ def aot_function(
             # Called under no_grad after a training compile: the forward graph
             # alone produces the outputs.
             outputs = _call(compiled_fw, [args[i] for i in fw_input_order])
+            if len(outputs) < num_fwd:
+                raise AssertionError(
+                    "compiled forward returned fewer outputs than the trace "
+                    f"promised: expected at least {num_fwd}, got {len(outputs)}"
+                )
             return tree_unflatten(list(outputs[:num_fwd]), out_spec)
         user = CompiledFunction.apply(*args)
         if not isinstance(user, tuple):
@@ -569,8 +591,26 @@ def _state_access(module: Any):
             owned.update(local)
             try:
                 if rooted and root is not None:
-                    with _reparametrize_module(root, rooted):
-                        yield
+                    if isinstance(root, tensorplay.nn.Module):
+                        with _reparametrize_module(root, rooted):
+                            yield
+                    else:
+                        # A plain callable root (a free function or a bound
+                        # method of a non-module object) has no parameter
+                        # containers to swap; the graph state it reads lives
+                        # in the graph module's attribute table, so the swap
+                        # happens there.
+                        attrs = module._graph_attrs
+                        saved_attrs = {k: attrs[k] for k in rooted if k in attrs}
+                        attrs.update(rooted)
+                        try:
+                            yield
+                        finally:
+                            for k in saved_attrs:
+                                attrs[k] = saved_attrs[k]
+                            for k in rooted:
+                                if k not in saved_attrs:
+                                    attrs.pop(k, None)
                 else:
                     yield
             finally:
