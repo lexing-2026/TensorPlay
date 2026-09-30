@@ -1,13 +1,13 @@
 import functools
 
-from torch._inductor.ir import get_stride_order
-from torch._inductor.runtime.cutedsl_cache import disk_cache_get, disk_cache_set
-from torch._inductor.runtime.runtime_utils import ceildiv
+from tensorplay.compiler.backends.stax.ir import get_stride_order
+from tensorplay.compiler.backends.stax.runtime.cutedsl_cache import disk_cache_get, disk_cache_set
+from tensorplay.compiler.backends.stax.runtime.runtime_utils import ceildiv
 from cutlass.utils import TensorMapUpdateMode
 {{gen_defines()}}
 # ---- Import GroupedGemm implementation, copied from Cutlass during build. ----
 # Source: examples/python/CuTeDSL/cute/blackwell/kernel/grouped_gemm/grouped_gemm.py
-from torch._inductor.kernel.vendored_templates.cutedsl.kernels.cutedsl_grouped_gemm import (
+from tensorplay.compiler.backends.stax.codegen.cutedsl.cutedsl_grouped_gemm import (
     GroupedGemmKernel,
 )
 
@@ -46,21 +46,21 @@ _KERNEL_CONFIG_KEY = (
 def _to_cute_tensor(t, assumed_align=16):
     return from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=True).mark_layout_dynamic()
 
-_TORCH_TO_CUTLASS_DTYPE = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
-    torch.float64: cutlass.Float64,
-    torch.int8: cutlass.Int8,
-    torch.int32: cutlass.Int32,
-    torch.int64: cutlass.Int64,
+_TP_TO_CUTLASS_DTYPE = {
+    tp.float16: cutlass.Float16,
+    tp.bfloat16: cutlass.BFloat16,
+    tp.float32: cutlass.Float32,
+    tp.float64: cutlass.Float64,
+    tp.int8: cutlass.Int8,
+    tp.int32: cutlass.Int32,
+    tp.int64: cutlass.Int64,
 }
 
 def _to_fake_cute_tensor(t, assumed_align=16):
     dyn_shape = tuple(map(int, t.shape))
     stride_order = tuple(get_stride_order(t.stride()))
     return cute.runtime.make_fake_compact_tensor(
-        _TORCH_TO_CUTLASS_DTYPE[t.dtype], dyn_shape,
+        _TP_TO_CUTLASS_DTYPE[t.dtype], dyn_shape,
         stride_order=stride_order, assumed_align=assumed_align,
     )
 
@@ -230,9 +230,9 @@ def launch_build_group_ptrs_from_bases(
     base_B_u64 = int(input_b.data_ptr())
     base_C_u64 = int({{get_output()}}.data_ptr())
 
-    ptrs_t = torch.empty((G, 3), device=dev, dtype=torch.int64)
-    probs_t = torch.empty((G, 4), device=dev, dtype=torch.int32)
-    strides_t = torch.empty((G, 3, 2), device=dev, dtype=torch.int32)
+    ptrs_t = tp.empty((G, 3), device=dev, dtype=tp.int64)
+    probs_t = tp.empty((G, 4), device=dev, dtype=tp.int32)
+    strides_t = tp.empty((G, 3, 2), device=dev, dtype=tp.int32)
 
     prep_cache_key = get_prep_cache_key(input_a, input_b, {{get_output()}})
     prep_executor = disk_cache_get(_prep_fn_cache, __file__, _KERNEL_CONFIG_KEY, prep_cache_key, dev_idx)
@@ -281,7 +281,7 @@ def launch_build_group_ptrs_from_bases(
         GroupedGemmKernel.num_tensormaps,
         GroupedGemmKernel.bytes_per_tensormap // 8,
     )
-    tensormap_workspace_t = torch.empty(tensormap_shape, device=dev, dtype=torch.int64)
+    tensormap_workspace_t = tp.empty(tensormap_shape, device=dev, dtype=tp.int64)
 
     # --- Total clusters ---
     cluster_tile_shape_mn = compute_cluster_tile_shape(
@@ -346,9 +346,9 @@ def {{kernel_name}}_precompile(precompile_shapes, precompile_strides, precompile
     import logging
     _precompile_log = logging.getLogger(__name__)
 
-    dtype_a = getattr(torch, precompile_dtypes["input_a"])
-    dtype_b = getattr(torch, precompile_dtypes["input_b"])
-    dtype_out = getattr(torch, precompile_dtypes["output"])
+    dtype_a = getattr(tp, precompile_dtypes["input_a"])
+    dtype_b = getattr(tp, precompile_dtypes["input_b"])
+    dtype_out = getattr(tp, precompile_dtypes["output"])
 
     shape_a = tuple(precompile_shapes["input_a"])
     shape_b = tuple(precompile_shapes["input_b"])
@@ -378,7 +378,7 @@ def {{kernel_name}}_precompile(precompile_shapes, precompile_strides, precompile
     # Subprocess workers cannot allocate CUDA tensors, so we create CPU
     # tensors with matching shape/stride/dtype for _to_fake_cute_tensor.
     def _cpu_proxy(shape, stride, dtype):
-        return torch.empty_strided(shape, stride, dtype=dtype, device="cpu")
+        return tp.empty_strided(shape, stride, dtype=dtype, device="cpu")
 
     # _main transposes then unsqueezes: a.unsqueeze(-1), b[0].unsqueeze(-1), c.unsqueeze(-1)
     # Replicate those stride transformations on CPU proxies.
@@ -389,13 +389,13 @@ def {{kernel_name}}_precompile(precompile_shapes, precompile_strides, precompile
     proxy_b_unsq = proxy_b_transposed[0].unsqueeze(-1)
     proxy_out = _cpu_proxy(shape_out, stride_out, dtype_out).unsqueeze(-1)
 
-    proxy_offs = _cpu_proxy(shape_offs, (1,), torch.int32)
-    proxy_ptrs = _cpu_proxy((G, 3), (3, 1), torch.int64)
-    proxy_probs = _cpu_proxy((G, 4), (4, 1), torch.int32)
-    proxy_strides = _cpu_proxy((G, 3, 2), (6, 2, 1), torch.int32)
+    proxy_offs = _cpu_proxy(shape_offs, (1,), tp.int32)
+    proxy_ptrs = _cpu_proxy((G, 3), (3, 1), tp.int64)
+    proxy_probs = _cpu_proxy((G, 4), (4, 1), tp.int32)
+    proxy_strides = _cpu_proxy((G, 3, 2), (6, 2, 1), tp.int32)
 
     # --- Compile prep_executor ---
-    sizeof_element = torch.tensor(0, dtype=dtype_a).element_size()
+    sizeof_element = tp.tensor(0, dtype=dtype_a).element_size()
     sA_m, sA_k = stride_a
     sB_0, sB_n, sB_k = trans_stride_b
     sC_m, sC_n = stride_out
@@ -453,7 +453,7 @@ def {{kernel_name}}_precompile(precompile_shapes, precompile_strides, precompile
         tensormap_shape[1] * tensormap_shape[2],
         tensormap_shape[2],
         1,
-    ), torch.int64)
+    ), tp.int64)
 
     # Compute per-group problem sizes analytically from offsets
     offs_data = [sumM * (i + 1) // G for i in range(G)]
