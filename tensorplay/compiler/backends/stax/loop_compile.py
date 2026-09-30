@@ -92,7 +92,8 @@ def compile_graph(graph_module, example_inputs, *, scheduler: KernelScheduler | 
 
     with set_fake_mode(FakeTensorMode(allow_non_fake_inputs=True)), \
             shared_V.set_fake_mode(FakeTensorMode(allow_non_fake_inputs=True)):
-        graph = GraphLowering(graph_module, list(example_inputs)).run()
+        graph = GraphLowering(graph_module, list(example_inputs))
+        graph.run(*example_inputs)
     # Everything from here on is being done about this region, and anything
     # asked along the way -- what a kernel reads, what a store writes, how big
     # an extent is -- is answered by the region those answers belong to.  So
@@ -176,7 +177,8 @@ def compile_half_host(graph_module, example_inputs, **options):
 
     with set_fake_mode(FakeTensorMode(allow_non_fake_inputs=True)), \
             shared_V.set_fake_mode(FakeTensorMode(allow_non_fake_inputs=True)):
-        graph = GraphLowering(graph_module, list(example_inputs)).run()
+        graph = GraphLowering(graph_module, list(example_inputs))
+        graph.run(*example_inputs)
     plan = KernelScheduler(graph)
     graph.scheduler = plan
     # Fusing is asked once and the groups are kept: fusing walks the region and
@@ -291,5 +293,3 @@ def _is_fx_node(value) -> bool:
     """Whether a value is a graph node rather than what a node stands for."""
 
     return hasattr(value, "op") and hasattr(value, "users")
-
-

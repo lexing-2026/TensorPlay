@@ -1655,6 +1655,7 @@ class PythonWrapperCodegen(CodeGen):
                 from tensorplay import device, empty_strided
                 from {async_compile.__name__} import AsyncCompile
                 async_compile = AsyncCompile()
+                from tensorplay.compiler.backends.stax.templates.select_algorithm import extern_kernels
                 {debug_utils_import}
             """,
             strip=True,

@@ -946,19 +946,24 @@ void gemm_strided_batched_3d_op(const Tensor& self_3d, const Tensor& other_3d,
     const cublasGemmAlgo_t algorithm = isComplexType(dtype)
         ? CUBLAS_GEMM_DEFAULT
         : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
-    // The leading dimension of an operand counts the rows of what is stored,
-    // whichever way the operand is read.  A right operand the caller holds as
-    // (N, K) and asks to be read transposed therefore has N stored rows, so its
-    // leading dimension is N; naming K instead would describe a matrix the
-    // caller does not have.
-    const int lda_b = static_cast<int>(N);
+    // The row-major trick reads the result buffer as the transpose of the
+    // column-major product, so the leading dimension of an operand is the row
+    // count of what is stored rather than of the logical matrix.  Reading the
+    // right operand transposed turns the product into self @ other^T, which
+    // the trick expresses as other @ self^T in column-major: the transpose flag
+    // moves to the left operand and the leading dimensions stay the stored
+    // row counts either way.
+    const cublasOperation_t trans_a = transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const cublasOperation_t trans_b = CUBLAS_OP_N;
+    const int lda = static_cast<int>(transpose_b ? K : N);
+    const int ldb = static_cast<int>(K);
     CUBLAS_CHECK(cublasGemmStridedBatchedEx(
         CUDAContext::getCublasHandle(),
-        CUBLAS_OP_N, transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N,
+        trans_a, trans_b,
         static_cast<int>(N), static_cast<int>(M), static_cast<int>(K),
         alpha_ptr,
-        other_3d.data_ptr(), cuda_type, lda_b, stride_b,
-        self_3d.data_ptr(), cuda_type, static_cast<int>(K), stride_a,
+        other_3d.data_ptr(), cuda_type, lda, stride_b,
+        self_3d.data_ptr(), cuda_type, ldb, stride_a,
         beta_ptr,
         result_3d.data_ptr(), cuda_type, static_cast<int>(N), stride_c,
         static_cast<int>(batch_size), compute_type, algorithm));

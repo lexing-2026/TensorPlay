@@ -58,8 +58,13 @@ from tensorplay.graph.experimental.sympy_functions import (
     SymT,
     ValueRanges,
 )
+from .codegen.index_expr import Const as IndexConst
 
 log = logging.getLogger(__name__)
+
+
+def _size_expr(value):
+    return sympy.Integer(value.value) if isinstance(value, IndexConst) else value
 
 def free_symbols_of(*values: Any) -> set:
     """Every free symbol appearing in the values."""
@@ -512,7 +517,9 @@ class SizeVarAllocator:
     def statically_known_equals(self, left, right) -> bool:
         """Whether the two are the same for every shape the code will be handed."""
 
-        return self.statically_known_true(sympy.Eq(left, right))
+        return self.statically_known_true(
+            sympy.Eq(_size_expr(left), _size_expr(right))
+        )
 
     def statically_known_list_equals(self, left, right) -> bool:
         """Whether two lists are the same element for element, for every shape."""
@@ -524,25 +531,25 @@ class SizeVarAllocator:
     def statically_known_leq(self, left, right) -> bool:
         """Whether one is no larger than the other, for every shape."""
 
-        expr = left <= right
+        expr = _size_expr(left) <= _size_expr(right)
         return self.statically_known_true(expr)
 
     def statically_known_geq(self, left, right) -> bool:
         """Whether one is no smaller than the other, for every shape."""
 
-        expr = left >= right
+        expr = _size_expr(left) >= _size_expr(right)
         return self.statically_known_true(expr)
 
     def statically_known_lt(self, left, right) -> bool:
         """Whether one is strictly smaller than the other, for every shape."""
 
-        expr = left < right
+        expr = _size_expr(left) < _size_expr(right)
         return self.statically_known_true(expr)
 
     def statically_known_gt(self, left, right) -> bool:
         """Whether one is strictly larger than the other, for every shape."""
 
-        expr = left > right
+        expr = _size_expr(left) > _size_expr(right)
         return self.statically_known_true(expr)
 
     def _is_multiple_of(self, numerator, denominator: int) -> bool:
@@ -1443,7 +1450,9 @@ class SizeVarAllocator:
     def statically_known_equals(self, left: Expr | int, right: Expr | int) -> bool:
         """Whether it is sound to proceed as if the two were the same value."""
 
-        return statically_known_true(self.shape_env, sympy.Eq(left, right))
+        return statically_known_true(
+            self.shape_env, sympy.Eq(_size_expr(left), _size_expr(right))
+        )
 
     def _is_multiple_of(self, numerator: Expr, denominator: int) -> bool:
         """Whether the numerator is provably a multiple of the denominator.

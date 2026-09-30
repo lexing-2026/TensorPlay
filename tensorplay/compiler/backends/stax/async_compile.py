@@ -418,6 +418,16 @@ class AsyncCompile:
         )
         return kernel
 
+    def cpp_pybinding(self, argtypes, source_code: str):
+        from .codecache import CppPythonBindingsCodeCache
+
+        if get_compile_threads() <= 1:
+            return CppPythonBindingsCodeCache.load_pybinding(argtypes, source_code)
+        get_result = CppPythonBindingsCodeCache.load_pybinding_async(
+            argtypes, source_code, submit_fn=self.submit
+        )
+        return LambdaFuture(get_result)
+
     def _wait_futures(self, scope: dict) -> None:
         """Replace each thing that was only started with the thing itself.
 

@@ -17,10 +17,13 @@ from __future__ import annotations
 import base64
 import dataclasses
 import hashlib
+import importlib.util
 import logging
 import os
 import pickle
 import sys
+import sysconfig
+import textwrap
 from functools import lru_cache
 
 from .compile_worker.utils import in_toplevel_process
@@ -809,6 +812,210 @@ class LambdaFuture(CodeCacheFuture):
             # future without blocking further.
             self.future.result(timeout=timeout)
         return self.result_fn()
+
+
+@clear_on_fresh_cache
+class CppPythonBindingsCodeCache:
+    """Build and load the Python entry point for a generated host kernel."""
+
+    cache: dict[str, Any] = {}
+    _loaded_module_names: set[str] = set()
+    entry_function = "kernel"
+
+    @staticmethod
+    def cache_clear() -> None:
+        CppPythonBindingsCodeCache.cache.clear()
+        for name in CppPythonBindingsCodeCache._loaded_module_names:
+            sys.modules.pop(name, None)
+        CppPythonBindingsCodeCache._loaded_module_names.clear()
+
+    @classmethod
+    def _load_library_inner(cls, path: str, key: str) -> ModuleType:
+        module_name = f"{key}.{cls.entry_function}"
+        try:
+            return sys.modules[module_name]
+        except KeyError:
+            pass
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        if spec is None or spec.loader is None:
+            raise AssertionError(f"failed to create module loader for {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        cls._loaded_module_names.add(module_name)
+        spec.loader.exec_module(module)
+        return module
+
+    @classmethod
+    def load_pybinding_async(
+        cls,
+        argtypes,
+        main_code: str,
+        device_type: str = "cpu",
+        submit_fn=None,
+        **kwargs,
+    ):
+        del device_type, kwargs
+        parseargs = ", ".join(
+            f"parse_arg<{argtype.replace('const ', '')}>(args, {index})"
+            for index, argtype in enumerate(argtypes)
+        )
+        suffix = textwrap.dedent(
+            f"""
+            #define PY_SSIZE_T_CLEAN
+            #include <Python.h>
+            #include <cstdint>
+            #include <stdexcept>
+            #include <type_traits>
+
+            template <typename T>
+            static inline T parse_arg(PyObject* const* args, size_t index) {{
+                static_assert(std::is_pointer_v<T>);
+                PyObject* method = PyObject_GetAttrString(args[index], "data_ptr");
+                if (method == nullptr) {{
+                    throw std::runtime_error("expected a tensor pointer argument");
+                }}
+                PyObject* raw = PyObject_CallNoArgs(method);
+                Py_DECREF(method);
+                if (raw == nullptr) {{
+                    throw std::runtime_error("data_ptr() failed");
+                }}
+                const unsigned long long address = PyLong_AsUnsignedLongLong(raw);
+                Py_DECREF(raw);
+                if (address == static_cast<unsigned long long>(-1) &&
+                    PyErr_Occurred()) {{
+                    throw std::runtime_error("data_ptr() did not return an address");
+                }}
+                return reinterpret_cast<T>(static_cast<uintptr_t>(address));
+            }}
+
+            template <>
+            inline int64_t parse_arg<int64_t>(PyObject* const* args, size_t index) {{
+                const auto value = PyLong_AsLongLong(args[index]);
+                if (value == -1 && PyErr_Occurred()) {{
+                    throw std::runtime_error("expected an integer argument");
+                }}
+                return static_cast<int64_t>(value);
+            }}
+
+            template <>
+            inline float parse_arg<float>(PyObject* const* args, size_t index) {{
+                const double value = PyFloat_AsDouble(args[index]);
+                if (value == -1.0 && PyErr_Occurred()) {{
+                    throw std::runtime_error("expected a floating-point argument");
+                }}
+                return static_cast<float>(value);
+            }}
+
+            static PyObject* kernel_py(
+                PyObject*, PyObject* const* args, Py_ssize_t nargs) {{
+                try {{
+                    if (nargs != {len(argtypes)}) {{
+                        throw std::runtime_error("wrong number of kernel arguments");
+                    }}
+                    kernel({parseargs});
+                    Py_RETURN_NONE;
+                }} catch (const std::exception& error) {{
+                    PyErr_SetString(PyExc_RuntimeError, error.what());
+                    return nullptr;
+                }} catch (...) {{
+                    PyErr_SetString(PyExc_RuntimeError, "host kernel failed");
+                    return nullptr;
+                }}
+            }}
+
+            static PyMethodDef kernel_methods[] = {{
+                {{"kernel", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)()>(kernel_py)),
+                  METH_FASTCALL, nullptr}},
+                {{nullptr, nullptr, 0, nullptr}}
+            }};
+
+            static PyModuleDef kernel_module = {{
+                PyModuleDef_HEAD_INIT, "kernel", nullptr, -1, kernel_methods
+            }};
+
+            PyMODINIT_FUNC PyInit_kernel(void) {{
+                return PyModule_Create(&kernel_module);
+            }}
+            """
+        )
+        source_code = main_code + suffix
+
+        from .cpp_builder import CppBuilder, CppOptions, get_cpp_compiler, package_paths
+        from .kernel_cache import file_lock
+
+        paths = package_paths()
+        compiler = get_cpp_compiler()
+        if paths is None or not compiler:
+            raise RuntimeError("host C++ runtime is unavailable")
+        include_dir, generated_include_dir, lib_dir = paths
+        python_include = sysconfig.get_paths().get("include")
+        if not python_include:
+            raise RuntimeError("Python headers are unavailable")
+        options = CppOptions(
+            compiler=compiler,
+            include_dirs=[include_dir, generated_include_dir, python_include],
+            cflags=["-std=c++20", "-O3", "-fPIC", "-shared", "-pthread"],
+            library_dirs=[lib_dir],
+            libraries=["p10"],
+            ldflags=["-pthread", f"-Wl,-rpath,{lib_dir}"],
+        )
+        key, source_path = write(
+            source_code,
+            "cpp",
+            extra=options.command(["<sources>"], "<output>").__repr__(),
+        )
+        extension_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
+        output_path = os.path.join(
+            os.path.dirname(source_path), f"{key}{extension_suffix}"
+        )
+
+        if key not in cls.cache:
+            def build() -> None:
+                if os.path.exists(output_path):
+                    return
+                with file_lock(output_path + ".lock"):
+                    if os.path.exists(output_path):
+                        return
+                    builder = CppBuilder(
+                        name=os.path.basename(output_path),
+                        sources=[source_path],
+                        options=options,
+                        output_dir=os.path.dirname(output_path),
+                    )
+                    builder.build()
+
+            pending = submit_fn(build) if submit_fn is not None else None
+            loaded = None
+
+            def load() -> ModuleType:
+                nonlocal loaded
+                if loaded is None:
+                    if pending is not None:
+                        pending.result()
+                    else:
+                        build()
+                    loaded = cls._load_library_inner(output_path, key)
+                return loaded
+
+            cls.cache[key] = load
+
+        get_result = cls.cache[key]
+        result = None
+
+        def future():
+            nonlocal result
+            if result is None:
+                module = get_result()
+                if not isinstance(module, ModuleType):
+                    raise AssertionError(f"expected a Python module, got {type(module)}")
+                result = getattr(module, cls.entry_function)
+            return result
+
+        return future
+
+    @classmethod
+    def load_pybinding(cls, *args, **kwargs):
+        return cls.load_pybinding_async(*args, **kwargs)()
 
 
 #: The name a built kernel is entered through.  One name for every kernel, so

@@ -4977,11 +4977,11 @@ class CppKernelProxy(CppKernel):
     def gen_body(self, code: BracesBuffer | None = None):
         if code is None:
             raise AssertionError("expected code is not None")
-        if_prefix = "C10_LIKELY"
+        if_prefix = "TP_LIKELY"
         for kernel in self.kernels:
             with contextlib.ExitStack() as stack:
                 if kernel.codegen_conditions(code, if_prefix):
-                    if_prefix = "C10_UNLIKELY"
+                    if_prefix = "TP_UNLIKELY"
                     stack.enter_context(code.indent())
                     code.splice(kernel.gen_body())
 
@@ -5024,13 +5024,13 @@ class CppKernelProxy(CppKernel):
             suffix_buf = BracesBuffer()
             with contextlib.ExitStack() as stack:
                 if main_loop_kernel.codegen_conditions(
-                    suffix_buf, "C10_LIKELY", outer_loop.var
+                    suffix_buf, "TP_LIKELY", outer_loop.var
                 ):
                     stack.enter_context(suffix_buf.indent())
                     suffix_buf.splice(main_loop_kernel.reduction_suffix)
             with contextlib.ExitStack() as stack:
                 if tail_loop_kernel.codegen_conditions(
-                    suffix_buf, "C10_UNLIKELY", outer_loop.var
+                    suffix_buf, "TP_UNLIKELY", outer_loop.var
                 ):
                     stack.enter_context(suffix_buf.indent())
                     if type(tail_loop_kernel) is self.kernel_cls:

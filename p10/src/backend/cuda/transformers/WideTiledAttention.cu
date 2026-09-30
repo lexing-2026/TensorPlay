@@ -50,11 +50,13 @@ constexpr int kWideTileD = 128;
 // The two tile shapes.  A one-row call needs one row of keys, a wide one
 // needs all of them.
 constexpr int kWideNarrowTile = 1;
-// A tile of at least sixteen rows is walked by two warps so that the key axis
-// has more than one lane working on it; a narrower tile would leave most of a
-// warp idle, so it is walked by one.
+// A tile of at least sixteen rows is walked by several warps so that a warp
+// scheduler always has another warp ready while one waits on the chip: the
+// walk is a chain of chip loads, and a block of one or two warps leaves the
+// scheduler idle behind every load.  A narrower tile has fewer rows to give
+// each warp, so it takes fewer warps; a one-row tile takes one.
 template <int kTile>
-constexpr int kWideWarps = kTile >= 16 ? 2 : 1;
+constexpr int kWideWarps = kTile >= 32 ? 8 : kTile >= 16 ? 4 : kTile >= 4 ? 2 : 1;
 template <int kTile>
 constexpr int kWideRowsPerWarp = kTile / kWideWarps<kTile>;
 template <int kTile>
@@ -66,6 +68,15 @@ constexpr int kWideColsPerLane = kWideTileD / 32;
 // tile of query, a tile of key and a score tile rather than two operand tiles.
 // The score tile is rewritten in place with the probability once the row
 // statistics are known, so the probability costs nothing.
+//
+// The key rows are stored through a column permutation that folds the row
+// index into the low five bits of the column.  A key sits in its own row and
+// a row is 128 floats wide, which is four bank widths, so under the plain
+// layout a sweep that reads one column of every key row finds every lane in
+// one bank and pays the full conflict on every load; under the permutation the
+// same sweep lands on as many banks as it has lanes.  The value rows keep the
+// plain layout: their product reads one row per lane step, and giving each
+// lane columns 32 floats apart serves that sweep without a permutation.
 template <int kTile>
 struct TpWideShared {
   float q[kTile][kWideTileD];
@@ -75,6 +86,12 @@ struct TpWideShared {
   float row_sum[kTile];
   float row_alpha[kTile];
 };
+
+// The low five bits of the column move with the row: storing column c of row
+// n at c ^ (n & 31) puts a fixed-column sweep across rows on distinct banks.
+__device__ __forceinline__ int wide_kv_col(int col, int row) {
+  return col ^ (row & 31);
+}
 
 template <int kTile>
 __global__ void sdpa_wide_flash_kernel(
@@ -143,7 +160,7 @@ __global__ void sdpa_wide_flash_kernel(
       const int kr = idx / tile_d;
       const int d = idx % tile_d;
       const int64_t kg = k0 + kr;
-      smem.kv[kr][d] = (kg < Tkv && d < D) ? k[kv_base + kg * D + d] : 0.f;
+      smem.kv[kr][wide_kv_col(d, kr)] = (kg < Tkv && d < D) ? k[kv_base + kg * D + d] : 0.f;
     }
     __syncthreads();
 
@@ -151,14 +168,16 @@ __global__ void sdpa_wide_flash_kernel(
     // the key tile, so every (row, key) score is produced by exactly one lane
     // and no two lanes write the same slot.  The product is a register dot
     // product, which is what a wide precision without a fragment form comes
-    // down to.
+    // down to.  The key read goes through the permutation the key was stored
+    // under, so a lane's sweep over the key rows reads across the banks
+    // instead of marching down one.
     if (warp < warps) {
       const int qr0 = warp * kWideRowsPerWarp<kTile>;
       for (int qr = qr0; qr < qr0 + kWideRowsPerWarp<kTile>; ++qr) {
         for (int n = lane; n < k_tile; n += 32) {
           float total = 0.f;
           for (int d0 = 0; d0 < tile_d; ++d0)
-            total += smem.q[qr][d0] * smem.kv[n][d0];
+            total += smem.q[qr][d0] * smem.kv[n][wide_kv_col(d0, n)];
           smem.score[qr][n] = total;
         }
       }
@@ -238,12 +257,16 @@ __global__ void sdpa_wide_flash_kernel(
       }
       for (int r = 0; r < kWideRowsPerWarp<kTile>; ++r) {
         const int qr = qr0 + r;
-        const int d0 = lane * kWideColsPerLane<kTile>;
+        // A lane takes columns a bank apart rather than a run of them: the
+        // value row a lane reads at each key step is then one float wide, and
+        // a warp's sweep over the key rows sweeps the banks instead of four
+        // lanes sharing one.  The column offset also coalesces the final
+        // store, which writes the same columns.
 #pragma unroll
         for (int c = 0; c < kWideColsPerLane<kTile>; ++c) {
           float total = 0.f;
           for (int n = 0; n < k_tile; ++n)
-            total += smem.score[qr][n] * smem.kv[n][d0 + c];
+            total += smem.score[qr][n] * smem.kv[n][lane + 32 * c];
           acc[r][c] += total;
         }
       }
@@ -261,10 +284,10 @@ __global__ void sdpa_wide_flash_kernel(
       if (qg >= Tq) continue;
       const float total = smem.row_sum[qr];
       const float inverse = total > 0.f ? 1.f / total : 0.f;
-      const int d0 = lane * kWideColsPerLane<kTile>;
 #pragma unroll
       for (int c = 0; c < kWideColsPerLane<kTile>; ++c) {
-        if (d0 + c < D) out[q_base + qg * D + (d0 + c)] = acc[r][c] * inverse;
+        if (lane + 32 * c < D)
+          out[q_base + qg * D + (lane + 32 * c)] = acc[r][c] * inverse;
       }
     }
   }
