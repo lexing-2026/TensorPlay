@@ -3742,7 +3742,12 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
             dtype = tp.float32 if should_upcast(dtype) else dtype
 
         if not self.inside_reduction:
-            raise AssertionError("expected inside_reduction")
+            if any(
+                prefix_is_reduction(t.prefix) for t in self.range_trees
+            ):
+                self.inside_reduction = True
+            else:
+                raise AssertionError("expected inside_reduction")
         masks = OrderedSet(tree.mask_name() for tree in self.range_trees)
         self.filter_masks(masks)
         masks = sorted(masks)

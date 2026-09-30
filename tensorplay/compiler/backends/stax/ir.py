@@ -4936,6 +4936,26 @@ class Reduction(Loops):
                 ranges=list(ranges),
             )
 
+        if reduction_numel == 1 and not strict_reduction:
+            # A reduction over a single element reads that element and is a
+            # pointwise op; emitting a reduction loop for it would produce a
+            # one-iteration reduction that some codegens cannot spell.
+            if reduction_type in ("argmin", "argmax"):
+                def fn(index):
+                    return ops.constant(0, dst_dtype)
+
+            else:
+                def fn(index):
+                    reduction_index = [sympy.S.Zero for _ in reduction_ranges]
+                    return inner_fn(index, reduction_index)
+
+            return Pointwise.create(
+                device=device,
+                dtype=dst_dtype,
+                inner_fn=fn,
+                ranges=list(ranges),
+            )
+
         hint, split = cls.num_splits(
             device,
             dst_dtype,
