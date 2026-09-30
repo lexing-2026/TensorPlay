@@ -586,7 +586,8 @@ class CppWrapperCodegen(PythonWrapperCodegen):
         stack_traces,
     ) -> None:
         raise NotImplementedError(
-            "C++ wrapper does not support fallback kernel calls yet"
+            "C++ wrapper does not yet generate multi-output fallback "
+            f"kernels ({kernel_name!r}, outputs={output_names!r})"
         )
 
     def _generate_index_put_fallback_helper(self, node) -> None:
