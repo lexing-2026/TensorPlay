@@ -17,8 +17,12 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <iostream>
 #include <limits>
+#include <string>
 #include <type_traits>
 #include <thread>
 #include <vector>
@@ -46,6 +50,61 @@ inline void throw_if_integer_div_error(std::atomic<int>& error) {
     if (error.load(std::memory_order_acquire)) {
         TP_THROW(RuntimeError, "ZeroDivisionError");
     }
+}
+
+// Debug helpers for a generated C++ wrapper.  They operate on raw buffer
+// pointers plus an explicit element count, which is what a generated wrapper
+// has for a tensor argument; the element count is emitted by the wrapper
+// codegen alongside the pointer.
+
+template <typename T>
+TP_ALWAYS_INLINE bool tp_has_inf_or_nan(const char* name, const T* data, int64_t numel) {
+    for (int64_t i = 0; i < numel; ++i) {
+        if (std::isnan(static_cast<double>(data[i])) ||
+            std::isinf(static_cast<double>(data[i]))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <typename T>
+TP_ALWAYS_INLINE void tp_print_tensor_handle(const T* data, int64_t numel, const char* msg) {
+    const int64_t max_numel_to_print = 64;
+    std::cout << '[';
+    if (msg != nullptr) {
+        std::cout << "  " << msg;
+    }
+    std::cout << "  ]:\n";
+    if (numel <= max_numel_to_print) {
+        for (int64_t i = 0; i < numel; ++i) {
+            std::cout << static_cast<double>(data[i]) << ' ';
+        }
+        std::cout << '\n';
+    }
+    std::cout << "Number of elements: " << numel << '\n';
+}
+
+template <typename T>
+TP_ALWAYS_INLINE void tp_save_tensor_handle(const T* data, int64_t numel,
+                                            const char* tensor_name,
+                                            const char* launch_prefix,
+                                            const char* kernel_name) {
+    const std::string folder = "tmp/tp_debug";
+    std::error_code ec;
+    std::filesystem::create_directories(folder, ec);
+    if (ec) {
+        std::cerr << "tp_save_tensor_handle: Error creating directory: "
+                  << folder << " error: " << ec.message() << '\n';
+        return;
+    }
+    const std::string path = folder + "/" + launch_prefix + "_" + kernel_name +
+                             "_" + tensor_name + ".bin";
+    std::ofstream fout(path, std::ios::out | std::ios::binary);
+    fout.write(reinterpret_cast<const char*>(data),
+               static_cast<std::streamsize>(numel * static_cast<int64_t>(sizeof(T))));
+    fout.close();
+    std::cout << "tp_save_tensor_handle: Saved tensor to " << path << '\n';
 }
 
 template <typename T, typename U>

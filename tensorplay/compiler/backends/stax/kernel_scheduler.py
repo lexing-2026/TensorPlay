@@ -1073,7 +1073,7 @@ class BaseSchedulerNode:
             flops = flops.node.expr
 
         resolved_flops = V.graph.sizevars.optimization_hint(flops, fallback=0)
-        counters["inductor"]["flop_count"] += resolved_flops
+        counters["tp"]["flop_count"] += resolved_flops
         return resolved_flops
 
     def get_estimated_runtime(self) -> float:

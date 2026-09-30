@@ -38,7 +38,7 @@ class _RuntimeContext(_Context):
     """Context provider for runtime configuration and environment settings.
 
     Collects configuration settings that affect runtime behavior but not
-    compilation, such as Inductor configs, determinism settings, and CUDA
+    compilation, such as tp configs, determinism settings, and CUDA
     matmul precision configurations.
     """
 
@@ -49,22 +49,22 @@ class _RuntimeContext(_Context):
 
         Returns:
             A sequence containing the available runtime context forms:
-            - "inductor_configs": compiler configuration settings
+            - "tp_configs": compiler configuration settings
             - "determinism_configs": Deterministic algorithm settings
             - "cuda_matmul_precision_configs": CUDA matrix multiplication precision settings
         """
         return (
-            "inductor_configs",
+            "tp_configs",
             "determinism_configs",
             "cuda_matmul_precision_configs",
         )
 
     @staticmethod
-    def inductor_configs() -> dict[str, object]:
-        """Get portable Inductor configuration settings.
+    def tp_configs() -> dict[str, object]:
+        """Get portable tp configuration settings.
 
         Returns:
-            A dictionary containing Inductor configuration settings,
+            A dictionary containing tp configuration settings,
             including private configs.
         """
         from ... import config
@@ -209,7 +209,7 @@ class _CompileContext(_Context):
 
 
 class SelectedRuntimeContext(TypedDict):
-    inductor_configs: bool
+    tp_configs: bool
     determinism_configs: bool
     cuda_matmul_precision_configs: bool
 

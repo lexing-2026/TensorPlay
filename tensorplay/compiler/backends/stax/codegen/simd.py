@@ -51,7 +51,7 @@ from ..optimize_indexing import (
     indexing_dtype_strength_reduction,
 )
 from ..runtime.coordinate_descent_tuner import CoordescTuner
-from ..runtime.hints import DeviceProperties, InductorMeta
+from ..runtime.hints import DeviceProperties, TpMeta
 from ..runtime.runtime_utils import (
     green_text,
     last_power_of_2,
@@ -3756,7 +3756,7 @@ class SIMDScheduling(BaseScheduling):
                     raise AssertionError("expected node.node to not be None")
                 origin_node = node.node.get_origin_node()
                 if origin_node is not None:
-                    counters["inductor"]["intermediate_hooks"] += 1
+                    counters["tp"]["intermediate_hooks"] += 1
                     V.graph.wrapper_code.writeline(
                         f"run_intermediate_hooks({origin_node.name!r}, {name})"
                     )
@@ -4149,11 +4149,11 @@ class SIMDScheduling(BaseScheduling):
             for prefix, numel in kernel.numels.items()
             if not prefix_is_reduction(prefix) or kernel.inside_reduction
         }
-        inductor_meta = cast(
-            "InductorMeta",
+        tp_meta = cast(
+            "TpMeta",
             {
-                **kernel.inductor_meta_common(),
-                **kernel.inductor_meta_per_kernel(),
+                **kernel.tp_meta_common(),
+                **kernel.tp_meta_per_kernel(),
             },
         )
         if kernel.persistent_reduction:
@@ -4161,7 +4161,7 @@ class SIMDScheduling(BaseScheduling):
                 size_hints,
                 reduction_hint=kernel.features.get_reduction_hint(kernel.tiling_scores),
                 triton_meta=kernel.triton_meta,
-                inductor_meta=inductor_meta,
+                tp_meta=tp_meta,
                 return_configs=True,
             )
         elif kernel.inside_reduction:
@@ -4169,7 +4169,7 @@ class SIMDScheduling(BaseScheduling):
                 size_hints,
                 reduction_hint=kernel.features.get_reduction_hint(kernel.tiling_scores),
                 triton_meta=kernel.triton_meta,
-                inductor_meta=inductor_meta,
+                tp_meta=tp_meta,
                 return_configs=True,
             )
         else:
@@ -4178,7 +4178,7 @@ class SIMDScheduling(BaseScheduling):
                 size_hints,
                 triton_meta=kernel.triton_meta,
                 tile_hint=select_tile_hint(size_hints, signature),
-                inductor_meta=inductor_meta,
+                tp_meta=tp_meta,
                 return_configs=True,
             )
         return configs, kernel
@@ -4310,7 +4310,7 @@ class SIMDScheduling(BaseScheduling):
         failed: OrderedSet[int] = OrderedSet()
 
         def fallback(index: int, pn: Any) -> None:
-            counters["inductor"]["combo_subkernel_autotune_fallback"] += 1
+            counters["tp"]["combo_subkernel_autotune_fallback"] += 1
             log.warning("combo compile-time autotune failed for %s; carving out", pn)
             failed.add(index)
 
@@ -4345,7 +4345,7 @@ class SIMDScheduling(BaseScheduling):
                 or not launchers
                 or info.get("autotune_cache_state") == "hit"
             )
-            counters["inductor"][
+            counters["tp"][
                 "combo_subkernel_autotune_cached"
                 if cached
                 else "combo_subkernel_autotune"

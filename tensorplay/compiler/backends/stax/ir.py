@@ -80,7 +80,7 @@ from .utils import (
 from .codegen.index_expr import _lift, FloorDiv, floordiv
 
 
-def convert_shape_to_inductor(lst) -> list:
+def convert_shape_to_tp(lst) -> list:
     """The shape and stride of a value, as expressions.
 
     Ordinary values are already numbers and need nothing done to them, while a
@@ -3495,7 +3495,7 @@ class Subgraph(IRNode):
 
     name: str
     graph_module: Any
-    inductor_config_patches: dict | None = None
+    tp_config_patches: dict | None = None
     graph: Any = None
 
 
@@ -7042,9 +7042,14 @@ class ExternKernel(InputsKernel):
         if self.allarg_properties:
             for name in self.ordered_kwargs_for_cpp_kernel or self.allarg_properties:
                 if name in self.kwargs:
-                    kwargs.append(f"{name}={self.kwargs[name]}")
+                    value = self.kwargs[name]
+                    if isinstance(value, str):
+                        value = repr(value)
+                    kwargs.append(f"{name}={value}")
         else:
             for name, value in self.kwargs.items():
+                if isinstance(value, str):
+                    value = repr(value)
                 kwargs.append(f"{name}={value}")
         return kwargs
 
@@ -7077,6 +7082,16 @@ class MultiOutput(ExternKernel):
         if not self.skip_size_stride_alignment_checks:
             self.codegen_size_asserts(wrapper)
             self.codegen_alignment_asserts(wrapper)
+
+    def get_op_name(self) -> str:
+        node = getattr(self, "origin_node", None)
+        if node is not None:
+            target = node.target
+            op_namespace = getattr(target, "__module__", "unknown_namespace")
+            op_namespace = op_namespace.replace("._ops.", ".ops.")
+            op_namespace = op_namespace.rsplit(".", 1)[0]
+            return f"{op_namespace}.{target}"
+        return "unknown_op"
 
     def __init__(
         self,
@@ -7944,7 +7959,7 @@ class IndexPutFallback(ExternKernel):
             self.unwrap_storage(tensors),
             (accumulate,),
             python_kernel_name="tp.index_put_",
-            cpp_kernel_name="aoti_torch_index_put_out",
+            cpp_kernel_name="tp_index_put_out",
             op_overload=op_overload,
         )
         V.graph.mark_buffer_mutated(self.input_name(0))
@@ -8029,7 +8044,7 @@ class InplaceCopyFallback(ExternKernel):
             inputs,
             constant_args,
             python_kernel_name="tp.copy_",
-            cpp_kernel_name="aoti_torch_copy_",
+            cpp_kernel_name="tp_copy_",
         )
         V.graph.mark_buffer_mutated(inputs[0].get_name())
         self.name = V.graph.register_buffer(self)
@@ -8354,7 +8369,7 @@ class DeviceCopy(ExternKernelOut):
             # so making it again on the other device would not do.
             and try_get_name(x) not in V.graph.mutated_buffers
             and all(r in V.graph.constants for r in x.get_read_names())
-            and not config.aot_inductor.use_runtime_constant_folding
+            and not config.tp_export.use_runtime_constant_folding
         ):
             if V.graph.cpp_wrapper:
                 # The value is being made on the other device, but both devices
@@ -9875,8 +9890,8 @@ class FallbackKernel(ExternKernelAlloc):
         return FixedLayout(
             output.device,
             output.dtype,
-            convert_shape_to_inductor(output.size()),
-            convert_shape_to_inductor(output.stride()),
+            convert_shape_to_tp(output.size()),
+            convert_shape_to_tp(output.stride()),
             is_pinned=is_pinned,
         )
     @staticmethod
@@ -10423,7 +10438,7 @@ class UserDefinedTritonKernel(ExternKernel):
         (
             new_name,
             triton_meta,
-            inductor_meta,
+            tp_meta,
             extra_launch_args,
         ) = wrapper.define_user_defined_triton_kernel(
             kernel,
@@ -10485,7 +10500,7 @@ class UserDefinedTritonKernel(ExternKernel):
             raw_args=raw_args_filtered,
             raw_keys=raw_keys_filtered,
             triton_meta=triton_meta,
-            inductor_meta=inductor_meta,
+            tp_meta=tp_meta,
             triton=True,
             device=self.get_device(),
             original_fxnode_name=getattr(self.fx_node, "name", None),
@@ -10759,7 +10774,7 @@ class _AllReduceKernel(_CollectiveKernel):
             kwargs=None,
             unbacked_bindings=unbacked_bindings,
         )
-        self.set_cpp_kernel_name("aoti_torch_cpu__c10d_functional_all_reduce")
+        self.set_cpp_kernel_name("tp_cpu__distributed_functional_all_reduce")
 
     def codegen(self, wrapper) -> None:
         wrapper.generate_extern_kernel_alloc(self)
@@ -10795,7 +10810,7 @@ class _AllReduce_Kernel(_CollectiveKernel):
             kwargs=None,
             unbacked_bindings=unbacked_bindings,
         )
-        self.set_cpp_kernel_name("aoti_torch_cpu__c10d_functional_all_reduce")
+        self.set_cpp_kernel_name("tp_cpu__distributed_functional_all_reduce")
 
     def codegen(self, wrapper) -> None:
         wrapper.generate_extern_kernel_alloc(self)
@@ -10835,7 +10850,7 @@ class _WaitKernel(_CollectiveKernel):
             kwargs=None,
             unbacked_bindings=unbacked_bindings,
         )
-        self.set_cpp_kernel_name("aoti_torch_cpu__c10d_functional_wait_tensor")
+        self.set_cpp_kernel_name("tp_cpu__distributed_functional_wait_tensor")
 
     def codegen(self, wrapper) -> None:
         wrapper.generate_extern_kernel_alloc(self)
@@ -11619,8 +11634,6 @@ class View(GenericView):
                 reindex = cls.dynamic_reshape_indexer(old_size, new_size)
                 return cls(data=x, size=list(new_size), reindex=reindex)
             except Exception:
-                # A position out of the data cannot be compared against a shape,
-                # so the arithmetic form is not available.
                 x = ExternKernel.require_contiguous(x)
                 return create_reinterpret_view(
                     x, new_size, FlexibleLayout.contiguous_strides(new_size)

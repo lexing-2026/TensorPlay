@@ -53,7 +53,7 @@ log = logging.getLogger(__name__)
 _PRESERVE_FLEX_GEMM_GEMM_OP = "preserve_flex_gemm_gemm_op"
 early_patterns = PatternMatcherPass()
 patterns = PatternMatcherPass()
-aten = tp.ops.tp
+tp_ops = tp.ops.tp
 prims = tp.ops.prims
 
 pass_patterns = [
@@ -172,7 +172,7 @@ def remove_no_ops(
             replacement.meta.update(node.meta)
             graph.erase_node(node)
 
-        for node in graph.find_nodes(op="call_function", target=aten.add.Tensor):
+        for node in graph.find_nodes(op="call_function", target=tp_ops.add.Tensor):
             if len(node.args) == 2:
                 if (
                     not any(
@@ -195,7 +195,7 @@ def remove_no_ops(
                         continue
                 replace_no_op(node, replace_index)
 
-        for node in graph.find_nodes(op="call_function", target=aten.sub.Tensor):
+        for node in graph.find_nodes(op="call_function", target=tp_ops.sub.Tensor):
             if len(node.args) == 2:
                 if (
                     not (
@@ -208,7 +208,7 @@ def remove_no_ops(
 
                 replace_no_op(node, 0)
 
-        for node in graph.find_nodes(op="call_function", target=aten.mul.Tensor):
+        for node in graph.find_nodes(op="call_function", target=tp_ops.mul.Tensor):
             if len(node.args) == 2:
                 if not any(
                     e in ones or (isScalarValue(e) and e == 1) for e in node.args
@@ -223,7 +223,7 @@ def remove_no_ops(
                 )
                 replace_no_op(node, replace_input_index)
 
-        for node in graph.find_nodes(op="call_function", target=aten.div.Tensor):
+        for node in graph.find_nodes(op="call_function", target=tp_ops.div.Tensor):
             if len(node.args) == 2 and (
                 node.args[1] in ones
                 or (isScalarValue(node.args[1]) and node.args[1] == 1)
@@ -249,7 +249,7 @@ def remove_no_ops(
                         stride = graph.materialize_symints(val.stride())
                         n.replace_all_uses_with(
                             graph.call_function(
-                                aten.empty_strided.default,
+                                tp_ops.empty_strided.default,
                                 args=(size, stride),
                                 kwargs={"dtype": val.dtype, "device": val.device},
                             )
@@ -271,7 +271,7 @@ def remove_redundant_views(gm: GraphModule):
         graph = gm.graph
 
         for node in graph.find_nodes(
-            op="call_function", target=aten.view.dtype
+            op="call_function", target=tp_ops.view.dtype
         ):
             src = node.args[0]
             to_type = node.args[1]
@@ -314,7 +314,7 @@ def remove_redundant_views(gm: GraphModule):
 class UniformValueConstantFolder(ConstantFolder):
     """
     Runs constant folding and replaces tensors that have a uniform value
-    with a tensor constructor call: aten.full([shape], value, ...)
+    with a tensor constructor call: tp_ops.full([shape], value, ...)
     """
 
     def __init__(self, gm, skip_constructors=False) -> None:
@@ -334,21 +334,21 @@ class UniformValueConstantFolder(ConstantFolder):
                     self.symint_nodes[n.meta["val"]] = n
 
         self.view_op_packets = [
-            aten.squeeze,
-            aten.unsqueeze,
-            aten.alias,
-            aten.view,
-            aten.slice,
-            aten.t,
+            tp_ops.squeeze,
+            tp_ops.unsqueeze,
+            tp_ops.alias,
+            tp_ops.view,
+            tp_ops.slice,
+            tp_ops.t,
             prims.broadcast_in_dim,
-            aten.expand,
-            aten.as_strided,
-            aten.permute,
+            tp_ops.expand,
+            tp_ops.as_strided,
+            tp_ops.permute,
         ]
 
         self.indexing_op_packets = OrderedSet(
             [
-                aten.slice,
+                tp_ops.slice,
             ]
         )
 
@@ -361,10 +361,10 @@ class UniformValueConstantFolder(ConstantFolder):
         """
         for op in itertools.chain(
             self.module.graph.find_nodes(  # type: ignore[operator, union-attr]
-                op="call_function", target=aten.mul.Tensor
+                op="call_function", target=tp_ops.mul.Tensor
             ),
             self.module.graph.find_nodes(  # type: ignore[operator, union-attr]
-                op="call_function", target=aten.mul.Scalar
+                op="call_function", target=tp_ops.mul.Scalar
             ),
         ):
             tensor_val = op.meta.get("val", None)
@@ -425,7 +425,7 @@ class UniformValueConstantFolder(ConstantFolder):
         # single-elem attrs
         if node.op == "get_attr" or (
             node.op == "call_function"
-            and node.target is aten.lift_fresh_copy.default
+            and node.target is tp_ops.lift_fresh_copy.default
         ):
             out = super(ConstantFolder, self).run_node(node)
             if isinstance(out, tp.Tensor) and out.numel() == 1:
@@ -438,7 +438,7 @@ class UniformValueConstantFolder(ConstantFolder):
         # constructors ops
         if (
             node.op == "call_function"
-            and node.target is aten.full.default
+            and node.target is tp_ops.full.default
             and len(node.args) == 2
         ):
             args, kwargs = self.fetch_args_kwargs_from_env(node)
@@ -446,10 +446,10 @@ class UniformValueConstantFolder(ConstantFolder):
             # Don't specialize symbolic value.
             if not isinstance(value, (tp.SymInt, tp.SymFloat, tp.SymBool)):
                 new_args = [[1], value]
-                return aten.full.default(*new_args, **node.kwargs)
+                return tp_ops.full.default(*new_args, **node.kwargs)
 
         # handle before view ops because this changes value
-        if node.target is aten.view.dtype:
+        if node.target is tp_ops.view.dtype:
             (input_tensor, output_dtype), kwargs = self.fetch_args_kwargs_from_env(node)
             # view.dtype with different element sizes changes element count
             # (e.g., complex64 [1+0j] viewed as float32 becomes [1.0, 0.0]),
@@ -477,7 +477,7 @@ class UniformValueConstantFolder(ConstantFolder):
         # pointwise ops
         if isinstance(node.target, tp._ops.OpOverload) and (
             "pointwise" in node.target.tags
-            or node.target is aten.scalar_tensor.default
+            or node.target is tp_ops.scalar_tensor.default
         ):
             args, kwargs = self.fetch_args_kwargs_from_env(node)
             flattened_inputs = pytree.arg_tree_leaves(*args, **kwargs)
@@ -517,7 +517,7 @@ def _has_self_referential_shape(
 def constant_fold_uniform_value(gm: GraphModule):
     """Runs constant folding and replaces constants which can be constructed with a single `full` call. Calls into remove_no_ops."""
     with _disable_current_modes():
-        aten = tp.ops.tp
+        tp_ops = tp.ops.tp
 
         # Constant folding can leak memory, especially with repeated compilation, so we are only going to
         # remove constants which can be replaced with a constructor.
@@ -551,7 +551,7 @@ def constant_fold_uniform_value(gm: GraphModule):
             # we don't have a functional way right now of instantiating a non-contiguous tensor with full/zeros/ones right now
             # hasn't shown up to be important yet
             if "val" not in node.meta:
-                # This can only happen in AOTI
+                # This can only happen in the ahead-of-time export
                 continue
 
             fake_tensor = node.meta["val"]
@@ -574,7 +574,7 @@ def constant_fold_uniform_value(gm: GraphModule):
                 # the conversion from tensor and back to value can be lossy, just use the original full ctor value
                 if (
                     node.op == "call_function"
-                    and node.target is aten.full.default
+                    and node.target is tp_ops.full.default
                     and len(node.args) == 2
                 ):
                     value = node.args[1]
@@ -606,7 +606,7 @@ def constant_fold_uniform_value(gm: GraphModule):
 
                 # zeros and ones just get traced into full, so we insert those
                 new_node = graph.call_function(
-                    aten.full.default,
+                    tp_ops.full.default,
                     args=(shapes, value),
                     kwargs={
                         "dtype": fake_tensor.dtype,
@@ -704,7 +704,7 @@ def canonicalize_quant_mapping(gm: GraphModule):
                 graph.erase_node(first_user)
 
 
-def canonicalize_aten_ir_passes(gm: GraphModule):
+def canonicalize_tp_ir_passes(gm: GraphModule):
     """
     Canonicalization passes that will run immediately after aot autograd
     tracing. Thsis must be run before all other graph passes.
@@ -728,7 +728,7 @@ def joint_graph_passes(
     count = 0
 
     # must occur before other passes
-    canonicalize_aten_ir_passes(graph)
+    canonicalize_tp_ir_passes(graph)
 
     for joint_custom_pre_pass in get_custom_graph_passes(config.joint_custom_pre_pass):
         GraphTransformObserver(graph, "joint_custom_pre_pass").apply_graph_pass(
@@ -805,7 +805,7 @@ def fix_iota_device(match: Match, length, start, step, dtype, device, requires_g
     """
     Eager supports:
 
-        aten.index(cuda_tensor, tp.arange(..., device="cpu"))
+        tp_ops.index(cuda_tensor, tp.arange(..., device="cpu"))
 
     But this results in an implicit host-device-copy and breaks cudagraphs.
     Rewrite the arange to use CUDA.
@@ -815,7 +815,7 @@ def fix_iota_device(match: Match, length, start, step, dtype, device, requires_g
     for user in node.users:
         if (
             user.op == "call_function"
-            and user.target in (aten.index.Tensor, aten.index_put.default)
+            and user.target in (tp_ops.index.Tensor, tp_ops.index_put.default)
             and hasattr(user.meta.get("val"), "device")
         ):
             user_devices.add(user.meta["val"].device)  # type: ignore[union-attr]
@@ -927,7 +927,7 @@ def definitely_equal(
 
 
 @register_graph_pattern(
-    CallFunction(aten.view.default, KeywordArg("arg"), KeywordArg("size")),
+    CallFunction(tp_ops.view.default, KeywordArg("arg"), KeywordArg("size")),
     # pyrefly: ignore [bad-argument-type]
     pass_dict=early_patterns,
 )
@@ -942,8 +942,8 @@ def pointless_view(match: Match, arg, size):
 
 @register_graph_pattern(
     CallFunction(
-        aten.view.default,
-        CallFunction(aten.view.default, KeywordArg("arg"), KeywordArg("size1")),
+        tp_ops.view.default,
+        CallFunction(tp_ops.view.default, KeywordArg("arg"), KeywordArg("size1")),
         KeywordArg("size2"),
     ),
     # pyrefly: ignore [bad-argument-type]
@@ -958,13 +958,13 @@ def pointless_view_pair(match: Match, arg, size1, size2):
     if definitely_equal(arg_size, size2):
         node.replace_all_uses_with(arg)
         match.erase_nodes()
-        counters["inductor"]["removed_pointless_view_pair"] += 1
+        counters["tp"]["removed_pointless_view_pair"] += 1
 
 
 @register_graph_pattern(
     CallFunction(
-        aten.permute.default,
-        CallFunction(aten.permute.default, KeywordArg("arg"), KeywordArg("perm1")),
+        tp_ops.permute.default,
+        CallFunction(tp_ops.permute.default, KeywordArg("arg"), KeywordArg("perm1")),
         KeywordArg("perm2"),
     ),
     # pyrefly: ignore [bad-argument-type]
@@ -985,7 +985,7 @@ def pointless_permute_pair(match: Match, arg, perm1, perm2):
 
 @register_graph_pattern(
     CallFunction(
-        aten.bmm,
+        tp_ops.bmm,
         Arg(),
         Arg(),
     ),
@@ -1043,9 +1043,9 @@ def _partial_softmax_pattern(linear_func, reverse=False, to_dtype=False):
             prims.convert_element_type, scaled, KeywordArg("dtype"), _users=MULTIPLE
         )
     amax = CallFunction(
-        aten.amax.default, scaled, KeywordArg("dim"), KeywordArg("keepdim")
+        tp_ops.amax.default, scaled, KeywordArg("dim"), KeywordArg("keepdim")
     )
-    return CallFunction(aten.sub.Tensor, scaled, amax)
+    return CallFunction(tp_ops.sub.Tensor, scaled, amax)
 
 
 def _preserve_scaled_softmax_nonfinite_semantics(scaled, stable, dim, keepdim):
@@ -1121,7 +1121,7 @@ def mul_softmax_pattern(match: Match, *, inp, other, dim, keepdim, dtype=None):
 
 for reverse, to_dtype in itertools.product((False, True), repeat=2):
     register_graph_pattern(
-        _partial_softmax_pattern(aten.mul.Tensor, reverse=reverse, to_dtype=to_dtype),
+        _partial_softmax_pattern(tp_ops.mul.Tensor, reverse=reverse, to_dtype=to_dtype),
         # pyrefly: ignore [bad-argument-type]
         pass_dict=pass_patterns[1],
         extra_check=_other_is_broadcasted_in_dim,
@@ -1156,7 +1156,7 @@ def div_softmax_pattern(match: Match, *, inp, other, dim, keepdim, dtype=None):
 
 for to_dtype in (False, True):
     register_graph_pattern(
-        _partial_softmax_pattern(aten.div.Tensor, to_dtype=to_dtype),
+        _partial_softmax_pattern(tp_ops.div.Tensor, to_dtype=to_dtype),
         # pyrefly: ignore [bad-argument-type]
         pass_dict=pass_patterns[1],
         extra_check=_other_is_broadcasted_in_dim,
@@ -1201,9 +1201,9 @@ def scatter_upon_const_tensor_extra_check(m):
 
 @register_graph_pattern(
     CallFunction(
-        aten.scatter.value,
+        tp_ops.scatter.value,
         CallFunction(
-            aten.full,
+            tp_ops.full,
             KeywordArg("shape"),
             KeywordArg("background_val"),
             dtype=KeywordArg("dtype"),
@@ -1251,7 +1251,7 @@ def scatter_upon_const_tensor(
         # When val and background_val are Python scalars, tp.where promotes
         # the result to the default floating dtype (float32), which loses the
         # const tensor's dtype. Cast back to dtype so the rewrite preserves
-        # aten.scatter.value semantics (the result has self's dtype, with the
+        # tp_ops.scatter.value semantics (the result has self's dtype, with the
         # scalar value cast to it).
         return tp.where(mask, val, background_val).to(dtype)
 

@@ -214,7 +214,7 @@ class TritonBundler:
             entries.append(
                 StaticallyLaunchedAutotuner(
                     key,
-                    new_kernel.inductor_meta.get("kernel_name", "unknown_kernel"),
+                    new_kernel.tp_meta.get("kernel_name", "unknown_kernel"),
                     new_kernel,
                 )
             )

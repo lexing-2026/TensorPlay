@@ -9,7 +9,7 @@ from typing import Any, Callable
 from ..graph_module import GraphModule
 from ..node import Node
 
-__all__ = ["regional_inductor_invoke_subgraph"]
+__all__ = ["regional_compile_invoke_subgraph"]
 
 
 _op_ids = itertools.count()
@@ -168,7 +168,7 @@ def _sample_inputs(subgraph: GraphModule) -> list[Any]:
     return result
 
 
-def regional_inductor_invoke_subgraph(
+def regional_compile_invoke_subgraph(
     gm: GraphModule,
     *example_args: object,
     compiler: Callable[..., Any] | None = None,
@@ -204,7 +204,7 @@ def regional_inductor_invoke_subgraph(
             if not isinstance(subgraph, GraphModule):
                 raise TypeError("nested region target is not a GraphModule")
 
-            regional_inductor_invoke_subgraph(
+            regional_compile_invoke_subgraph(
                 subgraph,
                 compiler=selected_compiler,
                 compiler_kwargs=compile_kwargs if selected_compiler is compiler else {},

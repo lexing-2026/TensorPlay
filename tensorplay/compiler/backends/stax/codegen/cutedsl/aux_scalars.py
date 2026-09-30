@@ -15,7 +15,7 @@ import sympy
 class CuteDSLAuxScalarBindings:
     """Render symbolic shape captures through FA4's runtime aux_scalars tuple.
 
-    Inductor represents captured dynamic ints/floats as SymPy expressions in the
+    The compiler represents captured dynamic ints/floats as SymPy expressions in the
     other-buffer list, while tensor captures remain TensorBox-backed aux_tensors.
     CuTe kernels receive those scalar values as ordinary kernel arguments, wrap
     them for FA4, and rewrite matching symbols in generated score_mod/mask_mod
@@ -35,7 +35,7 @@ class CuteDSLAuxScalarBindings:
     def symbol_codes_with_renames(
         self, rename: Callable[[sympy.Symbol], sympy.Expr]
     ) -> dict[sympy.Symbol, str]:
-        """Include Inductor-renamed symbols used in generated kernel signatures."""
+        """Include compiler-renamed symbols used in generated kernel signatures."""
         codes = self.symbol_codes()
         for symbol, code in list(codes.items()):
             renamed = rename(symbol)

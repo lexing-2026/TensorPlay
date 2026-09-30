@@ -2283,7 +2283,7 @@ class BaseSchedulerNode:
             flops = flops.node.expr
 
         resolved_flops = V.graph.sizevars.optimization_hint(flops, fallback=0)
-        counters["inductor"]["flop_count"] += resolved_flops
+        counters["tp"]["flop_count"] += resolved_flops
         return resolved_flops
 
     def get_estimated_runtime(self) -> float:
@@ -4866,7 +4866,7 @@ class Scheduler:
                 )
             self.nodes = comms.reorder_compute_and_comm_for_overlap(self.nodes)
 
-        if config.aten_distributed_optimizations.enable_simple_overlap:
+        if config.tp_distributed_optimizations.enable_simple_overlap:
             if (
                 not config.reorder_for_peak_memory
                 and not config.reorder_for_compute_comm_overlap
@@ -5273,7 +5273,7 @@ class Scheduler:
         unbacked_symbol_to_origin_node: dict[sympy.Symbol, str | None] = {}
 
         # NB: None means that the dependency is on an input.  Don't actually
-        # generate a dependency because if we do, Inductor will start trying
+        # generate a dependency because if we do, the compiler will start trying
         # to free the unbacked int but that's pointless
         for val in V.graph.graph_inputs.values():
             if isinstance(val, sympy.Expr):
@@ -5281,7 +5281,7 @@ class Scheduler:
                     unbacked_symbol_to_origin_node[fs] = None
             elif isinstance(val, ir.TensorBox):
                 # We also need to add symbols from input size as well because
-                # AOTI doesn't lift the unbacked symints to inputs
+                # The ahead-of-time export does not lift the unbacked symints to inputs
                 sym_size = [s for s in val.get_size() if isinstance(s, sympy.Expr)]
                 for s in sym_size:
                     for fs in s.free_symbols:
@@ -5437,7 +5437,7 @@ class Scheduler:
                 add_user(name, OutputNode(StarDep(name)))
                 V.graph.mutated_inputs.add(name)
             elif name in V.graph.constants:
-                # In AOTI, module parameters and buffers are not lifted as graph inputs
+                # In the ahead-of-time export, module parameters and buffers are not lifted as graph inputs
                 add_user(name, OutputNode(StarDep(name)))
 
         inp_names = {
@@ -5856,7 +5856,7 @@ class Scheduler:
     ) -> bool:
         """
         Check if selecting a Triton template would cause layout conflicts.
-        Returns True if there's a conflict and we should fall back to ATen.
+        Returns True if there's a conflict and we should fall back to eager.
         """
         constraints = V.graph.buffer_layout_constraints
         if not constraints:
@@ -9862,7 +9862,7 @@ class Scheduler:
         # those inplace update decisions.
         from .utils import counters
 
-        counters["inductor"]["extern_calls"] += 1
+        counters["tp"]["extern_calls"] += 1
         with V.set_kernel_handler(Kernel(increase_kernel_count=False)):
             scheduler_node.decide_inplace_update()
             scheduler_node.mark_run()
@@ -9929,7 +9929,7 @@ class Scheduler:
 
     def should_partition(self, node: BaseSchedulerNode) -> str | None:
         """
-        Return the reason why we should partition the inductor graph on this node,
+        Return the reason why we should partition the compiled graph on this node,
         or None if the node is cudagraphable.
         """
 
@@ -10730,7 +10730,7 @@ class Scheduler:
         partitions, signatures = self.graph_partition()
 
         if len(partitions) > 1:
-            counters["inductor"]["cudagraph_partitions"] += len(partitions)
+            counters["tp"]["cudagraph_partitions"] += len(partitions)
 
         with self.use_default_device_context(partitions, signatures):
             for partition, signature in zip(partitions, signatures):

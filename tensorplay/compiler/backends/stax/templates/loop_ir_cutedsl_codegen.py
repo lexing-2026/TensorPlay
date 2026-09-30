@@ -1,5 +1,5 @@
 # mypy: allow-untyped-defs
-"""Lower Inductor GEMM epilogue loop IR to CuTeDSL source."""
+"""Lower GEMM epilogue loop IR to CuTeDSL source."""
 
 from collections.abc import Sequence
 from typing import Any

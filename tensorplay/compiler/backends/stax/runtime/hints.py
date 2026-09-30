@@ -287,11 +287,11 @@ def get_warp_size(device) -> int:
     """
     return DeviceProperties.create(device).warp_size_or_default
 
-class InductorMeta(typing.TypedDict, total=False):
-    """The inductor kernel-config / heuristics metadata bag.
+class TpMeta(typing.TypedDict, total=False):
+    """The kernel-config / heuristics metadata bag.
 
-    Produced on the codegen side (TritonKernel.inductor_meta_common /
-    inductor_meta_per_kernel plus the codegen_kernel literal) and consumed by
+    Produced on the codegen side (TritonKernel.tp_meta_common /
+    tp_meta_per_kernel plus the codegen_kernel literal) and consumed by
     the runtime autotuning machinery in triton_heuristics.py,
     coordinate_descent_tuner.py, and autotune_cache.py. Every key is optional
     (total=False): consumers read via .get(...) with defaults, and several keys
@@ -302,7 +302,7 @@ class InductorMeta(typing.TypedDict, total=False):
     checked against this TypedDict; typing the producers is left as a follow-up.
     """
 
-    # Global inductor config snapshot (inductor_meta_common / inductor_meta_from_config)
+    # Global config snapshot (tp_meta_common / tp_meta_from_config)
     backend_hash: str | None
     assert_indirect_indexing: bool
     autotune_local_cache: bool
@@ -333,7 +333,7 @@ class InductorMeta(typing.TypedDict, total=False):
     coordinate_descent_search_radius: int
     coordinate_descent_check_all_directions: bool
 
-    # Per-kernel metadata (inductor_meta_per_kernel)
+    # Per-kernel metadata (tp_meta_per_kernel)
     no_x_dim: bool
     atomic_add_found: bool
     num_load: int
@@ -387,14 +387,14 @@ class HalideInputSpec(typing.NamedTuple):
     alias_of: str | None = None
 
     def bindings_type(self) -> str:
-        if self.ctype in ("at::Half*", "at::BFloat16*"):
+        if self.ctype in ("tensorplay::Half*", "tensorplay::BFloat16*"):
             return "uint16_t*"  # half not defined
         return self.ctype
 
     def halide_type(self) -> str:
-        if self.ctype == "at::Half*":
+        if self.ctype == "tensorplay::Half*":
             return "halide_type_t(halide_type_float, 16)"  # half not defined
-        if self.ctype == "at::BFloat16*":
+        if self.ctype == "tensorplay::BFloat16*":
             return "halide_type_t(halide_type_bfloat, 16)"  # half not defined
         return f"halide_type_of<{self.ctype.replace('*', '')}>()"
 

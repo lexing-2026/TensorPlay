@@ -31,11 +31,11 @@ if TYPE_CHECKING:
 
 
 def _get_tiling_scores(
-    inductor_meta: dict[str, Any],
+    tp_meta: dict[str, Any],
     size_hints: dict[str, int],
 ) -> dict[str, float]:
     """Retrieve tiling scores, providing suitable defaults if missing."""
-    return inductor_meta.get("tiling_scores") or dict.fromkeys(size_hints, 1)
+    return tp_meta.get("tiling_scores") or dict.fromkeys(size_hints, 1)
 
 
 def _match_target_block_product(
@@ -131,11 +131,11 @@ def _adapt_config_for_tiling(
 
 
 def _outer_config_opt(
-    make_config, size_hints, rnumel, inductor_meta, num_dynamic, register_intensive
+    make_config, size_hints, rnumel, tp_meta, num_dynamic, register_intensive
 ):
     """Optimized outer config for CUDA (non-HIP)."""
     max_x_block, x_block = 256, 64
-    load_factor = inductor_meta.get("num_load", 0)
+    load_factor = tp_meta.get("num_load", 0)
     x = size_hints["x"]
     num_warps = None
 
@@ -184,7 +184,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         self,
         *,
         size_hints: dict[str, int],
-        inductor_meta: dict[str, Any],
+        tp_meta: dict[str, Any],
         triton_meta: dict[str, Any],
         num_dynamic: int = 0,
     ) -> list[Config]:
@@ -197,15 +197,15 @@ class ReductionHeuristic(CodegenConfigHeuristics):
             triton_native_mm_configs,
         )
 
-        reduction_hint = inductor_meta.get("reduction_hint")
+        reduction_hint = tp_meta.get("reduction_hint")
         rnumel = get_total_reduction_numel(size_hints)
 
-        max_autotune_enabled = inductor_meta.get("max_autotune") or inductor_meta.get(
+        max_autotune_enabled = tp_meta.get("max_autotune") or tp_meta.get(
             "max_autotune_pointwise"
         )
 
         register_intensive = False
-        loads_and_red = inductor_meta.get("num_load", 0) + inductor_meta.get(
+        loads_and_red = tp_meta.get("num_load", 0) + tp_meta.get(
             "num_reduction", 0
         )
 
@@ -240,7 +240,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
             waves_per_eu=None,
         ):
             if "y" in size_hints:
-                tiling_scores = _get_tiling_scores(inductor_meta, size_hints)
+                tiling_scores = _get_tiling_scores(tp_meta, size_hints)
                 return _adapt_config_for_tiling(
                     size_hints,
                     tiling_scores,
@@ -288,12 +288,12 @@ class ReductionHeuristic(CodegenConfigHeuristics):
             # We found that sm_103 (b300/gb300) requires more memory level parallelism
             # than sm_100 (B200) or sm_90 (h100) to reach the same % of HBM peak BW.
             # At 4 elm/thread GB300 reaches 33% of peak HBM on GB300 where B200 reaches
-            # 69%, leading to poor GB300 inductor kernel perf for memory bound kernels.
+            # 69%, leading to poor GB300 kernel perf for memory bound kernels.
             # We also confirmed both GB300 & B200 have identical SASS therefore proving
             # the HBM BW issues are due to sm_103 HW behavior differences.
             # During testing we found 16 elm/thread (from 4 elm/thread) and 4096 R0
             # (from 1024) recovers HBM util and brings GB300 to ~70% HBM BW utilization
-            # and on par or better performance with B200 for inductor reduction kernels.
+            # and on par or better performance with B200 for reduction kernels.
             sm103_r0 = min(rnumel, 4096)
             sm103_config = make_config(
                 1, sm103_r0, num_warps=max(sm103_r0 // (warp_size * 16), 1)
@@ -309,14 +309,14 @@ class ReductionHeuristic(CodegenConfigHeuristics):
             make_config,
             size_hints,
             rnumel,
-            inductor_meta,
+            tp_meta,
             num_dynamic,
             register_intensive,
         )
 
         configs: list[Config] = []
 
-        if inductor_meta.get("add_persistent_rblock") and loads_and_red <= 8:
+        if tp_meta.get("add_persistent_rblock") and loads_and_red <= 8:
             xnumel = max(4096 // rnumel, 1)
             c = make_config(
                 xnumel,
@@ -351,7 +351,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         ]
 
         return self._finalize_configs(
-            result_configs, make_config, size_hints, inductor_meta
+            result_configs, make_config, size_hints, tp_meta
         )
 
     def get_persistent_configs(
@@ -359,7 +359,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         *,
         size_hints: dict[str, int],
         reduction_hint: Any = False,
-        inductor_meta: dict[str, Any],
+        tp_meta: dict[str, Any],
         triton_meta: dict[str, Any],
     ) -> list[Config]:
         """Generate persistent reduction autotuning configs."""
@@ -372,13 +372,13 @@ class ReductionHeuristic(CodegenConfigHeuristics):
             triton_native_persistent_mm_configs,
         )
 
-        inductor_meta = {} if inductor_meta is None else inductor_meta
+        tp_meta = {} if tp_meta is None else tp_meta
         # Under deterministic mode, canonicalize the batch-dim hint so the
         # candidate-config branching below (e.g. xnumel // 8 < 128) doesn't pick
         # a different (XBLOCK, num_warps) for bs=N vs bs=N/2. Different picks
         # change the bf16 reduction order and break batch invariance in
         # persistent reductions like LayerNorm.
-        if inductor_meta.get("batch_invariant"):
+        if tp_meta.get("batch_invariant"):
             size_hints = dict(size_hints)
             if "x" in size_hints:
                 size_hints["x"] = max(size_hints["x"], 4096)
@@ -395,7 +395,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
                 _cap_native_matmul_configs,
             )
 
-            native_matmul_rblock = inductor_meta.get("native_matmul_persistent_rblock")
+            native_matmul_rblock = tp_meta.get("native_matmul_persistent_rblock")
             if native_matmul_rblock is None:
                 native_matmul_rblock = native_matmul_persistent_rblock(rnumel)
 
@@ -414,7 +414,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
             else:
                 raise NotImplementedError("native matmul only supports mm/bmm pattern")
 
-        max_autotune_enabled = inductor_meta.get("max_autotune") or inductor_meta.get(
+        max_autotune_enabled = tp_meta.get("max_autotune") or tp_meta.get(
             "max_autotune_pointwise"
         )
 
@@ -436,7 +436,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
             ]
         else:
             configs = []
-            tiling_scores = _get_tiling_scores(inductor_meta, size_hints)
+            tiling_scores = _get_tiling_scores(tp_meta, size_hints)
             x_y_scores = {dim: tiling_scores[dim] for dim in ("x", "y")}
             for target_block_size in xblock_vals:
                 if target_block_size * rnumel > MAX_PERSISTENT_BLOCK_NUMEL:
@@ -472,7 +472,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
                 if (
                     rnumel > 1024
                     or xnumel // 8 < 128
-                    or inductor_meta.get("RSPLIT_SIZE")
+                    or tp_meta.get("RSPLIT_SIZE")
                 ):
                     configs = configs[:1]
                 else:
@@ -480,7 +480,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
                         size_hints,
                         rnumel,
                         xnumel,
-                        inductor_meta,
+                        tp_meta,
                         reduction_hint,
                         warp_size,
                     )
@@ -507,7 +507,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         make_config,
         size_hints,
         rnumel,
-        inductor_meta,
+        tp_meta,
         num_dynamic,
         register_intensive,
     ):
@@ -516,12 +516,12 @@ class ReductionHeuristic(CodegenConfigHeuristics):
             make_config,
             size_hints,
             rnumel,
-            inductor_meta,
+            tp_meta,
             num_dynamic,
             register_intensive,
         )
 
-    def _finalize_configs(self, configs, make_config, size_hints, inductor_meta):
+    def _finalize_configs(self, configs, make_config, size_hints, tp_meta):
         """Post-process non-persistent configs."""
         return configs
 
@@ -534,7 +534,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         size_hints,
         rnumel,
         xnumel,
-        inductor_meta,
+        tp_meta,
         reduction_hint,
         warp_size: int = 32,
     ) -> list[Config]:
@@ -564,7 +564,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         *,
         size_hints: dict[str, int],
         reduction_hint: Any,
-        inductor_meta: dict[str, Any],
+        tp_meta: dict[str, Any],
         triton_meta: dict[str, Any],
     ) -> list[Config]:
         """Generate configs for cooperative reduction (RSPLIT)."""
@@ -580,17 +580,17 @@ class ReductionHeuristic(CodegenConfigHeuristics):
 
         target = last_power_of_2(triton_meta["device"].multi_processor_count)
         split = max(1, min((rnumel, target // xnumel, TRITON_MAX_RSPLIT)))
-        if inductor_meta["persistent_reduction"]:
+        if tp_meta["persistent_reduction"]:
             configs = self.get_persistent_configs(
                 size_hints={"x": xnumel, "r0_": rnumel // split},
                 reduction_hint=reduction_hint,
-                inductor_meta=inductor_meta,
+                tp_meta=tp_meta,
                 triton_meta=triton_meta,
             )
         else:
             configs = self.get_configs(
                 size_hints={"x": xnumel, "r0_": rnumel // split},
-                inductor_meta=inductor_meta,
+                tp_meta=tp_meta,
                 triton_meta=triton_meta,
             )
         for config in configs:
@@ -602,18 +602,18 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         configs: list[Config],
         *,
         size_hints: dict[str, int],
-        inductor_meta: dict[str, Any],
+        tp_meta: dict[str, Any],
     ) -> list[Config]:
         """Apply RSPLIT_SIZE / mix-order post-processing to persistent configs."""
         import copy
 
         from ...runtime.triton_heuristics import unique_configs
 
-        max_autotune_enabled = inductor_meta.get("max_autotune") or inductor_meta.get(
+        max_autotune_enabled = tp_meta.get("max_autotune") or tp_meta.get(
             "max_autotune_pointwise"
         )
 
-        rsplit_size = inductor_meta.get("RSPLIT_SIZE")
+        rsplit_size = tp_meta.get("RSPLIT_SIZE")
         if not rsplit_size:
             return configs
 
@@ -623,7 +623,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
             min_x_block = 4
         required_x_block = 1
         if (
-            tma_min_block_sizes := inductor_meta.get("tma_min_block_sizes")
+            tma_min_block_sizes := tp_meta.get("tma_min_block_sizes")
         ) is not None:
             required_x_block = max(
                 required_x_block, tma_min_block_sizes.get("XBLOCK", 1)
@@ -637,13 +637,13 @@ class ReductionHeuristic(CodegenConfigHeuristics):
 
             num_iters = rsplit_size // x_block
 
-            if inductor_meta.get("mix_order_reduction_allow_multi_stages", True):
+            if tp_meta.get("mix_order_reduction_allow_multi_stages", True):
                 MAX_NUM_STAGES = 2 if rnumel_hint > 8192 else 3
             else:
                 MAX_NUM_STAGES = 1
             # Triton's tl.range pipeliner cannot predicate the ttng.tensormap_create
             # emitted by device-side descriptors.
-            if inductor_meta.get("uses_device_tma"):
+            if tp_meta.get("uses_device_tma"):
                 MAX_NUM_STAGES = 1
             c.kwargs["NUM_STAGES"] = min(  # type: ignore[union-attr]
                 max(num_iters // 4, 1), MAX_NUM_STAGES
@@ -676,16 +676,16 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         self,
         *,
         size_hints: dict[str, int],
-        inductor_meta: dict[str, Any],
+        tp_meta: dict[str, Any],
         triton_meta: dict[str, Any],
     ) -> list[Config]:
         """Generate configs for split scan kernels."""
         configs = self.get_configs(
             size_hints=size_hints,
-            inductor_meta=inductor_meta,
+            tp_meta=tp_meta,
             triton_meta=triton_meta,
         )
-        min_rblock = inductor_meta.get("min_split_scan_rblock", 256)
+        min_rblock = tp_meta.get("min_split_scan_rblock", 256)
         for cfg in configs:
             for var in list(cfg.kwargs.keys()):  # type: ignore[union-attr]
                 if var.startswith("R") and cfg.kwargs[var] < min_rblock:  # type: ignore[union-attr]
@@ -707,21 +707,21 @@ class ROCmReductionHeuristic(ReductionHeuristic):
         make_config,
         size_hints,
         rnumel,
-        inductor_meta,
+        tp_meta,
         num_dynamic,
         register_intensive,
     ):
         # HIP uses simple outer config (no outer_config_opt)
         return make_config(64, 8, register_intensive=register_intensive)
 
-    def _finalize_configs(self, configs, make_config, size_hints, inductor_meta):
+    def _finalize_configs(self, configs, make_config, size_hints, tp_meta):
         hip_configs = [
             make_config(1024, 8, num_warps=4, num_stages=1, waves_per_eu=2),
             make_config(512, 8, num_warps=4, num_stages=1, waves_per_eu=1),
         ]
         configs.extend(hip_configs)
 
-        max_persistent_rblock = inductor_meta.get("max_persistent_rblock", 0)
+        max_persistent_rblock = tp_meta.get("max_persistent_rblock", 0)
         if max_persistent_rblock > 0:
             configs = [
                 c
@@ -759,7 +759,7 @@ class XPUReductionHeuristic(ReductionHeuristic):
         size_hints,
         rnumel,
         xnumel,
-        inductor_meta,
+        tp_meta,
         reduction_hint,
         warp_size: int = 32,
     ) -> list[Config]:
@@ -769,7 +769,7 @@ class XPUReductionHeuristic(ReductionHeuristic):
         # We apply different configurations from #168335.
         # We currently let cost model in Triton to decide whether to use
         # shared memory.
-        loads_and_stores = inductor_meta.get("num_load", 0) + inductor_meta.get(
+        loads_and_stores = tp_meta.get("num_load", 0) + tp_meta.get(
             "num_store", 0
         )
         x_block = 8

@@ -93,7 +93,7 @@ class WhileLoopStackOutputOp(HigherOrderOperator):
             while cond_fn(*carried_inputs, *additional):
                 out = body_fn(*carried_inputs, *additional)
                 outs.append(out)
-            return torch.stack(outs)  # per carry, along dim 0
+            return tp.stack(outs)  # per carry, along dim 0
 
     The plain operator's autograd formula runs this variant to record the
     per-iteration values its backward needs.

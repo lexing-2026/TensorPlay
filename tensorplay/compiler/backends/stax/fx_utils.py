@@ -198,11 +198,11 @@ def _is_fake_tensor_same(
                 return True
 
             if isinstance(user.target, tp._ops.HigherOrderOperator):
-                # HOPs that survive until inductor are all non-aliasing HOPs.  We will
+                # HOPs that survive until the compiler are all non-aliasing HOPs.  We will
                 # likely never support HOPs that are aliasing.
                 continue
 
-            # Strategy: do a FakeTensor prop, see if the storage aliases.  If Inductor
+            # Strategy: do a FakeTensor prop, see if the storage aliases.  If the compiler
             # ever gets tighter invariants on OpOverloads (that is, we ban things like
             # reshape calls in the graph), then this could just be a fast
             # schema lookup.
@@ -451,7 +451,7 @@ class FakeTensorUpdater:
     continue to recursively compute the faketensors for all users until the
     fake tensors stop changing.
 
-    Since this runs in the context of Inductor, we assume that the input and
+    Since this runs in the context of the compiler, we assume that the input and
     output semantics for the outermost graph are not subject to change after class
     initialization, but we allow striding changes for subgraphs.  Any other changes will
     result in errors or undefined behavior.
@@ -508,9 +508,9 @@ class FakeTensorUpdater:
         def should_process_node(node: Node) -> bool:
             return (
                 callable(node.target)
-                # Dirty Inductor lowerings are handled by the guard below. Clean
+                # Dirty lowerings are handled by the guard below. Clean
                 # lowering nodes are skipped because their targets expect IR inputs.
-                and not hasattr(node.target, "_inductor_lowering_function")
+                and not hasattr(node.target, "_tp_lowering_function")
             )
 
         def node_invokes_subgraph(
@@ -566,12 +566,12 @@ class FakeTensorUpdater:
                     storage_only_change
                     and getattr(
                         user.target,
-                        "_inductor_lowering_output_metadata_ignores_input_storage",
+                        "_tp_lowering_output_metadata_ignores_input_storage",
                         False,
                     )
                     and getattr(
                         user.target,
-                        "_inductor_lowering_output_metadata_is_input",
+                        "_tp_lowering_output_metadata_is_input",
                         None,
                     )
                     is None
@@ -606,7 +606,7 @@ class FakeTensorUpdater:
             ):
                 raise RuntimeError(
                     "FakeTensorUpdater cannot update pass-through "
-                    "_inductor_lowering_function metadata because the input "
+                    "_tp_lowering_function metadata because the input "
                     f"metadata is unavailable. Encountered node: {node.format_node()}"
                 )
             return tree_map(partial(get_fake, gm=self.gm), raw_input)
@@ -624,21 +624,21 @@ class FakeTensorUpdater:
         for node in self.gm.graph.nodes:
             current_graph_hashes.add(node_hash := self.hash_node(node))
 
-            # Lowering functions consume Inductor IR nodes, not FakeTensors, so
+            # Lowering functions consume IR nodes, not FakeTensors, so
             # FakeTensorUpdater cannot safely recompute their metadata.
-            if hasattr(node.target, "_inductor_lowering_function") and (
+            if hasattr(node.target, "_tp_lowering_function") and (
                 node_hash not in self.processed_hashes or id(node) in to_process
             ):
                 if metadata_fn := getattr(
                     node.target,
-                    "_inductor_lowering_output_metadata_fn",
+                    "_tp_lowering_output_metadata_fn",
                     None,
                 ):
                     is_valid, args, kwargs = get_fake_args_kwargs(node, self.gm)
                     if not is_valid:
                         raise RuntimeError(
                             "FakeTensorUpdater cannot update "
-                            "_inductor_lowering_function metadata because the "
+                            "_tp_lowering_function metadata because the "
                             "metadata provider inputs are unavailable. "
                             f"Encountered node: {node.format_node()}"
                         )
@@ -651,7 +651,7 @@ class FakeTensorUpdater:
                 if (
                     metadata_input := getattr(
                         node.target,
-                        "_inductor_lowering_output_metadata_is_input",
+                        "_tp_lowering_output_metadata_is_input",
                         None,
                     )
                 ) is not None:
@@ -664,23 +664,23 @@ class FakeTensorUpdater:
                 if id(node) in to_process:
                     raise RuntimeError(
                         "FakeTensorUpdater cannot recompute metadata for "
-                        "_inductor_lowering_function nodes after their dependencies "
-                        "change because those targets expect Inductor IR inputs rather "
+                        "_tp_lowering_function nodes after their dependencies "
+                        "change because those targets expect IR inputs rather "
                         "than FakeTensor inputs. "
                         f"Encountered node with changed dependency: {node.format_node()}"
                     )
                 if id(node) in self.tracked_node_ids:
                     raise RuntimeError(
                         "FakeTensorUpdater cannot recompute metadata for tracked "
-                        "_inductor_lowering_function nodes after their inputs or "
+                        "_tp_lowering_function nodes after their inputs or "
                         "dependencies change because those targets expect "
-                        "Inductor IR inputs rather than FakeTensor inputs. "
+                        "IR inputs rather than FakeTensor inputs. "
                         f"Encountered changed node: {node.format_node()}"
                     )
                 if "val" not in node.meta:
                     raise RuntimeError(
                         "FakeTensorUpdater requires newly inserted "
-                        "_inductor_lowering_function nodes to already carry fake "
+                        "_tp_lowering_function nodes to already carry fake "
                         "metadata in node.meta['val']. "
                         f"Encountered new node without metadata: {node.format_node()}"
                     )
@@ -848,7 +848,7 @@ def get_fake_args_kwargs(
 
 
 def is_node_realized(node: Node) -> bool:
-    """Returns true if a node is always realized when lowered to inductor IR.
+    """Returns true if a node is always realized when lowered to the IR.
 
     NOTE: This may return some false negatives. e.g. it doesn't
     handle buffers realized heuristically during lowering, or

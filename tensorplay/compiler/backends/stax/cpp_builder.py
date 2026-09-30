@@ -23,7 +23,7 @@ import os
 #: writes something next to the sources has to say where the sources are, and
 #: four levels up from here is that root.
 _HERE = os.path.abspath(__file__)
-_TORCH_PATH = os.path.dirname(
+_REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(_HERE)))
 )
 import shutil

@@ -210,7 +210,7 @@ def get_collective_input_size_bytes(node: ir.IRNode) -> int:
 
 def get_collective_group_size(node: ir.IRNode) -> int:
     if isinstance(node, ir._CollectiveKernel) and not isinstance(node, ir._WaitKernel):
-        from tp.distributed.distributed_c10d import _get_group_size_by_name
+        from tp.distributed.distributed_core import _get_group_size_by_name
 
         return _get_group_size_by_name(node.constant_args[-1])
     else:
@@ -462,7 +462,7 @@ def estimate_nccl_collective_runtime_nccl_estimator(snode) -> float | None:  # t
         raise AssertionError("snode.node must not be None")
     py_kernel_name = getattr(kernel, "python_kernel_name", "")
     pg_name = kernel.constant_args[-1]  # type: ignore[attr-defined]
-    from tp.distributed.distributed_c10d import _resolve_process_group
+    from tp.distributed.distributed_core import _resolve_process_group
 
     pg = _resolve_process_group(pg_name)
     rank: int = tp.distributed.get_rank(pg)
@@ -501,7 +501,7 @@ def _nccl_algo_time(
 ) -> float:
     """Compute NCCL estimated time in us for a given (algo, proto) pair.
 
-    Mirrors ncclTopoTuneModel bandwidth/latency computation and
+    Follows the ncclTopoTuneModel bandwidth/latency computation and
     ncclTopoGetAlgoTime from NCCL tuning.cc. Returns -1 if the
     (algo, proto) combination is disabled for this configuration.
     """
@@ -530,7 +530,7 @@ def _nccl_algo_time(
         if nNodes > 1 and is_ib:
             return -1.0
 
-    # --- Bandwidth computation (mirrors ncclTopoTuneModel) ---
+    # --- Bandwidth computation (following ncclTopoTuneModel) ---
     # For IB interconnect, always use inter-node BW (bwIntra only for NVLink).
     # Original NCCL tuning.cc uses bwIntra for nNodes<=2, designed for NVSwitch;
     # doesn't apply to IB.
@@ -606,7 +606,7 @@ def _nccl_algo_time(
     if bandwidth <= 0:
         return -1.0
 
-    # --- Latency computation (mirrors ncclTopoTuneModel) ---
+    # --- Latency computation (following ncclTopoTuneModel) ---
     intraHw = NCCL_HW.PCI if interconnect == InterconnectType.PCIE else NCCL_HW.NVLINK
     lat = baseLat[algo][proto]
     intraLat = hwLat[intraHw][algo][proto]
@@ -818,11 +818,11 @@ def estimate_nccl_collective_runtime_from_fx_node(
     Tries the NCCL simulator first (if available and enabled), falls back
     to the multi-algo/proto analytical model from tuning.cc.
     """
-    from tp.distributed.distributed_c10d import _get_group_size_by_name
+    from tp.distributed.distributed_core import _get_group_size_by_name
 
     if fx_node.target is tp.ops.tp.all_to_all_single.default:
         # TODO(ivankobzarev): Temporarily disabled - NCCL estimator returns internal error.
-        # for all_to_all during inductor compilation. Falls back to heuristic estimation.
+        # for all_to_all during tp compilation. Falls back to heuristic estimation.
         use_nccl_estimator = False
 
     if override_size is None:
@@ -854,10 +854,10 @@ def estimate_nccl_collective_runtime_from_fx_node(
 
     def _nccl_estimate() -> float | None:
         # TODO: Refactor with estimate_nccl_collective_runtime_nccl_estimator
-        from tp.distributed.distributed_c10d import _resolve_process_group, Backend
+        from tp.distributed.distributed_core import _resolve_process_group, Backend
 
         pg = _resolve_process_group(group_name)
-        if tp.distributed.distributed_c10d.get_backend(pg) == Backend.FAKE:
+        if tp.distributed.distributed_core.get_backend(pg) == Backend.FAKE:
             # nccl estimator requires real process group
             return None
 

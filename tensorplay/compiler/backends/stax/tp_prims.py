@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 
 def make_prim(
     schema: str,
-    impl_aten,
+    impl_tp,
     return_type=_prims.RETURN_TYPE.NEW,
     doc: str = "",
     tags: Any = None,
@@ -28,18 +28,18 @@ def make_prim(
     if isinstance(return_type, tuple):
 
         def meta(*args, **kwargs):
-            return tuple(_prims.TensorMeta(o) for o in impl_aten(*args, **kwargs))
+            return tuple(_prims.TensorMeta(o) for o in impl_tp(*args, **kwargs))
 
     else:
 
         def meta(*args, **kwargs):
-            return _prims.TensorMeta(impl_aten(*args, **kwargs))
+            return _prims.TensorMeta(impl_tp(*args, **kwargs))
 
     return _prims._make_prim(
         schema=schema,
         return_type=return_type,
         meta=meta,
-        impl_aten=impl_aten,
+        impl_tp=impl_tp,
         doc=doc,
         tags=tags,
     )
@@ -63,37 +63,37 @@ def eager_prepare_softmax(x: Tensor, dim: int) -> tuple[Tensor, Tensor]:
 
 # Custom prims used for handling randomness
 seed = make_prim(
-    "inductor_seed(Device device) -> Tensor",
+    "tp_seed(Device device) -> Tensor",
     lambda device: tp.randint(2**63 - 1, [], device=device),
-    doc="create a fresh seed (one per call) for use with inductor_rand",
+    doc="create a fresh seed (one per call) for use with tp_rand",
     tags=(None,),
 )
 seeds = make_prim(
-    "inductor_seeds(int count, Device device) -> Tensor",
+    "tp_seeds(int count, Device device) -> Tensor",
     lambda count, device: tp.randint(2**63 - 1, [count], device=device),
-    doc="Horizontal fusion of many inductor_seed() calls",
+    doc="Horizontal fusion of many tp_seed() calls",
     tags=(None,),
 )
 lookup_seed = make_prim(
-    # if inductor_lookup_seed changes, update partitioners.py
-    "inductor_lookup_seed(Tensor seeds, int index) -> Tensor",
+    # if tp_lookup_seed changes, update partitioners.py
+    "tp_lookup_seed(Tensor seeds, int index) -> Tensor",
     lambda seeds, index: seeds[index].clone(),
-    doc="Extract a single seed from the result of inductor_seeds()",
+    doc="Extract a single seed from the result of tp_seeds()",
 )
-# inductor_random() doesn't accept a dtype.
+# tp_random() doesn't accept a dtype.
 # instead, its lowering always burns in float32, and conversions to a different type
 # are explicit in the graph. We therefore need this impl (used during tracing) to hardcode
 # the dtype, so it always faithfully produces a float32 tensor during tracing,
 # even if the default dtype is set to something else.
 random = make_prim(
-    "inductor_random(SymInt[] size, Tensor seed, str mode, *, ScalarType? align_dtype=None) -> Tensor",
+    "tp_random(SymInt[] size, Tensor seed, str mode, *, ScalarType? align_dtype=None) -> Tensor",
     lambda size, seed, mode, *, align_dtype=None: getattr(tp, mode)(
         size, device=seed.device, dtype=tp.float32
     ),
     doc="Uniform and normal draws using the generator that can be fused",
 )
 randint = make_prim(
-    "inductor_randint(SymInt low, SymInt high, SymInt[] size, Tensor seed) -> Tensor",
+    "tp_randint(SymInt low, SymInt high, SymInt[] size, Tensor seed) -> Tensor",
     lambda low, high, size, seed: tp.randint(low, high, size, device=seed.device),
     doc="tp.randint() using backend-specific RNG that can be fused",
 )
@@ -104,7 +104,7 @@ def _reserve_rng_state(device: tp.device, used_offset):
     Reserve `used_offset` 32-bit Philox samples on the given CUDA device and
     return (seed, base), where base is in Philox-4x32 units.
 
-    This mirrors how Inductor accounts for Philox consumption so compiled
+    This follows how the compiler accounts for Philox consumption so compiled
     dropout kernels can reconstruct eager RNG state.
     """
     dev = device if isinstance(device, tp.device) else tp.device(device)
@@ -118,7 +118,7 @@ def _reserve_rng_state(device: tp.device, used_offset):
         dev_index = tp.cuda.current_device()
 
     gen = tp.cuda.default_generators[dev_index]
-    seed_t, off_t, intra_t = tp.ops.inductor_prims.inductor_reserve_rng_state(
+    seed_t, off_t, intra_t = tp.ops.tp_prims.tp_reserve_rng_state(
         gen, used_offset
     )
 
@@ -168,7 +168,7 @@ def _rand_eager_offsets_meta(offsets, device: tp.device):
 
 
 rand_eager_offset = make_prim(
-    "inductor_rand_eager_offset(SymInt offset, Device device) -> Tensor",
+    "tp_rand_eager_offset(SymInt offset, Device device) -> Tensor",
     _rand_eager_offset_impl,
     doc=(
         "Reserve `offset` 32-bit Philox samples on `device` and return a "
@@ -179,12 +179,12 @@ rand_eager_offset = make_prim(
 
 
 rand_eager_offsets = _prims._make_prim(
-    schema="inductor_rand_eager_offsets(SymInt[] offsets, Device device) -> Tensor",
+    schema="tp_rand_eager_offsets(SymInt[] offsets, Device device) -> Tensor",
     return_type=_prims.RETURN_TYPE.NEW,
     meta=_rand_eager_offsets_meta,
-    impl_aten=_rand_eager_offsets_impl,
+    impl_tp=_rand_eager_offsets_impl,
     doc=(
-        "Batched version of inductor_rand_eager_offset. For each entry in "
+        "Batched version of tp_rand_eager_offset. For each entry in "
         "`offsets`, reserves that many 64-bit Philox samples and returns "
         "packed (seed, base) values."
     ),
@@ -193,7 +193,7 @@ rand_eager_offsets = _prims._make_prim(
 
 
 force_stride_order = make_prim(
-    "inductor_force_stride_order(Tensor input, SymInt[] stride) -> Tensor",
+    "tp_force_stride_order(Tensor input, SymInt[] stride) -> Tensor",
     eager_force_stride,
     doc="Force the stride order for input tensor. No-op if the input tensor already has the stride. Do a copy otherwise",
 )
@@ -293,7 +293,7 @@ def _flatten_index(indices, width):
     return result
 
 
-def _low_memory_max_pool_with_offsets_aten(
+def _low_memory_max_pool_with_offsets_tp(
     self,
     kernel_size,
     stride,
@@ -330,7 +330,7 @@ def _low_memory_max_pool_with_offsets_aten(
     return vals, offsets.to(tp.int8)
 
 
-def _low_memory_max_pool_offsets_to_indices_aten(
+def _low_memory_max_pool_offsets_to_indices_tp(
     offsets,
     kernel_size,
     input_size,
@@ -357,19 +357,19 @@ def _low_memory_max_pool_offsets_to_indices_aten(
 
 _low_memory_max_pool_with_offsets = make_prim(
     "_low_memory_max_pool_with_offsets(Tensor self, SymInt[] kernel_size, SymInt[] stride,  SymInt[] padding, SymInt[] dilation, bool ceil_mode) -> (Tensor, Tensor)",
-    _low_memory_max_pool_with_offsets_aten,
+    _low_memory_max_pool_with_offsets_tp,
     return_type=(_prims.RETURN_TYPE.NEW, _prims.RETURN_TYPE.NEW),
     doc="Instead of returning indices, returns indices offsets.",
 )
 
 _low_memory_max_pool_offsets_to_indices = make_prim(
     "_low_memory_max_pool_offsets_to_indices(Tensor self, SymInt[] kernel_size, SymInt[] input_size, SymInt[] stride, SymInt[] padding, SymInt[] dilation) -> Tensor",
-    _low_memory_max_pool_offsets_to_indices_aten,
+    _low_memory_max_pool_offsets_to_indices_tp,
     doc="Convert small int offsets to regular indices.",
 )
 
 
-def _cvt_e8m0_rceil_aten(inp: Tensor) -> Tensor:
+def _cvt_e8m0_rceil_tp(inp: Tensor) -> Tensor:
     """
     Convert float to e8m0 format with ceiling rounding and satfinite semantics.
 
@@ -395,7 +395,7 @@ def _cvt_e8m0_rceil_aten(inp: Tensor) -> Tensor:
 
 
 cvt_e8m0_rceil = make_prim(
-    "inductor_cvt_e8m0_rceil(Tensor input) -> Tensor",
-    _cvt_e8m0_rceil_aten,
+    "tp_cvt_e8m0_rceil(Tensor input) -> Tensor",
+    _cvt_e8m0_rceil_tp,
     doc="Convert float to e8m0 with ceiling rounding. Uses PTX cvt.rp.satfinite.ue8m0x2.f32 on SM100+.",
 )

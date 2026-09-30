@@ -68,17 +68,17 @@ pre_grad_pass_names = [
 ]
 
 post_grad_pass_names = [
-    "normalization_aten_pass",
+    "normalization_tp_pass",
     "decompose_mm_pass",
-    "unbind_stack_aten_pass",
+    "unbind_stack_tp_pass",
     "shape_padding_multiplier",
-    "pad_aten_mm_pass",
-    "split_cat_aten_pass",
-    "select_cat_aten_pass",
-    "move_view_after_cat_aten_pass",
+    "pad_tp_mm_pass",
+    "split_cat_tp_pass",
+    "select_cat_tp_pass",
+    "move_view_after_cat_tp_pass",
 ]
 
-backend = os.environ.get("TP_PATTERN_MATCH_BACKEND", "inductor")
+backend = os.environ.get("TP_PATTERN_MATCH_BACKEND", "tp")
 
 for pass_name in pre_grad_pass_names:
     # exclude all passes from the group batch fusion
@@ -1692,7 +1692,7 @@ def mutate_cat_node(match: Match, split_sections: list[int], dim: int):
                 counters[backend]["mutate_cat_pass"] += 1
 
 
-getitem_split_aten = ListOf(
+getitem_split_tp = ListOf(
     CallFunction(
         operator.getitem,
         CallFunctionVarArgs([tp.ops.tp.split_with_sizes.default], users=MULTIPLE),
@@ -1705,9 +1705,9 @@ getitem_split_aten = ListOf(
 
 @register_graph_pattern(
     CallFunctionVarArgs(tp.ops.tp.split.Tensor, users=MULTIPLE),
-    pass_dict=construct_pattern_matcher_pass("normalization_aten_pass"),
+    pass_dict=construct_pattern_matcher_pass("normalization_tp_pass"),
 )
-def normalize_split_default_aten(match: Match, *args, **kwargs):
+def normalize_split_default_tp(match: Match, *args, **kwargs):
     split_node = match.nodes[0]
     graph = match.graph
     split_input, split_size, split_dim = _get_split_args_default(split_node)
@@ -1750,14 +1750,14 @@ def normalize_split_default_aten(match: Match, *args, **kwargs):
     split_node.replace_all_uses_with(new_split_node)
     new_split_node.meta.update(split_node.meta)
     graph.erase_node(split_node)
-    counters[backend]["normalization_aten_pass"] += 1
+    counters[backend]["normalization_tp_pass"] += 1
 
 
 @register_graph_pattern(
     CallFunctionVarArgs(tp.ops.tp.split_with_sizes.default, users=MULTIPLE),
-    pass_dict=construct_pattern_matcher_pass("normalization_aten_pass"),
+    pass_dict=construct_pattern_matcher_pass("normalization_tp_pass"),
 )
-def normalize_split_with_size_default_aten(match: Match, *args, **kwargs):
+def normalize_split_with_size_default_tp(match: Match, *args, **kwargs):
     split_node = match.nodes[0]
     graph = match.graph
     split_input, split_sections, split_dim = _get_split_args_default(split_node)
@@ -1791,23 +1791,23 @@ def normalize_split_with_size_default_aten(match: Match, *args, **kwargs):
     split_node.replace_all_uses_with(new_split_node)
     new_split_node.meta.update(split_node.meta)
     graph.erase_node(split_node)
-    counters[backend]["normalization_aten_pass"] += 1
+    counters[backend]["normalization_tp_pass"] += 1
 
 
 @register_graph_pattern(
     CallFunction(
         tp.ops.tp.cat.default,
-        getitem_split_aten,
+        getitem_split_tp,
         dim=Ignored(),
         _users=MULTIPLE,
     ),
-    pass_dict=construct_pattern_matcher_pass("split_cat_aten_pass"),
+    pass_dict=construct_pattern_matcher_pass("split_cat_tp_pass"),
 )
-def merge_split_cat_aten(match: Match, *args, **kwargs):
+def merge_split_cat_tp(match: Match, *args, **kwargs):
     graph = match.graph
     split_node = match.nodes[0]
     threshold_to_cat = config.post_grad_fusion_options[
-        "split_cat_aten_pass"
+        "split_cat_tp_pass"
     ].get("threshold_to_cat", 10)
     # get the getitem nodes from the split node
     getitem_nodes = list(split_node.users.keys())
@@ -1892,7 +1892,7 @@ def merge_split_cat_aten(match: Match, *args, **kwargs):
                 graph.erase_node(getitem_node)
         if len(split_node.users) == 0:
             graph.erase_node(split_node)
-        counters[backend]["split_cat_aten_pass"] += 1
+        counters[backend]["split_cat_tp_pass"] += 1
 
 
 @register_graph_pattern(
@@ -1905,9 +1905,9 @@ def merge_split_cat_aten(match: Match, *args, **kwargs):
         dim=Ignored(),
         _users=MULTIPLE,
     ),
-    pass_dict=construct_pattern_matcher_pass("select_cat_aten_pass"),
+    pass_dict=construct_pattern_matcher_pass("select_cat_tp_pass"),
 )
-def merge_select_cat_aten(match: Match, *args, **kwargs):
+def merge_select_cat_tp(match: Match, *args, **kwargs):
     graph = match.graph
     node = match.nodes[0]
     node_input = get_arg_value(node, 0, "tensors")
@@ -1952,14 +1952,14 @@ def merge_select_cat_aten(match: Match, *args, **kwargs):
             for select_node in select_nodes:
                 if len(select_node.users) == 0:
                     graph.erase_node(select_node)
-            counters[backend]["select_cat_aten_pass"] += 1
+            counters[backend]["select_cat_tp_pass"] += 1
 
 
 @register_graph_pattern(
     CallFunctionVarArgs(tp.ops.tp.cat.default, users=MULTIPLE),
-    pass_dict=construct_pattern_matcher_pass("normalization_aten_pass"),
+    pass_dict=construct_pattern_matcher_pass("normalization_tp_pass"),
 )
-def normalize_cat_default_aten(match: Match, *args, **kwargs):
+def normalize_cat_default_tp(match: Match, *args, **kwargs):
     cat_node = match.nodes[0]
     graph = match.graph
     tensors = get_arg_value(cat_node, 0, "tensors")
@@ -2002,7 +2002,7 @@ def normalize_cat_default_aten(match: Match, *args, **kwargs):
     cat_node.replace_all_uses_with(new_cat_node)
     new_cat_node.meta.update(cat_node.meta)
     graph.erase_node(cat_node)
-    counters[backend]["normalization_aten_pass"] += 1
+    counters[backend]["normalization_tp_pass"] += 1
 
 
 @register_graph_pattern(
@@ -2011,9 +2011,9 @@ def normalize_cat_default_aten(match: Match, *args, **kwargs):
         ListOf(CallFunctionVarArgs(tp.ops.tp.unsqueeze)),
         _users=MULTIPLE,
     ),
-    pass_dict=construct_pattern_matcher_pass("unbind_stack_aten_pass"),
+    pass_dict=construct_pattern_matcher_pass("unbind_stack_tp_pass"),
 )
-def merge_unbind_stack_aten(match: Match, *args, **kwargs):
+def merge_unbind_stack_tp(match: Match, *args, **kwargs):
     node = match.nodes[-1]
     graph = match.graph
     # pyre-fixme[6]
@@ -2067,7 +2067,7 @@ def merge_unbind_stack_aten(match: Match, *args, **kwargs):
     for select_node in select_nodes:
         if len(select_node.users) == 0:
             graph.erase_node(select_node)
-    counters[backend]["unbind_stack_aten_pass"] += 1
+    counters[backend]["unbind_stack_tp_pass"] += 1
 
 
 def divide_into_consecutive_sublists(indices: list[int]) -> list[list[int]]:
@@ -2908,7 +2908,7 @@ def move_reshape_out_of_split_stack(match: Match, *args, **kwargs):
             counters[backend]["move_reshape_out_of_split_stack_pass"] += 1
 
 
-view_getitem_split_aten = ListOf(
+view_getitem_split_tp = ListOf(
     CallFunction(
         [tp.ops.tp.reshape.default],
         CallFunction(
@@ -2929,11 +2929,11 @@ view_getitem_split_aten = ListOf(
 @register_graph_pattern(
     CallFunction(
         tp.ops.tp.cat.default,
-        view_getitem_split_aten,
+        view_getitem_split_tp,
         dim=Ignored(),
         _users=MULTIPLE,
     ),
-    pass_dict=construct_pattern_matcher_pass("move_view_after_cat_aten_pass"),
+    pass_dict=construct_pattern_matcher_pass("move_view_after_cat_tp_pass"),
 )
 def move_view_after_cat(match: Match, *args, **kwargs):
     split_node = next(
@@ -2997,7 +2997,7 @@ def move_view_after_cat(match: Match, *args, **kwargs):
             cat_node.replace_all_uses_with(view_node)
             view_node.meta.update(cat_node.meta)
             graph.erase_node(cat_node)
-        counters[backend]["move_view_after_cat_aten_pass"] += 1
+        counters[backend]["move_view_after_cat_tp_pass"] += 1
 
 
 def match_einsum_strings(s: str) -> bool:

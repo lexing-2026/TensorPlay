@@ -8,4 +8,4 @@ rather than anything derived from where it is used.
 """
 
 #: Operations that are run through to, by name.
-inductor_fallback_ops: set = set()
+tp_fallback_ops: set = set()

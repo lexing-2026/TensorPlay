@@ -11,16 +11,16 @@ T = TypeVar("T")
 
 
 def _is_force_disable_caches() -> bool:
-    """Check if caching is force disabled via inductor config.
+    """Check if caching is force disabled via tp config.
 
     This defers importing tensorplay.compiler.backends.stax.config to avoid circular imports.
 
     Returns:
-        True if force_disable_caches is set in inductor config, False otherwise.
+        True if force_disable_caches is set in tp config, False otherwise.
     """
-    from ... import config as inductor_config
+    from ... import config as tp_config
 
-    return inductor_config.force_disable_caches
+    return tp_config.force_disable_caches
 
 
 @cache
@@ -112,7 +112,7 @@ def IS_CACHING_MODULE_ENABLED() -> bool:
 
     Returns False if:
     - The versioned config disables it
-    - force_disable_caches is set in inductor config
+    - force_disable_caches is set in tp config
 
     Returns:
         True if caching module is enabled, False otherwise.

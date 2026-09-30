@@ -30,7 +30,7 @@ from ..ir import (
     FixedLayout,
     FlexibleLayout,
     Layout,
-    convert_shape_to_inductor,
+    convert_shape_to_tp,
 )
 from ..kernel_inputs import ConvKernelInputs, KernelInputs
 from .select_algorithm import call_operation, TritonChoiceCaller
@@ -134,7 +134,7 @@ def conv_layout(x, weight, bias, stride, padding, dilation, transposed,
 
     import tensorplay as tp
 
-    from ..ir import convert_shape_to_inductor, ir_node_to_tensor
+    from ..ir import convert_shape_to_tp, ir_node_to_tensor
 
     # We use guard_int_seq rather than size_hints because the output shape
     # depends on these values — if they ever contained symbols, size_hints
@@ -153,8 +153,8 @@ def conv_layout(x, weight, bias, stride, padding, dilation, transposed,
             guard(output_padding),
             groups,
         )
-        sizes = convert_shape_to_inductor(output.shape)
-        out_stride = convert_shape_to_inductor(output.stride())  # type: ignore[assignment]
+        sizes = convert_shape_to_tp(output.shape)
+        out_stride = convert_shape_to_tp(output.stride())  # type: ignore[assignment]
 
     return FixedLayout(
         device if device is not None else output.device,
@@ -1244,8 +1244,8 @@ def conv_bwd_input_layout(
         grad_out, input, weight, stride, padding, dilation, transposed,
         output_padding, groups, (True, False, False),
     )
-    sizes = convert_shape_to_inductor(dx.size())
-    stride_ = convert_shape_to_inductor(dx.stride())
+    sizes = convert_shape_to_tp(dx.size())
+    stride_ = convert_shape_to_tp(dx.stride())
     return FixedLayout(
         input.get_device_or_error(), input.get_dtype(), sizes, stride_
     )
@@ -1273,8 +1273,8 @@ def conv_bwd_weight_layout(
         grad_out, input, weight, stride, padding, dilation, transposed,
         output_padding, groups, (False, True, False),
     )
-    sizes = convert_shape_to_inductor(dw.size())
-    stride_ = convert_shape_to_inductor(dw.stride())
+    sizes = convert_shape_to_tp(dw.size())
+    stride_ = convert_shape_to_tp(dw.stride())
     return FixedLayout(
         weight.get_device_or_error(), weight.get_dtype(), sizes, stride_
     )

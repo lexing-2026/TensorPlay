@@ -35,9 +35,26 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+def _cpp_numel_expr_for(arg: str) -> str:
+    """The element count of a C++ wrapper tensor variable.
+
+    Returns 0 when the name does not resolve to a buffer; the debug helpers
+    then skip that value instead of failing the generated wrapper.
+    """
+
+    if not arg.startswith("buf"):
+        return "0"
+    try:
+        buf = V.graph.get_buffer(arg)
+        numel = functools.reduce(lambda a, b: a * b, buf.get_size(), 1)
+    except Exception:
+        return "0"
+    return V.graph.wrapper_code.codegen_sizevar(numel)
+
+
 def _print_debugging_tensor_value_info(msg, arg):
     # helper for printing debugging stats for intermediate tensor values
-    # at jit inductor level codegen
+    # at debug printer level codegen
     max_numel_to_print = 64
     print(msg)
     if not isinstance(arg, tp.Tensor):
@@ -59,7 +76,7 @@ def _print_debugging_tensor_value_info(msg, arg):
     print("Std: ", std.item())
 
 
-# AOTI debug printing related configs
+# Debug printing related configs
 class IntermediateValueDebuggingLevel(Enum):
     # OFF: No intermediate tensor value debug info will be printed or saved.
     OFF = "0"
@@ -149,11 +166,11 @@ class DebugPrinterManager:
 
     @functools.lru_cache  # noqa: B019
     def _get_debug_filtered_kernel_names(self) -> list[str]:
-        if config.aot_inductor.filtered_kernel_names is None:
+        if config.tp_export.filtered_kernel_names is None:
             return []
         return [
             x.strip()
-            for x in config.aot_inductor.filtered_kernel_names.lower().split(",")
+            for x in config.tp_export.filtered_kernel_names.lower().split(",")
         ]
 
     def set_printer_args(
@@ -167,7 +184,7 @@ class DebugPrinterManager:
         # Note: MultiKernel debug printing is not supported for now
         if isinstance(kernel, MultiKernel):
             log.info(
-                "MultiKernel type is not supported in AOTI debug printer tool yet."
+                "MultiKernel type is not supported in the debug printer tool yet."
             )
             self.debug_printer_level = IntermediateValueDebuggingLevel.OFF
 
@@ -203,8 +220,9 @@ class DebugPrinterManager:
             return
         for arg in input_args_to_print:
             if V.graph.cpp_wrapper:
+                numel_expr = _cpp_numel_expr_for(arg)
                 V.graph.wrapper_code.prefix.writeline(
-                    f'aoti_torch_print_tensor_handle({arg}, "aoti_model_inputs - {arg}");'
+                    f'tp_print_tensor_handle({arg}, {numel_expr}, "model_inputs - {arg}");'
                 )
 
     def codegen_intermediate_tensor_value_save(
@@ -222,15 +240,16 @@ class DebugPrinterManager:
                 continue
             launch_prefix = "before_launch" if before_launch else "after_launch"
             if V.graph.cpp_wrapper:
+                numel_expr = _cpp_numel_expr_for(arg)
                 V.graph.wrapper_code.writeline(
-                    f'aoti_torch_save_tensor_handle({arg}, "{arg}", "{launch_prefix}", "{kernel_name}");'
+                    f'tp_save_tensor_handle({arg}, {numel_expr}, "{arg}", "{launch_prefix}", "{kernel_name}");'
                 )
             else:
                 cwd = os.getcwd()
-                saved_dir = cwd + "/tmp/jit_inductor/"
+                saved_dir = cwd + "/tmp/tp_debug/"
                 if not os.path.exists(saved_dir):
                     log.info(
-                        "Creating directory to save inductor intermediate tensor values."
+                        "Creating directory to save tp intermediate tensor values."
                     )
                     os.makedirs(saved_dir)
                 # Save the model to the directory
@@ -280,8 +299,9 @@ class DebugPrinterManager:
                     arg_signatures[i], tp.dtype
                 ):
                     # infer from the arg data type (has tp.dtype) to see if it is a tensor type
+                    numel_expr = _cpp_numel_expr_for(arg)
                     V.graph.wrapper_code.writeline(
-                        f'aoti_torch_print_tensor_handle({arg}, "{launch_prefix} - {kernel_name} - {arg}");'
+                        f'tp_print_tensor_handle({arg}, {numel_expr}, "{launch_prefix} - {kernel_name} - {arg}");'
                     )
                 elif arg_signatures is not None and isinstance(
                     arg_signatures[i],
@@ -297,10 +317,11 @@ class DebugPrinterManager:
                     )
                 else:
                     if arg_signatures is None and self.kernel_type in ("cpp", "extern"):
+                        numel_expr = _cpp_numel_expr_for(arg)
                         V.graph.wrapper_code.writeline(
-                            f'aoti_torch_print_tensor_handle({arg}, "{launch_prefix} - {kernel_name} - {arg}");'
+                            f'tp_print_tensor_handle({arg}, {numel_expr}, "{launch_prefix} - {kernel_name} - {arg}");'
                         )
             else:
                 V.graph.wrapper_code.writeline(
-                    f'_print_debugging_tensor_value_info("inductor: {launch_prefix} - {kernel_name} - {arg}", {arg})'
+                    f'_print_debugging_tensor_value_info("tp: {launch_prefix} - {kernel_name} - {arg}", {arg})'
                 )

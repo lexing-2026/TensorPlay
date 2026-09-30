@@ -20,7 +20,7 @@ class _HashLike(Protocol):
 @dataclasses.dataclass(frozen=True)
 class CacheKeyStrategy:
     """
-    Describes how an Inductor cache turns stable components into a cache key.
+    Describes how the tp cache turns stable components into a cache key.
 
     Different caches intentionally use different key formats for compatibility
     with existing on-disk and remote cache layouts. Keeping those choices in

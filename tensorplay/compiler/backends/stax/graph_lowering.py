@@ -1271,6 +1271,7 @@ class GraphLowering(Interpreter):
         for b in (mean, m2):
             self.register_buffer(b, set_name=True)
         self.register_operation(mean)
+        self.register_operation(m2)
         return mean, m2
 
     # -- realization ------------------------------------------------------
@@ -1469,9 +1470,18 @@ class GraphLowering(Interpreter):
 
         val = node.meta.get("val")
 
+        def count_tensors(item) -> int:
+            if _is_tensor(item):
+                return 1
+            if isinstance(item, (list, tuple)):
+                return sum(count_tensors(v) for v in item)
+            return 0
+
+        single_output = count_tensors(val) == 1
+
         def wrap(item, path):
             if _is_tensor(item):
-                if not kernel.outputs and len(kernel.get_outputs()) == 1:
+                if single_output:
                     # Boxed the way every value is, so that what holds this
                     # result is a place memory can be given.
                     return TensorBox.create(kernel)
@@ -1480,10 +1490,12 @@ class GraphLowering(Interpreter):
                 kernel.outputs.append(out)
                 return TensorBox.create(out)
             if isinstance(item, (list, tuple)):
-                return tuple(wrap(v, path + (i,)) for i, v in enumerate(item))
+                return tuple(
+                    wrap(v, [*path, (type(item), i)]) for i, v in enumerate(item)
+                )
             return item
 
-        return wrap(val, ())
+        return wrap(val, [])
 
     def make_extern(self, node, args, kwargs):
         def realize_args(value):

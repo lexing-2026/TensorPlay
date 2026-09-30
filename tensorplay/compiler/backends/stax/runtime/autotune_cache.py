@@ -42,7 +42,7 @@ from .cache_artifacts import (
     CacheArtifactRecorder,
 )
 from .device_compiler import has_triton_package
-from .hints import InductorMeta
+from .hints import TpMeta
 from .runtime_utils import cache_dir
 from .triton_compat import Config, HAS_WARP_SPEC
 from ..cache_key import AUTOTUNE_CACHE_KEY_STRATEGY
@@ -59,10 +59,10 @@ from ..remote_cache import (
 log = logging.getLogger(__name__)
 
 
-_InductorMetaTy = InductorMeta
+_TpMetaTy = TpMeta
 
 
-def inductor_meta_from_config() -> _InductorMetaTy:
+def tp_meta_from_config() -> _TpMetaTy:
     """The facts about this build that a measured answer depends on.
 
     Anything that would change which configuration wins goes in here, because
@@ -139,7 +139,7 @@ class AutotuneCache:
     # Create an AutotuneCache. Returns None if none of the caches can be used.
     @staticmethod
     def create(
-        inductor_meta: _InductorMetaTy, filename: str, configs_hash: str
+        tp_meta: _TpMetaTy, filename: str, configs_hash: str
     ) -> AutotuneCache | None:
         cache = AutotuneCache(configs_hash)
         key = AutotuneCache._prepare_key(filename)
@@ -151,8 +151,8 @@ class AutotuneCache:
             AutotuneCache._artifact_key_from_local_cache_key(local_cache_key),
         )
 
-        cache._setup_local_cache(inductor_meta, local_cache_key)
-        cache._setup_remote_autotune_cache(inductor_meta, key)
+        cache._setup_local_cache(tp_meta, local_cache_key)
+        cache._setup_remote_autotune_cache(tp_meta, key)
         if cache.local_cache or cache.remote_cache:
             return cache
         else:
@@ -174,9 +174,9 @@ class AutotuneCache:
         recorded is not something the entry can be made compatible with.
         """
 
-        from ..codecache import torch_key
+        from ..codecache import code_key
 
-        updated_cache_key = AUTOTUNE_CACHE_KEY_STRATEGY.key(cache_key, torch_key())
+        updated_cache_key = AUTOTUNE_CACHE_KEY_STRATEGY.key(cache_key, code_key())
         return os.path.join(dirname, f"{updated_cache_key}.best_config")
 
     @staticmethod
@@ -220,19 +220,19 @@ class AutotuneCache:
     # Read the best config options from the most local cache and figure out
     # which `configs` represents that option.
     def read_best(
-        self, inductor_meta: _InductorMetaTy, configs: list[Config]
+        self, tp_meta: _TpMetaTy, configs: list[Config]
     ) -> Config | None:
         if best := self._read():
             return _load_cached_autotuning(
-                best, self.configs_hash, configs, inductor_meta
+                best, self.configs_hash, configs, tp_meta
             )
         return None
 
     # Set up local filesystem caching information
     def _setup_local_cache(
-        self, inductor_meta: _InductorMetaTy, cache_key: str
+        self, tp_meta: _TpMetaTy, cache_key: str
     ) -> None:
-        if not inductor_meta.get("autotune_local_cache", True):
+        if not tp_meta.get("autotune_local_cache", True):
             return
 
         local_cache = create_cache(
@@ -245,14 +245,14 @@ class AutotuneCache:
 
     # Set up remote caching information
     def _setup_remote_autotune_cache(
-        self, inductor_meta: _InductorMetaTy, cache_key: str
+        self, tp_meta: _TpMetaTy, cache_key: str
     ) -> None:
-        if not _should_use_remote_autotune_cache(inductor_meta):
+        if not _should_use_remote_autotune_cache(tp_meta):
             return
 
-        if (backend_hash := inductor_meta.get("backend_hash", None)) is None:
+        if (backend_hash := tp_meta.get("backend_hash", None)) is None:
             log.debug(
-                "backend_hash is not passed on the inductor_meta, unable to use autotune remote cache"
+                "backend_hash is not passed on the tp_meta, unable to use autotune remote cache"
             )
             return
         if not isinstance(backend_hash, str):
@@ -260,12 +260,12 @@ class AutotuneCache:
                 f"Expected str for backend_hash, got {type(backend_hash)}"
             )
 
-        from ..codecache import torch_key
+        from ..codecache import code_key
 
         salt = "autotune-best-config-v2"
-        # re: torch_key - see the note on what goes into the local key
+        # re: code_key - see the note on what goes into the local key
         key = AUTOTUNE_CACHE_KEY_STRATEGY.key(
-            torch_key().hex(), backend_hash, self.configs_hash, salt
+            code_key().hex(), backend_hash, self.configs_hash, salt
         )
 
         remote_cache = create_cache(
@@ -409,16 +409,16 @@ class _AutotuneCacheBundlerImpl:
 
     @classmethod
     def _should_use_bundled_autotune_remote_cache(
-        cls, inductor_meta: _InductorMetaTy
+        cls, tp_meta: _TpMetaTy
     ) -> bool:
         # The bundled autotune cache is only available if you've also got local
         # caching enabled (because we feed the bundled data to the local cache).
-        if not inductor_meta.get("autotune_local_cache", True):
+        if not tp_meta.get("autotune_local_cache", True):
             return False
 
         # Check if we're enabled via config
         if (
-            bundled_autotune_remote_cache := inductor_meta.get(
+            bundled_autotune_remote_cache := tp_meta.get(
                 "bundled_autotune_remote_cache"
             )
         ) is not None:
@@ -451,8 +451,8 @@ class _AutotuneCacheBundlerImpl:
         return True
 
     @staticmethod
-    def _get_backend_hash(inductor_meta: _InductorMetaTy) -> str:
-        backend_hash = inductor_meta["backend_hash"]
+    def _get_backend_hash(tp_meta: _TpMetaTy) -> str:
+        backend_hash = tp_meta["backend_hash"]
         if not isinstance(backend_hash, str):
             raise AssertionError(
                 f"Expected str for backend_hash, got {type(backend_hash)}"
@@ -503,13 +503,13 @@ class AutotuneCacheBundler:
         context_bundler = cls._get_context_bundler(compile_context, create=False)
         return context_bundler is not None and context_bundler._bundler is not None
 
-    # Call this before we start any autotune computation for an inductor python
+    # Call this before we start any autotune computation for a tp python
     # file. On a cache hit it copies the individual results into the local
     # autotune caches.
     @classmethod
     def begin_compile(
         cls,
-        inductor_meta: _InductorMetaTy,
+        tp_meta: _TpMetaTy,
         *,
         code: str | None = None,
         code_hash: str | None = None,
@@ -524,7 +524,7 @@ class AutotuneCacheBundler:
             raise AssertionError("Either code or code_hash must be provided")
 
         if not _AutotuneCacheBundlerImpl._should_use_bundled_autotune_remote_cache(
-            inductor_meta
+            tp_meta
         ):
             return
 
@@ -554,7 +554,7 @@ class AutotuneCacheBundler:
         # from the cache.
 
         salt = "bundled-autotune-best-configs-v1"
-        backend_hash = _AutotuneCacheBundlerImpl._get_backend_hash(inductor_meta)
+        backend_hash = _AutotuneCacheBundlerImpl._get_backend_hash(tp_meta)
         key = AUTOTUNE_CACHE_KEY_STRATEGY.key(code_hash, backend_hash, salt)
 
         bundler = _AutotuneCacheBundlerImpl(key, cache)
@@ -567,7 +567,7 @@ class AutotuneCacheBundler:
         # autotune results.
 
     # Call this after all individual autotune results are finished for a
-    # inductor python file. If we gathered any individual results then we bundle
+    # tp python file. If we gathered any individual results then we bundle
     # those and put it into the cache.
     @classmethod
     def end_compile(cls) -> None:
@@ -621,8 +621,8 @@ def _comment_stripped_hash(code: str, code_hash_fn) -> str:
     return code_hash_fn(code)
 
 
-def _should_use_remote_autotune_cache(inductor_meta: _InductorMetaTy) -> bool:
-    if (config := inductor_meta.get("autotune_remote_cache")) is not None:
+def _should_use_remote_autotune_cache(tp_meta: _TpMetaTy) -> bool:
+    if (config := tp_meta.get("autotune_remote_cache")) is not None:
         return bool(config)
     return False
 
@@ -653,7 +653,7 @@ def _load_cached_autotuning(
     best_config: dict[str, JsonDataTy],
     configs_hash: str,
     configs: list[Config],
-    inductor_meta: _InductorMetaTy,
+    tp_meta: _TpMetaTy,
 ) -> Config | None:
     """The configuration a stored answer names, as one of the ones asked about.
 
@@ -682,7 +682,7 @@ def _load_cached_autotuning(
     # to restore custom tuned options from the cache.
     extra_options = best_config.pop("extra_options", None)
 
-    found_by_coordesc = inductor_meta.get(
+    found_by_coordesc = tp_meta.get(
         "coordinate_descent_tuning"
     ) and best_config.pop("found_by_coordesc", False)
 

@@ -553,7 +553,7 @@ class SubgraphTemplate(KernelTemplate):
                     "Skipping decomposition %s: adds guards during tracing",
                     decomp.__name__,
                 )
-                counters["inductor"]["custom_op_decomp_guard_skips"] += 1
+                counters["tp"]["custom_op_decomp_guard_skips"] += 1
                 continue
 
             choice.cache_decomposition(decomp, decomp_kwargs)

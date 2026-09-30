@@ -14,7 +14,7 @@ from ..utils import counters, is_nvidia_sm100_or_later
 # mypy: allow-untyped-defs
 import functools
 
-aten = tp.ops.tp
+tp_ops = tp.ops.tp
 
 
 @functools.cache
@@ -45,7 +45,7 @@ def _misc_patterns_init(input_device: tp.device | None = None):
         index = tp.randperm(x.shape[0], device=x.device)[: y.shape[0]]
         return (
             tp.ops.tp._unsafe_index_put(
-                x, (index,), aten._unsafe_index(x, (index,)) + y, accumulate=False
+                x, (index,), tp_ops._unsafe_index(x, (index,)) + y, accumulate=False
             ),
             index,
         )
@@ -124,7 +124,7 @@ def _misc_patterns_init(input_device: tp.device | None = None):
         is_sm100_plus = is_nvidia_sm100_or_later()
 
         if is_sm100_plus:
-            from .. import inductor_prims
+            from .. import tp_prims
 
             # Pattern 1: Bit manipulation approach (NVIDIA SM100+ only - uses PTX instruction)
             def e8m0_rceil_pattern(inp):
@@ -137,7 +137,7 @@ def _misc_patterns_init(input_device: tp.device | None = None):
                 return e8m0_biased.to(tp.uint8)
 
             def e8m0_rceil_replacement(inp):
-                return inductor_prims.cvt_e8m0_rceil(inp)
+                return tp_prims.cvt_e8m0_rceil(inp)
 
             register_replacement(
                 # pyrefly: ignore [bad-argument-type]
@@ -180,7 +180,7 @@ def _misc_patterns_init(input_device: tp.device | None = None):
         if is_sm100_plus:
 
             def e8m0_rceil_log2_replacement(inp):
-                return inductor_prims.cvt_e8m0_rceil(inp)
+                return tp_prims.cvt_e8m0_rceil(inp)
 
         else:
             # Bit-manipulation fallback: extract IEEE 754 biased exponent with
@@ -275,7 +275,7 @@ class NumpyCompatNormalization:
 
             if kwargs_changed:
                 node.kwargs = immutable_dict(new_kwargs)
-                counters["inductor"]["numpy_compat_normalization"] += 1
+                counters["tp"]["numpy_compat_normalization"] += 1
 
 
 numpy_compat_normalization = NumpyCompatNormalization()

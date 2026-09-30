@@ -63,7 +63,7 @@ __all__ = [
     "persistent_grouped_mm_grid",
     "persistent_mm_grid",
     "scale_mm_epilogue",
-    "use_aten_gemm_kernels",
+    "use_tp_gemm_kernels",
     "use_decompose_k_choice",
     "use_native_matmul",
     "use_template_for_gpu",
@@ -523,7 +523,7 @@ def use_template_for_gpu(layout: Layout, dtypes: Sequence[Any]) -> bool:
     return layout.dtype in dtypes
 
 
-def use_aten_gemm_kernels() -> bool:
+def use_tp_gemm_kernels() -> bool:
     """Whether the framework's own product is among the candidates.
 
     It is unless the measurement was asked for, because a measurement that

@@ -1,4 +1,4 @@
-"""Stream utilities for Inductor codegen."""
+"""Stream utilities for tp codegen."""
 
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ from .stream_constants import (
 
 
 __all__ = [
-    "AOTI_SUPPORTED_STREAM_OP_NAMES",
-    "AOTI_UNSUPPORTED_STREAM_OP_REASONS",
+    "TP_SUPPORTED_STREAM_OP_NAMES",
+    "TP_UNSUPPORTED_STREAM_OP_REASONS",
     "DEFAULT_STREAM",
     "DEFAULT_STREAM_IDX",
     "STREAM_NAME_TEMPLATE",
@@ -27,26 +27,26 @@ __all__ = [
 ]
 
 
-AOTI_SUPPORTED_STREAM_OP_NAMES: dict[str, str] = {
+TP_SUPPORTED_STREAM_OP_NAMES: dict[str, str] = {
     "tp.ops.streams.record_event.default": "record_event",
     "tp.ops.streams.wait_event.default": "wait_event",
     # A targeted single-event host wait (cudaEventSynchronize); required by e.g.
     # pinned non-blocking copies. Unlike synchronize_stream/device, it does not
-    # block the whole stream/device, so it is safe to emit inside an AOTI Run().
+    # block the whole stream/device, so it is safe to emit inside an ahead-of-time Run().
     "tp.ops.streams.synchronize_event.default": "synchronize_event",
 }
 
 
-AOTI_UNSUPPORTED_STREAM_OP_REASONS: dict[str, str] = {
+TP_UNSUPPORTED_STREAM_OP_REASONS: dict[str, str] = {
     "tp.ops.streams.synchronize_stream.default": (
-        "Host-blocking sync ops are not supported inside an AOTI Run(). "
+        "Host-blocking sync ops are not supported inside an ahead-of-time Run(). "
         "Use record_event + wait_event for device-side ordering instead."
     ),
     "tp.ops.streams.synchronize_device.default": (
-        "Host-blocking device synchronization is not supported inside an AOTI Run()."
+        "Host-blocking device synchronization is not supported inside an ahead-of-time Run()."
     ),
     "tp.ops.streams.wait_stream.default": (
-        "wait_stream is not supported in AOTI cpp_wrapper. Use explicit "
+        "wait_stream is not supported in the ahead-of-time cpp_wrapper. Use explicit "
         "record_event on the waited-on stream + wait_event on the waiting stream."
     ),
 }

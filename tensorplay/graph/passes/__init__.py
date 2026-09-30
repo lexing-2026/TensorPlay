@@ -65,8 +65,8 @@ from .splitter_base import (
 )
 from .split_module import Partition, split_module, split_module_simple
 from .reinplace import reinplace
-from .regional_inductor import regional_inductor
-from .regional_inductor_invoke_subgraph import regional_inductor_invoke_subgraph
+from .regional_compile import regional_compile
+from .regional_compile_invoke_subgraph import regional_compile_invoke_subgraph
 from .backends import CudaGraphsSupport, partition_cudagraphs
 from .tools_common import (
     CALLABLE_NODE_OPS,
@@ -143,8 +143,8 @@ __all__ = [
     "CudaGraphsSupport",
     "partition_cudagraphs",
     "reinplace",
-    "regional_inductor",
-    "regional_inductor_invoke_subgraph",
+    "regional_compile",
+    "regional_compile_invoke_subgraph",
     "split_module",
     "split_module_simple",
 ]

@@ -340,8 +340,8 @@ def {{kernel_name}}_precompile(precompile_shapes, precompile_strides, precompile
     """Compile CuTe DSL kernels using fake tensors (no CUDA tensor allocation).
 
     Called by the subprocess worker to warm the disk cache. Uses fake compact
-    CuTe tensors for cute.compile(), avoiding torch.cuda.* calls so this can
-    run in forked subprocess workers where PyTorch CUDA is unavailable.
+    CuTe tensors for cute.compile(), avoiding device-side CUDA calls so this can
+    run in forked subprocess workers where CUDA is unavailable.
     """
     import logging
     _precompile_log = logging.getLogger(__name__)

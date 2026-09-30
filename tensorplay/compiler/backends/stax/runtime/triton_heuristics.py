@@ -49,7 +49,7 @@ from .hints import (
     AutotuneHint,
     DeviceProperties,
     HeuristicType,
-    InductorMeta,
+    TpMeta,
     ReductionHint,
     TileHint,
     TritonMeta,
@@ -145,7 +145,7 @@ class BenchmarkFailureReason(enum.Enum):
     INVALID_CONFIG = "invalid_config"
 
 
-class InductorConfig(Config):
+class TpConfig(Config):
     """A configuration with this project's own switches alongside the tuning.
 
     A configuration says how to run a kernel; the switches here say how much
@@ -179,7 +179,7 @@ class GridExpr:
     written out of.
     """
 
-    inductor_meta: dict
+    tp_meta: dict
     mode: Literal["python", "cpp"] = "python"
     prefix: list[str] = dataclasses.field(default_factory=list)
     x_grid: str | int = 1
@@ -276,7 +276,7 @@ class GridExpr:
         raise AssertionError(f"invalid mode {self.mode}")
 
     @staticmethod
-    def from_meta(inductor_meta, cfg, mode="python"):
+    def from_meta(tp_meta, cfg, mode="python"):
         """The grid a launch recorded asking for, built from the name it recorded.
 
         A launch says which kind of grid it wants by name rather than by being
@@ -286,10 +286,10 @@ class GridExpr:
         quietly treated as a one-block grid.
         """
 
-        grid_cls = globals()[inductor_meta["grid_type"]]
+        grid_cls = globals()[tp_meta["grid_type"]]
         if not (isinstance(grid_cls, type) and issubclass(grid_cls, GridExpr)):
             raise AssertionError(f"Expected GridExpr subclass, got {grid_cls}")
-        grid = grid_cls(inductor_meta=inductor_meta, mode=mode)
+        grid = grid_cls(tp_meta=tp_meta, mode=mode)
         if isinstance(cfg, Config):
             cfg = config_to_dict(cfg)
         grid.generate(cfg)
@@ -320,19 +320,19 @@ class GridExpr:
     @classmethod
     def from_meta_lazy(
         cls,
-        inductor_meta,
+        tp_meta,
         kernel_name: str,
     ) -> "GridExpr":
         """The grid a launch asked for by name, for a kernel configured later."""
-        if inductor_meta is None:
-            raise AssertionError("inductor_meta must be specified for lazy compile")
-        grid_type = inductor_meta.get("grid_type", None)
+        if tp_meta is None:
+            raise AssertionError("tp_meta must be specified for lazy compile")
+        grid_type = tp_meta.get("grid_type", None)
         if grid_type is None:
             raise AssertionError("grid_type must be specified for lazy compile")
         grid_cls = globals()[grid_type]
         if not issubclass(grid_cls, GridExpr):
             raise AssertionError(f"Expected GridExpr subclass, got {grid_cls}")
-        grid = grid_cls(inductor_meta=inductor_meta, mode="cpp")
+        grid = grid_cls(tp_meta=tp_meta, mode="cpp")
         grid.generate_lazy(kernel_name)
         return grid
 
@@ -445,7 +445,7 @@ class FixedGrid(GridExpr):
         }
 
     def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
-        self.x_grid, self.y_grid, self.z_grid = self.inductor_meta["fixed_grid"]
+        self.x_grid, self.y_grid, self.z_grid = self.tp_meta["fixed_grid"]
 
 
 class PrecomputedGrid(GridExpr):
@@ -457,13 +457,13 @@ class PrecomputedGrid(GridExpr):
     """
 
     def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
-        for candidate in self.inductor_meta["precomputed_grids"]:
+        for candidate in self.tp_meta["precomputed_grids"]:
             if all(meta.get(k) == v for k, v in candidate["config"].items()):
                 self.x_grid, self.y_grid, self.z_grid = candidate[self.mode]
                 return
         raise AssertionError(
             f"no recorded grid for {meta} among "
-            f"{self.inductor_meta['precomputed_grids']}"
+            f"{self.tp_meta['precomputed_grids']}"
         )
 
 
@@ -537,7 +537,7 @@ class Grid2DWithYZOverflow(GridExpr):
 def check_autotune_cache(
     configs: list,
     filename: str | None,
-    inductor_meta,
+    tp_meta,
     dynamic_scale_rblock_eligible: bool = False,
 ):
     """The configurations to measure, narrowed to one if an answer is already known.
@@ -559,13 +559,13 @@ def check_autotune_cache(
 
     autotune_cache = None
     autotune_cache_info = {}
-    disabled = inductor_meta.get("force_disable_caches", False)
+    disabled = tp_meta.get("force_disable_caches", False)
     if (
         not disabled
         and filename is not None
         and (
             len(configs) > 1
-            or inductor_meta.get("coordinate_descent_tuning")
+            or tp_meta.get("coordinate_descent_tuning")
             or dynamic_scale_rblock_eligible
         )
         and os.environ.get("TRITON_INTERPRET", "0") != "1"
@@ -573,9 +573,9 @@ def check_autotune_cache(
         configs_hash = hash_configs(configs)
 
         watchdog.report_phase(watchdog.Phase.QUERYING_CACHE)
-        autotune_cache = AutotuneCache.create(inductor_meta, filename, configs_hash)
+        autotune_cache = AutotuneCache.create(tp_meta, filename, configs_hash)
         if autotune_cache:
-            if best_config := autotune_cache.read_best(inductor_meta, configs):
+            if best_config := autotune_cache.read_best(tp_meta, configs):
                 configs = [best_config]
                 autotune_cache_info["best_config"] = triton_config_to_hashable(
                     best_config
@@ -585,7 +585,7 @@ def check_autotune_cache(
             else:
                 autotune_cache_info["autotune_cache_state"] = "miss"
                 autotune_cache_info["num_configs"] = len(configs)
-                if inductor_meta.get("coordinate_descent_tuning"):
+                if tp_meta.get("coordinate_descent_tuning"):
                     autotune_cache_info["coordesc_tuning"] = True
                     if len(configs) == 1:
                         # This is the config that coordinate descent tuning started at,
@@ -685,7 +685,7 @@ def _resolve_dims(dims, cfg_kwargs, constants):
     return result
 
 
-def _should_enable_triton_debug_asserts(inductor_meta) -> bool:
+def _should_enable_triton_debug_asserts(tp_meta) -> bool:
     """Whether the compiler should check indirect indexing on this launch.
 
     Reading through a computed index is the one thing a kernel can do that
@@ -697,9 +697,9 @@ def _should_enable_triton_debug_asserts(inductor_meta) -> bool:
 
     from ..utils import get_triton_version
 
-    if not inductor_meta.get("assert_indirect_indexing", True):
+    if not tp_meta.get("assert_indirect_indexing", True):
         return False
-    if not inductor_meta.get("is_hip", False):
+    if not tp_meta.get("is_hip", False):
         return True
     return get_triton_version() >= (3, 7)
 
@@ -717,11 +717,11 @@ class CompileResult(Generic[_T]):
     it once per call is most of what a launch costs.
     """
 
-    def __init__(self, kernel, config, compile_meta, inductor_meta):
+    def __init__(self, kernel, config, compile_meta, tp_meta):
         self.kernel = kernel
         self.config = config
         self.compile_meta = compile_meta
-        self.inductor_meta = inductor_meta
+        self.tp_meta = tp_meta
 
     def make_launcher(self) -> LauncherType: ...
 
@@ -735,7 +735,7 @@ class CompileResult(Generic[_T]):
         arguments come back as well as the lines.
         """
 
-        host_tma_args = self.inductor_meta.get("host_tma_descriptor_args")
+        host_tma_args = self.tp_meta.get("host_tma_descriptor_args")
         pre_runner_lines: list[str] = []
         if not host_tma_args:
             return pre_runner_lines, runner_args
@@ -775,7 +775,7 @@ class CompileResult(Generic[_T]):
         number each time.
         """
 
-        grid = GridExpr.from_meta(self.inductor_meta, self.config)
+        grid = GridExpr.from_meta(self.tp_meta, self.config)
         lines = [
             f"def launcher({', '.join(def_args)}, stream):",
             *[f"    {line}" for line in grid.prefix],
@@ -859,8 +859,8 @@ class CompileResult(Generic[_T]):
                 if name not in cfg_dict and name not in none_args
             ]
 
-        if "extra_launcher_args" in self.inductor_meta:
-            def_args = [*def_args, *self.inductor_meta["extra_launcher_args"]]
+        if "extra_launcher_args" in self.tp_meta:
+            def_args = [*def_args, *self.tp_meta["extra_launcher_args"]]
 
         return call_args, def_args, none_args
 
@@ -933,7 +933,7 @@ def end_graph(output_file):
             )
 
 
-def _combo_has_reduction_subkernel(inductor_meta: dict) -> bool:
+def _combo_has_reduction_subkernel(tp_meta: dict) -> bool:
     """Whether a kernel of several has one of them reducing.
 
     A kernel of several is told how big each of its parts is rather than being
@@ -944,7 +944,7 @@ def _combo_has_reduction_subkernel(inductor_meta: dict) -> bool:
     either.
     """
 
-    combo_meta = inductor_meta.get("combo_grid_meta")
+    combo_meta = tp_meta.get("combo_grid_meta")
     if combo_meta is None or "heuristic_0" not in combo_meta:
         return False
     if "stitched_num_warps" in combo_meta or "stitched_launch_candidates" in combo_meta:
@@ -956,7 +956,7 @@ def _combo_has_reduction_subkernel(inductor_meta: dict) -> bool:
 
 
 def _subkernel_fingerprint(combo_meta: dict[str, Any], i: int) -> tuple[Any, ...]:
-    sub_meta = combo_meta.get(f"inductor_meta_{i}", {})
+    sub_meta = combo_meta.get(f"tp_meta_{i}", {})
     tma = sub_meta.get("tma_min_block_sizes") or {}
     tiling_scores = sub_meta.get("tiling_scores") or {}
     return (
@@ -994,14 +994,14 @@ def _update_combo_kernel_kwargs(
 
 def _handle_combo_kernel_per_subkernel_blocks(
     size_hints: dict[str, int],
-    inductor_meta: InductorMeta,
+    tp_meta: TpMeta,
     triton_meta: TritonMeta,
     filename: str | None = None,
     reduction_hint: bool = False,
     tile_hint: Any = None,
     min_elem_per_thread: int = 0,
 ) -> list[Config] | None:
-    combo_meta = inductor_meta.get("combo_grid_meta")
+    combo_meta = tp_meta.get("combo_grid_meta")
     if combo_meta is None or "heuristic_0" not in combo_meta:
         return None
 
@@ -1029,8 +1029,8 @@ def _handle_combo_kernel_per_subkernel_blocks(
         ]
 
     num_kernels = combo_meta["num_kernels"]
-    inductor_meta_clean = {
-        key: value for key, value in inductor_meta.items() if key != "combo_grid_meta"
+    tp_meta_clean = {
+        key: value for key, value in tp_meta.items() if key != "combo_grid_meta"
     }
     combined_kwargs: dict[str, int] = {}
     all_num_warps: list[int] = []
@@ -1043,11 +1043,11 @@ def _handle_combo_kernel_per_subkernel_blocks(
     for i in range(num_kernels):
         subkernel_heuristic = combo_meta[f"heuristic_{i}"]
         size_hints_i = combo_meta[f"size_hints_{i}"]
-        inductor_meta_i = cast(
-            "InductorMeta",
+        tp_meta_i = cast(
+            "TpMeta",
             {
-                **inductor_meta_clean,
-                **combo_meta.get(f"inductor_meta_{i}", {}),
+                **tp_meta_clean,
+                **combo_meta.get(f"tp_meta_{i}", {}),
             },
         )
 
@@ -1062,7 +1062,7 @@ def _handle_combo_kernel_per_subkernel_blocks(
                 ),
                 filename=filename,
                 min_elem_per_thread=min_elem_per_thread,
-                inductor_meta=inductor_meta_i,
+                tp_meta=tp_meta_i,
                 return_configs=True,
             )
             skip_rblock = False
@@ -1072,7 +1072,7 @@ def _handle_combo_kernel_per_subkernel_blocks(
                 reduction_hint=ReductionHint[combo_meta[f"reduction_hint_{i}"]],
                 triton_meta=triton_meta,
                 filename=filename,
-                inductor_meta=inductor_meta_i,
+                tp_meta=tp_meta_i,
                 return_configs=True,
             )
             skip_rblock = False
@@ -1082,7 +1082,7 @@ def _handle_combo_kernel_per_subkernel_blocks(
                 reduction_hint=ReductionHint[combo_meta[f"reduction_hint_{i}"]],
                 triton_meta=triton_meta,
                 filename=filename,
-                inductor_meta=inductor_meta_i,
+                tp_meta=tp_meta_i,
                 return_configs=True,
             )
             skip_rblock = True
@@ -1134,12 +1134,12 @@ def _handle_combo_kernel_per_subkernel_blocks(
     combo_tuning_groups.sort(
         key=lambda group: -functools.reduce(operator.mul, group["size_hints"].values())
     )
-    inductor_meta["combo_tuning_groups"] = combo_tuning_groups
-    inductor_meta["combo_coordesc_field_order"] = [
+    tp_meta["combo_tuning_groups"] = combo_tuning_groups
+    tp_meta["combo_coordesc_field_order"] = [
         field for group in combo_tuning_groups for field in group["coordesc_fields"]
     ]
-    inductor_meta["combo_coordesc_field_limits"] = combo_coordesc_field_limits
-    inductor_meta["combo_warp_stage_candidates"] = list(unique_warp_stage_pairs)
+    tp_meta["combo_coordesc_field_limits"] = combo_coordesc_field_limits
+    tp_meta["combo_warp_stage_candidates"] = list(unique_warp_stage_pairs)
 
     return [
         triton.Config(
@@ -1155,7 +1155,7 @@ def _could_dynamic_scale_rblock(
     size_hints: list[int] | None,
     heuristic_type: Any,
     device_prop: Any,
-    inductor_meta: dict,
+    tp_meta: dict,
 ) -> bool:
     """Whether a reducing kernel's block could be halved to fit more of them.
 
@@ -1169,11 +1169,11 @@ def _could_dynamic_scale_rblock(
 
     return (
         device_prop is not None
-        and not inductor_meta.get("deterministic", False)
-        and inductor_meta.get("dynamic_scale_rblock", True)
-        and not inductor_meta.get("persistent_reduction")
+        and not tp_meta.get("deterministic", False)
+        and tp_meta.get("dynamic_scale_rblock", True)
+        and not tp_meta.get("persistent_reduction")
         and heuristic_type == HeuristicType.REDUCTION
-        and (size_hints is not None or _combo_has_reduction_subkernel(inductor_meta))
+        and (size_hints is not None or _combo_has_reduction_subkernel(tp_meta))
         and device_prop.type in ["cuda", "hip"]
         and bool(device_prop.major)
         and (device_prop.major >= 8 or tp.version.hip)
@@ -1308,7 +1308,7 @@ class CachingAutotuner(KernelInterface):
         optimize_mem,
         heuristic_type,
         size_hints=None,
-        inductor_meta=None,
+        tp_meta=None,
         custom_kernel: bool = False,
         filename: str | None = None,
         reset_to_zero_arg_names: list | None = None,
@@ -1331,14 +1331,14 @@ class CachingAutotuner(KernelInterface):
             "device": self.device_props.index,
             "device_type": self.device_props.type,
         }
-        self.inductor_meta = {} if inductor_meta is None else inductor_meta
+        self.tp_meta = {} if tp_meta is None else tp_meta
         # What the coordinate-descent tuner needs to know about the device it
         # is tuning for, put where it looks.
-        self.inductor_meta["warp_size"] = self.device_props.warp_size
-        self.inductor_meta["max_threads_per_block"] = (
+        self.tp_meta["warp_size"] = self.device_props.warp_size
+        self.tp_meta["max_threads_per_block"] = (
             self.device_props.max_threads_per_block
         )
-        self.deterministic_mode = self.inductor_meta.get("deterministic", False)
+        self.deterministic_mode = self.tp_meta.get("deterministic", False)
 
         self.save_cache_hook = save_cache_hook
         # Arguments this kernel writes rather than reads.  A measurement runs
@@ -1357,12 +1357,12 @@ class CachingAutotuner(KernelInterface):
         self.autotune_cache_info = autotune_cache_info
         self.lock = threading.Lock()
         self.size_hints = size_hints
-        self.is_mix_order_reduction = self.inductor_meta.get("RSPLIT_SIZE") is not None
+        self.is_mix_order_reduction = self.tp_meta.get("RSPLIT_SIZE") is not None
         self.coordesc_tuner = CoordescTuner(
-            is_mm=inductor_meta.get("is_mm", False) if inductor_meta else False,
+            is_mm=tp_meta.get("is_mm", False) if tp_meta else False,
             is_mix_order_reduction=self.is_mix_order_reduction,
             size_hints=size_hints,
-            inductor_meta=inductor_meta,
+            tp_meta=tp_meta,
         )
         self.filename = filename
         self.kernel_hash: str | None = None
@@ -1523,7 +1523,7 @@ class CachingAutotuner(KernelInterface):
 
         if not getattr(
             self.launchers[0].config, "found_by_coordesc", False
-        ) and self.inductor_meta.get("coordinate_descent_tuning", False):
+        ) and self.tp_meta.get("coordinate_descent_tuning", False):
             self.launchers = [
                 self.coordinate_descent_tuning(self.launchers[0], *args, **kwargs)
             ]
@@ -1576,7 +1576,7 @@ class CachingAutotuner(KernelInterface):
         ):
             return False
         if (
-            self.deterministic_mode or "strict_reduction_rblock" in self.inductor_meta
+            self.deterministic_mode or "strict_reduction_rblock" in self.tp_meta
         ) and self.heuristic_type in (
             HeuristicType.REDUCTION,
             HeuristicType.PERSISTENT_REDUCTION,
@@ -1625,7 +1625,7 @@ class CachingAutotuner(KernelInterface):
             config2launcher[config] = launcher
 
             out = self.bench(launcher, *args, **kwargs)
-            counters["inductor"]["coordesc_tuning_bench"] += 1
+            counters["tp"]["coordesc_tuning_bench"] += 1
             log.debug(
                 "COORDESC: %s: %f, nreg %d, nspill %d, #shared-mem %d",
                 launcher.config,
@@ -1730,7 +1730,7 @@ class CachingAutotuner(KernelInterface):
         carried, which is everything the measurement depended on.
         """
 
-        kernel_name = self.inductor_meta.get("kernel_name", self.fn.__name__)
+        kernel_name = self.tp_meta.get("kernel_name", self.fn.__name__)
         signature = self.triton_meta.get("signature", {})
         arg_names = list(signature.keys())
 
@@ -1945,7 +1945,7 @@ class CachingAutotuner(KernelInterface):
             self.save_cache_hook(
                 launcher.config,
                 self.autotune_time_taken_ns,
-                found_by_coordesc=self.inductor_meta.get(
+                found_by_coordesc=self.tp_meta.get(
                     "coordinate_descent_tuning", False
                 ),
                 triton_cache_hash=launcher.cache_hash,
@@ -2107,7 +2107,7 @@ class CachingAutotuner(KernelInterface):
             return
 
         if len(args) > expected:
-            kernel_name = self.inductor_meta.get("kernel_name", "triton kernel")
+            kernel_name = self.tp_meta.get("kernel_name", "triton kernel")
             raise TypeError(
                 f"{kernel_name}: too many positional arguments - "
                 f"expected {expected}, got {len(args)}. "
@@ -2130,7 +2130,7 @@ class CachingAutotuner(KernelInterface):
             not self.custom_kernel
             and launcher.n_spills is not None
             and launcher.n_spills
-            > self.inductor_meta.get("spill_threshold", 32 if tp.version.hip else 16)
+            > self.tp_meta.get("spill_threshold", 32 if tp.version.hip else 16)
         ):
             log.debug(
                 "Skip config %s because of register spilling: %d",
@@ -2154,7 +2154,7 @@ class CachingAutotuner(KernelInterface):
             cloned_args, cloned_kwargs = self.maybe_clone_args(
                 cpu_copies, *args, **kwargs
             )
-            kernel_name = self.inductor_meta.get("kernel_name", "triton kernel")
+            kernel_name = self.tp_meta.get("kernel_name", "triton kernel")
             # Each configuration is measured from the same starting values, or
             # the first one measured would be measuring more work than the rest.
             self.reset_to_zero_args(*args, **kwargs)
@@ -2213,13 +2213,13 @@ class CachingAutotuner(KernelInterface):
         order the sum is taken in, so it is not offered at all.
         """
 
-        if "strict_reduction_rblock" in self.inductor_meta:
+        if "strict_reduction_rblock" in self.tp_meta:
             return False
         return _could_dynamic_scale_rblock(
             size_hints=self.size_hints,
             heuristic_type=self.heuristic_type,
             device_prop=self.device_props,
-            inductor_meta=self.inductor_meta,
+            tp_meta=self.tp_meta,
         )
 
     @functools.cached_property
@@ -2231,7 +2231,7 @@ class CachingAutotuner(KernelInterface):
         record of which parts there are.
         """
 
-        return _combo_has_reduction_subkernel(self.inductor_meta)
+        return _combo_has_reduction_subkernel(self.tp_meta)
 
     def _iter_rblock_scale_candidates(self):
         """Yield each configuration that halves a reducing block.
@@ -2258,7 +2258,7 @@ class CachingAutotuner(KernelInterface):
         # it wants is the sum over its parts.  Which parts reduce is shared
         # between the two kinds of kernel.
         combo_meta = (
-            self.inductor_meta.get("combo_grid_meta")
+            self.tp_meta.get("combo_grid_meta")
             if self.size_hints is None
             else None
         )
@@ -2329,7 +2329,7 @@ class CachingAutotuner(KernelInterface):
                 reduction_kwargs, key=triton_config.kwargs.__getitem__
             )
             new_rblock = triton_config.kwargs[largest_rkwarg] // 2
-            min_rblock = self.inductor_meta.get("min_rblock")
+            min_rblock = self.tp_meta.get("min_rblock")
             if (
                 min_rblock is not None
                 and largest_rkwarg.startswith("R0_BLOCK")
@@ -2529,7 +2529,7 @@ class CachingAutotuner(KernelInterface):
                             config.num_stages > 1
                             or config.kwargs.get("NUM_STAGES", 1) > 1
                         )
-                        and self.inductor_meta.get("dynamic_disable_pipelining", True)
+                        and self.tp_meta.get("dynamic_disable_pipelining", True)
                     ):
                         self.launchers = [self.compile_by_disabling_pipelining(config)]
                         return
@@ -2663,7 +2663,7 @@ class CachingAutotuner(KernelInterface):
             return
         for result in self.compile_results:
             if isinstance(result, StaticTritonCompileResult):
-                # Don't save this in the inductor cache, as it is very large
+                # Don't save this in the tp cache, as it is very large
                 result.kernel.cubin_raw = None
 
     def __getstate__(self) -> dict[str, Any]:
@@ -2720,20 +2720,20 @@ class CachingAutotuner(KernelInterface):
                 return list(self.triton_meta["signature"].keys())
 
         grid = GridExpr.from_meta(
-            self.inductor_meta, cfg, mode=self.grid_mode
+            self.tp_meta, cfg, mode=self.grid_mode
         ).eval_slow(
             dict(
                 zip(
                     [
                         *filtered_signature(),
-                        *self.inductor_meta.get("extra_launcher_args", ()),
+                        *self.tp_meta.get("extra_launcher_args", ()),
                     ],
                     args,
                 )
             )
         )
-        if self.inductor_meta.get("extra_launcher_args"):
-            args = args[: -len(self.inductor_meta["extra_launcher_args"])]
+        if self.tp_meta.get("extra_launcher_args"):
+            args = args[: -len(self.tp_meta["extra_launcher_args"])]
         return args, grid
 
     def recheck_autotune_cache(self, reload_kernel_from_src) -> None:
@@ -2759,7 +2759,7 @@ class CachingAutotuner(KernelInterface):
         (cached_configs, _, autotune_cache_info) = check_autotune_cache(
             configs,
             self.filename,
-            self.inductor_meta,
+            self.tp_meta,
             dynamic_scale_rblock_eligible=self._could_rblock_scale,
         )
         self.autotune_cache_info = autotune_cache_info
@@ -2854,7 +2854,7 @@ class CachingAutotuner(KernelInterface):
         # extents rather than giving them.  Now that the configuration is
         # known they can be said, and the signature entry for a descriptor is
         # the shape it describes.
-        host_tma_args = self.inductor_meta.get("host_tma_descriptor_args")
+        host_tma_args = self.tp_meta.get("host_tma_descriptor_args")
         if host_tma_args:
             all_constants = compile_meta["constants"]
             for key in list(compile_meta["signature"]):
@@ -2888,7 +2888,7 @@ class CachingAutotuner(KernelInterface):
                     f"tensordesc<{dtype_str}{list(block_shape_vals)}>"
                 )
 
-        compile_meta["debug"] = _should_enable_triton_debug_asserts(self.inductor_meta)
+        compile_meta["debug"] = _should_enable_triton_debug_asserts(self.tp_meta)
         compile_meta["device_type"] = self.device_props.type
         compile_meta["cc"] = self.device_props.cc
 
@@ -2988,7 +2988,7 @@ class CachingAutotuner(KernelInterface):
         except Exception:
             log.exception(
                 "could not compile %s\n%s\nmetadata: %s",
-                self.inductor_meta.get("kernel_name", "triton_"),
+                self.tp_meta.get("kernel_name", "triton_"),
                 self.fn.src,
                 compile_meta,
             )
@@ -2999,13 +2999,13 @@ class CachingAutotuner(KernelInterface):
             int(self.triton_meta.get("device", 0)),
         )
         static_launcher = StaticTritonCompileResult.can_statically_launch(
-            binary, self.inductor_meta, self.triton_meta, self.heuristic_type
+            binary, self.tp_meta, self.triton_meta, self.heuristic_type
         )
         if static_launcher is not None:
             return StaticTritonCompileResult(
-                static_launcher, cfg, compile_meta, self.inductor_meta
+                static_launcher, cfg, compile_meta, self.tp_meta
             )
-        return TritonCompileResult(binary, cfg, compile_meta, self.inductor_meta)
+        return TritonCompileResult(binary, cfg, compile_meta, self.tp_meta)
 
 
     def _post_launch(self) -> None:
@@ -3046,12 +3046,12 @@ class CachingAutotuner(KernelInterface):
             "num_stages": launcher.config.num_stages,
             "kernel_kwargs": kernel_kwargs_str,
         }
-        if "kernel_name" in self.inductor_meta:
-            ret["kernel_name"] = self.inductor_meta["kernel_name"]
-        if "kernel_flop" in self.inductor_meta:
-            ret["kernel_flop"] = self.inductor_meta["kernel_flop"]
-        if "kernel_num_gb" in self.inductor_meta:
-            ret["kernel_num_gb"] = self.inductor_meta["kernel_num_gb"]
+        if "kernel_name" in self.tp_meta:
+            ret["kernel_name"] = self.tp_meta["kernel_name"]
+        if "kernel_flop" in self.tp_meta:
+            ret["kernel_flop"] = self.tp_meta["kernel_flop"]
+        if "kernel_num_gb" in self.tp_meta:
+            ret["kernel_num_gb"] = self.tp_meta["kernel_num_gb"]
         return ret
 
 
@@ -3077,7 +3077,7 @@ class StaticTritonCompileResult(CompileResult[_T]):
     """
 
     @staticmethod
-    def can_statically_launch(kernel, inductor_meta, triton_meta, heuristic_type):
+    def can_statically_launch(kernel, tp_meta, triton_meta, heuristic_type):
         """The form of this kernel that launches from its binary, if there is one."""
 
         from .. import config
@@ -3106,7 +3106,7 @@ class StaticTritonCompileResult(CompileResult[_T]):
             ):
                 raise CannotStaticallyLaunchKernel("a user-written kernel")
 
-            if inductor_meta.get("store_cubin"):
+            if tp_meta.get("store_cubin"):
                 # The whole binary has to be kept, which is what this avoids.
                 raise CannotStaticallyLaunchKernel("the binary is being kept")
 
@@ -3289,7 +3289,7 @@ class TritonCompileResult(CompileResult[CompiledKernel]):
 
         import triton as triton_lib
 
-        import tensorplay as torch_lib
+        import tensorplay as tp_lib
 
         scope = {
             "grid_meta": cfg.kwargs,
@@ -3324,7 +3324,7 @@ class TritonCompileResult(CompileResult[CompiledKernel]):
             "function": get_first_attr(binary, "function", "cu_function"),
             "runner": get_first_attr(binary, "run", "c_wrapper"),
             "math": math_lib,
-            "torch": torch_lib,
+            "tp": tp_lib,
             "triton": triton_lib,
         }
 
@@ -3370,7 +3370,7 @@ class TritonCompileResult(CompileResult[CompiledKernel]):
         pre_runner_lines, runner_args = self._host_tma_pre_runner_lines(
             runner_args, call_args
         )
-        if self.inductor_meta.get("host_tma_descriptor_args"):
+        if self.tp_meta.get("host_tma_descriptor_args"):
             # _host_tma_pre_runner_lines already validated the stable TMA API.
             from triton.tools.tensor_descriptor import TensorDescriptor
 
@@ -3387,7 +3387,7 @@ class TritonCompileResult(CompileResult[CompiledKernel]):
         launcher.n_spills = getattr(binary, "n_spills", None)
         launcher.shared = binary_shared
         launcher.cache_hash = triton_hash_to_path_key(binary.hash)
-        launcher.store_cubin = self.inductor_meta.get("store_cubin", False)
+        launcher.store_cubin = self.tp_meta.get("store_cubin", False)
         # store this global variable to avoid the high overhead of reading it when calling run
         if launcher.store_cubin:
             launcher.fn = fn
@@ -3467,7 +3467,7 @@ class DebugAutotuner(CachingAutotuner):
                 # none; fall back to the name the compilation recorded, and
                 # then to the function's own, so that a filter still has
                 # something to match against.
-                kernel_name = self.inductor_meta.get("kernel_name") or self.fn.__name__
+                kernel_name = self.tp_meta.get("kernel_name") or self.fn.__name__
             if not re.match(self.regex_filter, kernel_name):
                 return
             if len(self.launchers) != 1:
@@ -3488,7 +3488,7 @@ class DebugAutotuner(CachingAutotuner):
                         if arg_name.startswith("in_out_ptr")
                     ]
                 )
-                num_gb = self.inductor_meta.get("kernel_num_gb", None)
+                num_gb = self.tp_meta.get("kernel_num_gb", None)
                 if num_gb is None:
                     num_gb = get_num_bytes(*args, num_in_out_args=num_in_out_ptrs) / 1e9
                 gb_per_s = num_gb / (ms / 1e3)
@@ -3516,7 +3516,7 @@ class ComboKernelGrid(GridExpr):
     """
 
     def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
-        combo_meta = self.inductor_meta["combo_grid_meta"]
+        combo_meta = self.tp_meta["combo_grid_meta"]
         if combo_meta["default_config"]:
             meta = {**combo_meta["default_config"], **meta}
         no_x_dims = []
@@ -3603,7 +3603,7 @@ class SequentialFlattenComboKernelGrid(GridExpr):
     """
 
     def generate_lazy(self, kernel_name: str) -> None:
-        combo_meta = self.inductor_meta["combo_grid_meta"]
+        combo_meta = self.tp_meta["combo_grid_meta"]
         num_kernels = combo_meta["num_kernels"]
         meta: dict[str, Any] = {}
         for i in range(num_kernels):
@@ -3612,7 +3612,7 @@ class SequentialFlattenComboKernelGrid(GridExpr):
         self.generate(meta, is_lazy=True)
 
     def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
-        combo_meta = self.inductor_meta["combo_grid_meta"]
+        combo_meta = self.tp_meta["combo_grid_meta"]
         if combo_meta["default_config"]:
             meta = {**combo_meta["default_config"], **meta}
 
@@ -3664,7 +3664,7 @@ class RoundRobinComboKernelGrid(ComboKernelGrid):
             raise AssertionError(
                 f"xnumels and no_x_dims length mismatch: {len(xnumels)} != {len(no_x_dims)}"
             )
-        num_kernels = self.inductor_meta["combo_grid_meta"]["num_kernels"]
+        num_kernels = self.tp_meta["combo_grid_meta"]["num_kernels"]
         exprs = [x for x, no_x_dim in zip(xnumels, no_x_dims) if no_x_dim]
         xnumels_x_dim = [x for x, no_x_dim in zip(xnumels, no_x_dims) if not no_x_dim]
         if xnumels_x_dim:
@@ -3675,10 +3675,10 @@ class RoundRobinComboKernelGrid(ComboKernelGrid):
 def _enforce_reduction_config_block_minimums(
     configs: list[Config],
     size_hints: dict[str, int],
-    inductor_meta: InductorMeta,
+    tp_meta: TpMeta,
 ) -> list[Config]:
-    min_xblock = inductor_meta.get("min_xblock")
-    min_rblock = inductor_meta.get("min_rblock")
+    min_xblock = tp_meta.get("min_xblock")
+    min_rblock = tp_meta.get("min_rblock")
     if min_xblock is None and min_rblock is None:
         return configs
 
@@ -3959,11 +3959,11 @@ def autotune_hints_to_configs(
     return configs
 
 
-def _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs):
-    restrictions = inductor_meta.get("tma_min_block_sizes")
+def _maybe_filter_configs_for_tma_restrictions(tp_meta, configs):
+    restrictions = tp_meta.get("tma_min_block_sizes")
     if not restrictions or not configs:
         return configs
-    if inductor_meta.get("persistent_reduction"):
+    if tp_meta.get("persistent_reduction"):
         restrictions = {
             name: minimum
             for name, minimum in restrictions.items()
@@ -4133,7 +4133,7 @@ def triton_config_reduction(
     cfg = _get_config({"x": x, **rnumels})
     check_max_block(cfg)
     check_config(cfg, xnumel=size_hints["x"])
-    result = InductorConfig(
+    result = TpConfig(
         cfg,
         num_warps=num_warps,
         num_stages=num_stages,
@@ -4191,7 +4191,7 @@ def triton_config_tiled_reduction(
 def _reduction_configs(
     *,
     size_hints: dict[str, int],
-    inductor_meta: InductorMeta,
+    tp_meta: TpMeta,
     triton_meta: TritonMeta,
     num_dynamic=0,
 ) -> list[Config]:
@@ -4202,11 +4202,11 @@ def _reduction_configs(
     heuristic = get_codegen_heuristic("reduction", triton_meta["device"].type)
     configs = heuristic.get_configs(
         size_hints=size_hints,
-        inductor_meta=inductor_meta,
+        tp_meta=tp_meta,
         triton_meta=triton_meta,
         num_dynamic=num_dynamic,
     )
-    r0 = inductor_meta.get("strict_reduction_rblock")
+    r0 = tp_meta.get("strict_reduction_rblock")
     if r0 is not None:
         configs = copy.deepcopy(configs)
         for cfg in configs:
@@ -4217,16 +4217,16 @@ def _reduction_configs(
 
 
 def filter_reduction_configs_for_determinism(
-    inductor_meta: InductorMeta, configs: list[Config]
+    tp_meta: TpMeta, configs: list[Config]
 ) -> list[Config]:
     configs = unique_configs(configs)
     if len(configs) == 0:
         raise AssertionError("No configs remaining after deduplication")
 
     should_filter = (
-        inductor_meta.get("deterministic", False)
-        or inductor_meta.get("force_filter_reduction_configs", False)
-        or inductor_meta.get("are_deterministic_algorithms_enabled")
+        tp_meta.get("deterministic", False)
+        or tp_meta.get("force_filter_reduction_configs", False)
+        or tp_meta.get("are_deterministic_algorithms_enabled")
     )
     if not should_filter or len(configs) == 1:
         return configs
@@ -4242,7 +4242,7 @@ def filter_reduction_configs_for_determinism(
         return rblock is not None and rblock <= 4
 
     def has_nonpromising_xblock(cfg):
-        return cfg.kwargs["XBLOCK"] == 1 and not inductor_meta.get(
+        return cfg.kwargs["XBLOCK"] == 1 and not tp_meta.get(
             "has_loadstore_with_contiguous_rdim", True
         )
 
@@ -4294,12 +4294,12 @@ def reduction(
     reduction_hint=False,
     triton_meta: TritonMeta | None = None,
     filename=None,
-    inductor_meta: InductorMeta | None = None,
+    tp_meta: TpMeta | None = None,
     return_configs=False,
 ):
-    inductor_meta = {} if inductor_meta is None else inductor_meta
-    inductor_meta["reduction_hint"] = reduction_hint
-    if inductor_meta.get("no_x_dim"):
+    tp_meta = {} if tp_meta is None else tp_meta
+    tp_meta["reduction_hint"] = reduction_hint
+    if tp_meta.get("no_x_dim"):
         size_hints["x"] = 1
 
     if triton_meta is None:
@@ -4307,7 +4307,7 @@ def reduction(
 
     configs = _handle_combo_kernel_per_subkernel_blocks(
         size_hints,
-        inductor_meta,
+        tp_meta,
         triton_meta,
         filename=filename,
         reduction_hint=reduction_hint,
@@ -4317,7 +4317,7 @@ def reduction(
             None,
             configs,
             triton_meta=triton_meta,
-            inductor_meta=inductor_meta,
+            tp_meta=tp_meta,
             heuristic_type=HeuristicType.REDUCTION,
             filename=filename,
         )
@@ -4325,13 +4325,13 @@ def reduction(
     num_dynamic = sum("ks" in name for name in triton_meta["signature"])
     configs = _reduction_configs(
         size_hints=size_hints,
-        inductor_meta=inductor_meta,
+        tp_meta=tp_meta,
         triton_meta=triton_meta,
         num_dynamic=num_dynamic,
     )
-    configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
-    configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
-    strict_rblock = inductor_meta.get("strict_reduction_rblock")
+    configs = _maybe_filter_configs_for_tma_restrictions(tp_meta, configs)
+    configs = filter_reduction_configs_for_determinism(tp_meta, configs)
+    strict_rblock = tp_meta.get("strict_reduction_rblock")
     if strict_rblock is not None and any(
         cfg.kwargs.get("R0_BLOCK", strict_rblock) != strict_rblock for cfg in configs
     ):
@@ -4343,7 +4343,7 @@ def reduction(
         size_hints,
         configs=configs,
         triton_meta=triton_meta,
-        inductor_meta=inductor_meta,
+        tp_meta=tp_meta,
         heuristic_type=HeuristicType.REDUCTION,
         filename=filename,
     )
@@ -4354,11 +4354,11 @@ def cooperative_reduction(
     reduction_hint,
     triton_meta: TritonMeta,
     filename,
-    inductor_meta: InductorMeta | None = None,
+    tp_meta: TpMeta | None = None,
 ):
-    inductor_meta = {} if inductor_meta is None else inductor_meta
-    inductor_meta["reduction_hint"] = reduction_hint
-    if inductor_meta.get("no_x_dim"):
+    tp_meta = {} if tp_meta is None else tp_meta
+    tp_meta["reduction_hint"] = reduction_hint
+    if tp_meta.get("no_x_dim"):
         size_hints["x"] = 1
 
     from ..heuristics.registry import get_codegen_heuristic
@@ -4369,16 +4369,16 @@ def cooperative_reduction(
     configs = heuristic.get_cooperative_configs(
         size_hints=size_hints,
         reduction_hint=reduction_hint,
-        inductor_meta=inductor_meta,
+        tp_meta=tp_meta,
         triton_meta=triton_meta,
     )
-    configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
-    configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
+    configs = _maybe_filter_configs_for_tma_restrictions(tp_meta, configs)
+    configs = filter_reduction_configs_for_determinism(tp_meta, configs)
     return cached_autotune(
         size_hints,
         configs=configs,
         triton_meta=triton_meta,
-        inductor_meta=inductor_meta,
+        tp_meta=tp_meta,
         heuristic_type=HeuristicType.REDUCTION,
         filename=filename,
     )
@@ -4387,7 +4387,7 @@ def cooperative_reduction(
 def _persistent_reduction_configs(
     size_hints,
     reduction_hint=False,
-    inductor_meta: InductorMeta | None = None,
+    tp_meta: TpMeta | None = None,
     triton_meta: TritonMeta | None = None,
 ):
     from ..heuristics.registry import get_codegen_heuristic
@@ -4398,7 +4398,7 @@ def _persistent_reduction_configs(
     return heuristic.get_persistent_configs(
         size_hints=size_hints,
         reduction_hint=reduction_hint,
-        inductor_meta=inductor_meta,
+        tp_meta=tp_meta,
         triton_meta=triton_meta,
     )
 
@@ -4408,12 +4408,12 @@ def persistent_reduction(
     reduction_hint=False,
     triton_meta: TritonMeta | None = None,
     filename=None,
-    inductor_meta: InductorMeta | None = None,
+    tp_meta: TpMeta | None = None,
     return_configs=False,
 ):
-    inductor_meta = {} if inductor_meta is None else inductor_meta
-    inductor_meta["reduction_hint"] = reduction_hint
-    if inductor_meta.get("no_x_dim"):
+    tp_meta = {} if tp_meta is None else tp_meta
+    tp_meta["reduction_hint"] = reduction_hint
+    if tp_meta.get("no_x_dim"):
         size_hints["x"] = 1
 
     if triton_meta is None:
@@ -4421,7 +4421,7 @@ def persistent_reduction(
 
     configs = _handle_combo_kernel_per_subkernel_blocks(
         size_hints,
-        inductor_meta,
+        tp_meta,
         triton_meta,
         filename=filename,
         reduction_hint=reduction_hint,
@@ -4431,20 +4431,20 @@ def persistent_reduction(
             None,
             configs,
             triton_meta=triton_meta,
-            inductor_meta=inductor_meta,
+            tp_meta=tp_meta,
             heuristic_type=HeuristicType.PERSISTENT_REDUCTION,
             filename=filename,
         )
 
     configs = _persistent_reduction_configs(
-        size_hints, reduction_hint, inductor_meta, triton_meta
+        size_hints, reduction_hint, tp_meta, triton_meta
     )
     persistent_key = "persistent_reduction"
-    inductor_meta[persistent_key] = True
-    configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
-    inductor_meta.pop(persistent_key)
+    tp_meta[persistent_key] = True
+    configs = _maybe_filter_configs_for_tma_restrictions(tp_meta, configs)
+    tp_meta.pop(persistent_key)
 
-    if inductor_meta.get("RSPLIT_SIZE"):
+    if tp_meta.get("RSPLIT_SIZE"):
         from ..heuristics.registry import get_codegen_heuristic
         from ..heuristics.triton_codegen import reduction as _reduction_rules
 
@@ -4453,17 +4453,17 @@ def persistent_reduction(
         configs = heuristic.apply_rsplit_size(
             configs,
             size_hints=size_hints,
-            inductor_meta=inductor_meta,
+            tp_meta=tp_meta,
         )
 
-    configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
+    configs = filter_reduction_configs_for_determinism(tp_meta, configs)
     if return_configs:
         return configs
     return cached_autotune(
         size_hints,
         configs,
         triton_meta=triton_meta,
-        inductor_meta=inductor_meta,
+        tp_meta=tp_meta,
         filename=filename,
         heuristic_type=HeuristicType.PERSISTENT_REDUCTION,
     )
@@ -4474,11 +4474,11 @@ def split_scan(
     reduction_hint=False,
     triton_meta: TritonMeta | None = None,
     filename=None,
-    inductor_meta: InductorMeta | None = None,
+    tp_meta: TpMeta | None = None,
 ):
-    inductor_meta = {} if inductor_meta is None else inductor_meta
-    inductor_meta["reduction_hint"] = reduction_hint
-    if inductor_meta.get("no_x_dim"):
+    tp_meta = {} if tp_meta is None else tp_meta
+    tp_meta["reduction_hint"] = reduction_hint
+    if tp_meta.get("no_x_dim"):
         size_hints["x"] = 1
 
     if triton_meta is None:
@@ -4493,16 +4493,16 @@ def split_scan(
     heuristic = get_codegen_heuristic("reduction", triton_meta["device"].type)
     configs = heuristic.get_split_scan_configs(
         size_hints=size_hints,
-        inductor_meta=inductor_meta,
+        tp_meta=tp_meta,
         triton_meta=triton_meta,
     )
-    configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
-    configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
+    configs = _maybe_filter_configs_for_tma_restrictions(tp_meta, configs)
+    configs = filter_reduction_configs_for_determinism(tp_meta, configs)
     return cached_autotune(
         size_hints,
         configs=configs,
         triton_meta=triton_meta,
-        inductor_meta=inductor_meta,
+        tp_meta=tp_meta,
         heuristic_type=HeuristicType.SPLIT_SCAN,
         filename=filename,
     )
@@ -4514,7 +4514,7 @@ def cached_autotune(
     triton_meta: TritonMeta,
     heuristic_type,
     filename=None,
-    inductor_meta: InductorMeta | None = None,
+    tp_meta: TpMeta | None = None,
     custom_kernel=False,
     caching_autotuner_cls: type[CachingAutotuner] = CachingAutotuner,
     debug_autotuner_cls: type[DebugAutotuner] = DebugAutotuner,
@@ -4523,13 +4523,13 @@ def cached_autotune(
     A copy of triton.autotune that calls our subclass.  Our subclass
     has additional debugging, error handling, and on-disk caching.
     """
-    inductor_meta = {} if inductor_meta is None else inductor_meta
+    tp_meta = {} if tp_meta is None else tp_meta
     if size_hints is not None and heuristic_type in (
         HeuristicType.REDUCTION,
         HeuristicType.PERSISTENT_REDUCTION,
     ):
         configs = _enforce_reduction_config_block_minimums(
-            configs, size_hints, inductor_meta
+            configs, size_hints, tp_meta
         )
     configs = unique_configs(configs)
     if len(configs) != 1 and not filename:
@@ -4542,16 +4542,16 @@ def cached_autotune(
         size_hints=size_hints,
         heuristic_type=heuristic_type,
         device_prop=device_prop,
-        inductor_meta=inductor_meta,
+        tp_meta=tp_meta,
     )
     configs, autotune_cache, autotune_cache_info = check_autotune_cache(
         configs,
         filename,
-        inductor_meta,
+        tp_meta,
         dynamic_scale_rblock_eligible=dynamic_scale_rblock_eligible,
     )
-    mutated_arg_names = cast("list[str]", inductor_meta.pop("mutated_arg_names", ()))
-    optimize_mem = inductor_meta.pop("optimize_mem", True)
+    mutated_arg_names = cast("list[str]", tp_meta.pop("mutated_arg_names", ()))
+    optimize_mem = tp_meta.pop("optimize_mem", True)
 
     if "restore_value" in triton_meta:
         mutated_arg_names += triton_meta.pop("restore_value")
@@ -4576,13 +4576,13 @@ def cached_autotune(
                         )
                     tconfig.kwargs.pop("XBLOCK")
 
-        if inductor_meta.get("profile_bandwidth"):
+        if tp_meta.get("profile_bandwidth"):
             return debug_autotuner_cls(
                 fn,
                 triton_meta=triton_meta,
-                inductor_meta=inductor_meta,
-                regex_filter=inductor_meta["profile_bandwidth_regex"],
-                with_profiler=inductor_meta[
+                tp_meta=tp_meta,
+                regex_filter=tp_meta["profile_bandwidth_regex"],
+                with_profiler=tp_meta[
                     "profile_bandwidth_with_do_bench_using_profiling"
                 ],
                 configs=configs,
@@ -4599,7 +4599,7 @@ def cached_autotune(
         return caching_autotuner_cls(
             fn,
             triton_meta=triton_meta,
-            inductor_meta=inductor_meta,
+            tp_meta=tp_meta,
             configs=configs,
             save_cache_hook=autotune_cache and autotune_cache.save,
             mutated_arg_names=mutated_arg_names,
@@ -4622,7 +4622,7 @@ def template(
     num_consumer_groups=0,
     num_buffers_warp_spec=0,
     filename=None,
-    inductor_meta: InductorMeta | None = None,
+    tp_meta: TpMeta | None = None,
     **kwargs,
 ):
     """
@@ -4651,7 +4651,7 @@ def template(
         None,
         [triton.Config({}, **config_args)],
         triton_meta=triton_meta,
-        inductor_meta=inductor_meta,
+        tp_meta=tp_meta,
         heuristic_type=HeuristicType.TEMPLATE,
         filename=filename,
     )
@@ -4663,15 +4663,15 @@ def pointwise(
     tile_hint=None,
     filename=None,
     min_elem_per_thread=0,
-    inductor_meta=None,
+    tp_meta=None,
     return_configs=False,
 ):
-    inductor_meta = {} if inductor_meta is None else inductor_meta
+    tp_meta = {} if tp_meta is None else tp_meta
     device_props = triton_meta["device"]
     numel = functools.reduce(operator.mul, size_hints.values())
     block_size = max(256, min(numel // 128, 1024))
     hinted_configs = autotune_hints_to_configs(
-        inductor_meta.get("autotune_hints", OrderedSet()),
+        tp_meta.get("autotune_hints", OrderedSet()),
         size_hints,
         block_size,
         device_props,
@@ -4693,16 +4693,16 @@ def pointwise(
         config_fn,
         hinted_configs,
         tile_hint=tile_hint,
-        inductor_meta=inductor_meta,
+        tp_meta=tp_meta,
     )
-    configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
+    configs = _maybe_filter_configs_for_tma_restrictions(tp_meta, configs)
     if return_configs:
         return unique_configs(configs)
     return cached_autotune(
         size_hints,
         unique_configs(configs),
         triton_meta=triton_meta,
-        inductor_meta=inductor_meta,
+        tp_meta=tp_meta,
         heuristic_type=HeuristicType.POINTWISE,
         filename=filename,
     )

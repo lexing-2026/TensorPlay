@@ -8,7 +8,7 @@ from tensorplay.graph import Graph, GraphModule
 from tensorplay.graph.passes.graph_transform_observer import GraphTransformObserver
 from tensorplay.graph.passes.shape_prop import _extract_tensor_metadata
 
-from .. import config, inductor_prims
+from .. import config, tp_prims
 from ..pattern_matcher import (
     CallFunctionVarArgs,
     Match,
@@ -75,19 +75,19 @@ def replace_random_passes(gm: GraphModule):
 
 def fuse_offset_creation_pass(graph: Graph) -> int:
     """
-    Here offset node means seed << 32 + offset, will unpacked in lowering.py:inductor_random()
+    Here offset node means seed << 32 + offset, will unpacked in lowering.py:tp_random()
     Horizontally fuse all the seed generation on each device
-        a = inductor_prims.rand_eager_offset(offset, dev)
-        b = inductor_prims.rand_eager_offset(offset, dev)
+        a = tp_prims.rand_eager_offset(offset, dev)
+        b = tp_prims.rand_eager_offset(offset, dev)
     Becomes:
-        offsets = inductor_prims.rand_eager_offsets([offset1, offset2...], dev)
+        offsets = tp_prims.rand_eager_offsets([offset1, offset2...], dev)
         a = tp.ops.tp.select.int(offsets, 0, 0)
         b = tp.ops.tp.select.int(offsets, 0, 1)
     We do this because seed creation is entirely launch overhead bound.
     """
     device_offsets = collections.defaultdict(list)
     for node in graph.nodes:
-        if CallFunctionVarArgs(inductor_prims.rand_eager_offset).match(node):
+        if CallFunctionVarArgs(tp_prims.rand_eager_offset).match(node):
             device_offsets[node.args[1]].append(node)
 
     if not device_offsets:
@@ -97,7 +97,7 @@ def fuse_offset_creation_pass(graph: Graph) -> int:
         with graph.inserting_before(offsets[0]):
             offs = [n.args[0] for n in offsets]
             combined = graph.call_function(
-                inductor_prims.rand_eager_offsets, (offs, device)
+                tp_prims.rand_eager_offsets, (offs, device)
             )
             combined.meta.update(offsets[0].meta)
             with V.fake_mode:
@@ -124,19 +124,19 @@ def fuse_seed_creation_pass(graph: Graph):
     """
     Horizontally fuse all the seed generation on each device
 
-        a = inductor_seed(dev)
-        b = inductor_seed(dev)
+        a = tp_seed(dev)
+        b = tp_seed(dev)
 
     Becomes:
-        seeds = inductor_seeds(2, dev)
-        a = inductor_lookup_seed(seeds, 0)
-        b = inductor_lookup_seed(seeds, 1)
+        seeds = tp_seeds(2, dev)
+        a = tp_lookup_seed(seeds, 0)
+        b = tp_lookup_seed(seeds, 1)
 
     We do this because seed creation is entirely launch overhead bound.
     """
     device_seeds = collections.defaultdict(list)
     for node in graph.nodes:
-        if CallFunctionVarArgs(inductor_prims.seed).match(node):
+        if CallFunctionVarArgs(tp_prims.seed).match(node):
             device_seeds[node.args[0]].append(node)
 
     if not device_seeds:
@@ -144,7 +144,7 @@ def fuse_seed_creation_pass(graph: Graph):
 
     for device, seeds in device_seeds.items():
         with graph.inserting_before(seeds[0]):
-            combined = graph.call_function(inductor_prims.seeds, (len(seeds), device))
+            combined = graph.call_function(tp_prims.seeds, (len(seeds), device))
             combined.meta.update(seeds[0].meta)
             with V.fake_mode:
                 combined.meta["val"] = tp.empty(
@@ -157,7 +157,7 @@ def fuse_seed_creation_pass(graph: Graph):
         for idx, seed in enumerate(seeds):
             with graph.inserting_before(seed):
                 new_seed = graph.call_function(
-                    inductor_prims.lookup_seed, (combined, idx)
+                    tp_prims.lookup_seed, (combined, idx)
                 )
             seed.replace_all_uses_with(new_seed)
             new_seed.meta.update(seed.meta)
@@ -200,8 +200,8 @@ def replace_random(
         return
 
     def replacement(size):
-        result = inductor_prims.random(
-            size, inductor_prims.seed(device), mode, **default_kwargs(device)
+        result = tp_prims.random(
+            size, tp_prims.seed(device), mode, **default_kwargs(device)
         )
         if dtype is not None:
             result = result.to(dtype)
@@ -225,9 +225,9 @@ def replace_random(
             if isinstance(align_dtype, (tuple, list)):
                 align_dtype = align_dtype[0] if len(align_dtype) else None
 
-            result = inductor_prims.random(
+            result = tp_prims.random(
                 size,
-                inductor_prims.rand_eager_offset(offset, device),
+                tp_prims.rand_eager_offset(offset, device),
                 mode,
                 **default_kwargs(device),
                 align_dtype=align_dtype,
@@ -259,7 +259,7 @@ def replace_randint(
         return
 
     def replacement(low, high, size):
-        result = inductor_prims.randint(low, high, size, inductor_prims.seed(device))
+        result = tp_prims.randint(low, high, size, tp_prims.seed(device))
         return result.to(dtype)
 
     device = get_device(device)

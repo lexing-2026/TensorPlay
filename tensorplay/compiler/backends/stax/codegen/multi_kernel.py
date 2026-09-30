@@ -162,7 +162,7 @@ class MultiKernel:
             kernels
         )
 
-        # need this since some code in inductor check if the kernel object has an args
+        # need this since some code in the compiler checks if the kernel object has an args
         # attribute to decide if it's a non-null kernel.
         self.args = object()
 
@@ -480,9 +480,9 @@ class MultiKernelCall:
             log.debug(
                 "pick %dth sub-kernel in %s. Size hints %s. Reduction hint %s. Timings %s",
                 self.picked_kernel,
-                [k.inductor_meta.get("kernel_name") for k in self.kernels],
+                [k.tp_meta.get("kernel_name") for k in self.kernels],
                 k0.size_hints,
-                k0.inductor_meta.get("reduction_hint"),
+                k0.tp_meta.get("reduction_hint"),
                 timings,
             )
             get_metric_table("persistent_red_perf").add_row(
@@ -494,7 +494,7 @@ class MultiKernelCall:
 
         if not self._recorded:
             self._recorded = True
-            picked_kernel_name = self.kernels[self.picked_kernel].inductor_meta.get(
+            picked_kernel_name = self.kernels[self.picked_kernel].tp_meta.get(
                 "kernel_name"
             )
             if picked_kernel_name is None:
@@ -512,7 +512,7 @@ class MultiKernelCall:
         k0 = self.kernels[0]
         row = {
             "size_hints": k0.size_hints,
-            "reduction_hint": k0.inductor_meta.get("reduction_hint"),
+            "reduction_hint": k0.tp_meta.get("reduction_hint"),
         }
         max_kernels = 4
         if len(timings) > max_kernels:
@@ -551,7 +551,7 @@ class SizeHintMultiKernel(MultiKernel):
             self.kernels, self.kernel_shape_keys
         )
 
-        # need this since some code in inductor check if the kernel object has an args
+        # need this since some code in the compiler checks if the kernel object has an args
         # attribute to decide if it's a non-null kernel.
         self.args = object()
 
@@ -616,7 +616,7 @@ class SizeHintMultiKernelCall(MultiKernelCall):
             log.debug(
                 "using cached shape-specialized choice %dth sub-kernel in %s. Cache key: %s",
                 self.picked_kernel,
-                [k.inductor_meta.get("kernel_name") for k in self.kernels],
+                [k.tp_meta.get("kernel_name") for k in self.kernels],
                 cache_key,
             )
         else:
@@ -624,7 +624,7 @@ class SizeHintMultiKernelCall(MultiKernelCall):
 
         if not self._recorded:
             self._recorded = True
-            picked_kernel_name = self.kernels[self.picked_kernel].inductor_meta.get(
+            picked_kernel_name = self.kernels[self.picked_kernel].tp_meta.get(
                 "kernel_name"
             )
             if picked_kernel_name is None:

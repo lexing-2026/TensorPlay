@@ -302,15 +302,15 @@ def _rebuild_tensor_v3(storage, storage_offset, size, stride, requires_grad,
 _rebuild_tensor_v2.__module__ = "torch._utils"
 _rebuild_tensor_v2.__name__ = "_rebuild_tensor_v2"
 _rebuild_tensor_v2.__qualname__ = "_rebuild_tensor_v2"
-_rebuild_tensor_v2._tp_torch_ref = ("torch._utils", "_rebuild_tensor_v2")
+_rebuild_tensor_v2._tp_backend_ref = ("torch._utils", "_rebuild_tensor_v2")
 _rebuild_tensor.__module__ = "torch._utils"
 _rebuild_tensor.__name__ = "_rebuild_tensor"
 _rebuild_tensor.__qualname__ = "_rebuild_tensor"
-_rebuild_tensor._tp_torch_ref = ("torch._utils", "_rebuild_tensor")
+_rebuild_tensor._tp_backend_ref = ("torch._utils", "_rebuild_tensor")
 _rebuild_tensor_v3.__module__ = "torch._utils"
 _rebuild_tensor_v3.__name__ = "_rebuild_tensor_v3"
 _rebuild_tensor_v3.__qualname__ = "_rebuild_tensor_v3"
-_rebuild_tensor_v3._tp_torch_ref = ("torch._utils", "_rebuild_tensor_v3")
+_rebuild_tensor_v3._tp_backend_ref = ("torch._utils", "_rebuild_tensor_v3")
 
 
 def _rebuild_parameter(data, requires_grad, backward_hooks, process_dict=None):
@@ -326,7 +326,7 @@ def _rebuild_parameter(data, requires_grad, backward_hooks, process_dict=None):
 _rebuild_parameter.__module__ = "torch.nn.parameter"
 _rebuild_parameter.__name__ = "_rebuild_parameter"
 _rebuild_parameter.__qualname__ = "_rebuild_parameter"
-_rebuild_parameter._tp_torch_ref = ("torch.nn.parameter", "_rebuild_parameter")
+_rebuild_parameter._tp_backend_ref = ("torch.nn.parameter", "_rebuild_parameter")
 
 
 def _rebuild_parameter_with_state(data, requires_grad, backward_hooks, state):
@@ -346,7 +346,7 @@ def _rebuild_parameter_with_state(data, requires_grad, backward_hooks, state):
 _rebuild_parameter_with_state.__module__ = "torch._utils"
 _rebuild_parameter_with_state.__name__ = "_rebuild_parameter_with_state"
 _rebuild_parameter_with_state.__qualname__ = "_rebuild_parameter_with_state"
-_rebuild_parameter_with_state._tp_torch_ref = (
+_rebuild_parameter_with_state._tp_backend_ref = (
     "torch._utils", "_rebuild_parameter_with_state"
 )
 
@@ -1001,7 +1001,7 @@ def _make_pt_storage_class(dtype_name: str):
         (),
         {"__module__": "torch", "__qualname__": storage_name, "__name__": storage_name},
     )
-    cls._tp_torch_ref = ("torch", storage_name)
+    cls._tp_backend_ref = ("torch", storage_name)
     return cls
 
 
@@ -1014,7 +1014,7 @@ class _TorchCompatPickler(pickle._Pickler):
     """Pickler that emits the external storage class names required by the format."""
 
     def save_global(self, obj, name=None):
-        forced = getattr(obj, "_tp_torch_ref", None)
+        forced = getattr(obj, "_tp_backend_ref", None)
         if forced is not None:
             module, forced_name = forced
             self.write(pickle.GLOBAL

@@ -10,7 +10,7 @@ from ..node import Node
 from .infra.partitioner import CapabilityBasedPartitioner
 from .operator_support import create_op_support
 
-__all__ = ["regional_inductor"]
+__all__ = ["regional_compile"]
 
 _REGION_PREFIX = "__marked_region_"
 
@@ -19,7 +19,7 @@ def _compile_marker(node: Node) -> Any:
     custom = node.meta.get("custom")
     if not isinstance(custom, dict):
         return None
-    return custom.get("compile_with_inductor")
+    return custom.get("compile_with_tp")
 
 
 def _needs_compile(node: Node) -> bool:
@@ -32,7 +32,7 @@ def _extract_regions(gm: GraphModule) -> GraphModule:
         if not _needs_compile(node):
             continue
         marker = _compile_marker(node)
-        region_id = marker.get("inductor_region") if isinstance(marker, dict) else None
+        region_id = marker.get("tp_region") if isinstance(marker, dict) else None
         regions[region_id].add(node)
     for index, region_nodes in enumerate(regions.values()):
         support = create_op_support(lambda _mods, node, nodes=region_nodes: node in nodes)
@@ -78,7 +78,7 @@ def _compile_regions(gm: GraphModule) -> GraphModule:
     return gm
 
 
-def regional_inductor(gm: GraphModule, *example_args: object) -> GraphModule:
+def regional_compile(gm: GraphModule, *example_args: object) -> GraphModule:
     """Extract marked regions and invoke their explicitly supplied compiler."""
 
     del example_args

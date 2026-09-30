@@ -323,7 +323,7 @@ def get_current_replay_node() -> Node | None:
 
 
 @contextmanager
-def _set_regional_inductor_subgraph_name(name: str | None) -> Iterator[None]:
+def _set_regional_compile_subgraph_name(name: str | None) -> Iterator[None]:
     old = getattr(_regional_name, "value", None)
     _regional_name.value = name
     try:
@@ -332,7 +332,7 @@ def _set_regional_inductor_subgraph_name(name: str | None) -> Iterator[None]:
         _regional_name.value = old
 
 
-def _get_regional_inductor_subgraph_name() -> str | None:
+def _get_regional_compile_subgraph_name() -> str | None:
     return getattr(_regional_name, "value", None)
 
 

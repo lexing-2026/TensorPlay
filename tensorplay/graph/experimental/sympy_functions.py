@@ -864,7 +864,7 @@ class IsNonOverlappingAndDenseIndicator(sympy.Function):
         sizes = args[0:dim]
         strides = args[dim:]
 
-        # sym_node imported in torch.__init__. Local import to avoid an import cycle
+        # sym_node imported in the package init. Local import to avoid an import cycle
         from .symbolic_shapes import eval_is_non_overlapping_and_dense
 
         if all(isinstance(a, sympy.Integer) for a in args):
@@ -1162,7 +1162,7 @@ def handlers() -> dict[type[sympy.Basic], str]:
         sympy.Pow: "pow_by_natural",
         Mod: "mod",
         PythonMod: "python_mod",
-        # TODO: Inductor can generate these, but it's ill-specified which
+        # TODO: the compiler can generate these, but it's ill-specified which
         # semantics were intended here.  Needs to be cleaned up along with
         # FloorDiv in a bigger cleanup
         sympy.Mod: "mod",
@@ -2873,6 +2873,17 @@ class FloorDiv(sympy.Function):
     def eval(cls, base, divisor):
         if divisor.is_zero:
             raise ZeroDivisionError("division by zero")
+        if base is sympy.S.IntInfinity or base is sympy.S.NegativeIntInfinity:
+            if divisor.is_positive:
+                return base
+            if divisor.is_negative:
+                return (sympy.S.NegativeIntInfinity if base is sympy.S.IntInfinity
+                        else sympy.S.IntInfinity)
+            return sympy.nan
+        if divisor is sympy.S.IntInfinity or divisor is sympy.S.NegativeIntInfinity:
+            if base.is_zero:
+                return sympy.S.Zero
+            return sympy.nan
         if is_infinite(base) and is_infinite(divisor):
             return sympy.nan
         if base is sympy.nan or divisor is sympy.nan:

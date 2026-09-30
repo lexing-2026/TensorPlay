@@ -102,7 +102,7 @@ def signature_of(
     size_dtype: str | None,
     use_fp64_for_python_float: bool = True,
 ) -> str:
-    """Return the Triton signature type for an Inductor kernel argument."""
+    """Return the Triton signature type for a kernel argument."""
     if isinstance(arg, TensorArg):
         typ = _type_of(arg.dtype)
         if should_unwrap_unspec_arg(arg.buffer):
@@ -132,7 +132,7 @@ def signature_of(
             # it should be marked as "constexpr" in the signature.
             return "constexpr"
         elif isinstance(arg.expr, (float, sympy.Float)):
-            # Inductor-generated kernels use fp64 to preserve Python-float
+            # Generated kernels use fp64 to preserve Python-float
             # precision. User-defined Triton kernels opt out so their compiled
             # signatures match Triton's eager specialization.
             if (
@@ -146,7 +146,7 @@ def signature_of(
             arg.expr, (SymT.UNBACKED_FLOAT)
         ):
             # Unbacked floats from .item() are runtime Python floats, so they
-            # follow the same eager-vs-Inductor signature policy as literals.
+            # follow the same eager-vs-compiled signature policy as literals.
             if (
                 use_fp64_for_python_float
                 and config._use_fp64_for_unbacked_floats
@@ -281,7 +281,7 @@ def is_unaligned_buffer_name(buf_name: str) -> bool:
         return True
 
     if buf_name in V.graph.graph_inputs:
-        # See Note: [Input Alignment handling in Inductor]
+        # See Note: [Input Alignment handling]
         # For graph inputs that is not recorded in V.graph.unaligned_buffers,
         # we know for sure the tensor is aligned.
         return False
@@ -325,7 +325,7 @@ def equal_1_arg_indices(
 def _is_tensor_within_2gb(arg: TensorArg) -> bool:
     """Check if a tensor argument's storage is provably within 2GB.
 
-    Mirrors HIPBackend.is_within_2gb() but uses compile-time symbolic analysis
+    Analogous to HIPBackend.is_within_2gb() but uses compile-time symbolic analysis
     instead of runtime tensor inspection. This enables canonicalize_pointers to
     decompose pointer arithmetic into (splat(base), offset) form for buffer ops.
     """

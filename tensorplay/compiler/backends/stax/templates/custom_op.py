@@ -308,7 +308,7 @@ def _merge_config_and_runtime_kwargs(config_params: dict[str, Any], runtime_kwar
 
 def _adapt_user_input_gen_fns(inputs: list[Any], op_overload: Any, user_input_gen_fns: dict[str, Callable[[Any], Any]]) -> dict[int, Callable[[Any], Any]]:
     """Convert user input generators from name-based to index-based format.
-    Inductor autotune's input_gen_fns expects index of arg_names as key.
+    The autotuner's input_gen_fns expects index of arg_names as key.
     """
     arg_names = _argument_names(op_overload)
     name_to_index = {name: i for i, name in enumerate(arg_names)}
@@ -415,7 +415,7 @@ def autotune_custom_op(name: str, decompositions: list[Callable[..., Any]], inpu
     TODO: Add support for multiple output custom ops (tuple/list returns).
 
     This function generates multiple implementation choices for a custom operation and
-    uses Inductor's autotuning system to select the best performing variant at runtime.
+    uses the autotuning system to select the best performing variant at runtime.
     After selecting the best choice, applies inline fusion if the winning choice has a graph.
 
     Args:
@@ -575,7 +575,7 @@ def _lower_single_impl(impl: Callable[..., Any], impl_kwargs: dict[str, Any], ru
             if not is_guard_error:
                 raise
             log.info('Implementation %s adds guards, skipping custom op lowering', impl.__name__)
-            counters['inductor']['custom_op_decomp_guard_skips'] += 1
+            counters['tp']['custom_op_decomp_guard_skips'] += 1
             return None
     log.info('Inlining implementation: %s', impl.__name__)
     ops_before = len(V.graph.operations)
@@ -679,7 +679,7 @@ def _range_based_lowering_fn(processed_configs: list[CustomOpConfig], default_im
             if not is_guard_error:
                 raise
             log.info('Dispatch function adds guards, skipping custom op lowering')
-            counters['inductor']['custom_op_decomp_guard_skips'] += 1
+            counters['tp']['custom_op_decomp_guard_skips'] += 1
             return None
         except Exception:
             log.exception('make_fx tracing FAILED')
@@ -743,7 +743,7 @@ def register_custom_op_autotuning(custom_op: CustomOpDef | Any, configs: list[Cu
 
     The default/fallback implementation is automatically derived:
     - For CustomOpDef: Uses the decorated function
-    - For OpOverload: Traces the op call, which falls through to normal inductor lowering
+    - For OpOverload: Traces the op call, which falls through to normal lowering
 
     Examples:
         # Static configs

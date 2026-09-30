@@ -41,9 +41,9 @@ if TYPE_CHECKING:
 
 REDISTRIBUTE_FUNC = "redistribute_input"
 
-# Tracks if we're in inductor benchmarking, and temporarily disables logging
+# Tracks if we're in tp benchmarking, and temporarily disables logging
 # (for ignoring autotuning kernel launches which don't affect the user-facing result)
-_IN_INDUCTOR_BENCHMARK: bool = False
+_IN_TP_BENCHMARK: bool = False
 # For record_outputs, log_tensor_hashes hooks for triton kernels.
 # Stores kernel outputs in call.record["output"]
 _RECORD_TRITON_OUTPUTS: bool = False
@@ -196,7 +196,7 @@ def _get_stack_trace() -> str:
 
 
 def _get_user_stack_trace(stack_trace_str: str) -> str | None:
-    # Extract user code stack trace, filtering out torch internals.
+    # Extract user code stack trace, filtering out backend internals.
     tp_dir = os.path.dirname(inspect.getfile(tp))
     filter_fn = lambda file, name, code: not file.startswith(tp_dir + os.path.sep)  # noqa: E731
     trace = _parse_stack_trace(stack_trace_str, filter_fn=filter_fn)

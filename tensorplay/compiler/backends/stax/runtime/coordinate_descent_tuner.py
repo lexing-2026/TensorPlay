@@ -9,7 +9,7 @@ from tensorplay.graph.experimental.sympy_functions import OrderedSet
 
 from ..utils import get_max_numwarps
 from .hints import (
-    InductorMeta,
+    TpMeta,
     native_matmul_block_numel,
     native_matmul_persistent_rblock,
     TRITON_MAX_BLOCK,
@@ -62,7 +62,7 @@ class CoordescTuner:
         is_mix_order_reduction=False,
         name="unknown",
         size_hints=None,
-        inductor_meta: InductorMeta | None = None,
+        tp_meta: TpMeta | None = None,
         frozen_fields=None,
     ):
         self.is_mm = is_mm  # we will tune num_stages for mm
@@ -77,8 +77,8 @@ class CoordescTuner:
         self.cached_benchmark_results = {}
         self.name = name
         self.size_hints = size_hints
-        self.inductor_meta: InductorMeta = (
-            inductor_meta if inductor_meta is not None else {}
+        self.tp_meta: TpMeta = (
+            tp_meta if tp_meta is not None else {}
         )
         self.frozen_fields: OrderedSet[str] = (
             OrderedSet(frozen_fields) if frozen_fields is not None else OrderedSet()
@@ -90,9 +90,9 @@ class CoordescTuner:
         return min(max_block, size_hint) if size_hint is not None else max_block
 
     def get_warpsmax(self):
-        # Avoid querying device directly if device properties are populated in inductor_meta
-        warp_size = self.inductor_meta.get("warp_size")
-        max_threads_per_block = self.inductor_meta.get("max_threads_per_block")
+        # Avoid querying device directly if device properties are populated in tp_meta
+        warp_size = self.tp_meta.get("warp_size")
+        max_threads_per_block = self.tp_meta.get("max_threads_per_block")
         if warp_size and max_threads_per_block:
             return max_threads_per_block // warp_size
         else:
@@ -132,7 +132,7 @@ class CoordescTuner:
         ]
         if self.is_mm:
             out.append("num_stages")
-        if self.inductor_meta.get("is_hip") is True:
+        if self.tp_meta.get("is_hip") is True:
             out.append("waves_per_eu")
         if self.is_native_matmul:
             out.append("num_stages")
@@ -145,18 +145,18 @@ class CoordescTuner:
             out.append("NUM_STAGES")
 
         # Combo-kernel per-subkernel block fields (e.g. XBLOCK_0/1, YBLOCK_0/1)
-        # come from the worker-side metadata in ``inductor_meta``. Prepend
+        # come from the worker-side metadata in ``tp_meta``. Prepend
         # them so coordesc iterates them alongside the base fields. Read
         # live each call so any post-construction mutation of
-        # ``inductor_meta`` is observed.
-        combo_fields: list[str] = self.inductor_meta.get(
+        # ``tp_meta`` is observed.
+        combo_fields: list[str] = self.tp_meta.get(
             "combo_coordesc_field_order", []
         )
         out = combo_fields + out
         return [f for f in out if f not in self.frozen_fields]
 
     def value_too_large(self, name: str, val: int) -> bool:
-        field_limits = self.inductor_meta.get("combo_coordesc_field_limits")
+        field_limits = self.tp_meta.get("combo_coordesc_field_limits")
         if isinstance(field_limits, dict) and name in field_limits:
             return val > field_limits[name]
 
@@ -174,9 +174,9 @@ class CoordescTuner:
     def value_too_small(self, name: str, val: int) -> bool:
         min_block = None
         if name == "XBLOCK":
-            min_block = self.inductor_meta.get("min_xblock")
+            min_block = self.tp_meta.get("min_xblock")
         elif name == "R0_BLOCK":
-            min_block = self.inductor_meta.get("min_rblock")
+            min_block = self.tp_meta.get("min_rblock")
         if min_block is not None and val < min_block:
             return True
 
@@ -252,7 +252,7 @@ class CoordescTuner:
         if self.is_native_matmul:
             r0_block = None
             if "R0_BLOCK" not in config.kwargs:
-                r0_block = self.inductor_meta.get("native_matmul_persistent_rblock")
+                r0_block = self.tp_meta.get("native_matmul_persistent_rblock")
                 if r0_block is None and self.size_hints is not None:
                     r0_block_hint = self.size_hints.get("r0_")
                     if r0_block_hint is not None:
@@ -277,7 +277,7 @@ class CoordescTuner:
             old_value = get_field(config, field)
             if old_value is None:
                 continue
-            radius = self.inductor_meta.get("coordinate_descent_search_radius", 1)
+            radius = self.tp_meta.get("coordinate_descent_search_radius", 1)
             candidate_values = self.get_neighbour_values(
                 field,
                 old_value,
@@ -419,7 +419,7 @@ class CoordescTuner:
                         improved = True
                         best_config, best_timing = candidate_config, candidate_timing
 
-            if not improved and self.inductor_meta.get(
+            if not improved and self.tp_meta.get(
                 "coordinate_descent_check_all_directions"
             ):
                 old_best_timing = best_timing

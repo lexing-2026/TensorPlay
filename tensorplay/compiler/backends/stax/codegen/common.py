@@ -90,6 +90,12 @@ class DeviceOpOverrides:
     def current_stream(self) -> str:
         raise NotImplementedError
 
+    def cpp_stream_guard(self) -> str:
+        raise NotImplementedError
+
+    def cpp_device_guard(self) -> str:
+        raise NotImplementedError
+
     def stream_handle(self, stream_name: str) -> str:
         return f"{stream_name}.native_handle"
 

@@ -98,7 +98,7 @@ from .loops import (
 
 log = logging.getLogger(__name__)
 
-aten = tp.ops.tp
+tp_ops = tp.ops.tp
 prims = tp.ops.prims
 
 #: A change of element type.  A conversion is what a traced graph holds rather
@@ -156,11 +156,11 @@ def unsupported_input_tensor(t: tp.Tensor, node=None):
             isinstance(node.target, tp.ops.OpOverload)
             and node.target
             in (
-                aten.view.dtype,
-                aten.cat.default,
-                aten.clone.default,
-                aten._scaled_mm.default,
-                aten._scaled_mm_v2.default,
+                tp_ops.view.dtype,
+                tp_ops.cat.default,
+                tp_ops.clone.default,
+                tp_ops._scaled_mm.default,
+                tp_ops._scaled_mm_v2.default,
                 _CONVERT_ELEMENT_TYPE,
             )
             or (isinstance(node.target, tp.ops.OpOverload) and is_view(node.target))
@@ -175,11 +175,11 @@ def unsupported_input_tensor(t: tp.Tensor, node=None):
         if not isinstance(node.target, tp.ops.OpOverload):
             return True
         if node.target in (
-            aten.view.dtype,
-            aten.cat.default,
-            aten.clone.default,
-            aten._scaled_mm.default,
-            aten._scaled_mm_v2.default,
+            tp_ops.view.dtype,
+            tp_ops.cat.default,
+            tp_ops.clone.default,
+            tp_ops._scaled_mm.default,
+            tp_ops._scaled_mm_v2.default,
         ) or is_view(node.target):
             return False
         if node.target == _CONVERT_ELEMENT_TYPE:
@@ -194,7 +194,7 @@ def unsupported_input_tensor(t: tp.Tensor, node=None):
 def unsupported_output_tensor(t: tp.Tensor, node=None):
     "Do not support writing tensor but can read from it"
     supported_complex_views = (
-        aten.view.dtype,
+        tp_ops.view.dtype,
         _CONVERT_ELEMENT_TYPE,
     )
     if node is not None and node.target in supported_complex_views and t.is_complex():
@@ -208,14 +208,14 @@ def unsupported_output_tensor(t: tp.Tensor, node=None):
 
 def fallback_node_due_to_unsupported_type(node, allow_cpu_inputs=True):
     # Custom fallback lowering
-    if node.target is aten.view_as_complex.default:
+    if node.target is tp_ops.view_as_complex.default:
         return False
 
     if node.op == "placeholder":
         return False
 
     # We should be able to remove this special case once `disable_cpp_codegen` is killed.
-    if node.target is aten.lift_fresh_copy.default:
+    if node.target is tp_ops.lift_fresh_copy.default:
         return False
 
     def check_skip_condition(inp_out_node, is_output):
@@ -1162,6 +1162,12 @@ def pointwise(fn, *inputs, val=None):
         device = val.get_device()
     else:
         size, dtype, device = val_info(val)
+    tensor_inputs = [x for x in inputs if hasattr(x, "get_size")]
+    if len(tensor_inputs) > 1:
+        target = functools.reduce(
+            broadcast_symbolic_shapes, (x.get_size() for x in tensor_inputs), ()
+        )
+        size = tuple(int(s) for s in target)
     loaders = [
         as_value_node(x, dtype, device).make_loader() for x in inputs
     ]
@@ -1453,6 +1459,27 @@ def reshape(x: TensorBox, new_size) -> TensorBox:
                 ),
             )
         )
+    if isinstance(node, (Pointwise, Reduction)) and isinstance(x.data, StorageBox):
+        # A loop that has not been materialized has no storage to view, so it
+        # is realized first; the resulting buffer is contiguous and the new
+        # shape can be described as a plain reinterpret view of it.
+        x.data.realize()
+        node = _underlying(x)
+        if isinstance(node, Buffer) and node.layout.is_contiguous():
+            settled = node.layout.as_fixed()
+            return TensorBox(
+                ReinterpretView(
+                    data=node,
+                    layout=FixedLayout(
+                        settled.device,
+                        settled.dtype,
+                        new_size,
+                        contiguous_strides(new_size),
+                        settled.offset,
+                        settled.is_pinned,
+                    ),
+                )
+            )
     return TensorBox(View.create(_underlying(x), new_size))
 
 
@@ -1775,25 +1802,53 @@ def lower_native_group_norm(x, weight, bias, n, c, hxw, groups, eps):
     rows = _group_view(x, n, groups, row)
     rows_loader = rows.make_loader()
 
-    def welford_inner(index, rindex):
+    def sum_inner(index, rindex):
         return ops.to_dtype(rows_loader([index[0], index[1], rindex[0]]), tp.float32)
 
-    stats = Reduction.create(
+    total = Reduction.create(
         device=device,
         dst_dtype=stat_dtype,
         src_dtype=stat_dtype,
-        inner_fn=welford_inner,
+        inner_fn=sum_inner,
         ranges=(n, groups),
         reduction_ranges=(row,),
-        reduction_type='welford',
+        reduction_type='sum',
     )
-    mean_buf, m2_buf = V.graph.register_welford(_underlying(stats))
-    mean_box = TensorBox(mean_buf)
-    m2_loader = TensorBox(m2_buf).make_loader()
+
+    def sq_inner(index, rindex):
+        v = ops.to_dtype(rows_loader([index[0], index[1], rindex[0]]), tp.float32)
+        return ops.mul(v, v)
+
+    sq = Reduction.create(
+        device=device,
+        dst_dtype=stat_dtype,
+        src_dtype=stat_dtype,
+        inner_fn=sq_inner,
+        ranges=(n, groups),
+        reduction_ranges=(row,),
+        reduction_type='sum',
+    )
+
+    total_loader = total.make_loader()
+    sq_loader = sq.make_loader()
+
+    def mean_at(ng):
+        return ops.truediv(total_loader(ng), ops.constant(float(row), tp.float32))
+
+    mean_box = Pointwise.create(
+        device=device,
+        dtype=stat_dtype,
+        inner_fn=lambda idx: mean_at(idx),
+        ranges=(n, groups),
+    )
     mean_loader = mean_box.make_loader()
 
     def rstd_at(ng):
-        var = ops.truediv(m2_loader(ng), ops.constant(float(row), tp.float32))
+        mean = mean_at(ng)
+        var = ops.sub(
+            ops.truediv(sq_loader(ng), ops.constant(float(row), tp.float32)),
+            ops.mul(mean, mean),
+        )
         return ops.rsqrt(ops.add(var, ops.constant(float(eps), tp.float32)))
 
     rstd_box = Pointwise.create(
@@ -3051,7 +3106,7 @@ def _register_attention_fallbacks() -> None:
         "_efficient_attention_forward",
         "_efficient_attention_backward",
     ):
-        packet = getattr(aten, name, None)
+        packet = getattr(tp_ops, name, None)
         if packet is None:
             continue
         # A name bound to a plain function is an adapter rather than a set of
@@ -3279,11 +3334,11 @@ def to_dtype(
 #: by the framework instead.  Both are the same computation; which one runs is
 #: decided per call, because whether an axis can be walked is a fact about its
 #: size that is not known until the program runs.
-fallback_cumsum = fallback_handler(aten.cumsum.default)
-fallback_cumprod = fallback_handler(aten.cumprod.default)
-fallback_logcumsumexp = fallback_handler(aten.logcumsumexp.default)
-fallback_cummax = fallback_handler(aten.cummax.default)
-fallback_cummin = fallback_handler(aten.cummin.default)
+fallback_cumsum = fallback_handler(tp_ops.cumsum.default)
+fallback_cumprod = fallback_handler(tp_ops.cumprod.default)
+fallback_logcumsumexp = fallback_handler(tp_ops.logcumsumexp.default)
+fallback_cummax = fallback_handler(tp_ops.cummax.default)
+fallback_cummin = fallback_handler(tp_ops.cummin.default)
 
 
 def _validate_dim(x: Any, dim: Any, offset: int = 0) -> Any:
@@ -3327,7 +3382,7 @@ def _make_scan_inner(x: Any, *, axis: Any, dtype: Any) -> dict:
     )
 
 
-@register_lowering(aten.cumsum)
+@register_lowering(tp_ops.cumsum)
 def cumsum(x: Any, dim: Any = 0, dtype: Any = None) -> Any:
     """Running totals along one axis.
 
@@ -3359,7 +3414,7 @@ def cumsum(x: Any, dim: Any = 0, dtype: Any = None) -> Any:
     return result
 
 
-@register_lowering(aten.cumprod)
+@register_lowering(tp_ops.cumprod)
 def cumprod(x: Any, dim: Any = 0, dtype: Any = None) -> Any:
     """Running products along one axis.
 
@@ -3390,7 +3445,7 @@ def cumprod(x: Any, dim: Any = 0, dtype: Any = None) -> Any:
     return result
 
 
-@register_lowering(aten.logcumsumexp)
+@register_lowering(tp_ops.logcumsumexp)
 def logcumsumexp(x: Any, dim: Any, dtype: Any = None) -> Any:
     """Running totals of exponents, kept in their logarithm.
 
@@ -3541,10 +3596,10 @@ def view(x: Any, sizes: Any) -> Any:
 #: sorted by the framework instead.  Both are the same computation; which one
 #: runs is decided per call, because whether an axis can be sorted is a fact
 #: about its length that is not known until the program runs.
-sort_fallback = fallback_handler(aten.sort.stable, add_to_fallback_set=False)
+sort_fallback = fallback_handler(tp_ops.sort.stable, add_to_fallback_set=False)
 
 
-@register_lowering(aten.sort.stable, type_promotion_kind=None)
+@register_lowering(tp_ops.sort.stable, type_promotion_kind=None)
 def sort_stable(x: Any, *, stable: Any = None, dim: Any = -1, descending: Any = False) -> Any:
     """The values of an axis in order, and which of them each one was.
 
@@ -3605,12 +3660,12 @@ def sort_stable(x: Any, *, stable: Any = None, dim: Any = -1, descending: Any = 
     return values, to_dtype(indices, tp.int64)
 
 
-@register_lowering(aten.sort.default, type_promotion_kind=None)
+@register_lowering(tp_ops.sort.default, type_promotion_kind=None)
 def sort(x: Any, dim: Any = -1, descending: Any = False) -> Any:
     return sort_stable(x, stable=False, dim=dim, descending=descending)
 
 
-select_fallback = fallback_handler(aten.select.int, add_to_fallback_set=False)
+select_fallback = fallback_handler(tp_ops.select.int, add_to_fallback_set=False)
 
 
 def unsqueeze(x: Any, dim: Any) -> Any:
@@ -3669,14 +3724,14 @@ def select(x: Any, dim: Any, idx: Any) -> Any:
 #: framework -- which is not a second way of doing it but the first way, reached
 #: differently, and the choice is made per call because whether the sort will be
 #: written is not known until the shapes are.
-topk_fallback = fallback_handler(aten.topk.default, add_to_fallback_set=False)
-kthvalue_fallback = fallback_handler(aten.kthvalue.default, add_to_fallback_set=False)
-median_fallback = fallback_handler(aten.median.default, add_to_fallback_set=False)
-median_dim_fallback = fallback_handler(aten.median.dim, add_to_fallback_set=False)
-mode_fallback = fallback_handler(aten.mode.default, add_to_fallback_set=False)
+topk_fallback = fallback_handler(tp_ops.topk.default, add_to_fallback_set=False)
+kthvalue_fallback = fallback_handler(tp_ops.kthvalue.default, add_to_fallback_set=False)
+median_fallback = fallback_handler(tp_ops.median.default, add_to_fallback_set=False)
+median_dim_fallback = fallback_handler(tp_ops.median.dim, add_to_fallback_set=False)
+mode_fallback = fallback_handler(tp_ops.mode.default, add_to_fallback_set=False)
 
 
-@register_lowering(aten.median.default, type_promotion_kind=None)
+@register_lowering(tp_ops.median.default, type_promotion_kind=None)
 def median_default(self: Any) -> Any:
     """The middle value of all of them, with no axis to speak of.
 
@@ -3695,7 +3750,7 @@ def median_default(self: Any) -> Any:
     return select(sorted_vals, 0, k)
 
 
-@register_lowering(aten.median.dim, type_promotion_kind=None)
+@register_lowering(tp_ops.median.dim, type_promotion_kind=None)
 def median_dim(self: Any, dim: Any, keepdim: Any = False) -> Any:
     """The middle value along one axis, and which position it was at.
 
@@ -3726,7 +3781,7 @@ def median_dim(self: Any, dim: Any, keepdim: Any = False) -> Any:
     return values, indices
 
 
-@register_lowering(aten.topk.default, type_promotion_kind=None)
+@register_lowering(tp_ops.topk.default, type_promotion_kind=None)
 def topk(
     self: Any,
     k: Any,
@@ -3766,7 +3821,7 @@ def topk(
     return values, indices
 
 
-@register_lowering(aten.kthvalue.default, type_promotion_kind=None)
+@register_lowering(tp_ops.kthvalue.default, type_promotion_kind=None)
 def kthvalue(self: Any, k: Any, dim: Any = -1, keepdim: Any = False) -> Any:
     """The kth smallest value along one axis, and where it was.
 
@@ -4032,7 +4087,7 @@ def gather(x: Any, dim: Any, index: Any, sparse_grad: Any = False) -> Any:
     )
 
 
-@register_lowering(aten.cummax, type_promotion_kind=None)
+@register_lowering(tp_ops.cummax, type_promotion_kind=None)
 def cummax(x: Any, dim: Any = 0) -> Any:
     """The largest value so far along one axis, and where it was.
 
@@ -4069,7 +4124,7 @@ def cummax(x: Any, dim: Any = 0) -> Any:
     return values, indices
 
 
-@register_lowering(aten.cummin, type_promotion_kind=None)
+@register_lowering(tp_ops.cummin, type_promotion_kind=None)
 def cummin(x: Any, dim: Any = 0) -> Any:
     """The smallest value so far along one axis, and where it was.
 
@@ -4155,7 +4210,7 @@ def _clamp_slice_end_to_start(end: Any, start: Any) -> Any:
     return Max(end, start)
 
 
-@register_lowering(aten.select_scatter, type_promotion_kind=None)
+@register_lowering(tp_ops.select_scatter, type_promotion_kind=None)
 def select_scatter(x: Any, src: Any, dim: Any, index: Any) -> Any:
     """One position of an axis replaced, the rest kept.
 
@@ -4179,7 +4234,7 @@ def select_scatter(x: Any, src: Any, dim: Any, index: Any) -> Any:
     elif V.graph.sizevars.guard_or_false(sympy.Ge(index, 0)):
         pass
     else:
-        return fallback_handler(aten.select_scatter.default)(x, src, dim, index)
+        return fallback_handler(tp_ops.select_scatter.default)(x, src, dim, index)
 
     V.graph.sizevars.check_leq(0, index)
     V.graph.sizevars.check_lt(index, x.get_size()[dim])
@@ -4204,7 +4259,7 @@ def select_scatter(x: Any, src: Any, dim: Any, index: Any) -> Any:
     )
 
 
-@register_lowering(aten.slice_scatter, type_promotion_kind=None)
+@register_lowering(tp_ops.slice_scatter, type_promotion_kind=None)
 def slice_scatter(
     x: Any, src: Any, dim: Any = 0, start: Any = None, end: Any = None, step: Any = 1
 ) -> Any:
@@ -4236,7 +4291,7 @@ def slice_scatter(
             end_index = _compute_slice_index(end, dim_size, dim_size)
 
         if start_index is None or end_index is None:
-            return fallback_handler(aten.slice_scatter.default)(
+            return fallback_handler(tp_ops.slice_scatter.default)(
                 x, src, dim, start, end, step
             )
 
@@ -4353,7 +4408,7 @@ def reduce_argmin(x: Any, dim: Any = None, keepdim: Any = False) -> Any:
     return make_reduction(x, dims, keepdim, tp.int64, device, "argmin")
 
 
-@register_lowering(aten.mode.default, type_promotion_kind=None)
+@register_lowering(tp_ops.mode.default, type_promotion_kind=None)
 def mode_default(self: Any, dim: Any = -1, keepdim: Any = False) -> Any:
     """The value that occurs most often along an axis, and where it was.
 
@@ -4685,11 +4740,11 @@ def to_dtype_bitcast(x: Any, dtype: Any, *, copy: bool = False) -> Any:
     dst_bits = _get_primitive_bitwidth(dtype)
     if src_bits != dst_bits:
         x_cont = ir.ExternKernel.require_contiguous_strides(x)
-        return fallback_handler(aten.view.dtype)(x_cont, dtype)
+        return fallback_handler(tp_ops.view.dtype)(x_cont, dtype)
     return TensorBox.create(ir.DtypeView.create(x, dtype))
 
 
-@register_lowering(aten.view.dtype, type_promotion_kind=None)
+@register_lowering(tp_ops.view.dtype, type_promotion_kind=None)
 def _view_dtype(x: Any, dtype: Any) -> Any:
     """The same values read as another element type.
 
@@ -4702,7 +4757,7 @@ def _view_dtype(x: Any, dtype: Any) -> Any:
 
     if _is_complex(dtype) or _is_complex(x.get_dtype()):
         return TensorBox.create(
-            ir.ComplexView.create(aten.view.dtype.default, x, dtype)
+            ir.ComplexView.create(tp_ops.view.dtype.default, x, dtype)
         )
     return to_dtype_bitcast(x, dtype)
 
@@ -4727,7 +4782,7 @@ def _convert_element_type(x: Any, dtype: Any) -> Any:
     return to_dtype(x, dtype)
 
 
-@register_lowering(aten.round.default)
+@register_lowering(tp_ops.round.default)
 def round(x: Any) -> Any:
     """The nearest whole number, halves away from zero.
 
@@ -4746,10 +4801,10 @@ def round(x: Any) -> Any:
 #: A greatest common divisor is the framework's rather than this one's: which
 #: of two answers is meant differs by sign convention, and a whole loop over
 #: the Euclidean steps is a lot of work for a question asked rarely.
-make_fallback(aten.gcd.default, warn=False)
+make_fallback(tp_ops.gcd.default, warn=False)
 
 
-@register_lowering(aten.pow.Tensor_Tensor)
+@register_lowering(tp_ops.pow.Tensor_Tensor)
 def pow_tensor_tensor(a: Any, b: Any) -> Any:
     """One whole number raised to another, exponent and all.
 
@@ -4768,7 +4823,7 @@ def _is_complex(dtype: Any) -> bool:
     return dtype in (tp.complex64, tp.complex128, tp.complex32)
 
 
-@register_lowering(aten.sym_size.int)
+@register_lowering(tp_ops.sym_size.int)
 def sym_size(a: Any, dim: Any) -> Any:
     """How long an axis is, as a number rather than as a value.
 
@@ -4780,7 +4835,7 @@ def sym_size(a: Any, dim: Any) -> Any:
     return a.get_size()[dim]
 
 
-@register_lowering(aten.sym_stride.int)
+@register_lowering(tp_ops.sym_stride.int)
 def sym_stride(a: Any, dim: Any) -> Any:
     """How far apart an axis's elements are, as a number rather than as a value.
 
@@ -4791,7 +4846,7 @@ def sym_stride(a: Any, dim: Any) -> Any:
     return a.get_stride()[dim]
 
 
-@register_lowering(aten.lift_fresh_copy.default)
+@register_lowering(tp_ops.lift_fresh_copy.default)
 def lift_fresh_copy(x: Any) -> Any:
     """The same values, as something nothing else shares.
 
@@ -4805,7 +4860,7 @@ def lift_fresh_copy(x: Any) -> Any:
     return clone(x)
 
 
-@register_lowering(aten._to_dense.default)
+@register_lowering(tp_ops._to_dense.default)
 def _to_dense(x: Any) -> Any:
     """A sparse value as a dense one, with room for every position.
 
@@ -4816,7 +4871,7 @@ def _to_dense(x: Any) -> Any:
     return clone(x)
 
 
-@register_lowering(aten.view_as_complex.default)
+@register_lowering(tp_ops.view_as_complex.default)
 def view_as_complex(x: Any) -> Any:
     """Two real numbers read as one complex one.
 
@@ -4825,10 +4880,10 @@ def view_as_complex(x: Any) -> Any:
     value is.
     """
 
-    return TensorBox.create(ir.ComplexView.create(aten.view_as_complex.default, x, None))
+    return TensorBox.create(ir.ComplexView.create(tp_ops.view_as_complex.default, x, None))
 
 
-@register_lowering(aten._assert_async.msg)
+@register_lowering(tp_ops._assert_async.msg)
 def _assert_async(msg: Any) -> None:
     """A check that does not stop the program, deferred to the device.
 
@@ -4840,7 +4895,7 @@ def _assert_async(msg: Any) -> None:
     return None
 
 
-@register_lowering(aten._functional_assert_async.msg)
+@register_lowering(tp_ops._functional_assert_async.msg)
 def _functional_assert_async(t: Any, msg: Any) -> None:
     """A check on a value, deferred to the device.
 
@@ -4880,7 +4935,7 @@ for _name, _warn in (
     ("adaptive_avg_pool2d_backward", False),
     ("adaptive_avg_pool3d_backward", False),
 ):
-    _op = getattr(aten, _name, None)
+    _op = getattr(tp_ops, _name, None)
     if _op is not None:
         make_fallback(_op, warn=_warn)
 
@@ -4925,14 +4980,14 @@ for _name, _warn in (
     ("_adaptive_avg_pool3d", False),
     ("adaptive_max_pool3d", False),
 ):
-    _op = getattr(aten, _name, None)
+    _op = getattr(tp_ops, _name, None)
     if _op is not None:
         make_fallback(_op, warn=_warn)
 
 #: A histogram whose edges are given rather than counted is a different
 #: operation from one that counts them: where the edges are is a fact about the
 #: call, and which bin a value falls in follows from them.
-_histogram = getattr(aten, "histogram", None)
+_histogram = getattr(tp_ops, "histogram", None)
 if _histogram is not None:
     for _ov in _histogram.overloads():
         make_fallback(getattr(_histogram, _ov), warn=False)
@@ -4952,7 +5007,7 @@ for _name, _warn in (
     ("nonzero", True),
     ("nonzero_static", True),
 ):
-    _op = getattr(aten, _name, None)
+    _op = getattr(tp_ops, _name, None)
     if _op is None:
         continue
     _overloads = (
@@ -4971,7 +5026,7 @@ for _name in (
     "_unsafe_masked_index",
     "_unsafe_masked_index_put_accumulate",
 ):
-    _op = getattr(aten, _name, None)
+    _op = getattr(tp_ops, _name, None)
     if _op is not None:
         make_fallback(_op, warn=False)
 
@@ -4980,7 +5035,7 @@ for _name in (
 #: work is meant -- and the two halves have to agree on which, which is why they
 #: are asked of the framework together rather than written here separately.
 for _name in ("segment_reduce", "_segment_reduce_backward"):
-    _op = getattr(aten, _name, None)
+    _op = getattr(tp_ops, _name, None)
     if _op is not None:
         make_fallback(_op, warn=False)
 
@@ -4989,7 +5044,7 @@ for _name in ("segment_reduce", "_segment_reduce_backward"):
 #: of several values landing on the same position wins -- which is a meaning
 #: rather than a walk.
 for _name in ("searchsorted", "scatter_reduce_"):
-    _op = getattr(aten, _name, None)
+    _op = getattr(tp_ops, _name, None)
     if _op is None:
         continue
     _overloads = (
@@ -5014,7 +5069,7 @@ def ceildiv(number: Any, denom: Any) -> Any:
     return -(-number // denom)
 
 
-@register_lowering(aten.arange.start_step, type_promotion_kind=None)
+@register_lowering(tp_ops.arange.start_step, type_promotion_kind=None)
 def arange_start_step(
     start: Any,
     end: Any,
@@ -5049,7 +5104,7 @@ def arange_start_step(
     )
 
 
-@register_lowering(aten.arange.end, type_promotion_kind=None)
+@register_lowering(tp_ops.arange.end, type_promotion_kind=None)
 def arange_end(
     end: Any,
     *,
@@ -5079,7 +5134,7 @@ def arange_end(
     )
 
 
-@register_lowering(aten.arange.start, type_promotion_kind=None)
+@register_lowering(tp_ops.arange.start, type_promotion_kind=None)
 def arange_start(
     start: Any,
     end: Any,
@@ -5104,7 +5159,7 @@ def arange_start(
     )
 
 
-@register_lowering(aten.arange.default, type_promotion_kind=None)
+@register_lowering(tp_ops.arange.default, type_promotion_kind=None)
 def arange_default(
     end: Any,
     *,
@@ -5137,7 +5192,7 @@ def arange_default(
 #: the shape rather than a walk, but the shape it is arithmetic on is the one
 #: the framework is better placed to work out -- and the answer is a value with
 #: room around it, which the framework already knows how to produce.
-_constant_pad = getattr(aten, "constant_pad_nd", None)
+_constant_pad = getattr(tp_ops, "constant_pad_nd", None)
 if _constant_pad is not None:
     make_fallback(_constant_pad, warn=False)
 
@@ -5156,7 +5211,7 @@ for _name in (
     "multinomial",
     "_weight_norm_interface_backward",
 ):
-    _op = getattr(aten, _name, None)
+    _op = getattr(tp_ops, _name, None)
     if _op is None:
         continue
     _overloads = (
@@ -5186,7 +5241,7 @@ for _name in (
     "embedding",
     "avg_pool1d",
 ):
-    _op = getattr(aten, _name, None)
+    _op = getattr(tp_ops, _name, None)
     if _op is None:
         continue
     _overloads = (
@@ -5448,7 +5503,7 @@ def index_impl(x: Any, indices: Any, check: Any) -> Any:
     )
 
 
-@register_lowering(aten.index.Tensor, type_promotion_kind=None)
+@register_lowering(tp_ops.index.Tensor, type_promotion_kind=None)
 def index_tensor(x: Any, indices: Any) -> Any:
     """One element per position asked for, each read at an index of its own.
 

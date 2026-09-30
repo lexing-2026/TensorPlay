@@ -83,17 +83,17 @@ def assert_size_stride_grouped(
     """
 
     for item, size, stride in zip(items, sizes, strides):
-        if tuple(item.shape) != tuple(size):
+        if item.shape != size:
             where = f" in {op_name}" if op_name else ""
             raise AssertionError(
-                f"Tensor shape mismatch{where}: expected {tuple(size)}, "
-                f"got {tuple(item.shape)}"
+                f"Tensor shape mismatch{where}: expected {size!r}, "
+                f"got {item.shape!r}"
             )
-        if tuple(item.stride()) != tuple(stride):
+        if item.stride() != stride:
             where = f" in {op_name}" if op_name else ""
             raise AssertionError(
-                f"Tensor stride mismatch{where}: expected {tuple(stride)}, "
-                f"got {tuple(item.stride())}"
+                f"Tensor stride mismatch{where}: expected {stride!r}, "
+                f"got {item.stride()!r}"
             )
 
 

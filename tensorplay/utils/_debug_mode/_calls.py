@@ -251,7 +251,7 @@ class _OutputPlacementCall(_DebugCall):
 
 
 class _TritonKernelCall(_DebugCall):
-    """Triton kernel call from Inductor"""
+    """Triton kernel call from the compiler"""
 
     def __init__(
         self,

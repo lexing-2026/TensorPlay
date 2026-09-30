@@ -7,7 +7,7 @@ from typing import Any
 
 from .._api import DTensor
 
-__all__ = ["fwd_bwd_compiler", "get_inductor_decomp_graphs", "print_op_coverage_summary"]
+__all__ = ["fwd_bwd_compiler", "get_tp_decomp_graphs", "print_op_coverage_summary"]
 
 
 graphs: list[Any] = []
@@ -31,7 +31,7 @@ def _capture_graph(model: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) ->
     return symbolic_trace(model)
 
 
-def get_inductor_decomp_graphs(
+def get_tp_decomp_graphs(
     model: Any, args: tuple[Any, ...], kwargs: dict[str, Any] | None = None
 ) -> list[Any]:
     graphs.clear()
@@ -76,7 +76,7 @@ def print_op_coverage_summary(
     output_csv: bool = False,
 ) -> list[tuple[str, str, int, bool]]:
     op_counts: Counter[Any] = Counter()
-    for graph_module in get_inductor_decomp_graphs(model, args, kwargs):
+    for graph_module in get_tp_decomp_graphs(model, args, kwargs):
         for node in _graph_nodes(graph_module):
             if getattr(node, "op", None) != "call_function":
                 continue

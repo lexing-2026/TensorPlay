@@ -1,4 +1,4 @@
-"""Constants for CUDA stream naming in Inductor codegen."""
+"""Constants for CUDA stream naming in tp codegen."""
 
 DEFAULT_STREAM: str = "default_stream"
 DEFAULT_STREAM_IDX: int = 0

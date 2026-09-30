@@ -89,7 +89,7 @@ def map(
         out = []
         for idx in range(xs.size(0)):
             out.append(f(xs.select(0, idx), *args))
-        return torch.stack(out)
+        return tp.stack(out)
 
     Args:
         f (Callable): Takes one slice of each mapped input plus the additional

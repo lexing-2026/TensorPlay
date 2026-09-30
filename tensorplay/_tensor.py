@@ -799,7 +799,7 @@ def __delitem__(self, key):
 
 def __array_wrap__(self, array):
     if array.dtype == _builtins.bool:
-        # Workaround, torch has no built-in bool tensor
+        # Workaround, the backend has no built-in bool tensor
         array = array.astype("uint8")
     return _C.from_numpy(array)
 

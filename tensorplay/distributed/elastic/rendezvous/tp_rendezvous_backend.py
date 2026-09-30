@@ -24,14 +24,14 @@ from .api import (
 from .core_rendezvous_backend import RendezvousBackend, Token
 from .utils import _matches_machine_hostname, parse_rendezvous_endpoint
 
-__all__ = ["C10dRendezvousBackend", "create_backend"]
+__all__ = ["TpRendezvousBackend", "create_backend"]
 
 
 logger = logging.getLogger(__name__)
 DEFAULT_PORT = 29400
 
 
-class C10dRendezvousBackend(RendezvousBackend):
+class TpRendezvousBackend(RendezvousBackend):
     """Store rendezvous state behind compare-and-set operations."""
 
     _NULL_SENTINEL = "Y2FuaW1hZGFt"
@@ -155,7 +155,7 @@ def _create_file_store(params: RendezvousParameters) -> FileStore:
 
 def create_backend(
     params: RendezvousParameters,
-) -> tuple[C10dRendezvousBackend, Store]:
+) -> tuple[TpRendezvousBackend, Store]:
     store_type = str(params.get("store_type", "tcp")).strip().lower()
     try:
         if store_type == "file":
@@ -166,7 +166,7 @@ def create_backend(
             raise ValueError(
                 "Invalid store type. Supported values are 'file' and 'tcp'."
             )
-        backend = C10dRendezvousBackend(store, params.run_id)
+        backend = TpRendezvousBackend(store, params.run_id)
     except Exception as exc:
         construct_and_record_rdzv_event(
             message=f"{type(exc).__name__}: {exc}",

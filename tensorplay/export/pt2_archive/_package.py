@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .constants import (
-    AOTINDUCTOR_DIR,
+    TP_EXPORT_DIR,
     ARCHIVE_FORMAT_PATH,
     ARCHIVE_FORMAT_VALUE,
     ARCHIVE_VERSION_PATH,
@@ -31,7 +31,7 @@ from .constants import (
 from ._package_weights import WeightType
 
 __all__ = [
-    "AOTICompiledModel",
+    "TPCompiledModel",
     "PT2ArchiveContents",
     "PT2ArchiveReader",
     "PT2ArchiveWriter",
@@ -147,11 +147,11 @@ class PT2ArchiveReader:
 @dataclass
 class PT2ArchiveContents:
     exported_programs: dict[str, Any] = field(default_factory=dict)
-    aoti_runners: dict[str, Any] = field(default_factory=dict)
+    tp_runners: dict[str, Any] = field(default_factory=dict)
     extra_files: dict[str, Any] = field(default_factory=dict)
 
 
-class AOTICompiledModel:
+class TPCompiledModel:
     def __init__(self, model_name: str, files: dict[str, bytes] | None = None) -> None:
         self.model_name = model_name
         self.files = dict(files or {})
@@ -310,7 +310,7 @@ def package_pt2(
     f: Any,
     *,
     exported_programs: Any = None,
-    aoti_files: Any = None,
+    tp_files: Any = None,
     extra_files: dict[str, Any] | None = None,
     opset_version: dict[str, int] | None = None,
     pickle_protocol: int = DEFAULT_PICKLE_PROTOCOL,
@@ -319,7 +319,7 @@ def package_pt2(
     from ..exported_program import ExportedProgram
     from ..serde import serialize
 
-    if exported_programs is None and aoti_files is None and extra_files is None and executorch_files is None:
+    if exported_programs is None and tp_files is None and extra_files is None and executorch_files is None:
         raise ValueError("at least one archive artifact is required")
     programs = _programs_mapping(exported_programs)
     for name, program in programs.items():
@@ -361,12 +361,12 @@ def package_pt2(
                 SAMPLE_INPUTS_FILENAME_FORMAT.format(name),
                 artifact.example_inputs,
             )
-        if aoti_files is not None:
-            files = aoti_files if isinstance(aoti_files, dict) else {"model": aoti_files}
+        if tp_files is not None:
+            files = tp_files if isinstance(tp_files, dict) else {"model": tp_files}
             for model_name, model_files in files.items():
                 for path in model_files:
                     path_obj = Path(path)
-                    writer.write_file(f"{AOTINDUCTOR_DIR}{model_name}/{path_obj.name}", path_obj)
+                    writer.write_file(f"{TP_EXPORT_DIR}{model_name}/{path_obj.name}", path_obj)
         for name, content in (extra_files or {}).items():
             data = content if isinstance(content, bytes) else str(content).encode("utf-8")
             writer.write_bytes(f"{EXTRA_DIR}{name}", data)
@@ -390,7 +390,7 @@ def load_pt2(
 
     del expected_opset_version, run_single_threaded, num_runners, device_index
     programs: dict[str, Any] = {}
-    aoti_runners: dict[str, Any] = {}
+    tp_runners: dict[str, Any] = {}
     extra: dict[str, Any] = {}
     with PT2ArchiveReader(f) as reader:
         if reader.read_string(ARCHIVE_FORMAT_PATH) != ARCHIVE_FORMAT_VALUE:
@@ -424,11 +424,11 @@ def load_pt2(
                 example_inputs=example_inputs,
             )
         for name in file_names:
-            if name.startswith(AOTINDUCTOR_DIR):
-                aoti_runners.setdefault(name[len(AOTINDUCTOR_DIR):].split("/")[0], AOTICompiledModel(name))
+            if name.startswith(TP_EXPORT_DIR):
+                tp_runners.setdefault(name[len(TP_EXPORT_DIR):].split("/")[0], TPCompiledModel(name))
             elif name.startswith(EXTRA_DIR):
                 extra[name[len(EXTRA_DIR):]] = reader.read_string(name)
-    return PT2ArchiveContents(programs, aoti_runners, extra)
+    return PT2ArchiveContents(programs, tp_runners, extra)
 
 
 def save_multimodal_pt2(
@@ -458,7 +458,7 @@ def load_multimodal_pt2(f: Any) -> dict[str, Any]:
     """Load every exported program stored by :func:`save_multimodal_pt2`.
 
     Returns the name-keyed program mapping; extra files are dropped.  Use
-    :func:`load_pt2` when AOTI runners or extra files matter.
+    :func:`load_pt2` when tp runners or extra files matter.
     """
 
     contents = load_pt2(f)
@@ -469,7 +469,7 @@ def load_multimodal_pt2(f: Any) -> dict[str, Any]:
 
 def load_weights_to_pt2_contents(pt2_contents: PT2ArchiveContents, weights_map: dict[str, Any]) -> None:
     for model_name, weights in weights_map.items():
-        runner = pt2_contents.aoti_runners.get(model_name)
+        runner = pt2_contents.tp_runners.get(model_name)
         if runner is None or not hasattr(runner, "load_constants"):
             raise KeyError(f"model {model_name!r} has no loadable runner")
         runner.load_constants(weights, check_full_update=True, user_managed=True)

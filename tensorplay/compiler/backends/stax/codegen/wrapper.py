@@ -68,7 +68,7 @@ from ..coor import (
     _coor_current_accelerator,
     _coor_enabled,
 )
-from .. import debug as inductor_debug
+from .. import debug as tp_debug
 from ..compile_log import (
     timed_block,
     get_debug_dir,
@@ -677,23 +677,23 @@ class EnterDeviceContextManagerLine(WrapperLine):
     def codegen(self, code: IndentedBuffer) -> None:
         if V.graph.cpp_wrapper:
             code.writeline("\n")
-            # AOTI stream is bound to a device, so CUDAStreamGuard sets both
+            # The stream is bound to a device, so CUDAStreamGuard sets both
             # stream and device, and the device cannot change later.
             if self.last_seen_device_guard_index is None:
                 code.writeline_aot(
-                    f"{V.graph.device_ops.cpp_aoti_stream_guard()} stream_guard(stream, this->device_idx_);"
+                    f"{V.graph.device_ops.cpp_stream_guard()} stream_guard(stream, this->device_idx_);"
                 )
                 code.writeline_jit(
-                    f"{V.graph.device_ops.cpp_aoti_device_guard()} device_guard({self.device_idx});"
+                    f"{V.graph.device_ops.cpp_device_guard()} device_guard({self.device_idx});"
                 )
             else:
                 if V.graph.aot_mode:
-                    # AOTI emits a single stream_guard on first use; later
+                    # The ahead-of-time wrapper emits a single stream_guard on first use; later
                     # contexts can only re-enter the same device. In dual-wrapper
                     # mode the JIT side still needs device_guard updates.
                     if self.last_seen_device_guard_index != self.device_idx:
                         raise AssertionError(
-                            "AOTInductor only supports running on one CUDA device"
+                            "The ahead-of-time export only supports running on one CUDA device"
                         )
                 if not V.graph.aot_mode or V.graph.is_dual_wrapper_mode:
                     code.writeline_jit(f"device_guard.set_index({self.device_idx});")
@@ -752,11 +752,11 @@ class ExternKernelOutLine(WrapperLine):
         kernel_name = node.get_kernel_name()
         if (
             V.graph.cpp_wrapper
-            and node.cpp_kernel_name == "tensorplay::inductor::_mm_plus_mm"
+            and node.cpp_kernel_name == "tensorplay::tp::_mm_plus_mm"
         ):
             # The combined form is not always available as a compiled entry
             # point, so where it is missing the call is named directly.
-            kernel_name = "aoti_torch__mm_plus_mm_out"
+            kernel_name = "tp__mm_plus_mm_out"
         else:
             kernel_name = node.get_kernel_name()
         device = d.type if (d := node.get_device()) else V.graph.device_type
@@ -823,7 +823,7 @@ class KernelCallLine(WrapperLine):
     arg_types: list[str]
     triton: bool
     triton_meta: TritonMeta
-    inductor_meta: dict[str, Any] | None
+    tp_meta: dict[str, Any] | None
     device: tp.device
     graph_name: str
     original_fxnode_name: str
@@ -838,7 +838,7 @@ class KernelCallLine(WrapperLine):
             raw_keys=self.raw_keys,
             raw_args=self.raw_args,
             triton_meta=self.triton_meta,
-            inductor_meta=self.inductor_meta,
+            tp_meta=self.tp_meta,
             device=self.device,
             graph_name=self.graph_name,
             original_fxnode_name=self.original_fxnode_name,
@@ -1450,7 +1450,7 @@ class GroupedAssertSizeStrideLine(WrapperLine):
 
 @dataclasses.dataclass
 class AssertDivByZeroLine(WrapperLine):
-    """Deferred AOTI runtime check that a sizevar divisor is non-zero.
+    """Deferred runtime check that a sizevar divisor is non-zero.
 
     Queued from CppWrapperCpu.codegen_cpp_sizevar during the build phase
     and replayed at the position of use so the check lands after the
@@ -1582,8 +1582,8 @@ class PythonWrapperCodegen(CodeGen):
 
         # intermediate tensor value printing utility
         self.debug_printer = DebugPrinterManager(
-            debug_printer_level=config.aot_inductor.debug_intermediate_value_printer,
-            use_array_ref=config.aot_inductor.allow_stack_allocation,
+            debug_printer_level=config.tp_export.debug_intermediate_value_printer,
+            use_array_ref=config.tp_export.allow_stack_allocation,
         )
 
         # Additional files that are dependent to the wrapper (ex. cubin files)
@@ -1628,7 +1628,7 @@ class PythonWrapperCodegen(CodeGen):
         call rather than at build time.
         """
         debug_utils_import = ""
-        if int(config.aot_inductor.debug_intermediate_value_printer) > 0:
+        if int(config.tp_export.debug_intermediate_value_printer) > 0:
             debug_utils_import = (
                 "from tensorplay.compiler.backends.stax.codegen.debug_utils "
                 "import _print_debugging_tensor_value_info"
@@ -1669,6 +1669,7 @@ class PythonWrapperCodegen(CodeGen):
                 empty_strided_cuda = lambda *args, **kwargs: tp.empty_strided(*args, device="cuda", **kwargs)
                 empty_strided_xpu = lambda *args, **kwargs: tp.empty_strided(*args, device="xpu", **kwargs)
                 empty_strided_mtia = lambda *args, **kwargs: tp.empty_strided(*args, device="mtia", **kwargs)
+                reinterpret_tensor = lambda t, size, stride, offset: tp.as_strided(t, size, stride, offset)
             """,
             strip=True,
         )
@@ -1691,8 +1692,8 @@ class PythonWrapperCodegen(CodeGen):
                 get_debug_dir(), "proton"
             )
             self.header.writeline(f'os.makedirs("{output_dir}", exist_ok=True)')
-            proton_name = f'os.path.join("{output_dir}", "inductor")'
-            trace_path = f'os.path.join("{output_dir}", "inductor.chrome_trace")'
+            proton_name = f'os.path.join("{output_dir}", "tp")'
+            trace_path = f'os.path.join("{output_dir}", "tp.chrome_trace")'
             group_by_sm = config.triton.proton_group_by_sm
             split_invocations = config.triton.proton_split_invocations
             per_cta_occupancy = config.triton.proton_per_cta_occupancy
@@ -1987,7 +1988,7 @@ class PythonWrapperCodegen(CodeGen):
         """Emit one assert_size_stride line to `code` (replay-phase target).
 
         Subclasses override to change the emitted form (e.g., C++ assert with
-        an AOTI runtime env guard).
+        an ahead-of-time runtime env guard).
         """
         if dtype is None:
             code.writeline(f"assert_size_stride({name}, {size}, {stride}, {op_name!r})")
@@ -2000,7 +2001,7 @@ class PythonWrapperCodegen(CodeGen):
             )
 
     def write_assert_div_by_zero(self, divisor_str: str, op_name: str) -> None:
-        """Queue a div-by-zero AOTI check for emission during replay.
+        """Queue a div-by-zero check for emission during replay.
 
         codegen_cpp_sizevar is called in both build and replay phases;
         set_writeline routes the WrapperLine appropriately in either case.
@@ -2010,13 +2011,13 @@ class PythonWrapperCodegen(CodeGen):
     def _codegen_assert_div_by_zero(
         self, code: IndentedBuffer, divisor_str: str, op_name: str
     ) -> None:
-        """Emit one div-by-zero AOTI check to `code` (replay-phase target).
+        """Emit one div-by-zero ahead-of-time check to `code` (replay-phase target).
 
         Only emitted by C++ wrappers; the Python wrapper relies on Python's
         native ZeroDivisionError instead of pre-checking divisors.
         """
         raise NotImplementedError(
-            "AOTI div-by-zero check is only emitted by C++ wrappers"
+            "The ahead-of-time div-by-zero check is only emitted by C++ wrappers"
         )
 
     def write_assert_size_stride_grouped(
@@ -2355,7 +2356,7 @@ class PythonWrapperCodegen(CodeGen):
         kernel_name = extern_kernel.get_kernel_name()
         ending = self.ending
         if config.memory_planning and "view_as_complex" in kernel_name:
-            # view operation fallbacks cause issues since inductor
+            # view operation fallbacks cause issues since the compiler
             # doesn't know the memory is still needed and might reuse it.
             ending = f".clone(){ending}"
 
@@ -2377,7 +2378,7 @@ class PythonWrapperCodegen(CodeGen):
                 and config.generate_intermediate_hooks
                 and origin_node is not None
             ):
-                counters["inductor"]["intermediate_hooks"] += 1
+                counters["tp"]["intermediate_hooks"] += 1
                 self.writeline(
                     f"run_intermediate_hooks({origin_node.name!r}, {output_name})"
                 )
@@ -2398,7 +2399,7 @@ class PythonWrapperCodegen(CodeGen):
         device: str,
         stack_traces: OrderedSet[str] | None = None,
     ) -> None:
-        # add debug printer code for triton kernel calls at (jit) inductor level
+        # add debug printer code for triton kernel calls
         debug_printer_manager = V.graph.wrapper_code.debug_printer
         debug_printer_manager.set_printer_args(args, kernel, None, None, "extern")
         args.append(f"out={out_view or out}")
@@ -2491,7 +2492,7 @@ class PythonWrapperCodegen(CodeGen):
             "_",
             f"extern_kernels_{kernel_name}_{suffix}",
         )
-        inductor_debug.alias_kernel_provenance(kernel_name, wrapper_kernel_name)
+        tp_debug.alias_kernel_provenance(kernel_name, wrapper_kernel_name)
         self.header.splice(f"def {wrapper_kernel_name}(*args, **kwargs):")
         with self.header.indent():
             self.header.splice(
@@ -2703,7 +2704,7 @@ class PythonWrapperCodegen(CodeGen):
         trace_structured(
             "artifact",
             metadata_fn=lambda: {
-                "name": "inductor_autotune_at_compile_time_code",
+                "name": "tp_autotune_at_compile_time_code",
                 "encoding": "string",
             },
             payload_fn=lambda: tuning_code,
@@ -3066,6 +3067,10 @@ class PythonWrapperCodegen(CodeGen):
         raise RuntimeError("codegen_cpp_sizevar is only implemented for cpp_wrapper!")
 
     def codegen_python_sizevar(self, x: Expr, *, simplify: bool = True) -> str:
+        from .index_expr import Const as IndexConst
+
+        if isinstance(x, IndexConst):
+            x = sympy.Integer(x.value)
         return pexpr(x, simplify=simplify)
 
     def codegen_sizevar(self, x: Expr) -> str:
@@ -3345,7 +3350,7 @@ class PythonWrapperCodegen(CodeGen):
                 if isinstance(value, sympy.Symbol) and isinstance(
                     V.graph.sizevars.backed_var_to_val.get(value, None), SingletonInt
                 ):
-                    # Inductor should only work with dense -> dense graph, and
+                    # The compiler should only work with dense -> dense graph, and
                     # SingletonInts belong to metadata that should only live on
                     # the subclass.
                     continue
@@ -3496,10 +3501,10 @@ class PythonWrapperCodegen(CodeGen):
 
     @classmethod
     def _get_triton_info_kernel_cls(cls):
-        # Other inductor triton backends may subclass from
+        # Other triton backends may subclass from
         # the `TritonKernel` class. An override of this method
         # allows them to set which subclass to use to get information
-        # such as common triton imports or inductor metadata
+        # such as common triton imports or tp metadata
         from .triton import TritonKernel
 
         return TritonKernel
@@ -3521,7 +3526,7 @@ class PythonWrapperCodegen(CodeGen):
         name (with a leading dunder stripped to avoid Python class-based name
         mangling at the call site), and records the kernel in
         ``user_defined_kernel_cache``. Returns ``(name, triton_meta,
-        inductor_meta, extra_launcher_call_args)``; subsequent calls with the
+        tp_meta, extra_launcher_call_args)``; subsequent calls with the
         same ``cache_key`` reuse the previously assigned name.
         """
         from ..runtime.benchmarking import get_interface_for_device
@@ -3710,7 +3715,7 @@ class PythonWrapperCodegen(CodeGen):
 
         if len(grids) == 1:
             # compute the grid in the wrapper and pass it in as an arg
-            inductor_meta: dict[str, Any] = FixedGrid.setup_grid_as_args()
+            tp_meta: dict[str, Any] = FixedGrid.setup_grid_as_args()
             extra_launcher_call_args = [*map(sympy.sympify, grids[0])]
         else:
 
@@ -3750,7 +3755,7 @@ class PythonWrapperCodegen(CodeGen):
                         "python_slow": [*map(pexpr, grid)],
                     }
                 )
-            inductor_meta = {
+            tp_meta = {
                 "grid_type": PrecomputedGrid.__name__,
                 "precomputed_grids": precomputed_grids,
                 "extra_launcher_args": [*map(str, extra_launcher_args.values())],
@@ -3758,7 +3763,7 @@ class PythonWrapperCodegen(CodeGen):
             extra_launcher_call_args = [*extra_launcher_args.keys()]
 
         if constexprs:
-            inductor_meta["declared_constexpr_names"] = [
+            tp_meta["declared_constexpr_names"] = [
                 arg_names[i] for i in constexprs
             ]
 
@@ -3770,20 +3775,20 @@ class PythonWrapperCodegen(CodeGen):
                 if not isinstance(arg, (ir.Buffer, ir.ReinterpretView)):
                     cache_key.append(arg)
         cache_key.append(str(triton_meta))
-        cache_key.extend(str(inductor_meta))
+        cache_key.extend(str(tp_meta))
 
         if epilogue_fusion is not None:
             cache_key.append((epilogue_fusion[0].get_name(), epilogue_fusion[1]))
 
         cache_key = tuple(cache_key)
         if cache_key in self.user_defined_kernel_cache:
-            name, triton_meta, cached_inductor_meta = self.user_defined_kernel_cache[
+            name, triton_meta, cached_tp_meta = self.user_defined_kernel_cache[
                 cache_key
             ]
             return (
                 name,
                 triton_meta,
-                cached_inductor_meta,
+                cached_tp_meta,
                 extra_launcher_call_args,
             )
 
@@ -3800,9 +3805,9 @@ class PythonWrapperCodegen(CodeGen):
         else:
             compile_wrapper.writeline(f"async_compile.triton({original_name!r}, '''")
 
-        inductor_meta["kernel_name"] = name
+        tp_meta["kernel_name"] = name
         triton_info_kernel_cls = self._get_triton_info_kernel_cls()
-        inductor_meta.update(triton_info_kernel_cls.inductor_meta_common())
+        tp_meta.update(triton_info_kernel_cls.tp_meta_common())
 
         compile_wrapper.splice(triton_info_kernel_cls.gen_common_triton_imports())
         if config.triton.proton_profiling:
@@ -3814,7 +3819,7 @@ class PythonWrapperCodegen(CodeGen):
             f"""
             @triton_heuristics.user_autotune(
                 configs={[*map(config_to_dict, configs)]!r},
-                inductor_meta={inductor_meta!r},
+                tp_meta={tp_meta!r},
                 triton_meta={sanitized_triton_meta!r},
                 filename=__file__,
                 custom_kernel=True,
@@ -3842,8 +3847,8 @@ class PythonWrapperCodegen(CodeGen):
             metadata,
         )
         # Add to the cache for the next use
-        self.user_defined_kernel_cache[cache_key] = (name, triton_meta, inductor_meta)
-        return name, triton_meta, inductor_meta, extra_launcher_call_args
+        self.user_defined_kernel_cache[cache_key] = (name, triton_meta, tp_meta)
+        return name, triton_meta, tp_meta, extra_launcher_call_args
 
     def generate_numel_expr(self, kernel_name: str, tree, suffix: str | None = None):
         sym_name = f"{kernel_name}_{tree.prefix}numel"
@@ -3930,7 +3935,7 @@ class PythonWrapperCodegen(CodeGen):
     def generate_profiler_mark_wrapper_call(self, stack):
         self.wrapper_call.writeline("from tensorplay.profiler import record_function")
         self.wrapper_call.writeline(
-            f"with record_function('graph_{V.graph.graph_id}_inductor_wrapper_call'):"
+            f"with record_function('graph_{V.graph.graph_id}_tp_wrapper_call'):"
         )
         stack.enter_context(self.wrapper_call.indent())
 
@@ -3964,7 +3969,7 @@ class PythonWrapperCodegen(CodeGen):
         the kernels that are saved, the remaining kernels are not launched,
         hence not saved. The main purpose of this codegen is to compile and
         save the Triton kernels outside the active control flow path for
-        subsequent AOTInductor code generation and compilation.
+        subsequent ahead-of-time code generation and compilation.
         """
         self.wrapper_call.splice(
             f"""
@@ -4082,7 +4087,7 @@ class PythonWrapperCodegen(CodeGen):
         raw_keys=None,
         raw_args=None,
         triton_meta: TritonMeta | None = None,
-        inductor_meta=None,
+        tp_meta=None,
         original_fxnode_name=None,
     ):
         """
@@ -4118,7 +4123,7 @@ class PythonWrapperCodegen(CodeGen):
                 triton=triton,
                 # pyrefly: ignore [bad-argument-type]
                 triton_meta=triton_meta,
-                inductor_meta=inductor_meta,
+                tp_meta=tp_meta,
                 device=device,
                 graph_name=V.graph.name,
                 # pyrefly: ignore [bad-argument-type]
@@ -4138,7 +4143,7 @@ class PythonWrapperCodegen(CodeGen):
         raw_keys=None,
         raw_args=None,
         triton_meta: TritonMeta | None = None,
-        inductor_meta=None,
+        tp_meta=None,
         graph_name="",
         original_fxnode_name=None,
         current_stream_idx=None,
@@ -4192,7 +4197,7 @@ class PythonWrapperCodegen(CodeGen):
                     original_fxnode_name, None
                 )
 
-            _per_kernel = config.aot_inductor.autotune_per_kernel_alloc
+            _per_kernel = config.tp_export.autotune_per_kernel_alloc
 
             def get_autotune_deletion_call() -> str:
                 """Returns del for tensors whose last consumer is this kernel."""
@@ -4277,7 +4282,7 @@ class PythonWrapperCodegen(CodeGen):
                     raw_keys, raw_args, i, reused_args
                 ):
                     # Empty raw_key means this is an arg that's not native to the triton kernel,
-                    # and is being added by inductor.
+                    # and is being added by the compiler.
                     arg_str = reused_args[raw_arg]
                 elif isinstance(arg_type, tp.dtype):
                     # workspace allocation is already generated by `generate_workspace_allocation()`
@@ -4338,7 +4343,7 @@ class PythonWrapperCodegen(CodeGen):
                 # For cpp wrapper, no need to continue codegen for the main body
                 return
 
-        # add debug printer code for triton kernel calls at (jit) inductor level
+        # add debug printer code for triton kernel calls
         debug_printer_manager = V.graph.wrapper_code.debug_printer
         debug_printer_manager.set_printer_args(call_args, kernel_name, arg_types, None)
         with debug_printer_manager:
@@ -4782,10 +4787,10 @@ class PythonWrapperCodegen(CodeGen):
             # Only ir.Subgraph (invoke_subgraph regions) carries nested config
             # patches; other subgraph adapters (e.g. the CodegenGraph used for
             # decompose_k) have none.
-            inductor_config_patches = getattr(subgraph, "inductor_config_patches", None)
+            tp_config_patches = getattr(subgraph, "tp_config_patches", None)
             ctx = (
-                config.patch(inductor_config_patches)
-                if inductor_config_patches
+                config.patch(tp_config_patches)
+                if tp_config_patches
                 else contextlib.nullcontext()
             )
             with ctx:
@@ -4891,10 +4896,10 @@ class PythonWrapperCodegen(CodeGen):
             # Only ir.Subgraph (invoke_subgraph regions) carries nested config
             # patches; other subgraph adapters (e.g. the CodegenGraph used for
             # decompose_k) have none.
-            inductor_config_patches = getattr(subgraph, "inductor_config_patches", None)
+            tp_config_patches = getattr(subgraph, "tp_config_patches", None)
             ctx = (
-                config.patch(inductor_config_patches)
-                if inductor_config_patches
+                config.patch(tp_config_patches)
+                if tp_config_patches
                 else contextlib.nullcontext()
             )
             # do not graph partition inside subgraph bodies

@@ -329,7 +329,7 @@ MetricTable.register_table(
         "num_args",
         # xyz numel can be different to size_hints since size_hints are rounded
         # up to the nearest power of 2.
-        # Inductor kernel will burn in the xyz numel in kernel code for static
+        # The compiler kernel will burn in the xyz numel in kernel code for static
         # shape kernels.
         # Logging them will be helpful to find unaligned shape for reduction
         "xnumel",

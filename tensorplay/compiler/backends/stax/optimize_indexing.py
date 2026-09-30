@@ -5,7 +5,7 @@ from typing import Any
 import sympy
 
 import tensorplay as tp
-from tensorplay.graph.node import map_arg
+from tensorplay.graph.node import Node, map_arg
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
 from tensorplay.graph.experimental.sympy_functions import ValueRanges
 
@@ -159,7 +159,7 @@ def _collect_input_nodes(node: Any) -> OrderedSet[Any]:
     if (
         node.op == "call_method"
         and node.args
-        and isinstance(node.args[0], Any)
+        and isinstance(node.args[0], Node)
     ):
         inputs.discard(node.args[0])
     return inputs

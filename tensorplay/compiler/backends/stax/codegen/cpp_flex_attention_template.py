@@ -313,8 +313,8 @@ FLEX_ATTENTION_TEMPLATE = r"""
   // Whether pack is needed for BFloat16/Half
   if (is_reduced_type) {
     // check platform ability
-    need_pack = std::is_same_v<scalar_t, tensorplay::BFloat16> ? at::native::cpublas::could_pack(tensorplay::kBFloat16)
-                                                       : at::native::cpublas::could_pack(tensorplay::kHalf);
+    need_pack = std::is_same_v<scalar_t, tensorplay::BFloat16> ? tensorplay::could_pack(tensorplay::DType::BFloat16)
+                                                       : tensorplay::could_pack(tensorplay::DType::Float16);
   }
   if (need_pack) {
     // When the number of gemm is greater than the number of pack,
@@ -364,7 +364,7 @@ FLEX_ATTENTION_TEMPLATE = r"""
         auto v_addr =
               v_data + i * vStrideB + j * vStrideH + n * vStrideN;
         // transpose [cur_kvSplitSize, headSize] -> [headSize, cur_kvSplitSize]
-        at::native::utils::transpose<uint16_t>(
+        tensorplay::utils::transpose<uint16_t>(
           cur_kvSplitSize,
           headSize,
           /* src_ptr */
@@ -495,7 +495,7 @@ FLEX_ATTENTION_TEMPLATE = r"""
               cur_kvSplitSize);
 
         } else {
-          at::native::cpublas::brgemm(
+          tensorplay::brgemm(
               cur_qSplitSize,
               cur_kvSplitSize,
               eheadSize,
@@ -602,7 +602,7 @@ FLEX_ATTENTION_TEMPLATE = r"""
               v_data + i_kv * vStrideB + j_kv * vStrideH + n * vStrideN;
           // Fallback Half brgemm is slower than micro gemm
           if (!std::is_same_v<scalar_t, tensorplay::Half>) {
-            at::native::cpublas::brgemm(
+            tensorplay::brgemm(
                   cur_qSplitSize,
                   headSize_v,
                   cur_ekvSplitSize,
@@ -641,7 +641,7 @@ FLEX_ATTENTION_TEMPLATE = r"""
           }
         } else {
           int64_t psize = n / kvSplitSize * ekvSplitSize;
-          at::native::cpublas::brgemm(
+          tensorplay::brgemm(
               cur_qSplitSize,
               headSize_v,
               cur_ekvSplitSize,
@@ -678,7 +678,7 @@ FLEX_ATTENTION_TEMPLATE = r"""
       tensorplay::generated::data_index_step(i, batchSize, j, num_head, k, qSlice);
     }
 
-    at::native::cpublas::brgemm_release(need_pack);
+    tensorplay::brgemm_release(need_pack);
 
   });
 }
@@ -928,7 +928,7 @@ FLEX_DECODING_TEMPLATE = r"""
         // Fallback Half brgemm is slower than micro gemm
 
         if constexpr (!std::is_same_v<scalar_t, tensorplay::Half>) {
-          at::native::cpublas::brgemm(
+          tensorplay::brgemm(
                 cur_qSplitSize,
                 headSize_v,
                 cur_kvSplitSize,
@@ -977,7 +977,7 @@ FLEX_DECODING_TEMPLATE = r"""
     }
 
     if constexpr (!std::is_same_v<scalar_t, tensorplay::Half>) {
-      at::native::cpublas::brgemm_release();
+      tensorplay::brgemm_release();
     }
   });
 

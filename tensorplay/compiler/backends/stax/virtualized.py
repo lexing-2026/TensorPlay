@@ -1,7 +1,7 @@
 # mypy: allow-untyped-defs
 """
 This file provides a number of "global" variables/handlers that are actually
-thread local and dynamically scoped, with Inductor patching them to various
+thread local and dynamically scoped, with the compiler patching them to various
 implementations depending on the situation.
 
 These handlers are interacted with in a fairly stylized way.  Typically,
@@ -28,7 +28,7 @@ There are a few distinct usage patterns for virtualized global variables:
    conveniently access them without having to pass them around.
 
 3. Alternate define-by-run interpretations.  Examples: ``V.ops``, ``V.kernel``.
-   A commonly used IR in Inductor is define-by-run: instead of maintaining
+   A commonly used IR in the compiler is define-by-run: instead of maintaining
    explicit syntax data structures, we instead represent loop bodies as
    callable functions, which internally invoke operations defined on
    ``V.ops``.  To perform semantic analysis, print or code generate these
@@ -79,7 +79,7 @@ if TYPE_CHECKING:
     from typing import Protocol
 
     import tensorplay as tp
-    from .config import InductorChoices
+    from .config import TpChoices
     from .codegen.common import CSE, CSEVariable, KernelArgs
     from .codegen.common import LocalBufferContext
     from .debug import DebugContext
@@ -154,7 +154,7 @@ class Virtualized(Generic[T]):
 
     def __init__(self, vname: str, default: Callable[[], T] | type[NullHandler]):
         self._vname = vname
-        self._key: str = f"__tp_inductor_{vname}"
+        self._key: str = f"__tp_{vname}"
         self._default = default
 
     def _set_handler(self, value: T) -> AbstractContextManager[None]:
@@ -260,14 +260,14 @@ def _choices_default():
     We virtualize the configuration to allow changing heuristics from out of tree.
     """
     from . import config
-    from .choices import create_inductor_choices
+    from .choices import create_tp_choices
 
-    rv = create_inductor_choices(config.inductor_choices_class)
+    rv = create_tp_choices(config.tp_choices_class)
     setattr(threadlocal, _choices._key, rv)
     return rv
 
 
-_choices: Virtualized[InductorChoices] = Virtualized("choices", _choices_default)
+_choices: Virtualized[TpChoices] = Virtualized("choices", _choices_default)
 
 
 class OpsValue:
@@ -463,7 +463,7 @@ class _V:
     get_local_buffer_context: Callable[[], LocalBufferContext] = (
         _local_buffer_context._get_handler
     )
-    set_choices_handler: Callable[[InductorChoices], AbstractContextManager[None]] = (
+    set_choices_handler: Callable[[TpChoices], AbstractContextManager[None]] = (
         _choices._set_handler
     )
     # Broad param: the state is reset by installing a NullHandler (see
@@ -540,7 +540,7 @@ class _V:
         return _local_buffer_context._get_handler()
 
     @property
-    def choices(self) -> InductorChoices:
+    def choices(self) -> TpChoices:
         return _choices._get_handler()
 
     @property

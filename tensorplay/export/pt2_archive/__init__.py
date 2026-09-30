@@ -1,7 +1,7 @@
 """Archive serialization for exported programs and packaged artifacts."""
 
 from ._package import (
-    AOTICompiledModel,
+    TPCompiledModel,
     PT2ArchiveContents,
     PT2ArchiveReader,
     PT2ArchiveWriter,
@@ -15,7 +15,7 @@ from ._package import (
 from ._package_weights import TensorProperties, WeightType, Weights, get_complete_tensor, group_weights
 
 __all__ = [
-    "AOTICompiledModel",
+    "TPCompiledModel",
     "PT2ArchiveContents",
     "PT2ArchiveReader",
     "PT2ArchiveWriter",

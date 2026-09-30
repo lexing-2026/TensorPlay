@@ -1,5 +1,5 @@
 """
-# Inductor Pattern Matcher
+# Pattern Matcher
 
 The pattern matcher enables search/replace within an FX graph.
 
@@ -367,7 +367,7 @@ class Match:
             if should_propagate_eager_input_vals(self.nodes):
                 # Our strategy is:
                 # 1) trace out the graph with eager_input_vals (which have accurate eager-mode metadata)
-                # 2) trace out the graph with vals (which have the accurate Inductor metadata)
+                # 2) trace out the graph with vals (which have the accurate tp metadata)
                 # 3) Propagate the eager_input_vals from the first graph to the second.
                 # 4) Use the second graph as the replacement graph.
 
@@ -2347,7 +2347,7 @@ def register_lowering_pattern(
     """
     Register a replacement pattern that turns one operation into another.  The decorated
     function is saved and then called at lowering time allowing direct
-    pattern to inductor IR conversion.
+    pattern to tp IR conversion.
     """
 
     def decorator(handler: Callable[..., Any]) -> Callable[..., Any]:
@@ -2356,14 +2356,14 @@ def register_lowering_pattern(
         LoweringPatternEntry(
             pattern=pattern, extra_check=extra_check, handler=handler
         ).register(pass_dict, prepend=prepend)
-        handler._inductor_lowering_function = True  # type: ignore[attr-defined]
-        handler._inductor_lowering_output_metadata_ignores_input_storage = (  # type: ignore[attr-defined]
+        handler._tp_lowering_function = True  # type: ignore[attr-defined]
+        handler._tp_lowering_output_metadata_ignores_input_storage = (  # type: ignore[attr-defined]
             output_metadata_ignores_input_storage
         )
-        handler._inductor_lowering_output_metadata_is_input = (  # type: ignore[attr-defined]
+        handler._tp_lowering_output_metadata_is_input = (  # type: ignore[attr-defined]
             output_metadata_is_input
         )
-        handler._inductor_lowering_output_metadata_fn = output_metadata_fn  # type: ignore[attr-defined]
+        handler._tp_lowering_output_metadata_fn = output_metadata_fn  # type: ignore[attr-defined]
         return handler
 
     return decorator
@@ -2402,7 +2402,7 @@ def is_start_of_fx_graph(graph: Any, node: Any) -> bool:
 _mutation_op_re = re.compile(r"(?<!_)(_$|_[.]|(\b|_)(set|enter|exit|seed)(\b|_))(?!_)")
 
 
-def fixme_incorrect_inductor_schema_op(op: OpOverload) -> bool:
+def an op with an incorrect schema(op: OpOverload) -> bool:
     if op.namespace != "stax":
         return False
 
@@ -2414,7 +2414,7 @@ def fixme_incorrect_inductor_schema_op(op: OpOverload) -> bool:
 def is_mutation_op(node: Any) -> bool:
     if isinstance(
         node.target, OpOverload
-    ) and not fixme_incorrect_inductor_schema_op(node.target):
+    ) and not an op with an incorrect schema(node.target):
         return node.target._schema.is_mutable
     elif node.target is tp._higher_order_ops.auto_functionalized:
         # A functionalized mutation is written as one node that runs the

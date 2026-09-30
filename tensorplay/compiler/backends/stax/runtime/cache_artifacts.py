@@ -138,7 +138,7 @@ class CacheInfo:
     #: then is an attribute error rather than an empty answer: a caller asking
     #: for pieces of a kind that does not exist is asking the wrong question.
     @property
-    def inductor_artifacts(self) -> list[str]:
+    def tp_artifacts(self) -> list[str]:
         ...
 
     @property

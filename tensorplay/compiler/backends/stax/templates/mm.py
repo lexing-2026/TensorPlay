@@ -35,7 +35,7 @@ from .mm_common import (
     mm_args,
     mm_grid,
     persistent_mm_grid,
-    use_aten_gemm_kernels,
+    use_tp_gemm_kernels,
     use_decompose_k_choice,
     use_native_matmul,
     use_triton_blackwell_tma_template,
@@ -496,7 +496,7 @@ def get_scaling_options(
         ) and is_desired_scaling(mat_b, scale_b_size, scale_option_b, transpose=True):
             return (scale_option_a, scale_option_b)
     raise AssertionError(
-        f"Inductor Triton does not support scale_a.shape = {scale_a_size}, "
+        f"The compiler does not support scale_a.shape = {scale_a_size}, "
         f"scale_b.shape = {scale_b_size}"
     )
 
@@ -775,7 +775,7 @@ def tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
 
     templates_to_use: list = []
     kwarg_overrides: dict = {}
-    if use_aten_gemm_kernels():
+    if use_tp_gemm_kernels():
         templates_to_use.append(aten_handler)
         if aten_extra_kwargs:
             kwarg_overrides[aten_handler.uid] = aten_extra_kwargs
@@ -851,7 +851,7 @@ def tuned_int_mm(mat1, mat2, *, layout=None):
     static_shape, is_nonzero = _is_static_problem(layout)
     kernel_inputs = MMKernelInputs([mat1, mat2], out_dtype=tp.int32)
     templates_to_use: list = []
-    if use_aten_gemm_kernels():
+    if use_tp_gemm_kernels():
         templates_to_use.append(framework__int_mm)
     if is_nonzero and use_triton_template(layout, enable_int32=True, check_max_autotune=False):
         templates_to_use.append(mm_template)
@@ -927,7 +927,7 @@ def tuned_scaled_mm(
 
     templates_to_use: list = []
     kwarg_overrides: dict = {}
-    if use_aten_gemm_kernels():
+    if use_tp_gemm_kernels():
         templates_to_use.append(framework_fp8_mm)
         kwarg_overrides[framework_fp8_mm.uid] = dict(
             out_dtype=out_dtype, use_fast_accum=use_fast_accum
@@ -1037,7 +1037,7 @@ def tuned_addmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
     kernel_inputs = MMKernelInputs(
         [inp_expanded, mat1, mat2], scalars=dict(alpha=alpha, beta=beta)
     )
-    kernel_inputs_aten = MMKernelInputs(
+    kernel_inputs_tp = MMKernelInputs(
         [inp, mat1, mat2], scalars=dict(alpha=alpha, beta=beta)
     )
 
@@ -1058,7 +1058,7 @@ def tuned_addmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
         # measuring it: a measurement that could only confirm what there is one
         # of costs the compile it is meant to save.
         choices.extend(
-            get_template_configs(kernel_inputs_aten, [framework_addmm], name)
+            get_template_configs(kernel_inputs_tp, [framework_addmm], name)
         )
         node, _ = autotune_select_algorithm(
             name, choices, kernel_inputs.nodes(), layout
@@ -1066,7 +1066,7 @@ def tuned_addmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
         return node
 
     templates_to_use: list = []
-    if use_aten_gemm_kernels():
+    if use_tp_gemm_kernels():
         aten_templates: list = [framework_addmm]
         if inp.get_stride()[0] == 0 and len(inp.get_size()) == 2:
             # A bias that is one value repeated is the same computation as one
@@ -1074,7 +1074,7 @@ def tuned_addmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
             # cheaper -- kernel when told it is one value.
             aten_templates.append(framework_bias_addmm)
         choices.extend(
-            get_template_configs(kernel_inputs_aten, aten_templates, name)
+            get_template_configs(kernel_inputs_tp, aten_templates, name)
         )
     if is_nonzero and use_triton_template(layout, check_max_autotune=False):
         templates_to_use.append(mm_template)
@@ -1090,7 +1090,7 @@ def tuned_addmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
             templates_to_use.append(persistent_mm_template)
         choices.extend(
             get_template_configs(
-                kernel_inputs_aten, [addmm_contiguous_subgraph_template], name
+                kernel_inputs_tp, [addmm_contiguous_subgraph_template], name
             )
         )
     choices.extend(get_template_configs(kernel_inputs, templates_to_use, name))
@@ -1136,7 +1136,7 @@ def tuned_sparse_semi_structured_mm(
                 (mat1, mat1_meta, mat2), layout, out_dtype=out_dtype
             )
         ]
-        if use_aten_gemm_kernels()
+        if use_tp_gemm_kernels()
         else []
     )
     node, _ = autotune_select_algorithm(
@@ -1244,7 +1244,7 @@ def tuned_scaled_mm_v2(
     choices: list = []
     templates_to_use: list = []
     kwarg_overrides: dict = {}
-    if use_aten_gemm_kernels():
+    if use_tp_gemm_kernels():
         templates_to_use.append(framework_fp8_mm)
         kwarg_overrides[framework_fp8_mm.uid] = dict(
             out_dtype=out_dtype, use_fast_accum=use_fast_accum

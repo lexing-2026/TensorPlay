@@ -277,35 +277,34 @@ def last_power_of_2(n: int) -> int:
 
 
 def assert_size_stride(
-    name: str,
+    tensor: Any,
     size: Any,
     stride: Any,
     op_name: str = "",
 ) -> None:
     """Raise unless a buffer has the shape and stride it was compiled for.
 
-    The name is the buffer's own, so the message says which argument of which
-    call was wrong rather than that something was.
+    The tensor is the buffer itself, so the message says which argument of
+    which call was wrong rather than that something was.
     """
 
-    tensor = _current_buffer(name)
     if tensor is None:
         return
     expected_size = tuple(int(s) for s in size)
     expected_stride = tuple(int(s) for s in stride)
-    actual_size = tuple(int(s) for s in tensor.shape)
-    actual_stride = tuple(int(s) for s in tensor.stride())
+    actual_size = tensor.shape
+    actual_stride = tensor.stride()
     if actual_size != expected_size or actual_stride != expected_stride:
         where = f" for {op_name}" if op_name else ""
         raise AssertionError(
-            f"buffer {name!r}{where} was compiled for shape {expected_size} and "
-            f"stride {expected_stride} but arrived with shape {actual_size} and "
-            f"stride {actual_stride}"
+            f"buffer {getattr(tensor, '_name', tensor)!r}{where} was compiled "
+            f"for shape {expected_size} and stride {expected_stride} but "
+            f"arrived with shape {actual_size} and stride {actual_stride}"
         )
 
 
 def assert_tensor_metadata(
-    name: str,
+    tensor: Any,
     size: Any,
     stride: Any,
     dtype: Any,
@@ -319,19 +318,19 @@ def assert_tensor_metadata(
     size reading the other produces a number rather than an error.
     """
 
-    tensor = _current_buffer(name)
     if tensor is None:
         return
-    assert_size_stride(name, size, stride, op_name)
+    assert_size_stride(tensor, size, stride, op_name)
     if tensor.dtype != dtype:
         where = f" for {op_name}" if op_name else ""
         raise AssertionError(
-            f"value {name!r}{where} was compiled for element type {dtype} but "
-            f"arrived with element type {tensor.dtype}"
+            f"value {getattr(tensor, '_name', tensor)!r}{where} was compiled "
+            f"for element type {dtype} but arrived with element type "
+            f"{tensor.dtype}"
         )
 
 
-def assert_alignment(name: str, alignment: int) -> None:
+def assert_alignment(tensor: Any, alignment: int, op_name: str = "") -> None:
     """Raise unless a buffer's memory is aligned as the kernel needs it to be.
 
     Separate from the shape check because the two fail for different reasons:
@@ -340,34 +339,14 @@ def assert_alignment(name: str, alignment: int) -> None:
     the hardware cannot read it from.
     """
 
-    tensor = _current_buffer(name)
     if tensor is None:
         return
     if tensor.numel() and int(tensor.data_ptr()) % alignment:
         raise AssertionError(
-            f"buffer {name!r} is at address {tensor.data_ptr()}, which is not "
-            f"a multiple of {alignment}, so a wide load from it would read the "
-            "wrong elements"
+            f"buffer {getattr(tensor, '_name', tensor)!r} is at address "
+            f"{tensor.data_ptr()}, which is not a multiple of {alignment}, so "
+            "a wide load from it would read the wrong elements"
         )
-
-
-def _current_buffer(name: str) -> Any:
-    """The buffer the generated wrapper is currently working on.
-
-    A miss is not a failure: a name the wrapper never allocated is a name the
-    call did not use, and there is nothing to check.
-    """
-
-    import sys
-
-    frame = sys._getframe(1)
-    while frame is not None:
-        if name in frame.f_locals:
-            value = frame.f_locals[name]
-            if isinstance(value, tp.Tensor):
-                return value
-        frame = frame.f_back
-    return None
 
 
 __all__ = [

@@ -234,7 +234,7 @@ def tuned_bmm(mat1, mat2, out_dtype=None, *, layout=None):
 
     from .mm_common import (
         mm_args,
-        use_aten_gemm_kernels,
+        use_tp_gemm_kernels,
         use_native_matmul,
         use_triton_template,
     )
@@ -268,7 +268,7 @@ def tuned_bmm(mat1, mat2, out_dtype=None, *, layout=None):
 
     templates_to_use: list = []
     kwarg_overrides = {}
-    if use_aten_gemm_kernels():
+    if use_tp_gemm_kernels():
         templates_to_use.append(framework_handler)
         kwarg_overrides[framework_handler.uid] = framework_extra_kwargs
     if use_triton_template(layout, check_max_autotune=False):

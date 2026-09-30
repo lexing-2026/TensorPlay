@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ... import config as inductor_config
+from ... import config as tp_config
 from ...templates.mm import (
     addmm_contiguous_subgraph_template,
     mm_contiguous_subgraph_template,
@@ -42,7 +42,7 @@ class GemmMaxAutotuneTemplateConfigHeuristics(TemplateConfigHeuristics):
     """
 
     def should_run(self, inputs) -> bool:
-        return inductor_config.max_autotune or inductor_config.max_autotune_gemm
+        return tp_config.max_autotune or tp_config.max_autotune_gemm
 
 
 @register_template_heuristic(GEMM.uid, "cuda")

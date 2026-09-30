@@ -12,7 +12,7 @@ from typing_extensions import ParamSpec, Self, TypeVar
 
 import tensorplay as tp
 
-from .. import config as inductor_config
+from .. import config as tp_config
 from ..utils import counters
 from tensorplay.utils import _pytree as pytree
 from .....graph.experimental.sympy_functions import OrderedSet
@@ -66,11 +66,11 @@ MILLISECONDS_PER_SECOND = 1000
 #: candidate that launches a thousand kernels then produces a thousand lines that
 #: are all the same line.  Read by the places that would log a launch, so that a
 #: launch during a measurement is counted rather than described.
-_IN_INDUCTOR_BENCHMARK = False
+_IN_TP_BENCHMARK = False
 
 
 @contextlib.contextmanager
-def _benchmarking_inductor() -> Iterator[None]:
+def _benchmarking_tp() -> Iterator[None]:
     """Mark the enclosed work as a measurement, so launches are not described.
 
     A measurement is not a program run: it is the same work run over and over to
@@ -80,13 +80,13 @@ def _benchmarking_inductor() -> Iterator[None]:
     leave the outer one un-marked.
     """
 
-    global _IN_INDUCTOR_BENCHMARK
-    previous = _IN_INDUCTOR_BENCHMARK
-    _IN_INDUCTOR_BENCHMARK = True
+    global _IN_TP_BENCHMARK
+    previous = _IN_TP_BENCHMARK
+    _IN_TP_BENCHMARK = True
     try:
         yield
     finally:
-        _IN_INDUCTOR_BENCHMARK = previous
+        _IN_TP_BENCHMARK = previous
 
 
 P = ParamSpec("P")
@@ -124,7 +124,7 @@ def set_gpu_benchmark_lock_context(
 ) -> _GpuBenchmarkLockContext | None:
     """Override the process-local GPU benchmark lock context.
 
-    This lets benchmark harnesses provide the context used by Inductor GPU
+    This lets benchmark harnesses provide the context used by the GPU compiler
     benchmark calls. Some benchmark helpers delegate to other benchmark
     methods, so harness contexts should support nested entry from the same
     thread. Returning the previous context lets callers restore it in tests.
@@ -191,7 +191,7 @@ def register_benchmarker(
 
 def may_distort_benchmarking_result(fn: Callable[..., Any]) -> Callable[..., Any]:
 
-    if inductor_config.test_configs.distort_benchmarking_result == "":
+    if tp_config.test_configs.distort_benchmarking_result == "":
         return fn
 
     def distort(
@@ -200,7 +200,7 @@ def may_distort_benchmarking_result(fn: Callable[..., Any]) -> Callable[..., Any
         if isinstance(ms, (list, tuple)):
             return type(ms)(distort(val) for val in ms)  # type: ignore[misc]
 
-        distort_method = inductor_config.test_configs.distort_benchmarking_result
+        distort_method = tp_config.test_configs.distort_benchmarking_result
         if not isinstance(ms, float):
             raise AssertionError(f"Expected float, got {type(ms)}")
         if distort_method == "inverse":
@@ -224,8 +224,8 @@ def may_distort_benchmarking_result(fn: Callable[..., Any]) -> Callable[..., Any
 
 
 def may_ban_benchmarking() -> None:
-    if inductor_config.deterministic:
-        raise RuntimeError("""In the deterministic mode of Inductor, we will avoid those
+    if tp_config.deterministic:
+        raise RuntimeError("""In the deterministic mode of the compiler, we will avoid those
         benchmarkings that would cause non-deterministic results. Only benchmarkings in the vetted
         scenarios are allowed. Examples include autotuning for triton configs of pointwise kernels.
 
@@ -253,7 +253,7 @@ def time_and_count(
     @wraps(fn)
     def wrapper(self: Any, *args: P.args, **kwargs: P.kwargs) -> T:
         fn_qual_name = f"{self.__class__.__name__}.{fn.__name__}"
-        counters["inductor"][f"benchmarking.{fn_qual_name}"] += 1
+        counters["tp"][f"benchmarking.{fn_qual_name}"] += 1
         return fn(self, *args, **kwargs)
 
     return wrapper
@@ -262,7 +262,7 @@ def time_and_count(
 class Benchmarker:
     """
     A device-agnostic benchmarking utility for measuring the runtime of
-    inductor generated callables.
+    tp generated callables.
     """
 
     def infer_device(self, *fn_args: Any, **fn_kwargs: Any) -> tp.device:
@@ -359,11 +359,11 @@ class Benchmarker:
             def _callable() -> Any:
                 return fn(*_args, **_kwargs)
 
-        warmup = kwargs.pop("warmup", inductor_config.inductor_default_autotune_warmup)
-        rep = kwargs.pop("rep", inductor_config.inductor_default_autotune_rep)
+        warmup = kwargs.pop("warmup", tp_config.tp_default_autotune_warmup)
+        rep = kwargs.pop("rep", tp_config.tp_default_autotune_rep)
 
         # Surfacing all kernels during autotuning is super noisy; filtering these out.
-        with _benchmarking_inductor():
+        with _benchmarking_tp():
             # First, try a registered device-specific benchmarker
             benchmark_fn: Callable[..., Any] | None = _BENCHMARK_DISPATCH.get(
                 inferred_device.type
@@ -621,7 +621,7 @@ class TritonBenchmarker(Benchmarker):
             raise
 
 
-class InductorBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
+class TpBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
     def __init__(self: Self) -> None:
         super().__init__()
         self._in_cudagraph_benchmark = False
@@ -746,8 +746,8 @@ class InductorBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
 
         if (
             device_type == "cuda"
-            and inductor_config.autotune_cudagraph_benchmarking
-            and inductor_config.max_autotune
+            and tp_config.autotune_cudagraph_benchmarking
+            and tp_config.max_autotune
             and not self._in_cudagraph_benchmark
         ):
             try:
@@ -821,7 +821,7 @@ class InductorBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
         device_interface.synchronize()
 
         # explicitly delete the buffer, sometimes helps memory
-        # footprint metrics in OSS Inductor performance benchmarks
+        # footprint metrics in tp performance benchmarks
         del buffer
 
         # Return based on the requested mode
@@ -843,7 +843,7 @@ class InductorBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
             )
 
 
-class TorchProfilerBenchmarker(InductorBenchmarker):  # noqa: docstring_linter
+class ProfilerBenchmarker(TpBenchmarker):  # noqa: docstring_linter
     """Benchmarker that uses tp.profiler for GPU kernel benchmarking."""
 
     @time_and_count
@@ -899,7 +899,7 @@ class TorchProfilerBenchmarker(InductorBenchmarker):  # noqa: docstring_linter
         device_interface.synchronize()
 
         # Keep Triton's 256 MB cache flush on ROCm. On other backends, reuse
-        # the shared L2-sized flush from InductorBenchmarker.
+        # the shared L2-sized flush from TpBenchmarker.
         # see https://github.com/triton-lang/triton/pull/840 for why `dtype=tp.int`
         if tp.version.hip:
             buffer_size_bytes = 256 * 1024 * 1024
@@ -912,7 +912,7 @@ class TorchProfilerBenchmarker(InductorBenchmarker):  # noqa: docstring_linter
 
         # Estimation phase with separate event pairs — also serves as warmup.
         # Using per-iteration event pairs lets us take the min, matching
-        # InductorBenchmarker's approach for a more robust estimate.
+        # TpBenchmarker's approach for a more robust estimate.
         event_pairs = self.get_event_pairs(estimation_iters, device_type=device_type)
         for start_event, end_event in event_pairs:
             if grad_to_none is not None:
@@ -990,7 +990,7 @@ class TorchProfilerBenchmarker(InductorBenchmarker):  # noqa: docstring_linter
         avg_time_ms = (total_time_us / rep) / 1000.0
 
         # explicitly delete the buffer, sometimes helps memory
-        # footprint metrics in OSS Inductor performance benchmarks
+        # footprint metrics in tp performance benchmarks
         del buffer
 
         # Return based on the requested mode
@@ -1005,10 +1005,10 @@ class TorchProfilerBenchmarker(InductorBenchmarker):  # noqa: docstring_linter
 
 
 def _make_default_benchmarker() -> Benchmarker:
-    if inductor_config.use_torch_profiler_benchmarker:
+    if tp_config.use_torch_profiler_benchmarker:
         return TorchProfilerBenchmarker()
-    if inductor_config.use_experimental_benchmarker:
-        return InductorBenchmarker()
+    if tp_config.use_experimental_benchmarker:
+        return TpBenchmarker()
     return TritonBenchmarker()
 
 

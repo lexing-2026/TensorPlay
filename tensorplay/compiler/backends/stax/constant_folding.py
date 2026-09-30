@@ -232,7 +232,7 @@ class ConstantFolder(Any):
         ):
             return self.unknown_value
 
-        # skip constructors, since inductor generates optimal code for them already
+        # skip constructors, since the compiler generates optimal code for them already
         # and turning into tensor would result in an additional global memory read
         # TODO - more complicated strategy
         if (

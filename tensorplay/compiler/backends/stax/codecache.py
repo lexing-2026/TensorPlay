@@ -47,11 +47,11 @@ import tensorplay as tp
 if TYPE_CHECKING:
     from .remote_cache import JsonDataTy, RemoteCache
 
-from tensorplay.utils._functools import prefetchable_cache as torch_key_cache
+from tensorplay.utils._functools import prefetchable_cache as code_key_cache
 
 from .cache_key import CODE_CACHE_KEY_STRATEGY, SYSTEM_CACHE_KEY_STRATEGY
 from .compile_log import timed_block
-from .cpp_builder import _TORCH_PATH
+from .cpp_builder import _REPO_ROOT
 from tensorplay._subclasses.fake_tensor import (
     extract_tensor_metadata,
     TensorMetadata,
@@ -103,7 +103,7 @@ def extract_tensor_metadata_for_cache_key(t) -> TensorMetadata:
     """
 
     meta = extract_tensor_metadata(t)
-    if not getattr(t, "_is_inductor_static", False):
+    if not getattr(t, "_is_tp_static", False):
         meta = dataclasses.replace(meta, storage_offset=0, storage_bytes=None)
     return meta
 
@@ -287,7 +287,7 @@ class GuardedCache(Generic[T]):
 
 
 @CacheArtifactFactory.register
-class InductorCacheArtifact(CacheArtifact):
+class TpCacheArtifact(CacheArtifact):
     """One compiled graph, to be put back in the local cache when read."""
 
     def populate_cache(self) -> None:
@@ -295,7 +295,7 @@ class InductorCacheArtifact(CacheArtifact):
 
     @staticmethod
     def type() -> str:
-        return "inductor"
+        return "tp"
 
 
 def triton_key() -> str | None:
@@ -520,8 +520,8 @@ def build_code_hash(
             build_code_hash(spec.submodule_search_locations, f"{spec.name}.", hasher)
 
 
-@torch_key_cache
-def torch_key() -> bytes:
+@code_key_cache
+def code_key() -> bytes:
     """A hash of the source this build was made from.
 
     Written into every cache entry, because an answer found by an earlier build
@@ -535,12 +535,10 @@ def torch_key() -> bytes:
         # A helper rather than inlining this, so that the one thing a caller
         # should reach for is the function above and not the walk underneath.
         extra_files = (
-            "codegen/aoti_runtime/interface.cpp",
-            "codegen/aoti_runtime/streams.h",
             "script.ld",
         )
-        inductor_root = os.path.dirname(__file__)
-        extra_files = [os.path.join(inductor_root, x) for x in extra_files]
+        tp_root = os.path.dirname(__file__)
+        extra_files = [os.path.join(tp_root, x) for x in extra_files]
         hasher = hashlib.sha256()
         hasher.update(tp.__version__.encode("utf-8"))
         build_code_hash([root], "", hasher)
@@ -550,8 +548,8 @@ def torch_key() -> bytes:
                     hasher.update(f.read())
         return hasher.digest()
 
-    with timed_block("inductor_codecache_torch_key"):
-        return get_code_hash(_TORCH_PATH)
+    with timed_block("code_key"):
+        return get_code_hash(_REPO_ROOT)
 
 
 def code_hash(code: str | bytes, extra: str | bytes = "") -> str:

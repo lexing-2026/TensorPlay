@@ -46,9 +46,9 @@ def _strided_input(
 
 log = logging.getLogger(__name__)
 perf_hint_log = tp.getArtifactLogger(__name__, "perf_hints")
-aten = tp.ops.tp
+tp_ops = tp.ops.tp
 
-_scaled_dot_product_attention = aten.scaled_dot_product_attention
+_scaled_dot_product_attention = tp_ops.scaled_dot_product_attention
 
 
 _INFERENCE_ONLY_SFDP_PATTERNS = frozenset(
@@ -79,7 +79,7 @@ def _sfdp_pattern_1(query, key, value, inv_scale):
 
 
 def _sfdp_replacement_1(query, key, value, inv_scale):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query,
         key,
@@ -101,7 +101,7 @@ def _sfdp_pattern_2(query, key, value, scale_factor):
 
 
 def _sfdp_replacement_2(query, key, value, scale_factor):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query,
         key,
@@ -123,7 +123,7 @@ def _sfdp_pattern_3(query, key, value, inv_scale_factor, dropout_p):
 
 
 def _sfdp_replacement_3(query, key, value, inv_scale_factor, dropout_p):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query,
         key,
@@ -143,7 +143,7 @@ def _sfdp_pattern_4(query, key, value, scale_factor, dropout_p):
 
 
 def _sfdp_replacement_4(query, key, value, scale_factor, dropout_p):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query,
         key,
@@ -164,7 +164,7 @@ def _sfdp_pattern_5(query, key, value, attn_mask, inv_scale):
 
 
 def _sfdp_replacement_5(query, key, value, attn_mask, inv_scale):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query,
         key,
@@ -185,7 +185,7 @@ def _sfdp_pattern_6(query, key, value, attn_mask, inv_scale, dropout_p):
 
 
 def _sfdp_replacement_6(query, key, value, attn_mask, inv_scale, dropout_p):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query,
         key,
@@ -219,7 +219,7 @@ def _sfdp_replacement_7(query, key, value, inv_scale, dropout_p):
     # if they aren't already
     # to make replacement efficient ensure that inputs to sdpa
     # are in required order
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     q = query.permute(0, 2, 1, 3)
     k = key.permute(0, 2, 1, 3)
     v = value.permute(0, 2, 1, 3)
@@ -248,7 +248,7 @@ def _sfdp_pattern_8(query, key, value, inv_scale):
 
 
 def _sfdp_replacement_8(query, key, value, inv_scale):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     q = query.permute(0, 2, 1, 3)
     k = key.permute(0, 2, 1, 3)
     v = value.permute(0, 2, 1, 3)
@@ -278,7 +278,7 @@ def _sfdp_pattern_9(query, key, value, inv_scale, dropout_p):
 
 
 def _sfdp_replacement_9(query, key, value, inv_scale, dropout_p):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     q = query.permute(0, 2, 1, 3)
     k = key.permute(0, 2, 1, 3)
     v = value.permute(0, 2, 1, 3)
@@ -308,7 +308,7 @@ def _sfdp_pattern_10(query, key, value, inv_scale):
 
 
 def _sfdp_replacement_10(query, key, value, inv_scale):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     q = query.permute(0, 2, 1, 3)
     k = key.permute(0, 2, 1, 3)
     v = value.permute(0, 2, 1, 3)
@@ -332,7 +332,7 @@ def _sfdp_pattern_11(query, key, value, inv_scale):
 
 
 def _sfdp_replacement_11(query, key, value, inv_scale):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query.transpose(1, 2),
         key.transpose(1, 2),
@@ -355,7 +355,7 @@ def _sfdp_pattern_12(query, key, value, inv_scale_factor, dropout_p):
 
 
 def _sfdp_replacement_12(query, key, value, inv_scale_factor, dropout_p):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query.transpose(1, 2),
         key.transpose(1, 2),
@@ -374,7 +374,7 @@ def _sfdp_pattern_13(query, key, value, dropout_p):
 
 
 def _sfdp_replacement_13(query, key, value, dropout_p):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query.unsqueeze(0),
         key.unsqueeze(0),
@@ -398,7 +398,7 @@ def _sfdp_pattern_14(query, key, value, attn_mask, inv_scale):
 
 
 def _sfdp_replacement_14(query, key, value, attn_mask, inv_scale):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query.transpose(1, 2),
         key.transpose(1, 2),
@@ -429,7 +429,7 @@ def _sfdp_pattern_15(query, key, value, attn_mask, inv_scale):
 
 
 def _sfdp_replacement_15(query, key, value, attn_mask, inv_scale):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     bs = query.size(0)
     n_head = query.size(2)
     q_len = query.size(1)
@@ -467,7 +467,7 @@ def _sfdp_pattern_16(query, key, value, attn_mask, inv_scale, dropout_p):
 
 
 def _sfdp_replacement_16(query, key, value, attn_mask, inv_scale, dropout_p):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     query = query.transpose(1, 2)
     key = key.transpose(1, 2)
     value = value.transpose(1, 2)
@@ -512,7 +512,7 @@ def _sfdp_pattern_17(query, key, value, attn_mask, inv_scale, dropout_p):
 
 
 def _sfdp_replacement_17(query, key, value, attn_mask, inv_scale, dropout_p):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     bs = query.size(0)
     n_head = query.size(2)
     q_len = query.size(1)
@@ -562,7 +562,7 @@ def _sfdp_pattern_18(query, key, value, causal_mask, inv_scale, dropout_p):
 
 
 def _sfdp_replacement_18(query, key, value, causal_mask, inv_scale, dropout_p):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     permuted_key = key.transpose(1, 2)
     permuted_value = value.transpose(1, 2)
     return (
@@ -602,7 +602,7 @@ def _sfdp_pattern_19(query, key, value, causal_mask, attn_mask, inv_scale, dropo
 def _sfdp_replacement_19(
     query, key, value, causal_mask, attn_mask, inv_scale, dropout_p
 ):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     fill_value = tp.full((), -float("inf"), dtype=query.dtype, device=query.device)
     attn_mask = tp.where(causal_mask, attn_mask, fill_value)
     return _scaled_dot_product_attention(
@@ -636,7 +636,7 @@ def _sfdp_pattern_20(query, key, value, attn_mask, inv_scale, dropout_p):
 
 
 def _sfdp_replacement_20(query, key, value, attn_mask, inv_scale, dropout_p):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     bs = query.size(0)
     n_head = query.size(2)
     q_len = query.size(1)
@@ -668,7 +668,7 @@ def _sfdp_pattern_21(query, key, value, attn_mask):
 
 
 def _sfdp_replacement_21(query, key, value, attn_mask):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     query = query.permute(0, 2, 1, 3)
     key = key.permute(0, 2, 1, 3)
     value = value.permute(0, 2, 1, 3)
@@ -694,7 +694,7 @@ def _sfdp_pattern_22(query, key, value, attn_mask):
 
 
 def _sfdp_replacement_22(query, key, value, attn_mask):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     query = query.permute(0, 2, 1, 3)
     key = key.permute(0, 2, 1, 3)
     value = value.permute(0, 2, 1, 3)
@@ -726,7 +726,7 @@ def _sfdp_pattern_23(query, key, value):
 
 
 def _sfdp_replacement_23(query, key, value):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     query = query.permute(0, 2, 1, 3)
     key = key.permute(0, 2, 1, 3)
     value = value.permute(0, 2, 1, 3)
@@ -769,7 +769,7 @@ def _sfdp_pattern_24(query, key, value, attention_mask):
 
 
 def _sfdp_replacement_24(query, key, value, attention_mask):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query,
         key,
@@ -793,7 +793,7 @@ def _sfdp_pattern_25(query, key, value, attn_mask, dropout_p):
 
 
 def _sfdp_replacement_25(query, key, value, attn_mask, dropout_p):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     query = query.permute(0, 2, 1, 3)
     key = key.permute(0, 2, 1, 3)
     value = value.permute(0, 2, 1, 3)
@@ -827,7 +827,7 @@ def _sfdp_pattern_26(query, key, value, attn_mask, dropout_p):
 
 
 def _sfdp_replacement_26(query, key, value, attn_mask, dropout_p):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     query = query.permute(0, 2, 1, 3)
     key = key.permute(0, 2, 1, 3)
     value = value.permute(0, 2, 1, 3)
@@ -866,7 +866,7 @@ def _sfdp_pattern_27(query, key, value, dropout_p):
 
 
 def _sfdp_replacement_27(query, key, value, dropout_p):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     query = query.permute(0, 2, 1, 3)
     key = key.permute(0, 2, 1, 3)
     value = value.permute(0, 2, 1, 3)
@@ -892,7 +892,7 @@ def _sfdp_pattern_28(query, key, value, scale_factor, dropout_p):
 
 
 def _sfdp_replacement_28(query, key, value, scale_factor, dropout_p):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query.contiguous(),
         key.contiguous(),
@@ -914,15 +914,15 @@ def _sfdp_pattern_29(query, key, value, attn_mask, inv_scale):
     q = query.permute([0, 2, 1, 3])
     k = key.permute([0, 2, 1, 3])
     v = value.permute([0, 2, 1, 3])
-    q = aten.mul.Scalar(q, inv_scale)
-    k = aten.mul.Scalar(k.transpose(-2, -1), inv_scale)
+    q = tp_ops.mul.Scalar(q, inv_scale)
+    k = tp_ops.mul.Scalar(k.transpose(-2, -1), inv_scale)
     attn_weight = (q @ k) + attn_mask
-    attn_weight = aten._safe_softmax(attn_weight, -1)
+    attn_weight = tp_ops._safe_softmax(attn_weight, -1)
     return attn_weight @ v
 
 
 def _sfdp_replacement_29(query, key, value, attn_mask, inv_scale):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query.transpose(1, 2),
         key.transpose(1, 2),
@@ -940,15 +940,15 @@ def _sfdp_pattern_30(query, key, value, inv_scale):
     q = query.permute([0, 2, 1, 3])
     k = key.permute([0, 2, 1, 3])
     v = value.permute([0, 2, 1, 3])
-    q = aten.mul.Scalar(q, inv_scale)
-    k = aten.mul.Scalar(k.transpose(-2, -1), inv_scale)
+    q = tp_ops.mul.Scalar(q, inv_scale)
+    k = tp_ops.mul.Scalar(k.transpose(-2, -1), inv_scale)
     attn_weight = q @ k
-    attn_weight = aten._safe_softmax(attn_weight, -1)
+    attn_weight = tp_ops._safe_softmax(attn_weight, -1)
     return attn_weight @ v
 
 
 def _sfdp_replacement_30(query, key, value, inv_scale):
-    counters["inductor"]["fuse_attention"] += 1
+    counters["tp"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query.transpose(1, 2),
         key.transpose(1, 2),
@@ -993,7 +993,7 @@ def _sfdp_params_check(match):
         _warn_tf32_disabled()
         return False
 
-    add_mask_node = filter_nodes(match.nodes, aten.add.Tensor)
+    add_mask_node = filter_nodes(match.nodes, tp_ops.add.Tensor)
     # Has attn_mask add.
     if len(add_mask_node) > 0:
         attn_mask_node = add_mask_node[0].args[1]
@@ -1026,7 +1026,7 @@ def _sfdp_params_check(match):
 def _sfdp_pattern_13_check(match):
     if not _sfdp_params_check(match):
         return False
-    permutes = filter_nodes(match.nodes, aten.permute.default)
+    permutes = filter_nodes(match.nodes, tp_ops.permute.default)
     if len(permutes) != 1:
         return False
     # The serialized pattern wildcard-matches the permute dimensions.
@@ -1164,28 +1164,28 @@ def _get_sfdp_patterns(input_device: tp.device | None = None):
                 _sfdp_replacement_1,
                 [g(), g(), g(), c()],
                 {},
-                _sfdp_extra_check(aten.div.Tensor),
+                _sfdp_extra_check(tp_ops.div.Tensor),
             ),
             (
                 _sfdp_pattern_2,
                 _sfdp_replacement_2,
                 [g(), g(), g(), c()],
                 {},
-                _sfdp_extra_check(aten.mul.Tensor),
+                _sfdp_extra_check(tp_ops.mul.Tensor),
             ),
             (
                 _sfdp_pattern_3,
                 _sfdp_replacement_3,
                 [g(), g(), g(), c()],
                 d,
-                _sfdp_extra_check(aten.div.Tensor),
+                _sfdp_extra_check(tp_ops.div.Tensor),
             ),
             (
                 _sfdp_pattern_4,
                 _sfdp_replacement_4,
                 [g(), g(), g(), c()],
                 d,
-                _sfdp_extra_check(aten.mul.Tensor),
+                _sfdp_extra_check(tp_ops.mul.Tensor),
             ),
             (
                 _sfdp_pattern_5,
@@ -1234,14 +1234,14 @@ def _get_sfdp_patterns(input_device: tp.device | None = None):
                 _sfdp_replacement_11,
                 [g(), g(), g(), c()],
                 {},
-                _sfdp_extra_check(aten.div.Tensor),
+                _sfdp_extra_check(tp_ops.div.Tensor),
             ),
             (
                 _sfdp_pattern_12,
                 _sfdp_replacement_12,
                 [g(), g(), g(), c()],
                 d,
-                _sfdp_extra_check(aten.div.Tensor),
+                _sfdp_extra_check(tp_ops.div.Tensor),
             ),
             (
                 _sfdp_pattern_13,
@@ -1255,35 +1255,35 @@ def _get_sfdp_patterns(input_device: tp.device | None = None):
                 _sfdp_replacement_14,
                 [g(), g(), g(), m(), c()],
                 {},
-                _sfdp_extra_check(aten.div.Tensor),
+                _sfdp_extra_check(tp_ops.div.Tensor),
             ),
             (
                 _sfdp_pattern_15,
                 _sfdp_replacement_15,
                 [g(), g(), g(), m_2d(), c()],
                 {},
-                _sfdp_extra_check(aten.div.Tensor),
+                _sfdp_extra_check(tp_ops.div.Tensor),
             ),
             (
                 _sfdp_pattern_16,
                 _sfdp_replacement_16,
                 [g(), g(), g(), m(), c()],
                 d,
-                _sfdp_extra_check(aten.div.Tensor),
+                _sfdp_extra_check(tp_ops.div.Tensor),
             ),
             (
                 _sfdp_pattern_16,
                 _sfdp_replacement_16,
                 [g_bs1(), g_bs1(), g_bs1(), m_bs1(), c()],
                 d,
-                _sfdp_extra_check(aten.div.Tensor),
+                _sfdp_extra_check(tp_ops.div.Tensor),
             ),
             (
                 _sfdp_pattern_17,
                 _sfdp_replacement_17,
                 [g(), g(), g(), m_2d(), c()],
                 d,
-                _sfdp_extra_check(aten.div.Tensor),
+                _sfdp_extra_check(tp_ops.div.Tensor),
             ),
             (
                 _sfdp_pattern_18,
@@ -1409,35 +1409,35 @@ def _get_sfdp_patterns(input_device: tp.device | None = None):
                 _sfdp_replacement_28,
                 [gn(), gn(), gn(), c()],
                 d,
-                _sfdp_extra_check(aten.mul.Tensor),
+                _sfdp_extra_check(tp_ops.mul.Tensor),
             ),
             (
                 _sfdp_pattern_29,
                 _sfdp_replacement_29,
                 [gp(), gp(), gp(), b()],
                 s,
-                _sfdp_extra_check(aten.mul.Scalar),
+                _sfdp_extra_check(tp_ops.mul.Scalar),
             ),
             (
                 _sfdp_pattern_29,
                 _sfdp_replacement_29,
                 [gp_bs1(), gp_bs1(), gp_bs1(), b()],
                 s,
-                _sfdp_extra_check(aten.mul.Scalar),
+                _sfdp_extra_check(tp_ops.mul.Scalar),
             ),
             (
                 _sfdp_pattern_30,
                 _sfdp_replacement_30,
                 [gp(), gp(), gp()],
                 s,
-                _sfdp_extra_check(aten.mul.Scalar),
+                _sfdp_extra_check(tp_ops.mul.Scalar),
             ),
             (
                 _sfdp_pattern_30,
                 _sfdp_replacement_30,
                 [gp_bs1(), gp_bs1(), gp_bs1()],
                 s,
-                _sfdp_extra_check(aten.mul.Scalar),
+                _sfdp_extra_check(tp_ops.mul.Scalar),
             ),
         ]
         mask_fp32_patterns = ["pattern_16"]
@@ -1450,7 +1450,7 @@ def _get_sfdp_patterns(input_device: tp.device | None = None):
                     [g(), g(), g(), m_float(), c()],
                     d,
                     _sfdp_extra_check(
-                        aten.div.Tensor, disable_cuda=tp.version.hip is None
+                        tp_ops.div.Tensor, disable_cuda=tp.version.hip is None
                     ),
                 )
             )
@@ -1461,7 +1461,7 @@ def _get_sfdp_patterns(input_device: tp.device | None = None):
                     [g_bs1(), g_bs1(), g_bs1(), m_bs1_float(), c()],
                     d,
                     _sfdp_extra_check(
-                        aten.div.Tensor, disable_cuda=tp.version.hip is None
+                        tp_ops.div.Tensor, disable_cuda=tp.version.hip is None
                     ),
                 )
             )

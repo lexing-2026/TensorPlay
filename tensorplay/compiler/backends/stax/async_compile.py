@@ -34,7 +34,7 @@ from .codecache import (
     LambdaFuture,
     PyCodeCache,
     code_hash,
-    torch_key,
+    code_key,
 )
 
 import tensorplay as tp
@@ -120,7 +120,7 @@ class CompiledTritonKernels:
 
     @staticmethod
     def key(kernel_src: str) -> str:
-        return code_hash(kernel_src, extra=torch_key())
+        return code_hash(kernel_src, extra=code_key())
 
     @staticmethod
     def save(kernel_src: str, future: CodeCacheFuture) -> None:
@@ -216,7 +216,7 @@ class AsyncCompile:
             )
         if not _process_pool_allowed():
             raise RuntimeError(
-                "Inductor async compile process pools are disabled in daemonic "
+                "async compile process pools are disabled in daemonic "
                 "multiprocessing processes. Set "
                 "the configuration that says how a worker process is started"
                 "(or TORCHINDUCTOR_WORKER_START=subprocess) to use the "
@@ -351,7 +351,7 @@ class AsyncCompile:
         def reload_kernel_in_parent():
             return load_kernel()
 
-        counters["inductor"]["async_compile_cache_miss"] += 1
+        counters["tp"]["async_compile_cache_miss"] += 1
         _compile_start()
 
         if os.environ.get("TRITON_INTERPRET", "0") == "1":
@@ -360,7 +360,7 @@ class AsyncCompile:
         is_parallel = self.use_process_pool()
         cached = CompiledTritonKernels.get(source_code)
         if cached is not None:
-            counters["inductor"]["async_compile_cache_hit"] += 1
+            counters["tp"]["async_compile_cache_hit"] += 1
             return cached if is_parallel else cached.result()
 
         if is_parallel:

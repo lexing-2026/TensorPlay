@@ -34,8 +34,8 @@ def _create_etcd_v2_handler(params: RendezvousParameters) -> RendezvousHandler:
     )
 
 
-def _create_c10d_handler(params: RendezvousParameters) -> RendezvousHandler:
-    from .c10d_rendezvous_backend import create_backend
+def _create_tp_handler(params: RendezvousParameters) -> RendezvousHandler:
+    from .tp_rendezvous_backend import create_backend
     from .dynamic_rendezvous import DynamicRendezvousHandler
 
     backend, store = create_backend(params)
@@ -53,7 +53,7 @@ def _create_c10d_handler(params: RendezvousParameters) -> RendezvousHandler:
 def _register_default_handlers(registry: RendezvousHandlerRegistry) -> None:
     registry.register("static", _create_static_handler)
     registry.register("core", _create_core_handler)
-    registry.register("c10d", _create_c10d_handler)
+    registry.register("c10d", _create_tp_handler)
     registry.register("p10d", _create_p10d_handler)
     registry.register("etcd", _create_etcd_handler)
     registry.register("etcd-v2", _create_etcd_v2_handler)

@@ -253,7 +253,7 @@ class SubprocPool:
 
         self.write_lock = threading.Lock()
         self.read_thread = threading.Thread(
-            target=self._read_thread, name="InductorSubproc", daemon=True
+            target=self._read_thread, name="TpSubproc", daemon=True
         )
         # Backstop for the sidecar dying. Closing the inherited pipe fds (in the
         # parent above and in each worker's initializer) means a dead sidecar
@@ -261,7 +261,7 @@ class SubprocPool:
         # covers the cases where EOF does not arrive -- e.g. a stray fd copy still
         # holding the write end open -- by detecting the dead process directly.
         self.health_thread = threading.Thread(
-            target=self._health_monitor, name="InductorSubprocHealth", daemon=True
+            target=self._health_monitor, name="TpSubprocHealth", daemon=True
         )
 
         self.futures_lock = threading.Lock()
@@ -490,7 +490,7 @@ class SubprocPool:
 
         pid = self.process.pid
         exc = RuntimeError(
-            f"Inductor compile worker sidecar (pid {pid}) exited unexpectedly "
+            f"tp compile worker sidecar (pid {pid}) exited unexpectedly "
             f"with code {returncode} during compilation. Re-run with "
             "TP_COMPILE_THREADS=1 to compile in the main process."
         )
@@ -502,7 +502,7 @@ class SubprocPool:
             # transition. `_WaitCounterTracker.__exit__` is idempotent.
             self.running_waitcounter.__exit__()
             log.error(
-                "Inductor compile worker sidecar (pid %s) exited unexpectedly with "
+                "tp compile worker sidecar (pid %s) exited unexpectedly with "
                 "code %s during compilation; failing pending compile jobs. Re-run "
                 "with TP_COMPILE_THREADS=1 to compile in the main process.",
                 pid,
@@ -864,7 +864,7 @@ class SubprocMain:
         threading.Thread(
             target=self._watchdog_loop,
             args=(interval,),
-            name="InductorSubprocWatchdog",
+            name="TpSubprocWatchdog",
             daemon=True,
         ).start()
 

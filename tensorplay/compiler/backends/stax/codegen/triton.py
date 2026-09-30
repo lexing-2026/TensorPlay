@@ -48,6 +48,7 @@ async_compile = AsyncCompile()
 
 from .....graph.experimental.sympy_functions import (
     OrderedSet,
+    ValueRanges,
     prefix_str,
     symbol_is_type,
     SymT,
@@ -55,6 +56,7 @@ from .....graph.experimental.sympy_functions import (
 from .. import config, ir
 from ..config import triton as triton_config
 from ..loops import V
+from ..virtualized import _ops as ops
 from tensorplay.utils._triton import (
     has_triton_cpu_backend,
     has_triton_stable_tma_api,
@@ -259,7 +261,7 @@ def needs_upcast_to_float32(arg: Any) -> bool:
 
 
 def get_dtype_handler() -> DtypePropagationOpsHandler:
-    from tp._inductor.dtype_propagation import DtypePropagationOpsHandler
+    from ..dtype_propagation import DtypePropagationOpsHandler
 
     return DtypePropagationOpsHandler()
 
@@ -334,10 +336,10 @@ def debug_triton_code(node: BaseSchedulerNode) -> list[str]:
     if multi_template and multi_template.make_kernel_render is None:
         lines.append(f"{node.get_name()} Unfinalized multi template buffer")
     else:
-        from tp._inductor.codegen.cuda_combined_scheduling import (
+        from ..codegen.cuda_combined_scheduling import (
             CUDACombinedScheduling,
         )
-        from tp._inductor.codegen.xpu.xpu_combined_scheduling import (
+        from ..codegen.xpu_combined_scheduling import (
             XPUCombinedScheduling,
         )
 
@@ -612,7 +614,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
         }
 
     @classmethod
-    def inductor_meta_common(cls) -> dict[str, Any]:
+    def tp_meta_common(cls) -> dict[str, Any]:
         """What is recorded about the settings this launch was written under.
 
         A launch is cached, and a cache entry is only good for the settings it
@@ -629,7 +631,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
 
         from tensorplay.utils._triton import triton_hash_with_backend
 
-        inductor_meta = {
+        tp_meta = {
             "backend_hash": triton_hash_with_backend(),
             "assert_indirect_indexing": config.assert_indirect_indexing,
             "max_autotune": config.max_autotune,
@@ -643,13 +645,13 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
         }
 
         if config.profile_bandwidth:
-            inductor_meta["profile_bandwidth"] = config.profile_bandwidth
-            inductor_meta["profile_bandwidth_output"] = config.profile_bandwidth_output
-            inductor_meta["profile_bandwidth_with_do_bench_using_profiling"] = (
+            tp_meta["profile_bandwidth"] = config.profile_bandwidth
+            tp_meta["profile_bandwidth_output"] = config.profile_bandwidth_output
+            tp_meta["profile_bandwidth_with_do_bench_using_profiling"] = (
                 config.profile_bandwidth_with_do_bench_using_profiling
             )
 
-        return inductor_meta
+        return tp_meta
 
     def triton_tensor_ndim(self) -> int:
         """How many dimensions a launch's value has.
@@ -920,7 +922,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
             triton=True,
             arg_types=arg_types,
             triton_meta=self.triton_meta,
-            inductor_meta=self.inductor_meta,
+            tp_meta=self.tp_meta,
         )
 
         if deallocate_ws:
@@ -1552,7 +1554,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
 
     def codegen_kernel(self, name=None) -> str:
         """
-        Convert the TritonKernel from Inductor SIMD IR to triton code, including inductor triton heuristics, imports,
+        Convert the TritonKernel from SIMD IR to triton code, including triton heuristics, imports,
         metadata, and benchmarking infra.
         """
 
@@ -1705,13 +1707,13 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
         # introduce a lot of unnecessary cpu copies.
         optimize_mem = V.graph.is_inference or V.graph.is_backward
 
-        inductor_meta = {
+        tp_meta = {
             "grid_type": self._get_grid_type().__name__,
             "kernel_name": str(Placeholder.DESCRIPTIVE_NAME),
             "mutated_arg_names": mutated_args,
             "optimize_mem": optimize_mem,
-            **self.inductor_meta_per_kernel(),
-            **self.inductor_meta_common(),
+            **self.tp_meta_per_kernel(),
+            **self.tp_meta_common(),
         }
 
         # An argument whose value is one is recorded as a constant even when
@@ -1722,7 +1724,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
             triton_meta["constants"][signature[arg_num].name] = 1  # type: ignore[index,union-attr]
 
         self.triton_meta = triton_meta
-        self.inductor_meta = inductor_meta
+        self.tp_meta = tp_meta
 
         self.codegen_prologue(self.body)
         self._prescan_host_tma_materializability()
@@ -1734,16 +1736,16 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
             "uses_device_tma",
             "host_tma_descriptor_args",
         )
-        final_kernel_meta = self.inductor_meta_per_kernel()
+        final_kernel_meta = self.tp_meta_per_kernel()
         for field in tma_fields:
-            self.inductor_meta.pop(field, None)
+            self.tp_meta.pop(field, None)
             if field in final_kernel_meta:
-                self.inductor_meta[field] = final_kernel_meta[field]
+                self.tp_meta[field] = final_kernel_meta[field]
 
         if not self.uses_tma:
             # TMA probing sets tma_min_block_sizes even when the access falls
             # back to tl.load; a stale constraint regresses non-TMA kernels.
-            self.inductor_meta.pop("tma_min_block_sizes", None)
+            self.tp_meta.pop("tma_min_block_sizes", None)
 
         self._filter_pdl(self.body)
 
@@ -1776,7 +1778,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
                     config={self.fixed_config.config!r},
                     filename=__file__,
                     triton_meta={triton_meta!r},
-                    inductor_meta={inductor_meta!r}
+                    tp_meta={tp_meta!r}
                 )
                 @triton.jit
             """
@@ -1788,7 +1790,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
                     reduction_hint={reduction_hint},
                     filename=__file__,
                     triton_meta={triton_meta!r},
-                    inductor_meta={inductor_meta!r}
+                    tp_meta={tp_meta!r}
                 )
                 @triton.jit
             """
@@ -1800,7 +1802,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
                     size_hints={size_hints!r}, {tile_hint}
                     filename=__file__,
                     triton_meta={triton_meta!r},
-                    inductor_meta={inductor_meta!r},
+                    tp_meta={tp_meta!r},
                     min_elem_per_thread={self.min_elem_per_thread}
                 )
                 @triton.jit
@@ -1823,7 +1825,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
         if config.benchmark_kernel:
             code.splice(
                 self.codegen_kernel_benchmark(
-                    inductor_meta.get("kernel_num_gb")  # type: ignore[arg-type]
+                    tp_meta.get("kernel_num_gb")  # type: ignore[arg-type]
                 )
             )
 
@@ -2395,7 +2397,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
         sorter_indices: CSEVariable | None = None,
     ) -> CSEVariable:
         """
-        See [Note: Inductor bucketize op]
+        See [Note: bucketize op]
         """
 
         # Triton performance for bucketize_binary_search is much better when the number
@@ -2687,7 +2689,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
             shape=out_shape,
         )
 
-    def inductor_meta_per_kernel(self) -> dict[str, Any]:
+    def tp_meta_per_kernel(self) -> dict[str, Any]:
         """
         Used by both standalone codegen_kernel() and ComboKernel.combo_grid_meta()
         (which calls this on each sub_kernel).
@@ -5089,8 +5091,13 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
         for arg, arg_signature in zip(call_args, arg_signatures):
             if isinstance(arg_signature, TensorArg):
                 if V.graph.cpp_wrapper:
+                    buf = V.graph.get_buffer(arg_signature.buffer)
+                    numel = functools.reduce(
+                        operator.mul, buf.get_size(), sympy.Integer(1)
+                    )
+                    numel_expr = V.graph.wrapper_code.codegen_sizevar(numel)
                     wrapper.writeline(
-                        f'AOTI_TORCH_ERROR_CODE_CHECK(aoti_torch_check_inf_and_nan("{arg}", {arg}));'
+                        f'TP_CHECK(!tensorplay::generated::tp_has_inf_or_nan("{arg}", {arg}, {numel_expr}), "inf or nan found in {arg}");'
                     )
                 else:
                     line = f"assert not {arg}.isnan().any().item()"
@@ -5986,8 +5993,13 @@ def triton_store_type(dtype) -> str:
         for arg, arg_signature in zip(call_args, arg_signatures):
             if isinstance(arg_signature, TensorArg):
                 if V.graph.cpp_wrapper:
+                    buf = V.graph.get_buffer(arg_signature.buffer)
+                    numel = functools.reduce(
+                        operator.mul, buf.get_size(), sympy.Integer(1)
+                    )
+                    numel_expr = V.graph.wrapper_code.codegen_sizevar(numel)
                     wrapper.writeline(
-                        f'AOTI_TORCH_ERROR_CODE_CHECK(aoti_torch_check_inf_and_nan("{arg}", {arg}));'
+                        f'TP_CHECK(!tensorplay::generated::tp_has_inf_or_nan("{arg}", {arg}, {numel_expr}), "inf or nan found in {arg}");'
                     )
                 else:
                     line = f"assert not {arg}.isnan().any().item()"
@@ -6408,7 +6420,7 @@ class TMACompatibilityChecker:
     dtype: tp.dtype
     for_store: bool
     force: bool
-    # Inductor buffer name being loaded from / stored to.
+    # Buffer name being loaded from / stored to.
     buffer_name: str | None = None
 
     def __post_init__(self):
@@ -7908,7 +7920,7 @@ class TritonOverrides(OpOverrides):
         if constraints is None:
             constraints = ", ".join(["=r"] + ["r" for _ in inputs])
 
-        # Inductor computes bf16/fp16 in fp32. For "h" (16-bit register)
+        # The compiler computes bf16/fp16 in fp32. For "h" (16-bit register)
         # constraints, cast back to the original dtype so the asm sees the
         # right register type.
         constraint_parts = [p.strip() for p in constraints.split(",")]

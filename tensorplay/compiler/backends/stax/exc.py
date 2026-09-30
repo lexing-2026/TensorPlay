@@ -162,8 +162,8 @@ class GPUTooOldForTriton(ShortenTraceback):
         )
 
 
-class InductorError(BackendCompilerFailed):
-    backend_name = "inductor"
+class CompilerError(BackendCompilerFailed):
+    backend_name = "tp"
 
     def __init__(
         self,

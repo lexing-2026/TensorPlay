@@ -38,13 +38,13 @@ class PointwiseHeuristic(CodegenConfigHeuristics):
         triton_config_fn: Callable[..., Any],
         hinted_configs: list[Any],
         tile_hint: TileHint | None = None,
-        inductor_meta: dict[str, Any] | None = None,
+        tp_meta: dict[str, Any] | None = None,
     ) -> list[Any]:
-        inductor_meta = inductor_meta or {}
+        tp_meta = tp_meta or {}
         n = len(size_hints)
         if n == 1:
             return self._configs_1d(
-                size_hints, bs, hinted_configs, triton_config_fn, inductor_meta
+                size_hints, bs, hinted_configs, triton_config_fn, tp_meta
             )
         if n == 2:
             return self._configs_2d(
@@ -53,20 +53,20 @@ class PointwiseHeuristic(CodegenConfigHeuristics):
                 hinted_configs,
                 triton_config_fn,
                 tile_hint,
-                inductor_meta,
+                tp_meta,
             )
         if n == 3:
             return self._configs_3d(
-                size_hints, bs, hinted_configs, triton_config_fn, inductor_meta
+                size_hints, bs, hinted_configs, triton_config_fn, tp_meta
             )
         raise NotImplementedError(f"size_hints: {size_hints}")
 
     def _configs_1d(
-        self, size_hints, bs, hinted_configs, triton_config_fn, inductor_meta
+        self, size_hints, bs, hinted_configs, triton_config_fn, tp_meta
     ):
-        if not inductor_meta.get("autotune_pointwise", True) and not (
-            inductor_meta.get("max_autotune")
-            or inductor_meta.get("max_autotune_pointwise")
+        if not tp_meta.get("autotune_pointwise", True) and not (
+            tp_meta.get("max_autotune")
+            or tp_meta.get("max_autotune_pointwise")
         ):
             return [triton_config_fn(size_hints, bs)]
         return [
@@ -76,14 +76,14 @@ class PointwiseHeuristic(CodegenConfigHeuristics):
         ]
 
     def _configs_2d(
-        self, size_hints, bs, hinted_configs, triton_config_fn, tile_hint, inductor_meta
+        self, size_hints, bs, hinted_configs, triton_config_fn, tile_hint, tp_meta
     ):
         if (
-            not inductor_meta.get("autotune_pointwise", True)
+            not tp_meta.get("autotune_pointwise", True)
             or tile_hint == TileHint.SQUARE
         ) and not (
-            inductor_meta.get("max_autotune")
-            or inductor_meta.get("max_autotune_pointwise")
+            tp_meta.get("max_autotune")
+            or tp_meta.get("max_autotune_pointwise")
         ):
             return [triton_config_fn(size_hints, 32, 32)]
         return [
@@ -97,11 +97,11 @@ class PointwiseHeuristic(CodegenConfigHeuristics):
         ]
 
     def _configs_3d(
-        self, size_hints, bs, hinted_configs, triton_config_fn, inductor_meta
+        self, size_hints, bs, hinted_configs, triton_config_fn, tp_meta
     ):
         if not (
-            inductor_meta.get("max_autotune")
-            or inductor_meta.get("max_autotune_pointwise")
+            tp_meta.get("max_autotune")
+            or tp_meta.get("max_autotune_pointwise")
         ):
             return [triton_config_fn(size_hints, 16, 16, 16)]
         return [
@@ -129,10 +129,10 @@ class ROCmPointwiseHeuristic(PointwiseHeuristic):
     """
 
     def _configs_1d(
-        self, size_hints, bs, hinted_configs, triton_config_fn, inductor_meta
+        self, size_hints, bs, hinted_configs, triton_config_fn, tp_meta
     ):
         configs = super()._configs_1d(
-            size_hints, bs, hinted_configs, triton_config_fn, inductor_meta
+            size_hints, bs, hinted_configs, triton_config_fn, tp_meta
         )
         if len(configs) > 1:
             configs.extend(
@@ -151,7 +151,7 @@ class ROCmPointwiseHeuristic(PointwiseHeuristic):
                     ),
                 ]
             )
-            if inductor_meta.get("atomic_add_found"):
+            if tp_meta.get("atomic_add_found"):
                 configs.append(
                     triton_config_fn(
                         size_hints,
@@ -163,12 +163,12 @@ class ROCmPointwiseHeuristic(PointwiseHeuristic):
         return configs
 
     def _configs_2d(
-        self, size_hints, bs, hinted_configs, triton_config_fn, tile_hint, inductor_meta
+        self, size_hints, bs, hinted_configs, triton_config_fn, tile_hint, tp_meta
     ):
         # ROCm doesn't skip autotune for SQUARE tile hints
-        if not inductor_meta.get("autotune_pointwise", True) and not (
-            inductor_meta.get("max_autotune")
-            or inductor_meta.get("max_autotune_pointwise")
+        if not tp_meta.get("autotune_pointwise", True) and not (
+            tp_meta.get("max_autotune")
+            or tp_meta.get("max_autotune_pointwise")
         ):
             return [triton_config_fn(size_hints, 32, 32)]
         return [
@@ -198,10 +198,10 @@ class XPUPointwiseHeuristic(PointwiseHeuristic):
     """Pointwise configs for XPU devices."""
 
     def _configs_1d(
-        self, size_hints, bs, hinted_configs, triton_config_fn, inductor_meta
+        self, size_hints, bs, hinted_configs, triton_config_fn, tp_meta
     ):
         configs = super()._configs_1d(
-            size_hints, bs, hinted_configs, triton_config_fn, inductor_meta
+            size_hints, bs, hinted_configs, triton_config_fn, tp_meta
         )
         if len(configs) > 1:
             configs.append(
@@ -211,12 +211,12 @@ class XPUPointwiseHeuristic(PointwiseHeuristic):
         return configs
 
     def _configs_2d(
-        self, size_hints, bs, hinted_configs, triton_config_fn, tile_hint, inductor_meta
+        self, size_hints, bs, hinted_configs, triton_config_fn, tile_hint, tp_meta
     ):
         # XPU doesn't skip autotune for SQUARE tile hints
-        if not inductor_meta.get("autotune_pointwise", True) and not (
-            inductor_meta.get("max_autotune")
-            or inductor_meta.get("max_autotune_pointwise")
+        if not tp_meta.get("autotune_pointwise", True) and not (
+            tp_meta.get("max_autotune")
+            or tp_meta.get("max_autotune_pointwise")
         ):
             return [triton_config_fn(size_hints, 32, 32)]
         return [
@@ -234,7 +234,7 @@ class XPUPointwiseHeuristic(PointwiseHeuristic):
         ]
 
     def _configs_3d(
-        self, size_hints, bs, hinted_configs, triton_config_fn, inductor_meta
+        self, size_hints, bs, hinted_configs, triton_config_fn, tp_meta
     ):
         # XPU always uses full set of configs (no autotune gate)
         return [

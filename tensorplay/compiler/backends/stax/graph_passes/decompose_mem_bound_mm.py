@@ -15,7 +15,7 @@ from ..pattern_matcher import Arg, CallFunction, Match, register_graph_pattern
 from .split_cat import construct_pattern_matcher_pass
 
 
-aten = tp.ops.tp
+tp_ops = tp.ops.tp
 log = logging.getLogger(__name__)
 
 # TODO: need a better strategy for decomposing mm
@@ -56,7 +56,7 @@ def check_device(a: Tensor, b: Tensor, device="cuda") -> bool:
 def realize_inputs(inputs: list[Node]):
     for inp in inputs:
         if isinstance(inp, Node):
-            inp.meta["inductor_realize_to_strides"] = True
+            inp.meta["tp_realize_to_strides"] = True
 
 
 def should_decompose_bmm(mat1, mat2) -> bool:
@@ -223,7 +223,7 @@ def print_decompose_pattern(match: Match, inputs: list[Node]):
 
 
 @register_graph_pattern(
-    CallFunction(aten.bmm, Arg(), Arg()),
+    CallFunction(tp_ops.bmm, Arg(), Arg()),
     pass_dict=construct_pattern_matcher_pass("decompose_mm_pass"),
 )
 def decompose_bmm(match: Match, mat1: Node, mat2: Node):
@@ -233,7 +233,7 @@ def decompose_bmm(match: Match, mat1: Node, mat2: Node):
         )
 
     if should_decompose_bmm(mat1, mat2):
-        counters["inductor"]["decompose_bmm"] += 1
+        counters["tp"]["decompose_bmm"] += 1
         # pyrefly: ignore [bad-argument-type]
         match.replace_by_example(repl, [mat1, mat2])
         print_decompose_pattern(match, [mat1, mat2])
@@ -242,7 +242,7 @@ def decompose_bmm(match: Match, mat1: Node, mat2: Node):
 
 
 @register_graph_pattern(
-    CallFunction(aten.addmm, Arg(), Arg(), Arg()),
+    CallFunction(tp_ops.addmm, Arg(), Arg(), Arg()),
     pass_dict=construct_pattern_matcher_pass("decompose_mm_pass"),
 )
 def decompose_addmm(
@@ -257,7 +257,7 @@ def decompose_addmm(
         )
 
     if should_decompose_mm(mat2, mat3):
-        counters["inductor"]["decompose_addmm"] += 1
+        counters["tp"]["decompose_addmm"] += 1
         # pyrefly: ignore [bad-argument-type]
         match.replace_by_example(repl, [mat1, mat2, mat3])
         print_decompose_pattern(match, [mat1, mat2, mat3])
@@ -266,7 +266,7 @@ def decompose_addmm(
 
 
 @register_graph_pattern(
-    CallFunction(aten.mm, Arg(), Arg()),
+    CallFunction(tp_ops.mm, Arg(), Arg()),
     pass_dict=construct_pattern_matcher_pass("decompose_mm_pass"),
 )
 def decompose_mm(
@@ -278,7 +278,7 @@ def decompose_mm(
         return tp.sum(mat1[:, :, None] * mat2[None, :, :], dim=-2).to(mat1.dtype)
 
     if should_decompose_mm(mat1, mat2):
-        counters["inductor"]["decompose_mm"] += 1
+        counters["tp"]["decompose_mm"] += 1
         # pyrefly: ignore [bad-argument-type]
         match.replace_by_example(repl, [mat1, mat2])
         print_decompose_pattern(match, [mat1, mat2])

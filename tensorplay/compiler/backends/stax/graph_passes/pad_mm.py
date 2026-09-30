@@ -60,7 +60,7 @@ def is_contiguous_or_false(a):
     return _is_contiguous(a, False)
 
 
-aten = tp.ops.tp
+tp_ops = tp.ops.tp
 
 
 # This flag is only used for testing purpose.
@@ -163,11 +163,11 @@ def can_pad(
 
     # Calculate padding lengths to check if padding is needed
     with no_dispatch():
-        if op is aten.mm or op is aten.addmm:
+        if op is tp_ops.mm or op is tp_ops.addmm:
             m = mat1.shape[0]
             k = mat1.shape[1]
             n = mat2.shape[1]
-        elif op is aten.bmm:
+        elif op is tp_ops.bmm:
             m = mat1.shape[1]
             k = mat1.shape[2]
             n = mat2.shape[2]
@@ -220,7 +220,7 @@ def pad_dim(x: tp.Tensor, padded_length: int, dim: int) -> Tensor:
 def addmm_pattern(
     input: tp.Tensor, mat1: tp.Tensor, mat2: tp.Tensor, beta: float, alpha: float
 ) -> Tensor:
-    return aten.addmm(input, mat1, mat2, beta=beta, alpha=alpha)
+    return tp_ops.addmm(input, mat1, mat2, beta=beta, alpha=alpha)
 
 
 def _is_statically_expandable_to(shape: tp.Size, desired: Sequence[Any]) -> bool:
@@ -243,7 +243,7 @@ def should_pad_addmm(match: Match) -> bool:
         )
     ):
         return False
-    return should_pad(match, mat1, mat2, aten.addmm, input=input)
+    return should_pad(match, mat1, mat2, tp_ops.addmm, input=input)
 
 
 def pad_addmm(
@@ -279,7 +279,7 @@ def pad_addmm(
         if m_padded_length != 0 and input.dim() == 2 and input.shape[0] != 1:
             input = pad_dim(input, m_padded_length, 0)
 
-    res = aten.addmm(input, mat1, mat2, beta=beta, alpha=alpha)
+    res = tp_ops.addmm(input, mat1, mat2, beta=beta, alpha=alpha)
 
     if m_padded_length != 0:
         res = res[:-m_padded_length, :]
@@ -433,20 +433,20 @@ def should_exclude_padding_time(match: Match, arg_name: str) -> bool:
     # first dimension padding. non-first we would still need a copy
     # because these outputs are fixed dense.
     cannot_plan_output = [
-        aten.mm.default,
-        aten.convolution.default,
-        aten.convolution_backward.default,
-        aten.bmm.default,
-        aten.addmm.default,
-        aten._scaled_dot_product_flash_attention.default,
-        aten._scaled_dot_product_efficient_attention.default,
+        tp_ops.mm.default,
+        tp_ops.convolution.default,
+        tp_ops.convolution_backward.default,
+        tp_ops.bmm.default,
+        tp_ops.addmm.default,
+        tp_ops._scaled_dot_product_flash_attention.default,
+        tp_ops._scaled_dot_product_efficient_attention.default,
     ]
 
     if node_def.target in cannot_plan_output:
         return False
 
     if (
-        node_def.target is aten.cat.default
+        node_def.target is tp_ops.cat.default
         and len(node_def.all_input_nodes)
         > config.max_pointwise_cat_inputs
     ):
@@ -470,7 +470,7 @@ def is_padded_faster(key: str, ori_time: float, pad_time: float) -> bool:
         multiplier = config.post_grad_fusion_options[
             "shape_padding_multiplier"
         ].get("value", 1.1)
-        counters["inductor"]["shape_padding_multiplier"] += 1
+        counters["tp"]["shape_padding_multiplier"] += 1
     padded_is_faster = _skip_do_bench_times or ori_time > pad_time * multiplier
     set_cached_should_pad(key, padded_is_faster)
     return padded_is_faster
@@ -479,7 +479,7 @@ def is_padded_faster(key: str, ori_time: float, pad_time: float) -> bool:
 def should_pad_mm_bf16(dtype: tp.dtype, M: int, N: int, K: int) -> bool:
     # always force pad for mm with bf16 when the following are satisfied to avoid perf regression
     large_k_threshold_to_pad = config.post_grad_fusion_options[
-        "pad_aten_mm_pass"
+        "pad_tp_mm_pass"
     ].get("k_threshold_to_pad", 8388608)
     if (
         dtype is tp.bfloat16
@@ -509,7 +509,7 @@ def should_pad(
 
     # Small-K/N mm is lowered to a fused pointwise kernel in tuned_mm.
     # Leave those shapes unpadded and let the pointwise lowering handle them.
-    if op is aten.mm:
+    if op is tp_ops.mm:
         from ..kernel.mm_common import _use_small_mm_pointwise
 
         m, k, n = mat1.shape[0], mat1.shape[1], mat2.shape[1]
@@ -548,14 +548,14 @@ def _should_pad(
     do_bench = get_do_bench()
 
     with no_dispatch():
-        if op is aten.mm or op is aten.addmm:
+        if op is tp_ops.mm or op is tp_ops.addmm:
             m = mat1.shape[0]
             k = mat1.shape[1]
             n = mat2.shape[1]
             k_padded_length = get_padded_length(k, get_alignment_size(mat1))
             n_padded_length = get_padded_length(n, get_alignment_size(mat2))
             m_padded_length = get_padded_length(m, get_alignment_size(mat1))
-        elif op is aten.bmm:
+        elif op is tp_ops.bmm:
             m = mat1.shape[1]
             k = mat1.shape[2]
             n = mat2.shape[2]
@@ -571,7 +571,7 @@ def _should_pad(
 
         # Performance heuristic for bf16 large K scenarios
         if (
-            "pad_aten_mm_pass" in config.post_grad_fusion_options
+            "pad_tp_mm_pass" in config.post_grad_fusion_options
             and should_pad_mm_bf16(mat1.dtype, m_concrete, n_concrete, k_concrete)
         ):
             return True
@@ -610,14 +610,14 @@ def _should_pad(
             match, mat1, mat2, op, input, is_base_time_key=True
         )
         ori_time = get_cached_base_mm_benchmark_time(ori_time_key)
-        if ori_time is None and op is aten.addmm and input is not None:
+        if ori_time is None and op is tp_ops.addmm and input is not None:
             # realize bias for addmm
             input = realize_tensor(input)
 
         mat1_pad = mat1
         mat2_pad = mat2
 
-        is_bmm = op is aten.bmm
+        is_bmm = op is tp_ops.bmm
 
         mat1_pre_padded = should_exclude_padding_time(match, "mat1")
         fns = []
@@ -654,7 +654,7 @@ def _should_pad(
 
             fns.append(write_pad)
 
-        if op is aten.addmm:
+        if op is tp_ops.addmm:
             input_pad = None
             if input is not None and (input.is_cuda or input.is_xpu):
                 input_pad = tp.randn_like(input)
@@ -670,7 +670,7 @@ def _should_pad(
                     mat2_pre_padded=mat2_pre_padded,
                 )
             )
-        elif op is aten.mm:
+        elif op is tp_ops.mm:
             fns.append(
                 lambda: pad_mm(
                     mat1_pad,
@@ -696,7 +696,7 @@ def _should_pad(
             )
 
         def orig_bench_fn():
-            if op is aten.bmm or op is aten.mm:
+            if op is tp_ops.bmm or op is tp_ops.mm:
                 op(mat1, mat2)
             else:
                 op(input, mat1, mat2)
@@ -707,7 +707,7 @@ def _should_pad(
 
         if (
             config.run_autoheuristic("pad_mm")
-            and op is aten.mm
+            and op is tp_ops.mm
         ):
             ah_should_pad = run_autoheuristic(
                 mat1,
@@ -737,7 +737,7 @@ def _should_pad(
 
         pad_time = do_bench(pad_bench_fn)
 
-        counters["inductor"]["pad_mm_bench"] += 1
+        counters["tp"]["pad_mm_bench"] += 1
         return is_padded_faster(key, ori_time, pad_time)
 
 
@@ -845,12 +845,12 @@ def run_autoheuristic(
 
 
 def mm_pattern(mat1: tp.Tensor, mat2: tp.Tensor) -> Tensor:
-    return aten.mm(mat1, mat2)
+    return tp_ops.mm(mat1, mat2)
 
 
 def should_pad_mm(match: Match) -> bool:
     mat1, mat2 = fetch_fake_tensors(match, ("mat1", "mat2"))
-    return should_pad(match, mat1, mat2, aten.mm)
+    return should_pad(match, mat1, mat2, tp_ops.mm)
 
 
 def pad_mat1(
@@ -861,7 +861,7 @@ def pad_mat1(
         pad_arg = [0, k_padded_length, 0, m_padded_length]
         if is_bmm:
             pad_arg.extend((0, 0))
-        return aten.constant_pad_nd(mat1, pad_arg)
+        return tp_ops.constant_pad_nd(mat1, pad_arg)
     else:
         return mat1
 
@@ -874,7 +874,7 @@ def pad_mat2(
         pad_arg = [0, n_padded_length, 0, k_padded_length]
         if is_bmm:
             pad_arg.extend((0, 0))
-        return aten.constant_pad_nd(mat2, pad_arg)
+        return tp_ops.constant_pad_nd(mat2, pad_arg)
     else:
         return mat2
 
@@ -896,7 +896,7 @@ def pad_mm(
         mat2 = pad_mat2(
             mat2, k_padded_length=k_padded_length, n_padded_length=n_padded_length
         )
-    res = aten.mm(mat1, mat2)
+    res = tp_ops.mm(mat1, mat2)
     if m_padded_length != 0:
         res = res[:-m_padded_length, :]
     if n_padded_length != 0:
@@ -918,12 +918,12 @@ def mm_replace(mat1: tp.Tensor, mat2: tp.Tensor) -> Tensor:
 
 
 def bmm_pattern(mat1: tp.Tensor, mat2: tp.Tensor) -> Tensor:
-    return aten.bmm(mat1, mat2)
+    return tp_ops.bmm(mat1, mat2)
 
 
 def should_pad_bmm(match: Match) -> bool:
     mat1, mat2 = fetch_fake_tensors(match, ("mat1", "mat2"))
-    return should_pad(match, mat1, mat2, aten.bmm)
+    return should_pad(match, mat1, mat2, tp_ops.bmm)
 
 
 def pad_bmm(
@@ -949,7 +949,7 @@ def pad_bmm(
             n_padded_length=n_padded_length,
             is_bmm=True,
         )
-    res = aten.bmm(mat1, mat2)
+    res = tp_ops.bmm(mat1, mat2)
     if m_padded_length != 0:
         res = res[:, :-m_padded_length, :]
     if n_padded_length != 0:

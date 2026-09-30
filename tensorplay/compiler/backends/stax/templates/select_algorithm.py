@@ -46,7 +46,7 @@ from ..ir import (
 from ..loops import V
 from ..ir import ChoiceCaller, TritonTemplateCallerBase
 from ..codegen.common import CSEVariable
-from .mm_common import use_aten_gemm_kernels
+from .mm_common import use_tp_gemm_kernels
 from ..loops import contiguous_strides, dtype_name
 from ..heuristics.template.params import DictKernelTemplateParams, KernelTemplateParams
 from ..runtime.triton_helpers import get_constexprs
@@ -905,7 +905,7 @@ class TritonChoiceCaller(ChoiceCaller):
                  launcher_args: tuple | None = None,
                  num_stages: int = 2, num_warps: int = 4,
                  config: dict | None = None, operands: dict | None = None,
-                 inductor_meta: dict | None = None, template: Any = None,
+                 tp_meta: dict | None = None, template: Any = None,
                  make_kernel_render: Callable[[], Any] | None = None,
                  mutated_inputs: tuple = (),
                  allowed_prologue_inps: Any = None):
@@ -923,7 +923,7 @@ class TritonChoiceCaller(ChoiceCaller):
         #: thing changed rather than guessed at again from the shape.
         self.config = dict(config or {})
         self.operands = dict(operands or {})
-        self.inductor_meta = dict(inductor_meta or {})
+        self.tp_meta = dict(tp_meta or {})
         self.template = template
         #: The text this kernel's body is written out by, the inputs it is
         #: allowed to read, and the inputs it writes rather than reads.  Carried
@@ -1039,7 +1039,7 @@ class TritonChoiceCaller(ChoiceCaller):
         """
 
         config = {**self.config, "num_stages": max(1, int(self.stages) - 1)}
-        meta = {**self.inductor_meta}
+        meta = {**self.tp_meta}
         result = _compile_rendered(
             self.template,
             self.source,
@@ -1050,7 +1050,7 @@ class TritonChoiceCaller(ChoiceCaller):
                 if k not in ("num_stages", "num_warps", "layout",
                              "input_nodes", "out_size")
             },
-            inductor_meta=meta,
+            tp_meta=meta,
         )
         if result is None:
             raise NotImplementedError(
@@ -1071,7 +1071,7 @@ class TritonChoiceCaller(ChoiceCaller):
             num_warps=int(self.warps),
             config=config,
             operands=self.operands,
-            inductor_meta=meta,
+            tp_meta=meta,
             template=self.template,
         ).bind(launcher)
 
@@ -1578,25 +1578,25 @@ class TritonTemplateKernel(TritonKernel):
         else:
             self.triton_meta.update(triton_meta)
 
-        inductor_meta = {
+        tp_meta = {
             "kernel_name": str(Placeholder.DESCRIPTIVE_NAME),
-            **self.inductor_meta_common(),
+            **self.tp_meta_common(),
             **FixedGrid.setup_grid_as_args(),
         }
         if config.profile_bandwidth or config.benchmark_kernel:
             num_gb = self.estimate_kernel_num_bytes() / 1e9
-            inductor_meta["kernel_num_gb"] = num_gb
+            tp_meta["kernel_num_gb"] = num_gb
         if config.benchmark_kernel:
             flops = self.estimate_flops()
-            inductor_meta["kernel_flop"] = flops
+            tp_meta["kernel_flop"] = flops
 
-        inductor_meta["config_args"] = self.meta
+        tp_meta["config_args"] = self.meta
 
         template_args = f"""
             num_stages={self.num_stages},
             num_warps={self.num_warps},
             triton_meta={self.triton_meta!r},
-            inductor_meta={inductor_meta!r},
+            tp_meta={tp_meta!r},
         """
 
         if HAS_WARP_SPEC:
@@ -2402,13 +2402,13 @@ class TritonTemplateKernel(TritonKernel):
             wrapper.generate_workspace_allocation(self.workspace_arg)
 
         # Use FixedGrid which properly handles grid values passed as arguments
-        inductor_meta = FixedGrid.setup_grid_as_args() if additional_call_args else None
+        tp_meta = FixedGrid.setup_grid_as_args() if additional_call_args else None
         wrapper.generate_kernel_call(
             name,
             call_args,
             arg_types=arg_types,
             triton_meta=self.triton_meta,
-            inductor_meta=inductor_meta,
+            tp_meta=tp_meta,
             triton=True,
         )
         self._emit_post_kernel_code(wrapper, name)
@@ -2460,7 +2460,7 @@ class TritonTemplateKernel(TritonKernel):
         if isinstance(layout, FlexibleLayout) and not isinstance(
             node, ReinterpretView
         ):
-            if not use_aten_gemm_kernels() or self.always_freeze_layout:
+            if not use_tp_gemm_kernels() or self.always_freeze_layout:
                 # No framework fallback available, or the caller has said to
                 # always freeze, so settle it now.
                 node.data.freeze_layout()
@@ -2779,7 +2779,7 @@ class TritonTemplateKernel(TritonKernel):
 
 
 def _compile_rendered(template, source: str, config: dict, constants: dict,
-                      inductor_meta: dict):
+                      tp_meta: dict):
     """The rendered text, compiled the way a configuration is compiled.
 
     Two things are handed to the runtime: the signature, which is the name and
@@ -2820,7 +2820,7 @@ def _compile_rendered(template, source: str, config: dict, constants: dict,
         }
         all_constants.setdefault("INDEX_DTYPE", _language_type(template.index_dtype))
         triton_meta = {
-            "device": DeviceProperties.create(inductor_meta["device"]),
+            "device": DeviceProperties.create(tp_meta["device"]),
             "signature": signature,
             "constants": {
                 name: value
@@ -2846,7 +2846,7 @@ def _compile_rendered(template, source: str, config: dict, constants: dict,
             mutated_arg_names=[],
             optimize_mem=False,
             heuristic_type=None,
-            inductor_meta=inductor_meta,
+            tp_meta=tp_meta,
         )
         return tuner._precompile_config(tuner.configs[0])
     except Exception:
@@ -5633,7 +5633,7 @@ class AlgorithmSelectorCache(PersistentCache):
             candidates took, and then asks again, is asking the same question.
             """
             log.debug("Waiting on futures")
-            counters["inductor"]["select_algorithm_precompile"] += 1
+            counters["tp"]["select_algorithm_precompile"] += 1
             exceptions: list = []
             try:
                 for future in as_completed(
@@ -5641,7 +5641,7 @@ class AlgorithmSelectorCache(PersistentCache):
                     timeout=precompilation_timeout_seconds,
                 ):
                     if e := future.exception():
-                        counters["inductor"][
+                        counters["tp"][
                             "select_algorithm_num_precompilation_exceptions"
                         ] += 1
                         exceptions.append((futures[future], e))
@@ -5653,7 +5653,7 @@ class AlgorithmSelectorCache(PersistentCache):
                         )
                         futures[future].mark_failed()
                     else:
-                        counters["inductor"]["select_algorithm_num_precompiles"] += 1
+                        counters["tp"]["select_algorithm_num_precompiles"] += 1
                         log.info(
                             "Precompiling benchmark choice %s took %.02fs",
                             futures.get(future),

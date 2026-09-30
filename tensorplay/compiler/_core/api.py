@@ -33,8 +33,8 @@ from tensorplay.graph.passes import (
     ShapeProp,
 )
 from tensorplay.graph.passes.dialect.common import CSEPass, get_CSE_banned_ops
-from tensorplay.graph.passes.regional_inductor_invoke_subgraph import (
-    regional_inductor_invoke_subgraph,
+from tensorplay.graph.passes.regional_compile_invoke_subgraph import (
+    regional_compile_invoke_subgraph,
 )
 from .registry import CompilerFn, get_default_backend, lookup_backend
 from .region_cache import (
@@ -819,7 +819,7 @@ def _compile_region(
         backend_kwargs,
     )
 
-    regional_inductor_invoke_subgraph(
+    regional_compile_invoke_subgraph(
         graph_module,
         compiler=compiler_fn,
         compiler_kwargs=backend_kwargs,

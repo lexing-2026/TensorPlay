@@ -17,7 +17,7 @@ class CustomPassBase(ABC):
     """
     Implement this interface for custom passes:
 
-    The uuid() method enables inductor to cache compiled graphs when your custom
+    The uuid() method enables the compiler to cache compiled graphs when your custom
     passes are applied. This method can return any identifier as long as it uniquely
     identifies your implementation (and can be pickled). The caching logic includes this
     identifier in its key calculation, i.e., any new value will effectively invalidate
@@ -47,7 +47,7 @@ class CustomPassBase(ABC):
     def uuid(self) -> Any | None:
         """
         Return an ID to uniquely identify your custom pass implementation. Return None
-        to skip inductor code caching entirely.
+        to skip tp code caching entirely.
         """
 
 
@@ -200,7 +200,7 @@ class CustomPartitionerFn(CustomPassBase):
     def uuid(self) -> Any | None:
         """
         Return an ID to uniquely identify your custom partitioner implementation.
-        Return None to skip inductor code caching entirely.
+        Return None to skip tp code caching entirely.
         """
 
 

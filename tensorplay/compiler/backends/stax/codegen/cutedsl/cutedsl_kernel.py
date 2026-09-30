@@ -459,7 +459,7 @@ class CuteDSLTemplateKernel(Kernel):
         """Generate code to set __cute_hash__ on a codegen function.
 
         This allows hash_callable in flash_attn to skip expensive runtime hashing
-        for Inductor-generated functions. The hash is based on the kernel name
+        for compiler-generated functions. The hash is based on the kernel name
         which already contains a unique hash suffix.
         """
         hash_value = f"{self.kernel_name}_{suffix}" if suffix else self.kernel_name
@@ -1160,7 +1160,7 @@ class ModificationWrapperCuteDSL(WrapperHandler):  # type: ignore[name-defined]
                 {bar}
                 UNSUPPORTED CUTEDSL OPERATION: '{name}'
                 {bar}
-                This operation is not yet implemented in Inductor.
+                This operation is not yet implemented in the compiler.
 
                 Please report this with the expression that produced it
                 with the following information:

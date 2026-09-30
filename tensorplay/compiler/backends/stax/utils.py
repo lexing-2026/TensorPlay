@@ -534,14 +534,14 @@ class IndentedBuffer:
         self.writeline(line)
 
     def writeline_aot(self, line: LineContext | DeferredLineBase | str) -> None:
-        """Write to AOTI buffer only. No-op on a plain IndentedBuffer."""
+        """Write to the ahead-of-time buffer only. No-op on a plain IndentedBuffer."""
 
     def splice_jit(self, other_code: IndentedBuffer | str, strip: bool = False) -> None:
         """Splice to JIT buffer only. On a plain IndentedBuffer, same as splice."""
         self.splice(other_code, strip=strip)
 
     def splice_aot(self, other_code: IndentedBuffer | str, strip: bool = False) -> None:
-        """Splice to AOTI buffer only. No-op on a plain IndentedBuffer."""
+        """Splice to the ahead-of-time buffer only. No-op on a plain IndentedBuffer."""
 
     def writelines(self, lines: Sequence[LineContext | DeferredLineBase | str]) -> None:
         for line in lines:
@@ -960,10 +960,10 @@ def get_fused_kernel_name(node_schedule, descriptive_names) -> str:
     """
 
     all_origins = aggregate_origins(node_schedule)
-    if descriptive_names == "original_aten":
+    if descriptive_names == "original":
 
         def get_origin_meta_str(origin):
-            original = origin.meta.get("original_aten")
+            original = origin.meta.get("original")
             key = ""
             if isinstance(original, tp.ops.OpOverload):
                 key = original._overloadpacket.__name__
@@ -975,7 +975,7 @@ def get_fused_kernel_name(node_schedule, descriptive_names) -> str:
             get_origin_meta_str(origin)
             for origin in all_origins
             if origin.op == "call_function"
-            and origin.meta.get("original_aten") is not None
+            and origin.meta.get("original") is not None
         ]
         sources = sorted(OrderedSet(sources))
     elif descriptive_names == "tp":
@@ -997,7 +997,7 @@ def get_fused_kernel_name(node_schedule, descriptive_names) -> str:
                 else:
                     sources.append(source_fn[1].__name__ + suffix)
         sources = sorted(OrderedSet(sources))
-    elif descriptive_names == "inductor_node":
+    elif descriptive_names == "tp_node":
         sources = [
             origin.name for origin in all_origins if origin.op == "call_function"
         ]
@@ -1428,8 +1428,8 @@ class AotOnlyBuffer(IndentedBuffer):
 def make_codegen_buffer() -> IndentedBuffer:
     """Construct the IndentedBuffer subclass matching the current codegen mode.
 
-    Dual-wrapper mode -> DualIndentedBuffer (JIT and AOTI both active).
-    Pure AOTI -> AotOnlyBuffer (writeline_aot writes; writeline_jit drops).
+    Dual-wrapper mode -> DualIndentedBuffer (JIT and ahead-of-time both active).
+    Pure ahead-of-time -> AotOnlyBuffer (writeline_aot writes; writeline_jit drops).
     Pure JIT  -> IndentedBuffer  (writeline_jit writes; writeline_aot drops).
     """
     from .loops import V
@@ -2064,12 +2064,12 @@ def expr_fits_within_32bit(e: sympy.Expr) -> bool:
     if V.graph.sizevars.statically_known_true(e <= int_max):
         return True
 
-    # AOTI doesn't guard on < 2**32, so checking hints isn't a viable option,
+    # The ahead-of-time export does not guard on < 2**32, so checking hints isn't a viable option,
     # in case the hinted value is < 2**32, but the allowed range is larger.
-    # However, to prevent possible perf regressions on pre-existing AOTI models
+    # However, to prevent possible perf regressions on pre-existing ahead-of-time models
     # which don't set an upper bound on the valid range, we'll skip the check.
     # To recap:
-    # - If using AOTI:
+    # - If using the ahead-of-time export:
     #   - If allowed range has no upper bound, then check the hint to determine
     #       whether this fits in int32
     #   - If allowed range does have an upper bound, then obey the upper bound
@@ -2237,7 +2237,7 @@ class Counters:
 
 
 counters = Counters()
-counters["inductor"]
+counters["tp"]
 
 
 #: The name a measured call is recorded under, so that the device work belonging
@@ -2245,7 +2245,7 @@ counters["inductor"]
 #: clearing around it.  A name rather than a time window because the two are
 #: recorded on different sides of the device and are matched by what was running,
 #: not by when.
-_DO_BENCH_PROFILE_EVENT_NAME = "inductor_do_bench_using_profiling"
+_DO_BENCH_PROFILE_EVENT_NAME = "tp_do_bench_using_profiling"
 
 
 def _gpu_device_module() -> Any:
@@ -2802,8 +2802,8 @@ def is_node_meta_valid(node: Any) -> bool:
 #: either needs a value only the forward graph has, or rewrites a node the
 #: backward graph has already consumed.
 OPTIMUS_EXCLUDE_POST_GRAD = [
-    "activation_quantization_aten_pass",
-    "inductor_autotune_lookup_table",
+    "activation_quantization_tp_pass",
+    "tp_autotune_lookup_table",
 ]
 
 

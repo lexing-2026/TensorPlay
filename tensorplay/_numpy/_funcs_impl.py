@@ -105,7 +105,7 @@ def _concat_cast_helper(tensors, out=None, dtype=None, casting="same_kind"):
 def _concatenate(
     tensors, axis=0, out=None, dtype=None, casting: CastingModes | None = "same_kind"
 ):
-    # pure torch implementation, used below and in cov/corrcoef below
+    # pure backend implementation, used below and in cov/corrcoef below
     tensors, axis = _util.axis_none_flatten(*tensors, axis=axis)
     tensors = _concat_cast_helper(tensors, out, dtype, casting)
     return tensorplay.cat(tensors, axis)
@@ -243,7 +243,7 @@ def _split_helper_int(tensor, indices_or_sections, axis, strict=False):
 def _split_helper_list(tensor, indices_or_sections, axis):
     if not isinstance(indices_or_sections, list):
         raise NotImplementedError("split: indices_or_sections: list")
-    # numpy expects indices, while torch expects lengths of sections
+    # numpy expects indices, while the backend expects lengths of sections
     # also, numpy appends zero-size arrays for indices above the shape[axis]
     lst = [x for x in indices_or_sections if x <= tensor.shape[axis]]
     num_extra = len(indices_or_sections) - len(lst)
@@ -551,7 +551,7 @@ def corrcoef(
 
     is_half = (xy_tensor.dtype == tensorplay.float16) and xy_tensor.is_cpu
     if is_half:
-        # work around torch's "addmm_impl_cpu_" not implemented for 'Half'"
+        # work around the backend's "addmm_impl_cpu_" not implemented for 'Half'"
         dtype = tensorplay.float32
 
     xy_tensor = _util.cast_if_needed(xy_tensor, dtype)
@@ -581,7 +581,7 @@ def cov(
 
     is_half = (m.dtype == tensorplay.float16) and m.is_cpu
     if is_half:
-        # work around torch's "addmm_impl_cpu_" not implemented for 'Half'"
+        # work around the backend's "addmm_impl_cpu_" not implemented for 'Half'"
         dtype = tensorplay.float32
 
     m = _util.cast_if_needed(m, dtype)
@@ -611,7 +611,7 @@ def _conv_corr_impl(a, v, mode):
 
     result = tensorplay.nn.functional.conv1d(aa, vv, padding=padding)
 
-    # torch returns a 2D result, numpy returns a 1D array
+    # the backend returns a 2D result, numpy returns a 1D array
     return result[0, :]
 
 
@@ -620,7 +620,7 @@ def convolve(a: ArrayLike, v: ArrayLike, mode="full"):
     if a.shape[0] < v.shape[0]:
         a, v = v, a
 
-    # flip the weights since numpy does and torch does not
+    # flip the weights since numpy does and the backend does not
     v = tensorplay.flip(v, (0,))
 
     return _conv_corr_impl(a, v, mode)
@@ -1134,8 +1134,8 @@ def fill_diagonal(a: ArrayLike, val: ArrayLike, wrap=False):
 
 
 def vdot(a: ArrayLike, b: ArrayLike, /):
-    # 1. torch only accepts 1D arrays, numpy flattens
-    # 2. torch requires matching dtype, while numpy casts (?)
+    # 1. the backend only accepts 1D arrays, numpy flattens
+    # 2. the backend requires matching dtype, while numpy casts (?)
     t_a, t_b = tensorplay.atleast_1d(a, b)
     if t_a.ndim > 1:
         t_a = t_a.flatten()
@@ -1146,7 +1146,7 @@ def vdot(a: ArrayLike, b: ArrayLike, /):
     is_half = dtype == tensorplay.float16 and (t_a.is_cpu or t_b.is_cpu)
     is_bool = dtype == tensorplay.bool
 
-    # work around torch's "dot" not implemented for 'Half', 'Bool'
+    # work around the backend's "dot" not implemented for 'Half', 'Bool'
     if is_half:
         dtype = tensorplay.float32
     elif is_bool:
@@ -1202,7 +1202,7 @@ def inner(a: ArrayLike, b: ArrayLike, /):
     is_bool = dtype == tensorplay.bool
 
     if is_half:
-        # work around torch's "addmm_impl_cpu_" not implemented for 'Half'"
+        # work around the backend's "addmm_impl_cpu_" not implemented for 'Half'"
         dtype = tensorplay.float32
     elif is_bool:
         dtype = tensorplay.uint8

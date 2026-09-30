@@ -8,7 +8,7 @@ from .logging import get_logger
 
 __all__ = [
     "create_core_store",
-    "create_c10d_store",
+    "create_tp_store",
     "get_free_port",
     "get_socket_with_port",
 ]
@@ -82,7 +82,7 @@ def _check_full_rank(store: Store, world_size: int, timeout: float) -> None:
         store.delete_key(key)
 
 
-def create_c10d_store(
+def create_tp_store(
     is_server: bool,
     server_addr: str,
     server_port: int = -1,

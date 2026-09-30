@@ -2754,9 +2754,9 @@ class CppKernel(Kernel):
     @property
     def assert_function(self) -> str:
         if V.graph.aot_mode:
-            return "AOTI_TORCH_CHECK"
+            return "TP_CHECK"
         else:
-            return "TORCH_CHECK"
+            return "TP_CHECK"
 
     def decide_parallel_depth(self, max_parallel_depth, threads):
         if self.call_ranges is None:
@@ -3717,7 +3717,7 @@ class CppVecKernel(CppKernel):
                     return f"welford_combine({var}, {next_value})"
         elif reduction_type == "welford_combine":
             if isinstance(next_value, tuple):
-                # When reading a value from Inductor IR we have a tuple of variable names
+                # When reading a value from the IR we have a tuple of variable names
                 mean, m2, weight = next_value
             else:
                 # When combining intermediate accumulators we have a Welford<T> struct
@@ -5944,8 +5944,8 @@ class CppScheduling(BaseScheduling):
         ]
         # The counter cpp_templated_kernel_counter is used for verifying if a
         # a templated kernel was successfully compiled in a UT
-        counters["inductor"]["cpp_templated_kernel_counter"] += 1
-        counters["inductor"]["cpp_epilogue_fusion_counter"] += len(epilogue_nodes)
+        counters["tp"]["cpp_templated_kernel_counter"] += 1
+        counters["tp"]["cpp_epilogue_fusion_counter"] += len(epilogue_nodes)
         if not (self.is_cpp_template(template_node)):
             raise AssertionError(
                 "Template node passed to CppScheduler.codegen_template must be a SchedulerNode that wraps a CppTemplateBuffer"

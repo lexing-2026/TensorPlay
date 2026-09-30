@@ -195,7 +195,7 @@ class FusionScore:
         )
 
 
-class InductorChoices:
+class TpChoices:
     """The policy that decides what is worth doing to a program.
 
     Nothing here is needed for an answer to be correct: a pair refused here is
@@ -448,21 +448,21 @@ class InductorChoices:
         one is the default policy, and the key says so.
         """
 
-        return ("inductor_choices",)
+        return ("tp_choices",)
 
 
-def create_inductor_choices(factory: Any) -> InductorChoices:
+def create_tp_choices(factory: Any) -> TpChoices:
     """The policy in place, which is the default one unless a program said."""
 
-    return _create_inductor_choices(factory, registered_inductor_choices())
+    return _create_tp_choices(factory, registered_tp_choices())
 
 
-def _create_inductor_choices(
+def _create_tp_choices(
     factory: Any,
     registrations: tuple,
-) -> InductorChoices:
+) -> TpChoices:
     if not registrations:
-        return InductorChoices() if factory is None else factory()
+        return TpChoices() if factory is None else factory()
 
     factories = list(registrations)
     if factory is not None:
@@ -471,19 +471,19 @@ def _create_inductor_choices(
     choices = []
     for key, choice_factory in factories:
         choice = choice_factory()
-        if not isinstance(choice, InductorChoices):
+        if not isinstance(choice, TpChoices):
             raise TypeError(
-                "Inductor choices factories must return InductorChoices instances, "
+                "Tp choices factories must return TpChoices instances, "
                 f"but {key!r} returned {type(choice)}"
             )
         choices.append(choice)
 
     if len(choices) == 1:
         return choices[0]
-    return _ComposedInductorChoices(choices)
+    return _ComposedTpChoices(choices)
 
 
-class _ComposedInductorChoices(InductorChoices):
+class _ComposedTpChoices(TpChoices):
     """Use the first contributor that overrides each policy hook.
 
     Composed rather than merged, because two policies answering the same
@@ -521,7 +521,7 @@ class _ComposedInductorChoices(InductorChoices):
                 return object.__getattribute__(self, name)
             return dispatcher
 
-        default = inspect.getattr_static(InductorChoices, name, None)
+        default = inspect.getattr_static(TpChoices, name, None)
         if name == "uuid" or not (
             callable(default) or isinstance(default, (classmethod, staticmethod))
         ):
@@ -536,7 +536,7 @@ class _ComposedInductorChoices(InductorChoices):
                 continue
             if dispatcher is not None:
                 log.warning(
-                    "InductorChoices hook %r is overridden by both %s and %s; "
+                    "TpChoices hook %r is overridden by both %s and %s; "
                     "list order selects %s",
                     name,
                     owner,
@@ -554,7 +554,7 @@ class _ComposedInductorChoices(InductorChoices):
 
     def uuid(self) -> tuple:
         return (
-            "composed_inductor_choices",
+            "composed_tp_choices",
             tuple(
                 _validate_choice_uuid(f"config:{index}", choice)()
                 for index, choice in enumerate(self._choices)
@@ -562,24 +562,24 @@ class _ComposedInductorChoices(InductorChoices):
         )
 
 
-_registered_inductor_choices: dict = {}
+_registered_tp_choices: dict = {}
 
 
-def register_inductor_choices(key: str, choice_factory: Any) -> None:
+def register_tp_choices(key: str, choice_factory: Any) -> None:
     """Add a policy to the set, under a name to refer to it by."""
 
-    _registered_inductor_choices[key] = choice_factory
+    _registered_tp_choices[key] = choice_factory
 
 
-def registered_inductor_choices() -> tuple:
-    return tuple(_registered_inductor_choices.items())
+def registered_tp_choices() -> tuple:
+    return tuple(_registered_tp_choices.items())
 
 
-def _validate_choice_uuid(key: str, choice: InductorChoices) -> Any:
+def _validate_choice_uuid(key: str, choice: TpChoices) -> Any:
     uuid = getattr(choice, "uuid", None)
     if not callable(uuid):
         raise RuntimeError(
-            f"InductorChoices contributor {key!r} does not implement uuid(). "
+            f"TpChoices contributor {key!r} does not implement uuid(). "
             "Implement uuid() for cache key participation."
         )
     return uuid

@@ -33,7 +33,7 @@ from ..ir import Layout
 from ..heuristics.template.base import TemplateConfigHeuristics
 from .mm_common import (
     check_supported_striding,
-    use_aten_gemm_kernels,
+    use_tp_gemm_kernels,
     use_triton_template,
 )
 from .select_algorithm import (
@@ -834,7 +834,7 @@ def _tuned_grouped_mm_common(operator_name: str, algorithm_name: str, extern_ker
     if use_fast_accum is None:
         use_fast_accum = False
     choices: list[ChoiceCaller] = []
-    if use_aten_gemm_kernels():
+    if use_tp_gemm_kernels():
         choices.append(aten_choice)
     _, is_nonzero = _is_static_problem(layout)
     if len(m1_size) == 2:

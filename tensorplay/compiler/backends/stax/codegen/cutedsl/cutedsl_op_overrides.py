@@ -447,7 +447,7 @@ class CuteDSLOpOverrides(OpOverrides):
 
     @staticmethod
     def mod(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
-        # Inductor ops.mod is C-style; SymPy/Python % is Python-style for
+        # The compiler's ops.mod is C-style; SymPy/Python % is Python-style for
         # negative values, so don't attach index_expr metadata here.
         return CuteDSLOpOverrides._apply_binary_op(a, b, "({a} % {b})")
 

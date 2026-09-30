@@ -217,7 +217,7 @@ class DebugMode(TensorPlayDispatchMode):
         self._output_info[op_index] = result
 
     def _record_call(self, call) -> None:
-        if _utils._IN_INDUCTOR_BENCHMARK:
+        if _utils._IN_TP_BENCHMARK:
             # A benchmark asks the backend for numbers as often as it can;
             # recording them would measure the recording.
             return
@@ -716,7 +716,7 @@ class DebugMode(TensorPlayDispatchMode):
 
     @staticmethod
     @contextlib.contextmanager
-    def _benchmarking_inductor():
+    def _benchmarking_tp():
         """Turn recording off for the duration of a measurement.
 
         Autotuning launches kernels as often as it can while looking for the
@@ -724,10 +724,10 @@ class DebugMode(TensorPlayDispatchMode):
         tried and thrown away, and measure the recording rather than the work.
         """
         try:
-            _utils._IN_INDUCTOR_BENCHMARK = True
+            _utils._IN_TP_BENCHMARK = True
             yield
         finally:
-            _utils._IN_INDUCTOR_BENCHMARK = False
+            _utils._IN_TP_BENCHMARK = False
 
     @property
     def logs(self):

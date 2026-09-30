@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from enum import auto, Enum
 from itertools import product
 
-from ... import config as inductor_config
+from ... import config as tp_config
 
 
 class TensorMapUpdateMode(Enum):
@@ -163,11 +163,11 @@ def get_groupgemm_configs() -> list[CuTeGemmConfig]:
     """
 
     if (
-        inductor_config.cutedsl_enable_autotuning
-        and inductor_config.max_autotune_gemm_search_space == "EXHAUSTIVE"
+        tp_config.cutedsl_enable_autotuning
+        and tp_config.max_autotune_gemm_search_space == "EXHAUSTIVE"
     ):
         return get_exhaustive_groupgemm_configs()
-    elif inductor_config.cutedsl_enable_autotuning:
+    elif tp_config.cutedsl_enable_autotuning:
         return get_default_groupgemm_configs()
     else:
         return [get_default_groupgemm_configs()[0]]

@@ -21,7 +21,7 @@ from ..pattern_matcher import (
 )
 
 
-aten = tp.ops.tp
+tp_ops = tp.ops.tp
 prims = tp.ops.prims
 
 #: The pattern tables the passes draw from, applied in order: a match found by
@@ -101,7 +101,7 @@ def _needs_spmd_graph_preservation() -> bool:
     )
 
 
-@register_noop_decomp(aten.slice)
+@register_noop_decomp(tp_ops.slice)
 def slice_noop(self, dim=0, start=None, end=None, step=1):
     if _needs_spmd_graph_preservation():
         # Keep no-op slices so all ranks produce identical FX graphs (SPMD)
@@ -123,7 +123,7 @@ def slice_noop(self, dim=0, start=None, end=None, step=1):
     return False
 
 
-@register_noop_decomp(aten.slice_scatter, 1)
+@register_noop_decomp(tp_ops.slice_scatter, 1)
 def slice_scatter_noop(self, src, dim=0, start=None, end=None, step=1):
     if start is None:
         start = 0
@@ -143,12 +143,12 @@ def slice_scatter_noop(self, src, dim=0, start=None, end=None, step=1):
     return False
 
 
-@register_noop_decomp(aten.repeat)
+@register_noop_decomp(tp_ops.repeat)
 def repeat_noop(self, repeats):
     return all(r == 1 for r in repeats)
 
 
-@register_noop_decomp(aten.constant_pad_nd)
+@register_noop_decomp(tp_ops.constant_pad_nd)
 def constant_pad_nd(x, padding, fill_value=0):
     if _needs_spmd_graph_preservation():
         # Keep no-op pads so all ranks produce identical FX graphs (SPMD)
@@ -164,42 +164,42 @@ def constant_pad_nd(x, padding, fill_value=0):
 # registration would have nothing to attach to.
 
 
-@register_noop_decomp([aten.ceil, aten.floor, aten.round, aten.trunc])
+@register_noop_decomp([tp_ops.ceil, tp_ops.floor, tp_ops.round, tp_ops.trunc])
 def int_noop(x):
     return is_integer_dtype(x.dtype)
 
 
-@register_noop_decomp([aten.pow])
+@register_noop_decomp([tp_ops.pow])
 def pow_noop(a, b):
     return isinstance(b, int) and b == 1
 
 
-@register_noop_decomp([aten.cat], lambda args: args[0][0])
+@register_noop_decomp([tp_ops.cat], lambda args: args[0][0])
 def cat_noop(inputs, dim=0):
     return len(inputs) == 1
 
 
-@register_noop_decomp(aten.view.default)
+@register_noop_decomp(tp_ops.view.default)
 def view_default_noop(arg, size):
     return statically_known_true(sym_eq(arg.shape, tuple(size)))
 
 
-@register_noop_decomp(aten.view.dtype)
+@register_noop_decomp(tp_ops.view.dtype)
 def view_dtype_noop(arg, dtype):
     return arg.dtype == dtype
 
 
 # Note, we also always have a check for identical metadata, which is why these
 # are safe
-@register_noop_decomp([aten.copy], nop_arg=1)
-@register_noop_decomp([aten.alias, aten.clone])
+@register_noop_decomp([tp_ops.copy], nop_arg=1)
+@register_noop_decomp([tp_ops.alias, tp_ops.clone])
 def true_noop(*args, **kwargs):
     return True
 
 
 def remove_noop_ops(graph: Graph):
     """
-    Removes both operations that are essentially aten.clone and operations that are essentially aten.alias from the graph.
+    Removes both operations that are essentially tp_ops.clone and operations that are essentially tp_ops.alias from the graph.
     """
     inputs = OrderedSet[Node]()
     input_storages = OrderedSet[int | None]()
@@ -230,7 +230,7 @@ def remove_noop_ops(graph: Graph):
             if not isinstance(src, Node):
                 continue
 
-            if node.target is aten.copy.default:
+            if node.target is tp_ops.copy.default:
                 dst = node.args[0]
                 if (
                     isinstance(dst, Node)

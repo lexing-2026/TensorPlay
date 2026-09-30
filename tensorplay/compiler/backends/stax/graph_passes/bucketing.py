@@ -29,7 +29,7 @@ from .....graph.experimental.sympy_functions import OrderedSet
 
 
 if TYPE_CHECKING:
-    from .....distributed.distributed_c10d import GroupName
+    from .....distributed.distributed_core import GroupName
 
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -258,7 +258,7 @@ def _populate_node_meta(
                     ]
                 n.meta[bucketing_sources_key] = sources
 
-            # used by inductor provenance tracking
+            # used by tp provenance tracking
             n.meta["from_node"] = [
                 NodeSource(
                     original_node,
@@ -811,7 +811,7 @@ def reduce_scatter_merge_fn_to_trace_custom_ops(
 
     new_rs_in = tp.ops.tp._pre_bucket_reduce_scatter(rs_ins, group_size)
 
-    # TODO - either use tp.cat or make sure inductor foreach codegen
+    # TODO - either use tp.cat or make sure tp foreach codegen
     # fires more reliably
     new_rs_out = tp.ops.tp.wait_tensor(
         tp.ops.tp.reduce_scatter_tensor.default(
@@ -1069,7 +1069,7 @@ def all_gather_merge_fn_to_trace(
     new_ag_out = tp.empty(ag_input_numel * group_size, dtype=dtype, device=device)
     new_ag_in = new_ag_out.narrow(0, ag_input_numel * rank, ag_input_numel)
     ag_ins_flattened = [ag_in.reshape(-1) for ag_in in ag_ins]
-    # Inductor fuses copy_(cat(...)) into 1 Triton kernel with no allocation for cat.
+    # The compiler fuses copy_(cat(...)) into 1 Triton kernel with no allocation for cat.
     # _foreach_copy_(..., ag_ins_flattened) emits separate kernel per item,
     # resulting in large number of small triton kernels to launch.
     new_ag_in.copy_(tp.cat(ag_ins_flattened))
@@ -1523,7 +1523,7 @@ def merge_all_gather_bucket(
     wait_insertion_point: Node | None = None,
 ) -> tuple[list[Node], dict[Node, Node]]:
     mode = mode or _default_bucket_mode()
-    from .....distributed.distributed_c10d import _resolve_process_group
+    from .....distributed.distributed_core import _resolve_process_group
 
     ag0 = ag_nodes[0]
     _, group_size, group_name = ag0.args

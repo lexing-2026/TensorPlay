@@ -345,7 +345,12 @@ class DtypePropagationOpsHandler:
         if dtype not in (tp.int32, tp.int64) or not hasattr(V.kernel, "index_dtype"):
             return upcast_compute_type(dtype)
 
-        return V.kernel.get_index_dtype_as_dtype()
+        index_dtype = V.kernel.index_dtype
+        if index_dtype == "int64":
+            return tp.int64
+        if index_dtype == "int32":
+            return tp.int32
+        return upcast_compute_type(dtype)
 
     @staticmethod
     def value_expr(expr, dtype):

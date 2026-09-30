@@ -1,6 +1,6 @@
 # mypy: allow-untyped-defs
 """
-Effect ordering pass for inductor.
+Effect ordering pass for the compiler.
 
 This pass adds ordering dependencies to FX graphs using the control_deps HOP
 for precise control over scheduling constraints. When you need exact ordering between

@@ -182,7 +182,7 @@ class _TestConfigs:
 
     #: Bisect on whether a custom backend is worth keeping.  Off by default,
     #: since the bisection runs the search twice.
-    bisect_keep_custom_backend_for_inductor = False
+    bisect_keep_custom_backend = False
 
     #: Bisect on where a graph should be split between the two graphs.  Off by
     #: default, for the same reason.
@@ -278,7 +278,9 @@ class _CppConfig:
     min_chunk_size = 512
 
     #: How many threads the kernels are written for, when the count is fixed.
-    threads = 1
+    #: A negative value asks the runtime for its thread count, so compiled
+    #: kernels use every available core by default.
+    threads = -1
 
     #: Whether a kernel is named after what it computes rather than after the
     #: loop nest it came from.  A report that says what was computed is easier to
@@ -286,9 +288,9 @@ class _CppConfig:
     #: was written.  Off, which is the same as naming it after neither.
     #:
     #: On, this says which operation the name is built from: ``"tp"`` for the
-    #: one this project's namespace spells, ``"original_aten"`` for the one the
+    #: one this project's namespace spells, ``"original"`` for the one the
     #: graph was captured with before it was decomposed, and
-    #: ``"inductor_node"`` for the graph node's own name.
+    #: ``"tp_node"`` for the graph node's own name.
     descriptive_names: bool | str = False
 
     #: Whether a reduction whose extent is past a threshold accumulates through
@@ -768,10 +770,10 @@ autotune_cudagraph_benchmarking = (
 #: How many times a measured candidate is run before its time is believed, and
 #: how many times before the measurement starts.  The first run of a kernel
 #: pays for loading it, so its time says nothing about the kernel.
-inductor_default_autotune_warmup = int(
+tp_default_autotune_warmup = int(
     os.environ.get("TP_DEFAULT_AUTOTUNE_WARMUP", 25)
 )
-inductor_default_autotune_rep = int(os.environ.get("TP_DEFAULT_AUTOTUNE_REP", 100))
+tp_default_autotune_rep = int(os.environ.get("TP_DEFAULT_AUTOTUNE_REP", 100))
 
 #: Which measurement a run uses.  The built-in one times a callable directly;
 #: the experimental one reports what the profiler saw, which costs more and
@@ -807,7 +809,7 @@ enabled_metric_tables = os.environ.get("TP_ENABLED_METRIC_TABLES", "")
 graph_partition = os.environ.get("TP_GRAPH_PARTITION", "1") == "1"
 
 
-class _AotIConfigs:
+class _TpExportConfigs:
     """The switches that only mean anything to a graph exported ahead of time.
 
     An exported graph is run without the Python that built it, so what it may
@@ -877,7 +879,7 @@ class _AotIConfigs:
     )
 
 
-aot_inductor = _AotIConfigs()
+tp_export = _TpExportConfigs()
 
 
 class _TritonConfig:
@@ -891,7 +893,7 @@ class _TritonConfig:
     #: How a fused kernel names the operations it stands for.  Which one is
     #: right depends on who is reading the name: a person reading a profile
     #: wants the operations, a cache key wants something short.
-    descriptive_names: str = "original_aten"
+    descriptive_names: str = "original"
 
     #: Whether each kernel is written under a name of its own, or under one
     #: name shared by every kernel written the same way, which is what lets two
@@ -1628,7 +1630,7 @@ class _AutoChunkerConfig:
 auto_chunker = _AutoChunkerConfig()
 
 
-class _AtenDistributedOptimizationsConfig:
+class _TpDistributedOptimizationsConfig:
     """How work is spread over devices, and when it is started."""
 
     #: Whether a candidate is started as soon as it is chosen rather than
@@ -1646,7 +1648,7 @@ class _AtenDistributedOptimizationsConfig:
     ) = None
 
 
-aten_distributed_optimizations = _AtenDistributedOptimizationsConfig()
+tp_distributed_optimizations = _TpDistributedOptimizationsConfig()
 
 
 #: Whether a program of the graph's own has been given a pass to run before
@@ -1696,7 +1698,7 @@ use_dce: bool = True
 
 #: Whether a candidate is written out on its own so that a program may name
 #: the class that chooses for it.
-inductor_choices_class: Callable[[], Any] | None = None
+tp_choices_class: Callable[[], Any] | None = None
 
 #: Whether a candidate is benchmarked across devices rather than on one.
 distributed_max_autotune_gemm = (
