@@ -55,6 +55,7 @@ inline bool engine_trace_enabled() {
 
 inline bool current_cuda_stream_is_capturing() {
 #ifdef USE_CUDA
+    if (tensorplay::cuda::deviceCount() == 0) return false;
     cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
     const cudaError_t error = cudaStreamIsCapturing(
         tensorplay::cuda::getCurrentCUDAStream().stream(), &status);

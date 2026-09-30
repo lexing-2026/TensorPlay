@@ -39,7 +39,12 @@ std::atomic<int>& cachedDeviceCount() {
 int deviceCountCached() {
     int count = cachedDeviceCount().load(std::memory_order_relaxed);
     if (count < 0) {
-        checkCuda(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
+        cudaError_t error = cudaGetDeviceCount(&count);
+        if (error == cudaErrorNoDevice) {
+            count = 0;
+        } else {
+            checkCuda(error, "cudaGetDeviceCount");
+        }
         cachedDeviceCount().store(count, std::memory_order_relaxed);
     }
     return count;
