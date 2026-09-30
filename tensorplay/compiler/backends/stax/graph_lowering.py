@@ -38,6 +38,7 @@ from .utils import (
 )
 from ....graph.interpreter import Interpreter
 from .codegen.common import FileBackedGraphModule, get_device_op_overrides
+from .codegen.cpp_wrapper import CppWrapperCode, CppWrapperModule
 from .sizevars import SizeVarAllocator
 from .virtualized import V
 from .ir import (
@@ -632,7 +633,7 @@ class GraphLowering(Interpreter):
         # Which kind of wrapper, since what a kernel may ask of it depends:
         # code that is run directly is handed values, and code that is
         # compiled is handed the C++ that stands for them.
-        self.cpp_wrapper = False
+        self.cpp_wrapper = cpp_wrapper
         self.fx_wrapper = False
         # The scheduler, once the region has one.  A name that was written in
         # place stands for the buffer that was really written, and the mapping
@@ -1702,6 +1703,8 @@ class GraphLowering(Interpreter):
             user_lowerings.get(node)
             or user_lowerings.get(target)
             or LOWERINGS.get(name)
+            or LOWERINGS.get(f"{name}.Tensor")
+            or LOWERINGS.get(f"{name}.Scalar")
         )
         with self.set_current_node(node), set_current_node(node):
             if lowering is not None:
@@ -1895,13 +1898,15 @@ class GraphLowering(Interpreter):
         """This region as something built, named, and callable on its own.
 
         What comes back is a built artifact rather than a program object: it
-        knows the key it was built under and the file it was written to, so the
-        same region asked for again is recognised as the same region and the
-        built file is reached rather than rebuilt.
+        knows the key it was built under and the file it was written to, so
+        the same region asked for again is recognised as the same region and
+        the built file is reached rather than rebuilt.
         """
 
         wrapper_code, _ = self.codegen()
 
+        if isinstance(wrapper_code, CppWrapperCode):
+            return self._compile_to_cpp_module(wrapper_code)
         if isinstance(wrapper_code, ValueWithLineMap):
             return self._compile_to_module_lines(wrapper_code)
         if isinstance(wrapper_code, FileBackedGraphModule):
@@ -1909,6 +1914,80 @@ class GraphLowering(Interpreter):
         raise NotImplementedError(
             f"Unrecognized wrapper code type: {type(wrapper_code)}"
         )
+
+    def _compile_to_cpp_module(self, wrapper_code: CppWrapperCode):
+        """Compile the generated C++ wrapper into a shared object.
+
+        The wrapper text is written to the code cache under a key derived from
+        its content and the compiler flags, built with the same host toolchain
+        used for generated host kernels, and loaded with ctypes.  The returned
+        module aliases graph input tensors and allocates output and
+        intermediate buffers on every call.
+        """
+
+        import ctypes
+        import os
+        import sysconfig
+
+        from .codecache import write
+        from .cpp_builder import CppBuilder, CppOptions, get_cpp_compiler, package_paths
+
+        paths = package_paths()
+        compiler = get_cpp_compiler()
+        if paths is None or not compiler:
+            raise RuntimeError("host C++ runtime is unavailable")
+        include_dir, generated_include_dir, lib_dir = paths
+        generated_ops_dir = os.path.join(
+            os.path.dirname(os.path.dirname(include_dir)),
+            "build",
+            "generated",
+        )
+        python_include = sysconfig.get_paths().get("include")
+        if not python_include:
+            raise RuntimeError("Python headers are unavailable")
+        options = CppOptions(
+            compiler=compiler,
+            include_dirs=[
+                include_dir,
+                generated_include_dir,
+                generated_ops_dir,
+                python_include,
+            ],
+            cflags=[
+                "-std=c++20",
+                "-O3",
+                "-fPIC",
+                "-shared",
+                "-pthread",
+                "-fopenmp",
+            ],
+            library_dirs=[lib_dir],
+            libraries=["p10", "gomp"],
+            ldflags=["-pthread", f"-Wl,-rpath,{lib_dir}"],
+        )
+        key, source_path = write(
+            wrapper_code.value,
+            "cpp",
+            extra=options.command(["<sources>"], "<output>").__repr__(),
+        )
+        output_path = os.path.join(os.path.dirname(source_path), f"{key}.so")
+        builder = CppBuilder(
+            name=os.path.basename(output_path),
+            sources=[source_path],
+            options=options,
+            output_dir=os.path.dirname(source_path),
+        )
+        if not os.path.exists(output_path):
+            builder.build()
+
+        lib = ctypes.CDLL(output_path)
+        call_fn = lib.call
+        call_fn.restype = None
+        call_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_long)]
+
+        self.cache_key = key
+        self.cache_path = source_path
+        return CppWrapperModule(call_fn, wrapper_code)
 
     def finalize(self) -> None:
         """Settle every buffer's layout, now that the region is all known.

@@ -731,6 +731,7 @@ def init_backend_registration() -> None:
     if get_scheduling_for_device("cpu") is not None:
         return
     from .cpp import CppScheduling
+    from .cpp_wrapper import CppWrapperCodegen
     from .cuda_combined_scheduling import CUDACombinedScheduling
     from .wrapper import PythonWrapperCodegen
 
@@ -745,11 +746,13 @@ def init_backend_registration() -> None:
         "cpu",
         lambda scheduling: CppScheduling(scheduling),
         PythonWrapperCodegen,
+        device_cpp_wrapper_codegen=CppWrapperCodegen,
     )
     register_backend_for_device(
         "cuda",
         lambda scheduling: cuda_backends[config.cuda_backend](scheduling),
         PythonWrapperCodegen,
+        device_cpp_wrapper_codegen=CppWrapperCodegen,
     )
 
 
