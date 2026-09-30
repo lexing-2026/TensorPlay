@@ -1681,6 +1681,19 @@ def lower_cat(tensors, dim=0):
 # ---------------------------------------------------------------------------
 
 
+def _resolve_dtype(dtype, default):
+    """An optional dtype, with the graph's "unspecified" sentinel read as none.
+
+    The dispatch graph spells an omitted optional dtype as ``tensorplay.undefined``
+    rather than as ``None``, so both have to be treated as "not given" before the
+    value the caller actually asked for (or the input's own type) is chosen.
+    """
+
+    if dtype is None or dtype == tp.undefined:
+        return default
+    return dtype
+
+
 def make_reduction(x: TensorBox, dims, keepdim, dtype, device, rtype="sum", prologue=None) -> TensorBox:
     # A lowering is handed a value, not a node: what may still be written into
     # it is part of what it is, and realizing below is a question about the
@@ -1734,8 +1747,14 @@ def lower_sum(x, dims=None, keepdim=False, dtype=None, **kwargs):
         dims = list(range(len(x.get_size())))
     elif isinstance(dims, (int, sympy.Integer)):
         dims = [dims]
+    if dtype is None or dtype == tp.undefined:
+        # A sum of whole numbers is not a whole number unless it is asked to be.
+        if is_integer_dtype(x.get_dtype()) or is_boolean_dtype(x.get_dtype()):
+            dtype = tp.int64
+        else:
+            dtype = x.get_dtype()
     return make_reduction(
-        x, dims, keepdim, dtype or x.get_dtype(), x.get_device(), "sum"
+        x, dims, keepdim, dtype, x.get_device(), "sum"
     )
 
 
@@ -1743,9 +1762,10 @@ def lower_sum(x, dims=None, keepdim=False, dtype=None, **kwargs):
 def lower_mean(x, dims, keepdim=False, dtype=None, **kwargs):
     if isinstance(dims, (int, sympy.Integer)):
         dims = [dims]
+    dtype = _resolve_dtype(dtype, x.get_dtype())
     count = prod(x.get_size()[normalize_dim(d, len(x.get_size()))] for d in dims)
     total = make_reduction(
-        x, dims, keepdim, dtype or x.get_dtype(), x.get_device(), "sum"
+        x, dims, keepdim, dtype, x.get_device(), "sum"
     )
     return pointwise(lambda v: ops.truediv(v, ops.constant(float(count), tp.float32)), total)
 
@@ -1760,7 +1780,7 @@ def lower_amax(x, dims=None, keepdim=False, dtype=None, **kwargs):
         dims = list(range(len(x.get_size())))
     elif isinstance(dims, (int, sympy.Integer)):
         dims = [dims]
-    return make_reduction(x, dims, keepdim, dtype or x.get_dtype(), x.get_device(), "max")
+    return make_reduction(x, dims, keepdim, _resolve_dtype(dtype, x.get_dtype()), x.get_device(), "max")
 
 
 @register("amin.default")
@@ -1769,7 +1789,7 @@ def lower_amin(x, dims=None, keepdim=False, dtype=None, **kwargs):
         dims = list(range(len(x.get_size())))
     elif isinstance(dims, (int, sympy.Integer)):
         dims = [dims]
-    return make_reduction(x, dims, keepdim, dtype or x.get_dtype(), x.get_device(), "min")
+    return make_reduction(x, dims, keepdim, _resolve_dtype(dtype, x.get_dtype()), x.get_device(), "min")
 
 
 @register("conv2d_grad_bias.default", "conv_grad_bias.default")
@@ -1906,7 +1926,8 @@ def lower_native_group_norm_backward(grad_out, x, mean, rstd, gamma, n, c, hxw, 
 
     ds = Reduction.create(
         device=device,
-        dtype=tp.float32,
+        dst_dtype=tp.float32,
+        src_dtype=tp.float32,
         inner_fn=ds_inner,
         ranges=(n, c),
         reduction_ranges=(hxw,),
@@ -1914,7 +1935,8 @@ def lower_native_group_norm_backward(grad_out, x, mean, rstd, gamma, n, c, hxw, 
     )
     db = Reduction.create(
         device=device,
-        dtype=tp.float32,
+        dst_dtype=tp.float32,
+        src_dtype=tp.float32,
         inner_fn=db_inner,
         ranges=(n, c),
         reduction_ranges=(hxw,),
@@ -1941,7 +1963,8 @@ def lower_native_group_norm_backward(grad_out, x, mean, rstd, gamma, n, c, hxw, 
 
         ds_val = Reduction.create(
         device=device,
-        dtype=tp.float32,
+        dst_dtype=tp.float32,
+        src_dtype=tp.float32,
         inner_fn=dsv_inner,
         ranges=(n, groups),
         reduction_ranges=(cpg,),
@@ -1949,7 +1972,8 @@ def lower_native_group_norm_backward(grad_out, x, mean, rstd, gamma, n, c, hxw, 
     )
         db_val = Reduction.create(
         device=device,
-        dtype=tp.float32,
+        dst_dtype=tp.float32,
+        src_dtype=tp.float32,
         inner_fn=dbv_inner,
         ranges=(n, groups),
         reduction_ranges=(cpg,),
@@ -3393,13 +3417,13 @@ def cumsum(x: Any, dim: Any = 0, dtype: Any = None) -> Any:
 
     if (
         is_integer_dtype(x.get_dtype()) or is_boolean_dtype(x.get_dtype())
-    ) and dtype is None:
+    ) and (dtype is None or dtype == tp.undefined):
         dtype = tp.int64
 
     if len(x.get_size()) == 0:
         if dim not in [0, -1]:
             raise AssertionError("expected: axis in [0, -1]")
-        dtype = dtype or x.get_dtype()
+        dtype = _resolve_dtype(dtype, x.get_dtype())
         return to_dtype(x, dtype, copy=True)
 
     def combine_fn(a_tuple: Any, b_tuple: Any) -> Any:
@@ -3424,13 +3448,13 @@ def cumprod(x: Any, dim: Any = 0, dtype: Any = None) -> Any:
 
     if (
         is_integer_dtype(x.get_dtype()) or is_boolean_dtype(x.get_dtype())
-    ) and dtype is None:
+    ) and (dtype is None or dtype == tp.undefined):
         dtype = tp.int64
 
     if len(x.get_size()) == 0:
         if dim not in [0, -1]:
             raise AssertionError("expected: axis in [0, -1]")
-        dtype = dtype or x.get_dtype()
+        dtype = _resolve_dtype(dtype, x.get_dtype())
         return to_dtype(x, dtype, copy=True)
 
     def combine_fn(a_tuple: Any, b_tuple: Any) -> Any:

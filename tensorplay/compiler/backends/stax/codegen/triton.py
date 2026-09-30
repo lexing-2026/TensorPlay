@@ -48,6 +48,7 @@ async_compile = AsyncCompile()
 
 from .....graph.experimental.sympy_functions import (
     OrderedSet,
+    TruncToInt,
     ValueRanges,
     prefix_str,
     symbol_is_type,
@@ -1930,7 +1931,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
 
         """Check if the buffer we're about to load, has
         more than one read dependency
-        NOTE: enabled with env variable TORCHINDUCTOR_SKIP_L1
+        NOTE: enabled with env variable TP_SKIP_L1
         """
         has_read_deps = True
         if config.triton.skip_l1_cache:
@@ -7584,6 +7585,11 @@ class TritonOverrides(OpOverrides):
     # pyrefly: ignore [bad-override]
     def abs(x):
         return f"tl_math.abs({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def neg(x):
+        return f"-({x})"
 
     # TODO - register these ops as having divergent dtype
     # output if doing graph pass to remove consecutive casts
