@@ -77,6 +77,15 @@ _backend_names = {
     "math": "MATH",
     "overrideable": "OVERRIDEABLE",
 }
+_backend_enabled = {
+    name: getattr(tensorplay._C, f"_get_{name}_sdp_enabled")
+    for name in _backend_names
+}
+_backend_setter = {
+    name: getattr(tensorplay._C, f"_set_sdp_use_{name}")
+    for name in _backend_names
+}
+_backend_value = {name: getattr(SDPBackend, val) for name, val in _backend_names.items()}
 _sdpa_kernel_uses_priority = ContextVar("sdpa_kernel_uses_priority", default=False)
 
 
@@ -89,11 +98,20 @@ def _backend_from_string(name: str):
     return getattr(SDPBackend, name)
 
 
+_backend_enabled = {
+    name: getattr(tensorplay._C, f"_get_{name}_sdp_enabled")
+    for name in _backend_names
+}
+
+
 def _cur_sdpa_kernel_backends(with_priority: bool = False):
+    # The enabled-set read is a C++ round trip per backend; the member lookups
+    # are hoisted to import time so a hot call pays bound calls rather than
+    # attribute walks from the module root.
     backends = []
     for name, val in _backend_names.items():
-        if getattr(tensorplay._C, f"_get_{name}_sdp_enabled")():
-            backends.append(getattr(SDPBackend, val))
+        if _backend_enabled[name]():
+            backends.append(_backend_value[name])
     if with_priority:
         curr_priority = tensorplay._C._get_sdp_priority_order()
         backends = sorted(
@@ -104,8 +122,8 @@ def _cur_sdpa_kernel_backends(with_priority: bool = False):
 
 def _sdpa_kernel(backends: Iterable, set_priority: bool = False) -> None:
     for name, val in _backend_names.items():
-        enabled = getattr(SDPBackend, val) in backends
-        getattr(tensorplay._C, f"_set_sdp_use_{name}")(enabled)
+        enabled = _backend_value[name] in backends
+        _backend_setter[name](enabled)
     if set_priority:
         # backends should be a unique list
         user_priority = [int(backend) for backend in backends]

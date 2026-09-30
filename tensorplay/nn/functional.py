@@ -3434,6 +3434,22 @@ def scaled_dot_product_attention(
     from tensorplay.nn import attention as _sdpa_attention
     from tensorplay.overrides import has_tensorplay_function
 
+    # The plain fused case -- no mask, no drop, no normaliser, no grouping --
+    # is the call a decode or training loop makes millions of times.  The
+    # routing below re-walks the hook protocol and rebuilds the parameter
+    # object for it; a call that carries none of the extras and whose
+    # arguments carry no dispatch hook lands on the same fused kernel, so it
+    # is answered before any of that is built.
+    if (
+        attn_mask is None
+        and dropout_p == 0.0
+        and scale is None
+        and not enable_gqa
+        and backend is None
+        and not has_tensorplay_function((query, key, value))
+    ):
+        return _plain_scaled_dot_product_attention(query, key, value, is_causal)
+
     # Attention-bias subclasses intercept the call through the Python
     # function-hook protocol before any backend routing happens.
     if has_tensorplay_function((query, key, value, attn_mask)):
