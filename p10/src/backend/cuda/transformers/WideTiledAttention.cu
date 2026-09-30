@@ -295,7 +295,8 @@ __global__ void sdpa_one_row_first_value_kernel(
 __global__ void sdpa_one_row_grouped_value_kernel(
     const float* __restrict__ v,
     float* __restrict__ out,
-    int64_t rows, int64_t D, int64_t B, int64_t Hq, int64_t Hkv) {
+    int64_t rows, int64_t D, int64_t B, int64_t Hq, int64_t Hkv,
+    int64_t Tkv) {
   const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= rows * D) return;
   const int64_t r = idx / D;
@@ -303,7 +304,7 @@ __global__ void sdpa_one_row_grouped_value_kernel(
   const int64_t b = r / Hq;
   const int64_t hq = r % Hq;
   const int64_t hk = hq / (Hq / Hkv);
-  out[r * D + d] = v[((b * Hkv + hk) * 1) * D + d];
+  out[r * D + d] = v[((b * Hkv + hk) * Tkv) * D + d];
 }
 
 }  // namespace
@@ -326,10 +327,10 @@ Tensor sdpa_one_row_first_value_cuda(const Tensor& q, const Tensor& k,
   const int64_t blocks = (rows * D + threads - 1) / threads;
   if (group == 1) {
     sdpa_one_row_first_value_kernel<<<blocks, threads, 0, stream>>>(
-        v.data_ptr<float>(), out.data_ptr<float>(), rows, D, D, D);
+        v.data_ptr<float>(), out.data_ptr<float>(), rows, D, Tkv * D, D);
   } else {
     sdpa_one_row_grouped_value_kernel<<<blocks, threads, 0, stream>>>(
-        v.data_ptr<float>(), out.data_ptr<float>(), rows, D, B, Hq, Hkv);
+        v.data_ptr<float>(), out.data_ptr<float>(), rows, D, B, Hq, Hkv, Tkv);
   }
   TP_WIDE_CUDA_CHECK(cudaGetLastError());
   return out;
@@ -429,7 +430,7 @@ Tensor sdpa_wide_tiled_cuda(const Tensor& query, const Tensor& key,
   if (Tq <= 1 && is_causal) {
     return sdpa_one_row_first_value_cuda(q, k, v, B, Hq, Hkv, Tkv, D);
   }
-  if (Tq <= 1)  if (Tq <= 1) {
+  if (Tq <= 1) {
     return sdpa_wide_tiled_launch<1>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
   }
   if (Tq <= 4) {
