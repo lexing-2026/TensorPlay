@@ -39,15 +39,25 @@ namespace cuda {
 // tile and a score tile, which is 36 KB and fits the default budget; a wider
 // tile would need the opt-in the block would then have to ask for on every
 // launch, and the operand tiles are what makes it grow.
-constexpr int kWideQueryTile = 32;
-constexpr int kWideKeyTile = 32;
+// The tile is a template parameter because a causal call's work is set by its
+// query length, not by its context length: row t admits keys 0..t, so a call of
+// one query row over a four-thousand-token context has one key to read.  A
+// fixed tile would read a whole tile of keys for that row and then mask all but
+// one of them away, which is thirty-two times the memory traffic for a result
+// that is a copy of one value.  The wide tile is for a call that fills it, and
+// the one-row tile is for a call that does not.
 constexpr int kWideTileD = 128;
-// Two warps, each owning half the query tile.  The output tile lives in the
-// owning warp's registers, so the warp count is what sets the register budget
-// for the output: more warps means fewer rows each, and the rows are spread
-// over the head width by lane.
-constexpr int kWideWarps = 2;
-constexpr int kWideRowsPerWarp = kWideQueryTile / kWideWarps;
+// The two tile shapes.  A one-row call needs one row of keys, a wide one
+// needs all of them.
+constexpr int kWideNarrowTile = 1;
+// A tile of at least sixteen rows is walked by two warps so that the key axis
+// has more than one lane working on it; a narrower tile would leave most of a
+// warp idle, so it is walked by one.
+template <int kTile>
+constexpr int kWideWarps = kTile >= 16 ? 2 : 1;
+template <int kTile>
+constexpr int kWideRowsPerWarp = kTile / kWideWarps<kTile>;
+template <int kTile>
 constexpr int kWideColsPerLane = kWideTileD / 32;
 
 // The key and the value are read through one buffer at different times: the
@@ -56,15 +66,17 @@ constexpr int kWideColsPerLane = kWideTileD / 32;
 // tile of query, a tile of key and a score tile rather than two operand tiles.
 // The score tile is rewritten in place with the probability once the row
 // statistics are known, so the probability costs nothing.
+template <int kTile>
 struct TpWideShared {
-  float q[kWideQueryTile][kWideTileD];
-  float kv[kWideKeyTile][kWideTileD];
-  float score[kWideQueryTile][kWideKeyTile];
-  float row_max[kWideQueryTile];
-  float row_sum[kWideQueryTile];
-  float row_alpha[kWideQueryTile];
+  float q[kTile][kWideTileD];
+  float kv[kTile][kWideTileD];
+  float score[kTile][kTile];
+  float row_max[kTile];
+  float row_sum[kTile];
+  float row_alpha[kTile];
 };
 
+template <int kTile>
 __global__ void sdpa_wide_flash_kernel(
     const float* __restrict__ q,
     const float* __restrict__ k,
@@ -72,16 +84,17 @@ __global__ void sdpa_wide_flash_kernel(
     float* __restrict__ out,
     int64_t B, int64_t Hq, int64_t Hkv, int64_t Tq, int64_t Tkv, int64_t D,
     float scale, bool is_causal) {
-  constexpr int q_tile = kWideQueryTile;
-  constexpr int k_tile = kWideKeyTile;
+  constexpr int q_tile = kTile;
+  constexpr int k_tile = kTile;
   constexpr int tile_d = kWideTileD;
-  constexpr int warps = kWideWarps;
+  constexpr int warps = kWideWarps<kTile>;
   constexpr int threads = warps * 32;
   constexpr unsigned long long full_mask = 0xffffffffffffffffull;
   constexpr float log2e = 1.4426950408889634f;
 
   extern __shared__ unsigned char smem_raw[];
-  TpWideShared& smem = *reinterpret_cast<TpWideShared*>(smem_raw);
+  TpWideShared<kTile>& smem =
+      *reinterpret_cast<TpWideShared<kTile>*>(smem_raw);
   const int thread = threadIdx.x;
   const int warp = thread >> 5;
   const int lane = thread & 31;
@@ -117,11 +130,11 @@ __global__ void sdpa_wide_flash_kernel(
   // tensor-core fragment: the wide precision has no fragment form here, and a
   // tile this size is cheaper in registers than a round trip through the chip.
   // The block covers the whole query tile, so each thread owns a slice of it.
-  float acc[kWideRowsPerWarp][kWideColsPerLane];
+  float acc[kWideRowsPerWarp<kTile>][kWideColsPerLane<kTile>];
 #pragma unroll
-  for (int r = 0; r < kWideRowsPerWarp; ++r)
+  for (int r = 0; r < kWideRowsPerWarp<kTile>; ++r)
 #pragma unroll
-    for (int c = 0; c < kWideColsPerLane; ++c) acc[r][c] = 0.f;
+    for (int c = 0; c < kWideColsPerLane<kTile>; ++c) acc[r][c] = 0.f;
 
   for (int64_t k0 = 0; k0 < last_k; k0 += k_tile) {
     // The key lands in the shared buffer and is consumed by the score product;
@@ -140,8 +153,8 @@ __global__ void sdpa_wide_flash_kernel(
     // product, which is what a wide precision without a fragment form comes
     // down to.
     if (warp < warps) {
-      const int qr0 = warp * kWideRowsPerWarp;
-      for (int qr = qr0; qr < qr0 + kWideRowsPerWarp; ++qr) {
+      const int qr0 = warp * kWideRowsPerWarp<kTile>;
+      for (int qr = qr0; qr < qr0 + kWideRowsPerWarp<kTile>; ++qr) {
         for (int n = lane; n < k_tile; n += 32) {
           float total = 0.f;
           for (int d0 = 0; d0 < tile_d; ++d0)
@@ -166,8 +179,8 @@ __global__ void sdpa_wide_flash_kernel(
     // The score tile is rewritten in place with the probability, so the value
     // product below reads a probability it does not have to be given twice.
     if (warp < warps) {
-      const int qr0 = warp * kWideRowsPerWarp;
-      for (int qr = qr0; qr < qr0 + kWideRowsPerWarp; ++qr) {
+      const int qr0 = warp * kWideRowsPerWarp<kTile>;
+      for (int qr = qr0; qr < qr0 + kWideRowsPerWarp<kTile>; ++qr) {
         const int64_t qg = q0 + qr;
         float maximum = -INFINITY;
         for (int kk = lane; kk < k_tile; kk += 32) {
@@ -216,18 +229,18 @@ __global__ void sdpa_wide_flash_kernel(
     // owns a slice of the head width for every key, so no column is touched by
     // two lanes and no cross-lane reduction is needed.
     if (warp < warps) {
-      const int qr0 = warp * kWideRowsPerWarp;
+      const int qr0 = warp * kWideRowsPerWarp<kTile>;
 #pragma unroll
-      for (int r = 0; r < kWideRowsPerWarp; ++r) {
+      for (int r = 0; r < kWideRowsPerWarp<kTile>; ++r) {
         const float alpha = smem.row_alpha[qr0 + r];
 #pragma unroll
-        for (int c = 0; c < kWideColsPerLane; ++c) acc[r][c] *= alpha;
+        for (int c = 0; c < kWideColsPerLane<kTile>; ++c) acc[r][c] *= alpha;
       }
-      for (int r = 0; r < kWideRowsPerWarp; ++r) {
+      for (int r = 0; r < kWideRowsPerWarp<kTile>; ++r) {
         const int qr = qr0 + r;
-        const int d0 = lane * kWideColsPerLane;
+        const int d0 = lane * kWideColsPerLane<kTile>;
 #pragma unroll
-        for (int c = 0; c < kWideColsPerLane; ++c) {
+        for (int c = 0; c < kWideColsPerLane<kTile>; ++c) {
           float total = 0.f;
           for (int n = 0; n < k_tile; ++n)
             total += smem.score[qr][n] * smem.kv[n][d0 + c];
@@ -241,21 +254,120 @@ __global__ void sdpa_wide_flash_kernel(
   // Normalize from the register tile straight into the result.  A row whose
   // keys were all masked away has no total and is left at zero.
   if (warp < warps) {
-    const int qr0 = warp * kWideRowsPerWarp;
-    for (int r = 0; r < kWideRowsPerWarp; ++r) {
+    const int qr0 = warp * kWideRowsPerWarp<kTile>;
+    for (int r = 0; r < kWideRowsPerWarp<kTile>; ++r) {
       const int qr = qr0 + r;
       const int64_t qg = q0 + qr;
       if (qg >= Tq) continue;
       const float total = smem.row_sum[qr];
       const float inverse = total > 0.f ? 1.f / total : 0.f;
-      const int d0 = lane * kWideColsPerLane;
+      const int d0 = lane * kWideColsPerLane<kTile>;
 #pragma unroll
-      for (int c = 0; c < kWideColsPerLane; ++c) {
+      for (int c = 0; c < kWideColsPerLane<kTile>; ++c) {
         if (d0 + c < D) out[q_base + qg * D + (d0 + c)] = acc[r][c] * inverse;
       }
     }
   }
 }
+
+
+namespace {
+
+// One row, causal: the row admits key zero alone, so the answer is that key's
+// value row.  A thread per output element copies it, and nothing else is read:
+// not the query, not the context, not the key.  The reference spends a full
+// attention pass to arrive at the same row, which is why a call of this shape is
+// the one where staying on the chip stops mattering and not reading at all
+// starts to.
+__global__ void sdpa_one_row_first_value_kernel(
+    const float* __restrict__ v,
+    float* __restrict__ out,
+    int64_t rows, int64_t D, int64_t kv_stride, int64_t out_stride) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= rows * D) return;
+  const int64_t r = idx / D;
+  const int64_t d = idx % D;
+  out[out_stride * r + d] = v[kv_stride * r + d];
+}
+
+// The same copy when query heads are grouped: query head hq reads key head
+// hq / (Hq / Hkv), so the row is fetched per head rather than as one run.
+__global__ void sdpa_one_row_grouped_value_kernel(
+    const float* __restrict__ v,
+    float* __restrict__ out,
+    int64_t rows, int64_t D, int64_t B, int64_t Hq, int64_t Hkv) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= rows * D) return;
+  const int64_t r = idx / D;
+  const int64_t d = idx % D;
+  const int64_t b = r / Hq;
+  const int64_t hq = r % Hq;
+  const int64_t hk = hq / (Hq / Hkv);
+  out[r * D + d] = v[((b * Hkv + hk) * 1) * D + d];
+}
+
+}  // namespace
+
+Tensor sdpa_one_row_first_value_cuda(const Tensor& q, const Tensor& k,
+                                     const Tensor& v, int64_t B, int64_t Hq,
+                                     int64_t Hkv, int64_t Tkv, int64_t D) {
+  (void)q;
+  (void)k;
+  (void)Tkv;
+  Tensor out = Tensor::empty({B, Hq, 1, D}, DType::Float32, v.device());
+  // A group's query heads read one key head, so the row being copied for query
+  // head hq is the first row of key head hq / (Hq / Hkv).
+  const int64_t group = Hq / Hkv;
+  const int64_t rows = B * Hq;
+  // The source rows are not contiguous in the query-head order when heads are
+  // grouped, so the copy is driven per query head rather than as one run.
+  auto stream = getCurrentCUDAStream().stream();
+  const int threads = 128;
+  const int64_t blocks = (rows * D + threads - 1) / threads;
+  if (group == 1) {
+    sdpa_one_row_first_value_kernel<<<blocks, threads, 0, stream>>>(
+        v.data_ptr<float>(), out.data_ptr<float>(), rows, D, D, D);
+  } else {
+    sdpa_one_row_grouped_value_kernel<<<blocks, threads, 0, stream>>>(
+        v.data_ptr<float>(), out.data_ptr<float>(), rows, D, B, Hq, Hkv);
+  }
+  TP_WIDE_CUDA_CHECK(cudaGetLastError());
+  return out;
+}
+
+namespace {
+
+// One launch per tile shape.  A call is served by the tile that fits its query
+// length, which is what keeps a one-row call from reading a whole tile of keys
+// and masking all but one of them away.
+template <int kTile>
+Tensor sdpa_wide_tiled_launch(const Tensor& q, const Tensor& k,
+                              const Tensor& v, int64_t B, int64_t Hq,
+                              int64_t Hkv, int64_t Tq, int64_t Tkv, int64_t D,
+                              bool is_causal) {
+  Tensor out = Tensor::empty({B, Hq, Tq, D}, DType::Float32, q.device());
+  const float scale = 1.f / std::sqrt(static_cast<float>(D));
+  const int64_t q_blocks = (Tq + kTile - 1) / kTile;
+  const size_t smem_bytes = sizeof(TpWideShared<kTile>);
+  const dim3 grid(static_cast<unsigned>(B * Hq),
+                  static_cast<unsigned>(q_blocks));
+  const int threads = kWideWarps<kTile> * 32;
+  cudaStream_t stream = getCurrentCUDAStream().stream();
+  sdpa_wide_flash_kernel<kTile><<<grid, threads, smem_bytes, stream>>>(
+      q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
+      out.data_ptr<float>(), B, Hq, Hkv, Tq, Tkv, D, scale, is_causal);
+  TP_WIDE_CUDA_CHECK(cudaGetLastError());
+  return out;
+}
+
+}  // namespace
+
+// A one-row causal call, answered without reading the context.  Declared apart
+// from the schedule below because it is not a schedule: there is no product to
+// perform, only a row to copy.
+Tensor sdpa_one_row_first_value_cuda(const Tensor& q, const Tensor& k,
+                                     const Tensor& v, int64_t B, int64_t Hq,
+                                     int64_t Hkv, int64_t Tkv, int64_t D);
 
 // The fused wide-precision schedule.  A query tile stays on the chip while the
 // key axis is walked, so the operands and the result are the only things that
@@ -298,18 +410,38 @@ Tensor sdpa_wide_tiled_cuda(const Tensor& query, const Tensor& key,
   if (B == 0 || Hq == 0 || Tq == 0 || D == 0) {
     return Tensor::empty({B, Hq, Tq, D}, DType::Float32, q.device());
   }
-
-  Tensor out = Tensor::empty({B, Hq, Tq, D}, DType::Float32, q.device());
-  const int64_t q_blocks = (Tq + kWideQueryTile - 1) / kWideQueryTile;
-  const size_t smem_bytes = sizeof(TpWideShared);
-  const float scale = 1.f / std::sqrt(static_cast<float>(D));
-  sdpa_wide_flash_kernel<<<
-      dim3(static_cast<unsigned>(B * Hq), static_cast<unsigned>(q_blocks)),
-      kWideWarps * 32, smem_bytes, getCurrentCUDAStream().stream()>>>(
-      q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
-      out.data_ptr<float>(), B, Hq, Hkv, Tq, Tkv, D, scale, is_causal);
-  TP_WIDE_CUDA_CHECK(cudaGetLastError());
-  return out;
+  // A causal call's work is set by its query length, so the tile is chosen to
+  // fit it.  A call too long for the narrow tile is served by the wide one,
+  // which walks the query axis in as many passes as it needs.
+  // The tile is chosen so that a call's blocks fill the device rather than so
+  // that they cover its query length.  One row over a long context is a single
+  // row of work no matter how long the context is, and a tile of thirty-two
+  // would read thirty-two rows of keys for it; a longer call has enough blocks
+  // of its own that the tile only has to be large enough to keep each warp
+  // busy, and past that a wider tile costs shared memory without buying
+  // occupancy.
+  // A one-row causal call has one key admissible: row zero admits key zero, so
+  // its softmax is over a single value and its answer is that key's value,
+  // whatever the context length.  Reading the context to find that out is the
+  // whole cost of the call and there is nothing else in it, so the call is
+  // answered by copying the first value row.  A non-causal one-row call has no
+  // such bound and is answered by the schedule below.
+  if (Tq <= 1 && is_causal) {
+    return sdpa_one_row_first_value_cuda(q, k, v, B, Hq, Hkv, Tkv, D);
+  }
+  if (Tq <= 1)  if (Tq <= 1) {
+    return sdpa_wide_tiled_launch<1>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
+  }
+  if (Tq <= 4) {
+    return sdpa_wide_tiled_launch<4>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
+  }
+  if (Tq <= 8) {
+    return sdpa_wide_tiled_launch<8>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
+  }
+  if (Tq <= 16) {
+    return sdpa_wide_tiled_launch<16>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
+  }
+  return sdpa_wide_tiled_launch<32>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
 }
 
 }  // namespace cuda

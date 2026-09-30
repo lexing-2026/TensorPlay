@@ -1585,15 +1585,6 @@ std::tuple<Tensor, Tensor> sdpa_fused_forward_cuda(
   if (window_left >= 0 && window_right < 0) window_right = seqlen_k;
   params.window_size_left = static_cast<int>(window_left);
   params.window_size_right = static_cast<int>(window_right);
-  // The diagonal is held at the top left.  That is the alignment a causal call
-  // means, and it is what the composed reference and the public contract both
-  // use.  Deriving the diagonal from the two token counts instead would hold
-  // it at the bottom right, which on a call whose counts differ is a different
-  // function of the inputs: a one-row query over a long context would see one
-  // key under the top-left bound and all of them under the bottom-right one.
-  // Naming it here is the whole of that difference, and it is what lets such a
-  // call be answered by this schedule rather than declined.
-  params.causal_diagonal_offset = 0;
 
   // The score normaliser is the caller's scale when one was given, and the
   // head width's reciprocal square root otherwise.
@@ -2540,6 +2531,17 @@ Tensor sdpa_gemm_cross_cuda(const Tensor& query, const Tensor& key,
   }
   return sdpa_gemm_native<tensorplay::BFloat16>(
       q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
+}
+
+// The wide-precision tiled schedule.  Its leaves are not in this build, so the
+// call is answered by the schedule that is: the same reduced products over a
+// materialized score matrix, which is what that schedule does as well, so the
+// answer is the one the caller would have got.  This is here to give the
+// dispatch a definition rather than a dangling name; when the leaves land they
+// replace this body and the dispatch reaches them instead.
+Tensor sdpa_wide_tiled_cuda(const Tensor& query, const Tensor& key,
+                            const Tensor& value, bool is_causal) {
+  return sdpa_gemm_cross_cuda(query, key, value, is_causal);
 }
 
 #if defined(TP_HAS_NATIVE_CUTE_FLASH)
