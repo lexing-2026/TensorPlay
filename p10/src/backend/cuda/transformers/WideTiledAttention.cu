@@ -47,19 +47,23 @@ namespace cuda {
 // that is a copy of one value.  The wide tile is for a call that fills it, and
 // the one-row tile is for a call that does not.
 constexpr int kWideTileD = 128;
-// The two tile shapes.  A one-row call needs one row of keys, a wide one
-// needs all of them.
-constexpr int kWideNarrowTile = 1;
+// The two tile axes are named separately: the query tile and the key tile do
+// not have to be square, and for a causal call they should not be.  A query
+// tile of a hundred and twenty-eight rows against a key tile of thirty-two
+// keeps the key axis short -- the score tile and the key tile stay small -- and
+// lets one block own a long stretch of the query axis, which is what cuts the
+// number of times the context's early tiles are re-read.
+constexpr int kWideQTileLarge = 128;
+constexpr int kWideKTileLarge = 32;
 // A tile of at least sixteen rows is walked by several warps so that a warp
 // scheduler always has another warp ready while one waits on the chip: the
 // walk is a chain of chip loads, and a block of one or two warps leaves the
 // scheduler idle behind every load.  A narrower tile has fewer rows to give
 // each warp, so it takes fewer warps; a one-row tile takes one.
-template <int kTile>
-constexpr int kWideWarps = kTile >= 32 ? 8 : kTile >= 16 ? 4 : kTile >= 4 ? 2 : 1;
-template <int kTile>
-constexpr int kWideRowsPerWarp = kTile / kWideWarps<kTile>;
-template <int kTile>
+template <int kQTile>
+constexpr int kWideWarps = kQTile >= 32 ? 8 : kQTile >= 16 ? 4 : kQTile >= 4 ? 2 : 1;
+template <int kQTile>
+constexpr int kWideRowsPerWarp = kQTile / kWideWarps<kQTile>;
 constexpr int kWideColsPerLane = kWideTileD / 32;
 
 // The key and the value are read through one buffer at different times: the
@@ -77,14 +81,14 @@ constexpr int kWideColsPerLane = kWideTileD / 32;
 // same sweep lands on as many banks as it has lanes.  The value rows keep the
 // plain layout: their product reads one row per lane step, and giving each
 // lane columns 32 floats apart serves that sweep without a permutation.
-template <int kTile>
+template <int kQTile, int kKTile>
 struct TpWideShared {
-  float q[kTile][kWideTileD];
-  float kv[kTile][kWideTileD];
-  float score[kTile][kTile];
-  float row_max[kTile];
-  float row_sum[kTile];
-  float row_alpha[kTile];
+  float q[kQTile][kWideTileD];
+  float kv[kKTile][kWideTileD];
+  float score[kQTile][kKTile];
+  float row_max[kQTile];
+  float row_sum[kQTile];
+  float row_alpha[kQTile];
 };
 
 // The low five bits of the column move with the row: storing column c of row
@@ -93,7 +97,7 @@ __device__ __forceinline__ int wide_kv_col(int col, int row) {
   return col ^ (row & 31);
 }
 
-template <int kTile>
+template <int kQTile, int kKTile>
 __global__ void sdpa_wide_flash_kernel(
     const float* __restrict__ q,
     const float* __restrict__ k,
@@ -101,17 +105,18 @@ __global__ void sdpa_wide_flash_kernel(
     float* __restrict__ out,
     int64_t B, int64_t Hq, int64_t Hkv, int64_t Tq, int64_t Tkv, int64_t D,
     float scale, bool is_causal) {
-  constexpr int q_tile = kTile;
-  constexpr int k_tile = kTile;
+  constexpr int q_tile = kQTile;
+  constexpr int k_tile = kKTile;
   constexpr int tile_d = kWideTileD;
-  constexpr int warps = kWideWarps<kTile>;
+  constexpr int warps = kWideWarps<kQTile>;
+  constexpr int rows_per_warp = kWideRowsPerWarp<kQTile>;
   constexpr int threads = warps * 32;
   constexpr unsigned long long full_mask = 0xffffffffffffffffull;
   constexpr float log2e = 1.4426950408889634f;
 
   extern __shared__ unsigned char smem_raw[];
-  TpWideShared<kTile>& smem =
-      *reinterpret_cast<TpWideShared<kTile>*>(smem_raw);
+  TpWideShared<kQTile, kKTile>& smem =
+      *reinterpret_cast<TpWideShared<kQTile, kKTile>*>(smem_raw);
   const int thread = threadIdx.x;
   const int warp = thread >> 5;
   const int lane = thread & 31;
@@ -143,15 +148,23 @@ __global__ void sdpa_wide_flash_kernel(
   // covers the whole context.
   const int64_t last_k = is_causal ? min(Tkv, q0 + q_tile) : Tkv;
 
+  // A causal row t admits keys 0..t, so the key tiles entirely past its bound
+  // contribute nothing to it.  A warp whose rows all sit past a tile's bound
+  // skips the whole tile for those rows: the score row is zeroed so the value
+  // product adds nothing, and the carried row state survives untouched.  This
+  // is what keeps a tall query tile from re-paying the early context for rows
+  // that cannot see it; without it a block owning rows far above the diagonal
+  // walks the tiles below for them as well, and the walk's cost grows with the
+  // rectangle rather than the triangle.
   // The output is carried in registers as a plain float tile rather than a
   // tensor-core fragment: the wide precision has no fragment form here, and a
   // tile this size is cheaper in registers than a round trip through the chip.
   // The block covers the whole query tile, so each thread owns a slice of it.
-  float acc[kWideRowsPerWarp<kTile>][kWideColsPerLane<kTile>];
+  float acc[rows_per_warp][kWideColsPerLane];
 #pragma unroll
-  for (int r = 0; r < kWideRowsPerWarp<kTile>; ++r)
+  for (int r = 0; r < rows_per_warp; ++r)
 #pragma unroll
-    for (int c = 0; c < kWideColsPerLane<kTile>; ++c) acc[r][c] = 0.f;
+    for (int c = 0; c < kWideColsPerLane; ++c) acc[r][c] = 0.f;
 
   for (int64_t k0 = 0; k0 < last_k; k0 += k_tile) {
     // The key lands in the shared buffer and is consumed by the score product;
@@ -172,8 +185,15 @@ __global__ void sdpa_wide_flash_kernel(
     // under, so a lane's sweep over the key rows reads across the banks
     // instead of marching down one.
     if (warp < warps) {
-      const int qr0 = warp * kWideRowsPerWarp<kTile>;
-      for (int qr = qr0; qr < qr0 + kWideRowsPerWarp<kTile>; ++qr) {
+      const int qr0 = warp * rows_per_warp;
+      for (int qr = qr0; qr < qr0 + rows_per_warp; ++qr) {
+        const int64_t qg = q0 + qr;
+        // A row whose bound is below this tile's first key has no score to
+        // compute and no state to carry: zero its slots and step past it.
+        if (is_causal && qg < k0) {
+          for (int n = lane; n < k_tile; n += 32) smem.score[qr][n] = 0.f;
+          continue;
+        }
         for (int n = lane; n < k_tile; n += 32) {
           float total = 0.f;
           for (int d0 = 0; d0 < tile_d; ++d0)
@@ -198,9 +218,12 @@ __global__ void sdpa_wide_flash_kernel(
     // The score tile is rewritten in place with the probability, so the value
     // product below reads a probability it does not have to be given twice.
     if (warp < warps) {
-      const int qr0 = warp * kWideRowsPerWarp<kTile>;
-      for (int qr = qr0; qr < qr0 + kWideRowsPerWarp<kTile>; ++qr) {
+      const int qr0 = warp * rows_per_warp;
+      for (int qr = qr0; qr < qr0 + rows_per_warp; ++qr) {
         const int64_t qg = q0 + qr;
+        // A row the score pass zeroed has nothing to fold: its probability
+        // slots are already zero and its carried state stays as it was.
+        if (is_causal && qg < k0) continue;
         float maximum = -INFINITY;
         for (int kk = lane; kk < k_tile; kk += 32) {
           const int64_t kg = k0 + kk;
@@ -248,22 +271,30 @@ __global__ void sdpa_wide_flash_kernel(
     // owns a slice of the head width for every key, so no column is touched by
     // two lanes and no cross-lane reduction is needed.
     if (warp < warps) {
-      const int qr0 = warp * kWideRowsPerWarp<kTile>;
+      const int qr0 = warp * rows_per_warp;
 #pragma unroll
-      for (int r = 0; r < kWideRowsPerWarp<kTile>; ++r) {
-        const float alpha = smem.row_alpha[qr0 + r];
-#pragma unroll
-        for (int c = 0; c < kWideColsPerLane<kTile>; ++c) acc[r][c] *= alpha;
-      }
-      for (int r = 0; r < kWideRowsPerWarp<kTile>; ++r) {
+      for (int r = 0; r < rows_per_warp; ++r) {
         const int qr = qr0 + r;
+        // A row the walk skips carries no new maximum, so its carried output
+        // is rescaled by one rather than by whatever the last walked tile
+        // left in its alpha slot -- that stale value would wipe the output.
+        const float alpha =
+            (is_causal && q0 + qr < k0) ? 1.f : smem.row_alpha[qr];
+#pragma unroll
+        for (int c = 0; c < kWideColsPerLane; ++c) acc[r][c] *= alpha;
+      }
+      for (int r = 0; r < rows_per_warp; ++r) {
+        const int qr = qr0 + r;
+        // A row past its bound carries no new probability, so its product
+        // would add zero; the rescale above was all it needed.
+        if (is_causal && q0 + qr < k0) continue;
         // A lane takes columns a bank apart rather than a run of them: the
         // value row a lane reads at each key step is then one float wide, and
         // a warp's sweep over the key rows sweeps the banks instead of four
         // lanes sharing one.  The column offset also coalesces the final
         // store, which writes the same columns.
 #pragma unroll
-        for (int c = 0; c < kWideColsPerLane<kTile>; ++c) {
+        for (int c = 0; c < kWideColsPerLane; ++c) {
           float total = 0.f;
           for (int n = 0; n < k_tile; ++n)
             total += smem.score[qr][n] * smem.kv[n][lane + 32 * c];
@@ -277,15 +308,15 @@ __global__ void sdpa_wide_flash_kernel(
   // Normalize from the register tile straight into the result.  A row whose
   // keys were all masked away has no total and is left at zero.
   if (warp < warps) {
-    const int qr0 = warp * kWideRowsPerWarp<kTile>;
-    for (int r = 0; r < kWideRowsPerWarp<kTile>; ++r) {
+    const int qr0 = warp * rows_per_warp;
+    for (int r = 0; r < rows_per_warp; ++r) {
       const int qr = qr0 + r;
       const int64_t qg = q0 + qr;
       if (qg >= Tq) continue;
       const float total = smem.row_sum[qr];
       const float inverse = total > 0.f ? 1.f / total : 0.f;
 #pragma unroll
-      for (int c = 0; c < kWideColsPerLane<kTile>; ++c) {
+      for (int c = 0; c < kWideColsPerLane; ++c) {
         if (lane + 32 * c < D)
           out[q_base + qg * D + (lane + 32 * c)] = acc[r][c] * inverse;
       }
@@ -363,21 +394,31 @@ namespace {
 
 // One launch per tile shape.  A call is served by the tile that fits its query
 // length, which is what keeps a one-row call from reading a whole tile of keys
-// and masking all but one of them away.
-template <int kTile>
+// and masking all but one of them away.  A long query takes the rectangular
+// tile: the score tile and the key tile stay at the key length, while the
+// query axis is stretched, so the context's early key tiles are re-read once
+// per query tile instead of once per handful of rows.
+template <int kQTile, int kKTile>
 Tensor sdpa_wide_tiled_launch(const Tensor& q, const Tensor& k,
                               const Tensor& v, int64_t B, int64_t Hq,
                               int64_t Hkv, int64_t Tq, int64_t Tkv, int64_t D,
                               bool is_causal) {
   Tensor out = Tensor::empty({B, Hq, Tq, D}, DType::Float32, q.device());
   const float scale = 1.f / std::sqrt(static_cast<float>(D));
-  const int64_t q_blocks = (Tq + kTile - 1) / kTile;
-  const size_t smem_bytes = sizeof(TpWideShared<kTile>);
+  const int64_t q_blocks = (Tq + kQTile - 1) / kQTile;
+  const size_t smem_bytes = sizeof(TpWideShared<kQTile, kKTile>);
   const dim3 grid(static_cast<unsigned>(B * Hq),
                   static_cast<unsigned>(q_blocks));
-  const int threads = kWideWarps<kTile> * 32;
+  const int threads = kWideWarps<kQTile> * 32;
   cudaStream_t stream = getCurrentCUDAStream().stream();
-  sdpa_wide_flash_kernel<kTile><<<grid, threads, smem_bytes, stream>>>(
+  // The rectangular tile's shared footprint clears the default per-block
+  // budget, so the launch opts into the larger one the device allows.
+  if (smem_bytes > 48 * 1024) {
+    TP_WIDE_CUDA_CHECK(cudaFuncSetAttribute(
+        sdpa_wide_flash_kernel<kQTile, kKTile>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+  }
+  sdpa_wide_flash_kernel<kQTile, kKTile><<<grid, threads, smem_bytes, stream>>>(
       q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
       out.data_ptr<float>(), B, Hq, Hkv, Tq, Tkv, D, scale, is_causal);
   TP_WIDE_CUDA_CHECK(cudaGetLastError());
@@ -454,18 +495,27 @@ Tensor sdpa_wide_tiled_cuda(const Tensor& query, const Tensor& key,
     return sdpa_one_row_first_value_cuda(q, k, v, B, Hq, Hkv, Tkv, D);
   }
   if (Tq <= 1) {
-    return sdpa_wide_tiled_launch<1>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
+    return sdpa_wide_tiled_launch<1, 1>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
   }
   if (Tq <= 4) {
-    return sdpa_wide_tiled_launch<4>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
+    return sdpa_wide_tiled_launch<4, 4>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
   }
   if (Tq <= 8) {
-    return sdpa_wide_tiled_launch<8>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
+    return sdpa_wide_tiled_launch<8, 8>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
   }
   if (Tq <= 16) {
-    return sdpa_wide_tiled_launch<16>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
+    return sdpa_wide_tiled_launch<16, 16>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
   }
-  return sdpa_wide_tiled_launch<32>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
+  // A long query takes the rectangular tile.  The walk's cost for a causal
+  // call is the context re-read once per query tile, so the query tile is
+  // stretched until the re-reads are paid for by the shorter key walk each
+  // carries; past that the score tile grows the shared footprint without
+  // shortening anything.
+  if (Tq <= 32) {
+    return sdpa_wide_tiled_launch<32, 32>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
+  }
+  return sdpa_wide_tiled_launch<kWideQTileLarge, kWideKTileLarge>(
+      q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
 }
 
 }  // namespace cuda

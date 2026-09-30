@@ -230,6 +230,27 @@ Tensor conv_transpose2d_cudnn_v8(const Tensor& input, const Tensor& weight,
                                  int64_t groups,
                                  const std::vector<int64_t>& dilation);
 
+// Backward-data convolution on the graph path.  Undefined tensor when the
+// case is not representable there (dtype, grouping, or a version that cannot
+// build the operation), in which case the caller falls back to the legacy
+// descriptor path.
+Tensor conv2d_grad_input_cudnn_v8(const Tensor& grad_output, const Tensor& input,
+                                  const Tensor& weight,
+                                  const std::vector<int64_t>& stride,
+                                  const std::vector<int64_t>& padding,
+                                  int64_t groups,
+                                  const std::vector<int64_t>& dilation);
+
+// Backward-filter convolution on the graph path.  Undefined tensor when the
+// case is not representable there, in which case the caller falls back to the
+// legacy descriptor path.
+Tensor conv2d_grad_weight_cudnn_v8(const Tensor& grad_output, const Tensor& input,
+                                   const Tensor& weight,
+                                   const std::vector<int64_t>& stride,
+                                   const std::vector<int64_t>& padding,
+                                   int64_t groups,
+                                   const std::vector<int64_t>& dilation);
+
 Tensor conv2d_cudnn_legacy(const Tensor& input, const Tensor& weight,
                             const Tensor& bias, const std::vector<int64_t>& stride,
                             const std::vector<int64_t>& padding,
