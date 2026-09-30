@@ -134,6 +134,7 @@ def _trace_forward(fn: Callable[..., Any], primals: Sequence[Any], decomposition
             out = fn(*trace_primals)
     flat_out, out_spec = tree_flatten(out)
     tracer.graph.output(tuple(tracer.map_value(v) for v in flat_out))
+    tracer.graph.eliminate_dead_code()
     return GraphModule(tracer.root, tracer.graph), out_spec, flat_out
 
 
@@ -200,6 +201,7 @@ def _trace_joint(fn: Callable[..., Any], primals: Sequence[Any], decompositions)
     fwd_values = [tracer.map_value(v) for v in flat_out]
     bwd_values = [None if g is None else tracer.map_value(g) for g in grads]
     tracer.graph.output(tuple(fwd_values + bwd_values))
+    tracer.graph.eliminate_dead_code()
     joint = GraphModule(tracer.root, tracer.graph)
     return (
         joint,

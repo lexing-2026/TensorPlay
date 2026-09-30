@@ -6166,9 +6166,10 @@ class KernelGroup:
 
         # 3. Function body
         with code.indent():
+            code.writeline("std::atomic<int> tensorplay_cpu_integer_div_error{0};")
             code.writeline(
-                "tensorplay::generated::integer_div_error_flag() ="
-                " &tensorplay::generated::integer_div_error();"
+                "tensorplay::generated::integer_div_error_flag ="
+                " &tensorplay_cpu_integer_div_error;"
             )
             if enable_kernel_profile:
                 graph_id = V.graph.graph_id
@@ -6184,8 +6185,11 @@ class KernelGroup:
             for old, new in self.args.aliases():
                 code.writeline(f"auto {old} = {new};")
             code.splice(self.loops_code)
-            code.writeline("tensorplay::generated::integer_div_error_flag() = nullptr;")
-            code.writeline("tensorplay::generated::throw_if_integer_div_error(0);")
+            code.writeline("tensorplay::generated::integer_div_error_flag = nullptr;")
+            code.writeline(
+                "tensorplay::generated::throw_if_integer_div_error("
+                "tensorplay_cpu_integer_div_error);"
+            )
         return code.getvalue()
 
     def call_kernel(self, wrapper, kernel_name):

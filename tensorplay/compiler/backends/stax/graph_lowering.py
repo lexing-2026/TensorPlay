@@ -532,6 +532,7 @@ class GraphLowering(Interpreter):
         self.operations: list[Any] = []
         self.graph_inputs: dict = {}
         self.constants: dict[str, Any] = {}
+        self._embedded_tensor_constants: dict[int, TensorBox] = {}
         #: What each constant is, described without reading it -- so that two
         #: compilations can be compared without holding the values, and so that
         #: a constant can be recognised as one already compiled.
@@ -651,7 +652,7 @@ class GraphLowering(Interpreter):
         # one-element sequence, so the compiled region matches its capture.
         self.single_output = True
         self._counter = 0
-        self.device = None
+        self.current_device = None
         # What each node has been lowered to, by the node itself.  Kept on the
         # region rather than inside the walk because a subgraph's nodes are
         # lowered into this same region, and a value produced by one of them
@@ -1231,9 +1232,9 @@ class GraphLowering(Interpreter):
         answered for it.
         """
 
-        if self.device is None:
+        if self.current_device is None:
             raise RuntimeError("Trying to get current device but it is not set")
-        return self.device
+        return self.current_device
 
     @contextlib.contextmanager
     def set_current_device(self, device):
@@ -1244,12 +1245,12 @@ class GraphLowering(Interpreter):
         previous one is put back when it is done.
         """
 
-        previous = self.device
-        self.device = device
+        previous = self.current_device
+        self.current_device = device
         try:
             yield device
         finally:
-            self.device = previous
+            self.current_device = previous
 
     def register_welford(self, reduction: Reduction):
         """One welford loop nest, two stored results: mean and m2."""
@@ -1642,8 +1643,6 @@ class GraphLowering(Interpreter):
         self.graph_inputs[name] = tensor
         self.graph_inputs_original[name] = buffer
         self.graph_input_names.append(name)
-        if self.device is None and example.device.is_cuda():
-            self.device = example.device
         return tensor
 
     def call_module(self, target, args, kwargs):
@@ -1668,6 +1667,19 @@ class GraphLowering(Interpreter):
         """
 
         node = V.graph.current_node
+
+        def materialize_embedded_tensor(value):
+            if isinstance(value, tp.Tensor):
+                key = id(value)
+                cached = self._embedded_tensor_constants.get(key)
+                if cached is None:
+                    cached = self.add_tensor_constant(value)
+                    self._embedded_tensor_constants[key] = cached
+                return cached
+            return value
+
+        args = pytree.tree_map(materialize_embedded_tensor, args)
+        kwargs = pytree.tree_map(materialize_embedded_tensor, kwargs)
         name = target_name(target)
         if name == "getitem" and args and isinstance(args[0], (list, tuple)):
             # Indexing a result tuple is answered here rather than called out
@@ -2012,14 +2024,9 @@ class GraphLowering(Interpreter):
         if self.can_inline_constant(value):
             from .op_lowerings import tensor
 
-            # The value is written into the body as numbers, and a number is
-            # written with the name of its type -- which is what the arithmetic
-            # that reads it back is written in terms of.  A value's own type
-            # object is not that name, and passing it would leave the numbers
-            # untyped where every other number in the body is typed.
             return tensor(
                 value.tolist(),
-                dtype=str(value.dtype).rsplit(".", 1)[-1],
+                dtype=value.dtype,
                 device=value.device,
             )
 

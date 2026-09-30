@@ -213,6 +213,11 @@ class NullKernelHandler(NullHandler):
         else:
             raise ValueError(f"Unknown dtype: {self.index_dtype}")
 
+    @contextmanager
+    def set_current_node(self, node):
+        del node
+        yield
+
 
 _ops: Virtualized[OpsHandler] = Virtualized(
     "ops", cast(type[OpsHandler], MockHandler)

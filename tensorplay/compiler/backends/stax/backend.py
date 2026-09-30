@@ -214,6 +214,8 @@ def _lower_stax_region(
     # buffer is written into -- is answered by the region it belongs to.  So
     # the region is the one that is current for all of it.
     from .loops import set_graph
+    from .loops import set_fake_mode
+    from .loop_compile import FakeTensorMode
 
     from .loops import Debug
     from .virtualized import V as VirtualMachine
@@ -224,7 +226,12 @@ def _lower_stax_region(
         # are asked of it by name while they are being decided, and neither can
         # say where to write unless something has already said that it wants to
         # be written at all.
-        with set_graph(graph), VirtualMachine.set_debug_handler(Debug()):
+        with (
+            set_fake_mode(FakeTensorMode(allow_non_fake_inputs=True)),
+            VirtualMachine.set_fake_mode(FakeTensorMode(allow_non_fake_inputs=True)),
+            set_graph(graph),
+            VirtualMachine.set_debug_handler(Debug()),
+        ):
             graph.run(*example_inputs)
             compiled_module = graph.compile_to_module()
     except NotImplementedError as exc:

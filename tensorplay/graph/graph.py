@@ -810,15 +810,15 @@ class CodeGen:
                 return node_ref(value)
             if value is None or value is True or value is False or value is Ellipsis:
                 return repr(value)
+            if isinstance(value, enum.Enum):
+                cls = add_global(value.__class__.__name__, value.__class__)
+                return f"{cls}.{value.name}"
             if isinstance(value, (str, bytes, int, float, complex)):
                 if isinstance(value, complex) and (
                     not math.isfinite(value.real) or not math.isfinite(value.imag)
                 ):
                     return f"complex({value.real!r}, {value.imag!r})"
                 return repr(value)
-            if isinstance(value, enum.Enum):
-                cls = add_global(value.__class__.__name__, value.__class__)
-                return f"{cls}.{value.name}"
             if isinstance(value, tuple) and hasattr(value, "_fields"):
                 cls = add_global(_qualified_name(type(value)), type(value))
                 return f"{cls}({', '.join(render(item) for item in value)})"

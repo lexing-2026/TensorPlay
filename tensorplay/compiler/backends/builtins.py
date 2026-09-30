@@ -8,7 +8,14 @@ from .._core.registry import BackendCapabilities, register_backend
 def register() -> None:
     from .stax import stax
 
-    register_backend(stax, name="stax")
+    register_backend(
+        stax,
+        name="stax",
+        capabilities=BackendCapabilities(
+            inference_only=True,
+            handles_training=False,
+        ),
+    )
     # Importing the module registers the debug-tagged backends.
     from . import debugging  # noqa: F401
 

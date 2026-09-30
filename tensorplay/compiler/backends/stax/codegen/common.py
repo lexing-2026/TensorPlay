@@ -37,7 +37,7 @@ import sympy
 from sympy.printing.python import PythonPrinter as _PythonPrinter
 from sympy.printing.precedence import PRECEDENCE
 import tensorplay as tp
-from tensorplay.graph import Graph
+from tensorplay.graph import Graph, Node
 
 from tensorplay.graph.experimental.sympy_functions import (
     Max,
@@ -3317,7 +3317,7 @@ class DataTypePropagation:
         for k, v in body.subblocks.items():
             self.graphs[k] = v.graph
 
-    def deduce_node_dtype_by_inputs(self, node: tp.Node) -> tp.dtype | None:
+    def deduce_node_dtype_by_inputs(self, node: Node) -> tp.dtype | None:
         """The type this operation produced, promoted from everything it was given.
 
         Where even one input has no settled type, nothing can be said: the
@@ -3326,7 +3326,7 @@ class DataTypePropagation:
 
         inputs = node.all_input_nodes
         input_nodes = [
-            n for n in inputs if isinstance(n, tp.Node) and n.op != "placeholder"
+            n for n in inputs if isinstance(n, Node) and n.op != "placeholder"
         ]
         if len(input_nodes) == 0:
             return None
@@ -3344,7 +3344,7 @@ class DataTypePropagation:
             [n.meta[OptimizationContext.key].dtype for n in input_nodes],
         )
 
-    def deduce_node_dtype_by_subgraph(self, node: tp.Node) -> tp.dtype:
+    def deduce_node_dtype_by_subgraph(self, node: Node) -> tp.dtype:
         """The type of a whole subgraph, which is whatever its output settled to."""
 
         sub_graph = self.graphs[node.target]
@@ -3353,7 +3353,7 @@ class DataTypePropagation:
             raise AssertionError("expected subgraph to propagate a dtype")
         return dtype
 
-    def deduce_node_dtype(self, node: tp.Node) -> tp.dtype | None:
+    def deduce_node_dtype(self, node: Node) -> tp.dtype | None:
         if node.op == "placeholder":
             return None
 
@@ -3364,7 +3364,7 @@ class DataTypePropagation:
 
         if node.target is operator.getitem:
             node_arg = node.args[0]
-            if not isinstance(node_arg, tp.Node):
+            if not isinstance(node_arg, Node):
                 raise AssertionError(type(node_arg))
             return self.deduce_node_dtype(node_arg)
 

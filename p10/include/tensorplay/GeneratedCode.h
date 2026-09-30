@@ -15,8 +15,11 @@
 // needs no state in the runtime library.
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <functional>
+#include <limits>
+#include <type_traits>
 #include <thread>
 #include <vector>
 
@@ -28,6 +31,65 @@
 
 namespace tensorplay {
 namespace generated {
+
+inline std::atomic<int>* integer_div_error_flag = nullptr;
+
+inline void note_integer_div_by_zero() {
+    if (integer_div_error_flag != nullptr) {
+        integer_div_error_flag->store(1, std::memory_order_relaxed);
+    } else {
+        TP_THROW(RuntimeError, "ZeroDivisionError");
+    }
+}
+
+inline void throw_if_integer_div_error(std::atomic<int>& error) {
+    if (error.load(std::memory_order_acquire)) {
+        TP_THROW(RuntimeError, "ZeroDivisionError");
+    }
+}
+
+template <typename T, typename U>
+TP_ALWAYS_INLINE std::common_type_t<T, U> floor_divide_integral(T a, U b) {
+    using C = std::common_type_t<T, U>;
+    static_assert(std::is_integral_v<C>);
+    const C lhs = static_cast<C>(a);
+    const C rhs = static_cast<C>(b);
+    if (rhs == C(0)) {
+        note_integer_div_by_zero();
+        return C(0);
+    }
+    if constexpr (std::is_signed_v<C>) {
+        if (lhs == std::numeric_limits<C>::min() && rhs == C(-1)) {
+            return lhs;
+        }
+        const C quotient = static_cast<C>(lhs / rhs);
+        const C remainder = static_cast<C>(lhs % rhs);
+        return remainder != C(0) && ((remainder < C(0)) != (rhs < C(0)))
+            ? static_cast<C>(quotient - C(1))
+            : quotient;
+    }
+    return static_cast<C>(lhs / rhs);
+}
+
+template <typename T>
+TP_ALWAYS_INLINE T div_floor_floating(T a, T b) {
+    if (b == T(0)) {
+        return a / b;
+    }
+    const T remainder = std::fmod(a, b);
+    T quotient = (a - remainder) / b;
+    if (remainder != T(0) && ((b < T(0)) != (remainder < T(0)))) {
+        quotient -= T(1);
+    }
+    if (quotient != T(0)) {
+        T result = std::floor(quotient);
+        if (quotient - result > T(0.5)) {
+            result += T(1);
+        }
+        return result;
+    }
+    return std::copysign(T(0), a / b);
+}
 
 // Which worker of a launch this is, counted from zero.
 //

@@ -91,7 +91,6 @@ from .loops import (
     as_index,
     contiguous_strides,
     dtype_name,
-    floordiv,
     modular_indexing,
     ops,
     prod,
@@ -1210,7 +1209,7 @@ def lower_add(a, b, *rest, **kwargs):
     alpha = _alpha((a, b, *rest), kwargs, 2)
     if alpha == 1:
         return pointwise(ops.add, a, b)
-    return pointwise(lambda x, y: ops.add(x, ops.mul(y, ops.constant(float(alpha), "float32"))), a, b)
+    return pointwise(lambda x, y: ops.add(x, ops.mul(y, ops.constant(float(alpha), tp.float32))), a, b)
 
 
 @register("sub.Tensor", "sub.Scalar")
@@ -1218,7 +1217,7 @@ def lower_sub(a, b, *rest, **kwargs):
     alpha = _alpha((a, b, *rest), kwargs, 2)
     if alpha == 1:
         return pointwise(ops.sub, a, b)
-    return pointwise(lambda x, y: ops.sub(x, ops.mul(y, ops.constant(float(alpha), "float32"))), a, b)
+    return pointwise(lambda x, y: ops.sub(x, ops.mul(y, ops.constant(float(alpha), tp.float32))), a, b)
 
 
 @register("rsub.Scalar", "rsub.Tensor")
@@ -1351,7 +1350,7 @@ def lower_silu_backward(grad, x):
     # grad * s * (1 + x * (1 - s)),  s = sigmoid(x)
     def fn(g, v):
         s = ops.sigmoid(v)
-        one = ops.constant(1.0, "float32")
+        one = ops.constant(1.0, tp.float32)
         return ops.mul(ops.mul(g, s), ops.add(one, ops.mul(v, ops.sub(one, s))))
 
     return pointwise(fn, grad, x)
@@ -1417,7 +1416,11 @@ def _unflatten_index(flat, size):
         elif stride == 1:
             out.append(modular_indexing(flat, 1, int(extent)) if out else flat)
         else:
-            out.append(modular_indexing(flat, stride, int(extent)) if out else floordiv(flat, sympy.Integer(stride)))
+            out.append(
+                modular_indexing(flat, stride, int(extent))
+                if out
+                else FloorDiv(flat, sympy.Integer(stride))
+            )
     return out
 
 
@@ -1623,7 +1626,7 @@ def lower_cat(tensors, dim=0):
     loaders = [t.make_loader() for t in inputs]
 
     def inner(index):
-        position = ops.index_expr(index[dim], "int64")
+        position = ops.index_expr(index[dim], tp.int64)
         value = None
         for k in range(len(inputs)):
             lo = starts[k]
@@ -1631,13 +1634,13 @@ def lower_cat(tensors, dim=0):
             shifted = list(index)
             shifted[dim] = index[dim] - lo
             if k == 0:
-                cond = ops.lt(position, ops.constant(hi, "int64"))
+                cond = ops.lt(position, ops.constant(hi, tp.int64))
             elif k == len(inputs) - 1:
-                cond = ops.ge(position, ops.constant(lo, "int64"))
+                cond = ops.ge(position, ops.constant(lo, tp.int64))
             else:
                 cond = ops.and_(
-                    ops.ge(position, ops.constant(lo, "int64")),
-                    ops.lt(position, ops.constant(hi, "int64")),
+                    ops.ge(position, ops.constant(lo, tp.int64)),
+                    ops.lt(position, ops.constant(hi, tp.int64)),
                 )
             loaded = ops.masked(cond, lambda k=k, shifted=shifted: loaders[k](shifted), 0.0)
             value = loaded if value is None else ops.where(cond, loaded, value)
@@ -1717,7 +1720,7 @@ def lower_mean(x, dims, keepdim=False, dtype=None, **kwargs):
     total = make_reduction(
         x, dims, keepdim, dtype or x.get_dtype(), x.get_device(), "sum"
     )
-    return pointwise(lambda v: ops.truediv(v, ops.constant(float(count), "float32")), total)
+    return pointwise(lambda v: ops.truediv(v, ops.constant(float(count), tp.float32)), total)
 
 
 @register("amax.default")
@@ -1773,7 +1776,7 @@ def lower_native_group_norm(x, weight, bias, n, c, hxw, groups, eps):
     rows_loader = rows.make_loader()
 
     def welford_inner(index, rindex):
-        return ops.to_dtype(rows_loader([index[0], index[1], rindex[0]]), "float32")
+        return ops.to_dtype(rows_loader([index[0], index[1], rindex[0]]), tp.float32)
 
     stats = Reduction.create(
         device=device,
@@ -1790,8 +1793,8 @@ def lower_native_group_norm(x, weight, bias, n, c, hxw, groups, eps):
     mean_loader = mean_box.make_loader()
 
     def rstd_at(ng):
-        var = ops.truediv(m2_loader(ng), ops.constant(float(row), "float32"))
-        return ops.rsqrt(ops.add(var, ops.constant(float(eps), "float32")))
+        var = ops.truediv(m2_loader(ng), ops.constant(float(row), tp.float32))
+        return ops.rsqrt(ops.add(var, ops.constant(float(eps), tp.float32)))
 
     rstd_box = Pointwise.create(
             device=device,
@@ -1806,9 +1809,9 @@ def lower_native_group_norm(x, weight, bias, n, c, hxw, groups, eps):
 
     def out_inner(index):
         channel = index[1]
-        group = floordiv(as_index(channel), sympy.Integer(cpg))
+        group = FloorDiv(as_index(channel), sympy.Integer(cpg))
         ng = [index[0], group]
-        value = ops.to_dtype(x_loader(index), "float32")
+        value = ops.to_dtype(x_loader(index), tp.float32)
         value = ops.mul(ops.sub(value, mean_loader(ng)), rstd_at(ng))
         if w_loader is not None:
             value = ops.mul(value, w_loader([channel]))
@@ -1832,7 +1835,7 @@ def lower_native_group_norm_backward(grad_out, x, mean, rstd, gamma, n, c, hxw, 
     mean_loader = mean.make_loader()
     rstd_loader = rstd.make_loader()
     gamma_loader = gamma.make_loader() if is_tensor_box(gamma) else None
-    f32 = "float32"
+    f32 = tp.float32
 
     # Per (n, c) sums over the spatial extent: ds = sum(dy * x), db = sum(dy).
     def full_index(index, rindex):
@@ -1848,7 +1851,7 @@ def lower_native_group_norm_backward(grad_out, x, mean, rstd, gamma, n, c, hxw, 
 
     ds = Reduction.create(
         device=device,
-        dtype='float32',
+        dtype=tp.float32,
         inner_fn=ds_inner,
         ranges=(n, c),
         reduction_ranges=(hxw,),
@@ -1856,7 +1859,7 @@ def lower_native_group_norm_backward(grad_out, x, mean, rstd, gamma, n, c, hxw, 
     )
     db = Reduction.create(
         device=device,
-        dtype='float32',
+        dtype=tp.float32,
         inner_fn=db_inner,
         ranges=(n, c),
         reduction_ranges=(hxw,),
@@ -1883,7 +1886,7 @@ def lower_native_group_norm_backward(grad_out, x, mean, rstd, gamma, n, c, hxw, 
 
         ds_val = Reduction.create(
         device=device,
-        dtype='float32',
+        dtype=tp.float32,
         inner_fn=dsv_inner,
         ranges=(n, groups),
         reduction_ranges=(cpg,),
@@ -1891,7 +1894,7 @@ def lower_native_group_norm_backward(grad_out, x, mean, rstd, gamma, n, c, hxw, 
     )
         db_val = Reduction.create(
         device=device,
-        dtype='float32',
+        dtype=tp.float32,
         inner_fn=dbv_inner,
         ranges=(n, groups),
         reduction_ranges=(cpg,),
@@ -1916,10 +1919,10 @@ def lower_native_group_norm_backward(grad_out, x, mean, rstd, gamma, n, c, hxw, 
             return ops.sub(left, right)
 
         c2 = Pointwise.create(
-                device=device, dtype="float32", inner_fn=c2_at, ranges=(n, groups)
+                device=device, dtype=tp.float32, inner_fn=c2_at, ranges=(n, groups)
         )
         c3 = Pointwise.create(
-                device=device, dtype="float32", inner_fn=c3_at, ranges=(n, groups)
+                device=device, dtype=tp.float32, inner_fn=c3_at, ranges=(n, groups)
         )
         c2.realize()
         c3.realize()
@@ -1929,7 +1932,7 @@ def lower_native_group_norm_backward(grad_out, x, mean, rstd, gamma, n, c, hxw, 
 
         def dx_inner(index):
             ch = index[1]
-            ng = [index[0], floordiv(as_index(ch), sympy.Integer(cpg))]
+            ng = [index[0], FloorDiv(as_index(ch), sympy.Integer(cpg))]
             c1 = ops.mul(ops.to_dtype(rstd_loader(ng), f32), gamma_at(ch))
             dy = ops.to_dtype(dy_loader(index), f32)
             xv = ops.to_dtype(x_loader(index), f32)
@@ -1941,7 +1944,7 @@ def lower_native_group_norm_backward(grad_out, x, mean, rstd, gamma, n, c, hxw, 
 
         def dgamma_inner(index, rindex):
             ch = index[0]
-            ng = [rindex[0], floordiv(as_index(ch), sympy.Integer(cpg))]
+            ng = [rindex[0], FloorDiv(as_index(ch), sympy.Integer(cpg))]
             m = ops.to_dtype(mean_loader(ng), f32)
             r = ops.to_dtype(rstd_loader(ng), f32)
             nc = [rindex[0], ch]
@@ -2050,7 +2053,7 @@ def _upsample_nearestnd(x, output_size, ndim, **kwargs):
         return [
             *index[: len(prefix)],
             *[
-                floordiv(
+                FloorDiv(
                     as_index(index[len(prefix) + axis]) * i, sympy.Integer(o)
                 )
                 for axis, (i, o) in enumerate(zip(in_spatial, out_spatial))
@@ -2103,7 +2106,7 @@ def lower_avg_poolnd(x, kernel_size, stride=(), padding=0, ceil_mode=False,
     prefix = in_size[: len(in_size) - ndim]
     loader = x.make_loader()
     boundary = any(padding)
-    f32 = "float32"
+    f32 = tp.float32
 
     def inner(index, rindex):
         full = list(index[: len(prefix)])
@@ -2116,10 +2119,10 @@ def lower_avg_poolnd(x, kernel_size, stride=(), padding=0, ceil_mode=False,
         outside = None
         for axis in range(ndim):
             # The address is index arithmetic; a bound test needs it as a value.
-            position = ops.index_expr(full[len(prefix) + axis], "int64")
-            low = ops.ge(position, ops.constant(0, "int64"))
+            position = ops.index_expr(full[len(prefix) + axis], tp.int64)
+            low = ops.ge(position, ops.constant(0, tp.int64))
             high = ops.lt(
-                position, ops.constant(spatial_in[axis], "int64")
+                position, ops.constant(spatial_in[axis], tp.int64)
             )
             inside = ops.and_(low, high)
             outside = inside if outside is None else ops.and_(outside, inside)
@@ -2165,10 +2168,10 @@ def _pool_with_masked_divisor(total, prefix, spatial_out, kernel, stride,
             )
         inside = None
         for axis in range(len(kernel)):
-            position = ops.index_expr(full[len(prefix) + axis], "int64")
+            position = ops.index_expr(full[len(prefix) + axis], tp.int64)
             term = ops.and_(
-                ops.ge(position, ops.constant(0, "int64")),
-                ops.lt(position, ops.constant(spatial_in[axis], "int64")),
+                ops.ge(position, ops.constant(0, tp.int64)),
+                ops.lt(position, ops.constant(spatial_in[axis], tp.int64)),
             )
             inside = term if inside is None else ops.and_(inside, term)
         return ops.masked(inside, lambda: ops.constant(1.0, f32),
@@ -2215,16 +2218,16 @@ def lower_index_add(base, dim, index_box, addend, alpha=None, **kwargs):
         raise NotImplementedError("an index that does not match its addend")
     index_loader = index_box.make_loader()
     addend_loader = addend.make_loader()
-    f32 = "float32"
+    f32 = tp.float32
     scale = 1.0 if alpha is None else float(alpha)
 
     def inner(index, rindex):
-        destination = index_loader([ops.index_expr(rindex[dim], "int64")])
-        here = ops.eq(destination, ops.index_expr(index[dim], "int64"))
+        destination = index_loader([ops.index_expr(rindex[dim], tp.int64)])
+        here = ops.eq(destination, ops.index_expr(index[dim], tp.int64))
         for axis in range(len(out_size)):
             if axis != dim:
                 here = ops.and_(
-                    here, ops.eq(rindex[axis], ops.index_expr(index[axis], "int64"))
+                    here, ops.eq(rindex[axis], ops.index_expr(index[axis], tp.int64))
                 )
         value = addend_loader(list(rindex))
         if scale != 1.0:
@@ -2267,19 +2270,19 @@ def _window_covers(index, rindex, prefix, stride, padding, kernel, f32):
         # output index counts the input positions and carries the prefix.
         at = len(prefix) + axis
         start = ops.mul(
-            ops.index_expr(rindex[axis], "int64"), ops.constant(int(stride[axis]), "int64")
+            ops.index_expr(rindex[axis], tp.int64), ops.constant(int(stride[axis]), tp.int64)
         )
         # start <= index + padding, and start > index + padding - kernel
         low = ops.le(
             start,
-            ops.add(ops.index_expr(index[at], "int64"),
-                    ops.constant(int(padding[axis]), "int64")),
+            ops.add(ops.index_expr(index[at], tp.int64),
+                    ops.constant(int(padding[axis]), tp.int64)),
         )
         high = ops.gt(
             start,
-            ops.sub(ops.add(ops.index_expr(index[at], "int64"),
-                            ops.constant(int(padding[axis]), "int64")),
-                    ops.constant(int(kernel[axis]), "int64")),
+            ops.sub(ops.add(ops.index_expr(index[at], tp.int64),
+                            ops.constant(int(padding[axis]), tp.int64)),
+                    ops.constant(int(kernel[axis]), tp.int64)),
         )
         term = ops.and_(low, high)
         inside = term if inside is None else ops.and_(inside, term)
@@ -2311,7 +2314,7 @@ def lower_avg_poolnd_backward(grad, _input, kernel_size, stride=(), padding=0,
     ]
     prefix = grad_size[: len(grad_size) - ndim]
     loader = grad.make_loader()
-    f32 = "float32"
+    f32 = tp.float32
 
     def summed(index, rindex):
         full = list(index[: len(prefix)]) + [
@@ -4522,7 +4525,7 @@ def tensor(
         def inner_fn(index: Any) -> Any:
             result = ops.index_expr(data, _index_dtype)
             if _truncate_fp:
-                result = ops.to_dtype(result, "float32")
+                result = ops.to_dtype(result, tp.float32)
                 result = ops.to_dtype(result, dtype)
             return result
 
@@ -4631,10 +4634,10 @@ def philox_rand(
         # The seed and the offset are values rather than numbers, and a device
         # reads a position as a number: so both are read and then read as
         # numbers, which is the same conversion the values come back through.
-        seed_index_expr = ops.to_dtype(seed_loader([]), "int32")
-        offset_index_expr = ops.to_dtype(offset_loader([]), "int32")
+        seed_index_expr = ops.to_dtype(seed_loader([]), tp.int32)
+        offset_index_expr = ops.to_dtype(offset_loader([]), tp.int32)
         rand_index_expr = ops.add(
-            ops.index_expr(random_pos(index), "int32"), offset_index_expr
+            ops.index_expr(random_pos(index), tp.int32), offset_index_expr
         )
         result = ops.rand(
             seed_index_expr,

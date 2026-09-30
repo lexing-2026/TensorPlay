@@ -504,12 +504,8 @@ def get_real_inputs():
 def set_fake_mode(mode):
     """Make a tensor mode current, and put back the previous one."""
 
-    previous = V.fake_mode
-    V.fake_mode = mode
-    try:
+    with V.set_fake_mode(mode):
         yield mode
-    finally:
-        V.fake_mode = previous
 
 
 def get_fake_mode():

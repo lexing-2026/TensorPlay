@@ -605,7 +605,11 @@ def _is_module_like(value: Any) -> bool:
     )
 
 
-def _region_is_training(example_inputs: tuple[Any, ...], example_kwargs: dict[str, Any]) -> bool:
+def _region_is_training(
+    example_inputs: tuple[Any, ...],
+    example_kwargs: dict[str, Any],
+    graph_module: GraphModule | None = None,
+) -> bool:
     """Whether any example input carries an autograd requirement.
 
     Backends declare what they support (``BackendCapabilities``); this only
@@ -623,15 +627,30 @@ def _region_is_training(example_inputs: tuple[Any, ...], example_kwargs: dict[st
             return any(touches_autograd(item) for item in value.values())
         return False
 
-    return any(touches_autograd(item) for item in example_inputs) or any(
+    if any(touches_autograd(item) for item in example_inputs) or any(
         touches_autograd(item) for item in example_kwargs.values()
-    )
+    ):
+        return True
+    if graph_module is None:
+        return False
+    for node in graph_module.graph.nodes:
+        if node.op != "get_attr":
+            continue
+        try:
+            value = graph_module._get_attr(node.target)
+        except (AttributeError, KeyError, IndexError, TypeError):
+            continue
+        if touches_autograd(value):
+            return True
+    return False
 
 
 def _adapt_backend_to_region(
     compiler_fn: CompilerFn,
     example_inputs: tuple[Any, ...],
     example_kwargs: dict[str, Any],
+    graph_module: GraphModule | None = None,
+    backend_kwargs: dict[str, Any] | None = None,
 ) -> CompilerFn:
     """Match a backend's declared capabilities to the region being compiled.
 
@@ -646,7 +665,7 @@ def _adapt_backend_to_region(
 
     capabilities = get_backend_capabilities(compiler_fn)
     if capabilities.handles_training or not _region_is_training(
-        example_inputs, example_kwargs
+        example_inputs, example_kwargs, graph_module
     ):
         return compiler_fn
     if not capabilities.inference_only:
@@ -659,8 +678,17 @@ def _adapt_backend_to_region(
     from .common import aot_autograd
     from ..backends.debugging import boxed_nop
 
+    forward_compiler = compiler_fn
+    if backend_kwargs:
+        kwargs = dict(backend_kwargs)
+
+        def forward_compiler(graph, inputs):
+            return compiler_fn(graph, inputs, **kwargs)
+
+        forward_compiler.__name__ = getattr(compiler_fn, "__name__", "compiler_fn")
+
     return aot_autograd(
-        fw_compiler=compiler_fn,
+        fw_compiler=forward_compiler,
         bw_compiler=boxed_nop,
         partition_fn=default_partition,
     )
@@ -783,7 +811,13 @@ def _compile_region(
     except (GraphCaptureError, RuntimeError):
         pass
 
-    compiler_fn = _adapt_backend_to_region(compiler_fn, example_inputs, example_kwargs)
+    compiler_fn = _adapt_backend_to_region(
+        compiler_fn,
+        example_inputs,
+        example_kwargs,
+        graph_module,
+        backend_kwargs,
+    )
 
     regional_inductor_invoke_subgraph(
         graph_module,

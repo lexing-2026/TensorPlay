@@ -587,21 +587,6 @@ class Proxy:
             "call_method", "__call__", (self, *args), kwargs
         )
 
-    def sin(self) -> "Proxy":
-        return self.tracer.create_proxy("call_method", "sin", (self,), {})
-
-    def cos(self) -> "Proxy":
-        return self.tracer.create_proxy("call_method", "cos", (self,), {})
-
-    def exp(self) -> "Proxy":
-        return self.tracer.create_proxy("call_method", "exp", (self,), {})
-
-    def sqrt(self) -> "Proxy":
-        return self.tracer.create_proxy("call_method", "sqrt", (self,), {})
-
-    def relu(self) -> "Proxy":
-        return self.tracer.create_proxy("call_method", "relu", (self,), {})
-
     def __bool__(self) -> bool:
         scalar = self._scalar_sample()
         if scalar is not None:

@@ -319,12 +319,18 @@ class Tracer:
         if isinstance(value, tp.Tensor):
             for name, existing in self._graph_attrs.items():
                 if existing is value:
-                    return self.graph.get_attr(name)
+                    node = self.graph.get_attr(name)
+                    self._node_samples[node.name] = value
+                    node.meta["val"] = value
+                    return node
             name = f"_tensor_constant{len(self._graph_attrs)}"
-            while name in self._graph_attrs:
+            while name in self._graph_attrs or hasattr(self.root, name):
                 name = f"_tensor_constant{len(self._graph_attrs) + 1}"
             self._graph_attrs[name] = value
-            return self.graph.get_attr(name)
+            node = self.graph.get_attr(name)
+            self._node_samples[node.name] = value
+            node.meta["val"] = value
+            return node
         if isinstance(value, tuple):
             mapped = [self.create_arg(item) for item in value]
             if hasattr(value, "_fields"):
@@ -497,6 +503,12 @@ class Tracer:
 
         self.graph.output(self.map_output(output))
         self.graph.lint()
+        for name, value in self._graph_attrs.items():
+            if not hasattr(root, name):
+                try:
+                    setattr(root, name, value)
+                except (AttributeError, TypeError):
+                    pass
         # Specialized (concrete) parameters disappear from the graph contract
         # together with their placeholders; every other parameter keeps its
         # kind and default so ``bind_partial().apply_defaults()`` keeps working.

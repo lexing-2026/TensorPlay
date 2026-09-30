@@ -6179,12 +6179,13 @@ class ExternKernel(InputsKernel):
 
         if not kernel_name:
             kernel_name = self.try_get_kernel_name()
-        if kernel_name and wrapper.write_provenance_debug_handle:
-            debug_handle = wrapper.write_provenance_debug_handle(
-                kernel_name, self, is_extern=True
+        if kernel_name:
+            from .debug import set_kernel_post_grad_provenance_tracing
+
+            debug_handle = set_kernel_post_grad_provenance_tracing(
+                self, kernel_name, is_extern=True
             )
-            if debug_handle is not None:
-                wrapper.make_comment(f"debug_handle: {debug_handle}")
+            wrapper.write_provenance_debug_handle(kernel_name, debug_handle)
 
     def codegen(self, wrapper) -> None:
         raise NotImplementedError
@@ -9924,7 +9925,7 @@ class FallbackKernel(ExternKernelAlloc):
         schema = getattr(self.op_overload, "_schema", None)
         if schema is None:
             return bool(self.alias_names or self.mutation_names)
-        return bool(schema.is_mutable or schema.alias_info_after)
+        return bool(schema.is_mutable or schema._is_view_op())
 
     def get_inputs_that_alias_output(self) -> Sequence:
         """Which inputs the results are the same memory as.

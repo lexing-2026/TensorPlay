@@ -163,6 +163,35 @@ class CppPrinter(CXX11CodePrinter):
             return f"({self._print(item)})"
         return super().parenthesize(item, level, strict)
 
+    def _print_ModularIndexing(self, expr: sympy.Expr) -> str:
+        x, div, mod = expr.args
+        x = self.doprint(x)
+        if div != 1:
+            div = self.doprint(div)
+            x = (
+                "tensorplay::generated::floor_divide_integral("
+                f"static_cast<int64_t>({x}), static_cast<int64_t>({div}))"
+            )
+        mod = self.doprint(mod)
+        return (
+            f"(static_cast<{INDEX_TYPE}>({x}) % "
+            f"static_cast<{INDEX_TYPE}>({mod}))"
+        )
+
+    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        x, div = expr.args
+        x = self.doprint(x)
+        div = self.doprint(div)
+        if expr.is_integer:
+            return (
+                "tensorplay::generated::floor_divide_integral("
+                f"static_cast<int64_t>({x}), static_cast<int64_t>({div}))"
+            )
+        return (
+            "tensorplay::generated::div_floor_floating("
+            f"static_cast<double>({x}), static_cast<double>({div}))"
+        )
+
 
 #: Print an expression as the host language writes it.
 cexpr = CppPrinter().doprint
