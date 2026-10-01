@@ -167,7 +167,10 @@ def test_relu_accuracy_error_backend():
 
 
 def test_non_leaf_compile_error_backend():
-    from tensorplay._stax.debugging import TestingOnlyCompileError
+    from tensorplay._stax.debugging import (
+        TestingOnlyCompileError,
+        non_leaf_compile_error_TESTING_ONLY,
+    )
 
     def fn(x):
         return tp.sin(x)
@@ -175,9 +178,15 @@ def test_non_leaf_compile_error_backend():
     leaf = tp.tensor([1.0, 2.0], requires_grad=True)
     compiled = tp.compile(fn, backend="non_leaf_compile_error_TESTING_ONLY")
     compiled(leaf)
-    fresh = tp.compile(fn, backend="non_leaf_compile_error_TESTING_ONLY")
+
+    # Training regions are routed through AOT autograd, whose traced primals
+    # are leaf clones, so the debug backend's non-leaf guard is exercised
+    # on the callable directly.
+    from tensorplay.graph import Tracer
+
+    gm = Tracer().trace(fn, sample_inputs={"x": leaf})
     with pytest.raises(TestingOnlyCompileError):
-        fresh(leaf * 2)
+        non_leaf_compile_error_TESTING_ONLY(gm, [leaf * 2])
 
 
 def test_tvm_backend_accepts_compile_options(monkeypatch):
