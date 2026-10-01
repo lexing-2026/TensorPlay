@@ -1192,10 +1192,13 @@ def cast_to(value, dtype):
     A value already of the type is returned as it is rather than converted to
     itself: a conversion to the type a value already has is a no-op that still
     costs a kernel, and for a value that is not a loop nest there is no loop to
-    put it in.
+    put it in.  A value with a loop of its own is cast by a kernel of its own;
+    only a scalar read inside a loop is cast by the loop's own arithmetic.
     """
     if is_tensor_box(value) and value.get_dtype() == dtype:
         return value
+    if is_tensor_box(value):
+        return to_dtype(value, dtype)
     return ops.to_dtype(value, dtype)
 
 

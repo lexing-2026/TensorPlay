@@ -1893,21 +1893,3 @@ def convolution_backward_lowering(
         # vary along, which is every axis but the channel one.
         db = grad_out.sum(axis=[0] + list(range(2, ndim + 2)))
     return (dx, dw, db)
-
-
-def _framework_convolution_backward(
-    grad_out, input, weight, bias_sizes, stride, padding, dilation, transposed,
-    output_padding, groups, output_mask,
-):
-    """Both gradients at once, computed by the framework's own operation.
-
-    The floor for a call whose shape no template here is written for, and the
-    only answer for one that asked for two gradients at once: the templates are
-    written to produce one gradient each, so a call that wants both is a call
-    this compiler has no kernel for and says so by handing it over.
-    """
-
-    return framework.convolution_backward(
-        grad_out, input, weight, bias_sizes, stride, padding, dilation,
-        transposed, output_padding, groups, output_mask,
-    )
