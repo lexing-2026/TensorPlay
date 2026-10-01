@@ -824,18 +824,7 @@ class GraphLowering(Interpreter):
             return True
 
         conv_nodes = [
-            n for n in gm.graph.nodes
-            if str(n.target).startswith(
-                (
-                    "tp.conv1d.",
-                    "tp.conv2d.",
-                    "tp.conv3d.",
-                    "tp.convolution.",
-                    "tp.conv1d_grad_",
-                    "tp.conv2d_grad_",
-                    "tp.conv3d_grad_",
-                )
-            )
+            n for n in gm.graph.nodes if n.target is tp.ops.tp.convolution.default
         ]
 
         for n in gm.graph.nodes:
