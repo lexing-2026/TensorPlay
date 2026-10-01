@@ -2289,8 +2289,8 @@ const bool flash_tensor_core_dtype =
 #endif
       )
 #if defined(TP_HAS_NATIVE_CUTE_FLASH)
-      // The wide precision's 128-wide kernel is a native flash leaf too.
-      || (dtype == DType::Float32 && D == 128)
+      // The wide precision's native flash leaves serve heads 64 and 128.
+      || (dtype == DType::Float32 && (D == 64 || D == 128))
 #endif
       ;
   bool tensor_cores_available = true;
@@ -2438,7 +2438,7 @@ const bool flash_tensor_core_dtype =
 #if defined(TP_HAS_NATIVE_CUTE_FLASH)
     supported_head_dim = supported_head_dim || D == 32;
 #endif
-    const bool wide_flash = dtype == DType::Float32 && D == 128;
+    const bool wide_flash = dtype == DType::Float32 && (D == 64 || D == 128);
     if ((!wide_flash && dtype != DType::Float16 && dtype != DType::BFloat16) ||
         !supported_head_dim) {
       TP_THROW(NotImplementedError,

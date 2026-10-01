@@ -31,6 +31,10 @@ void run_mha_fwd(Flash_fwd_params& params, cudaStream_t stream,
           run_mha_fwd_splitkv_dispatch<float, 128, Is_causal>(params, stream);
         }
       });
+    } else if (params.d == 64) {
+      BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+        run_mha_fwd_<float, 64, Is_causal>(params, stream);
+      });
     }
     return;
   }

@@ -9,6 +9,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/layout/layout.h"
 #include <cutlass/numeric_types.h>
+#include <type_traits>
 
 using namespace cute;
 
@@ -79,7 +80,13 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kBlockN = kBlockN_;
     static constexpr int kHeadDim = kHeadDim_;
     static_assert(kHeadDim % 32 == 0);
-    static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
+    // The smem tile's K is a 128-bit-load span: the reduced precisions step
+    // 64 elements when the head is a multiple of 64, while the wide
+    // precision's four-byte elements halve that span, so a 64-wide head uses
+    // a 32-element smem tile and a 128-wide head keeps the 64-element one.
+    static constexpr int kBlockKSmem = std::is_same_v<elem_type, float>
+        ? (kHeadDim % 128 == 0 ? 64 : 32)
+        : (kHeadDim % 64 == 0 ? 64 : 32);
     static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
 

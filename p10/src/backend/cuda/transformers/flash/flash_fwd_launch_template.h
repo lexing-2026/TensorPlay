@@ -279,6 +279,18 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
     });
 }
 
+// The wide precision at head 64 uses the square 64 x 64 tile for both
+    // schedules: its four-byte elements cap the shared-memory span at 32
+    // columns per 128-bit load, and the square tile keeps the causal and
+    // short non-causal walks inside two resident blocks per SM (48 KB).
+    template<typename T, bool Is_causal>
+void run_mha_fwd_hdim64_fp32(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 64;
+    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+    });
+}
+
 template<typename T, bool Is_causal>
 void run_mha_fwd_hdim128_fp32(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 128;
