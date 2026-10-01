@@ -2801,6 +2801,46 @@ def _identity(x):
     return x
 
 
+def _is_fx_node(value) -> bool:
+    """Whether a value is a graph node rather than what a node stands for."""
+
+    return hasattr(value, "op") and hasattr(value, "users")
+
+
+def record_original_output_strides(gm) -> None:
+    """Note the strides each of a graph's outputs had when the graph was traced.
+
+    Recorded once and then left alone, because a pass over the graph may pad a
+    result to make it easier to compute, and a later reader asking what the graph
+    produces is asking what the program asked for rather than what the pass made
+    of it.  Overwriting on a second call would replace the answer to that question
+    with the intermediate one.
+    """
+
+    import tensorplay as tp
+
+    output_node = gm.graph.find_nodes(op="output")[0]
+    if "original_output_strides" in output_node.meta:
+        return
+
+    # The output node wraps what it yields, so a graph yielding one value still
+    # holds it in a one-element sequence, and a graph yielding several holds them
+    # bare.
+    outputs = output_node.args[0]
+    if not _is_fx_node(outputs):
+        outputs = (outputs,)
+
+    strides = []
+    for output in outputs:
+        val = output.meta.get("val") if _is_fx_node(output) else None
+        strides.append(
+            tuple(int(x) for x in val.stride())
+            if val is not None and isinstance(val, tp.Tensor)
+            else None
+        )
+    output_node.meta["original_output_strides"] = strides
+
+
 def gm_original_output_strides(gm) -> None:
     """Record on a graph both what it yields and the strides each output had.
 
@@ -2814,8 +2854,6 @@ def gm_original_output_strides(gm) -> None:
     output_node.meta["user_visible_output_idxs"] = [
         idx for idx, _ in enumerate(output_node.args)
     ]
-
-    from .loop_compile import record_original_output_strides
 
     record_original_output_strides(gm)
 

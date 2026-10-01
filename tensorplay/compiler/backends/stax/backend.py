@@ -215,7 +215,7 @@ def _lower_stax_region(
     # the region is the one that is current for all of it.
     from .loops import set_graph
     from .loops import set_fake_mode
-    from .loop_compile import FakeTensorMode
+    from tensorplay._higher_order_ops._hop_base import FakeTensorMode
 
     from .loops import Debug
     from .virtualized import V as VirtualMachine
