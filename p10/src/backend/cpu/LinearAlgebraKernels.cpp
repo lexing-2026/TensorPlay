@@ -569,6 +569,27 @@ bool mm_onednn(const Tensor& self, const Tensor& mat2, Tensor& result) {
     }
 }
 
+// The oneDNN matmul primitive is only efficient for contiguous or
+// transposed-last-two-dims inputs whose batch dims are packed densely outside
+// the matrix.  Other layouts (e.g. a permuted view whose innermost dim is a
+// batch dim) make oneDNN fall back to a generic blocked kernel that can be
+// orders of magnitude slower than the per-slice BLAS path, so they are
+// normalized to contiguous copies before entering the primitive.
+inline bool onednn_matmul_layout_ok(const Tensor& t) {
+    if (t.is_contiguous()) return true;
+    const int64_t d = t.dim();
+    if (d < 2) return false;
+    const auto& sizes = t.sizes();
+    const auto& strides = t.strides();
+    if (strides[d - 2] != 1 || strides[d - 1] != sizes[d - 2]) return false;
+    int64_t expected = sizes[d - 2] * sizes[d - 1];
+    for (int64_t i = d - 3; i >= 0; --i) {
+        if (strides[i] != expected) return false;
+        expected *= sizes[i];
+    }
+    return true;
+}
+
 bool matmul_onednn(const Tensor& src, const Tensor& weights, Tensor& dst) {
     if (!OneDNNContext::is_enabled()) return false;
     if (!onednn_matmul_dtype_ok(src.dtype()) || src.dtype() != weights.dtype() ||
@@ -578,14 +599,17 @@ bool matmul_onednn(const Tensor& src, const Tensor& weights, Tensor& dst) {
         auto& engine = OneDNNContext::get_engine();
         auto& stream = OneDNNContext::get_stream();
 
+        Tensor src_c = onednn_matmul_layout_ok(src) ? src : src.contiguous();
+        Tensor weights_c = onednn_matmul_layout_ok(weights) ? weights : weights.contiguous();
+
         // Convert shapes and strides to memory::dims
-        memory::dims src_dims = static_cast<std::vector<int64_t>>(src.shape());
-        memory::dims src_strides = static_cast<std::vector<int64_t>>(src.strides());
-        const memory::data_type mdt = onednn_matmul_dt(src.dtype());
+        memory::dims src_dims = static_cast<std::vector<int64_t>>(src_c.shape());
+        memory::dims src_strides = static_cast<std::vector<int64_t>>(src_c.strides());
+        const memory::data_type mdt = onednn_matmul_dt(src_c.dtype());
         auto src_md = memory::desc(src_dims, mdt, src_strides);
 
-        memory::dims weights_dims = static_cast<std::vector<int64_t>>(weights.shape());
-        memory::dims weights_strides = static_cast<std::vector<int64_t>>(weights.strides());
+        memory::dims weights_dims = static_cast<std::vector<int64_t>>(weights_c.shape());
+        memory::dims weights_strides = static_cast<std::vector<int64_t>>(weights_c.strides());
         auto weights_md = memory::desc(weights_dims, mdt, weights_strides);
 
         memory::dims dst_dims = static_cast<std::vector<int64_t>>(dst.shape());
@@ -593,8 +617,8 @@ bool matmul_onednn(const Tensor& src, const Tensor& weights, Tensor& dst) {
         auto dst_md = memory::desc(dst_dims, mdt, dst_strides);
 
         // Create memories sharing data pointers
-        auto src_mem = memory(src_md, engine, src.data_ptr());
-        auto weights_mem = memory(weights_md, engine, weights.data_ptr());
+        auto src_mem = memory(src_md, engine, src_c.data_ptr());
+        auto weights_mem = memory(weights_md, engine, weights_c.data_ptr());
         auto dst_mem = memory(dst_md, engine, dst.data_ptr());
 
         // Cached primitive (JIT selection happens once per shape)
