@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING
 
 from ..registry import register_template_heuristic
 from ...templates.bmm import (
+    framework_bmm,
+    framework_bmm_dtype,
     framework_int_mm,
     framework_mm as framework_bmm_mm,
     framework_mm_dtype as framework_bmm_mm_dtype,
@@ -67,6 +69,7 @@ if TYPE_CHECKING:
 @register_template_heuristic(framework_dw.uid, None)
 @register_template_heuristic(framework_dx.uid, None)
 @register_template_heuristic(framework_convolution_backward.uid, None)
+@register_template_heuristic(framework_bmm.uid, None)
 @register_template_heuristic(framework_bmm_mm.uid, None)
 @register_template_heuristic(framework_bmm_mm_dtype.uid, "cuda")
 @register_template_heuristic(framework_int_mm.uid, None)

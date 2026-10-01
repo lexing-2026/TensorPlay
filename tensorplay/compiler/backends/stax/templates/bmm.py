@@ -30,7 +30,7 @@ from typing import Any
 
 import tensorplay as tp
 from .triton import CHOICES
-from ..op_lowerings import register_lowering
+from ..op_lowerings import register_lowering, reshape as _reshape_ir
 from .select_algorithm import (
     ChoiceCaller,
     call_operation,
@@ -250,6 +250,19 @@ def tuned_bmm(mat1, mat2, out_dtype=None, *, layout=None):
     m, n, k, layout, mat1, mat2 = mm_args(
         mat1, mat2, layout=layout, out_dtype=out_dtype
     )
+
+    # A batched product takes one batch dimension.  A call that arrives with
+    # several leading dimensions (e.g. from the attention math path, which
+    # folds head and batch together) is flattened to the single batch axis so
+    # both the framework's own bmm and the tiled kernels see a 3D call.
+    left_size = list(mat1.get_size())
+    if len(left_size) > 3:
+        batch = 1
+        for extent in left_size[:-2]:
+            batch *= extent
+        mat1 = _reshape_ir(mat1, [batch, m, k])
+        mat2 = _reshape_ir(mat2, [batch, k, n])
+
     name = "bmm"
     kernel_inputs = MMKernelInputs([mat1, mat2], out_dtype=out_dtype)
     log.info(
