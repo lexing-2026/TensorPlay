@@ -4171,8 +4171,8 @@ class PythonWrapperCodegen(CodeGen):
                 f"{stream_name} = get_raw_stream({_coor_device_idx_ref(device.index)})"
             )
         else:
-            stream_name = PythonWrapperCodegen.write_get_raw_stream(
-                self, device.index, graph_name
+            stream_name = self.write_get_raw_stream(
+                device.index, graph_name
             )
         if not triton:
             stream_ptr = f"c_void_p({stream_name})"

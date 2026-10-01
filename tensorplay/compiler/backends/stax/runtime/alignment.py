@@ -83,6 +83,12 @@ def assert_size_stride_grouped(
     """
 
     for item, size, stride in zip(items, sizes, strides):
+        try:
+            from tensorplay._C import _assert_tensor_metadata as _c_check
+            _c_check(item, size, stride)
+            continue
+        except (ImportError, TypeError, ValueError, RuntimeError):
+            pass
         if item.shape != size:
             where = f" in {op_name}" if op_name else ""
             raise AssertionError(

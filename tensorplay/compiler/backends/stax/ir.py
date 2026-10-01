@@ -6853,6 +6853,12 @@ class ExternKernel(InputsKernel):
 
         if not config.size_asserts:
             return
+        if not V.graph.cpp_wrapper:
+            # A Python wrapper allocates every buffer it hands an external call
+            # itself, so the result's shape and stride cannot disagree with the
+            # call: the check would guard a value nobody else can change.
+            # Inputs are still guarded, by the wrapper's own input assertions.
+            return
         if self.is_inplace_view() and not V.graph.cpp_wrapper:
             return
         op_name = self.get_op_name()

@@ -276,6 +276,14 @@ def last_power_of_2(n: int) -> int:
 
 
 
+def _c_assert_metadata(tensor: Any, size: Any, stride: Any, dtype: Any = None) -> bool:
+    try:
+        from tensorplay._C import _assert_tensor_metadata as _c_check
+        return _c_check(tensor, size, stride, dtype) or True
+    except (ImportError, TypeError, ValueError, RuntimeError):
+        return False
+
+
 def assert_size_stride(
     tensor: Any,
     size: Any,
@@ -289,6 +297,8 @@ def assert_size_stride(
     """
 
     if tensor is None:
+        return
+    if _c_assert_metadata(tensor, size, stride):
         return
     expected_size = tuple(int(s) for s in size)
     expected_stride = tuple(int(s) for s in stride)
@@ -319,6 +329,8 @@ def assert_tensor_metadata(
     """
 
     if tensor is None:
+        return
+    if _c_assert_metadata(tensor, size, stride, dtype):
         return
     assert_size_stride(tensor, size, stride, op_name)
     if tensor.dtype != dtype:
