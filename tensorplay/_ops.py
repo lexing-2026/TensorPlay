@@ -19,6 +19,24 @@ from typing import Any
 import tensorplay
 import tensorplay._C as _C
 
+_active_tracer_getter: Any = None
+
+
+def _capture_may_be_active() -> Any:
+    """Whether a graph tracer is recording in this context.
+
+    A proxy exists only while a tracer is active, so a call arriving with no
+    active tracer can never be part of a capture.  The gate is one
+    thread-local read, taken in place of scanning every argument of every
+    call on paths that never record.
+    """
+    global _active_tracer_getter
+    if _active_tracer_getter is None:
+        from .graph._utils import get_active_tracer
+
+        _active_tracer_getter = get_active_tracer
+    return _active_tracer_getter() is not None
+
 
 def _lower_right_causal_mask(query: Any, key: Any) -> Any:
     """Boolean keep-mask aligned to the lower-right (L, S) corner."""
@@ -799,15 +817,16 @@ class OpOverload:
         # symbolic argument is recorded rather than run: the arguments are
         # descriptions of values that do not exist yet, so there is nothing to
         # compute, and running it would ask the operator for the type of
-        # something that has not been made.  ``capture_call`` is what already
-        # decides whether an argument is symbolic, so it is what decides this
-        # too -- asking it here rather than deciding again would be the same
-        # question with two answers.
-        from .graph import capture_call as _capture_call
+        # something that has not been made.  Proxies only exist under an
+        # active tracer, so the check is worth its cost only there -- the
+        # steady-state call (eager op, compiled artifact, backward) is a
+        # single dispatch into C.
+        if _capture_may_be_active():
+            from .graph import capture_call as _capture_call
 
-        captured = _capture_call(self, args, kwargs)
-        if captured is not None:
-            return captured
+            captured = _capture_call(self, args, kwargs)
+            if captured is not None:
+                return captured
         return _C._call_overload(self._key, args, kwargs)
 
     @property
