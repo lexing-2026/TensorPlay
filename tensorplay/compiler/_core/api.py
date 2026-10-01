@@ -658,28 +658,16 @@ def _adapt_backend_to_region(
     graph_module: GraphModule | None = None,
     backend_kwargs: dict[str, Any] | None = None,
 ) -> CompilerFn:
-    """Match a backend's declared capabilities to the region being compiled.
+    """Match a backend to the region being compiled.
 
-    Training regions through an inference-only backend are routed through
-    ahead-of-time autograd: the forward graph goes to the backend, the
-    backward graph runs as traced (correctness-first default).  Backends
-    that support neither training nor inference-only wrapping are rejected
-    for training regions with an actionable error.
+    Training regions are routed through ahead-of-time autograd so parameters
+    are lifted into explicit inputs before the backend sees them (the same
+    pipeline the reference ``compile_fx`` runs); inference regions go to the
+    backend directly.
     """
 
-    from .registry import get_backend_capabilities
-
-    capabilities = get_backend_capabilities(compiler_fn)
-    if capabilities.handles_training or not _region_is_training(
-        example_inputs, example_kwargs, graph_module
-    ):
+    if not _region_is_training(example_inputs, example_kwargs, graph_module):
         return compiler_fn
-    if not capabilities.inference_only:
-        raise RuntimeError(
-            f"backend {getattr(compiler_fn, '__name__', compiler_fn)!r} does not "
-            "support training regions and does not declare itself "
-            "inference-only; it cannot be used for this region"
-        )
     from .aot_autograd import default_partition
     from .common import aot_autograd
 

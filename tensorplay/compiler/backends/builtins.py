@@ -11,10 +11,6 @@ def register() -> None:
     register_backend(
         stax,
         name="stax",
-        capabilities=BackendCapabilities(
-            inference_only=False,
-            handles_training=True,
-        ),
     )
     # Importing the module registers the debug-tagged backends.
     from . import debugging  # noqa: F401
@@ -29,10 +25,6 @@ def register() -> None:
     register_backend(
         tvm_backend,
         name="tvm",
-        capabilities=BackendCapabilities(
-            inference_only=True,
-            handles_training=False,
-        ),
     )
 
     from .cudagraphs import CudagraphsBackend

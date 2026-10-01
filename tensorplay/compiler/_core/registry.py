@@ -51,14 +51,6 @@ CORE_BACKEND_CONTRACT_VERSION = 1
 class BackendCapabilities:
     """What a backend supports, declared at registration or on the callable.
 
-    ``inference_only``: the backend lowers inference regions only.  The
-    frontend wraps such a backend with ahead-of-time autograd for training
-    regions (forward through the backend, backward through the eager graph).
-
-    ``handles_training``: the backend accepts regions whose inputs require
-    grad on its own.  A backend that is neither training-capable nor
-    inference-only is rejected for training regions.
-
     ``optional_deps``: import names the backend needs at call time.  A
     backend whose dependencies are missing is hidden from
     :func:`list_backends`; selecting it by name still works and explains
@@ -70,8 +62,6 @@ class BackendCapabilities:
     a core IR change is caught at lookup instead of at run time).
     """
 
-    inference_only: bool = False
-    handles_training: bool = True
     optional_deps: tuple[str, ...] = field(default=())
     contract_version: int = CORE_BACKEND_CONTRACT_VERSION
     min_core_version: str | None = None

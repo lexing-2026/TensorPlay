@@ -48,8 +48,6 @@ def _providers_for(device_type: str) -> list[str]:
 
 @declares_capabilities(
     BackendCapabilities(
-        inference_only=True,
-        handles_training=False,
         optional_deps=("onnxruntime",),
     )
 )
