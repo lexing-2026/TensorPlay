@@ -2025,8 +2025,7 @@ def native_group_norm(input, weight, bias, N, C, HxW, group, eps):
     # [N, group, channels-per-group, spatial] so the group's own channels and
     # the positions inside them are the last two axes.
     grouped = input_c.reshape(N, group, cpg, HxW)
-    mean = grouped.mean(dim=[2, 3], keepdim=True)
-    var = grouped.var(dim=[2, 3], correction=0, keepdim=True)
+    var, mean = tp.var_mean(grouped, dim=[2, 3], unbiased=False, keepdim=True)
     rstd = (var + eps).rsqrt()
 
     out = (grouped - mean) * rstd

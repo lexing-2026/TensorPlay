@@ -1853,6 +1853,68 @@ def lower_var(x, dims=None, correction=1, keepdim=False, **kwargs):
     return var
 
 
+@register("var_mean.default", "var_mean.dim", "var_mean.correction", "var_mean")
+def lower_var_mean(x, dims=None, unbiased=True, keepdim=False, **kwargs):
+    """The mean and variance of the reduced axes in one walk.
+
+    Both statistics come out of the same running mean and total of squared
+    differences, so the reduced data is read once rather than once for the
+    mean and once for the variance.  The variance is biased when no correction
+    is asked for and divided by the count less one otherwise.
+    """
+
+    if dims is None:
+        dims = list(range(len(x.get_size())))
+    elif isinstance(dims, (int, sympy.Integer)):
+        dims = [dims]
+    dtype = x.get_dtype()
+    device = x.get_device()
+    size = list(x.get_size())
+    rank = len(size)
+    dims = sorted({normalize_dim(d, rank) for d in dims})
+    out_ranges = [size[d] for d in range(rank) if d not in dims]
+    red_ranges = [size[d] for d in dims]
+    loader = x.make_loader()
+
+    def inner(index, rindex):
+        it = iter(index)
+        rt = iter(rindex)
+        full = [next(rt) if d in dims else next(it) for d in range(rank)]
+        return ops.to_dtype(loader(full), dtype)
+
+    mean, m2, _weight = ir.WelfordReduction.create(
+        device=device,
+        dtype=dtype,
+        inner_fns=(inner,),
+        ranges=out_ranges,
+        reduction_ranges=red_ranges,
+        reduction_type="welford_reduce",
+    )
+    mean.realize()
+    m2.realize()
+    n_elems = prod(red_ranges)
+    correction = 0 if not unbiased else 1
+    denom = Max(sympy.Integer(n_elems) - sympy.Integer(correction), 0)
+    m2_loader = m2.make_loader()
+
+    var = Pointwise.create(
+        device=device,
+        dtype=dtype,
+        inner_fn=lambda index: ops.truediv(
+            m2_loader(index), ops.constant(float(denom), tp.float32)
+        ),
+        ranges=out_ranges,
+    )
+    if keepdim:
+        kept = [1 if d in dims else size[d] for d in range(rank)]
+
+        def reindex(index):
+            return [index[d] for d in range(rank) if d not in dims]
+
+        return make_view(var, kept, reindex), make_view(mean, kept, reindex)
+    return var, mean
+
+
 @register("amax.default")
 def lower_amax(x, dims=None, keepdim=False, dtype=None, **kwargs):
     # What the reduction produces is read from the value it reduces: reducing
