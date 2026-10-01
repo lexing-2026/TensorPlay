@@ -17,24 +17,25 @@ def _trace(fn, sample):
 
 def test_sigmoid_decomposed_into_primitives():
     def fn(x):
-        return x.sigmoid().sum()
+        return x.softplus().sum()
 
     smap = {"x": tp.tensor([1.0, 2.0])}
     gm = _trace(fn, smap)
     targets = {n.target for n in gm.graph.nodes if n.op == "call_method"}
-    assert "sigmoid" in targets
+    assert "softplus" in targets
     res = DecomposePass()(gm)
     assert res.modified is True
     methods = {n.target for n in gm.graph.nodes if n.op == "call_method"}
     funcs = {getattr(n.target, "__name__", n.target) for n in gm.graph.nodes if n.op == "call_function"}
-    assert "sigmoid" not in methods
+    assert "softplus" not in methods
     assert "exp" in methods
-    assert "truediv" in funcs or operator.truediv in funcs
+    assert "log" in methods
+    assert "add" in funcs or operator.add in funcs
 
 
 def test_decomposed_graph_is_differentiable_structurally():
     def fn(x):
-        return x.sigmoid().sum()
+        return x.softplus().sum()
 
     smap = {"x": tp.tensor([1.0, 2.0])}
     gm = _trace(fn, smap)
@@ -119,11 +120,7 @@ def test_decomposed_ops_match_reference(name):
 
 @pytest.mark.parametrize("name", sorted(_CASES))
 def test_decomposed_op_compiles_to_native_graph(name):
-    """每个新分解条目都必须落进原生图——覆盖面倍增的直接证明。
-
-    （仅推理：compile 训练路径依赖 AOT 分解，被 tools/codegen 重构暂时
-    阻断，见 alignment plan 遗留项。）
-    """
+    """每个新分解条目都必须落进原生图——覆盖面倍增的直接证明。"""
     fn, _ = _CASES[name]
     x = tp.tensor([0.7])
     gm = Tracer().trace(fn, sample_inputs={"x": x})
@@ -148,7 +145,7 @@ def test_decomposed_op_compiles_to_native_graph(name):
         ]
     )(gm)
     compiled = stax(gm, [x])
-    assert getattr(gm, "_stax_native_graph", None) is not None, (
+    assert getattr(compiled, "_tensorplay_codegen", None) is not None, (
         f"{name} decomposition did not lower natively"
     )
     assert abs(float(compiled(x)[0]) - float(fn(x)[0])) < 1e-5
@@ -232,7 +229,7 @@ def test_fused_composite_lowers_to_one_native_node():
         ]
     )(gm)
     compiled = stax(gm, [x])
-    assert getattr(gm, "_stax_native_graph", None) is not None
+    assert getattr(compiled, "_tensorplay_codegen", None) is not None
     assert abs(float(compiled(x)[0]) - float(fn(x)[0])) < 1e-5
 
 

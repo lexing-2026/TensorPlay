@@ -1244,7 +1244,7 @@ def lower_mul(a, b):
     return pointwise(ops.mul, a, b)
 
 
-@register("div.Tensor", "div.Scalar")
+@register("div.Tensor", "div.Scalar", "truediv", "truediv.Tensor", "truediv.Scalar")
 def lower_div(a, b):
     return pointwise(ops.truediv, a, b)
 
@@ -1357,7 +1357,7 @@ def lower_clamp(x, min=None, max=None):
     return pointwise(lambda v: ops.maximum(min, ops.minimum(max, v)), x)
 
 
-@register("silu.default")
+@register("silu.default", "silu", "swish.default", "swish")
 def lower_silu(x):
     # silu(x) = x * sigmoid(x)
     return pointwise(lambda v: ops.mul(v, ops.sigmoid(v)), x)

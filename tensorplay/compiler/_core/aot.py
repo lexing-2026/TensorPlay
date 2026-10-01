@@ -272,6 +272,9 @@ _RULES: Dict[Tuple[str, Any], Callable] = {
     ("call_method", "exp"): _method_rule(
         lambda b, go, s: b.bwd("call_function", operator.mul, (b.bwd("call_method", "exp", (s,)), go))
     ),
+    ("call_method", "log"): _method_rule(
+        lambda b, go, s: b.bwd("call_function", operator.truediv, (go, s))
+    ),
 }
 
 

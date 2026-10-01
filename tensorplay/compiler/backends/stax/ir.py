@@ -6264,7 +6264,16 @@ class ExternKernel(InputsKernel):
         if module is None:
             self.python_kernel_name = name
         elif module.startswith("tensorplay."):
-            self.python_kernel_name = f"tp.{module[len('tensorplay.'):]}.{name}"
+            module_path = module[len("tensorplay."):]
+            if name.isidentifier():
+                self.python_kernel_name = f"tp.{module_path}.{name}"
+            else:
+                # A namespaced custom op (``capns::foo``) is not reachable
+                # through attribute syntax in the generated program; hand it
+                # the op object itself as a module-level constant.
+                const_name = f"_custom_op_{len(V.graph.constants)}"
+                V.graph.constants[const_name] = kernel
+                self.python_kernel_name = const_name
         elif module.startswith("tensorplay"):
             self.python_kernel_name = f"{module}.{name}"
         else:

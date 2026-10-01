@@ -222,7 +222,7 @@ def test_captured_loop_survives_the_region_cache(tmp_path, monkeypatch):
         return graph_module
 
     monkeypatch.setattr(
-        "tensorplay.compiler.backends.stax.codecache._default_caches", {}
+        "tensorplay.compiler.backends.stax.kernel_cache._default_caches", {}
     )
     monkeypatch.setenv("TP_CACHE_DIR", str(tmp_path))
 
@@ -234,7 +234,7 @@ def test_captured_loop_survives_the_region_cache(tmp_path, monkeypatch):
     # A fresh process holds no memoized instances: the region, including the
     # loop node's condition and body subgraphs, must reload from disk.
     monkeypatch.setattr(
-        "tensorplay.compiler.backends.stax.codecache._default_caches", {}
+        "tensorplay.compiler.backends.stax.kernel_cache._default_caches", {}
     )
     reloaded = tp.compile(probe, backend="while_loop_test_TESTING_ONLY")
     assert reloaded(tp.tensor([1.0, 2.0])).tolist() == [50.0, 51.0]

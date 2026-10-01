@@ -270,6 +270,7 @@ class CompilerCaptureTest(unittest.TestCase):
         # dispatcher bridge inside the compiled artifact, never via the
         # Python GraphModule interpreter.
         from tensorplay._stax.stax import stax
+        from tensorplay.graph.passes.shape_prop import ShapeProp
 
         @library.custom_op("capns::native_shift", mutates_args=())
         def native_shift(x):
@@ -281,9 +282,12 @@ class CompilerCaptureTest(unittest.TestCase):
             sample_inputs={"a": x},
         )
         backend_inputs = [x]
+        # The compile frontend annotates shapes before lowering; the backend
+        # needs that metadata to place an extern custom-op call's result.
+        ShapeProp(backend_inputs)(gm)
         compiled = stax(gm, backend_inputs)
         self.assertIsNotNone(
-            getattr(gm, "_stax_native_graph", None),
+            getattr(compiled, "_tensorplay_codegen", None),
             "custom-op graph fell back to the interpreter executor",
         )
         self.assertEqual(compiled(x).tolist(), [22.0, 24.0])
