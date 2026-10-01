@@ -1792,6 +1792,67 @@ def lower_mean(x, dims=None, keepdim=False, dtype=None, **kwargs):
     return pointwise(lambda v: ops.truediv(v, ops.constant(float(count), tp.float32)), total)
 
 
+@register("var.dim", "var.correction")
+def lower_var(x, dims=None, correction=1, keepdim=False, **kwargs):
+    """Variance as the mean of squared deviations from the mean.
+
+    The mean and the total of the squared differences from it are carried in a
+    single walk over the reduced axes, so the variance is that total divided by
+    the count, or by the count less the requested correction.  Keeping the two
+    running values instead of a sum of squares keeps the accumulation in range
+    for a long group.
+    """
+
+    if dims is None:
+        dims = list(range(len(x.get_size())))
+    elif isinstance(dims, (int, sympy.Integer)):
+        dims = [dims]
+    dtype = x.get_dtype()
+    device = x.get_device()
+    size = list(x.get_size())
+    rank = len(size)
+    dims = sorted({normalize_dim(d, rank) for d in dims})
+    out_ranges = [size[d] for d in range(rank) if d not in dims]
+    red_ranges = [size[d] for d in dims]
+    loader = x.make_loader()
+
+    def inner(index, rindex):
+        it = iter(index)
+        rt = iter(rindex)
+        full = [next(rt) if d in dims else next(it) for d in range(rank)]
+        return ops.to_dtype(loader(full), dtype)
+
+    _mean, m2, _weight = ir.WelfordReduction.create(
+        device=device,
+        dtype=dtype,
+        inner_fns=(inner,),
+        ranges=out_ranges,
+        reduction_ranges=red_ranges,
+        reduction_type="welford_reduce",
+    )
+    m2.realize()
+    n_elems = prod(red_ranges)
+    denom = Max(sympy.Integer(n_elems) - sympy.Integer(correction), 0)
+    m2_loader = m2.make_loader()
+
+    var = Pointwise.create(
+        device=device,
+        dtype=dtype,
+        inner_fn=lambda index: ops.truediv(
+            m2_loader(index), ops.constant(float(denom), tp.float32)
+        ),
+        ranges=out_ranges,
+    )
+    if keepdim:
+        kept = [1 if d in dims else size[d] for d in range(rank)]
+
+        def reindex(index):
+            return [index[d] for d in range(rank) if d not in dims]
+
+        return make_view(var, kept, reindex)
+    return var
+
+
 @register("amax.default")
 def lower_amax(x, dims=None, keepdim=False, dtype=None, **kwargs):
     # What the reduction produces is read from the value it reduces: reducing
