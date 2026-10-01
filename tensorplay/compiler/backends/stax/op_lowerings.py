@@ -1841,8 +1841,82 @@ def lower_native_group_norm(x, weight, bias, n, c, hxw, groups, eps):
     return _fallback_group_norm(x, weight, bias, n, c, hxw, groups, eps)
 
 
+def _lower_gn_bwd_template(grad_out, x, mean, rstd, gamma, n, c, hxw, groups, output_mask):
+    """Group-norm backward through a fused template kernel, if the call fits.
+
+    The template kernel reads the whole backward pass in one launch: it reduces
+    the two group sums per group, writes the input gradient, and accumulates the
+    per-channel weight and bias gradients atomically.  Calls that the template
+    does not cover -- a partial output mask, a missing weight, a non-four-
+    dimensional input, or dynamic shapes -- return None so the caller falls
+    back to the framework call.
+    """
+
+    if list(output_mask) != [True, True, True]:
+        return None
+    if gamma is None:
+        return None
+    x_size = x.get_size()
+    if len(x_size) != 4:
+        return None
+    if is_dynamic(*x_size, *grad_out.get_size(), *mean.get_size(), *rstd.get_size()):
+        return None
+    if not V.graph.sizevars.statically_known_equals(
+        sympy.sympify(c) % sympy.sympify(groups), 0
+    ):
+        return None
+
+    from .templates.group_norm import group_norm_backward_template
+    from .templates.select_algorithm import autotune_select_algorithm
+
+    device = grad_out.get_device()
+    dtype = grad_out.get_dtype()
+    c_int = int(c)
+    dgamma0 = Pointwise.create(
+        device=device,
+        dtype=dtype,
+        inner_fn=lambda i: ops.constant(0, dtype),
+        ranges=(c_int,),
+    )
+    dbeta0 = Pointwise.create(
+        device=device,
+        dtype=dtype,
+        inner_fn=lambda i: ops.constant(0, dtype),
+        ranges=(c_int,),
+    )
+    dgamma0.data.realize()
+    dbeta0.data.realize()
+    layout = grad_out.get_layout()
+    choices = []
+    err = group_norm_backward_template.maybe_append_choice(
+        choices,
+        input_nodes=(grad_out, x, mean, rstd, gamma, dgamma0, dbeta0),
+        mutated_inputs=[dgamma0, dbeta0],
+        layout=layout,
+        GROUPS=int(groups),
+        BLOCK=1024,
+        num_stages=1,
+        num_warps=4,
+    )
+    if err is not None or not choices:
+        return None
+    node, _ = autotune_select_algorithm(
+        "group_norm_backward",
+        choices,
+        [grad_out, x, mean, rstd, gamma, dgamma0, dbeta0],
+        layout,
+    )
+    return (node, dgamma0, dbeta0)
+
+
 @register("native_group_norm_backward.default")
 def lower_native_group_norm_backward(grad_out, x, mean, rstd, gamma, n, c, hxw, groups, output_mask):
+    if config.use_gn_bwd_template:
+        lowered = _lower_gn_bwd_template(
+            grad_out, x, mean, rstd, gamma, n, c, hxw, groups, output_mask
+        )
+        if lowered is not None:
+            return lowered
     return _fallback_group_norm_backward(
         grad_out, x, mean, rstd, gamma, n, c, hxw, groups, output_mask
     )

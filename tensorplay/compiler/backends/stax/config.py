@@ -435,6 +435,12 @@ max_autotune = os.environ.get("TP_MAX_AUTOTUNE", "0") == "1"
 # layer, so what it costs is paid by the whole model rather than by one line.
 max_autotune_gemm = os.environ.get("TP_MAX_AUTOTUNE_GEMM", "0") == "1"
 
+# Whether the fused group-norm backward kernel written from a template is
+# offered as the lowering.  Off by default until its performance against the
+# framework's own fused kernel is measured on whole models; enabling it makes
+# the compiler emit one persistent kernel for the backward pass.
+use_gn_bwd_template = os.environ.get("TP_USE_GN_BWD_TEMPLATE", "0") == "1"
+
 # How wide the search for attention tiles is when everything is being measured.
 # Two answers rather than a number, because the two are not more and fewer: the
 # default offers the handful of tilings worth offering, and the exhaustive one
