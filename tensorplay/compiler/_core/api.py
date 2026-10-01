@@ -686,7 +686,6 @@ def _adapt_backend_to_region(
 
     _GN_DECOMPOSITION_OPS = (
         tensorplay.ops.tp.native_group_norm,
-        tensorplay.ops.tp.native_group_norm_backward,
     )
 
     return aot_autograd(
