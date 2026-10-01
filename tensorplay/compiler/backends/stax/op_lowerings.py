@@ -1946,6 +1946,32 @@ def lower_conv_grad_bias(grad_out, *args):
     return make_reduction(grad_out, [0] + list(range(2, rank)), False, dtype, device, "sum")
 
 
+_fallback_conv2d_grad_input = fallback_handler(
+    tp.ops.tp.conv2d_grad_input.default, add_to_fallback_set=False
+)
+_fallback_conv2d_grad_weight = fallback_handler(
+    tp.ops.tp.conv2d_grad_weight.default, add_to_fallback_set=False
+)
+
+
+@register("conv2d_grad_input.default")
+def lower_conv2d_grad_input(grad_output, input, weight, stride, padding, dilation, groups):
+    """The input gradient, asked of the framework kernel."""
+
+    return _fallback_conv2d_grad_input(
+        grad_output, input, weight, stride, padding, dilation, groups
+    )
+
+
+@register("conv2d_grad_weight.default")
+def lower_conv2d_grad_weight(grad_output, input, weight, stride, padding, dilation, groups):
+    """The weight gradient, asked of the framework kernel."""
+
+    return _fallback_conv2d_grad_weight(
+        grad_output, input, weight, stride, padding, dilation, groups
+    )
+
+
 # ---------------------------------------------------------------------------
 # normalization
 # ---------------------------------------------------------------------------

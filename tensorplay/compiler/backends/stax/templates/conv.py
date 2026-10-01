@@ -1296,11 +1296,20 @@ def _gradient_by_asking(
 
     guard = V.graph.sizevars.guard_int_seq
     device = input.get_device_or_error()
-    zeros = lambda node: tp.zeros(
-        [int(dim) for dim in node.get_size()],
-        dtype=node.get_dtype(),
-        device=device,
-    )
+    layout_opt = bool(getattr(V.graph, "layout_opt", False))
+    if layout_opt and all(len(node.get_size()) == 4 for node in (grad_out, input, weight)):
+        zeros = lambda node: tp.empty(
+            [int(dim) for dim in node.get_size()],
+            dtype=node.get_dtype(),
+            device=device,
+            memory_format=tp.channels_last,
+        ).zero_()
+    else:
+        zeros = lambda node: tp.zeros(
+            [int(dim) for dim in node.get_size()],
+            dtype=node.get_dtype(),
+            device=device,
+        )
     result = framework.convolution_backward(
         zeros(grad_out), zeros(input), zeros(weight), None,
         guard(stride), guard(padding), guard(dilation), transposed,
@@ -1608,8 +1617,8 @@ def convolution(
             in_chan * groups, x.get_size()[1]
         )
     ):
-        if is_ones(kernel_shape) and is_ones(stride) and is_zeros(padding) and (
-            groups == 1
+        if config.conv_1x1_as_mm and is_ones(kernel_shape) and is_ones(stride) and (
+            is_zeros(padding) and groups == 1
         ):
             choices.append(framework_conv1x1_via_mm.bind(args, layout))
         is_depthwise = groups > 1 and in_chan == 1 and (out_chan == groups)
