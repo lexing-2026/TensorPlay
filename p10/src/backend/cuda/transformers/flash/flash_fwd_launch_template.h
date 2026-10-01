@@ -280,10 +280,28 @@ template<typename T, bool Is_causal>
 void run_mha_fwd_hdim128_fp32(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 128;
     // The wide precision's operands are twice as wide as the reduced ones',
-    // so the block that fits the shared budget is 64 x 64: the query tile,
-    // the key tile and the value tile together stay under the on-chip limit.
+    // so the block that fits the shared budget is a 128 x 32 query tile with
+    // eight warps: two blocks can not share an SM (96 KB of shared memory),
+    // but the wider tile halves the grid and the eight warps double the
+    // threads resident per SM.  The query length decides which schedule wins:
+    // short sequences keep the square 64 x 64 tile so decode rows are not
+    // wasted inside a wide tile, while a 128-row causal prompt amortizes its
+    // triangular masking over the wide tile's four k-steps.
+    const int seqlen_q = params.seqlen_q;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        if constexpr (!Is_causal) {
+            if (seqlen_q >= 128) {
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 8, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            } else {
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            }
+        } else {
+            if (seqlen_q == 128) {
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 8, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            } else {
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            }
+        }
     });
 }
 
