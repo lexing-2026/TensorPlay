@@ -284,10 +284,17 @@ __forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tC
             auto b_slice = tCrB_f(_, _, i);
             auto a_hi = make_tensor_like(recast<tfloat32_t>(a_slice));
             auto a_lo = make_tensor_like(recast<tfloat32_t>(a_slice));
-            auto b_hi = make_tensor_like(b_slice);
-            auto b_lo = make_tensor_like(b_slice);
+            // The value fragment's slice layout is a strided view whose
+            // codomain reaches past the per-thread fragment storage, so it is
+            // copied into a compact tensor first; splitting the compact
+            // tensor keeps every element inside the tensor-core operand.
+            auto b_compact = make_tensor<float>(make_shape(Int<size<0>(b_slice)>{}, Int<size<1>(b_slice)>{}),
+                                                make_stride(Int<size<1>(b_slice)>{}, _1{}));
+            cute::copy(b_slice, b_compact);
+            auto b_hi = make_tensor_like(b_compact);
+            auto b_lo = make_tensor_like(b_compact);
             split_f32_fragment(a_slice, a_hi, a_lo);
-            split_f32_fragment(b_slice, b_hi, b_lo);
+            split_f32_fragment(b_compact, b_hi, b_lo);
             cute::gemm(tiled_mma, a_hi, b_hi, acc);
             cute::gemm(tiled_mma, a_hi, b_lo, acc);
             cute::gemm(tiled_mma, a_lo, b_hi, acc);
