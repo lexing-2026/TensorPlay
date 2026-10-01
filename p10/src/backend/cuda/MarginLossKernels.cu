@@ -13,7 +13,6 @@
 #include "Scalar.h"
 #include "Exception.h"
 #include "CUDARuntime.h"
-#include "LinearAlgebraNames.h"
 
 #include <cuda_runtime.h>
 #include <vector>

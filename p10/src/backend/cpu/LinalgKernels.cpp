@@ -8,7 +8,6 @@
 #include "Exception.h"
 #include "Parallel.h"
 #include "Utils.h"
-#include "LinearAlgebraNames.h"
 #include "cpu/Lapack.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
@@ -43,7 +42,7 @@ decltype(auto) run_real(DType dt, Kernel&& k) {
             return k(static_cast<double*>(nullptr));
         default:
             TP_THROW(NotImplementedError,
-                     "unsupported dtype ", pretty_dtype_name(dt),
+                     "unsupported dtype ", toString(dt),
                      " for linalg on CPU (only float32/float64 are implemented)");
     }
 }
@@ -82,7 +81,7 @@ decltype(auto) run_linalg(DType dt, Kernel&& k) {
             return k(static_cast<complex<double>*>(nullptr));
         default:
             TP_THROW(NotImplementedError,
-                     "unsupported dtype ", pretty_dtype_name(dt),
+                     "unsupported dtype ", toString(dt),
                      " for linalg on CPU");
     }
 }
@@ -99,7 +98,7 @@ decltype(auto) run_linalg_complex(DType dt, Kernel&& k) {
             return k(static_cast<complex<double>*>(nullptr));
         default:
             TP_THROW(NotImplementedError,
-                     "unsupported dtype ", pretty_dtype_name(dt),
+                     "unsupported dtype ", toString(dt),
                      " for complex linalg on CPU");
     }
 }
@@ -382,7 +381,7 @@ inline void check_inputs_solver(const Tensor& A, const Tensor& B, bool left, con
     }
     if (A.dtype() != B.dtype()) {
         TP_THROW(RuntimeError, fn, ": A and B must have the same dtype, but got ",
-                 pretty_dtype_name(A.dtype()), " and ", pretty_dtype_name(B.dtype()));
+                 toString(A.dtype()), " and ", toString(B.dtype()));
     }
     if (!(left ? A.size(-2) == B.size(-2) : A.size(-1) == B.size(-1))) {
         TP_THROW(RuntimeError, fn, ": Incompatible shapes of A and B for the equation ",
@@ -943,7 +942,7 @@ Tensor linalg_solve_triangular_kernel(const Tensor& A, const Tensor& B,
     }
     if (A.dtype() != B.dtype()) {
         TP_THROW(RuntimeError, api, ": A and B must have the same dtype, but got ",
-                 pretty_dtype_name(A.dtype()), " and ", pretty_dtype_name(B.dtype()));
+                 toString(A.dtype()), " and ", toString(B.dtype()));
     }
     if (!(left ? A.size(-1) == B.size(-2) : A.size(-1) == B.size(-1))) {
         TP_THROW(RuntimeError, api, ": Incompatible shapes of A and B for the equation ",
@@ -994,7 +993,7 @@ Tensor linalg_lu_solve_kernel(const Tensor& LU, const Tensor& pivots,
     }
     if (LU.dtype() != B.dtype()) {
         TP_THROW(RuntimeError, api, ": LU and B must have the same dtype, but got ",
-                 pretty_dtype_name(LU.dtype()), " and ", pretty_dtype_name(B.dtype()));
+                 toString(LU.dtype()), " and ", toString(B.dtype()));
     }
     bool vector_case = B.dim() == 1;
     if (!vector_case && LU.dim() - 1 == B.dim()) {
@@ -1884,7 +1883,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_lstsq_kernel(
     }
     if (A.dtype() != B.dtype()) {
         TP_THROW(RuntimeError, api, ": A and B must have the same dtype, but got ",
-                 pretty_dtype_name(A.dtype()), " and ", pretty_dtype_name(B.dtype()));
+                 toString(A.dtype()), " and ", toString(B.dtype()));
     }
 
     bool vector_case = B.dim() == 1;

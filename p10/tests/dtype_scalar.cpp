@@ -39,7 +39,7 @@ TEST(DTypeTest, MessageSpellings) {
     EXPECT_STREQ(bounds_dtype_name(DType::Int64), "long");
     EXPECT_STREQ(bounds_dtype_name(DType::Float32), "float");
     EXPECT_STREQ(bounds_dtype_name(DType::Float64), "double");
-    EXPECT_STREQ(bounds_dtype_name(DType::Float16), "c10::Half");
+    EXPECT_STREQ(bounds_dtype_name(DType::Float16), "float16");
     EXPECT_STREQ(bounds_dtype_name(DType::Bool), "bool");
 }
 

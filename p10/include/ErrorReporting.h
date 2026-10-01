@@ -13,7 +13,6 @@
 #include <vector>
 
 #include "DType.h"
-#include "LinearAlgebraNames.h"
 #include "Tensor.h"
 
 namespace tensorplay {
@@ -39,7 +38,7 @@ inline std::string describe_tensor(const Tensor& t) {
     }
     std::ostringstream os;
     os << "shape=" << format_sizes(static_cast<std::vector<int64_t>>(t.shape()))
-       << ", dtype=" << pretty_dtype_name(t.dtype())
+       << ", dtype=" << toString(t.dtype())
        << ", device=" << t.device().toString();
     return os.str();
 }

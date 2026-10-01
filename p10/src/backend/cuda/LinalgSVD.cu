@@ -4,7 +4,6 @@
 #include "Dispatcher.h"
 #include "CUDAContext.h"
 #include "Exception.h"
-#include "LinearAlgebraNames.h"
 #include "Complex.h"
 
 #include <cublas_v2.h>
@@ -113,7 +112,7 @@ void dispatch_svd_dtype(DType dtype, Fn&& fn) {
             return;
         default:
             TP_THROW(NotImplementedError,
-                     "linalg.svd: unsupported dtype ", pretty_dtype_name(dtype),
+                     "linalg.svd: unsupported dtype ", toString(dtype),
                      " on CUDA");
     }
 }

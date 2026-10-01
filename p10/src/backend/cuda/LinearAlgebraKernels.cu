@@ -7,7 +7,6 @@
 #include "Scalar.h"
 #include "Utils.h"
 #include "GradMode.h"
-#include "LinearAlgebraNames.h"
 #include "CudaGemm.h"
 #include "Complex.h"
 #include <cublas_v2.h>
@@ -105,7 +104,7 @@ Tensor mm_kernel_cuda(const Tensor& self, const Tensor& other) {
     }
     if (self.dtype() != other.dtype()) {
         TP_THROW(RuntimeError, "expected mat1 and mat2 to have the same dtype, but got: ",
-                 c10_style_dtype_name(self.dtype()), " != ", c10_style_dtype_name(other.dtype()));
+                 toString(self.dtype()), " != ", toString(other.dtype()));
     }
     const DType result_dtype = self.dtype();
     // integer and bool CUDA matmul even when the mathematical result is empty
@@ -295,11 +294,11 @@ Tensor addmm_kernel_cuda(const Tensor& input, const Tensor& mat1, const Tensor& 
     // self-vs-mat2 first, then mat1-vs-mat2 (LinearAlgebra.cpp:185-186).
     if (input.dtype() != mat2.dtype()) {
         TP_THROW(RuntimeError, "self and mat2 must have the same dtype, but got ",
-                 pretty_dtype_name(input.dtype()), " and ", pretty_dtype_name(mat2.dtype()));
+                 toString(input.dtype()), " and ", toString(mat2.dtype()));
     }
     if (mat1.dtype() != mat2.dtype()) {
         TP_THROW(RuntimeError, "mat1 and mat2 must have the same dtype, but got ",
-                 pretty_dtype_name(mat1.dtype()), " and ", pretty_dtype_name(mat2.dtype()));
+                 toString(mat1.dtype()), " and ", toString(mat2.dtype()));
     }
     int64_t M = mat1.size(0);
     int64_t N = mat2.size(1);
@@ -385,7 +384,7 @@ Tensor matmul_kernel_cuda(const Tensor& self, const Tensor& other) {
 
     if (self.dtype() != other.dtype()) {
         TP_THROW(RuntimeError, "expected mat1 and mat2 to have the same dtype, but got: ",
-                 c10_style_dtype_name(self.dtype()), " != ", c10_style_dtype_name(other.dtype()));
+                 toString(self.dtype()), " != ", toString(other.dtype()));
     }
     const Tensor& self_p = self;
     const Tensor& other_p = other;
@@ -698,8 +697,8 @@ Tensor bmm_kernel_cuda(const Tensor& self, const Tensor& batch2) {
                  batch2.size(1), "].");
     }
     if (self.dtype() != batch2.dtype()) {
-        TP_THROW(RuntimeError, "expected scalar type ", pretty_dtype_name(self.dtype()),
-                 " but found ", pretty_dtype_name(batch2.dtype()));
+        TP_THROW(RuntimeError, "expected scalar type ", toString(self.dtype()),
+                 " but found ", toString(batch2.dtype()));
     }
     check_cublas_gemm_dtype(self.dtype());
     return matmul_batched_2d_cuda(self, batch2, {self.size(0)}, {batch2.size(0)});
@@ -716,9 +715,9 @@ Tensor baddbmm_kernel_cuda(const Tensor& input, const Tensor& batch1, const Tens
     }
     if (input.dtype() != batch1.dtype() || batch1.dtype() != batch2.dtype()) {
         TP_THROW(RuntimeError, "Input dtypes must be the same, got: input ",
-                 c10_style_dtype_name(input.dtype()), ", batch1: ",
-                 c10_style_dtype_name(batch1.dtype()), ", batch2: ",
-                 c10_style_dtype_name(batch2.dtype()));
+                 toString(input.dtype()), ", batch1: ",
+                 toString(batch1.dtype()), ", batch2: ",
+                 toString(batch2.dtype()));
     }
 
     const int64_t B = batch1.size(0);
@@ -766,8 +765,8 @@ Tensor mv_kernel_cuda(const Tensor& self, const Tensor& vec) {
     if (self.dtype() != vec.dtype()) {
         // The leading value is addmv's accumulator slot; via mv it echoes vec.
         TP_THROW(RuntimeError, "addmv input tensors must have the same dtype, but got ",
-                 pretty_dtype_name(vec.dtype()), ", ", pretty_dtype_name(self.dtype()), ", and ",
-                 pretty_dtype_name(vec.dtype()));
+                 toString(vec.dtype()), ", ", toString(self.dtype()), ", and ",
+                 toString(vec.dtype()));
     }
     return matmul_batched_2d_cuda(self, vec.unsqueeze(-1), {}, {}).squeeze(-1);
 }
@@ -798,13 +797,13 @@ Tensor dot_kernel_cuda(const Tensor& self, const Tensor& other) {
     }
     if (self.dtype() != other.dtype()) {
         TP_THROW(RuntimeError, "dot : expected both vectors to have same dtype, but found ",
-                 pretty_dtype_name(self.dtype()), " and ", pretty_dtype_name(other.dtype()));
+                 toString(self.dtype()), " and ", toString(other.dtype()));
     }
 
     const DType dtype = self.dtype();
     if (!isFloatingType(dtype) && !isComplexType(dtype)) {
         TP_THROW(NotImplementedError, "\"dot\" not implemented for '",
-                 pretty_dtype_name(dtype), "'");
+                 toString(dtype), "'");
     }
 
     const int64_t n = self.numel();
@@ -871,8 +870,8 @@ Tensor outer_kernel_cuda(const Tensor& self, const Tensor& vec2) {
                  vec2.dim(), "D tensors");
     }
     if (self.dtype() != vec2.dtype()) {
-        TP_THROW(RuntimeError, "expected scalar type ", pretty_dtype_name(self.dtype()),
-                 " but found ", pretty_dtype_name(vec2.dtype()));
+        TP_THROW(RuntimeError, "expected scalar type ", toString(self.dtype()),
+                 " but found ", toString(vec2.dtype()));
     }
     return self.unsqueeze(1).mul(vec2.unsqueeze(0));
 }

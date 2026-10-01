@@ -51,8 +51,8 @@ inline const char* bounds_dtype_name(DType dtype) {
         case DType::UInt64: return "unsigned long";
         case DType::Float32: return "float";
         case DType::Float64: return "double";
-        case DType::Float16: return "c10::Half";
-        case DType::BFloat16: return "c10::BFloat16";
+        case DType::Float16: return "float16";
+        case DType::BFloat16: return "bfloat16";
         case DType::Bool: return "bool";
         default: return "UNKNOWN_SCALAR";
     }

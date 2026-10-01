@@ -9,7 +9,6 @@
 #include "Parallel.h"
 #include "Half.h"
 #include "BFloat16.h"
-#include "LinearAlgebraNames.h"
 #include <vector>
 #include <string>
 #include <atomic>
@@ -24,7 +23,7 @@ namespace {
 void unpool_check_indices(const Tensor& self, const Tensor& indices, const char* name) {
     if (indices.dtype() != DType::Int64)
         TP_THROW(RuntimeError, std::string("elements in indices should be type int64 but got: ") +
-                     pretty_dtype_name(indices.dtype()));
+                     toString(indices.dtype()));
     if (self.shape() != indices.shape())
         TP_THROW(RuntimeError, std::string("Expected shape of indices to be same as that of the input tensor (") +
                      self.shape().toString() + ") but got indices tensor with shape: (" +
@@ -182,7 +181,7 @@ Tensor max_unpool2d_backward_cpu(const Tensor& grad_output, const Tensor& indice
         TP_THROW(RuntimeError, "MaxUnpool2d_backward: expect grad_output to be 3d or 4d tensor.");
     if (indices.dtype() != DType::Int64)
         TP_THROW(RuntimeError, "elements in indices should be type int64 but got: ",
-                 pretty_dtype_name(indices.dtype()));
+                 toString(indices.dtype()));
     if (grad_output.size(-2) != output_size[0] || grad_output.size(-1) != output_size[1])
         TP_THROW(RuntimeError, "Inconsistent gradOutput size. oH= ", output_size[0],
                  ", oW= ", output_size[1], ". gradOutput: ",
@@ -256,7 +255,7 @@ Tensor max_unpool3d_backward_cpu(const Tensor& grad_output, const Tensor& indice
         TP_THROW(RuntimeError, "MaxUnpool3d_backward: expect grad_output to be 4d or 5d tensor.");
     if (indices.dtype() != DType::Int64)
         TP_THROW(RuntimeError, "elements in indices should be type int64 but got: ",
-                 pretty_dtype_name(indices.dtype()));
+                 toString(indices.dtype()));
     if (grad_output.size(-3) != output_size[0] || grad_output.size(-2) != output_size[1] ||
         grad_output.size(-1) != output_size[2])
         TP_THROW(RuntimeError, "Inconsistent gradOutput size. oT= ", output_size[0],
