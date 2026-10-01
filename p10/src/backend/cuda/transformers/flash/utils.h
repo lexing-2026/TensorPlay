@@ -213,7 +213,46 @@ using SrcType = std::remove_cv_t<typename Tensor3::value_type>;
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Convert a probability fragment stored in the accumulator layout into the
+// A-operand register layout of the same tiled MMA.  For the 8-deep
+// wide-precision instruction the two layouts assign the fragment's rows and
+// columns to different lanes and registers, so the conversion is a register
+// permutation within each group of four lanes.
+template <typename Tensor>
+__forceinline__ __device__ auto convert_acc_to_Aregs(Tensor const& tCrA) {
+    using value_type = typename Tensor::value_type;
+    static_assert(std::is_same_v<value_type, float>);
+    static_assert(decltype(size<0>(tCrA))::value == 4);
+    static_assert(decltype(size<2>(tCrA))::value == 8);
+    auto out = make_tensor_like(tCrA);
+    const int lane = threadIdx.x % 32;
+    const int d = lane % 4;
+    const int lq = lane - d;
+    #pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        float f00 = tCrA(4 * g + 0);
+        float f02 = tCrA(4 * g + 2);
+        float f01 = tCrA(4 * g + 1);
+        float f03 = tCrA(4 * g + 3);
+        unsigned long long e0 = ((unsigned long long)__float_as_uint(f00) << 32) | (unsigned long long)__float_as_uint(f02);
+        unsigned long long e1 = ((unsigned long long)__float_as_uint(f01) << 32) | (unsigned long long)__float_as_uint(f03);
+        unsigned long long v0 = __shfl_sync(0xffffffff, e0, lq + d / 2);
+        unsigned long long v1 = __shfl_sync(0xffffffff, e1, lq + d / 2);
+        unsigned long long v2 = __shfl_sync(0xffffffff, e0, lq + d / 2 + 2);
+        unsigned long long v3 = __shfl_sync(0xffffffff, e1, lq + d / 2 + 2);
+        unsigned long long sel_lo = (d % 2 == 0) ? v0 : v1;
+        unsigned long long sel_hi = (d % 2 == 0) ? v2 : v3;
+        out(4 * g + 0) = __uint_as_float(uint32_t(sel_lo >> 32));
+        out(4 * g + 1) = __uint_as_float(uint32_t(sel_lo & 0xffffffff));
+        out(4 * g + 2) = __uint_as_float(uint32_t(sel_hi >> 32));
+        out(4 * g + 3) = __uint_as_float(uint32_t(sel_hi & 0xffffffff));
+    }
+    return out;
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
          typename TiledMma, typename TiledCopy, typename ThrCopy>
@@ -228,7 +267,10 @@ __forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tC
         // The probability fragment is already float; the value fragment is
         // loaded from smem and both are split into tf32 parts, with the three
         // tensor-core products accumulated into the output.  The hi/lo parts
-        // are per-K-slice to keep the register pressure bounded.
+        // are per-K-slice to keep the register pressure bounded.  The
+        // probability fragment lives in the accumulator layout, so it is
+        // permuted into the A-operand register layout first.
+        auto tCrA_A = convert_acc_to_Aregs(tCrA);
         auto tCrB_f = recast<float>(tCrB);
         Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB_f);
         CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));        // N
@@ -238,7 +280,7 @@ __forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tC
             if (i < size<2>(tCrA) - 1) {
                 cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
             }
-            auto a_slice = tCrA(_, _, i);
+            auto a_slice = tCrA_A(_, _, i);
             auto b_slice = tCrB_f(_, _, i);
             auto a_hi = make_tensor_like(recast<tfloat32_t>(a_slice));
             auto a_lo = make_tensor_like(recast<tfloat32_t>(a_slice));
@@ -264,7 +306,7 @@ __forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tC
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Convert acc_layout from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
 template<typename Layout>
