@@ -22,6 +22,7 @@ import functools
 import dataclasses
 import itertools
 import math
+import os
 import re
 import sympy
 from sympy.printing.precedence import PRECEDENCE

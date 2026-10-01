@@ -10,6 +10,7 @@ run that padded from a run that did not.
 from __future__ import annotations
 
 import dataclasses
+import os
 from functools import lru_cache
 
 from ....graph.experimental.sympy_functions import OrderedSet
