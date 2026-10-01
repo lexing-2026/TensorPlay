@@ -41,7 +41,7 @@ from ..backends.stax.kernel_cache import default_cache
 
 # Bump when capture recording, the pass pipeline, or this serialization
 # format changes such that a stored graph is no longer faithful.
-_SCHEMA_VERSION = "1"
+_SCHEMA_VERSION = "2"
 
 _CACHE_BACKEND = "capture-region"
 _ARTIFACT_EXT = "gmp"

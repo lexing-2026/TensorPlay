@@ -633,6 +633,12 @@ def _region_is_training(
         return True
     if graph_module is None:
         return False
+    # A module left in training mode is a training region even when a call's
+    # inputs carry no gradient requirement: its parameters still do, and the
+    # backward must be compiled alongside the forward.
+    root = getattr(graph_module, "root", None)
+    if isinstance(root, tensorplay.nn.Module) and root.training:
+        return True
     for node in graph_module.graph.nodes:
         if node.op != "get_attr":
             continue
@@ -676,7 +682,6 @@ def _adapt_backend_to_region(
         )
     from .aot_autograd import default_partition
     from .common import aot_autograd
-    from ..backends.debugging import boxed_nop
 
     forward_compiler = compiler_fn
     if backend_kwargs:
@@ -689,7 +694,7 @@ def _adapt_backend_to_region(
 
     return aot_autograd(
         fw_compiler=forward_compiler,
-        bw_compiler=boxed_nop,
+        bw_compiler=forward_compiler,
         partition_fn=default_partition,
     )
 
@@ -720,6 +725,43 @@ def _preserve_module_state(program: Any) -> Any:
                     tensor.copy_(value)
 
 
+@contextlib.contextmanager
+def _preserve_input_values(*values: Any) -> Any:
+    """Undo the input mutations an executing capture makes.
+
+    Capture, propagation and lowering all execute the captured program to
+    record or measure it; in-place updates it performs on its input tensors
+    must not count as a call, so the input values are restored afterwards.
+    The same values stand in for every compile-time run, which is what lets a
+    program that mutates one of its arguments behave identically at compile
+    time and at runtime without rewriting the caller's tensor.
+    """
+
+    import tensorplay
+
+    with tensorplay.no_grad():
+        saved: list[tuple[Any, Any]] = []
+
+        def _save(value: Any) -> None:
+            if isinstance(value, tensorplay.Tensor):
+                saved.append((value, value.clone()))
+            elif isinstance(value, (tuple, list)):
+                for item in value:
+                    _save(item)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    _save(item)
+
+        _save(values)
+    try:
+        yield
+    finally:
+        with tensorplay.no_grad():
+            for tensor, value in saved:
+                if tuple(tensor.shape) == tuple(value.shape):
+                    tensor.copy_(value)
+
+
 def _compile_region(
     model: Callable[..., Any],
     compiler_fn: CompilerFn,
@@ -734,50 +776,51 @@ def _compile_region(
     if stored is not None:
         graph_module = stored
     else:
-        try:
-            with _compiler_context(), _preserve_module_state(model):
-                tracer = Tracer(execute=True)
-                # An operator that stands for a region of the program -- rather
-                # than for one operation -- has to be told that a capture is
-                # running, or it runs itself and the region it stands for is
-                # inlined into the graph as the operations that implement it.
-                # That inlined form is correct, and it is exactly what a backend
-                # holding a schedule for that region can never be handed.  The
-                # state is entered around the trace alone: the passes that
-                # follow rewrite the graph that came out, and one of them
-                # evaluates values, which must not be recorded as part of the
-                # region.
-                with tracer.proxy_mode:
-                    graph_module = tracer.trace(
-                        model,
-                        sample_inputs=_bind_sample_arguments(
-                            model, example_inputs, example_kwargs
-                        ),
-                    )
-                # Default capture pipeline: canonicalize operators, then constant
-                # folding, then decomposition, common-subexpression elimination
-                # and dead code elimination; fusion hints are stamped last so
-                # they see the final graph.  CSE runs after decomposition so
-                # shared sub-chains across rewritten composites collapse too
-                # (two gelu sites share one erf chain).  Backends always receive
-                # a folded, linted, hint-annotated graph; ShapeProp below
-                # additionally annotates tensor shapes.
-                pass_result = PassManager(
-                    [
-                        NormalizeOperators(),
-                        ConstFold(),
-                        DecomposePass(),
-                        CSEPass(get_CSE_banned_ops()),
-                        DeadCodeElimination(),
-                        PointwiseFusionHint(),
-                    ]
-                )(graph_module)
-                graph_module = pass_result.graph_module
-        except GraphCaptureError as exc:
-            raise GraphCaptureError(
-                "TensorPlay could not capture the requested compiler region"
-            ) from exc
-        store_region(region_key, graph_module)
+        with _preserve_input_values(example_inputs, example_kwargs):
+            try:
+                with _compiler_context(), _preserve_module_state(model):
+                    tracer = Tracer(execute=True)
+                    # An operator that stands for a region of the program -- rather
+                    # than for one operation -- has to be told that a capture is
+                    # running, or it runs itself and the region it stands for is
+                    # inlined into the graph as the operations that implement it.
+                    # That inlined form is correct, and it is exactly what a backend
+                    # holding a schedule for that region can never be handed.  The
+                    # state is entered around the trace alone: the passes that
+                    # follow rewrite the graph that came out, and one of them
+                    # evaluates values, which must not be recorded as part of the
+                    # region.
+                    with tracer.proxy_mode:
+                        graph_module = tracer.trace(
+                            model,
+                            sample_inputs=_bind_sample_arguments(
+                                model, example_inputs, example_kwargs
+                            ),
+                        )
+                    # Default capture pipeline: canonicalize operators, then constant
+                    # folding, then decomposition, common-subexpression elimination
+                    # and dead code elimination; fusion hints are stamped last so
+                    # they see the final graph.  CSE runs after decomposition so
+                    # shared sub-chains across rewritten composites collapse too
+                    # (two gelu sites share one erf chain).  Backends always receive
+                    # a folded, linted, hint-annotated graph; ShapeProp below
+                    # additionally annotates tensor shapes.
+                    pass_result = PassManager(
+                        [
+                            NormalizeOperators(),
+                            ConstFold(),
+                            DecomposePass(),
+                            CSEPass(get_CSE_banned_ops()),
+                            DeadCodeElimination(),
+                            PointwiseFusionHint(),
+                        ]
+                    )(graph_module)
+                    graph_module = pass_result.graph_module
+            except GraphCaptureError as exc:
+                raise GraphCaptureError(
+                    "TensorPlay could not capture the requested compiler region"
+                ) from exc
+            store_region(region_key, graph_module)
 
     # Capture, propagation and lowering all execute the program to record or
     # measure it.  The generator they advance belongs to the caller, so the
@@ -792,55 +835,56 @@ def _compile_region(
             index = value.device.index or 0
             if index not in devices:
                 devices.append(index)
-    with tensorplay.random.fork_rng(devices=devices):
-        # Backend failures are compiler failures, not graph breaks.  In
-        # particular, a Stax lowering error must not silently turn a requested
-        # compiled region into an uncompiled call.
-        # Registered backends receive graph inputs in placeholder order, including
-        # values supplied through keywords and defaults.  Passing only
-        # positional arguments makes a keyword-only/scalar placeholder appear
-        # to be missing and is especially harmful for native Stax lowering.
-        bound = graph_module.signature.bind_partial(*example_inputs, **example_kwargs)
-        bound.apply_defaults()
-        # Numeric-gate placeholders ride the contract as synthetic inputs; their
-        # trace-time values stand in at lowering so kernels see real 0-d tensors.
-        backend_inputs = []
-        for node in graph_module.graph.placeholders:
-            parameter_name = node.target if isinstance(node.target, str) else node.name
+    with _preserve_input_values(example_inputs, example_kwargs):
+        with tensorplay.random.fork_rng(devices=devices):
+            # Backend failures are compiler failures, not graph breaks.  In
+            # particular, a Stax lowering error must not silently turn a requested
+            # compiled region into an uncompiled call.
+            # Registered backends receive graph inputs in placeholder order, including
+            # values supplied through keywords and defaults.  Passing only
+            # positional arguments makes a keyword-only/scalar placeholder appear
+            # to be missing and is especially harmful for native Stax lowering.
+            bound = graph_module.signature.bind_partial(*example_inputs, **example_kwargs)
+            bound.apply_defaults()
+            # Numeric-gate placeholders ride the contract as synthetic inputs; their
+            # trace-time values stand in at lowering so kernels see real 0-d tensors.
+            backend_inputs = []
+            for node in graph_module.graph.placeholders:
+                parameter_name = node.target if isinstance(node.target, str) else node.name
+                try:
+                    backend_inputs.append(bound.arguments[parameter_name])
+                except KeyError:
+                    if node.name not in bound.arguments:
+                        raise GraphCaptureError(
+                            f"missing sample value for graph placeholder {node.name!r}"
+                        ) from None
+                    backend_inputs.append(bound.arguments[node.name])
+
+            # Advisory shape/value metadata for backends and visualization; never a
+            # reason to reject an otherwise compilable region.
+            # Propagation executes the graph: it must not count as a call either.
             try:
-                backend_inputs.append(bound.arguments[parameter_name])
-            except KeyError:
-                if node.name not in bound.arguments:
-                    raise GraphCaptureError(
-                        f"missing sample value for graph placeholder {node.name!r}"
-                    ) from None
-                backend_inputs.append(bound.arguments[node.name])
+                with _preserve_module_state(model):
+                    ShapeProp(backend_inputs)(graph_module)
+            except (GraphCaptureError, RuntimeError):
+                pass
 
-        # Advisory shape/value metadata for backends and visualization; never a
-        # reason to reject an otherwise compilable region.
-        # Propagation executes the graph: it must not count as a call either.
-        try:
-            with _preserve_module_state(model):
-                ShapeProp(backend_inputs)(graph_module)
-        except (GraphCaptureError, RuntimeError):
-            pass
+            compiler_fn = _adapt_backend_to_region(
+                compiler_fn,
+                example_inputs,
+                example_kwargs,
+                graph_module,
+                backend_kwargs,
+            )
 
-        compiler_fn = _adapt_backend_to_region(
-            compiler_fn,
-            example_inputs,
-            example_kwargs,
-            graph_module,
-            backend_kwargs,
-        )
+            regional_compile_invoke_subgraph(
+                graph_module,
+                compiler=compiler_fn,
+                compiler_kwargs=backend_kwargs,
+            )
 
-        regional_compile_invoke_subgraph(
-            graph_module,
-            compiler=compiler_fn,
-            compiler_kwargs=backend_kwargs,
-        )
-
-        with _compiler_context():
-            compiled = compiler_fn(graph_module, backend_inputs, **backend_kwargs)
+            with _compiler_context():
+                compiled = compiler_fn(graph_module, backend_inputs, **backend_kwargs)
 
     if not callable(compiled):
         raise TypeError(

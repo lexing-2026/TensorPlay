@@ -78,6 +78,42 @@ _capture_disabled: ContextVar[bool] = ContextVar(
     "tensorplay_graph_capture_disabled", default=False
 )
 
+#: Set while a tracer executes a recorded node to obtain its example value.
+#: Sample execution must run eagerly; capture-aware factory functions check
+#: this so they do not record a nested node while the tracer is only sampling.
+_executing_sample: ContextVar[bool] = ContextVar(
+    "tensorplay_graph_executing_sample", default=False
+)
+
+#: Allocating tensor factories that must be recorded as graph nodes even
+#: with no proxy argument.  They return fresh storage; freezing their eager
+#: result into a constant would detach in-place fills and runtime-dependent
+#: factory calls from the compiled region.
+_FACTORY_NAMES = frozenset(
+    {
+        "empty",
+        "empty_like",
+        "empty_strided",
+        "empty_permuted",
+        "empty_quantized",
+        "full",
+        "full_like",
+        "zeros",
+        "zeros_like",
+        "ones",
+        "ones_like",
+        "arange",
+        "linspace",
+        "logspace",
+        "eye",
+        "new_empty",
+        "new_empty_strided",
+        "new_full",
+        "new_zeros",
+        "new_ones",
+    }
+)
+
 # The active tracer is exposed through a context variable so small graph
 # markers can participate in capture even when they have no tensor argument.
 # Keeping this state thread-local is important for nested captures and for
@@ -199,17 +235,46 @@ def capture_call(
                 break
             if found:
                 break
+    # Factory operations with no proxy argument are recorded anyway.  A
+    # stochastic factory (rand, randn, randint, ...) samples at call time, so
+    # freezing its eager result into a graph constant would make every
+    # compiled call reuse one random draw.  An allocating factory (empty,
+    # zeros, arange, ...) creates fresh storage, so freezing its eager result
+    # would pin the compiled call to one captured buffer -- which breaks
+    # in-place fills (``empty().uniform_()`` must re-sample per call) and
+    # leaves runtime shapes computed from metadata baked at capture time.
+    # During compile capture both kinds become graph nodes and run per call.
     if not found:
-        return None
+        name = getattr(target, "__name__", "")
+        stochastic = name.startswith("rand") or name in {
+            "bernoulli",
+            "multinomial",
+            "normal",
+            "poisson",
+            "exponential",
+            "geometric",
+            "cauchy",
+            "log_normal",
+        }
+        factory = name in _FACTORY_NAMES
+        if not (
+            (stochastic or factory)
+            and _compiling.get()
+            and not _executing_sample.get()
+        ):
+            return None
     proxies = list(_iter_proxies(args))
     proxies.extend(_iter_proxies(kwargs))
-    if not proxies:
-        return None
     if _capture_disabled.get():
         raise GraphCaptureError("graph capture is disabled for this operation")
-    tracer = proxies[0].tracer
-    if any(proxy.tracer is not tracer for proxy in proxies[1:]):
-        raise GraphCaptureError("cannot combine proxies from different traces")
+    if not proxies:
+        tracer = get_active_tracer()
+        if tracer is None:
+            return None
+    else:
+        tracer = proxies[0].tracer
+        if any(proxy.tracer is not tracer for proxy in proxies[1:]):
+            raise GraphCaptureError("cannot combine proxies from different traces")
     return tracer.create_proxy("call_function", target, args, kwargs)
 
 

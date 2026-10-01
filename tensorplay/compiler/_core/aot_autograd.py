@@ -318,6 +318,10 @@ def aot_function(
                 return tree_unflatten(list(_call(compiled_fw, args)), out_spec)
 
         run_inference._tensorplay_aot_graphs = (fw_module,)  # type: ignore[attr-defined]
+        run_inference._tensorplay_codegen = getattr(
+            compiled_fw, "_tensorplay_codegen", None
+        )  # type: ignore[attr-defined]
+        run_inference._tensorplay_backward_codegen = None  # type: ignore[attr-defined]
         return run_inference
 
     (
@@ -349,6 +353,7 @@ def aot_function(
     ]
     compiled_fw = fw_compiler(fw_module, fw_inputs)
     compiled_bw_box: list[Any] = []
+    fw_codegen = getattr(compiled_fw, "_tensorplay_codegen", None)
 
     fw_input_order = [primal_names.index(p.name) for p in fw_module.graph.placeholders]
 
@@ -411,6 +416,9 @@ def aot_function(
             )
             if not compiled_bw_box:
                 compiled_bw_box.append(bw_compiler(bw_module, inputs))
+                run_training._tensorplay_backward_codegen = getattr(
+                    compiled_bw_box[0], "_tensorplay_codegen", None
+                )
             grads = iter(_call(compiled_bw_box[0], inputs))
             out = tuple(next(grads) if needed else None for needed in grad_mask)
             # What this pass kept for itself is its own bookkeeping, and the
@@ -441,6 +449,8 @@ def aot_function(
         return tree_unflatten(list(user), out_spec)
 
     run_training._tensorplay_aot_graphs = (joint, fw_module, bw_module)  # type: ignore[attr-defined]
+    run_training._tensorplay_codegen = fw_codegen  # type: ignore[attr-defined]
+    run_training._tensorplay_backward_codegen = None  # type: ignore[attr-defined]
     return run_training
 
 
@@ -508,11 +518,40 @@ def aot_module_simplified(
         keep_inference_input_mutations=keep_inference_input_mutations,
     )
 
-    def forward(*args: Any, **kwargs: Any) -> Any:
-        return compiled(*read_state(), *_bind_graph_inputs(module, args, kwargs))
+    class _AotForward:
+        """Callable wrapper whose codegen reports mirror the compiled artifact.
 
-    forward._tensorplay_aot_graphs = getattr(compiled, "_tensorplay_aot_graphs", ())  # type: ignore[attr-defined]
-    return forward
+        The compiled forward and backward artifacts report which route
+        produced them; the wrapper a caller holds is not one of those, so a
+        report read through the wrapper reaches the artifact's live answer,
+        including the backward's route once a backward has run.
+        """
+
+        def __init__(
+            self,
+            compiled: Callable[..., Any],
+            module: Any,
+            read_state: Callable[[], list[Any]],
+            bind_graph_inputs: Callable[..., list[Any]],
+        ) -> None:
+            self._compiled = compiled
+            self._module = module
+            self._read_state = read_state
+            self._bind_graph_inputs = bind_graph_inputs
+            self._tensorplay_aot_graphs = getattr(
+                compiled, "_tensorplay_aot_graphs", ()
+            )
+
+        def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            return self._compiled(
+                *self._read_state(),
+                *self._bind_graph_inputs(self._module, args, kwargs),
+            )
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._compiled, name)
+
+    return _AotForward(compiled, module, read_state, _bind_graph_inputs)
 
 
 def _lift_literal_tensors(module: GraphModule) -> None:
@@ -558,6 +597,44 @@ def _lift_literal_tensors(module: GraphModule) -> None:
         module.recompile()
 
 
+def _swap_state_tables(module: Any, state: Mapping[str, Any]) -> list[tuple[Any, Any] | None]:
+    """Write tensors into the parameter/buffer tables generated code reads.
+
+    The generated forward resolves ``get_attr`` through the module's own
+    ``_parameters``/``_buffers`` (and nested ``_modules``) before the root,
+    so state written only to the root never reaches those reads.  Returns
+    ``(container, key, old_value)`` triples (``None`` for names that resolve
+    through the root) for restoration.
+    """
+
+    saved: list[tuple[Any, Any] | None] = []
+
+    def swap_holder(holder: Any, key: str, value: Any) -> None:
+        for table_name in ("_parameters", "_buffers"):
+            table = holder.__dict__.get(table_name)
+            if table is not None and key in table:
+                saved.append((table, key, table[key]))
+                table[key] = value
+                return
+        saved.append(None)
+
+    for name, value in state.items():
+        parts = name.split(".")
+        holder = module
+        for part in parts[:-1]:
+            modules = holder.__dict__.get("_modules", {})
+            if part in modules:
+                holder = modules[part]
+            else:
+                holder = None
+                break
+        if holder is None:
+            saved.append(None)
+            continue
+        swap_holder(holder, parts[-1], value)
+    return saved
+
+
 def _state_access(module: Any):
     """``(names, read_state, substitute)`` for the tensors a module reads."""
 
@@ -584,33 +661,39 @@ def _state_access(module: Any):
         @contextlib.contextmanager
         def substitute(state: dict[str, Any]):
             # Lifted literals live on the graph module itself; module state
-            # lives on the root.
+            # is read through the graph attribute table and through direct
+            # parameter/buffer lookup in the generated forward, so the state
+            # rides in every table those reads can hit.
             local = {k: v for k, v in state.items() if k in owned}
             rooted = {k: v for k, v in state.items() if k not in owned}
             saved = {k: owned[k] for k in local}
             owned.update(local)
             try:
-                if rooted and root is not None:
-                    if isinstance(root, tensorplay.nn.Module):
-                        with _reparametrize_module(root, rooted):
-                            yield
-                    else:
-                        # A plain callable root (a free function or a bound
-                        # method of a non-module object) has no parameter
-                        # containers to swap; the graph state it reads lives
-                        # in the graph module's attribute table, so the swap
-                        # happens there.
-                        attrs = module._graph_attrs
-                        saved_attrs = {k: attrs[k] for k in rooted if k in attrs}
-                        attrs.update(rooted)
-                        try:
-                            yield
-                        finally:
-                            for k in saved_attrs:
-                                attrs[k] = saved_attrs[k]
-                            for k in rooted:
-                                if k not in saved_attrs:
-                                    attrs.pop(k, None)
+                if rooted:
+                    attrs = module._graph_attrs
+                    saved_attrs = {k: attrs[k] for k in rooted if k in attrs}
+                    attrs.update(rooted)
+                    table_saved = _swap_state_tables(module, rooted)
+                    try:
+                        if root is not None and isinstance(root, tensorplay.nn.Module):
+                            # Keep the root's own bindings consistent for
+                            # any read that falls through the module's
+                            # attribute tables.
+                            with _reparametrize_module(root, rooted):
+                                yield
+                            return
+                        yield
+                    finally:
+                        for k in saved_attrs:
+                            attrs[k] = saved_attrs[k]
+                        for k in rooted:
+                            if k not in saved_attrs:
+                                attrs.pop(k, None)
+                        for entry in table_saved:
+                            if entry is None:
+                                continue
+                            table, key, old = entry
+                            table[key] = old
                 else:
                     yield
             finally:

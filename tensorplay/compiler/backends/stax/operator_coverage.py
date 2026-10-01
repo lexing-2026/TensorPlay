@@ -144,10 +144,13 @@ def coverage_of(name: str) -> Coverage:
     """
 
     lowerings, templates, _ = _tables()
-    if name in lowerings:
-        return Coverage.LOWERED
+    # A templated operator is declared by its template table before the
+    # lazy template import registers a lowering under the same name; the
+    # template is the stronger claim, so it is answered first.
     if name in templates:
         return Coverage.TEMPLATE
+    if name in lowerings:
+        return Coverage.LOWERED
     return declared_coverage().get(name, Coverage.NOT_COVERED)
 
 

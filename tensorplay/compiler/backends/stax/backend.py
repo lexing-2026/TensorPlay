@@ -225,10 +225,15 @@ def _lower_stax_region(
         # compilation, because both the schedule and the region's own picture
         # are asked of it by name while they are being decided, and neither can
         # say where to write unless something has already said that it wants to
-        # be written at all.
+        # be written at all.  The fake mode is entered as well as installed:
+        # fallback operators dispatch through the Python layer only while a
+        # mode sits on the dispatch stack, and a stack with no mode makes the
+        # generated Python-dispatch kernel pop nothing on entry.
+        fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
         with (
-            set_fake_mode(FakeTensorMode(allow_non_fake_inputs=True)),
-            VirtualMachine.set_fake_mode(FakeTensorMode(allow_non_fake_inputs=True)),
+            set_fake_mode(fake_mode),
+            VirtualMachine.set_fake_mode(fake_mode),
+            FakeTensorMode(allow_non_fake_inputs=True),
             set_graph(graph),
             VirtualMachine.set_debug_handler(Debug()),
         ):
@@ -252,12 +257,17 @@ def _lower_stax_region(
         return graph_module.recompile()
     except Exception as exc:
         if os.environ.get("TP_STAX_LOWER_DEBUG"):
+            import traceback as _tb
+
             print(
                 f"[stax-lower] unbuilt: {type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
+            _tb.print_exc(limit=30, file=sys.stderr)
         if strict:
-            raise
+            raise RuntimeError(
+                "strict_native Stax lowering failed: captured graph has no built form"
+            ) from exc
         return graph_module.recompile()
     # The generated entry point takes the region's arguments as one sequence,
     # because that is how the written-out code receives them, and it hands back
@@ -268,12 +278,37 @@ def _lower_stax_region(
     # produces that result, rather than a sequence holding it.
     module_call = compiled_module.call
     single_output = bool(getattr(graph, "single_output", False))
+    # The generated entry point takes the region's arguments as one sequence,
+    # in the order the region's placeholders stand.  The artifact is reached
+    # through the same signature the region was captured under, so keyword
+    # and default arguments are bound back to their parameter names and
+    # re-ordered into that sequence, mirroring the capture-time binding.
+    signature = graph_module.signature
 
-    def compiled(*args):
+    def compiled(*args, **kwargs):
+        if signature is None:
+            ordered = list(args)
+        else:
+            bound = signature.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+            ordered = []
+            for node in graph_module.graph.placeholders:
+                parameter_name = (
+                    node.target if isinstance(node.target, str) else node.name
+                )
+                if parameter_name in bound.arguments:
+                    ordered.append(bound.arguments[parameter_name])
+                elif node.name in bound.arguments:
+                    ordered.append(bound.arguments[node.name])
+                else:
+                    raise TypeError(
+                        f"compiled region is missing a value for "
+                        f"captured argument {parameter_name!r}"
+                    )
         # A list rather than a tuple, because the written-out code empties what
         # it is given once it has taken it -- which is how a caller that holds
         # the same values does not keep them alive for the call.
-        result = module_call(list(args))
+        result = module_call(ordered)
         if single_output and isinstance(result, tuple) and len(result) == 1:
             return result[0]
         return result
