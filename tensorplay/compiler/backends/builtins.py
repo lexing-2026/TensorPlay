@@ -12,8 +12,8 @@ def register() -> None:
         stax,
         name="stax",
         capabilities=BackendCapabilities(
-            inference_only=False,
-            handles_training=True,
+            inference_only=True,
+            handles_training=False,
         ),
     )
     # Importing the module registers the debug-tagged backends.
