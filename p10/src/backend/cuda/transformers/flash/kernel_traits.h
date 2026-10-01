@@ -19,7 +19,7 @@ struct Flash_kernel_traits {
     using Element = elem_type;
     static constexpr bool Has_cp_async = true;
 #else
-    using Element = cutlass::half_t;
+    using Element = std::conditional_t<std::is_same_v<elem_type, float>, float, cutlass::half_t>;
     static constexpr bool Has_cp_async = false;
 #endif
 
@@ -30,15 +30,27 @@ struct Flash_kernel_traits {
     using MMA_Atom_Arch = std::conditional_t<
         std::is_same_v<elem_type, cutlass::half_t>,
         MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
-        MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>
-    >;
+        std::conditional_t<
+            std::is_same_v<elem_type, cutlass::bfloat16_t>,
+            MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>,
+            MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>>>;
 #else
     using MMA_Atom_Arch = MMA_Atom<SM75_16x8x8_F32F16F16F32_TN>;
 #endif
 
 #if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 750
-    using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
-    using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, elem_type>;
+    // The tensor-core MMA takes a wide precision without a fragment form of its
+    // own: the operands stay in their 32-bit storage and are split into the
+    // tensor-core's two tf32 parts at the register level, so the smem copy
+    // atom is a plain 32-bit load rather than the 16-bit ldsm family.
+    using SmemCopyAtom = std::conditional_t<
+        std::is_same_v<elem_type, float>,
+        Copy_Atom<DefaultCopy, elem_type>,
+        Copy_Atom<SM75_U32x4_LDSM_N, elem_type>>;
+    using SmemCopyAtomTransposed = std::conditional_t<
+        std::is_same_v<elem_type, float>,
+        Copy_Atom<DefaultCopy, elem_type>,
+        Copy_Atom<SM75_U16x8_LDSM_T, elem_type>>;
 #else
     using SmemCopyAtom = Copy_Atom<DefaultCopy, elem_type>;
     using SmemCopyAtomTransposed = Copy_Atom<DefaultCopy, elem_type>;
@@ -71,10 +83,16 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
 
+    // The tile's K follows the mma's: the reduced precisions' instruction
+    // steps sixteen elements, the wide precision's tf32 instruction steps
+    // eight, and the score tile is partitioned accordingly.
     using TiledMma = TiledMMA<
         typename Base::MMA_Atom_Arch,
         Layout<Shape<Int<kNWarps>,_1,_1>>,  // 4x1x1 or 8x1x1 thread group
-        Tile<Int<16 * kNWarps>, _16, _16>>;
+        std::conditional_t<
+            std::is_same_v<elem_type, float>,
+            Tile<Int<16 * kNWarps>, _8, _8>,
+            Tile<Int<16 * kNWarps>, _16, _16>>>;
 
     using SmemLayoutAtomQ = decltype(
         composition(Swizzle<kSwizzle, 3, 3>{},

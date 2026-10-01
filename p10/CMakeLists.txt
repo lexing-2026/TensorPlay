@@ -309,6 +309,8 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/transformers/flash_fwd_hdim128_bf16_sm80.cu
         src/backend/cuda/transformers/flash_fwd_hdim128_fp16_causal_sm80.cu
         src/backend/cuda/transformers/flash_fwd_hdim128_fp16_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim128_fp32_causal_sm80.cu
+        src/backend/cuda/transformers/flash_fwd_hdim128_fp32_sm80.cu
         src/backend/cuda/transformers/flash_fwd_hdim192_bf16_causal_sm80.cu
         src/backend/cuda/transformers/flash_fwd_hdim192_bf16_sm80.cu
         src/backend/cuda/transformers/flash_fwd_hdim192_fp16_causal_sm80.cu

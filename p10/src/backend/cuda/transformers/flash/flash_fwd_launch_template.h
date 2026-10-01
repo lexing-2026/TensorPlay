@@ -277,6 +277,17 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, bool Is_causal>
+void run_mha_fwd_hdim128_fp32(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 128;
+    // The wide precision's operands are twice as wide as the reduced ones',
+    // so the block that fits the shared budget is 64 x 64: the query tile,
+    // the key tile and the value tile together stay under the on-chip limit.
+    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+    });
+}
+
+template<typename T, bool Is_causal>
 void run_mha_fwd_hdim192(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 192;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {

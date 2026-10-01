@@ -19,6 +19,17 @@ namespace tensorplay_native_flash {
 // paged store -- goes to the splitting leaf instead.
 void run_mha_fwd(Flash_fwd_params& params, cudaStream_t stream,
                  bool force_split_kernel) {
+  // The wide precision has leaves of its own, one per head width it serves.
+  // The split-kv path is not instantiated for it yet, so a wide call is served
+  // by the single tile walk regardless of the split count.
+  if (params.is_fp32) {
+    if (params.d == 128) {
+      BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+        run_mha_fwd_<float, 128, Is_causal>(params, stream);
+      });
+    }
+    return;
+  }
   FP16_SWITCH(!params.is_bf16, [&] {
     HEADDIM_SWITCH(params.d, [&] {
       BOOL_SWITCH(params.is_causal, Is_causal, [&] {

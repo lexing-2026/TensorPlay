@@ -132,6 +132,25 @@ static __device__ __forceinline__ T run(T x, Operator &op) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Split one float fragment into the big and small tf32 fragments a tensor
+// core's fast-f32 path consumes: the big part is the float rounded to tf32,
+// the small part is the residual, and the product of two floats is recovered
+// as big*big + big*small + small*big.
+template <typename TensorF, typename TensorHi, typename TensorLo>
+__forceinline__ __device__ void split_f32_fragment(TensorF const& f,
+                                                   TensorHi& hi,
+                                                   TensorLo& lo) {
+  cutlass::NumericConverterFastF32<> convert_;
+#pragma unroll
+  for (int i = 0; i < cute::size(f); ++i) {
+    auto r = convert_(f.data()[i]);
+    hi.data()[i] = r[0];
+    lo.data()[i] = r[1];
+  }
+}
+
 template<bool A_in_regs=false, bool B_in_regs=false, typename Tensor0, typename Tensor1,
          typename Tensor2, typename Tensor3, typename Tensor4,
          typename TiledMma, typename TiledCopyA, typename TiledCopyB,
@@ -143,6 +162,41 @@ __forceinline__ __device__ void gemm(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB,
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
     CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
+using SrcType = std::remove_cv_t<typename Tensor3::value_type>;
+    if constexpr (std::is_same_v<SrcType, float>) {
+        // The wide precision has no fragment form of its own, so the operand
+        // fragments stay float until they are split into tf32 parts at the
+        // register level and three products are accumulated per operand pair.
+        // The hi/lo parts are per-K-slice so the register pressure of the
+        // wide precision's larger fragments stays bounded.
+        auto tCrA_f = recast<float>(tCrA);
+        auto tCrB_f = recast<float>(tCrB);
+        Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA_f);
+        CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));        // M
+        Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB_f);
+        CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));        // N
+        if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{})); }
+        if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{})); }
+        #pragma unroll
+        for (int i = 0; i < size<2>(tCrA); ++i) {
+            if (i < size<2>(tCrA) - 1) {
+                if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i + 1), tCrA_copy_view(_, _, i + 1)); }
+                if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1)); }
+            }
+            auto a_slice = tCrA_f(_, _, i);
+            auto b_slice = tCrB_f(_, _, i);
+            auto a_hi = make_tensor_like(a_slice);
+            auto a_lo = make_tensor_like(a_slice);
+            auto b_hi = make_tensor_like(b_slice);
+            auto b_lo = make_tensor_like(b_slice);
+            split_f32_fragment(a_slice, a_hi, a_lo);
+            split_f32_fragment(b_slice, b_hi, b_lo);
+            cute::gemm(tiled_mma, a_hi, b_hi, acc);
+            cute::gemm(tiled_mma, a_hi, b_lo, acc);
+            cute::gemm(tiled_mma, a_lo, b_hi, acc);
+        }
+        return;
+    }
     Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
     CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // M
     Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
@@ -169,6 +223,35 @@ __forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tC
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
     CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
+    using SrcType = std::remove_cv_t<typename Tensor3::value_type>;
+    if constexpr (std::is_same_v<SrcType, float>) {
+        // The probability fragment is already float; the value fragment is
+        // loaded from smem and both are split into tf32 parts, with the three
+        // tensor-core products accumulated into the output.  The hi/lo parts
+        // are per-K-slice to keep the register pressure bounded.
+        auto tCrB_f = recast<float>(tCrB);
+        Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB_f);
+        CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));        // N
+        cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
+        #pragma unroll
+        for (int i = 0; i < size<2>(tCrA); ++i) {
+            if (i < size<2>(tCrA) - 1) {
+                cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
+            }
+            auto a_slice = tCrA(_, _, i);
+            auto b_slice = tCrB_f(_, _, i);
+            auto a_hi = make_tensor_like(recast<tfloat32_t>(a_slice));
+            auto a_lo = make_tensor_like(recast<tfloat32_t>(a_slice));
+            auto b_hi = make_tensor_like(b_slice);
+            auto b_lo = make_tensor_like(b_slice);
+            split_f32_fragment(a_slice, a_hi, a_lo);
+            split_f32_fragment(b_slice, b_hi, b_lo);
+            cute::gemm(tiled_mma, a_hi, b_hi, acc);
+            cute::gemm(tiled_mma, a_hi, b_lo, acc);
+            cute::gemm(tiled_mma, a_lo, b_hi, acc);
+        }
+        return;
+    }
     Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
     cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
@@ -228,11 +311,15 @@ __forceinline__ __device__ auto convert_layout_acc_dropout(Layout acc_layout) {
 template <typename To_type, typename Engine, typename Layout>
 __forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const &tensor) {
     using From_type = typename Engine::value_type;
-    constexpr int numel = decltype(size(tensor))::value;
-    cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
-    // HACK: this requires tensor to be "contiguous"
-    auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
-    return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
+    if constexpr (std::is_same_v<To_type, From_type>) {
+        return tensor;
+    } else {
+        constexpr int numel = decltype(size(tensor))::value;
+        cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
+        // HACK: this requires tensor to be "contiguous"
+        auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
+        return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

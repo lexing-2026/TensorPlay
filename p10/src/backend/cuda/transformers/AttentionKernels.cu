@@ -94,6 +94,11 @@ Tensor sdpa_gemm_native(
 // themselves.
 Tensor sdpa_wide_tiled_cuda(const Tensor& query, const Tensor& key,
                             const Tensor& value, bool is_causal);
+// The same schedule with the row log-sum-exp written out, for the fused entry
+// that returns it alongside the attention.
+Tensor sdpa_wide_tiled_cuda_with_lse(const Tensor& query, const Tensor& key,
+                                   const Tensor& value, bool is_causal,
+                                   Tensor& lse);
 
 namespace {
 
@@ -1608,6 +1613,7 @@ std::tuple<Tensor, Tensor> sdpa_fused_forward_cuda(
   params.softcap = 0.f;
   params.rng_state = nullptr;
   params.is_bf16 = q.dtype() == DType::BFloat16;
+  params.is_fp32 = q.dtype() == DType::Float32;
   params.is_rotary_interleaved = false;
   params.alibi_slopes_ptr = nullptr;
   params.alibi_slopes_batch_stride = 0;
@@ -2661,6 +2667,67 @@ std::tuple<Tensor, Tensor> sdpa_kernel_cuda_with_lse(
     }
   }
 #endif
+  // A context of a different length than the query is served here too, by
+  // the same schedule the public entry uses: the reduced precisions' tile path
+  // carries its own log-sum-exp, and the wide precision writes the same row
+  // statistics out of its kernel.
+  if (impl == 0 && query.dim() == 4 && key.dim() == 4 && value.dim() == 4 &&
+      query.size(2) != key.size(2) && query.size(0) == key.size(0) &&
+      query.size(1) == key.size(1) && key.size(1) == value.size(1) &&
+      query.size(3) == key.size(3) && key.size(3) == value.size(3) &&
+      key.size(2) == value.size(2) &&
+      query.dtype() == key.dtype() && key.dtype() == value.dtype()) {
+    const DType dtype = query.dtype();
+    if (dtype == DType::Float16 || dtype == DType::BFloat16) {
+#if defined(TP_HAS_NATIVE_CUTE_FLASH)
+      int major = 0;
+      TP_CUDA_CHECK(cudaDeviceGetAttribute(
+          &major, cudaDevAttrComputeCapabilityMajor,
+          getCurrentCUDAStream().device_index()));
+      if (major >= 8) {
+        auto feature_contiguous = [](const Tensor& tensor) {
+          return tensor.stride(3) == 1 ? tensor : tensor.contiguous();
+        };
+        Tensor q = feature_contiguous(query);
+        Tensor k = feature_contiguous(key);
+        Tensor v = feature_contiguous(value);
+        const double s = 1.0 / std::sqrt(static_cast<double>(q.size(3)));
+        Tensor lse;
+        SdpaFusedLaunch launch;
+        launch.lse_out = &lse;
+        launch.window_right = is_causal ? 0 : -1;
+        return sdpa_fused_forward_cuda(q, k, v, launch, s,
+                                       /*enable_gqa=*/false);
+      }
+#endif
+    } else if (dtype == DType::Float32 && query.size(3) == 128) {
+#if defined(TP_HAS_NATIVE_CUTE_FLASH)
+      int major = 0;
+      TP_CUDA_CHECK(cudaDeviceGetAttribute(
+          &major, cudaDevAttrComputeCapabilityMajor,
+          getCurrentCUDAStream().device_index()));
+      if (major >= 8) {
+        auto feature_contiguous = [](const Tensor& tensor) {
+          return tensor.stride(3) == 1 ? tensor : tensor.contiguous();
+        };
+        Tensor q = feature_contiguous(query);
+        Tensor k = feature_contiguous(key);
+        Tensor v = feature_contiguous(value);
+        const double s = 1.0 / std::sqrt(static_cast<double>(q.size(3)));
+        Tensor lse;
+        SdpaFusedLaunch launch;
+        launch.lse_out = &lse;
+        launch.window_right = is_causal ? 0 : -1;
+        return sdpa_fused_forward_cuda(q, k, v, launch, s,
+                                       /*enable_gqa=*/false);
+      }
+#endif
+      Tensor lse;
+      Tensor output =
+          sdpa_wide_tiled_cuda_with_lse(query, key, value, is_causal, lse);
+      return {output, lse};
+    }
+  }
   Tensor output = sdpa_kernel_cuda_plain(query, key, value, is_causal, impl);
   Tensor lse = Tensor::empty({0}, DType::Float32, query.device());
   return {output, lse};
