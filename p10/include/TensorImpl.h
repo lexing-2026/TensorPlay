@@ -63,7 +63,6 @@ private:
 
     struct SharedState {
         std::shared_ptr<void> onednn_md;
-        std::shared_ptr<void> onednn_memory_cache; // Cache for OneDNN memory object (reordered)
     };
     std::shared_ptr<SharedState> shared_state_;
 
@@ -455,17 +454,6 @@ public:
     }
     bool has_onednn_md() const {
         return shared_state_ && shared_state_->onednn_md != nullptr;
-    }
-
-    void set_onednn_memory_cache(std::shared_ptr<void> mem) {
-        if (!shared_state_) shared_state_ = std::make_shared<SharedState>();
-        shared_state_->onednn_memory_cache = std::move(mem);
-    }
-    std::shared_ptr<void> get_onednn_memory_cache() const {
-        return shared_state_ ? shared_state_->onednn_memory_cache : nullptr;
-    }
-    bool has_onednn_memory_cache() const {
-        return shared_state_ && shared_state_->onednn_memory_cache != nullptr;
     }
 
     void set_autograd_meta(std::shared_ptr<AutogradMetaBase> meta) { autograd_meta_ = std::move(meta); }

@@ -2110,78 +2110,47 @@ static bool conv2d_grad_input_onednn(const Tensor& grad_output, const Tensor& in
 
         // Prepare Diff Dst (grad_output)
         memory diff_dst_mem;
-        bool loaded_from_cache = false;
-        
-        // Try to use cached memory object from SharedState to avoid redundant reorder
-        if (grad_output_c.unsafeGetTensorImpl()->has_onednn_memory_cache()) {
-             auto cached_mem_ptr = std::static_pointer_cast<memory>(grad_output_c.unsafeGetTensorImpl()->get_onednn_memory_cache());
-             // Check if the cached memory descriptor matches what we need
-             if (cached_mem_ptr && cached_mem_ptr->get_desc() == expected_diff_dst_md) {
-                 diff_dst_mem = *cached_mem_ptr;
-                 loaded_from_cache = true;
-             }
-        }
-
-        if (!loaded_from_cache) {
-            if (grad_output_c.unsafeGetTensorImpl()->has_onednn_md()) {
-                 auto stored_md = std::static_pointer_cast<memory::desc>(grad_output_c.unsafeGetTensorImpl()->get_onednn_md());
-                 if (*stored_md == expected_diff_dst_md) {
-                     diff_dst_mem = memory(*stored_md, eng, grad_output_c.data_ptr<float>());
-                 } else {
-                     // std::cout << "DEBUG: Reordering grad_output (stored) in conv2d_grad_input_onednn" << std::endl;
-                     auto src = memory(*stored_md, eng, grad_output_c.data_ptr<float>());
-                     diff_dst_mem = memory(expected_diff_dst_md, eng);
-                     reorder(src, diff_dst_mem).execute(s, src, diff_dst_mem);
-                 }
+        if (grad_output_c.unsafeGetTensorImpl()->has_onednn_md()) {
+            auto stored_md = std::static_pointer_cast<memory::desc>(grad_output_c.unsafeGetTensorImpl()->get_onednn_md());
+            if (*stored_md == expected_diff_dst_md) {
+                diff_dst_mem = memory(*stored_md, eng, grad_output_c.data_ptr<float>());
             } else {
-                 auto user_tag = grad_output_c.is_contiguous(MemoryFormat::ChannelsLast)
-                     ? memory::format_tag::nhwc : memory::format_tag::nchw;
-                 auto user_md = memory::desc(dst_dims, memory::data_type::f32, user_tag);
-                 auto user_mem = memory(user_md, eng, grad_output_c.data_ptr<float>());
-                 if (user_md != expected_diff_dst_md) {
-                     // std::cout << "DEBUG: Reordering grad_output (NCHW) in conv2d_grad_input_onednn" << std::endl;
-                     
-                     // Optimize: Update grad_output storage to blocked format to avoid re-reordering in grad_weight
-                    // DISABLED: Modifying input tensor storage breaks other consumers (e.g. grad_bias, Python view)
-                    // We just use a temporary reordered buffer (owned by diff_dst_mem) and cache it.
-                    
-                    diff_dst_mem = memory(expected_diff_dst_md, eng);
+                auto src = memory(*stored_md, eng, grad_output_c.data_ptr<float>());
+                diff_dst_mem = memory(expected_diff_dst_md, eng);
+                reorder(src, diff_dst_mem).execute(s, src, diff_dst_mem);
+            }
+        } else {
+            auto user_tag = grad_output_c.is_contiguous(MemoryFormat::ChannelsLast)
+                ? memory::format_tag::nhwc : memory::format_tag::nchw;
+            auto user_md = memory::desc(dst_dims, memory::data_type::f32, user_tag);
+            auto user_mem = memory(user_md, eng, grad_output_c.data_ptr<float>());
+            if (user_md != expected_diff_dst_md) {
+                diff_dst_mem = memory(expected_diff_dst_md, eng);
 
-                     reorder r_prim;
-                     bool r_found = false;
-                     for (const auto& item : cached_entry.reorder_grad_output_cache) {
-                         if (item.first == user_md) {
-                             r_prim = item.second;
-                             r_found = true;
-                             break;
-                         }
-                     }
-                     
-                     if (!r_found) {
-                        r_prim = reorder(user_mem, diff_dst_mem);
-                        cached_entry.reorder_grad_output_cache.push_back({user_md, r_prim});
-                        {
-                            std::lock_guard<std::mutex> lock(mtx);
-                            auto it = cache.find(key);
-                            if (it != cache.end()) {
-                                it->second.reorder_grad_output_cache.push_back({user_md, r_prim});
-                            }
+                reorder r_prim;
+                bool r_found = false;
+                for (const auto& item : cached_entry.reorder_grad_output_cache) {
+                    if (item.first == user_md) {
+                        r_prim = item.second;
+                        r_found = true;
+                        break;
+                    }
+                }
+                if (!r_found) {
+                    r_prim = reorder(user_mem, diff_dst_mem);
+                    cached_entry.reorder_grad_output_cache.push_back({user_md, r_prim});
+                    {
+                        std::lock_guard<std::mutex> lock(mtx);
+                        auto it = cache.find(key);
+                        if (it != cache.end()) {
+                            it->second.reorder_grad_output_cache.push_back({user_md, r_prim});
                         }
                     }
-                    auto start_r = std::chrono::high_resolution_clock::now();
-                    r_prim.execute(s, user_mem, diff_dst_mem);
-                    auto end_r = std::chrono::high_resolution_clock::now();
-                    // std::cout << "DEBUG: GradOutput Reorder Time: " << std::chrono::duration_cast<std::chrono::microseconds>(end_r - start_r).count() << " us" << std::endl;
-
-                    // Update the tensor - DISABLED
-                   // grad_output_c.unsafeGetTensorImpl()->set_storage(new_storage);
-                   // grad_output_c.unsafeGetTensorImpl()->set_onednn_md(std::make_shared<memory::desc>(expected_diff_dst_md));
-                 } else {
-                     diff_dst_mem = user_mem;
-                 }
+                }
+                r_prim.execute(s, user_mem, diff_dst_mem);
+            } else {
+                diff_dst_mem = user_mem;
             }
-            // Cache the memory object for other backward functions (e.g. grad_weight)
-            grad_output_c.unsafeGetTensorImpl()->set_onednn_memory_cache(std::make_shared<memory>(diff_dst_mem));
         }
 
         // Prepare Weights
@@ -2468,67 +2437,47 @@ static bool conv2d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
 
         // Prepare Diff Dst (Grad Output)
         memory diff_dst_mem;
-        bool loaded_from_cache = false;
+        if (grad_output_c.unsafeGetTensorImpl()->has_onednn_md()) {
+            auto stored_md = std::static_pointer_cast<memory::desc>(grad_output_c.unsafeGetTensorImpl()->get_onednn_md());
+            if (*stored_md == expected_diff_dst_md) {
+                diff_dst_mem = memory(*stored_md, eng, grad_output_c.data_ptr<float>());
+            } else {
+                auto src = memory(*stored_md, eng, grad_output_c.data_ptr<float>());
+                diff_dst_mem = memory(expected_diff_dst_md, eng);
+                reorder(src, diff_dst_mem).execute(s, src, diff_dst_mem);
+            }
+        } else {
+            auto user_tag = grad_output_c.is_contiguous(MemoryFormat::ChannelsLast)
+                ? memory::format_tag::nhwc : memory::format_tag::nchw;
+            auto user_md = memory::desc(dst_dims, memory::data_type::f32, user_tag);
+            auto user_mem = memory(user_md, eng, grad_output_c.data_ptr<float>());
+            if (user_md != expected_diff_dst_md) {
+                diff_dst_mem = memory(expected_diff_dst_md, eng);
 
-        // Try to use cached memory object from SharedState
-        if (grad_output_c.unsafeGetTensorImpl()->has_onednn_memory_cache()) {
-             auto cached_mem_ptr = std::static_pointer_cast<memory>(grad_output_c.unsafeGetTensorImpl()->get_onednn_memory_cache());
-             if (cached_mem_ptr && cached_mem_ptr->get_desc() == expected_diff_dst_md) {
-                 diff_dst_mem = *cached_mem_ptr;
-                 loaded_from_cache = true;
-             }
-        }
-        
-        if (!loaded_from_cache) {
-             if (grad_output_c.unsafeGetTensorImpl()->has_onednn_md()) {
-                  auto stored_md = std::static_pointer_cast<memory::desc>(grad_output_c.unsafeGetTensorImpl()->get_onednn_md());
-                  if (*stored_md == expected_diff_dst_md) {
-                      diff_dst_mem = memory(*stored_md, eng, grad_output_c.data_ptr<float>());
-                  } else {
-                      // std::cout << "DEBUG: Reordering grad_output (stored) in conv2d_grad_weight_onednn. Impl: " << grad_output_c.unsafeGetTensorImpl() << std::endl;
-                      auto src = memory(*stored_md, eng, grad_output_c.data_ptr<float>());
-                      diff_dst_mem = memory(expected_diff_dst_md, eng);
-                      reorder(src, diff_dst_mem).execute(s, src, diff_dst_mem);
-                  }
-             } else {
-                  auto user_tag = grad_output_c.is_contiguous(MemoryFormat::ChannelsLast)
-                      ? memory::format_tag::nhwc : memory::format_tag::nchw;
-                  auto user_md = memory::desc(dst_dims, memory::data_type::f32, user_tag);
-                  auto user_mem = memory(user_md, eng, grad_output_c.data_ptr<float>());
-                   if (user_md != expected_diff_dst_md) {
-                      // DISABLED in-place storage swap: mutating the grad_output storage breaks
-                      // other consumers of the shared autograd grad (e.g. conv2d_grad_bias runs
-                      // afterwards and reads it as NCHW). Use an owning reordered buffer instead.
-                      diff_dst_mem = memory(expected_diff_dst_md, eng);
-
-                      reorder r_prim;
-                      bool r_found = false;
-                      for (const auto& item : cached_entry.reorder_grad_output_cache) {
-                          if (item.first == user_md) {
-                              r_prim = item.second;
-                              r_found = true;
-                              break;
-                          }
-                      }
-
-                      if (!r_found) {
-                          r_prim = reorder(user_mem, diff_dst_mem);
-                          cached_entry.reorder_grad_output_cache.push_back({user_md, r_prim});
-                          {
-                              std::lock_guard<std::mutex> lock(mtx);
-                              auto it = cache.find(key);
-                              if (it != cache.end()) {
-                                  it->second.reorder_grad_output_cache.push_back({user_md, r_prim});
-                              }
-                          }
-                      }
-                      r_prim.execute(s, user_mem, diff_dst_mem);
-                   } else {
-                       diff_dst_mem = user_mem;
-                   }
-             }
-             // Cache the memory object
-             grad_output_c.unsafeGetTensorImpl()->set_onednn_memory_cache(std::make_shared<memory>(diff_dst_mem));
+                reorder r_prim;
+                bool r_found = false;
+                for (const auto& item : cached_entry.reorder_grad_output_cache) {
+                    if (item.first == user_md) {
+                        r_prim = item.second;
+                        r_found = true;
+                        break;
+                    }
+                }
+                if (!r_found) {
+                    r_prim = reorder(user_mem, diff_dst_mem);
+                    cached_entry.reorder_grad_output_cache.push_back({user_md, r_prim});
+                    {
+                        std::lock_guard<std::mutex> lock(mtx);
+                        auto it = cache.find(key);
+                        if (it != cache.end()) {
+                            it->second.reorder_grad_output_cache.push_back({user_md, r_prim});
+                        }
+                    }
+                }
+                r_prim.execute(s, user_mem, diff_dst_mem);
+            } else {
+                diff_dst_mem = user_mem;
+            }
         }
 
         // Prepare Diff Weights (Grad Weight)
