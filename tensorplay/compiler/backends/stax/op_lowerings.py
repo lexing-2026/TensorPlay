@@ -1855,7 +1855,7 @@ def lower_native_group_norm(x, weight, bias, n, c, hxw, groups, eps):
     def one_inner(index, rindex):
         return ops.constant(1, f32)
 
-    mean, m2, _count = WelfordReduction.create(
+    mean, m2, _count = ir.WelfordReduction.create(
         device=device,
         dtype=stat_dtype,
         inner_fns=(sum_inner, sq_inner, one_inner),
