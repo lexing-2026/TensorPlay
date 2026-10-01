@@ -219,19 +219,23 @@ using SrcType = std::remove_cv_t<typename Tensor3::value_type>;
 // A-operand register layout of the same tiled MMA.  For the 8-deep
 // wide-precision instruction the two layouts assign the fragment's rows and
 // columns to different lanes and registers, so the conversion is a register
-// permutation within each group of four lanes.
+// permutation within each group of four lanes.  The fragment holds four
+// elements per mma step (one element pair per row), and the number of such
+// groups varies with the tile's N extent, so the shuffle pattern is applied to
+// each group of four linear elements in turn.
 template <typename Tensor>
 __forceinline__ __device__ auto convert_acc_to_Aregs(Tensor const& tCrA) {
     using value_type = typename Tensor::value_type;
     static_assert(std::is_same_v<value_type, float>);
     static_assert(decltype(size<0>(tCrA))::value == 4);
-    static_assert(decltype(size<2>(tCrA))::value == 8);
+    constexpr int numel = decltype(size(tCrA))::value;
+    static_assert(numel % 4 == 0);
     auto out = make_tensor_like(tCrA);
     const int lane = threadIdx.x % 32;
     const int d = lane % 4;
     const int lq = lane - d;
     #pragma unroll
-    for (int g = 0; g < 8; ++g) {
+    for (int g = 0; g < numel / 4; ++g) {
         float f00 = tCrA(4 * g + 0);
         float f02 = tCrA(4 * g + 2);
         float f01 = tCrA(4 * g + 1);
