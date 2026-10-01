@@ -83,15 +83,20 @@ std::shared_ptr<CachedTensorDesc> get_cached_tensor_desc(const Tensor& t) {
     for (int64_t dim : {t.size(0), t.size(1), t.size(2), t.size(3)}) {
         key += ":" + std::to_string(dim);
     }
+    for (int64_t s : {t.stride(0), t.stride(1), t.stride(2), t.stride(3)}) {
+        key += ":" + std::to_string(s);
+    }
     std::lock_guard<std::mutex> lock(g_conv_desc_cache_mutex);
     auto it = g_tensor_desc_cache.find(key);
     if (it != g_tensor_desc_cache.end()) return it->second;
     cudnnTensorDescriptor_t desc;
     CUDNN_CHECK(cudnnCreateTensorDescriptor(&desc));
-    CUDNN_CHECK(cudnnSetTensor4dDescriptor(
-        desc, CUDNN_TENSOR_NCHW, to_cudnn_data_type(t.dtype()),
+    CUDNN_CHECK(cudnnSetTensor4dDescriptorEx(
+        desc, to_cudnn_data_type(t.dtype()),
         static_cast<int>(t.size(0)), static_cast<int>(t.size(1)),
-        static_cast<int>(t.size(2)), static_cast<int>(t.size(3))));
+        static_cast<int>(t.size(2)), static_cast<int>(t.size(3)),
+        static_cast<int>(t.stride(0)), static_cast<int>(t.stride(1)),
+        static_cast<int>(t.stride(2)), static_cast<int>(t.stride(3))));
     auto holder = std::make_shared<CachedTensorDesc>();
     holder->desc = desc;
     g_tensor_desc_cache.emplace(key, holder);
@@ -102,6 +107,9 @@ std::shared_ptr<CachedFilterDesc> get_cached_filter_desc(const Tensor& t) {
     std::string key = std::to_string(static_cast<int>(t.dtype()));
     for (int64_t dim : {t.size(0), t.size(1), t.size(2), t.size(3)}) {
         key += ":" + std::to_string(dim);
+    }
+    for (int64_t s : {t.stride(0), t.stride(1), t.stride(2), t.stride(3)}) {
+        key += ":" + std::to_string(s);
     }
     std::lock_guard<std::mutex> lock(g_conv_desc_cache_mutex);
     auto it = g_filter_desc_cache.find(key);
