@@ -45,6 +45,8 @@ from sympy.utilities.iterables import sift
 from sympy.logic.boolalg import Boolean
 from sympy.printing.str import StrPrinter
 
+from tensorplay.primitives.common import dtype_to_type
+
 __all__ = [
     "CeilDiv",
     "ValueRangeError",

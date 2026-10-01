@@ -681,10 +681,19 @@ def _adapt_backend_to_region(
 
         forward_compiler.__name__ = getattr(compiler_fn, "__name__", "compiler_fn")
 
+    from tensorplay._decomp import get_decompositions
+    import tensorplay
+
+    _GN_DECOMPOSITION_OPS = (
+        tensorplay.ops.tp.native_group_norm,
+        tensorplay.ops.tp.native_group_norm_backward,
+    )
+
     return aot_autograd(
         fw_compiler=forward_compiler,
         bw_compiler=forward_compiler,
         partition_fn=default_partition,
+        decompositions=get_decompositions(_GN_DECOMPOSITION_OPS),
     )
 
 

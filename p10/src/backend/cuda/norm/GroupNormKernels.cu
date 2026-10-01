@@ -1274,6 +1274,46 @@ static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cuda_impl(
             grad_output, input, num_groups, weight_opt, bias_opt, eps,
             mean_saved, rstd_saved, output_mask);
     }
+    if (input.dtype() == DType::Float16 &&
+        grad_output.dtype() == DType::Float16) {
+        Tensor grad_output_f32 = grad_output.to(DType::Float32);
+        std::optional<Tensor> weight_f32;
+        if (weight_opt.has_value() && weight_opt->defined()) {
+            weight_f32 = weight_opt->to(DType::Float32);
+        }
+        std::optional<Tensor> bias_f32;
+        if (bias_opt.has_value() && bias_opt->defined()) {
+            bias_f32 = bias_opt->to(DType::Float32);
+        }
+        auto mixed = group_norm_backward_mixed_cuda_impl<Half>(
+            grad_output_f32, input, num_groups, weight_f32, bias_f32, eps,
+            mean_saved, rstd_saved, output_mask);
+        Tensor grad_weight = std::get<1>(mixed).defined()
+            ? std::get<1>(mixed).to(DType::Float16) : Tensor();
+        Tensor grad_bias = std::get<2>(mixed).defined()
+            ? std::get<2>(mixed).to(DType::Float16) : Tensor();
+        return {std::get<0>(mixed), grad_weight, grad_bias};
+    }
+    if (input.dtype() == DType::BFloat16 &&
+        grad_output.dtype() == DType::BFloat16) {
+        Tensor grad_output_f32 = grad_output.to(DType::Float32);
+        std::optional<Tensor> weight_f32;
+        if (weight_opt.has_value() && weight_opt->defined()) {
+            weight_f32 = weight_opt->to(DType::Float32);
+        }
+        std::optional<Tensor> bias_f32;
+        if (bias_opt.has_value() && bias_opt->defined()) {
+            bias_f32 = bias_opt->to(DType::Float32);
+        }
+        auto mixed = group_norm_backward_mixed_cuda_impl<BFloat16>(
+            grad_output_f32, input, num_groups, weight_f32, bias_f32, eps,
+            mean_saved, rstd_saved, output_mask);
+        Tensor grad_weight = std::get<1>(mixed).defined()
+            ? std::get<1>(mixed).to(DType::BFloat16) : Tensor();
+        Tensor grad_bias = std::get<2>(mixed).defined()
+            ? std::get<2>(mixed).to(DType::BFloat16) : Tensor();
+        return {std::get<0>(mixed), grad_weight, grad_bias};
+    }
     if (input.dim() < 2 || input.size(1) <= 0 || num_groups <= 0 ||
         input.size(1) % num_groups != 0) {
         TP_THROW(RuntimeError, "group_norm_backward has invalid group dimensions");
@@ -1281,7 +1321,7 @@ static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cuda_impl(
     if (input.dtype() != grad_output.dtype() ||
         (input.dtype() != DType::Float32 && input.dtype() != DType::Float64)) {
         TP_THROW(NotImplementedError,
-                 "group_norm_backward supports matching Float32/Float64 or mixed Float16/BFloat16 input with Float32 gradient");
+                 "group_norm_backward supports matching Float16, BFloat16, Float32, and Float64 gradients");
     }
     if (grad_output.dim() != input.dim()) {
         TP_THROW(RuntimeError,
@@ -1483,46 +1523,6 @@ static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cuda_impl(
         }                                                                       \
     }
 
-    if (input.dtype() == DType::Float16 &&
-        grad_output.dtype() == DType::Float16) {
-        Tensor grad_output_f32 = grad_output.to(DType::Float32);
-        std::optional<Tensor> weight_f32;
-        if (weight_opt.has_value() && weight_opt->defined()) {
-            weight_f32 = weight_opt->to(DType::Float32);
-        }
-        std::optional<Tensor> bias_f32;
-        if (bias_opt.has_value() && bias_opt->defined()) {
-            bias_f32 = bias_opt->to(DType::Float32);
-        }
-        auto mixed = group_norm_backward_mixed_cuda_impl<Half>(
-            grad_output_f32, input, num_groups, weight_f32, bias_f32, eps,
-            mean_saved, rstd_saved, output_mask);
-        Tensor grad_weight = std::get<1>(mixed).defined()
-            ? std::get<1>(mixed).to(DType::Float16) : Tensor();
-        Tensor grad_bias = std::get<2>(mixed).defined()
-            ? std::get<2>(mixed).to(DType::Float16) : Tensor();
-        return {std::get<0>(mixed), grad_weight, grad_bias};
-    }
-    if (input.dtype() == DType::BFloat16 &&
-        grad_output.dtype() == DType::BFloat16) {
-        Tensor grad_output_f32 = grad_output.to(DType::Float32);
-        std::optional<Tensor> weight_f32;
-        if (weight_opt.has_value() && weight_opt->defined()) {
-            weight_f32 = weight_opt->to(DType::Float32);
-        }
-        std::optional<Tensor> bias_f32;
-        if (bias_opt.has_value() && bias_opt->defined()) {
-            bias_f32 = bias_opt->to(DType::Float32);
-        }
-        auto mixed = group_norm_backward_mixed_cuda_impl<BFloat16>(
-            grad_output_f32, input, num_groups, weight_f32, bias_f32, eps,
-            mean_saved, rstd_saved, output_mask);
-        Tensor grad_weight = std::get<1>(mixed).defined()
-            ? std::get<1>(mixed).to(DType::BFloat16) : Tensor();
-        Tensor grad_bias = std::get<2>(mixed).defined()
-            ? std::get<2>(mixed).to(DType::BFloat16) : Tensor();
-        return {std::get<0>(mixed), grad_weight, grad_bias};
-    }
     if (input.dtype() == DType::Float32 && grad_output.dtype() == DType::Float32) {
         GN_BACKWARD_CASE(float, float, Float32)
     } else if (input.dtype() == DType::Float64 &&

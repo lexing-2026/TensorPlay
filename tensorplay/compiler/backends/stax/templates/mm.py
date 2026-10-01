@@ -51,8 +51,10 @@ from ..ir import Layout
 from ..heuristics.template.params import DictKernelTemplateParams, KernelTemplateParams
 from ..op_lowerings import (
     fallback_handler,
+    register,
     register_lowering,
     select_decomp_table,
+    to_dtype,
 )
 from .. import config
 from ..autoheuristic.autoheuristic import AutoHeuristicSelectAlgorithm
@@ -722,6 +724,19 @@ def tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
     another type, and everything after that is a question of how.
     """
 
+    # A matrix multiply recorded from an autograd walk sometimes loses the
+    # dtype casts the framework's backward applies internally: the saved
+    # tensor keeps its original dtype while the tangent is in the autocast
+    # dtype.  Normalize the inputs the same way the backward kernels do
+    # (cast the gradient side to the saved side's dtype) so the template and
+    # the framework product both see a well-typed call.
+    if hasattr(mat1, "get_dtype") and hasattr(mat2, "get_dtype"):
+        input_dtype = mat1.get_dtype()
+        other_dtype = mat2.get_dtype()
+        if input_dtype != other_dtype:
+            mat1 = to_dtype(mat1, other_dtype)
+            input_dtype = other_dtype
+
     if out_dtype is not None:
         input_dtype = mat1.get_dtype()
         tp._check(
@@ -822,6 +837,38 @@ def tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
         name, choices, kernel_inputs.nodes(), layout
     )
     return node
+
+
+# The `.default` spelling of ``mm`` resolves to the framework fallback rather
+# than the tuned template, so the dtype normalization above never runs for it.
+# Register the same normalization under that key: an autograd-recorded product
+# may pair a saved tensor in its original dtype with a tangent in the autocast
+# dtype, and the framework ``mm`` rejects the mixed call.
+_fallback_mm_default = fallback_handler(framework.mm.default, add_to_fallback_set=False)
+
+
+@register("mm.default")
+def lower_mm_default(mat1, mat2):
+    if hasattr(mat1, "get_dtype") and hasattr(mat2, "get_dtype"):
+        dtype1 = mat1.get_dtype()
+        dtype2 = mat2.get_dtype()
+        if dtype1 != dtype2:
+            mat1 = to_dtype(mat1, dtype2)
+    return _fallback_mm_default(mat1, mat2)
+
+
+_fallback_matmul_default = fallback_handler(framework.matmul.default, add_to_fallback_set=False)
+
+
+@register("matmul", "matmul.default")
+def lower_matmul_default(mat1, mat2):
+    if hasattr(mat1, "get_dtype") and hasattr(mat2, "get_dtype"):
+        dtype1 = mat1.get_dtype()
+        dtype2 = mat2.get_dtype()
+        if dtype1 != dtype2:
+            mat2 = to_dtype(mat2, dtype1)
+            mat2.data.realize()
+    return _fallback_matmul_default(mat1, mat2)
 
 
 @register_lowering(framework._int_mm, type_promotion_kind=None)

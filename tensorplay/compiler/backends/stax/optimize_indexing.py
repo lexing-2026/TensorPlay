@@ -11,6 +11,7 @@ from tensorplay.graph.experimental.sympy_functions import ValueRanges
 
 from .loop_body import LoopBody
 from .utils import dominated_nodes
+from .utils import dtype_to_type
 
 
 def val_expressable_in_32_bits(val: Any) -> bool:

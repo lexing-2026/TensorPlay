@@ -695,7 +695,8 @@ class IRNode:
         )
 
     def wrap_for_lowering(self) -> "IRNode":
-
+        if isinstance(self, TensorBox):
+            return self
         return TensorBox.create(self)
 
     def _post_init_setattr(self, attr: str, value: object) -> None:
@@ -6253,6 +6254,13 @@ class ExternKernel(InputsKernel):
         if isinstance(kernel, HigherOrderOperator):
             self.python_kernel_name = f"tp.ops.higher_order.{kernel.__name__}"
             return
+        # A method call survives to the backend as a bare string naming the
+        # method.  The generated program resolves it through the framework
+        # alias it already imports, where the functional spelling of the
+        # method lives.
+        if isinstance(kernel, str):
+            self.python_kernel_name = f"tp.{kernel}"
+            return
         module = getattr(kernel, "__module__", None)
         name = getattr(kernel, "__name__", str(kernel))
         # The in-place operator builtins carry a module name that is private to
@@ -7085,11 +7093,15 @@ class ExternKernel(InputsKernel):
                     value = self.kwargs[name]
                     if isinstance(value, str):
                         value = repr(value)
+                    elif isinstance(value, tp.device):
+                        value = repr(str(value))
                     kwargs.append(f"{name}={value}")
         else:
             for name, value in self.kwargs.items():
                 if isinstance(value, str):
                     value = repr(value)
+                elif isinstance(value, tp.device):
+                    value = repr(str(value))
                 kwargs.append(f"{name}={value}")
         return kwargs
 

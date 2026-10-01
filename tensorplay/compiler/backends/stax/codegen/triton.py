@@ -3971,6 +3971,8 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
 
         if self.persistent_reduction:
             default = ir.Reduction.default_value(reduction_type, src_dtype)
+            if reduction_type == "welford_reduce" and isinstance(value, tuple):
+                default = ir.WelfordReduction.default_value(reduction_type, src_dtype)
 
             def update_constant_dtype(constant, src_dtype, dst_dtype):
                 "update reduction constant mask value to match dst_dtype"
@@ -4009,6 +4011,8 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
                 # will fallback below
                 masked_value = None
             elif isinstance(value, tuple):
+                if not isinstance(default, (tuple, list)):
+                    default = (default,) * len(value)
                 masked_value = [_mask_value(v, d) for v, d in zip(value, default)]  # type: ignore[arg-type]
             elif reduction_type == "dot":
                 # Here, we don't perform the masking.
