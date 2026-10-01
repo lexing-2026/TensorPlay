@@ -579,6 +579,17 @@ class GraphLowering(Interpreter):
         # program's traffic that choice accounted for, which is the only way to
         # tell whether it was worth making.
         self.num_channels_last_conv = 0
+        # The nodes whose values are held channels-last, worked out from the
+        # graph before any node is lowered.  A node is on the list when a
+        # convolution reads or writes it, or when one of its users is on the
+        # list, so that a conv -> norm -> activation -> conv chain keeps one
+        # layout throughout instead of copying after every norm and again
+        # before the next convolution.
+        self.nodes_prefer_channels_last = (
+            self._find_nodes_prefer_channels_last()
+            if self.layout_opt
+            else OrderedSet()
+        )
         # Names the region used and then gave up on.  A lookup that finds one
         # of these is a lookup of something that does not exist, which is a
         # mistake in the caller rather than a missing entry.
@@ -957,6 +968,52 @@ class GraphLowering(Interpreter):
             return False
 
         return True
+
+    def _find_nodes_prefer_channels_last(self) -> OrderedSet:
+        """The nodes whose values are best held channels-last.
+
+        A node is on the list when a convolution reads or writes it, or when
+        one of its users is on the list.  The second rule is what keeps an
+        indirect input to a convolution in the same layout: without it, a
+        conv -> norm -> activation -> conv chain would copy the norm's output
+        back to the default layout and then copy it again into channels-last
+        before the next convolution.
+
+        The graph is walked backwards first so that every node feeding a
+        convolution is marked, then forwards so that downstream nodes of a
+        channels-last producer stay in the same layout instead of mixing
+        layouts inside a backward kernel.
+        """
+
+        gm = self.graph_module
+        blocked = (tp.ops.tp.bmm.default,)
+        output_set: OrderedSet = OrderedSet()
+        last_conv = None
+        for n in reversed(list(gm.graph.nodes)):
+            if n.target is tp.ops.tp.convolution.default:
+                output_set.add(n)
+                if last_conv is None:
+                    last_conv = n
+                continue
+            if n.target in blocked:
+                continue
+            for user in n.users:
+                if user in output_set:
+                    output_set.add(n)
+                    break
+
+        # A second pass adds the downstream users of the marked nodes, which
+        # keeps mixed layouts out of backward kernels.  Propagation stops at
+        # the last convolution, which is where the channels-last chain ends.
+        for n in gm.graph.nodes:
+            if last_conv is not None and n == last_conv:
+                break
+            if n in output_set:
+                for user in n.users:
+                    if user.target in blocked:
+                        continue
+                    output_set.add(user)
+        return output_set
 
     @property
     def fake_mode(self):
@@ -1459,6 +1516,14 @@ class GraphLowering(Interpreter):
             kwargs=realized_kwargs,
         )
         kernel.origin_node = node
+        # A method call that survives to the backend names its operation with
+        # a string.  In-place tensor methods carry a trailing underscore: the
+        # receiver is mutated and returned, which has to be recorded so memory
+        # planning keeps the receiver alive and the scheduler does not drop
+        # the call as dead.
+        if call_method and isinstance(node.target, str) and node.target.endswith("_"):
+            kernel.mutation_names.append(receiver.get_name())
+            kernel.alias_names.append(receiver.get_name())
         return kernel
 
     def _wrap_fallback(self, node, kernel):
@@ -1601,8 +1666,48 @@ class GraphLowering(Interpreter):
                 result = self.call_function(n.target, args, kwargs)
             else:
                 result = super().run_node(n)
+        result = self._maybe_apply_channels_last(n, result)
         self.env[n] = result
         return result
+
+    def _maybe_apply_channels_last(self, n, result):
+        """This node's result laid out channels-last, when the chain wants it.
+
+        A node that feeds a convolution (or is fed by one) is held in the
+        same channels-last layout as the rest of the chain, so that the
+        convolution reads it without a copy.  Multi-result calls are handled
+        per result; only four-dimensional dense values are rearranged.  A
+        value the graph returns to its caller is left in the layout the
+        caller wrote, since changing it would leak the choice into the
+        surrounding program.
+        """
+
+        if n not in self.nodes_prefer_channels_last:
+            return result
+        if any(u.op == "output" for u in n.users):
+            return result
+        if isinstance(result, tuple):
+            return tuple(self._channels_last_4d(r) for r in result)
+        return self._channels_last_4d(result)
+
+    def _channels_last_4d(self, r):
+        """One result, in channels-last order if it is a dense 4D tensor."""
+
+        try:
+            if (
+                isinstance(r, ir.TensorBox)
+                and len(r.get_size()) == 4
+                and r.get_stride() is not None
+            ):
+                data = r.data
+                if isinstance(data, ir.StorageBox):
+                    data.realize()
+                return ir.ExternKernel.require_stride_order(
+                    r, ir.NHWC_STRIDE_ORDER
+                )
+        except (NotImplementedError, AssertionError, TypeError, ValueError):
+            pass
+        return r
 
     def run(self, *args):
         """Read the region, one node at a time, and record what each stands for.
@@ -1658,15 +1763,86 @@ class GraphLowering(Interpreter):
         self.graph_input_names.append(name)
         return tensor
 
+    def _materialize_embedded_tensor(self, value):
+        """A constant tensor a graph holds is read as a buffer.
+
+        A value that was written into the graph as a constant has no node of
+        its own, so the walk gives it a named buffer the first time it is read
+        and reuses that buffer for every later read of the same value.
+        """
+
+        if isinstance(value, tp.Tensor):
+            key = id(value)
+            cached = self._embedded_tensor_constants.get(key)
+            if cached is None:
+                cached = self.add_tensor_constant(value)
+                self._embedded_tensor_constants[key] = cached
+            return cached
+        return value
+
     def call_module(self, target, args, kwargs):
         """A region is never a call to another region."""
 
         raise AssertionError
 
     def call_method(self, target, args, kwargs):
-        """A region is never a call to a method of a value."""
+        """What the region means by a method call, as a value the rest can be
+        written against.
 
-        raise AssertionError
+        A method call names its operation with a string and takes the object
+        it is called on first.  A lowering is looked up for the method's bare
+        name and overload spellings; view-like methods pass their shape as
+        varargs while the lowering expects a tuple, so the trailing arguments
+        are packed first.  An in-place method (trailing underscore) with no
+        lowering is handed to the framework whole -- the receiver leads the
+        inputs and the mutation is recorded so the call is not dropped as dead.
+        Any other method the backend has no lowering for stays a boundary the
+        compiler does not cross, exactly as before.
+        """
+
+        if not isinstance(target, str):
+            raise AssertionError
+        node = V.graph.current_node
+        name = target_name(target)
+        args = pytree.tree_map(self._materialize_embedded_tensor, args)
+        kwargs = pytree.tree_map(self._materialize_embedded_tensor, kwargs)
+        in_place = name.endswith("_")
+        lowering = None if in_place else (
+            user_lowerings.get(node)
+            or user_lowerings.get(target)
+            or LOWERINGS.get(name)
+            or LOWERINGS.get(f"{name}.Tensor")
+            or LOWERINGS.get(f"{name}.Scalar")
+            or LOWERINGS.get(f"{name}.default")
+            or LOWERINGS.get(f"{name}.int")
+            or LOWERINGS.get(f"{name}.dim")
+            or LOWERINGS.get(f"{name}.dims")
+            or LOWERINGS.get(f"{name}.dtype")
+            or LOWERINGS.get(f"{name}.device")
+            or LOWERINGS.get(f"{name}.dtype_layout")
+        )
+        with self.set_current_node(node), set_current_node(node):
+            if lowering is not None:
+                method_args = args[1:]
+                if name in {"view", "reshape", "permute"}:
+                    if len(method_args) != 1 or not isinstance(
+                        method_args[0], (list, tuple)
+                    ):
+                        method_args = (tuple(method_args),)
+                result = lowering(args[0], *method_args, **kwargs)
+            elif in_place:
+                result = self.make_extern(node, args, kwargs)
+            else:
+                raise AssertionError
+
+        if isinstance(result, TensorBox):
+            storage = result.data
+            while not isinstance(storage, StorageBox) and isinstance(storage, (View, TensorBox)):
+                storage = storage.data
+            if isinstance(storage, StorageBox):
+                storage.mark_reuse(len(node.users))
+        assign_origin_node(result, node)
+        return result
 
     def call_function(self, target, args, kwargs):
         """What the region means by a call, as a value the rest can be written
@@ -1680,19 +1856,8 @@ class GraphLowering(Interpreter):
         """
 
         node = V.graph.current_node
-
-        def materialize_embedded_tensor(value):
-            if isinstance(value, tp.Tensor):
-                key = id(value)
-                cached = self._embedded_tensor_constants.get(key)
-                if cached is None:
-                    cached = self.add_tensor_constant(value)
-                    self._embedded_tensor_constants[key] = cached
-                return cached
-            return value
-
-        args = pytree.tree_map(materialize_embedded_tensor, args)
-        kwargs = pytree.tree_map(materialize_embedded_tensor, kwargs)
+        args = pytree.tree_map(self._materialize_embedded_tensor, args)
+        kwargs = pytree.tree_map(self._materialize_embedded_tensor, kwargs)
         name = target_name(target)
         if name == "getitem" and args and isinstance(args[0], (list, tuple)):
             # Indexing a result tuple is answered here rather than called out
