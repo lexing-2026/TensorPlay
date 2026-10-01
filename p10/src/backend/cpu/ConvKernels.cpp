@@ -4191,30 +4191,18 @@ Tensor conv2d_grad_input_cpu(const Tensor& grad_output, const Tensor& input, con
          int64_t K = C_out;
          int64_t N_pixels = H_in * W_in;
          
-         parallel_for(0, N, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-         for (int64_t n = begin; n < end; ++n) {
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+         for (int64_t n = 0; n < N; ++n) {
              const float* go_n = go_ptr + n * C_out * N_pixels;
              float* gi_n = gi_ptr + n * C_in * N_pixels;
-             
-             // W is (C_out, C_in) in memory (RowMajor)
-             // We want W^T * GO
-             // W^T is (C_in, C_out).
-             // Calling gemm_direct with transA=true?
-             // gemm_direct(transA, transB, M, N, K, ...)
-             // C = op(A) * op(B)
-             // We want C(M,N) = W^T(K, M)^T * GO(K, N)
-             // Wait.
-             // GI (C_in, Pixels) = W^T (C_in, C_out) * GO (C_out, Pixels)
-             // A = W (C_out, C_in). op(A) = W^T. So transA = true.
-             // B = GO (C_out, Pixels). op(B) = GO. So transB = false.
-             // M = C_in, N = Pixels, K = C_out.
              
              gemm_direct(true, false, M, N_pixels, K,
                          1.0f, w_ptr, C_in, // lda = C_in (since A is C_out x C_in)
                          go_n, N_pixels,    // ldb = N_pixels
                          0.0f, gi_n, N_pixels); // ldc = N_pixels
          }
-         });
          return grad_input;
     }
 
@@ -4342,43 +4330,37 @@ static Tensor conv2d_grad_weight_cpu_impl(const Tensor& grad_output, const Tenso
         input_contig.dtype() == DType::Float32 && !input_contig.unsafeGetTensorImpl()->has_onednn_md()) {
          
          // GradWeight = GradOutput * Input^T
-         // GradOutput: (N, C_out, Pixels) -> Treat as (C_out, N*Pixels) ?
-         // Input: (N, C_in, Pixels) -> Treat as (C_in, N*Pixels) ?
+         // GradOutput: (N, C_out, Pixels)
+         // Input: (N, C_in, Pixels)
          // GW (C_out, C_in) = GO (C_out, N*Pixels) * Input^T (N*Pixels, C_in)
-         // M = C_out, N = C_in, K = N*Pixels
+         //
+         // Standard NCHW layout is (N, C, H, W), which is not (C, N*Pixels)
+         // in memory, so both operands are transposed once into contiguous
+         // (C, N, Pixels) buffers; the batch reduction then becomes a single
+         // GEMM instead of N accumulating ones.
          
-         // We can do one giant GEMM if we view (N, C, Pixels) as (C, N*Pixels).
-         // BUT standard NCHW layout is (N, C, H, W).
-         // Stride of C is H*W. Stride of N is C*H*W.
-         // This is NOT (C, N*H*W). It is physically separated by N.
-         // So we cannot do one single GEMM unless we permute/copy to (C, N, H, W) or similar.
-         // OR we accumulate over N.
+         int64_t P = H_in * W_in;
+         int64_t K_total = N * P;
          
-         const float* in_ptr = input_contig.data_ptr<float>();
-         const float* go_ptr = grad_output_contig.data_ptr<float>();
+         Tensor go_perm = grad_output_contig.permute({1, 0, 2, 3}).contiguous();
+         Tensor in_perm = input_contig.permute({1, 0, 2, 3}).contiguous();
+         const float* go_perm_ptr = go_perm.data_ptr<float>();
+         const float* in_perm_ptr = in_perm.data_ptr<float>();
          float* gw_ptr = grad_weight.data_ptr<float>();
          
-         int64_t M = C_out;
-         int64_t N_dim = C_in; // N in GEMM context
-         int64_t K = H_in * W_in; // Pixels
-         
-         // Accumulate over batch
-         for (int64_t n = 0; n < N; ++n) {
-             const float* go_n = go_ptr + n * C_out * K;
-             const float* in_n = in_ptr + n * C_in * K;
-             
-             // GW += GO_n * In_n^T
-             // GO_n: (C_out, K)
-             // In_n: (C_in, K). In_n^T: (K, C_in)
-             // gemm_direct(false, true, ...)
-             // alpha = 1.0, beta = 1.0 (accumulate)
-             // Except for first n=0, beta=0.0? No, grad_weight init to zeros.
-             // Wait, if we use beta=1.0 for all n, it works.
-             
-             gemm_direct(false, true, M, N_dim, K,
-                         1.0f, go_n, K,
-                         in_n, K,
-                         1.0f, gw_ptr, N_dim); // ldc = C_in
+#ifdef USE_ONEDNN
+         if (OneDNNContext::is_enabled()) {
+             onednn_matmul_gemm(false, true, C_out, C_in, K_total,
+                                 1.0f, go_perm_ptr, K_total,
+                                 in_perm_ptr, K_total,
+                                 0.0f, gw_ptr, C_in);
+         } else
+#endif
+         {
+             gemm_direct(false, true, C_out, C_in, K_total,
+                         1.0f, go_perm_ptr, K_total,
+                         in_perm_ptr, K_total,
+                         0.0f, gw_ptr, C_in);
          }
          return grad_weight;
     }
