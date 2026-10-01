@@ -126,6 +126,25 @@ def _input_signature(
     )
 
 
+_grad_enabled: Any = None
+
+
+def _grad_state_component() -> tuple[Any, ...]:
+    """The ambient autograd state at call time.
+
+    A region captured with autograd enabled wires its outputs for backward;
+    replaying it with the state flipped (or the reverse) would hand the
+    caller an output under the wrong autograd contract, so the state is
+    part of every specialization key and is read on every call.
+    """
+    global _grad_enabled
+    if _grad_enabled is None:
+        import tensorplay
+
+        _grad_enabled = tensorplay.is_grad_enabled
+    return (_grad_enabled(),)
+
+
 def _quick_value_signature(value: Any, *, dynamic: bool) -> Any:
     """Build the hot-path guard key without repr-heavy metadata formatting."""
 
@@ -408,9 +427,21 @@ def compile(
         The dispatcher re-enters it directly once its argument memo passes;
         any slow call routes through here again, so the binding stays
         current across recompiles and specialization switches.
+
+        The argument memo cannot see the ambient autograd state, so the
+        entry carries the state it was resolved under and falls back to the
+        trampoline when a call arrives under a flipped state; the trampoline
+        then resolves (and binds) the specialization for that state.
         """
 
-        dispatcher.tpx_set_fast(fast, nargs)
+        bound_grad_state = _grad_state_component()
+
+        def _fast(*args: Any) -> Any:
+            if _grad_state_component() == bound_grad_state:
+                return fast(*args)
+            return optimized(*args)
+
+        dispatcher.tpx_set_fast(_fast, nargs)
 
     @functools.wraps(model)
     def optimized(*args: Any, **kwargs: Any) -> Any:
@@ -460,7 +491,8 @@ def compile(
                 data_component,
             )
             last_call_fp = call_fp
-        quick_key = (input_signature, shape_component, data_component)
+        grad_state = _grad_state_component()
+        quick_key = (input_signature, shape_component, data_component, grad_state)
         with lock:
             if cache_enabled and cache and last_compiled_fn is not None and quick_key == last_quick_key:
                 compiled_fn = last_compiled_fn
@@ -469,6 +501,7 @@ def compile(
                     _input_signature(args, kwargs, dynamic=specialization_dynamic),
                     _guard_component(args, kwargs, _value_signature),
                     data_component,
+                    grad_state,
                 )
                 compiled_fn = cache.get(key) if cache_enabled else None
             store_compiled = cache_enabled
@@ -507,6 +540,10 @@ def compile(
                     kwargs,
                     fullgraph=fullgraph,
                     backend_kwargs=backend_kwargs,
+                    # An autograd artifact reads recorded values off the nodes
+                    # while it runs, so a training region keeps them; an
+                    # inference artifact consumes none and drops them here.
+                    preserve_recorded_values=bool(grad_state[0]),
                     region_key=make_region_key(
                         target_cache,
                         model if _is_module_like(model) else None,
@@ -537,6 +574,7 @@ def compile(
                     _input_signature(args, kwargs, dynamic=specialization_dynamic),
                     _guard_component(args, kwargs, _value_signature),
                     data_component,
+                    grad_state,
                 )
                 if store_compiled:
                     cache[key] = compiled_fn
@@ -768,6 +806,7 @@ def _compile_region(
     fullgraph: bool,
     backend_kwargs: dict[str, Any],
     region_key: str | None = None,
+    preserve_recorded_values: bool = False,
 ) -> tuple[Callable[..., Any], GraphModule]:
     stored = load_region(region_key, model)
     if stored is not None:
@@ -887,7 +926,42 @@ def _compile_region(
         raise TypeError(
             f"compiler backend returned {type(compiled)!r}; expected a callable"
         )
+    if not preserve_recorded_values:
+        _release_recorded_values(graph_module)
     return compiled, graph_module
+
+
+def _release_recorded_values(graph_module: Any) -> None:
+    """Drop execution artifacts that capture-time propagation parked on nodes.
+
+    Shape propagation executes the region on real tensors and leaves every
+    intermediate on its node for the lowering pipeline to inspect.  Once the
+    backend has produced its artifact those tensors are dead weight: one
+    region can hold the entire forward's activation set, and every cached
+    specialization would keep its own copy alive.  The cheap metadata each
+    node carries (shape, dtype, device) stays behind, and propagation on a
+    later compile of the same region regenerates whatever values the
+    pipeline consumes.
+    """
+    from tensorplay import Tensor
+
+    try:
+        nodes = graph_module.graph.nodes
+    except AttributeError:
+        return
+
+    def strip(value: Any) -> Any:
+        return None if isinstance(value, Tensor) else value
+
+    for node in nodes:
+        meta = getattr(node, "meta", None)
+        if not meta:
+            continue
+        value = meta.get("val")
+        if isinstance(value, Tensor):
+            meta["val"] = None
+        elif isinstance(value, tuple):
+            meta["val"] = tuple(strip(item) for item in value)
 
 
 _SHAPE_GUARD_ATTRS = frozenset({"shape", "len", "ndim"})

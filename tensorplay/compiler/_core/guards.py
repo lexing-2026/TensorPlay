@@ -125,6 +125,9 @@ class GuardChain:
         self._data_component = (
             components[2] if len(components) > 2 and isinstance(key, tuple) else ()
         )
+        self._state_component = (
+            components[3] if len(components) > 3 and isinstance(key, tuple) else ()
+        )
         self._evaluate: Callable[..., bool] | None = None
         self.hits = 0
 
@@ -148,6 +151,12 @@ class GuardChain:
                 "control-flow gate outcomes match the traced branch",
                 self._data_component,
             ))
+        if self._state_component:
+            rendered.append(Guard(
+                "grad-state",
+                "ambient autograd state matches the captured state",
+                self._state_component,
+            ))
         return rendered
 
     @property
@@ -161,12 +170,13 @@ class GuardChain:
     # -- evaluation ----------------------------------------------------------
 
     def _live_signature(self, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Any:
-        from .api import _input_signature
+        from .api import _grad_state_component, _input_signature
 
         return (
             _input_signature(args, kwargs, dynamic=self.dynamic),
             self._live_guard_component(args, kwargs),
             self._live_data_component(args, kwargs),
+            self._state_component and _grad_state_component(),
         )
 
     def _bind_arguments(
@@ -212,6 +222,7 @@ class GuardChain:
                     _chain._signature,
                     _chain._guard_component,
                     _chain._data_component,
+                    _chain._state_component,
                 )
 
             self._evaluate = _compiled
@@ -223,7 +234,12 @@ class GuardChain:
     def explain(self, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> List[Guard]:
         """Guards this chain would fail against the given live arguments."""
 
-        expected_sig = (self._signature, self._guard_component, self._data_component)
+        expected_sig = (
+            self._signature,
+            self._guard_component,
+            self._data_component,
+            self._state_component,
+        )
         live_sig = self._live_signature(args, kwargs)
         if expected_sig == live_sig:
             return []
@@ -236,6 +252,13 @@ class GuardChain:
                 "control-flow gate outcomes match the traced branch",
                 expected_sig[2],
                 live_sig[2],
+            ))
+        if self._state_component and expected_sig[3] != live_sig[3]:
+            failures.append(Guard(
+                "grad-state",
+                "ambient autograd state matches the captured state",
+                expected_sig[3],
+                live_sig[3],
             ))
         return failures
 
