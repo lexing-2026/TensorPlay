@@ -325,20 +325,13 @@ def test_reset_releases_captured_cuda_graphs():
 def test_builtin_capabilities_are_declared():
     from tensorplay._stax.registry import BackendCapabilities
 
-    caps = tp.compiler.get_backend_capabilities("onnxrt")
-    assert caps.inference_only is True
-    assert caps.handles_training is False
-    assert "onnxruntime" in caps.optional_deps
+    onnxrt_caps = tp.compiler.get_backend_capabilities("onnxrt")
+    assert "onnxruntime" in onnxrt_caps.optional_deps
 
-    stax_caps = tp.compiler.get_backend_capabilities("stax")
-    assert stax_caps.handles_training is True
-
-    tvm_caps = tp.compiler.get_backend_capabilities("tvm")
-    assert tvm_caps.inference_only is True
-
-    assert isinstance(
-        tp.compiler.get_backend_capabilities("cudagraphs"), BackendCapabilities
-    )
+    for backend in ("stax", "tvm", "cudagraphs"):
+        caps = tp.compiler.get_backend_capabilities(backend)
+        assert isinstance(caps, BackendCapabilities)
+        assert caps.optional_deps == ()
 
 
 def test_capabilities_via_decorator():
@@ -349,15 +342,14 @@ def test_capabilities_via_decorator():
         unregister_backend,
     )
 
-    @declares_capabilities(
-        BackendCapabilities(inference_only=True, handles_training=False)
-    )
+    @declares_capabilities(BackendCapabilities(optional_deps=("probe_dep",)))
     def caps_backend(graph_module, example_inputs, **kwargs):
         return graph_module.forward
 
     register_backend(caps_backend, name="caps_probe")
     try:
-        assert tp.compiler.get_backend_capabilities("caps_probe").inference_only
+        caps = tp.compiler.get_backend_capabilities("caps_probe")
+        assert "probe_dep" in caps.optional_deps
     finally:
         unregister_backend("caps_probe")
 
@@ -408,16 +400,13 @@ def test_contract_version_handshake(monkeypatch):
         registry.unregister_backend("core_range_probe")
 
 
-def test_inference_only_backend_gets_aot_wrapped_for_training():
+def test_training_region_gets_aot_wrapped():
+    from tensorplay._stax import api
     from tensorplay._stax.common import AotAutograd
-    from tensorplay._stax.registry import BackendCapabilities, declares_capabilities
 
     calls = []
 
-    @declares_capabilities(
-        BackendCapabilities(inference_only=True, handles_training=False)
-    )
-    def inference_backend(graph_module, example_inputs, **kwargs):
+    def plain_backend(graph_module, example_inputs, **kwargs):
         calls.append(kwargs)
         return graph_module.forward
 
@@ -425,35 +414,18 @@ def test_inference_only_backend_gets_aot_wrapped_for_training():
         return tp.exp(x) * x
 
     x = tp.randn(4, requires_grad=True)
-    compiled = tp.compile(fn, backend=inference_backend)
+    compiled = tp.compile(fn, backend=plain_backend)
     # The decision happens at compile time; running the artifact exercises the
     # parallel-line dispatcher machinery, so only assert the adaptation here.
     adapted = compiled._tensorplay_original is fn
     assert adapted
-    from tensorplay._stax import api
-
     assert hasattr(api, "_adapt_backend_to_region")
     wrapper = api._adapt_backend_to_region(
-        inference_backend, (x,), {}
+        plain_backend, (x,), {}
     )
     assert isinstance(wrapper, AotAutograd)
     # Inference calls pass the backend through untouched.
-    assert api._adapt_backend_to_region(inference_backend, (tp.randn(4),), {}) is inference_backend
-
-
-def test_training_rejects_backend_without_capabilities():
-    def rigid_backend(graph_module, example_inputs, **kwargs):
-        return graph_module.forward
-
-    from tensorplay._stax.registry import BackendCapabilities, declares_capabilities
-
-    rigid_backend = declares_capabilities(
-        BackendCapabilities(inference_only=False, handles_training=False)
-    )(rigid_backend)
-
-    x = tp.randn(4, requires_grad=True)
-    with pytest.raises(RuntimeError, match="does not support training regions"):
-        tp.compile(lambda v: tp.exp(v), backend=rigid_backend)(x)
+    assert api._adapt_backend_to_region(plain_backend, (tp.randn(4),), {}) is plain_backend
 
 
 def test_onnxrt_backend_matches_eager():

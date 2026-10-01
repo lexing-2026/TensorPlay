@@ -612,8 +612,9 @@ def _region_is_training(
 ) -> bool:
     """Whether any example input carries an autograd requirement.
 
-    Backends declare what they support (``BackendCapabilities``); this only
-    decides whether the declaration matters for the region at hand.
+    A region needs the autograd pipeline when any example input requires
+    grad, when the captured module root is in training mode, or when any
+    captured attribute (module parameter or buffer) requires grad.
     """
 
     import tensorplay
