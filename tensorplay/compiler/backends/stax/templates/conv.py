@@ -1301,16 +1301,25 @@ def _gradient_by_asking(
         dtype=node.get_dtype(),
         device=device,
     )
-    return framework.convolution_backward(
+    result = framework.convolution_backward(
         zeros(grad_out), zeros(input), zeros(weight), None,
         guard(stride), guard(padding), guard(dilation), transposed,
         guard(output_padding), groups, output_mask,
     )
+    # The backward answers with the full ``(dx, dw, db)`` triple; the caller
+    # asked for one gradient, so the element the mask selected is returned.
+    if output_mask == (True, False, False):
+        return result[0]
+    if output_mask == (False, True, False):
+        return result[1]
+    if output_mask == (False, False, True):
+        return result[2]
+    return result
 
 
 def call_framework_dw(
     x_t, go_t, *, w_shape, stride, padding, dilation, transposed,
-    output_padding, groups, out,
+    output_padding, groups, out=None,
 ):
     """A weight gradient, computed by handing the call to the framework.
 
@@ -1318,49 +1327,62 @@ def call_framework_dw(
     gradient's shape and does not use its values, and making a real weight to
     throw away would cost an allocation per measurement.  Its memory format is
     taken from the input's, because a gradient is expected in the layout of the
-    thing it is a gradient of.
+    thing it is a gradient of.  An ``out`` buffer, when one is supplied,
+    receives the gradient and is returned instead of a fresh tensor.
     """
 
     if x_t.is_contiguous(memory_format=tp.channels_last):
         memory_fmt = tp.channels_last
     else:
         memory_fmt = tp.contiguous_format
+    dtype = x_t.get_dtype() if hasattr(x_t, "get_dtype") else x_t.dtype
     dummy_weight = tp.empty(
-        w_shape, dtype=out.dtype, device=x_t.device, memory_format=memory_fmt
+        w_shape, dtype=dtype, device=x_t.device, memory_format=memory_fmt
     )
-    framework.convolution_backward.out(
-        out1=None, out2=out, out3=None, grad_output=go_t, input=x_t,
+    result = framework.convolution_backward(
+        grad_output=go_t, input=x_t,
         weight=dummy_weight, bias_sizes=None, stride=stride, padding=padding,
         dilation=dilation, transposed=transposed, output_padding=output_padding,
         groups=groups, output_mask=(False, True, False),
     )
-    return out
+    dw = result[1]
+    if out is not None:
+        out.copy_(dw)
+        return out
+    return dw
 
 
 def call_framework_dx(
     go_t, w_t, *, x_shape, stride, padding, dilation, transposed,
-    output_padding, groups, out,
+    output_padding, groups, out=None,
 ):
     """An input gradient, computed by handing the call to the framework.
 
     The input is a placeholder here rather than the weight, for the same reason:
     the operation reads it for the gradient's shape and the values are unused.
+    An ``out`` buffer, when one is supplied, receives the gradient and is
+    returned instead of a fresh tensor.
     """
 
     if go_t.is_contiguous(memory_format=tp.channels_last):
         memory_fmt = tp.channels_last
     else:
         memory_fmt = tp.contiguous_format
+    dtype = go_t.get_dtype() if hasattr(go_t, "get_dtype") else go_t.dtype
     dummy_input = tp.empty(
-        x_shape, dtype=out.dtype, device=go_t.device, memory_format=memory_fmt
+        x_shape, dtype=dtype, device=go_t.device, memory_format=memory_fmt
     )
-    framework.convolution_backward.out(
-        out1=out, out2=None, out3=None, grad_output=go_t, input=dummy_input,
+    result = framework.convolution_backward(
+        grad_output=go_t, input=dummy_input,
         weight=w_t, bias_sizes=None, stride=stride, padding=padding,
         dilation=dilation, transposed=transposed, output_padding=output_padding,
         groups=groups, output_mask=(True, False, False),
     )
-    return out
+    dx = result[0]
+    if out is not None:
+        out.copy_(dx)
+        return out
+    return dx
 
 
 def pad_listlike(x, size: int):
@@ -1651,10 +1673,14 @@ def convolution(
 #: its own because the weight is a placeholder in it -- the operation reads the
 #: weight for the gradient's shape and never uses its values -- which is a
 #: different call from the one that reads a real weight.
-framework_dw = ExternKernelChoice(call_framework_dw, None, name="dw")
+framework_dw = ExternKernelChoice(
+    call_framework_dw, None, name="dw", has_out_variant=False
+)
 
 #: An input gradient, likewise: the input is the placeholder here.
-framework_dx = ExternKernelChoice(call_framework_dx, None, name="dx")
+framework_dx = ExternKernelChoice(
+    call_framework_dx, None, name="dx", has_out_variant=False
+)
 
 #: Both gradients at once, as the operation computes them.  The floor for a call
 #: that asked for two gradients, and the only candidate for one whose shape no
@@ -1824,12 +1850,6 @@ def convolution_backward_lowering(
                         num_stages=cfg.num_stages, num_warps=cfg.num_warps,
                         **cfg.kwargs,
                     )
-
-    if not has_triton_dx_choices and (not has_triton_dw_choices):
-        return _framework_convolution_backward(
-            grad_out, input, weight, bias_sizes, stride, padding, dilation,
-            transposed, output_padding, groups, output_mask,
-        )
 
     if output_mask[1]:
         if _conv_bwd_backends("EAGER") or not has_triton_dw_choices:

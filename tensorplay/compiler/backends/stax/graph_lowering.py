@@ -1686,19 +1686,41 @@ class GraphLowering(Interpreter):
             return result
         if any(u.op == "output" for u in n.users):
             return result
+        if self._is_input_for_as_strided(n):
+            return result
         if isinstance(result, tuple):
             return tuple(self._channels_last_4d(r) for r in result)
         return self._channels_last_4d(result)
+
+    def _is_input_for_as_strided(self, n) -> bool:
+        """Whether this node feeds a call that reads by explicit strides.
+
+        Such a call spells the layout it wants itself, so choosing
+        channels-last here would fight the caller's own choice.
+        """
+
+        for user in n.users:
+            target = getattr(user, "target", None)
+            name = getattr(target, "__name__", str(target))
+            if "as_strided" in name or "resize" in name:
+                return True
+        return False
 
     def _channels_last_4d(self, r):
         """One result, in channels-last order if it is a dense 4D tensor."""
 
         try:
-            if (
-                isinstance(r, ir.TensorBox)
-                and len(r.get_size()) == 4
-                and r.get_stride() is not None
-            ):
+            if isinstance(r, ir.TensorBox) and len(r.get_size()) == 4:
+                size = r.get_size()
+                stride = r.get_stride()
+                if stride is None or not self._is_dense_4d(size, stride):
+                    return r
+                from tensorplay.graph.experimental.symbolic_shapes import (
+                    free_unbacked_symbols,
+                )
+
+                if free_unbacked_symbols(stride):
+                    return r
                 data = r.data
                 if isinstance(data, ir.StorageBox):
                     data.realize()
@@ -1708,6 +1730,34 @@ class GraphLowering(Interpreter):
         except (NotImplementedError, AssertionError, TypeError, ValueError):
             pass
         return r
+
+    def _is_dense_4d(self, size, stride) -> bool:
+        """Whether a 4D value is non-overlapping and dense.
+
+        Every element of a dense non-overlapping tensor has one position
+        of its own, which is what makes rearranging its strides a pure
+        reordering rather than a gather.  A strided layout is dense exactly
+        when, ordered by decreasing stride, each stride equals the product
+        of the sizes of the dims before it.
+        """
+
+        try:
+            size = [int(s) for s in size]
+            stride = [int(s) for s in stride]
+        except (TypeError, ValueError):
+            return False
+        if len(size) != 4 or len(stride) != 4:
+            return False
+        order = sorted(range(4), key=lambda i: stride[i], reverse=True)
+        expected = 1
+        for i in order:
+            if stride[i] < 0:
+                return False
+            if size[i] > 1:
+                if stride[i] != expected:
+                    return False
+                expected *= size[i]
+        return True
 
     def run(self, *args):
         """Read the region, one node at a time, and record what each stands for.
