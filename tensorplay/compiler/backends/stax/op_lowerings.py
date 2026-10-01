@@ -2449,6 +2449,23 @@ def _prod_ints(values) -> int:
     return out
 
 
+_fallback_avg_pool2d_backward = fallback_handler(
+    tp.ops.tp.avg_pool2d_backward.default, add_to_fallback_set=False
+)
+
+
+@register("avg_pool2d_backward.default")
+def lower_avg_pool2d_backward_fast(grad, _input, kernel_size, stride=(), padding=0,
+                                   ceil_mode=False, count_include_pad=True,
+                                   divisor_override=None, **kwargs):
+    """2D average pooling gradient, asked of the framework kernel."""
+
+    return _fallback_avg_pool2d_backward(
+        grad, _input, kernel_size, stride, padding, ceil_mode,
+        count_include_pad, divisor_override,
+    )
+
+
 def _pool_backward_with_masked_divisor(total, prefix, spatial_in, spatial_out,
                                        kernel, stride, padding, f32, device):
     """Pooling backwards whose divisor counts only the positions inside."""
