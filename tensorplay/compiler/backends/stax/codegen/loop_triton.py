@@ -592,7 +592,13 @@ class _Group:
                 self.acc_finish(node)
         for node in self._in_region(_EPILOGUE):
             self.sink = self.epilogue
-            self.emit_node(node, 1)
+            place = self.placements[id(node)]
+            if place.full and not self.persistent:
+                raise PlanError(
+                    "a consumer that re-walks the reduced row needs a "
+                    "persistent reduction kernel"
+                )
+            self.emit_node(node, 2 if place.full else 1)
 
     # -- emission helpers --------------------------------------------------
     def emit(self, line: str) -> None:

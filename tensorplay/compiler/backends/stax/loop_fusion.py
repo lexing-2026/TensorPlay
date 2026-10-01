@@ -64,6 +64,11 @@ RINDEX = sympy_index_symbol("rindex")
 #: Nodes one kernel may hold before fusion stops growing it.
 MAX_FUSION_SIZE = 64
 
+#: Largest reduction extent a fused kernel can keep in one block (persistent
+#: reduction).  A consumer that re-walks the reduced row after the reduction
+#: loops finish can only join the kernel while that is possible.
+_PERSISTENT_INNER_LIMIT = 1024
+
 _ITEMSIZE = {"float16": 2, "bfloat16": 2, "float32": 4, "float64": 8, "int64": 8, "int32": 4, "bool": 1, "uint8": 1, "int8": 1}
 
 
@@ -266,14 +271,23 @@ def emission_regions(nodes, placements, written) -> dict:
 
     regions = {}
     for node in nodes:
-        if node.is_reduction or placements[id(node)].full:
+        if node.is_reduction:
             regions[id(node)] = BODY
             continue
+        full = placements[id(node)].full
         needs_row_result = any(
             load.args[0] in written and written[load.args[0]][0].is_reduction
             for load in node.body.loads
         )
-        regions[id(node)] = EPILOGUE if needs_row_result else PROLOGUE
+        if full and needs_row_result:
+            # A consumer that re-walks the whole reduced row (for example the
+            # normalize step after a group statistics reduction) runs after
+            # the reduction loops, where the row result is already available.
+            regions[id(node)] = EPILOGUE
+        elif full:
+            regions[id(node)] = BODY
+        else:
+            regions[id(node)] = EPILOGUE if needs_row_result else PROLOGUE
     return regions
 
 
@@ -509,6 +523,21 @@ class KernelScheduler:
             for b in n.buffers:
                 written[b.name] = (n, b)
         regions = emission_regions(nodes, placements, written)
+        rewalk = [
+            n for n in nodes
+            if placements[id(n)].full and regions[id(n)] == EPILOGUE
+        ]
+        if rewalk:
+            if rnumel > _PERSISTENT_INNER_LIMIT:
+                # A consumer that re-walks the reduced row only runs after a
+                # persistent reduction; with a walked reduction the row
+                # indices do not outlive the loop, so the row cannot be
+                # re-walked.  Only an inner row can span one block this long.
+                return None
+            from .codegen.loop_triton import _is_inner_reduction
+            buffers = self.graph.name_to_buffer
+            if any(not _is_inner_reduction(node, buffers) for node in red):
+                return None
         for n in nodes:
             p = placements[id(n)]
             for load in n.body.loads:
@@ -530,7 +559,7 @@ class KernelScheduler:
                     return None
                 if producer.is_reduction and RINDEX in free_symbols(read):
                     return None
-                if producer.is_reduction and p.full:
+                if producer.is_reduction and p.full and regions[id(n)] != EPILOGUE:
                     # A nest that runs inside the reduction loops cannot read
                     # the row result: it only exists once the loops are done.
                     return None
