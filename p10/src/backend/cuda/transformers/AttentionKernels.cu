@@ -1412,9 +1412,11 @@ SdpaSplitBuffers sdpa_set_params_splitkv(
     int64_t max_seqlen_q, int64_t head_size_rounded, int num_splits,
     const Device& device) {
   // The key tile the split dispatch uses, spelled the same way so the two
-  // counts below are the same counts.
-  const int block_n =
-      head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
+  // counts below are the same counts.  The wide precision halves it because
+  // its operands take twice the shared memory of the reduced precisions'.
+  const int block_n = params.is_fp32
+      ? (head_size <= 64 ? 128 : 64)
+      : (head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64));
   const int num_n_blocks = static_cast<int>((max_seqlen_k + block_n - 1) / block_n);
   const int num_m_blocks = static_cast<int>((max_seqlen_q + 64 - 1) / 64);
   params.num_splits = num_splits;
@@ -2279,13 +2281,18 @@ Tensor sdpa_kernel_cuda_plain(const Tensor& query, const Tensor& key,
   // GPUs; every other supported dtype at head_dim <= 128 keeps the
   // warp-per-row flash kernel, avoiding the naive kernel's float32 upcast.
   // The naive row-per-block kernel stays as the fallback for wider heads.
-  const bool flash_tensor_core_dtype =
+const bool flash_tensor_core_dtype =
       (dtype == DType::Float16 || dtype == DType::BFloat16) &&
       (D == 64 || D == 96 || D == 128
 #if defined(TP_HAS_NATIVE_CUTE_FLASH)
        || D == 32
 #endif
-      );
+      )
+#if defined(TP_HAS_NATIVE_CUTE_FLASH)
+      // The wide precision's 128-wide kernel is a native flash leaf too.
+      || (dtype == DType::Float32 && D == 128)
+#endif
+      ;
   bool tensor_cores_available = true;
 #if !defined(USE_ROCM)
   if (impl == 0 && flash_tensor_core_dtype) {
@@ -2431,7 +2438,8 @@ Tensor sdpa_kernel_cuda_plain(const Tensor& query, const Tensor& key,
 #if defined(TP_HAS_NATIVE_CUTE_FLASH)
     supported_head_dim = supported_head_dim || D == 32;
 #endif
-    if ((dtype != DType::Float16 && dtype != DType::BFloat16) ||
+    const bool wide_flash = dtype == DType::Float32 && D == 128;
+    if ((!wide_flash && dtype != DType::Float16 && dtype != DType::BFloat16) ||
         !supported_head_dim) {
       TP_THROW(NotImplementedError,
                "sdpa impl=5 (aligned WMMA flash) requires dtype=float16/bfloat16 and a supported head dimension");

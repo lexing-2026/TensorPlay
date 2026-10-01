@@ -20,12 +20,16 @@ namespace tensorplay_native_flash {
 void run_mha_fwd(Flash_fwd_params& params, cudaStream_t stream,
                  bool force_split_kernel) {
   // The wide precision has leaves of its own, one per head width it serves.
-  // The split-kv path is not instantiated for it yet, so a wide call is served
-  // by the single tile walk regardless of the split count.
+  // Its split-kv path shares the reduced precisions' dispatch, but with a
+  // narrower key tile whose shared-memory footprint fits the on-chip budget.
   if (params.is_fp32) {
     if (params.d == 128) {
       BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-        run_mha_fwd_<float, 128, Is_causal>(params, stream);
+        if (params.num_splits <= 1 && !force_split_kernel) {
+          run_mha_fwd_<float, 128, Is_causal>(params, stream);
+        } else {
+          run_mha_fwd_splitkv_dispatch<float, 128, Is_causal>(params, stream);
+        }
       });
     }
     return;

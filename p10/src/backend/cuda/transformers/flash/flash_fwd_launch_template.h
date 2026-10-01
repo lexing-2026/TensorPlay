@@ -177,9 +177,12 @@ void run_mha_fwd_splitkv_align(Flash_fwd_params &params, cudaStream_t stream) {
 template<typename T, int Headdim, bool Is_causal>
 void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int kBlockM = 64;
-    // TD [2023-08-28]: nvcc segfaults for headdim 96 with block size 64 x 256,
-    // and for headdim 192 with block size 64 x 128.
-    constexpr static int kBlockN = Headdim <= 64 ? 256 : (Headdim <= 128 ? 128 : 64);
+    // The wide precision's operands double the shared-memory footprint of a
+    // key tile, so the split schedule for it halves the key tile the reduced
+    // precisions use; the 64 x 64 tile keeps the on-chip budget at 96 KB.
+    constexpr static int kBlockN = std::is_same_v<T, float>
+        ? (Headdim <= 64 ? 128 : 64)
+        : (Headdim <= 64 ? 256 : (Headdim <= 128 ? 128 : 64));
     if (params.num_splits == 1) {
         // Defined in flash_fwd_split_align_*.cu; declared extern in the main
         // flash_fwd_split_*.cu so this call does not re-instantiate the tree here.
