@@ -214,6 +214,19 @@ elif sys.platform.startswith('linux'):
             _preload_cuda_lib(lib_folder, lib_name, required=required)
 
 # -------------------------------------------------------------------------
+# Worker wait
+# -------------------------------------------------------------------------
+# How long an idle worker thread keeps polling for the next parallel region
+# before it goes to sleep is read by the threading runtime once, when it is
+# loaded.  Left unsaid, some builds of the runtime sleep at once: every region
+# then starts by waking its workers, and a training step made of a thousand
+# short regions spends a fifth of its time doing that.  A few milliseconds of
+# polling is the runtime's long-standing default, so it is asked for by name
+# unless the environment already says how workers should wait.
+if "GOMP_SPINCOUNT" not in os.environ and "OMP_WAIT_POLICY" not in os.environ:
+    os.environ["GOMP_SPINCOUNT"] = "300000"
+
+# -------------------------------------------------------------------------
 # Core Imports
 # -------------------------------------------------------------------------
 try:
