@@ -327,9 +327,13 @@ class Tracer:
                     self._node_samples[node.name] = value
                     node.meta["val"] = value
                     return node
-            name = f"_tensor_constant{len(self._graph_attrs)}"
+            # The root may already hold constants from an earlier capture of
+            # the same module, so the next free number is searched for.
+            index = len(self._graph_attrs)
+            name = f"_tensor_constant{index}"
             while name in self._graph_attrs or hasattr(self.root, name):
-                name = f"_tensor_constant{len(self._graph_attrs) + 1}"
+                index += 1
+                name = f"_tensor_constant{index}"
             self._graph_attrs[name] = value
             node = self.graph.get_attr(name)
             self._node_samples[node.name] = value

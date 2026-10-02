@@ -849,3 +849,20 @@ def test_export_keeps_a_tensor_the_function_closed_over():
     assert program.graph_module._graph_attrs[held[0]] is scale
     out = program.module()(tp.tensor([[1.0, 1.0, 1.0], [0.0, 2.0, -1.0]]))
     assert out.tolist() == [[3.0, 4.0, 5.0], [1.0, 7.0, -3.0]]
+
+
+def test_capturing_a_module_again_names_its_constants_afresh():
+    scale, shift = tp.tensor([2.0, 3.0]), tp.tensor([1.0, -1.0])
+
+    class Affine(tp.nn.Module):
+        def forward(self, x):
+            return x * scale + shift
+
+    model = Affine()
+    # The first capture leaves its constants on the module under the first
+    # free names; the second has to find names past them rather than keep
+    # asking for one that is taken.
+    for _ in range(3):
+        program = tp_export.export(model, tp.tensor([[1.0, 1.0]]))
+    out = program.module()(tp.tensor([[1.0, 2.0], [0.0, -1.0]]))
+    assert out.tolist() == [[3.0, 5.0], [1.0, -4.0]]
