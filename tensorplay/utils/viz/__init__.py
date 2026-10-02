@@ -88,7 +88,7 @@ def _make_dot_graphviz(var, param_map):
                     return # AccumulateGrad has no next edges we care about for viz usually
 
                 node_id = str(id(var))
-                name = var.name
+                name = var.name()
                 # Clean up name
                 if "::" in name:
                     name = name.split("::")[-1]
@@ -146,7 +146,7 @@ def _make_dot_networkx(var, param_map):
                     return # AccumulateGrad has no next edges we care about for viz usually
 
                 node_id = id(var)
-                name = var.name
+                name = var.name()
                 if "::" in name:
                     name = name.split("::")[-1]
                 if name.startswith("struct "):
