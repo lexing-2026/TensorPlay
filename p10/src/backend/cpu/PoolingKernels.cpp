@@ -348,7 +348,7 @@ Tensor avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
     
     TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "avg_pool2d", [&]() {
         scalar_t* out_ptr = out.data_ptr<scalar_t>();
-        const scalar_t* in_ptr = input.data_ptr<scalar_t>();
+        const scalar_t* in_ptr = input_c.data_ptr<scalar_t>();
 
         parallel_for(0, N * C * H_out, 1, [&](int64_t begin, int64_t end) {
             for (int64_t idx = begin; idx < end; ++idx) {
@@ -413,7 +413,7 @@ Tensor adaptive_avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
     
     TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "adaptive_avg_pool2d", [&]() {
         scalar_t* out_ptr = out.data_ptr<scalar_t>();
-        const scalar_t* in_ptr = input.data_ptr<scalar_t>();
+        const scalar_t* in_ptr = input_c.data_ptr<scalar_t>();
 
         parallel_for(0, N * C * H_out, 1, [&](int64_t begin, int64_t end) {
             for (int64_t idx = begin; idx < end; ++idx) {
@@ -503,6 +503,7 @@ Tensor adaptive_max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
 Tensor max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& dilation, bool ceil_mode) {
     if (grad_output.dim() != 4 || input.dim() != 4) TP_THROW(RuntimeError, "max_pool2d_backward: Expected 4D input and grad_output");
     const Tensor input_c = input.contiguous();
+    const Tensor grad_output_c = grad_output.contiguous();
 
     int64_t N = input_c.size(0);
     int64_t C = input_c.size(1);
@@ -521,11 +522,11 @@ Tensor max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
     int64_t dH, dW;
     std::tie(dH, dW) = get_pair(dilation, 1);
 
-    Tensor grad_input = Tensor::zeros_like(input);
+    Tensor grad_input = Tensor::zeros(static_cast<std::vector<int64_t>>(input.shape()), input.dtype(), input.device());
     
     TP_DISPATCH_ALL_TYPES(input.dtype(), "max_pool2d_backward", [&]() {
         scalar_t* grad_in_ptr = grad_input.data_ptr<scalar_t>();
-        const scalar_t* grad_out_ptr = grad_output.data_ptr<scalar_t>();
+        const scalar_t* grad_out_ptr = grad_output_c.data_ptr<scalar_t>();
         const scalar_t* in_ptr = input_c.data_ptr<scalar_t>();
 
         // Scatter into grad_input: parallel over (n, c) planes (each plane is
@@ -593,6 +594,7 @@ Tensor avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
         TP_THROW(RuntimeError, "divisor must be not zero");
     if (grad_output.dim() != 4 || input.dim() != 4) TP_THROW(RuntimeError, "avg_pool2d_backward: Expected 4D input and grad_output");
     const Tensor input_c = input.contiguous();
+    const Tensor grad_output_c = grad_output.contiguous();
 
     int64_t N = input_c.size(0);
     int64_t C = input_c.size(1);
@@ -609,11 +611,11 @@ Tensor avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
     int64_t pH, pW;
     std::tie(pH, pW) = get_pair(padding, 0);
 
-    Tensor grad_input = Tensor::zeros_like(input);
+    Tensor grad_input = Tensor::zeros(static_cast<std::vector<int64_t>>(input.shape()), input.dtype(), input.device());
 
     TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "avg_pool2d_backward", [&]() {
         scalar_t* grad_in_ptr = grad_input.data_ptr<scalar_t>();
-        const scalar_t* grad_out_ptr = grad_output.data_ptr<scalar_t>();
+        const scalar_t* grad_out_ptr = grad_output_c.data_ptr<scalar_t>();
 
         // Scatter into grad_input: parallel over (n, c) planes (independent,
         parallel_for(0, N * C, 1, [&](int64_t begin, int64_t end) {
@@ -657,6 +659,8 @@ Tensor avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
 
 Tensor adaptive_avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input) {
     if (grad_output.dim() != 4 || input.dim() != 4) TP_THROW(RuntimeError, "adaptive_avg_pool2d_backward: Expected 4D input and grad_output");
+    // Operands are read through a raw pointer in row-major order below.
+    const Tensor grad_output_c = grad_output.contiguous();
     
     int64_t N = input.size(0);
     int64_t C = input.size(1);
@@ -666,11 +670,11 @@ Tensor adaptive_avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor&
     int64_t H_out = grad_output.size(2);
     int64_t W_out = grad_output.size(3);
 
-    Tensor grad_input = Tensor::zeros_like(input);
+    Tensor grad_input = Tensor::zeros(static_cast<std::vector<int64_t>>(input.shape()), input.dtype(), input.device());
 
     TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "adaptive_avg_pool2d_backward", [&]() {
         scalar_t* grad_in_ptr = grad_input.data_ptr<scalar_t>();
-        const scalar_t* grad_out_ptr = grad_output.data_ptr<scalar_t>();
+        const scalar_t* grad_out_ptr = grad_output_c.data_ptr<scalar_t>();
 
         // Scatter: parallel over (n, c) planes (race free).
         parallel_for(0, N * C, 1, [&](int64_t begin, int64_t end) {
@@ -702,6 +706,9 @@ Tensor adaptive_avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor&
 
 Tensor adaptive_max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input) {
     if (grad_output.dim() != 4 || input.dim() != 4) TP_THROW(RuntimeError, "adaptive_max_pool2d_backward: Expected 4D input and grad_output");
+    // Operands are read through a raw pointer in row-major order below.
+    const Tensor grad_output_c = grad_output.contiguous();
+    const Tensor input_c = input.contiguous();
     
     int64_t N = input.size(0);
     int64_t C = input.size(1);
@@ -711,12 +718,12 @@ Tensor adaptive_max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor&
     int64_t H_out = grad_output.size(2);
     int64_t W_out = grad_output.size(3);
 
-    Tensor grad_input = Tensor::zeros_like(input);
+    Tensor grad_input = Tensor::zeros(static_cast<std::vector<int64_t>>(input.shape()), input.dtype(), input.device());
 
     TP_DISPATCH_ALL_TYPES(input.dtype(), "adaptive_max_pool2d_backward", [&]() {
         scalar_t* grad_in_ptr = grad_input.data_ptr<scalar_t>();
-        const scalar_t* grad_out_ptr = grad_output.data_ptr<scalar_t>();
-        const scalar_t* in_ptr = input.data_ptr<scalar_t>();
+        const scalar_t* grad_out_ptr = grad_output_c.data_ptr<scalar_t>();
+        const scalar_t* in_ptr = input_c.data_ptr<scalar_t>();
 
         // Scatter: parallel over (n, c) planes (race free).
         parallel_for(0, N * C, 1, [&](int64_t begin, int64_t end) {
@@ -831,7 +838,7 @@ Tensor adaptive_max_pool2d_with_indices_backward_cpu(const Tensor& grad_output, 
     }
     if (grad_output.dim() != 4 || input.dim() != 4)
         TP_THROW(RuntimeError, "adaptive_max_pool2d_with_indices_backward: Expected 4D input and grad_output");
-    Tensor grad_input = Tensor::zeros_like(input);
+    Tensor grad_input = Tensor::zeros(static_cast<std::vector<int64_t>>(input.shape()), input.dtype(), input.device());
     const Tensor go = grad_output.contiguous();
     const Tensor idx = indices.contiguous();
     TP_DISPATCH_ALL_TYPES(input.dtype(), "adaptive_max_pool2d_with_indices_backward", [&]() {
@@ -881,9 +888,10 @@ Tensor avg_pool3d_backward_cpu(const Tensor& grad_output, const Tensor& input,
     const int64_t sd = stride[0], sh = stride[1], sw = stride[2];
     const int64_t pd_ = padding[0], ph = padding[1], pw = padding[2];
     Tensor grad_input = Tensor::zeros({N, C, D, H, W}, input.dtype(), input.device());
+    const Tensor grad_output_c = grad_output.contiguous();
     TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "avg_pool3d_backward", [&]() {
         scalar_t* gi = grad_input.data_ptr<scalar_t>();
-        const scalar_t* go = grad_output.data_ptr<scalar_t>();
+        const scalar_t* go = grad_output_c.data_ptr<scalar_t>();
         // Scatter: parallel over (n, c) planes (race free).
         parallel_for(0, N * C, 1, [&](int64_t begin, int64_t end) {
             for (int64_t nc = begin; nc < end; ++nc) {
@@ -925,9 +933,10 @@ Tensor adaptive_avg_pool3d_cpu(const Tensor& input, const std::vector<int64_t>& 
     const int64_t D = input.size(2), H = input.size(3), W = input.size(4);
     const int64_t oD = output_size[0], oH = output_size[1], oW = output_size[2];
     Tensor out = Tensor::empty({N, C, oD, oH, oW}, input.dtype(), input.device());
+    const Tensor input_c = input.contiguous();
     TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "adaptive_avg_pool3d", [&]() {
         scalar_t* op = out.data_ptr<scalar_t>();
-        const scalar_t* ip = input.data_ptr<scalar_t>();
+        const scalar_t* ip = input_c.data_ptr<scalar_t>();
         parallel_for(0, N * C * oD * oH, 1, [&](int64_t begin, int64_t end) {
             for (int64_t idx = begin; idx < end; ++idx) {
                 const int64_t h = idx % oH;
@@ -968,9 +977,10 @@ Tensor adaptive_avg_pool3d_backward_cpu(const Tensor& grad_output, const Tensor&
     const int64_t D = input.size(2), H = input.size(3), W = input.size(4);
     const int64_t oD = grad_output.size(2), oH = grad_output.size(3), oW = grad_output.size(4);
     Tensor grad_input = Tensor::zeros({N, C, D, H, W}, input.dtype(), input.device());
+    const Tensor grad_output_c = grad_output.contiguous();
     TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "adaptive_avg_pool3d_backward", [&]() {
         scalar_t* gi = grad_input.data_ptr<scalar_t>();
-        const scalar_t* go = grad_output.data_ptr<scalar_t>();
+        const scalar_t* go = grad_output_c.data_ptr<scalar_t>();
         // Scatter: parallel over (n, c) planes (race free).
         parallel_for(0, N * C, 1, [&](int64_t begin, int64_t end) {
             for (int64_t nc = begin; nc < end; ++nc) {
@@ -1157,7 +1167,7 @@ Tensor max_pool2d_with_indices_backward_cpu(
                  idx_shape_ref.size(0), ", ", idx_shape_ref.size(1), ", ", idx_shape_ref.size(2),
                  ", ", idx_shape_ref.size(3), "]");
     }
-    Tensor grad_input = Tensor::zeros_like(input);
+    Tensor grad_input = Tensor::zeros(static_cast<std::vector<int64_t>>(input.shape()), input.dtype(), input.device());
     const Tensor go = grad_output.contiguous();
     const Tensor idx = indices.contiguous();
     TP_DISPATCH_ALL_TYPES(input.dtype(), "max_pool2d_with_indices_backward", [&]() {
@@ -1347,7 +1357,7 @@ Tensor max_pool3d_backward_cpu(const Tensor& grad_output, const Tensor& input,
     const int64_t pD = pd[0], pH = pd[1], pW = pd[2];
     const int64_t dD = dl[0], dH = dl[1], dW = dl[2];
 
-    Tensor grad_input = Tensor::zeros_like(input);
+    Tensor grad_input = Tensor::zeros(static_cast<std::vector<int64_t>>(input.shape()), input.dtype(), input.device());
     TP_DISPATCH_ALL_TYPES(input.dtype(), "max_pool3d_backward", [&]() {
         scalar_t* gi = grad_input.data_ptr<scalar_t>();
         const scalar_t* gop = go.data_ptr<scalar_t>();
@@ -1447,7 +1457,7 @@ Tensor max_pool3d_with_indices_backward_cpu(
     }
     if (grad_output.dim() != 5 || input.dim() != 5)
         TP_THROW(RuntimeError, "max_pool3d_with_indices_backward: Expected 5D input and grad_output");
-    Tensor grad_input = Tensor::zeros_like(input);
+    Tensor grad_input = Tensor::zeros(static_cast<std::vector<int64_t>>(input.shape()), input.dtype(), input.device());
     const Tensor go = grad_output.contiguous();
     const Tensor idx = indices.contiguous();
     TP_DISPATCH_ALL_TYPES(input.dtype(), "max_pool3d_with_indices_backward", [&]() {
