@@ -972,8 +972,17 @@ Tensor conv2d_grad_input_cudnn_v8(const Tensor& grad_output, const Tensor& input
         grad_output.stride(0), grad_output.stride(1), grad_output.stride(2), grad_output.stride(3)};
     const std::array<int64_t, 4> w_stride{
         weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3)};
-    const std::array<int64_t, 4> dx_stride{C * H * W, H * W, W, 1};
+    const bool use_channels_last =
+        is_channels_last_4d(grad_output) || is_channels_last_4d(input);
+    const std::array<int64_t, 4> dx_stride = use_channels_last
+        ? channels_last_strides(C, H, W)
+        : std::array<int64_t, 4>{C * H * W, H * W, W, 1};
     Tensor out = Tensor::empty({N, C, H, W}, input.dtype(), input.device());
+    if (use_channels_last) {
+        out = out.as_strided(
+            {N, C, H, W},
+            std::vector<int64_t>(dx_stride.begin(), dx_stride.end()));
+    }
 
     struct BKey {
         cudnnDataType_t dtype;
@@ -1370,11 +1379,18 @@ Tensor conv2d_grad_input_cuda(const Tensor& grad_output, const Tensor& input, co
     auto padding = expand_param_if_needed(padding_arg, 2, 0);
     auto dilation = expand_param_if_needed(dilation_arg, 2, 1);
 
-    // Backward grads can arrive as broadcast views (e.g. after .sum()); cuDNN
-    // needs contiguous NCHW.
+    // Backward grads can arrive as broadcast views (e.g. after .sum()); the
+    // cuDNN kernels here read either a contiguous NCHW tensor or a
+    // channels-last one, and anything else is copied to a contiguous form.
     const DType result_dtype = input.dtype();
-    Tensor grad_output_c = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
-    Tensor input_c = input.is_contiguous() ? input : input.contiguous();
+    const bool grad_out_cl = is_channels_last_4d(grad_output);
+    const bool input_cl = is_channels_last_4d(input);
+    Tensor grad_output_c = (grad_output.is_contiguous() || grad_out_cl)
+                               ? grad_output
+                               : grad_output.contiguous();
+    Tensor input_c = (input.is_contiguous() || input_cl)
+                        ? input
+                        : input.contiguous();
     Tensor weight_c = weight.is_contiguous() ? weight : weight.contiguous();
 
 #if defined(TP_HAS_CUDNN_FRONTEND)
@@ -1515,8 +1531,14 @@ Tensor conv2d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input, c
     auto padding = expand_param_if_needed(padding_arg, 2, 0);
     auto dilation = expand_param_if_needed(dilation_arg, 2, 1);
 
-    Tensor grad_output_c = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
-    Tensor input_c = input.is_contiguous() ? input : input.contiguous();
+    const bool grad_out_cl = is_channels_last_4d(grad_output);
+    const bool input_cl = is_channels_last_4d(input);
+    Tensor grad_output_c = (grad_output.is_contiguous() || grad_out_cl)
+                               ? grad_output
+                               : grad_output.contiguous();
+    Tensor input_c = (input.is_contiguous() || input_cl)
+                        ? input
+                        : input.contiguous();
     Tensor weight_c = weight.is_contiguous() ? weight : weight.contiguous();
 
 #if defined(TP_HAS_CUDNN_FRONTEND)

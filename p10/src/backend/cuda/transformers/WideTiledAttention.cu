@@ -21,6 +21,24 @@
 namespace tensorplay {
 namespace cuda {
 
+// Asynchronous shared-memory copy helpers for the double-buffered operand
+// walk.  A 16-byte copy moves one quarter-width segment of a key or value
+// row, which is the granularity the swizzle permutes at, so the key's
+// permutation can be applied by choosing the destination segment.
+__device__ __forceinline__ void tp_wide_cp_async16(
+    unsigned smem_dst, const void* gmem_src) {
+  asm volatile(
+      "cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem_dst),
+      "l"(gmem_src));
+}
+__device__ __forceinline__ void tp_wide_cp_async_commit() {
+  asm volatile("cp.async.commit_group;\n");
+}
+template <int kWait>
+__device__ __forceinline__ void tp_wide_cp_async_wait() {
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(kWait));
+}
+
 // The wide precision has no tiles of its own in the schedule that covers the
 // two reduced ones, so it is served by a schedule that materialises the score
 // matrix and walks it three times: once to write it, once to normalise it, once
@@ -83,8 +101,15 @@ constexpr int kWideRowsPerWarp = kQTile / kWideWarps<kQTile>;
 template <int kQTile, int kKTile>
 struct TpWideShared {
   float q[kQTile][kWideTileD];
-  float kv[kKTile][kWideTileD];
-  float score[kQTile][kKTile];
+  // Key and value each get two stages so the next tile's operands are fetched
+  // with cp.async while the current tile's products are in flight.  The key
+  // sits in its own buffer because its swizzled layout differs from the value
+  // rows' plain one; writing both into one buffer would overwrite each other.
+  float kbuf[2][kKTile][kWideTileD];
+  float vbuf[2][kKTile][kWideTileD];
+  // The score rows are padded so a lane reading its own column across
+  // consecutive query rows walks consecutive banks instead of one bank.
+  float score[kQTile][kKTile + 1];
   float row_max[kQTile];
   float row_sum[kQTile];
   float row_alpha[kQTile];
@@ -108,6 +133,7 @@ __global__ void sdpa_wide_flash_kernel(
     const float* __restrict__ k,
     const float* __restrict__ v,
     float* __restrict__ out,
+    float* __restrict__ lse,
     int64_t B, int64_t Hq, int64_t Hkv, int64_t Tq, int64_t Tkv, int64_t D,
     float scale, bool is_causal) {
   constexpr int q_tile = kQTile;
@@ -172,61 +198,117 @@ __global__ void sdpa_wide_flash_kernel(
 #pragma unroll
     for (int c = 0; c < kColsPerLane; ++c) acc[r][c] = 0.f;
 
+  // The first key and value tile are fetched before the walk starts; each
+  // following tile is fetched into the other stage while the current one is
+  // consumed, so the operand loads never sit on the critical path.  A
+  // sixteen-byte copy moves one quarter-width segment, which is the
+  // granularity the key swizzle permutes at, so the key's permutation is
+  // applied by choosing the destination segment.
+  constexpr int kSegsPerRow = kWideTileD / 4;
+  constexpr int kTotalSegs = kKTile * kSegsPerRow;
+  for (int idx = thread; idx < kTotalSegs; idx += threads) {
+    const int kr = idx / kSegsPerRow;
+    const int d0 = (idx % kSegsPerRow) * 4;
+    const int64_t kg = kr;
+    if (kg < Tkv) {
+      tp_wide_cp_async16(
+          static_cast<unsigned>(__cvta_generic_to_shared(
+              &smem.kbuf[0][kr][wide_kv_col(d0, kr)])),
+          &k[kv_base + kg * D + d0]);
+    }
+  }
+  for (int idx = thread; idx < kTotalSegs; idx += threads) {
+    const int kr = idx / kSegsPerRow;
+    const int d0 = (idx % kSegsPerRow) * 4;
+    const int64_t kg = kr;
+    if (kg < Tkv) {
+      tp_wide_cp_async16(
+          static_cast<unsigned>(__cvta_generic_to_shared(
+              &smem.vbuf[0][kr][d0])),
+          &v[kv_base + kg * D + d0]);
+    }
+  }
+  tp_wide_cp_async_commit();
+
   for (int64_t k0 = 0; k0 < last_k; k0 += k_tile) {
-    // The key lands in the shared buffer and is consumed by the score product;
-    // the value replaces it afterwards and is consumed by the second product.
-    for (int idx = thread; idx < k_tile * tile_d; idx += threads) {
-      const int kr = idx / tile_d;
-      const int d = idx % tile_d;
-      const int64_t kg = k0 + kr;
-      smem.kv[kr][wide_kv_col(d, kr)] = (kg < Tkv && d < D) ? k[kv_base + kg * D + d] : 0.f;
+    const int stage = (k0 / k_tile) & 1;
+    const int next_stage = stage ^ 1;
+    const bool has_next = (k0 + k_tile) < last_k;
+
+    if (has_next) {
+      const int64_t k1 = k0 + k_tile;
+      for (int idx = thread; idx < kTotalSegs; idx += threads) {
+        const int kr = idx / kSegsPerRow;
+        const int d0 = (idx % kSegsPerRow) * 4;
+        const int64_t kg = k1 + kr;
+        if (kg < Tkv) {
+          tp_wide_cp_async16(
+              static_cast<unsigned>(__cvta_generic_to_shared(
+                  &smem.kbuf[next_stage][kr][wide_kv_col(d0, kr)])),
+              &k[kv_base + kg * D + d0]);
+        }
+      }
+      for (int idx = thread; idx < kTotalSegs; idx += threads) {
+        const int kr = idx / kSegsPerRow;
+        const int d0 = (idx % kSegsPerRow) * 4;
+        const int64_t kg = k1 + kr;
+        if (kg < Tkv) {
+          tp_wide_cp_async16(
+              static_cast<unsigned>(__cvta_generic_to_shared(
+                  &smem.vbuf[next_stage][kr][d0])),
+              &v[kv_base + kg * D + d0]);
+        }
+      }
+      tp_wide_cp_async_commit();
+      tp_wide_cp_async_wait<1>();
+    } else {
+      tp_wide_cp_async_wait<0>();
     }
     __syncthreads();
 
-    // QK^T.  A warp owns a strip of the query tile and a lane owns a strip of
-    // the key tile, so every (row, key) score is produced by exactly one lane
-    // and no two lanes write the same slot.  The product is a register dot
+    // QK^T.  A warp owns a strip of the query tile and a lane owns one key
+    // column, so every (row, key) score is produced by exactly one lane and
+    // no two lanes write the same slot.  The product is a register dot
     // product, which is what a wide precision without a fragment form comes
     // down to.  The key read goes through the permutation the key was stored
     // under, so a lane's sweep over the key rows reads across the banks
     // instead of marching down one.
+    //
+    // The walk steps the head dimension once and fans the result out over the
+    // query rows: the key row is private to the lane and is read one vector
+    // load per four products per row, so a key tile is read once per head
+    // dimension instead of once per row.  The query rows are shared by the
+    // whole warp and broadcast from shared memory.
     if (warp < warps) {
       const int qr0 = warp * rows_per_warp;
-      for (int qr = qr0; qr < qr0 + rows_per_warp; ++qr) {
-        const int64_t qg = q0 + qr;
-        // A row whose bound is below this tile's first key has no score to
-        // compute and no state to carry: zero its slots and step past it.
-        if (is_causal && qg < k0) {
-          for (int n = lane; n < k_tile; n += 32) smem.score[qr][n] = 0.f;
-          continue;
-        }
-        for (int n = lane; n < k_tile; n += 32) {
-          // One lane owns one key.  The key row is private to the lane and is
-          // read in quarter-width steps that ride the same permutation as the
-          // store, so a step pays one vector load per four products instead
-          // of one load per product; the query row is shared by the whole
-          // warp and is broadcast.
-          float total = 0.f;
-          for (int d0 = 0; d0 < tile_d; d0 += 4) {
-            const float4 k4 =
-                *reinterpret_cast<const float4*>(&smem.kv[n][wide_kv_col(d0, n)]);
+      // A causal row admits keys 0..row.  When every row this warp owns lies
+      // before this tile's first key, none of them can see any key in the
+      // tile, so the tile is skipped without being read.
+      const bool all_skipped =
+          is_causal && (q0 + qr0 + rows_per_warp - 1 < k0);
+      if (!all_skipped && lane < k_tile) {
+        float total[rows_per_warp];
+#pragma unroll
+        for (int r = 0; r < rows_per_warp; ++r) total[r] = 0.f;
+        // The head dimension is walked in quarter-width steps; the unroll
+        // lets the compiler prefetch the next key and query vectors while the
+        // current four products are still in flight.
+#pragma unroll 4
+        for (int d0 = 0; d0 < tile_d; d0 += 4) {
+          const float4 k4 = *reinterpret_cast<const float4*>(
+              &smem.kbuf[stage][lane][wide_kv_col(d0, lane)]);
+#pragma unroll
+          for (int r = 0; r < rows_per_warp; ++r) {
             const float4 q4 =
-                *reinterpret_cast<const float4*>(&smem.q[qr][d0]);
-            total += q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
+                *reinterpret_cast<const float4*>(&smem.q[qr0 + r][d0]);
+            total[r] += q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
           }
-          smem.score[qr][n] = total;
+        }
+#pragma unroll
+        for (int r = 0; r < rows_per_warp; ++r) {
+          smem.score[qr0 + r][lane] = total[r];
         }
       }
-    }
-    __syncthreads();
-
-    // The value is fetched once the key is dead, so it takes the same buffer
-    // and the shared allocation never holds both.
-    for (int idx = thread; idx < k_tile * tile_d; idx += threads) {
-      const int kr = idx / tile_d;
-      const int d = idx % tile_d;
-      const int64_t kg = k0 + kr;
-      smem.kv[kr][d] = (kg < Tkv && d < D) ? v[kv_base + kg * D + d] : 0.f;
     }
     __syncthreads();
 
@@ -299,38 +381,31 @@ __global__ void sdpa_wide_flash_kernel(
 #pragma unroll
         for (int c = 0; c < kColsPerLane; ++c) acc[r][c] *= alpha;
       }
-      for (int r = 0; r < rows_per_warp; ++r) {
-        const int qr = qr0 + r;
-        // A row past its bound carries no new probability, so its product
-        // would add zero; the rescale above was all it needed.
-        if (is_causal && q0 + qr < k0) continue;
-        // A lane owns four adjacent columns of the head width and walks every
-        // key row for them.  One probability feeds four products, so the
-        // score row is read once per four products, and the value row step
-        // rides one vector load across the four columns.  The ownership also
-        // coalesces the final store, which writes the same columns.
-        float4 t0 = make_float4(0.f, 0.f, 0.f, 0.f);
-        float4 t1 = make_float4(0.f, 0.f, 0.f, 0.f);
-        float4 t2 = make_float4(0.f, 0.f, 0.f, 0.f);
-        float4 t3 = make_float4(0.f, 0.f, 0.f, 0.f);
-        for (int n = 0; n < k_tile; n += 4) {
-          const float p0 = smem.score[qr][n];
-          const float p1 = smem.score[qr][n + 1];
-          const float p2 = smem.score[qr][n + 2];
-          const float p3 = smem.score[qr][n + 3];
-          const float4 v0 = *reinterpret_cast<const float4*>(&smem.kv[n][lane * 4]);
-          const float4 v1 = *reinterpret_cast<const float4*>(&smem.kv[n + 1][lane * 4]);
-          const float4 v2 = *reinterpret_cast<const float4*>(&smem.kv[n + 2][lane * 4]);
-          const float4 v3 = *reinterpret_cast<const float4*>(&smem.kv[n + 3][lane * 4]);
-          t0.x += p0 * v0.x; t0.y += p0 * v0.y; t0.z += p0 * v0.z; t0.w += p0 * v0.w;
-          t1.x += p1 * v1.x; t1.y += p1 * v1.y; t1.z += p1 * v1.z; t1.w += p1 * v1.w;
-          t2.x += p2 * v2.x; t2.y += p2 * v2.y; t2.z += p2 * v2.z; t2.w += p2 * v2.w;
-          t3.x += p3 * v3.x; t3.y += p3 * v3.y; t3.z += p3 * v3.z; t3.w += p3 * v3.w;
+      // A lane owns four adjacent columns of the head width.  The value row
+      // is read once per key and reused across every query row this warp
+      // owns, so the value operand crosses the shared bus once per key
+      // instead of once per row-key pair.  One probability feeds four
+      // products, and the score row is read with a stride that walks the
+      // banks across query rows.  The ownership also coalesces the final
+      // store, which writes the same columns.
+      // The key walk is unrolled so the value vectors for the next keys are
+      // fetched while the current key's products accumulate.
+#pragma unroll 4
+      for (int n = 0; n < k_tile; ++n) {
+        const float4 v = *reinterpret_cast<const float4*>(
+            &smem.vbuf[stage][n][lane * 4]);
+#pragma unroll
+        for (int r = 0; r < rows_per_warp; ++r) {
+          const int qr = qr0 + r;
+          // A row past its bound carries no new probability, so its product
+          // would add zero; the rescale above was all it needed.
+          if (is_causal && q0 + qr < k0) continue;
+          const float p = smem.score[qr][n];
+          acc[r][0] += p * v.x;
+          acc[r][1] += p * v.y;
+          acc[r][2] += p * v.z;
+          acc[r][3] += p * v.w;
         }
-        acc[r][0] += t0.x + t1.x + t2.x + t3.x;
-        acc[r][1] += t0.y + t1.y + t2.y + t3.y;
-        acc[r][2] += t0.z + t1.z + t2.z + t3.z;
-        acc[r][3] += t0.w + t1.w + t2.w + t3.w;
       }
     }
     __syncthreads();
@@ -340,6 +415,7 @@ __global__ void sdpa_wide_flash_kernel(
   // keys were all masked away has no total and is left at zero.
   if (warp < warps) {
     const int qr0 = warp * rows_per_warp;
+    const int64_t lse_base = (b * Hq + hq) * Tq;
     for (int r = 0; r < rows_per_warp; ++r) {
       const int qr = qr0 + r;
       const int64_t qg = q0 + qr;
@@ -350,6 +426,12 @@ __global__ void sdpa_wide_flash_kernel(
       for (int c = 0; c < kColsPerLane; ++c) {
         if (lane * 4 + c < D)
           out[q_base + qg * D + (lane * 4 + c)] = acc[r][c] * inverse;
+      }
+      // The log-sum-exp row statistic is what the fused backward keys on, so
+      // the same kernel that carries the row maximum and sum writes it out.
+      if (lse != nullptr) {
+        lse[lse_base + qg] =
+            total > 0.f ? smem.row_max[qr] + logf(total) : -INFINITY;
       }
     }
   }
@@ -433,7 +515,7 @@ template <int kQTile, int kKTile>
 Tensor sdpa_wide_tiled_launch(const Tensor& q, const Tensor& k,
                               const Tensor& v, int64_t B, int64_t Hq,
                               int64_t Hkv, int64_t Tq, int64_t Tkv, int64_t D,
-                              bool is_causal) {
+                              bool is_causal, float* lse_ptr = nullptr) {
   Tensor out = Tensor::empty({B, Hq, Tq, D}, DType::Float32, q.device());
   const float scale = 1.f / std::sqrt(static_cast<float>(D));
   const int64_t q_blocks = (Tq + kQTile - 1) / kQTile;
@@ -451,7 +533,7 @@ Tensor sdpa_wide_tiled_launch(const Tensor& q, const Tensor& k,
   }
   sdpa_wide_flash_kernel<kQTile, kKTile><<<grid, threads, smem_bytes, stream>>>(
       q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
-      out.data_ptr<float>(), B, Hq, Hkv, Tq, Tkv, D, scale, is_causal);
+      out.data_ptr<float>(), lse_ptr, B, Hq, Hkv, Tq, Tkv, D, scale, is_causal);
   TP_WIDE_CUDA_CHECK(cudaGetLastError());
   return out;
 }
@@ -473,8 +555,9 @@ Tensor sdpa_one_row_first_value_cuda(const Tensor& q, const Tensor& k,
 // causal bound being the query row itself, which is what makes a context longer
 // than the query a shape here rather than a special case.  The head width is
 // the tile width, so a call of any other width is not one this answers.
-Tensor sdpa_wide_tiled_cuda(const Tensor& query, const Tensor& key,
-                            const Tensor& value, bool is_causal) {
+Tensor sdpa_wide_tiled_cuda_impl(const Tensor& query, const Tensor& key,
+                                const Tensor& value, bool is_causal,
+                                Tensor* lse_out) {
   const Tensor q = query.contiguous();
   const Tensor k = key.contiguous();
   const Tensor v = value.contiguous();
@@ -504,7 +587,23 @@ Tensor sdpa_wide_tiled_cuda(const Tensor& query, const Tensor& key,
              "the context head count must divide the query head count");
   }
   if (B == 0 || Hq == 0 || Tq == 0 || D == 0) {
+    if (lse_out != nullptr) {
+      *lse_out = Tensor::empty({B, Hq, Tq}, DType::Float32, q.device());
+    }
     return Tensor::empty({B, Hq, Tq, D}, DType::Float32, q.device());
+  }
+  // The log-sum-exp output has one entry per query row.  The one-row causal
+  // copy path's softmax is over a single value, whose log-sum-exp is zero.
+  float* lse_ptr = nullptr;
+  if (lse_out != nullptr) {
+    Tensor lse = Tensor::empty({B, Hq, Tq}, DType::Float32, q.device());
+    *lse_out = lse;
+    lse_ptr = lse.data_ptr<float>();
+    if (Tq <= 1 && is_causal) {
+      cudaMemsetAsync(lse_ptr, 0,
+                      static_cast<size_t>(B * Hq * Tq) * sizeof(float),
+                      getCurrentCUDAStream().stream());
+    }
   }
   // A causal call's work is set by its query length, so the tile is chosen to
   // fit it.  A call too long for the narrow tile is served by the wide one,
@@ -526,16 +625,20 @@ Tensor sdpa_wide_tiled_cuda(const Tensor& query, const Tensor& key,
     return sdpa_one_row_first_value_cuda(q, k, v, B, Hq, Hkv, Tkv, D);
   }
   if (Tq <= 1) {
-    return sdpa_wide_tiled_launch<1, 1>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
+    return sdpa_wide_tiled_launch<1, 1>(q, k, v, B, Hq, Hkv, Tq, Tkv, D,
+                                        is_causal, lse_ptr);
   }
   if (Tq <= 4) {
-    return sdpa_wide_tiled_launch<4, 4>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
+    return sdpa_wide_tiled_launch<4, 4>(q, k, v, B, Hq, Hkv, Tq, Tkv, D,
+                                        is_causal, lse_ptr);
   }
   if (Tq <= 8) {
-    return sdpa_wide_tiled_launch<8, 8>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
+    return sdpa_wide_tiled_launch<8, 8>(q, k, v, B, Hq, Hkv, Tq, Tkv, D,
+                                        is_causal, lse_ptr);
   }
   if (Tq <= 16) {
-    return sdpa_wide_tiled_launch<16, 16>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
+    return sdpa_wide_tiled_launch<16, 16>(q, k, v, B, Hq, Hkv, Tq, Tkv, D,
+                                          is_causal, lse_ptr);
   }
   // A long query takes the rectangular tile.  The walk's cost for a causal
   // call is the context re-read once per query tile, so the query tile is
@@ -543,9 +646,24 @@ Tensor sdpa_wide_tiled_cuda(const Tensor& query, const Tensor& key,
   // carries.  Sixteen rows of keys per step was measured slower: the extra
   // steps and their barriers outweigh the register traffic they save.
   if (Tq <= 32) {
-    return sdpa_wide_tiled_launch<32, 32>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
+    return sdpa_wide_tiled_launch<32, 32>(q, k, v, B, Hq, Hkv, Tq, Tkv, D,
+                                          is_causal, lse_ptr);
   }
-  return sdpa_wide_tiled_launch<64, 32>(q, k, v, B, Hq, Hkv, Tq, Tkv, D, is_causal);
+  return sdpa_wide_tiled_launch<32, 32>(q, k, v, B, Hq, Hkv, Tq, Tkv, D,
+                                        is_causal, lse_ptr);
+}
+
+Tensor sdpa_wide_tiled_cuda(const Tensor& query, const Tensor& key,
+                            const Tensor& value, bool is_causal) {
+  return sdpa_wide_tiled_cuda_impl(query, key, value, is_causal, nullptr);
+}
+
+// The wide-precision schedule with the row log-sum-exp written out, for the
+// fused entry that returns it alongside the attention.
+Tensor sdpa_wide_tiled_cuda_with_lse(const Tensor& query, const Tensor& key,
+                                     const Tensor& value, bool is_causal,
+                                     Tensor& lse) {
+  return sdpa_wide_tiled_cuda_impl(query, key, value, is_causal, &lse);
 }
 
 }  // namespace cuda
