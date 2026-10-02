@@ -673,7 +673,7 @@ def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
     if captured is not None:
         return captured
     normalized_shape = _single(normalized_shape)
-    return _C.layer_norm(input, normalized_shape, weight, bias, eps)
+    return _C.native_layer_norm(input, normalized_shape, weight, bias, eps)[0]
 
 def group_norm(input, num_groups, weight=None, bias=None, eps=1e-5):
     captured = _capture_call(group_norm, (input, num_groups, weight, bias, eps), {})
@@ -3381,13 +3381,13 @@ _CPU_FUSED_DTYPES = frozenset(
 
 
 def _plain_scaled_dot_product_attention(query, key, value, is_causal):
-    # The fused entry point takes a square self-attention call with the default
+    # The fused entry point takes a self-attention call with the default
     # normaliser: one head count, one token count, and a head width inside the
     # tiled range.  It is also the entry the matching fused backward hangs off,
     # so a training call routed here keeps the fast backward rather than
-    # falling back to the composed one.  Everything else -- grouped heads, an
-    # explicit normaliser, a context of another length -- goes to the public
-    # call, whose backend hands it to the fused schedule that does model those.
+    # falling back to the composed one.  The token counts may differ -- the
+    # schedule reads them independently, like the reference -- and everything
+    # else (grouped heads, an explicit normaliser) goes to the public call.
     if (
         query.device.type == "cuda"
         and query.dim() == 4
@@ -3398,7 +3398,6 @@ def _plain_scaled_dot_product_attention(query, key, value, is_causal):
         and key.size(-1) == query.size(-1) == value.size(-1)
         and key.size(0) == query.size(0) == value.size(0)
         and key.size(1) == query.size(1) == value.size(1)
-        and key.size(-2) == query.size(-2) == value.size(-2)
     ):
         output, _ = _C._scaled_dot_product_attention_with_lse(
             query, key, value, is_causal=is_causal)

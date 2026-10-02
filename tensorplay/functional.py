@@ -3308,7 +3308,7 @@ def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
             return _captured
     if isinstance(normalized_shape, int) and not isinstance(normalized_shape, bool):
         normalized_shape = [normalized_shape]
-    return _C.layer_norm(input, normalized_shape, weight, bias, eps)
+    return _C.native_layer_norm(input, normalized_shape, weight, bias, eps)[0]
 
 def group_norm(input, num_groups, weight=None, bias=None, eps=1e-5):
     if _capturing():
