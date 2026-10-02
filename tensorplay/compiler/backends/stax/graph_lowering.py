@@ -2059,6 +2059,40 @@ class GraphLowering(Interpreter):
 
         raise AssertionError
 
+    @classmethod
+    def _in_recorded_dtype(cls, val, result):
+        """A node's value in the element type the trace recorded for it.
+
+        The recorded value is what the program computed when it ran, so its
+        element type is the node's.  A lowering works the type out from the
+        operands it was handed, and the operands cannot say that the operation
+        changed the type on its own: a mixed-precision run computes some
+        operations wider than their operand and others narrower, without a
+        conversion appearing in the program.  A value that came out in another
+        type is read as the recorded one here, in the loop that computes it,
+        so every buffer that holds it and every reader of it agree with what
+        the program saw.
+        """
+
+        if isinstance(result, (list, tuple)):
+            if isinstance(val, (list, tuple)) and len(val) == len(result):
+                return type(result)(
+                    [cls._in_recorded_dtype(v, r) for v, r in zip(val, result)]
+                )
+            return result
+        if not isinstance(result, TensorBox) or not _is_tensor(val):
+            return result
+        try:
+            have = result.get_dtype()
+        except NotImplementedError:
+            # A value of several parts has no one type to compare.
+            return result
+        if have == val.dtype:
+            return result
+        from .op_lowerings import to_dtype
+
+        return to_dtype(result, val.dtype)
+
     def call_method(self, target, args, kwargs):
         """What the region means by a method call, as a value the rest can be
         written against.
@@ -2108,6 +2142,7 @@ class GraphLowering(Interpreter):
                 result = self.make_extern(node, args, kwargs)
             else:
                 raise AssertionError
+            result = self._in_recorded_dtype(node.meta.get("val"), result)
 
         result = self._mark_reuse(node, result)
         assign_origin_node(result, node)
@@ -2152,6 +2187,7 @@ class GraphLowering(Interpreter):
                 result = lowering(*args, **kwargs)
             else:
                 result = self.make_extern(node, args, kwargs)
+            result = self._in_recorded_dtype(node.meta.get("val"), result)
 
         result = self._mark_reuse(node, result)
         # Which node of the region this value was made by, so that a report

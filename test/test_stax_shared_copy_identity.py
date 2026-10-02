@@ -60,7 +60,8 @@ def test_layout_copy_rejects_a_recycled_identity(monkeypatch):
 
 
 def test_dtype_copy_rejects_a_recycled_identity(monkeypatch):
-    monkeypatch.setattr(op_lowerings, "pointwise", lambda fn, x: ("cast-of", x))
+    monkeypatch.setattr(
+        op_lowerings, "to_dtype", lambda x, dtype, copy=False: ("cast-of", x))
     monkeypatch.setattr(
         op_lowerings, "_flat_window_name", lambda x: None, raising=False)
     monkeypatch.setattr(op_lowerings, "_underlying", lambda x: x)

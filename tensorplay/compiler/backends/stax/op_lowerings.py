@@ -1221,7 +1221,11 @@ def lower_add(a, b, *rest, **kwargs):
     return pointwise(lambda x, y: ops.add(x, ops.mul(y, ops.constant(float(alpha), tp.float32))), a, b)
 
 
-@register("sub.Tensor", "sub.Scalar")
+@register_lowering(
+    ["sub.Tensor", "sub.Scalar"],
+    broadcast=True,
+    type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
+)
 def lower_sub(a, b, *rest, **kwargs):
     alpha = _alpha((a, b, *rest), kwargs, 2)
     if alpha == 1:
@@ -1229,17 +1233,34 @@ def lower_sub(a, b, *rest, **kwargs):
     return pointwise(lambda x, y: ops.sub(x, ops.mul(y, ops.constant(float(alpha), tp.float32))), a, b)
 
 
-@register("rsub.Scalar", "rsub.Tensor")
+@register_lowering(
+    ["rsub.Scalar", "rsub.Tensor"],
+    broadcast=True,
+    type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
+)
 def lower_rsub(a, b, *rest, **kwargs):
     return pointwise(lambda x, y: ops.sub(y, x), a, b)
 
 
-@register("mul.Tensor", "mul.Scalar")
+# Two operands of different element types are computed in the type both fit
+# in, as the sum above is: read in the first operand's type, a half value times
+# a float one would be laid down as a half and lose what the float carried.
+@register_lowering(
+    ["mul.Tensor", "mul.Scalar"],
+    broadcast=True,
+    type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
+)
 def lower_mul(a, b):
     return pointwise(ops.mul, a, b)
 
 
-@register("div.Tensor", "div.Scalar", "truediv", "truediv.Tensor", "truediv.Scalar")
+# A quotient is a real number whatever it was a quotient of, so whole-number
+# operands are read as real ones before they are divided.
+@register_lowering(
+    ["div.Tensor", "div.Scalar", "truediv", "truediv.Tensor", "truediv.Scalar"],
+    broadcast=True,
+    type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+)
 def lower_div(a, b):
     return pointwise(ops.truediv, a, b)
 
@@ -1417,7 +1438,11 @@ def _shared_copy(x, dtype):
     hit = cache.get(key)
     if hit is not None and hit[0] is node:
         return hit[1]
-    out = pointwise(lambda v: cast_to(v, dtype), x)
+    # The copy is described in the element type that was asked for: described
+    # in the source's, the converted values would be laid down in a buffer of
+    # the old type and every reader would see the type the copy was meant to
+    # leave behind.
+    out = to_dtype(x, dtype, copy=True)
     cache[key] = (node, out)
     return out
 
