@@ -7,7 +7,7 @@ must not hand one value's copy to another value.
 """
 import types
 
-from tensorplay.compiler.backends.stax import ir
+from tensorplay.compiler.backends.stax import ir, op_lowerings
 from tensorplay.compiler.backends.stax.virtualized import V
 
 
@@ -57,3 +57,21 @@ def test_layout_copy_rejects_a_recycled_identity(monkeypatch):
         copy_b = ir.ExternKernel._shared_layout_copy(b, layout_key=key_layout)
         assert copy_a == ("copy-of", a)
         assert copy_b == ("copy-of", b)
+
+
+def test_dtype_copy_rejects_a_recycled_identity(monkeypatch):
+    monkeypatch.setattr(op_lowerings, "pointwise", lambda fn, x: ("cast-of", x))
+    monkeypatch.setattr(
+        op_lowerings, "_flat_window_name", lambda x: None, raising=False)
+    monkeypatch.setattr(op_lowerings, "_underlying", lambda x: x)
+    with V.set_graph_handler(types.SimpleNamespace()):
+        a = _Node([2, 3])
+        b = _Node([2, 3])
+        cast_a = op_lowerings._shared_copy(a, "float32")
+        assert op_lowerings._shared_copy(a, "float32") is cast_a
+        cache = V.graph._shared_copy_cache
+        (key_a,) = list(cache)
+        cache[(id(b),) + key_a[1:]] = cache[key_a]
+        cast_b = op_lowerings._shared_copy(b, "float32")
+        assert cast_a == ("cast-of", a)
+        assert cast_b == ("cast-of", b)

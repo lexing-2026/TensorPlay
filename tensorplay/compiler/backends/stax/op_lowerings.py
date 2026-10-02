@@ -1411,11 +1411,14 @@ def _shared_copy(x, dtype):
     if cache is None:
         cache = {}
         V.graph._shared_copy_cache = cache
+    # The value is named by its node's identity.  The entry keeps the node,
+    # both so the identity cannot be handed to a later node once this one is
+    # collected and so a hit can be checked against the node that is asking.
     hit = cache.get(key)
-    if hit is not None:
-        return hit
+    if hit is not None and hit[0] is node:
+        return hit[1]
     out = pointwise(lambda v: cast_to(v, dtype), x)
-    cache[key] = out
+    cache[key] = (node, out)
     return out
 
 
