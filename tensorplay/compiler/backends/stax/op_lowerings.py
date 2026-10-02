@@ -2357,16 +2357,39 @@ def _lower_gn_bwd_decomp(grad_out, x, mean, rstd, gamma, n, c, hxw, groups,
         c3.realize()
         c2_loader = c2.make_loader()
         c3_loader = c3.make_loader()
-        dx_size, dx_dtype, _ = val_info(vals[0])
+        dx_size, _, _ = val_info(vals[0])
+        # The input gradient is wanted in the input's stored precision: the
+        # framework's backward returns it there, and the downstream gradient
+        # calls expect it in that precision too.  The declared output type of
+        # the native kernel (float) would force a widening cast here that the
+        # framework's own decomposed path does not make.
+        dx_dtype = input.get_dtype()
+
+        dx_rank = len(dx_size)
 
         def dx_inner(index):
-            ch = index[1]
-            ng = [index[0], FloorDiv(as_index(ch), sympy.Integer(cpg))]
+            if dx_rank == 4:
+                n_idx, ch = index[0], index[1]
+                full = list(index)
+            elif dx_rank == 3:
+                n_idx, ch = index[0], index[1]
+                full = [index[0], index[1]] + _unflatten_index(
+                    index[2], spatial
+                )
+            else:
+                flat = as_index(index[0])
+                total = sympy.Integer(c * hxw)
+                n_idx = FloorDiv(flat, total)
+                rem = modular_indexing(flat, 1, total)
+                ch = FloorDiv(rem, sympy.Integer(hxw))
+                s = modular_indexing(rem, 1, sympy.Integer(hxw))
+                full = [n_idx, ch] + _unflatten_index(s, spatial)
+            ng = [n_idx, FloorDiv(as_index(ch), sympy.Integer(cpg))]
             c1 = ops.mul(
                 ops.to_dtype(rstd_loader(ng), f32), gamma_at(ch)
             )
-            dy = ops.to_dtype(dy_loader(index), f32)
-            xv = ops.to_dtype(x_loader(index), f32)
+            dy = ops.to_dtype(dy_loader(full), f32)
+            xv = ops.to_dtype(x_loader(full), f32)
             return ops.add(
                 ops.add(ops.mul(dy, c1), ops.mul(xv, c2_loader(ng))),
                 c3_loader(ng),
