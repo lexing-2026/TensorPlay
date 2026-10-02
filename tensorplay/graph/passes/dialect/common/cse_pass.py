@@ -82,6 +82,29 @@ def _is_mutating_target(node: Node) -> bool:
     return False
 
 
+def _writes_in_place(node: Node, graph_module: GraphModule) -> bool:
+    """Whether a node changes a value that already exists.
+
+    An operation spelled as in-place, one handed somewhere to write its
+    result, one asked to work in place, and a module configured to do so all
+    leave an earlier value holding something else afterwards.
+    """
+
+    if _is_mutating_target(node):
+        return True
+    if node.op not in {"call_function", "call_method", "call_module"}:
+        return False
+    if node.kwargs.get("out") is not None or node.kwargs.get("inplace") is True:
+        return True
+    if node.op == "call_module":
+        try:
+            module = graph_module.get_submodule(node.target)
+        except AttributeError:
+            return False
+        return getattr(module, "inplace", False) is True
+    return False
+
+
 class CSEPass(PassBase):
     """Merge equivalent pure calls while preserving graph connectivity."""
 
@@ -89,6 +112,14 @@ class CSEPass(PassBase):
         self.banned_ops = set() if banned_ops is None else banned_ops
 
     def call(self, graph_module: GraphModule) -> PassResult:
+        # Two calls with the same arguments give the same value only while
+        # nothing writes into a value: merged, a later write to one result
+        # would show through the other, and a write to an argument between
+        # the two calls would be lost.  Telling which values a write reaches
+        # means knowing every view of every value, so a graph that writes in
+        # place anywhere is left as it is.
+        if any(_writes_in_place(node, graph_module) for node in graph_module.graph.nodes):
+            return PassResult(graph_module, False)
         modified = False
         new_graph = Graph()
         env: dict[Node, Node] = {}
