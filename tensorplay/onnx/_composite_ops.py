@@ -1038,7 +1038,13 @@ def _reduced_count(ctx: OpContext, dims: Any) -> int:
 def _variance(ctx: OpContext) -> tuple[str, np.dtype]:
     dims = ctx.get("dim")
     keepdim = bool(ctx.get("keepdim", False))
-    correction = float(ctx.get("correction", 1) or 0)
+    # The divisor is the element count less the correction.  When none is
+    # given it follows ``unbiased``, which itself defaults to one.
+    correction = ctx.get("correction")
+    if correction is None:
+        unbiased = ctx.get("unbiased")
+        correction = 1 if (unbiased is None or unbiased) else 0
+    correction = float(correction)
     dtype = _float_dtype(ctx, ctx.x)
     mean = _reduce(ctx, "ReduceMean", ctx.x, dims, True, axes_input_since=18)
     centered = ctx.op("Sub", [ctx.x, mean])
@@ -1048,13 +1054,13 @@ def _variance(ctx: OpContext) -> tuple[str, np.dtype]:
     return ctx.op("Div", [total, _scalar(ctx, denominator, dtype, "count")]), dtype
 
 
-@register("var", "input correction dim keepdim")
+@register("var", "input dim unbiased keepdim correction")
 def _handle_var(ctx: OpContext) -> str:
     variance, _ = _variance(ctx)
     return variance
 
 
-@register("std", "input correction dim keepdim")
+@register("std", "input dim unbiased keepdim correction")
 def _handle_std(ctx: OpContext) -> str:
     variance, _ = _variance(ctx)
     return ctx.op("Sqrt", [variance])
@@ -1986,6 +1992,57 @@ def _handle_nll_loss(ctx: OpContext) -> str:
         reduction=str(ctx.get("reduction", "mean") or "mean"),
         ignore_index=int(ctx.get("ignore_index", -100)),
     )
+
+
+# ---------------------------------------------------------------------------
+# Random factories
+# ---------------------------------------------------------------------------
+#
+# A factory that draws its values is a call in the model, as it is in the
+# program: every run draws again.  One whose extent is written out takes it as
+# an attribute; one shaped after another value follows that value at run time.
+
+
+def _drawn(ctx: OpContext, op_type: str, **attrs: Any) -> str:
+    if ctx.out_shape is None or ctx.out_dtype is None:
+        raise UnsupportedOperatorError(
+            f"{op_type} needs the extent and element type of what it draws, "
+            "and this call was captured without them"
+        )
+    return ctx.op(
+        op_type,
+        [],
+        dtype=int(_np_dtype_to_onnx(ctx.out_dtype)),
+        shape=[int(extent) for extent in ctx.out_shape],
+        **attrs,
+    )
+
+
+def _drawn_like(ctx: OpContext, op_type: str, **attrs: Any) -> str:
+    dtype = None
+    if ctx.out_dtype is not None:
+        dtype = int(_np_dtype_to_onnx(ctx.out_dtype))
+    return ctx.op(op_type, [ctx.x], dtype=dtype, **attrs)
+
+
+@register("randn", "size", methods=False)
+def _handle_randn(ctx: OpContext) -> str:
+    return _drawn(ctx, "RandomNormal", mean=0.0, scale=1.0)
+
+
+@register("rand", "size", methods=False)
+def _handle_rand(ctx: OpContext) -> str:
+    return _drawn(ctx, "RandomUniform", low=0.0, high=1.0)
+
+
+@register("randn_like", "input dtype device requires_grad", methods=False)
+def _handle_randn_like(ctx: OpContext) -> str:
+    return _drawn_like(ctx, "RandomNormalLike", mean=0.0, scale=1.0)
+
+
+@register("rand_like", "input dtype device requires_grad", methods=False)
+def _handle_rand_like(ctx: OpContext) -> str:
+    return _drawn_like(ctx, "RandomUniformLike", low=0.0, high=1.0)
 
 
 # ---------------------------------------------------------------------------

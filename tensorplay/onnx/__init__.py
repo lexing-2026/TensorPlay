@@ -19,6 +19,7 @@ from typing import Any, Mapping, Sequence
 from onnx import TensorProto, checker, helper, numpy_helper, shape_inference
 
 from ..export import ExportedProgram, export as tp_export
+from ..graph._utils import _iter_nodes
 from . import _external_data, _passes, errors, testing, utils, verification
 from ._composite_ops import (
     GraphBuilder,
@@ -58,6 +59,26 @@ __all__ = [
 
 DEFAULT_OPSET_VERSION = 18
 MIN_OPSET_VERSION = 13
+
+#: Factories whose result is fixed by their arguments alone.  The ones that
+#: leave their contents unset or draw them at random are not among them.
+_SETTLED_FACTORIES = frozenset(
+    {
+        "arange",
+        "eye",
+        "full",
+        "full_like",
+        "linspace",
+        "logspace",
+        "new_full",
+        "new_ones",
+        "new_zeros",
+        "ones",
+        "ones_like",
+        "zeros",
+        "zeros_like",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +265,35 @@ class _Converter:
         self.builder.initializers.append(numpy_helper.from_array(array, name))
         return Value(name, tuple(array.shape), array.dtype)
 
+    def _settled_factory(self, node: Any) -> Any:
+        """The tensor a factory call makes, when its arguments settle it.
+
+        A capture records ``zeros((2,), dtype=int64)`` as a call so each run
+        of the program makes its own tensor.  An exported model holds values,
+        not storage, and a factory whose arguments are all plain values makes
+        the same values every time: those go into the model as an initializer.
+        A factory that draws at random, leaves its contents unset, or takes
+        its extent from the graph is not settled and is lowered as a call.
+        """
+
+        if node.op != "call_function":
+            return None
+        name = getattr(node.target, "__name__", "")
+        if name not in _SETTLED_FACTORIES:
+            return None
+        if any(True for _ in _iter_nodes((node.args, node.kwargs))):
+            return None
+        sample = self.samples.get(node.name)
+        return sample if _is_tensor(sample) else None
+
     def _call(self, node: Any) -> Any:
+        settled = self._settled_factory(node)
+        if settled is not None:
+            name = self.builder.unique(node.name)
+            array = _to_numpy(settled)
+            self.builder.initializers.append(numpy_helper.from_array(array, name))
+            return Value(name, tuple(array.shape), array.dtype)
+
         args = [self._resolve(arg) for arg in node.args]
         kwargs = {key: self._resolve(value) for key, value in node.kwargs.items()}
 

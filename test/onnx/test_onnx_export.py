@@ -269,7 +269,8 @@ class TestActivation:
         assert "Gelu" in _op_types(model)
 
     def test_prelu_with_channel_weight(self):
-        _export_fn(lambda x: F.prelu(x, tp.randn((3,))), tp.randn((2, 3, 4, 4)))
+        weight = tp.randn((3,))
+        _export_fn(lambda x: F.prelu(x, weight), tp.randn((2, 3, 4, 4)))
 
 
 class TestConvolution:
@@ -285,26 +286,24 @@ class TestConvolution:
         assert "Conv" in _op_types(model)
 
     def test_conv1d(self):
-        _export_fn(
-            lambda x: F.conv1d(x, tp.randn((2, 3, 3))), tp.randn((1, 3, 8))
-        )
+        weight = tp.randn((2, 3, 3))
+        _export_fn(lambda x: F.conv1d(x, weight), tp.randn((1, 3, 8)))
 
     def test_conv3d(self):
-        _export_fn(
-            lambda x: F.conv3d(x, tp.randn((2, 3, 3, 3, 3))),
-            tp.randn((1, 3, 4, 4, 4)),
-        )
+        weight = tp.randn((2, 3, 3, 3, 3))
+        _export_fn(lambda x: F.conv3d(x, weight), tp.randn((1, 3, 4, 4, 4)))
 
     def test_conv2d_strided_with_bias(self):
+        weight, bias = tp.randn((2, 3, 3, 3)), tp.randn((2,))
         _export_fn(
-            lambda x: F.conv2d(x, tp.randn((2, 3, 3, 3)), tp.randn((2,)), 2, 1, 1, 1),
+            lambda x: F.conv2d(x, weight, bias, 2, 1, 1, 1),
             tp.randn((2, 3, 8, 8)),
         )
 
     def test_conv_transpose2d(self):
+        weight = tp.randn((3, 2, 3, 3))
         _export_fn(
-            lambda x: F.conv_transpose2d(x, tp.randn((3, 2, 3, 3))),
-            tp.randn((2, 3, 8, 8)),
+            lambda x: F.conv_transpose2d(x, weight), tp.randn((2, 3, 8, 8))
         )
 
 
@@ -355,18 +354,18 @@ class TestNormalization:
         assert "LayerNormalization" in _op_types(model)
 
     def test_layer_norm_affine(self):
+        weight, bias = tp.randn((4,)), tp.randn((4,))
         _export_fn(
-            lambda x: F.layer_norm(x, (4,), tp.randn((4,)), tp.randn((4,))),
-            tp.randn((2, 4)),
+            lambda x: F.layer_norm(x, (4,), weight, bias), tp.randn((2, 4))
         )
 
     def test_group_norm(self):
         _export_fn(lambda x: F.group_norm(x, 3), tp.randn((2, 3, 4, 4)))
 
     def test_group_norm_affine(self):
+        weight, bias = tp.randn((3,)), tp.randn((3,))
         _export_fn(
-            lambda x: F.group_norm(x, 3, tp.randn((3,)), tp.randn((3,))),
-            tp.randn((2, 3, 4, 4)),
+            lambda x: F.group_norm(x, 3, weight, bias), tp.randn((2, 3, 4, 4))
         )
 
     def test_local_response_norm(self):
@@ -390,9 +389,9 @@ class TestNormalization:
 
 class TestEmbedding:
     def test_embedding_functional(self):
+        table = tp.randn((10, 4))
         model = _export_fn(
-            lambda x: F.embedding(x, tp.randn((10, 4))),
-            tp.zeros((2, 3), dtype=tp.int64),
+            lambda x: F.embedding(x, table), tp.zeros((2, 3), dtype=tp.int64)
         )
         assert "Gather" in _op_types(model)
 
@@ -641,6 +640,47 @@ class TestLosses:
         )
         with pytest.raises(UnsupportedOperatorError, match="label_smoothing"):
             onnx_export(program)
+
+
+class TestFactories:
+    def test_a_factory_settled_by_its_arguments_becomes_a_constant(self):
+        model = _export_fn(
+            lambda x: x * tp.full((2, 3), 2.0) + tp.arange(3.0) + tp.ones((3,)),
+            tp.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+        )
+        assert set(_op_types(model)) == {"Mul", "Add"}
+        out = _run_onnx_model(model, [np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], np.float32)])
+        assert out.tolist() == [[3.0, 6.0, 9.0], [9.0, 12.0, 15.0]]
+
+    def test_a_drawing_factory_stays_a_call(self):
+        program = export(
+            _as_module(lambda x: x + tp.randn((2, 3)) * 0.0 + tp.rand(3) * 0.0),
+            tp.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+        )
+        # Each run draws again, so the model cannot be checked against the one
+        # draw the capture happened to make; the draws are scaled away instead.
+        model = onnx_export(program, verify=False)
+        checker.check_model(model)
+        drawn = {node.op_type: node for node in model.graph.node}
+        assert "RandomNormal" in drawn and "RandomUniform" in drawn
+        shapes = {
+            op: list(next(a for a in node.attribute if a.name == "shape").ints)
+            for op, node in drawn.items() if op.startswith("Random")
+        }
+        assert shapes == {"RandomNormal": [2, 3], "RandomUniform": [3]}
+        out = _run_onnx_model(model, [np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], np.float32)])
+        assert out.tolist() == [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+
+    def test_a_drawing_factory_shaped_after_a_value_follows_it(self):
+        program = export(
+            _as_module(lambda x: x + tp.randn_like(x) * 0.0 + tp.rand_like(x) * 0.0),
+            tp.tensor([[1.0, 2.0], [3.0, 4.0]]),
+        )
+        model = onnx_export(program, verify=False)
+        checker.check_model(model)
+        assert {"RandomNormalLike", "RandomUniformLike"} <= set(_op_types(model))
+        out = _run_onnx_model(model, [np.array([[1.0, 2.0], [3.0, 4.0]], np.float32)])
+        assert out.tolist() == [[1.0, 2.0], [3.0, 4.0]]
 
 
 class TestModels:
