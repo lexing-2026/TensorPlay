@@ -2185,10 +2185,206 @@ def _lower_gn_bwd_template(grad_out, x, mean, rstd, gamma, n, c, hxw, groups, ou
     return (node, dgamma0, dbeta0)
 
 
+def _lower_gn_bwd_decomp(grad_out, x, mean, rstd, gamma, n, c, hxw, groups,
+                         output_mask):
+    """The group-norm backward written as reduction and pointwise passes.
+
+    The native kernel is a single launch, but it is also a wall the scheduler
+    cannot fuse through: the gradient of the surrounding silu, the half to
+    float widening, and the weight gradients all stay separate calls.  This
+    path re-expresses the backward as the same reductions and pointwise passes
+    the scheduler already knows, so the input gradient can be produced in whatever
+    dtype the graph asks for and fused with its neighbours.
+    """
+
+    if len(x.get_size()) not in (3, 4):
+        return None
+    if is_dynamic(*x.get_size(), *grad_out.get_size(), *mean.get_size(),
+                  *rstd.get_size()):
+        return None
+    vals = node_val()
+    cpg = c // groups
+    device = grad_out.get_device()
+    rank = len(x.get_size())
+    spatial = list(x.get_size()[2:])
+    dy_loader = grad_out.make_loader()
+    x_loader = x.make_loader()
+    mean_loader = mean.make_loader()
+    rstd_loader = rstd.make_loader()
+    gamma_loader = gamma.make_loader() if is_tensor_box(gamma) else None
+    f32 = tp.float32
+
+    def full_index(index, rindex):
+        s = rindex[0]
+        return [index[0], index[1]] + _unflatten_index(s, spatial)
+
+    def ds_inner(index, rindex):
+        full = full_index(index, rindex)
+        return ops.mul(
+            ops.to_dtype(dy_loader(full), f32),
+            ops.to_dtype(x_loader(full), f32),
+        )
+
+    def db_inner(index, rindex):
+        return ops.to_dtype(dy_loader(full_index(index, rindex)), f32)
+
+    ds = Reduction.create(
+        device=device,
+        dst_dtype=f32,
+        src_dtype=f32,
+        inner_fn=ds_inner,
+        ranges=(n, c),
+        reduction_ranges=(hxw,),
+        reduction_type="sum",
+    )
+    db = Reduction.create(
+        device=device,
+        dst_dtype=f32,
+        src_dtype=f32,
+        inner_fn=db_inner,
+        ranges=(n, c),
+        reduction_ranges=(hxw,),
+        reduction_type="sum",
+    )
+    ds.realize()
+    db.realize()
+    ds_loader = ds.make_loader()
+    db_loader = db.make_loader()
+
+    def gamma_at(ch):
+        if gamma_loader is not None:
+            return ops.to_dtype(gamma_loader([ch]), f32)
+        return ops.constant(1.0, f32)
+
+    results = [None, None, None]
+    s = 1.0 / (hxw * cpg)
+    if output_mask[0]:
+        def dsv_inner(index, rindex):
+            ch = index[1] * cpg + rindex[0]
+            return ops.mul(ds_loader([index[0], ch]), gamma_at(ch))
+
+        def dbv_inner(index, rindex):
+            ch = index[1] * cpg + rindex[0]
+            return ops.mul(db_loader([index[0], ch]), gamma_at(ch))
+
+        ds_val = Reduction.create(
+            device=device,
+            dst_dtype=f32,
+            src_dtype=f32,
+            inner_fn=dsv_inner,
+            ranges=(n, groups),
+            reduction_ranges=(cpg,),
+            reduction_type="sum",
+        )
+        db_val = Reduction.create(
+            device=device,
+            dst_dtype=f32,
+            src_dtype=f32,
+            inner_fn=dbv_inner,
+            ranges=(n, groups),
+            reduction_ranges=(cpg,),
+            reduction_type="sum",
+        )
+        ds_val.realize()
+        db_val.realize()
+        dsv = ds_val.make_loader()
+        dbv = db_val.make_loader()
+
+        def c2_at(ng):
+            r = ops.to_dtype(rstd_loader(ng), f32)
+            m = ops.to_dtype(mean_loader(ng), f32)
+            num = ops.sub(ops.mul(dbv(ng), m), dsv(ng))
+            return ops.mul(
+                ops.mul(ops.mul(ops.mul(num, r), r), r), ops.constant(s, f32)
+            )
+
+        def c3_at(ng):
+            r = ops.to_dtype(rstd_loader(ng), f32)
+            m = ops.to_dtype(mean_loader(ng), f32)
+            left = ops.mul(ops.neg(c2_at(ng)), m)
+            right = ops.mul(ops.mul(dbv(ng), r), ops.constant(s, f32))
+            return ops.sub(left, right)
+
+        c2 = Pointwise.create(
+            device=device, dtype=f32, inner_fn=c2_at, ranges=(n, groups)
+        )
+        c3 = Pointwise.create(
+            device=device, dtype=f32, inner_fn=c3_at, ranges=(n, groups)
+        )
+        c2.realize()
+        c3.realize()
+        c2_loader = c2.make_loader()
+        c3_loader = c3.make_loader()
+        dx_size, dx_dtype, _ = val_info(vals[0])
+
+        def dx_inner(index):
+            ch = index[1]
+            ng = [index[0], FloorDiv(as_index(ch), sympy.Integer(cpg))]
+            c1 = ops.mul(
+                ops.to_dtype(rstd_loader(ng), f32), gamma_at(ch)
+            )
+            dy = ops.to_dtype(dy_loader(index), f32)
+            xv = ops.to_dtype(x_loader(index), f32)
+            return ops.add(
+                ops.add(ops.mul(dy, c1), ops.mul(xv, c2_loader(ng))),
+                c3_loader(ng),
+            )
+
+        results[0] = Pointwise.create(
+            device=device, dtype=dx_dtype, inner_fn=dx_inner, ranges=dx_size
+        )
+    if output_mask[1]:
+        dg_size, dg_dtype, _ = val_info(vals[1])
+
+        def dgamma_inner(index, rindex):
+            ch = index[0]
+            ng = [rindex[0], FloorDiv(as_index(ch), sympy.Integer(cpg))]
+            m = ops.to_dtype(mean_loader(ng), f32)
+            r = ops.to_dtype(rstd_loader(ng), f32)
+            nc = [rindex[0], ch]
+            return ops.mul(
+                ops.sub(ds_loader(nc), ops.mul(db_loader(nc), m)), r
+            )
+
+        results[1] = Reduction.create(
+            device=device,
+            dst_dtype=dg_dtype,
+            src_dtype=f32,
+            inner_fn=dgamma_inner,
+            ranges=(c,),
+            reduction_ranges=(n,),
+            reduction_type="sum",
+        )
+        results[1].realize()
+    if output_mask[2]:
+        db_size, db_dtype, _ = val_info(vals[2])
+
+        def dbeta_inner(index, rindex):
+            return db_loader([rindex[0], index[0]])
+
+        results[2] = Reduction.create(
+            device=device,
+            dst_dtype=db_dtype,
+            src_dtype=f32,
+            inner_fn=dbeta_inner,
+            ranges=(c,),
+            reduction_ranges=(n,),
+            reduction_type="sum",
+        )
+        results[2].realize()
+    return tuple(results)
+
+
 @register("native_group_norm_backward.default")
 def lower_native_group_norm_backward(grad_out, x, mean, rstd, gamma, n, c, hxw, groups, output_mask):
     if config.use_gn_bwd_template:
         lowered = _lower_gn_bwd_template(
+            grad_out, x, mean, rstd, gamma, n, c, hxw, groups, output_mask
+        )
+        if lowered is not None:
+            return lowered
+    if config.use_gn_bwd_decomp:
+        lowered = _lower_gn_bwd_decomp(
             grad_out, x, mean, rstd, gamma, n, c, hxw, groups, output_mask
         )
         if lowered is not None:

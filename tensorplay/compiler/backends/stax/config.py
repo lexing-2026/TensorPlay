@@ -441,6 +441,13 @@ max_autotune_gemm = os.environ.get("TP_MAX_AUTOTUNE_GEMM", "0") == "1"
 # the compiler emit one persistent kernel for the backward pass.
 use_gn_bwd_template = os.environ.get("TP_USE_GN_BWD_TEMPLATE", "0") == "1"
 
+# Whether the group-norm backward call is decomposed into reduction and
+# pointwise passes that the scheduler can fuse with their neighbours, instead
+# of being handed to the framework's native kernel.  On by default: the
+# decomposed path measures faster than the native kernel on whole models and
+# lets the scheduler fuse the surrounding silu and dtype conversions.
+use_gn_bwd_decomp = os.environ.get("TP_USE_GN_BWD_DECOMP", "1") == "1"
+
 # How wide the search for attention tiles is when everything is being measured.
 # Two answers rather than a number, because the two are not more and fewer: the
 # default offers the handful of tilings worth offering, and the exhaustive one
