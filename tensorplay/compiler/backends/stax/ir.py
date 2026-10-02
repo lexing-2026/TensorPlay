@@ -6439,7 +6439,7 @@ class ExternKernel(InputsKernel):
         return pw
 
     @classmethod
-    def process_kernel(cls, kernel, *args, **kwargs) -> ProcessKernelResult:
+    def process_kernel(cls, kernel, *args, _share_args: bool | None = None, **kwargs) -> ProcessKernelResult:
         """The arguments of a call, sorted, and what the call would produce.
 
         Three things happen, and all three are needed before the call can be
@@ -6455,6 +6455,13 @@ class ExternKernel(InputsKernel):
         The flat lists keep the order the call takes its arguments in, and the
         unflattening is what puts the original tree back together, since an
         argument may itself be a list of arguments.
+
+        A value that is not yet in memory is given a buffer by way of a copy;
+        when the call reads that value and nothing writes it, readers that ask
+        for the same value can read one shared copy instead of each building
+        their own.  ``_share_args`` says which: True when the caller knows the
+        call only reads, False when it writes, and None to take the answer
+        from the operation's own signature.
         """
 
         from tensorplay.utils import _pytree as pytree
@@ -6493,7 +6500,15 @@ class ExternKernel(InputsKernel):
             restored = pytree.tree_unflatten(result, args_spec)
             return restored.get("args", []), restored.get("kwargs", {})
 
-        tensor_args = [cls.realize_input(x) for x in tensor_args]
+        share_inputs = _share_args
+        if share_inputs is None:
+            schema = getattr(kernel, "_schema", None)
+            share_inputs = (
+                schema is not None
+                and not schema.is_mutable
+                and not _schema_mutates_and_returns_first_arg(schema)
+            )
+        tensor_args = [cls.realize_input(x, allow_shared=bool(share_inputs)) for x in tensor_args]
 
         # The layout is frozen here so that working out the result's strides
         # cannot be moved by a later change to it.
@@ -10810,7 +10825,7 @@ class _CollectiveKernel(FallbackKernel):
         anything else from being placed in between.
         """
 
-        result = cls.process_kernel(kernel, inputs, *args, **kwargs)
+        result = cls.process_kernel(kernel, inputs, *args, **kwargs, _share_args=False)
         tensor_args = result.tensor_args
         non_tensor_args = result.non_tensor_args
         unflatten_args = result.unflatten_args
@@ -10862,7 +10877,7 @@ class _CollectiveKernel(FallbackKernel):
         wait report them as written, so that nothing can be placed in between.
         """
 
-        result = cls.process_kernel(kernel, inputs, *args, **kwargs)
+        result = cls.process_kernel(kernel, inputs, *args, **kwargs, _share_args=True)
         example_output = result.example_output
         tensor_args = result.tensor_args
         non_tensor_args = result.non_tensor_args
@@ -11070,7 +11085,7 @@ class _WaitKernel(_CollectiveKernel):
 
     @classmethod
     def create_wait(cls, kernel, inp) -> None:
-        result = cls.process_kernel(kernel, inp)
+        result = cls.process_kernel(kernel, inp, _share_args=True)
         if result.unbacked_bindings:
             raise AssertionError(f"{kernel} {result.unbacked_bindings}")
         inps = _pytree.tree_leaves(inp)
