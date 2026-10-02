@@ -304,7 +304,7 @@ def test_graph_signature_replace_all_uses_and_str():
 
 def test_run_decompositions_rewrites_and_preserves_numerics():
     def fn(t):
-        return tp.nn.functional.silu(t) * 2
+        return tp.nn.functional.softplus(t) * 2
 
     program = tp_export.export(fn, tp.randn(3))
     decomposed = program.run_decompositions()
@@ -313,7 +313,7 @@ def test_run_decompositions_rewrites_and_preserves_numerics():
         for node in decomposed.graph.nodes
         if node.op in ("call_function", "call_method")
     ]
-    assert "silu" not in body
+    assert "softplus" not in body
     x = tp.randn(5)
     expected = fn(x).tolist()
     actual = decomposed.module()(x).tolist()
@@ -833,3 +833,19 @@ def test_update_tensor_list_mutable_validates_declared_list():
     update_tensor_list_mutable(program)
     with pytest.raises(ValueError, match="mutable_from_list"):
         update_tensor_list_mutable(program, [tp.randn(3)])
+
+
+def test_export_keeps_a_tensor_the_function_closed_over():
+    scale = tp.tensor([2.0, 3.0, 4.0])
+
+    class Scaled(tp.nn.Module):
+        def forward(self, x):
+            return x * scale + 1.0
+
+    program = tp_export.export(Scaled(), tp.tensor([[1.0, 2.0, 3.0]]))
+    held = [n.target for n in program.graph_module.graph.nodes if n.op == "get_attr"]
+    assert len(held) == 1
+    # The tensor is not an attribute of the model; the program carries it.
+    assert program.graph_module._graph_attrs[held[0]] is scale
+    out = program.module()(tp.tensor([[1.0, 1.0, 1.0], [0.0, 2.0, -1.0]]))
+    assert out.tolist() == [[3.0, 4.0, 5.0], [1.0, 7.0, -3.0]]

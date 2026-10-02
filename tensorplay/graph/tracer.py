@@ -281,13 +281,17 @@ class Tracer:
             raise TypeError(f"sample execution unsupported for node kind {node.op!r}")
 
         try:
+            sample_token = _utils._executing_sample.set(True)
             try:
-                from tensorplay.autograd.grad_mode import no_grad
-            except ImportError:
-                value = _run()
-            else:
-                with no_grad():
+                try:
+                    from tensorplay.autograd.grad_mode import no_grad
+                except ImportError:
                     value = _run()
+                else:
+                    with no_grad():
+                        value = _run()
+            finally:
+                _utils._executing_sample.reset(sample_token)
         except Exception:
             # Advisory: an op that fails eagerly simply stays symbolic.
             if _os.environ.get("TP_DEBUG_SAMPLE"):
@@ -378,7 +382,28 @@ class Tracer:
         # rather than about the region.
         if self.execute and kind != "placeholder" and not _is_higher_order(target):
             self._execute_node(proxy.node)
+        elif self._makes_a_settled_tensor(proxy.node):
+            # Nothing symbolic goes into this call, so what it makes is known
+            # now whether or not this tracer runs the rest of the program.  An
+            # operator that needs a real value to trace its body with -- the
+            # start of a scan, say -- can then be given one.
+            self._execute_node(proxy.node)
         return proxy
+
+    @staticmethod
+    def _makes_a_settled_tensor(node: Node) -> bool:
+        """Whether ``node`` is a factory call fixed by its arguments alone.
+
+        Only the allocating factories count.  One that draws at random is left
+        without a sample: running it here would take a draw the program never
+        asked for and shift every draw after it.
+        """
+
+        if node.op != "call_function":
+            return False
+        if getattr(node.target, "__name__", "") not in _utils._FACTORY_NAMES:
+            return False
+        return not any(True for _ in _utils._iter_nodes((node.args, node.kwargs)))
 
     def proxy(self, node: Node) -> Proxy:
         """Create the proxy object associated with an existing node."""

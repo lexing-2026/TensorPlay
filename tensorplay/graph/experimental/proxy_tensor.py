@@ -347,6 +347,25 @@ class PythonKeyTracer(Tracer):
         self.track(tensor, node)
         return node
 
+    def create_arg(self, value: Any) -> Any:
+        """An argument of a node being made, with a value a node already
+        stands for replaced by that node.
+
+        An operator that takes a whole body -- a scan, a branch -- is put in
+        the graph by naming it and its arguments, and the arguments are the
+        values the body was running on.  A value that came in through a
+        placeholder, or that an earlier operation made, is that node's value:
+        naming it as a fresh constant would write the example it happened to
+        hold into the graph, and the graph would no longer depend on its
+        input.  Only a value no node accounts for is held as a constant.
+        """
+
+        if _is_tensor(value):
+            entry = self.tensor_tracker.get(value._impl_id)
+            if entry is not None:
+                return entry if isinstance(entry, Node) else entry.node
+        return super().create_arg(value)
+
     def map_value(self, value: Any) -> Any:
         """The node for a value, or the value itself where it is not a tensor."""
 
@@ -655,22 +674,29 @@ def get_dispatch_modes() -> list[ProxyMode]:
 
 @contextmanager
 def disable_proxy_modes_tracing() -> Generator[ProxyMode | None, None, None]:
-    # Two stacks answer "is something being recorded right now", and a call that
-    # must not be recorded has to be off both of them.  The proxy state is the
-    # one an operator consults directly; the dispatch stack is the one every
+    # Three things answer "is something being recorded right now", and a call
+    # that must not be recorded has to be off all of them.  The proxy state is
+    # the one an operator consults directly; the dispatch stack is the one every
     # operator is routed through, and the mode that would record it sits on top
     # of that.  Clearing only the first leaves the recording mode in place, and
     # the call it makes is recorded as though it were part of the region -- which
     # for an operator whose own body is the region means it records itself, and
     # the region never gets recorded at all.
+    #
+    # The third is the tracer a factory records itself on when no argument of
+    # its own names one.  Left in place, a tensor made here only to stand for a
+    # shape would come back as a node of the region instead of as a tensor.
+    from tensorplay.graph._utils import _active_tracer
     from tensorplay.utils._dispatch import _disable_current_modes
 
     previous = _CURRENT_MODE.get()
     token = _CURRENT_MODE.set(None)
+    tracer_token = _active_tracer.set(None)
     try:
         with _disable_current_modes():
             yield previous
     finally:
+        _active_tracer.reset(tracer_token)
         _CURRENT_MODE.reset(token)
 
 

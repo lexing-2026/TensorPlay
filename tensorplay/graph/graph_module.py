@@ -1020,6 +1020,9 @@ class GraphModule:
             table = self.__dict__.get(table_name, {})
             if name in table:
                 return table[name]
+        graph_attrs = self.__dict__.get("_graph_attrs")
+        if graph_attrs is not None and name in graph_attrs:
+            return graph_attrs[name]
         root = self.__dict__.get("_root", _MISSING)
         if root is not _MISSING and root is not None:
             try:

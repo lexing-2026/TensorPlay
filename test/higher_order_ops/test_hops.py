@@ -261,6 +261,20 @@ def test_scan_trace_records_single_node():
     targets = [n.target.__name__ if hasattr(n.target, "__name__") else str(n.target)
                for n in gm.graph.nodes if n.op == "call_function"]
     assert any("scan" in name for name in targets), targets
+    # The node reads the graph's own input and the start value made in the
+    # body, not the example the capture happened to be given: running prefix
+    # sums of whatever is passed in.
+    assert [n.target for n in gm.graph.nodes if n.op == "get_attr"] == []
+    assert gm(tp.tensor([1.0, 2.0, 3.0, 4.0])).tolist() == [[1.0], [3.0], [6.0], [10.0]]
+
+
+def test_scan_trace_follows_every_input():
+    def f(xs, init):
+        return scan(lambda c, x: (c + x, (c + x).clone()), init, xs)[1]
+
+    gm = make_fx(f)(tp.arange(4.0), tp.zeros(1))
+    out = gm(tp.tensor([1.0, 2.0, 3.0, 4.0]), tp.tensor([10.0]))
+    assert out.tolist() == [[11.0], [13.0], [16.0], [20.0]]
 
 
 # ---------------------------------------------------------------------------

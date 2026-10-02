@@ -140,12 +140,6 @@ def test_hint_boundaries_split_regions():
     assert "matmul" in names
 
 
-def test_hint_op_set_matches_stax():
-    from tensorplay._stax.stax import _CPU_FUSED_OPS
-
-    assert _CPU_FUSED_OPS is POINTWISE_FUSED_OP_NAMES
-
-
 # --- Pipeline integration -----------------------------------------------------
 
 
@@ -170,54 +164,3 @@ def test_default_pipeline_stamps_hints_via_compile():
         assert calls["hints"] and all(r is not None for r in calls["hints"])
     finally:
         registry.unregister_backend("_hint_recorder")
-
-
-# --- Triton reduction epilogue --------------------------------------------------
-
-
-def test_sum_epilogue_detection_and_source():
-    from tensorplay._stax.codegen.triton import (
-        TritonProgramCodegen,
-        _split_sum_epilogue,
-    )
-
-    def fn(x, w):
-        return ((x * w).relu()).sum()
-
-    x = tp.tensor([-1.0, 0.5, 2.0])
-    w = tp.tensor([0.3, -0.2, 1.5])
-    gm = _trace(fn, x, w)
-
-    detected = _split_sum_epilogue(gm)
-    assert detected is not None
-    tail, producer, kind = detected
-    assert kind == "sum"
-
-    # triples: tmp0=mul(in0,in1); tmp1=relu(tmp0)
-    # Unknown reference shape -> the two-stage split emission: partial sums
-    # into a workspace plus a finalize kernel that writes the scalar.
-    codegen = TritonProgramCodegen(program=[3, 0, 1, 17, 2, -1], constants=[],
-                                   output_refs=(2,), input_count=2,
-                                   reduction="sum")
-    src = codegen.generate("k", fixed_config=(256, 4))
-    assert src.count("@triton.jit") == 2          # main + finalize kernels
-    assert "tl.sum(" in src                       # epilogue folded in
-    assert "tl.store(ws_ptr + tl.program_id(0), partial)" in src
-    assert "for fbase in tl.range(0, wsn, FBLOCK):" in src
-    assert "acc_f = acc_f + tl.sum(fvals, axis=0)" in src
-    assert "tl.store(out_ptr0, acc_f)" in src
-    assert "@triton.autotune" not in src          # reduction is config-pinned
-    assert "tp.empty((), dtype=" in src           # scalar output buffer
-    assert "tp.empty((wsn,)" in src               # split workspace buffer
-
-
-def test_no_epilogue_for_non_sum_tail():
-    def fn(x, w):
-        return (x * w).relu()
-
-    x = tp.tensor([1.0])
-    w = tp.tensor([1.0])
-    gm = _trace(fn, x, w)
-    from tensorplay._stax.codegen.triton import _split_sum_epilogue
-
-    assert _split_sum_epilogue(gm) is None

@@ -302,12 +302,12 @@ class _Namespace:
         assert match is not None
         base, suffix = match.groups()
         # Collisions number from zero (add, add_0, add_1, ...), whether the
-        # candidate arrives with or without a numeric suffix.  Only keywords
-        # are guarded: assigning to them is a syntax error in generated code.
-        # Builtin spellings (sum, abs, ...) are safe as node names because
-        # generated code invokes targets through resolved identifiers, never
-        # by node name.
-        if candidate in keyword.kwlist:
+        # candidate arrives with or without a numeric suffix.  Keywords are
+        # guarded because assigning to them is a syntax error in generated
+        # code, and builtin spellings are guarded too where generated source
+        # calls the builtin by name (getattr, ...) rather than through a
+        # resolved identifier.
+        if candidate in keyword.kwlist or candidate in _illegal_names:
             number = 0 if suffix is None else int(suffix) + 1
             candidate = f"{base}_{number}"
         number = int(suffix) if suffix is not None else None
@@ -1670,6 +1670,8 @@ class Graph:
         }
 
         def materialize(value: Any) -> Any:
+            from tensorplay.graph.experimental.sympy_functions import IntInfinity
+
             if isinstance(value, Node):
                 return value
             if isinstance(value, bool):
@@ -1687,6 +1689,8 @@ class Graph:
             elif isinstance(expression, sympy.Integer):
                 result = int(expression)
             elif isinstance(expression, sympy.Float):
+                result = float(expression)
+            elif isinstance(expression, IntInfinity):
                 result = float(expression)
             elif isinstance(expression, sympy.Rational):
                 result = int(expression) if expression.q == 1 else float(expression)

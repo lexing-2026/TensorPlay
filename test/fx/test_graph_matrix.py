@@ -77,7 +77,7 @@ class TestNodeTopology:
             mid = g.call_function(operator.abs, (x,))
         first.args = (mid,)
         order = [n.name for n in g.nodes]
-        assert order.index("abs") < order.index("neg")
+        assert order.index("abs_0") < order.index("neg")
         g.lint()
 
     def test_all_input_nodes_and_users_consistency(self):
@@ -110,7 +110,7 @@ class TestNodeTopology:
         a.replace_all_uses_with(b)
         assert out.args == (b,)
         assert g.eliminate_dead_code() == 1
-        assert [n.name for n in g.nodes] == ["x", "abs", "output"]
+        assert [n.name for n in g.nodes] == ["x", "abs_0", "output"]
 
     def test_erase_node_fails_while_used(self):
         g = Graph()

@@ -80,7 +80,7 @@ def test_pass_manager_runs_to_fixpoint_and_is_idempotent():
     pm = PassManager([DeadCodeElimination(), ConstFold()])
     first = pm(gm)
     assert first.modified is True
-    assert [n.name for n in gm.graph.nodes] == ["x", "abs", "output"]
+    assert [n.name for n in gm.graph.nodes] == ["x", "abs_0", "output"]
 
     second = pm(gm)
     assert second.modified is False

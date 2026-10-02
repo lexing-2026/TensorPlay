@@ -240,7 +240,12 @@ def _validate_graph(graph_module: GraphModule, attributes: Mapping[str, Any]) ->
     for node in graph_module.graph.nodes:
         op = node.op
         if op == "get_attr":
-            if node.target not in attributes:
+            # A tensor the function closed over is not an attribute of the
+            # model; the capture holds it itself, under a name of its own.
+            if (
+                node.target not in attributes
+                and node.target not in graph_module._graph_attrs
+            ):
                 raise GraphCaptureError(
                     f"get_attr target {node.target!r} is not present on the captured model"
                 )

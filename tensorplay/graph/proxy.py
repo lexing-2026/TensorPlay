@@ -440,10 +440,12 @@ class Proxy:
         """Example value bound to this node, if the tracer got one.
 
         Execute-mode tracers propagate samples through every recorded node;
-        symbolic tracers only know placeholder inputs.
+        symbolic tracers only know placeholder inputs.  A tracer that records
+        no samples at all (a light body tracer) reports none.
         """
 
-        sample = self.tracer._node_samples.get(self.node.name)
+        samples = getattr(self.tracer, "_node_samples", None)
+        sample = samples.get(self.node.name) if samples is not None else None
         if sample is None and self.node.op == "placeholder":
             return self.tracer._samples.get(self.node.name)
         return sample
@@ -745,7 +747,8 @@ class Proxy:
     def sample(self) -> Any:
         """Concrete trace-time value behind this node, or None."""
 
-        return self.tracer._node_samples.get(self.node.name)
+        samples = getattr(self.tracer, "_node_samples", None)
+        return samples.get(self.node.name) if samples is not None else None
 
     @property
     def is_symbolic_gate(self) -> bool:
