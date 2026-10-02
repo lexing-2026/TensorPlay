@@ -4,6 +4,7 @@
 #include "Exception.h"
 #include "Parallel.h"
 #include "NormRowHelpers.h"
+#include "MemoryFormat.h"
 
 namespace tensorplay {
 namespace cpu {
@@ -75,6 +76,295 @@ std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cpu(
 namespace tensorplay {
 namespace cpu {
 
+// ---------------------------------------------------------------------------
+// Group norm over channels-last storage.
+//
+// A channels-last activation stores the C channels of one position next to
+// each other, so a group's values are interleaved with the other groups'.
+// Rather than repacking the activation into planes, the kernels below walk a
+// sample position by position: per-channel accumulators (C wide, contiguous)
+// collect the moments, the groups are folded out of them, and a second walk
+// applies per-channel coefficient arrays.  Both walks vectorize across the
+// channel axis, and the result is written channels-last.  Samples are shared
+// over the intra-op pool; one sample is small enough that its second walk
+// reads what the first left in cache.
+// ---------------------------------------------------------------------------
+namespace {
+
+#if defined(__GNUC__) || defined(__clang__)
+#define TP_GN_BODY static inline __attribute__((always_inline))
+#else
+#define TP_GN_BODY static inline
+#endif
+
+// Per-channel sum and sum of squares over the S positions of one sample.
+TP_GN_BODY void gn_nhwc_moments_body(const float* x, int64_t S, int64_t C,
+                                     float* sum, float* sq) {
+    for (int64_t c = 0; c < C; ++c) { sum[c] = 0.0f; sq[c] = 0.0f; }
+    for (int64_t s = 0; s < S; ++s) {
+        const float* xs = x + s * C;
+        for (int64_t c = 0; c < C; ++c) {
+            const float v = xs[c];
+            sum[c] += v;
+            sq[c] += v * v;
+        }
+    }
+}
+
+// y = (x - mean_c) * scale_c + shift_c
+TP_GN_BODY void gn_nhwc_apply_body(const float* x, float* y, int64_t S,
+                                   int64_t C, const float* mean_c,
+                                   const float* scale_c, const float* shift_c) {
+    for (int64_t s = 0; s < S; ++s) {
+        const float* xs = x + s * C;
+        float* ys = y + s * C;
+        for (int64_t c = 0; c < C; ++c) {
+            ys[c] = (xs[c] - mean_c[c]) * scale_c[c] + shift_c[c];
+        }
+    }
+}
+
+// Per-channel sum(dy) and sum(dy * x), accumulated in double.
+TP_GN_BODY void gn_nhwc_bwd_sums_body(const float* dy, const float* x,
+                                      int64_t S, int64_t C, double* sd,
+                                      double* dot) {
+    for (int64_t c = 0; c < C; ++c) { sd[c] = 0.0; dot[c] = 0.0; }
+    for (int64_t s = 0; s < S; ++s) {
+        const float* ds = dy + s * C;
+        const float* xs = x + s * C;
+        for (int64_t c = 0; c < C; ++c) {
+            const double y = static_cast<double>(ds[c]);
+            sd[c] += y;
+            dot[c] += y * static_cast<double>(xs[c]);
+        }
+    }
+}
+
+// gi = term1_c * (M * (dy * w_c) - sdy_c - ((x - mean_c) * inv_c) * sxh_c)
+TP_GN_BODY void gn_nhwc_bwd_apply_body(const float* dy, const float* x,
+                                       float* gi, int64_t S, int64_t C,
+                                       const float* w_c, const float* mean_c,
+                                       const float* inv_c, const float* term1_c,
+                                       const float* sdy_c, const float* sxh_c,
+                                       float M) {
+    for (int64_t s = 0; s < S; ++s) {
+        const float* ds = dy + s * C;
+        const float* xs = x + s * C;
+        float* gs = gi + s * C;
+        for (int64_t c = 0; c < C; ++c) {
+            const float dyw = ds[c] * w_c[c];
+            const float x_hat = (xs[c] - mean_c[c]) * inv_c[c];
+            gs[c] = term1_c[c] * (M * dyw - sdy_c[c] - x_hat * sxh_c[c]);
+        }
+    }
+}
+
+// Each walk exists once for the base instruction set and once for AVX2+FMA;
+// the wider one is reached only after the running CPU reported both.
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#define TP_GN_WIDE __attribute__((target("avx2,fma")))
+TP_GN_WIDE void gn_nhwc_moments_wide(const float* x, int64_t S, int64_t C,
+                                     float* sum, float* sq) {
+    gn_nhwc_moments_body(x, S, C, sum, sq);
+}
+TP_GN_WIDE void gn_nhwc_apply_wide(const float* x, float* y, int64_t S,
+                                   int64_t C, const float* mean_c,
+                                   const float* scale_c, const float* shift_c) {
+    gn_nhwc_apply_body(x, y, S, C, mean_c, scale_c, shift_c);
+}
+TP_GN_WIDE void gn_nhwc_bwd_sums_wide(const float* dy, const float* x, int64_t S,
+                                      int64_t C, double* sd, double* dot) {
+    gn_nhwc_bwd_sums_body(dy, x, S, C, sd, dot);
+}
+TP_GN_WIDE void gn_nhwc_bwd_apply_wide(const float* dy, const float* x, float* gi,
+                                       int64_t S, int64_t C, const float* w_c,
+                                       const float* mean_c, const float* inv_c,
+                                       const float* term1_c, const float* sdy_c,
+                                       const float* sxh_c, float M) {
+    gn_nhwc_bwd_apply_body(dy, x, gi, S, C, w_c, mean_c, inv_c, term1_c, sdy_c,
+                           sxh_c, M);
+}
+bool gn_nhwc_wide_ok() {
+    static const bool ok =
+        __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+    return ok;
+}
+#else
+bool gn_nhwc_wide_ok() { return false; }
+#endif
+
+void gn_nhwc_moments(const float* x, int64_t S, int64_t C, float* sum, float* sq) {
+#ifdef TP_GN_WIDE
+    if (gn_nhwc_wide_ok()) return gn_nhwc_moments_wide(x, S, C, sum, sq);
+#endif
+    gn_nhwc_moments_body(x, S, C, sum, sq);
+}
+void gn_nhwc_apply(const float* x, float* y, int64_t S, int64_t C,
+                   const float* mean_c, const float* scale_c,
+                   const float* shift_c) {
+#ifdef TP_GN_WIDE
+    if (gn_nhwc_wide_ok()) return gn_nhwc_apply_wide(x, y, S, C, mean_c, scale_c, shift_c);
+#endif
+    gn_nhwc_apply_body(x, y, S, C, mean_c, scale_c, shift_c);
+}
+void gn_nhwc_bwd_sums(const float* dy, const float* x, int64_t S, int64_t C,
+                      double* sd, double* dot) {
+#ifdef TP_GN_WIDE
+    if (gn_nhwc_wide_ok()) return gn_nhwc_bwd_sums_wide(dy, x, S, C, sd, dot);
+#endif
+    gn_nhwc_bwd_sums_body(dy, x, S, C, sd, dot);
+}
+void gn_nhwc_bwd_apply(const float* dy, const float* x, float* gi, int64_t S,
+                       int64_t C, const float* w_c, const float* mean_c,
+                       const float* inv_c, const float* term1_c,
+                       const float* sdy_c, const float* sxh_c, float M) {
+#ifdef TP_GN_WIDE
+    if (gn_nhwc_wide_ok()) {
+        return gn_nhwc_bwd_apply_wide(dy, x, gi, S, C, w_c, mean_c, inv_c,
+                                      term1_c, sdy_c, sxh_c, M);
+    }
+#endif
+    gn_nhwc_bwd_apply_body(dy, x, gi, S, C, w_c, mean_c, inv_c, term1_c, sdy_c,
+                           sxh_c, M);
+}
+
+// The channels-last walk shares samples over the pool, so it is taken when
+// there are enough samples to occupy it; a batch too small for that keeps the
+// plane kernels, which share (sample, group) rows.
+bool gn_use_nhwc(const Tensor& input, int64_t N) {
+    return input.dim() == 4 && input.dtype() == DType::Float32 &&
+           input.is_contiguous(MemoryFormat::ChannelsLast) &&
+           !input.is_contiguous() &&
+           2 * N >= tensorplay::parallel::get_num_threads();
+}
+
+Tensor gn_empty_channels_last(const Tensor& like) {
+    const auto sizes = static_cast<std::vector<int64_t>>(like.shape());
+    Tensor out = Tensor::empty(sizes, like.dtype(), like.device());
+    return out.as_strided(sizes, get_channels_last_strides(sizes), 0);
+}
+
+Tensor gn_group_norm_nhwc(const Tensor& input, int64_t G, const float* w_ptr,
+                          const float* b_ptr, float feps, Tensor* mean_out,
+                          Tensor* rstd_out) {
+    const int64_t N = input.size(0), C = input.size(1);
+    const int64_t S = input.size(2) * input.size(3);
+    const int64_t D = C / G;
+    const float M = static_cast<float>(D * S);
+    Tensor out = gn_empty_channels_last(input);
+    const float* in_ptr = input.data_ptr<float>();
+    float* out_ptr = out.data_ptr<float>();
+    tensorplay::parallel::parallel_for(0, N, 1, [&](int64_t nb, int64_t ne) {
+        std::vector<float> scratch(static_cast<size_t>(5 * C));
+        float* sum = scratch.data();
+        float* sq = sum + C;
+        float* mean_c = sq + C;
+        float* scale_c = mean_c + C;
+        float* shift_c = scale_c + C;
+        for (int64_t n = nb; n < ne; ++n) {
+            const float* x = in_ptr + n * S * C;
+            gn_nhwc_moments(x, S, C, sum, sq);
+            for (int64_t g = 0; g < G; ++g) {
+                float gs = 0.0f, gq = 0.0f;
+                for (int64_t c = g * D; c < (g + 1) * D; ++c) {
+                    gs += sum[c];
+                    gq += sq[c];
+                }
+                const float mean = gs / M;
+                const float var = gq / M - mean * mean;
+                const float inv_std = 1.0f / std::sqrt(var + feps);
+                if (mean_out) normalization_stats_write(*mean_out, n * G + g, mean);
+                if (rstd_out) normalization_stats_write(*rstd_out, n * G + g, inv_std);
+                for (int64_t c = g * D; c < (g + 1) * D; ++c) {
+                    mean_c[c] = mean;
+                    scale_c[c] = inv_std * (w_ptr ? w_ptr[c] : 1.0f);
+                    shift_c[c] = b_ptr ? b_ptr[c] : 0.0f;
+                }
+            }
+            gn_nhwc_apply(x, out_ptr + n * S * C, S, C, mean_c, scale_c, shift_c);
+        }
+    });
+    return out;
+}
+
+// Fills grad_in (channels-last, may be null) and adds each thread's
+// dgamma/dbeta partials into its (C,) slice of gw_buf/gb_buf.
+void gn_group_norm_backward_nhwc(const float* dy, const float* x, float* grad_in,
+                                 int64_t N, int64_t C, int64_t S, int64_t G,
+                                 const float* w_ptr, float feps,
+                                 const Tensor* mean_opt, const Tensor* rstd_opt,
+                                 float* gw_buf, float* gb_buf) {
+    const int64_t D = C / G;
+    const float M = static_cast<float>(D * S);
+    tensorplay::parallel::parallel_for(0, N, 1, [&](int64_t nb, int64_t ne) {
+        const size_t tid = static_cast<size_t>(tensorplay::parallel::get_thread_num());
+        float* gw_row = gw_buf ? gw_buf + tid * C : nullptr;
+        float* gb_row = gb_buf ? gb_buf + tid * C : nullptr;
+        std::vector<double> dscratch(static_cast<size_t>(2 * C));
+        double* sd = dscratch.data();
+        double* dot = sd + C;
+        std::vector<float> scratch(static_cast<size_t>(8 * C));
+        float* sum = scratch.data();
+        float* sq = sum + C;
+        float* w_c = sq + C;
+        float* mean_c = w_c + C;
+        float* inv_c = mean_c + C;
+        float* term1_c = inv_c + C;
+        float* sdy_c = term1_c + C;
+        float* sxh_c = sdy_c + C;
+        for (int64_t n = nb; n < ne; ++n) {
+            const float* xs = x + n * S * C;
+            const float* ds = dy + n * S * C;
+            gn_nhwc_bwd_sums(ds, xs, S, C, sd, dot);
+            if (!mean_opt) gn_nhwc_moments(xs, S, C, sum, sq);
+            for (int64_t g = 0; g < G; ++g) {
+                float mean, inv_std;
+                if (mean_opt) {
+                    mean = static_cast<float>(normalization_stats_read(*mean_opt, n * G + g));
+                    inv_std = static_cast<float>(normalization_stats_read(*rstd_opt, n * G + g));
+                } else {
+                    float gs = 0.0f, gq = 0.0f;
+                    for (int64_t c = g * D; c < (g + 1) * D; ++c) {
+                        gs += sum[c];
+                        gq += sq[c];
+                    }
+                    mean = gs / M;
+                    const float var = gq / M - mean * mean;
+                    inv_std = 1.0f / std::sqrt(var + feps);
+                }
+                float s_dy = 0.0f, s_dy_xhat = 0.0f;
+                for (int64_t c = g * D; c < (g + 1) * D; ++c) {
+                    const float s_dy_c = static_cast<float>(sd[c]);
+                    const float s_dy_xhat_c =
+                        static_cast<float>((dot[c] - mean * sd[c]) * inv_std);
+                    if (gb_row) gb_row[c] += s_dy_c;
+                    if (gw_row) gw_row[c] += s_dy_xhat_c;
+                    const float w = w_ptr ? w_ptr[c] : 1.0f;
+                    s_dy += w * s_dy_c;
+                    s_dy_xhat += w * s_dy_xhat_c;
+                }
+                const float term1 = inv_std / M;
+                for (int64_t c = g * D; c < (g + 1) * D; ++c) {
+                    w_c[c] = w_ptr ? w_ptr[c] : 1.0f;
+                    mean_c[c] = mean;
+                    inv_c[c] = inv_std;
+                    term1_c[c] = term1;
+                    sdy_c[c] = s_dy;
+                    sxh_c[c] = s_dy_xhat;
+                }
+            }
+            if (grad_in) {
+                gn_nhwc_bwd_apply(ds, xs, grad_in + n * S * C, S, C, w_c, mean_c,
+                                  inv_c, term1_c, sdy_c, sxh_c, M);
+            }
+        }
+    });
+}
+
+#undef TP_GN_BODY
+
+}  // namespace
+
 // Helper to check input validity
 static void check_dims(const Tensor& input, int64_t expected_dim, const char* name) {
     if (input.dim() != expected_dim) {
@@ -124,10 +414,20 @@ static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cpu_impl(
         ? has_bias
         : (output_mask->size() > 2 && (*output_mask)[2]);
 
-    const Tensor go_c = grad_output.contiguous();
-    const Tensor in_c = input.contiguous();
+    // A channels-last activation is differentiated where it lies; the
+    // gradient is brought to the same order if it is not already in it.
+    const bool nhwc = gn_use_nhwc(input, N);
+    const Tensor go_c = nhwc
+        ? (grad_output.is_contiguous(MemoryFormat::ChannelsLast)
+               ? grad_output
+               : detail::contiguous_impl(
+                     grad_output, static_cast<int64_t>(MemoryFormat::ChannelsLast)))
+        : grad_output.contiguous();
+    const Tensor in_c = nhwc ? input : input.contiguous();
 
-    Tensor grad_input = want_input ? Tensor::empty_like(input) : Tensor();
+    Tensor grad_input = want_input
+        ? (nhwc ? gn_empty_channels_last(input) : Tensor::empty_like(in_c))
+        : Tensor();
     Tensor grad_weight;
     Tensor grad_bias;
 
@@ -177,6 +477,12 @@ static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cpu_impl(
     const int64_t row_grain = std::max<int64_t>(
         1, tensorplay::parallel::GRAIN_SIZE / std::max<int64_t>(group_size, 1));
 
+    if (nhwc) {
+        gn_group_norm_backward_nhwc(
+            grad_out_ptr, in_ptr, grad_in_ptr, N, C, spatial_size, G, w_ptr, feps,
+            mean_opt, rstd_opt, gw_ptr ? gw_buf.data() : nullptr,
+            gb_ptr ? gb_buf.data() : nullptr);
+    } else
     tensorplay::parallel::parallel_for(0, rows, row_grain, [&](int64_t rb, int64_t re) {
         float* gw_row = gw_ptr ? gw_buf.data() + static_cast<size_t>(tensorplay::parallel::get_thread_num()) * C : nullptr;
         float* gb_row = gb_ptr ? gb_buf.data() + static_cast<size_t>(tensorplay::parallel::get_thread_num()) * C : nullptr;
@@ -563,6 +869,15 @@ static Tensor group_norm_cpu_impl(
     // inner_size = (C/G) * spatial_size
     int64_t inner_size = channels_per_group * spatial_size;
     
+    if (N > 0 && gn_use_nhwc(input, N)) {
+        // A channels-last activation is normalized where it lies and the
+        // result keeps its order.
+        const float* w_nhwc = (weight_opt.has_value() && weight_opt->defined()) ? weight_opt->data_ptr<float>() : nullptr;
+        const float* b_nhwc = (bias_opt.has_value() && bias_opt->defined()) ? bias_opt->data_ptr<float>() : nullptr;
+        return gn_group_norm_nhwc(input, num_groups, w_nhwc, b_nhwc,
+                                  static_cast<float>(eps), mean_out, rstd_out);
+    }
+
     Tensor input_c = input.contiguous();
     Tensor out = Tensor::empty_like(input_c);
     
