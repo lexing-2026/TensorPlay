@@ -6401,8 +6401,14 @@ class ExternKernel(InputsKernel):
         while isinstance(node, MutableBox):
             node = node.data
         name = _flat_window_base_name(x)
+        # A value named by its own node is named by that node's identity.
+        # The entry keeps the node, both so the identity cannot be handed to
+        # a later node once this one is collected and so a hit can be checked
+        # against the node that is asking.
+        anchor = None
         if name is None:
             name = id(node)
+            anchor = node
         try:
             shape = tuple(int(s) for s in x.get_size())
         except (TypeError, ValueError):
@@ -6413,10 +6419,10 @@ class ExternKernel(InputsKernel):
             V.graph._shared_layout_copy_cache = cache
         key = (name, shape, layout_key)
         hit = cache.get(key)
-        if hit is not None:
-            return hit
+        if hit is not None and hit[0] is anchor:
+            return hit[1]
         out = cls.copy_input(x)
-        cache[key] = out
+        cache[key] = (anchor, out)
         return out
 
     @staticmethod
