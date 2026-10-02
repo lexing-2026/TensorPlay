@@ -21,6 +21,49 @@ import tensorplay._C as _C
 
 _active_tracer_getter: Any = None
 
+_FLOAT_WIDTH = {
+    tensorplay.float16: 0,
+    tensorplay.bfloat16: 0,
+    tensorplay.float32: 1,
+    tensorplay.float64: 2,
+}
+# These backward entry points take the gradient in a wider type than the
+# activations they were saved with, and re-cast everything to the activation
+# type themselves.  Forcing one element type here would move them off their
+# native-precision kernels.
+_MIXED_DTYPE_OPS = {
+    "_scaled_dot_product_attention_backward_with_lse",
+    "scaled_dot_product_attention_backward",
+}
+
+def _align_eager_dtypes(opname: str, args: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Give every tensor operand of a call one element type.
+
+    The compiled backward can hand the dispatch a half-precision gradient
+    next to a single-precision activation saved earlier in the graph.  Each
+    framework kernel expects one element type, so the floating operands are
+    promoted to the widest one among them before the call goes out.
+    """
+
+    if opname == "to" or opname in _MIXED_DTYPE_OPS:
+        return args
+    tensors = [a for a in args if isinstance(a, tensorplay.Tensor)]
+    if len(tensors) < 2:
+        return args
+    target = None
+    for t in tensors:
+        rank = _FLOAT_WIDTH.get(t.dtype, -1)
+        if rank < 0:
+            return args
+        if target is None or rank > _FLOAT_WIDTH[target]:
+            target = t.dtype
+    if all(t.dtype == target for t in tensors):
+        return args
+    return tuple(
+        a.to(target) if isinstance(a, tensorplay.Tensor) and a.dtype != target else a
+        for a in args
+    )
+
 
 def _capture_may_be_active() -> Any:
     """Whether a graph tracer is recording in this context.
@@ -827,6 +870,7 @@ class OpOverload:
             captured = _capture_call(self, args, kwargs)
             if captured is not None:
                 return captured
+        args = _align_eager_dtypes(self._opname, args)
         return _C._call_overload(self._key, args, kwargs)
 
     @property
