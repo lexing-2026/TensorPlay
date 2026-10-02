@@ -195,17 +195,17 @@ class ConvConfigHeuristics(TemplateConfigHeuristics):
             rows, cols, inner = kernel_inputs.mnk_symbolic()
         except NotImplementedError:
             return
-        for config in CHOICES.get_conv_configs(self.device_type)(
+        for tiling in CHOICES.get_conv_configs(self.device_type)(
             rows, cols, inner, dtype_size=dtype_size(kernel_inputs.dtype(0))
         ):
-            yield {"choice": "triton", **config.as_kwargs()}
+            yield {"choice": "triton", **tiling.as_kwargs()}
 
     def get_depthwise_configs_impl(self, kernel_inputs):
         """The depthwise tilings, which are not products and so are not fitted."""
 
         yield {"choice": "operator"}
-        for config in CHOICES.get_depthwise_conv_configs(self.device_type):
-            yield {"choice": "triton", **config.as_kwargs()}
+        for tiling in CHOICES.get_depthwise_conv_configs(self.device_type):
+            yield {"choice": "triton", **tiling.as_kwargs()}
 
 class DepthwiseConvTemplate(KernelTemplate):
 
@@ -346,8 +346,8 @@ class DepthwiseConvConfigHeuristics(TemplateConfigHeuristics):
 
     def _get_template_configs_impl(self, kernel_inputs, op_name):
         yield {"choice": "operator"}
-        for config in CHOICES.get_depthwise_conv_configs(self.device_type):
-            yield {"choice": "triton", **config.as_kwargs()}
+        for tiling in CHOICES.get_depthwise_conv_configs(self.device_type):
+            yield {"choice": "triton", **tiling.as_kwargs()}
 
 class ConvTemplate(KernelTemplate):
 
@@ -728,10 +728,10 @@ class ConvGradientConfigHeuristics(TemplateConfigHeuristics):
             rows, cols, inner = kernel_inputs.mnk_symbolic()
         except NotImplementedError:
             return
-        for config in CHOICES.get_conv_configs(self.device_type)(
+        for tiling in CHOICES.get_conv_configs(self.device_type)(
             rows, cols, inner, dtype_size=dtype_size(kernel_inputs.dtype(0))
         ):
-            yield {"choice": "triton", **config.as_kwargs()}
+            yield {"choice": "triton", **tiling.as_kwargs()}
 
 class ConvBwdInputTemplate(_ConvGradientTemplate):
 
