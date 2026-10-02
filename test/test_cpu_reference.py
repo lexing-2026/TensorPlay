@@ -21,7 +21,7 @@ class TestCPUReference(unittest.TestCase):
             k.requires_grad_(True)
             v.requires_grad_(True)
 
-            out = tp.scaled_dot_product_attention(q, k, v, is_causal=True, impl=1)
+            out = tp.scaled_dot_product_attention(q, k, v, is_causal=True)
             self.assertEqual(out.dtype, dtype)
             out.mean().backward()
 

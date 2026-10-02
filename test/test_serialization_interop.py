@@ -128,7 +128,7 @@ def _storage_class_for(tensor):
     cls = type(storage_name, (), {
         "__module__": "torch", "__qualname__": storage_name, "__name__": storage_name,
     })
-    cls._tp_torch_ref = ("torch", storage_name)
+    cls._tp_backend_ref = ("torch", storage_name)
     return cls
 
 

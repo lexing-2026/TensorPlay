@@ -1,5 +1,7 @@
 """Tensor.to / Module.to with a target memory format."""
 
+import pytest
+
 import tensorplay as tp
 
 
@@ -39,9 +41,14 @@ def test_to_without_changes_returns_self():
     assert x.to(x.dtype, copy=True) is not x
 
 
-def test_to_keeps_positional_non_blocking_after_device():
-    x = tp.randn(2, 3)
-    assert tp.equal(x.to("cpu", True), x)
+def test_to_takes_positional_non_blocking_after_the_dtype():
+    x = tp.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    # The slot after the device is the dtype's; a flag there is not one.
+    with pytest.raises(TypeError):
+        x.to("cpu", True)
+    assert x.to("cpu", None, True).tolist() == [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+    assert x.to("cpu", tp.float32, True) is x
+    assert x.to("cpu", non_blocking=True) is x
 
 
 def test_module_to_memory_format_converts_four_dimensional_parameters():

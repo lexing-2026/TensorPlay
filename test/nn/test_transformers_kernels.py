@@ -52,7 +52,7 @@ def test_sdpa_gemm_cuda_parity(dtype):
     k_tp = tp.from_numpy(k).to("cuda")
     v_tp = tp.from_numpy(v).to("cuda")
     out = tp.scaled_dot_product_attention(
-        q_tp, k_tp, v_tp, is_causal=True, impl=2
+        q_tp, k_tp, v_tp, is_causal=True
     ).cpu().numpy()
     ref = torch.nn.functional.scaled_dot_product_attention(
         torch.from_numpy(q).cuda(), torch.from_numpy(k).cuda(),
@@ -65,10 +65,19 @@ def test_sdpa_gemm_cuda_parity(dtype):
     )
 
 
-def test_sdpa_requires_4d():
-    q = tp.randn([2, 8]); k = tp.randn([2, 8, 8]); v = tp.randn([2, 8, 8])
-    with pytest.raises(Exception):
-        tp.scaled_dot_product_attention(q, k, v)
+@pytest.mark.parametrize("query_shape", [(2, 5, 8), (2, 8)])
+def test_sdpa_takes_inputs_without_a_head_dimension(query_shape):
+    # Attention is a product over the last two dimensions; whatever comes
+    # before them is carried along, including nothing at all.
+    rng = np.random.default_rng(17)
+    q = rng.standard_normal(query_shape).astype(np.float32)
+    k = rng.standard_normal((2, 8, 8)).astype(np.float32)
+    v = rng.standard_normal((2, 8, 8)).astype(np.float32)
+    out = tp.scaled_dot_product_attention(
+        tp.from_numpy(q), tp.from_numpy(k), tp.from_numpy(v)).numpy()
+    ref = _ref_sdpa(q, k, v, False)
+    assert out.shape == ref.shape
+    np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-5)
 
 
 def _grouped_ref(a, b, offs):

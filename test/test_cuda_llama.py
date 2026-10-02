@@ -124,7 +124,7 @@ class TinyLlamaForCausalLM:
                 q = self._apply_rope(q, seq_len)
                 k = self._apply_rope(k, seq_len)
             attention = tp.scaled_dot_product_attention(
-                q, k, v, is_causal=True, impl=1
+                q, k, v, is_causal=True
             )
             attention = attention.permute([0, 2, 1, 3]).reshape(
                 [batch, seq_len, self.hidden_size]
