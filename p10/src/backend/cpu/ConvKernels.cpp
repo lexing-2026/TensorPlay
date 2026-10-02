@@ -46,6 +46,10 @@ struct ConvKey {
     int64_t groups;
     bool has_bias;
     bool fused_relu = false;
+    // Activations are handed to the primitive in NHWC order; a primitive
+    // built for that order is a different primitive from the one built for
+    // the engine's own choice.
+    bool nhwc = false;
     int type; // 0: fwd, 1: bwd_data, 2: bwd_weights, 4: deconv fwd, 6: deconv bwd_w
     // Depth fields (3d convolutions / deconvolutions); defaulted so 2d keys
     // keep working without touching them.
@@ -62,7 +66,8 @@ struct ConvKey {
                ph_t == other.ph_t && ph_b == other.ph_b && pw_l == other.pw_l && pw_r == other.pw_r &&
                dh == other.dh && dw == other.dw &&
                groups == other.groups && has_bias == other.has_bias &&
-               fused_relu == other.fused_relu && type == other.type &&
+               fused_relu == other.fused_relu && nhwc == other.nhwc &&
+               type == other.type &&
                id == other.id && od == other.od && kd == other.kd &&
                sd == other.sd && pd_f == other.pd_f && pd_k == other.pd_k &&
                dd == other.dd;
@@ -82,7 +87,7 @@ namespace std {
             hc(k.sh); hc(k.sw);
             hc(k.ph_t); hc(k.ph_b); hc(k.pw_l); hc(k.pw_r);
             hc(k.dh); hc(k.dw);
-            hc(k.groups); hc(k.has_bias); hc(k.fused_relu); hc(k.type);
+            hc(k.groups); hc(k.has_bias); hc(k.fused_relu); hc(k.nhwc); hc(k.type);
             hc(k.id); hc(k.od); hc(k.kd); hc(k.sd); hc(k.pd_f); hc(k.pd_k); hc(k.dd);
             return h;
         }
@@ -959,6 +964,15 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         key.has_bias = (bias.defined() && bias.numel() > 0);
         key.fused_relu = fused_relu;
         key.type = 0; // Forward
+        // Channels-last activations go to the engine as they are stored: the
+        // primitive is built for an NHWC source and destination, so neither
+        // is repacked into a blocked layout and back.  The weights stay with
+        // the engine's own choice.
+        const bool nhwc_act =
+            !input.unsafeGetTensorImpl()->has_onednn_md() &&
+            input.is_contiguous(MemoryFormat::ChannelsLast) &&
+            output.is_contiguous(MemoryFormat::ChannelsLast);
+        key.nhwc = nhwc_act;
         
         struct CachedConv {
             convolution_forward::primitive_desc pd;
@@ -998,8 +1012,8 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
             // For 1x1 convolutions, we used to force NHWC, but this causes reorders if previous layer is blocked.
             // Let OneDNN decide globally.
             bool is_1x1 = (key.kh == 1 && key.kw == 1 && key.sh == 1 && key.sw == 1 && key.ph_t == 0 && key.ph_b == 0 && key.pw_l == 0 && key.pw_r == 0);
-            auto src_tag = memory::format_tag::any;
-            auto dst_tag = memory::format_tag::any;
+            auto src_tag = nhwc_act ? memory::format_tag::nhwc : memory::format_tag::any;
+            auto dst_tag = nhwc_act ? memory::format_tag::nhwc : memory::format_tag::any;
             
             auto src_md = memory::desc(src_dims, memory::data_type::f32, src_tag);
             auto dst_md = memory::desc(dst_dims, memory::data_type::f32, dst_tag);
@@ -1999,6 +2013,13 @@ static bool conv2d_grad_input_onednn(const Tensor& grad_output, const Tensor& in
         key.groups = groups;
         key.has_bias = false;
         key.type = 1; // BwdData
+        // A channels-last gradient written into a channels-last buffer runs
+        // on an NHWC primitive, with no repack on either side.
+        const bool nhwc_act =
+            !grad_output_c.unsafeGetTensorImpl()->has_onednn_md() &&
+            grad_output_c.is_contiguous(MemoryFormat::ChannelsLast) &&
+            grad_input.is_contiguous(MemoryFormat::ChannelsLast);
+        key.nhwc = nhwc_act;
 
         struct CachedConvBwdData {
             convolution_backward_data::primitive_desc pd;
@@ -2041,8 +2062,8 @@ static bool conv2d_grad_input_onednn(const Tensor& grad_output, const Tensor& in
 
         // For 1x1 convolutions, use NHWC to avoid reorders and match Forward
         bool is_1x1 = (key.kh == 1 && key.kw == 1 && key.sh == 1 && key.sw == 1 && key.ph_t == 0 && key.ph_b == 0 && key.pw_l == 0 && key.pw_r == 0);
-        auto src_tag = is_1x1 ? memory::format_tag::nhwc : memory::format_tag::any;
-        auto dst_tag = is_1x1 ? memory::format_tag::nhwc : memory::format_tag::any;
+        auto src_tag = (is_1x1 || nhwc_act) ? memory::format_tag::nhwc : memory::format_tag::any;
+        auto dst_tag = (is_1x1 || nhwc_act) ? memory::format_tag::nhwc : memory::format_tag::any;
 
         auto src_md = memory::desc(src_dims, memory::data_type::f32, src_tag);
         auto dst_md = memory::desc(dst_dims, memory::data_type::f32, dst_tag);
@@ -2276,6 +2297,13 @@ static bool conv2d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
         key.groups = groups;
         key.has_bias = false;
         key.type = 2; // BwdWeights
+        // Channels-last input and gradient feed an NHWC primitive directly.
+        const bool nhwc_act =
+            !input_c.unsafeGetTensorImpl()->has_onednn_md() &&
+            !grad_output_c.unsafeGetTensorImpl()->has_onednn_md() &&
+            input_c.is_contiguous(MemoryFormat::ChannelsLast) &&
+            grad_output_c.is_contiguous(MemoryFormat::ChannelsLast);
+        key.nhwc = nhwc_act;
 
         struct CachedConvBwdWeights {
             convolution_backward_weights::primitive_desc pd;
@@ -2318,8 +2346,8 @@ static bool conv2d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
 
         // For 1x1 convolutions, use NHWC to avoid reorders and match Forward
         bool is_1x1 = (key.kh == 1 && key.kw == 1 && key.sh == 1 && key.sw == 1 && key.ph_t == 0 && key.ph_b == 0 && key.pw_l == 0 && key.pw_r == 0);
-        auto src_tag = is_1x1 ? memory::format_tag::nhwc : memory::format_tag::any;
-        auto dst_tag = is_1x1 ? memory::format_tag::nhwc : memory::format_tag::any;
+        auto src_tag = (is_1x1 || nhwc_act) ? memory::format_tag::nhwc : memory::format_tag::any;
+        auto dst_tag = (is_1x1 || nhwc_act) ? memory::format_tag::nhwc : memory::format_tag::any;
 
         auto src_md = memory::desc(src_dims, memory::data_type::f32, src_tag);
         auto dst_md = memory::desc(dst_dims, memory::data_type::f32, dst_tag);
