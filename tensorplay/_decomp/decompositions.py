@@ -2045,39 +2045,35 @@ def native_group_norm(input, weight, bias, N, C, HxW, group, eps):
 
 @register_decomposition(ops.native_group_norm_backward.default)
 def native_group_norm_backward(grad_out, input, mean, rstd, weight, N, C, HxW, group, output_mask):
-    compute = _computation_dtype(input.dtype)
-    grad_out_c, input_c = grad_out.to(compute), input.to(compute)
-    mean_c, rstd_c = mean.to(compute), rstd.to(compute)
-    weight_c = _cast(weight, compute)
     cpg = C // group
     if C != cpg * group:
         raise RuntimeError(
             f"Expect number of channels {C} to be evenly-divisible by number of groups {group}"
         )
-    ds = (grad_out_c * input_c).reshape(N, C, HxW).sum(dim=[2])
-    db = grad_out_c.reshape(N, C, HxW).sum(dim=[2])
+    ds = (grad_out * input).reshape(N, C, HxW).sum(dim=[2])
+    db = grad_out.reshape(N, C, HxW).sum(dim=[2])
     d_input = d_gamma = d_bias = None
     if output_mask[0]:
         s = 1.0 / (HxW * cpg)
-        if weight_c is not None:
-            ds_val = (ds * weight_c.unsqueeze(0)).reshape(N, group, cpg).sum(2)
-            db_val = (db * weight_c.unsqueeze(0)).reshape(N, group, cpg).sum(2)
-            c1 = rstd_c.unsqueeze(-1) * weight_c.reshape(1, group, cpg)
+        if weight is not None:
+            ds_val = (ds * weight.unsqueeze(0)).reshape(N, group, cpg).sum(2)
+            db_val = (db * weight.unsqueeze(0)).reshape(N, group, cpg).sum(2)
+            c1 = rstd.unsqueeze(-1) * weight.reshape(1, group, cpg)
         else:
             ds_val = ds.reshape(N, group, cpg).sum(2)
             db_val = db.reshape(N, group, cpg).sum(2)
-            c1 = rstd_c.unsqueeze(-1) * tp.ones((1, group, cpg), dtype=compute, device=rstd.device)
-        c2 = (db_val * mean_c - ds_val) * rstd_c * rstd_c * rstd_c * s
-        c3 = -c2 * mean_c - db_val * rstd_c * s
+            c1 = rstd.unsqueeze(-1) * tp.ones((1, group, cpg), dtype=rstd.dtype, device=rstd.device)
+        c2 = (db_val * mean - ds_val) * rstd * rstd * rstd * s
+        c3 = -c2 * mean - db_val * rstd * s
         d_input = (
-            grad_out_c.reshape(N, group, cpg, HxW) * c1.unsqueeze(-1)
-            + input_c.reshape(N, group, cpg, HxW) * _to_rank(c2, 4)
+            grad_out.reshape(N, group, cpg, HxW) * c1.unsqueeze(-1)
+            + input.reshape(N, group, cpg, HxW) * _to_rank(c2, 4)
             + _to_rank(c3, 4)
         ).reshape(tuple(input.shape)).to(input.dtype)
     if output_mask[1]:
         d_gamma = (
-            ((ds.reshape(N, group, cpg) - db.reshape(N, group, cpg) * mean_c.unsqueeze(-1))
-             * rstd_c.unsqueeze(-1)).sum(dim=[0]).reshape(C)
+            ((ds.reshape(N, group, cpg) - db.reshape(N, group, cpg) * mean.unsqueeze(-1))
+             * rstd.unsqueeze(-1)).sum(dim=[0]).reshape(C)
         ).to(weight.dtype if weight is not None else input.dtype)
     if output_mask[2]:
         d_bias = db.sum(dim=[0]).to(weight.dtype if weight is not None else input.dtype)
