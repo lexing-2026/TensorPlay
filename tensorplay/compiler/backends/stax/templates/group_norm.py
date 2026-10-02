@@ -22,6 +22,7 @@ def group_norm_backward_grid(n, c, h, w, meta, *, cdiv):
 group_norm_backward_template = TritonTemplate(
     name="group_norm_backward",
     grid=group_norm_backward_grid,
+    always_freeze_layout=True,
     source=r"""
 {{def_kernel("GRAD_OUT", "X", "MEAN", "RSTD", "GAMMA", "DGAMMA", "DBETA")}}
     N = {{size("X", 0)}}

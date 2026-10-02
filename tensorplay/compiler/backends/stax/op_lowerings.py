@@ -2156,7 +2156,11 @@ def _lower_gn_bwd_template(grad_out, x, mean, rstd, gamma, n, c, hxw, groups, ou
     )
     dgamma0.data.realize()
     dbeta0.data.realize()
+    if isinstance(grad_out, TensorBox):
+        grad_out.realize()
     layout = grad_out.get_layout()
+    if isinstance(layout, ir.FlexibleLayout):
+        layout = layout.get_fixed_layout_without_freezing()
     choices = []
     err = group_norm_backward_template.maybe_append_choice(
         choices,
