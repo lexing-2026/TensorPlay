@@ -2018,13 +2018,12 @@ def native_group_norm(input, weight, bias, N, C, HxW, group, eps):
     The two statistics come back with the reduced axes squeezed out, so each is
     one value per group and broadcasts against the input again.
     """
-    compute = _computation_dtype(input.dtype)
-    input_c = input.to(compute)
-
     cpg = C // group
     # [N, group, channels-per-group, spatial] so the group's own channels and
-    # the positions inside them are the last two axes.
-    grouped = input_c.reshape(N, group, cpg, HxW)
+    # the positions inside them are the last two axes.  The input is read in
+    # its stored precision and widened inside the walk that reduces it, so no
+    # float copy of the whole tensor is materialised for the statistics.
+    grouped = input.reshape(N, group, cpg, HxW)
     var, mean = tp.var_mean(grouped, dim=[2, 3], unbiased=False, keepdim=True)
     rstd = (var + eps).rsqrt()
 
@@ -2039,8 +2038,8 @@ def native_group_norm(input, weight, bias, N, C, HxW, group, eps):
         out = out + bias.reshape(per_channel)
     return (
         _cast(out, input.dtype),
-        _cast(mean.squeeze((2, 3)), input.dtype),
-        _cast(rstd.squeeze((2, 3)), input.dtype),
+        mean.squeeze((2, 3)),
+        rstd.squeeze((2, 3)),
     )
 
 
