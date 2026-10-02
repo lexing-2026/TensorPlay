@@ -1369,16 +1369,57 @@ def lower_silu_backward(grad, x):
     return pointwise(fn, grad, x)
 
 
+def _identity_copy_source(x):
+    """The value itself, when a copy of it would arrive at the same bytes.
+
+    Inside a region a value is written once and only read, so a copy that
+    changes neither elements nor arrangement is the value.  That holds when
+    its storage has not been laid down yet -- a fresh realization settles
+    row-major, which is the arrangement a copy makes -- when the storage is
+    already row-major, and when the value is a plain window onto row-major
+    storage.  Anything else (a reshaped view whose reading is not a plain
+    window, a frozen non-row-major buffer) keeps its copy.
+    """
+
+    if isinstance(x, TensorBox) and isinstance(x.data, StorageBox):
+        inner = x.data.data
+        if isinstance(inner, (Pointwise, Reduction)):
+            return x
+        if isinstance(inner, Buffer) and inner.layout.is_contiguous():
+            return x
+        return None
+    if isinstance(x, TensorBox) and isinstance(x.data, ReinterpretView):
+        if x.data.get_layout().is_contiguous():
+            return x
+    return None
+
+
 @register("to.dtype", "to.device", "to.dtype_layout", "_to_copy.default")
 def lower_to(x, *args, **kwargs):
     size, dtype, _ = val_info(node_val())
-    if is_tensor_box(x) and dtype_name(x.get_dtype()) == dtype_name(dtype) and not kwargs.get("copy", False):
-        return x
+    if not kwargs.get("copy", False) and dtype_name(x.get_dtype()) == dtype_name(dtype):
+        # A request that changes no element type moves no bytes, so the value
+        # itself answers it.  A spelling that also carries an arrangement is
+        # only free for a boxed value, whose arrangement is still to be
+        # decided; for a bare node it keeps the old path.
+        spelling = "to.dtype"
+        try:
+            spelling = target_name(V.current_node.target)
+        except Exception:
+            pass
+        if spelling in ("to.dtype", "to.device") or is_tensor_box(x):
+            return x
+        source = _identity_copy_source(x)
+        if source is not None:
+            return source
     return pointwise(lambda v: cast_to(v, dtype), x)
 
 
 @register("clone.default", "contiguous.default")
 def lower_clone(x, *args, **kwargs):
+    source = _identity_copy_source(x)
+    if source is not None:
+        return source
     return pointwise(lambda v: v, x)
 
 
@@ -1867,7 +1908,14 @@ def lower_var_mean(x, dims=None, unbiased=True, keepdim=False, **kwargs):
         dims = list(range(len(x.get_size())))
     elif isinstance(dims, (int, sympy.Integer)):
         dims = [dims]
+    # The result element type is what the graph declares for this node, which
+    # can be wider than the input's: a normalization computes its moments in
+    # float32 even when the input is float16.  The input's own type is only a
+    # fallback for when the graph has not declared one.
     dtype = x.get_dtype()
+    val = node_val(index=0)
+    if val is not None and getattr(val, "dtype", None) is not None:
+        dtype = val.dtype
     device = x.get_device()
     size = list(x.get_size())
     rank = len(size)
@@ -1956,8 +2004,32 @@ _fallback_conv2d_grad_weight = fallback_handler(
 
 @register("conv2d_grad_input.default")
 def lower_conv2d_grad_input(grad_output, input, weight, stride, padding, dilation, groups):
-    """The input gradient, asked of the framework kernel."""
+    """The input gradient, asked of the framework kernel.
 
+    The graph declares the result element type (a half-precision forward
+    produces a half-precision input gradient), but the activation and weight
+    saved for the backward can still be the wider parameters they came from,
+    and the rest of the backward expects the result in that wider type.  The
+    kernel runs in the result's type, so the operands are brought to it; the
+    result is then returned in the type the caller supplied.
+    """
+
+    result_dtype = grad_output.get_dtype()
+    val = node_val(index=0)
+    dtype = getattr(val, "dtype", None)
+    if dtype is not None:
+        if grad_output.get_dtype() != dtype:
+            grad_output = to_dtype(grad_output, dtype)
+        if input.get_dtype() != dtype:
+            input = to_dtype(input, dtype)
+        if weight.get_dtype() != dtype:
+            weight = to_dtype(weight, dtype)
+        result = _fallback_conv2d_grad_input(
+            grad_output, input, weight, stride, padding, dilation, groups
+        )
+        if result.get_dtype() != result_dtype:
+            result = to_dtype(result, result_dtype)
+        return result
     return _fallback_conv2d_grad_input(
         grad_output, input, weight, stride, padding, dilation, groups
     )
@@ -1965,8 +2037,32 @@ def lower_conv2d_grad_input(grad_output, input, weight, stride, padding, dilatio
 
 @register("conv2d_grad_weight.default")
 def lower_conv2d_grad_weight(grad_output, input, weight, stride, padding, dilation, groups):
-    """The weight gradient, asked of the framework kernel."""
+    """The weight gradient, asked of the framework kernel.
 
+    The graph declares the result element type (a half-precision forward
+    produces a half-precision weight gradient), but the activation and weight
+    saved for the backward can still be the wider parameters they came from,
+    and the rest of the backward expects the result in that wider type.  The
+    kernel runs in the result's type, so the operands are brought to it; the
+    result is then returned in the type the caller supplied.
+    """
+
+    result_dtype = weight.get_dtype()
+    val = node_val(index=0)
+    dtype = getattr(val, "dtype", None)
+    if dtype is not None:
+        if grad_output.get_dtype() != dtype:
+            grad_output = to_dtype(grad_output, dtype)
+        if input.get_dtype() != dtype:
+            input = to_dtype(input, dtype)
+        if weight.get_dtype() != dtype:
+            weight = to_dtype(weight, dtype)
+        result = _fallback_conv2d_grad_weight(
+            grad_output, input, weight, stride, padding, dilation, groups
+        )
+        if result.get_dtype() != result_dtype:
+            result = to_dtype(result, result_dtype)
+        return result
     return _fallback_conv2d_grad_weight(
         grad_output, input, weight, stride, padding, dilation, groups
     )
@@ -2048,6 +2144,8 @@ def _lower_gn_bwd_template(grad_out, x, mean, rstd, gamma, n, c, hxw, groups, ou
         num_warps=4,
     )
     if err is not None or not choices:
+        import sys as _sys
+        print("GN_TEMPLATE_ERR:", repr(err), "groups:", groups, "x_size:", [str(s) for s in x_size], "layout_stride:", getattr(x.get_layout(), "stride", None), file=_sys.stderr, flush=True)
         return None
     node, _ = autotune_select_algorithm(
         "group_norm_backward",
@@ -2066,6 +2164,14 @@ def lower_native_group_norm_backward(grad_out, x, mean, rstd, gamma, n, c, hxw, 
         )
         if lowered is not None:
             return lowered
+    # The framework's mixed-precision group-norm backward keeps the
+    # activation-side inputs in their stored half precision and takes the
+    # gradient in float, returning the parameter gradients in float.  A
+    # half gradient next to a half activation would be re-cast by the
+    # framework kernel into half parameter gradients, which this graph does
+    # not expect, so the gradient is brought to float first.
+    if grad_out.get_dtype() != tp.float32:
+        grad_out = to_dtype(grad_out, tp.float32)
     return _fallback_group_norm_backward(
         grad_out, x, mean, rstd, gamma, n, c, hxw, groups, output_mask
     )
