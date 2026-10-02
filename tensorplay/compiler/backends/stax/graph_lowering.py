@@ -1928,6 +1928,17 @@ class GraphLowering(Interpreter):
         if storage is None:
             return result
         users = len(node.users)
+        if users > 1 and self._handed_over_to_a_reader(node):
+            # One of the readers is handed the value itself, so it ends up in
+            # memory whatever the others do.  Put there as it is made, the
+            # other readers read it from memory; left until that reader is
+            # reached, each reader before it would compute the value again
+            # inside its own loop and write a copy of its own.
+            result = self._channels_last_before_realize(node, result)
+            result.realize_hint()
+            storage = self._storage_box(result)
+            if storage is None:
+                return result
         if storage.should_realize_on_reuse(users):
             result = self._channels_last_before_realize(node, result)
             storage = self._storage_box(result)
@@ -1935,6 +1946,22 @@ class GraphLowering(Interpreter):
                 return result
         storage.mark_reuse(users)
         return result
+
+    @staticmethod
+    def _handed_over_to_a_reader(node) -> bool:
+        """Whether some reader of this node takes the value rather than a loop.
+
+        A convolution, its gradients, and every operation computed by handing
+        the call over are given tensors: what they read has to exist.
+        """
+
+        from .op_lowerings import needs_realized_inputs
+
+        return any(
+            _is_convolution_node(user)
+            or getattr(user, "target", None) in needs_realized_inputs
+            for user in node.users
+        )
 
     @staticmethod
     def _storage_box(result):
