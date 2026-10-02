@@ -641,7 +641,7 @@ max_fusion_size = int(os.environ.get("TP_MAX_FUSION_SIZE", "128"))
 # How much two pieces must share before joining them is worth it.  Below this
 # the join saves little and makes the launch larger.
 score_fusion_memory_threshold = int(
-    os.environ.get("TP_SCORE_FUSION_MEMORY_THRESHOLD", "0")
+    os.environ.get("TP_SCORE_FUSION_MEMORY_THRESHOLD", "10")
 )
 
 # Whether to look at pairs that share no value as well.  These are only joined
