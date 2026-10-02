@@ -99,7 +99,17 @@ int intraop_default_num_threads() {
         return n;
       }
     }
-    return physical_core_count();
+    // On a part with two CPU frequency tiers the default is the capped
+    // count, so the OpenMP team, the BLAS thread count, the per-thread
+    // scratch sizing and the thread count compiled into generated kernels
+    // all agree.  Counts that differ between consecutive regions make the
+    // OpenMP runtime resize its team at every region.
+    int n = physical_core_count();
+    const int cap = internal::hybrid_thread_cap();
+    if (cap > 0 && cap < n) {
+      n = cap;
+    }
+    return n;
   }();
   return cached;
 }
@@ -429,20 +439,15 @@ void invoke_parallel_impl(
   const int64_t numiter = end - begin;
   const int64_t num_threads = get_num_threads();
 
-  // Chunk size is at least grain_size, matching the semantics of
-  // parallel_for: work below grain_size never reaches this point.
-  int64_t chunk_size = std::max(grain_size, (numiter + num_threads - 1) / num_threads);
-  const size_t num_tasks = static_cast<size_t>((numiter + chunk_size - 1) / chunk_size);
-
 #ifdef _OPENMP
-  // an OpenMP region so libgomp keeps the team warm (threads spin between
-  // dispatch cost microseconds.  The native pool below stays as the fallback
-  // for non-OpenMP builds.
+  // Kernels run inside an OpenMP region so libgomp keeps the team warm
+  // between dispatches.  The native pool below stays as the fallback for
+  // non-OpenMP builds.
   //
   // TP_PARALLEL_BACKEND=native forces the in-house pool even in OpenMP builds.
   // Back-to-back small regions (RNN cell loops) measured ~600us cheaper per
   // region transition on Zen4 with the native pool: libgomp's post-barrier
-  // spin taxes the serial op that follows each region, and the native pool's
+  // spin taxes the serial op that follows each region.
   static const bool force_native_pool = [] {
       const char* e = std::getenv("TP_PARALLEL_BACKEND");
       return e && std::strcmp(e, "native") == 0;
@@ -450,17 +455,30 @@ void invoke_parallel_impl(
   if (!force_native_pool && omp_get_max_threads() > 1 && !omp_in_parallel()) {
     std::atomic_flag err_flag = ATOMIC_FLAG_INIT;
     std::exception_ptr eptr;
-    const int64_t ntasks = static_cast<int64_t>(num_tasks);
-    const int nthreads_clause =
-        static_cast<int>(std::min<size_t>(num_tasks, static_cast<size_t>(omp_get_max_threads())));
-    #pragma omp parallel for schedule(static) num_threads(nthreads_clause)
-    for (int64_t t = 0; t < ntasks; ++t) {
-      int64_t local_begin = begin + t * chunk_size;
-      if (local_begin < end) {
+    // The region always opens with the full team and the chunking is decided
+    // inside it.  A num_threads clause that differs from one region to the
+    // next makes libgomp retire the surplus workers and spawn them again at
+    // every change, so a short loop followed by a long one pays thread
+    // creation, and the fresh threads start on whichever CPU happens to be
+    // idle.  A loop with fewer chunks than threads leaves the surplus
+    // threads without a chunk instead.
+    #pragma omp parallel
+    {
+      // Never more chunks than the configured intra-op count: kernels size
+      // their per-thread scratch from get_num_threads() and index it with
+      // get_thread_num().
+      int64_t team = std::min<int64_t>(omp_get_num_threads(), num_threads);
+      if (grain_size > 0) {
+        team = std::min(team, (numiter + grain_size - 1) / grain_size);
+      }
+      team = std::max<int64_t>(team, 1);
+      const int64_t tid = omp_get_thread_num();
+      const int64_t chunk = (numiter + team - 1) / team;
+      const int64_t local_begin = begin + tid * chunk;
+      if (tid < team && local_begin < end) {
         try {
-          ParallelRegionGuard guard(static_cast<int>(t));
-          int64_t local_end = std::min(end, chunk_size + local_begin);
-          f(local_begin, local_end);
+          ParallelRegionGuard guard(static_cast<int>(tid));
+          f(local_begin, std::min(end, local_begin + chunk));
         } catch (...) {
           if (!err_flag.test_and_set()) {
             eptr = std::current_exception();
@@ -474,6 +492,11 @@ void invoke_parallel_impl(
     return;
   }
 #endif
+
+  // Chunk size is at least grain_size, matching the semantics of
+  // parallel_for: work below grain_size never reaches this point.
+  int64_t chunk_size = std::max(grain_size, (numiter + num_threads - 1) / num_threads);
+  const size_t num_tasks = static_cast<size_t>((numiter + chunk_size - 1) / chunk_size);
 
   struct State {
     std::atomic_flag err_flag = ATOMIC_FLAG_INIT;
