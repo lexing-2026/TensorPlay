@@ -652,7 +652,7 @@ aggressive_fusion = os.environ.get("TP_AGGRESSIVE_FUSION", "0") == "1"
 # How many values one launch may be given.  Nothing here, for a launch may be
 # given as many as it needs.
 max_fusion_unique_io_buffers = int(
-    os.environ.get("TP_MAX_FUSION_UNIQUE_IO_BUFFERS", "8")
+    os.environ.get("TP_MAX_FUSION_UNIQUE_IO_BUFFERS", "32")
 )
 
 # Whether a piece walking fewer elements may be made to look as though it
