@@ -2535,15 +2535,6 @@ def _spatial_ndim() -> int:
     return 3 if "3d" in target_name(V.current_node.target) else 2
 
 
-def _pool_output_size(extent: int, kernel: int, stride: int, padding: int,
-                      ceil_mode: bool) -> int:
-    """Output extent of one pooling axis."""
-
-    if ceil_mode:
-        return -((-(extent + 2 * padding - kernel)) // stride) + 1
-    return (extent + 2 * padding - kernel) // stride + 1
-
-
 def _upsample_nearestnd(x, output_size, ndim, **kwargs):
     """Nearest upsampling as an index remap of the source.
 
@@ -2588,122 +2579,153 @@ def lower_upsample_nearest3d(x, output_size, scales_d=None, scales_h=None,
     return _upsample_nearestnd(x, output_size, 3, **kwargs)
 
 
+def _prod_ints(values) -> int:
+    out = 1
+    for value in values:
+        out *= int(value)
+    return out
+
+
+def _window_overhangs(extent: int, kernel: int, stride: int, padding: int,
+                      pooled: int) -> bool:
+    """Whether the last window of an axis reaches past the padded extent.
+
+    Rounding the window count up is what lets a window start inside the padded
+    extent and end outside it; that window is divided by what it covers rather
+    than by the kernel, and reads nothing where it hangs over.
+    """
+
+    return (pooled - 1) * stride + kernel > extent + 2 * padding
+
+
+def _constant_outside(x, ndim: int, fill: float):
+    """A loader of ``x`` that answers ``fill`` for an address outside it."""
+
+    extents = list(x.get_size())[-ndim:]
+    loader = x.make_loader()
+
+    def load(index):
+        index = list(index)
+        inside = None
+        for axis in range(ndim):
+            at = ops.index_expr(index[len(index) - ndim + axis], tp.int64)
+            term = ops.and_(
+                ops.ge(at, ops.index_expr(sympy.Integer(0), tp.int64)),
+                ops.lt(at, ops.index_expr(as_index(extents[axis]), tp.int64)),
+            )
+            inside = term if inside is None else ops.and_(inside, term)
+        return ops.masked(inside, lambda: loader(index), fill)
+
+    return load
+
+
+_fallback_avg_pool = {
+    2: fallback_handler(tp.ops.tp.avg_pool2d.default, add_to_fallback_set=False),
+    3: fallback_handler(tp.ops.tp.avg_pool3d.default, add_to_fallback_set=False),
+}
+
+
 @register("avg_pool2d.default", "avg_pool3d.default")
 def lower_avg_poolnd(x, kernel_size, stride=(), padding=0, ceil_mode=False,
                      count_include_pad=True, divisor_override=None, **kwargs):
-    """Average pooling as a window sum followed by the window's divisor.
+    """Average pooling as the window's values added up and divided, per element.
 
-    A window that is both large and overlapping is left to the operator: the
-    decomposition reads the input once per window, which stops paying once
-    the windows overlap heavily.
+    Each output element reads its window and adds it up in the loop of
+    whatever consumes it, so a pooling of a few positions costs no kernel of
+    its own.  A window of many positions is asked of the framework kernel:
+    written out, it is a body too long to be worth having.
     """
 
-    size, dtype, device = val_info(node_val())
-    in_size = list(x.get_size())
+    size, _, device = val_info(node_val())
     ndim = _spatial_ndim()
     kernel = _pair(kernel_size, ndim)
     stride = _pair(stride, ndim) if stride else list(kernel)
     padding = _pair(padding, ndim) if padding else [0] * ndim
-    window = 1
-    for extent in kernel:
-        window *= extent
-    if window > 25 and any(k != s for k, s in zip(kernel, stride)):
-        raise NotImplementedError(
-            f"average pooling with an overlapping {window}-element window"
+    in_size = list(x.get_size())
+    window = _prod_ints(kernel)
+    if (
+        window > 25
+        or len(in_size) not in (ndim + 1, ndim + 2)
+        or is_dynamic(*in_size, *size)
+    ):
+        return _fallback_avg_pool[ndim](
+            x, kernel, stride, padding, ceil_mode, count_include_pad,
+            divisor_override,
         )
-    spatial_in = in_size[-ndim:]
-    spatial_out = [
-        _pool_output_size(extent, k, s, p, bool(ceil_mode))
-        for extent, k, s, p in zip(spatial_in, kernel, stride, padding)
+    lead = len(in_size) - ndim
+    spatial_in = [int(s) for s in in_size[lead:]]
+    spatial_out = [int(s) for s in list(size)[-ndim:]]
+    overhang = [
+        _window_overhangs(extent, k, s, p, pooled)
+        for extent, k, s, p, pooled in zip(
+            spatial_in, kernel, stride, padding, spatial_out
+        )
     ]
-    prefix = in_size[: len(in_size) - ndim]
-    loader = x.make_loader()
-    boundary = any(padding)
-    f32 = tp.float32
+    # A window that leaves the source reads nothing there, so the read has to
+    # be one that knows where the source ends.
+    had_padding = any(padding) or any(overhang)
 
-    def inner(index, rindex):
-        full = list(index[: len(prefix)])
-        for axis in range(ndim):
-            base = index[len(prefix) + axis]
-            full.append(base * stride[axis] - padding[axis] + rindex[axis])
-        if not boundary:
-            return loader(full)
-        # A padded window reads zero outside the source, so the sum skips it.
-        outside = None
-        for axis in range(ndim):
-            # The address is index arithmetic; a bound test needs it as a value.
-            position = ops.index_expr(full[len(prefix) + axis], tp.int64)
-            low = ops.ge(position, ops.constant(0, tp.int64))
-            high = ops.lt(
-                position, ops.constant(spatial_in[axis], tp.int64)
-            )
-            inside = ops.and_(low, high)
-            outside = inside if outside is None else ops.and_(outside, inside)
-        return ops.masked(outside, lambda: loader(full), ops.constant(0.0, f32))
+    # Read once per position of the window, so it is put in memory when it is
+    # more than a plain read.
+    x.realize_hint()
+    loader = _constant_outside(x, ndim, 0.0) if had_padding else x.make_loader()
+    dtype = x.get_dtype()
+    floating = dtype.is_floating_point
 
-    total = Reduction.create(
-        device=device,
-        dst_dtype=f32,
-        src_dtype=f32,
-        inner_fn=inner,
-        ranges=(*prefix, *spatial_out),
-        reduction_ranges=tuple(kernel),
-        reduction_type='sum',
-    )
-    total.realize()
-    if divisor_override is not None:
-        divisor = float(divisor_override)
-    elif count_include_pad or not any(padding):
-        divisor = float(window)
+    def window_sum(index):
+        base = index[lead:]
+        total = None
+        for offset in itertools.product(*[range(k) for k in kernel]):
+            at = [
+                as_index(base[axis]) * stride[axis] + offset[axis] - padding[axis]
+                for axis in range(ndim)
+            ]
+            value = loader([*index[:lead], *at])
+            total = value if total is None else ops.add(value, total)
+        return total
+
+    if divisor_override:
+        fixed = int(divisor_override)
+    elif not had_padding or (count_include_pad and not any(overhang)):
+        fixed = window
     else:
-        # Only the positions inside the source contribute to the divisor.
-        divisor = None
-    if divisor is None:
-        return _pool_with_masked_divisor(
-            total, prefix, spatial_out, kernel, stride, padding,
-            spatial_in, f32, device,
-        )
-    return pointwise(
-        lambda value: ops.truediv(value, ops.constant(divisor, f32)),
-        total,
-    )
+        fixed = None
 
+    def covered(index):
+        """How many positions the window of this element is divided by."""
 
-def _pool_with_masked_divisor(total, prefix, spatial_out, kernel, stride,
-                              padding, spatial_in, f32, device):
-    """Average pooling whose divisor counts only the positions inside."""
+        base = index[lead:]
+        factor = None
+        for axis in range(ndim):
+            start = as_index(base[axis]) * stride[axis] - padding[axis]
+            end = Min(start + kernel[axis], spatial_in[axis] + padding[axis])
+            if not count_include_pad:
+                start = Max(start, 0)
+                end = Min(end, spatial_in[axis])
+            term = ops.index_expr(end - start, tp.int32)
+            factor = term if factor is None else ops.mul(factor, term)
+        return factor
 
-    def inner(index, rindex):
-        full = list(index[: len(prefix)])
-        for axis in range(len(kernel)):
-            full.append(
-                index[len(prefix) + axis] * stride[axis] - padding[axis] + rindex[axis]
-            )
-        inside = None
-        for axis in range(len(kernel)):
-            position = ops.index_expr(full[len(prefix) + axis], tp.int64)
-            term = ops.and_(
-                ops.ge(position, ops.constant(0, tp.int64)),
-                ops.lt(position, ops.constant(spatial_in[axis], tp.int64)),
-            )
-            inside = term if inside is None else ops.and_(inside, term)
-        return ops.masked(inside, lambda: ops.constant(1.0, f32),
-                          ops.constant(0.0, f32))
+    def fn(index):
+        total = window_sum(index)
+        if fixed is None:
+            divisor = covered(index)
+            if floating:
+                return ops.truediv(total, divisor)
+            return ops.truncdiv(total, divisor)
+        if not floating:
+            return ops.truncdiv(total, ops.constant(fixed, dtype))
+        if fixed > 0 and fixed & (fixed - 1) == 0:
+            # A power of two divides exactly as a product, which is the cheaper
+            # of the two ways to write the same answer.
+            return ops.mul(total, ops.constant(1.0 / fixed, dtype))
+        return ops.truediv(total, ops.constant(fixed, dtype))
 
-    counted = Reduction.create(
-        device=device,
-        dst_dtype=f32,
-        src_dtype=f32,
-        inner_fn=inner,
-        ranges=(*prefix, *spatial_out),
-        reduction_ranges=tuple(kernel),
-        reduction_type='sum',
-    )
-    counted.realize()
-    return pointwise(
-        lambda value, count: ops.truediv(value, count),
-        total,
-        counted,
+    return Pointwise.create(
+        device=x.get_device(),
+        dtype=dtype,
+        inner_fn=fn,
+        ranges=[*in_size[:lead], *spatial_out],
     )
 
 
@@ -2745,7 +2767,7 @@ def lower_index_add(base, dim, index_box, addend, alpha=None, **kwargs):
         value = addend_loader(list(rindex))
         if scale != 1.0:
             value = ops.mul(value, ops.constant(scale, f32))
-        return ops.masked(here, lambda: value, ops.constant(0.0, f32))
+        return ops.masked(here, lambda: value, 0.0)
 
     landed = Reduction.create(
         device=device,
@@ -2769,149 +2791,202 @@ def lower_index_add(base, dim, index_box, addend, alpha=None, **kwargs):
 # ---------------------------------------------------------------------------
 
 
-def _window_covers(index, rindex, prefix, stride, padding, kernel, f32):
-    """Does the output window at ``rindex`` include the input at ``index``?
-
-    A window reaching from ``o * stride - padding`` for ``kernel`` positions
-    covers the input position when that position is within reach, which is two
-    comparisons on where the window starts.
-    """
-
-    inside = None
-    for axis in range(len(kernel)):
-        # The reduced index counts the windows, so it is local to them; the
-        # output index counts the input positions and carries the prefix.
-        at = len(prefix) + axis
-        start = ops.mul(
-            ops.index_expr(rindex[axis], tp.int64), ops.constant(int(stride[axis]), tp.int64)
-        )
-        # start <= index + padding, and start > index + padding - kernel
-        low = ops.le(
-            start,
-            ops.add(ops.index_expr(index[at], tp.int64),
-                    ops.constant(int(padding[axis]), tp.int64)),
-        )
-        high = ops.gt(
-            start,
-            ops.sub(ops.add(ops.index_expr(index[at], tp.int64),
-                            ops.constant(int(padding[axis]), tp.int64)),
-                    ops.constant(int(kernel[axis]), tp.int64)),
-        )
-        term = ops.and_(low, high)
-        inside = term if inside is None else ops.and_(inside, term)
-    return inside
-
-
-@register("avg_pool2d_backward.default", "avg_pool3d_backward.default")
-def lower_avg_poolnd_backward(grad, _input, kernel_size, stride=(), padding=0,
-                              ceil_mode=False, count_include_pad=True,
-                              divisor_override=None, **kwargs):
-    """The input's gradient as the sum of the windows that covered it.
-
-    Pooling reads the input once per window, so the input's gradient is the
-    sum of the output's gradient over every window that read that position --
-    the same sum the forward did, read the other way round.  The divisor is
-    the same one the forward divided by, so the pair stays a pair.
-    """
-
-    _, dtype, device = val_info(node_val())
-    ndim = _spatial_ndim()
-    kernel = _pair(kernel_size, ndim)
-    stride = _pair(stride, ndim) if stride else list(kernel)
-    padding = _pair(padding, ndim) if padding else [0] * ndim
-    grad_size = [int(s) for s in grad.get_size()]
-    spatial_in = grad_size[grad_size.__len__() - ndim:]
-    spatial_out = [
-        _pool_output_size(extent, k, s, p, bool(ceil_mode))
-        for extent, k, s, p in zip(spatial_in, kernel, stride, padding)
-    ]
-    prefix = grad_size[: len(grad_size) - ndim]
-    loader = grad.make_loader()
-    f32 = tp.float32
-
-    def summed(index, rindex):
-        full = list(index[: len(prefix)]) + [
-            rindex[axis] for axis in range(ndim)
-        ]
-        inside = _window_covers(
-            index, rindex, prefix, stride, padding, kernel, f32
-        )
-        return ops.masked(inside, lambda: loader(full), ops.constant(0.0, f32))
-
-    total = Reduction.create(
-        device=device,
-        dst_dtype=f32,
-        src_dtype=f32,
-        inner_fn=summed,
-        ranges=(*prefix, *spatial_in),
-        reduction_ranges=tuple(spatial_out),
-        reduction_type='sum',
-    )
-    total.realize()
-    if divisor_override is not None:
-        divisor = float(divisor_override)
-    elif count_include_pad or not any(padding):
-        divisor = float(_prod_ints(kernel))
-    else:
-        return _pool_backward_with_masked_divisor(
-            total, prefix, spatial_in, spatial_out, kernel, stride, padding, f32,
-            device,
-        )
-    return pointwise(
-        lambda value: ops.truediv(value, ops.constant(divisor, f32)),
-        total,
-    )
-
-
-def _prod_ints(values) -> int:
-    out = 1
-    for value in values:
-        out *= int(value)
-    return out
-
-
 _fallback_avg_pool2d_backward = fallback_handler(
     tp.ops.tp.avg_pool2d_backward.default, add_to_fallback_set=False
 )
 
 
 @register("avg_pool2d_backward.default")
-def lower_avg_pool2d_backward_fast(grad, _input, kernel_size, stride=(), padding=0,
-                                   ceil_mode=False, count_include_pad=True,
-                                   divisor_override=None, **kwargs):
-    """2D average pooling gradient, asked of the framework kernel."""
+def lower_avg_pool2d_backward(grad, _input, kernel_size, stride=(), padding=0,
+                              ceil_mode=False, count_include_pad=True,
+                              divisor_override=None, **kwargs):
+    """2D average pooling gradient, read from the few windows that cover a position.
 
-    return _fallback_avg_pool2d_backward(
-        grad, _input, kernel_size, stride, padding, ceil_mode,
-        count_include_pad, divisor_override,
-    )
+    A position of the input was read by the windows whose start lies within a
+    kernel's width before it, which for the usual strides is one window or a
+    handful.  Each position therefore reads those few gradient values and adds
+    them, in the loop of whatever consumes the result, instead of a kernel of
+    its own walking every window.  A kernel wide enough that a position sits
+    under many windows is asked of the framework kernel instead.
+    """
 
-
-def _pool_backward_with_masked_divisor(total, prefix, spatial_in, spatial_out,
-                                       kernel, stride, padding, f32, device):
-    """Pooling backwards whose divisor counts only the positions inside."""
-
-    def counted(index, rindex):
-        inside = _window_covers(
-            index, rindex, prefix, stride, padding, kernel, f32
+    def fallback():
+        return _fallback_avg_pool2d_backward(
+            grad, _input, kernel_size, stride, padding, ceil_mode,
+            count_include_pad, divisor_override,
         )
-        return ops.masked(inside, lambda: ops.constant(1.0, f32),
-                          ops.constant(0.0, f32))
 
-    count = Reduction.create(
-        device=device,
-        dst_dtype=f32,
-        src_dtype=f32,
-        inner_fn=counted,
-        ranges=(*prefix, *spatial_in),
-        reduction_ranges=tuple(spatial_out),
-        reduction_type='sum',
+    kernel = _pair(kernel_size, 2)
+    stride = _pair(stride, 2) if stride else list(kernel)
+    padding = _pair(padding, 2) if padding else [0, 0]
+    if divisor_override is not None and divisor_override == 0:
+        return fallback()
+    in_size = list(_input.get_size())
+    grad_size = list(grad.get_size())
+    if len(in_size) not in (3, 4) or is_dynamic(*in_size, *grad_size):
+        return fallback()
+    height, width = int(in_size[-2]), int(in_size[-1])
+    pooled_height, pooled_width = int(grad_size[-2]), int(grad_size[-1])
+    # A window that hangs over the padded extent is divided by what it covers
+    # rather than by the kernel, whichever way the padding is counted.
+    overhang = _window_overhangs(
+        height, kernel[0], stride[0], padding[0], pooled_height
+    ) or _window_overhangs(width, kernel[1], stride[1], padding[1], pooled_width)
+    if divisor_override is not None:
+        fixed = divisor_override
+    elif not overhang and (count_include_pad or not (padding[0] or padding[1])):
+        fixed = kernel[0] * kernel[1]
+    else:
+        fixed = None
+
+    h_window = max(
+        max(h // stride[0] - max(0, (h - kernel[0]) // stride[0]), 1)
+        for h in range(kernel[0] * 2)
     )
-    count.realize()
-    return pointwise(
-        lambda value, seen: ops.truediv(value, seen),
-        total,
-        count,
+    w_window = max(
+        max(w // stride[1] - max(0, (w - kernel[1]) // stride[1]), 1)
+        for w in range(kernel[1] * 2)
+    )
+    if h_window * w_window > 25:
+        return fallback()
+
+    # Read once per covering window, so it is put in memory when it is more
+    # than a plain read.
+    grad.realize_hint()
+    loader = grad.make_loader()
+    i32 = tp.int32
+
+    def covered(ph, pw):
+        """How many positions the window at (ph, pw) is divided by."""
+
+        hstart = ops.sub(ops.mul(ph, ops.constant(stride[0], i32)), ops.constant(padding[0], i32))
+        wstart = ops.sub(ops.mul(pw, ops.constant(stride[1], i32)), ops.constant(padding[1], i32))
+        hend = ops.minimum(
+            ops.add(hstart, ops.constant(kernel[0], i32)),
+            ops.constant(height + padding[0], i32),
+        )
+        wend = ops.minimum(
+            ops.add(wstart, ops.constant(kernel[1], i32)),
+            ops.constant(width + padding[1], i32),
+        )
+        if not count_include_pad:
+            hstart = ops.maximum(hstart, ops.constant(0, i32))
+            wstart = ops.maximum(wstart, ops.constant(0, i32))
+            hend = ops.minimum(hend, ops.constant(height, i32))
+            wend = ops.minimum(wend, ops.constant(width, i32))
+        return ops.mul(ops.sub(hend, hstart), ops.sub(wend, wstart))
+
+    def fn(idx):
+        *prefix, h, w = idx
+        h = as_index(h) + padding[0]
+        w = as_index(w) + padding[1]
+        phstart = ops.index_expr(FloorDiv(h - kernel[0] + stride[0], stride[0]), i32)
+        pwstart = ops.index_expr(FloorDiv(w - kernel[1] + stride[1], stride[1]), i32)
+        phend = ops.index_expr(FloorDiv(h, stride[0]) + 1, i32)
+        pwend = ops.index_expr(FloorDiv(w, stride[1]) + 1, i32)
+        phstart = ops.maximum(phstart, ops.constant(0, i32))
+        pwstart = ops.maximum(pwstart, ops.constant(0, i32))
+        phend = ops.minimum(phend, ops.constant(pooled_height, i32))
+        pwend = ops.minimum(pwend, ops.constant(pooled_width, i32))
+
+        gradient = None
+        for ph_ in range(h_window):
+            for pw_ in range(w_window):
+                ph = ops.add(phstart, ops.constant(ph_, i32))
+                pw = ops.add(pwstart, ops.constant(pw_, i32))
+                scale = fixed if fixed is not None else covered(ph, pw)
+                part = ops.truediv(
+                    loader([
+                        *prefix,
+                        ops.indirect_indexing(
+                            ops.minimum(ph, ops.sub(phend, ops.constant(1, i32))),
+                            pooled_height,
+                            check=False,
+                        ),
+                        ops.indirect_indexing(
+                            ops.minimum(pw, ops.sub(pwend, ops.constant(1, i32))),
+                            pooled_width,
+                            check=False,
+                        ),
+                    ]),
+                    scale,
+                )
+                mask = ops.and_(ops.lt(ph, phend), ops.lt(pw, pwend))
+                if gradient is None:
+                    gradient = ops.where(mask, part, ops.constant(0.0, tp.float32))
+                else:
+                    gradient = ops.where(mask, ops.add(gradient, part), gradient)
+        return gradient
+
+    return Pointwise.create(
+        device=grad.get_device(),
+        dtype=_input.get_dtype(),
+        inner_fn=fn,
+        ranges=in_size,
+    )
+
+
+_fallback_upsample_nearest2d_backward = fallback_handler(
+    tp.ops.tp.upsample_nearest2d_backward.default, add_to_fallback_set=False
+)
+
+
+@register("upsample_nearest2d_backward.default")
+def lower_upsample_nearest2d_backward(grad, output_size, input_size,
+                                      scales_h=None, scales_w=None, **kwargs):
+    """Nearest upsampling's gradient, as the sum of the positions that read one.
+
+    Upsampling by a whole factor reads each input position from a block of
+    output positions, so the input's gradient at a position is the sum of the
+    output's gradient over that block: a few reads and additions per element,
+    done in the loop of whatever consumes the result.  A factor that is not a
+    whole number, or one spelled differently from the sizes, is asked of the
+    framework kernel.
+    """
+
+    def fallback():
+        return _fallback_upsample_nearest2d_backward(
+            grad, output_size, input_size, scales_h, scales_w
+        )
+
+    grad_size = list(grad.get_size())
+    if len(grad_size) != 4 or is_dynamic(*grad_size):
+        return fallback()
+    try:
+        out_h, out_w = (int(s) for s in list(output_size)[-2:])
+        in_h, in_w = (int(s) for s in list(input_size)[-2:])
+    except (TypeError, ValueError):
+        return fallback()
+    if (int(grad_size[-2]), int(grad_size[-1])) != (out_h, out_w):
+        return fallback()
+    if in_h <= 0 or in_w <= 0 or out_h % in_h or out_w % in_w:
+        return fallback()
+    rh, rw = out_h // in_h, out_w // in_w
+    for given, ratio in ((scales_h, rh), (scales_w, rw)):
+        if given is not None and float(given) != float(ratio):
+            return fallback()
+    if rh * rw > 25:
+        return fallback()
+
+    # Read once per position of the block, so it is put in memory when it is
+    # more than a plain read.
+    grad.realize_hint()
+    loader = grad.make_loader()
+
+    def fn(idx):
+        *prefix, i, j = idx
+        total = None
+        for a in range(rh):
+            for b in range(rw):
+                value = loader([*prefix, as_index(i) * rh + a, as_index(j) * rw + b])
+                total = value if total is None else ops.add(total, value)
+        return total
+
+    return Pointwise.create(
+        device=grad.get_device(),
+        dtype=grad.get_dtype(),
+        inner_fn=fn,
+        ranges=[*grad_size[:-2], in_h, in_w],
     )
 
 
@@ -5405,8 +5480,7 @@ for _name, _warn in (
     ("_pdist_backward", False),
     ("max_pool2d_with_indices_backward", False),
     ("max_pool3d_with_indices_backward", False),
-    ("avg_pool2d_backward", False),
-    ("upsample_nearest2d_backward", False),
+    ("avg_pool3d_backward", False),
     ("adaptive_avg_pool2d_backward", False),
     ("adaptive_avg_pool3d_backward", False),
 ):

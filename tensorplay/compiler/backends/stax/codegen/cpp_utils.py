@@ -192,6 +192,22 @@ class CppPrinter(CXX11CodePrinter):
             f"static_cast<double>({x}), static_cast<double>({div}))"
         )
 
+    def _print_min_max(self, expr: sympy.Expr, name: str) -> str:
+        # The host's min and max take two operands of one type and deduce it
+        # from both, so a literal beside an index would not compile: every
+        # operand is written in the one type the answer has.
+        cpp_type = INDEX_TYPE if expr.is_integer else "double"
+        args = [f"static_cast<{cpp_type}>({self._print(a)})" for a in expr.args]
+        if len(args) == 2:
+            return f"std::{name}({args[0]}, {args[1]})"
+        return f"std::{name}<{cpp_type}>({{{', '.join(args)}}})"
+
+    def _print_Min(self, expr: sympy.Expr) -> str:
+        return self._print_min_max(expr, "min")
+
+    def _print_Max(self, expr: sympy.Expr) -> str:
+        return self._print_min_max(expr, "max")
+
 
 #: Print an expression as the host language writes it.
 cexpr = CppPrinter().doprint
