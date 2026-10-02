@@ -36,6 +36,36 @@ _MIXED_DTYPE_OPS = {
     "scaled_dot_product_attention_backward",
 }
 
+# Operators whose native kernels require every floating tensor operand to
+# share one element type.  Pointwise operators promote their own mixed inputs
+# (a half activation next to a float weight is read in float), so aligning
+# those here only adds runtime casts that the kernels would widen themselves.
+_NEEDS_DTYPE_ALIGN_OPS = {
+    "conv2d",
+    "convolution",
+    "conv_transpose",
+    "conv2d_grad_input",
+    "conv2d_grad_weight",
+    "conv2d_grad_bias",
+    "matmul",
+    "addmm",
+    "mm",
+    "bmm",
+    "linear",
+    "native_group_norm",
+    "native_group_norm_backward",
+    "layer_norm",
+    "native_layer_norm",
+    "native_layer_norm_backward",
+    "avg_pool2d",
+    "avg_pool2d_backward",
+    "max_pool2d",
+    "max_pool2d_backward",
+    "upsample_nearest2d",
+    "upsample_nearest2d_backward",
+    "_scaled_dot_product_attention_forward",
+}
+
 def _align_eager_dtypes(opname: str, args: tuple[Any, ...]) -> tuple[Any, ...]:
     """Give every tensor operand of a call one element type.
 
@@ -46,6 +76,8 @@ def _align_eager_dtypes(opname: str, args: tuple[Any, ...]) -> tuple[Any, ...]:
     """
 
     if opname == "to" or opname in _MIXED_DTYPE_OPS:
+        return args
+    if opname not in _NEEDS_DTYPE_ALIGN_OPS:
         return args
     tensors = [a for a in args if isinstance(a, tensorplay.Tensor)]
     if len(tensors) < 2:
