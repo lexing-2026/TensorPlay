@@ -191,6 +191,37 @@ def has_free_unbacked_symbols(x, unbacked_only: bool = False) -> bool:
     return len(get_free_symbols(x, unbacked_only=unbacked_only)) > 0
 
 
+def _flat_window_base_name(x) -> str | None:
+    """The storage's name, when the value reads that storage in order.
+
+    A window with contiguous strides and no offset over row-major storage
+    holds exactly the storage's bytes under another shape, so a copy of the
+    window is a copy of the storage.  A shifted or strided window, a reshaped
+    reading, or an unrealized body names only itself, and the answer is none.
+    """
+
+    node = x
+    while isinstance(node, MutableBox):
+        node = node.data
+    if not isinstance(node, ReinterpretView):
+        return None
+    cursor = node
+    while isinstance(cursor, ReinterpretView):
+        layout = cursor.get_layout()
+        try:
+            size = [int(s) for s in cursor.get_size()]
+        except (TypeError, ValueError):
+            return None
+        if int(layout.offset) != 0 or list(layout.stride) != [
+            int(s) for s in FlexibleLayout.contiguous_strides(size)
+        ]:
+            return None
+        cursor = cursor.data
+    if isinstance(cursor, Buffer) and cursor.layout.is_contiguous():
+        return cursor.get_name()
+    return None
+
+
 def is_contiguous_for_memory_format_or_false(x, memory_format) -> bool:
     """Whether this value is laid out in that memory format.
 
@@ -6353,6 +6384,41 @@ class ExternKernel(InputsKernel):
             raise AssertionError("Expected name is not None")
         return name
 
+    @classmethod
+    def _shared_layout_copy(cls, x: "IRNode", *, layout_key) -> "TensorBox":
+        """A copy made once per (value, arrangement) instead of once per ask.
+
+        The conversions that arrange a value for a caller only read it, so
+        callers asking for the same value under the same arrangement can read
+        one result.  The value is named by its storage when the ask reads
+        row-major storage in order -- such a window holds the storage's bytes
+        under another shape -- and by its own node otherwise, since a view is
+        named by its base and two views of one base need not read it alike.
+        A caller that writes what it is given must go through copy_input.
+        """
+
+        node = x
+        while isinstance(node, MutableBox):
+            node = node.data
+        name = _flat_window_base_name(x)
+        if name is None:
+            name = id(node)
+        try:
+            shape = tuple(int(s) for s in x.get_size())
+        except (TypeError, ValueError):
+            shape = tuple(str(s) for s in x.get_size())
+        cache = getattr(V.graph, "_shared_layout_copy_cache", None)
+        if cache is None:
+            cache = {}
+            V.graph._shared_layout_copy_cache = cache
+        key = (name, shape, layout_key)
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        out = cls.copy_input(x)
+        cache[key] = out
+        return out
+
     @staticmethod
     def copy_input(x: "IRNode") -> "TensorBox":
         """A separate copy of a value, so that writing over it is harmless.
@@ -6584,20 +6650,23 @@ class ExternKernel(InputsKernel):
         )
 
     @classmethod
-    def realize_input(cls, x: "IRNode") -> "IRNode":
+    def realize_input(cls, x: "IRNode", allow_shared: bool = False) -> "IRNode":
         """Put a value in memory, so that an external call has something to read.
 
         Where the value is already a view of memory someone else holds, that
         memory is used; otherwise the value is given a buffer of its own.
+        A caller that only reads may ask for the fallback buffer to be shared
+        between asks for the same value, which turns one copy per reader into
+        one copy per value; a caller that can write what it is given must not.
         """
 
         if isinstance(x, TensorBox):
-            return cls.realize_input(x.data)
+            return cls.realize_input(x.data, allow_shared=allow_shared)
         if isinstance(x, ConstantBuffer):
             return x
         if isinstance(x, ReinterpretView):
             return ReinterpretView(
-                data=cls.realize_input(x.data), layout=x.get_layout()
+                data=cls.realize_input(x.data, allow_shared=allow_shared), layout=x.get_layout()
             )
         if isinstance(x, BaseView):
             try:
@@ -6610,6 +6679,8 @@ class ExternKernel(InputsKernel):
         if isinstance(x, StorageBox):
             x.realize()
             return x
+        if allow_shared:
+            return cls._shared_layout_copy(x, layout_key=("realize_input",))
         return cls.copy_input(x)
 
     @classmethod
@@ -6628,7 +6699,7 @@ class ExternKernel(InputsKernel):
             x = cls.realize_input(x)
         if is_stride_order_storage_and_layout(x, [0, 1]):
             return x
-        return cls.copy_input(x)
+        return cls._shared_layout_copy(x, layout_key=("stride1",))
 
     @classmethod
     def require_strides(
@@ -6802,7 +6873,16 @@ class ExternKernel(InputsKernel):
         # An expanded dimension has no stride of its own, so the stride asked
         # for is only a shape to fit into; what is copied is the value as it
         # already is.
-        x = cls.copy_input(x)
+        x = cls._shared_layout_copy(
+            x,
+            layout_key=(
+                "require_strides",
+                tuple(str(s) for s in order) if order is not None else None,
+                tuple(str(s) for s in exact_strides) if exact_strides is not None else None,
+                bool(allow_padding),
+                tuple(expanded_dims) if expanded_dims is not None else None,
+            ),
+        )
         if isinstance(x, TensorBox) and isinstance(x.data, ExpandView):
             x = TensorBox(x.data.create_with_same_size(x.data.get_size()))
 
@@ -6873,7 +6953,7 @@ class ExternKernel(InputsKernel):
 
         if is_contiguous_storage_and_layout(x):
             return x
-        x = cls.copy_input(x)
+        x = cls._shared_layout_copy(x, layout_key=("contiguous",))
         assert is_contiguous_storage_and_layout(x)
         return x
 
