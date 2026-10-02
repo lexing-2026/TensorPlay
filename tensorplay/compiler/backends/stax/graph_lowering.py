@@ -26,7 +26,7 @@ import tensorplay as tp
 from ....graph.experimental.sympy_functions import OrderedSet
 from tensorplay.utils import _pytree as pytree
 
-from . import config
+from . import config, ir
 from .fx_utils import count_flops_fx
 from .loops import compute_required_storage_length, contiguous_strides
 from .utils import (
@@ -405,6 +405,39 @@ def mark_nodes_dislike_padding(g, user_visible_output_strides: dict) -> None:
 
 
 log = logging.getLogger(__name__)
+
+
+# A region records a convolution under the name it was called by -- the
+# rank-specific forward calls and the gradient calls a backward region is
+# made of -- as well as under the general one.
+_CONVOLUTION_TARGET_PREFIXES = (
+    "tp.convolution.",
+    "tp.conv1d.",
+    "tp.conv2d.",
+    "tp.conv3d.",
+    "tp.conv1d_grad_input.",
+    "tp.conv1d_grad_weight.",
+    "tp.conv2d_grad_input.",
+    "tp.conv2d_grad_weight.",
+    "tp.conv3d_grad_input.",
+    "tp.conv3d_grad_weight.",
+)
+
+
+def _is_convolution_node(node) -> bool:
+    """Whether a node is a convolution or one of a convolution's gradients."""
+    if node.op != "call_function":
+        return False
+    if node.target is tp.ops.tp.convolution.default:
+        return True
+    return str(node.target).startswith(_CONVOLUTION_TARGET_PREFIXES)
+
+
+def _node_device_type(node) -> str | None:
+    """The device kind of the value a node stands for, when it is known."""
+    val = node.meta.get("val") if hasattr(node, "meta") else None
+    device = getattr(val, "device", None)
+    return getattr(device, "type", None)
 
 
 def is_mkldnn_conv(node) -> bool:
@@ -831,6 +864,19 @@ class GraphLowering(Interpreter):
             if is_mkldnn_conv(n):
                 conv_nodes.append(n)
 
+        if not conv_nodes:
+            # A region records a convolution under the name it was called by.
+            # On the cpu those calls land on the same engine the general call
+            # does, so a region made of them is laid out the same way.
+            named = [n for n in gm.graph.nodes if _is_convolution_node(n)]
+            if named and all(
+                _node_device_type(arg) in SUPPORTED_MKLDNN_DEVICES
+                for n in named
+                for arg in n.args[:3]
+                if isinstance(arg, tp.graph.Node)
+            ):
+                conv_nodes = named
+
         nconv = len(conv_nodes)
 
         if nconv == 0:
@@ -991,7 +1037,7 @@ class GraphLowering(Interpreter):
         output_set: OrderedSet = OrderedSet()
         last_conv = None
         for n in reversed(list(gm.graph.nodes)):
-            if n.target is tp.ops.tp.convolution.default:
+            if _is_convolution_node(n):
                 output_set.add(n)
                 if last_conv is None:
                     last_conv = n
