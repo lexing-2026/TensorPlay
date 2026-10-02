@@ -1506,13 +1506,37 @@ def _unflatten_index(flat, size):
     return out
 
 
+#: What a body may do besides reading and converting while still counting as
+#: a lone element-type conversion.
+_CAST_ONLY_OPS = frozenset({"load", "to_dtype", "constant"})
+
+
+def _is_lone_cast(node) -> bool:
+    """Whether a loop's body is its reads converted to another element type.
+
+    Laying such a body down would put a whole copy of the input in memory,
+    holding what every reader re-derives from the input itself: nothing a
+    conversion of the reads cannot give them.  Anything the body computes
+    beyond the conversion means real work whose result is worth keeping.
+    """
+
+    try:
+        opcount = node.inner_fn_opcount()
+    except Exception:
+        return False
+    return opcount.used_ops <= _CAST_ONLY_OPS
+
+
 def reshape(x: TensorBox, new_size) -> TensorBox:
     """This value under a different shape, without moving anything if it can be.
 
     Memory that already lies in consecutive elements is described by the new
     shape rather than copied: the elements are where they were, and a shape, a
-    stride and an offset say how to read them as the new shape.  Memory that
-    does not lie that way has to be walked, which is a view over an index.
+    stride and an offset say how to read them as the new shape.  The view is
+    recorded before any storage exists, so a producer that is still only a
+    loop stays unwritten and each consumer reads straight through the view;
+    where the new shape cannot be reached by arithmetic on the position, the
+    view says so and the elements are moved when the value is laid down.
     """
 
     old_size = tuple(int(s) for s in x.get_size())
@@ -1538,24 +1562,28 @@ def reshape(x: TensorBox, new_size) -> TensorBox:
     if isinstance(node, (Pointwise, Reduction)) and isinstance(x.data, StorageBox):
         # A loop that has not been materialized has no storage to view, so it
         # is realized first; the resulting buffer is contiguous and the new
-        # shape can be described as a plain reinterpret view of it.
-        x.data.realize()
-        node = _underlying(x)
-        if isinstance(node, Buffer) and node.layout.is_contiguous():
-            settled = node.layout.as_fixed()
-            return TensorBox(
-                ReinterpretView(
-                    data=node,
-                    layout=FixedLayout(
-                        settled.device,
-                        settled.dtype,
-                        new_size,
-                        contiguous_strides(new_size),
-                        settled.offset,
-                        settled.is_pinned,
-                    ),
+        # shape can be described as a plain reinterpret view of it.  A bare
+        # element-type conversion is excluded: writing it down would put a
+        # whole copy of the value in memory that every reader re-derives
+        # anyway, so it stays unwritten and each reader converts on load.
+        if not _is_lone_cast(node):
+            x.data.realize()
+            node = _underlying(x)
+            if isinstance(node, Buffer) and node.layout.is_contiguous():
+                settled = node.layout.as_fixed()
+                return TensorBox(
+                    ReinterpretView(
+                        data=node,
+                        layout=FixedLayout(
+                            settled.device,
+                            settled.dtype,
+                            new_size,
+                            contiguous_strides(new_size),
+                            settled.offset,
+                            settled.is_pinned,
+                        ),
+                    )
                 )
-            )
     return TensorBox(View.create(_underlying(x), new_size))
 
 
