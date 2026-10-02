@@ -96,8 +96,6 @@ def _assert_close(got, expected):
 @pytest.mark.parametrize("pooling", POOLINGS)
 def test_average_pooling_value_and_gradient(device, pooling):
     kernel, stride, padding, ceil_mode, count_include_pad = pooling
-    if device == "cuda" and ceil_mode and not count_include_pad:
-        pytest.skip("covered on the host; the device kernel is checked with its own fix")
     pooled, grad, weights = _pool_by_hand(*pooling)
 
     def pool(v):
@@ -130,3 +128,18 @@ def test_nearest_upsampling_value_and_gradient(device, extent):
     got, got_grad = _run(upsample, device, weights)
     _assert_close(got, upsampled)
     _assert_close(got_grad, grad)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("pooling", POOLINGS)
+def test_average_pooling_run_directly(device, pooling):
+    kernel, stride, padding, ceil_mode, count_include_pad = pooling
+    pooled, grad, weights = _pool_by_hand(*pooling)
+    x = tp.tensor([[_source()]], device=device, requires_grad=True)
+    out = F.avg_pool2d(
+        x, kernel, stride, padding, ceil_mode=ceil_mode,
+        count_include_pad=count_include_pad,
+    )
+    (out * tp.tensor([[weights]], device=device)).sum().backward()
+    _assert_close(out.detach().cpu().tolist()[0][0], pooled)
+    _assert_close(x.grad.cpu().tolist()[0][0], grad)

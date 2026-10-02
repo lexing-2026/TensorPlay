@@ -147,14 +147,15 @@ Tensor avg_pool2d_backward_native_cuda(const Tensor& grad_output,
                                        bool ceil_mode, bool count_include_pad,
                                        std::optional<int64_t> divisor_override);
 
-// The DNN library takes float and double only, and takes the full window as
-// the divisor, so an explicit divisor, windows clipped by ceil_mode, and any
-// narrower element type all go through the native kernel instead.
+// The DNN library takes float and double only, counts its windows rounding
+// down, and takes the full window as the divisor, so an explicit divisor, a
+// window count rounded up by ceil_mode, and any narrower element type all go
+// through the native kernel instead.
 static inline bool avg_pool2d_prefers_native(const Tensor& input,
                                              bool ceil_mode,
-                                             bool count_include_pad,
+                                             bool /*count_include_pad*/,
                                              const std::optional<int64_t>& divisor_override) {
-    if (divisor_override.has_value() || (ceil_mode && count_include_pad)) {
+    if (divisor_override.has_value() || ceil_mode) {
         return true;
     }
     return !(input.dtype() == DType::Float32 || input.dtype() == DType::Float64);
