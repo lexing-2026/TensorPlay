@@ -4187,11 +4187,14 @@ Tensor conv2d_grad_input_cpu(const Tensor& grad_output, const Tensor& input, con
     int64_t W_out = grad_output.size(3);
 
     // Grad buffers follow the activation layout the forward chain produced,
-    // so the gradient keeps flowing without a repack at this boundary.
+    // so the gradient keeps flowing without a repack at this boundary.  Every
+    // kernel tried first writes the whole buffer, so it is handed over as
+    // allocated; only the column fallback at the end adds into it, and that
+    // one clears it before it starts.
     const bool use_cl = conv2d_use_channels_last(input, weight);
     Tensor grad_input = use_cl
-        ? zeros_channels_last({N, C_in, H_in, W_in}, input.dtype(), input.device())
-        : Tensor::zeros({N, C_in, H_in, W_in}, input.dtype(), input.device());
+        ? empty_channels_last({N, C_in, H_in, W_in}, input.dtype(), input.device())
+        : Tensor::empty({N, C_in, H_in, W_in}, input.dtype(), input.device());
 
     Tensor grad_output_contig = contiguous_in(grad_output, use_cl);
 
@@ -4243,13 +4246,12 @@ Tensor conv2d_grad_input_cpu(const Tensor& grad_output, const Tensor& input, con
     }
     #endif
 
-    // The col2im fallback addresses the grad buffer as row-major.
+    // The col2im fallback addresses the grad buffer as row-major and adds
+    // each column into it, so it starts from a cleared buffer.
     if (!grad_output_contig.is_contiguous()) {
         grad_output_contig = grad_output_contig.contiguous();
     }
-    if (!grad_input.is_contiguous()) {
-        grad_input = Tensor::zeros({N, C_in, H_in, W_in}, input.dtype(), input.device());
-    }
+    grad_input = Tensor::zeros({N, C_in, H_in, W_in}, input.dtype(), input.device());
 
     if (input.dtype() == DType::Float32) {
         int64_t C_out_group = C_out / groups;
