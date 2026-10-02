@@ -1,9 +1,10 @@
 // CPU scaled-dot-product attention kernels.
 // lives under transformers/, not an "llm" grab-bag.
 //
-// Forward f32/f16/bf16 path: BLAS sgemm for QK^T and PV, fused causal-prefix
-// row softmax with runtime-dispatched libmvec vector exp (AVX-512 16-wide ->
-// AVX2 8-wide -> scalar).  f64 keeps a serial double reference oracle.
+// The fused flash path tiles the query and key axes, runs BLAS gemm for
+// Q K^T and P V per tile with a row softmax in between (runtime-dispatched
+// vector exp: AVX-512 -> AVX2 -> scalar), and shares the tiles over the
+// intra-op pool.  f16/bf16 inputs accumulate in f32; f64 accumulates in f64.
 
 #include <algorithm>
 #include <type_traits>
@@ -21,6 +22,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <tuple>
 #include <type_traits>
 #include <vector>
@@ -47,22 +49,74 @@ namespace ops = tensorplay::tpx::ops;
 
 namespace {
 
-// Vectorized expf: AVX-512 16 lanes -> AVX2 8 lanes -> scalar libm tail.
-// The target attribute is required because the TU compiles with base
-// x86-64 flags (repo convention: per-function targets, cf. VecUnary.h).
+// Vectorized exp over a row.  Each lane width lives in its own function so
+// the wider instruction set is confined to code reached only after the
+// running CPU reported it; the TU itself compiles with base x86-64 flags.
+// Every helper returns how many leading elements it handled and the caller
+// finishes the tail through libm.
 #if defined(TP_SDPA_SLEEF)
-__attribute__((target("avx2,avx512f")))
+__attribute__((target("avx512f")))
+int64_t vexp_f32_avx512(const float* x, float* y, int64_t n) {
+  int64_t i = 0;
+  for (; i + 16 <= n; i += 16)
+    _mm512_storeu_ps(y + i, tensorplay::tpsleef::exp(_mm512_loadu_ps(x + i)));
+  return i;
+}
+
+__attribute__((target("avx2")))
+int64_t vexp_f32_avx2(const float* x, float* y, int64_t n) {
+  int64_t i = 0;
+  for (; i + 8 <= n; i += 8)
+    _mm256_storeu_ps(y + i, tensorplay::tpsleef::exp(_mm256_loadu_ps(x + i)));
+  return i;
+}
+
+__attribute__((target("avx512f")))
+int64_t vexp_f64_avx512(const double* x, double* y, int64_t n) {
+  int64_t i = 0;
+  for (; i + 8 <= n; i += 8)
+    _mm512_storeu_pd(y + i, tensorplay::tpsleef::exp(_mm512_loadu_pd(x + i)));
+  return i;
+}
+
+__attribute__((target("avx2")))
+int64_t vexp_f64_avx2(const double* x, double* y, int64_t n) {
+  int64_t i = 0;
+  for (; i + 4 <= n; i += 4)
+    _mm256_storeu_pd(y + i, tensorplay::tpsleef::exp(_mm256_loadu_pd(x + i)));
+  return i;
+}
+
+// 2: AVX-512F, 1: AVX2, 0: neither.
+int vexp_isa_level() {
+  static const int level = __builtin_cpu_supports("avx512f")
+                               ? 2
+                               : (__builtin_cpu_supports("avx2") ? 1 : 0);
+  return level;
+}
 #endif
+
 void vexp_f32(const float* x, float* y, int64_t n) {
   int64_t i = 0;
 #if defined(TP_SDPA_SLEEF)
-  const bool avx512 = __builtin_cpu_supports("avx512f");
-  if (avx512) {
-    for (; i + 16 <= n; i += 16)
-      _mm512_storeu_ps(y + i, tensorplay::tpsleef::exp(_mm512_loadu_ps(x + i)));
-  } else if (__builtin_cpu_supports("avx2")) {
-    for (; i + 8 <= n; i += 8)
-      _mm256_storeu_ps(y + i, tensorplay::tpsleef::exp(_mm256_loadu_ps(x + i)));
+  const int level = vexp_isa_level();
+  if (level == 2) {
+    i = vexp_f32_avx512(x, y, n);
+  } else if (level == 1) {
+    i = vexp_f32_avx2(x, y, n);
+  }
+#endif
+  for (; i < n; ++i) y[i] = std::exp(x[i]);
+}
+
+void vexp_f64(const double* x, double* y, int64_t n) {
+  int64_t i = 0;
+#if defined(TP_SDPA_SLEEF)
+  const int level = vexp_isa_level();
+  if (level == 2) {
+    i = vexp_f64_avx512(x, y, n);
+  } else if (level == 1) {
+    i = vexp_f64_avx2(x, y, n);
   }
 #endif
   for (; i < n; ++i) y[i] = std::exp(x[i]);
@@ -558,284 +612,492 @@ int64_t fused_sdp_choice_cpu(const Tensor& query, const Tensor& key,
                                             enable_gqa);
 }
 
-// Fused flash-style kernel for the `_scaled_dot_product_attention_for_cpu`
-// dispatcher contract: 4D [B, H, Tq, D], optional 2D/4D float mask, causal
-// flag, explicit scale.  Returns the attention output plus the per-row
-// logsumexp (B, H, Tq) in the accumulate dtype that the backward kernel
-// replays.  Dropout is rejected, matching the CPU flash contract.
+// ---------------------------------------------------------------------------
+// Blocked flash attention on the CPU.
+//
+// The query axis is cut into blocks of `flash_q_split` rows and the key axis
+// into blocks of `kFlashKvSplit` columns.  A (query block, key block) pair
+// costs two matrix products -- scores = Q K^T and the weighted values P V --
+// with a row softmax in between, and the key blocks of one query block are
+// merged with the running-max/running-sum recurrence, so the full
+// [Tq, Skv] score matrix never exists: the scratch per thread is one
+// q_split x kv_split tile.  Work is shared over batch x head x query block.
+//
+// The backward replays the same tiling.  The probabilities are rebuilt from
+// the saved per-row logsumexp as p = exp(s - lse) and
+//   dV += P^T dO,  dS = P * (dO V^T - rowsum(dO * O)),
+//   dQ += scale * dS K,  dK += scale * dS^T Q,
+// shared over batch x key head so every worker owns its gradient slices.
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr int64_t kFlashKvSplit = 512;
+
+inline int64_t flash_q_split(int64_t q_len) {
+  return q_len >= 768 ? 256 : (q_len >= 192 ? 64 : 32);
+}
+
+// Row-major C[m, n] = alpha * op(A)[m, k] @ op(B)[k, n] + beta * C.
+template <typename A>
+inline void flash_gemm(bool trans_a, bool trans_b, int64_t m, int64_t n,
+                       int64_t k, A alpha, const A* a, int64_t lda,
+                       const A* b, int64_t ldb, A beta, A* c, int64_t ldc) {
+#if defined(USE_MKL) || defined(USE_BLAS)
+  const CBLAS_TRANSPOSE ta = trans_a ? CblasTrans : CblasNoTrans;
+  const CBLAS_TRANSPOSE tb = trans_b ? CblasTrans : CblasNoTrans;
+  if constexpr (std::is_same_v<A, float>) {
+    cblas_sgemm(CblasRowMajor, ta, tb, static_cast<int>(m),
+                static_cast<int>(n), static_cast<int>(k), alpha, a,
+                static_cast<int>(lda), b, static_cast<int>(ldb), beta, c,
+                static_cast<int>(ldc));
+  } else {
+    cblas_dgemm(CblasRowMajor, ta, tb, static_cast<int>(m),
+                static_cast<int>(n), static_cast<int>(k), alpha, a,
+                static_cast<int>(lda), b, static_cast<int>(ldb), beta, c,
+                static_cast<int>(ldc));
+  }
+#else
+  for (int64_t i = 0; i < m; ++i) {
+    A* crow = c + i * ldc;
+    if (beta == A(0)) {
+      std::fill(crow, crow + n, A(0));
+    } else if (beta != A(1)) {
+      for (int64_t j = 0; j < n; ++j) crow[j] *= beta;
+    }
+    for (int64_t p = 0; p < k; ++p) {
+      const A av = alpha * (trans_a ? a[p * lda + i] : a[i * lda + p]);
+      if (trans_b) {
+        for (int64_t j = 0; j < n; ++j) crow[j] += av * b[j * ldb + p];
+      } else {
+        const A* brow = b + p * ldb;
+        for (int64_t j = 0; j < n; ++j) crow[j] += av * brow[j];
+      }
+    }
+  }
+#endif
+}
+
+inline void flash_vexp(float* x, int64_t n) { vexp_f32(x, x, n); }
+inline void flash_vexp(double* x, int64_t n) { vexp_f64(x, x, n); }
+
+// An additive mask broadcast to [mask_b, mask_h, Tq, Skv] in the accumulate
+// type, where mask_b is 1 or B and mask_h is 1 or H.
+struct FlashMask {
+  Tensor data;
+  int64_t mask_b = 1;
+  int64_t mask_h = 1;
+
+  template <typename A>
+  const A* rows(int64_t b, int64_t h, int64_t tq, int64_t skv) const {
+    if (!data.defined()) return nullptr;
+    const int64_t bi = mask_b > 1 ? b : 0;
+    const int64_t hi = mask_h > 1 ? h : 0;
+    return data.data_ptr<A>() + (bi * mask_h + hi) * tq * skv;
+  }
+};
+
+FlashMask flash_prepare_mask(const std::optional<Tensor>& attn_mask,
+                             DType origin_dtype, DType acc_dtype, int64_t B,
+                             int64_t H, int64_t Tq, int64_t Skv,
+                             const char* who) {
+  FlashMask out;
+  if (!attn_mask.has_value() || !attn_mask->defined() ||
+      attn_mask->numel() == 0) {
+    return out;
+  }
+  const Tensor& m = *attn_mask;
+  if (m.dtype() != DType::Float32 && m.dtype() != origin_dtype) {
+    TP_THROW(ValueError, who,
+             ": attn_mask must be float32 or the query dtype");
+  }
+  if (m.dim() != 2 && m.dim() != 4) {
+    TP_THROW(ValueError, who, ": attn_mask dim must be 2 or 4");
+  }
+  const int64_t rows = m.size(-2), cols = m.size(-1);
+  if ((rows != Tq && rows != 1) || (cols != Skv && cols != 1)) {
+    TP_THROW(ValueError, who,
+             ": attn_mask trailing sizes must be {Tq or 1, Skv or 1}");
+  }
+  if (m.dim() == 4) {
+    if ((m.size(0) != B && m.size(0) != 1) ||
+        (m.size(1) != H && m.size(1) != 1)) {
+      TP_THROW(ValueError, who,
+               ": 4D attn_mask leading sizes must be {B or 1, H or 1}");
+    }
+    out.mask_b = m.size(0);
+    out.mask_h = m.size(1);
+  }
+  out.data = m.to(acc_dtype)
+                 .reshape({out.mask_b, out.mask_h, rows, cols})
+                 .expand({out.mask_b, out.mask_h, Tq, Skv})
+                 .contiguous();
+  return out;
+}
+
+struct FlashDims {
+  int64_t B, H, Hkv, Tq, Skv, D;
+};
+
+template <typename A>
+void flash_forward(const A* q, const A* k, const A* v, const FlashMask& mask,
+                   A* out, A* lse, const FlashDims& dims, A scale,
+                   bool is_causal) {
+  const int64_t B = dims.B, H = dims.H, Hkv = dims.Hkv;
+  const int64_t Tq = dims.Tq, Skv = dims.Skv, D = dims.D;
+  const int64_t q_split = std::min(flash_q_split(Tq), Tq);
+  const int64_t kv_split = std::min(kFlashKvSplit, Skv);
+  const int64_t q_slices = (Tq + q_split - 1) / q_split;
+  const int64_t repeat = H / Hkv;
+  const A neg_inf = -std::numeric_limits<A>::infinity();
+
+  // Per-thread scratch: score tile, running max, running sum, value tile.
+  const size_t per_thread = static_cast<size_t>(q_split) * kv_split +
+                            2 * static_cast<size_t>(q_split) +
+                            static_cast<size_t>(q_split) * D;
+  const int threads = std::max(1, parallel::get_num_threads());
+  std::vector<A> scratch(static_cast<size_t>(threads) * per_thread);
+
+  parallel::parallel_for(0, B * H * q_slices, 1, [&](int64_t begin, int64_t end) {
+    A* qk = scratch.data() +
+            static_cast<size_t>(parallel::get_thread_num()) * per_thread;
+    A* qk_max = qk + q_split * kv_split;
+    A* qk_sum = qk_max + q_split;
+    A* dst = qk_sum + q_split;
+    for (int64_t idx = begin; idx < end; ++idx) {
+      const int64_t slice = idx % q_slices;
+      const int64_t bh = idx / q_slices;
+      const int64_t b = bh / H, h = bh % H;
+      const int64_t hkv = h / repeat;
+      const int64_t m = slice * q_split;
+      const int64_t qb = std::min(q_split, Tq - m);
+      const A* qp = q + (bh * Tq + m) * D;
+      const A* kp = k + (b * Hkv + hkv) * Skv * D;
+      const A* vp = v + (b * Hkv + hkv) * Skv * D;
+      const A* mp = mask.template rows<A>(b, h, Tq, Skv);
+      std::fill(qk_max, qk_max + qb, neg_inf);
+      std::fill(qk_sum, qk_sum + qb, A(0));
+      const int64_t num_keys = is_causal ? std::min(m + qb, Skv) : Skv;
+      for (int64_t n = 0; n < num_keys; n += kv_split) {
+        const int64_t kvb = std::min(kv_split, Skv - n);
+        // scores <- Q K^T
+        flash_gemm<A>(false, true, qb, kvb, D, A(1), qp, D, kp + n * D, D,
+                      A(0), qk, kvb);
+        const bool causal_tail = is_causal && num_keys - n <= kv_split;
+        for (int64_t row = 0; row < qb; ++row) {
+          A* r = qk + row * kvb;
+          if (causal_tail) {
+            // Row m + row sees keys [0, m + row]; later columns are closed.
+            const int64_t first_closed = std::max<int64_t>(m + row - n + 1, 0);
+            for (int64_t c = first_closed; c < kvb; ++c) r[c] = neg_inf;
+          }
+          A mx = neg_inf;
+          if (mp != nullptr) {
+            const A* mr = mp + (m + row) * Skv + n;
+            for (int64_t c = 0; c < kvb; ++c) {
+              r[c] = r[c] * scale + mr[c];
+              mx = r[c] > mx ? r[c] : mx;
+            }
+          } else {
+            for (int64_t c = 0; c < kvb; ++c) {
+              r[c] *= scale;
+              mx = r[c] > mx ? r[c] : mx;
+            }
+          }
+          if (qk_max[row] > mx) mx = qk_max[row];
+          if (mx == neg_inf) {
+            // Nothing visible so far: exp(-inf - -inf) would be nan.
+            std::fill(r, r + kvb, A(0));
+            continue;
+          }
+          for (int64_t c = 0; c < kvb; ++c) r[c] -= mx;
+          flash_vexp(r, kvb);
+          A sum = A(0);
+          for (int64_t c = 0; c < kvb; ++c) sum += r[c];
+          // Rebase what earlier key blocks accumulated onto the new max.
+          const A carry = std::exp(qk_max[row] - mx);
+          qk_sum[row] = sum + carry * qk_sum[row];
+          qk_max[row] = mx;
+          if (n > 0) {
+            A* drow = dst + row * D;
+            for (int64_t d = 0; d < D; ++d) drow[d] *= carry;
+          }
+        }
+        // values <- values + P V
+        flash_gemm<A>(false, false, qb, D, kvb, A(1), qk, kvb, vp + n * D, D,
+                      n == 0 ? A(0) : A(1), dst, D);
+      }
+      A* op = out + (bh * Tq + m) * D;
+      A* lp = lse + bh * Tq + m;
+      for (int64_t row = 0; row < qb; ++row) {
+        // A fully closed row has sum 0; it yields zeros rather than nan.
+        const A mx = qk_max[row] == neg_inf ? A(0) : qk_max[row];
+        const A sum = qk_sum[row] == A(0) ? A(1) : qk_sum[row];
+        const A inv = A(1) / sum;
+        const A* drow = dst + row * D;
+        A* orow = op + row * D;
+        for (int64_t d = 0; d < D; ++d) orow[d] = drow[d] * inv;
+        lp[row] = mx + std::log(sum);
+      }
+    }
+  });
+}
+
+template <typename A>
+void flash_backward(const A* q, const A* k, const A* v, const A* go,
+                    const A* out, const A* lse, const FlashMask& mask, A* dq,
+                    A* dk, A* dv, const FlashDims& dims, A scale,
+                    bool is_causal) {
+  const int64_t B = dims.B, H = dims.H, Hkv = dims.Hkv;
+  const int64_t Tq = dims.Tq, Skv = dims.Skv, D = dims.D;
+  const int64_t q_split = std::min(flash_q_split(Tq), Tq);
+  const int64_t kv_split = std::min(kFlashKvSplit, Skv);
+  const int64_t repeat = H / Hkv;
+
+  // Per-thread scratch: probability tile, score-gradient tile, row sums.
+  const size_t per_thread = 2 * static_cast<size_t>(q_split) * kv_split +
+                            static_cast<size_t>(q_split);
+  const int threads = std::max(1, parallel::get_num_threads());
+  std::vector<A> scratch(static_cast<size_t>(threads) * per_thread);
+
+  parallel::parallel_for(0, B * Hkv, 1, [&](int64_t begin, int64_t end) {
+    A* attn = scratch.data() +
+              static_cast<size_t>(parallel::get_thread_num()) * per_thread;
+    A* gattn = attn + q_split * kv_split;
+    A* dsum = gattn + q_split * kv_split;
+    for (int64_t idx = begin; idx < end; ++idx) {
+      const int64_t b = idx / Hkv, hkv = idx % Hkv;
+      const A* kp = k + idx * Skv * D;
+      const A* vp = v + idx * Skv * D;
+      A* dkp = dk + idx * Skv * D;
+      A* dvp = dv + idx * Skv * D;
+      for (int64_t rep = 0; rep < repeat; ++rep) {
+        const int64_t h = hkv * repeat + rep;
+        const int64_t bh = b * H + h;
+        const A* mp = mask.template rows<A>(b, h, Tq, Skv);
+        for (int64_t m = 0; m < Tq; m += q_split) {
+          const int64_t qb = std::min(q_split, Tq - m);
+          const A* qp = q + (bh * Tq + m) * D;
+          const A* gp = go + (bh * Tq + m) * D;
+          const A* op = out + (bh * Tq + m) * D;
+          const A* lp = lse + bh * Tq + m;
+          A* dqp = dq + (bh * Tq + m) * D;
+          // dsum <- rowsum(dO * O)
+          for (int64_t row = 0; row < qb; ++row) {
+            const A* grow = gp + row * D;
+            const A* orow = op + row * D;
+            A acc = A(0);
+            for (int64_t d = 0; d < D; ++d) acc += grow[d] * orow[d];
+            dsum[row] = acc;
+          }
+          const int64_t num_keys = is_causal ? std::min(m + qb, Skv) : Skv;
+          for (int64_t n = 0; n < num_keys; n += kv_split) {
+            const int64_t kvb = std::min(kv_split, Skv - n);
+            // attn <- scale * Q K^T
+            flash_gemm<A>(false, true, qb, kvb, D, scale, qp, D, kp + n * D,
+                          D, A(0), attn, kvb);
+            const bool causal_tail = is_causal && num_keys - n <= kv_split;
+            for (int64_t row = 0; row < qb; ++row) {
+              A* r = attn + row * kvb;
+              const A shift = lp[row];
+              if (mp != nullptr) {
+                const A* mr = mp + (m + row) * Skv + n;
+                for (int64_t c = 0; c < kvb; ++c) r[c] = r[c] + mr[c] - shift;
+              } else {
+                for (int64_t c = 0; c < kvb; ++c) r[c] -= shift;
+              }
+              // attn <- exp(attn - lse): the forward probabilities.
+              flash_vexp(r, kvb);
+              if (causal_tail) {
+                const int64_t first_closed =
+                    std::max<int64_t>(m + row - n + 1, 0);
+                for (int64_t c = first_closed; c < kvb; ++c) r[c] = A(0);
+              }
+            }
+            // dV <- dV + P^T dO
+            flash_gemm<A>(true, false, kvb, D, qb, A(1), attn, kvb, gp, D,
+                          A(1), dvp + n * D, D);
+            // gattn <- dO V^T
+            flash_gemm<A>(false, true, qb, kvb, D, A(1), gp, D, vp + n * D, D,
+                          A(0), gattn, kvb);
+            // gattn <- P * (gattn - dsum)
+            for (int64_t row = 0; row < qb; ++row) {
+              const A* ar = attn + row * kvb;
+              A* gr = gattn + row * kvb;
+              const A ds = dsum[row];
+              for (int64_t c = 0; c < kvb; ++c) gr[c] = ar[c] * (gr[c] - ds);
+            }
+            // dQ <- dQ + scale * gattn K
+            flash_gemm<A>(false, false, qb, D, kvb, scale, gattn, kvb,
+                          kp + n * D, D, A(1), dqp, D);
+            // dK <- dK + scale * gattn^T Q
+            flash_gemm<A>(true, false, kvb, D, qb, scale, gattn, kvb, qp, D,
+                          A(1), dkp + n * D, D);
+          }
+        }
+      }
+    }
+  });
+}
+
+FlashDims flash_check_shapes(const Tensor& query, const Tensor& key,
+                             const Tensor& value, double dropout_p,
+                             const char* who) {
+  const DType dtype = query.dtype();
+  if (dtype != DType::Float32 && dtype != DType::Float64 &&
+      dtype != DType::Float16 && dtype != DType::BFloat16) {
+    TP_THROW(NotImplementedError, who,
+             ": expected float32/float64/float16/bfloat16");
+  }
+  if (query.dim() != 4 || key.dim() != 4 || value.dim() != 4) {
+    TP_THROW(ValueError, who, ": accept only 4D inputs of shape {B, H, T, K}");
+  }
+  if (dropout_p != 0.0) {
+    TP_THROW(ValueError, who, ": dropout > 0 is not supported");
+  }
+  if (key.dtype() != dtype || value.dtype() != dtype) {
+    TP_THROW(ValueError, who, ": Q/K/V must share one dtype");
+  }
+  if (value.size(3) != query.size(3) || key.size(3) != value.size(3)) {
+    TP_THROW(ValueError, who, ": Q/K/V must share the head size");
+  }
+  FlashDims dims{query.size(0), query.size(1), key.size(1),
+                 query.size(2), key.size(2),   query.size(3)};
+  if (key.size(0) != dims.B || value.size(0) != dims.B ||
+      value.size(1) != dims.Hkv || value.size(2) != dims.Skv) {
+    TP_THROW(ValueError, who, ": key/value shapes must match {B, Hkv, S, D}");
+  }
+  if (dims.Hkv != dims.H && (dims.Hkv == 0 || dims.H % dims.Hkv != 0)) {
+    TP_THROW(ValueError, who,
+             ": the query head count must be a multiple of the key head count");
+  }
+  if (dims.Tq * dims.Skv > static_cast<int64_t>(INT32_MAX) ||
+      dims.Skv * dims.D > static_cast<int64_t>(INT32_MAX) ||
+      dims.Tq * dims.D > static_cast<int64_t>(INT32_MAX)) {
+    TP_THROW(RuntimeError, who, ": shape too large for BLAS ints");
+  }
+  return dims;
+}
+
+inline bool flash_is_empty(const FlashDims& d) {
+  return d.B == 0 || d.H == 0 || d.Hkv == 0 || d.Tq == 0 || d.Skv == 0 ||
+         d.D == 0;
+}
+
+} // namespace
+
+// Fused kernel for the `_scaled_dot_product_flash_attention_for_cpu`
+// dispatcher contract: 4D [B, H, Tq, D] query against [B, Hkv, Skv, D]
+// key/value (H a multiple of Hkv), optional additive 2D/4D mask, causal flag,
+// explicit scale.  Returns the attention output plus the per-row logsumexp
+// [B, H, Tq] in the accumulate dtype that the backward kernel replays.  A row
+// with no visible key yields zeros.  Dropout is rejected.
 std::tuple<Tensor, Tensor> sdpa_flash_cpu_kernel(
     const Tensor& query, const Tensor& key, const Tensor& value,
     double dropout_p, bool is_causal, const std::optional<Tensor>& attn_mask,
     std::optional<double> scale) {
+  static const char* who = "sdpa cpu flash";
+  const FlashDims dims = flash_check_shapes(query, key, value, dropout_p, who);
   const DType origin_dtype = query.dtype();
-  if (origin_dtype != DType::Float32 && origin_dtype != DType::Float64 &&
-      origin_dtype != DType::Float16 && origin_dtype != DType::BFloat16) {
-    TP_THROW(NotImplementedError,
-             "sdpa cpu flash: expected float32/float64/float16/bfloat16");
-  }
-  if (query.dim() != 4 || key.dim() != 4 || value.dim() != 4) {
-    TP_THROW(ValueError,
-             "sdpa cpu flash: accept only 4D inputs of shape {B, H, T, K}");
-  }
-  if (dropout_p != 0.0) {
-    TP_THROW(ValueError, "sdpa cpu flash: dropout > 0 is not supported");
-  }
-  if (value.size(3) != query.size(3) || key.size(3) != value.size(3)) {
-    TP_THROW(ValueError, "sdpa cpu flash: Q/K/V must share the head size");
-  }
-  if (attn_mask.has_value()) {
-    const Tensor& m = *attn_mask;
-    if (m.dtype() != DType::Float32 && m.dtype() != origin_dtype &&
-        m.dtype() != DType::Float64) {
-      TP_THROW(ValueError,
-               "sdpa cpu flash: attn_mask must be float or the query dtype");
-    }
-    if (m.dim() != 2 && m.dim() != 4) {
-      TP_THROW(ValueError, "sdpa cpu flash: attn_mask dim must be 2 or 4");
-    }
-    if (m.dim() == 4 && (m.size(0) != query.size(0) ||
-                         m.size(1) != query.size(1) ||
-                         m.size(2) != query.size(2) ||
-                         m.size(3) != key.size(2))) {
-      TP_THROW(ValueError,
-               "sdpa cpu flash: 4D attn_mask must match {B, H, Tq, Skv}");
-    }
-  }
-  const int64_t B = query.size(0), H = query.size(1);
-  const int64_t Tq = query.size(2), Skv = key.size(2), D = query.size(3);
-  if (key.size(0) != B || key.size(1) != H || value.size(0) != B ||
-      value.size(1) != H || value.size(2) != Skv) {
-    TP_THROW(ValueError,
-             "sdpa cpu flash: key/value shapes must match {B, H, S, D}");
-  }
-  if (Tq * Skv > static_cast<int64_t>(INT32_MAX) ||
-      Skv * D > static_cast<int64_t>(INT32_MAX) ||
-      Tq * D > static_cast<int64_t>(INT32_MAX)) {
-    TP_THROW(RuntimeError, "sdpa cpu flash: shape too large for BLAS ints");
-  }
-
   const DType acc_dtype = origin_dtype == DType::Float64 ? DType::Float64
                                                          : DType::Float32;
+  const FlashMask mask = flash_prepare_mask(attn_mask, origin_dtype, acc_dtype,
+                                            dims.B, dims.H, dims.Tq, dims.Skv,
+                                            who);
+  if (flash_is_empty(dims)) {
+    return {Tensor::zeros({dims.B, dims.H, dims.Tq, dims.D}, origin_dtype,
+                          query.device()),
+            Tensor::zeros({dims.B, dims.H, dims.Tq}, acc_dtype,
+                          query.device())};
+  }
   Tensor q = query.to(acc_dtype).contiguous();
   Tensor k = key.to(acc_dtype).contiguous();
   Tensor v = value.to(acc_dtype).contiguous();
-  Tensor mask_f;
-  if (attn_mask.has_value()) {
-    mask_f = attn_mask->to(acc_dtype).contiguous();
-  }
-  const double scale_val = scale.has_value()
-                               ? *scale
-                               : 1.0 / std::sqrt(static_cast<double>(D));
+  const double scale_val =
+      scale.has_value() ? *scale
+                        : 1.0 / std::sqrt(static_cast<double>(dims.D));
 
-  Tensor out = Tensor::empty({B, H, Tq, D}, acc_dtype, q.device());
-  Tensor lse = Tensor::empty({B, H, Tq}, acc_dtype, q.device());
-
-  const bool has_mask2d = mask_f.defined() && mask_f.dim() == 2;
-  const bool has_mask4d = mask_f.defined() && mask_f.dim() == 4;
-  std::vector<double> scores;
-
-  auto run_head = [&](auto qd, auto kd, auto vd, auto od, auto ld, auto md) {
-    using A = std::remove_pointer_t<decltype(qd)>;
-    for (int64_t bh = 0; bh < B * H; ++bh) {
-      const A* qh = qd + bh * Tq * D;
-      const A* kh = kd + bh * Skv * D;
-      const A* vh = vd + bh * Skv * D;
-      A* oh = od + bh * Tq * D;
-      A* lh = ld + bh * Tq;
-      const A* mh = has_mask4d ? md + bh * Tq * Skv : nullptr;
-      const A* m2 = has_mask2d ? md : nullptr;
-      scores.resize(static_cast<size_t>(Tq) * Skv);
-      for (int64_t t = 0; t < Tq; ++t) {
-        const int64_t visible = is_causal ? std::min(t + 1, Skv) : Skv;
-        double mx = -INFINITY;
-        for (int64_t j = 0; j < Skv; ++j) {
-          double s = -INFINITY;
-          if (j < visible) {
-            s = 0.0;
-            for (int64_t d = 0; d < D; ++d) s += static_cast<double>(qh[t * D + d]) * kh[j * D + d];
-            s *= scale_val;
-            if (has_mask4d) s += static_cast<double>(mh[t * Skv + j]);
-            else if (has_mask2d) s += static_cast<double>(m2[t * Skv + j]);
-          }
-          scores[static_cast<size_t>(t) * Skv + j] = s;
-          mx = std::max(mx, s);
-        }
-        double total = 0.0;
-        for (int64_t j = 0; j < Skv; ++j) {
-          double e = std::exp(scores[static_cast<size_t>(t) * Skv + j] - mx);
-          scores[static_cast<size_t>(t) * Skv + j] = e;
-          total += e;
-        }
-        lh[t] = static_cast<A>(mx + std::log(total));
-        for (int64_t d = 0; d < D; ++d) {
-          double acc = 0.0;
-          for (int64_t j = 0; j < Skv; ++j)
-            acc += scores[static_cast<size_t>(t) * Skv + j] *
-                   static_cast<double>(vh[j * D + d]);
-          oh[t * D + d] = static_cast<A>(acc / total);
-        }
-      }
-    }
-  };
-
+  Tensor out = Tensor::empty({dims.B, dims.H, dims.Tq, dims.D}, acc_dtype,
+                             q.device());
+  Tensor lse = Tensor::empty({dims.B, dims.H, dims.Tq}, acc_dtype, q.device());
   if (acc_dtype == DType::Float64) {
-    run_head(q.data_ptr<double>(), k.data_ptr<double>(), v.data_ptr<double>(),
-             out.data_ptr<double>(), lse.data_ptr<double>(),
-             mask_f.defined() ? mask_f.data_ptr<double>()
-                              : static_cast<const double*>(nullptr));
+    flash_forward<double>(q.data_ptr<double>(), k.data_ptr<double>(),
+                          v.data_ptr<double>(), mask, out.data_ptr<double>(),
+                          lse.data_ptr<double>(), dims, scale_val, is_causal);
   } else {
-    run_head(q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
-             out.data_ptr<float>(), lse.data_ptr<float>(),
-             mask_f.defined() ? mask_f.data_ptr<float>()
-                              : static_cast<const float*>(nullptr));
+    flash_forward<float>(q.data_ptr<float>(), k.data_ptr<float>(),
+                         v.data_ptr<float>(), mask, out.data_ptr<float>(),
+                         lse.data_ptr<float>(), dims,
+                         static_cast<float>(scale_val), is_causal);
   }
   if (acc_dtype != origin_dtype) out = out.to(origin_dtype);
   return {std::move(out), std::move(lse)};
 }
 
 // Replay partner of sdpa_flash_cpu_kernel: rebuilds the probabilities from
-// the saved logsumexp and emits dQ/dK/dV.  dS = p * (dP - rowsum(dP * p))
-// with dP = dO @ V^T; dQ = scale * dS @ K; dK = scale * dS^T @ Q;
-// dV = P^T @ dO.  Masked/causal positions carry p = 0 so no extra masking
-// pass is needed.
+// the saved logsumexp and emits dQ/dK/dV in the shapes of Q/K/V.
 std::tuple<Tensor, Tensor, Tensor> sdpa_flash_backward_cpu_kernel(
     const Tensor& grad_out, const Tensor& query, const Tensor& key,
     const Tensor& value, const Tensor& out, const Tensor& logsumexp,
     double dropout_p, bool is_causal, const std::optional<Tensor>& attn_mask,
     std::optional<double> scale) {
-  (void)out;
   if (!grad_out.defined()) {
     return {Tensor(), Tensor(), Tensor()};
   }
-  if (dropout_p != 0.0) {
-    TP_THROW(ValueError,
-             "sdpa cpu flash backward: dropout > 0 is not supported");
+  static const char* who = "sdpa cpu flash backward";
+  const FlashDims dims = flash_check_shapes(query, key, value, dropout_p, who);
+  if (grad_out.dim() != 4 || grad_out.size(0) != dims.B ||
+      grad_out.size(1) != dims.H || grad_out.size(2) != dims.Tq ||
+      grad_out.size(3) != dims.D || out.dim() != 4 ||
+      out.numel() != grad_out.numel() || logsumexp.dim() != 3 ||
+      logsumexp.numel() != dims.B * dims.H * dims.Tq) {
+    TP_THROW(ValueError, who,
+             ": grad_out/out must be {B, H, Tq, D} and logsumexp {B, H, Tq}");
   }
   const DType origin_dtype = query.dtype();
-  const int64_t B = query.size(0), H = query.size(1);
-  const int64_t Tq = query.size(2), Skv = key.size(2), D = query.size(3);
-  if (Tq * Skv > static_cast<int64_t>(INT32_MAX) ||
-      Skv * D > static_cast<int64_t>(INT32_MAX) ||
-      Tq * D > static_cast<int64_t>(INT32_MAX)) {
-    TP_THROW(RuntimeError,
-             "sdpa cpu flash backward: shape too large for BLAS ints");
-  }
   const DType acc_dtype = origin_dtype == DType::Float64 ? DType::Float64
                                                          : DType::Float32;
-  Tensor q = query.to(acc_dtype).contiguous();
-  Tensor k = key.to(acc_dtype).contiguous();
-  Tensor v = value.to(acc_dtype).contiguous();
-  Tensor go = grad_out.to(acc_dtype).contiguous();
-  Tensor lse = logsumexp.to(acc_dtype).contiguous();
-  Tensor mask_f;
-  if (attn_mask.has_value() && attn_mask->defined()) {
-    mask_f = attn_mask->to(acc_dtype).contiguous();
-  }
-  const double scale_val = scale.has_value()
-                               ? *scale
-                               : 1.0 / std::sqrt(static_cast<double>(D));
-  const bool has_mask2d = mask_f.defined() && mask_f.dim() == 2;
-  const bool has_mask4d = mask_f.defined() && mask_f.dim() == 4;
-
-  Tensor d_q = Tensor::zeros({B, H, Tq, D}, acc_dtype, q.device());
-  Tensor d_k = Tensor::zeros({B, H, Skv, D}, acc_dtype, q.device());
-  Tensor d_v = Tensor::zeros({B, H, Skv, D}, acc_dtype, q.device());
-  std::vector<double> scores;
-  std::vector<double> dp;
-  std::vector<double> ds;
-
-  auto run_head = [&](auto qd, auto kd, auto vd, auto god, auto ld, auto md) {
-    using A = std::remove_pointer_t<decltype(qd)>;
-    for (int64_t bh = 0; bh < B * H; ++bh) {
-      const A* qh = qd + bh * Tq * D;
-      const A* kh = kd + bh * Skv * D;
-      const A* vh = vd + bh * Skv * D;
-      const A* gh = god + bh * Tq * D;
-      const A* lh = ld + bh * Tq;
-      const A* mh = has_mask4d ? md + bh * Tq * Skv : nullptr;
-      const A* m2 = has_mask2d ? md : nullptr;
-      A* dqh = d_q.data_ptr<A>() + bh * Tq * D;
-      A* dkh = d_k.data_ptr<A>() + bh * Skv * D;
-      A* dvh = d_v.data_ptr<A>() + bh * Skv * D;
-      scores.resize(static_cast<size_t>(Tq) * Skv);
-      dp.resize(static_cast<size_t>(Tq) * Skv);
-      ds.resize(static_cast<size_t>(Tq) * Skv);
-      // Rebuild logits; p = exp(s - lse) recovers the softmax probabilities
-      // with masked/causal entries at -inf -> 0.
-      for (int64_t t = 0; t < Tq; ++t) {
-        const int64_t visible = is_causal ? std::min(t + 1, Skv) : Skv;
-        for (int64_t j = 0; j < Skv; ++j) {
-          double s = -INFINITY;
-          if (j < visible) {
-            s = 0.0;
-            for (int64_t d = 0; d < D; ++d) s += static_cast<double>(qh[t * D + d]) * kh[j * D + d];
-            s *= scale_val;
-            if (has_mask4d) s += static_cast<double>(mh[t * Skv + j]);
-            else if (has_mask2d) s += static_cast<double>(m2[t * Skv + j]);
-          }
-          scores[static_cast<size_t>(t) * Skv + j] = s;
-        }
-      }
-      auto prob = [&](int64_t t, int64_t j) -> double {
-        return std::exp(scores[static_cast<size_t>(t) * Skv + j] -
-                        static_cast<double>(lh[t]));
-      };
-      // Softmax backward: dS = p * (dP - rowsum(dP * p)), dP = dO @ V^T.
-      for (int64_t t = 0; t < Tq; ++t) {
-        double row_dot = 0.0;
-        for (int64_t j = 0; j < Skv; ++j) {
-          double dot = 0.0;
-          for (int64_t d = 0; d < D; ++d)
-            dot += static_cast<double>(gh[t * D + d]) *
-                   static_cast<double>(vh[j * D + d]);
-          dp[static_cast<size_t>(t) * Skv + j] = dot;
-          row_dot += dot * prob(t, j);
-        }
-        for (int64_t j = 0; j < Skv; ++j) {
-          ds[static_cast<size_t>(t) * Skv + j] =
-              prob(t, j) * (dp[static_cast<size_t>(t) * Skv + j] - row_dot) *
-              scale_val;
-        }
-      }
-      // dQ = dS @ K
-      for (int64_t t = 0; t < Tq; ++t) {
-        for (int64_t d = 0; d < D; ++d) {
-          double acc = 0.0;
-          for (int64_t j = 0; j < Skv; ++j)
-            acc += ds[static_cast<size_t>(t) * Skv + j] *
-                   static_cast<double>(kh[j * D + d]);
-          dqh[t * D + d] = static_cast<A>(acc);
-        }
-      }
-      // dK = dS^T @ Q ; dV = P^T @ dO (per key position j)
-      for (int64_t j = 0; j < Skv; ++j) {
-        for (int64_t d = 0; d < D; ++d) {
-          double kacc = 0.0, vacc = 0.0;
-          for (int64_t t = 0; t < Tq; ++t) {
-            const double p = prob(t, j);
-            kacc += ds[static_cast<size_t>(t) * Skv + j] *
-                    static_cast<double>(qh[t * D + d]);
-            vacc += p * static_cast<double>(gh[t * D + d]);
-          }
-          dkh[j * D + d] = static_cast<A>(kacc);
-          dvh[j * D + d] = static_cast<A>(vacc);
-        }
-      }
+  const FlashMask mask = flash_prepare_mask(attn_mask, origin_dtype, acc_dtype,
+                                            dims.B, dims.H, dims.Tq, dims.Skv,
+                                            who);
+  Tensor d_q = Tensor::zeros({dims.B, dims.H, dims.Tq, dims.D}, acc_dtype,
+                             query.device());
+  Tensor d_k = Tensor::zeros({dims.B, dims.Hkv, dims.Skv, dims.D}, acc_dtype,
+                             query.device());
+  Tensor d_v = Tensor::zeros({dims.B, dims.Hkv, dims.Skv, dims.D}, acc_dtype,
+                             query.device());
+  if (!flash_is_empty(dims)) {
+    Tensor q = query.to(acc_dtype).contiguous();
+    Tensor k = key.to(acc_dtype).contiguous();
+    Tensor v = value.to(acc_dtype).contiguous();
+    // A broadcast gradient (zero strides) is materialized before the matrix
+    // products read it.
+    Tensor go = grad_out.to(acc_dtype).contiguous();
+    Tensor o = out.to(acc_dtype).contiguous();
+    Tensor lse = logsumexp.to(acc_dtype).contiguous();
+    const double scale_val =
+        scale.has_value() ? *scale
+                          : 1.0 / std::sqrt(static_cast<double>(dims.D));
+    if (acc_dtype == DType::Float64) {
+      flash_backward<double>(
+          q.data_ptr<double>(), k.data_ptr<double>(), v.data_ptr<double>(),
+          go.data_ptr<double>(), o.data_ptr<double>(), lse.data_ptr<double>(),
+          mask, d_q.data_ptr<double>(), d_k.data_ptr<double>(),
+          d_v.data_ptr<double>(), dims, scale_val, is_causal);
+    } else {
+      flash_backward<float>(
+          q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
+          go.data_ptr<float>(), o.data_ptr<float>(), lse.data_ptr<float>(),
+          mask, d_q.data_ptr<float>(), d_k.data_ptr<float>(),
+          d_v.data_ptr<float>(), dims, static_cast<float>(scale_val),
+          is_causal);
     }
-  };
-
-  if (acc_dtype == DType::Float64) {
-    run_head(q.data_ptr<double>(), k.data_ptr<double>(), v.data_ptr<double>(),
-             go.data_ptr<double>(), lse.data_ptr<double>(),
-             mask_f.defined() ? mask_f.data_ptr<double>()
-                              : static_cast<const double*>(nullptr));
-  } else {
-    run_head(q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
-             go.data_ptr<float>(), lse.data_ptr<float>(),
-             mask_f.defined() ? mask_f.data_ptr<float>()
-                              : static_cast<const float*>(nullptr));
   }
-  return {d_q.to(origin_dtype), d_k.to(origin_dtype), d_v.to(origin_dtype)};
+  if (acc_dtype != origin_dtype) {
+    d_q = d_q.to(origin_dtype);
+    d_k = d_k.to(origin_dtype);
+    d_v = d_v.to(origin_dtype);
+  }
+  return {std::move(d_q), std::move(d_k), std::move(d_v)};
 }
 
 
