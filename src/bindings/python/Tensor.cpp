@@ -38,6 +38,13 @@ using namespace tensorplay::python;
 using Tensor = tensorplay::tpx::Tensor; 
 using Tensor = tensorplay::Tensor;
 
+// Python's NotImplemented singleton, used so an operator on a tensor whose
+// other operand is a graph proxy (or any foreign type) reports that it does
+// not know the operand, letting Python fall back to the reflected operator.
+static py::object not_implemented() {
+    return py::reinterpret_borrow<py::object>(Py_NotImplemented);
+}
+
 namespace {
 
 // A conversion that returns the tensor it was given (same element type,
@@ -1979,7 +1986,37 @@ void init_tensor(py::module_& m) {
         // ([8, 1] / Size / tuple), -1 inference, and a dtype reinterpret.
         // Route through tpx::ops::view (NOT Tensor::view): the generated
         // wrapper records ViewBackward; the raw method silently detaches.
-        .def("view", [](const Tensor& self, py::args args) -> Tensor {
+        .def("view", [](const Tensor& self, py::args args,
+                        py::kwargs kwargs) -> Tensor {
+            if (kwargs.size() > 1) {
+                throw py::type_error("view(): got an unexpected keyword argument '"
+                                   + kwargs.begin()->first.cast<std::string>() + "'");
+            }
+            if (kwargs.size() == 1) {
+                std::string name = kwargs.begin()->first.cast<std::string>();
+                if (args.size() > 0) {
+                    throw py::type_error("view(): got multiple values for argument '"
+                                          + name + "'");
+                }
+                py::object spec = kwargs[py::str(name)];
+                if (name == "dtype") {
+                    return self.view_dtype(spec.cast<DType>());
+                }
+                if (name != "size") {
+                    throw py::type_error("view(): got an unexpected keyword argument '"
+                                         + name + "'");
+                }
+                if (py::isinstance<DType>(spec)) {
+                    return self.view_dtype(spec.cast<DType>());
+                }
+                try {
+                    return tensorplay::tpx::ops::view(
+                        self, spec.cast<std::vector<int64_t>>());
+                } catch (const py::cast_error&) {
+                    throw py::type_error(
+                        "view(): argument 'size' must be a sequence of integers");
+                }
+            }
             if (args.size() == 1) {
                 py::object spec = args[0];
                 if (py::isinstance<DType>(spec)) {
@@ -2446,28 +2483,49 @@ void init_tensor(py::module_& m) {
             return py::iter(py::cast(tensorplay::tpx::ops::unbind(self, 0)));
         })
 
-        .def("__getitem__", [](const Tensor& self, py::object index) -> Tensor {
+        .def("__getitem__", [](const Tensor& self, py::object index) -> py::object {
+            // A symbolic index carries a graph tracer: the indexing operation
+            // is recorded on the tracer's graph instead of running eagerly.
+            if (py::hasattr(index, "tracer")) {
+                return index.attr("tracer").attr("create_proxy")(
+                    "call_function",
+                    py::module_::import("operator").attr("getitem"),
+                    py::make_tuple(py::cast(self), index),
+                    py::dict());
+            }
+            if (py::isinstance<py::tuple>(index)) {
+                py::tuple tup = py::cast<py::tuple>(index);
+                for (py::handle item : tup) {
+                    if (py::hasattr(item, "tracer")) {
+                        return item.attr("tracer").attr("create_proxy")(
+                            "call_function",
+                            py::module_::import("operator").attr("getitem"),
+                            py::make_tuple(py::cast(self), index),
+                            py::dict());
+                    }
+                }
+            }
             // Tensor and sequence indices are advanced indices: basic parts
             // (ints, slices, None, bools) apply as views first, then the
             // remaining tensors go through the index operator.
             if (py::isinstance<Tensor>(index) || py::isinstance<py::list>(index)) {
-                return finish_advanced_getitem(
-                    self, make_advanced_tuple_index(self, py::make_tuple(index)));
+                return py::cast(finish_advanced_getitem(
+                    self, make_advanced_tuple_index(self, py::make_tuple(index))));
             }
 
             if (py::isinstance<py::tuple>(index)) {
-                return finish_advanced_getitem(
-                    self, make_advanced_tuple_index(self, py::cast<py::tuple>(index)));
+                return py::cast(finish_advanced_getitem(
+                    self, make_advanced_tuple_index(self, py::cast<py::tuple>(index))));
             } else if (py::isinstance<py::bool_>(index) || index.is_none() ||
                        index.ptr() == Py_Ellipsis) {
-                return finish_advanced_getitem(
-                    self, make_advanced_tuple_index(self, py::make_tuple(index)));
+                return py::cast(finish_advanced_getitem(
+                    self, make_advanced_tuple_index(self, py::make_tuple(index))));
             } else if (py::isinstance<py::int_>(index)) {
-                return tensorplay::tpx::ops::select(self, 0, py::cast<int64_t>(index));
+                return py::cast(tensorplay::tpx::ops::select(self, 0, py::cast<int64_t>(index)));
             } else if (py::isinstance<py::slice>(index)) {
                 py::slice s = py::cast<py::slice>(index);
                 auto [start, stop, step, slicelength] = compute_slice(s, self.size(0));
-                return tensorplay::tpx::ops::slice(self, 0, start, stop, step);
+                return py::cast(tensorplay::tpx::ops::slice(self, 0, start, stop, step));
             }
             TP_THROW(TypeError, "Unsupported index type");
         })
@@ -2612,6 +2670,25 @@ void init_tensor(py::module_& m) {
         .def("__ge__", [](const Tensor& self, int64_t other) { return self.ge(Scalar(other)); })
         .def("__ge__", [](const Tensor& self, double other) { return self.ge(Scalar(other)); })
 
+        // Incompatible operands report NotImplemented so Python falls back to
+        // the other operand's reflected operator, letting a graph proxy
+        // (which carries a tracer but is not a Tensor) capture the operation.
+        .def("__add__", [](const Tensor&, py::object) { return not_implemented(); })
+        .def("__radd__", [](const Tensor&, py::object) { return not_implemented(); })
+        .def("__sub__", [](const Tensor&, py::object) { return not_implemented(); })
+        .def("__rsub__", [](const Tensor&, py::object) { return not_implemented(); })
+        .def("__mul__", [](const Tensor&, py::object) { return not_implemented(); })
+        .def("__rmul__", [](const Tensor&, py::object) { return not_implemented(); })
+        .def("__truediv__", [](const Tensor&, py::object) { return not_implemented(); })
+        .def("__rtruediv__", [](const Tensor&, py::object) { return not_implemented(); })
+        .def("__matmul__", [](const Tensor&, py::object) { return not_implemented(); })
+        .def("__eq__", [](const Tensor&, py::object) { return not_implemented(); })
+        .def("__ne__", [](const Tensor&, py::object) { return not_implemented(); })
+        .def("__lt__", [](const Tensor&, py::object) { return not_implemented(); })
+        .def("__le__", [](const Tensor&, py::object) { return not_implemented(); })
+        .def("__gt__", [](const Tensor&, py::object) { return not_implemented(); })
+        .def("__ge__", [](const Tensor&, py::object) { return not_implemented(); })
+
         // Pointwise ops
                                                                                                                 .def("__pow__", [](const Tensor& self, Scalar exponent) { return self.pow(exponent); }, "exponent"_a)
         .def("__pow__", [](const Tensor& self, const Tensor& exponent) { return self.pow(exponent); }, "exponent"_a)
@@ -2619,9 +2696,9 @@ void init_tensor(py::module_& m) {
             Tensor base_t = tensorplay::native::wrapped_scalar_tensor(base, self.device());
             return base_t.pow(self);
         })
-        // Plain Python numbers are matched by exact type: an overload that
-        // accepts any object without conversion would otherwise answer
-        // before the Scalar overloads above get to convert one.
+        // Plain Python numbers are matched by exact type here: the catch-all
+        // below accepts any object without conversion, so it would otherwise
+        // answer before the Scalar overloads above get to convert one.
         .def("__pow__", [](const Tensor& self, int64_t exponent) { return self.pow(Scalar(exponent)); })
         .def("__pow__", [](const Tensor& self, double exponent) { return self.pow(Scalar(exponent)); })
         .def("__rpow__", [](const Tensor& self, int64_t base) {
@@ -2632,6 +2709,8 @@ void init_tensor(py::module_& m) {
             Tensor base_t = tensorplay::native::wrapped_scalar_tensor(Scalar(base), self.device());
             return base_t.pow(self);
         })
+        .def("__pow__", [](const Tensor&, py::object) { return not_implemented(); })
+        .def("__rpow__", [](const Tensor&, py::object) { return not_implemented(); })
         // DLPack
         .def("__dlpack__", [](py::object self_obj, std::optional<int64_t> stream) {
             return to_dlpack(self_obj, stream);

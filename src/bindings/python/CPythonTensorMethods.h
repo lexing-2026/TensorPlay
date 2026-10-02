@@ -38,64 +38,79 @@ namespace tensorplay { namespace python_c {
 // every one of those questions.
 
 // ``size()`` is the extent of every dimension, ``size(dim)`` one dimension's.
+//
+// The whole body is guarded: a nested tensor refuses to report a single dense
+// size, and that refusal arrives as a C++ exception.  These hand-written slots
+// bypass the shared pybind translator, so the exception has to be turned into
+// a Python exception here or it would escape into the interpreter.
 inline PyObject* tpx_size_call(PyObject* self_obj, PyObject* const* args,
                                Py_ssize_t nargs, PyObject* kwnames) {
-    if (kwnames != nullptr && PyTuple_GET_SIZE(kwnames) != 0) {
-        PyErr_SetString(PyExc_TypeError,
-                        "size() got an unexpected keyword argument");
+    try {
+        if (kwnames != nullptr && PyTuple_GET_SIZE(kwnames) != 0) {
+            PyErr_SetString(PyExc_TypeError,
+                            "size() got an unexpected keyword argument");
+            return nullptr;
+        }
+        if (nargs > 1) {
+            PyErr_SetString(PyExc_TypeError, "size() takes at most 1 argument");
+            return nullptr;
+        }
+        const Tensor& self = tpx_py_tensor_cref(self_obj);
+        if (nargs == 0) return Size_New(self.shape());
+        if (PyIndex_Check(args[0]) == 0) {
+            PyErr_SetString(PyExc_TypeError, "size(): dim must be an integer");
+            return nullptr;
+        }
+        const int64_t dim = PyLong_AsLongLong(args[0]);
+        if (dim == -1 && PyErr_Occurred() != nullptr) return nullptr;
+        return PyLong_FromLongLong(self.size(dim));
+    } catch (const std::exception& e) {
+        tpx_py_set_error(e);
         return nullptr;
     }
-    if (nargs > 1) {
-        PyErr_SetString(PyExc_TypeError, "size() takes at most 1 argument");
-        return nullptr;
-    }
-    const Tensor& self = tpx_py_tensor_cref(self_obj);
-    if (nargs == 0) return Size_New(self.shape());
-    if (PyIndex_Check(args[0]) == 0) {
-        PyErr_SetString(PyExc_TypeError, "size(): dim must be an integer");
-        return nullptr;
-    }
-    const int64_t dim = PyLong_AsLongLong(args[0]);
-    if (dim == -1 && PyErr_Occurred() != nullptr) return nullptr;
-    return PyLong_FromLongLong(self.size(dim));
 }
 
 // ``stride()`` is the step of every dimension, ``stride(dim)`` one dimension's.
 inline PyObject* tpx_stride_call(PyObject* self_obj, PyObject* const* args,
                                  Py_ssize_t nargs, PyObject* kwnames) {
-    if (kwnames != nullptr && PyTuple_GET_SIZE(kwnames) != 0) {
-        PyErr_SetString(PyExc_TypeError,
-                        "stride() got an unexpected keyword argument");
-        return nullptr;
-    }
-    if (nargs > 1) {
-        PyErr_SetString(PyExc_TypeError, "stride() takes at most 1 argument");
-        return nullptr;
-    }
-    const Tensor& self = tpx_py_tensor_cref(self_obj);
-    if (nargs == 1) {
-        if (PyIndex_Check(args[0]) == 0) {
+    try {
+        if (kwnames != nullptr && PyTuple_GET_SIZE(kwnames) != 0) {
             PyErr_SetString(PyExc_TypeError,
-                            "size(): dim must be an integer");
+                            "stride() got an unexpected keyword argument");
             return nullptr;
         }
-        const int64_t dim = PyLong_AsLongLong(args[0]);
+        if (nargs > 1) {
+            PyErr_SetString(PyExc_TypeError, "stride() takes at most 1 argument");
+            return nullptr;
+        }
+        const Tensor& self = tpx_py_tensor_cref(self_obj);
+        if (nargs == 1) {
+            if (PyIndex_Check(args[0]) == 0) {
+                PyErr_SetString(PyExc_TypeError,
+                                "size(): dim must be an integer");
+                return nullptr;
+            }
+            const int64_t dim = PyLong_AsLongLong(args[0]);
 
-        if (dim == -1 && PyErr_Occurred() != nullptr) return nullptr;
-        return PyLong_FromLongLong(self.stride(dim));
-    }
-    const auto strides = self.strides();
-    PyObject* out = PyTuple_New(static_cast<Py_ssize_t>(strides.size()));
-    if (out == nullptr) return nullptr;
-    for (size_t i = 0; i < strides.size(); ++i) {
-        PyObject* item = PyLong_FromLongLong(strides[i]);
-        if (item == nullptr) {
-            Py_DECREF(out);
-            return nullptr;
+            if (dim == -1 && PyErr_Occurred() != nullptr) return nullptr;
+            return PyLong_FromLongLong(self.stride(dim));
         }
-        PyTuple_SET_ITEM(out, static_cast<Py_ssize_t>(i), item);
+        const auto strides = self.strides();
+        PyObject* out = PyTuple_New(static_cast<Py_ssize_t>(strides.size()));
+        if (out == nullptr) return nullptr;
+        for (size_t i = 0; i < strides.size(); ++i) {
+            PyObject* item = PyLong_FromLongLong(strides[i]);
+            if (item == nullptr) {
+                Py_DECREF(out);
+                return nullptr;
+            }
+            PyTuple_SET_ITEM(out, static_cast<Py_ssize_t>(i), item);
+        }
+        return out;
+    } catch (const std::exception& e) {
+        tpx_py_set_error(e);
+        return nullptr;
     }
-    return out;
 }
 
 // Restates the remaining hand-written methods as method descriptors.
@@ -164,7 +179,12 @@ inline PyObject* tpx_get_device_call(PyObject* self_obj, PyObject* const*,
 // asked for: a program reads it to decide what to do next, and a decision
 // should not cost a call to ask.
 inline PyObject* tpx_shape_get(PyObject* self_obj, void*) {
-    return Size_New(tpx_py_tensor_cref(self_obj).shape());
+    try {
+        return Size_New(tpx_py_tensor_cref(self_obj).shape());
+    } catch (const std::exception& e) {
+        tpx_py_set_error(e);
+        return nullptr;
+    }
 }
 
 // Installs the methods above under their names, replacing whatever the type
