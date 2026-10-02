@@ -105,6 +105,26 @@ public:
 
     const std::vector<Edge>& next_edges() const { return next_edges_; }
 
+    // The stream this node consumes its inputs on: the recorded stream of
+    // the first input edge that carries one, preferring an accelerator
+    // device when present.  The engine switches the evaluating worker to this
+    // stream so kernels read gradients produced on the caller's stream.
+    std::optional<Stream> stream() const {
+        std::optional<Stream> first;
+        for (const auto& edge : next_edges_) {
+            if (!edge.stream.has_value()) continue;
+            const auto& s = *edge.stream;
+            if (s.device_type() == DeviceType::CUDA ||
+                s.device_type() == DeviceType::Vulkan) {
+                return s;
+            }
+            if (!first.has_value()) {
+                first = s;
+            }
+        }
+        return first;
+    }
+
     // Number of gradient inputs this node expects, indexed by input_nr.
     virtual size_t num_inputs() const { return next_edges_.size(); }
 

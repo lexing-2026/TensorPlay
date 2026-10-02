@@ -6,6 +6,9 @@
 #include "ManualNodes.h" // For AsStridedBackward
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include "tensorplay/ops/AutogradNodesGenerated.h"
+#ifdef USE_CUDA
+#include "CUDARuntime.h"
+#endif
 
 namespace tensorplay {
 namespace tpx {
@@ -397,12 +400,25 @@ std::vector<Edge> collect_next_edges(const Tensor& t) {
             shape[i] = t.size(i);
         }
         const DType dt = t.dtype();
-        auto fn = impl::grad_fn(t);
-        if (fn) {
-            Edge edge(std::move(fn), impl::output_nr(t), std::move(shape));
+        auto fill_metadata = [&](Edge& edge) {
             edge.grad_dtype = dt;
             edge.device_type_hint = t.device().type();
             edge.device_index_hint = t.device().index();
+#ifdef USE_CUDA
+            if (t.device().is_cuda()) {
+                edge.stream = tensorplay::cuda::getCurrentStream(
+                    static_cast<int>(t.device().index()));
+            } else {
+                edge.stream = Stream(Stream::DEFAULT, t.device());
+            }
+#else
+            edge.stream = Stream(Stream::DEFAULT, t.device());
+#endif
+        };
+        auto fn = impl::grad_fn(t);
+        if (fn) {
+            Edge edge(std::move(fn), impl::output_nr(t), std::move(shape));
+            fill_metadata(edge);
             edges.push_back(std::move(edge));
         } else {
             // Leaf
@@ -416,9 +432,7 @@ std::vector<Edge> collect_next_edges(const Tensor& t) {
                     meta->set_grad_accumulator(acc);
                 }
                 Edge edge(std::move(acc), 0, std::move(shape));
-                edge.grad_dtype = dt;
-                edge.device_type_hint = t.device().type();
-                edge.device_index_hint = t.device().index();
+                fill_metadata(edge);
                 edges.push_back(std::move(edge));
             } else {
                 edges.emplace_back();
@@ -475,10 +489,11 @@ void backward(const std::vector<Tensor>& tensors, const std::vector<Tensor>& gra
             if (tensor.numel() != 1) {
                 TP_THROW(RuntimeError, "grad can be implicitly created only for scalar outputs");
             }
-            // Create scalar tensor on the same device and fill with 1.0
-            std::vector<int64_t> shape = {};
-            grad = Tensor(shape, tensor.dtype(), tensor.device());
-            grad.fill_(1.0);
+            // Create scalar tensor on the same device and fill with 1.0.
+            // The ones_like factory is used (rather than an empty tensor plus
+            // an asynchronous fill_) so the value is visible to the engine's
+            // kernels on the current stream as soon as the root is consumed.
+            grad = Tensor::ones_like(tensor);
         }
         inputs.push_back(grad);
 

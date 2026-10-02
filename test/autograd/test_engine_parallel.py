@@ -99,5 +99,19 @@ class TestEngineParallel(unittest.TestCase):
         self.assertEqual(tp.cuda.memory_allocated(), baseline)
 
 
+    def test_many_short_device_graphs_finish_cleanly(self):
+        # Each graph ends on the device worker, and the thread that started it
+        # returns as soon as the last node is counted.  Nothing the worker does
+        # after that may touch the graph; done often enough, a worker that did
+        # would find it already gone and take the process down with it.
+        if not tp.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        x = tp.tensor([1.0, -2.0, 3.0], device="cuda", requires_grad=True)
+        for step in range(2000):
+            x.grad = None
+            ((x * 2.0).sum() + (x * x).sum()).backward()
+        self.assertEqual(x.grad.cpu().tolist(), [4.0, -2.0, 8.0])
+
+
 if __name__ == "__main__":
     unittest.main()

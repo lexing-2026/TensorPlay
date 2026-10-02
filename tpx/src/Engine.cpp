@@ -232,12 +232,18 @@ void Engine::execute_task(ReadyQueue::NodeTask&& task, ReadyQueue& cpu_queue,
         if (!graph.dispatch_modes_.stack.empty()) {
             modes_guard.emplace(graph.dispatch_modes_);
         }
-        evaluate_function(graph, task.fn_.get(), task.input_buffer_, cpu_queue, local_queue);
 #ifdef USE_CUDA
+        // The stream this thread works on is one the caller has to be ordered
+        // behind, and it is said before the node runs rather than after.  A
+        // node that turns out to be the graph's last is counted complete from
+        // inside the call below, and from then on the thread that started the
+        // graph may return and take the graph with it: nothing here may reach
+        // for it once the call is back.
         if (task_device >= 0) {
             graph.note_cuda_stream(cuda::getCurrentCUDAStream(task_device));
         }
 #endif
+        evaluate_function(graph, task.fn_.get(), task.input_buffer_, cpu_queue, local_queue);
     } catch (...) {
         // A failing node must not hang the whole backward: record the error
         // and account for this task so the graph still drains naturally; the
@@ -404,6 +410,38 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
     // Worker threads must honor this graph's create_graph decision regardless
     // of their thread-local GradMode.
     GradModeGuard grad_guard(task.grad_mode_);
+
+    // Switch the evaluating worker to the consumer node's canonical stream,
+    // then make sure every incoming gradient is ready on it before the node
+    // runs.  This is what orders a producer that ran on the caller's stream
+    // against a consumer (or accumulator) running on a worker thread.
+    const auto opt_parent_stream =
+        inputs.opt_overridden_consumer_stream.has_value()
+            ? inputs.opt_overridden_consumer_stream
+            : func->stream();
+#ifdef USE_CUDA
+    cuda::OptionalStreamGuard parent_stream_guard(opt_parent_stream);
+    // The node runs on the stream just switched to, which need not be the one
+    // this thread was on.  It is noted here for the same reason as the other:
+    // while the graph is certain to still be there.
+    if (const int node_device = inputs.device_index(); node_device >= 0) {
+        task.note_cuda_stream(cuda::getCurrentCUDAStream(node_device));
+    }
+    for (size_t pos = 0; pos < inputs.ready_events.size(); ++pos) {
+        if (!inputs.buffer[pos].defined()) continue;
+        if (inputs.buffer[pos].device().type() != DeviceType::CUDA) continue;
+        const auto& opt_ready_stream = inputs.ready_streams[pos];
+        const auto& opt_ready_event = inputs.ready_events[pos];
+        if (!opt_ready_stream.has_value() || !opt_parent_stream.has_value()) {
+            continue;
+        }
+        if (*opt_parent_stream != *opt_ready_stream) {
+            if (opt_ready_event.has_value()) {
+                opt_ready_event->block(cuda::toCUDAStream(*opt_parent_stream));
+            }
+        }
+    }
+#endif
 
     if (!exec_info_.empty()) {
         GraphTask::ExecInfo& fn_info = exec_info_.at(func);
@@ -624,7 +662,13 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
                 // slots even when some arrivals are undefined.
                 state.buffer = InputBuffer(next.function->num_inputs());
             }
-            state.buffer.add(next.input_nr, std::move(output), task.grad_mode_);
+            state.buffer.add(
+                next.input_nr,
+                std::move(output),
+                opt_parent_stream,
+                next.function->stream(),
+                next.function.get(),
+                task.grad_mode_);
             if (is_ready) {
                 pending.emplace(next.function, std::move(state.buffer), &task);
                 task.not_ready_.erase(it);

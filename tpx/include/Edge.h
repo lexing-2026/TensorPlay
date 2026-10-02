@@ -6,6 +6,7 @@
 #include "Device.h"
 #include "DType.h"
 #include "Macros.h"
+#include "Stream.h"
 
 namespace tensorplay {
 namespace tpx {
@@ -32,6 +33,10 @@ struct TENSORPLAY_API Edge {
     // report "cpu:0"), so an index alone cannot distinguish backends.
     std::optional<DeviceType> device_type_hint;
     std::optional<int64_t> device_index_hint;
+    // The stream the forward input's value was produced on.  The engine uses
+    // it as the producer stream when routing this edge's gradient, so the
+    // consumer can wait on the right event before accumulating.
+    std::optional<Stream> stream;
 
     bool has_input_metadata() const {
         return has_shape_hint && grad_dtype.has_value()

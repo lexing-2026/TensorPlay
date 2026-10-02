@@ -2,9 +2,11 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 
 #include "Device.h"
 #include "Macros.h"
+#include "Stream.h"
 
 #ifdef USE_CUDA
 #include <cuda_runtime_api.h>
@@ -80,6 +82,27 @@ P10_API CUDAStream getCurrentCUDAStream(int device_index = -1);
 P10_API void setCurrentCUDAStream(const CUDAStream& stream);
 P10_API void sleep(uint64_t cycles);
 
+// Conversion between the backend-agnostic Stream value and the CUDA-specific
+// handle.  The id stored in Stream is the raw cudaStream_t pointer value, so
+// the round trip is lossless.
+inline Stream toStream(const CUDAStream& stream) {
+    return Stream(
+        Stream::UNSAFE,
+        stream.device(),
+        static_cast<uint64_t>(stream.id()));
+}
+
+inline CUDAStream toCUDAStream(const Stream& stream) {
+    return CUDAStream(
+        static_cast<int>(stream.device_index()),
+        reinterpret_cast<cudaStream_t>(stream.id()));
+}
+
+// The ambient CUDA stream of one device as a backend-agnostic Stream.
+inline Stream getCurrentStream(int device_index = -1) {
+    return toStream(getCurrentCUDAStream(device_index));
+}
+
 class P10_API CUDAStreamGuard {
 public:
     explicit CUDAStreamGuard(const CUDAStream& stream);
@@ -93,6 +116,24 @@ private:
     int stream_device_ = -1;
     cudaStream_t original_stream_ = nullptr;
     bool active_ = false;
+};
+
+// Switches the current thread's CUDA stream while the guard is alive, and
+// restores the previous stream on destruction.  It is a no-op when the
+// optional stream is empty, is not on a CUDA device, or CUDA is unavailable.
+class P10_API OptionalStreamGuard {
+public:
+    explicit OptionalStreamGuard(const std::optional<Stream>& stream) {
+        if (stream.has_value() && stream->device_type() == DeviceType::CUDA) {
+            guard_.emplace(toCUDAStream(*stream));
+        }
+    }
+
+    OptionalStreamGuard(const OptionalStreamGuard&) = delete;
+    OptionalStreamGuard& operator=(const OptionalStreamGuard&) = delete;
+
+private:
+    std::optional<CUDAStreamGuard> guard_;
 };
 
 // Device guard that is a no-op for CPU devices. Generated dispatch wrappers
@@ -149,6 +190,15 @@ P10_API void recordPinnedStream(void* base_ptr, const CUDAStream& stream);
 class OptionalCUDAGuard {
 public:
     explicit OptionalCUDAGuard(const Device&) {}
+};
+
+// No-op when CUDA is unavailable.
+class OptionalStreamGuard {
+public:
+    explicit OptionalStreamGuard(const std::optional<Stream>&) {}
+
+    OptionalStreamGuard(const OptionalStreamGuard&) = delete;
+    OptionalStreamGuard& operator=(const OptionalStreamGuard&) = delete;
 };
 
 #endif // USE_CUDA
