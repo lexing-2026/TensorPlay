@@ -7,6 +7,7 @@ import threading
 
 import tensorplay as tp
 import tensorplay.distributed as dist
+from tensorplay import library
 from tensorplay.autograd.function import Function
 from tensorplay.graph import Proxy, capture_call, capturing
 from tensorplay.overrides import _disable_tensorplay_function
@@ -478,54 +479,24 @@ def all_reduce_sync(tensor_input, reduce_op="sum", group=None, *, op=None):
 
     if op is not None:
         reduce_op = op
-    name, op_int = _normalize_reduce_op(reduce_op)
+    name, _ = _normalize_reduce_op(reduce_op)
     pg = _resolve_group(group)
     if name not in ("sum", "avg"):
         raise ValueError(
             f"all_reduce_sync supports sum and avg, got {name!r}"
         )
-    if not tp.autograd.is_grad_enabled() or not tensor_input.requires_grad:
-        # No tape to feed: skip the autograd wrapper entirely (a captured
-        # region's trace pass runs under no_grad and must stay quiet).
-        output = tensor_input.detach().clone().contiguous()
-        work = dist.all_reduce(
-            output, op=op_int, group=pg, async_op=True
-        )
-        if work is not None and work.wait() is False:
-            raise TimeoutError("collective wait timed out")
-        if name == "avg":
-            output = output / max(1, pg.size())
-        return output
-    return AllReduceSyncWithAutograd.apply(
-        pg.group_name, name, tensor_input
-    )
+    return _all_reduce_op(tensor_input, name, pg.group_name)
 
 
-class AllReduceSyncWithAutograd(_CollectiveFunctionBase):
-    @staticmethod
-    def forward(ctx, group_name, reduce_op, tensor_input):
-        ctx.group_name = group_name
-        ctx.reduce_op = reduce_op
-        pg = _resolve_group(group_name)
-        _, op_int = _normalize_reduce_op(reduce_op)
-        output = tensor_input.detach().clone().contiguous()
-        work = dist.all_reduce(output, op=op_int, group=pg, async_op=True)
-        if work is not None and work.wait() is False:
-            raise TimeoutError("collective wait timed out")
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        pg = _resolve_group(ctx.group_name)
-        grad = grad_output.detach().clone().contiguous()
-        work = dist.all_reduce(
-            grad, op=dist.ReduceOp.SUM, group=pg, async_op=True
-        )
-        if work is not None and work.wait() is False:
-            raise TimeoutError("collective wait timed out")
-        if ctx.reduce_op == "avg":
-            grad = grad / max(1, pg.size())
-        return None, None, grad
+def _all_reduce_sync_impl(tensor_input, name, pg):
+    _, op_int = _normalize_reduce_op(name)
+    output = tensor_input.detach().clone().contiguous()
+    work = dist.all_reduce(output, op=op_int, group=pg, async_op=True)
+    if work is not None and work.wait() is False:
+        raise TimeoutError("collective wait timed out")
+    if name == "avg":
+        output = output / max(1, pg.size())
+    return output
 
 
 class BroadcastWithAutograd(_CollectiveFunctionBase):
@@ -1243,19 +1214,19 @@ def all_gather_sync(tensor_input, group=None):
     sum reduce-scatter on the gradient.
     """
 
-    pg = _resolve_group(group)
-    if not tp.autograd.is_grad_enabled() or not tensor_input.requires_grad:
-        # No tape to feed: the bare synchronous form (see all_reduce_sync).
-        return _all_gather_sync_impl(tensor_input, pg)
-    return AllGatherSyncWithAutograd.apply(pg.group_name, tensor_input)
+    return _all_gather_op(tensor_input, _resolve_group(group).group_name)
+
+
+def _all_gather_shape(input_shape, size):
+    shape = tuple(int(dim) for dim in input_shape)
+    return (size * shape[0],) + shape[1:] if shape else (size,)
 
 
 def _all_gather_sync_impl(tensor_input, pg):
-    size = pg.size()
-    shape = tuple(int(dim) for dim in tensor_input.shape)
-    out_shape = (size * shape[0],) + shape[1:] if shape else (size,)
     out = tp.empty(
-        out_shape, dtype=tensor_input.dtype, device=tensor_input.device
+        _all_gather_shape(tensor_input.shape, pg.size()),
+        dtype=tensor_input.dtype,
+        device=tensor_input.device,
     )
     work = dist.all_gather_single(
         out, tensor_input.contiguous(), group=pg, async_op=True
@@ -1263,33 +1234,6 @@ def _all_gather_sync_impl(tensor_input, pg):
     if work is not None and work.wait() is False:
         raise TimeoutError("collective wait timed out")
     return out
-
-
-class AllGatherSyncWithAutograd(_CollectiveFunctionBase):
-    @staticmethod
-    def forward(ctx, group_name, tensor_input):
-        ctx.group_name = group_name
-        return _all_gather_sync_impl(tensor_input, _resolve_group(group_name))
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        pg = _resolve_group(ctx.group_name)
-        grad = grad_output.detach().clone().contiguous()
-        out = tp.empty(
-            tuple(int(dim) for dim in grad_output.shape[1:]),
-            dtype=grad_output.dtype,
-            device=grad_output.device,
-        )
-        work = dist.reduce_scatter_single(
-            out,
-            grad.reshape(-1),
-            op=dist.ReduceOp.SUM,
-            group=pg,
-            async_op=True,
-        )
-        if work is not None and work.wait() is False:
-            raise TimeoutError("collective wait timed out")
-        return None, out
 
 
 def reduce_scatter_sync(tensor_input, group=None):
@@ -1302,11 +1246,7 @@ def reduce_scatter_sync(tensor_input, group=None):
     every rank, and the tangent rule all-gathers the shard gradient.
     """
 
-    pg = _resolve_group(group)
-    if not tp.autograd.is_grad_enabled() or not tensor_input.requires_grad:
-        # No tape to feed: the bare synchronous form (see all_reduce_sync).
-        return _reduce_scatter_sync_impl(tensor_input, pg)
-    return ReduceScatterSyncWithAutograd.apply(pg.group_name, tensor_input)
+    return _reduce_scatter_op(tensor_input, _resolve_group(group).group_name)
 
 
 def _reduce_scatter_sync_impl(tensor_input, pg):
@@ -1319,9 +1259,10 @@ def _reduce_scatter_sync_impl(tensor_input, pg):
             "reduce_scatter requires the leading dimension to divide "
             "evenly by the group size"
         )
-    shard_shape = (shape[0] // size,) + shape[1:]
     out = tp.empty(
-        shard_shape, dtype=tensor_input.dtype, device=tensor_input.device
+        _reduce_scatter_shape(shape, size),
+        dtype=tensor_input.dtype,
+        device=tensor_input.device,
     )
     work = dist.reduce_scatter_single(
         out,
@@ -1335,27 +1276,88 @@ def _reduce_scatter_sync_impl(tensor_input, pg):
     return out
 
 
-class ReduceScatterSyncWithAutograd(_CollectiveFunctionBase):
-    @staticmethod
-    def forward(ctx, group_name, tensor_input):
-        ctx.group_name = group_name
-        return _reduce_scatter_sync_impl(
-            tensor_input, _resolve_group(group_name)
-        )
+def _reduce_scatter_shape(input_shape, size):
+    shape = tuple(int(dim) for dim in input_shape)
+    return (shape[0] // size,) + shape[1:]
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        pg = _resolve_group(ctx.group_name)
-        size = pg.size()
-        grad = grad_output.detach().clone().contiguous()
-        out = tp.empty(
-            (size * grad.shape[0],) + tuple(grad.shape[1:]),
-            dtype=grad_output.dtype,
-            device=grad_output.device,
-        )
-        work = dist.all_gather_single(
-            out, grad, group=pg, async_op=True
-        )
-        if work is not None and work.wait() is False:
-            raise TimeoutError("collective wait timed out")
-        return None, out
+
+# The captured collectives, as operations of their own.
+#
+# A compiled training region is traced one operation at a time, and the
+# process group's sends and receives are not operations it can see.  Traced
+# through, a collective left only its copies in the graph, and the region
+# added up its own rank's values alone, in the forward and in the gradient.
+# As operations they are recorded whole, run once per call on every rank, and
+# carry the rule for their gradient with them.  What they produce is shaped
+# from what they are given, so a trace that only needs shapes is answered
+# without communicating.
+
+
+@library.custom_op("tp_collectives::all_reduce", mutates_args=())
+def _all_reduce_op(tensor_input: tp.Tensor, reduce_op: str, group: str) -> tp.Tensor:
+    return _all_reduce_sync_impl(tensor_input, reduce_op, _resolve_group(group))
+
+
+@_all_reduce_op.register_fake
+def _(tensor_input, reduce_op, group):
+    return tp.empty_like(tensor_input)
+
+
+def _all_reduce_setup(ctx, inputs, output):
+    ctx.reduce_op, ctx.group = inputs[1], inputs[2]
+
+
+def _all_reduce_backward(ctx, grad):
+    # Every rank's input reaches every rank's output, so each input's
+    # gradient is the sum of the gradients all ranks hold for the output.
+    summed = _all_reduce_op(grad.contiguous(), "sum", ctx.group)
+    if ctx.reduce_op == "avg":
+        summed = summed / max(1, _resolve_group(ctx.group).size())
+    return summed, None, None
+
+
+_all_reduce_op.register_autograd(_all_reduce_backward, setup_context=_all_reduce_setup)
+
+
+@library.custom_op("tp_collectives::all_gather", mutates_args=())
+def _all_gather_op(tensor_input: tp.Tensor, group: str) -> tp.Tensor:
+    return _all_gather_sync_impl(tensor_input, _resolve_group(group))
+
+
+@_all_gather_op.register_fake
+def _(tensor_input, group):
+    shape = _all_gather_shape(tensor_input.shape, _resolve_group(group).size())
+    return tp.empty(shape, dtype=tensor_input.dtype, device=tensor_input.device)
+
+
+def _group_setup(ctx, inputs, output):
+    ctx.group = inputs[1]
+
+
+def _all_gather_backward(ctx, grad):
+    # This rank's shard went to every rank; its gradient is the sum, over
+    # ranks, of the slice of each gradient that shard became.
+    return _reduce_scatter_op(grad.contiguous(), ctx.group), None
+
+
+_all_gather_op.register_autograd(_all_gather_backward, setup_context=_group_setup)
+
+
+@library.custom_op("tp_collectives::reduce_scatter", mutates_args=())
+def _reduce_scatter_op(tensor_input: tp.Tensor, group: str) -> tp.Tensor:
+    return _reduce_scatter_sync_impl(tensor_input, _resolve_group(group))
+
+
+@_reduce_scatter_op.register_fake
+def _(tensor_input, group):
+    shape = _reduce_scatter_shape(tensor_input.shape, _resolve_group(group).size())
+    return tp.empty(shape, dtype=tensor_input.dtype, device=tensor_input.device)
+
+
+def _reduce_scatter_backward(ctx, grad):
+    # Every rank's input fed this rank's shard; each input's gradient is the
+    # shard gradients of all ranks laid end to end.
+    return _all_gather_op(grad.contiguous(), ctx.group), None
+
+
+_reduce_scatter_op.register_autograd(_reduce_scatter_backward, setup_context=_group_setup)

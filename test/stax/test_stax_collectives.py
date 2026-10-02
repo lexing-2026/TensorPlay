@@ -225,6 +225,25 @@ loss = ct(xc)
 loss.backward()
 assert tp.allclose(xc.grad, ref_grad, rtol=1e-5, atol=1e-4), (
     xc.grad, ref_grad)
+# The loss itself is the sum over every rank's values, not this rank's alone:
+# 2 * (world * sum(base) + rows * sum(ranks)).
+expect_loss = 2.0 * (world * float(base.sum()) + world * float(sum(range(world))))
+assert abs(float(loss) - expect_loss) < 1e-4, (float(loss), expect_loss)
+assert tp.allclose(xc.grad, tp.full_like(x, 2.0 * world)), xc.grad
+
+# The gathered value's gradient comes back summed over the ranks it went to,
+# and the scattered shard's gradient is laid back out over the whole input.
+def train_gather(t):
+    return (fc.all_gather_single(t) * 3.0).sum()
+
+def train_scatter(t):
+    return (fc.reduce_scatter_single(t) * 3.0).sum()
+
+for region, expect_grad in ((train_gather, 3.0 * world), (train_scatter, 3.0)):
+    xg = x.clone().requires_grad_(True)
+    tp.compile(region)(xg).backward()
+    assert tp.allclose(xg.grad, tp.full_like(x, expect_grad)), (
+        region.__name__, xg.grad, expect_grad)
 
 print(f"RANK{rank}OK")
 """
