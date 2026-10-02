@@ -1422,7 +1422,7 @@ def _shared_copy(x, dtype):
 @register("to.dtype", "to.device", "to.dtype_layout", "_to_copy.default")
 def lower_to(x, *args, **kwargs):
     size, dtype, _ = val_info(node_val())
-    if not kwargs.get("copy", False) and dtype_name(x.get_dtype()) == dtype_name(dtype):
+    if not kwargs.get("copy", False) and hasattr(x, "get_dtype") and dtype_name(x.get_dtype()) == dtype_name(dtype):
         # A request that changes no element type moves no bytes, so the value
         # itself answers it.  A spelling that also carries an arrangement is
         # only free for a boxed value, whose arrangement is still to be
