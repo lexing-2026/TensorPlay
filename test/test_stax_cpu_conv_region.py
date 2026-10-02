@@ -21,6 +21,10 @@ class _Net(nn.Module):
         self.n2 = nn.GroupNorm(4, 16)
         self.proj_a = nn.Linear(8, 16)
         self.proj_b = nn.Linear(8, 16)
+        self.down = nn.Conv2d(16, 16, 3, padding=1)
+        self.n3 = nn.GroupNorm(4, 32)
+        self.merge = nn.Conv2d(32, 16, 3, padding=1)
+        self.skip = nn.Conv2d(32, 16, 1)
         self.c3 = nn.Conv2d(16, 3, 1)
 
     def forward(self, x, emb):
@@ -28,6 +32,13 @@ class _Net(nn.Module):
         h = h + self.proj_a(emb)[:, :, None, None]
         h = h + F.silu(self.n2(self.c2(h)))
         h = h + self.proj_b(emb)[:, :, None, None]
+        # A down/up path whose result is joined with the skip: the join is
+        # read by a norm, a convolution and a 1x1 convolution, and is kept
+        # for the backward pass.
+        low = self.down(F.avg_pool2d(h, 2))
+        up = F.interpolate(low, scale_factor=2.0, mode="nearest")
+        joined = tp.cat([up, h], dim=1)
+        h = self.merge(F.silu(self.n3(joined))) + self.skip(joined)
         return self.c3(h)
 
 

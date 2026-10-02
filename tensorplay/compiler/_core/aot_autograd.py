@@ -45,6 +45,37 @@ __all__ = [
     "min_cut_rematerialization_partition",
 ]
 
+def _mark_user_outputs(module: Any, count: int) -> None:
+    """Record which of a region's results the program's caller reads.
+
+    A backend that chooses how values are laid out leaves the results a
+    caller reads as the program produced them and is free with the rest.  The
+    first ``count`` results are the caller's; the strides every result was
+    traced with are recorded beside them.
+    """
+
+    graph = getattr(module, "graph", None)
+    find_nodes = getattr(graph, "find_nodes", None)
+    if find_nodes is None:
+        return
+    output_nodes = find_nodes(op="output")
+    if not output_nodes:
+        return
+    output_node = output_nodes[0]
+    args = output_node.args
+    if args and isinstance(args[0], (tuple, list)):
+        args = args[0]
+    strides = []
+    for arg in args:
+        val = getattr(arg, "meta", {}).get("val") if hasattr(arg, "meta") else None
+        try:
+            strides.append(tuple(int(s) for s in val.stride()) if _is_tensor(val) else None)
+        except (TypeError, ValueError):
+            strides.append(None)
+    output_node.meta["user_visible_output_idxs"] = list(range(min(count, len(args))))
+    output_node.meta["original_output_strides"] = strides
+
+
 def _holds_tensor(value: Any) -> bool:
     """Whether a list, tuple or dict argument has a tensor somewhere inside."""
     if isinstance(value, (list, tuple)):
@@ -402,6 +433,11 @@ def aot_function(
     fw_inputs = [
         trace_primals[primal_names.index(p.name)] for p in fw_module.graph.placeholders
     ]
+    # The forward returns the program's results followed by what it keeps for
+    # the backward; only the first are read by the caller.  The backward's
+    # results go to the engine, which lays each gradient out for its leaf.
+    _mark_user_outputs(fw_module, num_fwd)
+    _mark_user_outputs(bw_module, 0)
     compiled_fw = fw_compiler(fw_module, fw_inputs)
     compiled_bw_box: list[Any] = []
     fw_codegen = getattr(compiled_fw, "_tensorplay_codegen", None)

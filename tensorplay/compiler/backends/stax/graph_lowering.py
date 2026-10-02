@@ -424,6 +424,11 @@ _CONVOLUTION_TARGET_PREFIXES = (
 )
 
 
+# Calls run by the framework whose result keeps the order of a channels-last
+# operand, so they are handed their activations in that order.
+_LAYOUT_KEEPING_FALLBACKS = frozenset({"group_norm", "group_norm_backward"})
+
+
 def _is_convolution_node(node) -> bool:
     """Whether a node is a convolution or one of a convolution's gradients."""
     if node.op != "call_function":
@@ -553,6 +558,7 @@ class GraphLowering(Interpreter):
         mark_nodes_dislike_padding(
             graph_module.graph, self.user_visible_output_strides
         )
+        self.user_visible_nodes = self._user_visible_nodes(graph_module.graph)
         # The module whose constants a constant node reads, which is this region's
         # own while it is being lowered and the subgraph's while a subgraph's
         # nodes are being lowered into it.  A node names a constant as an
@@ -1476,15 +1482,80 @@ class GraphLowering(Interpreter):
         return meta
 
     @staticmethod
-    def _layout_of(val):
-        """Where the elements of a traced result sit."""
+    def _layout_of(val, strides=None):
+        """Where the elements of a traced result sit.
 
+        ``strides`` replaces the traced strides when the call was run on
+        operands laid out the way this region lays them out and answered with
+        another arrangement.
+        """
+
+        if strides is not None:
+            return FixedLayout(
+                val.device, val.dtype,
+                tuple(int(s) for s in val.shape),
+                tuple(int(s) for s in strides),
+                0,
+            )
         return FixedLayout(
             val.device, val.dtype,
             tuple(int(s) for s in val.shape),
             tuple(int(s) for s in val.stride()),
             int(val.storage_offset()) if hasattr(val, "storage_offset") else 0,
         )
+
+    def _probe_fallback_result(self, node, tensor_args, other_args, unflatten):
+        """What a described call returns for operands laid out as they are here.
+
+        The traced result says how the call arranged its result for the
+        operands the program was traced with.  A region that chooses its own
+        layouts hands the call operands arranged differently, and a call that
+        keeps its operand's arrangement then returns its result arranged
+        differently too.  So where layouts are chosen, the call is run once on
+        empty operands with the arrangements they have here, and the result's
+        strides are read from that run.  Nothing is returned when layouts are
+        left as traced, or when the call cannot be run this way.
+        """
+
+        if not self.layout_opt or node.op != "call_function":
+            return None
+        try:
+            # Only a four-dimensional operand can be laid out differently
+            # from how it was traced.
+            if not any(len(x.get_size()) == 4 for x in tensor_args):
+                return None
+            for x in tensor_args:
+                if ir.is_storage_and_layout(x):
+                    ir.as_storage_and_layout(x, freeze=True)
+            example = []
+            for x in tensor_args:
+                if not isinstance(x, ir.BaseView) and x.get_name() in self.constants:
+                    example.append(self.constants[x.get_name()])
+                else:
+                    example.append(ir.ir_node_to_tensor(x))
+            args, kwargs = unflatten(example, list(other_args))
+            with tp.no_grad():
+                return node.target(*args, **kwargs)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _probed_strides(val, probed, item, path=()):
+        """The probed strides of one traced result, when the probe has it."""
+
+        cursor = probed
+        try:
+            for index in path:
+                cursor = cursor[index]
+        except (TypeError, IndexError, KeyError):
+            return None
+        if not _is_tensor(cursor) or not _is_tensor(item):
+            return None
+        if tuple(int(s) for s in cursor.shape) != tuple(int(s) for s in item.shape):
+            return None
+        if cursor.dtype != item.dtype:
+            return None
+        return tuple(int(s) for s in cursor.stride())
 
     def _make_fallback(self, node, kernel_name, realized_args, kwargs):
         """Describe a call that is run rather than written out.
@@ -1544,6 +1615,7 @@ class GraphLowering(Interpreter):
                 f"cannot run {getattr(node.target, '__name__', node.target)!r}: "
                 f"the call's result is not known, so there is nowhere to put it"
             )
+        probed = self._probe_fallback_result(node, tensor_args, other_args, unflatten)
         if len(tensor_outputs) > 1:
             # Several results cannot all be the call itself, so the call is
             # given no result of its own and each result is a buffer naming the
@@ -1552,7 +1624,9 @@ class GraphLowering(Interpreter):
                 device=tensor_outputs[0].device,
             )
         else:
-            layout = self._layout_of(tensor_outputs[0])
+            layout = self._layout_of(
+                tensor_outputs[0], self._probed_strides(val, probed, tensor_outputs[0])
+            )
 
         kernel = IrFallbackKernel(
             layout=layout,
@@ -1563,6 +1637,7 @@ class GraphLowering(Interpreter):
             kwargs=realized_kwargs,
         )
         kernel.origin_node = node
+        kernel.probed_result = probed
         # A method call that survives to the backend names its operation with
         # a string.  In-place tensor methods carry a trailing underscore: the
         # receiver is mutated and returned, which has to be recorded so memory
@@ -1598,7 +1673,13 @@ class GraphLowering(Interpreter):
                     # Boxed the way every value is, so that what holds this
                     # result is a place memory can be given.
                     return TensorBox.create(kernel)
-                out = MultiOutput(self._layout_of(item), kernel, path)
+                strides = self._probed_strides(
+                    val,
+                    getattr(kernel, "probed_result", None),
+                    item,
+                    tuple(index for _, index in path),
+                )
+                out = MultiOutput(self._layout_of(item, strides), kernel, path)
                 out.origin_node = node
                 kernel.outputs.append(out)
                 return TensorBox.create(out)
@@ -1609,6 +1690,19 @@ class GraphLowering(Interpreter):
             return item
 
         return wrap(val, [])
+
+    @staticmethod
+    def _is_image_box(value) -> bool:
+        """Whether a value is a four-dimensional tensor with more than one
+        spatial position, the only kind two layouts arrange differently."""
+
+        if not isinstance(value, TensorBox):
+            return False
+        try:
+            size = [int(s) for s in value.get_size()]
+        except (NotImplementedError, TypeError, ValueError):
+            return False
+        return len(size) == 4 and size[2] * size[3] > 1
 
     def make_extern(self, node, args, kwargs):
         def realize_args(value):
@@ -1622,6 +1716,19 @@ class GraphLowering(Interpreter):
                 return {k: realize_args(v) for k, v in value.items()}
             return value
 
+        if self.layout_opt and target_name(node.target) in _LAYOUT_KEEPING_FALLBACKS:
+            # These calls keep a channels-last operand's order in their
+            # result.  Handing them their activations in that order -- rather
+            # than in whatever order putting an unwritten body in memory
+            # happens to settle on -- writes each body once, in the order the
+            # convolutions around the call read, instead of row-major first
+            # and repacked for each of them afterwards.
+            args = tuple(
+                ir.ExternKernel.require_channels_last(a)
+                if self._is_image_box(a)
+                else a
+                for a in args
+            )
         realized_args = realize_args(args)
         # An operator a template owns is built as that template's kernel, so
         # the operation is named in one place and its implementation is chosen
@@ -1713,31 +1820,130 @@ class GraphLowering(Interpreter):
                 result = self.call_function(n.target, args, kwargs)
             else:
                 result = super().run_node(n)
-        result = self._maybe_apply_channels_last(n, result)
         self.env[n] = result
         return result
 
-    def _maybe_apply_channels_last(self, n, result):
-        """This node's result laid out channels-last, when the chain wants it.
+    def _channels_last_before_realize(self, n, result):
+        """This node's result with channels-last strides, when the chain wants it.
 
-        A node that feeds a convolution (or is fed by one) is held in the
-        same channels-last layout as the rest of the chain, so that the
-        convolution reads it without a copy.  Multi-result calls are handled
-        per result; only four-dimensional dense values are rearranged.  A
-        value the graph returns to its caller is left in the layout the
-        caller wrote, since changing it would leak the choice into the
-        surrounding program.
+        Asked at the point a value read by several consumers is about to be
+        put in memory: a value that feeds a convolution, or is fed by one, is
+        stored in the order the convolution reads, so it is written once in
+        that order rather than stored row-major and repacked for each reader.
+        Whether the value is a dense four-dimensional one is read from the
+        traced value, since a body that is not in memory yet has no strides
+        of its own to ask.  A value the region returns to its caller keeps the
+        layout the caller wrote, and one read by explicit strides keeps the
+        layout that reader spelled.
+        """
+
+        if not self.stores_channels_last(n):
+            return result
+        try:
+            if len(result.get_size()) != 4:
+                return result
+        except NotImplementedError:
+            return result
+        return self.in_channels_last_order(result)
+
+    @staticmethod
+    def in_channels_last_order(value):
+        """A value arranged channels-last, boxed the way a node's value is.
+
+        Arranging a value may answer with the storage it settled rather than
+        with a box around it; a node's value is always the box.
+        """
+
+        arranged = ir.ExternKernel.require_stride_order(value, ir.NHWC_STRIDE_ORDER)
+        if isinstance(arranged, StorageBox):
+            arranged = TensorBox(arranged)
+        return arranged
+
+    def stores_channels_last(self, n) -> bool:
+        """Whether this node's value is one the region stores channels-last.
+
+        It is when the chain wants it there (the node feeds a convolution or
+        is fed by one), the program's caller does not read it, no reader
+        spells strides of its own, and the traced value is a dense
+        four-dimensional one with more than one spatial position.
         """
 
         if n not in self.nodes_prefer_channels_last:
-            return result
-        if any(u.op == "output" for u in n.users):
-            return result
+            return False
+        if n in self.user_visible_nodes:
+            return False
         if self._is_input_for_as_strided(n):
+            return False
+        val = n.meta.get("val")
+        if not _is_tensor(val):
+            return False
+        try:
+            size = [int(s) for s in val.shape]
+            stride = [int(s) for s in val.stride()]
+        except (TypeError, ValueError):
+            # Extents that are not plain numbers.
+            return False
+        if len(size) != 4 or size[2] * size[3] == 1:
+            # One spatial position: both orders are the same arrangement, so
+            # there is nothing to choose and no copy worth making.
+            return False
+        return self._is_dense_4d(size, stride)
+
+    @staticmethod
+    def _user_visible_nodes(g) -> set:
+        """The nodes whose values the caller of the region reads.
+
+        A region that says which of its results are the program's own -- the
+        rest being values kept for a later pass -- is believed.  A region that
+        does not say is taken to hand every result to its caller.
+        """
+
+        output_nodes = g.find_nodes(op="output")
+        if not output_nodes:
+            return set()
+        output_node = output_nodes[0]
+        args = output_node.args
+        if args and isinstance(args[0], (tuple, list)):
+            args = args[0]
+        visible = output_node.meta.get("user_visible_output_idxs")
+        return {
+            a
+            for i, a in enumerate(args)
+            if hasattr(a, "op") and (visible is None or i in visible)
+        }
+
+    def _mark_reuse(self, node, result):
+        """Record how many consumers read a result, storing it if that pays.
+
+        A body read by several consumers is stored rather than recomputed per
+        consumer when it is worth storing; cheap index arithmetic stays inline
+        so a shared constant does not inflate every downstream read count.
+        The decision belongs to the box.  Where it decides to store, the
+        layout the value is stored in is settled first.
+        """
+
+        if not isinstance(result, TensorBox):
             return result
-        if isinstance(result, tuple):
-            return tuple(self._channels_last_4d(r) for r in result)
-        return self._channels_last_4d(result)
+        storage = self._storage_box(result)
+        if storage is None:
+            return result
+        users = len(node.users)
+        if storage.should_realize_on_reuse(users):
+            result = self._channels_last_before_realize(node, result)
+            storage = self._storage_box(result)
+            if storage is None:
+                return result
+        storage.mark_reuse(users)
+        return result
+
+    @staticmethod
+    def _storage_box(result):
+        """The box that holds a result's memory, under any views of it."""
+
+        storage = result.data
+        while not isinstance(storage, StorageBox) and isinstance(storage, (View, TensorBox)):
+            storage = storage.data
+        return storage if isinstance(storage, StorageBox) else None
 
     def _is_input_for_as_strided(self, n) -> bool:
         """Whether this node feeds a call that reads by explicit strides.
@@ -1753,57 +1959,28 @@ class GraphLowering(Interpreter):
                 return True
         return False
 
-    def _channels_last_4d(self, r):
-        """One result, in channels-last order if it is a dense 4D tensor."""
-
-        try:
-            if isinstance(r, ir.TensorBox) and len(r.get_size()) == 4:
-                size = r.get_size()
-                stride = r.get_stride()
-                if stride is None or not self._is_dense_4d(size, stride):
-                    return r
-                from tensorplay.graph.experimental.symbolic_shapes import (
-                    free_unbacked_symbols,
-                )
-
-                if free_unbacked_symbols(stride):
-                    return r
-                data = r.data
-                if isinstance(data, ir.StorageBox):
-                    data.realize()
-                return ir.ExternKernel.require_stride_order(
-                    r, ir.NHWC_STRIDE_ORDER
-                )
-        except (NotImplementedError, AssertionError, TypeError, ValueError):
-            pass
-        return r
-
-    def _is_dense_4d(self, size, stride) -> bool:
+    @staticmethod
+    def _is_dense_4d(size, stride) -> bool:
         """Whether a 4D value is non-overlapping and dense.
 
-        Every element of a dense non-overlapping tensor has one position
-        of its own, which is what makes rearranging its strides a pure
-        reordering rather than a gather.  A strided layout is dense exactly
-        when, ordered by decreasing stride, each stride equals the product
-        of the sizes of the dims before it.
+        Every element of a dense non-overlapping tensor has one position of
+        its own, which is what makes rearranging its strides a pure
+        reordering rather than a gather.  Walking the dimensions from the
+        smallest stride up, each stride must equal the number of elements the
+        dimensions before it span; a dimension of one element spans nothing
+        and may carry any stride.
         """
 
-        try:
-            size = [int(s) for s in size]
-            stride = [int(s) for s in stride]
-        except (TypeError, ValueError):
-            return False
         if len(size) != 4 or len(stride) != 4:
             return False
-        order = sorted(range(4), key=lambda i: stride[i], reverse=True)
+        order = sorted(range(4), key=lambda i: stride[i])
         expected = 1
         for i in order:
-            if stride[i] < 0:
+            if size[i] == 1:
+                continue
+            if stride[i] != expected:
                 return False
-            if size[i] > 1:
-                if stride[i] != expected:
-                    return False
-                expected *= size[i]
+            expected *= size[i]
         return True
 
     def run(self, *args):
@@ -1932,12 +2109,7 @@ class GraphLowering(Interpreter):
             else:
                 raise AssertionError
 
-        if isinstance(result, TensorBox):
-            storage = result.data
-            while not isinstance(storage, StorageBox) and isinstance(storage, (View, TensorBox)):
-                storage = storage.data
-            if isinstance(storage, StorageBox):
-                storage.mark_reuse(len(node.users))
+        result = self._mark_reuse(node, result)
         assign_origin_node(result, node)
         return result
 
@@ -1981,18 +2153,7 @@ class GraphLowering(Interpreter):
             else:
                 result = self.make_extern(node, args, kwargs)
 
-        if isinstance(result, TensorBox):
-            # A value several consumers read is stored rather than recomputed
-            # per consumer, but only when the body is worth storing: cheap
-            # index arithmetic stays inline so a shared constant does not
-            # inflate every downstream read count.  The decision belongs to the
-            # box, the only thing that knows what it holds and how it got its
-            # reads.
-            storage = result.data
-            while not isinstance(storage, StorageBox) and isinstance(storage, (View, TensorBox)):
-                storage = storage.data
-            if isinstance(storage, StorageBox):
-                storage.mark_reuse(len(node.users))
+        result = self._mark_reuse(node, result)
         # Which node of the region this value was made by, so that a report
         # about it can name where it came from.
         assign_origin_node(result, node)
