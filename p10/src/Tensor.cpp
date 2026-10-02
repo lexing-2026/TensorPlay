@@ -1341,6 +1341,10 @@ Tensor clone_impl(const Tensor& self, std::optional<MemoryFormat> memory_format)
         }
     }
     out_impl->set_memory_format(result_format);
+    // Row-major contiguity is a property of the strides, not of the layout
+    // that was asked for: a channels-last result is dense in its own order
+    // and is still not row-major.  Recompute the flags from the strides.
+    out_impl->set_sizes_and_strides(sizes_v, strides);
     // A clone is a full-value copy: a quantized source's quantizer rides
     // along so the result stays a quantized tensor with the same mapping.
     if (self.unsafeGetTensorImpl()->has_quantizer()) {
@@ -1394,6 +1398,9 @@ Tensor contiguous_impl(const Tensor& self, int64_t memory_format_raw) {
                     getAllocator(self.device().type()), self.device());
     auto out_impl = make_intrusive<TensorImpl>(storage, sizes_v, strides, self.dtype(), 0);
     out_impl->set_memory_format(format);
+    // As in clone: the row-major flag follows the strides, so a result laid
+    // out channels-last does not report itself row-major.
+    out_impl->set_sizes_and_strides(sizes_v, strides);
     if (self.unsafeGetTensorImpl()->has_quantizer()) {
         out_impl->set_quantizer(self.unsafeGetTensorImpl()->quantizer());
     }
