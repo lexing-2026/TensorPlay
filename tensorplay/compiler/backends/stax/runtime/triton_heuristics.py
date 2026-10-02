@@ -4110,6 +4110,7 @@ def triton_config_reduction(
     for prefix in sorted(rnumels):
         while rnumels[prefix] < size_hints[prefix] and total_numel() < target:
             rnumels[prefix] *= 2
+    requested_num_warps = num_warps
     if num_warps is None:
         num_warps = (
             r // 128
@@ -4117,6 +4118,10 @@ def triton_config_reduction(
             else total_numel() // 128
         )
     max_num_warps = 16 if r <= 8192 else 32
+    # The cap keeps a derived count from oversubscribing a small block; a
+    # count the caller named is a deliberate candidate, so it is honored.
+    if requested_num_warps is not None:
+        max_num_warps = max(max_num_warps, requested_num_warps)
     warps_fn = functools.partial(_num_warps, min_num_warps=min_num_warps) if min_num_warps is not None else _num_warps
     num_warps = warps_fn(
         num_warps,

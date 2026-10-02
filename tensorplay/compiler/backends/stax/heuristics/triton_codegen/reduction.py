@@ -325,6 +325,40 @@ class ReductionHeuristic(CodegenConfigHeuristics):
                 dynamic_scale_rblock=False,
             )
             configs.append(c)
+            # The whole-line block keeps every accumulator resident in one
+            # pass, and past a few thousand reduction elements that working
+            # set no longer fits the register file, so the compiler spills
+            # and the candidate is dropped.  A companion block at a couple
+            # thousand elements per pass on the widest team the device
+            # allows streams the same loads while keeping each thread's
+            # working set spill-free; the autotuner keeps whichever of the
+            # two measures faster.
+            wide_r0 = min(rnumel, 2048)
+            if wide_r0 >= warp_size * 32:
+                configs.append(
+                    make_config(
+                        xnumel,
+                        wide_r0,
+                        num_warps=max(1024 // warp_size, 1),
+                        register_intensive=register_intensive,
+                        dynamic_scale_rblock=False,
+                    )
+                )
+                # One step up from the spill-free block: a wider pass per
+                # iteration at the narrower team.  Reads that stream from
+                # memory in a low-precision element type run fastest here,
+                # which the wider block reaches sooner than either of the
+                # two above.
+                if min(rnumel, 32768) > 4096:
+                    configs.append(
+                        make_config(
+                            xnumel,
+                            4096,
+                            num_warps=max(512 // warp_size, 1),
+                            register_intensive=register_intensive,
+                            dynamic_scale_rblock=False,
+                        )
+                    )
 
         # For 3d tiling, default to more autotuning initially
         if "y" in size_hints:
