@@ -1353,6 +1353,13 @@ LOWERINGS["lt.Scalar"] = _binary("lt")
 LOWERINGS["ge.Scalar"] = _binary("ge")
 LOWERINGS["gt.Scalar"] = _binary("gt")
 LOWERINGS["ne.Scalar"] = _binary("ne")
+LOWERINGS["eq.Scalar"] = _binary("eq")
+#: The form between two values under the name the operation's own declaration
+#: gives it.  A region recorded operation by operation holds the comparison
+#: under that name, and without it the comparison is handed to the framework
+#: whole instead of being written into the loop that reads it.
+for _comparison in ("le", "lt", "ge", "gt", "ne", "eq"):
+    LOWERINGS[f"{_comparison}.Tensor"] = LOWERINGS[f"{_comparison}.default"]
 
 
 @register("clamp.default")
@@ -6210,3 +6217,17 @@ def lower_as_strided(
         sympy.expand(storage_offset),
     )
     return TensorBox(ir.ReinterpretView(data=storage, layout=new_layout))
+
+
+def load_lowering_modules() -> None:
+    """Pull in the lowerings that are kept in modules of their own.
+
+    Such a lowering registers by being imported, and its module imports this
+    one -- along with the template helpers, which import this one too -- so it
+    cannot be imported from here while this module is still being read.  It is
+    asked for by whatever is about to lower a region instead; without that
+    nothing would ever load it, and its operations would be handed to the
+    framework whole.
+    """
+
+    from . import attention  # noqa: F401

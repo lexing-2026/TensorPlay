@@ -725,15 +725,13 @@ def trace_omni_attention(
         # gradient of its own: the region being traced decides that from the
         # values it was captured with, not from a value made to stand in for
         # one of them.
-        return tensorplay.empty_strided(
-            size,
-            # The distances of a value whose extents are known and whose numbers
-            # are not read: the ones a value of this shape has, laid out one
-            # after another.
-            _contiguous_strides(size),
-            device=device,
-            dtype=dtype,
-        )
+        # The numbers are not what the example is for, but some of them are
+        # read on the way to a shape: a block mask says how many blocks each
+        # query block attends to, and the dense formula loops that many times.
+        # Zeros make that read mean "none", so the example walks no block and
+        # still comes out with the extents it was run for.  Memory left as it
+        # was found would make the loop bounds whatever happened to be there.
+        return tensorplay.zeros(size, device=device, dtype=dtype)
 
     # The example runs below autograd.  What it exists for is the shapes of the
     # outputs, and the region is traced with that alone in hand: the parts of a
@@ -764,12 +762,22 @@ def trace_omni_attention(
     # stand-in for a value to make one is a way of recording that request, and
     # what is wanted here is a shape to trace against rather than a node to
     # appear in the graph.
-    _probe = tensorplay.empty_strided((), (), device=query.device, dtype=query.dtype)
-    _index_probe = tensorplay.empty_strided(
-        (), (), device=query.device, dtype=tensorplay.int64
-    )
-    example_vals = [_probe] + [_index_probe for _ in range(4)]
-    mask_example_vals = [_index_probe for _ in range(4)]
+    #
+    # Each extent gets a stand-in of its own.  A capture tells the values it is
+    # given apart by which value they are, so one stand-in handed over four
+    # times would be one argument four times over, and a mask comparing the
+    # query position with the key position would be comparing a value with
+    # itself.
+    def _index_probes():
+        return [
+            tensorplay.zeros((), device=query.device, dtype=tensorplay.int64)
+            for _ in range(4)
+        ]
+
+    with disable_proxy_modes_tracing():
+        _probe = tensorplay.zeros((), device=query.device, dtype=query.dtype)
+        example_vals = [_probe] + _index_probes()
+        mask_example_vals = _index_probes()
     mask_mod = block_mask[-1]
     with TransformGetItemToIndex():
         score_graph = _maybe_reenter_make_fx(score_mod)(
@@ -791,8 +799,8 @@ def trace_omni_attention(
         mask_mod_other_buffers,
     )
     proxy_args = unwrap_proxy(node_args)
-    set_original_aten_op = nullcontext
-    with set_original_aten_op():
+    set_original_tp_op = nullcontext
+    with set_original_tp_op():
         out_proxy = proxy_mode.tracer.create_proxy(
             "call_function", omni_attention, proxy_args, {}
         )
@@ -1645,8 +1653,8 @@ def trace_omni_attention_backward(
         mask_mod_other_buffers,
     )
     proxy_args = unwrap_proxy(node_args)
-    set_original_aten_op = nullcontext
-    with set_original_aten_op():
+    set_original_tp_op = nullcontext
+    with set_original_tp_op():
         out_proxy = proxy_mode.tracer.create_proxy(
             "call_function",
             omni_attention_backward,

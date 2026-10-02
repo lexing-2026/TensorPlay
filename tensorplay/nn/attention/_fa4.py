@@ -181,7 +181,7 @@ def _fa4_backward_support_error(
     return None
 
 
-def _aten_to_fa4_window_size(val: int | None) -> int | None:
+def _tp_to_fa4_window_size(val: int | None) -> int | None:
     """need to convert -1 to None for FA4"""
     return None if val == -1 else val
 
@@ -217,8 +217,8 @@ def _fa4_run_forward(
     kwargs: dict[str, Any] = {
         "softmax_scale": scale,
         "causal": is_causal,
-        "window_size_left": _aten_to_fa4_window_size(window_size_left),
-        "window_size_right": _aten_to_fa4_window_size(window_size_right),
+        "window_size_left": _tp_to_fa4_window_size(window_size_left),
+        "window_size_right": _tp_to_fa4_window_size(window_size_right),
         "return_lse": True,
         "cu_seqlens_q": cu_seq_q,
         "cu_seqlens_k": cu_seq_k,
@@ -260,8 +260,8 @@ def _fa4_run_backward(
         logsumexp.contiguous(),
         softmax_scale=scale,
         causal=is_causal,
-        window_size_left=_aten_to_fa4_window_size(window_size_left),
-        window_size_right=_aten_to_fa4_window_size(window_size_right),
+        window_size_left=_tp_to_fa4_window_size(window_size_left),
+        window_size_right=_tp_to_fa4_window_size(window_size_right),
         cu_seqlens_q=cu_seq_q,
         cu_seqlens_k=cu_seq_k,
         deterministic=deterministic,

@@ -33,7 +33,9 @@ import sympy
 
 import tensorplay as tp
 
+from tensorplay.graph import GraphModule
 from tensorplay.graph.experimental.symbolic_shapes import ValueRanges
+from tensorplay.graph.experimental.sympy_functions import int_oo
 from ..ir import FixedLayout
 from ..loops import V
 from ..op_lowerings import empty_strided
@@ -151,14 +153,14 @@ def lower_omni_attention_cpu(
     # time.  So the two counts are symbols now and numbers later, and the
     # template turns them into what they will be.
     shape_env = V.graph.sizevars.shape_env
-    cur_q_split_size = shape_env.create_unbacked_symint().node.expr
-    cur_kv_split_size = shape_env.create_unbacked_symint().node.expr
+    cur_q_split_size = shape_env.create_unbacked_symint().expr
+    cur_kv_split_size = shape_env.create_unbacked_symint().expr
 
     # Both counts are more than one, which is what stops a comparison of either
     # against one from deciding they are equal: two groups that each took one
     # position are two groups, not one.
-    shape_env.var_to_range[cur_q_split_size] = ValueRanges(2, None)
-    shape_env.var_to_range[cur_kv_split_size] = ValueRanges(2, None)
+    shape_env.var_to_range[cur_q_split_size] = ValueRanges(2, int_oo)
+    shape_env.var_to_range[cur_kv_split_size] = ValueRanges(2, int_oo)
 
     score_dtype = tp.float
     placeholder_inps = [
@@ -212,7 +214,7 @@ def lower_omni_attention_cpu(
         argument and returns the value rather than the yes or no.
         """
 
-        gm = copy.deepcopy(mask_graph.graph_module)
+        gm = copy.deepcopy(getattr(mask_graph, "graph_module", mask_graph))
         graph = gm.graph
         with graph.inserting_before(next(iter(graph.nodes))):
             qk_data_node = graph.placeholder("qk_data")
@@ -247,7 +249,7 @@ def lower_omni_attention_cpu(
         output_node.args = (where_node,)
 
         graph.lint()
-        return tp.fx.GraphModule(gm, graph)
+        return GraphModule(gm, graph)
 
     converted_mask_graph_module = convert_mask_graph_module(mask_graph)
 

@@ -87,7 +87,12 @@ from .loops import (
     set_graph,
     set_ops_handler,
 )
-from .op_lowerings import LOWERINGS, target_name, user_lowerings
+from .op_lowerings import (
+    LOWERINGS,
+    load_lowering_modules,
+    target_name,
+    user_lowerings,
+)
 
 #: A multi-user value is stored once it reads more than this many buffers.
 REALIZE_READS_THRESHOLD = 4
@@ -488,6 +493,7 @@ class GraphLowering(Interpreter):
         # therefore set up before anything of the region's own is recorded,
         # since a value recorded against a walk that is not this one would be
         # recorded against nothing.
+        load_lowering_modules()
         super().__init__(graph_module)
         self.name = "GraphLowering" if name is None else name
         #: The operations a node in the region named is computed by the
