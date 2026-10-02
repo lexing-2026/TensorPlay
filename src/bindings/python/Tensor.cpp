@@ -2618,7 +2618,21 @@ void init_tensor(py::module_& m) {
         .def("__rpow__", [](const Tensor& self, Scalar base) {
             Tensor base_t = tensorplay::native::wrapped_scalar_tensor(base, self.device());
             return base_t.pow(self);
-        })        // DLPack
+        })
+        // Plain Python numbers are matched by exact type: an overload that
+        // accepts any object without conversion would otherwise answer
+        // before the Scalar overloads above get to convert one.
+        .def("__pow__", [](const Tensor& self, int64_t exponent) { return self.pow(Scalar(exponent)); })
+        .def("__pow__", [](const Tensor& self, double exponent) { return self.pow(Scalar(exponent)); })
+        .def("__rpow__", [](const Tensor& self, int64_t base) {
+            Tensor base_t = tensorplay::native::wrapped_scalar_tensor(Scalar(base), self.device());
+            return base_t.pow(self);
+        })
+        .def("__rpow__", [](const Tensor& self, double base) {
+            Tensor base_t = tensorplay::native::wrapped_scalar_tensor(Scalar(base), self.device());
+            return base_t.pow(self);
+        })
+        // DLPack
         .def("__dlpack__", [](py::object self_obj, std::optional<int64_t> stream) {
             return to_dlpack(self_obj, stream);
         }, "stream"_a = py::none())
