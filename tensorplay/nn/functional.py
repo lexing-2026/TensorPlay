@@ -3375,6 +3375,10 @@ def embedding_bag(
 # no tile to land in and stays on the composed reference.
 _FUSED_MAX_HEAD_DIM = 128
 
+# Element types the fused cpu attention kernel computes in.
+_CPU_FUSED_DTYPES = frozenset(
+    (tensorplay.float16, tensorplay.bfloat16, tensorplay.float32, tensorplay.float64))
+
 
 def _plain_scaled_dot_product_attention(query, key, value, is_causal):
     # The fused entry point takes a square self-attention call with the default
@@ -3398,6 +3402,27 @@ def _plain_scaled_dot_product_attention(query, key, value, is_causal):
     ):
         output, _ = _C._scaled_dot_product_attention_with_lse(
             query, key, value, is_causal=is_causal)
+        return output
+    # The cpu counterpart is the blocked fused kernel.  It takes any pair of
+    # token counts (its causal bound is the top-left one the composed path
+    # uses), so only the element type, the head layout and a non-empty
+    # sequence are asked for; an empty call is answered by the public entry.
+    if (
+        query.device.type == "cpu"
+        and query.dim() == 4
+        and key.dim() == 4
+        and value.dim() == 4
+        and query.dtype in _CPU_FUSED_DTYPES
+        and key.dtype == query.dtype == value.dtype
+        and key.size(-1) == query.size(-1) == value.size(-1)
+        and key.size(0) == query.size(0) == value.size(0)
+        and key.size(1) == query.size(1) == value.size(1)
+        and key.size(-2) == value.size(-2)
+        and query.numel() != 0
+        and key.numel() != 0
+    ):
+        output, _ = _C._scaled_dot_product_flash_attention_for_cpu(
+            query, key, value, 0.0, is_causal, attn_mask=None, scale=None)
         return output
     return tensorplay.scaled_dot_product_attention(
         query, key, value, is_causal=is_causal)

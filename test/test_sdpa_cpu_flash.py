@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 import tensorplay as tp
+import tensorplay.nn.functional as F
 from tensorplay import _C
 
 
@@ -142,6 +143,19 @@ def test_fully_closed_row_gives_zero_output_and_zero_gradient():
     out, d_q, d_k, d_v = _run(q, k, v, grad_out, False, mask, None, tp.float32)
     np.testing.assert_array_equal(out[0, 0, 2], np.zeros(3))
     np.testing.assert_array_equal(d_q[0, 0, 2], np.zeros(3))
+
+
+def test_functional_entry_routes_cpu_calls_to_the_fused_kernel():
+    _, q, k, v, grad_out = _inputs(4, 2, 2, 2, 40, 50, 16)
+    for causal in (False, True):
+        tq = tp.tensor(q, requires_grad=True)
+        out = F.scaled_dot_product_attention(
+            tq, tp.tensor(k), tp.tensor(v), is_causal=causal)
+        assert "FlashAttentionForCpu" in out.grad_fn.name()
+        (d_q,) = tp.autograd.grad(out, [tq], grad_outputs=[tp.tensor(grad_out)])
+        want = _reference(q, k, v, grad_out, causal, None, None)
+        assert np.abs(out.detach().numpy() - want[0]).max() < 1e-5
+        assert np.abs(d_q.numpy() - want[1]).max() < 1e-5
 
 
 def test_empty_sequence_returns_zeros():
