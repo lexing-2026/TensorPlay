@@ -10,7 +10,7 @@ import tempfile
 import time
 import unittest
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 WORKER_OK = """\
 import os, sys

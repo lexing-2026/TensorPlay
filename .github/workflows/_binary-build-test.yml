@@ -92,7 +92,7 @@ on:
       test_matrix:
         required: false
         type: string
-        default: '[{"name":"core","test_files":"test/test_set_native.py test/test_compressed_sparse_constructors.py test/test_nn_utils_norm.py"}]'
+        default: '[{"name":"core","test_files":"test/test_set_native.py test/test_compressed_sparse_constructors.py test/nn/test_nn_utils_norm.py"}]'
         description: JSON array of test shard names and space-separated test files
       build_version:
         required: false

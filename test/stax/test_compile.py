@@ -16,7 +16,7 @@ def test_standalone_import_loads_cuda_runtime_without_torch():
             "-c",
             "import sys; import tensorplay; assert 'torch' not in sys.modules; print(tensorplay._stax.get_default_backend())",
         ],
-        cwd=Path(__file__).resolve().parent.parent,
+        cwd=Path(__file__).resolve().parent.parent.parent,
         check=True,
         capture_output=True,
         text=True,

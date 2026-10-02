@@ -455,7 +455,7 @@ Besides the builtin GLOO/MPI/NCCL backends, TensorPlay distributed supports
 third-party backends through a run-time register mechanism.
 For references on how to develop a third-party backend through C++ Extension,
 please refer to [Tutorials - Custom C++ and CUDA Extensions](https://www.tensorplay.cn/guide/tutorials) and
-the samples under `test/cpp_extension/`. The capability of third-party
+the samples under `test/cpp_extensions/`. The capability of third-party
 backends are decided by their own implementations.
 The new backend derives from {class}`tensorplay.distributed.ProcessGroup` and registers the backend
 name and the instantiating interface through {func}`tensorplay.distributed.Backend.register_backend`

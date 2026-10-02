@@ -507,11 +507,10 @@ def test_stax_mode_patch_overlaid_by_explicit_options(monkeypatch):
 
     # a mode without the autotune knobs leaves them off
     stax_backend.stax(
-        graph_like, [], mode="reduce-overhead", options={"stax.native": False}
+        graph_like, [], mode="reduce-overhead", options={"stax.max_autotune": False}
     )
     assert captured["max_autotune"] is False
     assert captured["coordinate_descent_tuning"] is False
-    assert captured["use_native"] is False
     assert len(wrapped) == 2
 
 

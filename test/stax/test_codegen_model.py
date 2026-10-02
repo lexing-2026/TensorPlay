@@ -7,7 +7,7 @@ from tools.codegen.gen_python_c import _is_variadic_shape_list
 from tools.codegen.model import parse_native_yaml, parse_schema
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_native_collection_retains_reference_records_and_indexes():

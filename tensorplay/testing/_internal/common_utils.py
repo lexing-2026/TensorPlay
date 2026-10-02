@@ -129,6 +129,31 @@ def subtest(**kwargs):
     return (kwargs,)
 
 
+def _expect_dir(module_dir: str) -> str:
+    """Locate the ``expect`` directory that owns the golden files of a suite.
+
+    A test module sitting directly beside an ``expect`` directory keeps using
+    it. A module inside a grouped subdirectory walks up to the nearest ancestor
+    that has one, which is how a suite shares the golden files collected at the
+    root of the tree. With no such ancestor the module's own directory is
+    returned, so the first run with ``TP_TEST_ACCEPT=1`` creates one there.
+
+    The walk stops at the first hit and at the directory carrying the suite's
+    ``conftest.py``, so an ``expect`` directory further up the filesystem cannot
+    capture the golden files.
+    """
+    parts = os.path.abspath(module_dir).split(os.sep)
+    for depth in range(len(parts), 0, -1):
+        candidate = os.sep.join(parts[:depth])
+        if not os.path.isdir(candidate):
+            continue
+        if os.path.isdir(os.path.join(candidate, "expect")):
+            return os.path.join(candidate, "expect")
+        if os.path.isfile(os.path.join(candidate, "conftest.py")):
+            break
+    return os.path.join(os.path.abspath(module_dir), "expect")
+
+
 def noncontiguous_like(t: Tensor) -> Tensor:
     """Returns a non-contiguous tensor with the same values as ``t``."""
     if not t.is_contiguous():
@@ -605,11 +630,14 @@ class TestCase(unittest.TestCase):
     def assertExpected(self, actual, subname: str | None = None) -> None:
         """Compare against a golden file instead of an inline literal.
 
-        The golden file lives in ``expect/<Class>.<test>[-<subname>].expect``
-        next to the calling test module, so a suite that uses golden files
-        ships them alongside the tests. Regenerate by running the test with
-        ``TP_TEST_ACCEPT=1`` set; without it, a mismatch shows a diff and
-        names the file to regenerate.
+        The golden file lives in ``expect/<Class>.<test>[-<subname>].expect``.
+        The directory is the calling test module's own one when it has an
+        ``expect`` next to it, otherwise the nearest one on the way up, so a
+        suite grouped into a subdirectory still shares the golden files at the
+        root of the tree. A module with no ``expect`` anywhere above it gets one
+        beside itself. Regenerate by running the test with ``TP_TEST_ACCEPT=1``
+        set; without it, a mismatch shows a diff and names the file to
+        regenerate.
         """
         module_file = getattr(sys.modules[type(self).__module__], "__file__", None)
         if module_file is None:
@@ -617,8 +645,8 @@ class TestCase(unittest.TestCase):
         name = f"{type(self).__name__}.{self._testMethodName}"
         if subname is not None:
             name = f"{name}-{subname}"
-        path = os.path.join(os.path.dirname(os.path.abspath(module_file)),
-                            "expect", f"{name}.expect")
+        path = os.path.join(_expect_dir(os.path.dirname(os.path.abspath(module_file))),
+                            f"{name}.expect")
         if os.environ.get("TP_TEST_ACCEPT") == "1":
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:

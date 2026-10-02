@@ -155,9 +155,11 @@ against a golden file instead of an inline literal:
 self.assertExpected(repr(module))
 ```
 
-The file lives in `test/expect/<Class>.<test>[-<subname>].expect` next to
-the suite. To (re)generate it, run the test with `TP_TEST_ACCEPT=1`; a
-mismatch otherwise shows a diff and names the file to regenerate.
+The file lives in `test/expect/<Class>.<test>[-<subname>].expect`, the
+`expect` directory beside the test module or, for a module inside a grouped
+subdirectory, the nearest one above it. To (re)generate it, run the test with
+`TP_TEST_ACCEPT=1`; a mismatch otherwise shows a diff and names the file to
+regenerate.
 
 ## Sharding a run
 

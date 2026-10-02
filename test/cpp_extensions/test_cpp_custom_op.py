@@ -14,10 +14,10 @@ from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[2]
 GEN_TOOL = REPO / "tools" / "codegen" / "tensorplaygen.py"
-SAMPLE_YAML = REPO / "test" / "cpp_extension" / "sample_ops.yaml"
-IMPL_CPP = REPO / "test" / "cpp_extension" / "ops_impl.cpp"
+SAMPLE_YAML = REPO / "test" / "cpp_extensions" / "sample_ops.yaml"
+IMPL_CPP = REPO / "test" / "cpp_extensions" / "ops_impl.cpp"
 GEN_INCLUDE = REPO / "build" / "generated"
 
 tp = pytest.importorskip("tensorplay")

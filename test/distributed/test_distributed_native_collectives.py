@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 TEST_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.dirname(TEST_DIR)
+REPO_ROOT = os.path.dirname(os.path.dirname(TEST_DIR))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 if TEST_DIR not in sys.path:

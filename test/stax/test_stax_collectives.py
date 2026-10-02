@@ -238,7 +238,7 @@ class TestMultiRankCapturedCollectives(unittest.TestCase):
         os.unlink(store)
         script = _WORKER.replace(
             "@ROOT@",
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
         ).replace(
             "@PRELOAD@",
             preload,

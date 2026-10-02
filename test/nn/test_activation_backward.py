@@ -15,7 +15,7 @@ import unittest
 import numpy as np
 import torch
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import tensorplay as tp
 from tensorplay.testing._internal.reference import assert_reference_close, from_reference, reference_devices, to_numpy
 

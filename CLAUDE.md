@@ -26,7 +26,7 @@ pillar per post.
 | `stax/` | Compiler stack (graph capture, codegen) |
 | `src/` | Python bindings, distributed support, version glue |
 | `config/` | Op contract: `native_functions.yaml`, `derivatives.yaml`, `tags.yaml` |
-| `test/` | pytest suite (`test/test_*.py`) |
+| `test/` | pytest suite, grouped by subject into subdirectories (`test/nn/`, `test/autograd/`, `test/stax/`, …) |
 | `benchmark/` | Benchmark harness |
 | `docs/` | Sphinx documentation, blog series, release notes, whitepaper |
 | `tools/` | Maintenance scripts (commit schema, release notes, versioning) |
@@ -70,8 +70,8 @@ contract and rebuild instead.
 
 ```bash
 pytest test/                       # full suite
-pytest test/test_nn_utils_norm.py  # single file
-pytest test/test_nn_utils_norm.py -k relu   # single test by keyword
+pytest test/nn/test_nn_utils_norm.py  # single file
+pytest test/nn/test_nn_utils_norm.py -k relu   # single test by keyword
 ```
 
 Match the existing test style in `test/`: plain pytest files named
