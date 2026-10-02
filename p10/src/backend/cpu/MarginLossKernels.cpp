@@ -18,6 +18,7 @@
 #include "Dispatcher.h"
 #include "Scalar.h"
 #include "Exception.h"
+#include "DTypeNames.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <vector>
@@ -351,7 +352,7 @@ Tensor multilabel_margin_loss_backward_impl(const Tensor& grad_output, const Ten
     do {                                                               \
         if ((dt) == DType::Float32) return fn<float>(__VA_ARGS__);     \
         if ((dt) == DType::Float64) return fn<double>(__VA_ARGS__);    \
-        TP_THROW(NotImplementedError, std::string(#fn) + ": only supports Float32/Float64, got " + toString(dt)); \
+        TP_THROW(NotImplementedError, std::string(#fn) + ": only supports Float32/Float64, got " + scalarTypeName(dt)); \
     } while (0)
 
 } // namespace
@@ -386,7 +387,7 @@ std::tuple<Tensor, Tensor> multilabel_margin_loss_forward_cpu(const Tensor& inpu
         return multilabel_margin_loss_forward_impl<float>(input, target, reduction);
     if (input.dtype() == DType::Float64)
         return multilabel_margin_loss_forward_impl<double>(input, target, reduction);
-    TP_THROW(NotImplementedError, std::string("multilabel_margin_loss_forward: only supports Float32/Float64, got ") + toString(input.dtype()));
+    TP_THROW(NotImplementedError, std::string("multilabel_margin_loss_forward: only supports Float32/Float64, got ") + scalarTypeName(input.dtype()));
 }
 
 Tensor multilabel_margin_loss_backward_cpu(const Tensor& grad_output, const Tensor& input,

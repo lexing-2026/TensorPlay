@@ -12,6 +12,7 @@
 #include "CudaTunable.h"
 #include "Context.h"
 #include "Exception.h"
+#include "DTypeNames.h"
 
 #include <cublas_v2.h>
 #include <cublasLt.h>
@@ -639,7 +640,7 @@ void check_cublas_gemm_dtype(DType t) {
             // addmm_cuda ("addmm_cuda" not implemented for 'Int' etc.), even
             // when the mathematical result would be empty.
             TP_THROW(NotImplementedError, "\"addmm_cuda\" not implemented for '",
-                     toString(t), "'");
+                     scalarTypeName(t), "'");
     }
 }
 

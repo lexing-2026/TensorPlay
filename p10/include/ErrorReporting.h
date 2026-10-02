@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "DType.h"
+#include "DTypeNames.h"
 #include "Tensor.h"
 
 namespace tensorplay {
@@ -38,7 +39,7 @@ inline std::string describe_tensor(const Tensor& t) {
     }
     std::ostringstream os;
     os << "shape=" << format_sizes(static_cast<std::vector<int64_t>>(t.shape()))
-       << ", dtype=" << toString(t.dtype())
+       << ", dtype=" << scalarTypeName(t.dtype())
        << ", device=" << t.device().toString();
     return os.str();
 }

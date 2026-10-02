@@ -3,6 +3,7 @@
 #include "AnomalyMode.h"
 #include "ManualNodes.h"
 #include "Exception.h"
+#include "DTypeNames.h"
 #include "Parallel.h"
 #include "Profiler.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
@@ -120,7 +121,7 @@ struct EngineTrace {
         shape += ")";
         char base[48];
         snprintf(base, sizeof(base), "%s%s rg=%d",
-                 toString(t.dtype()), shape.c_str(),
+                 elementTypeName(t.dtype()), shape.c_str(),
                  t.requires_grad() ? 1 : 0);
         if (level() < 3) { snprintf(buf, n, "%s", base); return; }
         std::string vals = "{";

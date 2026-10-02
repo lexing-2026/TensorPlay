@@ -8,6 +8,7 @@
 #include "Utils.h"
 #include "OneDNNContext.h"
 #include "GradMode.h"
+#include "DTypeNames.h"
 #include "Complex.h"
 #include <vector>
 #include <cmath>
@@ -103,11 +104,11 @@ void check_cpu_matmul_dtype(DType dtype) {
         case DType::UInt64:
             // rejection reads "addmm_impl_cpu_" not implemented for 'Bool'.
             TP_THROW(NotImplementedError, "\"addmm_impl_cpu_\" not implemented for '",
-                     toString(dtype), "'");
+                     scalarTypeName(dtype), "'");
         case DType::ComplexHalf:
         case DType::BComplex32:
             TP_THROW(NotImplementedError, "\"addmm_impl_cpu_\" not implemented for '",
-                     toString(dtype), "'");
+                     scalarTypeName(dtype), "'");
         default:
             return;
     }
@@ -829,7 +830,7 @@ Tensor mm_kernel(const Tensor& self, const Tensor& mat2) {
     // dtype.  This is intentionally stricter than elementwise promotion.
     if (self.dtype() != mat2.dtype()) {
         TP_THROW(RuntimeError, "expected m1 and m2 to have the same dtype, but got: ",
-                 toString(self.dtype()), " != ", toString(mat2.dtype()));
+                 elementTypeName(self.dtype()), " != ", elementTypeName(mat2.dtype()));
     }
     check_cpu_matmul_dtype(self.dtype());
     Tensor result = Tensor::empty({self.size(0), mat2.size(1)}, self.dtype(), self.device());
@@ -894,11 +895,11 @@ Tensor addmm_kernel(const Tensor& input, const Tensor& mat1, const Tensor& mat2,
     // self-vs-mat2 first, then mat1-vs-mat2 (LinearAlgebra.cpp:185-186).
     if (input.dtype() != mat2.dtype()) {
         TP_THROW(RuntimeError, "self and mat2 must have the same dtype, but got ",
-                 toString(input.dtype()), " and ", toString(mat2.dtype()));
+                 scalarTypeName(input.dtype()), " and ", scalarTypeName(mat2.dtype()));
     }
     if (mat1.dtype() != mat2.dtype()) {
         TP_THROW(RuntimeError, "mat1 and mat2 must have the same dtype, but got ",
-                 toString(mat1.dtype()), " and ", toString(mat2.dtype()));
+                 scalarTypeName(mat1.dtype()), " and ", scalarTypeName(mat2.dtype()));
     }
 
     int64_t M = mat1.size(0);
@@ -1259,7 +1260,7 @@ Tensor matmul_kernel(const Tensor& self, const Tensor& other) {
 
     if (self.dtype() != other.dtype()) {
         TP_THROW(RuntimeError, "expected m1 and m2 to have the same dtype, but got: ",
-                 toString(self.dtype()), " != ", toString(other.dtype()));
+                 elementTypeName(self.dtype()), " != ", elementTypeName(other.dtype()));
     }
     check_cpu_matmul_dtype(self.dtype());
     const Tensor& self_p = self;
@@ -1530,8 +1531,8 @@ Tensor bmm_kernel(const Tensor& self, const Tensor& batch2) {
                  batch2.size(1), "].");
     }
     if (self.dtype() != batch2.dtype()) {
-        TP_THROW(RuntimeError, "expected scalar type ", toString(self.dtype()),
-                 " but found ", toString(batch2.dtype()));
+        TP_THROW(RuntimeError, "expected scalar type ", scalarTypeName(self.dtype()),
+                 " but found ", scalarTypeName(batch2.dtype()));
     }
     check_cpu_matmul_dtype(self.dtype());
     // Small/thin slices keep the parallel batched-2d path; fat contiguous
@@ -1681,9 +1682,9 @@ Tensor baddbmm_kernel(const Tensor& input, const Tensor& batch1, const Tensor& b
     }
     if (input.dtype() != batch1.dtype() || batch1.dtype() != batch2.dtype()) {
         TP_THROW(RuntimeError, "Input dtypes must be the same, got: input ",
-                 toString(input.dtype()), ", batch1: ",
-                 toString(batch1.dtype()), ", batch2: ",
-                 toString(batch2.dtype()));
+                 elementTypeName(input.dtype()), ", batch1: ",
+                 elementTypeName(batch1.dtype()), ", batch2: ",
+                 elementTypeName(batch2.dtype()));
     }
     check_cpu_matmul_dtype(batch1.dtype());
 
@@ -1816,8 +1817,8 @@ Tensor mv_kernel(const Tensor& self, const Tensor& vec) {
     if (self.dtype() != vec.dtype()) {
         // The leading value is addmv's accumulator slot; via mv it echoes vec.
         TP_THROW(RuntimeError, "addmv input tensors must have the same dtype, but got ",
-                 toString(vec.dtype()), ", ", toString(self.dtype()), ", and ",
-                 toString(vec.dtype()));
+                 scalarTypeName(vec.dtype()), ", ", scalarTypeName(self.dtype()), ", and ",
+                 scalarTypeName(vec.dtype()));
     }
     check_cpu_matmul_dtype(self.dtype());
 
@@ -1889,7 +1890,7 @@ Tensor dot_kernel(const Tensor& self, const Tensor& other) {
     }
     if (self.dtype() != other.dtype()) {
         TP_THROW(RuntimeError, "dot : expected both vectors to have same dtype, but found ",
-                 toString(self.dtype()), " and ", toString(other.dtype()));
+                 scalarTypeName(self.dtype()), " and ", scalarTypeName(other.dtype()));
     }
 
     const int64_t n = self.numel();
@@ -1970,7 +1971,7 @@ Tensor dot_kernel(const Tensor& self, const Tensor& other) {
             }
         default:
             TP_THROW(NotImplementedError, "\"dot\" not implemented for '",
-                     toString(self.dtype()), "'");
+                     scalarTypeName(self.dtype()), "'");
     }
 #undef DOT_CASE
 }
@@ -2007,8 +2008,8 @@ Tensor outer_kernel(const Tensor& self, const Tensor& vec2) {
                  vec2.dim(), "D tensors");
     }
     if (self.dtype() != vec2.dtype()) {
-        TP_THROW(RuntimeError, "expected scalar type ", toString(self.dtype()),
-                 " but found ", toString(vec2.dtype()));
+        TP_THROW(RuntimeError, "expected scalar type ", scalarTypeName(self.dtype()),
+                 " but found ", scalarTypeName(vec2.dtype()));
     }
     return self.unsqueeze(1).mul(vec2.unsqueeze(0));
 }

@@ -6,6 +6,7 @@
 #include "CUDAContext.h"
 #include "CUDARuntime.h"
 #include "Exception.h"
+#include "DTypeNames.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <cublas_v2.h>
@@ -61,7 +62,7 @@ decltype(auto) run_real(DType dt, Kernel&& k) {
             return k(static_cast<double*>(nullptr));
         default:
             TP_THROW(NotImplementedError,
-                     "linalg: unsupported dtype ", toString(dt),
+                     "linalg: unsupported dtype ", scalarTypeName(dt),
                      " on CUDA (only float32/float64 are implemented)");
     }
 }

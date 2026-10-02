@@ -14,6 +14,7 @@
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "GradMode.h"
+#include "DTypeNames.h"
 #include "Parallel.h"
 
 #include "../composite/AttentionComposite.h"
@@ -187,8 +188,8 @@ Tensor grouped_mm_cpu(const Tensor& self, const Tensor& mat2,
   }
   if (self.dtype() != mat2.dtype()) {
     TP_THROW(RuntimeError, "grouped_mm(): expected self and mat2 to have the same dtype, but got: ",
-             toString(self.dtype()), " != ",
-             toString(mat2.dtype()));
+             elementTypeName(self.dtype()), " != ",
+             elementTypeName(mat2.dtype()));
   }
   if (self.dtype() != DType::Float32 && self.dtype() != DType::Float64) {
     TP_THROW(NotImplementedError,

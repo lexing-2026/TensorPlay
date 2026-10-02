@@ -221,7 +221,7 @@ void TensorIteratorBase::compute_types(const TensorIteratorConfig& config) {
     if (!op.tensor().defined()) {
       // Not-yet-allocated outputs still carry their target metadata.
       os << "shape=<to be allocated>, dtype="
-         << toString(op.target_dtype) << ", device="
+         << scalarTypeName(op.target_dtype) << ", device="
          << (op.device.has_value() ? op.device->toString() : "<unknown>");
     } else {
       os << describe_tensor(op.tensor());
@@ -325,7 +325,7 @@ void TensorIteratorBase::compute_types(const TensorIteratorConfig& config) {
       if (!first_dtype) {
         input_dtypes << ", ";
       }
-      input_dtypes << toString(op.target_dtype);
+      input_dtypes << scalarTypeName(op.target_dtype);
       first_dtype = false;
     }
     input_dtypes << "]";
@@ -348,9 +348,9 @@ void TensorIteratorBase::compute_types(const TensorIteratorConfig& config) {
       if (op.target_dtype != common_dtype_) {
         TP_THROW(RuntimeError,
             "Expected all tensors to have the same dtype, but found ",
-            toString(op.target_dtype),
+            scalarTypeName(op.target_dtype),
             " on an operand while the computed common dtype is ",
-            toString(common_dtype_), ".",
+            scalarTypeName(common_dtype_), ".",
             dump_operands(),
             "\nHINT: create the arguments with the same dtype, or cast the "
             "mismatching tensor(s) with .to(dtype).");
@@ -431,9 +431,9 @@ void TensorIteratorBase::compute_types(const TensorIteratorConfig& config) {
     if (config.enforce_safe_casting_to_output_ && op.is_output && op.current_dtype != common_dtype_) {
       if (!can_cast(common_dtype_, op.current_dtype)) {
         TP_THROW(RuntimeError,
-            "result type ", toString(common_dtype_),
+            "result type ", scalarTypeName(common_dtype_),
             " can't be cast to the desired output type ",
-            toString(op.current_dtype), ".", dump_operands());
+            scalarTypeName(op.current_dtype), ".", dump_operands());
       }
     }
 
