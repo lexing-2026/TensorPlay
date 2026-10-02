@@ -180,22 +180,19 @@ inline void launch_binary(int64_t n, const void* a, const void* b, void* y,
 }
 
 // --- binary broadcast (TensorDesc driven) -----------------------------------
-#define TP_CPLX_GRIDSTRIDE(i)                                                \
-    int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x;              \
-    int64_t tp_cplx_stride = static_cast<int64_t>(blockDim.x) * gridDim.x;   \
-    (void)tp_cplx_stride;
-
 template <typename T, typename F>
 __global__ void binary_broadcast_kernel(
         int64_t n,
         const tensorplay::complex<T>* __restrict__ a, TensorDesc a_desc,
         const tensorplay::complex<T>* __restrict__ b, TensorDesc b_desc,
         tensorplay::complex<T>* __restrict__ y, TensorDesc y_desc, F f) {
-    TP_CPLX_GRIDSTRIDE(i) {
-        const int64_t a_off = get_offset(i, a_desc, y_desc);
-        const int64_t b_off = get_offset(i, b_desc, y_desc);
-        y[i] = f(a[a_off], b[b_off]);
-    }
+    // The last block is launched whole, so its threads past the final
+    // element have nothing to write and must not touch what lies after it.
+    const int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x;
+    if (i >= n) return;
+    const int64_t a_off = get_offset(i, a_desc, y_desc);
+    const int64_t b_off = get_offset(i, b_desc, y_desc);
+    y[i] = f(a[a_off], b[b_off]);
 }
 
 template <typename T, typename F>
