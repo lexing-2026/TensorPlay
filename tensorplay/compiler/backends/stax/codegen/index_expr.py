@@ -71,6 +71,17 @@ class Expr:
     def _key(self) -> Any:  # pragma: no cover - abstract
         raise NotImplementedError
 
+    def to_sympy(self) -> "sympy.Expr":
+        """The same integer expression in the symbolic value language.
+
+        The index algebra keeps extents and offsets as its own node types for
+        fast canonical manipulation, while value-range analysis and shape
+        propagation work on ``sympy`` expressions; this is the bridge the
+        latter uses when handed one of these values.
+        """
+
+        raise NotImplementedError(type(self).__name__)
+
     def __repr__(self) -> str:
         return f"{type(self).__name__}{self._key()!r}"
 
@@ -85,6 +96,9 @@ class Symbol(Expr):
 
     def _key(self) -> Any:
         return ("S", self.name)
+
+    def to_sympy(self) -> sympy.Expr:
+        return sympy.Symbol(self.name)
 
 
 class Const(Expr):
@@ -103,11 +117,26 @@ class Const(Expr):
     def _key(self) -> Any:
         return ("C", self.value)
 
+    def to_sympy(self) -> sympy.Expr:
+        return sympy.Integer(self.value)
+
     def __int__(self) -> int:
         return self.value
 
     def __index__(self) -> int:
         return self.value
+
+    def __le__(self, other: Any) -> bool:
+        return self.value <= (other.value if isinstance(other, Const) else int(other))
+
+    def __lt__(self, other: Any) -> bool:
+        return self.value < (other.value if isinstance(other, Const) else int(other))
+
+    def __ge__(self, other: Any) -> bool:
+        return self.value >= (other.value if isinstance(other, Const) else int(other))
+
+    def __gt__(self, other: Any) -> bool:
+        return self.value > (other.value if isinstance(other, Const) else int(other))
 
 
 _Zero = Const(0)
@@ -132,6 +161,12 @@ class Add(Expr):
             self.offset,
         )
 
+    def to_sympy(self) -> sympy.Expr:
+        result: sympy.Expr = sympy.Integer(self.offset)
+        for term, coeff in self.terms.items():
+            result = result + coeff * term.to_sympy()
+        return result
+
 
 class Mul(Expr):
     """``scalar * expr``; factors beyond one scalar stay symbolic."""
@@ -145,6 +180,9 @@ class Mul(Expr):
     def _key(self) -> Any:
         return ("M", self.scalar, self.operand._key())
 
+    def to_sympy(self) -> sympy.Expr:
+        return self.scalar * self.operand.to_sympy()
+
 
 class FloorDiv(Expr):
     """``floor(a / b)`` with positive divisor (rounds toward -inf)."""
@@ -157,6 +195,9 @@ class FloorDiv(Expr):
 
     def _key(self) -> Any:
         return ("F", self.numerator._key(), self.divisor)
+
+    def to_sympy(self) -> sympy.Expr:
+        return sympy.floor(self.numerator.to_sympy() / self.divisor)
 
 
 class ModularIndexing(Expr):
@@ -172,6 +213,9 @@ class ModularIndexing(Expr):
     def _key(self) -> Any:
         return ("MI", self.base._key(), self.divisor, self.modulus)
 
+    def to_sympy(self) -> sympy.Expr:
+        return sympy.Mod(sympy.floor(self.base.to_sympy() / self.divisor), self.modulus)
+
 
 class Where(Expr):
     """Opaque split: one of two arms selected by a runtime condition."""
@@ -185,6 +229,12 @@ class Where(Expr):
 
     def _key(self) -> Any:
         return ("W", self.condition._key(), self.left._key(), self.right._key())
+
+    def to_sympy(self) -> sympy.Expr:
+        return sympy.Piecewise(
+            (self.left.to_sympy(), self.condition.to_sympy() != 0),
+            (self.right.to_sympy(), True),
+        )
 
 
 def _lift(value: Any) -> Expr:

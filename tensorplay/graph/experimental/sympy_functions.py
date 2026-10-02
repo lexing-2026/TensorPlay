@@ -2303,6 +2303,9 @@ class IntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.singleton.Sing
     def _eval_evalf(self, prec):
         return sympy.Float("inf")
 
+    def _as_mpf_val(self, prec):
+        return sympy.Float("inf")._as_mpf_val(prec)
+
     def _eval_subs(self, old, new):
         if self == old:
             return new
@@ -2475,6 +2478,12 @@ class NegativeIntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.single
 
     def _sympystr(self, printer) -> str:
         return "-int_oo"
+
+    def _eval_evalf(self, prec):
+        return sympy.Float("-inf")
+
+    def _as_mpf_val(self, prec):
+        return sympy.Float("-inf")._as_mpf_val(prec)
 
     def __add__(self, other):
         if isinstance(other, sympy.Number) and sympy.core.parameters.global_parameters.evaluate:

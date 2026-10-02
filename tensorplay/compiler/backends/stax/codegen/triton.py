@@ -7225,13 +7225,13 @@ class TritonPrinter(PythonPrinter):  # noqa: docstring_linter
 
     def _print_PowByNatural(self, expr: sympy.Expr) -> str:
         float_type = self._get_scalar_float_type()
-        if expr.args[0].is_Integer:
+        if isinstance(expr.args[0], sympy.Integer):
             base = f"tl.full([], {float(expr.args[0])}, {float_type})"
         else:
             # pyrefly: ignore [missing-attribute]
             base = f"({self._print(expr.args[0])}).to({float_type})"
         exp_val = expr.args[1]
-        if exp_val.is_Integer:
+        if isinstance(exp_val, sympy.Integer):
             exp = f"tl.full([], {float(exp_val)}, {float_type})"
         else:
             # pyrefly: ignore [missing-attribute]
