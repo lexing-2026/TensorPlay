@@ -430,5 +430,42 @@ std::ostream& operator<<(std::ostream& stream, const VectorizedN<T, N>& vec_n) {
   return stream;
 }
 
+// Fold a vector with a custom combine lambda.  The lane walk rebuilds a
+// single-lane vector for every remaining lane so the combine is always called
+// with full vectors; the last stored lane is the scalar answer.
+template <typename scalar_t, typename Op>
+inline scalar_t vec_reduce_all(
+    const Op& vec_fun,
+    Vectorized<scalar_t> acc_vec,
+    int64_t size) {
+  using Vec = Vectorized<scalar_t>;
+  scalar_t acc_arr[Vec::size()];
+  acc_vec.store(acc_arr);
+  for (int64_t i = 1; i < size; ++i) {
+    std::array<scalar_t, Vec::size()> acc_arr_next = {};
+    acc_arr_next[0] = acc_arr[i];
+    Vec acc_vec_next = Vec::loadu(acc_arr_next.data());
+    acc_vec = vec_fun(acc_vec, acc_vec_next);
+  }
+  acc_vec.store(acc_arr);
+  return acc_arr[0];
+}
+
+template <typename scalar_t, typename Op>
+inline scalar_t vec_reduce_all(
+    const Op& vec_fun,
+    Vectorized<scalar_t> acc_vec) {
+  return vec_reduce_all(vec_fun, acc_vec, Vectorized<scalar_t>::size());
+}
+
+template <typename T, int N, typename OpVec>
+inline T vec_reduce_all(const OpVec& vec_fun, VectorizedN<T, N> acc_vec) {
+  Vectorized<T> vec_result = acc_vec[0];
+  for (int i = 1; i < N; ++i) {
+    vec_result = vec_fun(vec_result, acc_vec[i]);
+  }
+  return vec_reduce_all(vec_fun, vec_result);
+}
+
 } // namespace tensorplay::vec::inline CPU_CAPABILITY
 } // namespace tensorplay::vec

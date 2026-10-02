@@ -22,6 +22,7 @@
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <omp.h>
 #include <string>
 #include <type_traits>
 #include <thread>
@@ -34,6 +35,16 @@
 #include "cpu/vec/vec.h"
 
 namespace tensorplay {
+
+// Scalar conversion between value types for generated kernels (index and
+// dtype casts).  ``static_cast`` covers the arithmetic types and the
+// framework's own scalar types through their conversion operators; the
+// complex types build on the same operators as the eager runtime.
+template <typename To, typename From>
+inline To convert(From f) {
+    return static_cast<To>(f);
+}
+
 namespace generated {
 
 inline std::atomic<int>* integer_div_error_flag = nullptr;
@@ -453,5 +464,107 @@ TP_ALWAYS_INLINE void data_index_step(
     c3 += 1;
 }
 
+// A cascade (pairwise) summation accumulator for generated reduction kernels.
+//
+// The running sum is kept as a stack of partial sums that are folded together
+// in balanced pairs as full chunks arrive, which keeps the rounding error of a
+// long reduction closer to a balanced tree than to a straight left-to-right
+// walk.  The value returned by ``cascade_sum_combine`` is only the current
+// bottom of the stack and is not the final total; the kernel must call
+// ``cascade_sum_final`` once the whole reduction has been fed to it.
+
+inline uint64_t ceil_log2_u64(uint64_t n) {
+    if (n <= 1) {
+        return 0;
+    }
+    n -= 1;
+    uint64_t result = 0;
+    while (n > 0) {
+        n >>= 1;
+        result += 1;
+    }
+    return result;
+}
+
+template <typename T, uint64_t kChunkSize>
+struct CascadeSumHelper {
+    std::vector<T> sum_stk{};
+    uint64_t depth{0};
+    uint64_t num_chunks{0};
+    uint64_t index{0};
+    CascadeSumHelper() = default;
+    CascadeSumHelper(uint64_t N) {
+        const uint64_t m = (N + kChunkSize - 1) / kChunkSize;
+        depth = ceil_log2_u64(m);
+        sum_stk.assign(depth > 1 ? depth : 1, T(0));
+    }
+};
+
+template <typename T, uint64_t kChunkSize = 0>
+inline T cascade_sum_combine(T& data, CascadeSumHelper<T, kChunkSize>* c) {
+    c->sum_stk[0] = c->sum_stk[0] + data;
+    if (c->depth > 0) {
+        c->index++;
+        if (c->index == kChunkSize) {
+            c->num_chunks += 1;
+            c->index = 0;
+            uint64_t mask = c->num_chunks;
+            uint64_t j = 1;
+            for (; j < c->depth && (mask & 1) == 0; ++j) {
+                c->sum_stk[j] = c->sum_stk[j] + c->sum_stk[j - 1];
+                c->sum_stk[j - 1] = T(0);
+                mask >>= 1;
+            }
+            return c->sum_stk[j - 1];
+        }
+    }
+    return c->sum_stk[0];
+}
+
+template <typename T, uint64_t kChunkSize = 0>
+inline T cascade_sum_combine(
+    T& data,
+    int64_t tail_size,
+    CascadeSumHelper<T, kChunkSize>* c) {
+    auto out = c->sum_stk[0] + data;
+    c->sum_stk[0] = T::set(c->sum_stk[0], out, tail_size);
+    if (c->depth > 0) {
+        c->index++;
+        if (c->index == kChunkSize) {
+            c->num_chunks += 1;
+            c->index = 0;
+            uint64_t mask = c->num_chunks;
+            uint64_t j = 1;
+            for (; j < c->depth && (mask & 1) == 0; ++j) {
+                c->sum_stk[j] = c->sum_stk[j] + c->sum_stk[j - 1];
+                c->sum_stk[j - 1] = T(0);
+                mask >>= 1;
+            }
+            return c->sum_stk[j - 1];
+        }
+    }
+    return c->sum_stk[0];
+}
+
+template <typename T, uint64_t kChunkSize = 0>
+inline T cascade_sum_final(CascadeSumHelper<T, kChunkSize>* c) {
+    T result = c->sum_stk[0];
+    for (uint64_t i = 1; i < c->depth; ++i) {
+        result = result + c->sum_stk[i];
+    }
+    return result;
+}
+
 }  // namespace generated
 }  // namespace tensorplay
+
+// The generated kernel body calls the transposed tile load/store by its
+// unqualified name, so expose the vector-layer entry points here.
+using tensorplay::vec::atomic_add;
+using tensorplay::vec::transpose_mxn;
+
+// The cascade summation accumulator is likewise referenced by its unqualified
+// name from generated reduction kernels.
+using tensorplay::generated::CascadeSumHelper;
+using tensorplay::generated::cascade_sum_combine;
+using tensorplay::generated::cascade_sum_final;

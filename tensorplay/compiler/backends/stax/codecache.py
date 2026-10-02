@@ -852,7 +852,7 @@ class CppPythonBindingsCodeCache:
         submit_fn=None,
         **kwargs,
     ):
-        del device_type, kwargs
+        del kwargs
         parseargs = ", ".join(
             f"parse_arg<{argtype.replace('const ', '')}>(args, {index})"
             for index, argtype in enumerate(argtypes)
@@ -940,6 +940,7 @@ class CppPythonBindingsCodeCache:
 
         from .cpp_builder import CppBuilder, CppOptions, get_cpp_compiler, package_paths
         from .kernel_cache import file_lock
+        from .cpu_vec_isa import InvalidVecISA, pick_vec_isa
 
         paths = package_paths()
         compiler = get_cpp_compiler()
@@ -949,12 +950,29 @@ class CppPythonBindingsCodeCache:
         python_include = sysconfig.get_paths().get("include")
         if not python_include:
             raise RuntimeError("Python headers are unavailable")
+        # The generated unit contains vectorized kernels that call into the
+        # AVX2/AVX-512 runtime layers, so the unit must be built with the
+        # same ISA flags and capability macros as the native kernel path.
+        isa = (
+            pick_vec_isa()
+            if device_type.split(":", maxsplit=1)[0] == "cpu"
+            else InvalidVecISA()
+        )
         options = CppOptions(
             compiler=compiler,
             include_dirs=[include_dir, generated_include_dir, python_include],
-            cflags=["-std=c++20", "-O3", "-fPIC", "-shared", "-pthread"],
+            cflags=[
+                "-std=c++20",
+                "-O3",
+                "-fPIC",
+                "-shared",
+                "-pthread",
+                "-fopenmp",
+                *isa.build_arch_flags(),
+            ],
+            definitions=isa.definitions(),
             library_dirs=[lib_dir],
-            libraries=["p10"],
+            libraries=["p10", "gomp"],
             ldflags=["-pthread", f"-Wl,-rpath,{lib_dir}"],
         )
         key, source_path = write(
