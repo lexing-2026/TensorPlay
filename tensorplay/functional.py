@@ -1317,12 +1317,12 @@ def ge(input, other, *, out=None):
 def copy_(input, src, non_blocking=False):
     return input.copy_(src=src, non_blocking=non_blocking)
 
-def view(input, shape):
+def view(input, size):
     if _capturing():
-        _captured = _capture_call(view, (input, shape), {})
+        _captured = _capture_call(view, (input, size), {})
         if _captured is not None:
             return _captured
-    return input.view(shape=shape)
+    return input.view(size=size)
 
 def fill_(input, value):
     return input.fill_(value=value)
@@ -3308,7 +3308,7 @@ def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
             return _captured
     if isinstance(normalized_shape, int) and not isinstance(normalized_shape, bool):
         normalized_shape = [normalized_shape]
-    return _C.native_layer_norm(input, normalized_shape, weight, bias, eps)[0]
+    return _C.layer_norm(input, normalized_shape, weight, bias, eps)
 
 def group_norm(input, num_groups, weight=None, bias=None, eps=1e-5):
     if _capturing():
@@ -9021,7 +9021,7 @@ def is_signed(input):
             return _captured
     return _C.is_signed(input)
 
-def nonzero_static(input, *, size=None, fill_value=-1, out=None):
+def nonzero_static(input, *, size, fill_value=-1, out=None):
     if out is not None:
         if _capturing():
             _captured = _capture_call(nonzero_static, (input,), {'size': size, 'fill_value': fill_value, 'out': out})

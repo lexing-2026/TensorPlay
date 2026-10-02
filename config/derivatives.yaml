@@ -234,7 +234,7 @@
 
 # (tools/autograd/derivatives.yaml): reshape falls back to a copy when the
 # incoming grad is not viewable, so non-contiguous grads never error here.
-- name: view(Tensor self, int[] shape) -> Tensor
+- name: view(Tensor self, SymInt[] size) -> Tensor
   self: grad.reshape(self.shape())
 
 - name: clone(Tensor self, *, MemoryFormat? memory_format=None) -> Tensor
@@ -258,7 +258,7 @@
 - name: select_backward(Tensor grad_output, Tensor self, int dim, int index) -> Tensor
   grad_output: tensorplay::tpx::ops::select(grad, dim, index)
 
-- name: slice_backward(Tensor grad_output, Tensor self, int dim=0, int? start=None, int? end=None, int step=1) -> Tensor
+- name: slice_backward(Tensor grad_output, Tensor self, int dim=0, SymInt? start=None, SymInt? end=None, SymInt step=1) -> Tensor
   grad_output: tensorplay::tpx::ops::slice(grad, dim, start, end, step)
 
 # Narrow is a slice(dim, start, start+length);

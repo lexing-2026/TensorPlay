@@ -2991,7 +2991,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> flash_attention_forward_cuda(
 // only: its batched inputs are head-major, and it hands the cumulative-length
 // tables back unchanged so a caller can see which layout it got.  The rest is
 // the same schedule over the same arguments.
-std::tuple<Tensor, Tensor, Tensor, Tensor, int64_t, int64_t, Tensor, Tensor,
+std::tuple<Tensor, Tensor, Tensor, Tensor, SymInt, SymInt, Tensor, Tensor,
            Tensor>
 cudnn_attention_forward_cuda(
     const Tensor& query, const Tensor& key, const Tensor& value,
@@ -3063,15 +3063,15 @@ cudnn_attention_forward_cuda(
 // the kernel derives from the two lengths, which is the lower-right corner; the
 // upper-left one is the same window with its right bound moved back by the
 // length difference, and that is how it is asked for.
-std::tuple<Tensor, Tensor, Tensor, Tensor, int64_t, int64_t>
+std::tuple<Tensor, Tensor, Tensor, Tensor, SymInt, SymInt>
 efficient_attention_forward_cuda(
     const Tensor& query, const Tensor& key, const Tensor& value,
     const std::optional<Tensor>& bias, const std::optional<Tensor>& cu_seqlens_q,
     const std::optional<Tensor>& cu_seqlens_k,
-    const std::optional<int64_t>& max_seqlen_q,
-    const std::optional<int64_t>& max_seqlen_k, double dropout_p,
-    int64_t custom_mask_type, bool compute_log_sumexp, std::optional<double> scale,
-    const std::optional<Tensor>& seqlen_k, const std::optional<int64_t>& window_size) {
+    std::optional<int64_t> max_seqlen_q, std::optional<int64_t> max_seqlen_k,
+    double dropout_p, int64_t custom_mask_type, bool compute_log_sumexp,
+    std::optional<double> scale, const std::optional<Tensor>& seqlen_k,
+    std::optional<int64_t> window_size) {
   (void)seqlen_k;
   (void)window_size;
   const bool packed = cu_seqlens_q.has_value();

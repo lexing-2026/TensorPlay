@@ -12,12 +12,11 @@ namespace {
 // rows beyond the actual count.
 // ---------------------------------------------------------------------------
 
-Tensor interop_nonzero_static_cuda(const Tensor& self,
-                                   std::optional<int64_t> size,
+Tensor interop_nonzero_static_cuda(const Tensor& self, int64_t size,
                                    int64_t fill_value) {
     Tensor nz = ops::nonzero(self);
     const int64_t ndim = self.dim();
-    const int64_t cap = size.value_or(nz.size(0));
+    const int64_t cap = size;
     Tensor result = ops::full({cap, ndim}, Scalar(fill_value), DType::Int64,
                               self.device());
     const int64_t copy_n = std::min<int64_t>(cap, nz.size(0));

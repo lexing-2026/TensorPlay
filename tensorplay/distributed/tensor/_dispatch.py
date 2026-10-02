@@ -204,8 +204,10 @@ def _normalize_shape_arg(value: Any, total: int | None = None) -> tuple[int, ...
 def _view_shape_arg(
     args: tuple[Any, ...], kwargs: Mapping[str, Any], name: str
 ) -> Any:
-    if "shape" in kwargs:
-        return kwargs["shape"]
+    # A view names its extents ``size`` and a reshape names them ``shape``.
+    for keyword in ("size", "shape"):
+        if keyword in kwargs:
+            return kwargs[keyword]
     if name in {"view", "reshape", "view_copy", "_unsafe_view"} and len(args) != 1:
         return args
     return args[0] if args else ()
@@ -243,10 +245,13 @@ def _local_view_call(
         output_spec.placements,
         skip_offset=True,
     )
-    if "shape" in kwargs:
-        local_kwargs = dict(kwargs)
-        local_kwargs.pop("shape")
-        return (local_shape,), local_kwargs
+    for keyword in ("size", "shape"):
+        if keyword in kwargs:
+            # The local extents take the place of the global ones, so the
+            # keyword that carried those is dropped rather than passed twice.
+            local_kwargs = dict(kwargs)
+            local_kwargs.pop(keyword)
+            return (local_shape,), local_kwargs
     if len(args) == 1:
         return (local_shape,), kwargs
     return tuple(local_shape), kwargs

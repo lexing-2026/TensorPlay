@@ -62,17 +62,14 @@ Tensor put_native(const Tensor& self, const Tensor& index,
 
 // Fixed-size variant of nonzero: the result always has `size` rows, taken
 // from the leading matches and padded (or truncated) with fill_value rows.
-Tensor nonzero_static_native(const Tensor& self, std::optional<int64_t> size,
+Tensor nonzero_static_native(const Tensor& self, int64_t size,
                              int64_t fill_value) {
     if (self.dim() == 0) {
         TP_THROW(RuntimeError,
                  "nonzero_static(): not supported with 0-d tensors");
     }
     Tensor nz = ops::nonzero(self);
-    if (!size.has_value()) {
-        return nz;
-    }
-    const int64_t n = *size;
+    const int64_t n = size;
     if (n < 0) {
         TP_THROW(RuntimeError,
                  "nonzero_static(): size must be non-negative, got ", n);

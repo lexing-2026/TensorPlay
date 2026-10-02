@@ -1450,7 +1450,7 @@
   dispatch:
     CPU: select_backward_kernel
 
-- func: slice_backward(Tensor grad_output, Tensor self, int dim=0, SymInt start=None, SymInt end=None, SymInt step=1) -> Tensor
+- func: slice_backward(Tensor grad_output, Tensor self, int dim=0, SymInt? start=None, SymInt? end=None, SymInt step=1) -> Tensor
   device_check: NoCheck
   variants: function
   dispatch:
@@ -6691,7 +6691,7 @@
   variants: function, method
 
 # TensorAdvancedIndexing.cpp: fixed-size nonzero indices, padded/truncated.
-- func: nonzero_static(Tensor self, *, SymInt size=None, int fill_value=-1) -> Tensor
+- func: nonzero_static(Tensor self, *, SymInt size, int fill_value=-1) -> Tensor
   variants: function, method
 
 # ---------------------------------------------------------------------------
