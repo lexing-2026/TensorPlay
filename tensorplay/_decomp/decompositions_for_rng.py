@@ -28,7 +28,7 @@ __all__ = [
     "rng_decompositions",
 ]
 
-aten = tensorplay.ops.tp
+tp_ops = tensorplay.ops.tp
 rngprims = tensorplay.ops.prims
 
 # The reads go into a table of their own rather than into the table every other
@@ -190,18 +190,18 @@ def register_rng_decompositions() -> None:
         return
     _registered = True
 
-    register_rng_decomposition(aten.rand)(rand)
-    register_rng_decomposition(aten.rand_like)(rand_like)
-    register_rng_decomposition(aten.bernoulli_)(bernoulli_)
-    register_rng_decomposition(aten.bernoulli.p)(bernoulli_p)
+    register_rng_decomposition(tp_ops.rand)(rand)
+    register_rng_decomposition(tp_ops.rand_like)(rand_like)
+    register_rng_decomposition(tp_ops.bernoulli_)(bernoulli_)
+    register_rng_decomposition(tp_ops.bernoulli.p)(bernoulli_p)
 
     # Collected after the four above, and handed on as their own table, so
     # that an operation reaching for a random value finds the read rather than
     # the call it would otherwise make.
     extra = [
-        getattr(aten, name)
+        getattr(tp_ops, name)
         for name in _EXTRA_RANDOM_NAMES
-        if hasattr(aten, name)
+        if hasattr(tp_ops, name)
     ]
     if extra:
         inherited = get_decompositions(extra)
