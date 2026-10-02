@@ -389,16 +389,76 @@ std::string get_parallel_info() {
 
 namespace internal {
 
-// Team-size cap for OpenMP-backed GEMM kernels (oneDNN) on parts with two
-// CPU frequency tiers.  A team spanning every logical CPU spreads GEMM tiles
-// onto the slow tier, and the slowest core paces the whole team through the
-// kernel's internal barriers; the straggler effect then dominates the
-// compute itself.  Cap the team near the fast-tier size, never below half
-// the logical count.  Uniform-frequency parts keep the full team; explicit
-// thread counts (environment or set_num_threads) are never second-guessed.
+#ifdef __linux__
+namespace {
+
+// Number of CPUs named by a sysfs cpu list such as "0-7" or "0-3,8-11";
+// zero when the file is missing or malformed.
+int count_cpu_list(const std::string& path) {
+  std::FILE* f = std::fopen(path.c_str(), "re");
+  if (!f) return 0;
+  char buf[512];
+  const bool ok = std::fgets(buf, sizeof(buf), f) != nullptr;
+  std::fclose(f);
+  if (!ok) return 0;
+  int total = 0;
+  const char* p = buf;
+  while (*p != '\0' && *p != '\n') {
+    char* next = nullptr;
+    const long lo = std::strtol(p, &next, 10);
+    if (next == p || lo < 0) return 0;
+    long hi = lo;
+    p = next;
+    if (*p == '-') {
+      ++p;
+      hi = std::strtol(p, &next, 10);
+      if (next == p || hi < lo) return 0;
+      p = next;
+    }
+    total += static_cast<int>(hi - lo + 1);
+    if (*p == ',') ++p;
+  }
+  return total;
+}
+
+// Performance-core count of a part that exposes its two core kinds as
+// separate PMU devices; zero when the part is not of that kind.
+int performance_core_count() {
+  const int p_logical = count_cpu_list("/sys/devices/cpu_core/cpus");
+  if (p_logical <= 0 || count_cpu_list("/sys/devices/cpu_atom/cpus") <= 0) {
+    return 0;
+  }
+  // The performance cores are listed first; their sibling list gives the
+  // hardware threads per core.
+  const int smt = std::max(
+      1, count_cpu_list(
+             "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list"));
+  return std::max(1, p_logical / smt);
+}
+
+} // namespace
+#endif
+
+// Team-size cap for statically partitioned kernels on parts with two kinds
+// of cores.  A team spanning every logical CPU puts equal chunks on the slow
+// kind, and the slowest core paces the whole team through each region's
+// closing barrier; the straggler effect then dominates the compute itself.
+// When the performance cores are a large enough share of the part (two
+// fifths of the logical CPUs or more) the team is capped to exactly their
+// count.  Parts that do not name their core kinds fall back to the
+// frequency tiers: cap near the fast-tier size, never below half the logical
+// count.  Uniform parts keep the full team; explicit thread counts
+// (environment or set_num_threads) are never second-guessed.
 int hybrid_thread_cap() {
   static const int cached = []() -> int {
 #ifdef __linux__
+    {
+      const int p_cores = performance_core_count();
+      const int logical = static_cast<int>(std::thread::hardware_concurrency());
+      if (p_cores > 0 && p_cores < logical && p_cores * 5 >= logical * 2) {
+        return p_cores;
+      }
+    }
     std::vector<int> max_freqs;
     for (int cpu = 0; cpu < 512; ++cpu) {
       std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
