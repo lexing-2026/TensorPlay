@@ -1790,7 +1790,18 @@ def lower_cat(tensors, dim=0):
             value = loaded if value is None else ops.where(cond, loaded, value)
         return value
 
-    return Pointwise.create(device=device, dtype=dtype, inner_fn=inner, ranges=size)
+    result = Pointwise.create(device=device, dtype=dtype, inner_fn=inner, ranges=size)
+    stores_channels_last = getattr(V.graph, "stores_channels_last", None)
+    if (
+        getattr(V.graph, "layout_opt", False)
+        and stores_channels_last is not None
+        and stores_channels_last(V.graph.current_node)
+    ):
+        # A join the region stores channels-last is written in that order
+        # here, once, rather than being stored row-major by whichever reader
+        # asks first and repacked for the convolutions that read it.
+        result = V.graph.in_channels_last_order(result)
+    return result
 
 
 # ---------------------------------------------------------------------------
