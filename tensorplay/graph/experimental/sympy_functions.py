@@ -2274,7 +2274,7 @@ prefix_str = _PREFIX_STR = {
 }
 
 
-class IntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.singleton.Singleton):
+class IntegerInfinity(sympy.core.numbers.Number, metaclass=sympy.core.singleton.Singleton):
     """A value larger than every integer.
 
     An integer infinity says an extent has no upper bound, which is a
@@ -2342,7 +2342,7 @@ class IntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.singleton.Sing
                 return sympy.S.NaN
             if other.is_extended_positive:
                 return self
-            return sympy.S.NegativeIntInfinity
+            return _NEG_INT_OO
         return sympy.core.numbers.Number.__mul__(self, other)
 
     __rmul__ = __mul__
@@ -2351,9 +2351,9 @@ class IntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.singleton.Sing
         if isinstance(other, sympy.Number) and sympy.core.parameters.global_parameters.evaluate:
             if other in (
                 sympy.S.Infinity,
-                sympy.S.IntInfinity,
+                _INT_OO,
                 sympy.S.NegativeInfinity,
-                sympy.S.NegativeIntInfinity,
+                _NEG_INT_OO,
                 sympy.S.NaN,
             ):
                 return sympy.S.NaN
@@ -2363,14 +2363,14 @@ class IntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.singleton.Sing
         return sympy.core.numbers.Number.__truediv__(self, other)
 
     def __abs__(self):
-        return sympy.S.IntInfinity
+        return _INT_OO
 
     def __neg__(self):
-        return sympy.S.NegativeIntInfinity
+        return _NEG_INT_OO
 
     def _eval_power(self, expt):
         if expt.is_extended_positive:
-            return sympy.S.IntInfinity
+            return _INT_OO
         if expt.is_extended_negative:
             return sympy.S.Zero
         if expt is sympy.S.NaN:
@@ -2395,15 +2395,15 @@ class IntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.singleton.Sing
         return super().__hash__()
 
     def __eq__(self, other) -> bool:
-        return other is sympy.S.IntInfinity
+        return other is _INT_OO
 
     def __ne__(self, other) -> bool:
-        return other is not sympy.S.IntInfinity
+        return other is not _INT_OO
 
     def __gt__(self, other):
         if other is sympy.S.Infinity:
             return sympy.false
-        elif other is sympy.S.IntInfinity:
+        elif other is _INT_OO:
             return sympy.false
         else:
             return sympy.true
@@ -2411,7 +2411,7 @@ class IntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.singleton.Sing
     def __ge__(self, other):
         if other is sympy.S.Infinity:
             return sympy.false
-        elif other is sympy.S.IntInfinity:
+        elif other is _INT_OO:
             return sympy.true
         else:
             return sympy.true
@@ -2419,7 +2419,7 @@ class IntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.singleton.Sing
     def __lt__(self, other):
         if other is sympy.S.Infinity:
             return sympy.true
-        elif other is sympy.S.IntInfinity:
+        elif other is _INT_OO:
             return sympy.false
         else:
             return sympy.false
@@ -2427,7 +2427,7 @@ class IntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.singleton.Sing
     def __le__(self, other):
         if other is sympy.S.Infinity:
             return sympy.true
-        elif other is sympy.S.IntInfinity:
+        elif other is _INT_OO:
             return sympy.true
         else:
             return sympy.false
@@ -2439,9 +2439,9 @@ class IntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.singleton.Sing
             return sympy.S.NaN
         if other is sympy.S.NegativeInfinity:
             return sympy.S.NaN
-        if other is sympy.S.IntInfinity:
+        if other is _INT_OO:
             return sympy.S.NaN
-        if other is sympy.S.NegativeIntInfinity:
+        if other is _NEG_INT_OO:
             return sympy.S.NaN
         if other is sympy.S.NaN:
             return other
@@ -2456,7 +2456,7 @@ class IntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.singleton.Sing
         return self
 
 
-class NegativeIntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.singleton.Singleton):
+class NegativeIntegerInfinity(sympy.core.numbers.Number, metaclass=sympy.core.singleton.Singleton):
     """A value smaller than every integer."""
 
     _op_priority = 100.0
@@ -2489,7 +2489,7 @@ class NegativeIntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.single
         if isinstance(other, sympy.Number) and sympy.core.parameters.global_parameters.evaluate:
             if other is sympy.S.NegativeInfinity:
                 return other
-            if other is sympy.S.IntInfinity:
+            if other is _INT_OO:
                 return sympy.S.NaN
             return self
         return sympy.core.numbers.Number.__add__(self, other)
@@ -2500,7 +2500,7 @@ class NegativeIntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.single
         if isinstance(other, sympy.Number) and sympy.core.parameters.global_parameters.evaluate:
             if other is sympy.S.NegativeInfinity:
                 return sympy.S.NegativeInfinity
-            if other is sympy.S.IntInfinity:
+            if other is _INT_OO:
                 return sympy.S.NegativeInfinity
             if other is sympy.S.NaN or other is self:
                 return sympy.S.NaN
@@ -2516,7 +2516,7 @@ class NegativeIntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.single
                 return sympy.S.NaN
             if other.is_extended_negative:
                 return self
-            return sympy.S.IntInfinity
+            return _INT_OO
         return sympy.core.numbers.Number.__mul__(self, other)
 
     __rmul__ = __mul__
@@ -2525,9 +2525,9 @@ class NegativeIntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.single
         if isinstance(other, sympy.Number) and sympy.core.parameters.global_parameters.evaluate:
             if other in (
                 sympy.S.Infinity,
-                sympy.S.IntInfinity,
+                _INT_OO,
                 sympy.S.NegativeInfinity,
-                sympy.S.NegativeIntInfinity,
+                _NEG_INT_OO,
                 sympy.S.NaN,
             ):
                 return sympy.S.NaN
@@ -2537,10 +2537,10 @@ class NegativeIntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.single
         return sympy.core.numbers.Number.__truediv__(self, other)
 
     def __abs__(self):
-        return sympy.S.IntInfinity
+        return _INT_OO
 
     def __neg__(self):
-        return sympy.S.IntInfinity
+        return _INT_OO
 
     def _eval_power(self, expt):
         if expt is sympy.S.NaN:
@@ -2549,8 +2549,8 @@ class NegativeIntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.single
             return sympy.S.NaN
         if isinstance(expt, sympy.Integer) and expt.is_extended_positive:
             if expt.is_odd:
-                return sympy.S.NegativeIntInfinity
-            return sympy.S.IntInfinity
+                return _NEG_INT_OO
+            return _INT_OO
         if expt.is_extended_real is False and expt.is_number:
             from sympy.functions.elementary.complexes import im, re
 
@@ -2559,7 +2559,7 @@ class NegativeIntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.single
                 return sympy.S.ComplexInfinity
             if s_part is sympy.S.NegativeInfinity:
                 return sympy.S.ComplexInfinity
-            inf_part = sympy.S.IntInfinity**expt
+            inf_part = _INT_OO**expt
             if inf_part is sympy.S.ComplexInfinity:
                 return sympy.S.ComplexInfinity
             return s_part * inf_part
@@ -2569,15 +2569,15 @@ class NegativeIntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.single
         return super().__hash__()
 
     def __eq__(self, other) -> bool:
-        return other is sympy.S.NegativeIntInfinity
+        return other is _NEG_INT_OO
 
     def __ne__(self, other) -> bool:
-        return other is not sympy.S.NegativeIntInfinity
+        return other is not _NEG_INT_OO
 
     def __gt__(self, other):
         if other is sympy.S.NegativeInfinity:
             return sympy.true
-        elif other is sympy.S.NegativeIntInfinity:
+        elif other is _NEG_INT_OO:
             return sympy.false
         else:
             return sympy.false
@@ -2585,7 +2585,7 @@ class NegativeIntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.single
     def __ge__(self, other):
         if other is sympy.S.NegativeInfinity:
             return sympy.true
-        elif other is sympy.S.NegativeIntInfinity:
+        elif other is _NEG_INT_OO:
             return sympy.true
         else:
             return sympy.false
@@ -2593,7 +2593,7 @@ class NegativeIntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.single
     def __lt__(self, other):
         if other is sympy.S.NegativeInfinity:
             return sympy.false
-        elif other is sympy.S.NegativeIntInfinity:
+        elif other is _NEG_INT_OO:
             return sympy.false
         else:
             return sympy.true
@@ -2601,7 +2601,7 @@ class NegativeIntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.single
     def __le__(self, other):
         if other is sympy.S.NegativeInfinity:
             return sympy.true
-        elif other is sympy.S.NegativeIntInfinity:
+        elif other is _NEG_INT_OO:
             return sympy.true
         else:
             return sympy.false
@@ -2613,8 +2613,25 @@ class NegativeIntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.single
         return self
 
 
+#: The two infinities, by the names the rest of this module reaches them by.
+#:
+#: They are held here and not looked up through the registry of singletons the
+#: symbolic library keeps.  That registry is keyed by class name and shared by
+#: everything in the process, so a second package that defines a class of the
+#: same name takes the entry over, and a lookup through it would then hand back
+#: that package's object: one this module's arithmetic does not recognize as
+#: its own infinity, which leaves ``int_oo // 2`` standing as written instead
+#: of being ``int_oo``.  The classes are named so as not to take over anyone
+#: else's entry either.
+_INT_OO = IntegerInfinity()
+_NEG_INT_OO = NegativeIntegerInfinity()
+
+#: The names the two classes are imported under.
+IntInfinity = IntegerInfinity
+NegativeIntInfinity = NegativeIntegerInfinity
+
 #: A value larger than every integer.
-int_oo = sympy.S.IntInfinity
+int_oo = _INT_OO
 
 def make_symbol(prefix, idx, **kwargs):
     """A symbol of the kind named, numbered.
@@ -2887,14 +2904,14 @@ class FloorDiv(sympy.Function):
     def eval(cls, base, divisor):
         if divisor.is_zero:
             raise ZeroDivisionError("division by zero")
-        if base is sympy.S.IntInfinity or base is sympy.S.NegativeIntInfinity:
+        if base is _INT_OO or base is _NEG_INT_OO:
             if divisor.is_positive:
                 return base
             if divisor.is_negative:
-                return (sympy.S.NegativeIntInfinity if base is sympy.S.IntInfinity
-                        else sympy.S.IntInfinity)
+                return (_NEG_INT_OO if base is _INT_OO
+                        else _INT_OO)
             return sympy.nan
-        if divisor is sympy.S.IntInfinity or divisor is sympy.S.NegativeIntInfinity:
+        if divisor is _INT_OO or divisor is _NEG_INT_OO:
             if base.is_zero:
                 return sympy.S.Zero
             return sympy.nan
