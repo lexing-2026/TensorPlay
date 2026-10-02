@@ -1622,9 +1622,51 @@ def _sdpa_math_attention(query, key, value, attn_mask, dropout_p, is_causal,
     return tp.matmul(probs, value)
 
 
+def _can_use_cpu_flash(query, key, value, attn_mask, dropout_p, is_causal,
+                       enable_gqa):
+    """Whether the fused cpu flash kernel covers the call.
+
+    The kernel accepts four-dimensional float inputs with matching head
+    sizes, no dropout, and an optional two- or four-dimensional mask of the
+    same precision as the query (or float for a float query).  Calls outside
+    that envelope fall back to the math path.
+    """
+    if query.device.type != "cpu":
+        return False
+    if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
+        return False
+    if dropout_p != 0.0:
+        return False
+    if query.dtype not in (tp.float16, tp.bfloat16, tp.float32, tp.float64):
+        return False
+    if query.dtype != key.dtype or query.dtype != value.dtype:
+        return False
+    if query.size(-1) != key.size(-1) or query.size(-1) != value.size(-1):
+        return False
+    if enable_gqa and query.size(-3) != key.size(-3):
+        return False
+    if is_causal and query.size(-2) != key.size(-2):
+        return False
+    if attn_mask is not None:
+        if attn_mask.requires_grad:
+            return False
+        if attn_mask.dim() not in (2, 4):
+            return False
+        if attn_mask.dtype != tp.float32 and attn_mask.dtype != query.dtype:
+            return False
+    return True
+
+
 @register_decomposition(ops.scaled_dot_product_attention.default)
 def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
                                  is_causal=False, *, scale=None, enable_gqa=False):
+    if _can_use_cpu_flash(query, key, value, attn_mask, dropout_p, is_causal,
+                          enable_gqa):
+        output, _ = ops._scaled_dot_product_flash_attention_for_cpu.default(
+            query, key, value, dropout_p, is_causal, attn_mask=attn_mask,
+            scale=scale,
+        )
+        return output
     return _sdpa_math_attention(query, key, value, attn_mask, dropout_p,
                                 is_causal, scale, enable_gqa)
 

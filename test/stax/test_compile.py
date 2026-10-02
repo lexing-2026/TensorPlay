@@ -104,7 +104,7 @@ def test_stax_native_lowering_handles_direct_conv2d_relu():
     compiled = tp.compile(fn, backend="stax", fullgraph=True)
     actual = compiled(x, weight, bias)
     lowering = next(iter(compiled._tensorplay_cache.values()))
-    assert lowering._tensorplay_codegen == "triton"
+    assert lowering._tensorplay_codegen == "stax-cpu"
     assert tp.allclose(actual, fn(x, weight, bias))
 
 

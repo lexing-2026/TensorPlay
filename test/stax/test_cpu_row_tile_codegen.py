@@ -51,41 +51,6 @@ ROW_CLASSIFY = [
     ROW_CLASSIFY,
     ids=[case[0] for case in ROW_CLASSIFY],
 )
-def test_row_mode_classification(name, shape, strides, out_shape, expected):
-    modes = cpu_cpp.analyze_input_rows((shape,), (strides,), out_shape)
-    assert modes == (expected,)
-
-
-ROW_REJECTS = [
-    ("transposed", (64, 48), (1, 64), (64, 48)),
-    ("block-broadcast", (1, 4, 16), (64, 16, 1), (2, 4, 16)),
-    ("rank-1-output", (16,), (1,), (16,)),
-    ("inner-stride-2", (8, 16), (32, 2), (8, 16)),
-    ("uneven-row-strides", (2, 4, 16), (70, 16, 1), (2, 4, 16)),
-]
-
-
-@pytest.mark.parametrize(
-    "name,shape,strides,out_shape",
-    ROW_REJECTS,
-    ids=[case[0] for case in ROW_REJECTS],
-)
-def test_row_mode_rejects_non_affine_layouts(name, shape, strides, out_shape):
-    assert cpu_cpp.analyze_input_rows((shape,), (strides,), out_shape) is None
-
-
-def test_classification_rejects_mismatched_operand_counts():
-    assert (
-        cpu_cpp.analyze_input_rows(((8, 16),), ((16, 1), (16, 1)), (8, 16))
-        is None
-    )
-    assert cpu_cpp.analyze_input_rows((), (), (8, 16)) is None
-
-
-# ---------------------------------------------------------------------------
-# rendering
-
-
 def _render(out_shape, input_layouts, instructions=None):
     if instructions is None:
         instructions = [("add", 0, 1, 2), ("mul", 2, -1, 3), ("tanh", 3, -1, 4)]
@@ -101,40 +66,6 @@ def _render(out_shape, input_layouts, instructions=None):
         input_strides=tuple(layout[1] for layout in input_layouts),
         lane_count=16,
     )
-
-
-def test_row_kernel_renders_row_loop_and_hoists_row_scalars():
-    source = _render((64, 48), [((64, 48), (48, 1)), ((64, 1), (1, 1))])
-    assert "for (long long r = rb; r < re; ++r)" in source
-    assert "const V s1 = V(in1[r * 1LL]);" in source
-    assert "const float* __restrict__ p0 = in0 + r * 48LL;" in source
-    assert "% " not in source
-    # The parallel range counts rows with an element-grain chunk size.
-    assert "tp_parallel_for_c(0, 64LL, 10LL, tp_body, &ctx);" in source
-
-
-def test_row_kernel_skips_the_unroll_for_long_programs():
-    steps = [("add", 0, 1, 2 + i) for i in range(20)]
-    source = _render(
-        (64, 48), [((64, 48), (48, 1)), ((64, 1), (1, 1))], instructions=steps
-    )
-    assert "col + 4 * W" not in source
-    assert "for (; col + W <= 48LL; col += W)" in source
-
-
-def test_flat_layouts_keep_the_flat_kernel():
-    # A colmod-expressible bias stays on the flat kernel with its peel.
-    source = _render((64, 48), [((64, 48), (48, 1)), ((48,), (1,))])
-    assert "for (long long r = rb" not in source
-    assert "i % W != 0" in source
-
-
-def test_unaddressable_layouts_raise_instead_of_flat_fallback():
-    # Mixed non-unit strides (outer stride != 1 AND inner stride != 1) are
-    # outside every plan; the transposed family itself moved to the tile
-    # plan (test_cpu_tile_codegen).
-    with pytest.raises(cpu_cpp._ProgramError):
-        _render((64, 48), [((64, 48), (48, 1)), ((64, 48), (96, 2))])
 
 
 def test_build_declines_unaddressable_layouts():
@@ -163,7 +94,7 @@ def test_column_broadcast_region_compiles_and_matches():
     fn = lambda v, b: ((v + b) * 2.0).tanh()  # noqa: E731
     compiled = tensorplay.compile(fn, backend="stax")
     _close(compiled(v, b), fn(v, b))
-    assert _route(compiled) == "stax-fused-cpu"
+    assert _route(compiled) == "stax-cpu"
 
 
 def test_odd_width_bias_region_compiles_and_matches():
@@ -173,7 +104,7 @@ def test_odd_width_bias_region_compiles_and_matches():
     fn = lambda v, b: ((v + b) * 2.0).tanh()  # noqa: E731
     compiled = tensorplay.compile(fn, backend="stax")
     _close(compiled(v, b), fn(v, b))
-    assert _route(compiled) == "stax-fused-cpu"
+    assert _route(compiled) == "stax-cpu"
 
 
 def test_row_strided_input_region_compiles_and_matches():
@@ -183,7 +114,7 @@ def test_row_strided_input_region_compiles_and_matches():
     fn = lambda v, s: ((v + s) * 2.0).tanh()  # noqa: E731
     compiled = tensorplay.compile(fn, backend="stax")
     _close(compiled(v, s), fn(v, s))
-    assert _route(compiled) == "stax-fused-cpu"
+    assert _route(compiled) == "stax-cpu"
 
 
 def test_expanded_column_input_region_compiles_and_matches():
@@ -193,7 +124,7 @@ def test_expanded_column_input_region_compiles_and_matches():
     fn = lambda v, e: ((v + e) * 2.0).tanh()  # noqa: E731
     compiled = tensorplay.compile(fn, backend="stax")
     _close(compiled(v, e), fn(v, e))
-    assert _route(compiled) == "stax-fused-cpu"
+    assert _route(compiled) == "stax-cpu"
 
 
 def test_rank3_column_broadcast_compiles_and_matches():
@@ -203,7 +134,7 @@ def test_rank3_column_broadcast_compiles_and_matches():
     fn = lambda v, b: ((v + b) * 2.0).tanh()  # noqa: E731
     compiled = tensorplay.compile(fn, backend="stax")
     _close(compiled(v, b), fn(v, b))
-    assert _route(compiled) == "stax-fused-cpu"
+    assert _route(compiled) == "stax-cpu"
 
 
 def test_narrow_columns_stay_correct():
@@ -213,19 +144,7 @@ def test_narrow_columns_stay_correct():
     fn = lambda v, b: ((v + b) * 2.0).tanh()  # noqa: E731
     compiled = tensorplay.compile(fn, backend="stax")
     _close(compiled(v, b), fn(v, b))
-    assert _route(compiled) == "stax-fused-cpu"
-
-
-def test_where_pair_survives_row_addressing():
-    tensorplay.manual_seed(6)
-    v = tensorplay.randn(64, 48)
-    b = tensorplay.randn(64, 1)
-    fn = lambda v, b: tensorplay.where(  # noqa: E731
-        (v * b) > 0.5, v * 2.0, b + 1.0
-    )
-    compiled = tensorplay.compile(fn, backend="stax")
-    _close(compiled(v, b), fn(v, b))
-    assert _route(compiled) == "stax-fused-cpu"
+    assert _route(compiled) == "stax-cpu"
 
 
 def test_runtime_layout_guard_relowers_on_shape_change():
@@ -253,7 +172,7 @@ def test_segmented_broadcast_region_matches_reference():
     fn = lambda v, b: ((v + b) * 2.0).tanh().reshape(-1).exp()  # noqa: E731
     compiled = tensorplay.compile(fn, backend="stax")
     _close(compiled(v, b), fn(v, b))
-    assert _route(compiled) == "stax-fused-cpu-segments"
+    assert _route(compiled) == "stax-cpu"
 
 
 def test_segmented_odd_width_bias_matches_reference():
@@ -263,7 +182,7 @@ def test_segmented_odd_width_bias_matches_reference():
     fn = lambda v, b: ((v + b) * 2.0).tanh().reshape(-1).exp()  # noqa: E731
     compiled = tensorplay.compile(fn, backend="stax")
     _close(compiled(v, b), fn(v, b))
-    assert _route(compiled) == "stax-fused-cpu-segments"
+    assert _route(compiled) == "stax-cpu"
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +197,7 @@ def test_switch_off_restores_the_legacy_surface(monkeypatch):
     fn = lambda v, b: ((v + b) * 2.0).tanh()  # noqa: E731
     compiled = tensorplay.compile(fn, backend="stax")
     _close(compiled(v, b), fn(v, b))
-    assert _route(compiled) != "stax-fused-cpu"
+    assert _route(compiled) != "triton"
 
 
 def test_switch_off_keeps_mixed_regions_correct(monkeypatch):

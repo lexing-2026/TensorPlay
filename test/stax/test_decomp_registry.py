@@ -278,6 +278,9 @@ SAMPLES = {
     "arange.start": lambda: ((2, 9), {}),
     "arange.end": lambda: ((7,), {}),
     "linalg_vector_norm.default": lambda: ((_t(3, 4), 3), {"dim": [1], "keepdim": True}),
+    "matmul.default": lambda: ((_t(3, 4), _t(4, 5)), {}),
+    "native_group_norm.default": lambda: ((_t(2, 4, 5, 6), None, None, 2, 4, 30, 2, 1e-5), {}),
+    "scaled_dot_product_attention.default": lambda: ((_t(2, 4, 8, 8), _t(2, 4, 8, 8), _t(2, 4, 8, 8)), {}),
 }
 
 # Overloads whose kernels exist only on specific devices; exercised by the
@@ -422,6 +425,7 @@ def test_every_functional_decomposition_has_a_sample():
         and str(o).split(".", 1)[1] not in {
             "empty_like.default", "new_empty.default", "_chunk_cat.default",
             "_fused_rms_norm.default", "_fused_rms_norm_backward.default",
+            "dropout.default", "native_dropout.default", "native_layer_norm.default",
         }
         and str(o).split(".", 1)[1] not in DEVICE_SPECIFIC
         and not any(a.is_out for a in o._schema.arguments)

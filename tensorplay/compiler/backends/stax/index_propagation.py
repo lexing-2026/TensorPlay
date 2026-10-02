@@ -34,6 +34,7 @@ from tensorplay.graph.experimental.sympy_functions import (
 )
 from tensorplay.primitives.common import dtype_to_type, is_integer_dtype
 
+from .codegen.index_expr import Expr as IndexExpr
 from .codegen.index_expr import Where
 
 from .loops import V
@@ -52,6 +53,8 @@ def _is_constant(val: _ExprType):
 
 
 def upper_bound(val: _ExprType):
+    if isinstance(val, IndexExpr):
+        val = val.to_sympy()
     return bound_sympy(val).upper if isinstance(val, sympy.Expr) else val
 
 

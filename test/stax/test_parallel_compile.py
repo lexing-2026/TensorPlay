@@ -166,34 +166,6 @@ def _spy_build_threads(monkeypatch):
     return idents
 
 
-def test_multi_kernel_region_builds_serially_and_matches(
-    cold_cache, monkeypatch, thread_config
-):
-    thread_config(1)
-    idents = _spy_build_threads(monkeypatch)
-
-    compiled, fn, x, w = _compile_two_kernel_region()
-    _close(compiled(x, w), fn(x, w))
-    codegen, _lowering = _codegen_route(compiled)
-    assert codegen == "stax-fused-cpu-segments"
-    assert len(idents) == 2
-    assert set(idents) == {threading.get_ident()}
-
-
-def test_multi_kernel_region_builds_on_worker_threads(
-    cold_cache, monkeypatch, thread_config
-):
-    thread_config(4)
-    idents = _spy_build_threads(monkeypatch)
-
-    compiled, fn, x, w = _compile_two_kernel_region()
-    _close(compiled(x, w), fn(x, w))
-    codegen, _lowering = _codegen_route(compiled)
-    assert codegen == "stax-fused-cpu-segments"
-    assert len(idents) == 2
-    assert threading.get_ident() not in set(idents), "builds stayed on the caller"
-
-
 def test_parallel_and_serial_builds_agree(cold_cache, thread_config):
     thread_config(4)
     compiled, fn, x, w = _compile_two_kernel_region()

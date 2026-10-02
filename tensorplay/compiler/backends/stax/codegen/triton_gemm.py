@@ -195,6 +195,7 @@ def _decision_key(
     dtype: str,
     device: str,
     allow_tf32: bool,
+    epilogue=None,
     bias: bool = False,
     b_transposed: bool = False,
 ) -> str:
@@ -536,7 +537,7 @@ def tuned_matmul_launch(
         )
     cache_key = _decision_key(
         M, N, K, str(a.dtype), device_key, allow_tf32,
-        None, bias_spec is not None, b_transposed,
+        bias=bias_spec is not None, b_transposed=b_transposed,
     )
 
     try:

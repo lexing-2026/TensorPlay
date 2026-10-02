@@ -88,17 +88,24 @@ class _Block(nn.Module):
         self.c2 = nn.Conv2d(8, 8, 3, padding=1)
 
     def forward(self, x):
-        return self.c2(F.silu(self.norm(self.c1(x))))
+        h = self.c1(x)
+        # A peak taken in single precision: its gradient needs the peak itself,
+        # so the forward keeps a single-precision value as well as the
+        # half-precision ones around it.
+        peak = h.float().abs().amax(dim=(2, 3), keepdim=True)
+        return self.c2(F.silu(self.norm(h))) / (peak + 1.0)
 
 
 @pytest.mark.skipif(not tp.cuda.is_available(), reason="mixed precision needs cuda")
 def test_saved_values_keep_their_recorded_type(monkeypatch):
     seen = {}
-    partition = aot_autograd.default_partition
+    # The partitioner a training region is split by, so the forward it keeps
+    # values for is the one compared below.
+    partition = aot_autograd.min_cut_rematerialization_partition
     call = aot_autograd._call
 
-    def remember_forward(joint, inputs, *, num_fwd_outputs):
-        result = partition(joint, inputs, num_fwd_outputs=num_fwd_outputs)
+    def remember_forward(joint, inputs, **kwargs):
+        result = partition(joint, inputs, **kwargs)
         seen["forward"] = result[0]
         return result
 
@@ -116,7 +123,7 @@ def test_saved_values_keep_their_recorded_type(monkeypatch):
                 ]
         return out
 
-    monkeypatch.setattr(aot_autograd, "default_partition", remember_forward)
+    monkeypatch.setattr(aot_autograd, "min_cut_rematerialization_partition", remember_forward)
     monkeypatch.setattr(aot_autograd, "_call", compare)
 
     tp.manual_seed(0)

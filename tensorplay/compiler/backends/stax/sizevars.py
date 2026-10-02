@@ -36,6 +36,7 @@ from tensorplay.graph.experimental.symbolic_shapes import (
     free_unbacked_symbols,
     ShapeEnv,
 )
+from .codegen.index_expr import Expr as IndexExpr
 from .loops import V
 from .ops_handler import WrapperHandler
 from .utils import (
@@ -58,13 +59,15 @@ from tensorplay.graph.experimental.sympy_functions import (
     SymT,
     ValueRanges,
 )
-from .codegen.index_expr import Const as IndexConst
+
 
 log = logging.getLogger(__name__)
 
 
 def _size_expr(value):
-    return sympy.Integer(value.value) if isinstance(value, IndexConst) else value
+    if isinstance(value, IndexExpr):
+        return value.to_sympy()
+    return value
 
 def free_symbols_of(*values: Any) -> set:
     """Every free symbol appearing in the values."""
@@ -301,6 +304,9 @@ class SizeVarAllocator:
         division is zero, and a position taken modulo something larger than the
         whole range is the position itself.
         """
+
+        expr = _size_expr(expr)
+        var_ranges = {k: _size_expr(v) for k, v in var_ranges.items()}
 
         expr = join_dimensions(self.simplify(expr))
         original_expr = expr
@@ -1319,33 +1325,6 @@ class SizeVarAllocator:
                 return LaneContiguity(contiguous_width=width, stride=1)
             width //= 2
         return LaneContiguity(unknown=True)
-
-    def check(self, e) -> None:
-        """The environment is asked to stand behind this relation between extents.
-
-        A relation the environment cannot vouch for is refused here rather than
-        assumed, because the caller is about to decide something on the strength
-        of it.  Which relations are allowed to depend on data is the
-        environment's decision, not this one's.
-        """
-
-        if not backed_size_oblivious:
-            return
-        from tensorplay.graph.experimental._config import ShapeEnv
-
-        if isinstance(e, Expr):
-            e = ShapeEnv().get_deferred_symbol(e)
-        self.shape_env.check(e)
-
-    def check_leq(self, left: Expr, right: Expr) -> None:
-        """Require that one extent is no larger than another."""
-
-        self.check(sympy.Le(left, right))
-
-    def check_lt(self, left: Expr, right: Expr) -> None:
-        """Require that one extent is strictly smaller than another."""
-
-        self.check(sympy.Lt(left, right))
 
     def optimization_hint(self, expr, fallback: int | None = None) -> int:
         """A concrete value to use for an extent while choosing between layouts.

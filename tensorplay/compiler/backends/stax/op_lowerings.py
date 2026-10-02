@@ -1422,6 +1422,30 @@ def _identity_copy_source(x):
     return None
 
 
+def _flat_window_name(x):
+    """The storage's name, when the value reads that storage in order.
+
+    A window with contiguous strides and no offset over row-major storage
+    holds exactly the storage's bytes under another shape, so a copy of the
+    window is a copy of the storage and both are one buffer.  Anything else --
+    a shifted or strided window, a reshaped reading -- names only itself.
+    """
+
+    node = _underlying(x)
+    if not isinstance(node, ReinterpretView):
+        return None
+    cursor = node
+    while isinstance(cursor, ReinterpretView):
+        layout = cursor.get_layout()
+        size = [int(s) for s in cursor.get_size()]
+        if int(layout.offset) != 0 or list(layout.stride) != contiguous_strides(size):
+            return None
+        cursor = cursor.data
+    if isinstance(cursor, Buffer) and cursor.layout.is_contiguous():
+        return cursor.get_name()
+    return None
+
+
 def _shared_copy(x, dtype):
     """One materialized copy per (value, element type), however many ask.
 
@@ -1430,27 +1454,41 @@ def _shared_copy(x, dtype):
     element type.  Answering every ask from the same result means one buffer
     where there would have been one per ask, and the reads still see the same
     elements.  The cache lives on the region, so it never outlives the values
-    it names.
+    it names.  The value is named by its storage when the ask reads the
+    storage in order, and by the node itself otherwise.
     """
 
     node = _underlying(x)
-    key = (id(node), dtype_name(dtype))
+    # Only a window that reads row-major storage in order may name the copy
+    # by the storage; anything else shares by its own node, since a view is
+    # named by its base and two views of one base need not read it alike.
+    name = _flat_window_name(x)
+    # A value named by its own node is named by that node's identity.  The
+    # entry keeps the node, both so the identity cannot be handed to a later
+    # node once this one is collected and so a hit can be checked against the
+    # node that is asking.
+    anchor = None
+    if name is None:
+        name = id(node)
+        anchor = node
+    try:
+        shape = tuple(int(s) for s in x.get_size())
+    except (TypeError, ValueError):
+        shape = tuple(str(s) for s in x.get_size())
+    key = (name, shape, dtype_name(dtype))
     cache = getattr(V.graph, "_shared_copy_cache", None)
     if cache is None:
         cache = {}
         V.graph._shared_copy_cache = cache
-    # The value is named by its node's identity.  The entry keeps the node,
-    # both so the identity cannot be handed to a later node once this one is
-    # collected and so a hit can be checked against the node that is asking.
     hit = cache.get(key)
-    if hit is not None and hit[0] is node:
+    if hit is not None and hit[0] is anchor:
         return hit[1]
     # The copy is described in the element type that was asked for: described
     # in the source's, the converted values would be laid down in a buffer of
     # the old type and every reader would see the type the copy was meant to
     # leave behind.
     out = to_dtype(x, dtype, copy=True)
-    cache[key] = (node, out)
+    cache[key] = (anchor, out)
     return out
 
 
@@ -1902,11 +1940,12 @@ def make_reduction(x: TensorBox, dims, keepdim, dtype, device, rtype="sum", prol
 
 
 @register("sum.dim_IntList", "sum.default")
-def lower_sum(x, dims=None, keepdim=False, dtype=None, **kwargs):
-    if not dims:
-        dims = list(range(len(x.get_size())))
-    elif isinstance(dims, (int, sympy.Integer)):
-        dims = [dims]
+def lower_sum(x, dim=None, keepdim=False, dtype=None, **kwargs):
+    # An empty list of dimensions reduces over all of them, as no list does.
+    if dim is None or (isinstance(dim, (list, tuple)) and len(dim) == 0):
+        dim = list(range(len(x.get_size())))
+    elif isinstance(dim, (int, sympy.Integer)):
+        dim = [dim]
     if dtype is None or dtype == tp.undefined:
         # A sum of whole numbers is not a whole number unless it is asked to be.
         if is_integer_dtype(x.get_dtype()) or is_boolean_dtype(x.get_dtype()):
@@ -1914,26 +1953,26 @@ def lower_sum(x, dims=None, keepdim=False, dtype=None, **kwargs):
         else:
             dtype = x.get_dtype()
     return make_reduction(
-        x, dims, keepdim, dtype, x.get_device(), "sum"
+        x, dim, keepdim, dtype, x.get_device(), "sum"
     )
 
 
 @register("mean.dim")
-def lower_mean(x, dims=None, keepdim=False, dtype=None, **kwargs):
-    if dims is None:
-        dims = list(range(len(x.get_size())))
-    elif isinstance(dims, (int, sympy.Integer)):
-        dims = [dims]
+def lower_mean(x, dim=None, keepdim=False, dtype=None, **kwargs):
+    if dim is None:
+        dim = list(range(len(x.get_size())))
+    elif isinstance(dim, (int, sympy.Integer)):
+        dim = [dim]
     dtype = _resolve_dtype(dtype, x.get_dtype())
-    count = prod(x.get_size()[normalize_dim(d, len(x.get_size()))] for d in dims)
+    count = prod(x.get_size()[normalize_dim(d, len(x.get_size()))] for d in dim)
     total = make_reduction(
-        x, dims, keepdim, dtype, x.get_device(), "sum"
+        x, dim, keepdim, dtype, x.get_device(), "sum"
     )
     return pointwise(lambda v: ops.truediv(v, ops.constant(float(count), tp.float32)), total)
 
 
 @register("var.dim", "var.correction")
-def lower_var(x, dims=None, correction=1, keepdim=False, **kwargs):
+def lower_var(x, dim=None, correction=1, keepdim=False, **kwargs):
     """Variance as the mean of squared deviations from the mean.
 
     The mean and the total of the squared differences from it are carried in a
@@ -1943,23 +1982,23 @@ def lower_var(x, dims=None, correction=1, keepdim=False, **kwargs):
     for a long group.
     """
 
-    if dims is None:
-        dims = list(range(len(x.get_size())))
-    elif isinstance(dims, (int, sympy.Integer)):
-        dims = [dims]
+    if dim is None:
+        dim = list(range(len(x.get_size())))
+    elif isinstance(dim, (int, sympy.Integer)):
+        dim = [dim]
     dtype = x.get_dtype()
     device = x.get_device()
     size = list(x.get_size())
     rank = len(size)
-    dims = sorted({normalize_dim(d, rank) for d in dims})
-    out_ranges = [size[d] for d in range(rank) if d not in dims]
-    red_ranges = [size[d] for d in dims]
+    dim = sorted({normalize_dim(d, rank) for d in dim})
+    out_ranges = [size[d] for d in range(rank) if d not in dim]
+    red_ranges = [size[d] for d in dim]
     loader = x.make_loader()
 
     def inner(index, rindex):
         it = iter(index)
         rt = iter(rindex)
-        full = [next(rt) if d in dims else next(it) for d in range(rank)]
+        full = [next(rt) if d in dim else next(it) for d in range(rank)]
         return ops.to_dtype(loader(full), dtype)
 
     _mean, m2, _weight = ir.WelfordReduction.create(
@@ -1984,17 +2023,17 @@ def lower_var(x, dims=None, correction=1, keepdim=False, **kwargs):
         ranges=out_ranges,
     )
     if keepdim:
-        kept = [1 if d in dims else size[d] for d in range(rank)]
+        kept = [1 if d in dim else size[d] for d in range(rank)]
 
         def reindex(index):
-            return [index[d] for d in range(rank) if d not in dims]
+            return [index[d] for d in range(rank) if d not in dim]
 
         return make_view(var, kept, reindex)
     return var
 
 
 @register("var_mean.default", "var_mean.dim", "var_mean.correction", "var_mean")
-def lower_var_mean(x, dims=None, unbiased=True, keepdim=False, **kwargs):
+def lower_var_mean(x, dim=None, unbiased=True, keepdim=False, **kwargs):
     """The mean and variance of the reduced axes in one walk.
 
     Both statistics come out of the same running mean and total of squared
@@ -2003,10 +2042,10 @@ def lower_var_mean(x, dims=None, unbiased=True, keepdim=False, **kwargs):
     is asked for and divided by the count less one otherwise.
     """
 
-    if dims is None:
-        dims = list(range(len(x.get_size())))
-    elif isinstance(dims, (int, sympy.Integer)):
-        dims = [dims]
+    if dim is None:
+        dim = list(range(len(x.get_size())))
+    elif isinstance(dim, (int, sympy.Integer)):
+        dim = [dim]
     # The result element type is what the graph declares for this node, which
     # can be wider than the input's: a normalization computes its moments in
     # float32 even when the input is float16.  The input's own type is only a
@@ -2018,15 +2057,15 @@ def lower_var_mean(x, dims=None, unbiased=True, keepdim=False, **kwargs):
     device = x.get_device()
     size = list(x.get_size())
     rank = len(size)
-    dims = sorted({normalize_dim(d, rank) for d in dims})
-    out_ranges = [size[d] for d in range(rank) if d not in dims]
-    red_ranges = [size[d] for d in dims]
+    dim = sorted({normalize_dim(d, rank) for d in dim})
+    out_ranges = [size[d] for d in range(rank) if d not in dim]
+    red_ranges = [size[d] for d in dim]
     loader = x.make_loader()
 
     def inner(index, rindex):
         it = iter(index)
         rt = iter(rindex)
-        full = [next(rt) if d in dims else next(it) for d in range(rank)]
+        full = [next(rt) if d in dim else next(it) for d in range(rank)]
         return ops.to_dtype(loader(full), dtype)
 
     mean, m2, _weight = ir.WelfordReduction.create(
@@ -2053,35 +2092,36 @@ def lower_var_mean(x, dims=None, unbiased=True, keepdim=False, **kwargs):
         ranges=out_ranges,
     )
     if keepdim:
-        kept = [1 if d in dims else size[d] for d in range(rank)]
+        kept = [1 if d in dim else size[d] for d in range(rank)]
 
         def reindex(index):
-            return [index[d] for d in range(rank) if d not in dims]
+            return [index[d] for d in range(rank) if d not in dim]
 
         return make_view(var, kept, reindex), make_view(mean, kept, reindex)
     return var, mean
 
 
 @register("amax.default")
-def lower_amax(x, dims=None, keepdim=False, dtype=None, **kwargs):
+def lower_amax(x, dim=None, keepdim=False, dtype=None, **kwargs):
     # What the reduction produces is read from the value it reduces: reducing
     # over axes changes how many there are and leaves a value with the same
     # element type.  A dtype the caller asked for is a different thing, and
     # overrides what that would say.
-    if not dims:
-        dims = list(range(len(x.get_size())))
-    elif isinstance(dims, (int, sympy.Integer)):
-        dims = [dims]
-    return make_reduction(x, dims, keepdim, _resolve_dtype(dtype, x.get_dtype()), x.get_device(), "max")
+    # An empty list of dimensions reduces over all of them, as no list does.
+    if dim is None or (isinstance(dim, (list, tuple)) and len(dim) == 0):
+        dim = list(range(len(x.get_size())))
+    elif isinstance(dim, (int, sympy.Integer)):
+        dim = [dim]
+    return make_reduction(x, dim, keepdim, _resolve_dtype(dtype, x.get_dtype()), x.get_device(), "max")
 
 
 @register("amin.default")
-def lower_amin(x, dims=None, keepdim=False, dtype=None, **kwargs):
-    if not dims:
-        dims = list(range(len(x.get_size())))
-    elif isinstance(dims, (int, sympy.Integer)):
-        dims = [dims]
-    return make_reduction(x, dims, keepdim, _resolve_dtype(dtype, x.get_dtype()), x.get_device(), "min")
+def lower_amin(x, dim=None, keepdim=False, dtype=None, **kwargs):
+    if dim is None:
+        dim = list(range(len(x.get_size())))
+    elif isinstance(dim, (int, sympy.Integer)):
+        dim = [dim]
+    return make_reduction(x, dim, keepdim, _resolve_dtype(dtype, x.get_dtype()), x.get_device(), "min")
 
 
 @register("conv2d_grad_bias.default", "conv_grad_bias.default")
@@ -2272,9 +2312,6 @@ def _lower_gn_bwd_decomp(grad_out, x, mean, rstd, gamma, n, c, hxw, groups,
     """
 
     if len(x.get_size()) not in (3, 4):
-        return None
-    if is_dynamic(*x.get_size(), *grad_out.get_size(), *mean.get_size(),
-                  *rstd.get_size()):
         return None
     vals = node_val()
     cpg = c // groups

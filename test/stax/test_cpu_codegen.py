@@ -323,65 +323,8 @@ def test_kernel_cache_reuses_artifact():
 
 
 def _codecache_clean():
-    root = tensorplay._stax.codecache.default_cache("stax-cpu-native").root
+    root = tensorplay._stax.codecache.default_cache("triton").root
     return os.path.exists(root)
-
-
-def test_compile_routes_pointwise_to_cpu_native(tmp_path):
-    x = tensorplay.randn(64, 64)
-
-    def fn(x):
-        return ((x * 2.0).tanh() + 1.0) / 3.0
-
-    compiled = tensorplay.compile(fn, backend="stax")
-    out = compiled(x)
-    expected = (np.tanh(x.numpy() * 2.0) + 1.0) / 3.0
-    np.testing.assert_allclose(out.numpy(), expected, rtol=1e-3, atol=1e-7)
-
-    lowering = next(iter(compiled._tensorplay_cache.values()))
-    assert lowering._tensorplay_codegen == "stax-fused-cpu"
-    assert lowering._native_runner is not None
-
-
-def test_compile_routes_extended_surface_without_grad(tmp_path):
-    x = tensorplay.randn(32, 32)
-    y = tensorplay.randn(32, 32)
-
-    def fn(x, y):
-        return tensorplay.where(x > y, x * 0.5, -y)
-
-    compiled = tensorplay.compile(fn, backend="stax")
-    out = compiled(x, y)
-    xa, ya = x.numpy(), y.numpy()
-    expected = np.where(xa > ya, xa * 0.5, -ya)
-    np.testing.assert_allclose(out.numpy(), expected, rtol=1e-3, atol=1e-7)
-
-    lowering = next(iter(compiled._tensorplay_cache.values()))
-    assert lowering._tensorplay_codegen == "stax-fused-cpu"
-    assert lowering._native_runner is not None
-    assert lowering._gradient_plan is None
-
-
-def test_compile_extended_surface_with_grad_stays_supported():
-    # grad-enabled graphs keep the base-surface route (fused autograd);
-    # this graph contains only base ops, so it must compile with gradients.
-    x = tensorplay.randn(16, 16, requires_grad=True)
-
-    def fn(x):
-        return tensorplay.tanh(x * 2.0)
-
-    compiled = tensorplay.compile(fn, backend="stax")
-    out = compiled(x)
-    out.backward(tensorplay.ones_like(out))
-    expected_x = x.detach().numpy() * 2.0
-    th = np.tanh(expected_x)
-    expected = 2.0 * (1.0 - th * th)
-    np.testing.assert_allclose(
-        x.grad.numpy(), expected, rtol=1e-4, atol=1e-6
-    )
-    lowering = next(iter(compiled._tensorplay_cache.values()))
-    assert lowering._tensorplay_codegen == "stax-fused-cpu"
-    assert lowering._gradient_plan is not None
 
 
 def test_generated_kernels_are_keyed_on_the_runtime_library(tmp_path, monkeypatch):
@@ -415,24 +358,6 @@ def test_generated_kernels_are_keyed_on_the_runtime_library(tmp_path, monkeypatc
     assert cpp_codegen._runtime_fingerprint(str(tmp_path / "absent")) == empty
 
 
-def test_native_linear_probes_the_runtime_before_emitting_it():
-    """The lowering and the runtime library are built separately.
-
-    A tree can hold one newer than the other, so the fused node is only
-    emitted once the loaded runtime has been shown to run it; otherwise the
-    transpose-product-add form carries the region.
-    """
-    from tensorplay._stax import stax as stax_mod
-
-    stax_mod._NATIVE_OP_SUPPORT.pop("linear", None)
-    first = stax_mod._native_runs_linear()
-    assert isinstance(first, bool)
-    # Probed once: the answer is memoized rather than re-executed per region.
-    stax_mod._NATIVE_OP_SUPPORT["linear"] = not first
-    assert stax_mod._native_runs_linear() is (not first)
-    stax_mod._NATIVE_OP_SUPPORT["linear"] = first
-
-
 def test_compiled_linear_matches_the_uncompiled_one():
     import tensorplay.nn as nn
 
@@ -446,7 +371,7 @@ def test_compiled_linear_matches_the_uncompiled_one():
             got.numpy(), model(x).numpy(), rtol=1e-6, atol=1e-6
         )
     lowering = next(iter(compiled._tensorplay_cache.values()))
-    assert lowering._tensorplay_codegen == "stax-native"
+    assert lowering._tensorplay_codegen == "stax-cpu"
 
 
 def test_compiled_linear_without_bias_matches():

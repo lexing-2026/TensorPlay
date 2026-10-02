@@ -36,7 +36,7 @@ from ..kernel_inputs import ConvKernelInputs, KernelInputs
 from .select_algorithm import call_operation, TritonChoiceCaller
 
 from .. import config
-from ..op_lowerings import LOWERINGS, register, register_lowering
+from ..op_lowerings import LOWERINGS, node_val, register, register_lowering, to_dtype
 from .mm import GEMM, tuned_addmm, tuned_mm
 from .mm_common import load_kernel_template, use_triton_template
 
@@ -1457,9 +1457,21 @@ def conv2d(
     past the edge; a call that is neither does not have those to say, so it is
     answered by the general call rather than being a second way of computing the
     same thing.  What the call is stays fixed here -- only the way of computing
-    it is chosen.
+    it is chosen.  The graph declares the result element type (a half-precision
+    call under a mixed-precision graph), and the activation and weight arriving
+    here can still be the wider values they came from, so the operands are
+    brought to the declared type before a way of computing the call is chosen.
     """
 
+    val = node_val(index=0)
+    dtype = getattr(val, "dtype", None)
+    if dtype is not None:
+        if x.get_dtype() != dtype:
+            x = to_dtype(x, dtype)
+        if weight.get_dtype() != dtype:
+            weight = to_dtype(weight, dtype)
+        if bias is not None and bias.get_dtype() != dtype:
+            bias = to_dtype(bias, dtype)
     return convolution(
         x,
         weight,

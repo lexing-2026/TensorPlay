@@ -186,8 +186,11 @@ class BoundVars:
             # The length of a run of memory is its stride's multiple less the
             # stride, since the last element starts one stride short of the
             # end.  A value that is not an expression has no length to work
-            # out, and is its own upper bound.
-            return bound_sympy(value).upper if isinstance(value, Expr) else value
+            # out, and is its own upper bound.  An index-algebra value is
+            # translated into the symbolic language the range analysis uses.
+            if isinstance(value, Expr):
+                return bound_sympy(value.to_sympy()).upper
+            return value
 
         self.loop_body = loop_body
         self.replacement_vals = {
@@ -315,6 +318,6 @@ class BoundVars:
         expr = self.loop_body.indexing_exprs[name]
         bound = self.replacement_vals.get(expr)
         if bound is None:
-            bound = bound_sympy(expr, self.replacement_vals)
+            bound = bound_sympy(expr.to_sympy(), self.replacement_vals)
         self.replacement_vals[name] = bound
         return bound

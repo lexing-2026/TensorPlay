@@ -317,7 +317,7 @@ def _lower_stax_region(
     # The report is on what the caller actually receives, which is this and not
     # the module behind it -- a caller asking which route produced its callable
     # would otherwise be told nothing, since the module is not what it holds.
-    _publish_codegen(compiled, "triton", backward=training)
+    _publish_codegen(compiled, "triton" if on_cuda else "stax-cpu", backward=training)
     return compiled
 
 
