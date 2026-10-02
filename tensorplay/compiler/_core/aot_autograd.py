@@ -45,6 +45,15 @@ __all__ = [
     "min_cut_rematerialization_partition",
 ]
 
+def _holds_tensor(value: Any) -> bool:
+    """Whether a list, tuple or dict argument has a tensor somewhere inside."""
+    if isinstance(value, (list, tuple)):
+        return any(_is_tensor(v) or _holds_tensor(v) for v in value)
+    if isinstance(value, dict):
+        return any(_is_tensor(v) or _holds_tensor(v) for v in value.values())
+    return False
+
+
 def _is_tensor(value: Any) -> bool:
     return isinstance(value, tensorplay.Tensor)
 
@@ -298,11 +307,53 @@ def aot_function(
 ) -> Callable[..., Any]:
     """Compile ``fn(*primals)`` (flat primals) with an AOT forward/backward."""
 
+    primals = list(example_primals)
+    if any(not _is_tensor(p) and _holds_tensor(p) for p in primals):
+        # A tensor inside a list, tuple or dict argument is an input like any
+        # other: it is given a placeholder of its own, so whether it requires
+        # grad is seen and its gradient is returned to it.  Left inside its
+        # container it would be one opaque input, and a region whose only
+        # differentiable inputs sit in containers would be compiled as if it
+        # had none.
+        leaves, spec = tree_flatten(tuple(primals))
+
+        def flat_fn(*flat: Any) -> Any:
+            return fn(*tree_unflatten(list(flat), spec))
+
+        inner = aot_function(
+            flat_fn,
+            leaves,
+            fw_compiler=fw_compiler,
+            bw_compiler=bw_compiler,
+            inference_compiler=inference_compiler,
+            partition_fn=partition_fn,
+            decompositions=decompositions,
+            keep_inference_input_mutations=keep_inference_input_mutations,
+        )
+
+        def run_flattened(*args: Any) -> Any:
+            run_leaves, run_spec = tree_flatten(tuple(args))
+            if run_spec != spec:
+                raise TypeError(
+                    "compiled region called with arguments nested differently "
+                    "from the ones it was compiled for"
+                )
+            return inner(*run_leaves)
+
+        for name in (
+            "_tensorplay_aot_graphs",
+            "_tensorplay_codegen",
+            "_tensorplay_backward_codegen",
+        ):
+            if hasattr(inner, name):
+                setattr(run_flattened, name, getattr(inner, name))
+        run_flattened._tensorplay_flattened = inner  # type: ignore[attr-defined]
+        return run_flattened
+
     del keep_inference_input_mutations  # mutations stay in the traced graph order
     bw_compiler = bw_compiler or fw_compiler
     inference_compiler = inference_compiler or fw_compiler
     partition_fn = partition_fn or default_partition
-    primals = list(example_primals)
     needs_grad = tensorplay.is_grad_enabled() and any(
         _is_tensor(p) and p.requires_grad for p in primals
     )
