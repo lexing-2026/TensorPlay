@@ -2300,6 +2300,9 @@ class IntInfinity(sympy.core.numbers.Number, metaclass=sympy.core.singleton.Sing
     def _sympystr(self, printer) -> str:
         return "int_oo"
 
+    def _eval_evalf(self, prec):
+        return sympy.Float("inf")
+
     def _eval_subs(self, old, new):
         if self == old:
             return new
