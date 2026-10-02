@@ -48,16 +48,21 @@ void tpx_py_parse_into(PyObject* const* args, Py_ssize_t nargs,
 // The tuple is supplied by the interpreter and is borrowed by the caller.
 bool tpx_py_kwnames_has(PyObject* kwnames, const char* name);
 
-// Whether the keywords only fill holes, so that the arguments the caller
-// passed positionally still stand exactly where they were put and can be read
-// as the shape of the call.  A keyword naming a parameter at or past the
-// number of positionals is filling a hole; one naming a parameter below it has
-// claimed an argument the positional reading already accounted for, and a
-// keyword naming no parameter of this overload at all is a call this overload
-// cannot serve.  Either way the answer is false.  kwlist is the parameter names
-// in order, as the overload's own argument parser is given them.
-bool tpx_py_kwnames_fill_holes(PyObject* kwnames, Py_ssize_t nargs,
-                               const char* const* kwlist, Py_ssize_t nkws);
+// Whether a call serves this candidate and, when it does, how many of the
+// candidate's positional parameters it fills: -1 when the call is not this
+// candidate's to serve (a keyword names no parameter of it, a keyword names a
+// parameter a positional already filled, or the call has more positionals than
+// the candidate takes), 0 when a supplied positional parameter has the wrong
+// kind, otherwise the count of filled positional slots.  The kind of every
+// supplied positional parameter is checked whether it was passed by position or
+// by name; a keyword naming a keyword-only parameter is carried by name and does
+// not fill a slot.  kwlist is the parameter names in schema order, excluding
+// the receiver of a method, arity is how many of them are positional, and kinds
+// is the per-position kind constant of each positional parameter.
+int tpx_py_probe_match(PyObject* const* args, Py_ssize_t nargs,
+                       PyObject* kwnames, const char* const* kwlist,
+                       Py_ssize_t nkws, const unsigned char* kinds,
+                       Py_ssize_t arity);
 
 // Give Python Tensor subclasses the first chance to handle an operator.
 // Returns 1 when result is owned by the caller, 0 when native parsing should
@@ -86,12 +91,14 @@ enum tpx_py_function_state : unsigned char {
 // nothing watching -- which is nearly all of them -- each of those is a call
 // that can only answer "nothing here".
 //
-// So the question is asked once, where it can be had without leaving the
-// caller's translation unit: a function mode registered, or any value ever seen
-// carrying a hook.  Either means there is somewhere the call could be sent, and
-// the three are then asked as they should be.  Neither means there is not, and
-// three calls are not made only to be told so.
-bool tpx_py_hooks_active();
+// So the question is asked once: a function mode registered, a value already
+// seen carrying a hook, or a value in this call that is neither a tensor nor a
+// plain builtin and so might carry one.  Any of them means there is somewhere
+// the call could be sent, and the three are then asked as they should be.
+// None means there is not, and three calls are not made only to be told so.
+bool tpx_py_hooks_active(
+    PyObject* receiver, PyObject* const* args, Py_ssize_t nargs,
+    PyObject* kwnames);
 
 int tpx_py_get_function_state();
 bool tpx_py_set_function_state(int state);

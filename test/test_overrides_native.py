@@ -37,6 +37,36 @@ def test_function_hook_precedes_native_argument_conversion():
     assert calls[0][3] == {}
 
 
+def test_a_hooked_call_leaves_the_public_function_as_it_found_it():
+    import sys
+
+    seen = []
+
+    class FunctionLike:
+        @classmethod
+        def __tensorplay_function__(cls, func, types, args, kwargs):
+            seen.append(func)
+            return "function"
+
+    x = tp.tensor([1.0])
+    like = FunctionLike()
+    assert tp._C.add(x, like) == "function"
+    assert seen == [tp.add]
+    seen.clear()
+    # The hook is handed the operation under its public name on every call.
+    # What it is handed is given back afterwards, so however many calls go
+    # through, the name is held exactly as often as before them.
+    before = sys.getrefcount(tp.add)
+    for _ in range(500):
+        tp._C.add(x, like)
+    assert len(seen) == 500
+    seen.clear()
+    # Read into a name first: an assertion holds what it compares while it
+    # compares it, and that would be counted too.
+    after = sys.getrefcount(tp.add)
+    assert after == before
+
+
 def test_mode_stack_and_exception_restore():
     events = []
 

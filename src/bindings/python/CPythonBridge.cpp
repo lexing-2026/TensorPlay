@@ -161,11 +161,11 @@ bool is_tensor_object(PyObject* value) {
     return g_tensor_type != nullptr && PyObject_TypeCheck(value, g_tensor_type);
 }
 
-// Whether any value has ever been found carrying a hook.  Until one is, the
-// hook layer has nothing to offer any call, and every operation would be
-// walked for one and found not to have it.  The flag flips the first time a
-// hook is actually found, so a call made before any hook exists skips the walk
-// and a call made after one exists takes it.
+// Whether any value has ever been found carrying a hook.  Until one is, a
+// call whose values are all tensors and plain builtins has nowhere to be sent
+// and skips the layers; a call holding anything else is still looked at, and
+// the flag flips the first time that look finds a hook.  From then on every
+// call is offered to the layers.
 std::atomic<bool> g_saw_any_hook{false};
 
 bool has_subclass_dispatch(PyObject* value) {
@@ -188,6 +188,76 @@ bool is_builtin_dispatch_free(PyObject* value) {
            type == Py_TYPE(Py_Ellipsis) || type == Py_TYPE(Py_NotImplemented);
 }
 
+// Types already looked at and found to carry no hook, each with the version
+// its attributes had when it was looked at.  A module parameter is the usual
+// case: not the tensor type itself, so it has to be asked once, but asked on
+// every operation of every step if the answer is not kept.  Giving a type a
+// hook later changes its version, so a stale entry stops matching by itself.
+// Only read and written with the interpreter lock held.
+struct HookFreeType {
+    PyTypeObject* type = nullptr;
+    unsigned int version = 0;
+};
+std::array<HookFreeType, 8> g_hook_free_types{};
+std::size_t g_hook_free_next = 0;
+
+bool type_version(PyTypeObject* type, unsigned int* version) {
+    if (!PyType_HasFeature(type, Py_TPFLAGS_VALID_VERSION_TAG)) return false;
+    *version = type->tp_version_tag;
+    return *version != 0;
+}
+
+bool known_hook_free(PyTypeObject* type) {
+    unsigned int version = 0;
+    if (!type_version(type, &version)) return false;
+    for (const HookFreeType& entry : g_hook_free_types) {
+        if (entry.type == type && entry.version == version) return true;
+    }
+    return false;
+}
+
+void remember_hook_free(PyTypeObject* type) {
+    unsigned int version = 0;
+    if (!type_version(type, &version)) return;
+    g_hook_free_types[g_hook_free_next] = {type, version};
+    g_hook_free_next = (g_hook_free_next + 1) % g_hook_free_types.size();
+}
+
+// Whether a value could carry a hook.  The one tensor type, a plain builtin
+// and a plain container of those never do, and are answered from the type
+// alone; any other type is asked once and the answer kept while it holds.
+bool may_carry_hook(PyObject* value) {
+    if (g_tensor_type == nullptr) {
+        (void)is_tensor_object(value);
+    }
+    if (Py_TYPE(value) == g_tensor_type) return false;
+    if (is_builtin_dispatch_free(value)) return false;
+    if (PyTuple_CheckExact(value) || PyList_CheckExact(value)) {
+        const Py_ssize_t size = PySequence_Fast_GET_SIZE(value);
+        PyObject** items = PySequence_Fast_ITEMS(value);
+        for (Py_ssize_t i = 0; i < size; ++i) {
+            if (may_carry_hook(items[i])) return true;
+        }
+        return false;
+    }
+    if (PyDict_CheckExact(value)) {
+        PyObject* key = nullptr;
+        PyObject* item = nullptr;
+        Py_ssize_t position = 0;
+        while (PyDict_Next(value, &position, &key, &item)) {
+            if (may_carry_hook(item)) return true;
+        }
+        return false;
+    }
+    PyTypeObject* type = Py_TYPE(value);
+    if (known_hook_free(type)) return false;
+    if (has_function_dispatch(value) || has_subclass_dispatch(value)) {
+        return true;
+    }
+    remember_hook_free(type);
+    return false;
+}
+
 // The candidate values a call might have to be handed to a hook, and the types
 // they are, held in order from the most derived outward.
 //
@@ -208,6 +278,7 @@ public:
     const_iterator begin() const { return data_.data(); }
     const_iterator end() const { return data_.data() + size_; }
     std::size_t size() const { return size_; }
+    std::size_t capacity() const { return N; }
     bool empty() const { return size_ == 0; }
     T& operator[](std::size_t i) { return data_[i]; }
     const T& operator[](std::size_t i) const { return data_[i]; }
@@ -276,6 +347,17 @@ bool insert_candidate(
     auto* type = Py_TYPE(value);
     for (PyTypeObject* old_type : candidate_types) {
         if (old_type == type) return true;
+    }
+
+    // One entry per distinct type, and the room for them is fixed.  A call
+    // with more kinds of hooked value than that is refused rather than written
+    // past the end of the list.
+    if (candidates.size() == candidates.capacity()) {
+        PyErr_SetString(
+            PyExc_RuntimeError,
+            "a call holds more distinct hooked types than the hook layer "
+            "keeps track of");
+        return false;
     }
 
     size_t index = candidates.size();
@@ -363,11 +445,18 @@ inline PublicApiCacheEntry& public_api_cache_slot(
 
 PyObject* resolve_public_api(const char* op_name, bool is_method);
 
+// Hands back a reference of the caller's own, or null when the name is absent.
+// The one the cache holds stays with the cache: a caller releases what it was
+// given when the call is over, and if that were the cache's reference the name
+// would be let go a little more on every call until it was freed under the
+// module that still points at it.
 PyObject* make_public_api(const char* op_name, bool is_method) {
     PublicApiCacheEntry& slot = public_api_cache_slot(op_name, is_method);
-    if (slot.looked) return slot.api;
-    slot.looked = true;
-    slot.api = resolve_public_api(op_name, is_method);
+    if (!slot.looked) {
+        slot.looked = true;
+        slot.api = resolve_public_api(op_name, is_method);
+    }
+    Py_XINCREF(slot.api);
     return slot.api;
 }
 
@@ -481,8 +570,7 @@ int tpx_py_try_tensor_function_dispatch(
         g_python_dispatch_tls.function_skip_next = false;
         return 0;
     }
-    if (g_python_dispatch_tls.function_state == TPX_ALL_DISABLED ||
-        g_saw_any_hook.load(std::memory_order_relaxed) == false) {
+    if (g_python_dispatch_tls.function_state == TPX_ALL_DISABLED) {
         return 0;
     }
 
@@ -603,8 +691,7 @@ int tpx_py_try_tensor_subclass_dispatch(
         return 0;
     }
     if (g_python_dispatch_tls.function_state == TPX_ALL_DISABLED ||
-        g_python_dispatch_tls.function_state == TPX_SUBCLASSES_DISABLED ||
-        g_saw_any_hook.load(std::memory_order_relaxed) == false) {
+        g_python_dispatch_tls.function_state == TPX_SUBCLASSES_DISABLED) {
         return 0;
     }
 
@@ -781,10 +868,27 @@ Py_ssize_t tpx_py_function_mode_len() {
     return static_cast<Py_ssize_t>(g_python_dispatch_tls.function_modes.size());
 }
 
-bool tpx_py_hooks_active() {
-    if (g_python_dispatch_tls.function_skip_next) return true;
+bool tpx_py_hooks_active(
+    PyObject* receiver, PyObject* const* args, Py_ssize_t nargs,
+    PyObject* kwnames) {
+    if (g_python_dispatch_tls.function_skip_next ||
+        g_python_dispatch_tls.subclass_skip_next) {
+        return true;
+    }
     if (!g_python_dispatch_tls.function_modes.empty()) return true;
-    return g_saw_any_hook.load(std::memory_order_relaxed);
+    if (g_saw_any_hook.load(std::memory_order_relaxed)) return true;
+    // No hook has been found so far, and the only place one can turn up is in
+    // the values of a call.  A value of the tensor type or of a plain builtin
+    // never carries one, so a call made of those is answered here; any other
+    // value sends the call to the layers, which look at it properly and note
+    // the hook if it has one.
+    if (receiver != nullptr && may_carry_hook(receiver)) return true;
+    const Py_ssize_t total =
+        nargs + (kwnames == nullptr ? 0 : PyTuple_GET_SIZE(kwnames));
+    for (Py_ssize_t i = 0; i < total; ++i) {
+        if (args[i] != nullptr && may_carry_hook(args[i])) return true;
+    }
+    return false;
 }
 
 int tpx_py_try_function_mode_dispatch(
@@ -796,8 +900,7 @@ int tpx_py_try_function_mode_dispatch(
         return 0;
     }
     if (g_python_dispatch_tls.function_state == TPX_ALL_DISABLED ||
-        g_python_dispatch_tls.function_modes.empty() ||
-        g_saw_any_hook.load(std::memory_order_relaxed) == false) {
+        g_python_dispatch_tls.function_modes.empty()) {
         return 0;
     }
 
@@ -1010,28 +1113,40 @@ bool tpx_py_kwnames_has(PyObject* kwnames, const char* name) {
     return false;
 }
 
-bool tpx_py_kwnames_fill_holes(PyObject* kwnames, Py_ssize_t nargs,
-                               const char* const* kwlist, Py_ssize_t nkws) {
-    // Whether the keywords only fill holes, leaving the positionally given
-    // arguments exactly where the caller put them.
+int tpx_py_probe_match(PyObject* const* args, Py_ssize_t nargs,
+                       PyObject* kwnames, const char* const* kwlist,
+                       Py_ssize_t nkws, const unsigned char* kinds,
+                       Py_ssize_t arity) {
+    // Whether a call serves this candidate and, when it does, how many of the
+    // candidate's positional parameters it fills.  A return of -1 means the
+    // call is not this candidate's to serve; 0 means it is but a supplied
+    // parameter has the wrong kind; otherwise the return is the count of
+    // filled positional slots.
     //
-    // Overload resolution reads the arguments that were passed positionally --
-    // what kind each one is, how many there are -- and that reading describes
-    // the call only while no keyword has claimed one of those positions.  A
-    // keyword naming a parameter at or past the number of positionals is
-    // filling a hole, so the reading still describes the call; a keyword naming
-    // one below it has taken an argument the reading already accounted for, and
-    // the call has to be resolved by trying the candidates instead.
+    // Overload resolution picks a candidate on the shape of a call -- how many
+    // arguments there are and what kind each is -- and that shape is settled
+    // here for positionals and keywords together.  The kind of every supplied
+    // positional parameter is checked, whether it was passed by position or by
+    // name; a keyword naming a keyword-only parameter is carried by name and
+    // does not fill a positional slot, and a keyword that has taken a slot a
+    // positional already filled is two values for one parameter.
     //
     // A keyword naming no parameter of this candidate at all is a call this
-    // candidate cannot serve, so it is reported as not filling holes and the
-    // candidate is settled by trying it.
-    if (kwnames == nullptr) return true;
-    const Py_ssize_t size = PyTuple_GET_SIZE(kwnames);
-    if (size == 0) return true;
-    for (Py_ssize_t i = 0; i < size; ++i) {
+    // candidate cannot serve, so it is reported as unservable and the candidate
+    // is settled by trying it.
+    if (kwnames == nullptr) {
+        if (nargs > arity) return -1;
+        for (Py_ssize_t i = 0; i < nargs; ++i) {
+            if (!tpx_py_obj_matches_kind(args[i], kinds[i])) return 0;
+        }
+        return static_cast<int>(nargs);
+    }
+    const Py_ssize_t nkw = PyTuple_GET_SIZE(kwnames);
+    if (nargs > arity) return -1;
+    int supplied = static_cast<int>(nargs);
+    for (Py_ssize_t i = 0; i < nkw; ++i) {
         PyObject* key = PyTuple_GET_ITEM(kwnames, i);
-        if (!PyUnicode_Check(key)) return false;
+        if (!PyUnicode_Check(key)) return -1;
         Py_ssize_t slot = -1;
         for (Py_ssize_t k = 0; k < nkws; ++k) {
             if (kwlist[k] != nullptr &&
@@ -1040,9 +1155,17 @@ bool tpx_py_kwnames_fill_holes(PyObject* kwnames, Py_ssize_t nargs,
                 break;
             }
         }
-        if (slot < 0 || slot < nargs) return false;
+        if (slot < 0 || slot < nargs) return -1;
+        if (slot < arity) {
+            PyObject* value = args[nargs + i];
+            if (!tpx_py_obj_matches_kind(value, kinds[slot])) return 0;
+            ++supplied;
+        }
     }
-    return true;
+    for (Py_ssize_t i = 0; i < nargs; ++i) {
+        if (!tpx_py_obj_matches_kind(args[i], kinds[i])) return 0;
+    }
+    return supplied;
 }
 
 ParsedArgs tpx_py_parse(PyObject* const* args, Py_ssize_t nargs,
