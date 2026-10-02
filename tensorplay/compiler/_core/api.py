@@ -721,6 +721,7 @@ def _adapt_backend_to_region(
 
     from tensorplay._decomp import get_decompositions
     import tensorplay
+    from .exact_narrowing import exact_narrowing_rules
 
     _GN_DECOMPOSITION_OPS = (
         tensorplay.ops.tp.native_group_norm,
@@ -734,7 +735,10 @@ def _adapt_backend_to_region(
         # compute the rest again inside its own loops, rather than have the
         # forward write every value the backward reads.
         partition_fn=min_cut_rematerialization_partition,
-        decompositions=get_decompositions(_GN_DECOMPOSITION_OPS),
+        decompositions={
+            **get_decompositions(_GN_DECOMPOSITION_OPS),
+            **exact_narrowing_rules(),
+        },
     )
 
 

@@ -87,6 +87,17 @@ class DispatchTracer:
             return entry[1]
         return self._constant(tensor)
 
+    def producer(self, tensor: Any) -> Node | None:
+        """The node this tensor currently stands for, if the trace computed it.
+
+        Unlike :meth:`node_for`, a tensor the trace has not seen is not turned
+        into a constant: asking where a value came from must not add to the
+        graph.
+        """
+
+        entry = self._tracked.get(tensor._impl_id)
+        return entry[1] if entry is not None else None
+
     def _constant(self, tensor: Any) -> Node:
         name = f"_tensor_constant{self._constant_count}"
         self._constant_count += 1
@@ -224,9 +235,12 @@ class ProxyTensorDispatchMode(TensorPlayDispatchMode):
         kwargs = kwargs or {}
         decomposition = self.decomposition_table.get(func)
         if decomposition is not None:
-            # The decomposition's own operators are recorded instead of func.
+            # The decomposition's own operators are recorded instead of func,
+            # unless it declines this call, which is then recorded as it is.
             with self:
-                return decomposition(*args, **kwargs)
+                out = decomposition(*args, **kwargs)
+            if out is not NotImplemented:
+                return out
         out = func(*args, **kwargs)
         self.tracer.record(func, args, kwargs, out)
         return out
