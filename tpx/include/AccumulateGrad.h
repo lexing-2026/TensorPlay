@@ -30,7 +30,10 @@ struct AccumulateGrad : public Node {
     variable_list apply(variable_list&& inputs) override {
         if (inputs.empty() || !inputs[0].defined()) return {};
 
-        Tensor grad = inputs[0];
+        // Take the engine's handle rather than copying it: whether the
+        // gradient may be kept without a deep copy is decided from its
+        // holder count, which must not include a second local handle.
+        Tensor grad = std::move(inputs[0]);
 
         if (grad.device() != value_.device()) {
             TP_THROW(RuntimeError, "Expected all tensors to be on the same device, but found at least two devices, " +

@@ -15,9 +15,11 @@ namespace tpx {
 // with add_() is safe.
 inline bool can_accumulate_inplace(const Tensor& v) {
     if (!v.is_contiguous()) return false;
-    // unsafeGetTensorImpl()/impl() return temporary shared_ptr copies; a
-    // use_count of 2 means the tensor itself is the only other holder.
-    if (v.unsafeGetTensorImpl().use_count() != 2) return false;
+    // impl() hands back a reference to the handle's own pointer, so a
+    // use_count of 1 means `v` is the only holder.  Any second holder (a
+    // leaf's stored grad, a captured gradient, another node's buffer slot)
+    // would observe the in-place update.
+    if (v.impl().use_count() != 1) return false;
     if (!v.impl()->has_storage()) return false;
     if (v.impl()->storage().use_count() != 1) return false;
     return true;

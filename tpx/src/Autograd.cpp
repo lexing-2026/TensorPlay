@@ -230,12 +230,21 @@ bool has_same_fw_meta(const Tensor& base, const Tensor& other) {
 
 void AutogradMeta::accum_grad(const tensorplay::Tensor& grad) {
     if (!grad_.defined()) {
-        grad_ = grad;
-    } else if (!GradMode::is_enabled() && can_accumulate_inplace(grad_)) {
-        // In-place accumulation when safe: avoids an allocation per backward
+        // The first gradient is kept as-is only when the caller's handle is
+        // its sole holder and no second-order graph is being recorded.  A
+        // gradient that fans out (an addend's gradient reaching two leaves,
+        // or a leaf and a buffered interior node) is deep-copied, so later
+        // in-place updates of this slot or of the other holder stay private.
+        if (!GradMode::is_enabled() && grad.impl().use_count() <= 1) {
+            grad_ = grad;
+        } else {
+            grad_ = grad.clone();
+        }
+    } else if (!GradMode::is_enabled()) {
+        // First-order accumulation keeps the stored tensor's identity:
+        // handles to `.grad` taken earlier observe the running sum.
         grad_ += grad;
     } else {
-        // Accumulate gradient
         grad_ = grad_ + grad;
     }
 }
