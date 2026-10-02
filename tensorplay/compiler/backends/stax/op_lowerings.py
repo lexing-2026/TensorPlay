@@ -1394,6 +1394,31 @@ def _identity_copy_source(x):
     return None
 
 
+def _shared_copy(x, dtype):
+    """One materialized copy per (value, element type), however many ask.
+
+    Several consumers of the same value each ask for the same copy -- a
+    gradient handed to several backward calls, each wanting it in the value's
+    element type.  Answering every ask from the same result means one buffer
+    where there would have been one per ask, and the reads still see the same
+    elements.  The cache lives on the region, so it never outlives the values
+    it names.
+    """
+
+    node = _underlying(x)
+    key = (id(node), dtype_name(dtype))
+    cache = getattr(V.graph, "_shared_copy_cache", None)
+    if cache is None:
+        cache = {}
+        V.graph._shared_copy_cache = cache
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    out = pointwise(lambda v: cast_to(v, dtype), x)
+    cache[key] = out
+    return out
+
+
 @register("to.dtype", "to.device", "to.dtype_layout", "_to_copy.default")
 def lower_to(x, *args, **kwargs):
     size, dtype, _ = val_info(node_val())
@@ -1412,7 +1437,7 @@ def lower_to(x, *args, **kwargs):
         source = _identity_copy_source(x)
         if source is not None:
             return source
-    return pointwise(lambda v: cast_to(v, dtype), x)
+    return _shared_copy(x, dtype)
 
 
 @register("clone.default", "contiguous.default")
@@ -1420,7 +1445,7 @@ def lower_clone(x, *args, **kwargs):
     source = _identity_copy_source(x)
     if source is not None:
         return source
-    return pointwise(lambda v: v, x)
+    return _shared_copy(x, x.get_dtype())
 
 
 # ---------------------------------------------------------------------------
