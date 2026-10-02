@@ -8,6 +8,7 @@ a min-cut strategy behind the same signature later.
 
 from __future__ import annotations
 
+import heapq
 import inspect
 import operator
 from collections import deque
@@ -475,6 +476,311 @@ _RECOMPUTABLE_OPS = {
 
 _INF = float("inf")
 
+#: Operations cheap enough to be computed a second time in the backward
+#: rather than kept from the forward: one element at a time, a view, a
+#: conversion, a small reduction.  An operation tagged pointwise is one of
+#: these whether it is listed or not.
+_RECOMPUTABLE_NAMES = frozenset({
+    "add", "sub", "div", "truediv", "atan2", "mul", "max", "min", "pow",
+    "remainder", "fmod", "__and__", "__or__", "__xor__", "__lshift__",
+    "__rshift__", "eq", "ne", "ge", "gt", "le", "lt", "abs", "bitwise_not",
+    "ceil", "floor", "frac", "neg", "relu", "round", "silu", "trunc", "log",
+    "log10", "log1p", "log2", "lgamma", "exp", "expm1", "erf", "erfc", "cos",
+    "acos", "cosh", "sin", "asin", "sinh", "tan", "atan", "tanh", "atanh",
+    "sqrt", "rsqrt", "reciprocal", "sigmoid", "softplus", "threshold",
+    "threshold_backward", "clamp", "where", "lerp", "addcmul", "gelu",
+    "gelu_backward", "sum", "mean", "_grad_sum_to_size", "sum_to_size",
+    "amax", "to", "type_as", "getitem", "squeeze", "unsqueeze", "rsub",
+    "_to_copy", "clone", "full_like", "var", "std", "select", "_unsafe_view",
+    "view", "expand", "slice", "reshape", "broadcast_tensors",
+    "scalar_tensor", "ones", "new_zeros", "lift_fresh_copy", "arange", "triu",
+    "var_mean", "isinf", "any", "full", "as_strided", "zeros", "empty",
+    "empty_like", "argmax", "maximum", "index", "gather", "alias", "t",
+    "permute", "split", "chunk", "zeros_like",
+})
+
+#: Operations that only re-read memory another value owns.
+_VIEW_NAMES = frozenset({
+    "squeeze", "unsqueeze", "alias", "view", "slice", "t", "expand",
+    "as_strided", "permute", "select", "split", "chunk",
+})
+
+#: Operations that draw from a generator: computing one again gives another
+#: draw, so they are fusible but never computed twice.
+_RANDOM_NAMES = frozenset({"native_dropout", "rand_like", "randn_like"})
+
+#: Farther from the backward than any node of a real graph.
+_FAR = int(1e9)
+
+
+def _op_name(node: Node) -> Optional[str]:
+    """The operation a call node names, without its overload."""
+
+    if node.op == "call_method":
+        return node.target if isinstance(node.target, str) else None
+    if node.op != "call_function":
+        return None
+    target = node.target
+    if target is operator.getitem:
+        return "getitem"
+    name = getattr(target, "_opname", None) or getattr(target, "__name__", None)
+    return name if isinstance(name, str) else None
+
+
+def _is_recomputable(node: Node) -> bool:
+    if (node.op, node.target) in _RECOMPUTABLE_OPS:
+        return True
+    name = _op_name(node)
+    if name is None:
+        return False
+    if name in _RECOMPUTABLE_NAMES:
+        return True
+    return "pointwise" in (getattr(node.target, "tags", None) or ())
+
+
+def _is_view(node: Node) -> bool:
+    return _op_name(node) in _VIEW_NAMES
+
+
+def _is_fusible_op(node: Node) -> bool:
+    return _is_recomputable(node) or _op_name(node) in _RANDOM_NAMES
+
+
+def _can_fuse(a: Node, b: Node) -> bool:
+    """Whether ``b`` can be computed in the loop that computes ``a``."""
+
+    # A join reads its operands in place, whatever produced them; it is not
+    # itself read in place by what follows.
+    if _op_name(b) == "cat":
+        return True
+    return _is_fusible_op(a) and _is_fusible_op(b)
+
+
+def _nbytes(val: Any) -> int:
+    """The memory a recorded value occupies; nothing for what is not a tensor."""
+
+    if isinstance(val, (list, tuple)):
+        return sum(_nbytes(v) for v in val)
+    numel = getattr(val, "numel", None)
+    dtype = getattr(val, "dtype", None)
+    if not callable(numel) or dtype is None:
+        return 0
+    return int(numel()) * int(getattr(dtype, "itemsize", 4) or 4)
+
+
+def _is_tensor_val(val: Any) -> bool:
+    return hasattr(val, "shape") and hasattr(val, "dtype") and callable(
+        getattr(val, "numel", None)
+    )
+
+
+def _choose_saved_values(
+    joint: Graph,
+    user_outputs: Sequence[Any],
+    bwd_out_args: Sequence[Any],
+    *,
+    heuristics: bool = True,
+) -> Optional[set]:
+    """The forward values worth keeping for the backward, by a minimum cut.
+
+    Every forward value the backward reads is either kept or computed again
+    from values that are kept.  Keeping costs memory and a write in the
+    forward; computing again costs arithmetic the backward can do inside the
+    loop that reads the result.  The choice is a minimum cut of the forward's
+    data flow: each value is an edge weighted by its size, a value that cannot
+    be computed again is tied to the source, a value the backward reads is
+    tied to the sink, and the cheapest set of edges that separates the two is
+    what is kept.
+
+    A value cannot be computed again when its operation is not a cheap one,
+    when the backward hands it to something that needs it in memory anyway,
+    or when it is a reduction -- small to keep and a whole pass to redo.  A
+    value read both nearby and far away, or sitting at the end of a very long
+    run of fusible operations, is kept as well, since computing it again
+    would drag the whole run into the backward.  Values nearer the backward
+    are preferred, and a value that is in memory already is cheaper to keep
+    than one that would have to be written for the purpose.
+
+    ``None`` when the graph has no finite cut: something the backward needs
+    can neither be kept nor computed again, and the caller keeps everything.
+    """
+
+    nodes = [n for n in joint.nodes if n.op != "output"]
+    is_bw = lambda n: bool(n.meta.get("is_backward"))
+    is_leaf = lambda n: n.op in _LEAF_OPS
+
+    # What the program's own results are computed from.
+    required_fw: set = set()
+    stack = [o for o in user_outputs if isinstance(o, Node)]
+    while stack:
+        n = stack.pop()
+        if n in required_fw or is_bw(n):
+            continue
+        required_fw.add(n)
+        stack.extend(n.all_input_nodes)
+    fw_order: Dict[Node, int] = {}
+    for n in nodes:
+        if n in required_fw:
+            fw_order[n] = len(fw_order)
+
+    # How many forward steps separate a value from its first backward reader.
+    dist: Dict[Node, int] = {}
+    for n in reversed(list(joint.nodes)):
+        if n.op == "output":
+            dist[n] = _FAR
+        elif n not in required_fw:
+            dist[n] = 0
+        else:
+            dist[n] = min([dist.get(u, _FAR) + 1 for u in n.users] or [_FAR])
+
+    read_by_backward = {a for a in bwd_out_args if isinstance(a, Node) and not is_bw(a)}
+
+    def materialized_in_backward(node: Node) -> bool:
+        if _is_view(node):
+            return False
+        pending = [node]
+        seen = {node}
+        while pending:
+            cur = pending.pop()
+            for user in cur.users:
+                if user not in required_fw and not _can_fuse(cur, user):
+                    return True
+                if _is_view(user) and user not in seen:
+                    seen.add(user)
+                    pending.append(user)
+        return False
+
+    def ban_reason(node: Node) -> Optional[str]:
+        if node.op not in ("call_function", "call_method"):
+            return None
+        if _op_name(node) == "getitem":
+            return None
+        if not _is_recomputable(node):
+            return "not a cheap operation"
+        if materialized_in_backward(node):
+            return "in memory in the backward anyway"
+        inputs = sum(_nbytes(a.meta.get("val")) for a in node.args if isinstance(a, Node))
+        if _nbytes(node.meta.get("val")) * 4 < inputs:
+            return "a reduction"
+        return None
+
+    def materialized(node: Node) -> bool:
+        if node.op == "placeholder":
+            return True
+        return not all(_can_fuse(node, user) for user in node.users)
+
+    def weight(node: Node) -> float:
+        val = node.meta.get("val")
+        if not _is_tensor_val(val):
+            # Several values, or none: there is no one buffer to keep.
+            return _INF
+        size = int(_nbytes(val) * (1.1 ** max(min(dist[node], 100), 1)))
+        return size if materialized(node) else size * 2
+
+    source, sink = "__S__", "__T__"
+    capacity: Dict[str, Dict[str, float]] = {}
+    banned: set = set()
+
+    def edge(u: str, v: str, c: float) -> None:
+        capacity.setdefault(u, {})[v] = c
+
+    def ban(node: Node) -> None:
+        if _is_view(node) or is_leaf(node) or is_bw(node):
+            return
+        banned.add(node)
+        edge(source, f"{node.name}_in", _INF)
+
+    flow_nodes = [n for n in nodes if not is_bw(n) and not is_leaf(n)]
+    for node in flow_nodes:
+        if node in required_fw and ban_reason(node):
+            ban(node)
+        edge(f"{node.name}_in", f"{node.name}_out", weight(node))
+        if node in read_by_backward:
+            edge(f"{node.name}_out", sink, _INF)
+        for user in node.users:
+            if user.op == "output":
+                continue
+            if is_bw(user):
+                edge(f"{node.name}_out", sink, _INF)
+            else:
+                edge(f"{node.name}_out", f"{user.name}_in", _INF)
+
+    if heuristics:
+        # A value read both by a nearby operation and by one beyond the first
+        # operation that cannot be fused: the far reader is kept, since the
+        # two readers would not end up in one loop anyway.
+        def first_unfusible(start_nodes: List[Node], max_range: int) -> int:
+            heap: List[Tuple[int, int, Node, bool]] = []
+            pushed = set()
+            for n in start_nodes:
+                heapq.heappush(heap, (fw_order[n], id(n), n, True))
+            while heap:
+                _, _, node, fusible = heapq.heappop(heap)
+                if not fusible:
+                    return fw_order[node]
+                for user in node.users:
+                    if user not in required_fw or fw_order[user] > max_range:
+                        continue
+                    entry = (fw_order[user], id(user), user, _can_fuse(node, user))
+                    key = (id(user), entry[3])
+                    if key not in pushed:
+                        pushed.add(key)
+                        heapq.heappush(heap, entry)
+            return max_range
+
+        for used in sorted(required_fw, key=fw_order.__getitem__):
+            fw_users = [u for u in used.users if u in required_fw]
+            if not fw_users:
+                continue
+            first = first_unfusible(fw_users, max(fw_order[u] for u in fw_users))
+            for user in tuple(used.users):
+                if (
+                    user in required_fw
+                    and fw_order[user] > first
+                    and _can_fuse(used, user)
+                    and user not in banned
+                ):
+                    ban(user)
+
+        # The end of a very long run of fusible operations is kept, so that a
+        # chain running the length of the program is not computed twice.
+        visited: set = set()
+        for start in nodes:
+            if start not in required_fw:
+                continue
+            start_order = fw_order[start]
+            heap2: List[Tuple[int, int, Node]] = [(start_order, id(start), start)]
+            while heap2:
+                _, _, cur = heapq.heappop(heap2)
+                if cur in visited:
+                    continue
+                visited.add(cur)
+                if fw_order[cur] > start_order + 100 and not heap2:
+                    ban(cur)
+                    break
+                for user in cur.users:
+                    if user in required_fw and _can_fuse(cur, user) and user not in banned:
+                        heapq.heappush(heap2, (fw_order[user], id(user), user))
+
+    # No finite cut when the source reaches the sink through edges that cannot
+    # be cut at all.
+    reach = {source}
+    queue = deque([source])
+    while queue:
+        u = queue.popleft()
+        for v, c in capacity.get(u, {}).items():
+            if c == _INF and v not in reach:
+                reach.add(v)
+                queue.append(v)
+    if sink in reach:
+        return None
+
+    _, reachable = _mincut_maxflow(capacity, source, sink)
+    return {
+        n for n in flow_nodes
+        if f"{n.name}_in" in reachable and f"{n.name}_out" not in reachable
+    }
+
 
 def _mincut_maxflow(
     capacity: Dict[str, Dict[str, float]], source: str, sink: str
@@ -523,11 +829,16 @@ def partition_min_cut(
     memory_budget: Optional[int] = None,
     ban_fusible_chains: bool = True,
 ):
-    """Memory-optimal split of a tagged joint graph (P3-L4b design).
+    """Split a tagged joint graph, keeping the cheapest cut of forward values.
 
-    Min-cut over the forward DAG decides which backward-referenced values are
-    saved vs recomputed inside the backward graph; must-save nodes carry an
-    infinite-capacity edge so they are never cut.
+    A minimum cut over the forward's data flow decides which values the
+    backward reads from memory and which it computes again inside its own
+    loops (see ``_choose_saved_values``); the backward graph then carries a
+    copy of every operation between the kept values and its own.
+    ``ban_fusible_chains`` turns on the rules that keep a value read far from
+    where it was made or sitting at the end of a very long fusible run.
+    ``memory_budget`` is accepted for callers that pass one; the cut is
+    always the one that is cheapest to run.
     """
 
     joint = joint_gm.graph
@@ -547,83 +858,23 @@ def partition_min_cut(
     user_outputs = out_args[:num_fwd_outputs]
     bwd_out_args = out_args[num_fwd_outputs:]
 
-    def _weight(node: Node) -> float:
-        if memory_budget is None:
-            return 1.0
-        val = node.meta.get("val")
-        numel = getattr(val, "numel", None)
-        n = numel() if callable(numel) else 1
-        return float(max(1, int(n) * 4))
+    saved_set = _choose_saved_values(
+        joint, user_outputs, bwd_out_args, heuristics=ban_fusible_chains
+    )
+    if saved_set is None:
+        return partition_default(joint_gm, num_fwd_outputs=num_fwd_outputs)
 
-    has_bw_user = lambda n: any(u.meta.get("is_backward") for u in n.users)
-
-    # ban_fusible_chains: interior nodes of a recomputable chain are forced
-    # into the saved set so chains are cut at boundaries only.
-    chain_interior = set()
-    if ban_fusible_chains:
-        for n in fwd_nodes:
-            if n.op in _LEAF_OPS or (n.op, n.target) not in _RECOMPUTABLE_OPS:
-                continue
-            producers = [
-                a for a in n.args if isinstance(a, Node) and a.op not in _LEAF_OPS
-            ]
-            interior = (
-                all((p.op, p.target) in _RECOMPUTABLE_OPS for p in producers)
-                and producers
-                and any((u.op, u.target) in _RECOMPUTABLE_OPS for u in n.users)
-            )
-            if interior:
-                chain_interior.add(n)
-
-    candidates = [n for n in fwd_nodes if n.op not in _LEAF_OPS and has_bw_user(n)]
-
-    # Must-save: get_attr (params), fusible-chain interiors, and any node
-    # consumed by BOTH the forward-output subtree and backward (dual-use).
-    user_set = {o for o in user_outputs if isinstance(o, Node)}
-    fw_needed = set()
-    stack = list(user_set)
+    # The forward holds what its results and the kept values are computed
+    # from; a value only the backward reads is computed there.
+    needed: set = set()
+    stack = [o for o in [*user_outputs, *saved_set] if isinstance(o, Node)]
     while stack:
         n = stack.pop()
-        if n in fw_needed or n.op in _LEAF_OPS:
+        if n in needed:
             continue
-        fw_needed.add(n)
-        stack.extend(a for a in n.args if isinstance(a, Node))
-    must_save = {
-        n for n in candidates
-        if n.op == "get_attr"
-        or n in chain_interior
-        or n in fw_needed
-    }
-
-    source, sink = "__S__", "__T__"
-    capacity: Dict[str, Dict[str, float]] = {}
-
-    def _edge(u: str, v: str, c: float) -> None:
-        capacity.setdefault(u, {})[v] = c
-
-    for out_arg in user_outputs:
-        if isinstance(out_arg, Node) and out_arg.op not in _LEAF_OPS:
-            _edge(source, f"n_{out_arg.name}", _INF)
-    for n in fwd_nodes:
-        if n.op in _LEAF_OPS:
-            continue
-        key = f"n_{n.name}"
-        for a in n.args:
-            if isinstance(a, Node) and a.op not in _LEAF_OPS:
-                _edge(f"n_{a.name}", key, _INF)
-        if n in candidates:
-            _edge(key, sink, _INF if n in must_save else _weight(n))
-
-    _, reachable = _mincut_maxflow(capacity, source, sink)
-    # Sink-side candidates (unreachable in the residual graph) keep their
-    # intact save edges -> saved; reachable ones were cut -> recomputed.
-    saved_set = {
-        n for n in candidates
-        if f"n_{n.name}" not in reachable or n in must_save
-    }
-    # An empty save set is legal when every backward formula reads only
-    # metadata or inputs (e.g. sum's expand-only derivative): the backward
-    # then recomputes/clones everything it needs.
+        needed.add(n)
+        stack.extend(n.all_input_nodes)
+    fwd_nodes = [n for n in fwd_nodes if n.op == "placeholder" or n in needed]
 
     fw_graph, _, _ = _copy_nodes(fwd_nodes, [*user_outputs, *sorted(saved_set, key=lambda x: x.name)], False)
 
@@ -686,8 +937,23 @@ def partition_min_cut(
         bw_map[node] = clone
         return clone
 
-    for node in bwd_nodes:
-        ensure(node)
+    # Everything the backward computes -- its own operations and the forward
+    # ones it computes again -- is copied in the order the joint graph holds
+    # it, so each copy finds its operands already made and a long run of
+    # recomputed operations is not walked by recursion.
+    wanted: set = set()
+    stack = [*bwd_nodes, *(a for a in bwd_out_args if isinstance(a, Node))]
+    while stack:
+        n = stack.pop()
+        if n in wanted:
+            continue
+        wanted.add(n)
+        if n.op in _LEAF_OPS or n in saved_set:
+            continue
+        stack.extend(n.all_input_nodes)
+    for node in joint.nodes:
+        if node in wanted:
+            ensure(node)
     # An input that does not take a gradient has none, and the joint graph
     # says so by having nothing there.  There is no node to carry, so it is
     # not carried: the backward graph produces what it does produce, and the

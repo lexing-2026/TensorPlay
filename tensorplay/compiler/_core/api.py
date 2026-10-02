@@ -707,7 +707,7 @@ def _adapt_backend_to_region(
 
     if not _region_is_training(example_inputs, example_kwargs, graph_module):
         return compiler_fn
-    from .aot_autograd import default_partition
+    from .aot_autograd import min_cut_rematerialization_partition
     from .common import aot_autograd
 
     forward_compiler = compiler_fn
@@ -730,7 +730,10 @@ def _adapt_backend_to_region(
     return aot_autograd(
         fw_compiler=forward_compiler,
         bw_compiler=forward_compiler,
-        partition_fn=default_partition,
+        # Keep the cheapest cut of forward values and let the backward
+        # compute the rest again inside its own loops, rather than have the
+        # forward write every value the backward reads.
+        partition_fn=min_cut_rematerialization_partition,
         decompositions=get_decompositions(_GN_DECOMPOSITION_OPS),
     )
 
