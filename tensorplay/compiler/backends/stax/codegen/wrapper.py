@@ -1669,7 +1669,7 @@ class PythonWrapperCodegen(CodeGen):
                 empty_strided_cuda = lambda *args, **kwargs: tp.empty_strided(*args, device="cuda", **kwargs)
                 empty_strided_xpu = lambda *args, **kwargs: tp.empty_strided(*args, device="xpu", **kwargs)
                 empty_strided_mtia = lambda *args, **kwargs: tp.empty_strided(*args, device="mtia", **kwargs)
-                reinterpret_tensor = lambda t, size, stride, offset: tp.as_strided(t, size, stride, offset)
+                reinterpret_tensor = lambda t, size, stride, offset: tp.as_strided(t, size, stride, t.storage_offset() + offset)
             """,
             strip=True,
         )
