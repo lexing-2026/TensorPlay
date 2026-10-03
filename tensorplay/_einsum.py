@@ -56,6 +56,15 @@ def einsum(*args):
 
     equation, operands = parse_equation(args)
 
+    from tensorplay.graph import capture_call, capturing
+
+    if capturing():
+        # Recorded in this function's own spelling: a graph replays the
+        # call through it.
+        captured = capture_call(einsum, (equation, *operands), {})
+        if captured is not None:
+            return captured
+
     # With more than two operands the kernel plans the contraction order
     # itself; pass path=[...] to pin a specific order.
     return tensorplay._C.einsum(equation=equation, operands=list(operands), path=[])
