@@ -6,6 +6,7 @@
 
 #include "Context.h"
 #include "AdvancedIndex.h"
+#include "Autograd.h"
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
@@ -1485,13 +1486,71 @@ Tensor batch_repeat_interleave_self_int(const Tensor& input, int64_t repeats,
     return make_batched(result, *operand.bdim, operand.level);
 }
 
+// The conversions are composites with no autograd kernel of their own, so
+// the rule steps below this level itself -- where autograd is live again, as
+// it is for an operator dispatched onward -- converts the unwrapped value and
+// records the conversion there.  A value still mapped at an outer level goes
+// through that level's rule.  A conversion that changes nothing hands back the
+// input itself, as it does outside a transform.
+template <typename... Args>
+Tensor batch_convert(const char* op, const Tensor& input, Args... args) {
+    Operand operand = unwrap_operand(input);
+    if (!operand.bdim.has_value()) {
+        TP_THROW(RuntimeError, "conversion batch rule received an unbatched operand");
+    }
+    const Tensor& value = operand.value;
+    Tensor result;
+    {
+        transform::DynamicLayerBackGuard below;
+        result = value.is_batched()
+            ? call_next<Tensor, const Tensor&, Args...>(op, value, value, args...)
+            : tpx::record_conversion(
+                  value, call_device<Tensor, const Tensor&, Args...>(
+                             op, value.device(), value, args...));
+    }
+    if (result.unsafeGetTensorImpl() == value.unsafeGetTensorImpl()) {
+        return input;
+    }
+    return make_batched(result, *operand.bdim, operand.level);
+}
+
 Tensor batch_to_dtype(const Tensor& input, DType dtype, bool non_blocking,
                       bool copy, std::optional<int64_t> memory_format) {
-    return unary_impl(input, [&](const Tensor& value) {
-        return call_next<Tensor, const Tensor&, DType, bool, bool,
-                         std::optional<int64_t>>(
-            "to.dtype", value, value, dtype, non_blocking, copy, memory_format);
-    });
+    return batch_convert("to.dtype", input, dtype, non_blocking, copy,
+                         memory_format);
+}
+
+Tensor batch_to_device(const Tensor& input, Device device, DType dtype,
+                       bool non_blocking, bool copy,
+                       std::optional<int64_t> memory_format) {
+    return batch_convert("to.device", input, device, dtype, non_blocking, copy,
+                         memory_format);
+}
+
+Tensor batch_to_dtype_layout(const Tensor& input, std::optional<DType> dtype,
+                             std::optional<int64_t> layout,
+                             std::optional<Device> device,
+                             std::optional<bool> pin_memory, bool non_blocking,
+                             bool copy, std::optional<int64_t> memory_format) {
+    return batch_convert("to.dtype_layout", input, dtype, layout, device,
+                         pin_memory, non_blocking, copy, memory_format);
+}
+
+Tensor batch_to_other(const Tensor& input, const Tensor& other,
+                      bool non_blocking, bool copy,
+                      std::optional<int64_t> memory_format) {
+    // Only the template's dtype and device are read, so it may be mapped.
+    return batch_convert("to.device", input, other.device(), other.dtype(),
+                         non_blocking, copy, memory_format);
+}
+
+Tensor batch_to_copy(const Tensor& input, std::optional<DType> dtype,
+                     std::optional<int64_t> layout,
+                     std::optional<Device> device,
+                     std::optional<bool> pin_memory, bool non_blocking,
+                     std::optional<int64_t> memory_format) {
+    return batch_convert("_to_copy", input, dtype, layout, device, pin_memory,
+                         non_blocking, memory_format);
 }
 
 Tensor batch_tril(const Tensor& input, int64_t diagonal) {
@@ -2152,6 +2211,10 @@ void register_batch_rules(tensorplay::Library& library) {
     register_batch_rule<&batch_gather>(library, "gather");
     register_batch_rule<&batch_repeat_interleave_self_int>(library, "repeat_interleave.self_int");
     register_batch_rule<&batch_to_dtype>(library, "to.dtype");
+    register_batch_rule<&batch_to_device>(library, "to.device");
+    register_batch_rule<&batch_to_dtype_layout>(library, "to.dtype_layout");
+    register_batch_rule<&batch_to_other>(library, "to.other");
+    register_batch_rule<&batch_to_copy>(library, "_to_copy");
     register_batch_rule<&batch_tril>(library, "tril");
     register_batch_rule<&batch_new_zeros>(library, "new_zeros");
     register_batch_rule<&batch_new_ones>(library, "new_ones");

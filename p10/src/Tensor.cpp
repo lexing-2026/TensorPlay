@@ -1414,7 +1414,9 @@ Tensor contiguous_impl(const Tensor& self, int64_t memory_format_raw) {
 
 
 Tensor Tensor::to(DType dtype, bool non_blocking, bool copy) const {
-    if (impl_ && impl::python_dispatch_active()) {
+    // A mapped tensor converts through its batch rule, which converts
+    // the unwrapped value and wraps the result at the same level.
+    if (impl_ && (impl::python_dispatch_active() || is_batched())) {
         return detail::redispatch_to_dtype_method(*this, dtype, non_blocking, copy, std::nullopt);
     }
     if (!impl_) return Tensor();
@@ -1441,7 +1443,7 @@ Tensor Tensor::to(DType dtype, bool non_blocking, bool copy) const {
 }
 
 Tensor Tensor::to(Device device, bool non_blocking, bool copy) const {
-    if (impl_ && impl::python_dispatch_active()) {
+    if (impl_ && (impl::python_dispatch_active() || is_batched())) {
         return detail::redispatch_to_device_method(
             *this, device, this->dtype(), non_blocking, copy, std::nullopt);
     }
@@ -1475,7 +1477,7 @@ Tensor Tensor::to(Device device, bool non_blocking, bool copy) const {
 }
 
 Tensor Tensor::to(Device device, DType dtype, bool non_blocking, bool copy) const {
-    if (impl_ && impl::python_dispatch_active()) {
+    if (impl_ && (impl::python_dispatch_active() || is_batched())) {
         return detail::redispatch_to_device_method(
             *this, device, dtype, non_blocking, copy, std::nullopt);
     }

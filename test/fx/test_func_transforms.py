@@ -97,6 +97,33 @@ class TestVmap:
         a = tp.randn([5, 3])
         assert_close(vmap(grad(lambda t: (t ** 3).sum()))(a), 3 * a ** 2)
 
+    @pytest.mark.parametrize("convert", [
+        lambda t: t.to(tp.float64),
+        lambda t: t.double(),
+        lambda t: t.to("cpu", tp.float64),
+        lambda t: t.to(tp.zeros([1], dtype=tp.float64)),
+    ])
+    def test_converts_each_sample(self, convert):
+        a = tp.randn([5, 3])
+        got = vmap(convert)(a)
+        assert got.dtype == tp.float64 and tuple(got.shape) == (5, 3)
+        assert_close(got, a.double())
+
+    def test_conversion_keeps_the_mapped_axis_where_it_was(self):
+        a = tp.randn([5, 3])
+        assert_close(vmap(lambda t: t.to(tp.float64), in_dims=1)(a), a.t().double())
+        nested = vmap(vmap(lambda t: t.to(tp.float64)))(tp.ones([2, 5, 3]))
+        assert nested.dtype == tp.float64 and tuple(nested.shape) == (2, 5, 3)
+
+    def test_gradients_flow_through_a_conversion(self):
+        a = tp.randn([5, 3])
+        per_sample = vmap(grad(lambda t: (t.double() ** 2).sum()))(a)
+        assert per_sample.dtype == tp.float32
+        assert_close(per_sample, 2 * a)
+        leaf = a.clone().requires_grad_()
+        vmap(lambda t: t.to(tp.float64) * 3)(leaf).sum().backward()
+        assert_close(leaf.grad, tp.full([5, 3], 3.0))
+
     def test_mismatched_batch_sizes_are_rejected(self):
         with pytest.raises(ValueError, match="same size"):
             vmap(lambda p, q: p + q)(tp.randn([3, 2]), tp.randn([4, 2]))
