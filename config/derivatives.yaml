@@ -1277,6 +1277,10 @@
   self: sum_to_size(grad, self.shape())
   result: auto_linear
 
+- name: expand_as(Tensor self, Tensor other) -> Tensor
+  self: sum_to_size(grad, self.shape())
+  result: auto_linear
+
 - name: repeat(Tensor self, int[] repeats) -> Tensor
   self: repeat_backward(grad, repeats, self.shape())
 
