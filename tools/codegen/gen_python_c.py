@@ -447,6 +447,31 @@ def _probe_info(f, variant: str):
     return {"arity": len(pos), "required": required, "kinds": kinds}
 
 
+def _arity_max(f, variant: str) -> int | None:
+    """Delivered-argument ceiling for one group candidate, or None.
+
+    The dispatcher can settle a candidate on the count of delivered
+    arguments -- positionals plus keyword values, since keyword values ride
+    alongside the positionals -- before running the candidate's parser.  The
+    ceiling is the candidate's parameter count: schema positionals (the
+    receiver too on the function surface, where it travels inside args[])
+    plus keyword-only parameters.  A trailing sequence parameter has no
+    ceiling: the variadic fold absorbs any number of extra positionals.
+
+    The ceiling is a superset of what the parser accepts, never a subset: a
+    candidate skipped by it would have thrown on the same count inside its
+    parser, so dispatch order and error reporting are unchanged, minus one
+    thrown exception per skipped candidate.
+    """
+    is_method = variant == "method"
+    pos = [a for a in f.args
+           if not (is_method and a.name == "self") and not a.kwonly]
+    if pos and pos[-1].type.is_list:
+        return None
+    kwonly = [a for a in f.args if a.kwonly]
+    return len(pos) + len(kwonly)
+
+
 def _unique_keyword_probes(funcs, variant: str):
     """Return keyword names that identify one overload in a group."""
     names = [
@@ -1035,14 +1060,47 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
             # its Python-visible signature and the reason it rejected the
             # arguments, instead of surfacing whichever overload happened
             # to be tried last.
+            #
+            # Count gate: a candidate whose parameter count is fixed cannot
+            # serve a call delivering more arguments than it has slots, so
+            # the dispatcher settles such a candidate on the delivered count
+            # instead of entering its parser and paying a thrown exception
+            # per rejected candidate.  Candidates ending in a sequence
+            # parameter have no ceiling (the variadic fold absorbs any
+            # number of extra positionals) and are always tried.  A skipped
+            # candidate still contributes its reason line, worded as its
+            # parser would have worded it.
             out.append("        std::string tpx_reasons;")
+            maxes = [_arity_max(f, variant) for f in fs]
+            if any(m is not None for m in maxes):
+                out.append("        const Py_ssize_t tpx_supplied = nargs +")
+                out.append("            (kwnames == nullptr ? 0"
+                           " : PyTuple_GET_SIZE(kwnames));")
             for k, ovn in enumerate(ovfns):
-                out.append("        try { return " + ovn
+                sig = _py_signature(fs[k], variant).replace(
+                    '\\', '\\\\').replace('"', '\\"')
+                bound = maxes[k]
+                if bound is None:
+                    out.append("        try { return " + ovn
+                               + "(self, args, nargs, kwnames); }")
+                    out.append("        catch (const std::invalid_argument& e) {")
+                    out.append(f'            tpx_reasons += "\\n * {sig}: ";')
+                    out.append("            tpx_reasons += e.what();")
+                    out.append("        }")
+                    continue
+                op = fs[k].base_name
+                out.append(f"        if (tpx_supplied <= {bound}) {{")
+                out.append("            try { return " + ovn
                            + "(self, args, nargs, kwnames); }")
-                out.append("        catch (const std::invalid_argument& e) {")
-                sig = _py_signature(fs[k], variant).replace('\\', '\\\\').replace('"', '\\"')
+                out.append("            catch (const std::invalid_argument& e) {")
+                out.append(f'                tpx_reasons += "\\n * {sig}: ";')
+                out.append("                tpx_reasons += e.what();")
+                out.append("            }")
+                out.append("        } else {")
                 out.append(f'            tpx_reasons += "\\n * {sig}: ";')
-                out.append("            tpx_reasons += e.what();")
+                out.append(f'            tpx_reasons += (nargs > {bound})')
+                out.append(f'                ? "{op}: too many positional arguments"')
+                out.append(f'                : "{op}: too many arguments";')
                 out.append("        }")
             receiver = "self" if variant == "method" else "nullptr"
             out.append(
