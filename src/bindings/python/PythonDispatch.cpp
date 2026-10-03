@@ -6,6 +6,7 @@
 
 #include "Dispatcher.h"
 #include "Exception.h"
+#include "InferenceMode.h"
 #include "python_bindings.h"
 #include "PythonRuntime.h"
 
@@ -160,6 +161,30 @@ PyObject* ModeCall::invoke() {
                  "and every tensor subclass returned NotImplemented",
                  entry_.name);
     throw python_c::PythonError();
+}
+
+KernelFunction implicit_autograd_kernel(const OpEntry& entry,
+                                        const Tensor* differentiable) {
+    if (differentiable == nullptr) return nullptr;
+    if (!GradMode::is_enabled() || InferenceMode::is_enabled() ||
+        autograd_dispatch_excluded()) {
+        return nullptr;
+    }
+    const DispatchKey key = dispatchKeyForTensor(*differentiable);
+    if (is_vmap_key(key)) return nullptr;
+    const DispatchKey backend = toBackendKey(key);
+    if (!is_backend_key(backend)) return nullptr;
+    auto& dispatcher = Dispatcher::singleton();
+    const OperatorHandle handle = dispatcher.findHandle(entry.name);
+    // An operator with a derivative records its history whole and is the
+    // mode's to see whole.
+    if (handle.getKernel(toAutogradKey(backend)) != nullptr) return nullptr;
+    const KernelFunction composite = handle.getKernel(DispatchKey::Composite);
+    if (composite == nullptr) return nullptr;
+    // A backend kernel of its own is a primitive the mode has to see.
+    const KernelFunction own = dispatcher.direct_kernel(entry.name, backend);
+    if (own != nullptr && own != composite) return nullptr;
+    return composite;
 }
 
 namespace {

@@ -222,3 +222,21 @@ def test_mask_assignment_is_recorded():
 
     graph = dispatch_make_graph(fn)(tp.tensor([1.0, -2.0, 3.0]))
     assert graph(tp.tensor([-1.0, 2.0, -3.0])).tolist() == [-1.0, 0.0, -3.0]
+
+
+def test_composites_without_a_derivative_are_seen_through():
+    # einsum has no derivative of its own.  With history to record, the mode
+    # sees the products it is made of, each recorded by autograd, and the
+    # result carries a gradient.
+    a = tp.randn(2, 3, 4, requires_grad=True)
+    b = tp.randn(2, 4, 5)
+    with RecordingMode() as mode:
+        out = tp.einsum("bij,bjk->bik", a, b)
+    assert not [n for n in mode.names() if n.startswith("einsum")], mode.names()
+    assert out.requires_grad and out.grad_fn is not None
+    out.sum().backward()
+    assert tp.allclose(a.grad, b.sum(-1)[:, None, :].expand(2, 3, 4), atol=1e-5)
+
+    with RecordingMode() as mode:
+        tp.einsum("bij,bjk->bik", a.detach(), b)
+    assert "einsum.default" in mode.names(), mode.names()

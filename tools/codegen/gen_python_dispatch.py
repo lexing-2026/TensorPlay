@@ -178,6 +178,7 @@ def _emit_kernel(out: list[str], f: NativeFunction) -> str:
     if kind == "mut_ref" and not mutable:
         raise UnsupportedPythonDispatch("mutable return without a mutable argument")
 
+    signature = ", ".join(stub_arg_type_for(f.base_name, a) for a in args)
     names = ", ".join(_cpp_string(a.python_name) for a in args) or "nullptr"
     num_positional = sum(1 for a in args if not a.kwonly)
     out.append(f"const char* const argnames_{sym}[] = {{{names}}};")
@@ -186,6 +187,18 @@ def _emit_kernel(out: list[str], f: NativeFunction) -> str:
         f"{_cpp_string(f.schema)}, argnames_{sym}, {len(args)}, "
         f"{num_positional}, {_cpp_string(','.join(sorted(f.tags)))}, nullptr}};")
     out.append(f"{ret} kernel_{sym}({', '.join(params)}) {{")
+    differentiable = [a.name for a in args if a.type.is_tensor_like]
+    if differentiable and not mutable and kind not in ("void", "mut_ref"):
+        # Differentiated through its composite kernel when it has no
+        # derivative of its own (see implicit_autograd_kernel).  The guard
+        # variable is spelled to stay clear of every schema argument name.
+        out.append(
+            f"    if (KernelFunction ia_kernel = implicit_autograd_kernel(entry_{sym}, "
+            f"first_requiring_grad({', '.join(differentiable)}))) {{")
+        out.append(
+            f"        return reinterpret_cast<{ret} (*)({signature})>(ia_kernel)"
+            f"({', '.join(a.name for a in args)});")
+        out.append("    }")
     out.append(f"    ModeCall call(entry_{sym});")
     for i, conv in enumerate(conversions):
         out.append(f"    call.set_arg({i}, {conv});")
@@ -202,7 +215,6 @@ def _emit_kernel(out: list[str], f: NativeFunction) -> str:
             f"[&](PyObject* o) -> {ret} {{ return {ret_expr}; }});")
     out.append("}")
     out.append("")
-    signature = ", ".join(stub_arg_type_for(f.base_name, a) for a in args)
     return (f'    D.registerKernel({_cpp_string(f.func_name)}, DispatchKey::Python, '
             f'static_cast<{ret} (*)({signature})>(&kernel_{sym}));')
 

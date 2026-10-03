@@ -73,6 +73,47 @@ private:
     PyObject* args_ = nullptr;   // one slot per schema argument
 };
 
+// The tensor among a call's arguments that makes the call one to
+// differentiate (the first defined one that requires grad), or null.
+inline const Tensor* requiring_grad(const Tensor& tensor) {
+    return tensor.defined() && tensor.requires_grad() ? &tensor : nullptr;
+}
+inline const Tensor* requiring_grad(const std::optional<Tensor>& tensor) {
+    return tensor.has_value() ? requiring_grad(*tensor) : nullptr;
+}
+inline const Tensor* requiring_grad(const std::vector<Tensor>& tensors) {
+    for (const Tensor& tensor : tensors) {
+        if (const Tensor* found = requiring_grad(tensor)) return found;
+    }
+    return nullptr;
+}
+inline const Tensor* requiring_grad(const std::vector<std::optional<Tensor>>& tensors) {
+    for (const auto& tensor : tensors) {
+        if (const Tensor* found = requiring_grad(tensor)) return found;
+    }
+    return nullptr;
+}
+inline const Tensor* requiring_grad(const std::optional<std::vector<Tensor>>& tensors) {
+    return tensors.has_value() ? requiring_grad(*tensors) : nullptr;
+}
+template <typename... Tensors>
+const Tensor* first_requiring_grad(const Tensors&... tensors) {
+    const Tensor* found = nullptr;
+    ((found = found != nullptr ? found : requiring_grad(tensors)), ...);
+    return found;
+}
+
+// An operator without a derivative of its own is differentiated through the
+// operators its backend-neutral composite kernel calls.  Handed to a mode
+// whole, such a call runs below the autograd layer and its result carries no
+// history.  When the call has to be differentiated, the composite kernel is
+// therefore run in place of the mode: each operator it calls is recorded by
+// autograd and reaches the mode on its own.  Returns that kernel, or null
+// when the operator has its own derivative, when no composite kernel serves
+// the backend of ``differentiable``, or when nothing records history.
+KernelFunction implicit_autograd_kernel(const OpEntry& entry,
+                                        const Tensor* differentiable);
+
 // Converts a handler result, owning ``result``: the conversion runs under
 // the lock ModeCall holds and releases the reference afterwards.
 template <typename Convert>

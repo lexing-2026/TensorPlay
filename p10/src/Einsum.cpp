@@ -1119,18 +1119,21 @@ Tensor einsum_kernel(const std::string& equation,
     return ops_stack[0];
 }
 
-TENSORPLAY_LIBRARY_IMPL(CPU, EinsumKernels) {
+// einsum and tensordot are compositions of permute/reshape/bmm/sum with no
+// derivative of their own: they are differentiated through the operators
+// they call, on every backend those operators serve.
+TENSORPLAY_LIBRARY_IMPL(Composite, EinsumComposites) {
     m.impl("einsum", einsum_kernel);
     m.impl("tensordot", tensordot_kernel);
     m.impl("tensordot.out", tensordot_out_kernel);
+}
+
+TENSORPLAY_LIBRARY_IMPL(CPU, EinsumKernels) {
     m.impl("_trilinear", _trilinear_kernel);
     m.impl("_trilinear_backward", _trilinear_backward_kernel);
 }
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, EinsumKernelsCUDA) {
-    m.impl("einsum", einsum_kernel);
-    m.impl("tensordot", tensordot_kernel);
-    m.impl("tensordot.out", tensordot_out_kernel);
     m.impl("_trilinear", _trilinear_kernel);
     m.impl("_trilinear_backward", _trilinear_backward_kernel);
 }
