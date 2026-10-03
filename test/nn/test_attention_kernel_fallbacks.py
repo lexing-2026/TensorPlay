@@ -1,10 +1,13 @@
-"""The attention contracts that have no kernel of their own in this build.
+"""The fused attention contracts and the composite that answers them.
 
-Each one declared in the op schema set is served here by a composite over the
-kernels that do exist, so what these check is that the composite reproduces
-the contract: the axis order each one takes its inputs in, which corner a
-causal mask aligns to, what a sliding window keeps, the shape and meaning of
-the logsumexp it hands back, and what a query with no visible key does.
+Every call a fused kernel cannot express -- and every call on a backend with no
+fused kernel -- is answered by the composite that forms the score matrix, so
+what these check is that the answer reproduces the contract: the axis order
+each one takes its inputs in, which corner a causal mask aligns to, what a
+sliding window keeps, the shape and meaning of the logsumexp it hands back,
+what a query with no visible key does, the sizes the scaled-dot-product entry
+points return, and that the backward reading the saved logsumexp and dropout
+seed agrees with differentiating the reference.
 
 The reference throughout is the same arithmetic in float64, so a case that
 disagrees with it disagrees about the contract rather than about rounding.
@@ -298,7 +301,11 @@ def test_logsumexp_is_only_computed_when_asked_for():
     q, k, v = tensors
     asked = _efficient(*tensors, custom_mask_type=1, compute_log_sumexp=True)
     skipped = _efficient(*tensors, custom_mask_type=1)
-    assert tuple(asked[1].shape) == (2, 4, 8)
+    # The query axis of this contract's constant is padded to a multiple of 32,
+    # and the padding reads as rows with nothing to see.
+    assert tuple(asked[1].shape) == (2, 4, 32)
+    assert bool(tp.isfinite(asked[1][..., :8]).all())
+    assert bool((asked[1][..., 8:] == float("inf")).all())
     assert skipped[1].numel() == 0, "an unasked-for constant is not worth computing"
     keep = _triu_ish(8, 8, False, q.device)
     _assert_close(
@@ -359,7 +366,8 @@ def test_reduced_precision_accumulates_wider_and_comes_back_narrow(dtype, tol):
     q, k, v = tensors
     out, lse, *_ = _flash(q, k, v, max_q=length, max_k=length, is_causal=True)
     assert out.dtype == dtype
-    assert lse.dtype == tp.float32, "the constant is kept wider than the inputs"
+    want_lse = tp.float64 if dtype == tp.float64 else tp.float32
+    assert lse.dtype == want_lse, "the constant is kept at least as wide as float32 and as the inputs"
     keep = _triu_ish(length, length, False, q.device)
     _assert_close(
         str(dtype),
@@ -391,30 +399,61 @@ def test_gradients_reach_all_three_inputs(device):
         _assert_close(f"grad {name}", got.grad, expect.grad, 1e-9)
 
 
-@pytest.mark.parametrize(
-    "name",
-    [
-        "_flash_attention_forward",
-        "_cudnn_attention_forward",
-        "_efficient_attention_forward",
-    ],
-)
-def test_dropout_has_no_composite_here(name):
-    """Dropout needs the counter the kernels keep, not just the scaling.
+def _seeded(seed, fn):
+    tp.manual_seed(seed)
+    return fn()
 
-    A composite can rescale by ``1 / (1 - p)`` and get the expectation right
-    while getting every individual draw wrong, so the refusal stands.
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("name", ["flash", "efficient", "cudnn"])
+def test_dropout_is_replayed_by_the_backward(device, name):
+    """The positions a forward drops are a function of the seed it recorded.
+
+    With the default generator seeded the same way before every call, the
+    forward is a deterministic function of its inputs, so its derivative can be
+    taken numerically; the backward only agrees with that if it drops the same
+    positions the forward did.
     """
+    if device == "cuda" and not tp.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    dev = tp.device(device)
     generator = tp.Generator()
     generator.manual_seed(13)
-    q, k, v = (tp.randn([1, 8, 2, 16], generator=generator) for _ in range(3))
-    with pytest.raises(NotImplementedError, match="dropout"):
-        if name == "_flash_attention_forward":
-            _flash(q, k, v, max_q=8, max_k=8, dropout_p=0.1)
-        elif name == "_cudnn_attention_forward":
-            _cudnn(q, k, v, max_q=8, max_k=8, dropout_p=0.1)
+    length, heads, dim = 6, 2, 8
+    shape = [1, heads, length, dim] if name == "cudnn" else [1, length, heads, dim]
+    q, k, v = (tp.randn(shape, generator=generator, dtype=tp.float64, device=dev) for _ in range(3))
+    weight = tp.randn(shape, generator=generator, dtype=tp.float64, device=dev)
+
+    def forward(query):
+        if name == "flash":
+            out = _flash(query, k, v, max_q=length, max_k=length, dropout_p=0.3)[0]
+        elif name == "cudnn":
+            out = _cudnn(query, k, v, max_q=length, max_k=length, dropout_p=0.3)[0]
         else:
-            _efficient(q, k, v, dropout_p=0.1)
+            out = _efficient(query, k, v, dropout_p=0.3, compute_log_sumexp=True)[0]
+        return (out * weight).sum()
+
+    first = _seeded(7, lambda: forward(q))
+    again = _seeded(7, lambda: forward(q))
+    other = _seeded(8, lambda: forward(q))
+    assert first.item() == again.item(), "the same seed must drop the same positions"
+    assert first.item() != other.item(), "a different seed should drop different positions"
+    no_drop = (_ref_attention(q, k, v) if name == "cudnn" else
+               _ref_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2))
+    assert first.item() != (no_drop * weight).sum().item(), "nothing was dropped"
+
+    leaf = q.clone().requires_grad_(True)
+    _seeded(7, lambda: forward(leaf)).backward()
+    step = 1e-6
+    numeric = tp.zeros_like(q)
+    flat = numeric.view(-1)
+    for i in range(q.numel()):
+        bump = tp.zeros_like(q).view(-1)
+        bump[i] = step
+        up = _seeded(7, lambda: forward(q + bump.view(shape))).item()
+        down = _seeded(7, lambda: forward(q - bump.view(shape))).item()
+        flat[i] = (up - down) / (2 * step)
+    _assert_close("dropout gradient", leaf.grad, numeric, 1e-6)
 
 
 @pytest.mark.parametrize(
@@ -425,25 +464,46 @@ def test_dropout_has_no_composite_here(name):
         "_efficient_attention_forward",
     ],
 )
-def test_cached_and_paged_key_stores_have_no_composite(name):
-    """A cached store is an indirection, not an argument the composite can read.
+def test_a_paged_key_store_has_no_composite(name):
+    """A page table is an indirection, not an argument the composite can read.
 
-    Trimming a packed tensor to the lengths a cache says are still live is what
-    a kernel does inside a decoding step; a composite handed the same tables
-    would have to guess whether they name a prefix or a gather.
+    The pages a decoding step reads are a gather the kernel walks; a composite
+    handed the same table would have to materialize every page to read it.
     """
     generator = tp.Generator()
     generator.manual_seed(14)
     tensors = [tp.randn([1, 8, 2, 16], generator=generator) for _ in range(3)]
     q, k, v = tensors
     lengths = tp.tensor([8], dtype=tp.int32)
-    with pytest.raises(NotImplementedError, match="key lengths|seqused_k"):
+    table = tp.zeros((1, 1), dtype=tp.int32)
+    if name == "_efficient_attention_forward":
+        pytest.skip("the memory-efficient contract has no page table")
+    with pytest.raises(NotImplementedError, match="block_table"):
         if name == "_flash_attention_forward":
-            _flash(q, k, v, max_q=8, max_k=8, seqused_k=lengths)
-        elif name == "_cudnn_attention_forward":
-            _cudnn(q, k, v, max_q=8, max_k=8, seqused_k=lengths)
+            _flash(q, k, v, max_q=8, max_k=8, seqused_k=lengths, block_table=table)
         else:
-            _efficient(q, k, v, seqlen_k=lengths)
+            _cudnn(q, k, v, max_q=8, max_k=8, seqused_k=lengths, block_table=table)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_key_lengths_read_a_prefix_of_the_keys(device):
+    """Per-entry key lengths keep each batch entry to the first keys it names."""
+    if device == "cuda" and not tp.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    dev = tp.device(device)
+    generator = tp.Generator()
+    generator.manual_seed(16)
+    batch, length, heads, dim = 2, 8, 2, 16
+    q, k, v = (tp.randn([batch, length, heads, dim], generator=generator, device=dev) for _ in range(3))
+    used = tp.tensor([3, 8], dtype=tp.int32, device=dev)
+    keep = tp.arange(length, device=dev).view(1, 1, 1, length) < used.view(batch, 1, 1, 1).long()
+    want = _ref_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), keep=keep)
+    flash = _flash(q, k, v, max_q=length, max_k=length, seqused_k=used)[0]
+    efficient = _efficient(q, k, v, seqlen_k=used)[0]
+    cudnn = _cudnn(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), max_q=length, max_k=length, seqused_k=used)[0]
+    _assert_close("flash", flash, want.transpose(1, 2), 1e-5)
+    _assert_close("efficient", efficient, want.transpose(1, 2), 1e-5)
+    _assert_close("cudnn", cudnn, want, 1e-5)
 
 
 def test_low_precision_entry_points_name_the_kernel_they_need():
@@ -470,4 +530,168 @@ def test_a_rank_the_contract_does_not_take_is_named_rather_than_computed():
     with pytest.raises(ValueError, match=r"packed attention takes query as"):
         _flash(*batched, cum_q=bounds, cum_k=bounds, max_q=4, max_k=4)
     with pytest.raises(ValueError, match=r"packed attention takes key as"):
-        _cudnn(packed[0], batched[1], batched[2], cum_q=bounds, cum_k=bounds)
+        _cudnn(packed[0], batched[1], batched[2], cum_q=bounds, cum_k=bounds, max_q=4, max_k=4)
+
+
+def _sdpa_entry(name, query, key, value, *, bias=None, is_causal=False, scale=None):
+    """Call one scaled-dot-product entry point; returns (output, logsumexp, fields)."""
+    ops = tp.ops.tp
+    if name == "flash":
+        fields = ops._scaled_dot_product_flash_attention(query, key, value, 0.0, is_causal, False, scale=scale)
+    elif name == "efficient":
+        fields = ops._scaled_dot_product_efficient_attention(query, key, value, bias, True, 0.0, is_causal, scale=scale)
+    else:
+        fields = ops._scaled_dot_product_cudnn_attention(query, key, value, bias, True, 0.0, is_causal, False, scale=scale)
+    return fields[0], fields[1], fields
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("name", ["flash", "efficient", "cudnn"])
+def test_scaled_dot_product_entry_points_hand_back_their_fields(device, name):
+    """Head-major in, head-major out, with the sizes as plain integers."""
+    if device == "cuda" and not tp.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    dev = tp.device(device)
+    generator = tp.Generator()
+    generator.manual_seed(20)
+    batch, heads, length_q, length_k, dim = 2, 4, 5, 9, 16
+    q = tp.randn([batch, heads, length_q, dim], generator=generator, device=dev)
+    k = tp.randn([batch, heads, length_k, dim], generator=generator, device=dev)
+    v = tp.randn([batch, heads, length_k, dim], generator=generator, device=dev)
+    out, lse, fields = _sdpa_entry(name, q, k, v)
+    _assert_close(name, out, _ref_attention(q, k, v), 1e-5)
+    if name == "efficient":
+        assert len(fields) == 4
+        assert tuple(lse.shape) == (batch, heads, 32)
+        return
+    assert len(fields) == 9
+    # The sizes are the query and key lengths, as plain integers.
+    assert type(fields[4]) is int and type(fields[5]) is int
+    assert (fields[4], fields[5]) == (length_q, length_k)
+    # A batched call has no sequence tables to hand back.
+    assert not fields[2].defined() and not fields[3].defined()
+    want_lse = (batch, heads, length_q, 1) if name == "cudnn" else (batch, heads, length_q)
+    assert tuple(lse.shape) == want_lse
+
+
+def test_the_private_forwards_hand_back_sizes_as_plain_integers():
+    generator = tp.Generator()
+    generator.manual_seed(21)
+    q, k, v = (tp.randn([2, 7, 2, 16], generator=generator) for _ in range(3))
+    efficient = _efficient(q, k, v, compute_log_sumexp=True)
+    assert type(efficient[4]) is int and type(efficient[5]) is int
+    assert (efficient[4], efficient[5]) == (7, 7)
+    cudnn = _cudnn(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), max_q=7, max_k=7)
+    assert (cudnn[4], cudnn[5]) == (7, 7) and type(cudnn[4]) is int
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(
+    "name,is_causal,grouped,with_bias",
+    [
+        ("flash", False, False, False),
+        ("flash", True, True, False),
+        ("efficient", True, False, True),
+        ("efficient", False, True, False),
+        ("cudnn", True, False, True),
+        ("cudnn", False, False, False),
+    ],
+)
+def test_scaled_dot_product_gradients_match_the_reference(device, name, is_causal, grouped, with_bias):
+    """The backward reads the saved logsumexp; it must agree with the reference.
+
+    The lengths differ so that the causal corner matters: the flash entry point
+    keeps the lower-right one and the other two the upper-left one.
+    """
+    if device == "cuda" and not tp.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    dev = tp.device(device)
+    generator = tp.Generator()
+    generator.manual_seed(22)
+    batch, heads, length_q, length_k, dim = 2, 4, 6, 10, 8
+    heads_k = 2 if grouped else heads
+    shapes = [(batch, heads, length_q, dim), (batch, heads_k, length_k, dim), (batch, heads_k, length_k, dim)]
+    inputs = [tp.randn(list(s), generator=generator, device=dev, dtype=tp.float64) for s in shapes]
+    bias = (tp.randn([1, heads, length_q, length_k], generator=generator, device=dev, dtype=tp.float64)
+            if with_bias else None)
+    leaves = [t.clone().requires_grad_(True) for t in inputs]
+    replicas = [t.clone().requires_grad_(True) for t in inputs]
+    bias_leaf = bias.clone().requires_grad_(True) if bias is not None else None
+    bias_replica = bias.clone().requires_grad_(True) if bias is not None else None
+    out, _, _ = _sdpa_entry(name, *leaves, bias=bias_leaf, is_causal=is_causal, scale=0.3)
+    seed = tp.randn(list(out.shape), generator=generator, device=dev, dtype=tp.float64)
+    out.backward(seed)
+
+    group = heads // heads_k
+    k_ref = tp.repeat_interleave(replicas[1], group, dim=1)
+    v_ref = tp.repeat_interleave(replicas[2], group, dim=1)
+    keep = None
+    if is_causal:
+        keep = _triu_ish(length_q, length_k, name == "flash", dev)
+    scores_bias = bias_replica
+    q_ref = replicas[0].double()
+    scores = tp.matmul(q_ref * 0.3, k_ref.transpose(-2, -1))
+    if scores_bias is not None:
+        scores = scores + scores_bias
+    if keep is not None:
+        scores = scores.masked_fill(~keep, float("-inf"))
+    probs = tp.softmax(scores, -1)
+    probs = tp.where(tp.isfinite(scores).sum(-1, keepdim=True) > 0, probs, tp.zeros_like(probs))
+    want = tp.matmul(probs, v_ref)
+    _assert_close("output", out, want, 1e-10)
+    want.backward(seed)
+    for label, got, expect in zip("qkv", leaves, replicas):
+        _assert_close(f"grad {label}", got.grad, expect.grad, 1e-9)
+    if bias is not None and name == "efficient":
+        _assert_close("grad bias", bias_leaf.grad, bias_replica.grad, 1e-9)
+
+
+def test_the_efficient_backward_reduces_the_bias_gradient_to_its_shape():
+    generator = tp.Generator()
+    generator.manual_seed(23)
+    q, k, v = (tp.randn([1, 2, 4, 8], generator=generator, dtype=tp.float64) for _ in range(3))
+    bias = tp.randn([1, 1, 4, 4], generator=generator, dtype=tp.float64)
+    out, lse, seed, offset = tp.ops.tp._scaled_dot_product_efficient_attention(q, k, v, bias, True, 0.0, False)
+    grad = tp.ones_like(out)
+    grads = tp.ops.tp._scaled_dot_product_efficient_attention_backward(
+        grad, q, k, v, bias, out, lse, seed, offset, 0.0, [True, True, True, True], False
+    )
+    assert tuple(grads[3].shape) == tuple(bias.shape)
+    none_for_bias = tp.ops.tp._scaled_dot_product_efficient_attention_backward(
+        grad, q, k, v, bias, out, lse, seed, offset, 0.0, [True, True, True, False], False
+    )
+    assert not none_for_bias[3].defined()
+    _assert_close("grad q", none_for_bias[0], grads[0], 0.0)
+
+
+def test_the_overrideable_entry_point_is_for_a_backend_to_fill():
+    q = tp.zeros(1, 2, 4, 8)
+    with pytest.raises(NotImplementedError, match="registers"):
+        tp.ops.tp._scaled_dot_product_fused_attention_overrideable(q, q, q)
+
+
+@pytest.mark.skipif(not tp.cuda.is_available(), reason="CUDA unavailable")
+@pytest.mark.parametrize("dtype", [tp.float16, tp.bfloat16])
+@pytest.mark.parametrize("name", ["flash", "efficient", "cudnn"])
+def test_the_fused_schedule_and_the_composite_agree(dtype, name):
+    """Half-precision calls with a head the schedule takes run fused; the same
+    call with a bias or an odd head width runs the composite.  Both must give
+    the contract's output and constant."""
+    generator = tp.Generator()
+    generator.manual_seed(24)
+    batch, heads, length_q, length_k, dim = 2, 4, 40, 72, 64
+    dev = tp.device("cuda")
+    q = tp.randn([batch, heads, length_q, dim], generator=generator, device=dev).to(dtype)
+    k = tp.randn([batch, heads, length_k, dim], generator=generator, device=dev).to(dtype)
+    v = tp.randn([batch, heads, length_k, dim], generator=generator, device=dev).to(dtype)
+    for is_causal in (False, True):
+        out, lse, _ = _sdpa_entry(name, q, k, v, is_causal=is_causal)
+        keep = _triu_ish(length_q, length_k, name == "flash", dev) if is_causal else None
+        want = _ref_attention(q, k, v, keep=keep)
+        _assert_close(f"{name} causal={is_causal}", out, want, 2e-2)
+        scores = tp.matmul(q.double() / math.sqrt(dim), k.double().transpose(-2, -1))
+        if keep is not None:
+            scores = scores.masked_fill(~keep, float("-inf"))
+        want_lse = tp.logsumexp(scores, -1)
+        got_lse = lse[..., :length_q] if name == "efficient" else lse.reshape(batch, heads, length_q)
+        _assert_close(f"{name} constant causal={is_causal}", got_lse, want_lse, 2e-2)

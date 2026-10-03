@@ -133,6 +133,7 @@ set(P10_SOURCES
     src/backend/composite/NestedTensorComposite.cpp
     src/backend/composite/ChanelShuffle.cpp
     src/backend/composite/BaseMetaComposites.cpp
+    src/backend/composite/AttentionPrivate.cpp
     src/backend/composite/MetaView.cpp
     src/backend/composite/CompositeViewCopyKernels.cpp
     src/backend/composite/ConvolutionTBC.cpp

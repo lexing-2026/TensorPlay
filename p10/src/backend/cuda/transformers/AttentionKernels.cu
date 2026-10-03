@@ -6,6 +6,7 @@
 #include "GradMode.h"
 #include "AttentionUtils.cuh"
 #include "../composite/AttentionComposite.h"
+#include "../composite/AttentionPrivate.h"
 #include <cuda_runtime.h>
 // Tensor-core primitive API: <mma.h> on the CUDA toolchain; on HIP the
 // RDNA3 WMMA instruction backs a compatible subset (WmmaRocmCompat.cuh).
@@ -1507,13 +1508,16 @@ std::tuple<Tensor, Tensor> sdpa_fused_forward_cuda(
     const int64_t group = Hq / Hkv;
     SdpaFusedLaunch flat = launch;
     Tensor q_grouped = tpx::ops::reshape(q4, {B, Hkv, group, D});
+    Tensor grouped_lse;
+    flat.lse_out = &grouped_lse;
     auto [out, lse] = sdpa_fused_forward_cuda(q_grouped, k4, v4, flat, scale,
                                               /*enable_gqa=*/false);
     // The result already lands on query head hk * group + s, so putting the
-    // group back is a view.  Its constant has one row per group rather than
-    // one per query head, so it is left empty rather than handed back in a
-    // shape that would be read wrongly.
-    return {tpx::ops::reshape(out, {B, Hq, Tq, D}), Tensor()};
+    // group back is a view.  The constant is indexed the same way, (hk, s) for
+    // the one query row, so it reads back as (batch, query heads, 1).
+    Tensor head_lse = tpx::ops::reshape(lse, {B, Hq, Tq});
+    if (launch.lse_out) *launch.lse_out = head_lse;
+    return {tpx::ops::reshape(out, {B, Hq, Tq, D}), head_lse};
   }
 
   // The output of a packed call is the whole run of tokens, not one such run
@@ -2792,24 +2796,6 @@ bool fused_schedule_serves(const Tensor& q, const Tensor& k, const Tensor& v,
   return true;
 }
 
-// The sequence table names where each sequence starts, and the composite needs
-// that on the host to hand the schedule one sequence at a time.  The kernel
-// never needs it there -- it reads the table itself -- so this copy is on the
-// path that only a non-schedulable call takes.
-std::vector<int64_t> read_bounds(const Tensor& table) {
-  const int64_t count = table.numel();
-  TP_CHECK(table.dtype() == DType::Int32,
-           "sdpa: a cumulative-length table must be int32, got ",
-           table.dtype());
-  std::vector<int32_t> host(static_cast<size_t>(count));
-  cudaStream_t stream = getCurrentCUDAStream().stream();
-  TP_CUDA_CHECK(cudaMemcpyAsync(host.data(), table.data_ptr(),
-                                host.size() * sizeof(int32_t),
-                                cudaMemcpyDeviceToHost, stream));
-  TP_CUDA_CHECK(cudaStreamSynchronize(stream));
-  return std::vector<int64_t>(host.begin(), host.end());
-}
-
 // Whether the keys and values carry fewer heads than the query.  None of these
 // three contracts names grouped heads, but the head counts say so plainly, and
 // reading it here keeps the schedule from being handed a shape it cannot use.
@@ -2829,33 +2815,28 @@ Tensor flash_debug_mask(const Tensor& like) {
   return Tensor::empty({0}, like.dtype(), like.device());
 }
 
-// The schedule answers in the layout it computes in -- heads on the second
-// axis, and a packed batch's output written straight through the token axis as
-// the table describes it.  Each contract names its own order, so the result is
-// restated here rather than every body restating it.
-void restore_layout(Tensor* out, Tensor* lse, bool packed, bool sequence_major,
-                    int64_t total = 0, int64_t heads = 0, int64_t dim = 0) {
-  if (packed) {
-    // The kernel wrote (tokens, heads, dim) back to back; the tensor it was
-    // handed describes that run as one axis per sequence, so the buffer is
-    // read as the run it is.
-    *out = out->reshape({total, heads, dim});
-    return;
-  }
-  if (sequence_major) *out = out->transpose(1, 2);
-  // The constant is indexed by head then by token on the schedule side; the
-  // sequence-major contracts read the same pair the other way round.
-  if (lse != nullptr && lse->defined() && lse->numel() != 0 &&
-      sequence_major) {
-    *lse = lse->transpose(1, 2);
-  }
+// The schedule answers with the heads on the second axis, and a packed batch's
+// output written straight through the token axis as the table describes it.
+// Its constant is already in the layout every contract names -- (batch,
+// heads, queries), or (heads, total) when packed -- so only the output moves.
+Tensor restore_output(const Tensor& out, bool packed, bool sequence_major,
+                      int64_t total, int64_t heads, int64_t dim) {
+  if (packed) return out.reshape({total, heads, dim});
+  return sequence_major ? out.transpose(1, 2) : out;
+}
+
+// The window a top-left causal mask is on the schedule's own terms: the
+// schedule measures bounds from the lower-right diagonal, so the upper-left one
+// is a right bound of lq - lk, which is a bound only when it is not negative.
+std::optional<int64_t> top_left_causal_right(int64_t lq, int64_t lk) {
+  if (lq < lk) return std::nullopt;
+  return lq - lk;
 }
 
 // `_flash_attention_forward`: batched inputs are (batch, sequence, heads,
 // dim); a cumulative-length table means they are packed as (total, heads, dim)
-// instead.  The causal flag is the window whose right bound is zero, so a
-// caller that sets both gets the window -- which is the more specific of the
-// two and the one a named bound asks for.
+// instead.  The causal flag is the window whose right bound is zero.  What the
+// fused schedule cannot express is answered by the composite.
 std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> flash_attention_forward_cuda(
     const Tensor& query, const Tensor& key, const Tensor& value,
     const std::optional<Tensor>& cum_seq_q, const std::optional<Tensor>& cum_seq_k,
@@ -2864,133 +2845,50 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> flash_attention_forward_cuda(
     std::optional<int64_t> window_size_left, std::optional<int64_t> window_size_right,
     const std::optional<Tensor>& seqused_k, const std::optional<Tensor>& alibi_slopes,
     const std::optional<Tensor>& block_table, std::optional<int64_t> num_splits) {
-  (void)return_debug_mask;
   const bool packed = cum_seq_q.has_value();
   const int64_t left = window_size_left.value_or(-1);
-  int64_t right = is_causal ? 0 : window_size_right.value_or(-1);
-  // Causal is the window whose right bound is zero with the left unbounded;
-  // a caller that sets both has asked for the window, which is the more
-  // specific of the two.
-  if (is_causal) right = 0;
+  const int64_t right = is_causal ? 0 : window_size_right.value_or(-1);
   const bool servable =
       dropout_p == 0.0 && !seqused_k.has_value() && !alibi_slopes.has_value() &&
       !block_table.has_value() && (cum_seq_q.has_value() == cum_seq_k.has_value()) &&
       fused_schedule_serves(query, key, value, packed, query.dim());
-  if (servable) {
-    Tensor q, k, v;
-    heads_second(query, !packed, &q);
-    heads_second(key, !packed, &k);
-    heads_second(value, !packed, &v);
-    SdpaFusedLaunch launch;
-    launch.window_left = static_cast<int>(left);
-    launch.window_right = static_cast<int>(right);
-    if (packed) {
-      launch.cu_seqlens_q = cum_seq_q->data_ptr<int32_t>();
-      launch.cu_seqlens_k = cum_seq_k.has_value()
-                                ? cum_seq_k->data_ptr<int32_t>()
-                                : launch.cu_seqlens_q;
-      launch.num_seqs = cum_seq_q->size(0) - 1;
-      launch.max_seqlen_q = max_q;
-      launch.max_seqlen_k = max_k;
-    }
-    Tensor lse;
-    launch.lse_out = &lse;
-    // The caller's own count, or none for the split choice to make from the
-    // block count.  A packed batch is answered without a cut, so the count is
-    // only read on the batched path below.
-    launch.num_splits = static_cast<int>(num_splits.value_or(0));
-    Tensor out = std::get<0>(
-        sdpa_fused_forward_cuda(q, k, v, launch, scale,
-                                heads_are_grouped(q, k)));
-    restore_layout(&out, &lse, packed, /*sequence_major=*/!packed, query.size(0),
-                   query.size(1), query.size(-1));
-    return {out, lse, flash_rng_state(query), flash_empty_scalar(query),
-            flash_debug_mask(query)};
+  if (!servable) {
+    return composite::attention::flash_forward(
+        query, key, value, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p,
+        is_causal, return_debug_mask, scale, window_size_left, window_size_right,
+        seqused_k, alibi_slopes, block_table, num_splits);
   }
-  // Everything else is the composite's to answer, and it reports the constant
-  // in the layout its own scoring produces; the caller asked for a specific
-  // one, so it is restated here rather than left to be interpreted.
-  const bool sequence_major = !packed;
-  Tensor q4, k4, v4;
-  heads_second(query, sequence_major, &q4);
-  heads_second(key, sequence_major, &k4);
-  heads_second(value, sequence_major, &v4);
-  std::optional<Tensor> mask_tensor;
+  Tensor q, k, v;
+  heads_second(query, !packed, &q);
+  heads_second(key, !packed, &k);
+  heads_second(value, !packed, &v);
+  SdpaFusedLaunch launch;
+  launch.window_left = left;
+  launch.window_right = right;
   if (packed) {
-    const std::vector<int64_t> bounds_q = read_bounds(*cum_seq_q);
-    const std::vector<int64_t> bounds_k =
-        cum_seq_k.has_value() ? read_bounds(*cum_seq_k) : bounds_q;
-    TP_CHECK(bounds_q.size() == bounds_k.size(),
-             "sdpa packed: the query and key tables disagree (", bounds_q.size(),
-             " vs ", bounds_k.size(), " entries)");
-    // The window is per sequence, so the mask cannot be built once for the
-    // whole run; each sequence's is built inside the loop below.
-    return [&] {
-      std::vector<Tensor> outs;
-      std::vector<Tensor> lses;
-      for (size_t seq = 0; seq + 1 < bounds_q.size(); ++seq) {
-        const int64_t start_q = bounds_q[seq], stop_q = bounds_q[seq + 1];
-        const int64_t start_k = bounds_k[seq], stop_k = bounds_k[seq + 1];
-        if (stop_q == start_q) continue;
-        TP_CHECK(stop_k > start_k, "sdpa packed: sequence ", seq, " has ",
-                 stop_q - start_q, " queries and no keys");
-        const int64_t length_q_seq = stop_q - start_q;
-        const int64_t length_k_seq = stop_k - start_k;
-        std::optional<Tensor> seq_mask;
-        if (left >= 0 || right >= 0) {
-          seq_mask = composite::window_additive_mask(
-              length_q_seq, length_k_seq, left, right, query.dtype(),
-              query.device());
-        }
-        // A packed slice is (tokens, heads, dim); the composite scores with
-        // the head on the second axis, so the view moves it there.  That is a
-        // view, so the sequence still reads the packed buffer as it is.
-        auto slice = [](const Tensor& x, int64_t a, int64_t b) {
-          return x.slice(0, a, b).unsqueeze(0).transpose(1, 2);
-        };
-        auto [out, lse] = composite::sdpa_math_composite_with_lse(
-            slice(query, start_q, stop_q), slice(key, start_k, stop_k),
-            slice(value, start_k, stop_k), seq_mask, dropout_p,
-            /*is_causal=*/false, /*dropout_mask=*/std::nullopt, scale,
-            /*enable_gqa=*/false);
-        outs.push_back(out);
-        lses.push_back(lse);
-      }
-      Tensor out, lse;
-      if (outs.empty()) {
-        out = Tensor::empty({query.size(0), query.size(1), value.size(-1)},
-                            query.dtype(), query.device());
-        lse = Tensor::empty({query.size(1), query.size(0)}, DType::Float32,
-                            query.device());
-      } else {
-        out = tpx::ops::cat(outs, 2).reshape({query.size(0), query.size(1), value.size(-1)});
-        lse = tpx::ops::cat(lses, 2);
-      }
-      return std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor>{
-          out, lse, flash_rng_state(query), flash_empty_scalar(query),
-          flash_debug_mask(query)};
-    }();
+    launch.cu_seqlens_q = cum_seq_q->data_ptr<int32_t>();
+    launch.cu_seqlens_k = cum_seq_k->data_ptr<int32_t>();
+    launch.num_seqs = cum_seq_q->size(0) - 1;
+    launch.max_seqlen_q = max_q;
+    launch.max_seqlen_k = max_k;
   }
-  const int64_t length_q = q4.size(2);
-  const int64_t length_k = k4.size(2);
-  if (left >= 0 || right >= 0) {
-    mask_tensor = composite::window_additive_mask(
-        length_q, length_k, left, right, query.dtype(), query.device());
-  }
-  auto [out, lse] = composite::sdpa_math_composite_with_lse(
-      q4, k4, v4, mask_tensor, dropout_p, /*is_causal=*/false,
-      /*dropout_mask=*/std::nullopt, scale,
-      heads_are_grouped(query, key));
-  restore_layout(&out, &lse, packed, /*sequence_major=*/!packed, length_q,
-                 q4.size(1), q4.size(-1));
+  Tensor lse;
+  launch.lse_out = &lse;
+  // The caller's own count, or none for the split choice to make from the
+  // block count.  A packed batch is answered without a cut, so the count is
+  // only read on the batched path.
+  launch.num_splits = static_cast<int>(num_splits.value_or(0));
+  Tensor out = std::get<0>(
+      sdpa_fused_forward_cuda(q, k, v, launch, scale, heads_are_grouped(q, k)));
+  out = restore_output(out, packed, /*sequence_major=*/true, query.size(0),
+                       query.size(1), value.size(-1));
   return {out, lse, flash_rng_state(query), flash_empty_scalar(query),
           flash_debug_mask(query)};
 }
 
-// `_cudnn_attention_forward` differs from the flash-shaped one in two ways
-// only: its batched inputs are head-major, and it hands the cumulative-length
-// tables back unchanged so a caller can see which layout it got.  The rest is
-// the same schedule over the same arguments.
+// `_cudnn_attention_forward`: batched inputs are head-major and the causal
+// flag keeps the keys at or before the query index; a packed call hands its
+// tables back unchanged.
 std::tuple<Tensor, Tensor, Tensor, Tensor, SymInt, SymInt, Tensor, Tensor,
            Tensor>
 cudnn_attention_forward_cuda(
@@ -3000,69 +2898,63 @@ cudnn_attention_forward_cuda(
     bool compute_logsumexp, double dropout_p, bool is_causal,
     bool return_debug_mask, std::optional<double> scale,
     const std::optional<Tensor>& seqused_k, const std::optional<Tensor>& block_table) {
-  (void)return_debug_mask;
   const bool packed = cum_seq_q.has_value();
-  const bool windowed = false;
+  // Over a packed batch each sequence aligns its own diagonal, and the two
+  // corners agree for every sequence only when the query and key tables are
+  // one table.
+  std::optional<int64_t> causal_right;
+  if (is_causal) {
+    if (packed) {
+      if (cum_seq_k.has_value() &&
+          cum_seq_k->unsafeGetTensorImpl() == cum_seq_q->unsafeGetTensorImpl()) {
+        causal_right = 0;
+      }
+    } else if (query.dim() == 4 && key.dim() == 4) {
+      causal_right = top_left_causal_right(query.size(2), key.size(2));
+    }
+  }
   const bool servable =
       dropout_p == 0.0 && !attn_bias.has_value() && !seqused_k.has_value() &&
-      !block_table.has_value() &&
-      (cum_seq_q.has_value() == cum_seq_k.has_value()) &&
+      !block_table.has_value() && cum_seq_k.has_value() == packed &&
+      (!is_causal || causal_right.has_value()) &&
       fused_schedule_serves(query, key, value, packed, query.dim());
-  if (servable) {
-    SdpaFusedLaunch launch;
-    if (packed) {
-      launch.cu_seqlens_q = cum_seq_q->data_ptr<int32_t>();
-      launch.cu_seqlens_k = cum_seq_k.has_value()
-                                ? cum_seq_k->data_ptr<int32_t>()
-                                : launch.cu_seqlens_q;
-      launch.num_seqs = cum_seq_q->size(0) - 1;
-      launch.max_seqlen_q = max_q;
-      launch.max_seqlen_k = max_k;
-    }
-    Tensor lse;
-    if (compute_logsumexp) launch.lse_out = &lse;
-    Tensor out = std::get<0>(
-        sdpa_fused_forward_cuda(query, key, value, launch, scale,
-                                heads_are_grouped(query, key)));
-    restore_layout(&out, &lse, packed, /*sequence_major=*/false, query.size(0),
-                   query.size(1), query.size(-1));
-    if (!compute_logsumexp) {
-      lse = Tensor::empty({0}, DType::Float32, query.device());
-    }
-    Tensor echo_q = cum_seq_q.value_or(
-        Tensor::empty({0}, query.dtype(), query.device()));
-    Tensor echo_k = cum_seq_k.value_or(
-        Tensor::empty({0}, key.dtype(), key.device()));
-    return {out, lse, echo_q, echo_k, max_q, max_k,
-            Tensor::zeros({}, DType::Int64, query.device()),
-            Tensor::zeros({}, DType::Int64, query.device()),
-            flash_debug_mask(query)};
+  if (!servable) {
+    return composite::attention::cudnn_forward(
+        query, key, value, attn_bias, cum_seq_q, cum_seq_k, max_q, max_k,
+        compute_logsumexp, dropout_p, is_causal, return_debug_mask, scale,
+        seqused_k, block_table);
   }
-  Tensor q4, k4, v4;
-  heads_second(query, false, &q4);
-  heads_second(key, false, &k4);
-  heads_second(value, false, &v4);
-  auto [out, lse] = composite::sdpa_math_composite_with_lse(
-      q4, k4, v4, /*attn_mask=*/std::nullopt, dropout_p, is_causal,
-      /*dropout_mask=*/std::nullopt, scale, /*enable_gqa=*/false);
-  if (!compute_logsumexp) {
-    lse = Tensor::empty({0}, DType::Float32, query.device());
+  SdpaFusedLaunch launch;
+  launch.window_left = -1;
+  launch.window_right = causal_right.value_or(-1);
+  if (packed) {
+    launch.cu_seqlens_q = cum_seq_q->data_ptr<int32_t>();
+    launch.cu_seqlens_k = cum_seq_k->data_ptr<int32_t>();
+    launch.num_seqs = cum_seq_q->size(0) - 1;
+    launch.max_seqlen_q = max_q;
+    launch.max_seqlen_k = max_k;
   }
-  return {out, lse, Tensor::empty({0}, query.dtype(), query.device()),
-          Tensor::empty({0}, key.dtype(), key.device()),
-          packed ? query.size(0) : q4.size(2),
-          packed ? key.size(0) : k4.size(2),
+  Tensor lse;
+  if (compute_logsumexp) launch.lse_out = &lse;
+  Tensor out = std::get<0>(sdpa_fused_forward_cuda(
+      query, key, value, launch, scale, heads_are_grouped(query, key)));
+  out = restore_output(out, packed, /*sequence_major=*/false, query.size(0),
+                       query.size(1), value.size(-1));
+  if (compute_logsumexp && !packed) lse = lse.unsqueeze(-1);
+  return {out,
+          lse,
+          packed ? *cum_seq_q : Tensor(),
+          packed ? *cum_seq_k : Tensor(),
+          SymInt(packed ? max_q : query.size(2)),
+          SymInt(packed ? max_k : key.size(2)),
           Tensor::zeros({}, DType::Int64, query.device()),
           Tensor::zeros({}, DType::Int64, query.device()),
-          flash_debug_mask(query)};
+          Tensor()};
 }
 
 // `_efficient_attention_forward`: batched inputs are (batch, sequence, heads,
-// dim) like the flash-shaped one, and the mask alignment arrives as an explicit
-// code rather than as a bound.  The alignment a window can express is the one
-// the kernel derives from the two lengths, which is the lower-right corner; the
-// upper-left one is the same window with its right bound moved back by the
-// length difference, and that is how it is asked for.
+// dim) like the flash-shaped one, and the mask alignment arrives as a code.
+// Its constant is padded to a multiple of 32 queries with positive infinity.
 std::tuple<Tensor, Tensor, Tensor, Tensor, SymInt, SymInt>
 efficient_attention_forward_cuda(
     const Tensor& query, const Tensor& key, const Tensor& value,
@@ -3072,130 +2964,130 @@ efficient_attention_forward_cuda(
     double dropout_p, int64_t custom_mask_type, bool compute_log_sumexp,
     std::optional<double> scale, const std::optional<Tensor>& seqlen_k,
     std::optional<int64_t> window_size) {
-  (void)seqlen_k;
-  (void)window_size;
   const bool packed = cu_seqlens_q.has_value();
+  // The packed constant is laid out per sequence, which needs the table on the
+  // host; only a packed call that does not ask for it is left to the schedule.
+  std::optional<int64_t> right;
+  if (!packed && query.dim() == 4 && key.dim() == 4) {
+    if (custom_mask_type == composite::attention::kCausalFromTopLeft) {
+      right = top_left_causal_right(query.size(1), key.size(1));
+    } else if (custom_mask_type == composite::attention::kCausalFromBottomRight) {
+      right = 0;
+    } else if (custom_mask_type == composite::attention::kNoCustomMask) {
+      right = -1;
+    }
+  } else if (packed && !compute_log_sumexp &&
+             custom_mask_type == composite::attention::kNoCustomMask) {
+    right = -1;
+  }
+  const bool packed_rank_ok = !packed || query.dim() == 3;
+  const bool servable =
+      dropout_p == 0.0 && !bias.has_value() && !window_size.has_value() &&
+      !seqlen_k.has_value() && right.has_value() && packed_rank_ok &&
+      cu_seqlens_q.has_value() == cu_seqlens_k.has_value() &&
+      fused_schedule_serves(query, key, value, packed, query.dim());
+  if (!servable) {
+    return composite::attention::efficient_forward(
+        query, key, value, bias, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,
+        max_seqlen_k, dropout_p, custom_mask_type, compute_log_sumexp, scale,
+        seqlen_k, window_size);
+  }
   const int64_t length_q = packed ? query.size(0) : query.size(1);
   const int64_t length_k = packed ? key.size(0) : key.size(1);
   SdpaFusedLaunch launch;
-  // Alignment 1 keeps the included positions against the query index and
-  // alignment 2 against the key index; shifting the window's right bound by
-  // the length difference is what moves it from one to the other.
-  const int64_t align_shift = length_q - length_k;
-  if (custom_mask_type == 1) {
-    launch.window_left = -1;
-    launch.window_right = static_cast<int>(align_shift);
-  } else if (custom_mask_type == 2) {
-    launch.window_left = -1;
-    launch.window_right = 0;
-  } else {
-    launch.window_left = -1;
-    launch.window_right = -1;
-  }
+  launch.window_left = -1;
+  launch.window_right = *right;
   if (packed) {
     launch.cu_seqlens_q = cu_seqlens_q->data_ptr<int32_t>();
-    launch.cu_seqlens_k = cu_seqlens_k.has_value()
-                              ? cu_seqlens_k->data_ptr<int32_t>()
-                              : launch.cu_seqlens_q;
+    launch.cu_seqlens_k = cu_seqlens_k->data_ptr<int32_t>();
     launch.num_seqs = cu_seqlens_q->size(0) - 1;
     launch.max_seqlen_q = max_seqlen_q.value_or(length_q);
     launch.max_seqlen_k = max_seqlen_k.value_or(length_k);
   }
-  const bool servable =
-      dropout_p == 0.0 && !bias.has_value() && !window_size.has_value() &&
-      (cu_seqlens_q.has_value() == cu_seqlens_k.has_value()) &&
-      (custom_mask_type >= 0 && custom_mask_type <= 2) &&
-      fused_schedule_serves(query, key, value, packed, query.dim());
-  if (servable) {
-    Tensor q, k, v;
-    heads_second(query, !packed, &q);
-    heads_second(key, !packed, &k);
-    heads_second(value, !packed, &v);
-    Tensor lse;
-    if (compute_log_sumexp) launch.lse_out = &lse;
-    Tensor out = std::get<0>(
-        sdpa_fused_forward_cuda(q, k, v, launch, scale, /*enable_gqa=*/true));
-    restore_layout(&out, &lse, packed, /*sequence_major=*/!packed, query.size(0),
-                   query.size(1), query.size(-1));
-    if (!compute_log_sumexp) {
-      lse = Tensor::empty({0}, DType::Float32, query.device());
-    }
-    return {out, lse, Tensor::zeros({}, DType::Int64, query.device()),
-            Tensor::zeros({}, DType::Int64, query.device()),
-            packed ? query.size(0) : q.size(2), packed ? key.size(0) : k.size(2)};
-  }
-  // The two alignments differ by the right bound alone: moving it by the
-  // length difference is what moves the diagonal from one corner to the other.
-  std::optional<Tensor> mask_tensor;
-  if (custom_mask_type == 1) {
-    mask_tensor = composite::window_additive_mask(
-        length_q, length_k, /*left=*/-1, align_shift, query.dtype(), query.device());
-  } else if (custom_mask_type == 2) {
-    mask_tensor = composite::window_additive_mask(
-        length_q, length_k, /*left=*/-1, /*right=*/0, query.dtype(), query.device());
-  }
-  if (packed) {
-    // A packed tensor has no batch axis to score along, so the composite is
-    // asked one sequence at a time; the window each sequence sees is its own.
-    const std::vector<int64_t> bounds_q = read_bounds(*cu_seqlens_q);
-    const std::vector<int64_t> bounds_k =
-        cu_seqlens_k.has_value() ? read_bounds(*cu_seqlens_k) : bounds_q;
-    std::vector<Tensor> outs;
-    std::vector<Tensor> lses;
-    for (size_t seq = 0; seq + 1 < bounds_q.size(); ++seq) {
-      const int64_t start_q = bounds_q[seq], stop_q = bounds_q[seq + 1];
-      const int64_t start_k = bounds_k[seq], stop_k = bounds_k[seq + 1];
-      if (stop_q == start_q) continue;
-      TP_CHECK(stop_k > start_k, "sdpa packed: sequence ", seq, " has ",
-               stop_q - start_q, " queries and no keys");
-      std::optional<Tensor> seq_mask;
-      if (custom_mask_type == 1 || custom_mask_type == 2) {
-        const int64_t shift = custom_mask_type == 2
-                                  ? 0
-                                  : (stop_q - start_q) - (stop_k - start_k);
-        seq_mask = composite::window_additive_mask(
-            stop_q - start_q, stop_k - start_k, /*left=*/-1,
-            custom_mask_type == 2 ? 0 : shift, query.dtype(), query.device());
-      }
-      // A packed slice is (tokens, heads, dim); the composite scores with
-        // the head on the second axis, so the view moves it there.  That is a
-        // view, so the sequence still reads the packed buffer as it is.
-      auto slice = [](const Tensor& x, int64_t a, int64_t b) {
-        return x.slice(0, a, b).unsqueeze(0).transpose(1, 2);
-      };
-      auto [out, lse] = composite::sdpa_math_composite_with_lse(
-          slice(query, start_q, stop_q), slice(key, start_k, stop_k),
-          slice(value, start_k, stop_k), seq_mask, dropout_p,
-          /*is_causal=*/false, /*dropout_mask=*/std::nullopt, scale,
-          /*enable_gqa=*/false);
-      outs.push_back(out);
-      lses.push_back(lse);
-    }
-    Tensor out = outs.empty()
-                     ? Tensor::empty({query.size(0), query.size(1),
-                                      value.size(-1)},
-                                     query.dtype(), query.device())
-                     : tpx::ops::cat(outs, 2).reshape(
-                           {query.size(0), query.size(1), value.size(-1)});
-    Tensor lse = outs.empty()
-                     ? Tensor::empty({query.size(1), query.size(0)},
-                                     DType::Float32, query.device())
-                     : tpx::ops::cat(lses, 2);
-    if (!compute_log_sumexp) {
-      lse = Tensor::empty({0}, DType::Float32, query.device());
-    }
-    return {out, lse, Tensor::zeros({}, DType::Int64, query.device()),
-            Tensor::zeros({}, DType::Int64, query.device()), query.size(0),
-            key.size(0)};
-  }
-  auto [out, lse] = composite::sdpa_math_composite_with_lse(
-      query, key, value, mask_tensor, dropout_p, /*is_causal=*/false,
-      /*dropout_mask=*/std::nullopt, scale, /*enable_gqa=*/true);
-  if (!compute_log_sumexp) {
-    lse = Tensor::empty({0}, DType::Float32, query.device());
+  Tensor q, k, v;
+  heads_second(query, !packed, &q);
+  heads_second(key, !packed, &k);
+  heads_second(value, !packed, &v);
+  Tensor lse;
+  if (compute_log_sumexp) launch.lse_out = &lse;
+  Tensor out = std::get<0>(
+      sdpa_fused_forward_cuda(q, k, v, launch, scale, heads_are_grouped(q, k)));
+  out = restore_output(out, packed, /*sequence_major=*/true, query.size(0),
+                       query.size(1), value.size(-1));
+  const int64_t batch = packed ? cu_seqlens_q->size(0) - 1 : query.size(0);
+  const int64_t heads = packed ? query.size(1) : query.size(2);
+  if (compute_log_sumexp) {
+    Tensor padded = composite::attention::infinite(
+        {batch, heads, composite::attention::round_up_32(length_q)},
+        DType::Float32, query.device());
+    composite::attention::write_rows(padded, 2, 0, lse);
+    lse = padded;
+  } else {
+    lse = Tensor::empty({batch, heads, 0}, DType::Float32, query.device());
   }
   return {out, lse, Tensor::zeros({}, DType::Int64, query.device()),
-          Tensor::zeros({}, DType::Int64, query.device()), length_q, length_k};
+          Tensor::zeros({}, DType::Int64, query.device()),
+          SymInt(packed ? launch.max_seqlen_q : length_q),
+          SymInt(packed ? launch.max_seqlen_k : length_k)};
+}
+
+// `_flash_attention_backward`: the fused backward serves the half-precision
+// self-attention shape with 32-wide heads, no window but the causal one, and
+// the scale the head width implies; every other call is the composite's.
+std::tuple<Tensor, Tensor, Tensor> flash_attention_backward_cuda(
+    const Tensor& grad_out, const Tensor& query, const Tensor& key,
+    const Tensor& value, const Tensor& out, const Tensor& logsumexp,
+    const Tensor& cum_seq_q, const Tensor& cum_seq_k, int64_t max_q,
+    int64_t max_k, double dropout_p, bool is_causal, const Tensor& rng_state,
+    const Tensor& unused, std::optional<double> scale,
+    std::optional<int64_t> window_size_left, std::optional<int64_t> window_size_right) {
+  const int64_t left = window_size_left.value_or(-1);
+  const int64_t right = is_causal ? 0 : window_size_right.value_or(-1);
+  const bool plain_window = left < 0 && (right < 0 || right == 0);
+  const DType dt = query.dtype();
+  const bool fused =
+      grad_out.defined() && !cum_seq_q.defined() && dropout_p == 0.0 &&
+      plain_window && query.dim() == 4 && key.dim() == 4 && value.dim() == 4 &&
+      (dt == DType::Float16 || dt == DType::BFloat16) && key.dtype() == dt &&
+      value.dtype() == dt && grad_out.dtype() == dt && out.dtype() == dt &&
+      query.size(3) == 32 && key.size(3) == 32 && value.size(3) == 32 &&
+      query.size(1) == key.size(1) && query.size(2) == key.size(2) &&
+      key.shape() == value.shape() && query.shape() == out.shape() &&
+      query.shape() == grad_out.shape() && query.size(1) > 0 &&
+      logsumexp.dtype() == DType::Float32 && logsumexp.is_contiguous() &&
+      logsumexp.numel() == query.size(0) * query.size(1) * query.size(2) &&
+      (!scale.has_value() ||
+       *scale == 1.0 / std::sqrt(static_cast<double>(query.size(3))));
+  if (fused) {
+    int major = 0;
+    TP_CUDA_CHECK(cudaDeviceGetAttribute(
+        &major, cudaDevAttrComputeCapabilityMajor,
+        getCurrentCUDAStream().device_index()));
+    if (major >= 8) {
+      const bool causal = right == 0;
+      Tensor go = grad_out.transpose(1, 2), q = query.transpose(1, 2);
+      Tensor k = key.transpose(1, 2), v = value.transpose(1, 2);
+      Tensor o = out.transpose(1, 2);
+      std::tuple<Tensor, Tensor, Tensor> grads;
+      if (dt == DType::Float16) {
+        grads = causal ? sdpa_flash_backward_d32_impl<cutlass::half_t, true>(
+                             go, q, k, v, o, logsumexp)
+                       : sdpa_flash_backward_d32_impl<cutlass::half_t, false>(
+                             go, q, k, v, o, logsumexp);
+      } else {
+        grads = causal ? sdpa_flash_backward_d32_impl<cutlass::bfloat16_t, true>(
+                             go, q, k, v, o, logsumexp)
+                       : sdpa_flash_backward_d32_impl<cutlass::bfloat16_t, false>(
+                             go, q, k, v, o, logsumexp);
+      }
+      return {std::get<0>(grads).transpose(1, 2), std::get<1>(grads).transpose(1, 2),
+              std::get<2>(grads).transpose(1, 2)};
+    }
+  }
+  return composite::attention::flash_backward(
+      grad_out, query, key, value, out, logsumexp, cum_seq_q, cum_seq_k, max_q,
+      max_k, dropout_p, is_causal, rng_state, unused, scale, window_size_left,
+      window_size_right);
 }
 #endif  // TP_HAS_NATIVE_CUTE_FLASH
 
@@ -3230,6 +3122,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, AttentionKernels) {
   m.impl("_flash_attention_forward", flash_attention_forward_cuda);
   m.impl("_cudnn_attention_forward", cudnn_attention_forward_cuda);
   m.impl("_efficient_attention_forward", efficient_attention_forward_cuda);
+  m.impl("_flash_attention_backward", flash_attention_backward_cuda);
 #endif
 }
 
