@@ -81,7 +81,7 @@ void check_cuda_launch(const char* name) {
 
 }
 
-Tensor batch_norm_cuda(
+Tensor batch_norm_cudnn(
     const Tensor& input,
     const std::optional<Tensor>& weight_opt,
     const std::optional<Tensor>& bias_opt,
@@ -166,7 +166,7 @@ Tensor batch_norm_cuda(
     return output;
 }
 
-std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cuda(
+std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cudnn(
     const Tensor& grad_output,
     const Tensor& input,
     const std::optional<Tensor>& weight_opt,
@@ -292,20 +292,6 @@ std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cuda(
         grad_bias = Tensor();
     }
     return std::make_tuple(grad_input, grad_scale, grad_bias);
-}
-
-#else
-
-Tensor batch_norm_cuda(
-    const Tensor&, const std::optional<Tensor>&, const std::optional<Tensor>&,
-    const std::optional<Tensor>&, const std::optional<Tensor>&, bool, double, double) {
-    TP_THROW(NotImplementedError, "batch_norm CUDA requires cuDNN");
-}
-
-std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cuda(
-    const Tensor&, const Tensor&, const std::optional<Tensor>&,
-    const std::optional<Tensor>&, const std::optional<Tensor>&, bool, double) {
-    TP_THROW(NotImplementedError, "batch_norm_backward CUDA requires cuDNN");
 }
 
 #endif
@@ -1313,6 +1299,143 @@ Tensor batch_norm_backward_elemt_cuda(
 }
 
 }  // namespace batch_norm
+
+namespace {
+
+bool float32_or_absent(const std::optional<Tensor>& value) {
+    return !value.has_value() || !value->defined() ||
+           value->dtype() == DType::Float32;
+}
+
+// The cuDNN routines serve a float32 operand with float32 parameters.  Half
+// and bfloat16 activations (mixed precision keeps the parameters in float32),
+// double operands and the evaluation-mode gradient go through the native
+// kernels, which accumulate in the wider type.
+bool cudnn_serves(const Tensor& input, const std::optional<Tensor>& weight,
+                  const std::optional<Tensor>& bias,
+                  const std::optional<Tensor>& running_mean,
+                  const std::optional<Tensor>& running_var) {
+#ifdef USE_CUDNN
+    return input.dtype() == DType::Float32 && input.dim() >= 2 &&
+           input.dim() <= 5 && float32_or_absent(weight) &&
+           float32_or_absent(bias) && float32_or_absent(running_mean) &&
+           float32_or_absent(running_var);
+#else
+    (void)input; (void)weight; (void)bias; (void)running_mean; (void)running_var;
+    return false;
+#endif
+}
+
+// The native kernels address dense and channels-last operands directly; any
+// other arrangement is laid out densely first.
+Tensor native_operand(const Tensor& t) {
+    return batch_norm::choose_layout(t) == batch_norm::Layout::General
+        ? t.contiguous() : t;
+}
+
+// Running statistics read as the per-channel mean and reciprocal standard
+// deviation, in the accumulation type the native kernels take.
+std::tuple<Tensor, Tensor> running_statistics(
+        const Tensor& input, const std::optional<Tensor>& running_mean,
+        const std::optional<Tensor>& running_var, double eps) {
+    TP_CHECK(running_mean.has_value() && running_mean->defined() &&
+                 running_var.has_value() && running_var->defined(),
+             "batch_norm in evaluation mode requires running statistics");
+    const DType acc = batch_norm::accumulate_dtype(input.dtype());
+    Tensor mean = running_mean->to(acc);
+    Tensor invstd = ops::rsqrt(running_var->to(acc) + Scalar(eps));
+    return std::make_tuple(mean, invstd);
+}
+
+}  // namespace
+
+Tensor batch_norm_cuda(
+    const Tensor& input,
+    const std::optional<Tensor>& weight,
+    const std::optional<Tensor>& bias,
+    const std::optional<Tensor>& running_mean,
+    const std::optional<Tensor>& running_var,
+    bool training,
+    double momentum,
+    double eps) {
+#ifdef USE_CUDNN
+    if (cudnn_serves(input, weight, bias, running_mean, running_var)) {
+        return batch_norm_cudnn(input, weight, bias, running_mean, running_var,
+                                training, momentum, eps);
+    }
+#endif
+    TP_CHECK(input.dim() >= 2, "batch_norm expects an input with a channel axis");
+    const Tensor x = native_operand(input);
+    Tensor mean;
+    Tensor invstd;
+    if (training) {
+        // Batch statistics, folded into the running buffers in place.
+        Tensor var;
+        std::tie(mean, var) = batch_norm::batch_norm_update_stats_cuda(
+            x, running_mean, running_var, momentum);
+        invstd = ops::rsqrt(var + Scalar(eps));
+    } else {
+        std::tie(mean, invstd) = running_statistics(x, running_mean, running_var, eps);
+    }
+    return batch_norm::batch_norm_elemt_cuda(x, weight, bias, mean, invstd, eps);
+}
+
+std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cuda(
+    const Tensor& grad_output,
+    const Tensor& input,
+    const std::optional<Tensor>& weight,
+    const std::optional<Tensor>& running_mean,
+    const std::optional<Tensor>& running_var,
+    bool training,
+    double eps) {
+#ifdef USE_CUDNN
+    // cuDNN's backward differentiates through batch statistics, so it only
+    // answers for training mode.
+    if (training && grad_output.dtype() == DType::Float32 &&
+        cudnn_serves(input, weight, std::nullopt, running_mean, running_var)) {
+        return batch_norm_backward_cudnn(grad_output, input, weight, running_mean,
+                                         running_var, training, eps);
+    }
+#endif
+    TP_CHECK(grad_output.numel() == input.numel(),
+             "batch_norm_backward expects a gradient matching the input");
+    const Tensor x = native_operand(input);
+    const Tensor dy = native_operand(grad_output);
+    const bool has_weight = weight.has_value() && weight->defined();
+    Tensor mean;
+    Tensor invstd;
+    if (training) {
+        std::tie(mean, invstd) = batch_norm::batch_norm_stats_cuda(x, eps);
+    } else {
+        std::tie(mean, invstd) = running_statistics(x, running_mean, running_var, eps);
+    }
+    Tensor sum_dy;
+    Tensor sum_dy_xmu;
+    Tensor grad_weight;
+    Tensor grad_bias;
+    std::tie(sum_dy, sum_dy_xmu, grad_weight, grad_bias) =
+        batch_norm::batch_norm_backward_reduce_cuda(
+            dy, x, mean, invstd, weight, /*input_g=*/training,
+            /*weight_g=*/has_weight, /*bias_g=*/has_weight);
+    Tensor grad_input;
+    if (training) {
+        const int64_t per_channel = x.numel() / x.size(1);
+        Tensor count = Tensor::full({1}, Scalar(per_channel), DType::Int32, x.device());
+        grad_input = batch_norm::batch_norm_backward_elemt_cuda(
+            dy, x, mean, invstd, weight, sum_dy, sum_dy_xmu, count);
+    } else {
+        // With frozen statistics the normalization is an affine map per
+        // channel and its input gradient is dy * weight * invstd.
+        Tensor zero = Tensor::zeros({x.size(1)}, mean.dtype(), x.device());
+        grad_input = batch_norm::batch_norm_elemt_cuda(
+            dy, weight, std::nullopt, zero, invstd, eps);
+    }
+    if (!has_weight) {
+        grad_weight = Tensor();
+        grad_bias = Tensor();
+    }
+    return std::make_tuple(grad_input, grad_weight, grad_bias);
+}
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, BatchNormKernels) {
     m.impl("batch_norm", batch_norm_cuda);
