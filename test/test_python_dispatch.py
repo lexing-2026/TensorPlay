@@ -242,17 +242,20 @@ def test_composites_without_a_derivative_are_seen_through():
     assert "einsum.default" in mode.names(), mode.names()
 
 
-def test_conversions_and_reshapes_are_seen_whole_with_history():
-    # A result that may be its input or a view of it is recorded as the call
-    # the program made, history or not: its gradient reads nothing the
-    # composite would make, and a mode rewriting values by type needs the
-    # conversion rather than the copy it is made of.
-    a = tp.randn(2, 3, requires_grad=True)
+def test_conversions_are_seen_whole_and_composites_keep_history():
+    # A conversion records its own gradient node and makes its call beneath
+    # autograd, so a mode is handed the conversion itself -- one rewriting
+    # values by type needs it rather than the copy it is made of.  A
+    # composite without a derivative still runs as its composite under the
+    # mode, so its result carries history: flatten keeps the reshape it is
+    # made of, and a gradient flows through it.
+    a = tp.randn(2, 3, 2, requires_grad=True)
     with RecordingMode() as mode:
         half = a.half()
-        flat = half.float().reshape(6)
+        flat = half.float().flatten(1)
     names = mode.names()
     assert names.count("to.dtype") == 2, names
-    assert "reshape.default" in names and "copy_.default" not in names, names
+    assert "copy_.default" not in names and "flatten.using_ints" not in names, names
+    assert flat.grad_fn is not None
     flat.sum().backward()
-    assert tp.equal(a.grad, tp.ones(2, 3))
+    assert tp.equal(a.grad, tp.ones(2, 3, 2))

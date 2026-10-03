@@ -4,6 +4,7 @@
 #include "Engine.h"
 #include "InputBuffer.h"
 #include "ManualNodes.h" // For AsStridedBackward
+#include "LocalDispatchKeySet.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include "tensorplay/ops/AutogradNodesGenerated.h"
 #ifdef USE_CUDA
@@ -737,16 +738,48 @@ Tensor record_conversion(const Tensor& self, Tensor result) {
     return result;
 }
 
+namespace {
+
+// The conversion records its own node, so the call it makes runs beneath
+// autograd: nothing under it records history a second time, and a dispatch
+// mode is handed the conversion itself rather than the copy it is made of.
+struct BelowConversionAutograd {
+    tensorplay::impl::ExcludeDispatchKeyGuard guard{
+        DispatchKeySet::make(DispatchKey::AutogradCPU) |
+        DispatchKeySet::make(DispatchKey::AutogradCUDA) |
+        DispatchKeySet::make(DispatchKey::AutogradVulkan) |
+        DispatchKeySet::make(DispatchKey::AutogradSparseCPU) |
+        DispatchKeySet::make(DispatchKey::AutogradSparseCUDA) |
+        DispatchKeySet::make(DispatchKey::AutogradSparse)};
+};
+
+} // namespace
+
 Tensor to(const Tensor& self, DType dtype, bool non_blocking, bool copy) {
-    return record_conversion(self, self.to(dtype, non_blocking, copy));
+    Tensor result;
+    {
+        BelowConversionAutograd below;
+        result = self.to(dtype, non_blocking, copy);
+    }
+    return record_conversion(self, std::move(result));
 }
 
 Tensor to(const Tensor& self, Device device, bool non_blocking, bool copy) {
-    return record_conversion(self, self.to(device, non_blocking, copy));
+    Tensor result;
+    {
+        BelowConversionAutograd below;
+        result = self.to(device, non_blocking, copy);
+    }
+    return record_conversion(self, std::move(result));
 }
 
 Tensor to(const Tensor& self, Device device, DType dtype, bool non_blocking, bool copy) {
-    return record_conversion(self, self.to(device, dtype, non_blocking, copy));
+    Tensor result;
+    {
+        BelowConversionAutograd below;
+        result = self.to(device, dtype, non_blocking, copy);
+    }
+    return record_conversion(self, std::move(result));
 }
 
 } // namespace tpx
