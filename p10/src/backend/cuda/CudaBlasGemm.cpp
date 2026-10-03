@@ -658,21 +658,30 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
     }
 
     const auto self_strides = self.strides();
-    const bool self_transposed_contiguous =
-        !self.is_contiguous() && self.dim() == 2 &&
-        self_strides[0] == 1 && self_strides[1] == self.shape()[0];
-    const bool native_cublas_dtype =
-        isComplexType(self.dtype()) || self.dtype() == DType::Float16 ||
-        self.dtype() == DType::BFloat16;
+    const bool has_bias = (bias != nullptr);
+    // User-pinned backend selection.  "cublas" routes plain GEMMs through
+    // the classic API even where the heuristic would pick Lt; "cublaslt"
+    // sends half/bfloat16 products through the Lt plan path instead of the
+    // classic fast path.  A pinned choice never overrides two limits: the
+    // bias epilogue always stays on Lt (the classic API has no epilogue),
+    // and complex dtypes always stay on the classic API (Lt's complex
+    // algorithm set is not uniformly available across CUDA versions).
+    const BlasBackend pinned_blas = globalContext().blasPreferredBackend();
     // A live transpose view is already a valid column-major operand for the
-    // row-major cuBLAS trick.  Keep it in place for the native cuBLAS dtypes;
-    // materializing this view five times is the dominant cost of tall Muon's
-    // Newton-Schulz loop.  The Lt path still receives a dense copy below.
-    Tensor self_contig = self.is_contiguous()
+    // row-major cuBLAS trick, and the classic API reads it through its
+    // transpose flag: materializing it costs a read and a write of the
+    // whole operand per product -- five times per step in tall Muon's
+    // Newton-Schulz loop, once per linear layer in every weight gradient.
+    // The Lt plans here describe a row-major left operand only, so a call
+    // headed there (a bias epilogue, or Lt pinned) still gets a dense copy.
+    const bool self_kept_transposed =
+        !self.is_contiguous() && self.dim() == 2 &&
+        self_strides[0] == 1 && self_strides[1] == self.shape()[0] &&
+        (isComplexType(self.dtype()) ||
+         (!has_bias && pinned_blas != BlasBackend::Cublaslt));
+    Tensor self_contig = (self.is_contiguous() || self_kept_transposed)
         ? self
-        : (native_cublas_dtype && self_transposed_contiguous
-               ? self
-               : self.contiguous());
+        : self.contiguous();
 
     // The decoder linear layer pattern ``x @ weight.t()``: keep the weight
     // view untouched (its memory already reads as the transposed operand).
@@ -714,9 +723,9 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
         const cublasOperation_t trans_a =
             other_transposed ? CUBLAS_OP_T : CUBLAS_OP_N;
         const cublasOperation_t trans_b =
-            self_transposed_contiguous ? CUBLAS_OP_T : CUBLAS_OP_N;
+            self_kept_transposed ? CUBLAS_OP_T : CUBLAS_OP_N;
         const int lda = static_cast<int>(other_transposed ? K : N);
-        const int ldb = static_cast<int>(self_transposed_contiguous ? M : K);
+        const int ldb = static_cast<int>(self_kept_transposed ? M : K);
         CUBLAS_CHECK(cublasGemmEx(
             CUDAContext::getCublasHandle(),
             trans_a, trans_b,
@@ -734,7 +743,6 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
     // per-shape plan/autotune cost, this matters for tall Newton-Schulz
     // products where the cuBLAS reduction policy is the reference numerical
     // path.  Keep the Lt bias epilogue for vector-bias addmm below.
-    const bool has_bias = (bias != nullptr);
     // The AMD math-library port ships no real fp32/fp64 kernel set for the
     // Lt heuristic on RDNA iGPUs (measured 3-6x slower than the classic
     // API), so plain-precision GEMMs route through the classic API there
@@ -746,14 +754,6 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
 #else
     const bool prefer_classic_precision = false;
 #endif
-    // User-pinned backend selection.  "cublas" routes plain GEMMs through
-    // the classic API even where the heuristic would pick Lt; "cublaslt"
-    // sends half/bfloat16 products through the Lt plan path instead of the
-    // classic fast path.  A pinned choice never overrides two limits: the
-    // bias epilogue always stays on Lt (the classic API has no epilogue),
-    // and complex dtypes always stay on the classic API (Lt's complex
-    // algorithm set is not uniformly available across CUDA versions).
-    const BlasBackend pinned_blas = globalContext().blasPreferredBackend();
     // The custom half-precision GEMV kernels cover the memory-bound skinny
     // shapes (single vector or a small activation batch against a large
     // output axis), where the BLAS tile kernels run far below the copy
@@ -768,7 +768,7 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
     }
     if (!has_bias && pinned_blas != BlasBackend::Cublaslt &&
         (dtype == DType::Float16 || dtype == DType::BFloat16 ||
-         prefer_classic_precision)) {
+         prefer_classic_precision || self_kept_transposed)) {
         const cudaDataType_t cuda_type = to_cublas_type(dtype);
         const cublasComputeType_t compute_type = to_compute_type(dtype);
         void* alpha_ptr = to_scalar_ptr(alpha, dtype, 0);
@@ -783,7 +783,7 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
         const cublasOperation_t trans_a =
             other_transposed ? CUBLAS_OP_T : CUBLAS_OP_N;
         const cublasOperation_t trans_b =
-            self_transposed_contiguous ? CUBLAS_OP_T : CUBLAS_OP_N;
+            self_kept_transposed ? CUBLAS_OP_T : CUBLAS_OP_N;
         const int lda = static_cast<int>(other_transposed ? K : N);
         const cublasStatus_t status = cublasGemmEx(
             handle,
@@ -792,7 +792,7 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
             alpha_ptr,
             a_ptr, cuda_type, lda,
             b_ptr, cuda_type,
-            static_cast<int>(self_transposed_contiguous ? M : K),
+            static_cast<int>(self_kept_transposed ? M : K),
             beta_ptr,
             result.data_ptr(), cuda_type, static_cast<int>(N),
             compute_type,
