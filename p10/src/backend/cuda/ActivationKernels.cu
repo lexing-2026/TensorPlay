@@ -322,9 +322,11 @@ Tensor threshold_backward_kernel(const Tensor& grad_output, const Tensor& output
     }
 
     if (grad_output.dtype() != DType::Float32 &&
+        grad_output.dtype() != DType::Float64 &&
         grad_output.dtype() != DType::Float16 &&
         grad_output.dtype() != DType::BFloat16) {
-        TP_THROW(NotImplementedError, "threshold_backward: only float32/fp16/bf16 supported");
+        TP_THROW(NotImplementedError,
+                 "threshold_backward: only float32/float64/fp16/bf16 supported");
     }
 
     Tensor grad_input = Tensor::empty_like(
@@ -346,6 +348,9 @@ Tensor threshold_backward_kernel(const Tensor& grad_output, const Tensor& output
         case DType::Float32:
             run_threshold_backward_iter<float>(iter, threshold.to<float>());
             break;
+        case DType::Float64:
+            run_threshold_backward_iter<double>(iter, threshold.to<double>());
+            break;
         case DType::Float16:
             run_threshold_backward_iter<Half>(iter, threshold.to<Half>());
             break;
@@ -354,7 +359,7 @@ Tensor threshold_backward_kernel(const Tensor& grad_output, const Tensor& output
             break;
         default:
             TP_THROW(NotImplementedError,
-                     "threshold_backward: only float32/fp16/bf16 supported");
+                     "threshold_backward: only float32/float64/fp16/bf16 supported");
     }
 
     return grad_input;

@@ -350,6 +350,18 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
         }
     };
 
+    // The heuristic's fallback list: engines ranked without the instant
+    // model, including the plain ones it leaves out.
+    auto fallback_engine_configs = [](fe::OperationGraph& op_graph) {
+        auto heuristics = fe::EngineHeuristicsBuilder()
+                              .setOperationGraph(op_graph)
+                              .setHeurMode(CUDNN_HEUR_MODE_FALLBACK)
+                              .build();
+        fe::EngineConfigList configs =
+            heuristics.getEngineConfig(heuristics.getEngineConfigCount());
+        return configs;
+    };
+
     // Numerical-note based engine filter: an engine is unusable when it is
     // non-deterministic (in deterministic mode), when it down-converts the
     // inputs, or when it relies on tensor cores while TF32 is off for float32.
@@ -406,6 +418,12 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
             engine_configs = heuristics.getEngineConfig(heuristics.getEngineConfigCount());
             filtered = usable_engine_configs(engine_configs, deterministic,
                                              allow_tf32, dtype);
+        }
+        if (filtered.empty()) {
+            // The instant list can hold tensor-core engines only; the fallback
+            // list carries the plain ones a float32 call without TF32 needs.
+            fe::EngineConfigList plain = fallback_engine_configs(op_graph);
+            filtered = usable_engine_configs(plain, deterministic, allow_tf32, dtype);
         }
         if (filtered.empty()) filtered = engine_configs;
         if (!autotune || filtered.size() == 1) {
@@ -880,6 +898,18 @@ Tensor conv_transpose2d_cudnn_v8(const Tensor& input, const Tensor& weight,
             };
             fe::EngineConfigList kept;
             fe::filter(engine_configs, kept, drop);
+            if (kept.empty()) {
+                // The instant list can hold tensor-core engines only; the
+                // fallback list carries the plain ones float32 without TF32
+                // needs.
+                auto plain_heuristics = fe::EngineHeuristicsBuilder()
+                                            .setOperationGraph(op_graph)
+                                            .setHeurMode(CUDNN_HEUR_MODE_FALLBACK)
+                                            .build();
+                fe::EngineConfigList plain = plain_heuristics.getEngineConfig(
+                    plain_heuristics.getEngineConfigCount());
+                fe::filter(plain, kept, drop);
+            }
             if (kept.empty()) kept = engine_configs;
             for (auto& ec : kept) {
                 try {
@@ -1105,6 +1135,18 @@ Tensor conv2d_grad_input_cudnn_v8(const Tensor& grad_output, const Tensor& input
             };
             fe::EngineConfigList kept;
             fe::filter(engine_configs, kept, drop);
+            if (kept.empty()) {
+                // The instant list can hold tensor-core engines only; the
+                // fallback list carries the plain ones float32 without TF32
+                // needs.
+                auto plain_heuristics = fe::EngineHeuristicsBuilder()
+                                            .setOperationGraph(op_graph)
+                                            .setHeurMode(CUDNN_HEUR_MODE_FALLBACK)
+                                            .build();
+                fe::EngineConfigList plain = plain_heuristics.getEngineConfig(
+                    plain_heuristics.getEngineConfigCount());
+                fe::filter(plain, kept, drop);
+            }
             if (kept.empty()) kept = engine_configs;
             for (auto& ec : kept) {
                 try {
@@ -1314,6 +1356,18 @@ Tensor conv2d_grad_weight_cudnn_v8(const Tensor& grad_output, const Tensor& inpu
             };
             fe::EngineConfigList kept;
             fe::filter(engine_configs, kept, drop);
+            if (kept.empty()) {
+                // The instant list can hold tensor-core engines only; the
+                // fallback list carries the plain ones float32 without TF32
+                // needs.
+                auto plain_heuristics = fe::EngineHeuristicsBuilder()
+                                            .setOperationGraph(op_graph)
+                                            .setHeurMode(CUDNN_HEUR_MODE_FALLBACK)
+                                            .build();
+                fe::EngineConfigList plain = plain_heuristics.getEngineConfig(
+                    plain_heuristics.getEngineConfigCount());
+                fe::filter(plain, kept, drop);
+            }
             if (kept.empty()) kept = engine_configs;
             for (auto& ec : kept) {
                 try {
