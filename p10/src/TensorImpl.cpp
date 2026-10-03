@@ -1,5 +1,6 @@
 #include "TensorImpl.h"
 #include "Allocator.h"
+#include "Exception.h"
 #include "Storage.h"
 #include "Tensor.h"
 
@@ -27,6 +28,15 @@ TensorImpl::TensorImpl(const std::vector<int64_t>& sizes, DType dtype,
                        const Device& device, bool allocate_storage)
     : storage_offset_(0), sizes_and_strides_(sizes), dtype_(dtype), device_(device),
       is_contiguous_(true) {
+    // Every dense allocation derives its byte count from these values, so a
+    // negative entry would wrap the size_t product into a bogus (huge)
+    // allocation or an out-of-range memset rather than failing loudly.
+    for (const int64_t s : sizes) {
+        if (s < 0) {
+            TP_THROW(RuntimeError,
+                     "Trying to create tensor with negative dimension ", s);
+        }
+    }
     int64_t num_elements = sizes_and_strides_.numel();
     if (allocate_storage) {
         size_t total_bytes = static_cast<size_t>(num_elements) * elementSize(dtype);
@@ -40,7 +50,13 @@ TensorImpl::TensorImpl(const std::vector<int64_t>& sizes, const std::vector<int6
     : storage_offset_(0), sizes_and_strides_(sizes, strides), dtype_(dtype), device_(device),
       is_contiguous_(false) {
     is_contiguous_ = sizes_and_strides_.is_contiguous();
-    
+
+    for (const int64_t s : sizes) {
+        if (s < 0) {
+            TP_THROW(RuntimeError,
+                     "Trying to create tensor with negative dimension ", s);
+        }
+    }
     int64_t num_elements = sizes_and_strides_.numel();
     size_t total_bytes = static_cast<size_t>(num_elements) * elementSize(dtype);
     Allocator* allocator = getAllocator(device.type());
