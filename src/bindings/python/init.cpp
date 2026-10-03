@@ -732,10 +732,10 @@ PYBIND11_MODULE(_C, m) {
     // GraphRuntimeScope.h).  Nesting is counted, so a region entering
     // another region stays inside one scope.
     m.def("_enter_lowered_graph_scope", []() {
-        ++tensorplay::impl::lowered_graph_depth;
+        tensorplay::impl::enter_lowered_graph();
     });
     m.def("_exit_lowered_graph_scope", []() {
-        --tensorplay::impl::lowered_graph_depth;
+        tensorplay::impl::exit_lowered_graph();
     });
     m.def("_in_lowered_graph", []() {
         return tensorplay::impl::in_lowered_graph();

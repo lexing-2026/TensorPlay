@@ -219,7 +219,14 @@ def _lower_stax_region(
 
     from .loops import Debug
     from .virtualized import V as VirtualMachine
+    from tensorplay._C import (
+        _enter_lowered_graph_scope as _enter_lowered_graph_scope,
+        _exit_lowered_graph_scope as _exit_lowered_graph_scope,
+    )
 
+    # Layouts and timings asked of operators while planning are asked under
+    # the conditions the written-out code runs them in.
+    _enter_lowered_graph_scope()
     try:
         # A recorder of what was emitted is current for the whole of the
         # compilation, because both the schedule and the region's own picture
@@ -269,6 +276,8 @@ def _lower_stax_region(
                 "strict_native Stax lowering failed: captured graph has no built form"
             ) from exc
         return graph_module.recompile()
+    finally:
+        _exit_lowered_graph_scope()
     # The generated entry point takes the region's arguments as one sequence,
     # because that is how the written-out code receives them, and it hands back
     # a sequence of results for the same reason.  Everything that calls a
@@ -278,10 +287,6 @@ def _lower_stax_region(
     # produces that result, rather than a sequence holding it.
     module_call = compiled_module.call
     single_output = bool(getattr(graph, "single_output", False))
-    from tensorplay._C import (
-        _enter_lowered_graph_scope as _enter_lowered_graph_scope,
-        _exit_lowered_graph_scope as _exit_lowered_graph_scope,
-    )
     # The generated entry point takes the region's arguments as one sequence,
     # in the order the region's placeholders stand.  The artifact is reached
     # through the same signature the region was captured under, so keyword
@@ -313,10 +318,10 @@ def _lower_stax_region(
         # it is given once it has taken it -- which is how a caller that holds
         # the same values does not keep them alive for the call.
         #
-        # The call runs inside a lowered-graph scope: while the written-out
-        # code executes, the operators it hands work to may count on the
-        # region's layout planning keeping a non-default memory order dense
-        # across the whole region, which an eager caller never promises.
+        # The call runs inside a lowered-graph scope: the written-out code
+        # reads every result with the strides recorded when it was planned,
+        # so the operators it hands work to take their operands as they lie
+        # instead of repacking them into an order of their own choosing.
         _enter_lowered_graph_scope()
         try:
             result = module_call(ordered)

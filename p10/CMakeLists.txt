@@ -10,6 +10,7 @@ set(P10_SOURCES
     src/FileCheck.cpp
     src/Generator.cpp
     src/GradMode.cpp
+    src/GraphRuntimeScope.cpp
     src/InferenceMode.cpp
     src/PythonDispatchModeTLS.cpp
     src/Parallel.cpp

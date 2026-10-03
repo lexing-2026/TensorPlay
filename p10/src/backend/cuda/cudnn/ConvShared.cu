@@ -68,21 +68,20 @@ std::vector<int64_t> expand_param_if_needed(const std::vector<int64_t>& list, in
         // Reduced-precision convolution plans come in two orders: the
         // channel-major engines read their operands as they lie but ask the
         // caller to repack row-major buffers first, while the row-major
-        // engines repack internally.  Which trade pays depends on whether
-        // the surrounding execution keeps the channel-major buffers dense
-        // across calls.  A lowered graph does -- its layout planning reads
-        // and writes every value in the order it chose -- so the repack is
-        // made there and the channel-major engines are used.  Eager calls
-        // normalize back to row-major between operators, where the internal
-        // repack wins.  TP_CONV_CHANNEL_MAJOR=0 pins the row-major engines
-        // everywhere; =1 pins the channel-major ones everywhere.
-        static const int mode = [] {
+        // engines repack internally.  Repacking here also hands the result
+        // back channel-major, a layout the caller did not ask for.  A lowered
+        // graph reads every result with the strides its plan recorded for the
+        // operands it passes, so inside one the operands are taken as they
+        // lie: the plan itself passes channel-major operands where that
+        // order pays.  Eager calls normalize back to row-major between
+        // operators, where the internal repack wins; TP_CONV_CHANNEL_MAJOR=1
+        // repacks them anyway.
+        if (impl::in_lowered_graph()) return false;
+        static const bool forced = [] {
             const char* env = std::getenv("TP_CONV_CHANNEL_MAJOR");
-            if (env == nullptr || *env == '\0') return 0;  // auto
-            return std::string(env) == "0" ? -1 : 1;
+            return env != nullptr && std::string(env) == "1";
         }();
-        if (mode != 0) return mode > 0;
-        return impl::in_lowered_graph();
+        return forced;
     }
 
     bool conv_operand_repackable(const Tensor& t, bool is_weight) {
