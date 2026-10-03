@@ -107,7 +107,10 @@ struct FactoryHook {
     PyObject* wrapper;  // original Python functional wrapper (strong ref)
     PyObject* tensor_type;  // tensorplay.Tensor (strong, may be null)
     PyObject* scalar_type;  // tensorplay.Scalar (strong, may be null)
-    bool varargs;           // empty family: fold *size positionals
+    // Positional spelling each factory needs rewritten before the generated
+    // parser: variadic sizes folded into one list, a bare leading size lifted
+    // out of the fill value, or nothing at all.
+    enum class Shape { Plain, VariadicSize, FullLift } shape = Shape::Plain;
 };
 
 bool factory_trace_depth(long* out) {
@@ -136,7 +139,7 @@ PyObject* factory_trampoline(PyObject* self, PyObject* const* args,
     PyObject* owned_size = nullptr;   // list built for fold/lift conversions
     Py_ssize_t call_nargs = nargs;
     bool fold_all = false, lift_first = false, listify_single = false;
-    if (h->varargs) {
+    if (h->shape == FactoryHook::Shape::VariadicSize) {
         if (nargs != 1 || !factory_size_seq(args[0])) {
             if (nargs == 1 && PyObject_HasAttrString(args[0], "__iter__")) {
                 listify_single = true;   // generator/range-like: consume like list(x)
@@ -144,16 +147,18 @@ PyObject* factory_trampoline(PyObject* self, PyObject* const* args,
                 fold_all = true;         // *size ints (or ()) -> single list
             }
         }
-    } else if (nargs >= 1 && PyLong_Check(args[0]) && !PyBool_Check(args[0])) {
+    } else if (h->shape == FactoryHook::Shape::FullLift &&
+               nargs >= 1 && PyLong_Check(args[0]) && !PyBool_Check(args[0])) {
         lift_first = true;               // full(3, v) -> full([3], v)
     }
 
-    // full(): numbers/Tensors/Scalars go straight through; anything exotic
-    // (numpy scalars, Decimal, ...) takes the wrapper's Scalar() promotion.
-    if (!h->varargs && !lift_first && nargs >= 2 && h->tensor_type &&
-        h->scalar_type) {
+    // Fill values: numbers (Python and numpy alike), Tensors and Scalars go
+    // straight through to the generated parser; anything else falls back to
+    // the wrapper's own promotion path.
+    if (h->shape != FactoryHook::Shape::VariadicSize && !lift_first &&
+        nargs >= 2 && h->tensor_type && h->scalar_type) {
         PyObject* fv = args[nargs - 1];
-        if (!PyLong_Check(fv) && !PyFloat_Check(fv) && !PyBool_Check(fv) &&
+        if (!tensorplay::python_c::tpx_py_obj_is_number(fv) &&
             Py_TYPE(fv) != (PyTypeObject*)h->tensor_type &&
             Py_TYPE(fv) != (PyTypeObject*)h->scalar_type) {
             PyObject* r = PyObject_Vectorcall(h->wrapper, args,
@@ -228,9 +233,29 @@ PyMethodDef factory_defs[] = {
         METH_FASTCALL | METH_KEYWORDS, nullptr},
     {"full",   (PyCFunction)(void(*)(void))factory_trampoline,
         METH_FASTCALL | METH_KEYWORDS, nullptr},
+    {"eye",         (PyCFunction)(void(*)(void))factory_trampoline,
+        METH_FASTCALL | METH_KEYWORDS, nullptr},
+    {"empty_like",  (PyCFunction)(void(*)(void))factory_trampoline,
+        METH_FASTCALL | METH_KEYWORDS, nullptr},
+    {"zeros_like",  (PyCFunction)(void(*)(void))factory_trampoline,
+        METH_FASTCALL | METH_KEYWORDS, nullptr},
+    {"ones_like",   (PyCFunction)(void(*)(void))factory_trampoline,
+        METH_FASTCALL | METH_KEYWORDS, nullptr},
+    {"full_like",   (PyCFunction)(void(*)(void))factory_trampoline,
+        METH_FASTCALL | METH_KEYWORDS, nullptr},
 };
 const char* factory_names[] = {"empty", "zeros", "ones",
-                               "rand", "randn", "full"};
+                               "rand", "randn", "full",
+                               "eye", "empty_like", "zeros_like",
+                               "ones_like", "full_like"};
+
+FactoryHook::Shape factory_shape(const char* name) {
+    if (strcmp(name, "full") == 0) return FactoryHook::Shape::FullLift;
+    if (strcmp(name, "eye") == 0 || strcmp(name, "empty_like") == 0 ||
+        strcmp(name, "zeros_like") == 0 || strcmp(name, "ones_like") == 0 ||
+        strcmp(name, "full_like") == 0) return FactoryHook::Shape::Plain;
+    return FactoryHook::Shape::VariadicSize;
+}
 
 int install_factory_fast_paths_impl(py::module_& m, py::dict wrappers) {
     static bool done = false;
@@ -260,7 +285,7 @@ int install_factory_fast_paths_impl(py::module_& m, py::dict wrappers) {
         h->wrapper = Py_NewRef(w);
         h->tensor_type = tensor_type ? Py_NewRef(tensor_type) : nullptr;
         h->scalar_type = scalar_type ? Py_NewRef(scalar_type) : nullptr;
-        h->varargs = (strcmp(factory_names[i], "full") != 0);
+        h->shape = factory_shape(factory_names[i]);
 
         PyObject* cap = PyCapsule_New((void*)h, nullptr,
                                       [](PyObject* c) {

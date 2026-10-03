@@ -15790,6 +15790,8 @@ try:
     _C.install_factory_fast_paths(_C, {
         'empty': empty, 'zeros': zeros, 'ones': ones,
         'rand': rand, 'randn': randn, 'full': full,
+        'eye': eye, 'empty_like': empty_like, 'zeros_like': zeros_like,
+        'ones_like': ones_like, 'full_like': full_like,
     })
     # Adopt the C trampolines (installed as _C.<name>_fast) as the
     # public factories: eager calls skip the Python frame; captures
@@ -15800,6 +15802,11 @@ try:
     rand = _C.rand_fast
     randn = _C.randn_fast
     full = _C.full_fast
+    eye = _C.eye_fast
+    empty_like = _C.empty_like_fast
+    zeros_like = _C.zeros_like_fast
+    ones_like = _C.ones_like_fast
+    full_like = _C.full_like_fast
 except (AttributeError, TypeError):
     pass
 
