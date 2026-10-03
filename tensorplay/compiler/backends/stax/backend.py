@@ -278,6 +278,10 @@ def _lower_stax_region(
     # produces that result, rather than a sequence holding it.
     module_call = compiled_module.call
     single_output = bool(getattr(graph, "single_output", False))
+    from tensorplay._C import (
+        _enter_lowered_graph_scope as _enter_lowered_graph_scope,
+        _exit_lowered_graph_scope as _exit_lowered_graph_scope,
+    )
     # The generated entry point takes the region's arguments as one sequence,
     # in the order the region's placeholders stand.  The artifact is reached
     # through the same signature the region was captured under, so keyword
@@ -308,7 +312,16 @@ def _lower_stax_region(
         # A list rather than a tuple, because the written-out code empties what
         # it is given once it has taken it -- which is how a caller that holds
         # the same values does not keep them alive for the call.
-        result = module_call(ordered)
+        #
+        # The call runs inside a lowered-graph scope: while the written-out
+        # code executes, the operators it hands work to may count on the
+        # region's layout planning keeping a non-default memory order dense
+        # across the whole region, which an eager caller never promises.
+        _enter_lowered_graph_scope()
+        try:
+            result = module_call(ordered)
+        finally:
+            _exit_lowered_graph_scope()
         if single_output and isinstance(result, tuple) and len(result) == 1:
             return result[0]
         return result
