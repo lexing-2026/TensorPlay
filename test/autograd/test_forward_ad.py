@@ -104,6 +104,7 @@ OPS_CASES = [
     ("sin", lambda a, b: a.sin(), ((4,), (4,))),
     ("cos", lambda a, b: a.cos(), ((4,), (4,))),
     ("neg", lambda a, b: -a, ((4,), (4,))),
+    ("to", lambda a, b: a.double() * b.double(), ((4,), (4,))),
     ("abs", lambda a, b: a.abs(), ((4,), (4,))),
     ("sum", lambda a, b: a.sum(dim=0), ((4,), (4,))),
     ("mm", lambda a, b: a @ b, ((2, 2), (2, 2))),

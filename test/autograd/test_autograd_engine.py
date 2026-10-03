@@ -87,5 +87,42 @@ class TestAutogradEngine(unittest.TestCase):
         self._check_reentrant_grad(tp.device("cuda", 0))
 
 
+class TestConversion(unittest.TestCase):
+    def test_records_only_under_grad_mode(self):
+        x = tp.randn(3, requires_grad=True)
+        with tp.no_grad():
+            self.assertFalse(x.double().requires_grad)
+        with tp.inference_mode():
+            self.assertFalse(x.double().requires_grad)
+        self.assertIsNotNone(x.double().grad_fn)
+
+    def test_unchanged_conversion_is_the_input_and_a_copy_is_recorded(self):
+        x = tp.randn(3, requires_grad=True)
+        self.assertIs(x.to(tp.float32), x)
+        copied = x.to(tp.float32, copy=True)
+        self.assertIsNotNone(copied.grad_fn)
+        copied.sum().backward()
+        self.assertEqual(x.grad.tolist(), [1.0, 1.0, 1.0])
+
+    def test_integer_result_is_outside_the_graph(self):
+        x = tp.randn(3, requires_grad=True)
+        self.assertFalse(x.to(tp.int64).requires_grad)
+
+    def test_gradient_of_the_gradient(self):
+        x = tp.tensor([0.5, -1.0, 2.0], dtype=tp.float64, requires_grad=True)
+        g, = tp.autograd.grad((x.float() ** 3).sum(), x, create_graph=True)
+        self.assertEqual(g.dtype, tp.float64)
+        gg, = tp.autograd.grad(g.sum(), x)
+        self.assertEqual(gg.dtype, tp.float64)
+        for got, want in zip(gg.tolist(), [3.0, -6.0, 12.0]):
+            self.assertAlmostEqual(got, want, places=5)
+
+    def test_real_source_takes_the_real_part_of_a_complex_gradient(self):
+        x = tp.randn(3, requires_grad=True)
+        (x.to(tp.complex64) * (1 + 2j)).real.sum().backward()
+        self.assertEqual(x.grad.dtype, tp.float32)
+        self.assertEqual(x.grad.tolist(), [1.0, 1.0, 1.0])
+
+
 if __name__ == '__main__':
     unittest.main()

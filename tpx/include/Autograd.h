@@ -140,6 +140,9 @@ TENSORPLAY_API Tensor narrow(const Tensor& self, int64_t dim, int64_t start, int
 TENSORPLAY_API Tensor to(const Tensor& self, DType dtype, bool non_blocking = false, bool copy = false);
 TENSORPLAY_API Tensor to(const Tensor& self, Device device, bool non_blocking = false, bool copy = false);
 TENSORPLAY_API Tensor to(const Tensor& self, Device device, DType dtype, bool non_blocking = false, bool copy = false);
+// Records ``result`` as a dtype and/or device conversion of ``self``; the
+// conversions above and the batched conversion rules go through it.
+TENSORPLAY_API Tensor record_conversion(const Tensor& self, Tensor result);
 
 TENSORPLAY_API void backward(const Tensor& tensor, const Tensor& gradient = {}, bool retain_graph = false, bool create_graph = false);
 TENSORPLAY_API void backward(const std::vector<Tensor>& tensors, const std::vector<Tensor>& gradients = {}, bool retain_graph = false, bool create_graph = false);

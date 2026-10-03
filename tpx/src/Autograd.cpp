@@ -695,56 +695,58 @@ struct ToCopyBackward : public Node {
 
     variable_list apply(variable_list&& inputs) override {
         if (inputs.empty() || !inputs[0].defined()) return {Tensor()};
-        return {inputs[0].to(device_, dtype_)};
+        Tensor grad = inputs[0];
+        // A real source receives the real part of a complex gradient.
+        if (isComplexType(grad.dtype()) && !isComplexType(dtype_)) {
+            grad = ops::real(grad);
+        }
+        // Through the recording conversion so a second derivative sees it.
+        return {record_conversion(grad, grad.to(device_, dtype_))};
     }
 };
 
-Tensor to(const Tensor& self, DType dtype, bool non_blocking, bool copy) {
-    bool requires_grad = self.requires_grad();
-    // -- integer tensors cannot require grad, so no ToCopyBackward node is
-    // registered and the result sits outside the graph.  Letting the node
-    // through would push floating grads into the integer subgraph.
-    if (requires_grad && !isFloatingOrComplexType(dtype)) {
-        requires_grad = false;
+// Records a conversion of ``self`` into ``result``.  Only a floating or
+// complex result is differentiable; a conversion that changed nothing
+// returned ``self`` itself and has nothing to record.  The gradient flows
+// back converted to the source's dtype and device, and the tangent is
+// converted forward like the value.
+Tensor record_conversion(const Tensor& self, Tensor result) {
+    if (!result.defined() ||
+        result.unsafeGetTensorImpl() == self.unsafeGetTensorImpl() ||
+        !isFloatingOrComplexType(result.dtype())) {
+        return result;
     }
-    std::shared_ptr<Node> grad_fn;
-    if (requires_grad && (self.dtype() != dtype)) {
-        grad_fn = std::make_shared<ToCopyBackward>(self.dtype(), self.device());
+    const bool requires_grad =
+        GradMode::is_enabled() && !InferenceMode::is_enabled() &&
+        self.requires_grad() && !autograd_dispatch_excluded();
+    if (requires_grad) {
+        auto grad_fn = std::make_shared<ToCopyBackward>(self.dtype(), self.device());
         grad_fn->add_next_edge_list(collect_next_edges(self));
-    }
-    Tensor result = self.to(dtype, non_blocking, copy);
-    if (requires_grad && result.defined() && grad_fn) {
+        impl::set_requires_grad(result, true);
         impl::set_grad_fn(result, grad_fn);
     }
+    if (impl::is_fw_grad_defined(self, /* level */ 0)) {
+        Tensor tangent = impl::to_non_opt_fw_grad(self);
+        if (tangent.defined()) {
+            impl::set_fw_grad(
+                result,
+                record_conversion(tangent, tangent.to(result.device(), result.dtype())),
+                /* level */ 0, /* is_inplace_op */ false);
+        }
+    }
     return result;
+}
+
+Tensor to(const Tensor& self, DType dtype, bool non_blocking, bool copy) {
+    return record_conversion(self, self.to(dtype, non_blocking, copy));
 }
 
 Tensor to(const Tensor& self, Device device, bool non_blocking, bool copy) {
-    bool requires_grad = self.requires_grad();
-    std::shared_ptr<Node> grad_fn;
-    if (requires_grad && !(self.device() == device)) {
-        grad_fn = std::make_shared<ToCopyBackward>(self.dtype(), self.device());
-        grad_fn->add_next_edge_list(collect_next_edges(self));
-    }
-    Tensor result = self.to(device, non_blocking, copy);
-    if (requires_grad && result.defined() && grad_fn) {
-        impl::set_grad_fn(result, grad_fn);
-    }
-    return result;
+    return record_conversion(self, self.to(device, non_blocking, copy));
 }
 
 Tensor to(const Tensor& self, Device device, DType dtype, bool non_blocking, bool copy) {
-    bool requires_grad = self.requires_grad();
-    std::shared_ptr<Node> grad_fn;
-    if (requires_grad && ((self.dtype() != dtype) || !(self.device() == device))) {
-        grad_fn = std::make_shared<ToCopyBackward>(self.dtype(), self.device());
-        grad_fn->add_next_edge_list(collect_next_edges(self));
-    }
-    Tensor result = self.to(device, dtype, non_blocking, copy);
-    if (requires_grad && result.defined() && grad_fn) {
-        impl::set_grad_fn(result, grad_fn);
-    }
-    return result;
+    return record_conversion(self, self.to(device, dtype, non_blocking, copy));
 }
 
 } // namespace tpx
