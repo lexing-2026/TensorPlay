@@ -52,7 +52,9 @@ std::vector<Tensor> foreach_map_pair_inplace(std::vector<Tensor> self,
 
 bool foreach_tensor_scalar_mta_ready(const std::vector<Tensor>& self,
                                      const Tensor& other) {
-    if (!foreach_mta::eligible_list(self) || !other.defined() ||
+    // An empty list has no element to read the reference dtype from; the
+    // per-tensor fallback returns immediately for it.
+    if (self.empty() || !foreach_mta::eligible_list(self) || !other.defined() ||
         other.is_sparse() || other.dim() != 0 || other.numel() != 1 ||
         !other.is_contiguous() || other.dtype() != self.front().dtype() ||
         other.device() != self.front().device()) {
