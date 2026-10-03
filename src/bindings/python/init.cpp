@@ -15,6 +15,7 @@
 #include "OneDNNContext.h"
 #include "Profiler.h"
 #include "Graph.h"
+#include "GraphRuntimeScope.h"
 #ifdef USE_CUDA
 #include "CuFFTPlanCache.h"
 #include "CudaTunable.h"
@@ -724,6 +725,20 @@ PYBIND11_MODULE(_C, m) {
         return tensorplay::python_c::tpx_py_get_function_state() !=
                    tensorplay::python_c::TPX_ALL_DISABLED &&
                tensorplay::python_c::tpx_py_function_mode_len() != 0;
+    });
+    // Scope markers for lowered-graph execution: while a compiled region
+    // runs, the operators it calls may rely on the region's layout planning
+    // keeping a non-default memory order dense across calls (see
+    // GraphRuntimeScope.h).  Nesting is counted, so a region entering
+    // another region stays inside one scope.
+    m.def("_enter_lowered_graph_scope", []() {
+        ++tensorplay::impl::lowered_graph_depth;
+    });
+    m.def("_exit_lowered_graph_scope", []() {
+        --tensorplay::impl::lowered_graph_depth;
+    });
+    m.def("_in_lowered_graph", []() {
+        return tensorplay::impl::in_lowered_graph();
     });
 
     m.def("_get_nnpack_enabled", []() {

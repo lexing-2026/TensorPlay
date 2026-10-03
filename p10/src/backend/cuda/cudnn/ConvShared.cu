@@ -9,8 +9,10 @@
 #include "CUDNNUtils.h"
 #include "CudaGemm.h"
 #include "Allocator.h"
+#include "GraphRuntimeScope.h"
 #include <vector>
 #include <array>
+#include <cstdlib>
 #include <unordered_map>
 #include <string>
 #include <mutex>
@@ -60,6 +62,50 @@ std::vector<int64_t> expand_param_if_needed(const std::vector<int64_t>& list, in
         const auto strides = channels_last_strides(c, h, w);
         return result.as_strided(
             shape, std::vector<int64_t>(strides.begin(), strides.end()));
+    }
+
+    bool conv_channel_major_enabled() {
+        // Reduced-precision convolution plans come in two orders: the
+        // channel-major engines read their operands as they lie but ask the
+        // caller to repack row-major buffers first, while the row-major
+        // engines repack internally.  Which trade pays depends on whether
+        // the surrounding execution keeps the channel-major buffers dense
+        // across calls.  A lowered graph does -- its layout planning reads
+        // and writes every value in the order it chose -- so the repack is
+        // made there and the channel-major engines are used.  Eager calls
+        // normalize back to row-major between operators, where the internal
+        // repack wins.  TP_CONV_CHANNEL_MAJOR=0 pins the row-major engines
+        // everywhere; =1 pins the channel-major ones everywhere.
+        static const int mode = [] {
+            const char* env = std::getenv("TP_CONV_CHANNEL_MAJOR");
+            if (env == nullptr || *env == '\0') return 0;  // auto
+            return std::string(env) == "0" ? -1 : 1;
+        }();
+        if (mode != 0) return mode > 0;
+        return impl::in_lowered_graph();
+    }
+
+    bool conv_operand_repackable(const Tensor& t, bool is_weight) {
+        // Reduced-precision 4-D operands in the row-major order make the
+        // engine selection settle on plans that repack the operands around
+        // the convolution itself; the channel-major order is read as it
+        // lies.  An operand already in that order needs no work, and a
+        // single channel or a single spatial position gives both orders the
+        // same layout.
+        if (!conv_channel_major_enabled()) return false;
+        if (t.dim() != 4) return false;
+        if (t.dtype() != DType::Float16 && t.dtype() != DType::BFloat16) return false;
+        if (is_channels_last_4d(t) || !t.is_contiguous()) return false;
+        if (t.size(1) <= 1) return false;
+        if (!is_weight && t.size(2) * t.size(3) <= 1) return false;
+        return true;
+    }
+
+    Tensor conv_to_channel_major(const Tensor& t) {
+        // Same shape, channel-major strides: one repacking kernel writes the
+        // values in the order the channel-major engines read, and the
+        // trailing permutation is a view.
+        return t.permute({0, 2, 3, 1}).contiguous().permute({0, 3, 1, 2});
     }
 
 #ifdef USE_CUDNN

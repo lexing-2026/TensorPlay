@@ -33,6 +33,15 @@ bool add_channel_broadcast_inplace_cuda(Tensor& self, const Tensor& other);
 
 bool is_channels_last_4d(const Tensor& tensor);
 
+// Whether a reduced-precision 4-D operand gains from being repacked into the
+// channel-major order before a convolution reads it.  ``is_weight`` lifts the
+// single-spatial-position exclusion, which is about activations only.
+bool conv_operand_repackable(const Tensor& t, bool is_weight);
+
+// Same shape and values with channel-major strides, by way of one repacking
+// kernel.
+Tensor conv_to_channel_major(const Tensor& t);
+
 std::array<int64_t, 4> channels_last_strides(int64_t c, int64_t h, int64_t w);
 
 Tensor empty_conv_output(int64_t n, int64_t c, int64_t h, int64_t w, DType dtype,

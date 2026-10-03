@@ -1354,6 +1354,21 @@ Tensor conv2d_grad_weight_cudnn_v8(const Tensor& grad_output, const Tensor& inpu
 Tensor conv2d_cuda(const Tensor& input, const Tensor& weight, const Tensor& bias,
                    const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                    const std::vector<int64_t>& dilation, int64_t groups) {
+    // Reduced-precision ungrouped calls run in the channel-major order: the
+    // row-major plan for them interleaves repacking kernels around the
+    // convolution, while here the operands are repacked once and the result
+    // comes back in the order the plan writes it.  A bias rides inside the
+    // plan in that order instead of a separate pointwise kernel.  The
+    // graph-only conversion is compiled out where the graph path is, since
+    // the descriptor fallback spells no filter strides.
+#if defined(TP_HAS_CUDNN_FRONTEND)
+    if (groups == 1 && conv_operand_repackable(input, false) &&
+        conv_operand_repackable(weight, true)) {
+        return conv2d_cuda_impl(conv_to_channel_major(input),
+                                conv_to_channel_major(weight), bias, stride,
+                                padding, dilation, groups, false);
+    }
+#endif
     return conv2d_cuda_impl(input, weight, bias, stride, padding, dilation, groups, false);
 }
 
@@ -1364,6 +1379,14 @@ Tensor conv2d_relu_cuda(const Tensor& input, const Tensor& weight, const std::op
                         const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                         const std::vector<int64_t>& dilation, int64_t groups) {
     const Tensor bias = bias_opt.has_value() ? *bias_opt : Tensor();
+#if defined(TP_HAS_CUDNN_FRONTEND)
+    if (groups == 1 && conv_operand_repackable(input, false) &&
+        conv_operand_repackable(weight, true)) {
+        return conv2d_cuda_impl(conv_to_channel_major(input),
+                                conv_to_channel_major(weight), bias, stride,
+                                padding, dilation, groups, true);
+    }
+#endif
     return conv2d_cuda_impl(input, weight, bias, stride, padding, dilation, groups, true);
 }
 
@@ -1393,6 +1416,21 @@ Tensor conv2d_grad_input_cuda(const Tensor& grad_output, const Tensor& input, co
                         : input.contiguous();
     Tensor weight_c = weight.is_contiguous() ? weight : weight.contiguous();
 
+    // A row-major reduced-precision gradient runs the data gradient in the
+    // channel-major order: the repacks are one kernel per operand, where the
+    // row-major plan would pay for repacks around every engine read.  The
+    // data gradient then comes back in that order, dense and readable
+    // either way.  The graph path spells every operand's strides, so the
+    // channel-major filter is read as it lies; the legacy descriptor path,
+    // which spells no filter strides, renormalizes its operands below.
+    if (groups == 1 && conv_operand_repackable(grad_output_c, false)) {
+        grad_output_c = conv_to_channel_major(grad_output_c);
+    }
+    if (groups == 1 && is_channels_last_4d(grad_output_c) &&
+        conv_operand_repackable(weight_c, true)) {
+        weight_c = conv_to_channel_major(weight_c);
+    }
+
 #if defined(TP_HAS_CUDNN_FRONTEND)
     // The graph path is the primary route for the ungrouped reduced-precision
     // and float32 cases: its engine selection has no frequency-domain member,
@@ -1411,6 +1449,14 @@ Tensor conv2d_grad_input_cuda(const Tensor& grad_output, const Tensor& input, co
     if (grad_output_c.dtype() != compute_dtype) {
         grad_output_c = grad_output_c.to(compute_dtype);
     }
+
+    // The descriptor algorithms take every activation's order from the
+    // filter descriptor, which is always spelled row-major; anything still
+    // in the channel-major order here is repacked back so the descriptors
+    // name the memory they are handed.
+    if (is_channels_last_4d(grad_output_c)) grad_output_c = grad_output_c.contiguous();
+    if (is_channels_last_4d(input_c)) input_c = input_c.contiguous();
+    if (is_channels_last_4d(weight_c)) weight_c = weight_c.contiguous();
 
     cudnnHandle_t handle = CUDAContext::getCudnnHandle();
 
@@ -1541,12 +1587,22 @@ Tensor conv2d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input, c
                         : input.contiguous();
     Tensor weight_c = weight.is_contiguous() ? weight : weight.contiguous();
 
+    // The filter gradient reads both operands; running it in the
+    // channel-major order when they arrive row-major in reduced precision
+    // trades the plans' own repacking for one kernel per operand.  The
+    // gradient of the filter itself stays row-major either way.
+    if (groups == 1 && conv_operand_repackable(grad_output_c, false) &&
+        conv_operand_repackable(input_c, false)) {
+        grad_output_c = conv_to_channel_major(grad_output_c);
+        input_c = conv_to_channel_major(input_c);
+    }
+
 #if defined(TP_HAS_CUDNN_FRONTEND)
     // The graph path is the primary route for the ungrouped reduced-precision
     // and float32 cases: its engine selection has no frequency-domain member,
     // so the backward-filter gradient never pays for an FFT the legacy
-    // heuristic picks.  The legacy descriptor path remains for every shape
-    // the graph cannot express.
+    // heuristic picks.  The legacy descriptor path remains for every shape the
+    // graph cannot express.
     Tensor v8 = conv2d_grad_weight_cudnn_v8(
         grad_output_c, input_c, weight_c, stride, padding, groups, dilation);
     if (v8.defined()) {
@@ -1559,9 +1615,17 @@ Tensor conv2d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input, c
     if (grad_output_c.dtype() != compute_dtype) {
         grad_output_c = grad_output_c.to(compute_dtype);
     }
-    
+
+    // The descriptor algorithms take every activation's order from the
+    // filter descriptor, which is always spelled row-major; anything still
+    // in the channel-major order here is repacked back so the descriptors
+    // name the memory they are handed.
+    if (is_channels_last_4d(grad_output_c)) grad_output_c = grad_output_c.contiguous();
+    if (is_channels_last_4d(input_c)) input_c = input_c.contiguous();
+    if (is_channels_last_4d(weight_c)) weight_c = weight_c.contiguous();
+
     cudnnHandle_t handle = CUDAContext::getCudnnHandle();
-    
+
     auto x_desc = get_cached_tensor_desc(input_c);
     auto dy_desc = get_cached_tensor_desc(grad_output_c);
     
