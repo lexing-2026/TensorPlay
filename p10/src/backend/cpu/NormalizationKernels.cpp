@@ -630,6 +630,13 @@ static std::optional<Tensor> dense_affine(const std::optional<Tensor>& term) {
     return term->contiguous();
 }
 
+// The backward walks the input and the incoming gradient the same way, one
+// dense row per normalized group; a view laid out otherwise (a transpose
+// feeding the norm) is made into one first.
+static Tensor dense_rows(const Tensor& t) {
+    return t.is_contiguous() ? t : t.contiguous();
+}
+
 static Tensor layer_norm_cpu_impl(
         const Tensor& input, const std::vector<int64_t>& normalized_shape,
         const std::optional<Tensor>& weight_opt,
@@ -1238,10 +1245,12 @@ static std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu_reduced(
 }
 
 std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu(
-                              const Tensor& grad_output, const Tensor& input,
+                              const Tensor& grad_output_in, const Tensor& input_in,
                               const std::vector<int64_t>& normalized_shape,
                               const std::optional<Tensor>& weight_in,
                               const std::optional<Tensor>& bias_in, double eps) {
+    const Tensor grad_output = dense_rows(grad_output_in);
+    const Tensor input = dense_rows(input_in);
     const std::optional<Tensor> weight_opt = dense_affine(weight_in);
     const std::optional<Tensor> bias_opt = dense_affine(bias_in);
     switch (input.dtype()) {
@@ -1284,11 +1293,13 @@ std::tuple<Tensor, Tensor, Tensor> native_layer_norm_cpu(
 }
 
 std::tuple<Tensor, Tensor, Tensor> native_layer_norm_backward_cpu(
-        const Tensor& grad_output, const Tensor& input,
+        const Tensor& grad_output_in, const Tensor& input_in,
         const std::vector<int64_t>& normalized_shape, const Tensor& mean,
     const Tensor& rstd, const std::optional<Tensor>& weight_in,
         const std::optional<Tensor>& bias_in,
         const std::vector<bool>& output_mask) {
+    const Tensor grad_output = dense_rows(grad_output_in);
+    const Tensor input = dense_rows(input_in);
     const std::optional<Tensor> weight_opt = dense_affine(weight_in);
     const std::optional<Tensor> bias_opt = dense_affine(bias_in);
     switch (input.dtype()) {

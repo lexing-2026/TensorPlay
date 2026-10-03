@@ -43,3 +43,25 @@ def test_affine_terms_laid_out_as_views(device):
     ref.backward(grad)
     for a, c in ((x, x2), (w, w2), (b, b2)):
         assert tp.allclose(a.grad, c.grad, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_input_and_gradient_laid_out_as_views(device):
+    # A transpose feeding the norm -- the tokens of a patch embedding -- and
+    # an incoming gradient that is itself a view are read element by element.
+    tp.manual_seed(0)
+    base = tp.randn(2, 16, 5, device=device, requires_grad=True)
+    w = tp.randn(16, device=device, requires_grad=True)
+    b = tp.randn(16, device=device, requires_grad=True)
+    grad = tp.randn(2, 16, 5, device=device).transpose(1, 2)
+    out = F.layer_norm(base.transpose(1, 2), (16,), w, b)
+    got = tp.autograd.grad(out, (base, w, b), grad)
+
+    base2 = base.detach().clone().requires_grad_(True)
+    w2 = w.detach().clone().requires_grad_(True)
+    b2 = b.detach().clone().requires_grad_(True)
+    ref = F.layer_norm(base2.transpose(1, 2).contiguous(), (16,), w2, b2)
+    want = tp.autograd.grad(ref, (base2, w2, b2), grad.contiguous())
+    assert tp.allclose(out, ref, atol=1e-5)
+    for a, c in zip(got, want):
+        assert tp.allclose(a, c, atol=1e-4, rtol=1e-4)
