@@ -6922,6 +6922,19 @@ class ExternKernel(InputsKernel):
             if not exact_strides:
                 return x
 
+        # A copy an earlier caller asked for under the same arrangement is
+        # handed out again, and that caller already fixed its strides.
+        if not expanded_dims and is_storage_and_layout(x):
+            layout = x.get_layout()
+            if isinstance(layout, FixedLayout) and (
+                (order is not None and layout.is_stride_ordered(order))
+                or (
+                    exact_strides is not None
+                    and significant_strides_equal(exact_strides, layout.stride, x.get_size())
+                )
+            ):
+                return x
+
         # What is copied is a value laid out the way the caller assumed, which
         # is what arranging the strides comes down to.
         if order is not None:
