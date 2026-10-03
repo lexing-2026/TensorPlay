@@ -40,6 +40,13 @@ def _build_gm():
     return GraphModule(root, g)
 
 
+@pytest.fixture(autouse=True)
+def capture_cache_requested(monkeypatch):
+    """The capture cache is opt-in; these tests exercise it as requested."""
+
+    monkeypatch.setenv("TP_CAPTURE_CACHE", "1")
+
+
 @pytest.fixture
 def isolated_region_cache(tmp_path, monkeypatch):
     """Point the capture-region store at a fresh per-test cache root."""
@@ -217,3 +224,41 @@ def test_persistent_region_cache_keeps_gate_replay(tmp_path, monkeypatch):
         assert len(_gate_probe_runs) == 2
     finally:
         _registry.unregister_backend(backend_name)
+
+
+def test_capture_cache_is_off_unless_requested(monkeypatch):
+    monkeypatch.delenv("TP_CAPTURE_CACHE")
+    assert region_key(_mul, None, (("tensor", "f32"),)) is None
+
+
+def test_a_program_reading_a_changed_global_is_captured_again(tmp_path):
+    # The key reads the program's source and state, not the values of the
+    # globals it reads; with the cache left off a second process captures
+    # its own program instead of reloading the first one's.
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import sys
+        import tensorplay as tp
+        variant = sys.argv[1]
+        def region(x):
+            return x * 2.0 if variant == "double" else x + 1.0
+        print(tp.compile(region)(tp.tensor([1.0, 3.0])).tolist())
+        """
+    )
+    path = tmp_path / "program.py"
+    path.write_text(script)
+    env = {k: v for k, v in os.environ.items() if k != "TP_CAPTURE_CACHE"}
+    env["TP_CACHE_DIR"] = str(tmp_path / "cache")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(tp.__file__)))
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [root, env.get("PYTHONPATH")]))
+    run = lambda variant: subprocess.run(  # noqa: E731
+        [sys.executable, str(path), variant], env=env, cwd=tmp_path,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip().splitlines()[-1]
+    assert run("double") == "[2.0, 6.0]"
+    assert run("shift") == "[2.0, 4.0]"

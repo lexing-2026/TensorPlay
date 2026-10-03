@@ -24,14 +24,25 @@ The cache key covers:
 
 Stored entries keep the example tensors recorded in node metadata, so a
 loaded region looks the same to guard promotion and backends as a freshly
-captured one.  Everything here is best-effort: any load or store failure
-degrades to an ordinary capture, never to a wrong result.
+captured one.  Any load or store failure degrades to an ordinary capture.
+
+What the key cannot see is everything else the program's behavior depends
+on: the values of globals and closure cells it reads, the code it calls in
+other files (submodules defined elsewhere, helpers, the library itself in a
+development tree whose version string does not change), and process state
+such as environment flags.  A change to any of those leaves the key as it
+was, and a stored graph would answer for a program that no longer computes
+it.  So the cache is off unless ``TP_CAPTURE_CACHE=1`` asks for it, for a
+caller who knows the program is a function of its source and state alone.
+Capturing is a small part of compiling a region; the lowered code is cached
+separately, keyed by what was generated.
 """
 
 from __future__ import annotations
 
 import hashlib
 import inspect
+import os
 import pickle
 from typing import Any, Callable, Optional, Sequence
 
@@ -107,6 +118,8 @@ def region_key(
 ) -> Optional[str]:
     """The persistent cache key for one region, or ``None`` if uncachable."""
 
+    if os.environ.get("TP_CAPTURE_CACHE", "0") != "1":
+        return None
     program_stamp = _program_stamp(program)
     if program_stamp is None:
         return None
