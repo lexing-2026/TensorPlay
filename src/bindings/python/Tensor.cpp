@@ -1239,6 +1239,137 @@ static int tpx_data_set(PyObject* self_obj, PyObject* value, void*) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ``view`` behind a fastcall method descriptor.
+//
+// The call is split by argument shape before anything is parsed: a run of
+// integers -- a variadic shape or a lone -1 -- reads straight into the shape
+// vector, a dtype reinterprets the element stream, and the remaining forms
+// (a single sequence argument, the keyword forms) go through the sequence
+// caster.  The size form routes through the operation layer rather than the
+// member function of the same name: the operation records the view for
+// backward, while the member builds the alias directly and the record would
+// be lost.
+// ---------------------------------------------------------------------------
+
+static PyObject* tpx_tensor_view_call(PyObject* self_obj,
+                                      PyObject* const* args, Py_ssize_t nargs,
+                                      PyObject* kwnames) {
+    try {
+        const Tensor& self = tpx_py_tensor_cref(self_obj);
+        // Keyword values ride after the positional arguments: position i is
+        // at args[nargs + i], while nargs itself counts positionals only.
+        const Py_ssize_t nkw =
+            kwnames == nullptr ? 0 : PyTuple_GET_SIZE(kwnames);
+        const Py_ssize_t npos = nargs;
+        if (nkw > 1) {
+            PyErr_Format(PyExc_TypeError,
+                         "view(): got an unexpected keyword argument '%U'",
+                         PyTuple_GET_ITEM(kwnames, 0));
+            return nullptr;
+        }
+        if (nkw == 1) {
+            PyObject* name = PyTuple_GET_ITEM(kwnames, 0);
+            PyObject* spec = args[npos];
+            if (npos > 0) {
+                PyErr_Format(PyExc_TypeError,
+                             "view(): got multiple values for argument '%U'",
+                             name);
+                return nullptr;
+            }
+            if (PyUnicode_CompareWithASCIIString(name, "dtype") == 0) {
+                if (py::isinstance<DType>(spec) == 0) {
+                    PyErr_SetString(PyExc_TypeError,
+                                    "view(): argument 'dtype' must be a dtype");
+                    return nullptr;
+                }
+                return wrap_fresh(self.view_dtype(py::cast<DType>(spec)));
+            }
+            if (PyUnicode_CompareWithASCIIString(name, "size") == 0) {
+                if (py::isinstance<DType>(spec) != 0) {
+                    return wrap_fresh(self.view_dtype(py::cast<DType>(spec)));
+                }
+                try {
+                    return wrap_fresh(tensorplay::tpx::ops::view(
+                        self, py::cast<std::vector<int64_t>>(
+                                  py::handle(spec))));
+                } catch (const py::cast_error&) {
+                    PyErr_SetString(PyExc_TypeError,
+                                    "view(): argument 'size' must be a "
+                                    "sequence of integers");
+                    return nullptr;
+                }
+            }
+            PyErr_Format(PyExc_TypeError,
+                         "view(): got an unexpected keyword argument '%U'",
+                         name);
+            return nullptr;
+        }
+        if (npos == 1) {
+            PyObject* spec = args[0];
+            if (py::isinstance<DType>(spec) != 0) {
+                return wrap_fresh(self.view_dtype(py::cast<DType>(spec)));
+            }
+            if (PyLong_CheckExact(spec) != 0) {
+                const int64_t d = PyLong_AsLongLong(spec);
+                if (d == -1 && PyErr_Occurred() != nullptr) return nullptr;
+                return wrap_fresh(tensorplay::tpx::ops::view(
+                    self, std::vector<int64_t>{d}));
+            }
+            try {
+                return wrap_fresh(tensorplay::tpx::ops::view(
+                    self, py::cast<std::vector<int64_t>>(py::handle(spec))));
+            } catch (const py::cast_error&) {
+                // not a sequence; a lone integer-like argument follows
+            }
+            if (PyIndex_Check(spec) != 0) {
+                const int64_t d = PyLong_AsLongLong(spec);
+                if (d == -1 && PyErr_Occurred() != nullptr) return nullptr;
+                return wrap_fresh(tensorplay::tpx::ops::view(
+                    self, std::vector<int64_t>{d}));
+            }
+        }
+        std::vector<int64_t> shape;
+        shape.reserve(static_cast<size_t>(npos));
+        for (Py_ssize_t i = 0; i < npos; ++i) {
+            if (PyIndex_Check(args[i]) == 0) {
+                PyErr_Format(PyExc_TypeError,
+                             "view(): arguments must be integers, not %.200s",
+                             Py_TYPE(args[i])->tp_name);
+                return nullptr;
+            }
+            const int64_t d = PyLong_AsLongLong(args[i]);
+            if (d == -1 && PyErr_Occurred() != nullptr) return nullptr;
+            shape.push_back(d);
+        }
+        return wrap_fresh(tensorplay::tpx::ops::view(self, shape));
+    } catch (const std::exception& e) {
+        tpx_py_set_error(e);
+        return nullptr;
+    }
+}
+
+// Installs the view implementation under its name, replacing whatever the
+// type dictionary held.  A generated entry for the same name resolves the
+// size form through the member function, which drops the backward record,
+// so this install runs after it.
+inline int install_view_method(PyObject* type_obj) {
+    static PyMethodDef def = {
+        "view",
+        reinterpret_cast<PyCFunction>(
+            reinterpret_cast<void (*)()>(tpx_tensor_view_call)),
+        METH_FASTCALL | METH_KEYWORDS,
+        "view(*shape) -> Tensor\nview(dtype) -> Tensor"};
+    auto* type = reinterpret_cast<PyTypeObject*>(type_obj);
+    PyObject* descr = PyDescr_NewMethod(type, &def);
+    if (descr == nullptr) return -1;
+    int rc = PyObject_SetAttrString(type_obj, "view", descr);
+    Py_DECREF(descr);
+    if (rc != 0) return -1;
+    PyType_Modified(type);
+    return 0;
+}
+
 inline int install_property_methods(PyObject* type_obj) {
     static PyGetSetDef table[] = {
         {"dtype", tpx_dtype_get, nullptr, nullptr, nullptr},
@@ -2347,57 +2478,6 @@ void init_tensor(py::module_& m) {
         .def("size", [](const Tensor& self, int64_t dim) {
             return self.size(dim);
         })
-        // expand: served by the generated METH_FASTCALL layer (dispatcher op).
-        // ([8, 1] / Size / tuple), -1 inference, and a dtype reinterpret.
-        // Route through tpx::ops::view (NOT Tensor::view): the generated
-        // wrapper records ViewBackward; the raw method silently detaches.
-        .def("view", [](const Tensor& self, py::args args,
-                        py::kwargs kwargs) -> Tensor {
-            if (kwargs.size() > 1) {
-                throw py::type_error("view(): got an unexpected keyword argument '"
-                                   + kwargs.begin()->first.cast<std::string>() + "'");
-            }
-            if (kwargs.size() == 1) {
-                std::string name = kwargs.begin()->first.cast<std::string>();
-                if (args.size() > 0) {
-                    throw py::type_error("view(): got multiple values for argument '"
-                                          + name + "'");
-                }
-                py::object spec = kwargs[py::str(name)];
-                if (name == "dtype") {
-                    return self.view_dtype(spec.cast<DType>());
-                }
-                if (name != "size") {
-                    throw py::type_error("view(): got an unexpected keyword argument '"
-                                         + name + "'");
-                }
-                if (py::isinstance<DType>(spec)) {
-                    return self.view_dtype(spec.cast<DType>());
-                }
-                try {
-                    return tensorplay::tpx::ops::view(
-                        self, spec.cast<std::vector<int64_t>>());
-                } catch (const py::cast_error&) {
-                    throw py::type_error(
-                        "view(): argument 'size' must be a sequence of integers");
-                }
-            }
-            if (args.size() == 1) {
-                py::object spec = args[0];
-                if (py::isinstance<DType>(spec)) {
-                    return self.view_dtype(spec.cast<DType>());
-                }
-                try {
-                    return tensorplay::tpx::ops::view(self, spec.cast<std::vector<int64_t>>());
-                } catch (const py::cast_error&) {
-                    // fall through to per-arg ints below (e.g. numpy scalars)
-                }
-            }
-            std::vector<int64_t> shape;
-            shape.reserve(args.size());
-            for (auto a : args) shape.push_back(a.cast<int64_t>());
-            return tensorplay::tpx::ops::view(self, shape);
-        })
         // (CompositeImplicitAutograd -> reshape(other.shape)).
         .def("reshape_as", [](const Tensor& self, const Tensor& other) -> Tensor {
             return tensorplay::tpx::ops::reshape(
@@ -3374,6 +3454,13 @@ void init_tensor(py::module_& m) {
     }
 
     if (tensorplay::python_c::install_property_methods(tensor.ptr()) != 0) {
+        throw py::error_already_set();
+    }
+
+    // ``view`` goes in after the generated layer has had its fill: the
+    // generated entry resolves the size form through the member function,
+    // which drops the backward record.
+    if (tensorplay::python_c::install_view_method(tensor.ptr()) != 0) {
         throw py::error_already_set();
     }
 

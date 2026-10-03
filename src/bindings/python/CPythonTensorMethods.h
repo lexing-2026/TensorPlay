@@ -246,7 +246,7 @@ namespace detail {
 // is installed at.  A method descriptor is handed the value separately from
 // the arguments, while what it forwards to takes the value as its first
 // argument, so the value goes back at the front.
-inline constexpr int kForwardedMethods = 22;
+inline constexpr int kForwardedMethods = 21;
 inline PyObject* g_forwarded[kForwardedMethods];
 
 inline PyObject* forward(PyObject* impl, PyObject* self_obj,
@@ -287,7 +287,7 @@ TPX_FORWARDER(8)  TPX_FORWARDER(9)  TPX_FORWARDER(10) TPX_FORWARDER(11)
 TPX_FORWARDER(12) TPX_FORWARDER(13) TPX_FORWARDER(14) TPX_FORWARDER(15)
 TPX_FORWARDER(16) TPX_FORWARDER(17) TPX_FORWARDER(18) TPX_FORWARDER(19)
 
-TPX_FORWARDER(20) TPX_FORWARDER(21)
+TPX_FORWARDER(20)
 
 #undef TPX_FORWARDER
 
@@ -297,7 +297,7 @@ TPX_FORWARDER(20) TPX_FORWARDER(21)
 // order their names are listed.
 inline int install_forwarded_methods(PyObject* type_obj) {
     static const char* const names[] = {
-        "view", "to", "detach", "is_contiguous", "type_as",
+        "to", "detach", "is_contiguous", "type_as",
         "as_strided", "coalesce", "pin_memory", "requires_grad_", "retain_grad", "reshape_as",
         "detach_", "values", "dense_dim", "sparse_dim", "is_pinned",
         "is_floating_point", "is_coalesced", "col_indices", "crow_indices",
@@ -313,7 +313,6 @@ inline int install_forwarded_methods(PyObject* type_obj) {
         detail::forward_12, detail::forward_13, detail::forward_14,
         detail::forward_15, detail::forward_16, detail::forward_17,
         detail::forward_18, detail::forward_19, detail::forward_20,
-        detail::forward_21,
     };
     static PyMethodDef table[detail::kForwardedMethods + 1];
     static bool built = false;
