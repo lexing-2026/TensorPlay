@@ -842,6 +842,213 @@ static Tensor finish_advanced_getitem(const Tensor& self,
     return native.base;
 }
 
+namespace tensorplay { namespace python_c {
+
+// ---------------------------------------------------------------------------
+// Mapping slots behind ``t[i]`` and ``t[i] = v``.
+//
+// A subscript is asked for on every data-dependent step of a program, so the
+// type's mapping table names these implementations directly and a subscript
+// reaches this code without resolving a name in the type's dictionary first.
+// The same functions are also named ``__getitem__``/``__setitem__`` as method
+// descriptors, so the name fetched from the type is the operation itself
+// (same object across fetches, hashable) and an explicit call takes the
+// identical path.
+//
+// Index forms: a bare integer selects in dimension 0, a bare slice slices it;
+// a bool, None, Ellipsis, tensor or sequence funnels through the tuple form,
+// where the basic parts are applied as views and the advanced parts go to the
+// index operator.  A symbolic index (any object carrying a ``tracer``
+// attribute) records the indexing on its tracer's graph instead of running
+// eagerly.
+// ---------------------------------------------------------------------------
+
+// A subscript result is a fresh view or a fresh tensor every time: it is
+// never wrapped again by anyone else, so it skips the impl-keyed wrap cache,
+// which would pay a lookup plus an insertion for every result and an erase
+// when the result is dropped.
+inline PyObject* wrap_fresh(const Tensor& t) {
+    return py::cast(t).release().ptr();
+}
+
+static PyObject* tpx_tensor_getitem(PyObject* self_obj, PyObject* index) {
+    try {
+        const Tensor& self = tpx_py_tensor_cref(self_obj);
+        if (py::hasattr(index, "tracer")) {
+            py::object proxy = py::handle(index).attr("tracer").attr("create_proxy")(
+                "call_function",
+                py::module_::import("operator").attr("getitem"),
+                py::make_tuple(py::cast(self),
+                               py::reinterpret_borrow<py::object>(index)),
+                py::dict());
+            return proxy.release().ptr();
+        }
+        if (PyTuple_Check(index)) {
+            py::tuple tup = py::reinterpret_borrow<py::tuple>(index);
+            for (py::handle item : tup) {
+                if (py::hasattr(item, "tracer")) {
+                    py::object proxy = item.attr("tracer").attr("create_proxy")(
+                        "call_function",
+                        py::module_::import("operator").attr("getitem"),
+                        py::make_tuple(py::cast(self),
+                                       py::reinterpret_borrow<py::object>(index)),
+                        py::dict());
+                    return proxy.release().ptr();
+                }
+            }
+        }
+        // Tensor and sequence indices are advanced indices: basic parts
+        // (ints, slices, None, bools) apply as views first, then the
+        // remaining tensors go through the index operator.
+        if (py::isinstance<Tensor>(index) || PyList_Check(index)) {
+            return wrap_fresh(finish_advanced_getitem(
+                self,
+                make_advanced_tuple_index(
+                    self,
+                    py::make_tuple(py::reinterpret_borrow<py::object>(index)))));
+        }
+        if (PyTuple_Check(index)) {
+            return wrap_fresh(finish_advanced_getitem(
+                self, make_advanced_tuple_index(
+                          self, py::reinterpret_borrow<py::tuple>(index))));
+        }
+        if (PyBool_Check(index) || index == Py_None || index == Py_Ellipsis) {
+            return wrap_fresh(finish_advanced_getitem(
+                self,
+                make_advanced_tuple_index(
+                    self,
+                    py::make_tuple(py::reinterpret_borrow<py::object>(index)))));
+        }
+        if (PyLong_Check(index)) {
+            const int64_t dim = PyLong_AsLongLong(index);
+            if (dim == -1 && PyErr_Occurred() != nullptr) return nullptr;
+            return wrap_fresh(tensorplay::tpx::ops::select(self, 0, dim));
+        }
+        if (PySlice_Check(index)) {
+            py::slice s = py::reinterpret_borrow<py::slice>(index);
+            auto [start, stop, step, slicelength] =
+                compute_slice(s, self.size(0));
+            return wrap_fresh(
+                tensorplay::tpx::ops::slice(self, 0, start, stop, step));
+        }
+        TP_THROW(TypeError, "Unsupported index type");
+    } catch (const std::exception& e) {
+        tpx_py_set_error(e);
+        return nullptr;
+    }
+}
+
+// Assignment through the mapping slot.  Deletion (``value == nullptr``) is
+// refused: a tensor has no deletion form of subscript.  A ``False`` boolean
+// index selects nothing, so only the value's convertibility is checked.
+static int tpx_tensor_ass_subscript(PyObject* self_obj, PyObject* index,
+                                    PyObject* value) {
+    try {
+        if (value == nullptr) {
+            TP_THROW(TypeError, "Tensor does not support deleting items");
+        }
+        const Tensor& self = tpx_py_tensor_cref(self_obj);
+        if (self.is_sparse() || self.is_sparse_csr()) {
+            TP_THROW(TypeError, "Cannot assign to a sparse tensor");
+        }
+        Tensor rhs = setitem_value_to_tensor(
+            self, py::reinterpret_borrow<py::object>(value));
+        if (PyBool_Check(index) && PyObject_IsTrue(index) == 0) {
+            // A false index selects nothing; the value only has to
+            // be convertible.
+            return 0;
+        }
+        const py::tuple indices = PyTuple_Check(index)
+            ? py::reinterpret_borrow<py::tuple>(index)
+            : py::make_tuple(py::reinterpret_borrow<py::object>(index));
+        AdvancedTupleIndex native = make_advanced_tuple_index(self, indices);
+        if (!native.has_advanced) {
+            tensorplay::indexing::copy_to(native.base, rhs);
+            return 0;
+        }
+        const auto value_sizes = static_cast<std::vector<int64_t>>(rhs.shape());
+        const auto sliced_sizes = tensorplay::indexing::slicePrefix1sSize(value_sizes);
+        if (sliced_sizes != value_sizes) {
+            rhs = tensorplay::tpx::ops::view(rhs, sliced_sizes);
+        }
+        if (rhs.device() != native.base.device()) {
+            rhs = rhs.to(native.base.device());
+        }
+        tensorplay::tpx::ops::index_put_(
+            native.base, native.indices, rhs, false);
+        return 0;
+    } catch (const std::exception& e) {
+        tpx_py_set_error(e);
+        return -1;
+    }
+}
+
+// The descriptor form of assignment: a subscript descriptor is handed the
+// arguments as a vector, while the mapping slot takes them separately.
+static PyObject* tpx_tensor_setitem(PyObject* self_obj,
+                                    PyObject* const* args, Py_ssize_t nargs,
+                                    PyObject* kwnames) {
+    if (nargs != 2 || (kwnames != nullptr && PyTuple_GET_SIZE(kwnames) != 0)) {
+        PyErr_SetString(PyExc_TypeError,
+                        "__setitem__ takes exactly 2 arguments");
+        return nullptr;
+    }
+    if (tpx_tensor_ass_subscript(self_obj, args[0], args[1]) != 0) {
+        return nullptr;
+    }
+    Py_RETURN_NONE;
+}
+
+// ``len(t)`` is the extent of dimension 0; a 0-d tensor has no length.
+static Py_ssize_t tpx_tensor_length(PyObject* self_obj) {
+    try {
+        const Tensor& self = tpx_py_tensor_cref(self_obj);
+        if (self.dim() == 0) {
+            TP_THROW(TypeError, "len() of a 0-d tensor");
+        }
+        return static_cast<Py_ssize_t>(self.size(0));
+    } catch (const std::exception& e) {
+        tpx_py_set_error(e);
+        return -1;
+    }
+}
+
+// Installs subscripting on the type.  The names land in the type's dictionary
+// first (each setattr refreshes the interpreter's slot dispatchers), then the
+// mapping table is pointed straight at the implementations, so a subscript
+// takes the direct route while the dictionary names keep being descriptors.
+inline int install_indexing_methods(PyObject* type_obj) {
+    static PyMethodDef table[] = {
+        {"__getitem__",
+         reinterpret_cast<PyCFunction>(
+             reinterpret_cast<void (*)()>(tpx_tensor_getitem)),
+         METH_O, "t[i] -> Tensor"},
+        {"__setitem__",
+         reinterpret_cast<PyCFunction>(
+             reinterpret_cast<void (*)()>(tpx_tensor_setitem)),
+         METH_FASTCALL | METH_KEYWORDS, "t[i] = v"},
+        {nullptr, nullptr, 0, nullptr},
+    };
+    static PyMappingMethods mapping = {
+        tpx_tensor_length,         // mp_length
+        tpx_tensor_getitem,        // mp_subscript
+        tpx_tensor_ass_subscript,  // mp_ass_subscript
+    };
+    auto* type = reinterpret_cast<PyTypeObject*>(type_obj);
+    for (PyMethodDef* def = table; def->ml_name != nullptr; ++def) {
+        PyObject* descr = PyDescr_NewMethod(type, def);
+        if (descr == nullptr) return -1;
+        int rc = PyObject_SetAttrString(type_obj, def->ml_name, descr);
+        Py_DECREF(descr);
+        if (rc != 0) return -1;
+    }
+    type->tp_as_mapping = &mapping;
+    PyType_Modified(type);
+    return 0;
+}
+
+}}  // namespace tensorplay::python_c
+
 static std::pair<Tensor, py::dict> setstate_helper(py::tuple state) {
     // Check for shared memory tag
     if (state.size() == 8) {
@@ -2483,81 +2690,6 @@ void init_tensor(py::module_& m) {
             return py::iter(py::cast(tensorplay::tpx::ops::unbind(self, 0)));
         })
 
-        .def("__getitem__", [](const Tensor& self, py::object index) -> py::object {
-            // A symbolic index carries a graph tracer: the indexing operation
-            // is recorded on the tracer's graph instead of running eagerly.
-            if (py::hasattr(index, "tracer")) {
-                return index.attr("tracer").attr("create_proxy")(
-                    "call_function",
-                    py::module_::import("operator").attr("getitem"),
-                    py::make_tuple(py::cast(self), index),
-                    py::dict());
-            }
-            if (py::isinstance<py::tuple>(index)) {
-                py::tuple tup = py::cast<py::tuple>(index);
-                for (py::handle item : tup) {
-                    if (py::hasattr(item, "tracer")) {
-                        return item.attr("tracer").attr("create_proxy")(
-                            "call_function",
-                            py::module_::import("operator").attr("getitem"),
-                            py::make_tuple(py::cast(self), index),
-                            py::dict());
-                    }
-                }
-            }
-            // Tensor and sequence indices are advanced indices: basic parts
-            // (ints, slices, None, bools) apply as views first, then the
-            // remaining tensors go through the index operator.
-            if (py::isinstance<Tensor>(index) || py::isinstance<py::list>(index)) {
-                return py::cast(finish_advanced_getitem(
-                    self, make_advanced_tuple_index(self, py::make_tuple(index))));
-            }
-
-            if (py::isinstance<py::tuple>(index)) {
-                return py::cast(finish_advanced_getitem(
-                    self, make_advanced_tuple_index(self, py::cast<py::tuple>(index))));
-            } else if (py::isinstance<py::bool_>(index) || index.is_none() ||
-                       index.ptr() == Py_Ellipsis) {
-                return py::cast(finish_advanced_getitem(
-                    self, make_advanced_tuple_index(self, py::make_tuple(index))));
-            } else if (py::isinstance<py::int_>(index)) {
-                return py::cast(tensorplay::tpx::ops::select(self, 0, py::cast<int64_t>(index)));
-            } else if (py::isinstance<py::slice>(index)) {
-                py::slice s = py::cast<py::slice>(index);
-                auto [start, stop, step, slicelength] = compute_slice(s, self.size(0));
-                return py::cast(tensorplay::tpx::ops::slice(self, 0, start, stop, step));
-            }
-            TP_THROW(TypeError, "Unsupported index type");
-        })
-        .def("__setitem__", [](Tensor& self, py::object index, py::object value) {
-            if (self.is_sparse() || self.is_sparse_csr()) {
-                TP_THROW(TypeError, "Cannot assign to a sparse tensor");
-            }
-            Tensor rhs = setitem_value_to_tensor(self, std::move(value));
-            if (py::isinstance<py::bool_>(index) && !py::cast<bool>(index)) {
-                // A false index selects nothing; the value only has to
-                // be convertible.
-                return;
-            }
-            const py::tuple indices = py::isinstance<py::tuple>(index)
-                ? py::cast<py::tuple>(index) : py::make_tuple(index);
-            AdvancedTupleIndex native = make_advanced_tuple_index(self, indices);
-            if (!native.has_advanced) {
-                tensorplay::indexing::copy_to(native.base, rhs);
-                return;
-            }
-            const auto value_sizes = static_cast<std::vector<int64_t>>(rhs.shape());
-            const auto sliced_sizes = tensorplay::indexing::slicePrefix1sSize(value_sizes);
-            if (sliced_sizes != value_sizes) {
-                rhs = tensorplay::tpx::ops::view(rhs, sliced_sizes);
-            }
-            if (rhs.device() != native.base.device()) {
-                rhs = rhs.to(native.base.device());
-            }
-            tensorplay::tpx::ops::index_put_(
-                native.base, native.indices, rhs, false);
-        })
-        
         // Operators
         .def("__neg__", [](const Tensor& t) { return t.neg(); })
         .def("__add__", [](const Tensor& a, const Tensor& b) { return a.add(b); })
@@ -3080,6 +3212,12 @@ void init_tensor(py::module_& m) {
         throw py::error_already_set();
     }
     if (tensorplay::python_c::install_forwarded_methods(tensor.ptr()) != 0) {
+        throw py::error_already_set();
+    }
+
+    // Subscripting goes in after every other name is in place: the mapping
+    // table is the last word on how ``t[i]`` resolves.
+    if (tensorplay::python_c::install_indexing_methods(tensor.ptr()) != 0) {
         throw py::error_already_set();
     }
 }
