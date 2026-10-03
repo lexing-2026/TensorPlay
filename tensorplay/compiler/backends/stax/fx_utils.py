@@ -349,7 +349,7 @@ def _extract_subgraphs_and_args(
         # Scans accept a dim keyword, but the dimensions will be reordered so that at
         # this point we always scan over dim 0.
         # first_slice_copy tolerates a zero-length scan dim.
-        from tp._higher_order_ops.utils import first_slice_copy
+        from tensorplay._higher_order_ops.utils import first_slice_copy
 
         yield args[0], (*args[1], *(first_slice_copy(a) for a in args[2]), *args[3])
     elif node.target in (

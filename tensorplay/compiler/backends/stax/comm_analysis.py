@@ -210,9 +210,9 @@ def get_collective_input_size_bytes(node: ir.IRNode) -> int:
 
 def get_collective_group_size(node: ir.IRNode) -> int:
     if isinstance(node, ir._CollectiveKernel) and not isinstance(node, ir._WaitKernel):
-        from tp.distributed.distributed_core import _get_group_size_by_name
+        from tensorplay.distributed.distributed_core import get_world_size
 
-        return _get_group_size_by_name(node.constant_args[-1])
+        return get_world_size(node.constant_args[-1])
     else:
         raise TypeError(f"Unsupported collective type: {node}")
 
@@ -462,9 +462,9 @@ def estimate_nccl_collective_runtime_nccl_estimator(snode) -> float | None:  # t
         raise AssertionError("snode.node must not be None")
     py_kernel_name = getattr(kernel, "python_kernel_name", "")
     pg_name = kernel.constant_args[-1]  # type: ignore[attr-defined]
-    from tp.distributed.distributed_core import _resolve_process_group
+    from tensorplay.distributed.distributed_core import _resolve_group
 
-    pg = _resolve_process_group(pg_name)
+    pg = _resolve_group(pg_name)
     rank: int = tp.distributed.get_rank(pg)
     # TODO(ivankobzarev): Figure out how we can use time estimations,
     # without cuda allocations.
@@ -818,7 +818,7 @@ def estimate_nccl_collective_runtime_from_fx_node(
     Tries the NCCL simulator first (if available and enabled), falls back
     to the multi-algo/proto analytical model from tuning.cc.
     """
-    from tp.distributed.distributed_core import _get_group_size_by_name
+    from tensorplay.distributed.distributed_core import get_world_size as _get_group_size_by_name
 
     if fx_node.target is tp.ops.tp.all_to_all_single.default:
         # TODO(ivankobzarev): Temporarily disabled - NCCL estimator returns internal error.
@@ -854,11 +854,12 @@ def estimate_nccl_collective_runtime_from_fx_node(
 
     def _nccl_estimate() -> float | None:
         # TODO: Refactor with estimate_nccl_collective_runtime_nccl_estimator
-        from tp.distributed.distributed_core import _resolve_process_group, Backend
+        from tensorplay.distributed.distributed_core import _resolve_group, Backend
 
-        pg = _resolve_process_group(group_name)
-        if tp.distributed.distributed_core.get_backend(pg) == Backend.FAKE:
-            # nccl estimator requires real process group
+        pg = _resolve_group(group_name)
+        # Only a group whose collectives run through the device library can
+        # say how long one takes; any other group has nothing to ask.
+        if tp.distributed.distributed_core.get_backend(pg) != Backend.NCCL:
             return None
 
         device = tp.device("cuda")

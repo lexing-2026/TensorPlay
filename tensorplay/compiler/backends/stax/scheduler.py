@@ -6133,6 +6133,8 @@ class Scheduler:
 
         from triton.compiler.errors import CompilationError
 
+        from .templates.select_algorithm import TritonTemplateCaller
+
         why = WhyNoFuse(node1, node2)
 
         device = node_list_fused[0].get_device()
@@ -6282,7 +6284,6 @@ class Scheduler:
                     and hasattr(choice, "allowed_prologue_inps")
                     and choice.allowed_prologue_inps != multi_node.allowed_prologue_inps
                 )
-                from .templates.select_algorithm import TritonTemplateCaller
 
             def compile_without_benchmarking(
                 choice: TritonTemplateCaller,
@@ -10759,15 +10760,15 @@ class Scheduler:
 
     def _codegen(self, nodes: list[BaseSchedulerNode]) -> None:
         if config.check_stack_no_cycles_TESTING_ONLY:
-            import tp._dynamo.convert_frame
+            from . import backend as region_backend
 
             stack = traceback.extract_stack()
             seen: OrderedSet[tuple[str, int | None]] = OrderedSet()
             for frame in reversed(stack):
-                # This is where maybe_cprofile is
+                # The walk stops where the region started being lowered.
                 if (
-                    frame.name == "_compile_inner"
-                    and frame.filename == tp._dynamo.convert_frame.__file__
+                    frame.name == "_lower_stax_region"
+                    and frame.filename == region_backend.__file__
                 ):
                     break
                 key = (frame.filename, frame.lineno)

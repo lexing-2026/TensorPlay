@@ -418,8 +418,6 @@ def get_non_view_def(node: Node) -> Node:
 
 
 def should_exclude_padding_time(match: Match, arg_name: str) -> bool:
-    from tp._prims_common import is_contiguous_or_false
-
     node_def = get_non_view_def(match.kwargs[arg_name])
 
     # constant padding converts tensors to contiguous so even if the input tensor
