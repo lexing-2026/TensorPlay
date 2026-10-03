@@ -1,6 +1,7 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "CUDARuntime.h"
+#include "CudaGemm.h"
 #include "Exception.h"
 #include "Allocator.h"
 #include "GradMode.h"
@@ -1668,55 +1669,26 @@ std::tuple<Tensor, Tensor> sdpa_fused_forward_cuda(
 // than retaining every forward intermediate.
 // ---------------------------------------------------------------------------
 
-struct Sdpa4DStrides {
-  int64_t batch;
-  int64_t head;
-  int64_t token;
-  int64_t feature;
-};
-
-template <typename DT>
-__global__ void sdpa_backward_probs_kernel(
-    const DT* __restrict__ q, const DT* __restrict__ k,
-    float* __restrict__ probs, int64_t rows, int64_t H, int64_t T, int64_t D,
-    Sdpa4DStrides q_strides, Sdpa4DStrides k_strides,
-    float scale, bool is_causal) {
+// The scores arrive scaled and unmasked, one query row per block; masking and
+// normalizing them in place leaves the probability rows the gradient products
+// read.
+__global__ void sdpa_backward_softmax_rows_kernel(
+    float* __restrict__ probs, int64_t query_rows, int64_t T, bool is_causal) {
   const int64_t row = static_cast<int64_t>(blockIdx.x);
-  const int64_t total = rows * T;
-  if (row >= total) return;
-  const int64_t bh = row / T;
-  const int64_t b = bh / H;
-  const int64_t h = bh % H;
+  if (row >= query_rows) return;
   const int64_t t = row % T;
-  const DT* q_row = q + b * q_strides.batch + h * q_strides.head +
-      t * q_strides.token;
-  const DT* k_base = k + b * k_strides.batch + h * k_strides.head;
   float* p_row = probs + row * T;
-  const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
   __shared__ float reduce_smem[32];
 
-  for (int64_t kk = warp; kk < T; kk += blockDim.x / 32) {
-    if (is_causal && kk > t) {
-      if (lane == 0) p_row[kk] = -INFINITY;
-      continue;
-    }
-    float dot = 0.f;
-    const DT* k_row = k_base + kk * k_strides.token;
-    for (int64_t d = lane; d < D; d += 32)
-      dot += to_float(q_row[d * q_strides.feature]) *
-          to_float(k_row[d * k_strides.feature]);
-    for (int offset = 16; offset > 0; offset >>= 1)
-      dot += __shfl_down_sync(0xffffffffu, dot, offset);
-    if (lane == 0) p_row[kk] = dot * scale;
-  }
-  __syncthreads();
-
-  // The scores this kernel wrote are normalized in place, so what leaves it is
-  // the probability row the two consumers below read.
   float local_max = -INFINITY;
-  for (int64_t kk = threadIdx.x; kk < T; kk += blockDim.x)
-    local_max = max(local_max, p_row[kk]);
+  for (int64_t kk = threadIdx.x; kk < T; kk += blockDim.x) {
+    float score = p_row[kk];
+    if (is_causal && kk > t) {
+      score = -INFINITY;
+      p_row[kk] = score;
+    }
+    local_max = max(local_max, score);
+  }
   const float row_max = blockReduceMax(local_max, reduce_smem);
 
   float local_sum = 0.f;
@@ -1727,34 +1699,10 @@ __global__ void sdpa_backward_probs_kernel(
     local_sum += p;
   }
   const float total_exp = blockReduceSum(local_sum, reduce_smem);
+  const float inverse = total_exp > 0.f ? 1.f / total_exp : 0.f;
 
   for (int64_t kk = threadIdx.x; kk < T; kk += blockDim.x)
-    p_row[kk] = p_row[kk] / total_exp;
-}
-
-template <typename DT>
-__global__ void sdpa_backward_dprob_kernel(
-    const DT* __restrict__ grad, const DT* __restrict__ value,
-    float* __restrict__ dprob, int64_t rows, int64_t H, int64_t T, int64_t D,
-    Sdpa4DStrides grad_strides, Sdpa4DStrides value_strides) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = rows * T * T;
-  if (idx >= total) return;
-  int64_t tmp = idx;
-  const int64_t kk = tmp % T; tmp /= T;
-  const int64_t t = tmp % T; tmp /= T;
-  const int64_t bh = tmp;
-  const int64_t b = bh / H;
-  const int64_t h = bh % H;
-  const DT* g_row = grad + b * grad_strides.batch + h * grad_strides.head +
-      t * grad_strides.token;
-  const DT* v_row = value + b * value_strides.batch + h * value_strides.head +
-      kk * value_strides.token;
-  float dot = 0.f;
-  for (int64_t d = 0; d < D; ++d)
-    dot += to_float(g_row[d * grad_strides.feature]) *
-        to_float(v_row[d * value_strides.feature]);
-  dprob[idx] = dot;
+    p_row[kk] = p_row[kk] * inverse;
 }
 
 // The row statistic that the score gradient subtracts.  Written once per query
@@ -1776,145 +1724,92 @@ __global__ void sdpa_backward_delta_kernel(
   delta[r] = blockReduceSum(local, reduce_smem);
 }
 
-// dS[t, j] = P[t, j] * (dP[t, j] - delta[t]).  The row statistic arrives
-// already reduced, so this pass is the score matrix and nothing else.
+// dS[t, j] = P[t, j] * (dP[t, j] - delta[t]), written over dP: each element is
+// read and then written by the one thread that owns it, so the two pointers
+// may name the same memory and neither is declared unaliased.
 __global__ void sdpa_backward_dscore_kernel(
-    const float* __restrict__ probs, const float* __restrict__ dprob,
-    const float* __restrict__ delta, float* __restrict__ dscore, int64_t rows,
+    const float* __restrict__ probs, const float* dprob,
+    const float* __restrict__ delta, float* dscore, int64_t rows,
     int64_t T, float scale) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t total = rows * T * T;
   if (idx >= total) return;
-  int64_t tmp = idx;
-  const int64_t kk = tmp % T; tmp /= T;
-  const int64_t t = tmp % T; tmp /= T;
-  const int64_t bh = tmp;
-  const float* p_row = probs + (bh * T + t) * T;
-  const float* dp_row = dprob + (bh * T + t) * T;
-  dscore[idx] = p_row[kk] * (dp_row[kk] - delta[bh * T + t]) * scale;
+  const int64_t query_row = idx / T;
+  dscore[idx] = probs[idx] * (dprob[idx] - delta[query_row]) * scale;
 }
 
-template <typename DT>
-__global__ void sdpa_backward_dq_kernel(
-    const float* __restrict__ dscore, const DT* __restrict__ key,
-    DT* __restrict__ grad_q, int64_t rows, int64_t H, int64_t T, int64_t D,
-    Sdpa4DStrides key_strides) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = rows * T * D;
-  if (idx >= total) return;
-  int64_t tmp = idx;
-  const int64_t d = tmp % D; tmp /= D;
-  const int64_t t = tmp % T; tmp /= T;
-  const int64_t bh = tmp;
-  const int64_t b = bh / H;
-  const int64_t h = bh % H;
-  float acc = 0.f;
-  const DT* k_base = key + b * key_strides.batch + h * key_strides.head;
-  for (int64_t kk = 0; kk < T; ++kk)
-    acc += dscore[(bh * T + t) * T + kk] *
-        to_float(k_base[kk * key_strides.token + d * key_strides.feature]);
-  grad_q[idx] = from_float<DT>(acc);
-}
-
-template <typename DT>
-__global__ void sdpa_backward_dk_kernel(
-    const float* __restrict__ dscore, const DT* __restrict__ query,
-    DT* __restrict__ grad_k, int64_t rows, int64_t H, int64_t T, int64_t D,
-    Sdpa4DStrides query_strides) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = rows * T * D;
-  if (idx >= total) return;
-  int64_t tmp = idx;
-  const int64_t d = tmp % D; tmp /= D;
-  const int64_t kk = tmp % T; tmp /= T;
-  const int64_t bh = tmp;
-  const int64_t b = bh / H;
-  const int64_t h = bh % H;
-  float acc = 0.f;
-  const DT* q_base = query + b * query_strides.batch + h * query_strides.head;
-  for (int64_t t = 0; t < T; ++t)
-    acc += dscore[(bh * T + t) * T + kk] *
-        to_float(q_base[t * query_strides.token + d * query_strides.feature]);
-  grad_k[idx] = from_float<DT>(acc);
-}
-
-template <typename DT>
-__global__ void sdpa_backward_dv_kernel(
-    const float* __restrict__ probs, const DT* __restrict__ grad,
-    DT* __restrict__ grad_v, int64_t rows, int64_t H, int64_t T, int64_t D,
-    Sdpa4DStrides grad_strides) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = rows * T * D;
-  if (idx >= total) return;
-  int64_t tmp = idx;
-  const int64_t d = tmp % D; tmp /= D;
-  const int64_t kk = tmp % T; tmp /= T;
-  const int64_t bh = tmp;
-  const int64_t b = bh / H;
-  const int64_t h = bh % H;
-  float acc = 0.f;
-  const DT* g_base = grad + b * grad_strides.batch + h * grad_strides.head;
-  for (int64_t t = 0; t < T; ++t)
-    acc += probs[(bh * T + t) * T + kk] *
-        to_float(g_base[t * grad_strides.token + d * grad_strides.feature]);
-  grad_v[idx] = from_float<DT>(acc);
-}
-
-template <typename DT>
+// Every product the backward needs is a batched matrix product over the
+// (batch, head) pairs -- the scores Q K^T, the probability gradient dO V^T,
+// and the three operand gradients P^T dO, dS K and dS^T Q -- so each is one
+// strided-batched library call; only the row softmax, the row statistic and
+// the score gradient are kernels of their own.  The two score-sized
+// intermediates are materialized, as the forward of the same shapes does.  A
+// reduced-precision operand is widened once on the way in, so the scores and
+// every accumulation stay in float whatever the call's element type.
 std::tuple<Tensor, Tensor, Tensor> sdpa_backward_impl(
     const Tensor& grad_output, const Tensor& query, const Tensor& key,
-    const Tensor& value, bool is_causal, int64_t impl) {
-  (void)impl;
+    const Tensor& value, bool is_causal) {
+  const DType dtype = query.dtype();
   const int64_t B = query.size(0), H = query.size(1);
   const int64_t T = query.size(2), D = query.size(3);
-  const int64_t rows = B * H;
-  const Sdpa4DStrides q_strides{
-      query.stride(0), query.stride(1), query.stride(2), query.stride(3)};
-  const Sdpa4DStrides k_strides{
-      key.stride(0), key.stride(1), key.stride(2), key.stride(3)};
-  const Sdpa4DStrides v_strides{
-      value.stride(0), value.stride(1), value.stride(2), value.stride(3)};
-  const Sdpa4DStrides go_strides{
-      grad_output.stride(0), grad_output.stride(1), grad_output.stride(2),
-      grad_output.stride(3)};
-  Tensor probs = Tensor::empty({B, H, T, T}, DType::Float32, query.device());
-  Tensor dprob = Tensor::empty({B, H, T, T}, DType::Float32, query.device());
-  Tensor dscore = Tensor::empty({B, H, T, T}, DType::Float32, query.device());
-  Tensor d_q = Tensor::empty({B, H, T, D}, query.dtype(), query.device());
-  Tensor d_k = Tensor::empty({B, H, T, D}, query.dtype(), query.device());
-  Tensor d_v = Tensor::empty({B, H, T, D}, query.dtype(), query.device());
-  constexpr int threads = 256;
-  auto blocks = [&](int64_t n) { return static_cast<unsigned>((n + threads - 1) / threads); };
+  const int64_t batch = B * H;
+  const int64_t query_rows = batch * T;
+  if (query_rows == 0 || D == 0) {
+    return {Tensor::zeros({B, H, T, D}, dtype, query.device()),
+            Tensor::zeros({B, H, T, D}, dtype, query.device()),
+            Tensor::zeros({B, H, T, D}, dtype, query.device())};
+  }
+  auto packed = [&](const Tensor& t) {
+    Tensor widened = t.dtype() == DType::Float32 ? t : t.to(DType::Float32);
+    return widened.contiguous().reshape({batch, T, D});
+  };
+  const Tensor q = packed(query);
+  const Tensor k = packed(key);
+  const Tensor v = packed(value);
+  const Tensor go = packed(grad_output);
+  Tensor probs = Tensor::empty({batch, T, T}, DType::Float32, query.device());
+  Tensor dprob = Tensor::empty({batch, T, T}, DType::Float32, query.device());
+  const float scale = 1.f / sqrtf(static_cast<float>(D));
+  const long long td = static_cast<long long>(T) * D;
+  const long long tt = static_cast<long long>(T) * T;
   cudaStream_t stream = getCurrentCUDAStream().stream();
-  sdpa_backward_probs_kernel<DT><<<static_cast<unsigned>(rows * T), 128, 0, stream>>>(
-      query.data_ptr<DT>(), key.data_ptr<DT>(), probs.data_ptr<float>(),
-      rows, H, T, D, q_strides, k_strides,
-      1.f / sqrtf(static_cast<float>(D)), is_causal);
-  sdpa_backward_dprob_kernel<DT><<<blocks(rows * T * T), threads, 0, stream>>>(
-      grad_output.data_ptr<DT>(), value.data_ptr<DT>(), dprob.data_ptr<float>(),
-      rows, H, T, D, go_strides, v_strides);
-  // `rows` counts (batch, head) pairs, so the score matrix holds rows * T query
-  // rows of T scores each, and the row statistic has one entry per query row.
-  const int64_t query_rows = rows * T;
+
+  gemm_strided_batched_3d_op(q, k, probs, batch, T, T, D, td, td,
+                             /*transpose_b=*/true, scale, 0.0);
+  sdpa_backward_softmax_rows_kernel<<<
+      static_cast<unsigned>(query_rows), 128, 0, stream>>>(
+      probs.data_ptr<float>(), query_rows, T, is_causal);
+  gemm_strided_batched_3d_op(go, v, dprob, batch, T, T, D, td, td,
+                             /*transpose_b=*/true, 1.0, 0.0);
   Tensor delta = Tensor::empty({query_rows}, DType::Float32, query.device());
   sdpa_backward_delta_kernel<<<
       static_cast<unsigned>(query_rows), 128, 0, stream>>>(
       probs.data_ptr<float>(), dprob.data_ptr<float>(),
       delta.data_ptr<float>(), query_rows, T);
-  sdpa_backward_dscore_kernel<<<blocks(rows * T * T), threads, 0, stream>>>(
+  constexpr int threads = 256;
+  const int64_t score_elems = batch * tt;
+  sdpa_backward_dscore_kernel<<<
+      static_cast<unsigned>((score_elems + threads - 1) / threads), threads, 0,
+      stream>>>(
       probs.data_ptr<float>(), dprob.data_ptr<float>(), delta.data_ptr<float>(),
-      dscore.data_ptr<float>(), rows, T, 1.f / sqrtf(static_cast<float>(D)));
-  sdpa_backward_dq_kernel<DT><<<blocks(rows * T * D), threads, 0, stream>>>(
-      dscore.data_ptr<float>(), key.data_ptr<DT>(), d_q.data_ptr<DT>(),
-      rows, H, T, D, k_strides);
-  sdpa_backward_dk_kernel<DT><<<blocks(rows * T * D), threads, 0, stream>>>(
-      dscore.data_ptr<float>(), query.data_ptr<DT>(), d_k.data_ptr<DT>(),
-      rows, H, T, D, q_strides);
-  sdpa_backward_dv_kernel<DT><<<blocks(rows * T * D), threads, 0, stream>>>(
-      probs.data_ptr<float>(), grad_output.data_ptr<DT>(), d_v.data_ptr<DT>(),
-      rows, H, T, D, go_strides);
+      dprob.data_ptr<float>(), batch, T, scale);
   TP_CUDA_CHECK(cudaGetLastError());
-  return {d_q, d_k, d_v};
+
+  Tensor d_q = Tensor::empty({batch, T, D}, DType::Float32, query.device());
+  Tensor d_k = Tensor::empty({batch, T, D}, DType::Float32, query.device());
+  Tensor d_v = Tensor::empty({batch, T, D}, DType::Float32, query.device());
+  gemm_strided_batched_3d_ops(probs, go, d_v, batch, T, D, T, tt, td,
+                              /*transpose_a=*/true, /*transpose_b=*/false,
+                              1.0, 0.0);
+  gemm_strided_batched_3d(dprob, k, d_q, batch, T, D, T, tt, td, 1.0, 0.0);
+  gemm_strided_batched_3d_ops(dprob, q, d_k, batch, T, D, T, tt, td,
+                              /*transpose_a=*/true, /*transpose_b=*/false,
+                              1.0, 0.0);
+  auto restored = [&](const Tensor& t) {
+    Tensor shaped = t.reshape({B, H, T, D});
+    return dtype == DType::Float32 ? shaped : shaped.to(dtype);
+  };
+  return {restored(d_q), restored(d_k), restored(d_v)};
 }
 
 std::tuple<Tensor, Tensor, Tensor> sdpa_backward_kernel_cuda(
@@ -1960,9 +1855,10 @@ std::tuple<Tensor, Tensor, Tensor> sdpa_backward_kernel_cuda(
   if (grad_output_c.dtype() != compute_dtype) {
     grad_output_c = grad_output_c.to(compute_dtype);
   }
-  if (compute_dtype == DType::Float32) return sdpa_backward_impl<float>(grad_output_c, query_c, key_c, value_c, is_causal, /*impl=*/0);
-  if (compute_dtype == DType::Float16) return sdpa_backward_impl<tensorplay::Half>(grad_output_c, query_c, key_c, value_c, is_causal, /*impl=*/0);
-  if (compute_dtype == DType::BFloat16) return sdpa_backward_impl<tensorplay::BFloat16>(grad_output_c, query_c, key_c, value_c, is_causal, /*impl=*/0);
+  if (compute_dtype == DType::Float32 || compute_dtype == DType::Float16 ||
+      compute_dtype == DType::BFloat16) {
+    return sdpa_backward_impl(grad_output_c, query_c, key_c, value_c, is_causal);
+  }
   TP_THROW(NotImplementedError, "sdpa backward: only float32/float16/bfloat16 supported");
 }
 
@@ -2230,6 +2126,16 @@ std::tuple<Tensor, Tensor, Tensor> sdpa_backward_kernel_cuda_with_lse(
     const Tensor& grad_output, const Tensor& query, const Tensor& key,
     const Tensor& value, const Tensor& output, const Tensor& logsumexp,
     bool is_causal, int64_t impl) {
+  if (query.numel() == 0 || key.numel() == 0) {
+    // Without query rows or keys every product is empty and every gradient
+    // is zero.
+    auto zeros_shaped = [](const Tensor& like) {
+      return Tensor::zeros(static_cast<std::vector<int64_t>>(like.shape()),
+                           like.dtype(), like.device());
+    };
+    return std::make_tuple(zeros_shaped(query), zeros_shaped(key),
+                           zeros_shaped(value));
+  }
   Tensor query_c = query;
   Tensor key_c = key;
   Tensor value_c = value;
@@ -2739,6 +2645,15 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key,
 std::tuple<Tensor, Tensor> sdpa_kernel_cuda_with_lse(
     const Tensor& query, const Tensor& key, const Tensor& value,
     bool is_causal, int64_t impl) {
+  if (query.dim() == 4 && value.dim() == 4 && query.numel() == 0) {
+    // No query rows: nothing to attend from, and no kernel to launch over
+    // an empty grid.
+    return std::make_tuple(
+        Tensor::empty({query.size(0), query.size(1), query.size(2), value.size(3)},
+                      query.dtype(), query.device()),
+        Tensor::empty({query.size(0), query.size(1), query.size(2)},
+                      DType::Float32, query.device()));
+  }
 #if defined(TP_HAS_NATIVE_CUTE_FLASH)
   if (impl == 0 && query.dim() == 4 && key.dim() == 4 && value.dim() == 4 &&
       query.size(3) == 32 &&

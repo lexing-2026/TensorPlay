@@ -34,6 +34,15 @@ void gemm_strided_batched_3d_op(const Tensor& self_3d, const Tensor& other_3d,
                                 long long stride_a, long long stride_b,
                                 bool transpose_b, double alpha, double beta);
 
+// The same product with either operand read transposed: op(A) is (M, K) and
+// op(B) is (K, N) whichever way each is stored.
+void gemm_strided_batched_3d_ops(const Tensor& self_3d, const Tensor& other_3d,
+                                 Tensor& result_3d, int64_t batch_size,
+                                 int64_t M, int64_t N, int64_t K,
+                                 long long stride_a, long long stride_b,
+                                 bool transpose_a, bool transpose_b,
+                                 double alpha, double beta);
+
 // Ragged grouped GEMM fast path: one persistent tensor-op kernel covers all
 // groups.  A is row-major (M_total, K); B stacks G per-expert [K, N]
 // matrices -- dense [G, K, N] row-major stacks read as RowMajor, stacks of

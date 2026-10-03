@@ -931,6 +931,17 @@ void gemm_strided_batched_3d_op(const Tensor& self_3d, const Tensor& other_3d,
                                 int64_t M, int64_t N, int64_t K,
                                 long long stride_a, long long stride_b,
                                 bool transpose_b, double alpha, double beta) {
+    gemm_strided_batched_3d_ops(self_3d, other_3d, result_3d, batch_size, M, N,
+                                K, stride_a, stride_b, /*transpose_a=*/false,
+                                transpose_b, alpha, beta);
+}
+
+void gemm_strided_batched_3d_ops(const Tensor& self_3d, const Tensor& other_3d,
+                                 Tensor& result_3d, int64_t batch_size,
+                                 int64_t M, int64_t N, int64_t K,
+                                 long long stride_a, long long stride_b,
+                                 bool transpose_a, bool transpose_b,
+                                 double alpha, double beta) {
     if (batch_size == 0 || M == 0 || N == 0) return;
     if (K == 0) {
         zero_matmul_output(result_3d);
@@ -947,23 +958,22 @@ void gemm_strided_batched_3d_op(const Tensor& self_3d, const Tensor& other_3d,
         ? CUBLAS_GEMM_DEFAULT
         : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
     // The row-major trick reads the result buffer as the transpose of the
-    // column-major product, so the leading dimension of an operand is the row
-    // count of what is stored rather than of the logical matrix.  Reading the
-    // right operand transposed turns the product into self @ other^T, which
-    // the trick expresses as other @ self^T in column-major: the transpose flag
-    // moves to the left operand and the leading dimensions stay the stored
-    // row counts either way.
-    const cublasOperation_t trans_a = transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N;
-    const cublasOperation_t trans_b = CUBLAS_OP_N;
-    const int lda = static_cast<int>(transpose_b ? K : N);
-    const int ldb = static_cast<int>(K);
+    // column-major product, so C = op(A) op(B) is computed as
+    // C^T = op(B)^T op(A)^T with the operands swapped.  A row-major operand
+    // seen column-major is already its own transpose, so an operand read as
+    // stored takes no transpose flag and one read transposed takes one; the
+    // leading dimension is always the row length of what is stored.
+    const cublasOperation_t trans_first = transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const cublasOperation_t trans_second = transpose_a ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const int ld_first = static_cast<int>(transpose_b ? K : N);
+    const int ld_second = static_cast<int>(transpose_a ? M : K);
     CUBLAS_CHECK(cublasGemmStridedBatchedEx(
         CUDAContext::getCublasHandle(),
-        trans_a, trans_b,
+        trans_first, trans_second,
         static_cast<int>(N), static_cast<int>(M), static_cast<int>(K),
         alpha_ptr,
-        other_3d.data_ptr(), cuda_type, lda, stride_b,
-        self_3d.data_ptr(), cuda_type, ldb, stride_a,
+        other_3d.data_ptr(), cuda_type, ld_first, stride_b,
+        self_3d.data_ptr(), cuda_type, ld_second, stride_a,
         beta_ptr,
         result_3d.data_ptr(), cuda_type, static_cast<int>(N), stride_c,
         static_cast<int>(batch_size), compute_type, algorithm));
