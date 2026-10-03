@@ -2754,28 +2754,28 @@ def cauchy_(input, median=0.0, sigma=1.0):
 
 def empty_like(input, dtype=DType.undefined, device=None, requires_grad=False):
     if _capturing():
-        _captured = _capture_call(empty_like, (input, dtype, device, requires_grad), {})
+        _captured = _capture_call(empty_like, (input,), {'device': device, 'dtype': dtype, 'requires_grad': requires_grad})
         if _captured is not None:
             return _captured
     return _C.empty_like(input, dtype=dtype, device=device, requires_grad=requires_grad)
 
 def zeros_like(input, dtype=DType.undefined, device=None, requires_grad=False):
     if _capturing():
-        _captured = _capture_call(zeros_like, (input, dtype, device, requires_grad), {})
+        _captured = _capture_call(zeros_like, (input,), {'device': device, 'dtype': dtype, 'requires_grad': requires_grad})
         if _captured is not None:
             return _captured
     return _C.zeros_like(input, dtype=dtype, device=device, requires_grad=requires_grad)
 
 def ones_like(input, dtype=DType.undefined, device=None, requires_grad=False):
     if _capturing():
-        _captured = _capture_call(ones_like, (input, dtype, device, requires_grad), {})
+        _captured = _capture_call(ones_like, (input,), {'device': device, 'dtype': dtype, 'requires_grad': requires_grad})
         if _captured is not None:
             return _captured
     return _C.ones_like(input, dtype=dtype, device=device, requires_grad=requires_grad)
 
 def full_like(input, fill_value, dtype=DType.undefined, device=None, requires_grad=False):
     if _capturing():
-        _captured = _capture_call(full_like, (input, fill_value, dtype, device, requires_grad), {})
+        _captured = _capture_call(full_like, (input, fill_value), {'device': device, 'dtype': dtype, 'requires_grad': requires_grad})
         if _captured is not None:
             return _captured
     if not isinstance(fill_value, (tensorplay.Scalar, tensorplay.Tensor)):

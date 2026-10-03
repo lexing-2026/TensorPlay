@@ -44,6 +44,14 @@ _VARIADIC_TENSOR_LIST_FUNCTIONS = frozenset({
     'block_diag', 'broadcast_tensors', 'cartesian_prod', 'chain_matmul',
 })
 
+# The ops whose public spelling becomes the adopted C trampoline (the
+# install_factory_fast_paths keys below).  Their eager calls skip the Python
+# wrapper, so anything these wrappers record for capture must be replayable
+# through the trampoline's keyword-only binding.
+_TRAMPOLINE_PUBLIC = frozenset({
+    'eye', 'empty_like', 'zeros_like', 'ones_like', 'full_like',
+})
+
 
 def _param_name(a) -> str:
     name = a.python_name
@@ -948,7 +956,19 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
             arg_strs = [s for _, s, _ in sig_items]
 
             lines.append(f'def {name}({", ".join(arg_strs)}):')
-            _capture_line(lines, name, [pn for _, _, pn in sig_items])
+            kwonly_pns = {_param_name(a) for a in f.args if a.kwonly}
+            if kwonly_pns and name in _TRAMPOLINE_PUBLIC:
+                # The public spelling of these ops is the adopted C
+                # trampoline, whose binding is keyword-only for the option
+                # parameters.  Recording those positionally would produce a
+                # captured node the interpreter cannot replay, so they ride
+                # the capture as keywords, like the factory paths do.
+                _capture_line(
+                    lines, name,
+                    [pn for _, _, pn in sig_items if pn not in kwonly_pns],
+                    sorted(kwonly_pns))
+            else:
+                _capture_line(lines, name, [pn for _, _, pn in sig_items])
 
             for a in f.args:
                 t, pname = a.type, _param_name(a)
