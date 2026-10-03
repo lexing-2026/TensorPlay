@@ -432,6 +432,27 @@ class _Functionalizer:
             values[argument.name] = value
         values.update(node.kwargs)
         targets = [values[a.name] for a in mutated]
+        # A mutated value the region neither received as an input nor
+        # computed is an opaque constant -- a buffer the program allocated
+        # before the trace reached this code (an autocast cast cache, for
+        # one).  Nothing in the graph can alias it, so the mutation is
+        # rewritten as its out-of-place equivalent and the constant drops
+        # out: the copy overwrites the buffer's entire contents, so the
+        # buffer's prior value has no bearing on the result.
+        if (
+            len(targets) == 1
+            and not isinstance(targets[0], Node)
+            and _is_tensor(targets[0])
+            and node.target is _ops().copy_.default
+        ):
+            ops = _ops()
+            result = self.emit(
+                ops.to.dtype, (self.map(values["src"]), targets[0].dtype)
+            )
+            result.meta.update(node.meta)
+            self.env[node] = result
+            self.new_base(node, result)
+            return
         functional = _functional_variant(node.target)
         if functional is not None:
             out_names = {a.name for a in schema.arguments if a.is_out}
@@ -493,7 +514,13 @@ class _Functionalizer:
                 if argument.alias_info.before_set & ret.alias_info.before_set:
                     aliases[index] = values[argument.name]
         if len(schema.returns) == 1 and 0 in aliases:
-            self.base_of[node] = self.base_of[aliases[0]]
+            base = aliases[0]
+            if isinstance(base, Node):
+                self.base_of[node] = self.base_of[base]
+            else:
+                # The single return aliases an opaque constant (see above):
+                # it stands for a value of its own.
+                self.new_base(node, result)
         else:
             if not hasattr(self, "_aliased_results"):
                 self._aliased_results = {}
