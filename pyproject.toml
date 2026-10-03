@@ -73,7 +73,7 @@ Repository = "https://github.com/lexing-2026/TensorPlay.git"
 Issues = "https://github.com/lexing-2026/TensorPlay/issues"
 PyPI = "https://pypi.org/project/tensorplay/"
 Socket = "https://socket.dev/pypi/package/tensorplay"
-Changelog = "https://github.com/lexing-2026/TensorPlay/blob/main/CHANGELOG.md"
+Changelog = "https://github.com/lexing-2026/TensorPlay/releases"
 Documentation = "https://tensorplay.cn"
 Contributing = "https://github.com/lexing-2026/TensorPlay/blob/main/CONTRIBUTING.md"
 

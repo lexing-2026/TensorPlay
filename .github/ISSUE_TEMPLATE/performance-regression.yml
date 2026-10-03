@@ -8,7 +8,8 @@ body:
       value: |
         Performance reports need measured numbers with hardware, shapes and
         methodology (e.g. "min-of-200, RTX 4090 D"), the same convention used
-        in CHANGELOG.md. Reports without numbers will be closed. A [contribution
+        in the release notes performance sections. Reports without numbers
+        will be closed. A [contribution
         guide](https://github.com/lexing-2026/TensorPlay/blob/main/docs/README.md)
         for benchmark methodology is available.
   - type: textarea

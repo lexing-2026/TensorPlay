@@ -57,5 +57,4 @@
       - any-glob-to-any-file:
           - 'docs/**'
           - 'README*.md'
-          - 'CHANGELOG.md'
           - 'CONTRIBUTING.md'

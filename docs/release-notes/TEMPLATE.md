@@ -57,7 +57,8 @@ Kernels / Frontend ... -->
 # Performance
 
 <!-- Measured numbers with hardware, shape and methodology
-(e.g. "min-of-200, RTX 4090 D"), like the CHANGELOG entries. -->
+(e.g. "min-of-200, RTX 4090 D"), like the performance sections of previous
+release notes. -->
 
 # Tracked Regressions
 
