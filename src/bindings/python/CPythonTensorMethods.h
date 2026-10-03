@@ -157,8 +157,15 @@ inline PyObject* tpx_storage_offset_call(PyObject* self_obj, PyObject* const*,
                         "storage_offset() takes no arguments");
         return nullptr;
     }
+    const Tensor& self = tpx_py_tensor_cref(self_obj);
+    if (!self.defined()) {
+        // An undefined tensor has no storage to be offset into.
+        PyErr_SetString(PyExc_RuntimeError,
+                        "storage_offset() called on an undefined Tensor");
+        return nullptr;
+    }
     return PyLong_FromLongLong(static_cast<int64_t>(
-        tpx_py_tensor_cref(self_obj).unsafeGetTensorImpl()->storage_offset()));
+        self.unsafeGetTensorImpl()->storage_offset()));
 }
 
 // ``get_device()`` is the ordinal of the device, or -1 for the host.

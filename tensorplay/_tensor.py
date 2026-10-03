@@ -524,7 +524,7 @@ def _bitwise_fn(name, reflect=False):
         import tensorplay
         fn = getattr(tensorplay, _BITWISE_NAMES[name])
         if reflect:
-            return fn(_as_tensor(other), self)
+            return fn(_as_tensor(other, device=self.device), self)
         return fn(self, other)
 
     return op
