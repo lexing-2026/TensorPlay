@@ -2096,7 +2096,14 @@ def _shared_copy(x, dtype):
     return out
 
 
-@register("to.dtype", "to.device", "to.dtype_layout", "_to_copy.default")
+# The element-type methods are conversions by another name; a region that
+# records the method rather than the conversion it stands for is lowered the
+# same way, with the type read off the result.
+@register(
+    "to.dtype", "to.device", "to.dtype_layout", "_to_copy.default",
+    "half", "float", "double", "bfloat16", "long", "int", "short", "bool",
+    "char", "byte",
+)
 def lower_to(x, *args, **kwargs):
     size, dtype, _ = val_info(node_val())
     if not kwargs.get("copy", False) and hasattr(x, "get_dtype") and dtype_name(x.get_dtype()) == dtype_name(dtype):

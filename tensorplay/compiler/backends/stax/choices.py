@@ -336,6 +336,119 @@ class TpChoices:
         )
 
     @staticmethod
+    def _inner_reduction_no_split_threshold(props: Any, xnumel: int, num_sm: int) -> int:
+        """The longest contiguous reduction left in one launch.
+
+        Below it the second launch a split needs costs more than the
+        parallelism it buys.  The newest parts finish longer rows in one
+        launch before a split pays.
+        """
+
+        if props.major is not None and props.major >= 10:
+            return 32768 if xnumel < num_sm else 40960
+        return 8192
+
+    def reduction_split_factor(
+        self,
+        device: Any,
+        reduction_numel_hint: int,
+        numel_hint: int,
+        inner_reduction: bool,
+    ) -> int:
+        """How many pieces a reduction with too few outputs is cut into.
+
+        A reduction with few outputs gives the device few blocks, each walking
+        a long axis alone.  Cutting the axis into pieces reduced side by side
+        and combined by a second pass fills the device; the piece size is
+        chosen from how many elements a thread should walk, so the device has
+        enough blocks without each doing too little.  A contiguous (inner)
+        reduction is laid out one row per block group; an outer one reads the
+        outputs side by side, so its blocks cover many outputs at once.
+        """
+
+        import sympy
+
+        from .runtime.hints import DeviceProperties
+
+        props = DeviceProperties.create(device)
+        num_sm = props.multi_processor_count
+        warp_size = props.warp_size_or_default
+        threads_per_sm = (
+            props.max_threads_per_multi_processor
+            if props.max_threads_per_multi_processor is not None
+            else 2048
+        )
+        min_elements_per_thread = warp_size
+        max_elements_per_thread = 512
+        min_elements_per_device = min_elements_per_thread * num_sm * threads_per_sm
+        max_elements_per_device = max_elements_per_thread * num_sm * threads_per_sm
+        num_threads = warp_size * 8
+
+        def even_size(target: int, slack: int) -> int:
+            # A piece that divides the axis evenly, when one is close.
+            closest = min(sympy.divisors(reduction_numel_hint), key=lambda d: abs(d - target))
+            return max(closest, min_elements_per_thread) if abs(closest - target) < slack else target
+
+        total = reduction_numel_hint * numel_hint
+        if inner_reduction:
+            if numel_hint >= 2 * num_sm:
+                return 1
+            if reduction_numel_hint <= self._inner_reduction_no_split_threshold(
+                props, numel_hint, num_sm
+            ):
+                return 1
+            if total <= min_elements_per_device:
+                split_size = min_elements_per_thread
+            elif total < max_elements_per_device:
+                target_blocks = num_sm * threads_per_sm // (2 * num_threads)
+                blocks_per_output = (target_blocks + numel_hint - 1) // numel_hint
+                split_size = even_size(
+                    (reduction_numel_hint + num_threads * blocks_per_output - 1)
+                    // (num_threads * blocks_per_output),
+                    30,
+                )
+            else:
+                closest = min(
+                    sympy.divisors(reduction_numel_hint),
+                    key=lambda d: abs(d - max_elements_per_thread),
+                )
+                split_size = (
+                    closest if abs(closest - max_elements_per_thread) < 50
+                    else max_elements_per_thread
+                )
+            return (reduction_numel_hint + split_size * num_threads - 1) // (
+                split_size * num_threads
+            )
+
+        # An outer reduction's block covers this many outputs, each walked by
+        # threads taking this many values per step.
+        rvals_per_thread = 4
+        xvals_per_block = 128
+        xblocks = (numel_hint + xvals_per_block - 1) // xvals_per_block
+        if total < min_elements_per_device:
+            split_size = min_elements_per_thread
+        elif total < max_elements_per_device:
+            target_blocks = num_sm * threads_per_sm // num_threads
+            target_blocks = (target_blocks + xblocks - 1) // xblocks
+            split_size = even_size(
+                (reduction_numel_hint + rvals_per_thread * target_blocks - 1)
+                // (rvals_per_thread * target_blocks),
+                20,
+            )
+        else:
+            closest = min(
+                sympy.divisors(reduction_numel_hint),
+                key=lambda d: abs(d - max_elements_per_thread),
+            )
+            split_size = (
+                closest if abs(closest - max_elements_per_thread) < 50
+                else max_elements_per_thread
+            )
+        return (reduction_numel_hint + rvals_per_thread * split_size - 1) // (
+            rvals_per_thread * split_size
+        )
+
+    @staticmethod
     def should_use_cooperative_reduction(
         device: Any, numel: Any, reduction_numel: Any
     ) -> bool:

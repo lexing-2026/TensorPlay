@@ -38,6 +38,7 @@ from tensorplay.graph.experimental.symbolic_shapes import (
 )
 from tensorplay.graph.experimental.sympy_functions import (
     CleanDiv,
+    FloorDiv,
     Max,
     Min,
     Mod,
@@ -77,7 +78,7 @@ from .utils import (
     sympy_product,
     sympy_subs,
 )
-from .codegen.index_expr import _lift, FloorDiv, floordiv
+from .codegen.index_expr import _lift, floordiv
 
 
 def convert_shape_to_tp(lst) -> list:
@@ -4871,6 +4872,12 @@ class Reduction(Loops):
         if not config.split_reductions:
             return ReductionHint.DEFAULT, 1
 
+        if getattr(device, "type", None) not in (None, "cpu"):
+            return Reduction._device_splits(
+                device, dst_dtype, src_dtype, inner_fn, ranges, reduction_ranges,
+                reduction_type, reduction_numel, reduction_numel_hint, numel_hint,
+            )
+
         # One output element, so there is nothing to combine across blocks and
         # the whole reduced axis belongs to one block.
         if numel_hint == 1:
@@ -4885,6 +4892,124 @@ class Reduction(Loops):
         if split <= 1:
             return ReductionHint.DEFAULT, 1
         return ReductionHint.OUTER, split
+
+    @staticmethod
+    def _device_splits(
+        device, dst_dtype, src_dtype, inner_fn, ranges, reduction_ranges,
+        reduction_type, reduction_numel, reduction_numel_hint, numel_hint,
+    ):
+        """The hint and split count on an accelerator, sized to fill it.
+
+        A reduction with fewer outputs than the device has room for blocks is
+        cut so that the device fills; how far depends on whether the reduced
+        axis is the contiguous one (inner: one row per group of blocks) or an
+        outer one (each block covers many outputs side by side and walks the
+        reduced axis down them), which is read off the strides the reduction's
+        inputs are read with.  A reduction whose warps cooperate on one launch
+        is not cut.
+        """
+
+        from .runtime.hints import DeviceProperties
+
+        numel = sympy_product(ranges)
+        try:
+            if V.choices.should_use_cooperative_reduction(device, numel, reduction_numel):
+                return ReductionHint.DEFAULT, 1
+        except Exception:  # noqa: BLE001 - no policy installed: no cooperation
+            pass
+        num_sm = DeviceProperties.create(device).multi_processor_count
+        min_elements_per_thread = 32
+
+        def splits(inner: bool) -> int:
+            return V.choices.reduction_split_factor(
+                device, reduction_numel_hint, numel_hint, inner_reduction=inner
+            )
+
+        if numel_hint == 1:
+            return ReductionHint.INNER, splits(True)
+        if reduction_numel_hint <= min_elements_per_thread or numel_hint >= num_sm * 2 * 32:
+            return ReductionHint.DEFAULT, 1
+
+        r = Reduction(
+            device=device,
+            dtype=dst_dtype,
+            inner_fn=inner_fn,
+            ranges=ranges,
+            reduction_ranges=reduction_ranges,
+            reduction_type=reduction_type,
+            src_dtype=src_dtype,
+            reduction_hint=ReductionHint.DEFAULT,
+        )
+
+        def read_indices():
+            # The reads that cover the whole iteration space say which axis
+            # the reduction walks contiguously; reads that only vary along
+            # the reduced axes are a fallback.  Laying out a producer the
+            # reduction reads can change what it reads, so a change is asked
+            # about again.
+            cb = ComputedBuffer(
+                name=None,
+                layout=FlexibleLayout(
+                    device=device, dtype=r.get_dtype(), size=r.get_size(), is_pinned=False
+                ),
+                data=r,
+            )
+            read_writes = cb.get_read_writes()
+            range_vars = [
+                v for v in (read_writes.range_vars or [])
+                if isinstance(v, sympy.Expr) and not isinstance(v, sympy.Number)
+            ]
+            (_, reduction_vars), _ = dependencies.index_vars_squeeze(
+                r.get_size(), r.get_reduction_size()
+            )
+            reduction_vars = [
+                v for v in reduction_vars
+                if isinstance(v, sympy.Expr) and not isinstance(v, sympy.Number)
+            ]
+            full, partial = [], []
+            changed = False
+            for md in sorted(read_writes.reads, key=lambda d: d.name):
+                free = md.index.free_symbols
+                is_full = all(v in free for v in range_vars)
+                is_partial = not is_full and any(v in free for v in reduction_vars)
+                if is_full:
+                    full.append(md.index)
+                elif is_partial:
+                    partial.append(md.index)
+                if (is_full or is_partial) and md.name in V.graph.name_to_buffer:
+                    buf = V.graph.name_to_buffer[md.name]
+                    before = getattr(buf.layout, "stride", None)
+                    if hasattr(buf, "decide_layout"):
+                        buf.decide_layout()
+                    if getattr(buf.layout, "stride", None) != before:
+                        changed = True
+            return full or partial, changed
+
+        indices, changed = read_indices()
+        if changed:
+            indices, _ = read_indices()
+        if not indices:
+            return ReductionHint.DEFAULT, 1
+
+        (_, reduction_vars), ranges1 = dependencies.index_vars_squeeze(
+            r.get_size(), r.get_reduction_size()
+        )
+        num_outer = 0
+        num_inner = 0
+        for index in indices:
+            simplified = V.graph.sizevars.simplify_with_ranges(index, ranges1)
+            strides = V.graph.sizevars.stride_hints(
+                simplified, reduction_vars, list(ranges1.keys())
+            )
+            # A reduced axis of extent one reads with stride zero, which does
+            # not make the walk contiguous.
+            if all(st == 0 or st > 1 for st in strides):
+                num_outer += 1
+            else:
+                num_inner += 1
+        if num_inner > num_outer:
+            return ReductionHint.INNER, splits(True)
+        return ReductionHint.OUTER, splits(False)
 
     @staticmethod
     def _unroll_reduction_fn(inner_fn, reduction_ranges, reduction_type, src_dtype):
@@ -4925,22 +5050,48 @@ class Reduction(Loops):
 
     @classmethod
     def check_for_split_dense_dim_reindexing(cls, reduction_numel, input_node):
-        """Whether splitting would make a dense reduced axis be indexed oddly.
+        """The input axis to walk innermost when a whole-tensor reduction is cut.
 
-        A split walk reindexes the reduced axis to include which part is being
-        reduced, and a caller that has already recorded how that axis is read
-        would be left describing the wrong thing, so this is asked before
-        splitting rather than after.
+        Cutting the reduced extent into pieces walks it as one flat run; when
+        the input is dense along some axis other than its last, the flat run
+        is taken along that axis so each piece still reads consecutive
+        memory.  ``None`` when the reduction does not cover the whole input or
+        the input's last axis is the dense one.
         """
 
-        return False
+        if input_node is None:
+            return None
+        if not V.graph.sizevars.statically_known_equals(
+            input_node.get_numel(), reduction_numel
+        ):
+            return None
+        input_node.realize()
+        try:
+            as_storage_and_layout(input_node)
+        except NotImplementedError:
+            return None
+        strides = input_node.get_stride()
+        for i, stride in enumerate(strides[:-1]):
+            if V.graph.sizevars.statically_known_equals(stride, 1):
+                return i
+        return None
 
     @staticmethod
     def _multilayer_second_step_hint(split, numel_hint, reduction_hint):
-        """The hint for the step that combines what the split steps produced."""
+        """The hint for the step that combines what the split steps produced.
 
-        if reduction_hint == ReductionHint.OUTER:
-            return ReductionHint.INNER
+        An outer reduction's partial results are laid out one row per output,
+        a split long; when both the split and the outputs are few the combine
+        is a small outer reduction of its own, scheduled as such.
+        """
+
+        if split == -1:
+            return reduction_hint
+        if reduction_hint == ReductionHint.OUTER and (
+            (split <= 512 and numel_hint <= 512)
+            or (split <= 1024 and numel_hint <= 256)
+        ):
+            return ReductionHint.OUTER_TINY
         return reduction_hint
 
     @classmethod
@@ -5072,6 +5223,7 @@ class Reduction(Loops):
         result.realize()
         return result
 
+    @classmethod
     def create_multilayer(
         cls,
         device,
@@ -5084,50 +5236,48 @@ class Reduction(Loops):
         split,
         reduction_hint,
         input_node=None,
+        *,
+        strict_reduction: bool = False,
     ):
         """Reduce in two layers: pieces of the axis, then the pieces together.
 
-        The axis is cut into ``split`` pieces of equal size and each is reduced
-        on its own, which is the layer that has the parallelism; the partial
-        results are then reduced among themselves, which is a much shorter
-        reduction than the original.
+        The reduced extent, walked as one flat run, is cut into ``split``
+        pieces of ``block_size``; the first layer reduces each piece into a
+        partial result indexed by which piece it was, which is where the
+        parallelism is, and the second reduces the partial results of each
+        output, a much shorter walk.  The last piece may run past the end; the
+        positions past it contribute the value that leaves the reduction
+        unchanged.
         """
 
         reduction_numel = sympy_product(reduction_ranges)
-        # The pieces have to divide the axis, so the last one takes what is
-        # left over; asking for a split that does not fit is a mistake in the
-        # caller rather than something to work around.
-        block_size = V.graph.sizevars.simplify(ceildiv(reduction_numel, split))
-        new_ranges = [*ranges, sympy_index_symbol("R2")]
-        new_reduction_ranges = [block_size]
-        # Which piece is being reduced has to appear in the index, so that each
-        # piece's partial result is stored somewhere of its own.
-        original_ranges = [*ranges, sympy_index_symbol("R3")]
-        original_reduction_ranges = [
-            *reduction_ranges,
-            sympy_index_symbol_with_prefix("R2"),
-        ]
+        block_size = FloorDiv(reduction_numel + (split - 1), split)
+        default = cls.default_value(reduction_type, dst_dtype)
         wrapper_fn = cls._multilayer_wrap_loader(
             inner_fn,
-            original_ranges,
-            original_reduction_ranges,
-            new_ranges,
-            new_reduction_ranges,
+            reduction_ranges,
+            reduction_numel,
+            split,
+            block_size,
+            default,
+            input_node,
         )
         return cls.create_multilayer_helper(
             device,
             dst_dtype,
             src_dtype,
             wrapper_fn,
-            original_ranges,
-            original_reduction_ranges,
-            new_ranges,
-            new_reduction_ranges,
+            ranges,
+            reduction_ranges,
+            [*ranges, split],
+            [block_size],
             reduction_type,
             split,
             reduction_hint,
+            strict_reduction,
         )
 
+    @classmethod
     def create_multilayer_existing_ranges(
         cls,
         device,
@@ -5141,10 +5291,11 @@ class Reduction(Loops):
         reduction_type,
         reduction_hint,
     ):
-        """Two layers where both sets of axes are already spelled out.
+        """Two layers where the cut of the reduced axes is already decided.
 
-        This is the case where the axes have been worked out already -- by a
-        fusion that produced them -- so nothing here has to be cut.
+        The pieces are the extents ``new_ranges`` and each piece's walk is
+        ``new_reduction_ranges`` -- a cut taken from a producer laid out that
+        way -- so nothing here has to choose one.
         """
 
         wrapper_fn = cls._multilayer_wrap_loader_existing_ranges(
@@ -5161,13 +5312,14 @@ class Reduction(Loops):
             wrapper_fn,
             original_ranges,
             original_reduction_ranges,
-            new_ranges,
+            [*original_ranges, *new_ranges],
             new_reduction_ranges,
             reduction_type,
-            sympy_product(new_reduction_ranges),
+            -1,
             reduction_hint,
         )
 
+    @classmethod
     def create_multilayer_helper(
         cls,
         device,
@@ -5183,65 +5335,58 @@ class Reduction(Loops):
         reduction_hint,
         strict_reduction: bool = False,
     ):
-        """Build the first layer, and hang the second layer off its results."""
+        """Build the first layer, then the second over its realized results.
 
-        if reduction_hint == ReductionHint.DEFAULT:
-            reduction_hint = cls._multilayer_second_step_hint(
-                split,
-                sympy_product(new_ranges),
-                reduction_hint,
-            )
-        assert len(new_ranges) == len(original_ranges) + 1
+        The partial results are kept in single precision when the reduction
+        produces a half-precision value: a kernel reducing half-precision
+        values accumulates in single precision, and storing the pieces any
+        narrower would round the reduction partway through.  The first layer
+        may itself be cut again, which ``Reduction.create`` decides.
+        """
 
-        first_step_hint = ReductionHint.INNER
-        if reduction_hint == ReductionHint.INNER:
-            first_step_hint = reduction_hint
-
-        results = []
-        for second_step_hint in (
-            cls._multilayer_second_step_hint(
-                split, sympy_product(new_ranges), reduction_hint
-            ),
+        intermediate_dtype = (
+            dst_dtype if dst_dtype not in (tp.float16, tp.bfloat16) else tp.float32
+        )
+        intermediate = Reduction.create(
+            device,
+            intermediate_dtype,
+            src_dtype,
+            wrapper_fn,
+            new_ranges,
+            new_reduction_ranges,
+            reduction_type,
             reduction_hint,
-        ):
-            res = TensorBox.create(
-                cls(
-                    device=device,
-                    dtype=dst_dtype,
-                    inner_fn=wrapper_fn,
-                    ranges=new_ranges,
-                    reduction_ranges=new_reduction_ranges,
-                    reduction_type=reduction_type,
-                    src_dtype=src_dtype,
-                    reduction_hint=first_step_hint,
-                )
-            )
-            results.append(res)
+            strict_reduction=strict_reduction,
+        )
+        intermediate.realize()
+        intermediate_loader = intermediate.make_loader()
 
-        # The second layer reduces the partial results among themselves.  It
-        # reads them out of the first layer's output, so the first layer has
-        # to be written out before this can be read.
-        def second_step_body(idx, r_idx):
-            return wrapper_fn(
-                idx[:-1],
-                [*r_idx, idx[-1]],
-            )
+        def intermediate_fn(index, reduction_index):
+            return intermediate_loader([*index, *reduction_index])
 
-        second_step = TensorBox.create(
-            cls(
+        numel_hint = V.graph.sizevars.optimization_hint(sympy_product(original_ranges))
+        reduction_hint = cls._multilayer_second_step_hint(
+            split, numel_hint, reduction_hint
+        )
+        if list(original_ranges) != list(new_ranges[: len(original_ranges)]):
+            raise AssertionError(
+                "the first layer's outputs have to begin with the reduction's own"
+            )
+        return TensorBox.create(
+            Reduction(
                 device=device,
                 dtype=dst_dtype,
-                inner_fn=second_step_body,
-                ranges=new_ranges[:-1],
-                reduction_ranges=[split],
+                inner_fn=intermediate_fn,
+                ranges=original_ranges,
+                reduction_ranges=new_ranges[len(original_ranges):],
                 reduction_type=reduction_type,
-                src_dtype=dst_dtype,
+                src_dtype=src_dtype,
                 reduction_hint=reduction_hint,
+                strict_reduction_rblock=1 if strict_reduction else None,
             )
         )
-        second_step.realize()
-        return second_step
 
+    @classmethod
     def _multilayer_wrap_loader(
         cls,
         loader,
@@ -5252,37 +5397,49 @@ class Reduction(Loops):
         default,
         input_node=None,
     ):
-        """Wrap a body so that a piece of the reduced axis looks like the axis.
+        """The body of the first layer, indexed by output, piece, and position.
 
-        The first layer is written as though the reduced axis were one block
-        long, with the body seeing ``default`` where the position is outside
-        the piece being reduced, so that a position nobody reduces over
-        contributes the value that leaves a reduction unchanged.
+        The first layer's index is the output's followed by which piece; its
+        reduced index is the position within the piece.  The flat position in
+        the reduced extent is the piece's start plus that, mapped back onto the
+        reduced axes; past the end -- when the pieces do not divide the extent
+        -- the body is masked to ``default``.
         """
 
-        ranges = list(reduction_ranges[:-1]) if reduction_ranges else []
-        rnumel = V.graph.sizevars.simplify(reduction_numel)
+        dense_index = cls.check_for_split_dense_dim_reindexing(
+            reduction_numel, input_node
+        )
+        reindex = View.dynamic_reshape_indexer(
+            reduction_ranges, [reduction_numel], dense_index
+        )
+        need_mask = not V.graph.sizevars.statically_known_true(
+            sympy.Eq(sympy.Mod(reduction_numel, split), 0)
+        )
 
-        def get_rindex(rindex):
-            new_rindex = [0 if default is None else default, *rindex]
-            if len(new_rindex) > len(reduction_ranges):
-                raise AssertionError("new_rindex is too long")
-            if rnumel == block_size * split:
-                return new_rindex
-            return [
-                sympy.Max(0, sympy.Min(block_size - 1, new_rindex[i] - block_size * i))
-                if i > 0
-                else sympy.Max(0, sympy.Min(block_size - 1, new_rindex[i]))
-                for i in range(len(new_rindex))
-            ]
+        def wrapper_fn(index, reduction_index):
+            (reduction_index,) = reduction_index
+            *new_index, reduction_block = index
+            indices = block_size * reduction_block + reduction_index
 
-        def inner(index, rindex):
-            new_rindex = get_rindex(rindex)
-            inner_loader = loader(index, new_rindex)
-            return inner_loader
+            def body():
+                return loader(new_index, reindex([indices]))
 
-        return inner
+            if need_mask:
+                index_dtype = (
+                    tp.int32
+                    if V.graph.sizevars.statically_known_lt(reduction_numel, 2**31)
+                    else tp.int64
+                )
+                mask = ops.lt(
+                    ops.index_expr(indices, index_dtype),
+                    ops.index_expr(reduction_numel, index_dtype),
+                )
+                return ops.masked(mask, body, default)
+            return body()
 
+        return wrapper_fn
+
+    @classmethod
     def _multilayer_wrap_loader_existing_ranges(
         cls,
         loader,
@@ -5291,22 +5448,29 @@ class Reduction(Loops):
         new_ranges,
         new_reduction_ranges,
     ):
-        """Wrap a body so a piece of the reduced axis looks like the whole axis.
+        """The first layer's body when the cut is already given as extents.
 
-        As above, but with both sets of axes given, which is the case where a
-        fusion has already worked out what the pieces are.
+        Only a reduction to one output is cut this way: its reduced axes are
+        reshaped onto the pieces followed by each piece's walk.
         """
 
-        def inner(index, rindex):
-            # The last axis is which piece is being reduced; it is dropped from
-            # the body's own index and put into the reduced position instead.
-            new_index = [*index[:-1], *index[-1:]]
-            new_rindex = [*rindex, *index[-1:]]
-            assert len(new_index) == len(original_ranges)
-            assert len(new_rindex) == len(original_reduction_ranges)
-            return loader(new_index, new_rindex)
+        if not all(r == 1 for r in original_ranges):
+            raise AssertionError(
+                f"a given cut serves a reduction to one output, not {original_ranges}"
+            )
+        reindex = View.dynamic_reshape_indexer(
+            original_reduction_ranges, tuple(new_ranges) + tuple(new_reduction_ranges)
+        )
 
-        return inner
+        def wrapper_fn(merged_index, new_reduction_index):
+            original_idx = merged_index[: len(original_ranges)]
+            new_index = merged_index[len(original_ranges):]
+            return loader(
+                original_idx,
+                reindex(tuple(new_index) + tuple(new_reduction_index)),
+            )
+
+        return wrapper_fn
 
 
 class MultiOutputReduction(Reduction):
