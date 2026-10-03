@@ -78,9 +78,15 @@ _LOCK = threading.RLock()
 _OP_REGISTRY: dict[str, "CustomOpDef"] = {}
 _DEFINED_LIBRARY_NAMESPACES: set[str] = set()
 
+import tensorplay._C._autograd as _autograd_c
+
 # Hot-path aliases resolved once at import (this module is imported last by
 # tensorplay/__init__, so every attribute below already exists).
 _is_grad_enabled = tensorplay.is_grad_enabled
+# One native scan over the call arguments replaces the full graph-node
+# build when no input needs a gradient.  Older extensions without the
+# binding keep the unconditional apply path.
+_any_requires_grad = getattr(_autograd_c, "_any_requires_grad", None)
 
 # Profiler session gate for automatic op-span emission.  Resolved lazily:
 # the bridge function exists whenever the compiled extension ships it, and
@@ -647,6 +653,12 @@ class CustomOpDef:
                             k: _cast_if_floating(v, rule) for k, v in kwargs.items()
                         }
             if _is_grad_enabled():
+                # With no requires-grad input the generated autograd class
+                # would only build and discard an empty graph node, so run
+                # the kernel directly instead.
+                if (_any_requires_grad is not None
+                        and not _any_requires_grad(*args, **kwargs)):
+                    return self._run_profiled(args, kwargs, key)
                 if _profiling_sessions:
                     return self._profiled(
                         self._autograd_cls.apply, args, kwargs)

@@ -34,6 +34,30 @@ inline bool fast_is_tensor(PyObject* obj) {
     return PyObject_TypeCheck(obj, g_fast_tensor_type) != 0;
 }
 
+// Requires-grad scan over one Python argument.  A direct tensor is
+// inspected; a list is descended only when every element is a tensor; any
+// other object (tuple, dict, mixed list) contributes nothing.  Stops at the
+// first tensor whose requires_grad bit is set.
+bool visit_requires_grad(PyObject* object) {
+    if (fast_is_tensor(object)) {
+        return py::cast<const Tensor&>(py::handle(object)).requires_grad();
+    }
+    if (PyList_Check(object)) {
+        const Py_ssize_t size = PyList_GET_SIZE(object);
+        for (Py_ssize_t i = 0; i < size; ++i) {
+            if (!fast_is_tensor(PyList_GET_ITEM(object, i))) {
+                return false;
+            }
+        }
+        for (Py_ssize_t i = 0; i < size; ++i) {
+            if (visit_requires_grad(PyList_GET_ITEM(object, i))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 using PyObjectRef = std::shared_ptr<PyObject>;
 
 PyObjectRef retain_pyobject(py::handle object) {
@@ -1626,6 +1650,29 @@ void init_autograd(py::module_& m) {
             result.push_back({edge.function, (int)edge.input_nr});
         }
         return result;
+    });
+
+    // Single-crossing requires-grad gate for generated autograd classes:
+    // without it, a call whose inputs need no gradient builds and discards
+    // an empty graph node.  Tensors nested in plain lists count; tensors
+    // inside dicts or mixed lists do not.
+    autograd.def("_any_requires_grad", [](py::args args, py::kwargs kwargs) {
+        for (py::handle item : args) {
+            if (visit_requires_grad(item.ptr())) {
+                return true;
+            }
+        }
+        if (kwargs) {
+            PyObject* key = nullptr;
+            PyObject* value = nullptr;
+            Py_ssize_t position = 0;
+            while (PyDict_Next(kwargs.ptr(), &position, &key, &value)) {
+                if (visit_requires_grad(value)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     });
 
     // tuple producing needs_input_grad bits AND wiring this node's
