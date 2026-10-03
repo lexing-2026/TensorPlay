@@ -186,6 +186,36 @@ PyOpSlot parse_bridge_key(const std::string& device_type) {
 
 namespace {
 
+// Device-key selection for the Python hot path: the first tensor argument
+// decides which registered kernel serves the call.  One crossing returns
+// the device type as an interned lowercase string ("cpu", "cuda", ...),
+// replacing a per-argument Python attribute walk.  The name cache is
+// process-lifetime, matching the other leaky registries in this file.
+py::object first_device_key(py::args args) {
+    constexpr int kDeviceTypeSlots = 16;
+    static PyObject* interned[kDeviceTypeSlots] = {};
+    for (py::handle item : args) {
+        if (!py::isinstance<Tensor>(item)) {
+            continue;
+        }
+        const auto type = static_cast<int>(
+            item.cast<const Tensor&>().device().type());
+        if (type < 0 || type >= kDeviceTypeSlots) {
+            break;
+        }
+        PyObject* name = interned[type];
+        if (name == nullptr) {
+            name = PyUnicode_InternFromString(
+                tensorplay::Device(static_cast<tensorplay::DeviceType>(type))
+                    .toString()
+                    .c_str());
+            interned[type] = name;
+        }
+        return py::reinterpret_borrow<py::object>(name);
+    }
+    return py::none();
+}
+
 // tensor() is a flagship constructor, so its argument errors and repr are
 // part of the public face.  The pybind11 typed-arg surface answers a mismatch
 // with an aggregate "incompatible function arguments" dump that spells out
@@ -564,6 +594,8 @@ void init_ops(py::module_& m) {
         tensorplay::DispatchKey key = want_cuda ? tensorplay::DispatchKey::CUDA : tensorplay::DispatchKey::CPU;
         return tensorplay::Dispatcher::singleton().getKernel(op_name, key) != nullptr;
     }, "op_name"_a, "device_type"_a = py::none());
+
+    m.def("_first_device_key", &first_device_key);
 
     // Bind generated functions (includes *_like, transpose, permute, etc.)
     // onto the dedicated op-functions submodule; every bound name is then

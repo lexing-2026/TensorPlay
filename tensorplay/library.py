@@ -87,6 +87,10 @@ _is_grad_enabled = tensorplay.is_grad_enabled
 # build when no input needs a gradient.  Older extensions without the
 # binding keep the unconditional apply path.
 _any_requires_grad = getattr(_autograd_c, "_any_requires_grad", None)
+# Native first-tensor device scan and the O(1) dispatch-mode stack probe;
+# both fall back to the Python walks when the extension predates them.
+_fast_device_key = getattr(tensorplay._C, "_first_device_key", None)
+_len_dispatch_modes = getattr(tensorplay._C, "_len_dispatch_mode", None)
 
 # Profiler session gate for automatic op-span emission.  Resolved lazily:
 # the bridge function exists whenever the compiled extension ships it, and
@@ -643,27 +647,28 @@ class CustomOpDef:
         """
 
         if self._autograd_cls is not None:
-            key = _first_device_key(args)
-            if self._autocast_rules:
-                rule = self._autocast_rules.get(key) if key is not None else None
-                if rule is not None and _autocast_enabled(key):
-                    args = tuple(_cast_if_floating(v, rule) for v in args)
-                    if kwargs:
-                        kwargs = {
-                            k: _cast_if_floating(v, rule) for k, v in kwargs.items()
-                        }
-            if _is_grad_enabled():
-                # With no requires-grad input the generated autograd class
-                # would only build and discard an empty graph node, so run
-                # the kernel directly instead.
-                if (_any_requires_grad is not None
-                        and not _any_requires_grad(*args, **kwargs)):
-                    return self._run_profiled(args, kwargs, key)
+            # With no requires-grad input the generated autograd class would
+            # only build and discard an empty graph node, so run the kernel
+            # directly instead.  The autocast cast below preserves
+            # requires_grad, so the scan can run on the raw arguments.
+            if _is_grad_enabled() and (
+                    _any_requires_grad is None
+                    or _any_requires_grad(*args, **kwargs)):
+                key = _first_device_key(args) if self._autocast_rules else None
+                if key is not None:
+                    rule = self._autocast_rules.get(key)
+                    if rule is not None and _autocast_enabled(key):
+                        args = tuple(_cast_if_floating(v, rule) for v in args)
+                        if kwargs:
+                            kwargs = {
+                                k: _cast_if_floating(v, rule)
+                                for k, v in kwargs.items()
+                            }
                 if _profiling_sessions:
                     return self._profiled(
                         self._autograd_cls.apply, args, kwargs)
                 return self._autograd_cls.apply(*args, **kwargs)
-            return self._run_profiled(args, kwargs, key)
+            return self._run_profiled(args, kwargs, None)
         if self._autocast_rules:
             key = _first_device_key(args)
             rule = self._autocast_rules.get(key) if key is not None else None
@@ -748,6 +753,11 @@ def _recording_tracer() -> Any:
     being written.  Only a mode that carries such a tracer counts.
     """
 
+    # An empty mode stack can carry no tracer; the length probe is one
+    # native call, far cheaper than materializing the stack.
+    if _len_dispatch_modes is not None and _len_dispatch_modes() == 0:
+        return None
+
     from .utils._dispatch import _get_current_dispatch_mode_stack
 
     for mode in reversed(_get_current_dispatch_mode_stack()):
@@ -758,6 +768,8 @@ def _recording_tracer() -> Any:
 
 
 def _first_device_key(values: tuple[Any, ...]) -> str | None:
+    if _fast_device_key is not None:
+        return _fast_device_key(*values)
     for value in values:
         if isinstance(value, tensorplay.Tensor):
             device = value.device
