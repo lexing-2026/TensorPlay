@@ -61,18 +61,6 @@ def cpu(self):
     """
     return self.to(_C.Device(_C.DeviceType.CPU))
 
-def t(self):
-    """
-    Returns the transpose of the tensor.
-    Aliased to transpose(0, 1) to ensure correct autograd behavior (TransposeBackward).
-    """
-    ndim = self.dim()
-    if ndim > 2:
-        raise RuntimeError(f"t() expects a tensor with <= 2 dimensions, but self is {ndim}D")
-    if ndim < 2:
-        return self
-    return self.transpose(0, 1)
-
 def type(self, dtype=None, non_blocking=False, **kwargs):
     """
     Returns the type if dtype is not provided, else casts this object to the specified type.
@@ -117,22 +105,9 @@ Tensor.int = int
 Tensor.double = double
 Tensor.cuda = cuda
 Tensor.cpu = cpu
-Tensor.t = t
 Tensor.type = type
 
 
-
-
-def unfold(self, dimension, size, step):
-    """Returns a view of the original tensor which contains all slices of
-    size :attr:`size` from :attr:`self` in the dimension :attr:`dimension`,
-
-    view semantics, including 0-d inputs and error messages).
-    """
-    return _C.unfold(self, dimension, size, step)
-
-
-Tensor.unfold = unfold
 
 
 def register_hook(self, hook):
@@ -227,47 +202,6 @@ def register_post_accumulate_grad_hook(self, hook):
 
 
 Tensor.register_post_accumulate_grad_hook = register_post_accumulate_grad_hook
-
-
-# ---------------------------------------------------------------------------
-# The C++ binding takes a single sequence; normalize the variadic form here.
-# ---------------------------------------------------------------------------
-_orig_permute = Tensor.permute
-
-
-def _permute(self, *dims):
-    if len(dims) == 1 and isinstance(dims[0], (list, tuple)):
-        dims = dims[0]
-    return _orig_permute(self, list(dims))
-
-
-Tensor.permute = _permute
-
-
-# ---------------------------------------------------------------------------
-# generated TensorMethods binding also names the parameter `size`, so
-# t.expand(size=[2, 3]) is valid there; keep that surface here.
-# ---------------------------------------------------------------------------
-_orig_expand = Tensor.expand
-
-
-def _expand(self, *args, size=None, implicit=False):
-    if size is not None:
-        if args:
-            raise TypeError("expand() got multiple values for argument 'size'")
-        size = size
-    else:
-        size = args
-    if len(size) == 1:
-        s0 = size[0]
-        if isinstance(s0, (list, tuple)) or hasattr(s0, "__iter__"):
-            size = tuple(s0)
-    if implicit:
-        return _orig_expand(self, list(size), implicit=True)
-    return _orig_expand(self, list(size))
-
-
-Tensor.expand = _expand
 
 
 # ---------------------------------------------------------------------------

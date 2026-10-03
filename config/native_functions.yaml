@@ -3283,7 +3283,7 @@
 
 - func: unfold(Tensor(a) self, int dimension, int size, int step) -> Tensor(a)
   device_check: NoCheck
-  variants: function
+  variants: function, method
   dispatch:
     CPU: unfold_cpu
 
