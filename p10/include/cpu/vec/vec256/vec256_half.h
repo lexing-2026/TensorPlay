@@ -268,6 +268,7 @@ TP_LOAD_FP32_VECTORIZED_INIT(tensorplay::Half, fp16)
 
 #else // defined(CPU_CAPABILITY_AVX2)
 
+TP_CONVERT_NON_VECTORIZED_INIT(tensorplay::Half, half)
 TP_LOAD_FP32_NON_VECTORIZED_INIT_FALLBACK(tensorplay::Half, fp16)
 
 #endif // defined(CPU_CAPABILITY_AVX2)

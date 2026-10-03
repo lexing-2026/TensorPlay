@@ -115,6 +115,122 @@ def test_isa_probe_marker_persists(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# runtime headers a generated kernel is compiled against
+
+_RUNTIME_HELPERS_PROGRAM = r"""
+#include "tensorplay/GeneratedCode.h"
+#include "cpu/vec/functional.h"
+#include "irange.h"
+#include <cstdio>
+#include <vector>
+
+using namespace tensorplay::vec;
+
+int main() {
+  int failures = 0;
+  auto expect = [&](bool ok, const char* what) {
+    if (!ok) { std::printf("FAIL %s\n", what); ++failures; }
+  };
+
+  // A flat position splits with the last axis fastest, and a step moves the
+  // last axis first, carrying outward.
+  int64_t i = -1, j = -1, k = -1;
+  tensorplay::generated::data_index_init(int64_t(7), i, int64_t(2), j, int64_t(2), k, int64_t(3));
+  expect(i == 1 && j == 0 && k == 1, "data_index_init order");
+  tensorplay::generated::data_index_step(i, int64_t(2), j, int64_t(2), k, int64_t(3));
+  expect(i == 1 && j == 0 && k == 2, "data_index_step inner");
+  tensorplay::generated::data_index_step(i, int64_t(2), j, int64_t(2), k, int64_t(3));
+  expect(i == 1 && j == 1 && k == 0, "data_index_step carry");
+
+  // Every position of a range is handed out exactly once, to a worker whose
+  // number fits the scratch sized by the runtime's worker count.
+  std::vector<int> hits(1000, 0);
+  bool ids_ok = true;
+  tensorplay::generated::parallel_for(0, 1000, 1, [&](int64_t b, int64_t e) {
+    if (tensorplay::generated::get_thread_num() >= omp_get_max_threads()) ids_ok = false;
+    for (int64_t p = b; p < e; ++p) hits[p] += 1;
+  });
+  bool once = true;
+  for (int h : hits) once &= h == 1;
+  expect(once, "parallel_for covers each position once");
+  expect(ids_ok, "parallel_for worker numbers");
+
+  // Whole-register folds, a register-block transpose, and narrowing stores.
+  constexpr int L = Vectorized<float>::size();
+  float a[L];
+  for (int p = 0; p < L; ++p) a[p] = float(p + 1);
+  auto v = Vectorized<float>::loadu(a);
+  float s = vec_reduce_all([](Vectorized<float>& x, Vectorized<float>& y) { return x + y; }, v);
+  float m = vec_reduce_all([](Vectorized<float>& x, Vectorized<float>& y) { return maximum(x, y); }, v);
+  expect(s == float(L * (L + 1) / 2) && m == float(L), "vec_reduce_all");
+
+  VectorizedN<float, L> block;
+  float rows[L * L], cols[L * L];
+  for (int p = 0; p < L * L; ++p) rows[p] = float(p);
+  for (int r = 0; r < L; ++r) block[r] = Vectorized<float>::loadu(rows + r * L);
+  transpose_block(block);
+  for (int r = 0; r < L; ++r) block[r].store(cols + r * L);
+  bool transposed = true;
+  for (int r = 0; r < L; ++r)
+    for (int c = 0; c < L; ++c) transposed &= cols[r * L + c] == rows[c * L + r];
+  expect(transposed, "transpose_block");
+
+  float in[37];
+  for (int p = 0; p < 37; ++p) in[p] = 0.5f * p;
+  tensorplay::BFloat16 out[37];
+  map<tensorplay::BFloat16>([](Vectorized<float> x) { return x * Vectorized<float>(2.0f); }, out, in, 37);
+  expect(float(out[0]) == 0.f && float(out[17]) == 17.f && float(out[36]) == 36.f, "map narrowing");
+  tensorplay::BFloat16 twice[37];
+  map<tensorplay::BFloat16>([](Vectorized<float> x) { return x + x; }, twice, out, 37);
+  expect(float(twice[36]) == 72.f, "map through float");
+
+  int64_t ints[4] = {-3, 5, (int64_t(1) << 40) + 7, -(int64_t(1) << 45)};
+  auto as_double = convert_to_fp_of_same_size<double>(Vectorized<int64_t>::loadu(ints));
+  double back[Vectorized<double>::size()];
+  as_double.store(back);
+  expect(back[0] == -3.0 && back[2] == double((int64_t(1) << 40) + 7), "integer to double lanes");
+
+  std::printf("failures=%d\n", failures);
+  return failures;
+}
+"""
+
+
+@pytest.mark.parametrize("tier", ["native", "default"])
+def test_runtime_helpers_behave_on_every_tier(tmp_path, tier):
+    """The pieces a generated kernel calls into, compiled the way one is.
+
+    Each is checked by what it answers rather than by how it is written: the
+    order a flat position splits in, that a range is handed out once, the
+    register folds and transposes, and the conversions between float and the
+    narrow types.  The vector tier this machine picks is checked alongside the
+    plain one every machine has.
+    """
+    import subprocess
+
+    from tensorplay._stax.cpp_builder import package_paths
+
+    isa = pick_vec_isa() if tier == "native" else VecDefault()
+    include_dir, generated_include_dir, lib_dir = package_paths()
+    source = tmp_path / "helpers.cpp"
+    source.write_text(_RUNTIME_HELPERS_PROGRAM)
+    binary = tmp_path / "helpers"
+    cmd = [
+        get_cpp_compiler(), "-std=c++20", "-O2", "-fopenmp",
+        *isa.build_arch_flags(), *isa.definitions(),
+        f"-I{include_dir}", f"-I{generated_include_dir}",
+        str(source), "-o", str(binary),
+        f"-L{lib_dir}", "-lp10", f"-Wl,-rpath,{lib_dir}",
+        "-Wl,--unresolved-symbols=ignore-in-shared-libs",
+    ]
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    result = subprocess.run([str(binary)], capture_output=True, text=True,
+                            env={**os.environ, "OMP_NUM_THREADS": "4"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "failures=0" in result.stdout
+
+
+# ---------------------------------------------------------------------------
 # codegen: rendering structure
 
 

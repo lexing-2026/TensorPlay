@@ -14,6 +14,7 @@
 // the division and the end of that kernel, so one flag per unit is enough and
 // needs no state in the runtime library.
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -26,6 +27,7 @@
 #include <string>
 #include <type_traits>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "Allocator.h"
@@ -177,72 +179,44 @@ TP_ALWAYS_INLINE int get_thread_num() {
     return thread_num_slot();
 }
 
-// Hand a range to the pool, in pieces, and call back with each piece's bounds.
+// Hand a range to the runtime's workers, one piece each, and call back with
+// each piece's bounds.
 //
-// The pieces follow from a static schedule rather than from a queue, so a piece's
-// bounds follow from where it starts: two workers cannot be handed the same
-// element, and what one gets does not depend on what the others finished.  The
-// calling thread takes a piece too, rather than only waiting -- otherwise a
-// launch of one piece would spawn nothing and pay for the pool to find that out.
-//
-// A grain of zero or less means the caller has no opinion, so the pieces are as
-// wide as they can be while there are still as many of them as there are
-// workers: any wider and some worker has nothing to do, and any narrower and the
-// cost of handing out a piece starts to show.
+// The workers are the ones every other parallel loop of a generated kernel runs
+// on, and as many of them as the program asked for -- a launch that brought up
+// threads of its own would ignore that request and pay to start them on every
+// call.  The schedule is static: worker `t` takes the `t`-th of as many equal
+// pieces as there are workers, so a piece's bounds follow from its number and
+// no element is handed out twice.  A grain caps the worker count so that no
+// piece is narrower than it, and a call made from inside a parallel region runs
+// the whole range where it is rather than nesting another one.
 template <typename Body>
 void parallel_for(int64_t begin, int64_t end, int64_t grain, Body body) {
     const int64_t total = end - begin;
     if (total <= 0) {
         return;
     }
-    const unsigned reported = std::thread::hardware_concurrency();
-    int64_t workers = reported < 1u ? 1 : static_cast<int64_t>(reported);
-
-    int64_t chunk = grain;
-    if (chunk <= 0) {
-        // As many pieces as there are workers, so none is left with nothing and
-        // none is handed out more than once.
-        chunk = (total + workers - 1) / workers;
-        if (chunk < 1) {
-            chunk = 1;
-        }
+    int64_t workers = omp_get_max_threads();
+    if (grain > 0) {
+        workers = std::min<int64_t>(workers, (total + grain - 1) / grain);
     }
-
-    const int64_t by_chunk = (total + chunk - 1) / chunk;
-    if (workers > by_chunk) {
-        workers = by_chunk;
-    }
-    if (workers <= 1) {
+    if (workers <= 1 || omp_in_parallel()) {
+        thread_num_slot() = 0;
         body(begin, end);
         return;
     }
-    // Each worker's run is a whole number of pieces, so every run but the last is
-    // the same length and a worker can tell where it ends without asking anyone.
-    const int64_t per = ((total + workers - 1) / workers + chunk - 1) / chunk * chunk;
-
-    std::vector<std::thread> pool;
-    pool.reserve(static_cast<size_t>(workers - 1));
-    int64_t at = begin;
-    for (int64_t t = 1; t < workers; ++t) {
-        int64_t stop = at + per;
-        if (stop > end) {
-            stop = end;
+#pragma omp parallel num_threads(static_cast<int>(workers))
+    {
+        const int64_t count = omp_get_num_threads();
+        const int64_t tid = omp_get_thread_num();
+        const int64_t chunk = (total + count - 1) / count;
+        const int64_t first = begin + tid * chunk;
+        if (first < end) {
+            thread_num_slot() = static_cast<int>(tid);
+            body(first, std::min(end, first + chunk));
         }
-        if (stop <= at) {
-            break;
-        }
-        const int64_t num = static_cast<int64_t>(t);
-        pool.emplace_back([=]() {
-            thread_num_slot() = static_cast<int>(num);
-            body(at, stop);
-        });
-        at = stop;
     }
     thread_num_slot() = 0;
-    body(at, end);
-    for (auto& thread : pool) {
-        thread.join();
-    }
 }
 
 // Where host memory comes from.
@@ -340,128 +314,43 @@ TP_ALWAYS_INLINE Irange<T> irange(T end, T step) {
 // several axes are two different things, and the kernel that wants both spends
 // most of its body converting between them.  So the conversion is here once: hand
 // it a position and, per axis, a variable to write the coordinate into and the
-// length of that axis.  The last axis given varies fastest, so a position and the
-// coordinates are two accounts of the same place rather than two different
-// places.
+// length of that axis.  The last axis given varies fastest, as it does in the
+// tensor's own order, so a range of consecutive positions is a run along the
+// innermost axis -- which is what makes a worker's share of a range a set of
+// whole inner runs rather than one slice through every outer one.
 //
 // The coordinate is written to and the length is read, which is why the two are
 // taken differently: a caller writes the length as a value, because a length is
 // a fact, and names the coordinate as a variable, because that is what the
-// conversion is for.
-// Take a flat position apart into one coordinate per axis.
-//
-// A loop over a range of positions and a tensor whose elements are laid out by
-// several axes are two different things, and the kernel that wants both spends
-// most of its body converting between them.  So the conversion is here once: hand
-// it a position and, per axis, a variable to write the coordinate into and the
-// length of that axis.  The last axis given varies fastest, so a position and the
-// coordinates are two accounts of the same place rather than two different
-// places.
-//
-// The coordinate is written to and the length is read, which is why the two are
-// taken differently: a caller writes the length as a value, because a length is
-// a fact, and names the coordinate as a variable, because that is what the
-// conversion is for.
-//
-// One form per axis count rather than one form that counts.  A pack cannot be
-// indexed where the call is written, so a general form would walk the pack on
-// every call to work out which argument is the length and which is the
-// coordinate -- and a conversion that costs a walk is a conversion not worth
-// having.  One, two, three and four are the shapes a kernel walks; a fifth axis
-// is a tensor laid out more ways than anything here has a name for.
-template <typename C0, typename L0>
-TP_ALWAYS_INLINE void data_index_init(int64_t index, C0& c0, L0 l0) {
-    c0 = static_cast<C0>(index % l0);
+// conversion is for.  What comes back is the position with every axis taken
+// out, which is the coordinate of an axis outside all of the given ones.
+template <typename T>
+TP_ALWAYS_INLINE T data_index_init(T offset) {
+    return offset;
 }
 
-template <typename C0, typename L0, typename C1, typename L1>
-TP_ALWAYS_INLINE void data_index_init(
-    int64_t index, C0& c0, L0 l0, C1& c1, L1 l1) {
-    c1 = static_cast<C1>((index / l0) % l1);
-    c0 = static_cast<C0>(index % l0);
+template <typename T, typename C, typename L, typename... Rest>
+TP_ALWAYS_INLINE T data_index_init(T offset, C& c, L l, Rest&&... rest) {
+    offset = data_index_init(offset, std::forward<Rest>(rest)...);
+    c = static_cast<C>(offset % static_cast<T>(l));
+    return offset / static_cast<T>(l);
 }
 
-template <typename C0, typename L0, typename C1, typename L1, typename C2, typename L2>
-TP_ALWAYS_INLINE void data_index_init(
-    int64_t index, C0& c0, L0 l0, C1& c1, L1 l1, C2& c2, L2 l2) {
-    c2 = static_cast<C2>((index / l0 / l1) % l2);
-    c1 = static_cast<C1>((index / l0) % l1);
-    c0 = static_cast<C0>(index % l0);
+// One step along the axes: the last one moves, and an axis that runs past its
+// end comes back to the start of itself and moves the one outside it.  Returns
+// whether the step carried out of the first axis, which is when the whole set of
+// coordinates has come back to where it started.
+TP_ALWAYS_INLINE bool data_index_step() {
+    return true;
 }
 
-template <typename C0, typename L0, typename C1, typename L1, typename C2, typename L2,
-          typename C3, typename L3>
-TP_ALWAYS_INLINE void data_index_init(
-    int64_t index, C0& c0, L0 l0, C1& c1, L1 l1, C2& c2, L2 l2, C3& c3, L3 l3) {
-    c3 = static_cast<C3>((index / l0 / l1 / l2) % l3);
-    c2 = static_cast<C2>((index / l0 / l1) % l2);
-    c1 = static_cast<C1>((index / l0) % l1);
-    c0 = static_cast<C0>(index % l0);
-}
-
-// One step along the axes, resetting those that have run out.
-//
-// Every axis inside the one being stepped restarts, because a position that has
-// run past the end of an axis comes back to the start of it rather than
-// continuing into the next.
-//
-// The outermost axis is the caller's to move: it is walking the range the others
-// are nested inside, so stepping it here would step it twice.  So the form for a
-// given number of axes moves the axes inside the last and leaves that one alone.
-template <typename C0, typename L0>
-TP_ALWAYS_INLINE void data_index_step(C0& c0, L0 l0) {
-    c0 += 1;
-    if (c0 >= static_cast<C0>(l0)) {
-        c0 = 0;
+template <typename C, typename L, typename... Rest>
+TP_ALWAYS_INLINE bool data_index_step(C& c, L l, Rest&&... rest) {
+    if (data_index_step(std::forward<Rest>(rest)...)) {
+        c = (c + 1 == static_cast<C>(l)) ? C(0) : C(c + 1);
+        return c == 0;
     }
-}
-
-template <typename C0, typename L0, typename C1, typename L1>
-TP_ALWAYS_INLINE void data_index_step(C0& c0, L0 l0, C1& c1, L1 l1) {
-    c0 += 1;
-    if (c0 < static_cast<C0>(l0)) {
-        return;
-    }
-    c0 = 0;
-    c1 += 1;
-}
-
-template <typename C0, typename L0, typename C1, typename L1, typename C2, typename L2>
-TP_ALWAYS_INLINE void data_index_step(
-    C0& c0, L0 l0, C1& c1, L1 l1, C2& c2, L2 l2) {
-    c0 += 1;
-    if (c0 < static_cast<C0>(l0)) {
-        return;
-    }
-    c0 = 0;
-    c1 += 1;
-    if (c1 < static_cast<C1>(l1)) {
-        return;
-    }
-    c1 = 0;
-    c2 += 1;
-}
-
-template <typename C0, typename L0, typename C1, typename L1, typename C2, typename L2,
-          typename C3, typename L3>
-TP_ALWAYS_INLINE void data_index_step(
-    C0& c0, L0 l0, C1& c1, L1 l1, C2& c2, L2 l2, C3& c3, L3 l3) {
-    c0 += 1;
-    if (c0 < static_cast<C0>(l0)) {
-        return;
-    }
-    c0 = 0;
-    c1 += 1;
-    if (c1 < static_cast<C1>(l1)) {
-        return;
-    }
-    c1 = 0;
-    c2 += 1;
-    if (c2 < static_cast<C2>(l2)) {
-        return;
-    }
-    c2 = 0;
-    c3 += 1;
+    return false;
 }
 
 // A cascade (pairwise) summation accumulator for generated reduction kernels.

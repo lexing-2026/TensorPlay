@@ -451,11 +451,66 @@ inline scalar_t vec_reduce_all(
   return acc_arr[0];
 }
 
+// The whole-register fold, which a kernel folding one register per output does
+// once per output.  For float on the x86 tiers it folds the register against
+// shuffled copies of itself, halving the lanes still in play each step, so the
+// answer never leaves the register; every other type and tier folds through
+// memory as above.
+template <typename scalar_t, typename Op>
+struct VecReduceAllSIMD {
+  static inline scalar_t apply(
+      const Op& vec_fun,
+      const Vectorized<scalar_t>& acc_vec) {
+    return vec_reduce_all(vec_fun, acc_vec, Vectorized<scalar_t>::size());
+  }
+};
+
+#if defined(__GNUC__) && !defined(_MSC_VER)
+#if defined(CPU_CAPABILITY_AVX2)
+template <typename Op>
+struct VecReduceAllSIMD<float, Op> {
+  static inline float apply(
+      const Op& vec_fun,
+      const Vectorized<float>& acc_vec) {
+    using Vec = Vectorized<float>;
+    Vec v = acc_vec;
+    Vec v1 = _mm256_permute2f128_ps(v, v, 0x1);  // halves swapped
+    v = vec_fun(v, v1);
+    v1 = _mm256_shuffle_ps(v, v, 0x4E);  // pairs swapped
+    v = vec_fun(v, v1);
+    v1 = _mm256_shuffle_ps(v, v, 0xB1);  // neighbours swapped
+    v = vec_fun(v, v1);
+    return _mm256_cvtss_f32(v);
+  }
+};
+#endif
+#if defined(CPU_CAPABILITY_AVX512)
+template <typename Op>
+struct VecReduceAllSIMD<float, Op> {
+  static inline float apply(
+      const Op& vec_fun,
+      const Vectorized<float>& acc_vec) {
+    using Vec = Vectorized<float>;
+    Vec v = acc_vec;
+    Vec v1 = _mm512_shuffle_f32x4(v, v, 0x4E);  // halves swapped
+    v = vec_fun(v, v1);
+    v1 = _mm512_shuffle_f32x4(v, v, 0xB1);  // quarters swapped
+    v = vec_fun(v, v1);
+    v1 = _mm512_shuffle_ps(v, v, 0x4E);  // pairs swapped
+    v = vec_fun(v, v1);
+    v1 = _mm512_shuffle_ps(v, v, 0xB1);  // neighbours swapped
+    v = vec_fun(v, v1);
+    return _mm512_cvtss_f32(v);
+  }
+};
+#endif
+#endif
+
 template <typename scalar_t, typename Op>
 inline scalar_t vec_reduce_all(
     const Op& vec_fun,
     Vectorized<scalar_t> acc_vec) {
-  return vec_reduce_all(vec_fun, acc_vec, Vectorized<scalar_t>::size());
+  return VecReduceAllSIMD<scalar_t, Op>::apply(vec_fun, acc_vec);
 }
 
 template <typename T, int N, typename OpVec>

@@ -783,6 +783,31 @@ static inline Vectorized<T> binary_op_as_fp32(
 
 #else // CPU_CAPABILITY_AVX2
 
+// Without the 256-bit conversions the lanes go through memory: written out
+// in one type, converted element by element, and read back in the other.
+#define TP_CONVERT_NON_VECTORIZED_INIT(type, name)                  \
+  inline std::tuple<Vectorized<float>, Vectorized<float>>           \
+      convert_##name##_float(const Vectorized<type>& a) {           \
+    constexpr int64_t K = Vectorized<type>::size();                 \
+    __at_align__ float arr[K];                                      \
+    __at_align__ type arr2[K];                                      \
+    a.store(arr2);                                                  \
+    convert(arr2, arr, K);                                          \
+    return std::make_tuple(                                         \
+        Vectorized<float>::loadu(arr),                              \
+        Vectorized<float>::loadu(arr + Vectorized<float>::size())); \
+  }                                                                 \
+  inline Vectorized<type> convert_float_##name(                     \
+      const Vectorized<float>& a, const Vectorized<float>& b) {     \
+    constexpr int64_t K = Vectorized<type>::size();                 \
+    __at_align__ float arr[K];                                      \
+    __at_align__ type arr2[K];                                      \
+    a.store(arr);                                                   \
+    b.store(arr + Vectorized<float>::size());                       \
+    convert(arr, arr2, K);                                          \
+    return Vectorized<type>::loadu(arr2);                           \
+  }
+
 #define TP_LOAD_FP32_NON_VECTORIZED_INIT_FALLBACK(type, name)               \
   inline void load_fp32_from_##name(                                        \
       const type* data, Vectorized<float>& out) {                           \

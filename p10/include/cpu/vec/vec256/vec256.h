@@ -97,6 +97,57 @@ std::
   return _mm256_mask_i32gather_ps(src, base_addr, vindex, mask, scale);
 }
 
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ CONVERT ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Between a floating type and the integer type of the same width, lane for
+// lane.  The 256-bit tier has the 32-bit conversions as instructions; the
+// 64-bit ones are done with the exponent trick below.
+
+// Exact for inputs in [-2^51, 2^51]: adding 1.5 * 2^52 puts the integer in
+// the low mantissa bits, and subtracting the same constant's bit pattern
+// leaves the integer.
+template <>
+Vectorized<int64_t> inline convert_to_int_of_same_size<double>(
+    const Vectorized<double>& src) {
+  auto x = _mm256_add_pd(src, _mm256_set1_pd(0x0018000000000000));
+  return _mm256_sub_epi64(
+      _mm256_castpd_si256(x),
+      _mm256_castpd_si256(_mm256_set1_pd(0x0018000000000000)));
+}
+
+template <>
+Vectorized<int32_t> inline convert_to_int_of_same_size<float>(
+    const Vectorized<float>& src) {
+  return _mm256_cvttps_epi32(src);
+}
+
+// Each 64-bit integer is split into its two 32-bit halves, each half is
+// placed in the mantissa of a double with a known exponent, and the two
+// doubles are combined with the exponents' contribution taken back out.
+template <>
+Vectorized<double> inline convert_to_fp_of_same_size<double>(
+    const Vectorized<int64_t>& src) {
+  __m256i magic_i_lo = _mm256_set1_epi64x(0x4330000000000000); /* 2^52 */
+  __m256i magic_i_hi32 =
+      _mm256_set1_epi64x(0x4530000080000000); /* 2^84 + 2^63 */
+  __m256i magic_i_all =
+      _mm256_set1_epi64x(0x4530000080100000); /* 2^84 + 2^63 + 2^52 */
+  __m256d magic_d_all = _mm256_castsi256_pd(magic_i_all);
+
+  __m256i v_lo = _mm256_blend_epi32(
+      magic_i_lo, src, 0b01010101); /* low32 + 2^52 */
+  __m256i v_hi = _mm256_srli_epi64(src, 32);
+  v_hi = _mm256_xor_si256(v_hi, magic_i_hi32); /* high32 * 2^32 + 2^84 + 2^63 */
+  /* value = low32 + high32 * 2^32 = v_hi + v_lo - 2^52 - 2^63 - 2^84 */
+  __m256d v_hi_dbl = _mm256_sub_pd(_mm256_castsi256_pd(v_hi), magic_d_all);
+  return _mm256_add_pd(v_hi_dbl, _mm256_castsi256_pd(v_lo));
+}
+
+template <>
+Vectorized<float> inline convert_to_fp_of_same_size<float>(
+    const Vectorized<int32_t>& src) {
+  return _mm256_cvtepi32_ps(src);
+}
+
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ INTERLEAVE ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 template <>
 std::pair<Vectorized<double>, Vectorized<double>> inline interleave2<double>(

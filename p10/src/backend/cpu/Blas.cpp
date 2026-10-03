@@ -13,13 +13,31 @@
 #include "Parallel.h"
 #include "Utils.h"
 #include "Complex.h"
+#include "cpu/BlockGemm.h"
 
+#include <functional>
+#include <memory>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 #include <cmath>
 #include <cstring>
 #include <algorithm>
 #include <cstdint>
 #include <mutex>
+
+// The generated block-product kernels of the convolution library, where the
+// build has them.
+#ifdef USE_ONEDNN
+#include "oneapi/dnnl/dnnl_config.h"
+#if defined(DNNL_EXPERIMENTAL_UKERNEL) && (defined(__x86_64__) || defined(_M_X64))
+#include "oneapi/dnnl/dnnl_ukernel.hpp"
+#define TP_BLOCK_GEMM_UKERNEL 1
+#endif
+#endif
+#ifndef TP_BLOCK_GEMM_UKERNEL
+#define TP_BLOCK_GEMM_UKERNEL 0
+#endif
 
 #ifdef USE_MKL
 #include <mkl.h>
@@ -458,4 +476,191 @@ TENSORPLAY_LIBRARY_IMPL(CPU, Blas) {
 }
 
 }  // namespace cpu
+
+namespace {
+
+#if TP_BLOCK_GEMM_UKERNEL
+// A product shape the processor has a generated kernel for.  A block product is
+// called once per block of a much larger computation, with the same few shapes
+// over and over, so the kernel for a shape is generated once and kept: what a
+// library call spends per call on deciding how to compute a shape is spent here
+// once per shape instead.
+struct BlockGemmKey {
+    int64_t M, N, K, ld_a, ld_b, ld_c;
+    bool add_C;
+    bool operator==(const BlockGemmKey& o) const {
+        return M == o.M && N == o.N && K == o.K && ld_a == o.ld_a &&
+               ld_b == o.ld_b && ld_c == o.ld_c && add_C == o.add_C;
+    }
+};
+
+struct BlockGemmKeyHash {
+    size_t operator()(const BlockGemmKey& k) const {
+        size_t h = std::hash<int64_t>()(k.M);
+        for (int64_t v : {k.N, k.K, k.ld_a, k.ld_b, k.ld_c}) {
+            h = std::hash<int64_t>()(v) ^ (h << 1);
+        }
+        return std::hash<bool>()(k.add_C) ^ (h << 1);
+    }
+};
+
+struct BlockGemmKernel {
+    dnnl::ukernel::brgemm brg;
+    std::vector<uint8_t> scratchpad;
+    std::vector<std::pair<dnnl::memory::dim, dnnl::memory::dim>> offsets{{0, 0}};
+};
+
+// Whether this processor has the generated float kernel, which it does from
+// the 256-bit vector tier up; below that the library product is the one used.
+bool block_gemm_ukernel_available() {
+    static const bool available = [] {
+        try {
+            return dnnl::get_effective_cpu_isa() >= dnnl::cpu_isa::avx2 &&
+                   dnnl::ukernel::brgemm::get_B_pack_type(
+                       dnnl::memory::data_type::f32,
+                       dnnl::memory::data_type::f32) ==
+                       dnnl::ukernel::pack_type::no_trans;
+        } catch (...) {
+            return false;
+        }
+    }();
+    return available;
+}
+
+// The kernel for this shape on the calling thread, or null when none can be
+// made.  The cache is the thread's own: a kernel is executed on the thread
+// that made it ready, and readying one is a per-thread state of the unit.
+BlockGemmKernel* block_gemm_kernel(const BlockGemmKey& key) {
+    thread_local std::unordered_map<BlockGemmKey,
+                                    std::unique_ptr<BlockGemmKernel>,
+                                    BlockGemmKeyHash>
+        cache;
+    thread_local BlockGemmKernel* current = nullptr;
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+        std::unique_ptr<BlockGemmKernel> made;
+        try {
+            auto kernel = std::make_unique<BlockGemmKernel>();
+            kernel->brg = dnnl::ukernel::brgemm(
+                key.M, key.N, key.K, /*batch_size=*/1, key.ld_a, key.ld_b,
+                key.ld_c, dnnl::memory::data_type::f32,
+                dnnl::memory::data_type::f32, dnnl::memory::data_type::f32,
+                /*allow_empty=*/true);
+            if (kernel->brg) {
+                kernel->brg.set_add_C(key.add_C);
+                kernel->brg.finalize();
+                kernel->scratchpad.resize(kernel->brg.get_scratchpad_size());
+                kernel->brg.generate();
+                made = std::move(kernel);
+            }
+        } catch (...) {
+            made.reset();
+        }
+        it = cache.emplace(key, std::move(made)).first;
+    }
+    BlockGemmKernel* kernel = it->second.get();
+    if (kernel != nullptr && kernel != current) {
+        kernel->brg.set_hw_context();
+        current = kernel;
+    }
+    return kernel;
+}
+#endif
+
+// C (M x N, row stride ld_c) = A @ B (+ C), every operand in float.
+void block_gemm_float(int64_t M, int64_t N, int64_t K, int64_t ld_a,
+                      int64_t ld_b, int64_t ld_c, bool add_C, const float* A,
+                      const float* B, float* C) {
+    if (M <= 0 || N <= 0) return;
+#if TP_BLOCK_GEMM_UKERNEL
+    if (K > 0 && block_gemm_ukernel_available()) {
+        if (BlockGemmKernel* kernel =
+                block_gemm_kernel({M, N, K, ld_a, ld_b, ld_c, add_C})) {
+            kernel->brg.execute(A, B, kernel->offsets, C,
+                                kernel->scratchpad.data());
+            return;
+        }
+    }
+#endif
+#if defined(USE_MKL) || defined(USE_BLAS)
+    if (K > 0) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    static_cast<int>(M), static_cast<int>(N),
+                    static_cast<int>(K), 1.0f, A, static_cast<int>(ld_a), B,
+                    static_cast<int>(ld_b), add_C ? 1.0f : 0.0f, C,
+                    static_cast<int>(ld_c));
+        return;
+    }
+#endif
+    for (int64_t i = 0; i < M; ++i) {
+        float* c_row = C + i * ld_c;
+        if (!add_C) {
+            for (int64_t j = 0; j < N; ++j) c_row[j] = 0.0f;
+        }
+        for (int64_t p = 0; p < K; ++p) {
+            const float a = A[i * ld_a + p];
+            const float* b_row = B + p * ld_b;
+            for (int64_t j = 0; j < N; ++j) c_row[j] += a * b_row[j];
+        }
+    }
+}
+
+// The same product for sixteen-bit operands: both blocks are widened to float
+// first, which is the precision the product is defined in, and then multiplied
+// as float blocks.
+template <typename T>
+void block_gemm_widened(int64_t M, int64_t N, int64_t K, int64_t ld_a,
+                        int64_t ld_b, int64_t ld_c, bool add_C, const T* A,
+                        const T* B, float* C) {
+    thread_local std::vector<float> a_wide;
+    thread_local std::vector<float> b_wide;
+    a_wide.resize(static_cast<size_t>(std::max<int64_t>(M * K, 0)));
+    b_wide.resize(static_cast<size_t>(std::max<int64_t>(K * N, 0)));
+    for (int64_t i = 0; i < M; ++i) {
+        for (int64_t p = 0; p < K; ++p) {
+            a_wide[i * K + p] = static_cast<float>(A[i * ld_a + p]);
+        }
+    }
+    for (int64_t p = 0; p < K; ++p) {
+        for (int64_t j = 0; j < N; ++j) {
+            b_wide[p * N + j] = static_cast<float>(B[p * ld_b + j]);
+        }
+    }
+    block_gemm_float(M, N, K, K, N, ld_c, add_C, a_wide.data(), b_wide.data(), C);
+}
+
+}  // namespace
+
+void brgemm(int64_t M, int64_t N, int64_t K, int64_t ld_a, int64_t ld_b,
+            int64_t ld_c, bool add_C, const float* A, const float* B, float* C,
+            bool is_vnni) {
+    TP_CHECK(!is_vnni, "a float block product has no pair-interleaved form");
+    block_gemm_float(M, N, K, ld_a, ld_b, ld_c, add_C, A, B, C);
+}
+
+void brgemm(int64_t M, int64_t N, int64_t K, int64_t ld_a, int64_t ld_b,
+            int64_t ld_c, bool add_C, const BFloat16* A, const BFloat16* B,
+            float* C, bool is_vnni) {
+    TP_CHECK(!is_vnni,
+             "a pair-interleaved bfloat16 block needs a matrix unit this "
+             "library does not drive");
+    block_gemm_widened(M, N, K, ld_a, ld_b, ld_c, add_C, A, B, C);
+}
+
+void brgemm(int64_t M, int64_t N, int64_t K, int64_t ld_a, int64_t ld_b,
+            int64_t ld_c, bool add_C, const Half* A, const Half* B, float* C,
+            bool is_vnni) {
+    TP_CHECK(!is_vnni,
+             "a pair-interleaved half block needs a matrix unit this library "
+             "does not drive");
+    block_gemm_widened(M, N, K, ld_a, ld_b, ld_c, add_C, A, B, C);
+}
+
+bool could_pack(DType dtype) {
+    (void)dtype;
+    return false;
+}
+
+void brgemm_release(bool is_vnni) { (void)is_vnni; }
+
 }  // namespace tensorplay

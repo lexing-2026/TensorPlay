@@ -105,6 +105,34 @@ std::
 }
 
 
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ CONVERT ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Between a floating type and the integer type of the same width, lane for
+// lane; the 512-bit tier has all four as instructions.
+
+template <>
+Vectorized<int64_t> inline convert_to_int_of_same_size<double>(
+    const Vectorized<double>& src) {
+  return _mm512_cvtpd_epi64(src);
+}
+
+template <>
+Vectorized<int32_t> inline convert_to_int_of_same_size<float>(
+    const Vectorized<float>& src) {
+  return _mm512_cvttps_epi32(src);
+}
+
+template <>
+Vectorized<double> inline convert_to_fp_of_same_size<double>(
+    const Vectorized<int64_t>& src) {
+  return _mm512_cvtepi64_pd(src);
+}
+
+template <>
+Vectorized<float> inline convert_to_fp_of_same_size<float>(
+    const Vectorized<int32_t>& src) {
+  return _mm512_cvtepi32_ps(src);
+}
+
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ INTERLEAVE ~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 template <>
 std::pair<Vectorized<double>, Vectorized<double>> inline interleave2<double>(
