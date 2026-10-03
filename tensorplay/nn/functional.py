@@ -3380,6 +3380,22 @@ _CPU_FUSED_DTYPES = frozenset(
     (tensorplay.float16, tensorplay.bfloat16, tensorplay.float32, tensorplay.float64))
 
 
+_AUTOCAST_ELIGIBLE = frozenset((tensorplay.float32, tensorplay.float16, tensorplay.bfloat16))
+
+
+def _attention_dtype(t):
+    # The element type the kernel receives: both attention entries are cast
+    # to the autocast type under autocast, so a query left in single precision
+    # by a rotary embedding meets its half-precision value there anyway.
+    if (
+        t.dtype in _AUTOCAST_ELIGIBLE
+        and t.device.type == "cuda"
+        and tensorplay.is_autocast_enabled("cuda")
+    ):
+        return tensorplay.get_autocast_dtype("cuda")
+    return t.dtype
+
+
 def _plain_scaled_dot_product_attention(query, key, value, is_causal):
     # The fused entry point takes a self-attention call with the default
     # normaliser: one head count, one token count, and a head width inside the
@@ -3394,7 +3410,7 @@ def _plain_scaled_dot_product_attention(query, key, value, is_causal):
         and key.dim() == 4
         and value.dim() == 4
         and 0 < query.size(-1) <= _FUSED_MAX_HEAD_DIM
-        and key.dtype == query.dtype == value.dtype
+        and _attention_dtype(key) == _attention_dtype(query) == _attention_dtype(value)
         and key.size(-1) == query.size(-1) == value.size(-1)
         and key.size(0) == query.size(0) == value.size(0)
         and key.size(1) == query.size(1) == value.size(1)

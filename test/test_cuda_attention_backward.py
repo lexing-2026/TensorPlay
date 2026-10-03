@@ -99,3 +99,30 @@ def test_the_pair_a_compiled_region_calls(shape, causal, dtype):
         assert a.dtype == dtype and a.shape == b.shape
         err = ((a.double() - b).abs().max() / (b.abs().max() + 1e-6)).item()
         assert err < TOLERANCE[dtype], (name, err)
+
+
+def test_autocast_inputs_of_mixed_types_take_the_fused_pair():
+    # Under autocast a query and key left in single precision (a rotary
+    # embedding) and a half-precision value all reach the kernel in half
+    # precision, so the call takes the fused entry and its backward.
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(__file__))
+    from test_python_dispatch import RecordingMode
+
+    tp.manual_seed(0)
+    q = tp.randn(2, 4, 64, 64, device="cuda", requires_grad=True)
+    k = tp.randn(2, 4, 64, 64, device="cuda", requires_grad=True)
+    v = tp.randn(2, 4, 64, 64, device="cuda").half().requires_grad_(True)
+    with tp.autocast("cuda", dtype=tp.float16), RecordingMode() as mode:
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    assert any(n.startswith("_scaled_dot_product_attention_with_lse") for n in mode.names()), mode.names()
+    grad = tp.randn(2, 4, 64, 64, device="cuda").half()
+    got = tp.autograd.grad(out, (q, k, v), grad)
+
+    q64, k64, v64 = (t.detach().half().double().requires_grad_(True) for t in (q, k, v))
+    ref = _attention_by_hand(q64, k64, v64, True)
+    want = tp.autograd.grad(ref, (q64, k64, v64), grad.double())
+    for name, a, b in zip("qkv", got, want):
+        err = ((a.double() - b).abs().max() / (b.abs().max() + 1e-6)).item()
+        assert err < 2e-2, (name, err)
