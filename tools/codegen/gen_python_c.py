@@ -512,6 +512,79 @@ def _unique_keyword_probes(funcs, variant: str):
     return probes
 
 
+def _arg_type_smaller(t1, t2) -> bool:
+    """True when ``t1`` binds a strictly narrower set of Python objects than
+    ``t2`` at the same parameter position.
+
+    A zero-dim tensor argument binds both the tensor spellings and the
+    number spellings, so a group with a tensor-taking overload and a
+    number-taking twin is ambiguous: the number-taking parser would pull the
+    argument to the host through the Python number protocol (a device
+    round trip) while the tensor-taking kernel reads it on device.  The
+    tensor-taking overload therefore has to be tried first.
+    """
+    s1, s2 = str(t1), str(t2)
+    if s1 == "Scalar" and s2 == "Tensor":
+        return True
+    if s1 == "Scalar?" and s2 == "Tensor?":
+        return True
+    if s1 == "int64_t[]" and s2 in ("int64_t", "int64_t?"):
+        return True
+    if s1 == "Tensor[]" and s2.endswith("[]") and s2 != "Tensor[]":
+        return True
+    if s1 in ("int64_t", "SymInt") and s2 == "Tensor":
+        return True
+    return False
+
+
+def _canonical_overload_order(fs, variant: str) -> list:
+    """Try tensor-taking candidates before their number-taking twins.
+
+    Part of the call sites a number-taking overload serves are also served
+    by its tensor-taking sibling, and which one runs decides whether the
+    call stays on device.  This builds the same partial order the schema
+    conventions assume (tensor > number at a shared position, tensor lists
+    after other lists) and walks a topological sort of it, keeping schema
+    order for pairs the order does not relate.
+    """
+    group_args = [
+        [a for a in f.args
+         if a.name not in f.out_args
+         and not (variant == "method" and a.name == "self")]
+        for f in fs
+    ]
+
+    def smaller(i1: int, i2: int) -> bool:
+        a1, a2 = group_args[i1], group_args[i2]
+        if len(a1) != len(a2):
+            return False
+        equal = all(x.type == y.type for x, y in zip(a1, a2))
+        dominated = all(
+            x.type == y.type or _arg_type_smaller(x.type, y.type)
+            for x, y in zip(a1, a2))
+        return dominated and not equal
+
+    n = len(fs)
+    larger_than: dict[int, set[int]] = {
+        i: {j for j in range(n) if smaller(i, j)} for i in range(n)
+    }
+    larger_than = {i: rest for i, rest in larger_than.items() if rest}
+    if not larger_than:
+        return list(fs)
+    sorted_ids = [i for i in range(n) if i not in larger_than]
+    for _ in range(n):
+        if len(sorted_ids) == n:
+            break
+        for j in sorted(larger_than.keys()):
+            larger_than[j].difference_update(sorted_ids)
+            if not larger_than[j]:
+                del larger_than[j]
+                sorted_ids.append(j)
+    if len(sorted_ids) != n:
+        return list(fs)
+    return [fs[i] for i in sorted_ids]
+
+
 def _trailing_tensorlist(f, variant: str) -> bool:
     """True when the overload's last positional parameter is a tensor list.
 
@@ -971,6 +1044,7 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
     prop_table: list[str] = []
     claimed = plan_groups(ctx.funcs)
     for (variant, cname), fs in sorted(claimed.items()):
+        fs = _canonical_overload_order(fs, variant)
         base = f"pyop_{cname}_{variant}"
         multi = len(fs) > 1
         # A lone positional may fold into the trailing tensor list only when
