@@ -662,6 +662,29 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
             ]
             continue
 
+        if name in ('var_mean', 'std_mean') and 'function' in f.variants:
+            seen.add(name)
+            # Same surface as var/std: the axes come second, ``correction`` is
+            # keyword-only and ``unbiased`` its boolean spelling.  Both reach
+            # the correction overload, which also takes ``dim=None`` for a
+            # reduction over every axis.
+            lines += [
+                f'def {name}(input, dim=None, unbiased=None, keepdim=False, *, correction=None):',
+                '    if _capturing():',
+                f'        _captured = _capture_call({name}, (input, dim, unbiased, keepdim), {{\"correction\": correction}})',
+                '        if _captured is not None:',
+                '            return _captured',
+                '    if correction is None:',
+                '        correction = 1 if (unbiased is None or unbiased) else 0',
+                '    if isinstance(dim, int) and not isinstance(dim, bool):',
+                '        dim = [dim]',
+                '    elif dim is not None:',
+                '        dim = list(dim)',
+                f'    return _C.{name}(input, dim, correction=correction, keepdim=keepdim)',
+                '',
+            ]
+            continue
+
         if name == 'squeeze_copy' and 'function' in f.variants:
             seen.add(name)
             # routes to the base overload, an int to .dim, a sequence to

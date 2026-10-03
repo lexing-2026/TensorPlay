@@ -5589,23 +5589,31 @@ def nansum(input, dim=[], keepdim=False, *, out=None):
             return _captured
     return _C.nansum(self=input, dim=dim, keepdim=keepdim)
 
-def std_mean(input, dim=[], unbiased=True, keepdim=False):
+def std_mean(input, dim=None, unbiased=None, keepdim=False, *, correction=None):
     if _capturing():
-        _captured = _capture_call(std_mean, (input, dim, unbiased, keepdim), {})
+        _captured = _capture_call(std_mean, (input, dim, unbiased, keepdim), {"correction": correction})
         if _captured is not None:
             return _captured
+    if correction is None:
+        correction = 1 if (unbiased is None or unbiased) else 0
     if isinstance(dim, int) and not isinstance(dim, bool):
         dim = [dim]
-    return _C.std_mean(input, dim, unbiased, keepdim)
+    elif dim is not None:
+        dim = list(dim)
+    return _C.std_mean(input, dim, correction=correction, keepdim=keepdim)
 
-def var_mean(input, dim=[], unbiased=True, keepdim=False):
+def var_mean(input, dim=None, unbiased=None, keepdim=False, *, correction=None):
     if _capturing():
-        _captured = _capture_call(var_mean, (input, dim, unbiased, keepdim), {})
+        _captured = _capture_call(var_mean, (input, dim, unbiased, keepdim), {"correction": correction})
         if _captured is not None:
             return _captured
+    if correction is None:
+        correction = 1 if (unbiased is None or unbiased) else 0
     if isinstance(dim, int) and not isinstance(dim, bool):
         dim = [dim]
-    return _C.var_mean(input, dim, unbiased, keepdim)
+    elif dim is not None:
+        dim = list(dim)
+    return _C.var_mean(input, dim, correction=correction, keepdim=keepdim)
 
 def trace(input):
     if _capturing():
