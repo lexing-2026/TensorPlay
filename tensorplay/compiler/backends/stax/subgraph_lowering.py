@@ -171,8 +171,6 @@ class PointwiseSubgraphLowering:
     def call_function(self, target: TargetType, args: Any, kwargs: dict[str, Any]) -> Any:
         """Lower one call, and hand back what it stands for."""
 
-        from .op_lowerings import LOWERINGS
-
         with self._op_context(target):
             # Indexing a result that was already produced is addressing, not
             # calling, so it is resolved rather than looked for a lowering.
@@ -190,14 +188,15 @@ class PointwiseSubgraphLowering:
             # the same operation and they are not the same object: the name is
             # what the table can be written and read in, and a lookup that used
             # the object would find nothing for every operation in it.
-            from .op_lowerings import target_name
+            from .op_lowerings import find_lowering, target_name
 
             name = target_name(target)
-            if name not in LOWERINGS:
+            lowering = find_lowering(name)
+            if lowering is None:
                 raise SubgraphLoweringException(
                     f"{name} not supported in subgraph, (missing lowering)"
                 )
-            return LOWERINGS[name](*args, **kwargs)
+            return lowering(*args, **kwargs)
 
     def run(self, *args: Any) -> None:
         """Walk the subgraph, lowering each of its calls as it is reached."""

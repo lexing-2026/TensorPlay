@@ -180,9 +180,9 @@ class TensorMeta:
             device=device,
             dtype=dtype,
             sizes=V.graph.sizevars.optimization_hints(node.get_size()),
-            strides=V.graph.sizevars.optimization_hints(node.layout.stride),
-            offset=V.graph.sizevars.optimization_hint(node.layout.offset),
-            name=node.name,
+            strides=V.graph.sizevars.optimization_hints(node.get_layout().stride),
+            offset=V.graph.sizevars.optimization_hint(node.get_layout().offset),
+            name=node.get_name(),
         )
 
     def to_tensor(self):

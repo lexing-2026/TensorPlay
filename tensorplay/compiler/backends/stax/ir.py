@@ -6712,14 +6712,13 @@ class ExternKernel(InputsKernel):
         one that is not has to be made so, and a copy is what makes it so.
         """
 
-        if isinstance(x, TensorBox):
-            x = x.data
-        if isinstance(x, StorageBox):
-            x = x.data
-        if isinstance(x, BaseView) and not isinstance(x, ReinterpretView):
-            x = cls.realize_input(x)
-        if is_stride_order_storage_and_layout(x, [0, 1]):
-            return x
+        # A buffer that already has an axis of unit stride is read as it is:
+        # that axis is the one the call walks one element at a time.  So is a
+        # buffer with no axes, which has nothing to walk.
+        if is_storage_and_layout(x):
+            strides = x.get_stride()
+            if len(strides) == 0 or any(stride == 1 for stride in strides):
+                return x
         return cls._shared_layout_copy(x, layout_key=("stride1",))
 
     @classmethod

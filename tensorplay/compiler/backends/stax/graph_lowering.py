@@ -88,7 +88,7 @@ from .loops import (
     set_ops_handler,
 )
 from .op_lowerings import (
-    LOWERINGS,
+    find_lowering,
     load_lowering_modules,
     target_name,
     user_lowerings,
@@ -2151,16 +2151,7 @@ class GraphLowering(Interpreter):
         lowering = None if in_place else (
             user_lowerings.get(node)
             or user_lowerings.get(target)
-            or LOWERINGS.get(name)
-            or LOWERINGS.get(f"{name}.Tensor")
-            or LOWERINGS.get(f"{name}.Scalar")
-            or LOWERINGS.get(f"{name}.default")
-            or LOWERINGS.get(f"{name}.int")
-            or LOWERINGS.get(f"{name}.dim")
-            or LOWERINGS.get(f"{name}.dims")
-            or LOWERINGS.get(f"{name}.dtype")
-            or LOWERINGS.get(f"{name}.device")
-            or LOWERINGS.get(f"{name}.dtype_layout")
+            or find_lowering(name)
         )
         with self.set_current_node(node), set_current_node(node):
             if lowering is not None:
@@ -2204,16 +2195,7 @@ class GraphLowering(Interpreter):
         lowering = (
             user_lowerings.get(node)
             or user_lowerings.get(target)
-            or LOWERINGS.get(name)
-            or LOWERINGS.get(f"{name}.Tensor")
-            or LOWERINGS.get(f"{name}.Scalar")
-            or LOWERINGS.get(f"{name}.default")
-            or LOWERINGS.get(f"{name}.int")
-            or LOWERINGS.get(f"{name}.dim")
-            or LOWERINGS.get(f"{name}.dims")
-            or LOWERINGS.get(f"{name}.dtype")
-            or LOWERINGS.get(f"{name}.device")
-            or LOWERINGS.get(f"{name}.dtype_layout")
+            or find_lowering(name)
         )
         with self.set_current_node(node), set_current_node(node):
             if lowering is not None:

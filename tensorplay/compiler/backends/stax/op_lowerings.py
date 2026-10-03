@@ -614,7 +614,9 @@ def decode_device(device: Any) -> Any:
     """
 
     if device is None:
-        return tp.device("cuda", 0)
+        # Unnamed is the device a new tensor would be made on, which is the
+        # processor unless the program said otherwise.
+        return tp.get_default_device()
     if isinstance(device, str):
         device = tp.device(device)
     if device.type not in ("cpu", "meta") and device.index is None:
@@ -1091,6 +1093,29 @@ def target_name(target) -> str:
     return str(getattr(target, "__name__", target))
 
 
+#: The overloads a call named without one is read as, in the order they are
+#: tried.  A call through the operator's packet, the function, or a tensor
+#: method carries the bare name, and the table is written per overload.
+_OVERLOAD_SUFFIXES = (
+    "", ".Tensor", ".Scalar", ".default", ".int", ".dim", ".dims", ".dtype",
+    ".device", ".dtype_layout",
+)
+
+
+def find_lowering(name: str):
+    """The lowering a call by this name is written by, or None.
+
+    Every walk that lowers calls asks this, so a call reads the same in a region
+    and in a region nested inside one.
+    """
+
+    for suffix in _OVERLOAD_SUFFIXES:
+        lowering = LOWERINGS.get(f"{name}{suffix}")
+        if lowering is not None:
+            return lowering
+    return None
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -1122,6 +1147,24 @@ def val_info(val):
     )
 
 
+def _extent(s):
+    """One extent of a loop nest: a number when it is one, its symbol otherwise.
+
+    Most extents are known when the region is lowered and are kept as plain
+    numbers.  Some are only known while the kernel runs -- how many positions
+    one group of a split takes, say, which the kernel decides from what it
+    reads -- and those stay the symbols they were made as, because there is no
+    number to give them yet.
+    """
+    if isinstance(s, int):
+        return s
+    if isinstance(s, sympy.Expr) and s.is_number:
+        return int(s)
+    if isinstance(s, sympy.Expr):
+        return s
+    return int(s)
+
+
 def is_tensor_box(x) -> bool:
     return isinstance(x, TensorBox)
 
@@ -1142,7 +1185,7 @@ def as_value_node(x, dtype, device):
     return Constant(value=x, dtype=dtype, device=device)
 
 
-def pointwise(fn, *inputs, val=None):
+def pointwise(fn, *inputs, val=None, out_dtype=None):
     # What the result is like is read from the inputs first: the first input's
     # extents and the device they live on say what the operation runs over,
     # and this is the one reading that holds whatever the call was handed --
@@ -1157,7 +1200,7 @@ def pointwise(fn, *inputs, val=None):
     if val is None:
         val = node_val()
     if hasattr(val, "get_size"):
-        size = tuple(int(s) for s in val.get_size())
+        size = tuple(_extent(s) for s in val.get_size())
         dtype = val.get_dtype()
         device = val.get_device()
     else:
@@ -1167,7 +1210,7 @@ def pointwise(fn, *inputs, val=None):
         target = functools.reduce(
             broadcast_symbolic_shapes, (x.get_size() for x in tensor_inputs), ()
         )
-        size = tuple(int(s) for s in target)
+        size = tuple(_extent(s) for s in target)
     loaders = [
         as_value_node(x, dtype, device).make_loader() for x in inputs
     ]
@@ -1175,7 +1218,14 @@ def pointwise(fn, *inputs, val=None):
     def inner(index):
         return fn(*[load(index) for load in loaders])
 
-    return Pointwise.create(device=device, dtype=dtype, inner_fn=inner, ranges=size)
+    # A number among the inputs is read in the inputs' type; the result may be
+    # of another type altogether, as a comparison's is.
+    return Pointwise.create(
+        device=device,
+        dtype=dtype if out_dtype is None else out_dtype,
+        inner_fn=inner,
+        ranges=size,
+    )
 
 
 def cast_to(value, dtype):
@@ -1339,21 +1389,34 @@ register_pointwise("lt.default", type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_
 register_pointwise("ge.default", type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.ALWAYS_BOOL)
 register_pointwise("gt.default", type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.ALWAYS_BOOL)
 register_pointwise("ne.default", type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.ALWAYS_BOOL)
-LOWERINGS["le.default"] = lower_le = _binary("le")
-LOWERINGS["lt.default"] = lower_lt = _binary("lt")
-LOWERINGS["ge.default"] = lower_ge = _binary("ge")
-LOWERINGS["gt.default"] = lower_gt = _binary("gt")
-LOWERINGS["ne.default"] = lower_ne = _binary("ne")
-LOWERINGS["eq.default"] = lower_eq = _binary("eq")
+
+
+def _comparison(_op: str):
+    """A lowering of a comparison: its answer is a truth value whatever it compared."""
+
+    fn = ops_wrapper(_op)
+
+    def lower(x, y):
+        return pointwise(fn, x, y, out_dtype=tp.bool)
+
+    return lower
+
+
+LOWERINGS["le.default"] = lower_le = _comparison("le")
+LOWERINGS["lt.default"] = lower_lt = _comparison("lt")
+LOWERINGS["ge.default"] = lower_ge = _comparison("ge")
+LOWERINGS["gt.default"] = lower_gt = _comparison("gt")
+LOWERINGS["ne.default"] = lower_ne = _comparison("ne")
+LOWERINGS["eq.default"] = lower_eq = _comparison("eq")
 #: The forms where one side is a plain number: a value asked whether it is
 #: below a bound is answered by the same comparison, with the number on the
 #: other side of it.
-LOWERINGS["le.Scalar"] = _binary("le")
-LOWERINGS["lt.Scalar"] = _binary("lt")
-LOWERINGS["ge.Scalar"] = _binary("ge")
-LOWERINGS["gt.Scalar"] = _binary("gt")
-LOWERINGS["ne.Scalar"] = _binary("ne")
-LOWERINGS["eq.Scalar"] = _binary("eq")
+LOWERINGS["le.Scalar"] = _comparison("le")
+LOWERINGS["lt.Scalar"] = _comparison("lt")
+LOWERINGS["ge.Scalar"] = _comparison("ge")
+LOWERINGS["gt.Scalar"] = _comparison("gt")
+LOWERINGS["ne.Scalar"] = _comparison("ne")
+LOWERINGS["eq.Scalar"] = _comparison("eq")
 #: The form between two values under the name the operation's own declaration
 #: gives it.  A region recorded operation by operation holds the comparison
 #: under that name, and without it the comparison is handed to the framework
@@ -1779,6 +1842,67 @@ def _slice(x, dim, start, end, step):
 @register("slice.Tensor")
 def lower_slice(x, dim=0, start=None, end=None, step=1):
     return _slice(x, dim, start, end, step)
+
+
+# The forms a kernel template addresses its operands through.  A template
+# names parts of a buffer as it writes the kernel -- a block of rows, the heads
+# in another order -- and gets back a box whose contents are a view of the
+# same storage, so the part it names is the memory it will read.  The extents
+# it names them by may be symbols the kernel gives numbers to while it runs,
+# which is why these keep every extent as the expression it was written in.
+
+
+def permute(x: TensorBox, dims: Any) -> TensorBox:
+    """The same buffer with its axes read in another order."""
+
+    if not isinstance(x, TensorBox):
+        raise AssertionError(f"expected a box, got {type(x)}")
+    return TensorBox(PermuteView.create(x.data, tuple(dims)))
+
+
+def slice_(x: TensorBox, dim: int = 0, start: Any = 0, end: Any = 2**63 - 1,
+           step: Any = 1, clamp: bool = True) -> TensorBox:
+    """Part of one axis of a buffer, as a view of it.
+
+    ``clamp`` brings the two ends inside the axis, which is what a slice in a
+    program means.  A template that has already worked its ends out says so
+    with ``clamp=False``, since an end it computed is the end it wants even
+    when it is a symbol the axis cannot be compared with.
+    """
+
+    if not isinstance(x, TensorBox):
+        raise AssertionError(f"expected a box, got {type(x)}")
+    dim = normalize_dim(dim, len(x.get_size()))
+    return TensorBox(SliceView.create(x.data, dim, start, end, step, clamp=clamp))
+
+
+def squeeze(x: TensorBox, dim: Any = None) -> TensorBox:
+    """A buffer without the axes of extent one it was asked to drop."""
+
+    if not isinstance(x, TensorBox):
+        raise AssertionError(f"expected a box, got {type(x)}")
+    if dim is None:
+        return TensorBox(SqueezeView.create(x.data))
+    size = list(x.get_size())
+    dims = {normalize_dim(d, len(size)) for d in (dim if isinstance(dim, (list, tuple)) else (dim,))}
+    new_size = [
+        s for d, s in enumerate(size)
+        if not (d in dims and V.graph.sizevars.guard_or_false(sympy.Eq(s, 1)))
+    ]
+    return view(x, new_size) if new_size != size else x
+
+
+def copy(dst: Any, src: Any, non_blocking: bool = False) -> TensorBox:
+    """A fresh buffer holding ``src`` as ``dst`` is: its device, type and extents."""
+
+    x = src
+    if x.get_device() != dst.get_device():
+        x = to_device(x, dst.get_device())
+    if x.get_dtype() != dst.get_dtype():
+        x = to_dtype(x, dst.get_dtype())
+    if list(x.get_size()) != list(dst.get_size()):
+        x = TensorBox(ExpandView.create(x.data if isinstance(x, TensorBox) else x, list(dst.get_size())))
+    return clone(x)
 
 
 @register("chunk.default")
@@ -4602,10 +4726,15 @@ register("new_ones.default")(_new_ones)
 
 
 def lower_full(size: Any, fill_value: Any, **kwargs: Any) -> Any:
-    """A tensor of one value, at a shape the program writes down."""
+    """A tensor of one value, at a shape the program writes down.
 
-    dtype = kwargs.get("dtype")
-    device = kwargs.get("device")
+    An extent may be a symbol the kernel only gives a number to while it runs,
+    so the shape is kept as the expressions it was written in.
+    """
+
+    dtype = kwargs.get("dtype") or tp.get_default_dtype()
+    device = decode_device(kwargs.get("device"))
+    size = [sympy.expand(s) if isinstance(s, sympy.Expr) else s for s in size]
     return _full(fill_value, device, dtype, size)
 
 
@@ -4621,7 +4750,10 @@ def lower_ones(size: Any, **kwargs: Any) -> Any:
     return lower_full(size, 1, **kwargs)
 
 
-register("full.default")(lower_full)
+# Also under the bare name, which is how a program that calls the function
+# itself rather than the operator reaches a region -- the mask a processor
+# kernel applies is one.
+register("full.default", "full")(lower_full)
 register("zeros.default")(lower_zeros)
 register("ones.default")(lower_ones)
 
@@ -6155,8 +6287,14 @@ def lower_where(cond, a, b):
     for i in range(len(args)):
         if isinstance(args[i], ir.Constant):
             args[i] = ExpandView.create(args[i], list(args[indices[0]].get_size()))
+    # The condition is read as the truth value it is; only the two values are
+    # brought to the type of the result.
+    cond = args[0]
+    if is_tensor_box(cond) and cond.get_dtype() != tp.bool:
+        cond = to_dtype(cond, tp.bool)
     return pointwise(
-        ops.where, to_dtype(args[0], dtype), to_dtype(args[1], dtype), to_dtype(args[2], dtype)
+        ops.where, cond, to_dtype(args[1], dtype), to_dtype(args[2], dtype),
+        out_dtype=dtype,
     )
 
 

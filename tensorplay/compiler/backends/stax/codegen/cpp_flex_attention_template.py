@@ -38,7 +38,7 @@ inline void {{kernel_name}}_exp_reduce_sum_fusion_kernel(
     auto tmp1 = tmp0 - vec_max;
     auto tmp2 = tmp1.exp_u20();
     vec_tmp_sum += tmp2;
-    _tp_store(out + i, tmp2);
+    tensorplay::vec::store(out + i, tmp2);
   }
   tmp_sum = tensorplay::vec::vec_reduce_all<T1>(
       [](tensorplay::vec::Vectorized<T1>& x, tensorplay::vec::Vectorized<T1>& y) {
@@ -72,7 +72,7 @@ inline void {{kernel_name}}_mul_reduce_max_fusion_kernel(
     auto tmp0 = tensorplay::vec::Vectorized<scalar_t>::loadu(a + i);
     auto tmp1 = tmp0 * vec_scale;
     vec_tmp_max = tensorplay::vec::maximum(vec_tmp_max, tmp1);
-    _tp_store(out + i, tmp1);
+    tensorplay::vec::store(out + i, tmp1);
   }
   for (long i = vec_size * (size / vec_size); i < size; i++) {
     auto tmp0 = a[i];
@@ -91,7 +91,7 @@ inline void {{kernel_name}}_mul_reduce_max_fusion_kernel(
 
 template <typename scalar_t>
 static inline scalar_t* {{kernel_name}}_conditional_data_ptr(scalar_t* ptr, scalar_t* ptr2) {
-  TORCH_CHECK(ptr2 == nullptr);
+  TP_CHECK(ptr2 == nullptr, "a float buffer is read where no narrower one was kept");
   return ptr;
 }
 
@@ -128,7 +128,7 @@ inline void {{kernel_name}}_mul_scale_kernel(
   for (int64_t i = 0; i < vec_size * (size / vec_size); i += vec_size) {
     auto tmp0 = tensorplay::vec::Vectorized<scalar_t>::loadu(a + i);
     auto tmp1 = tmp0 * vec_scale;
-    tensorplay::generated::_tp_store(a + i, tmp1);
+    tensorplay::vec::store(a + i, tmp1);
   }
   for (int64_t i = vec_size * (size / vec_size); i < size; i++) {
     auto tmp0 = a[i];
@@ -208,6 +208,10 @@ ALLOCATE_BUFFER = r"""
 INIT_PARAMS = r"""
 {{template.header().getvalue()}}
 #include "cpu/vec/vec.h"
+#include "cpu/vec/functional.h"
+#include "cpu/BlockGemm.h"
+#include "irange.h"
+#include "OpMathType.h"
 #include <cmath>
 #include <cstdint>
 {{template.codegen_micro_gemm(kernel.kernel_name)}}
@@ -226,14 +230,16 @@ extern "C"
   // dtypes
   using scalar_t = {{kernel.dtype(query)}};
   constexpr bool is_reduced_type = tensorplay::vec::is_reduced_floating_point_v<scalar_t>;
-  using accum_t = tensorplay::generated::opmath_type<{{kernel.dtype(query)}}>;
+  using accum_t = tensorplay::opmath_type<{{kernel.dtype(query)}}>;
   using Vec = tensorplay::vec::Vectorized<accum_t>;
   accum_t scaling_factor = {{scale}};
 
   // sizes
   int64_t qBlockSize = {{qBlockSize}};
   int64_t kvBlockSize = {{kvBlockSize}};
-  int64_t num_thread = {{num_thread}};
+  // Per-worker scratch is sized for every worker that may run, which is as
+  // many as the runtime has now even if that changed since this was written.
+  int64_t num_thread = std::max<int64_t>({{num_thread}}, omp_get_max_threads());
   int64_t batchSize = {{kernel.size(query, 0)}};
   int64_t qSize = {{kernel.size(query, 1)}};
   int64_t num_head = {{kernel.size(query, 2)}};
@@ -356,7 +362,7 @@ FLEX_ATTENTION_TEMPLATE = r"""
       int64_t i = 0, j = 0, l = 0, n = 0;
       scalar_t* transpose_ptr = need_pack? transpose_buffer_ptr + ompIdx * kvSplitSize * headSize : nullptr;
       tensorplay::generated::data_index_init(begin, i, batchSize_k, j, num_head_k, l, kvSlice);
-      for ([[maybe_unused]] auto z : tensorplay::generated::irange(begin, end)) {
+      for ([[maybe_unused]] auto z : tensorplay::irange(begin, end)) {
         n = l * kvSplitSize;
         int64_t cur_kvSplitSize = std::min(kvSplitSize, kvSize - n);
         auto k_addr =
@@ -414,7 +420,7 @@ FLEX_ATTENTION_TEMPLATE = r"""
             ? query_padding_ptr + ompIdx * qSplitSize * eheadSize
             : nullptr;
 
-    for ([[maybe_unused]] auto z : tensorplay::generated::irange(begin, end)) {
+    for ([[maybe_unused]] auto z : tensorplay::irange(begin, end)) {
       auto i_kvi = is_broadcast_bs_kvi ? i/bs_shards_kvi : i;
       auto j_kvi = is_broadcast_head_kvi ? j/gqa_shards_kvi : j;
       auto kv_logical_num_data = kv_num_blocks_data + i_kvi * num_kviStrideB +
@@ -692,8 +698,8 @@ FLEX_DECODING_TEMPLATE = r"""
   bool bs_head_independent_mod = true;
   int64_t first_num_kvblocks = kv_num_blocks[0];
   int64_t first_full_num_kvblocks = full_kv_num_blocks[0];
-  for (const auto& b : tensorplay::generated::irange(batchSize_kvi)) {
-    for (const auto& h : tensorplay::generated::irange(num_head_kvi)) {
+  for (const auto& b : tensorplay::irange(batchSize_kvi)) {
+    for (const auto& h : tensorplay::irange(num_head_kvi)) {
       if (*(kv_num_blocks + b * num_kviStrideB + h * num_kviStrideH) != first_num_kvblocks
           || *(full_kv_num_blocks + b * full_num_kviStrideB + h * full_num_kviStrideH) != first_full_num_kvblocks) {
         bs_head_independent_mod = false;
@@ -743,7 +749,7 @@ FLEX_DECODING_TEMPLATE = r"""
             ? logits_reduced_ptrs + ompIdx * PARTITION_SIZE
             : nullptr;
 
-    for ([[maybe_unused]] auto z : tensorplay::generated::irange(begin, end)) {
+    for ([[maybe_unused]] auto z : tensorplay::irange(begin, end)) {
       auto kvblock_offset = num_kvblocks_per_partition * partition_id;
       auto i_kvi = is_broadcast_bs_kvi ? i/bs_shards_kvi : i;
       auto j_kvi = is_broadcast_head_kvi ? j/gqa_shards_kvi : j;
@@ -791,7 +797,7 @@ FLEX_DECODING_TEMPLATE = r"""
         n_idx_start = 0;
         n_idx_end = kv_indice_num + full_kv_indice_num;
       }
-      for (int64_t n_idx : tensorplay::generated::irange(n_idx_start, n_idx_end)) {
+      for (int64_t n_idx : tensorplay::irange(n_idx_start, n_idx_end)) {
         auto n = n_idx < kv_indice_num ? kv_indice_list[n_idx]*kvSplitSize : full_kv_indice_list[n_idx - kv_indice_num]*kvSplitSize;
 {%- else %}
       int64_t n_idx_start = kvblock_offset;
@@ -800,7 +806,7 @@ FLEX_DECODING_TEMPLATE = r"""
         n_idx_start = 0;
         n_idx_end = kv_indice_num;
       }
-      for (int64_t n_idx : tensorplay::generated::irange(n_idx_start, n_idx_end)) {
+      for (int64_t n_idx : tensorplay::irange(n_idx_start, n_idx_end)) {
         auto n = kv_indice_list[n_idx]*kvSplitSize;
 {%- endif %}
         if (!bs_head_independent_mod
@@ -903,7 +909,7 @@ FLEX_DECODING_TEMPLATE = r"""
         n_idx_start = 0;
         n_idx_end = kv_indice_num + full_kv_indice_num;
       }
-      for (int64_t n_idx : tensorplay::generated::irange(n_idx_start, n_idx_end)) {
+      for (int64_t n_idx : tensorplay::irange(n_idx_start, n_idx_end)) {
         auto n = n_idx < kv_indice_num ? kv_indice_list[n_idx]*kvSplitSize : full_kv_indice_list[n_idx - kv_indice_num]*kvSplitSize;
 {%- else %}
       n_idx_start = kvblock_offset;
@@ -912,7 +918,7 @@ FLEX_DECODING_TEMPLATE = r"""
         n_idx_start = 0;
         n_idx_end = kv_indice_num;
       }
-      for (int64_t n_idx : tensorplay::generated::irange(n_idx_start, n_idx_end)) {
+      for (int64_t n_idx : tensorplay::irange(n_idx_start, n_idx_end)) {
         auto n = kv_indice_list[n_idx]*kvSplitSize;
 {%- endif %}
         if (!bs_head_independent_mod
@@ -987,7 +993,7 @@ FLEX_DECODING_TEMPLATE = r"""
     int64_t i = 0, j = 0;
     tensorplay::generated::data_index_init(begin, i, batchSize, j, num_head);
 
-    for ([[maybe_unused]] auto z : tensorplay::generated::irange(begin, end)) {
+    for ([[maybe_unused]] auto z : tensorplay::irange(begin, end)) {
       auto global_max = -std::numeric_limits<float>::infinity();
       auto global_exp_sum = 0.0;
 
@@ -1202,7 +1208,7 @@ class CppFlexAttentionTemplate(CppTemplate):
         subgraph_buffer_data = subgraph_buffer.data
         from ..loop_body import LoopBody
         from ..utils import sympy_index_symbol_with_prefix, SymT
-        from ...loops import V
+        from ..loops import V
         from .cpp import CppKernelProxy, KernelGroup, ParallelDepth
 
         kernel_group = KernelGroup()
@@ -1471,12 +1477,8 @@ class CppFlexAttentionTemplate(CppTemplate):
         )
 
     def micro_gemm_define(self, kernel_name: str):
-        from tp.compiler.backends.stax.codegen.cpp_gemm_template import (
-            CppTemplateKernel,
-            parallel_num_threads,
-        )
-        from tp.compiler.backends.stax.codegen.cpp_micro_gemm import CppMicroGemmFP32Vec
-
+        from .cpp_micro_gemm import CppMicroGemmFP32Vec
+        from .cpp_template_kernel import CppTemplateKernel
 
         micro_gemm_trans = CppMicroGemmFP32Vec(
             kernel_name + "_kernel_micro_gemm_transpose_b",

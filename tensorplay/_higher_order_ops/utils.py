@@ -433,11 +433,14 @@ def setup_compilation_env() -> Iterator[Any]:
     Context manager that sets up the environment and backend for ``compile``
     invoked inside a higher-order operator or an export region.
 
-    Yields the backend that the inner compile call should pass on.
+    Yields the backend that the inner compile call should pass on.  That is the
+    one that captures the region and then runs what it captured as it is: an
+    operator called outside a compiled program is asked for its answer, not for
+    a kernel, so the capture is there to give the operator a graph to run and
+    nothing is generated for it.
     """
-    from tensorplay.compiler import get_default_backend
 
-    yield get_default_backend()
+    yield "eager"
 
 
 # ---------------------------------------------------------------------------
