@@ -1986,12 +1986,64 @@ __global__ void tp_flash_bwd_convert_dq_kernel(
   ::tensorplay_native_flash::convert_dQ<KernelTraits>(params, nsplits);
 }
 
-template <typename ElementT, bool IsCausal, bool IsEvenMN>
+// The schedule each head width runs on: the block sizes and atom layouts the
+// launch template picks when the shared-memory budget is tight, which keeps
+// every entry launchable on the smallest sm80-and-newer part.  The widest
+// heads give up the Q double buffer to fit.
+template <int D, typename ElementT> struct BwdKernelTraitsFor;
+template <typename T> struct BwdKernelTraitsFor<32, T> {
+  using Traits = Flash_bwd_kernel_traits<32, 128, 128, 8, 4, 4, 4, true, false, T>;
+};
+template <typename T> struct BwdKernelTraitsFor<64, T> {
+  using Traits = Flash_bwd_kernel_traits<64, 64, 128, 8, 2, 4, 4, true, false, T>;
+};
+template <typename T> struct BwdKernelTraitsFor<96, T> {
+  using Traits = Flash_bwd_kernel_traits<96, 64, 128, 8, 2, 4, 4, true, false, T>;
+};
+template <typename T> struct BwdKernelTraitsFor<128, T> {
+  using Traits = Flash_bwd_kernel_traits<128, 64, 64, 8, 4, 2, 2, true, false, T>;
+};
+template <typename T> struct BwdKernelTraitsFor<192, T> {
+  using Traits = Flash_bwd_kernel_traits<192, 64, 64, 8, 4, 2, 2, true, true, T>;
+};
+template <typename T> struct BwdKernelTraitsFor<256, T> {
+  using Traits = Flash_bwd_kernel_traits<256, 64, 32, 8, 4, 1, 2, true, true, T>;
+};
+
+// The shared memory one launch of the schedule for ``D`` asks for.  The sizes
+// scale with the element width, and the two half-precision element types are
+// the same width, so one of them stands for both.
+template <int D>
+constexpr int bwd_launch_smem() {
+  using Traits = typename BwdKernelTraitsFor<D, cutlass::half_t>::Traits;
+  return std::max(Traits::kSmemSize1colblock, Traits::kSmemdQSize);
+}
+
+// The head widths a fused backward schedule exists for, and whether the
+// device offers the shared memory that schedule's launch asks for.
+bool flash_bwd_schedule_serves(int64_t d) {
+  int wanted = 0;
+  switch (d) {
+    case 32: wanted = bwd_launch_smem<32>(); break;
+    case 64: wanted = bwd_launch_smem<64>(); break;
+    case 96: wanted = bwd_launch_smem<96>(); break;
+    case 128: wanted = bwd_launch_smem<128>(); break;
+    case 192: wanted = bwd_launch_smem<192>(); break;
+    case 256: wanted = bwd_launch_smem<256>(); break;
+    default: return false;
+  }
+  int max_smem = 0;
+  TP_CUDA_CHECK(cudaDeviceGetAttribute(
+      &max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+      getCurrentCUDAStream().device_index()));
+  return wanted <= max_smem;
+}
+
+template <typename ElementT, int D, bool IsCausal, bool IsEvenMN>
 void launch_tp_flash_bwd_dq_dk_dv(
     const ::tensorplay_native_flash::Flash_bwd_params& params,
     dim3 grid, cudaStream_t stream) {
-  using KernelTraits = Flash_bwd_kernel_traits<
-      32, 128, 128, 8, 4, 4, 4, true, false, ElementT>;
+  using KernelTraits = typename BwdKernelTraitsFor<D, ElementT>::Traits;
   constexpr int smem_size = KernelTraits::kSmemSize1colblock;
   auto kernel = &tp_flash_bwd_dq_dk_dv_kernel<KernelTraits, IsCausal, IsEvenMN>;
   if (smem_size >= 48 * 1024) {
@@ -2002,16 +2054,15 @@ void launch_tp_flash_bwd_dq_dk_dv(
   TP_CUDA_CHECK(cudaGetLastError());
 }
 
-template <typename ElementT, bool IsCausal>
+template <typename ElementT, int D, bool IsCausal>
 void launch_tp_flash_bwd(
     ::tensorplay_native_flash::Flash_bwd_params& params,
-    int64_t B, int64_t H, int64_t T, cudaStream_t stream) {
-  using KernelTraits = Flash_bwd_kernel_traits<
-      32, 128, 128, 8, 4, 4, 4, true, false, ElementT>;
+    int64_t B, int64_t H, int64_t lq, int64_t lk, cudaStream_t stream) {
+  using KernelTraits = typename BwdKernelTraitsFor<D, ElementT>::Traits;
   const int m_blocks = static_cast<int>(
-      (T + KernelTraits::kBlockM - 1) / KernelTraits::kBlockM);
+      (lq + KernelTraits::kBlockM - 1) / KernelTraits::kBlockM);
   const int n_blocks = static_cast<int>(
-      (T + KernelTraits::kBlockN - 1) / KernelTraits::kBlockN);
+      (lk + KernelTraits::kBlockN - 1) / KernelTraits::kBlockN);
   const dim3 grid_m(m_blocks, static_cast<unsigned>(B), static_cast<unsigned>(H));
   const dim3 grid_n(n_blocks, static_cast<unsigned>(B), static_cast<unsigned>(H));
 
@@ -2019,11 +2070,13 @@ void launch_tp_flash_bwd(
       grid_m, KernelTraits::kNThreads, 0, stream>>>(params);
   TP_CUDA_CHECK(cudaGetLastError());
 
-  if (T % KernelTraits::kBlockM == 0) {
-    launch_tp_flash_bwd_dq_dk_dv<ElementT, IsCausal, true>(
+  // A row block runs past the end of its tensor unless the length divides
+  // the block height, and the query and key lengths each divide their own.
+  if (lq % KernelTraits::kBlockM == 0 && lk % KernelTraits::kBlockN == 0) {
+    launch_tp_flash_bwd_dq_dk_dv<ElementT, D, IsCausal, true>(
         params, grid_n, stream);
   } else {
-    launch_tp_flash_bwd_dq_dk_dv<ElementT, IsCausal, false>(
+    launch_tp_flash_bwd_dq_dk_dv<ElementT, D, IsCausal, false>(
         params, grid_n, stream);
   }
 
@@ -2038,15 +2091,19 @@ void launch_tp_flash_bwd(
   TP_CUDA_CHECK(cudaGetLastError());
 }
 
-template <typename ElementT, bool IsCausal>
-std::tuple<Tensor, Tensor, Tensor> sdpa_flash_backward_d32_impl(
+template <typename ElementT, int D, bool IsCausal>
+std::tuple<Tensor, Tensor, Tensor> sdpa_flash_backward_cute_impl(
     const Tensor& grad_output, const Tensor& query, const Tensor& key,
-    const Tensor& value, const Tensor& output, const Tensor& logsumexp) {
+    const Tensor& value, const Tensor& output, const Tensor& logsumexp,
+    double scale) {
   const int64_t B = query.size(0);
   const int64_t H = query.size(1);
-  const int64_t T = query.size(2);
-  constexpr int64_t D = 32;
-  const int64_t T_rounded = (T + 127) / 128 * 128;
+  const int64_t lq = query.size(2);
+  const int64_t lk = key.size(2);
+  // The accumulators the kernels walk over a 128-row pitch, whatever row
+  // block height the schedule for this head width runs.
+  const int64_t lq_rounded = (lq + 127) / 128 * 128;
+  const int64_t lk_rounded = (lk + 127) / 128 * 128;
 
   auto feature_contiguous = [](const Tensor& tensor) {
     return tensor.stride(3) == 1 ? tensor : tensor.contiguous();
@@ -2056,13 +2113,13 @@ std::tuple<Tensor, Tensor, Tensor> sdpa_flash_backward_d32_impl(
   Tensor v = feature_contiguous(value);
   Tensor go = feature_contiguous(grad_output);
   Tensor out = feature_contiguous(output);
-  Tensor d_q = Tensor::empty({B, H, T, D}, query.dtype(), query.device());
-  Tensor d_k = Tensor::empty({B, H, T, D}, query.dtype(), query.device());
-  Tensor d_v = Tensor::empty({B, H, T, D}, query.dtype(), query.device());
+  Tensor d_q = Tensor::empty({B, H, lq, D}, query.dtype(), query.device());
+  Tensor d_k = Tensor::empty({B, H, lk, D}, query.dtype(), query.device());
+  Tensor d_v = Tensor::empty({B, H, lk, D}, query.dtype(), query.device());
   Tensor dq_accum = Tensor::empty(
-      {B, T_rounded, H, D}, DType::Float32, query.device());
+      {B, lq_rounded, H, D}, DType::Float32, query.device());
   Tensor dsoftmax_sum = Tensor::empty(
-      {B, H, T_rounded}, DType::Float32, query.device());
+      {B, H, lq_rounded}, DType::Float32, query.device());
 
   ::tensorplay_native_flash::Flash_bwd_params params{};
   params.q_ptr = q.data_ptr();
@@ -2086,14 +2143,14 @@ std::tuple<Tensor, Tensor, Tensor> sdpa_flash_backward_d32_impl(
   params.h_k = static_cast<int>(H);
   params.h_h_k_ratio = 1;
   params.b = static_cast<int>(B);
-  params.seqlen_q = static_cast<int>(T);
-  params.seqlen_k = static_cast<int>(T);
-  params.seqlen_q_rounded = static_cast<int>(T_rounded);
-  params.seqlen_k_rounded = static_cast<int>(T_rounded);
-  params.total_q = static_cast<int>(B * T);
+  params.seqlen_q = static_cast<int>(lq);
+  params.seqlen_k = static_cast<int>(lk);
+  params.seqlen_q_rounded = static_cast<int>(lq_rounded);
+  params.seqlen_k_rounded = static_cast<int>(lk_rounded);
+  params.total_q = static_cast<int>(B * lq);
   params.d = static_cast<int>(D);
   params.d_rounded = static_cast<int>(D);
-  params.scale_softmax = 1.f / sqrtf(static_cast<float>(D));
+  params.scale_softmax = static_cast<float>(scale);
   params.scale_softmax_log2 = params.scale_softmax * 1.4426950408889634f;
   params.p_dropout = 1.f;
   params.p_dropout_in_uint8_t = 255;
@@ -2133,8 +2190,39 @@ std::tuple<Tensor, Tensor, Tensor> sdpa_flash_backward_d32_impl(
   params.dq_accum_split_stride = 0;
 
   const cudaStream_t stream = getCurrentCUDAStream().stream();
-  launch_tp_flash_bwd<ElementT, IsCausal>(params, B, H, T, stream);
+  launch_tp_flash_bwd<ElementT, D, IsCausal>(params, B, H, lq, lk, stream);
   return {d_q, d_k, d_v};
+}
+
+// The head width a call asks for picks the schedule its backward runs on.
+template <typename ElementT, bool IsCausal>
+std::tuple<Tensor, Tensor, Tensor> sdpa_flash_backward_cute_dispatch(
+    const Tensor& grad_output, const Tensor& query, const Tensor& key,
+    const Tensor& value, const Tensor& output, const Tensor& logsumexp,
+    int64_t d, double scale) {
+  switch (d) {
+    case 32:
+      return sdpa_flash_backward_cute_impl<ElementT, 32, IsCausal>(
+          grad_output, query, key, value, output, logsumexp, scale);
+    case 64:
+      return sdpa_flash_backward_cute_impl<ElementT, 64, IsCausal>(
+          grad_output, query, key, value, output, logsumexp, scale);
+    case 96:
+      return sdpa_flash_backward_cute_impl<ElementT, 96, IsCausal>(
+          grad_output, query, key, value, output, logsumexp, scale);
+    case 128:
+      return sdpa_flash_backward_cute_impl<ElementT, 128, IsCausal>(
+          grad_output, query, key, value, output, logsumexp, scale);
+    case 192:
+      return sdpa_flash_backward_cute_impl<ElementT, 192, IsCausal>(
+          grad_output, query, key, value, output, logsumexp, scale);
+    case 256:
+      return sdpa_flash_backward_cute_impl<ElementT, 256, IsCausal>(
+          grad_output, query, key, value, output, logsumexp, scale);
+    default:
+      TP_THROW(NotImplementedError,
+               "no fused attention backward for head width ", d);
+  }
 }
 #endif
 
@@ -2156,35 +2244,43 @@ std::tuple<Tensor, Tensor, Tensor> sdpa_backward_kernel_cuda_with_lse(
   }
   if (impl == 0 && query.dim() == 4 && key.dim() == 4 && value.dim() == 4 &&
       output.dim() == 4 && grad_output.dim() == 4 &&
-      query_c.size(3) == 32 && query_c.dtype() == grad_output_c.dtype() &&
+      query_c.size(3) == key_c.size(3) && key_c.size(3) == value_c.size(3) &&
+      query_c.dtype() == grad_output_c.dtype() &&
       query_c.dtype() == key_c.dtype() && query_c.dtype() == value_c.dtype() &&
       logsumexp.dtype() == DType::Float32 && logsumexp.is_contiguous() &&
       logsumexp.numel() == query_c.size(0) * query_c.size(1) * query_c.size(2) &&
       (query_c.dtype() == DType::Float16 || query_c.dtype() == DType::BFloat16)) {
 #if defined(TP_HAS_NATIVE_CUTE_FLASH)
-    int major = 0;
-    TP_CUDA_CHECK(cudaDeviceGetAttribute(
-        &major, cudaDevAttrComputeCapabilityMajor,
-        getCurrentCUDAStream().device_index()));
-    if (major >= 8 && query_c.size(2) > 0 &&
-        query_c.size(0) == key_c.size(0) && query_c.size(1) == key_c.size(1) &&
-        query_c.size(2) == key_c.size(2) && query_c.size(3) == key_c.size(3) &&
-        key_c.shape() == value_c.shape() && query_c.shape() == output_c.shape() &&
-        query_c.shape() == grad_output_c.shape()) {
-      if (is_causal) {
-        if (query_c.dtype() == DType::Float16) {
-          return sdpa_flash_backward_d32_impl<cutlass::half_t, true>(
-              grad_output_c, query_c, key_c, value_c, output_c, logsumexp);
+    if (flash_bwd_schedule_serves(query_c.size(3))) {
+      int major = 0;
+      TP_CUDA_CHECK(cudaDeviceGetAttribute(
+          &major, cudaDevAttrComputeCapabilityMajor,
+          getCurrentCUDAStream().device_index()));
+      if (major >= 8 && query_c.size(2) > 0 && key_c.size(2) > 0 &&
+          query_c.size(0) == key_c.size(0) && query_c.size(1) == key_c.size(1) &&
+          key_c.shape() == value_c.shape() && query_c.shape() == output_c.shape() &&
+          query_c.shape() == grad_output_c.shape()) {
+        const double s = composite::attention::resolve_scale(
+            std::nullopt, query_c.size(3));
+        if (is_causal) {
+          if (query_c.dtype() == DType::Float16) {
+            return sdpa_flash_backward_cute_dispatch<cutlass::half_t, true>(
+                grad_output_c, query_c, key_c, value_c, output_c, logsumexp,
+                query_c.size(3), s);
+          }
+          return sdpa_flash_backward_cute_dispatch<cutlass::bfloat16_t, true>(
+              grad_output_c, query_c, key_c, value_c, output_c, logsumexp,
+              query_c.size(3), s);
         }
-        return sdpa_flash_backward_d32_impl<cutlass::bfloat16_t, true>(
-            grad_output_c, query_c, key_c, value_c, output_c, logsumexp);
+        if (query_c.dtype() == DType::Float16) {
+          return sdpa_flash_backward_cute_dispatch<cutlass::half_t, false>(
+              grad_output_c, query_c, key_c, value_c, output_c, logsumexp,
+              query_c.size(3), s);
+        }
+        return sdpa_flash_backward_cute_dispatch<cutlass::bfloat16_t, false>(
+            grad_output_c, query_c, key_c, value_c, output_c, logsumexp,
+            query_c.size(3), s);
       }
-      if (query_c.dtype() == DType::Float16) {
-        return sdpa_flash_backward_d32_impl<cutlass::half_t, false>(
-            grad_output_c, query_c, key_c, value_c, output_c, logsumexp);
-      }
-      return sdpa_flash_backward_d32_impl<cutlass::bfloat16_t, false>(
-          grad_output_c, query_c, key_c, value_c, output_c, logsumexp);
     }
 #endif
   }
@@ -3032,8 +3128,9 @@ efficient_attention_forward_cuda(
 }
 
 // `_flash_attention_backward`: the fused backward serves the half-precision
-// self-attention shape with 32-wide heads, no window but the causal one, and
-// the scale the head width implies; every other call is the composite's.
+// self-attention shape -- any head width a schedule exists for, no window but
+// the causal one, no dropout, and either the scale the head width implies or
+// one the caller passes; every other call is the composite's.
 std::tuple<Tensor, Tensor, Tensor> flash_attention_backward_cuda(
     const Tensor& grad_out, const Tensor& query, const Tensor& key,
     const Tensor& value, const Tensor& out, const Tensor& logsumexp,
@@ -3050,35 +3147,35 @@ std::tuple<Tensor, Tensor, Tensor> flash_attention_backward_cuda(
       plain_window && query.dim() == 4 && key.dim() == 4 && value.dim() == 4 &&
       (dt == DType::Float16 || dt == DType::BFloat16) && key.dtype() == dt &&
       value.dtype() == dt && grad_out.dtype() == dt && out.dtype() == dt &&
-      query.size(3) == 32 && key.size(3) == 32 && value.size(3) == 32 &&
-      query.size(1) == key.size(1) && query.size(2) == key.size(2) &&
+      query.size(3) == key.size(3) && query.size(3) == value.size(3) &&
+      query.size(2) == key.size(2) &&
       key.shape() == value.shape() && query.shape() == out.shape() &&
-      query.shape() == grad_out.shape() && query.size(1) > 0 &&
+      query.shape() == grad_out.shape() && query.size(2) > 0 &&
+      query.size(1) > 0 && key.size(1) > 0 &&
       logsumexp.dtype() == DType::Float32 && logsumexp.is_contiguous() &&
-      logsumexp.numel() == query.size(0) * query.size(1) * query.size(2) &&
-      (!scale.has_value() ||
-       *scale == 1.0 / std::sqrt(static_cast<double>(query.size(3))));
+      logsumexp.numel() == query.size(0) * query.size(1) * query.size(2);
   if (fused) {
     int major = 0;
     TP_CUDA_CHECK(cudaDeviceGetAttribute(
         &major, cudaDevAttrComputeCapabilityMajor,
         getCurrentCUDAStream().device_index()));
-    if (major >= 8) {
+    if (major >= 8 && flash_bwd_schedule_serves(query.size(3))) {
       const bool causal = right == 0;
+      const double s = composite::attention::resolve_scale(scale, query.size(3));
       Tensor go = grad_out.transpose(1, 2), q = query.transpose(1, 2);
       Tensor k = key.transpose(1, 2), v = value.transpose(1, 2);
       Tensor o = out.transpose(1, 2);
       std::tuple<Tensor, Tensor, Tensor> grads;
       if (dt == DType::Float16) {
-        grads = causal ? sdpa_flash_backward_d32_impl<cutlass::half_t, true>(
-                             go, q, k, v, o, logsumexp)
-                       : sdpa_flash_backward_d32_impl<cutlass::half_t, false>(
-                             go, q, k, v, o, logsumexp);
+        grads = causal ? sdpa_flash_backward_cute_dispatch<cutlass::half_t, true>(
+                             go, q, k, v, o, logsumexp, query.size(3), s)
+                       : sdpa_flash_backward_cute_dispatch<cutlass::half_t, false>(
+                             go, q, k, v, o, logsumexp, query.size(3), s);
       } else {
-        grads = causal ? sdpa_flash_backward_d32_impl<cutlass::bfloat16_t, true>(
-                             go, q, k, v, o, logsumexp)
-                       : sdpa_flash_backward_d32_impl<cutlass::bfloat16_t, false>(
-                             go, q, k, v, o, logsumexp);
+        grads = causal ? sdpa_flash_backward_cute_dispatch<cutlass::bfloat16_t, true>(
+                             go, q, k, v, o, logsumexp, query.size(3), s)
+                       : sdpa_flash_backward_cute_dispatch<cutlass::bfloat16_t, false>(
+                             go, q, k, v, o, logsumexp, query.size(3), s);
       }
       return {std::get<0>(grads).transpose(1, 2), std::get<1>(grads).transpose(1, 2),
               std::get<2>(grads).transpose(1, 2)};
