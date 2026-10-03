@@ -39,12 +39,14 @@ struct PyOpKernelEntry {
     py::object composite;  // device-agnostic kernel (device_types=None)
 };
 
-// Leaky singleton: entries must outlive interpreter shutdown because the
-// dispatcher table (also process-lifetime) keeps raw trampoline pointers.
+// Kernel slots for Python-backed operators.  Every reader and writer runs
+// under the GIL -- all entry points live in this file and acquire it before
+// touching the map -- so the plain map carries no lock of its own and a
+// rehash during registration cannot interleave with a kernel selection.
+// Leaky by design: the dispatcher table (also process-lifetime) keeps raw
+// trampoline pointers.
 PyOpKernelEntry* py_op_entry(const std::string& op_name) {
     static auto* map = new std::unordered_map<std::string, PyOpKernelEntry>();
-    static auto* mutex = new std::mutex();
-    std::lock_guard<std::mutex> lock(*mutex);
     auto it = map->find(op_name);
     if (it == map->end()) {
         it = map->emplace(op_name, PyOpKernelEntry{}).first;
@@ -86,10 +88,24 @@ std::vector<Tensor> tensor_results_from_python(py::object result) {
     return py::cast<std::vector<Tensor>>(result);
 }
 
+// Acquires the GIL only when the calling thread does not already hold it;
+// every other caller pays one thread-state check instead of the full
+// ensure/release pair.
+struct GilIfExternal {
+    const bool held = PyGILState_Check() == 1;
+    PyGILState_STATE state;
+    GilIfExternal() : state(held ? PyGILState_UNLOCKED : PyGILState_Ensure()) {}
+    ~GilIfExternal() {
+        if (!held) {
+            PyGILState_Release(state);
+        }
+    }
+};
+
 std::vector<Tensor> invoke_python_kernel_by_name(
     const std::string& op_name,
     const std::vector<Tensor>& inputs) {
-    py::gil_scoped_acquire acquire;
+    GilIfExternal gil;
     py::object fn = select_py_kernel(op_name, inputs);
     // User kernels take per-tensor parameters, matching their signature at
     // registration time; results come back as one or many tensors.
@@ -113,7 +129,9 @@ py::object resolve_python_eager_call(const std::string& op_name) {
 }
 
 std::vector<Tensor> python_op_trampoline(const std::vector<Tensor>& inputs) {
-    const std::string op_name = t_active_python_op;
+    // A reference: the name lives in TLS and nothing between here and the
+    // last read can dispatch another operator to overwrite it.
+    const std::string& op_name = t_active_python_op;
     if (op_name.empty()) {
         TP_THROW(RuntimeError,
             "Python op trampoline invoked without an active operator name");
@@ -132,7 +150,7 @@ void ensure_stax_custom_op_executor() {
     tensorplay::stax::setCustomOpExecutor(
         [](const std::string& op_name,
            const std::vector<Tensor>& inputs) -> std::vector<Tensor> {
-            py::gil_scoped_acquire acquire;
+            GilIfExternal gil;
             py::object result;
             if (op_name.rfind("tp_stax::pointwise_", 0) == 0) {
                 py::object kernel = select_py_kernel(op_name, inputs);

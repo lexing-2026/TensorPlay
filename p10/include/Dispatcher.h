@@ -139,7 +139,10 @@ public:
     KernelFunction getKernel(const std::string& op_name, DispatchKey key);
 
     // Resolve an operator once and use the returned handle for subsequent
-    // calls.  The table is owned by the process-lifetime Dispatcher singleton.
+    // calls.  The table is owned by the process-lifetime Dispatcher
+    // singleton; an unknown name creates an (empty) table, so a handle
+    // resolved before a registration still sees the kernels registered
+    // into it later.  Hits are lock-free.
     OperatorHandle findHandle(const std::string& op_name);
     OperatorHandle findHandle(const char* op_name) {
         return findHandle(std::string(op_name));
@@ -161,10 +164,22 @@ public:
     bool has_kernel(const std::string& op_name, DispatchKey key) const;
 
 private:
-    Dispatcher() = default;
+    Dispatcher();
 
     std::unordered_map<std::string, std::unique_ptr<DispatchTable>> operators_;
     mutable std::mutex mutex_;
+
+    // Open-addressed mirror of the registry for lock-free lookups: a slot
+    // holds a table pointer once and is never emptied or reassigned, so a
+    // reader probes by hash and stops at the first empty slot.  Tables
+    // themselves stay owned by ``operators_``; slots only observe them.
+    static constexpr std::size_t kOpSlotCount = 1 << 12;
+    std::array<std::atomic<DispatchTable*>, kOpSlotCount> op_slots_;
+
+    // Publish ``table`` in the probe array.  Best effort: a full array
+    // leaves the table reachable only through the registry mutex, and
+    // lookups then take the slow path for that name.
+    void install_slot(DispatchTable* table);
 };
 // Helper for type-safe dispatch
 template<typename Return, typename... Args>
