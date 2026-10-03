@@ -156,6 +156,16 @@ def _kernel_args(f: NativeFunction):
     return [a for a in f.args if a.name != "requires_grad"]
 
 
+def _returns_input_alias(f: NativeFunction) -> bool:
+    """Whether a result is declared as possibly an input or a view of one."""
+
+    for r in f.returns:
+        annotation = getattr(r.source_return, "annotation", None)
+        if annotation is not None and not getattr(annotation, "is_write", False):
+            return True
+    return False
+
+
 def _emit_kernel(out: list[str], f: NativeFunction) -> str:
     sym = _symbol(f.func_name)
     args = _kernel_args(f)
@@ -188,10 +198,15 @@ def _emit_kernel(out: list[str], f: NativeFunction) -> str:
         f"{num_positional}, {_cpp_string(','.join(sorted(f.tags)))}, nullptr}};")
     out.append(f"{ret} kernel_{sym}({', '.join(params)}) {{")
     differentiable = [a.name for a in args if a.type.is_tensor_like]
-    if differentiable and not mutable and kind not in ("void", "mut_ref"):
+    if (differentiable and not mutable and kind not in ("void", "mut_ref")
+            and not _returns_input_alias(f)):
         # Differentiated through its composite kernel when it has no
         # derivative of its own (see implicit_autograd_kernel).  The guard
         # variable is spelled to stay clear of every schema argument name.
+        # A result that may be an input or a view of one (a conversion, a
+        # reshape) stays whole: its gradient reads nothing the composite
+        # makes, and a mode that rewrites values by type has to see the
+        # conversion itself rather than the copy it is made of.
         out.append(
             f"    if (KernelFunction ia_kernel = implicit_autograd_kernel(entry_{sym}, "
             f"first_requiring_grad({', '.join(differentiable)}))) {{")

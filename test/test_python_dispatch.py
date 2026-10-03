@@ -240,3 +240,19 @@ def test_composites_without_a_derivative_are_seen_through():
     with RecordingMode() as mode:
         tp.einsum("bij,bjk->bik", a.detach(), b)
     assert "einsum.default" in mode.names(), mode.names()
+
+
+def test_conversions_and_reshapes_are_seen_whole_with_history():
+    # A result that may be its input or a view of it is recorded as the call
+    # the program made, history or not: its gradient reads nothing the
+    # composite would make, and a mode rewriting values by type needs the
+    # conversion rather than the copy it is made of.
+    a = tp.randn(2, 3, requires_grad=True)
+    with RecordingMode() as mode:
+        half = a.half()
+        flat = half.float().reshape(6)
+    names = mode.names()
+    assert names.count("to.dtype") == 2, names
+    assert "reshape.default" in names and "copy_.default" not in names, names
+    flat.sum().backward()
+    assert tp.equal(a.grad, tp.ones(2, 3))
