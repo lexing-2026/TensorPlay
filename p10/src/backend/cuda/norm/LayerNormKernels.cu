@@ -1271,6 +1271,12 @@ std::tuple<Tensor, Tensor, Tensor> native_layer_norm_cuda(
 
     const bool has_weight = weight_opt.has_value() && weight_opt->defined();
     const bool has_bias = bias_opt.has_value() && bias_opt->defined();
+    // The affine terms are read one per normalized element: a shape of any
+    // other extent would be read past its end.
+    if (has_weight && static_cast<std::vector<int64_t>>(weight_opt->shape()) != normalized_shape)
+        TP_THROW(RuntimeError, "layer_norm: weight shape mismatch with normalized_shape");
+    if (has_bias && static_cast<std::vector<int64_t>>(bias_opt->shape()) != normalized_shape)
+        TP_THROW(RuntimeError, "layer_norm: bias shape mismatch with normalized_shape");
 
     Tensor in_contig = input.contiguous();
     Tensor weight = has_weight ? weight_opt->contiguous() : Tensor();

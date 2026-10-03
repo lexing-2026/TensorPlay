@@ -622,6 +622,14 @@ std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cpu(
 // ============================================================================
 
 
+// The kernels below walk an affine term as one dense run of normalized
+// elements; a term laid out otherwise (an expanded or strided view) is made
+// into one first.
+static std::optional<Tensor> dense_affine(const std::optional<Tensor>& term) {
+    if (!term.has_value() || !term->defined() || term->is_contiguous()) return term;
+    return term->contiguous();
+}
+
 static Tensor layer_norm_cpu_impl(
         const Tensor& input, const std::vector<int64_t>& normalized_shape,
         const std::optional<Tensor>& weight_opt,
@@ -645,6 +653,16 @@ static Tensor layer_norm_cpu_impl(
             TP_THROW(RuntimeError, "layer_norm: Input shape mismatch with normalized_shape");
         }
         inner_size *= normalized_shape[i];
+    }
+    // The affine terms are read one per normalized element: a shape of any
+    // other extent would be read past its end.
+    for (const auto* affine : {&weight_opt, &bias_opt}) {
+        if (affine->has_value() && (*affine)->defined() &&
+            static_cast<std::vector<int64_t>>((*affine)->shape()) != normalized_shape) {
+            TP_THROW(RuntimeError, affine == &weight_opt
+                ? "layer_norm: weight shape mismatch with normalized_shape"
+                : "layer_norm: bias shape mismatch with normalized_shape");
+        }
     }
     
     int64_t outer_size = inner_size == 0 ? 0 : input.numel() / inner_size;
@@ -1222,8 +1240,10 @@ static std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu_reduced(
 std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu(
                               const Tensor& grad_output, const Tensor& input,
                               const std::vector<int64_t>& normalized_shape,
-                              const std::optional<Tensor>& weight_opt,
-                              const std::optional<Tensor>& bias_opt, double eps) {
+                              const std::optional<Tensor>& weight_in,
+                              const std::optional<Tensor>& bias_in, double eps) {
+    const std::optional<Tensor> weight_opt = dense_affine(weight_in);
+    const std::optional<Tensor> bias_opt = dense_affine(bias_in);
     switch (input.dtype()) {
         case DType::Float32:
             return layer_norm_backward_cpu_typed<float>(
@@ -1246,8 +1266,10 @@ std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu(
 
 std::tuple<Tensor, Tensor, Tensor> native_layer_norm_cpu(
         const Tensor& input, const std::vector<int64_t>& normalized_shape,
-        const std::optional<Tensor>& weight_opt,
-        const std::optional<Tensor>& bias_opt, double eps) {
+        const std::optional<Tensor>& weight_in,
+        const std::optional<Tensor>& bias_in, double eps) {
+    const std::optional<Tensor> weight_opt = dense_affine(weight_in);
+    const std::optional<Tensor> bias_opt = dense_affine(bias_in);
     int64_t inner_size = 1;
     if (normalized_shape.empty())
         TP_THROW(RuntimeError, "native_layer_norm: normalized_shape must not be empty");
@@ -1264,9 +1286,11 @@ std::tuple<Tensor, Tensor, Tensor> native_layer_norm_cpu(
 std::tuple<Tensor, Tensor, Tensor> native_layer_norm_backward_cpu(
         const Tensor& grad_output, const Tensor& input,
         const std::vector<int64_t>& normalized_shape, const Tensor& mean,
-    const Tensor& rstd, const std::optional<Tensor>& weight_opt,
-        const std::optional<Tensor>& bias_opt,
+    const Tensor& rstd, const std::optional<Tensor>& weight_in,
+        const std::optional<Tensor>& bias_in,
         const std::vector<bool>& output_mask) {
+    const std::optional<Tensor> weight_opt = dense_affine(weight_in);
+    const std::optional<Tensor> bias_opt = dense_affine(bias_in);
     switch (input.dtype()) {
         case DType::Float32:
             return layer_norm_backward_cpu_typed<float>(
