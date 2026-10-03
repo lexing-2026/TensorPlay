@@ -723,12 +723,20 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
 
     if splat:
         P = user_pos
+        # The parser reads keyword values from the same array it reads
+        # positionals from -- at an + i once buf replaces args -- so the
+        # buffer must have room for the keyword values behind the folded
+        # positionals.  At most one value per kwlist slot is ever read.
+        KW_MAX = len(kw_names)
         body += [
-            f"        PyObject* buf[{P}];",
+            f"        PyObject* buf[{P + KW_MAX}];",
             # Seed every slot from args up front: the fold branches below may
             # rewrite only the tail slots, and ap=buf must never expose an
-            # uninitialized stack value to tpx_py_parse_into.
-            f"        for (Py_ssize_t i = 0; i < {P}; ++i) buf[i] = args[i];",
+            # uninitialized stack value to tpx_py_parse_into.  The call may
+            # deliver fewer positionals than P (then it cannot fold and buf
+            # goes unread), so the seed stops at what was delivered.
+            f"        Py_ssize_t tpx_seed = nargs < {P} ? nargs : (Py_ssize_t){P};",
+            "        for (Py_ssize_t i = 0; i < tpx_seed; ++i) buf[i] = args[i];",
             "        PyObject* const* ap = args;",
             "        Py_ssize_t an = nargs;",
             f"        if (nargs > {P}) {{",
@@ -767,6 +775,22 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
                 "            PyTuple_SET_ITEM(single, 0, ap[" + str(P - 1) + "]);",
                 "            buf[" + str(P - 1) + "] = single;",
                 "            ap = buf;",
+                "        }",
+            ]
+        if KW_MAX:
+            body += [
+                # Both rewrites above hand buf to the parser; keyword values
+                # still sit at the tail of the original args array, so they
+                # are carried behind the folded positionals here.  More
+                # keywords than kwlist slots cannot be read by the parser
+                # (an unknown name is rejected before its value is read),
+                # which bounds the copy.
+                "        if (ap != args && kwnames != nullptr) {",
+                "            Py_ssize_t tpx_nkw = PyTuple_GET_SIZE(kwnames);",
+                f"            if (tpx_nkw > {KW_MAX}) tpx_nkw = {KW_MAX};",
+                "            for (Py_ssize_t i = 0; i < tpx_nkw; ++i) {",
+                "                buf[an + i] = args[nargs + i];",
+                "            }",
                 "        }",
             ]
     else:
