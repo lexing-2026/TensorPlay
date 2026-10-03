@@ -1689,9 +1689,6 @@
   tags: [core, inplace_view]
 
 
-- func: normal(Tensor mean, Tensor std) -> Tensor
-  variants: function
-
 - func: abs(Tensor self) -> Tensor
   device_check: NoCheck
   variants: function, method
@@ -1748,7 +1745,7 @@
     CUDA: atan2_kernel_cuda
   tags: [core, pointwise]
 
-- func: poisson(Tensor self) -> Tensor
+- func: poisson(Tensor self, Generator? generator=None) -> Tensor
   device_check: NoCheck
   variants: function, method
   dispatch:
@@ -2325,21 +2322,21 @@
   dispatch:
     CPU: norm_dim_kernel
 
-- func: exponential_(Tensor(a!) self, float lambd=1.0) -> Tensor(a!)
+- func: exponential_(Tensor(a!) self, float lambd=1.0, *, Generator? generator=None) -> Tensor(a!)
   device_check: NoCheck
   variants: method
   dispatch:
     CPU: exponential_kernel
   tags: nondeterministic_seeded
 
-- func: geometric_(Tensor(a!) self, float p) -> Tensor(a!)
+- func: geometric_(Tensor(a!) self, float p, *, Generator? generator=None) -> Tensor(a!)
   device_check: NoCheck
   variants: method
   dispatch:
     CPU: geometric_kernel
   tags: nondeterministic_seeded
 
-- func: log_normal_(Tensor(a!) self, float mean=1.0, float std=2.0) -> Tensor(a!)
+- func: log_normal_(Tensor(a!) self, float mean=1.0, float std=2.0, *, Generator? generator=None) -> Tensor(a!)
   device_check: NoCheck
   variants: method
   dispatch:
@@ -2353,7 +2350,7 @@
     CPU: normal_inplace_kernel
   tags: nondeterministic_seeded
 
-- func: random_(Tensor(a!) self, int low=0, int high=0) -> Tensor(a!)
+- func: random_(Tensor(a!) self, *, Generator? generator=None) -> Tensor(a!)
   device_check: NoCheck
   variants: method
   dispatch:
@@ -2384,7 +2381,7 @@
     CUDA: bernoulli_scalar_inplace_kernel_cuda
   tags: nondeterministic_seeded
 
-- func: cauchy_(Tensor(a!) self, float median=0.0, float sigma=1.0) -> Tensor(a!)
+- func: cauchy_(Tensor(a!) self, float median=0.0, float sigma=1.0, *, Generator? generator=None) -> Tensor(a!)
   device_check: NoCheck
   variants: method
   dispatch:
@@ -2747,7 +2744,7 @@
   dispatch:
     CPU: instance_norm_backward_cpu
 
-- func: multinomial(Tensor self, SymInt num_samples, bool replacement=false, int impl=0) -> Tensor
+- func: multinomial(Tensor self, SymInt num_samples, bool replacement=false, *, Generator? generator=None) -> Tensor
   variants: function, method
   dispatch:
     CPU: multinomial_kernel_cpu
@@ -9750,7 +9747,6 @@
   tags: nondeterministic_seeded
 - func: normal.Tensor_Tensor(Tensor mean, Tensor std, *, Generator? generator=None) -> Tensor
   variants: function
-  cpp_no_default_args: ['generator']
   tags: nondeterministic_seeded
 - func: normal.float_float(float mean, float std, SymInt[] size, *, Generator? generator=None, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
   variants: function

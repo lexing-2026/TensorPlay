@@ -430,7 +430,8 @@ Tensor& normal_kernel_cuda(Tensor& self, double mean, double std,
 // transformation::exponential CUDA branch
 // (0, 1]; log(1) is 0 and the exponential distribution excludes 0, so values
 // within epsilon/2 of 1 clamp their log to -epsilon/2.
-Tensor& exponential_kernel_cuda(Tensor& self, double lambd) {
+Tensor& exponential_kernel_cuda(Tensor& self, double lambd,
+                                std::optional<Generator> generator) {
     if (!(lambd > 0.0)) {
         TP_THROW(RuntimeError,
                  "exponential_ expects lambda > 0.0, but found lambda=", lambd);
@@ -438,7 +439,7 @@ Tensor& exponential_kernel_cuda(Tensor& self, double lambd) {
     if (self.numel() == 0) return self;
     if (!self.is_contiguous()) {
         return fill_via_contiguous(self, [&](Tensor& t) {
-            return exponential_kernel_cuda(t, lambd);
+            return exponential_kernel_cuda(t, lambd, std::move(generator));
         });
     }
     int64_t n = self.numel();
@@ -452,7 +453,8 @@ Tensor& exponential_kernel_cuda(Tensor& self, double lambd) {
             [lambda] __device__ (float val) {
                 float log = val >= 1.f - kEps / 2 ? -kEps / 2 : __logf(val);
                 return -1.f / lambda * log;
-            });
+            },
+            std::move(generator));
     } else if (self.dtype() == DType::Float64) {
         double* data = self.data_ptr<double>();
         const double lambda = lambd;
@@ -463,7 +465,8 @@ Tensor& exponential_kernel_cuda(Tensor& self, double lambd) {
             [lambda] __device__ (double val) {
                 double log = val >= 1. - kEps / 2 ? -kEps / 2 : ::log(val);
                 return -1. / lambda * log;
-            });
+            },
+            std::move(generator));
     } else if (self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16) {
         if (self.dtype() == DType::Float16) {
             Half* data = self.data_ptr<Half>();
@@ -475,7 +478,8 @@ Tensor& exponential_kernel_cuda(Tensor& self, double lambd) {
                 [lambda] __device__ (float val) {
                     float log = val >= 1.f - kEps / 2 ? -kEps / 2 : __logf(val);
                     return static_cast<Half>(-1.f / lambda * log);
-                });
+                },
+                std::move(generator));
         } else {
             BFloat16* data = self.data_ptr<BFloat16>();
             const float lambda = static_cast<float>(lambd);
@@ -486,7 +490,8 @@ Tensor& exponential_kernel_cuda(Tensor& self, double lambd) {
                 [lambda] __device__ (float val) {
                     float log = val >= 1.f - kEps / 2 ? -kEps / 2 : __logf(val);
                     return static_cast<BFloat16>(-1.f / lambda * log);
-                });
+                },
+                std::move(generator));
         }
     } else {
         TP_THROW(NotImplementedError, "exponential_() only supports floating dtypes on CUDA for now");
@@ -498,31 +503,36 @@ Tensor& exponential_kernel_cuda(Tensor& self, double lambd) {
 // --- log_normal_ / cauchy_ / poisson / randperm ----------------------------
 
 template <typename scalar_t>
-void geometric_fill_float_cuda(scalar_t* data, int64_t n, float p) {
+void geometric_fill_float_cuda(scalar_t* data, int64_t n, float p,
+                               std::optional<Generator> generator) {
     distribution_nullary_kernel<scalar_t, float4, 4>(
         data, n,
         [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
         [p] __device__ (float val) {
             return static_cast<scalar_t>(::ceilf(::logf(val) / ::log1pf(-p)));
-        });
+        },
+        std::move(generator));
 }
 
-void geometric_fill_double_cuda(double* data, int64_t n, double p) {
+void geometric_fill_double_cuda(double* data, int64_t n, double p,
+                                std::optional<Generator> generator) {
     distribution_nullary_kernel<double, double2, 2>(
         data, n,
         [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform2_double(state); },
         [p] __device__ (double val) {
             return ::ceil(::log(val) / ::log1p(-p));
-        });
+        },
+        std::move(generator));
 }
 
-Tensor& geometric_kernel_cuda(Tensor& self, double p) {
+Tensor& geometric_kernel_cuda(Tensor& self, double p,
+                              std::optional<Generator> generator) {
     TP_THROW_IF(!(p > 0.0 && p < 1.0), RuntimeError,
                 "geometric_ expects p to be in (0, 1), but got p=", p);
     if (self.numel() == 0) return self;
     if (!self.is_contiguous()) {
         return fill_via_contiguous(self, [&](Tensor& t) {
-            return geometric_kernel_cuda(t, p);
+            return geometric_kernel_cuda(t, p, std::move(generator));
         });
     }
 
@@ -530,23 +540,28 @@ Tensor& geometric_kernel_cuda(Tensor& self, double p) {
     distribution::dispatch_dtype(self.dtype(), [&](auto tag) {
         using scalar_t = decltype(tag);
         if constexpr (std::is_same_v<scalar_t, double>) {
-            geometric_fill_double_cuda(self.data_ptr<double>(), n, p);
+            geometric_fill_double_cuda(self.data_ptr<double>(), n, p,
+                                       std::move(generator));
         } else {
             geometric_fill_float_cuda<scalar_t>(
-                self.data_ptr<scalar_t>(), n, static_cast<float>(p));
+                self.data_ptr<scalar_t>(), n, static_cast<float>(p),
+                std::move(generator));
         }
     });
     return self;
 }
 
-Tensor& log_normal_kernel_cuda(Tensor& self, double mean, double std) {
+Tensor& log_normal_kernel_cuda(Tensor& self, double mean, double std,
+                               std::optional<Generator> generator) {
     if (!(std > 0.0)) {
         TP_THROW(RuntimeError,
                  "log_normal_ expects std > 0.0, but found std=", std);
     }
     if (self.numel() == 0) return self;
     if (!self.is_contiguous()) {
-        return fill_via_contiguous(self, [&](Tensor& t) { return log_normal_kernel_cuda(t, mean, std); });
+        return fill_via_contiguous(self, [&](Tensor& t) {
+            return log_normal_kernel_cuda(t, mean, std, std::move(generator));
+        });
     }
     int64_t n = self.numel();
     if (self.dtype() == DType::Float32) {
@@ -557,13 +572,15 @@ Tensor& log_normal_kernel_cuda(Tensor& self, double mean, double std) {
         distribution_nullary_kernel<float, float4, 4>(
             data, n,
             [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
-            [mu, sigma] __device__ (float rand) { return ::expf(mu + sigma * rand); });
+            [mu, sigma] __device__ (float rand) { return ::expf(mu + sigma * rand); },
+            std::move(generator));
     } else if (self.dtype() == DType::Float64) {
         double* data = self.data_ptr<double>();
         distribution_nullary_kernel<double, double2, 2>(
             data, n,
             [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal2_double(state); },
-            [mean, std] __device__ (double rand) { return ::exp(mean + std * rand); });
+            [mean, std] __device__ (double rand) { return ::exp(mean + std * rand); },
+            std::move(generator));
     } else if (self.dtype() == DType::Float16) {
         Half* data = self.data_ptr<Half>();
         const float mu = static_cast<float>(mean);
@@ -573,7 +590,8 @@ Tensor& log_normal_kernel_cuda(Tensor& self, double mean, double std) {
             [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
             [mu, sigma] __device__ (float rand) {
                 return static_cast<Half>(::expf(mu + sigma * rand));
-            });
+            },
+            std::move(generator));
     } else if (self.dtype() == DType::BFloat16) {
         BFloat16* data = self.data_ptr<BFloat16>();
         const float mu = static_cast<float>(mean);
@@ -583,21 +601,25 @@ Tensor& log_normal_kernel_cuda(Tensor& self, double mean, double std) {
             [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
             [mu, sigma] __device__ (float rand) {
                 return static_cast<BFloat16>(::expf(mu + sigma * rand));
-            });
+            },
+            std::move(generator));
     } else {
         TP_THROW(NotImplementedError, "log_normal_() only supports floating dtypes on CUDA");
     }
     return self;
 }
 
-Tensor& cauchy_kernel_cuda(Tensor& self, double median, double sigma) {
+Tensor& cauchy_kernel_cuda(Tensor& self, double median, double sigma,
+                           std::optional<Generator> generator) {
     if (!(sigma > 0.0)) {
         TP_THROW(RuntimeError,
                  "cauchy_ expects sigma > 0.0, but found sigma=", sigma);
     }
     if (self.numel() == 0) return self;
     if (!self.is_contiguous()) {
-        return fill_via_contiguous(self, [&](Tensor& t) { return cauchy_kernel_cuda(t, median, sigma); });
+        return fill_via_contiguous(self, [&](Tensor& t) {
+            return cauchy_kernel_cuda(t, median, sigma, std::move(generator));
+        });
     }
     int64_t n = self.numel();
     constexpr double kPi = 3.14159265358979323846;
@@ -615,7 +637,8 @@ Tensor& cauchy_kernel_cuda(Tensor& self, double median, double sigma) {
                 val = val > 1.f - kEps ? 1.f - kEps : val;
                 val = val < kEps ? kEps : val;
                 return med + sig * ::tanf(static_cast<float>(kPi) * (val - 0.5f));
-            });
+            },
+            std::move(generator));
     } else if (self.dtype() == DType::Float64) {
         double* data = self.data_ptr<double>();
         distribution_nullary_kernel<double, double2, 2>(
@@ -623,7 +646,8 @@ Tensor& cauchy_kernel_cuda(Tensor& self, double median, double sigma) {
             [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform2_double(state); },
             [median, sigma] __device__ (double val) {
                 return median + sigma * ::tan(kPi * (val - 0.5));
-            });
+            },
+            std::move(generator));
     } else if (self.dtype() == DType::Float16) {
         Half* data = self.data_ptr<Half>();
         const float med = static_cast<float>(median);
@@ -637,7 +661,8 @@ Tensor& cauchy_kernel_cuda(Tensor& self, double median, double sigma) {
                 val = val < kEps ? kEps : val;
                 return static_cast<Half>(med + sig * ::tanf(
                     3.14159265358979323846f * (val - 0.5f)));
-            });
+            },
+            std::move(generator));
     } else if (self.dtype() == DType::BFloat16) {
         BFloat16* data = self.data_ptr<BFloat16>();
         const float med = static_cast<float>(median);
@@ -651,7 +676,8 @@ Tensor& cauchy_kernel_cuda(Tensor& self, double median, double sigma) {
                 val = val < kEps ? kEps : val;
                 return static_cast<BFloat16>(med + sig * ::tanf(
                     3.14159265358979323846f * (val - 0.5f)));
-            });
+            },
+            std::move(generator));
     } else {
         TP_THROW(NotImplementedError, "cauchy_() only supports floating dtypes on CUDA");
     }
@@ -660,7 +686,8 @@ Tensor& cauchy_kernel_cuda(Tensor& self, double median, double sigma) {
 
 template <typename scalar_t>
 void launch_random_range_cuda(scalar_t* data, int64_t n,
-                              uint64_t range, int64_t base) {
+                              uint64_t range, int64_t base,
+                              std::optional<Generator> generator = std::nullopt) {
     if (range >= (1ULL << 28)) {
         distribution_nullary_kernel<scalar_t, ulonglong2, 2>(
             data, n,
@@ -674,7 +701,8 @@ void launch_random_range_cuda(scalar_t* data, int64_t n,
             [range, base] __device__ (uint64_t value) {
                 return static_cast<scalar_t>(static_cast<int64_t>(
                     (value % range) + static_cast<uint64_t>(base)));
-            });
+            },
+            std::move(generator));
     } else {
         distribution_nullary_kernel<scalar_t, uint4, 4>(
             data, n,
@@ -685,47 +713,45 @@ void launch_random_range_cuda(scalar_t* data, int64_t n,
                 return static_cast<scalar_t>(static_cast<int64_t>(
                     (static_cast<uint64_t>(value) % range) +
                     static_cast<uint64_t>(base)));
-            });
-    }
-}
-
-template <typename scalar_t>
-void launch_random_full_range_cuda(scalar_t* data, int64_t n) {
-    if constexpr (std::is_same_v<scalar_t, uint64_t>) {
-        distribution_nullary_kernel<scalar_t, ulonglong2, 2>(
-            data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) {
-                ulonglong2 random;
-                uint4 words = curand4(state);
-                random.x = (static_cast<uint64_t>(words.x) << 32) | words.y;
-                random.y = (static_cast<uint64_t>(words.z) << 32) | words.w;
-                return random;
             },
-            [] __device__ (uint64_t value) {
-                return static_cast<scalar_t>(value);
-            });
-    } else {
-        uint64_t range;
-        if constexpr (std::is_same_v<scalar_t, int64_t>) {
-            range = uint64_t{1} << 63;
-        } else if constexpr (std::is_same_v<scalar_t, double>) {
-            range = uint64_t{1} << 53;
-        } else if constexpr (std::is_same_v<scalar_t, float>) {
-            range = uint64_t{1} << 24;
-        } else if constexpr (std::is_same_v<scalar_t, Half>) {
-            range = uint64_t{1} << 11;
-        } else if constexpr (std::is_same_v<scalar_t, BFloat16>) {
-            range = uint64_t{1} << 8;
-        } else if constexpr (std::is_same_v<scalar_t, bool>) {
-            range = 2;
-        } else {
-            range = static_cast<uint64_t>(std::numeric_limits<scalar_t>::max()) + 1;
-        }
-        launch_random_range_cuda(data, n, range, 0);
+            std::move(generator));
     }
 }
 
-static void randint_fill_dispatch(Tensor& t, int64_t low, int64_t high) {
+// Raw 64-bit draws, for a range covering every 64-bit value.
+template <typename scalar_t>
+void launch_random_bits_cuda(scalar_t* data, int64_t n,
+                             std::optional<Generator> generator) {
+    distribution_nullary_kernel<scalar_t, ulonglong2, 2>(
+        data, n,
+        [] __device__ (curandStatePhilox4_32_10_t* state) {
+            ulonglong2 random;
+            uint4 words = curand4(state);
+            random.x = (static_cast<uint64_t>(words.x) << 32) | words.y;
+            random.y = (static_cast<uint64_t>(words.z) << 32) | words.w;
+            return random;
+        },
+        [] __device__ (uint64_t value) {
+            return static_cast<scalar_t>(static_cast<int64_t>(value));
+        },
+        std::move(generator));
+}
+
+// Every value in [base, top]; a range that wraps to zero covers all 64-bit
+// values and is drawn as raw bits.
+template <typename scalar_t>
+void launch_random_upto_cuda(scalar_t* data, int64_t n, int64_t base,
+                             uint64_t top, std::optional<Generator> generator) {
+    const uint64_t range = top - static_cast<uint64_t>(base) + 1;
+    if (range == 0) {
+        launch_random_bits_cuda(data, n, std::move(generator));
+    } else {
+        launch_random_range_cuda(data, n, range, base, std::move(generator));
+    }
+}
+
+static void randint_fill_dispatch(Tensor& t, int64_t low, int64_t high,
+                                  std::optional<Generator> generator = std::nullopt) {
     int64_t n = t.numel();
     distribution::check_random_from_to_bounds(low, high, t.dtype());
     if (n == 0) return;
@@ -734,7 +760,8 @@ static void randint_fill_dispatch(Tensor& t, int64_t low, int64_t high) {
     const int64_t base = low;
     distribution::dispatch_dtype(t.dtype(), [&](auto tag) {
         using scalar_t = decltype(tag);
-        launch_random_range_cuda(t.data_ptr<scalar_t>(), n, range, base);
+        launch_random_range_cuda(t.data_ptr<scalar_t>(), n, range, base,
+                                 std::move(generator));
     });
 }
 
@@ -757,25 +784,59 @@ Tensor randint_like_kernel_cuda(const Tensor& self, int64_t low, int64_t high,
     return t;
 }
 
-Tensor& random_kernel_cuda(Tensor& self, int64_t low, int64_t high) {
-    const bool full_range = (low == 0 && high == 0);
-    if (!full_range && low >= high) {
-        TP_THROW(RuntimeError, "random_ expects 'from' to be less than 'to', but got from=", low, " >= to=", high);
-    }
+// `random_` without bounds: every value from zero up to the largest one the
+// dtype holds exactly.
+Tensor& random_kernel_cuda(Tensor& self, std::optional<Generator> generator) {
     if (!self.is_contiguous()) {
-        return fill_via_contiguous(self, [&](Tensor& t) { return random_kernel_cuda(t, low, high); });
-    }
-    int64_t n = self.numel();
-    if (full_range) {
-        if (n == 0) return self;
-        distribution::dispatch_dtype(self.dtype(), [&](auto tag) {
-            using scalar_t = decltype(tag);
-            launch_random_full_range_cuda(self.data_ptr<scalar_t>(), n);
+        return fill_via_contiguous(self, [&](Tensor& t) {
+            return random_kernel_cuda(t, std::move(generator));
         });
-    } else {
-        randint_fill_dispatch(self, low, high);
     }
+    const int64_t n = self.numel();
+    if (n == 0) return self;
+    distribution::dispatch_dtype(self.dtype(), [&](auto tag) {
+        using scalar_t = decltype(tag);
+        launch_random_upto_cuda(self.data_ptr<scalar_t>(), n, 0,
+                                distribution::unbounded_top<scalar_t>(),
+                                std::move(generator));
+    });
     return self;
+}
+
+// `random_.from`: [from, to), or from `from` up to the largest value the
+// dtype holds exactly when no upper bound is given.
+Tensor& random_from_kernel_cuda(Tensor& self, int64_t from,
+                                std::optional<int64_t> to,
+                                std::optional<Generator> generator) {
+    TP_THROW_IF(to.has_value() && *to <= from, RuntimeError,
+                "random_ expects 'from' to be less than 'to', but got from=",
+                from, " >= to=", to.value_or(from));
+    if (!self.is_contiguous()) {
+        return fill_via_contiguous(self, [&](Tensor& t) {
+            return random_from_kernel_cuda(t, from, to, std::move(generator));
+        });
+    }
+    if (to.has_value()) {
+        randint_fill_dispatch(self, from, *to, std::move(generator));
+        return self;
+    }
+    const int64_t n = self.numel();
+    distribution::dispatch_dtype(self.dtype(), [&](auto tag) {
+        using scalar_t = decltype(tag);
+        const uint64_t top = distribution::unbounded_top<scalar_t>();
+        TP_THROW_IF(from >= 0 && static_cast<uint64_t>(from) > top, RuntimeError,
+                    "random_ expects 'from' to be at most ", top, " for ",
+                    self.dtype(), ", but got from=", from);
+        if (n == 0) return;
+        launch_random_upto_cuda(self.data_ptr<scalar_t>(), n, from, top,
+                                std::move(generator));
+    });
+    return self;
+}
+
+Tensor& random_to_kernel_cuda(Tensor& self, int64_t to,
+                              std::optional<Generator> generator) {
+    return random_from_kernel_cuda(self, 0, to, std::move(generator));
 }
 
 template <typename output_t, typename probability_t>
@@ -1126,27 +1187,6 @@ Tensor bernoulli_p_kernel_cuda(const Tensor& self, double p,
 
 } // anonymous namespace
 
-Tensor normal_broadcast_kernel_cuda(const Tensor& mean, const Tensor& std) {
-    if (mean.device() != std.device()) {
-        TP_THROW(DeviceMismatchError, "normal: mean and std must be on the same device");
-    }
-    if (mean.dtype() != std.dtype()) {
-        TP_THROW(RuntimeError, "normal: mean and std must have the same dtype");
-    }
-    if (std.numel() > 0 && !std.ge(Scalar(0)).all().item<bool>()) {
-        TP_THROW(RuntimeError, "normal: standard deviation must be non-negative");
-    }
-
-    std::vector<int64_t> shape = broadcast_shapes(
-        static_cast<std::vector<int64_t>>(mean.shape()),
-        static_cast<std::vector<int64_t>>(std.shape()));
-    Tensor out(shape, mean.dtype(), mean.device());
-    if (out.numel() == 0) return out;
-    out.normal_(0.0, 1.0);
-    out.mul_(std).add_(mean);
-    return out;
-}
-
 /*
  * The registration table is kept at the end of the translation unit so every
  * overload has a complete schema-level function type before registration.
@@ -1165,12 +1205,13 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, RandomKernels) {
     m.impl("log_normal_", log_normal_kernel_cuda);
     m.impl("cauchy_", cauchy_kernel_cuda);
     m.impl("random_", random_kernel_cuda);
+    m.impl("random_.from", random_from_kernel_cuda);
+    m.impl("random_.to", random_to_kernel_cuda);
     m.impl("bernoulli", bernoulli_kernel_cuda);
     m.impl("bernoulli.out", bernoulli_out_kernel_cuda);
     m.impl("bernoulli.p", bernoulli_p_kernel_cuda);
     m.impl("bernoulli_.Tensor", bernoulli_tensor_inplace_kernel_cuda);
     m.impl("bernoulli_.float", bernoulli_scalar_inplace_kernel_cuda);
-    m.impl("normal", normal_broadcast_kernel_cuda);
     m.impl("randint", randint_stub_cuda);
     m.impl("randint_like", randint_like_kernel_cuda);
     m.impl("randperm", randperm_stub_cuda);

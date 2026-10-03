@@ -366,6 +366,27 @@ _PY_SIG_TYPE = {
 }
 
 
+_FACTORY_OPTIONS = frozenset({"dtype", "layout", "device", "pin_memory"})
+
+
+def _takes_requires_grad(f, variant: str) -> bool:
+    """Whether the overload takes a ``requires_grad`` keyword of its own.
+
+    A factory spelled with the full set of tensor options (dtype, layout,
+    device, pin_memory) creates a fresh leaf; on the Python surface every such
+    signature also takes ``requires_grad``, which marks the result.  The flag
+    is not part of the schema, so the entry point parses it beside the schema
+    arguments and applies it to the returned tensor.
+    """
+    if variant != "function" or f.out_args or f.cpp_return_kind != "value":
+        return False
+    if cpp_return_type(f) != "Tensor":
+        return False
+    names = {a.name for a in f.args if a.kwonly}
+    return _FACTORY_OPTIONS <= names and not any(
+        a.name == "requires_grad" for a in f.args)
+
+
 def _py_sig_default(dflt: str | None) -> str:
     if dflt is None:
         return ""
@@ -392,6 +413,8 @@ def _py_signature(f, variant: str) -> str:
             seen_kwonly = True
         cxx = _PY_SIG_TYPE.get(cpp_arg_type(a.type), cpp_arg_type(a.type))
         display.append(f"{cxx} {a.name}{_py_sig_default(a.default)}")
+    if _takes_requires_grad(f, variant):
+        display.append("bool requires_grad=False")
     return f"{f.base_name}({', '.join(display)})"
 
 
@@ -469,7 +492,7 @@ def _arity_max(f, variant: str) -> int | None:
     if pos and pos[-1].type.is_list:
         return None
     kwonly = [a for a in f.args if a.kwonly]
-    return len(pos) + len(kwonly)
+    return len(pos) + len(kwonly) + int(_takes_requires_grad(f, variant))
 
 
 def _unique_keyword_probes(funcs, variant: str):
@@ -477,6 +500,7 @@ def _unique_keyword_probes(funcs, variant: str):
     names = [
         {a.name for a in f.args
          if not (variant == "method" and a.name == "self")}
+        | ({"requires_grad"} if _takes_requires_grad(f, variant) else set())
         for f in funcs
     ]
     probes = []
@@ -554,6 +578,12 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
                 prelude.extend(["    return v;", "}", ""])
                 dflt = f"{helper}()"
         slots.append((a.name, tpl, dflt))
+    # The schema arguments the operator is called with; a factory's
+    # requires_grad flag rides behind them as one more keyword.
+    call_slots = list(slots)
+    marks_result = _takes_requires_grad(f, variant)
+    if marks_result:
+        slots.append(("requires_grad", _BRIDGE["bool"], "Py_False"))
 
     if f.cpp_return_kind not in _RET_SHAPES:
         raise SystemExit(
@@ -589,7 +619,7 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
               + ', nullptr};') if kw_names else \
              'static const char* kwlist[] = {nullptr};'
 
-    call = ", ".join("s_" + n for n, _, _ in slots)
+    call = ", ".join("s_" + n for n, _, _ in call_slots)
     # A hand-registered operation without a derivative is generated as an inline
     # wrapper that cannot be called through a function pointer, so the call is
     # made on the tensor instead.  Once the operation carries a derivative
@@ -604,7 +634,7 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
         and f.args[0].name == "self"
     )
     if use_member_entry:
-        method_call = ", ".join("s_" + n for n, _, _ in slots[1:])
+        method_call = ", ".join("s_" + n for n, _, _ in call_slots[1:])
         # An overload name says which reading of the operation this is; the
         # member it stands for is named without it.
         member = f.base_name if f.overload_name else f.cpp_name
@@ -637,8 +667,11 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
             invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {invoke_expr}; }}(); "
                       "return PyLong_FromLongLong(r);")
         elif ret_cpp == "Tensor":
+            mark = ("if (s_requires_grad) "
+                    "tensorplay::tpx::impl::set_requires_grad(r, true); "
+                    if marks_result else "")
             invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {invoke_expr}; }}(); "
-                      "return tpx_py_wrap(r);")
+                      f"{mark}return tpx_py_wrap(r);")
         else:
             pack = _pack_expr(ret_cpp, "r")
             if pack is None:
@@ -844,6 +877,8 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
     kind_consts = [_KIND_CONST.get(cpp_arg_type(a.type))
                    for i, a in enumerate(f.args)
                    if not (is_method and i == self_idx)]
+    if marks_result:
+        kind_consts.append(_KIND_CONST["bool"])
     if any(kind is None for kind in kind_consts):
         missing = next(
             cpp_arg_type(a.type) for i, a in enumerate(f.args)

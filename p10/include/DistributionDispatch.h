@@ -73,6 +73,25 @@ template <> inline double fp_dtype_max<BFloat16>() {
 template <typename T>
 inline double fp_dtype_lowest() { return -fp_dtype_max<T>(); }
 
+// The largest value a draw without an upper bound may take: every integer a
+// floating type represents exactly, or the integer type's own maximum.
+template <typename T>
+inline uint64_t unbounded_top() {
+    if constexpr (std::is_same_v<T, double>) {
+        return uint64_t{1} << 53;
+    } else if constexpr (std::is_same_v<T, float>) {
+        return uint64_t{1} << 24;
+    } else if constexpr (std::is_same_v<T, Half>) {
+        return uint64_t{1} << 11;
+    } else if constexpr (std::is_same_v<T, BFloat16>) {
+        return uint64_t{1} << 8;
+    } else if constexpr (std::is_same_v<T, bool>) {
+        return 1;
+    } else {
+        return static_cast<uint64_t>(std::numeric_limits<T>::max());
+    }
+}
+
 // 'from' and 'to - 1' of a discrete uniform draw over [from, to) must be
 // representable in the destination dtype.
 inline void check_random_from_to_bounds(int64_t low, int64_t high, DType dtype) {

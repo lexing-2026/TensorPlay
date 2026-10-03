@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <numeric>
+#include <optional>
 
 #if defined(USE_MKL)
 #include <mkl.h>
@@ -55,7 +56,8 @@ int64_t sample_from_weights(const float* row, int64_t cols) {
 
 } // namespace
 
-Tensor multinomial_kernel_cpu(const Tensor& self, int64_t num_samples, bool replacement, int64_t impl) {
+Tensor multinomial_kernel_cpu(const Tensor& self, int64_t num_samples, bool replacement,
+                              std::optional<Generator> generator) {
   if (num_samples < 0) {
     TP_THROW(RuntimeError, "multinomial: num_samples must be >= 0");
   }
@@ -86,7 +88,7 @@ Tensor multinomial_kernel_cpu(const Tensor& self, int64_t num_samples, bool repl
   int64_t* rdata = result.data_ptr<int64_t>();
   if (num_samples == 0) return result;
 
-  auto& gen = default_generator();
+  Generator& gen = generator.has_value() ? *generator : default_generator();
   for (int64_t r = 0; r < rows; ++r) {
     const float* row = pdata + r * cols;
     if (replacement) {

@@ -3,6 +3,7 @@
 #include "CUDARuntime.h"
 #include "Exception.h"
 #include "Allocator.h"
+#include "Generator.h"
 #include "CUDAContext.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include <cuda_runtime.h>
@@ -499,7 +500,8 @@ __global__ void fused_sample_kernel(
 // Host wrappers
 // ---------------------------------------------------------------------------
 
-Tensor multinomial_kernel_cuda(const Tensor& self, int64_t num_samples, bool replacement, int64_t impl) {
+Tensor multinomial_kernel_cuda(const Tensor& self, int64_t num_samples, bool replacement,
+                               std::optional<Generator> generator) {
   if (num_samples < 0) {
     TP_THROW(RuntimeError, "multinomial: num_samples must be >= 0");
   }
@@ -530,7 +532,7 @@ Tensor multinomial_kernel_cuda(const Tensor& self, int64_t num_samples, bool rep
     Tensor scores = Tensor::empty(
         static_cast<std::vector<int64_t>>(prob.shape()), DType::Float32,
         prob.device());
-    ops::exponential_(scores, 1.0);
+    ops::exponential_(scores, 1.0, generator);
     scores = ops::div(prob, scores);
     Tensor vals, idxs;
     std::tie(vals, idxs) = ops::topk(scores, num_samples, /*dim=*/-1,
@@ -544,18 +546,20 @@ Tensor multinomial_kernel_cuda(const Tensor& self, int64_t num_samples, bool rep
   if (num_samples == 0) return result;
 
   Tensor uniforms = Tensor::empty({rows * num_samples}, DType::Float32, prob.device());
-  uniforms.uniform_(0.0, 1.0);
+  ops::uniform_(uniforms, 0.0, 1.0, generator);
 
   constexpr int kThreads = 256;
-  Tensor cumdist = Tensor::empty({rows, cols}, DType::Float32, prob.device());
-  size_t smem = kThreads * sizeof(float);
 
-  if (impl == 1 && num_samples == 1) {
+  // A single draw per row is one scan over the row; several draws share one
+  // prefix sum and search it per draw.
+  if (num_samples == 1) {
     size_t smem_once = (kThreads + 2) * sizeof(float);
     scan_sample_kernel<<<rows, kThreads, smem_once, getCurrentCUDAStream().stream()>>>(
         prob.data_ptr<float>(), uniforms.data_ptr<float>(), result.data_ptr<int64_t>(), rows, cols);
     TP_CUDA_CHECK(cudaGetLastError());
   } else {
+    Tensor cumdist = Tensor::empty({rows, cols}, DType::Float32, prob.device());
+    size_t smem = kThreads * sizeof(float);
     prefix_renorm_kernel<<<rows, kThreads, smem, getCurrentCUDAStream().stream()>>>(
         prob.data_ptr<float>(), cumdist.data_ptr<float>(), rows, cols);
     TP_CUDA_CHECK(cudaGetLastError());

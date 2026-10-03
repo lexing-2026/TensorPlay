@@ -27,6 +27,7 @@
 #include <type_traits>
 #include <vector>
 #include "OutWrite.h"
+#include "Utils.h"
 
 namespace tensorplay {
 namespace composite {
@@ -2142,9 +2143,9 @@ Tensor sparse_compressed_tensor_with_dims_native(
 
 Tensor& multinomial_out_native(const Tensor& self, int64_t num_samples, bool replacement,
                                std::optional<Generator> generator, Tensor& out) {
-    (void)generator;
     return write_exact_out("multinomial",
-                           ops::multinomial(self, num_samples, replacement),
+                           ops::multinomial(self, num_samples, replacement,
+                                            std::move(generator)),
                            out);
 }
 
@@ -2363,6 +2364,93 @@ Tensor randperm_generator_native(int64_t n, std::optional<Generator> generator,
 
 Tensor& random_to_native(Tensor& self, int64_t to, std::optional<Generator> generator) {
     return ops::random_(self, 0, std::optional<int64_t>(to), generator);
+}
+
+// ---- randint into a destination ----------------------------------------------
+// The destination takes the requested size and is filled in its own dtype.
+Tensor& randint_low_generator_out_native(int64_t low, int64_t high,
+                                         const std::vector<int64_t>& size,
+                                         std::optional<Generator> generator,
+                                         Tensor& out) {
+    if (static_cast<std::vector<int64_t>>(out.shape()) != size) out.resize_(size);
+    return ops::random_(out, low, std::optional<int64_t>(high), std::move(generator));
+}
+
+Tensor& randint_low_out_native(int64_t low, int64_t high,
+                               const std::vector<int64_t>& size, Tensor& out) {
+    return randint_low_generator_out_native(low, high, size, std::nullopt, out);
+}
+
+Tensor& randint_generator_out_native(int64_t high, const std::vector<int64_t>& size,
+                                     std::optional<Generator> generator, Tensor& out) {
+    return randint_low_generator_out_native(0, high, size, std::move(generator), out);
+}
+
+Tensor& randint_out_native(int64_t high, const std::vector<int64_t>& size, Tensor& out) {
+    return randint_low_generator_out_native(0, high, size, std::nullopt, out);
+}
+
+// ---- normal ------------------------------------------------------------------
+// Standard draws, scaled by the deviation and shifted by the mean, so each
+// overload consumes the generator the same way normal_ does.
+namespace {
+
+void check_normal_std(double std) {
+    TP_THROW_IF(!(std >= 0.0), RuntimeError,
+                "normal expects std >= 0.0, but found std ", std);
+}
+
+void check_normal_std(const Tensor& std) {
+    TP_THROW_IF(isComplexType(std.dtype()), RuntimeError,
+                "normal expects standard deviation to be non-complex");
+    TP_THROW_IF(std.numel() > 0 && !std.ge(Scalar(0)).all().item<bool>(),
+                RuntimeError, "normal expects all elements of std >= 0.0");
+}
+
+}  // namespace
+
+Tensor normal_tensor_float_native(const Tensor& mean, double std,
+                                  std::optional<Generator> generator) {
+    check_normal_std(std);
+    Tensor out = Tensor::empty(static_cast<std::vector<int64_t>>(mean.shape()),
+                               mean.dtype(), mean.device());
+    ops::normal_(out, 0.0, std, std::move(generator));
+    return out.add_(mean);
+}
+
+Tensor normal_float_tensor_native(double mean, const Tensor& std,
+                                  std::optional<Generator> generator) {
+    check_normal_std(std);
+    Tensor out = Tensor::empty(static_cast<std::vector<int64_t>>(std.shape()),
+                               std.dtype(), std.device());
+    ops::normal_(out, 0.0, 1.0, std::move(generator));
+    return out.mul_(std).add_(Scalar(mean));
+}
+
+Tensor normal_tensor_tensor_native(const Tensor& mean, const Tensor& std,
+                                   std::optional<Generator> generator) {
+    check_normal_std(std);
+    TP_THROW_IF(mean.device() != std.device(), DeviceMismatchError,
+                "normal: mean and std must be on the same device");
+    Tensor out = Tensor::empty(
+        broadcast_shapes(static_cast<std::vector<int64_t>>(mean.shape()),
+                         static_cast<std::vector<int64_t>>(std.shape())),
+        mean.dtype(), mean.device());
+    ops::normal_(out, 0.0, 1.0, std::move(generator));
+    return out.mul_(std).add_(mean);
+}
+
+Tensor normal_float_float_native(double mean, double std,
+                                 const std::vector<int64_t>& size,
+                                 std::optional<Generator> generator,
+                                 std::optional<DType> dtype,
+                                 std::optional<int64_t> layout,
+                                 std::optional<Device> device,
+                                 std::optional<bool> pin_memory) {
+    (void)layout; (void)pin_memory;
+    check_normal_std(std);
+    Tensor out = ops::empty(size, dtype, device);
+    return ops::normal_(out, mean, std, std::move(generator));
 }
 
 Tensor range_step_native(const Scalar& start, const Scalar& end, const Scalar& step,
@@ -2754,6 +2842,14 @@ TENSORPLAY_LIBRARY_IMPL(Composite, VariantHandOps) {
     m.impl("randn_like.generator", randn_like_generator_native);
     m.impl("randperm.generator", randperm_generator_native);
     m.impl("random_.to", random_to_native);
+    m.impl("randint.out", randint_out_native);
+    m.impl("randint.generator_out", randint_generator_out_native);
+    m.impl("randint.low_out", randint_low_out_native);
+    m.impl("randint.low_generator_out", randint_low_generator_out_native);
+    m.impl("normal.Tensor_float", normal_tensor_float_native);
+    m.impl("normal.float_Tensor", normal_float_tensor_native);
+    m.impl("normal.Tensor_Tensor", normal_tensor_tensor_native);
+    m.impl("normal.float_float", normal_float_float_native);
     m.impl("range.step", range_step_native);
 
     m.impl("xlogy.Scalar_Other", xlogy_scalar_other_native);

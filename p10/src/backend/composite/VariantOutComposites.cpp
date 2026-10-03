@@ -515,11 +515,6 @@ Tensor& out_wrap_ormqr_out(const Tensor& self, const Tensor& input2, const Tenso
     return out;
 }
 
-Tensor& out_wrap_randint_low_out(int64_t low, int64_t high, const std::vector<int64_t>& size, Tensor& out) {
-    write_out(out, ops::randint(low, high, size, DType::Int64, std::nullopt, false));
-    return out;
-}
-
 Tensor& out_wrap_range_out(const Scalar& start, const Scalar& end, const Scalar& step, Tensor& out) {
     write_out(out, ops::range(start, end, step, std::optional<DType>(), std::optional<Device>()));
     return out;
@@ -850,7 +845,6 @@ TENSORPLAY_LIBRARY_IMPL(Composite, VariantWiringoutvariants) {
     m.impl("nll_loss_forward.output", composite::out_wrap_nll_loss_forward_output);
     m.impl("orgqr.out", composite::out_wrap_orgqr_out);
     m.impl("ormqr.out", composite::out_wrap_ormqr_out);
-    m.impl("randint.low_out", composite::out_wrap_randint_low_out);
     m.impl("range.out", composite::out_wrap_range_out);
     m.impl("range.out_", composite::out_wrap_range_out_);
     m.impl("reflection_pad1d.out", composite::out_wrap_reflection_pad1d_out);

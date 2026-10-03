@@ -67,7 +67,7 @@ __global__ void poisson_fill_impl(int64_t numel, PhiloxCudaState philox_args,
         curand_poisson(&state, static_cast<double>(in_data[idx])));
 }
 
-Tensor poisson_kernel_cuda(const Tensor& self) {
+Tensor poisson_kernel_cuda(const Tensor& self, std::optional<Generator> generator) {
     if (!isFloatingType(self.dtype())) {
         TP_THROW(NotImplementedError, "poisson() only supports floating dtypes on CUDA");
     }
@@ -85,7 +85,13 @@ Tensor poisson_kernel_cuda(const Tensor& self) {
     const uint64_t counter_offset = 16u *
         ((static_cast<uint64_t>(n) + threads * blocks - 1) / (threads * blocks) + 1) *
         kMaxGeneratorOffsetsPerCall;
-    auto philox_args = philox_cuda_state(counter_offset);
+    PhiloxCudaState philox_args;
+    if (generator.has_value()) {
+        philox_args.seed = generator->random64();
+        philox_args.offset = 0;
+    } else {
+        philox_args = philox_cuda_state(counter_offset);
+    }
 
     if (self.dtype() == DType::Float32) {
         poisson_fill_impl<float><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(

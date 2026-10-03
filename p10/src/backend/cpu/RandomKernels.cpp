@@ -386,52 +386,9 @@ Tensor bernoulli_p_kernel(const Tensor& self, double p,
     return out;
 }
 
-Tensor normal_kernel(const Tensor& mean, const Tensor& std) {
-    if (mean.device() != std.device()) {
-        TP_THROW(DeviceMismatchError, "normal: mean and std must be on the same device");
-    }
-    if (mean.dtype() != std.dtype()) {
-        TP_THROW(RuntimeError, "normal: mean and std must have the same dtype");
-    }
-
-    const std::vector<int64_t> out_shape = broadcast_shapes(
-        static_cast<std::vector<int64_t>>(mean.shape()),
-        static_cast<std::vector<int64_t>>(std.shape()));
-    Tensor out(out_shape, mean.dtype(), mean.device());
-    if (out.numel() == 0) {
-        return out;
-    }
-
-    Tensor mean_broadcast = mean.expand(out_shape).contiguous();
-    Tensor std_broadcast = std.expand(out_shape).contiguous();
-
-    dispatch_floating(mean.dtype(), [&](auto tag) {
-        using scalar_t = decltype(tag);
-        scalar_t* out_data = out.data_ptr<scalar_t>();
-        const scalar_t* mean_data = mean_broadcast.data_ptr<scalar_t>();
-        const scalar_t* std_data = std_broadcast.data_ptr<scalar_t>();
-        const int64_t n = out.numel();
-
-        for (int64_t i = 0; i < n; ++i) {
-            const double std_value = static_cast<double>(std_data[i]);
-            if (!(std_value >= 0.0)) {
-                TP_THROW(RuntimeError, "normal: standard deviation must be non-negative");
-            }
-        }
-
-        auto& gen = default_generator();
-        for (int64_t i = 0; i < n; ++i) {
-            normal_distribution<double> dist(static_cast<double>(mean_data[i]),
-                                             static_cast<double>(std_data[i]));
-            out_data[i] = static_cast<scalar_t>(dist(&gen));
-        }
-    });
-    return out;
-}
-
-Tensor poisson_kernel(const Tensor& self) {
+Tensor poisson_kernel(const Tensor& self, std::optional<Generator> generator) {
     Tensor out(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
-    auto& gen = default_generator();
+    Generator& gen = generator.has_value() ? *generator : default_generator();
 
     dispatch_floating(self.dtype(), [&](auto tag) {
         using scalar_t = decltype(tag);
@@ -1056,8 +1013,9 @@ Tensor& bernoulli_inplace_kernel(Tensor& self) {
     return self;
 }
 
-Tensor& cauchy_kernel(Tensor& self, double median, double sigma) {
-    auto& gen = default_generator();
+Tensor& cauchy_kernel(Tensor& self, double median, double sigma,
+                      std::optional<Generator> generator) {
+    Generator& gen = generator.has_value() ? *generator : default_generator();
     TP_THROW_IF(!(sigma > 0.0), RuntimeError, "cauchy_ expects sigma > 0.0, but found sigma=", sigma);
     if (self.numel() == 0) return self;
     check_writable_inplace(self);
@@ -1072,8 +1030,9 @@ Tensor& cauchy_kernel(Tensor& self, double median, double sigma) {
     return self;
 }
 
-Tensor& exponential_kernel(Tensor& self, double lambd) {
-    auto& gen = default_generator();
+Tensor& exponential_kernel(Tensor& self, double lambd,
+                           std::optional<Generator> generator) {
+    Generator& gen = generator.has_value() ? *generator : default_generator();
     TP_THROW_IF(!(lambd > 0.0), RuntimeError, "exponential_ expects lambda > 0.0, but found lambda=", lambd);
     if (self.numel() == 0) return self;
     check_writable_inplace(self);
@@ -1088,8 +1047,9 @@ Tensor& exponential_kernel(Tensor& self, double lambd) {
     return self;
 }
 
-Tensor& geometric_kernel(Tensor& self, double p) {
-    auto& gen = default_generator();
+Tensor& geometric_kernel(Tensor& self, double p,
+                         std::optional<Generator> generator) {
+    Generator& gen = generator.has_value() ? *generator : default_generator();
     TP_THROW_IF(!(0.0 < p && p < 1.0), RuntimeError, "geometric_ expects p to be in (0, 1), but got p=", p);
     if (self.numel() == 0) return self;
     check_writable_inplace(self);
@@ -1104,8 +1064,9 @@ Tensor& geometric_kernel(Tensor& self, double p) {
     return self;
 }
 
-Tensor& log_normal_kernel(Tensor& self, double mean, double std) {
-    auto& gen = default_generator();
+Tensor& log_normal_kernel(Tensor& self, double mean, double std,
+                          std::optional<Generator> generator) {
+    Generator& gen = generator.has_value() ? *generator : default_generator();
     TP_THROW_IF(!(std > 0.0), RuntimeError, "log_normal_ expects std > 0.0, but found std=", std);
     if (self.numel() == 0) return self;
     check_writable_inplace(self);
@@ -1174,26 +1135,17 @@ Tensor& random_fill(Tensor& self, int64_t low, int64_t high, Generator& gen) {
                     value = static_cast<scalar_t>(gen.random64());
                 });
             } else {
-                uint64_t range;
-                if constexpr (std::is_same_v<scalar_t, int64_t>) {
-                    range = uint64_t{1} << 63;
-                } else if constexpr (std::is_same_v<scalar_t, double>) {
-                    range = uint64_t{1} << 53;
-                } else if constexpr (std::is_same_v<scalar_t, float>) {
-                    range = uint64_t{1} << 24;
-                } else if constexpr (std::is_same_v<scalar_t, Half>) {
-                    range = uint64_t{1} << 11;
-                } else if constexpr (std::is_same_v<scalar_t, BFloat16>) {
-                    range = uint64_t{1} << 8;
-                } else if constexpr (std::is_same_v<scalar_t, bool>) {
-                    range = 2;
-                } else {
-                    range = static_cast<uint64_t>(
-                        std::numeric_limits<scalar_t>::max()) + 1;
-                }
-                uniform_int_from_to_distribution<scalar_t> dist(range, 0);
+                // Every value from zero up to the largest one the dtype
+                // holds exactly.
+                const uint64_t range = distribution::unbounded_top<scalar_t>() + 1;
+                // The 64-bit types reduce a 64-bit draw, every other type a
+                // 32-bit one, whatever the size of the range.
+                constexpr bool wide = std::is_same_v<scalar_t, int64_t> ||
+                                      std::is_same_v<scalar_t, double>;
                 for_each_element<scalar_t>(self, [&](scalar_t& value) {
-                    value = dist(&gen);
+                    const uint64_t bits = wide ? gen.random64() : gen.random();
+                    value = static_cast<scalar_t>(
+                        static_cast<int64_t>(bits % range));
                 });
             }
         });
@@ -1221,29 +1173,12 @@ Tensor& random_fill(Tensor& self, int64_t low, int64_t high, Generator& gen) {
     return self;
 }
 
-// The largest value a draw without an upper bound may take: every integer a
-// floating type represents exactly, or the integer type's own maximum.
-template <typename scalar_t>
-uint64_t unbounded_top() {
-    if constexpr (std::is_same_v<scalar_t, double>) {
-        return uint64_t{1} << 53;
-    } else if constexpr (std::is_same_v<scalar_t, float>) {
-        return uint64_t{1} << 24;
-    } else if constexpr (std::is_same_v<scalar_t, Half>) {
-        return uint64_t{1} << 11;
-    } else if constexpr (std::is_same_v<scalar_t, BFloat16>) {
-        return uint64_t{1} << 8;
-    } else if constexpr (std::is_same_v<scalar_t, bool>) {
-        return 1;
-    } else {
-        return static_cast<uint64_t>(std::numeric_limits<scalar_t>::max());
-    }
-}
-
 }  // namespace
 
-Tensor& random_kernel(Tensor& self, int64_t low, int64_t high) {
-    return random_fill(self, low, high, default_generator());
+// `random_` without bounds: every value the dtype holds exactly, from zero.
+Tensor& random_kernel(Tensor& self, std::optional<Generator> generator) {
+    Generator& gen = generator.has_value() ? *generator : default_generator();
+    return random_fill(self, 0, 0, gen);
 }
 
 // `random_.from`: [from, to), or from ``from`` up to the largest value the
@@ -1262,7 +1197,7 @@ Tensor& random_from_kernel(Tensor& self, int64_t from, std::optional<int64_t> to
     check_writable_inplace(self);
     dispatch_all(self.dtype(), [&](auto tag) {
         using scalar_t = decltype(tag);
-        const uint64_t top = unbounded_top<scalar_t>();
+        const uint64_t top = distribution::unbounded_top<scalar_t>();
         TP_THROW_IF(from >= 0 && static_cast<uint64_t>(from) > top, RuntimeError,
                     "random_ expects 'from' to be at most ", top, " for ",
                     self.dtype(), ", but got from=", from);
@@ -1357,7 +1292,6 @@ TENSORPLAY_LIBRARY_IMPL(CPU, RandomKernels) {
     m.impl("bernoulli", bernoulli_kernel);
     m.impl("bernoulli.out", bernoulli_out_kernel);
     m.impl("bernoulli.p", bernoulli_p_kernel);
-    m.impl("normal", normal_kernel);
     m.impl("poisson", poisson_kernel);
     m.impl("binomial", binomial_kernel);
     m.impl("_standard_gamma", standard_gamma_kernel);

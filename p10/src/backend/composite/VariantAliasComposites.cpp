@@ -80,10 +80,6 @@ Tensor alias_wrap_movedim_intlist(const Tensor& self, const std::vector<int64_t>
     return ops::movedim(self, source, destination);
 }
 
-Tensor alias_wrap_normal_Tensor_Tensor(const Tensor& mean, const Tensor& std, std::optional<Generator> generator) {
-    return ops::normal(mean, std);
-}
-
 Tensor alias_wrap_scatter_reduce_two(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& src, const std::string& reduce, bool include_self) {
     return ops::scatter_reduce(self, dim, index, src, reduce, include_self);
 }
@@ -126,11 +122,8 @@ Tensor& inplace_wrap_masked_fill_dd_Scalar(Tensor& self, const Tensor& mask, con
 }
 
 Tensor& inplace_wrap_random_dd_from(Tensor& self, int64_t from, std::optional<int64_t> to, std::optional<Generator> generator) {
-    if (to.has_value() && !generator.has_value()) {
-        return ops::random_(self, from, *to);
-    }
-    // A caller's generator, or a draw with no upper bound, is served by the
-    // host kernel, and the values are then placed where the tensor lives.
+    // A backend without a kernel of its own draws on the host, and the values
+    // are then placed where the tensor lives.
     Tensor host = ops::empty_like(self, self.dtype(), Device(DeviceType::CPU));
     ops::random_(host, from, to, generator);
     ops::copy_(self, host);
@@ -163,7 +156,6 @@ TENSORPLAY_LIBRARY_IMPL(Composite, VariantWiringaliasoverloads) {
     m.impl("meshgrid.indexing", composite::alias_wrap_meshgrid_indexing);
     m.impl("min.other", composite::alias_wrap_min_other);
     m.impl("movedim.intlist", composite::alias_wrap_movedim_intlist);
-    m.impl("normal.Tensor_Tensor", composite::alias_wrap_normal_Tensor_Tensor);
     m.impl("scatter_reduce.two", composite::alias_wrap_scatter_reduce_two);
     m.impl("softmax.int", composite::alias_wrap_softmax_int);
     m.impl("split.Tensor", composite::alias_wrap_split_Tensor);
