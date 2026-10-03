@@ -1047,6 +1047,224 @@ inline int install_indexing_methods(PyObject* type_obj) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Attribute access behind the hot properties.
+//
+// ``dtype``, ``device``, ``ndim``, ``T``, ``H``, ``strides``, ``requires_grad``,
+// ``grad`` and ``data`` sit on nearly every expression that touches a tensor,
+// so each one resolves to a plain C function through a getset descriptor in
+// the type's dictionary, skipping the binding layer's recorded argument
+// parsing.  Getters return fresh wrapper objects; setters keep the semantics
+// of the properties they replace.
+// ---------------------------------------------------------------------------
+
+static PyObject* tpx_dtype_get(PyObject* self_obj, void*) {
+    try {
+        return tpx_py_wrap_dtype(tpx_py_tensor_cref(self_obj).dtype());
+    } catch (const std::exception& e) {
+        tpx_py_set_error(e);
+        return nullptr;
+    }
+}
+
+static PyObject* tpx_device_get(PyObject* self_obj, void*) {
+    try {
+        return tpx_py_wrap_device(tpx_py_tensor_cref(self_obj).device());
+    } catch (const std::exception& e) {
+        tpx_py_set_error(e);
+        return nullptr;
+    }
+}
+
+static PyObject* tpx_ndim_get(PyObject* self_obj, void*) {
+    try {
+        return PyLong_FromLongLong(tpx_py_tensor_cref(self_obj).dim());
+    } catch (const std::exception& e) {
+        tpx_py_set_error(e);
+        return nullptr;
+    }
+}
+
+// ``T`` is the transposed view; a 0-d tensor is its own transpose.
+static PyObject* tpx_transpose_get(PyObject* self_obj, void*) {
+    try {
+        const Tensor& self = tpx_py_tensor_cref(self_obj);
+        if (self.dim() == 0) {
+            return wrap_fresh(self);
+        }
+        return wrap_fresh(tensorplay::tpx::ops::transpose(self, -2, -1));
+    } catch (const std::exception& e) {
+        tpx_py_set_error(e);
+        return nullptr;
+    }
+}
+
+// ``H`` is the conjugate-transposed view; for non-complex dtypes it is ``T``.
+static PyObject* tpx_conjugate_transpose_get(PyObject* self_obj, void*) {
+    try {
+        const Tensor& self = tpx_py_tensor_cref(self_obj);
+        if (self.dim() == 0) {
+            return wrap_fresh(self);
+        }
+        Tensor base =
+            isComplexType(self.dtype()) ? tensorplay::tpx::ops::conj(self) : self;
+        return wrap_fresh(tensorplay::tpx::ops::transpose(base, -2, -1));
+    } catch (const std::exception& e) {
+        tpx_py_set_error(e);
+        return nullptr;
+    }
+}
+
+static PyObject* tpx_strides_get(PyObject* self_obj, void*) {
+    try {
+        return py::tuple(py::cast(tpx_py_tensor_cref(self_obj).strides()))
+            .release()
+            .ptr();
+    } catch (const std::exception& e) {
+        tpx_py_set_error(e);
+        return nullptr;
+    }
+}
+
+static PyObject* tpx_requires_grad_get(PyObject* self_obj, void*) {
+    try {
+        if (tpx_py_tensor_cref(self_obj).requires_grad()) {
+            Py_RETURN_TRUE;
+        }
+        Py_RETURN_FALSE;
+    } catch (const std::exception& e) {
+        tpx_py_set_error(e);
+        return nullptr;
+    }
+}
+
+static int tpx_requires_grad_set(PyObject* self_obj, PyObject* value, void*) {
+    try {
+        if (value == nullptr) {
+            PyErr_SetString(PyExc_AttributeError, "can't delete attribute");
+            return -1;
+        }
+        const int flag = PyObject_IsTrue(value);
+        if (flag < 0) return -1;
+        Tensor& self = py::cast<Tensor&>(py::handle(self_obj));
+        tensorplay::tpx::impl::set_requires_grad(self, flag != 0);
+        return 0;
+    } catch (const std::exception& e) {
+        tpx_py_set_error(e);
+        return -1;
+    }
+}
+
+static PyObject* tpx_grad_get(PyObject* self_obj, void*) {
+    try {
+        Tensor g = tpx_py_tensor_cref(self_obj).grad();
+        if (g.defined()) {
+            return wrap_fresh(g);
+        }
+        Py_RETURN_NONE;
+    } catch (const std::exception& e) {
+        tpx_py_set_error(e);
+        return nullptr;
+    }
+}
+
+static int tpx_grad_set(PyObject* self_obj, PyObject* value, void*) {
+    try {
+        if (value == nullptr) {
+            PyErr_SetString(PyExc_AttributeError, "can't delete attribute");
+            return -1;
+        }
+        Tensor& self = py::cast<Tensor&>(py::handle(self_obj));
+        if (value == Py_None) {
+            tensorplay::tpx::impl::set_grad(self, Tensor());
+            return 0;
+        }
+        if (!py::isinstance<Tensor>(value)) {
+            PyErr_Format(PyExc_TypeError,
+                         "assigned grad expected to be a Tensor or None, but "
+                         "got %.200s",
+                         Py_TYPE(value)->tp_name);
+            return -1;
+        }
+        // Route through tpx::impl::set_grad so autograd metadata is lazily
+        // created -- assigning .grad to a leaf still lays the slot down.
+        tensorplay::tpx::impl::set_grad(self, tpx_py_tensor_cref(value));
+        return 0;
+    } catch (const std::exception& e) {
+        tpx_py_set_error(e);
+        return -1;
+    }
+}
+
+static PyObject* tpx_data_get(PyObject* self_obj, void*) {
+    try {
+        // The returned view drops the version counter, so in-place writes
+        // through it stay invisible to mutation tracking on the original
+        // tensor.
+        Tensor out = tpx_py_tensor_cref(self_obj).detach();
+        out.unsafeGetTensorImpl()->set_version_counter(
+            tensorplay::VariableVersion());
+        return wrap_fresh(out);
+    } catch (const std::exception& e) {
+        tpx_py_set_error(e);
+        return nullptr;
+    }
+}
+
+static int tpx_data_set(PyObject* self_obj, PyObject* value, void*) {
+    try {
+        if (value == nullptr) {
+            PyErr_SetString(PyExc_AttributeError, "can't delete attribute");
+            return -1;
+        }
+        if (!py::isinstance<Tensor>(value)) {
+            PyErr_Format(PyExc_TypeError, "data must be assigned a Tensor, not %.200s",
+                         Py_TYPE(value)->tp_name);
+            return -1;
+        }
+        Tensor& self = py::cast<Tensor&>(py::handle(self_obj));
+        const Tensor& other = tpx_py_tensor_cref(value);
+        if (!self.defined() || !other.defined()) {
+            self = other;
+            return 0;
+        }
+        // Update the impl's data/metadata in place: this keeps other
+        // references (like p.grad) seeing the change through the same object.
+        self.unsafeGetTensorImpl()->copy_metadata_from(
+            *other.unsafeGetTensorImpl());
+        return 0;
+    } catch (const std::exception& e) {
+        tpx_py_set_error(e);
+        return -1;
+    }
+}
+
+inline int install_property_methods(PyObject* type_obj) {
+    static PyGetSetDef table[] = {
+        {"dtype", tpx_dtype_get, nullptr, nullptr, nullptr},
+        {"device", tpx_device_get, nullptr, nullptr, nullptr},
+        {"ndim", tpx_ndim_get, nullptr, nullptr, nullptr},
+        {"T", tpx_transpose_get, nullptr, nullptr, nullptr},
+        {"H", tpx_conjugate_transpose_get, nullptr, nullptr, nullptr},
+        {"strides", tpx_strides_get, nullptr, nullptr, nullptr},
+        {"requires_grad", tpx_requires_grad_get, tpx_requires_grad_set,
+         nullptr, nullptr},
+        {"grad", tpx_grad_get, tpx_grad_set, nullptr, nullptr},
+        {"data", tpx_data_get, tpx_data_set, nullptr, nullptr},
+        {nullptr, nullptr, nullptr, nullptr, nullptr},
+    };
+    auto* type = reinterpret_cast<PyTypeObject*>(type_obj);
+    for (PyGetSetDef* def = table; def->name != nullptr; ++def) {
+        PyObject* descr = PyDescr_NewGetSet(type, def);
+        if (descr == nullptr) return -1;
+        int rc = PyObject_SetAttrString(type_obj, def->name, descr);
+        Py_DECREF(descr);
+        if (rc != 0) return -1;
+    }
+    PyType_Modified(type);
+    return 0;
+}
+
 }}  // namespace tensorplay::python_c
 
 static std::pair<Tensor, py::dict> setstate_helper(py::tuple state) {
@@ -1911,26 +2129,6 @@ void init_tensor(py::module_& m) {
         .def_property_readonly("_impl_id", [](const Tensor& self) {
              return (uintptr_t)self.unsafeGetTensorImpl().get();
         })
-        .def_property_readonly("dtype", &Tensor::dtype)
-        .def_property_readonly("device", &Tensor::device)
-        .def_property_readonly(
-            "ndim", static_cast<int64_t (Tensor::*)() const>(&Tensor::dim))
-        // Transposed view; identity on 0-d inputs (matching the reference
-        // semantics of a trailing-dimension swap).
-        .def_property_readonly("T", [](const Tensor& self) {
-            if (self.dim() == 0) {
-                return self;
-            }
-            return tensorplay::tpx::ops::transpose(self, -2, -1);
-        })
-        // Conjugated transposed view; equals .T for non-complex dtypes.
-        .def_property_readonly("H", [](const Tensor& self) {
-            if (self.dim() == 0) {
-                return self;
-            }
-            Tensor base = isComplexType(self.dtype()) ? tensorplay::tpx::ops::conj(self) : self;
-            return tensorplay::tpx::ops::transpose(base, -2, -1);
-        })
         .def("dim", static_cast<int64_t (Tensor::*)() const>(&Tensor::dim))
         // Ops that return an optional gradient slot (convolution_backward and
         // friends) hand back an undefined tensor for the slots the caller did
@@ -1983,17 +2181,11 @@ void init_tensor(py::module_& m) {
         .def("sparse_mask",
              static_cast<Tensor (Tensor::*)(const Tensor&) const>(&Tensor::sparse_mask),
              "mask"_a)
-        .def_property_readonly("strides", [](const Tensor& self) {
-            return py::tuple(py::cast(self.strides()));
-        })
         .def("stride", [](const Tensor& self) {
             return py::tuple(py::cast(self.strides()));
         })
         .def("stride", [](const Tensor& self, int64_t dim) {
             return self.stride(dim);
-        })
-        .def_property("requires_grad", &Tensor::requires_grad, [](Tensor& self, bool r) {
-            tensorplay::tpx::impl::set_requires_grad(self, r);
         })
         .def_property_readonly("_version", [](const Tensor& self) {
             return self.unsafeGetTensorImpl()->version();
@@ -2107,22 +2299,6 @@ void init_tensor(py::module_& m) {
              tensorplay::cuda::recordStream(impl->storage().data(), stream);
         }, "stream"_a)
 #endif
-        .def_property("grad", 
-            [](const Tensor& self) -> std::optional<Tensor> {
-                Tensor g = self.grad();
-                if (g.defined()) return g;
-                return std::nullopt;
-            },
-            [](Tensor& self, const Tensor* grad) {
-                // Route through tpx::impl::set_grad so autograd metadata is
-                // lazily created -- assigning .grad to a leaf that never
-                if (grad) {
-                    tensorplay::tpx::impl::set_grad(self, *grad);
-                } else {
-                    tensorplay::tpx::impl::set_grad(self, Tensor());
-                }
-            }
-        )
         .def("retain_grad", [](Tensor& self) { tensorplay::tpx::impl::retain_grad(self); })
         .def("backward", [](Tensor& self, std::optional<Tensor> gradient, std::optional<bool> retain_graph, bool create_graph) {
              bool keep_graph = retain_graph.value_or(create_graph);
@@ -2136,24 +2312,6 @@ void init_tensor(py::module_& m) {
                  tensorplay::tpx::backward(self, Tensor(), keep_graph, create_graph);
              }
         }, "gradient"_a = py::none(), "retain_graph"_a = py::none(), "create_graph"_a = false)
-        .def_property("data",
-            [](const Tensor& self) {
-                // version counter, so in-place writes through it stay
-                // invisible to mutation tracking on the original tensor.
-                Tensor out = self.detach();
-                out.unsafeGetTensorImpl()->set_version_counter(tensorplay::VariableVersion());
-                return out;
-            },
-            [](Tensor& self, const Tensor& other) {
-                if (!self.defined() || !other.defined()) {
-                    self = other;
-                    return;
-                }
-                // Update underlying TensorImpl data/metadata in-place
-                // This ensures other references (like p.grad) see the change
-                self.unsafeGetTensorImpl()->copy_metadata_from(*other.unsafeGetTensorImpl());
-            }
-        )
         .def("detach", static_cast<Tensor (Tensor::*)() const>(&Tensor::detach))
         .def("_is_view", [](const Tensor& self) {
             return self.defined() && self.unsafeGetTensorImpl()->is_view();
@@ -3212,6 +3370,10 @@ void init_tensor(py::module_& m) {
         throw py::error_already_set();
     }
     if (tensorplay::python_c::install_forwarded_methods(tensor.ptr()) != 0) {
+        throw py::error_already_set();
+    }
+
+    if (tensorplay::python_c::install_property_methods(tensor.ptr()) != 0) {
         throw py::error_already_set();
     }
 
