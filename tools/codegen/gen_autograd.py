@@ -636,6 +636,15 @@ MANUAL_DERIVATIVES: dict[str, dict] = {
 EXTERNAL_NODES: set[str] = set()
 
 
+def saved_output_member_type(cpp_type: str) -> str:
+    """Node member type of a saved forward output.
+
+    A symbolic size the forward hands back is concrete by the time the node
+    runs, and the backward ops take it as a plain integer.
+    """
+    return "int64_t" if cpp_type == "SymInt" else cpp_type
+
+
 def compute_op_derivatives(func: NativeFunction, raw_formulas: dict[str, str],
                            node_name: str | None = None,
                            fw_raw: dict[str, str] | None = None,
@@ -677,9 +686,11 @@ def compute_op_derivatives(func: NativeFunction, raw_formulas: dict[str, str],
             members.append((a.name, node_member_type(a.type)))
     if func.cpp_return_kind == "tuple":
         from .api_types import tuple_element_cpp_types, tuple_element_names
+        cpp_types = tuple_element_cpp_types(func)
         for i, nm in enumerate(tuple_element_names(func)):
-            if nm in used:
-                members.append((nm, tuple_element_cpp_types(func)[i]))
+            # A name an argument also carries refers to the argument.
+            if nm in used and nm not in arg_names:
+                members.append((nm, saved_output_member_type(cpp_types[i])))
     elif "result" in used:
         rt = func.returns[0].type
         members.append(("result", "std::vector<Tensor>" if rt.is_list else "Tensor"))
@@ -867,7 +878,14 @@ def generate_autograd_nodes(
             tensor_syms.add("result")
         if f.cpp_return_kind == "tuple":
             from .api_types import tuple_element_names
-            tensor_syms.update(n for n in tuple_element_names(f) if n in member_names)
+            tensor_syms.update(n for n in tuple_element_names(f)
+                               if n in tensor_members)
+        # A saved output can be undefined from the start (an output a call
+        # does not produce); only one that was defined and is now gone has
+        # been released.
+        arg_names = {a.name for a in f.args}
+        output_tensor_members = [m for m, _t in dv.members
+                                 if m in tensor_members and m not in arg_names]
 
         lines.append(f"struct {dv.node_name} : public Node {{")
         for m, t in dv.members:
@@ -875,9 +893,13 @@ def generate_autograd_nodes(
                 lines.append(f"    SavedVariable {m}_;")
             else:
                 lines.append(f"    {t} {m}_;")
+        for m in output_tensor_members:
+            lines.append(f"    bool {m}_saved_undefined_;")
         lines.append("")
         ctor_args = [f"{t} {m}" for m, t in dv.members]
         ctor_inits = [f"{m}_({m})" for m, _ in dv.members]
+        ctor_inits += [f"{m}_saved_undefined_(!{m}.defined())"
+                       for m in output_tensor_members]
         lines.append(f"    explicit {dv.node_name}({', '.join(ctor_args)})")
         if ctor_inits:
             lines.append(f"        : {', '.join(ctor_inits)} {{}}")
@@ -908,7 +930,10 @@ def generate_autograd_nodes(
             # released storage: the subgraph is already consumed, so every
             # grad slot goes out undefined and propagation stops here.
             required = [m for m, _t in dv.members if m in tensor_members]
-            cond = " || ".join(f"!{m}_sv.defined()" for m in required)
+            cond = " || ".join(
+                f"(!{m}_sv.defined() && !{m}_saved_undefined_)"
+                if m in output_tensor_members else f"!{m}_sv.defined()"
+                for m in required)
             lines.append(f"        if ({cond}) return {{{undef}}};")
         lines.append("")
         lines.append("        variable_list grads;")

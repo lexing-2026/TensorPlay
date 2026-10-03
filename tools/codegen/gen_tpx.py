@@ -240,6 +240,9 @@ def _node_ctor_args(dv: OpDerivatives, f: NativeFunction,
             expr = f'std::get<{out_index[m]}>({core_result_var or "core_result"})'
             if dv.node_name == 'ReluBackward':
                 expr += '.detach()'
+            if _t == 'int64_t' and tuple_element_cpp_types(f)[out_index[m]] == 'SymInt':
+                # Saved as the integer it is by the time the node runs.
+                expr += '.expect_int()'
             args.append(expr)
         else:
             args.append(m)
