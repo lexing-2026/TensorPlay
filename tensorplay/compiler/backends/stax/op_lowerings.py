@@ -3373,17 +3373,116 @@ LOWERINGS["_log_softmax_backward_data.default"] = _softmax_backward_lowering(
 _fallback_batch_norm = fallback_handler(tp.ops.tp.batch_norm.default, add_to_fallback_set=False)
 
 
+def _lower_batch_norm_training(x, weight, bias, running_mean, running_var, momentum, eps):
+    """A training batch norm: the batch's statistics, the normalized value,
+    and the running statistics moved toward the batch's.
+
+    The mean and the biased variance per channel come from one Welford pass
+    over every other axis; the running variance takes the unbiased one.  The
+    running statistics are written in place, as the call does.  None when the
+    shape is not known or the call needs what this does not spell (a
+    cumulative average, a batch of one element per channel).
+    """
+
+    size = _static_ints(x.get_size())
+    has_running = _given(running_mean) and _given(running_var)
+    if size is None or len(size) < 2 or 0 in size:
+        return None
+    if has_running and momentum is None:
+        return None
+    device = x.get_device()
+    in_dtype = x.get_dtype()
+    acc = _accumulation_dtype(in_dtype)
+    channels = size[1]
+    rest = [size[0], *size[2:]]
+    count = prod(rest)
+    if has_running and count <= 1:
+        return None
+    x_l = x.make_loader()
+    w_l = weight.make_loader() if _given(weight) else None
+    b_l = bias.make_loader() if _given(bias) else None
+
+    def full(c, r):
+        parts = _unflatten_index(r, rest)
+        return [parts[0], c, *parts[1:]]
+
+    mean, m2, _count = ir.WelfordReduction.create(
+        device=device,
+        dtype=acc,
+        inner_fns=(
+            lambda index, rindex: ops.to_dtype(x_l(full(index[0], rindex[0])), acc),
+        ),
+        ranges=[channels],
+        reduction_ranges=[count],
+        reduction_type="welford_reduce",
+    )
+    mean.realize()
+    m2.realize()
+    mean_l = mean.make_loader()
+    m2_l = m2.make_loader()
+
+    def fn(index):
+        c = [index[1]]
+        rstd = ops.rsqrt(
+            ops.add(
+                ops.truediv(m2_l(c), ops.constant(float(count), acc)),
+                ops.constant(float(eps), acc),
+            )
+        )
+        v = ops.mul(ops.sub(ops.to_dtype(x_l(index), acc), mean_l(c)), rstd)
+        if w_l is not None:
+            v = ops.mul(v, ops.to_dtype(w_l(c), acc))
+        if b_l is not None:
+            v = ops.add(v, ops.to_dtype(b_l(c), acc))
+        return ops.to_dtype(v, in_dtype)
+
+    out = Pointwise.create(device=device, dtype=in_dtype, inner_fn=fn, ranges=list(size))
+    if has_running:
+        keep = 1.0 - float(momentum)
+        rm_l = running_mean.make_loader()
+        rv_l = running_var.make_loader()
+        stat_dtype = running_mean.get_dtype()
+
+        def moved(old_l, batch):
+            def body(index):
+                old = ops.to_dtype(old_l(index), acc)
+                value = ops.add(
+                    ops.mul(old, ops.constant(keep, acc)),
+                    ops.mul(batch(index), ops.constant(float(momentum), acc)),
+                )
+                return ops.to_dtype(value, stat_dtype)
+
+            return Pointwise.create(
+                device=device, dtype=stat_dtype, inner_fn=body, ranges=[channels]
+            )
+
+        new_mean = moved(rm_l, mean_l)
+        new_var = moved(
+            rv_l,
+            lambda index: ops.truediv(m2_l(index), ops.constant(float(count - 1), acc)),
+        )
+        LOWERINGS["copy_.default"](running_mean, new_mean)
+        LOWERINGS["copy_.default"](running_var, new_var)
+    return out
+
+
 @register("batch_norm.default")
 def lower_batch_norm(x, weight, bias, running_mean, running_var, training, momentum, eps, *rest):
     """A batch norm that reads its running statistics is an affine map per
-    channel: (x - mean) * rsqrt(var + eps) * weight + bias.  One that updates
-    them is handed to the framework whole."""
+    channel: (x - mean) * rsqrt(var + eps) * weight + bias.  One that uses the
+    batch's statistics computes them in one pass and moves the running ones
+    toward them."""
 
-    if training or not (_given(running_mean) and _given(running_var)):
+    if training:
+        lowered = _lower_batch_norm_training(
+            x, weight, bias, running_mean, running_var, momentum, eps
+        )
+        if lowered is not None:
+            return lowered
         return _fallback_batch_norm(
             x, weight, bias, running_mean, running_var, training, momentum, eps, *rest
         )
-    if len(x.get_size()) < 2:
+    if not (_given(running_mean) and _given(running_var)) or len(x.get_size()) < 2:
         return _fallback_batch_norm(
             x, weight, bias, running_mean, running_var, training, momentum, eps, *rest
         )
