@@ -16,6 +16,7 @@
 #include <exception>
 #include <mutex>
 #include <set>
+#include <unordered_map>
 #include <sstream>
 #include <stdexcept>
 #include <typeinfo>
@@ -1198,35 +1199,171 @@ private:
     bool debug_ = false;
     bool early_stop_ = true;
 };
+
+// Interned attribute names for the custom-apply hot paths.  Setting a
+// context attribute with a freshly built string would allocate (and hash)
+// a new unicode object on every forward; interning once turns each setattr
+// into a dict hit on a shared key.
+struct ApplyAttrNames {
+    PyObject* needs_input_grad = nullptr;
+    PyObject* backward_fn = nullptr;
+    PyObject* node_name = nullptr;
+    PyObject* backward = nullptr;
+    PyObject* backward_entry = nullptr;
+    PyObject* engine_materializes = nullptr;
+    PyObject* n_outputs = nullptr;
+    PyObject* materialize_grads = nullptr;
+    PyObject* node_id = nullptr;
+    PyObject* saved_anchors = nullptr;   // "_saved_anchors"
+};
+ApplyAttrNames g_apply_names;
+
+void init_apply_attr_names() {
+    g_apply_names.needs_input_grad = PyUnicode_InternFromString("needs_input_grad");
+    g_apply_names.backward_fn = PyUnicode_InternFromString("backward_fn");
+    g_apply_names.node_name = PyUnicode_InternFromString("_node_name");
+    g_apply_names.backward = PyUnicode_InternFromString("backward");
+    g_apply_names.backward_entry = PyUnicode_InternFromString("_backward_entry");
+    g_apply_names.engine_materializes = PyUnicode_InternFromString("_engine_materializes");
+    g_apply_names.n_outputs = PyUnicode_InternFromString("_n_outputs");
+    g_apply_names.materialize_grads = PyUnicode_InternFromString("materialize_grads");
+    g_apply_names.node_id = PyUnicode_InternFromString("_node_id");
+    g_apply_names.saved_anchors = PyUnicode_InternFromString("_saved_anchors");
+}
+
+// Borrowed-value setattr for pre-interned names; errors propagate as
+// pybind exceptions so the caller's cleanup paths stay uniform.
+inline void set_attr(PyObject* obj, PyObject* name, PyObject* value) {
+    if (PyObject_SetAttr(obj, name, value) < 0) {
+        throw py::error_already_set();
+    }
+}
+
+// True only when the attribute exists and is truthy; a missing attribute
+// reads as false, which matches the class-level default on the context.
+inline bool get_attr_flag(PyObject* obj, PyObject* name) {
+    PyObject* value = PyObject_GetAttr(obj, name);
+    if (value == nullptr) {
+        PyErr_Clear();
+        return false;
+    }
+    int truth = PyObject_IsTrue(value);
+    Py_DECREF(value);
+    return truth == 1;
+}
 } // namespace
+
+class PyNode;
+
+// Live nodes from the fused custom-apply paths, keyed by the handle
+// recorded on the Python context.  The context itself only holds this
+// integer: a strong context-to-node edge would let any context that saved
+// an output tensor pin the node (and through it the output) in a cycle
+// the Python collector cannot see through the C++ shared_ptr.  When a
+// context is finalized while its node is still owned elsewhere -- a live
+// output, an in-flight backward -- the finalizer adopts the node here,
+// moving the keep-alive onto the context so the backward entry can still
+// reach it.
+std::mutex g_live_py_nodes_mutex;
+std::unordered_map<int64_t, PyNode*> g_live_py_nodes;
+int64_t g_next_py_node_id = 1;
+
+// Drop an owning Python reference during node teardown: never touch a
+// dead interpreter, and take the GIL only when the calling thread does
+// not already hold it.
+void py_node_decref(py::object& obj) {
+    PyObject* raw = obj.release().ptr();
+    if (raw == nullptr) return;
+    if (!tensorplay::python_c::interpreter_active()) return;
+    if (PyGILState_Check()) {
+        Py_DECREF(raw);
+        return;
+    }
+    py::gil_scoped_acquire gil;
+    Py_DECREF(raw);
+}
 
 // Custom Node for Python-defined Autograd Functions
 class PyNode : public tensorplay::tpx::Node {
 public:
-    PyNode(py::object py_ctx) : py_ctx_(std::move(py_ctx)) {}
+    explicit PyNode(py::object py_ctx) {
+        // The node holds its context only weakly.  A strong member here
+        // would close, for any context that saved an output tensor, a
+        // context -> output -> this node -> context cycle the Python
+        // collector cannot see through; the strong reference comes back
+        // through adopt() when the context is finalized while the node is
+        // still owned elsewhere.
+        PyObject* ref = PyWeakref_NewRef(py_ctx.ptr(), nullptr);
+        if (ref == nullptr) {
+            throw py::error_already_set();
+        }
+        ctx_ref_ = py::reinterpret_steal<py::object>(ref);
+        adopted_ = py::none();
+        {
+            std::lock_guard<std::mutex> lock(g_live_py_nodes_mutex);
+            registry_id_ = g_next_py_node_id++;
+            g_live_py_nodes.emplace(registry_id_, this);
+        }
+        // The context carries the handle instead of the node: its
+        // finalizer uses the handle to find this node and decide whether
+        // the node still needs a keeper.
+        PyObject* handle = PyLong_FromLongLong(registry_id_);
+        if (handle == nullptr) {
+            std::lock_guard<std::mutex> lock(g_live_py_nodes_mutex);
+            g_live_py_nodes.erase(registry_id_);
+            throw py::error_already_set();
+        }
+        try {
+            set_attr(py_ctx.ptr(), g_apply_names.node_id, handle);
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(g_live_py_nodes_mutex);
+            g_live_py_nodes.erase(registry_id_);
+            Py_DECREF(handle);
+            throw;
+        }
+        Py_DECREF(handle);
+    }
 
     ~PyNode() {
-        PyObject* context = py_ctx_.ptr();
-        if (context == nullptr) {
-            return;
+        // Leave the registry before dropping the Python references: a
+        // finalizer they may trigger looks this node up by handle and must
+        // not find a half-destroyed entry.
+        {
+            std::lock_guard<std::mutex> lock(g_live_py_nodes_mutex);
+            g_live_py_nodes.erase(registry_id_);
         }
-        if (!tensorplay::python_c::interpreter_active()) {
-            py_ctx_.release();
-            return;
-        }
-        if (PyGILState_Check()) {
-            py_ctx_.release();
-            Py_DECREF(context);
-            return;
-        }
-        if (!tensorplay::python_c::interpreter_active()) {
-            py_ctx_.release();
-            return;
-        }
-        py::gil_scoped_acquire gil;
-        py_ctx_.release();
-        Py_DECREF(context);
+        py_node_decref(adopted_);
+        py_node_decref(ctx_ref_);
     }
+
+    // The wrapped context, honoring an adoption.  Raises when neither the
+    // adoption slot nor the weak reference resolves, so a caller surfaces
+    // a clear error instead of silently running against a dead context.
+    py::object resolve_ctx() const {
+        if (!adopted_.is_none()) {
+            return adopted_;
+        }
+        PyObject* result = PyObject_CallNoArgs(ctx_ref_.ptr());
+        if (result == nullptr) {
+            throw py::error_already_set();
+        }
+        py::object ctx = py::reinterpret_steal<py::object>(result);
+        if (ctx.is_none()) {
+            throw std::runtime_error(
+                "the autograd context of this node is no longer alive");
+        }
+        return ctx;
+    }
+
+    // Called from the context's finalizer while the node is still owned
+    // elsewhere.  Taking the context strongly here resurrects it, which
+    // finalization permits, and keeps the context alive exactly as long
+    // as the node itself lives.
+    void adopt(py::object ctx) { adopted_ = std::move(ctx); }
+
+    // Number of external owners (live outputs, engine queues).  Zero means
+    // the node is dying on its own and must not be pinned by an adoption.
+    long owner_count() const { return weak_from_this().use_count(); }
 
     // Backward input slots correspond to forward OUTPUTS for custom
     // this node's incoming gradient buffer by the attached output count.
@@ -1261,9 +1398,17 @@ public:
         // Call backward on the context object.  One lookup covers both the
         // presence check and the invocation (a missing attribute is turned
         // into the runtime error below, matching the previous hasattr gate).
+        py::object ctx;
+        try {
+            ctx = resolve_ctx();
+        } catch (const std::runtime_error&) {
+            throw std::runtime_error(
+                "the context of this autograd node is no longer alive; "
+                "its backward pass cannot run");
+        }
         py::object backward_fn;
         try {
-            backward_fn = py_ctx_.attr("backward");
+            backward_fn = ctx.attr("backward");
         } catch (const py::error_already_set&) {
             throw std::runtime_error("PyNode context object has no 'backward' method");
         }
@@ -1298,11 +1443,17 @@ public:
             return "PyNode";
         }
         py::gil_scoped_acquire gil;
-        py::object label = py::getattr(py_ctx_, "_node_name", py::none());
-        if (label.is_none()) {
+        try {
+            py::object ctx = resolve_ctx();
+            py::object label = py::getattr(ctx, "_node_name", py::none());
+            if (label.is_none()) {
+                return "PyNode";
+            }
+            return label.cast<std::string>();
+        } catch (const std::exception&) {
+            PyErr_Clear();
             return "PyNode";
         }
-        return label.cast<std::string>();
     }
 
     // A context holds what its backward pass will read, and that pass is the
@@ -1312,26 +1463,38 @@ public:
     // the context to be collected -- which a caller holding an output keeps
     // alive for as long as the graph is reachable.
     void release_variables() override {
-        if (py_ctx_ && !py_ctx_.is_none()) {
+        if (tensorplay::python_c::interpreter_active()) {
             py::gil_scoped_acquire gil;
-            py::object release = py::getattr(py_ctx_, "release_saved", py::none());
-            if (!release.is_none()) {
-                try {
-                    release();
-                } catch (const py::error_already_set&) {
-                    PyErr_Clear();
+            try {
+                py::object ctx = resolve_ctx();
+                py::object release = py::getattr(ctx, "release_saved", py::none());
+                if (!release.is_none()) {
+                    try {
+                        release();
+                    } catch (const py::error_already_set&) {
+                        PyErr_Clear();
+                    }
                 }
+            } catch (const std::runtime_error&) {
+                // The context is already gone, so it released its own saved
+                // state when it died.
             }
         }
         tensorplay::tpx::Node::release_variables();
     }
 
-    py::object py_ctx_;
+    // Weak reference to the context (never a strong edge; see the ctor).
+    py::object ctx_ref_;
+    // Strong reference taken back from the context's finalizer while the
+    // node is still owned elsewhere.
+    py::object adopted_;
+    int64_t registry_id_ = 0;
 public:
-    py::object ctx() const { return py_ctx_; }
+    py::object ctx() const { return resolve_ctx(); }
 };
 
 void init_autograd(py::module_& m) {
+    init_apply_attr_names();
     py::class_<tensorplay::tpx::Node, std::shared_ptr<tensorplay::tpx::Node>>(m, "Node")
         .def("name", [](const tensorplay::tpx::Node& self) {
             return self.name();
@@ -1446,8 +1609,11 @@ void init_autograd(py::module_& m) {
         .def("set_materialize_grads", &PyNode::set_materialize_grads,
              py::arg("value"))
         .def_property_readonly(
-            "_py_ctx", [](PyNode& self) -> py::object { return self.py_ctx_; },
+            "_py_ctx", [](PyNode& self) -> py::object { return self.resolve_ctx(); },
             "The Python context object this node wraps.")
+        .def_property_readonly(
+            "_node_id", [](PyNode& self) { return self.registry_id_; },
+            "Registry handle the node recorded on its context.")
         .def(
             "register_hook",
             [](PyNode& self, py::function hook) {
@@ -1747,18 +1913,19 @@ void init_autograd(py::module_& m) {
         "ctx"_a, "forward_fn"_a, "setup_ctx_fn"_a.none(), "args"_a);
 
     // THE single-entry hot path: node creation, unpack_input, the
-    // AutoGradMode(false) forward block, setup_context and _wrap_outputs
-    // all happen inside ONE pybind crossing.  Returns (output, ctx, needs,
-    // executable); Python only wires the backward entry afterwards.
-    // The node is constructed natively (same translation unit), so the
-    // graph node never round-trips through a Python factory callback.
+    // AutoGradMode(false) forward block, setup_context, output marking and
+    // the backward-entry wiring all happen inside ONE pybind crossing, on
+    // the same Node/Edge machinery native kernels build their graph with.
+    // Returns (output, ctx, needs, executable, node); Python only handles
+    // the rare direct-backward override afterwards.  The node is
+    // constructed natively (same translation unit), so the graph node never
+    // round-trips through a Python factory callback.
     autograd.def("custom_function_apply",
         [](py::object ctx_factory,
            py::object forward_fn, std::optional<py::object> setup_ctx_fn,
-           py::sequence args) {
+           py::sequence args,
+           py::object backward_fn, py::object node_name) {
             auto ctx = ctx_factory();
-            auto node = py::cast(std::make_shared<PyNode>(ctx));
-            auto* py_node = node.cast<PyNode*>();
 
             // ---- unpack_input ----
             Py_ssize_t n_args = PyTuple_GET_SIZE(args.ptr());
@@ -1769,7 +1936,9 @@ void init_autograd(py::module_& m) {
                 if (fast_is_tensor(item)) {
                     bool rg = py::cast<const Tensor&>(item).requires_grad();
                     any_rg |= rg;
-                    needs[i] = py::bool_(rg);
+                    PyObject* bit = rg ? Py_True : Py_False;
+                    Py_INCREF(bit);
+                    PyTuple_SET_ITEM(needs.ptr(), i, bit);
                 } else if (py::isinstance<py::sequence>(item)) {
                     // Nested containers are rare; mark conservatively and
                     // let the Python fallback re-wire if needed.
@@ -1782,15 +1951,27 @@ void init_autograd(py::module_& m) {
                         }
                     }
                     any_rg |= nested_rg;
-                    needs[i] = py::bool_(nested_rg);
+                    PyObject* bit = nested_rg ? Py_True : Py_False;
+                    Py_INCREF(bit);
+                    PyTuple_SET_ITEM(needs.ptr(), i, bit);
                 } else {
-                    needs[i] = py::bool_(false);
+                    PyObject* bit = Py_False;
+                    Py_INCREF(bit);
+                    PyTuple_SET_ITEM(needs.ptr(), i, bit);
                 }
             }
 
             const bool prev_grad = tensorplay::tpx::GradMode::is_enabled();
             const bool executable = prev_grad && any_rg;
+            // The node only exists when this call is actually tracked:
+            // with the gate closed there is no backward to serve, and
+            // skipping it keeps the untracked path free of the weakref and
+            // registry bookkeeping the ownership design needs.
+            py::object node = py::none();
+            PyNode* py_node = nullptr;
             if (executable) {
+                node = py::cast(std::make_shared<PyNode>(ctx));
+                py_node = node.cast<PyNode*>();
                 // next_edges from every tensor arg (single pass)
                 std::vector<tensorplay::tpx::Edge> edges;
                 edges.reserve((size_t)n_args);
@@ -1807,7 +1988,6 @@ void init_autograd(py::module_& m) {
                     }
                 }
                 py_node->add_next_edge_list(std::move(edges));
-                py_node->set_materialize_grads(true);
             }
 
             // ---- forward block under AutoGradMode(false) ----
@@ -1860,29 +2040,47 @@ void init_autograd(py::module_& m) {
                 } else if (py::isinstance<py::sequence>(output)) {
                     for (auto item : output.cast<py::sequence>()) mark(item);
                 }
-                // The engine zero-fills missing gradients from the per-output
-                // metadata recorded above, so the raw output tensors never
-                // need to be held on ctx here.  Retaining them would close a
+                // The engine zero-fills missing gradient slots from the
+                // per-output metadata recorded above.  The raw outputs are
+                // never retained on the context: doing so would close a
                 // reference cycle (ctx -> output -> grad_fn -> ctx) that
-                // Python's collector cannot see through the C++ node.  Only
-                // users who opt out of engine materialization keep the
-                // outputs for the Python fallback that fills None grads from
-                // their shapes.  The other attrs the Python layer reads are
-                // all assigned there after this call returns.
-                ctx.attr("_n_outputs") = idx;
-                if (!py::cast<bool>(ctx.attr("materialize_grads"))) {
-                    ctx.attr("_outputs") = py::isinstance<py::tuple>(output)
-                        ? output
-                        : (py::isinstance<py::list>(output)
-                               ? py::tuple(output.cast<py::sequence>())
-                               : py::make_tuple(output));
+                // Python's collector cannot see through the C++ node.
+                PyObject* num = PyLong_FromLong(idx);
+                set_attr(ctx.ptr(), g_apply_names.n_outputs, num);
+                Py_DECREF(num);
+                bool materialize = get_attr_flag(
+                    ctx.ptr(), g_apply_names.materialize_grads);
+                py_node->set_materialize_grads(materialize);
+                set_attr(ctx.ptr(), g_apply_names.engine_materializes,
+                         materialize ? Py_True : Py_False);
+            }
+            // Backward-entry wiring.  ``needs_input_grad`` is read by user
+            // backward code, the rest only by the entry itself; setting it
+            // here keeps the Python layer off the hot path entirely.
+            set_attr(ctx.ptr(), g_apply_names.needs_input_grad, needs.ptr());
+            if (executable) {
+                if (backward_fn.ptr() != nullptr && !backward_fn.is_none()) {
+                    set_attr(ctx.ptr(), g_apply_names.backward_fn,
+                             backward_fn.ptr());
                 }
+                if (node_name.ptr() != nullptr && !node_name.is_none()) {
+                    set_attr(ctx.ptr(), g_apply_names.node_name,
+                             node_name.ptr());
+                }
+                PyObject* entry = PyObject_GetAttr(
+                    ctx.ptr(), g_apply_names.backward_entry);
+                if (entry == nullptr) {
+                    throw py::error_already_set();
+                }
+                set_attr(ctx.ptr(), g_apply_names.backward, entry);
+                Py_DECREF(entry);
             }
             return py::make_tuple(output, ctx, needs, executable,
                                    node);
         },
         "ctx_factory"_a, "forward_fn"_a,
-        "setup_ctx_fn"_a.none(), "args"_a);
+        "setup_ctx_fn"_a.none(), "args"_a,
+        "backward_fn"_a = py::none(), "node_name"_a = py::none());
 
     // Full eager custom-operator call in ONE crossing: grad gate,
     // requires-grad scan, graph node, kernel invocation and context wiring.
@@ -1908,7 +2106,9 @@ void init_autograd(py::module_& m) {
                 if (fast_is_tensor(item)) {
                     bool rg = py::cast<const Tensor&>(item).requires_grad();
                     any_rg |= rg;
-                    needs[i] = py::bool_(rg);
+                    PyObject* bit = rg ? Py_True : Py_False;
+                    Py_INCREF(bit);
+                    PyTuple_SET_ITEM(needs.ptr(), i, bit);
                 } else if (py::isinstance<py::sequence>(item)) {
                     // Nested containers are rare; mark conservatively.
                     bool nested_rg = false;
@@ -1920,9 +2120,13 @@ void init_autograd(py::module_& m) {
                         }
                     }
                     any_rg |= nested_rg;
-                    needs[i] = py::bool_(nested_rg);
+                    PyObject* bit = nested_rg ? Py_True : Py_False;
+                    Py_INCREF(bit);
+                    PyTuple_SET_ITEM(needs.ptr(), i, bit);
                 } else {
-                    needs[i] = py::bool_(false);
+                    PyObject* bit = Py_False;
+                    Py_INCREF(bit);
+                    PyTuple_SET_ITEM(needs.ptr(), i, bit);
                 }
             }
             if (!any_rg) {
@@ -1938,10 +2142,12 @@ void init_autograd(py::module_& m) {
             }
 
             auto ctx = ctx_factory();
-            auto node = py::cast(std::make_shared<PyNode>(ctx));
-            auto* py_node = node.cast<PyNode*>();
+            // The node stays a pure C++ object: nothing on this path hands
+            // it back to Python, so no Python wrapper is allocated for it.
+            auto node = std::make_shared<PyNode>(ctx);
+            std::shared_ptr<tensorplay::tpx::Node> shared = node;
 
-            if (any_rg) {
+            {
                 std::vector<tensorplay::tpx::Edge> edges;
                 edges.reserve((size_t)n_args);
                 for (Py_ssize_t i = 0; i < n_args; ++i) {
@@ -1956,8 +2162,7 @@ void init_autograd(py::module_& m) {
                         edges.emplace_back();
                     }
                 }
-                py_node->add_next_edge_list(std::move(edges));
-                py_node->set_materialize_grads(true);
+                node->add_next_edge_list(std::move(edges));
             }
 
             // ---- forward block under AutoGradMode(false) ----
@@ -1978,28 +2183,30 @@ void init_autograd(py::module_& m) {
             }
             tensorplay::tpx::GradMode::set_enabled(true);
 
-            // ---- context wiring (everything backward needs) ----
-            ctx.attr("needs_input_grad") = needs;
-            ctx.attr("backward_fn") = backward_fn;
-            ctx.attr("_node_name") = node_name;
-            ctx.attr("backward") = ctx.attr("_backward_entry");
-            if (!py::cast<bool>(ctx.attr("materialize_grads"))) {
-                py_node->set_materialize_grads(false);
-                ctx.attr("_engine_materializes") = false;
-                ctx.attr("_outputs") = py::isinstance<py::tuple>(output)
-                    ? output
-                    : (py::isinstance<py::list>(output)
-                           ? py::tuple(output.cast<py::sequence>())
-                           : py::make_tuple(output));
-            } else {
-                ctx.attr("_engine_materializes") = true;
+            // ---- context wiring (everything backward needs), with
+            // pre-interned names so no per-call string is built ----
+            PyObject* ctx_ptr = ctx.ptr();
+            set_attr(ctx_ptr, g_apply_names.needs_input_grad, needs.ptr());
+            set_attr(ctx_ptr, g_apply_names.backward_fn, backward_fn.ptr());
+            set_attr(ctx_ptr, g_apply_names.node_name, node_name.ptr());
+            PyObject* entry = PyObject_GetAttr(ctx_ptr, g_apply_names.backward_entry);
+            if (entry == nullptr) {
+                throw py::error_already_set();
             }
+            set_attr(ctx_ptr, g_apply_names.backward, entry);
+            Py_DECREF(entry);
+            bool materialize = get_attr_flag(ctx_ptr, g_apply_names.materialize_grads);
+            node->set_materialize_grads(materialize);
+            set_attr(ctx_ptr, g_apply_names.engine_materializes,
+                     materialize ? Py_True : Py_False);
+            // The raw outputs are never retained on the context: that would
+            // close a reference cycle (ctx -> output -> grad_fn -> ctx) the
+            // Python collector cannot see through the C++ node.  With
+            // materialization opted out the engine hands undefined slots to
+            // backward as-is, which is the point of opting out.
 
             // ---- attach outputs ----
-            auto shared = std::shared_ptr<tensorplay::tpx::Node>(
-                std::static_pointer_cast<tensorplay::tpx::Node>(
-                    py_node->shared_from_this()));
-            auto& metas = py_node->output_metas();
+            auto& metas = node->output_metas();
             metas.clear();
             int idx = 0;
             auto mark = [&](py::handle item) {
@@ -2021,12 +2228,76 @@ void init_autograd(py::module_& m) {
             } else if (py::isinstance<py::sequence>(output)) {
                 for (auto item : output.cast<py::sequence>()) mark(item);
             }
-            ctx.attr("_n_outputs") = idx;
+            PyObject* num = PyLong_FromLong(idx);
+            set_attr(ctx_ptr, g_apply_names.n_outputs, num);
+            Py_DECREF(num);
 
             return output;
         },
         "ctx_factory"_a, "kernel_fn"_a, "backward_fn"_a,
         "node_name"_a, "args"_a, "kwargs"_a);
+
+    // Marks that custom_function_apply takes the backward_fn/node_name
+    // parameters and wires the backward-entry context attributes itself;
+    // older extensions without it keep the Python-side wiring.
+    autograd.attr("_apply_wiring_v2") = py::bool_(true);
+
+    // Adoption entry point, called from a context's finalizer with the
+    // handle the node recorded on it.  True means the node is still alive
+    // and owned from elsewhere, so the context -- resurrected by this call
+    // -- takes the keep-alive over.  The whole decision runs under the
+    // registry lock so a node being torn down concurrently finishes its
+    // destructor (which needs the same lock) before this could touch it.
+    //
+    // Owners whose only life support is the context's own saved tensors do
+    // not count: a context that saved one of this node's outputs pins the
+    // node through that tensor's grad_fn, and adopting on top of it would
+    // close a context -> saved output -> node -> context cycle the
+    // collector cannot see through.  Such a context collects together with
+    // its saved tensors instead (each carries the context back), so the
+    // node dies with the island.  A positive surplus means real external
+    // owners -- a kept output, downstream graph edges, an in-flight
+    // backward -- and the context must outlive them for backward to run.
+    autograd.def("_adopt_node_if_needed",
+        [](int64_t node_id, py::object ctx) -> bool {
+            std::lock_guard<std::mutex> lock(g_live_py_nodes_mutex);
+            auto it = g_live_py_nodes.find(node_id);
+            if (it == g_live_py_nodes.end()) {
+                return false;
+            }
+            PyNode* node = it->second;
+            long owners = node->owner_count();
+            if (owners == 0) {
+                return false;
+            }
+            long self_saved = 0;
+            PyObject* anchors = PyObject_GetAttr(
+                ctx.ptr(), g_apply_names.saved_anchors);
+            if (anchors == nullptr) {
+                PyErr_Clear();
+            } else {
+                if (PyTuple_Check(anchors)) {
+                    Py_ssize_t n = PyTuple_GET_SIZE(anchors);
+                    for (Py_ssize_t i = 0; i < n; ++i) {
+                        PyObject* item = PyTuple_GET_ITEM(anchors, i);
+                        if (fast_is_tensor(item)) {
+                            auto fn = tensorplay::tpx::impl::grad_fn(
+                                py::cast<const Tensor&>(item));
+                            if (fn.get() ==
+                                static_cast<tensorplay::tpx::Node*>(node)) {
+                                ++self_saved;
+                            }
+                        }
+                    }
+                }
+                Py_DECREF(anchors);
+            }
+            if (owners <= self_saved) {
+                return false;
+            }
+            node->adopt(std::move(ctx));
+            return true;
+        });
 
     autograd.def("backward", [](const std::vector<Tensor>& tensors, std::optional<std::vector<Tensor>> grad_tensors, std::optional<bool> retain_graph, bool create_graph) {
         bool keep_graph = retain_graph.value_or(create_graph);

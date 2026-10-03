@@ -36,6 +36,9 @@ _PyNode = _autograd.PyNode
 _setup_graph = getattr(_autograd, "setup_custom_function_graph", None)
 _APPLY_ALL = getattr(_autograd, "custom_function_apply", None)
 _RUN_FWD = getattr(_autograd, "run_custom_function_forward", None)
+# Newer extensions wire the backward-entry context attributes inside the
+# fused apply itself; older ones need the Python-side wiring below.
+_APPLY_ALL_WIRES = getattr(_autograd, "_apply_wiring_v2", False)
 
 
 def _fast_capable():
@@ -125,6 +128,7 @@ class _Context:
     requires_grad = False
     next_functions: tuple = ()
     _saved_tensors: tuple = ()
+    _saved_anchors: tuple = ()
     _to_save_for_backward: tuple = ()
     _outputs: tuple = ()
 
@@ -138,6 +142,23 @@ class _Context:
         # into them directly.
         self._hooks: list = []
         self._prehooks: list = []
+
+    def __del__(self):
+        # Adoption, not teardown: the saved tensors stay untouched because a
+        # backward pass that has not run yet still reads them.  While saved
+        # tensors exist they carry this context back (``_tp_saved_ctx``), so
+        # reaching the finalizer means either the node is already gone or
+        # the node is owned from elsewhere without holding any of this
+        # context's tensors -- in both cases adopting (taking the node's
+        # keep-alive) is safe and cannot close a cycle the collector cannot
+        # see.
+        node_id = getattr(self, "_node_id", None)
+        if node_id is None:
+            return
+        try:
+            _autograd._adopt_node_if_needed(node_id, self)
+        except Exception:
+            pass
 
     @property
     def metadata(self):
@@ -157,8 +178,18 @@ class _Context:
         memory for nothing.  The engine knows when a graph is being kept for
         another pass, so this is one call at the point where the engine stops
         needing them, and a function whose backward may run again does not
-        make it.
+        make it.  The back-references each saved tensor carries to this
+        context (see :meth:`save_for_backward`) go with them.
         """
+        anchors = getattr(self, "_saved_anchors", None)
+        if anchors:
+            for t in anchors:
+                if getattr(t, "_tp_saved_ctx", None) is self:
+                    try:
+                        del t._tp_saved_ctx
+                    except AttributeError:
+                        pass
+        self._saved_anchors = ()
         self._saved_tensors = ()
         for name in ("_saved_versions", "_saved_native_tokens", "_saved_pack"):
             if isinstance(getattr(self, name, None), tuple):
@@ -241,6 +272,17 @@ class _Context:
             if t is not None and not isinstance(t, tensorplay.Tensor):
                 raise TypeError(
                     "save_for_backward only accepts Tensors or None")
+        # Each saved tensor carries this context back: the backward pass may
+        # still have to run after the caller drops the context, and a tensor
+        # that outlives it (a kept output, a live parameter) must keep the
+        # context -- with the backward entry and the saved state -- reachable.
+        # The reference is a plain instance attribute, so a context whose
+        # saved tensors all became unreachable collects together with them
+        # instead of pinning a dead graph.
+        anchors = tuple(t for t in tensors if t is not None)
+        for t in anchors:
+            t._tp_saved_ctx = self
+        self._saved_anchors = anchors
         if _native_saved_hooks_active():
             self._saved_native_tokens = tuple(
                 None if t is None else _native_pack_saved_tensor(t)
@@ -518,9 +560,9 @@ class Function(metaclass=FunctionMeta):
 
         flat arguments computes ``needs_input_grad`` and wires next-edges
         BEFORE forward; outputs are marked and attached AFTER
-        ``setup_context``.  When the fused C++ helpers are present the hot
-        path makes two pybind crossings total (graph setup + output
-        attach); otherwise a generic Python fallback runs.
+        ``setup_context``.  When the fused C++ apply is present the hot
+        path makes a single pybind crossing that also wires the backward
+        entry; otherwise a generic Python fallback runs.
         """
         uses_setup_context = cls.setup_context is not _BASE_SETUP_CONTEXT
         grad_enabled = _autograd.is_grad_enabled()
@@ -535,26 +577,34 @@ class Function(metaclass=FunctionMeta):
 
         # ---- C++ boundary: ONE crossing ----
         if _APPLY_ALL is not None and flat and not kwargs and grad_enabled:
-            output, ctx, needs, executable, fn = _APPLY_ALL(
+            forward_args = (
                 _Context,
                 cls.forward,
                 cls.setup_context if uses_setup_context else None,
                 args,
             )
-            ctx.needs_input_grad = needs
-            if executable:
-                ctx.backward_fn = cls.backward
-                ctx._node_name = cls._node_name
-                if not bool(ctx.materialize_grads):
-                    fn.set_materialize_grads(False)
-                    ctx._engine_materializes = False
-                else:
-                    ctx._engine_materializes = True
-                ctx.backward = (
-                    _make_direct_backward(ctx, cls)
-                    if getattr(cls, "_tensorplay_direct_backward", False)
-                    else _make_backward(ctx, cls)
-                )
+            if _APPLY_ALL_WIRES:
+                output, ctx, needs, executable, fn = _APPLY_ALL(
+                    *forward_args, cls.backward, cls._node_name)
+                if executable and getattr(
+                        cls, "_tensorplay_direct_backward", False):
+                    ctx.backward = _make_direct_backward(ctx, cls)
+            else:
+                output, ctx, needs, executable, fn = _APPLY_ALL(*forward_args)
+                ctx.needs_input_grad = needs
+                if executable:
+                    ctx.backward_fn = cls.backward
+                    ctx._node_name = cls._node_name
+                    if not bool(ctx.materialize_grads):
+                        fn.set_materialize_grads(False)
+                        ctx._engine_materializes = False
+                    else:
+                        ctx._engine_materializes = True
+                    ctx.backward = (
+                        _make_direct_backward(ctx, cls)
+                        if getattr(cls, "_tensorplay_direct_backward", False)
+                        else _make_backward(ctx, cls)
+                    )
             if cls.jvp is _BASE_JVP:
                 return output
             return _maybe_process_forward_ad(cls, ctx, args, output)
@@ -634,20 +684,6 @@ class Function(metaclass=FunctionMeta):
         else:
             n_out = 1
         ctx._n_outputs = n_out
-        # The output tensors are only retained when Python-side
-        # materialization can run (materialize_grads=False).  Otherwise the
-        # engine zero-fills missing gradients itself from the recorded
-        # metadata, and keeping the tensors on ctx would close a reference
-        # cycle the Python collector cannot see through the C++ node.
-        if not bool(ctx.materialize_grads):
-            if isinstance(output, tuple):
-                ctx._outputs = output
-            elif isinstance(output, list):
-                ctx._outputs = tuple(output)
-            else:
-                ctx._outputs = (output,)
-        else:
-            ctx._outputs = None
         # The fused attach assumes edges were already wired by the fused
         # setup above; never mix fast-attach with slow wiring (or vice
         # versa) or the node reaches the engine with a wrong input arity.
