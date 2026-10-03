@@ -616,6 +616,7 @@ inline void record_output_slots(Node* node,
         OutputSlotMeta m;
         m.shape = shapes.back();
         m.dtype = t.dtype();
+        m.device_type = t.device().type();
         m.device_index = t.device().index();
         m.valid = true;
         node->output_metas().push_back(std::move(m));

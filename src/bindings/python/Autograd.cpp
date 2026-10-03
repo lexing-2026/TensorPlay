@@ -250,6 +250,7 @@ py::object attach_checkpoint_outputs(
         tensorplay::tpx::OutputSlotMeta meta;
         meta.shape = static_cast<std::vector<int64_t>>(output.shape());
         meta.dtype = output.dtype();
+        meta.device_type = output.device().type();
         meta.device_index = output.device().index();
         meta.valid = true;
         metas.push_back(std::move(meta));
@@ -1096,6 +1097,7 @@ public:
                 const auto& meta = metas[i];
                 if (static_cast<std::vector<int64_t>>(output.shape()) != meta.shape ||
                     output.dtype() != meta.dtype ||
+                    output.device().type() != meta.device_type ||
                     output.device().index() != meta.device_index) {
                     throw std::runtime_error(
                         "checkpoint replay returned different tensor metadata");
@@ -1646,6 +1648,7 @@ void init_autograd(py::module_& m) {
                         const Tensor& t = py::cast<const Tensor&>(item);
                         m.shape = static_cast<std::vector<int64_t>>(t.shape());
                         m.dtype = t.dtype();
+                        m.device_type = t.device().type();
                         m.device_index = t.device().index();
                         m.valid = true;
                     }
@@ -2029,6 +2032,7 @@ void init_autograd(py::module_& m) {
                         m.shape =
                             static_cast<std::vector<int64_t>>(t.shape());
                         m.dtype = t.dtype();
+                        m.device_type = t.device().type();
                         m.device_index = t.device().index();
                         m.valid = true;
                     }
@@ -2217,6 +2221,7 @@ void init_autograd(py::module_& m) {
                     tensorplay::tpx::impl::set_grad_fn(t, shared, idx);
                     m.shape = static_cast<std::vector<int64_t>>(t.shape());
                     m.dtype = t.dtype();
+                    m.device_type = t.device().type();
                     m.device_index = t.device().index();
                     m.valid = true;
                 }

@@ -510,6 +510,7 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
                     && out_metas[i].valid) {
                     shape = out_metas[i].shape;
                     dt = out_metas[i].dtype;
+                    dev_type = out_metas[i].device_type;
                     dev_idx = out_metas[i].device_index;
                     have = true;
                 } else if (i < in_edges.size() && in_edges[i].has_shape_hint

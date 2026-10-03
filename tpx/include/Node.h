@@ -26,6 +26,7 @@ using edge_list = std::vector<Edge>;
 struct OutputSlotMeta {
     std::vector<int64_t> shape;
     DType dtype{DType::Undefined};
+    DeviceType device_type = DeviceType::CPU;
     int64_t device_index = -1;
     bool valid = false;
 };
