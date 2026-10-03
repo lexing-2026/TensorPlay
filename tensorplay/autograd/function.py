@@ -36,9 +36,6 @@ _PyNode = _autograd.PyNode
 _setup_graph = getattr(_autograd, "setup_custom_function_graph", None)
 _APPLY_ALL = getattr(_autograd, "custom_function_apply", None)
 _RUN_FWD = getattr(_autograd, "run_custom_function_forward", None)
-# Newer extensions wire the backward-entry context attributes inside the
-# fused apply itself; older ones need the Python-side wiring below.
-_APPLY_ALL_WIRES = getattr(_autograd, "_apply_wiring_v2", False)
 
 
 def _fast_capable():
@@ -577,34 +574,16 @@ class Function(metaclass=FunctionMeta):
 
         # ---- C++ boundary: ONE crossing ----
         if _APPLY_ALL is not None and flat and not kwargs and grad_enabled:
-            forward_args = (
+            output, ctx, needs, executable, fn = _APPLY_ALL(
                 _Context,
                 cls.forward,
                 cls.setup_context if uses_setup_context else None,
                 args,
-            )
-            if _APPLY_ALL_WIRES:
-                output, ctx, needs, executable, fn = _APPLY_ALL(
-                    *forward_args, cls.backward, cls._node_name)
-                if executable and getattr(
-                        cls, "_tensorplay_direct_backward", False):
-                    ctx.backward = _make_direct_backward(ctx, cls)
-            else:
-                output, ctx, needs, executable, fn = _APPLY_ALL(*forward_args)
-                ctx.needs_input_grad = needs
-                if executable:
-                    ctx.backward_fn = cls.backward
-                    ctx._node_name = cls._node_name
-                    if not bool(ctx.materialize_grads):
-                        fn.set_materialize_grads(False)
-                        ctx._engine_materializes = False
-                    else:
-                        ctx._engine_materializes = True
-                    ctx.backward = (
-                        _make_direct_backward(ctx, cls)
-                        if getattr(cls, "_tensorplay_direct_backward", False)
-                        else _make_backward(ctx, cls)
-                    )
+                cls.backward,
+                cls._node_name)
+            if executable and getattr(
+                    cls, "_tensorplay_direct_backward", False):
+                ctx.backward = _make_direct_backward(ctx, cls)
             if cls.jvp is _BASE_JVP:
                 return output
             return _maybe_process_forward_ad(cls, ctx, args, output)

@@ -2237,11 +2237,6 @@ void init_autograd(py::module_& m) {
         "ctx_factory"_a, "kernel_fn"_a, "backward_fn"_a,
         "node_name"_a, "args"_a, "kwargs"_a);
 
-    // Marks that custom_function_apply takes the backward_fn/node_name
-    // parameters and wires the backward-entry context attributes itself;
-    // older extensions without it keep the Python-side wiring.
-    autograd.attr("_apply_wiring_v2") = py::bool_(true);
-
     // Adoption entry point, called from a context's finalizer with the
     // handle the node recorded on it.  True means the node is still alive
     // and owned from elsewhere, so the context -- resurrected by this call
