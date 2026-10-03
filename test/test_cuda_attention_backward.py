@@ -71,3 +71,31 @@ def test_fully_masked_free_rows_and_empty_batches():
     out = F.scaled_dot_product_attention(*empty)
     grads = tp.autograd.grad(out, empty, tp.ones_like(out))
     assert all(g.shape == (0, 2, 5, 4) for g in grads)
+
+
+@pytest.mark.parametrize("shape", [(2, 4, 33, 64), (1, 2, 64, 128), (2, 2, 40, 96)])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dtype", [tp.float32, tp.float16, tp.bfloat16])
+def test_the_pair_a_compiled_region_calls(shape, causal, dtype):
+    # The forward hands back each row's log-sum-exp where its schedule writes
+    # one, and the backward reads the probabilities off it and the row
+    # statistic off the output.  The heads are read out of one interleaved
+    # projection, as a compiled region passes them.
+    if dtype == tp.float32 and shape[-1] == 96:
+        pytest.skip("no float32 schedule for this head width")
+    tp.manual_seed(0)
+    q, k, v = _operands(shape, dtype, "interleaved")
+    ops = tp.ops.tp
+    out, lse = ops._scaled_dot_product_attention_with_lse(q, k, v, causal, 0)
+    assert lse.shape == shape[:3] and lse.dtype == tp.float32
+    grad = tp.randn(*shape, device="cuda").to(dtype)
+    got = ops._scaled_dot_product_attention_backward_with_lse(grad, q, k, v, out, lse, causal, 0)
+
+    q64, k64, v64 = (t.detach().double().requires_grad_(True) for t in (q, k, v))
+    ref = _attention_by_hand(q64, k64, v64, causal)
+    want = tp.autograd.grad(ref, (q64, k64, v64), grad.double())
+    assert ((out.double() - ref).abs().max() / ref.abs().max()).item() < TOLERANCE[dtype]
+    for name, a, b in zip("qkv", got, want):
+        assert a.dtype == dtype and a.shape == b.shape
+        err = ((a.double() - b).abs().max() / (b.abs().max() + 1e-6)).item()
+        assert err < TOLERANCE[dtype], (name, err)

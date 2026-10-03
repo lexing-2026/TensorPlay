@@ -1738,6 +1738,49 @@ __global__ void sdpa_backward_dscore_kernel(
   dscore[idx] = probs[idx] * (dprob[idx] - delta[query_row]) * scale;
 }
 
+// The row statistic the score gradient subtracts, read off the forward's
+// output: sum_j P[t, j] dP[t, j] = sum_j P[t, j] (dO[t] . V[j]) = dO[t] . O[t],
+// a dot product over the head width instead of a pass over the score row.
+// One warp owns one query row.
+__global__ void sdpa_backward_delta_from_output_kernel(
+    const float* __restrict__ grad_out, const float* __restrict__ out,
+    float* __restrict__ delta, int64_t num_query_rows, int64_t D) {
+  const int64_t r = static_cast<int64_t>(blockIdx.x) * (blockDim.x / 32) +
+                    threadIdx.x / 32;
+  if (r >= num_query_rows) return;
+  const int lane = threadIdx.x % 32;
+  const float* go_row = grad_out + r * D;
+  const float* o_row = out + r * D;
+  float local = 0.f;
+  for (int64_t d = lane; d < D; d += 32) local += go_row[d] * o_row[d];
+  local = warpReduceSum(local);
+  if (lane == 0) delta[r] = local;
+}
+
+// Probabilities and score gradient in one pass, from the scaled scores and
+// the forward's log-sum-exp: P = exp(S - lse) and dS = P (dP - delta) scale.
+// Each element is read and written by the one thread that owns it, so the
+// results overwrite the scores and the probability gradient in place.  Keys
+// past the query under the causal mask have no probability and no gradient.
+__global__ void sdpa_backward_scores_from_lse_kernel(
+    float* scores_to_probs, float* dprob_to_dscore,
+    const float* __restrict__ lse, const float* __restrict__ delta,
+    int64_t rows, int64_t T, float scale, bool is_causal) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = rows * T * T;
+  if (idx >= total) return;
+  const int64_t query_row = idx / T;
+  const int64_t key = idx - query_row * T;
+  if (is_causal && key > query_row % T) {
+    scores_to_probs[idx] = 0.f;
+    dprob_to_dscore[idx] = 0.f;
+    return;
+  }
+  const float p = expf(scores_to_probs[idx] - lse[query_row]);
+  scores_to_probs[idx] = p;
+  dprob_to_dscore[idx] = p * (dprob_to_dscore[idx] - delta[query_row]) * scale;
+}
+
 // Every product the backward needs is a batched matrix product over the
 // (batch, head) pairs -- the scores Q K^T, the probability gradient dO V^T,
 // and the three operand gradients P^T dO, dS K and dS^T Q -- so each is one
@@ -1793,6 +1836,73 @@ std::tuple<Tensor, Tensor, Tensor> sdpa_backward_impl(
       stream>>>(
       probs.data_ptr<float>(), dprob.data_ptr<float>(), delta.data_ptr<float>(),
       dprob.data_ptr<float>(), batch, T, scale);
+  TP_CUDA_CHECK(cudaGetLastError());
+
+  Tensor d_q = Tensor::empty({batch, T, D}, DType::Float32, query.device());
+  Tensor d_k = Tensor::empty({batch, T, D}, DType::Float32, query.device());
+  Tensor d_v = Tensor::empty({batch, T, D}, DType::Float32, query.device());
+  gemm_strided_batched_3d_ops(probs, go, d_v, batch, T, D, T, tt, td,
+                              /*transpose_a=*/true, /*transpose_b=*/false,
+                              1.0, 0.0);
+  gemm_strided_batched_3d(dprob, k, d_q, batch, T, D, T, tt, td, 1.0, 0.0);
+  gemm_strided_batched_3d_ops(dprob, q, d_k, batch, T, D, T, tt, td,
+                              /*transpose_a=*/true, /*transpose_b=*/false,
+                              1.0, 0.0);
+  auto restored = [&](const Tensor& t) {
+    Tensor shaped = t.reshape({B, H, T, D});
+    return dtype == DType::Float32 ? shaped : shaped.to(dtype);
+  };
+  return {restored(d_q), restored(d_k), restored(d_v)};
+}
+
+// The same products when the forward kept its output and each row's
+// log-sum-exp: the probabilities are one exponential per score and the row
+// statistic is read off the output, so the score rows are never normalized
+// again -- one pass over the two score-sized buffers instead of three.
+std::tuple<Tensor, Tensor, Tensor> sdpa_backward_from_lse(
+    const Tensor& grad_output, const Tensor& query, const Tensor& key,
+    const Tensor& value, const Tensor& output, const Tensor& logsumexp,
+    bool is_causal) {
+  const DType dtype = query.dtype();
+  const int64_t B = query.size(0), H = query.size(1);
+  const int64_t T = query.size(2), D = query.size(3);
+  const int64_t batch = B * H;
+  const int64_t query_rows = batch * T;
+  auto packed = [&](const Tensor& t) {
+    Tensor widened = t.dtype() == DType::Float32 ? t : t.to(DType::Float32);
+    return widened.contiguous().reshape({batch, T, D});
+  };
+  const Tensor q = packed(query);
+  const Tensor k = packed(key);
+  const Tensor v = packed(value);
+  const Tensor go = packed(grad_output);
+  const Tensor o = packed(output);
+  Tensor probs = Tensor::empty({batch, T, T}, DType::Float32, query.device());
+  Tensor dprob = Tensor::empty({batch, T, T}, DType::Float32, query.device());
+  const float scale = 1.f / sqrtf(static_cast<float>(D));
+  const long long td = static_cast<long long>(T) * D;
+  const long long tt = static_cast<long long>(T) * T;
+  cudaStream_t stream = getCurrentCUDAStream().stream();
+
+  Tensor delta = Tensor::empty({query_rows}, DType::Float32, query.device());
+  constexpr int rows_per_block = 4;
+  sdpa_backward_delta_from_output_kernel<<<
+      static_cast<unsigned>((query_rows + rows_per_block - 1) / rows_per_block),
+      32 * rows_per_block, 0, stream>>>(
+      go.data_ptr<float>(), o.data_ptr<float>(), delta.data_ptr<float>(),
+      query_rows, D);
+  gemm_strided_batched_3d_op(q, k, probs, batch, T, T, D, td, td,
+                             /*transpose_b=*/true, scale, 0.0);
+  gemm_strided_batched_3d_op(go, v, dprob, batch, T, T, D, td, td,
+                             /*transpose_b=*/true, 1.0, 0.0);
+  constexpr int threads = 256;
+  const int64_t score_elems = batch * tt;
+  sdpa_backward_scores_from_lse_kernel<<<
+      static_cast<unsigned>((score_elems + threads - 1) / threads), threads, 0,
+      stream>>>(
+      probs.data_ptr<float>(), dprob.data_ptr<float>(),
+      logsumexp.data_ptr<float>(), delta.data_ptr<float>(), batch, T, scale,
+      is_causal);
   TP_CUDA_CHECK(cudaGetLastError());
 
   Tensor d_q = Tensor::empty({batch, T, D}, DType::Float32, query.device());
@@ -2190,6 +2300,17 @@ std::tuple<Tensor, Tensor, Tensor> sdpa_backward_kernel_cuda_with_lse(
     }
 #endif
   }
+  if (impl == 0 && query_c.dim() == 4 && output_c.dim() == 4 &&
+      query_c.shape() == key_c.shape() && key_c.shape() == value_c.shape() &&
+      query_c.shape() == output_c.shape() &&
+      query_c.shape() == grad_output_c.shape() && query_c.size(3) > 0 &&
+      logsumexp.dtype() == DType::Float32 && logsumexp.is_contiguous() &&
+      logsumexp.numel() == query_c.size(0) * query_c.size(1) * query_c.size(2) &&
+      (compute_dtype == DType::Float32 || compute_dtype == DType::Float16 ||
+       compute_dtype == DType::BFloat16)) {
+    return sdpa_backward_from_lse(grad_output_c, query_c, key_c, value_c,
+                                  output_c, logsumexp, is_causal);
+  }
   return sdpa_backward_kernel_cuda(
       grad_output_c, query_c, key_c, value_c, /*attn_mask=*/std::nullopt,
       /*dropout_p=*/0.0, is_causal, /*scale=*/std::nullopt,
@@ -2205,34 +2326,17 @@ std::tuple<Tensor, Tensor, Tensor> sdpa_backward_kernel_cuda_with_lse(
 Tensor sdpa_kernel_cuda_plain(const Tensor& query, const Tensor& key,
                                  const Tensor& value, bool is_causal,
                                  int64_t impl) {
-#if defined(TP_HAS_NATIVE_CUTE_FLASH)
-  const bool native_flash = impl == 5 || impl == 6 || impl == 7;
-#else
-  constexpr bool native_flash = false;
-#endif
-  // The standalone CUTE/CUTLASS kernel supports arbitrary strides in its
-  // batch/head/token coordinates, but its innermost dimension is vectorized.
-  // Preserve a compatible view and only materialize inputs whose D dimension
-  // is not contiguous.  GEMM and the legacy kernels retain their canonical
-  // contiguous-input contract below.
-  auto flash_input = [](const Tensor& input) {
-    return input.dim() == 4 && input.stride(3) == 1
-        ? input : input.contiguous();
-  };
-  Tensor q = native_flash ? flash_input(query) : query.contiguous();
-  Tensor k = native_flash ? flash_input(key) : key.contiguous();
-  Tensor v = native_flash ? flash_input(value) : value.contiguous();
-  if (q.dim() != 4 || k.dim() != 4 || v.dim() != 4) {
+  if (query.dim() != 4 || key.dim() != 4 || value.dim() != 4) {
     TP_THROW(RuntimeError, "sdpa: query/key/value must be 4D [B, H, T, D]");
   }
-  int64_t B = q.size(0), H = q.size(1), T = q.size(2), D = q.size(3);
-  if (k.size(0) != B || k.size(1) != H || v.size(0) != B || v.size(1) != H) {
+  int64_t B = query.size(0), H = query.size(1), T = query.size(2), D = query.size(3);
+  if (key.size(0) != B || key.size(1) != H || value.size(0) != B || value.size(1) != H) {
     TP_THROW(RuntimeError, "sdpa: batch/head dims must match across q/k/v");
   }
-  if (k.size(2) != v.size(2) || k.size(3) != D || v.size(3) != D) {
+  if (key.size(2) != value.size(2) || key.size(3) != D || value.size(3) != D) {
     TP_THROW(RuntimeError, "sdpa: key/value shapes must match [B, H, T, D]");
   }
-  if (k.size(2) != T) {
+  if (key.size(2) != T) {
     // Every kernel behind this entry reads one token count for query, key and
     // value alike, so a context of a different length than the query is not a
     // shape it can express -- and taking the query's count for all three would
@@ -2242,8 +2346,8 @@ Tensor sdpa_kernel_cuda_plain(const Tensor& query, const Tensor& key,
              "sdpa: query and key/value token counts must match; this entry "
              "point serves shapes where all three are the same length");
   }
-  DType dtype = q.dtype();
-  if (dtype != k.dtype() || dtype != v.dtype()) {
+  DType dtype = query.dtype();
+  if (dtype != key.dtype() || dtype != value.dtype()) {
     TP_THROW(RuntimeError, "sdpa: q/k/v dtypes must match");
   }
   if (dtype != DType::Float32 && dtype != DType::Float16 && dtype != DType::BFloat16) {
@@ -2253,6 +2357,46 @@ Tensor sdpa_kernel_cuda_plain(const Tensor& query, const Tensor& key,
 
   constexpr int kThreads = 256;
 
+  // Default (impl=0) routing: fp16/bf16 with head_dim 32/64/96/128 takes the
+  // tensor-core flash path, which beats the warp-per-row kernel on compact
+  // GPUs; every other supported dtype at head_dim <= 128 keeps the
+  // warp-per-row flash kernel, avoiding the naive kernel's float32 upcast.
+  // The naive row-per-block kernel stays as the fallback for wider heads.
+  auto route = [&]() {
+    const bool flash_tensor_core_dtype =
+        (dtype == DType::Float16 || dtype == DType::BFloat16) &&
+        (D == 64 || D == 96 || D == 128
+#if defined(TP_HAS_NATIVE_CUTE_FLASH)
+         || D == 32
+#endif
+        )
+#if defined(TP_HAS_NATIVE_CUTE_FLASH)
+        // The wide precision's native flash leaves serve heads 64 and 128.
+        || (dtype == DType::Float32 && (D == 64 || D == 128))
+#endif
+        ;
+    bool tensor_cores_available = true;
+#if !defined(USE_ROCM)
+    if (impl == 0 && flash_tensor_core_dtype) {
+      int major = 0;
+      TP_CUDA_CHECK(cudaDeviceGetAttribute(
+          &major, cudaDevAttrComputeCapabilityMajor,
+          getCurrentCUDAStream().device_index()));
+      tensor_cores_available = major >= (D == 32 ? 8 : 7);
+    }
+#endif
+    if (impl == 0 && flash_tensor_core_dtype && tensor_cores_available) {
+      impl = 5;
+    } else if (impl == 0 && D <= 128) {
+      // Scalar-precision attention outgrows the warp-per-row flash quickly:
+      // the GEMM-native route runs tuned BLAS kernels and wins from short
+      // sequences onward (crossover measured near T=64; at T=1024 it is an
+      // order of magnitude ahead).  Short sequences keep the flash kernel's
+      // single-launch simplicity.
+      impl = (dtype == DType::Float32 && T >= 64) ? 2 : 3;
+    }
+  };
+
   // A short sequence with a narrow head is answered by the fused kernel: the
   // whole score matrix fits in one block's shared memory, so it never reaches
   // global memory and the row reduction is a tree instead of a single lane's
@@ -2261,13 +2405,36 @@ Tensor sdpa_kernel_cuda_plain(const Tensor& query, const Tensor& key,
   // base address on a sixteen-byte boundary, and contiguous storage so the base
   // is the allocator's own.  A shape outside the gate is not slower for having
   // been turned away; it keeps the kernel it had.
+  const bool fused_short_shape =
+      impl == 0 && dtype == DType::Float32 && T > 0 && T <= kSdpaFusedMaxTokens &&
+      D > 0 && D <= kSdpaFusedMaxDim && (D % 4) == 0;
+  // Which schedule answers the call decides what it needs of its operands,
+  // so the route is settled before anything is copied.
+  if (!fused_short_shape) route();
+#if defined(TP_HAS_NATIVE_CUTE_FLASH)
+  const bool native_flash = impl == 5 || impl == 6 || impl == 7;
+#else
+  constexpr bool native_flash = false;
+#endif
+  // The standalone CUTE/CUTLASS kernel supports arbitrary strides in its
+  // batch/head/token coordinates, but its innermost dimension is vectorized.
+  // Preserve a compatible view and only materialize inputs whose D dimension
+  // is not contiguous -- the heads read straight out of a packed projection.
+  // GEMM and the legacy kernels retain their canonical contiguous-input
+  // contract.
+  auto flash_input = [](const Tensor& input) {
+    return input.stride(3) == 1 ? input : input.contiguous();
+  };
+  Tensor q = native_flash ? flash_input(query) : query.contiguous();
+  Tensor k = native_flash ? flash_input(key) : key.contiguous();
+  Tensor v = native_flash ? flash_input(value) : value.contiguous();
+
   const auto offset_aligned = [](const Tensor& t) {
     return (t.storage_offset() * static_cast<int64_t>(t.itemsize())) % 16 == 0;
   };
-  if (impl == 0 && dtype == DType::Float32 && T > 0 && T <= kSdpaFusedMaxTokens &&
-      D > 0 && D <= kSdpaFusedMaxDim && (D % 4) == 0 &&
-      q.is_contiguous() && k.is_contiguous() && v.is_contiguous() &&
-      offset_aligned(q) && offset_aligned(k) && offset_aligned(v)) {
+  if (fused_short_shape && q.is_contiguous() && k.is_contiguous() &&
+      v.is_contiguous() && offset_aligned(q) && offset_aligned(k) &&
+      offset_aligned(v)) {
     const int dstride = static_cast<int>(D) + kSdpaFusedRowPad;
     const int tstride = static_cast<int>(T) + 1;
     const size_t smem = static_cast<size_t>(3 * T * dstride + T * tstride) *
@@ -2281,44 +2448,9 @@ Tensor sdpa_kernel_cuda_plain(const Tensor& query, const Tensor& key,
     TP_CUDA_CHECK(cudaGetLastError());
     return out;
   }
-
-  // Default (impl=0) routing: fp16/bf16 with head_dim 32/64/96/128 takes the
-  // tensor-core flash path, which beats the warp-per-row kernel on compact
-  // GPUs; every other supported dtype at head_dim <= 128 keeps the
-  // warp-per-row flash kernel, avoiding the naive kernel's float32 upcast.
-  // The naive row-per-block kernel stays as the fallback for wider heads.
-const bool flash_tensor_core_dtype =
-      (dtype == DType::Float16 || dtype == DType::BFloat16) &&
-      (D == 64 || D == 96 || D == 128
-#if defined(TP_HAS_NATIVE_CUTE_FLASH)
-       || D == 32
-#endif
-      )
-#if defined(TP_HAS_NATIVE_CUTE_FLASH)
-      // The wide precision's native flash leaves serve heads 64 and 128.
-      || (dtype == DType::Float32 && (D == 64 || D == 128))
-#endif
-      ;
-  bool tensor_cores_available = true;
-#if !defined(USE_ROCM)
-  if (impl == 0 && flash_tensor_core_dtype) {
-    int major = 0;
-    TP_CUDA_CHECK(cudaDeviceGetAttribute(
-        &major, cudaDevAttrComputeCapabilityMajor,
-        getCurrentCUDAStream().device_index()));
-    tensor_cores_available = major >= (D == 32 ? 8 : 7);
-  }
-#endif
-  if (impl == 0 && flash_tensor_core_dtype && tensor_cores_available) {
-    impl = 5;
-  } else if (impl == 0 && D <= 128) {
-    // Scalar-precision attention outgrows the warp-per-row flash quickly:
-    // the GEMM-native route runs tuned BLAS kernels and wins from short
-    // sequences onward (crossover measured near T=64; at T=1024 it is an
-    // order of magnitude ahead).  Short sequences keep the flash kernel's
-    // single-launch simplicity.
-    impl = (dtype == DType::Float32 && T >= 64) ? 2 : 3;
-  }
+  // A short shape the fused kernel turned away is routed like any other; its
+  // operands are already dense, which every route reads.
+  if (fused_short_shape) route();
 
   if (impl == 0) {
     Tensor out;
@@ -2751,6 +2883,39 @@ std::tuple<Tensor, Tensor> sdpa_kernel_cuda_with_lse(
       return {output, lse};
     }
   }
+#if defined(TP_HAS_NATIVE_CUTE_FLASH)
+  // The fused schedule writes each row's log-sum-exp as it goes.  A
+  // same-length call it serves hands that back, so the backward reads the
+  // probabilities off it instead of normalizing every score row again.
+  const bool flash_head =
+      query.dim() == 4 &&
+      ((query.dtype() == DType::Float32 &&
+        (query.size(3) == 64 || query.size(3) == 128)) ||
+       ((query.dtype() == DType::Float16 || query.dtype() == DType::BFloat16) &&
+        (query.size(3) == 64 || query.size(3) == 96 || query.size(3) == 128)));
+  if (impl == 0 && flash_head && key.dim() == 4 && value.dim() == 4 &&
+      query.dtype() == key.dtype() && key.dtype() == value.dtype() &&
+      query.shape() == key.shape() && key.shape() == value.shape()) {
+    int major = 0;
+    TP_CUDA_CHECK(cudaDeviceGetAttribute(
+        &major, cudaDevAttrComputeCapabilityMajor,
+        getCurrentCUDAStream().device_index()));
+    if (major >= 8) {
+      auto feature_contiguous = [](const Tensor& tensor) {
+        return tensor.stride(3) == 1 ? tensor : tensor.contiguous();
+      };
+      Tensor lse;
+      SdpaFusedLaunch launch;
+      launch.lse_out = &lse;
+      launch.window_right = is_causal ? 0 : -1;
+      return sdpa_fused_forward_cuda(
+          feature_contiguous(query), feature_contiguous(key),
+          feature_contiguous(value), launch,
+          1.0 / std::sqrt(static_cast<double>(query.size(3))),
+          /*enable_gqa=*/false);
+    }
+  }
+#endif
   Tensor output = sdpa_kernel_cuda_plain(query, key, value, is_causal, impl);
   Tensor lse = Tensor::empty({0}, DType::Float32, query.device());
   return {output, lse};
