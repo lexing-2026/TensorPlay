@@ -423,6 +423,13 @@ def aot_function(
     )
     diff_out_mask = [_is_tensor(o) and o.requires_grad for o in flat_out]
     grad_mask = [_is_tensor(p) and p.requires_grad for p in primals]
+    # Which differentiable inputs the program reached.  One it never read has
+    # no gradient, and the backward graph produces nothing for it: its results
+    # are the gradients of the reached inputs alone, in input order.
+    joint_out = list(joint.graph.output_node.args)
+    if joint_out and isinstance(joint_out[0], (tuple, list)):
+        joint_out = list(joint_out[0])
+    grad_reached = [arg is not None for arg in joint_out[num_fwd:]]
 
     fw_module, bw_module, input_kinds, input_keys, saved_names = partition_fn(
         joint, trace_primals + tangents, num_fwd_outputs=num_fwd
@@ -507,7 +514,14 @@ def aot_function(
                     compiled_bw_box[0], "_tensorplay_codegen", None
                 )
             grads = iter(_call(compiled_bw_box[0], inputs))
-            out = tuple(next(grads) if needed else None for needed in grad_mask)
+            reached = iter(grad_reached)
+            out = []
+            for needed in grad_mask:
+                if needed and next(reached):
+                    out.append(next(grads))
+                else:
+                    out.append(None)
+            out = tuple(out)
             # What this pass kept for itself is its own bookkeeping, and the
             # forward's outputs are its largest entry: they are read only to
             # decide which incoming gradients matter, which is now decided.

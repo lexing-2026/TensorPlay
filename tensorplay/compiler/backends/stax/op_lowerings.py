@@ -1185,6 +1185,33 @@ def as_value_node(x, dtype, device):
     return Constant(value=x, dtype=dtype, device=device)
 
 
+def _broadcast_loader(x, size):
+    """A loader of ``x`` asked at positions of the broadcast extents ``size``.
+
+    Axes line up from the last; an axis ``x`` lacks, or holds once where the
+    result holds many, is read at its only position.
+    """
+
+    load = x.make_loader()
+    own = list(x.get_size())
+    lead = len(size) - len(own)
+    if lead == 0 and all(
+        V.graph.sizevars.statically_known_equals(a, b) for a, b in zip(own, size)
+    ):
+        return load
+    single = [
+        V.graph.sizevars.statically_known_equals(a, 1)
+        and not V.graph.sizevars.statically_known_equals(b, 1)
+        for a, b in zip(own, size[lead:])
+    ]
+
+    def reindexed(index):
+        index = list(index)[lead:]
+        return load([sympy.S.Zero if one else i for i, one in zip(index, single)])
+
+    return reindexed
+
+
 def pointwise(fn, *inputs, val=None, out_dtype=None):
     # What the result is like is read from the inputs first: the first input's
     # extents and the device they live on say what the operation runs over,
@@ -1212,7 +1239,9 @@ def pointwise(fn, *inputs, val=None, out_dtype=None):
         )
         size = tuple(_extent(s) for s in target)
     loaders = [
-        as_value_node(x, dtype, device).make_loader() for x in inputs
+        _broadcast_loader(x, size) if hasattr(x, "get_size")
+        else as_value_node(x, dtype, device).make_loader()
+        for x in inputs
     ]
 
     def inner(index):
@@ -1423,6 +1452,518 @@ LOWERINGS["eq.Scalar"] = _comparison("eq")
 #: whole instead of being written into the loop that reads it.
 for _comparison in ("le", "lt", "ge", "gt", "ne", "eq"):
     LOWERINGS[f"{_comparison}.Tensor"] = LOWERINGS[f"{_comparison}.default"]
+
+
+# ---------------------------------------------------------------------------
+# The rest of the elementwise vocabulary.  Every operation below is one value
+# per element computed from the same element of its operands, so each is a
+# loop body the kernels around it can absorb; handed to the framework instead
+# it would be a launch of its own and a round trip of its operands through
+# memory.  The ones the device kernels have a unit for are named by that unit;
+# the rest are written in terms of those.
+# ---------------------------------------------------------------------------
+
+
+def _is_real(dtype) -> bool:
+    return dtype in (tp.float16, tp.bfloat16, tp.float32, tp.float64)
+
+
+def _real_unary(op_name):
+    """An operation that reads a number and produces a real number: an
+    integer operand is read in the default real type first."""
+
+    fn = ops_wrapper(op_name)
+
+    def lower(x):
+        if _is_real(x.get_dtype()):
+            return pointwise(fn, x)
+        dtype = tp.get_default_dtype()
+        return pointwise(lambda v: fn(ops.to_dtype(v, dtype)), x, out_dtype=dtype)
+
+    return lower
+
+
+def _rounding_unary(op_name):
+    """A rounding: an integer is already whole and is its own answer."""
+
+    fn = ops_wrapper(op_name)
+
+    def lower(x):
+        if _is_real(x.get_dtype()):
+            return pointwise(fn, x)
+        return pointwise(lambda v: v, x)
+
+    return lower
+
+
+for _op in (
+    "erf", "erfc", "erfinv", "expm1", "log1p", "log10", "sinh", "cosh", "tan",
+    "asin", "acos", "atan", "asinh", "acosh", "atanh", "lgamma",
+):
+    LOWERINGS[f"{_op}.default"] = _real_unary(_op)
+for _op in ("floor", "ceil", "trunc"):
+    LOWERINGS[f"{_op}.default"] = _rounding_unary(_op)
+
+
+def _real_predicate(op_name, integral_answer: bool):
+    """A question about a real value; every integer gets the same answer."""
+
+    fn = ops_wrapper(op_name)
+
+    def lower(x):
+        if _is_real(x.get_dtype()):
+            return pointwise(fn, x, out_dtype=tp.bool)
+        return pointwise(
+            lambda v: ops.constant(integral_answer, tp.bool), x, out_dtype=tp.bool
+        )
+
+    return lower
+
+
+LOWERINGS["isnan.default"] = _real_predicate("isnan", False)
+LOWERINGS["isinf.default"] = _real_predicate("isinf", False)
+
+
+@register("isfinite.default")
+def lower_isfinite(x):
+    if not _is_real(x.get_dtype()):
+        return pointwise(lambda v: ops.constant(True, tp.bool), x, out_dtype=tp.bool)
+    return pointwise(
+        lambda v: ops.logical_not(ops.logical_or(ops.isnan(v), ops.isinf(v))),
+        x,
+        out_dtype=tp.bool,
+    )
+
+
+@register("signbit.default")
+def lower_signbit(x):
+    if _is_real(x.get_dtype()):
+        return pointwise(ops.signbit, x, out_dtype=tp.bool)
+    return pointwise(
+        lambda v: ops.lt(v, ops.constant(0, x.get_dtype())), x, out_dtype=tp.bool
+    )
+
+
+@register("logical_not.default")
+def lower_logical_not(x):
+    return pointwise(
+        lambda v: ops.logical_not(ops.to_dtype(v, tp.bool)), x, out_dtype=tp.bool
+    )
+
+
+@register("bitwise_not.default")
+def lower_bitwise_not(x):
+    if x.get_dtype() == tp.bool:
+        return pointwise(ops.logical_not, x)
+    return pointwise(ops.bitwise_not, x)
+
+
+@register("square.default")
+def lower_square(x):
+    return pointwise(lambda v: ops.mul(v, v), x)
+
+
+@register("frac.default")
+def lower_frac(x):
+    return pointwise(lambda v: ops.sub(v, ops.trunc(v)), x)
+
+
+@register("sgn.default", "positive.default")
+def lower_sgn_or_positive(x):
+    node = V.current_node
+    name = target_name(node.target) if node is not None else ""
+    if name.startswith("positive"):
+        return pointwise(lambda v: v, x)
+    return pointwise(ops.sign, x)
+
+
+def _promoted_pair(a, b):
+    """The type two operands are computed in, the way an arithmetic
+    operation promotes them: a tensor's type wins over a number's."""
+
+    from .dtype_propagation import get_promoted_dtype
+
+    return get_promoted_dtype(
+        _promotion_input(a),
+        _promotion_input(b),
+        type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
+    )
+
+
+def _binary_on(op_name, *, real: bool, out_bool: bool = False, to_bool: bool = False):
+    """A two-operand operation, broadcast and computed in the operands'
+    promoted type (a real one when the operation produces a real number)."""
+
+    fn = ops_wrapper(op_name)
+
+    def lower(a, b):
+        dtype = _promoted_pair(a, b)
+        if real and not _is_real(dtype):
+            dtype = tp.get_default_dtype()
+        compute = tp.bool if to_bool else dtype
+        tensors = [x for x in (a, b) if isinstance(x, TensorBox)]
+        if len(tensors) == 2:
+            a, b = broadcast_tensors(a, b)
+        anchor = a if isinstance(a, TensorBox) else b
+
+        def inner(x, y):
+            return fn(ops.to_dtype(x, compute), ops.to_dtype(y, compute))
+
+        return pointwise(
+            inner, a, b, val=anchor, out_dtype=tp.bool if out_bool else dtype
+        )
+
+    return lower
+
+
+for _op in ("atan2", "hypot", "nextafter"):
+    LOWERINGS[f"{_op}.default"] = _binary_on(_op, real=True)
+for _overload in ("Tensor", "Scalar"):
+    LOWERINGS[f"copysign.{_overload}"] = _binary_on("copysign", real=True)
+    LOWERINGS[f"fmod.{_overload}"] = _binary_on("fmod", real=False)
+    for _op in ("bitwise_and", "bitwise_or", "bitwise_xor"):
+        LOWERINGS[f"{_op}.{_overload}"] = _binary_on(_op, real=False)
+for _op in ("bitwise_left_shift", "bitwise_right_shift"):
+    for _overload in ("Tensor", "Tensor_Scalar"):
+        LOWERINGS[f"{_op}.{_overload}"] = _binary_on(_op, real=False)
+for _op in ("logical_and", "logical_or", "logical_xor"):
+    LOWERINGS[f"{_op}.default"] = _binary_on(_op, real=False, out_bool=True, to_bool=True)
+
+
+def _scalar_const(value, like):
+    return ops.constant(value, like.get_dtype() if _is_real(like.get_dtype()) else tp.float32)
+
+
+def _lower_remainder(a, b):
+    """The remainder whose sign follows the divisor (floor division's)."""
+
+    dtype = _promoted_pair(a, b)
+    tensors = [x for x in (a, b) if isinstance(x, TensorBox)]
+    if len(tensors) == 2:
+        a, b = broadcast_tensors(a, b)
+    anchor = a if isinstance(a, TensorBox) else b
+
+    def fn(x, y):
+        x = ops.to_dtype(x, dtype)
+        y = ops.to_dtype(y, dtype)
+        if _is_real(dtype):
+            # x - floor(x / y) * y
+            return ops.sub(x, ops.mul(ops.floor(ops.truediv(x, y)), y))
+        return ops.remainder(x, y)
+
+    return pointwise(fn, a, b, val=anchor, out_dtype=dtype)
+
+
+for _overload in ("Tensor", "Scalar", "Scalar_Tensor"):
+    LOWERINGS[f"remainder.{_overload}"] = _lower_remainder
+LOWERINGS["mod"] = _lower_remainder
+
+
+@register("clamp_min.default", "clamp_min.Tensor")
+def lower_clamp_min(x, min):
+    if isinstance(min, TensorBox):
+        x, min = broadcast_tensors(x, min)
+        return pointwise(ops.maximum, x, min)
+    return pointwise(lambda v: ops.maximum(v, ops.constant(min, x.get_dtype())), x)
+
+
+@register("clamp_max.default", "clamp_max.Tensor")
+def lower_clamp_max(x, max):
+    if isinstance(max, TensorBox):
+        x, max = broadcast_tensors(x, max)
+        return pointwise(ops.minimum, x, max)
+    return pointwise(lambda v: ops.minimum(v, ops.constant(max, x.get_dtype())), x)
+
+
+@register("lerp.Scalar", "lerp.Tensor", "lerp.default")
+def lower_lerp(start, end, weight):
+    """start + weight * (end - start), evaluated from whichever end the
+    weight is nearer so the endpoints are reproduced exactly."""
+
+    def fn(s, e, w):
+        half = ops.constant(0.5, tp.float32)
+        one = ops.constant(1.0, tp.float32)
+        diff = ops.sub(e, s)
+        near_start = ops.add(s, ops.mul(w, diff))
+        near_end = ops.sub(e, ops.mul(diff, ops.sub(one, w)))
+        return ops.where(ops.lt(ops.abs(w), half), near_start, near_end)
+
+    tensors = [t for t in (start, end, weight) if isinstance(t, TensorBox)]
+    if len(tensors) > 1:
+        shaped = broadcast_tensors(*tensors)
+        it = iter(shaped)
+        start, end, weight = (
+            next(it) if isinstance(t, TensorBox) else t for t in (start, end, weight)
+        )
+    return pointwise(fn, start, end, weight, val=start)
+
+
+@register("nan_to_num.default")
+def lower_nan_to_num(x, nan=0.0, posinf=None, neginf=None):
+    dtype = x.get_dtype()
+    if not _is_real(dtype):
+        return pointwise(lambda v: v, x)
+    info = tp.finfo(dtype)
+    nan = 0.0 if nan is None else nan
+    posinf = info.max if posinf is None else posinf
+    neginf = info.min if neginf is None else neginf
+
+    def fn(v):
+        zero = ops.constant(0.0, dtype)
+        inf = ops.isinf(v)
+        out = ops.where(ops.isnan(v), ops.constant(nan, dtype), v)
+        out = ops.where(
+            ops.logical_and(inf, ops.gt(v, zero)), ops.constant(posinf, dtype), out
+        )
+        return ops.where(
+            ops.logical_and(inf, ops.lt(v, zero)), ops.constant(neginf, dtype), out
+        )
+
+    return pointwise(fn, x)
+
+
+# Activations and the gradients of activations.  A gradient formula is as
+# elementwise as the activation it differentiates, and in a training region it
+# sits between the gradient of the layer after it and the reduction of the
+# layer before it -- exactly where a separate launch costs the most.
+
+
+def _f32(value):
+    return ops.constant(float(value), tp.float32)
+
+
+@register("tanh_backward.default")
+def lower_tanh_backward(grad, output):
+    # grad * (1 - y^2)
+    return pointwise(
+        lambda g, y: ops.mul(g, ops.sub(_f32(1.0), ops.mul(y, y))), grad, output
+    )
+
+
+@register("sigmoid_backward.default")
+def lower_sigmoid_backward(grad, output):
+    # grad * y * (1 - y)
+    return pointwise(
+        lambda g, y: ops.mul(ops.mul(g, y), ops.sub(_f32(1.0), y)), grad, output
+    )
+
+
+@register("threshold.default")
+def lower_threshold(x, threshold, value, inplace=False):
+    return pointwise(
+        lambda v: ops.where(ops.le(v, _f32(threshold)), _f32(value), v), x
+    )
+
+
+@register("threshold_backward.default")
+def lower_threshold_backward(grad, self, threshold):
+    return pointwise(
+        lambda g, v: ops.where(ops.le(v, _f32(threshold)), _f32(0.0), g), grad, self
+    )
+
+
+@register("leaky_relu.default")
+def lower_leaky_relu(x, negative_slope=0.01, inplace=False):
+    return pointwise(
+        lambda v: ops.where(
+            ops.gt(v, _f32(0.0)), v, ops.mul(v, _f32(negative_slope))
+        ),
+        x,
+    )
+
+
+@register("leaky_relu_backward.default")
+def lower_leaky_relu_backward(grad, self, negative_slope, self_is_result=False):
+    return pointwise(
+        lambda g, v: ops.where(
+            ops.gt(v, _f32(0.0)), g, ops.mul(g, _f32(negative_slope))
+        ),
+        grad,
+        self,
+    )
+
+
+@register("hardtanh.default")
+def lower_hardtanh(x, min_val=-1.0, max_val=1.0, inplace=False):
+    return pointwise(
+        lambda v: ops.minimum(ops.maximum(v, _f32(min_val)), _f32(max_val)), x
+    )
+
+
+@register("hardtanh_backward.default")
+def lower_hardtanh_backward(grad, self, min_val, max_val):
+    return pointwise(
+        lambda g, v: ops.where(
+            ops.logical_or(ops.le(v, _f32(min_val)), ops.ge(v, _f32(max_val))),
+            _f32(0.0),
+            g,
+        ),
+        grad,
+        self,
+    )
+
+
+@register("softplus.default")
+def lower_softplus(x, beta=1.0, threshold=20.0):
+    # log(1 + exp(beta x)) / beta, and x itself where beta x is past threshold
+    def fn(v):
+        scaled = ops.mul(v, _f32(beta))
+        soft = ops.truediv(ops.log1p(ops.exp(scaled)), _f32(beta))
+        return ops.where(ops.gt(scaled, _f32(threshold)), v, soft)
+
+    return pointwise(fn, x)
+
+
+@register("softplus_backward.default")
+def lower_softplus_backward(grad, self, beta, threshold):
+    def fn(g, v):
+        scaled = ops.mul(v, _f32(beta))
+        z = ops.exp(scaled)
+        return ops.where(
+            ops.gt(scaled, _f32(threshold)),
+            g,
+            ops.truediv(ops.mul(g, z), ops.add(z, _f32(1.0))),
+        )
+
+    return pointwise(fn, grad, self)
+
+
+@register("elu.default")
+def lower_elu(x, alpha=1.0, scale=1.0, input_scale=1.0, inplace=False):
+    def fn(v):
+        negative = ops.mul(
+            _f32(alpha * scale), ops.expm1(ops.mul(v, _f32(input_scale)))
+        )
+        return ops.where(ops.gt(v, _f32(0.0)), ops.mul(v, _f32(scale)), negative)
+
+    return pointwise(fn, x)
+
+
+@register("elu_backward.default")
+def lower_elu_backward(grad, alpha, scale, input_scale, is_result, self_or_result):
+    def fn(g, v):
+        if is_result:
+            negative = ops.mul(
+                ops.mul(g, _f32(input_scale)), ops.add(v, _f32(alpha * scale))
+            )
+        else:
+            negative = ops.mul(
+                ops.mul(g, _f32(input_scale * alpha * scale)),
+                ops.exp(ops.mul(v, _f32(input_scale))),
+            )
+        return ops.where(ops.le(v, _f32(0.0)), negative, ops.mul(g, _f32(scale)))
+
+    return pointwise(fn, grad, self_or_result)
+
+
+@register("hardsigmoid.default")
+def lower_hardsigmoid(x, inplace=False):
+    return pointwise(
+        lambda v: ops.minimum(
+            ops.maximum(ops.add(ops.truediv(v, _f32(6.0)), _f32(0.5)), _f32(0.0)),
+            _f32(1.0),
+        ),
+        x,
+    )
+
+
+@register("hardsigmoid_backward.default")
+def lower_hardsigmoid_backward(grad, self):
+    return pointwise(
+        lambda g, v: ops.where(
+            ops.logical_and(ops.gt(v, _f32(-3.0)), ops.lt(v, _f32(3.0))),
+            ops.truediv(g, _f32(6.0)),
+            _f32(0.0),
+        ),
+        grad,
+        self,
+    )
+
+
+@register("hardswish.default")
+def lower_hardswish(x, inplace=False):
+    return pointwise(
+        lambda v: ops.truediv(
+            ops.mul(
+                v,
+                ops.minimum(
+                    ops.maximum(ops.add(v, _f32(3.0)), _f32(0.0)), _f32(6.0)
+                ),
+            ),
+            _f32(6.0),
+        ),
+        x,
+    )
+
+
+@register("hardswish_backward.default")
+def lower_hardswish_backward(grad, self):
+    def fn(g, v):
+        middle = ops.mul(g, ops.add(ops.truediv(v, _f32(3.0)), _f32(0.5)))
+        return ops.where(
+            ops.lt(v, _f32(-3.0)),
+            _f32(0.0),
+            ops.where(ops.le(v, _f32(3.0)), middle, g),
+        )
+
+    return pointwise(fn, grad, self)
+
+
+_SQRT1_2 = 0.7071067811865476
+_INV_SQRT_2PI = 0.3989422804014327
+_SQRT_2_OVER_PI = 0.7978845608028654
+_GELU_KAPPA = 0.044715
+
+
+@register("gelu.default")
+def lower_gelu(x, approximate="none"):
+    def exact(v):
+        cdf = ops.mul(
+            _f32(0.5), ops.add(_f32(1.0), ops.erf(ops.mul(v, _f32(_SQRT1_2))))
+        )
+        return ops.mul(v, cdf)
+
+    def tanh(v):
+        inner = ops.mul(
+            _f32(_SQRT_2_OVER_PI),
+            ops.add(v, ops.mul(_f32(_GELU_KAPPA), ops.mul(v, ops.mul(v, v)))),
+        )
+        return ops.mul(ops.mul(_f32(0.5), v), ops.add(_f32(1.0), ops.tanh(inner)))
+
+    return pointwise(tanh if approximate == "tanh" else exact, x)
+
+
+@register("gelu_backward.default")
+def lower_gelu_backward(grad, self, approximate="none"):
+    def exact(g, v):
+        cdf = ops.mul(
+            _f32(0.5), ops.add(_f32(1.0), ops.erf(ops.mul(v, _f32(_SQRT1_2))))
+        )
+        pdf = ops.mul(
+            _f32(_INV_SQRT_2PI), ops.exp(ops.mul(_f32(-0.5), ops.mul(v, v)))
+        )
+        return ops.mul(g, ops.add(cdf, ops.mul(v, pdf)))
+
+    def tanh(g, v):
+        v2 = ops.mul(v, v)
+        inner = ops.mul(
+            _f32(_SQRT_2_OVER_PI),
+            ops.add(v, ops.mul(_f32(_GELU_KAPPA), ops.mul(v2, v))),
+        )
+        t = ops.tanh(inner)
+        left = ops.mul(_f32(0.5), v)
+        right = ops.add(_f32(1.0), t)
+        left_derivative = ops.mul(_f32(0.5), right)
+        right_derivative = ops.mul(
+            ops.mul(left, ops.sub(_f32(1.0), ops.mul(t, t))),
+            ops.mul(
+                _f32(_SQRT_2_OVER_PI),
+                ops.add(_f32(1.0), ops.mul(_f32(3.0 * _GELU_KAPPA), v2)),
+            ),
+        )
+        return ops.mul(g, ops.add(left_derivative, right_derivative))
+
+    return pointwise(tanh if approximate == "tanh" else exact, grad, self)
 
 
 @register("clamp.default")
@@ -1678,7 +2219,11 @@ def reshape(x: TensorBox, new_size) -> TensorBox:
         return x
     node = _underlying(x)
     if isinstance(node, Buffer) and node.layout.is_contiguous():
-        settled = node.layout.as_fixed()
+        # The view reads the buffer as consecutive elements, so the buffer is
+        # held to that arrangement: a layout left open could be settled
+        # differently later, and the view would then read the wrong elements.
+        node.freeze_layout()
+        settled = node.layout
         return TensorBox(
             ReinterpretView(
                 data=node,
@@ -1703,7 +2248,8 @@ def reshape(x: TensorBox, new_size) -> TensorBox:
             x.data.realize()
             node = _underlying(x)
             if isinstance(node, Buffer) and node.layout.is_contiguous():
-                settled = node.layout.as_fixed()
+                node.freeze_layout()
+                settled = node.layout
                 return TensorBox(
                     ReinterpretView(
                         data=node,
@@ -1733,7 +2279,7 @@ def lower_view(x, size):
     return reshape(x, _resolve_size(size, x.get_numel()))
 
 
-@register("flatten.default", "flatten.int", "flatten")
+@register("flatten.default", "flatten.int", "flatten", "flatten.using_ints")
 def lower_flatten(x, start_dim=0, end_dim=-1):
     # Flatten merges the axes in ``[start_dim, end_dim]`` into one: the
     # leading and trailing axes stay as they are, and the merged axis holds
@@ -1844,6 +2390,134 @@ def lower_slice(x, dim=0, start=None, end=None, step=1):
     return _slice(x, dim, start, end, step)
 
 
+def _as_box(node):
+    """A lowering's result held the way a graph value is: a view is boxed as
+    the window it is, anything else in storage of its own."""
+
+    if is_tensor_box(node):
+        return node
+    if isinstance(node, BaseView):
+        return TensorBox(node)
+    return TensorBox.create(node)
+
+
+def lower_basic_getitem(x, index):
+    """``x[index]`` as views, for an index made of integers, slices, ``None``
+    and at most one ``...``; None for any other index (tensors, booleans,
+    lists), which the caller computes as a call instead."""
+
+    if not isinstance(index, tuple):
+        index = (index,)
+    basic = (int, slice, type(None), type(Ellipsis))
+    if any(isinstance(i, bool) or not isinstance(i, basic) for i in index):
+        return None
+    for part in index:
+        if isinstance(part, slice):
+            for bound in (part.start, part.stop, part.step):
+                if bound is not None and not isinstance(bound, int):
+                    return None
+            if part.step is not None and part.step <= 0:
+                return None
+    size = list(x.get_size())
+    if _static_ints(size) is None:
+        return None
+    consumed = sum(1 for i in index if isinstance(i, (int, slice)))
+    if sum(1 for i in index if i is Ellipsis) > 1 or consumed > len(size):
+        return None
+    expanded = []
+    for part in index:
+        if part is Ellipsis:
+            expanded.extend([slice(None)] * (len(size) - consumed))
+        else:
+            expanded.append(part)
+    # Axes the index does not reach are kept whole.
+    result = x
+    dim = 0
+    for part in expanded:
+        if part is None:
+            result = _as_box(LOWERINGS["unsqueeze.default"](result, dim))
+            dim += 1
+        elif isinstance(part, int):
+            result = _as_box(lower_select(result, dim, part))
+        else:
+            if part != slice(None):
+                result = _as_box(
+                    _slice(result, dim, part.start, part.stop, part.step or 1)
+                )
+            dim += 1
+    return result
+
+
+@register("select.int")
+def lower_select(x, dim, index):
+    """One position along an axis, the axis dropped: a window, no copy."""
+
+    size = list(x.get_size())
+    dim = normalize_dim(int(dim), len(size))
+    index = int(index)
+    if index < 0:
+        index += int(size[dim])
+    window = _slice(x, dim, index, index + 1, 1)
+    new_size = size[:dim] + size[dim + 1 :]
+    return View.create(_underlying(window), new_size)
+
+
+_COMPLEX_DTYPES = tuple(
+    d for d in (getattr(tp, "complex32", None), getattr(tp, "complex64", None),
+                getattr(tp, "complex128", None)) if d is not None
+)
+
+
+def _real_identity(op):
+    """An operation that is the value itself for a real value: a conjugate,
+    a detach (history is not part of a value), an alias."""
+
+    fallback = fallback_handler(op, add_to_fallback_set=False)
+
+    def lower(x, *args, **kwargs):
+        if x.get_dtype() in _COMPLEX_DTYPES:
+            return fallback(x, *args, **kwargs)
+        return x
+
+    return lower
+
+
+for _op_name in ("conj", "_conj", "resolve_conj", "resolve_neg", "detach", "alias"):
+    _packet = getattr(tp.ops.tp, _op_name, None)
+    if _packet is not None:
+        LOWERINGS[f"{_op_name}.default"] = _real_identity(_packet.default)
+
+
+@register("slice_backward.default")
+def lower_slice_backward(grad, self, dim=0, start=None, end=None, step=1):
+    """The gradient of a slice: zeros the input's shape, the gradient laid
+    into the sliced run."""
+
+    size = list(self.get_size()) if hasattr(self, "get_size") else list(self)
+    zeros = Pointwise.create(
+        device=grad.get_device(),
+        dtype=grad.get_dtype(),
+        inner_fn=lambda index: ops.constant(0, grad.get_dtype()),
+        ranges=size,
+    )
+    return slice_scatter(zeros, grad, dim, start, end, step)
+
+
+@register("select_backward.default")
+def lower_select_backward(grad, self, dim, index):
+    """The gradient of a selection: zeros the input's shape, the gradient at
+    the one position it was read from."""
+
+    size = list(self.get_size()) if hasattr(self, "get_size") else list(self)
+    zeros = Pointwise.create(
+        device=grad.get_device(),
+        dtype=grad.get_dtype(),
+        inner_fn=lambda index: ops.constant(0, grad.get_dtype()),
+        ranges=size,
+    )
+    return select_scatter(zeros, grad, dim, index)
+
+
 # The forms a kernel template addresses its operands through.  A template
 # names parts of a buffer as it writes the kernel -- a block of rows, the heads
 # in another order -- and gets back a box whose contents are a view of the
@@ -1918,7 +2592,7 @@ def lower_chunk(x, chunks, dim=0):
     return tuple(out)
 
 
-@register("split.Tensor")
+@register("split.Tensor", "split.default", "unsafe_split.Tensor")
 def lower_split(x, split_size, dim=0):
     size = list(x.get_size())
     dim = normalize_dim(dim, len(size))
@@ -1930,7 +2604,7 @@ def lower_split(x, split_size, dim=0):
     return tuple(out)
 
 
-@register("split_with_sizes.default")
+@register("split_with_sizes.default", "split.sizes")
 def lower_split_with_sizes(x, sizes, dim=0):
     size = list(x.get_size())
     dim = normalize_dim(dim, len(size))
@@ -1942,12 +2616,24 @@ def lower_split_with_sizes(x, sizes, dim=0):
     return tuple(out)
 
 
+@register("stack.default")
+def lower_stack(tensors, dim=0):
+    """A stack is a concatenation of the inputs, each given a new axis."""
+
+    rank = len(tensors[0].get_size()) + 1
+    dim = normalize_dim(int(dim), rank)
+    unsqueeze = LOWERINGS["unsqueeze.default"]
+    return lower_cat([unsqueeze(t, dim) for t in tensors], dim)
+
+
 @register("cat.default")
 def lower_cat(tensors, dim=0):
     """Concatenation as one pointwise loop selecting its source per index."""
 
     size, dtype, device = val_info(node_val())
     dim = normalize_dim(dim, len(size))
+    # A view handed over by another lowering reads as the value it views.
+    tensors = [_as_box(t) if isinstance(t, IRNode) else t for t in tensors]
     inputs = [t for t in tensors if is_tensor_box(t) and t.get_size()[dim] > 0]
     if not inputs:
         # Every operand was a constant or empty, so there is no source to read
@@ -2081,9 +2767,29 @@ def lower_sum(x, dim=None, keepdim=False, dtype=None, **kwargs):
     )
 
 
+@register("sum_to_size.default")
+def lower_sum_to_size(x, size):
+    """The sum over the axes a broadcast to ``x``'s shape added or widened:
+    the leading ones it added go away, the ones it widened from one stay."""
+
+    own = list(x.get_size())
+    size = list(size)
+    lead = len(own) - len(size)
+    widened = [
+        lead + i for i, (want, have) in enumerate(zip(size, own[lead:]))
+        if V.graph.sizevars.statically_known_equals(want, 1)
+        and not V.graph.sizevars.statically_known_equals(have, 1)
+    ]
+    reduced = list(range(lead)) + widened
+    if not reduced:
+        return x
+    total = lower_sum(x, reduced, keepdim=True)
+    return view(total, size)
+
+
 @register("mean.dim")
 def lower_mean(x, dim=None, keepdim=False, dtype=None, **kwargs):
-    if dim is None:
+    if dim is None or (isinstance(dim, (list, tuple)) and len(dim) == 0):
         dim = list(range(len(x.get_size())))
     elif isinstance(dim, (int, sympy.Integer)):
         dim = [dim]
@@ -2097,6 +2803,8 @@ def lower_mean(x, dim=None, keepdim=False, dtype=None, **kwargs):
 
 @register("var.dim", "var.correction")
 def lower_var(x, dim=None, correction=1, keepdim=False, **kwargs):
+    if correction is None:
+        correction = 1
     """Variance as the mean of squared deviations from the mean.
 
     The mean and the total of the squared differences from it are carried in a
@@ -2106,7 +2814,7 @@ def lower_var(x, dim=None, correction=1, keepdim=False, **kwargs):
     for a long group.
     """
 
-    if dim is None:
+    if dim is None or (isinstance(dim, (list, tuple)) and len(dim) == 0):
         dim = list(range(len(x.get_size())))
     elif isinstance(dim, (int, sympy.Integer)):
         dim = [dim]
@@ -2135,7 +2843,7 @@ def lower_var(x, dim=None, correction=1, keepdim=False, **kwargs):
     )
     m2.realize()
     n_elems = prod(red_ranges)
-    denom = Max(sympy.Integer(n_elems) - sympy.Integer(correction), 0)
+    denom = Max(sympy.Integer(n_elems) - sympy.sympify(correction), 0)
     m2_loader = m2.make_loader()
 
     var = Pointwise.create(
@@ -2157,7 +2865,7 @@ def lower_var(x, dim=None, correction=1, keepdim=False, **kwargs):
 
 
 @register("var_mean.default", "var_mean.dim", "var_mean.correction", "var_mean")
-def lower_var_mean(x, dim=None, unbiased=True, keepdim=False, **kwargs):
+def lower_var_mean(x, dim=None, unbiased=True, keepdim=False, *, correction=None, **kwargs):
     """The mean and variance of the reduced axes in one walk.
 
     Both statistics come out of the same running mean and total of squared
@@ -2166,7 +2874,7 @@ def lower_var_mean(x, dim=None, unbiased=True, keepdim=False, **kwargs):
     is asked for and divided by the count less one otherwise.
     """
 
-    if dim is None:
+    if dim is None or (isinstance(dim, (list, tuple)) and len(dim) == 0):
         dim = list(range(len(x.get_size())))
     elif isinstance(dim, (int, sympy.Integer)):
         dim = [dim]
@@ -2203,8 +2911,10 @@ def lower_var_mean(x, dim=None, unbiased=True, keepdim=False, **kwargs):
     mean.realize()
     m2.realize()
     n_elems = prod(red_ranges)
-    correction = 0 if not unbiased else 1
-    denom = Max(sympy.Integer(n_elems) - sympy.Integer(correction), 0)
+    if correction is None:
+        # Unstated, the variance is the unbiased one.
+        correction = 1 if (unbiased is None or unbiased) else 0
+    denom = Max(sympy.Integer(n_elems) - sympy.sympify(correction), 0)
     m2_loader = m2.make_loader()
 
     var = Pointwise.create(
@@ -2246,6 +2956,637 @@ def lower_amin(x, dim=None, keepdim=False, dtype=None, **kwargs):
     elif isinstance(dim, (int, sympy.Integer)):
         dim = [dim]
     return make_reduction(x, dim, keepdim, _resolve_dtype(dtype, x.get_dtype()), x.get_device(), "min")
+
+
+# ---------------------------------------------------------------------------
+# Normalizations and the softmax family, written as the reductions and
+# elementwise passes they are.  Each is a statistic over some axes followed by
+# an elementwise pass that reads it; written this way the scheduler puts the
+# statistic, the pass and whatever surrounds them (the residual add before a
+# layer norm, the activation after it, the scaling before a softmax) into one
+# kernel, where a library call would be a wall none of them can cross.
+# ---------------------------------------------------------------------------
+
+
+def _given(value) -> bool:
+    """Whether an optional operand was given: a value reaches a lowering
+    boxed, or bare when it is a view of one (an expanded weight)."""
+
+    return isinstance(value, ir.IRNode)
+
+
+def _accumulation_dtype(dtype):
+    """The type a statistic of values of this type is accumulated in."""
+
+    return tp.float32 if dtype in (tp.float16, tp.bfloat16) else dtype
+
+
+def _static_ints(values) -> list[int] | None:
+    out = []
+    for v in values:
+        try:
+            out.append(int(v))
+        except (TypeError, ValueError):
+            return None
+    return out
+
+
+def _reduce_rows(device, dtype, rows, cols, value, reduction_type):
+    """One statistic per row of a rows x cols reading: value(row, col)."""
+
+    box = Reduction.create(
+        device=device,
+        dst_dtype=dtype,
+        src_dtype=dtype,
+        inner_fn=lambda index, rindex: value(index[0], rindex[0]),
+        ranges=[rows],
+        reduction_ranges=[cols],
+        reduction_type=reduction_type,
+    )
+    box.realize()
+    return box
+
+
+def _reduce_cols(device, dtype, rows, cols, value, reduction_type):
+    """One statistic per column of a rows x cols reading: value(row, col)."""
+
+    box = Reduction.create(
+        device=device,
+        dst_dtype=dtype,
+        src_dtype=dtype,
+        inner_fn=lambda index, rindex: value(rindex[0], index[0]),
+        ranges=[cols],
+        reduction_ranges=[rows],
+        reduction_type=reduction_type,
+    )
+    box.realize()
+    return box
+
+
+class _RowView:
+    """A tensor read as rows x cols: the leading axes flattened into the row
+    and the trailing ``inner`` axes into the column, in row-major order."""
+
+    def __init__(self, size, inner_rank):
+        self.size = list(size)
+        self.axis = len(self.size) - inner_rank
+        self.outer = self.size[: self.axis]
+        self.inner = self.size[self.axis :]
+        self.rows = prod(self.outer) if self.outer else 1
+        self.cols = prod(self.inner) if self.inner else 1
+
+    def full(self, row, col):
+        return _unflatten_index(row, self.outer) + _unflatten_index(col, self.inner)
+
+    def row_of(self, index):
+        flat = sympy.Integer(0)
+        for i, extent in zip(index[: self.axis], self.outer):
+            flat = flat * int(extent) + i
+        return flat
+
+    def col_of(self, index):
+        flat = sympy.Integer(0)
+        for i, extent in zip(index[self.axis :], self.inner):
+            flat = flat * int(extent) + i
+        return flat
+
+
+_fallback_layer_norm = fallback_handler(tp.ops.tp.native_layer_norm.default)
+_fallback_layer_norm_backward = fallback_handler(
+    tp.ops.tp.native_layer_norm_backward.default
+)
+
+
+@register("native_layer_norm.default")
+def lower_native_layer_norm(x, normalized_shape, weight, bias, eps):
+    """(x - mean) * rstd * weight + bias over the trailing axes, with the
+    per-row mean and reciprocal standard deviation as further results."""
+
+    size = _static_ints(x.get_size())
+    if size is None or len(normalized_shape) > len(size) or 0 in size:
+        return _fallback_layer_norm(x, normalized_shape, weight, bias, eps)
+    view = _RowView(size, len(normalized_shape))
+    device = x.get_device()
+    in_dtype = x.get_dtype()
+    acc = _accumulation_dtype(in_dtype)
+    x_l = x.make_loader()
+
+    def element(row, col):
+        return ops.to_dtype(x_l(view.full(row, col)), acc)
+
+    mean, m2, _weight = ir.WelfordReduction.create(
+        device=device,
+        dtype=acc,
+        inner_fns=(lambda index, rindex: element(index[0], rindex[0]),),
+        ranges=[view.rows],
+        reduction_ranges=[view.cols],
+        reduction_type="welford_reduce",
+    )
+    mean.realize()
+    m2.realize()
+    m2_l = m2.make_loader()
+    mean_l = mean.make_loader()
+    rstd = Pointwise.create(
+        device=device,
+        dtype=acc,
+        inner_fn=lambda index: ops.rsqrt(
+            ops.add(
+                ops.truediv(m2_l(index), ops.constant(float(view.cols), acc)),
+                ops.constant(float(eps), acc),
+            )
+        ),
+        ranges=[view.rows],
+    )
+    rstd.realize()
+    rstd_l = rstd.make_loader()
+    w_l = weight.make_loader() if _given(weight) else None
+    b_l = bias.make_loader() if _given(bias) else None
+
+    def out_fn(index):
+        row = [view.row_of(index)]
+        inner = list(index[view.axis :])
+        v = ops.mul(
+            ops.sub(ops.to_dtype(x_l(index), acc), mean_l(row)), rstd_l(row)
+        )
+        if w_l is not None:
+            v = ops.mul(v, ops.to_dtype(w_l(inner), acc))
+        if b_l is not None:
+            v = ops.add(v, ops.to_dtype(b_l(inner), acc))
+        return ops.to_dtype(v, in_dtype)
+
+    out = Pointwise.create(device=device, dtype=in_dtype, inner_fn=out_fn, ranges=size)
+    return out, mean, rstd
+
+
+@register("layer_norm.default", "layer_norm")
+def lower_layer_norm(x, normalized_shape, weight=None, bias=None, eps=1e-5, *rest):
+    result = lower_native_layer_norm(x, normalized_shape, weight, bias, eps)
+    return result[0] if isinstance(result, (tuple, list)) else result
+
+
+@register("native_layer_norm_backward.default")
+def lower_native_layer_norm_backward(
+    grad_out, x, normalized_shape, mean, rstd, weight, bias, output_mask
+):
+    """The three gradients of a layer norm from the saved row statistics.
+
+    With x̂ = (x - mean) * rstd and ĝ = grad * weight, the input gradient is
+    rstd / N * (N ĝ - Σ ĝ - x̂ Σ x̂ ĝ) with the sums over the row; the weight
+    and bias gradients are Σ grad x̂ and Σ grad down the columns.
+    """
+
+    size = _static_ints(x.get_size())
+    if size is None or 0 in size:
+        return _fallback_layer_norm_backward(
+            grad_out, x, normalized_shape, mean, rstd, weight, bias, output_mask
+        )
+    view = _RowView(size, len(normalized_shape))
+    device = x.get_device()
+    in_dtype = x.get_dtype()
+    acc = _accumulation_dtype(in_dtype)
+    g_l = grad_out.make_loader()
+    x_l = x.make_loader()
+    mean_l = mean.make_loader()
+    rstd_l = rstd.make_loader()
+    w_l = weight.make_loader() if _given(weight) else None
+
+    def x_hat(full, row):
+        return ops.mul(
+            ops.sub(ops.to_dtype(x_l(full), acc), ops.to_dtype(mean_l([row]), acc)),
+            ops.to_dtype(rstd_l([row]), acc),
+        )
+
+    def g_hat(full):
+        g = ops.to_dtype(g_l(full), acc)
+        if w_l is not None:
+            g = ops.mul(g, ops.to_dtype(w_l(full[view.axis :]), acc))
+        return g
+
+    results = [None, None, None]
+    if output_mask[0]:
+        sum_g = _reduce_rows(
+            device, acc, view.rows, view.cols,
+            lambda r, c: g_hat(view.full(r, c)), "sum",
+        )
+        sum_gx = _reduce_rows(
+            device, acc, view.rows, view.cols,
+            lambda r, c: ops.mul(g_hat(view.full(r, c)), x_hat(view.full(r, c), r)),
+            "sum",
+        )
+        sum_g_l = sum_g.make_loader()
+        sum_gx_l = sum_gx.make_loader()
+
+        def grad_input(index):
+            row = view.row_of(index)
+            count = ops.constant(float(view.cols), acc)
+            inner = ops.sub(
+                ops.sub(ops.mul(g_hat(list(index)), count), sum_g_l([row])),
+                ops.mul(x_hat(list(index), row), sum_gx_l([row])),
+            )
+            scale = ops.truediv(ops.to_dtype(rstd_l([row]), acc), count)
+            return ops.to_dtype(ops.mul(scale, inner), in_dtype)
+
+        results[0] = Pointwise.create(
+            device=device, dtype=in_dtype, inner_fn=grad_input, ranges=size
+        )
+    inner_shape = view.inner
+
+    def by_column(value):
+        flat = _reduce_cols(device, acc, view.rows, view.cols, value, "sum")
+        flat_l = flat.make_loader()
+        return Pointwise.create(
+            device=device,
+            dtype=in_dtype,
+            inner_fn=lambda index: ops.to_dtype(
+                flat_l([view.col_of([sympy.Integer(0)] * view.axis + list(index))]),
+                in_dtype,
+            ),
+            ranges=inner_shape,
+        )
+
+    if output_mask[1] and _given(weight):
+        results[1] = by_column(
+            lambda r, c: ops.mul(
+                ops.to_dtype(g_l(view.full(r, c)), acc), x_hat(view.full(r, c), r)
+            )
+        )
+    if output_mask[2] and _given(bias):
+        results[2] = by_column(lambda r, c: ops.to_dtype(g_l(view.full(r, c)), acc))
+    return tuple(results)
+
+
+def _softmax_like(x, dim, out_dtype, log):
+    size = _static_ints(x.get_size())
+    rank = len(x.get_size())
+    if rank == 0:
+        return None
+    d = normalize_dim(int(dim), rank)
+    if size is None or size[d] == 0:
+        return None
+    device = x.get_device()
+    in_dtype = x.get_dtype()
+    acc = _accumulation_dtype(in_dtype)
+    others = [s for i, s in enumerate(size) if i != d]
+    view_rows = prod(others) if others else 1
+    x_l = x.make_loader()
+
+    def full(row, col):
+        outer = _unflatten_index(row, others)
+        return outer[:d] + [col] + outer[d:]
+
+    def row_of(index):
+        flat = sympy.Integer(0)
+        for i, (idx, extent) in enumerate(zip(index, size)):
+            if i != d:
+                flat = flat * int(extent) + idx
+        return flat
+
+    peak = _reduce_rows(
+        device, acc, view_rows, size[d],
+        lambda r, c: ops.to_dtype(x_l(full(r, c)), acc), "max",
+    )
+    peak_l = peak.make_loader()
+    total = _reduce_rows(
+        device, acc, view_rows, size[d],
+        lambda r, c: ops.exp(ops.sub(ops.to_dtype(x_l(full(r, c)), acc), peak_l([r]))),
+        "sum",
+    )
+    total_l = total.make_loader()
+
+    def fn(index):
+        row = [row_of(index)]
+        shifted = ops.sub(ops.to_dtype(x_l(index), acc), peak_l(row))
+        if log:
+            value = ops.sub(shifted, ops.log(total_l(row)))
+        else:
+            value = ops.truediv(ops.exp(shifted), total_l(row))
+        return ops.to_dtype(value, out_dtype)
+
+    return Pointwise.create(device=device, dtype=out_dtype, inner_fn=fn, ranges=size)
+
+
+def _softmax_out_dtype(x, dtype=None, half_to_float=False):
+    if dtype is not None and dtype != tp.undefined:
+        return dtype
+    if half_to_float:
+        return tp.float32
+    return x.get_dtype()
+
+
+def _softmax_lowering(op, log):
+    fallback = fallback_handler(op, add_to_fallback_set=False)
+
+    def lower(x, dim, third=None, **kwargs):
+        # ``_softmax(x, dim, half_to_float)`` and ``softmax(x, dim, dtype)``
+        # differ only in how the result type is named.
+        if isinstance(third, bool):
+            out_dtype = _softmax_out_dtype(x, half_to_float=third)
+        else:
+            out_dtype = _softmax_out_dtype(x, dtype=kwargs.get("dtype", third))
+        if out_dtype != x.get_dtype() and not log:
+            x = to_dtype(x, out_dtype)
+        result = _softmax_like(x, dim, out_dtype, log)
+        if result is None:
+            return fallback(x, dim, third) if third is not None else fallback(x, dim)
+        return result
+
+    return lower
+
+
+for _name, _log in (
+    ("_softmax.default", False), ("softmax.int", False), ("softmax.default", False),
+    ("_log_softmax.default", True), ("log_softmax.int", True), ("log_softmax.default", True),
+):
+    _op_name, _overload = _name.split(".")
+    LOWERINGS[_name] = _softmax_lowering(
+        getattr(getattr(tp.ops.tp, _op_name), _overload), _log
+    )
+
+
+def _softmax_backward_lowering(op, log):
+    fallback = fallback_handler(op, add_to_fallback_set=False)
+
+    def lower(grad, output, dim, input_dtype):
+        size = _static_ints(grad.get_size())
+        rank = len(grad.get_size())
+        if size is None or rank == 0:
+            return fallback(grad, output, dim, input_dtype)
+        d = normalize_dim(int(dim), rank)
+        device = grad.get_device()
+        acc = _accumulation_dtype(grad.get_dtype())
+        others = [s for i, s in enumerate(size) if i != d]
+        rows = prod(others) if others else 1
+        g_l = grad.make_loader()
+        y_l = output.make_loader()
+
+        def full(row, col):
+            outer = _unflatten_index(row, others)
+            return outer[:d] + [col] + outer[d:]
+
+        def row_of(index):
+            flat = sympy.Integer(0)
+            for i, (idx, extent) in enumerate(zip(index, size)):
+                if i != d:
+                    flat = flat * int(extent) + idx
+            return flat
+
+        def summand(r, c):
+            g = ops.to_dtype(g_l(full(r, c)), acc)
+            if log:
+                return g
+            return ops.mul(g, ops.to_dtype(y_l(full(r, c)), acc))
+
+        total = _reduce_rows(device, acc, rows, size[d], summand, "sum")
+        total_l = total.make_loader()
+        out_dtype = input_dtype if input_dtype is not None else grad.get_dtype()
+
+        def fn(index):
+            row = [row_of(index)]
+            g = ops.to_dtype(g_l(index), acc)
+            y = ops.to_dtype(y_l(index), acc)
+            if log:
+                value = ops.sub(g, ops.mul(ops.exp(y), total_l(row)))
+            else:
+                value = ops.mul(y, ops.sub(g, total_l(row)))
+            return ops.to_dtype(value, out_dtype)
+
+        return Pointwise.create(device=device, dtype=out_dtype, inner_fn=fn, ranges=size)
+
+    return lower
+
+
+LOWERINGS["_softmax_backward_data.default"] = _softmax_backward_lowering(
+    tp.ops.tp._softmax_backward_data.default, False
+)
+LOWERINGS["_log_softmax_backward_data.default"] = _softmax_backward_lowering(
+    tp.ops.tp._log_softmax_backward_data.default, True
+)
+
+
+_fallback_batch_norm = fallback_handler(tp.ops.tp.batch_norm.default, add_to_fallback_set=False)
+
+
+@register("batch_norm.default")
+def lower_batch_norm(x, weight, bias, running_mean, running_var, training, momentum, eps, *rest):
+    """A batch norm that reads its running statistics is an affine map per
+    channel: (x - mean) * rsqrt(var + eps) * weight + bias.  One that updates
+    them is handed to the framework whole."""
+
+    if training or not (_given(running_mean) and _given(running_var)):
+        return _fallback_batch_norm(
+            x, weight, bias, running_mean, running_var, training, momentum, eps, *rest
+        )
+    if len(x.get_size()) < 2:
+        return _fallback_batch_norm(
+            x, weight, bias, running_mean, running_var, training, momentum, eps, *rest
+        )
+    in_dtype = x.get_dtype()
+    acc = _accumulation_dtype(in_dtype)
+    x_l = x.make_loader()
+    m_l = running_mean.make_loader()
+    v_l = running_var.make_loader()
+    w_l = weight.make_loader() if _given(weight) else None
+    b_l = bias.make_loader() if _given(bias) else None
+
+    def fn(index):
+        channel = [index[1]]
+        v = ops.mul(
+            ops.sub(ops.to_dtype(x_l(index), acc), ops.to_dtype(m_l(channel), acc)),
+            ops.rsqrt(
+                ops.add(ops.to_dtype(v_l(channel), acc), ops.constant(float(eps), acc))
+            ),
+        )
+        if w_l is not None:
+            v = ops.mul(v, ops.to_dtype(w_l(channel), acc))
+        if b_l is not None:
+            v = ops.add(v, ops.to_dtype(b_l(channel), acc))
+        return ops.to_dtype(v, in_dtype)
+
+    return Pointwise.create(
+        device=x.get_device(), dtype=in_dtype, inner_fn=fn, ranges=list(x.get_size())
+    )
+
+
+_fallback_batch_norm_backward = fallback_handler(
+    tp.ops.tp.batch_norm_backward.default, add_to_fallback_set=False
+)
+
+
+@register("batch_norm_backward.default")
+def lower_batch_norm_backward(
+    grad_out, x, weight=None, running_mean=None, running_var=None, training=True, eps=1e-5
+):
+    """The three gradients of a batch norm over every axis but the channel.
+
+    In training the statistics are those of the batch: with x̂ the normalized
+    input and M the count per channel, the input gradient is
+    w · rstd / M · (M g - Σ g - x̂ Σ g x̂); the weight and bias gradients are
+    Σ g x̂ and Σ g.  With running statistics the normalization is an affine
+    map and the input gradient is g · w · rstd.
+    """
+
+    size = _static_ints(x.get_size())
+    if size is None or len(size) < 2 or 0 in size or (
+        not training and not (_given(running_mean) and _given(running_var))
+    ):
+        return _fallback_batch_norm_backward(
+            grad_out, x, weight, running_mean, running_var, training, eps
+        )
+    device = x.get_device()
+    in_dtype = x.get_dtype()
+    acc = _accumulation_dtype(in_dtype)
+    channels = size[1]
+    rest = [size[0], *size[2:]]
+    count = prod(rest)
+    g_l = grad_out.make_loader()
+    x_l = x.make_loader()
+    w_l = weight.make_loader() if _given(weight) else None
+
+    def full(c, r):
+        parts = _unflatten_index(r, rest)
+        return [parts[0], c, *parts[1:]]
+
+    def per_channel(value, reduction_type="sum"):
+        box = Reduction.create(
+            device=device,
+            dst_dtype=acc,
+            src_dtype=acc,
+            inner_fn=lambda index, rindex: value(index[0], rindex[0]),
+            ranges=[channels],
+            reduction_ranges=[count],
+            reduction_type=reduction_type,
+        )
+        box.realize()
+        return box.make_loader()
+
+    if training:
+        mean, m2, _weight = ir.WelfordReduction.create(
+            device=device,
+            dtype=acc,
+            inner_fns=(
+                lambda index, rindex: ops.to_dtype(x_l(full(index[0], rindex[0])), acc),
+            ),
+            ranges=[channels],
+            reduction_ranges=[count],
+            reduction_type="welford_reduce",
+        )
+        mean.realize()
+        m2.realize()
+        mean_l = mean.make_loader()
+        m2_l = m2.make_loader()
+
+        def centre(c):
+            return mean_l([c])
+
+        def rstd(c):
+            return ops.rsqrt(
+                ops.add(
+                    ops.truediv(m2_l([c]), ops.constant(float(count), acc)),
+                    ops.constant(float(eps), acc),
+                )
+            )
+    else:
+        rm_l = running_mean.make_loader()
+        rv_l = running_var.make_loader()
+
+        def centre(c):
+            return ops.to_dtype(rm_l([c]), acc)
+
+        def rstd(c):
+            return ops.rsqrt(
+                ops.add(ops.to_dtype(rv_l([c]), acc), ops.constant(float(eps), acc))
+            )
+
+    def x_hat(index, c):
+        return ops.mul(ops.sub(ops.to_dtype(x_l(index), acc), centre(c)), rstd(c))
+
+    sum_g = per_channel(lambda c, r: ops.to_dtype(g_l(full(c, r)), acc))
+    sum_gx = per_channel(
+        lambda c, r: ops.mul(ops.to_dtype(g_l(full(c, r)), acc), x_hat(full(c, r), c))
+    )
+
+    def scale(c):
+        if w_l is None:
+            return rstd(c)
+        return ops.mul(ops.to_dtype(w_l([c]), acc), rstd(c))
+
+    def grad_input(index):
+        c = index[1]
+        g = ops.to_dtype(g_l(index), acc)
+        if not training:
+            return ops.to_dtype(ops.mul(g, scale(c)), in_dtype)
+        m = ops.constant(float(count), acc)
+        inner = ops.sub(
+            ops.sub(ops.mul(g, m), sum_g([c])), ops.mul(x_hat(index, c), sum_gx([c]))
+        )
+        return ops.to_dtype(ops.mul(ops.truediv(scale(c), m), inner), in_dtype)
+
+    gi = Pointwise.create(device=device, dtype=in_dtype, inner_fn=grad_input, ranges=size)
+    param_dtype = weight.get_dtype() if _given(weight) else acc
+    gw = Pointwise.create(
+        device=device, dtype=param_dtype,
+        inner_fn=lambda index: ops.to_dtype(sum_gx(index), param_dtype),
+        ranges=[channels],
+    )
+    gb = Pointwise.create(
+        device=device, dtype=param_dtype,
+        inner_fn=lambda index: ops.to_dtype(sum_g(index), param_dtype),
+        ranges=[channels],
+    )
+    return gi, gw, gb
+
+
+_fallback_adaptive_avg_pool2d = fallback_handler(
+    tp.ops.tp.adaptive_avg_pool2d.default, add_to_fallback_set=False
+)
+
+
+@register("adaptive_avg_pool2d.default", "_adaptive_avg_pool2d.default")
+def lower_adaptive_avg_pool2d(x, output_size):
+    """An adaptive average pool whose windows tile the input exactly is a
+    mean over each window: one reduction, fusable with what reads it."""
+
+    size = _static_ints(x.get_size())
+    out = _static_ints(output_size) if output_size is not None else None
+    if size is None or out is None or len(size) not in (3, 4) or len(out) != 2:
+        return _fallback_adaptive_avg_pool2d(x, output_size)
+    h, w = size[-2:]
+    oh, ow = out
+    if oh == 0 or ow == 0 or h % oh or w % ow:
+        return _fallback_adaptive_avg_pool2d(x, output_size)
+    kh, kw = h // oh, w // ow
+    lead = size[:-2]
+    acc = _accumulation_dtype(x.get_dtype())
+    x_l = x.make_loader()
+
+    def inner(index, rindex):
+        *prefix, i, j = index
+        r = rindex[0]
+        return ops.to_dtype(
+            x_l([*prefix, i * kh + FloorDiv(r, sympy.Integer(kw)), j * kw + modular_indexing(r, 1, kw)]),
+            acc,
+        )
+
+    total = Reduction.create(
+        device=x.get_device(),
+        dst_dtype=acc,
+        src_dtype=acc,
+        inner_fn=inner,
+        ranges=[*lead, oh, ow],
+        reduction_ranges=[kh * kw],
+        reduction_type="sum",
+    )
+    total.realize()
+    t_l = total.make_loader()
+    count = float(kh * kw)
+    return Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=lambda index: ops.to_dtype(
+            ops.truediv(t_l(index), ops.constant(count, acc)), x.get_dtype()
+        ),
+        ranges=[*lead, oh, ow],
+    )
 
 
 @register("conv2d_grad_bias.default", "conv_grad_bias.default")
@@ -4725,6 +6066,48 @@ register("new_zeros.default")(_new_zeros)
 register("new_ones.default")(_new_ones)
 
 
+def _filled_like(fill: Any):
+    """A tensor of one value at another value's shape: a constant every
+    reader computes in its own loop, never a buffer of its own."""
+
+    def lower(x: Any, *args: Any, dtype: Any = None, device: Any = None, **kwargs: Any) -> Any:
+        value = args[0] if fill is None else fill
+        return _full(
+            value,
+            decode_device(device) if device is not None else x.get_device(),
+            dtype if isinstance(dtype, tp.dtype) and dtype != tp.undefined else x.get_dtype(),
+            list(x.get_size()),
+        )
+
+    return lower
+
+
+@register("eye", "eye.default", "eye.m")
+def lower_eye(n, m=None, *, dtype=None, layout=None, device=None, pin_memory=None, requires_grad=False):
+    """Ones where the row is the column, zeros elsewhere: computed by every
+    reader from its position, never written down."""
+
+    m = n if m is None else m
+    if not isinstance(dtype, tp.dtype) or dtype == tp.undefined:
+        dtype = tp.get_default_dtype()
+
+    def fn(index):
+        on_diagonal = ops.eq(ops.index_expr(index[0], tp.int64), ops.index_expr(index[1], tp.int64))
+        return ops.to_dtype(on_diagonal, dtype)
+
+    return Pointwise.create(
+        device=decode_device(device if device is not None else "cpu"),
+        dtype=dtype,
+        inner_fn=fn,
+        ranges=[n, m],
+    )
+
+
+register("zeros_like.default", "zeros_like")(_filled_like(0))
+register("ones_like.default", "ones_like")(_filled_like(1))
+register("full_like.default", "full_like")(_filled_like(None))
+
+
 def lower_full(size: Any, fill_value: Any, **kwargs: Any) -> Any:
     """A tensor of one value, at a shape the program writes down.
 
@@ -6253,7 +7636,11 @@ def _promotion_input(value: Any) -> tuple:
     return (value.get_dtype(), len(value.get_size()) == 0)
 
 
-@register_lowering("where.default", broadcast=False, type_promotion_kind=None)
+@register_lowering(
+    ("where.default", "where.self", "where.ScalarSelf", "where.ScalarOther", "where.Scalar"),
+    broadcast=False,
+    type_promotion_kind=None,
+)
 def lower_where(cond, a, b):
     """One of two values, chosen by a third.
 
@@ -6270,6 +7657,14 @@ def lower_where(cond, a, b):
 
     from .dtype_propagation import get_promoted_dtype
 
+    if isinstance(a, (float, int)) and isinstance(b, (float, int)):
+        # Two numbers: the type is the one the numbers come to by themselves.
+        number_type = (
+            tp.bool if isinstance(a, bool) and isinstance(b, bool)
+            else tp.int64 if not isinstance(a, float) and not isinstance(b, float)
+            else tp.get_default_dtype()
+        )
+        a = ir.Constant(value=a, dtype=number_type, device=cond.get_device())
     if isinstance(a, (float, int)):
         a = ir.Constant(value=a, dtype=b.get_dtype(), device=b.get_device())
     if isinstance(b, (float, int)):

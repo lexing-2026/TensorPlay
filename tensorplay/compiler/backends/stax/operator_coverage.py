@@ -63,8 +63,6 @@ LIBRARY_CALLS: dict[str, str] = {
     "scaled_dot_product_efficient_attention.default": "one launch, and its own backward",
     "nll_loss_forward.default": "one launch, and its own backward",
     "nll_loss_backward.default": "one launch, and its own backward",
-    "_log_softmax_backward_data.default": "one launch over a large extent",
-    "_softmax_backward_data.default": "one launch over a large extent",
     "log_softmax_backward.default": "one launch over a large extent",
     "softmax_backward.default": "one launch over a large extent",
     "nll_loss2d_forward.default": "one launch over a large extent",

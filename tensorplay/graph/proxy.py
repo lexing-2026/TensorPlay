@@ -860,8 +860,13 @@ class ParameterProxy(Proxy):
 
 
 def _define_operator(name: str, target: Any, reflected: bool = False) -> None:
-    method_name = f"__r{name}__" if reflected else f"__{name}__"
-    if hasattr(Proxy, method_name):
+    # ``and_``/``or_`` are the operator module's spellings; the protocol
+    # methods are ``__and__``/``__rand__``.
+    bare = name.strip("_")
+    method_name = f"__r{bare}__" if reflected else f"__{bare}__"
+    # Looked up in the class's own namespace: ``type`` itself defines
+    # ``__or__``/``__ror__`` (class unions), which ``hasattr`` would find.
+    if method_name in vars(Proxy):
         return
 
     def impl(self: Proxy, other: Any = None) -> Proxy:

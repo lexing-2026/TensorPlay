@@ -78,14 +78,22 @@ def _square(graph: Graph, node: Node) -> Node:
 
 @_method("softplus")
 def _softplus(graph: Graph, node: Node) -> Node:
-    """softplus(x) -> log(1 + exp(x))
+    """softplus(x, β, t) -> where(β x > t, x, log(1 + exp(β x)) / β)
 
-    log(1 + .) below, so both spellings converge on the same primitive chain.
+    Past the threshold the function is x itself; the exponential there would
+    only overflow.
     """
     x = node.args[0]
-    exp_x = _unop(graph, "exp", x)
+    beta = _scalar_arg(node, 1, "beta", 1.0)
+    threshold = _scalar_arg(node, 2, "threshold", 20.0)
+    scaled = x if beta == 1 else _binop(graph, operator.mul, x, beta)
+    exp_x = _unop(graph, "exp", scaled)
     summed = _binop(graph, operator.add, exp_x, 1)
-    return _unop(graph, "log", summed)
+    soft = _unop(graph, "log", summed)
+    if beta != 1:
+        soft = _binop(graph, operator.truediv, soft, beta)
+    gate = _binop(graph, operator.gt, scaled, threshold)
+    return _where(graph, gate, x, soft)
 
 
 @_method("mish")
@@ -145,6 +153,10 @@ def _logit(graph: Graph, node: Node) -> Node:
     avoids a division whose numerator/denominator can both underflow.
     """
     x = node.args[0]
+    eps = _scalar_arg(node, 1, "eps")
+    if eps is not None:
+        # The input is first held inside [eps, 1 - eps].
+        x = graph.create_node("call_method", "clamp", (x, eps, 1.0 - eps))
     log_x = _unop(graph, "log", x)
     one_minus = _binop(graph, operator.sub, 1, x)
     log_one_minus = _unop(graph, "log", one_minus)
@@ -735,7 +747,16 @@ def _rewrite(
 #: gradient needs the input alone.  Only names the native graph spells as one
 #: node belong here; ``swish`` stays in the table because that vocabulary spells
 #: it as the sigmoid product.
-_FUSED_COMPOSITES = frozenset({"silu"})
+_FUSED_COMPOSITES = frozenset({
+    "silu",
+    # Each of these is one device unit or one elementwise loop body with a
+    # gradient rule of its own, so the expansion buys nothing a backend needs
+    # and costs accuracy: log(1 + x), exp(x) - 1 and (eˣ - e⁻ˣ) / 2 cancel
+    # catastrophically for small x where the units do not.
+    "log1p", "expm1", "log10", "sinh", "cosh", "asinh", "acosh", "atanh",
+    "softplus", "gelu", "elu", "leaky_relu", "hardtanh", "hardsigmoid",
+    "threshold",
+})
 
 #: The table :class:`DecomposePass` rewrites with, resolved after every rule
 #: above has registered itself.

@@ -1494,20 +1494,18 @@ class GraphLowering(Interpreter):
         ``strides`` replaces the traced strides when the call was run on
         operands laid out the way this region lays them out and answered with
         another arrangement.
+
+        The offset is always zero: the buffer a call's result is held in is
+        the tensor the call returned, whose first element is where its data
+        begins.  A view returned at an offset into its base already starts
+        there, and counting the base's offset again would read past it.
         """
 
-        if strides is not None:
-            return FixedLayout(
-                val.device, val.dtype,
-                tuple(int(s) for s in val.shape),
-                tuple(int(s) for s in strides),
-                0,
-            )
         return FixedLayout(
             val.device, val.dtype,
             tuple(int(s) for s in val.shape),
-            tuple(int(s) for s in val.stride()),
-            int(val.storage_offset()) if hasattr(val, "storage_offset") else 0,
+            tuple(int(s) for s in (val.stride() if strides is None else strides)),
+            0,
         )
 
     def _probe_fallback_result(self, node, tensor_args, other_args, unflatten):
@@ -1674,6 +1672,9 @@ class GraphLowering(Interpreter):
         single_output = count_tensors(val) == 1
 
         def wrap(item, path):
+            if _is_absent_tensor(item):
+                # An output the call was asked not to compute is no value.
+                return None
             if _is_tensor(item):
                 if single_output:
                     # Boxed the way every value is, so that what holds this
@@ -2191,6 +2192,21 @@ class GraphLowering(Interpreter):
             # Indexing a result tuple is answered here rather than called out
             # to: a value that is already computed is addressed, not recomputed.
             return args[0][args[1]]
+        if (
+            name == "getitem"
+            and len(args) == 2
+            and isinstance(args[0], (TensorBox, ir.BaseView))
+        ):
+            # Basic indexing names a window of the value: written as views it
+            # is read in place by whatever consumes it.
+            from .op_lowerings import _as_box, lower_basic_getitem
+
+            with self.set_current_node(node), set_current_node(node):
+                viewed = lower_basic_getitem(_as_box(args[0]), args[1])
+            if viewed is not None:
+                viewed = self._mark_reuse(node, viewed)
+                assign_origin_node(viewed, node)
+                return viewed
 
         lowering = (
             user_lowerings.get(node)
@@ -2699,7 +2715,21 @@ def _ints(value) -> tuple:
 
 
 def _is_tensor(value) -> bool:
-    return hasattr(value, "shape") and hasattr(value, "dtype") and hasattr(value, "stride")
+    return (
+        hasattr(value, "shape")
+        and hasattr(value, "dtype")
+        and hasattr(value, "stride")
+        and not _is_absent_tensor(value)
+    )
+
+
+def _is_absent_tensor(value) -> bool:
+    """Whether a value is the placeholder an operator returns for an output
+    it was asked not to compute (a gradient masked off, say): it has no
+    elements, no layout and no memory, so it stands for nothing."""
+
+    defined = getattr(value, "defined", None)
+    return callable(defined) and hasattr(value, "stride") and not defined()
 
 
 __all__ = ["GraphLowering", "SubgraphLowering"]

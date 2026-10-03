@@ -6700,6 +6700,11 @@ class ExternKernel(InputsKernel):
         if isinstance(x, StorageBox):
             x.realize()
             return x
+        if isinstance(x, Buffer) and x.get_buffer_name():
+            # Already written somewhere with a name to read it by -- a window
+            # onto a laid-down value reaches here unboxed -- so it is read
+            # where it is rather than copied.
+            return x
         if allow_shared:
             return cls._shared_layout_copy(x, layout_key=("realize_input",))
         return cls.copy_input(x)
