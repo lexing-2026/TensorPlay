@@ -36,18 +36,25 @@ def test_symbolic_float_native_operations():
     assert (tp.SymFloat(1.5) + tp.SymFloat(2.5)).expect_float() == 4.0
 
 
-def test_symbolic_metadata_returns_are_native_types():
-    value = tp.empty((2, 3))
-    assert isinstance(tp.sym_size(value, 0), tp.SymInt)
-    assert tp.sym_size(value, 0).expect_int() == 2
-    assert isinstance(tp.sym_numel(value), tp.SymInt)
-    assert tp.sym_numel(value).expect_int() == 6
-    assert isinstance(tp.sym_stride(value, 1), tp.SymInt)
-    assert tp.sym_stride(value, 1).expect_int() == 1
-    assert isinstance(tp.sym_storage_offset(value), tp.SymInt)
-    assert tp.sym_storage_offset(value).expect_int() == 0
-    assert isinstance(tp.sym_is_contiguous(value), tp.SymBool)
-    assert tp.sym_is_contiguous(value).expect_bool()
+def test_known_symbolic_metadata_comes_back_as_plain_numbers():
+    # A size that is already known is a number, and it comes back as one:
+    # the same type `Tensor.size()` gives for it, so arithmetic and
+    # `isinstance(n, int)` treat both alike.
+    value = tp.empty((2, 3))[1:]
+    returned = {
+        "sym_size": (tp.sym_size(value, 1), 3),
+        "sym_size.int": (tp.ops.tp.sym_size.int(value, 0), 1),
+        "sym_numel": (tp.sym_numel(value), 3),
+        "sym_stride": (tp.sym_stride(value, 0), 3),
+        "sym_storage_offset": (tp.sym_storage_offset(value), 3),
+    }
+    for name, (got, expected) in returned.items():
+        assert type(got) is int, name
+        assert got == expected, name
+    contiguous = tp.sym_is_contiguous(value)
+    assert type(contiguous) is bool
+    assert contiguous is True
+    assert tp.sym_is_contiguous(tp.empty((2, 3)).t()) is False
 
 
 def test_symbolic_scalar_native_operator_surface():

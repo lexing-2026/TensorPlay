@@ -1787,13 +1787,27 @@ PyObject* tpx_py_wrap_optional_scalar(const std::optional<Scalar>& s) {
     }
     return tpx_py_wrap_scalar(*s);
 }
+// A symbolic value that already knows its number goes back as that number:
+// only one still waiting on a symbol needs the symbolic wrapper, and handing
+// out a wrapper for a known size would make every caller that does
+// arithmetic or `isinstance(n, int)` on it see a different type than the one
+// `Tensor.size()` gives for the same value.
 PyObject* tpx_py_wrap_symint(const SymInt& value) {
+    if (const auto concrete = value.maybe_as_int()) {
+        return PyLong_FromLongLong(*concrete);
+    }
     return py::cast(value).release().ptr();
 }
 PyObject* tpx_py_wrap_symbool(const SymBool& value) {
+    if (const auto concrete = value.maybe_as_bool()) {
+        return PyBool_FromLong(*concrete);
+    }
     return py::cast(value).release().ptr();
 }
 PyObject* tpx_py_wrap_symfloat(const SymFloat& value) {
+    if (const auto concrete = value.maybe_as_float()) {
+        return PyFloat_FromDouble(*concrete);
+    }
     return py::cast(value).release().ptr();
 }
 PyObject* tpx_py_wrap_optional_symint(const std::optional<SymInt>& value) {
@@ -1814,14 +1828,30 @@ PyObject* tpx_py_wrap_optional_symfloat(const std::optional<SymFloat>& value) {
     }
     return tpx_py_wrap_symfloat(*value);
 }
+namespace {
+template <typename T, typename Wrap>
+PyObject* wrap_each(const std::vector<T>& values, Wrap wrap) {
+    PyObject* list = PyList_New(static_cast<Py_ssize_t>(values.size()));
+    if (list == nullptr) return nullptr;
+    for (size_t i = 0; i < values.size(); ++i) {
+        PyObject* item = wrap(values[i]);
+        if (item == nullptr) {
+            Py_DECREF(list);
+            return nullptr;
+        }
+        PyList_SET_ITEM(list, static_cast<Py_ssize_t>(i), item);
+    }
+    return list;
+}
+} // namespace
 PyObject* tpx_py_wrap_symintlist(const std::vector<SymInt>& values) {
-    return py::cast(values).release().ptr();
+    return wrap_each(values, tpx_py_wrap_symint);
 }
 PyObject* tpx_py_wrap_symboollist(const std::vector<SymBool>& values) {
-    return py::cast(values).release().ptr();
+    return wrap_each(values, tpx_py_wrap_symbool);
 }
 PyObject* tpx_py_wrap_symfloatlist(const std::vector<SymFloat>& values) {
-    return py::cast(values).release().ptr();
+    return wrap_each(values, tpx_py_wrap_symfloat);
 }
 PyObject* tpx_py_wrap_optional_symintlist(
     const std::optional<std::vector<SymInt>>& values) {
