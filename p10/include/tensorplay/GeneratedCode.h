@@ -444,6 +444,196 @@ inline T cascade_sum_final(CascadeSumHelper<T, kChunkSize>* c) {
     return result;
 }
 
+// A running mean and second moment, the state a variance reduction carries.
+//
+// ``weight`` counts the elements folded in per lane (a masked tail folds a
+// different number into different lanes); ``index`` counts the steps taken,
+// which is what a chunk boundary is measured in.
+template <typename T>
+struct Welford {
+    T mean = T(0);
+    T m2 = T(0);
+    T weight = T(0);
+    uint64_t index = 0;
+};
+
+template <typename T>
+struct IsVecType : std::false_type {};
+template <typename T>
+struct IsVecType<tensorplay::vec::Vectorized<T>> : std::true_type {};
+template <typename T, int N>
+struct IsVecType<tensorplay::vec::VectorizedN<T, N>> : std::true_type {};
+
+template <typename T>
+struct GetScalarType {
+    using type = T;
+};
+template <typename T>
+struct GetScalarType<tensorplay::vec::Vectorized<T>> {
+    using type = T;
+};
+template <typename T, int N>
+struct GetScalarType<tensorplay::vec::VectorizedN<T, N>> {
+    using type = T;
+};
+
+// What a long variance reduction keeps besides its running state: the
+// reciprocals of the first ``kChunkSize`` counts, so a step multiplies
+// instead of dividing, and a stack of finished chunks folded together in
+// balanced pairs, which keeps a long reduction's rounding close to a tree's.
+template <typename T, uint64_t kChunkSize>
+struct WelfordHelper {
+    static std::vector<typename GetScalarType<T>::type> weight_recps;
+    std::vector<Welford<T>> welford_stk{};
+    uint64_t depth{0};
+    uint64_t num_chunks{0};
+    WelfordHelper() = default;
+    WelfordHelper(uint64_t N) {
+        const uint64_t m = (N + kChunkSize - 1) / kChunkSize;
+        depth = ceil_log2_u64(m);
+        welford_stk.assign(depth, Welford<T>());
+    }
+};
+
+template <typename T, uint64_t kChunkSize>
+std::vector<typename GetScalarType<T>::type>
+    WelfordHelper<T, kChunkSize>::weight_recps = []() {
+        using scalar_t = typename GetScalarType<T>::type;
+        std::vector<scalar_t> recps(kChunkSize);
+        for (uint64_t i = 0; i < kChunkSize; ++i) {
+            recps[i] = scalar_t(1.0 / static_cast<double>(i + 1));
+        }
+        return recps;
+    }();
+
+// Two partial states merged.  Equal infinite means give a zero difference
+// rather than inf - inf, and lanes that hold nothing contribute nothing.
+template <typename T>
+Welford<T> welford_combine(const Welford<T>& a, const Welford<T>& b, bool use_index = false) {
+    if (a.index == 0) return b;
+    if (b.index == 0) return a;
+    auto delta = b.mean - a.mean;
+    if constexpr (IsVecType<T>::value) {
+        delta = T::blendv(delta, T(0), a.mean == b.mean);
+    } else {
+        if (std::isinf(a.mean) && a.mean == b.mean) delta = T(0);
+    }
+    auto a_weight = use_index ? T(a.index) : a.weight;
+    auto b_weight = use_index ? T(b.index) : b.weight;
+    auto new_weight = a_weight + b_weight;
+    auto new_index = a.index + b.index;
+    auto wb_over_w = b_weight / new_weight;
+    if constexpr (IsVecType<T>::value) {
+        wb_over_w = T::blendv(wb_over_w, T(0), new_weight == T(0));
+    }
+    return Welford<T>{
+        a.mean + delta * wb_over_w,
+        a.m2 + b.m2 + delta * delta * a_weight * wb_over_w,
+        new_weight,
+        new_index};
+}
+
+// One more element folded in.  With a helper, every finished chunk is pushed
+// onto its stack and folded with the chunks below it in balanced pairs.
+template <typename T, uint64_t kChunkSize = 0>
+Welford<T> welford_combine(Welford<T>& acc, T& data, WelfordHelper<T, kChunkSize>* w = nullptr) {
+    if (w != nullptr && w->depth > 0 && acc.index == kChunkSize) {
+        w->welford_stk[0] = welford_combine(w->welford_stk[0], acc);
+        w->num_chunks += 1;
+        acc.mean = T(0);
+        acc.m2 = T(0);
+        acc.weight = T(0);
+        acc.index = 0;
+        uint64_t mask = w->num_chunks;
+        for (uint64_t j = 1; j < w->depth && (mask & 1) == 0; ++j) {
+            w->welford_stk[j] = welford_combine(w->welford_stk[j], w->welford_stk[j - 1]);
+            w->welford_stk[j - 1] = Welford<T>();
+            mask >>= 1;
+        }
+    }
+    const uint64_t new_index = acc.index + 1;
+    auto new_weight = acc.weight + T(1);
+    auto delta = data - acc.mean;
+    T new_mean = acc.mean +
+        ((w == nullptr || acc.index >= w->weight_recps.size())
+             ? delta / new_weight
+             : delta * T(w->weight_recps[acc.index]));
+    auto new_delta = data - new_mean;
+    return Welford<T>{new_mean, acc.m2 + delta * new_delta, new_weight, new_index};
+}
+
+// The chunks still on a helper's stack, folded into the running state; a
+// reduction's result is read only after this.
+template <typename T, uint64_t kChunkSize>
+Welford<T> welford_combine(Welford<T>& acc, WelfordHelper<T, kChunkSize>* w) {
+    for (uint64_t i = 0; i < w->depth; ++i) {
+        acc = welford_combine(acc, w->welford_stk[i]);
+    }
+    return acc;
+}
+
+// A vector step over a tail: only the first ``tail_size`` lanes take it.
+template <typename T, uint64_t kChunkSize = 0>
+Welford<T> welford_combine(
+    Welford<T>& acc, T& data, int64_t tail_size, WelfordHelper<T, kChunkSize>* w = nullptr) {
+    auto out = welford_combine(acc, data, w);
+    return Welford<T>{
+        T::set(acc.mean, out.mean, tail_size),
+        T::set(acc.m2, out.m2, tail_size),
+        T::set(acc.weight, out.weight, tail_size),
+        out.index};
+}
+
+// Lane ``i`` takes lane ``i + n`` for every ``i`` a multiple of ``2n``: the
+// pairing a tree reduction over the lanes needs.
+template <typename scalar_t>
+inline tensorplay::vec::Vectorized<scalar_t> vec_shuffle_down(
+    tensorplay::vec::Vectorized<scalar_t> x, size_t n) {
+    using Vec = tensorplay::vec::Vectorized<scalar_t>;
+    alignas(alignof(Vec)) scalar_t array[Vec::size()];
+    x.store(array);
+    for (size_t i = 0; i + n < Vec::size(); i += 2 * n) {
+        array[i] = array[i + n];
+    }
+    return Vec::loadu(array);
+}
+
+// The lanes of a vector state merged into one.  When every lane folded in
+// the same number of elements, the step count stands in for the weights.
+template <typename scalar_t>
+Welford<scalar_t> welford_vec_reduce_all(Welford<tensorplay::vec::Vectorized<scalar_t>> acc) {
+    using Vec = tensorplay::vec::Vectorized<scalar_t>;
+    Welford<scalar_t> result;
+    if (acc.index == 0) return result;
+    const bool use_index = (acc.weight - Vec(acc.index)).zero_mask() ==
+        static_cast<int>((1 << Vec::size()) - 1);
+    for (size_t n = 1; n < Vec::size(); n *= 2) {
+        auto shuffled = Welford<Vec>{
+            vec_shuffle_down(acc.mean, n),
+            vec_shuffle_down(acc.m2, n),
+            use_index ? Vec(0) : vec_shuffle_down(acc.weight, n),
+            acc.index};
+        acc = welford_combine(acc, shuffled, use_index);
+    }
+    alignas(alignof(Vec)) scalar_t array[Vec::size()];
+    acc.mean.store(array);
+    result.mean = array[0];
+    acc.m2.store(array);
+    result.m2 = array[0];
+    acc.weight.store(array);
+    result.weight = array[0];
+    result.index = result.weight;
+    return result;
+}
+
+template <typename scalar_t>
+Welford<scalar_t> welford_vec_reduce_all(Welford<tensorplay::vec::VectorizedN<scalar_t, 2>> acc) {
+    using Vec = tensorplay::vec::Vectorized<scalar_t>;
+    auto first = Welford<Vec>{acc.mean[0], acc.m2[0], acc.weight[0], acc.index};
+    auto second = Welford<Vec>{acc.mean[1], acc.m2[1], acc.weight[1], acc.index};
+    return welford_vec_reduce_all(welford_combine(first, second));
+}
+
 }  // namespace generated
 }  // namespace tensorplay
 
@@ -457,3 +647,9 @@ using tensorplay::vec::transpose_mxn;
 using tensorplay::generated::CascadeSumHelper;
 using tensorplay::generated::cascade_sum_combine;
 using tensorplay::generated::cascade_sum_final;
+
+// So is the variance reduction's state and its helpers.
+using tensorplay::generated::Welford;
+using tensorplay::generated::WelfordHelper;
+using tensorplay::generated::welford_combine;
+using tensorplay::generated::welford_vec_reduce_all;
