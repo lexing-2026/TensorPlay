@@ -126,7 +126,14 @@ Tensor& inplace_wrap_masked_fill_dd_Scalar(Tensor& self, const Tensor& mask, con
 }
 
 Tensor& inplace_wrap_random_dd_from(Tensor& self, int64_t from, std::optional<int64_t> to, std::optional<Generator> generator) {
-    ops::copy_(self, ops::random_(self, from, to.value_or(0)));
+    if (to.has_value() && !generator.has_value()) {
+        return ops::random_(self, from, *to);
+    }
+    // A caller's generator, or a draw with no upper bound, is served by the
+    // host kernel, and the values are then placed where the tensor lives.
+    Tensor host = ops::empty_like(self, self.dtype(), Device(DeviceType::CPU));
+    ops::random_(host, from, to, generator);
+    ops::copy_(self, host);
     return self;
 }
 

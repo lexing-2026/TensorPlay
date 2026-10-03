@@ -2171,8 +2171,11 @@ Tensor rand_generator_native(const std::vector<int64_t>& size,
                              std::optional<int64_t> layout,
                              std::optional<Device> device,
                              std::optional<bool> pin_memory) {
-    (void)generator; (void)layout; (void)pin_memory;
-    return ops::rand(size, dtype, device);
+    (void)layout; (void)pin_memory;
+    if (!generator.has_value()) return ops::rand(size, dtype, device);
+    // The draws come from the caller's generator, not the default one.
+    Tensor t = ops::empty(size, dtype, device);
+    return ops::uniform_(t, 0.0, 1.0, generator);
 }
 
 Tensor rand_like_generator_native(const Tensor& self,
@@ -2182,8 +2185,12 @@ Tensor rand_like_generator_native(const Tensor& self,
                                   std::optional<Device> device,
                                   std::optional<bool> pin_memory,
                                   std::optional<int64_t> memory_format) {
-    (void)generator; (void)layout; (void)pin_memory; (void)memory_format;
-    return ops::rand_like(self, dtype.value_or(DType::Undefined), device);
+    (void)layout; (void)pin_memory; (void)memory_format;
+    if (!generator.has_value()) {
+        return ops::rand_like(self, dtype.value_or(DType::Undefined), device);
+    }
+    Tensor t = ops::empty_like(self, dtype.value_or(DType::Undefined), device);
+    return ops::uniform_(t, 0.0, 1.0, generator);
 }
 
 Tensor randint_low_native(int64_t low, int64_t high, const std::vector<int64_t>& size,
@@ -2201,8 +2208,12 @@ Tensor randint_generator_native(int64_t high, const std::vector<int64_t>& size,
                                 std::optional<int64_t> layout,
                                 std::optional<Device> device,
                                 std::optional<bool> pin_memory) {
-    (void)generator; (void)layout; (void)pin_memory;
-    return ops::randint(0, high, size, dtype.value_or(DType::Int64), device);
+    (void)layout; (void)pin_memory;
+    if (!generator.has_value()) {
+        return ops::randint(0, high, size, dtype.value_or(DType::Int64), device);
+    }
+    Tensor t = ops::empty(size, dtype.value_or(DType::Int64), device);
+    return ops::random_(t, 0, high, generator);
 }
 
 Tensor randint_low_generator_native(int64_t low, int64_t high,
@@ -2212,8 +2223,12 @@ Tensor randint_low_generator_native(int64_t low, int64_t high,
                                     std::optional<int64_t> layout,
                                     std::optional<Device> device,
                                     std::optional<bool> pin_memory) {
-    (void)generator; (void)layout; (void)pin_memory;
-    return ops::randint(low, high, size, dtype.value_or(DType::Int64), device);
+    (void)layout; (void)pin_memory;
+    if (!generator.has_value()) {
+        return ops::randint(low, high, size, dtype.value_or(DType::Int64), device);
+    }
+    Tensor t = ops::empty(size, dtype.value_or(DType::Int64), device);
+    return ops::random_(t, low, high, generator);
 }
 
 Tensor randint_like_low_dtype_native(const Tensor& self, int64_t low, int64_t high,
@@ -2246,8 +2261,12 @@ Tensor randint_like_generator_native(const Tensor& self, int64_t high,
                                      std::optional<Device> device,
                                      std::optional<bool> pin_memory,
                                      std::optional<int64_t> memory_format) {
-    (void)generator; (void)layout; (void)pin_memory; (void)memory_format;
-    return ops::randint_like(self, 0, high, dtype.value_or(DType::Undefined), device);
+    (void)layout; (void)pin_memory; (void)memory_format;
+    if (!generator.has_value()) {
+        return ops::randint_like(self, 0, high, dtype.value_or(DType::Undefined), device);
+    }
+    Tensor t = ops::empty_like(self, dtype.value_or(DType::Undefined), device);
+    return ops::random_(t, 0, high, generator);
 }
 
 Tensor randint_like_tensor_generator_native(const Tensor& self, const Tensor& high,
@@ -2257,9 +2276,13 @@ Tensor randint_like_tensor_generator_native(const Tensor& self, const Tensor& hi
                                             std::optional<Device> device,
                                             std::optional<bool> pin_memory,
                                             std::optional<int64_t> memory_format) {
-    (void)generator; (void)layout; (void)pin_memory; (void)memory_format;
-    return ops::randint_like(self, 0, high.item().to<int64_t>(),
-                             dtype.value_or(DType::Undefined), device);
+    (void)layout; (void)pin_memory; (void)memory_format;
+    const int64_t bound = high.item().to<int64_t>();
+    if (!generator.has_value()) {
+        return ops::randint_like(self, 0, bound, dtype.value_or(DType::Undefined), device);
+    }
+    Tensor t = ops::empty_like(self, dtype.value_or(DType::Undefined), device);
+    return ops::random_(t, 0, bound, generator);
 }
 
 Tensor randint_like_low_generator_dtype_native(const Tensor& self, int64_t low, int64_t high,
@@ -2269,8 +2292,12 @@ Tensor randint_like_low_generator_dtype_native(const Tensor& self, int64_t low, 
                                                std::optional<Device> device,
                                                std::optional<bool> pin_memory,
                                                std::optional<int64_t> memory_format) {
-    (void)generator; (void)layout; (void)pin_memory; (void)memory_format;
-    return ops::randint_like(self, low, high, dtype.value_or(DType::Undefined), device);
+    (void)layout; (void)pin_memory; (void)memory_format;
+    if (!generator.has_value()) {
+        return ops::randint_like(self, low, high, dtype.value_or(DType::Undefined), device);
+    }
+    Tensor t = ops::empty_like(self, dtype.value_or(DType::Undefined), device);
+    return ops::random_(t, low, high, generator);
 }
 
 Tensor randn_like_generator_native(const Tensor& self,
@@ -2280,8 +2307,12 @@ Tensor randn_like_generator_native(const Tensor& self,
                                    std::optional<Device> device,
                                    std::optional<bool> pin_memory,
                                    std::optional<int64_t> memory_format) {
-    (void)generator; (void)layout; (void)pin_memory; (void)memory_format;
-    return ops::randn_like(self, dtype.value_or(DType::Undefined), device);
+    (void)layout; (void)pin_memory; (void)memory_format;
+    if (!generator.has_value()) {
+        return ops::randn_like(self, dtype.value_or(DType::Undefined), device);
+    }
+    Tensor t = ops::empty_like(self, dtype.value_or(DType::Undefined), device);
+    return ops::normal_(t, 0.0, 1.0, generator);
 }
 
 Tensor randperm_generator_native(int64_t n, std::optional<Generator> generator,
@@ -2331,8 +2362,7 @@ Tensor randperm_generator_native(int64_t n, std::optional<Generator> generator,
 }
 
 Tensor& random_to_native(Tensor& self, int64_t to, std::optional<Generator> generator) {
-    (void)generator;
-    return ops::random_(self, 0, to);
+    return ops::random_(self, 0, std::optional<int64_t>(to), generator);
 }
 
 Tensor range_step_native(const Scalar& start, const Scalar& end, const Scalar& step,

@@ -67,6 +67,36 @@ class TestRandom(unittest.TestCase):
             v2 = tp.randn([10], generator=g)
             self.assertEqual(v1.tolist(), v2.tolist())
 
+    def test_factories_draw_from_the_generator_they_are_given(self):
+        like = tp.zeros([6])
+        factories = {
+            "rand": lambda g: tp.rand([6], generator=g),
+            "rand_like": lambda g: tp.ops.tp.rand_like.generator(like, generator=g),
+            "randint": lambda g: tp.ops.tp.randint.low_generator(0, 100, [6], generator=g),
+            "randint_like": lambda g: tp.ops.tp.randint_like.low_generator_dtype(like, 0, 100, generator=g),
+            "randn_like": lambda g: tp.ops.tp.randn_like.generator(like, generator=g),
+        }
+        for name, draw in factories.items():
+            first = draw(tp.Generator(SEED))
+            # Advancing the default generator in between must not matter.
+            tp.rand([17])
+            second = draw(tp.Generator(SEED))
+            self.assertEqual(first.tolist(), second.tolist(), name)
+
+    def test_random_draws_from_its_generator_and_bound(self):
+        for dtype in (tp.int64, tp.float32):
+            first = tp.empty([8], dtype=dtype).random_(3, 40, generator=tp.Generator(SEED))
+            tp.rand([5])
+            second = tp.empty([8], dtype=dtype).random_(3, 40, generator=tp.Generator(SEED))
+            self.assertEqual(first.tolist(), second.tolist())
+            self.assertTrue(bool(((first >= 3) & (first < 40)).all().item()))
+        upto = tp.empty([64], dtype=tp.int64).random_(7, generator=tp.Generator(SEED))
+        self.assertTrue(bool(((upto >= 0) & (upto < 7)).all().item()))
+        # Without an upper bound a float draw stays within the integers float32
+        # represents exactly.
+        unbounded = tp.empty([64]).random_(5, None, generator=tp.Generator(SEED))
+        self.assertTrue(bool(((unbounded >= 5) & (unbounded <= 2 ** 24)).all().item()))
+
     def _supports_generator_kwarg(self):
         try:
             tp.randn([2], generator=tp.Generator(SEED))

@@ -1160,8 +1160,9 @@ Tensor& normal_inplace_kernel(Tensor& self, double mean, double std,
     return self;
 }
 
-Tensor& random_kernel(Tensor& self, int64_t low, int64_t high) {
-    auto& gen = default_generator();
+namespace {
+
+Tensor& random_fill(Tensor& self, int64_t low, int64_t high, Generator& gen) {
     const bool full_range = (low == 0 && high == 0);
     if (full_range) {
         if (self.numel() == 0) return self;
@@ -1218,6 +1219,73 @@ Tensor& random_kernel(Tensor& self, int64_t low, int64_t high) {
         });
     });
     return self;
+}
+
+// The largest value a draw without an upper bound may take: every integer a
+// floating type represents exactly, or the integer type's own maximum.
+template <typename scalar_t>
+uint64_t unbounded_top() {
+    if constexpr (std::is_same_v<scalar_t, double>) {
+        return uint64_t{1} << 53;
+    } else if constexpr (std::is_same_v<scalar_t, float>) {
+        return uint64_t{1} << 24;
+    } else if constexpr (std::is_same_v<scalar_t, Half>) {
+        return uint64_t{1} << 11;
+    } else if constexpr (std::is_same_v<scalar_t, BFloat16>) {
+        return uint64_t{1} << 8;
+    } else if constexpr (std::is_same_v<scalar_t, bool>) {
+        return 1;
+    } else {
+        return static_cast<uint64_t>(std::numeric_limits<scalar_t>::max());
+    }
+}
+
+}  // namespace
+
+Tensor& random_kernel(Tensor& self, int64_t low, int64_t high) {
+    return random_fill(self, low, high, default_generator());
+}
+
+// `random_.from`: [from, to), or from ``from`` up to the largest value the
+// dtype holds exactly when no upper bound is given; the draws come from the
+// caller's generator when one is passed.
+Tensor& random_from_kernel(Tensor& self, int64_t from, std::optional<int64_t> to,
+                           std::optional<Generator> generator) {
+    Generator gen = generator.has_value() ? *generator : default_generator();
+    if (to.has_value()) {
+        TP_THROW_IF(*to <= from, RuntimeError,
+                    "random_ expects 'from' to be less than 'to', but got from=",
+                    from, " >= to=", *to);
+        return random_fill(self, from, *to, gen);
+    }
+    if (self.numel() == 0) return self;
+    check_writable_inplace(self);
+    dispatch_all(self.dtype(), [&](auto tag) {
+        using scalar_t = decltype(tag);
+        const uint64_t top = unbounded_top<scalar_t>();
+        TP_THROW_IF(from >= 0 && static_cast<uint64_t>(from) > top, RuntimeError,
+                    "random_ expects 'from' to be at most ", top, " for ",
+                    self.dtype(), ", but got from=", from);
+        // The count of values in [from, top]; it wraps to zero only for the
+        // whole 64-bit range, which is drawn as raw bits.
+        const uint64_t range = top - static_cast<uint64_t>(from) + 1;
+        if (range == 0) {
+            for_each_element<scalar_t>(self, [&](scalar_t& v) {
+                v = static_cast<scalar_t>(gen.random64());
+            });
+            return;
+        }
+        uniform_int_from_to_distribution<scalar_t> dist(range, from);
+        for_each_element<scalar_t>(self, [&](scalar_t& v) {
+            v = dist(&gen);
+        });
+    });
+    return self;
+}
+
+Tensor& random_to_kernel(Tensor& self, int64_t to,
+                         std::optional<Generator> generator) {
+    return random_from_kernel(self, 0, to, std::move(generator));
 }
 
 Tensor& uniform_kernel(Tensor& self, double from, double to,
@@ -1304,6 +1372,8 @@ TENSORPLAY_LIBRARY_IMPL(CPU, RandomKernels) {
     m.impl("log_normal_", log_normal_kernel);
     m.impl("normal_", normal_inplace_kernel);
     m.impl("random_", random_kernel);
+    m.impl("random_.from", random_from_kernel);
+    m.impl("random_.to", random_to_kernel);
     m.impl("uniform_", uniform_kernel);
 }
 
