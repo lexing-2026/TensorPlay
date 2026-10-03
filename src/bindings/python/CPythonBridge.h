@@ -160,6 +160,11 @@ void tpx_py_check_types(PyObject* const* slots, Py_ssize_t n,
 // kind is flagged TPK_OPTIONAL.
 bool tpx_py_obj_matches_kind(PyObject* obj, unsigned char kind);
 
+// Whether the object fills a Number slot: Python numbers, numpy scalars, or
+// the registered tensorplay.Scalar wrapper.  Non-throwing; never sets an
+// error.
+bool tpx_py_obj_is_number(PyObject* obj);
+
 // ---- unpacking -------------------------------------------------------------
 // Tensor getters come in three flavours: by value (legacy), and by reference
 // into the Python wrapper's storage.  The reference forms skip one

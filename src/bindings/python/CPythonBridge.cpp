@@ -1192,6 +1192,65 @@ Tensor as_tensor(PyObject* obj, const char* op, int idx) {
     }
 }
 
+// Numpy scalar support for Number-typed slots.  NumPy scalars (np.float32,
+// np.int64, np.bool_, ...) are numbers to callers but carry type objects the
+// Python number slots do not recognize, so they are identified through the
+// module's own scalar class hierarchy, resolved once and cached.  NumPy is an
+// optional dependency: when the module is absent every lookup answers "not a
+// numpy scalar".
+struct NumpyScalarTypes {
+    PyObject* generic = nullptr;          // numpy.generic
+    PyObject* bool_ = nullptr;            // numpy.bool_
+    PyObject* integer = nullptr;          // numpy.integer
+    PyObject* floating = nullptr;         // numpy.floating
+    PyObject* complexfloating = nullptr;  // numpy.complexfloating
+    bool resolved = false;
+};
+
+NumpyScalarTypes& numpy_scalar_types() {
+    static NumpyScalarTypes t;
+    if (!t.resolved) {
+        t.resolved = true;
+        PyObject* mod = PyImport_ImportModule("numpy");
+        if (mod) {
+            t.generic = PyObject_GetAttrString(mod, "generic");
+            t.bool_ = PyObject_GetAttrString(mod, "bool_");
+            t.integer = PyObject_GetAttrString(mod, "integer");
+            t.floating = PyObject_GetAttrString(mod, "floating");
+            t.complexfloating = PyObject_GetAttrString(mod, "complexfloating");
+            Py_DECREF(mod);
+        } else {
+            PyErr_Clear();
+        }
+    }
+    return t;
+}
+
+enum class NumpyScalarKind { None, Bool, Int, Float, Complex };
+
+NumpyScalarKind numpy_scalar_kind(PyObject* obj) {
+    NumpyScalarTypes& t = numpy_scalar_types();
+    if (!t.generic) return NumpyScalarKind::None;
+    int r = PyObject_IsInstance(obj, t.generic);
+    if (r <= 0) {
+        if (r < 0) PyErr_Clear();
+        return NumpyScalarKind::None;
+    }
+    auto is = [&](PyObject* cls) -> bool {
+        if (!cls) return false;
+        r = PyObject_IsInstance(obj, cls);
+        if (r < 0) PyErr_Clear();
+        return r == 1;
+    };
+    // Flexible scalars (str_, bytes_, void) are instances of generic but not
+    // numbers; unmatched kinds fall through to None.
+    if (is(t.bool_)) return NumpyScalarKind::Bool;
+    if (is(t.integer)) return NumpyScalarKind::Int;
+    if (is(t.floating)) return NumpyScalarKind::Float;
+    if (is(t.complexfloating)) return NumpyScalarKind::Complex;
+    return NumpyScalarKind::None;
+}
+
 Scalar as_scalar(PyObject* obj, const char* op, int idx) {
     // Fast paths for the overwhelmingly common number cases; complex and
     // exotic inputs fall through to the pybind caster.
@@ -1210,6 +1269,33 @@ Scalar as_scalar(PyObject* obj, const char* op, int idx) {
     if (PyComplex_Check(obj)) {
         return Scalar(std::complex<double>(PyComplex_RealAsDouble(obj),
                                            PyComplex_ImagAsDouble(obj)));
+    }
+    switch (numpy_scalar_kind(obj)) {
+        case NumpyScalarKind::Bool: {
+            int t = PyObject_IsTrue(obj);
+            if (t < 0) { PyErr_Clear(); break; }
+            return Scalar(t == 1);
+        }
+        case NumpyScalarKind::Int: {
+            PyObject* idx = PyNumber_Index(obj);
+            if (!idx) { PyErr_Clear(); break; }
+            long long v = PyLong_AsLongLong(idx);
+            Py_DECREF(idx);
+            if (v == -1 && PyErr_Occurred()) { PyErr_Clear(); break; }
+            return Scalar(static_cast<int64_t>(v));
+        }
+        case NumpyScalarKind::Float: {
+            double d = PyFloat_AsDouble(obj);
+            if (d == -1.0 && PyErr_Occurred()) { PyErr_Clear(); break; }
+            return Scalar(d);
+        }
+        case NumpyScalarKind::Complex: {
+            Py_complex c = PyComplex_AsCComplex(obj);
+            if (c.real == -1.0 && PyErr_Occurred()) { PyErr_Clear(); break; }
+            return Scalar(std::complex<double>(c.real, c.imag));
+        }
+        case NumpyScalarKind::None:
+            break;
     }
     try {
         return py::reinterpret_borrow<py::object>(obj).cast<Scalar>();
@@ -1487,8 +1573,13 @@ bool obj_is_storage(PyObject* obj) {
 bool seq_item_is_number(PyObject* o) {
     // Python numbers plus the registered tensorplay.Scalar wrapper, which
     // generated wrappers (e.g. addmm's beta/alpha) pass through directly.
-    // Complex numbers are part of the Number category.
+    // Complex numbers are part of the Number category, and numpy scalars
+    // reach the same slots through the module's scalar hierarchy.
     if (PyIndex_Check(o) || PyFloat_Check(o) || PyComplex_Check(o)) return true;
+    switch (numpy_scalar_kind(o)) {
+        case NumpyScalarKind::None: break;
+        default: return true;
+    }
     try {
         return py::isinstance<tensorplay::Scalar>(py::handle(o));
     } catch (...) {
@@ -1599,6 +1690,10 @@ bool tpx_py_obj_matches_kind(PyObject* obj, unsigned char kind) {
         case TPK_STORAGE:    return obj_is_storage(obj);
     }
     return false;
+}
+
+bool tpx_py_obj_is_number(PyObject* obj) {
+    return obj != nullptr && seq_item_is_number(obj);
 }
 
 void tpx_py_check_types(PyObject* const* slots, Py_ssize_t n,
