@@ -1749,13 +1749,15 @@ void init_autograd(py::module_& m) {
     // THE single-entry hot path: node creation, unpack_input, the
     // AutoGradMode(false) forward block, setup_context and _wrap_outputs
     // all happen inside ONE pybind crossing.  Returns (output, ctx, needs,
-    // executable); Python only builds the backward closure afterwards.
+    // executable); Python only wires the backward entry afterwards.
+    // The node is constructed natively (same translation unit), so the
+    // graph node never round-trips through a Python factory callback.
     autograd.def("custom_function_apply",
-        [](py::object ctx_factory, py::object node_factory,
+        [](py::object ctx_factory,
            py::object forward_fn, std::optional<py::object> setup_ctx_fn,
            py::sequence args) {
             auto ctx = ctx_factory();
-            auto node = node_factory(ctx);
+            auto node = py::cast(std::make_shared<PyNode>(ctx));
             auto* py_node = node.cast<PyNode*>();
 
             // ---- unpack_input ----
@@ -1879,8 +1881,152 @@ void init_autograd(py::module_& m) {
             return py::make_tuple(output, ctx, needs, executable,
                                    node);
         },
-        "ctx_factory"_a, "node_factory"_a, "forward_fn"_a,
+        "ctx_factory"_a, "forward_fn"_a,
         "setup_ctx_fn"_a.none(), "args"_a);
+
+    // Full eager custom-operator call in ONE crossing: grad gate,
+    // requires-grad scan, graph node, kernel invocation and context wiring.
+    // ``kernel_fn`` is the generated legacy forward (ctx, *args, **kwargs)
+    // so user setup_context runs inside the same disabled-grad block;
+    // ``backward_fn`` is the registered backward formula, stored on the
+    // context for the backward entry.  Returns the kernel output, or None
+    // when no input requires grad (or gradients are disabled) — the caller
+    // then invokes the kernel directly.
+    autograd.def("custom_op_autograd_apply",
+        [](py::object ctx_factory, py::object kernel_fn, py::object backward_fn,
+           py::object node_name, py::sequence args, py::dict kwargs) -> py::object {
+            if (!tensorplay::tpx::GradMode::is_enabled()) {
+                return py::none();
+            }
+
+            // ---- unpack_input: needs bits + any-requires-grad ----
+            Py_ssize_t n_args = PyTuple_GET_SIZE(args.ptr());
+            py::tuple needs(n_args);
+            bool any_rg = false;
+            for (Py_ssize_t i = 0; i < n_args; ++i) {
+                PyObject* item = PyTuple_GET_ITEM(args.ptr(), i);
+                if (fast_is_tensor(item)) {
+                    bool rg = py::cast<const Tensor&>(item).requires_grad();
+                    any_rg |= rg;
+                    needs[i] = py::bool_(rg);
+                } else if (py::isinstance<py::sequence>(item)) {
+                    // Nested containers are rare; mark conservatively.
+                    bool nested_rg = false;
+                    for (auto inner : py::reinterpret_borrow<py::sequence>(item)) {
+                        if (py::isinstance<Tensor>(inner)
+                            && py::cast<const Tensor&>(inner).requires_grad()) {
+                            nested_rg = true;
+                            break;
+                        }
+                    }
+                    any_rg |= nested_rg;
+                    needs[i] = py::bool_(nested_rg);
+                } else {
+                    needs[i] = py::bool_(false);
+                }
+            }
+            if (!any_rg) {
+                for (auto value : kwargs) {
+                    if (visit_requires_grad(value.second.ptr())) {
+                        any_rg = true;
+                        break;
+                    }
+                }
+                if (!any_rg) {
+                    return py::none();
+                }
+            }
+
+            auto ctx = ctx_factory();
+            auto node = py::cast(std::make_shared<PyNode>(ctx));
+            auto* py_node = node.cast<PyNode*>();
+
+            if (any_rg) {
+                std::vector<tensorplay::tpx::Edge> edges;
+                edges.reserve((size_t)n_args);
+                for (Py_ssize_t i = 0; i < n_args; ++i) {
+                    PyObject* item = PyTuple_GET_ITEM(args.ptr(), i);
+                    if (fast_is_tensor(item)
+                        && py::cast<const Tensor&>(item).requires_grad()) {
+                        for (auto& e : tensorplay::tpx::collect_next_edges(
+                                 py::cast<const Tensor&>(item))) {
+                            edges.push_back(std::move(e));
+                        }
+                    } else {
+                        edges.emplace_back();
+                    }
+                }
+                py_node->add_next_edge_list(std::move(edges));
+                py_node->set_materialize_grads(true);
+            }
+
+            // ---- forward block under AutoGradMode(false) ----
+            py::object output;
+            tensorplay::tpx::GradMode::set_enabled(false);
+            try {
+                py::tuple full(n_args + 1);
+                full[0] = ctx;
+                for (Py_ssize_t i = 0; i < n_args; ++i) {
+                    full[i + 1] = PyTuple_GET_ITEM(args.ptr(), i);
+                }
+                output = py::reinterpret_steal<py::object>(
+                    PyObject_Call(kernel_fn.ptr(), full.ptr(), kwargs.ptr()));
+                if (!output) throw py::error_already_set();
+            } catch (...) {
+                tensorplay::tpx::GradMode::set_enabled(true);
+                throw;
+            }
+            tensorplay::tpx::GradMode::set_enabled(true);
+
+            // ---- context wiring (everything backward needs) ----
+            ctx.attr("needs_input_grad") = needs;
+            ctx.attr("backward_fn") = backward_fn;
+            ctx.attr("_node_name") = node_name;
+            ctx.attr("backward") = ctx.attr("_backward_entry");
+            if (!py::cast<bool>(ctx.attr("materialize_grads"))) {
+                py_node->set_materialize_grads(false);
+                ctx.attr("_engine_materializes") = false;
+                ctx.attr("_outputs") = py::isinstance<py::tuple>(output)
+                    ? output
+                    : (py::isinstance<py::list>(output)
+                           ? py::tuple(output.cast<py::sequence>())
+                           : py::make_tuple(output));
+            } else {
+                ctx.attr("_engine_materializes") = true;
+            }
+
+            // ---- attach outputs ----
+            auto shared = std::shared_ptr<tensorplay::tpx::Node>(
+                std::static_pointer_cast<tensorplay::tpx::Node>(
+                    py_node->shared_from_this()));
+            auto& metas = py_node->output_metas();
+            metas.clear();
+            int idx = 0;
+            auto mark = [&](py::handle item) {
+                tensorplay::tpx::OutputSlotMeta m;
+                if (fast_is_tensor(item.ptr())) {
+                    Tensor& t = py::cast<Tensor&>(item);
+                    tensorplay::tpx::impl::set_requires_grad(t, true);
+                    tensorplay::tpx::impl::set_grad_fn(t, shared, idx);
+                    m.shape = static_cast<std::vector<int64_t>>(t.shape());
+                    m.dtype = t.dtype();
+                    m.device_index = t.device().index();
+                    m.valid = true;
+                }
+                metas.push_back(std::move(m));
+                ++idx;
+            };
+            if (py::isinstance<Tensor>(output)) {
+                mark(output);
+            } else if (py::isinstance<py::sequence>(output)) {
+                for (auto item : output.cast<py::sequence>()) mark(item);
+            }
+            ctx.attr("_n_outputs") = idx;
+
+            return output;
+        },
+        "ctx_factory"_a, "kernel_fn"_a, "backward_fn"_a,
+        "node_name"_a, "args"_a, "kwargs"_a);
 
     autograd.def("backward", [](const std::vector<Tensor>& tensors, std::optional<std::vector<Tensor>> grad_tensors, std::optional<bool> retain_graph, bool create_graph) {
         bool keep_graph = retain_graph.value_or(create_graph);

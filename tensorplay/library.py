@@ -81,12 +81,24 @@ _DEFINED_LIBRARY_NAMESPACES: set[str] = set()
 import tensorplay._C._autograd as _autograd_c
 
 # Hot-path aliases resolved once at import (this module is imported last by
-# tensorplay/__init__, so every attribute below already exists).
-_is_grad_enabled = tensorplay.is_grad_enabled
+# tensorplay/__init__, so every attribute below already exists).  The gate
+# reads the grad mode through the native binding directly: the public
+# wrapper only adds a Python frame around the same thread-local probe.
+_is_grad_enabled = _autograd_c.is_grad_enabled
 # One native scan over the call arguments replaces the full graph-node
 # build when no input needs a gradient.  Older extensions without the
 # binding keep the unconditional apply path.
 _any_requires_grad = getattr(_autograd_c, "_any_requires_grad", None)
+if _any_requires_grad is None:
+    def _any_requires_grad(*args, **kwargs):
+        return True
+# One-crossing native apply for registered custom operators: grad gate,
+# requires-grad scan, graph node, kernel call and context wiring all happen
+# inside the extension.  Extensions without the binding fall back to
+# Function.apply.
+_CUSTOM_OP_AUTOGRAD_APPLY = getattr(
+    _autograd_c, "custom_op_autograd_apply", None)
+_CONTEXT_CLS: Any = None
 # Native first-tensor device scan and the O(1) dispatch-mode stack probe;
 # both fall back to the Python walks when the extension predates them.
 _fast_device_key = getattr(tensorplay._C, "_first_device_key", None)
@@ -293,6 +305,7 @@ class CustomOpDef:
         self._vmap_fn: Callable[..., Any] | None = None
         self._autocast_rules: dict[str, Any] = {}
         self._autograd_cls: type | None = None
+        self._autograd_apply: Callable[..., Any] | None = None
 
     def _install_default_kernel(self, fn: Callable[..., Any]) -> None:
         """Use ``fn`` as the initial kernel (the ``@custom_op`` body).
@@ -453,6 +466,7 @@ class CustomOpDef:
         self._backward = backward
         self._setup_context = setup_context
         self._autograd_cls = self._build_autograd_class()
+        self._autograd_apply = self._autograd_cls.apply
 
     def register_vmap(self, fn: Callable[..., Any]) -> Callable[..., Any]:
         """
@@ -468,6 +482,7 @@ class CustomOpDef:
         # same way a hand-written Function subclass would.
         if self._backward is not None:
             self._autograd_cls = self._build_autograd_class()
+            self._autograd_apply = self._autograd_cls.apply
         return fn
 
     def register_autocast(
@@ -548,17 +563,23 @@ class CustomOpDef:
             self._kernel_cache.clear()
 
     def _build_autograd_class(self) -> type:
+        global _CONTEXT_CLS
+        if _CONTEXT_CLS is None:
+            from tensorplay.autograd.function import _Context
+            _CONTEXT_CLS = _Context
         op_def = self
 
+        # Legacy forward shape (ctx first): the native apply helper then
+        # makes ONE Python call per op instead of separate forward and
+        # setup-context callbacks, and classes whose operator registers no
+        # setup_context skip that work entirely.
         class _CustomOpAutograd(tensorplay.autograd.Function):
             @staticmethod
-            def forward(*args: Any, **kwargs: Any) -> Any:
-                return op_def._run_kernel(args, kwargs)
-
-            @staticmethod
-            def setup_context(ctx: Any, inputs: tuple[Any, ...], output: Any) -> None:
+            def forward(ctx: Any, *args: Any, **kwargs: Any) -> Any:
+                output = op_def._run_kernel(args, kwargs)
                 if op_def._setup_context is not None:
-                    op_def._setup_context(ctx, inputs, output)
+                    op_def._setup_context(ctx, args, output)
+                return output
 
             @staticmethod
             def backward(ctx: Any, *grad_outputs: Any) -> Any:
@@ -636,6 +657,22 @@ class CustomOpDef:
             )
         return bridge(self._name, list(inputs), device_type)
 
+    def _autograd_call(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        """Registered-op call through the one-crossing native apply.
+
+        The native side invokes the generated forward (which runs the user
+        setup_context inside the disabled-grad block), wires the context and
+        attaches the graph node.  Returns None when no input needs grad (or
+        grads are disabled); the caller then runs the kernel directly
+        instead of building and discarding an empty graph node.
+        """
+        out = _CUSTOM_OP_AUTOGRAD_APPLY(
+            _CONTEXT_CLS, self._autograd_cls.forward, self._backward,
+            self._autograd_cls._node_name, args, kwargs)
+        if out is None:
+            return self._run_profiled(args, kwargs, None)
+        return out
+
     def _eager_call(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
         """Dispatch real tensors with full eager semantics (no capture).
 
@@ -647,14 +684,10 @@ class CustomOpDef:
         """
 
         if self._autograd_cls is not None:
-            # With no requires-grad input the generated autograd class would
-            # only build and discard an empty graph node, so run the kernel
-            # directly instead.  The autocast cast below preserves
-            # requires_grad, so the scan can run on the raw arguments.
-            if _is_grad_enabled() and (
-                    _any_requires_grad is None
-                    or _any_requires_grad(*args, **kwargs)):
-                key = _first_device_key(args) if self._autocast_rules else None
+            # The autocast cast preserves requires_grad, so it can run on
+            # the raw arguments before the native gate below.
+            if self._autocast_rules:
+                key = _first_device_key(args)
                 if key is not None:
                     rule = self._autocast_rules.get(key)
                     if rule is not None and _autocast_enabled(key):
@@ -664,10 +697,17 @@ class CustomOpDef:
                                 k: _cast_if_floating(v, rule)
                                 for k, v in kwargs.items()
                             }
-                if _profiling_sessions:
-                    return self._profiled(
-                        self._autograd_cls.apply, args, kwargs)
-                return self._autograd_cls.apply(*args, **kwargs)
+            if _profiling_sessions:
+                return self._profiled(self._autograd_call, args, kwargs)
+            if _CUSTOM_OP_AUTOGRAD_APPLY is not None:
+                return self._autograd_call(args, kwargs)
+            # Stale-extension fallback: Python gate plus Function.apply.
+            # Keyword arguments are scanned only when present: the unpacking
+            # itself would cost more than the scan on the common path.
+            if _is_grad_enabled() and (
+                    _any_requires_grad(*args) if not kwargs
+                    else _any_requires_grad(*args, **kwargs)):
+                return self._autograd_apply(*args, **kwargs)
             return self._run_profiled(args, kwargs, None)
         if self._autocast_rules:
             key = _first_device_key(args)

@@ -36,7 +36,6 @@ _PyNode = _autograd.PyNode
 _setup_graph = getattr(_autograd, "setup_custom_function_graph", None)
 _APPLY_ALL = getattr(_autograd, "custom_function_apply", None)
 _RUN_FWD = getattr(_autograd, "run_custom_function_forward", None)
-_NODE_FACTORY = (lambda c: _PyNode(c)) if _APPLY_ALL is not None else None
 
 
 def _fast_capable():
@@ -73,57 +72,14 @@ def _materialize(ctx, grads):
 
 
 def _make_backward(ctx, cls):
+    """Resolve the generic backward entry for ``ctx``.
+
+    All per-apply state (hooks, materialization flags, gradient arity)
+    lives on the context, so the entry reads it at backward time instead
+    of the forward pass building a closure per call.  Returns a bound
+    method: the engine invokes ``ctx.backward(*grads)``.
     """
-    prehook(grads_tuple) -> replacement; hook(grad_inputs, grad_outputs)
-    -> replacement grad_inputs.
-
-    When the engine materializes missing gradients itself (Node::
-    zero-fill branch is compiled out entirely.
-    """
-    hooks = ctx._hooks
-    prehooks = ctx._prehooks
-    engine_materializes = getattr(ctx, "_engine_materializes", False)
-    materialize_default = getattr(ctx, "materialize_grads", True) and not engine_materializes
-    backward_fn = ctx.backward_fn
-    n_in = len(ctx.needs_input_grad)
-    # Output count is provided by the C++ fast path (which no longer stores
-    # the output tensors on ctx); fall back to the stored tuple for the slow
-    # path / materialize_grads=False case.
-    n_out = getattr(ctx, "_n_outputs", None)
-    if n_out is None:
-        n_out = len(getattr(ctx, "_outputs", ()))
-    if n_out == 0:
-        n_out = 1
-
-    def backward(*grads):
-        # Complete missing trailing slots with None before anything else.
-        if len(grads) > n_out:
-            grads = grads[:n_out]
-        if len(grads) < n_out:
-            grads = grads + (None,) * (n_out - len(grads))
-        for ph in prehooks:
-            replaced = ph((grads,))
-            if replaced is not None:
-                grads = tuple(replaced[0])
-        if materialize_default and any(g is None for g in grads):
-            grads = tuple(_materialize(ctx, grads))
-        results = backward_fn(ctx, *grads)
-        if not isinstance(results, tuple):
-            results = (results,)
-        n = len(results)
-        if n != n_in and not (n > n_in and all(r is None for r in results[n_in:])):
-            raise RuntimeError(
-                f"function {cls.name} returned an incorrect number of "
-                f"gradients (expected {n_in}, got {n})")
-        if n > n_in:
-            results = results[:n_in]
-        for hk in hooks:
-            replaced = hk(results, grads)
-            if replaced is not None:
-                results = tuple(replaced)
-        return results
-
-    return backward
+    return ctx._backward_entry
 
 
 def _make_direct_backward(ctx, cls):
@@ -160,20 +116,24 @@ class _Context:
     Records information needed for computing gradients.
     """
 
+    # Immutable per-apply defaults live on the class so the constructor
+    # only allocates the mutable holders (hooks, gradient metas, sets);
+    # instance assignment shadows these on first write.
+    materialize_grads = True
+    backward_fn = None
+    _metadata = None
+    requires_grad = False
+    next_functions: tuple = ()
+    _saved_tensors: tuple = ()
+    _to_save_for_backward: tuple = ()
+    _outputs: tuple = ()
+
     def __init__(self):
-        self._saved_tensors = ()
-        self._to_save_for_forward = ()
-        self.materialize_grads = True
         self.dirty_tensors = set()
         self._non_differentiable = set()
         # Outputs captured lazily for gradient materialization; metas are
         # only computed if a None grad actually arrives in backward.
-        self._outputs: tuple = ()
         self._output_grad_metas: list = []
-        self.backward_fn = None
-        self._metadata = None
-        self.requires_grad = False
-        self.next_functions: tuple = ()
         # Kept as real lists: the C++ PyNode register_hook bindings append
         # into them directly.
         self._hooks: list = []
@@ -225,8 +185,51 @@ class _Context:
     def register_prehook(self, hook):
         """
         ``(grad_outputs,)`` before :meth:`Function.backward` runs; may
-        return replacement ``grad_outputs``."""
+        return replacement for ``grad_outputs``."""
         self._prehooks.append(hook)
+
+    def _backward_entry(self, *grads):
+        """Engine-invoked backward: complete/mask the gradient tuple, run
+        prehooks, materialize missing grads, call the user formula, then
+        posthooks.  Every piece of state is read off this context so the
+        forward pass binds this method instead of building a closure."""
+        # Complete missing trailing slots with None before anything else.
+        # Output count is provided by the C++ fast path (which no longer
+        # stores the output tensors on ctx); fall back to the stored tuple
+        # for the slow path / materialize_grads=False case.
+        n_out = getattr(self, "_n_outputs", None)
+        if n_out is None:
+            n_out = len(self._outputs)
+        if n_out == 0:
+            n_out = 1
+        if len(grads) > n_out:
+            grads = grads[:n_out]
+        if len(grads) < n_out:
+            grads = grads + (None,) * (n_out - len(grads))
+        for ph in self._prehooks:
+            replaced = ph((grads,))
+            if replaced is not None:
+                grads = tuple(replaced[0])
+        engine_materializes = getattr(self, "_engine_materializes", False)
+        if self.materialize_grads and not engine_materializes \
+                and any(g is None for g in grads):
+            grads = tuple(_materialize(self, grads))
+        results = self.backward_fn(self, *grads)
+        if not isinstance(results, tuple):
+            results = (results,)
+        n = len(results)
+        n_in = len(self.needs_input_grad)
+        if n != n_in and not (n > n_in and all(r is None for r in results[n_in:])):
+            raise RuntimeError(
+                f"function {getattr(self, '_node_name', 'Function')} returned "
+                f"an incorrect number of gradients (expected {n_in}, got {n})")
+        if n > n_in:
+            results = results[:n_in]
+        for hk in self._hooks:
+            replaced = hk(results, grads)
+            if replaced is not None:
+                results = tuple(replaced)
+        return results
 
     def save_for_backward(self, *tensors):
         r"""Saves given tensors to be accessed via ``ctx.saved_tensors`` in backward.
@@ -351,9 +354,14 @@ class FunctionMeta(type):
     the ``name`` classproperty (``"<Cls>Backward"``, used for node naming)
     and a friendlier repr for subclasses."""
 
+    def __new__(mcls, name, bases, namespace, **kwds):
+        cls = super().__new__(mcls, name, bases, namespace, **kwds)
+        cls._node_name = f"{name}Backward"
+        return cls
+
     @property
     def name(cls):
-        return f"{cls.__name__}Backward"
+        return cls._node_name
 
 
 def _maybe_process_forward_ad(cls, ctx, args, output):
@@ -364,7 +372,7 @@ def _maybe_process_forward_ad(cls, ctx, args, output):
     one-for-one.  Tangent reads stay disabled while ``jvp`` runs so the
     tangent arithmetic itself never re-enters forward propagation.
     """
-    if cls.jvp is Function.jvp:
+    if cls.jvp is _BASE_JVP:
         return output
 
     grad_inputs = []
@@ -514,26 +522,29 @@ class Function(metaclass=FunctionMeta):
         path makes two pybind crossings total (graph setup + output
         attach); otherwise a generic Python fallback runs.
         """
-        uses_setup_context = cls.setup_context is not Function.setup_context
+        uses_setup_context = cls.setup_context is not _BASE_SETUP_CONTEXT
         grad_enabled = _autograd.is_grad_enabled()
 
-        flat = not any(
-            isinstance(a, (list, tuple, dict)) for a in args)
+        # Containers need the flattening fallback below; the fused helper
+        # records one needs-bit per top-level slot only.
+        flat = True
+        for a in args:
+            if isinstance(a, (list, tuple, dict)):
+                flat = False
+                break
 
         # ---- C++ boundary: ONE crossing ----
         if _APPLY_ALL is not None and flat and not kwargs and grad_enabled:
             output, ctx, needs, executable, fn = _APPLY_ALL(
                 _Context,
-                _NODE_FACTORY,
                 cls.forward,
                 cls.setup_context if uses_setup_context else None,
                 args,
             )
-            needs = tuple(needs)
             ctx.needs_input_grad = needs
             if executable:
                 ctx.backward_fn = cls.backward
-                ctx._node_name = f"{cls.__name__}Backward"
+                ctx._node_name = cls._node_name
                 if not bool(ctx.materialize_grads):
                     fn.set_materialize_grads(False)
                     ctx._engine_materializes = False
@@ -544,7 +555,8 @@ class Function(metaclass=FunctionMeta):
                     if getattr(cls, "_tensorplay_direct_backward", False)
                     else _make_backward(ctx, cls)
                 )
-                return _maybe_process_forward_ad(cls, ctx, args, output)
+            if cls.jvp is _BASE_JVP:
+                return output
             return _maybe_process_forward_ad(cls, ctx, args, output)
 
         fast = (
@@ -693,6 +705,13 @@ class Function(metaclass=FunctionMeta):
             else _make_backward(ctx, cls)
         )
         return _maybe_process_forward_ad(cls, ctx, args, output)
+
+
+# Base-class markers for the per-call style checks in apply; module-level
+# so the hot path compares against a plain global instead of walking the
+# base class each time.
+_BASE_SETUP_CONTEXT = Function.setup_context
+_BASE_JVP = Function.jvp
 
 
 class InplaceFunction(Function):
