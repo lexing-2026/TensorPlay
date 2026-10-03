@@ -3606,6 +3606,22 @@ _fallback_conv2d_grad_weight = fallback_handler(
 )
 
 
+def _conv_grad_channels_last(input, groups) -> bool:
+    """Whether a gradient call's operands are handed over channels last.
+
+    The same rule as the forward call's: the library computes the gradients of
+    a reduced-precision ungrouped call channels last, and an operand in the
+    other order is repacked inside the call on every step.  The input gradient
+    reads the output gradient and the weight, the weight gradient reads the
+    output gradient and the input; the operand only read for its shape keeps
+    its order.
+    """
+
+    from .templates.conv import channels_last_call
+
+    return len(input.get_size()) == 4 and channels_last_call(input, 2, groups, False)
+
+
 @register("conv2d_grad_input.default")
 def lower_conv2d_grad_input(grad_output, input, weight, stride, padding, dilation, groups):
     """The input gradient, asked of the framework kernel.
@@ -3628,6 +3644,9 @@ def lower_conv2d_grad_input(grad_output, input, weight, stride, padding, dilatio
             input = to_dtype(input, dtype)
         if weight.get_dtype() != dtype:
             weight = to_dtype(weight, dtype)
+        if _conv_grad_channels_last(input, groups):
+            grad_output = ir.ExternKernel.require_channels_last(grad_output)
+            weight = ir.ExternKernel.require_channels_last(weight)
         result = _fallback_conv2d_grad_input(
             grad_output, input, weight, stride, padding, dilation, groups
         )
@@ -3661,6 +3680,9 @@ def lower_conv2d_grad_weight(grad_output, input, weight, stride, padding, dilati
             input = to_dtype(input, dtype)
         if weight.get_dtype() != dtype:
             weight = to_dtype(weight, dtype)
+        if _conv_grad_channels_last(input, groups):
+            grad_output = ir.ExternKernel.require_channels_last(grad_output)
+            input = ir.ExternKernel.require_channels_last(input)
         result = _fallback_conv2d_grad_weight(
             grad_output, input, weight, stride, padding, dilation, groups
         )

@@ -1296,8 +1296,8 @@ def _gradient_by_asking(
 
     guard = V.graph.sizevars.guard_int_seq
     device = input.get_device_or_error()
-    layout_opt = bool(getattr(V.graph, "layout_opt", False))
-    if layout_opt and all(len(node.get_size()) == 4 for node in (grad_out, input, weight)):
+    channels_last = channels_last_call(input, len(weight.get_size()) - 2, groups, transposed)
+    if channels_last and all(len(node.get_size()) == 4 for node in (grad_out, input, weight)):
         zeros = lambda node: tp.empty(
             [int(dim) for dim in node.get_size()],
             dtype=node.get_dtype(),
@@ -1432,6 +1432,31 @@ def require_stride_order(x, order, allow_padding: bool = False):
     """
 
     return ir.ExternKernel.require_strides(x, order=order, allow_padding=allow_padding)
+
+
+def channels_last_call(x, ndim: int, groups: int, transposed: bool) -> bool:
+    """Whether a call's operands are handed over with their channels last.
+
+    Always, where the region's layouts are chosen as a whole.  Otherwise for a
+    reduced-precision, ungrouped two-dimensional call on the GPU: the library
+    computes those channels last whatever it is handed, and repacks operands
+    in the other order itself -- one pass over each operand before the call
+    and one over the result after it.  Asked for here, the order is written by
+    whatever produces the operand, which a kernel of the region does anyway,
+    and the result arrives channels last for its readers.
+    """
+
+    if ndim != 2:
+        return False
+    if V.graph.layout_opt:
+        return True
+    return (
+        config.conv_channels_last_reduced_precision
+        and groups == 1
+        and not transposed
+        and ir.get_device_type(x) == "cuda"
+        and x.get_dtype() in (tp.float16, tp.bfloat16)
+    )
 
 
 #: Whether a kernel is written for the reduced-precision path of this build.
@@ -1584,7 +1609,7 @@ def convolution(
 
     x.realize()
     weight.realize()
-    if V.graph.layout_opt and ndim == 2:
+    if channels_last_call(x, ndim, groups, transposed):
         V.graph.num_channels_last_conv += 1
         x = ir.ExternKernel.require_channels_last(x)
         weight = ir.ExternKernel.require_channels_last(weight)
@@ -1789,8 +1814,9 @@ def convolution_backward_lowering(
     choices_dw = []
     args_w = []
     layout_dw = conv_bwd_weight_layout(grad_out, input, weight, **kwargs)
+    channels_last = channels_last_call(input, ndim, groups, transposed)
     if output_mask[1]:
-        if V.graph.layout_opt and ndim == 2:
+        if channels_last:
             V.graph.num_channels_last_conv += 1
             input = ir.ExternKernel.require_channels_last(input)
             grad_out = ir.ExternKernel.require_channels_last(grad_out)
@@ -1834,7 +1860,7 @@ def convolution_backward_lowering(
     args_x = []
     layout_dx = conv_bwd_input_layout(grad_out, input, weight, **kwargs)
     if output_mask[0]:
-        if V.graph.layout_opt and ndim == 2:
+        if channels_last:
             V.graph.num_channels_last_conv += 1
             grad_out = ir.ExternKernel.require_channels_last(grad_out)
             weight = ir.ExternKernel.require_channels_last(weight)

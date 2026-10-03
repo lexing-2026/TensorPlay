@@ -79,6 +79,15 @@ layout_optimization = True
 # where a measurement says it pays and the shape of the region would not say so.
 force_layout_optimization = os.environ.get("TP_FORCE_LAYOUT_OPT", "0") == "1"
 
+# Whether a reduced-precision, ungrouped two-dimensional convolution on the GPU
+# is handed its operands channels last even where the region's layouts are not
+# chosen as a whole.  The library runs such a call channels last either way and
+# repacks operands it is handed in the other order; asking for the order lets
+# the kernel that writes an operand write it that way instead.
+conv_channels_last_reduced_precision = (
+    os.environ.get("TP_STAX_CONV_CHANNELS_LAST", "1") == "1"
+)
+
 # Whether strides are padded when the extents they belong to are symbolic.
 pad_dynamic_shapes = False
 

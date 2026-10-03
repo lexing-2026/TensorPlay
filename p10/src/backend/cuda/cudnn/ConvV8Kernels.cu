@@ -1414,7 +1414,11 @@ Tensor conv2d_grad_input_cuda(const Tensor& grad_output, const Tensor& input, co
     Tensor input_c = (input.is_contiguous() || input_cl)
                         ? input
                         : input.contiguous();
-    Tensor weight_c = weight.is_contiguous() ? weight : weight.contiguous();
+    // A channel-major filter is read as it lies by the graph path; the
+    // descriptor path below renormalizes it.
+    Tensor weight_c = (weight.is_contiguous() || is_channels_last_4d(weight))
+                          ? weight
+                          : weight.contiguous();
 
     // A row-major reduced-precision gradient runs the data gradient in the
     // channel-major order: the repacks are one kernel per operand, where the
@@ -1585,7 +1589,11 @@ Tensor conv2d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input, c
     Tensor input_c = (input.is_contiguous() || input_cl)
                         ? input
                         : input.contiguous();
-    Tensor weight_c = weight.is_contiguous() ? weight : weight.contiguous();
+    // Only the filter's shape is read here; the descriptor path below
+    // renormalizes a channel-major one.
+    Tensor weight_c = (weight.is_contiguous() || is_channels_last_4d(weight))
+                          ? weight
+                          : weight.contiguous();
 
     // The filter gradient reads both operands; running it in the
     // channel-major order when they arrive row-major in reduced precision
