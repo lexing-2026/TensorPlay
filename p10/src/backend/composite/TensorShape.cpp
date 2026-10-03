@@ -68,10 +68,14 @@ Tensor& resize_as__native(Tensor& self, const Tensor& other,
 
     auto format = static_cast<MemoryFormat>(*memory_format);
     if (format == MemoryFormat::Preserve) {
-        format = other.memory_format();
-        if (format != MemoryFormat::ChannelsLast &&
-            format != MemoryFormat::ChannelsLast3d) {
-            format = MemoryFormat::Contiguous;
+        // Read off the strides ``other`` has, however it got them.
+        format = MemoryFormat::Contiguous;
+        if (!other.is_contiguous()) {
+            if (other.is_contiguous(MemoryFormat::ChannelsLast)) {
+                format = MemoryFormat::ChannelsLast;
+            } else if (other.is_contiguous(MemoryFormat::ChannelsLast3d)) {
+                format = MemoryFormat::ChannelsLast3d;
+            }
         }
     }
     if (format != MemoryFormat::Contiguous &&

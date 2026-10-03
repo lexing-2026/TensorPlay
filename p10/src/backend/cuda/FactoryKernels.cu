@@ -186,7 +186,13 @@ Tensor empty_like_kernel(const Tensor& self, DType dtype, std::optional<Device> 
     Device dev = device.has_value() ? *device : self.device();
     const auto shape = static_cast<std::vector<int64_t>>(self.shape());
     Tensor result = empty_kernel(shape, dtype, dev, false);
-    if (self.dim() == 4 && self.is_channels_last()) {
+    // The layout follows the strides the tensor has, however it got them: one
+    // made channels last by a strided allocation or a view is as channels
+    // last as one repacked into that order, and a kernel that fills a result
+    // "like" its input addresses it with the input's strides.
+    const bool row_major = self.is_contiguous();
+    if (self.dim() == 4 && !row_major &&
+        self.is_contiguous(MemoryFormat::ChannelsLast)) {
         const int64_t c = shape[1];
         const int64_t h = shape[2];
         const int64_t w = shape[3];
@@ -195,7 +201,8 @@ Tensor empty_like_kernel(const Tensor& self, DType dtype, std::optional<Device> 
         out.unsafeGetTensorImpl()->set_sizes_and_strides(shape, strides);
         return out;
     }
-    if (self.dim() == 5 && self.is_channels_last_3d()) {
+    if (self.dim() == 5 && !row_major &&
+        self.is_contiguous(MemoryFormat::ChannelsLast3d)) {
         const int64_t c = shape[1];
         const int64_t d = shape[2];
         const int64_t h = shape[3];

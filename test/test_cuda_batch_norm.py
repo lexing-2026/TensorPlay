@@ -94,3 +94,36 @@ def test_batch_norm_trains_under_autocast():
     for p, q in zip(model.parameters(), ref.parameters()):
         assert p.grad is not None
         assert tp.allclose(p.grad, q.grad, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("dtype", [tp.float32, tp.float16])
+def test_channels_last_input_made_by_strides(dtype):
+    # A channels-last buffer made by a strided allocation -- the way compiled
+    # code makes every buffer -- is normalized like one repacked into that
+    # order.  The native kernels lay the result out like the input; the
+    # library path single precision takes repacks it first.
+    tp.manual_seed(0)
+    dense = tp.randn(4, 8, 5, 6, device="cuda").to(dtype)
+    strided = tp.empty_strided(dense.shape, (240, 1, 48, 8), dtype=dtype, device="cuda")
+    strided.copy_(dense)
+    w = tp.randn(8, device="cuda")
+    b = tp.randn(8, device="cuda")
+    outs = []
+    for x in (dense, strided):
+        rm = tp.zeros(8, device="cuda")
+        rv = tp.ones(8, device="cuda")
+        outs.append(F.batch_norm(x, rm, rv, w, b, training=True, momentum=MOMENTUM, eps=EPS))
+    if dtype == tp.float16:
+        assert outs[1].stride() == strided.stride()
+    tol = 1e-5 if dtype == tp.float32 else 2e-3
+    assert tp.allclose(outs[0].float(), outs[1].float(), atol=tol, rtol=tol)
+
+
+def test_like_allocations_follow_the_strides():
+    t = tp.empty_strided((2, 3, 4, 5), (60, 1, 15, 3), device="cuda")
+    assert tp.empty_like(t).stride() == (60, 1, 15, 3)
+    t3 = tp.empty_strided((2, 3, 2, 4, 5), (120, 1, 60, 15, 3), device="cuda")
+    assert tp.empty_like(t3).stride() == (120, 1, 60, 15, 3)
+    target = tp.empty(1, device="cuda")
+    target.resize_as_(t, memory_format=tp.preserve_format)
+    assert target.stride() == (60, 1, 15, 3)

@@ -96,3 +96,26 @@ def test_lowered_graph_scope_reaches_the_convolution_kernels():
     layouts, diff = result.stdout.split("\n")[:2]
     assert layouts == "True True"
     assert float(diff) < 1e-2
+
+
+def test_batch_norm_after_a_channels_last_convolution():
+    # The convolution's result arrives channels last, so the batch norm the
+    # region hands it to normalizes a buffer in that order and the readers
+    # after it read the order the norm wrote.
+    tp.manual_seed(0)
+    net = nn.Sequential(nn.Conv2d(8, 16, 3, padding=1), nn.BatchNorm2d(16), nn.ReLU(),
+                        nn.Conv2d(16, 8, 3, padding=1), nn.BatchNorm2d(8)).cuda()
+    ref = nn.Sequential(nn.Conv2d(8, 16, 3, padding=1), nn.BatchNorm2d(16), nn.ReLU(),
+                        nn.Conv2d(16, 8, 3, padding=1), nn.BatchNorm2d(8)).cuda()
+    ref.load_state_dict(net.state_dict())
+    x = tp.randn(4, 8, 12, 12, device="cuda")
+    outs = []
+    for model in (tp.compile(net, strict_native=True), ref):
+        with tp.autocast("cuda", dtype=tp.float16):
+            out = model(x)
+        out.float().pow(2).mean().backward()
+        outs.append(out.float())
+    assert ((outs[0] - outs[1]).abs().max() / outs[1].abs().max()).item() < 5e-3
+    for (name, p), q in zip(net.named_parameters(), ref.parameters()):
+        err = ((p.grad - q.grad).abs().max() / (q.grad.abs().max() + 1e-3)).item()
+        assert err < 3e-2, (name, err)
