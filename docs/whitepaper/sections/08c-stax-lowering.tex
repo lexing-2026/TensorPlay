@@ -1,0 +1,406 @@
+% 08c-stax-lowering.tex
+\section{图编译管线（二）：stax 后端、降级与代码生成}
+\label{sec:compile:backend}
+
+前端交给后端的是一张规范图和一个后端函数（\S\ref{sec:compile:frontend}）。stax 后端的工作是：把图走一遍，产出循环中间表示，决定哪些中间量需要真正写进内存，排一个调度，然后把它打印成可以构建的东西。这一章按这个顺序讲，最后落到那段真正被编译的 C++ 代码上——本章末尾给出一次实测生成的完整内核。
+
+\subsection{规模}
+
+\texttt{tensorplay/compiler/backends/stax/} 共 \textbf{173\,141} 行 Python（不含缓存产物），其中表~\ref{tab:be:files} 列出承重的十几个文件。
+
+\begin{table}[H]
+\centering
+\caption{stax 后端主要文件规模（\texttt{wc -l}）。}
+\label{tab:be:files}
+\small
+\begin{tabular}{lrl}
+\toprule
+文件 & 行数 & 职责 \\
+\midrule
+\texttt{ir.py} & 12\,251 & 中间表示节点族：布局、循环、归约、缓冲、存储盒 \\
+\texttt{scheduler.py} & 11\,391 & 调度器：融合、分块、归约策略、循环次序 \\
+\texttt{op\_lowerings.py} & 6\,353 & 算子到降级函数的注册表（实测 388 条） \\
+\texttt{codegen/wrapper.py} & 5\,308 & 包装器代码生成（内核调用与内存管理） \\
+\texttt{codegen/cpp\_wrapper.py} & 744 & 单翻译单元的 C++ 入口 \\
+\texttt{graph\_lowering.py} & 2\,733 & 遍历、调度上下文、模板算子、产物装配 \\
+\texttt{autotune\_process.py} & 1\,406 & 自动调优与配置缓存 \\
+\texttt{codecache.py} & 1\,208 & 产物命名与原子发布 \\
+\texttt{loops.py} & 1\,111 & 循环级记录体、索引代数、算术类型提升 \\
+\texttt{memory.py} & 1\,060 & 缓冲复用与内存规划 \\
+\texttt{backend.py} & 330 & 后端入口、选项解析、降级策略 \\
+\texttt{kernel\_cache.py} & 237 & 内核缓存键、进程内记忆化 \\
+\midrule
+合计（stax 后端） & 173\,141 & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{入口与选项}
+
+后端函数是 \texttt{backend.py:79} 的 \texttt{stax}。它先解模式再解选项，二者的关系写在 \texttt{backend.py:101--114}：模式的选项补丁先应用，显式选项按键覆盖它——“模式选的是缺省值，显式选项赢”。
+
+\begin{table}[H]
+\centering
+\caption{四个模式与它们覆盖的选项（实测 \texttt{\_MODE\_OPTIONS}）。}
+\label{tab:be:modes}
+\small
+\begin{tabular}{lll}
+\toprule
+模式 & 覆盖的选项 & 含义 \\
+\midrule
+\texttt{default} & 无 & 基线 \\
+\texttt{reduce-overhead} & \texttt{stax.cudagraphs} & 把重复的启动开销折叠掉 \\
+\texttt{max-autotune-no-cudagraphs} & \texttt{stax.max\_autotune}、\texttt{stax.coordinate\_descent\_tuning} & 全力调优，但不用图捕获 \\
+\texttt{max-autotune} & 上述两项加 \texttt{stax.cudagraphs} & 全力调优并捕获 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+六个选项是 \texttt{stax.fusion}、\texttt{stax.cuda\_codegen}、\texttt{stax.triton}、\texttt{stax.max\_autotune}、\texttt{stax.coordinate\_descent\_tuning}、\texttt{stax.cudagraphs}，且必须是布尔值（\texttt{backend.py:112--113}）。未知选项与未知模式都以错误结束，并列出可选项（\texttt{backend.py:99--100}、\texttt{backend.py:109--111}；模式清单由 \texttt{list\_mode\_options} 给出，\texttt{backend.py:62--77}）。
+
+\subsection{降级：一个节点一次遍历}
+
+真正的降级是 \texttt{\_lower\_stax\_region}（\texttt{backend.py:161--321}）。它的文档只有两句，但两句都是契约：区域被降级、被调度、被打印，调用者调用的就是那三者产出的东西；一个无法被降级的区域，是框架自己跑的区域，而回退正是为它准备的。
+
+进入遍历之前要确定三件事：
+
+\begin{enumerate}[nosep, leftmargin=1.2em]
+\item \textbf{训练还是推理。} 由根模块的 \texttt{training} 标志与样例输入里是否存在 \texttt{requires\_grad} 张量共同决定（\texttt{backend.py:183--185}）。它决定 \texttt{aot\_mode} 与 \texttt{is\_inference} 两个参数。
+\item \textbf{在哪个设备上。} 从第一个样例输入读，失败即当作 CPU（\texttt{backend.py:186--189}）。
+\item \textbf{假张量模式。} 五个上下文一起进入：假张量模式、循环层当前图、调试处理器、以及虚拟机的假模式（\texttt{backend.py:232--239}）。注释解释了为什么假模式既要“进入”又要“安装”：回退算子只在一个模式位于分派栈上时才经 Python 层分派，而一个没有模式的栈会让生成的 Python 分派内核在入口处弹不出东西。
+\end{enumerate}
+
+遍历器是 \texttt{GraphLowering}（\texttt{graph\_lowering.py:469}），继承自图的解释器。每个节点在 \texttt{run\_node}（\texttt{graph\_lowering.py:1789--1824}）里被读，且读的时候挂着一组上下文：来源节点集合、流索引、内存池、以及“当前节点”。
+
+\begin{lstlisting}[caption={\texttt{run\_node} 的上下文（\texttt{graph\_lowering.py:1804--1823}）。}, label=lst:be:runnode, style=pystyle]
+origins: OrderedSet = OrderedSet([n])
+if n.op == "call_function":
+    args, kwargs = self.fetch_args_kwargs_from_env(n)
+    origins |= gather_origins(args, kwargs)
+    self._realize_inputs_at_context_boundaries(n)
+node_mempool = self._get_node_mempool(n)
+
+with (
+    IRNode.current_origins(origins),
+    IRNode.current_stream_idx(self._get_node_stream(n)),
+    IRNode.current_mempool(node_mempool),
+    self.set_current_node(n),
+    V.set_current_node(n),
+):
+    result = self.call_function(n.target, args, kwargs)
+self.env[n] = result
+\end{lstlisting}
+
+注释说明了为什么这些决定放在 \texttt{run\_node} 而不是各个算子内部：一个值可能被后面的节点在不同上下文下复用，而这种复用的含义只有在两个上下文都在手边时才说得清。来源节点必须在读之前收集，因为读完之后值可能已经被放进内存，而内存里的值不再说明它从哪里来。
+
+\subsubsection{算子名到降级函数的回退链}
+
+\texttt{call\_function}（\texttt{graph\_lowering.py:2151--2196}）是整条管线的调度点。它按顺序问十二个名字（\texttt{graph\_lowering.py:2171--2184}）：
+
+\begin{lstlisting}[caption={降级查找链（\texttt{graph\_lowering.py:2171--2184}）。}, label=lst:be:dispatch, style=pystyle]
+lowering = (
+    user_lowerings.get(node)          # 程序为自己的算子写的
+    or user_lowerings.get(target)     # 按算子对象
+    or LOWERINGS.get(name)            # 按调用名
+    or LOWERINGS.get(f"{name}.Tensor")
+    or LOWERINGS.get(f"{name}.Scalar")
+    or LOWERINGS.get(f"{name}.default")
+    or LOWERINGS.get(f"{name}.int")
+    or LOWERINGS.get(f"{name}.dim")
+    or LOWERINGS.get(f"{name}.dims")
+    or LOWERINGS.get(f"{name}.dtype")
+    or LOWERINGS.get(f"{name}.device")
+    or LOWERINGS.get(f"{name}.dtype_layout")
+)
+\end{lstlisting}
+
+用户降级排在最前不是风格问题：\texttt{op\_lowerings.py:253--258} 的注释说，一个程序为某个算子写过降级，那个降级就是这个程序自己的算子，而内置的同名降级描述的是另一个恰好同名的算子。十二个名字的顺序则把“方法拼写”与“功能拼写”都收敛到一条链上——同一个算子被 \texttt{x.sin()} 记成方法、被 \texttt{functional.sin(x)} 记成函数，两条路都通向同一个降级函数。
+
+都没有时，调用被整体交给框架（\texttt{graph\_lowering.py:2189} 的 \texttt{make\_extern}），并有注释给这一档定性：比内核慢，但正确，而且是唯一还能说的话。实测注册表规模：\texttt{LOWERINGS} 有 \textbf{388} 条，\texttt{FALLBACKS} 有 \textbf{6} 条。
+
+\subsubsection{模板算子：把“是什么”与“怎么算”分开}
+
+有些算子不写单个降级，而是交给一组候选去挑。表 \texttt{\_TEMPLATE\_OPERATORS}（\texttt{graph\_lowering.py:107--116}）把 8 个名字映射到 3 个模板：四个卷积名字到 \texttt{conv}，卷积反向到 \texttt{convolution2d\_bwd\_input}，而 \texttt{linear}、\texttt{matmul}、\texttt{addmv} 三个到 \texttt{gemm}。
+
+这条路径的准入规则值得引用（\texttt{graph\_lowering.py:100--106}）：一个算子只有在“没有任何可降级的东西回答它”时才进来；乘积与带偏置的乘积\emph{不在}这里，因为二者各有自己的降级负责收集候选并测量它们，把它们也路由到模板就会是一次调用两个答案，而哪一个跑过取决于谁先被导入。模板路径在 \texttt{make\_extern} 里接上（\texttt{graph\_lowering.py:1733--1746}）：模板拥有候选与选择权，调用点只声明这是哪个模板。
+
+\subsection{循环中间表示}
+
+降级的产物不是“算子”，而是\emph{循环嵌套}。\texttt{loops.py:1--17} 的模块文档给出定义：一张降级后的图是一组缓冲；每个被计算的缓冲是一个循环嵌套（\texttt{Pointwise} 或 \texttt{Reduction}），其体是一个 \texttt{inner\_fn}——一个从符号循环下标到用算子处理器构造出的值的 Python 函数。
+
+\begin{lstlisting}[caption={一个逐元素降级如何变成循环嵌套（\texttt{op\_lowerings.py:1145--1178}，节选）。}, label=lst:be:pointwise, style=pystyle]
+tensor_inputs = [x for x in inputs if hasattr(x, "get_size")]
+if len(tensor_inputs) > 1:
+    target = functools.reduce(
+        broadcast_symbolic_shapes, (x.get_size() for x in tensor_inputs), ()
+    )
+    size = tuple(int(s) for s in target)
+loaders = [as_value_node(x, dtype, device).make_loader() for x in inputs]
+
+def inner(index):
+    return fn(*[load(index) for load in loaders])
+
+return Pointwise.create(device=device, dtype=dtype, inner_fn=inner, ranges=size)
+\end{lstlisting}
+
+这段代码里有四个决定：结果的形状先从输入读（第一个输入的范围与它所在的设备说明这个算子跑在什么上）；多个输入先广播到同一形状；每个输入贡献一个\emph{索引函数}（loader）而不是一份数据；循环范围就是广播后的形状。视图因此从不拷贝——它们通过索引函数重新寻址自己的来源，而一个已实现的视图是对该缓冲的带 stride 重解释（\texttt{loops.py:13--15}）。
+
+一元与二元算子因此只有各一个工厂（\texttt{\_unary} 在 \texttt{op\_lowerings.py:1268--1278}，\texttt{\_binary} 在 \texttt{op\_lowerings.py:1311--1325}），表驱动地把 13 个一元名字与两个二元名字接上去（\texttt{op\_lowerings.py:1281--1288}、\texttt{op\_lowerings.py:1328--1331}）。注意 \texttt{\_unary} 的注释（\texttt{op\_lowerings.py:1269--1272}）：名字是延迟解析的，因为在区域被降级之前不知道哪个处理器是激活的，而在这里解析名字会捕获导入那一刻的状态——那等于什么都没有。
+
+表~\ref{tab:be:ir} 给出中间表示的节点族。分类依据是“它是什么”，而不是“它怎么算”：\texttt{Loops} 家族是有范围的计算，\texttt{Buffer} 家族是有地址的东西，\texttt{MutableBox} 家族是“可能还没实现的盒子”，\texttt{ExternKernel} 家族是对别处写的东西的调用。
+
+\begin{table}[H]
+\centering
+\caption{中间表示的主要节点（实测行号）。}
+\label{tab:be:ir}
+\small
+\begin{tabular}{lll}
+\toprule
+家族 & 代表类与位置 & 语义 \\
+\midrule
+计算 & \texttt{Loops}（\texttt{ir.py:1710}） & 有循环范围与体的一个计算 \\
+ & \texttt{Pointwise}（\texttt{ir.py:1917}） & 逐元素；负载与存储按索引函数 \\
+ & \texttt{Reduction}（\texttt{ir.py:4674}） & 带归约范围与归约方式 \\
+ & \texttt{MultiOutputReduction}（\texttt{ir.py:5312}） & 多输出归约：在线 softmax（\texttt{:5374}）、Welford（\texttt{:5561}）、argmax 类（\texttt{:5775}） \\
+ & \texttt{Scan}（\texttt{ir.py:4353}）、\texttt{Sort}（\texttt{ir.py:4529}）、\texttt{Scatter}（\texttt{ir.py:8501}） & 有序或非逐元素的循环形态 \\
+\hline
+地址 & \texttt{Layout}（\texttt{ir.py:1017}） & 形状与元素顺序 \\
+ & \texttt{Buffer}（\texttt{ir.py:2158}）、\texttt{ComputedBuffer}（\texttt{ir.py:3719}） & 有地址的量；前者是基类，后者带一个计算 \\
+ & \texttt{ConstantBuffer}（\texttt{ir.py:2373}）、\texttt{Constant}（\texttt{ir.py:3400}） & 不必计算的量 \\
+\hline
+未实现 & \texttt{MutableBox}（\texttt{ir.py:2399}） & 可能仍是循环的东西 \\
+ & \texttt{TensorBox}（\texttt{ir.py:2554}）、\texttt{StorageBox}（\texttt{ir.py:2565}） & 带盒子语义的包装 \\
+\hline
+外部 & \texttt{ExternKernel}（\texttt{ir.py:6126}） & 可被调度的、对别处写的内核的调用 \\
+ & \texttt{FallbackKernel}（\texttt{ir.py:9961}）、\texttt{EffectfulKernel}（\texttt{ir.py:11122}） & 回退内核与有副作用的内核 \\
+ & \texttt{MultiOutput}（\texttt{ir.py:7262}）、\texttt{Subgraph}（\texttt{ir.py:3558}） & 多输出与子图 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+循环体还有第二种记录方式。\texttt{LoopBody}（\texttt{loops.py:778--793}）把一个体记成值的树加上它跑在哪些循环上，而 \texttt{record\_body}（\texttt{loops.py:795--822}）用一次带记录处理器的执行得到它：给循环起名字，然后拿回来的是读了哪些位置与结果是什么。文档把两种形态的取舍写清楚了（\texttt{loops.py:779--784}）——记录体是程序路径需要的形状；另一种把体记成图的形状说得更多、拆起来也更贵。
+
+两处算术规则值得单独记住，因为它们解释了生成代码里为什么没有除法、为什么没有额外的类型转换趟：\texttt{compute\_dtype}（\texttt{loops.py:831--839}）规定归约的浮点算术类型——除非输入里有 \texttt{float64}，一律用 \texttt{float32}；\texttt{PROMOTED\_ON\_LOAD}（\texttt{loops.py:849}）是 \texttt{float16} 与 \texttt{bfloat16}，声明了某一算术类型的消费者按更宽的算术读它们、载入后再转换，因此要多精度并不额外多一趟内存。
+
+\subsection{物化：什么时候一个值必须写进内存}
+
+降级期间什么都不落地：一个只被读一次的逐元素值直接内联进它的读者。模块文档（\texttt{graph\_lowering.py:1--9}）给出的判据是“某个东西需要内存时”才落地，并列出三类：库调用、图输出、以及被许多消费者重读的值——在每个消费者里各重算一次这样的值，代价高于存一次。除这三条之外还有三条数量阈值（\texttt{graph\_lowering.py:92--97}）：
+
+\begin{table}[H]
+\centering
+\caption{物化阈值（实测常量）。}
+\label{tab:be:realize}
+\small
+\begin{tabular}{rl}
+\toprule
+常量 & 含义 \\
+\midrule
+\texttt{REALIZE\_READS\_THRESHOLD} $= 4$ & 一个值被读超过这么多缓冲时存一次 \\
+\texttt{REALIZE\_ACC\_READS\_THRESHOLD} $= 8$ & 内联体的读取数超过它时存一次 \\
+\texttt{REALIZE\_OPCOUNT\_THRESHOLD} $= 30$ & 内联体的操作数超过它时存一次 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+除了阈值，还有三类强制物化：库调用（回退内核与外部内核）、图输出，以及处在上下文边界上的输入（\texttt{\_realize\_inputs\_at\_context\_boundaries}，\texttt{graph\_lowering.py:1765}）。输出侧的规则在 \texttt{output}（\texttt{graph\_lowering.py:2198--2227}）：调用者是从内存里读输出的，所以无论这个值是怎么来的——还在盒子里，或已经是裸视图——都先落地，再把调用者不读的 stride 匹配回区域声称的 stride，使同一份值的两种描述一致。同一处还有一个显式的类型闸门（\texttt{graph\_lowering.py:2219--2222}）：输出只能是内存能给的地方、无需计算就知道的量、或一个形状。
+
+布局的最终决定被推到区域末尾（\texttt{finalize}，\texttt{graph\_lowering.py:2458--2470}）：一个缓冲的布局在降级期间仍可能改变，因为后面的算子还可以说要什么形状；区域完整之后就没有了，于是逐个定下来。注释给出了反面理由：把决定推迟到某个内核第一次读该缓冲时，会让布局变更对已经按旧布局写好的代码可见。
+
+\subsection{调度、融合与自动调优}
+
+调度器把已实现的节点变成一串内核调用与一串内存动作。表~\ref{tab:be:sched} 是它的节点族（实测行号），可以看出它把“调度问题”拆成了几类互相独立的决策。
+
+\begin{table}[H]
+\centering
+\caption{调度器节点族（实测行号）。}
+\label{tab:be:sched}
+\small
+\begin{tabular}{lll}
+\toprule
+类 & 位置 & 承担的决策 \\
+\midrule
+\texttt{BaseSchedulerNode} & \texttt{scheduler.py:1581} & 基类：依赖、内存、循环次序 \\
+\texttt{ExternKernelSchedulerNode} & \texttt{scheduler.py:2590} & 外部内核调用如何排 \\
+\texttt{SchedulerNode} & \texttt{scheduler.py:2636} & 普通已实现节点 \\
+\texttt{FusedSchedulerNode} & \texttt{scheduler.py:3104} & 融合链的共同上下文 \\
+\texttt{FusedMixOrderReductions} & \texttt{scheduler.py:3355} & 多归约混序：一个内核里做多个归约 \\
+\texttt{FusedStagedReduction} & \texttt{scheduler.py:3466} & 分阶段归约 \\
+\texttt{FusedNestedReduction} & \texttt{scheduler.py:3470} & 嵌套归约 \\
+\texttt{NestedReduction} 与阶段类 & \texttt{scheduler.py:508}、\texttt{:1422}、\texttt{:1433} & 嵌套归约的分解与阶段 \\
+\texttt{MixOrderReduction} & \texttt{scheduler.py:200} & 单个混序归约 \\
+\texttt{StagedReductionPlan} & \texttt{scheduler.py:1442} & 阶段归约计划 \\
+\texttt{WhyNoFuse} & \texttt{scheduler.py:2498} & \textbf{为什么这两个节点没被融合} \\
+\texttt{OutputNode} & \texttt{scheduler.py:2529} & 输出落地 \\
+\hline
+\texttt{SchedulerBuffer} 与 \texttt{SchedulerDonatedBuffer} & \texttt{scheduler.py:1461}、\texttt{:1577} & 缓冲与其被交出所有权的变体 \\
+\texttt{FusionResult} 与 \texttt{PendingFusion} & \texttt{scheduler.py:132}、\texttt{:155} & 融合尝试的结果与待定项 \\
+\texttt{ComboKernelMemoryContext} & \texttt{scheduler.py:166} & 多内核共享的内存上下文 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\texttt{WhyNoFuse} 这一类值得单独说明：把“没融合”的原因也变成节点，意味着融合决策是可被检视的，而不是一次沉默的跳过。代价是每条不融合的边都要给出一个理由，收益是性能报告里能区分“没有机会”与“有机会但被否决”。
+
+自动调优（\texttt{autotune\_process.py}，1\,406 行）是这条链上的最后一环：它为内核参数搜索配置，把胜出的配置写进缓存目录下的 \texttt{*.best\_config} 文件（实测存在），下次同一形状直接读取。坐标下降调优由 \texttt{stax.coordinate\_descent\_tuning} 开关控制，只在两个 \texttt{max-autotune} 模式下打开。
+
+\subsection{代码生成：三条路与一个入口函数}
+
+\texttt{codegen}（\texttt{graph\_lowering.py:2308--2327}）打印两样东西：内核，以及调用它们的程序。顺序是固定的——先建立包装器代码（它要先问设备该怎么称呼那些包装器自己没法称呼的东西，比如把哪个设备设为当前、等哪条流），再更新调度器，然后让包装器收下这张图，然后让调度器打印节点，最后生成。
+
+打印结果有三种形态，\texttt{compile\_to\_module}（\texttt{graph\_lowering.py:2363--2382}）按类型分派：
+
+\begin{table}[H]
+\centering
+\caption{三条代码生成路线（实测）。}
+\label{tab:be:routes}
+\small
+\begin{tabular}{lll}
+\toprule
+形态 & 走向 & 位置 \\
+\midrule
+\texttt{ValueWithLineMap} & 打印成 Python 文本，写进按内容取名的文件，再按那个键加载回来 & \texttt{\_compile\_to\_module\_lines}，\texttt{graph\_lowering.py:2329--2361} \\
+\texttt{CppWrapperCode} & 打印成单个 C++ 翻译单元，用宿主工具链构建成 \texttt{.so}，用 \texttt{ctypes} 载入 & \texttt{\_compile\_to\_cpp\_module}，\texttt{graph\_lowering.py:2384--2456} \\
+\texttt{FileBackedGraphModule} & 已经是文件支撑的图模块，直接返回 & \texttt{graph\_lowering.py:2378--2379} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Python 路线额外携带一张行号表（\texttt{graph\_lowering.py:2342--2345}）：包装器的每一部分来自区域的哪一行被一起记下来，于是包装器内部的失败可以报在产生它的那一行区域代码上，而不是报在它被打印进去的那个文件的行上。
+
+C++ 路线的入口签名是这一节最该记住的一行（\texttt{codegen/cpp\_wrapper.py:3--12}）：
+
+\begin{lstlisting}[caption={C++ 包装器暴露的唯一入口（\texttt{codegen/cpp\_wrapper.py:3--12}）。}, label=lst:be:entry, style=cppstyle]
+extern "C" void call(void** tensor_data, long* sizevars);
+\end{lstlisting}
+
+\texttt{tensor\_data} 装着图触碰的每个缓冲（图输入、输出与中间量）的数据指针，索引在代码生成时分配；\texttt{sizevars} 装着图里每个符号尺寸的值。Python 运行时负责分配缓冲、填这两个数组、通过载入的共享对象调用 \texttt{call}。构建参数写死在 \texttt{graph\_lowering.py:2414--2433}：\texttt{-std=c++20 -O3 -fPIC -shared -pthread -fopenmp}，链接 \texttt{p10} 与 \texttt{gomp}，产物按内容键命名并 \texttt{ctypes} 载入。
+
+\subsubsection{实测产物：一个 108 行的 SIMD 内核}
+
+下面这段是一次真实编译写出的完整文件（\texttt{relu}，\texttt{float32}，向量化宽度 $W$）。它由 \texttt{stax-cpu} 路线的模板打印，再交给宿主工具链构建。三个可读的细节：主循环按 $4W$ 展开并带 \texttt{\#pragma GCC ivdep}；不足一个向量宽度的尾巴逐元素算；并行只在元素数达到 4096 时启用，且按 512 的静态分块。
+
+\begin{lstlisting}[caption={实测生成的 CPU 内核（节选自 \texttt{.tp\_cache/kernels/stax-cpu-native/.../*.cpp}，108 行）。}, label=lst:be:kernel, style=cppstyle]
+#include "cpu/vec/vec.h"
+using V = tensorplay::vec::Vectorized<float>;
+namespace {
+constexpr long W = V::size();
+
+template <typename Body>
+void tp_parallel_for_c(long begin, long end, long chunk, Body body, void* ctx) {
+  const long total = end - begin;
+  const unsigned reported = std::thread::hardware_concurrency();
+  long workers = reported < 1u ? 1 : static_cast<long>(reported);
+  const long by_chunk = (total + chunk - 1) / chunk;   // 不多于块数
+  if (workers > by_chunk) workers = by_chunk;
+  if (workers <= 1) { body(ctx, begin, end); return; }
+  const long per = ((total + workers - 1) / workers + chunk - 1) / chunk * chunk;
+  std::vector<std::thread> pool;
+  long at = begin;
+  for (long t = 1; t < workers; ++t) {
+    long stop = at + per; if (stop > end) stop = end;
+    if (stop <= at) break;
+    pool.emplace_back([=]() { body(ctx, at, stop); });
+    at = stop;
+  }
+  body(ctx, at, end);
+  for (auto& thread : pool) thread.join();
+}
+}  // namespace
+
+extern "C" void tp_cpu_native_entry(long n, const float* const* ins, float* out) {
+  auto tp_body = [](void* raw, long tp_begin, long tp_end) {
+    TpCtx& g = *static_cast<TpCtx*>(raw);
+    const long e = tp_end - tp_begin;
+    const float* __restrict__ in0 = g.ins[0] + tp_begin;
+    float* __restrict__ out = g.out + tp_begin;
+    long i = 0;
+    #pragma GCC ivdep
+    for (; i + 4 * W <= e; i += 4 * W) {
+      V x0_0 = V::loadu(in0 + (i), W);
+      V x1_0 = tensorplay::vec::maximum(x0_0, V(0.0f));
+      x1_0.store(out + (i), W);
+      // ... 同样三段，偏移 1*W、2*W、3*W ...
+    }
+    #pragma GCC ivdep
+    for (; i + W <= e; i += W) {
+      V x0 = V::loadu(in0 + i, W);
+      V x1 = tensorplay::vec::maximum(x0, V(0.0f));
+      x1.store(out + i, W);
+    }
+    const long count = e - i;
+    #pragma GCC ivdep
+    for (long j = 0; j < count; ++j) {              // 逐元素尾巴
+      const float x0 = in0[i + j];
+      const float x1 = ((x0) > 0.0f ? (x0) : 0.0f);
+      out[i + j] = x1;
+    }
+  };
+  if (n < 4096LL) {
+    tp_body(&ctx, 0, n);
+  } else {
+    tp_parallel_for_c(0, n, 512LL, tp_body, &ctx);
+  }
+}
+\end{lstlisting}
+
+这条路线与手写 CPU 内核是同一件事的两个方向：内核作者手写同一套向量化抽象（\texttt{p10/include/cpu/vec/vec.h}）下的循环，而这里是编译器按同一个抽象把循环打印出来。两条路共用抽象，因此一条路上加的新算术类型对另一条路立刻可用。
+
+\subsection{两级缓存}
+
+产物有两个名字系统，因为有两种东西要命名：被打印出来的源码，以及被构建出来的二进制。
+
+\begin{table}[H]
+\centering
+\caption{两级缓存的职责（模块文档逐字）。}
+\label{tab:be:caches}
+\small
+\begin{tabular}{p{0.30\textwidth}p{0.30\textwidth}p{0.30\textwidth}}
+\toprule
+ & \texttt{codecache.py}（1\,208 行） & \texttt{kernel\_cache.py}（237 行） \\
+\midrule
+命名什么 & 打印出来的源码与已构建产物 & 内核产物 \\
+键 & 内容摘要 & 规范化后的键 \\
+发布方式 & 写到旁边的临时名再移入 & 临时文件加重命名 \\
+布局 & \texttt{\$TP\_CACHE\_DIR} 下按后端分目录 & \texttt{.tp\_cache/kernels/<backend>/<前两位>/<key>.<ext>} \\
+其它 & 保留可读的词干给人看；行号表随产物走 & \texttt{flock} 跨进程锁、进程内记忆化 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\texttt{codecache.py} 的模块文档（\texttt{:1--12}）把命名原则写成了规则：“一个编译产物按它是从什么构建出来的命名，而不是按它被写到哪里，因此同一份源码无论被请求多少次、从哪里被请求，都只编译一次。”原子发布同样有理由：“写一个产物本身不是原子的，所以它被写到目标旁边的名字再移进去——读者要么看到上一个产物，要么看到新的那个，永远不是半个。”
+
+实测这台机器上的三处目录：\texttt{.tp\_cache/kernels/capture-region/} 放前端捕获图（\texttt{.gmp}），\texttt{.tp\_cache/kernels/stax-cpu-native/} 与 \texttt{.tp\_cache/kernels/stax-cpu-isa/} 放 CPU 内核源码与 \texttt{.so}。三者都在同一个键空间规则下，只是后端名不同。
+
+\subsection{降级策略：诚实性是被强制的}
+
+降级有两档，且第二档可以被要求。捕获不到内置形式的区域时，\texttt{backend.py:242--271} 做同一件事：把图重新解释回 \texttt{GraphModule} 交给框架跑。但它先检查 \texttt{strict\_native}——若为真，则把这次降级变成一次编译错误，消息是 \texttt{"strict\_native Stax lowering failed: captured graph has no built form"}（\texttt{backend.py:254--256} 与 \texttt{:268--270}）。理由写在函数文档里：一个无法被降级的区域是框架自己跑的区域，而一个进不去的产物比没有产物更糟——失败会推迟到第一次调用才到；所以没要求构建形式的调用方拿到按原样运行的区域，要求的调用方拿到失败。
+
+这条设计的目的是让基准测试不可能误报：没有 \texttt{strict\_native} 时，一个降级失败会安静地交出 Python 图解释器，而性能数字看起来仍然像编译后的数字。
+
+产物的路线标签由 \texttt{\_publish\_codegen} 统一写入（\texttt{backend.py:146--158}），值是 \texttt{"triton"} 或 \texttt{"stax-cpu"}（\texttt{backend.py:320}），写在调用者真正拿到的那份对象上（而不是它背后的模块上）。实测一次训练编译的两个标签都是 \texttt{"stax-cpu"}，前后向一致。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\scriptsize, stage/.style={draw,rounded corners=2pt,thick,align=center,inner sep=3pt,minimum height=9mm}]
+\node[stage, fill=tporange!8, draw=tporange] (gm) {\texttt{GraphModule}\\\scriptsize 前端交付};
+\node[stage, right=6mm of gm, fill=tpblue!8, draw=tpblue] (walk) {遍历\\\scriptsize\texttt{call\_function}\\\scriptsize 12 级名字回退};
+\node[stage, right=6mm of walk, fill=tpblue!8, draw=tpblue] (ir) {循环中间表示\\\scriptsize \texttt{Loops}/\texttt{Buffer}\\\scriptsize 索引函数};
+\node[stage, right=6mm of ir, fill=tpblue!8, draw=tpblue] (mat) {物化\\\scriptsize 阈值 4/8/30\\\scriptsize 布局在末尾定};
+\node[stage, below=8mm of mat, fill=tporange!8, draw=tporange] (sch) {调度与融合\\\scriptsize 归约策略、分块\\\scriptsize \texttt{WhyNoFuse}};
+\node[stage, right=6mm of sch, fill=tpgreen!8, draw=tpgreen] (cg) {打印\\\scriptsize 内核 + 包装器};
+\node[stage, right=6mm of cg, fill=tpgreen!8, draw=tpgreen] (art) {产物\\\scriptsize Python 模块 / \texttt{.so}\\\scriptsize 内容键缓存};
+\node[stage, right=6mm of art, fill=tpgreen!12, draw=tpgreen] (run) {调用\\\scriptsize\texttt{tp\_cpu\_native\_entry}};
+
+\draw[-{Stealth[length=1.6mm]}, thick] (gm) -- (walk);
+\draw[-{Stealth[length=1.6mm]}, thick] (walk) -- (ir);
+\draw[-{Stealth[length=1.6mm]}, thick] (ir) -- (mat);
+\draw[-{Stealth[length=1.6mm]}, thick] (mat) -- (sch);
+\draw[-{Stealth[length=1.6mm]}, thick] (sch) -- (cg);
+\draw[-{Stealth[length=1.6mm]}, thick] (cg) -- (art);
+\draw[-{Stealth[length=1.6mm]}, thick] (art) -- (run);
+\draw[-{Stealth[length=1.6mm]}, thick, dashed, tporange!80!black] (walk.south) |- (sch.west);
+\node[right=1mm of walk, font=\scriptsize\itshape, text=tporange!80!black] {未命中：\texttt{make\_extern}};
+\end{tikzpicture}
+\caption{stax 后端的降级与生成流程。虚线是回退路径：没有内置降级的算子走模板或库调用。}
+\label{fig:be:pipeline}
+\end{figure}

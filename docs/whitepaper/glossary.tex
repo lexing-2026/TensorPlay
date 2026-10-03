@@ -88,6 +88,31 @@
 }
 \newglossaryentry{linktime_axiom}{
   name=链接期无环性,
-  description={公理：对任意 $(a,b)\in D$，\texttt{level}(a) > \texttt{level}(b)，其中 \texttt{level}(p10)=0、\texttt{level}(tpx)=1、\texttt{level}(stax)=2、\texttt{level}(\_C)=3，由 \texttt{CMakeLists.txt:938--944} 的 \texttt{add\_subdirectory} 顺序与仅向下的 \texttt{target\_link\_libraries} 边强制。},
+  description={公理：对任意 $(a,b)\in D$，\texttt{level}(a) > $\mathrm{level}(b)$，其中 $\mathrm{level}(p10)=0$、$\mathrm{level}(tpx)=1$、$\mathrm{level}(stax)=2$、$\mathrm{level}(\_C)=3$，由 \texttt{CMakeLists.txt:938--944} 的 \texttt{add\_subdirectory} 顺序与仅向下的 \texttt{target\_link\_libraries} 边强制。},
   sort=LinkTimeAcyclicity
+}
+\newglossaryentry{lowering}{
+  name=降级,
+  description={把捕获图的一个节点变成循环嵌套（\texttt{Loops}）或对别处写的内核的调用（\texttt{ExternKernel}）的动作。实测注册表 \texttt{LOWERINGS} 有 388 条，查找链见 \texttt{graph\_lowering.py:2171--2184}。},
+  sort=Lowering
+}
+\newglossaryentry{aotpartition}{
+  name=前后向分割,
+  description={把联合图分成前向图与反向图，并决定前向必须写出哪些中间值的算法。最小割实现在 \texttt{aot.py:825--983}，流算法为 Edmonds--Karp（\texttt{aot.py:785--822}）。},
+  sort=AOTPartition
+}
+\newglossaryentry{guard}{
+  name=守卫,
+  description={特化缓存键的一个可内省投影：每个条件是一个四字段冻结数据类（\texttt{guards.py:27--39}），键本身是四元组（\texttt{api.py:500--505}）。键不变，守卫是它的投影。},
+  sort=Guard
+}
+\newglossaryentry{regioncache}{
+  name=区域缓存,
+  description={捕获图在磁盘上的持久化形式，键是源码、模块状态与签名的 SHA-256（\texttt{region\_cache.py:103--132}），布局为 \texttt{.tp\_cache/kernels/capture-region/<key 前两位>/<key>.gmp}。},
+  sort=RegionCache
+}
+\newglossaryentry{strictnative}{
+  name=\texttt{strict\_native},
+  description={后端开关：把一次降级失败从“交回框架自己跑”变成编译错误（\texttt{backend.py:254--256}），使基准测试不可能把图解释器的速度报成编译后的速度。},
+  sort=StrictNative
 }

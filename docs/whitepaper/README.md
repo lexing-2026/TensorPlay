@@ -19,6 +19,9 @@ docs/whitepaper/
 │   ├── 07-memory.tex        # DataPtr、Storage、TensorImpl、Tensor、MemoryFormat（已中文化）
 │   ├── 07b-tensoriterator.tex # 张量迭代器流水线（已中文化）
 │   ├── 08-codegen.tex       # YAML 契约、7 个生成器、构建分段（已中文化）
+│   ├── 08b-compiler-frontend.tex # 图编译管线（一）：捕获、六 pass 流水线、两套分解、AOT 联合图与最小割分割、守卫四元组、区域缓存
+│   ├── 08c-stax-lowering.tex # 图编译管线（二）：stax 后端入口与选项、12 级降级查找链、循环 IR、物化阈值、调度器节点族、三条代码生成路线、两级缓存
+│   ├── 08d-native-graph.tex # 原生图运行时：ValueNode/OpNode/Graph、最后一次使用即释放、并行门控、fused_mul_add 融合、custom_op 桥
 │   ├── 09-evaluation.tex    # 可读性、正确性守卫、裁剪轴（已中文化）
 │   └── 10-appendix.tex      # 可复现性、Windows 构建、文件地图（已中文化）
 ├── glossary.tex             # 术语与缩写（已中文化）

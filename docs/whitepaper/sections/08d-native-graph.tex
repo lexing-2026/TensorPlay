@@ -1,0 +1,132 @@
+% 08d-native-graph.tex
+\section{原生图运行时：stax 的 \texorpdfstring{\texttt{Graph}}{Graph} 与融合}
+\label{sec:compile:native}
+
+前两章的产物是“把一切都变成内核”的那条路。这一章讲另一条路的底座：当一个算子没有专用内核、或者一张图不值得拆成多个内核时，框架有一张本地图可以走。\S\ref{sec:arch:stax} 已给出它的定位（单一 \texttt{fused\_mul\_add} 通道、无循环融合、布局规划器缺席），本章给出它的实际机制：数据结构、执行顺序、内存回收、并行门控，以及那条唯一的融合规则。
+
+\subsection{三个类型与一个注册表}
+
+\texttt{stax/include/Graph.h} 只有 137 行，类型只有三个半。
+
+\begin{table}[H]
+\centering
+\caption{原生图的类型（\texttt{stax/include/Graph.h}）。}
+\label{tab:ng:types}
+\small
+\begin{tabular}{llll}
+\toprule
+类型 & 位置 & 关键字段 & 作用 \\
+\midrule
+\texttt{ValueNode} & \texttt{:45} & \texttt{id}、\texttt{producer}、\texttt{producer\_output\_index}、\texttt{uses}、\texttt{dtype}、\texttt{shape}、\texttt{device} & 一次 SSA 结果；\texttt{uses} 是消费者列表 \\
+\texttt{OpNode} & \texttt{:65} & \texttt{op\_type}、\texttt{name}、\texttt{inputs}、\texttt{outputs}、\texttt{attrs} & 一个操作 \\
+\texttt{Graph} & \texttt{:91} & \texttt{nodes}、\texttt{values}、\texttt{inputs}、\texttt{outputs} & 拥有前两者；\texttt{execute} 是唯一的执行入口 \\
+\texttt{IRBuilder} & \texttt{:106} & \texttt{op\_counter\_} & 建图期的便利封装 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+三个设计选择值得写下来。\textbf{第一，属性是强类型的变体}（\texttt{Graph.h:62--66}）：\texttt{std::variant} 的五种选择是 \texttt{int64\_t}、\texttt{double}、\texttt{std::string}、\texttt{std::vector<int64\_t>}、\texttt{std::vector<double>}；取错类型不是静默转换，而是 \texttt{"Attribute not found or type mismatch: " + key}（\texttt{Graph.h:126--133}）。\textbf{第二，值的所有者是图}：\texttt{Graph} 持有 \texttt{std::vector<std::unique\_ptr<ValueNode>>}，节点的 \texttt{inputs} 存裸指针。\textbf{第三，图不可拷贝}：拷贝构造与赋值都被删除（\texttt{Graph.h:100--101}），所以一张图的身份就是它的地址。
+
+pass 走注册表（\texttt{stax/include/Fusion.h:20--50}）：抽象基类 \texttt{Pass} 只有 \texttt{name()} 与 \texttt{run(Graph\&)}，后者返回“图是否被改动”；\texttt{PassRegistry} 是单例，\texttt{registerPass}、\texttt{createPass}、\texttt{listPasses} 三个方法。当前注册两个：\texttt{"dce"} 与 \texttt{"fusion"}（\texttt{stax/src/Fusion.cpp:67}、\texttt{:140}）。
+
+\subsection{执行：一个带回收的拓扑走查}
+
+\texttt{Graph::execute}（\texttt{stax/src/Graph.cpp:183}）是全部执行语义所在。入口检查输入个数（\texttt{:184--188}），随后做五件事。
+
+\textbf{一、环境按值下标索引，而不是按哈希。} 注释（\texttt{Graph.cpp:190--193}）给出理由：\texttt{ValueNode} 的 \texttt{id} 在图的寿命里稠密且稳定，一个向量避免了每次原生执行都为每个操作数做哈希；这与一次卷积相比很小，但对卷积周围成百上千的逐元素与残差节点是实质开销。
+
+\textbf{二、只保留还有下游消费者的值。} \texttt{Graph.cpp:199--217} 先数每个值的入度，再标记图输出，然后每消费一次就减一，减到零且不是图输出就把环境槽清空。注释说明了动机：张量分配器可以在最后一次使用退休时立刻回收存储，而保留每个中间量直到整图返回会让这一点失效。
+
+\begin{lstlisting}[caption={最后一次使用即释放（\texttt{stax/src/Graph.cpp:199--217}）。}, label=lst:ng:release, style=cppstyle]
+std::vector<size_t> remaining_uses(this->values.size(), 0);
+std::vector<bool> keep_alive(this->values.size(), false);
+for (const auto& node_ptr : nodes) {
+    for (const ValueNode* input : node_ptr->inputs) {
+        ++remaining_uses[input->id];
+    }
+}
+for (const ValueNode* output : outputs) {
+    keep_alive[output->id] = true;
+}
+
+auto release_inputs = [&](const OpNode& node) {
+    for (const ValueNode* input : node.inputs) {
+        if (remaining_uses[input->id] > 0) --remaining_uses[input->id];
+        if (remaining_uses[input->id] == 0 && !keep_alive[input->id]) {
+            env[input->id] = Tensor();
+        }
+    }
+};
+\end{lstlisting}
+
+\textbf{三、未定义的值是硬错误。} 取值辅助函数（\texttt{Graph.cpp:226}）在槽位越界或未定义时抛出 \texttt{"Stax Graph::execute encountered an undefined value"}。这条与上面的释放逻辑是一对：释放是按引用计数做的，因此“读了已被释放的值”必须且只可能以这个错误出现。
+
+\textbf{四、两个内建算子带手写语义。} \texttt{channels\_last}（\texttt{Graph.cpp:267--305}）把逻辑 NCHW 的值变成物理 NHWC：先按 \texttt{(n,h,w,c)} 与置换后的 stride 造一个物理视图并 \texttt{contiguous()}，再把它按目标 stride 重解释回逻辑 NCHW。注释解释了为什么不能做保留 stride 的拷贝——那会保留源的物理顺序，最后的重解释就会把元素读到错误的位置。另一个是 \texttt{add\_relu}。属性读取各有一组带诊断的辅助：整型列表、浮点列表、整型标量、浮点标量、整型位置（\texttt{Graph.cpp:38--89}），每个都在类型不符时给出带属性名的消息，例如 \texttt{"Stax fused pointwise attribute is missing: " + key}。
+
+\textbf{五、并行是有门控的。} 注释（\texttt{Graph.cpp:1745--1748}）解释了动机与代价：分叉点的重叠让多个 worker 上相互独立的就绪节点并发跑，残差分支的链条不再串行化；没有分叉的图（任一时刻只有一个就绪节点）得不到任何好处，却要付出同步的开销，所以它们保持顺序走查。门控条件四个同时成立才并行（\texttt{Graph.cpp:1764--1766}）：
+
+\begin{table}[H]
+\centering
+\caption{并行执行的四个门控条件（\texttt{stax/src/Graph.cpp:1764--1766}）。}
+\label{tab:ng:gate}
+\small
+\begin{tabular}{lll}
+\toprule
+条件 & 值 & 为什么 \\
+\midrule
+节点数 & $\ge 24$ & 低于这个规模，建依赖图与同步的固定开销盖过收益 \\
+含 \texttt{custom\_op} & 否 & 那类节点要回 Python，线程亲和与并行不安全 \\
+worker 预算 & $> 1$ & 预算取 \texttt{omp\_get\_max\_threads()}；没有 OpenMP 时恒为 1 \\
+输入设备 & 无 CUDA 张量 & CUDA 流的语义由 CUDA 自己管 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+并行分支的实现是标准的有向无环图调度：按\textbf{不同生产者}去重后数入度、建后继表（\texttt{Graph.cpp:1767--1788}），一个 \texttt{std::deque<size\_t>} 就绪队列加互斥量与条件变量（\texttt{Graph.cpp:1789--1793}），每个 worker 循环取就绪节点、执行、把后继入度减一、必要时入队（\texttt{:1809--1845}），异常用 \texttt{aborted} 与 \texttt{std::exception\_ptr} 汇合（\texttt{:1797--1800}、\texttt{:1811}），主线程 \texttt{join} 完所有 worker（\texttt{:1857--1864}）。与 \S\ref{sec:autograd} 的 \texttt{sequence\_nr} 优先队列相比，这里的顺序就是入度为零的发现顺序，没有第二排序键——因为图是静态的，先序是确定的。
+
+\subsection{唯一的融合规则，以及它为什么这么写}
+
+\texttt{FusionPass}（\texttt{stax/src/Fusion.cpp:69--139}）只做一件事：把 \texttt{add(\_,\ mul(x, y))} 变成 \texttt{fused\_mul\_add}。触发条件有三条，缺一不可：外层是 \texttt{add}；被乘的那条输入有生产者且生产者是 \texttt{mul}；这条输入的 \texttt{uses.size() == 1} 且不是图输出。第三条是这条规则的全部重点——中间值若有第二个消费者，删掉它就改了程序。
+
+改写本身有四步细节，每一步都在源码里有理由（\texttt{Fusion.cpp:87--133}）：
+
+\begin{lstlisting}[caption={融合改写（\texttt{stax/src/Fusion.cpp:87--133}，节选）。}, label=lst:ng:fusion, style=cppstyle]
+// 保留标量操作数，同时删掉中间 mul 值：常量留作融合节点的属性
+if (auto it = mul_node->attrs.find("scalar_value"); it != mul_node->attrs.end()) {
+    node->attrs["mul_scalar_value"] = it->second;
+    if (auto pos = mul_node->attrs.find("scalar_position"); pos != mul_node->attrs.end()) {
+        node->attrs["mul_scalar_position"] = pos->second;
+    }
+}
+// 输入重排：加法可交换，融合执行器的契约是 mul(input0, scalar) + input1
+std::vector<ValueNode*> new_inputs;
+for (auto* mul_input : mul_node->inputs) {
+    new_inputs.push_back(mul_input);
+    mul_input->uses.push_back(node.get());
+}
+for (auto* original_input : node->inputs) {
+    if (original_input != input) new_inputs.push_back(original_input);
+}
+node->inputs = new_inputs;
+input->uses.clear();          // 断开 mul 的输出
+\end{lstlisting}
+
+最后那三行值得读慢一点。注释说明：如果保持原来加法的操作数顺序，就会把 \texttt{input0 + mul(input1, scalar)} 编译成 \texttt{mul(input0, scalar) + input1}——数学上等价，因为加法可交换、乘法对分配也成立；但融合执行器的契约是固定形状的 \texttt{mul(input0, scalar) + input1}，所以重排是让代码生成器拿到它能直接用的那种形状，而不是让它自己发现可以交换。
+
+\subsection{\texorpdfstring{\texttt{custom\_op}}{custom\_op}：回 Python 的桥}
+
+属性表里有一类特殊算子。\texttt{Graph.h:32--40} 的文档写明：一个 \texttt{custom\_op} 节点把限定的 \texttt{"ns::op"} 名字作为字符串属性携带，并把张量输入交给已安装的执行器——那正是绑定层里的 Python 与分派器之间的桥。理由写在同一处：内核保持完整的 eager 语义（设备分派、自动微分），因为桥重新进入的是 Python 算子入口，而不是一个裸可调用体。
+
+这条桥就是 \S\ref{sec:compile:backend} 里那 12 级名字回退链的落点。降级找不到内置形式时，调用被交给框架；框架这一侧把它表达成 \texttt{custom\_op}，由 Python 执行器按名字重新进入算子；执行器装在 \texttt{customOpExecutor()} 这个 \texttt{thread\_local} 槽里（\texttt{Graph.cpp:170--177}）。它同时也是并行门控里“含 \texttt{custom\_op} 就串行”那条的原因：跨到 Python 的调用会把 GIL 带进来，而门控宁可放弃重叠也不引入那种交错。
+
+\subsection{捕获状态：一个线程局部三元组}
+
+\texttt{CaptureState}（\texttt{stax/include/Graph.h:19--23}）是三个计数器：\texttt{compile\_depth}、\texttt{disabled\_depth}、\texttt{exporting\_depth}，配套 \texttt{enterCaptureState}、\texttt{exitCaptureState}、\texttt{currentCaptureState}。它们存在的理由与前端那句注释是同一件事：代表“一段程序区域”而非“一次操作”的算子，必须被告知正在捕获，否则它会自己跑，而它代表的区域就被内联成实现它的那些操作进入图里——那份内联形式是\textbf{正确}的，也正是持有该区域调度的后端永远拿不到的形式（\texttt{\_core/api.py:823--832}）。
+
+三个计数器都是 \texttt{thread\_local}（\texttt{Graph.cpp:26}），因此捕获状态按线程隔离：一条 worker 线程上的编译不会让另一条线程以为自己在捕获。进出是不对称的，\texttt{exitCaptureState} 对每个计数器都做下溢检查并给出带消息的错误（\texttt{Graph.cpp:103--111}）。
+
+\subsection{这一层教会了什么}
+
+\begin{tpnote}[把三章连起来看]
+原生图运行时是整条编译管线的\textbf{参照实现}。它用 137 行头文件与不到 2\,000 行源文件回答了四个问题：一个 SSA 值在最后一次使用后能不能立刻回收（能，且必须有未定义检查兜底）；独立节点能不能并发（能，但要有明确门控而不是一律并发）；什么时候两个算子可以合并成一个（只在中间值只有一个消费者时）；以及一份没被降级的图该由谁执行（由框架执行，并诚实地标出这条路线）。
+\end{tpnote}

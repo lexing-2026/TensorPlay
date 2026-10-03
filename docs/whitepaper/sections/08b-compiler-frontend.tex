@@ -1,0 +1,541 @@
+% 08b-compiler-frontend.tex
+\section{图编译管线（一）：捕获、分解、AOT 与特化}
+\label{sec:compile:frontend}
+
+前四章讲的是 eager 路径：一次调用分发一次、一次算子一次内核、Python 解释器站在每个节点之间。本章讲的是另一条路——把一段 Python 函数变成一个可调用产物。这条路由三个部分组成：\textbf{前端}把 Python 变成一张规范图并把它编译成产物，\textbf{stax 后端}把图降级成循环中间表示与内核（\S\ref{sec:compile:backend}），\textbf{原生图运行时}执行那些没有专用内核的算子（\S\ref{sec:compile:native}）。本章给出前端的完整机制，理由是这一层承担了整个框架里最容易出错的判断：什么可以静态决定，什么必须在运行时重新决定。
+
+\subsection{规模与位置}
+
+编译器前端是 \texttt{tensorplay/compiler/}（门面 1\,300 行，\texttt{\_core} 4\,257 行），分解层是 \texttt{tensorplay/\_decomp/}（3\,168 行），图改写层是 \texttt{tensorplay/graph/passes/}。表~\ref{tab:fe:files} 给出这些文件的行数；后端与原生图的规模在 \S\ref{sec:compile:backend} 给出。
+
+\begin{table}[H]
+\centering
+\caption{编译器前端文件规模（\texttt{wc -l}）。}
+\label{tab:fe:files}
+\small
+\begin{tabular}{lrl}
+\toprule
+文件 & 行数 & 职责 \\
+\midrule
+\texttt{compiler/\_\_init\_\_.py} & 1\,300 & 门面：参数校验、后端包装、装饰器形式 \\
+\texttt{compiler/\_core/api.py} & 1\,065 & 入口、运行时缓存、区域编译编排 \\
+\texttt{compiler/\_core/aot.py} & 1\,177 & 前后向图分割器（最小割、重算策略） \\
+\texttt{compiler/\_core/aot\_autograd.py} & 812 & 联合图捕获、前后向分别编译、运行时封装 \\
+\texttt{compiler/\_core/registry.py} & 449 & 后端注册表与能力契约 \\
+\texttt{compiler/\_core/guards.py} & 303 & 特化守卫的构造、求值与失配解释 \\
+\texttt{compiler/\_core/region\_cache.py} & 212 & 捕获图的持久化缓存 \\
+\texttt{compiler/\_core/common.py} & 120 & \texttt{AotAutograd} 包装器 \\
+\texttt{graph/tracer.py} & 835 & 图捕获 \\
+\texttt{graph/passes/decompose.py} & 781 & 名字级算子分解 \\
+\texttt{\_decomp/decompositions.py} & 2\,777 & 过载级算子分解 \\
+\midrule
+前端合计（\texttt{\_core}） & 4\,257 & \\
+分解合计（\texttt{\_decomp}） & 3\,168 & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{两个入口与后端契约}
+
+\texttt{tensorplay.compile} 与 \texttt{tensorplay.compiler.compile} 是两个不同的函数对象：前者由 \texttt{tensorplay/\_\_init\_\_.py:618} 直接从 \texttt{compiler.\_core} 重导出，绕过门面；后者定义在 \texttt{compiler/\_\_init\_\_.py:1057}，额外负责旋钮校验、适配器式函数包装与捕获根克隆。实测 \texttt{tp.compile is tp.compiler.compile} 为假。门面路径做的事是：校验 12 个旋钮（\texttt{compiler/\_\_init\_\_.py:1074--1116}）、把可调用对象拆成 \texttt{(model, record)}、按配置补默认值、用适配器补丁后的全局量克隆出捕获根（\texttt{compiler/\_\_init\_\_.py:991--1026}），然后交给 \texttt{\_core.compile}。
+
+后端解析只有两步（\texttt{\_core/api.py:364--365}）：默认后端取 \texttt{get\_default\_backend()}（即字符串 \texttt{"stax"}，\texttt{registry.py:78}），再由 \texttt{lookup\_backend} 解析成函数。契约是一行字（\texttt{registry.py:2--4}）：
+
+\begin{lstlisting}[caption={后端契约。}, label=lst:fe:contract, style=pystyle]
+backend(graph_module, example_inputs, **options) -> callable
+# Backends do not capture Python and do not own graph-break policy.
+\end{lstlisting}
+
+注册表只登记后端，不登记算子，也不登记 pass。三个来源：显式 \texttt{register\_backend}、内建后端（\texttt{compiler/backends/builtins.py:8--40}，含 \texttt{stax}、\texttt{tvm}、\texttt{cudagraphs}、\texttt{onnxrt}），以及入口点组 \texttt{tensorplay\_compiler\_backends}（\texttt{registry.py:83}）。实测默认可见后端为 5 个：\texttt{cudagraphs}、\texttt{onnxrt}、\texttt{stax}、\texttt{tensorrt}、\texttt{tvm}。名字拼错时抛出的异常同时继承 \texttt{ValueError} 与 \texttt{RuntimeError}，并给出两个最接近的候选（\texttt{registry.py:95--106}）：
+
+\begin{lstlisting}[caption={后端名错误的诊断（\texttt{registry.py:98--105}）。}, label=lst:fe:badbackend, style=pystyle]
+message = f"Invalid backend: {name!r}"
+if self.suggestions:
+    message += f", did you mean: {', '.join(map(repr, self.suggestions))}?"
+else:
+    message += "."
+message += " See `tensorplay.compiler.list_backends()` for available backends."
+\end{lstlisting}
+
+能力契约是加性的：\texttt{BackendCapabilities}（\texttt{registry.py:50--68}）携带 \texttt{optional\_deps}、\texttt{contract\_version}、\texttt{min\_core\_version}、\texttt{max\_core\_version}。契约版本高于核心实现时立即拒绝，并说明该升级核心还是该换后端（\texttt{registry.py:262--267}）；开发版与 nightly 版本号跳过版本比较（\texttt{registry.py:254--256}）。
+
+\subsection{捕获：把 Python 函数变成图}
+
+捕获器是 \texttt{graph/tracer.py} 的 \texttt{Tracer}，前端一律以 \texttt{Tracer(execute=True)} 建立（\texttt{\_core/api.py:822}）——\texttt{execute=True} 意味着被捕获的函数真的被执行一遍，执行过程中的每次算子调用被记成节点。图不是从字节码反推的，也不是靠代理对象猜的：\texttt{body\_value} 的文档（\texttt{tracer.py:402--412}）说明了为什么“看着函数执行”才是对的——在代理对象上调用的方法是那个方法，而在真值上做的运算是那个运算，只有后者命名了工作。
+
+捕获有三条硬约束，都以错误而非回退的形式给出：
+
+\begin{enumerate}[nosep, leftmargin=1.2em]
+\item \texttt{*args} 与 \texttt{**kwargs} 不支持（\texttt{tracer.py:446--448}），因为它们会让占位符与形参的对应关系跑到签名之外。
+\item 未被登记为形参的具体实参被拒绝（\texttt{tracer.py:450--456}），否则它会在图外被固化。
+\item 捕获期间程序的副作用必须回滚：输入张量由 \texttt{\_preserve\_input\_values}（\texttt{api.py:767--801}）快照并 \texttt{copy\_} 复原，模块参数与缓冲区由 \texttt{\_preserve\_module\_state}（\texttt{api.py:741--764}）复原。捕获不是一次无副作用的观察，它是一次真实的执行。
+\end{enumerate}
+
+捕获同时记录两类元数据，它们之后各有用途：\texttt{meta["metadata\_touches"]} 记录被读取过的属性名（\texttt{tracer.py:527--528}），供守卫提升使用；\texttt{meta["data\_specializations"]} 记录依赖张量内容的读取（\texttt{tracer.py:529--532}）。
+
+以一个含三个复合算子的函数为例，实测捕获结果是：
+
+\begin{lstlisting}[caption={捕获结果（实测 \texttt{graph} 文本）。占位符名即形参名，元数据写在节点上。}, label=lst:fe:captured, style=pystyle]
+def g(x):
+    return x.softplus() + x.sigmoid() * 2.0 + tp.sqrt(x * x + 1.0)
+
+graph(
+    %x : [num_users=3] = placeholder[target=x]
+    %softplus shape=(8, 16) : [num_users=1] = call_method[target=softplus](args = (%x,), kwargs = {})
+    %sigmoid shape=(8, 16) : [num_users=1] = call_method[target=sigmoid](args = (%x,), kwargs = {})
+    %mul    shape=(8, 16) : [num_users=1] = call_function[target=operator.mul](args = (%sigmoid, 2.0), kwargs = {})
+    %add    shape=(8, 16) : [num_users=1] = call_function[target=operator.add](args = (%softplus, %mul), kwargs = {})
+    %mul_0  shape=(8, 16) : [num_users=1] = call_function[target=operator.mul](args = (%x, %x), kwargs = {})
+    %add_0  shape=(8, 16) : [num_users=1] = call_function[target=operator.add](args = (%mul_0, 1.0), kwargs = {})
+    %sqrt   shape=(8, 16) : [num_users=1] = call_function[target=tensorplay.functional.sqrt](args = (%add_0,), kwargs = {})
+    %add_1  shape=(8, 16) : [num_users=1] = call_function[target=operator.add](args = (%add, %sqrt), kwargs = {})
+    return add_1
+)
+\end{lstlisting}
+
+注意这里\textbf{没有任何分解}：图里就是 \texttt{softplus} 与 \texttt{sigmoid} 两个复合节点。分解发生在下一步，由一个显式的 pass 完成，而不是在捕获时顺带发生。把两者分开的原因是可测性：捕获只回答“程序做了什么”，pass 只回答“把它改写成什么”。
+
+\subsection{规范化流水线：六个 pass 与它们的顺序}
+
+捕获之后是固定的六步流水线（\texttt{\_core/api.py:848--857}），顺序不是偏好而是契约：
+
+\begin{lstlisting}[caption={默认规范化流水线（\texttt{\_core/api.py:848--857}）。}, label=lst:fe:passes, style=pystyle]
+pass_result = PassManager(
+    [
+        NormalizeOperators(),
+        ConstFold(),
+        DecomposePass(),
+        CSEPass(get_CSE_banned_ops()),
+        DeadCodeElimination(),
+        PointwiseFusionHint(),
+    ]
+)(graph_module)
+\end{lstlisting}
+
+\begin{table}[H]
+\centering
+\caption{六个 pass 的位置与理由。}
+\label{tab:fe:passes}
+\small
+\begin{tabular}{lll}
+\toprule
+顺序 & Pass & 为什么在这个位置 \\
+\midrule
+1 & \texttt{NormalizeOperators} & 先把拼写归一（同义算子、out 变体），后面的分析才有一份确定的算子名 \\
+2 & \texttt{ConstFold} & 常量折叠要在分解之前：先折掉能折的，剩下的结构才值得改写 \\
+3 & \texttt{DecomposePass} & 复合算子在此落到基元集合（\S\ref{sec:fe:decomp}） \\
+4 & \texttt{CSEPass} & \emph{在分解之后}：两个 \texttt{gelu} 站点各自展开出的 \texttt{erf} 链必须能合并成一条 \\
+5 & \texttt{DeadCodeElimination} & 分解会制造死节点（被替换节点的旧结果），删掉它们 \\
+6 & \texttt{PointwiseFusionHint} & 最后盖章：它看到的必须是最终图 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+第 4 步的顺序是这一段里唯一容易写错的地方。源码注释把它写成了可见的契约（\texttt{api.py:840--847}）：“CSE runs after decomposition so shared sub-chains across rewritten composites collapse too (two gelu sites share one erf chain)”。若把 CSE 提前，展开后的重复链不会被识别，融合收益直接消失。
+
+CSE 对 27 个算子条目禁用（\texttt{get\_CSE\_banned\_ops}，\texttt{graph/passes/dialect/common/cse\_pass.py:38}）。实测该集合包含 \texttt{dropout}、\texttt{\_fused\_dropout}、\texttt{\_standard\_gamma}、\texttt{bernoulli}、\texttt{binomial}、\texttt{multinomial}、\texttt{normal}、\texttt{poisson}、\texttt{rrelu}、\texttt{rand}、\texttt{rand\_like}、\texttt{randn}、\texttt{randint}、\texttt{randperm}、\texttt{native\_dropout}，以及就地算子 \texttt{add\_}、\texttt{sub\_}、\texttt{mul\_}、\texttt{div\_}、\texttt{pow\_}、\texttt{lerp\_}、\texttt{relu\_}、\texttt{sigmoid\_}、\texttt{tanh\_}、\texttt{dropout\_}、\texttt{rrelu\_}。判据是语义而非性能：这些算子每次调用都是一次新的抽样，或者写回它们的参数，合并两次调用等于改变程序。
+
+\subsection{分解：两套机制、两个时刻}
+\label{sec:fe:decomp}
+
+“分解”在本框架里有两个实现，服务两个不同的时刻。把它们混为一谈是读这套代码最容易犯的错。
+
+\subsubsection{过载级表：给捕获器看的}
+
+\texttt{tensorplay/\_decomp/} 是一张以\textbf{算子过载}为键的表，定义写在 \texttt{\_decomp/\_\_init\_\_.py:1--18} 的模块文档里：一个分解用其它算子表达一个算子过载；捕获器查表并记录分解函数所分派的算子，而不是被分解的那个，因此后端只需要为剩下的算子准备内核。
+
+注册用装饰器 \texttt{register\_decomposition}（\texttt{\_decomp/\_\_init\_\_.py:91--122}），接受过载、算子包（包内所有过载）或它们的嵌套列表；同一过载重复注册是错误（\texttt{\_decomp/\_\_init\_\_.py:111}）。注册时还会给函数套一层 \texttt{\_without\_out}（\texttt{\_decomp/\_\_init\_\_.py:64--88}），让函数式分解也能服务 \texttt{out=} 变体：先算结果，再按 out 变体的契约把目标 \texttt{resize\_} 到结果的形状、写入，并返回目标本身。
+
+表按阶段分成两张（\texttt{\_decomp/\_\_init\_\_.py:37--43}）：\texttt{post\_autograd}（图里已经含有反向，必须不依赖自动微分）与 \texttt{pre\_autograd}（在自动微分看到程序之前运行）。实测 \texttt{post\_autograd} 表有 \textbf{297} 条，\texttt{pre\_autograd} 表有 \textbf{0} 条——即当前所有分解都属于前一阶段。\texttt{core\_decompositions()}（\texttt{\_decomp/\_\_init\_\_.py:160--172}）返回其中所有\emph{不带} \texttt{core} 标签的条目，实测 \textbf{279} 条，也就是这张表把程序降到了 18 个核心过载上。表~\ref{tab:fe:decomptags} 给出标签分布。
+
+\begin{table}[H]
+\centering
+\caption{297 条过载级分解的标签分布（实测）。}
+\label{tab:fe:decomptags}
+\small
+\begin{tabular}{rl}
+\toprule
+标签 & 条数 \\
+\midrule
+\texttt{pointwise} & 77 \\
+\texttt{core} & 18 \\
+\texttt{reduction} & 14 \\
+\texttt{view\_copy} & 11 \\
+\texttt{nondeterministic\_seeded} & 4 \\
+\texttt{maybe\_aliasing\_or\_mutating} & 1 \\
+\midrule
+合计 & 297 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+那 18 个核心过载是：\texttt{elu}、\texttt{gelu}、\texttt{hardtanh}、\texttt{leaky\_relu}、\texttt{fill.Scalar}、\texttt{col2im}、\texttt{native\_dropout}、\texttt{native\_group\_norm}、\texttt{native\_group\_norm\_backward}、\texttt{native\_layer\_norm\_backward}、\texttt{embedding\_dense\_backward}、\texttt{select\_scatter}、\texttt{reflection\_pad1d/2d/3d}、\texttt{replication\_pad2d/3d}、\texttt{upsample\_bilinear2d.vec}。
+
+\subsubsection{名字级改写：给 pass 用的}
+
+\texttt{graph/passes/decompose.py} 是另一套：它以\textbf{语义算子名}为键，改写已经捕获好的图，并且在 \texttt{call\_method} 与 \texttt{call\_function} 两个站点都触发（\texttt{decompose.py:19--21}），这样 \texttt{x.softplus()} 与 \texttt{nn.functional.softplus(x)} 会收敛到同一条链。
+
+实测这张表有 \textbf{34} 条规则。它的设计目标是“把每个算子乘上原生编译的覆盖面，而不新增任何内核”（\texttt{decompose.py:8--16}）：所有改写都落到 \texttt{add/sub/mul/div/pow/neg/exp/log/sqrt/tanh/relu/sigmoid/square} 加标量常数，以及比较与 \texttt{where} 组成的 select 族（\texttt{elu}、\texttt{selu}、\texttt{gelu}、\texttt{leaky\_relu}、\texttt{relu6}、\texttt{hardtanh}、\texttt{hardsigmoid}、\texttt{hardshrink}、\texttt{softshrink}、\texttt{threshold}、\texttt{clamp}）。实测同一函数过一遍 \texttt{DecomposePass} 的前后：
+
+\begin{lstlisting}[caption={\texttt{DecomposePass} 前后（实测 \texttt{PassResult.modified=True}）。}, label=lst:fe:decomp, style=pystyle]
+% 之前
+%softplus = call_method[target=softplus](%x)
+%sqrt     = call_function[target=tensorplay.functional.sqrt](%add_0)
+
+% 之后
+%exp   = call_method[target=exp](%x)
+%add_2 = call_function[target=operator.add](%exp, 1)
+%log   = call_method[target=log](%add_2)
+%sigmoid = call_method[target=sigmoid](%x)     % 不在改写表里，保留
+%sqrt  = call_function[target=tensorplay.functional.sqrt](%add_0)  % 不变
+\end{lstlisting}
+
+改写器本体在 \texttt{decompose.py:691--726}，四个决定值得记住：
+
+\begin{enumerate}[nosep, leftmargin=1.2em]
+\item \textbf{规则可以拒绝。} 规则返回原节点表示“这份拼写我不表达”，原算子留给后端处理或回退。例：\texttt{elu} 在 \texttt{scale} 或 \texttt{input\_scale} 不为 1 时直接返回原节点（\texttt{decompose.py:355--356}）；\texttt{gelu} 的 \texttt{approximate} 既非 \texttt{"none"} 也非 \texttt{"tanh"} 时返回原节点（\texttt{decompose.py:397--398}）；\texttt{threshold} 带 \texttt{inplace=True} 时返回原节点（\texttt{decompose.py:478--479}）。
+\item \textbf{out= 调用被跳过。} 规则构造的是新的函数式结果，而 \texttt{out=} 调用必须写它的目标（\texttt{decompose.py:708--712}）。
+\item \textbf{替换必须插在被替换节点之前。} \texttt{with graph.inserting\_before(node)} 保证新链排在原位之前（\texttt{decompose.py:715--716}），否则新节点会排在它的用户之后。
+\item \textbf{有融合内核的复合算子留在原地。} \texttt{\_FUSED\_COMPOSITES = frozenset({"silu"})}（\texttt{decompose.py:738}），实际改写表由 \texttt{\_DECOMP\_METHODS} 减去它得到（\texttt{decompose.py:742--746}）。
+\end{enumerate}
+
+\begin{tpnote}[注：改写的收益是覆盖面，不是局部速度]
+\texttt{decompose.py} 的开头把收益算得很清楚：一条小的基元集合覆盖很宽的算子面，于是每条改写规则都在\emph{不新增任何内核}的前提下扩大了原生编译的覆盖面；反过来，把一个已经有融合内核的复合算子展开，会把一次内存遍历换成好几次。这条权衡同时解释了 \texttt{\_FUSED\_COMPOSITES} 与下面第 3 点的存在。
+\end{tpnote}
+
+\subsubsection{行归一化分解：默认关闭}
+
+softmax、\texttt{log\_softmax} 与 \texttt{group\_norm} 有对应的展开规则（实测三条），但它们被放在单独的表 \texttt{\_ROW\_NORM\_METHODS} 里，由 \texttt{DecomposeRowNormalizations} 这个可选 pass 驱动（\texttt{decompose.py:766--775}），不在默认流水线里。原因写在 \texttt{decompose.py:506--513}：这些复合算子本身已经是单个融合内核，而且各自带梯度规则，展开成基元链买不到覆盖面，却要付可见的代价——在联合前后向捕获里，链引入的每个中间量都要物化到反向读取为止，而逐基元的梯度需要指数输出、和与商，而融合梯度只需要输入。
+
+\begin{tpexample}[例：group\_norm 展开为行统计]
+规则见 \texttt{decompose.py:617--688}。把每组的通道与空间范围折进一个行轴：\texttt{flatten(1)} 得到 \texttt{(n, C*spatial)}，\texttt{unflatten} 把它看成 \texttt{(n, g, C/g, spatial)}，于是行统计就是对 \texttt{[2,3]} 的 \texttt{sum}；末尾再 \texttt{flatten(1,2)} 折回逐通道布局，让逐通道仿射广播一个 \texttt{(1, C, 1)} 视图。规则会先检查形状（\texttt{C \% g} 必须为 0、空间范围非空），不满足就返回原节点。
+\end{tpexample}
+
+\subsubsection{随机性：把生成器改写成位置}
+
+\texttt{\_decomp/decompositions\_for\_rng.py}（209 行）处理一件不同的事。它的文档（\texttt{decompositions\_for\_rng.py:1--13}）给出理由：生成器的答案取决于已经被问过多少次，所以一张随机算子图被问两次会给两个不同答案，两者无法比较。这里的做法是\emph{按位置读}——一个 \texttt{(seed, offset)} 对命名流里的一个点，在那里读无论之前读过多少都给同样的值，并把流被读到多远交回去，好让下一次读从后面开始。
+
+这些分解让随机算子被写成“这次读”加上“图携带的偏移”，而不是一个会去查运行总计的调用。偏移被携带在图里，这正是随机算子图可复现的原因：图是每次读发生位置的记录。它们在 \texttt{op\_lowerings.py:300--308} 处被合并进捕获期的分解表，合并而非分开的理由写在同一处：被捕获的图本就应当用“按位置读”来表达，而分开保留是为了让一次读可以向框架要值而不让框架把这次要求展开成另一次读。
+
+\begin{tpdef}[两套分解表的分工]
+\begin{tabular}{lll}
+\toprule
+ & 过载级（\texttt{\_decomp}） & 名字级（\texttt{decompose.py}） \\
+\midrule
+键 & 算子过载对象 & 语义算子名字 \\
+消费者 & 捕获器（记录时查表） & \texttt{PassManager}（改写已捕获的图） \\
+时刻 & 捕获之前 & 捕获之后 \\
+触发站点 & 过载被调用处 & \texttt{call\_method} 与 \texttt{call\_function} 两处 \\
+拒绝方式 & 表中没有该过载即跳过 & 规则返回原节点 \\
+实测规模 & 297 条过载，18 个核心 & 名字级 34 条，另有 3 条按需启用 \\
+\bottomrule
+\end{tabular}
+\end{tpdef}
+
+\subsection{AOT：前后向如何被分开又如何被编译}
+
+\subsubsection{先看清问题：这里是联合图，不是分裂图}
+
+很多实现里“AOT 自动微分”指的是先各自捕获前向与反向两张图。TensorPlay 不是这样。\texttt{aot\_autograd.py:12--19} 的模块文档写明：前向与它的反向被\textbf{一起}捕获，进入一张联合图，反向节点与切线（tangent）输入在图上被标记 \texttt{is\_backward}。分裂发生在联合捕获之后的 \texttt{partition\_fn} 里，而不是之前。
+
+理由是别名与可变性的正确性只能在联合图上判定：前向写进某个存储、反向从同一存储读出，这件事只有在两张图的节点出现在同一张图里时才看得见。
+
+\subsubsection{七个步骤}
+
+入口是 \texttt{aot\_function}（\texttt{aot\_autograd.py:328--541}）。设 \texttt{primals} 为前向输入、\texttt{tangents} 为其伴随：
+
+\begin{table}[H]
+\centering
+\caption{\texttt{aot\_function} 的步骤与行号。}
+\label{tab:fe:aotsteps}
+\small
+\begin{tabular}{rlll}
+\toprule
+\# & 位置 & 动作 & 不变式 \\
+\midrule
+1 & \texttt{:342--382} & 容器展平：任一非张量参数里含张量则整体展平，按叶子重编译 & 调用点嵌套形状必须与编译时一致，否则报错 \\
+2 & \texttt{:384--390} & 缺省补齐：\texttt{bw\_compiler}、\texttt{inference\_compiler}、\texttt{partition\_fn} 各有缺省 & 无 \\
+3 & \texttt{:388--390} & 判定 \texttt{needs\_grad}：全局微分开且存在 \texttt{requires\_grad} 输入 & 二者缺一即走推理分支 \\
+4 & \texttt{:392--407} & 推理：\texttt{no\_grad()} 下捕前向、功能化、只编前向 & 产物不带任何反向 \\
+5 & \texttt{:418--420} & 训练：捕联合图（前向、反向与切线占位符） & 切线占位符插在第一个非占位符节点之前（\texttt{:227--233}） \\
+6 & \texttt{:421--429} & 功能化、切线克隆、掩码，然后 \texttt{partition\_fn(joint, primals+tangents)} & 分割器返回 5 元组 \\
+7 & \texttt{:441} 与 \texttt{:504--508} & 前向立即编译；反向惰性编译 & 反向产物在第一次反向时才生成 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+第 7 步的惰性是刻意的：\texttt{aot\_autograd.py:609--615} 的文档说，一个经由包装器发来的查询会拿到产物的“当前答案”，包括“反向走了哪条路”——前提是已经跑过一次反向。因此 \texttt{\_AotForward} 这个包装器存在的理由就是把这个“当前答案”如实报出来，而不是在编译时把结论写死。
+
+\subsubsection{分割：保存什么、重算什么}
+
+\texttt{partition\_fn} 的默认实现是 \texttt{aot.py} 里的 \texttt{partition\_min\_cut}（\texttt{aot.py:825--983}）。前端在训练区域上包装的是 \texttt{min\_cut\_rematerialization\_partition}（\texttt{api.py:730--738}），并附带一条注释里的决定：“保留最便宜的那一份前向值，让反向在自己的循环里重算其余的，而不是让前向写下反向要读的每一个值”。
+
+最小割建模如下。源点 \texttt{"\_\_S\_\_"}、汇点 \texttt{"\_\_T\_\_"}（\texttt{aot.py:680}）；每个节点被切成 \texttt{name\_in} 与 \texttt{name\_out} 两个点，割掉这条边就意味着“这个值不在前向写出来”。边权由 \texttt{weight()} 给（\texttt{aot.py:672--678}）：只为“写出来给别人看”而存在的值代价翻倍，并按它到第一个反向读者的距离膨胀 \texttt{1.1 ** min(dist,100)}（\texttt{aot.py:677}）。三类边的容量是 \texttt{\_INF = float("inf")}（\texttt{aot.py:477}）：不可切割的、被反向无论如何都要读的、以及被显式禁用的。
+
+禁用原因只有三个字符串，写在 \texttt{aot.py:653--665}：\texttt{"not a cheap operation"}、\texttt{"in memory in the backward anyway"}、\texttt{"a reduction"}。归约的判据是 \texttt{\_nbytes(node) * 4 < inputs}（\texttt{aot.py:663}）——归约的结果通常很小，存下来比重算便宜。启发式再额外禁两类：离反向读者太远的（\texttt{aot.py:712--743}），以及超过融合链地平线的链尾（\texttt{fw\_order[cur] > start\_order + 100}，\texttt{aot.py:758}）。若汇点只能经 \texttt{\_INF} 边到达，函数返回 \texttt{None}，调用方退回 \texttt{partition\_default}，即“全存”（\texttt{aot.py:765--776}、\texttt{aot.py:864--865}）。
+
+流算法是 Edmonds--Karp：BFS 增广路，复杂度 $O(V\cdot E^2)$，残量反向弧就地改写容量（\texttt{aot.py:785--822}）。选它而不是更复杂的算法，是因为这里的图通常只有几十个节点，而可读的代码在这个规模上比常数因子更重要。
+
+\begin{tppitfall}[陷阱：memory\_budget 被接受但被忽略]
+\texttt{partition\_min\_cut} 的签名带 \texttt{memory\_budget} 参数，文档字符串（\texttt{aot.py:840--841}）说明它“为会传一个进来的调用方而接受”，而割永远是“运行起来最便宜的那一个”。因此传预算不会改变结果；若需要按预算选割，必须改这个函数而不是改调用方。同类不一致还有一处：\texttt{partition\_default} 的文档承诺返回第 6 个元素 \texttt{leaf\_targets}，但两个分割器实际都只返回 5 个（\texttt{aot.py:449--455}、\texttt{aot.py:977--983}）。
+\end{tppitfall}
+
+表~\ref{tab:fe:aottables} 给出 \texttt{aot.py} 里的字面表规模；这些都是实测计数，它们决定“能被自动微分的是什么”。
+
+\begin{table}[H]
+\centering
+\caption{\texttt{aot.py} 的判据表（实测）。}
+\label{tab:fe:aottables}
+\small
+\begin{tabular}{llrl}
+\toprule
+表 & 位置 & 规模 & 作用 \\
+\midrule
+\texttt{\_LEAF\_OPS} & \texttt{:24} & 2 & \texttt{placeholder}、\texttt{get\_attr}，即图里没有生产者的节点 \\
+\texttt{\_RULES} & \texttt{:234--279} & 21 & 逐元素 VJP 规则（5 个函数式二元、2 个函数式索引、7 个方法式算术、7 个方法式一元） \\
+\texttt{\_RECOMPUTABLE\_OPS} & \texttt{:458--475} & 16 & 精确到 \texttt{(op,target)} 的可重算集合 \\
+\texttt{\_RECOMPUTABLE\_NAMES} & \texttt{:483--500} & 111 & 按名字的可重算集合 \\
+\texttt{\_VIEW\_NAMES} & \texttt{:503--506} & 12 & 视图算子，重算代价几乎为零 \\
+\texttt{\_RANDOM\_NAMES} & \texttt{:510} & 3 & 可融合但永不重算：再算一次是另一次抽样 \\
+\texttt{\_INF} 与 \texttt{\_FAR} & \texttt{:477}、\texttt{:513} & --- & 无限容量边与远距离哨兵 $10^{9}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+可重算判定分三层（\texttt{aot.py:530--538}）：先查 \texttt{(op,target)} 精确集合，再查名字集合，最后看 \texttt{"pointwise" in target.tags}。第三层是关键——它在不新增内核的情况下把大量逐元素算子纳入可重算，而这是最小割能切出好解的前提。
+
+\subsubsection{实测：一次训练编译产出的三张图}
+
+对 \texttt{h(a,b) = (a @ b).relu().tanh().sum()}，两个 \texttt{requires\_grad} 输入，实测产物是一个 \texttt{\_AotForward}，它同时携带三张图（\texttt{aot\_autograd.py:538--540} 的 \texttt{\_tensorplay\_aot\_graphs}）以及两个路线标签 \texttt{\_tensorplay\_codegen} 与 \texttt{\_tensorplay\_backward\_codegen}，实测二者均为 \texttt{"stax-cpu"}。反向后 \texttt{A.grad} 的范数为 \texttt{5.847685813903809}。
+
+联合图（实测，已省略 \texttt{shape} 元数据）：
+
+\begin{lstlisting}[caption={联合图：前向与反向在同一个图里，反向节点带 \texttt{is\_backward} 标记。}, label=lst:fe:joint, style=pystyle]
+%primals_1 = placeholder      %primals_2 = placeholder      %tangents_1 = placeholder
+%matmul             = tp.matmul(%primals_1, %primals_2)
+%relu               = tp.relu(%matmul)
+%detach             = tp.detach(%relu)
+%tanh               = tp.tanh(%relu)
+%sum_0              = tp.sum(%tanh, dtype=undefined)
+%expand             = tp.expand(%tangents_1, [4, 16], implicit=False)
+%tanh_backward      = tp.tanh_backward(%expand, %tanh)
+%threshold_backward = tp.threshold_backward(%tanh_backward, %detach, 0)
+%t                  = tp.t(%primals_2)
+%matmul_0           = tp.matmul(%threshold_backward, %t)
+%t_0                = tp.t(%primals_1)
+%matmul_1           = tp.matmul(%t_0, %threshold_backward)
+return (sum_0, matmul_0, matmul_1)
+\end{lstlisting}
+
+分割结果（实测，两个 \texttt{return} 行是关键差异）：
+
+\begin{lstlisting}[caption={前向图把 \texttt{relu} 的输出作为额外输出交出；反向图把它变成占位符并重算 \texttt{tanh} 与 \texttt{detach}。}, label=lst:fe:fwbw, style=pystyle]
+% --- fw ---
+%matmul = tp.matmul(%primals_1, %primals_2)
+%relu   = tp.relu(%matmul)              [num_users=2]
+%tanh   = tp.tanh(%relu)
+%sum_0  = tp.sum(%tanh, dtype=undefined)
+return (sum_0, relu)                    % relu 存下来给反向用
+
+% --- bw ---
+%primals_1, %primals_2, %tangents_1, %relu = placeholder
+%detach = tp.detach(%relu)               % 重算，不再是保存值
+%tanh   = tp.tanh(%relu)                 % 重算
+%expand = tp.expand(%tangents_1, [4, 16], implicit=False)
+%tanh_backward = tp.tanh_backward(%expand, %tanh)
+%threshold_backward = tp.threshold_backward(%tanh_backward, %detach, 0)
+%matmul_0 = tp.matmul(%threshold_backward, %t(%primals_2))
+%matmul_1 = tp.matmul(%t(%primals_1), %threshold_backward)
+return (matmul_0, matmul_1)
+\end{lstlisting}
+
+这是最小割的一次具体裁决：保存 \texttt{relu} 的输出（一份 $4\times16$ 的张量），换取在反向里省掉一次 \texttt{tanh} 与一次 \texttt{detach} 的重算；两个 \texttt{matmul} 的梯度则各自重算转置。反向侧的位置绑定是\emph{按位置}而非按名字的（\texttt{aot\_autograd.py:303--325}），文档说明了原因：被分割出去的一半会自己建占位符并重新命名，所以切线创建时带的那个名字不是任何东西持有的键；切线创建的顺序就是那一半读取它们的顺序。
+
+\subsubsection{运行时的保存与释放}
+
+前向把用户输出与保存值一起返回，再由 \texttt{CompiledFunction.forward} 切开（\texttt{aot\_autograd.py:456--490}）。保存走 \texttt{ctx.save\_for\_backward}（\texttt{aot\_autograd.py:465}），理由写在 \texttt{aot\_autograd.py:460--463}：经由上下文保存，引擎释放图时就会释放它们；挂在上下文上的一个列表对引擎是不可见的。切线槽位存的是 \texttt{(shape, dtype, device)} 三元组而不是张量本身（\texttt{aot\_autograd.py:478--483}），理由是持有输出张量会形成“输出 $\to$ 梯度节点 $\to$ 上下文 $\to$ 输出”的引用环，而 Python 收集器看不穿底层节点。反向结束时把上下文清空（\texttt{aot\_autograd.py:517--519}）。
+
+\subsubsection{状态提升：参数与缓冲区是显式输入}
+
+编译出来的前向要看到调用方的参数，而不是编译时的一份拷贝。\texttt{aot\_autograd.py:725--797} 的 \texttt{\_state\_access} 负责这件事，注释在 \texttt{aot\_autograd.py:690--694}：生成的前向会先经过模块自己的 \texttt{\_parameters} 与 \texttt{\_buffers} 解析 \texttt{get\_attr}，然后才到根，所以只写到根上的状态永远到不了那些读取点。因此状态被写进三处：图模块自己的 \texttt{\_\_dict\_\_}、\texttt{\_graph\_attrs}、以及参数与缓冲区表。字面张量被提升成 \texttt{\_lifted\_tensor\_i} 的 \texttt{get\_attr} 节点并按 \texttt{id} 去重（\texttt{aot\_autograd.py:644--684}），这样梯度能回到原来那些张量上。
+
+\subsection{守卫：什么必须重新决定}
+\label{sec:fe:guards}
+
+\subsubsection{键的四元组}
+
+特化缓存的键是四元组（\texttt{api.py:500--505}）：
+
+\begin{table}[H]
+\centering
+\caption{特化键的四个槽位。}
+\label{tab:fe:key}
+\small
+\begin{tabular}{cll}
+\toprule
+槽 & 内容 & 构造函数 \\
+\midrule
+0 & \texttt{\_input\_signature(args, kwargs, dynamic)} & \texttt{api.py:115--126}，张量签名见 \texttt{api.py:57--87} \\
+1 & \texttt{("shape-guards", ...)} & \texttt{\_guard\_component}，\texttt{api.py:402--422} \\
+2 & 控制流闸门的结果 & \texttt{\_make\_gate\_evaluator}，\texttt{api.py:974--1028} \\
+3 & \texttt{(\_grad\_enabled(),)} & \texttt{\_grad\_state\_component}，\texttt{api.py:132--145} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+张量签名是六元组 \texttt{("tensor", type, shape, repr(dtype), repr(device), requires\_grad)}（\texttt{api.py:80--87}）。动态模式把形状塌成秩（\texttt{api.py:68}）：形状分量变成 \texttt{("dynamic", 2)}，于是 \texttt{(3,4)}、\texttt{(5,7)}、\texttt{(9,2)} 共用一个特化。
+
+第 3 槽的设计理由值得单独引用（\texttt{api.py:132--138}）：一个在自动微分开启下捕获的区域会给它的输出接上反向；用翻转后的状态（或反过来）重放它，会在错误的自动微分契约下把输出交给调用者，因此这个状态是每个特化键的一部分，而且每次调用都要读。
+
+\subsubsection{守卫是键的投影}
+
+模块文档把这句话写在最前面（\texttt{guards.py:6--17}）：TensorPlay 的特化缓存以结构化元数据签名（类型、形状、dtype、设备、\texttt{requires\_grad}）为键，本模块从这些签名导出\emph{表达式对象}，使得每个条件都可内省、求值是记忆化的编译比较而不是每次未命中都拼元组、并且一次未命中可以对着每条已存链解释，给出确切失败的那些表达式——“\emph{缓存键本身不变；守卫是它的投影}”。
+
+守卫对象是四个字段的冻结数据类（\texttt{guards.py:27--39}）：\texttt{path}、\texttt{expr}、\texttt{expected}、\texttt{actual}。张量字段名在 \texttt{guards.py:83} 写死为 \texttt{("pytype", "shape", "dtype", "device", "requires\_grad")}。实测一条 \texttt{compile} 后的守卫渲染：
+
+\begin{lstlisting}[caption={实测守卫渲染（\texttt{GuardChain.guards}）。}, label=lst:fe:guards, style=pystyle]
+inputs[0][0].pytype        | inputs[0][0].pytype == <class 'tensorplay.Tensor'>
+inputs[0][0].shape         | inputs[0][0].shape == (4, 8)
+inputs[0][0].dtype         | inputs[0][0].dtype == 'tensorplay.float32'
+inputs[0][0].device        | inputs[0][0].device == 'cpu'
+inputs[0][0].requires_grad | inputs[0][0].requires_grad == True
+inputs[0][1].shape         | inputs[0][1].shape == (8, 16)
+grad-state                 | ambient autograd state matches the captured state
+\end{lstlisting}
+
+键本身（实测，训练区域）：
+
+\begin{lstlisting}[caption={实测特化键。}, label=lst:fe:keydump, style=pystyle]
+(((('tensor', <class 'tensorplay.Tensor'>, (4, 8), 'tensorplay.float32', 'cpu', True),
+   ('tensor', <class 'tensorplay.Tensor'>, (8, 16), 'tensorplay.float32', 'cpu', True)), ()),
+ (), (), (True,))
+\end{lstlisting}
+
+\subsubsection{形状守卫的提升会清空缓存}
+
+捕获暴露出元数据读取或控制流闸门时，键会长出新的槽位，此时整个缓存被丢弃（\texttt{api.py:553--570}），以便条目以统一形式存储。提升的判据在 \texttt{\_SHAPE\_GUARD\_ATTRS}（\texttt{api.py:971}），提取函数是 \texttt{\_extract\_shape\_guard\_params}（\texttt{api.py:1031--1046}），取值集合为 \texttt{shape}、\texttt{len}、\texttt{ndim}。文档（\texttt{api.py:1032--1037}）说明理由：对 \texttt{x.shape[0]} 分支会把分支的一侧固化进图，所以动态模式的缓存条目只有在该占位符形状不变时才可复用；而 dtype、设备与读取不需要额外守卫，它们本来就在每个特化签名里。
+
+控制流闸门的求值器把闸门结果作为键的一部分（\texttt{api.py:1017--1024}）：图内的闸门节点保持符号，其具体值不会打散复用；而普通 \texttt{int()} 与 \texttt{float()} 的消费会把常量固化进产物，因此\textbf{必须}进键。
+
+\subsubsection{未命中：解释，然后重编译}
+
+未命中不是错误。流程（\texttt{api.py:515--534}）：先对每条已存链求 \texttt{explain} 并收集失配原因，把它们挂到 \texttt{\_tensorplay\_last\_recompile\_reasons} 上，然后在开启 \texttt{verbose} 或设置了环境变量 \texttt{TP\_LOG\_RECOMPILES} 时发出警告（原因串最多显示 4 条，多余的折叠为 \texttt{(+N more)}，\texttt{guards.py:296--303}），最后在累计次数超过上限时抛出累计上限错误（\texttt{api.py:533}）。实测一次形状变化的失配报告：
+
+\begin{lstlisting}[caption={实测重编译原因。}, label=lst:fe:recompile, style=pystyle]
+WARN: recompiling 'f': inputs[0][0][2][0] == 1; inputs[0][0][2][1] == 1
+Guard(path='inputs[0][0][2][0]', expr='inputs[0][0][2][0] == 1', expected=1, actual=2)
+Guard(path='inputs[0][0][2][1]', expr='inputs[0][0][2][1] == 1', expected=1, actual=2)
+\end{lstlisting}
+
+热路径另有一条更便宜的探测：\texttt{\_arg\_fingerprint}（\texttt{api.py:204--232}）对张量取 \texttt{(id, version)}，对标量取值，其余取 \texttt{id}；注释写明这套指纹在稳态编译调用时间里约占 40\%，且就地修改会抬高版本计数，所以一个缓存键的组成不会跨一次修改被复用。
+
+\subsection{区域缓存：把捕获结果留在磁盘上}
+
+前端第一步就查盘（\texttt{api.py:815}），命中就完全跳过捕获与规范化。键的构造在 \texttt{region\_cache.py:103--132}，按顺序哈希六项：域分隔串、模式版本 \texttt{"2"}（\texttt{region\_cache.py:44}）、\texttt{tensorplay.\_\_version\_\_}、程序戳、模块状态指纹、签名各部分的 \texttt{repr}，输出 64 位十六进制 SHA-256。
+
+\begin{lstlisting}[caption={区域键的构造（\texttt{region\_cache.py:120--132}）。}, label=lst:fe:regionkey, style=pystyle]
+h.update(b"tensorplay-region\x00")          # 域分隔
+h.update(_SCHEMA_VERSION.encode())          # "2"
+h.update(tensorplay.__version__.encode())
+program = _program_stamp(program)           # getsource + __qualname__
+if program is not None:
+    h.update(program)
+state = _state_fingerprint(module)          # 参数与缓冲区的字节
+if state is not None:
+    h.update(state)
+for part in signature_parts:
+    h.update(repr(part).encode())
+    h.update(b"\x00")
+return h.hexdigest()
+\end{lstlisting}
+
+程序戳基于 \texttt{inspect.getsource} 加限定名（\texttt{region\_cache.py:50--64}），读不到源码时返回 \texttt{None}，该区域即视为不可缓存。状态指纹遍历 \texttt{named\_parameters()} 与 \texttt{named\_buffers()}，对每个张量哈希名字、形状与 dtype、以及原始字节（\texttt{region\_cache.py:80--100}）。
+
+存的是\emph{捕获后的 \texttt{GraphModule}} 本身，且是在形状传播与后端之前——捕获结果与后端无关。实测布局为 \texttt{.tp\_cache/kernels/capture-region/<key 前两位>/<key>.gmp}，后端名与扩展名分别是 \texttt{"capture-region"} 与 \texttt{"gmp"}（\texttt{region\_cache.py:46--47}）。
+
+三条必须写下来的性质：
+
+\begin{enumerate}[nosep, leftmargin=1.2em]
+\item \textbf{重绑定是必需的。} 存下来的条目携带模块的一份拷贝，因此加载后必须把参数与缓冲区指回调用方的活对象，否则梯度、优化器步与滑动统计的更新都到不了调用者的模块（\texttt{region\_cache.py:146--175}，注释在 \texttt{region\_cache.py:150--152}）。
+\item \textbf{全程 best-effort。} 任何加载或存储失败都退化为一次普通捕获，绝不退化为错误结果（\texttt{region\_cache.py:25--28}）；实现里有三处独立的宽异常捕获。
+\item \textbf{没有淘汰，也没有锁。} 写入从不删除条目，\texttt{region\_cache} 自身零同步；写入经过内核缓存（内部对每次操作持有 \texttt{flock}），跨进程竞争退化为“后写者胜”——在这里是安全的，因为键由内容导出，两位写者写的是同一张图。增长只由不同的“源码、状态、签名”三元组决定。
+\end{enumerate}
+
+\subsection{运行时：谁真正被调用}
+
+前端返回的\textbf{不是} Python 慢路径 \texttt{optimized}（\texttt{api.py:447}），而是一个 C 层分发器：\texttt{api.py:598--600} 用 \texttt{\_stax\_native.make\_call\_dispatcher(optimized)} 把它包起来并返回。绑定侧文档在 \texttt{src/bindings/python/Stax.cpp:290--306}，调用路径是 \texttt{call\_dispatcher\_call}（\texttt{Stax.cpp:307--315}）：已绑定的快路径走 \texttt{d->fast}，否则走 \texttt{d->python\_entry}。
+
+稳态调用的顺序是（\texttt{api.py:447--596}）：先问 C 分发器要一张只读证书 \texttt{tpx\_fingerprint\_matches}（一次 C 探测循环取代 Python 的 \texttt{(id, version)} 遍历）；命中记忆化的 \texttt{last\_quick\_parts} 时连元数据读取与闸门重放都跳过；否则在锁内查缓存，未命中则解释、重编译、入库。最后若产物带 \texttt{\_fast\_call} 且本次调用无关键字参数，就把快路径绑到分发器上并直接返回（\texttt{api.py:591--596}）。绑定的快路径携带它被解析时的自动微分状态，状态翻转时退回慢路径（\texttt{api.py:437--444}）——因为参数指纹看不见环境里的自动微分状态。
+
+\subsection{失败模式一览}
+
+表~\ref{tab:fe:failures} 汇总这一层会给出的拒绝，每一条都是显式的，不是静默回退。
+
+\begin{table}[H]
+\centering
+\caption{前端拒绝与诊断（错误串逐字引用）。}
+\label{tab:fe:failures}
+\small
+\begin{tabular}{ll}
+\toprule
+条件 & 消息与位置 \\
+\midrule
+签名含 \texttt{*args} 或 \texttt{**kwargs} & \texttt{varargs and varkw arguments are not supported by this compiler frontend}（\texttt{tracer.py:447}） \\
+具体实参不是形参 & \texttt{concrete arguments ... are not parameters of the traced callable}（\texttt{tracer.py:452}） \\
+捕获失败 & \texttt{TensorPlay could not capture the requested compiler region}（\texttt{api.py:861}） \\
+占位符缺样例值 & \texttt{missing sample value for graph placeholder '...'}（\texttt{api.py:899}） \\
+后端返回不可调用 & \texttt{compiler backend returned ...; expected a callable}（\texttt{api.py:931}） \\
+后端名无效 & \texttt{Invalid backend: '...', did you mean: ...?}（\texttt{registry.py:98--105}） \\
+后端缺可选依赖 & \texttt{backend '...' is missing optional dependencies: ...}（\texttt{registry.py:291--293}） \\
+契约版本过高 & \texttt{implements backend-contract revision N, but this TensorPlay core implements up to revision M}（\texttt{registry.py:263--267}） \\
+特化数超限 & \texttt{TensorPlay compile specialization limit reached}（\texttt{api.py:512}） \\
+累计重编译超限 & \texttt{TensorPlay accumulated recompilation limit reached}（\texttt{api.py:533}） \\
+反向产物缺输入 & \texttt{compiled region is missing a value for captured argument '...'}（\texttt{backend.py:304--307}） \\
+容器嵌套形状变化 & \texttt{compiled region called with arguments nested differently ...}（\texttt{aot\_autograd.py:368--371}） \\
+无梯度规则 & \texttt{no derivative registered for ...}（\texttt{aot.py:1115--1117}） \\
+常量输出求导 & \texttt{constant outputs cannot be differentiated}（\texttt{aot.py:1092}） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  font=\scriptsize,
+  stage/.style={draw,rounded corners=2pt,thick,align=center,inner sep=3pt,minimum height=8mm},
+  io/.style={draw,dashed,align=center,inner sep=3pt}
+]
+\node[stage, fill=tpblue!8, draw=tpblue] (py) {Python 函数\\\scriptsize\texttt{model}};
+\node[stage, right=5mm of py, fill=tpblue!8, draw=tpblue] (tr) {捕获\\\scriptsize\texttt{Tracer(execute=True)}};
+\node[stage, right=5mm of tr, fill=tpblue!8, draw=tpblue] (gm) {\texttt{GraphModule}\\\scriptsize 占位符=形参};
+\node[stage, right=5mm of gm, fill=tporange!8, draw=tporange] (pass) {六个 pass\\\scriptsize 归一、折叠、分解、CSE、删死、提示};
+\node[stage, right=5mm of pass, fill=tporange!8, draw=tporange] (aot) {AOT\\\scriptsize 联合图分割};
+\node[stage, right=5mm of aot, fill=tpgreen!8, draw=tpgreen] (be) {后端\\\scriptsize\texttt{stax(...)}};
+\node[stage, fill=tpgreen!12, draw=tpgreen, right=5mm of be] (art) {产物\\\scriptsize\texttt{\_tensorplay\_codegen}};
+
+\draw[-{Stealth[length=1.6mm]}, thick] (py) -- (tr);
+\draw[-{Stealth[length=1.6mm]}, thick] (tr) -- (gm);
+\draw[-{Stealth[length=1.6mm]}, thick] (gm) -- (pass);
+\draw[-{Stealth[length=1.6mm]}, thick] (pass) -- (aot);
+\draw[-{Stealth[length=1.6mm]}, thick] (aot) -- (be);
+\draw[-{Stealth[length=1.6mm]}, thick] (be) -- (art);
+
+\node[io, fill=gray!6, draw=gray, below=9mm of gm] (rc) {区域缓存\\\scriptsize \texttt{capture-region/*.gmp}\\\scriptsize SHA-256 内容键};
+\node[io, fill=gray!6, draw=gray, below=9mm of aot] (gd) {守卫链\\\scriptsize 四元组键、形状守卫、闸门};
+\node[io, fill=gray!6, draw=gray, below=9mm of be] (fwb) {前向产物\\\scriptsize 反向惰性编译};
+\node[io, fill=gray!6, draw=gray, below=9mm of art] (disp) {C 分发器\\\scriptsize\texttt{make\_call\_dispatcher}};
+
+\draw[->, thick, dashed, tporange!80!black] (gm) -- (rc);
+\draw[->, thick, dashed, tporange!80!black] (rc.west) -- ++(-5mm,0) |- (tr.south);
+\draw[->, thick, dashed, tporange!80!black] (aot) -- (gd);
+\draw[->, thick, dashed, tporange!80!black] (gd) -- (fwb);
+\draw[->, thick, dashed, gray] (art) -- (disp);
+\node[below=1mm of rc, font=\scriptsize\itshape, text=gray!70!black] {命中则跳过捕获与全部 pass};
+\end{tikzpicture}
+\caption{编译器前端管线。实线是编译期一次性流过的阶段，虚线是跨调用持久的状态。}
+\label{fig:fe:pipeline}
+\end{figure}
+
+\subsection{小结}
+
+前端只做三件事，且每件都可独立验证：把 Python 变成一张带占位符的图并让它规范化；把需要梯度时的那张图变成前后两个可调用产物，代价由最小割决定；把“这次调用的形状是什么”变成一个可以解释、可以重编译、可以跨进程复用的键。它不做的事同样重要：它不猜后端会需要什么形状的缓冲（那是后端的内存规划），不决定循环怎么排（那是调度器），也不在失败时假装成功——\texttt{strict\_native} 让降级成为一次显式的编译错误，见\S\ref{sec:compile:backend}。下一章接手被规范化之后的图。
