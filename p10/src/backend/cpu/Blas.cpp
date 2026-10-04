@@ -444,7 +444,10 @@ Tensor vdot_cpu(const Tensor& a_in, const Tensor& b_in) {
     const bool is64 = dt == DType::Float64;
     double total = 0;
     {
-        static std::mutex combine_mutex;
+        // Per-thread partial sums combined serially: no lock on the workers,
+        // and the fixed lane order keeps the sum deterministic.
+        const int nthreads = std::max(1, get_num_threads());
+        std::vector<double> partials(static_cast<size_t>(nthreads), 0.0);
         parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
             double part = 0;
             if (is64) {
@@ -456,9 +459,9 @@ Tensor vdot_cpu(const Tensor& a_in, const Tensor& b_in) {
                 const float* bp = b32.data_ptr<float>();
                 for (int64_t i = begin; i < end; ++i) part += static_cast<double>(ap[i]) * bp[i];
             }
-            std::lock_guard<std::mutex> lock(combine_mutex);
-            total += part;
+            partials[static_cast<size_t>(get_thread_num())] += part;
         });
+        for (double part : partials) total += part;
     }
     if (dt == DType::Float64) {
         result.data_ptr<double>()[0] = total;

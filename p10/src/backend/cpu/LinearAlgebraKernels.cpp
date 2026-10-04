@@ -1895,17 +1895,19 @@ Tensor dot_kernel(const Tensor& self, const Tensor& other) {
 
     const int64_t n = self.numel();
     Tensor result = Tensor::empty({}, self.dtype(), self.device());
+    // Per-thread partial sums combined serially: no lock on the workers, and
+    // the fixed lane order keeps the reduction deterministic.
+    const int nthreads = std::max(1, parallel::get_num_threads());
     const auto accumulate = [&](auto&& body) {
         using Acc = decltype(body(int64_t{0}));
-        Acc total{};
+        std::vector<Acc> partials(static_cast<size_t>(nthreads), Acc{});
         parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
             Acc part{};
             for (int64_t i = begin; i < end; ++i) part += body(i);
-            // Serial combine keeps the reduction deterministic.
-            static std::mutex m;
-            std::lock_guard<std::mutex> lock(m);
-            total += part;
+            partials[static_cast<size_t>(parallel::get_thread_num())] += part;
         });
+        Acc total{};
+        for (const auto& part : partials) total += part;
         return total;
     };
 
