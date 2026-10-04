@@ -426,6 +426,37 @@ def _triple(x):
         return (x, x, x)
     return tuple(x)
 
+
+def _conv_padding_mode(input, padding, stride, dilation, weight, ndim):
+    """A padding spelled as a word instead of a count of cells.
+
+    ``"valid"`` pads nothing.  ``"same"`` keeps every output position, which
+    only holds at unit stride, and asks the padding to cover the kernel's
+    reach: that reach split evenly, with an odd cell going to the trailing
+    side.  A per-axis count pads both sides alike, so the trailing excess is
+    put on the input up front -- nothing on the leading side, the difference
+    on the trailing side -- and the convolution keeps the leading count.
+    """
+    if padding == "valid":
+        return input, [0] * ndim
+    if padding != "same":
+        raise ValueError(f"invalid padding string: {padding!r}")
+    if any(s != 1 for s in stride):
+        raise ValueError(
+            "padding='same' is not supported for strided convolutions"
+        )
+    pairs = []
+    for axis in range(ndim):
+        reach = dilation[axis] * (weight.size(2 + axis) - 1)
+        lead = reach // 2
+        pairs.append((lead, reach - lead))
+    if any(lead != trail for lead, trail in pairs):
+        excess = []
+        for lead, trail in reversed(pairs):
+            excess.extend((0, trail - lead))
+        input = pad(input, excess)
+    return input, [lead for lead, _ in pairs]
+
 def conv1d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
     r"""Applies a 1D convolution over an input signal composed of several input planes.
 
@@ -437,7 +468,7 @@ def conv1d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
         bias: optional bias of shape :math:`(\text{out\_channels})`. Default: ``None``
         stride: the stride of the convolving kernel. Can be a single number or
           a one-element tuple `(sW,)`. Default: 1
-        padding: implicit paddings on both sides of the input. Can be a single number or a one-element tuple `(padW,)`. Default: 0
+        padding: implicit paddings on both sides of the input. Can be a single number, a one-element tuple `(padW,)`, ``'valid'`` for no padding, or ``'same'`` to keep every output position (unit stride only). Default: 0
         dilation: the spacing between kernel elements. Can be a single number or
           a one-element tuple `(dW,)`. Default: 1
         groups: split input into groups, :math:`\text{in\_channels}` should be divisible by
@@ -449,6 +480,10 @@ def conv1d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
         >>> filters = tp.randn(20, 16, 5)
         >>> F.conv1d(inputs, filters)
     """
+    if isinstance(padding, str):
+        stride = _single(stride)
+        dilation = _single(dilation)
+        input, padding = _conv_padding_mode(input, padding, stride, dilation, weight, 1)
     captured = _capture_call(conv1d, (input, weight, bias, stride, padding, dilation, groups), {})
     if captured is not None:
         return captured
@@ -470,7 +505,7 @@ def conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
         bias: optional bias tensor of shape :math:`(\text{out\_channels})`. Default: ``None``
         stride: the stride of the convolving kernel. Can be a single number or a
           tuple `(sH, sW)`. Default: 1
-        padding: implicit paddings on both sides of the input. Can be a single number or a tuple `(padH, padW)`. Default: 0
+        padding: implicit paddings on both sides of the input. Can be a single number, a tuple `(padH, padW)`, ``'valid'`` for no padding, or ``'same'`` to keep every output position (unit stride only). Default: 0
         dilation: the spacing between kernel elements. Can be a single number or
           a tuple `(dH, dW)`. Default: 1
         groups: split input into groups, both :math:`\text{in\_channels}` and :math:`\text{out\_channels}`
@@ -484,8 +519,11 @@ def conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
         >>> F.conv2d(inputs, filters, padding=1)
     """
     stride = _pair(stride)
-    padding = _pair(padding)
     dilation = _pair(dilation)
+    if isinstance(padding, str):
+        input, padding = _conv_padding_mode(input, padding, stride, dilation, weight, 2)
+    else:
+        padding = _pair(padding)
     captured = _capture_call(
         conv2d,
         (input, weight, bias, stride, padding, dilation, groups),
@@ -508,7 +546,7 @@ def conv3d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
         bias: optional bias tensor of shape :math:`(\text{out\_channels})`. Default: ``None``
         stride: the stride of the convolving kernel. Can be a single number or a
           tuple `(sD, sH, sW)`. Default: 1
-        padding: implicit paddings on both sides of the input. Can be a single number or a tuple `(padD, padH, padW)`. Default: 0
+        padding: implicit paddings on both sides of the input. Can be a single number, a tuple `(padD, padH, padW)`, ``'valid'`` for no padding, or ``'same'`` to keep every output position (unit stride only). Default: 0
         dilation: the spacing between kernel elements. Can be a single number or
           a tuple `(dD, dH, dW)`. Default: 1
         groups: split input into groups, both :math:`\text{in\_channels}` and :math:`\text{out\_channels}`
@@ -521,6 +559,10 @@ def conv3d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
         >>> inputs = tp.randn(1, 4, 5, 5, 5)
         >>> F.conv3d(inputs, filters, padding=1)
     """
+    if isinstance(padding, str):
+        stride = _triple(stride)
+        dilation = _triple(dilation)
+        input, padding = _conv_padding_mode(input, padding, stride, dilation, weight, 3)
     captured = _capture_call(conv3d, (input, weight, bias, stride, padding, dilation, groups), {})
     if captured is not None:
         return captured
