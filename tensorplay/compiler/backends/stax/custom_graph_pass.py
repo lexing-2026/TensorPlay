@@ -9,7 +9,7 @@ from tensorplay.graph import Graph, GraphModule, Node
 
 
 if TYPE_CHECKING:
-    from tensorplay.compiler.backends.stax.codegen.simd import NodeInfo
+    from .codegen.simd import NodeInfo
     from .scheduler import BaseSchedulerNode
 
 

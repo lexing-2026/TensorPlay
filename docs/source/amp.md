@@ -29,13 +29,12 @@ datatype of `tensorplay.bfloat16` only uses {class}`tensorplay.autocast`.
 `tensorplay.cuda.amp.GradScaler(args...)` and `tensorplay.cpu.amp.GradScaler(args...)` is deprecated. Please use `tensorplay.amp.GradScaler("cuda", args...)` or `tensorplay.amp.GradScaler("cpu", args...)` instead.
 :::
 :::{warning}
-When combining AMP with `tensorplay.compile`, note that the default
-`backward_pass_autocast` setting is
-`"same_as_forward"`. This assumes the compiled backward runs under the same
-autocast context as the compiled forward. If you follow AMP's recommended
-training pattern and run backward outside autocast, set
-`backward_pass_autocast` to `"off"` for the
-compiled region.
+When combining AMP with `tensorplay.compile`, note that a backward op runs in
+the same type autocast chose for the corresponding forward op. This assumes
+the compiled backward runs under the same autocast context as the compiled
+forward. If you follow AMP's recommended training pattern and run backward
+outside autocast, use {func}`tensorplay.amp.custom_bwd` on the backward method
+so it re-enters the forward's autocast state explicitly.
 :::
 {class}`tensorplay.autocast` and {class}`tensorplay.cpu.amp.autocast` are new in version `1.10`.
 ```{contents}
