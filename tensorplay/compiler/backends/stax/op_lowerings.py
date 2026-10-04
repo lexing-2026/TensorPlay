@@ -4447,7 +4447,7 @@ def _spatial_ndim() -> int:
     return 3 if "3d" in target_name(V.current_node.target) else 2
 
 
-def _upsample_nearestnd(x, output_size, ndim, **kwargs):
+def _upsample_nearestnd(x, output_size, ndim, exact=False, **kwargs):
     """Nearest upsampling as an index remap of the source.
 
     Each output element reads the input element the scale maps it to, so the
@@ -4455,7 +4455,14 @@ def _upsample_nearestnd(x, output_size, ndim, **kwargs):
     with whatever consumes it instead of standing on its own.
 
     ``ndim`` is how many trailing axes are spatial, which is what says how much
-    of the output size is a size rather than a leading extent.
+    of the output size is a size rather than a leading extent.  ``exact``
+    picks the flavor of the mapping: the plain one anchors the sample at the
+    output position itself, the exact one at the midpoint between positions,
+    so the same extent can read a different source element under the two.
+
+    The exact mapping is carried out in integer arithmetic — the output
+    position is doubled on both sides so the half stays a whole number —
+    where a float scale could round a boundary position the wrong way.
     """
 
     size, dtype, device = val_info(node_val())
@@ -4465,42 +4472,72 @@ def _upsample_nearestnd(x, output_size, ndim, **kwargs):
     prefix = in_size[:-ndim]
 
     def reindex(index):
-        # Nearest maps output position i to floor(i / scale) of the input.
-        return [
-            *index[: len(prefix)],
-            *[
-                FloorDiv(
-                    as_index(index[len(prefix) + axis]) * i, sympy.Integer(o)
-                )
-                for axis, (i, o) in enumerate(zip(in_spatial, out_spatial))
-            ],
-        ]
+        # Plain: floor(i * in / out); exact: floor((i + 1/2) * in / out).
+        out = []
+        for axis, (i, o) in enumerate(zip(in_spatial, out_spatial)):
+            at = as_index(index[len(prefix) + axis])
+            if exact:
+                out.append(FloorDiv((2 * at + 1) * i, sympy.Integer(2 * o)))
+            else:
+                out.append(FloorDiv(at * i, sympy.Integer(o)))
+        return [*index[: len(prefix)], *out]
 
     return make_view(x, size, reindex)
 
 
-@register("upsample_nearest2d.default", "_upsample_nearest_exact2d.default")
+def _no_scale_hint(scales):
+    # A scale handed alongside an extent is a hint the lowering cannot carry
+    # through the integer mapping; that call stays a boundary.
+    for scale in scales:
+        if scale is not None:
+            raise NotImplementedError("a scale handed alongside an extent")
+
+
+@register("upsample_nearest2d.default")
 def lower_upsample_nearest2d(x, output_size, scales_h=None, scales_w=None,
                             **kwargs):
+    _no_scale_hint((scales_h, scales_w))
     return _upsample_nearestnd(x, output_size, 2, **kwargs)
 
 
-@register("upsample_nearest3d.default", "_upsample_nearest_exact3d.default")
+@register("_upsample_nearest_exact2d.default")
+def lower_upsample_nearest_exact2d(x, output_size, scales_h=None,
+                                   scales_w=None, **kwargs):
+    _no_scale_hint((scales_h, scales_w))
+    return _upsample_nearestnd(x, output_size, 2, exact=True, **kwargs)
+
+
+@register("upsample_nearest3d.default")
 def lower_upsample_nearest3d(x, output_size, scales_d=None, scales_h=None,
                              scales_w=None, **kwargs):
+    _no_scale_hint((scales_d, scales_h, scales_w))
     return _upsample_nearestnd(x, output_size, 3, **kwargs)
 
 
-@register("upsample_nearest1d.default", "_upsample_nearest_exact1d.default")
+@register("_upsample_nearest_exact3d.default")
+def lower_upsample_nearest_exact3d(x, output_size, scales_d=None,
+                                   scales_h=None, scales_w=None, **kwargs):
+    _no_scale_hint((scales_d, scales_h, scales_w))
+    return _upsample_nearestnd(x, output_size, 3, exact=True, **kwargs)
+
+
+@register("upsample_nearest1d.default")
 def lower_upsample_nearest1d(x, output_size, scales_d=None, **kwargs):
+    _no_scale_hint((scales_d,))
     return _upsample_nearestnd(x, output_size, 1, **kwargs)
+
+
+@register("_upsample_nearest_exact1d.default")
+def lower_upsample_nearest_exact1d(x, output_size, scales_d=None, **kwargs):
+    _no_scale_hint((scales_d,))
+    return _upsample_nearestnd(x, output_size, 1, exact=True, **kwargs)
 
 
 @register("_upsample_nearest_exact1d.vec", "_upsample_nearest_exact2d.vec",
           "_upsample_nearest_exact3d.vec")
 def lower_upsample_nearest_exact_vec(x, output_size, scale_factors=None,
                                      **kwargs):
-    """The bundled spelling of a nearest upsampling, along every spatial axis.
+    """The bundled spelling of a nearest-exact upsampling, every spatial axis.
 
     The bundled call carries one scale where the axis-by-axis call carries
     one per axis; the extent it works on is what the operation's own name
@@ -4511,7 +4548,7 @@ def lower_upsample_nearest_exact_vec(x, output_size, scale_factors=None,
     if not output_size:
         raise NotImplementedError("a scale given without an extent")
     ndim = int(target_name(V.current_node.target).split(".")[0][-2])
-    return _upsample_nearestnd(x, output_size, ndim, **kwargs)
+    return _upsample_nearestnd(x, output_size, ndim, exact=True, **kwargs)
 
 
 def _prod_ints(values) -> int:
