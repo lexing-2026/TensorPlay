@@ -474,19 +474,7 @@ static Tensor empty_scalar_result(const Tensor& self, DType dt) {
 
 template<typename Op, typename MklOp>
 Tensor binary_op_kernel_impl(const Tensor& self, const Tensor& other, Op op, MklOp mkl_op, bool use_mkl_op = false, bool force_float = false) {
-    std::vector<int64_t> out_shape;
-    try {
-        out_shape = broadcast_shapes(self.sizes(), other.sizes());
-    } catch (const std::exception& e) {
-        std::cout << "DEBUG: broadcast_shapes failed in binary_op_kernel_impl: " << e.what() << std::endl;
-        std::cout << "Self shape: ";
-        for (auto s : self.shape()) std::cout << s << " ";
-        std::cout << std::endl;
-        std::cout << "Other shape: ";
-        for (auto s : other.shape()) std::cout << s << " ";
-        std::cout << std::endl;
-        throw;
-    }
+    std::vector<int64_t> out_shape = broadcast_shapes(self.sizes(), other.sizes());
     DType result_dtype = native::result_type(self, other);
     if (force_float && isIntegralType(result_dtype, true)) {
         result_dtype = DType::Float32;
@@ -751,20 +739,8 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) 
             if (match) {
                  // Optimization: Treat as contiguous 1D array
                  auto md = std::static_pointer_cast<dnnl::memory::desc>(self_impl->get_onednn_md());
-                 
-                 std::vector<int64_t> out_shape;
-                 try {
-                     out_shape = broadcast_shapes(self.sizes(), other.sizes());
-                 } catch (const std::exception& e) {
-                     std::cout << "DEBUG: broadcast_shapes failed in add_kernel (OneDNN): " << e.what() << std::endl;
-                     std::cout << "Self shape: ";
-                     for (auto s : self.shape()) std::cout << s << " ";
-                     std::cout << std::endl;
-                     std::cout << "Other shape: ";
-                     for (auto s : other.shape()) std::cout << s << " ";
-                     std::cout << std::endl;
-                     throw;
-                 }
+
+                 std::vector<int64_t> out_shape = broadcast_shapes(self.sizes(), other.sizes());
 
                  DType result_dtype = promoteTypes(self.dtype(), other.dtype());
                  if (alpha.isFloatingPoint() && !isFloatingType(result_dtype)) {
@@ -1711,20 +1687,8 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, const Scalar& alph
     if (other.is_sparse()) {
         return add_sparse_to_dense_cpu(self, other, alpha);
     }
-    std::vector<int64_t> out_shape;
-    try {
-        out_shape = broadcast_shapes(self.sizes(), other.sizes());
-    } catch (const std::exception& e) {
-        std::cout << "DEBUG: broadcast_shapes failed in add_inplace_kernel: " << e.what() << std::endl;
-        std::cout << "Self shape: ";
-        for (auto s : self.shape()) std::cout << s << " ";
-        std::cout << std::endl;
-        std::cout << "Other shape: ";
-        for (auto s : other.shape()) std::cout << s << " ";
-        std::cout << std::endl;
-        throw;
-    }
-    
+    std::vector<int64_t> out_shape = broadcast_shapes(self.sizes(), other.sizes());
+
     if (static_cast<std::vector<int64_t>>(self.shape()) != out_shape) {
         TP_THROW(RuntimeError, "output with shape " + self.shape().toString() + " doesn't match the broadcast shape " + Size(out_shape).toString());
     }
@@ -1785,11 +1749,7 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, const Scalar& alph
             
             dnnl::memory::dims dims = static_cast<std::vector<int64_t>>(self.shape());
             auto nchw_md = dnnl::memory::desc(dims, dnnl::memory::data_type::f32, dnnl::memory::format_tag::nchw);
-            
-            // Debug info
-            // std::cout << "DEBUG: Broadcasting unblock. Src dims: " << md->get_ndims() << " Dst dims: " << nchw_md.get_ndims() << std::endl;
-            // for(int i=0; i<md->get_ndims(); ++i) std::cout << md->get_dims()[i] << " "; std::cout << std::endl;
-            
+
             Tensor self_nchw = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
             auto src_mem = dnnl::memory(*md, eng, self.data_ptr<float>());
             auto dst_mem = dnnl::memory(nchw_md, eng, self_nchw.data_ptr<float>());
@@ -2403,20 +2363,13 @@ namespace {
 // integral tensors to Float32.
 inline DType scalar_result_dtype(DType self_dt, const Scalar& other,
                                  const Scalar* alpha = nullptr) {
-    const bool alpha_cplx = alpha && alpha->isComplex();
-    const bool alpha_float = alpha && alpha->isFloatingPoint();
-    if (isComplexType(self_dt)) return self_dt;
-    if (other.isComplex() || alpha_cplx) {
-        // Wrapped numbers participate weakly: the component width follows the
-        // TENSOR (float64 -> complex128, everything else -> complex64),
-        // never the scalar's own width.
-        return isFloatingType(self_dt) ? toComplexType(self_dt)
-                                       : DType::ComplexFloat;
+    DType dt = result_type(other, self_dt);
+    // A real or complex alpha scales the scalar in its own category, so it
+    // moves the result the way such a scalar would.
+    if (alpha != nullptr && (alpha->isFloatingPoint() || alpha->isComplex())) {
+        dt = result_type(*alpha, dt);
     }
-    if (!isFloatingType(self_dt) && (other.isFloatingPoint() || alpha_float)) {
-        return promoteTypes(self_dt, DType::Float32);
-    }
-    return self_dt;
+    return dt;
 }
 } // namespace
 
