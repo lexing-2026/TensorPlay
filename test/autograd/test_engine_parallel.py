@@ -86,14 +86,19 @@ class TestEngineParallel(unittest.TestCase):
     def test_no_leak_after_many_iterations(self):
         if not tp.cuda.is_available():
             self.skipTest("CUDA unavailable")
+        def step():
+            x = tp.ones([4, 4], device="cuda", requires_grad=True)
+            (x * 2.0).sum().backward()
+
+        # One step first: whatever the device sets up once, on first use, is
+        # not a leak, and is kept for the life of the process.
+        step()
+        gc.collect()
         tp.cuda.synchronize()
         tp.cuda.empty_cache()
         baseline = tp.cuda.memory_allocated()
         for _ in range(50):
-            x = tp.ones([4, 4], device="cuda", requires_grad=True)
-            y = (x * 2.0).sum()
-            y.backward()
-        del x, y
+            step()
         gc.collect()
         tp.cuda.synchronize()
         self.assertEqual(tp.cuda.memory_allocated(), baseline)
