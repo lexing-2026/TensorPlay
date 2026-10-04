@@ -367,3 +367,24 @@ def test_index_add_sums_every_repeat_of_an_index(dim, shape, n):
 def test_index_add_with_a_scalar_source_adds_it_everywhere_indexed():
     got = tp.zeros(3, 4).index_add(0, tp.tensor([0, 0, 2]), tp.tensor(1.0))
     assert tp.equal(got, tp.tensor([[2.0] * 4, [0.0] * 4, [1.0] * 4]))
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_bitwise_with_a_number_answers_in_the_pair_type(device):
+    # An integer number widens a boolean tensor to int64; against an integer
+    # tensor it, like a zero-dim tensor, keeps the tensor's own width.
+    b = tp.tensor([True, False, True], device=device)
+    i8 = tp.tensor([6, 3, 1], dtype=tp.int8, device=device)
+    cases = [
+        (b & 5, tp.int64, [1, 0, 1]),
+        (5 | b, tp.int64, [5, 5, 5]),
+        (b ^ 2, tp.int64, [3, 2, 3]),
+        (b << 2, tp.int64, [4, 0, 4]),
+        (b & True, tp.bool, [True, False, True]),
+        (2 << i8, tp.int8, [-128, 16, 4]),
+        (i8 & 5, tp.int8, [4, 1, 1]),
+        (tp.tensor(5, device=device) & i8, tp.int8, [4, 1, 1]),
+    ]
+    for got, dtype, values in cases:
+        assert got.dtype == dtype
+        assert got.cpu().tolist() == values

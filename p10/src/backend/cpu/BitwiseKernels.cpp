@@ -25,6 +25,7 @@
 #include "Exception.h"
 #include "Parallel.h"
 #include "TypePromotion.h"
+#include "TypeProperties.h"
 #include "cpu/vec/vec.h"
 
 #include <cstdint>
@@ -140,8 +141,10 @@ Tensor bitwise_binary_cpu(const Tensor& a_in, const Tensor& b_in, Pred pred, con
     std::vector<int64_t> out_shape = broadcast_shapes(
         static_cast<std::vector<int64_t>>(a_in.shape()),
         static_cast<std::vector<int64_t>>(b_in.shape()));
-    DType dt = promoteTypes(a_in.dtype(), b_in.dtype());
-    if (a_in.dtype() == DType::Bool && b_in.dtype() == DType::Bool) dt = DType::Bool;
+    // A zero-dim operand takes part by category only, as it does in every
+    // other binary operation: it widens a tensor of a lower category but never
+    // one of its own.
+    DType dt = native::result_type(a_in, b_in);
     if (dt != DType::Bool && !isIntegralType(dt)) {
         TP_THROW(TypeError, name, ": only integral and boolean types are supported");
     }
@@ -179,6 +182,10 @@ Tensor bitwise_binary_cpu(const Tensor& a_in, const Tensor& b_in, Pred pred, con
 
 template <typename Pred>
 Tensor bitwise_scalar_cpu(const Tensor& self_in, Scalar other, Pred pred, const char* name) {
+    // An integer scalar moves a boolean tensor to int64; a scalar of the
+    // tensor's own category leaves its type alone.
+    const DType dt = result_type(other, self_in.dtype());
+    if (dt != self_in.dtype()) return bitwise_scalar_cpu(self_in.to(dt), other, pred, name);
     bitwise_check_cpu(self_in, name);
     Tensor sc = self_in.contiguous();
     Tensor out = Tensor::empty(static_cast<std::vector<int64_t>>(self_in.shape()),
@@ -214,6 +221,8 @@ Tensor bitwise_scalar_cpu(const Tensor& self_in, Scalar other, Pred pred, const 
 
 template <bool kLeft>
 Tensor bitwise_shift_scalar_cpu(const Tensor& self_in, Scalar other, const char* name) {
+    const DType dt = result_type(other, self_in.dtype());
+    if (dt != self_in.dtype()) return bitwise_shift_scalar_cpu<kLeft>(self_in.to(dt), other, name);
     bitwise_check_cpu(self_in, name);
     const int64_t shift = other.to<int64_t>();
     Tensor sc = self_in.contiguous();
@@ -282,8 +291,10 @@ Tensor bitwise_shift_tensor_cpu(const Tensor& a_in, const Tensor& b_in, const ch
     std::vector<int64_t> out_shape = broadcast_shapes(
         static_cast<std::vector<int64_t>>(a_in.shape()),
         static_cast<std::vector<int64_t>>(b_in.shape()));
-    DType dt = promoteTypes(a_in.dtype(), b_in.dtype());
-    if (a_in.dtype() == DType::Bool && b_in.dtype() == DType::Bool) dt = DType::Bool;
+    // A zero-dim operand takes part by category only, as it does in every
+    // other binary operation: it widens a tensor of a lower category but never
+    // one of its own.
+    DType dt = native::result_type(a_in, b_in);
     if (dt != DType::Bool && !isIntegralType(dt)) {
         TP_THROW(TypeError, name, ": only integral and boolean types are supported");
     }
@@ -355,9 +366,9 @@ Tensor bitwise_rshift_scalar_cpu(const Tensor& a, const Scalar& b) {
 }
 
 // Scalar-first variants: materialize the scalar as a 0-dim tensor in the
-// tensor's dtype, then run the plain tensor-tensor kernel.  A floating or
-// complex scalar would move the result out of the integral domain, so it is
-// refused up front.
+// type the pair answers in, then run the plain tensor-tensor kernel.  A
+// floating or complex scalar would move the result out of the integral
+// domain, so it is refused up front.
 
 inline void bitwise_scalar_check_cpu(Scalar self, const char* name) {
     if (self.isBoolean() || self.isIntegral()) return;
@@ -368,34 +379,34 @@ inline void bitwise_scalar_check_cpu(Scalar self, const char* name) {
 Tensor bitwise_and_scalar_tensor_cpu(const Scalar& self, const Tensor& other) {
     bitwise_check_cpu(other, "bitwise_and");
     bitwise_scalar_check_cpu(self, "bitwise_and");
-    Tensor wrapped = Tensor::full({}, self, other.dtype(), other.device());
+    Tensor wrapped = Tensor::full({}, self, result_type(self, other.dtype()), other.device());
     return bitwise_binary_cpu(wrapped, other,
         [](auto x, auto y) { return static_cast<decltype(x)>(x & y); }, "bitwise_and");
 }
 Tensor bitwise_or_scalar_tensor_cpu(const Scalar& self, const Tensor& other) {
     bitwise_check_cpu(other, "bitwise_or");
     bitwise_scalar_check_cpu(self, "bitwise_or");
-    Tensor wrapped = Tensor::full({}, self, other.dtype(), other.device());
+    Tensor wrapped = Tensor::full({}, self, result_type(self, other.dtype()), other.device());
     return bitwise_binary_cpu(wrapped, other,
         [](auto x, auto y) { return static_cast<decltype(x)>(x | y); }, "bitwise_or");
 }
 Tensor bitwise_xor_scalar_tensor_cpu(const Scalar& self, const Tensor& other) {
     bitwise_check_cpu(other, "bitwise_xor");
     bitwise_scalar_check_cpu(self, "bitwise_xor");
-    Tensor wrapped = Tensor::full({}, self, other.dtype(), other.device());
+    Tensor wrapped = Tensor::full({}, self, result_type(self, other.dtype()), other.device());
     return bitwise_binary_cpu(wrapped, other,
         [](auto x, auto y) { return static_cast<decltype(x)>(x ^ y); }, "bitwise_xor");
 }
 Tensor bitwise_lshift_scalar_tensor_cpu(const Scalar& self, const Tensor& other) {
     bitwise_check_cpu(other, "bitwise_left_shift");
     bitwise_scalar_check_cpu(self, "bitwise_left_shift");
-    Tensor wrapped = Tensor::full({}, self, other.dtype(), other.device());
+    Tensor wrapped = Tensor::full({}, self, result_type(self, other.dtype()), other.device());
     return bitwise_shift_tensor_cpu<true>(wrapped, other, "bitwise_left_shift");
 }
 Tensor bitwise_rshift_scalar_tensor_cpu(const Scalar& self, const Tensor& other) {
     bitwise_check_cpu(other, "bitwise_right_shift");
     bitwise_scalar_check_cpu(self, "bitwise_right_shift");
-    Tensor wrapped = Tensor::full({}, self, other.dtype(), other.device());
+    Tensor wrapped = Tensor::full({}, self, result_type(self, other.dtype()), other.device());
     return bitwise_shift_tensor_cpu<false>(wrapped, other, "bitwise_right_shift");
 }
 

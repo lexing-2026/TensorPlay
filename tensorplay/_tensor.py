@@ -519,11 +519,18 @@ _BITWISE_NAMES = {
 }
 
 
+_COMMUTATIVE_BITWISE = frozenset({"and", "or", "xor"})
+
+
 def _bitwise_fn(name, reflect=False):
     def op(self, other):
         import tensorplay
         fn = getattr(tensorplay, _BITWISE_NAMES[name])
         if reflect:
+            # Order does not matter to and/or/xor, so the number stays a
+            # number; a shift needs it on the left, as a tensor.
+            if name in _COMMUTATIVE_BITWISE:
+                return fn(self, other)
             return fn(_as_tensor(other, device=self.device), self)
         return fn(self, other)
 
