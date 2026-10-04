@@ -158,3 +158,42 @@ if __name__ == "__main__":
     test_max_pool2d()
     test_linear()
     test_cross_entropy()
+
+
+def test_activations_in_double_keep_double_precision():
+    # A float64 activation and its gradient are computed in double: they agree
+    # with the closed forms to the last few bits, contiguous or strided.
+    import math
+    import tensorplay.nn.functional as F
+
+    xs = np.linspace(-4.5, 4.5, 37)
+    scale, alpha = 1.0507009873554805, 1.6732632423543772
+    cases = {
+        "elu": (lambda x: F.elu(x, 1.3),
+                lambda v: v if v > 0 else 1.3 * math.expm1(v),
+                lambda v: 1.0 if v > 0 else 1.3 * math.exp(v)),
+        "selu": (lambda x: F.selu(x),
+                 lambda v: scale * v if v > 0 else scale * alpha * math.expm1(v),
+                 lambda v: scale if v > 0 else scale * alpha * math.exp(v)),
+        "celu": (lambda x: F.celu(x, 0.7),
+                 lambda v: v if v > 0 else 0.7 * math.expm1(v / 0.7),
+                 lambda v: 1.0 if v > 0 else math.exp(v / 0.7)),
+        "softplus": (lambda x: F.softplus(x, 2.0, 5.0),
+                     lambda v: v if 2.0 * v > 5.0 else math.log1p(math.exp(2.0 * v)) / 2.0,
+                     lambda v: 1.0 if 2.0 * v > 5.0 else 1.0 / (1.0 + math.exp(-2.0 * v))),
+        "leaky_relu": (lambda x: F.leaky_relu(x, 0.2),
+                       lambda v: v if v >= 0 else 0.2 * v,
+                       lambda v: 1.0 if v > 0 else 0.2),
+        "silu": (lambda x: F.silu(x),
+                 lambda v: v / (1.0 + math.exp(-v)),
+                 lambda v: (1.0 / (1.0 + math.exp(-v))) * (1.0 + v * (1.0 - 1.0 / (1.0 + math.exp(-v))))),
+    }
+    for strided in (False, True):
+        base = tp.tensor(np.repeat(xs, 2) if strided else xs, dtype=tp.float64)
+        for name, (fn, value, slope) in cases.items():
+            x = (base[::2] if strided else base).detach().requires_grad_(True)
+            y = fn(x)
+            (g,) = tp.autograd.grad(y.sum(), [x])
+            for v, got_y, got_g in zip(xs, y.tolist(), g.tolist()):
+                assert abs(got_y - value(v)) <= 1e-13 * max(1.0, abs(value(v))), (name, v)
+                assert abs(got_g - slope(v)) <= 1e-13 * max(1.0, abs(slope(v))), (name, v)

@@ -97,10 +97,9 @@ inline bool avx512_available() {
 #endif
 }
 
-// f64 kernels whose scalar reference rounds intermediates through float
-// (double(float(x)) games); they stay on the AVX2 path which already
-// reproduces those semantics lane-for-lane.
-inline bool f64_rounding_sensitive(VOp op) {
+// f64 kernels only the AVX2 tier carries; the 512-bit double kernels have no
+// case for them, so they run there (or on the scalar loop) instead.
+inline bool f64_avx2_only(VOp op) {
     return op == VOp::Elu || op == VOp::Softplus || op == VOp::LeakyRelu ||
            op == VOp::Celu || op == VOp::Hardswish || op == VOp::Hardsigmoid;
 }
@@ -181,7 +180,7 @@ inline T scalar_apply(VOp op, VParams prm, T x) {
             const T negcoef = static_cast<T>(prm.p0); // alpha*scale
             const T poscoef = static_cast<T>(prm.p1); // scale
             const T negipt = static_cast<T>(prm.p2);  // input_scale
-            return x < T(0) ? static_cast<T>(std::expm1(static_cast<T>(float(x) * float(negipt))) * float(negcoef))
+            return x < T(0) ? static_cast<T>(std::expm1(x * negipt) * negcoef)
                             : x * poscoef;
         }
         case VOp::Softplus: {
@@ -189,22 +188,22 @@ inline T scalar_apply(VOp op, VParams prm, T x) {
             const T threshold = static_cast<T>(prm.p1);
             return x * beta > threshold
                 ? x
-                : static_cast<T>(std::log1p(std::exp(static_cast<float>(x * beta))) / prm.p0);
+                : static_cast<T>(std::log1p(std::exp(static_cast<T>(x * beta))) / prm.p0);
         }
         case VOp::Hardswish: {
-            T xf = static_cast<T>(static_cast<float>(x));
+            T xf = x;
             T clamped = (xf + T(3) < T(0)) ? T(0) : (xf + T(3) > T(6)) ? T(6) : xf + T(3);
             return xf * clamped / T(6);
         }
         case VOp::Hardsigmoid: {
-            T xf = static_cast<T>(static_cast<float>(x));
+            T xf = x;
             T v = xf + T(3);
             v = v < T(0) ? T(0) : (v > T(6) ? T(6) : v);
             return v / T(6);
         }
         case VOp::LeakyRelu: {
             const T slope = static_cast<T>(prm.p0);
-            T xf = static_cast<T>(static_cast<float>(x));
+            T xf = x;
             return xf < T(0) ? slope * xf : xf;
         }
         case VOp::Hardtanh: {
@@ -217,7 +216,7 @@ inline T scalar_apply(VOp op, VParams prm, T x) {
         }
         case VOp::Celu: {
             const T a = static_cast<T>(prm.p0);
-            T af = static_cast<T>(static_cast<float>(x));
+            T af = x;
             return af > T(0) ? af : static_cast<T>(static_cast<double>(a)) * (std::expm1(af / a));
         }
         default: return x;
@@ -581,27 +580,16 @@ inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
             const __m256d negcoef = _mm256_set1_pd(prm.p0);
             const __m256d poscoef = _mm256_set1_pd(prm.p1);
             const __m256d negipt = _mm256_set1_pd(prm.p2);
-            // Scalar f64 kernel: a = double(float(x)); expm1(float(a)*float(ipt))
-            // in double, times float(negcoef); positive branch a*poscoef.
-            __m256d xf = _mm256_cvtps_pd(_mm256_cvtpd_ps(x));
-            __m256d scaled = _mm256_mul_pd(xf, _mm256_cvtps_pd(_mm256_cvtpd_ps(negipt)));
-            __m256d neg = _mm256_mul_pd(tensorplay::tpsleef::expm1(scaled),
-                                        _mm256_cvtps_pd(_mm256_cvtpd_ps(negcoef)));
-            __m256d pos = _mm256_mul_pd(xf, poscoef);
-            return _mm256_blendv_pd(neg, pos, _mm256_cmp_pd(xf, _mm256_setzero_pd(), _CMP_GE_OQ));
+            __m256d scaled = _mm256_mul_pd(x, negipt);
+            __m256d neg = _mm256_mul_pd(tensorplay::tpsleef::expm1(scaled), negcoef);
+            __m256d pos = _mm256_mul_pd(x, poscoef);
+            return _mm256_blendv_pd(neg, pos, _mm256_cmp_pd(x, _mm256_setzero_pd(), _CMP_GE_OQ));
         }
         case VOp::Softplus: {
-            // Scalar f64: a = double(float(x)); threshold test on a*beta;
-            // numerator log1p(exp(float(a*beta))) computed in float, divided
-            // by beta (double), rounded once to T.
             const __m256d beta = _mm256_set1_pd(prm.p0);
             const __m256d threshold = _mm256_set1_pd(prm.p1);
-            __m256d xf = _mm256_cvtps_pd(_mm256_cvtpd_ps(x));
-            __m256d bt = _mm256_mul_pd(xf, beta);
-            __m128 btf4 = _mm256_cvtpd_ps(bt); // float(x*beta), all 4 lanes
-            __m256 btf8 = _mm256_insertf128_ps(_mm256_setzero_ps(), btf4, 0);
-            __m256d num = _mm256_cvtps_pd(
-                _mm256_castps256_ps128(tensorplay::tpsleef::log1p(tensorplay::tpsleef::exp(btf8))));
+            __m256d bt = _mm256_mul_pd(x, beta);
+            __m256d num = tensorplay::tpsleef::log1p(tensorplay::tpsleef::exp(bt));
             __m256d sp = _mm256_div_pd(num, beta);
             return _mm256_blendv_pd(sp, x, _mm256_cmp_pd(bt, threshold, _CMP_GT_OQ));
         }
@@ -620,11 +608,9 @@ inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
             return _mm256_div_pd(y, six);
         }
         case VOp::LeakyRelu: {
-            // Scalar f64: xf = double(float(x)); slope stays full double.
             const __m256d slope = _mm256_set1_pd(prm.p0);
-            __m256d xf = _mm256_cvtps_pd(_mm256_cvtpd_ps(x));
-            __m256d neg = _mm256_mul_pd(slope, xf);
-            return _mm256_blendv_pd(xf, neg, _mm256_cmp_pd(xf, _mm256_setzero_pd(), _CMP_LT_OQ));
+            __m256d neg = _mm256_mul_pd(slope, x);
+            return _mm256_blendv_pd(x, neg, _mm256_cmp_pd(x, _mm256_setzero_pd(), _CMP_LT_OQ));
         }
         case VOp::Hardtanh: {
             const __m256d lo = _mm256_set1_pd(prm.p0);
@@ -634,11 +620,9 @@ inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
         case VOp::Relu6:
             return _mm256_min_pd(_mm256_max_pd(x, zero), _mm256_set1_pd(6.0));
         case VOp::Celu: {
-            // Scalar f64: af = double(float(x)); alpha stays full double.
             const __m256d a = _mm256_set1_pd(prm.p0);
-            __m256d af = _mm256_cvtps_pd(_mm256_cvtpd_ps(x));
-            __m256d neg = _mm256_mul_pd(a, tensorplay::tpsleef::expm1(_mm256_div_pd(af, a)));
-            __m256d pos = _mm256_max_pd(_mm256_setzero_pd(), af);
+            __m256d neg = _mm256_mul_pd(a, tensorplay::tpsleef::expm1(_mm256_div_pd(x, a)));
+            __m256d pos = _mm256_max_pd(_mm256_setzero_pd(), x);
             __m256d minneg = _mm256_min_pd(neg, _mm256_setzero_pd());
             return _mm256_add_pd(pos, minneg);
         }
@@ -1164,19 +1148,18 @@ inline void run_f32(VOp op, VParams prm, const float* src, float* dst, int64_t b
 inline void run_f64(VOp op, VParams prm, const double* src, double* dst, int64_t b, int64_t e) {
 #ifdef TP_VECUNARY_SLEEF
 #if defined(CPU_CAPABILITY_AVX512)
-    // Tier-compiled copy (see run_f32).  The f64_rounding_sensitive ops keep
-    // their AVX2-only contract: route them through the scalar loop here the
-    // same way the runtime path would.
-    if (!f64_rounding_sensitive(op)) {
+    // Tier-compiled copy (see run_f32).  The f64_avx2_only ops have no
+    // 512-bit double kernel and run on the AVX2 one.
+    if (!f64_avx2_only(op)) {
         f64_chunk_avx512(op, prm, src, dst, b, e);
         return;
     }
     f64_chunk_avx2(op, prm, src, dst, b, e);
     return;
 #endif
-    // Elu/Softplus/LeakyRelu/Celu keep double(float(x)) rounding semantics
-    // that only the AVX2 kernels reproduce; everything else goes 512-bit.
-    if (avx512_available() && !f64_rounding_sensitive(op)) {
+    // Elu/Softplus/LeakyRelu/Celu/Hardswish/Hardsigmoid have AVX2 double
+    // kernels only; everything else goes 512-bit.
+    if (avx512_available() && !f64_avx2_only(op)) {
         f64_chunk_avx512(op, prm, src, dst, b, e);
         return;
     }

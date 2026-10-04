@@ -1213,6 +1213,11 @@ Tensor silu_and_mul_cpu(const Tensor& input) {
 //     (MishBackwardCUDAKernelImpl)
 //     (SoftplusBackwardCUDAKernelImpl)
 // ---------------------------------------------------------------------------
+// The type an activation computes in: double for double, float for the rest
+// (reduced-precision inputs widen to float, as their vector paths do).
+template <typename T>
+using activation_math_t = std::conditional_t<std::is_same_v<T, double>, double, float>;
+
 template<typename Func>
 Tensor activation_backward_kernel(const Tensor& grad_output, const Tensor& self, Func func) {
     DType out_dtype = grad_output.dtype();
@@ -1230,7 +1235,8 @@ Tensor activation_backward_kernel(const Tensor& grad_output, const Tensor& self,
         ctype* dst = result.data_ptr<ctype>(); \
         parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
             for (int64_t i = begin; i < end; ++i) { \
-                dst[i] = static_cast<ctype>(func(static_cast<float>(dy[i]), static_cast<float>(x[i]))); \
+                using M = activation_math_t<ctype>; \
+                dst[i] = static_cast<ctype>(func(static_cast<M>(dy[i]), static_cast<M>(x[i]))); \
             } \
         }); \
         break; \
@@ -1263,6 +1269,29 @@ static inline float gelu_backward_none_scalar(float dy, float x) {
     float pdf = kBeta * std::exp(x * x * -0.5f);
     return dy * (cdf + x * pdf);
 }
+static inline double gelu_tanh_scalar(double x) {
+    constexpr double kBeta = 1.41421356237309504880 * 1.12837916709551257390 * 0.5;
+    constexpr double kKappa = 0.044715;
+    double inner = kBeta * (x + kKappa * x * x * x);
+    return 0.5 * x * (1.0 + std::tanh(inner));
+}
+static inline double gelu_backward_none_scalar(double dy, double x) {
+    constexpr double kAlpha = 0.70710678118654752440;
+    constexpr double kBeta = 1.12837916709551257390 * 0.70710678118654752440 * 0.5;
+    double cdf = 0.5 * (1.0 + std::erf(x * kAlpha));
+    double pdf = kBeta * std::exp(x * x * -0.5);
+    return dy * (cdf + x * pdf);
+}
+static inline double gelu_backward_tanh_scalar(double dy, double x) {
+    constexpr double kBeta = 1.41421356237309504880 * 1.12837916709551257390 * 0.5;
+    constexpr double kKappa = 0.044715;
+    double x_sq = x * x;
+    double inner = kBeta * (x + kKappa * x_sq * x);
+    double tanh_inner = std::tanh(inner);
+    double right_derivative =
+        0.5 * x * (1.0 - tanh_inner * tanh_inner) * kBeta * (1.0 + 3.0 * kKappa * x_sq);
+    return dy * (0.5 * (1.0 + tanh_inner) + right_derivative);
+}
 static inline float gelu_backward_tanh_scalar(float dy, float x) {
     constexpr float kBeta = 1.41421356237309504880f * 1.12837916709551257390f * 0.5f;
     constexpr float kKappa = 0.044715f;
@@ -1282,15 +1311,17 @@ static inline float gelu_backward_tanh_scalar(float dy, float x) {
 Tensor gelu_tanh_impl(const Tensor& self) {
     return unary_float_op_kernel(self, [](auto x) {
         using T = decltype(x);
-        return static_cast<T>(gelu_tanh_scalar(static_cast<float>(x)));
+        return static_cast<T>(gelu_tanh_scalar(static_cast<activation_math_t<T>>(x)));
     }, vecunary::VOp::GeluTanh);
 }
 
 Tensor gelu_backward_impl(const Tensor& grad_output, const Tensor& self, const std::string& approximate) {
     if (approximate == "none") {
-        return activation_backward_kernel(grad_output, self, gelu_backward_none_scalar);
+        return activation_backward_kernel(grad_output, self,
+            [](auto dy, auto x) { return gelu_backward_none_scalar(dy, x); });
     } else if (approximate == "tanh") {
-        return activation_backward_kernel(grad_output, self, gelu_backward_tanh_scalar);
+        return activation_backward_kernel(grad_output, self,
+            [](auto dy, auto x) { return gelu_backward_tanh_scalar(dy, x); });
     }
     TP_THROW(ValueError, "approximate argument must be either none or tanh, but got " + approximate);
 }
@@ -1311,7 +1342,7 @@ Tensor hardtanh_backward_kernel_impl(const Tensor& grad_output, const Tensor& se
     double lo = min_val.toDouble();
     double hi = max_val.toDouble();
     return activation_backward_kernel(grad_output, self,
-        [lo, hi](float dy, float x) -> float { return (x <= lo || x >= hi) ? 0.0f : dy; });
+        [lo, hi](auto dy, auto x) { return (x <= lo || x >= hi) ? decltype(dy)(0) : dy; });
 }
 
 Tensor relu6_kernel_impl(const Tensor& self) {
@@ -1321,7 +1352,7 @@ Tensor relu6_kernel_impl(const Tensor& self) {
 Tensor hardswish_kernel_impl(const Tensor& self) {
     return unary_float_op_kernel(self, [](auto x) {
         using T = decltype(x);
-        T xf = static_cast<T>(static_cast<float>(x));
+        T xf = static_cast<T>(static_cast<activation_math_t<T>>(x));
         T clamped = (xf + T(3) < T(0)) ? T(0) : (xf + T(3) > T(6)) ? T(6) : xf + T(3);
         return xf * clamped / T(6);
     }, vecunary::VOp::Hardswish);
@@ -1331,9 +1362,10 @@ Tensor hardswish_backward_kernel_impl(const Tensor& grad_output, const Tensor& s
     //   d/dx [x * relu6(x + 3) / 6]:
     //   x <= -3 -> 0 ; -3 < x < 3 -> dy * (x/3 + 0.5) ; x >= 3 -> dy
     return activation_backward_kernel(grad_output, self,
-        [](float dy, float x) -> float {
-            if (x <= -3.0f) return 0.0f;
-            if (x < 3.0f) return dy * (x / 3.0f + 0.5f);
+        [](auto dy, auto x) {
+            using M = decltype(x);
+            if (x <= M(-3)) return M(0);
+            if (x < M(3)) return dy * (x / M(3) + M(0.5));
             return dy;
         });
 }
@@ -1341,16 +1373,17 @@ Tensor hardswish_backward_kernel_impl(const Tensor& grad_output, const Tensor& s
 Tensor silu_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) {
     //   sigmoid = 1 / (1 + exp(-x)); dy * sigmoid * (1 + x * (1 - sigmoid))
     return activation_backward_kernel(grad_output, self,
-        [](float dy, float x) -> float {
-            const float s = 1.0f / (1.0f + std::exp(-x));
-            return dy * s * (1.0f + x * (1.0f - s));
+        [](auto dy, auto x) {
+            using M = decltype(x);
+            const M s = M(1) / (M(1) + std::exp(-x));
+            return dy * s * (M(1) + x * (M(1) - s));
         });
 }
 
 Tensor hardsigmoid_kernel_impl(const Tensor& self) {
     return unary_float_op_kernel(self, [](auto x) {
         using T = decltype(x);
-        T xf = static_cast<T>(static_cast<float>(x));
+        T xf = static_cast<T>(static_cast<activation_math_t<T>>(x));
         T v = xf + T(3);
         v = v < T(0) ? T(0) : (v > T(6) ? T(6) : v);
         return v / T(6);
@@ -1360,9 +1393,10 @@ Tensor hardsigmoid_kernel_impl(const Tensor& self) {
 Tensor hardsigmoid_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) {
     //   d/dx [relu6(x + 3) / 6]: dy / 6 strictly inside (-3, 3), else 0
     return activation_backward_kernel(grad_output, self,
-        [](float dy, float x) -> float {
-            if (x <= -3.0f || x >= 3.0f) return 0.0f;
-            return dy / 6.0f;
+        [](auto dy, auto x) {
+            using M = decltype(x);
+            if (x <= M(-3) || x >= M(3)) return M(0);
+            return dy / M(6);
         });
 }
 
@@ -1372,7 +1406,7 @@ Tensor leaky_relu_kernel_impl(const Tensor& self, const Scalar& negative_slope) 
     prm.p0 = slope;
     return unary_float_op_kernel(self, [slope](auto x) {
         using T = decltype(x);
-        T xf = static_cast<T>(static_cast<float>(x));
+        T xf = static_cast<T>(static_cast<activation_math_t<T>>(x));
         return xf < T(0) ? static_cast<T>(slope) * xf : xf;
     }, vecunary::VOp::LeakyRelu, prm);
 }
@@ -1381,7 +1415,10 @@ Tensor leaky_relu_backward_kernel_impl(const Tensor& grad_output, const Tensor& 
     (void)self_is_result; // out-of-place call always receives the input itself
     double slope = negative_slope.toDouble();
     return activation_backward_kernel(grad_output, self,
-        [slope](float dy, float x) -> float { return x > 0.0f ? dy : dy * static_cast<float>(slope); });
+        [slope](auto dy, auto x) {
+            using M = decltype(x);
+            return x > M(0) ? dy : dy * static_cast<M>(slope);
+        });
 }
 
 Tensor elu_kernel_impl(const Tensor& self, const Scalar& alpha, const Scalar& scale, const Scalar& input_scale) {
@@ -1395,9 +1432,10 @@ Tensor elu_kernel_impl(const Tensor& self, const Scalar& alpha, const Scalar& sc
     prm.p2 = negiptcoef;
     return unary_float_op_kernel(self, [negcoef, poscoef, negiptcoef](auto x) {
         using T = decltype(x);
-        T a = static_cast<T>(static_cast<float>(x));
+        using M = activation_math_t<T>;
+        T a = static_cast<T>(static_cast<M>(x));
         return a < T(0)
-            ? static_cast<T>(std::expm1(static_cast<float>(a) * static_cast<float>(negiptcoef)) * static_cast<float>(negcoef))
+            ? static_cast<T>(std::expm1(static_cast<M>(a) * static_cast<M>(negiptcoef)) * static_cast<M>(negcoef))
             : a * static_cast<T>(poscoef);
     }, vecunary::VOp::Elu, prm);
 }
@@ -1409,19 +1447,20 @@ Tensor elu_backward_kernel_impl(const Tensor& grad_output, const Scalar& alpha, 
     double poscoef = scale.toDouble();
     double negiptcoef = input_scale.toDouble();
     return activation_backward_kernel(grad_output, self_or_result,
-        [negcoef, poscoef, negiptcoef, is_result](float dy, float b) -> float {
-            return b <= 0.0f
+        [negcoef, poscoef, negiptcoef, is_result](auto dy, auto b) {
+            using M = decltype(b);
+            return b <= M(0)
                 ? (is_result
-                      ? dy * static_cast<float>(negiptcoef) * (b + static_cast<float>(negcoef))
-                      : dy * static_cast<float>(negiptcoef) * static_cast<float>(negcoef) * std::exp(b * static_cast<float>(negiptcoef)))
-                : dy * static_cast<float>(poscoef);
+                      ? dy * static_cast<M>(negiptcoef) * (b + static_cast<M>(negcoef))
+                      : dy * static_cast<M>(negiptcoef) * static_cast<M>(negcoef) * std::exp(b * static_cast<M>(negiptcoef)))
+                : dy * static_cast<M>(poscoef);
         });
 }
 
 Tensor mish_kernel_impl(const Tensor& self) {
     return unary_float_op_kernel(self, [](auto x) {
         using T = decltype(x);
-        T xf = static_cast<T>(static_cast<float>(x));
+        T xf = static_cast<T>(static_cast<activation_math_t<T>>(x));
         T sp = std::log(T(1) + std::exp(xf));
         return xf * std::tanh(sp);
     }, vecunary::VOp::Mish);
@@ -1431,11 +1470,12 @@ Tensor mish_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) 
     //   sp = log1p(exp(x)); tanh_sp = tanh(sp); sech2 = 1 - tanh_sp^2
     //   return dy * (tanh_sp + x * sech2 * sigmoid(x))
     return activation_backward_kernel(grad_output, self,
-        [](float dy, float x) -> float {
-            float sp = std::log1p(std::exp(x));
-            float tanh_sp = std::tanh(sp);
-            float sech2 = 1.0f - tanh_sp * tanh_sp;
-            float gsp = 1.0f / (1.0f + std::exp(-x));
+        [](auto dy, auto x) {
+            using M = decltype(x);
+            M sp = std::log1p(std::exp(x));
+            M tanh_sp = std::tanh(sp);
+            M sech2 = M(1) - tanh_sp * tanh_sp;
+            M gsp = M(1) / (M(1) + std::exp(-x));
             return dy * (tanh_sp + x * sech2 * gsp);
         });
 }
@@ -1447,7 +1487,7 @@ Tensor selu_kernel_impl(const Tensor& self) {
     constexpr double alpha_ = 1.6732632423543772848170429916717;
     return unary_float_op_kernel(self, [lambda_, alpha_](auto x) {
         using T = decltype(x);
-        T a = static_cast<T>(static_cast<float>(x));
+        T a = static_cast<T>(static_cast<activation_math_t<T>>(x));
         return a > T(0) ? a * static_cast<T>(lambda_)
                         : static_cast<T>(alpha_ * lambda_) * std::expm1(a);
     }, vecunary::VOp::Selu);
@@ -1459,7 +1499,7 @@ Tensor celu_kernel_impl(const Tensor& self, Scalar alpha) {
     prm.p0 = a;
     return unary_float_op_kernel(self, [a](auto x) {
         using T = decltype(x);
-        T af = static_cast<T>(static_cast<float>(x));
+        T af = static_cast<T>(static_cast<activation_math_t<T>>(x));
         return af > T(0) ? af : static_cast<T>(a) * (std::expm1(af / static_cast<T>(a)));
     }, vecunary::VOp::Celu, prm);
 }
@@ -1473,11 +1513,12 @@ Tensor softplus_kernel_impl(const Tensor& self, const Scalar& beta, const Scalar
     prm.p1 = threshold_in;
     return unary_float_op_kernel(self, [beta_in, threshold_in](auto x) {
         using T = decltype(x);
-        T a = static_cast<T>(static_cast<float>(x));
+        using M = activation_math_t<T>;
+        T a = static_cast<T>(static_cast<M>(x));
         T beta_in_t = static_cast<T>(beta_in);
         return a * beta_in_t > static_cast<T>(threshold_in)
             ? a
-            : static_cast<T>(std::log1p(std::exp(static_cast<float>(a * beta_in_t))) / beta_in);
+            : static_cast<T>(std::log1p(std::exp(static_cast<M>(a * beta_in_t))) / beta_in);
     }, vecunary::VOp::Softplus, prm);
 }
 
@@ -1486,10 +1527,11 @@ Tensor softplus_backward_kernel_impl(const Tensor& grad_output, const Tensor& se
     double beta_in = beta.toDouble();
     double threshold_in = threshold.toDouble();
     return activation_backward_kernel(grad_output, self,
-        [beta_in, threshold_in](float dy, float a) -> float {
-            return a * static_cast<float>(beta_in) > static_cast<float>(threshold_in)
+        [beta_in, threshold_in](auto dy, auto a) {
+            using M = decltype(a);
+            return a * static_cast<M>(beta_in) > static_cast<M>(threshold_in)
                 ? dy
-                : dy * (1.0f / (1.0f + std::exp(-a * static_cast<float>(beta_in))));
+                : dy * (M(1) / (M(1) + std::exp(-a * static_cast<M>(beta_in))));
         });
 }
 
@@ -1595,7 +1637,8 @@ static Tensor binary_float_kernel(const Tensor& a, const Tensor& b, Func func) {
         ctype* yp = result.data_ptr<ctype>(); \
         parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
             for (int64_t i = begin; i < end; ++i) { \
-                yp[i] = static_cast<ctype>(func(static_cast<float>(ap[i]), static_cast<float>(bp[i]))); \
+                using M = activation_math_t<ctype>; \
+                yp[i] = static_cast<ctype>(func(static_cast<M>(ap[i]), static_cast<M>(bp[i]))); \
             } \
         }); \
         break; \
@@ -1609,7 +1652,7 @@ static Tensor binary_float_kernel(const Tensor& a, const Tensor& b, Func func) {
 }
 
 Tensor rrelu_with_noise_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, const Tensor& noise, const Scalar& lower, const Scalar& upper, bool training, bool self_is_result) {
-    const float slope = static_cast<float>((lower.toDouble() + upper.toDouble()) / 2.0);
+    const double mean_slope = (lower.toDouble() + upper.toDouble()) / 2.0;
     // Training: the forward recorded each slope in noise (1 for positive
     // inputs), so the gradient is grad * noise.
     if (training) {
@@ -1643,8 +1686,9 @@ Tensor rrelu_with_noise_backward_kernel_impl(const Tensor& grad_output, const Te
     }
     (void)self_is_result; // result > 0 iff self > 0 for a positive slope.
     // The leaky slope applies at zero as well (x > 0 passes through).
-    return binary_float_kernel(grad_output, self, [slope](float dy, float x) -> float {
-        return x > 0.0f ? dy : dy * slope;
+    return binary_float_kernel(grad_output, self, [mean_slope](auto dy, auto x) {
+        using M = decltype(x);
+        return x > M(0) ? dy : dy * static_cast<M>(mean_slope);
     });
 }
 
