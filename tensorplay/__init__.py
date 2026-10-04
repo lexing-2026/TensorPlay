@@ -29,6 +29,15 @@ from typing_extensions import TypeIs as _TypeIs
 # generated version module.
 from tensorplay.version import __version__ as __version__
 
+# The OpenMP runtime parks its worker team only after a fixed spin-out, which
+# defaults to several milliseconds of full-core spinning per worker. Op
+# sequences reach the next region far sooner than that, so a running process
+# keeps every worker core hot even when each region is tiny. A ~100us window
+# still spans back-to-back regions (measured wall-clock identical) while
+# letting idle workers sleep between bursts. Explicit user settings win.
+if "GOMP_SPINCOUNT" not in os.environ and "OMP_WAIT_POLICY" not in os.environ:
+    os.environ["GOMP_SPINCOUNT"] = "10000"
+
 
 # -------------------------------------------------------------------------
 # DLL Loading (Windows)
