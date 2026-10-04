@@ -1,7 +1,7 @@
 """Arithmetic, reductions and linear algebra over sparse tensors."""
 import tensorplay
 
-from ._construction import _as_index, sparse_coo_tensor
+from ._construction import _as_index
 
 __all__ = ["add", "addmm", "log_softmax", "mm", "mul", "softmax", "solve", "sum"]
 
@@ -143,92 +143,6 @@ def sum(input, dim=None, dtype=None):
     )
 
 
-def _grouped_softmax(input, dim, dtype, log):
-    """Softmax over the specified entries of a sparse COO tensor.
-
-    Unspecified entries are treated as absent rather than as zeros: the
-    normalization runs over the stored values of each slice only, and the
-    result keeps ``input``'s coordinates.  ``dim`` may address a sparse
-    dimension (the slice is then the set of stored entries agreeing on every
-    other sparse coordinate) or a dense dimension (the reduction is the
-    ordinary one, inside each stored value block).
-    """
-    input = _require_sparse_coo(input, "input")
-    from tensorplay.nn.functional import log_softmax as _dense_log_softmax
-    from tensorplay.nn.functional import softmax as _dense_softmax
-
-    dim = _as_index(dim, "dim")
-    input = input.coalesce()
-    if dtype is not None:
-        target_dtype = dtype
-        if not (
-            getattr(target_dtype, "is_floating_point", False)
-            or getattr(target_dtype, "is_complex", False)
-        ):
-            raise TypeError("sparse softmax requires a floating or complex dtype")
-        input = sparse_coo_tensor(
-            input._indices(),
-            input.values().to(dtype),
-            list(input.shape),
-            is_coalesced=True,
-        )
-
-    ndim = input.dim()
-    sparse_dim = input.sparse_dim()
-    dim = dim + ndim if dim < 0 else dim
-    if not 0 <= dim < ndim:
-        raise IndexError(f"dimension {dim} out of range for {ndim}-D input")
-
-    indices = input._indices()
-    values = input.values()
-    sizes = list(input.shape)
-
-    if dim >= sparse_dim:
-        # Dense dimension: the reduction never crosses stored entries, so the
-        # value block can go through the ordinary kernel directly.
-        block_dim = dim - sparse_dim + 1
-        fn = _dense_log_softmax if log else _dense_softmax
-        new_values = fn(values, dim=block_dim)
-        return sparse_coo_tensor(indices, new_values, sizes, is_coalesced=True)
-
-    nnz = int(values.shape[0])
-    dense_shape = list(values.shape[1:])
-    if nnz == 0:
-        return sparse_coo_tensor(indices, values, sizes, is_coalesced=True)
-
-    # Slice key: the mixed-radix encoding of every sparse coordinate but `dim`.
-    keys = tensorplay.zeros([nnz], dtype=indices.dtype, device=indices.device)
-    for d in range(sparse_dim):
-        if d == dim:
-            continue
-        keys = keys * int(sizes[d]) + indices[d]
-    _, inverse, _ = tensorplay.unique(keys, sorted=True, return_inverse=True)
-    groups = int(inverse.max().item()) + 1
-
-    width = 1
-    for s in dense_shape:
-        width *= int(s)
-    flat = values.reshape([nnz, width])
-    scatter_index = inverse.reshape([nnz, 1]).expand([nnz, width])
-
-    empty = tensorplay.zeros([groups, width], dtype=flat.dtype, device=flat.device)
-    slice_max = empty.scatter_reduce(
-        0, scatter_index, flat, "amax", include_self=False
-    )
-    shifted = flat - slice_max.index_select(0, inverse)
-    exponent = shifted.exp()
-    total = tensorplay.zeros(
-        [groups, width], dtype=flat.dtype, device=flat.device
-    ).index_add(0, inverse, exponent)
-    if log:
-        out = shifted - total.log().index_select(0, inverse)
-    else:
-        out = exponent / total.index_select(0, inverse)
-
-    new_values = out.reshape([nnz] + dense_shape)
-    return sparse_coo_tensor(indices, new_values, sizes, is_coalesced=True)
-
-
 def softmax(input, dim, *, dtype=None):
     r"""Applies a softmax over the stored entries of a sparse tensor.
 
@@ -245,7 +159,8 @@ def softmax(input, dim, *, dtype=None):
             operation, which is the way to keep the accumulation in higher
             precision than the input.
     """
-    return _grouped_softmax(input, dim, dtype, log=False)
+    input = _require_sparse_coo(input, "input")
+    return tensorplay.functional._sparse_softmax(input, dim, dtype)
 
 
 def log_softmax(input, dim, *, dtype=None):
@@ -254,7 +169,8 @@ def log_softmax(input, dim, *, dtype=None):
     Shares :func:`softmax`'s treatment of unspecified entries and avoids the
     intermediate exponential in the same way the dense kernel does.
     """
-    return _grouped_softmax(input, dim, dtype, log=True)
+    input = _require_sparse_coo(input, "input")
+    return tensorplay.functional._sparse_log_softmax(input, dim, dtype)
 
 
 def solve(input, other, *, left=True):

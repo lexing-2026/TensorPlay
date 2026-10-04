@@ -1,3 +1,4 @@
+import math
 import unittest
 
 import tensorplay as tp
@@ -124,6 +125,66 @@ class TestSparseSum(unittest.TestCase):
         out = sparse.sum(s, dtype=tp.float64)
         self.assertEqual(out.dtype, tp.float64)
         self.assertAlmostEqual(float(out), 3.5, places=6)
+
+
+class TestSparseSoftmax(unittest.TestCase):
+    def make_input(self):
+        # [[11, 0, 14, 0, 15], [0, 22, 0, 24, 0]] with only stored entries.
+        d = tp.tensor([[11.0, 0.0, 14.0, 0.0, 15.0],
+                       [0.0, 22.0, 0.0, 24.0, 0.0]])
+        return d, d.to_sparse().coalesce()
+
+    def test_softmax_over_sparse_dim_runs_over_stored_entries(self):
+        d, s = self.make_input()
+        out = sparse.softmax(s, 1)
+        self.assertTrue(out.is_sparse)
+        self.assertEqual(out._nnz(), s._nnz())
+        # unspecified entries act as negative infinities: a pool's softmax
+        # runs over its stored coordinates only, and the output keeps the
+        # input's sparsity pattern
+        dense_ref = tp.softmax(d.to_dense().masked_fill(d == 0, float("-inf")), 1)
+        dense_ref = tp.nan_to_num(dense_ref)
+        self.assertTrue(tp.allclose(dense_from_coo(out), dense_ref))
+
+    def test_softmax_keeps_empty_rows_unspecified(self):
+        d = tp.tensor([[1.0, 2.0], [0.0, 0.0], [3.0, 4.0]])
+        s = d.to_sparse().coalesce()
+        out = sparse.softmax(s, 1)
+        got = dense_from_coo(out).tolist()
+        # a row without stored entries keeps no output coordinates
+        self.assertEqual(got[1], [0.0, 0.0])
+        e = math.exp(1.0)
+        self.assertAlmostEqual(got[0][0], 1.0 / (1.0 + e), places=6)
+        self.assertAlmostEqual(got[0][1], e / (1.0 + e), places=6)
+
+    def test_softmax_dim_in_dense_part_uses_dense_path(self):
+        idx = tp.tensor([[0, 0], [0, 1]], dtype=tp.int64)
+        vals = tp.randn(2, 3)
+        s = sparse.sparse_coo_tensor(idx, vals, (1, 2, 3))
+        out = sparse.softmax(s, 2)
+        self.assertTrue(tp.allclose(out.values(), tp.softmax(vals, 1)))
+
+    def test_softmax_negative_dim(self):
+        d, s = self.make_input()
+        out = sparse.softmax(s, -1)
+        dense_ref = tp.nan_to_num(
+            tp.softmax(d.to_dense().masked_fill(d == 0, float("-inf")), 1))
+        self.assertTrue(tp.allclose(dense_from_coo(out), dense_ref))
+
+    def test_softmax_dtype(self):
+        _, s = self.make_input()
+        out = sparse.softmax(s, 1, dtype=tp.float64)
+        self.assertEqual(out.dtype, tp.float64)
+
+    def test_log_softmax_matches_stored_coordinates(self):
+        d, s = self.make_input()
+        out = sparse.log_softmax(s, 1)
+        dense_ls = tp.log_softmax(d, 1).to_dense()
+        coords = s._indices().tolist()
+        vals = out.values().tolist()
+        for n in range(s._nnz()):
+            self.assertAlmostEqual(
+                vals[n], float(dense_ls[coords[0][n]][coords[1][n]]), places=6)
 
 
 class TestSparseBinaryOps(unittest.TestCase):
