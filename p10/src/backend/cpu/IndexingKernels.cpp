@@ -607,18 +607,33 @@ Tensor gather_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
     int64_t n = result.numel();
     int64_t self_dim_size = self.size(dim);
 
+// One row of the index shape per task step: the row base and the source
+// row base are hoisted, so the inner walk is a pure lookup without any
+// per-element coordinate division.
 #define TP_GATHER_CASE(ctype, name) \
     case DType::name: { \
         const ctype* s = self_c.data_ptr<ctype>(); \
         const int64_t* ip = idx_c.data_ptr<int64_t>(); \
         ctype* d = result.data_ptr<ctype>(); \
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
-            for (int64_t flat = begin; flat < end; ++flat) { \
-                int64_t rem = flat; \
-                int64_t outer_off = rem / (idx_dim_size * idx_inner); rem -= outer_off * idx_dim_size * idx_inner; \
-                int64_t t = rem % idx_inner; \
-                int64_t idx = ip[flat]; \
-                d[flat] = s[(outer_off * self_dim_size + idx) * self_inner + t]; \
+        const int64_t row_elems = idx_dim_size * idx_inner; \
+        const int64_t chunk_c = \
+            std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(idx_inner, 1)); \
+        const int64_t nchunk_c = (idx_dim_size + chunk_c - 1) / chunk_c; \
+        parallel_for(0, idx_outer * nchunk_c, 1, [&](int64_t begin, int64_t end) { \
+            for (int64_t task = begin; task < end; ++task) { \
+                const int64_t g = task / nchunk_c; \
+                const int64_t ci = task - g * nchunk_c; \
+                const int64_t c0 = ci * chunk_c; \
+                const int64_t c1 = std::min(c0 + chunk_c, idx_dim_size); \
+                const int64_t* idx_row = ip + g * row_elems + c0 * idx_inner; \
+                ctype* d_row = d + g * row_elems + c0 * idx_inner; \
+                const ctype* s_row = s + g * self_dim_size * self_inner; \
+                for (int64_t c = c0; c < c1; ++c) { \
+                    for (int64_t t = 0; t < idx_inner; ++t) \
+                        d_row[t] = s_row[idx_row[t] * self_inner + t]; \
+                    idx_row += idx_inner; \
+                    d_row += idx_inner; \
+                } \
             } \
         }); \
         break; \
