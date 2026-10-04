@@ -2483,7 +2483,7 @@ class PythonWrapperCodegen(CodeGen):
                 python_kernel_name, self.next_kernel_suffix()
             )
         line = f"{python_kernel_name}({','.join(map(str, inputs))}"
-        if orig_python_kernel_name.startswith("scatter_reduce"):
+        if orig_python_kernel_name.startswith("operator_set.scatter_reduce"):
             line += ", ".join([""] + kwargs)
         elif reduce:
             line += f", reduce={repr(reduce)}"

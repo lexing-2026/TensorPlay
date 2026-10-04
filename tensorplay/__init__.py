@@ -604,6 +604,7 @@ if not TYPE_CHECKING:
 
 from .functional import *
 from .functional import _assert_async
+from .functional import _unsafe_index_put
 
 
 def unique(input, sorted=True, return_inverse=False, return_counts=False):

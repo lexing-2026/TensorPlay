@@ -33,8 +33,10 @@ import tensorplay as tp
 from . import config
 from .utils import (
     is_dynamic,
+    is_gpu,
     is_triton_fp8_dtype_supported,
     is_view,
+    parallel_num_threads,
     register_op_dtype_propagation_rules,
 )
 
@@ -4640,60 +4642,548 @@ def lower_avg_poolnd(x, kernel_size, stride=(), padding=0, ceil_mode=False,
 
 
 # ---------------------------------------------------------------------------
-# Scattering into a tensor along one axis
+# Scattering into a tensor: writing the elements a value chooses
 # ---------------------------------------------------------------------------
 
 
-@register("index_add.default")
-def lower_index_add(base, dim, index_box, addend, alpha=None, **kwargs):
-    """Accumulating along one axis, as the sum over that axis of what lands.
+def needs_fallback_due_to_atomic_add_limitations(dtype: Any) -> bool:
+    """Whether adding into memory atomically is ruled out for a type.
 
-    A scattered position is a sum of the contributions that name it, so the
-    scatter is a reduction over the axis being scattered: each contribution
-    asks the index where it belongs and contributes to that one destination,
-    and to no other.  Nothing needs to be written twice and nothing needs a
-    lock, because each destination is written by exactly one loop iteration.
+    Adding in place from many threads asks the memory system for a read that
+    also writes, and not every type can: a 64-bit whole number or a truth
+    value has no atomic add to begin with, and a 16-bit brain float only once
+    the hardware grew one.
     """
 
-    dim = normalize_dim(int(dim), len(base.get_size()))
-    _, dtype, device = val_info(node_val())
-    out_size = [int(s) for s in base.get_size()]
-    addend_size = [int(s) for s in addend.get_size()]
-    if addend_size[dim] != int(index_box.get_size()[0]):
-        raise NotImplementedError("an index that does not match its addend")
-    index_loader = index_box.make_loader()
-    addend_loader = addend.make_loader()
-    f32 = tp.float32
-    scale = 1.0 if alpha is None else float(alpha)
+    if dtype == tp.bfloat16 and tp.cuda.is_available():
+        return tp.cuda.get_device_capability() < (9, 0)
+    return dtype in (tp.int64, tp.bool)
 
-    def inner(index, rindex):
-        destination = index_loader([ops.index_expr(rindex[dim], tp.int64)])
-        here = ops.eq(destination, ops.index_expr(index[dim], tp.int64))
-        for axis in range(len(out_size)):
-            if axis != dim:
-                here = ops.and_(
-                    here, ops.eq(rindex[axis], ops.index_expr(index[axis], tp.int64))
-                )
-        value = addend_loader(list(rindex))
-        if scale != 1.0:
-            value = ops.mul(value, ops.constant(scale, f32))
-        return ops.masked(here, lambda: value, 0.0)
 
-    landed = Reduction.create(
-        device=device,
-        dst_dtype=dtype,
-        src_dtype=addend.get_dtype(),
-        inner_fn=inner,
-        ranges=tuple(out_size),
-        reduction_ranges=tuple(addend_size),
-        reduction_type='sum',
+def use_scatter_fallback(
+    op_overload: Any,
+    reduction_type: Any,
+    self_dtype: Any,
+    src_dtype: Any,
+    src_device_type: Any,
+    src_is_tensor: bool,
+) -> bool:
+    """Whether a scatter is handed to the framework rather than written out.
+
+    A written-out scatter is a store, or an atomic add when the contributions
+    accumulate.  Every other way of combining -- taking the larger, the
+    smaller, the product, the mean -- has no atomic form here, so it is run
+    through; and even an add is run through for a type that cannot be added
+    atomically, for a whole-number or truth-valued destination, for a source
+    of such a type on a device where threads run apart, or when the whole
+    program has been asked to settle every tie the same way.
+    """
+
+    packet_name = getattr(op_overload, "__name__", str(op_overload))
+    if packet_name.startswith("scatter_reduce") and reduction_type is None:
+        return False
+
+    accumulate_name = "add" if packet_name.startswith("scatter_") else "sum"
+
+    return (
+        reduction_type not in (None, accumulate_name)
+        or (
+            src_is_tensor
+            and is_gpu(src_device_type)
+            and needs_fallback_due_to_atomic_add_limitations(src_dtype)
+        )
+        or (
+            packet_name.startswith("scatter_reduce_")
+            and reduction_type == "sum"
+            and src_is_tensor
+            and src_device_type == "cpu"
+            and getattr(config.cpp, "fallback_scatter_reduce_sum", False)
+            and (
+                getattr(config.cpp, "dynamic_threads", False)
+                or parallel_num_threads() != 1
+            )
+        )
+        or (reduction_type == accumulate_name and self_dtype in (tp.bool, tp.int64))
+        or tp.are_deterministic_algorithms_enabled()
     )
-    landed.realize()
-    if all(int(s) == 0 for s in out_size) or not any(addend_size):
-        return landed
-    # The scatter is a sum over what arrives, so the tensor it starts from is
-    # added once, afterwards, rather than folded into every contribution.
-    return pointwise(lambda a, b: ops.add(a, b), base, landed)
+
+
+def scatter_fallback(
+    op_overload: Any,
+    self: Any,
+    dim: Any,
+    index: Any,
+    src: Any,
+    *,
+    reduce: Any = None,
+    include_self: bool = True,
+) -> Any:
+    """Hand one scatter to the framework, or answer with nothing.
+
+    Nothing is the answer that says the caller may write the scatter out
+    itself; the framework call, once made, writes into the value it was given
+    and the value is the answer.
+    """
+
+    src_is_tensor = isinstance(src, TensorBox)
+    if use_scatter_fallback(
+        op_overload,
+        reduce,
+        self.get_dtype(),
+        src.get_dtype() if src_is_tensor else type(src),
+        src.get_device().type if src_is_tensor else "not impl",
+        src_is_tensor,
+    ):
+        ir.ScatterFallback(
+            op_overload,
+            self,
+            dim,
+            index,
+            src,
+            reduce=reduce,
+            include_self=include_self,
+        )
+        return self
+
+    return None
+
+
+def index_put_as_masked_fill(self: Any, indices: Any, value: Any, accumulate: bool):
+    """One truth-valued position list, one value: a masked fill.
+
+    Where the mask is set the value is written, and where it is not what was
+    there stays -- which is the whole of what writing one value at the
+    positions a mask names does.  Accumulating adds the value everywhere
+    first, so the positions the mask names end up holding what was there plus
+    the value.
+    """
+
+    if value.get_device() != self.get_device():
+        value = to_device(value, self.get_device())
+    if accumulate:
+        value = lower_add(self, value)
+    return mutate_to(self, lower_where(indices[0], value, self))
+
+
+def index_put_fallback(self: Any, indices: Any, values: Any, accumulate: bool):
+    """Hand a write-by-position-list to the framework.
+
+    A list of positions can name one place twice, and which of the values
+    named for one place wins is not settled here -- the framework settles it,
+    so the whole call is run through.
+    """
+
+    op_overload = getattr(
+        tp_ops.index_put_, V.graph.current_node.target._overloadname
+    )
+    ir.IndexPutFallback(op_overload, self, indices, values, accumulate)
+    return self
+
+
+def index_put_impl_(
+    self: Any,
+    indices: Any,
+    values: Any,
+    accumulate: bool,
+    check: bool,
+    may_realize: bool = False,
+):
+    """Write a value into a tensor at a list of positions.
+
+    Each position names one place for every element of the value -- the value's
+    leading axes are given by the position's shape -- so the write is a loop
+    over the value's positions, each asking the indices where its element
+    belongs.  A position naming a place outside the tensor is a mistake and is
+    refused when asked to be checked; accumulating adds instead of replaces,
+    which several threads do at once through atomic adds.
+
+    The value is read at every position it covers even where the indices
+    collapse many positions onto one place, because which of those wins is
+    what a scatter settles -- so the value is lined up against the positions'
+    shape first, and what it would repeat is repeated.
+    """
+
+    if may_realize:
+        name = ir.try_get_name(self)
+        if name is not None and name in values.get_read_names() and not all(
+            _index_is_a_permutation_slice(i) for i in indices
+        ):
+            # The value being written may be read out of the memory being
+            # written to.  The write then races the read, since a position
+            # written early changes what a later element reads; give the
+            # value its own memory first.
+            values.realize()
+
+    # Dispatch to masked fill for single boolean index with single value
+    if V.graph.sizevars.statically_known_true(
+        sympy.Eq(values.get_numel(), 1)
+    ) and len(indices) == 1 and indices[0].get_dtype() in (tp.bool, tp.uint8):
+        mask = indices[0]
+        for _ in range(len(mask.get_size()), len(self.get_size())):
+            mask = unsqueeze(mask, -1)
+        return index_put_as_masked_fill(self, [mask], values, accumulate)
+
+    # Fallback in deterministic mode
+    if tp.are_deterministic_algorithms_enabled():
+        return index_put_fallback(self, indices, values, accumulate)
+
+    # Fallback if there is a boolean index
+    for index in indices:
+        if index is not None and index.get_dtype() in (tp.bool, tp.uint8):
+            return index_put_fallback(self, indices, values, accumulate)
+
+    x_size = self.get_size()
+    x_ndim = len(x_size)
+
+    device = self.get_device()
+    if (
+        accumulate
+        and device is not None
+        and is_gpu(device.type)
+        and needs_fallback_due_to_atomic_add_limitations(self.get_dtype())
+    ):
+        # self is a scalar tensor
+        if x_ndim == 0:
+            self = view(self, [1])
+        self = index_put_fallback(self, indices, values, accumulate)
+        if x_ndim == 0:
+            self = view(self, [])
+        return self
+
+    values = to_dtype(values, self.get_dtype())
+
+    try:
+        indices, tensor_indices = check_and_broadcast_indices(
+            indices, self.get_device()
+        )
+    except NotImplementedError:
+        return index_put_fallback(self, indices, values, accumulate)
+
+    indices_loaders = [i.make_loader() if i is not None else None for i in indices]
+
+    if not (isinstance(self, TensorBox)):
+        raise AssertionError("expected: isinstance(self, TensorBox)")
+    self.realize()
+
+    # self is a scalar tensor
+    if x_ndim == 0:
+        self = view(self, [1])
+
+    # They are all required to be the same size, so the first names it
+    tensor_size = list(indices[tensor_indices[0]].get_size())
+    indexed_size = [x_size[i] for i in range(len(indices))]
+
+    expected_vals_size, inner_fn = index_output_size_and_inner_fn(
+        x_size,
+        indices,
+        tensor_indices,
+        tensor_size,
+        indices_loaders,
+        indexed_size,
+        None,
+        check=check,
+    )
+    # The scatter reads the value at every position of the positions' shape;
+    # see expand.
+    values = lower_expand(values, expected_vals_size)
+    # all guards are set above during broadcast_tensors and expand
+
+    device = self.get_device()
+    if device is None:
+        raise AssertionError("expected: device is not None")
+    scatter = ir.Scatter(
+        device=device,
+        dtype=self.get_dtype(),
+        inner_fn=values.make_loader(),
+        ranges=expected_vals_size,
+        output_indexer=inner_fn,
+        scatter_mode="atomic_add" if accumulate else None,
+    )
+    buffer = ir.ComputedBuffer(
+        name=None,
+        layout=ir.MutationLayoutSHOULDREMOVE(self),
+        data=scatter,
+    )
+    buffer.name = V.graph.register_buffer(buffer)
+    V.graph.register_operation(buffer)
+
+    if x_ndim == 0:
+        self = view(self, [])
+    return self
+
+
+def _index_is_a_permutation_slice(indice: Any) -> bool:
+    """Whether an index is a fresh list of every position in some order.
+
+    A list of positions that names each place exactly once, made on its own,
+    cannot make the value written race its own reads: no place is written
+    twice, so what an element reads is never changed by the write beside it.
+    Such a list is recognized by where it came from -- a draw of every
+    position once -- and anything else is refused.
+    """
+
+    if isinstance(indice, TensorBox) and isinstance(indice.data, ir.BaseView):
+        indice = indice.data.unwrap_view()
+        if not (isinstance(indice, ir.StorageBox) and isinstance(indice.data, ir.ExternKernel)):
+            return False
+        node = getattr(indice.data, "fx_node", None)
+        if node is None:
+            return False
+        return node.target is tp_ops.randperm.default
+    return False
+
+
+@register_lowering(tp_ops.index_put, type_promotion_kind=None)
+def index_put(x: Any, indices: Any, values: Any, accumulate: bool = False):
+    return index_put_impl_(
+        clone(x), indices, values, accumulate, check=True, may_realize=False
+    )
+
+
+@register_lowering(tp_ops._unsafe_index_put, type_promotion_kind=None)
+def _unsafe_index_put(x: Any, indices: Any, values: Any, accumulate: bool = False):
+    return index_put_impl_(
+        clone(x), indices, values, accumulate, check=False, may_realize=False
+    )
+
+
+@register_lowering(tp_ops.index_put_, type_promotion_kind=None)
+def index_put_(self: Any, indices: Any, values: Any, accumulate: bool = False):
+    return index_put_impl_(
+        self, indices, values, accumulate, check=True, may_realize=True
+    )
+
+
+def _positions_along_one_axis(index: Any, dim: int) -> list:
+    """A single axis's index as a whole position list.
+
+    An index that names positions along one axis, with every other axis taken
+    whole, is a position list with one entry for that axis and nothing for the
+    rest.
+    """
+
+    return [None] * dim + [index]
+
+
+@register_lowering(tp_ops.index_add, type_promotion_kind=None)
+def index_add(x: Any, dim: Any, index: Any, tensor: Any, *, alpha: Any = 1):
+    if alpha != 1:
+        tensor = lower_mul(tensor, alpha)
+    return index_put_impl_(
+        clone(x),
+        _positions_along_one_axis(index, dim),
+        tensor,
+        True,
+        check=True,
+        may_realize=False,
+    )
+
+
+@register_lowering(tp_ops.index_add_, type_promotion_kind=None)
+def index_add_(x: Any, dim: Any, index: Any, tensor: Any, *, alpha: Any = 1):
+    if alpha != 1:
+        tensor = lower_mul(tensor, alpha)
+    return index_put_impl_(
+        x, _positions_along_one_axis(index, dim), tensor, True, check=True, may_realize=True
+    )
+
+
+@register_lowering(tp_ops.index_copy, type_promotion_kind=None)
+def index_copy(x: Any, dim: Any, index: Any, tensor: Any):
+    return index_put_impl_(
+        clone(x),
+        _positions_along_one_axis(index, dim),
+        tensor,
+        False,
+        check=True,
+        may_realize=False,
+    )
+
+
+@register_lowering(tp_ops.index_copy_, type_promotion_kind=None)
+def index_copy_(x: Any, dim: Any, index: Any, tensor: Any):
+    return index_put_impl_(
+        x, _positions_along_one_axis(index, dim), tensor, False, check=True, may_realize=True
+    )
+
+
+@register_lowering(tp_ops.diagonal_scatter, type_promotion_kind=None)
+def diagonal_scatter(input: Any, src: Any, offset: Any = 0, dim1: Any = 0, dim2: Any = 1):
+    output = clone(input)
+    target = lower_diagonal(output, offset, dim1, dim2)
+    mutate_to(target, src)
+    return output
+
+
+@register_lowering(tp_ops.scatter, type_promotion_kind=None)
+def scatter(x: Any, dim: Any, index: Any, src: Any, **kwargs: Any):
+    return scatter_(clone(x), dim, index, src, **kwargs)
+
+
+@register_lowering(tp_ops.scatter_, type_promotion_kind=None)
+def scatter_(self: Any, dim: Any, index: Any, src: Any, *, reduce: Any = None):
+    if reduce not in (None, "add", "multiply"):
+        raise AssertionError('expected: reduce in (None, "add", "multiply")')
+    if reduce is None:
+        op_overload = getattr(
+            tp_ops.scatter_, V.graph.current_node.target._overloadname
+        )
+        fallback_result = scatter_fallback(
+            op_overload, self, dim, index, src, reduce=reduce
+        )
+        if fallback_result is not None:
+            return fallback_result
+
+    if reduce == "add":
+        reduce = "sum"
+    elif reduce == "multiply":
+        reduce = "prod"
+    return scatter_reduce_(self, dim, index, src, reduce)
+
+
+@register_lowering(tp_ops.scatter_add, type_promotion_kind=None)
+def scatter_add(x: Any, dim: Any, index: Any, src: Any):
+    return scatter_add_(clone(x), dim, index, src)
+
+
+@register_lowering(tp_ops.scatter_add_, type_promotion_kind=None)
+def scatter_add_(x: Any, dim: Any, index: Any, src: Any):
+    return scatter_reduce_(x, dim, index, src, "sum")
+
+
+@register_lowering(tp_ops.scatter_reduce, type_promotion_kind=None)
+def scatter_reduce(x: Any, dim: Any, index: Any, src: Any, reduction_type: Any, **kwargs: Any):
+    return scatter_reduce_(clone(x), dim, index, src, reduction_type, **kwargs)
+
+
+@register_lowering(tp_ops.scatter_reduce_, type_promotion_kind=None)
+def scatter_reduce_(self: Any, dim: Any, index: Any, src: Any, reduce: Any, *, include_self: bool = True):
+    """Write a value into a tensor along one axis, combining what lands together.
+
+    Each element of the value is written at the place its index names along
+    that axis, its other axes taken as they are.  Several elements can name
+    the same place; how they combine is the reduction: added, or replaced --
+    replaced being an add of nothing, since the place already holds what the
+    destination started with.  What was there can also be left out, which
+    zeroes each destination first so only what arrives is kept.
+
+    Adding is written as an atomic add, so many threads can land on one place
+    at once; every other combining is handed to the framework, which settles
+    the order among the contributions itself.
+    """
+
+    if reduce not in (None, "sum", "prod", "mean", "amax", "amin"):
+        raise AssertionError(
+            'expected: reduce in (None, "sum", "prod", "mean", "amax", "amin")'
+        )
+    if "two" not in getattr(tp_ops.scatter_reduce_, "overloads", list)():
+        raise AssertionError(
+            "tp.scatter_reduce_.two is not the unique overload of tp.scatter_reduce_"
+        )
+
+    fallback_result = scatter_fallback(
+        tp_ops.scatter_reduce_.two,
+        self,
+        dim,
+        index,
+        src,
+        reduce=reduce,
+        include_self=include_self,
+    )
+    if fallback_result:
+        return fallback_result
+
+    if not (isinstance(self, TensorBox)):
+        raise AssertionError("expected: isinstance(self, TensorBox)")
+
+    ndim = len(self.get_size())
+    if ndim == 0:
+        self = view(self, [1])
+
+    if isinstance(src, TensorBox) and len(src.get_size()) == 0:
+        src = view(src, [1])
+
+    if isinstance(index, TensorBox) and len(index.get_size()) == 0:
+        index = view(index, [1])
+
+    if V.graph.sizevars.statically_known_true(sympy.Eq(index.get_numel(), 0)):
+        return self
+
+    if "int" not in str(index.get_dtype()):
+        raise AssertionError('expected: "int" in str(index.get_dtype())')
+
+    dim = _validate_dim(self, dim)
+
+    self.realize()
+    index_loader = index.make_loader()
+    src_loader = src.make_loader() if isinstance(src, TensorBox) else None
+
+    def output_indexer(idx: Any):
+        shape = self.get_size()
+        ndim = len(shape)
+        indirect_idx = list(idx)
+        indirect_idx[dim] = ops.indirect_indexing(
+            index_loader(idx), 1 if ndim == 0 else shape[dim], wrap_neg=False
+        )
+        return indirect_idx
+
+    def fn(idx: Any):
+        if src_loader:
+            return src_loader(idx)
+        # src is a scalar
+        return ops.constant(src, self.get_dtype())
+
+    def backend_reduce_str(reduce: Any):
+        if reduce == "sum":
+            return "atomic_add"
+        if reduce is not None:
+            raise AssertionError("expected: reduce is None")
+        return None
+
+    device = self.get_device()
+    if device is None:
+        raise AssertionError("expected: device is not None")
+
+    if not include_self:
+        # zero out the corresponding elements first
+        zero_out = ir.Scatter(
+            device=device,
+            dtype=self.get_dtype(),
+            inner_fn=lambda index: ops.constant(0, self.get_dtype()),
+            ranges=index.get_size(),
+            output_indexer=output_indexer,
+            scatter_mode=None,
+        )
+        buffer = ir.ComputedBuffer(
+            name=None,
+            layout=ir.MutationLayoutSHOULDREMOVE(self),
+            data=zero_out,
+        )
+        buffer.name = V.graph.register_buffer(buffer)
+        V.graph.register_operation(buffer)
+
+    # self[index[i][j][k]][j][k] += src[i][j][k]  # if dim == 0
+    # self[i][index[i][j][k]][k] += src[i][j][k]  # if dim == 1
+    # self[i][j][index[i][j][k]] += src[i][j][k]  # if dim == 2
+    scatter = ir.Scatter(
+        device=device,
+        dtype=self.get_dtype(),
+        inner_fn=fn,
+        ranges=index.get_size(),
+        output_indexer=output_indexer,
+        scatter_mode=backend_reduce_str(reduce),
+    )
+    buffer = ir.ComputedBuffer(
+        name=None,
+        layout=ir.MutationLayoutSHOULDREMOVE(self),
+        data=scatter,
+    )
+    buffer.name = V.graph.register_buffer(buffer)
+    V.graph.register_operation(buffer)
+
+    if ndim == 0:
+        self = view(self, [])
+    return self
 
 
 # ---------------------------------------------------------------------------

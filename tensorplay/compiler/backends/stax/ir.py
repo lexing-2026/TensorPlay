@@ -7673,7 +7673,7 @@ class RandomSeeds(ExternKernelOut):
             ),
             inputs=[],
             constant_args=[limits.min, limits.max, [count]],
-            python_kernel_name="tp.randint.low_out",
+            python_kernel_name="operator_set.randint.low_out",
             cpp_kernel_name="tp::_ops::randint_low_out::call",
             op_overload=op_overload,
         )
@@ -8347,13 +8347,17 @@ class ScatterFallback(ExternKernel):
             tensors = [self.realize_input(t) for t in [x, index]]
             constant_args = (dim, src)
 
+        # The generated program looks operators up in the operation table it
+        # binds to a short name, not in the module an op name is written with,
+        # so the call names the operation through that table.
+        _, _, op_name = str(op_overload).partition(".")
         super().__init__(
             None,
             NoneLayout(device=x.get_device()),
             self.unwrap_storage(tensors),
             constant_args,
             {"reduce": reduce, "include_self": include_self},
-            python_kernel_name=str(op_overload),
+            python_kernel_name=f"operator_set.{op_name}",
             ordered_kwargs_for_cpp_kernel=["reduce", "include_self"],
             op_overload=op_overload,
         )
