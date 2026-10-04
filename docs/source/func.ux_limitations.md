@@ -137,7 +137,7 @@ vmap(relu)(tp.randn(3))
 # data-dependent control flow cannot see per-batch values. ...
 ```
 
-Re-express value-dependent branches with {func}`tp.where`, whose
+Re-express value-dependent branches with {func}`tensorplay.where`, whose
 comparison and selection rules are supported.
 :::
 

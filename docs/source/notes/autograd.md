@@ -193,7 +193,7 @@ For more fine-grained exclusion of subgraphs from gradient computation,
 there is setting the ``requires_grad`` field of a tensor.
 
 Below, in addition to discussing the mechanisms above, we also describe
-evaluation mode ({meth}`nn.Module.eval()`), a method that is not used
+evaluation mode ({meth}`tensorplay.nn.Module.eval`), a method that is not used
 to disable gradient computation but, because of its name, is often mixed up with the three.
 
 ### Setting ``requires_grad``
@@ -230,7 +230,7 @@ pass because they won't be part of the backward graph in the first place, as
 desired.
 
 Because this is such a common pattern, ``requires_grad`` can also be set at
-the module level with {meth}`nn.Module.requires_grad_()`.
+the module level with {meth}`tensorplay.nn.Module.requires_grad_`.
 When applied to a module, ``.requires_grad_()`` takes effect on all
 of the module's parameters (which have ``requires_grad=True`` by default).
 
@@ -390,8 +390,7 @@ gradients are correct.
 
 The autograd engine is responsible for running all the backward operations
 necessary to compute the backward pass. This section will describe all the details
-that can help you make the best use of it in a multithreaded environment. (This is
-relevant only for TensorPlay 1.6+ as the behavior in previous version was different.)
+that can help you make the best use of it in a multithreaded environment.
 
 User could train their model with multithreading code (e.g. Hogwild training), and
 does not block on the concurrent backward computations, example code could be:
@@ -424,8 +423,7 @@ Note that some behaviors that user should be aware of:
 
 When you run ``backward()`` or ``grad()`` via python or C++ API in multiple
 threads on CPU, you are expecting to see extra concurrency instead of
-serializing all the backward calls in a specific order during execution
-(behavior before TensorPlay 1.6).
+serializing all the backward calls in a specific order during execution.
 
 ### Non-determinism
 
@@ -940,8 +938,8 @@ Then it will discuss the order in which they are fired.
 The hooks that will be covered are: backward hooks registered to Tensor via
 {meth}`tensorplay.Tensor.register_hook`, post-accumulate-grad hooks registered to
 Tensor via {meth}`tensorplay.Tensor.register_post_accumulate_grad_hook`, post-hooks
-registered to Node via {meth}`tensorplay.autograd.graph.Node.register_hook`, and
-pre-hooks registered to Node via {meth}`tensorplay.autograd.graph.Node.register_prehook`.
+registered to Node via {meth}`tensorplay.Node.add_post_hook`, and
+pre-hooks registered to Node via {meth}`tensorplay.Node.add_pre_hook`.
 
 ### Whether a particular hook will be fired
 
@@ -960,9 +958,9 @@ the backward pass. Thus, post-accumulate-grad hooks can only be registered for l
 Tensors. Registering a hook via {meth}`tensorplay.Tensor.register_post_accumulate_grad_hook`
 on a non-leaf Tensor will error, even if you call `backward(retain_graph=True)`.
 
-Hooks registered to {class}`tensorplay.autograd.graph.Node` using
-{meth}`tensorplay.autograd.graph.Node.register_hook` or
-{meth}`tensorplay.autograd.graph.Node.register_prehook` are only fired if
+Hooks registered to {class}`tensorplay.Node` using
+{meth}`tensorplay.Node.add_post_hook` or
+{meth}`tensorplay.Node.add_pre_hook` are only fired if
 the Node it was registered to is executed.
 
 Whether a particular Node is executed may depend on whether the backward pass was called with
@@ -1001,17 +999,13 @@ earlier hooks.
 
 ### Special hooks
 
-{func}`tensorplay.autograd.graph.register_multi_grad_hook` is implemented using hooks registered
-to Tensors. Each individual Tensor hook is fired following the Tensor hook ordering
-defined above and the registered multi-grad hook is called when the last Tensor gradient
-is computed.
-
-{meth}`tensorplay.nn.modules.module.register_module_full_backward_hook` is implemented using hooks
+{meth}`tensorplay.nn.Module.register_full_backward_hook` is implemented using hooks
 registered to Node. As the forward is computed, hooks are registered to grad_fn corresponding
 to the inputs and outputs of the module. Because a module may take multiple inputs and return
 multiple outputs, a dummy custom autograd Function is first applied to the inputs of the module
 before forward and the outputs of the module before the output of forward is returned to ensure
 that those Tensors share a single grad_fn, which we can then attach our hooks to.
+Its pre-hook counterpart is {meth}`tensorplay.nn.Module.register_full_backward_pre_hook`.
 
 ### Behavior of Tensor hooks when Tensor is modified in-place
 

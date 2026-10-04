@@ -691,7 +691,7 @@ tensor will be interpreted as missing values in the sparse tensor:
 #### CSR Tensor Operations
 
 The sparse matrix-vector multiplication can be performed with the
-{meth}`tensor.matmul` method. This is currently the only math operation
+{meth}`tensorplay.Tensor.matmul` method. This is currently the only math operation
 supported on CSR tensors.
     >>> vec = tensorplay.randn(4, 1, dtype=tensorplay.float64)
     >>> sp.matmul(vec)
@@ -964,11 +964,7 @@ multiplication, and `@` is matrix multiplication.
    :func:`tensorplay.addmm`; no; ``f * M[strided] + f * (M[SparseSemiStructured] @ M[strided]) -> M[strided]``
    :func:`tensorplay.addmm`; no; ``f * M[strided] + f * (M[strided] @ M[SparseSemiStructured]) -> M[strided]``
    :func:`tensorplay.sparse.addmm`; yes; ``f * M[strided] + f * (M[sparse_coo] @ M[strided]) -> M[strided]``
-   :func:`tensorplay.sparse.spsolve`; no; ``SOLVE(M[sparse_csr], V[strided]) -> V[strided]``
    :func:`tensorplay.sspaddmm`; no; ``f * M[sparse_coo] + f * (M[sparse_coo] @ M[strided]) -> M[sparse_coo]``
-   :func:`tensorplay.lobpcg`; no; ``GENEIG(M[sparse_coo]) -> M[strided], M[strided]``
-   :func:`tensorplay.pca_lowrank`; yes; ``PCA(M[sparse_coo]) -> M[strided], M[strided], M[strided]``
-   :func:`tensorplay.svd_lowrank`; yes; ``SVD(M[sparse_coo]) -> M[strided], M[strided], M[strided]``
 ```
 where "Sparse grad?" column indicates if the TensorPlay operation supports
 backward with respect to sparse matrix argument. All TensorPlay operations,
@@ -1055,13 +1051,10 @@ The following {mod}`tensorplay` functions support sparse tensors:
 {func}`~tensorplay.is_same_size`
 {func}`~tensorplay.is_signed`
 {func}`~tensorplay.is_tensor`
-{func}`~tensorplay.lobpcg`
 {func}`~tensorplay.mm`
 {func}`~tensorplay.native_norm`
-{func}`~tensorplay.pca_lowrank`
 {func}`~tensorplay.select`
 {func}`~tensorplay.stack`
-{func}`~tensorplay.svd_lowrank`
 {func}`~tensorplay.unsqueeze`
 {func}`~tensorplay.vstack`
 {func}`~tensorplay.zeros`

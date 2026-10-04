@@ -5,13 +5,8 @@
 
 # Automatic Mixed Precision package - tensorplay.amp
 
-% Both modules below are missing doc entry. Adding them here for now.
-% This does not add anything to the rendered page
 ```{eval-rst}
-.. py:module:: tensorplay.cpu.amp
-```
-```{eval-rst}
-.. py:module:: tensorplay.cuda.amp
+.. py:module:: tensorplay.amp
 ```
 {class}`tensorplay.amp` provides convenience methods for mixed precision,
 where some operations use the `tensorplay.float32` (`float`) datatype and other operations
@@ -24,9 +19,11 @@ and [Automatic Mixed Precision recipe](https://www.tensorplay.cn/guide/tutorials
 However, {class}`tensorplay.autocast` and {class}`tensorplay.GradScaler` are modular, and may be used separately if desired.
 As shown in the CPU example section of {class}`tensorplay.autocast`, "automatic mixed precision training/inference" on CPU with
 datatype of `tensorplay.bfloat16` only uses {class}`tensorplay.autocast`.
-:::{warning}
-`tensorplay.cuda.amp.autocast(args...)` and `tensorplay.cpu.amp.autocast(args...)` is deprecated. Please use `tensorplay.amp.autocast("cuda", args...)` or `tensorplay.amp.autocast("cpu", args...)` instead.
-`tensorplay.cuda.amp.GradScaler(args...)` and `tensorplay.cpu.amp.GradScaler(args...)` is deprecated. Please use `tensorplay.amp.GradScaler("cuda", args...)` or `tensorplay.amp.GradScaler("cpu", args...)` instead.
+:::{note}
+{class}`tensorplay.autocast` takes the device type as its first argument, so the
+same class covers CPU and CUDA: `tensorplay.autocast("cuda", ...)` and
+`tensorplay.autocast("cpu", ...)`. {class}`tensorplay.amp.GradScaler` takes the
+device the same way.
 :::
 :::{warning}
 When combining AMP with `tensorplay.compile`, note that a backward op runs in
@@ -36,7 +33,6 @@ forward. If you follow AMP's recommended training pattern and run backward
 outside autocast, use {func}`tensorplay.amp.custom_bwd` on the backward method
 so it re-enters the forward's autocast state explicitly.
 :::
-{class}`tensorplay.autocast` and {class}`tensorplay.cpu.amp.autocast` are new in version `1.10`.
 ```{contents}
 :local: true
 ```
@@ -448,21 +444,6 @@ regardless of whether autocast is enabled.
 .. py:module:: tensorplay.amp.autocast_mode
 ```
 ```{eval-rst}
-.. py:module:: tensorplay.cpu.amp.autocast_mode
-```
-```{eval-rst}
-.. py:module:: tensorplay.cuda.amp.autocast_mode
-```
-```{eval-rst}
-.. py:module:: tensorplay.cuda.amp.common
-```
-```{eval-rst}
 .. py:module:: tensorplay.amp.grad_scaler
-```
-```{eval-rst}
-.. py:module:: tensorplay.cpu.amp.grad_scaler
-```
-```{eval-rst}
-.. py:module:: tensorplay.cuda.amp.grad_scaler
 ```
 

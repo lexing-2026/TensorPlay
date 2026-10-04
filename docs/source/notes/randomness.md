@@ -33,7 +33,7 @@ tensorplay.manual_seed(0)
 ```
 
 Some TensorPlay operations may use random numbers internally.
-{meth}`tensorplay.svd_lowrank()` does this, for instance. Consequently, calling it
+{meth}`tensorplay.randperm()` does this, for instance. Consequently, calling it
 multiple times back-to-back with the same input arguments may give different
 results. However, as long as {meth}`tensorplay.manual_seed()` is set to a constant
 at the beginning of an application and all other sources of nondeterminism have
@@ -237,16 +237,14 @@ See {meth}`tensorplay.nn.RNN` and {meth}`tensorplay.nn.LSTM` for details and wor
 Operations like {meth}`tensorplay.empty` and {meth}`tensorplay.Tensor.resize_` can return
 tensors with uninitialized memory that contain undefined values. Using such a
 tensor as an input to another operation is invalid if determinism is required,
-because the output will be nondeterministic. But there is nothing to actually
-prevent such invalid code from being run. So for safety,
-{attr}`tensorplay.utils.deterministic.fill_uninitialized_memory` is set to `True`
-by default, which will fill the uninitialized memory with a known value if
-`tensorplay.use_deterministic_algorithms(True)` is set. This will prevent the
-possibility of this kind of nondeterministic behavior.
+because the output will be nondeterministic. This tree does not add a switch
+that pre-fills such memory: if your program depends on the contents of an
+uninitialized tensor, allocate it explicitly instead — for example with
+{meth}`tensorplay.zeros` — and the result becomes reproducible.
 
-However, filling uninitialized memory is detrimental to performance. So if your
-program is valid and does not use uninitialized memory as the input to an
-operation, then this setting can be turned off for better performance.
+Note that {func}`tensorplay.use_deterministic_algorithms` only gates the
+algorithms it lists on the {doc}`deterministic` page; it does not change what
+{meth}`tensorplay.empty` returns.
 
 ## DataLoader
 

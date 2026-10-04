@@ -94,13 +94,13 @@ RuntimeError: The expanded size of the tensor (1) must match the existing size (
 
 ## Backwards compatibility
 
-Prior versions of TensorPlay allowed certain pointwise functions to execute on tensors with different shapes,
-as long as the number of elements in each tensor was equal.  The pointwise operation would then be carried
-out by viewing each tensor as 1-dimensional.  TensorPlay now supports broadcasting and the "1-dimensional"
-pointwise behavior is considered deprecated and will generate a Python warning in cases where tensors are
-not broadcastable, but have the same number of elements.
+TensorPlay supports broadcasting, so the older behaviour — certain pointwise
+functions executing on tensors of different shapes as long as the number of
+elements matched, by viewing each tensor as 1-dimensional — is considered
+deprecated. It now generates a Python warning in cases where tensors are not
+broadcastable but have the same number of elements.
 
-Note that the introduction of broadcasting can cause backwards incompatible changes in the case where
+Note that the presence of broadcasting can cause backwards incompatible changes in the case where
 two tensors do not have the same shape, but are broadcastable and have the same number of elements.
 For Example:
 

@@ -12194,10 +12194,10 @@ Returns a tensor filled with uninitialized data. The shape of the tensor is
 defined by the variable argument :attr:`size`.
 
 .. note::
-    If :func:`tensorplay.use_deterministic_algorithms()` and
-    :attr:`tensorplay.utils.deterministic.fill_uninitialized_memory` are both set to
-    ``True``, the output tensor is initialized to prevent any possible
-    nondeterministic behavior from using the data as an input to an operation.
+    The returned storage is uninitialized, and :func:`tensorplay.use_deterministic_algorithms`
+    does not change that. If the contents matter, allocate with
+    :func:`tensorplay.zeros` or fill the tensor before reading it, otherwise the
+    output becomes a source of nondeterminism.
     Floating point and complex tensors are filled with NaN, and integer tensors
     are filled with the maximum value.
 
@@ -12232,10 +12232,10 @@ Returns an uninitialized tensor with the same size as :attr:`input`.
 ``tensorplay.empty(input.size(), dtype=input.dtype, layout=input.layout, device=input.device)``.
 
 .. note::
-    If :func:`tensorplay.use_deterministic_algorithms()` and
-    :attr:`tensorplay.utils.deterministic.fill_uninitialized_memory` are both set to
-    ``True``, the output tensor is initialized to prevent any possible
-    nondeterministic behavior from using the data as an input to an operation.
+    The returned storage is uninitialized, and :func:`tensorplay.use_deterministic_algorithms`
+    does not change that. If the contents matter, allocate with
+    :func:`tensorplay.zeros` or fill the tensor before reading it, otherwise the
+    output becomes a source of nondeterminism.
     Floating point and complex tensors are filled with NaN, and integer tensors
     are filled with the maximum value.
 
@@ -12276,10 +12276,10 @@ Creates a tensor with the specified :attr:`size` and :attr:`stride` and filled w
     in memory) its behavior is undefined.
 
 .. note::
-    If :func:`tensorplay.use_deterministic_algorithms()` and
-    :attr:`tensorplay.utils.deterministic.fill_uninitialized_memory` are both set to
-    ``True``, the output tensor is initialized to prevent any possible
-    nondeterministic behavior from using the data as an input to an operation.
+    The returned storage is uninitialized, and :func:`tensorplay.use_deterministic_algorithms`
+    does not change that. If the contents matter, allocate with
+    :func:`tensorplay.zeros` or fill the tensor before reading it, otherwise the
+    output becomes a source of nondeterminism.
     Floating point and complex tensors are filled with NaN, and integer tensors
     are filled with the maximum value.
 
@@ -12327,10 +12327,10 @@ tensor with no overlaps.  If possible, prefer using this function over
 :func:`tensorplay.empty_strided` or manual use of :func:`tensorplay.as_strided`.
 
 .. note::
-    If :func:`tensorplay.use_deterministic_algorithms()` and
-    :attr:`tensorplay.utils.deterministic.fill_uninitialized_memory` are both set to
-    ``True``, the output tensor is initialized to prevent any possible
-    nondeterministic behavior from using the data as an input to an operation.
+    The returned storage is uninitialized, and :func:`tensorplay.use_deterministic_algorithms`
+    does not change that. If the contents matter, allocate with
+    :func:`tensorplay.zeros` or fill the tensor before reading it, otherwise the
+    output becomes a source of nondeterminism.
     Floating point and complex tensors are filled with NaN, and integer tensors
     are filled with the maximum value.
 

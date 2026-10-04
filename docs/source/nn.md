@@ -41,7 +41,7 @@ Utility functions to apply and remove weight normalization from Module parameter
 Utility functions for initializing Module parameters.
 Utility classes and functions for pruning Module parameters.
 Parametrizations implemented using the new parametrization functionality
-in {func}`tensorplay.nn.utils.parameterize.register_parametrization`.
+in {func}`tensorplay.nn.utils.parametrize.register_parametrization`.
 Utility functions to parametrize Tensors on existing Modules.
 Note that these functions can be used to parametrize a given Parameter
 or Buffer given a specific function that maps from an input space to the

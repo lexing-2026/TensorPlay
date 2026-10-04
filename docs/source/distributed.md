@@ -503,7 +503,7 @@ To use it, simply issue `tensorplay.distributed.breakpoint(rank)` on all ranks, 
 
 ### Monitored Barrier
 
-As of v1.10, {func}`tensorplay.distributed.monitored_barrier` exists as an alternative to {func}`tensorplay.distributed.barrier` which fails with helpful information about which rank may be faulty
+{func}`tensorplay.distributed.monitored_barrier` is available as an alternative to {func}`tensorplay.distributed.barrier` which fails with helpful information about which rank may be faulty
 when crashing, i.e. not all ranks calling into {func}`tensorplay.distributed.monitored_barrier` within the provided timeout. {func}`tensorplay.distributed.monitored_barrier` implements a host-side
 barrier using `send`/`recv` communication primitives in a process similar to acknowledgements, allowing rank 0 to report which rank(s) failed to acknowledge
 the barrier in time. As an example, consider the following function where rank 1 fails to call into {func}`tensorplay.distributed.monitored_barrier` (in practice this could be due

@@ -177,21 +177,23 @@ OrderedDict([('l0.weight', tensor([[ 0.1400, 0.4563, -0.0271, -0.4406],
 
 ## Serialized file format for `tensorplay.save`
 
-Since TensorPlay 1.6.0, `tensorplay.save` defaults to returning an uncompressed ZIP64
-archive unless the user sets `_use_new_zipfile_serialization=False`.
-
-In this archive, the files are ordered as such
+`tensorplay.save` defaults to returning an uncompressed ZIP64 archive unless the
+user sets `_use_new_zipfile_serialization=False`. Every record lives under an
+`archive/` prefix:
 
 ```text
 checkpoint.pth
-├── data.pkl
-├── byteorder  # added in TensorPlay 2.1.0
-├── data/
-│   ├── 0
-│   ├── 1
-│   ├── 2
-│   └── …
-└── version
+└── archive/
+    ├── .format_version
+    ├── .storage_alignment
+    ├── data.pkl
+    ├── byteorder
+    ├── version
+    └── data/
+        ├── 0
+        ├── 1
+        ├── 2
+        └── …
 ```
 
 The entries are as follows:
@@ -201,15 +203,17 @@ The entries are as follows:
 - `byteorder` contains a string with the `sys.byteorder` when saving (“little” or “big”)
 - `data/` contains all the storages in the object, where each storage is a separate file
 - `version` contains a version number at save time that can be used at load time
+- `.format_version` and `.storage_alignment` record the on-disk layout so a future
+  reader can tell which conventions the archive was written with
 
 When saving, TensorPlay will ensure that the local file header of each file is padded
 to an offset that is a multiple of 64 bytes, ensuring that the offset of each file
 is 64-byte aligned.
 
 ```{note}
-Tensors on certain devices such as XLA are serialized as pickled numpy arrays. As
-such, their storages are not serialized. In these cases `data/` might not exist
-in the checkpoint.
+Tensors on devices whose storage cannot be written directly are serialized as
+pickled numpy arrays. As such, their storages are not serialized. In these cases
+`data/` might not exist in the checkpoint.
 ```
 
 (layout-control)=
@@ -234,7 +238,7 @@ the checkpoint, enabling direct checkpoint manipulation.
 
 ```python
 import tensorplay.nn as nn
-from tensorplay._subclasses.fake_tensor import FakeTensorMode
+from tensorplay._higher_order_ops._hop_base import FakeTensorMode
 
 m = nn.Linear(10, 10)
 tensorplay.save(m.state_dict(), "checkpoint.pt")
@@ -255,8 +259,8 @@ offers a comprehensive example of using these features to manipulate a checkpoin
 
 ## `tensorplay.load` with `weights_only=True`
 
-Starting in version 2.6, `tensorplay.load` will use `weights_only=True` if the `pickle_module`
-argument is not passed.
+`tensorplay.load` defaults to `weights_only=True`, so omitting `pickle_module`
+still takes the restricted path.
 
 (weights-only-security)=
 
