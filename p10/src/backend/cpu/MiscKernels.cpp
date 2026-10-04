@@ -534,8 +534,6 @@ TENSORPLAY_LIBRARY_IMPL(CPU, MiscKernels) {
     m.impl("corrcoef", corrcoef_cpu);
     m.impl("_cov_backward", cov_backward_cpu);
     m.impl("_corrcoef_backward", corrcoef_backward_cpu);
-    m.impl("quantile", quantile_kernel);
-    m.impl("nanquantile", nanquantile_kernel);
     m.impl("histogram.bins_tensor", histogram_bins_tensor_kernel);
     m.impl("histogram.bin_ct", histogram_bin_ct_kernel);
     m.impl("hash_tensor", hash_tensor_cpu);
@@ -1540,14 +1538,20 @@ std::tuple<Tensor, Tensor> histogram_bin_ct_kernel(
     return {std::move(hist), std::move(bin_edges)};
 }
 
-// quantile/nanquantile/histogram bodies are device-generic composites over
-// dispatched primitives (sort/gather/lerp/searchsorted/index_add/aminmax/
-// linspace), so the same functions register for CUDA (Einsum.cpp precedent).
+// The histogram bodies are device-generic compositions of dispatched
+// primitives (searchsorted/index_add/aminmax/linspace), so the same functions
+// register for CUDA (Einsum.cpp precedent).
 TENSORPLAY_LIBRARY_IMPL(CUDA, MiscKernelsQuantileHistogramComposites) {
-    m.impl("quantile", quantile_kernel);
-    m.impl("nanquantile", nanquantile_kernel);
     m.impl("histogram.bins_tensor", histogram_bins_tensor_kernel);
     m.impl("histogram.bin_ct", histogram_bin_ct_kernel);
+}
+
+// quantile and nanquantile are compositions of sort/gather/lerp with no
+// derivative of their own: they are differentiated through the operators
+// they call, on every backend those operators serve.
+TENSORPLAY_LIBRARY_IMPL(Composite, MiscKernelsQuantileComposites) {
+    m.impl("quantile", quantile_kernel);
+    m.impl("nanquantile", nanquantile_kernel);
 }
 
 
