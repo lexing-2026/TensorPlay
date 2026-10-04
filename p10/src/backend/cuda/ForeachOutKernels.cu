@@ -242,11 +242,22 @@ std::vector<Tensor> foreach_norm_cuda(const std::vector<Tensor>& self,
                                       std::optional<DType> dtype) {
     std::vector<Tensor> out;
     out.reserve(self.size());
-    bool fast_l2 = !self.empty() && !dtype.has_value() &&
-        ord.toDouble() == 2.0 && foreach_mta::eligible_list(self);
+    // One pass decides both list eligibility and per-tensor fast-path
+    // suitability; walking the list twice cost measurable host time at
+    // optimizer-scale list lengths.
+    bool fast_l2 = !self.empty() && !dtype.has_value() && ord.toDouble() == 2.0;
     if (fast_l2) {
+        const Tensor& first = self.front();
+        fast_l2 = first.defined() && !first.is_sparse() && first.is_contiguous() &&
+            foreach_mta::supported_dtype(first.dtype());
+    }
+    if (fast_l2) {
+        const DType first_dtype = self.front().dtype();
+        const Device first_device = self.front().device();
         for (const auto& value : self) {
-            if (value.requires_grad() || value.numel() == 0 ||
+            if (!value.defined() || value.is_sparse() || !value.is_contiguous() ||
+                value.dtype() != first_dtype || value.device() != first_device ||
+                value.requires_grad() || value.numel() == 0 ||
                 foreach_norm_chunk_count(value.numel()) > kNormMaxGridY) {
                 fast_l2 = false;
                 break;
