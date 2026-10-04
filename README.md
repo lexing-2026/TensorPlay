@@ -65,7 +65,7 @@
 
 <!-- Platform & Build -->
 <p>
-    <img src="https://img.shields.io/badge/Platform-Win%20%7C%20Linux-23347A?style=flat-square&labelColor=11B5D1" alt="Platform">
+    <img src="https://img.shields.io/badge/Platform-Win%20%7C%20Linux%20%7C%20macOS-23347A?style=flat-square&labelColor=11B5D1" alt="Platform">
     <img src="https://img.shields.io/badge/CPU-available-11B5D1?style=flat-square&labelColor=23347A" alt="CPU">
     <img src="https://img.shields.io/badge/CUDA-12.x%20%7C%2013.x-23347A?style=flat-square&labelColor=11B5D1&logo=nvidia&logoColor=white" alt="NVIDIA CUDA">
     <img src="https://img.shields.io/badge/ROCm-7.2-23347A?style=flat-square&labelColor=11B5D1&logo=amd&logoColor=white" alt="AMD ROCm">
@@ -78,10 +78,7 @@
         <img src="https://img.shields.io/badge/build-passing-23347A?style=flat-square&labelColor=11B5D1&logo=githubactions&logoColor=white" alt="Build">
     </a>
     <a href="https://github.com/lexing-2026/TensorPlay/actions/workflows/trunk.yml">
-        <img src="https://img.shields.io/badge/tests-1824%20passed-23347A?style=flat-square&labelColor=11B5D1&logo=pytest&logoColor=white" alt="Tests">
-    </a>
-    <a href="https://github.com/lexing-2026/TensorPlay/actions/workflows/trunk.yml">
-        <img src="https://img.shields.io/badge/coverage-91%25-11B5D1?style=flat-square&labelColor=23347A" alt="Coverage">
+        <img src="https://img.shields.io/badge/tests-5680%20passed-23347A?style=flat-square&labelColor=11B5D1&logo=pytest&logoColor=white" alt="Tests">
     </a>
 </p>
 
@@ -119,13 +116,19 @@ The whole stack — Python API, C++ core, CUDA kernels, compiler — is engineer
 - [About TensorPlay](#about-tensorplay)
   - [A Transparent Tensor Library](#a-transparent-tensor-library)
   - [Why TensorPlay](#why-tensorplay)
+    - [Familiar and Python-First](#familiar-and-python-first)
+    - [DIY Hardware Acceleration](#diy-hardware-acceleration)
+    - [An Explicit Autograd Engine](#an-explicit-autograd-engine)
+    - [Extensions Without Pain](#extensions-without-pain)
 - [Installation](#installation)
   - [Binaries](#binaries)
+  - [Nightly (preview) builds](#nightly-preview-builds)
   - [From Source](#from-source)
     - [Prerequisites](#prerequisites)
     - [Get the TensorPlay Source](#get-the-tensorplay-source)
     - [Install Build Dependencies](#install-build-dependencies)
     - [Install TensorPlay](#install-tensorplay)
+    - [Run the Test Suite](#run-the-test-suite)
     - [Adjusting Build Options (Optional)](#adjusting-build-options-optional)
 - [Getting Started](#getting-started)
   - [Automatic Differentiation](#automatic-differentiation)
@@ -137,7 +140,9 @@ The whole stack — Python API, C++ core, CUDA kernels, compiler — is engineer
 - [Communication](#communication)
 - [Releases and Contributing](#releases-and-contributing)
 - [License](#license)
-- [The organization behind TensorPlay](#the-organization-behind-tensorplay)
+- [The Organization: TensorPlay](#the-organization-tensorplay)
+  - [Projects](#projects)
+  - [Other dependencies](#other-dependencies)
 
 <!-- tocstop -->
 
@@ -165,7 +170,7 @@ Every call is one short, visible path — no black box between your model and th
 ```mermaid
 flowchart TB
     py["Python API — tensorplay / nn / optim / data"] --> ag["TPX autograd — explicit DAG"]
-    py --> disp["P10 dispatcher — 13 dispatch keys"]
+    py --> disp["P10 dispatcher — 33 dispatch keys"]
     ag --> disp
     disp --> cpu["CPU kernels"]
     disp --> cuda["CUDA kernels"]
@@ -207,7 +212,8 @@ First-class custom operators: register an op with `tensorplay.library`, attach f
 # CPU wheels from PyPI
 pip install tensorplay --upgrade
 
-# CUDA 13.0 wheels from the TensorPlay CUDA index
+# CUDA wheels from the TensorPlay CUDA index — pick the variant matching
+# your toolkit: cu124, cu126 or cu130.
 # Keep PyPI as an extra index for runtime dependencies.
 pip install tensorplay \
   --index-url https://download.tensorplay.cn/whl/cu130/ \
@@ -215,7 +221,7 @@ pip install tensorplay \
 ```
 
 > [!NOTE]
-> Make sure your Python version matches the wheel tags (e.g. `cp310` for Python 3.10). For CUDA wheels, the driver and runtime must support the CUDA version of the wheel.
+> Make sure your Python version matches the wheel tags (e.g. `cp310` for Python 3.10). For CUDA wheels, the driver and runtime must support the CUDA version of the wheel. The full variant list lives in [`.github/cuda-variants.json`](.github/cuda-variants.json).
 
 > [!TIP]
 > The CUDA 13.0 wheels target compute capability 8.6 GPUs only. If your GPU has a different compute capability (or the wheel fails to run on your device), [build from source](#from-source) instead and set `CMAKE_CUDA_ARCHITECTURES` to your target — it defaults to `native`, which auto-detects the local GPU.
@@ -225,7 +231,7 @@ pip install tensorplay \
 Try tomorrow's features today: every change that passes our build-and-smoke pipeline lands on the rolling `nightly` channel automatically, following the nightly version format (`X.Y.0.dev<date>+cuXXX` / `+cpu`). Only the latest build per variant is kept.
 
 ```bash
-# CUDA nightly
+# CUDA nightly — same variants as the stable channel: cu124, cu126, cu130
 pip install --pre tensorplay \
   --index-url https://download.tensorplay.cn/whl/nightly/cu130/ \
   --extra-index-url https://pypi.org/simple
@@ -348,7 +354,8 @@ z = x.matmul(y) + tp.ones_like(x)
 loss = z.sum()
 loss.backward()
 
-print(x.grad)  # [[6., 6.], [6., 6.]]
+# x.grad is [[11., 15.], [11., 15.]] — the row sums of y, since dL/dz is all ones
+print(x.grad)
 ```
 
 Under the hood, TPX records each operation into an explicit DAG and replays the chain rule node by node: $\dfrac{\partial \mathcal{L}}{\partial x} = \dfrac{\partial \mathcal{L}}{\partial z} \cdot \dfrac{\partial z}{\partial x}$ — every edge of that graph is code you can step through.
@@ -402,7 +409,7 @@ The [benchmark/](benchmark/) suite measures what a readable framework costs — 
 - **Micro and subsystem**: GEMM, optimizer steps, dataloader, serialization, autograd Function overhead, custom-op call overhead, LLaMA end-to-end
 - **Reports**: every script emits a JSON report (`--json-out`) — throughput, latency percentiles, compile cost — ready for plotting and for the [white paper](docs/whitepaper/main.pdf) evaluation
 
-Measured highlights (see the [white paper](docs/whitepaper/main.pdf), §9): the dispatcher adds the same sub-1% sliver on CPU, CUDA and Vulkan paths; the CUDA backend covers 1,274 unique ops (96% of the CPU surface); the Vulkan teaching backend ships 145 ops backed by 4.5k lines of GLSL shaders.
+Measured highlights (see the [white paper](docs/whitepaper/main.pdf), §9): the dispatcher adds the same sub-1% sliver on CPU, CUDA and Vulkan paths; the CUDA backend covers 1,262 unique ops (97% of the CPU surface, 1,233 ops); the Vulkan teaching backend ships 224 ops backed by 6.8k lines of GLSL shaders across 102 files. The pytest suite collects 5,680 tests.
 
 Scripts and methodology: [benchmark/README.md](benchmark/README.md).
 
