@@ -160,7 +160,6 @@ def test_epilogue_decision_key_separates_chains():
 @pytest.mark.skipif(
     not tp.cuda.is_available(), reason="CUDA unavailable"
 )
-@pytest.mark.skip(reason="CUDA autotune crashes in this environment")
 def test_extern_epilogue_region_feeds_reduction_gpu(cache_root):
     """The folded chain's export wires into a following reduction
     segment; numerics stay on the eager schedule."""
@@ -179,7 +178,6 @@ def test_extern_epilogue_region_feeds_reduction_gpu(cache_root):
     assert tp.allclose(out, ref, rtol=1e-4, atol=1e-4)
 
 
-@pytest.mark.skip(reason="CUDA autotune crashes in this environment")
 @pytest.mark.skipif(
     not tp.cuda.is_available(), reason="CUDA unavailable"
 )

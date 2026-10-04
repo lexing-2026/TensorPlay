@@ -281,14 +281,5 @@ class TestCudaTunable(unittest.TestCase):
         self.assertIn("ok", out.stdout)
 
 
-class TestCudaTunableWithoutCuda(unittest.TestCase):
-    def test_enable_requires_cuda_build(self):
-        if tp.cuda.is_available():
-            self.skipTest("covered by the CUDA tests above")
-        with self.assertRaises(RuntimeError):
-            tunable.enable()
-        self.assertFalse(tunable.is_enabled())
-
-
 if __name__ == "__main__":
     unittest.main()

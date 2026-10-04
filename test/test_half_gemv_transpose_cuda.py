@@ -54,14 +54,17 @@ def _gen32(shape, seed):
     return tp.randn(shape, device="cuda", dtype=tp.float32)
 
 
-@pytest.mark.parametrize("dt", HALF_DTYPES)
-@pytest.mark.parametrize("M,K,N", CUDA_SHAPES_GEMV)
-@pytest.mark.parametrize("transposed", [False, True])
+def _gemv_cases():
+    for dt in HALF_DTYPES:
+        for M, K, N in CUDA_SHAPES_GEMV:
+            for transposed in (False,) if N == 1 else (False, True):
+                yield pytest.param(dt, M, K, N, transposed)
+
+
+@pytest.mark.parametrize("dt,M,K,N,transposed", _gemv_cases())
 def test_half_gemv_matches_fp32_reference(dt, M, K, N, transposed):
     if not _available():
         pytest.skip("no cuda")
-    if transposed and N == 1:
-        pytest.skip("transpose flag meaningless for N == 1")
 
     af = _gen32([M, K], M * 31 + K)
     bf = _gen32([K, N], K * 17 + N)
