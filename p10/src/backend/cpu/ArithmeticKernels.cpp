@@ -235,6 +235,46 @@ void scalar_f64_avx512(int code, const double* a, double* y, int64_t n,
     }
 }
 
+// 256-bit twins of the scalar kernels above for client cores whose 512-bit
+// datapath is emulated: same op folding, half the lanes.
+__attribute__((target("avx2")))
+void scalar_f32_avx256(int code, const float* a, float* y, int64_t n,
+                       float scalar) {
+    const __m256 vscalar = _mm256_set1_ps(scalar);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 x = _mm256_loadu_ps(a + i);
+        switch (code) {
+            case BIN_ADD: _mm256_storeu_ps(y + i, _mm256_add_ps(x, vscalar)); break;
+            case BIN_MUL: _mm256_storeu_ps(y + i, _mm256_mul_ps(x, vscalar)); break;
+            default:      _mm256_storeu_ps(y + i, _mm256_div_ps(x, vscalar)); break;
+        }
+    }
+    for (; i < n; ++i) {
+        y[i] = code == BIN_ADD ? a[i] + scalar
+             : code == BIN_MUL ? a[i] * scalar : a[i] / scalar;
+    }
+}
+
+__attribute__((target("avx2")))
+void scalar_f64_avx256(int code, const double* a, double* y, int64_t n,
+                       double scalar) {
+    const __m256d vscalar = _mm256_set1_pd(scalar);
+    int64_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const __m256d x = _mm256_loadu_pd(a + i);
+        switch (code) {
+            case BIN_ADD: _mm256_storeu_pd(y + i, _mm256_add_pd(x, vscalar)); break;
+            case BIN_MUL: _mm256_storeu_pd(y + i, _mm256_mul_pd(x, vscalar)); break;
+            default:      _mm256_storeu_pd(y + i, _mm256_div_pd(x, vscalar)); break;
+        }
+    }
+    for (; i < n; ++i) {
+        y[i] = code == BIN_ADD ? a[i] + scalar
+             : code == BIN_MUL ? a[i] * scalar : a[i] / scalar;
+    }
+}
+
 // Broadcast variants of the dense kernels above: one operand is constant
 // along the inner run (its TensorIterator stride is zero), so it loads once
 // and the dense side streams at full width.
@@ -936,30 +976,44 @@ static void binary_f64_vec_scalar_a(int code, double a, const double* b, double*
 inline void scalar_f32_contiguous(int code, const float* a, float* y,
                                    int64_t n, float scalar) {
     parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-        scalar_f32_avx512(code, a + begin, y + begin, end - begin, scalar);
+        if (cpu_has_avx512())
+            scalar_f32_avx512(code, a + begin, y + begin, end - begin, scalar);
+        else
+            scalar_f32_avx256(code, a + begin, y + begin, end - begin, scalar);
     });
 }
 
 inline void scalar_f64_contiguous(int code, const double* a, double* y,
                                    int64_t n, double scalar) {
     parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-        scalar_f64_avx512(code, a + begin, y + begin, end - begin, scalar);
+        if (cpu_has_avx512())
+            scalar_f64_avx512(code, a + begin, y + begin, end - begin, scalar);
+        else
+            scalar_f64_avx256(code, a + begin, y + begin, end - begin, scalar);
     });
 }
 
 inline void binary_f32_contiguous(int code, const float* a, const float* b,
                                    float* y, int64_t n, float alpha) {
     parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-        binary_f32_avx512(code, a + begin, b + begin, y + begin,
-                          end - begin, alpha);
+        if (cpu_has_avx512())
+            binary_f32_avx512(code, a + begin, b + begin, y + begin,
+                              end - begin, alpha);
+        else
+            binary_f32_avx256(code, a + begin, b + begin, y + begin,
+                              end - begin, alpha);
     });
 }
 
 inline void binary_f64_contiguous(int code, const double* a, const double* b,
                                    double* y, int64_t n, double alpha) {
     parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-        binary_f64_avx512(code, a + begin, b + begin, y + begin,
-                          end - begin, alpha);
+        if (cpu_has_avx512())
+            binary_f64_avx512(code, a + begin, b + begin, y + begin,
+                              end - begin, alpha);
+        else
+            binary_f64_avx256(code, a + begin, b + begin, y + begin,
+                              end - begin, alpha);
     });
 }
 
@@ -2553,7 +2607,7 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, const Scalar& alph
     if (self.dtype() == DType::Float32 && other.dtype() == DType::Float32 &&
         self.is_contiguous() && other.is_contiguous() &&
         self.shape() == other.shape() && !alpha.isComplex() &&
-        cpu_has_avx512()) {
+        (cpu_has_avx512() || cpu_has_avx2f())) {
         binary_f32_contiguous(BIN_ADD, self.data_ptr<float>(),
                               other.data_ptr<float>(), self.data_ptr<float>(),
                               self.numel(), alpha.to<float>());
@@ -3210,7 +3264,7 @@ Tensor add_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& 
     // agree with the generic path.
     if (self.dtype() == DType::Float32 && result_dtype == DType::Float32 &&
         !other.isComplex() && !alpha.isComplex() && self.is_contiguous() &&
-        cpu_has_avx512()) {
+        (cpu_has_avx512() || cpu_has_avx2f())) {
         Tensor result = Tensor::empty(
             static_cast<std::vector<int64_t>>(self.shape()), DType::Float32,
             self.device());
@@ -3221,7 +3275,7 @@ Tensor add_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& 
     }
     if (self.dtype() == DType::Float64 && result_dtype == DType::Float64 &&
         !other.isComplex() && !alpha.isComplex() && self.is_contiguous() &&
-        cpu_has_avx512()) {
+        (cpu_has_avx512() || cpu_has_avx2f())) {
         Tensor result = Tensor::empty(
             static_cast<std::vector<int64_t>>(self.shape()), DType::Float64,
             self.device());
@@ -3264,7 +3318,7 @@ Tensor sub_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& 
     // product instead of the recursive elementwise functor.
     if (self.dtype() == DType::Float32 && result_dtype == DType::Float32 &&
         !other.isComplex() && !alpha.isComplex() && self.is_contiguous() &&
-        cpu_has_avx512()) {
+        (cpu_has_avx512() || cpu_has_avx2f())) {
         Tensor result = Tensor::empty(
             static_cast<std::vector<int64_t>>(self.shape()), DType::Float32,
             self.device());
@@ -3275,7 +3329,7 @@ Tensor sub_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& 
     }
     if (self.dtype() == DType::Float64 && result_dtype == DType::Float64 &&
         !other.isComplex() && !alpha.isComplex() && self.is_contiguous() &&
-        cpu_has_avx512()) {
+        (cpu_has_avx512() || cpu_has_avx2f())) {
         Tensor result = Tensor::empty(
             static_cast<std::vector<int64_t>>(self.shape()), DType::Float64,
             self.device());
@@ -3314,7 +3368,7 @@ Tensor mul_scalar_kernel(const Tensor& self, const Scalar& other) {
 
 #if defined(__x86_64__)
     if (self.dtype() == DType::Float32 && result_dtype == DType::Float32 &&
-        !other.isComplex() && self.is_contiguous() && cpu_has_avx512()) {
+        !other.isComplex() && self.is_contiguous() && (cpu_has_avx512() || cpu_has_avx2f())) {
         Tensor result = Tensor::empty(
             static_cast<std::vector<int64_t>>(self.shape()), DType::Float32,
             self.device());
@@ -3324,7 +3378,7 @@ Tensor mul_scalar_kernel(const Tensor& self, const Scalar& other) {
         return result;
     }
     if (self.dtype() == DType::Float64 && result_dtype == DType::Float64 &&
-        !other.isComplex() && self.is_contiguous() && cpu_has_avx512()) {
+        !other.isComplex() && self.is_contiguous() && (cpu_has_avx512() || cpu_has_avx2f())) {
         Tensor result = Tensor::empty(
             static_cast<std::vector<int64_t>>(self.shape()), DType::Float64,
             self.device());
@@ -3383,7 +3437,7 @@ Tensor div_scalar_kernel(const Tensor& self, const Scalar& other) {
 
 #if defined(__x86_64__)
     if (self.dtype() == DType::Float32 && result_dtype == DType::Float32 &&
-        !other.isComplex() && self.is_contiguous() && cpu_has_avx512()) {
+        !other.isComplex() && self.is_contiguous() && (cpu_has_avx512() || cpu_has_avx2f())) {
         Tensor result = Tensor::empty(
             static_cast<std::vector<int64_t>>(self.shape()), DType::Float32,
             self.device());
@@ -3393,7 +3447,7 @@ Tensor div_scalar_kernel(const Tensor& self, const Scalar& other) {
         return result;
     }
     if (self.dtype() == DType::Float64 && result_dtype == DType::Float64 &&
-        !other.isComplex() && self.is_contiguous() && cpu_has_avx512()) {
+        !other.isComplex() && self.is_contiguous() && (cpu_has_avx512() || cpu_has_avx2f())) {
         Tensor result = Tensor::empty(
             static_cast<std::vector<int64_t>>(self.shape()), DType::Float64,
             self.device());
@@ -3449,7 +3503,7 @@ Tensor& add_scalar_inplace_kernel(Tensor& self, const Scalar& other, const Scala
 #if defined(__x86_64__)
     if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
         !other.isComplex() && !alpha.isComplex() && self.is_contiguous() &&
-        cpu_has_avx512()) {
+        (cpu_has_avx512() || cpu_has_avx2f())) {
         if (self.dtype() == DType::Float32) {
             const float scalar = alpha.to<float>() * other.to<float>();
             scalar_f32_contiguous(BIN_ADD, self.data_ptr<float>(),
@@ -3482,14 +3536,31 @@ Tensor& add_scalar_inplace_kernel(Tensor& self, const Scalar& other, const Scala
 }
 
 Tensor& sub_scalar_inplace_kernel(Tensor& self, const Scalar& other, const Scalar& alpha) {
+#if defined(__x86_64__)
+    if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        !other.isComplex() && !alpha.isComplex() && self.is_contiguous() &&
+        (cpu_has_avx512() || cpu_has_avx2f())) {
+        if (self.dtype() == DType::Float32) {
+            const float scalar = alpha.to<float>() * other.to<float>();
+            scalar_f32_contiguous(BIN_ADD, self.data_ptr<float>(),
+                                  self.data_ptr<float>(), self.numel(), -scalar);
+        } else {
+            const double scalar = alpha.to<double>() * other.to<double>();
+            scalar_f64_contiguous(BIN_ADD, self.data_ptr<double>(),
+                                  self.data_ptr<double>(), self.numel(), -scalar);
+        }
+        return self;
+    }
+#endif
+
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         auto op = [other, alpha](ctype a) -> ctype { \
             return static_cast<ctype>(a - alpha.to<ctype>() * other.to<ctype>()); \
         }; \
         apply_unary_op_recursive<ctype>(self.data_ptr<ctype>(), self.strides(), \
-                                       self, self.strides(), \
-                                       0, 0, 0, static_cast<std::vector<int64_t>>(self.shape()), op); \
+                                        self, self.strides(), \
+                                        0, 0, 0, static_cast<std::vector<int64_t>>(self.shape()), op); \
         break; \
     }
     switch (self.dtype()) {
@@ -3503,14 +3574,14 @@ Tensor& sub_scalar_inplace_kernel(Tensor& self, const Scalar& other, const Scala
 Tensor& mul_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
 #if defined(__x86_64__)
     if (self.dtype() == DType::Float32 && !other.isComplex() &&
-        self.is_contiguous() && cpu_has_avx512()) {
+        self.is_contiguous() && (cpu_has_avx512() || cpu_has_avx2f())) {
         scalar_f32_contiguous(BIN_MUL, self.data_ptr<float>(),
                               self.data_ptr<float>(), self.numel(),
                               other.to<float>());
         return self;
     }
     if (self.dtype() == DType::Float64 && !other.isComplex() &&
-        self.is_contiguous() && cpu_has_avx512()) {
+        self.is_contiguous() && (cpu_has_avx512() || cpu_has_avx2f())) {
         scalar_f64_contiguous(BIN_MUL, self.data_ptr<double>(),
                               self.data_ptr<double>(), self.numel(),
                               other.to<double>());
@@ -3549,14 +3620,14 @@ Tensor& mul_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
 Tensor& div_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
 #if defined(__x86_64__)
     if (self.dtype() == DType::Float32 && !other.isComplex() &&
-        self.is_contiguous() && cpu_has_avx512()) {
+        self.is_contiguous() && (cpu_has_avx512() || cpu_has_avx2f())) {
         scalar_f32_contiguous(BIN_DIV, self.data_ptr<float>(),
                               self.data_ptr<float>(), self.numel(),
                               other.to<float>());
         return self;
     }
     if (self.dtype() == DType::Float64 && !other.isComplex() &&
-        self.is_contiguous() && cpu_has_avx512()) {
+        self.is_contiguous() && (cpu_has_avx512() || cpu_has_avx2f())) {
         scalar_f64_contiguous(BIN_DIV, self.data_ptr<double>(),
                               self.data_ptr<double>(), self.numel(),
                               other.to<double>());
