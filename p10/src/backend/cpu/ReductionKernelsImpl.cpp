@@ -2777,6 +2777,30 @@ inline T nan_min(T a, T b) {
     return b < a ? b : a;
 }
 
+// Whole-tensor extremum folds over a contiguous buffer, seeded from the first
+// element so no identity value is needed. Seeding also keeps the Int64/UInt64
+// minima exact: the identity-only pair tracking exists because a double
+// identity cannot round-trip 64-bit values, and a direct fold never touches
+// one.
+template <typename scalar_t>
+inline scalar_t direct_fold_max(const scalar_t* data, int64_t n) {
+    scalar_t best = data[0];
+    for (int64_t i = 1; i < n; ++i) best = nan_max(best, data[i]);
+    return best;
+}
+
+template <typename scalar_t>
+inline scalar_t direct_fold_min(const scalar_t* data, int64_t n) {
+    scalar_t best = data[0];
+    for (int64_t i = 1; i < n; ++i) best = nan_min(best, data[i]);
+    return best;
+}
+
+// At or below this element count, an all-reduce runs as the direct fold
+// above: constructing the reduction iterator and filling its identity costs
+// more host time than the whole scan.
+constexpr int64_t kMaxDirectFoldElements = 128;
+
 // Pair-tracking ops for reductions whose identity value cannot round-trip
 // precision as doubles and would corrupt the identity fill.
 template <typename scalar_t>
@@ -2804,6 +2828,32 @@ Tensor max_kernel_impl(const Tensor& self) {
     }
     Tensor input = self.contiguous();
     Tensor out = Tensor::empty({}, self.dtype(), self.device());
+
+#define TP_MAX_DIRECT_FOLD_CASE(ctype, name) \
+    case DType::name: \
+        *out.data_ptr<ctype>() = \
+            direct_fold_max<ctype>(input.data_ptr<ctype>(), input.numel()); \
+        return out;
+
+    if (input.numel() <= kMaxDirectFoldElements) {
+        switch (input.dtype()) {
+            TP_MAX_DIRECT_FOLD_CASE(uint8_t, UInt8)
+            TP_MAX_DIRECT_FOLD_CASE(int8_t, Int8)
+            TP_MAX_DIRECT_FOLD_CASE(int16_t, Int16)
+            TP_MAX_DIRECT_FOLD_CASE(int32_t, Int32)
+            TP_MAX_DIRECT_FOLD_CASE(int64_t, Int64)
+            TP_MAX_DIRECT_FOLD_CASE(uint16_t, UInt16)
+            TP_MAX_DIRECT_FOLD_CASE(uint32_t, UInt32)
+            TP_MAX_DIRECT_FOLD_CASE(uint64_t, UInt64)
+            TP_MAX_DIRECT_FOLD_CASE(float, Float32)
+            TP_MAX_DIRECT_FOLD_CASE(double, Float64)
+            TP_MAX_DIRECT_FOLD_CASE(Half, Float16)
+            TP_MAX_DIRECT_FOLD_CASE(BFloat16, BFloat16)
+            TP_MAX_DIRECT_FOLD_CASE(bool, Bool)
+            default: break;
+        }
+    }
+#undef TP_MAX_DIRECT_FOLD_CASE
 
 #if defined(__x86_64__)
     if (input.is_contiguous() &&
@@ -2947,6 +2997,33 @@ Tensor min_kernel_impl(const Tensor& self) {
     }
     Tensor input = self.contiguous();
     Tensor out = Tensor::empty({}, self.dtype(), self.device());
+
+#define TP_MIN_DIRECT_FOLD_CASE(ctype, name) \
+    case DType::name: \
+        *out.data_ptr<ctype>() = \
+            direct_fold_min<ctype>(input.data_ptr<ctype>(), input.numel()); \
+        return out;
+
+    if (input.numel() <= kMaxDirectFoldElements) {
+        switch (input.dtype()) {
+            TP_MIN_DIRECT_FOLD_CASE(uint8_t, UInt8)
+            TP_MIN_DIRECT_FOLD_CASE(int8_t, Int8)
+            TP_MIN_DIRECT_FOLD_CASE(int16_t, Int16)
+            TP_MIN_DIRECT_FOLD_CASE(int32_t, Int32)
+            TP_MIN_DIRECT_FOLD_CASE(int64_t, Int64)
+            TP_MIN_DIRECT_FOLD_CASE(uint16_t, UInt16)
+            TP_MIN_DIRECT_FOLD_CASE(uint32_t, UInt32)
+            TP_MIN_DIRECT_FOLD_CASE(uint64_t, UInt64)
+            TP_MIN_DIRECT_FOLD_CASE(float, Float32)
+            TP_MIN_DIRECT_FOLD_CASE(double, Float64)
+            TP_MIN_DIRECT_FOLD_CASE(Half, Float16)
+            TP_MIN_DIRECT_FOLD_CASE(BFloat16, BFloat16)
+            TP_MIN_DIRECT_FOLD_CASE(bool, Bool)
+            default: break;
+        }
+    }
+#undef TP_MIN_DIRECT_FOLD_CASE
+
     TensorIterator iter = TensorIterator::reduce_op(out, input);
 
     // the vec path's double ident, so it reduces with pair-tracking ops
