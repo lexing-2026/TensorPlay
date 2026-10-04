@@ -179,6 +179,56 @@ Tensor reduce_dims_impl(const Tensor& self, std::vector<int64_t> dims_in,
 
 }  // namespace
 
+// Welford partial state: chunks reduce independently and merge pairwise,
+// so a flat reduction parallelizes without a second pass over the data.
+struct WelfordPartial {
+    double mean;
+    double m2;
+    int64_t n;
+};
+
+inline void welford_step(WelfordPartial& s, double x) {
+    const double delta = x - s.mean;
+    ++s.n;
+    s.mean += delta / static_cast<double>(s.n);
+    s.m2 += delta * (x - s.mean);
+}
+
+inline void welford_merge(WelfordPartial& a, const WelfordPartial& b) {
+    if (b.n == 0) return;
+    if (a.n == 0) {
+        a = b;
+        return;
+    }
+    const double n_ab = static_cast<double>(a.n + b.n);
+    const double delta = b.mean - a.mean;
+    a.mean += delta * (static_cast<double>(b.n) / n_ab);
+    a.m2 += b.m2 + delta * delta *
+        (static_cast<double>(a.n) * static_cast<double>(b.n) / n_ab);
+    a.n += b.n;
+}
+
+// One Welford chain per lane over interleaved elements: the per-element
+// `delta / count` division is a long dependency chain inside a single lane,
+// so independent lanes are what lets the pipeline stay busy.  Lanes merge
+// pairwise at the end.
+inline constexpr int64_t kWelfordLanes = 8;
+
+template <typename Load>
+inline WelfordPartial welford_reduce_strided(int64_t count, int64_t stride,
+                                             Load load) {
+    WelfordPartial lanes[kWelfordLanes];
+    for (auto& lane : lanes) lane = WelfordPartial{0.0, 0.0, 0};
+    int64_t c = 0;
+    for (; c + kWelfordLanes <= count; c += kWelfordLanes)
+        for (int64_t k = 0; k < kWelfordLanes; ++k)
+            welford_step(lanes[k], load(c + k, stride));
+    for (; c < count; ++c) welford_step(lanes[0], load(c, stride));
+    WelfordPartial total = lanes[0];
+    for (int64_t k = 1; k < kWelfordLanes; ++k) welford_merge(total, lanes[k]);
+    return total;
+}
+
 // mean_var_over_dims keeps external linkage: ReductionKernels.cpp reaches it
 // through an extern declaration.
 std::pair<Tensor, Tensor> mean_var_over_dims(const Tensor& self,
@@ -255,6 +305,173 @@ std::pair<Tensor, Tensor> mean_var_over_dims(const Tensor& self,
             }
         }
     }
+    // Fast paths for contiguous float input.  A single reduced dim becomes
+    // one fixed-stride Welford chain per output element; a full reduction
+    // splits into independently reduced chunks merged pairwise.  Both skip
+    // the per-element coordinate arithmetic of the generic walk below.
+    if (n_red > 0 && (dt == DType::Float32 || dt == DType::Float64) &&
+        (red_dims.size() == 1 ||
+         static_cast<int64_t>(red_dims.size()) == nd)) {
+        const auto run = [&](auto* sp) {
+            using T = std::remove_cv_t<std::remove_pointer_t<decltype(sp)>>;
+            T* mp = mean.data_ptr<T>();
+            T* vp = var.data_ptr<T>();
+            const T* data = sp;
+            if (static_cast<int64_t>(red_dims.size()) == nd) {
+                // Everything reduced: the output is one element, so the
+                // parallelism has to come from splitting the data itself
+                // into independently reduced chunks merged pairwise.
+                const int64_t chunk = 32768;
+                const int64_t nchunks = (n_red + chunk - 1) / chunk;
+                std::vector<WelfordPartial> partials(nchunks);
+                parallel_for(0, nchunks, 1, [&](int64_t b, int64_t e) {
+                    for (int64_t ci = b; ci < e; ++ci) {
+                        const int64_t beg = ci * chunk;
+                        const int64_t fin = std::min(beg + chunk, n_red);
+                        partials[ci] = welford_reduce_strided(
+                            fin - beg, 1,
+                            [data, beg](int64_t idx, int64_t st) -> double {
+                                return static_cast<double>(data[beg + idx * st]);
+                            });
+                    }
+                });
+                WelfordPartial total{0.0, 0.0, 0};
+                for (const auto& ps : partials) welford_merge(total, ps);
+                mp[0] = static_cast<T>(total.mean);
+                vp[0] = static_cast<T>(total.m2 /
+                    (static_cast<double>(total.n) - correction));
+            } else {
+                // Exactly one reduced dim.
+                const int64_t d = red_dims[0];
+                const int64_t d_size = self.size(d);
+                int64_t outer = 1;
+                int64_t inner = 1;
+                for (int64_t i = 0; i < d; ++i) outer *= self.size(i);
+                for (int64_t i = d + 1; i < nd; ++i) inner *= self.size(i);
+                if (inner >= 64) {
+                    // Wide trailing extent: stream the data row-major in two
+                    // passes with column accumulators that stay L1-resident,
+                    // instead of one chain per output whose loads would jump
+                    // whole cache lines.  With several groups each task owns
+                    // whole groups and needs no cross-task merge; with one
+                    // group the parallelism splits the rows and merges.
+                    if (outer > 1) {
+                        const int64_t grain = std::max<int64_t>(
+                            1, GRAIN_SIZE / std::max<int64_t>(d_size * inner, 1));
+                        parallel_for(0, outer, grain, [&](int64_t b, int64_t e) {
+                            std::vector<double> acc(static_cast<size_t>(inner));
+                            std::vector<double> acc2(static_cast<size_t>(inner));
+                            std::vector<double> meanv(static_cast<size_t>(inner));
+                            for (int64_t g = b; g < e; ++g) {
+                                std::fill(acc.begin(), acc.end(), 0.0);
+                                const T* row = data + g * d_size * inner;
+                                for (int64_t c = 0; c < d_size; ++c, row += inner)
+                                    for (int64_t j = 0; j < inner; ++j)
+                                        acc[static_cast<size_t>(j)] +=
+                                            static_cast<double>(row[j]);
+                                const int64_t base = g * inner;
+                                for (int64_t j = 0; j < inner; ++j) {
+                                    meanv[static_cast<size_t>(j)] =
+                                        acc[static_cast<size_t>(j)] /
+                                        static_cast<double>(d_size);
+                                    mp[base + j] =
+                                        static_cast<T>(meanv[static_cast<size_t>(j)]);
+                                    acc2[static_cast<size_t>(j)] = 0.0;
+                                }
+                                row = data + g * d_size * inner;
+                                for (int64_t c = 0; c < d_size; ++c, row += inner)
+                                    for (int64_t j = 0; j < inner; ++j) {
+                                        const double delta =
+                                            static_cast<double>(row[j]) -
+                                            meanv[static_cast<size_t>(j)];
+                                        acc2[static_cast<size_t>(j)] += delta * delta;
+                                    }
+                                for (int64_t j = 0; j < inner; ++j)
+                                    vp[base + j] = static_cast<T>(acc2[static_cast<size_t>(j)] /
+                                        (static_cast<double>(d_size) - correction));
+                            }
+                        });
+                    } else {
+                        const int64_t rows_per_task =
+                            std::max<int64_t>(1, GRAIN_SIZE / inner);
+                        const int64_t ntasks =
+                            (d_size + rows_per_task - 1) / rows_per_task;
+                        std::vector<double> sums(
+                            static_cast<size_t>(ntasks * inner), 0.0);
+                        parallel_for(0, ntasks, 1, [&](int64_t b, int64_t e) {
+                            for (int64_t ti = b; ti < e; ++ti) {
+                                double* acc = &sums[static_cast<size_t>(ti * inner)];
+                                const int64_t c0 = ti * rows_per_task;
+                                const int64_t c1 = std::min(c0 + rows_per_task, d_size);
+                                const T* row = data + c0 * inner;
+                                for (int64_t c = c0; c < c1; ++c, row += inner)
+                                    for (int64_t j = 0; j < inner; ++j)
+                                        acc[j] += static_cast<double>(row[j]);
+                            }
+                        });
+                        std::vector<double> mean_buf(static_cast<size_t>(inner), 0.0);
+                        for (int64_t j = 0; j < inner; ++j) {
+                            double total = 0.0;
+                            for (int64_t ti = 0; ti < ntasks; ++ti)
+                                total += sums[static_cast<size_t>(ti * inner + j)];
+                            mean_buf[static_cast<size_t>(j)] =
+                                total / static_cast<double>(d_size);
+                        }
+                        std::vector<double> squares(
+                            static_cast<size_t>(ntasks * inner), 0.0);
+                        parallel_for(0, ntasks, 1, [&](int64_t b, int64_t e) {
+                            for (int64_t ti = b; ti < e; ++ti) {
+                                double* acc =
+                                    &squares[static_cast<size_t>(ti * inner)];
+                                const int64_t c0 = ti * rows_per_task;
+                                const int64_t c1 =
+                                    std::min(c0 + rows_per_task, d_size);
+                                const T* row = data + c0 * inner;
+                                for (int64_t c = c0; c < c1; ++c, row += inner)
+                                    for (int64_t j = 0; j < inner; ++j) {
+                                        const double delta =
+                                            static_cast<double>(row[j]) -
+                                            mean_buf[static_cast<size_t>(j)];
+                                        acc[j] += delta * delta;
+                                    }
+                            }
+                        });
+                        for (int64_t j = 0; j < inner; ++j) {
+                            double m2 = 0.0;
+                            for (int64_t ti = 0; ti < ntasks; ++ti)
+                                m2 += squares[static_cast<size_t>(ti * inner + j)];
+                            mp[j] = static_cast<T>(mean_buf[static_cast<size_t>(j)]);
+                            vp[j] = static_cast<T>(m2 /
+                                (static_cast<double>(d_size) - correction));
+                        }
+                    }
+                } else {
+                    // One fixed-stride chain per output element; the outputs
+                    // split across threads.
+                    const int64_t grain =
+                        std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(d_size, 1));
+                    parallel_for(0, out_numel, grain, [&](int64_t b, int64_t e) {
+                        for (int64_t oi = b; oi < e; ++oi) {
+                            const T* src = data + (oi / inner) * d_size * inner +
+                                           (oi % inner);
+                            const WelfordPartial s = welford_reduce_strided(
+                                d_size, inner,
+                                [src](int64_t idx, int64_t st) -> double {
+                                    return static_cast<double>(src[idx * st]);
+                                });
+                            mp[oi] = static_cast<T>(s.mean);
+                            vp[oi] = static_cast<T>(s.m2 /
+                                (static_cast<double>(s.n) - correction));
+                        }
+                    });
+                }
+            }
+        };
+        if (dt == DType::Float32) run(sc.data_ptr<float>());
+        else run(sc.data_ptr<double>());
+        return {var, mean};
+    }
+
     auto compute = [&](auto* sp, auto* mp, auto* vp) {
         using output_t = std::remove_cv_t<std::remove_pointer_t<decltype(mp)>>;
         parallel_for(0, out_numel, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
