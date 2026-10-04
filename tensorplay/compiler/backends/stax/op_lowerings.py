@@ -2582,13 +2582,23 @@ def lower_unsqueeze(x, dim):
 def lower_squeeze(x, dim=None):
     size = list(x.get_size())
     rank = len(size)
+
+    def extent_is_one(extent):
+        # An extent carried in the index language reads as one only through
+        # the equality it is asked, not through comparison against the number.
+        return V.graph.sizevars.guard_or_false(sympy.Eq(extent, 1))
+
     if dim is None:
-        dims = [d for d in range(rank) if size[d] == 1]
+        dims = [d for d in range(rank) if extent_is_one(size[d])]
     elif isinstance(dim, (list, tuple)):
-        dims = [normalize_dim(d, rank) for d in dim if size[normalize_dim(d, rank)] == 1]
+        dims = [
+            normalize_dim(d, rank)
+            for d in dim
+            if extent_is_one(size[normalize_dim(d, rank)])
+        ]
     else:
         d = normalize_dim(dim, rank)
-        dims = [d] if size[d] == 1 else []
+        dims = [d] if extent_is_one(size[d]) else []
     if not dims:
         return x
     if dim is None:
