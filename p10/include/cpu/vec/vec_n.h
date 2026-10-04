@@ -10,6 +10,7 @@
 #include "cpu/vec/vec_base.h"
 
 #include <array>
+#include <optional>
 #include <ostream>
 
 namespace tensorplay::vec {
@@ -520,6 +521,28 @@ inline T vec_reduce_all(const OpVec& vec_fun, VectorizedN<T, N> acc_vec) {
     vec_result = vec_fun(vec_result, acc_vec[i]);
   }
   return vec_reduce_all(vec_fun, vec_result);
+}
+
+// Adds one vector of values into one vector of destinations, lane by lane,
+// for a generated reduction store whose rows several threads write at once
+// and so must accumulate through an atomic per element.  A tail covering
+// fewer lanes than the index vector holds is honored when it is given.
+template <typename T, int NI, int NV>
+inline void atomic_add_vec(
+    T* addr,
+    VectorizedN<int64_t, NI> index,
+    VectorizedN<T, NV> offset,
+    std::optional<int64_t> tail_size = std::nullopt) {
+  constexpr int len = VectorizedN<int64_t, NI>::size();
+  static_assert(len <= VectorizedN<T, NV>::size());
+  __at_align__ std::array<T, len> tmpbuf;
+  __at_align__ std::array<int64_t, len> tmpidx;
+  offset.store(tmpbuf.data(), len);
+  index.store(tmpidx.data(), len);
+  int size = tail_size.has_value() ? static_cast<int>(tail_size.value()) : len;
+  for (int i = 0; i < size; i++) {
+    atomic_add(addr + tmpidx[i], tmpbuf[i]);
+  }
 }
 
 } // namespace tensorplay::vec::inline CPU_CAPABILITY

@@ -1367,7 +1367,8 @@ inline void transpose_mxn(
 // transposed store path when several threads write overlapping tiles.
 template <typename T>
 inline void atomic_add(volatile T* addr, T offset) {
-  std::atomic<T>* atomic_addr = reinterpret_cast<std::atomic<T>*>(addr);
+  std::atomic<T>* atomic_addr =
+      reinterpret_cast<std::atomic<T>*>(const_cast<T*>(addr));
   T expected = *addr;
   while (!atomic_addr->compare_exchange_weak(
       expected, expected + offset, std::memory_order_relaxed)) {
