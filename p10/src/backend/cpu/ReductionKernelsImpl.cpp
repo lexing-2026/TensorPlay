@@ -1389,6 +1389,78 @@ static bool try_extremum_lastdim_integral_avx512(
     return true;
 }
 
+// One fold step for the running extremum: a NaN candidate always wins, a
+// NaN running best is never displaced, and ties keep the earlier element.
+// The index scan relies on this first-occurrence convention.
+template <bool IsMax, typename T>
+inline void extremum_fold_step(T& best, T x) {
+    if (!std::isnan(best) &&
+        (std::isnan(x) || (IsMax ? x > best : x < best))) {
+        best = x;
+    }
+}
+
+// Extremum over contiguous rows in two passes: a vector fold produces the
+// value, then a scan finds the first position holding it. The fold yields
+// a NaN exactly when the row contains one, so the scan locates either the
+// first NaN or the first element equal to the folded extremum.
+template <bool IsMax, typename T>
+static void extremum_lastdim_rows_vec(const T* in, T* out_values,
+                                      int64_t* indices, int64_t outer,
+                                      int64_t d_size) {
+    using vec_t = Vectorized<T>;
+    constexpr int64_t width = static_cast<int64_t>(vec_t::size());
+    const int64_t row_grain = std::max<int64_t>(1, GRAIN_SIZE / d_size);
+    parallel_for(0, outer, row_grain, [&](int64_t begin, int64_t end) {
+        for (int64_t row = begin; row < end; ++row) {
+            const T* line = in + row * d_size;
+            vec_t acc = vec_t::loadu(line);
+            int64_t i = width;
+            for (; i + width <= d_size; i += width) {
+                const vec_t x = vec_t::loadu(line + i);
+                acc = IsMax ? maximum(acc, x) : minimum(acc, x);
+            }
+            alignas(64) T lanes[width];
+            acc.store(lanes);
+            T best = lanes[0];
+            for (int64_t k = 1; k < width; ++k) {
+                extremum_fold_step<IsMax>(best, lanes[k]);
+            }
+            for (; i < d_size; ++i) {
+                extremum_fold_step<IsMax>(best, line[i]);
+            }
+            int64_t bi = 0;
+            if (std::isnan(best)) {
+                while (!std::isnan(line[bi])) ++bi;
+            } else {
+                while (line[bi] != best) ++bi;
+            }
+            out_values[row] = best;
+            indices[row] = bi;
+        }
+    });
+}
+
+template <bool IsMax>
+static bool try_extremum_lastdim_vec(const Tensor& input, Tensor& values,
+                                     int64_t* indices, int64_t outer,
+                                     int64_t d_size) {
+    if (d_size < 32 || outer <= 0 || !input.is_contiguous()) return false;
+    if (input.dtype() == DType::Float32) {
+        extremum_lastdim_rows_vec<IsMax>(input.data_ptr<float>(),
+                                         values.data_ptr<float>(), indices,
+                                         outer, d_size);
+        return true;
+    }
+    if (input.dtype() == DType::Float64) {
+        extremum_lastdim_rows_vec<IsMax>(input.data_ptr<double>(),
+                                         values.data_ptr<double>(), indices,
+                                         outer, d_size);
+        return true;
+    }
+    return false;
+}
+
 __attribute__((target("avx512f")))
 static void sum_f32_leading_range_avx512(
     const float* input, float* output, int64_t rows, int64_t cols,
@@ -2806,11 +2878,19 @@ std::tuple<Tensor, Tensor> max_dim_kernel_impl(const Tensor& self, int64_t dim0,
             sc, vals, idxs.data_ptr<int64_t>(), outer, d_size, inner)) {
         return {vals, idxs};
     }
+    if (inner == 1 && try_extremum_lastdim_vec<true>(
+            sc, vals, idxs.data_ptr<int64_t>(), outer, d_size)) {
+        return {vals, idxs};
+    }
 #endif
 
     // With the reduced dim removed (or sized 1 under keepdim), the output is
     // a contiguous [outer, inner] grid and line i lives at o*d_size*inner +
-    // i*inner + in2 -- identical addressing for both keepdim modes.
+    // i*inner + in2 -- identical addressing for both keepdim modes. A NaN
+    // candidate wins once, then a NaN running best is never displaced, so
+    // the first NaN fixes both the value and the index; for integral
+    // element types both added comparisons are tautologies the compiler
+    // folds away.
 #define TP_MAXMIN_DIM_CASE(ctype, name_, CMP_OP)                                        \
     case DType::name_: {                                                                \
         const ctype* sp = sc.data_ptr<ctype>();                                         \
@@ -2824,8 +2904,9 @@ std::tuple<Tensor, Tensor> max_dim_kernel_impl(const Tensor& self, int64_t dim0,
                 ctype best = line[0];                                                   \
                 int64_t bi = 0;                                                         \
                 for (int64_t i = 1; i < d_size; ++i) {                                  \
-                    if (line[i * inner] CMP_OP best) {                                  \
-                        best = line[i * inner];                                         \
+                    const ctype x = line[i * inner];                                    \
+                    if (best == best && (x != x || x CMP_OP best)) {                    \
+                        best = x;                                                       \
                         bi = i;                                                         \
                     }                                                                   \
                 }                                                                       \
@@ -2939,8 +3020,16 @@ std::tuple<Tensor, Tensor> min_dim_kernel_impl(const Tensor& self, int64_t dim0,
             sc, vals, idxs.data_ptr<int64_t>(), outer, d_size, inner)) {
         return {vals, idxs};
     }
+    if (inner == 1 && try_extremum_lastdim_vec<false>(
+            sc, vals, idxs.data_ptr<int64_t>(), outer, d_size)) {
+        return {vals, idxs};
+    }
 #endif
 
+    // A NaN candidate wins once, then a NaN running best is never
+    // displaced, so the first NaN fixes both the value and the index; for
+    // integral element types both added comparisons are tautologies the
+    // compiler folds away.
 #define TP_MIN_DIM_CASE(ctype, name_)                                                   \
     case DType::name_: {                                                                \
         const ctype* sp = sc.data_ptr<ctype>();                                         \
@@ -2954,8 +3043,9 @@ std::tuple<Tensor, Tensor> min_dim_kernel_impl(const Tensor& self, int64_t dim0,
                 ctype best = line[0];                                                   \
                 int64_t bi = 0;                                                         \
                 for (int64_t i = 1; i < d_size; ++i) {                                  \
-                    if (line[i * inner] < best) {                                       \
-                        best = line[i * inner];                                         \
+                    const ctype x = line[i * inner];                                    \
+                    if (best == best && (x != x || x < best)) {                         \
+                        best = x;                                                       \
                         bi = i;                                                         \
                     }                                                                   \
                 }                                                                       \
