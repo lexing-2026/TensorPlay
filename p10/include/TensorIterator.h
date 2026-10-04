@@ -230,8 +230,8 @@ struct TensorIteratorBase {
 
   const Tensor& tensor(int64_t arg) const { return operands_[arg].tensor(); }
   Tensor& tensor(int64_t arg) { return operands_[arg].tensor(); }
-  // The TensorBase layer of the reference design collapses to Tensor here;
-  // the _base spellings are kept so call sites match the upstream shape.
+  // One tensor type serves both roles here, so the _base spellings are thin
+  // aliases kept so call sites can name either.
   const Tensor& tensor_base(int64_t arg) const { return tensor(arg); }
   const Tensor& output(int64_t arg = 0) const {
     TP_CHECK(arg < num_outputs_, "output index out of bounds");

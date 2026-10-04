@@ -2528,9 +2528,9 @@ Tensor& fft_irfft2_out_native(const Tensor& self, const std::optional<std::vecto
 // ---- upsample vec overloads -------------------------------------------------
 namespace {
 
-// Upstream .vec overloads accept either an explicit output size or per-dim
-// scale factors; when only scales are given the target size is the floor of
-// each spatial input extent times its factor.
+// Accepts either an explicit output size or per-dim scale factors; when only
+// scales are given the target size is the floor of each spatial input extent
+// times its factor.
 std::vector<int64_t> upsample_out_size(const Tensor& input,
                                        const std::optional<std::vector<int64_t>>& output_size,
                                        const std::optional<std::vector<double>>& scale_factors) {

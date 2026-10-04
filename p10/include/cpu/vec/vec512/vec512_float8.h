@@ -20,8 +20,8 @@ inline namespace CPU_CAPABILITY {
 
 static inline void cvtfp8e4m3_fp32(const __m128i& a, __m512& o) {
 #ifdef __AVX10_2__
-  // It takes effect only with a compiler and hardware that both support the AVX10.2 path
-  // otherwise the fallback below is used.
+  // Takes effect only when both the compiler and the hardware support the
+  // AVX10.2 path; the fallback below is used otherwise.
   __m256h f16_vec = _mm256_cvthf8_ph(a);
   o = _mm512_cvtph_ps(_mm256_castph_si256(f16_vec));
 #else
@@ -105,8 +105,8 @@ static inline void cvtfp8e4m3_fp32(const __m128i& a, __m512& o) {
 
 static inline __m128i cvtfp32_fp8e4m3(const __m512& src) {
 #ifdef __AVX10_2__
-  // It takes effect only with a compiler and hardware that both support the AVX10.2 path
-  // otherwise the fallback below is used.
+  // Takes effect only when both the compiler and the hardware support the
+  // AVX10.2 path; the fallback below is used otherwise.
   __m256i f16_vec =
       _mm512_cvt_roundps_ph(src, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
   return _mm256_cvtph_hf8(_mm256_castsi256_ph(f16_vec));
