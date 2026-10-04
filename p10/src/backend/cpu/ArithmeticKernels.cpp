@@ -227,6 +227,126 @@ void scalar_f64_avx512(int code, const double* a, double* y, int64_t n,
     }
 }
 
+// Broadcast variants of the dense kernels above: one operand is constant
+// along the inner run (its TensorIterator stride is zero), so it loads once
+// and the dense side streams at full width.
+
+__attribute__((target("avx512f,fma")))
+void binary_f32_avx512_scalar_b(int code, const float* a, float b, float* y,
+                                int64_t n, float alpha) {
+    const __m512 vb = _mm512_set1_ps(b);
+    const __m512 valpha = _mm512_set1_ps(alpha);
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 x = _mm512_loadu_ps(a + i);
+        __m512 r;
+        switch (code) {
+            case BIN_ADD:
+                r = alpha == 1.0f   ? _mm512_add_ps(x, vb)
+                  : alpha == -1.0f  ? _mm512_sub_ps(x, vb)
+                                    : _mm512_fmadd_ps(valpha, vb, x);
+                break;
+            case BIN_MUL: r = _mm512_mul_ps(x, vb); break;
+            default:      r = _mm512_div_ps(x, vb); break;
+        }
+        _mm512_storeu_ps(y + i, r);
+    }
+    for (; i < n; ++i) {
+        switch (code) {
+            case BIN_ADD: y[i] = a[i] + alpha * b; break;
+            case BIN_MUL: y[i] = a[i] * b; break;
+            default:      y[i] = a[i] / b; break;
+        }
+    }
+}
+
+__attribute__((target("avx512f,fma")))
+void binary_f32_avx512_scalar_a(int code, float a, const float* b, float* y,
+                                int64_t n, float alpha) {
+    const __m512 va = _mm512_set1_ps(a);
+    const __m512 valpha = _mm512_set1_ps(alpha);
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 w = _mm512_loadu_ps(b + i);
+        __m512 r;
+        switch (code) {
+            case BIN_ADD:
+                r = alpha == 1.0f   ? _mm512_add_ps(va, w)
+                  : alpha == -1.0f  ? _mm512_sub_ps(va, w)
+                                    : _mm512_fmadd_ps(valpha, w, va);
+                break;
+            case BIN_MUL: r = _mm512_mul_ps(va, w); break;
+            default:      r = _mm512_div_ps(va, w); break;
+        }
+        _mm512_storeu_ps(y + i, r);
+    }
+    for (; i < n; ++i) {
+        switch (code) {
+            case BIN_ADD: y[i] = a + alpha * b[i]; break;
+            case BIN_MUL: y[i] = a * b[i]; break;
+            default:      y[i] = a / b[i]; break;
+        }
+    }
+}
+
+__attribute__((target("avx512f,fma")))
+void binary_f64_avx512_scalar_b(int code, const double* a, double b, double* y,
+                                int64_t n, double alpha) {
+    const __m512d vb = _mm512_set1_pd(b);
+    const __m512d valpha = _mm512_set1_pd(alpha);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m512d x = _mm512_loadu_pd(a + i);
+        __m512d r;
+        switch (code) {
+            case BIN_ADD:
+                r = alpha == 1.0   ? _mm512_add_pd(x, vb)
+                  : alpha == -1.0  ? _mm512_sub_pd(x, vb)
+                                   : _mm512_fmadd_pd(valpha, vb, x);
+                break;
+            case BIN_MUL: r = _mm512_mul_pd(x, vb); break;
+            default:      r = _mm512_div_pd(x, vb); break;
+        }
+        _mm512_storeu_pd(y + i, r);
+    }
+    for (; i < n; ++i) {
+        switch (code) {
+            case BIN_ADD: y[i] = a[i] + alpha * b; break;
+            case BIN_MUL: y[i] = a[i] * b; break;
+            default:      y[i] = a[i] / b; break;
+        }
+    }
+}
+
+__attribute__((target("avx512f,fma")))
+void binary_f64_avx512_scalar_a(int code, double a, const double* b, double* y,
+                                int64_t n, double alpha) {
+    const __m512d va = _mm512_set1_pd(a);
+    const __m512d valpha = _mm512_set1_pd(alpha);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m512d w = _mm512_loadu_pd(b + i);
+        __m512d r;
+        switch (code) {
+            case BIN_ADD:
+                r = alpha == 1.0   ? _mm512_add_pd(va, w)
+                  : alpha == -1.0  ? _mm512_sub_pd(va, w)
+                                   : _mm512_fmadd_pd(valpha, w, va);
+                break;
+            case BIN_MUL: r = _mm512_mul_pd(va, w); break;
+            default:      r = _mm512_div_pd(va, w); break;
+        }
+        _mm512_storeu_pd(y + i, r);
+    }
+    for (; i < n; ++i) {
+        switch (code) {
+            case BIN_ADD: y[i] = a + alpha * b[i]; break;
+            case BIN_MUL: y[i] = a * b[i]; break;
+            default:      y[i] = a / b[i]; break;
+        }
+    }
+}
+
 // TensorIterator's native CPU kernels parallelize contiguous scalar and
 // wrapped-scalar operations at the same grain size as ordinary pointwise
 // kernels.  Keep the target-specific loop above single-purpose, but add the
@@ -473,7 +593,7 @@ static Tensor empty_scalar_result(const Tensor& self, DType dt) {
 }
 
 template<typename Op, typename MklOp>
-Tensor binary_op_kernel_impl(const Tensor& self, const Tensor& other, Op op, MklOp mkl_op, bool use_mkl_op = false, bool force_float = false) {
+Tensor binary_op_kernel_impl(const Tensor& self, const Tensor& other, Op op, MklOp mkl_op, bool use_mkl_op = false, bool force_float = false, int vec_code = -1) {
     std::vector<int64_t> out_shape = broadcast_shapes(self.sizes(), other.sizes());
     DType result_dtype = native::result_type(self, other);
     if (force_float && isIntegralType(result_dtype, true)) {
@@ -501,6 +621,71 @@ Tensor binary_op_kernel_impl(const Tensor& self, const Tensor& other, Op op, Mkl
     if (!optimized) {
         Tensor self_casted = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
         Tensor other_casted = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
+
+#if defined(__x86_64__)
+        // The four arithmetic callers pass a BIN_* code so the vector
+        // kernels can take over: TensorIterator hands the inner run with
+        // per-operand strides, and a zero stride is a value constant along
+        // the run (a broadcast operand), which the vector kernels accept as
+        // a scalar.  Everything else keeps the generic iterator loop below.
+        if (vec_code >= 0 && cpu_has_avx512() &&
+            (result_dtype == DType::Float32 || result_dtype == DType::Float64)) {
+            const bool is_f32 = (result_dtype == DType::Float32);
+            TensorIterator iter = TensorIterator::binary_op(result, self_casted, other_casted);
+            iter.for_each([&](char** data, const int64_t* strides, int64_t n) {
+                if (is_f32) {
+                    float* r = reinterpret_cast<float*>(data[0]);
+                    const float* a = reinterpret_cast<const float*>(data[1]);
+                    const float* b = reinterpret_cast<const float*>(data[2]);
+                    if (strides[0] == 4 && strides[1] == 4 && strides[2] == 4) {
+                        binary_f32_avx512(vec_code, a, b, r, n, 1.0f);
+                    } else if (strides[0] == 4 && strides[1] == 4 && strides[2] == 0) {
+                        binary_f32_avx512_scalar_b(vec_code, a, *b, r, n, 1.0f);
+                    } else if (strides[0] == 4 && strides[1] == 0 && strides[2] == 4) {
+                        binary_f32_avx512_scalar_a(vec_code, *a, b, r, n, 1.0f);
+                    } else if (strides[0] == 4 && strides[1] == 0 && strides[2] == 0) {
+                        const float va = *a, vb = *b;
+                        for (int64_t i = 0; i < n; ++i)
+                            r[i] = vec_code == BIN_MUL ? va * vb
+                                 : vec_code == BIN_DIV ? va / vb : va + vb;
+                    } else {
+                        for (int64_t i = 0; i < n; ++i) {
+                            const float av = *reinterpret_cast<const float*>(data[1] + i * strides[1]);
+                            const float bv = *reinterpret_cast<const float*>(data[2] + i * strides[2]);
+                            *reinterpret_cast<float*>(data[0] + i * strides[0]) =
+                                vec_code == BIN_MUL ? av * bv
+                              : vec_code == BIN_DIV ? av / bv : av + bv;
+                        }
+                    }
+                } else {
+                    double* r = reinterpret_cast<double*>(data[0]);
+                    const double* a = reinterpret_cast<const double*>(data[1]);
+                    const double* b = reinterpret_cast<const double*>(data[2]);
+                    if (strides[0] == 8 && strides[1] == 8 && strides[2] == 8) {
+                        binary_f64_avx512(vec_code, a, b, r, n, 1.0);
+                    } else if (strides[0] == 8 && strides[1] == 8 && strides[2] == 0) {
+                        binary_f64_avx512_scalar_b(vec_code, a, *b, r, n, 1.0);
+                    } else if (strides[0] == 8 && strides[1] == 0 && strides[2] == 8) {
+                        binary_f64_avx512_scalar_a(vec_code, *a, b, r, n, 1.0);
+                    } else if (strides[0] == 8 && strides[1] == 0 && strides[2] == 0) {
+                        const double va = *a, vb = *b;
+                        for (int64_t i = 0; i < n; ++i)
+                            r[i] = vec_code == BIN_MUL ? va * vb
+                                 : vec_code == BIN_DIV ? va / vb : va + vb;
+                    } else {
+                        for (int64_t i = 0; i < n; ++i) {
+                            const double av = *reinterpret_cast<const double*>(data[1] + i * strides[1]);
+                            const double bv = *reinterpret_cast<const double*>(data[2] + i * strides[2]);
+                            *reinterpret_cast<double*>(data[0] + i * strides[0]) =
+                                vec_code == BIN_MUL ? av * bv
+                              : vec_code == BIN_DIV ? av / bv : av + bv;
+                        }
+                    }
+                }
+            });
+            return result;
+        }
+#endif
 
         // Route through the shared TensorIterator: it broadcasts, reorders
         // dimensions for memory locality, coalesces adjacent dims and
@@ -652,6 +837,20 @@ bool try_add_tensor_iterator_out(const Tensor& self, const Tensor& other,
             if (strides[0] == 4 && strides[1] == 4 && strides[2] == 4) {
                 binary_f32_avx512(
                     BIN_ADD, reinterpret_cast<const float*>(data[1]),
+                    reinterpret_cast<const float*>(data[2]),
+                    reinterpret_cast<float*>(data[0]), n, alpha_val);
+                return;
+            }
+            if (strides[0] == 4 && strides[1] == 4 && strides[2] == 0) {
+                binary_f32_avx512_scalar_b(
+                    BIN_ADD, reinterpret_cast<const float*>(data[1]),
+                    *reinterpret_cast<const float*>(data[2]),
+                    reinterpret_cast<float*>(data[0]), n, alpha_val);
+                return;
+            }
+            if (strides[0] == 4 && strides[1] == 0 && strides[2] == 4) {
+                binary_f32_avx512_scalar_a(
+                    BIN_ADD, *reinterpret_cast<const float*>(data[1]),
                     reinterpret_cast<const float*>(data[2]),
                     reinterpret_cast<float*>(data[0]), n, alpha_val);
                 return;
@@ -1150,12 +1349,59 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) 
                                       reinterpret_cast<const float*>(data[2]),
                                       reinterpret_cast<float*>(data[0]),
                                       n, alpha_val);
+                } else if (strides[0] == 4 && strides[1] == 4 && strides[2] == 0) {
+                    binary_f32_avx512_scalar_b(BIN_ADD,
+                                               reinterpret_cast<const float*>(data[1]),
+                                               *reinterpret_cast<const float*>(data[2]),
+                                               reinterpret_cast<float*>(data[0]),
+                                               n, alpha_val);
+                } else if (strides[0] == 4 && strides[1] == 0 && strides[2] == 4) {
+                    binary_f32_avx512_scalar_a(BIN_ADD,
+                                               *reinterpret_cast<const float*>(data[1]),
+                                               reinterpret_cast<const float*>(data[2]),
+                                               reinterpret_cast<float*>(data[0]),
+                                               n, alpha_val);
                 } else {
                     for (int64_t i = 0; i < n; ++i)
                         *reinterpret_cast<float*>(data[0] + i * strides[0]) =
                             *reinterpret_cast<const float*>(data[1] + i * strides[1]) +
                             alpha_val *
                             *reinterpret_cast<const float*>(data[2] + i * strides[2]);
+                }
+            });
+            optimized = true;
+        }
+
+        // Broadcast float64 add: same-shape dense runs took the AVX-512 path
+        // above, so what reaches the iterator here is exactly the
+        // broadcast/strided residue.
+        if (!optimized && result_dtype == DType::Float64 && cpu_has_avx512()) {
+            const double alpha_val = alpha.toDouble();
+            iter.for_each([&](char** data, const int64_t* strides, int64_t n) {
+                if (strides[0] == 8 && strides[1] == 8 && strides[2] == 8) {
+                    binary_f64_avx512(BIN_ADD,
+                                      reinterpret_cast<const double*>(data[1]),
+                                      reinterpret_cast<const double*>(data[2]),
+                                      reinterpret_cast<double*>(data[0]),
+                                      n, alpha_val);
+                } else if (strides[0] == 8 && strides[1] == 8 && strides[2] == 0) {
+                    binary_f64_avx512_scalar_b(BIN_ADD,
+                                               reinterpret_cast<const double*>(data[1]),
+                                               *reinterpret_cast<const double*>(data[2]),
+                                               reinterpret_cast<double*>(data[0]),
+                                               n, alpha_val);
+                } else if (strides[0] == 8 && strides[1] == 0 && strides[2] == 8) {
+                    binary_f64_avx512_scalar_a(BIN_ADD,
+                                               *reinterpret_cast<const double*>(data[1]),
+                                               reinterpret_cast<const double*>(data[2]),
+                                               reinterpret_cast<double*>(data[0]),
+                                               n, alpha_val);
+                } else {
+                    for (int64_t i = 0; i < n; ++i)
+                        *reinterpret_cast<double*>(data[0] + i * strides[0]) =
+                            *reinterpret_cast<const double*>(data[1] + i * strides[1]) +
+                            alpha_val *
+                            *reinterpret_cast<const double*>(data[2] + i * strides[2]);
                 }
             });
             optimized = true;
@@ -1452,7 +1698,7 @@ Tensor mul_kernel(const Tensor& self, const Tensor& other) {
         vsMul(n, a, b, y);
         #endif
     };
-    return binary_op_kernel_impl(self, other, op, mkl_op, true);
+    return binary_op_kernel_impl(self, other, op, mkl_op, true, false, BIN_MUL);
 }
 
 Tensor div_kernel(const Tensor& self, const Tensor& other) {
@@ -1629,7 +1875,7 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
         vsDiv(n, a, b, y);
         #endif
     };
-    return binary_op_kernel_impl(self, other, op, mkl_op, true, true);
+    return binary_op_kernel_impl(self, other, op, mkl_op, true, true, BIN_DIV);
 }
 
 // Stax pointwise fusion primitive.  Keep the generic path on the existing
