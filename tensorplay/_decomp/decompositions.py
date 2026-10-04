@@ -911,6 +911,75 @@ def split_with_sizes_copy(self, split_sizes, dim=0):
     return [piece.clone() for piece in _split_with_sizes(self, list(split_sizes), dim)]
 
 
+def _tensor_split_sections(self, sections, dim):
+    if self.dim() == 0:
+        raise RuntimeError(
+            "tensor_split expected at least a 1-dimensional tensor, but got a tensor with 0 dims"
+        )
+    if sections <= 0:
+        raise RuntimeError(f"number of sections must be larger than 0, got {sections}")
+    dim = dim % self.dim()
+    length = int(self.shape[dim])
+    base, extras = divmod(length, sections)
+    sizes = [base + (1 if index < extras else 0) for index in range(sections)]
+    return _split_with_sizes(self, sizes, dim)
+
+
+def _tensor_split_boundaries(self, boundaries, dim):
+    if self.dim() == 0:
+        raise RuntimeError(
+            "tensor_split expected at least a 1-dimensional tensor, but got a tensor with 0 dims"
+        )
+    dim = dim % self.dim()
+    length = int(self.shape[dim])
+    pieces = []
+    start = 0
+    for boundary in [*boundaries, length]:
+        end = int(boundary)
+        if end < 0:
+            end += length
+        end = min(max(end, 0), length)
+        start = min(max(start, 0), length)
+        pieces.append(tp.narrow(self, dim, start, max(end - start, 0)))
+        start = end
+    return pieces
+
+
+@register_decomposition(ops.tensor_split.sections)
+def tensor_split_sections(self, sections, dim=0):
+    return _tensor_split_sections(self, sections, dim)
+
+
+@register_decomposition(ops.tensor_split.indices)
+def tensor_split_indices(self, indices, dim=0):
+    if isinstance(indices, tp.Tensor):
+        indices = indices.tolist()
+    return _tensor_split_boundaries(self, list(indices), dim)
+
+
+@register_decomposition(ops.tensor_split.tensor_indices_or_sections)
+def tensor_split_tensor(self, tensor_indices_or_sections, dim=0):
+    if tensor_indices_or_sections.device.type != "cpu":
+        raise RuntimeError(
+            "tensor_split expected tensor_indices_or_sections to be on cpu, but it's on "
+            f"{tensor_indices_or_sections.device.type}"
+        )
+    if tensor_indices_or_sections.dtype != tp.int64:
+        raise RuntimeError(
+            "tensor_split expected tensor_indices_or_sections to have dtype of long, but got "
+            f"{tensor_indices_or_sections.dtype}"
+        )
+    if tensor_indices_or_sections.dim() > 1:
+        raise RuntimeError(
+            "tensor_split expected tensor_indices_or_sections to be a zero-dimensional or "
+            f"one-dimensional tensor, but got a tensor with {tensor_indices_or_sections.dim()} dims"
+        )
+    boundaries = tensor_indices_or_sections.tolist()
+    if tensor_indices_or_sections.dim() == 0:
+        boundaries = [boundaries]
+    return _tensor_split_boundaries(self, boundaries, dim)
+
+
 @register_decomposition([ops.unbind.default, ops.unbind.int])
 def unbind(self, dim=0):
     if self.dim() == 0:
@@ -1315,6 +1384,170 @@ def std_mean_dim(self, dim, unbiased=True, keepdim=False):
 @register_decomposition(ops.std_mean.correction)
 def std_mean_correction(self, dim=None, *, correction=None, keepdim=False):
     return _std_mean(self, dim, _correction(correction), keepdim)
+
+
+_QUANTILE_INTERPOLATIONS = ("linear", "lower", "higher", "midpoint", "nearest")
+
+
+def _quantile_impl(self, q, dim, keepdim, interpolation, ignore_nan):
+    name = "nanquantile()" if ignore_nan else "quantile()"
+    if self.numel() == 0:
+        raise RuntimeError(f"{name} input tensor must be non-empty")
+    if not isinstance(q, tp.Tensor):
+        q = tp.full((), q, dtype=self.dtype, device=self.device)
+    if q.dim() > 1:
+        raise RuntimeError(f"{name} q must be a scalar or 1D tensor")
+    if self.dtype not in (tp.float32, tp.float64):
+        raise RuntimeError(f"{name} input tensor must be either float or double dtype")
+    if q.dtype != self.dtype:
+        raise RuntimeError(f"{name} q tensor must be same dtype as the input tensor")
+    if q.device != self.device:
+        raise RuntimeError(f"{name} q tensor must be on the same device as the input tensor")
+    if interpolation not in _QUANTILE_INTERPOLATIONS:
+        raise RuntimeError(
+            f"{name} interpolation must be one of linear, lower, higher, midpoint or "
+            f"nearest, but got {interpolation}"
+        )
+
+    scalar_q = q.dim() == 0
+    q_extent = 1 if scalar_q else int(q.numel())
+
+    if dim is None:
+        wrapped_dim = None
+    elif self.dim() == 0:
+        raise IndexError("Dimension specified as 0 but tensor has no dimensions")
+    else:
+        wrapped_dim = dim % self.dim()
+
+    out_shape = []
+    if dim is not None:
+        out_shape = list(self.shape)
+        if keepdim:
+            out_shape[wrapped_dim] = 1
+        else:
+            del out_shape[wrapped_dim]
+    elif keepdim:
+        out_shape = [1] * self.dim()
+    if not scalar_q:
+        out_shape.insert(0, q_extent)
+
+    if dim is None:
+        reduced = self.reshape(-1)
+    elif wrapped_dim == self.dim() - 1:
+        reduced = self
+    else:
+        reduced = self.unsqueeze(-1).transpose(wrapped_dim, -1)
+
+    # The reduction runs over the last axis of the view; every remaining axis
+    # is a row the quantiles are read from, and the reduction extent joins
+    # them as one more trailing axis.
+    view_shape = list(out_shape)
+    if scalar_q:
+        view_shape.insert(0, 1)
+    in_shape = list(view_shape[1:])
+    in_shape.append(int(reduced.shape[-1]))
+    reduced = reduced.reshape(in_shape)
+
+    last_index = int(reduced.shape[-1]) - 1
+    if ignore_nan:
+        # Rows carry their rank by their non-NaN count, so a row that is all
+        # NaN ranks at zero and reads a NaN back; a partly NaN row skips the
+        # NaN entries in both count and order.
+        non_nan = tp.logical_not(tp.isnan(reduced)).sum(-1, keepdim=True)
+        ranks = q.to(tp.float64) * (non_nan - 1).to(tp.float64)
+        ranks = tp.masked_fill(ranks, ranks < 0, 0)
+    else:
+        # A NaN anywhere in a row pins every rank of that row to the last
+        # position, so the quantile read there is NaN.
+        nan_anywhere = tp.isnan(reduced).any(-1, keepdim=True)
+        q_ranks = q.to(tp.float64) * float(last_index)
+        rank_shape = tuple(nan_anywhere.shape[:-1]) + (q_extent,)
+        ranks = tp.masked_fill(q_ranks.expand(rank_shape), nan_anywhere, float(last_index))
+
+    if interpolation == "lower":
+        ranks = ranks.floor()
+    elif interpolation == "higher":
+        ranks = ranks.ceil()
+    elif interpolation == "nearest":
+        ranks = ranks.round()
+
+    ranks_below = ranks.to(tp.int64)
+    interpolate = interpolation in ("linear", "midpoint")
+    if interpolate:
+        if interpolation == "midpoint":
+            weights = tp.full_like(ranks_below, 0.5, dtype=self.dtype)
+        else:
+            weights = (ranks - ranks_below).to(self.dtype)
+        ranks_above = ranks.ceil().to(tp.int64)
+
+    ordered = tp.sort(reduced).values
+    values = ordered.gather(-1, ranks_below)
+    if interpolate:
+        values = tp.lerp(values, ordered.gather(-1, ranks_above), weights)
+
+    if scalar_q:
+        values = values.squeeze(-1)
+    else:
+        values = values.unsqueeze(0).transpose(0, -1).squeeze(-1)
+    return values
+
+
+@register_decomposition(ops.quantile.default)
+def quantile(self, q, dim=None, keepdim=False, *, interpolation="linear"):
+    return _quantile_impl(self, q, dim, keepdim, interpolation, False)
+
+
+@register_decomposition(ops.nanquantile.default)
+def nanquantile(self, q, dim=None, keepdim=False, *, interpolation="linear"):
+    return _quantile_impl(self, q, dim, keepdim, interpolation, True)
+
+
+@register_decomposition(ops.instance_norm.default)
+def instance_norm(input, weight=None, bias=None, running_mean=None, running_var=None,
+                  use_input_stats=True, momentum=0.1, eps=1e-5):
+    if not use_input_stats and (running_mean is None or running_var is None):
+        raise RuntimeError(
+            "Expected running_mean and running_var to be defined when use_input_stats is false"
+        )
+    if input.dim() < 3:
+        raise RuntimeError(
+            f"instance_norm: input must have at least 3 dimensions, but got {input.dim()} dims"
+        )
+
+    batch = int(input.shape[0])
+    channels = int(input.shape[1])
+    # Every sample's every channel is one normalization group of its own, so
+    # the samples are folded into the channel axis and each channel's
+    # per-sample statistic stands alone: the merged call is one batch norm
+    # whose channels are the (sample, channel) pairs.
+    merged = [1, batch * channels] + list(input.shape[2:])
+
+    def repeated(stats):
+        if stats is None:
+            return None
+        return stats.repeat([batch] + [1] * (stats.dim() - 1))
+
+    # Mixed running-stat dtypes follow the weight's dtype when one is given.
+    if weight is not None:
+        if running_mean is not None and running_mean.dtype != weight.dtype:
+            running_mean = running_mean.to(weight.dtype)
+        if running_var is not None and running_var.dtype != weight.dtype:
+            running_var = running_var.to(weight.dtype)
+
+    input_reshaped = input.contiguous().view(merged)
+    running_mean_ = repeated(running_mean)
+    running_var_ = repeated(running_var)
+    out = ops.batch_norm.default(
+        input_reshaped, repeated(weight), repeated(bias),
+        running_mean_, running_var_,
+        use_input_stats, momentum, eps,
+    )
+    if use_input_stats:
+        if running_mean is not None:
+            running_mean.copy_(running_mean_.view(batch, channels).mean(0))
+        if running_var is not None:
+            running_var.copy_(running_var_.view(batch, channels).mean(0))
+    return out.view(list(input.shape))
 
 
 # ---------------------------------------------------------------------------
