@@ -448,3 +448,27 @@ def test_onnxrt_backend_matches_eager():
     out = compiled(x)
     ref = fn(x)
     assert float((out - ref).abs().max()) < 1e-5
+
+
+def test_generated_kernel_backends_declare_the_features_they_have():
+    # A feature a backend declares changes how kernels are scheduled.  The
+    # store-led loop order is not one the Triton backend is built around: with
+    # it, the reductions of a UNet step read their inputs across the grain and
+    # the step's forward ran about 0.4 ms slower.
+    from tensorplay.compiler.backends.stax.codegen.common import BackendFeature
+    from tensorplay.compiler.backends.stax.codegen.cpp import CppScheduling
+    from tensorplay.compiler.backends.stax.codegen.triton import TritonScheduling
+
+    triton = set(TritonScheduling.backend_features)
+    assert BackendFeature.PREFER_STORE_LOOP_ORDER not in triton
+    assert {
+        BackendFeature.FOREACH,
+        BackendFeature.INPLACE_BUFFERS,
+        BackendFeature.SCAN,
+        BackendFeature.SORT,
+        BackendFeature.TUPLE_REDUCTION,
+    } <= triton
+    assert set(CppScheduling.backend_features) == {
+        BackendFeature.INPLACE_BUFFERS,
+        BackendFeature.REDUCE_TO_SINGLE_ELEMENT,
+    }
