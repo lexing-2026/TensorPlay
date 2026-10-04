@@ -17,6 +17,7 @@
 #include <iostream>
 #include <cmath>
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <type_traits>
 #if defined(__x86_64__) || defined(__i386__)
@@ -131,6 +132,114 @@ static Tensor empty_like_in_input_order(const Tensor& t, DType dt) {
     return result;
 }
 
+// Elementwise work over a strided source without a materialization copy.
+// The result is contiguous, so the traversal follows the result layout and
+// the innermost dim (unit stride on the result side) is chosen as:
+//   * a dim that is unit-stride on the source too, when long enough -- the
+//     body then sees adjacent runs on both sides and can vectorize (slices,
+//     batch offsets, channels-last rows);
+//   * otherwise the last non-degenerate dim, with the body reading the
+//     source at a constant byte step (transposed / permuted views).
+// body(src_run, src_step, dst_run, len) must handle any len.  Returns false
+// only for a 0-dim input, where the caller's flat path is trivial.
+template <class Body>
+static bool strided_unary_loop(const Tensor& self, Tensor& result,
+                               int64_t min_run, Body&& body) {
+    const int64_t ndim = self.dim();
+    if (ndim == 0) return false;
+    const std::vector<int64_t> sizes = static_cast<std::vector<int64_t>>(self.shape());
+    const std::vector<int64_t> src_strides = self.strides();
+
+    // Destination strides: the result is contiguous in shape order.
+    std::vector<int64_t> dst_strides(ndim, 0);
+    int64_t suffix = 1;
+    for (int64_t d = ndim - 1; d >= 0; --d) {
+        dst_strides[d] = suffix;
+        suffix *= sizes[d];
+    }
+
+    int64_t inner_dim = -1;
+    for (int64_t d = 0; d < ndim; ++d) {
+        if (sizes[d] > 1 && src_strides[d] == 1 && dst_strides[d] == 1 &&
+            sizes[d] >= min_run) {
+            inner_dim = d;
+            break;
+        }
+    }
+    if (inner_dim < 0) {
+        for (int64_t d = ndim - 1; d >= 0; --d) {
+            if (sizes[d] > 1) {
+                inner_dim = d;
+                break;
+            }
+        }
+        if (inner_dim < 0) return false;  // scalar tensor
+        // Gather reads pull one cache line per element when the inner step
+        // is large.  A 2D layout still prefers that cost onto the blocked
+        // copy + vector pass; deeper permutes have no such blocked copy, so
+        // the direct gather wins there regardless of the step.
+        const int64_t step_bytes =
+            src_strides[inner_dim] * static_cast<int64_t>(self.itemsize());
+        if (ndim == 2 && step_bytes > 256) return false;
+    }
+    const int64_t inner_size = sizes[inner_dim];
+    const int64_t src_inner_step =
+        src_strides[inner_dim] * static_cast<int64_t>(self.itemsize());
+
+    // Outer dims, outermost first (descending source stride) so the
+    // fastest-varying outer step takes the shortest source jumps.  Offsets
+    // are byte-based: the two tensors may have different item sizes.
+    struct OuterDim { int64_t size, src_step, dst_step; };
+    std::vector<OuterDim> dims;
+    dims.reserve(ndim);
+    for (int64_t d = 0; d < ndim; ++d) {
+        if (d == inner_dim || sizes[d] <= 1) continue;
+        dims.push_back({sizes[d],
+                        src_strides[d] * static_cast<int64_t>(self.itemsize()),
+                        dst_strides[d] * static_cast<int64_t>(result.itemsize())});
+    }
+    std::sort(dims.begin(), dims.end(),
+              [](const OuterDim& a, const OuterDim& b) { return a.src_step > b.src_step; });
+
+    int64_t outer_count = 1;
+    for (const OuterDim& od : dims) outer_count *= od.size;
+    const int64_t grain_iters = std::max<int64_t>(
+        1, kUnaryGrain / std::max<int64_t>(inner_size, 1));
+
+    const char* src_base = static_cast<const char*>(self.data_ptr());
+    char* dst_base = static_cast<char*>(result.data_ptr());
+    const int ndims = static_cast<int>(dims.size());
+
+    parallel_for(0, outer_count, grain_iters, [&](int64_t begin, int64_t end) {
+        std::vector<int64_t> idx(ndims, 0);
+        int64_t src_off = 0, dst_off = 0;
+        int64_t linear = begin;
+        for (int j = ndims - 1; j >= 0; --j) {
+            const int64_t v = linear % dims[j].size;
+            linear /= dims[j].size;
+            idx[j] = v;
+            src_off += v * dims[j].src_step;
+            dst_off += v * dims[j].dst_step;
+        }
+        for (int64_t o = begin; o < end; ++o) {
+            body(src_base + src_off, src_inner_step, dst_base + dst_off, inner_size);
+            for (int j = ndims - 1; j >= 0; --j) {
+                if (++idx[j] < dims[j].size) {
+                    src_off += dims[j].src_step;
+                    dst_off += dims[j].dst_step;
+                    break;
+                }
+                // idx[j] wraps size-1 -> 0: its contribution (size-1)*step
+                // leaves the sum.
+                idx[j] = 0;
+                src_off -= dims[j].src_step * (dims[j].size - 1);
+                dst_off -= dims[j].dst_step * (dims[j].size - 1);
+            }
+        }
+    });
+    return true;
+}
+
 // Helper for operations that preserve dtype (e.g. abs, neg, square).
 // vec_op selects the AVX2 fast path (see cpu/VecUnary.h) for float/double;
 // the scalar lambda stays as the fallback for other dtypes and non-AVX2 hosts.
@@ -142,16 +251,39 @@ Tensor unary_op_kernel(const Tensor& self, Func func,
     Tensor result = empty_like_in_input_order(self, self.dtype());
     int64_t n = self.numel();
 
-    Tensor self_contig = keep_cl ? self : self.contiguous();
     // Vector fast paths exist only for f32/f64; other dtypes take the
     // scalar-lambda fallback and must never instantiate the vec calls.
     const bool vec_ok = vecunary::vec_ready() && vec_op != vecunary::VOp::None
         && (self.dtype() == DType::Float32 || self.dtype() == DType::Float64);
+    const bool contiguous_path = keep_cl || self.is_contiguous();
 
     #define OP_CASE(ctype, name) \
     case DType::name: { \
-        const ctype* src = self_contig.data_ptr<ctype>(); \
         ctype* dst = result.data_ptr<ctype>(); \
+        if (!contiguous_path) { \
+            const bool strided = strided_unary_loop( \
+                self, result, /*min_run=*/vec_ok ? 8 : 1, \
+                [&](const char* sp, int64_t sstep, char* dp, int64_t len) { \
+                    ctype* d = reinterpret_cast<ctype*>(dp); \
+                    if (sstep == static_cast<int64_t>(sizeof(ctype))) { \
+                        const ctype* s = reinterpret_cast<const ctype*>(sp); \
+                        if (vec_ok) { \
+                            vec_run(vec_op, vec_prm, s, d, 0, len); \
+                        } else { \
+                            for (int64_t i = 0; i < len; ++i) d[i] = func(s[i]); \
+                        } \
+                    } else { \
+                        for (int64_t i = 0; i < len; ++i) { \
+                            ctype v; \
+                            std::memcpy(&v, sp + i * sstep, sizeof(ctype)); \
+                            d[i] = func(v); \
+                        } \
+                    } \
+                }); \
+            if (strided) break; \
+        } \
+        Tensor self_contig = contiguous_path ? self : self.contiguous(); \
+        const ctype* src = self_contig.data_ptr<ctype>(); \
         if (vec_ok) { \
             parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) { \
             vec_run(vec_op, vec_prm, src, dst, begin, end); \
@@ -169,7 +301,7 @@ Tensor unary_op_kernel(const Tensor& self, Func func,
         default: TP_THROW(TypeError, "Unsupported dtype");
     }
     #undef OP_CASE
-    
+
     return result;
 }
 
@@ -189,19 +321,33 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func,
     Tensor result = empty_like_in_input_order(self, out_dtype);
     int64_t n = self.numel();
 
-    Tensor self_contig = keep_cl ? self : self.contiguous();
     // Vector fast paths cover f32/f64 plus the widen-compute-narrow f16/bf16
     // kernels; integral inputs stay on the scalar-lambda fallback.
     const bool vec_ok = vecunary::vec_ready() && vec_op != vecunary::VOp::None
         && (self.dtype() == DType::Float32 || self.dtype() == DType::Float64
             || self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16);
+    const bool contiguous_path = keep_cl || self.is_contiguous();
 
     if (isIntegralType(self.dtype())) {
         // Input int, Output float
         #define INT_CASE(ctype, name) \
         case DType::name: { \
-            const ctype* src = self_contig.data_ptr<ctype>(); \
             float* dst = result.data_ptr<float>(); \
+            if (!contiguous_path) { \
+                const bool strided = strided_unary_loop( \
+                    self, result, /*min_run=*/1, \
+                    [&](const char* sp, int64_t sstep, char* dp, int64_t len) { \
+                        float* d = reinterpret_cast<float*>(dp); \
+                        for (int64_t i = 0; i < len; ++i) { \
+                            ctype v; \
+                            std::memcpy(&v, sp + i * sstep, sizeof(ctype)); \
+                            d[i] = static_cast<float>(func(static_cast<float>(v))); \
+                        } \
+                    }); \
+                if (strided) break; \
+            } \
+            Tensor self_contig = contiguous_path ? self : self.contiguous(); \
+            const ctype* src = self_contig.data_ptr<ctype>(); \
             parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) { \
             for(int64_t i = begin; i < end; ++i) dst[i] = static_cast<float>(func(static_cast<float>(src[i]))); \
             }); \
@@ -215,8 +361,28 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func,
     } else if (self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16) {
         int64_t n = self.numel();
         if (self.dtype() == DType::Float16) {
-            const Half* src = self_contig.data_ptr<Half>();
             Half* dst = result.data_ptr<Half>();
+            if (!contiguous_path) {
+                const bool strided = strided_unary_loop(
+                    self, result, /*min_run=*/(vec_ok && vecunary::f16c_available()) ? 8 : 1,
+                    [&](const char* sp, int64_t sstep, char* dp, int64_t len) {
+                        Half* d = reinterpret_cast<Half*>(dp);
+                        if (sstep == 2 && vec_ok && vecunary::f16c_available()) {
+                            vecunary::run_f16(vec_op, vec_prm,
+                                              reinterpret_cast<const uint16_t*>(sp),
+                                              reinterpret_cast<uint16_t*>(d), 0, len);
+                        } else {
+                            for (int64_t i = 0; i < len; ++i) {
+                                Half h;
+                                std::memcpy(&h, sp + i * sstep, sizeof(Half));
+                                d[i] = static_cast<Half>(func(static_cast<float>(h)));
+                            }
+                        }
+                    });
+                if (strided) return result;
+            }
+            const Half* src = contiguous_path
+                ? self.data_ptr<Half>() : self.contiguous().data_ptr<Half>();
             if (vec_ok && vecunary::f16c_available()) {
                 parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
                 vecunary::run_f16(vec_op, vec_prm,
@@ -229,8 +395,28 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func,
                 });
             }
         } else {
-            const BFloat16* src = self_contig.data_ptr<BFloat16>();
             BFloat16* dst = result.data_ptr<BFloat16>();
+            if (!contiguous_path) {
+                const bool strided = strided_unary_loop(
+                    self, result, /*min_run=*/vec_ok ? 8 : 1,
+                    [&](const char* sp, int64_t sstep, char* dp, int64_t len) {
+                        BFloat16* d = reinterpret_cast<BFloat16*>(dp);
+                        if (sstep == 2 && vec_ok) {
+                            vecunary::run_bf16(vec_op, vec_prm,
+                                               reinterpret_cast<const uint16_t*>(sp),
+                                               reinterpret_cast<uint16_t*>(d), 0, len);
+                        } else {
+                            for (int64_t i = 0; i < len; ++i) {
+                                BFloat16 h;
+                                std::memcpy(&h, sp + i * sstep, sizeof(BFloat16));
+                                d[i] = static_cast<BFloat16>(func(static_cast<float>(h)));
+                            }
+                        }
+                    });
+                if (strided) return result;
+            }
+            const BFloat16* src = contiguous_path
+                ? self.data_ptr<BFloat16>() : self.contiguous().data_ptr<BFloat16>();
             if (vec_ok) {
                 parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
                 vecunary::run_bf16(vec_op, vec_prm,
@@ -247,8 +433,27 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func,
         // Input float, Output float
         #define FLOAT_CASE(ctype, name) \
         case DType::name: { \
-            const ctype* src = self_contig.data_ptr<ctype>(); \
             ctype* dst = result.data_ptr<ctype>(); \
+            if (!contiguous_path) { \
+                const bool strided = strided_unary_loop( \
+                    self, result, /*min_run=*/vec_ok ? 8 : 1, \
+                    [&](const char* sp, int64_t sstep, char* dp, int64_t len) { \
+                        ctype* d = reinterpret_cast<ctype*>(dp); \
+                        if (sstep == static_cast<int64_t>(sizeof(ctype))) { \
+                            const ctype* s = reinterpret_cast<const ctype*>(sp); \
+                            for (int64_t i = 0; i < len; ++i) d[i] = func(s[i]); \
+                        } else { \
+                            for (int64_t i = 0; i < len; ++i) { \
+                                ctype v; \
+                                std::memcpy(&v, sp + i * sstep, sizeof(ctype)); \
+                                d[i] = func(v); \
+                            } \
+                        } \
+                    }); \
+                if (strided) break; \
+            } \
+            Tensor self_contig = contiguous_path ? self : self.contiguous(); \
+            const ctype* src = self_contig.data_ptr<ctype>(); \
             parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) { \
             for(int64_t i = begin; i < end; ++i) dst[i] = func(src[i]); \
             }); \
@@ -256,8 +461,31 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func,
         }
         switch (self.dtype()) {
             case DType::Float32: {
-                 const float* src = self_contig.data_ptr<float>();
                  float* dst = result.data_ptr<float>();
+                 if (!contiguous_path) {
+                     const bool strided = strided_unary_loop(
+                         self, result, /*min_run=*/vec_ok ? 8 : 1,
+                         [&](const char* sp, int64_t sstep, char* dp, int64_t len) {
+                             float* d = reinterpret_cast<float*>(dp);
+                             if (sstep == 4) {
+                                 const float* s = reinterpret_cast<const float*>(sp);
+                                 if (vec_ok) {
+                                     vecunary::run_f32(vec_op, vec_prm, s, d, 0, len);
+                                 } else {
+                                     for (int64_t i = 0; i < len; ++i) d[i] = func(s[i]);
+                                 }
+                             } else {
+                                 for (int64_t i = 0; i < len; ++i) {
+                                     float v;
+                                     std::memcpy(&v, sp + i * sstep, sizeof(float));
+                                     d[i] = func(v);
+                                 }
+                             }
+                         });
+                     if (strided) break;
+                 }
+                 Tensor self_contig = contiguous_path ? self : self.contiguous();
+                 const float* src = self_contig.data_ptr<float>();
                  if (vec_ok) {
                      parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) { \
                      vecunary::run_f32(vec_op, vec_prm, src, dst, begin, end);
@@ -270,8 +498,31 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func,
                  break;
             }
             case DType::Float64: {
-                 const double* src = self_contig.data_ptr<double>();
                  double* dst = result.data_ptr<double>();
+                 if (!contiguous_path) {
+                     const bool strided = strided_unary_loop(
+                         self, result, /*min_run=*/vec_ok ? 8 : 1,
+                         [&](const char* sp, int64_t sstep, char* dp, int64_t len) {
+                             double* d = reinterpret_cast<double*>(dp);
+                             if (sstep == 8) {
+                                 const double* s = reinterpret_cast<const double*>(sp);
+                                 if (vec_ok) {
+                                     vecunary::run_f64(vec_op, vec_prm, s, d, 0, len);
+                                 } else {
+                                     for (int64_t i = 0; i < len; ++i) d[i] = func(s[i]);
+                                 }
+                             } else {
+                                 for (int64_t i = 0; i < len; ++i) {
+                                     double v;
+                                     std::memcpy(&v, sp + i * sstep, sizeof(double));
+                                     d[i] = func(v);
+                                 }
+                             }
+                         });
+                     if (strided) break;
+                 }
+                 Tensor self_contig = contiguous_path ? self : self.contiguous();
+                 const double* src = self_contig.data_ptr<double>();
                  if (vec_ok) {
                      parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) { \
                      vecunary::run_f64(vec_op, vec_prm, src, dst, begin, end);
@@ -287,7 +538,7 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func,
         }
         #undef FLOAT_CASE
     }
-    
+
     return result;
 }
 
