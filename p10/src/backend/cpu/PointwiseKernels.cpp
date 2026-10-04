@@ -128,18 +128,41 @@ static Tensor empty_like_in_input_order(const Tensor& t, DType dt) {
     Tensor result = Tensor::empty(sizes, dt, t.device());
     if (pointwise_keep_channels_last(t)) {
         result = result.as_strided(sizes, get_channels_last_strides(sizes), 0);
+    } else if (!t.is_contiguous() && t.dim() > 1) {
+        // A dense permuted view (e.g. transpose) keeps its layout in the
+        // output: the elementwise pass then runs over unit-stride runs on
+        // both sides instead of gathering one cache line per element.
+        const std::vector<int64_t> t_strides = t.strides();
+        if (SizesAndStrides::is_non_overlapping_and_dense(sizes, t_strides)) {
+            result = result.as_strided(sizes, t_strides, 0);
+        }
     }
     return result;
 }
 
+// True when source and result share one storage-order traversal: identical
+// strides that tile memory exactly (contiguous, channels-last, or a dense
+// permuted view).  Element i in the source's storage then maps to element i
+// in the result's storage, so the op can run as one flat pass over data_ptr
+// instead of per-run addressing.
+static bool flat_layout_pair(const Tensor& t, const Tensor& result) {
+    if (t.is_contiguous() && result.is_contiguous()) return true;
+    const std::vector<int64_t> ts = t.strides();
+    if (ts != static_cast<std::vector<int64_t>>(result.strides())) return false;
+    const auto sizes = static_cast<std::vector<int64_t>>(t.shape());
+    return SizesAndStrides::is_non_overlapping_and_dense(sizes, ts);
+}
+
 // Elementwise work over a strided source without a materialization copy.
-// The result is contiguous, so the traversal follows the result layout and
-// the innermost dim (unit stride on the result side) is chosen as:
+// The result carries the input's layout (dense permuted views keep their
+// strides), so the innermost dim -- unit stride on the result side -- is
+// chosen as:
 //   * a dim that is unit-stride on the source too, when long enough -- the
 //     body then sees adjacent runs on both sides and can vectorize (slices,
-//     batch offsets, channels-last rows);
+//     batch offsets, channels-last rows, transposed views);
 //   * otherwise the last non-degenerate dim, with the body reading the
-//     source at a constant byte step (transposed / permuted views).
+//     source at a constant byte step (layouts with holes, e.g. strided
+//     slices, whose output is plain contiguous).
 // body(src_run, src_step, dst_run, len) must handle any len.  Returns false
 // only for a 0-dim input, where the caller's flat path is trivial.
 template <class Body>
@@ -150,13 +173,9 @@ static bool strided_unary_loop(const Tensor& self, Tensor& result,
     const std::vector<int64_t> sizes = static_cast<std::vector<int64_t>>(self.shape());
     const std::vector<int64_t> src_strides = self.strides();
 
-    // Destination strides: the result is contiguous in shape order.
-    std::vector<int64_t> dst_strides(ndim, 0);
-    int64_t suffix = 1;
-    for (int64_t d = ndim - 1; d >= 0; --d) {
-        dst_strides[d] = suffix;
-        suffix *= sizes[d];
-    }
+    // Destination strides come from the result itself: plain contiguous
+    // except where the input's dense permuted layout was preserved.
+    const std::vector<int64_t> dst_strides = result.strides();
 
     int64_t inner_dim = -1;
     for (int64_t d = 0; d < ndim; ++d) {
@@ -247,7 +266,6 @@ template<typename Func>
 Tensor unary_op_kernel(const Tensor& self, Func func,
                        vecunary::VOp vec_op = vecunary::VOp::None,
                        vecunary::VParams vec_prm = {}) {
-    const bool keep_cl = pointwise_keep_channels_last(self);
     Tensor result = empty_like_in_input_order(self, self.dtype());
     int64_t n = self.numel();
 
@@ -255,7 +273,7 @@ Tensor unary_op_kernel(const Tensor& self, Func func,
     // scalar-lambda fallback and must never instantiate the vec calls.
     const bool vec_ok = vecunary::vec_ready() && vec_op != vecunary::VOp::None
         && (self.dtype() == DType::Float32 || self.dtype() == DType::Float64);
-    const bool contiguous_path = keep_cl || self.is_contiguous();
+    const bool contiguous_path = flat_layout_pair(self, result);
 
     #define OP_CASE(ctype, name) \
     case DType::name: { \
@@ -317,7 +335,6 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func,
     if (isIntegralType(out_dtype)) {
         out_dtype = DType::Float32;
     }
-    const bool keep_cl = pointwise_keep_channels_last(self);
     Tensor result = empty_like_in_input_order(self, out_dtype);
     int64_t n = self.numel();
 
@@ -326,7 +343,7 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func,
     const bool vec_ok = vecunary::vec_ready() && vec_op != vecunary::VOp::None
         && (self.dtype() == DType::Float32 || self.dtype() == DType::Float64
             || self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16);
-    const bool contiguous_path = keep_cl || self.is_contiguous();
+    const bool contiguous_path = flat_layout_pair(self, result);
 
     if (isIntegralType(self.dtype())) {
         // Input int, Output float
