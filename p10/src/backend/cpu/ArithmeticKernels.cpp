@@ -1554,6 +1554,36 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) 
         });
         return result;
     }
+
+    // Operands that share one dense layout stream flat in storage order:
+    // allocate the result with the same strides so a permuted pair (e.g.
+    // two transposes) runs one unit-stride pass instead of gathering a
+    // cache line per element.
+    if (plain_layout && (cpu_has_avx512() || cpu_has_avx2f()) &&
+        (self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        other.dtype() == self.dtype() && self.shape() == other.shape() &&
+        !alpha.isComplex()) {
+        const std::vector<int64_t> sizes =
+            static_cast<std::vector<int64_t>>(self.shape());
+        const std::vector<int64_t> strides =
+            static_cast<std::vector<int64_t>>(self.strides());
+        if (strides == static_cast<std::vector<int64_t>>(other.strides()) &&
+            SizesAndStrides::is_non_overlapping_and_dense(sizes, strides)) {
+            Tensor result = Tensor::empty(sizes, self.dtype(), self.device());
+            result = result.as_strided(sizes, strides, 0);
+            const int64_t n = self.numel();
+            if (self.dtype() == DType::Float32) {
+                binary_f32_vec(BIN_ADD, self.data_ptr<float>(),
+                               other.data_ptr<float>(),
+                               result.data_ptr<float>(), n, alpha.to<float>());
+            } else {
+                binary_f64_vec(BIN_ADD, self.data_ptr<double>(),
+                               other.data_ptr<double>(),
+                               result.data_ptr<double>(), n, alpha.to<double>());
+            }
+            return result;
+        }
+    }
 #endif
     #ifdef USE_ONEDNN
     if (OneDNNContext::is_enabled()) {
@@ -2175,6 +2205,42 @@ Tensor sub_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) 
 }
 
 Tensor mul_kernel(const Tensor& self, const Tensor& other) {
+#if defined(__x86_64__)
+    // Operands that share one dense layout stream flat in storage order:
+    // allocate the result with the same strides so a permuted pair (e.g.
+    // two transposes) runs one unit-stride pass instead of gathering a
+    // cache line per element.
+    bool plain_layout = true;
+#ifdef USE_ONEDNN
+    plain_layout =
+        !self.unsafeGetTensorImpl()->has_onednn_md() &&
+        !other.unsafeGetTensorImpl()->has_onednn_md();
+#endif
+    if (plain_layout && (cpu_has_avx512() || cpu_has_avx2f()) &&
+        (self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        other.dtype() == self.dtype() && self.shape() == other.shape()) {
+        const std::vector<int64_t> sizes =
+            static_cast<std::vector<int64_t>>(self.shape());
+        const std::vector<int64_t> strides =
+            static_cast<std::vector<int64_t>>(self.strides());
+        if (strides == static_cast<std::vector<int64_t>>(other.strides()) &&
+            SizesAndStrides::is_non_overlapping_and_dense(sizes, strides)) {
+            Tensor result = Tensor::empty(sizes, self.dtype(), self.device());
+            result = result.as_strided(sizes, strides, 0);
+            const int64_t n = self.numel();
+            if (self.dtype() == DType::Float32) {
+                binary_f32_vec(BIN_MUL, self.data_ptr<float>(),
+                               other.data_ptr<float>(),
+                               result.data_ptr<float>(), n, 1.0f);
+            } else {
+                binary_f64_vec(BIN_MUL, self.data_ptr<double>(),
+                               other.data_ptr<double>(),
+                               result.data_ptr<double>(), n, 1.0);
+            }
+            return result;
+        }
+    }
+#endif
     #ifdef USE_ONEDNN
     if (OneDNNContext::is_enabled()) {
         auto self_impl = self.unsafeGetTensorImpl();
@@ -2337,6 +2403,42 @@ Tensor mul_kernel(const Tensor& self, const Tensor& other) {
 }
 
 Tensor div_kernel(const Tensor& self, const Tensor& other) {
+#if defined(__x86_64__)
+    // Operands that share one dense layout stream flat in storage order:
+    // allocate the result with the same strides so a permuted pair (e.g.
+    // two transposes) runs one unit-stride pass instead of gathering a
+    // cache line per element.
+    bool plain_layout = true;
+#ifdef USE_ONEDNN
+    plain_layout =
+        !self.unsafeGetTensorImpl()->has_onednn_md() &&
+        !other.unsafeGetTensorImpl()->has_onednn_md();
+#endif
+    if (plain_layout && (cpu_has_avx512() || cpu_has_avx2f()) &&
+        (self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        other.dtype() == self.dtype() && self.shape() == other.shape()) {
+        const std::vector<int64_t> sizes =
+            static_cast<std::vector<int64_t>>(self.shape());
+        const std::vector<int64_t> strides =
+            static_cast<std::vector<int64_t>>(self.strides());
+        if (strides == static_cast<std::vector<int64_t>>(other.strides()) &&
+            SizesAndStrides::is_non_overlapping_and_dense(sizes, strides)) {
+            Tensor result = Tensor::empty(sizes, self.dtype(), self.device());
+            result = result.as_strided(sizes, strides, 0);
+            const int64_t n = self.numel();
+            if (self.dtype() == DType::Float32) {
+                binary_f32_vec(BIN_DIV, self.data_ptr<float>(),
+                               other.data_ptr<float>(),
+                               result.data_ptr<float>(), n, 1.0f);
+            } else {
+                binary_f64_vec(BIN_DIV, self.data_ptr<double>(),
+                               other.data_ptr<double>(),
+                               result.data_ptr<double>(), n, 1.0);
+            }
+            return result;
+        }
+    }
+#endif
     #ifdef USE_ONEDNN
     if (OneDNNContext::is_enabled()) {
         auto self_impl = self.unsafeGetTensorImpl();
