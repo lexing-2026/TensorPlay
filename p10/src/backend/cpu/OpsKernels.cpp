@@ -889,6 +889,48 @@ inline void f64_512(const double* in, double* out, int64_t n, double lo, double 
         out[i] = v;
     }
 }
+
+inline bool avx2_ok() {
+    static const bool ok = __builtin_cpu_supports("avx2") != 0;
+    return ok;
+}
+
+// AVX2 twins of the helpers above, selected when the 512-bit path is
+// unavailable. The bound order matches so NaN lanes flow through the same
+// way.
+__attribute__((target("avx2")))
+inline void f32_256(const float* in, float* out, int64_t n, float lo, float hi) {
+    const __m256 vlo = _mm256_set1_ps(lo), vhi = _mm256_set1_ps(hi);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(in + i);
+        v = _mm256_min_ps(vhi, _mm256_max_ps(vlo, v));
+        _mm256_storeu_ps(out + i, v);
+    }
+    for (; i < n; ++i) {
+        float v = in[i];
+        v = v < lo ? lo : v;
+        v = v > hi ? hi : v;
+        out[i] = v;
+    }
+}
+
+__attribute__((target("avx2")))
+inline void f64_256(const double* in, double* out, int64_t n, double lo, double hi) {
+    const __m256d vlo = _mm256_set1_pd(lo), vhi = _mm256_set1_pd(hi);
+    int64_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        __m256d v = _mm256_loadu_pd(in + i);
+        v = _mm256_min_pd(vhi, _mm256_max_pd(vlo, v));
+        _mm256_storeu_pd(out + i, v);
+    }
+    for (; i < n; ++i) {
+        double v = in[i];
+        v = v < lo ? lo : v;
+        v = v > hi ? hi : v;
+        out[i] = v;
+    }
+}
 #endif
 }  // namespace clamp_row
 
@@ -931,6 +973,13 @@ Tensor clamp_min_scalar_cpu(const Tensor& self, Scalar min) {
             });
             return result;
         }
+        if (clamp_row::avx2_ok()) {
+            tensorplay::parallel::parallel_for(0, n, 8192, [&](int64_t b, int64_t e) {
+                clamp_row::f32_256(in + b, out + b, e - b, lo,
+                                   std::numeric_limits<float>::infinity());
+            });
+            return result;
+        }
 #endif
         tensorplay::parallel::parallel_for(0, n, 8192, [&](int64_t b, int64_t e) {
             for (int64_t i = b; i < e; ++i) out[i] = in[i] < lo ? lo : in[i];
@@ -955,6 +1004,13 @@ Tensor clamp_max_scalar_cpu(const Tensor& self, Scalar max) {
         if (clamp_row::avx512_ok()) {
             tensorplay::parallel::parallel_for(0, n, 8192, [&](int64_t b, int64_t e) {
                 clamp_row::f32_512(in + b, out + b, e - b,
+                                   -std::numeric_limits<float>::infinity(), hi);
+            });
+            return result;
+        }
+        if (clamp_row::avx2_ok()) {
+            tensorplay::parallel::parallel_for(0, n, 8192, [&](int64_t b, int64_t e) {
+                clamp_row::f32_256(in + b, out + b, e - b,
                                    -std::numeric_limits<float>::infinity(), hi);
             });
             return result;
@@ -1001,6 +1057,12 @@ Tensor clip_cpu(const Tensor& self, const std::optional<Scalar>& min, const std:
                 });
                 return result;
             }
+            if (clamp_row::avx2_ok()) {
+                tensorplay::parallel::parallel_for(0, n, 8192, [&](int64_t b, int64_t e) {
+                    clamp_row::f32_256(in + b, out + b, e - b, lo32, hi32);
+                });
+                return result;
+            }
 #endif
             tensorplay::parallel::parallel_for(0, n, 8192, [&](int64_t b, int64_t e) {
                 for (int64_t i = b; i < e; ++i) {
@@ -1022,6 +1084,12 @@ Tensor clip_cpu(const Tensor& self, const std::optional<Scalar>& min, const std:
             if (clamp_row::avx512_ok()) {
                 tensorplay::parallel::parallel_for(0, n, 8192, [&](int64_t b, int64_t e) {
                     clamp_row::f64_512(in + b, out + b, e - b, lo, hi);
+                });
+                return result;
+            }
+            if (clamp_row::avx2_ok()) {
+                tensorplay::parallel::parallel_for(0, n, 8192, [&](int64_t b, int64_t e) {
+                    clamp_row::f64_256(in + b, out + b, e - b, lo, hi);
                 });
                 return result;
             }

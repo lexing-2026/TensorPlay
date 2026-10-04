@@ -99,7 +99,9 @@ Tensor masked_fill_cpu(const Tensor& self, const Tensor& mask, const Scalar& val
         static_cast<std::vector<int64_t>>(mask.shape()));
     Tensor self_b = self.expand(out_shape).contiguous();
     Tensor mask_b = mask.expand(out_shape).contiguous();
-    Tensor result = self_b.clone();
+    // The pass below writes every element, so an uninitialized result
+    // avoids a full extra copy of the input.
+    Tensor result = Tensor::empty(out_shape, self.dtype(), self.device());
     int64_t n = result.numel();
 #define TP_MF_CASE(ctype, name) \
     case DType::name: { \
