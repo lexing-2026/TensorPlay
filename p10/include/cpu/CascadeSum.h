@@ -285,7 +285,8 @@ void scalar_inner_sum(
   }
 }
 
-template <typename T, typename VecLoad, typename ScalarLoad, typename Store>
+template <typename T, typename VecLoad, typename ScalarLoad, typename Store,
+          bool kLaneStore = false>
 void vectorized_outer_sum(
     char* __restrict data[2],
     int64_t inner_stride,
@@ -297,6 +298,12 @@ void vectorized_outer_sum(
   constexpr int64_t vec_stride = VecLoad::memsize();
   constexpr int64_t rows = 4;
 
+  // kLaneStore: the caller guarantees every output slot is written exactly
+  // once with unit-element stride and no widening, so each lane vector can
+  // go straight to memory instead of per-lane read-modify-write stores.
+  T* const out_base = kLaneStore
+      ? reinterpret_cast<T*>(data[0]) : nullptr;
+
   int64_t j = 0;
   for (; j + rows * Vec::size() <= size1; j += rows * Vec::size()) {
     const char* row = data[1] + j * scalar_stride;
@@ -305,14 +312,22 @@ void vectorized_outer_sum(
     for (int64_t i = 0; i < rows; ++i) {
       // Each lane of sums[i] belongs to a distinct output column, so the
       // lanes must be stored individually -- never folded into one scalar.
-      store_sum<Store>(data[0], out_stride, j + i * Vec::size(), sums[i]);
+      if constexpr (kLaneStore) {
+        sums[i].store(out_base + j + i * Vec::size());
+      } else {
+        store_sum<Store>(data[0], out_stride, j + i * Vec::size(), sums[i]);
+      }
     }
   }
 
   for (; j + Vec::size() <= size1; j += Vec::size()) {
     const char* row = data[1] + j * scalar_stride;
     const Vec sums = row_sum<Vec, VecLoad>(row, inner_stride, size0);
-    store_sum<Store>(data[0], out_stride, j, sums);
+    if constexpr (kLaneStore) {
+      sums.store(out_base + j);
+    } else {
+      store_sum<Store>(data[0], out_stride, j, sums);
+    }
   }
 
   for (; j < size1; ++j) {
@@ -377,7 +392,8 @@ bool contiguous_sum_dim(const Tensor& input, Tensor& output, int64_t dim) {
         char* data[2] = {
             output_data + begin * static_cast<int64_t>(sizeof(Scalar)),
             const_cast<char*>(input_data + begin * static_cast<int64_t>(sizeof(Scalar)))};
-        vectorized_outer_sum<Acc, OuterVecLoad, ScalarLoad, Store>(
+        vectorized_outer_sum<Acc, OuterVecLoad, ScalarLoad, Store,
+                             std::is_same_v<Scalar, Acc>>(
             data,
             columns * static_cast<int64_t>(sizeof(Scalar)),
             static_cast<int64_t>(sizeof(Scalar)),
