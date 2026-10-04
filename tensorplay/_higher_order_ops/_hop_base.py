@@ -38,6 +38,19 @@ class _AutoDispatchBelowAutograd:
 
 _below_autograd = threading.local()
 _autocast_excluded = threading.local()
+_recorded_whole = threading.local()
+
+
+def recording_whole_call() -> bool:
+    """Whether a trace is recording the operator call now running as one node.
+
+    The call runs on real values with recording switched off, so nothing on
+    the dispatch stack says a trace is watching -- yet the gradient of what it
+    returns is asked for later, through the trace, and has to come back as an
+    operator the trace can keep whole, not as the steps this one run took.
+    """
+
+    return getattr(_recorded_whole, "depth", 0) > 0
 
 
 class _ExcludeAutocastGuard:
@@ -80,6 +93,14 @@ class HigherOrderOperator:
     below it), then the autocast layer (unless excluded), then the composite
     eager base registration.
     """
+
+    #: Whether a trace that follows real values records this operator's steps
+    #: rather than the operator.  A loop over a known number of steps is what
+    #: such a trace sees anyway -- every extent is the one it was run with --
+    #: and its steps lower and fuse as ordinary operations, where a loop kept
+    #: whole would have to run one step at a time.  A capture still records it
+    #: as one node.
+    runs_inline_under_value_trace = False
 
     def __init__(self, name: str, *, cacheable: bool = False) -> None:
         self._name = name
@@ -154,10 +175,28 @@ class HigherOrderOperator:
             disable_proxy_modes_tracing,
         )
 
+        _recorded_whole.depth = getattr(_recorded_whole, "depth", 0) + 1
+        try:
+            with disable_proxy_modes_tracing():
+                out = self(*args, **kwargs)
+        finally:
+            _recorded_whole.depth -= 1
         with disable_proxy_modes_tracing():
-            out = self(*args, **kwargs)
+            args, kwargs = self.traced_arguments(args, kwargs)
         tracer.record(self, args, kwargs, out)
         return out
+
+    def traced_arguments(self, args: tuple, kwargs: dict) -> tuple[tuple, dict]:
+        """The call's arguments as a recorded node holds them.
+
+        A node can hold a function only as a traced graph, and an operator
+        called from inside a gradient formula is handed plain functions -- the
+        formula builds them as it goes.  An operator that can be handed one
+        traces it here on the values it was given; the default has nothing to
+        trace.
+        """
+
+        return args, kwargs
 
     def __call__(self, /, *args: Any, **kwargs: Any) -> Any:
         # Positional-only receiver: operator arguments may be named ``self``.
@@ -169,6 +208,8 @@ class HigherOrderOperator:
             mode = get_proxy_mode()
             if mode is not None:
                 if getattr(mode.tracer, "records_real_values", False):
+                    if self.runs_inline_under_value_trace:
+                        return self._impls["CompositeExplicitAutograd"](*args, **kwargs)
                     return self._record_real_call(mode.tracer, args, kwargs)
                 return self._impls["ProxyDispatchMode"](mode, *args, **kwargs)
 

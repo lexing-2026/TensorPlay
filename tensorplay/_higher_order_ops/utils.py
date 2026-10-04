@@ -391,6 +391,64 @@ def validate_subgraph_args_types(lifted_args: tuple[Any, ...] | list[Any]) -> No
         )
 
 
+def lift_closed_over_tensors(graphs: Sequence[Any]) -> list[Tensor]:
+    """Turn the tensors traced subgraphs close over into trailing inputs.
+
+    A function handed to an operator may read a tensor it was not given -- a
+    weight in an enclosing scope, say.  Its trace holds that tensor as a
+    constant of its own, where the program around it cannot see it: a gradient
+    taken through the operator would not reach it, since the operator is only
+    differentiated with respect to what it was handed.  So each such tensor is
+    handed over instead, after the inputs the subgraphs already take, in the
+    same order for every subgraph so that one argument list fits all of them;
+    a subgraph that does not read one takes it and leaves it unused.
+
+    Returns the tensors, for the caller to append to the operator's inputs.
+    """
+
+    lifted: list[Tensor] = []
+    position: dict[int, int] = {}
+
+    def _tensor_read(gm: Any, node: Any) -> Tensor | None:
+        if node.op != "get_attr":
+            return None
+        value = functools.reduce(getattr, node.target.split("."), gm)
+        return value if isinstance(value, Tensor) else None
+
+    for gm in graphs:
+        for node in gm.graph.nodes:
+            value = _tensor_read(gm, node)
+            if value is not None and id(value) not in position:
+                position[id(value)] = len(lifted)
+                lifted.append(value)
+    if not lifted:
+        return lifted
+
+    for gm in graphs:
+        graph = gm.graph
+        placeholders = graph.placeholders
+        anchor = placeholders[-1] if placeholders else None
+        inputs = []
+        for index, value in enumerate(lifted):
+            insert = (
+                graph.inserting_after(anchor)
+                if anchor is not None
+                else graph.inserting_before(next(iter(graph.nodes)))
+            )
+            with insert:
+                node = graph.placeholder(f"closed_over_{index}")
+            node.meta["val"] = value
+            inputs.append(node)
+            anchor = node
+        for node in list(graph.nodes):
+            value = _tensor_read(gm, node)
+            if value is not None:
+                node.replace_all_uses_with(inputs[position[id(value)]])
+                graph.erase_node(node)
+        gm.recompile()
+    return lifted
+
+
 def has_user_subclass(args, allowed_subclasses) -> bool:
     """Check if any tensor arguments are user subclasses.
 

@@ -119,6 +119,7 @@ class DispatchTracer:
             name = f"_subgraph{len(self._subgraphs)}"
             setattr(self.root, name, module)
             node = self.graph.get_attr(name)
+            node.meta["is_subgraph"] = True
             self._subgraphs[id(module)] = node
         return node
 

@@ -18,6 +18,7 @@ from tensorplay import Tensor
 from tensorplay._higher_order_ops._hop_base import (
     HigherOrderOperator,
     _AutoDispatchBelowAutograd,
+    recording_whole_call,
     register_fake,
 )
 from tensorplay._higher_order_ops.utils import (
@@ -29,6 +30,7 @@ from tensorplay._higher_order_ops.utils import (
     create_bw_fn,
     create_fn_remove_none,
     fill_none_with_masks,
+    lift_closed_over_tensors,
     _maybe_reenter_make_fx,
     save_values_for_backward,
     saved_values,
@@ -73,6 +75,31 @@ class CondOp(HigherOrderOperator):
             # concrete types are checked by the eager entry point instead.
             validate_subgraph_args_types(operands)
         return super().__call__(pred, true_fn, false_fn, operands)
+
+    def traced_arguments(self, args: tuple, kwargs: dict) -> tuple[tuple, dict]:
+        # The gradient of a choice is a choice between the branches'
+        # gradients, built as plain functions; each is traced on the operands
+        # whichever one this run takes, since the node keeps both.
+        # They are traced at the dispatcher, the level a gradient formula's
+        # own operations reach -- detaching, recomputing, differentiating --
+        # and each graph takes its inputs positionally, so that the tensors
+        # the branches close over can follow as further inputs.
+        from tensorplay.graph.experimental._dispatch_trace import dispatch_make_graph
+        from tensorplay.graph.graph import CodeGen
+        from tensorplay.graph.graph_module import GraphModule
+
+        pred, true_fn, false_fn, operands = args
+        if isinstance(true_fn, GraphModule) and isinstance(false_fn, GraphModule):
+            return args, kwargs
+        graphs = []
+        for branch in (true_fn, false_fn):
+            graph = dispatch_make_graph(branch)(*operands)
+            graph.graph._codegen = CodeGen()
+            graph.recompile()
+            graphs.append(graph)
+        true_graph, false_graph = graphs
+        closed_over = lift_closed_over_tensors([true_graph, false_graph])
+        return (pred, true_graph, false_graph, (*operands, *closed_over)), kwargs
 
 
 cond_op = CondOp()
@@ -222,8 +249,17 @@ class CondAutogradOp(tensorplay.autograd.Function):
 
 @cond_op.py_autograd_impl
 def cond_autograd(pred: Any, true_fn: Callable, false_fn: Callable, operands: tuple):
-    if not tensorplay.is_grad_enabled() or not _any_requires_grad(operands):
-        # Nothing to differentiate: run the composite selection directly.
+    if (
+        not tensorplay.is_grad_enabled()
+        or not _any_requires_grad(operands)
+        or not recording_whole_call()
+    ):
+        # Run the selected branch itself.  Its operations record their own
+        # gradients, which reach every tensor the branch reads -- including
+        # one it closes over rather than takes as an operand, which a formula
+        # over the operands alone would leave without one.  Only a trace that
+        # keeps the call whole needs the formula, so that the backward is a
+        # choice between branches too and not the branch this run took.
         return cond_op_dense(pred, true_fn, false_fn, operands)
     return CondAutogradOp.apply(pred, true_fn, false_fn, *operands)
 
@@ -277,7 +313,8 @@ def trace_cond(
     true_graph.meta["hop_graph_name"] = true_name
     false_graph.meta["hop_graph_name"] = false_name
 
-    args = (pred, true_graph, false_graph, tuple(operands))
+    closed_over = lift_closed_over_tensors([true_graph, false_graph])
+    args = (pred, true_graph, false_graph, (*operands, *closed_over))
     proxy_args = unwrap_proxy(args)
     out_proxy = tracer.create_proxy("call_function", func_overload, proxy_args, {})
 

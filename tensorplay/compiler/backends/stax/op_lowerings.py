@@ -2617,6 +2617,13 @@ def lower_expand(x, size, *args, **kwargs):
     return ExpandView.create(x, [int(s) for s in size])
 
 
+@register("broadcast_tensors.default")
+def lower_broadcast_tensors(tensors):
+    # Each value seen in the shape they all share: a view, like expanding, so
+    # nothing is copied for a value that only has to be repeated.
+    return list(broadcast_tensors(*tensors))
+
+
 def _slice(x, dim, start, end, step):
     size = list(x.get_size())
     dim = normalize_dim(dim, len(size))
@@ -5543,6 +5550,13 @@ def use_scatter_fallback(
     )
 
 
+def _box_view(value: Any) -> Any:
+    """A tensor argument held in a box, whether it arrived boxed or as a bare
+    view; anything that is not a tensor -- a scalar source -- is left as it is."""
+
+    return _as_box(value) if isinstance(value, ir.IRNode) else value
+
+
 def scatter_fallback(
     op_overload: Any,
     self: Any,
@@ -5560,6 +5574,7 @@ def scatter_fallback(
     and the value is the answer.
     """
 
+    self, index, src = (_box_view(v) for v in (self, index, src))
     src_is_tensor = isinstance(src, TensorBox)
     if use_scatter_fallback(
         op_overload,
@@ -5911,6 +5926,7 @@ def scatter_reduce_(self: Any, dim: Any, index: Any, src: Any, reduce: Any, *, i
         raise AssertionError(
             'expected: reduce in (None, "sum", "prod", "mean", "amax", "amin")'
         )
+    self, index, src = (_box_view(v) for v in (self, index, src))
     if "two" not in getattr(tp_ops.scatter_reduce_, "overloads", list)():
         raise AssertionError(
             "tp.scatter_reduce_.two is not the unique overload of tp.scatter_reduce_"
@@ -6529,7 +6545,7 @@ def lower_pow(a: Any, b: Any) -> Any:
         return clone(a)
 
     # The arguments have been made to agree on a type by now, so either will do.
-    dtype = next(x.get_dtype() for x in (a, b) if isinstance(x, ir.TensorBox))
+    dtype = next(x.get_dtype() for x in (a, b) if isinstance(x, ir.IRNode))
     is_integer_pow = is_integer_dtype(dtype)
 
     embed_exponent = isinstance(b, int) and (
@@ -7893,8 +7909,8 @@ def gather(x: Any, dim: Any, index: Any, sparse_grad: Any = False) -> Any:
     # the backward pass is not this.
     del sparse_grad
 
-    if not (isinstance(x, TensorBox)):
-        raise AssertionError("expected: isinstance(x, TensorBox)")
+    # A view reaches here bare as often as boxed; it is read the same way.
+    x = _as_box(x)
     if index.get_numel() == 0:
         return new_empty(x, index.get_size())
 

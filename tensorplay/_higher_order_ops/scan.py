@@ -29,6 +29,7 @@ from tensorplay._higher_order_ops.utils import (
     check_meta_consistency,
     first_slice_copy,
     get_tensor_mask,
+    lift_closed_over_tensors,
     mask_list,
     _maybe_reenter_make_fx,
     split_into_chunks,
@@ -56,15 +57,30 @@ def _wrap_combine_fn_flat(
     spec_init: Any,
     spec_xs: Any,
     num_init_leaves: int,
+    out_specs: list[Any],
 ) -> Callable:
-    """Flatten the two pytree arguments of ``combine_fn(carry, x)``."""
+    """``combine_fn(carry, x)`` over flat leaves, in and out.
+
+    The operator hands the step its carry and slice as leaves and reads the
+    next carry and the step's output back as leaves, carry first.  The shapes
+    of the two results are recorded in ``out_specs`` each time the step runs,
+    so the caller can rebuild them.
+    """
+
+    pytree = tensorplay.utils._pytree
 
     def wrapped(*args: Any) -> Any:
-        carry = tensorplay.utils._pytree.tree_unflatten(
-            args[:num_init_leaves], spec_init
-        )
-        xs = tensorplay.utils._pytree.tree_unflatten(args[num_init_leaves:], spec_xs)
-        return combine_fn(carry, xs)
+        carry = pytree.tree_unflatten(list(args[:num_init_leaves]), spec_init)
+        xs = pytree.tree_unflatten(list(args[num_init_leaves:]), spec_xs)
+        next_carry, y = combine_fn(carry, xs)
+        carry_leaves, carry_spec = pytree.tree_flatten(next_carry)
+        if len(carry_leaves) != num_init_leaves:
+            raise RuntimeError(
+                "scan() combine_fn must return a carry with the same structure as init"
+            )
+        y_leaves, y_spec = pytree.tree_flatten(y)
+        out_specs[:] = [carry_spec, y_spec]
+        return (*carry_leaves, *y_leaves)
 
     return wrapped
 
@@ -145,7 +161,7 @@ def scan(
             # Counter mode: a dummy sequence of the requested length whose
             # slices are discarded; the wrapped body receives x=None.
             leaves_xs_orig = [tensorplay.zeros(length, dtype=tensorplay.int64)]
-            spec_xs = pytree.tree_structure(None)
+            spec_xs = pytree.tree_structure(leaves_xs_orig[0])
             _user_combine_fn = combine_fn
 
             def combine_fn(carry: Any, _ignored: Any) -> Any:  # noqa: F811
@@ -187,27 +203,19 @@ def scan(
     if reverse:
         leaves_xs = [tensorplay.flip(leaf, [0]) for leaf in leaves_xs]
 
-    # A flat tuple pair passes the callable straight through: the operator
-    # invokes it positionally, and fixed signatures stay traceable (varargs
-    # wrappers are not capturable by the frontend).
-    def _flat_tensor_likes(value: Any) -> bool:
-        if _tensor_like(value):
-            return True
-        return isinstance(value, (tuple, list)) and all(
-            _tensor_like(leaf) for leaf in value
-        )
-
-    trivial_shapes = _flat_tensor_likes(init) and _flat_tensor_likes(xs)
-    if trivial_shapes:
-        carry, out = scan_op(
-            combine_fn, tuple(leaves_init), tuple(leaves_xs), ()
-        )
-        flat_combine = combine_fn
-    else:
-        flat_combine = _wrap_combine_fn_flat(
-            combine_fn, spec_init, spec_xs, len(leaves_init)
-        )
-        carry, out = scan_op(flat_combine, tuple(leaves_init), tuple(leaves_xs), ())
+    out_specs: list[Any] = []
+    flat_combine = _wrap_combine_fn_flat(
+        combine_fn, spec_init, spec_xs, len(leaves_init), out_specs
+    )
+    flat_out = scan_op(flat_combine, tuple(leaves_init), tuple(leaves_xs), ())
+    # The step has run by now -- eagerly or while it was traced -- so the
+    # shapes of the carry and of the output are known, and the operator's flat
+    # results are read back into them.
+    carry_spec, out_spec = out_specs
+    leaves = [flat_out[i] for i in range(len(leaves_init) + out_spec.num_leaves)]
+    carry_leaves, out_leaves = _extract_carry_and_out(leaves, len(leaves_init))
+    carry = pytree.tree_unflatten(carry_leaves, carry_spec)
+    out = pytree.tree_unflatten(out_leaves, out_spec)
 
     if reverse:
         out = pytree.tree_map(lambda elem: elem.flip([0]), out)
@@ -243,6 +251,8 @@ def _empty_output_for_length_zero(combine_fn: Callable, init: Any) -> Any:
 
 class ScanOp(HigherOrderOperator):
     """``scan_op(combine_fn, init, xs, additional_inputs)`` as a registered operator."""
+
+    runs_inline_under_value_trace = True
 
     def __init__(self) -> None:
         super().__init__("scan")
@@ -352,7 +362,10 @@ def trace_scan(
     _, combine_name = unique_graph_id(proxy_mode, prefix="scan_combine_graph")
     combine_graph.meta["hop_graph_name"] = combine_name
 
-    args = (combine_graph, init, xs, additional_inputs)
+    # A tensor the body closes over is handed to it as one more input, so a
+    # gradient taken through the scan reaches it.
+    closed_over = lift_closed_over_tensors([combine_graph])
+    args = (combine_graph, init, xs, (*additional_inputs, *closed_over))
     proxy_args = unwrap_proxy(args)
     out_proxy = tracer.create_proxy("call_function", func_overload, proxy_args, {})
 

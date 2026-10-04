@@ -475,6 +475,26 @@ class PythonKeyTracer(Tracer):
         return proxy
 
 
+def _positional_signature(fn: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    """A callable taking any number of positional values, as one taking these.
+
+    A graph names each of its inputs, and a callable written over ``*args``
+    names none of them -- a function built on the fly, such as a gradient
+    formula's, usually is.  It is traced as a callable of exactly the
+    arguments it was handed.
+    """
+
+    if kwargs:
+        return fn
+    try:
+        parameters = inspect.signature(getattr(fn, "forward", fn)).parameters.values()
+    except (TypeError, ValueError):
+        return fn
+    if any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in parameters):
+        return fake_signature(fn, len(args))
+    return fn
+
+
 def _bind_sample_inputs(fn: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
     signature = inspect.signature(getattr(fn, "forward", fn))
     bound = signature.bind(*args, **kwargs)
@@ -541,10 +561,11 @@ def make_graph(
     def wrapped(*args: Any, **kwargs: Any) -> GraphModule:
         token = _CURRENT_MAKE_GRAPH_TRACER.set(session)
         try:
-            samples = _bind_sample_inputs(f, args, kwargs)
+            fn = _positional_signature(f, args, kwargs)
+            samples = _bind_sample_inputs(fn, args, kwargs)
             tracer = PythonKeyTracer(decomposition_table=decomposition_table, execute=False)
             tracer.dynamic_shapes = dynamic_shapes
-            graph_module = dispatch_trace(f, tracer, samples)
+            graph_module = dispatch_trace(fn, tracer, samples)
             graph_module.meta["tracing_mode"] = tracing_mode
             return graph_module
         finally:
@@ -575,6 +596,7 @@ class MakeGraphTracer:
     ) -> GraphModule:
         token = _CURRENT_MAKE_GRAPH_TRACER.set(self)
         try:
+            fn = _positional_signature(fn, args, {})
             samples = _bind_sample_inputs(fn, args, {})
             tracer = PythonKeyTracer(
                 decomposition_table=decomposition_table, execute=False
@@ -641,7 +663,21 @@ def selective_decompose(
 
 
 def get_proxy_mode() -> ProxyMode | None:
-    return _CURRENT_MODE.get()
+    mode = _CURRENT_MODE.get()
+    if mode is not None:
+        return mode
+    # The dispatch stack follows the autograd engine onto the thread it runs a
+    # backward on; the proxy state does not.  An operator called from a
+    # gradient formula there asks the same question, so the recording mode on
+    # the stack answers it.  Nothing is found where recording was switched
+    # off, since that clears the stack as well.
+    from tensorplay._C import _get_dispatch_mode, _len_dispatch_mode
+
+    for index in range(_len_dispatch_mode() - 1, -1, -1):
+        tracer = getattr(_get_dispatch_mode(index), "tracer", None)
+        if tracer is not None and hasattr(tracer, "proxy_mode"):
+            return tracer.proxy_mode
+    return None
 
 
 def get_innermost_proxy_mode() -> ProxyMode | None:

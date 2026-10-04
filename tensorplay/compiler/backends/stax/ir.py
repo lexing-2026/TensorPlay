@@ -6589,9 +6589,14 @@ class ExternKernel(InputsKernel):
             else:
                 # A namespaced custom op (``capns::foo``) is not reachable
                 # through attribute syntax in the generated program; hand it
-                # the op object itself as a module-level constant.
-                const_name = f"_custom_op_{len(V.graph.constants)}"
-                V.graph.constants[const_name] = kernel
+                # the op object itself as a module-level constant.  The module
+                # is the outermost region's, so a call inside a piece of it
+                # attaches the op there too.
+                root = V.graph
+                while getattr(root, "parent", None) is not None:
+                    root = root.parent
+                const_name = f"_custom_op_{len(root.constants)}"
+                root.constants[const_name] = kernel
                 self.python_kernel_name = const_name
         elif module.startswith("tensorplay"):
             self.python_kernel_name = f"{module}.{name}"
@@ -6888,6 +6893,11 @@ class ExternKernel(InputsKernel):
             ) from exc
         strides = []
         for var in range_vars:
+            if not isinstance(var, sympy.Symbol):
+                # An axis of extent one is squeezed to the constant zero: it
+                # has no position to step through, so its stride is zero.
+                strides.append(0)
+                continue
             try:
                 poly = sympy.Poly(index, var)
             except sympy.PolynomialError:
@@ -10020,7 +10030,9 @@ class WhileLoop(ExternKernel):
             return out
         elif isinstance(out, (StorageBox, ReinterpretView)):
             return TensorBox(out)
-        elif isinstance(out, MultiOutput):
+        elif isinstance(out, Buffer):
+            # A value already laid down under a name is put in memory as
+            # itself, unboxed, so it is boxed here the way a result is.
             return TensorBox.create(out)
         else:
             raise RuntimeError(f"NYI unsupported output type: {type(out)}")
@@ -10061,20 +10073,34 @@ class WhileLoop(ExternKernel):
                     ret.append(tb)
             return ret
 
+        # The pieces are lowered against the values the loop was traced with:
+        # handed the region's own buffers instead, a piece would read those
+        # directly and depend on memory that is not its own.  The traced values
+        # also say how each carried value is laid out, which both the values
+        # going in and every pass's results are held to.
+        def _traced(values):
+            return [v.meta["val"] if hasattr(v, "meta") else v for v in values]
+
+        traced_carried = _traced(V.graph.current_node.args[-2])
+        traced_additional = _traced(V.graph.current_node.args[-1])
+        traced_all = traced_carried + traced_additional
+
         carried_inputs_ = [cls.realize_input(x) for x in carried_inputs]
         carried_inputs_ = WhileLoop._clone_aliased_inputs(carried_inputs_)
+        carried_inputs_ = _require_exact_strides(carried_inputs_, traced_carried)
         additional_inputs_ = [cls.realize_input(x) for x in additional_inputs]
+        additional_inputs_ = _require_exact_strides(additional_inputs_, traced_additional)
         all_inputs = carried_inputs_ + additional_inputs_
 
         for subgraph in (cond_fn, body_fn):
             if subgraph.graph is None:
                 subgraph.graph = V.graph.make_subgraph(
                     gm=subgraph.graph_module,
-                    example_inputs=list(all_inputs),
+                    example_inputs=traced_all,
                     subgraph_name=subgraph.name,
                 )
                 with V.set_graph_handler(subgraph.graph):
-                    subgraph.graph.run(*all_inputs)
+                    subgraph.graph.run(*traced_all)
                     # What one pass produces is what the next is given, so the
                     # arrangement has to be the same both times.  That is not
                     # something lowering a piece can be left to work out, since
@@ -10086,7 +10112,7 @@ class WhileLoop(ExternKernel):
                             )
                         subgraph.graph.graph_outputs = _require_exact_strides(
                             subgraph.graph.graph_outputs,
-                            carried_inputs_,
+                            traced_carried,
                         )
 
         if not (cond_fn.graph and body_fn.graph):

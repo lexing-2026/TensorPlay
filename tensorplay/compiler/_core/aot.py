@@ -300,6 +300,11 @@ def _copy_nodes(
 
     def remap(value: Any) -> Any:
         if isinstance(value, Node):
+            if value not in mapping and value.meta.get("is_subgraph"):
+                # A graph an operation is handed is read where it is used: it
+                # is part of the program, not a value passed between halves.
+                mapping[value] = graph.get_attr(value.target)
+                mapping[value].meta.update(value.meta)
             if value not in mapping:
                 if not external_as_inputs:
                     raise AOTError(f"unmapped node {value.name} during extraction")
@@ -378,6 +383,11 @@ def partition_default(
         def ensure(node: Node) -> Node:
             if node in bw_map:
                 return bw_map[node]
+            if node.meta.get("is_subgraph"):
+                clone = bw_graph.get_attr(node.target)
+                clone.meta.update(node.meta)
+                bw_map[node] = clone
+                return clone
             if node.op in _LEAF_OPS:
                 clone = bw_graph.placeholder(node.name)
                 clone.meta.update(node.meta)
@@ -896,6 +906,11 @@ def partition_min_cut(
         # saved set holds: without it a tangent read here is recreated as a
         # node named like an input, which the half does not declare and the
         # lowering cannot resolve.
+        if node.meta.get("is_subgraph"):
+            clone = bw_graph.get_attr(node.target)
+            clone.meta.update(node.meta)
+            bw_map[node] = clone
+            return clone
         external = (
             node.op in _LEAF_OPS
             or node in saved_set

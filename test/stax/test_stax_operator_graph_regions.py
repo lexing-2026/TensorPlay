@@ -27,6 +27,11 @@ def _check(fn, *inputs, tol=1e-5, second=None):
 
 
 def _same(got, want, tol):
+    if isinstance(want, dict):
+        assert set(got) == set(want)
+        for key in want:
+            _same(got[key], want[key], tol)
+        return
     if isinstance(want, (tuple, list)):
         assert len(got) == len(want)
         for g, w in zip(got, want):
@@ -226,14 +231,109 @@ def test_control_flow_runs_its_pieces(device):
         lambda x: cond(x.sum() > 0, lambda v: v.sin(), lambda v: v.cos(), (x,)) * 2,
         x, second=(-x,),
     )
-    _check(lambda x: map_steps(lambda r: r.exp() + 1, x), x)
-    # A loop and a scan are not lowered as pieces yet; the region still has to
-    # compute what the program does.
-    for fn in (
+    _check(lambda x: map_steps(lambda r: r.exp() + 1, x), x, second=(x * 2,))
+    _check(
         lambda x: while_loop(
             lambda i, y: i < 3, lambda i, y: (i + 1, y * 1.5),
             (tp.tensor(0, device=x.device), x),
         )[1],
+        x, second=(x * 2,),
+    )
+    _check(
         lambda x: scan(lambda c, v: (c + v, c * v), tp.zeros(3, device=x.device), x)[1],
-    ):
-        _same(tp.compile(fn)(x), fn(x), 1e-5)
+        x, second=(x * 2,),
+    )
+    # A carry of several tensors in a structure comes back in that structure.
+    _check(
+        lambda x: scan(
+            lambda c, v: ({"a": c["a"] + v, "b": c["b"] * 0.5}, c["a"] * v),
+            {"a": tp.zeros(3, device=x.device), "b": tp.ones(3, device=x.device)},
+            x,
+        ),
+        x, second=(x * 2,),
+    )
+    # A loop body that reads a tensor from its enclosing scope and calls an
+    # operation the region does not write itself.
+    w = tp.randn(3, 3, device=device) * 0.3
+    _check(
+        lambda x: while_loop(
+            lambda i, y: i < 4, lambda i, y: (i + 1, (y @ w).tanh() + y),
+            (tp.tensor(0, device=x.device), x),
+        ),
+        x, second=(x * 2,),
+    )
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_control_flow_differentiates_what_its_pieces_read(device):
+    # A gradient through a branch, a map or a scan reaches the tensors the
+    # pieces close over as well as the ones they are handed, and a branch
+    # chosen differently on a later call is differentiated as that branch.
+    from tensorplay import cond
+    from tensorplay._higher_order_ops import map as map_steps, scan
+
+    tp.manual_seed(0)
+    w = tp.randn(3, 3, device=device, requires_grad=True)
+    cases = {
+        "cond": lambda x: cond(
+            x.sum() > 0, lambda v: (v @ w).sin(), lambda v: v.cos(), (x,)
+        ).sum(),
+        "map": lambda x: map_steps(lambda r: (r @ w).exp(), x).sum(),
+        "scan": lambda x: scan(
+            lambda c, v: ((c @ w).tanh() + v, c * v), tp.zeros(3, device=x.device), x
+        )[1].sum(),
+    }
+    for name, fn in cases.items():
+        compiled = tp.compile(fn, strict_native=True)
+        for sign in (1.0, -1.0):
+            x = (sign * tp.randn(4, 3, device=device).abs()).requires_grad_()
+            want = tp.autograd.grad(fn(x), (x, w), allow_unused=True)
+            got = tp.autograd.grad(compiled(x), (x, w), allow_unused=True)
+            for g, e in zip(got, want):
+                e = tp.zeros_like(w) if e is None else e
+                assert g is not None, name
+                _same(g, e, 1e-5)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("op", ["quantile", "nanquantile"])
+def test_quantile_differentiated_through_its_parts(device, op):
+    # An operation without a derivative of its own is differentiated through
+    # the operations it is made of, compiled as much as eager.
+    tp.manual_seed(0)
+    reduce = getattr(tp, op)
+    q1 = tp.tensor([0.25, 0.5, 0.9], device=device)
+    q0 = tp.tensor(0.3, device=device)
+    cases = [
+        (q1, None, False, "linear"),
+        (q1, 1, True, "lower"),
+        (q0, 0, False, "higher"),
+        (q1, -1, False, "midpoint"),
+        (q0, None, True, "nearest"),
+    ]
+    for q, dim, keepdim, interpolation in cases:
+        fn = lambda a: (
+            reduce(a, q, dim=dim, keepdim=keepdim, interpolation=interpolation) ** 2
+        ).sum()
+        compiled = tp.compile(fn, strict_native=True)
+        for _ in range(2):
+            x = tp.randn(4, 7, device=device).requires_grad_()
+            (want,) = tp.autograd.grad(fn(x), [x])
+            got_value = compiled(x)
+            _same(got_value, fn(x), 1e-5)
+            (got,) = tp.autograd.grad(got_value, [x])
+            _same(got, want, 1e-5)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_detached_value_follows_its_input(device):
+    # A value detached from one that requires grad is still computed from it:
+    # a later call reads that call's input, not the trace's.
+    fn = lambda x: (x.detach() * 3 + x).sum()
+    compiled = tp.compile(fn, strict_native=True)
+    for _ in range(3):
+        x = tp.randn(5, device=device, requires_grad=True)
+        got = compiled(x)
+        _same(got, fn(x), 1e-5)
+        (grad,) = tp.autograd.grad(got, [x])
+        _same(grad, tp.ones_like(x), 1e-6)
