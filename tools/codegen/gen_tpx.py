@@ -43,6 +43,14 @@ _LIST_VIEW_OPS = {
 
 _COMPOSITE_AUTOGRAD_WRAPPERS = frozenset({'dropout'})
 
+# Operators without a derivative whose generated wrapper is still registered
+# as their autograd kernel.  ``detach`` is one: its backend-neutral kernel
+# copies the tensor's metadata and dispatches nothing, so a tensor that
+# requires grad has to reach it through a kernel that redispatches --
+# otherwise a dispatch mode never sees the call and a trace takes the result
+# for a constant.
+_REDISPATCHING_AUTOGRAD_KERNELS = frozenset({'detach'})
+
 def _dedup_key(f: NativeFunction) -> str:
     return f.cpp_name + ':' + ','.join(cpp_arg_type(a.type) for a in f.args)
 
@@ -710,7 +718,7 @@ def generate_autograd_registration(funcs: list[NativeFunction], *,
     adapters: list[str] = []
     seen: set[str] = set()
     for f in funcs:
-        if not _has_autograd(f, derivatives):
+        if not (_has_autograd(f, derivatives) or f.func_name in _REDISPATCHING_AUTOGRAD_KERNELS):
             continue
         if _dedup_key(f) in seen:
             continue
