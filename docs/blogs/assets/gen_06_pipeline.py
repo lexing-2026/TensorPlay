@@ -27,7 +27,7 @@ def main():
     ax.annotate("", xy=(7.0,1.4), xytext=(6.4,2.8), arrowprops=dict(arrowstyle="->", color="#00897b", lw=1, ls="--"))
     ax.annotate("", xy=(9.1,1.4), xytext=(9.9,2.8), arrowprops=dict(arrowstyle="->", color="#f9a025", lw=1, ls="--"))
     # bottom note
-    ax.text(6,0.8, "compile() is manager, _stax is scheduler, stax/tvm/inductor are machines", ha="center", fontsize=6, color="#546e7a", style="italic")
+    ax.text(6,0.8, "compile() is manager, _stax is scheduler, stax/tvm are machines", ha="center", fontsize=6, color="#546e7a", style="italic")
     ax.set_title("Compiler Pipeline: Capture -> Host (Guard+Pass) -> Codegen (C++/Triton)", fontsize=11, weight="bold", color="#212121")
     plt.tight_layout(); plt.savefig(args.out, dpi=220, bbox_inches="tight"); print(f"saved to {args.out}")
 if __name__=="__main__": main()
