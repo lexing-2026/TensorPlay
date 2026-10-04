@@ -2819,6 +2819,23 @@ static Tensor zeros_channels_last3d(const std::vector<int64_t>& sizes, DType dt,
     return out.as_strided(sizes, get_channels_last_strides(sizes), 0);
 }
 
+// Epilogue for convolutions that asked for a fused ReLU: run in place,
+// parallel over the output with an explicit simd hint.  Applied after the
+// GEMM stage, the pass would otherwise be a single-thread scalar sweep over
+// the whole output tensor.
+static void apply_fused_relu_inplace(Tensor& out) {
+    float* relu_ptr = out.data_ptr<float>();
+    const int64_t numel = out.numel();
+    parallel_for(0, numel, /*grain=*/8192, [&](int64_t begin, int64_t end) {
+        #ifdef _OPENMP
+        #pragma omp simd
+        #endif
+        for (int64_t i = begin; i < end; ++i) {
+            relu_ptr[i] = std::max(0.0f, relu_ptr[i]);
+        }
+    });
+}
+
 static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg, const Tensor& bias, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups, bool fused_relu) {
     const bool use_cl = conv2d_use_channels_last(input_arg, weight_arg);
     Tensor input = contiguous_in(input_arg, use_cl);
@@ -2919,8 +2936,7 @@ static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg,
         if (groups == 1 && kH == 3 && kW == 3 && sH == 1 && sW == 1 && dH == 1 && dW == 1) {
              conv2d_winograd_3x3(input, weight, bias, pH_top, pW_left, out);
              if (fused_relu) {
-                 float* relu_ptr = out.data_ptr<float>();
-                 for (int64_t i = 0; i < out.numel(); ++i) relu_ptr[i] = std::max(0.0f, relu_ptr[i]);
+                 apply_fused_relu_inplace(out);
              }
              return out;
         }
@@ -3062,31 +3078,32 @@ static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg,
         // Add bias if present (Parallelized)
         if (bias.defined() && bias.numel() > 0) {
              const float* b_ptr = bias.data_ptr<float>();
-             
-             parallel_for(0, N, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-             for (int64_t n = begin; n < end; ++n) {
-                 for (int64_t c = 0; c < C_out; ++c) {
-                     float b = b_ptr[c];
-                     float* out_n_c = out_ptr + (n * C_out + c) * out_spatial;
-                     
-                     #ifdef _OPENMP
-                     // #pragma omp simd
-                     #endif
-                     for (int64_t i = 0; i < out_spatial; ++i) {
-                         out_n_c[i] += b;
-                     }
+
+             // Split over (batch x output channel) runs: batches alone are too
+             // few to spread the tail across workers at the global grain.
+             const int64_t nc_total = N * C_out;
+             const int64_t nc_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(out_spatial, 1));
+             parallel_for(0, nc_total, nc_grain, [&](int64_t begin, int64_t end) {
+             for (int64_t nc = begin; nc < end; ++nc) {
+                 float b = b_ptr[nc % C_out];
+                 float* out_n_c = out_ptr + nc * out_spatial;
+
+                 #ifdef _OPENMP
+                 #pragma omp simd
+                 #endif
+                 for (int64_t i = 0; i < out_spatial; ++i) {
+                     out_n_c[i] += b;
                  }
              }
              });
         }
-        
+
     } else {
         TP_THROW(NotImplementedError, "conv2d only supports Float32");
     }
-    
+
     if (fused_relu) {
-        float* relu_ptr = out.data_ptr<float>();
-        for (int64_t i = 0; i < out.numel(); ++i) relu_ptr[i] = std::max(0.0f, relu_ptr[i]);
+        apply_fused_relu_inplace(out);
     }
     return out;
 }
