@@ -10,8 +10,8 @@ if not (hasattr(tp, "cuda") and tp.cuda.is_available()):
 import torch
 
 if not torch.cuda.is_available():
-    # The reference assertions need a CUDA-capable reference build; without one
-    # this module has no usable baseline.
+    # The reference assertions need a CUDA-capable reference build; without
+    # one this module has no usable baseline.
     raise unittest.SkipTest("torch CUDA not available")
 
 

@@ -211,8 +211,8 @@ def foreign_repo(tmp_path):
 
 
 def test_foreign_dependencies_satisfied(foreign_repo):
-    # The foreign module name resolves through the compat mapping, so the dependency check passes
-    # even without that package installed.
+    # The foreign module name resolves through the compat mapping, so the
+    # dependency check passes even without that package installed.
     assert hub.load(str(foreign_repo), "ops_available", source="local") is True
 
 

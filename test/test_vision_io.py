@@ -89,8 +89,8 @@ class JpegDecodeReferenceTest(unittest.TestCase):
         self.assertEqual(tuple(got.shape), (1,) + g.shape)
 
     def test_jpeg_decode_shares_bytes_with_pil(self):
-        # same stream produces byte-identical output against the reference codec when the
-        # codec build matches; both funnel through the same IDCT tables.
+        # same stream produces byte-identical output against the reference
+        # codec when the build matches; both funnel through the same IDCT tables.
         rgb = _rgb(seed=3)
         raw = _jpeg_bytes(rgb)
         got = tp_io.decode_jpeg(_bytes_tensor(raw))

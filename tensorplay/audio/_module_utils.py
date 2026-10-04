@@ -1,4 +1,4 @@
-"""
+"""Optional-dependency helper decorators.
 
 These decorators mark functions that need an optional dependency so that
 importing the module never fails; calling an unavailable function raises a

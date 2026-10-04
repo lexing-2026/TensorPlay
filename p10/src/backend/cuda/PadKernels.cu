@@ -229,8 +229,8 @@ Tensor circular_pad_nd_backward_cuda(const Tensor& grad_output, const Tensor& se
     return pad_mode_backward(grad_output, self, pad, 2);
 }
 
-// constant_pad_nd is a composite over slice/fill_/copy_ (see the CPU implementation of
-// so the same body serves both backends.
+// constant_pad_nd is a composite over slice/fill_/copy_ (see the CPU
+// implementation) so the same body serves both backends.
 static Tensor constant_pad_nd_cuda(const Tensor& self, const std::vector<int64_t>& pad,
                                    const Scalar& value) {
     auto input_sizes = self.shape();
