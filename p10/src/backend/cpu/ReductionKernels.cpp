@@ -12,10 +12,6 @@
 namespace tensorplay {
 namespace cpu {
 
-extern std::pair<Tensor, Tensor> mean_var_over_dims(
-    const Tensor& self, const std::vector<int64_t>& dims, int64_t correction,
-    bool keepdim);
-
 DEFINE_DISPATCH(sum_stub);
 DEFINE_DISPATCH(sum_dim_stub);
 DEFINE_DISPATCH(max_stub);
@@ -33,6 +29,7 @@ DEFINE_DISPATCH(argmin_stub);
 DEFINE_DISPATCH(median_stub);
 DEFINE_DISPATCH(norm_stub);
 DEFINE_DISPATCH(norm_dim_stub);
+DEFINE_DISPATCH(var_mean_stub);
 
 Tensor sum_kernel(const Tensor& self, DType dtype) {
     return sum_stub(DeviceType::CPU, self, dtype);
@@ -175,11 +172,12 @@ Tensor argmin_kernel(const Tensor& self, std::optional<int64_t> dim, bool keepdi
 }
 
 Tensor var_kernel(const Tensor& self, int64_t correction) {
-    return mean_var_over_dims(self, {}, correction, false).first;
+    return var_mean_stub(DeviceType::CPU, self, std::vector<int64_t>{},
+                         correction, false).first;
 }
 
 Tensor var_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, int64_t correction, bool keepdim) {
-    return mean_var_over_dims(self, dim, correction, keepdim).first;
+    return var_mean_stub(DeviceType::CPU, self, dim, correction, keepdim).first;
 }
 
 Tensor std_kernel(const Tensor& self, int64_t correction) {

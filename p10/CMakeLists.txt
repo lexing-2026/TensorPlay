@@ -569,6 +569,7 @@ set(TP_CPU_KERNEL_SRCS
     src/backend/cpu/EmbeddingBagKernelsImpl.cpp
     src/backend/cpu/ActivationUnaryKernels.cpp
     src/backend/cpu/ComplexKernels.cpp
+    src/backend/cpu/ReduceMomentsKernels.cpp
 )
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
     # (TP_CXX_AVX512_FOUND): only build the tier when the compiler accepts

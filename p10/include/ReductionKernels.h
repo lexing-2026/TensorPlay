@@ -92,5 +92,13 @@ DECLARE_DISPATCH(norm_fn, norm_stub)
 using norm_dim_fn = Tensor (*)(const Tensor&, const std::vector<int64_t>&, double, bool);
 DECLARE_DISPATCH(norm_dim_fn, norm_dim_stub)
 
+// Variance/mean moments. The kernel returns {variance, mean} for the given
+// dims (an empty list reduces the whole tensor), dividing by (count -
+// correction).
+using var_mean_fn = std::pair<Tensor, Tensor> (*)(const Tensor&,
+                                                  const std::vector<int64_t>&,
+                                                  int64_t, bool);
+DECLARE_DISPATCH(var_mean_fn, var_mean_stub)
+
 } // namespace cpu
 } // namespace tensorplay
