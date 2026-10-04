@@ -319,7 +319,7 @@ class HistogramObserver(ObserverBase):
     """Running-histogram observer.
 
     Records a running histogram of incoming values together with the global
-    min/max; ``calculate_qparams`` narrows the range with the L2-quantization-
+    min/max; ``calculate_qparams`` narrows the range with an L2-quantization-
     error search (the norm-minimization formulation) before deriving affine
     parameters, which filters outliers instead of trusting raw extremes.
     """

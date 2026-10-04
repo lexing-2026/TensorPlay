@@ -100,7 +100,7 @@ class MultivariateNormal(Distribution):
 
     Example:
 
-        >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_LAPACK)
+        >>> # xdoctest: +REQUIRES(env:TENSORPLAY_DOCTEST_LAPACK)
         >>> # xdoctest: +IGNORE_WANT("non-deterministic")
         >>> m = MultivariateNormal(tensorplay.zeros(2), tensorplay.eye(2))
         >>> m.sample()  # normally distributed with mean=`[0,0]` and covariance_matrix=`I`

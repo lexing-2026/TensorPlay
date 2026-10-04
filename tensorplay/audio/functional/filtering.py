@@ -6,8 +6,6 @@ import tensorplay as tensorplay
 import tensorplay.nn.functional as F
 from tensorplay import Tensor
 
-from ._extension import _IS_AUDIO_EXT_AVAILABLE
-
 
 def _dB2Linear(x: float) -> float:
     return math.exp(x * math.log(10) / 20.0)
@@ -914,10 +912,9 @@ def _lfilter_core_generic_loop(input_signal_windows: Tensor, a_coeffs_flipped: T
         padded_output_waveform[:, :, i_sample + n_order - 1] = o0
 
 
-if _IS_AUDIO_EXT_AVAILABLE:
-    _lfilter_core_loop = 
-else:
-    _lfilter_core_loop = _lfilter_core_generic_loop
+# The native loop kernels are not part of this build, so the portable
+# implementations are what these names resolve to.
+_lfilter_core_loop = _lfilter_core_generic_loop
 
 
 class DifferentiableFIR(tensorplay.autograd.Function):
@@ -1123,10 +1120,9 @@ def _overdrive_core_loop_generic(
         output_waveform[:, i] = waveform[:, i] * 0.5 + last_out * 0.75
 
 
-if _IS_AUDIO_EXT_AVAILABLE:
-    _overdrive_core_loop_cpu = 
-else:
-    _overdrive_core_loop_cpu = _overdrive_core_loop_generic
+# The native loop kernel is not part of this build, so the portable
+# implementation is what this name resolves to.
+_overdrive_core_loop_cpu = _overdrive_core_loop_generic
 
 
 def overdrive(waveform: Tensor, gain: float = 20, colour: float = 20) -> Tensor:

@@ -59,7 +59,7 @@ class LowRankMultivariateNormal(Distribution):
         covariance_matrix = cov_factor @ cov_factor.T + cov_diag
 
     Example:
-        >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_LAPACK)
+        >>> # xdoctest: +REQUIRES(env:TENSORPLAY_DOCTEST_LAPACK)
         >>> # xdoctest: +IGNORE_WANT("non-deterministic")
         >>> m = LowRankMultivariateNormal(
         ...     tensorplay.zeros(2), tensorplay.tensor([[1.0], [0.0]]), tensorplay.ones(2)
