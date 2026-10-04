@@ -4641,6 +4641,192 @@ def lower_avg_poolnd(x, kernel_size, stride=(), padding=0, ceil_mode=False,
     )
 
 
+_fallback_max_pool = {
+    2: fallback_handler(tp.ops.tp.max_pool2d.default, add_to_fallback_set=False),
+    3: fallback_handler(tp.ops.tp.max_pool3d.default, add_to_fallback_set=False),
+}
+
+_fallback_max_pool_with_indices = {
+    2: fallback_handler(tp.ops.tp.max_pool2d_with_indices.default, add_to_fallback_set=False),
+    3: fallback_handler(tp.ops.tp.max_pool3d_with_indices.default, add_to_fallback_set=False),
+}
+
+
+def _max_pool_common(x, kernel_size, stride, padding, dilation, ndim):
+    """The window of a pooling call, spread over its spatial axes.
+
+    Every argument may arrive as a single number meant for each axis, and an
+    empty stride means the windows do not overlap: the stride is the window.
+    """
+
+    kernel = _pair(kernel_size, ndim)
+    stride = _pair(stride, ndim) if stride else list(kernel)
+    padding = _pair(padding, ndim) if padding else [0] * ndim
+    dilation = _pair(dilation, ndim)
+    return kernel, stride, padding, dilation
+
+
+def _max_pool_checks(x, size, kernel, ndim, window):
+    """Whether this call is one whose window can be written out.
+
+    A window of many positions is a body too long to be worth having, and a
+    call whose extents are only numbers the kernel gives later has no window
+    to unroll -- those are asked of the framework kernel.
+    """
+
+    in_size = list(x.get_size())
+    return (
+        window <= 25
+        and len(in_size) in (ndim + 1, ndim + 2)
+        and not is_dynamic(*in_size, *size)
+    )
+
+
+@register("max_pool2d.default", "max_pool3d.default")
+def lower_max_poolnd(x, kernel_size, stride=(), padding=0, dilation=1,
+                     ceil_mode=False, **kwargs):
+    """Max pooling as the largest value of each window.
+
+    Like the average, each output element reads its window in the loop of
+    whatever consumes it, so no kernel of its own is launched; a window that
+    reaches past the source reads the smallest value its type can hold there,
+    which is the one value that can never win.
+    """
+
+    size, _, _ = val_info(node_val())
+    ndim = _spatial_ndim()
+    kernel, stride, padding, dilation = _max_pool_common(
+        x, kernel_size, stride, padding, dilation, ndim
+    )
+    in_size = list(x.get_size())
+    window = _prod_ints(kernel)
+    if not _max_pool_checks(x, size, kernel, ndim, window):
+        return _fallback_max_pool[ndim](
+            x, kernel, stride, padding, dilation, ceil_mode
+        )
+    lead = len(in_size) - ndim
+    spatial_out = [int(s) for s in list(size)[-ndim:]]
+
+    dtype = x.get_dtype()
+    loader = _max_pool_window_loader(x, ndim, dtype)
+
+    def fn(index):
+        base = index[lead:]
+        best = None
+        for offset in itertools.product(*[range(k) for k in kernel]):
+            value = loader([*index[:lead], *_max_pool_at(base, offset, stride,
+                                                         padding, dilation)])
+            best = value if best is None else ops.maximum(best, value)
+        return best
+
+    return Pointwise.create(
+        device=x.get_device(),
+        dtype=dtype,
+        inner_fn=fn,
+        ranges=[*in_size[:lead], *spatial_out],
+    )
+
+
+def _max_pool_at(base, offset, stride, padding, dilation):
+    """Where one position of a window sits in the source."""
+
+    return [
+        as_index(base[axis]) * stride[axis] + offset[axis] * dilation[axis]
+        - padding[axis]
+        for axis in range(len(base))
+    ]
+
+
+def _max_pool_window_loader(x, ndim, dtype):
+    """A reader of the window's source that reads the losing value outside.
+
+    The value a window reads where the source has nothing is the smallest one
+    its type can hold, so that no position of the source is beaten by a
+    position that is not there.  A truth is its own scale: nothing wins over
+    something, which is what the false reads as.
+    """
+
+    if dtype == tp.bool:
+        fill = False
+    elif dtype.is_floating_point:
+        fill = float("-inf")
+    else:
+        fill = tp.iinfo(dtype).min
+    return _constant_outside(x, ndim, fill)
+
+
+@register("max_pool2d_with_indices.default", "max_pool3d_with_indices.default")
+def lower_max_pool_with_indices(x, kernel_size, stride=(), padding=0, dilation=1,
+                                ceil_mode=False, **kwargs):
+    """Max pooling together with where each largest value was read from.
+
+    The largest value and its place are asked for together, but the place is
+    not worth a second pass over memory: the winner is chosen again in the
+    loop that writes the places, by the same rule -- the earliest position of
+    the window holds when two read equal, which is what a scan in order gives.
+    """
+
+    size, _, _ = val_info(node_val(index=0))
+    ndim = _spatial_ndim()
+    kernel, stride, padding, dilation = _max_pool_common(
+        x, kernel_size, stride, padding, dilation, ndim
+    )
+    in_size = list(x.get_size())
+    window = _prod_ints(kernel)
+    if not _max_pool_checks(x, size, kernel, ndim, window):
+        return _fallback_max_pool_with_indices[ndim](
+            x, kernel, stride, padding, dilation, ceil_mode
+        )
+    lead = len(in_size) - ndim
+    spatial_in = [int(s) for s in in_size[lead:]]
+    spatial_out = [int(s) for s in list(size)[-ndim:]]
+
+    dtype = x.get_dtype()
+    loader = _max_pool_window_loader(x, ndim, dtype)
+    positions = list(itertools.product(*[range(k) for k in kernel]))
+
+    def largest(index):
+        base = index[lead:]
+        best = None
+        for offset in positions:
+            value = loader([*index[:lead], *_max_pool_at(base, offset, stride,
+                                                         padding, dilation)])
+            best = value if best is None else ops.maximum(best, value)
+        return best
+
+    def fn(index):
+        base = index[lead:]
+        best = largest(index)
+        # The places are flat positions in the source's spatial volume, one
+        # number however many spatial axes there are.
+        found = ops.constant(False, tp.bool)
+        where = ops.constant(0, tp.int64)
+        for offset in positions:
+            at = _max_pool_at(base, offset, stride, padding, dilation)
+            value = loader([*index[:lead], *at])
+            take = ops.logical_and(ops.logical_not(found), ops.eq(value, best))
+            flat = as_index(at[0])
+            for axis in range(1, ndim):
+                flat = flat * spatial_in[axis] + as_index(at[axis])
+            where = ops.where(take, ops.index_expr(flat, tp.int64), where)
+            found = ops.logical_or(found, take)
+        return where
+
+    values = Pointwise.create(
+        device=x.get_device(),
+        dtype=dtype,
+        inner_fn=largest,
+        ranges=[*in_size[:lead], *spatial_out],
+    )
+    indices = Pointwise.create(
+        device=x.get_device(),
+        dtype=tp.int64,
+        inner_fn=fn,
+        ranges=[*in_size[:lead], *spatial_out],
+    )
+    return values, indices
+
+
 # ---------------------------------------------------------------------------
 # Scattering into a tensor: writing the elements a value chooses
 # ---------------------------------------------------------------------------
