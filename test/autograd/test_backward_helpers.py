@@ -74,6 +74,72 @@ class BackwardHelperOps(unittest.TestCase):
             self.assertIsNotNone(table, op)
             self.assertEqual(table.get("Composite"), "registered")
 
+    def test_logsumexp_backward_puts_the_reduced_axis_back(self):
+        # d logsumexp(x, dim) / dx is the softmax of x along dim, scaled by
+        # the gradient arriving for that slice -- with or without keepdim.
+        for keepdim in (False, True):
+            for dim in (0, 1, -1):
+                x = tp.tensor(
+                    [[0.5, -1.0, 2.0], [1.5, 0.0, -0.5]], dtype=tp.float64,
+                    requires_grad=True,
+                )
+                out = tp.logsumexp(x, dim, keepdim=keepdim)
+                weight = tp.arange(1.0, out.numel() + 1.0, dtype=tp.float64).reshape(out.shape)
+                (grad,) = tp.autograd.grad((out * weight).sum(), [x])
+                upstream = weight if keepdim else weight.unsqueeze(dim)
+                self._check(grad, tp.softmax(x.detach(), dim) * upstream, tol=1e-12)
+        scalar = tp.tensor(1.5, dtype=tp.float64, requires_grad=True)
+        out = tp.logsumexp(scalar, 0)
+        self.assertEqual(out.item(), 1.5)
+        (grad,) = tp.autograd.grad(out, [scalar])
+        self.assertAlmostEqual(grad.item(), 1.0, delta=1e-12)
+
+    def test_selu_and_celu_backward_follow_their_derivatives(self):
+        scale, alpha = 1.0507009873554805, 1.6732632423543772
+        x = tp.tensor([-2.0, -0.5, 0.5, 2.0], dtype=tp.float64, requires_grad=True)
+        (grad,) = tp.autograd.grad(tp.nn.functional.selu(x).sum(), [x])
+        v = x.detach()
+        self._check(grad, tp.where(v > 0, tp.full_like(v, scale), scale * alpha * v.exp()), tol=1e-12)
+        for a in (0.5, 2.0):
+            (grad,) = tp.autograd.grad(tp.nn.functional.celu(x, a).sum(), [x])
+            self._check(grad, tp.where(v > 0, tp.ones_like(v), (v / a).exp()), tol=1e-12)
+
+    def test_fmax_fmin_backward_follow_the_operand_returned(self):
+        # The returned operand takes the gradient, a NaN loses to a number,
+        # and a tie splits it.
+        nan = float("nan")
+        a = tp.tensor([1.0, nan, 3.0, 2.0, nan], requires_grad=True)
+        b = tp.tensor([2.0, 1.0, nan, 2.0, nan], requires_grad=True)
+        ga, gb = tp.autograd.grad(tp.fmax(a, b).sum(), [a, b])
+        self.assertEqual(ga.tolist(), [0.0, 0.0, 1.0, 0.5, 1.0])
+        self.assertEqual(gb.tolist(), [1.0, 1.0, 0.0, 0.5, 0.0])
+        ga, gb = tp.autograd.grad(tp.fmin(a, b).sum(), [a, b])
+        self.assertEqual(ga.tolist(), [1.0, 0.0, 1.0, 0.5, 1.0])
+        self.assertEqual(gb.tolist(), [0.0, 1.0, 0.0, 0.5, 0.0])
+
+    def test_float_power_answers_in_double_and_differentiates(self):
+        base = tp.tensor([2.0, 3.0], requires_grad=True)
+        exponent = tp.tensor([3.0, 2.0], requires_grad=True)
+        out = tp.float_power(base, exponent)
+        self.assertEqual(out.dtype, tp.float64)
+        self.assertEqual(tp.float_power(tp.tensor([2, 3]), 2).dtype, tp.float64)
+        gb, ge = tp.autograd.grad(out.sum(), [base, exponent])
+        self.assertEqual(gb.dtype, tp.float32)
+        self._check(gb, tp.tensor([12.0, 6.0]))
+        self._check(ge, tp.tensor([8.0 * 0.6931471805599453, 9.0 * 1.0986122886681098]), tol=1e-6)
+
+    def test_msort_and_take_along_dim_differentiate_on_every_device(self):
+        devices = ["cpu"] + (["cuda"] if tp.cuda.is_available() else [])
+        for device in devices:
+            y = tp.tensor([[3.0, 1.0], [1.0, 4.0], [2.0, 0.0]], device=device, requires_grad=True)
+            weight = tp.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], device=device)
+            (grad,) = tp.autograd.grad((tp.msort(y) * weight).sum(), [y])
+            # Row k of the sorted column receives weight row k.
+            self._check(grad.cpu(), tp.tensor([[5.0, 4.0], [1.0, 6.0], [3.0, 2.0]]))
+            index = tp.tensor([[1, 1], [0, 1], [1, 0]], device=device)
+            (grad,) = tp.autograd.grad(tp.take_along_dim(y, index, 1).sum(), [y])
+            self._check(grad.cpu(), tp.tensor([[0.0, 2.0], [1.0, 1.0], [1.0, 1.0]]))
+
 
 if __name__ == "__main__":
     unittest.main()

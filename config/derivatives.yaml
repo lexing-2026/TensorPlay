@@ -185,6 +185,16 @@
   self: where(eq(self, other), grad / 2, where(lt(self, other), grad, zeros_like(self)))
   other: where(eq(self, other), grad / 2, where(gt(self, other), grad, zeros_like(other)))
 
+# The operand fmax/fmin returns takes the gradient -- a NaN loses to a number
+# -- and a tie splits it.
+- name: fmax(Tensor self, Tensor other) -> Tensor
+  self: where(logical_or(ge(self, other), isnan(other)), where(eq(self, other), grad / 2, grad), zeros_like(grad))
+  other: where(logical_or(gt(self, other), isnan(other)), zeros_like(grad), where(eq(self, other), grad / 2, grad))
+
+- name: fmin(Tensor self, Tensor other) -> Tensor
+  self: where(logical_or(le(self, other), isnan(other)), where(eq(self, other), grad / 2, grad), zeros_like(grad))
+  other: where(logical_or(lt(self, other), isnan(other)), zeros_like(grad), where(eq(self, other), grad / 2, grad))
+
 - name: fused_mul_add(Tensor self, Tensor other, Tensor addend) -> Tensor
   self: grad * other
   other: grad * self
@@ -840,7 +850,7 @@
   self: elu_backward(grad, alpha, scale, input_scale, false, self)
 
 - name: celu(Tensor self, Scalar alpha=1.0) -> Tensor
-  self: elu_backward(grad, alpha, 1, 1.0/alpha, false, self)
+  self: elu_backward(grad, alpha, 1, 1.0 / alpha.toDouble(), false, self)
 
 # generated node; TensorPlay always uses the finite kernel).
 - name: mish(Tensor self) -> Tensor
@@ -899,10 +909,6 @@
 # Tier-1 indexing/masking/scan autograd rules. Formulas follow
 # expressed with TensorPlay-native operators.
 # ===========================================================================
-
-# derivatives.yaml:1096 grad.masked_fill(mask, 0)
-- name: masked_fill(Tensor self, Tensor mask, Scalar value) -> Tensor
-  self: grad.masked_fill(mask, 0)
 
 # derivatives.yaml:1096 (in-place shares the functional rule)
 - name: masked_fill_(Tensor(a!) self, Tensor mask, Scalar value) -> Tensor(a!)
@@ -1080,13 +1086,6 @@
 - name: softshrink(Tensor self, Scalar lambd=0.5) -> Tensor
   self: softshrink_backward(grad, self, lambd)
 
-# Activation.cpp:525 selu / :541 celu
-- name: selu(Tensor self) -> Tensor
-  self: grad * (self > 0) * 1.0507009873554804934193349852946 + grad * (self <= 0) * (self * 1.0507009873554804934193349852946 * 1.6732632423543772848170429916717).exp()
-
-- name: celu(Tensor self, Scalar alpha=1.0) -> Tensor
-  self: grad * (self > 0) + grad * (self <= 0) * ((self / alpha).exp() * alpha / alpha)
-
 # threshold_backward(grad, self, threshold) uses the same threshold rule.
 - name: threshold(Tensor self, Scalar threshold, Scalar value) -> Tensor
   self: threshold_backward(grad, self, threshold)
@@ -1120,7 +1119,7 @@
 
 # ReduceOps.cpp:1578 logsumexp
 - name: logsumexp(Tensor self, int dim, bool keepdim=false) -> Tensor
-  self: grad * exp(self - unsqueeze(result, dim))
+  self: logsumexp_backward(grad, self, result, dim, keepdim)
 
 # ===========================================================================
 # Tier 5 autograd rules (only formulas expressible with native ops; linalg
@@ -1213,9 +1212,6 @@
 # differentiates as grad.rot90(-k, dims).
 - name: rot90(Tensor self, int k=1, int[] dims=[0,1]) -> Tensor
   self: tensorplay::tpx::ops::rot90(grad, -k, dims)
-
-- name: index_select(Tensor self, int dim, Tensor index) -> Tensor
-  self: tensorplay::tpx::ops::index_add(tensorplay::tpx::ops::zeros_like(self), dim, index, grad)
 
 - name: log10(Tensor self) -> Tensor
   self: grad / self * 0.43429448190325176

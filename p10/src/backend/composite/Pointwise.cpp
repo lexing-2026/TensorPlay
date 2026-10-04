@@ -9,8 +9,8 @@
 //               power of two is exact.
 //   fmax/fmin:  maximum/minimum with NaN treated as missing -- whenever one
 //               operand is NaN the other is returned verbatim.
-//   float_power: exponentiation evaluated in Float64, cast back to the
-//               natural result type (integral inputs promote to Float32).
+//   float_power: exponentiation in double precision, answered there: a
+//               Float64 result, or ComplexDouble when an operand is complex.
 //   mvlgamma:   sum_{i=0..p-1} lgamma(x - i/2), elementwise.
 
 #include "CompositeCommon.h"
@@ -18,6 +18,7 @@
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
+#include "Autograd.h"
 
 #include <cmath>
 #include <cstdint>
@@ -93,11 +94,12 @@ Tensor fmin_native(const Tensor& self, const Tensor& other) {
 }
 
 Tensor float_power_native(const Tensor& self, const Tensor& exponent) {
-    const DType rt = ops::result_type(self, exponent);
-    const DType out = (isFloatingType(rt) || isComplexType(rt)) ? rt
-                                                                : DType::Float32;
-    return ops::pow(self.to(DType::Float64), exponent.to(DType::Float64))
-        .to(out);
+    const DType dt = (isComplexType(self.dtype()) || isComplexType(exponent.dtype()))
+                         ? DType::ComplexDouble
+                         : DType::Float64;
+    // The conversions record themselves, so the result is differentiated
+    // through them back to the operands' own types.
+    return ops::pow(tpx::to(self, dt), tpx::to(exponent, dt));
 }
 
 Tensor mvlgamma_native(const Tensor& self, int64_t p) {

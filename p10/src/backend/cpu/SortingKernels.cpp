@@ -8,17 +8,16 @@ namespace tensorplay {
 namespace cpu {
 
 namespace {
-Tensor msort_cpu(const Tensor& self) {
-    // msort: values of sort along dim 0.
-    Tensor values = std::get<0>(self.sort(0, false));
-    return values;
+// msort is the values of a sort along dim 0, on any device, and it is
+// differentiated through that sort.
+Tensor msort_composite(const Tensor& self) {
+    return std::get<0>(self.sort(0, false));
 }
-
 
 }  // namespace
 
-TENSORPLAY_LIBRARY_IMPL(CPU, SortingKernels) {
-    m.impl("msort", msort_cpu);
+TENSORPLAY_LIBRARY_IMPL(Composite, SortingComposites) {
+    m.impl("msort", msort_composite);
 }
 
 } // namespace cpu

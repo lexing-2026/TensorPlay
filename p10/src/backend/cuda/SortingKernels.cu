@@ -971,13 +971,7 @@ std::tuple<Tensor, Tensor, Tensor> unique_dim_consecutive_cuda(
     return unique_dim_cuda_impl(self, dim, true, return_inverse, return_counts);
 }
 
-Tensor msort_cuda(const Tensor& self) {
-    Tensor values = std::get<0>(self.sort(0, false));
-    return values;
-}
-
 TENSORPLAY_LIBRARY_IMPL(CUDA, SortingKernels) {
-    m.impl("msort", msort_cuda);
     m.impl("sort", sort_cuda);
     m.impl("argsort", argsort_cuda);
     m.impl("unique", unique_cuda);

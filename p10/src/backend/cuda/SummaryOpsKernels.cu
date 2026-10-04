@@ -739,6 +739,14 @@ Tensor logsumexp_cuda2(const Tensor& self, int64_t dim, bool keepdim) {
         !isIntegralType(self.dtype(), true))
         TP_THROW(RuntimeError, "logsumexp(): Expected floating point type");
     int64_t nd = self.dim();
+    if (nd == 0) {
+        // A zero-dim tensor reduces along dim 0 or -1 as one value along one
+        // axis, and one value is its own log-sum-exp.
+        wrap_dim(dim, 1);
+        return isIntegralType(self.dtype(), true)
+            ? self.to(globalContext().defaultDType())
+            : self.clone();
+    }
     dim = wrap_dim(dim, nd);
     Tensor sc = self.contiguous();
     if (isIntegralType(sc.dtype(), true)) {

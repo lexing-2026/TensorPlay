@@ -717,7 +717,14 @@ def load_derivatives(path: str, native_by_opname: dict[str, NativeFunction]) \
     from .model import parse_schema, parse_derivatives_yaml
 
     out: dict[str, OpDerivatives] = {}
+    seen_names: set[str] = set()
     for item in parse_derivatives_yaml(path):
+        # One entry per schema: a second one would silently replace the
+        # first, and the two need not agree.
+        schema_key = "".join(item["name"].split())
+        if schema_key in seen_names:
+            raise ValueError(f"derivatives.yaml defines '{item['name']}' more than once")
+        seen_names.add(schema_key)
         f = parse_schema(item["name"])
         op = f.func_name
         native = native_by_opname.get(op)

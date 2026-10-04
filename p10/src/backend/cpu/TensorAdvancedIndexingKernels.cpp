@@ -35,7 +35,9 @@ inline int64_t wrap_dim(int64_t dim, int64_t ndim) {
     return dim < 0 ? dim + ndim : dim;
 }
 
-Tensor take_along_dim_cpu(const Tensor& self, const Tensor& indices, std::optional<int64_t> dim) {
+// take_along_dim is a gather over the broadcast operands, on any device, and
+// it is differentiated through that gather.
+Tensor take_along_dim_composite(const Tensor& self, const Tensor& indices, std::optional<int64_t> dim) {
     if (indices.dtype() != DType::Int64) {
         TP_THROW(TypeError, "take_along_dim: expected indices to have dtype Int64");
     }
@@ -219,8 +221,11 @@ Tensor& index_put_impl_cpu(Tensor& self,
 
 TENSORPLAY_LIBRARY_IMPL(CPU, TensorAdvancedIndexingKernels) {
     m.impl("index.Tensor", index_cpu);
-    m.impl("take_along_dim", take_along_dim_cpu);
     m.impl("_index_put_impl_", index_put_impl_cpu);
+}
+
+TENSORPLAY_LIBRARY_IMPL(Composite, TensorAdvancedIndexingComposites) {
+    m.impl("take_along_dim", take_along_dim_composite);
 }
 
 } // namespace cpu

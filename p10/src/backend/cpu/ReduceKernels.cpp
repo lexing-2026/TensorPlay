@@ -265,6 +265,12 @@ std::tuple<Tensor, Tensor> aminmax_dim_cpu(const Tensor& self, int64_t dim,
 Tensor logsumexp_cpu(const Tensor& self, int64_t dim, bool keepdim) {
     if (!isFloatingType(self.dtype()))
         TP_THROW(RuntimeError, "logsumexp(): Expected floating point type");
+    if (self.dim() == 0) {
+        // A zero-dim tensor reduces along dim 0 or -1 as one value along one
+        // axis, and one value is its own log-sum-exp.
+        wrap_dim(dim, 1);
+        return self.clone();
+    }
     LseState init{-std::numeric_limits<double>::infinity(), 0.0, false};
     return reduce_dims_impl<LseState>(
         self, {dim}, keepdim, self.dtype(), init,
