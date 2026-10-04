@@ -4417,13 +4417,13 @@ class Scan(Loops):
 
     def inner_fn_args(self):
         index = self._index(self.ranges)
-        rindex = self._index(self.scan_ranges, sympy.Symbol("R0", integer=True))
+        rindex = self._index(self.scan_ranges, SymT.R0_INDEX)
         idx = self.reindex(index, rindex)
         return (idx,)
 
     def inner_fn_free_symbols(self, unbacked_only: bool = False) -> OrderedSet:
         index = self._index(self.ranges)
-        rindex = self._index(self.scan_ranges, sympy.Symbol("R0", integer=True))
+        rindex = self._index(self.scan_ranges, SymT.R0_INDEX)
         idx = self.reindex(index, rindex)
         return extract_free_symbols(self.inner_fn, idx, unbacked_only=unbacked_only)
 
@@ -4443,16 +4443,64 @@ class Scan(Loops):
 
         The body is written over the axes walked independently followed by the
         running axis, so reindexing puts the running index back in the position
-        the axis occupies.
+        the axis occupies.  A device that cannot write a scan, or several
+        results on a device that cannot carry them together, gets no value and
+        the call is handed to the framework; a scan over one element is that
+        element copied.  A scan worth splitting is split into partial walks
+        combined in order, where the device can do that and the order of the
+        additions is not required to be fixed.
         """
 
-        pointwise_ranges = []
-        scan_ranges = []
-        for i in range(len(size)):
-            if i == axis:
-                scan_ranges.append(sympy_index_symbol(f"x{i}"))
+        can_fallback_to_framework = kwargs.pop("can_fallback_to_aten", True)
+        pointwise_ranges = [*size[:axis], *size[axis + 1 :]]
+        scan_ranges = [size[axis]]
+
+        if not V.graph.has_feature(device, BackendFeature.SCAN):
+            return [None] * len(dtypes)
+
+        if len(dtypes) > 1 and not V.graph.has_feature(
+            device, BackendFeature.TUPLE_REDUCTION
+        ):
+            return [None] * len(dtypes)
+
+        sizevars = V.graph.sizevars
+        scan_numel = sizevars.simplify(sympy_product(scan_ranges))
+
+        if len(dtypes) != len(inner_fns):
+            raise AssertionError("Expected len(dtypes) == len(inner_fns)")
+
+        if sizevars.statically_known_true(sympy.Le(scan_numel, 1)):
+            return [
+                Pointwise.create(
+                    device=device,
+                    dtype=dtypes[output_index],
+                    inner_fn=inner_fns[output_index],
+                    ranges=size,
+                )
+                for output_index in range(len(dtypes))
+            ]
+
+        reduction_hint, num_splits = cls.num_splits(
+            device=device,
+            dtype=dtypes[0],
+            inner_fn=inner_fns[0],
+            axis=axis,
+            pointwise_ranges=pointwise_ranges,
+            scan_ranges=scan_ranges,
+            combine_fn=combine_fn,
+            scan_numel=scan_numel,
+        )
+        scan_type = Scan
+        if num_splits > 1:
+            supports_split = (
+                len(dtypes) == 1 and not tp.are_deterministic_algorithms_enabled()
+            )
+            if not supports_split:
+                if can_fallback_to_framework:
+                    return [None] * len(dtypes)
+                num_splits = 1
             else:
-                pointwise_ranges.append(sympy_index_symbol(f"x{i}"))
+                scan_type = SplitScan
 
         def reindex(index, scan_index):
             if len(scan_index) != len(scan_ranges):
@@ -4463,7 +4511,7 @@ class Scan(Loops):
 
         results = [
             TensorBox.create(
-                cls(
+                scan_type(
                     device=device,
                     dtype=dtypes[output_index],
                     dtypes=dtypes,
@@ -4591,13 +4639,13 @@ class Sort(Loops):
 
     def inner_fn_args(self):
         index = self._index(self.ranges)
-        rindex = self._index(self.sort_ranges, sympy.Symbol("R0", integer=True))
+        rindex = self._index(self.sort_ranges, SymT.R0_INDEX)
         idx = self.reindex(index, rindex)
         return (idx,)
 
     def inner_fn_free_symbols(self, unbacked_only: bool = False) -> OrderedSet:
         index = self._index(self.ranges)
-        rindex = self._index(self.sort_ranges, sympy.Symbol("R0", integer=True))
+        rindex = self._index(self.sort_ranges, SymT.R0_INDEX)
         idx = self.reindex(index, rindex)
         return extract_free_symbols(self.inner_fn, idx, unbacked_only=unbacked_only)
 
@@ -4619,21 +4667,54 @@ class Sort(Loops):
         Which end the values go in is part of what a sort is rather than
         something applied to its result, so it is settled where the sort is
         built: the walk reads the order it has been given and extends it, and
-        an order has a direction.
+        an order has a direction.  A sort is written only as one block that
+        holds the whole axis, so a device without sorting, or an axis longer
+        than such a block pays for, is handed to the framework; a sort of one
+        element is that element copied.
         """
 
-        sort_ranges = []
-        for i, s in enumerate(size):
-            if i == axis:
-                sort_ranges.append(sympy_index_symbol(f"x{i}"))
+        pointwise_ranges = [*size[:axis], *size[axis + 1 :]]
+        sort_ranges = [size[axis]]
+
+        if not V.graph.has_feature(device, BackendFeature.SORT):
+            return [None] * len(dtypes)
+
+        sizevars = V.graph.sizevars
+        sort_numel = sizevars.simplify(sympy_product(sort_ranges))
+
+        # The shortest axis at which a written sort usually beats the
+        # framework's; past it the work is not bandwidth bound, so fusing it
+        # buys little.
+        if config.triton.decompose_sort_ops:
+            is_persistent_kernel = config.triton.persistent_reductions
+        else:
+            max_rblock = 512
+            is_persistent_kernel = (
+                config.triton.persistent_reductions
+                and sizevars.statically_known_true(sympy.Le(sort_numel, max_rblock))
+            )
+        if not is_persistent_kernel:
+            return [None] * len(dtypes)
+
+        if len(dtypes) != len(inner_fns):
+            raise AssertionError("Expected len(dtypes) == len(inner_fns)")
+
+        if sizevars.statically_known_true(sympy.Le(sort_numel, 1)):
+            return [
+                Pointwise.create(
+                    device=device,
+                    dtype=dtypes[output_index],
+                    inner_fn=inner_fns[output_index],
+                    ranges=size,
+                )
+                for output_index in range(len(dtypes))
+            ]
 
         def reindex(index, sort_index):
             if len(sort_index) != len(sort_ranges):
                 raise AssertionError("Expected len(sort_index) == len(sort_ranges)")
-            if len(index) + len(sort_ranges) != len(size):
-                raise AssertionError(
-                    "Expected len(index) + len(sort_ranges) == len(size)"
-                )
+            if len(index) != len(pointwise_ranges):
+                raise AssertionError("Expected len(index) == len(pointwise_ranges)")
             return [*index[:axis], *sort_index, *index[axis:]]
 
         results = [
@@ -4645,14 +4726,7 @@ class Sort(Loops):
                     inner_fn=inner_fns[output_index],
                     inner_fns=inner_fns,
                     size=size,
-                    # The axis being sorted is walked apart from the others and
-                    # put back by reindexing, so a range that also contained it
-                    # would walk it twice and the sizes would not add up.
-                    ranges=[
-                        sympy_index_symbol(f"x{i}")
-                        for i in range(len(size))
-                        if i != axis
-                    ],
+                    ranges=pointwise_ranges,
                     sort_ranges=sort_ranges,
                     stable=stable,
                     descending=descending,
@@ -7383,19 +7457,15 @@ class ExternKernel(InputsKernel):
     def codegen_args(self) -> list:
         """The arguments of the call, in the order the call takes them.
 
-        Each is the name of the thing holding it: a buffer where the argument is
-        memory, a computed value where it is something else.  Passing the names
-        rather than the values is what lets the caller write the values where
-        they were computed and only the names here.
+        Each tensor argument is written the way it refers to itself: a buffer by
+        its name, a view of one as that view, since the call reads the elements
+        the view selects and not the whole buffer behind it.  The arguments that
+        are the same in every call follow, written as they stand.
         """
 
-        args: list = []
-        for i, inp in enumerate(self.inputs):
-            if isinstance(inp, Sequence):
-                for j, x in enumerate(inp):
-                    args.append(f"{x.get_name()}[{j}]")
-            else:
-                args.append(inp.get_name())
+        wrapper = V.graph.wrapper_code
+        args: list = [wrapper.val_to_arg_str(inp) for inp in self.inputs]
+        args.extend(wrapper.val_to_arg_str(value) for value in self.constant_args)
         return args
 
     def codegen_kwargs(self, skip_out: bool = False) -> list:
@@ -10210,13 +10280,51 @@ class FallbackKernel(ExternKernelAlloc):
                 f"NYI: Can't generate FallbackKernel for {self.op_overload}"
             )
 
-        if schema is None:
+        if schema is not None:
+            args, kwargs = self.unflatten_args(self.inputs, self.constant_args)
+            for info, arg in zip_schema(schema, args, kwargs):
+                handle_aliasing_and_mutation(self, info, arg)
+        self._record_traced_aliases()
+
+    def _record_traced_aliases(self) -> None:
+        """Record the inputs the traced call's result shared memory with.
+
+        A contract that does not say a result is a view of an input does not
+        make the result fresh memory: the framework call may hand back a view
+        anyway.  Those inputs are aliases all the same, so the result is never
+        written over in place of fresh memory and the input is not handed out
+        again while the result is alive.
+        """
+
+        node = getattr(V.graph, "current_node", None)
+        if node is None or not hasattr(node, "meta"):
             return
 
-        args, kwargs = self.unflatten_args(self.inputs, self.constant_args)
+        def storages(value):
+            found = set()
+            for t in _pytree.tree_leaves(value):
+                if isinstance(t, tp.Tensor) and t.defined():
+                    try:
+                        ptr = t.untyped_storage().data_ptr()
+                    except Exception:
+                        continue
+                    if ptr:
+                        found.add(ptr)
+            return found
 
-        for info, arg in zip_schema(schema, args, kwargs):
-            handle_aliasing_and_mutation(self, info, arg)
+        produced = storages(node.meta.get("val"))
+        if not produced:
+            return
+        env = getattr(V.graph, "env", {})
+        for arg in node.all_input_nodes:
+            if not storages(arg.meta.get("val")) & produced:
+                continue
+            try:
+                name = env[arg].get_name()
+            except Exception:
+                continue
+            if name not in self.alias_names:
+                self.alias_names.append(name)
 
     def get_read_writes(self):
         return super().get_read_writes()
@@ -10422,7 +10530,7 @@ class FallbackKernel(ExternKernelAlloc):
         new_args = [convert(x) for x in args]
         new_kwargs = {k: convert(v) for k, v in kwargs.items()}
 
-        return FallbackKernel(
+        packed = FallbackKernel(
             layout=(
                 cls.tensor_to_layout(example_output)
                 if isinstance(example_output, tp.Tensor)
@@ -10435,6 +10543,39 @@ class FallbackKernel(ExternKernelAlloc):
             kwargs=new_kwargs,
             unbacked_bindings=unbacked_bindings,
         )
+        if isinstance(example_output, tp.Tensor):
+            return packed
+
+        # A call that returns several values returns a structure, and each
+        # tensor in it is a result of its own: a buffer that says where in the
+        # structure it sits, read out of what the call handed back.
+        def generate_output(output, indices):
+            if isinstance(output, (list, tuple)):
+                return type(output)(
+                    generate_output(item, [*indices, (type(output), i)])
+                    for i, item in enumerate(output)
+                )
+            if isinstance(output, dict):
+                return {
+                    key: generate_output(item, [*indices, (type(output), key)])
+                    for key, item in output.items()
+                }
+            if isinstance(output, tp.Tensor):
+                return MultiOutput(cls.tensor_to_layout(output), packed, indices)
+            if output is None or isinstance(output, (int, float, bool)):
+                return output
+            raise AssertionError(
+                f"FallbackKernel output type {type(output)} is not supported"
+            )
+
+        outputs = generate_output(example_output, [])
+        if isinstance(outputs, (list, tuple)):
+            packed.outputs = list(outputs)
+        elif isinstance(outputs, dict):
+            packed.outputs = list(outputs.values())
+        else:
+            packed.outputs = [outputs]
+        return outputs
 
     @staticmethod
     @contextlib.contextmanager
@@ -11553,18 +11694,22 @@ def _schema_mutates_and_returns_first_arg(schema) -> bool:
     an input and produced a new value.
     """
 
+    # The shape is ``op_(Tensor(a!) self, ...) -> Tensor(a!)``: one return, in
+    # the alias set of a first argument that is written, and no other argument
+    # aliased at all.  Alias sets are named (``a``), so the return and the first
+    # argument are matched by that name.
     arguments = schema.arguments
-    if not arguments:
+    if len(schema.returns) != 1 or not arguments:
         return False
-    first = arguments[0]
-    if first.alias_info is None or not first.alias_info.is_write:
+    returned = schema.returns[0].alias_info
+    if returned is None or len(returned.after_set) != 1:
         return False
-    for r in schema.returns:
-        if r.alias_info is not None and r.alias_info.before_set:
-            before = r.alias_info.before_set
-            if any(len(before) == 1 and 0 in before for _ in (0,)):
-                return True
-    return False
+    first = arguments[0].alias_info
+    if first is None or not first.is_write or len(first.after_set) != 1:
+        return False
+    if next(iter(returned.after_set)) != next(iter(first.after_set)):
+        return False
+    return all(argument.alias_info is None for argument in arguments[1:])
 
 
 def _is_tensor_like_type(arg_type) -> bool:

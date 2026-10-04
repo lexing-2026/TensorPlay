@@ -26,7 +26,7 @@ from ...ops_handler import ReductionType
 
 from ...virtualized import V
 from ...utils import get_bounds_index_expr
-from ...ops_handler import OpsValue
+from ...virtualized import OpsValue
 from tensorplay.graph.experimental.sympy_functions import Max, Min
 from tensorplay.graph.experimental.symbolic_shapes import ValueRanges
 

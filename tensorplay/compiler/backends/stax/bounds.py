@@ -318,6 +318,8 @@ class BoundVars:
         expr = self.loop_body.indexing_exprs[name]
         bound = self.replacement_vals.get(expr)
         if bound is None:
-            bound = bound_sympy(expr.to_sympy(), self.replacement_vals)
+            # An index may be held as an expression already, or wrapped.
+            to_sympy = getattr(expr, "to_sympy", None)
+            bound = bound_sympy(to_sympy() if to_sympy is not None else expr, self.replacement_vals)
         self.replacement_vals[name] = bound
         return bound

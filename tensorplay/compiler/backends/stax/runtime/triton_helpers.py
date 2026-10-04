@@ -21,7 +21,7 @@ import sympy
 import tensorplay as tp
 
 
-from .triton_compat import JITFunction, libdevice, math, tl, triton
+from .triton_compat import JITFunction, _log2, builtins_use_semantic_kwarg, libdevice, math, tl, triton
 from .triton_compat import math as tl_math
 
 _skip_gpu_driver_setup: ContextVar[bool] = ContextVar(
@@ -469,3 +469,524 @@ def welford_combine(mean_1, m2_1, weight_1, mean_2, m2_2, weight_2):
 @triton.jit
 def welford(mean, m2, weight, dim):
     return tl.reduce((mean, m2, weight), dim, welford_combine)
+
+
+@triton.jit
+def device_assert_then(cond, msg, r):
+    tl.device_assert(cond, msg)
+    return r
+
+
+@triton.jit
+def _random_4x_to_block(r0, r1, r2, r3):
+    # Lanes are laid out by logical offset, so the stream drawn does not depend
+    # on the block size.
+    size: tl.constexpr = r0.numel
+    return tl.reshape(tl.join(tl.join(r0, r2), tl.join(r1, r3)), [size * 4])
+
+
+@triton.jit
+def rand4x(seed, offsets, BLOCK: tl.constexpr):
+    offsets = offsets.to(tl.uint32)
+    seed = tl.min(seed + offsets * 0, axis=0)
+    if BLOCK >= 4 and BLOCK % 4 == 0:
+        base = tl.min(offsets, axis=0)
+        reduced_offsets = base // 4 + tl.arange(0, BLOCK // 4)
+        r0, r1, r2, r3 = tl.rand4x(seed, reduced_offsets)
+        return _random_4x_to_block(r0, r1, r2, r3)
+    return tl.rand(seed, offsets)
+
+
+@triton.jit
+def randn4x(seed, offsets, BLOCK: tl.constexpr):
+    offsets = offsets.to(tl.uint32)
+    seed = tl.min(seed + offsets * 0, axis=0)
+    if BLOCK >= 4 and BLOCK % 4 == 0:
+        base = tl.min(offsets, axis=0)
+        reduced_offsets = base // 4 + tl.arange(0, BLOCK // 4)
+        r0, r1, r2, r3 = tl.randn4x(seed, reduced_offsets)
+        return _random_4x_to_block(r0, r1, r2, r3)
+    return tl.randn(seed, offsets)
+
+
+@triton.jit
+def randint64(seed, offset, low, high):
+    r0, r1, _r2, _r3 = tl.randint4x(seed, offset)
+    r0 = r0.to(tl.uint64)
+    r1 = r1.to(tl.uint64)
+    result = r0 | (r1 << 32)
+    size = high - low
+    result = result % size.to(tl.uint64)
+    result = result.to(tl.int64) + low
+    return result
+
+
+@triton.jit
+def _any_combine(a, b):
+    return a | b
+
+
+@triton.jit
+def any(a, dim):
+    return tl.reduce(a, dim, _any_combine)
+
+
+@triton.jit
+def bucketize_binary_search(
+    values: tl.tensor,
+    boundaries_ptr: tl.tensor,
+    BOUNDARIES_SIZE: int,
+    BOUNDARIES_UNDERLYING_NUMEL: int,
+    BOUNDARIES_STRIDE: int,
+    boundary_indices: tl.tensor,
+    indexing_dtype: tl.dtype,
+    right: "bool",  # the jit cannot read an unquoted bool annotation
+    sorter_ptr: tl.tensor,
+    SORTER_STRIDE: int,
+    sorter_indices: tl.tensor,
+):
+    """The bucket each of ``values`` falls in, by binary search of one set of
+    boundaries per value.
+
+    ``boundary_indices`` points each value at the first element of its set in
+    the flat boundaries buffer; ``right`` closes the intervals on the left.  A
+    ``sorter_ptr`` (with its stride and indices) reads unsorted boundaries in
+    sorted order.  The result is in ``indexing_dtype``.
+    """
+
+    low = tl.zeros(values.shape, dtype=indexing_dtype)
+    high = tl.full(values.shape, BOUNDARIES_SIZE, dtype=indexing_dtype)
+
+    full_range = BOUNDARIES_SIZE + 1
+    while full_range > 1:
+        mid = (high + low) // 2
+        mask = (
+            (mid * BOUNDARIES_STRIDE + boundary_indices) < BOUNDARIES_UNDERLYING_NUMEL
+        ).logical_and(mid < BOUNDARIES_SIZE)
+        mid_indices = (
+            mid
+            if sorter_ptr is None or SORTER_STRIDE is None
+            else tl.load(
+                sorter_ptr + sorter_indices + SORTER_STRIDE * mid,
+                mask=mask,
+                other=0,
+            )
+        )
+
+        bucket_upper_bound = tl.load(
+            boundaries_ptr + boundary_indices + BOUNDARIES_STRIDE * mid_indices,
+            mask=mask,
+            other=0,
+        )
+        if right:
+            is_above = values >= bucket_upper_bound
+        else:
+            is_above = values > bucket_upper_bound
+
+        if is_floating(values):
+            is_above = is_above | (values != values)
+
+        low = tl.where(is_above & mask, mid + 1, low)
+        high = tl.where(is_above, high, mid)
+
+        full_range = (full_range + 1) // 2
+
+    return low
+
+
+@triton.jit
+def pack_value_flag(
+    value,
+    flag,
+    DTYPE_VALUE_AS_UINT: tl.constexpr,
+    DTYPE_PACK: tl.constexpr,
+):
+    # ``tensor.to`` does not unwrap a constexpr type itself.
+    DTYPE_VALUE_AS_UINT = tl.core._unwrap_if_constexpr(DTYPE_VALUE_AS_UINT)
+    bitwidth = DTYPE_VALUE_AS_UINT.primitive_bitwidth
+    uv = value.to(DTYPE_VALUE_AS_UINT, bitcast=True).to(DTYPE_PACK)
+    return flag.to(DTYPE_PACK) | (uv << bitwidth)
+
+
+@triton.jit
+def unpack_value(
+    pack,
+    DTYPE_VALUE,
+    DTYPE_VALUE_AS_UINT,
+):
+    DTYPE_VALUE = tl.core._unwrap_if_constexpr(DTYPE_VALUE)
+    DTYPE_VALUE_AS_UINT = tl.core._unwrap_if_constexpr(DTYPE_VALUE_AS_UINT)
+    bitwidth = DTYPE_VALUE_AS_UINT.primitive_bitwidth
+    value_uint = (pack >> bitwidth).to(DTYPE_VALUE_AS_UINT)
+    return value_uint.to(DTYPE_VALUE, bitcast=True)
+
+
+@triton.jit
+def unpack_flag(pack, DTYPE_FLAG):
+    return pack.to(DTYPE_FLAG)
+
+
+@triton.jit
+def exclusive_scan_decoupled_lookback(
+    scratch_base,
+    block_value,
+    index,
+    combine_fn,
+    DTYPE_VALUE_AS_UINT: tl.constexpr,
+    DTYPE_PACK: tl.constexpr,
+):
+    """The combination of every earlier block's value, by decoupled look-back.
+
+    Each block publishes its own value, then walks back over the blocks before
+    it until one has published an inclusive prefix, and finally publishes its
+    own inclusive prefix.  A value and its flag are packed into one unsigned
+    word of twice the value's width, so values are at most 32 bits wide.
+    """
+
+    # Published first, so the blocks after this one are never left waiting.
+    DTYPE_VALUE = block_value.dtype
+    pack = pack_value_flag(
+        block_value,
+        tl.full(block_value.shape, 1, DTYPE_VALUE_AS_UINT),
+        DTYPE_VALUE_AS_UINT,
+        DTYPE_PACK,
+    )
+    if index > 0:
+        tl.atomic_xchg(scratch_base + index, pack, sem="relaxed")
+
+    exclusive_prefix = tl.zeros([], DTYPE_VALUE)
+    prefix_valid = False
+    test_target = index - 1
+    while test_target >= 0:
+        flag = tl.full([], 0, DTYPE_VALUE_AS_UINT)
+        while flag == 0:
+            pack = tl.atomic_add(scratch_base + test_target, 0, sem="relaxed")
+            flag = unpack_flag(pack, DTYPE_VALUE_AS_UINT)
+
+        value = unpack_value(pack, DTYPE_VALUE, DTYPE_VALUE_AS_UINT)
+        if prefix_valid:
+            exclusive_prefix = combine_fn(value, exclusive_prefix)
+        else:
+            exclusive_prefix = value
+            prefix_valid = True
+
+        if flag == 2:
+            test_target = -1
+        else:
+            test_target = test_target - 1
+
+    if prefix_valid:
+        inclusive_prefix = combine_fn(exclusive_prefix, block_value)
+    else:
+        inclusive_prefix = block_value
+    pack = pack_value_flag(
+        inclusive_prefix,
+        tl.full([], 2, DTYPE_VALUE_AS_UINT),
+        DTYPE_VALUE_AS_UINT,
+        DTYPE_PACK,
+    )
+    tl.atomic_xchg(scratch_base + index, pack, sem="relaxed")
+    return exclusive_prefix
+
+
+@triton.jit
+def exclusive_scan_decoupled_lookback_64(scratch_base, block_value, index, combine_fn):
+    """The decoupled look-back for 64-bit values, which cannot be packed with
+    their flag: each block keeps a flag word and two value words."""
+
+    if index > 0:
+        block_value_u64 = block_value.to(tl.uint64, bitcast=True)
+        tl.store(scratch_base + 3 * index + 1, block_value_u64)
+        tl.debug_barrier()
+        flag_one = tl.full([], 1, tl.uint64)
+        tl.atomic_xchg(scratch_base + 3 * index + 0, flag_one, sem="release")
+
+    exclusive_prefix = tl.zeros([], block_value.dtype)
+    prefix_valid = False
+    test_target = index - 1
+    while test_target >= 0:
+        flag = tl.full([], 0, tl.uint64)
+        while flag == 0:
+            flag = tl.atomic_add(scratch_base + 3 * test_target + 0, 0, sem="acquire")
+
+        value_u64 = tl.load(scratch_base + 3 * test_target + flag.to(tl.int32))
+        value = value_u64.to(block_value.dtype, bitcast=True)
+        if prefix_valid:
+            exclusive_prefix = combine_fn(value, exclusive_prefix)
+        else:
+            exclusive_prefix = value
+            prefix_valid = True
+
+        if flag == 2:
+            test_target = tl.full([], -1, index.dtype)
+        else:
+            test_target = test_target - 1
+
+    if prefix_valid:
+        inclusive_prefix = combine_fn(exclusive_prefix, block_value)
+    else:
+        inclusive_prefix = block_value
+    inclusive_prefix_u64 = inclusive_prefix.to(tl.uint64, bitcast=True)
+    tl.store(scratch_base + 3 * index + 2, inclusive_prefix_u64)
+    tl.debug_barrier()
+    flag_two = tl.full([], 2, tl.uint64)
+    tl.atomic_xchg(scratch_base + 3 * index + 0, flag_two, sem="release")
+
+    return exclusive_prefix
+
+
+@triton.jit
+def frexp(x):
+    zero = x == 0
+    not_finite = libdevice.isinf(x).to(tl.int1) | libdevice.isnan(x).to(tl.int1)
+    special = zero | not_finite
+    safe_x = tl.where(special, 1.0, x)
+    y = libdevice.ilogb(safe_x) + 1
+    exponent = tl.where(special, 0, y)
+    mantissa = tl.where(zero, 0, tl.where(not_finite, x, libdevice.ldexp(safe_x, -y)))
+    return mantissa, exponent
+
+
+@triton.jit
+def _compare_and_swap_with_index(
+    x,
+    idxs,
+    rnumel,
+    flip,
+    i: tl.constexpr,
+    n_dims: tl.constexpr,
+    stable: tl.constexpr,
+    descending: tl.constexpr,
+):
+    n_outer: tl.constexpr = x.numel >> n_dims
+    shape: tl.constexpr = [n_outer * 2**i, 2, 2 ** (n_dims - i - 1)]
+
+    idtype = tl.core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)
+
+    y = tl.reshape(x, shape)
+    iy = y.to(idtype, bitcast=True)
+    # The left and right halves, ``2**(n_dims - i - 1)`` apart.
+    right_mask = tl.arange(0, 2)[None, :, None].to(idtype)
+    left_mask = (1 - right_mask).to(idtype)
+    ileft = tl.broadcast_to(tl.sum(iy * left_mask, 1).to(idtype)[:, None, :], shape)
+    iright = tl.broadcast_to(tl.sum(iy * right_mask, 1).to(idtype)[:, None, :], shape)
+    ileft = tl.reshape(ileft, x.shape)
+    iright = tl.reshape(iright, x.shape)
+    left = ileft.to(x.dtype, bitcast=True)
+    right = iright.to(x.dtype, bitcast=True)
+
+    y_idx = tl.reshape(idxs, shape)
+    left_idx = tl.broadcast_to(
+        tl.sum(y_idx * left_mask.to(y_idx.dtype), 1)[:, None, :], shape
+    )
+    right_idx = tl.broadcast_to(
+        tl.sum(y_idx * right_mask.to(y_idx.dtype), 1)[:, None, :], shape
+    )
+    left_idx = tl.reshape(left_idx, x.shape)
+    right_idx = tl.reshape(right_idx, x.shape)
+
+    if rnumel is None:
+        left_valid_mask = tl.full(x.shape, True, tl.int1)
+        right_valid_mask = tl.full(x.shape, True, tl.int1)
+    else:
+        left_valid_mask = left_idx < rnumel
+        right_valid_mask = right_idx < rnumel
+
+    ix = x.to(idtype, bitcast=True)
+
+    # A sort places NaN above every number, while every comparison with NaN is
+    # false: descending checks the right one for NaN, ascending the left.
+    left_isnan = left != left
+    right_isnan = right != right
+
+    if descending:
+        cond = left < right
+        if is_floating(left):
+            if not stable:
+                cond = cond | right_isnan
+            else:
+                cond = cond | (right_isnan & (~left_isnan))
+
+    else:
+        cond = left > right
+        if is_floating(left):
+            if not stable:
+                cond = cond | left_isnan
+            else:
+                cond = cond | (left_isnan & (~right_isnan))
+
+    if stable:
+        # Equal values keep the order of their positions.
+        eq = left == right
+        if is_floating(left):
+            eq = eq | (left_isnan & right_isnan)
+        cond = cond | (eq & (left_idx > right_idx))
+
+    cond = (right_valid_mask > left_valid_mask) | (
+        (right_valid_mask == left_valid_mask) & cond
+    )
+    cond = (cond ^ flip).to(tl.int1)
+    ret = ix ^ tl.where(cond, ileft ^ iright, tl.zeros_like(ix))
+    new_idxs = idxs ^ tl.where(cond, left_idx ^ right_idx, tl.zeros_like(idxs))
+
+    return ret.to(x.dtype, bitcast=True), new_idxs
+
+
+@triton.jit
+def _bitonic_merge_with_index(
+    x,
+    idxs,
+    rnumel,
+    stage: tl.constexpr,
+    alternating: tl.constexpr,
+    n_dims: tl.constexpr,
+    stable: tl.constexpr,
+    descending: tl.constexpr,
+):
+    n_outer: tl.constexpr = x.numel >> n_dims
+    tl.static_assert(stage <= n_dims)
+    # ``flip`` says which runs are put in descending order at this stage: none
+    # of them, or every other run of ``2**stage``.
+    if alternating:
+        shape: tl.constexpr = [n_outer * 2 ** (n_dims - 1 - stage), 2, 2**stage]
+        flip = tl.reshape(
+            tl.broadcast_to(tl.arange(0, 2)[None, :, None], shape), x.shape
+        )
+    else:
+        flip = False
+    for i in tl.static_range(stage):
+        x, idxs = _compare_and_swap_with_index(
+            x, idxs, rnumel, flip, i + (n_dims - stage), n_dims, stable, descending
+        )
+    return x, idxs
+
+
+@triton.jit
+def sort_with_index(
+    x,
+    idxs,
+    rnumel,
+    dim: tl.constexpr = None,
+    stable: tl.constexpr = tl.constexpr(False),
+    descending: tl.constexpr = tl.constexpr(False),
+):
+    """``x`` sorted along its last axis by bitonic merges, with ``idxs``
+    carried along; positions at or past ``rnumel`` sort last."""
+
+    x, idxs = tl.broadcast(x, idxs)
+    _dim: tl.constexpr = len(x.shape) - 1 if dim is None else dim
+    tl.static_assert(
+        _dim == len(x.shape) - 1, "only minor dimension is currently supported"
+    )
+    n_dims: tl.constexpr = _log2(x.shape[_dim])
+
+    for i in tl.static_range(1, n_dims + 1):
+        x, idxs = _bitonic_merge_with_index(
+            x,
+            idxs,
+            rnumel,
+            i,
+            alternating=i < n_dims,
+            n_dims=n_dims,
+            stable=stable,
+            descending=descending,
+        )
+    return x, idxs
+
+
+@triton.jit
+def select_one(x, mask, dim, keep_dims=False):
+    idtype = tl.core.get_int_dtype(x.dtype.primitive_bitwidth, signed=False)
+    ix = x.to(idtype, bitcast=True)
+    iy = tl.sum(ix * mask, dim, keep_dims=keep_dims)
+    return iy.to(idtype).to(x.dtype, bitcast=True)
+
+
+@triton.jit
+def x_grid_barrier(sem):
+    """Waits until every block of the grid that shares this block's y and z
+    program ids has arrived.
+
+    ``sem`` is a 32-bit semaphore initialized to zero or ``0x80000000``, one per
+    y/z program id.
+    """
+
+    # Stores made before the barrier are visible after it.
+    tl.debug_barrier()
+
+    one_i32 = 1
+    one_u32 = one_i32.to(tl.uint32)
+    expected = tl.num_programs(0).to(tl.uint32)
+    if tl.program_id(0) == 0:
+        nb = 0x80000000 - (expected - one_u32)
+    else:
+        nb = one_u32
+
+    old_arrive = tl.atomic_add(sem, nb, sem="release")
+
+    bar_flipped = False
+    while not bar_flipped:
+        current_arrive = tl.atomic_add(sem, 0, sem="acquire")
+        bar_flipped = ((old_arrive ^ current_arrive) & 0x80000000) != 0
+
+    tl.debug_barrier()
+
+
+def triton_builtin(f):
+    """Marks ``f`` as a builtin the kernel compiler evaluates at compile time."""
+
+    if builtins_use_semantic_kwarg:
+
+        def wrapper(*args, _semantic, **kwargs):
+            kwargs["_builder"] = _semantic
+            return f(*args, **kwargs)
+
+    else:
+        wrapper = f
+
+    wrapper.__triton_builtin__ = True
+    return wrapper
+
+
+@triton_builtin
+def constexpr_next_power_of_2(n: tl.constexpr, *, _builder: object = None) -> tl.constexpr:
+    """The next power of two of a compile-time constant."""
+
+    if not isinstance(n, tl.constexpr):
+        raise AssertionError(f"Expected tl.constexpr, got {type(n)}")
+    return tl.constexpr(triton.next_power_of_2(n.value))
+
+
+@triton_builtin
+def if_mask(mask, val, *, _builder: object = None) -> tl.constexpr:
+    """``val``, or nothing when there is no mask: a load given ``other``
+    without a mask does not compile."""
+
+    if isinstance(mask, tl.constexpr) and mask.value is None:
+        return tl.constexpr(None)
+    return val
+
+
+@triton.jit
+def inline_asm_pack(x, pack: tl.constexpr):
+    """``x`` flattened and padded with zeros to a multiple of ``pack``."""
+
+    result = x.ravel()
+    # A block at least ``pack`` long is already a multiple (both are powers of
+    # two); only a shorter one is padded.
+    n_pad: tl.constexpr = _log2(pack) - _log2(result.numel)
+    for _ in tl.static_range(n_pad):
+        result = tl.reshape(tl.join(result, tl.zeros_like(result)), (result.shape[0] * 2,))
+    return result
+
+
+@triton.jit
+def inline_asm_unpack(x, orig, pack: tl.constexpr):
+    """The padding of ``inline_asm_pack`` removed, in ``orig``'s shape."""
+
+    result = x
+    n_pad: tl.constexpr = _log2(pack) - _log2(orig.numel)
+    for _ in tl.static_range(n_pad):
+        result, _ = tl.split(tl.reshape(result, (result.shape[0] // 2, 2)))
+    return tl.reshape(result, orig.shape)
+

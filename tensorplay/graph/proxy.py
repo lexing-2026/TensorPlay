@@ -533,10 +533,9 @@ class Proxy:
         """
 
         if not index:
-            # Asked with no argument the question is "how many", and the number
-            # of extents is the answer -- the whole shape is a different
-            # question and is what the shape is for.
-            return len(self._property("shape"))
+            # Asked with no argument the answer is every extent, as the value
+            # itself answers it: a traced program compares and unpacks it.
+            return self._property("shape")
         if len(index) > 1:
             raise TypeError(f"size() takes at most 1 argument, got {len(index)}")
         (position,) = index

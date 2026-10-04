@@ -130,6 +130,22 @@ if triton is not None:
     except ImportError:
         ASTSource = None
 
+    try:
+        from triton.language.standard import _log2
+    except ImportError:
+
+        def _log2(x):
+            raise NotImplementedError("this runtime has no compile-time log2")
+
+    import inspect as _inspect
+
+    #: Whether a compile-time builtin is handed the semantic object under
+    #: ``_semantic`` rather than the builder under ``_builder``; the spelling
+    #: changed between runtime versions.
+    builtins_use_semantic_kwarg = (
+        "_semantic" in _inspect.signature(triton.language.core.view).parameters
+    )
+
 else:  # pragma: no cover - the kernel-writing runtime is absent
     tl = None
     CompiledKernel = None
@@ -154,6 +170,10 @@ else:  # pragma: no cover - the kernel-writing runtime is absent
     IntelGPUError = None
     libdevice = None
     math = None
+    builtins_use_semantic_kwarg = False
+
+    def _log2(x):
+        raise RuntimeError("the kernel-writing runtime is not installed")
 
     def triton_key(*args, **kwargs):
         raise RuntimeError("the kernel-writing runtime is not installed")

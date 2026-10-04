@@ -1903,6 +1903,7 @@ class BaseSchedulerNode:
         Decide if there should be inplace updates for the node
         and record the decision in the active kernel.
         """
+        from .codegen.simd import SIMDKernel
         from .codegen.wrapper import can_match_buffer_size
 
         if not (
@@ -2042,7 +2043,6 @@ class BaseSchedulerNode:
                             input_buf.get_name()
                         )
                         break
-        from .codegen.simd import SIMDKernel
 
     def codegen_originating_info(
         self, buffer: IndentedBuffer, only_once: bool = True

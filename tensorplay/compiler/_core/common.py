@@ -57,7 +57,7 @@ class AotAutograd:
         self.kwargs = kwargs
 
     def __call__(self, gm: Any, example_inputs: list[Any], **kwargs: Any) -> Callable[..., Any]:
-        if kwargs:
+        if kwargs and not getattr(self, "options_bound", False):
             log.warning("aot_autograd-based backend ignoring extra kwargs %s", kwargs)
 
         from .aot_autograd import aot_module_simplified

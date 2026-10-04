@@ -701,11 +701,15 @@ def _adapt_backend_to_region(
 
     Training regions are routed through ahead-of-time autograd so parameters
     are lifted into explicit inputs before the backend sees them (the same
-    pipeline the reference ``compile_fx`` runs); inference regions go to the
-    backend directly.
+    pipeline the reference ``compile_fx`` runs).  Inference regions go to the
+    backend directly unless it declares ``lowers_operator_graphs``: such a
+    backend is handed the operator-level trace of every region, with nothing
+    to differentiate in an inference one.
     """
 
-    if not _region_is_training(example_inputs, example_kwargs, graph_module):
+    if not _region_is_training(
+        example_inputs, example_kwargs, graph_module
+    ) and not getattr(compiler_fn, "lowers_operator_graphs", False):
         return compiler_fn
     from .aot_autograd import min_cut_rematerialization_partition
     from .common import aot_autograd
@@ -728,7 +732,10 @@ def _adapt_backend_to_region(
         tensorplay.ops.tp.native_group_norm_backward,
     )
 
-    return aot_autograd(
+    # A backend that lowers operator graphs says which operations it would
+    # rather see as their parts; the trace writes those in their parts.
+    backend_decompositions = getattr(compiler_fn, "trace_decompositions", None)
+    adapted = aot_autograd(
         fw_compiler=forward_compiler,
         bw_compiler=forward_compiler,
         # Keep the cheapest cut of forward values and let the backward
@@ -736,10 +743,15 @@ def _adapt_backend_to_region(
         # forward write every value the backward reads.
         partition_fn=min_cut_rematerialization_partition,
         decompositions={
+            **(backend_decompositions() if backend_decompositions is not None else {}),
             **get_decompositions(_NORM_DECOMPOSITION_OPS),
             **exact_narrowing_rules(),
         },
     )
+    # The backend options are already bound into the compilers above; the
+    # same options handed to the call again are not extra ones.
+    adapted.options_bound = True
+    return adapted
 
 
 @contextlib.contextmanager

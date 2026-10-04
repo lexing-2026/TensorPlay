@@ -7685,9 +7685,17 @@ class TritonOverrides(OpOverrides):
         return f"libdevice.expm1({x})"
 
     @staticmethod
-    @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def sqrt(x):
+        # The round-to-nearest square root takes single precision only; a
+        # double is rooted by the device library, which rounds the same way.
+        if getattr(x, "dtype", None) == tp.float64:
+            return f"libdevice.sqrt({x})"
+        return TritonOverrides._sqrt_rn(x)
+
+    @staticmethod
+    @maybe_upcast_float32()
+    def _sqrt_rn(x):
         return f"tl.sqrt_rn({x})"
 
     @staticmethod

@@ -144,6 +144,27 @@ def stax(
         return compiled
     return wrapped
 
+
+# This backend lowers operator overloads, never the Python functions a capture
+# happened to call.  A region with nothing to differentiate is therefore traced
+# down to the operators it runs before it is handed over, exactly as a training
+# region is: a function's name does not say which overload it reached, nor what
+# a composite is made of.
+stax.lowers_operator_graphs = True
+
+
+def _trace_decompositions():
+    from .op_lowerings import trace_decompositions
+
+    return trace_decompositions()
+
+
+# An operation with no lowering, template or library call of its own is traced
+# as the parts it decomposes into, which are lowered, instead of reaching the
+# region as a call the framework makes.
+stax.trace_decompositions = _trace_decompositions
+
+
 def _publish_codegen(compiled, tag: str, *, backward: bool) -> None:
     """Report on the artifact itself which route produced it.
 
@@ -199,6 +220,19 @@ def _lower_stax_region(
     # what the caller calls.  A region that cannot be lowered is a region the
     # framework runs itself, which is what falling back is for.
     from .graph_lowering import GraphLowering
+
+    if any(
+        getattr(node.target, "__name__", None) == "auto_functionalized"
+        for node in graph_module.graph.nodes
+        if node.op == "call_function"
+    ):
+        # A mutating operator with no functional form reaches this backend as
+        # its functional stand-in; it is lowered as the copies and the
+        # operator writing into them.
+        from .graph_passes.post_grad import decompose_auto_functionalized
+
+        decompose_auto_functionalized(graph_module.graph)
+        graph_module.recompile()
 
     graph = GraphLowering(
         graph_module,

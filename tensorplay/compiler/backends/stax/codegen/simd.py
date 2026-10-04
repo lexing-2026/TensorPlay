@@ -72,7 +72,8 @@ from ..utils import (
     sympy_subs,
     unique,
 )
-from ..loops import ops, V
+from ..loops import V
+from ..virtualized import ops
 from .block_analysis import BlockPatternMatcher
 from .common import (
     BackendFeature,

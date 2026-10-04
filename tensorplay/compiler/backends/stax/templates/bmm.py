@@ -120,6 +120,11 @@ framework_bmm_dtype = ExternKernelChoice(
     op_overload=tp.ops.tp.bmm.out,
 )
 
+#: The framework's own batched product with a bias, scaled as the call asks.
+framework_baddbmm = ExternKernelChoice(
+    tp.ops.tp.baddbmm, "baddbmm_out", op_overload=tp.ops.tp.baddbmm.out,
+)
+
 framework_int_mm = ExternKernelChoice(
     tp.ops.tp._int_mm, "int_mm_out", name="int_mm",
     op_overload=tp.ops.tp._int_mm.out,
@@ -308,23 +313,28 @@ def tuned_bmm(mat1, mat2, out_dtype=None, *, layout=None):
 
 
 @register_lowering(framework.baddbmm)
-def tuned_baddbmm(mat1, batch1, batch2, beta=1, alpha=1, *, layout=None,
-                  plain=None, bias_spec=None):
+def tuned_baddbmm(inp, batch1, batch2, *, beta=1, alpha=1, layout=None):
     """A batched product with a bias added to it, and its candidates.
 
-    The bias is added where the product's store already is, so the two are one
-    kernel rather than two; the result is the product's own candidates, with the
-    bias riding along in the store.
+    The framework's own call adds the bias inside the product's store, scaled
+    as asked, so it is the candidate: the bias costs no pass of its own.
     """
 
-    from .mm_common import addmm_epilogue, mm_args
+    from ..ir import FixedLayout
+    from ..op_lowerings import lower_expand, realize_inputs
+    from .select_algorithm import autotune_select_algorithm, get_template_configs
 
-    candidates, meta = tuned_bmm(
-        batch1, batch2, layout=layout, plain=plain
+    batch1, batch2 = realize_inputs(batch1, batch2)
+    b, m, _k = batch1.get_size()
+    n = batch2.get_size()[-1]
+    if layout is None:
+        layout = FixedLayout(batch1.get_device(), batch1.get_dtype(), [b, m, n])
+    inp = realize_inputs(lower_expand(inp, list(layout.size)))
+    kernel_inputs = MMKernelInputs(
+        [inp, batch1, batch2], scalars=dict(alpha=alpha, beta=beta)
     )
-    if candidates is None:
-        return None
-    if bias_spec is not None:
-        meta = dict(meta, bias_spec=bias_spec)
-        meta["epilogue"] = addmm_epilogue(None, alpha, beta)
-    return candidates, meta
+    choices = get_template_configs(kernel_inputs, [framework_baddbmm], "baddbmm")
+    node, _ = autotune_select_algorithm(
+        "baddbmm", choices, kernel_inputs.nodes(), layout
+    )
+    return node

@@ -221,6 +221,15 @@ def has_side_effect(target: Any) -> bool:
             return True
     except TypeError:
         pass
+    # An operator overload says in its schema whether it writes to an
+    # argument; one that does changes a value someone else may read, whether
+    # or not anything reads its own result.  Its name ends in the overload
+    # (``copy_.default``), so the name alone cannot say so.
+    schema = getattr(target, "_schema", None)
+    if schema is not None and not isinstance(schema, str) and getattr(
+        schema, "is_mutable", False
+    ):
+        return True
     name = getattr(target, "__name__", "")
     return bool(
         getattr(target, "_tensorplay_effectful", False)

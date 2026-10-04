@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 from ..registry import register_template_heuristic
 from ...templates.bmm import (
+    framework_baddbmm,
     framework_bmm,
     framework_bmm_dtype,
     framework_int_mm,
@@ -91,6 +92,7 @@ class TPConfigHeuristics(TemplateConfigHeuristics):
 
 @register_template_heuristic(framework_addmm.uid, None, op_name="addmm")
 @register_template_heuristic(framework_bias_addmm.uid, None, op_name="addmm")
+@register_template_heuristic(framework_baddbmm.uid, None, op_name="baddbmm")
 class TPAddMMConfigHeuristics(TPConfigHeuristics):
     """A product with something added, where the coefficients are not a choice.
 

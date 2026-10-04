@@ -2775,3 +2775,383 @@ def linalg_vector_norm(self, ord=2, dim=None, keepdim=False, *, dtype=None):
     if not dims:
         return x.to(result_dtype).contiguous()
     return tp.pow(tp.pow(x, ord).sum(dim=dims, keepdim=keepdim), 1.0 / ord).to(result_dtype)
+
+
+# ---------------------------------------------------------------------------
+# Operations the framework computes whole, written as the operations they are
+# made of.  A compiled region lowers the parts, where a whole call would be a
+# boundary nothing fuses across.
+# ---------------------------------------------------------------------------
+
+
+register_decomposition(ops.entr.default)(special_entr)
+register_decomposition(ops.xlog1py.default)(special_xlog1py)
+
+
+@register_decomposition(ops.index_select.default)
+def index_select(self, dim, index):
+    if index.dim() > 1:
+        raise RuntimeError(f"index_select(): Index is supposed to be a vector, got {index.dim()} dims")
+    if index.dim() == 0:
+        index = index.unsqueeze(0)
+    if self.dim() == 0:
+        return self.reshape(1).expand(tuple(index.shape)).contiguous()
+    dim = dim % self.dim()
+    return ops.index.Tensor(self, [None] * dim + [index]).contiguous()
+
+
+def _norm(self, p, dim, keepdim, dtype):
+    if p is None or p == "fro":
+        p = 2
+    return ops.linalg_vector_norm.default(self, p, dim, keepdim, dtype=dtype)
+
+
+@register_decomposition([ops.norm.default, ops.norm.Scalar])
+def norm(self, p=2):
+    return _norm(self, p, None, False, None)
+
+
+@register_decomposition(ops.norm.dim)
+def norm_dim(self, dim, p=2.0, keepdim=False):
+    return _norm(self, p, list(dim), keepdim, None)
+
+
+@register_decomposition(ops.norm.ScalarOpt_dim)
+def norm_scalaropt_dim(self, p, dim, keepdim=False):
+    return _norm(self, p, list(dim), keepdim, None)
+
+
+@register_decomposition(ops.norm.ScalarOpt_dtype)
+def norm_scalaropt_dtype(self, p, *, dtype):
+    return _norm(self, p, None, False, dtype)
+
+
+@register_decomposition(ops.norm.ScalarOpt_dim_dtype)
+def norm_scalaropt_dim_dtype(self, p, dim, keepdim, *, dtype):
+    return _norm(self, p, list(dim), keepdim, dtype)
+
+
+@register_decomposition(ops.mT.default)
+def mT(self):
+    if self.dim() < 2:
+        raise RuntimeError(f"tensor.mT is only supported on matrices or batches of matrices. Got {self.dim()}-D tensor.")
+    return self.transpose(-2, -1)
+
+
+@register_decomposition([ops.mH.default, ops.adjoint.default])
+def mH(self):
+    if self.dim() < 2:
+        raise RuntimeError(f"tensor.mH is only supported on matrices or batches of matrices. Got {self.dim()}-D tensor.")
+    transposed = self.transpose(-2, -1)
+    return transposed.conj() if self.is_complex() else transposed
+
+
+@register_decomposition(ops.log_sigmoid.default)
+def log_sigmoid(self):
+    return ops.log_sigmoid_forward.default(self)[0]
+
+
+@register_decomposition(ops.logsumexp.default)
+def logsumexp(self, dim, keepdim=False):
+    dims = list(dim) if isinstance(dim, (list, tuple)) else [dim]
+    if not (self.is_floating_point() or self.is_complex()):
+        self = self.to(tp.get_default_dtype())
+    if self.numel() == 0:
+        return tp.log(tp.sum(tp.exp(self), dims, keepdim))
+    # The largest value is taken out before exponentiating so nothing
+    # overflows; an infinite largest value is not taken out, since inf - inf
+    # is no number.
+    maxes = tp.amax(self, dims, keepdim=True)
+    maxes = tp.masked_fill(maxes, maxes.abs() == math.inf, 0)
+    total = tp.sum(tp.exp(self - maxes), dims, keepdim)
+    return tp.log(total) + maxes.reshape(tuple(total.shape))
+
+
+@register_decomposition(ops.round.decimals)
+def round_decimals(self, *, decimals=0):
+    if not self.is_floating_point():
+        return NotImplemented
+    if decimals >= 0:
+        scale = 10.0 ** decimals
+        return tp.round(self * scale) / scale
+    scale = 10.0 ** (-decimals)
+    return tp.round(self / scale) * scale
+
+
+@register_decomposition(ops.isclose.default)
+def isclose(self, other, rtol=1e-05, atol=1e-08, equal_nan=False):
+    if self.dtype != other.dtype:
+        raise RuntimeError(f"{self.dtype} did not match {other.dtype}")
+    if rtol < 0:
+        raise RuntimeError(f"rtol must be greater than or equal to zero, but got {rtol}")
+    if atol < 0:
+        raise RuntimeError(f"atol must be greater than or equal to zero, but got {atol}")
+    close = self == other
+    if equal_nan and (self.is_floating_point() or self.is_complex()):
+        close = close | (tp.isnan(self) & tp.isnan(other))
+    if atol == 0 and rtol == 0:
+        return close
+    if not (self.is_floating_point() or self.is_complex()):
+        self = self.to(tp.get_default_dtype())
+        other = other.to(tp.get_default_dtype())
+    allowed = atol + tp.abs(other * rtol)
+    actual = tp.abs(self - other)
+    return close | (tp.isfinite(actual) & (actual <= allowed))
+
+
+@register_decomposition([ops.swapaxes.default, ops.swapdims.default])
+def swapaxes(self, axis0, axis1):
+    return self.transpose(axis0, axis1)
+
+
+@register_decomposition([ops.movedim.default, ops.movedim.intlist, ops.movedim.int,
+                         ops.moveaxis.intlist, ops.moveaxis.int])
+def movedim(self, source, destination):
+    src = [source] if isinstance(source, int) else list(source)
+    dst = [destination] if isinstance(destination, int) else list(destination)
+    if len(src) != len(dst):
+        raise RuntimeError(
+            f"movedim: Invalid source or destination dims: source ({src} dims) should "
+            f"contain the same number of dims as destination ({dst} dims)"
+        )
+    ndim = self.dim()
+    if ndim == 0:
+        return self.view(())
+    src = [s % ndim for s in src]
+    dst = [d % ndim for d in dst]
+    order = [-1] * ndim
+    for s, d in zip(src, dst):
+        order[d] = s
+    rest = iter(i for i in range(ndim) if i not in src)
+    return self.permute([o if o != -1 else next(rest) for o in order])
+
+
+@register_decomposition(ops.outer.default)
+def outer(self, vec2):
+    if self.dim() != 1:
+        raise RuntimeError(f"outer: Expected 1-D argument self, but got {self.dim()}-D")
+    if vec2.dim() != 1:
+        raise RuntimeError(f"outer: Expected 1-D argument vec2, but got {vec2.dim()}-D")
+    return self.reshape(-1, 1) * vec2
+
+
+@register_decomposition(ops.atleast_1d.default)
+def atleast_1d(self):
+    return self.reshape(1) if self.dim() == 0 else self
+
+
+@register_decomposition(ops.atleast_2d.default)
+def atleast_2d(self):
+    if self.dim() == 0:
+        return self.reshape(1, 1)
+    if self.dim() == 1:
+        return self.unsqueeze(0)
+    return self
+
+
+@register_decomposition(ops.atleast_3d.default)
+def atleast_3d(self):
+    if self.dim() == 0:
+        return self.reshape(1, 1, 1)
+    if self.dim() == 1:
+        return self.unsqueeze(0).unsqueeze(-1)
+    if self.dim() == 2:
+        return self.unsqueeze(-1)
+    return self
+
+
+@register_decomposition(ops.atleast_1d.Sequence)
+def atleast_1d_sequence(tensors):
+    return [atleast_1d(t) for t in tensors]
+
+
+@register_decomposition(ops.atleast_2d.Sequence)
+def atleast_2d_sequence(tensors):
+    return [atleast_2d(t) for t in tensors]
+
+
+@register_decomposition(ops.atleast_3d.Sequence)
+def atleast_3d_sequence(tensors):
+    return [atleast_3d(t) for t in tensors]
+
+
+@register_decomposition(ops.hstack.default)
+def hstack(tensors):
+    tensors = [atleast_1d(t) for t in tensors]
+    return tp.cat(tensors, 0 if tensors[0].dim() == 1 else 1)
+
+
+@register_decomposition(ops.vstack.default)
+def vstack(tensors):
+    return tp.cat([atleast_2d(t) for t in tensors], 0)
+
+
+@register_decomposition(ops.unflatten.int)
+def unflatten(self, dim, sizes):
+    if self.dim() == 0:
+        raise RuntimeError("Cannot unflatten a 0-d tensor")
+    dim = dim % self.dim()
+    shape = list(self.shape)
+    return self.view(tuple(shape[:dim] + list(sizes) + shape[dim + 1:]))
+
+
+@register_decomposition(ops.tile.default)
+def tile(self, dims):
+    dims = list(dims)
+    if len(dims) < self.dim():
+        dims = [1] * (self.dim() - len(dims)) + dims
+    return self.repeat(dims)
+
+
+@register_decomposition(ops.diag.default)
+def diag(self, diagonal=0):
+    if self.dim() == 1:
+        return tp.diag_embed(self, diagonal)
+    if self.dim() == 2:
+        return tp.diagonal(self, diagonal).clone()
+    raise RuntimeError(f"diag(): Supports 1D or 2D tensors. Got {self.dim()}D")
+
+
+@register_decomposition(ops.kron.default)
+def kron(self, other):
+    ndim = max(self.dim(), other.dim())
+    a = self.reshape((1,) * (ndim - self.dim()) + tuple(self.shape))
+    b = other.reshape((1,) * (ndim - other.dim()) + tuple(other.shape))
+    # Each axis of the result is an axis of ``a`` with an axis of ``b`` nested
+    # inside it.
+    a_spread = a.reshape(tuple(s for size in a.shape for s in (size, 1)))
+    b_spread = b.reshape(tuple(s for size in b.shape for s in (1, size)))
+    return (a_spread * b_spread).reshape(tuple(sa * sb for sa, sb in zip(a.shape, b.shape)))
+
+
+@register_decomposition(ops.diff.default)
+def diff(self, n=1, dim=-1, prepend=None, append=None):
+    if self.dim() == 0:
+        raise RuntimeError("diff expects input to be at least one-dimensional")
+    if n < 0:
+        raise RuntimeError(f"order must be non-negative but got {n}")
+    dim = dim % self.dim()
+    parts = []
+    for extra in (prepend,):
+        if extra is not None:
+            parts.append(extra)
+    parts.append(self)
+    if append is not None:
+        parts.append(append)
+    x = tp.cat(parts, dim) if len(parts) > 1 else self
+    for _ in range(n):
+        length = int(x.shape[dim])
+        if length == 0:
+            break
+        later, earlier = x.narrow(dim, 1, length - 1), x.narrow(dim, 0, length - 1)
+        x = tp.logical_xor(later, earlier) if x.dtype == tp.bool else later - earlier
+    return x.contiguous() if x is not self else x.clone()
+
+
+@register_decomposition(ops.take_along_dim.default)
+def take_along_dim(self, indices, dim=None):
+    if dim is None:
+        return tp.gather(self.reshape(-1), 0, indices.reshape(-1))
+    if self.dim() != indices.dim():
+        raise RuntimeError(
+            "take_along_dim(): input and indices should have the same number of dimensions, "
+            f"but got {self.dim()} dimensions for input, and {indices.dim()} dimensions for indices"
+        )
+    dim = dim % self.dim()
+    shape = [1 if d == dim else max(int(a), int(b)) for d, (a, b) in enumerate(zip(self.shape, indices.shape))]
+    self_shape = list(shape)
+    self_shape[dim] = int(self.shape[dim])
+    index_shape = list(shape)
+    index_shape[dim] = int(indices.shape[dim])
+    return tp.gather(self.expand(tuple(self_shape)), dim, indices.expand(tuple(index_shape)))
+
+
+@register_decomposition(ops.nanmean.default)
+def nanmean(self, dim=None, keepdim=False, *, dtype=None):
+    if not (self.is_floating_point() or self.is_complex()):
+        raise RuntimeError(f"nanmean(): expected input to have floating point or complex dtype but got {self.dtype}")
+    dims = [] if dim is None else ([dim] if isinstance(dim, int) else list(dim))
+    values = self if dtype is None else self.to(dtype)
+    counted = tp.logical_not(tp.isnan(values))
+    total = ops.nansum.default(values, dims, keepdim)
+    count = counted.sum(dims, keepdim) if dims else counted.sum()
+    return total / count
+
+
+@register_decomposition(ops.argsort.default)
+def argsort(self, dim=-1, descending=False):
+    return tp.sort(self, dim, descending)[1]
+
+
+@register_decomposition(ops.argsort.stable)
+def argsort_stable(self, *, stable, dim=-1, descending=False):
+    return ops.sort.stable(self, stable=stable, dim=dim, descending=descending)[1]
+
+
+@register_decomposition(ops.msort.default)
+def msort(self):
+    return tp.sort(self, 0)[0]
+
+
+@register_decomposition(ops.rms_norm.default)
+def rms_norm(input, normalized_shape, weight=None, eps=None):
+    count = len(normalized_shape)
+    if count > input.dim():
+        raise RuntimeError("rms_norm: normalized_shape dim larger than input dim")
+    if tuple(input.shape[input.dim() - count:]) != tuple(normalized_shape):
+        raise RuntimeError("rms_norm: Input shape mismatch with normalized_shape")
+    # Computed in single precision for the half-precision types and stored
+    # back in the input's; an unset epsilon is that of the computation type.
+    compute = tp.float64 if input.dtype == tp.float64 else tp.float32
+    if eps is None:
+        eps = 2.220446049250313e-16 if compute == tp.float64 else 1.1920928955078125e-07
+    dims = list(range(input.dim() - count, input.dim()))
+    x = input.to(compute)
+    scaled = x * tp.rsqrt((x * x).mean(dims, keepdim=True) + eps)
+    if weight is not None:
+        scaled = scaled * weight.to(compute)
+    return scaled.to(input.dtype)
+
+
+@register_decomposition(ops.tp_l1_loss.default)
+def tp_l1_loss(input, target, reduction=1):
+    return _reduce(tp.abs(input - target), reduction)
+
+
+@register_decomposition(ops.tp_kl_div.default)
+def tp_kl_div(input, target, reduction=1, log_target=False):
+    if log_target:
+        loss = tp.exp(target) * (target - input)
+    else:
+        loss = tp.xlogy(target, target) - target * input
+    return _reduce(loss, reduction)
+
+
+@register_decomposition(ops.tp_margin_ranking_loss.default)
+def tp_margin_ranking_loss(input1, input2, target, margin=0.0, reduction=1):
+    return _reduce(tp.clamp(-target * (input1 - input2) + margin, min=0), reduction)
+
+
+@register_decomposition(ops.tp_soft_margin_loss.default)
+def tp_soft_margin_loss(input, target, reduction=1):
+    return _reduce(tp.log1p(tp.exp(-target * input)), reduction)
+
+
+@register_decomposition(ops.tp_hinge_embedding_loss.default)
+def tp_hinge_embedding_loss(input, target, margin=1.0, reduction=1):
+    zeros = tp.zeros_like(input)
+    margin_part = tp.where(target != 1, tp.clamp(margin - input, min=0), zeros)
+    self_part = tp.where(target != -1, input, zeros)
+    return _reduce(margin_part + self_part, reduction)
+
+
+@register_decomposition(ops.tp_poisson_nll_loss.default)
+def tp_poisson_nll_loss(input, target, log_input=True, full=False, eps=1e-08, reduction=1):
+    if log_input:
+        loss = tp.exp(input) - target * input
+    else:
+        loss = input - target * tp.log(input + eps)
+    if full:
+        stirling = target * tp.log(target) - target + 0.5 * tp.log(2 * math.pi * target)
+        loss = loss + tp.masked_fill(stirling, target <= 1, 0)
+    return _reduce(loss, reduction)

@@ -29,11 +29,13 @@ from tensorplay.graph.experimental.sympy_functions import OrderedSet
 from .. import ir
 from ..dependencies import Dep
 from ..scheduler import BaseSchedulerNode, SchedulerBuffer
-from ..loops import ops, V
+from ..loops import V
+from ..virtualized import ops
 from ..loop_body import LoopBody
 from ..utils import sympy_index_symbol_with_prefix, sympy_subs
 from tensorplay.graph.experimental.sympy_functions import SymT, symbol_is_type
-from ..ops_handler import OpsValue, WrapperHandler
+from ..ops_handler import WrapperHandler
+from ..virtualized import OpsValue
 from .common import CSEVariable, Kernel, KernelArgs, OptimizationContext
 
 #: The element type each dtype is written as.  A type absent from this table

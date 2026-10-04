@@ -252,32 +252,13 @@ class PythonPrinter(_PythonPrinter):
 from ..ops_handler import DefaultHandler, OpsHandler
 from ..loops import NullKernel
 from ..virtualized import V
-from ..ops_handler import DefaultHandler as _DefaultHandler
 
 
-class _PrinterOps:
-    """The operators a printer spells, taken from the handler that spells them.
-
-    A decomposition says what an operation is in terms of operations the
-    language has, and spelling those is the handler's work rather than the
-    printer's -- reaching for the graph-walking handler here instead asked
-    for a running graph, which at printing time there is not: a decomposition
-    is reached precisely when one operation is written as another, and by
-    then the graph it came from has been walked already.
-    """
-
-    def __getattr__(self, name):
-        # The mixin is asked first: it spells the operations that need no
-        # context, as a function of their operands alone, while the handler's
-        # own methods take the handler.  Both know how to spell a division, and
-        # only one of them can be called with two values.
-        spelled = getattr(BasicMathOpsMixin, name, None)
-        if spelled is not None:
-            return spelled
-        return getattr(_DefaultHandler, name)
-
-
-ops = _PrinterOps()
+# A decomposition writes one operation as others while a kernel is being
+# printed, and those others are spelled by whichever handler is current then --
+# the kernel's own, so each piece is written, named and reused like any other
+# value of the kernel.
+from ..virtualized import OpsValue, ops
 from ..utils import (
     DeferredLineBase,
     boolean_ops,
@@ -2010,6 +1991,10 @@ class CSE:
 
         if bounds is None:
             bounds = ValueRanges.unknown()
+        if isinstance(expr, OpsValue):
+            # A value spelled through the handler arrives wrapped so that it
+            # can be written with operators; what it holds is the value.
+            expr = expr.value
 
         if not (write or assignment):
             raise AssertionError("expected write or assignment to be set")
@@ -2142,6 +2127,12 @@ class CSEProxy(DefaultHandler):
         if name == "masked" and backend == "triton":
             output_dtype = getattr(value, "dtype", None)
             output_shape = getattr(value, "shape", None)
+        elif name == "masked" and backend == "cpp":
+            # The masked part is a block of the body, not a value: its type is
+            # the one the dtype pass settled for the node, and its shape is not
+            # known here.
+            opt_ctx = V.interpreter.current_node.meta.get(OptimizationContext.key, None)
+            output_dtype = getattr(opt_ctx, "dtype", None)
         elif backend in ("triton", "cpp", "mps"):
             dtype_op = getattr(dtype_handler, name, None)
             if dtype_op is not None:
@@ -2807,7 +2798,7 @@ class OverridesData:
     mps: Optional[Callable] = None
 
 
-def _bessel_at_infinity(kind: str, order: int, x: str) -> str:
+def _bessel_at_infinity(order: int, kind: str, x: str) -> str:
     """A special function written so that an infinite argument gives a not-a-number.
 
     The mathematical limit at an infinity is a number, but the eager result is
@@ -2928,13 +2919,11 @@ pointwise_overrides_data: dict = dict(
         type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
         cpp=lambda x: f"calc_i0({x})",
         triton=lambda x: _cyl_bessel_i_at_infinity(0, x),
-        cppvec=lambda x: f"{x}.i0()",
         name="i0",
     ),
     i0e=OverridesData(
         type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
         cpp=lambda x: f"calc_i0e({x})",
-        cppvec=lambda x: f"{x}.i0e()",
         name="special_i0e",
     ),
     i1=OverridesData(

@@ -308,6 +308,50 @@ def select_decomp_table() -> dict:
     return table
 
 
+#: Operations a region's trace keeps whole although the table can decompose
+#: them: a random draw is the framework's own generator's, so a compiled region
+#: draws the values the program would have drawn without it.
+_TRACE_KEEPS_RANDOM_DRAWS = frozenset({
+    "rand", "rand_like", "randn", "randn_like", "randint", "randint_like",
+    "randperm", "bernoulli", "bernoulli_", "dropout", "native_dropout",
+    "normal", "normal_", "uniform", "uniform_", "exponential", "exponential_",
+})
+
+
+def trace_decompositions() -> dict:
+    """The decompositions a region's operator-level trace is written in.
+
+    An operation with a lowering, a template or a library call of its own
+    reaches the region whole, where it is written better than its parts would
+    be.  Any other operation the table can decompose is traced as its parts,
+    which are lowered, instead of being handed to the framework as a call: the
+    region keeps its loops around it and fuses through it.
+    """
+
+    from tensorplay._decomp import decompositions_for_rng
+
+    from .graph_lowering import _TEMPLATE_OPERATORS
+    from .operator_coverage import LIBRARY_CALLS
+
+    load_lowering_modules()
+    table = select_decomp_table()
+    random_draws = set(decompositions_for_rng.rng_decompositions)
+    traced = {}
+    for op, fn in table.items():
+        name = target_name(op)
+        if (
+            op in random_draws
+            or name.split(".", 1)[0] in _TRACE_KEEPS_RANDOM_DRAWS
+            or op in user_lowerings
+            or find_lowering(name) is not None
+            or name in _TEMPLATE_OPERATORS
+            or name in LIBRARY_CALLS
+        ):
+            continue
+        traced[op] = fn
+    return traced
+
+
 def in_namespace(op: Any, namespace: str) -> bool:
     """Whether an operation belongs to a namespace.
 
@@ -346,6 +390,64 @@ def _record_symbolic_input_source(tensor, dim, expr, kind) -> None:
 
     V.graph.symbolic_input_sources.setdefault(expr, (name, kind, int(dim)))
     from .ir import InputBuffer
+
+
+def unsupported_input_tensor(t, node=None) -> bool:
+    """Whether a value cannot be read or written by a generated kernel.
+
+    A complex value has two parts per element that no kernel here addresses,
+    a meta value has no memory, and a sparse one has its elements somewhere
+    other than its positions.
+    """
+
+    return bool(t.is_complex() or t.is_meta or t.is_sparse)
+
+
+def unsupported_output_tensor(t, node=None) -> bool:
+    """Whether a value cannot be written by a generated kernel.
+
+    Reinterpreting the bits of a complex value as another type writes nothing
+    of the complex value itself, so that one is allowed.
+    """
+
+    if (
+        node is not None
+        and t.is_complex()
+        and target_name(node.target) == "view.dtype"
+    ):
+        return False
+    if unsupported_input_tensor(t, node):
+        return True
+    return t.device.type == "cpu" and config.disable_cpp_codegen
+
+
+def fallback_node_due_to_unsupported_type(node) -> bool:
+    """Whether a call reads or writes a value no generated kernel can hold.
+
+    Such a call is handed to the framework on its own; the calls around it are
+    still generated, reading and writing ordinary values in memory.
+    """
+
+    if node.op != "call_function" or node.target is operator.getitem:
+        return False
+
+    def check(item, is_output: bool) -> bool:
+        if not hasattr(item, "meta") or "val" not in item.meta:
+            return False
+        for value in tree_leaves(item.meta["val"]):
+            if not isinstance(value, tp.Tensor):
+                continue
+            if is_output:
+                if unsupported_output_tensor(value, node):
+                    return True
+            elif unsupported_input_tensor(value, node):
+                return True
+        return False
+
+    for arg in arg_tree_leaves(*node.args, **node.kwargs):
+        if check(arg, is_output=False):
+            return True
+    return check(node, is_output=True)
 
 
 def fallback_handler(kernel, add_to_fallback_set: bool = True):
@@ -1336,7 +1438,8 @@ def lower_mul(a, b):
 # A quotient is a real number whatever it was a quotient of, so whole-number
 # operands are read as real ones before they are divided.
 @register_lowering(
-    ["div.Tensor", "div.Scalar", "truediv", "truediv.Tensor", "truediv.Scalar"],
+    ["div.Tensor", "div.Scalar", "truediv", "truediv.Tensor", "truediv.Scalar",
+     "true_divide.Tensor", "true_divide.Scalar"],
     broadcast=True,
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
 )
@@ -1524,6 +1627,72 @@ LOWERINGS["isnan.default"] = _real_predicate("isnan", False)
 LOWERINGS["isinf.default"] = _real_predicate("isinf", False)
 
 
+def _overridden_pointwise(funcname, data, op_overload):
+    """An element-wise operation each target spells for itself.
+
+    The operands are promoted the way the operation says and read in that
+    type.  A target with no spelling of the operation hands the call to the
+    framework, which has one.
+    """
+
+    fn = ops_wrapper(funcname)
+
+    def lower(*args):
+        tensors = [a for a in args if isinstance(a, TensorBox)]
+        if not tensors:
+            raise NotImplementedError(f"{funcname} of numbers only")
+        device = tensors[0].get_device()
+        if (device.type == "cpu" and data.cpp is None) or (
+            device.type != "cpu" and data.triton is None
+        ):
+            return fallback_handler(op_overload, add_to_fallback_set=False)(*args)
+        from .dtype_propagation import get_promoted_dtype
+
+        dtype = get_promoted_dtype(
+            *[_promotion_input(a) for a in args], type_promotion_kind=data.type_promotion_kind
+        )
+        args = [
+            to_dtype(a, dtype) if isinstance(a, TensorBox) and a.get_dtype() != dtype else a
+            for a in args
+        ]
+        if len(tensors) > 1:
+            shaped = iter(broadcast_tensors(*[a for a in args if isinstance(a, TensorBox)]))
+            args = [next(shaped) if isinstance(a, TensorBox) else a for a in args]
+        return pointwise(
+            lambda *values: fn(*[ops.to_dtype(v, dtype) for v in values]),
+            *args,
+            val=next(a for a in args if isinstance(a, TensorBox)),
+            out_dtype=dtype,
+        )
+
+    return lower
+
+
+def _register_overridden_pointwise() -> None:
+    """The special functions, each under the operation names it is reached by:
+    its own and, where the framework names it differently, that name too."""
+
+    from .codegen.common import pointwise_overrides_data
+
+    for funcname, data in pointwise_overrides_data.items():
+        for op_name in dict.fromkeys((data.name, funcname)):
+            packet = getattr(tp_ops, op_name, None)
+            if packet is None or not callable(getattr(packet, "overloads", None)):
+                continue
+            for overload in packet.overloads():
+                key = f"{op_name}.{overload}"
+                op_overload = getattr(packet, overload)
+                schema = getattr(op_overload, "_schema", None)
+                if schema is not None and schema.is_mutable:
+                    continue
+                if key in LOWERINGS:
+                    continue
+                LOWERINGS[key] = _overridden_pointwise(funcname, data, op_overload)
+
+
+_register_overridden_pointwise()
+
+
 @register("isfinite.default")
 def lower_isfinite(x):
     if not _is_real(x.get_dtype()):
@@ -1590,24 +1759,46 @@ def _promoted_pair(a, b):
     )
 
 
-def _binary_on(op_name, *, real: bool, out_bool: bool = False, to_bool: bool = False):
+def _binary_on(
+    op_name,
+    *,
+    real: bool,
+    out_bool: bool = False,
+    to_bool: bool = False,
+    whole_op: str | None = None,
+):
     """A two-operand operation, broadcast and computed in the operands'
-    promoted type (a real one when the operation produces a real number)."""
+    promoted type (a real one when the operation produces a real number).
+
+    ``whole_op`` names the operation computed instead when that type is a
+    whole number: the floating-point form of some operations has no meaning
+    for whole numbers, and another one computes the same result for them.
+    """
 
     fn = ops_wrapper(op_name)
+    whole_fn = ops_wrapper(whole_op) if whole_op is not None else fn
 
     def lower(a, b):
         dtype = _promoted_pair(a, b)
         if real and not _is_real(dtype):
             dtype = tp.get_default_dtype()
         compute = tp.bool if to_bool else dtype
+        # The operands are brought to the type they are computed in before a
+        # number among them is made into a value, since a number is made in
+        # the type of the operand beside it: 2.5 beside a whole-number tensor
+        # would otherwise be read as 2.
+        a, b = (
+            to_dtype(x, compute) if isinstance(x, TensorBox) and x.get_dtype() != compute else x
+            for x in (a, b)
+        )
         tensors = [x for x in (a, b) if isinstance(x, TensorBox)]
         if len(tensors) == 2:
             a, b = broadcast_tensors(a, b)
         anchor = a if isinstance(a, TensorBox) else b
+        op = whole_fn if is_integer_dtype(compute) or is_boolean_dtype(compute) else fn
 
         def inner(x, y):
-            return fn(ops.to_dtype(x, compute), ops.to_dtype(y, compute))
+            return op(ops.to_dtype(x, compute), ops.to_dtype(y, compute))
 
         return pointwise(
             inner, a, b, val=anchor, out_dtype=tp.bool if out_bool else dtype
@@ -1620,7 +1811,8 @@ for _op in ("atan2", "hypot", "nextafter"):
     LOWERINGS[f"{_op}.default"] = _binary_on(_op, real=True)
 for _overload in ("Tensor", "Scalar"):
     LOWERINGS[f"copysign.{_overload}"] = _binary_on("copysign", real=True)
-    LOWERINGS[f"fmod.{_overload}"] = _binary_on("fmod", real=False)
+    # The remainder of whole numbers that truncates toward zero is ``mod``.
+    LOWERINGS[f"fmod.{_overload}"] = _binary_on("fmod", real=False, whole_op="mod")
     for _op in ("bitwise_and", "bitwise_or", "bitwise_xor"):
         LOWERINGS[f"{_op}.{_overload}"] = _binary_on(_op, real=False)
 for _op in ("bitwise_left_shift", "bitwise_right_shift"):
@@ -1659,20 +1851,29 @@ for _overload in ("Tensor", "Scalar", "Scalar_Tensor"):
 LOWERINGS["mod"] = _lower_remainder
 
 
+def _clamp_one_side(x, bound, op):
+    """``x`` held on one side of ``bound``, in the type the two promote to: a
+    fractional bound beside whole numbers is not read as a whole number."""
+
+    dtype = _promoted_pair(x, bound)
+    if x.get_dtype() != dtype:
+        x = to_dtype(x, dtype)
+    if isinstance(bound, TensorBox):
+        if bound.get_dtype() != dtype:
+            bound = to_dtype(bound, dtype)
+        x, bound = broadcast_tensors(x, bound)
+        return pointwise(op, x, bound)
+    return pointwise(lambda v: op(v, ops.constant(bound, dtype)), x)
+
+
 @register("clamp_min.default", "clamp_min.Tensor")
 def lower_clamp_min(x, min):
-    if isinstance(min, TensorBox):
-        x, min = broadcast_tensors(x, min)
-        return pointwise(ops.maximum, x, min)
-    return pointwise(lambda v: ops.maximum(v, ops.constant(min, x.get_dtype())), x)
+    return _clamp_one_side(x, min, ops.maximum)
 
 
 @register("clamp_max.default", "clamp_max.Tensor")
 def lower_clamp_max(x, max):
-    if isinstance(max, TensorBox):
-        x, max = broadcast_tensors(x, max)
-        return pointwise(ops.minimum, x, max)
-    return pointwise(lambda v: ops.minimum(v, ops.constant(max, x.get_dtype())), x)
+    return _clamp_one_side(x, max, ops.minimum)
 
 
 @register("lerp.Scalar", "lerp.Tensor", "lerp.default")
@@ -1975,13 +2176,11 @@ def lower_clamp(x, min=None, max=None):
     upper one, and saying which is which is the whole of what clamping is.
     """
 
-    if min is None and max is None:
-        return x
-    if min is None:
-        return pointwise(lambda v: ops.minimum(v, max), x)
-    if max is None:
-        return pointwise(lambda v: ops.maximum(v, min), x)
-    return pointwise(lambda v: ops.maximum(min, ops.minimum(max, v)), x)
+    if min is not None:
+        x = lower_clamp_min(x, min)
+    if max is not None:
+        x = lower_clamp_max(x, max)
+    return x
 
 
 @register("silu.default", "silu", "swish.default", "swish")
@@ -2225,25 +2424,9 @@ def reshape(x: TensorBox, new_size) -> TensorBox:
     if old_size == new_size:
         return x
     node = _underlying(x)
-    if isinstance(node, Buffer) and node.layout.is_contiguous():
-        # The view reads the buffer as consecutive elements, so the buffer is
-        # held to that arrangement: a layout left open could be settled
-        # differently later, and the view would then read the wrong elements.
-        node.freeze_layout()
-        settled = node.layout
-        return TensorBox(
-            ReinterpretView(
-                data=node,
-                layout=FixedLayout(
-                    settled.device,
-                    settled.dtype,
-                    new_size,
-                    contiguous_strides(new_size),
-                    settled.offset,
-                    settled.is_pinned,
-                ),
-            )
-        )
+    viewed = _reinterpret_consecutive(node, new_size)
+    if viewed is not None:
+        return viewed
     if isinstance(node, (Pointwise, Reduction)) and isinstance(x.data, StorageBox):
         # A loop that has not been materialized has no storage to view, so it
         # is realized first; the resulting buffer is contiguous and the new
@@ -2254,23 +2437,42 @@ def reshape(x: TensorBox, new_size) -> TensorBox:
         if not _is_lone_cast(node):
             x.data.realize()
             node = _underlying(x)
-            if isinstance(node, Buffer) and node.layout.is_contiguous():
-                node.freeze_layout()
-                settled = node.layout
-                return TensorBox(
-                    ReinterpretView(
-                        data=node,
-                        layout=FixedLayout(
-                            settled.device,
-                            settled.dtype,
-                            new_size,
-                            contiguous_strides(new_size),
-                            settled.offset,
-                            settled.is_pinned,
-                        ),
-                    )
-                )
+            viewed = _reinterpret_consecutive(node, new_size)
+            if viewed is not None:
+                return viewed
     return TensorBox(View.create(_underlying(x), new_size))
+
+
+def _reinterpret_consecutive(node, new_size):
+    """A buffer laid out as consecutive elements, read under a new shape.
+
+    The view reads the buffer as consecutive elements, so the buffer is held to
+    that arrangement first: a layout left open could be settled differently
+    later, and the view would then read the wrong elements.  Settling it is
+    also where rows may be padded apart, so whether the elements are still
+    consecutive is asked of the settled layout, not of the open one; a padded
+    buffer is read through the view's own index arithmetic instead.
+    """
+
+    if not isinstance(node, Buffer) or not node.layout.is_contiguous():
+        return None
+    node.freeze_layout()
+    settled = node.layout
+    if not settled.is_contiguous():
+        return None
+    return TensorBox(
+        ReinterpretView(
+            data=node,
+            layout=FixedLayout(
+                settled.device,
+                settled.dtype,
+                new_size,
+                contiguous_strides(new_size),
+                settled.offset,
+                settled.is_pinned,
+            ),
+        )
+    )
 
 
 def _resolve_size(size, numel):
@@ -2722,6 +2924,17 @@ def make_reduction(x: TensorBox, dims, keepdim, dtype, device, rtype="sum", prol
     out_ranges = [size[d] for d in range(rank) if d not in dims]
     red_ranges = [size[d] for d in dims]
     loader = x.make_loader()
+    # A total or a product asked for in another type is accumulated in that
+    # type: counting truths is a sum of whole numbers, not of truths, and a
+    # sum of truths stays a truth however many there are.
+    convert = (
+        rtype in ("sum", "prod")
+        and dtype is not None
+        and dtype != src_dtype
+        and prologue is None
+    )
+    if convert:
+        src_dtype = dtype
 
     def inner(index, rindex):
         it = iter(index)
@@ -2730,6 +2943,8 @@ def make_reduction(x: TensorBox, dims, keepdim, dtype, device, rtype="sum", prol
         value = loader(full)
         if prologue is not None:
             value = prologue(value, full)
+        if convert:
+            value = ops.to_dtype(value, dtype)
         return value
 
     box = Reduction.create(
@@ -2958,11 +3173,69 @@ def lower_amax(x, dim=None, keepdim=False, dtype=None, **kwargs):
 
 @register("amin.default")
 def lower_amin(x, dim=None, keepdim=False, dtype=None, **kwargs):
-    if dim is None:
+    if dim is None or (isinstance(dim, (list, tuple)) and len(dim) == 0):
         dim = list(range(len(x.get_size())))
     elif isinstance(dim, (int, sympy.Integer)):
         dim = [dim]
     return make_reduction(x, dim, keepdim, _resolve_dtype(dtype, x.get_dtype()), x.get_device(), "min")
+
+
+@register("prod.default", "prod.dim_int", "prod.dim_IntList")
+def lower_prod(x, dim=None, keepdim=False, dtype=None, **kwargs):
+    """The product along the axes; a product of whole numbers widens unless
+    another type is asked for, as a total does."""
+
+    if dim is None or (isinstance(dim, (list, tuple)) and len(dim) == 0):
+        dim = list(range(len(x.get_size())))
+    elif isinstance(dim, (int, sympy.Integer)):
+        dim = [dim]
+    dtype = _resolve_dtype(dtype, None)
+    if dtype is None:
+        whole = is_integer_dtype(x.get_dtype()) or is_boolean_dtype(x.get_dtype())
+        dtype = tp.int64 if whole else x.get_dtype()
+    return make_reduction(x, dim, keepdim, dtype, x.get_device(), "prod")
+
+
+@register("mean.default")
+def lower_mean_all(x, dtype=None, **kwargs):
+    """The mean of every element: the mean over all the axes."""
+
+    return lower_mean(x, None, False, dtype)
+
+
+@register("max.dim")
+def lower_max_dim(x, dim, keepdim=False):
+    """The largest value along an axis, and where it is."""
+
+    return lower_amax(x, [dim], keepdim), reduce_argmax(x, dim, keepdim)
+
+
+@register("min.dim")
+def lower_min_dim(x, dim, keepdim=False):
+    """The smallest value along an axis, and where it is."""
+
+    return lower_amin(x, [dim], keepdim), reduce_argmin(x, dim, keepdim)
+
+
+@register("min.default")
+def lower_min_all(x):
+    """The smallest of every element."""
+
+    return lower_amin(x, None, False)
+
+
+@register("any.default", "any.dim", "any.dims")
+def lower_any(x, dim=None, keepdim=False):
+    """Whether any element along the axes is true: a reduction by ``or`` of
+    the elements read as truth values."""
+
+    if dim is None or (isinstance(dim, (list, tuple)) and len(dim) == 0):
+        dim = list(range(len(x.get_size())))
+    elif isinstance(dim, (int, sympy.Integer)):
+        dim = [dim]
+    if x.get_dtype() != tp.bool:
+        x = to_dtype(x, tp.bool)
+    return make_reduction(x, dim, keepdim, tp.bool, x.get_device(), "any")
 
 
 # ---------------------------------------------------------------------------
@@ -4382,7 +4655,7 @@ def lower_index_add(base, dim, index_box, addend, alpha=None, **kwargs):
     lock, because each destination is written by exactly one loop iteration.
     """
 
-    dim = normalize_dim(int(dim), base.get_rank())
+    dim = normalize_dim(int(dim), len(base.get_size()))
     _, dtype, device = val_info(node_val())
     out_size = [int(s) for s in base.get_size()]
     addend_size = [int(s) for s in addend.get_size()]
@@ -4681,9 +4954,6 @@ register_pointwise(
     "clamp_min",
     "clamp_max",
     "where",
-    "logical_and",
-    "logical_or",
-    "logical_xor",
     "remainder",
     "fmod",
     "aten_add",
@@ -4716,7 +4986,6 @@ register_pointwise(
     "sin",
     "tan",
     "sign",
-    "signbit",
     "abs",
     "neg",
     "square",
@@ -4724,14 +4993,11 @@ register_pointwise(
     "floor",
     "round",
     "trunc",
-    "isnan",
-    "isinf",
     "nan_to_num",
     "nextafter",
     "hypot",
     "copysign",
     "ldexp",
-    "logical_not",
     "sigmoid_backward",
     "relu",
     "lu",
@@ -4766,6 +5032,14 @@ register_op_dtype_propagation_rules(
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
     override_return_dtype=None,
 )
+# The predicates and the logical operations answer with a truth value
+# whatever they were asked about.
+for _name in ("isnan", "isinf", "signbit", "logical_not", "logical_and", "logical_or", "logical_xor"):
+    register_op_dtype_propagation_rules(
+        _name,
+        type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.ALWAYS_BOOL,
+        override_return_dtype=tp.bool,
+    )
 # The operations that produce no value, and so have no result type at all.
 for _name in ("output", "placeholder", "device_assert_async", "check_bounds"):
     register_op_dtype_propagation_rules(
@@ -5649,8 +5923,8 @@ def logcumsumexp(x: Any, dim: Any, dtype: Any = None) -> Any:
         (b,) = b_tuple
         min_v = ops.minimum(a, b)
         max_v = ops.maximum(a, b)
-        mask = (min_v != max_v) | (~ops.isinf(min_v))
-        return (ops.where(mask, ops.log1p(ops.exp(min_v - max_v)) + max_v, a),)
+        mask = ops.logical_or(ops.ne(min_v, max_v), ops.logical_not(ops.isinf(min_v)))
+        return (ops.where(mask, ops.add(ops.log1p(ops.exp(ops.sub(min_v, max_v))), max_v), a),)
 
     dtype = x.get_dtype()
     if len(x.get_size()) == 0:
@@ -6215,7 +6489,8 @@ def lower_eye(n, m=None, *, dtype=None, layout=None, device=None, pin_memory=Non
     """Ones where the row is the column, zeros elsewhere: computed by every
     reader from its position, never written down."""
 
-    m = n if m is None else m
+    # The contract spells "as many columns as rows" as a negative count.
+    m = n if m is None or (isinstance(m, int) and m < 0) else m
     if not isinstance(dtype, tp.dtype) or dtype == tp.undefined:
         dtype = tp.get_default_dtype()
 
@@ -7327,16 +7602,45 @@ def arange_start_step(
     differently, and which one was asked for has to have been said.
     """
 
-    if dtype is None:
-        raise AssertionError("expected: dtype is not None")
-    length = ceildiv(sympy.sympify(end) - sympy.sympify(start), sympy.sympify(step))
-    return iota(
-        length,
-        start=start,
-        step=step,
+    if dtype is None or dtype == tp.undefined:
+        # Unsaid, the numbers say it: whole numbers count in the wide whole
+        # type, and any real one among them makes the range real.
+        dtype = (
+            tp.get_default_dtype()
+            if any(isinstance(v, float) for v in (start, end, step))
+            else tp.int64
+        )
+    device = device if device is not None else "cpu"
+    numbers = all(isinstance(v, (int, float)) for v in (start, end, step))
+    if numbers:
+        # Counted as the numbers are: a real step is not something an index
+        # expression can divide by.
+        length = max(0, math.ceil((end - start) / step))
+    else:
+        length = ceildiv(sympy.sympify(end) - sympy.sympify(start), sympy.sympify(step))
+    if not any(isinstance(v, float) for v in (start, end, step)):
+        return iota(
+            length, start=start, step=step, dtype=dtype, device=device,
+            requires_grad=requires_grad,
+        )
+    # A real range is the position counted in whole numbers and then scaled:
+    # ``start + step * i`` in double precision and rounded once to the range's
+    # type, which is how each value is computed when the range is made eagerly.
+    real_dtype = tp.float64
+
+    def fn(index: Any) -> Any:
+        position = ops.to_dtype(ops.index_expr(index[0], tp.int64), real_dtype)
+        value = ops.add(
+            ops.constant(start, real_dtype),
+            ops.mul(ops.constant(step, real_dtype), position),
+        )
+        return ops.to_dtype(value, dtype)
+
+    return Pointwise.create(
+        device=decode_device(device),
         dtype=dtype,
-        device=device if device is not None else "cpu",
-        requires_grad=requires_grad,
+        inner_fn=fn,
+        ranges=[length],
     )
 
 
@@ -7397,7 +7701,9 @@ def arange_start(
 
 @register_lowering(tp_ops.arange.default, type_promotion_kind=None)
 def arange_default(
+    start: Any,
     end: Any,
+    step: Any = 1,
     *,
     dtype: Any = None,
     layout: Any = None,
@@ -7405,16 +7711,12 @@ def arange_default(
     pin_memory: Any = None,
     requires_grad: Any = False,
 ) -> Any:
-    """One number: the number asked for.
-
-    A range of one is the number itself, and treating it as a range rather than
-    as a value would make it a tensor where a number was asked for.
-    """
+    """The numbers from here to there, by so much: the contract's general form."""
 
     return arange_start_step(
-        0,
+        start,
         end,
-        1,
+        step,
         dtype=dtype,
         layout=layout,
         device=device,
@@ -7423,14 +7725,6 @@ def arange_default(
     )
 
 
-#: Padding with a value, where how much is added to each side is named from the
-#: last axis backwards.  Which positions the value ends up at is arithmetic on
-#: the shape rather than a walk, but the shape it is arithmetic on is the one
-#: the framework is better placed to work out -- and the answer is a value with
-#: room around it, which the framework already knows how to produce.
-_constant_pad = getattr(tp_ops, "constant_pad_nd", None)
-if _constant_pad is not None:
-    make_fallback(_constant_pad, warn=False)
 
 
 #: Operations whose answer is a property of the framework's own state or of a
@@ -7469,12 +7763,10 @@ for _name in (
     "_scaled_dot_product_flash_attention",
     "mm",
     "addmm",
-    "prod",
     "scatter_reduce_",
     "_foreach_addcdiv_",
     "_foreach_addcmul_",
     "bucketize",
-    "embedding",
     "avg_pool1d",
 ):
     _op = getattr(tp_ops, _name, None)
@@ -7747,9 +8039,18 @@ def index_tensor(x: Any, indices: Any) -> Any:
     checked index refuses to read past the end of an axis, and an unchecked one
     does not, and which of the two is wanted is a property of where the index
     came from rather than of what an index is.
+
+    A mask of truths selects as many elements as it holds truths, which is a
+    size the data decides; that call is handed to the framework whole.
     """
 
-    return index_impl(x, indices, check=True)
+    try:
+        return index_impl(x, indices, check=True)
+    except NotImplementedError:
+        x.realize()
+        return fallback_handler(tp_ops.index.Tensor, add_to_fallback_set=False)(
+            x, indices
+        )
 
 
 def _promotion_input(value: Any) -> tuple:
@@ -7757,10 +8058,21 @@ def _promotion_input(value: Any) -> tuple:
 
     A number promotes differently from a value of one dimension, so the two
     facts travel together rather than being read apart at each lattice step.
+    A plain number contributes its kind -- a truth, a whole number, a real
+    one -- and never a width: a whole number beside a 32-bit tensor stays a
+    32-bit whole number, and only a real number turns a whole tensor real.
     """
 
-    if isinstance(value, (ir.Constant, int, float)):
-        return (value.get_dtype() if isinstance(value, ir.Constant) else None, True)
+    if isinstance(value, ir.Constant):
+        return (value.get_dtype(), True)
+    if isinstance(value, bool):
+        return (tp.bool, True)
+    if isinstance(value, int):
+        return (tp.int64, True)
+    if isinstance(value, float):
+        return (tp.get_default_dtype(), True)
+    if isinstance(value, complex):
+        return (tp.complex64, True)
     return (value.get_dtype(), len(value.get_size()) == 0)
 
 
@@ -7838,10 +8150,249 @@ def lower_max(x, dim=None, keepdim=False):
 
     if dim is not None:
         return (
-            lower_amax(x, dims=dim, keepdim=keepdim),
+            lower_amax(x, [dim], keepdim=keepdim),
             reduce_argmax(x, dim, keepdim),
         )
-    return lower_amax(x, dims=None, keepdim=keepdim)
+    return lower_amax(x, None, keepdim=keepdim)
+
+
+# ---------------------------------------------------------------------------
+# Copies, gathers, reversals, repetitions and padding: each element of the
+# result is one element of the input, found by arithmetic on its position, so
+# each is a loop that reads where the arithmetic says.
+# ---------------------------------------------------------------------------
+
+
+@register("copy.default")
+def lower_copy(self, src, non_blocking=False):
+    """``src`` written in ``self``'s place: on its device, in its type and
+    broadcast to its shape."""
+
+    x = src
+    if not isinstance(x, ir.IRNode):
+        x = _full(x, self.get_device(), self.get_dtype(), list(self.get_size()))
+    if x.get_device() != self.get_device():
+        x = to_device(x, self.get_device())
+    if x.get_dtype() != self.get_dtype():
+        x = to_dtype(x, self.get_dtype())
+    if list(x.get_size()) != list(self.get_size()):
+        x = lower_expand(x, list(self.get_size()))
+    return clone(x)
+
+
+@register("gather.default")
+def lower_gather(x, dim, index, sparse_grad=False):
+    """Each element read from ``x`` at the position ``index`` holds along
+    ``dim``, the others in place."""
+
+    if V.graph.sizevars.statically_known_equals(prod(index.get_size()), 0):
+        return new_empty(x, index.get_size())
+    size = list(x.get_size())
+    scalar = len(size) == 0
+    dim = _validate_dim(x, dim, 1 if scalar else 0)
+    if scalar:
+        x = lower_expand(x, [1])
+        size = [1]
+    x_loader = x.make_loader()
+    index_loader = index.make_loader()
+
+    def fn(idx):
+        idx = list(idx)
+        gathered = ops.indirect_indexing(index_loader(idx), size[dim])
+        if len(idx) == 0:
+            idx = [gathered]
+        else:
+            idx[dim] = gathered
+        return x_loader(idx)
+
+    return Pointwise.create(
+        device=x.get_device(), dtype=x.get_dtype(), inner_fn=fn, ranges=list(index.get_size())
+    )
+
+
+@register("diagonal.default")
+def lower_diagonal(x, offset=0, dim1=0, dim2=1):
+    """The elements whose positions along two axes differ by ``offset``,
+    along a new last axis: a view of ``x``."""
+
+    shape = list(x.get_size())
+    rank = len(shape)
+    dim1, dim2 = normalize_dim(dim1, rank), normalize_dim(dim2, rank)
+    if dim1 == dim2:
+        raise RuntimeError(f"diagonal dimensions cannot be identical {dim1}, {dim2}")
+    sizevars = V.graph.sizevars
+    if offset < 0:
+        diag = sizevars.evaluate_max(sizevars.evaluate_min(shape[dim1] + offset, shape[dim2]), 0)
+        base = (-offset, 0)
+    else:
+        diag = sizevars.evaluate_max(sizevars.evaluate_min(shape[dim1], shape[dim2] - offset), 0)
+        base = (0, offset)
+    sizes = [s for d, s in enumerate(shape) if d not in (dim1, dim2)] + [diag]
+
+    def reindex(idx):
+        position = idx[-1]
+        rest = iter(idx[:-1])
+        out = []
+        for d in range(rank):
+            if d == dim1:
+                out.append(position + base[0])
+            elif d == dim2:
+                out.append(position + base[1])
+            else:
+                out.append(next(rest))
+        return out
+
+    return TensorBox(ir.GenericView.create(_underlying(x), sizes, reindex))
+
+
+@register("flip.default")
+def lower_flip(x, dims=()):
+    """The elements in reverse order along each of ``dims``."""
+
+    size = list(x.get_size())
+    rank = len(size)
+    flipped = {normalize_dim(d, rank) for d in dims}
+    loader = x.make_loader()
+
+    def fn(idx):
+        idx = list(idx)
+        for d in flipped:
+            idx[d] = size[d] - 1 - idx[d]
+        return loader(idx)
+
+    return Pointwise.create(device=x.get_device(), dtype=x.get_dtype(), inner_fn=fn, ranges=size)
+
+
+@register("repeat.default")
+def lower_repeat(x, repeats):
+    """``x`` laid end to end ``repeats[d]`` times along each axis ``d``; extra
+    leading repeats add leading axes."""
+
+    old_size = list(x.get_size())
+    if len(repeats) > len(old_size):
+        old_size = [sympy.S.One] * (len(repeats) - len(old_size)) + old_size
+        x = view(x, list(old_size))
+    new_size = [s * r for s, r in zip(old_size, repeats)]
+    if any(r == 0 for r in repeats):
+        return new_empty(x, new_size)
+    if all(r == 1 or s == 1 for r, s in zip(repeats, old_size)):
+        return clone(lower_expand(x, new_size))
+    loader = x.make_loader()
+
+    def fn(idx):
+        idx = list(idx)
+        for d, r in enumerate(repeats):
+            if r != 1:
+                idx[d] = sympy.S.Zero if old_size[d] == 1 else ModularIndexing(idx[d], 1, old_size[d])
+        return loader(idx)
+
+    return Pointwise.create(device=x.get_device(), dtype=x.get_dtype(), inner_fn=fn, ranges=new_size)
+
+
+def _range_mask_low(i, low):
+    return ops.ge(ops.index_expr(i, tp.int64), ops.index_expr(sympy.Integer(low), tp.int64))
+
+
+def _range_mask_high(i, high):
+    return ops.lt(ops.index_expr(i, tp.int64), ops.index_expr(high, tp.int64))
+
+
+def _python_value_of(value, dtype):
+    """A number as the kind of number ``dtype`` holds."""
+
+    if dtype == tp.bool:
+        return bool(value)
+    if is_integer_dtype(dtype):
+        return int(value)
+    return float(value)
+
+
+@register("constant_pad_nd.default")
+def lower_constant_pad_nd(x, pad, value=0):
+    """``x`` with ``value`` added around it; ``pad`` names the amount before
+    and after each axis from the last backwards, and a negative amount cuts."""
+
+    if len(pad) % 2:
+        raise RuntimeError("Length of pad must be even")
+    if all(p == 0 for p in pad):
+        return clone(x)
+    sizes = list(x.get_size())
+    bounds = list(reversed(list(zip(pad[::2], pad[1::2]))))
+    n = len(sizes) - len(bounds)
+    output_size = list(sizes[:n])
+    mask_sizes = []
+    for (low, high), size in zip(bounds, sizes[n:]):
+        mask_sizes.append(size)
+        output_size.append(sympy.expand(size + low + high))
+    fill = _python_value_of(value, x.get_dtype())
+    loader = x.make_loader()
+
+    def fn(index):
+        shifted = list(index[:n])
+        for idx, (low, _high) in zip(index[n:], bounds):
+            shifted.append(idx - low)
+        conds = []
+        for idx, (low, high), length in zip(shifted[n:], bounds, mask_sizes):
+            if low != 0:
+                conds.append(_range_mask_low(idx, 0))
+            if high != 0:
+                conds.append(_range_mask_high(idx, length))
+        cond = functools.reduce(ops.and_, conds)
+        return ops.masked(cond, lambda: loader(shifted), fill)
+
+    return Pointwise.create(device=x.get_device(), dtype=x.get_dtype(), inner_fn=fn, ranges=output_size)
+
+
+@register("embedding.default")
+def lower_embedding(weight, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False):
+    """The rows of ``weight`` that ``indices`` name, one per index."""
+
+    if sparse:
+        return fallback_handler(tp_ops.embedding.default, add_to_fallback_set=False)(
+            weight, indices, padding_idx, scale_grad_by_freq, sparse
+        )
+    weight_loader = weight.make_loader()
+    indices_loader = indices.make_loader()
+    indices_ndim = len(indices.get_size())
+    weight_size = list(weight.get_size())
+    new_size = [*indices.get_size(), *weight_size[1:]]
+
+    def fn(idx):
+        row = ops.indirect_indexing(indices_loader(idx[:indices_ndim]), weight_size[0])
+        return weight_loader([row, *idx[indices_ndim:]])
+
+    return Pointwise.create(
+        device=weight.get_device(), dtype=weight.get_dtype(), inner_fn=fn, ranges=new_size
+    )
+
+
+def _nan_ignoring(op_name):
+    """The larger or smaller of two values, a missing value (NaN) losing to
+    any number."""
+
+    op = ops_wrapper(op_name)
+
+    def lower(a, b):
+        dtype = _promoted_pair(a, b)
+        a, b = (to_dtype(t, dtype) if isinstance(t, TensorBox) and t.get_dtype() != dtype else t for t in (a, b))
+        if isinstance(a, TensorBox) and isinstance(b, TensorBox):
+            a, b = broadcast_tensors(a, b)
+        anchor = a if isinstance(a, TensorBox) else b
+
+        def fn(x, y):
+            x, y = ops.to_dtype(x, dtype), ops.to_dtype(y, dtype)
+            chosen = op(x, y)
+            if not _is_real(dtype) or not dtype.is_floating_point:
+                return chosen
+            return ops.where(ops.isnan(x), y, ops.where(ops.isnan(y), x, chosen))
+
+        return pointwise(fn, a, b, val=anchor, out_dtype=dtype)
+
+    return lower
+
+
+LOWERINGS["fmax.default"] = _nan_ignoring("maximum")
+LOWERINGS["fmin.default"] = _nan_ignoring("minimum")
 
 
 def convert_symint_to_expr(val: Any) -> Any:
@@ -7922,7 +8473,7 @@ def load_lowering_modules() -> None:
 
     Such a lowering registers by being imported, and its module imports this
     one -- along with the template helpers, which import this one too -- so it
-    cannot be imported from here while this module is still being read.  It is
+    cannot be loaded from here while this module is still being read.  It is
     asked for by whatever is about to lower a region instead; without that
     nothing would ever load it, and its operations would be handed to the
     framework whole.

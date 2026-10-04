@@ -88,6 +88,7 @@ from .loops import (
     set_ops_handler,
 )
 from .op_lowerings import (
+    fallback_node_due_to_unsupported_type,
     find_lowering,
     load_lowering_modules,
     target_name,
@@ -120,6 +121,19 @@ _TEMPLATE_OPERATORS = {
     "addmv.default": "gemm",
 }
 _LINEAR_OPERATOR = "linear.default"
+
+
+def _device_type_of(x):
+    """The type of device a value, a node or a device is on, or None."""
+
+    get_device = getattr(x, "get_device", None)
+    if get_device is not None:
+        return _device_type_of(get_device())
+    if isinstance(x, tp.device):
+        return x.type
+    if isinstance(x, str):
+        return x
+    return None
 
 
 class _IndexCapture:
@@ -578,6 +592,10 @@ class GraphLowering(Interpreter):
         self.buffers: list[Any] = []
         self.operations: list[Any] = []
         self.graph_inputs: dict = {}
+        #: Where in its storage each tensor input starts.  The pointer a region
+        #: is handed already points there, so an offset a call names from the
+        #: start of the storage has this taken off.
+        self.graph_input_storage_offsets: dict[str, Any] = {}
         self.constants: dict[str, Any] = {}
         self._embedded_tensor_constants: dict[int, TensorBox] = {}
         #: What each constant is, described without reading it -- so that two
@@ -677,7 +695,6 @@ class GraphLowering(Interpreter):
         # Calls that were run through to rather than written out, and the
         # features this backend can be asked whether it has.
         self.fallback_ops: list = []
-        self.backend_features: set = set()
         # The pieces of this region that are compiled on their own.
         # Whether values made only of constants are made by running the
         # operations rather than while the code is being written.
@@ -1152,7 +1169,11 @@ class GraphLowering(Interpreter):
         refers to.
         """
 
-        return [buf.get_name() for buf in self.graph_outputs]
+        return [
+            buf.get_name()
+            for buf in self.graph_outputs
+            if not isinstance(buf, (ir.NoneAsConstantBuffer, ShapeAsConstantBuffer))
+        ]
 
     def has_feature(self, device, feature) -> bool:
         """Whether this backend can do a particular thing on a device.
@@ -1168,7 +1189,16 @@ class GraphLowering(Interpreter):
             raise AssertionError(
                 f"Expected BackendFeature, got {type(feature)}"
             )
-        return feature in self.backend_features
+        return feature in self._backend_features_of(_device_type_of(device))
+
+    @functools.cached_property
+    def _backend_features_of(self):
+        """What the emitter of each device type can express, asked of it once
+        per region."""
+
+        from .codegen.common import get_backend_features
+
+        return functools.lru_cache(None)(get_backend_features)
 
     def warn_fallback(self, kernel_name: str) -> None:
         """Note that a call is being run through to rather than written out.
@@ -1669,7 +1699,10 @@ class GraphLowering(Interpreter):
                 return sum(count_tensors(v) for v in item)
             return 0
 
-        single_output = count_tensors(val) == 1
+        # Only a call that returns a bare tensor returns its result as it is; a
+        # lone tensor inside a returned tuple or list is an element of what
+        # the call returns, and is taken out of it like any other.
+        single_output = _is_tensor(val) and count_tensors(val) == 1
 
         def wrap(item, path):
             if _is_absent_tensor(item):
@@ -1827,6 +1860,10 @@ class GraphLowering(Interpreter):
                 result = self.call_function(n.target, args, kwargs)
             else:
                 result = super().run_node(n)
+        # A value not yet in memory reads its operands whenever it is finally
+        # written, so a later write over one of them has to put it in memory
+        # first; that write can only find it if its reads are on record.
+        self.register_users_of(result)
         self.env[n] = result
         return result
 
@@ -2067,6 +2104,7 @@ class GraphLowering(Interpreter):
         self.name_to_buffer[buffer.name] = buffer
         self.buffers.append(buffer)
         self.graph_inputs[name] = tensor
+        self.graph_input_storage_offsets[name] = sympy.Integer(example.storage_offset())
         self.graph_inputs_original[name] = buffer
         self.graph_input_names.append(name)
         return tensor
@@ -2213,6 +2251,10 @@ class GraphLowering(Interpreter):
             or user_lowerings.get(target)
             or find_lowering(name)
         )
+        if lowering is not None and fallback_node_due_to_unsupported_type(node):
+            # A value no kernel here can hold is read or written by this call,
+            # so the framework runs the call and the region keeps the rest.
+            lowering = None
         with self.set_current_node(node), set_current_node(node):
             if lowering is not None:
                 result = lowering(*args, **kwargs)
@@ -2251,11 +2293,68 @@ class GraphLowering(Interpreter):
                 raise AssertionError(
                     f"Unexpected output types: {[type(value)]}, full result: {value}"
                 )
+            if value is None:
+                # A result the program returns as nothing: written out as
+                # nothing, and named by nothing.
+                self.graph_outputs.append(ir.NoneAsConstantBuffer())
+                continue
             self.graph_outputs.append(
                 self.realize_input(value) if isinstance(value, IRNode) else value
             )
+        self._separate_aliased_outputs()
         self.single_output = len(self.graph_outputs) == 1
         self.finalize()
+
+    @staticmethod
+    def _traced_storage(node):
+        """Which memory the traced program's value for a node lived in."""
+
+        val = node.meta.get("val") if hasattr(node, "meta") else None
+        if not _is_tensor(val) or not val.defined():
+            return None
+        try:
+            return val.untyped_storage().data_ptr()
+        except (RuntimeError, AttributeError):
+            return None
+
+    def _separate_aliased_outputs(self) -> None:
+        """Give an output memory of its own where the program gave it some.
+
+        Inside the region a copy that changes nothing may be the value it
+        copies, since nothing writes to either.  An output leaves the region,
+        though, and a caller may write to it: if it came back as one of the
+        region's inputs, or as the same memory as another output, the write
+        would reach the other one too.  So an output whose memory is an input's
+        or an earlier output's is copied -- unless the traced program itself
+        returned that memory, in which case sharing it is what was asked for.
+        """
+
+        fx_outputs = self.current_node.args[0] if self.current_node is not None else ()
+        if not isinstance(fx_outputs, (tuple, list)):
+            fx_outputs = (fx_outputs,)
+        if len(fx_outputs) != len(self.graph_outputs):
+            return
+        placeholder_storage = {}
+        for node in self.module.graph.nodes:
+            if node.op == "placeholder":
+                placeholder_storage[self.qualify_name(node.target)] = self._traced_storage(node)
+        claimed: dict = {}
+        for position, (out, fx_node) in enumerate(zip(self.graph_outputs, fx_outputs)):
+            if not isinstance(out, (Buffer, ReinterpretView)):
+                continue
+            storage = out.data.get_name() if isinstance(out, ReinterpretView) else out.get_name()
+            traced = self._traced_storage(fx_node)
+            if storage in placeholder_storage:
+                shared = traced is not None and traced == placeholder_storage[storage]
+            elif storage in claimed:
+                shared = traced is not None and traced == claimed[storage]
+            else:
+                claimed[storage] = traced
+                continue
+            if shared:
+                continue
+            copied = IrExternKernel.copy_input(out)
+            self.graph_outputs[position] = self.realize_input(copied)
 
 
     def _update_scheduler(self) -> None:

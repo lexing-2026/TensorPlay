@@ -6,7 +6,9 @@ tables, codegen templates) reliable:
 - commutative binaries carry their scalar constant on the right
   (``2 * x`` -> ``x * 2``), so identity/constant patterns only need one side;
 - algebraic identities are folded away: ``x + 0``, ``x - 0``, ``x * 1``,
-  ``x / 1``, ``x ** 1``, ``neg(neg(x))`` -> ``x``;
+  ``x / 1``, ``x ** 1``, ``neg(neg(x))`` -> ``x``, where the folded value is
+  known to keep its type and shape and a returned value is not folded onto an
+  input;
 - augmented assignments whose mutation cannot be observed (the mutated
   operand has no other use in the graph) rewrite to the out-of-place op.
 
@@ -82,6 +84,40 @@ def _is_node_like(value: Any) -> bool:
     return hasattr(value, "meta") and hasattr(value, "erase_node")
 
 
+def _traced_value(item: Any) -> Any:
+    meta = getattr(item, "meta", None) or {}
+    return meta.get("val")
+
+
+def _folds_without_change(graph, node, replacement) -> bool:
+    """Whether ``node`` may be replaced by ``replacement`` as the same value.
+
+    An identity keeps the value only when it also keeps the type and the
+    shape: ``x + 0.0`` on whole numbers is real, ``x + 0`` on truths is a whole
+    number, and a broadcast widens.  Both values have to be known to say so.
+    A value the region returns is also not folded onto an input: the caller
+    would get the input back where the program made new memory, and a write to
+    one would reach the other.
+    """
+
+    mine, theirs = _traced_value(node), _traced_value(replacement)
+    if mine is None or theirs is None:
+        return False
+    if getattr(mine, "dtype", None) != getattr(theirs, "dtype", None):
+        return False
+    if tuple(getattr(mine, "shape", ())) != tuple(getattr(theirs, "shape", ())):
+        return False
+    if getattr(replacement, "op", None) == "placeholder":
+        returned = any(
+            node is arg or (isinstance(arg, (tuple, list)) and any(node is a for a in arg))
+            for out in graph.outputs
+            for arg in out.args
+        )
+        if returned:
+            return False
+    return True
+
+
 def _replace_node_everywhere(graph, node, replacement) -> None:
     """Point every consumer AND the graph outputs at ``replacement``, then erase."""
     for out in graph.outputs:
@@ -140,6 +176,8 @@ class NormalizeOperators(PassBase):
                 ):
                     # neg(neg(x)) == x, even when the outer neg feeds the
                     # graph output directly (outputs get rewritten too).
+                    if not _folds_without_change(graph, node, inner.args[0]):
+                        continue
                     _replace_node_everywhere(graph, node, inner.args[0])
                     if not inner.users:
                         inner.erase_node()
@@ -151,7 +189,9 @@ class NormalizeOperators(PassBase):
                 rhs = node.args[1]
                 if _is_scalar_literal(rhs) and rhs == identity_right:
                     replacement = node.args[0]
-                    if _is_node_like(replacement):
+                    if _is_node_like(replacement) and _folds_without_change(
+                        graph, node, replacement
+                    ):
                         _replace_node_everywhere(graph, node, replacement)
                         modified = True
                         continue

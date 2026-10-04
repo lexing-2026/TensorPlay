@@ -268,3 +268,111 @@ def remove_noop_ops(graph: Graph):
                 node.replace_all_uses_with(src)
                 graph.erase_node(node)
 
+
+
+def decompose_auto_functionalized(graph: Graph) -> bool:
+    """Each functional stand-in for a mutating operator, as what it does.
+
+    ``auto_functionalized(op, **kwargs)`` stands for ``op`` run on private
+    copies of the arguments it writes, returning ``op``'s own fresh outputs
+    followed by the copies.  Written out that way -- one copy per written
+    argument, then ``op`` writing into the copies -- the copies are values this
+    region made, so writing into them is a mutation of the region's own memory
+    that the lowering orders like any other.  Left whole, the stand-in would be
+    a call returning a tuple that nothing here knows how to take apart.
+
+    Returns whether anything was rewritten.
+    """
+
+    import operator
+
+    from tensorplay._higher_order_ops.auto_functionalize import (
+        auto_functionalized,
+        get_mutable_args,
+        returns_without_aliases,
+    )
+
+    clone = tp_ops.clone.default
+    changed = False
+    for node in list(graph.nodes):
+        if node.op != "call_function" or node.target is not auto_functionalized:
+            continue
+        changed = True
+        op = node.args[0]
+        schema = op._schema
+        kwargs = dict(node.kwargs)
+        names, _ = get_mutable_args(op)
+        kept = returns_without_aliases(op)
+        value = node.meta.get("val")
+        values = list(value) if isinstance(value, (tuple, list)) else [value]
+        new_value_meta = values[len(kept):]
+
+        def copy_of(arg: Any, meta: Any) -> Node:
+            made = graph.call_function(clone, (arg,))
+            made.meta["val"] = meta if meta is not None else arg.meta.get("val")
+            return made
+
+        with graph.inserting_before(node):
+            copies: list[Any] = []
+            for position, name in enumerate(names):
+                arg = kwargs.get(name)
+                meta = new_value_meta[position] if position < len(new_value_meta) else None
+                if arg is None:
+                    copies.append(None)
+                    continue
+                if isinstance(arg, (list, tuple)):
+                    metas = list(meta) if isinstance(meta, (list, tuple)) else [None] * len(arg)
+                    made = [copy_of(a, m) for a, m in zip(arg, metas)]
+                else:
+                    made = copy_of(arg, meta)
+                kwargs[name] = made
+                copies.append(made)
+            positional = tuple(kwargs[a.name] for a in schema.arguments if not a.kwarg_only)
+            keywords = {a.name: kwargs[a.name] for a in schema.arguments if a.kwarg_only}
+            call = graph.call_function(op, positional, keywords)
+
+            # What the call returns: its fresh outputs as recorded, and for a
+            # return that is one of the written arguments, that argument's copy.
+            written = {}
+            for name, made in zip(names, copies):
+                for argument in schema.mutated_arguments():
+                    if argument.name == name:
+                        for alias in argument.alias_info.before_set:
+                            written[alias] = made
+            returns = []
+            for index, ret in enumerate(schema.returns):
+                if index in kept:
+                    returns.append(values[kept.index(index)])
+                    continue
+                alias = next(iter(ret.alias_info.before_set & set(written)), None)
+                target = written.get(alias)
+                returns.append(target.meta.get("val") if isinstance(target, Node) else None)
+            call.meta["val"] = returns[0] if len(schema.returns) == 1 else tuple(returns)
+
+        for user in list(node.users):
+            if user.target is not operator.getitem or user.args[0] is not node:
+                raise RuntimeError(f"unexpected reader of {node}: {user}")
+            index = user.args[1]
+            if index < len(kept):
+                if len(schema.returns) == 1:
+                    replacement = call
+                else:
+                    with graph.inserting_after(call):
+                        replacement = graph.call_function(
+                            operator.getitem, (call, kept[index])
+                        )
+                    replacement.meta["val"] = values[index]
+            else:
+                replacement = copies[index - len(kept)]
+            if isinstance(replacement, list):
+                # A written list of tensors: each element is read on its own.
+                for reader in list(user.users):
+                    if reader.target is not operator.getitem:
+                        raise RuntimeError(f"unexpected reader of {user}: {reader}")
+                    reader.replace_all_uses_with(replacement[reader.args[1]])
+                    graph.erase_node(reader)
+            else:
+                user.replace_all_uses_with(replacement)
+            graph.erase_node(user)
+        graph.erase_node(node)
+    return changed

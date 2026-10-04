@@ -99,6 +99,11 @@ class Interpreter:
         }
         for node in self.graph.nodes:
             if node in self.env:
+                # A value the caller supplied stands for the node, the output
+                # included: then that is what the graph returns.
+                if node.op == "output":
+                    value = self.env[node]
+                    return self.graph.process_outputs(value) if enable_io_processing else value
                 continue
             self.last_node = node
             try:

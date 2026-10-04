@@ -32,8 +32,10 @@ from tensorplay.primitives.common import is_float_dtype, is_integer_dtype
 
 from .. import config, cpp_builder, cpu_vec_isa, dependencies, ir, metrics
 from ..debug import set_kernel_post_grad_provenance_tracing
-from ..loops import ops, V
-from ..ops_handler import NullKernelHandler, OpsValue
+from ..loops import V
+from ..virtualized import ops
+from ..ops_handler import NullKernelHandler
+from ..virtualized import OpsValue
 from ..loop_body import LoopBody
 from ..scheduler import (
     BaseSchedulerNode,
