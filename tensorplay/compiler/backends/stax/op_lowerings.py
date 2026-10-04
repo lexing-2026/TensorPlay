@@ -4034,7 +4034,9 @@ def _adaptive_avg_pool_windows(x, h, w, oh, ow, lead):
             idx_h,
             out_dtype=tp.int64,
         )
-        length_h = lower_sub(ends_h, starts_h)
+        # A column, so that it lines up with the row axis of a window grid
+        # rather than with the trailing column axis.
+        length_h = unsqueeze(lower_sub(ends_h, starts_h), -1)
     else:
         length_h = max_h
     if adaptive_w:
@@ -4081,7 +4083,7 @@ def _adaptive_avg_pool_windows(x, h, w, oh, ow, lead):
 
     if adaptive_h and adaptive_w:
         count = lower_mul(
-            unsqueeze(_cast_to(length_h, acc), -1),
+            _cast_to(length_h, acc),
             unsqueeze(_cast_to(length_w, acc), 0),
         )
     elif adaptive_h:

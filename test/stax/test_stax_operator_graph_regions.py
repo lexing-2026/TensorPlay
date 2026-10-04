@@ -187,3 +187,25 @@ def test_python_functions_seen_whole_by_capture(device):
             tp.tensor([5, 4], device=lp.device)),
         lp, tgt, tol=1e-4,
     )
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize(
+    "shape,out",
+    [
+        ((20, 1), (7, 1)),  # rows uneven, one column: the one-axis pool
+        ((20, 14), (7, 7)),  # rows uneven, columns even, as many of each
+        ((14, 20), (7, 7)),  # columns uneven, rows even
+        ((20, 20), (7, 7)),  # both uneven
+        ((10, 9), (3, 4)),
+    ],
+)
+def test_adaptive_average_windows_line_up_with_their_axis(device, shape, out):
+    # A window grid whose windows differ in length along one axis divides
+    # each window by its own length along that axis and no other.
+    tp.manual_seed(0)
+    x = tp.randn(2, 3, *shape, device=device)
+    _check(lambda x: F.adaptive_avg_pool2d(x, out), x)
+    if shape[1] == 1:
+        y = x.squeeze(3)
+        _check(lambda y: F.adaptive_avg_pool1d(y, out[0]), y)
