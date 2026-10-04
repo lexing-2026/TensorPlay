@@ -5,6 +5,7 @@
 #include "InputBuffer.h"
 #include "ManualNodes.h" // For AsStridedBackward
 #include "LocalDispatchKeySet.h"
+#include "TransformDispatch.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include "tensorplay/ops/AutogradNodesGenerated.h"
 #ifdef USE_CUDA
@@ -743,14 +744,24 @@ namespace {
 // The conversion records its own node, so the call it makes runs beneath
 // autograd: nothing under it records history a second time, and a dispatch
 // mode is handed the conversion itself rather than the copy it is made of.
+//
+// Not under a function transform: a batched value is unwrapped and the call
+// made again one level down, where the conversion is that level's own and has
+// to record history there.  Excluding autograd for the whole call would reach
+// that inner call too, and the gradient a transform asks for would vanish.
 struct BelowConversionAutograd {
-    tensorplay::impl::ExcludeDispatchKeyGuard guard{
-        DispatchKeySet::make(DispatchKey::AutogradCPU) |
-        DispatchKeySet::make(DispatchKey::AutogradCUDA) |
-        DispatchKeySet::make(DispatchKey::AutogradVulkan) |
-        DispatchKeySet::make(DispatchKey::AutogradSparseCPU) |
-        DispatchKeySet::make(DispatchKey::AutogradSparseCUDA) |
-        DispatchKeySet::make(DispatchKey::AutogradSparse)};
+    std::optional<tensorplay::impl::ExcludeDispatchKeyGuard> guard;
+    BelowConversionAutograd() {
+        if (!tensorplay::transform::are_transforms_active()) {
+            guard.emplace(
+                DispatchKeySet::make(DispatchKey::AutogradCPU) |
+                DispatchKeySet::make(DispatchKey::AutogradCUDA) |
+                DispatchKeySet::make(DispatchKey::AutogradVulkan) |
+                DispatchKeySet::make(DispatchKey::AutogradSparseCPU) |
+                DispatchKeySet::make(DispatchKey::AutogradSparseCUDA) |
+                DispatchKeySet::make(DispatchKey::AutogradSparse));
+        }
+    }
 };
 
 } // namespace
