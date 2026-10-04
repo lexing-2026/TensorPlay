@@ -2456,6 +2456,25 @@ class GraphLowering(Interpreter):
         self.wrapper_code.pop_codegened_graph()
         return result
 
+    def codegen_subgraph(self, parent_graph) -> None:
+        """Print this piece into the program of the region that runs it.
+
+        A piece's kernels and calls go into the region's own program, so the
+        piece writes with the region's printer and for the region's devices,
+        and nothing is finished here: the region finishes the program once
+        every piece in it has been printed.
+        """
+
+        self.wrapper_code = parent_graph.wrapper_code
+        self.device_ops = parent_graph.device_ops
+        self.cpp_wrapper = parent_graph.cpp_wrapper
+        self.device_types = parent_graph.device_types
+        self.device_idxs = parent_graph.device_idxs
+        self.device_type = parent_graph.device_type
+
+        self._update_scheduler()
+        self.scheduler.codegen()
+
     def _compile_to_module_lines(self, wrapper_code):
         """Write what was printed, and load it back as something callable.
 
@@ -2795,10 +2814,16 @@ class GraphLowering(Interpreter):
         """
 
         return SubgraphLowering(
-            parent=self,
+            self,
+            gm,
+            example_inputs,
+            shape_env=self.shape_env,
+            cpp_wrapper=self.cpp_wrapper,
+            aot_mode=self.aot_mode,
+            extern_node_serializer=self.extern_node_serializer,
+            is_inference=self.is_inference,
+            is_backward=self.is_backward,
             name=f"{self.name}_{subgraph_name}" if self.name else subgraph_name,
-            gm=gm,
-            example_inputs=example_inputs,
         )
 
 

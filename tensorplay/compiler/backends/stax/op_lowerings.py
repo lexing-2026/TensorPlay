@@ -24,6 +24,7 @@ import math
 import operator
 import warnings
 from numbers import Number
+from collections.abc import Sequence
 from typing import Any, Callable
 
 import sympy
@@ -10105,6 +10106,52 @@ def lower_as_strided(
         sympy.expand(storage_offset),
     )
     return TensorBox(ir.ReinterpretView(data=storage, layout=new_layout))
+
+
+# ---------------------------------------------------------------------------
+# Control flow: branches and loops run as pieces of their own
+# ---------------------------------------------------------------------------
+
+
+def _register_control_flow_lowerings() -> None:
+    from tensorplay._higher_order_ops.cond import cond_op
+    from tensorplay._higher_order_ops.while_loop import (
+        while_loop_op,
+        while_loop_stack_output_op,
+    )
+
+    @register_lowering(cond_op, type_promotion_kind=None)
+    def cond(pred: Any, true_fn: Any, false_fn: Any, operands: Any) -> list:
+        """One of two pieces, chosen on the host by a truth value.
+
+        The pieces are listed false first: the choice is made by reading the
+        truth value as a number, and false reads as the first of them.
+        """
+
+        result = ir.Switch.create(pred, [false_fn, true_fn], list(operands), is_cond=True)
+        boxes = list(map(TensorBox.create, result))
+        # Pieces that return one value make the operation return that value.
+        if not isinstance(V.graph.current_node.meta.get("val"), (list, tuple)):
+            return boxes[0]
+        return boxes
+
+    def while_loop(cond_fn, body_fn, carried_inputs, additional_inputs, stack_output=False):
+        """A piece run again until another piece says to stop, on the host."""
+
+        result = ir.WhileLoop.create(
+            cond_fn, body_fn, list(carried_inputs), list(additional_inputs), stack_output
+        )
+        if not isinstance(result, Sequence):
+            raise AssertionError(f"expected a sequence of results, got {type(result)}")
+        return list(map(ir.WhileLoop._maybe_wrap_as_tensor_box, result))
+
+    register_lowering(while_loop_op, type_promotion_kind=None)(while_loop)
+    register_lowering(while_loop_stack_output_op, type_promotion_kind=None)(
+        functools.partial(while_loop, stack_output=True)
+    )
+
+
+_register_control_flow_lowerings()
 
 
 def load_lowering_modules() -> None:

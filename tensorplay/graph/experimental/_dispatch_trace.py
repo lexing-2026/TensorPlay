@@ -53,6 +53,8 @@ class DispatchTracer:
         self._tracked: dict[int, tuple[Any, Node]] = {}
         self._constant_count = 0
         self._proxy_mode: Any = None
+        # graph identity -> the get_attr node that reads it off the root
+        self._subgraphs: dict[int, Node] = {}
 
     @property
     def proxy_mode(self) -> Any:
@@ -102,6 +104,24 @@ class DispatchTracer:
         entry = self._tracked.get(tensor._impl_id)
         return entry[1] if entry is not None else None
 
+    def _subgraph(self, module: GraphModule) -> Node:
+        """A graph handed to an operation, read off the module that holds it.
+
+        An operator that takes a function -- a branch, a loop body, a score
+        modifier -- is handed its traced graph.  The graph is kept on the root
+        and read by name, so a lowering sees a region of its own rather than an
+        object it would have to recognise, and a graph handed twice is one
+        submodule.
+        """
+
+        node = self._subgraphs.get(id(module))
+        if node is None:
+            name = f"_subgraph{len(self._subgraphs)}"
+            setattr(self.root, name, module)
+            node = self.graph.get_attr(name)
+            self._subgraphs[id(module)] = node
+        return node
+
     def _constant(self, tensor: Any) -> Node:
         name = f"_tensor_constant{self._constant_count}"
         self._constant_count += 1
@@ -137,6 +157,8 @@ class DispatchTracer:
         if _is_tensor(value):
             entry = self._tracked.get(value._impl_id)
             return entry[1] if entry is not None else value
+        if isinstance(value, GraphModule):
+            return self._subgraph(value)
         if isinstance(value, tuple):
             return tuple(self.map_operands(item) for item in value)
         if isinstance(value, list):

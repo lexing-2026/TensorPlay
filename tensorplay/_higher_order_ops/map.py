@@ -27,7 +27,7 @@ from tensorplay._higher_order_ops.utils import (
     filter_with_masks,
     fill_none_with_masks,
     first_slice_copy,
-    reenter_make_fx,
+    _maybe_reenter_make_fx,
     save_values_for_backward,
     saved_values,
     split_into_chunks,
@@ -116,6 +116,21 @@ def map(
     pytree = tensorplay.utils._pytree
     flat_xs, xs_spec = pytree.tree_flatten(xs)
     flat_args, args_spec = pytree.tree_flatten(args)
+    if flat_xs and any(_is_capture_value(t) for t in flat_xs):
+        # A capture knows how long the loop is -- the leading extent is one
+        # of the shapes it was captured with -- so it records the steps one
+        # after another and stacks what they return, which is what the loop
+        # computes.
+        steps = []
+        for index in range(flat_xs[0].shape[0]):
+            step_xs = pytree.tree_unflatten([x[index] for x in flat_xs], xs_spec)
+            steps.append(pytree.tree_flatten(f(step_xs, *args)))
+        out_spec = steps[0][1]
+        stacked = [
+            tensorplay.stack([leaves[k] for leaves, _ in steps])
+            for k in range(len(steps[0][0]))
+        ]
+        return pytree.tree_unflatten(stacked, out_spec)
     if not all(isinstance(t, Tensor) for t in flat_xs):
         raise RuntimeError(f"Mapped xs can only consist of tensors. Got xs {flat_xs}.")
     if not flat_xs:
@@ -244,7 +259,7 @@ def trace_map(
         example_input = [
             first_slice_copy(x) if isinstance(x, Tensor) else x for x in trace_xs
         ]
-        body_graph = reenter_make_fx(f)(*example_input, *pos_args)
+        body_graph = _maybe_reenter_make_fx(f)(*example_input, *pos_args)
 
     _, graph_name = unique_graph_id(proxy_mode, prefix="map_body_graph")
     body_graph.meta["hop_graph_name"] = graph_name
@@ -357,7 +372,7 @@ def trace_map(
         example_input = [
             first_slice_copy(x) if isinstance(x, Tensor) else x for x in xs
         ]
-        body_graph = reenter_make_fx(f)(*example_input, *pos_args)
+        body_graph = _maybe_reenter_make_fx(f)(*example_input, *pos_args)
         example = func_overload(f, tuple(xs), tuple(pos_args))
 
     _, graph_name = unique_graph_id(proxy_mode, prefix="map_body_graph")
@@ -465,7 +480,7 @@ def trace_map(
         example_input = [
             first_slice_copy(x) if isinstance(x, Tensor) else x for x in xs
         ]
-        body_graph = reenter_make_fx(f)(*example_input, *pos_args)
+        body_graph = _maybe_reenter_make_fx(f)(*example_input, *pos_args)
 
     with disable_proxy_modes_tracing():
         example = func_overload(f, tuple(xs), tuple(pos_args))

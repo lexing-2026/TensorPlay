@@ -13,6 +13,8 @@ graph and nn layers, so an eager import here would close a cycle during
 package initialization.
 """
 
+import sys
+import types
 from typing import Any
 
 __all__ = [
@@ -44,6 +46,28 @@ _LAZY_ATTRS = {
     "omni_attention": "tensorplay._higher_order_ops.omni_attention",
     "omni_attention_backward": "tensorplay._higher_order_ops.omni_attention",
 }
+
+
+class _OperatorPackage(types.ModuleType):
+    """This package, keeping its operator names bound to the operators.
+
+    Several operators share a name with the module that defines them, and
+    importing that module binds the name on the package to the module -- after
+    which the operator imported by name is a module, and calling it fails.  The
+    module stays reachable as an import; only the name keeps meaning the
+    operator.
+    """
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if (
+            isinstance(value, types.ModuleType)
+            and _LAZY_ATTRS.get(name) == value.__name__
+        ):
+            return
+        super().__setattr__(name, value)
+
+
+sys.modules[__name__].__class__ = _OperatorPackage
 
 
 def __getattr__(name: str) -> Any:

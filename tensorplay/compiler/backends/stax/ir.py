@@ -300,6 +300,8 @@ def resolve_unbacked_bindings(shape_env, unbacked_bindings):
     the kernel runs.
     """
 
+    if unbacked_bindings is None:
+        return None
     resolved = {}
     for s, keypath in unbacked_bindings.items():
         if isinstance(keypath, (list, tuple)):
@@ -3555,13 +3557,15 @@ class MutationOutput(Buffer):
         ]
 
 
-@ir_dataclass
+@ir_dataclass(frozen=False)
 class Subgraph(IRNode):
     """A piece of a graph that is compiled on its own and then called.
 
     Naming it separately is what lets it be compiled once and used more than
     once, and it is also what lets the settings it was written under be recorded
     alongside it, since those settings are part of what it was compiled as.
+    Its lowering is filled in by the first operation that runs it, which is why
+    the field can be written after the piece is made.
     """
 
     name: str
@@ -9787,19 +9791,37 @@ class Switch(ExternKernel):
                     )
             return ret
 
+        # The pieces are lowered against the values the operation was traced
+        # with, and their results are made to come out the way the traced
+        # results did: one arrangement for every piece, since the operation
+        # has one result whichever piece produced it.
+        traced_operands = [
+            op.meta["val"] if hasattr(op, "meta") else op
+            for op in V.graph.current_node.args[-1]
+        ]
+        # A piece that returns one value makes the operation return that value
+        # rather than a sequence holding it.
+        traced = V.graph.current_node.meta["val"]
+        traced_outputs = list(traced) if isinstance(traced, (list, tuple)) else [traced]
+
         for subgraph in branches:
             if subgraph.graph is None:
                 subgraph.graph = V.graph.make_subgraph(
                     gm=subgraph.graph_module,
-                    example_inputs=list(operands),
+                    example_inputs=traced_operands,
                     subgraph_name=subgraph.name,
                 )
+                branch_out_args = subgraph.graph_module.graph.output_node.args[0]
+                if not isinstance(branch_out_args, (list, tuple)):
+                    branch_out_args = (branch_out_args,)
+                branch_traced = [
+                    a.meta.get("val", merged) if hasattr(a, "meta") else merged
+                    for a, merged in zip(branch_out_args, traced_outputs)
+                ]
                 with V.set_graph_handler(subgraph.graph):
-                    subgraph.graph.run(*operands)
+                    subgraph.graph.run(*traced_operands)
                     subgraph.graph.graph_outputs = _require_exact_strides(
-                        subgraph.graph.graph_outputs,
-                        subgraph.graph.graph_outputs,
-                        subgraph.graph.graph_outputs,
+                        subgraph.graph.graph_outputs, traced_outputs, branch_traced
                     )
 
         if any(branch.graph is None for branch in branches):
@@ -9838,7 +9860,7 @@ class Switch(ExternKernel):
             if not isinstance(o, ShapeAsConstantBuffer)
         )
         unbacked_bindings = resolve_unbacked_bindings(
-            V.graph.sizevars.shape_env, getattr(V.graph.current_node, "unbacked_bindings", None),
+            V.graph.sizevars.shape_env, V.graph.current_node.meta.get("unbacked_bindings", None),
         )
         if device is None:
             raise AssertionError("cannot determine device")
@@ -9856,15 +9878,17 @@ class Switch(ExternKernel):
                 FixedLayout(
                     device=output.get_device() if output.get_device() is not None else device,
                     dtype=output.get_dtype(),
-                    size=output.get_size(),
-                    stride=output.get_stride(),
+                    size=[_maybe_expr(sz) for sz in merged.size()],
+                    stride=[_maybe_expr(sz) for sz in merged.stride()],
                     offset=output.get_layout().offset,
                     is_pinned=output.get_layout().is_pinned,
                 ),
                 switch,
                 [(list, i)],
             )
-            for i, output in enumerate(ref_outputs)
+            # The pieces' results are alike, so either one is the template
+            # for where each result lives.
+            for i, (output, merged) in enumerate(zip(ref_outputs, traced_outputs))
         ]
 
         switch.outputs = outputs
@@ -10117,7 +10141,7 @@ class WhileLoop(ExternKernel):
                 raise AssertionError((i, op, bo))
 
         unbacked_bindings = resolve_unbacked_bindings(
-            V.graph.sizevars.shape_env, getattr(V.graph.current_node, "unbacked_bindings", None),
+            V.graph.sizevars.shape_env, V.graph.current_node.meta.get("unbacked_bindings", None),
         )
 
         while_loop = WhileLoop(

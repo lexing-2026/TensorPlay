@@ -209,3 +209,31 @@ def test_adaptive_average_windows_line_up_with_their_axis(device, shape, out):
     if shape[1] == 1:
         y = x.squeeze(3)
         _check(lambda y: F.adaptive_avg_pool1d(y, out[0]), y)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_control_flow_runs_its_pieces(device):
+    # Branches and loops are captured as one operator holding their pieces,
+    # recorded whole by the region's trace, and lowered as pieces of their
+    # own: the branch taken, the number of passes and the per-step results are
+    # the program's, on fresh values too.
+    from tensorplay import cond, while_loop
+    from tensorplay._higher_order_ops import map as map_steps, scan
+
+    tp.manual_seed(0)
+    x = tp.randn(4, 3, device=device).abs()
+    _check(
+        lambda x: cond(x.sum() > 0, lambda v: v.sin(), lambda v: v.cos(), (x,)) * 2,
+        x, second=(-x,),
+    )
+    _check(lambda x: map_steps(lambda r: r.exp() + 1, x), x)
+    # A loop and a scan are not lowered as pieces yet; the region still has to
+    # compute what the program does.
+    for fn in (
+        lambda x: while_loop(
+            lambda i, y: i < 3, lambda i, y: (i + 1, y * 1.5),
+            (tp.tensor(0, device=x.device), x),
+        )[1],
+        lambda x: scan(lambda c, v: (c + v, c * v), tp.zeros(3, device=x.device), x)[1],
+    ):
+        _same(tp.compile(fn)(x), fn(x), 1e-5)

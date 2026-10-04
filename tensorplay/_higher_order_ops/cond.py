@@ -29,7 +29,7 @@ from tensorplay._higher_order_ops.utils import (
     create_bw_fn,
     create_fn_remove_none,
     fill_none_with_masks,
-    reenter_make_fx,
+    _maybe_reenter_make_fx,
     save_values_for_backward,
     saved_values,
     unique_graph_id,
@@ -260,8 +260,8 @@ def trace_cond(
         trace_operands = (
             real_operands if all(o is not None for o in real_operands) else tuple(operands)
         )
-        true_graph = reenter_make_fx(true_fn)(*trace_operands)
-        false_graph = reenter_make_fx(false_fn)(*trace_operands)
+        true_graph = _maybe_reenter_make_fx(true_fn)(*trace_operands)
+        false_graph = _maybe_reenter_make_fx(false_fn)(*trace_operands)
 
     flat_true_outs = _flat_graph_outputs(true_graph)
     flat_false_outs = _flat_graph_outputs(false_graph)

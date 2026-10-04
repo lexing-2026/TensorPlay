@@ -27,7 +27,7 @@ from tensorplay._higher_order_ops.utils import (
     filter_with_masks,
     fill_none_with_masks,
     autograd_not_implemented,
-    reenter_make_fx,
+    _maybe_reenter_make_fx,
     split_into_chunks,
     unique_graph_id,
     validate_subgraph_args_types,
@@ -456,8 +456,8 @@ def trace_while_loop(
             real_carried if all(c is not None for c in real_carried)
             else tuple(carried_inputs)
         )
-        cond_graph = reenter_make_fx(cond_fn)(*trace_carried, *additional_inputs)
-        body_graph = reenter_make_fx(body_fn)(*trace_carried, *additional_inputs)
+        cond_graph = _maybe_reenter_make_fx(cond_fn)(*trace_carried, *additional_inputs)
+        body_graph = _maybe_reenter_make_fx(body_fn)(*trace_carried, *additional_inputs)
 
     i, cond_name = unique_graph_id(proxy_mode, prefix="while_loop_cond_graph")
     body_name = f"while_loop_body_graph_{i}"
@@ -528,7 +528,7 @@ def while_loop_func(
         return ctx.wrap_tensors(ret)
 
 
-@while_loop_op.py_impl("ProxyDispatchMode")
+@while_loop_stack_output_op.py_impl("ProxyDispatchMode")
 def _while_loop_stack_proxy_mode(
     mode: Any,
     cond_fn: Callable,

@@ -30,7 +30,7 @@ from tensorplay._higher_order_ops.utils import (
     first_slice_copy,
     get_tensor_mask,
     mask_list,
-    reenter_make_fx,
+    _maybe_reenter_make_fx,
     split_into_chunks,
     unique_graph_id,
     validate_subgraph_args_types,
@@ -345,7 +345,7 @@ def trace_scan(
         sample_xs = [
             first_slice_copy(x) if isinstance(x, Tensor) else x for x in trace_xs
         ]
-        combine_graph = reenter_make_fx(combine_fn)(
+        combine_graph = _maybe_reenter_make_fx(combine_fn)(
             *sample_init, *sample_xs, *real_additional
         )
 
