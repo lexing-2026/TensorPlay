@@ -14,6 +14,7 @@
 #include "cpu/VecComplex.h"
 #include <iostream>
 #include <numeric>
+#include <optional>
 #include <vector>
 #include <algorithm>
 #include <cmath>
@@ -1643,6 +1644,91 @@ static bool try_sum_dim_real_avx512(
     return true;
 }
 
+// Leading-dim contiguous reduction over a small row count. Each task owns a
+// contiguous span of the output and streams one full row segment at a time
+// with kUnroll independent vector accumulators. A round-robin walk over row
+// groups instead interleaves one stream per row, and once the row stride
+// exceeds the page size those streams are too far apart for the hardware
+// prefetchers to track together. Accumulation is sequential over at most
+// kMaxRows terms per output element, the same error class as the unbounded
+// per-row walks used for trailing-dim reductions. Every output element is
+// stored exactly once, so the result is written into freshly allocated
+// storage without pre-zeroing it.
+template <int64_t kUnroll, typename Scalar>
+bool sum_leading_rows_stream(const Tensor& input, Tensor& output) {
+    constexpr int64_t kMaxRows = 32;
+    const int64_t rows = input.size(0);
+    const int64_t cols = input.numel() / rows;
+    if (rows < 2 || rows > kMaxRows || cols == 0) {
+        return false;
+    }
+
+    using Vec = Vectorized<Scalar>;
+    constexpr int64_t vec_size = Vec::size();
+    const int64_t group = kUnroll * vec_size;
+    const int64_t chunk_target =
+        std::max<int64_t>(group, GRAIN_SIZE / rows);
+    const int64_t chunk = ((chunk_target + group - 1) / group) * group;
+    const Scalar* TP_RESTRICT in =
+        static_cast<const Scalar*>(input.data_ptr());
+    Scalar* TP_RESTRICT out = static_cast<Scalar*>(output.data_ptr());
+    parallel_for(0, cols, chunk, [&](int64_t begin, int64_t end) {
+        const int64_t n = end - begin;
+        const Scalar* TP_RESTRICT base0 = in + begin;
+        Scalar* TP_RESTRICT dst = out + begin;
+        int64_t j = 0;
+        for (; j + group <= n; j += group) {
+            Vec acc[kUnroll];
+            for (int64_t u = 0; u < kUnroll; ++u) {
+                acc[u] = Vec::loadu(base0 + j + u * vec_size);
+            }
+            for (int64_t r = 1; r < rows; ++r) {
+                const Scalar* TP_RESTRICT row = in + r * cols + begin + j;
+                for (int64_t u = 0; u < kUnroll; ++u) {
+                    acc[u] = acc[u] + Vec::loadu(row + u * vec_size);
+                }
+            }
+            for (int64_t u = 0; u < kUnroll; ++u) {
+                acc[u].store(dst + j + u * vec_size);
+            }
+        }
+        for (; j + vec_size <= n; j += vec_size) {
+            Vec a = Vec::loadu(base0 + j);
+            for (int64_t r = 1; r < rows; ++r) {
+                a = a + Vec::loadu(in + r * cols + begin + j);
+            }
+            a.store(dst + j);
+        }
+        for (; j < n; ++j) {
+            Scalar s = base0[j];
+            for (int64_t r = 1; r < rows; ++r) {
+                s += in[r * cols + begin + j];
+            }
+            dst[j] = s;
+        }
+    });
+    return true;
+}
+
+static std::optional<Tensor> try_sum_leading_rows(
+    const Tensor& input, const std::vector<int64_t>& out_shape, int64_t dim) {
+    if (dim != 0 || !input.is_contiguous() || input.dim() == 0 ||
+        input.numel() == 0) {
+        return std::nullopt;
+    }
+    if (input.dtype() != DType::Float32 && input.dtype() != DType::Float64) {
+        return std::nullopt;
+    }
+    Tensor out = Tensor::empty(out_shape, input.dtype(), input.device());
+    bool handled = input.dtype() == DType::Float32
+        ? sum_leading_rows_stream<8, float>(input, out)
+        : sum_leading_rows_stream<8, double>(input, out);
+    if (!handled) {
+        return std::nullopt;
+    }
+    return out;
+}
+
 __attribute__((target("avx512f")))
 static void product_f32_leading_range_avx512(
     const float* input, float* output, int64_t rows, int64_t cols,
@@ -2296,13 +2382,28 @@ Tensor sum_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
         acc_dtype = DType::ComplexFloat;
     }
     if (acc_dtype == DType::Float32 || acc_dtype == DType::Float64) {
-        Tensor out = Tensor::zeros(out_shape, out_dtype, self.device());
         Tensor input = self;
         if (self.dtype() != out_dtype) {
             input = self.to(out_dtype);
         }
 
         const int64_t ndim = self.dim();
+        // The leading-rows kernel stores every output element exactly once,
+        // so it allocates its own result and runs before the zero-filled
+        // buffer below (whose memset it would otherwise render waste).
+        bool try_leading = false;
+#if defined(__x86_64__)
+        try_leading = !reduce_avx512_available();
+#endif
+        if (dims.size() == 1 && input.dtype() == out_dtype && try_leading) {
+            const int64_t dim = dims[0] < 0 ? dims[0] + ndim : dims[0];
+            if (std::optional<Tensor> leading =
+                    try_sum_leading_rows(input, out_shape, dim)) {
+                return std::move(*leading);
+            }
+        }
+
+        Tensor out = Tensor::zeros(out_shape, out_dtype, self.device());
         std::vector<bool> mask(ndim, false);
         for (int64_t d : dims) {
             if (d < 0) d += ndim;
