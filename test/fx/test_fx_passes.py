@@ -10,6 +10,7 @@ from tensorplay.graph.passes import (
     POINTWISE_FUSED_OP_NAMES,
     NormalizeOperators,
     PointwiseFusionHint,
+    ShapeProp,
 )
 from tensorplay.graph import GraphModule, Tracer
 from tensorplay.graph.passes import PassManager
@@ -21,6 +22,14 @@ def _trace(fn, *args, **kwargs):
         for name, value in zip(("x", "w", "z"), args)
     }
     return Tracer().trace(fn, sample_inputs=sample | kwargs if kwargs else sample)
+
+
+def _trace_typed(fn, x):
+    # Identities fold only where the folded value is known to keep its type
+    # and shape, which is what shape propagation records.
+    gm = _trace(fn, x)
+    ShapeProp([x])(gm)
+    return gm
 
 
 # --- NormalizeOperators -------------------------------------------------------
@@ -45,14 +54,15 @@ def test_normalize_commutes_constant_to_rhs():
 
 def test_normalize_folds_double_neg():
     def fn(x):
-        return -(-x)
+        return -(-x) * 3.0
 
     x = tp.tensor([1.0])
-    gm = _trace(fn, x)
+    gm = _trace_typed(fn, x)
     res = NormalizeOperators()(gm)
     assert res.modified is True
     ops = [n for n in gm.graph.nodes if n.op == "call_function"]
-    assert len(ops) == 0  # both negs gone; output aliases the placeholder
+    # Both negs gone; the product reads the placeholder directly.
+    assert len(ops) == 1 and ops[0].args[0].op == "placeholder"
 
 
 @pytest.mark.parametrize(
@@ -66,11 +76,22 @@ def test_normalize_folds_double_neg():
 )
 def test_normalize_identity_right(mk, target_identity):
     x = tp.tensor([3.0])
-    gm = _trace(mk, x)
+    gm = _trace_typed(lambda x: mk(x) * 3.0, x)
     res = NormalizeOperators()(gm)
     assert res.modified is True
     remaining = [n for n in gm.graph.nodes if n.op == "call_function"]
-    assert remaining == []
+    # Only the product the identity fed is left, reading the placeholder.
+    assert len(remaining) == 1 and remaining[0].args[0].op == "placeholder"
+
+
+@pytest.mark.parametrize("mk", [lambda x: x + 0.0, lambda x: -(-x)])
+def test_normalize_keeps_a_returned_identity_off_its_input(mk):
+    # Folded, the region would hand its caller the input itself where the
+    # program made new memory, and a write to one would reach the other.
+    x = tp.tensor([3.0])
+    gm = _trace_typed(mk, x)
+    NormalizeOperators()(gm)
+    assert any(n.op == "call_function" for n in gm.graph.nodes)
 
 
 def test_normalize_keeps_x_times_zero():

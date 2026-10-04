@@ -15,27 +15,30 @@ def _trace(fn, sample):
     return Tracer().trace(fn, sample_inputs=sample)
 
 
-def test_sigmoid_decomposed_into_primitives():
+def test_composite_decomposed_into_primitives():
+    # mish expands through the softplus rule even though softplus on its own
+    # stays fused: the expansion is the chain mish is defined by.
     def fn(x):
-        return x.softplus().sum()
+        return x.mish().sum()
 
     smap = {"x": tp.tensor([1.0, 2.0])}
     gm = _trace(fn, smap)
     targets = {n.target for n in gm.graph.nodes if n.op == "call_method"}
-    assert "softplus" in targets
+    assert "mish" in targets
     res = DecomposePass()(gm)
     assert res.modified is True
     methods = {n.target for n in gm.graph.nodes if n.op == "call_method"}
     funcs = {getattr(n.target, "__name__", n.target) for n in gm.graph.nodes if n.op == "call_function"}
-    assert "softplus" not in methods
-    assert "exp" in methods
-    assert "log" in methods
+    assert "mish" not in methods
+    assert {"exp", "log", "tanh"} <= methods
     assert "add" in funcs or operator.add in funcs
 
 
 def test_decomposed_graph_is_differentiable_structurally():
+    # sec expands to a quotient of a cosine, both of which the graph-level
+    # builder differentiates.
     def fn(x):
-        return x.softplus().sum()
+        return x.sec().sum()
 
     smap = {"x": tp.tensor([1.0, 2.0])}
     gm = _trace(fn, smap)
@@ -152,12 +155,12 @@ def test_decomposed_op_compiles_to_native_graph(name):
 
 
 _DECOMP_GRAD_CASES = {
-    "softplus": lambda x: tp.softplus(x),
     "mish": lambda x: tp.mish(x),
     "logit": lambda x: tp.logit(x),
-    "sinh": lambda x: tp.sinh(x),
-    "cosh": lambda x: tp.cosh(x),
-    "atanh": lambda x: tp.atanh(x),
+    "sec": lambda x: tp.sec(x),
+    "tanhshrink": lambda x: tp.tanhshrink(x),
+    "selu": lambda x: tp.selu(x),
+    "exp2": lambda x: tp.exp2(x),
 }
 
 
@@ -184,12 +187,23 @@ def test_decomposed_grad_matches_eager(name):
     )
 
 
-def test_fused_composite_stays_whole_and_keeps_its_gradient():
+_FUSED_GRAD_CASES = {
+    "silu": lambda x: tp.silu(x),
+    "softplus": lambda x: tp.softplus(x),
+    "sinh": lambda x: tp.sinh(x),
+    "cosh": lambda x: tp.cosh(x),
+    "atanh": lambda x: tp.atanh(x),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_FUSED_GRAD_CASES))
+def test_fused_composite_stays_whole_and_keeps_its_gradient(name):
     """保留融合的复合算子不展开：原生图按单节点执行，梯度仍走它自己的求导式。"""
-    assert "silu" in fused_composite_names()
+    assert name in fused_composite_names()
+    fn = _FUSED_GRAD_CASES[name]
 
     def loss(v):
-        return (tp.silu(v * v) * 2).sum()
+        return (fn(v * v) * 2).sum()
 
     xa = tp.tensor([0.7], requires_grad=True)
     loss(xa).backward()
