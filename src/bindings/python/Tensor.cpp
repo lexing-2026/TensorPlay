@@ -1246,10 +1246,10 @@ static int tpx_data_set(PyObject* self_obj, PyObject* value, void*) {
 // integers -- a variadic shape or a lone -1 -- reads straight into the shape
 // vector, a dtype reinterprets the element stream, and the remaining forms
 // (a single sequence argument, the keyword forms) go through the sequence
-// caster.  The size form routes through the operation layer rather than the
-// member function of the same name: the operation records the view for
-// backward, while the member builds the alias directly and the record would
-// be lost.
+// caster.  Both the size and the dtype forms route through the operation
+// layer rather than the member functions of the same names: the operation is
+// what autograd records and what a dispatch mode sees, while a member builds
+// the alias directly and both would be lost.
 // ---------------------------------------------------------------------------
 
 static PyObject* tpx_tensor_view_call(PyObject* self_obj,
@@ -1283,11 +1283,11 @@ static PyObject* tpx_tensor_view_call(PyObject* self_obj,
                                     "view(): argument 'dtype' must be a dtype");
                     return nullptr;
                 }
-                return wrap_fresh(self.view_dtype(py::cast<DType>(spec)));
+                return wrap_fresh(tensorplay::tpx::ops::view(self, py::cast<DType>(spec)));
             }
             if (PyUnicode_CompareWithASCIIString(name, "size") == 0) {
                 if (py::isinstance<DType>(spec) != 0) {
-                    return wrap_fresh(self.view_dtype(py::cast<DType>(spec)));
+                    return wrap_fresh(tensorplay::tpx::ops::view(self, py::cast<DType>(spec)));
                 }
                 try {
                     return wrap_fresh(tensorplay::tpx::ops::view(
@@ -1308,7 +1308,7 @@ static PyObject* tpx_tensor_view_call(PyObject* self_obj,
         if (npos == 1) {
             PyObject* spec = args[0];
             if (py::isinstance<DType>(spec) != 0) {
-                return wrap_fresh(self.view_dtype(py::cast<DType>(spec)));
+                return wrap_fresh(tensorplay::tpx::ops::view(self, py::cast<DType>(spec)));
             }
             if (PyLong_CheckExact(spec) != 0) {
                 const int64_t d = PyLong_AsLongLong(spec);
@@ -2387,9 +2387,11 @@ void init_tensor(py::module_& m) {
             return static_cast<int64_t>(self.numel() * self.itemsize());
         })
         .def("storage_offset", [](const Tensor& self) -> int64_t {
+            TP_CHECK(self.defined(), "storage_offset() of an undefined tensor");
             return static_cast<int64_t>(self.unsafeGetTensorImpl()->storage_offset());
         })
         .def("untyped_storage", [](const Tensor& self) {
+            TP_CHECK(self.defined(), "untyped_storage() of an undefined tensor");
             return self.unsafeGetTensorImpl()->storage();
         })
         .def("get_device", [](const Tensor& self) -> int64_t {
@@ -2935,6 +2937,11 @@ void init_tensor(py::module_& m) {
         .def("__mul__", [](const Tensor& a, const Tensor& b) { return a.mul(b); })
         .def("__truediv__", [](const Tensor& a, const Tensor& b) { return a.div(b); })
         // as int64 scalars); the double overloads below handle real scalars.
+        // A Python bool is an int to pybind's int caster, so the bool forms
+        // come first: a truth takes part as a truth, and a boolean tensor
+        // added to or multiplied by one stays boolean.
+        .def("__add__", [](const Tensor& t, bool s) { return t.add(Scalar(s)); })
+        .def("__mul__", [](const Tensor& t, bool s) { return t.mul(Scalar(s)); })
         .def("__add__", [](const Tensor& t, int64_t s) { return t.add(Scalar(s)); })
         .def("__sub__", [](const Tensor& t, int64_t s) { return t.sub(Scalar(s)); })
         .def("__mul__", [](const Tensor& t, int64_t s) { return t.mul(Scalar(s)); })
@@ -2947,6 +2954,8 @@ void init_tensor(py::module_& m) {
         .def("__sub__", [](const Tensor& t, std::complex<double> s) { return t.sub(Scalar(s)); })
         .def("__mul__", [](const Tensor& t, std::complex<double> s) { return t.mul(Scalar(s)); })
         .def("__truediv__", [](const Tensor& t, std::complex<double> s) { return t.div(Scalar(s)); })
+        .def("__radd__", [](const Tensor& t, bool s) { return t.add(Scalar(s)); })
+        .def("__rmul__", [](const Tensor& t, bool s) { return t.mul(Scalar(s)); })
         .def("__radd__", [](const Tensor& t, int64_t s) { return t.add(Scalar(s)); })
         .def("__rmul__", [](const Tensor& t, int64_t s) { return t.mul(Scalar(s)); })
         .def("__radd__", [](const Tensor& t, double s) { return t.add(Scalar(s)); })
