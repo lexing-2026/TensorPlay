@@ -162,3 +162,26 @@ def test_narrow_types_are_computed_in_float_in_the_kernel(dtype, tolerance):
     assert out.dtype == dtype
     expected = _attention_by_hand(q, k, v, _keep(causal, length, length))
     assert float((out.float() - expected).abs().max()) < tolerance
+
+
+@pytest.mark.skipif(not tp.cuda.is_available(), reason="needs CUDA")
+def test_compiled_training_reaches_every_input():
+    # The attention is recorded whole in a traced region, and its backward
+    # reads the forward's result through a conversion to the type it already
+    # has; the region still returns the forward's own result and every input
+    # gets its gradient.
+    tp.manual_seed(0)
+    length = 128
+    mask = omni.create_block_mask(causal, 1, 1, length, length, device="cuda")
+    q, k, v = (tp.randn((1, 2, length, 32), device="cuda", requires_grad=True) for _ in range(3))
+
+    def loss(q, k, v):
+        return omni.omni_attention(q, k, v, block_mask=mask).sum()
+
+    got = tp.compile(loss, backend="stax")(q, k, v)
+    got_grads = tp.autograd.grad(got, (q, k, v))
+    want = loss(q, k, v)
+    want_grads = tp.autograd.grad(want, (q, k, v))
+    assert abs(float(got - want)) < 1e-3
+    for g, w in zip(got_grads, want_grads):
+        assert float((g - w).abs().max()) < 1e-4

@@ -138,6 +138,27 @@ class HigherOrderOperator:
     def has_impl(self, role: str) -> bool:
         return role in self._impls
 
+    def _record_real_call(self, tracer: Any, args: tuple, kwargs: dict) -> Any:
+        """Run the call on the values it was given and record it as one node.
+
+        A trace that records values rather than stand-ins has no stand-in to
+        hand back: the program it is following goes on computing with whatever
+        this returns, so what is returned is the real result.  The call runs
+        with recording off, so the operations inside it stay inside it, and it
+        is recorded whole, with the subgraphs it was handed as its arguments --
+        the same node a capture of the program holds for it.  A gradient the
+        trace asks for later reaches the backward operator the same way.
+        """
+
+        from tensorplay.graph.experimental.proxy_tensor import (
+            disable_proxy_modes_tracing,
+        )
+
+        with disable_proxy_modes_tracing():
+            out = self(*args, **kwargs)
+        tracer.record(self, args, kwargs, out)
+        return out
+
     def __call__(self, /, *args: Any, **kwargs: Any) -> Any:
         # Positional-only receiver: operator arguments may be named ``self``.
         # A running proxy capture sees every call first so it can record the
@@ -147,6 +168,8 @@ class HigherOrderOperator:
 
             mode = get_proxy_mode()
             if mode is not None:
+                if getattr(mode.tracer, "records_real_values", False):
+                    return self._record_real_call(mode.tracer, args, kwargs)
                 return self._impls["ProxyDispatchMode"](mode, *args, **kwargs)
 
         # The Autograd layer sits above autocast and the composite one: route

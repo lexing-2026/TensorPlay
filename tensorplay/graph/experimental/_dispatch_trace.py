@@ -42,6 +42,10 @@ class _ConstantHolder(tensorplay.nn.Module):
 class DispatchTracer:
     """Graph under construction plus the tensor-to-node map."""
 
+    #: Operations run on the values they are given and are recorded alongside;
+    #: an operator that would hand back a stand-in hands back its result.
+    records_real_values = True
+
     def __init__(self) -> None:
         self.graph = Graph()
         self.root = _ConstantHolder()

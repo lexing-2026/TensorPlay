@@ -222,6 +222,11 @@ def _trace_joint(fn: Callable[..., Any], primals: Sequence[Any], decompositions)
             with tensorplay.enable_grad():
                 out = fn(*trace_primals)
             flat_out, out_spec = tree_flatten(out)
+            # Settled before the backward runs: an operation that hands back
+            # the very value it was given (a cast to the type it already has)
+            # makes the backward's node the one that value stands for, and a
+            # forward result read after that would name a backward node.
+            fwd_values = [tracer.map_value(v) for v in flat_out]
             diff_outputs = [o for o in flat_out if _is_tensor(o) and o.requires_grad]
             with _disable_current_modes():
                 tangents = [tensorplay.ones_like(o.detach()) for o in diff_outputs]
@@ -242,8 +247,7 @@ def _trace_joint(fn: Callable[..., Any], primals: Sequence[Any], decompositions)
             )
             tracer.backward = False
     del primal_nodes
-    fwd_values = [tracer.map_value(v) for v in flat_out]
-    bwd_values = [None if g is None else tracer.map_value(g) for g in grads]
+    bwd_values =[None if g is None else tracer.map_value(g) for g in grads]
     tracer.graph.output(tuple(fwd_values + bwd_values))
     tracer.graph.eliminate_dead_code()
     joint = GraphModule(tracer.root, tracer.graph)
