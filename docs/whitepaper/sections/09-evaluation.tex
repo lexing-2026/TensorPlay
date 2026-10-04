@@ -21,9 +21,9 @@
 \midrule
 C++核心 & $\approx$ 75\,k & 数百 k（核心运行时 $>$ 300\,k） \\
 Python表面 & 267\,k / 899 个文件（见表~\ref{tab:pybreakdown}） & 更大的封装表面 \\
-运算符（唯一的 \texttt{m.impl}） & 642--673 & 2000+ \\
-\texttt{DispatchKey} 基数 & 13 & 60+ \\
-Autograd 节点（生成） & 148 & 数千 \\
+运算符（唯一的 \texttt{m.impl}） & 1{,}466--1{,}563 & 2000+ \\
+\texttt{DispatchKey} 基数 & 33 & 60+ \\
+Autograd 节点（生成） & 368 & 数千 \\
 构建工件 & 4 个库：\texttt{libp10}、\texttt{libtpx}、\texttt{libstax}、\texttt{\_C} & 几十个 \\
 \bottomrule
 \end{tabular}
@@ -31,19 +31,22 @@ Autograd 节点（生成） & 148 & 数千 \\
 
 \begin{table}[H]
 \centering
-\caption{75\,k C++ 行所在的地方。生成的文件被排除。}
+\caption{约 300\,k C++ 行所在的地方。生成的文件被排除。}
 \label{tab:corebreakdown}
 \small
 \begin{tabular}{llr}
 \toprule
 成分 & 代表内容 & 大约\ 行 \\
 \midrule
-\texttt{p10} 对象模型 & \texttt{Tensor}、\texttt{TensorImpl}、\texttt{Storage}、版本计数器 & $\sim$18\,k \\
-\texttt{p10} 调度员 & 13槽工作台、按键组、注册宏 & $\sim$1.5\,k \\
-\texttt{p10} 内核 & CPU 后端 ($\ast$.cpp) 与 CUDA 对应项 ($\ast$.cu) & $\sim$35\,k \\
+\texttt{p10} 对象模型 & \texttt{Tensor}、\texttt{TensorImpl}、\texttt{Storage}、版本计数器 & $\sim$35\,k \\
+\texttt{p10} 调度员 & 33槽工作台、按键组、注册宏 & $\sim$2\,k \\
+\texttt{p10} CPU 内核 & \texttt{p10/src/backend/cpu} & $\sim$77\,k \\
+\texttt{p10} CUDA 内核 & \texttt{p10/src/backend/cuda}（含 \texttt{transformers}、\texttt{flash}） & $\sim$98\,k \\
+\texttt{p10} Vulkan 后端 & \texttt{p10/src/backend/vulkan}（C++ 加 GLSL） & $\sim$27\,k \\
+\texttt{p10} composite 后端 & \texttt{p10/src/backend/composite} & $\sim$17\,k \\
 \texttt{tpx} autograd 引擎 & \texttt{Node}, \texttt{Edge}, \texttt{GraphTask}, \texttt{ReadyQueue}, \texttt{Engine} & $\sim$6\,k \\
-\texttt{stax} + 编译器 & 图 IR、融合、解释器 & $\sim$8\,k \\
-绑定 & CPython 桥接器，每个域单元 & $\sim$7\,k \\
+\texttt{stax} & 图 IR、融合、解释器 & $\sim$2\,k \\
+绑定 & CPython 桥接器，每个域单元 & $\sim$10\,k \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -87,7 +90,7 @@ Table~\ref{tab:evalsize} 引用了一个 Python 数字，这引发了一个问�
 \subsection{GPU 后端：CUDA 和 Vulkan 插槽}
 \label{subsec:eval-backends}
 
-\S\ref{sec:redispatch} 将 \texttt{CUDA}=1 和 \texttt{Vulkan}=2 的 13 个键声明为密集后端槽，并且 \S\ref{subsec:eval-microbench} 引用了它们的调度成本。本小节显示插槽已填充：后端存在，而不仅仅是键。
+\S\ref{sec:redispatch} 将 \texttt{CUDA}=1 和 \texttt{Vulkan}=2 声明为七个密集后端键中的两个，并且 \S\ref{subsec:eval-microbench} 引用了它们的调度成本。本小节显示插槽已填充：后端存在，而不仅仅是键。
 
 \begin{table}[H]
 \centering
@@ -98,10 +101,10 @@ Table~\ref{tab:evalsize} 引用了一个 Python 数字，这引发了一个问�
 \toprule
 后端 & 文件 & 线路 & 注册 & 独特的行动 \\
 \midrule
-CPU & 69 & 61{,}108 & 66 & 1{,}325 \\
-CUDA & 86 & 56{,}949 & 66 & 1{,}274 \\
-伏尔甘 & 93 & 16{,}289 + 4{,}500 GLSL & 26 & 145 \\
-合成的 & 34 & 8{,}533 & 34 & --- \\
+CPU & 87 & 77{,}352 & 75 & 1{,}233 \\
+CUDA & 301 & 98{,}287 & 152 & 1{,}262 \\
+伏尔甘 & 179 & 27{,}122（含 6{,}844 GLSL） & 27 & 224 \\
+合成的 & 51 & 17{,}132 & 54 & --- \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -113,9 +116,9 @@ CUDA & 86 & 56{,}949 & 66 & 1{,}274 \\
 \def\cw{0.62}
 \def\ch{0.0028}
 \foreach \x/\name/\count/\fillc/\drawc in {
-  0/CPU/1325/blue!8/tpblue,
-  1/CUDA/1274/orange!10/tporange,
-  2/Vulkan/145/purple!8/tppurple}{
+  0/CPU/1233/blue!8/tpblue,
+  1/CUDA/1262/orange!10/tporange,
+  2/Vulkan/224/purple!8/tppurple}{
   \pgfmathsetmacro{\h}{\count*\ch}
   \pgfmathsetmacro{\lbl}{\h+0.55}
   \fill[\fillc] (\x*\cw+0.05,0) rectangle (\x*\cw+0.05+0.5,\h);
@@ -125,9 +128,9 @@ CUDA & 86 & 56{,}949 & 66 & 1{,}274 \\
 }
 % axis
 \draw[->,gray] (-0.15,0) -- (2.35,0);
-\node[anchor=west,gray] at (2.45,3.7) {unique ops};
+\node[anchor=west,gray] at (2.45,3.9) {unique ops};
 \end{tikzpicture}
-\caption{每个后端的唯一操作名称（表~\ref{tab:backends}）。 CUDA列是CPU列的96\%； Vulkan 是特意设计的小型教学后端。}
+\caption{每个后端的唯一操作名称（表~\ref{tab:backends}）。 CUDA列是CPU列的97\%； Vulkan 是特意设计的小型教学后端。}
 \label{fig:backendops}
 \end{figure}
 
@@ -649,9 +652,9 @@ RPC & 408 & RPC 绑定 &  & \\
 \toprule
 层 & 张量播放 & 供应商基线 \\
 \midrule
-注册内核（\texttt{m.impl} dedup） & 673（CPU 671、CUDA 587） & 2000 多个不同的操作 \\
+注册内核（\texttt{m.impl} dedup） & 3{,}029（CPU 1{,}466、CUDA 1{,}563） & 2000 多个不同的操作 \\
 模式 & 479 个名字 / 618 个活跃 & 2000+（有过载） \\
-倒推公式 & 187 个公式 $\rightarrow$ 148 个节点 & 数千 \\
+倒推公式 & 423 个名字 $\rightarrow$ 368 个节点 & 数千 \\
 Python \texttt{\_C} 表面 & $\sim$550 & $\sim$1500 \\
 覆盖重点 & 逐点、缩减、matmul、卷积/池（24 个卷积操作）、linalg 26、\texttt{foreach} $\sim$100 & 全域 \\
 \bottomrule
@@ -661,37 +664,34 @@ Python \texttt{\_C} 表面 & $\sim$550 & $\sim$1500 \\
 三角洲是故意的。 TensorPlay 涵盖了卷积分类器或转换器预训练步骤所执行的密集张量循环，以及使其余部分可运行的复合回退：张量属性、直方图、唯一性、itertools 和集成，每个都注册一个后端中性 \texttt{TENSORPLAY\_LIBRARY\_IMPL(Composite,\dots)} 块，该块服务于每个后端，直到本机内核覆盖它。失踪的家庭被记录下来，而不是隐藏起来：通过本机内核到达的辍学； \texttt{cross\_entropy}/\texttt{ctc\_loss}、\texttt{rms\_norm}、\texttt{scatter\_reduce} 和长尾稀疏操作仍然仅复合或不存在，每个操作都被分类为“内核存在，架构缺失”或“三层缺失”，因此间隙是一个表条目，这并不奇怪。
 
 %======================================================================
-\subsection{DispatchKey: 13 vs.\ 60+}
+\subsection{DispatchKey: 33 vs.\ 60+}
 \label{subsec:eval-dispatchkey}
 
 \begin{table}[H]
 \centering
-\caption{\texttt{DispatchKey} 枚举。 Sentinel \texttt{EndOfKeys=13} 被拼写出来，因此表大小是一个编译时常量。}
+\caption{\texttt{DispatchKey} 枚举（按层分组，非逐条列举）。 Sentinel \texttt{EndOfKeys=33} 被拼写出来，因此表大小是一个编译时常量。}
 \label{tab:dispatchkey}
 \small
 \begin{tabular}{lll}
 \toprule
 Key & 价值 & Role \\
 \midrule
-\texttt{CPU} & 0 & 密集后端 \\
-\texttt{CUDA} & 1 & 密集后端 \\
-\texttt{Vulkan} & 2 & 密集后端，预留 \\
-\texttt{AutogradCPU} & 3 & \texttt{toAutogradKey(CPU)} = CPU + 3 \\
-\texttt{AutogradCUDA} & 4 & 基于 CUDA 的 Autograd \\
-\texttt{AutogradVulkan} & 5 & Autograd 优于 Vulkan \\
-\texttt{AutocastCPU} & 6 & \texttt{toAutocastKey(CPU)} = CPU + 6 \\
-\texttt{AutocastCUDA} & 7 & 通过 CUDA 自动投射 \\
-\texttt{AutocastVulkan} & 8 & 通过 Vulkan 自动施放 \\
-\texttt{VmapCPU} & 9 & \texttt{toVmapKey(CPU)} = CPU + 9，优于 autograd \\
-\texttt{VmapCUDA} & 10 & 基于 CUDA 的 Vmap \\
-\texttt{VmapVulkan} & 11 & Vulkan 上的 Vmap \\
-\texttt{Composite} & 12 & 后端中立回退 \\
-\texttt{EndOfKeys} & 13 & 哨兵，表大小 \\
+\texttt{CPU}--\texttt{Meta} & 0--6 & 七个密集后端键，稠密与稀疏各占一条 \\
+\texttt{Python} & 7 & 线程局部的 Python 调度模式 \\
+\texttt{DynamicLayerBackMode} & 8 & 动态层模式哨兵 \\
+\texttt{Autograd*} & 9--15 & \texttt{toAutogradKey(b)} = b + 9，整块复制后端键 \\
+\texttt{Autocast*} & 16--22 & \texttt{toAutocastKey(b)} = b + 16 \\
+\texttt{Vmap*} & 23--29 & \texttt{toVmapKey(b)} = b + 29 \texorpdfstring{更正}{更正} 23，排名高于 autocast \\
+\texttt{Composite} & 30 & 后端中立回退 \\
+\texttt{VmapMode}、两个 \texttt{DynamicLayer*Mode} & 31--32 & 模式哨兵，从不进入 key set \\
+\texttt{EndOfKeys} & 33 & 哨兵，表大小 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-因此，调度表是 \texttt{array<atomic<KernelFunction>,13>}，每个槽宽松初始化为 \texttt{nullptr} 并使用 \texttt{memory\_order\_release} 发布。键集是 13 个键的 \texttt{uint32\_t} 位集；优先级解析扫描掩码中数值最大的位，因此优先级为 \texttt{Vmap -> Autocast -> Autograd -> backend}。助手一次清除一个轴，由每一层下面的重新调度使用。
+因此，调度表是 \texttt{array<atomic<KernelFunction>,33>}，每个槽宽松初始化为 \texttt{nullptr} 并使用 \texttt{memory\_order\_release} 发布。键集是一个 \texttt{uint64\_t} 位集——33 位远小于字长，所以移位不需要边界检查；优先级解析扫描掩码中数值最大的位，因此优先级为 \texttt{Vmap -> Autocast -> Autograd -> Python -> backend}。助手一次清除一个轴，由每一层下面的重新调度使用。
+
+三层变换轴各占 7 个槽，与后端键块等宽，因此「加一个固定偏移」就完成了一层到另一层的映射，不需要按 (层, 设备) 查表。代价是键的数量随后端数线性增长：每新增一个后端就多 4 个键（自身 + 三层）。
 
 \begin{lstlisting}[caption={The \texttt{Composite} fallthrough in the hot path: one extra load, only when a backend slot is empty.}, label=lst:composite]
 KernelFunction getKernel(DispatchKey key) const noexcept {
@@ -704,13 +704,13 @@ KernelFunction getKernel(DispatchKey key) const noexcept {
 }
 \end{lstlisting}
 
-TensorPlay 保留一组紧凑的调度键，并将专用轴保留在核心表之外。没有 \texttt{Meta} 键，也没有开放的注册 API：注册是一个由一个互斥锁保护的封闭式 \texttt{unordered\_map<string,DispatchTable>}，并且 \texttt{TENSORPLAY\_LIBRARY\_IMPL} 宏扩展为进程生命周期静态构造函数。代价是纯形状推理、稀疏调度和量化调度没有专用的快速路径；它们要么共享 \texttt{Composite} 后备，要么明确不受支持。
+TensorPlay 保留一组紧凑的调度键，并将模式轴保留在核心表之外：三个 \texttt{mode} 键从不进入 \texttt{key\_set}，只为模式哨兵而存在。表内确有专用的 \texttt{Meta} 与稀疏键（\texttt{SparseCPU}/\texttt{SparseCUDA}/\texttt{Sparse}），因此纯形状推理与稀疏布局各走自己的快速路径，而不是共享 \texttt{Composite} 后备。注册则刻意保持封闭：注册是一个由一个互斥锁保护的封闭式 \texttt{unordered\_map<string,DispatchTable>}，并且 \texttt{TENSORPLAY\_LIBRARY\_IMPL} 宏扩展为进程生命周期静态构造函数，没有运行期开放注册 API 的入口。好处是名称查找是一个哈希探针加一个原子负载，而不是向量遍历加上一次 API 边界检查。
 
 %======================================================================
-\subsection{Autograd 节点：148 个生成、显式 DAG、无磁带}
+\subsection{Autograd 节点：368 个生成、显式 DAG、无磁带}
 \label{subsec:eval-autograd-nodes}
 
-生成器通过表达式 AST 解析导数公式注册表（分组后 345 个原始记录分解为 187 个公式）并发出 148 个节点结构。每个节点将保存的前向张量存储为 \texttt{SavedVariable} ，其中公式需要它们，并从决定保存集的同一 AST 合成 \texttt{apply} ，因此保存列表、构造函数和 \texttt{apply} 不会漂移。公式无法表达的手写节点（串联、堆叠、滚动）遵循相同的 \texttt{SavedVariable} 契约。
+生成器通过表达式 AST 解析导数公式注册表（\texttt{config/derivatives.yaml} 中 428 条记录、423 个不同名字）并发出 368 个节点结构。每个节点将保存的前向张量存储为 \texttt{SavedVariable} ，其中公式需要它们，并从决定保存集的同一 AST 合成 \texttt{apply} ，因此保存列表、构造函数和 \texttt{apply} 不会漂移。公式无法表达的手写节点（串联、堆叠、滚动）遵循相同的 \texttt{SavedVariable} 契约。
 
 没有磁带。该图是每个节点的 \texttt{next\_edges} 的传递闭包，其中每个 \texttt{Edge} 仅携带提示——形状提示、梯度数据类型、设备提示——因此向后可以在不接触前向张量的情况下实现缺失的梯度。 \texttt{GraphTask} 保存每次向后构建一次的依赖计数器映射、由原始 \texttt{Node*} 键控的输入缓冲区映射以及 \texttt{grad} 捕获的输出向量。 \texttt{ReadyQueue} 是按节点的创建序列号排序的最大堆：它首先弹出最大的序列号，近似于反向创建顺序，而真正的拓扑顺序由依赖计数器强制执行。每个节点解释器执行十个步骤——梯度模式保护、捕获簿记、缺失梯度物化、预钩子、评估节点保护、\texttt{apply}、后钩子、\texttt{sum\_to\_shape}、dtype 转换、NaN 探测——然后在任务互斥体下传播到父级。
 
@@ -896,7 +896,7 @@ Autocast+复合分支 & 预测未采取 & $\sim$1--2\,ns \\
 \end{tabular}
 \end{table}
 
-以下是两个结论。首先，\textbf{the dispatcher is not the bottleneck}； C++ 端调度是 $\sim$890\,ns 总计 ($<0.5\%$) 的 $\sim$4\,ns，因此 13 槽数组和封闭密钥设计在 Python 层中实际上不会花费任何成本。其次，\textbf{the binding dominates}，它是每操作 Python 控制流所固有的：将 1{,}000 个操作批处理到已编译的 \texttt{stax} 程序中的训练步骤将 1{,}000 个桥交叉替换为一个 (\S\ref{sec:arch:stax})，从而消除了该主机上每个步骤 $\sim$0.9\,ms 的纯每操作开销。
+以下是两个结论。首先，\textbf{the dispatcher is not the bottleneck}； C++ 端调度是 $\sim$890\,ns 总计 ($<0.5\%$) 的 $\sim$4\,ns，因此 33 槽数组和封闭密钥设计在 Python 层中实际上不会花费任何成本。其次，\textbf{the binding dominates}，它是每操作 Python 控制流所固有的：将 1{,}000 个操作批处理到已编译的 \texttt{stax} 程序中的训练步骤将 1{,}000 个桥交叉替换为一个 (\S\ref{sec:arch:stax})，从而消除了该主机上每个步骤 $\sim$0.9\,ms 的纯每操作开销。
 
 \subsubsection{CPU vs.\ CUDA vs.\ Vulkan 调度开销}
 
@@ -917,7 +917,7 @@ Table~\ref{tab:trimmed} 枚举了 TensorPlay 剪切的轴以及取代它们的�
 \toprule
 Axis & 什么船 & 修剪了什么 \\
 \midrule
-调度钥匙 & 13 个键，\texttt{Composite} 后备 & 无需第三方注册，无需创建运行时密钥 \\
+调度钥匙 & 33 个键，\texttt{Composite} 后备，专用 \texttt{Meta}/稀疏键 & 无需第三方注册，无需创建运行时密钥 \\
 \texttt{Meta} 调度 & none & 没有纯形状内核；形状推断存在于编译器支柱中 \\
 稀疏/量化 & 最小的 COO 存储，无量化的 CPU 操作 & 没有稀疏或量化的调度密钥 \\
 就地别名分析 & 视图函数上的 \texttt{check\_inplace} & 没有多版本别名跟踪器 \\

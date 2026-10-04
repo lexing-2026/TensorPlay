@@ -617,7 +617,7 @@ static PyObject* pyop_add_function_ov0(PyObject*, PyObject* const* args,
 \end{tabular}
 \end{table}
 
-大小排序是故意的：重新调度层和 CPython FASTCALL 层占主导地位，因为它们显式枚举每个重载；手写的调度程序表（超过 13 个键的 \texttt{DispatchTable}）保持较小且不变。 \texttt{TensorGenerated.cpp} 和 \texttt{TensorCPythonGenerated.h} 中操作员数量的增长呈线性；添加一个新模式正好添加一个重新调度渠道、一个成员和一个 CPython 条目，通过比较 YAML 编辑前后的暂存树进行验证。
+大小排序是故意的：重新调度层和 CPython FASTCALL 层占主导地位，因为它们显式枚举每个重载；手写的调度程序表（超过 33 个键的 \texttt{DispatchTable}）保持较小且不变。 \texttt{TensorGenerated.cpp} 和 \texttt{TensorCPythonGenerated.h} 中操作员数量的增长呈线性；添加一个新模式正好添加一个重新调度渠道、一个成员和一个 CPython 条目，通过比较 YAML 编辑前后的暂存树进行验证。
 
 \subsection{新鲜度和失效模式}
 

@@ -8,32 +8,48 @@ Redispatch 将张量的运行时属性解析为键，选择
 通过两个合作层的运算符：手写的 \texttt{pybind11}
 绑定和生成的 \texttt{METH\_FASTCALL} 函数，都是漏斗
 通过 \texttt{CPythonBridge} 助手和共享的 \texttt{tp\_python}
-图书馆。该设计将异构键空间修剪为 13 个插槽，编码分层
+图书馆。该设计将异构键空间修剪为 33 个插槽，编码分层
 作为固定偏移量，以便优先级是算术，使用获取/释放原子
 将类型擦除隔离到一个模板，而不是锁定热路径，并且
 重用一种 Python 类型注册，以便返回的张量保留身份。
 
-\subsection{DispatchKey：13 个键和固定偏移}
+\subsection{DispatchKey：33 个键和固定偏移}
 \label{sec:dispatchkey}
 
-定义了 13 个 live key 加哨兵；
-数字顺序优先：
+定义了 32 个 live key 加哨兵；
+数字顺序即优先顺序：
 
-\begin{lstlisting}[caption={13 keys.}, label=lst:dispatchkey]
+\begin{lstlisting}[caption={33 keys.}, label=lst:dispatchkey]
 enum class DispatchKey : uint8_t {
-  CPU=0, CUDA=1, Vulkan=2,
-  AutogradCPU=3, AutogradCUDA=4, AutogradVulkan=5,
-  AutocastCPU=6, AutocastCUDA=7, AutocastVulkan=8,
-  VmapCPU=9, VmapCUDA=10, VmapVulkan=11,
-  Composite=12, EndOfKeys=13
+  CPU=0, CUDA=1, Vulkan=2, SparseCPU=3, SparseCUDA=4, Sparse=5, Meta=6,
+  Python=7, DynamicLayerBackMode=8,
+  AutogradCPU=9, AutogradCUDA=10, AutogradVulkan=11, AutogradSparseCPU=12,
+  AutogradSparseCUDA=13, AutogradSparse=14, AutogradMeta=15,
+  AutocastCPU=16, AutocastCUDA=17, AutocastVulkan=18, AutocastSparseCPU=19,
+  AutocastSparseCUDA=20, AutocastSparse=21, AutocastMeta=22,
+  VmapCPU=23, VmapCUDA=24, VmapVulkan=25, VmapSparseCPU=26,
+  VmapSparseCUDA=27, VmapSparse=28, VmapMeta=29,
+  Composite=30, VmapMode=31, DynamicLayerFrontMode=32,
+  EndOfKeys=33
 };
-constexpr size_t kBackendKeyCount=3, kAutogradKeyOffset=3,
-                 kAutocastKeyOffset=6, kVmapKeyOffset=9;
+constexpr size_t kBackendKeyCount=7, kAutogradKeyOffset=9,
+                 kAutocastKeyOffset=16, kVmapKeyOffset=23;
 \end{lstlisting}
 
-\texttt{Composite}=12 的存储不符合逻辑优先级，因此
+七个后端键占据低位，稀疏布局自成一条后端分量：
+携带稀疏元数据的张量取 \texttt{SparseCPU}/\texttt{SparseCUDA}/\texttt{Sparse}
+而不是其设备的稠密键，因此稀疏注册会被优先选中，
+而不是设备查询找到的稠密内核。 \texttt{Python} 键紧随其后，
+三条变换层按固定偏移整体复制后端键块，所以
+「给一个后端键加偏移」就得到该后端在那一层的键，无需
+按层查表。三个 \texttt{mode} 键（\texttt{VmapMode} 与两个
+\texttt{DynamicLayer*Mode}）只用于模式哨兵，从不进入
+\texttt{key\_set}。
+
+\texttt{Composite}=30 与 \texttt{VmapMode}=31
+的存储不符合逻辑优先级，因此
 \texttt{dispatchKeyIndex} 是一个普通的
-\texttt{static\_cast<size\_t>} 和 \texttt{Composite} 永远不会进入
+\texttt{static\_cast<size\_t>}，这两个键永远不会进入
 \texttt{highest\_priority\_key} 扫描。帮手
  是 \texttt{constexpr}：
 
@@ -41,19 +57,24 @@ constexpr size_t kBackendKeyCount=3, kAutogradKeyOffset=3,
 inline constexpr DispatchKey toAutogradKey(DispatchKey b){return DispatchKey(uint8_t(b)+kAutogradKeyOffset);}
 inline constexpr DispatchKey toAutocastKey(DispatchKey b){return DispatchKey(uint8_t(b)+kAutocastKeyOffset);}
 inline constexpr DispatchKey toVmapKey(DispatchKey b){return DispatchKey(uint8_t(b)+kVmapKeyOffset);}
-inline constexpr bool is_autograd_key(DispatchKey k){uint8_t v=uint8_t(k); return v>=3 && v<6;}
-inline constexpr bool is_autocast_key(DispatchKey k){uint8_t v=uint8_t(k); return v>=6 && v<9;}
-inline constexpr bool is_vmap_key(DispatchKey k){uint8_t v=uint8_t(k); return v>=9 && v<12;}
-inline constexpr bool is_backend_key(DispatchKey k){return k==DispatchKey::CPU||k==DispatchKey::CUDA||k==DispatchKey::Vulkan;}
+inline constexpr bool is_autograd_key(DispatchKey k){uint8_t v=uint8_t(k); return v>=9 && v<16;}
+inline constexpr bool is_autocast_key(DispatchKey k){uint8_t v=uint8_t(k); return v>=16 && v<23;}
+inline constexpr bool is_vmap_key(DispatchKey k){uint8_t v=uint8_t(k); return v>=23 && v<30;}
+inline constexpr bool is_backend_key(DispatchKey k){
+  return k==DispatchKey::CPU||k==DispatchKey::CUDA||k==DispatchKey::Vulkan
+      || k==DispatchKey::SparseCPU||k==DispatchKey::SparseCUDA
+      || k==DispatchKey::Sparse||k==DispatchKey::Meta;}
 inline constexpr DispatchKey toBackendKey(DispatchKey k){
-  return is_vmap_key(k)?DispatchKey(uint8_t(k)-9):is_autograd_key(k)?DispatchKey(uint8_t(k)-3)
-        :is_autocast_key(k)?DispatchKey(uint8_t(k)-6):k;}
+  return is_vmap_key(k)?DispatchKey(uint8_t(k)-23):is_autograd_key(k)?DispatchKey(uint8_t(k)-9)
+        :is_autocast_key(k)?DispatchKey(uint8_t(k)-16):k;}
 \end{lstlisting}
 
-\texttt{is\_backend\_key} 枚举三个密集键； \texttt{Composite}
+每个谓词都是一条范围测试，编译后一至两次比较。
+\texttt{is\_backend\_key} 枚举七个密集键； \texttt{Composite}
 为 false，它控制 \S\ref{sec:handle} 中的后备。
-\texttt{computeDispatchKey} 地图 \texttt{Device}
-经 \texttt{is\_cuda}/\texttt{is\_vulkan} 至 \texttt{Vulkan}。
+\texttt{computeDispatchKey} 映射 \texttt{Device}
+经 \texttt{is\_cuda}/\texttt{is\_vulkan} 至 \texttt{Vulkan}，
+形状推理设备映到 \texttt{Meta}。
 
 \begin{table}[H]
 \centering
@@ -64,33 +85,46 @@ inline constexpr DispatchKey toBackendKey(DispatchKey k){
 \toprule
 抵消 & 瓦尔 & 按键 & 谓词 \\
 \midrule
-$kBackendKeyCount$ & 3 & 0--2 \texttt{Vulkan} & \texttt{is\_backend\_key} \\
-$kAutogradKeyOffset$ & 3 & 3--5 \texttt{Autograd*} & \texttt{is\_autograd\_key} \\
-$kAutocastKeyOffset$ & 6 & 6--8 \texttt{Autocast*} & \texttt{is\_autocast\_key} \\
-$kVmapKeyOffset$ & 9 & 9--11 \texttt{Vmap*} & \texttt{is\_vmap\_key} \\
---- & 12 & \texttt{Composite} & \texttt{key==Composite} \\
---- & 13 & \texttt{EndOfKeys} & 边界检查 \\
+$kBackendKeyCount$ & 7 & 0--6 \texttt{Meta} & \texttt{is\_backend\_key} \\
+--- & 7--8 & \texttt{Python}、\texttt{DynamicLayerBackMode} & 精确比较 \\
+$kAutogradKeyOffset$ & 9 & 9--15 \texttt{Autograd*} & \texttt{is\_autograd\_key} \\
+$kAutocastKeyOffset$ & 16 & 16--22 \texttt{Autocast*} & \texttt{is\_autocast\_key} \\
+$kVmapKeyOffset$ & 23 & 23--29 \texttt{Vmap*} & \texttt{is\_vmap\_key} \\
+--- & 30--32 & \texttt{Composite}、两个 \texttt{mode} & 从不进入 key set \\
+--- & 33 & \texttt{EndOfKeys} & 边界检查 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \subsection{DispatchKeySet：位掩码和优先级}
+
 \label{sec:keyset}
 
-是一个 32 位的位集； 13 位直播：
+是一个 64 位的位集； 33 位全部在掩码宽度内，
+所以边界检查消失：移位不可能越过字长。 32 位本来也够用，
+但 64 位让 \texttt{above()} 的端点算术不需要条件编译：
 
 \begin{lstlisting}[caption={bitmask.}, label=lst:keysetdef]
 class DispatchKeySet{
 public:
-  using raw_t=uint32_t;
+  using raw_t=uint64_t;
   constexpr DispatchKeySet() noexcept: mask_(0){}
   static constexpr DispatchKeySet make(DispatchKey k){return DispatchKeySet(raw_t(1)<<uint8_t(k));}
   void add(DispatchKey k){mask_|=raw_t(1)<<uint8_t(k);}
+  void remove(DispatchKey k){mask_&=~(raw_t(1)<<uint8_t(k));}
   bool has(DispatchKey k) const {return mask_ & (raw_t(1)<<uint8_t(k));}
   bool empty() const {return mask_==0;} raw_t raw() const {return mask_;}
   DispatchKeySet operator|(DispatchKeySet o) const {return DispatchKeySet(mask_|o.mask_);}
-  // remove_autograd/autocast/vmap build masks by iterating kBackendKeyCount (3):
-  DispatchKeySet remove_autograd() const {raw_t m=0; for(size_t i=0;i<3;++i) m|=raw_t(1)<<(i+3); return DispatchKeySet(mask_&~m);}
+  DispatchKeySet operator-(DispatchKeySet o) const {return DispatchKeySet(mask_&~o.mask_);}
+  // remove_autograd/autocast/vmap build masks by iterating kBackendKeyCount (7):
+  DispatchKeySet remove_autograd() const {raw_t m=0; for(size_t i=0;i<7;++i) m|=raw_t(1)<<(i+9); return DispatchKeySet(mask_&~m);}
+  // Every key numerically above `key` -- the layers that have already run by
+  // the time dispatch reaches `key`:
+  static constexpr DispatchKeySet above(DispatchKey key){
+    const raw_t end=raw_t(1)<<uint8_t(DispatchKey::EndOfKeys);
+    const raw_t upto=raw_t(1)<<(uint8_t(key)+1);
+    return DispatchKeySet((end-1)&~(upto-1));
+  }
 private: raw_t mask_=0;
 };
 \end{lstlisting}
@@ -105,18 +139,19 @@ constexpr DispatchKey highest_priority_key() const {
 
 \begin{table}[H]
 \centering
-\caption{来自 \texttt{highest\_priority\_key} 的有效优先级。复合从未在集合中。}
+\caption{来自 \texttt{highest\_priority\_key} 的有效优先级。哨兵键从未在集合中。}
 \label{tab:keypriority}
 \small
 \begin{tabular}{cll}
 \toprule
 指数 & 按键 & 删除以重新调度下面的层 \\
 \midrule
-9--11 & \texttt{Vulkan} 通过 \texttt{toVmapKey} & \texttt{remove\_vmap} \\
-6--8 & \texttt{Vulkan} 通过 \texttt{toAutocastKey} & \texttt{remove\_autocast} \\
-3--5 & \texttt{Vulkan} 通过 \texttt{toAutogradKey} & \texttt{remove\_autograd} \\
-0--2 & \texttt{Vulkan} 通过 \texttt{computeDispatchKey} & 最终计算 \\
-12 & \texttt{Composite} & 仅在 \texttt{getKernel} 中为 \texttt{is\_backend\_key} 进行回退 \\
+23--29 & \texttt{Vulkan} 通过 \texttt{toVmapKey} & \texttt{remove\_vmap} \\
+16--22 & \texttt{Vulkan} 通过 \texttt{toAutocastKey} & \texttt{remove\_autocast} \\
+9--15 & \texttt{Vulkan} 通过 \texttt{toAutogradKey} & \texttt{remove\_autograd} \\
+7--8 & \texttt{Python}、\texttt{DynamicLayerBackMode} & 由 Python 层消费 \\
+0--6 & \texttt{Vulkan} 通过 \texttt{computeDispatchKey} & 最终计算 \\
+30--32 & \texttt{Composite} 与两个 \texttt{mode} & 从不进入集合；仅 \texttt{getKernel} 为 \texttt{is\_backend\_key} 回退到 \texttt{Composite} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -126,10 +161,14 @@ constexpr DispatchKey highest_priority_key() const {
 
 \begin{lstlisting}[caption={computed, not stored.}, label=lst:implkeyset]
 DispatchKeySet key_set() const {
-  DispatchKey backend=computeDispatchKey(device_);
+  const DispatchKey backend = sparse_state_
+      ? (device_.is_cuda() ? DispatchKey::SparseCUDA
+         : device_.is_cpu() ? DispatchKey::SparseCPU
+             : DispatchKey::Sparse)
+      : computeDispatchKey(device_);
   DispatchKeySet ks;
-  if(is_batched()){ks.add(toVmapKey(backend)); return ks;}
   ks.add(backend);
+  if(is_batched()){ks.add(toVmapKey(backend)); return ks;}
   if(!inference_tensor_) ks.add(toAutogradKey(backend));
   return ks;
 }
@@ -144,16 +183,17 @@ DispatchKeySet key_set() const {
 缓存结果，并通过 \texttt{OperatorHandle::getKernel} 处理顶部键进行迭代
 然后用 \texttt{remove\_autograd} 剥离该层，直到
 \texttt{highest\_priority\_key==EndOfKeys} 或找到内核；循环是
-最多三次迭代，因为只能同时存在三层。
+最多三次迭代，因为一个张量的 key set 里只能同时存在
+三层变换轴。
 
 \subsection{调度表和调度程序}
 \label{sec:dispatcher}
 
 每个操作员存储一张固定表：
 
-\begin{lstlisting}[caption={13 atomics per operator.}, label=lst:dispatchtable]
+\begin{lstlisting}[caption={33 atomics per operator.}, label=lst:dispatchtable]
 using KernelFunction = void*;
-constexpr size_t kDispatchKeyCount = size_t(DispatchKey::EndOfKeys); // 13
+constexpr size_t kDispatchKeyCount = size_t(DispatchKey::EndOfKeys); // 33
 inline constexpr size_t dispatchKeyIndex(DispatchKey k) noexcept {return size_t(k);}
 struct P10_API DispatchTable{
   explicit DispatchTable(std::string n): name(std::move(n)){
@@ -211,7 +251,7 @@ void Dispatcher::registerKernel(const std::string& op, DispatchKey k, KernelFunc
 \draw[arrow, color=tporange] (table) -- (kernels);
 \draw[arrow, color=gray, dashed] (table) -- (handle);
 \end{tikzpicture}
-\caption{所有权：单例映射拥有表；表拥有 13 个原子；句柄是通过 \texttt{findHandle} 的视图。}
+\caption{所有权：单例映射拥有表；表拥有 33 个原子；句柄是通过 \texttt{findHandle} 的视图。}
 \label{fig:dispatchermap}
 \end{figure}
 
@@ -688,13 +728,13 @@ py::register_exception_translator([](std::exception_ptr p){
 \end{tabular}
 \end{table}
 
-\begin{tpexample}[Example: Tracing \texttt{tp.add(a,b)} Through All 13 Slots]
-令 \texttt{a} 为 CPU 浮点张量，\texttt{requires\_grad=True} 和 \texttt{b} 为普通 CPU 浮点张量，禁用自动转换，无 vmap。桥接器将两者解压并调用为 \texttt{add} 生成的包装器。输出路径上的 \texttt{key\_set} 产生位 \texttt{CPU(0)} $\cup$ \texttt{AutogradCPU(3)} 因为 \texttt{a} 需要梯度。 \texttt{highest\_priority\_key} 返回 \texttt{AutogradCPU}=3，因此 \texttt{getKernel(3)} 找到生成的 autograd 包装器，该包装器记录 \texttt{AddBackward} 节点，然后用 \texttt{remove\_autograd} 调用 \texttt{redispatch\_add}。第二次迭代看到 \texttt{CPU}=0，通过 \texttt{DispatchStub::call} 在 \texttt{PointwiseKernels.cpp} 处找到 \texttt{add\_cpu}，并执行 TensorIterator 循环。步行恰好触及了十三个槽位中的两个；其余十一个从未装载。相同输入上的推理模式会产生一位集 \texttt{\{CPU\}} 和一次迭代。
+\begin{tpexample}[Example: Tracing \texttt{tp.add(a,b)} Through Two Slots]
+令 \texttt{a} 为 CPU 浮点张量，\texttt{requires\_grad=True} 和 \texttt{b} 为普通 CPU 浮点张量，禁用自动转换，无 vmap。桥接器将两者解压并调用为 \texttt{add} 生成的包装器。输出路径上的 \texttt{key\_set} 产生位 \texttt{CPU(0)} $\cup$ \texttt{AutogradCPU(9)} 因为 \texttt{a} 需要梯度。 \texttt{highest\_priority\_key} 返回 \texttt{AutogradCPU}=9，因此 \texttt{getKernel(9)} 找到生成的 autograd 包装器，该包装器记录 \texttt{AddBackward} 节点，然后用 \texttt{remove\_autograd} 调用 \texttt{redispatch\_add}。第二次迭代看到 \texttt{CPU}=0，通过 \texttt{DispatchStub::call} 在 \texttt{ArithmeticKernels.cpp} 处找到 \texttt{add\_cpu}，并执行 TensorIterator 循环。步行恰好触及了三十三个槽位中的两个；其余三十一个从未装载。相同输入上的推理模式会产生一位集 \texttt{\{CPU\}} 和一次迭代。
 \end{tpexample}
 每个表条目都是枚举值或 \texttt{constexpr} 的直接转录，并且
 每个列表都是逐字摘录，最多有空格折叠。篇幅不是通过散文的膨胀而是通过揭露五个具体的
 定义重新调度的工件：使优先级成为的偏移算术
-强制转换，避免存储位集的两分支 \texttt{key\_set}，13-
+强制转换，避免存储位集的两分支 \texttt{key\_set}，33-
 元素原子数组，使查找无锁，两级
 \texttt{TP\_CONCAT} 使批量注册变得卫生，并且单个共享
 \texttt{tp\_python} 保持施法者注册表和包装缓存一致

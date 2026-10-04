@@ -222,7 +222,7 @@
   \node[anchor=west, text=tpblue!35!white, font=\Large\sffamily]
     at ([xshift=1.37cm, yshift=1.35cm]current page.center) {可读的深度学习框架};
   \node[anchor=west, text=white!80!covernavy, font=\small\sffamily]
-    at ([xshift=1.37cm, yshift=0.72cm]current page.center) {显式四支柱架构 \textbullet\ 约 7.5 万行 C++ \textbullet\ 13 槽分发};
+    at ([xshift=1.37cm, yshift=0.72cm]current page.center) {显式四支柱架构 \textbullet\ 约 30 万行 C++ \textbullet\ 33 槽分发};
 
   % 版本标签
   \node[anchor=west, draw=tporange, text=tporange!30!white, rounded corners=2pt,
@@ -329,7 +329,7 @@
 \setlength{\parindent}{2em}
 TensorPlay 是以清晰性与系统严谨性为核心构建的深度学习框架。框架确立由 \textbf{p10}（张量、存储与分发）、\textbf{tpx}（自动微分）、\textbf{stax}（编译中间表示）与原生扩展 \textbf{\_C} 构成的四支柱体系，实现层次分明、依赖单向、链接期强约束的清晰架构，在保持实现精炼的同时完整覆盖分发、自动微分、向量化与剖析等关键机制，为教学、研究与系统探索提供了可读、可复现的基座。
 
-本文系统呈现其关键具体机制：13 槽位 \texttt{DispatchTable} 与 \texttt{Composite} 回退、\texttt{TENSORPLAY\_LIBRARY\_IMPL} 静态注册、\texttt{TensorIterator} 七步流水线、显式有向无环图（无 Tape）、基于 \texttt{sequence\_nr} 的 \texttt{ReadyQueue} 调度、\texttt{SavedVariable} 版本守卫、偏移 9 的 \texttt{Vmap} 键，以及 \texttt{OpRecord}/\texttt{GpuTimerPair}/\texttt{Cupti}/\texttt{Nvtx} 构成的多维剖析技术栈。图编译侧给出同样粒度的机制：捕获期的六 pass 规范化流水线与其顺序契约、两套算子分解表（过载级 297 条、名字级改写含拒绝语义）、联合图捕获与最小割前后向分割（Edmonds--Karp，禁用原因仅三条）、特化键的四元组与可解释守卫、内容派生的区域缓存、388 条降级构成的 12 级查找链、循环中间表示与物化阈值 4/8/30、调度器的 \texttt{WhyNoFuse}、三条代码生成路线，以及原生图“最后一次使用即释放”的执行语义与 \texttt{fused\_mul\_add} 融合规则。
+本文系统呈现其关键具体机制：33 槽位 \texttt{DispatchTable} 与 \texttt{Composite} 回退、\texttt{TENSORPLAY\_LIBRARY\_IMPL} 静态注册、\texttt{TensorIterator} 七步流水线、显式有向无环图（无 Tape）、基于 \texttt{sequence\_nr} 的 \texttt{ReadyQueue} 调度、\texttt{SavedVariable} 版本守卫、偏移 23 的 \texttt{Vmap} 键，以及 \texttt{OpRecord}/\texttt{GpuTimerPair}/\texttt{Cupti}/\texttt{Nvtx} 构成的多维剖析技术栈。图编译侧给出同样粒度的机制：捕获期的六 pass 规范化流水线与其顺序契约、两套算子分解表（过载级 297 条、名字级改写含拒绝语义）、联合图捕获与最小割前后向分割（Edmonds--Karp，禁用原因仅三条）、特化键的四元组与可解释守卫、内容派生的区域缓存、388 条降级构成的 12 级查找链、循环中间表示与物化阈值 4/8/30、调度器的 \texttt{WhyNoFuse}、三条代码生成路线，以及原生图“最后一次使用即释放”的执行语义与 \texttt{fused\_mul\_add} 融合规则。
 
 \medskip
 \noindent\textbf{关键词：}深度学习框架、分发、自动微分、向量化映射、重分发、剖析器、代码生成、张量迭代器、图编译、算子分解、前后向分割、降级、守卫

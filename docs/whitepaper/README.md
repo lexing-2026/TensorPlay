@@ -2,7 +2,7 @@
 
 **业界最高标准，Windows `E:\texlive` 本地可编译，已全面中文化**
 
-本目录包含 TensorPlay 白皮书的可发表 LaTeX 源码。与高层概述不同，本文档以 `path:line` 援引**具体**机制：13 槽 `DispatchTable`、`TENSORPLAY_LIBRARY_IMPL` 静态注册、7 步 `TensorIterator` 流水线、显式有向无环图（无 Tape）、按 `sequence_nr` 排序的 `ReadyQueue`、`SavedVariable` 版本守卫、偏移 9 的 `Vmap` 键，以及 `OpRecord / GpuTimerPair / Cupti / Nvtx` 剖析器栈。**全文已译为中文**，正文、标题、图表标题、术语表均为中文，代码清单与 `path:line` 援引保持原文。
+本目录包含 TensorPlay 白皮书的可发表 LaTeX 源码。与高层概述不同，本文档以 `path:line` 援引**具体**机制：33 槽 `DispatchTable`、`TENSORPLAY_LIBRARY_IMPL` 静态注册、7 步 `TensorIterator` 流水线、显式有向无环图（无 Tape）、按 `sequence_nr` 排序的 `ReadyQueue`、`SavedVariable` 版本守卫、偏移 23 的 `Vmap` 键，以及 `OpRecord / GpuTimerPair / Cupti / Nvtx` 剖析器栈。**全文已译为中文**，正文、标题、图表标题、术语表均为中文，代码清单与 `path:line` 援引保持原文。
 
 ## 文件结构
 
@@ -15,7 +15,7 @@ docs/whitepaper/
 │   ├── 03-redispatch.tex    # 分发键 13、分发器 214 行、宏、双绑定（已中文化）
 │   ├── 04-profiler.tex      # OpRecord、GpuTimerPair、Cupti/Nvtx/Itt、开销（已中文化）
 │   ├── 05-autograd.tex      # Node/Edge/GraphTask/InputBuffer/Engine、SavedVariable、Anomaly（已中文化）
-│   ├── 06-vmap.tex          # 偏移 9 的向量化映射、TransformDispatch、BatchingKernels（已中文化）
+│   ├── 06-vmap.tex          # 偏移 23 的向量化映射、TransformDispatch、BatchingKernels（已中文化）
 │   ├── 07-memory.tex        # DataPtr、Storage、TensorImpl、Tensor、MemoryFormat（已中文化）
 │   ├── 07b-tensoriterator.tex # 张量迭代器流水线（已中文化）
 │   ├── 08-codegen.tex       # YAML 契约、7 个生成器、构建分段（已中文化）
@@ -73,5 +73,5 @@ ls -lh build/generated/tensorplay/ops/  # 10 个产物
 
 - 剖析器：每算子 `OpRecord`/`GpuTimerPair`、`RingBuffer`、`cuptiSubscribe`、`nvtxRangePushA`，禁用开销约 2 周期。
 - 自动微分：`Node:150 next_edges_`、`Edge:14 shape_hint`、`GraphTask:22 dependencies_`、`InputBuffer:16 accumulate`、`Engine:621 execute` 带 `local_queue` 重入、`SavedVariable:15` 版本守卫。
-- 向量化映射：`VmapCPU=9` 于 `kVmapKeyOffset=9`、`TransformDispatch` 在 `Autograd` 前解包、按切片回退 vs. 批量内核。
+- 向量化映射：`VmapCPU=23` 于 `kVmapKeyOffset=23`、`TransformDispatch` 在 `Autograd` 前解包、按切片回退 vs. 批量内核。
 - 重分发：`array<atomic<void*>,13>` + `Composite` 回退、`TP_CONCAT` 唯一命名、`Library::impl` 链式、`DispatchStub::call` 自动混合精度关口。

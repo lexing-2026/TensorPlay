@@ -9,20 +9,23 @@ Vmap 将为单个样本编写的函数转换为可批量运行的函数，而无
 \subsection{偏移量 9 处的调度密钥和优先级}
 \label{sec:vmapkey}
 
-定义了 13 个具有固定数值的键。 vmap族被放置在offset~9处：
+键的数值是固定的。 vmap 族被放置在 offset~23 处：
 
-\begin{lstlisting}[caption={13 keys, Vmap at offset~9.}, label=lst:vmapkeys]
+\begin{lstlisting}[caption={Vmap keys, at offset~23.}, label=lst:vmapkeys]
 enum class DispatchKey : uint8_t {
-  CPU=0, CUDA=1, Vulkan=2,
-  AutogradCPU=3, AutogradCUDA=4, AutogradVulkan=5,
-  AutocastCPU=6, AutocastCUDA=7, AutocastVulkan=8,
-  VmapCPU=9, VmapCUDA=10, VmapVulkan=11,
-  Composite=12, EndOfKeys=13
+  CPU=0, CUDA=1, Vulkan=2, SparseCPU=3, SparseCUDA=4, Sparse=5, Meta=6,
+  Python=7, DynamicLayerBackMode=8,
+  AutogradCPU=9, /* ... */ AutogradMeta=15,
+  AutocastCPU=16, /* ... */ AutocastMeta=22,
+  VmapCPU=23, VmapCUDA=24, VmapVulkan=25, VmapSparseCPU=26,
+  VmapSparseCUDA=27, VmapSparse=28, VmapMeta=29,
+  Composite=30, VmapMode=31, DynamicLayerFrontMode=32,
+  EndOfKeys=33
 };
-constexpr size_t kBackendKeyCount=3, kAutogradKeyOffset=3, kAutocastKeyOffset=6, kVmapKeyOffset=9;
+constexpr size_t kBackendKeyCount=7, kAutogradKeyOffset=9, kAutocastKeyOffset=16, kVmapKeyOffset=23;
 \end{lstlisting}
 
-助手 \texttt{toVmapKey}、\texttt{is\_vmap\_key} 和 \texttt{toBackendKey} 是 \texttt{constexpr}。 \texttt{DispatchKeySet} 是一个 \texttt{uint32\_t} 位掩码，具有 \texttt{has} 和 \texttt{highest\_priority\_key}，从最高有效设置位向下扫描；因为 vmap 占据 9--11，所以它总是胜过 autocast (6--8)、autograd (3--5) 和 backend (0--2)。 Table~\ref{tab:vmappriority} 使排序更加明确。
+助手 \texttt{toVmapKey}、\texttt{is\_vmap\_key} 和 \texttt{toBackendKey} 是 \texttt{constexpr}。 \texttt{DispatchKeySet} 是一个 \texttt{uint64\_t} 位掩码，具有 \texttt{has} 和 \texttt{highest\_priority\_key}，从最高有效设置位向下扫描；因为 vmap 占据 23--29，所以它总是胜过 autocast (16--22)、autograd (9--15)、\texttt{Python} (7) 和 backend (0--6)。 Table~\ref{tab:vmappriority} 使排序更加明确。
 
 \begin{table}[H]
 \centering
@@ -33,11 +36,12 @@ constexpr size_t kBackendKeyCount=3, kAutogradKeyOffset=3, kAutocastKeyOffset=6,
 \toprule
 Rank & 数字 & 重点家庭 & 定义于 \\
 \midrule
-4 & 9--11 & \texttt{ VmapVulkan} & , \texttt{kVmapKeyOffset=9} \\
-3 & 6--8 & \texttt{ AutocastVulkan} & , \texttt{kAutocastKeyOffset=6} \\
-2 & 3--5 & \texttt{ AutogradVulkan} & , \texttt{kAutogradKeyOffset=3} \\
-1 & 0--2 & \texttt{ Vulkan}（密集后端） & \\
-0 & 12 & \texttt{Composite} （后端中立后备） & \\
+5 & 23--29 & \texttt{ VmapVulkan} & , \texttt{kVmapKeyOffset=23} \\
+4 & 16--22 & \texttt{ AutocastVulkan} & , \texttt{kAutocastKeyOffset=16} \\
+3 & 9--15 & \texttt{ AutogradVulkan} & , \texttt{kAutogradKeyOffset=9} \\
+2 & 7 & \texttt{Python} & \\
+1 & 0--6 & \texttt{ Vulkan}（密集后端） & \\
+0 & 30 & \texttt{Composite} （后端中立后备） & \\
 \bottomrule
 \end{tabular}
 \end{table}

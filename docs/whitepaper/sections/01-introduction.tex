@@ -44,9 +44,9 @@ Table~\ref{tab:intro:contrib} 是索引； \S\ref{sec:intro:c1}--\S\ref{sec:intr
 \# & 机制 & 主要 \texttt{path:line} & 详解章节 \\
 \midrule
 C1 & 四支柱分解（链接期无环） & \texttt{p10/CMakeLists.txt} & \S\ref{sec:arch} \\
-C2 & 13 槽位重调度 + 静态注册 & \texttt{DispatchKey.h}、\texttt{CPythonBridge.cpp} & \S\ref{sec:redispatch} \\
+C2 & 33 槽位重调度 + 静态注册 & \texttt{DispatchKey.h}、\texttt{CPythonBridge.cpp} & \S\ref{sec:redispatch} \\
 C3 & 显式 DAG（无磁带）的自动微分 & \texttt{Node.h}、\texttt{Engine.h}、\texttt{SavedVariable.h} & \S\ref{sec:autograd} \\
-C4 & Vmap（offset 9）+ 剖析栈 & \texttt{DispatchKey.h}、\texttt{Profiler.h} & \S\ref{sec:vmap}、\S\ref{sec:profiler} \\
+C4 & Vmap（offset 23）+ 剖析栈 & \texttt{DispatchKey.h}、\texttt{Profiler.h} & \S\ref{sec:vmap}、\S\ref{sec:profiler} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -81,13 +81,13 @@ core & \texttt{p10} & \texttt{libp10.so} & \texttt{Threads}, \texttt{COMPUTE\_LI
 \subsubsection{C2：重新调度和静态注册}
 \label{sec:intro:c2}
 
-编码 13 个键：\texttt{CPU}=0、\texttt{CUDA}=1、\texttt{Vulkan}=2、\texttt{AutogradCPU}=3--5、\texttt{AutocastCPU}=6--8、
-\texttt{VmapCPU}=9--11，\texttt{Composite}=12，\texttt{EndOfKeys}=13。偏移量 \texttt{kAutogradKeyOffset}=3、\texttt{kAutocastKeyOffset}=6、\texttt{kVmapKeyOffset}=9
- 进行优先级算术。 \texttt{DispatchKeySet} 是一个 \texttt{uint32\_t} 位集，其 \texttt{highest\_priority\_key}
+编码 33 个键：\texttt{CPU}--\texttt{Meta}=0--6，\texttt{Python}=7，\texttt{Autograd*}=9--15、\texttt{Autocast*}=16--22、
+\texttt{Vmap*}=23--29，\texttt{Composite}=30，\texttt{EndOfKeys}=33。偏移量 \texttt{kAutogradKeyOffset}=9、\texttt{kAutocastKeyOffset}=16、\texttt{kVmapKeyOffset}=23
+ 进行优先级算术。 \texttt{DispatchKeySet} 是一个 \texttt{uint64\_t} 位集，其 \texttt{highest\_priority\_key}
 at 扫描最高有效的设置位，因此数字较大的键获胜； \texttt{TensorImpl::key\_set} at 计算
 从设备和 \texttt{inference\_tensor\_} 设置而不存储它。
 
-每个操作员存储 \texttt{array<atomic<KernelFunction>,13>}； \texttt{OperatorHandle::getKernel} 在做一
+每个操作员存储 \texttt{array<atomic<KernelFunction>,33>}； \texttt{OperatorHandle::getKernel} 在做一
 \texttt{acquire} 加载，并且仅适用于 \texttt{is\_backend\_key} (0--2)，在 \texttt{Composite} 索引~12 处进行第二次加载。 \texttt{DispatchStub::call} 是
 强制自动转换合约 \texttt{is\_autocast\_key(k) \&\& !is\_enabled(k) -> throw} 与 \texttt{[[unlikely]]} 的单一阻塞点并发出 32 帧
 当设置 \texttt{TP\_TRACE\_KERNEL\_MISS} 时，为 \texttt{backtrace}。注册是批量的：\texttt{TENSORPLAY\_LIBRARY\_IMPL(KEY, NAME)} 使用两级
@@ -129,7 +129,7 @@ fn->sequence\_nr < other.fn->sequence\_nr}) 将 \texttt{ReadyQueue} 定义为线
 \subsubsection{C4：Vmap 和 Profiler 堆栈}
 \label{sec:intro:c4}
 
-Vmap 精确地占据了 offset~9，因此它的排名优于 autograd 和 backend。 \texttt{DispatchKey::VmapCPU}=9 且 \texttt{kVmapKeyOffset}=9
+Vmap 精确地占据了 offset~23，因此它的排名优于 autocast、autograd 和 backend。 \texttt{DispatchKey::VmapCPU}=23 且 \texttt{kVmapKeyOffset}=23
 ; \texttt{toVmapKey} at 和 \texttt{is\_vmap\_key} 是 \texttt{constexpr} 范围测试，低于 1
 比较。 \texttt{TransformDispatch} at 和内核表 at 实现每片回退与
 分批内核；调度程序在 autograd 层观察张量之前解开变换状态，因此 \texttt{Vmap} 和 autograd 无需第二个调度表即可组合。
@@ -157,8 +157,8 @@ CUDA 操作并在会话停止时解析已用的 \texttt{gpu\_ms}。 \ac{cupti} \
 \toprule
 Axis & 存在于 & 修剪（非目标）和后备 \\
 \midrule
-在 (\texttt{Vulkan} + \texttt{Vmap} + \texttt{Composite}) 处调度键和 13 个键且无稀疏、量化、meta、mkldnn、xla、lazy
-调度键；量化内核仅以复合形式存在 \\
+在 (\texttt{Vulkan} + \texttt{Vmap} + \texttt{Composite}) 处调度键和 33 个键且无 mkldnn、xla、lazy
+调度键；量化内核仅以复合形式存在，稀疏与 meta 各有专用后端键 \\
 张量存储和密集 \texttt{Storage}、\texttt{DataPtr}、\texttt{Allocator}
  &没有稀疏的COO/CSR存储，没有量化的每张量/每通道存储，没有元设备分配；稀疏的助手
 正在教学存根 \\
@@ -174,15 +174,13 @@ Autograd 和显式 DAG (, \texttt{GraphTask.h},) 与 \texttt{SavedVariable} 版�
 \end{tabular}
 \end{table}
 
-稀疏是最能说明问题的装饰。声明 API 表面，但从未定义 \texttt{SparseCPU} 和
-\texttt{TensorImpl::key\_set} 从不发出它，因此调度从不查询稀疏槽。添加稀疏的贡献者将添加一个密钥，从 13 扩展 \texttt{kDispatchKeyCount}，并添加
-偏移助手，这正是非循环构建旨在使讨论变得足够痛苦的变化。由于同样的原因，元张量不存在：\texttt{DeviceType::Meta}
-作为枚举值存在，但从不参与 \texttt{computeDispatchKey} at 且从不获取 \texttt{RegisterKernel} 条目，因此 \texttt{has\_kernel(...,
-Meta)} 通过构造仍然为 false。盒装别名分析和形状检查省略不存在，因为代码生成管道位于 和
+稀疏是这条规则的一个真实用例，而不是被修剪掉的轴。稀疏布局需要自己的后端分量：\texttt{TensorImpl::key\_set} 在张量携带稀疏元数据时发出 \texttt{SparseCPU}/\texttt{SparseCUDA}/\texttt{Sparse}，而不是该设备的稠密键，所以稀疏注册会被优先选中，而不是设备查询找到的稠密内核。代价是键数随后端数线性增长——每新增一个后端就多四个键（自身加三层），因为三条变换轴的偏移量是对整块后端键复制的。\texttt{Meta} 是第二个这样的后端：\texttt{computeDispatchKey} 把形状推理设备映到它，因此 \texttt{has\_kernel(...,Meta)} 是真的——纯形状推理有专用快速路径，而不是共享 \texttt{Composite} 后备。
+
+盒装别名分析和形状检查仍然被修剪，因为代码生成管道
  故意生成没有别名元数据的直线向后公式； stax 解释器重新输入 \texttt{tpx::ops}
  因此，别名的正确性取决于急切的调度程序，而不是编译器传递。
 
-修剪后的轴并非没有记录；它们被记录为经过修剪的，以便读者不会搜索不存在的稀疏调度键。将修剪轴提升为真实关键点的未来修订必须进行更新。
+修剪后的轴并非没有记录；它们被记录为经过修剪的，以便读者不会搜索不存在的调度键。真正被修剪的是量化的专用键：量化内核只以 composite 形式存在。把任何一个修剪轴提升为真实关键点的未来修订必须同步更新 \S\ref{sec:redispatch} 的偏移表。
 
 \subsection{如何阅读本文}
 \label{sec:intro:howto}
@@ -209,7 +207,7 @@ Goal & 章节 & 中心人物 \\
 \end{table}
 
 系统概述：先阅读\S\ref{sec:arch}和Fig.~\ref{fig:pillars}；它下面的 YAML$\rightarrow$artifact 合约位于 via \texttt{main.py}。调度内部结构住在
-\S\ref{sec:redispatch}（DispatchKey算术，\texttt{array<atomic<void*>,13>}，复合回退，\texttt{TP\_CONCAT}）和\S\ref{sec:memory}（TensorIterator七步管道
+\S\ref{sec:redispatch}（DispatchKey算术，\texttt{array<atomic<void*>,33>}，复合回退，\texttt{TP\_CONCAT}）和\S\ref{sec:memory}（TensorIterator七步管道
 ）。 Autograd 是 \S\ref{sec:autograd} 的主题：$\rightarrow$ 处的 USB 插槽
 $\rightarrow$ 在 \texttt{Autograd.cpp} 进行强制转换，堆 \texttt{ReadyQueue} 由 \texttt{sequence\_nr} 进行转换，以及
 \texttt{SavedVariable} 守卫。编译器支柱是 \S\ref{sec:arch:stax} ，stax IR 加上解释器；所有其他Python
