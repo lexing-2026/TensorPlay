@@ -194,32 +194,75 @@ bool is_builtin_dispatch_free(PyObject* value) {
 // every operation of every step if the answer is not kept.  Giving a type a
 // hook later changes its version, so a stale entry stops matching by itself.
 // Only read and written with the interpreter lock held.
+//
+// The two flags are kept apart on purpose: each probe asks about one
+// attribute, and only the scan in may_carry_hook asks about both.  A type
+// whose entry says nothing about the subclass attribute must still be asked
+// there, or a tensor subclass carrying only a dispatch hook would lose its
+// dispatch.
 struct HookFreeType {
     PyTypeObject* type = nullptr;
     unsigned int version = 0;
+    bool function_free = false;
+    bool subclass_free = false;
 };
 std::array<HookFreeType, 8> g_hook_free_types{};
 std::size_t g_hook_free_next = 0;
 
 bool type_version(PyTypeObject* type, unsigned int* version) {
+#if PY_VERSION_HEX >= 0x030D0000
+    // The interpreter retired the flag gate this check used to read: a type
+    // holds a usable version exactly when its tag is nonzero, and whenever
+    // the type's attributes change the interpreter clears the tag itself
+    // before another one is handed out.  The value read here is therefore
+    // either current or absent, never a stale version of an altered type.
+    *version = type->tp_version_tag;
+    return *version != 0;
+#else
     if (!PyType_HasFeature(type, Py_TPFLAGS_VALID_VERSION_TAG)) return false;
     *version = type->tp_version_tag;
     return *version != 0;
+#endif
 }
 
-bool known_hook_free(PyTypeObject* type) {
+HookFreeType* find_hook_free_entry(PyTypeObject* type) {
     unsigned int version = 0;
-    if (!type_version(type, &version)) return false;
-    for (const HookFreeType& entry : g_hook_free_types) {
-        if (entry.type == type && entry.version == version) return true;
+    if (!type_version(type, &version)) return nullptr;
+    for (HookFreeType& entry : g_hook_free_types) {
+        if (entry.type == type && entry.version == version) return &entry;
     }
-    return false;
+    return nullptr;
 }
 
-void remember_hook_free(PyTypeObject* type) {
+void remember_hook_free(PyTypeObject* type, bool function_free,
+                        bool subclass_free) {
     unsigned int version = 0;
+#if PY_VERSION_HEX >= 0x030D0000
+    // A type only carries a version once something has asked for one, and a
+    // type never probed by a cacheable attribute lookup still reads zero.
+    // Asking here keeps the answer below keepable for those types too; once
+    // the tag exists, the interpreter owns it: an attribute added later
+    // clears the tag, the kept answer stops matching, and the live probes
+    // run again.
+    if (!type_version(type, &version)) {
+        if (PyUnstable_Type_AssignVersionTag(type) == 0) return;
+        if (!type_version(type, &version)) return;
+    }
+#else
     if (!type_version(type, &version)) return;
-    g_hook_free_types[g_hook_free_next] = {type, version};
+#endif
+    for (HookFreeType& entry : g_hook_free_types) {
+        if (entry.type == type && entry.version == version) {
+            entry.function_free = entry.function_free || function_free;
+            entry.subclass_free = entry.subclass_free || subclass_free;
+            return;
+        }
+    }
+    HookFreeType& entry = g_hook_free_types[g_hook_free_next];
+    entry.type = type;
+    entry.version = version;
+    entry.function_free = function_free;
+    entry.subclass_free = subclass_free;
     g_hook_free_next = (g_hook_free_next + 1) % g_hook_free_types.size();
 }
 
@@ -250,11 +293,14 @@ bool may_carry_hook(PyObject* value) {
         return false;
     }
     PyTypeObject* type = Py_TYPE(value);
-    if (known_hook_free(type)) return false;
+    HookFreeType* entry = find_hook_free_entry(type);
+    if (entry != nullptr && entry->function_free && entry->subclass_free) {
+        return false;
+    }
     if (has_function_dispatch(value) || has_subclass_dispatch(value)) {
         return true;
     }
-    remember_hook_free(type);
+    remember_hook_free(type, true, true);
     return false;
 }
 
@@ -338,13 +384,26 @@ bool insert_candidate(
         return true;
     }
     if (require_subclass && !is_tensor_object(value)) return true;
+    PyTypeObject* type = Py_TYPE(value);
+    // Same kept-answer rule as may_carry_hook below: without it, a call
+    // holding a hook-registered value (a DType kwarg, say) pays the live
+    // attribute probe on every operation for as long as the layers run.
+    // Only this probe's own answer may skip it: a type with no function hook
+    // can still carry the dispatch hook the subclass probe looks for.
+    HookFreeType* entry = find_hook_free_entry(type);
+    if (entry != nullptr &&
+        (require_subclass ? entry->subclass_free : entry->function_free)) {
+        return true;
+    }
     const bool has_hook = require_subclass ? has_subclass_dispatch(value)
                                            : has_function_dispatch(value);
     if (PyErr_Occurred()) return false;
-    if (!has_hook) return true;
+    if (!has_hook) {
+        remember_hook_free(type, !require_subclass, require_subclass);
+        return true;
+    }
     g_saw_any_hook.store(true, std::memory_order_relaxed);
 
-    auto* type = Py_TYPE(value);
     for (PyTypeObject* old_type : candidate_types) {
         if (old_type == type) return true;
     }
@@ -1305,6 +1364,19 @@ Scalar as_scalar(PyObject* obj, const char* op, int idx) {
 }
 
 DType as_dtype(PyObject* obj, const char* op, int idx) {
+    // Enum members are plain pybind instances holding the DType behind the
+    // first holder slot.  A type match reads it directly instead of sending
+    // every factory call that spells dtype=... explicitly through the
+    // generic caster's registry lookup.  Anything else (ints, subclasses,
+    // foreign objects) still takes the caster, so the accepted argument
+    // surface is unchanged.
+    static PyTypeObject* dtype_tp = Py_TYPE(py::cast(DType::Float32).ptr());
+    if (Py_TYPE(obj) == dtype_tp) {
+        auto* inst = reinterpret_cast<py::detail::instance*>(obj);
+        if (inst->simple_layout && inst->simple_value_holder[0] != nullptr) {
+            return *static_cast<const DType*>(inst->simple_value_holder[0]);
+        }
+    }
     try {
         return py::reinterpret_borrow<py::object>(obj).cast<DType>();
     } catch (const py::cast_error&) {
