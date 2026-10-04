@@ -71,10 +71,7 @@
         <img src="https://img.shields.io/badge/build-passing-23347A?style=flat-square&labelColor=11B5D1&logo=githubactions&logoColor=white" alt="Build">
     </a>
     <a href="https://github.com/lexing-2026/TensorPlay/actions/workflows/trunk.yml">
-        <img src="https://img.shields.io/badge/tests-1824%20passed-23347A?style=flat-square&labelColor=11B5D1&logo=pytest&logoColor=white" alt="Tests">
-    </a>
-    <a href="https://github.com/lexing-2026/TensorPlay/actions/workflows/trunk.yml">
-        <img src="https://img.shields.io/badge/coverage-91%25-11B5D1?style=flat-square&labelColor=23347A" alt="Coverage">
+        <img src="https://img.shields.io/badge/tests-5680%20passed-23347A?style=flat-square&labelColor=11B5D1&logo=pytest&logoColor=white" alt="Tests">
     </a>
 </p>
 
@@ -111,6 +108,41 @@ TensorPlay 是一个 Python 软件包，提供两大高层能力：
 
 整个技术栈——Python API、C++ 核心、CUDA 内核、编译器——都为「可读」而生：实现干净、计算图显式，模型与硬件之间没有黑盒。
 
+<!-- toc -->
+
+- [关于 TensorPlay](#关于-tensorplay)
+  - [一个透明的张量库](#一个透明的张量库)
+  - [为什么选择 TensorPlay](#为什么选择-tensorplay)
+    - [亲切且 Python 优先](#亲切且-python-优先)
+    - [DIY 硬件加速](#diy-硬件加速)
+    - [显式的自动微分引擎](#显式的自动微分引擎)
+    - [无痛扩展](#无痛扩展)
+- [安装](#安装)
+  - [二进制安装](#二进制安装)
+  - [Nightly（预览版）](#nightly预览版)
+  - [从源码构建](#从源码构建)
+    - [环境要求](#环境要求)
+    - [获取源码](#获取源码)
+    - [安装构建依赖](#安装构建依赖)
+    - [安装 TensorPlay](#安装-tensorplay)
+    - [运行测试套件](#运行测试套件)
+    - [调整构建选项（可选）](#调整构建选项可选)
+- [快速上手](#快速上手)
+  - [自动微分](#自动微分)
+  - [定义神经网络](#定义神经网络)
+  - [训练循环](#训练循环)
+- [基准测试](#基准测试)
+- [测试](#测试)
+- [资源](#资源)
+- [社区交流](#社区交流)
+- [发布与贡献](#发布与贡献)
+- [许可证](#许可证)
+- [开发组织](#开发组织)
+  - [项目](#项目)
+  - [其他依赖](#其他依赖)
+
+<!-- tocstop -->
+
 ## 关于 TensorPlay
 
 ### 一个透明的张量库
@@ -135,7 +167,7 @@ TensorPlay 是一个 Python 软件包，提供两大高层能力：
 ```mermaid
 flowchart TB
     py["Python API — tensorplay / nn / optim / data"] --> ag["TPX autograd — 显式 DAG"]
-    py --> disp["P10 dispatcher — 13 个 dispatch key"]
+    py --> disp["P10 dispatcher — 33 个 dispatch key"]
     ag --> disp
     disp --> cpu["CPU 内核"]
     disp --> cuda["CUDA 内核"]
@@ -177,7 +209,7 @@ CPU 与 CUDA 后端刻意做了简化：每个文件一族内核、每个单元�
 # 从 PyPI 安装 CPU 版本
 pip install tensorplay --upgrade
 
-# 从 TensorPlay CUDA 源安装 CUDA 13.0 版本
+# 从 TensorPlay CUDA 源安装 CUDA 内核版本——按工具链选变体：cu124 / cu126 / cu130
 # PyPI 作为运行时依赖的额外索引
 pip install tensorplay \
   --index-url https://download.tensorplay.cn/whl/cu130/ \
@@ -185,7 +217,7 @@ pip install tensorplay \
 ```
 
 > [!NOTE]
-> 请确保 Python 版本与 wheel 标签匹配（如 `cp310` 对应 Python 3.10）。CUDA 版本要求驱动与运行时支持对应 CUDA 版本。
+> 请确保 Python 版本与 wheel 标签匹配（如 `cp310` 对应 Python 3.10）。CUDA 版本要求驱动与运行时支持对应 CUDA 版本。完整变体列表见 [`.github/cuda-variants.json`](.github/cuda-variants.json)。
 
 > [!TIP]
 > CUDA 13.0 wheel 仅面向计算能力 8.6 的 GPU。若你的 GPU 计算能力不同（或 wheel 无法在你的设备上运行），请改为[从源码构建](#从源码构建)，并通过 `CMAKE_CUDA_ARCHITECTURES` 指定目标架构——默认值 `native` 会自动探测本机 GPU。
@@ -195,7 +227,7 @@ pip install tensorplay \
 预览明天的功能：每一处通过构建与冒烟流水线的改动都会自动进入滚动的 `nightly` 通道，采用 nightly 版本号格式（`X.Y.0.dev<日期>+cuXXX` / `+cpu`）。每个变体仅保留最新一次构建。
 
 ```bash
-# CUDA nightly
+# CUDA nightly——变体与稳定通道一致：cu124 / cu126 / cu130
 pip install --pre tensorplay \
   --index-url https://download.tensorplay.cn/whl/nightly/cu130/ \
   --extra-index-url https://pypi.org/simple
@@ -224,7 +256,12 @@ pip install --pre tensorplay \
 ```bash
 git clone https://github.com/lexing-2026/TensorPlay.git
 cd TensorPlay
+# 如果你更新的是已有 checkout
+git submodule sync
+git submodule update --init --recursive
 ```
+
+第三方源码通过 submodule 引入，并锁定到具体 revision。跳过它们的 checkout 仍能编译，但会降级：没有 BLAS 向量数学、没有 distributed 传输，Vulkan 后端在没有系统安装提供依赖时回退到 CPU。
 
 #### 安装构建依赖
 
@@ -249,10 +286,21 @@ pip install -e . --no-build-isolation
 python -m build --wheel
 ```
 
-构建成功后，`import tensorplay` 会加载安装包内编译好的 `_C` 扩展。
+构建成功后，`import tensorplay` 会加载安装包内编译好的 `_C` 扩展。快速验证：
+
+```bash
+python -c "import tensorplay as tp; print(tp.__version__); print('vulkan:', tp.is_vulkan_available())"
+```
 
 > [!TIP]
 > 日常内核开发推荐可编辑安装（`pip install -e . --no-build-isolation`），只重编译改动的部分。
+
+#### 运行测试套件
+
+```bash
+pytest test/ -q          # 全部
+pytest test/test_vulkan.py -q   # 单个后端套件，例如 Vulkan
+```
 
 #### 调整构建选项（可选）
 
@@ -276,6 +324,7 @@ CMAKE_CUDA_ARCHITECTURES="70;75;86" pip install .
 | ---- | ---- | ---- |
 | `USE_CUDA` | 自动探测 | 启用/禁用 CUDA 构建 |
 | `USE_ROCM` | `OFF` | 启用 AMD GPU / HIP 构建（与 `USE_CUDA` 互斥） |
+| `USE_VULKAN` | 自动探测 | 启用 Vulkan 构建；需要机器上有 Vulkan loader，以及 submodule 提供的头文件与 GLSL 编译器 |
 | `BUILD_TESTS` | `OFF` | 构建 C++ 测试套件 |
 | `USE_BLAS` / `USE_ONEDNN` | `ON` | BLAS 加速 / oneDNN 算子库 |
 | `MAX_JOBS` | 机器默认 | 限制编译并行度 |
@@ -301,7 +350,8 @@ z = x.matmul(y) + tp.ones_like(x)
 loss = z.sum()
 loss.backward()
 
-print(x.grad)  # [[6., 6.], [6., 6.]]
+# x.grad 为 [[11., 15.], [11., 15.]]——因为 dL/dz 全为 1，结果就是 y 的行和
+print(x.grad)
 ```
 
 在底层，TPX 把每个操作记录进一张显式的 DAG，并逐节点重放链式法则：$\dfrac{\partial \mathcal{L}}{\partial x} = \dfrac{\partial \mathcal{L}}{\partial z} \cdot \dfrac{\partial z}{\partial x}$ —— 图的每一条边都是你可以单步调试的代码。
@@ -355,7 +405,7 @@ for batch_x, batch_y in train_loader:
 - **微观与子系统**：GEMM、优化器 step、dataloader、序列化、autograd Function 开销、自定义算子调用开销、LLaMA 端到端
 - **报告**：每个脚本输出 JSON 报告（`--json-out`）——吞吐、延迟分位数、编译开销——可直接绘图并用于[白皮书](docs/whitepaper/main.pdf)评估
 
-实测亮点（见[白皮书](docs/whitepaper/main.pdf) §9）：dispatcher 在 CPU、CUDA 与 Vulkan 路径上都只增加不到 1% 的开销；CUDA 后端覆盖 1,274 个独立算子（CPU 面的 96%）；Vulkan 教学后端交付 145 个算子，背后是 4.5k 行 GLSL shader。
+实测亮点（见[白皮书](docs/whitepaper/main.pdf) §9）：dispatcher 在 CPU、CUDA 与 Vulkan 路径上都只增加不到 1% 的开销；CUDA 后端覆盖 1,262 个独立算子（CPU 面 1,233 个的 97%）；Vulkan 教学后端交付 224 个算子，背后是 102 个文件、6.8k 行 GLSL shader。pytest 套件共收集 5,680 个测试。
 
 脚本与方法论：[benchmark/README.md](benchmark/README.md)。
 
