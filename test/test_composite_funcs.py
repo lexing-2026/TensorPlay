@@ -1045,6 +1045,15 @@ class TestLeftoverNativeBatch:
         es2 = tp.empty_strided([2, 3], [3, 1], dtype=tp.float64)
         es2.copy_(tp.ones([2, 3]))
         assert close(es2.cpu().tolist(), [[1.0] * 3, [1.0] * 3])
+        # A gapped layout reaches past its element count: the buffer holds one
+        # past the farthest offset, so writing through the strides stays in it.
+        es3 = tp.empty_strided([17, 5], [33, 1], dtype=tp.float32)
+        assert es3.stride() == (33, 1)
+        assert es3.untyped_storage().nbytes() == 4 * (16 * 33 + 5)
+        es3.fill_(2.0)
+        assert close(es3.sum().item(), 170.0)
+        assert tp.empty_strided([0, 5], [5, 1]).untyped_storage().nbytes() == 0
+        assert tp.empty_strided([], [], dtype=tp.float64).untyped_storage().nbytes() == 8
 
     def test_cdist_batched_and_generic_p(self):
         x1 = torch.randn(2, 4, 6)

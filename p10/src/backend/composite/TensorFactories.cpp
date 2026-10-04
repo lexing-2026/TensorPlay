@@ -191,14 +191,28 @@ Tensor range_native(const Scalar& start, const Scalar& end, const Scalar& step,
                        dtype.value_or(DType::Undefined), device);
 }
 
-// Uninitialized allocation with explicit strides: the base dense buffer is
-// handed the requested layout via as_strided, matching the factory contract
-// (values undefined until written).
+// Uninitialized allocation with explicit strides (values undefined until
+// written).  The buffer holds every element the layout can reach -- one past
+// the farthest offset, which for padded or gapped strides is more than the
+// element count -- and is handed the requested layout via as_strided.
 Tensor empty_strided_native(const std::vector<int64_t>& size,
                             const std::vector<int64_t>& stride,
                             std::optional<DType> dtype,
                             std::optional<Device> device, bool pin_memory) {
-    Tensor base = ops::empty(size, dtype, device, pin_memory);
+    TP_CHECK(size.size() == stride.size(),
+             "empty_strided: got ", size.size(), " sizes and ", stride.size(),
+             " strides");
+    int64_t storage_elems = 1;
+    for (size_t d = 0; d < size.size(); ++d) {
+        TP_CHECK(size[d] >= 0, "empty_strided: negative size ", size[d]);
+        TP_CHECK(stride[d] >= 0, "empty_strided: negative stride ", stride[d]);
+        if (size[d] == 0) {
+            storage_elems = 0;
+            break;
+        }
+        storage_elems += (size[d] - 1) * stride[d];
+    }
+    Tensor base = ops::empty({storage_elems}, dtype, device, pin_memory);
     return base.as_strided(size, stride, 0);
 }
 
