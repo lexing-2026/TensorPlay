@@ -166,11 +166,17 @@ Tensor full_kernel(const std::vector<int64_t>& size, Scalar fill_value, DType dt
 Tensor& fill_kernel(Tensor& self, const Scalar& value) {
     if (self.numel() == 0) return self;
     // Dense storage fills in one sweep; any other layout walks its strides.
+    // Chunks are handed to the intra-op pool once the element count clears
+    // the grain threshold; smaller fills stay on the calling thread.
     if (self.is_contiguous()) {
         #define OP_CASE(ctype, name) \
         case DType::name: { \
+            const ctype val = value.to<ctype>(); \
             ctype* data = self.data_ptr<ctype>(); \
-            std::fill(data, data + self.numel(), value.to<ctype>()); \
+            parallel::parallel_for(0, self.numel(), parallel::GRAIN_SIZE, \
+                [data, val](int64_t begin, int64_t end) { \
+                    std::fill(data + begin, data + end, val); \
+                }); \
             break; \
         }
         switch (self.dtype()) {
