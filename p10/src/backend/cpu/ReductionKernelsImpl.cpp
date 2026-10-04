@@ -1746,6 +1746,16 @@ static std::optional<Tensor> try_sum_leading_rows(
 // the row count is a large multiple of the team size. Tasks own their slice
 // by index and zero it themselves, so every slice is written exactly once and
 // the fold needs no cross-task coordination.
+//
+// A running sum's rounding error grows with the depth of the accumulation
+// chain, so a task folding thousands of rows into one slice compounds far more
+// error than a short partial sum. Tasks past a few dozen rows per task fold
+// through a carry cascade instead: level 0 absorbs a fixed group of rows and
+// is carried into level 1, level 1 into level 2 every 16 groups, level 2 into
+// level 3 every 256 groups, and the levels fold together at the end. Each add
+// then lands on an accumulator holding only a bounded number of rows' worth of
+// magnitude no matter how many rows the task owns, capping the effective chain
+// depth near the group size times the level count.
 template <typename Scalar>
 std::optional<Tensor> sum_leading_rows_split_impl(
     const Tensor& input, const std::vector<int64_t>& out_shape) {
@@ -1764,9 +1774,18 @@ std::optional<Tensor> sum_leading_rows_split_impl(
         return std::nullopt;
     }
     Tensor out = Tensor::empty(out_shape, input.dtype(), input.device());
-    Tensor buffer =
-        Tensor::empty({nthreads * cols}, input.dtype(), input.device());
     const int64_t grain = (rows + nthreads - 1) / nthreads;
+    const bool cascade = grain > 64;
+    // The group stays at 16 rows unless the task's row count outgrows what
+    // four carry levels cap, so the wide levels only ever hold whole groups.
+    int64_t lg = 0;
+    while ((int64_t(1) << lg) < grain) {
+        ++lg;
+    }
+    const int64_t group = int64_t(1) << std::max<int64_t>(4, lg / 4);
+    const int64_t tslice = cascade ? 4 * cols : cols;
+    Tensor buffer =
+        Tensor::empty({nthreads * tslice}, input.dtype(), input.device());
 
     const Scalar* TP_RESTRICT in =
         static_cast<const Scalar*>(input.data_ptr());
@@ -1774,23 +1793,98 @@ std::optional<Tensor> sum_leading_rows_split_impl(
     Scalar* TP_RESTRICT outp = static_cast<Scalar*>(out.data_ptr());
     using Vec = Vectorized<Scalar>;
     constexpr int64_t vs = Vec::size();
+    const int64_t vec_cols = cols & ~(vs - 1);
 
     tensorplay::parallel::parallel_for(
         0, nthreads, 1, [&](int64_t b, int64_t be) {
             (void)be;
-            Scalar* TP_RESTRICT acc = buf + b * cols;
-            std::memset(acc, 0, cols * sizeof(Scalar));
+            Scalar* TP_RESTRICT a0 = buf + b * tslice;
             const int64_t rb = b * grain;
             const int64_t re = std::min(rows, rb + grain);
-            for (int64_t r = rb; r < re; ++r) {
+            if (!cascade) {
+                std::memset(a0, 0, cols * sizeof(Scalar));
+                for (int64_t r = rb; r < re; ++r) {
+                    const Scalar* TP_RESTRICT row = in + r * cols;
+                    int64_t j = 0;
+                    for (; j + vs <= cols; j += vs) {
+                        (Vec::loadu(a0 + j) + Vec::loadu(row + j)).store(a0 + j);
+                    }
+                    for (; j < cols; ++j) {
+                        a0[j] += row[j];
+                    }
+                }
+                return;
+            }
+            Scalar* TP_RESTRICT a1 = a0 + cols;
+            Scalar* TP_RESTRICT a2 = a1 + cols;
+            Scalar* TP_RESTRICT a3 = a2 + cols;
+            std::memset(a0, 0, 4 * cols * sizeof(Scalar));
+            const Vec zero(Scalar(0));
+            // Fold one group of rows into level 0, then carry: level 1 takes
+            // every group total, level 2 takes level 1 every 16 groups, level
+            // 3 takes level 2 every 256 groups. A carry zeroes its donor, so
+            // each level only ever holds whole groups of rows.
+            int64_t r = rb;
+            int64_t groups = 0;
+            for (; r + group <= re; r += group) {
+                for (int64_t s = 0; s < group; ++s) {
+                    const Scalar* TP_RESTRICT row = in + (r + s) * cols;
+                    int64_t j = 0;
+                    for (; j + vs <= cols; j += vs) {
+                        (Vec::loadu(a0 + j) + Vec::loadu(row + j)).store(a0 + j);
+                    }
+                    for (; j < cols; ++j) {
+                        a0[j] += row[j];
+                    }
+                }
+                ++groups;
+                for (int64_t j = 0; j + vs <= cols; j += vs) {
+                    (Vec::loadu(a1 + j) + Vec::loadu(a0 + j)).store(a1 + j);
+                    zero.store(a0 + j);
+                }
+                for (int64_t j = vec_cols; j < cols; ++j) {
+                    a1[j] += a0[j];
+                    a0[j] = Scalar(0);
+                }
+                if ((groups & 15) == 0) {
+                    for (int64_t j = 0; j + vs <= cols; j += vs) {
+                        (Vec::loadu(a2 + j) + Vec::loadu(a1 + j)).store(a2 + j);
+                        zero.store(a1 + j);
+                    }
+                    for (int64_t j = vec_cols; j < cols; ++j) {
+                        a2[j] += a1[j];
+                        a1[j] = Scalar(0);
+                    }
+                    if ((groups & 255) == 0) {
+                        for (int64_t j = 0; j + vs <= cols; j += vs) {
+                            (Vec::loadu(a3 + j) + Vec::loadu(a2 + j))
+                                .store(a3 + j);
+                            zero.store(a2 + j);
+                        }
+                        for (int64_t j = vec_cols; j < cols; ++j) {
+                            a3[j] += a2[j];
+                            a2[j] = Scalar(0);
+                        }
+                    }
+                }
+            }
+            for (; r < re; ++r) {
                 const Scalar* TP_RESTRICT row = in + r * cols;
                 int64_t j = 0;
                 for (; j + vs <= cols; j += vs) {
-                    (Vec::loadu(acc + j) + Vec::loadu(row + j)).store(acc + j);
+                    (Vec::loadu(a0 + j) + Vec::loadu(row + j)).store(a0 + j);
                 }
                 for (; j < cols; ++j) {
-                    acc[j] += row[j];
+                    a0[j] += row[j];
                 }
+            }
+            for (int64_t j = 0; j + vs <= cols; j += vs) {
+                (Vec::loadu(a0 + j) + Vec::loadu(a1 + j) + Vec::loadu(a2 + j) +
+                 Vec::loadu(a3 + j))
+                    .store(a0 + j);
+            }
+            for (int64_t j = vec_cols; j < cols; ++j) {
+                a0[j] += a1[j] + a2[j] + a3[j];
             }
         });
     tensorplay::parallel::parallel_for(0, cols, 256, [&](int64_t cb, int64_t ce) {
@@ -1798,14 +1892,14 @@ std::optional<Tensor> sum_leading_rows_split_impl(
         for (; j + vs <= ce; j += vs) {
             Vec a = Vec::loadu(buf + j);
             for (int64_t t = 1; t < nthreads; ++t) {
-                a = a + Vec::loadu(buf + t * cols + j);
+                a = a + Vec::loadu(buf + t * tslice + j);
             }
             a.store(outp + j);
         }
         for (; j < ce; ++j) {
             Scalar s = buf[j];
             for (int64_t t = 1; t < nthreads; ++t) {
-                s += buf[t * cols + j];
+                s += buf[t * tslice + j];
             }
             outp[j] = s;
         }
