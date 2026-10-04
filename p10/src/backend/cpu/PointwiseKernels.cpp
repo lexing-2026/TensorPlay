@@ -2458,6 +2458,112 @@ inline DType wrapped_scalar_pair_dtype(DType tensor_dtype, DType scalar_dtype) {
     return tensor_dtype;
 }
 
+#if defined(__x86_64__)
+namespace {
+
+// Runtime ISA gates; defined with the other x86 helpers further below.
+bool pointwise_cpu_has_avx512();
+bool pointwise_cpu_has_avx2();
+
+// Vector power over dense same-shape operands.  libmvec-class u10 entries
+// evaluate the whole vector at once; the scalar tail falls back to std::pow.
+__attribute__((target("avx2,fma")))
+void pow_tensor_f32_avx2(const float* base, const float* exp, float* out,
+                         int64_t n) {
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        _mm256_storeu_ps(out + i,
+                         tpsleef::pow(_mm256_loadu_ps(base + i),
+                                      _mm256_loadu_ps(exp + i)));
+    }
+    for (; i < n; ++i) {
+        out[i] = std::pow(base[i], exp[i]);
+    }
+}
+
+__attribute__((target("avx2,fma")))
+void pow_tensor_f64_avx2(const double* base, const double* exp, double* out,
+                         int64_t n) {
+    int64_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        _mm256_storeu_pd(out + i,
+                         tpsleef::pow(_mm256_loadu_pd(base + i),
+                                      _mm256_loadu_pd(exp + i)));
+    }
+    for (; i < n; ++i) {
+        out[i] = std::pow(base[i], exp[i]);
+    }
+}
+
+__attribute__((target("avx512f,fma")))
+void pow_tensor_f32_avx512(const float* base, const float* exp, float* out,
+                           int64_t n) {
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        _mm512_storeu_ps(out + i,
+                         tpsleef::pow(_mm512_loadu_ps(base + i),
+                                      _mm512_loadu_ps(exp + i)));
+    }
+    for (; i < n; ++i) {
+        out[i] = std::pow(base[i], exp[i]);
+    }
+}
+
+__attribute__((target("avx512f,fma")))
+void pow_tensor_f64_avx512(const double* base, const double* exp, double* out,
+                           int64_t n) {
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        _mm512_storeu_pd(out + i,
+                         tpsleef::pow(_mm512_loadu_pd(base + i),
+                                      _mm512_loadu_pd(exp + i)));
+    }
+    for (; i < n; ++i) {
+        out[i] = std::pow(base[i], exp[i]);
+    }
+}
+
+template <typename T>
+void pow_vec_contiguous(const T* base, const T* exp, T* out, int64_t n) {
+#if defined(__x86_64__)
+    if constexpr (std::is_same_v<T, float>) {
+        if (pointwise_cpu_has_avx512()) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+                pow_tensor_f32_avx512(base + b, exp + b, out + b, e - b);
+            });
+            return;
+        }
+        if (pointwise_cpu_has_avx2()) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+                pow_tensor_f32_avx2(base + b, exp + b, out + b, e - b);
+            });
+            return;
+        }
+    } else if constexpr (std::is_same_v<T, double>) {
+        if (pointwise_cpu_has_avx512()) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+                pow_tensor_f64_avx512(base + b, exp + b, out + b, e - b);
+            });
+            return;
+        }
+        if (pointwise_cpu_has_avx2()) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+                pow_tensor_f64_avx2(base + b, exp + b, out + b, e - b);
+            });
+            return;
+        }
+    }
+#endif
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+        for (int64_t i = b; i < e; ++i) {
+            out[i] = std::pow(base[i], exp[i]);
+        }
+    });
+}
+
+} // namespace
+#endif
+
 // Helper for pow (Tensor, Tensor)
 Tensor pow_tensor_tensor_kernel(const Tensor& self, const Tensor& exponent) {
     std::vector<int64_t> out_shape = broadcast_shapes(self.sizes(), exponent.sizes());
@@ -2476,6 +2582,29 @@ Tensor pow_tensor_tensor_kernel(const Tensor& self, const Tensor& exponent) {
 
     Tensor self_c = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
     Tensor exp_c = (exponent.dtype() == result_dtype) ? exponent : exponent.to(result_dtype);
+
+    // Single vectorized pass when both operands are dense, share one shape
+    // and stay in a vector-capable float dtype; anything else (broadcasting,
+    // promotion, other dtypes) keeps the generic path below.
+#if defined(__x86_64__)
+    if (!isComplexType(result_dtype) &&
+        (result_dtype == DType::Float32 || result_dtype == DType::Float64) &&
+        self_c.dtype() == exp_c.dtype() &&
+        self_c.is_contiguous() && exp_c.is_contiguous() &&
+        self_c.sizes() == exp_c.sizes()) {
+        const int64_t n = self_c.numel();
+        if (result_dtype == DType::Float32) {
+            pow_vec_contiguous<float>(self_c.data_ptr<float>(),
+                                      exp_c.data_ptr<float>(),
+                                      result.data_ptr<float>(), n);
+        } else {
+            pow_vec_contiguous<double>(self_c.data_ptr<double>(),
+                                       exp_c.data_ptr<double>(),
+                                       result.data_ptr<double>(), n);
+        }
+        return result;
+    }
+#endif
 
     if (isComplexType(result_dtype)) {
         // Reduced-width values compute in full precision before narrowing.
@@ -2562,6 +2691,18 @@ inline bool pointwise_cpu_has_avx512_bf16() {
     return ok;
 }
 
+inline bool pointwise_cpu_has_avx2() {
+    static const bool ok = __builtin_cpu_supports("avx2") != 0 &&
+                           __builtin_cpu_supports("fma") != 0;
+    return ok;
+}
+
+inline bool pointwise_cpu_has_avx512dq() {
+    static const bool ok = pointwise_cpu_has_avx512() &&
+                           __builtin_cpu_supports("avx512dq") != 0;
+    return ok;
+}
+
 __attribute__((target("avx512f,fma")))
 void lerp_f32_avx512(const float* self, const float* end, float* result,
                      int64_t n, float weight) {
@@ -2629,6 +2770,220 @@ void lerp_bf16_avx512(const uint16_t* self, const uint16_t* end,
     }
 }
 
+__attribute__((target("avx2,fma")))
+void lerp_f32_avx2(const float* self, const float* end, float* result,
+                   int64_t n, float weight) {
+    const __m256 w = _mm256_set1_ps(weight);
+    const __m256 coeff = std::abs(weight) < 0.5f
+        ? w : _mm256_sub_ps(w, _mm256_set1_ps(1.0f));
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 s = _mm256_loadu_ps(self + i);
+        const __m256 e = _mm256_loadu_ps(end + i);
+        const __m256 b = std::abs(weight) < 0.5f ? s : e;
+        _mm256_storeu_ps(result + i,
+                         _mm256_fmadd_ps(coeff, _mm256_sub_ps(e, s), b));
+    }
+    for (; i < n; ++i) {
+        result[i] = lerp_scalar_value(self[i], end[i], weight);
+    }
+}
+
+__attribute__((target("avx2,fma")))
+void lerp_f64_avx2(const double* self, const double* end, double* result,
+                   int64_t n, double weight) {
+    const __m256d w = _mm256_set1_pd(weight);
+    const __m256d coeff = std::abs(weight) < 0.5
+        ? w : _mm256_sub_pd(w, _mm256_set1_pd(1.0));
+    int64_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const __m256d s = _mm256_loadu_pd(self + i);
+        const __m256d e = _mm256_loadu_pd(end + i);
+        const __m256d b = std::abs(weight) < 0.5 ? s : e;
+        _mm256_storeu_pd(result + i,
+                         _mm256_fmadd_pd(coeff, _mm256_sub_pd(e, s), b));
+    }
+    for (; i < n; ++i) {
+        result[i] = lerp_scalar_value(self[i], end[i], weight);
+    }
+}
+
+// Tensor-weight lerp: the weight varies per lane, so the small-weight
+// selection and the base operand are blended per lane instead of hoisted.
+__attribute__((target("avx2,fma")))
+void lerp_tensor_f32_avx2(const float* self, const float* end,
+                          const float* weight, float* result, int64_t n) {
+    const __m256 half = _mm256_set1_ps(0.5f);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 abs_mask = _mm256_set1_ps(-0.0f);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 s = _mm256_loadu_ps(self + i);
+        const __m256 e = _mm256_loadu_ps(end + i);
+        const __m256 w = _mm256_loadu_ps(weight + i);
+        const __m256 small = _mm256_cmp_ps(
+            _mm256_andnot_ps(abs_mask, w), half, _CMP_LT_OQ);
+        const __m256 coeff = _mm256_blendv_ps(_mm256_sub_ps(w, one), w, small);
+        const __m256 base = _mm256_blendv_ps(e, s, small);
+        _mm256_storeu_ps(result + i,
+                         _mm256_fmadd_ps(coeff, _mm256_sub_ps(e, s), base));
+    }
+    for (; i < n; ++i) {
+        result[i] = lerp_scalar_value(self[i], end[i], weight[i]);
+    }
+}
+
+__attribute__((target("avx2,fma")))
+void lerp_tensor_f64_avx2(const double* self, const double* end,
+                          const double* weight, double* result, int64_t n) {
+    const __m256d half = _mm256_set1_pd(0.5);
+    const __m256d one = _mm256_set1_pd(1.0);
+    const __m256d abs_mask = _mm256_set1_pd(-0.0);
+    int64_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const __m256d s = _mm256_loadu_pd(self + i);
+        const __m256d e = _mm256_loadu_pd(end + i);
+        const __m256d w = _mm256_loadu_pd(weight + i);
+        const __m256d small = _mm256_cmp_pd(
+            _mm256_andnot_pd(abs_mask, w), half, _CMP_LT_OQ);
+        const __m256d coeff = _mm256_blendv_pd(_mm256_sub_pd(w, one), w, small);
+        const __m256d base = _mm256_blendv_pd(e, s, small);
+        _mm256_storeu_pd(result + i,
+                         _mm256_fmadd_pd(coeff, _mm256_sub_pd(e, s), base));
+    }
+    for (; i < n; ++i) {
+        result[i] = lerp_scalar_value(self[i], end[i], weight[i]);
+    }
+}
+
+__attribute__((target("avx512f,avx512dq,fma")))
+void lerp_tensor_f32_avx512(const float* self, const float* end,
+                            const float* weight, float* result, int64_t n) {
+    const __m512 half = _mm512_set1_ps(0.5f);
+    const __m512 one = _mm512_set1_ps(1.0f);
+    const __m512 abs_mask = _mm512_set1_ps(-0.0f);
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m512 s = _mm512_loadu_ps(self + i);
+        const __m512 e = _mm512_loadu_ps(end + i);
+        const __m512 w = _mm512_loadu_ps(weight + i);
+        const __mmask16 small = _mm512_cmp_ps_mask(
+            _mm512_xor_ps(abs_mask, w), half, _CMP_LT_OQ);
+        const __m512 coeff = _mm512_mask_blend_ps(
+            small, _mm512_sub_ps(w, one), w);
+        const __m512 base = _mm512_mask_blend_ps(small, e, s);
+        _mm512_storeu_ps(result + i,
+                         _mm512_fmadd_ps(coeff, _mm512_sub_ps(e, s), base));
+    }
+    for (; i < n; ++i) {
+        result[i] = lerp_scalar_value(self[i], end[i], weight[i]);
+    }
+}
+
+__attribute__((target("avx512f,avx512dq,fma")))
+void lerp_tensor_f64_avx512(const double* self, const double* end,
+                            const double* weight, double* result, int64_t n) {
+    const __m512d half = _mm512_set1_pd(0.5);
+    const __m512d one = _mm512_set1_pd(1.0);
+    const __m512d abs_mask = _mm512_set1_pd(-0.0);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m512d s = _mm512_loadu_pd(self + i);
+        const __m512d e = _mm512_loadu_pd(end + i);
+        const __m512d w = _mm512_loadu_pd(weight + i);
+        const __mmask8 small = _mm512_cmp_pd_mask(
+            _mm512_xor_pd(abs_mask, w), half, _CMP_LT_OQ);
+        const __m512d coeff = _mm512_mask_blend_pd(
+            small, _mm512_sub_pd(w, one), w);
+        const __m512d base = _mm512_mask_blend_pd(small, e, s);
+        _mm512_storeu_pd(result + i,
+                         _mm512_fmadd_pd(coeff, _mm512_sub_pd(e, s), base));
+    }
+    for (; i < n; ++i) {
+        result[i] = lerp_scalar_value(self[i], end[i], weight[i]);
+    }
+}
+
+template <typename T>
+void lerp_tensor_contiguous(const T* self, const T* end, const T* weight,
+                            T* result, int64_t n) {
+#if defined(__x86_64__)
+    if constexpr (std::is_same_v<T, float>) {
+        if (pointwise_cpu_has_avx512dq()) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
+                lerp_tensor_f32_avx512(self + begin, end + begin,
+                                       weight + begin, result + begin,
+                                       finish - begin);
+            });
+            return;
+        }
+        if (pointwise_cpu_has_avx2()) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
+                lerp_tensor_f32_avx2(self + begin, end + begin,
+                                     weight + begin, result + begin,
+                                     finish - begin);
+            });
+            return;
+        }
+    } else if constexpr (std::is_same_v<T, double>) {
+        if (pointwise_cpu_has_avx512dq()) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
+                lerp_tensor_f64_avx512(self + begin, end + begin,
+                                       weight + begin, result + begin,
+                                       finish - begin);
+            });
+            return;
+        }
+        if (pointwise_cpu_has_avx2()) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
+                lerp_tensor_f64_avx2(self + begin, end + begin,
+                                     weight + begin, result + begin,
+                                     finish - begin);
+            });
+            return;
+        }
+    }
+#endif
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
+        for (int64_t i = begin; i < finish; ++i) {
+            result[i] = lerp_scalar_value(self[i], end[i], weight[i]);
+        }
+    });
+}
+
+// Single-pass fused lerp for three same-shape dense f32/f64 operands;
+// anything else keeps the general broadcasting/promotion path.
+bool lerp_tensor_fast(const Tensor& self, const Tensor& end,
+                      const Tensor& weight, Tensor& result) {
+    if (!self.is_contiguous() || !end.is_contiguous() ||
+        !weight.is_contiguous()) {
+        return false;
+    }
+    if (!lerp_same_shape(self, end) || !lerp_same_shape(self, weight)) {
+        return false;
+    }
+    const DType dt = self.dtype();
+    if (end.dtype() != dt || weight.dtype() != dt ||
+        (dt != DType::Float32 && dt != DType::Float64)) {
+        return false;
+    }
+    result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()),
+                           dt, self.device());
+    const int64_t n = self.numel();
+    if (dt == DType::Float32) {
+        lerp_tensor_contiguous<float>(self.data_ptr<float>(),
+                                      end.data_ptr<float>(),
+                                      weight.data_ptr<float>(),
+                                      result.data_ptr<float>(), n);
+    } else {
+        lerp_tensor_contiguous<double>(self.data_ptr<double>(),
+                                       end.data_ptr<double>(),
+                                       weight.data_ptr<double>(),
+                                       result.data_ptr<double>(), n);
+    }
+    return true;
+}
+
 } // namespace
 #endif
 
@@ -2645,12 +3000,28 @@ void lerp_scalar_contiguous(const T* self, const T* end, T* result,
             });
             return;
         }
+        if (pointwise_cpu_has_avx2()) {
+            const float w = static_cast<float>(weight);
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
+                lerp_f32_avx2(self + begin, end + begin, result + begin,
+                              finish - begin, w);
+            });
+            return;
+        }
     } else if constexpr (std::is_same_v<T, double>) {
         if (pointwise_cpu_has_avx512()) {
             const double w = static_cast<double>(weight);
             parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
                 lerp_f64_avx512(self + begin, end + begin, result + begin,
                                 finish - begin, w);
+            });
+            return;
+        }
+        if (pointwise_cpu_has_avx2()) {
+            const double w = static_cast<double>(weight);
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
+                lerp_f64_avx2(self + begin, end + begin, result + begin,
+                              finish - begin, w);
             });
             return;
         }
@@ -2719,6 +3090,16 @@ Tensor lerp_tensor_kernel(const Tensor& self, const Tensor& end, const Tensor& w
     DType common_dtype = promoteTypes(self.dtype(), end.dtype());
     common_dtype = promoteTypes(common_dtype, weight.dtype());
     if (isIntegralType(common_dtype)) common_dtype = DType::Float32;
+
+    // Single pass over three dense same-shape operands; the generic
+    // composition below spends several full-tensor passes and temporaries.
+    if (self.dtype() == common_dtype && end.dtype() == common_dtype &&
+        weight.dtype() == common_dtype) {
+        Tensor result;
+        if (lerp_tensor_fast(self, end, weight, result)) {
+            return result;
+        }
+    }
 
     // result = self + weight * (end - self)
     // Ensure all operands are cast to common_dtype
