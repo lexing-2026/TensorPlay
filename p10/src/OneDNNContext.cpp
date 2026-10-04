@@ -27,13 +27,14 @@ dnnl::engine& OneDNNContext::get_engine() {
     // OpenMP team size is a per-thread ICV, and kernel blocking is chosen
     // from it at primitive creation.  Autograd drives backward on its own
     // thread, so apply the hybrid cap on every thread that reaches oneDNN,
-    // once each, unless the user pinned the pool explicitly.
-    static const int thread_cap = std::getenv("OMP_NUM_THREADS")
-                                      ? 0 : parallel::internal::hybrid_thread_cap();
+    // once each, unless the user pinned the pool explicitly (set_num_threads
+    // or the environment) -- an explicit configuration is never second-guessed.
     static thread_local bool cap_applied = false;
     if (!cap_applied) {
         cap_applied = true;
-        if (thread_cap > 0 && thread_cap < omp_get_max_threads()) {
+        const int thread_cap = parallel::internal::hybrid_thread_cap();
+        if (thread_cap > 0 && !parallel::internal::user_pins_thread_count() &&
+            thread_cap < omp_get_max_threads()) {
             omp_set_num_threads(thread_cap);
         }
     }

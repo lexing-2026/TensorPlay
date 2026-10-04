@@ -487,6 +487,15 @@ int hybrid_thread_cap() {
   return cached;
 }
 
+bool user_pins_thread_count() {
+  // A positive store means set_num_threads ran; CONSUMED/NOT_SET leave the
+  // decision to the environment probe.
+  if (num_intraop_threads.load() > 0) {
+    return true;
+  }
+  return env_pins_thread_count();
+}
+
 void set_thread_num(int id) {
   thread_num_ = id;
 }

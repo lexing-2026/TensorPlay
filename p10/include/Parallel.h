@@ -59,6 +59,11 @@ inline void lazy_init_num_threads() {
 // Explicit thread counts (environment, set_num_threads) bypass it.
 P10_API int hybrid_thread_cap();
 
+// True when the thread count was fixed explicitly -- a set_num_threads call
+// or a positive OMP_NUM_THREADS/MKL_NUM_THREADS. Cap heuristics must not
+// second-guess an explicit configuration.
+P10_API bool user_pins_thread_count();
+
 P10_API void set_thread_num(int id);
 
 class ThreadIdGuard {
