@@ -222,20 +222,26 @@ std::array<T, N> multi_row_sum(
 template <typename T, typename Load>
 T row_sum(const char* __restrict data, int64_t stride, int64_t size) {
   constexpr int64_t ilp_factor = 4;
-  const int64_t size_ilp = size / ilp_factor;
-  auto partial_sums = multi_row_sum<T, ilp_factor, Load>(
-      data, stride * ilp_factor, stride, size_ilp);
-
-  for (int64_t i = size_ilp * ilp_factor; i < size; ++i) {
-    partial_sums[0] += Load::load(data, stride, i);
+  // Independent per-lane accumulators hide the load latency; the lane
+  // visitation order matches a sequential walk modulo the lane split.
+  T acc[ilp_factor];
+  for (int64_t k = 0; k < ilp_factor; ++k) {
+    acc[k] = T(0);
   }
-  #if !defined(COMPILING_FOR_MIN_SIZE)
-  # pragma unroll
-  #endif
+  int64_t i = 0;
+  for (; i + ilp_factor <= size; i += ilp_factor) {
+    for (int64_t k = 0; k < ilp_factor; ++k) {
+      acc[k] += Load::load(data, stride, i + k);
+    }
+  }
+  for (; i < size; ++i) {
+    acc[0] += Load::load(data, stride, i);
+  }
+  T total = acc[0];
   for (int64_t k = 1; k < ilp_factor; ++k) {
-    partial_sums[0] += partial_sums[k];
+    total += acc[k];
   }
-  return partial_sums[0];
+  return total;
 }
 
 template <typename T, typename VecLoad, typename ScalarLoad, typename Store>
@@ -255,15 +261,11 @@ void vectorized_inner_sum(
     const char* row = data[1] + j * outer_stride;
     auto vec_acc = row_sum<Vec, VecLoad>(row, vec_stride, vec_size);
 
-    T final_acc = 0;
+    // The horizontal fold must not detour through a scratch array: one
+    // in-register lane reduction per row keeps the pass bandwidth-bound.
+    T final_acc = vec_acc.reduce_add();
     for (int64_t k = vec_size * vec_numel; k < size0; ++k) {
       final_acc += ScalarLoad::load(row, scalar_stride, k);
-    }
-
-    alignas(64) std::array<T, Vec::size()> partials{};
-    vec_acc.store(partials.data());
-    for (const auto value : partials) {
-      final_acc += value;
     }
     store_sum<Store>(data[0], out_stride, j, final_acc);
   }
@@ -301,6 +303,8 @@ void vectorized_outer_sum(
     auto sums = multi_row_sum<Vec, rows, VecLoad>(
         row, inner_stride, vec_stride, size0);
     for (int64_t i = 0; i < rows; ++i) {
+      // Each lane of sums[i] belongs to a distinct output column, so the
+      // lanes must be stored individually -- never folded into one scalar.
       store_sum<Store>(data[0], out_stride, j + i * Vec::size(), sums[i]);
     }
   }
