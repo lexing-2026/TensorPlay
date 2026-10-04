@@ -3949,6 +3949,144 @@ def lower_batch_norm_backward(
     return gi, gw, gb
 
 
+def _adaptive_avg_pool_windows(x, h, w, oh, ow, lead):
+    """The average of each window when the windows do not tile the input.
+
+    Where each window starts and how far it runs follows from the two extents
+    alone, so the positions are written as a small table of whole numbers and
+    the answer reads the input once per window position.  A place a window
+    would reach past its end reads zero, and the value each window is divided
+    by is the window's own length, so a short window averages over what it
+    actually holds rather than over the room it leaves empty.
+    """
+    dev = x.get_device()
+    acc = _accumulation_dtype(x.get_dtype())
+
+    def window_plan(in_len, out_len):
+        # How far the longest window runs, and whether the windows differ in
+        # length at all: they all run the same unless one extent misses the
+        # other's measure and misses it unevenly.
+        maxlength = in_len // out_len + 1
+        mod = in_len % out_len
+        adaptive = not (mod == 0 or out_len % mod == 0)
+        if adaptive:
+            maxlength += 1
+        elif mod == 0:
+            maxlength -= 1
+        return maxlength, adaptive
+
+    def window_starts(in_len, out_len):
+        iota = arange_start_step(0, out_len, 1, dtype=tp.int64, device=dev)
+        return pointwise(
+            lambda o: ops.floordiv(
+                ops.mul(o, ops.constant(in_len, tp.int64)),
+                ops.constant(out_len, tp.int64),
+            ),
+            iota,
+            out_dtype=tp.int64,
+        )
+
+    def window_ends(in_len, out_len):
+        iota = arange_start_step(0, out_len, 1, dtype=tp.int64, device=dev)
+        return pointwise(
+            lambda o: ops.floordiv(
+                ops.add(
+                    ops.mul(o, ops.constant(in_len, tp.int64)),
+                    ops.constant(in_len + out_len - 1, tp.int64),
+                ),
+                ops.constant(out_len, tp.int64),
+            ),
+            iota,
+            out_dtype=tp.int64,
+        )
+
+    max_h, adaptive_h = window_plan(h, oh)
+    max_w, adaptive_w = window_plan(w, ow)
+    if max_h * max_w > 256:
+        # A window too long to unroll is read by the framework kernel, whose
+        # loop does not grow with the window.
+        return _fallback_adaptive_avg_pool2d(x, [oh, ow])
+    starts_h = window_starts(h, oh)
+    ends_h = window_ends(h, oh)
+    starts_w = window_starts(w, ow)
+    ends_w = window_ends(w, ow)
+    iota_h = arange_start_step(0, max_h, 1, dtype=tp.int64, device=dev)
+    iota_w = arange_start_step(0, max_w, 1, dtype=tp.int64, device=dev)
+    idx_h = pointwise(
+        ops.add, unsqueeze(starts_h, -1), iota_h, out_dtype=tp.int64
+    )
+    idx_w = pointwise(
+        ops.add, unsqueeze(starts_w, -1), iota_w, out_dtype=tp.int64
+    )
+    if adaptive_h:
+        idx_h = pointwise(
+            lambda v: ops.minimum(v, ops.constant(h - 1, tp.int64)),
+            idx_h,
+            out_dtype=tp.int64,
+        )
+        length_h = lower_sub(ends_h, starts_h)
+    else:
+        length_h = max_h
+    if adaptive_w:
+        idx_w = pointwise(
+            lambda v: ops.minimum(v, ops.constant(w - 1, tp.int64)),
+            idx_w,
+            out_dtype=tp.int64,
+        )
+        length_w = lower_sub(ends_w, starts_w)
+    else:
+        length_w = max_w
+
+    vals = index_tensor(
+        x,
+        [
+            None,
+            None,
+            view(idx_h, [oh, max_h, 1, 1]),
+            view(idx_w, [1, 1, ow, max_w]),
+        ],
+    )
+    total = None
+    for i in range(max_h):
+        for j in range(max_w):
+            cell = _cast_to(
+                lower_basic_getitem(
+                    _as_box(vals),
+                    (
+                        slice(None),
+                        slice(None),
+                        slice(None),
+                        i,
+                        slice(None),
+                        j,
+                    ),
+                ),
+                acc,
+            )
+            if adaptive_h:
+                cell = lower_where(lower_ge(i, length_h), 0.0, cell)
+            if adaptive_w:
+                cell = lower_where(lower_ge(j, length_w), 0.0, cell)
+            total = cell if total is None else lower_add(total, cell)
+
+    if adaptive_h and adaptive_w:
+        count = lower_mul(
+            unsqueeze(_cast_to(length_h, acc), -1),
+            unsqueeze(_cast_to(length_w, acc), 0),
+        )
+    elif adaptive_h:
+        count = lower_mul(_cast_to(length_h, acc), float(max_w))
+    elif adaptive_w:
+        count = lower_mul(_cast_to(length_w, acc), float(max_h))
+    else:
+        count = float(max_h * max_w)
+
+    averaged = pointwise(
+        lambda v, k: ops.truediv(v, k), total, count, out_dtype=acc
+    )
+    return _cast_to(averaged, x.get_dtype())
+
+
 _fallback_adaptive_avg_pool2d = fallback_handler(
     tp.ops.tp.adaptive_avg_pool2d.default, add_to_fallback_set=False
 )
@@ -3957,7 +4095,9 @@ _fallback_adaptive_avg_pool2d = fallback_handler(
 @register("adaptive_avg_pool2d.default", "_adaptive_avg_pool2d.default")
 def lower_adaptive_avg_pool2d(x, output_size):
     """An adaptive average pool whose windows tile the input exactly is a
-    mean over each window: one reduction, fusable with what reads it."""
+    mean over each window: one reduction, fusable with what reads it.  Windows
+    that stop mid-stride are read position by position instead, each averaged
+    over what it actually holds."""
 
     size = _static_ints(x.get_size())
     out = _static_ints(output_size) if output_size is not None else None
@@ -3965,8 +4105,12 @@ def lower_adaptive_avg_pool2d(x, output_size):
         return _fallback_adaptive_avg_pool2d(x, output_size)
     h, w = size[-2:]
     oh, ow = out
-    if oh == 0 or ow == 0 or h % oh or w % ow:
+    if oh == 0 or ow == 0:
         return _fallback_adaptive_avg_pool2d(x, output_size)
+    if h % oh or w % ow:
+        if is_integer_dtype(x.get_dtype()) or x.get_dtype() == tp.bool:
+            return _fallback_adaptive_avg_pool2d(x, output_size)
+        return _adaptive_avg_pool_windows(x, h, w, oh, ow, size[:-2])
     kh, kw = h // oh, w // ow
     lead = size[:-2]
     acc = _accumulation_dtype(x.get_dtype())
@@ -4557,6 +4701,406 @@ def lower_upsample_nearest_exact3d(x, output_size, scales_d=None,
 def lower_upsample_nearest1d(x, output_size, scales_d=None, **kwargs):
     _no_scale_hint((scales_d,))
     return _upsample_nearestnd(x, output_size, 1, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Grid sampling and bicubic resampling: every output element reads the source
+# at a position of its own, computed from the coordinates the call carries, so
+# each is a gather the kernels around it absorb.
+# ---------------------------------------------------------------------------
+
+
+def _cast_to(value, dtype):
+    return pointwise(lambda v: ops.to_dtype(v, dtype), value, out_dtype=dtype)
+
+
+def _cubic_convolution1(t, dtype):
+    """The weight of a source at a distance of at most one from the sample:
+    ``((A + 2) t - (A + 3)) t^2 + 1`` with A = -0.75."""
+    A = -0.75
+    return pointwise(
+        lambda x: ops.add(
+            ops.mul(
+                ops.sub(
+                    ops.mul(ops.constant(A + 2.0, dtype), x),
+                    ops.constant(A + 3.0, dtype),
+                ),
+                ops.mul(x, x),
+            ),
+            ops.constant(1.0, dtype),
+        ),
+        t,
+        out_dtype=dtype,
+    )
+
+
+def _cubic_convolution2(t, dtype):
+    """The weight of a source one or two steps from the sample:
+    ``((A t - 5A) t + 8A) t - 4A`` with A = -0.75."""
+    A = -0.75
+    return pointwise(
+        lambda x: ops.sub(
+            ops.mul(
+                ops.add(
+                    ops.mul(
+                        ops.sub(
+                            ops.mul(ops.constant(A, dtype), x),
+                            ops.constant(5.0 * A, dtype),
+                        ),
+                        x,
+                    ),
+                    ops.constant(8.0 * A, dtype),
+                ),
+                x,
+            ),
+            ops.constant(4.0 * A, dtype),
+        ),
+        t,
+        out_dtype=dtype,
+    )
+
+
+def _cubic_weights(t, dtype):
+    """The four weights a cubic interpolation at distance t asks for, one per
+    source element counting from one step below the sample."""
+    return (
+        _cubic_convolution2(lower_add(t, 1), dtype),
+        _cubic_convolution1(t, dtype),
+        _cubic_convolution1(lower_sub(1, t), dtype),
+        _cubic_convolution2(lower_sub(2, t), dtype),
+    )
+
+
+_fallback_grid_sampler_2d = fallback_handler(
+    tp_ops.grid_sampler_2d.default, add_to_fallback_set=False
+)
+
+
+@register_lowering(tp_ops.grid_sampler_2d, type_promotion_kind=None)
+def lower_grid_sampler_2d(a, grid, interpolation_mode=0, padding_mode=0,
+                          align_corners=False):
+    """Read the input at the positions the grid names.
+
+    The grid names a position in the unit square for every output element, and
+    the answer gathers the input there, blending the neighbours the requested
+    smoothness asks for: the two-by-two neighbourhood a linear blend reads, the
+    one nearest element, or the sixteen a cubic blend reads.  A position named
+    outside the input is answered by the padding rule: zeros, the nearest
+    border, or the input mirrored across its edge.  A named position with no
+    input there contributes nothing, so the positions outside cost a zero
+    weight rather than a read past the end.
+    """
+    if interpolation_mode not in (0, 1, 2):
+        raise RuntimeError(f"Invalid interpolation mode {interpolation_mode}")
+    if padding_mode not in (0, 1, 2):
+        raise RuntimeError(f"Invalid padding mode {padding_mode}")
+    a_size = list(a.get_size())
+    grid_size = list(grid.get_size())
+    in_dtype = a.get_dtype()
+    static = _static_ints([*a_size, *grid_size])
+    if (
+        static is None
+        or len(a_size) != 4
+        or len(grid_size) != 4
+        or static[0] != static[4]
+        or static[7] != 2
+        or is_integer_dtype(in_dtype)
+        or in_dtype == tp.bool
+        or in_dtype in (tp.complex64, tp.complex128)
+    ):
+        return _fallback_grid_sampler_2d(
+            a, grid, interpolation_mode, padding_mode, align_corners
+        )
+    n, c, ih, iw, _gn, oh, ow, _two = static
+    dev = a.get_device()
+    acc = tp.float32 if in_dtype in (tp.float16, tp.bfloat16) else in_dtype
+
+    grid_box = _as_box(grid)
+    xg = _cast_to(
+        lower_basic_getitem(
+            grid_box, (slice(None), slice(None), slice(None), 0)
+        ),
+        acc,
+    )
+    yg = _cast_to(
+        lower_basic_getitem(
+            grid_box, (slice(None), slice(None), slice(None), 1)
+        ),
+        acc,
+    )
+
+    def unnormalize(coords, size):
+        mul = size * 0.5 - 0.5 if align_corners else size * 0.5
+        ofs = size * 0.5 - 0.5
+        return pointwise(
+            lambda v: ops.add(
+                ops.mul(v, ops.constant(mul, acc)), ops.constant(ofs, acc)
+            ),
+            coords,
+            out_dtype=acc,
+        )
+
+    def reflect(coords, twice_low, twice_high):
+        # A position outside the pair of bounds is folded back in: the distance
+        # past an edge is read again inward, and every other fold reads the
+        # remaining span rather than the distance, which is what the odd or
+        # even fold count tells apart.
+        if twice_low == twice_high:
+            return _full(0, dev, acc, coords.get_size())
+        coords_min = twice_low / 2
+        span = (twice_high - twice_low) / 2
+        distance = pointwise(
+            lambda v: ops.abs(ops.sub(v, ops.constant(coords_min, acc))),
+            coords,
+            out_dtype=acc,
+        )
+        extra = pointwise(
+            lambda v: ops.fmod(v, ops.constant(span, acc)),
+            distance,
+            out_dtype=acc,
+        )
+        flips = pointwise(
+            lambda v: ops.floor(ops.truediv(v, ops.constant(span, acc))),
+            distance,
+            out_dtype=acc,
+        )
+        even = pointwise(
+            lambda v: ops.eq(
+                ops.fmod(v, ops.constant(2.0, acc)), ops.constant(0.0, acc)
+            ),
+            flips,
+            out_dtype=tp.bool,
+        )
+        return lower_where(
+            even,
+            lower_add(extra, coords_min),
+            lower_sub(lower_add(span, coords_min), extra),
+        )
+
+    def coordinates(coords, size):
+        if padding_mode == 0:
+            return coords
+        if padding_mode == 1:
+            return lower_clamp(coords, 0, size - 1)
+        if align_corners:
+            reflected = reflect(coords, 0, 2 * (size - 1))
+        else:
+            reflected = reflect(coords, -1, 2 * size - 1)
+        return lower_clamp(reflected, 0, size - 1)
+
+    def source_index(coords, size):
+        return coordinates(unnormalize(coords, size), size)
+
+    n_idx = view(
+        arange_start_step(0, n, 1, dtype=tp.int64, device=dev), [n, 1, 1, 1]
+    )
+    c_idx = view(
+        arange_start_step(0, c, 1, dtype=tp.int64, device=dev), [1, c, 1, 1]
+    )
+
+    def within(ix, iy):
+        return pointwise(
+            lambda x, y: ops.logical_and(
+                ops.logical_and(
+                    ops.ge(x, ops.constant(0.0, acc)),
+                    ops.lt(x, ops.constant(iw, acc)),
+                ),
+                ops.logical_and(
+                    ops.ge(y, ops.constant(0.0, acc)),
+                    ops.lt(y, ops.constant(ih, acc)),
+                ),
+            ),
+            ix,
+            iy,
+            out_dtype=tp.bool,
+        )
+
+    def summand(ix, iy, weight):
+        # One corner of the blend: read where the position lands inside, and
+        # nowhere (with no weight) where it does not, so a position outside
+        # costs the input's border element rather than a read past the end.
+        cond = within(ix, iy)
+
+        def index_of(value):
+            return pointwise(
+                lambda f, v: ops.where(
+                    f, ops.to_dtype(v, tp.int64), ops.constant(0, tp.int64)
+                ),
+                cond,
+                value,
+                out_dtype=tp.int64,
+            )
+
+        if isinstance(weight, (int, float)):
+            weight = lower_where(cond, float(weight), 0.0)
+        else:
+            weight = lower_where(cond, weight, 0.0)
+        gathered = index_tensor(
+            a,
+            [n_idx, c_idx, unsqueeze(index_of(iy), 1), unsqueeze(index_of(ix), 1)],
+        )
+        return lower_mul(gathered, unsqueeze(weight, 1))
+
+    if interpolation_mode == 0:
+        ix = source_index(xg, iw)
+        iy = source_index(yg, ih)
+        ix_nw = pointwise(ops.floor, ix, out_dtype=acc)
+        iy_nw = pointwise(ops.floor, iy, out_dtype=acc)
+        ix_nw_p1 = lower_add(ix_nw, 1)
+        iy_nw_p1 = lower_add(iy_nw, 1)
+        total = lower_add(
+            lower_add(
+                summand(
+                    ix_nw,
+                    iy_nw,
+                    lower_mul(
+                        lower_sub(ix_nw_p1, ix), lower_sub(iy_nw_p1, iy)
+                    ),
+                ),
+                summand(
+                    ix_nw_p1,
+                    iy_nw,
+                    lower_mul(lower_sub(ix, ix_nw), lower_sub(iy_nw_p1, iy)),
+                ),
+            ),
+            lower_add(
+                summand(
+                    ix_nw,
+                    iy_nw_p1,
+                    lower_mul(lower_sub(ix_nw_p1, ix), lower_sub(iy, iy_nw)),
+                ),
+                summand(
+                    ix_nw_p1,
+                    iy_nw_p1,
+                    lower_mul(lower_sub(ix, ix_nw), lower_sub(iy, iy_nw)),
+                ),
+            ),
+        )
+
+    elif interpolation_mode == 1:
+        nearest_x = pointwise(
+            ops.round, source_index(xg, iw), out_dtype=acc
+        )
+        nearest_y = pointwise(
+            ops.round, source_index(yg, ih), out_dtype=acc
+        )
+        total = summand(nearest_x, nearest_y, 1)
+
+    else:
+        ix = unnormalize(xg, iw)
+        iy = unnormalize(yg, ih)
+        ix_nw = pointwise(ops.floor, ix, out_dtype=acc)
+        iy_nw = pointwise(ops.floor, iy, out_dtype=acc)
+        wx = _cubic_weights(lower_sub(ix, ix_nw), acc)
+        wy = _cubic_weights(lower_sub(iy, iy_nw), acc)
+        total = None
+        for row in range(4):
+            y_ofs = lower_add(iy_nw, row - 1)
+            line = None
+            for col in range(4):
+                piece = lower_mul(
+                    summand(lower_add(ix_nw, col - 1), y_ofs, 1.0), wx[col]
+                )
+                line = piece if line is None else lower_add(line, piece)
+            piece = lower_mul(line, wy[row])
+            total = piece if total is None else lower_add(total, piece)
+
+    return _cast_to(total, in_dtype)
+
+
+_fallback_upsample_bicubic2d = fallback_handler(
+    tp_ops.upsample_bicubic2d.default, add_to_fallback_set=False
+)
+
+
+@register_lowering(tp_ops.upsample_bicubic2d, type_promotion_kind=None)
+def lower_upsample_bicubic2d(input, output_size, align_corners,
+                             scales_h=None, scales_w=None):
+    """Resample the two trailing axes with a cubic blend.
+
+    Every output element is a weighted read of the four-by-four source
+    neighbourhood its position maps to, the weights set by how far the mapped
+    position sits inside it.  A mapped position outside the source reads the
+    border the clamped index names, and the blend weights make the edge hold
+    still: a weight of one on the border element and none on the rest.
+    """
+    _no_scale_hint((scales_h, scales_w))
+    in_dtype = input.get_dtype()
+    out = _static_ints(output_size) if output_size is not None else None
+    in_size = _static_ints(input.get_size())
+    if (
+        out is None
+        or len(out) != 2
+        or in_size is None
+        or len(in_size) != 4
+        or is_integer_dtype(in_dtype)
+        or in_dtype == tp.bool
+        or in_dtype in (tp.complex64, tp.complex128)
+    ):
+        return _fallback_upsample_bicubic2d(
+            input, output_size, align_corners, scales_h, scales_w
+        )
+    _n, _c, ih, iw = in_size
+    oh, ow = out
+    dev = input.get_device()
+    acc = tp.float32 if in_dtype in (tp.float16, tp.bfloat16) else in_dtype
+
+    def scale(in_len, out_len):
+        if align_corners:
+            return (in_len - 1.0) / (out_len - 1.0) if out_len > 1 else 0.0
+        return in_len / out_len
+
+    def source_positions(scale_value, out_len):
+        # Where each output position sits in the source: at the position
+        # itself when the corners are pinned, half a step in from it otherwise.
+        iota = arange_start_step(0, out_len, 1, dtype=tp.int64, device=dev)
+        if align_corners:
+            return pointwise(
+                lambda i: ops.mul(
+                    ops.constant(scale_value, acc), ops.to_dtype(i, acc)
+                ),
+                iota,
+                out_dtype=acc,
+            )
+        return pointwise(
+            lambda i: ops.sub(
+                ops.mul(
+                    ops.constant(scale_value, acc),
+                    ops.add(ops.to_dtype(i, acc), ops.constant(0.5, acc)),
+                ),
+                ops.constant(0.5, acc),
+            ),
+            iota,
+            out_dtype=acc,
+        )
+
+    x_float = source_positions(scale(iw, ow), ow)
+    y_float = source_positions(scale(ih, oh), oh)
+    x_nw = pointwise(ops.floor, x_float, out_dtype=acc)
+    y_nw = pointwise(ops.floor, y_float, out_dtype=acc)
+    tx = lower_clamp(lower_sub(x_float, x_nw), 0.0, 1.0)
+    ty = lower_clamp(lower_sub(y_float, y_nw), 0.0, 1.0)
+    x_i = _cast_to(x_nw, tp.int64)
+    y_i = unsqueeze(_cast_to(y_nw, tp.int64), -1)
+    wx = _cubic_weights(tx, acc)
+    wy = tuple(unsqueeze(w, -1) for w in _cubic_weights(ty, acc))
+    y_ofs = tuple(lower_add(y_i, ofs) for ofs in (-1, 0, 1, 2))
+    x_ofs = tuple(lower_add(x_i, ofs) for ofs in (-1, 0, 1, 2))
+
+    def read(yv, xv):
+        y_idx = lower_clamp(yv, 0, ih - 1)
+        x_idx = lower_clamp(xv, 0, iw - 1)
+        return index_tensor(input, [None, None, y_idx, x_idx])
+
+    total = None
+    for row in range(4):
+        line = None
+        for col in range(4):
+            piece = lower_mul(read(y_ofs[row], x_ofs[col]), wx[col])
+            line = piece if line is None else lower_add(line, piece)
+        piece = lower_mul(line, wy[row])
+        total = piece if total is None else lower_add(total, piece)
+    return _cast_to(total, in_dtype)
 
 
 @register("_upsample_nearest_exact1d.default")
