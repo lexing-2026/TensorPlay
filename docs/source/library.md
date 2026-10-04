@@ -16,7 +16,7 @@ for more details on how to effectively use these APIs.
 ## Testing custom ops
 
 Use {func}`tensorplay.library.opcheck` to test custom ops for incorrect usage of the
-Python tensorplay.library and/or C++ TORCH_LIBRARY APIs. Also, if your operator supports
+Python tensorplay.library and/or C++ ``TENSORPLAY_LIBRARY_IMPL`` APIs. Also, if your operator supports
 training, use {func}`tensorplay.autograd.gradcheck` to test that the gradients are
 mathematically correct.
 
@@ -190,7 +190,7 @@ via TensorPlay's C++ operator registration APIs).
 The following APIs are direct bindings to TensorPlay's C++ low-level
 operator registration APIs.
 ```{eval-rst}
-.. warning:: The low-level operator registration APIs and the TensorPlay Dispatcher are a complicated TensorPlay concept. We recommend you use the higher level APIs above (that do not require a tensorplay.library.Library object) when possible. `This blog post <http://blog.ezyang.com/2020/09/lets-talk-about-the-tensorplay-dispatcher/>`_ is a good starting point to learn about the TensorPlay Dispatcher.
+.. warning:: The low-level operator registration APIs and the TensorPlay Dispatcher are a complicated TensorPlay concept. We recommend you use the higher level APIs above (that do not require a tensorplay.library.Library object) when possible. The dispatcher's key arithmetic is documented on the :doc:`backends` page, and the code generator that emits the redispatch channels is described in the codegen chapter of the white paper.
 ```
 A tutorial that walks you through some examples on how to use this API is available on [Google Colab](https://colab.research.google.com/drive/1RRhSfk7So3Cn02itzLWE9K4Fam-8U011?usp=sharing).
 

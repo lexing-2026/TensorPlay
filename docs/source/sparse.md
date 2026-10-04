@@ -525,7 +525,6 @@ explicitly and is assumed to be zero in general. However, there exists
 operations that may interpret the fill value differently. For
 instance, {func}`tensorplay.sparse.softmax` computes the softmax with the
 assumption that the fill value is negative infinity.
-<!-- See https://github.com/Quansight-Labs/rfcs/tree/pearu/rfc-fill-value/RFC-0004-sparse-fill-value for a new API -->
 (sparse-compressed-docs)=
 
 ## Sparse Compressed Tensors

@@ -467,74 +467,6 @@ the new backend.
 The support of third-party backend is experimental and subject to change.
 :::
 
-## TorchComms backend
-
-[TorchComms](https://github.com/meta-tensorplay/torchcomms) is an optional
-communication backend for ``tensorplay.distributed``. When enabled, it
-overrides the normal backend instantiation in {func}`init_process_group`
-so that all process groups are created through TorchComms instead of
-the built-in ``ProcessGroup`` implementations.
-:::{note}
-TorchComms is experimental and must be installed separately.
-The ``torchcomms`` package must be importable for the flags below to
-take effect.
-:::
-
-### Enabling TorchComms
-
-Set the ``TP_DISTRIBUTED_USE_TORCHCOMMS`` environment variable
-before calling {func}`init_process_group`:
-```bash
-export TP_DISTRIBUTED_USE_TORCHCOMMS=1
-```
-Or set the config flag programmatically:
-```python
-import tensorplay.distributed.config as dist_config
-
-dist_config.use_torchcomms = True
-```
-The ``backend`` argument to {func}`init_process_group` (e.g. ``"nccl"``,
-``"gloo"``) is still respected -- it is forwarded to TorchComms, which
-selects the corresponding vendor plugin. No other application code
-changes are required; all ``tensorplay.distributed`` collective APIs continue
-to work as before.
-
-### Behavior when enabled
-
-When TorchComms is enabled, {func}`init_process_group` changes its
-backend instantiation path for every device/backend pair in the process
-group (except the ``fake`` backend, which is always handled natively):
-1. A TorchComms communicator is created via ``torchcomms.new_comm()``
-   using the requested backend string and device.
-2. The communicator is wrapped in a ``_BackendWrapper`` that plugs into the
-   backend registry, making it a drop-in replacement
-   for the native ``ProcessGroup`` backends.
-3. A ``FlightRecorderHook`` is automatically registered on the
-   communicator for trace capture with a configurable buffer size.
-4. {func}`destroy_process_group` calls ``finalize()`` on TorchComms
-   communicators during cleanup.
-5. {func}`split_group` creates sub-communicators through TorchComms'
-   native splitting rather than constructing a new process group from
-   scratch.
-
-### Eager initialization
-
-TorchComms communicators are eagerly initialized during
-{func}`init_process_group` and only support a single backend device per
-group. The ``device_id`` argument must be specified at initialization
-time:
-```python
-dist.init_process_group(backend="nccl", device_id=tensorplay.device("cuda", local_rank))
-```
-
-### Point-to-point operation concurrency
-
-Each TorchComms process group maps 1:1 to a single underlying
-communicator. Point-to-point operations (``send``/``recv``) issued on
-the same group and stream are **not guaranteed to run concurrently**.
-Code that relies on concurrent point-to-point operations must either:
-- Use the batched P2P APIs ({func}`batch_isend_irecv`), or
-- Issue the operations on separate groups or communicators.
 (distributed-launch)=
 
 ## Launch utility
@@ -779,11 +711,13 @@ capability.
   Calls), and renders them as HTML tables.
 **FlightRecorder CPU JSON** ``/fr_trace_json``
   Same data as ``/fr_trace`` but rendered as raw formatted JSON per rank.
-**TorchComms FlightRecorder** ``/torchcomms_fr_trace``
-  Fetches TorchComms flight recorder data from ``torchcomms_fr_trace_json``
+**Comms FlightRecorder** ``/torchcomms_fr_trace``
+  Fetches flight-recorder data from ``torchcomms_fr_trace_json``
   (with ``onlyactive=true``) on all workers. Renders the same structured tables
   as the FlightRecorder views (Groups, Memberships, Collectives, NCCL Calls).
-**TorchComms FlightRecorder JSON** ``/torchcomms_fr_trace_json``
+  This is a secondary source: it queries a separate communication-layer
+  recorder endpoint, so it only returns data when a worker is serving one.
+**Comms FlightRecorder JSON** ``/torchcomms_fr_trace_json``
   Same data as ``/torchcomms_fr_trace`` but rendered as raw formatted JSON.
 **tensorplay.profiler** ``/profile``
   Triggers ``tensorplay.profiler.profile()`` on every worker for a configurable
@@ -834,8 +768,9 @@ collective operations, their metadata, and timing information.
 curl -X POST \
   http://worker-host:port/handler/fr_trace_json  # @lint-ignore
 ```
-**``torchcomms_fr_trace_json``** — TorchComms flight-recorder trace
-(application/json). Fetches the TorchComms communication layer recorder.
+**``torchcomms_fr_trace_json``** — communication-layer flight-recorder trace
+(application/json). Queries the separate communication-layer recorder on each
+worker; returns nothing unless a worker is serving one.
 Accepts parameter ``onlyactive``
 (``true``/``false``, default ``false``).
 ```bash
@@ -883,7 +818,7 @@ Handlers that support dumping:
 +------------------------------------+------------------------+---------------------------------------------------+
 | ``FlightRecorderHandler``          | ``fr_trace``           | CPU + NCCL flight-recorder tables.                |
 +------------------------------------+------------------------+---------------------------------------------------+
-| ``TorchCommsFlightRecorderHandler``| ``torchcomms_fr_trace``| TorchComms flight-recorder tables.                |
+| ``CommsFlightRecorderHandler``    | ``torchcomms_fr_trace``| Communication-layer flight-recorder tables.     |
 +------------------------------------+------------------------+---------------------------------------------------+
 | ``WaitCountersHandler``            | ``wait_counters``      | Wait counter JSON for all ranks.                  |
 +------------------------------------+------------------------+---------------------------------------------------+

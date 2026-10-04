@@ -714,7 +714,7 @@ TensorPlay 保留一组紧凑的调度键，并将专用轴保留在核心表之
 
 没有磁带。该图是每个节点的 \texttt{next\_edges} 的传递闭包，其中每个 \texttt{Edge} 仅携带提示——形状提示、梯度数据类型、设备提示——因此向后可以在不接触前向张量的情况下实现缺失的梯度。 \texttt{GraphTask} 保存每次向后构建一次的依赖计数器映射、由原始 \texttt{Node*} 键控的输入缓冲区映射以及 \texttt{grad} 捕获的输出向量。 \texttt{ReadyQueue} 是按节点的创建序列号排序的最大堆：它首先弹出最大的序列号，近似于反向创建顺序，而真正的拓扑顺序由依赖计数器强制执行。每个节点解释器执行十个步骤——梯度模式保护、捕获簿记、缺失梯度物化、预钩子、评估节点保护、\texttt{apply}、后钩子、\texttt{sum\_to\_shape}、dtype 转换、NaN 探测——然后在任务互斥体下传播到父级。
 
-内存/性能权衡是明确的：每条边都保存一个 \texttt{shared\_ptr<Node>}，每个输入缓冲区保存一个 \texttt{vector<Tensor>}，因此每个节点一个 \texttt{shared\_ptr} 加上每个不同输入槽的一个分配。生产运行时使用 \texttt{intrusive\_ptr} 来削减控制块。 TensorPlay 保留标准库指针，以便学生可以使用普通工具跟踪所有权；常数因子成本是一个教学决策，如此记录。
+内存/性能权衡是明确的：每条边都保存一个 \texttt{shared\_ptr<Node>}，每个输入缓冲区保存一个 \texttt{vector<Tensor>}，因此每个节点一个 \texttt{shared\_ptr} 加上每个不同输入槽的一个分配。张量句柄本身不走这条路径：\texttt{Tensor} 与 \texttt{Storage} 用的是本仓库自研的 \texttt{intrusive\_ptr}（\texttt{p10/include/IntrusivePtr.h}），强/弱计数合并进一个 64 位原子字，句柄因此只有一个机器字、没有控制块的额外间接跳转。图节点保留标准库指针，以便学生可以用普通工具跟踪所有权；这个常数因子成本是一个教学决策，如此记录。
 
 %======================================================================
 \subsection{正确性卫士}

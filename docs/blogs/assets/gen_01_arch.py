@@ -15,7 +15,7 @@ def main():
 
     # foundation
     ax.add_patch(patches.FancyBboxPatch((1, 0.5), 10, 0.6, boxstyle="round,pad=0.08", facecolor="#e8eaf6", edgecolor="#3949ab", lw=1.2))
-    ax.text(6, 0.8, "CMake + codegen  ( native_functions.yaml  ->  10 artifacts )", ha="center", va="center", fontsize=8, color="#283593")
+    ax.text(6, 0.8, "CMake + codegen  ( native_functions.yaml  ->  13 codegen targets )", ha="center", va="center", fontsize=8, color="#283593")
 
     pillars = [
         (1.5, "p10\nTensor / Storage\nDispatcher / Kernels", "#e3f2fd", "#1565c0"),

@@ -338,14 +338,14 @@ but got <class 'numpy.dtypes.Float32DType'>
 
 This can be allowlisted via `{add_}safe_globals([np.dtypes.Float32DType])`.
 
-#### Environment Variables
+#### Forcing the restricted set
 
-There are two environment variables that will influence the behavior of `tensorplay.load`. These can be helpful
-if one does not have access to the `tensorplay.load` callsites.
-
-- `TORCH_FORCE_WEIGHTS_ONLY_LOAD=1` will override all `tensorplay.load` callsites to use `weights_only=True`.
-- `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1` will make `tensorplay.load` callsites use `weights_only=False` **only**
-  if `weights_only` was not passed as an argument.
+`tensorplay.load` always restricts unpickling to registered data types. The
+`weights_only` argument is therefore not a way to unlock executable object
+loading: passing `weights_only=False` emits a `UserWarning` and the restricted
+set still applies. There is no environment variable that relaxes it — every
+`tensorplay.load` callsite in a process behaves the same way, and the allowlist
+is the only lever. Widen it with `{add_}safe_globals`.
 
 (utility functions)=
 
