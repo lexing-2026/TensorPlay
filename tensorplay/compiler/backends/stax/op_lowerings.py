@@ -2235,18 +2235,44 @@ def lower_silu_backward(grad, x):
     return pointwise(fn, grad, x)
 
 
+def _copy_meets_a_write() -> bool:
+    """Whether the region writes into what the copy being lowered reads or makes.
+
+    An input updated in place, or a copy written into afterwards, changes the
+    memory after the copy was asked for; the copy then has to be memory of
+    its own, holding the value as it stood.
+    """
+
+    written = V.graph.written_storages()
+    if not written:
+        return False
+    from .fx_utils import get_node_storage
+
+    node = V.graph.current_node
+    if node is None:
+        return True
+    source = node.args[0] if node.args else None
+    for value in (source, node):
+        if isinstance(value, Node) and get_node_storage(value) in written:
+            return True
+    return False
+
+
 def _identity_copy_source(x):
     """The value itself, when a copy of it would arrive at the same bytes.
 
-    Inside a region a value is written once and only read, so a copy that
+    Inside a region whose values are written once and only read, a copy that
     changes neither elements nor arrangement is the value.  That holds when
     its storage has not been laid down yet -- a fresh realization settles
     row-major, which is the arrangement a copy makes -- when the storage is
     already row-major, and when the value is a plain window onto row-major
     storage.  Anything else (a reshaped view whose reading is not a plain
-    window, a frozen non-row-major buffer) keeps its copy.
+    window, a frozen non-row-major buffer) keeps its copy, and so does a copy
+    of memory the region writes into, or that is itself written into.
     """
 
+    if _copy_meets_a_write():
+        return None
     if isinstance(x, TensorBox) and isinstance(x.data, StorageBox):
         inner = x.data.data
         if isinstance(inner, (Pointwise, Reduction)):
@@ -5804,14 +5830,18 @@ def index_put_(self: Any, indices: Any, values: Any, accumulate: bool = False):
     )
 
 
-def _positions_along_one_axis(index: Any, dim: int) -> list:
+def _positions_along_one_axis(x: Any, index: Any, dim: int) -> list:
     """A single axis's index as a whole position list.
 
     An index that names positions along one axis, with every other axis taken
     whole, is a position list with one entry for that axis and nothing for the
-    rest.
+    rest.  The axis is counted from the front of ``x``, so one counted from the
+    back is first turned around.
     """
 
+    ndim = len(x.get_size())
+    if ndim:
+        dim = dim % ndim
     return [None] * dim + [index]
 
 
@@ -5821,7 +5851,7 @@ def index_add(x: Any, dim: Any, index: Any, tensor: Any, *, alpha: Any = 1):
         tensor = lower_mul(tensor, alpha)
     return index_put_impl_(
         clone(x),
-        _positions_along_one_axis(index, dim),
+        _positions_along_one_axis(x, index, dim),
         tensor,
         True,
         check=True,
@@ -5834,7 +5864,7 @@ def index_add_(x: Any, dim: Any, index: Any, tensor: Any, *, alpha: Any = 1):
     if alpha != 1:
         tensor = lower_mul(tensor, alpha)
     return index_put_impl_(
-        x, _positions_along_one_axis(index, dim), tensor, True, check=True, may_realize=True
+        x, _positions_along_one_axis(x, index, dim), tensor, True, check=True, may_realize=True
     )
 
 
@@ -5842,7 +5872,7 @@ def index_add_(x: Any, dim: Any, index: Any, tensor: Any, *, alpha: Any = 1):
 def index_copy(x: Any, dim: Any, index: Any, tensor: Any):
     return index_put_impl_(
         clone(x),
-        _positions_along_one_axis(index, dim),
+        _positions_along_one_axis(x, index, dim),
         tensor,
         False,
         check=True,
@@ -5853,7 +5883,7 @@ def index_copy(x: Any, dim: Any, index: Any, tensor: Any):
 @register_lowering(tp_ops.index_copy_, type_promotion_kind=None)
 def index_copy_(x: Any, dim: Any, index: Any, tensor: Any):
     return index_put_impl_(
-        x, _positions_along_one_axis(index, dim), tensor, False, check=True, may_realize=True
+        x, _positions_along_one_axis(x, index, dim), tensor, False, check=True, may_realize=True
     )
 
 

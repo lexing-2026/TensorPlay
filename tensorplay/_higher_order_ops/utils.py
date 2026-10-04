@@ -169,14 +169,18 @@ def reenter_make_fx(fn, subgraph_decomp_table=None):
 def _maybe_reenter_make_fx(fn, subgraph_decomp_table=None):
     """Like :func:`reenter_make_fx`, but outside an active capture it traces a
     standalone subgraph instead of erroring."""
+    from tensorplay.graph._utils import reading_enclosing_values
     from tensorplay.graph.experimental import proxy_tensor
 
     if proxy_tensor._CURRENT_MAKE_GRAPH_TRACER.get() is not None:
         return reenter_make_fx(fn, subgraph_decomp_table=subgraph_decomp_table)
 
+    # The piece may close over values of the trace it sits in; they are read
+    # as their tensors here, and the caller lifts them back out as inputs.
     @functools.wraps(fn)
     def wrapped(*args):
-        return make_fx(fn, subgraph_decomp_table)(*args)
+        with reading_enclosing_values():
+            return make_fx(fn, subgraph_decomp_table)(*args)
 
     return wrapped
 

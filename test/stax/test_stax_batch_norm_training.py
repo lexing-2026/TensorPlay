@@ -48,3 +48,32 @@ def test_training_batch_norm_matches_eager(device, shape, monkeypatch):
         assert tp.allclose(a, b, atol=1e-4, rtol=1e-4)
     assert tp.allclose(norm.running_mean, ref.running_mean, atol=1e-6)
     assert tp.allclose(norm.running_var, ref.running_var, atol=1e-6)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("momentum", [0.1, None])
+def test_training_batch_norm_counts_its_batches(device, momentum):
+    # The count of batches seen moves with every compiled training step --
+    # with no momentum the running statistics are averaged by it -- and a
+    # region calling a model it closes over updates that model once per call.
+    tp.manual_seed(0)
+    norm = nn.BatchNorm1d(4, momentum=momentum).to(device)
+    ref = copy.deepcopy(norm)
+    compiled = [tp.compile(norm, strict_native=True)]
+    if momentum is not None:
+        closing = nn.BatchNorm1d(4).to(device)
+        closing_ref = copy.deepcopy(closing)
+        compiled.append(tp.compile(lambda x: closing(x), strict_native=True))
+    for _ in range(3):
+        x = tp.randn(8, 4, device=device, requires_grad=True)
+        compiled[0](x).sum().backward()
+        ref(x).sum().backward()
+        if momentum is not None:
+            compiled[1](x).sum().backward()
+            closing_ref(x).sum().backward()
+    pairs = [(norm, ref)] + ([(closing, closing_ref)] if momentum is not None else [])
+    for mine, theirs in pairs:
+        assert mine.num_batches_tracked.item() == theirs.num_batches_tracked.item() == 3
+        for name in ("running_mean", "running_var"):
+            err = (getattr(mine, name) - getattr(theirs, name)).abs().max().item()
+            assert err <= 1e-5

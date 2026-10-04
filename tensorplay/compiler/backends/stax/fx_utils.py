@@ -809,9 +809,13 @@ def get_node_storage(node: Node) -> int | None:
         return None
     if not isinstance(node.meta["val"], tp.Tensor):
         return None
-    if not tp._C.is_storage(node.meta["val"]):
+    # Whether the value has memory behind it -- a tensor standing only for a
+    # shape has none to compare.  (``is_storage`` asks whether an object is a
+    # storage, which a tensor never is.)
+    try:
+        return get_storage(node.meta["val"])
+    except (RuntimeError, AttributeError, NotImplementedError):
         return None
-    return get_storage(node.meta["val"])
 
 
 def get_fake(x: Any, gm: GraphModule | None) -> Any:

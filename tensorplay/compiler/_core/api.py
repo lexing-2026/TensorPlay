@@ -8,10 +8,12 @@ never asked to discover Python control flow; it only receives a captured
 from __future__ import annotations
 
 import contextlib
-
+import dis
 import functools
 import inspect
+import re
 import threading
+import types
 from typing import Any, Callable
 from weakref import WeakSet
 
@@ -361,6 +363,26 @@ def compile(
     if recompile_limit is not None and recompile_limit < 1:
         raise ValueError("recompile_limit must be positive")
 
+    lifted = _lift_free_tensors(model)
+    if lifted is not None:
+        program, read_free = lifted
+        return _WithFreeTensors(
+            model,
+            compile(
+                program,
+                fullgraph=fullgraph,
+                backend=backend,
+                dynamic=dynamic,
+                mode=mode,
+                options=options,
+                name=name,
+                recompile_limit=recompile_limit,
+                isolate_recompiles=isolate_recompiles,
+                strict_native=strict_native,
+            ),
+            read_free,
+        )
+
     backend_spec = get_default_backend() if backend is None else backend
     compiler_fn = lookup_backend(backend_spec)
     backend_kwargs = _backend_kwargs(
@@ -615,6 +637,230 @@ def compile(
     return optimized
 
 
+def _loaded_global_names(function: types.FunctionType) -> set[str]:
+    """The names ``function``'s code, and code defined inside it, loads as globals."""
+
+    loaded: set[str] = set()
+    pending = [function.__code__]
+    while pending:
+        code = pending.pop()
+        for instruction in dis.get_instructions(code):
+            if instruction.opname in ("LOAD_GLOBAL", "LOAD_NAME"):
+                loaded.add(instruction.argval)
+        pending.extend(c for c in code.co_consts if isinstance(c, types.CodeType))
+    return loaded
+
+
+def _modules_reached(program: Any) -> list[Any]:
+    """The modules whose state running ``program`` can update.
+
+    The program itself or the module a bound method belongs to; for a plain
+    function, the modules it reaches through its closure or the globals it
+    loads -- a lambda calling a model it closes over updates that model.
+    """
+
+    import tensorplay
+
+    module_type = tensorplay.nn.Module
+    if isinstance(program, module_type):
+        return [program]
+    owner = getattr(program, "__self__", None)
+    if isinstance(owner, module_type):
+        return [owner]
+    function = inspect.unwrap(program) if callable(program) else None
+    if not isinstance(function, types.FunctionType):
+        return []
+    found: list[Any] = []
+
+    def add(value: Any) -> None:
+        if isinstance(value, module_type) and all(value is not m for m in found):
+            found.append(value)
+
+    for cell in function.__closure__ or ():
+        try:
+            add(cell.cell_contents)
+        except ValueError:
+            continue
+    scope = function.__globals__
+    for name in _loaded_global_names(function):
+        add(scope.get(name))
+    return found
+
+
+def _free_tensor_sources(
+    function: types.FunctionType,
+) -> tuple[tuple[str, ...], tuple[int, ...]]:
+    """The global names and closure cells through which ``function`` reads tensors.
+
+    Only names the code loads as globals count -- an attribute that happens
+    to share a global's name is not a read of it -- and functions defined
+    inside the body are searched too, since they read the same globals.
+    """
+
+    import tensorplay
+
+    scope = function.__globals__
+    global_names = tuple(
+        sorted(
+            name
+            for name in _loaded_global_names(function)
+            if isinstance(scope.get(name), tensorplay.Tensor)
+        )
+    )
+    cell_indices = []
+    for index, cell in enumerate(function.__closure__ or ()):
+        try:
+            value = cell.cell_contents
+        except ValueError:
+            continue
+        if isinstance(value, tensorplay.Tensor):
+            cell_indices.append(index)
+    return global_names, tuple(cell_indices)
+
+
+def _module_state_slots(modules: list[Any]) -> list[tuple[Any, str, str, str]]:
+    """Every parameter and buffer of ``modules``, as (module, table, name, label).
+
+    A tensor held under several names is listed once, under the first.
+    """
+
+    slots: list[tuple[Any, str, str, str]] = []
+    seen: set[int] = set()
+    for index, root in enumerate(modules):
+        for qualname, module in root.named_modules(remove_duplicate=True):
+            for table in ("_parameters", "_buffers"):
+                for name, value in getattr(module, table, {}).items():
+                    if value is None or id(value) in seen:
+                        continue
+                    seen.add(id(value))
+                    label = ".".join(p for p in (str(index), qualname, name) if p)
+                    slots.append((module, table, name, label))
+    return slots
+
+
+def _lift_free_tensors(
+    model: Callable[..., Any],
+) -> tuple[Callable[..., Any], Callable[[], tuple[Any, ...]]] | None:
+    """Make the tensors a function reads from outside into inputs of the region.
+
+    A tensor a function reaches through a global or a closure -- directly, or
+    as a parameter or buffer of a module it reaches that way -- is read when
+    the function runs, not when it was compiled: an in-place update between
+    calls, or a name rebound to another tensor, must reach the next call, and
+    work done on such a tensor alone belongs to the call rather than to the
+    capture.  So the region is captured from a copy of the function that takes
+    those tensors as leading positional inputs, and every call reads them from
+    where the function would.  Returns ``None`` when the function reads none.
+    """
+
+    if not isinstance(model, types.FunctionType) or getattr(model, "_tensorplay_lifted", False):
+        return None
+    try:
+        signature = inspect.signature(model)
+    except (TypeError, ValueError):
+        return None
+    global_names, cell_indices = _free_tensor_sources(model)
+    slots = _module_state_slots(_modules_reached(model))
+    if not global_names and not cell_indices and not slots:
+        return None
+
+    taken = set(signature.parameters)
+    free_names = []
+    for name in [
+        *global_names,
+        *(model.__code__.co_freevars[i] for i in cell_indices),
+        *(label for *_, label in slots),
+    ]:
+        candidate = "free_" + re.sub(r"\W", "_", name)
+        while candidate in taken:
+            candidate = f"_{candidate}"
+        taken.add(candidate)
+        free_names.append(candidate)
+    num_globals = len(global_names)
+    num_direct = num_globals + len(cell_indices)
+    count = len(free_names)
+    missing = object()
+
+    def program(*args: Any, **kwargs: Any) -> Any:
+        free, rest = args[:count], args[count:]
+        scope = dict(model.__globals__)
+        scope.update(zip(global_names, free[:num_globals]))
+        closure = model.__closure__
+        if cell_indices:
+            cells = list(closure)
+            for index, value in zip(cell_indices, free[num_globals:num_direct]):
+                cells[index] = types.CellType(value)
+            closure = tuple(cells)
+        body = types.FunctionType(
+            model.__code__, scope, model.__name__, model.__defaults__, closure
+        )
+        body.__kwdefaults__ = model.__kwdefaults__
+        # A module's state is read through the module, so the values handed
+        # in stand in its attributes while the body runs, as a traced module's
+        # own state does.
+        patched = []
+        try:
+            for (module, _, name, _), value in zip(slots, free[num_direct:]):
+                patched.append((module, name, module.__dict__.get(name, missing)))
+                module.__dict__[name] = value
+            return body(*rest, **kwargs)
+        finally:
+            for module, name, previous in reversed(patched):
+                if previous is missing:
+                    module.__dict__.pop(name, None)
+                else:
+                    module.__dict__[name] = previous
+
+    functools.update_wrapper(program, model)
+    program._tensorplay_lifted = True  # type: ignore[attr-defined]
+    program.__signature__ = signature.replace(  # type: ignore[attr-defined]
+        parameters=[
+            inspect.Parameter(name, inspect.Parameter.POSITIONAL_ONLY)
+            for name in free_names
+        ]
+        + list(signature.parameters.values())
+    )
+
+    def read_free() -> tuple[Any, ...]:
+        scope = model.__globals__
+        closure = model.__closure__
+        return (
+            *(scope.get(name) for name in global_names),
+            *(closure[index].cell_contents for index in cell_indices),
+            *(getattr(module, table).get(name) for module, table, name, _ in slots),
+        )
+
+    return program, read_free
+
+
+class _WithFreeTensors:
+    """A compiled region handed the tensors its function reads from outside.
+
+    Calls go to the region compiled from the lifted copy, with the current
+    value of every such tensor ahead of the caller's arguments; what the
+    compiled callable reports about itself is read from that region.
+    """
+
+    def __init__(
+        self,
+        model: Callable[..., Any],
+        compiled: Callable[..., Any],
+        read_free: Callable[[], tuple[Any, ...]],
+    ) -> None:
+        self._compiled = compiled
+        self._read_free = read_free
+        self._tensorplay_original = model
+        functools.update_wrapper(self, model)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self._compiled(*self._read_free(), *args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_tensorplay_"):
+            return getattr(self._compiled, name)
+        raise AttributeError(name)
+
+
 def _bind_sample_arguments(
     model: Callable[..., Any],
     args: tuple[Any, ...],
@@ -759,18 +1005,25 @@ def _preserve_module_state(program: Any) -> Any:
     """Undo the state updates an executing capture makes.
 
     Capture runs the program to record it; in-place updates it performs on
-    the module's parameters and buffers (running statistics, counters) must
-    not count as a call, so their values are restored afterwards.
+    the parameters and buffers of the modules it reaches (running statistics,
+    counters) must not count as a call, so their values are restored
+    afterwards.
     """
 
     import tensorplay
 
-    module = program if isinstance(program, tensorplay.nn.Module) else getattr(program, "__self__", None)
-    if not isinstance(module, tensorplay.nn.Module):
+    modules = _modules_reached(program)
+    if not modules:
         yield
         return
+    seen: set[int] = set()
+    saved = []
     with tensorplay.no_grad():
-        saved = [(t, t.clone()) for t in list(module.parameters()) + list(module.buffers())]
+        for module in modules:
+            for t in (*module.parameters(), *module.buffers()):
+                if id(t) not in seen:
+                    seen.add(id(t))
+                    saved.append((t, t.clone()))
     try:
         yield
     finally:
@@ -828,11 +1081,15 @@ def _compile_region(
     region_key: str | None = None,
     preserve_recorded_values: bool = False,
 ) -> tuple[Callable[..., Any], GraphModule]:
+    devices = _generator_devices(example_inputs, example_kwargs)
     stored = load_region(region_key, model)
     if stored is not None:
         graph_module = stored
     else:
-        with _preserve_input_values(example_inputs, example_kwargs):
+        import tensorplay
+
+        with _preserve_input_values(example_inputs, example_kwargs), \
+                tensorplay.random.fork_rng(devices=devices):
             try:
                 with _compiler_context(), _preserve_module_state(model):
                     tracer = Tracer(execute=True)
@@ -885,12 +1142,6 @@ def _compile_region(
     # where the compiler's own sample pass stopped.
     import tensorplay
 
-    devices = []
-    for value in example_inputs:
-        if isinstance(value, tensorplay.Tensor) and value.device.type == "cuda":
-            index = value.device.index or 0
-            if index not in devices:
-                devices.append(index)
     with _preserve_input_values(example_inputs, example_kwargs):
         with tensorplay.random.fork_rng(devices=devices):
             # Backend failures are compiler failures, not graph breaks.  In
@@ -951,6 +1202,33 @@ def _compile_region(
     return compiled, graph_module
 
 
+def _generator_devices(
+    example_inputs: tuple[Any, ...], example_kwargs: dict[str, Any]
+) -> list[int]:
+    """The CUDA devices whose generators compiling a region may advance.
+
+    Every device an input lives on, and the current device whenever CUDA is
+    present, since a region can draw on it without reading anything there.
+    Reading a device's generator state does not open a context on it.
+    """
+
+    import tensorplay
+
+    devices: list[int] = []
+
+    def add(index: int) -> None:
+        if index not in devices:
+            devices.append(index)
+
+    for value in (*example_inputs, *example_kwargs.values()):
+        if isinstance(value, tensorplay.Tensor) and value.device.type == "cuda":
+            add(value.device.index or 0)
+    cuda = getattr(tensorplay, "cuda", None)
+    if cuda is not None and cuda.is_available():
+        add(cuda.current_device())
+    return devices
+
+
 def _release_recorded_values(graph_module: Any) -> None:
     """Drop execution artifacts that capture-time propagation parked on nodes.
 
@@ -999,8 +1277,15 @@ def _make_gate_evaluator(replay: dict[str, Any], target: Any) -> Callable[..., t
 
     from tensorplay.graph import GraphModule, gate_outcome
 
+    # The condition reads state off the module a bound method belongs to --
+    # a buffer counting batches, say -- so the module is what it is read from;
+    # the method only says how the call's arguments are named.
+    owner = getattr(target, "__self__", None)
+    import tensorplay
+
+    root = owner if isinstance(owner, tensorplay.nn.Module) else target
     mini = GraphModule(
-        target,
+        root,
         replay["graph"],
         inspect.Signature(
             [

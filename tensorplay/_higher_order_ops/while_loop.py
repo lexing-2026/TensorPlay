@@ -32,6 +32,7 @@ from tensorplay._higher_order_ops.utils import (
     unique_graph_id,
     validate_subgraph_args_types,
     _resolve_real_sample,
+    lift_closed_over_tensors,
 )
 from tensorplay.graph.experimental.proxy_tensor import (
     disable_proxy_modes_tracing,
@@ -464,7 +465,10 @@ def trace_while_loop(
     cond_graph.meta["hop_graph_name"] = cond_name
     body_graph.meta["hop_graph_name"] = body_name
 
-    args = (cond_graph, body_graph, carried_inputs, additional_inputs)
+    # A tensor either piece closes over is handed to both as one more input,
+    # read from the program on every call rather than held by the pieces.
+    closed_over = lift_closed_over_tensors([cond_graph, body_graph])
+    args = (cond_graph, body_graph, carried_inputs, (*additional_inputs, *closed_over))
     proxy_args = unwrap_proxy(args)
     out_proxy = tracer.create_proxy("call_function", op, proxy_args, {})
 

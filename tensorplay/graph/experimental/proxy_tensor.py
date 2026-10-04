@@ -722,14 +722,17 @@ def disable_proxy_modes_tracing() -> Generator[ProxyMode | None, None, None]:
     # The third is the tracer a factory records itself on when no argument of
     # its own names one.  Left in place, a tensor made here only to stand for a
     # shape would come back as a node of the region instead of as a tensor.
-    from tensorplay.graph._utils import _active_tracer
+    #
+    # A value of a trace that the code run here reads -- one a branch or loop
+    # body closes over -- is read as the tensor it stands for.
+    from tensorplay.graph._utils import _active_tracer, reading_enclosing_values
     from tensorplay.utils._dispatch import _disable_current_modes
 
     previous = _CURRENT_MODE.get()
     token = _CURRENT_MODE.set(None)
     tracer_token = _active_tracer.set(None)
     try:
-        with _disable_current_modes():
+        with _disable_current_modes(), reading_enclosing_values():
             yield previous
     finally:
         _active_tracer.reset(tracer_token)

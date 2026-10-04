@@ -459,27 +459,23 @@ def quantile(input, q, dim=None, keepdim=False, *, interpolation="linear"):
     All five interpolation modes, float32/float64, NaN semantics, and output
     shapes are handled here.  A Python-number q is
 """
-    if isinstance(q, tensorplay.Tensor):
-        qs = q
-    elif isinstance(q, (int, float)):
+    # A Python number becomes a tensor of the input's type; anything else
+    # (a tensor, or a value standing for one under a trace) goes to the
+    # binding, which rejects what is not a tensor.
+    qs = q
+    if isinstance(q, (int, float)) and not isinstance(q, tensorplay.Tensor):
         qs = tensorplay.tensor(q, dtype=input.dtype, device=input.device)
-    else:
-        raise TypeError(
-            "quantile() received an invalid combination of arguments - got "
-            f"(Tensor, {type(q).__name__}), but expected (Tensor, Tensor)")
     return tensorplay._C.quantile(input, qs, dim=dim, keepdim=keepdim,
                                   interpolation=interpolation)
 
 
 def nanquantile(input, q, dim=None, keepdim=False, *, interpolation="linear"):
-    if isinstance(q, tensorplay.Tensor):
-        qs = q
-    elif isinstance(q, (int, float)):
+    # A Python number becomes a tensor of the input's type; anything else
+    # (a tensor, or a value standing for one under a trace) goes to the
+    # binding, which rejects what is not a tensor.
+    qs = q
+    if isinstance(q, (int, float)) and not isinstance(q, tensorplay.Tensor):
         qs = tensorplay.tensor(q, dtype=input.dtype, device=input.device)
-    else:
-        raise TypeError(
-            "nanquantile() received an invalid combination of arguments - got "
-            f"(Tensor, {type(q).__name__}), but expected (Tensor, Tensor)")
     return tensorplay._C.nanquantile(input, qs, dim=dim, keepdim=keepdim,
                                      interpolation=interpolation)
 

@@ -1210,6 +1210,47 @@ class GraphLowering(Interpreter):
 
         self.fallback_ops.append(kernel_name)
 
+    def written_storages(self) -> set:
+        """The memory this region's operations write into, by storage.
+
+        A region whose every operation makes a new value writes nothing; one
+        that updates an input in place, or writes into a copy it made, names
+        that memory here.  Asked once and kept: the graph does not change
+        while it is lowered.
+        """
+
+        cached = getattr(self, "_written_storages", None)
+        if cached is not None:
+            return cached
+        from tensorplay.graph import Node
+
+        from .fx_utils import get_node_storage
+
+        written: set = set()
+        for node in self.module.graph.nodes:
+            if node.op != "call_function":
+                continue
+            schema = getattr(node.target, "_schema", None)
+            arguments = getattr(schema, "arguments", None)
+            if not arguments or not getattr(schema, "is_mutable", False):
+                continue
+            for position, argument in enumerate(arguments):
+                alias = getattr(argument, "alias_info", None)
+                if alias is None or not getattr(alias, "is_write", False):
+                    continue
+                value = (
+                    node.args[position]
+                    if position < len(node.args)
+                    else node.kwargs.get(argument.name)
+                )
+                for item in value if isinstance(value, (list, tuple)) else (value,):
+                    if isinstance(item, Node):
+                        storage = get_node_storage(item)
+                        if storage is not None:
+                            written.add(storage)
+        self._written_storages = written
+        return written
+
     def mark_buffer_mutated(self, name: str) -> None:
         """Record that a buffer's contents are overwritten, and let its readers finish.
 

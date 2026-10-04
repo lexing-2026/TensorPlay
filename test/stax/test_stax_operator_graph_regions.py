@@ -348,3 +348,106 @@ def test_comparisons_answer_for_each_call(device):
     a = tp.randn(4, 5, device=device)
     for b in (a.clone(), a + 1e-3, a.clone()):
         assert [bool(v) for v in compiled(a, b)] == list(fn(a, b))
+
+
+_GLOBAL_X = None
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_tensors_read_from_outside_are_read_on_every_call(device):
+    # A tensor a function reaches through a global or a closure is read when
+    # the call runs: work done on it alone happens on the call, an in-place
+    # update between calls is seen, and so is a name rebound to another one.
+    global _GLOBAL_X
+    _GLOBAL_X = tp.randn(6, 8, device=device)
+    rows = tp.tensor([0, 2], device=device)
+
+    def copy_and_add():
+        y = _GLOBAL_X.clone()
+        y.index_add_(0, rows, tp.ones(2, 8, device=device))
+        return y
+
+    def update_a_copy():
+        y = _GLOBAL_X.clone()
+        y.add_(1)
+        return y
+
+    w = tp.randn(3, 8, device=device)
+
+    def column_sums(a):
+        return a + w.sum(0) + _GLOBAL_X.sum(0)
+
+    a = tp.randn(8, device=device)
+    compiled = [
+        (tp.compile(copy_and_add, strict_native=True), copy_and_add, ()),
+        (tp.compile(update_a_copy, strict_native=True), update_a_copy, ()),
+        (tp.compile(column_sums, strict_native=True), column_sums, (a,)),
+    ]
+    for step in range(3):
+        for fast, fn, args in compiled:
+            _same(fast(*args), fn(*args), 1e-5)
+        if step == 0:
+            _GLOBAL_X.add_(1.0)
+            w.mul_(2.0)
+        else:
+            _GLOBAL_X = tp.randn(6, 8, device=device)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_first_compiled_call_draws_what_eager_draws(device):
+    # Compiling runs the program to record it; those runs draw from a forked
+    # generator, so the first compiled call draws what an eager call would.
+    fn = lambda: tp.randn(4, 5, device=device) * 2
+    compiled = tp.compile(fn, strict_native=True)
+    for _ in range(2):
+        tp.manual_seed(7)
+        want = fn()
+        tp.manual_seed(7)
+        _same(compiled(), want, 1e-6)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_training_region_updates_its_buffers(device):
+    # A training region that updates buffers in place makes the updates, and
+    # its gradients read a buffer as it stood when the program read it, not
+    # as the update left it.
+    class Accumulates(tp.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = tp.nn.Parameter(tp.ones(3))
+            self.register_buffer("count", tp.zeros((), dtype=tp.int64))
+            self.register_buffer("total", tp.ones(3))
+
+        def forward(self, x):
+            before = x * self.total
+            self.count.add_(1)
+            self.total.add_(x.sum(0))
+            return x * self.w + before * self.w
+
+    mine, ref = Accumulates().to(device), Accumulates().to(device)
+    compiled = tp.compile(mine, strict_native=True)
+    for _ in range(3):
+        x = tp.randn(4, 3, device=device)
+        _same(compiled(x), ref(x), 1e-5)
+        compiled(x).sum().backward()
+        ref(x).sum().backward()
+    assert mine.count.item() == ref.count.item() == 6
+    _same(mine.total, ref.total, 1e-5)
+    _same(mine.w.grad, ref.w.grad, 1e-5)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_axis_counted_from_the_back(device):
+    # An indexed add or copy along an axis counted from the back lands on that
+    # axis, and so does the gradient of a window taken along it.
+    index = tp.tensor([0, 1, 2, 2, 3, 4, 4, 5, 6], device=device)
+    source = tp.randn(6, 9, device=device)
+    zeros = tp.zeros(6, 8, device=device)
+    _check(lambda z, s: z.index_add(-1, index, s), zeros, source)
+    rows = tp.tensor([0, 2, 4, 6, 7, 5, 1], device=device)
+    _check(lambda z, s: z.index_copy(-1, rows, s[:, :7]), zeros, source)
+    x = tp.randn(6, 8, device=device, requires_grad=True)
+    compiled = tp.compile(lambda x: x.unfold(-1, 3, 2), strict_native=True)
+    (got,) = tp.autograd.grad((compiled(x) * 2).sum(), [x])
+    (want,) = tp.autograd.grad((x.unfold(-1, 3, 2) * 2).sum(), [x])
+    _same(got, want, 1e-6)

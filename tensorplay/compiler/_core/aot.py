@@ -331,6 +331,69 @@ def _copy_nodes(
     return graph, mapping, [mapping[n] for n in nodes]
 
 
+def _forward_writes(fwd_nodes: List[Node]) -> List[Node]:
+    """The forward operations held for what they write rather than return."""
+
+    return [
+        n for n in fwd_nodes
+        if n.op == "call_function" and n.is_impure(impure_random=False)
+    ]
+
+
+def _backward_reach(bwd_nodes: List[Node], bwd_out_args: List[Any], stop: set) -> set:
+    """Every node the backward computes or reads, not looking past ``stop``."""
+
+    reached: set = set()
+    stack = [*bwd_nodes, *(a for a in bwd_out_args if isinstance(a, Node))]
+    while stack:
+        n = stack.pop()
+        if n in reached:
+            continue
+        reached.add(n)
+        if n.op in _LEAF_OPS or n in stop:
+            continue
+        stack.extend(n.all_input_nodes)
+    return reached
+
+
+def _snapshot_inputs_read_after_write(
+    joint: Graph, writes: List[Node], reached: set
+) -> List[Node]:
+    """Give the backward a copy of each input it reads that the forward writes.
+
+    The forward's results are written back into an input -- a buffer updated
+    in place -- before the backward runs, so a backward reading that input
+    would read the value after the write.  It reads a copy taken before the
+    write instead, as does every other reader; the copies are returned for
+    the caller to keep for the backward.
+    """
+
+    import tensorplay
+
+    written: Dict[Node, List[Node]] = {}
+    for n in writes:
+        dest = n.args[0] if n.args else None
+        if _op_name(n) == "copy_" and isinstance(dest, Node) and dest.op == "placeholder":
+            written.setdefault(dest, []).append(n)
+    snapshots = []
+    for primal, its_writes in written.items():
+        if primal not in reached:
+            continue
+        with joint.inserting_after(primal):
+            snap = joint.call_function(tensorplay.ops.tp.clone.default, (primal,))
+        snap.meta.update({k: v for k, v in primal.meta.items() if k != "is_backward"})
+        # Its value is a tensor of its own: one sharing the input's memory
+        # would say the copy is the input, and the copy would be dropped.
+        value = primal.meta.get("val")
+        if isinstance(value, tensorplay.Tensor):
+            snap.meta["val"] = value.clone()
+        primal.replace_all_uses_with(
+            snap, delete_user_cb=lambda u, s=snap, w=its_writes: u is not s and u not in w
+        )
+        snapshots.append(snap)
+    return snapshots
+
+
 def partition_default(
     joint_gm: GraphModule, *, num_fwd_outputs: int = 1, policy: str = "save_needed"
 ):
@@ -361,11 +424,28 @@ def partition_default(
     user_outputs = out_args[:num_fwd_outputs]
     bwd_out_args = out_args[num_fwd_outputs:]
 
+    # An input the forward writes into and the backward reads is read through
+    # a copy taken before the write, which the backward then reads as a kept
+    # value.
+    snapshots = _snapshot_inputs_read_after_write(
+        joint,
+        _forward_writes(fwd_nodes),
+        _backward_reach(
+            bwd_nodes,
+            bwd_out_args,
+            set() if policy == "recompute_all" else set(fwd_nodes),
+        ),
+    )
+    if snapshots:
+        fwd_nodes = [
+            n for n in joint.nodes if n.op != "output" and not n.meta.get("is_backward")
+        ]
+
     candidate_saved = [
         n for n in fwd_nodes
-        if policy != "recompute_all"
+        if (policy != "recompute_all" or n in snapshots)
         and n.op not in _LEAF_OPS
-        and any(u.meta.get("is_backward") for u in n.users)
+        and (n in snapshots or any(u.meta.get("is_backward") for u in n.users))
     ]
 
     fw_graph, _, _ = _copy_nodes(fwd_nodes, [*user_outputs, *candidate_saved], False)
@@ -387,6 +467,13 @@ def partition_default(
                 clone = bw_graph.get_attr(node.target)
                 clone.meta.update(node.meta)
                 bw_map[node] = clone
+                return clone
+            if node in snapshots:
+                clone = bw_graph.placeholder(node.name)
+                clone.meta.update(node.meta)
+                bw_map[node] = clone
+                input_kinds.append("saved")
+                input_keys.append(node.name)
                 return clone
             if node.op in _LEAF_OPS:
                 clone = bw_graph.placeholder(node.name)
@@ -874,10 +961,25 @@ def partition_min_cut(
     if saved_set is None:
         return partition_default(joint_gm, num_fwd_outputs=num_fwd_outputs)
 
+    # A forward operation that writes into something -- an input updated in
+    # place, say a buffer counting the batches it has seen -- is held for that
+    # write, which nothing reads but the program after the call.  An input it
+    # writes and the backward reads, directly or through a value it computes
+    # again, is read through a copy taken before the write and kept.
+    writes = _forward_writes(fwd_nodes)
+    snapshots = _snapshot_inputs_read_after_write(
+        joint, writes, _backward_reach(bwd_nodes, bwd_out_args, saved_set)
+    )
+    if snapshots:
+        saved_set = set(saved_set) | set(snapshots)
+        fwd_nodes = [
+            n for n in joint.nodes if n.op != "output" and not n.meta.get("is_backward")
+        ]
+
     # The forward holds what its results and the kept values are computed
     # from; a value only the backward reads is computed there.
     needed: set = set()
-    stack = [o for o in [*user_outputs, *saved_set] if isinstance(o, Node)]
+    stack = [o for o in [*user_outputs, *saved_set, *writes] if isinstance(o, Node)]
     while stack:
         n = stack.pop()
         if n in needed:

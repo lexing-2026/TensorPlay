@@ -109,6 +109,46 @@ def _iter_values(value: Any) -> Iterator[Any]:
         yield value
 
 
+def _enclosing_samples(
+    proxy_type: type,
+    tracer: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    lent: dict[int, Any] | None = None,
+) -> tuple[tuple[Any, ...], dict[str, Any]] | None:
+    """``args`` and ``kwargs`` with every value of ``tracer`` replaced by its tensor.
+
+    ``None`` when one of them has no tensor recorded for it.  Each tensor
+    handed out is noted in ``lent`` against the node it stands for.
+    """
+
+    samples = getattr(tracer, "_node_samples", None)
+    if samples is None:
+        return None
+    missing = object()
+
+    def swap(value: Any) -> Any:
+        if isinstance(value, proxy_type) and value.tracer is tracer:
+            sample = samples.get(value.node.name, missing)
+            if sample is missing or sample is None:
+                raise LookupError
+            if lent is not None:
+                lent[id(sample)] = value.node
+            return sample
+        if isinstance(value, tuple | list):
+            return type(value)(swap(item) for item in value)
+        if isinstance(value, dict):
+            return {key: swap(item) for key, item in value.items()}
+        return value
+
+    try:
+        return tuple(swap(item) for item in args), {
+            key: swap(item) for key, item in kwargs.items()
+        }
+    except LookupError:
+        return None
+
+
 _PRESERVED_NODE_META_FIELDS = (
     "module_stack",
     "nn_module_stack",

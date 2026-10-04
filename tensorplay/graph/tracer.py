@@ -13,13 +13,14 @@ from ._utils import (
     _capture_disabled,
     _active_tracer,
     _iter_nodes,
+    _reading_enclosing_values,
     compiler_context,
     gate_outcome,
 )
 from .graph import Graph
 from .graph_module import GraphModule
 from .node import Node
-from .proxy import Proxy, _apply_preserved_node_meta
+from .proxy import Proxy, _apply_preserved_node_meta, _enclosing_samples
 
 
 def _is_module(value: Any) -> bool:
@@ -321,6 +322,15 @@ class Tracer:
         if isinstance(value, Proxy):
             return value.node
         if isinstance(value, tp.Tensor):
+            # A tensor this trace lent out for one of its values -- read by a
+            # piece of the program traced on its own, and handed back as an
+            # input of the operator holding that piece -- is that value, not a
+            # constant to be captured.
+            lent = self.__dict__.get("_lent_samples")
+            if lent:
+                node = lent.get(id(value))
+                if node is not None and self._node_samples.get(node.name) is value:
+                    return node
             for name, existing in self._graph_attrs.items():
                 if existing is value:
                     node = self.graph.get_attr(name)
@@ -374,6 +384,23 @@ class Tracer:
     ) -> Proxy:
         if _capture_disabled.get():
             raise GraphCaptureError("graph capture is disabled for this operation")
+        if (
+            kind in ("call_function", "call_method")
+            and _reading_enclosing_values.get()
+            and _active_tracer.get() is not self
+        ):
+            # A piece of the program traced on its own -- a branch, a loop
+            # body -- reads a value of this trace: the call is made on the
+            # tensor that value stands for, and the piece's own trace records
+            # it.  The operator holding the piece hands that tensor back here
+            # as an input, where it is recognised as this value.
+            lent = self.__dict__.setdefault("_lent_samples", {})
+            values = _enclosing_samples(Proxy, self, args, kwargs, lent)
+            if values is not None:
+                real_args, real_kwargs = values
+                if kind == "call_method":
+                    return getattr(real_args[0], target)(*real_args[1:], **real_kwargs)
+                return target(*real_args, **real_kwargs)
         args = self.create_arg(args)
         kwargs = self.create_arg(kwargs)
         proxy = Proxy(self.graph.create_node(kind, target, args, kwargs), self)

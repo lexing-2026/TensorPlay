@@ -127,6 +127,25 @@ def get_active_tracer() -> Any:
     return _active_tracer.get()
 
 
+# Set while an operator traces a piece of the program it holds -- a branch, a
+# loop body -- in a trace of its own.  A value of the enclosing trace that the
+# piece closes over is read there as the tensor it stood for; the operator then
+# hands that tensor back to the enclosing trace as one more input, where it is
+# recognised as the value it came from.
+_reading_enclosing_values: ContextVar[bool] = ContextVar(
+    "tensorplay_graph_reading_enclosing_values", default=False
+)
+
+
+@contextmanager
+def reading_enclosing_values():
+    token = _reading_enclosing_values.set(True)
+    try:
+        yield
+    finally:
+        _reading_enclosing_values.reset(token)
+
+
 def _native_capture_state(
     entering: bool,
     *,
