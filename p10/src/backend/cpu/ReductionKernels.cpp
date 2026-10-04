@@ -39,15 +39,29 @@ Tensor sum_dim_kernel(const Tensor& self, const std::vector<int64_t>& dims, bool
     return sum_dim_stub(DeviceType::CPU, self, std::move(dims), keepdim, dtype);
 }
 
+namespace {
+// A narrow-float mean cannot be computed in its storage type: the running sum
+// overflows past the type's maximum long before the mean does, and a
+// whole-tensor element count also overflows when narrowed to it (the division
+// then yields zero or nan). Sum and divide in single precision, and narrow the
+// final quotient once.
+bool mean_needs_opmath(DType out_dtype) {
+    return out_dtype == DType::Float16 || out_dtype == DType::BFloat16;
+}
+} // namespace
+
 Tensor mean_kernel(const Tensor& self, DType dtype) {
     DType out_dtype = (dtype == DType::Undefined) ? (isFloatingOrComplexType(self.dtype()) ? self.dtype() : DType::Float32) : dtype;
+    if (mean_needs_opmath(out_dtype)) {
+        Tensor s = sum_kernel(self, DType::Float32);
+        return (s / Scalar(self.numel())).to(out_dtype);
+    }
     Tensor s = sum_kernel(self, out_dtype);
     return s / Scalar(self.numel());
 }
 
 Tensor mean_dim_kernel(const Tensor& self, const std::vector<int64_t>& dims, bool keepdim, DType dtype) {
     DType out_dtype = (dtype == DType::Undefined) ? (isFloatingOrComplexType(self.dtype()) ? self.dtype() : DType::Float32) : dtype;
-    Tensor s = sum_dim_kernel(self, dims, keepdim, out_dtype);
 
     int64_t count = 1;
     std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(self.shape());
@@ -56,6 +70,11 @@ Tensor mean_dim_kernel(const Tensor& self, const std::vector<int64_t>& dims, boo
         count *= shape[d];
     }
 
+    if (mean_needs_opmath(out_dtype)) {
+        Tensor s = sum_dim_kernel(self, dims, keepdim, DType::Float32);
+        return (s / Scalar(count)).to(out_dtype);
+    }
+    Tensor s = sum_dim_kernel(self, dims, keepdim, out_dtype);
     return s / Scalar(count);
 }
 
