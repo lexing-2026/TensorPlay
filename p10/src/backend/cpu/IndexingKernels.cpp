@@ -664,12 +664,49 @@ Tensor gather_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
 // ---------------------------------------------------------------------------
 // scatter / scatter_add
 //
-// The CPU implementation updates one indexed slice at a time. The optional
-// accumulation mode is intentionally serialized because duplicate indices
-// must have deterministic update order.
+// Every destination element is written by exactly one task: the index's
+// scatter axis is walked in order inside a task, and tasks split only the
+// positions beside it.  Repeated indices therefore accumulate, or let the
+// last one win, exactly as a serial walk would.
 // ---------------------------------------------------------------------------
 
 enum class ScatterMode { Assign, Add };
+
+// Index layout [outer][dim][inner]; destination layout [outer][self_dim]
+// [self_inner].  A task owns one outer slot and a run of inner positions,
+// whose destinations no other task touches.
+template <typename T>
+static void scatter_lines(T* d, const int64_t* ip, const T* vp, ScatterMode mode,
+                          int64_t idx_outer, int64_t idx_dim_size, int64_t idx_inner,
+                          int64_t self_dim_size, int64_t self_inner) {
+    if (idx_outer == 0 || idx_dim_size == 0 || idx_inner == 0) return;
+    const int64_t chunk_t = std::min<int64_t>(
+        idx_inner, std::max<int64_t>(1, GRAIN_SIZE / idx_dim_size));
+    const int64_t nchunk_t = (idx_inner + chunk_t - 1) / chunk_t;
+    const int64_t task_grain =
+        std::max<int64_t>(1, GRAIN_SIZE / (idx_dim_size * chunk_t));
+    parallel_for(0, idx_outer * nchunk_t, task_grain, [&](int64_t begin, int64_t end) {
+        for (int64_t task = begin; task < end; ++task) {
+            const int64_t g = task / nchunk_t;
+            const int64_t t0 = (task - g * nchunk_t) * chunk_t;
+            const int64_t t1 = std::min(t0 + chunk_t, idx_inner);
+            const int64_t* idx_row = ip + g * idx_dim_size * idx_inner;
+            const T* v_row = vp + g * idx_dim_size * idx_inner;
+            T* d_slot = d + g * self_dim_size * self_inner;
+            for (int64_t j = 0; j < idx_dim_size; ++j) {
+                if (mode == ScatterMode::Assign) {
+                    for (int64_t t = t0; t < t1; ++t)
+                        d_slot[idx_row[t] * self_inner + t] = v_row[t];
+                } else {
+                    for (int64_t t = t0; t < t1; ++t)
+                        d_slot[idx_row[t] * self_inner + t] += v_row[t];
+                }
+                idx_row += idx_inner;
+                v_row += idx_inner;
+            }
+        }
+    });
+}
 
 Tensor scatter_base_cpu(const Tensor& self, int64_t dim, const Tensor& index,
                         const Tensor& src, ScatterMode mode) {
@@ -705,33 +742,15 @@ Tensor scatter_base_cpu(const Tensor& self, int64_t dim, const Tensor& index,
     int64_t self_inner = 1;
     for (int64_t i = dim + 1; i < nd; ++i) self_inner *= self.size(i);
     int64_t idx_dim_size = idx_c.size(dim);
-    int64_t total_idx = idx_c.numel();
     int64_t self_dim_size = self.size(dim);
     // One destination element is produced for every index element:
     // out[oo][idx_value][t] <- src[oo][j][t].
 #define TP_SCATTER_CASE(ctype, name) \
-    case DType::name: { \
-        ctype* d = result.data_ptr<ctype>(); \
-        const int64_t* ip = idx_c.data_ptr<int64_t>(); \
-        const ctype* vp = src_b.data_ptr<ctype>(); \
-        parallel_for(0, total_idx, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
-            for (int64_t flat = begin; flat < end; ++flat) { \
-                int64_t rem = flat; \
-                int64_t outer_off = rem / (idx_dim_size * idx_inner); \
-                rem -= outer_off * idx_dim_size * idx_inner; \
-                int64_t t = rem % idx_inner; \
-                int64_t idx = ip[flat]; \
-                int64_t dst = (outer_off * self_dim_size + idx) * self_inner + t; \
-                ctype v = vp[flat]; \
-                if (mode == ScatterMode::Assign) { \
-                    d[dst] = v; \
-                } else { \
-                    d[dst] += v; \
-                } \
-            } \
-        }); \
-        break; \
-    }
+    case DType::name: \
+        scatter_lines<ctype>(result.data_ptr<ctype>(), idx_c.data_ptr<int64_t>(), \
+                             src_b.data_ptr<ctype>(), mode, idx_outer, idx_dim_size, \
+                             idx_inner, self_dim_size, self_inner); \
+        break;
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_SCATTER_CASE)
         default: TP_THROW(TypeError, "scatter: unsupported dtype");
@@ -794,32 +813,14 @@ static Tensor& scatter_base_inplace_cpu(Tensor& self, int64_t dim, const Tensor&
     int64_t inner = 1;
     for (int64_t i = dim + 1; i < nd; ++i) inner *= self.size(i);
     int64_t idx_dim_size = idx_c.size(dim);
-    int64_t total_idx = idx_c.numel();
     int64_t self_dim_size = self.size(dim);
 
 #define TP_SCATTER_INPLACE_CASE(ctype, name) \
-    case DType::name: { \
-        ctype* d = result.data_ptr<ctype>(); \
-        const int64_t* ip = idx_c.data_ptr<int64_t>(); \
-        const ctype* vp = src_b.data_ptr<ctype>(); \
-        parallel_for(0, total_idx, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
-            for (int64_t flat = begin; flat < end; ++flat) { \
-                int64_t rem = flat; \
-                int64_t outer_off = rem / (idx_dim_size * idx_inner); \
-                rem -= outer_off * idx_dim_size * idx_inner; \
-                int64_t t = rem % idx_inner; \
-                int64_t idx = ip[flat]; \
-                int64_t dst = (outer_off * self_dim_size + idx) * inner + t; \
-                ctype v = vp[flat]; \
-                if (mode == ScatterMode::Assign) { \
-                    d[dst] = v; \
-                } else { \
-                    d[dst] += v; \
-                } \
-            } \
-        }); \
-        break; \
-    }
+    case DType::name: \
+        scatter_lines<ctype>(result.data_ptr<ctype>(), idx_c.data_ptr<int64_t>(), \
+                             src_b.data_ptr<ctype>(), mode, idx_outer, idx_dim_size, \
+                             idx_inner, self_dim_size, inner); \
+        break;
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_SCATTER_INPLACE_CASE)
         default: TP_THROW(TypeError, "scatter_: unsupported dtype");
@@ -921,17 +922,31 @@ Tensor index_add_cpu(const Tensor& self, int64_t dim, const Tensor& index, const
     if (!source_is_scalar && source_c.size(dim) != n_idx) {
         TP_THROW(RuntimeError, "index_add: source size along dim must equal index length");
     }
+    // A task owns one outer slot and a run of inner positions and walks the
+    // index in order, so a repeated index adds its rows one after another
+    // instead of racing another task for the same destination.
+    const int64_t chunk_c = std::min<int64_t>(
+        std::max<int64_t>(inner, 1), std::max<int64_t>(1, GRAIN_SIZE / n_idx));
+    const int64_t nchunk_c = (inner + chunk_c - 1) / chunk_c;
+    const int64_t task_grain = std::max<int64_t>(1, GRAIN_SIZE / (n_idx * chunk_c));
 #define TP_IADD_CASE(ctype, name) \
     case DType::name: { \
         ctype* d = result.data_ptr<ctype>(); \
         const ctype* sp = source_c.data_ptr<ctype>(); \
-        parallel_for(0, outer * n_idx, GRAIN_SIZE, [&](int64_t b, int64_t e) { \
-            for (int64_t t = b; t < e; ++t) { \
-                int64_t o = t / n_idx, k = t % n_idx; \
-                int64_t iv = ip[k]; \
-                const ctype* sv = source_is_scalar ? sp : sp + (o * n_idx + k) * inner; \
-                ctype* dv = d + (o * row + iv) * inner; \
-                for (int64_t c = 0; c < inner; ++c) dv[c] += sv[c]; \
+        parallel_for(0, outer * nchunk_c, task_grain, [&](int64_t b, int64_t e) { \
+            for (int64_t task = b; task < e; ++task) { \
+                const int64_t o = task / nchunk_c; \
+                const int64_t c0 = (task - o * nchunk_c) * chunk_c; \
+                const int64_t c1 = std::min(c0 + chunk_c, inner); \
+                for (int64_t k = 0; k < n_idx; ++k) { \
+                    ctype* dv = d + (o * row + ip[k]) * inner; \
+                    if (source_is_scalar) { \
+                        for (int64_t c = c0; c < c1; ++c) dv[c] += sp[0]; \
+                    } else { \
+                        const ctype* sv = sp + (o * n_idx + k) * inner; \
+                        for (int64_t c = c0; c < c1; ++c) dv[c] += sv[c]; \
+                    } \
+                } \
             } \
         }); \
         break; \

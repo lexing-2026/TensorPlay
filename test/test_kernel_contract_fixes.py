@@ -328,3 +328,42 @@ def test_nll_loss2d_backward_normalizes_only_mean(reduction):
         tp.nn.functional.nll_loss(inp, target.to(device), reduction=reduction).backward()
         grads.append(inp.grad)
     assert _close(grads[0], grads[1])
+
+
+@pytest.mark.parametrize("inplace", [False, True])
+def test_scatter_add_sums_every_repeat_of_an_index(inplace):
+    # Thousands of index rows land on eight destinations per column; with ones
+    # as the source each destination must hold exactly its repeat count.
+    tp.manual_seed(0)
+    idx = tp.randint(0, 8, (4000, 512))
+    ones = tp.ones(4000, 512)
+    out = tp.zeros(8, 512)
+    got = out.scatter_add_(0, idx, ones) if inplace else out.scatter_add(0, idx, ones)
+    expected = tp.stack([(idx == k).sum(0).float() for k in range(8)])
+    assert tp.equal(got, expected)
+
+
+def test_scatter_keeps_the_last_write_along_its_axis():
+    # Along the scatter axis the later index row wins, call after call.
+    idx = tp.zeros(4000, 512, dtype=tp.int64)
+    src = tp.arange(4000.0).unsqueeze(1).expand(4000, 512).contiguous()
+    got = tp.zeros(2, 512).scatter(0, idx, src)
+    assert tp.equal(got[0], tp.full((512,), 3999.0))
+
+
+@pytest.mark.parametrize("dim,shape,n", [(0, (64, 256), 4000), (1, (999, 77), 77)])
+def test_index_add_sums_every_repeat_of_an_index(dim, shape, n):
+    tp.manual_seed(0)
+    idx = tp.randint(0, shape[dim], (n,))
+    src_shape = list(shape)
+    src_shape[dim] = n
+    got = tp.zeros(*shape).index_add(dim, idx, tp.ones(*src_shape))
+    counts = tp.stack([(idx == k).sum().float() for k in range(shape[dim])])
+    view = [1, 1]
+    view[dim] = shape[dim]
+    assert tp.equal(got, counts.reshape(view).expand(*shape))
+
+
+def test_index_add_with_a_scalar_source_adds_it_everywhere_indexed():
+    got = tp.zeros(3, 4).index_add(0, tp.tensor([0, 0, 2]), tp.tensor(1.0))
+    assert tp.equal(got, tp.tensor([[2.0] * 4, [0.0] * 4, [1.0] * 4]))
