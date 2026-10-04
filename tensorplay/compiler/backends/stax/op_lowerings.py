@@ -8982,7 +8982,7 @@ def lower_diagonal(x, offset=0, dim1=0, dim2=1):
                 out.append(next(rest))
         return out
 
-    return TensorBox(ir.GenericView.create(_underlying(x), sizes, reindex))
+    return TensorBox(ir.GenericView.create(x, sizes, reindex))
 
 
 @register("flip.default")
