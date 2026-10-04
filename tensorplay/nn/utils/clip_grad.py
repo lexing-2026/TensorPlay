@@ -87,8 +87,14 @@ def get_total_norm(
                 [tp.linalg.vector_norm(g, norm_type) for g in device_tensors]
             )
 
+    # Grouping already places every norm on its own device; the move below
+    # only fires in the multi-device case, keeping the single-device step
+    # free of per-tensor cross-device dispatches.
     total_norm = tp.linalg.vector_norm(
-        tp.stack([norm.to(first_device) for norm in norms]), norm_type
+        tp.stack([
+            norm if norm.device == first_device else norm.to(first_device)
+            for norm in norms
+        ]), norm_type
     )
 
     if error_if_nonfinite and bool(
