@@ -528,7 +528,11 @@ def _arg_type_smaller(t1, t2) -> bool:
         return True
     if s1 == "Scalar?" and s2 == "Tensor?":
         return True
-    if s1 == "int64_t[]" and s2 in ("int64_t", "int64_t?"):
+    # A bare whole number binds an unsized whole-number list too, so the
+    # list-taking overload goes after the number-taking one whichever way
+    # either is spelled; ``tensor_split(x, 3)`` asks for three sections, not
+    # for a cut at index three.
+    if s1 in ("int64_t[]", "SymInt[]") and s2 in ("int64_t", "int64_t?", "SymInt", "SymInt?"):
         return True
     if s1 == "Tensor[]" and s2.endswith("[]") and s2 != "Tensor[]":
         return True
