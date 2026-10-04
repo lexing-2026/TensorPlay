@@ -50,6 +50,9 @@ struct ConvKey {
     // built for that order is a different primitive from the one built for
     // the engine's own choice.
     bool nhwc = false;
+    // Element type of src/weights/dst as a oneDNN data_type tag; f32, f16
+    // and bf16 convolutions each build their own primitives.
+    int dt = 0;
     int type; // 0: fwd, 1: bwd_data, 2: bwd_weights, 4: deconv fwd, 6: deconv bwd_w
     // Depth fields (3d convolutions / deconvolutions); defaulted so 2d keys
     // keep working without touching them.
@@ -67,6 +70,7 @@ struct ConvKey {
                dh == other.dh && dw == other.dw &&
                groups == other.groups && has_bias == other.has_bias &&
                fused_relu == other.fused_relu && nhwc == other.nhwc &&
+               dt == other.dt &&
                type == other.type &&
                id == other.id && od == other.od && kd == other.kd &&
                sd == other.sd && pd_f == other.pd_f && pd_k == other.pd_k &&
@@ -87,7 +91,8 @@ namespace std {
             hc(k.sh); hc(k.sw);
             hc(k.ph_t); hc(k.ph_b); hc(k.pw_l); hc(k.pw_r);
             hc(k.dh); hc(k.dw);
-            hc(k.groups); hc(k.has_bias); hc(k.fused_relu); hc(k.nhwc); hc(k.type);
+            hc(k.groups); hc(k.has_bias); hc(k.fused_relu); hc(k.nhwc);
+            hc(k.dt); hc(k.type);
             hc(k.id); hc(k.od); hc(k.kd); hc(k.sd); hc(k.pd_f); hc(k.pd_k); hc(k.dd);
             return h;
         }
@@ -937,6 +942,18 @@ static dnnl::algorithm get_onednn_algo(int64_t kh, int64_t kw) {
     return algorithm::convolution_auto;
 }
 
+// Activation/weight element types the convolution primitives accept. Full
+// precision and the two reduced-precision float types run natively in the
+// engine (accumulation stays f32); anything else has no engine conv.
+static dnnl::memory::data_type onednn_conv_dt(DType d) {
+    switch (d) {
+        case DType::Float32: return dnnl::memory::data_type::f32;
+        case DType::Float16: return dnnl::memory::data_type::f16;
+        case DType::BFloat16: return dnnl::memory::data_type::bf16;
+        default: return dnnl::memory::data_type::undef;
+    }
+}
+
 static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tensor& bias,
                          const std::vector<int64_t>& stride, 
                          int64_t pH_top, int64_t pH_bottom, int64_t pW_left, int64_t pW_right,
@@ -946,7 +963,13 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
     if (!OneDNNContext::is_enabled()) {
         return false;
     }
-    if (input.dtype() != DType::Float32) return false;
+    const dnnl::memory::data_type dt = onednn_conv_dt(input.dtype());
+    // Reduced-precision activations require matching weights: the engine
+    // convolves in one element type. Mixed inputs keep the widen-to-f32
+    // fallback in the caller.
+    if (dt == dnnl::memory::data_type::undef || weight.dtype() != input.dtype()) {
+        return false;
+    }
     
     try {
         auto& eng = OneDNNContext::get_engine();
@@ -963,6 +986,7 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         key.groups = groups;
         key.has_bias = (bias.defined() && bias.numel() > 0);
         key.fused_relu = fused_relu;
+        key.dt = static_cast<int>(dt);
         key.type = 0; // Forward
         // Channels-last activations go to the engine as they are stored: the
         // primitive is built for an NHWC source and destination, so neither
@@ -1015,15 +1039,13 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
             auto src_tag = nhwc_act ? memory::format_tag::nhwc : memory::format_tag::any;
             auto dst_tag = nhwc_act ? memory::format_tag::nhwc : memory::format_tag::any;
             
-            auto src_md = memory::desc(src_dims, memory::data_type::f32, src_tag);
-            auto dst_md = memory::desc(dst_dims, memory::data_type::f32, dst_tag);
+            auto src_md = memory::desc(src_dims, dt, src_tag);
+            auto dst_md = memory::desc(dst_dims, dt, dst_tag);
             
             // Let oneDNN choose a blocked format; the inference path retains
             // a read-only reordered copy, while training still leaves the
             // user-visible parameter storage untouched.
-            auto weights_md = groups > 1
-                ? memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::any)
-                : memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::any);
+            auto weights_md = memory::desc(weights_dims, dt, memory::format_tag::any);
             
             memory::desc bias_md;
             if (bias.defined() && bias.numel() > 0) {
@@ -1117,7 +1139,7 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         static std::unordered_map<const TensorImpl*, std::vector<CachedWeight>> weight_cache;
         static std::mutex weight_cache_mutex;
         const TensorImpl* weight_impl = weight.unsafeGetTensorImpl().get();
-        const void* weight_data = weight.data_ptr<float>();
+        const void* weight_data = weight.data_ptr();
         const uint32_t weight_version = weight_impl->version();
         // Keep the user-visible parameter in its plain layout for autograd,
         // but cache the oneDNN-layout copy across training calls as well.
@@ -1135,12 +1157,12 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
              auto stored_md = std::static_pointer_cast<memory::desc>(input.unsafeGetTensorImpl()->get_onednn_md());
              user_src_md = *stored_md;
         } else if (input.is_contiguous(MemoryFormat::ChannelsLast)) {
-             user_src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::nhwc);
+             user_src_md = memory::desc(src_dims, dt, memory::format_tag::nhwc);
         } else {
-             user_src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::nchw);
+             user_src_md = memory::desc(src_dims, dt, memory::format_tag::nchw);
         }
 
-        auto user_src_mem = memory(user_src_md, eng, input.data_ptr<float>());
+        auto user_src_mem = memory(user_src_md, eng, input.data_ptr());
         
         if (expected_src_md != user_src_md) {             
              size_t req_size = expected_src_md.get_size();
@@ -1238,10 +1260,10 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         if (weight.unsafeGetTensorImpl()->has_onednn_md()) {
              auto stored_md = std::static_pointer_cast<memory::desc>(weight.unsafeGetTensorImpl()->get_onednn_md());
              if (*stored_md == expected_weights_md) {
-                 weights_mem = memory(*stored_md, eng, weight.data_ptr<float>());
+                 weights_mem = memory(*stored_md, eng, weight.data_ptr());
              } else if (!load_cached_weight(*stored_md)) {
                  // Reorder from stored to expected
-                 auto src_mem = memory(*stored_md, eng, weight.data_ptr<float>());
+                 auto src_mem = memory(*stored_md, eng, weight.data_ptr());
                  size_t required_size = expected_weights_md.get_size();
                  Allocator* allocator = getAllocator(weight.device().type());
                  reordered_weight_storage = Storage(required_size, allocator);
@@ -1252,12 +1274,12 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
              }
         } else {
              auto user_weights_md = groups > 1 
-                 ? memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::goihw)
-                 : memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::oihw);
+                 ? memory::desc(weights_dims, dt, memory::format_tag::goihw)
+                 : memory::desc(weights_dims, dt, memory::format_tag::oihw);
                  
              if (expected_weights_md != user_weights_md &&
                  !load_cached_weight(user_weights_md)) {
-                 auto user_mem = memory(user_weights_md, eng, weight.data_ptr<float>());
+                 auto user_mem = memory(user_weights_md, eng, weight.data_ptr());
                  
                  size_t required_size = expected_weights_md.get_size();
                  Allocator* allocator = getAllocator(weight.device().type());
@@ -1268,7 +1290,7 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
                  save_cached_weight(user_weights_md);
              } else {
                  if (expected_weights_md == user_weights_md) {
-                     weights_mem = memory(user_weights_md, eng, weight.data_ptr<float>());
+                     weights_mem = memory(user_weights_md, eng, weight.data_ptr());
                  }
              }
         }
@@ -1276,8 +1298,8 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         // 3. Output
         memory dst_mem;
         auto user_dst_md = output.is_contiguous(MemoryFormat::ChannelsLast)
-            ? memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::nhwc)
-            : memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::nchw);
+            ? memory::desc(dst_dims, dt, memory::format_tag::nhwc)
+            : memory::desc(dst_dims, dt, memory::format_tag::nchw);
 
         // If expected layout is different from NCHW, we need a temporary buffer
         bool need_reorder_dst = (expected_dst_md != user_dst_md);
@@ -1289,7 +1311,7 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
              blocked_storage_handle = Storage(required_size, allocator);
              dst_mem = memory(expected_dst_md, eng, blocked_storage_handle.data());
         } else {
-             dst_mem = memory(expected_dst_md, eng, output.data_ptr<float>());
+             dst_mem = memory(expected_dst_md, eng, output.data_ptr());
         }
         
         std::unordered_map<int, memory> args;
@@ -1298,16 +1320,19 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         args.insert({DNNL_ARG_DST, dst_mem});
 
         if (bias.defined() && bias.numel() > 0) {
-            auto user_bias_md = memory::desc({bias.size(0)}, memory::data_type::f32, memory::format_tag::x);
+            // The primitive is built with an f32 bias (supported for every
+            // activation dtype above); a reduced-precision bias buffer is
+            // described in its own type and widened by the reorder.
+            auto user_bias_md = memory::desc({bias.size(0)}, onednn_conv_dt(bias.dtype()), memory::format_tag::x);
             auto expected_bias_md = pd.bias_desc();
             memory bias_mem;
 
             if (expected_bias_md != user_bias_md) {
-                 auto user_bias_mem = memory(user_bias_md, eng, bias.data_ptr<float>());
+                 auto user_bias_mem = memory(user_bias_md, eng, bias.data_ptr());
                  bias_mem = memory(expected_bias_md, eng);
                  reorder(user_bias_mem, bias_mem).execute(s, user_bias_mem, bias_mem);
             } else {
-                 bias_mem = memory(user_bias_md, eng, bias.data_ptr<float>());
+                 bias_mem = memory(user_bias_md, eng, bias.data_ptr());
             }
             args.insert({DNNL_ARG_BIAS, bias_mem});
         }
@@ -1319,7 +1344,7 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         conv.execute(s, args);
         
         if (need_reorder_dst) {
-             auto user_dst_mem = memory(user_dst_md, eng, output.data_ptr<float>());
+             auto user_dst_mem = memory(user_dst_md, eng, output.data_ptr());
              reorder(dst_mem, user_dst_mem).execute(s, dst_mem, user_dst_mem);
         }
         
@@ -1348,7 +1373,8 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
                          Tensor& output) {
     
     if (!OneDNNContext::is_enabled()) return false;
-    if (input.dtype() != DType::Float32) return false;
+    const dnnl::memory::data_type dt = onednn_conv_dt(input.dtype());
+    if (dt == dnnl::memory::data_type::undef || weight.dtype() != input.dtype()) return false;
     if (std::getenv("TP_DISABLE_ONEDNN_CONV3D")) return false;
     try {
         auto& eng = OneDNNContext::get_engine();
@@ -1382,6 +1408,7 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         key.dh = dilation[0]; key.dw = dilation[1]; key.dd = dilation[2];
         key.groups = groups;
         key.has_bias = (bias.defined() && bias.numel() > 0);
+        key.dt = static_cast<int>(dt);
         key.type = 10; // conv3d forward
 
         struct CachedConv3d {
@@ -1415,18 +1442,18 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
                 memory::dims padding_r_dims = {key.ph_b, key.pw_r, key.pd_k};
                 memory::dims dilates_dims = {key.dd - 1, key.dh - 1, key.dw - 1};
 
-                auto user_src_md = memory::desc(src_dims_l, memory::data_type::f32,
+                auto user_src_md = memory::desc(src_dims_l, dt,
                                                 src_cl ? memory::format_tag::ndhwc
                                                        : memory::format_tag::ncdhw);
-                auto user_dst_md = memory::desc(dst_dims_l, memory::data_type::f32,
+                auto user_dst_md = memory::desc(dst_dims_l, dt,
                                                 dst_cl ? memory::format_tag::ndhwc
                                                        : memory::format_tag::ncdhw);
                 // Grouped convolutions require the weights in grouped
                 // channels-last order for an ndhwc primitive to exist; any
                 // other combination is rejected by the engine.
-                memory::desc weights_any = memory::desc(weights_dims_l, memory::data_type::f32, memory::format_tag::any);
+                memory::desc weights_any = memory::desc(weights_dims_l, dt, memory::format_tag::any);
                 if (groups > 1 && (src_cl || dst_cl)) {
-                    weights_any = memory::desc(weights_dims_l, memory::data_type::f32, memory::format_tag::godhwi);
+                    weights_any = memory::desc(weights_dims_l, dt, memory::format_tag::godhwi);
                 }
                 auto bias_md = key.has_bias
                     ? memory::desc({key.oc}, memory::data_type::f32, memory::format_tag::x)
@@ -1440,9 +1467,9 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
                 // Stage 1: let the engine choose its blocked weights layout.
                 auto probe_pd = convolution_forward::primitive_desc(
                     eng, prop_kind::forward_inference, algorithm::convolution_auto,
-                    memory::desc(src_dims_l, memory::data_type::f32, memory::format_tag::any),
+                    memory::desc(src_dims_l, dt, memory::format_tag::any),
                     weights_any, bias_md,
-                    memory::desc(dst_dims_l, memory::data_type::f32, memory::format_tag::any),
+                    memory::desc(dst_dims_l, dt, memory::format_tag::any),
                     strides_dims, dilates_dims, padding_l_dims, padding_r_dims, sp_attr);
                 // Stage 2 (channels-last only): plain ndhwc activations +
                 // the chosen blocked weights run the fast brg kernel directly
@@ -1474,7 +1501,7 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
 
         auto expected_dst_md = conv_pd.dst_desc();
         auto user_dst_md = memory::desc(
-            dst_dims, memory::data_type::f32,
+            dst_dims, dt,
             dst_cl ? memory::format_tag::ndhwc
                    : memory::format_tag::ncdhw);
         bool need_reorder_dst = (expected_dst_md != user_dst_md);
@@ -1488,7 +1515,7 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
              blocked_storage_handle = Storage(required_size, allocator);
              dst_mem = memory(expected_dst_md, eng, blocked_storage_handle.data());
         } else {
-             dst_mem = memory(expected_dst_md, eng, output.data_ptr<float>());
+             dst_mem = memory(expected_dst_md, eng, output.data_ptr());
         }
 
         auto expected_src_md = conv_pd.src_desc();
@@ -1499,7 +1526,7 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         memory src_mem;
         Storage src_storage_handle;
         auto user_src_md = memory::desc(
-            src_dims, memory::data_type::f32,
+            src_dims, dt,
             src_cl ? memory::format_tag::ndhwc
                    : memory::format_tag::ncdhw);
         if (expected_src_md != user_src_md) {
@@ -1507,10 +1534,10 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
              Allocator* allocator = getAllocator(input.device().type());
              src_storage_handle = Storage(req_size, allocator);
              src_mem = memory(expected_src_md, eng, src_storage_handle.data());
-             auto user_src_mem = memory(user_src_md, eng, input.data_ptr<float>());
+             auto user_src_mem = memory(user_src_md, eng, input.data_ptr());
              reorder(user_src_mem, src_mem).execute(s, user_src_mem, src_mem);
         } else {
-             src_mem = memory(user_src_md, eng, input.data_ptr<float>());
+             src_mem = memory(user_src_md, eng, input.data_ptr());
         }
 
         // 2. Weights reorder: the blocked copy is cached per parameter
@@ -1519,9 +1546,9 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         Storage weights_storage_handle;
         {
             memory::desc user_weights_md = weight.is_contiguous(MemoryFormat::ChannelsLast3d)
-                ? memory::desc(weights_dims, memory::data_type::f32,
+                ? memory::desc(weights_dims, dt,
                                groups > 1 ? memory::format_tag::godhwi : memory::format_tag::odhwi)
-                : memory::desc(weights_dims, memory::data_type::f32,
+                : memory::desc(weights_dims, dt,
                                groups > 1 ? memory::format_tag::goidhw : memory::format_tag::oidhw);
             if (expected_weights_md != user_weights_md) {
                 struct CachedReorder {
@@ -1533,7 +1560,7 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
                 static std::mutex wr_mtx;
                 static std::unordered_map<const TensorImpl*, std::vector<CachedReorder>> wr_cache;
                 const TensorImpl* w_impl = weight.unsafeGetTensorImpl().get();
-                void* w_mutable = weight.data_ptr<float>();
+                void* w_mutable = weight.data_ptr();
                 const void* w_data = w_mutable;
                 const uint32_t w_version = w_impl->version();
 
@@ -1571,7 +1598,7 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
                     entries.push_back({w_data, w_version, user_weights_md, weights_mem});
                 }
             } else {
-                weights_mem = memory(user_weights_md, eng, weight.data_ptr<float>());
+                weights_mem = memory(user_weights_md, eng, weight.data_ptr());
             }
         }
 
@@ -1582,7 +1609,7 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         
         if (bias.defined() && bias.numel() > 0) {
             auto expected_bias_md = conv_pd.bias_desc();
-            auto user_bias_md = memory::desc({bias.size(0)}, memory::data_type::f32, memory::format_tag::x);
+            auto user_bias_md = memory::desc({bias.size(0)}, onednn_conv_dt(bias.dtype()), memory::format_tag::x);
             memory bias_mem;
             Storage bias_storage_handle;
             if (expected_bias_md != user_bias_md) {
@@ -1590,10 +1617,10 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
                  Allocator* allocator = getAllocator(bias.device().type());
                  bias_storage_handle = Storage(req_size, allocator);
                  bias_mem = memory(expected_bias_md, eng, bias_storage_handle.data());
-                 auto user_bias_mem = memory(user_bias_md, eng, bias.data_ptr<float>());
+                 auto user_bias_mem = memory(user_bias_md, eng, bias.data_ptr());
                  reorder(user_bias_mem, bias_mem).execute(s, user_bias_mem, bias_mem);
             } else {
-                 bias_mem = memory(user_bias_md, eng, bias.data_ptr<float>());
+                 bias_mem = memory(user_bias_md, eng, bias.data_ptr());
             }
             args.insert({DNNL_ARG_BIAS, bias_mem});
         }
@@ -1611,7 +1638,7 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         conv.execute(s, args);
         
         if (need_reorder_dst) {
-             auto user_dst_mem = memory(user_dst_md, eng, output.data_ptr<float>());
+             auto user_dst_mem = memory(user_dst_md, eng, output.data_ptr());
              reorder(dst_mem, user_dst_mem).execute(s, dst_mem, user_dst_mem);
         }
         
@@ -2747,6 +2774,10 @@ bool onednn_claims_conv2d(const Tensor& input, const Tensor& weight,
                           int64_t groups) {
     if (!tensorplay::globalContext().userEnabledMkldnn()) return false;
     if (input.unsafeGetTensorImpl()->has_onednn_md()) return true;
+    // Reduced-precision activations have no native kernel behind this call:
+    // the engine is the only accelerated path, so it takes every shape it
+    // supports (it declines internally when the ISA lacks the datatype).
+    if (conv_is_low_precision(input.dtype())) return true;
     if (input.dtype() != DType::Float32) return false;
     const bool strided = (sH != 1) || (sW != 1);
     const bool dilated = (dH != 1) || (dW != 1);
@@ -3098,6 +3129,14 @@ static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg,
              });
         }
 
+    } else if (conv_is_low_precision(input.dtype())) {
+        // The engine declined the call (datatype unsupported on this ISA, or
+        // mkldnn disabled). Run full precision and narrow the result back.
+        Tensor wide = conv2d_cpu_impl(
+            input.to(DType::Float32), weight.to(DType::Float32),
+            (bias.defined() && bias.numel() > 0) ? bias.to(DType::Float32) : bias,
+            stride_arg, padding_arg, dilation_arg, groups, fused_relu);
+        return wide.to(input_arg.dtype());
     } else {
         TP_THROW(NotImplementedError, "conv2d only supports Float32");
     }
@@ -3111,11 +3150,9 @@ static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg,
 Tensor conv2d_cpu(const Tensor& input, const Tensor& weight, const Tensor& bias,
                   const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                   const std::vector<int64_t>& dilation, int64_t groups) {
-    if (conv_is_low_precision(input.dtype())) {
-        return conv2d_cpu_impl(input.to(DType::Float32), weight.to(DType::Float32),
-                               (bias.defined() && bias.numel() > 0) ? bias.to(DType::Float32) : bias,
-                               stride, padding, dilation, groups, false).to(input.dtype());
-    }
+    // Reduced-precision inputs run the engine natively when it can and fall
+    // back to a full-precision round trip inside the impl otherwise; no
+    // caller-side widening.
     return conv2d_cpu_impl(input, weight, bias, stride, padding, dilation, groups, false);
 }
 
@@ -3123,11 +3160,6 @@ Tensor conv2d_relu_cpu(const Tensor& input, const Tensor& weight, const std::opt
                        const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                        const std::vector<int64_t>& dilation, int64_t groups) {
     const Tensor bias = bias_opt.has_value() ? *bias_opt : Tensor();
-    if (conv_is_low_precision(input.dtype())) {
-        return conv2d_cpu_impl(input.to(DType::Float32), weight.to(DType::Float32),
-                               (bias.defined() && bias.numel() > 0) ? bias.to(DType::Float32) : bias,
-                               stride, padding, dilation, groups, true).to(input.dtype());
-    }
     return conv2d_cpu_impl(input, weight, bias, stride, padding, dilation, groups, true);
 }
 
@@ -3160,12 +3192,6 @@ Tensor conv3d_cpu(const Tensor& input_arg, const Tensor& weight_arg, const Tenso
 
     if (input.dim() != 5 || weight.dim() != 5) TP_THROW(RuntimeError, "conv3d: Expected 5D input and weight");
 
-    if (conv_is_low_precision(input.dtype())) {
-        return conv3d_cpu(input.to(DType::Float32), weight.to(DType::Float32),
-                          (bias.defined() && bias.numel() > 0) ? bias.to(DType::Float32) : bias,
-                          stride_arg, padding_arg, dilation_arg, groups).to(input.dtype());
-    }
-    
     int64_t N = input.size(0);
     int64_t C_in = input.size(1);
     int64_t D_in = input.size(2);
@@ -3315,6 +3341,13 @@ Tensor conv3d_cpu(const Tensor& input_arg, const Tensor& weight_arg, const Tenso
              }
              });
         }
+    } else if (conv_is_low_precision(input.dtype())) {
+        // The engine declined the call; widen, run full precision, narrow back.
+        Tensor wide = conv3d_cpu(
+            input.to(DType::Float32), weight.to(DType::Float32),
+            (bias.defined() && bias.numel() > 0) ? bias.to(DType::Float32) : bias,
+            stride_arg, padding_arg, dilation_arg, groups);
+        return wide.to(input_arg.dtype());
     } else {
         TP_THROW(NotImplementedError, "conv3d only supports Float32");
     }
