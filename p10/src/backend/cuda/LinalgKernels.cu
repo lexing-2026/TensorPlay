@@ -22,6 +22,15 @@
 #include <vector>
 #include "CudaDispatchHelpers.cuh"
 
+#define CUDA_CHECK(condition)                                                 \
+  do {                                                                        \
+    cudaError_t error = (condition);                                          \
+    if (error != cudaSuccess) {                                               \
+      TP_THROW(RuntimeError,                                                  \
+               std::string("CUDA Error: ") + cudaGetErrorString(error));      \
+    }                                                                         \
+  } while (0)
+
 namespace tensorplay {
 namespace cuda {
 
@@ -867,9 +876,12 @@ __global__ void triu_extract_kernel(const scalar_t* src, scalar_t* dst,
                                     int64_t total) {
     const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total) return;
-    const int64_t col = idx % cols;
-    const int64_t row = (idx / cols) % rows;
+    // dst is column-major: a plane element (row, col) sits at linear offset
+    // col * rows + row, so the row is the low-order residue.
     const int64_t b = idx / (rows * cols);
+    const int64_t local = idx % (rows * cols);
+    const int64_t row = local % rows;
+    const int64_t col = local / rows;
     dst[idx] = col >= row ? src[b * ld_src * cols + col * ld_src + row]
                           : scalar_t(0);
 }
@@ -893,16 +905,26 @@ std::tuple<Tensor, Tensor> linalg_qr_kernel_cuda_impl(const Tensor& A,
     const int64_t rrows = reduced ? k : m;
     const int64_t bs = linear_batch_size(batch);
 
-    // Pack the first qcols reflector columns: column segments are contiguous
-    // in both layouts, so one strided 2D copy suffices.
+    // Pack the first qcols reflector columns of each matrix into orgqr's
+    // input.  Both buffers are column-major with leading dimension m, so a
+    // column is one contiguous run of m elements and the packed region of a
+    // matrix is one contiguous run of m*qcols elements; the loop walks the
+    // batch because the packed regions of consecutive matrices do not
+    // concatenate when qcols < n.
     Tensor Q_in = empty_column_major(cat_batch(batch, {m, qcols}),
                                      A.dtype(), A.device());
     run_real(A.dtype(), [&](auto tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
-        cudaMemcpy2DAsync(
-            Q_in.data_ptr<T>(), sizeof(T) * qcols, QR.data_ptr<T>(), sizeof(T) * n,
-            sizeof(T) * m, qcols, cudaMemcpyDeviceToDevice,
-            getCurrentCUDAStream().stream());
+        if (m > 0 && qcols > 0) {
+            const int64_t qr_ms = matrix_stride_of(QR);
+            for (int64_t b = 0; b < bs; ++b) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    Q_in.data_ptr<T>() + b * m * qcols,
+                    QR.data_ptr<T>() + b * qr_ms, sizeof(T) * m * qcols,
+                    cudaMemcpyDeviceToDevice,
+                    getCurrentCUDAStream().stream()));
+            }
+        }
         apply_orgqr<T>(Q_in, tau);
     });
 

@@ -1723,9 +1723,9 @@ std::tuple<Tensor, Tensor> linalg_qr_kernel(const Tensor& A, const std::string& 
         const int64_t bs = linear_batch_size(batch);
         for (int64_t b = 0; b < bs; ++b)
             for (int64_t row = 0; row < rrows; ++row)
-                for (int64_t col = row; col < n; ++col)
+                for (int64_t col = 0; col < n; ++col)
                     dst[b * rrows * n + col * rrows + row] =
-                        src[b * m * n + col * m + row];
+                        col >= row ? src[b * m * n + col * m + row] : T(0);
     });
     return {compute_q ? Q_in.contiguous() : Tensor::empty({0}, A.dtype(), A.device()),
             R.contiguous()};
