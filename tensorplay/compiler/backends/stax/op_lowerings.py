@@ -9023,6 +9023,66 @@ def lower_constant_pad_nd(x, pad, value=0):
     return Pointwise.create(device=x.get_device(), dtype=x.get_dtype(), inner_fn=fn, ranges=output_size)
 
 
+_fallback_remap_pad = {
+    name: fallback_handler(getattr(tp.ops.tp, name).default, add_to_fallback_set=False)
+    for name in ("reflection_pad_nd", "replication_pad_nd", "circular_pad_nd")
+}
+
+
+@register("reflection_pad_nd.default", "replication_pad_nd.default", "circular_pad_nd.default")
+def lower_remap_pad_nd(x, pad, **kwargs):
+    """A pad that reads the source's own values again rather than filling.
+
+    Each output element reads one source element, chosen by folding the
+    position it stands at back into the source's extent: a reflection doubles
+    back one short of each edge, a replication holds at the edge, a circular
+    wrap continues from the other side.  The reading is an address of the
+    source rather than a call, so it fuses with whatever consumes it.
+    """
+
+    op_name = target_name(V.current_node.target).split(".")[0]
+    sizes = list(x.get_size())
+    if len(pad) % 2:
+        raise RuntimeError("Length of pad must be even")
+    pad = [int(p) for p in pad]
+    if all(p == 0 for p in pad):
+        return clone(x)
+    if any(p < 0 for p in pad) or is_dynamic(*sizes):
+        return _fallback_remap_pad[op_name](x, pad)
+    bounds = list(reversed(list(zip(pad[::2], pad[1::2]))))
+    n = len(sizes) - len(bounds)
+    extents = [int(s) for s in sizes[n:]]
+    if op_name == "reflection_pad_nd" and any(
+        m <= 1 or low >= m or high >= m for (low, high), m in zip(bounds, extents)
+    ):
+        return _fallback_remap_pad[op_name](x, pad)
+    output_size = list(sizes[:n])
+    for (low, high), size in zip(bounds, sizes[n:]):
+        output_size.append(sympy.expand(size + low + high))
+    loader = x.make_loader()
+
+    def fold(at, extent):
+        """One position past the edge, read as a position of the source."""
+
+        if op_name == "reflection_pad_nd":
+            # m - 1 - |m - 1 - |at||: the walk doubles back one short of each
+            # edge.  Both folds read as a smallest of two, so the address
+            # stays arithmetic the kernel computes.
+            inner = Min(extent - 1 - at, extent - 1 + at)
+            return Min(extent - 1 - inner, extent - 1 + inner)
+        if op_name == "replication_pad_nd":
+            return Max(Min(at, extent - 1), 0)
+        return at % extent
+
+    def fn(index):
+        shifted = list(index[:n])
+        for at, (low, _high), extent in zip(index[n:], bounds, extents):
+            shifted.append(fold(at - low, extent))
+        return loader(shifted)
+
+    return Pointwise.create(device=x.get_device(), dtype=x.get_dtype(), inner_fn=fn, ranges=output_size)
+
+
 @register("embedding.default")
 def lower_embedding(weight, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False):
     """The rows of ``weight`` that ``indices`` name, one per index."""
