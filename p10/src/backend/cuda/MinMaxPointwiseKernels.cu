@@ -143,6 +143,13 @@ Tensor ldexp_cuda(const Tensor& self, const Tensor& other) {
         static_cast<std::vector<int64_t>>(self.shape()),
         static_cast<std::vector<int64_t>>(other.shape()));
     DType common_dtype = promoteTypes(self.dtype(), other.dtype());
+    // An integral result would evaluate the power of two in integer
+    // arithmetic, where a negative exponent has no meaning; the product is
+    // evaluated in single precision instead, which is the type an integral
+    // pair promotes to.
+    if (!isFloatingType(common_dtype)) {
+        common_dtype = DType::Float32;
+    }
     Tensor result = Tensor::empty(out_shape, common_dtype, self.device());
     const int64_t n = result.numel();
     if (n == 0) return result;
