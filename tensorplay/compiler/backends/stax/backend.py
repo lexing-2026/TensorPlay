@@ -7,6 +7,7 @@ surface for the code generators and the tests.
 """
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 
@@ -294,8 +295,25 @@ def _lower_stax_region(
     # re-ordered into that sequence, mirroring the capture-time binding.
     signature = graph_module.signature
 
+    # A call that hands every captured argument by position, in the order
+    # the placeholders stand, needs no binding: that is how the autograd
+    # wrapper and every compiled caller call a region.
+    placeholder_names = [
+        node.target if isinstance(node.target, str) else node.name
+        for node in graph_module.graph.placeholders
+    ]
+    positional = signature is not None and [
+        name for name, parameter in signature.parameters.items()
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD
+        )
+    ] == placeholder_names and len(signature.parameters) == len(placeholder_names)
+    num_placeholders = len(placeholder_names)
+
     def compiled(*args, **kwargs):
-        if signature is None:
+        if signature is None or (
+            positional and not kwargs and len(args) == num_placeholders
+        ):
             ordered = list(args)
         else:
             bound = signature.bind_partial(*args, **kwargs)

@@ -1664,9 +1664,14 @@ class PythonWrapperCodegen(CodeGen):
             """
                 operator_set = tp.ops.tp
                 inductor_ops = tp.ops.inductor
-                empty_strided_cpu = lambda *args, **kwargs: tp.empty_strided(*args, device="cpu", **kwargs)
-                empty_strided_cpu_pinned = lambda size, stride, dtype: tp.empty_strided(size, stride, dtype=dtype, device="cpu", pin_memory=True)
-                empty_strided_cuda = lambda *args, **kwargs: tp.empty_strided(*args, device="cuda", **kwargs)
+                _empty_strided = tp._C.empty_strided
+                _device_cpu = tp.device("cpu")
+                _device_cuda = tp.device("cuda")
+                def empty_strided_cpu(size, stride, dtype, **kwargs):
+                    return _empty_strided(size, stride, dtype=dtype, device=_device_cpu, **kwargs)
+                empty_strided_cpu_pinned = lambda size, stride, dtype: _empty_strided(size, stride, dtype=dtype, device=_device_cpu, pin_memory=True)
+                def empty_strided_cuda(size, stride, dtype, **kwargs):
+                    return _empty_strided(size, stride, dtype=dtype, device=_device_cuda, **kwargs)
                 empty_strided_xpu = lambda *args, **kwargs: tp.empty_strided(*args, device="xpu", **kwargs)
                 empty_strided_mtia = lambda *args, **kwargs: tp.empty_strided(*args, device="mtia", **kwargs)
                 reinterpret_tensor = lambda t, size, stride, offset: tp.as_strided(t, size, stride, t.storage_offset() + offset)

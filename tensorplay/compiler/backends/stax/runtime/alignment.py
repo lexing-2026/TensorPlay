@@ -57,6 +57,25 @@ def copy_if_misaligned(
     return tensor.clone().contiguous()
 
 
+_NATIVE_CHECK: list = []
+
+
+def _native_metadata_check():
+    """The native shape-and-stride check, looked up once; None without one.
+
+    A region checks every input it is handed on every call, so the lookup
+    is kept out of that loop.
+    """
+
+    if not _NATIVE_CHECK:
+        try:
+            from tensorplay._C import _assert_tensor_metadata as check
+        except ImportError:
+            check = None
+        _NATIVE_CHECK.append(check)
+    return _NATIVE_CHECK[0]
+
+
 def assert_size_stride_grouped(
     items: Any,
     sizes: Any,
@@ -82,13 +101,14 @@ def assert_size_stride_grouped(
     generated kernel cannot see which of its values became which.
     """
 
+    c_check = _native_metadata_check()
     for item, size, stride in zip(items, sizes, strides):
-        try:
-            from tensorplay._C import _assert_tensor_metadata as _c_check
-            _c_check(item, size, stride)
-            continue
-        except (ImportError, TypeError, ValueError, RuntimeError):
-            pass
+        if c_check is not None:
+            try:
+                c_check(item, size, stride)
+                continue
+            except (TypeError, ValueError, RuntimeError):
+                pass
         if item.shape != size:
             where = f" in {op_name}" if op_name else ""
             raise AssertionError(
