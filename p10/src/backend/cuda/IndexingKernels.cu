@@ -126,29 +126,36 @@ void launch_index_select_for_index(
 #undef TP_IS_CASE
 }
 
+// Both walk (outer, index, inner) over the selected slices: every position
+// before `dim` gets its own copy of the slices, so a flat position splits into
+// the outer block, the index slot and the column within the slice.
 template <typename T>
-__global__ void index_copy_kernel(int64_t n_idx_x_inner, int64_t inner, int64_t row,
+__global__ void index_copy_kernel(int64_t total, int64_t n_idx, int64_t inner, int64_t row,
                                   T* d, const int64_t* ip, const T* sp) {
     int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; t < n_idx_x_inner; t += stride) {
-        int64_t k = t / inner, c = t % inner;
+    const int64_t block = n_idx * inner;
+    for (; t < total; t += stride) {
+        int64_t o = t / block, r = t % block;
+        int64_t k = r / inner, c = r % inner;
         int64_t iv = ip[k];
         TP_INDEX_RANGE_GUARD(iv, row);
-        d[iv * inner + c] = sp[t];
+        d[(o * row + iv) * inner + c] = sp[t];
     }
 }
 
 template <typename T>
-__global__ void index_fill_kernel(int64_t total, int64_t inner, int64_t row,
+__global__ void index_fill_kernel(int64_t total, int64_t n_idx, int64_t inner, int64_t row,
                                   T* d, const int64_t* ip, T v) {
     int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    const int64_t block = n_idx * inner;
     for (; t < total; t += stride) {
-        int64_t k = t / inner, c = t % inner;
+        int64_t o = t / block, r = t % block;
+        int64_t k = r / inner, c = r % inner;
         int64_t iv = ip[k];
         TP_INDEX_RANGE_GUARD(iv, row);
-        d[iv * inner + c] = v;
+        d[(o * row + iv) * inner + c] = v;
     }
 }
 
@@ -370,15 +377,16 @@ Tensor index_copy_cuda(const Tensor& self, int64_t dim, const Tensor& index, con
     int64_t n_idx = idx.numel();
     if (n_idx == 0) return result;
     int64_t row = self.size(dim);
-    int64_t inner = 1;
-    for (int64_t i = dim + 1; i < nd; ++i) inner *= self.size(i);
-    int64_t total = n_idx * inner;
+    int64_t outer = 1, inner = 1;
+    outer_inner(static_cast<std::vector<int64_t>>(self.shape()), dim, outer, inner);
+    int64_t total = outer * n_idx * inner;
+    if (total == 0) return result;
     Tensor source_c = source.contiguous();
     auto stream = getCurrentCUDAStream().stream();
 #define TP_IC_CASE(ctype, name) \
     case DType::name: \
         index_copy_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-            total, inner, row, static_cast<ctype*>(result.data_ptr()), \
+            total, n_idx, inner, row, static_cast<ctype*>(result.data_ptr()), \
             idx.data_ptr<int64_t>(), static_cast<const ctype*>(source_c.data_ptr())); \
         break;
     switch (self.dtype()) {
@@ -415,15 +423,16 @@ Tensor index_fill_scalar_cuda(const Tensor& self, int64_t dim, const Tensor& ind
     int64_t n_idx = idx.numel();
     if (n_idx == 0) return result;
     int64_t row = self.size(dim);
-    int64_t inner = 1;
-    for (int64_t i = dim + 1; i < nd; ++i) inner *= self.size(i);
-    int64_t total = n_idx * inner;
+    int64_t outer = 1, inner = 1;
+    outer_inner(static_cast<std::vector<int64_t>>(self.shape()), dim, outer, inner);
+    int64_t total = outer * n_idx * inner;
+    if (total == 0) return result;
     auto stream = getCurrentCUDAStream().stream();
 #define TP_IF_CASE(ctype, name) \
     case DType::name: { \
         ctype v = value.to<ctype>(); \
         index_fill_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-            total, inner, row, static_cast<ctype*>(result.data_ptr()), \
+            total, n_idx, inner, row, static_cast<ctype*>(result.data_ptr()), \
             idx.data_ptr<int64_t>(), v); \
         break; \
     }

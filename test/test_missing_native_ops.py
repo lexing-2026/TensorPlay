@@ -508,6 +508,28 @@ def test_index_fill_int_spellings():
     assert a.index_fill(0, tp.tensor([0]), 9.0).tolist() == [9.0, 2.0, 3.0]
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_index_fill_and_copy_reach_every_leading_position(device):
+    # A dimension in the middle has positions before it, and each of them
+    # holds its own copy of the selected slices.
+    if device == "cuda" and not tp.cuda.is_available():
+        pytest.skip("needs CUDA")
+    x = tp.arange(24, dtype=tp.float32, device=device).reshape(2, 3, 4)
+    index = tp.tensor([2, 0], device=device)
+    filled = x.index_fill(1, index, -1.0).cpu()
+    expected = x.cpu().clone()
+    expected[:, 0, :] = -1.0
+    expected[:, 2, :] = -1.0
+    assert filled.tolist() == expected.tolist()
+
+    source = -tp.arange(16, dtype=tp.float32, device=device).reshape(2, 2, 4)
+    copied = x.index_copy(1, index, source).cpu()
+    expected = x.cpu().clone()
+    expected[:, 2, :] = source.cpu()[:, 0, :]
+    expected[:, 0, :] = source.cpu()[:, 1, :]
+    assert copied.tolist() == expected.tolist()
+
+
 def test_scatter_reduce_inplace_two():
     out = tp.zeros(3)
     result = out.scatter_reduce_(0, tp.zeros(3, dtype=tp.int64), tp.ones(3),
