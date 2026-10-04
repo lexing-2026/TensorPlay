@@ -236,22 +236,16 @@ def prelu(input, weight):
     captured = _capture_call(prelu, (input, weight), {})
     if captured is not None:
         return captured
-    # PReLU(x) = max(0, x) + weight * min(0, x)
-    #          = relu(x) - weight * relu(-x)
-    
+    # PReLU(x) = max(0, x) + weight * min(0, x), one weight per channel (the
+    # input's second axis).  The operator takes the weights as a flat list and
+    # lays them along that axis itself.
     if weight.numel() != 1:
         if input.dim() < 2:
              raise ValueError("Input must have at least 2 dimensions when num_parameters > 1")
-        
+
         # Check if num_parameters matches channel dim (dim 1)
         if input.size(1) != weight.numel():
             raise ValueError(f"num_parameters {weight.numel()} does not match input channel size {input.size(1)}")
-        
-        # Reshape weight for broadcasting
-        # We want (1, C, 1, ...)
-        view_shape = [1] * input.dim()
-        view_shape[1] = weight.numel()
-        weight = weight.view(view_shape)
 
     return _C.prelu(input, weight)
 
@@ -2756,6 +2750,14 @@ def ctc_loss(
         reduction: ``'none' | 'mean' | 'sum'``.
         zero_infinity: zero out infinite losses (targets too long for T).
     """
+    captured = _capture_call(
+        ctc_loss,
+        (log_probs, targets, input_lengths, target_lengths, blank, reduction,
+         zero_infinity),
+        {},
+    )
+    if captured is not None:
+        return captured
     if log_probs.dim() == 2:
         log_probs = log_probs.unsqueeze(1)
         unbatched = True
@@ -3282,6 +3284,14 @@ def embedding_bag(
     exclusion and ``max_norm`` renormalization.
     See :class:`tensorplay.nn.EmbeddingBag` for details.
     """
+    captured = _capture_call(
+        embedding_bag,
+        (input, weight, offsets, max_norm, norm_type, scale_grad_by_freq, mode,
+         sparse, per_sample_weights, include_last_offset, padding_idx),
+        {},
+    )
+    if captured is not None:
+        return captured
     # Backward compatibility with the old (weight, input) argument order.
     if weight.dtype == DType.int64 and _is_float_dtype(input.dtype):
         warnings.warn(

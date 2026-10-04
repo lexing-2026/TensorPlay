@@ -898,33 +898,59 @@ def can_cast(from_, to):
 
 
 def result_type(*args):
-    best = None
-    saw_float_scalar = False
+    """The type an elementwise operation on these operands produces.
+
+    Operands rank by category: tensors with dimensions over 0-dim tensors over
+    plain numbers, and within a category by promotion.  A number takes part
+    as a wrapped number -- its kind counts, never a width: a whole number
+    beside a 32-bit tensor stays 32-bit, a real number turns a whole tensor
+    into the default real type, and a complex number keeps a real tensor's
+    width in the complex result.
+    """
+
+    dim_result = zero_result = wrapped_result = None
+
+    def promote(a, b):
+        return b if a is None else (a if b is None else promote_types(a, b))
+
     for item in args:
         if isinstance(item, tensorplay.Tensor):
-            dt = item.dtype
-        elif isinstance(item, bool):
-            dt = None
+            if item.dim() > 0:
+                dim_result = promote(dim_result, item.dtype)
+            else:
+                zero_result = promote(zero_result, item.dtype)
+            continue
+        if isinstance(item, bool):
+            dt = DType.bool
         elif isinstance(item, int):
-            dt = None
+            dt = DType.int64
         elif isinstance(item, float):
-            dt = None
-            saw_float_scalar = True
+            dt = tensorplay.get_default_dtype()
+        elif isinstance(item, complex):
+            dt = DType.complex128 if tensorplay.get_default_dtype() == DType.float64 else DType.complex64
         else:
             dt = _dt(item)
-        if dt is not None:
-            best = dt if best is None else promote_types(best, dt)
-    if best is None:
-        if saw_float_scalar:
-            return DType.float32
-        if all(isinstance(a, bool) for a in args):
-            return DType.bool
-        return DType.int64
-    if saw_float_scalar and _CATEGORY.get(best, 2) == 1:
-        return DType.float32
-    if saw_float_scalar and best == DType.bool:
-        return DType.float32
-    return best
+        wrapped_result = promote(wrapped_result, dt)
+
+    def combine(higher, lower):
+        if higher is not None and higher.is_complex:
+            return higher
+        if lower is not None and lower.is_complex:
+            if higher is not None and higher.is_floating_point:
+                # The real tensor's width carries into the complex result.
+                return {
+                    DType.float16: DType.complex32,
+                    DType.float32: DType.complex64,
+                    DType.float64: DType.complex128,
+                }.get(higher, lower)
+            return lower
+        if higher is not None and higher.is_floating_point:
+            return higher
+        if higher == DType.bool or (lower is not None and lower.is_floating_point):
+            return promote(higher, lower)
+        return higher if higher is not None else lower
+
+    return combine(dim_result, combine(zero_result, wrapped_result))
 
 
 def is_nonzero(input):

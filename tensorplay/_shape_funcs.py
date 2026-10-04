@@ -31,6 +31,7 @@ __all__ = [
     "dsplit",
     "tensordot",
     "block_diag",
+    "meshgrid",
     "unravel_index",
 ]
 
@@ -397,89 +398,39 @@ def tensordot(input, other, dims=2):
     return out.reshape(fa_shape + fb_shape)
 
 
-_DTYPE_ORDER = {
-    DType.bool: 0,
-    DType.uint8: 1,
-    DType.int8: 1,
-    DType.int16: 2,
-    DType.uint16: 2,
-    DType.int32: 3,
-    DType.uint32: 4,
-    DType.int64: 5,
-    DType.uint64: 6,
-    DType.bfloat16: 7,
-    DType.float16: 8,
-    DType.float32: 9,
-    DType.float64: 10,
-}
-
-
-def _promote_dtypes(dtypes):
-    best = dtypes[0]
-    for dt in dtypes[1:]:
-        if _DTYPE_ORDER.get(dt, -1) > _DTYPE_ORDER.get(best, -1):
-            best = dt
-    return best
-
-
-def _device_key(device):
-    try:
-        return (str(device.type), device.index)
-    except AttributeError:
-        return str(device)
-
-
 def block_diag(*tensors):
     """Builds a block diagonal matrix from the given blocks.
 
-    0-D blocks become 1x1 matrices and 1-D blocks become diagonal
+    0-D blocks become 1x1 matrices and 1-D blocks become single rows.  The
+    blocks are promoted to one type and must share a device; the zeros around
+    them are made on that device by the operator itself.
     """
     _captured = _capture_call(block_diag, tensors, {})
     if _captured is not None:
         return _captured
     if len(tensors) == 0:
         return _C.zeros(size=[1, 0], dtype=DType.float32)
-
-    blocks = []
-    devices = []
     for t in tensors:
         if not isinstance(t, tensorplay.Tensor):
             raise TypeError(
                 f"block_diag(): expected Tensor arguments, got {type(t).__name__}"
             )
-        ndim = t.dim()
-        if ndim == 0:
-            blocks.append(t.reshape([1, 1]))
-        elif ndim == 1:
-            blocks.append(t.reshape([1, t.numel()]))
-        elif ndim == 2:
-            blocks.append(t)
-        else:
-            raise RuntimeError(
-                f"Expected tensors to have 0, 1, or 2 dimensions, but got {ndim}-D"
-            )
-        devices.append(_device_key(t.device))
+    return _C.block_diag(list(tensors))
 
-    for key in devices[1:]:
-        if key != devices[0]:
-            raise RuntimeError(
-                "block_diag(): all tensors are expected to be on the same device"
-            )
 
-    dtype = _promote_dtypes([b.dtype for b in blocks])
-    row_sizes = [b.size(0) for b in blocks]
-    col_sizes = [b.size(1) for b in blocks]
+def meshgrid(*tensors, indexing="ij"):
+    """Coordinate grids from 1-D tensors, one grid per input.
 
-    rows = []
-    for i, blk in enumerate(blocks):
-        pieces = []
-        for j in range(len(blocks)):
-            if j == i:
-                pieces.append(blk.to(dtype) if blk.dtype != dtype else blk)
-            else:
-                pieces.append(_C.zeros(size=[row_sizes[i], col_sizes[j]], dtype=dtype))
-        rows.append(_C.cat(tensors=pieces, dim=1))
-    return _C.cat(tensors=rows, dim=0)
+    The tensors come either as separate arguments or as one sequence.  With
+    ``indexing="ij"`` the grids' axes follow the inputs' order; ``"xy"``
+    swaps the first two, the order Cartesian coordinates are read in.
+    """
+    if len(tensors) == 1 and isinstance(tensors[0], (list, tuple)):
+        tensors = tuple(tensors[0])
+    _captured = _capture_call(meshgrid, tensors, {"indexing": indexing})
+    if _captured is not None:
+        return _captured
+    return tuple(_C.meshgrid(list(tensors), indexing))
 
 
 def unravel_index(indices, shape):

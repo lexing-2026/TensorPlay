@@ -1149,6 +1149,7 @@ chalf = DType.complex32
 from tensorplay._shape_funcs import (
     block_diag as block_diag,
     broadcast_tensors as broadcast_tensors,
+    meshgrid as meshgrid,
     tensordot as tensordot,
 )
 
