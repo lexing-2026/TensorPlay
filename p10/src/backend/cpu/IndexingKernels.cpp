@@ -161,18 +161,31 @@ Tensor triangular_mask_kernel(const Tensor& self, int64_t diagonal) {
     int64_t cols = self.size(ndim - 1);
     int64_t batch = self.numel() / (rows * cols);
     int64_t stride_rc = rows * cols;
+    // Clamp k into [-rows, cols] so the per-row boundary below cannot
+    // overflow, mirroring the saturated keep ranges.
+    if (diagonal < -rows) diagonal = -rows;
+    if (diagonal > cols) diagonal = cols;
+    // Each row splits at one boundary into a zero run and a copy run, so a
+    // row costs two block moves instead of a predicated select per element.
+    // The zero of every supported element type is all-zero bytes, and the
+    // grain is per row so a large square matrix still fills the pool.
 #define TP_TRI_CASE(ctype, name) \
     case DType::name: { \
         const ctype* s = self_c.data_ptr<ctype>(); \
         ctype* d = result.data_ptr<ctype>(); \
-        parallel_for(0, batch * rows, GRAIN_SIZE, [&](int64_t b, int64_t e) { \
+        const int64_t row_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(cols, 1)); \
+        parallel_for(0, batch * rows, row_grain, [&](int64_t b, int64_t e) { \
             for (int64_t t = b; t < e; ++t) { \
                 int64_t bi = t / rows, r = t % rows; \
                 const ctype* sp = s + bi * stride_rc + r * cols; \
                 ctype* dp = d + bi * stride_rc + r * cols; \
-                for (int64_t c = 0; c < cols; ++c) { \
-                    bool keep = Lower ? (c <= r + diagonal) : (c >= r + diagonal); \
-                    dp[c] = keep ? sp[c] : static_cast<ctype>(0); \
+                const int64_t cut = std::max<int64_t>(0, std::min<int64_t>(cols, Lower ? r + diagonal + 1 : r + diagonal)); \
+                if (Lower) { \
+                    std::memcpy(dp, sp, cut * sizeof(ctype)); \
+                    std::memset(dp + cut, 0, (cols - cut) * sizeof(ctype)); \
+                } else { \
+                    std::memset(dp, 0, cut * sizeof(ctype)); \
+                    std::memcpy(dp + cut, sp + cut, (cols - cut) * sizeof(ctype)); \
                 } \
             } \
         }); \
