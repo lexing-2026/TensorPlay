@@ -7008,7 +7008,11 @@ def lower_full(size: Any, fill_value: Any, **kwargs: Any) -> Any:
     so the shape is kept as the expressions it was written in.
     """
 
-    dtype = kwargs.get("dtype") or tp.get_default_dtype()
+    dtype = kwargs.get("dtype")
+    # The dispatch graph spells an unsaid type as the undefined one, which is
+    # a value in its own right and not the absence of one.
+    if not isinstance(dtype, tp.dtype) or dtype == tp.undefined:
+        dtype = tp.get_default_dtype()
     device = decode_device(kwargs.get("device"))
     size = [sympy.expand(s) if isinstance(s, sympy.Expr) else s for s in size]
     return _full(fill_value, device, dtype, size)
