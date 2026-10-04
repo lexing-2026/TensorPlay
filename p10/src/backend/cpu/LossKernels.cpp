@@ -534,10 +534,12 @@ Tensor poisson_nll_loss_kernel(const Tensor& input, const Tensor& target,
     }
     if (full) {
         // Stirling approximation term: t*log(t) - t + 0.5*log(2*pi*t), for t>0
-        Tensor pos = target.gt(1).to(input.dtype());
+        // The selection takes the truth values; the product takes them as
+        // numbers of the loss's type.
+        Tensor pos = target.gt(1);
         Tensor t_safe = Tensor::where(pos, target, Tensor::ones_like(target));
         Tensor stirling = (xlogy_shim(target, t_safe) - target +
-                           (t_safe * (2.0 * M_PI)).log() * 0.5) * pos;
+                           (t_safe * (2.0 * M_PI)).log() * 0.5) * pos.to(input.dtype());
         loss = loss + stirling;
     }
     return loss_reduce(loss, reduction);

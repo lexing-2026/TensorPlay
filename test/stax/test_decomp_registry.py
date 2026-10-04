@@ -281,6 +281,86 @@ SAMPLES = {
     "matmul.default": lambda: ((_t(3, 4), _t(4, 5)), {}),
     "native_group_norm.default": lambda: ((_t(2, 4, 5, 6), None, None, 2, 4, 30, 2, 1e-5), {}),
     "scaled_dot_product_attention.default": lambda: ((_t(2, 4, 8, 8), _t(2, 4, 8, 8), _t(2, 4, 8, 8)), {}),
+    # Views and arrangements.
+    "adjoint.default": lambda: ((_t(2, 3, 4),), {}),
+    "mH.default": lambda: ((_t(2, 3, 4),), {}),
+    "mT.default": lambda: ((_t(2, 3, 4),), {}),
+    "swapaxes.default": lambda: ((_t(2, 3, 4), 0, 2), {}),
+    "swapdims.default": lambda: ((_t(2, 3, 4), 2, 1), {}),
+    "moveaxis.int": lambda: ((_t(2, 3, 4), 0, 2), {}),
+    "moveaxis.intlist": lambda: ((_t(2, 3, 4), [0, 1], [2, 0]), {}),
+    "movedim.default": lambda: ((_t(2, 3, 4), [2], [0]), {}),
+    "movedim.int": lambda: ((_t(2, 3, 4), -1, 0), {}),
+    "movedim.intlist": lambda: ((_t(2, 3, 4), [0, 2], [1, 0]), {}),
+    "unflatten.int": lambda: ((_t(2, 12), 1, [3, -1]), {}),
+    "atleast_1d.default": lambda: ((tp.tensor(1.5),), {}),
+    "atleast_2d.default": lambda: ((_t(3),), {}),
+    "atleast_3d.default": lambda: ((_t(2, 3),), {}),
+    "atleast_1d.Sequence": lambda: (([tp.tensor(1.5), _t(3), _t(2, 3)],), {}),
+    "atleast_2d.Sequence": lambda: (([tp.tensor(1.5), _t(3), _t(2, 3)],), {}),
+    "atleast_3d.Sequence": lambda: (([tp.tensor(1.5), _t(3), _t(2, 3), _t(2, 3, 4)],), {}),
+    "hstack.default": lambda: (([_t(2, 3), _t(2, 1)],), {}),
+    "vstack.default": lambda: (([_t(3), _t(2, 3)],), {}),
+    "tile.default": lambda: ((_t(2, 3), [2, 1, 2]), {}),
+    "tensor_split.indices": lambda: ((_t(7, 2), [2, 5], 0), {}),
+    "tensor_split.sections": lambda: ((_t(7, 2), 3, 0), {}),
+    "tensor_split.tensor_indices_or_sections": lambda: ((_t(2, 7), tp.tensor([1, 4]), 1), {}),
+    "diag.default": lambda: ((_t(4), 1), {}),
+    # Gathers, sorts and products.
+    "index_select.default": lambda: ((_t(4, 5), 1, tp.tensor([4, 0, 2])), {}),
+    "take_along_dim.default": lambda: ((_t(3, 4), tp.tensor([[0, 3], [1, 1], [2, 0]]), 1), {}),
+    "argsort.default": lambda: ((_t(3, 6), 1, True), {}),
+    "argsort.stable": lambda: ((tp.tensor([[2.0, 1.0, 2.0, 0.0, 1.0]]),), {"stable": True, "dim": 1}),
+    "msort.default": lambda: ((_t(5, 3),), {}),
+    "kron.default": lambda: ((_t(2, 3), _t(3, 2)), {}),
+    "outer.default": lambda: ((_t(3), _t(4)), {}),
+    "diff.default": lambda: ((_t(3, 5), 2, -1, _t(3, 1), _t(3, 2)), {}),
+    # Elementwise.
+    "entr.default": lambda: ((tp.tensor([0.0, 0.5, 2.0, -1.0]),), {}),
+    "xlog1py.default": lambda: ((tp.tensor([0.0, 1.0, 2.0]), _unit(3)), {}),
+    "isclose.default": lambda: (
+        (tp.tensor([1.0, 2.0, float("nan"), 3.0]), tp.tensor([1.0, 2.1, float("nan"), 3.0 + 1e-9])),
+        {"equal_nan": True},
+    ),
+    "round.decimals": lambda: ((tp.tensor([1.2345, -2.5678, 0.1049]),), {"decimals": 2}),
+    "log_sigmoid.default": lambda: ((_t(5, low=-30, high=30),), {}),
+    # Reductions.
+    "logsumexp.default": lambda: ((_t(3, 4), 1, True), {}),
+    "nanmean.default": lambda: (
+        (tp.tensor([[1.0, float("nan"), 3.0], [4.0, 5.0, float("nan")]]), 1), {}
+    ),
+    "norm.default": lambda: ((_t(3, 4), 3.0), {}),
+    "norm.Scalar": lambda: ((_t(3, 4), 1), {}),
+    "norm.dim": lambda: ((_t(3, 4), [1], 2.0, True), {}),
+    "norm.ScalarOpt_dim": lambda: ((_t(3, 4), 3, [0], False), {}),
+    "norm.ScalarOpt_dtype": lambda: ((_t(3, 4), 2), {"dtype": tp.float64}),
+    "norm.ScalarOpt_dim_dtype": lambda: ((_t(3, 4), 2, [1], False), {"dtype": tp.float64}),
+    "quantile.default": lambda: ((_t(3, 8), tp.tensor([0.25, 0.5, 0.9]), 1, False), {}),
+    "nanquantile.default": lambda: (
+        (tp.tensor([[1.0, float("nan"), 3.0, 0.5], [4.0, 5.0, 2.0, float("nan")]]),
+         tp.tensor([0.3, 0.75]), 1, True),
+        {},
+    ),
+    # Normalizations.
+    "instance_norm.default": lambda: (
+        (_t(2, 3, 4, 5), _unit(3), _t(3), None, None, True, 0.1, 1e-5), {}
+    ),
+    "rms_norm.default": lambda: ((_t(3, 4), [4], _unit(4), 1e-5), {}),
+    # Losses (reduction 1 is the mean).
+    "tp_l1_loss.default": lambda: ((_t(3, 4), _t(3, 4), 1), {}),
+    "tp_kl_div.default": lambda: (
+        (tp.log_softmax(_t(3, 4), 1), tp.softmax(_t(3, 4), 1), 1, False), {}
+    ),
+    "tp_poisson_nll_loss.default": lambda: ((_t(3, 4), _unit(3, 4) * 4, True, True, 1e-8, 1), {}),
+    "tp_soft_margin_loss.default": lambda: (
+        (_t(3, 4), tp.tensor([[1.0, -1.0, 1.0, -1.0]] * 3), 1), {}
+    ),
+    "tp_hinge_embedding_loss.default": lambda: (
+        (_t(3, 4), tp.tensor([[1.0, -1.0, -1.0, 1.0]] * 3), 0.5, 1), {}
+    ),
+    "tp_margin_ranking_loss.default": lambda: (
+        (_t(5), _t(5), tp.tensor([1.0, -1.0, 1.0, 1.0, -1.0]), 0.2, 1), {}
+    ),
 }
 
 # Overloads whose kernels exist only on specific devices; exercised by the

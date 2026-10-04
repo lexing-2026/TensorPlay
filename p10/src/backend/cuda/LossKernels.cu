@@ -430,7 +430,7 @@ Tensor tp_poisson_nll_loss_cuda(const Tensor& input, const Tensor& target,
     Tensor loss = log_input ? input.exp() - target * input
                             : input - target * (input + eps).log();
     if (full) {
-        Tensor active = target.gt(Scalar(1)).to(input.dtype());
+        Tensor active = target.gt(Scalar(1));
         Tensor safe_target = Tensor::where(active, target,
                                            Tensor::ones_like(target));
         Tensor stirling = target * safe_target.log() - target +
