@@ -4487,8 +4487,31 @@ def lower_upsample_nearest2d(x, output_size, scales_h=None, scales_w=None,
 
 @register("upsample_nearest3d.default", "_upsample_nearest_exact3d.default")
 def lower_upsample_nearest3d(x, output_size, scales_d=None, scales_h=None,
-                            scales_w=None, **kwargs):
+                             scales_w=None, **kwargs):
     return _upsample_nearestnd(x, output_size, 3, **kwargs)
+
+
+@register("upsample_nearest1d.default", "_upsample_nearest_exact1d.default")
+def lower_upsample_nearest1d(x, output_size, scales_d=None, **kwargs):
+    return _upsample_nearestnd(x, output_size, 1, **kwargs)
+
+
+@register("_upsample_nearest_exact1d.vec", "_upsample_nearest_exact2d.vec",
+          "_upsample_nearest_exact3d.vec")
+def lower_upsample_nearest_exact_vec(x, output_size, scale_factors=None,
+                                     **kwargs):
+    """The bundled spelling of a nearest upsampling, along every spatial axis.
+
+    The bundled call carries one scale where the axis-by-axis call carries
+    one per axis; the extent it works on is what the operation's own name
+    says, and a scale without an extent is not something an address can be
+    read from, so that call stays a boundary.
+    """
+
+    if not output_size:
+        raise NotImplementedError("a scale given without an extent")
+    ndim = int(target_name(V.current_node.target).split(".")[0][-2])
+    return _upsample_nearestnd(x, output_size, ndim, **kwargs)
 
 
 def _prod_ints(values) -> int:
