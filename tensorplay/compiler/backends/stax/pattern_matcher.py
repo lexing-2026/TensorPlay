@@ -99,7 +99,7 @@ prims = tp.ops.prims
 Constant = Any
 NodeOrConstant = Constant | Any
 
-backend = os.environ.get("TORCHINDUCTOR_PATTERN_MATCH_BACKEND", "inductor")
+backend = os.environ.get("TP_PATTERN_MATCH_BACKEND", "tp")
 
 
 _debug_nodes_cache: bool | OrderedSet[str] | None = None
@@ -117,7 +117,7 @@ def _should_debug_node(node_name: str) -> bool:
                 return True
             return OrderedSet(env_value.split(","))
 
-        current_env = os.environ.get("TORCHINDUCTOR_PATTERN_MATCH_DEBUG")
+        current_env = os.environ.get("TP_PATTERN_MATCH_DEBUG")
 
         # Recompute only if env changed
         if current_env != _debug_nodes_env_value_cache or _debug_nodes_cache is None:
@@ -2402,19 +2402,8 @@ def is_start_of_fx_graph(graph: Any, node: Any) -> bool:
 _mutation_op_re = re.compile(r"(?<!_)(_$|_[.]|(\b|_)(set|enter|exit|seed)(\b|_))(?!_)")
 
 
-def an op with an incorrect schema(op: OpOverload) -> bool:
-    if op.namespace != "stax":
-        return False
-
-    # TODO - fix schema
-    # Don't add any more!
-    return op in (tp.ops.stax.resize_storage_bytes_.default,)
-
-
 def is_mutation_op(node: Any) -> bool:
-    if isinstance(
-        node.target, OpOverload
-    ) and not an op with an incorrect schema(node.target):
+    if isinstance(node.target, OpOverload):
         return node.target._schema.is_mutable
     elif node.target is tp._higher_order_ops.auto_functionalized:
         # A functionalized mutation is written as one node that runs the
@@ -2759,7 +2748,7 @@ class PatternMatcherPass:
                         counters[backend]["pattern_matcher_nodes"] += len(m.nodes)
 
                         # Track per-pattern counts when debug mode is active
-                        if os.environ.get("TORCHINDUCTOR_PATTERN_MATCH_DEBUG"):
+                        if os.environ.get("TP_PATTERN_MATCH_DEBUG"):
                             if getattr(entry, "pattern_name", None):
                                 pattern_name = entry.pattern_name
                             else:

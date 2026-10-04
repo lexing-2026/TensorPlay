@@ -175,8 +175,6 @@ _PYI_DEFAULTS = {
     "Preserve": "preserve_format",
     "ChannelsLast": "channels_last",
     "ChannelsLast3d": "channels_last_3d",
-    "c10::MemoryFormat::Contiguous": "contiguous_format",
-    "c10::MemoryFormat::Preserve": "preserve_format",
     "Float32": "DType.float32",
     "Int64": "DType.int64",
     "Undefined": "DType.undefined",

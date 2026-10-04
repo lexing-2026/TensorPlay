@@ -10,9 +10,8 @@ package version), so an upgraded toolchain re-probes instead of inheriting
 a stale verdict.
 
 ``pick_vec_isa()`` selects the widest supported tier.  ``TP_STAX_CPU_TIER``
-overrides the choice with a tier name (``avx512``/``avx2``/``default``),
-mirroring an unrecognized or empty name falls back to auto-detection used by the
-in-tree kernels.
+overrides the choice with a tier name (``avx512``/``avx2``/``default``); an
+unrecognized or empty name falls back to auto-detection.
 """
 
 from __future__ import annotations

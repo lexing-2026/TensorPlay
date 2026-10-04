@@ -226,7 +226,7 @@ framework = tp.ops.tp
 #: products added together, which is a shape the framework has no single call
 #: for: a tuned kernel that walks both in one pass is measured against this.
 @tp.library.custom_op(
-      "stax::_mm_plus_mm", mutates_args=(), schema="(a, b, c, d) -> Tensor"
+    "stax::_mm_plus_mm", mutates_args=(), schema="(a, b, c, d) -> Tensor"
 )
 def _mm_plus_mm(a, b, c, d):
     return tp.mm(a, b) + tp.mm(c, d)
@@ -240,7 +240,7 @@ def _(a, b, c, d):
 
 
 @tp.library.custom_op(
-      "stax::_mm_plus_mm_out",
+    "stax::_mm_plus_mm_out",
     mutates_args=(),
     schema="(a, b, c, d, out) -> ()",
 )

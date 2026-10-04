@@ -844,7 +844,7 @@ class _TpExportConfigs:
     #: named by that text where the level is chosen, and read back as that text
     #: where the level is acted on.
     debug_intermediate_value_printer: Literal["0", "1", "2", "3"] = os.environ.get(
-        "AOT_INDUCTOR_DEBUG_INTERMEDIATE_VALUE_PRINTER", "0"
+        "TP_DEBUG_INTERMEDIATE_VALUE_PRINTER", "0"
     )
 
     #: Keep the launcher beside the graph rather than emitting it separately,
@@ -883,7 +883,7 @@ class _TpExportConfigs:
     #: directory is made under the cache for this export alone.  A path that
     #: ends in a module extension names the library to produce, so that a
     #: caller who asked for a particular name gets one.
-    output_path: str = os.environ.get("TP_AOT_INDUCTOR_OUTPUT_PATH", "")
+    output_path: str = os.environ.get("TP_AOT_OUTPUT_PATH", "")
 
     #: Package only the C++ side, leaving each kernel to be compiled where it
     #: will run.  Unset rather than off, because it is not a preference: it
@@ -1201,7 +1201,7 @@ class _TraceConfig:
     #: yes without having to name a level.
     provenance_tracking_level: int = int(
         os.environ.get(
-            "TP_INDUCTOR_PROVENANCE", os.environ.get("TP_COMPILE_DEBUG", "0")
+            "TP_CODEGEN_PROVENANCE", os.environ.get("TP_COMPILE_DEBUG", "0")
         )
     )
 
@@ -1485,7 +1485,7 @@ class _EagerNumerics:
     #: it rather than the way the arithmetic defines it, so that what a kernel
     #: computes agrees with what the framework would have computed.
     division_rounding: bool = (
-        os.environ.get("TORCHINDUCTOR_EMULATE_DIVISION_ROUNDING", "0") == "1"
+        os.environ.get("TP_EMULATE_DIVISION_ROUNDING", "0") == "1"
     )
     use_project_libdevice = False
 
@@ -1646,7 +1646,7 @@ class _AutoChunkerConfig:
     """Whether the graph is cut into pieces that are each worth compiling."""
 
     #: Whether the chunking is done at all.
-    enable: bool = os.environ.get("TORCHINDUCTOR_AUTO_CHUNKER") == "1"
+    enable: bool = os.environ.get("TP_AUTO_CHUNKER") == "1"
 
 
 auto_chunker = _AutoChunkerConfig()

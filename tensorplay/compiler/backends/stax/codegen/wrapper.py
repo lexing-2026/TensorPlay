@@ -1663,7 +1663,7 @@ class PythonWrapperCodegen(CodeGen):
         self.header.splice(
             """
                 operator_set = tp.ops.tp
-                inductor_ops = tp.ops.inductor
+                framework_ops = tp.ops.stax
                 _empty_strided = tp._C.empty_strided
                 _device_cpu = tp.device("cpu")
                 _device_cuda = tp.device("cuda")

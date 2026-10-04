@@ -311,7 +311,7 @@ class CppTemplateKernel(CppKernel):
             if prefix and prefix_kernel_name:
                 prefix += prefix_kernel_name + "_"
             handle_str = (
-                "tp::aot_inductor::RAIIAtenRecordFunctionHandle "
+                "tp::aot::RAIIRecordFunctionHandle "
                 f'record_{prefix}{self.kernel_name}_("{prefix}{self.kernel_name}", nullptr);'
             )
             return handle_str

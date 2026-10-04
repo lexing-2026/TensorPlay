@@ -352,7 +352,7 @@ class SimpleElasticAgent(ElasticAgent):
         them and writes base ranks per agent; every agent then derives its
         workers' ranks from its own base.
         """
-        if os.environ.get("TORCH_ELASTIC_WORKER_IDENTICAL", "0") == "1":
+        if os.environ.get("TP_ELASTIC_WORKER_IDENTICAL", "0") == "1":
             global_world_size = group_world_size * spec.local_world_size
             base_global_rank = group_rank * spec.local_world_size
             base_role_rank = base_global_rank

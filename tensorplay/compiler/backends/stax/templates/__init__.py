@@ -5,7 +5,7 @@ a check that no two entries in it answer to the same identity: a stored decision
 names a choice by its identity, so a collision would make every stored decision
 ambiguous between the one that was measured and the one that was not.
 
-Each module here answers to one upstream module, and the split is the split:
+Each module here answers to one question, and the split is the split:
 
   params        what a configuration is
   ir            where a result lands, what a call is, what a built choice is

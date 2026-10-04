@@ -66,9 +66,9 @@ _pool_set: OrderedSet[Any] = OrderedSet()
 
 def _pycodecache_kernel_compile_env() -> dict[str, str | None]:
     env_vars = [
-        "TORCHINDUCTOR_CACHE_DIR",
+        "TP_CACHE_DIR",
         "TRITON_CACHE_DIR",
-        "TORCHINDUCTOR_CUTLASS_DIR",
+        "TP_CUTLASS_DIR",
     ]
     return {v: os.environ.get(v) for v in env_vars}
 
@@ -219,7 +219,7 @@ class AsyncCompile:
                 "async compile process pools are disabled in daemonic "
                 "multiprocessing processes. Set "
                 "the configuration that says how a worker process is started"
-                "(or TORCHINDUCTOR_WORKER_START=subprocess) to use the "
+                "(or TP_WORKER_START=subprocess) to use the "
                 "SubprocPool path, which is not affected by the daemon restriction."
             )
         AsyncCompile._ready_future = None
@@ -238,7 +238,7 @@ class AsyncCompile:
         else:
             if config.worker_start_method == "spawn":
                 # Avoid creating pools in the spawned subprocs themselves:
-                os.environ["TORCH_WARM_POOL"] = "0"
+                os.environ["TP_WARM_POOL"] = "0"
             pre_fork_setup()
             ctx = multiprocessing.get_context(config.worker_start_method)
             pool = TrackedProcessPoolExecutor(
@@ -460,8 +460,8 @@ class AsyncCompile:
 
 def maybe_warm_pool() -> None:
     if (
-        os.environ.get("TORCH_TNT_IN_USE", "0") == "1"
-        or os.environ.get("TORCH_WARM_POOL", "1") != "1"
+        os.environ.get("TP_TNT_IN_USE", "0") == "1"
+        or os.environ.get("TP_WARM_POOL", "1") != "1"
         # The subprocess pool is only used for the Triton backend
         or not has_triton_package()
         # Skip for fbcode. We have internal reports of usages inside multiprocessing

@@ -1248,11 +1248,12 @@ class CppVecOverrides(CppOverrides):
 
                 # DType Promotion
                 if vectors:
-                    # We have saw several data type mismatch issues related with index_expr in
-                    # the lowering phase of tp.int8. tp.int32, tp.int64.
-                    # 1. int32 and int64 in test_torchinductor.py::test_max_pool2d_with_indices_backward3_cpu
-                    # 2. int8 and int32 in test_torchinductor.py::test_max_pool2d5_cpu
-                    # 3. int32 and fp32 in test_torchinductor_dynamic_shapes.py::test_avg_pool2d8_dynamic_shapes_cpu
+                    # A lowered index argument is not always already the
+                    # element type the op wants, so the pair is promoted here.
+                    # Observed mismatches, all reaching lowering as int32:
+                    # 1. int32 and int64, from max_pool2d_with_indices backward
+                    # 2. int8 and int32, from max_pool2d
+                    # 3. int32 and fp32, from avg_pool2d
                     if len(new_args) == 2:
                         new_args = promote_args(new_args)
                     elif func is CppVecOverrides.where:

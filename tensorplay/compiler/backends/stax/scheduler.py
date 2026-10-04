@@ -5119,7 +5119,7 @@ class Scheduler:
 
     def debug_draw_graph(self) -> None:
         """Generate an image of the graph for debugging"""
-        if os.environ.get("INDUCTOR_WRITE_SCHEDULER_GRAPH", None) == "1":
+        if os.environ.get("TP_WRITE_SCHEDULER_GRAPH", None) == "1":
             from .debug import draw_buffers
 
             draw_buffers(self.nodes, print_graph=True)
