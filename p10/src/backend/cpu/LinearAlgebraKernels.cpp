@@ -10,6 +10,7 @@
 #include "GradMode.h"
 #include "DTypeNames.h"
 #include "Complex.h"
+#include "cpu/VecUnary.h"
 #include <vector>
 #include <cmath>
 #include <memory>
@@ -1877,6 +1878,109 @@ Tensor mv_kernel(const Tensor& self, const Tensor& vec) {
     return matmul_batched_2d(self, vec.unsqueeze(-1), {}, {}).squeeze(-1);
 }
 
+// Wide multiply-add reductions for dot: independent accumulators hide FMA
+// latency and lanes collapse once at the end; the scalar tail keeps any
+// remainder.  Each carries its own target attribute so the TU keeps
+// compiling without global ISA flags.
+__attribute__((target("avx512f,fma")))
+static float dot_f32_avx512(const float* a, const float* b, int64_t n) {
+    __m512 s0 = _mm512_setzero_ps();
+    __m512 s1 = _mm512_setzero_ps();
+    __m512 s2 = _mm512_setzero_ps();
+    __m512 s3 = _mm512_setzero_ps();
+    int64_t i = 0;
+    for (; i + 64 <= n; i += 64) {
+        s0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i),      _mm512_loadu_ps(b + i),      s0);
+        s1 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 16), _mm512_loadu_ps(b + i + 16), s1);
+        s2 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 32), _mm512_loadu_ps(b + i + 32), s2);
+        s3 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 48), _mm512_loadu_ps(b + i + 48), s3);
+    }
+    for (; i + 16 <= n; i += 16)
+        s0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), s0);
+    float total = _mm512_reduce_add_ps(s0) + _mm512_reduce_add_ps(s1)
+                + _mm512_reduce_add_ps(s2) + _mm512_reduce_add_ps(s3);
+    for (; i < n; ++i) total += a[i] * b[i];
+    return total;
+}
+
+__attribute__((target("avx2,fma")))
+static float dot_f32_avx2(const float* a, const float* b, int64_t n) {
+    __m256 s0 = _mm256_setzero_ps();
+    __m256 s1 = _mm256_setzero_ps();
+    __m256 s2 = _mm256_setzero_ps();
+    __m256 s3 = _mm256_setzero_ps();
+    int64_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i),      s0);
+        s1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8),  _mm256_loadu_ps(b + i + 8),  s1);
+        s2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16), s2);
+        s3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24), s3);
+    }
+    for (; i + 8 <= n; i += 8)
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), s0);
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(s0), _mm256_extractf128_ps(s0, 1));
+    h = _mm_add_ps(h, _mm256_castps256_ps128(s1));
+    h = _mm_add_ps(h, _mm256_extractf128_ps(s1, 1));
+    h = _mm_add_ps(h, _mm256_castps256_ps128(s2));
+    h = _mm_add_ps(h, _mm256_extractf128_ps(s2, 1));
+    h = _mm_add_ps(h, _mm256_castps256_ps128(s3));
+    h = _mm_add_ps(h, _mm256_extractf128_ps(s3, 1));
+    h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+    h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 1));
+    float total = _mm_cvtss_f32(h);
+    for (; i < n; ++i) total += a[i] * b[i];
+    return total;
+}
+
+__attribute__((target("avx512f,fma")))
+static double dot_f64_avx512(const double* a, const double* b, int64_t n) {
+    __m512d s0 = _mm512_setzero_pd();
+    __m512d s1 = _mm512_setzero_pd();
+    __m512d s2 = _mm512_setzero_pd();
+    __m512d s3 = _mm512_setzero_pd();
+    int64_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        s0 = _mm512_fmadd_pd(_mm512_loadu_pd(a + i),      _mm512_loadu_pd(b + i),      s0);
+        s1 = _mm512_fmadd_pd(_mm512_loadu_pd(a + i + 8),  _mm512_loadu_pd(b + i + 8),  s1);
+        s2 = _mm512_fmadd_pd(_mm512_loadu_pd(a + i + 16), _mm512_loadu_pd(b + i + 16), s2);
+        s3 = _mm512_fmadd_pd(_mm512_loadu_pd(a + i + 24), _mm512_loadu_pd(b + i + 24), s3);
+    }
+    for (; i + 8 <= n; i += 8)
+        s0 = _mm512_fmadd_pd(_mm512_loadu_pd(a + i), _mm512_loadu_pd(b + i), s0);
+    double total = _mm512_reduce_add_pd(s0) + _mm512_reduce_add_pd(s1)
+                 + _mm512_reduce_add_pd(s2) + _mm512_reduce_add_pd(s3);
+    for (; i < n; ++i) total += a[i] * b[i];
+    return total;
+}
+
+__attribute__((target("avx2,fma")))
+static double dot_f64_avx2(const double* a, const double* b, int64_t n) {
+    __m256d s0 = _mm256_setzero_pd();
+    __m256d s1 = _mm256_setzero_pd();
+    __m256d s2 = _mm256_setzero_pd();
+    __m256d s3 = _mm256_setzero_pd();
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        s0 = _mm256_fmadd_pd(_mm256_loadu_pd(a + i),      _mm256_loadu_pd(b + i),      s0);
+        s1 = _mm256_fmadd_pd(_mm256_loadu_pd(a + i + 4),  _mm256_loadu_pd(b + i + 4),  s1);
+        s2 = _mm256_fmadd_pd(_mm256_loadu_pd(a + i + 8),  _mm256_loadu_pd(b + i + 8),  s2);
+        s3 = _mm256_fmadd_pd(_mm256_loadu_pd(a + i + 12), _mm256_loadu_pd(b + i + 12), s3);
+    }
+    for (; i + 4 <= n; i += 4)
+        s0 = _mm256_fmadd_pd(_mm256_loadu_pd(a + i), _mm256_loadu_pd(b + i), s0);
+    __m128d h = _mm_add_pd(_mm256_castpd256_pd128(s0), _mm256_extractf128_pd(s0, 1));
+    h = _mm_add_pd(h, _mm256_castpd256_pd128(s1));
+    h = _mm_add_pd(h, _mm256_extractf128_pd(s1, 1));
+    h = _mm_add_pd(h, _mm256_castpd256_pd128(s2));
+    h = _mm_add_pd(h, _mm256_extractf128_pd(s2, 1));
+    h = _mm_add_pd(h, _mm256_castpd256_pd128(s3));
+    h = _mm_add_pd(h, _mm256_extractf128_pd(s3, 1));
+    h = _mm_add_sd(h, _mm_unpackhi_pd(h, h));
+    double total = _mm_cvtsd_f64(h);
+    for (; i < n; ++i) total += a[i] * b[i];
+    return total;
+}
+
 Tensor dot_kernel(const Tensor& self, const Tensor& other) {
     if (self.dim() != 1 || other.dim() != 1) {
         TP_THROW(RuntimeError, "1D tensors expected, but got ", self.dim(), "D and ",
@@ -1898,6 +2002,42 @@ Tensor dot_kernel(const Tensor& self, const Tensor& other) {
     // Per-thread partial sums combined serially: no lock on the workers, and
     // the fixed lane order keeps the reduction deterministic.
     const int nthreads = std::max(1, parallel::get_num_threads());
+#if defined(__x86_64__)
+    // Wide multiply-add reduction for the two contiguous float types; the
+    // generic case below evaluates one element per loop iteration.
+    const bool has_vec = vecunary::avx512_available() || vecunary::avx2_available();
+    if (has_vec && self.is_contiguous() && other.is_contiguous()
+        && (self.dtype() == DType::Float32 || self.dtype() == DType::Float64)) {
+        if (self.dtype() == DType::Float32) {
+            const float* a = self.data_ptr<float>();
+            const float* b = other.data_ptr<float>();
+            std::vector<float> partials(static_cast<size_t>(nthreads), 0.0f);
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                partials[static_cast<size_t>(parallel::get_thread_num())]
+                    += vecunary::avx512_available()
+                           ? dot_f32_avx512(a + begin, b + begin, end - begin)
+                           : dot_f32_avx2(a + begin, b + begin, end - begin);
+            });
+            float total = 0.0f;
+            for (const float part : partials) total += part;
+            result.data_ptr<float>()[0] = total;
+            return result;
+        }
+        const double* a = self.data_ptr<double>();
+        const double* b = other.data_ptr<double>();
+        std::vector<double> partials(static_cast<size_t>(nthreads), 0.0);
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            partials[static_cast<size_t>(parallel::get_thread_num())]
+                += vecunary::avx512_available()
+                       ? dot_f64_avx512(a + begin, b + begin, end - begin)
+                       : dot_f64_avx2(a + begin, b + begin, end - begin);
+        });
+        double total = 0.0;
+        for (const double part : partials) total += part;
+        result.data_ptr<double>()[0] = total;
+        return result;
+    }
+#endif
     const auto accumulate = [&](auto&& body) {
         using Acc = decltype(body(int64_t{0}));
         std::vector<Acc> partials(static_cast<size_t>(nthreads), Acc{});
