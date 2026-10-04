@@ -5,6 +5,8 @@
 // call site rejects them with NotImplementedError next to the real dtypes.
 #pragma once
 
+#include "TypePromotion.h"
+
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -36,13 +38,13 @@ inline constexpr double kInvSqrt2 = 0.70710678118654752440;
 // own complex width (float64 -> complex128, everything else -> complex64).
 inline DType scalar_result_dtype(DType self_dt, const Scalar& other,
                                  const Scalar* alpha = nullptr) {
-    const bool alpha_cplx = alpha && alpha->isComplex();
-    if (isComplexType(self_dt)) return self_dt;
-    if (other.isComplex() || alpha_cplx) {
-        return isFloatingType(self_dt) ? toComplexType(self_dt)
-                                       : DType::ComplexFloat;
+    DType dt = result_type(other, self_dt);
+    // A real or complex alpha scales the scalar in its own category, so it
+    // moves the result the way such a scalar would.
+    if (alpha != nullptr && (alpha->isFloatingPoint() || alpha->isComplex())) {
+        dt = result_type(*alpha, dt);
     }
-    return self_dt;
+    return dt;
 }
 
 // --- elementwise unary over interleaved storage -----------------------------

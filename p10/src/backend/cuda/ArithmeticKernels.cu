@@ -1809,6 +1809,12 @@ Tensor add_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& 
 
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
     if (self.numel() == 0) return result;
+    if (result_dtype == DType::Bool) {
+        // Truths add as "or": summed as whole numbers, then read back as
+        // whether each sum is nonzero.
+        result.copy_(add_scalar_kernel(self.to(DType::Int64), other, alpha));
+        return result;
+    }
 
     Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
     if (result_dtype == DType::ComplexFloat || result_dtype == DType::ComplexDouble) {
@@ -1826,6 +1832,9 @@ Tensor add_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& 
         case DType::Float64:
         case DType::Float16:
         case DType::BFloat16:
+        case DType::UInt8:
+        case DType::Int8:
+        case DType::Int16:
         case DType::Int32:
         case DType::Int64:
             break;
@@ -1863,6 +1872,9 @@ Tensor& add_scalar_inplace_kernel(Tensor& self, const Scalar& other, const Scala
         case DType::Float64:
         case DType::Float16:
         case DType::BFloat16:
+        case DType::UInt8:
+        case DType::Int8:
+        case DType::Int16:
         case DType::Int32:
         case DType::Int64:
             break;
@@ -1898,6 +1910,9 @@ Tensor sub_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& 
         case DType::Float64:
         case DType::Float16:
         case DType::BFloat16:
+        case DType::UInt8:
+        case DType::Int8:
+        case DType::Int16:
         case DType::Int32:
         case DType::Int64:
             break;
@@ -1935,6 +1950,9 @@ Tensor& sub_scalar_inplace_kernel(Tensor& self, const Scalar& other, const Scala
         case DType::Float64:
         case DType::Float16:
         case DType::BFloat16:
+        case DType::UInt8:
+        case DType::Int8:
+        case DType::Int16:
         case DType::Int32:
         case DType::Int64:
             break;
@@ -1952,6 +1970,12 @@ Tensor mul_scalar_kernel(const Tensor& self, const Scalar& other) {
 
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
     if (self.numel() == 0) return result;
+    if (result_dtype == DType::Bool) {
+        // Truths multiply as "and": multiplied as whole numbers, then read
+        // back as whether each product is nonzero.
+        result.copy_(mul_scalar_kernel(self.to(DType::Int64), other));
+        return result;
+    }
 
     Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
     if (result_dtype == DType::ComplexFloat || result_dtype == DType::ComplexDouble) {
@@ -1969,6 +1993,9 @@ Tensor mul_scalar_kernel(const Tensor& self, const Scalar& other) {
         case DType::Float64:
         case DType::Float16:
         case DType::BFloat16:
+        case DType::UInt8:
+        case DType::Int8:
+        case DType::Int16:
         case DType::Int32:
         case DType::Int64:
             break;
@@ -2006,6 +2033,9 @@ Tensor& mul_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
         case DType::Float64:
         case DType::Float16:
         case DType::BFloat16:
+        case DType::UInt8:
+        case DType::Int8:
+        case DType::Int16:
         case DType::Int32:
         case DType::Int64:
             break;
@@ -2022,7 +2052,8 @@ Tensor div_scalar_kernel(const Tensor& self, const Scalar& other) {
     DType result_dtype = self.dtype();
     // True division promotes integral tensors to Float32 (ComplexFloat for a
     if (!isFloatingOrComplexType(result_dtype)) {
-        result_dtype = other.isComplex() ? DType::ComplexFloat : DType::Float32;
+        result_dtype = other.isComplex() ? globalContext().defaultComplexDType()
+                                         : globalContext().defaultDType();
     } else if (!isComplexType(result_dtype) && other.isComplex()) {
         result_dtype = promoteTypes(toComplexType(result_dtype), other.dtype());
     }
@@ -2046,6 +2077,9 @@ Tensor div_scalar_kernel(const Tensor& self, const Scalar& other) {
         case DType::Float64:
         case DType::Float16:
         case DType::BFloat16:
+        case DType::UInt8:
+        case DType::Int8:
+        case DType::Int16:
         case DType::Int32:
         case DType::Int64:
             break;
@@ -2083,6 +2117,9 @@ Tensor& div_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
         case DType::Float64:
         case DType::Float16:
         case DType::BFloat16:
+        case DType::UInt8:
+        case DType::Int8:
+        case DType::Int16:
         case DType::Int32:
         case DType::Int64:
             break;

@@ -1,11 +1,11 @@
 // Composite kernels: can_cast / promote_types / result_type (4 overloads) /
 // is_conj / is_neg.
-// fast path).
 
 #include "CompositeCommon.h"
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "TypePromotion.h"
+#include "TypeProperties.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
 namespace tensorplay {
@@ -15,54 +15,23 @@ namespace ops = tensorplay::tpx::ops;
 
 namespace {
 
-// category (dim'd tensors > 0-dim tensors > wrapped scalars).
-DType combine_categories(DType higher, DType lower) {
-    if (higher == DType::Undefined) return lower;
-    if (lower == DType::Undefined) return higher;
-    if (isComplexType(higher)) return higher;
-    if (isComplexType(lower)) {
-        return isFloatingType(higher) ? toComplexType(higher) : lower;
-    }
-    if (isFloatingType(higher)) return higher;
-    if (higher == DType::Bool || isFloatingType(lower)) {
-        return promoteTypes(higher, lower);
-    }
-    return higher;
-}
-
-// Wrapped numbers (Scalar arguments) contribute only when float/complex, and
-// update_result_type_state(Scalar)).
-DType scalar_wrapped_dtype(const Scalar& s) {
-    if (s.isComplex()) return DType::ComplexFloat;
-    if (s.isFloatingPoint()) return DType::Float32;
-    return DType::Undefined;
-}
-
+// The result type of up to two tensors and two scalars, by category: tensors
+// with dimensions over 0-dim tensors over wrapped scalars, and within a
+// category by promotion.  A scalar takes part as a wrapped number -- a real
+// one as the default real type, a complex one as the default complex type,
+// whole numbers and truths as themselves.
 DType result_type_state(const Tensor* t1, const Tensor* t2,
                         const Scalar* s1, const Scalar* s2) {
-    DType dim_result = DType::Undefined;
-    DType zero_result = DType::Undefined;
-    DType wrapped_result = DType::Undefined;
+    native::ResultTypeState state{};
     const Tensor* tensors[2] = {t1, t2};
     for (const Tensor* t : tensors) {
-        if (!t) continue;
-        const DType dt = t->dtype();
-        if (t->dim() > 0) {
-            dim_result = dim_result == DType::Undefined
-                             ? dt : promoteTypes(dim_result, dt);
-        } else {
-            zero_result = zero_result == DType::Undefined
-                              ? dt : promoteTypes(zero_result, dt);
-        }
+        if (t != nullptr) state = native::update_result_type_state(*t, state);
     }
     const Scalar* scalars[2] = {s1, s2};
     for (const Scalar* s : scalars) {
-        if (!s) continue;
-        wrapped_result = combine_categories(wrapped_result,
-                                            scalar_wrapped_dtype(*s));
+        if (s != nullptr) state = native::update_result_type_state(*s, state);
     }
-    return combine_categories(dim_result,
-                              combine_categories(zero_result, wrapped_result));
+    return native::result_type(state);
 }
 
 } // anonymous namespace
@@ -90,9 +59,9 @@ DType result_type_scalar_tensor_native(const Scalar& scalar,
 
 DType result_type_scalar_scalar_native(const Scalar& scalar1,
                                        const Scalar& scalar2) {
-    // tensors with their natural dtypes.
-    return promoteTypes(scalar_natural_dtype(scalar1),
-                        scalar_natural_dtype(scalar2));
+    // Two wrapped numbers and nothing else: their own promotion, with a real
+    // or complex one taken as the default type of its kind.
+    return result_type_state(nullptr, nullptr, &scalar1, &scalar2);
 }
 
 bool is_conj_native(const Tensor& /*self*/) { return false; }

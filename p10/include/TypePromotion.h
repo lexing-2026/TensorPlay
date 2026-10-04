@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Context.h"
 #include "DType.h"
 #include "Scalar.h"
 #include <array>
@@ -165,19 +166,31 @@ inline DType promoteTypes(DType type1, DType type2) {
                                       [static_cast<size_t>(ix2)];
 }
 
-// Result type of Tensor + Scalar
-// Simplified: If scalar is float and tensor is int, result is float. Otherwise tensor type wins.
+// Result type of Tensor (op) Scalar.  The scalar takes part as a wrapped
+// number: its category counts, its width does not.  A tensor keeps its type
+// against a scalar of the same or a lower category; a scalar of a higher
+// category moves the result to that category's default type -- an integer
+// scalar turns a boolean tensor into int64, a real scalar turns an integral
+// tensor into the default real type -- and a complex scalar keeps a real
+// tensor's width in the complex result.
 inline DType result_type(const Scalar& scalar, DType tensorType) {
-    if (isFloatingOrComplexType(tensorType)) {
+    DType wrapped = scalar.dtype();
+    if (isComplexType(wrapped)) {
+        wrapped = globalContext().defaultComplexDType();
+    } else if (isFloatingType(wrapped)) {
+        wrapped = globalContext().defaultDType();
+    }
+    if (isComplexType(tensorType)) {
         return tensorType;
     }
-    if (scalar.isComplex()) {
-        // Int Tensor + Complex Scalar -> Complex64 Tensor
-        return DType::ComplexFloat;
+    if (isComplexType(wrapped)) {
+        return isFloatingType(tensorType) ? toComplexType(tensorType) : wrapped;
     }
-    if (scalar.isFloatingPoint()) {
-        // Int Tensor + Float Scalar -> Float Tensor (usually Float32 default unless tensor is Double)
-        return DType::Float32;
+    if (isFloatingType(tensorType)) {
+        return tensorType;
+    }
+    if (tensorType == DType::Bool || isFloatingType(wrapped)) {
+        return promoteTypes(tensorType, wrapped);
     }
     return tensorType;
 }
