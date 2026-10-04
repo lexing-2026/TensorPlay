@@ -108,15 +108,27 @@ def test_stax_native_lowering_handles_direct_conv2d_relu():
     assert tp.allclose(actual, fn(x, weight, bias))
 
 
-def test_stax_strict_native_never_reports_python_graph_executor_as_compiled():
+def test_stax_strict_native_never_reports_python_graph_executor_as_compiled(monkeypatch):
+    # A variance builds natively now; a region whose lowering fails must make
+    # a strict compile fail rather than run the graph as Python.
+    value = tp.tensor([[1.0, 2.0]])
+    built = tp.compile(lambda v: v.var(), backend="stax", fullgraph=True, strict_native=True)
+    assert built(value).item() == pytest.approx(0.5)
+
+    from tensorplay.compiler.backends.stax import graph_lowering
+
+    def no_built_form(self, *args):
+        raise NotImplementedError("no built form for this region")
+
+    monkeypatch.setattr(graph_lowering.GraphLowering, "run", no_built_form)
     compiled = tp.compile(
-        lambda value: value.var(),
+        lambda v: v.var() * 2,
         backend="stax",
         fullgraph=True,
         strict_native=True,
     )
     with pytest.raises(RuntimeError, match="strict_native|native Stax"):
-        compiled(tp.tensor([[1.0, 2.0]]))
+        compiled(value)
 
 
 def test_stax_fusion_lowers_to_p10_and_keeps_autograd():
