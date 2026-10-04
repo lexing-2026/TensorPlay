@@ -2761,9 +2761,14 @@ int64_t argmin_reduce_parallel(const scalar_t* data, int64_t n) {
 }
 
 // returns NaN when any element is NaN), plain compare otherwise.
+// The reduced-float types carry NaN payloads through their float conversions,
+// so the NaN rule covers them too; their vectorized maximum/minimum and the
+// dim-reduction kernels already propagate NaN, and the whole-tensor fold must
+// agree with both.
 template <typename T>
 inline T nan_max(T a, T b) {
-    if constexpr (std::is_floating_point_v<T>) {
+    if constexpr (std::is_floating_point_v<T> ||
+                  std::is_same_v<T, Half> || std::is_same_v<T, BFloat16>) {
         if (std::isnan(a) || std::isnan(b)) return std::numeric_limits<T>::quiet_NaN();
     }
     return a < b ? b : a;
@@ -2771,7 +2776,8 @@ inline T nan_max(T a, T b) {
 
 template <typename T>
 inline T nan_min(T a, T b) {
-    if constexpr (std::is_floating_point_v<T>) {
+    if constexpr (std::is_floating_point_v<T> ||
+                  std::is_same_v<T, Half> || std::is_same_v<T, BFloat16>) {
         if (std::isnan(a) || std::isnan(b)) return std::numeric_limits<T>::quiet_NaN();
     }
     return b < a ? b : a;
