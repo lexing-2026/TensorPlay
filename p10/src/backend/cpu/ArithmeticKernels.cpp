@@ -66,6 +66,14 @@ inline bool cpu_has_avx512() {
     return ok;
 }
 
+// Client cores without the 512-bit datapath still carry AVX2+FMA; the
+// broadcast kernels below run 256-bit loops there.
+inline bool cpu_has_avx2f() {
+    static const bool ok = __builtin_cpu_supports("avx2") != 0 &&
+                           __builtin_cpu_supports("fma") != 0;
+    return ok;
+}
+
 enum : int { BIN_ADD = 0, BIN_MUL = 1, BIN_DIV = 2 };
 
 __attribute__((target("avx512f,fma")))
@@ -237,19 +245,51 @@ void binary_f32_avx512_scalar_b(int code, const float* a, float b, float* y,
     const __m512 vb = _mm512_set1_ps(b);
     const __m512 valpha = _mm512_set1_ps(alpha);
     int64_t i = 0;
-    for (; i + 16 <= n; i += 16) {
-        __m512 x = _mm512_loadu_ps(a + i);
-        __m512 r;
-        switch (code) {
-            case BIN_ADD:
-                r = alpha == 1.0f   ? _mm512_add_ps(x, vb)
-                  : alpha == -1.0f  ? _mm512_sub_ps(x, vb)
-                                    : _mm512_fmadd_ps(valpha, vb, x);
-                break;
-            case BIN_MUL: r = _mm512_mul_ps(x, vb); break;
-            default:      r = _mm512_div_ps(x, vb); break;
+    // The op selection stays outside the streaming loop: a branch per vector
+    // costs issue slots at the rates these loops run.
+    if (code == BIN_MUL) {
+        for (; i + 32 <= n; i += 32) {
+            _mm512_storeu_ps(y + i, _mm512_mul_ps(_mm512_loadu_ps(a + i), vb));
+            _mm512_storeu_ps(y + i + 16,
+                             _mm512_mul_ps(_mm512_loadu_ps(a + i + 16), vb));
         }
-        _mm512_storeu_ps(y + i, r);
+        for (; i + 16 <= n; i += 16)
+            _mm512_storeu_ps(y + i, _mm512_mul_ps(_mm512_loadu_ps(a + i), vb));
+    } else if (code == BIN_DIV) {
+        for (; i + 32 <= n; i += 32) {
+            _mm512_storeu_ps(y + i, _mm512_div_ps(_mm512_loadu_ps(a + i), vb));
+            _mm512_storeu_ps(y + i + 16,
+                             _mm512_div_ps(_mm512_loadu_ps(a + i + 16), vb));
+        }
+        for (; i + 16 <= n; i += 16)
+            _mm512_storeu_ps(y + i, _mm512_div_ps(_mm512_loadu_ps(a + i), vb));
+    } else if (alpha == 1.0f) {
+        for (; i + 32 <= n; i += 32) {
+            _mm512_storeu_ps(y + i, _mm512_add_ps(_mm512_loadu_ps(a + i), vb));
+            _mm512_storeu_ps(y + i + 16,
+                             _mm512_add_ps(_mm512_loadu_ps(a + i + 16), vb));
+        }
+        for (; i + 16 <= n; i += 16)
+            _mm512_storeu_ps(y + i, _mm512_add_ps(_mm512_loadu_ps(a + i), vb));
+    } else if (alpha == -1.0f) {
+        for (; i + 32 <= n; i += 32) {
+            _mm512_storeu_ps(y + i, _mm512_sub_ps(_mm512_loadu_ps(a + i), vb));
+            _mm512_storeu_ps(y + i + 16,
+                             _mm512_sub_ps(_mm512_loadu_ps(a + i + 16), vb));
+        }
+        for (; i + 16 <= n; i += 16)
+            _mm512_storeu_ps(y + i, _mm512_sub_ps(_mm512_loadu_ps(a + i), vb));
+    } else {
+        for (; i + 32 <= n; i += 32) {
+            _mm512_storeu_ps(
+                y + i, _mm512_fmadd_ps(valpha, vb, _mm512_loadu_ps(a + i)));
+            _mm512_storeu_ps(y + i + 16,
+                             _mm512_fmadd_ps(valpha, vb,
+                                             _mm512_loadu_ps(a + i + 16)));
+        }
+        for (; i + 16 <= n; i += 16)
+            _mm512_storeu_ps(
+                y + i, _mm512_fmadd_ps(valpha, vb, _mm512_loadu_ps(a + i)));
     }
     for (; i < n; ++i) {
         switch (code) {
@@ -266,19 +306,49 @@ void binary_f32_avx512_scalar_a(int code, float a, const float* b, float* y,
     const __m512 va = _mm512_set1_ps(a);
     const __m512 valpha = _mm512_set1_ps(alpha);
     int64_t i = 0;
-    for (; i + 16 <= n; i += 16) {
-        __m512 w = _mm512_loadu_ps(b + i);
-        __m512 r;
-        switch (code) {
-            case BIN_ADD:
-                r = alpha == 1.0f   ? _mm512_add_ps(va, w)
-                  : alpha == -1.0f  ? _mm512_sub_ps(va, w)
-                                    : _mm512_fmadd_ps(valpha, w, va);
-                break;
-            case BIN_MUL: r = _mm512_mul_ps(va, w); break;
-            default:      r = _mm512_div_ps(va, w); break;
+    if (code == BIN_MUL) {
+        for (; i + 32 <= n; i += 32) {
+            _mm512_storeu_ps(y + i, _mm512_mul_ps(va, _mm512_loadu_ps(b + i)));
+            _mm512_storeu_ps(y + i + 16,
+                             _mm512_mul_ps(va, _mm512_loadu_ps(b + i + 16)));
         }
-        _mm512_storeu_ps(y + i, r);
+        for (; i + 16 <= n; i += 16)
+            _mm512_storeu_ps(y + i, _mm512_mul_ps(va, _mm512_loadu_ps(b + i)));
+    } else if (code == BIN_DIV) {
+        for (; i + 32 <= n; i += 32) {
+            _mm512_storeu_ps(y + i, _mm512_div_ps(va, _mm512_loadu_ps(b + i)));
+            _mm512_storeu_ps(y + i + 16,
+                             _mm512_div_ps(va, _mm512_loadu_ps(b + i + 16)));
+        }
+        for (; i + 16 <= n; i += 16)
+            _mm512_storeu_ps(y + i, _mm512_div_ps(va, _mm512_loadu_ps(b + i)));
+    } else if (alpha == 1.0f) {
+        for (; i + 32 <= n; i += 32) {
+            _mm512_storeu_ps(y + i, _mm512_add_ps(va, _mm512_loadu_ps(b + i)));
+            _mm512_storeu_ps(y + i + 16,
+                             _mm512_add_ps(va, _mm512_loadu_ps(b + i + 16)));
+        }
+        for (; i + 16 <= n; i += 16)
+            _mm512_storeu_ps(y + i, _mm512_add_ps(va, _mm512_loadu_ps(b + i)));
+    } else if (alpha == -1.0f) {
+        for (; i + 32 <= n; i += 32) {
+            _mm512_storeu_ps(y + i, _mm512_sub_ps(va, _mm512_loadu_ps(b + i)));
+            _mm512_storeu_ps(y + i + 16,
+                             _mm512_sub_ps(va, _mm512_loadu_ps(b + i + 16)));
+        }
+        for (; i + 16 <= n; i += 16)
+            _mm512_storeu_ps(y + i, _mm512_sub_ps(va, _mm512_loadu_ps(b + i)));
+    } else {
+        for (; i + 32 <= n; i += 32) {
+            _mm512_storeu_ps(
+                y + i, _mm512_fmadd_ps(valpha, _mm512_loadu_ps(b + i), va));
+            _mm512_storeu_ps(y + i + 16,
+                             _mm512_fmadd_ps(valpha,
+                                             _mm512_loadu_ps(b + i + 16), va));
+        }
+        for (; i + 16 <= n; i += 16)
+            _mm512_storeu_ps(
+                y + i, _mm512_fmadd_ps(valpha, _mm512_loadu_ps(b + i), va));
     }
     for (; i < n; ++i) {
         switch (code) {
@@ -295,19 +365,49 @@ void binary_f64_avx512_scalar_b(int code, const double* a, double b, double* y,
     const __m512d vb = _mm512_set1_pd(b);
     const __m512d valpha = _mm512_set1_pd(alpha);
     int64_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        __m512d x = _mm512_loadu_pd(a + i);
-        __m512d r;
-        switch (code) {
-            case BIN_ADD:
-                r = alpha == 1.0   ? _mm512_add_pd(x, vb)
-                  : alpha == -1.0  ? _mm512_sub_pd(x, vb)
-                                   : _mm512_fmadd_pd(valpha, vb, x);
-                break;
-            case BIN_MUL: r = _mm512_mul_pd(x, vb); break;
-            default:      r = _mm512_div_pd(x, vb); break;
+    if (code == BIN_MUL) {
+        for (; i + 16 <= n; i += 16) {
+            _mm512_storeu_pd(y + i, _mm512_mul_pd(_mm512_loadu_pd(a + i), vb));
+            _mm512_storeu_pd(y + i + 8,
+                             _mm512_mul_pd(_mm512_loadu_pd(a + i + 8), vb));
         }
-        _mm512_storeu_pd(y + i, r);
+        for (; i + 8 <= n; i += 8)
+            _mm512_storeu_pd(y + i, _mm512_mul_pd(_mm512_loadu_pd(a + i), vb));
+    } else if (code == BIN_DIV) {
+        for (; i + 16 <= n; i += 16) {
+            _mm512_storeu_pd(y + i, _mm512_div_pd(_mm512_loadu_pd(a + i), vb));
+            _mm512_storeu_pd(y + i + 8,
+                             _mm512_div_pd(_mm512_loadu_pd(a + i + 8), vb));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm512_storeu_pd(y + i, _mm512_div_pd(_mm512_loadu_pd(a + i), vb));
+    } else if (alpha == 1.0) {
+        for (; i + 16 <= n; i += 16) {
+            _mm512_storeu_pd(y + i, _mm512_add_pd(_mm512_loadu_pd(a + i), vb));
+            _mm512_storeu_pd(y + i + 8,
+                             _mm512_add_pd(_mm512_loadu_pd(a + i + 8), vb));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm512_storeu_pd(y + i, _mm512_add_pd(_mm512_loadu_pd(a + i), vb));
+    } else if (alpha == -1.0) {
+        for (; i + 16 <= n; i += 16) {
+            _mm512_storeu_pd(y + i, _mm512_sub_pd(_mm512_loadu_pd(a + i), vb));
+            _mm512_storeu_pd(y + i + 8,
+                             _mm512_sub_pd(_mm512_loadu_pd(a + i + 8), vb));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm512_storeu_pd(y + i, _mm512_sub_pd(_mm512_loadu_pd(a + i), vb));
+    } else {
+        for (; i + 16 <= n; i += 16) {
+            _mm512_storeu_pd(
+                y + i, _mm512_fmadd_pd(valpha, vb, _mm512_loadu_pd(a + i)));
+            _mm512_storeu_pd(y + i + 8,
+                             _mm512_fmadd_pd(valpha, vb,
+                                             _mm512_loadu_pd(a + i + 8)));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm512_storeu_pd(
+                y + i, _mm512_fmadd_pd(valpha, vb, _mm512_loadu_pd(a + i)));
     }
     for (; i < n; ++i) {
         switch (code) {
@@ -324,19 +424,49 @@ void binary_f64_avx512_scalar_a(int code, double a, const double* b, double* y,
     const __m512d va = _mm512_set1_pd(a);
     const __m512d valpha = _mm512_set1_pd(alpha);
     int64_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        __m512d w = _mm512_loadu_pd(b + i);
-        __m512d r;
-        switch (code) {
-            case BIN_ADD:
-                r = alpha == 1.0   ? _mm512_add_pd(va, w)
-                  : alpha == -1.0  ? _mm512_sub_pd(va, w)
-                                   : _mm512_fmadd_pd(valpha, w, va);
-                break;
-            case BIN_MUL: r = _mm512_mul_pd(va, w); break;
-            default:      r = _mm512_div_pd(va, w); break;
+    if (code == BIN_MUL) {
+        for (; i + 16 <= n; i += 16) {
+            _mm512_storeu_pd(y + i, _mm512_mul_pd(va, _mm512_loadu_pd(b + i)));
+            _mm512_storeu_pd(y + i + 8,
+                             _mm512_mul_pd(va, _mm512_loadu_pd(b + i + 8)));
         }
-        _mm512_storeu_pd(y + i, r);
+        for (; i + 8 <= n; i += 8)
+            _mm512_storeu_pd(y + i, _mm512_mul_pd(va, _mm512_loadu_pd(b + i)));
+    } else if (code == BIN_DIV) {
+        for (; i + 16 <= n; i += 16) {
+            _mm512_storeu_pd(y + i, _mm512_div_pd(va, _mm512_loadu_pd(b + i)));
+            _mm512_storeu_pd(y + i + 8,
+                             _mm512_div_pd(va, _mm512_loadu_pd(b + i + 8)));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm512_storeu_pd(y + i, _mm512_div_pd(va, _mm512_loadu_pd(b + i)));
+    } else if (alpha == 1.0) {
+        for (; i + 16 <= n; i += 16) {
+            _mm512_storeu_pd(y + i, _mm512_add_pd(va, _mm512_loadu_pd(b + i)));
+            _mm512_storeu_pd(y + i + 8,
+                             _mm512_add_pd(va, _mm512_loadu_pd(b + i + 8)));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm512_storeu_pd(y + i, _mm512_add_pd(va, _mm512_loadu_pd(b + i)));
+    } else if (alpha == -1.0) {
+        for (; i + 16 <= n; i += 16) {
+            _mm512_storeu_pd(y + i, _mm512_sub_pd(va, _mm512_loadu_pd(b + i)));
+            _mm512_storeu_pd(y + i + 8,
+                             _mm512_sub_pd(va, _mm512_loadu_pd(b + i + 8)));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm512_storeu_pd(y + i, _mm512_sub_pd(va, _mm512_loadu_pd(b + i)));
+    } else {
+        for (; i + 16 <= n; i += 16) {
+            _mm512_storeu_pd(
+                y + i, _mm512_fmadd_pd(valpha, _mm512_loadu_pd(b + i), va));
+            _mm512_storeu_pd(y + i + 8,
+                             _mm512_fmadd_pd(valpha,
+                                             _mm512_loadu_pd(b + i + 8), va));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm512_storeu_pd(
+                y + i, _mm512_fmadd_pd(valpha, _mm512_loadu_pd(b + i), va));
     }
     for (; i < n; ++i) {
         switch (code) {
@@ -345,6 +475,457 @@ void binary_f64_avx512_scalar_a(int code, double a, const double* b, double* y,
             default:      y[i] = a / b[i]; break;
         }
     }
+}
+
+// --- 256-bit twins for hosts without the 512-bit datapath ------------------
+// Same shapes as the zmm kernels above; every branch is hoisted out of the
+// streaming loop and runs two-way unrolled.
+
+__attribute__((target("avx2,fma")))
+void binary_f32_avx256(int code, const float* a, const float* b, float* y,
+                       int64_t n, float alpha) {
+    const __m256 va = _mm256_set1_ps(alpha);
+    int64_t i = 0;
+    if (code == BIN_MUL) {
+        for (; i + 32 <= n; i += 32) {
+            _mm256_storeu_ps(y + i, _mm256_mul_ps(_mm256_loadu_ps(a + i),
+                                                  _mm256_loadu_ps(b + i)));
+            _mm256_storeu_ps(y + i + 8, _mm256_mul_ps(_mm256_loadu_ps(a + i + 8),
+                                                      _mm256_loadu_ps(b + i + 8)));
+            _mm256_storeu_ps(y + i + 16, _mm256_mul_ps(_mm256_loadu_ps(a + i + 16),
+                                                       _mm256_loadu_ps(b + i + 16)));
+            _mm256_storeu_ps(y + i + 24, _mm256_mul_ps(_mm256_loadu_ps(a + i + 24),
+                                                       _mm256_loadu_ps(b + i + 24)));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm256_storeu_ps(y + i, _mm256_mul_ps(_mm256_loadu_ps(a + i),
+                                                  _mm256_loadu_ps(b + i)));
+    } else if (code == BIN_DIV) {
+        for (; i + 32 <= n; i += 32) {
+            _mm256_storeu_ps(y + i, _mm256_div_ps(_mm256_loadu_ps(a + i),
+                                                  _mm256_loadu_ps(b + i)));
+            _mm256_storeu_ps(y + i + 8, _mm256_div_ps(_mm256_loadu_ps(a + i + 8),
+                                                      _mm256_loadu_ps(b + i + 8)));
+            _mm256_storeu_ps(y + i + 16, _mm256_div_ps(_mm256_loadu_ps(a + i + 16),
+                                                       _mm256_loadu_ps(b + i + 16)));
+            _mm256_storeu_ps(y + i + 24, _mm256_div_ps(_mm256_loadu_ps(a + i + 24),
+                                                       _mm256_loadu_ps(b + i + 24)));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm256_storeu_ps(y + i, _mm256_div_ps(_mm256_loadu_ps(a + i),
+                                                  _mm256_loadu_ps(b + i)));
+    } else if (alpha == 1.0f) {
+        for (; i + 32 <= n; i += 32) {
+            _mm256_storeu_ps(y + i, _mm256_add_ps(_mm256_loadu_ps(a + i),
+                                                  _mm256_loadu_ps(b + i)));
+            _mm256_storeu_ps(y + i + 8, _mm256_add_ps(_mm256_loadu_ps(a + i + 8),
+                                                      _mm256_loadu_ps(b + i + 8)));
+            _mm256_storeu_ps(y + i + 16, _mm256_add_ps(_mm256_loadu_ps(a + i + 16),
+                                                       _mm256_loadu_ps(b + i + 16)));
+            _mm256_storeu_ps(y + i + 24, _mm256_add_ps(_mm256_loadu_ps(a + i + 24),
+                                                       _mm256_loadu_ps(b + i + 24)));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm256_storeu_ps(y + i, _mm256_add_ps(_mm256_loadu_ps(a + i),
+                                                  _mm256_loadu_ps(b + i)));
+    } else if (alpha == -1.0f) {
+        for (; i + 32 <= n; i += 32) {
+            _mm256_storeu_ps(y + i, _mm256_sub_ps(_mm256_loadu_ps(a + i),
+                                                  _mm256_loadu_ps(b + i)));
+            _mm256_storeu_ps(y + i + 8, _mm256_sub_ps(_mm256_loadu_ps(a + i + 8),
+                                                      _mm256_loadu_ps(b + i + 8)));
+            _mm256_storeu_ps(y + i + 16, _mm256_sub_ps(_mm256_loadu_ps(a + i + 16),
+                                                       _mm256_loadu_ps(b + i + 16)));
+            _mm256_storeu_ps(y + i + 24, _mm256_sub_ps(_mm256_loadu_ps(a + i + 24),
+                                                       _mm256_loadu_ps(b + i + 24)));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm256_storeu_ps(y + i, _mm256_sub_ps(_mm256_loadu_ps(a + i),
+                                                  _mm256_loadu_ps(b + i)));
+    } else {
+        for (; i + 32 <= n; i += 32) {
+            _mm256_storeu_ps(y + i, _mm256_add_ps(_mm256_loadu_ps(a + i),
+                                                  _mm256_mul_ps(va, _mm256_loadu_ps(b + i))));
+            _mm256_storeu_ps(y + i + 8, _mm256_add_ps(_mm256_loadu_ps(a + i + 8),
+                                                      _mm256_mul_ps(va, _mm256_loadu_ps(b + i + 8))));
+            _mm256_storeu_ps(y + i + 16, _mm256_add_ps(_mm256_loadu_ps(a + i + 16),
+                                                       _mm256_mul_ps(va, _mm256_loadu_ps(b + i + 16))));
+            _mm256_storeu_ps(y + i + 24, _mm256_add_ps(_mm256_loadu_ps(a + i + 24),
+                                                       _mm256_mul_ps(va, _mm256_loadu_ps(b + i + 24))));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm256_storeu_ps(y + i, _mm256_add_ps(_mm256_loadu_ps(a + i),
+                                                  _mm256_mul_ps(va, _mm256_loadu_ps(b + i))));
+    }
+    for (; i < n; ++i) {
+        switch (code) {
+            case BIN_ADD: y[i] = a[i] + alpha * b[i]; break;
+            case BIN_MUL: y[i] = a[i] * b[i]; break;
+            default:      y[i] = a[i] / b[i]; break;
+        }
+    }
+}
+
+__attribute__((target("avx2,fma")))
+void binary_f64_avx256(int code, const double* a, const double* b, double* y,
+                       int64_t n, double alpha) {
+    const __m256d va = _mm256_set1_pd(alpha);
+    int64_t i = 0;
+    if (code == BIN_MUL) {
+        for (; i + 16 <= n; i += 16) {
+            _mm256_storeu_pd(y + i, _mm256_mul_pd(_mm256_loadu_pd(a + i),
+                                                  _mm256_loadu_pd(b + i)));
+            _mm256_storeu_pd(y + i + 4, _mm256_mul_pd(_mm256_loadu_pd(a + i + 4),
+                                                      _mm256_loadu_pd(b + i + 4)));
+            _mm256_storeu_pd(y + i + 8, _mm256_mul_pd(_mm256_loadu_pd(a + i + 8),
+                                                      _mm256_loadu_pd(b + i + 8)));
+            _mm256_storeu_pd(y + i + 12, _mm256_mul_pd(_mm256_loadu_pd(a + i + 12),
+                                                       _mm256_loadu_pd(b + i + 12)));
+        }
+        for (; i + 4 <= n; i += 4)
+            _mm256_storeu_pd(y + i, _mm256_mul_pd(_mm256_loadu_pd(a + i),
+                                                  _mm256_loadu_pd(b + i)));
+    } else if (code == BIN_DIV) {
+        for (; i + 16 <= n; i += 16) {
+            _mm256_storeu_pd(y + i, _mm256_div_pd(_mm256_loadu_pd(a + i),
+                                                  _mm256_loadu_pd(b + i)));
+            _mm256_storeu_pd(y + i + 4, _mm256_div_pd(_mm256_loadu_pd(a + i + 4),
+                                                      _mm256_loadu_pd(b + i + 4)));
+            _mm256_storeu_pd(y + i + 8, _mm256_div_pd(_mm256_loadu_pd(a + i + 8),
+                                                      _mm256_loadu_pd(b + i + 8)));
+            _mm256_storeu_pd(y + i + 12, _mm256_div_pd(_mm256_loadu_pd(a + i + 12),
+                                                       _mm256_loadu_pd(b + i + 12)));
+        }
+        for (; i + 4 <= n; i += 4)
+            _mm256_storeu_pd(y + i, _mm256_div_pd(_mm256_loadu_pd(a + i),
+                                                  _mm256_loadu_pd(b + i)));
+    } else if (alpha == 1.0) {
+        for (; i + 16 <= n; i += 16) {
+            _mm256_storeu_pd(y + i, _mm256_add_pd(_mm256_loadu_pd(a + i),
+                                                  _mm256_loadu_pd(b + i)));
+            _mm256_storeu_pd(y + i + 4, _mm256_add_pd(_mm256_loadu_pd(a + i + 4),
+                                                      _mm256_loadu_pd(b + i + 4)));
+            _mm256_storeu_pd(y + i + 8, _mm256_add_pd(_mm256_loadu_pd(a + i + 8),
+                                                      _mm256_loadu_pd(b + i + 8)));
+            _mm256_storeu_pd(y + i + 12, _mm256_add_pd(_mm256_loadu_pd(a + i + 12),
+                                                       _mm256_loadu_pd(b + i + 12)));
+        }
+        for (; i + 4 <= n; i += 4)
+            _mm256_storeu_pd(y + i, _mm256_add_pd(_mm256_loadu_pd(a + i),
+                                                  _mm256_loadu_pd(b + i)));
+    } else if (alpha == -1.0) {
+        for (; i + 16 <= n; i += 16) {
+            _mm256_storeu_pd(y + i, _mm256_sub_pd(_mm256_loadu_pd(a + i),
+                                                  _mm256_loadu_pd(b + i)));
+            _mm256_storeu_pd(y + i + 4, _mm256_sub_pd(_mm256_loadu_pd(a + i + 4),
+                                                      _mm256_loadu_pd(b + i + 4)));
+            _mm256_storeu_pd(y + i + 8, _mm256_sub_pd(_mm256_loadu_pd(a + i + 8),
+                                                      _mm256_loadu_pd(b + i + 8)));
+            _mm256_storeu_pd(y + i + 12, _mm256_sub_pd(_mm256_loadu_pd(a + i + 12),
+                                                       _mm256_loadu_pd(b + i + 12)));
+        }
+        for (; i + 4 <= n; i += 4)
+            _mm256_storeu_pd(y + i, _mm256_sub_pd(_mm256_loadu_pd(a + i),
+                                                  _mm256_loadu_pd(b + i)));
+    } else {
+        for (; i + 16 <= n; i += 16) {
+            _mm256_storeu_pd(y + i, _mm256_add_pd(_mm256_loadu_pd(a + i),
+                                                  _mm256_mul_pd(va, _mm256_loadu_pd(b + i))));
+            _mm256_storeu_pd(y + i + 4, _mm256_add_pd(_mm256_loadu_pd(a + i + 4),
+                                                      _mm256_mul_pd(va, _mm256_loadu_pd(b + i + 4))));
+            _mm256_storeu_pd(y + i + 8, _mm256_add_pd(_mm256_loadu_pd(a + i + 8),
+                                                      _mm256_mul_pd(va, _mm256_loadu_pd(b + i + 8))));
+            _mm256_storeu_pd(y + i + 12, _mm256_add_pd(_mm256_loadu_pd(a + i + 12),
+                                                       _mm256_mul_pd(va, _mm256_loadu_pd(b + i + 12))));
+        }
+        for (; i + 4 <= n; i += 4)
+            _mm256_storeu_pd(y + i, _mm256_add_pd(_mm256_loadu_pd(a + i),
+                                                  _mm256_mul_pd(va, _mm256_loadu_pd(b + i))));
+    }
+    for (; i < n; ++i) {
+        switch (code) {
+            case BIN_ADD: y[i] = a[i] + alpha * b[i]; break;
+            case BIN_MUL: y[i] = a[i] * b[i]; break;
+            default:      y[i] = a[i] / b[i]; break;
+        }
+    }
+}
+
+__attribute__((target("avx2,fma")))
+void binary_f32_avx256_scalar_b(int code, const float* a, float b, float* y,
+                                int64_t n, float alpha) {
+    const __m256 vb = _mm256_set1_ps(b);
+    const __m256 valpha = _mm256_set1_ps(alpha);
+    int64_t i = 0;
+    if (code == BIN_MUL) {
+        for (; i + 32 <= n; i += 32) {
+            _mm256_storeu_ps(y + i, _mm256_mul_ps(_mm256_loadu_ps(a + i), vb));
+            _mm256_storeu_ps(y + i + 8, _mm256_mul_ps(_mm256_loadu_ps(a + i + 8), vb));
+            _mm256_storeu_ps(y + i + 16, _mm256_mul_ps(_mm256_loadu_ps(a + i + 16), vb));
+            _mm256_storeu_ps(y + i + 24, _mm256_mul_ps(_mm256_loadu_ps(a + i + 24), vb));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm256_storeu_ps(y + i, _mm256_mul_ps(_mm256_loadu_ps(a + i), vb));
+    } else if (code == BIN_DIV) {
+        for (; i + 32 <= n; i += 32) {
+            _mm256_storeu_ps(y + i, _mm256_div_ps(_mm256_loadu_ps(a + i), vb));
+            _mm256_storeu_ps(y + i + 8, _mm256_div_ps(_mm256_loadu_ps(a + i + 8), vb));
+            _mm256_storeu_ps(y + i + 16, _mm256_div_ps(_mm256_loadu_ps(a + i + 16), vb));
+            _mm256_storeu_ps(y + i + 24, _mm256_div_ps(_mm256_loadu_ps(a + i + 24), vb));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm256_storeu_ps(y + i, _mm256_div_ps(_mm256_loadu_ps(a + i), vb));
+    } else if (alpha == 1.0f) {
+        for (; i + 32 <= n; i += 32) {
+            _mm256_storeu_ps(y + i, _mm256_add_ps(_mm256_loadu_ps(a + i), vb));
+            _mm256_storeu_ps(y + i + 8, _mm256_add_ps(_mm256_loadu_ps(a + i + 8), vb));
+            _mm256_storeu_ps(y + i + 16, _mm256_add_ps(_mm256_loadu_ps(a + i + 16), vb));
+            _mm256_storeu_ps(y + i + 24, _mm256_add_ps(_mm256_loadu_ps(a + i + 24), vb));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm256_storeu_ps(y + i, _mm256_add_ps(_mm256_loadu_ps(a + i), vb));
+    } else if (alpha == -1.0f) {
+        for (; i + 32 <= n; i += 32) {
+            _mm256_storeu_ps(y + i, _mm256_sub_ps(_mm256_loadu_ps(a + i), vb));
+            _mm256_storeu_ps(y + i + 8, _mm256_sub_ps(_mm256_loadu_ps(a + i + 8), vb));
+            _mm256_storeu_ps(y + i + 16, _mm256_sub_ps(_mm256_loadu_ps(a + i + 16), vb));
+            _mm256_storeu_ps(y + i + 24, _mm256_sub_ps(_mm256_loadu_ps(a + i + 24), vb));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm256_storeu_ps(y + i, _mm256_sub_ps(_mm256_loadu_ps(a + i), vb));
+    } else {
+        for (; i + 32 <= n; i += 32) {
+            _mm256_storeu_ps(y + i, _mm256_fmadd_ps(valpha, vb, _mm256_loadu_ps(a + i)));
+            _mm256_storeu_ps(y + i + 8, _mm256_fmadd_ps(valpha, vb, _mm256_loadu_ps(a + i + 8)));
+            _mm256_storeu_ps(y + i + 16, _mm256_fmadd_ps(valpha, vb, _mm256_loadu_ps(a + i + 16)));
+            _mm256_storeu_ps(y + i + 24, _mm256_fmadd_ps(valpha, vb, _mm256_loadu_ps(a + i + 24)));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm256_storeu_ps(y + i, _mm256_fmadd_ps(valpha, vb, _mm256_loadu_ps(a + i)));
+    }
+    for (; i < n; ++i) {
+        switch (code) {
+            case BIN_ADD: y[i] = a[i] + alpha * b; break;
+            case BIN_MUL: y[i] = a[i] * b; break;
+            default:      y[i] = a[i] / b; break;
+        }
+    }
+}
+
+__attribute__((target("avx2,fma")))
+void binary_f32_avx256_scalar_a(int code, float a, const float* b, float* y,
+                                int64_t n, float alpha) {
+    const __m256 va = _mm256_set1_ps(a);
+    const __m256 valpha = _mm256_set1_ps(alpha);
+    int64_t i = 0;
+    if (code == BIN_MUL) {
+        for (; i + 32 <= n; i += 32) {
+            _mm256_storeu_ps(y + i, _mm256_mul_ps(va, _mm256_loadu_ps(b + i)));
+            _mm256_storeu_ps(y + i + 8, _mm256_mul_ps(va, _mm256_loadu_ps(b + i + 8)));
+            _mm256_storeu_ps(y + i + 16, _mm256_mul_ps(va, _mm256_loadu_ps(b + i + 16)));
+            _mm256_storeu_ps(y + i + 24, _mm256_mul_ps(va, _mm256_loadu_ps(b + i + 24)));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm256_storeu_ps(y + i, _mm256_mul_ps(va, _mm256_loadu_ps(b + i)));
+    } else if (code == BIN_DIV) {
+        for (; i + 32 <= n; i += 32) {
+            _mm256_storeu_ps(y + i, _mm256_div_ps(va, _mm256_loadu_ps(b + i)));
+            _mm256_storeu_ps(y + i + 8, _mm256_div_ps(va, _mm256_loadu_ps(b + i + 8)));
+            _mm256_storeu_ps(y + i + 16, _mm256_div_ps(va, _mm256_loadu_ps(b + i + 16)));
+            _mm256_storeu_ps(y + i + 24, _mm256_div_ps(va, _mm256_loadu_ps(b + i + 24)));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm256_storeu_ps(y + i, _mm256_div_ps(va, _mm256_loadu_ps(b + i)));
+    } else if (alpha == 1.0f) {
+        for (; i + 32 <= n; i += 32) {
+            _mm256_storeu_ps(y + i, _mm256_add_ps(va, _mm256_loadu_ps(b + i)));
+            _mm256_storeu_ps(y + i + 8, _mm256_add_ps(va, _mm256_loadu_ps(b + i + 8)));
+            _mm256_storeu_ps(y + i + 16, _mm256_add_ps(va, _mm256_loadu_ps(b + i + 16)));
+            _mm256_storeu_ps(y + i + 24, _mm256_add_ps(va, _mm256_loadu_ps(b + i + 24)));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm256_storeu_ps(y + i, _mm256_add_ps(va, _mm256_loadu_ps(b + i)));
+    } else if (alpha == -1.0f) {
+        for (; i + 32 <= n; i += 32) {
+            _mm256_storeu_ps(y + i, _mm256_sub_ps(va, _mm256_loadu_ps(b + i)));
+            _mm256_storeu_ps(y + i + 8, _mm256_sub_ps(va, _mm256_loadu_ps(b + i + 8)));
+            _mm256_storeu_ps(y + i + 16, _mm256_sub_ps(va, _mm256_loadu_ps(b + i + 16)));
+            _mm256_storeu_ps(y + i + 24, _mm256_sub_ps(va, _mm256_loadu_ps(b + i + 24)));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm256_storeu_ps(y + i, _mm256_sub_ps(va, _mm256_loadu_ps(b + i)));
+    } else {
+        for (; i + 32 <= n; i += 32) {
+            _mm256_storeu_ps(y + i, _mm256_fmadd_ps(valpha, _mm256_loadu_ps(b + i), va));
+            _mm256_storeu_ps(y + i + 8, _mm256_fmadd_ps(valpha, _mm256_loadu_ps(b + i + 8), va));
+            _mm256_storeu_ps(y + i + 16, _mm256_fmadd_ps(valpha, _mm256_loadu_ps(b + i + 16), va));
+            _mm256_storeu_ps(y + i + 24, _mm256_fmadd_ps(valpha, _mm256_loadu_ps(b + i + 24), va));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm256_storeu_ps(y + i, _mm256_fmadd_ps(valpha, _mm256_loadu_ps(b + i), va));
+    }
+    for (; i < n; ++i) {
+        switch (code) {
+            case BIN_ADD: y[i] = a + alpha * b[i]; break;
+            case BIN_MUL: y[i] = a * b[i]; break;
+            default:      y[i] = a / b[i]; break;
+        }
+    }
+}
+
+__attribute__((target("avx2,fma")))
+void binary_f64_avx256_scalar_b(int code, const double* a, double b, double* y,
+                                int64_t n, double alpha) {
+    const __m256d vb = _mm256_set1_pd(b);
+    const __m256d valpha = _mm256_set1_pd(alpha);
+    int64_t i = 0;
+    if (code == BIN_MUL) {
+        for (; i + 16 <= n; i += 16) {
+            _mm256_storeu_pd(y + i, _mm256_mul_pd(_mm256_loadu_pd(a + i), vb));
+            _mm256_storeu_pd(y + i + 4, _mm256_mul_pd(_mm256_loadu_pd(a + i + 4), vb));
+            _mm256_storeu_pd(y + i + 8, _mm256_mul_pd(_mm256_loadu_pd(a + i + 8), vb));
+            _mm256_storeu_pd(y + i + 12, _mm256_mul_pd(_mm256_loadu_pd(a + i + 12), vb));
+        }
+        for (; i + 4 <= n; i += 4)
+            _mm256_storeu_pd(y + i, _mm256_mul_pd(_mm256_loadu_pd(a + i), vb));
+    } else if (code == BIN_DIV) {
+        for (; i + 16 <= n; i += 16) {
+            _mm256_storeu_pd(y + i, _mm256_div_pd(_mm256_loadu_pd(a + i), vb));
+            _mm256_storeu_pd(y + i + 4, _mm256_div_pd(_mm256_loadu_pd(a + i + 4), vb));
+            _mm256_storeu_pd(y + i + 8, _mm256_div_pd(_mm256_loadu_pd(a + i + 8), vb));
+            _mm256_storeu_pd(y + i + 12, _mm256_div_pd(_mm256_loadu_pd(a + i + 12), vb));
+        }
+        for (; i + 4 <= n; i += 4)
+            _mm256_storeu_pd(y + i, _mm256_div_pd(_mm256_loadu_pd(a + i), vb));
+    } else if (alpha == 1.0) {
+        for (; i + 16 <= n; i += 16) {
+            _mm256_storeu_pd(y + i, _mm256_add_pd(_mm256_loadu_pd(a + i), vb));
+            _mm256_storeu_pd(y + i + 4, _mm256_add_pd(_mm256_loadu_pd(a + i + 4), vb));
+            _mm256_storeu_pd(y + i + 8, _mm256_add_pd(_mm256_loadu_pd(a + i + 8), vb));
+            _mm256_storeu_pd(y + i + 12, _mm256_add_pd(_mm256_loadu_pd(a + i + 12), vb));
+        }
+        for (; i + 4 <= n; i += 4)
+            _mm256_storeu_pd(y + i, _mm256_add_pd(_mm256_loadu_pd(a + i), vb));
+    } else if (alpha == -1.0) {
+        for (; i + 16 <= n; i += 16) {
+            _mm256_storeu_pd(y + i, _mm256_sub_pd(_mm256_loadu_pd(a + i), vb));
+            _mm256_storeu_pd(y + i + 4, _mm256_sub_pd(_mm256_loadu_pd(a + i + 4), vb));
+            _mm256_storeu_pd(y + i + 8, _mm256_sub_pd(_mm256_loadu_pd(a + i + 8), vb));
+            _mm256_storeu_pd(y + i + 12, _mm256_sub_pd(_mm256_loadu_pd(a + i + 12), vb));
+        }
+        for (; i + 4 <= n; i += 4)
+            _mm256_storeu_pd(y + i, _mm256_sub_pd(_mm256_loadu_pd(a + i), vb));
+    } else {
+        for (; i + 16 <= n; i += 16) {
+            _mm256_storeu_pd(y + i, _mm256_fmadd_pd(valpha, vb, _mm256_loadu_pd(a + i)));
+            _mm256_storeu_pd(y + i + 4, _mm256_fmadd_pd(valpha, vb, _mm256_loadu_pd(a + i + 4)));
+            _mm256_storeu_pd(y + i + 8, _mm256_fmadd_pd(valpha, vb, _mm256_loadu_pd(a + i + 8)));
+            _mm256_storeu_pd(y + i + 12, _mm256_fmadd_pd(valpha, vb, _mm256_loadu_pd(a + i + 12)));
+        }
+        for (; i + 4 <= n; i += 4)
+            _mm256_storeu_pd(y + i, _mm256_fmadd_pd(valpha, vb, _mm256_loadu_pd(a + i)));
+    }
+    for (; i < n; ++i) {
+        switch (code) {
+            case BIN_ADD: y[i] = a[i] + alpha * b; break;
+            case BIN_MUL: y[i] = a[i] * b; break;
+            default:      y[i] = a[i] / b; break;
+        }
+    }
+}
+
+__attribute__((target("avx2,fma")))
+void binary_f64_avx256_scalar_a(int code, double a, const double* b, double* y,
+                                int64_t n, double alpha) {
+    const __m256d va = _mm256_set1_pd(a);
+    const __m256d valpha = _mm256_set1_pd(alpha);
+    int64_t i = 0;
+    if (code == BIN_MUL) {
+        for (; i + 16 <= n; i += 16) {
+            _mm256_storeu_pd(y + i, _mm256_mul_pd(va, _mm256_loadu_pd(b + i)));
+            _mm256_storeu_pd(y + i + 4, _mm256_mul_pd(va, _mm256_loadu_pd(b + i + 4)));
+            _mm256_storeu_pd(y + i + 8, _mm256_mul_pd(va, _mm256_loadu_pd(b + i + 8)));
+            _mm256_storeu_pd(y + i + 12, _mm256_mul_pd(va, _mm256_loadu_pd(b + i + 12)));
+        }
+        for (; i + 4 <= n; i += 4)
+            _mm256_storeu_pd(y + i, _mm256_mul_pd(va, _mm256_loadu_pd(b + i)));
+    } else if (code == BIN_DIV) {
+        for (; i + 16 <= n; i += 16) {
+            _mm256_storeu_pd(y + i, _mm256_div_pd(va, _mm256_loadu_pd(b + i)));
+            _mm256_storeu_pd(y + i + 4, _mm256_div_pd(va, _mm256_loadu_pd(b + i + 4)));
+            _mm256_storeu_pd(y + i + 8, _mm256_div_pd(va, _mm256_loadu_pd(b + i + 8)));
+            _mm256_storeu_pd(y + i + 12, _mm256_div_pd(va, _mm256_loadu_pd(b + i + 12)));
+        }
+        for (; i + 4 <= n; i += 4)
+            _mm256_storeu_pd(y + i, _mm256_div_pd(va, _mm256_loadu_pd(b + i)));
+    } else if (alpha == 1.0) {
+        for (; i + 16 <= n; i += 16) {
+            _mm256_storeu_pd(y + i, _mm256_add_pd(va, _mm256_loadu_pd(b + i)));
+            _mm256_storeu_pd(y + i + 4, _mm256_add_pd(va, _mm256_loadu_pd(b + i + 4)));
+            _mm256_storeu_pd(y + i + 8, _mm256_add_pd(va, _mm256_loadu_pd(b + i + 8)));
+            _mm256_storeu_pd(y + i + 12, _mm256_add_pd(va, _mm256_loadu_pd(b + i + 12)));
+        }
+        for (; i + 4 <= n; i += 4)
+            _mm256_storeu_pd(y + i, _mm256_add_pd(va, _mm256_loadu_pd(b + i)));
+    } else if (alpha == -1.0) {
+        for (; i + 16 <= n; i += 16) {
+            _mm256_storeu_pd(y + i, _mm256_sub_pd(va, _mm256_loadu_pd(b + i)));
+            _mm256_storeu_pd(y + i + 4, _mm256_sub_pd(va, _mm256_loadu_pd(b + i + 4)));
+            _mm256_storeu_pd(y + i + 8, _mm256_sub_pd(va, _mm256_loadu_pd(b + i + 8)));
+            _mm256_storeu_pd(y + i + 12, _mm256_sub_pd(va, _mm256_loadu_pd(b + i + 12)));
+        }
+        for (; i + 4 <= n; i += 4)
+            _mm256_storeu_pd(y + i, _mm256_sub_pd(va, _mm256_loadu_pd(b + i)));
+    } else {
+        for (; i + 16 <= n; i += 16) {
+            _mm256_storeu_pd(y + i, _mm256_fmadd_pd(valpha, _mm256_loadu_pd(b + i), va));
+            _mm256_storeu_pd(y + i + 4, _mm256_fmadd_pd(valpha, _mm256_loadu_pd(b + i + 4), va));
+            _mm256_storeu_pd(y + i + 8, _mm256_fmadd_pd(valpha, _mm256_loadu_pd(b + i + 8), va));
+            _mm256_storeu_pd(y + i + 12, _mm256_fmadd_pd(valpha, _mm256_loadu_pd(b + i + 12), va));
+        }
+        for (; i + 4 <= n; i += 4)
+            _mm256_storeu_pd(y + i, _mm256_fmadd_pd(valpha, _mm256_loadu_pd(b + i), va));
+    }
+    for (; i < n; ++i) {
+        switch (code) {
+            case BIN_ADD: y[i] = a + alpha * b[i]; break;
+            case BIN_MUL: y[i] = a * b[i]; break;
+            default:      y[i] = a / b[i]; break;
+        }
+    }
+}
+
+// ISA selectors: keep every TensorIterator branch ISA-agnostic by picking
+// the widest kernel the host actually runs.
+static void binary_f32_vec(int code, const float* a, const float* b, float* y,
+                           int64_t n, float alpha) {
+    if (cpu_has_avx512()) binary_f32_avx512(code, a, b, y, n, alpha);
+    else binary_f32_avx256(code, a, b, y, n, alpha);
+}
+static void binary_f32_vec_scalar_b(int code, const float* a, float b, float* y,
+                                    int64_t n, float alpha) {
+    if (cpu_has_avx512()) binary_f32_avx512_scalar_b(code, a, b, y, n, alpha);
+    else binary_f32_avx256_scalar_b(code, a, b, y, n, alpha);
+}
+static void binary_f32_vec_scalar_a(int code, float a, const float* b, float* y,
+                                    int64_t n, float alpha) {
+    if (cpu_has_avx512()) binary_f32_avx512_scalar_a(code, a, b, y, n, alpha);
+    else binary_f32_avx256_scalar_a(code, a, b, y, n, alpha);
+}
+static void binary_f64_vec(int code, const double* a, const double* b, double* y,
+                           int64_t n, double alpha) {
+    if (cpu_has_avx512()) binary_f64_avx512(code, a, b, y, n, alpha);
+    else binary_f64_avx256(code, a, b, y, n, alpha);
+}
+static void binary_f64_vec_scalar_b(int code, const double* a, double b, double* y,
+                                    int64_t n, double alpha) {
+    if (cpu_has_avx512()) binary_f64_avx512_scalar_b(code, a, b, y, n, alpha);
+    else binary_f64_avx256_scalar_b(code, a, b, y, n, alpha);
+}
+static void binary_f64_vec_scalar_a(int code, double a, const double* b, double* y,
+                                    int64_t n, double alpha) {
+    if (cpu_has_avx512()) binary_f64_avx512_scalar_a(code, a, b, y, n, alpha);
+    else binary_f64_avx256_scalar_a(code, a, b, y, n, alpha);
 }
 
 // TensorIterator's native CPU kernels parallelize contiguous scalar and
@@ -628,7 +1209,7 @@ Tensor binary_op_kernel_impl(const Tensor& self, const Tensor& other, Op op, Mkl
         // per-operand strides, and a zero stride is a value constant along
         // the run (a broadcast operand), which the vector kernels accept as
         // a scalar.  Everything else keeps the generic iterator loop below.
-        if (vec_code >= 0 && cpu_has_avx512() &&
+        if (vec_code >= 0 && cpu_has_avx2f() &&
             (result_dtype == DType::Float32 || result_dtype == DType::Float64)) {
             const bool is_f32 = (result_dtype == DType::Float32);
             TensorIterator iter = TensorIterator::binary_op(result, self_casted, other_casted);
@@ -638,11 +1219,11 @@ Tensor binary_op_kernel_impl(const Tensor& self, const Tensor& other, Op op, Mkl
                     const float* a = reinterpret_cast<const float*>(data[1]);
                     const float* b = reinterpret_cast<const float*>(data[2]);
                     if (strides[0] == 4 && strides[1] == 4 && strides[2] == 4) {
-                        binary_f32_avx512(vec_code, a, b, r, n, 1.0f);
+                        binary_f32_vec(vec_code, a, b, r, n, 1.0f);
                     } else if (strides[0] == 4 && strides[1] == 4 && strides[2] == 0) {
-                        binary_f32_avx512_scalar_b(vec_code, a, *b, r, n, 1.0f);
+                        binary_f32_vec_scalar_b(vec_code, a, *b, r, n, 1.0f);
                     } else if (strides[0] == 4 && strides[1] == 0 && strides[2] == 4) {
-                        binary_f32_avx512_scalar_a(vec_code, *a, b, r, n, 1.0f);
+                        binary_f32_vec_scalar_a(vec_code, *a, b, r, n, 1.0f);
                     } else if (strides[0] == 4 && strides[1] == 0 && strides[2] == 0) {
                         const float va = *a, vb = *b;
                         for (int64_t i = 0; i < n; ++i)
@@ -662,11 +1243,11 @@ Tensor binary_op_kernel_impl(const Tensor& self, const Tensor& other, Op op, Mkl
                     const double* a = reinterpret_cast<const double*>(data[1]);
                     const double* b = reinterpret_cast<const double*>(data[2]);
                     if (strides[0] == 8 && strides[1] == 8 && strides[2] == 8) {
-                        binary_f64_avx512(vec_code, a, b, r, n, 1.0);
+                        binary_f64_vec(vec_code, a, b, r, n, 1.0);
                     } else if (strides[0] == 8 && strides[1] == 8 && strides[2] == 0) {
-                        binary_f64_avx512_scalar_b(vec_code, a, *b, r, n, 1.0);
+                        binary_f64_vec_scalar_b(vec_code, a, *b, r, n, 1.0);
                     } else if (strides[0] == 8 && strides[1] == 0 && strides[2] == 8) {
-                        binary_f64_avx512_scalar_a(vec_code, *a, b, r, n, 1.0);
+                        binary_f64_vec_scalar_a(vec_code, *a, b, r, n, 1.0);
                     } else if (strides[0] == 8 && strides[1] == 0 && strides[2] == 0) {
                         const double va = *a, vb = *b;
                         for (int64_t i = 0; i < n; ++i)
@@ -831,25 +1412,25 @@ bool try_add_tensor_iterator_out(const Tensor& self, const Tensor& other,
         TensorIterator::binary_op(out, self_casted, other_casted);
 
 #if defined(__x86_64__)
-    if (result_dtype == DType::Float32 && cpu_has_avx512()) {
+    if (result_dtype == DType::Float32 && cpu_has_avx2f()) {
         const float alpha_val = alpha.to<float>();
         iter.for_each([&](char** data, const int64_t* strides, int64_t n) {
             if (strides[0] == 4 && strides[1] == 4 && strides[2] == 4) {
-                binary_f32_avx512(
+                binary_f32_vec(
                     BIN_ADD, reinterpret_cast<const float*>(data[1]),
                     reinterpret_cast<const float*>(data[2]),
                     reinterpret_cast<float*>(data[0]), n, alpha_val);
                 return;
             }
             if (strides[0] == 4 && strides[1] == 4 && strides[2] == 0) {
-                binary_f32_avx512_scalar_b(
+                binary_f32_vec_scalar_b(
                     BIN_ADD, reinterpret_cast<const float*>(data[1]),
                     *reinterpret_cast<const float*>(data[2]),
                     reinterpret_cast<float*>(data[0]), n, alpha_val);
                 return;
             }
             if (strides[0] == 4 && strides[1] == 0 && strides[2] == 4) {
-                binary_f32_avx512_scalar_a(
+                binary_f32_vec_scalar_a(
                     BIN_ADD, *reinterpret_cast<const float*>(data[1]),
                     reinterpret_cast<const float*>(data[2]),
                     reinterpret_cast<float*>(data[0]), n, alpha_val);
@@ -1340,23 +1921,23 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) 
         // whose strides all equal the element size vectorize exactly like the
         // same-shape path.  This is the bias-add pattern ((N,G)+(G,)) that
         // the RNN cells hit at every timestep; the scalar run loop below was
-        if (result_dtype == DType::Float32 && cpu_has_avx512()) {
+        if (result_dtype == DType::Float32 && cpu_has_avx2f()) {
             const float alpha_val = alpha.to<float>();
             iter.for_each([&](char** data, const int64_t* strides, int64_t n) {
                 if (strides[0] == 4 && strides[1] == 4 && strides[2] == 4) {
-                    binary_f32_avx512(BIN_ADD,
+                    binary_f32_vec(BIN_ADD,
                                       reinterpret_cast<const float*>(data[1]),
                                       reinterpret_cast<const float*>(data[2]),
                                       reinterpret_cast<float*>(data[0]),
                                       n, alpha_val);
                 } else if (strides[0] == 4 && strides[1] == 4 && strides[2] == 0) {
-                    binary_f32_avx512_scalar_b(BIN_ADD,
+                    binary_f32_vec_scalar_b(BIN_ADD,
                                                reinterpret_cast<const float*>(data[1]),
                                                *reinterpret_cast<const float*>(data[2]),
                                                reinterpret_cast<float*>(data[0]),
                                                n, alpha_val);
                 } else if (strides[0] == 4 && strides[1] == 0 && strides[2] == 4) {
-                    binary_f32_avx512_scalar_a(BIN_ADD,
+                    binary_f32_vec_scalar_a(BIN_ADD,
                                                *reinterpret_cast<const float*>(data[1]),
                                                reinterpret_cast<const float*>(data[2]),
                                                reinterpret_cast<float*>(data[0]),
@@ -1375,23 +1956,23 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) 
         // Broadcast float64 add: same-shape dense runs took the AVX-512 path
         // above, so what reaches the iterator here is exactly the
         // broadcast/strided residue.
-        if (!optimized && result_dtype == DType::Float64 && cpu_has_avx512()) {
+        if (!optimized && result_dtype == DType::Float64 && cpu_has_avx2f()) {
             const double alpha_val = alpha.toDouble();
             iter.for_each([&](char** data, const int64_t* strides, int64_t n) {
                 if (strides[0] == 8 && strides[1] == 8 && strides[2] == 8) {
-                    binary_f64_avx512(BIN_ADD,
+                    binary_f64_vec(BIN_ADD,
                                       reinterpret_cast<const double*>(data[1]),
                                       reinterpret_cast<const double*>(data[2]),
                                       reinterpret_cast<double*>(data[0]),
                                       n, alpha_val);
                 } else if (strides[0] == 8 && strides[1] == 8 && strides[2] == 0) {
-                    binary_f64_avx512_scalar_b(BIN_ADD,
+                    binary_f64_vec_scalar_b(BIN_ADD,
                                                reinterpret_cast<const double*>(data[1]),
                                                *reinterpret_cast<const double*>(data[2]),
                                                reinterpret_cast<double*>(data[0]),
                                                n, alpha_val);
                 } else if (strides[0] == 8 && strides[1] == 0 && strides[2] == 8) {
-                    binary_f64_avx512_scalar_a(BIN_ADD,
+                    binary_f64_vec_scalar_a(BIN_ADD,
                                                *reinterpret_cast<const double*>(data[1]),
                                                reinterpret_cast<const double*>(data[2]),
                                                reinterpret_cast<double*>(data[0]),
