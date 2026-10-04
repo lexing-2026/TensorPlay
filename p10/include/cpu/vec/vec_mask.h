@@ -119,7 +119,11 @@ class VecMask {
       return static_cast<bool>(b);
     } else {
       using int_t = int_same_size_t<T>;
-      return b ? static_cast<T>(static_cast<int_t>(-1)) : static_cast<T>(0);
+      // A lane is a mask only when its bits are all ones or all zeros:
+      // bitwise complement, AND, OR and XOR then stay masks.  The value
+      // reinterpretation of -1 would not (it is -1.0f for float, whose
+      // complemented bits are neither zero nor all ones).
+      return b ? std::bit_cast<T>(static_cast<int_t>(-1)) : static_cast<T>(0);
     }
   }
 
