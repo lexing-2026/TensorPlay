@@ -8776,6 +8776,7 @@ class TritonScheduling(SIMDScheduling):
     backend_features = OrderedSet(
         [
             BackendFeature.FOREACH,
+            BackendFeature.BUCKETIZE,
             BackendFeature.INPLACE_BUFFERS,
             BackendFeature.MASKED_SCATTER_WITH_INDEX,
             BackendFeature.SCAN,

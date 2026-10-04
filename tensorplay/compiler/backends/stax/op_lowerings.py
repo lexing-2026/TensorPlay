@@ -1824,6 +1824,38 @@ for _op in ("logical_and", "logical_or", "logical_xor"):
     LOWERINGS[f"{_op}.default"] = _binary_on(_op, real=False, out_bool=True, to_bool=True)
 
 
+@register_lowering(tp_ops.ldexp, broadcast=True, type_promotion_kind=None)
+def lower_ldexp(x, n):
+    """The value scaled by a power of two, with the exponent read from the other
+    input one place at a time.
+
+    An exponent that is a whole number is what the device's own scaling answers,
+    so it is asked for directly.  Any other pair falls back to a product with
+    two raised to the exponent, which is the same number written the long way.
+    """
+
+    x_dtype = x.get_dtype()
+    n_dtype = n.get_dtype() if hasattr(n, "get_dtype") else None
+    n_is_int = n_dtype is None or (not _is_real(n_dtype) and n_dtype != tp.bool)
+    if _is_real(x_dtype) and n_is_int:
+
+        def inner(value, exponent):
+            return ops.ldexp(value, exponent)
+
+        return pointwise(inner, x, n, out_dtype=x_dtype)
+
+    out_dtype = tp.float32 if is_integer_dtype(x_dtype) else x_dtype
+
+    def inner(value, exponent):
+        two = ops.constant(2.0, out_dtype)
+        return ops.mul(
+            ops.to_dtype(value, out_dtype),
+            ops.pow(two, ops.to_dtype(exponent, out_dtype)),
+        )
+
+    return pointwise(inner, x, n, out_dtype=out_dtype)
+
+
 def _scalar_const(value, like):
     return ops.constant(value, like.get_dtype() if _is_real(like.get_dtype()) else tp.float32)
 
@@ -8290,11 +8322,10 @@ for _name in ("segment_reduce", "_segment_reduce_backward"):
     if _op is not None:
         make_fallback(_op, warn=False)
 
-#: A search for where values would fall among ordered boundaries answers a
-#: question about a list this cannot read, and a scatter that reduces says which
-#: of several values landing on the same position wins -- which is a meaning
-#: rather than a walk.
-for _name in ("searchsorted", "scatter_reduce_"):
+#: A scatter that reduces says which of several values landing on the same
+#: position wins -- a meaning rather than a walk, which is why it is asked of
+#: the framework together rather than written here.
+for _name in ("scatter_reduce_",):
     _op = getattr(tp_ops, _name, None)
     if _op is None:
         continue
@@ -8304,6 +8335,202 @@ for _name in ("searchsorted", "scatter_reduce_"):
     )
     for _ov in _overloads:
         make_fallback(_ov, warn=False)
+
+
+# ---------------------------------------------------------------------------
+# searches among ordered boundaries
+# ---------------------------------------------------------------------------
+
+
+def _bucketize_lookup(tb: Any) -> Any:
+    """The ordered list as the search's walk reads it: one named buffer.
+
+    The walk addresses the list directly rather than loading it element by
+    element, so it has to stand in memory with a name and strides before the
+    search is written.
+    """
+
+    return TensorBox(ir.ExternKernel.realize_input(tb))
+
+
+def _bucketize_boundaries(tb: Any) -> Any:
+    """The ordered list's buffer, length, storage and stride, in one tuple."""
+
+    size = tb.get_size()
+    return (
+        tb.get_name(),
+        size[-1],
+        tb.get_layout().storage_size(),
+        tb.get_stride()[-1],
+    )
+
+
+def _bucketize_sorter(tb: Any) -> Any:
+    """The list's companion order, as a buffer and a stride along its last axis."""
+
+    return tb.get_name(), tb.get_stride()[-1]
+
+
+def _bucketize_indices(tb: Any, index: Any, index_dtype: Any) -> Any:
+    """Where one search starts reading inside the flattened list.
+
+    The leading positions of the output name which row of the list is being
+    read, so they fold into an offset along the list's own strides; the last
+    position of the output has no part in it, because the walk covers the whole
+    row however long it is.
+    """
+
+    strides = tb.get_stride()
+    flattened_index = tb.get_layout().offset + sum(
+        (s * i for s, i in zip(strides[:-1], index[:-1])), sympy.S.Zero
+    )
+    if not index and isinstance(flattened_index, sympy.Integer):
+        return int(flattened_index)
+    return ops.index_expr(flattened_index, index_dtype)
+
+
+searchsorted_fallback = fallback_handler(
+    tp_ops.searchsorted.Tensor, add_to_fallback_set=False
+)
+
+
+@register_lowering(tp_ops.searchsorted.Tensor, type_promotion_kind=None)
+def lower_searchsorted(
+    sorted_sequence: Any,
+    self: Any,
+    *,
+    out_int32: bool = False,
+    right: bool = False,
+    side: Any = None,
+    sorter: Any = None,
+) -> Any:
+    """For each value, the position it would keep in an ordered list.
+
+    Every answer is found by one walk of the same list, and a walk answers one
+    element at a time, so each element of the result is written as a search
+    rather than the whole answer being handed to the framework.  Whether a
+    value equal to a boundary belongs on its left or its right is part of what
+    was asked, and the side the caller named is the walk's own choice of edge.
+    """
+
+    if not (
+        V.graph.has_feature(sorted_sequence, BackendFeature.BUCKETIZE)
+        and V.graph.has_feature(self, BackendFeature.BUCKETIZE)
+        and (sorter is None or V.graph.has_feature(sorter, BackendFeature.BUCKETIZE))
+    ):
+        return searchsorted_fallback(
+            sorted_sequence,
+            self,
+            out_int32=out_int32,
+            right=right,
+            side=side,
+            sorter=sorter,
+        )
+
+    if side is not None and side == "right":
+        right = True
+
+    index_dtype = tp.int32 if out_int32 else tp.int64
+    values_loader = self.make_loader()
+
+    sorted_sequence = _bucketize_lookup(sorted_sequence)
+    if sorter is not None:
+        sorter = _bucketize_lookup(sorter)
+
+    boundaries = _bucketize_boundaries(sorted_sequence)
+    sorter_arg = None if sorter is None else _bucketize_sorter(sorter)
+
+    def walk(value: Any, index: Any) -> Any:
+        return ops.bucketize(
+            value,
+            boundaries,
+            _bucketize_indices(sorted_sequence, index, index_dtype),
+            index_dtype,
+            right,
+            sorter=sorter_arg,
+            sorter_indices=(
+                None
+                if sorter is None
+                else _bucketize_indices(sorter, index, index_dtype)
+            ),
+        )
+
+    if len(sorted_sequence.get_size()) == 1:
+        # One long row: every read starts at its head, whatever the output
+        # position is.
+        def inner_fn(index: Any) -> Any:
+            return walk(values_loader(index), ())
+
+    else:
+
+        def inner_fn(index: Any) -> Any:
+            return walk(values_loader(index), index)
+
+    result = ir.Pointwise.create(
+        device=self.get_device(),
+        dtype=index_dtype,
+        inner_fn=inner_fn,
+        ranges=self.get_size(),
+    )
+    # A walk of an ordered list is not cheap, and a result that is read many
+    # times -- a broadcast over it, say -- would walk once per read if it were
+    # left inside whatever reads it.  It is written to memory once instead.
+    result.realize()
+    return result
+
+
+bucketize_fallback = fallback_handler(tp_ops.bucketize.Tensor, add_to_fallback_set=False)
+
+
+@register_lowering(
+    tp_ops.bucketize.Tensor,
+    type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.NO_OPMATH,
+)
+def lower_bucketize(
+    input: Any,
+    boundaries: Any,
+    *,
+    out_int32: bool = False,
+    right: bool = False,
+) -> Any:
+    """Which bin each value falls into, told by one ordered list of edges.
+
+    A bin is the stretch between two neighbours of the list, so the answer for
+    one value is the same walk the position search makes, and it is written the
+    same way: one search per element of the result.
+    """
+
+    if len(boundaries.get_size()) != 1:
+        raise AssertionError("expected: len(boundaries.get_size()) == 1")
+
+    if not (
+        V.graph.has_feature(input, BackendFeature.BUCKETIZE)
+        and V.graph.has_feature(boundaries, BackendFeature.BUCKETIZE)
+    ):
+        return bucketize_fallback(input, boundaries, out_int32=out_int32, right=right)
+
+    boundaries = _bucketize_lookup(boundaries)
+    input_loader = input.make_loader()
+    index_dtype = tp.int32 if out_int32 else tp.int64
+    edges = _bucketize_boundaries(boundaries)
+
+    def inner_fn(index: Any) -> Any:
+        return ops.bucketize(
+            input_loader(index),
+            edges,
+            _bucketize_indices(boundaries, (), index_dtype),
+            index_dtype,
+            right,
+        )
+
+    result = ir.Pointwise.create(
+        device=input.get_device(),
+        dtype=index_dtype,
+        inner_fn=inner_fn,
+        ranges=input.get_size(),
+    )
+    result.realize()
+    return result
 
 
 def ceildiv(number: Any, denom: Any) -> Any:
@@ -8506,7 +8733,6 @@ for _name in (
     "scatter_reduce_",
     "_foreach_addcdiv_",
     "_foreach_addcmul_",
-    "bucketize",
     "avg_pool1d",
 ):
     _op = getattr(tp_ops, _name, None)
@@ -8983,6 +9209,63 @@ def lower_diagonal(x, offset=0, dim1=0, dim2=1):
         return out
 
     return TensorBox(ir.GenericView.create(x, sizes, reindex))
+
+
+@register_lowering(tp_ops.unfold, type_promotion_kind=None)
+def lower_unfold(x, dimension, size, step):
+    """Sliding windows of one axis, laid out along a new trailing axis.
+
+    Every window reads values the source already holds, so the result is an
+    address of the source rather than a copy: a position in the output names a
+    window and a place inside it, and the place it names in the source is the
+    window's start plus how far into the window it stands.
+    """
+
+    sizes = x.get_size()
+    ndim = len(sizes)
+    dim = canonicalize_dim(ndim, dimension)
+
+    if ndim == 0:
+        return _slice(unsqueeze(x, 0), 0, 0, size, 1)
+
+    dim_size = sizes[dim]
+    sizevars = V.graph.sizevars
+    if sizevars.statically_known_gt(sympy.sympify(size), dim_size):
+        raise RuntimeError(
+            f"maximum size for tensor at dimension {dimension} is {dim_size} "
+            f"but size is {size}"
+        )
+    if sizevars.statically_known_leq(sympy.sympify(step), 0):
+        raise RuntimeError(f"step must be greater than 0 but got step={step}")
+
+    new_dim_size = FloorDiv(dim_size - size, step) + 1
+    out_size = [*sizes[:dim], new_dim_size, *sizes[dim + 1 :], size]
+
+    def reindexer(idx):
+        window = idx[-1] + idx[dim] * step
+        return (*idx[:dim], window, *idx[dim + 1 : -1])
+
+    return TensorBox(ir.GenericView.create(x, out_size, reindexer))
+
+
+@register_lowering(tp_ops.prelu, type_promotion_kind=None)
+def lower_prelu(x, weight):
+    """A pass with a learned slope: the values above zero go through, the rest
+    are scaled -- by one slope shared by all of them, or by one slope per
+    channel, the second axis when there is more than one.
+    """
+
+    count = functools.reduce(operator.mul, weight.get_size(), sympy.Integer(1))
+    shape = list(x.get_size())
+    if count == 1:
+        slope = weight
+    elif len(shape) >= 2:
+        broadcast_shape = [sympy.S.One] * len(shape)
+        broadcast_shape[1] = shape[1]
+        slope = view(weight, broadcast_shape)
+    else:
+        slope = weight
+    return lower_where(lower_gt(x, 0), x, lower_mul(slope, x))
 
 
 @register("flip.default")
