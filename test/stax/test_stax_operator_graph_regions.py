@@ -337,3 +337,14 @@ def test_detached_value_follows_its_input(device):
         _same(got, fn(x), 1e-5)
         (grad,) = tp.autograd.grad(got, [x])
         _same(grad, tp.ones_like(x), 1e-6)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_comparisons_answer_for_each_call(device):
+    # A comparison answering with one truth value is computed from the call's
+    # operands, not from the ones it was traced with.
+    fn = lambda a, b: (tp.allclose(a, b), tp.equal(a, b), tp.equal(a, b[:2]))
+    compiled = tp.compile(fn, strict_native=True)
+    a = tp.randn(4, 5, device=device)
+    for b in (a.clone(), a + 1e-3, a.clone()):
+        assert [bool(v) for v in compiled(a, b)] == list(fn(a, b))

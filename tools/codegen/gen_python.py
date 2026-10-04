@@ -32,6 +32,14 @@ def _ensure_device(device):
 
 _MISSING = object()
 
+def _traced_values():
+    # Whether a value-level trace is recording.  A compile trace writes what a
+    # call does, so a call whose eager contract is a Python scalar is written
+    # through the tensor operations it stands for: a traced region hands back
+    # memory, and the caller reads the zero-dim tensor it produced.
+    from tensorplay.graph.experimental.proxy_tensor import get_proxy_mode
+    return get_proxy_mode() is not None
+
 def _as_left_operand(value, other):
     # A plain-number left operand joins the right operand's device when one
     # is given, so reflected calls stay on the tensor's device.
@@ -417,6 +425,44 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
 
         # linalg ops are exposed through the tensorplay.linalg package only
         if name.startswith('linalg_'):
+            continue
+
+        # ---- comparisons whose eager contract is a Python bool --------------
+        # A compile trace records what a call does, and what these do is
+        # compare and reduce.  The scalar-returning binding cannot carry a
+        # traced region's value, so under a trace the call is written through
+        # the tensor operations it stands for and the region hands back the
+        # zero-dim tensor; eager keeps the scalar return.
+        if name in ('allclose', 'equal') and 'function' in f.variants:
+            seen.add(name)
+            if name == 'allclose':
+                lines += [
+                    'def allclose(input, other, rtol=1e-05, atol=1e-08, equal_nan=False):',
+                    '    if _capturing():',
+                    "        _captured = _capture_call(allclose, "
+                    "(input, other, rtol, atol, equal_nan), {})",
+                    '        if _captured is not None:',
+                    '            return _captured',
+                    '    if _traced_values():',
+                    '        return isclose(input, other, rtol, atol, equal_nan).all()',
+                    '    return _C.allclose(input, other, rtol, atol, equal_nan)',
+                    '',
+                ]
+            else:
+                lines += [
+                    'def equal(input, other):',
+                    '    if _capturing():',
+                    "        _captured = _capture_call(equal, (input, other), {})",
+                    '        if _captured is not None:',
+                    '            return _captured',
+                    '    if _traced_values():',
+                    '        if (input.shape != other.shape or input.dtype != other.dtype',
+                    '                or input.device != other.device):',
+                    '            return tensorplay.zeros((), dtype=tensorplay.bool)',
+                    '        return (input == other).all()',
+                    '    return _C.equal(input, other)',
+                    '',
+                ]
             continue
 
         # ---- overload families routed straight to the extension -------------
