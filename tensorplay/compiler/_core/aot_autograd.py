@@ -22,6 +22,7 @@ callable:
 from __future__ import annotations
 
 import contextlib
+import functools
 
 import itertools
 from collections.abc import Callable, Mapping, Sequence
@@ -736,6 +737,68 @@ def _swap_state_tables(module: Any, state: Mapping[str, Any]) -> list[tuple[Any,
     return saved
 
 
+_NO_ENTRY = object()
+
+
+def _state_reader(module: Any, target: str) -> Callable[[], Any]:
+    """A reader of one tensor a graph module reads, fetched on every call.
+
+    The full lookup walks a dotted path through attribute access, which for
+    modules runs Python attribute hooks at every level -- a hundred-odd
+    parameters cost more than the region's own launch.  A path that resolves
+    through modules' child and state tables is walked through those tables
+    directly, which is where the module API keeps what it registers, so a
+    parameter or submodule assigned after compiling is still the one read.
+    The graph's own attribute table is consulted first on every call, as the
+    full lookup does (substituted state lives there), and any path the tables
+    do not answer falls back to the full lookup.
+    """
+
+    full = functools.partial(module._get_attr, target)
+    parts = target.split(".")
+    path, leaf = parts[:-1], parts[-1]
+    table = module.__dict__
+
+    def walk(base: Any) -> Any:
+        current = base
+        for name in path:
+            current = current._modules[name]
+        state = current._parameters
+        if leaf in state:
+            return state[leaf]
+        return current._buffers[leaf]
+
+    try:
+        expected = full()
+    except (AttributeError, KeyError, IndexError, TypeError):
+        return full
+    base = None
+    for candidate in (module, table.get("_root")):
+        if not isinstance(candidate, tensorplay.nn.Module):
+            continue
+        try:
+            if walk(candidate) is expected:
+                base = candidate
+                break
+        except (AttributeError, KeyError, TypeError):
+            continue
+    if base is None:
+        return full
+
+    def read() -> Any:
+        attrs = table.get("_graph_attrs")
+        if attrs:
+            hit = attrs.get(target, _NO_ENTRY)
+            if hit is not _NO_ENTRY:
+                return hit
+        try:
+            return walk(base)
+        except (AttributeError, KeyError, TypeError):
+            return full()
+
+    return read
+
+
 def _state_access(module: Any):
     """``(names, read_state, substitute)`` for the tensors a module reads."""
 
@@ -753,8 +816,10 @@ def _state_access(module: Any):
                 seen.add(id(value))
                 targets.append(node.target)
 
+        readers = [_state_reader(module, target) for target in targets]
+
         def read_graph_state() -> list[Any]:
-            return [module._get_attr(target) for target in targets]
+            return [read() for read in readers]
 
         root = module.root
         owned = module.__dict__
