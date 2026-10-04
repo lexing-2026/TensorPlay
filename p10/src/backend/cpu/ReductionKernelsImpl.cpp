@@ -1720,6 +1720,14 @@ static std::optional<Tensor> try_sum_leading_rows(
         return std::nullopt;
     }
     Tensor out = Tensor::empty(out_shape, input.dtype(), input.device());
+    if (input.size(0) == 1) {
+        // One row: the reduction is the row itself, copied verbatim.
+        const size_t bytes = input.numel() * (input.dtype() == DType::Float32
+                                                  ? sizeof(float)
+                                                  : sizeof(double));
+        std::memcpy(out.data_ptr(), input.data_ptr(), bytes);
+        return out;
+    }
     bool handled = input.dtype() == DType::Float32
         ? sum_leading_rows_stream<8, float>(input, out)
         : sum_leading_rows_stream<8, double>(input, out);
@@ -1727,6 +1735,96 @@ static std::optional<Tensor> try_sum_leading_rows(
         return std::nullopt;
     }
     return out;
+}
+
+// Row-split leading-dim reduction: the row range is tiled into one block per
+// task, and each task folds its block into a private column slice with fully
+// sequential reads before the slices combine into the output. A column split
+// makes every task walk all rows once per column block, and past a few dozen
+// rows those strided walks overwhelm the prefetchers; the row split reads one
+// contiguous block per task and pays a buffer pass instead, which wins once
+// the row count is a large multiple of the team size. Tasks own their slice
+// by index and zero it themselves, so every slice is written exactly once and
+// the fold needs no cross-task coordination.
+template <typename Scalar>
+std::optional<Tensor> sum_leading_rows_split_impl(
+    const Tensor& input, const std::vector<int64_t>& out_shape) {
+    const int64_t rows = input.size(0);
+    const int64_t cols = input.numel() / rows;
+    const int64_t nthreads =
+        std::max<int64_t>(1, tensorplay::parallel::get_num_threads());
+    // Each task's accumulator slice must stay cache-resident while its rows
+    // fold in; past that the read-modify-write traffic rivals the input walk
+    // and the column split is the better shape. The row count must also be a
+    // wide multiple of the team size: below a few dozen rows per task the
+    // column split's strided walks still prefetch well and the buffer pass is
+    // pure overhead.
+    if (rows < 32 * nthreads || cols <= 0 ||
+        cols * static_cast<int64_t>(sizeof(Scalar)) > 16384) {
+        return std::nullopt;
+    }
+    Tensor out = Tensor::empty(out_shape, input.dtype(), input.device());
+    Tensor buffer =
+        Tensor::empty({nthreads * cols}, input.dtype(), input.device());
+    const int64_t grain = (rows + nthreads - 1) / nthreads;
+
+    const Scalar* TP_RESTRICT in =
+        static_cast<const Scalar*>(input.data_ptr());
+    Scalar* TP_RESTRICT buf = static_cast<Scalar*>(buffer.data_ptr());
+    Scalar* TP_RESTRICT outp = static_cast<Scalar*>(out.data_ptr());
+    using Vec = Vectorized<Scalar>;
+    constexpr int64_t vs = Vec::size();
+
+    tensorplay::parallel::parallel_for(
+        0, nthreads, 1, [&](int64_t b, int64_t be) {
+            (void)be;
+            Scalar* TP_RESTRICT acc = buf + b * cols;
+            std::memset(acc, 0, cols * sizeof(Scalar));
+            const int64_t rb = b * grain;
+            const int64_t re = std::min(rows, rb + grain);
+            for (int64_t r = rb; r < re; ++r) {
+                const Scalar* TP_RESTRICT row = in + r * cols;
+                int64_t j = 0;
+                for (; j + vs <= cols; j += vs) {
+                    (Vec::loadu(acc + j) + Vec::loadu(row + j)).store(acc + j);
+                }
+                for (; j < cols; ++j) {
+                    acc[j] += row[j];
+                }
+            }
+        });
+    tensorplay::parallel::parallel_for(0, cols, 256, [&](int64_t cb, int64_t ce) {
+        int64_t j = cb;
+        for (; j + vs <= ce; j += vs) {
+            Vec a = Vec::loadu(buf + j);
+            for (int64_t t = 1; t < nthreads; ++t) {
+                a = a + Vec::loadu(buf + t * cols + j);
+            }
+            a.store(outp + j);
+        }
+        for (; j < ce; ++j) {
+            Scalar s = buf[j];
+            for (int64_t t = 1; t < nthreads; ++t) {
+                s += buf[t * cols + j];
+            }
+            outp[j] = s;
+        }
+    });
+    return out;
+}
+
+static std::optional<Tensor> try_sum_leading_rows_split(
+    const Tensor& input, const std::vector<int64_t>& out_shape) {
+    if (!input.is_contiguous() || input.dim() < 2 || input.numel() == 0) {
+        return std::nullopt;
+    }
+    if (input.dtype() == DType::Float32) {
+        return sum_leading_rows_split_impl<float>(input, out_shape);
+    }
+    if (input.dtype() == DType::Float64) {
+        return sum_leading_rows_split_impl<double>(input, out_shape);
+    }
+    return std::nullopt;
 }
 
 __attribute__((target("avx512f")))
@@ -2400,6 +2498,12 @@ Tensor sum_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
             if (std::optional<Tensor> leading =
                     try_sum_leading_rows(input, out_shape, dim)) {
                 return std::move(*leading);
+            }
+            if (dim == 0) {
+                if (std::optional<Tensor> split =
+                        try_sum_leading_rows_split(input, out_shape)) {
+                    return std::move(*split);
+                }
             }
         }
 
