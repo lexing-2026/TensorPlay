@@ -238,6 +238,11 @@ class PythonPrinter(_PythonPrinter):
             x = f"({x} // {div})"
         return f"({x} % {mod})"
 
+    def _print_Mod(self, expr: sympy.Expr) -> str:
+        # The remainder of a value the expression keeps nonnegative, spelled
+        # with the language's own remainder operator.
+        return self.stringify(expr.args, " % ", PRECEDENCE["Atom"] - 0.5)
+
     def doprint(self, expr: sympy.Expr, *, simplify: bool = True, p: bool = True) -> str:
         if simplify and isinstance(expr, sympy.Expr) and hasattr(V.graph, "sizevars"):
             expr = V.graph.sizevars.simplify(expr)
