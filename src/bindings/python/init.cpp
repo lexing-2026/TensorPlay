@@ -89,8 +89,9 @@ namespace {
 // Factory fast paths
 //
 // The generated METH_FASTCALL layer already parses empty/zeros/ones/rand/
-// wrappers in front of them cost ~0.5us of frame/checks per call -- which is
-// rebinds those public names onto C trampolines:
+// randn/full and the _like family natively; the Python wrappers in front of
+// them cost ~0.5us of frame/checks per call.  This pass rebinds those public
+// names onto C trampolines:
 //
 //   * while the native capture state reports an active compiler region the
 //     call vectors straight to the original Python wrapper, so
@@ -125,11 +126,8 @@ bool factory_size_seq(PyObject* o) {
     return PyList_Check(o) || PyTuple_Check(o) || PyRange_Check(o);
 }
 
-PyObject* factory_trampoline(PyObject* self, PyObject* const* args,
-                             Py_ssize_t nargs, PyObject* kwnames) {
-    FactoryHook* h = (FactoryHook*)PyCapsule_GetPointer(self, nullptr);
-    if (!h) return nullptr;
-
+PyObject* factory_trampoline_impl(FactoryHook* h, PyObject* const* args,
+                                  Py_ssize_t nargs, PyObject* kwnames) {
     long depth;
     if (!factory_trace_depth(&depth) || depth > 0)
         return PyObject_Vectorcall(h->wrapper, args, (size_t)nargs, kwnames);
@@ -221,34 +219,51 @@ fail:
     return nullptr;
 }
 
+// One trampoline per factory, each holding its hook in a static the thunk
+// passes straight through.  Binding the entry to the module itself is what
+// keeps the Python side shim-free: a module self is what makes the
+// interpreter present a plain name, qualname and repr, so the public
+// factories need no wrapper object standing in front of them.
+#define TP_FACTORY_LIST(X)                                                   \
+    X(empty)                                                                 \
+    X(zeros)                                                                 \
+    X(ones)                                                                  \
+    X(rand)                                                                  \
+    X(randn)                                                                 \
+    X(full)                                                                  \
+    X(eye)                                                                   \
+    X(empty_like)                                                            \
+    X(zeros_like)                                                            \
+    X(ones_like)                                                             \
+    X(full_like)
+
+#define TP_FACTORY_DEFINE(NAME)                                              \
+    FactoryHook g_factory_##NAME;                                            \
+    PyObject* factory_trampoline_##NAME(PyObject*, PyObject* const* args,    \
+                                        Py_ssize_t nargs,                    \
+                                        PyObject* kwnames) {                 \
+        return factory_trampoline_impl(&g_factory_##NAME, args, nargs,       \
+                                       kwnames);                             \
+    }
+TP_FACTORY_LIST(TP_FACTORY_DEFINE)
+#undef TP_FACTORY_DEFINE
+
+#define TP_FACTORY_ENTRY(NAME)                                               \
+    {#NAME, (PyCFunction)(void(*)(void))factory_trampoline_##NAME,           \
+        METH_FASTCALL | METH_KEYWORDS, nullptr},
 PyMethodDef factory_defs[] = {
-    {"empty",  (PyCFunction)(void(*)(void))factory_trampoline,
-        METH_FASTCALL | METH_KEYWORDS, nullptr},
-    {"zeros",  (PyCFunction)(void(*)(void))factory_trampoline,
-        METH_FASTCALL | METH_KEYWORDS, nullptr},
-    {"ones",   (PyCFunction)(void(*)(void))factory_trampoline,
-        METH_FASTCALL | METH_KEYWORDS, nullptr},
-    {"rand",   (PyCFunction)(void(*)(void))factory_trampoline,
-        METH_FASTCALL | METH_KEYWORDS, nullptr},
-    {"randn",  (PyCFunction)(void(*)(void))factory_trampoline,
-        METH_FASTCALL | METH_KEYWORDS, nullptr},
-    {"full",   (PyCFunction)(void(*)(void))factory_trampoline,
-        METH_FASTCALL | METH_KEYWORDS, nullptr},
-    {"eye",         (PyCFunction)(void(*)(void))factory_trampoline,
-        METH_FASTCALL | METH_KEYWORDS, nullptr},
-    {"empty_like",  (PyCFunction)(void(*)(void))factory_trampoline,
-        METH_FASTCALL | METH_KEYWORDS, nullptr},
-    {"zeros_like",  (PyCFunction)(void(*)(void))factory_trampoline,
-        METH_FASTCALL | METH_KEYWORDS, nullptr},
-    {"ones_like",   (PyCFunction)(void(*)(void))factory_trampoline,
-        METH_FASTCALL | METH_KEYWORDS, nullptr},
-    {"full_like",   (PyCFunction)(void(*)(void))factory_trampoline,
-        METH_FASTCALL | METH_KEYWORDS, nullptr},
+    TP_FACTORY_LIST(TP_FACTORY_ENTRY)
+#undef TP_FACTORY_ENTRY
+    {nullptr, nullptr, 0, nullptr}
 };
-const char* factory_names[] = {"empty", "zeros", "ones",
-                               "rand", "randn", "full",
-                               "eye", "empty_like", "zeros_like",
-                               "ones_like", "full_like"};
+
+#define TP_FACTORY_NAME(NAME) #NAME,
+const char* factory_names[] = {TP_FACTORY_LIST(TP_FACTORY_NAME)};
+#undef TP_FACTORY_NAME
+
+#define TP_FACTORY_HOOK(NAME) &g_factory_##NAME,
+FactoryHook* factory_hooks[] = {TP_FACTORY_LIST(TP_FACTORY_HOOK)};
+#undef TP_FACTORY_HOOK
 
 FactoryHook::Shape factory_shape(const char* name) {
     if (strcmp(name, "full") == 0) return FactoryHook::Shape::FullLift;
@@ -281,36 +296,23 @@ int install_factory_fast_paths_impl(py::module_& m, py::dict wrappers) {
         PyObject* w = PyDict_GetItemString(wrappers.ptr(), factory_names[i]);
         if (!w) { Py_DECREF(raw); continue; }
 
-        FactoryHook* h = new FactoryHook();
+        FactoryHook* h = factory_hooks[i];
         h->raw = raw;                       // ownership moved from GetAttr
         h->wrapper = Py_NewRef(w);
         h->tensor_type = tensor_type ? Py_NewRef(tensor_type) : nullptr;
         h->scalar_type = scalar_type ? Py_NewRef(scalar_type) : nullptr;
         h->shape = factory_shape(factory_names[i]);
+        // The hook outlives the call into install: its references live as
+        // long as the process, which is as long as the extension module
+        // holding the installed entries does.
 
-        PyObject* cap = PyCapsule_New((void*)h, nullptr,
-                                      [](PyObject* c) {
-            auto* hh = (FactoryHook*)PyCapsule_GetPointer(c, nullptr);
-            if (hh) {
-                Py_XDECREF(hh->raw);
-                Py_XDECREF(hh->wrapper);
-                Py_XDECREF(hh->tensor_type);
-                Py_XDECREF(hh->scalar_type);
-                delete hh;
-            }
-        });
-        if (!cap) { PyErr_Clear(); continue; }
-        PyObject* fn = PyCFunction_New(&factory_defs[i], cap);
-        Py_DECREF(cap);  // fn holds the self reference
+        // A module self keeps the plain qualname and repr the public
+        // surface presents, and the module name is spelled out so
+        // __module__ reads as the package rather than the extension.
+        static PyObject* module_name = PyUnicode_InternFromString("tensorplay");
+        PyObject* fn = PyCFunction_NewEx(&factory_defs[i], m.ptr(),
+                                         module_name);
         if (!fn) { PyErr_Clear(); continue; }
-        // Inherit the generated entry's docstring (best effort).
-        PyObject* doc = PyObject_GetAttrString(raw, "__doc__");
-        if (doc) {
-            if (PyObject_SetAttrString(fn, "__doc__", doc) != 0) PyErr_Clear();
-            Py_DECREF(doc);
-        } else {
-            PyErr_Clear();
-        }
         std::string fast_name = std::string(factory_names[i]) + "_fast";
         if (PyObject_SetAttrString(m.ptr(), fast_name.c_str(), fn) != 0)
             PyErr_Clear();
