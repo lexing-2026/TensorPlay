@@ -438,6 +438,18 @@ def _bool_vals():
     return tp.tensor([True, False, True, True])
 
 
+def _float_vals():
+    return _t(4, low=-2.0, high=2.0)
+
+
+def _positive_vals():
+    return _t(4, low=0.5, high=3.0)
+
+
+def _bounded_vals():
+    return _t(4, low=-0.9, high=0.9)
+
+
 WRITING_FORMS = {
     "bitwise_and_.Tensor": lambda: (_int_vals(), _int_vals()),
     "bitwise_and_.Scalar": lambda: (_int_vals(), 7),
@@ -466,6 +478,124 @@ WRITING_FORMS = {
     "__ilshift__.Scalar": lambda: (_int_vals(), 2),
     "__irshift__.Tensor": lambda: (_int_vals(), _shift_vals()),
     "__irshift__.Scalar": lambda: (_int_vals(), 2),
+    # Arithmetic and rounding writing forms.  A comparison writes into a
+    # boolean value: the answer is already boolean, so that is the only
+    # target an eager write accepts.
+    "add_.Tensor": lambda: ((_float_vals(), _float_vals()), {"alpha": 2}),
+    "add_.Scalar": lambda: ((_float_vals(), 3.0), {"alpha": 2}),
+    "sub_.Tensor": lambda: ((_float_vals(), _float_vals()), {"alpha": 2}),
+    "sub_.Scalar": lambda: ((_float_vals(), 3.0), {"alpha": 2}),
+    "mul_.Tensor": lambda: (_float_vals(), _float_vals()),
+    "mul_.Scalar": lambda: (_float_vals(), 3.0),
+    "div_.Tensor": lambda: (_float_vals(), _t(4, low=0.5, high=2.0)),
+    "div_.Scalar": lambda: (_float_vals(), 2.0),
+    "div_.Tensor_mode": lambda: (
+        (_float_vals(), _t(4, low=0.5, high=2.0)), {"rounding_mode": "floor"},
+    ),
+    "div_.Scalar_mode": lambda: ((_float_vals(), 2.0), {"rounding_mode": "floor"}),
+    "true_divide_.Tensor": lambda: (_float_vals(), _t(4, low=0.5, high=2.0)),
+    "true_divide_.Scalar": lambda: (_float_vals(), 2.0),
+    "remainder_.Tensor": lambda: (_float_vals(), _t(4, low=0.5, high=2.0)),
+    "remainder_.Scalar": lambda: (_float_vals(), 2.0),
+    "fmod_.Tensor": lambda: (_float_vals(), _t(4, low=1.0, high=2.0)),
+    "fmod_.Scalar": lambda: (_float_vals(), 2.0),
+    "pow_.Tensor": lambda: (_positive_vals(), _t(4, low=0.5, high=2.0)),
+    "pow_.Scalar": lambda: (_float_vals(), 3),
+    "float_power_.Tensor": lambda: (_positive_vals(), _t(4, low=0.5, high=2.0)),
+    "float_power_.Scalar": lambda: (_float_vals(), 3),
+    "copysign_.Tensor": lambda: (_float_vals(), _t(4, low=-1.0, high=1.0)),
+    "copysign_.Scalar": lambda: (_float_vals(), -1.5),
+    "atan2_.default": lambda: (_float_vals(), _float_vals()),
+    "hypot_.default": lambda: (_float_vals(), _float_vals()),
+    "ldexp_.default": lambda: (_int_vals(), _shift_vals()),
+    "nextafter_.default": lambda: (_float_vals(), _float_vals()),
+    "gcd_.default": lambda: (_int_vals(), _int_vals()),
+    "lcm_.default": lambda: (_int_vals(), _int_vals()),
+    "igamma_.default": lambda: (_positive_vals(), _positive_vals()),
+    "igammac_.default": lambda: (_positive_vals(), _positive_vals()),
+    "eq_.Tensor": lambda: (_bool_vals(), _bool_vals()),
+    "eq_.Scalar": lambda: (_bool_vals(), True),
+    "ne_.Tensor": lambda: (_bool_vals(), _bool_vals()),
+    "ne_.Scalar": lambda: (_bool_vals(), True),
+    "lt_.Tensor": lambda: (_bool_vals(), _bool_vals()),
+    "lt_.Scalar": lambda: (_bool_vals(), False),
+    "le_.Tensor": lambda: (_bool_vals(), _bool_vals()),
+    "le_.Scalar": lambda: (_bool_vals(), False),
+    "gt_.Tensor": lambda: (_bool_vals(), _bool_vals()),
+    "gt_.Scalar": lambda: (_bool_vals(), False),
+    "ge_.Tensor": lambda: (_bool_vals(), _bool_vals()),
+    "ge_.Scalar": lambda: (_bool_vals(), False),
+    "clamp_.default": lambda: (_float_vals(), 0.2, 0.8),
+    "clamp_.Tensor": lambda: (_float_vals(), tp.tensor(0.2), tp.tensor(0.8)),
+    # Unary mathematical writing forms; each value builder stays inside the
+    # domain the operator is defined on.
+    "abs_.default": lambda: (_float_vals(),),
+    "neg_.default": lambda: (_float_vals(),),
+    "reciprocal_.default": lambda: (_positive_vals(),),
+    "sqrt_.default": lambda: (_positive_vals(),),
+    "rsqrt_.default": lambda: (_positive_vals(),),
+    "square_.default": lambda: (_float_vals(),),
+    "sign_.default": lambda: (_float_vals(),),
+    "exp_.default": lambda: (_float_vals(),),
+    "exp2_.default": lambda: (_float_vals(),),
+    "expm1_.default": lambda: (_float_vals(),),
+    "log_.default": lambda: (_positive_vals(),),
+    "log2_.default": lambda: (_positive_vals(),),
+    "log10_.default": lambda: (_positive_vals(),),
+    "log1p_.default": lambda: (_positive_vals(),),
+    "floor_.default": lambda: (_float_vals(),),
+    "ceil_.default": lambda: (_float_vals(),),
+    "trunc_.default": lambda: (_float_vals(),),
+    "round_.default": lambda: (_float_vals(),),
+    "round_.decimals": lambda: ((_float_vals(),), {"decimals": 2}),
+    "sin_.default": lambda: (_float_vals(),),
+    "cos_.default": lambda: (_float_vals(),),
+    "tan_.default": lambda: (_t(4, low=-1.2, high=1.2),),
+    "asin_.default": lambda: (_bounded_vals(),),
+    "acos_.default": lambda: (_bounded_vals(),),
+    "atan_.default": lambda: (_float_vals(),),
+    "sinh_.default": lambda: (_t(4, low=-1.5, high=1.5),),
+    "cosh_.default": lambda: (_t(4, low=-1.5, high=1.5),),
+    "tanh_.default": lambda: (_float_vals(),),
+    "asinh_.default": lambda: (_float_vals(),),
+    "acosh_.default": lambda: (_t(4, low=1.5, high=4.0),),
+    "atanh_.default": lambda: (_bounded_vals(),),
+    "erf_.default": lambda: (_float_vals(),),
+    "erfc_.default": lambda: (_float_vals(),),
+    "erfinv_.default": lambda: (_bounded_vals(),),
+    "digamma_.default": lambda: (_positive_vals(),),
+    "lgamma_.default": lambda: (_positive_vals(),),
+    "i0_.default": lambda: (_float_vals(),),
+    "conj_physical_.default": lambda: (_float_vals(),),
+    # Running sums, small matrix chains, gated activation.
+    "cumsum_.default": lambda: (_float_vals(), 0),
+    "cumprod_.default": lambda: (_positive_vals(), 0),
+    "addbmm_.default": lambda: (
+        (_t(3, 5), _t(2, 3, 4), _t(2, 4, 5)), {"beta": 0.5, "alpha": 2},
+    ),
+    "addmm_.default": lambda: ((_t(3, 5), _t(3, 4), _t(4, 5)), {"beta": 0.5, "alpha": 2}),
+    "addmv_.default": lambda: ((_t(5), _t(5, 4), _t(4)), {"beta": 0.5, "alpha": 2}),
+    "selu_.default": lambda: (_float_vals(),),
+    # Reads and writes at positions.
+    "scatter_.src": lambda: (_t(3, 4), 0, tp.tensor([[0, 1, 2, 0], [2, 1, 0, 1]]), _t(2, 4)),
+    "scatter_.value": lambda: (_t(3, 4), 0, tp.tensor([[0, 1, 2, 0], [2, 1, 0, 1]]), 7.0),
+    "scatter_.reduce": lambda: (
+        (_t(3, 4), 0, tp.tensor([[0, 1, 2, 0], [2, 1, 0, 1]]), _t(2, 4)), {"reduce": "add"},
+    ),
+    "scatter_.value_reduce": lambda: (
+        (_t(3, 4), 0, tp.tensor([[0, 1, 2, 0], [2, 1, 0, 1]]), 7.0),
+        {"reduce": "multiply"},
+    ),
+    "scatter_add_.default": lambda: (
+        _t(3, 4), 0, tp.tensor([[0, 1, 2, 0], [2, 1, 0, 1]]), _t(2, 4),
+    ),
+    "scatter_reduce_.two": lambda: (
+        (_t(3, 4), 0, tp.tensor([[0, 1, 2, 0], [2, 1, 0, 1]]), _t(2, 4)), {"reduce": "amax"},
+    ),
+    "index_put_.default": lambda: (_t(3, 4), [tp.tensor([0, 2])], _t(2, 4), False),
+    "index_reduce_.default": lambda: (
+        (_t(3, 4), 0, tp.tensor([0, 2]), _t(2, 4)), {"reduce": "mean"},
+    ),
 }
 
 
@@ -584,12 +714,16 @@ def test_inplace_writing_form_matches_operator(name):
     packet, overload_name = name.split(".")
     overload = getattr(getattr(ops, packet), overload_name)
     assert overload in decomposition_table
-    args = WRITING_FORMS[name]()
-    expected = overload(args[0].clone(), *args[1:])
+    built = WRITING_FORMS[name]()
+    if len(built) == 2 and isinstance(built[1], dict):
+        args, kwargs = built
+    else:
+        args, kwargs = built, {}
+    expected = overload(args[0].clone(), *args[1:], **kwargs)
     inputs = (args[0].clone(),) + tuple(
         a.clone() if isinstance(a, tp.Tensor) else a for a in args[1:]
     )
-    result = decomposition_table[overload](*inputs)
+    result = decomposition_table[overload](*inputs, **kwargs)
     assert result is inputs[0]
     if expected.dtype == tp.bool or not expected.is_floating_point():
         assert tp.equal(result, expected)
@@ -677,3 +811,44 @@ def test_vector_norm_orders(ord, dim):
     got = decomposition_table[overload](x, ord, dim)
     assert tuple(got.shape) == tuple(expected.shape)
     assert tp.allclose(got, expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "name, kwargs",
+    [
+        ("uniform_.default", {}),
+        ("normal_.default", {}),
+        ("cauchy_.default", {"median": 0.0, "sigma": 1.0}),
+        ("exponential_.default", {"lambd": 1.5}),
+        ("geometric_.default", {"p": 0.5}),
+        ("log_normal_.default", {"mean": 0.0, "std": 1.0}),
+    ],
+)
+def test_rng_fill_decomposition_leaves_the_draw_in_the_value(name, kwargs):
+    get_decompositions([])
+    packet, overload_name = name.split(".")
+    fn = decomposition_table[getattr(getattr(ops, packet), overload_name)]
+    dest = tp.zeros(3, 4)
+    assert fn(dest, **kwargs) is dest
+    assert tuple(dest.shape) == (3, 4)
+    assert dest.dtype == tp.get_default_dtype()
+    assert bool(tp.isfinite(dest).all())
+    assert float(dest.abs().sum()) > 0.0
+
+
+@pytest.mark.parametrize(
+    "name, call",
+    [
+        ("uniform_.default", lambda fn, t: fn(t, 0, 1, generator=object())),
+        ("cauchy_.default", lambda fn, t: fn(t, 0, 1, generator=object())),
+        ("exponential_.default", lambda fn, t: fn(t, 1, generator=object())),
+        ("geometric_.default", lambda fn, t: fn(t, 0.5, generator=object())),
+        ("log_normal_.default", lambda fn, t: fn(t, 0, 1, generator=object())),
+    ],
+)
+def test_rng_fill_decomposition_refuses_a_generator(name, call):
+    get_decompositions([])
+    packet, overload_name = name.split(".")
+    fn = decomposition_table[getattr(getattr(ops, packet), overload_name)]
+    with pytest.raises(AssertionError):
+        call(fn, tp.zeros(3))

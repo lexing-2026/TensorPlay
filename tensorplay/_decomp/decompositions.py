@@ -3564,3 +3564,517 @@ def randn(size, *, dtype=None, device=None, requires_grad=False):
 @register_decomposition(ops.sym_numel.default)
 def sym_numel(t):
     return reduce(operator.mul, t.shape, 1)
+
+
+# ---------------------------------------------------------------------------
+# Writing forms of the arithmetic, comparison and rounding operations
+#
+# The same pattern as the writing forms above: an in-place overload computes
+# what the non-writing one computes and copies the answer into the value it
+# was called on.  The eager kernels reject writes that would change the value
+# of a dtype the target cannot hold; the copy here carries the same result,
+# which is why no additional promotion decision is made on the way in.
+# ---------------------------------------------------------------------------
+
+
+@register_decomposition([ops.add_.Scalar, ops.add_.Tensor])
+def add_(self, other, alpha=1):
+    return self.copy_(ops.add(self, other, alpha=alpha))
+
+
+@register_decomposition([ops.sub_.Scalar, ops.sub_.Tensor])
+def sub_(self, other, alpha=1):
+    if isinstance(other, tp.Tensor):
+        return self.copy_(ops.sub.Tensor(self, other, alpha=alpha))
+    return self.copy_(ops.sub.Scalar(self, other, alpha=alpha))
+
+
+@register_decomposition([ops.mul_.Scalar, ops.mul_.Tensor])
+def mul_(self, other):
+    if isinstance(other, tp.Tensor):
+        return self.copy_(ops.mul.Tensor(self, other))
+    return self.copy_(ops.mul.Scalar(self, other))
+
+
+@register_decomposition([ops.div_.Scalar, ops.div_.Tensor])
+def div_(self, other):
+    if isinstance(other, tp.Tensor):
+        return self.copy_(ops.div.Tensor(self, other))
+    return self.copy_(ops.div.Scalar(self, other))
+
+
+@register_decomposition([ops.div_.Scalar_mode, ops.div_.Tensor_mode])
+def div_mode_(self, other, rounding_mode=None):
+    if isinstance(other, tp.Tensor):
+        return self.copy_(
+            ops.div.Tensor_mode(self, other, rounding_mode=rounding_mode)
+        )
+    return self.copy_(ops.div.Scalar_mode(self, other, rounding_mode=rounding_mode))
+
+
+@register_decomposition([ops.true_divide_.Scalar, ops.true_divide_.Tensor])
+def true_divide_(self, other):
+    if isinstance(other, tp.Tensor):
+        return self.copy_(ops.true_divide.Tensor(self, other))
+    return self.copy_(ops.true_divide.Scalar(self, other))
+
+
+@register_decomposition([ops.remainder_.Scalar, ops.remainder_.Tensor])
+def remainder_(self, other):
+    return self.copy_(ops.remainder(self, other))
+
+
+@register_decomposition([ops.fmod_.Scalar, ops.fmod_.Tensor])
+def fmod_(self, other):
+    if isinstance(other, tp.Tensor):
+        return self.copy_(ops.fmod.Tensor(self, other))
+    return self.copy_(ops.fmod.Scalar(self, other))
+
+
+@register_decomposition([ops.pow_.Scalar, ops.pow_.Tensor])
+def pow_(self, exponent):
+    return self.copy_(ops.pow(self, exponent))
+
+
+@register_decomposition([ops.float_power_.Scalar, ops.float_power_.Tensor])
+def float_power_(self, exponent):
+    return self.copy_(ops.float_power(self, exponent))
+
+
+@register_decomposition([ops.copysign_.Scalar, ops.copysign_.Tensor])
+def copysign_(self, other):
+    if isinstance(other, tp.Tensor):
+        return self.copy_(ops.copysign.Tensor(self, other))
+    return self.copy_(ops.copysign.Scalar(self, other))
+
+
+@register_decomposition(ops.atan2_.default)
+def atan2_(self, other):
+    return self.copy_(ops.atan2(self, other))
+
+
+@register_decomposition(ops.hypot_.default)
+def hypot_(self, other):
+    return self.copy_(ops.hypot(self, other))
+
+
+@register_decomposition(ops.ldexp_.default)
+def ldexp_(self, other):
+    return self.copy_(ops.ldexp(self, other))
+
+
+@register_decomposition(ops.nextafter_.default)
+def nextafter_(self, other):
+    return self.copy_(ops.nextafter(self, other))
+
+
+@register_decomposition(ops.gcd_.default)
+def gcd_(self, other):
+    return self.copy_(ops.gcd(self, other))
+
+
+@register_decomposition(ops.lcm_.default)
+def lcm_(self, other):
+    return self.copy_(ops.lcm(self, other))
+
+
+@register_decomposition(ops.igamma_.default)
+def igamma_(self, other):
+    return self.copy_(ops.igamma(self, other))
+
+
+@register_decomposition(ops.igammac_.default)
+def igammac_(self, other):
+    return self.copy_(ops.igammac(self, other))
+
+
+@register_decomposition([ops.eq_.Scalar, ops.eq_.Tensor])
+def eq_(self, other):
+    return self.copy_(ops.eq(self, other))
+
+
+@register_decomposition([ops.ne_.Scalar, ops.ne_.Tensor])
+def ne_(self, other):
+    return self.copy_(ops.ne(self, other))
+
+
+@register_decomposition([ops.lt_.Scalar, ops.lt_.Tensor])
+def lt_(self, other):
+    return self.copy_(ops.lt(self, other))
+
+
+@register_decomposition([ops.le_.Scalar, ops.le_.Tensor])
+def le_(self, other):
+    return self.copy_(ops.le(self, other))
+
+
+@register_decomposition([ops.gt_.Scalar, ops.gt_.Tensor])
+def gt_(self, other):
+    return self.copy_(ops.gt(self, other))
+
+
+@register_decomposition([ops.ge_.Scalar, ops.ge_.Tensor])
+def ge_(self, other):
+    return self.copy_(ops.ge(self, other))
+
+
+@register_decomposition([ops.clamp_.default, ops.clamp_.Tensor])
+def clamp_(self, min=None, max=None):
+    return self.copy_(ops.clamp(self, min, max))
+
+
+# ---------------------------------------------------------------------------
+# Writing forms of the unary mathematical functions
+# ---------------------------------------------------------------------------
+
+
+@register_decomposition(ops.abs_.default)
+def abs_(self):
+    return self.copy_(ops.abs(self))
+
+
+@register_decomposition(ops.neg_.default)
+def neg_(self):
+    return self.copy_(ops.neg(self))
+
+
+@register_decomposition(ops.reciprocal_.default)
+def reciprocal_(self):
+    return self.copy_(ops.reciprocal(self))
+
+
+@register_decomposition(ops.sqrt_.default)
+def sqrt_(self):
+    return self.copy_(ops.sqrt(self))
+
+
+@register_decomposition(ops.rsqrt_.default)
+def rsqrt_(self):
+    return self.copy_(ops.rsqrt(self))
+
+
+@register_decomposition(ops.square_.default)
+def square_(self):
+    return self.copy_(ops.square(self))
+
+
+@register_decomposition(ops.sign_.default)
+def sign_(self):
+    return self.copy_(ops.sign(self))
+
+
+@register_decomposition(ops.exp_.default)
+def exp_(self):
+    return self.copy_(ops.exp(self))
+
+
+@register_decomposition(ops.exp2_.default)
+def exp2_(self):
+    return self.copy_(ops.exp2(self))
+
+
+@register_decomposition(ops.expm1_.default)
+def expm1_(self):
+    return self.copy_(ops.expm1(self))
+
+
+@register_decomposition(ops.log_.default)
+def log_(self):
+    return self.copy_(ops.log(self))
+
+
+@register_decomposition(ops.log2_.default)
+def log2_(self):
+    return self.copy_(ops.log2(self))
+
+
+@register_decomposition(ops.log10_.default)
+def log10_(self):
+    return self.copy_(ops.log10(self))
+
+
+@register_decomposition(ops.log1p_.default)
+def log1p_(self):
+    return self.copy_(ops.log1p(self))
+
+
+@register_decomposition(ops.floor_.default)
+def floor_(self):
+    return self.copy_(ops.floor(self))
+
+
+@register_decomposition(ops.ceil_.default)
+def ceil_(self):
+    return self.copy_(ops.ceil(self))
+
+
+@register_decomposition(ops.trunc_.default)
+def trunc_(self):
+    return self.copy_(ops.trunc(self))
+
+
+@register_decomposition(ops.round_.default)
+def round_(self):
+    return self.copy_(ops.round(self))
+
+
+@register_decomposition(ops.round_.decimals)
+def round_decimals_(self, decimals):
+    return self.copy_(ops.round.decimals(self, decimals=decimals))
+
+
+@register_decomposition(ops.sin_.default)
+def sin_(self):
+    return self.copy_(ops.sin(self))
+
+
+@register_decomposition(ops.cos_.default)
+def cos_(self):
+    return self.copy_(ops.cos(self))
+
+
+@register_decomposition(ops.tan_.default)
+def tan_(self):
+    return self.copy_(ops.tan(self))
+
+
+@register_decomposition(ops.asin_.default)
+def asin_(self):
+    return self.copy_(ops.asin(self))
+
+
+@register_decomposition(ops.acos_.default)
+def acos_(self):
+    return self.copy_(ops.acos(self))
+
+
+@register_decomposition(ops.atan_.default)
+def atan_(self):
+    return self.copy_(ops.atan(self))
+
+
+@register_decomposition(ops.sinh_.default)
+def sinh_(self):
+    return self.copy_(ops.sinh(self))
+
+
+@register_decomposition(ops.cosh_.default)
+def cosh_(self):
+    return self.copy_(ops.cosh(self))
+
+
+@register_decomposition(ops.tanh_.default)
+def tanh_(self):
+    return self.copy_(ops.tanh(self))
+
+
+@register_decomposition(ops.asinh_.default)
+def asinh_(self):
+    return self.copy_(ops.asinh(self))
+
+
+@register_decomposition(ops.acosh_.default)
+def acosh_(self):
+    return self.copy_(ops.acosh(self))
+
+
+@register_decomposition(ops.atanh_.default)
+def atanh_(self):
+    return self.copy_(ops.atanh(self))
+
+
+@register_decomposition(ops.erf_.default)
+def erf_(self):
+    return self.copy_(ops.erf(self))
+
+
+@register_decomposition(ops.erfc_.default)
+def erfc_(self):
+    return self.copy_(ops.erfc(self))
+
+
+@register_decomposition(ops.erfinv_.default)
+def erfinv_(self):
+    return self.copy_(ops.erfinv(self))
+
+
+@register_decomposition(ops.digamma_.default)
+def digamma_(self):
+    return self.copy_(ops.digamma(self))
+
+
+@register_decomposition(ops.lgamma_.default)
+def lgamma_(self):
+    return self.copy_(ops.lgamma(self))
+
+
+@register_decomposition(ops.i0_.default)
+def i0_(self):
+    return self.copy_(ops.i0(self))
+
+
+@register_decomposition(ops.conj_physical_.default)
+def conj_physical_(self):
+    return self.copy_(ops.conj_physical(self))
+
+
+# ---------------------------------------------------------------------------
+# Writing forms of the running sums, the products of small matrix chains and
+# the gated activation
+# ---------------------------------------------------------------------------
+
+
+@register_decomposition(ops.cumsum_.default)
+def cumsum_(self, dim=0, dtype=None):
+    return self.copy_(ops.cumsum(self, dim, dtype=dtype))
+
+
+@register_decomposition(ops.cumprod_.default)
+def cumprod_(self, dim=0, dtype=None):
+    return self.copy_(ops.cumprod(self, dim, dtype=dtype))
+
+
+@register_decomposition(ops.addbmm_.default)
+def addbmm_(self, batch1, batch2, beta=1, alpha=1):
+    return self.copy_(ops.addbmm(self, batch1, batch2, beta=beta, alpha=alpha))
+
+
+@register_decomposition(ops.addmm_.default)
+def addmm_(self, mat1, mat2, beta=1, alpha=1):
+    return self.copy_(ops.addmm(self, mat1, mat2, beta=beta, alpha=alpha))
+
+
+@register_decomposition(ops.addmv_.default)
+def addmv_(self, mat, vec, beta=1, alpha=1):
+    return self.copy_(ops.addmv(self, mat, vec, beta=beta, alpha=alpha))
+
+
+@register_decomposition(ops.selu_.default)
+def selu_(self):
+    return self.copy_(ops.selu(self))
+
+
+# ---------------------------------------------------------------------------
+# Writing forms of the reads and writes at positions
+#
+# Each is the non-writing operation's answer copied into the value it was
+# called on, exactly like the arithmetic forms above; the write at a position
+# needs no decision of its own because the read at that position already made
+# every one.
+# ---------------------------------------------------------------------------
+
+
+@register_decomposition(ops.scatter_.src)
+def scatter_src_(self, dim, index, src):
+    return self.copy_(ops.scatter.src(self, dim, index, src))
+
+
+@register_decomposition(ops.scatter_.value)
+def scatter_value_(self, dim, index, value):
+    return self.copy_(ops.scatter.value(self, dim, index, value))
+
+
+@register_decomposition(ops.scatter_.reduce)
+def scatter_reduce_(self, dim, index, src, reduce):
+    return self.copy_(ops.scatter.reduce(self, dim, index, src, reduce=reduce))
+
+
+@register_decomposition(ops.scatter_.value_reduce)
+def scatter_value_reduce_(self, dim, index, value, reduce):
+    return self.copy_(
+        ops.scatter.value_reduce(self, dim, index, value, reduce=reduce)
+    )
+
+
+@register_decomposition(ops.scatter_add_.default)
+def scatter_add_(self, dim, index, src):
+    return self.copy_(ops.scatter_add(self, dim, index, src))
+
+
+@register_decomposition(ops.scatter_reduce_.two)
+def scatter_reduce_two_(self, dim, index, src, reduce, include_self=True):
+    return self.copy_(
+        ops.scatter_reduce(self, dim, index, src, reduce, include_self=include_self)
+    )
+
+
+@register_decomposition(ops.index_put_.default)
+def index_put_(self, indices, values, accumulate=False):
+    return self.copy_(ops.index_put(self, indices, values, accumulate=accumulate))
+
+
+@register_decomposition(ops.index_reduce_.default)
+def index_reduce_(self, dim, index, source, reduce, include_self=True):
+    return self.copy_(
+        ops.index_reduce(self, dim, index, source, reduce, include_self=include_self)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Writing forms of the distributions
+#
+# A fill reads a draw and leaves it in the value it was called on.  The uniform
+# reads come out of the uniform prim at the value's own layout; the rest are
+# the standard inverses of the distributions' distribution functions applied
+# to a uniform or a normal draw.  A generator cannot be carried into the read,
+# so one handed here is refused rather than silently ignored.
+# ---------------------------------------------------------------------------
+
+
+def _no_generator(op, generator):
+    if generator is not None:
+        raise AssertionError(f"{op} does not accept a generator when written as its parts")
+
+
+@register_decomposition(ops.uniform_.default)
+def uniform_(self, low=0, high=1, generator=None):
+    _no_generator("uniform_", generator)
+    return self.copy_(
+        prims.uniform(
+            list(self.shape),
+            low=low,
+            high=high,
+            dtype=self.dtype,
+            device=self.device,
+            stride=list(self.stride()),
+        )
+    )
+
+
+@register_decomposition(ops.normal_.default)
+def normal_(self, mean=0, std=1, generator=None):
+    if isinstance(mean, tp.Tensor) or isinstance(std, tp.Tensor):
+        return self.copy_(ops.normal(mean, std, generator=generator))
+    return self.copy_(ops.normal(mean, std, list(self.shape), generator=generator))
+
+
+@register_decomposition(ops.cauchy_.default)
+def cauchy_(self, median=0, sigma=1, generator=None):
+    _no_generator("cauchy_", generator)
+    u = ops.rand_like(self)
+    return self.copy_(median + sigma * ops.tan(math.pi * (u - 0.5)))
+
+
+@register_decomposition(ops.exponential_.default)
+def exponential_(self, lambd=1, generator=None):
+    _no_generator("exponential_", generator)
+    u = ops.rand_like(self)
+    # The draw lands in (0, 1); where it rounds to 1 the logarithm would be 0
+    # and the inverse exponential would be 0, so the log is clamped to -eps/2.
+    eps = tp.finfo(u.dtype).eps / 2
+    log_u = prims.where(u >= 1.0 - eps, -eps, ops.log(u))
+    return self.copy_(-log_u / lambd)
+
+
+@register_decomposition(ops.geometric_.default)
+def geometric_(self, p, generator=None):
+    _no_generator("geometric_", generator)
+    u = ops.rand_like(self)
+    return self.copy_(ops.floor(ops.log1p(-u) / math.log1p(-p)) + 1)
+
+
+@register_decomposition(ops.log_normal_.default)
+def log_normal_(self, mean=1, std=2, generator=None):
+    _no_generator("log_normal_", generator)
+    n = ops.randn_like(self)
+    return self.copy_(ops.exp(std * n + mean))
