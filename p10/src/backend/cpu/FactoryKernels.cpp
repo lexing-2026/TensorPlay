@@ -8,7 +8,7 @@
 #include "Exception.h"
 #include "Parallel.h"
 #include "Context.h"
-#include "cpu/vec/vec.h"
+#include "cpu/RangeKernels.h"
 #include "TensorIterator.h"
 #include <vector>
 #include <cmath>
@@ -212,27 +212,6 @@ Tensor& fill_kernel(Tensor& self, const Scalar& value) {
 
 #include <iostream>
 
-template <typename T>
-void arange_fill(T* data, int64_t steps, double start, double step) {
-    using Vec = tensorplay::vec::Vectorized<T>;
-    constexpr int64_t width = Vec::size();
-    parallel::parallel_for(0, steps, parallel::GRAIN_SIZE,
-        [&](int64_t begin, int64_t last) {
-            int64_t index = begin;
-            const int64_t vector_end = begin +
-                ((last - begin) / width) * width;
-            for (; index < vector_end; index += width) {
-                const T base = static_cast<T>(
-                    start + static_cast<double>(index) * step);
-                Vec::arange(base, step).store(data + index);
-            }
-            for (; index < last; ++index) {
-                data[index] = static_cast<T>(
-                    start + static_cast<double>(index) * step);
-            }
-        });
-}
-
 Tensor arange_start_step_kernel(Scalar start, Scalar end, Scalar step, DType dtype, Device device) {
     // Better length calculation to avoid precision issues with large integers
     double s_d = start.toDouble();
@@ -278,7 +257,8 @@ Tensor arange_start_step_kernel(Scalar start, Scalar end, Scalar step, DType dty
                      "\"arange\" not implemented for '" + std::string(toString(dtype)) + "'");
 #define ARANGE_CASE(ctype, name) \
         case DType::name: { \
-            arange_fill<ctype>(t.data_ptr<ctype>(), len, s_d, st_d); \
+            arange_fill_stub(DeviceType::CPU, t.data_ptr<ctype>(), len, \
+                             s_d, st_d, static_cast<int>(DType::name)); \
             break; \
         }
         ARANGE_CASE(uint8_t, UInt8)
@@ -884,6 +864,8 @@ Tensor full_stub(const std::vector<int64_t>& size, const Scalar& fill_value,
 }
 
 } // anonymous namespace
+
+DEFINE_DISPATCH(arange_fill_stub);
 
 TENSORPLAY_LIBRARY_IMPL(CPU, FactoryKernels) {
     m.impl("rand", rand_stub);

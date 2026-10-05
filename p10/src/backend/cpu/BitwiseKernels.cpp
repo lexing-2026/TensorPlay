@@ -15,6 +15,11 @@
 // Tensors carrying an active transform level (vmap) hold their payload in the
 // transform wrapper, so every entry point rejects them instead of touching
 // storage directly; batch rules live in the transform layer.
+//
+// The vectorized integral cores are tier-compiled (BitwiseKernelsImpl.cpp)
+// and reached through the stubs declared in cpu/BitwiseKernels.h; this TU
+// keeps the base-tier plumbing: checks, broadcasting, dtype promotion, the
+// boolean special cases and the dispatcher registrations.
 
 #include "Tensor.h"
 #include "TensorImpl.h"
@@ -26,10 +31,9 @@
 #include "Parallel.h"
 #include "TypePromotion.h"
 #include "TypeProperties.h"
-#include "cpu/vec/vec.h"
+#include "cpu/BitwiseKernels.h"
 
 #include <cstdint>
-#include <type_traits>
 #include <vector>
 
 namespace tensorplay {
@@ -38,16 +42,6 @@ namespace cpu {
 using namespace tensorplay::parallel;
 
 namespace {
-
-#define TENSORPLAY_FORALL_INT_TYPES(_) \
-    _(uint8_t, UInt8)                  \
-    _(int8_t, Int8)                    \
-    _(int16_t, Int16)                  \
-    _(int32_t, Int32)                  \
-    _(int64_t, Int64)                  \
-    _(uint16_t, UInt16)                \
-    _(uint32_t, UInt32)                \
-    _(uint64_t, UInt64)
 
 inline void bitwise_check_cpu(const Tensor& t, const char* name) {
     if (t.unsafeGetTensorImpl() && t.unsafeGetTensorImpl()->is_batched()) {
@@ -60,82 +54,20 @@ inline void bitwise_check_cpu(const Tensor& t, const char* name) {
     TP_THROW(TypeError, name, ": only integral and boolean types are supported");
 }
 
-template <typename T, bool kLeft>
-inline T bitwise_shift_value(T value, T shift) {
-    using S = typename std::make_signed<T>::type;
-    using U = typename std::make_unsigned<T>::type;
-    constexpr U kBits = static_cast<U>(sizeof(T) * 8);
-    const bool invalid = static_cast<S>(shift) < 0 || static_cast<U>(shift) >= kBits;
-    if constexpr (kLeft) {
-        if (invalid) return T(0);
-        return static_cast<T>(static_cast<U>(value) << static_cast<U>(shift));
+// Boolean operands carry 0/1 in each byte and apply the matching logical
+// operation; only and/or/xor reach a boolean tensor (shifts refuse them).
+inline bool bitwise_bool_apply(int op, uint8_t a, uint8_t b) {
+    switch (op) {
+        case static_cast<int>(BitwiseOp::kAnd): return a & b;
+        case static_cast<int>(BitwiseOp::kOr): return a | b;
+        case static_cast<int>(BitwiseOp::kXor): return a ^ b;
+        default:
+            TP_THROW(TypeError, "bitwise: unsupported operation on bool");
     }
-    if (invalid) {
-        if constexpr (std::is_signed_v<T>) return value < 0 ? T(-1) : T(0);
-        return T(0);
-    }
-    return static_cast<T>(value >> static_cast<U>(shift));
 }
 
-template <typename T, typename ScalarOp, typename VectorOp>
-inline void parallel_binary_vectorized(
-        const T* lhs, const T* rhs, T* output, int64_t n,
-        ScalarOp scalar_op, VectorOp vector_op) {
-    using Vec = tensorplay::vec::Vectorized<T>;
-    constexpr int64_t width = Vec::size();
-    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-        int64_t index = begin;
-        const int64_t vector_end = begin + ((end - begin) / width) * width;
-        for (; index < vector_end; index += width) {
-            vector_op(Vec::loadu(lhs + index), Vec::loadu(rhs + index))
-                .store(output + index);
-        }
-        for (; index < end; ++index) {
-            output[index] = scalar_op(lhs[index], rhs[index]);
-        }
-    });
-}
-
-template <typename T, typename ScalarOp, typename VectorOp>
-inline void parallel_scalar_vectorized(
-        const T* input, T scalar, T* output, int64_t n,
-        ScalarOp scalar_op, VectorOp vector_op) {
-    using Vec = tensorplay::vec::Vectorized<T>;
-    constexpr int64_t width = Vec::size();
-    const Vec vector_scalar(scalar);
-    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-        int64_t index = begin;
-        const int64_t vector_end = begin + ((end - begin) / width) * width;
-        for (; index < vector_end; index += width) {
-            vector_op(Vec::loadu(input + index), vector_scalar)
-                .store(output + index);
-        }
-        for (; index < end; ++index) {
-            output[index] = scalar_op(input[index], scalar);
-        }
-    });
-}
-
-template <typename T, typename ScalarOp, typename VectorOp>
-inline void parallel_unary_vectorized(
-        const T* input, T* output, int64_t n,
-        ScalarOp scalar_op, VectorOp vector_op) {
-    using Vec = tensorplay::vec::Vectorized<T>;
-    constexpr int64_t width = Vec::size();
-    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-        int64_t index = begin;
-        const int64_t vector_end = begin + ((end - begin) / width) * width;
-        for (; index < vector_end; index += width) {
-            vector_op(Vec::loadu(input + index)).store(output + index);
-        }
-        for (; index < end; ++index) {
-            output[index] = scalar_op(input[index]);
-        }
-    });
-}
-
-template <typename Pred>
-Tensor bitwise_binary_cpu(const Tensor& a_in, const Tensor& b_in, Pred pred, const char* name) {
+Tensor bitwise_binary_cpu(const Tensor& a_in, const Tensor& b_in,
+                          BitwiseOp op, const char* name) {
     bitwise_check_cpu(a_in, name);
     bitwise_check_cpu(b_in, name);
     std::vector<int64_t> out_shape = broadcast_shapes(
@@ -158,34 +90,24 @@ Tensor bitwise_binary_cpu(const Tensor& a_in, const Tensor& b_in, Pred pred, con
         bool* dp = out.data_ptr<bool>();
         parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
             for (int64_t i = begin; i < end; ++i)
-                dp[i] = pred(static_cast<uint8_t>(ap[i]), static_cast<uint8_t>(bp[i]));
+                dp[i] = bitwise_bool_apply(static_cast<int>(op),
+                                           static_cast<uint8_t>(ap[i]),
+                                           static_cast<uint8_t>(bp[i]));
         });
         return out;
     }
-#define TP_BIT_BIN_CASE(ctype, name_) \
-    case DType::name_: { \
-        const ctype* ap = ac.data_ptr<ctype>(); \
-        const ctype* bp = bc.data_ptr<ctype>(); \
-        ctype* dp = out.data_ptr<ctype>(); \
-        parallel_binary_vectorized<ctype>(ap, bp, dp, n, pred,                 \
-            [pred](tensorplay::vec::Vectorized<ctype> a,                     \
-                   tensorplay::vec::Vectorized<ctype> b) { return pred(a, b); }); \
-        break; \
-    }
-    switch (dt) {
-        TENSORPLAY_FORALL_INT_TYPES(TP_BIT_BIN_CASE)
-        default: TP_THROW(TypeError, name, ": unsupported dtype");
-    }
-#undef TP_BIT_BIN_CASE
+    bitwise_binary_stub(DeviceType::CPU, ac.data_ptr(), bc.data_ptr(),
+                        out.data_ptr(), n, static_cast<int>(dt),
+                        static_cast<int>(op));
     return out;
 }
 
-template <typename Pred>
-Tensor bitwise_scalar_cpu(const Tensor& self_in, Scalar other, Pred pred, const char* name) {
+Tensor bitwise_scalar_cpu(const Tensor& self_in, Scalar other, BitwiseOp op,
+                          const char* name) {
     // An integer scalar moves a boolean tensor to int64; a scalar of the
     // tensor's own category leaves its type alone.
     const DType dt = result_type(other, self_in.dtype());
-    if (dt != self_in.dtype()) return bitwise_scalar_cpu(self_in.to(dt), other, pred, name);
+    if (dt != self_in.dtype()) return bitwise_scalar_cpu(self_in.to(dt), other, op, name);
     bitwise_check_cpu(self_in, name);
     Tensor sc = self_in.contiguous();
     Tensor out = Tensor::empty(static_cast<std::vector<int64_t>>(self_in.shape()),
@@ -197,25 +119,14 @@ Tensor bitwise_scalar_cpu(const Tensor& self_in, Scalar other, Pred pred, const 
         bool* dp = out.data_ptr<bool>();
         parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
             for (int64_t i = begin; i < end; ++i)
-                dp[i] = pred(static_cast<uint8_t>(sp[i]), o);
+                dp[i] = bitwise_bool_apply(static_cast<int>(op),
+                                           static_cast<uint8_t>(sp[i]), o);
         });
         return out;
     }
-#define TP_BIT_SCALAR_CASE(ctype, name_) \
-    case DType::name_: { \
-        const ctype* sp = sc.data_ptr<ctype>(); \
-        ctype ov = static_cast<ctype>(other.to<int64_t>()); \
-        ctype* dp = out.data_ptr<ctype>(); \
-        parallel_scalar_vectorized<ctype>(sp, ov, dp, n, pred,                \
-            [pred](tensorplay::vec::Vectorized<ctype> a,                     \
-                   tensorplay::vec::Vectorized<ctype> b) { return pred(a, b); }); \
-        break; \
-    }
-    switch (self_in.dtype()) {
-        TENSORPLAY_FORALL_INT_TYPES(TP_BIT_SCALAR_CASE)
-        default: TP_THROW(TypeError, name, ": unsupported dtype");
-    }
-#undef TP_BIT_SCALAR_CASE
+    bitwise_scalar_stub(DeviceType::CPU, sc.data_ptr(), other.to<int64_t>(),
+                        out.data_ptr(), n, static_cast<int>(self_in.dtype()),
+                        static_cast<int>(op));
     return out;
 }
 
@@ -224,32 +135,17 @@ Tensor bitwise_shift_scalar_cpu(const Tensor& self_in, Scalar other, const char*
     const DType dt = result_type(other, self_in.dtype());
     if (dt != self_in.dtype()) return bitwise_shift_scalar_cpu<kLeft>(self_in.to(dt), other, name);
     bitwise_check_cpu(self_in, name);
+    if (self_in.dtype() == DType::Bool) {
+        TP_THROW(TypeError, name, ": unsupported dtype");
+    }
     const int64_t shift = other.to<int64_t>();
     Tensor sc = self_in.contiguous();
     Tensor out = Tensor::empty(static_cast<std::vector<int64_t>>(self_in.shape()),
                                self_in.dtype(), self_in.device());
-    int64_t n = out.numel();
-#define TP_SHIFT_SCALAR_CASE(ctype, name_) \
-    case DType::name_: { \
-        const ctype* sp = sc.data_ptr<ctype>(); \
-        const ctype sh = static_cast<ctype>(shift); \
-        ctype* dp = out.data_ptr<ctype>(); \
-        parallel_scalar_vectorized<ctype>(sp, sh, dp, n,                    \
-            [](ctype value, ctype shift_value) {                            \
-                return bitwise_shift_value<ctype, kLeft>(value, shift_value); \
-            },                                                               \
-            [](tensorplay::vec::Vectorized<ctype> value,                    \
-               tensorplay::vec::Vectorized<ctype> shift_value) {             \
-                if constexpr (kLeft) return value << shift_value;            \
-                return value >> shift_value;                                  \
-            });                                                               \
-        break; \
-    }
-    switch (self_in.dtype()) {
-        TENSORPLAY_FORALL_INT_TYPES(TP_SHIFT_SCALAR_CASE)
-        default: TP_THROW(TypeError, name, ": unsupported dtype");
-    }
-#undef TP_SHIFT_SCALAR_CASE
+    bitwise_scalar_stub(DeviceType::CPU, sc.data_ptr(), shift, out.data_ptr(),
+                        out.numel(), static_cast<int>(self_in.dtype()),
+                        static_cast<int>(kLeft ? BitwiseOp::kLshift
+                                               : BitwiseOp::kRshift));
     return out;
 }
 
@@ -267,20 +163,8 @@ Tensor bitwise_not_cpu(const Tensor& self) {
         });
         return out;
     }
-#define TP_BNOT_CASE(ctype, name_) \
-    case DType::name_: { \
-        const ctype* sp = sc.data_ptr<ctype>(); \
-        ctype* dp = out.data_ptr<ctype>(); \
-        parallel_unary_vectorized<ctype>(sp, dp, n,                        \
-            [](ctype value) { return static_cast<ctype>(~value); },         \
-            [](tensorplay::vec::Vectorized<ctype> value) { return ~value; }); \
-        break; \
-    }
-    switch (self.dtype()) {
-        TENSORPLAY_FORALL_INT_TYPES(TP_BNOT_CASE)
-        default: TP_THROW(TypeError, "bitwise_not: unsupported dtype");
-    }
-#undef TP_BNOT_CASE
+    bitwise_not_stub(DeviceType::CPU, sc.data_ptr(), out.data_ptr(), n,
+                     static_cast<int>(self.dtype()));
     return out;
 }
 
@@ -301,56 +185,35 @@ Tensor bitwise_shift_tensor_cpu(const Tensor& a_in, const Tensor& b_in, const ch
     Tensor ac = (a_in.dtype() == dt ? a_in : a_in.to(dt)).expand(out_shape).contiguous();
     Tensor bc = (b_in.dtype() == dt ? b_in : b_in.to(dt)).expand(out_shape).contiguous();
     Tensor out = Tensor::empty(out_shape, dt, a_in.device());
-    int64_t n = out.numel();
-#define TP_SHIFT_BIN_CASE(ctype, name_) \
-    case DType::name_: { \
-        const ctype* ap = ac.data_ptr<ctype>(); \
-        const ctype* bp = bc.data_ptr<ctype>(); \
-        ctype* dp = out.data_ptr<ctype>(); \
-        parallel_binary_vectorized<ctype>(ap, bp, dp, n,                    \
-            [](ctype value, ctype shift_value) {                            \
-                return bitwise_shift_value<ctype, kLeft>(value, shift_value); \
-            },                                                               \
-            [](tensorplay::vec::Vectorized<ctype> value,                    \
-               tensorplay::vec::Vectorized<ctype> shift_value) {             \
-                if constexpr (kLeft) return value << shift_value;            \
-                return value >> shift_value;                                  \
-            });                                                               \
-        break; \
+    if (dt == DType::Bool) {
+        TP_THROW(TypeError, name, ": unsupported dtype");
     }
-    switch (dt) {
-        TENSORPLAY_FORALL_INT_TYPES(TP_SHIFT_BIN_CASE)
-        default: TP_THROW(TypeError, name, ": unsupported dtype");
-    }
-#undef TP_SHIFT_BIN_CASE
+    bitwise_binary_stub(DeviceType::CPU, ac.data_ptr(), bc.data_ptr(),
+                        out.data_ptr(), out.numel(), static_cast<int>(dt),
+                        static_cast<int>(kLeft ? BitwiseOp::kLshift
+                                               : BitwiseOp::kRshift));
     return out;
 }
 
 // --- Named entry points registered with the dispatcher ----------------------
 
 Tensor bitwise_and_tensor_cpu(const Tensor& a, const Tensor& b) {
-    return bitwise_binary_cpu(a, b,
-        [](auto x, auto y) { return static_cast<decltype(x)>(x & y); }, "bitwise_and");
+    return bitwise_binary_cpu(a, b, BitwiseOp::kAnd, "bitwise_and");
 }
 Tensor bitwise_or_tensor_cpu(const Tensor& a, const Tensor& b) {
-    return bitwise_binary_cpu(a, b,
-        [](auto x, auto y) { return static_cast<decltype(x)>(x | y); }, "bitwise_or");
+    return bitwise_binary_cpu(a, b, BitwiseOp::kOr, "bitwise_or");
 }
 Tensor bitwise_xor_tensor_cpu(const Tensor& a, const Tensor& b) {
-    return bitwise_binary_cpu(a, b,
-        [](auto x, auto y) { return static_cast<decltype(x)>(x ^ y); }, "bitwise_xor");
+    return bitwise_binary_cpu(a, b, BitwiseOp::kXor, "bitwise_xor");
 }
 Tensor bitwise_and_scalar_cpu(const Tensor& a, const Scalar& b) {
-    return bitwise_scalar_cpu(a, b,
-        [](auto x, auto y) { return static_cast<decltype(x)>(x & y); }, "bitwise_and");
+    return bitwise_scalar_cpu(a, b, BitwiseOp::kAnd, "bitwise_and");
 }
 Tensor bitwise_or_scalar_cpu(const Tensor& a, const Scalar& b) {
-    return bitwise_scalar_cpu(a, b,
-        [](auto x, auto y) { return static_cast<decltype(x)>(x | y); }, "bitwise_or");
+    return bitwise_scalar_cpu(a, b, BitwiseOp::kOr, "bitwise_or");
 }
 Tensor bitwise_xor_scalar_cpu(const Tensor& a, const Scalar& b) {
-    return bitwise_scalar_cpu(a, b,
-        [](auto x, auto y) { return static_cast<decltype(x)>(x ^ y); }, "bitwise_xor");
+    return bitwise_scalar_cpu(a, b, BitwiseOp::kXor, "bitwise_xor");
 }
 Tensor bitwise_lshift_tensor_cpu(const Tensor& a, const Tensor& b) {
     return bitwise_shift_tensor_cpu<true>(a, b, "bitwise_left_shift");
@@ -380,22 +243,19 @@ Tensor bitwise_and_scalar_tensor_cpu(const Scalar& self, const Tensor& other) {
     bitwise_check_cpu(other, "bitwise_and");
     bitwise_scalar_check_cpu(self, "bitwise_and");
     Tensor wrapped = Tensor::full({}, self, result_type(self, other.dtype()), other.device());
-    return bitwise_binary_cpu(wrapped, other,
-        [](auto x, auto y) { return static_cast<decltype(x)>(x & y); }, "bitwise_and");
+    return bitwise_binary_cpu(wrapped, other, BitwiseOp::kAnd, "bitwise_and");
 }
 Tensor bitwise_or_scalar_tensor_cpu(const Scalar& self, const Tensor& other) {
     bitwise_check_cpu(other, "bitwise_or");
     bitwise_scalar_check_cpu(self, "bitwise_or");
     Tensor wrapped = Tensor::full({}, self, result_type(self, other.dtype()), other.device());
-    return bitwise_binary_cpu(wrapped, other,
-        [](auto x, auto y) { return static_cast<decltype(x)>(x | y); }, "bitwise_or");
+    return bitwise_binary_cpu(wrapped, other, BitwiseOp::kOr, "bitwise_or");
 }
 Tensor bitwise_xor_scalar_tensor_cpu(const Scalar& self, const Tensor& other) {
     bitwise_check_cpu(other, "bitwise_xor");
     bitwise_scalar_check_cpu(self, "bitwise_xor");
     Tensor wrapped = Tensor::full({}, self, result_type(self, other.dtype()), other.device());
-    return bitwise_binary_cpu(wrapped, other,
-        [](auto x, auto y) { return static_cast<decltype(x)>(x ^ y); }, "bitwise_xor");
+    return bitwise_binary_cpu(wrapped, other, BitwiseOp::kXor, "bitwise_xor");
 }
 Tensor bitwise_lshift_scalar_tensor_cpu(const Scalar& self, const Tensor& other) {
     bitwise_check_cpu(other, "bitwise_left_shift");
@@ -456,6 +316,10 @@ Tensor& bitwise_rshift_scalar_out_cpu(const Tensor& a, const Scalar& b, Tensor& 
 }
 
 } // anonymous namespace
+
+DEFINE_DISPATCH(bitwise_binary_stub);
+DEFINE_DISPATCH(bitwise_scalar_stub);
+DEFINE_DISPATCH(bitwise_not_stub);
 
 TENSORPLAY_LIBRARY_IMPL(CPU, BitwiseKernels) {
     m.impl("bitwise_not", bitwise_not_cpu);

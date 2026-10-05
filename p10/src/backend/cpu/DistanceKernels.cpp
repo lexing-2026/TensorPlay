@@ -10,7 +10,7 @@
 #include "Exception.h"
 #include "Parallel.h"
 #include "TypePromotion.h"
-#include "cpu/vec/vec.h"
+#include "cpu/DistanceKernels.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include "tensorplay/ops/TensorRedispatchGenerated.h"
 
@@ -34,52 +34,14 @@ void require_float(const Tensor& t, const char* who) {
         TP_THROW(TypeError, who, ": only floating-point tensors are supported");
 }
 
-enum class PdistMode { One, Two, Infinity, General };
-
-template <PdistMode mode, typename T>
-T pdist_distance(const T* lhs, const T* rhs, int64_t width, double p) {
-    using Vec = tensorplay::vec::Vectorized<T>;
-    Vec aggregate(static_cast<T>(0));
-    const int64_t vector_width = Vec::size();
-    int64_t column = 0;
-    for (; column + vector_width <= width; column += vector_width) {
-        const Vec diff =
-            (Vec::loadu(lhs + column) - Vec::loadu(rhs + column)).abs();
-        if constexpr (mode == PdistMode::One) {
-            aggregate = aggregate + diff;
-        } else if constexpr (mode == PdistMode::Two) {
-            aggregate = aggregate + diff * diff;
-        } else if constexpr (mode == PdistMode::Infinity) {
-            aggregate = tensorplay::vec::maximum(aggregate, diff);
-        } else {
-            aggregate = aggregate + diff.pow(Vec(static_cast<T>(p)));
-        }
-    }
-
-    T result = mode == PdistMode::Infinity
-        ? aggregate.reduce_max()
-        : aggregate.reduce_add();
-    for (; column < width; ++column) {
-        const T diff = static_cast<T>(
-            std::abs(lhs[column] - rhs[column]));
-        if constexpr (mode == PdistMode::One) {
-            result += diff;
-        } else if constexpr (mode == PdistMode::Two) {
-            result += diff * diff;
-        } else if constexpr (mode == PdistMode::Infinity) {
-            result = std::max(result, diff);
-        } else {
-            result += static_cast<T>(std::pow(diff, p));
-        }
-    }
-
-    if constexpr (mode == PdistMode::Two) {
-        return static_cast<T>(std::sqrt(result));
-    } else if constexpr (mode == PdistMode::General) {
-        return static_cast<T>(std::pow(result, 1.0 / p));
-    } else {
-        return result;
-    }
+// Norm selector for pdist_stub/cdist_stub; see cpu/DistanceKernels.h for the
+// encoding.  Resolved once per operation, not per row pair.
+inline int pdist_mode_code(double p) {
+    if (p == 0.0) return 0;
+    if (p == 1.0) return 1;
+    if (p == 2.0) return 2;
+    if (std::isinf(p)) return 3;
+    return 4;
 }
 
 template <typename T>
@@ -101,42 +63,11 @@ Tensor pdist_impl(const Tensor& self, double p) {
     Tensor input = self.contiguous().to(work_dtype);
     const T* data = input.data_ptr<T>();
     Tensor out = Tensor::empty({outn}, work_dtype, self.device());
-    T* output = out.data_ptr<T>();
 
-    parallel_for(0, outn, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-        const double n2 = static_cast<double>(n) - 0.5;
-        int64_t i = static_cast<int64_t>(
-            n2 - std::sqrt(n2 * n2 - 2.0 * static_cast<double>(begin) - 1.0));
-        int64_t j = begin - n * i + i * (i + 1) / 2 + i + 1;
-        for (int64_t index = begin; index < end; ++index) {
-            const T* lhs = data + i * width;
-            const T* rhs = data + j * width;
-            if (p == 0.0) {
-                int64_t count = 0;
-                for (int64_t column = 0; column < width; ++column) {
-                    count += lhs[column] != rhs[column];
-                }
-                output[index] = static_cast<T>(count);
-            } else if (p == 1.0) {
-                output[index] = pdist_distance<PdistMode::One>(
-                    lhs, rhs, width, p);
-            } else if (p == 2.0) {
-                output[index] = pdist_distance<PdistMode::Two>(
-                    lhs, rhs, width, p);
-            } else if (std::isinf(p)) {
-                output[index] = pdist_distance<PdistMode::Infinity>(
-                    lhs, rhs, width, p);
-            } else {
-                output[index] = pdist_distance<PdistMode::General>(
-                    lhs, rhs, width, p);
-            }
-            ++j;
-            if (j == n) {
-                ++i;
-                j = i + 1;
-            }
-        }
-    });
+    // The parallel vectorized loop is tier-compiled; this hands it the
+    // ready-to-run buffers together with the resolved norm selector.
+    pdist_stub(DeviceType::CPU, data, out.data_ptr(), n, width, p,
+               pdist_mode_code(p), static_cast<int>(work_dtype));
 
     return out;
 }
@@ -193,40 +124,12 @@ Tensor cdist_impl(const Tensor& x1, const Tensor& x2, double p,
 
     const T* lhs_data = lhs.data_ptr<T>();
     const T* rhs_data = rhs.data_ptr<T>();
-    T* output_data = output.data_ptr<T>();
-    const int64_t pair_count = batches * rows1 * rows2;
-    const int64_t grain = std::max<int64_t>(1, GRAIN_SIZE / width);
-    parallel_for(0, pair_count, grain, [&](int64_t begin, int64_t end) {
-        for (int64_t linear = begin; linear < end; ++linear) {
-            const int64_t batch_pair = linear % (rows1 * rows2);
-            const int64_t batch = linear / (rows1 * rows2);
-            const int64_t row1 = batch_pair / rows2;
-            const int64_t row2 = batch_pair % rows2;
-            const T* lhs_row = lhs_data + (batch * rows1 + row1) * width;
-            const T* rhs_row = rhs_data + (batch * rows2 + row2) * width;
-            T value;
-            if (p == 0.0) {
-                int64_t count = 0;
-                for (int64_t column = 0; column < width; ++column) {
-                    count += lhs_row[column] != rhs_row[column];
-                }
-                value = static_cast<T>(count);
-            } else if (p == 1.0) {
-                value = pdist_distance<PdistMode::One>(
-                    lhs_row, rhs_row, width, p);
-            } else if (p == 2.0) {
-                value = pdist_distance<PdistMode::Two>(
-                    lhs_row, rhs_row, width, p);
-            } else if (std::isinf(p)) {
-                value = pdist_distance<PdistMode::Infinity>(
-                    lhs_row, rhs_row, width, p);
-            } else {
-                value = pdist_distance<PdistMode::General>(
-                    lhs_row, rhs_row, width, p);
-            }
-            output_data[linear] = value;
-        }
-    });
+
+    // The parallel vectorized loop is tier-compiled; the matmul shortcut and
+    // the batch plumbing above stay in this base-tier TU.
+    cdist_stub(DeviceType::CPU, lhs_data, rhs_data, output.data_ptr(), batches,
+               rows1, rows2, width, p, pdist_mode_code(p),
+               static_cast<int>(work_dtype));
     return output;
 }
 
@@ -304,6 +207,9 @@ Tensor cdist_cpu(const Tensor& x1, const Tensor& x2, double p,
     return cdist_impl<float>(
         x1, x2, p, compute_mode, batch_shape, rows1, rows2, width);
 }
+
+DEFINE_DISPATCH(pdist_stub);
+DEFINE_DISPATCH(cdist_stub);
 
 TENSORPLAY_LIBRARY_IMPL(CPU, Distance) {
     m.impl("cdist", cdist_cpu);
