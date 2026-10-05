@@ -134,7 +134,9 @@ def test_group_norm_codegen_shares_backward_and_marks_saved_statistics():
     )
     group_norm_wrapper = wrappers.split(
         "std::tuple<Tensor, Tensor, Tensor> native_group_norm(", 1
-    )[1].split("Tensor index(", 1)[0]
+    )[1].split("Tensor index(", 1)[0].split(
+        "std::tuple<Tensor, Tensor, Tensor> native_group_norm_backward(", 1
+    )[0]
     assert "set_grad_fn(std::get<0>(__tp_wrapped_result)" in group_norm_wrapper
     assert "set_grad_fn(std::get<1>(__tp_wrapped_result)" not in group_norm_wrapper
     assert "set_grad_fn(std::get<2>(__tp_wrapped_result)" not in group_norm_wrapper

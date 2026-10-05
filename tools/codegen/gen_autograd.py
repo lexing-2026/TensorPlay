@@ -666,6 +666,34 @@ MANUAL_DERIVATIVES: dict[str, dict] = {
     "tp_cosine_embedding_loss_backward": {
         "saved": ["grad_output", "input1", "input2", "target", "margin", "reduction"],
         "node": "TpCosineEmbeddingLossBackwardBackward"},
+    # Convolution and normalization backward kernels return one gradient per
+    # input of the forward op (ConvNormBackward.h); the node receives one
+    # incoming gradient for each.
+    "convolution_backward": {
+        "saved": ["grad_output", "input", "weight", "stride", "padding", "dilation",
+                  "transposed", "output_padding", "groups"],
+        "node": "ConvolutionBackwardBackward"},
+    "convolution_backward_overrideable": {
+        "saved": ["grad_output", "input", "weight", "stride", "padding", "dilation",
+                  "transposed", "output_padding", "groups"],
+        "node": "ConvolutionBackwardOverrideableBackward"},
+    "batch_norm_backward": {
+        "saved": ["grad_output", "input", "weight", "running_mean", "running_var",
+                  "training", "eps"],
+        "node": "BatchNormBackwardBackward"},
+    "instance_norm_backward": {
+        "saved": ["grad_output", "input", "weight", "bias", "running_mean",
+                  "running_var", "use_input_stats", "eps"],
+        "node": "InstanceNormBackwardBackward"},
+    "group_norm_backward": {
+        "saved": ["grad_output", "input", "num_groups", "weight", "bias", "eps"],
+        "node": "GroupNormBackwardBackward"},
+    "native_group_norm_backward": {
+        "saved": ["grad_out", "input", "mean", "rstd", "weight", "N", "C", "HxW", "group"],
+        "node": "NativeGroupNormBackwardBackward"},
+    "native_layer_norm_backward": {
+        "saved": ["grad_out", "input", "normalized_shape", "mean", "rstd", "weight", "bias"],
+        "node": "NativeLayerNormBackwardBackward"},
     "linalg_lu": {"saved": ["pivot"], "saved_outputs": ["P", "L", "U"],
                   "output_differentiability": [False, True, True]},
     "lu_unpack": {"saved": ["LU_data"],

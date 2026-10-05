@@ -717,6 +717,98 @@
   weight: conv_transpose1d_grad_weight(grad, input, weight, stride, padding, output_padding, groups, dilation)
   bias: conv_transpose1d_grad_bias(grad, input, weight, stride, padding, output_padding, groups, dilation)
 
+# The convolution backward kernels are bilinear in (grad_output, input / weight), so
+# their derivatives are convolutions and convolution backwards (ConvNormBackward.h).
+- name: conv1d_grad_input(Tensor grad_output, Tensor input, Tensor weight, int[] stride, int[] padding, int[] dilation, int groups) -> Tensor
+  grad_output: conv_grad_input_wrt_grad_output(grad, weight, stride, padding, dilation, false, {}, groups)
+  weight: conv_grad_input_wrt_weight(grad, grad_output, weight, stride, padding, dilation, false, {}, groups)
+  input: zeros_like(input)
+
+- name: conv1d_grad_weight(Tensor grad_output, Tensor input, Tensor weight, int[] stride, int[] padding, int[] dilation, int groups) -> Tensor
+  grad_output: conv_grad_weight_wrt_grad_output(grad, input, stride, padding, dilation, false, {}, groups)
+  input: conv_grad_weight_wrt_input(grad, grad_output, input, stride, padding, dilation, false, {}, groups)
+  weight: zeros_like(weight)
+
+- name: conv1d_grad_bias(Tensor grad_output, Tensor input, Tensor weight, int[] stride, int[] padding, int[] dilation, int groups) -> Tensor
+  grad_output: conv_grad_bias_wrt_grad_output(grad, grad_output)
+  input: zeros_like(input)
+  weight: zeros_like(weight)
+
+- name: conv2d_grad_input(Tensor grad_output, Tensor input, Tensor weight, int[] stride, int[] padding, int[] dilation, int groups) -> Tensor
+  grad_output: conv_grad_input_wrt_grad_output(grad, weight, stride, padding, dilation, false, {}, groups)
+  weight: conv_grad_input_wrt_weight(grad, grad_output, weight, stride, padding, dilation, false, {}, groups)
+  input: zeros_like(input)
+
+- name: conv2d_grad_weight(Tensor grad_output, Tensor input, Tensor weight, int[] stride, int[] padding, int[] dilation, int groups) -> Tensor
+  grad_output: conv_grad_weight_wrt_grad_output(grad, input, stride, padding, dilation, false, {}, groups)
+  input: conv_grad_weight_wrt_input(grad, grad_output, input, stride, padding, dilation, false, {}, groups)
+  weight: zeros_like(weight)
+
+- name: conv2d_grad_bias(Tensor grad_output, Tensor input, Tensor weight, int[] stride, int[] padding, int[] dilation, int groups) -> Tensor
+  grad_output: conv_grad_bias_wrt_grad_output(grad, grad_output)
+  input: zeros_like(input)
+  weight: zeros_like(weight)
+
+- name: conv3d_grad_input(Tensor grad_output, Tensor input, Tensor weight, int[] stride, int[] padding, int[] dilation, int groups) -> Tensor
+  grad_output: conv_grad_input_wrt_grad_output(grad, weight, stride, padding, dilation, false, {}, groups)
+  weight: conv_grad_input_wrt_weight(grad, grad_output, weight, stride, padding, dilation, false, {}, groups)
+  input: zeros_like(input)
+
+- name: conv3d_grad_weight(Tensor grad_output, Tensor input, Tensor weight, int[] stride, int[] padding, int[] dilation, int groups) -> Tensor
+  grad_output: conv_grad_weight_wrt_grad_output(grad, input, stride, padding, dilation, false, {}, groups)
+  input: conv_grad_weight_wrt_input(grad, grad_output, input, stride, padding, dilation, false, {}, groups)
+  weight: zeros_like(weight)
+
+- name: conv3d_grad_bias(Tensor grad_output, Tensor input, Tensor weight, int[] stride, int[] padding, int[] dilation, int groups) -> Tensor
+  grad_output: conv_grad_bias_wrt_grad_output(grad, grad_output)
+  input: zeros_like(input)
+  weight: zeros_like(weight)
+
+- name: conv_transpose1d_grad_input(Tensor grad_output, Tensor input, Tensor weight, int[] stride, int[] padding, int[] output_padding, int groups, int[] dilation) -> Tensor
+  grad_output: conv_grad_input_wrt_grad_output(grad, weight, stride, padding, dilation, true, output_padding, groups)
+  weight: conv_grad_input_wrt_weight(grad, grad_output, weight, stride, padding, dilation, true, output_padding, groups)
+  input: zeros_like(input)
+
+- name: conv_transpose1d_grad_weight(Tensor grad_output, Tensor input, Tensor weight, int[] stride, int[] padding, int[] output_padding, int groups, int[] dilation) -> Tensor
+  grad_output: conv_grad_weight_wrt_grad_output(grad, input, stride, padding, dilation, true, output_padding, groups)
+  input: conv_grad_weight_wrt_input(grad, grad_output, input, stride, padding, dilation, true, output_padding, groups)
+  weight: zeros_like(weight)
+
+- name: conv_transpose1d_grad_bias(Tensor grad_output, Tensor input, Tensor weight, int[] stride, int[] padding, int[] output_padding, int groups, int[] dilation) -> Tensor
+  grad_output: conv_grad_bias_wrt_grad_output(grad, grad_output)
+  input: zeros_like(input)
+  weight: zeros_like(weight)
+
+- name: conv_transpose2d_grad_input(Tensor grad_output, Tensor input, Tensor weight, int[] stride, int[] padding, int[] output_padding, int groups, int[] dilation) -> Tensor
+  grad_output: conv_grad_input_wrt_grad_output(grad, weight, stride, padding, dilation, true, output_padding, groups)
+  weight: conv_grad_input_wrt_weight(grad, grad_output, weight, stride, padding, dilation, true, output_padding, groups)
+  input: zeros_like(input)
+
+- name: conv_transpose2d_grad_weight(Tensor grad_output, Tensor input, Tensor weight, int[] stride, int[] padding, int[] output_padding, int groups, int[] dilation) -> Tensor
+  grad_output: conv_grad_weight_wrt_grad_output(grad, input, stride, padding, dilation, true, output_padding, groups)
+  input: conv_grad_weight_wrt_input(grad, grad_output, input, stride, padding, dilation, true, output_padding, groups)
+  weight: zeros_like(weight)
+
+- name: conv_transpose2d_grad_bias(Tensor grad_output, Tensor input, Tensor weight, int[] stride, int[] padding, int[] output_padding, int groups, int[] dilation) -> Tensor
+  grad_output: conv_grad_bias_wrt_grad_output(grad, grad_output)
+  input: zeros_like(input)
+  weight: zeros_like(weight)
+
+- name: conv_transpose3d_grad_input(Tensor grad_output, Tensor input, Tensor weight, int[] stride, int[] padding, int[] output_padding, int groups, int[] dilation) -> Tensor
+  grad_output: conv_grad_input_wrt_grad_output(grad, weight, stride, padding, dilation, true, output_padding, groups)
+  weight: conv_grad_input_wrt_weight(grad, grad_output, weight, stride, padding, dilation, true, output_padding, groups)
+  input: zeros_like(input)
+
+- name: conv_transpose3d_grad_weight(Tensor grad_output, Tensor input, Tensor weight, int[] stride, int[] padding, int[] output_padding, int groups, int[] dilation) -> Tensor
+  grad_output: conv_grad_weight_wrt_grad_output(grad, input, stride, padding, dilation, true, output_padding, groups)
+  input: conv_grad_weight_wrt_input(grad, grad_output, input, stride, padding, dilation, true, output_padding, groups)
+  weight: zeros_like(weight)
+
+- name: conv_transpose3d_grad_bias(Tensor grad_output, Tensor input, Tensor weight, int[] stride, int[] padding, int[] output_padding, int groups, int[] dilation) -> Tensor
+  grad_output: conv_grad_bias_wrt_grad_output(grad, grad_output)
+  input: zeros_like(input)
+  weight: zeros_like(weight)
+
 # is the col2im kernel plus input-shape bookkeeping; same for col2im_backward.
 - name: im2col(Tensor self, int[] kernel_size, int[] dilation, int[] padding, int[] stride) -> Tensor
   self: im2col_backward(grad, self.shape(), kernel_size, dilation, padding, stride)
