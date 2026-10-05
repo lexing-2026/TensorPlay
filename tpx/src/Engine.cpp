@@ -490,43 +490,21 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
         // undefined input gradient so user backward functions never see None
         // unless they opted out via set_materialize_grads(false).
         //
-        // Metadata source differs by node kind: custom-function nodes
-        // (PyNode) record per-OUTPUT-slot metadata at attach time (their
-        // backward inputs ARE the forward outputs); generated derivative
-        // nodes fall back to the metadata recorded on their next_edges.
+        // The zeros are built from the per-output-slot metadata a node
+        // recorded when it was attached (custom-function nodes and the
+        // multi-output views).  A node without that record is handed the
+        // undefined gradient and answers for it itself: its next edges
+        // describe the forward inputs, whose shapes say nothing about the
+        // outputs whose gradients are missing.
         if (func->materialize_grads()) {
             const auto& out_metas = func->output_metas();
-            const auto& in_edges = func->next_edges();
-            const size_t n = std::min(vars.size(),
-                out_metas.empty() ? in_edges.size() : out_metas.size());
+            const size_t n = std::min(vars.size(), out_metas.size());
             for (size_t i = 0; i < n; ++i) {
-                if (vars[i].defined()) continue;
-                std::vector<int64_t> shape;
-                DType dt = DType::Undefined;
-                DeviceType dev_type = DeviceType::CPU;
-                int64_t dev_idx = -1;
-                bool have = false;
-                if (!out_metas.empty() && i < out_metas.size()
-                    && out_metas[i].valid) {
-                    shape = out_metas[i].shape;
-                    dt = out_metas[i].dtype;
-                    dev_type = out_metas[i].device_type;
-                    dev_idx = out_metas[i].device_index;
-                    have = true;
-                } else if (i < in_edges.size() && in_edges[i].has_shape_hint
-                           && in_edges[i].grad_dtype.has_value()
-                           && in_edges[i].device_type_hint.has_value()
-                           && in_edges[i].device_index_hint.has_value()) {
-                    shape = in_edges[i].shape_hint;
-                    dt = *in_edges[i].grad_dtype;
-                    dev_type = *in_edges[i].device_type_hint;
-                    dev_idx = *in_edges[i].device_index_hint;
-                    have = true;
-                }
-                if (!have) continue;
-                Device dev(dev_type,
-                           dev_type == DeviceType::CPU ? -1 : dev_idx);
-                vars[i] = ops::zeros(shape, dt, dev);
+                if (vars[i].defined() || !out_metas[i].valid) continue;
+                const OutputSlotMeta& meta = out_metas[i];
+                Device dev(meta.device_type,
+                           meta.device_type == DeviceType::CPU ? -1 : meta.device_index);
+                vars[i] = ops::zeros(meta.shape, meta.dtype, dev);
             }
         }
         for (const auto& hook : func->tensor_pre_hooks()) {

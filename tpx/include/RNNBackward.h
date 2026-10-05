@@ -402,21 +402,33 @@ public:
     // delivered at input slots 0..n by the engine.
     size_t num_inputs() const override { return kind_ == 0 ? 3 : 2; }
 
+    // A loss that reads only the final hidden (or cell) state leaves the
+    // sequence output's gradient undefined; it is then zero, shaped like the
+    // output: the input's layout with one hidden width per direction.
     variable_list apply(variable_list&& inputs) override {
-        if (inputs.empty() || !inputs[0].defined()) {
-            variable_list undef(1 + hx_.size() + params_.size());
-            return undef;
+        const auto slot = [&](size_t i) {
+            return i < inputs.size() ? inputs[i] : Tensor();
+        };
+        const Tensor grad_hy = slot(1);
+        const Tensor grad_cy = slot(2);
+        Tensor grad_y = slot(0);
+        if (!grad_y.defined() && !grad_hy.defined() && !grad_cy.defined()) {
+            return variable_list(1 + hx_.size() + params_.size());
         }
         std::vector<Tensor> hx, params;
         hx.reserve(hx_.size());
         for (auto& sv : hx_) hx.push_back(sv.unpack());
         params.reserve(params_.size());
         for (auto& sv : params_) params.push_back(sv.unpack());
-        const Tensor grad_y = inputs[0];
-        const Tensor grad_hy = inputs.size() > 1 ? inputs[1] : Tensor();
-        const Tensor grad_cy = inputs.size() > 2 ? inputs[2] : Tensor();
+        const Tensor input = input_.unpack();
+        if (!grad_y.defined()) {
+            const IntArrayRef sizes = input.sizes();
+            std::vector<int64_t> shape(sizes.begin(), sizes.end());
+            shape.back() = hx[0].size(-1) * (bidirectional_ ? 2 : 1);
+            grad_y = ops::zeros(shape, input.dtype(), input.device());
+        }
         auto [gx, ghx, gparams] = rnn_backward_impl(
-            kind_, grad_y, grad_hy, grad_cy, input_.unpack(), hx, params,
+            kind_, grad_y, grad_hy, grad_cy, input, hx, params,
             has_biases_, num_layers_, bidirectional_, batch_first_);
         variable_list grads;
         grads.reserve(1 + hx_.size() + params_.size());
