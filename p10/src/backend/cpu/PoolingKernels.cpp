@@ -1,7 +1,9 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
+#include "MemoryFormat.h"
 #include "Parallel.h"
+#include "cpu/PoolingKernels.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include <vector>
 #include <cmath>
@@ -244,9 +246,9 @@ Tensor max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
     }
 
     if (H_out <= 0 || W_out <= 0) TP_THROW(RuntimeError, "max_pool2d: Calculated output size is too small");
-    
+
     // Ensure padding doesn't make us start reading out of bounds if ceil_mode used?
-    
+
     Tensor out = Tensor::empty({N, C, H_out, W_out}, input.dtype(), input.device());
     
     TP_DISPATCH_ALL_TYPES(input.dtype(), "max_pool2d", [&]() {
@@ -344,8 +346,24 @@ Tensor avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
 
     if (H_out <= 0 || W_out <= 0) TP_THROW(RuntimeError, "avg_pool2d: Calculated output size is too small");
 
+    // Channels-last frames pool the NHWC buffer in place; the channel span
+    // is the tier-compiled vectorized dimension (cpu/PoolingKernels.h).
+    // Non-vectorized dtypes keep the NCHW path below.
+    if (input.is_contiguous(MemoryFormat::ChannelsLast) &&
+        (input.dtype() == DType::Float32 || input.dtype() == DType::Float64)) {
+        Tensor out = Tensor::empty({N, C, H_out, W_out}, input.dtype(), input.device());
+        out = out.as_strided({N, C, H_out, W_out},
+                             get_channels_last_strides({N, C, H_out, W_out}), 0);
+        avg_pool2d_cl_stub(DeviceType::CPU, input.data_ptr(), out.data_ptr(),
+                           N, C, H_in, W_in, H_out, W_out, kH, kW, sH, sW,
+                           pH, pW, count_include_pad,
+                           divisor_override.has_value() ? *divisor_override : 0,
+                           static_cast<int>(input.dtype()));
+        return out;
+    }
+
     Tensor out = Tensor::empty({N, C, H_out, W_out}, input.dtype(), input.device());
-    
+
     TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "avg_pool2d", [&]() {
         scalar_t* out_ptr = out.data_ptr<scalar_t>();
         const scalar_t* in_ptr = input_c.data_ptr<scalar_t>();
@@ -408,9 +426,23 @@ Tensor adaptive_avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
     int64_t H_out, W_out;
     std::tie(H_out, W_out) = get_pair(output_size);
     if (H_out <= 0 || W_out <= 0) TP_THROW(RuntimeError, "adaptive_avg_pool2d: Invalid output size");
-    
+
+    // Channels-last frames pool the NHWC buffer in place; the channel span
+    // is the tier-compiled vectorized dimension (cpu/PoolingKernels.h).
+    if (input.is_contiguous(MemoryFormat::ChannelsLast) &&
+        (input.dtype() == DType::Float32 || input.dtype() == DType::Float64)) {
+        Tensor out = Tensor::empty({N, C, H_out, W_out}, input.dtype(), input.device());
+        out = out.as_strided({N, C, H_out, W_out},
+                             get_channels_last_strides({N, C, H_out, W_out}), 0);
+        adaptive_avg_pool2d_cl_stub(DeviceType::CPU, input.data_ptr(),
+                                    out.data_ptr(), N, C, H_in, W_in,
+                                    H_out, W_out,
+                                    static_cast<int>(input.dtype()));
+        return out;
+    }
+
     Tensor out = Tensor::empty({N, C, H_out, W_out}, input.dtype(), input.device());
-    
+
     TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "adaptive_avg_pool2d", [&]() {
         scalar_t* out_ptr = out.data_ptr<scalar_t>();
         const scalar_t* in_ptr = input_c.data_ptr<scalar_t>();
@@ -771,13 +803,30 @@ std::tuple<Tensor, Tensor> adaptive_max_pool2d_with_indices_cpu(const Tensor& in
         return std::make_tuple(std::get<0>(r).squeeze(0), std::get<1>(r).squeeze(0));
     }
     if (input.dim() != 4) TP_THROW(RuntimeError, "adaptive_max_pool2d_with_indices: Expected 4D input");
-    const Tensor input_c = input.contiguous();
-    const int64_t N = input_c.size(0), C = input_c.size(1);
-    const int64_t H_in = input_c.size(2), W_in = input_c.size(3);
+    const int64_t N = input.size(0), C = input.size(1);
+    const int64_t H_in = input.size(2), W_in = input.size(3);
     int64_t H_out, W_out;
     std::tie(H_out, W_out) = get_pair(output_size);
     if (H_out <= 0 || W_out <= 0) TP_THROW(RuntimeError, "adaptive_max_pool2d_with_indices: Invalid output size");
 
+    // Channels-last frames pool the NHWC buffer in place; the channel span
+    // is the tier-compiled vectorized dimension (cpu/PoolingKernels.h).
+    // Values come back channels-last, indices stay dense NCHW int64 exactly
+    // like the scalar frame below.  Other dtypes take the NCHW path.
+    if (input.is_contiguous(MemoryFormat::ChannelsLast) &&
+        (input.dtype() == DType::Float32 || input.dtype() == DType::Float64)) {
+        Tensor out = Tensor::empty({N, C, H_out, W_out}, input.dtype(), input.device());
+        out = out.as_strided({N, C, H_out, W_out},
+                             get_channels_last_strides({N, C, H_out, W_out}), 0);
+        Tensor indices = Tensor::empty({N, C, H_out, W_out}, DType::Int64, input.device());
+        adaptive_max_pool2d_cl_stub(DeviceType::CPU, input.data_ptr(),
+                                    out.data_ptr(), indices.data_ptr<int64_t>(),
+                                    N, C, H_in, W_in, H_out, W_out,
+                                    static_cast<int>(input.dtype()));
+        return std::make_tuple(out, indices);
+    }
+
+    const Tensor input_c = input.contiguous();
     Tensor out = Tensor::empty({N, C, H_out, W_out}, input.dtype(), input.device());
     Tensor indices = Tensor::empty({N, C, H_out, W_out}, DType::Int64, input.device());
 
@@ -1053,9 +1102,8 @@ std::tuple<Tensor, Tensor> max_pool2d_with_indices_cpu(
         return std::make_tuple(std::get<0>(r).squeeze(0), std::get<1>(r).squeeze(0));
     }
     if (input.dim() != 4) TP_THROW(RuntimeError, "max_pool2d_with_indices: Expected 4D input");
-    const Tensor input_c = input.contiguous();
-    const int64_t N = input_c.size(0), C = input_c.size(1);
-    const int64_t H_in = input_c.size(2), W_in = input_c.size(3);
+    const int64_t N = input.size(0), C = input.size(1);
+    const int64_t H_in = input.size(2), W_in = input.size(3);
 
     const auto ks = expand_pool_param(kernel_size, "max_pool2d_with_indices kernel_size", 2, 1);
     const auto st = expand_pool_param(stride.empty() ? ks : stride, "max_pool2d_with_indices stride", 2, ks[0]);
@@ -1069,6 +1117,24 @@ std::tuple<Tensor, Tensor> max_pool2d_with_indices_cpu(
     if (H_out <= 0 || W_out <= 0)
         TP_THROW(RuntimeError, "max_pool2d_with_indices: Calculated output size is too small");
 
+    // Channels-last frames pool the NHWC buffer in place; the channel span
+    // is the tier-compiled vectorized dimension (cpu/PoolingKernels.h).
+    // Values come back channels-last, indices stay dense NCHW int64 exactly
+    // like the scalar frame below.  Other dtypes take the NCHW path.
+    if (input.is_contiguous(MemoryFormat::ChannelsLast) &&
+        (input.dtype() == DType::Float32 || input.dtype() == DType::Float64)) {
+        Tensor out = Tensor::empty({N, C, H_out, W_out}, input.dtype(), input.device());
+        out = out.as_strided({N, C, H_out, W_out},
+                             get_channels_last_strides({N, C, H_out, W_out}), 0);
+        Tensor indices = Tensor::empty({N, C, H_out, W_out}, DType::Int64, input.device());
+        max_pool2d_cl_stub(DeviceType::CPU, input.data_ptr(), out.data_ptr(),
+                           indices.data_ptr<int64_t>(),
+                           N, C, H_in, W_in, H_out, W_out, kH, kW, sH, sW,
+                           pH, pW, dH, dW, static_cast<int>(input.dtype()));
+        return std::make_tuple(out, indices);
+    }
+
+    const Tensor input_c = input.contiguous();
     Tensor out = Tensor::empty({N, C, H_out, W_out}, input.dtype(), input.device());
     Tensor indices = Tensor::empty({N, C, H_out, W_out}, DType::Int64, input.device());
 
@@ -1635,6 +1701,11 @@ Tensor adaptive_max_pool3d_backward_cpu(const Tensor& grad_output, const Tensor&
     });
     return grad_input;
 }
+
+DEFINE_DISPATCH(avg_pool2d_cl_stub);
+DEFINE_DISPATCH(max_pool2d_cl_stub);
+DEFINE_DISPATCH(adaptive_avg_pool2d_cl_stub);
+DEFINE_DISPATCH(adaptive_max_pool2d_cl_stub);
 
 TENSORPLAY_LIBRARY_IMPL(CPU, PoolingKernels) {
     m.impl("avg_pool2d", avg_pool2d_cpu);

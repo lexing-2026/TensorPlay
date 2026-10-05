@@ -660,8 +660,9 @@ def max_pool2d(input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode
         stride = _pair(stride)
     padding = _pair(padding)
     dilation = _pair(dilation)
-    # native kernel assumes contiguous layout; normalize views (no-op when
-    return _C.max_pool2d(input.contiguous(), kernel_size, stride, padding,
+    # Non-contiguous inputs (any memory format) are normalized by the CPU
+    # kernel itself; channels-last tensors keep their layout end to end.
+    return _C.max_pool2d(input, kernel_size, stride, padding,
                          dilation, ceil_mode)
 
 def avg_pool2d(input, kernel_size, stride=None, padding=0, ceil_mode=False, count_include_pad=True, divisor_override=None):
