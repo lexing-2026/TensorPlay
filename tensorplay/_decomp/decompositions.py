@@ -21,6 +21,7 @@ from tensorplay._ops import NATIVE_NAMESPACE
 from . import register_decomposition
 
 ops = getattr(tp.ops, NATIVE_NAMESPACE)
+prims = tp.ops.prims
 
 
 def _inplace(functional: Callable[..., Any]) -> Callable[..., Any]:
@@ -3388,3 +3389,178 @@ def tp_poisson_nll_loss(input, target, log_input=True, full=False, eps=1e-08, re
         stirling = target * tp.log(target) - target + 0.5 * tp.log(2 * math.pi * target)
         loss = loss + tp.masked_fill(stirling, target <= 1, 0)
     return _reduce(loss, reduction)
+
+
+# ---------------------------------------------------------------------------
+# Writing forms of the bitwise, logical and activation operations
+#
+# An in-place overload computes what the non-writing one computes and writes
+# the answer into the value it was called on; the operation behind it is the
+# same one, and only where the answer goes differs.
+# ---------------------------------------------------------------------------
+
+
+@register_decomposition([ops.bitwise_and_.Scalar, ops.bitwise_and_.Tensor])
+def bitwise_and_(self, other):
+    return self.copy_(ops.bitwise_and(self, other))
+
+
+@register_decomposition([ops.bitwise_or_.Scalar, ops.bitwise_or_.Tensor])
+def bitwise_or_(self, other):
+    return self.copy_(ops.bitwise_or(self, other))
+
+
+@register_decomposition([ops.bitwise_xor_.Scalar, ops.bitwise_xor_.Tensor])
+def bitwise_xor_(self, other):
+    return self.copy_(ops.bitwise_xor(self, other))
+
+
+@register_decomposition(ops.bitwise_not_.default)
+def bitwise_not_(self):
+    return self.copy_(ops.bitwise_not(self))
+
+
+@register_decomposition(
+    [ops.bitwise_left_shift_.Tensor, ops.bitwise_left_shift_.Tensor_Scalar]
+)
+def bitwise_left_shift_(self, other):
+    return self.copy_(ops.bitwise_left_shift(self, other))
+
+
+@register_decomposition(
+    [ops.bitwise_right_shift_.Tensor, ops.bitwise_right_shift_.Tensor_Scalar]
+)
+def bitwise_right_shift_(self, other):
+    return self.copy_(ops.bitwise_right_shift(self, other))
+
+
+@register_decomposition(ops.logical_and_.default)
+def logical_and_(self, other):
+    return self.copy_(ops.logical_and(self, other))
+
+
+@register_decomposition(ops.logical_not_.default)
+def logical_not_(self):
+    return self.copy_(ops.logical_not(self))
+
+
+@register_decomposition(ops.logical_or_.default)
+def logical_or_(self, other):
+    return self.copy_(ops.logical_or(self, other))
+
+
+@register_decomposition(ops.logical_xor_.default)
+def logical_xor_(self, other):
+    return self.copy_(ops.logical_xor(self, other))
+
+
+@register_decomposition(ops.relu_.default)
+def relu_(self):
+    return self.copy_(ops.relu(self))
+
+
+@register_decomposition(ops.sigmoid_.default)
+def sigmoid_(self):
+    return self.copy_(ops.sigmoid(self))
+
+
+@register_decomposition([ops.__iand__.Scalar, ops.__iand__.Tensor])
+def __iand__(self, other):
+    return self.copy_(ops.__and__(self, other))
+
+
+@register_decomposition([ops.__ior__.Scalar, ops.__ior__.Tensor])
+def __ior__(self, other):
+    return self.copy_(ops.__or__(self, other))
+
+
+@register_decomposition([ops.__ixor__.Scalar, ops.__ixor__.Tensor])
+def __ixor__(self, other):
+    return self.copy_(ops.__xor__(self, other))
+
+
+@register_decomposition([ops.__ilshift__.Scalar, ops.__ilshift__.Tensor])
+def __ilshift__(self, other):
+    return self.copy_(ops.__lshift__(self, other))
+
+
+@register_decomposition([ops.__irshift__.Scalar, ops.__irshift__.Tensor])
+def __irshift__(self, other):
+    return self.copy_(ops.__rshift__(self, other))
+
+
+# ---------------------------------------------------------------------------
+# A value carried under a new name
+#
+# Lifting retags a value as one a graph owns: the values and the sharing
+# underneath are the ones it already has, so what comes back is the value
+# itself.
+# ---------------------------------------------------------------------------
+
+
+@register_decomposition([ops.lift.default, ops.lift_fresh.default])
+def lift(x):
+    return ops.alias(x)
+
+
+# ---------------------------------------------------------------------------
+# A shape read at a layout of its own, a scatter into such a shape, and a
+# place made to a shape and a layout
+# ---------------------------------------------------------------------------
+
+
+@register_decomposition(ops.as_strided_copy.default)
+def as_strided_copy(self, size, stride, storage_offset=None):
+    return ops.as_strided(self, size, stride, storage_offset).clone(
+        memory_format=tp.contiguous_format
+    )
+
+
+@register_decomposition(ops.as_strided_scatter.default)
+def as_strided_scatter(input, src, size, stride, storage_offset=None):
+    # The distances are measured from the start of the storage, so an offset
+    # nobody stated is the start of it rather than a question about the input.
+    offset = 0 if storage_offset is None else storage_offset
+    return prims.as_strided_scatter(input, src, size, stride, offset)
+
+
+@register_decomposition(ops.new_empty_strided.default)
+def new_empty_strided(
+    self, size, stride, *, dtype=None, layout=None, device=None, pin_memory=None
+):
+    if layout is not None and layout != tp.strided:
+        raise NotImplementedError(f"layout={layout}")
+    return ops.empty_strided(
+        size,
+        stride,
+        dtype=_dtype_or(dtype, self.dtype),
+        device=device or self.device,
+        pin_memory=bool(pin_memory),
+    )
+
+
+# ---------------------------------------------------------------------------
+# A draw of normal values, written as a read of a distribution at a shape
+# ---------------------------------------------------------------------------
+
+
+@register_decomposition(ops.randn.default)
+def randn(size, *, dtype=None, device=None, requires_grad=False):
+    return prims.normal(
+        size,
+        mean=0.0,
+        std=1.0,
+        dtype=_dtype_or(dtype, tp.get_default_dtype()),
+        device=device or tp.get_default_device(),
+        requires_grad=requires_grad,
+    )
+
+
+# ---------------------------------------------------------------------------
+# How many positions a value has, as a number rather than as a read
+# ---------------------------------------------------------------------------
+
+
+@register_decomposition(ops.sym_numel.default)
+def sym_numel(t):
+    return reduce(operator.mul, t.shape, 1)

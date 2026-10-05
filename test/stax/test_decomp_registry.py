@@ -126,6 +126,13 @@ SAMPLES = {
     "unsafe_split.Tensor": lambda: ((_t(5), 2), {}),
     "unsafe_split_with_sizes.default": lambda: ((_t(5), [2, 3]), {}),
     "split_with_sizes_copy.default": lambda: ((_t(5), [4, 1]), {}),
+    "lift.default": lambda: ((_t(3),), {}),
+    "lift_fresh.default": lambda: ((_t(3),), {}),
+    "as_strided_copy.default": lambda: ((tp.arange(6.0), [2, 3], [3, 1]), {"storage_offset": 0}),
+    "as_strided_scatter.default": lambda: (
+        (tp.arange(6.0), tp.arange(6.0).reshape(2, 3) + 100, [2, 3], [3, 1]),
+        {"storage_offset": 0},
+    ),
     "unbind.default": lambda: ((_t(3, 2),), {}),
     "unbind.int": lambda: ((_t(3, 2), 1), {}),
     "narrow.default": lambda: ((_t(5, 2), 0, 1, 3), {}),
@@ -416,6 +423,52 @@ def _nll2d_backward_sample():
     return ((tp.tensor(1.0), scores, target, None, 1, -100, total_weight), {})
 
 
+# Inputs for the in-place overloads that reuse the functional operator and
+# write the answer into the value they were called on; each call builds
+# fresh values so no case sees what a previous one wrote.
+def _int_vals():
+    return tp.tensor([5, 6, 9, 12])
+
+
+def _shift_vals():
+    return tp.tensor([1, 2, 0, 3])
+
+
+def _bool_vals():
+    return tp.tensor([True, False, True, True])
+
+
+WRITING_FORMS = {
+    "bitwise_and_.Tensor": lambda: (_int_vals(), _int_vals()),
+    "bitwise_and_.Scalar": lambda: (_int_vals(), 7),
+    "bitwise_or_.Tensor": lambda: (_int_vals(), _int_vals()),
+    "bitwise_or_.Scalar": lambda: (_int_vals(), 7),
+    "bitwise_xor_.Tensor": lambda: (_int_vals(), _int_vals()),
+    "bitwise_xor_.Scalar": lambda: (_int_vals(), 7),
+    "bitwise_not_.default": lambda: (_int_vals(),),
+    "bitwise_left_shift_.Tensor": lambda: (_int_vals(), _shift_vals()),
+    "bitwise_left_shift_.Tensor_Scalar": lambda: (_int_vals(), 2),
+    "bitwise_right_shift_.Tensor": lambda: (_int_vals(), _shift_vals()),
+    "bitwise_right_shift_.Tensor_Scalar": lambda: (_int_vals(), 2),
+    "logical_and_.default": lambda: (_bool_vals(), _bool_vals()),
+    "logical_not_.default": lambda: (_bool_vals(),),
+    "logical_or_.default": lambda: (_bool_vals(), _bool_vals()),
+    "logical_xor_.default": lambda: (_bool_vals(), _bool_vals()),
+    "relu_.default": lambda: (_t(4, low=-1.0, high=1.0),),
+    "sigmoid_.default": lambda: (_t(4, low=-3.0, high=3.0),),
+    "__iand__.Tensor": lambda: (_int_vals(), _int_vals()),
+    "__iand__.Scalar": lambda: (_int_vals(), 7),
+    "__ior__.Tensor": lambda: (_int_vals(), _int_vals()),
+    "__ior__.Scalar": lambda: (_int_vals(), 7),
+    "__ixor__.Tensor": lambda: (_int_vals(), _int_vals()),
+    "__ixor__.Scalar": lambda: (_int_vals(), 7),
+    "__ilshift__.Tensor": lambda: (_int_vals(), _shift_vals()),
+    "__ilshift__.Scalar": lambda: (_int_vals(), 2),
+    "__irshift__.Tensor": lambda: (_int_vals(), _shift_vals()),
+    "__irshift__.Scalar": lambda: (_int_vals(), 2),
+}
+
+
 def _registered_functional():
     return {
         overload: fn
@@ -506,6 +559,7 @@ def test_every_functional_decomposition_has_a_sample():
             "empty_like.default", "new_empty.default", "_chunk_cat.default",
             "_fused_rms_norm.default", "_fused_rms_norm_backward.default",
             "dropout.default", "native_dropout.default", "native_layer_norm.default",
+            "new_empty_strided.default", "randn.default", "sym_numel.default",
         }
         and str(o).split(".", 1)[1] not in DEVICE_SPECIFIC
         and not any(a.is_out for a in o._schema.arguments)
@@ -522,6 +576,58 @@ def test_inplace_decomposition_writes_self():
     result = fn(y, 0.2)
     assert result is y
     assert tp.allclose(y, expected)
+
+
+@pytest.mark.parametrize("name", sorted(WRITING_FORMS))
+def test_inplace_writing_form_matches_operator(name):
+    get_decompositions([])
+    packet, overload_name = name.split(".")
+    overload = getattr(getattr(ops, packet), overload_name)
+    assert overload in decomposition_table
+    args = WRITING_FORMS[name]()
+    expected = overload(args[0].clone(), *args[1:])
+    inputs = (args[0].clone(),) + tuple(
+        a.clone() if isinstance(a, tp.Tensor) else a for a in args[1:]
+    )
+    result = decomposition_table[overload](*inputs)
+    assert result is inputs[0]
+    if expected.dtype == tp.bool or not expected.is_floating_point():
+        assert tp.equal(result, expected)
+    else:
+        assert tp.allclose(result, expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"dtype": tp.float64}, {"dtype": tp.int32}])
+def test_new_empty_strided_metadata(kwargs):
+    get_decompositions([])
+    x = _t(2)
+    expected = ops.new_empty_strided.default(x, [4, 1], [1, 4], **kwargs)
+    got = decomposition_table[ops.new_empty_strided.default](x, [4, 1], [1, 4], **kwargs)
+    assert got.dtype == expected.dtype
+    assert tuple(got.shape) == tuple(expected.shape)
+    assert tuple(got.stride()) == tuple(expected.stride())
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{}, {"dtype": tp.float64}, {"requires_grad": True}, {"device": tp.get_default_device()}],
+)
+def test_randn_decomposition_draws_at_shape(kwargs):
+    get_decompositions([])
+    got = decomposition_table[ops.randn.default]([3, 4], **kwargs)
+    assert tuple(got.shape) == (3, 4)
+    assert got.dtype == kwargs.get("dtype", tp.get_default_dtype())
+    assert got.requires_grad == kwargs.get("requires_grad", False)
+    assert bool(tp.isfinite(got).all())
+
+
+def test_sym_numel_counts_positions():
+    get_decompositions([])
+    x = _t(2, 3, 4)
+    got = decomposition_table[ops.sym_numel.default](x)
+    assert isinstance(got, int)
+    assert got == 24
+    assert got == ops.sym_numel.default(x)
 
 
 def test_out_overload_writes_destination():
