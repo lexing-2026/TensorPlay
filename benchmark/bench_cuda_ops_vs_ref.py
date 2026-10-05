@@ -64,7 +64,8 @@ def build_cases(dev, dtype):
 
     C = []
     # ---- softmax 家族（SoftmaxKernels.cu）----
-    for shape in [(8192, 512), (4096, 1024), (2048, 2048), (32, 256, 32, 32), (65536, 128)]:
+    for shape in [(8192, 512), (4096, 1024), (2048, 2048), (32, 256, 32, 32), (65536, 128),
+                  (65536, 768), (16384, 2048), (4, 32, 1024, 1024)]:
         x = r(*shape)
         tx = T(x)
         C.append((f"softmax.dim-1{shape}", lambda tx=tx: F.softmax(tx, -1),
@@ -86,6 +87,22 @@ def build_cases(dev, dtype):
         C.append((f"amax.dim-1{shape}", lambda tx=tx: F.amax(tx, [-1]), lambda x=x: torch.amax(x, -1)))
         C.append((f"var_mean{shape}", lambda tx=tx: F.var_mean(tx, [-1]),
                   lambda x=x: torch.var_mean(x, -1)))
+    # ---- 带索引的维度极值（打包值+下标归一路径）----
+    for shape in [(4096, 4096), (1024, 1024, 64)]:
+        x = r(*shape)
+        tx = T(x)
+        C.append((f"max.dim-1{shape}", lambda tx=tx: F.max(tx, -1), lambda x=x: torch.max(x, -1)))
+        C.append((f"min.dim-1{shape}", lambda tx=tx: F.min(tx, -1), lambda x=x: torch.min(x, -1)))
+        C.append((f"argmax.dim-1{shape}", lambda tx=tx: F.argmax(tx, -1),
+                  lambda x=x: torch.argmax(x, -1)))
+        C.append((f"argmin.dim-1{shape}", lambda tx=tx: F.argmin(tx, -1),
+                  lambda x=x: torch.argmin(x, -1)))
+        C.append((f"aminmax.dim-1{shape}", lambda tx=tx: F.aminmax(tx, -1),
+                  lambda x=x: torch.aminmax(x, dim=-1)))
+    x = r(4096, 4096)
+    tx = T(x)
+    C.append(("max.dim0", lambda tx=tx: F.max(tx, 0), lambda x=x: torch.max(x, 0)))
+    C.append(("argmax.dim0", lambda tx=tx: F.argmax(tx, 0), lambda x=x: torch.argmax(x, 0)))
     # ---- 逐元素家族（ArithmeticKernels.cu / UnaryMathKernels.cu）----
     a, b = r(4096, 4096), r(4096, 1)
     ta, tb = T(a), T(b)
@@ -101,6 +118,9 @@ def build_cases(dev, dtype):
     tx = T(x)
     C.append(("cumsum.dim-1", lambda tx=tx: F.cumsum(tx, -1), lambda x=x: torch.cumsum(x, -1)))
     C.append(("cummax.dim-1", lambda tx=tx: F.cummax(tx, -1), lambda x=x: torch.cummax(x, -1)))
+    C.append(("cummin.dim-1", lambda tx=tx: F.cummin(tx, -1), lambda x=x: torch.cummin(x, -1)))
+    C.append(("cummax.dim0", lambda tx=tx: F.cummax(tx, 0), lambda x=x: torch.cummax(x, 0)))
+    C.append(("cummin.dim0", lambda tx=tx: F.cummin(tx, 0), lambda x=x: torch.cummin(x, 0)))
     C.append(("sort.dim-1", lambda tx=tx: F.sort(tx, -1), lambda x=x: torch.sort(x, -1)))
     # topk returns (values, indices); compare the values only.
     C.append(("topk.k64", lambda tx=tx: F.topk(tx, 64, -1)[0],
