@@ -330,6 +330,8 @@ TENSOR_METHODS = {
     "atan2": "atan2", "clamp": "clamp", "lerp": "lerp", "clone": "clone",
     "detach": "detach", "contiguous": "contiguous", "select": "select",
     "slice": "slice", "t_": "t_", "conj": "conj",
+    # A type conversion inside a formula stays on the recorded graph.
+    "to": "to",
 }
 
 _GRAD_SYMBOLS = {"grad", "grad_output"}
