@@ -332,10 +332,14 @@ void cast_contiguous(dst_t* dst, const src_t* src, int64_t len) {
 
 
 
-Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
+Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
     if (!self.device().is_cpu()) {
         throw std::runtime_error("copy_kernel (CPU) called with non-CPU destination");
     }
+    // The source broadcasts to the destination's shape; a source that does
+    // not is refused rather than read past its own elements.
+    const Tensor src = src_in.shape() == self.shape()
+        ? src_in : src_in.expand(static_cast<std::vector<int64_t>>(self.shape()));
 
     // of empty tensors away from memcpy/cudaMemcpyAsync.
     if (self.numel() == 0) {

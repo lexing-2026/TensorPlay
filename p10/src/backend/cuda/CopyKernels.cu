@@ -335,10 +335,19 @@ __global__ void transpose_tiled_vec4_batched_kernel(
 // dst is a [rows, cols] column-major view of a [cols, rows] row-major
 // source: the two storages agree element for element, so the copy
 // degenerates to memcpy.
+// The two layouts place every element at the same offset of one dense
+// block (a transposed or channels-last tensor copied onto the same layout),
+// so a byte copy moves each element onto itself.  Equal extents are
+// required: a block that only matches after relabelling the dimensions is
+// a different tensor.
 bool transpose_layout_is_identity(const Tensor& self, const Tensor& src) {
-    return self.dim() == 2 && src.dim() == 2 &&
-           self.size(0) == src.size(1) && self.size(1) == src.size(0) &&
-           self.stride(0) == 1 && self.stride(1) == self.size(0);
+    if (self.dim() != src.dim()) return false;
+    for (int64_t d = 0; d < self.dim(); ++d) {
+        if (self.size(d) != src.size(d)) return false;
+        if (self.size(d) > 1 && self.stride(d) != src.stride(d)) return false;
+    }
+    return SizesAndStrides::is_non_overlapping_and_dense(
+        static_cast<std::vector<int64_t>>(self.shape()), self.strides());
 }
 
 // src is the [rows, cols] transpose view of row-major [cols, rows] storage:
@@ -443,10 +452,11 @@ bool transpose_layout_is_strided_outer_4d(const Tensor& self, const Tensor& src)
 
 }  // namespace
 
-Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
-    if (self.numel() != src.numel()) {
-        TP_THROW(RuntimeError, "Sizes do not match for copy");
-    }
+Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
+    // The source broadcasts to the destination's shape; a source that does
+    // not is refused rather than copied in some flattened order.
+    const Tensor src = src_in.shape() == self.shape()
+        ? src_in : src_in.expand(static_cast<std::vector<int64_t>>(self.shape()));
     
     Device dst_dev = self.device();
     Device src_dev = src.device();

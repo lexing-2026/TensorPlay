@@ -128,6 +128,43 @@ def test_functional_copy_takes_values_from_src(device):
 
 
 @pytest.mark.parametrize("device", DEVICES)
+def test_copy_into_a_permuted_destination_places_every_element(device):
+    # A square destination laid out column-major over a row-major source has
+    # the extents of a relabelled transpose but must still receive src[i, j]
+    # at [i, j].
+    src = tp.tensor([[1.0, 2.0], [3.0, 4.0]], device=device)
+    base = tp.zeros(2, 2, device=device)
+    base.t().copy_(src)
+    assert base.cpu().tolist() == [[1.0, 3.0], [2.0, 4.0]]
+    for shape, perm in (((64, 64), (1, 0)), ((48, 32), (1, 0)), ((2, 5, 3, 4), (0, 2, 3, 1))):
+        source = tp.randn(*shape, device=device)
+        dest = tp.empty(*[shape[p] for p in perm], device=device).permute(
+            *sorted(range(len(perm)), key=lambda d: perm[d]))
+        dest.copy_(source)
+        assert tp.equal(dest.cpu(), source.cpu())
+        same = tp.empty(*[shape[p] for p in perm], device=device).permute(
+            *sorted(range(len(perm)), key=lambda d: perm[d]))
+        same.copy_(dest)
+        assert tp.equal(same.cpu(), source.cpu())
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_copy_broadcasts_its_source_and_refuses_other_shapes(device):
+    row = tp.arange(3.0, device=device)
+    for source in (row, row.reshape(1, 3), row.cpu()):
+        dest = tp.zeros(2, 3, device=device)
+        dest.copy_(source)
+        assert dest.cpu().tolist() == [[0.0, 1.0, 2.0], [0.0, 1.0, 2.0]]
+    dest = tp.zeros(2, 3, device=device)
+    dest.copy_(tp.tensor([[5.0], [7.0]], device=device))
+    assert dest.cpu().tolist() == [[5.0, 5.0, 5.0], [7.0, 7.0, 7.0]]
+    # Equal element counts are not enough: the source must broadcast.
+    for dshape, sshape in (((2, 3), (3, 2)), ((2, 3), (6,)), ((6,), (2, 3))):
+        with pytest.raises(RuntimeError):
+            tp.zeros(*dshape, device=device).copy_(tp.zeros(*sshape, device=device))
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_nll_loss_forward_output_writes_destinations(device):
     scores = tp.log_softmax(tp.rand(4, 5, device=device), 1)
     target = tp.tensor([0, 2, 1, 4], device=device)
