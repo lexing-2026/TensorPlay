@@ -1991,7 +1991,9 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_lstsq_kernel(
         run_linalg(B.dtype(), [&](auto tag) {
             using T = std::remove_pointer_t<decltype(tag)>;
             using R = typename LinalgScalarTraits<T>::value_type;
-            const auto* src = solved.data_ptr<T>();
+            // Rows n..m-1 of the column-major working RHS hold the residual
+            // vector of each right-hand side after the LAPACK call.
+            const auto* src = B_work.data_ptr<T>();
             auto* dst = residuals.data_ptr<R>();
             for (int64_t i = 0; i < bs; ++i) {
                 for (int64_t col = 0; col < nrhs; ++col) {
