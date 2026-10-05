@@ -1162,7 +1162,7 @@
   self: tensorplay::tpx::ops::pixel_shuffle(grad, downscale_factor)
 
 # ReduceOps.cpp:1578 logsumexp
-- name: logsumexp(Tensor self, int dim, bool keepdim=false) -> Tensor
+- name: logsumexp(Tensor self, int[1] dim, bool keepdim=false) -> Tensor
   self: logsumexp_backward(grad, self, result, dim, keepdim)
 
 # ===========================================================================

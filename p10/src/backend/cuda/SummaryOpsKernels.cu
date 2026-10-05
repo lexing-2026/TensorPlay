@@ -1,5 +1,6 @@
 #include "ReduceKernels.cuh"
 #include "CudaDispatchHelpers.cuh"
+#include "DTypeNames.h"
 
 namespace tensorplay {
 namespace cuda {
@@ -734,25 +735,33 @@ std::tuple<Tensor, Tensor> interop_nanmedian_dim_values_cuda(
     return {values, indices};
 }
 
-Tensor logsumexp_cuda2(const Tensor& self, int64_t dim, bool keepdim) {
-    if (!isFloatingType(self.dtype()) &&
-        !isIntegralType(self.dtype(), true))
-        TP_THROW(RuntimeError, "logsumexp(): Expected floating point type");
-    int64_t nd = self.dim();
+// Every listed dimension is reduced; an empty list reduces them all.
+// Integer and boolean inputs answer in the default floating type.
+Tensor logsumexp_cuda2(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim) {
+    const bool integral = isIntegralType(self.dtype(), true);
+    if (!isFloatingType(self.dtype()) && !integral)
+        TP_THROW(RuntimeError, "logsumexp(): Expected floating point type, got ",
+                 scalarTypeName(self.dtype()));
+    const int64_t nd = self.dim();
+    std::vector<int64_t> dims;
+    std::vector<bool> seen(static_cast<size_t>(std::max<int64_t>(nd, 1)), false);
+    for (int64_t d : dim) {
+        const int64_t wrapped = wrap_dim(d, std::max<int64_t>(nd, 1));
+        TP_CHECK(!seen[static_cast<size_t>(wrapped)], "logsumexp(): dim ", wrapped,
+                 " appears multiple times in the list of dims");
+        seen[static_cast<size_t>(wrapped)] = true;
+        dims.push_back(wrapped);
+    }
     if (nd == 0) {
         // A zero-dim tensor reduces along dim 0 or -1 as one value along one
         // axis, and one value is its own log-sum-exp.
-        wrap_dim(dim, 1);
-        return isIntegralType(self.dtype(), true)
-            ? self.to(globalContext().defaultDType())
-            : self.clone();
+        return integral ? self.to(globalContext().defaultDType()) : self.clone();
     }
-    dim = wrap_dim(dim, nd);
+    if (dims.empty()) {
+        for (int64_t i = 0; i < nd; ++i) dims.push_back(i);
+    }
     Tensor sc = self.contiguous();
-    if (isIntegralType(sc.dtype(), true)) {
-        sc = sc.to(globalContext().defaultDType());
-    }
-    const std::vector<int64_t> dims{dim};
+    if (integral) sc = sc.to(globalContext().defaultDType());
     if (sc.numel() == 0) {
         return sum_dim_kernel(sc.exp(), dims, keepdim, sc.dtype()).log();
     }
@@ -761,7 +770,7 @@ Tensor logsumexp_cuda2(const Tensor& self, int64_t dim, bool keepdim) {
     Tensor safe_max = Tensor::where(max_keep.abs().eq(infinity), Scalar(0), max_keep);
     Tensor summed = sum_dim_kernel((sc - safe_max).exp(), dims, keepdim, sc.dtype());
     Tensor result = summed.log();
-    return result + (keepdim ? safe_max : safe_max.squeeze(dim));
+    return result + (keepdim ? safe_max : safe_max.reshape(result.shape()));
 }
 
 } // namespace

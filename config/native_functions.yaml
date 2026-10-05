@@ -4857,7 +4857,7 @@
     CPU: rnn_tanh_cpu
     CUDA: rnn_tanh_cuda
 
-- func: logsumexp(Tensor self, int dim, bool keepdim=False) -> Tensor
+- func: logsumexp(Tensor self, int[1] dim, bool keepdim=False) -> Tensor
   device_check: NoCheck
   variants: function, method
   dispatch:

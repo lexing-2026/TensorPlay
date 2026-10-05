@@ -472,9 +472,25 @@ Tensor sum_dim(const Tensor& input, const std::vector<int64_t>& dims,
     }
     const int64_t old_bdim = *operand.bdim;
     const int64_t level = operand.level;
+    if (input.dim() == 0) {
+        // A zero-dim sample is its own sum: reduce a trailing unit axis,
+        // which also applies the requested result type.
+        for (int64_t d : dims) normalize_dim(d, 1);
+        const Tensor value = operand.value.unsqueeze(-1);
+        Tensor result = call_next<Tensor, const Tensor&, const std::vector<int64_t>&,
+                                     bool, DType>(
+            "sum.dim_IntList", value, value, std::vector<int64_t>{value.dim() - 1},
+            false, dtype);
+        return make_batched(result, old_bdim, level);
+    }
+    // An empty list sums every dimension of each sample, never the batch one.
+    std::vector<int64_t> public_dims = dims;
+    if (public_dims.empty()) {
+        for (int64_t d = 0; d < input.dim(); ++d) public_dims.push_back(d);
+    }
     std::vector<int64_t> actual_dims;
-    actual_dims.reserve(dims.size());
-    for (int64_t dim : dims) {
+    actual_dims.reserve(public_dims.size());
+    for (int64_t dim : public_dims) {
         const int64_t public_dim = normalize_dim(dim, input.dim());
         const int64_t actual = public_dim < old_bdim ? public_dim : public_dim + 1;
         if (std::find(actual_dims.begin(), actual_dims.end(), actual) == actual_dims.end()) {
@@ -1388,16 +1404,38 @@ Tensor batch_cumsum(const Tensor& input, int64_t dim,
     return make_batched(result, *operand.bdim, operand.level);
 }
 
-Tensor batch_logsumexp(const Tensor& input, int64_t dim, bool keepdim) {
+// An empty list reduces every dimension of each sample, never the batch one,
+// so it is spelled out before the dimensions move past the batch dimension.
+Tensor batch_logsumexp(const Tensor& input, const std::vector<int64_t>& dim, bool keepdim) {
     Operand operand = unwrap_operand(input);
-    const int64_t public_dim = normalize_dim(dim, input.dim());
-    const int64_t actual =
-        public_dim < *operand.bdim ? public_dim : public_dim + 1;
-    Tensor result = call_next<Tensor, const Tensor&, int64_t, bool>(
-        "logsumexp", operand.value, operand.value, actual, keepdim);
-    const int64_t result_bdim =
-        keepdim ? *operand.bdim
-                : (actual < *operand.bdim ? *operand.bdim - 1 : *operand.bdim);
+    const int64_t old_bdim = *operand.bdim;
+    if (input.dim() == 0) {
+        // A zero-dim sample is its own log-sum-exp: reduce a trailing unit
+        // axis, which also gives integer samples the floating result type.
+        for (int64_t d : dim) normalize_dim(d, 1);
+        const Tensor value = operand.value.unsqueeze(-1);
+        Tensor result = call_next<Tensor, const Tensor&, const std::vector<int64_t>&, bool>(
+            "logsumexp", value, value, std::vector<int64_t>{value.dim() - 1}, false);
+        return make_batched(result, old_bdim, operand.level);
+    }
+    std::vector<int64_t> public_dims = dim;
+    if (public_dims.empty()) {
+        for (int64_t d = 0; d < input.dim(); ++d) public_dims.push_back(d);
+    }
+    std::vector<int64_t> actual_dims;
+    actual_dims.reserve(public_dims.size());
+    for (int64_t d : public_dims) {
+        const int64_t public_dim = normalize_dim(d, input.dim());
+        actual_dims.push_back(public_dim < old_bdim ? public_dim : public_dim + 1);
+    }
+    Tensor result = call_next<Tensor, const Tensor&, const std::vector<int64_t>&, bool>(
+        "logsumexp", operand.value, operand.value, actual_dims, keepdim);
+    int64_t result_bdim = old_bdim;
+    if (!keepdim) {
+        result_bdim -= static_cast<int64_t>(std::count_if(
+            actual_dims.begin(), actual_dims.end(),
+            [old_bdim](int64_t d) { return d < old_bdim; }));
+    }
     return make_batched(result, result_bdim, operand.level);
 }
 

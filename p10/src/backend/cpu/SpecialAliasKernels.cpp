@@ -17,8 +17,6 @@
 
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
-#include <algorithm>
-#include <functional>
 #include <optional>
 #include <vector>
 #include "OutWrite.h"
@@ -487,31 +485,9 @@ Tensor& alias_polygamma_out(int64_t n, const Tensor& self, Tensor& out) {
     return out;
 }
 
-// special_logsumexp -> logsumexp.  Several dimensions reduce one after
-// another, the highest first so the remaining indices stay valid when the
-// reduced dimensions are dropped; an empty list reduces every dimension.
+// special_logsumexp -> logsumexp
 Tensor alias_logsumexp(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim) {
-    const int64_t rank = self.dim();
-    std::vector<int64_t> dims;
-    if (dim.empty()) {
-        for (int64_t d = 0; d < rank; ++d) dims.push_back(d);
-    } else {
-        for (int64_t d : dim) {
-            const int64_t bound = std::max<int64_t>(rank, 1);
-            TP_CHECK(d >= -bound && d < bound, "special_logsumexp(): dimension ", d,
-                     " out of range for a ", rank, "-D tensor");
-            const int64_t wrapped = d < 0 ? d + bound : d;
-            TP_CHECK(std::find(dims.begin(), dims.end(), wrapped) == dims.end(),
-                     "special_logsumexp(): dimension ", wrapped,
-                     " appears multiple times in the list of dims");
-            dims.push_back(wrapped);
-        }
-    }
-    if (dims.empty()) return ops::logsumexp(self, 0, keepdim);
-    std::sort(dims.begin(), dims.end(), std::greater<int64_t>());
-    Tensor result = self;
-    for (int64_t d : dims) result = ops::logsumexp(result, d, keepdim);
-    return result;
+    return ops::logsumexp(self, dim, keepdim);
 }
 
 Tensor& alias_logsumexp_out(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim, Tensor& out) {

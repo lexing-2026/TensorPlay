@@ -7,6 +7,8 @@
 #include "Parallel.h"
 #include "ReductionKernels.h"
 #include "TypePromotion.h"
+#include "Context.h"
+#include "DTypeNames.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <algorithm>
@@ -262,18 +264,35 @@ std::tuple<Tensor, Tensor> aminmax_dim_cpu(const Tensor& self, int64_t dim,
     return aminmax_cpu(self, {dim}, keepdim);
 }
 
-Tensor logsumexp_cpu(const Tensor& self, int64_t dim, bool keepdim) {
-    if (!isFloatingType(self.dtype()))
-        TP_THROW(RuntimeError, "logsumexp(): Expected floating point type");
-    if (self.dim() == 0) {
+// Every listed dimension is reduced in one pass; an empty list reduces them
+// all.  Integer and boolean inputs answer in the default floating type.
+Tensor logsumexp_cpu(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim) {
+    const bool integral = isIntegralType(self.dtype(), true);
+    if (!isFloatingType(self.dtype()) && !integral)
+        TP_THROW(RuntimeError, "logsumexp(): Expected floating point type, got ",
+                 scalarTypeName(self.dtype()));
+    const DType out_dtype = integral ? globalContext().defaultDType() : self.dtype();
+    const int64_t nd = self.dim();
+    std::vector<int64_t> dims;
+    std::vector<bool> seen(static_cast<size_t>(std::max<int64_t>(nd, 1)), false);
+    for (int64_t d : dim) {
+        const int64_t wrapped = wrap_dim(d, std::max<int64_t>(nd, 1));
+        TP_CHECK(!seen[static_cast<size_t>(wrapped)], "logsumexp(): dim ", wrapped,
+                 " appears multiple times in the list of dims");
+        seen[static_cast<size_t>(wrapped)] = true;
+        dims.push_back(wrapped);
+    }
+    if (nd == 0) {
         // A zero-dim tensor reduces along dim 0 or -1 as one value along one
         // axis, and one value is its own log-sum-exp.
-        wrap_dim(dim, 1);
-        return self.clone();
+        return self.to(out_dtype).clone();
+    }
+    if (dims.empty()) {
+        for (int64_t i = 0; i < nd; ++i) dims.push_back(i);
     }
     LseState init{-std::numeric_limits<double>::infinity(), 0.0, false};
     return reduce_dims_impl<LseState>(
-        self, {dim}, keepdim, self.dtype(), init,
+        self, dims, keepdim, out_dtype, init,
         [](LseState acc, double value) {
             if (value != value) {
                 acc.nan_flag = true;
@@ -284,9 +303,14 @@ Tensor logsumexp_cpu(const Tensor& self, int64_t dim, bool keepdim) {
                 acc.s = 1.0;
                 return acc;
             }
+            // A value equal to the running maximum adds exactly one; written
+            // as exp(value - m) it would be exp(inf - inf) for a repeated
+            // infinity.
             if (value > acc.m) {
                 acc.s = acc.s * std::exp(acc.m - value) + 1.0;
                 acc.m = value;
+            } else if (value == acc.m) {
+                acc.s += 1.0;
             } else {
                 acc.s += std::exp(value - acc.m);
             }

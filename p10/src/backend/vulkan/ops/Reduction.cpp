@@ -862,24 +862,34 @@ Tensor cumprod_kernel(
   return convert(v_output);
 }
 
-Tensor logsumexp_kernel(const Tensor& self, int64_t dim, bool keepdim) {
+// Every listed dimension is reduced; an empty list reduces them all.
+Tensor logsumexp_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim) {
   TP_CHECK(
       self.dtype() == DType::Float32,
       "Vulkan logsumexp supports Float32 tensors only");
   TP_CHECK(
       self.dim() >= 1 && self.dim() <= 4,
       "Vulkan logsumexp supports 1d to 4d tensors");
-  int64_t axis = dim < 0 ? dim + self.dim() : dim;
-  TP_CHECK(axis >= 0 && axis < self.dim(), "Vulkan logsumexp: dim out of range");
+  std::vector<int64_t> axes;
+  for (int64_t d : dim) {
+    const int64_t axis = d < 0 ? d + self.dim() : d;
+    TP_CHECK(axis >= 0 && axis < self.dim(), "Vulkan logsumexp: dim out of range");
+    TP_CHECK(std::find(axes.begin(), axes.end(), axis) == axes.end(),
+             "logsumexp(): dim ", axis, " appears multiple times in the list of dims");
+    axes.push_back(axis);
+  }
+  if (axes.empty()) {
+    for (int64_t i = 0; i < self.dim(); ++i) axes.push_back(i);
+  }
 
-  const Tensor max_keep = extremum_impl(self, {axis}, true, ExtremumKind::kMax);
+  const Tensor max_keep = extremum_impl(self, axes, true, ExtremumKind::kMax);
   const Tensor shifted = self - max_keep;
-  const Tensor summed = shifted.exp().sum({axis}, keepdim);
+  const Tensor summed = shifted.exp().sum(axes, keepdim);
   Tensor result = summed.log();
   if (keepdim) {
     return result + max_keep;
   }
-  return result + max_keep.squeeze(axis);
+  return result + max_keep.reshape(result.shape());
 }
 
 Tensor isnan_kernel(const Tensor& self) {

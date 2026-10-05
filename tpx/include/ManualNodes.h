@@ -1052,14 +1052,15 @@ inline Tensor amax_amin_backward(const Tensor& grad, const Tensor& self,
     return scale_grad_by_count(g, ops::eq(r, self), dims);
 }
 
-// logsumexp backward: with the reduced axis put back on both the gradient and
+// logsumexp backward: with the reduced axes put back on both the gradient and
 // the result, each input's share is exp(self - result) -- its softmax weight
-// along that axis.
+// over those axes.  An empty list reduced every axis.
 inline Tensor logsumexp_backward(const Tensor& grad, const Tensor& self,
-                                 const Tensor& result, int64_t dim,
+                                 const Tensor& result, const std::vector<int64_t>& dim,
                                  bool keepdim) {
     if (self.dim() == 0) return ops::mul(grad, ops::exp(ops::sub(self, result)));
-    const std::vector<int64_t> dims = wrap_dims({dim}, self.dim());
+    std::vector<int64_t> dims = wrap_dims(dim, self.dim());
+    if (dims.empty()) dims = all_dims(self.dim());
     const Tensor g = restore_reduced_dims(grad, dims, keepdim);
     const Tensor r = restore_reduced_dims(result, dims, keepdim);
     return ops::mul(g, ops::exp(ops::sub(self, r)));

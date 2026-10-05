@@ -310,16 +310,7 @@ std::tuple<Tensor, Tensor> topk_values_native(const Tensor& self, int64_t k, int
 
 Tensor& logsumexp_out_native(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim,
                              Tensor& out) {
-    // log-sum-exp over disjoint dimension sets composes, but each reduction
-    // removes an axis, so the dims are consumed from the highest index down
-    // to keep the remaining indices valid.
-    Tensor r = self;
-    std::vector<int64_t> dims = dim;
-    std::sort(dims.begin(), dims.end(), std::greater<int64_t>());
-    for (int64_t d : dims) {
-        r = ops::logsumexp(r, d, keepdim);
-    }
-    return write_reduction_out("logsumexp", std::move(r), out);
+    return write_reduction_out("logsumexp", ops::logsumexp(self, dim, keepdim), out);
 }
 
 // ---- shape ops --------------------------------------------------------------
