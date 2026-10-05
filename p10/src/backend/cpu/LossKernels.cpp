@@ -480,7 +480,8 @@ Tensor soft_margin_loss_kernel(const Tensor& input, const Tensor& target, int64_
 
 Tensor soft_margin_loss_backward_kernel(const Tensor& grad_output, const Tensor& input,
                                         const Tensor& target, int64_t reduction) {
-    Tensor g = -target * ((input * target) * -1.0).exp().sigmoid() * grad_output;
+    // d/dx log(1 + exp(-t x)) = -t * sigmoid(-t x)
+    Tensor g = -target * ((input * target) * -1.0).sigmoid() * grad_output;
     return scale_grad(g, reduction, input.numel());
 }
 
@@ -512,7 +513,7 @@ std::tuple<Tensor, Tensor> cosine_embedding_loss_backward_kernel(
     Tensor dl_dcos = Tensor::where(target.eq(1), -1.0 * ones_row,
                      Tensor::where(target.eq(-1),
                          ((cos - margin).gt(0.0)).to(x1.dtype()),
-                         ((1.0 - cos - margin).gt(0.0)).to(x1.dtype()) * -1.0));
+                         zeros_like_shim(ones_row)));
 
     if (reduction == 1) dl_dcos = dl_dcos / static_cast<double>(x1.size(0));
 

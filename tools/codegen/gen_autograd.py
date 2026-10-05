@@ -331,7 +331,7 @@ TENSOR_METHODS = {
     "detach": "detach", "contiguous": "contiguous", "select": "select",
     "slice": "slice", "t_": "t_", "conj": "conj",
     # A type conversion inside a formula stays on the recorded graph.
-    "to": "to",
+    "to": "tensorplay::tpx::to",
 }
 
 _GRAD_SYMBOLS = {"grad", "grad_output"}
@@ -658,6 +658,14 @@ MANUAL_DERIVATIVES: dict[str, dict] = {
     "linalg_eig": {"saved": ["A"],
                    "saved_outputs": ["eigenvalues", "eigenvectors"]},
     "linalg_qr": {"saved": ["mode"], "saved_outputs": ["Q", "R"]},
+    # The two-output loss backward kernels return one gradient per input
+    # (LossBackward.h); the node receives one incoming gradient for each.
+    "tp_margin_ranking_loss_backward": {
+        "saved": ["grad_output", "input1", "input2", "target", "margin", "reduction"],
+        "node": "TpMarginRankingLossBackwardBackward"},
+    "tp_cosine_embedding_loss_backward": {
+        "saved": ["grad_output", "input1", "input2", "target", "margin", "reduction"],
+        "node": "TpCosineEmbeddingLossBackwardBackward"},
     "linalg_lu": {"saved": ["pivot"], "saved_outputs": ["P", "L", "U"],
                   "output_differentiability": [False, True, True]},
     "lu_unpack": {"saved": ["LU_data"],

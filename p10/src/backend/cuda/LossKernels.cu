@@ -370,8 +370,9 @@ Tensor tp_soft_margin_loss_backward_cuda(const Tensor& grad_output,
                                          const Tensor& input,
                                          const Tensor& target,
                                          int64_t reduction) {
-    Tensor z = ((input * target) * Scalar(-1)).exp();
-    Tensor grad = -target * z.sigmoid() * grad_output;
+    // d/dx log(1 + exp(-t x)) = -t * sigmoid(-t x)
+    Tensor s = ((input * target) * Scalar(-1)).sigmoid();
+    Tensor grad = -target * s * grad_output;
     return tp_scale_grad(grad, reduction, input.numel());
 }
 
@@ -407,9 +408,7 @@ std::tuple<Tensor, Tensor> tp_cosine_embedding_loss_backward_cuda(
         target.eq(Scalar(1)), -ones,
         Tensor::where(target.eq(Scalar(-1)),
                       (cosine - margin).gt(Scalar(0)).to(input1.dtype()),
-                      (Scalar(1) - cosine - margin)
-                          .gt(Scalar(0))
-                          .to(input1.dtype()) * Scalar(-1)));
+                      Tensor::zeros_like(ones)));
     if (reduction == 1) {
         dl_dcos = dl_dcos / static_cast<double>(input1.size(0));
     }

@@ -463,6 +463,14 @@
 - name: nll_loss2d(Tensor self, Tensor target, Tensor? weight=None, int reduction=1, int ignore_index=-100) -> (Tensor output, Tensor total_weight)
   self: nll_loss2d_backward(grad, self, target, weight, reduction, ignore_index, total_weight)
 
+- name: nll_loss_backward(Tensor grad_output, Tensor self, Tensor target, Tensor? weight=None, int reduction=1, SymInt ignore_index=-100, Tensor? total_weight=None) -> Tensor
+  grad_output: std::get<0>(nll_loss(grad, target, weight, reduction, ignore_index))
+  self: zeros_like(grad)
+
+- name: nll_loss2d_backward(Tensor grad_output, Tensor self, Tensor target, Tensor? weight=None, int reduction=1, SymInt ignore_index=-100, Tensor? total_weight=None) -> Tensor
+  grad_output: std::get<0>(nll_loss2d(grad, target, weight, reduction, ignore_index))
+  self: zeros_like(grad)
+
 # its native backward (target is class indices, non-differentiable);
 # multilabel_margin_loss is composite over multilabel_margin_loss_forward,
 # whose backward consumes the saved is_target mask.
@@ -479,6 +487,12 @@
 
 - name: mse_loss(Tensor self, Tensor target, int reduction=1) -> Tensor
   self: mse_loss_backward(grad, self, target, reduction)
+  target: mse_loss_backward(grad, target, self, reduction)
+
+- name: mse_loss_backward(Tensor grad_output, Tensor self, Tensor target, int reduction=1) -> Tensor
+  grad_output: loss_grad_output(grad, (self - target) * 2, reduction)
+  self: mse_loss_double_backward(grad * grad_output, reduction)
+  target: -mse_loss_double_backward(grad * grad_output, reduction)
 
 - name: relu(Tensor self) -> Tensor
   self: threshold_backward(grad, result, 0)
@@ -1249,35 +1263,87 @@
 
 - name: tp_l1_loss(Tensor input, Tensor target, int64_t reduction=1) -> Tensor
   input: tp_l1_loss_backward(grad, input, target, reduction)
+  target: -tp_l1_loss_backward(grad, input, target, reduction)
 
 - name: smooth_l1_loss(Tensor self, Tensor target, int reduction=1, float beta=1.0) -> Tensor
   self: smooth_l1_loss_backward(grad, self, target, reduction, beta)
+  target: smooth_l1_loss_backward(grad, target, self, reduction, beta)
 
 - name: huber_loss(Tensor self, Tensor target, int reduction=1, float delta=1.0) -> Tensor
   self: huber_loss_backward(grad, self, target, reduction, delta)
+  target: huber_loss_backward(grad, target, self, reduction, delta)
 
 - name: tp_kl_div(Tensor input, Tensor target, int64_t reduction=1, bool log_target=false) -> Tensor
   input: tp_kl_div_backward(grad, input, target, reduction, log_target)
+  target: kl_div_target_backward(grad, input, target, reduction, log_target)
 
 - name: binary_cross_entropy(Tensor self, Tensor target, Tensor? weight=None, int reduction=1) -> Tensor
   self: binary_cross_entropy_backward(grad, self, target, weight, reduction)
+  target: binary_cross_entropy_target_backward(grad, self, weight, reduction)
 
 - name: tp_margin_ranking_loss(Tensor input1, Tensor input2, Tensor target, float margin=0.0, int64_t reduction=1) -> Tensor
   input1: std::get<0>(tp_margin_ranking_loss_backward(grad, input1, input2, target, margin, reduction))
   input2: std::get<1>(tp_margin_ranking_loss_backward(grad, input1, input2, target, margin, reduction))
+  target: margin_ranking_loss_target_backward(grad, input1, input2, target, margin, reduction)
 
 - name: tp_hinge_embedding_loss(Tensor input, Tensor target, float margin=1.0, int64_t reduction=1) -> Tensor
   input: tp_hinge_embedding_loss_backward(grad, input, target, margin, reduction)
+  target: zeros_like(target)
 
 - name: tp_soft_margin_loss(Tensor input, Tensor target, int64_t reduction=1) -> Tensor
   input: tp_soft_margin_loss_backward(grad, input, target, reduction)
+  target: soft_margin_loss_target_backward(grad, input, target, reduction)
 
 - name: tp_cosine_embedding_loss(Tensor input1, Tensor input2, Tensor target, float margin=0.0, int64_t reduction=1) -> Tensor
   input1: std::get<0>(tp_cosine_embedding_loss_backward(grad, input1, input2, target, margin, reduction))
   input2: std::get<1>(tp_cosine_embedding_loss_backward(grad, input1, input2, target, margin, reduction))
+  target: zeros_like(target)
 
 - name: tp_poisson_nll_loss(Tensor input, Tensor target, bool log_input=true, bool full=false, float eps=1e-08, int64_t reduction=1) -> Tensor
   input: tp_poisson_nll_loss_backward(grad, input, target, log_input, full, eps, reduction)
+  target: poisson_nll_loss_target_backward(grad, input, target, log_input, full, eps, reduction)
+
+# The backward kernels of the losses above differentiate too; the two-output
+# ones (margin ranking, cosine embedding) are hand-written nodes in LossBackward.h.
+- name: smooth_l1_loss_backward(Tensor grad_output, Tensor self, Tensor target, int reduction, float beta) -> Tensor
+  grad_output: loss_grad_output(grad, smooth_l1_loss_backward(ones_like(grad), self, target, 0, beta), reduction)
+  self: smooth_l1_loss_double_backward(grad * grad_output, self, target, reduction, beta)
+  target: -smooth_l1_loss_double_backward(grad * grad_output, self, target, reduction, beta)
+
+- name: huber_loss_backward(Tensor grad_output, Tensor self, Tensor target, int reduction, float delta) -> Tensor
+  grad_output: loss_grad_output(grad, huber_loss_backward(ones_like(grad), self, target, 0, delta), reduction)
+  self: huber_loss_double_backward(grad * grad_output, self, target, reduction, delta)
+  target: -huber_loss_double_backward(grad * grad_output, self, target, reduction, delta)
+
+- name: binary_cross_entropy_backward(Tensor grad_output, Tensor self, Tensor target, Tensor? weight=None, int reduction=1) -> Tensor
+  grad_output: loss_grad_output(grad, binary_cross_entropy_backward(ones_like(grad), self, target, weight, 0), reduction)
+  self: binary_cross_entropy_double_backward(grad * grad_output, self, target, weight, reduction)
+  target: binary_cross_entropy_double_backward_target(grad * grad_output, self, weight, reduction)
+
+- name: tp_l1_loss_backward(Tensor grad_output, Tensor input, Tensor target, int64_t reduction=1) -> Tensor
+  grad_output: loss_grad_output(grad, sign(input - target), reduction)
+  input: zeros_like(grad)
+  target: zeros_like(grad)
+
+- name: tp_kl_div_backward(Tensor grad_output, Tensor input, Tensor target, int64_t reduction=1, bool log_target=false) -> Tensor
+  grad_output: loss_grad_output(grad, tp_kl_div_backward(ones_like(grad), input, target, 0, log_target), reduction)
+  input: zeros_like(grad)
+  target: kl_div_double_backward_target(grad * grad_output, input, target, reduction, log_target)
+
+- name: tp_hinge_embedding_loss_backward(Tensor grad_output, Tensor input, Tensor target, float margin=1.0, int64_t reduction=1) -> Tensor
+  grad_output: loss_grad_output(grad, tp_hinge_embedding_loss_backward(ones_like(grad), input, target, margin, 0), reduction)
+  input: zeros_like(grad)
+  target: zeros_like(target)
+
+- name: tp_soft_margin_loss_backward(Tensor grad_output, Tensor input, Tensor target, int64_t reduction=1) -> Tensor
+  grad_output: loss_grad_output(grad, tp_soft_margin_loss_backward(ones_like(grad), input, target, 0), reduction)
+  input: soft_margin_loss_double_backward(grad * grad_output, input, target, reduction)
+  target: soft_margin_loss_double_backward_target(grad * grad_output, input, target, reduction)
+
+- name: tp_poisson_nll_loss_backward(Tensor grad_output, Tensor input, Tensor target, bool log_input=true, bool full=false, float eps=1e-08, int64_t reduction=1) -> Tensor
+  grad_output: loss_grad_output(grad, tp_poisson_nll_loss_backward(ones_like(grad), input, target, log_input, full, eps, 0), reduction)
+  input: poisson_nll_loss_double_backward(grad * grad_output, input, target, log_input, eps, reduction)
+  target: poisson_nll_loss_double_backward_target(grad * grad_output, input, log_input, eps, reduction)
 
 # ===========================================================================
 # ===========================================================================
