@@ -1450,12 +1450,18 @@ def channels_last_call(x, ndim: int, groups: int, transposed: bool) -> bool:
         return False
     if V.graph.layout_opt:
         return True
+    dtype = x.get_dtype()
     return (
         config.conv_channels_last_reduced_precision
         and groups == 1
         and not transposed
         and ir.get_device_type(x) == "cuda"
-        and x.get_dtype() in (tp.float16, tp.bfloat16)
+        and (
+            dtype in (tp.float16, tp.bfloat16)
+            # Single precision runs on the same channels-last tensor-core
+            # engines when it may round through TF32.
+            or (dtype == tp.float32 and _tf32_allowed())
+        )
     )
 
 
