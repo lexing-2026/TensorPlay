@@ -451,3 +451,17 @@ def test_axis_counted_from_the_back(device):
     (got,) = tp.autograd.grad((compiled(x) * 2).sum(), [x])
     (want,) = tp.autograd.grad((x.unfold(-1, 3, 2) * 2).sum(), [x])
     _same(got, want, 1e-6)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_take_along_dim_differentiated_through_its_parts(device):
+    # Its index is wrapped by a remainder of a broadcast view, which the
+    # lowering reads as a value rather than a number.
+    index = tp.tensor([[0, 2], [3, -1]], device=device)
+    fn = lambda x: tp.take_along_dim(x[:2], index, 1)
+    compiled = tp.compile(fn, strict_native=True)
+    x = tp.randn(6, 8, device=device, requires_grad=True)
+    _same(compiled(x), fn(x), 1e-6)
+    (got,) = tp.autograd.grad((compiled(x) * 2).sum(), [x])
+    (want,) = tp.autograd.grad((fn(x) * 2).sum(), [x])
+    _same(got, want, 1e-6)

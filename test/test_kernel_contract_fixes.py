@@ -388,3 +388,24 @@ def test_bitwise_with_a_number_answers_in_the_pair_type(device):
     for got, dtype, values in cases:
         assert got.dtype == dtype
         assert got.cpu().tolist() == values
+
+
+@cuda_only
+def test_cuda_binary_math_broadcasts_like_cpu():
+    # atan2, lerp and pow meet their operands in the broadcast shape, and
+    # atan2 promotes the pair, as on the CPU.
+    tp.manual_seed(0)
+    a = tp.randn(3, 5)
+    b = tp.randn(5)
+    wide = tp.randn(3, 1, dtype=tp.float64)
+    cases = [
+        lambda a, b, w: tp.atan2(a, b),
+        lambda a, b, w: tp.atan2(a, w),
+        lambda a, b, w: tp.lerp(a, b, 0.3),
+        lambda a, b, w: tp.pow(a.abs(), b),
+    ]
+    for fn in cases:
+        want = fn(a, b, wide)
+        got = fn(a.cuda(), b.cuda(), wide.cuda())
+        assert tuple(got.shape) == tuple(want.shape) and got.dtype == want.dtype
+        assert _close(got, want)

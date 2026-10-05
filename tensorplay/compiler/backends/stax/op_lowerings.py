@@ -1782,6 +1782,8 @@ def _binary_on(
     whole_fn = ops_wrapper(whole_op) if whole_op is not None else fn
 
     def lower(a, b):
+        # An operand may arrive as a bare view rather than a box.
+        a, b = _box_view(a), _box_view(b)
         dtype = _promoted_pair(a, b)
         if real and not _is_real(dtype):
             dtype = tp.get_default_dtype()
@@ -1864,6 +1866,8 @@ def _scalar_const(value, like):
 def _lower_remainder(a, b):
     """The remainder whose sign follows the divisor (floor division's)."""
 
+    # An operand may arrive as a bare view rather than a box.
+    a, b = _box_view(a), _box_view(b)
     dtype = _promoted_pair(a, b)
     tensors = [x for x in (a, b) if isinstance(x, TensorBox)]
     if len(tensors) == 2:
@@ -10059,6 +10063,8 @@ def _nan_ignoring(op_name):
     op = ops_wrapper(op_name)
 
     def lower(a, b):
+        # An operand may arrive as a bare view rather than a box.
+        a, b = _box_view(a), _box_view(b)
         dtype = _promoted_pair(a, b)
         a, b = (to_dtype(t, dtype) if isinstance(t, TensorBox) and t.get_dtype() != dtype else t for t in (a, b))
         if isinstance(a, TensorBox) and isinstance(b, TensorBox):

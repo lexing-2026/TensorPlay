@@ -6,6 +6,7 @@
 #include "Parallel.h"
 #include "Quantizer.h"
 #include "TypePromotion.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <algorithm>
 #include <cmath>
@@ -158,62 +159,6 @@ Tensor trace_cpu(const Tensor& self) {
     }
 #undef TP_TRACE_CASE
     return result;
-}
-
-Tensor diag_cpu(const Tensor& self, int64_t diagonal) {
-    int64_t nd = self.dim();
-    Tensor sc = self.contiguous();
-    if (nd == 1) {
-        int64_t n = sc.size(0);
-        int64_t size = checked_diagonal_extent(n, diagonal, "diag");
-        Tensor outc = Tensor::zeros({size, size}, sc.dtype(), sc.device());
-        switch (sc.dtype()) {
-#define TP_DIAG_FILL(ctype, name_) \
-    case DType::name_: { \
-        const ctype* s = sc.data_ptr<ctype>(); \
-        ctype* d = outc.data_ptr<ctype>(); \
-        for (int64_t i = 0; i < n; ++i) { \
-            int64_t r = diagonal >= 0 ? i : i - diagonal; \
-            int64_t c = diagonal >= 0 ? i + diagonal : i; \
-            d[r * size + c] = s[i]; \
-        } \
-        break; \
-    }
-            TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_DIAG_FILL)
-#undef TP_DIAG_FILL
-            default: TP_THROW(TypeError, "diag: unsupported dtype");
-        }
-        return outc;
-    }
-    if (nd == 2) {
-        int64_t rows = sc.size(0), cols = sc.size(1);
-        const int64_t offset_abs = checked_diagonal_magnitude(diagonal, "diag");
-        const int64_t row_start = diagonal < 0 ? offset_abs : 0;
-        const int64_t col_start = diagonal > 0 ? offset_abs : 0;
-        const int64_t diagonal_size =
-            row_start >= rows || col_start >= cols
-                ? 0
-                : std::min(rows - row_start, cols - col_start);
-        std::vector<int64_t> idx;
-        idx.reserve(static_cast<size_t>(diagonal_size));
-        for (int64_t i = 0; i < diagonal_size; ++i)
-            idx.push_back((row_start + i) * cols + col_start + i);
-        Tensor out = Tensor::zeros({static_cast<int64_t>(idx.size())}, sc.dtype(), sc.device());
-        switch (sc.dtype()) {
-#define TP_DIAG_EX(ctype, name_) \
-    case DType::name_: { \
-        const ctype* s = sc.data_ptr<ctype>(); \
-        ctype* d = out.data_ptr<ctype>(); \
-        for (size_t k = 0; k < idx.size(); ++k) d[k] = s[idx[k]]; \
-        break; \
-    }
-            TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_DIAG_EX)
-#undef TP_DIAG_EX
-            default: TP_THROW(TypeError, "diag: unsupported dtype");
-        }
-        return out;
-    }
-    TP_THROW(RuntimeError, "diag: input must be 1-D or 2-D");
 }
 
 Tensor diag_embed_cpu(const Tensor& self, int64_t offset, int64_t dim1_, int64_t dim2_) {
@@ -877,11 +822,22 @@ Tensor diagonal_scatter_cpu(const Tensor& self, const Tensor& src,
 }
 
 
+// diag is diag_embed for a vector and a copy of the diagonal for a matrix, on
+// any device, and it is differentiated through those.
+Tensor diag_composite(const Tensor& self, int64_t diagonal) {
+    if (self.dim() == 1) return tpx::ops::diag_embed(self, diagonal);
+    if (self.dim() == 2) return tpx::ops::clone(tpx::ops::diagonal(self, diagonal));
+    TP_THROW(RuntimeError, "diag(): Supports 1D or 2D tensors. Got ", self.dim(), "D");
+}
+
 }  // namespace
+
+TENSORPLAY_LIBRARY_IMPL(Composite, ShapeOpsComposites) {
+    m.impl("diag", diag_composite);
+}
 
 TENSORPLAY_LIBRARY_IMPL(CPU, ShapeOpsKernels) {
     m.impl("trace", trace_cpu);
-    m.impl("diag", diag_cpu);
     m.impl("diag_embed", diag_embed_cpu);
     m.impl("narrow", narrow_cpu);
     m.impl("split_with_sizes", split_with_sizes_cpu);

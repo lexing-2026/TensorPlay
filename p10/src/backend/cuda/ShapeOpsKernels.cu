@@ -329,64 +329,6 @@ Tensor trace_cuda(const Tensor& self) {
     return self.diagonal().sum();
 }
 
-Tensor diag_cuda(const Tensor& self, int64_t diagonal) {
-    int64_t nd = self.dim();
-    Tensor sc = self.contiguous();
-    if (nd == 1) {
-        int64_t n = sc.size(0);
-        int64_t size = checked_diagonal_extent(n, diagonal, "diag");
-        Tensor out = Tensor::zeros({size, size}, sc.dtype(), sc.device());
-        auto stream = getCurrentCUDAStream().stream();
-        dim3 grid = make_grid(std::max<int64_t>(n, 1)), block(kThreads);
-#define TP_DGS(ctype, name_) \
-    case DType::name_: \
-        diag_scatter_kernel<ctype><<<grid, block, 0, stream>>>( \
-            n, size, diagonal, sc.data_ptr<ctype>(), out.data_ptr<ctype>()); \
-        break;
-        switch (sc.dtype()) {
-            TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_DGS)
-            default: TP_THROW(TypeError, "diag: unsupported dtype");
-        }
-#undef TP_DGS
-        CUDA_CHECK(cudaGetLastError());
-        return out;
-    }
-    if (nd == 2) {
-        int64_t rows = sc.size(0), cols = sc.size(1);
-        const int64_t offset_abs = checked_diagonal_magnitude(diagonal, "diag");
-        const int64_t row_start = diagonal < 0 ? offset_abs : 0;
-        const int64_t col_start = diagonal > 0 ? offset_abs : 0;
-        const int64_t diagonal_size =
-            row_start >= rows || col_start >= cols
-                ? 0
-                : std::min(rows - row_start, cols - col_start);
-        std::vector<int64_t> idx;
-        idx.reserve(static_cast<size_t>(diagonal_size));
-        for (int64_t i = 0; i < diagonal_size; ++i)
-            idx.push_back((row_start + i) * cols + col_start + i);
-        Tensor out = Tensor::empty({static_cast<int64_t>(idx.size())}, sc.dtype(), sc.device());
-        if (!idx.empty()) {
-            Tensor d_idx = pack_i64(idx, sc.device());
-            auto stream = getCurrentCUDAStream().stream();
-            dim3 grid = make_grid(static_cast<int64_t>(idx.size())), block(kThreads);
-#define TP_DGE(ctype, name_) \
-    case DType::name_: \
-        index_gather_kernel<ctype><<<grid, block, 0, stream>>>( \
-            static_cast<int64_t>(idx.size()), sc.data_ptr<ctype>(), \
-            d_idx.data_ptr<int64_t>(), out.data_ptr<ctype>()); \
-        break;
-            switch (sc.dtype()) {
-                TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_DGE)
-                default: TP_THROW(TypeError, "diag: unsupported dtype");
-            }
-#undef TP_DGE
-            CUDA_CHECK(cudaGetLastError());
-        }
-        return out;
-    }
-    TP_THROW(RuntimeError, "diag: input must be 1-D or 2-D");
-}
-
 Tensor diag_embed_cuda(const Tensor& self, int64_t offset, int64_t dim1_, int64_t dim2_) {
     int64_t nDims = self.dim() + 1;
     int64_t dim1 = wrap_dim(dim1_, nDims);
@@ -1120,7 +1062,6 @@ Tensor diagonal_scatter_cuda(const Tensor& self, const Tensor& src,
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, ShapeOpsKernels) {
     m.impl("trace", trace_cuda);
-    m.impl("diag", diag_cuda);
     m.impl("diag_embed", diag_embed_cuda);
     m.impl("narrow", narrow_cuda);
     m.impl("split_with_sizes", split_with_sizes_cuda);

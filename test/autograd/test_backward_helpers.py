@@ -140,6 +140,46 @@ class BackwardHelperOps(unittest.TestCase):
             (grad,) = tp.autograd.grad(tp.take_along_dim(y, index, 1).sum(), [y])
             self._check(grad.cpu(), tp.tensor([[0.0, 2.0], [1.0, 1.0], [1.0, 1.0]]))
 
+    def test_views_and_selections_differentiate_on_every_device(self):
+        devices = ["cpu"] + (["cuda"] if tp.cuda.is_available() else [])
+        for device in devices:
+            x = tp.arange(12.0, device=device).reshape(3, 4).requires_grad_(True)
+            (grad,) = tp.autograd.grad(tp.hsplit(x, 2)[1].sum() + 2 * tp.vsplit(x, 3)[0].sum(), [x])
+            self._check(grad.cpu(), tp.tensor([[2.0, 2.0, 3.0, 3.0], [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]]))
+            row = tp.tensor([[1.0, 2.0, 3.0]], device=device, requires_grad=True)
+            weight = tp.arange(12.0, device=device).reshape(4, 3)
+            (grad,) = tp.autograd.grad((tp.broadcast_to(row, (4, 3)) * weight).sum(), [row])
+            self._check(grad.cpu(), tp.tensor([[18.0, 22.0, 26.0]]))
+            vec = tp.tensor([1.0, 2.0], device=device, requires_grad=True)
+            (grad,) = tp.autograd.grad((tp.diag(vec, 1) * tp.arange(9.0, device=device).reshape(3, 3)).sum(), [vec])
+            self._check(grad.cpu(), tp.tensor([1.0, 5.0]))
+            (grad,) = tp.autograd.grad(tp.diag(x, -1).sum(), [x])
+            self._check(grad.cpu(), tp.tensor([[0.0] * 4, [1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]))
+            m = tp.tensor([[3.0, 1.0, 2.0], [float("nan"), 5.0, 4.0]], device=device, requires_grad=True)
+            (grad,) = tp.autograd.grad(tp.median(m[:1], 1)[0].sum() + tp.nanmedian(m, 1)[0].sum(), [m])
+            # Row 0's median is 2 (both calls); row 1 ignores the NaN: median of {5, 4} is 4.
+            self._check(grad.cpu(), tp.tensor([[0.0, 0.0, 2.0], [0.0, 0.0, 1.0]]))
+
+    def test_distances_differentiate_for_every_norm(self):
+        # d/dx1 ||x1 - x2||_p for each pair, summed over the pairs a row is in.
+        devices = ["cpu"] + (["cuda"] if tp.cuda.is_available() else [])
+        a_rows = [[0.0, 0.0], [3.0, 1.0]]
+        b_rows = [[1.0, 2.0]]
+        for device in devices:
+            for p, expected in ((1.0, [[-1.0, -1.0], [1.0, -1.0]]),
+                                (2.0, [[-0.4472135954999579, -0.8944271909999159],
+                                       [0.8944271909999159, -0.4472135954999579]]),
+                                (float("inf"), [[0.0, -1.0], [1.0, 0.0]])):
+                a = tp.tensor(a_rows, dtype=tp.float64, device=device, requires_grad=True)
+                b = tp.tensor(b_rows, dtype=tp.float64, device=device, requires_grad=True)
+                ga, gb = tp.autograd.grad(tp.cdist(a, b, p).sum(), [a, b])
+                self._check(ga.cpu(), tp.tensor(expected, dtype=tp.float64), tol=1e-12)
+                self._check(gb.cpu(), -tp.tensor(expected, dtype=tp.float64).sum(0, keepdim=True), tol=1e-12)
+            pts = tp.tensor([[0.0, 0.0], [3.0, 4.0], [0.0, 4.0]], dtype=tp.float64, device=device, requires_grad=True)
+            (grad,) = tp.autograd.grad(tp.pdist(pts).sum(), [pts])
+            # Pairs (0,1): 5, (0,2): 4, (1,2): 3; each row gathers unit vectors away from the others.
+            self._check(grad.cpu(), tp.tensor([[-0.6, -1.8], [1.6, 0.8], [-1.0, 1.0]], dtype=tp.float64), tol=1e-12)
+
 
 if __name__ == "__main__":
     unittest.main()

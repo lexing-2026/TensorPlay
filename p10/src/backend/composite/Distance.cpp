@@ -80,7 +80,60 @@ Tensor cdist_native(const Tensor& x1, const Tensor& x2, double p,
     return batched ? d : ops::squeeze(d, 0);
 }
 
+namespace {
+
+// How each p-norm distance moves with the first point of its pair, per
+// coordinate: sign(diff) |diff|^(p-1) / dist^(p-1), with p = 0, 1, 2 and
+// infinity written out.  A zero distance passes nothing back.
+Tensor distance_slope(const Tensor& diff, const Tensor& dist, double p) {
+    if (p == 0) return ops::zeros_like(diff);
+    if (p == 1) return ops::sign(diff);
+    const Tensor at_zero = ops::eq(dist, Scalar(0));
+    const Tensor none = ops::zeros_like(diff);
+    if (p == 2) return ops::where(at_zero, none, ops::div(diff, dist));
+    if (p == std::numeric_limits<double>::infinity()) {
+        return ops::mul(ops::sign(diff), ops::eq(ops::abs(diff), dist).to(diff.dtype()));
+    }
+    const Tensor slope = ops::div(
+        ops::mul(ops::sign(diff), ops::pow(ops::abs(diff), Scalar(p - 1))),
+        ops::pow(dist, Scalar(p - 1)));
+    return ops::where(at_zero, none, slope);
+}
+
+} // namespace
+
+// The gradient of cdist with respect to x1: each row of x1 gathers the slopes
+// of its distances to every row of x2, weighted by the gradient arriving for
+// each distance.  (The gradient for x2 is the same question asked the other
+// way round.)
+Tensor _cdist_backward_native(const Tensor& grad, const Tensor& x1, const Tensor& x2,
+                              double p, const Tensor& cdist) {
+    const Tensor diff = ops::sub(ops::unsqueeze(x1, -2), ops::unsqueeze(x2, -3));
+    const Tensor slope = distance_slope(diff, ops::unsqueeze(cdist, -1), p);
+    return ops::sum(ops::mul(slope, ops::unsqueeze(grad, -1)), {-2}, false);
+}
+
+// pdist lists the distances of row pairs (i, j), i < j, in row order; both
+// rows of a pair move with it, so the condensed gradient and distances are
+// laid out as symmetric matrices and differentiated as cdist of the rows
+// against themselves.
+Tensor _pdist_backward_native(const Tensor& grad, const Tensor& self, double p,
+                              const Tensor& pdist) {
+    const int64_t n = self.size(0);
+    if (n < 2 || grad.numel() == 0) return ops::zeros_like(self);
+    const Tensor pairs = ops::triu_indices(n, n, 1, DType::Int64, self.device());
+    const std::vector<std::optional<Tensor>> at = {ops::select(pairs, 0, 0),
+                                                   ops::select(pairs, 0, 1)};
+    const Tensor blank = ops::zeros({n, n}, grad.dtype(), grad.device());
+    const Tensor g = ops::index_put(blank, at, grad);
+    const Tensor d = ops::index_put(blank, at, pdist);
+    return _cdist_backward_native(ops::add(g, ops::transpose(g, 0, 1)), self, self, p,
+                                  ops::add(d, ops::transpose(d, 0, 1)));
+}
+
 TENSORPLAY_LIBRARY_IMPL(Composite, DistanceComposite) {
+    m.impl("_cdist_backward", _cdist_backward_native);
+    m.impl("_pdist_backward", _pdist_backward_native);
     m.impl("cosine_similarity", cosine_similarity_native);
     m.impl("cdist", cdist_native);
 }

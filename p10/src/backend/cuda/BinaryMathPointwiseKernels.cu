@@ -164,12 +164,16 @@ Tensor clamp_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self,
 
 template<typename Functor>
 Tensor binary_float_op_kernel_v2(const Tensor& self, const Tensor& other, Functor functor) {
-    if (self.shape() != other.shape()) TP_THROW(RuntimeError, "CUDA binary op: broadcasting not supported");
+    // The operands meet in their common broadcast shape; the iterator reads
+    // each at its own positions of it.
+    const std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(other.shape()));
 
     DType out_dtype = self.dtype();
     if (isIntegralType(out_dtype)) out_dtype = DType::Float32;
 
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), out_dtype, self.device());
+    Tensor result = Tensor::empty(out_shape, out_dtype, self.device());
     if (self.numel() == 0) return result;
     Tensor a = self.dtype() == out_dtype ? self : self.to(out_dtype);
     Tensor b = other.dtype() == out_dtype ? other : other.to(out_dtype);
@@ -364,12 +368,16 @@ Tensor pow_scalar_tensor_kernel_cuda(const Scalar& base, const Tensor& exponent)
         exponent_cast, PowBaseFunctor{base.toDouble()});
 }
 Tensor atan2_kernel_cuda(const Tensor& self, const Tensor& other) {
-    if (self.shape() != other.shape()) TP_THROW(RuntimeError, "CUDA binary op: broadcasting not supported");
+    // The pair is promoted together (a whole-number pair answers in float)
+    // and meets in its common broadcast shape.
+    const std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(other.shape()));
 
-    DType out_dtype = self.dtype();
-    if (isIntegralType(out_dtype)) out_dtype = DType::Float32;
+    DType out_dtype = ops::result_type(self, other);
+    if (isIntegralType(out_dtype, /*includeBool=*/true)) out_dtype = DType::Float32;
 
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), out_dtype, self.device());
+    Tensor result = Tensor::empty(out_shape, out_dtype, self.device());
     if (self.numel() == 0) return result;
     Tensor a = self.dtype() == out_dtype ? self : self.to(out_dtype);
     Tensor b = other.dtype() == out_dtype ? other : other.to(out_dtype);
@@ -451,8 +459,10 @@ void complex_lerp_tensor_loop(TensorIterator& iter) {
 }
 
 Tensor lerp_scalar_kernel_cuda(const Tensor& self, const Tensor& end, const Scalar& weight) {
-    if (self.shape() != end.shape()) TP_THROW(RuntimeError, "CUDA lerp: broadcasting not supported");
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
+    const std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(end.shape()));
+    Tensor result = Tensor::empty(out_shape, self.dtype(), self.device());
     if (self.numel() == 0) return result;
     TensorIterator iter = TensorIteratorConfig()
         .check_all_same_dtype(true)

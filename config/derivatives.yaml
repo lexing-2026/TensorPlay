@@ -1509,6 +1509,21 @@
 - name: nanmedian(Tensor self) -> Tensor
   self: evenly_distribute_backward(grad, self, result)
 
+- name: median.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor values, Tensor indices)
+  self: tensorplay::tpx::value_selecting_reduction_backward(grad, dim, indices, self, keepdim)
+
+- name: nanmedian.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor values, Tensor indices)
+  self: tensorplay::tpx::value_selecting_reduction_backward(grad, dim, indices, self, keepdim)
+
+# Each point of a pair moves its distance by the slope of the p-norm; the
+# second operand's gradient is the same question asked the other way round.
+- name: cdist(Tensor x1, Tensor x2, float p=2, *, int? compute_mode=None) -> Tensor
+  x1: _cdist_backward(grad.contiguous(), x1, x2, p, result)
+  x2: _cdist_backward(transpose(grad, -1, -2).contiguous(), x2, x1, p, transpose(result, -1, -2).contiguous())
+
+- name: pdist(Tensor self, float p=2.0) -> Tensor
+  self: _pdist_backward(grad, self, p, result)
+
 - name: amax(Tensor self, int[] dim=[], bool keepdim=False) -> Tensor
   self: amax_amin_backward(grad, self, result, dim, keepdim)
 
