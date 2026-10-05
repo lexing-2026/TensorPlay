@@ -6,6 +6,16 @@ import tensorplay
 import tensorplay._C._autograd as _autograd
 
 
+_BACKWARD_TWICE_MESSAGE = (
+    "Trying to backward through the graph a second time (or directly access "
+    "saved tensors after they have already been freed). Saved intermediate "
+    "values of the graph are freed when you call .backward() or "
+    "autograd.grad(). Specify retain_graph=True if you need to backward "
+    "through the graph a second time or if you need to access saved tensors "
+    "after calling backward."
+)
+
+
 def _current_saved_hooks_pair():
     """Active (pack, unpack) pair from an enclosing saved_tensors_hooks
     context, or None.  Late import avoids a graph<->function cycle."""
@@ -126,6 +136,7 @@ class _Context:
     next_functions: tuple = ()
     _saved_tensors: tuple = ()
     _saved_anchors: tuple = ()
+    _saved_released: bool = False
     _to_save_for_backward: tuple = ()
     _outputs: tuple = ()
 
@@ -188,6 +199,7 @@ class _Context:
                         pass
         self._saved_anchors = ()
         self._saved_tensors = ()
+        self._saved_released = True
         for name in ("_saved_versions", "_saved_native_tokens", "_saved_pack"):
             if isinstance(getattr(self, name, None), tuple):
                 setattr(self, name, ())
@@ -312,6 +324,8 @@ class _Context:
 
         Raises if any saved tensor was modified in-place since saving,
         """
+        if self._saved_released:
+            raise RuntimeError(_BACKWARD_TWICE_MESSAGE)
         native_tokens = getattr(self, "_saved_native_tokens", None)
         if native_tokens is not None:
             return tuple(

@@ -30,14 +30,25 @@ void pop_saved_variable_hooks() {
     g_hooks.pop_back();
 }
 
+const char* backward_twice_message() {
+    return "Trying to backward through the graph a second time (or directly "
+           "access saved tensors after they have already been freed). Saved "
+           "intermediate values of the graph are freed when you call "
+           ".backward() or autograd.grad(). Specify retain_graph=True if you "
+           "need to backward through the graph a second time or if you need "
+           "to access saved tensors after calling backward.";
+}
+
 void SavedVariable::save(const Tensor& tensor, bool is_output) {
     if (!tensor.defined()) {
+        was_default_constructed_ = true;
         data_ = Tensor();
         packed_.reset();
         hooks_.reset();
         saved_version_ = 0;
         return;
     }
+    was_default_constructed_ = false;
     hooks_ = current_saved_variable_hooks();
     data_ = is_output ? tensor.detach() : tensor;
     saved_version_ = tensor.unsafeGetTensorImpl()->version();
@@ -66,7 +77,12 @@ Tensor SavedVariable::unpack() const {
     if (hooks_) {
         return hooks_->unpack(packed_);
     }
-    if (!data_.defined()) return Tensor();
+    if (!data_.defined()) {
+        if (!was_default_constructed_) {
+            TP_THROW(RuntimeError, backward_twice_message());
+        }
+        return Tensor();
+    }
     uint32_t current = data_.unsafeGetTensorImpl()->version();
     if (current != saved_version_) {
         TP_THROW(RuntimeError,

@@ -139,9 +139,10 @@ public:
 
     // Virtual so generated/hand-written nodes can also free the forward
     // tensors they saved (SavedVariable::reset_data) when the graph is
-    virtual void release_variables() {
-        next_edges_.clear();
-    }
+    // not kept.  The edges stay: a second pass over a graph that saved
+    // nothing still reaches its leaves, and one that saved something fails
+    // when it unpacks.
+    virtual void release_variables() {}
 
     uint64_t sequence_nr() const { return sequence_nr_; }
     void set_sequence_nr(uint64_t nr) { sequence_nr_ = nr; }

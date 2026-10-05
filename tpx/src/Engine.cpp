@@ -613,7 +613,6 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
 
     auto num_outputs = outputs.size();
 
-    // Propagate before deferring release (which clears next_edges_).
     const auto& edges = func->next_edges();
     for (size_t i = 0; i < num_outputs; ++i) {
         if (i >= edges.size()) break;

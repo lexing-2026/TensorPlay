@@ -23,6 +23,9 @@ TENSORPLAY_API std::shared_ptr<SavedVariableHooks> current_saved_variable_hooks(
 TENSORPLAY_API void push_saved_variable_hooks(std::shared_ptr<SavedVariableHooks> hooks);
 TENSORPLAY_API void pop_saved_variable_hooks();
 
+// Error text for reading state that a backward pass already freed.
+TENSORPLAY_API const char* backward_twice_message();
+
 // Saved forward tensor of a backward node, preserving
 // save time; unpack() fails loudly if the tensor (or a view base sharing its
 // counter) was mutated in-place between the forward and the backward, instead
@@ -54,7 +57,8 @@ public:
     Tensor unpack() const;
 
     // Frees the stored tensor (Node::release_variables path); a later
-    // unpack() returns an undefined Tensor rather than stale memory.
+    // unpack() of something that was saved raises, since the graph was
+    // already walked without retain_graph.
     void reset_data() {
         data_ = Tensor();
         packed_.reset();
@@ -69,6 +73,9 @@ private:
     std::shared_ptr<void> packed_;
     std::shared_ptr<SavedVariableHooks> hooks_;
     uint32_t saved_version_ = 0;
+    // True until a defined tensor is saved; only then does an empty slot
+    // mean "freed" rather than "nothing was saved".
+    bool was_default_constructed_ = true;
 };
 
 } // namespace tpx

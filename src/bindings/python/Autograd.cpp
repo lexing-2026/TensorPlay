@@ -1032,6 +1032,9 @@ public:
     tensorplay::tpx::variable_list apply(
         tensorplay::tpx::variable_list&& inputs) override {
         py::gil_scoped_acquire gil;
+        if (released_) {
+            throw std::runtime_error(tensorplay::tpx::backward_twice_message());
+        }
         const bool create_graph = tensorplay::tpx::GradMode::is_enabled();
 
         std::vector<Tensor> replay_inputs;
@@ -1174,6 +1177,7 @@ public:
     }
 
     void release_variables() override {
+        released_ = true;
         saved_inputs_.clear();
         original_inputs_.clear();
         grad_parameters_.clear();
@@ -1194,6 +1198,7 @@ private:
     std::vector<Tensor> grad_parameters_;
     Tensor cpu_rng_state_;
     std::vector<CheckpointCudaRngState> cuda_rng_states_;
+    bool released_ = false;
     bool use_reentrant_ = false;
     bool preserve_rng_state_ = true;
     PyObjectRef replay_context_;

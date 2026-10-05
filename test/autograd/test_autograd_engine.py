@@ -11,16 +11,11 @@ class TestAutogradEngine(unittest.TestCase):
         y.backward()
         self.assertEqual(x.grad.item(), 4.0)
         
-        # Second backward should fail or do nothing effectively because graph is cleared
-        # In our current implementation, clearing edges means the graph is disconnected.
-        # So x.grad should NOT increase.
-        
-        # Reset grad to be sure
+        # The first pass freed what the graph saved, so a second one fails
+        # and leaves the gradient alone.
         x.grad = tp.Tensor([0.0])
-        y.backward()
-        
-        # If graph was cleared, backward propagation stops at y.grad_fn because it has no edges.
-        # So x.grad remains 0.0.
+        with self.assertRaisesRegex(RuntimeError, "backward through the graph a second time"):
+            y.backward()
         self.assertEqual(x.grad.item(), 0.0)
 
     def test_retain_graph(self):
@@ -36,9 +31,10 @@ class TestAutogradEngine(unittest.TestCase):
         y.backward() # retain_graph=False (default) implies we can consume it now
         self.assertEqual(x.grad.item(), 8.0)
         
-        # Third backward should fail/do nothing
+        # The pass that released the graph was the last one.
         x.grad = tp.Tensor([0.0])
-        y.backward()
+        with self.assertRaisesRegex(RuntimeError, "backward through the graph a second time"):
+            y.backward()
         self.assertEqual(x.grad.item(), 0.0)
 
     def test_multi_root_backward(self):

@@ -503,7 +503,7 @@ struct CopySlices : public Node {
         if (inputs.empty() || !inputs[0].defined()) {
             return variable_list(next_edges_.size());
         }
-        TP_CHECK(fn_ != nullptr, "backward graph has already been released");
+        TP_CHECK(fn_ != nullptr, backward_twice_message());
 
         const Tensor& grad = inputs[0];
         const auto base_size = static_cast<std::vector<int64_t>>(base_.shape());
