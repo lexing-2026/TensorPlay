@@ -318,6 +318,7 @@ _TRACE_KEEPS_RANDOM_DRAWS = frozenset({
     "rand", "rand_like", "randn", "randn_like", "randint", "randint_like",
     "randperm", "bernoulli", "bernoulli_", "dropout", "native_dropout",
     "normal", "normal_", "uniform", "uniform_", "exponential", "exponential_",
+    "cauchy", "cauchy_", "geometric", "geometric_", "log_normal", "log_normal_",
 })
 
 
@@ -8689,20 +8690,16 @@ _fallback_randn_generator = fallback_handler(tp_ops.randn.generator)
 def randn(*args: Any, **kwargs: Any) -> Any:
     """Normal values handed to the framework rather than drawn here.
 
-    A draw the graph cannot write -- one naming a generator of its own, or
-    one made while draws are being read by the generator they belong to --
-    is a call the framework answers with the values the program would have
-    drawn without it.  A draw the pass that rewrites random operations was
-    meant to catch and did not is a program in two minds, and is said so.
+    A draw reads the generator the program runs with, so the values a
+    compiled call makes are the ones an eager call would: the call goes to
+    the framework whole, and the generator's state moves with it.  A draw
+    naming a generator of its own reaches that generator's overload the same
+    way.
     """
 
     if kwargs.get("generator") is not None:
         return _fallback_randn_generator(*args, **kwargs)
-    if config.fallback_random or kwargs.get("pin_memory"):
-        kwargs.pop("generator", None)
-        kwargs.pop("pin_memory", None)
-        return _fallback_randn_default(*args, **kwargs)
-    raise AssertionError("should have been handled in replace_random.py")
+    return _fallback_randn_default(*args, **kwargs)
 
 
 def to_dtype_bitcast(x: Any, dtype: Any, *, copy: bool = False) -> Any:
