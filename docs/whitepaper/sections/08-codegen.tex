@@ -453,7 +453,7 @@ class P10_API Tensor {
 
 \subsection{导数编译：（785行）}
 
-导数不是字符串替换的；它们被编译。 \texttt{gen\_autograd.py} 标记每个公式，构建表达式 AST（节点 \texttt{Num}、\texttt{BoolLit}、\texttt{Var}、\texttt{Call}），并运行优先级攀爬解析器，将比较转换为分派操作（\texttt{\_normalize\_comparisons} 将 \texttt{a > b} 重写为 \texttt{gt(a,b)}）。 \texttt{OpDerivatives} 存储 \texttt{node\_name}、\texttt{members}、\texttt{used\_input\_names} 和每个输出公式。对 AST 的一次遍历会收集保存的变量需求，因此结构定义、其构造函数参数列表以及构造 \texttt{grad\_fn} 的每个调用站点都在构造上一致。无法表示为标量公式的向后列表映射（\texttt{cat}、\texttt{stack}、\texttt{roll}）在 \texttt{MANUAL\_DERIVATIVES} 中声明并作为手写节点实例发出。输出 \texttt{AutogradNodesGenerated.h} 包含 148 个节点结构；每个都在需要时将保存的张量保存为 \texttt{SavedVariable} ，并保存一个 \texttt{apply} ，以正确的广播重播公式。
+导数不是字符串替换的；它们被编译。 \texttt{gen\_autograd.py} 标记每个公式，构建表达式 AST（节点 \texttt{Num}、\texttt{BoolLit}、\texttt{Var}、\texttt{Call}），并运行优先级攀爬解析器，将比较转换为分派操作（\texttt{\_normalize\_comparisons} 将 \texttt{a > b} 重写为 \texttt{gt(a,b)}）。 \texttt{OpDerivatives} 存储 \texttt{node\_name}、\texttt{members}、\texttt{used\_input\_names} 和每个输出公式。对 AST 的一次遍历会收集保存的变量需求，因此结构定义、其构造函数参数列表以及构造 \texttt{grad\_fn} 的每个调用站点都在构造上一致。无法表示为标量公式的向后列表映射（\texttt{cat}、\texttt{stack}、\texttt{roll}）在 \texttt{MANUAL\_DERIVATIVES} 中声明并作为手写节点实例发出。输出 \texttt{AutogradNodesGenerated.h} 包含 368 个节点结构；每个都在需要时将保存的张量保存为 \texttt{SavedVariable} ，并保存一个 \texttt{apply} ，以正确的广播重播公式。
 
 \subsection{Autocast、结构化和 Alias 垫片}
 
@@ -607,7 +607,7 @@ static PyObject* pyop_add_function_ov0(PyObject*, PyObject* const* args,
 \texttt{TPXOpsGenerated.h} & 5\,100 & 592\,k & 标题中的内联简单转发器 \\
 \texttt{TPXOpsGenerated.cpp} & 4\,800 & 453\,k & 具有图形逻辑的外线包装器 \\
 \texttt{TPXAutogradRegistration.cpp} & 1\,900 & 200\,k & 静态构造函数，187 个内核 $\times$~3 个键 \\
-\texttt{AutogradNodesGenerated.h} & 3\,200 & 286\,k & 148 个节点结构 \\
+\texttt{AutogradNodesGenerated.h} & 12\,299 & 1\,100\,k & 368 个节点结构 \\
 \texttt{AutocastGenerated.cpp} & 1\,100 & 111\,k & 自动铸造内核 \\
 \texttt{TensorCPythonGenerated.h} & 98\,000 & 9\,304\,k & 每次过载 \texttt{METH\_FASTCALL} \\
 \texttt{TensorBindingsGenerated.h} & 12 & $<1$\,k & 后备 pybind11 表面 \\

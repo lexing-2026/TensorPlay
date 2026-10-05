@@ -184,10 +184,10 @@
 \pagestyle{fancy}
 \fancyhf{}
 \fancyhead[L]{\small\textsc{TensorPlay 白皮书}}
-\fancyhead[R]{\small\textit{2026-09-02 --- v1.0.0rc0}}
+\fancyhead[R]{\small\textit{2026-10-04 --- v1.1.0a0}}
 \fancyfoot[L]{\small\textit{\nouppercase\thesection}}
 \fancyfoot[C]{\thepage}
-\fancyfoot[R]{\small\texttt{v1.0.0rc0}}
+\fancyfoot[R]{\small\texttt{v1.1.0a0}}
 \renewcommand{\headrulewidth}{0.4pt}
 \renewcommand{\footrulewidth}{0.2pt}
 
@@ -227,7 +227,7 @@
   % 版本标签
   \node[anchor=west, draw=tporange, text=tporange!30!white, rounded corners=2pt,
         inner xsep=8pt, inner ysep=4pt, font=\small\sffamily\bfseries]
-    at ([xshift=1.35cm, yshift=-0.15cm]current page.center) {v1.0.0rc0};
+    at ([xshift=1.35cm, yshift=-0.15cm]current page.center) {v1.1.0a0};
 
   % ---- 四支柱示意 ----
   \begin{scope}[shift={([xshift=1.35cm, yshift=-4.6cm]current page.center)},
@@ -368,16 +368,18 @@ TensorPlay 是以清晰性与系统严谨性为核心构建的深度学习框架
 \printglossary[title={术语表}, toctitle={术语表}]
 
 % ---------- 参考文献 ----------
-\begin{thebibliography}{9}
-\bibitem{tp2026} TensorPlay 贡献者, \emph{TensorPlay 源码树}, v1.0.0rc0, 2026. \texttt{https://github.com/lexing-2026/TensorPlay}.
-\bibitem{adis} A.~Griewank and A.~Walther, \emph{Evaluating Derivatives: Principles and Techniques of AD}, SIAM, 2nd ed., 2008.
-\bibitem{cupti2024} NVIDIA, \emph{CUPTI 文档}, CUDA 12.x, 2024.
-\bibitem{pybind11} W.~Jakob 等, \emph{pybind11 文档}, 2024.
-\bibitem{tc2024} T.~Chen 等, \emph{Tensor Comprehensions: Framework-Agnostic High-Performance Machine Learning Abstractions}, \emph{ArXiv:1802.04730}, 2018.
-\bibitem{cuda2024} NVIDIA, \emph{CUDA C++ 编程指南}, CUDA 12.x, 2024.
-\bibitem{llvm2024} C.~Lattner 等, \emph{MLIR: Scaling Compiler Infrastructure for Domain-Specific Computation}, \emph{CGO}, 2021.
-\bibitem{xla2024} T.~Authors, \emph{XLA: Optimizing Compiler for Machine Learning}, \texttt{tensorflow/compiler/xla}, 2024.
-\bibitem{autocast} NVIDIA, \emph{面向 NVIDIA TensorCore GPU 的自动混合精度}, \texttt{developer.nvidia.com/autocast}, 2024.
+% 本文的引用约定是 \texttt{path:line}：机制的位置一律指到本仓库的源码，
+% 不引外部实现。下面只列实现真正依赖的外部规范与教材，供延伸阅读；
+% 文中按名字提及（\texttt{CUPTI}、\texttt{pybind11}、\texttt{CUDA}），
+% 因此不按编号引用。
+\begin{thebibliography}{7}
+\bibitem{tp2026} TensorPlay 贡献者, \emph{TensorPlay 源码树}, v1.1.0a0, 2026. \texttt{https://github.com/lexing-2026/TensorPlay}.
+\bibitem{adis} A.~Griewank and A.~Walther, \emph{Evaluating Derivatives: Principles and Techniques of Automatic Differentiation}, SIAM, 2nd ed., 2008.
+\bibitem{cuda2024} NVIDIA, \emph{CUDA C++ Programming Guide}, \texttt{docs.nvidia.com/cuda/cuda-c-programming-guide}, 2024.
+\bibitem{cublas2024} NVIDIA, \emph{cuBLAS Documentation}, \texttt{docs.nvidia.com/cuda/cublas}, 2024.
+\bibitem{cupti2024} NVIDIA, \emph{CUPTI Documentation}, \texttt{docs.nvidia.com/cupti}, 2024.
+\bibitem{amp2024} NVIDIA, \emph{Mixed Precision Training}, \texttt{docs.nvidia.com/deeplearning/performance/mixed-precision-training}, 2024.
+\bibitem{pybind11} W.~Jakob, J.~Stansbridge 等, \emph{pybind11 Documentation}, \texttt{pybind11.readthedocs.io}, 2024.
 \end{thebibliography}
 
 % ---------- 附录 ----------

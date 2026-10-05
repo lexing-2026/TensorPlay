@@ -19,8 +19,8 @@
 \toprule
 公制 & 张量播放 & 更广泛的实施 \\
 \midrule
-C++核心 & $\approx$ 75\,k & 数百 k（核心运行时 $>$ 300\,k） \\
-Python表面 & 267\,k / 899 个文件（见表~\ref{tab:pybreakdown}） & 更大的封装表面 \\
+C++核心 & $\approx$ 300\,k & 数百 k \\
+Python表面 & 552\,k / 1\,374 个文件（见表~\ref{tab:pybreakdown}） & 更大的封装表面 \\
 运算符（唯一的 \texttt{m.impl}） & 1{,}466--1{,}563 & 2000+ \\
 \texttt{DispatchKey} 基数 & 33 & 60+ \\
 Autograd 节点（生成） & 368 & 数千 \\
@@ -57,7 +57,7 @@ Autograd 节点（生成） & 368 & 数千 \\
 \subsection{Python 线路所在的地方}
 \label{subsec:eval-pybreakdown}
 
-Table~\ref{tab:evalsize} 引用了一个 Python 数字，这引发了一个问题“里面有什么？”。 Table~\ref{tab:pybreakdown} 分解了 267\,k 行，因此可以逐个子系统检查“薄饰面”声明。
+Table~\ref{tab:evalsize} 引用了一个 Python 数字，这引发了一个问题“里面有什么？”。 Table~\ref{tab:pybreakdown} 分解了 552\,k 行，因此可以逐个子系统检查“薄饰面”声明。
 
 \begin{table}[H]
 \centering
@@ -68,23 +68,26 @@ Table~\ref{tab:evalsize} 引用了一个 Python 数字，这引发了一个问�
 \toprule
 分包 & 那里住着什么 & 文件 & 线路 \\
 \midrule
-\texttt{distributed/} & 进程组集体、fsdp、DTensor、elastic、rpc & 367 & 62{,}770 \\
-\texttt{vision/} + \texttt{audio/} & 数据集、转换、模型动物园 & 148 & 51{,}039 \\
-\texttt{graph/} & 符号示踪器、节点/图表、符号形状 & 113 & 27{,}991 \\
-\texttt{nn/} & 模块、功能、初始化 & 42 & 22{,}832 \\
-\texttt{\_stax/} & shape 属性、DCE、const 折叠、解释器 & 20 & 11{,}528 \\
-\texttt{optim/} & 15 个优化器，foreach/fused 路径 & 24 & 11{,}365 \\
-\texttt{export/} + \texttt{onnx/} & 草稿导出、效果令牌通行证 & 34 & 9{,}216 \\
-\texttt{autograd/} + \texttt{\_transforms/} & 函数、grad-mode、vmap 包装器 & 24 & 8{,}072 \\
-其他17个子包 & cuda、分析器、放大器、稀疏、量化、\dots & 134 & 35{,}884 \\
-根模块 & \texttt{\_tensor.py}, \texttt{library.py} (1\,779), \texttt{overrides.py} & 23 & 37{,}805 \\
+\texttt{compiler/} & 捕获、lowering、codegen、stax 后端 & 250 & 186{,}999 \\
+\texttt{distributed/} & 进程组集体、fsdp、DTensor、elastic、rpc & 371 & 92{,}038 \\
+\texttt{vision/} + \texttt{audio/} & 数据集、转换、模型动物园 & 169 & 56{,}151 \\
+根模块 & \texttt{\_tensor.py}, \texttt{library.py}, \texttt{overrides.py} & 31 & 41{,}348 \\
+\texttt{graph/} & 符号示踪器、节点/图表、符号形状 & 120 & 34{,}749 \\
+\texttt{nn/} & 模块、功能、初始化 & 60 & 31{,}714 \\
+\texttt{utils/} & hooks、pytree、tensorboard 桥 & 32 & 11{,}321 \\
+\texttt{optim/} & 15 个优化器，foreach/fused 路径 & 24 & 11{,}221 \\
+\texttt{export/} + \texttt{onnx/} & 草稿导出、效果令牌通行证 & 39 & 10{,}564 \\
+\texttt{distributions/} & 概率分布 & 49 & 9{,}940 \\
+\texttt{autograd/} + \texttt{\_transforms/} & 函数、grad-mode、vmap 包装器 & 23 & 8{,}071 \\
+\texttt{ao/} + \texttt{primitives/} + \texttt{masked/} & 量化感知算子、分派原语 & 60 & 15{,}174 \\
+其他23个子包 & \texttt{\_numpy}、\texttt{\_higher\_order\_ops}、serialization、cuda、sparse、\dots & 146 & 42{,}808 \\
 \midrule
-全部的 &  & 899 & 266{,}907 \\
+全部的 &  & 1{,}374 & 552{,}098 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-以下是两个观察结果。首先，框架机制内容——\texttt{nn}、\texttt{optim}、\texttt{\_stax}、\texttt{autograd}、根模块——是$\sim$91\,k行（34\%），符合\S\ref{sec:arch}的“薄饰面”主张：张量类型和library-impl注册面是唯一的大手写集成点。其次，单个最大块是\texttt{distributed/}(63\,k, 24\%)；仅其 FSDP 子树就有 9.5\,k 行。模型动物园 (\texttt{vision/} + \texttt{audio/}, 51\,k) 是数据集/检查点管道，可以在不涉及调度或自动微分的情况下删除；它们的存在使得 \S\ref{subsec:eval-bench} 的端到端基准测试具有实际的工作负载。 899 个文件都没有注册内核或调度密钥；一切都回到\texttt{\_C}。
+以下是三个观察结果。首先，框架机制内容——\texttt{nn}、\texttt{optim}、\texttt{autograd}、根模块——是$\sim$92\,k行（17\%），符合\S\ref{sec:arch}的“薄饰面”主张：张量类型和library-impl注册面是唯一的大手写集成点。其次，单个最大块是\texttt{compiler/}(187\,k, 34\%)：\texttt{\_stax/} 只剩一个 190 行的兼容垫片，捕获、lowering 与 codegen 都已收进编译器包。\texttt{distributed/} 次之 (92\,k, 17\%)，仅其 FSDP 子树就有 15\,k 行。最后，模型动物园 (\texttt{vision/} + \texttt{audio/}, 56\,k) 是数据集/检查点管道，可以在不涉及调度或自动微分的情况下删除；它们的存在使得 \S\ref{subsec:eval-bench} 的端到端基准测试具有实际的工作负载。 1\,374 个文件都没有注册内核或调度密钥；一切都回到\texttt{\_C}。
 
 %======================================================================
 \subsection{GPU 后端：CUDA 和 Vulkan 插槽}
@@ -285,7 +288,7 @@ for (; i + level_step <= size;) {
 \subsection{分布式训练：FSDP、DTensor、Functional Collective}
 \label{subsec:eval-distributed}
 
-分布式堆栈（63\,k 个 Python 行加上 17\,k 个基于 gloo 和 MPI 的进程组后端 C++ 行）组织成三层，反映了支柱理念：C++ 通信层、可微分的 Python 功能层和可组合的分片策略。
+分布式堆栈（92\,k 个 Python 行加上 17\,k 个基于 gloo 和 MPI 的进程组后端 C++ 行）组织成三层，反映了支柱理念：C++ 通信层、可微分的 Python 功能层和可组合的分片策略。
 
 \paragraph{FSDP。} Fully sharded data parallelism is configured by a small enum vocabulary rather than ad-hoc flags: \texttt{FULL\_SHARD} (parameters sharded, gathered per layer, freed after use), \texttt{SHARD\_GRAD\_OP} (gather once per forward, shard only gradients and optimizer state), \texttt{NO\_SHARD} (plain DDP), and a hybrid intra/inter-node variant. Policies compose as dataclasses---\texttt{MixedPrecision} chooses independent dtypes for parameters, reduction, and buffers; \texttt{CPUOffload} swaps parameters to host memory between uses; \texttt{BackwardPrefetch} overlaps the next layer's gather with the current layer's backward.
 
@@ -501,7 +504,7 @@ RPC & 408 & RPC 绑定 &  & \\
 \subsection{三轨测试套件}
 \label{subsec:eval-tests}
 
-测试树——145 个 Python 文件（2{,}069 个测试函数，2{,}571 个收集的测试函数，包括参数化案例）加上 2{,}078 行 C++ 测试（gloo 进程组、Vulkan api/op 套件）——被组织为具有不同断言的三个系列：
+测试树——245 个 Python 文件（3{,}442 个测试函数，5{,}688 个收集的测试，包括参数化案例）加上 3{,}718 行 C++ 测试（gloo 进程组、Vulkan api/op 套件）——被组织为具有不同断言的三个系列：
 
 \begin{table}[H]
 \centering
@@ -512,11 +515,11 @@ RPC & 408 & RPC 绑定 &  & \\
 \toprule
 追踪 & 断言风格 & 文件 & 测试 \\
 \midrule
-\texttt{alignment} & 数值公差与参考 & 13 & 152 \\
-\texttt{native} & 调度到达后端本机内核，而不是复合内核 & 22 & 226 \\
-\texttt{contract} & 精确的行为对等，包括异常类型 & 4 & 51 \\
+\texttt{alignment} & 数值公差与参考 & 15 & 186 \\
+\texttt{native} & 调度到达后端本机内核，而不是复合内核 & 33 & 814 \\
+\texttt{contract} & 精确的行为对等，包括异常类型 & 1 & 71 \\
 \midrule
-其他106个文件 & 引擎、编译器、前端、e2e & 106 & --- \\
+其他196个文件 & 引擎、编译器、前端、e2e & 196 & --- \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -532,7 +535,7 @@ RPC & 408 & RPC 绑定 &  & \\
 \begin{figure}[H]
 \centering
 \begin{tikzpicture}[every node/.style={font=\scriptsize}]
-% horizontal stacked bar of test outcomes (widths precomputed: 9.6 * n/2577)
+% horizontal stacked bar of test outcomes (widths precomputed: 9.6 * n/5688)
 \def\totalw{9.6}
 \def\wp{8.5867}
 \def\ws{0.9797}
@@ -556,10 +559,10 @@ RPC & 408 & RPC 绑定 &  & \\
 % three-track test counts
 \def\cw{0.78}
 \foreach \x/\name/\count/\fillc/\drawc in {
-  0/{*}\_alignment/152/blue!8/tpblue,
-  1/{*}\_native/226/orange!10/tporange,
-  2/{*}\_contract/51/purple!8/tppurple}{
-  \pgfmathsetmacro{\h}{\count/100}
+  0/{*}\_alignment/186/blue!8/tpblue,
+  1/{*}\_native/814/orange!10/tporange,
+  2/{*}\_contract/71/purple!8/tppurple}{
+  \pgfmathsetmacro{\h}{\count/300}
   \pgfmathsetmacro{\lbl}{\h+0.45}
   \fill[\fillc] (\x*\cw,0) rectangle (\x*\cw+0.5*\cw,\h);
   \draw[\drawc] (\x*\cw,0) rectangle (\x*\cw+0.5*\cw,\h);
@@ -568,7 +571,7 @@ RPC & 408 & RPC 绑定 &  & \\
 }
 \draw[->,gray] (-0.1,0) -- (2.35,0);
 \end{tikzpicture}
-\caption{左：全套运行的结果 (163\,s)。右：每个轨道的测试计数；跨三个后缀族进行 429 次测试，跨整个树进行 2{,}069 次测试。}
+\caption{左：全套运行的结果 (163\,s)。右：每个轨道收集到的测试数；三个后缀族共 49 个文件、1{,}071 个测试，全树 245 个文件、5{,}688 个测试。}
 \label{fig:testoutcomes}
 \end{figure}
 

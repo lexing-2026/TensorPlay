@@ -105,7 +105,7 @@ Python 绑定是双路径且仅填充的。桥接器和生成的模块一起实�
 \subsubsection{C3：自动微分}
 \label{sec:intro:c3}
 
-没有\ac{tape}。每个需要 grad 的前向操作都会分配一个 \texttt{Node} 子类（从 via 生成的 148 种类型到 \texttt{AutogradNodesGenerated.h} 中，或者是手写节点中）。
+没有\ac{tape}。每个需要 grad 的前向操作都会分配一个 \texttt{Node} 子类（从 via 生成的 368 种类型到 \texttt{AutogradNodesGenerated.h} 中，或者是手写节点中）。
 \texttt{next\_edges: vector<Edge>} 指向父母； \texttt{Edge} at 带有 \texttt{weak\_ptr<Node>} 加上 \texttt{output\_nr}。
 \texttt{output\_nr}。该图是这些边的传递闭包。 \texttt{Node::sequence\_nr} at \texttt{Node.h} 是一个全局单调计数器
 \texttt{get\_and\_increment\_sequence\_nr}，由引擎用来确定重新计算顺序的优先级。

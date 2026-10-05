@@ -8,7 +8,7 @@ autograd 引擎按代码逐条记录。没有 \ac{tape}：搜索该符号返回�
 \subsection{无磁带，显式 DAG}
 \label{subsec:notape}
 
-引擎在转发过程中急切地构建图表。每个操作的自动微分包装器分配一个 \texttt{Node} 子类（从 via 生成到 \texttt{AutogradNodesGenerated.h} 的 148 种类型）或使用手写节点（例如\ \texttt{CatBackward}、\texttt{MeanBackward}、\texttt{AccumulateGrad}）。该节点的 \texttt{next\_edges:\ vector<Edge>} 指向其父节点。整个图是这些边的传递闭包。打印或绘制图表需要\texttt{shared\_ptr<Node>}；设备分区调度是从节点到队列的映射，无需扫描全局磁带。仅当 \texttt{roots.size!=1} 时才创建合成 \texttt{GraphRoot}，否则单根直接是图根。
+引擎在转发过程中急切地构建图表。每个操作的自动微分包装器分配一个 \texttt{Node} 子类（从 via 生成到 \texttt{AutogradNodesGenerated.h} 的 368 种类型）或使用手写节点（例如\ \texttt{CatBackward}、\texttt{MeanBackward}、\texttt{AccumulateGrad}）。该节点的 \texttt{next\_edges:\ vector<Edge>} 指向其父节点。整个图是这些边的传递闭包。打印或绘制图表需要\texttt{shared\_ptr<Node>}；设备分区调度是从节点到队列的映射，无需扫描全局磁带。仅当 \texttt{roots.size!=1} 时才创建合成 \texttt{GraphRoot}，否则单根直接是图根。
 
 %==============================================================================
 \subsection{节点：字段和不变量}
