@@ -237,6 +237,17 @@ Tensor& var_out_native(const Tensor& self, const std::optional<std::vector<int64
 std::tuple<Tensor, Tensor> std_mean_correction_native(
         const Tensor& self, const std::optional<std::vector<int64_t>>& dim,
         const std::optional<Scalar>& correction, bool keepdim) {
+    const int64_t c = correction.has_value() ? correction->to<int64_t>() : 1;
+    if (c == 0 || c == 1) {
+        // The Welford pass yields both statistics in one sweep; the square
+        // root only touches the already-reduced variance output.
+        const auto dims = correction_reduce_dims(self, dim, keepdim);
+        Tensor mean;
+        Tensor var;
+        std::tie(var, mean) = ops::var_mean(self, dims.value_or(std::vector<int64_t>{}),
+                                            c == 1, keepdim);
+        return {var.sqrt(), mean};
+    }
     return {std_correction_native(self, dim, correction, keepdim),
             mean_for_correction(self, dim, keepdim)};
 }
@@ -244,6 +255,15 @@ std::tuple<Tensor, Tensor> std_mean_correction_native(
 std::tuple<Tensor, Tensor> var_mean_correction_native(
         const Tensor& self, const std::optional<std::vector<int64_t>>& dim,
         const std::optional<Scalar>& correction, bool keepdim) {
+    const int64_t c = correction.has_value() ? correction->to<int64_t>() : 1;
+    if (c == 0 || c == 1) {
+        // The Welford pass yields both statistics in one sweep; the var/mean
+        // pair of passes re-reads the whole input for a value the accumulator
+        // already holds.
+        const auto dims = correction_reduce_dims(self, dim, keepdim);
+        return ops::var_mean(self, dims.value_or(std::vector<int64_t>{}),
+                             c == 1, keepdim);
+    }
     return {var_correction_native(self, dim, correction, keepdim),
             mean_for_correction(self, dim, keepdim)};
 }
