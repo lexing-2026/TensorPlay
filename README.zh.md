@@ -1,11 +1,18 @@
+<h1 align="center">
+    <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/lexing-2026/TensorPlay/main/docs/images/tensorplay-lockup-dark.png">
+        <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/lexing-2026/TensorPlay/main/docs/images/tensorplay-lockup.png">
+        <img src="https://raw.githubusercontent.com/lexing-2026/TensorPlay/main/docs/images/tensorplay-lockup.png" alt="TensorPlay" width="620">
+    </picture>
+</h1>
+
 <div align="center">
-    <p>
-        <picture>
-            <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/lexing-2026/TensorPlay/main/docs/images/tensorplay-lockup-dark.png">
-            <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/lexing-2026/TensorPlay/main/docs/images/tensorplay-lockup.png">
-            <img src="https://raw.githubusercontent.com/lexing-2026/TensorPlay/main/docs/images/tensorplay-lockup.png" alt="TensorPlay" width="620">
-        </picture>
-    </p>
+<h3>
+    <samp>Read the whole stack.</samp>
+</h3>
+<p>
+    <samp>一个面向学习者的 DIY 友好型框架，为张量、内核与自定义硬件而生。</samp>
+</p>
 
 <p>
     <a href="https://www.tensorplay.cn/zh/guide/tutorials"><strong>教程</strong></a> •
@@ -96,17 +103,11 @@
 
 </details>
 
-<h3>
-    <samp>一个面向学习者的 DIY 友好型深度学习框架<br>
-    旨在揭示神经网络内部机制并促进自定义硬件实验</samp>
-</h3>
+<div align="center">
+    <iframe src="https://player.bilibili.com/player.html?bvid=BV1JcaD64E8H&page=1" scrolling="no" border="0" frameborder="no" framespacing="0" allowfullscreen="true" width="100%" height="500" style="max-width: 960px; display: block; margin: 0 auto;"></iframe>
+</div>
 
-TensorPlay 是一个 Python 软件包，提供两大高层能力：
-
-- 带有强大 GPU 加速的张量计算（类 NumPy）
-- 建立在显式、基于磁带（tape）机制的自动微分系统之上的深度神经网络
-
-整个技术栈——Python API、C++ 核心、CUDA 内核、编译器——都为「可读」而生：实现干净、计算图显式，模型与硬件之间没有黑盒。
+TensorPlay 是一个面向学习者的深度学习框架：它融合了类 NumPy 的张量计算与 GPU 加速，并配以建立在显式计算图（DAG）之上的自动微分引擎来训练神经网络。整个技术栈——Python API、C++ 核心、CUDA 内核、编译器——都写成可以从头读到尾：模型与硬件之间没有黑盒。
 
 <!-- toc -->
 
@@ -157,7 +158,7 @@ TensorPlay 是一个 Python 软件包，提供两大高层能力：
 | **stax** | JIT 编译器试验场：静态图捕获与算子融合实验，支持自定义算子的原生下沉 |
 | **tensorplay.nn** | 神经网络构件：`Module`、`Linear`、`Conv2d`、激活函数、损失函数与容器抽象 |
 | **tensorplay.optim** | 优化器（SGD、Adam、AdamW），支持学习率调度与权重衰减 |
-| **tensorplay.data** | `Dataset` / `DataLoader`：多 worker 批处理、预取 (prefetch) 与自动打乱 |
+| **tensorplay.utils.data** | `Dataset` / `DataLoader`：多 worker 批处理、预取 (prefetch) 与自动打乱 |
 | **tensorplay.library** | 一等公民的自定义算子：注册算子、挂接 fake/meta 与自动微分公式、接入自有 Triton kernel |
 
 四大支柱——**P10**、**TPX**、**Stax** 与 **NN**——是刻意解耦的核心库，既可协同工作，也可独立使用。`linalg`、`fft`、`sparse`、`special`、`amp`、`distributed`、`serialization` 等领域子包补全了完整的 API 面。
@@ -381,14 +382,24 @@ print(model)  # 自动生成层结构可视化
 ### 训练循环
 
 ```python
+from tensorplay.nn import MSELoss
+from tensorplay.optim import SGD
 from tensorplay.utils.data import DataLoader, TensorDataset
 
 train_data = TensorDataset(tp.randn(100, 10), tp.randn(100, 1))
 train_loader = DataLoader(dataset=train_data, batch_size=8, shuffle=True)
 
-for batch_x, batch_y in train_loader:
-    predictions = model(batch_x)
-    # ... 计算损失、调用 loss.backward()、更新优化器
+model = MLP(10, 32, 1)
+criterion = MSELoss()
+optimizer = SGD(model.parameters(), lr=0.01)
+
+for epoch in range(3):
+    for batch_x, batch_y in train_loader:
+        optimizer.zero_grad()
+        predictions = model(batch_x)
+        loss = criterion(predictions, batch_y)
+        loss.backward()
+        optimizer.step()
 ```
 
 体系化教程——从零开始的线性回归、MNIST CNN 图像分类、自定义数据集、`.mega` + `state_dict` 模型保存与加载——见 [tensorplay.cn](https://www.tensorplay.cn/zh/guide/tutorials)。深度长文，一篇一个支柱——dispatch、autograd 引擎、张量存储、编译器——见[博客系列](docs/blogs/00-index.md)。
@@ -405,7 +416,7 @@ for batch_x, batch_y in train_loader:
 - **微观与子系统**：GEMM、优化器 step、dataloader、序列化、autograd Function 开销、自定义算子调用开销、LLaMA 端到端
 - **报告**：每个脚本输出 JSON 报告（`--json-out`）——吞吐、延迟分位数、编译开销——可直接绘图并用于[白皮书](docs/whitepaper/main.pdf)评估
 
-实测亮点（见[白皮书](docs/whitepaper/main.pdf) §9）：dispatcher 在 CPU、CUDA 与 Vulkan 路径上都只增加不到 1% 的开销；CUDA 后端覆盖 1,262 个独立算子（CPU 面 1,233 个的 97%）；Vulkan 教学后端交付 224 个算子，背后是 102 个文件、6.8k 行 GLSL shader。pytest 套件共收集 5,680 个测试。
+实测亮点（见[白皮书](docs/whitepaper/main.pdf) §9，对应当前 `main` 的快照）：dispatcher 在 CPU、CUDA 与 Vulkan 路径上都只增加不到 1% 的开销；CUDA 后端覆盖 1,262 个独立算子（CPU 面 1,233 个的 97%）；Vulkan 教学后端交付 224 个算子，背后是 102 个文件、6.8k 行 GLSL shader。pytest 套件共收集 5,680 个测试。
 
 脚本与方法论：[benchmark/README.md](benchmark/README.md)。
 

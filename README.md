@@ -102,14 +102,13 @@
 </p>
 </details>
 
+<div align="center">
+    <iframe src="https://player.bilibili.com/player.html?bvid=BV1JcaD64E8H&page=1" scrolling="no" border="0" frameborder="no" framespacing="0" allowfullscreen="true" width="100%" height="500" style="max-width: 960px; display: block; margin: 0 auto;"></iframe>
+</div>
+
 --------------------------------------------------------------------------------
 
-TensorPlay is a Python package that provides two high-level features:
-
-- Tensor computation (like NumPy) with strong GPU acceleration
-- Deep neural networks built on an explicit, tape-based autograd system
-
-The whole stack — Python API, C++ core, CUDA kernels, compiler — is engineered to be read: clean implementations, explicit computation graphs, and no black box between your model and the hardware.
+TensorPlay is a learner-first deep learning framework. It combines NumPy-style tensor computation with GPU acceleration and neural networks trained by an explicit computation-graph autograd engine. The entire stack — Python API, C++ core, CUDA kernels, compiler — is written to be read end to end: no black box between your model and the hardware.
 
 <!-- toc -->
 
@@ -160,7 +159,7 @@ At a granular level, TensorPlay consists of the following components:
 | **stax** | JIT compiler playground: static graph capture and operator fusion experiments, including native lowering of custom ops |
 | **tensorplay.nn** | Neural network building blocks: `Module`, `Linear`, `Conv2d`, activations, losses, container abstractions |
 | **tensorplay.optim** | Optimizers (SGD, Adam, AdamW) with learning-rate scheduling and weight decay |
-| **tensorplay.data** | `Dataset` / `DataLoader` with multi-worker batching, prefetching and shuffling |
+| **tensorplay.utils.data** | `Dataset` / `DataLoader` with multi-worker batching, prefetching and shuffling |
 | **tensorplay.library** | First-class custom operators: register ops, attach fake/meta and autograd formulas, bring your own Triton kernels |
 
 The four pillars — **P10**, **TPX**, **Stax** and **NN** — are deliberately decoupled libraries that can work together or independently. Domain subpackages such as `linalg`, `fft`, `sparse`, `special`, `amp`, `distributed` and `serialization` round out the API surface.
@@ -385,14 +384,24 @@ print(model)  # auto-generated architecture visualization
 ### Training Loop
 
 ```python
+from tensorplay.nn import MSELoss
+from tensorplay.optim import SGD
 from tensorplay.utils.data import DataLoader, TensorDataset
 
 train_data = TensorDataset(tp.randn(100, 10), tp.randn(100, 1))
 train_loader = DataLoader(dataset=train_data, batch_size=8, shuffle=True)
 
-for batch_x, batch_y in train_loader:
-    predictions = model(batch_x)
-    # ... compute loss, call loss.backward(), step the optimizer
+model = MLP(10, 32, 1)
+criterion = MSELoss()
+optimizer = SGD(model.parameters(), lr=0.01)
+
+for epoch in range(3):
+    for batch_x, batch_y in train_loader:
+        optimizer.zero_grad()
+        predictions = model(batch_x)
+        loss = criterion(predictions, batch_y)
+        loss.backward()
+        optimizer.step()
 ```
 
 Structured tutorials — linear regression from scratch, MNIST CNN classification, custom datasets, model saving/loading with `.mega` + `state_dict` — live at [tensorplay.cn](https://www.tensorplay.cn/en/guide/tutorials). Deep dives, one pillar per post — dispatch, autograd engine, tensor storage, compiler — live in the [blog series](docs/blogs/00-index.md).
@@ -409,7 +418,7 @@ The [benchmark/](benchmark/) suite measures what a readable framework costs — 
 - **Micro and subsystem**: GEMM, optimizer steps, dataloader, serialization, autograd Function overhead, custom-op call overhead, LLaMA end-to-end
 - **Reports**: every script emits a JSON report (`--json-out`) — throughput, latency percentiles, compile cost — ready for plotting and for the [white paper](docs/whitepaper/main.pdf) evaluation
 
-Measured highlights (see the [white paper](docs/whitepaper/main.pdf), §9): the dispatcher adds the same sub-1% sliver on CPU, CUDA and Vulkan paths; the CUDA backend covers 1,262 unique ops (97% of the CPU surface, 1,233 ops); the Vulkan teaching backend ships 224 ops backed by 6.8k lines of GLSL shaders across 102 files. The pytest suite collects 5,680 tests.
+Measured highlights from the [white paper](docs/whitepaper/main.pdf), §9 — a snapshot of current `main`: the dispatcher adds the same sub-1% sliver on CPU, CUDA and Vulkan paths; the CUDA backend covers 1,262 unique ops (97% of the CPU surface, 1,233 ops); the Vulkan teaching backend ships 224 ops backed by 6.8k lines of GLSL shaders across 102 files. The pytest suite collects 5,680 tests.
 
 Scripts and methodology: [benchmark/README.md](benchmark/README.md).
 
