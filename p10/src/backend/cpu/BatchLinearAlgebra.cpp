@@ -602,21 +602,31 @@ std::tuple<Tensor, Tensor> triangular_solve_cpu(const Tensor& self, const Tensor
 
 std::tuple<Tensor, Tensor, Tensor> svd_cpu(const Tensor& self, bool some, bool compute_uv) {
     require_float(self, "svd");
-    const int64_t m = self.size(-2), k = self.size(-1);
-    const int64_t batch = self.numel() / (m * k);
-    (void)some;
-    if (lapack_available()) {
-        // gesdd-backed factorization via the linalg.svd kernel.  The legacy
-        // contract returns V (A = U diag(S) V^T), so the Vh factor is
-        // transposed before it lands in the third slot.
-        if (compute_uv) {
-            auto [U, S, Vh] = ops::linalg_svd(self, false, std::optional<std::string>());
-            return {U, S, Vh.transpose(-2, -1).contiguous()};
-        }
-        Tensor S = ops::linalg_svdvals(self, std::optional<std::string>());
-        Tensor zero = Tensor::zeros({}, self.dtype(), self.device());
-        return {zero, S, zero};
+    if (self.dim() < 2) {
+        TP_THROW(RuntimeError, "linalg.svd: input should have at least 2 dimensions, but has ",
+                 self.dim(), " dimensions instead");
     }
+    const int64_t m = self.size(-2), k = self.size(-1);
+    if (lapack_available()) {
+        // gesdd-backed factorization via the linalg.svd operator, which also
+        // carries the derivative.  The legacy contract returns V (A = U
+        // diag(S) V^H), the full factors when some=False, and zero factors
+        // of the full shapes when the vectors are not computed.
+        Tensor U, S, Vh;
+        if (compute_uv) {
+            std::tie(U, S, Vh) = ops::linalg_svd(self, !some, std::optional<std::string>());
+        } else {
+            S = ops::linalg_svdvals(self, std::optional<std::string>());
+            std::vector<int64_t> shape = shape_of(self);
+            shape.back() = m;
+            U = ops::zeros(shape, self.dtype(), self.device());
+            shape[shape.size() - 2] = k;
+            shape.back() = k;
+            Vh = ops::zeros(shape, self.dtype(), self.device());
+        }
+        return {U, S, ops::mH(Vh)};
+    }
+    const int64_t batch = m * k == 0 ? 0 : self.numel() / (m * k);
     return svd_scalar(self, m, k, batch, compute_uv);
 }
 

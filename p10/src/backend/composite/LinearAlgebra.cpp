@@ -10,16 +10,23 @@
 //   entry points additionally hand back the LU factorization and its pivots
 //   from one factorization pass, so a caller that needs the decomposition for
 //   a subsequent derivative does not factor the matrix twice.
+//
+//   The user-facing factorizations, solvers and pseudo-inverse spellings
+//   forward to the core operators that carry the derivatives, so a gradient
+//   reaches the input whichever spelling the caller used.
 
 #include "CompositeCommon.h"
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
+#include "GradMode.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <cmath>
 #include <limits>
 #include <cstdint>
+#include <optional>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -150,8 +157,123 @@ std::tuple<Tensor, Tensor, Tensor> lu_unpack_out_native(
     return {P, L, U};
 }
 
+// The user-facing factorizations and solvers.  Each answers through the core
+// operator that carries the derivative and then reports what its info codes
+// say; the eigenvalue and singular-value spellings compute the vectors only
+// when a gradient will need them.
+namespace {
+
+bool may_need_grad(const Tensor& A) {
+    return GradMode::is_enabled() && A.requires_grad();
+}
+
+}  // namespace
+
+Tensor linalg_cholesky_native(const Tensor& A, bool upper) {
+    auto [L, info] = ops::linalg_cholesky_ex(A, upper, false);
+    ops::_linalg_check_errors(info, "linalg.cholesky", A.dim() == 2);
+    return L;
+}
+
+Tensor linalg_inv_native(const Tensor& A) {
+    auto [inverse, info] = ops::linalg_inv_ex(A, false);
+    ops::_linalg_check_errors(info, "linalg.inv", A.dim() == 2);
+    return inverse;
+}
+
+Tensor linalg_det_native(const Tensor& A) {
+    return std::get<0>(ops::_linalg_det(A));
+}
+
+std::tuple<Tensor, Tensor> linalg_slogdet_native(const Tensor& A) {
+    auto values = ops::_linalg_slogdet(A);
+    return {std::get<0>(values), std::get<1>(values)};
+}
+
+std::tuple<Tensor, Tensor> linalg_solve_ex_native(const Tensor& A, const Tensor& B,
+                                                  bool left, bool check_errors) {
+    auto values = ops::_linalg_solve_ex(A, B, left, check_errors);
+    return {std::get<0>(values), std::get<3>(values)};
+}
+
+Tensor linalg_solve_native(const Tensor& A, const Tensor& B, bool left) {
+    auto [result, info] = ops::linalg_solve_ex(A, B, left, false);
+    ops::_linalg_check_errors(info, "linalg.solve", A.dim() == 2);
+    return result;
+}
+
+std::tuple<Tensor, Tensor> linalg_lu_factor_native(const Tensor& A, bool pivot) {
+    auto [LU, pivots, info] = ops::linalg_lu_factor_ex(A, pivot, false);
+    ops::_linalg_check_errors(info, "linalg.lu_factor", A.dim() == 2);
+    return {LU, pivots};
+}
+
+std::tuple<Tensor, Tensor> linalg_eigh_native(const Tensor& A, const std::string& UPLO) {
+    return ops::_linalg_eigh(A, UPLO, true);
+}
+
+Tensor linalg_eigvalsh_native(const Tensor& A, const std::string& UPLO) {
+    return std::get<0>(ops::_linalg_eigh(A, UPLO, may_need_grad(A)));
+}
+
+// The eigenvalues of a general matrix are differentiated through its
+// eigenvectors, which are then computed and dropped.
+Tensor linalg_eigvals_native(const Tensor& A) {
+    if (may_need_grad(A)) return std::get<0>(ops::linalg_eig(A));
+    return ops::_linalg_eigvals(A);
+}
+
+std::tuple<Tensor, Tensor, Tensor> linalg_svd_native(
+        const Tensor& A, bool full_matrices, const std::optional<std::string>& driver) {
+    return ops::_linalg_svd(A, full_matrices, true, driver);
+}
+
+Tensor linalg_svdvals_native(const Tensor& A, const std::optional<std::string>& driver) {
+    return std::get<1>(ops::_linalg_svd(A, false, may_need_grad(A), driver));
+}
+
+// The pseudo-inverse spellings answer through the tensor-tolerance form,
+// which carries the derivative.  A plain rcond is a relative tolerance.
+Tensor linalg_pinv_float_native(const Tensor& input, std::optional<double> atol,
+                                std::optional<double> rtol, bool hermitian) {
+    const auto as_tensor = [&](std::optional<double> value) -> std::optional<Tensor> {
+        if (!value.has_value()) return std::nullopt;
+        return ops::full({}, Scalar(*value), DType::Float64, input.device());
+    };
+    return ops::linalg_pinv(input, as_tensor(atol), as_tensor(rtol), hermitian);
+}
+
+Tensor linalg_pinv_rcond_native(const Tensor& input, double rcond, bool hermitian) {
+    return ops::linalg_pinv(input, std::optional<double>(0.0), std::optional<double>(rcond),
+                            hermitian);
+}
+
+Tensor linalg_pinv_rcond_tensor_native(const Tensor& input, const Tensor& rcond,
+                                       bool hermitian) {
+    TP_CHECK(!isComplexType(rcond.dtype()),
+             "linalg.pinv: rcond tensor of complex type is not supported.");
+    return ops::linalg_pinv(
+        input, std::optional<Tensor>(ops::zeros({}, DType::Float64, input.device())),
+        std::optional<Tensor>(rcond), hermitian);
+}
+
 TENSORPLAY_LIBRARY_IMPL(Composite, LinearAlgebraComposite) {
     m.impl("chain_matmul", chain_matmul_native);
+    m.impl("linalg_cholesky", linalg_cholesky_native);
+    m.impl("linalg_inv", linalg_inv_native);
+    m.impl("linalg_det", linalg_det_native);
+    m.impl("linalg_slogdet", linalg_slogdet_native);
+    m.impl("linalg_solve_ex", linalg_solve_ex_native);
+    m.impl("linalg_solve", linalg_solve_native);
+    m.impl("linalg_lu_factor", linalg_lu_factor_native);
+    m.impl("linalg_eigh", linalg_eigh_native);
+    m.impl("linalg_eigvalsh", linalg_eigvalsh_native);
+    m.impl("linalg_eigvals", linalg_eigvals_native);
+    m.impl("linalg_svd", linalg_svd_native);
+    m.impl("linalg_svdvals", linalg_svdvals_native);
+    m.impl("linalg_pinv.atol_rtol_float", linalg_pinv_float_native);
+    m.impl("linalg_pinv", linalg_pinv_rcond_native);
+    m.impl("linalg_pinv.rcond_tensor", linalg_pinv_rcond_tensor_native);
     m.impl("det", det_native);
     m.impl("slogdet", slogdet_native);
     m.impl("logdet", logdet_native);

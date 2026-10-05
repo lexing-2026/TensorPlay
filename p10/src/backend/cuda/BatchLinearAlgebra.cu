@@ -67,10 +67,8 @@ Tensor cholesky_inverse_cuda(const Tensor& self, bool upper) {
     const DType dt = self.dtype();
     const Tensor factor = to_compute(self);
     const int64_t n = factor.size(-1);
-    const std::vector<int64_t> batch(factor.shape().begin(), factor.shape().end() - 2);
-    std::vector<int64_t> eye_shape = batch;
-    eye_shape.push_back(n);
-    eye_shape.push_back(n);
+    const IntArrayRef sizes = factor.sizes();
+    std::vector<int64_t> eye_shape(sizes.begin(), sizes.end());
     Tensor identity = ops::eye(n, n, factor.dtype(), factor.device())
                           .expand(eye_shape)
                           .contiguous();
@@ -127,19 +125,33 @@ std::tuple<Tensor, Tensor> triangular_solve_cuda(const Tensor& self, const Tenso
 
 std::tuple<Tensor, Tensor, Tensor> svd_cuda(const Tensor& self, bool some, bool compute_uv) {
     require_float(self, "svd");
-    (void)some;
-    const DType dt = self.dtype();
-    if (compute_uv) {
-        // Reduced factorization; the legacy contract returns V (A =
-        // U diag(S) V^T), so the Vh factor is transposed into the third
-        // slot, matching the CPU kernel.
-        auto [U, S, Vh] = ops::linalg_svd(to_compute(self), false, std::optional<std::string>());
-        return {from_compute(U, dt), from_compute(S, dt),
-                from_compute(Vh, dt).transpose(-2, -1).contiguous()};
+    if (self.dim() < 2) {
+        TP_THROW(RuntimeError, "linalg.svd: input should have at least 2 dimensions, but has ",
+                 self.dim(), " dimensions instead");
     }
-    Tensor S = ops::linalg_svdvals(to_compute(self), std::optional<std::string>());
-    Tensor zero = Tensor::zeros({}, dt, self.device());
-    return {zero, from_compute(S, dt), zero};
+    // The legacy contract returns V (A = U diag(S) V^H), the full factors
+    // when some=False, and zero factors of the full shapes when the vectors
+    // are not computed.  Every step is a recorded operator, the precision
+    // round trip included, so the factorization carries linalg.svd's
+    // derivative.
+    const DType dt = self.dtype();
+    const bool widen = is_low_precision(dt);
+    const Tensor A = widen ? ops::to(self, DType::Float32) : self;
+    const auto back = [dt, widen](const Tensor& t) { return widen ? ops::to(t, dt) : t; };
+    Tensor U, S, Vh;
+    if (compute_uv) {
+        std::tie(U, S, Vh) = ops::linalg_svd(A, !some, std::optional<std::string>());
+    } else {
+        S = ops::linalg_svdvals(A, std::optional<std::string>());
+        const IntArrayRef sizes = self.sizes();
+        std::vector<int64_t> shape(sizes.begin(), sizes.end());
+        shape.back() = self.size(-2);
+        U = ops::zeros(shape, A.dtype(), A.device());
+        shape[shape.size() - 2] = self.size(-1);
+        shape.back() = self.size(-1);
+        Vh = ops::zeros(shape, A.dtype(), A.device());
+    }
+    return {back(U), back(S), back(ops::mH(Vh))};
 }
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, BatchLinearAlgebra) {

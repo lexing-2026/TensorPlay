@@ -6160,7 +6160,7 @@ def svd(input, some=True, compute_uv=True, *, out=None):
             return _captured
     return _C.svd(self=input, some=some, compute_uv=compute_uv)
 
-def triangular_solve(input, A, upper=False, transpose=False, unitriangular=False, *, out=None):
+def triangular_solve(input, A, upper=True, transpose=False, unitriangular=False, *, out=None):
     if out is not None:
         if _capturing():
             _captured = _capture_call(triangular_solve, (input, A, upper, transpose, unitriangular), {'out': out})

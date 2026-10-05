@@ -463,13 +463,6 @@ std::tuple<Tensor, Tensor, Tensor> lu_factor_ex_cuda_impl(const Tensor& A,
     return {LU.contiguous(), pivots.contiguous(), info.contiguous()};
 }
 
-std::tuple<Tensor, Tensor> linalg_lu_factor_kernel_cuda(const Tensor& A, bool pivot) {
-    (void)pivot;
-    auto [LU, pivots, info] = lu_factor_ex_cuda_impl(A, false);
-    check_infos(info, "linalg.lu_factor", A.dim() == 2);
-    return {LU, pivots};
-}
-
 std::tuple<Tensor, Tensor, Tensor> linalg_lu_factor_ex_kernel_cuda(const Tensor& A,
                                                                    bool pivot,
                                                                    bool check_errors) {
@@ -537,10 +530,6 @@ std::tuple<Tensor, Tensor, Tensor> linalg_det_internal_kernel_cuda(
     return {out, LU, pivots};
 }
 
-Tensor linalg_det_kernel_cuda(const Tensor& A) {
-    return std::get<0>(linalg_det_internal_kernel_cuda(A));
-}
-
 std::tuple<Tensor, Tensor, Tensor> linalg_det_internal_out_kernel_cuda(
         const Tensor& A, Tensor& result, Tensor& LU, Tensor& pivots) {
     auto values = linalg_det_internal_kernel_cuda(A);
@@ -566,11 +555,6 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_slogdet_internal_kernel_cuda(
         host_det_slogdet<T>(LU_h, piv_h, dummy, &sign, &logabsdet);
     });
     return {sign, logabsdet, LU, pivots};
-}
-
-std::tuple<Tensor, Tensor> linalg_slogdet_kernel_cuda(const Tensor& A) {
-    auto values = linalg_slogdet_internal_kernel_cuda(A);
-    return {std::get<0>(values), std::get<1>(values)};
 }
 
 std::tuple<Tensor, Tensor, Tensor, Tensor>
@@ -694,12 +678,6 @@ linalg_solve_ex_internal_out_kernel_cuda(
     return {result, LU, pivots, info};
 }
 
-Tensor linalg_solve_kernel_cuda(const Tensor& A, const Tensor& B, bool left) {
-    auto values = linalg_solve_ex_kernel_cuda(A, B, left, false);
-    check_infos(std::get<1>(values), "linalg.solve", A.dim() == 2);
-    return std::get<0>(values);
-}
-
 // The right-hand side of an inverse is a stack of identities.  Writing it on
 // the device keeps the host out of the loop: staging it through a host buffer
 // costs a full-size upload plus a stream synchronization, and the solve that
@@ -736,12 +714,6 @@ std::tuple<Tensor, Tensor> linalg_inv_ex_kernel_cuda(const Tensor& A,
     auto [inv, info] = linalg_solve_ex_kernel_cuda(A, identity, true, false);
     if (check_errors) check_infos(info, "linalg.inv_ex", A.dim() == 2);
     return {inv, info};
-}
-
-Tensor linalg_inv_kernel_cuda(const Tensor& A) {
-    auto [inv, info] = linalg_inv_ex_kernel_cuda(A, false);
-    check_infos(info, "linalg.inv", A.dim() == 2);
-    return inv;
 }
 
 // ------------------------------------------------------------- potrf -------
@@ -801,12 +773,6 @@ std::tuple<Tensor, Tensor> linalg_cholesky_ex_kernel_cuda(const Tensor& A, bool 
     });
     if (check_errors) check_infos(info, "linalg.cholesky_ex", A.dim() == 2);
     return {L.contiguous(), info.contiguous()};
-}
-
-Tensor linalg_cholesky_kernel_cuda(const Tensor& A, bool upper) {
-    auto [L, info] = linalg_cholesky_ex_kernel_cuda(A, upper, false);
-    check_infos(info, "linalg.cholesky", A.dim() == 2);
-    return L;
 }
 
 // -------------------------------------------------------------- lu_solve ---
@@ -1167,14 +1133,6 @@ std::tuple<Tensor, Tensor> linalg_eigh_internal_kernel_cuda(
     return eigh_impl_cuda(A, UPLO == "U", compute_v);
 }
 
-std::tuple<Tensor, Tensor> linalg_eigh_kernel_cuda(const Tensor& A, const std::string& UPLO) {
-    return linalg_eigh_internal_kernel_cuda(A, UPLO, true);
-}
-
-Tensor linalg_eigvalsh_kernel_cuda(const Tensor& A, const std::string& UPLO) {
-    return std::get<0>(linalg_eigh_internal_kernel_cuda(A, UPLO, false));
-}
-
 std::tuple<Tensor, Tensor> linalg_eigh_internal_out_kernel_cuda(
         const Tensor& A, const std::string& UPLO, bool compute_v, Tensor& values,
         Tensor& vectors) {
@@ -1420,63 +1378,14 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_lstsq_kernel_cuda(
 
 // -------------------------------------------------------- lu with unpack ---
 
+// A = P L U for any m x n matrix: the packed factorization unpacked on the
+// device into its permutation and its two triangles.
 std::tuple<Tensor, Tensor, Tensor> linalg_lu_kernel_cuda(const Tensor& A, bool pivot) {
     (void)pivot;
     check_is_matrix(A, "linalg.lu");
     auto [LU, pivots, info] = lu_factor_ex_cuda_impl(A, false);
     (void)info;
-    const int64_t m = A.size(-2);
-    const int64_t n = A.size(-1);
-    const int64_t kk = std::min(m, n);
-    const auto batch = batch_shape_of(A);
-    const int64_t bs = linear_batch_size(batch);
-    Tensor P = Tensor::zeros(cat_batch(batch, {m, m}), A.dtype(), A.device());
-    Tensor L = Tensor::zeros(cat_batch(batch, {m, kk}), A.dtype(), A.device());
-    Tensor U = Tensor::zeros(cat_batch(batch, {kk, n}), A.dtype(), A.device());
-    Tensor LU_h = LU.to(Device(DeviceType::CPU), A.dtype()).contiguous();
-    Tensor piv_h = pivots.to(Device(DeviceType::CPU), DType::Int32).contiguous();
-    run_real(A.dtype(), [&](auto tag) {
-        using T = std::remove_pointer_t<decltype(tag)>;
-        const T* lu_all = LU_h.data_ptr<T>();
-        const int32_t* piv = piv_h.data_ptr<int32_t>();
-        std::vector<T> p_host(static_cast<size_t>(bs * m * m));
-        std::vector<T> l_host(static_cast<size_t>(bs * m * kk));
-        std::vector<T> u_host(static_cast<size_t>(bs * kk * n));
-        for (int64_t b = 0; b < bs; ++b) {
-            const T* lu = &lu_all[b * m * n];
-            for (int64_t col = 0; col < kk; ++col) {
-                for (int64_t row = 0; row < m; ++row)
-                    l_host[(b * m + row) * kk + col] =
-                        row < col ? T(0)
-                                  : (row == col ? T(1) : lu[row * n + col]);
-            }
-            for (int64_t col = 0; col < n; ++col)
-                for (int64_t row = 0; row < kk; ++row)
-                    u_host[(b * kk + row) * n + col] =
-                        row <= col ? lu[row * n + col] : T(0);
-            std::vector<int64_t> perm(static_cast<size_t>(m));
-            for (int64_t i = 0; i < m; ++i) perm[i] = i;
-            for (int64_t i = 0; i < kk; ++i) {
-                const int64_t p_ = piv[b * kk + i] - 1;
-                if (p_ != i) std::swap(perm[i], perm[p_]);
-            }
-            for (int64_t j = 0; j < m; ++j)
-                p_host[(b * m + perm[j]) * m + j] = T(1);
-        }
-        Tensor p_stage = Tensor::tensor(p_host);
-        Tensor l_stage = Tensor::tensor(l_host);
-        Tensor u_stage = Tensor::tensor(u_host);
-        cudaMemcpyAsync(P.data_ptr(), p_stage.data_ptr(),
-                        sizeof(T) * bs * m * m, cudaMemcpyHostToDevice,
-                        getCurrentCUDAStream().stream());
-        cudaMemcpyAsync(L.data_ptr(), l_stage.data_ptr(),
-                        sizeof(T) * bs * m * kk, cudaMemcpyHostToDevice,
-                        getCurrentCUDAStream().stream());
-        cudaMemcpyAsync(U.data_ptr(), u_stage.data_ptr(),
-                        sizeof(T) * bs * kk * n, cudaMemcpyHostToDevice,
-                        getCurrentCUDAStream().stream());
-    });
-    return {P, L, U};
+    return ops::lu_unpack(LU, pivots, true, true);
 }
 
 // ------------------------------------------------------- eig (no MAGMA) ----
@@ -1608,34 +1517,24 @@ Tensor linalg_diagonal_kernel_cuda(const Tensor& A, int64_t offset, int64_t dim1
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, LinalgKernels) {
     m.impl("_linalg_check_errors", linalg_check_errors_kernel);
-    m.impl("linalg_cholesky", linalg_cholesky_kernel_cuda);
     m.impl("linalg_cholesky_ex", linalg_cholesky_ex_kernel_cuda);
-    m.impl("linalg_inv", linalg_inv_kernel_cuda);
     m.impl("linalg_inv_ex", linalg_inv_ex_kernel_cuda);
     m.impl("_linalg_det", linalg_det_internal_kernel_cuda);
     m.impl("_linalg_det.result", linalg_det_internal_out_kernel_cuda);
-    m.impl("linalg_det", linalg_det_kernel_cuda);
     m.impl("_linalg_slogdet", linalg_slogdet_internal_kernel_cuda);
     m.impl("_linalg_slogdet.sign", linalg_slogdet_internal_out_kernel_cuda);
-    m.impl("linalg_slogdet", linalg_slogdet_kernel_cuda);
-    m.impl("linalg_solve", linalg_solve_kernel_cuda);
     m.impl("_linalg_solve_ex", linalg_solve_ex_internal_kernel_cuda);
     m.impl("_linalg_solve_ex.result", linalg_solve_ex_internal_out_kernel_cuda);
-    m.impl("linalg_solve_ex", linalg_solve_ex_kernel_cuda);
-    m.impl("linalg_lu_factor", linalg_lu_factor_kernel_cuda);
     m.impl("linalg_lu_factor_ex", linalg_lu_factor_ex_kernel_cuda);
     m.impl("linalg_lu", linalg_lu_kernel_cuda);
     m.impl("linalg_lu_solve", linalg_lu_solve_kernel_cuda);
     m.impl("linalg_solve_triangular", linalg_solve_triangular_kernel_cuda);
     m.impl("_linalg_eigh", linalg_eigh_internal_kernel_cuda);
     m.impl("_linalg_eigh.eigenvalues", linalg_eigh_internal_out_kernel_cuda);
-    m.impl("linalg_eigh", linalg_eigh_kernel_cuda);
     m.impl("linalg_eigh.eigvals", linalg_eigh_eigvals_out_kernel_cuda);
-    m.impl("linalg_eigvalsh", linalg_eigvalsh_kernel_cuda);
     m.impl("linalg_eigvalsh.out", linalg_eigvalsh_out_kernel_cuda);
     m.impl("linalg_eig", linalg_eig_kernel_cuda);
     m.impl("linalg_eig.out", linalg_eig_out_kernel_cuda);
-    m.impl("linalg_eigvals", linalg_eigvals_kernel_cuda);
     m.impl("_linalg_eigvals", linalg_eigvals_kernel_cuda);
     m.impl("linalg_eigvals.out", linalg_eigvals_out_kernel_cuda);
     m.impl("linalg_polar", linalg_polar_kernel_cuda);

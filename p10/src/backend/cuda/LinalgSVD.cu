@@ -848,18 +848,6 @@ std::tuple<Tensor, Tensor, Tensor> linalg_svd_internal_kernel_cuda(
     return svd_impl_cuda(input, full_matrices, compute_uv, driver);
 }
 
-std::tuple<Tensor, Tensor, Tensor> linalg_svd_kernel_cuda(
-        const Tensor& input, bool full_matrices,
-        const std::optional<std::string>& driver) {
-    return linalg_svd_internal_kernel_cuda(input, full_matrices, true, driver);
-}
-
-Tensor linalg_svdvals_kernel_cuda(const Tensor& input,
-                                  const std::optional<std::string>& driver) {
-    return std::get<1>(linalg_svd_internal_kernel_cuda(input, false, false,
-                                                       driver));
-}
-
 std::tuple<Tensor, Tensor, Tensor> linalg_svd_internal_out_kernel_cuda(
         const Tensor& input, bool full_matrices, bool compute_uv,
         const std::optional<std::string>& driver, Tensor& U, Tensor& S, Tensor& Vh) {
@@ -889,9 +877,7 @@ Tensor& linalg_svdvals_out_kernel_cuda(const Tensor& input,
 TENSORPLAY_LIBRARY_IMPL(CUDA, LinalgSVD) {
     m.impl("_linalg_svd", linalg_svd_internal_kernel_cuda);
     m.impl("_linalg_svd.U", linalg_svd_internal_out_kernel_cuda);
-    m.impl("linalg_svd", linalg_svd_kernel_cuda);
     m.impl("linalg_svd.U", linalg_svd_out_kernel_cuda);
-    m.impl("linalg_svdvals", linalg_svdvals_kernel_cuda);
     m.impl("linalg_svdvals.out", linalg_svdvals_out_kernel_cuda);
 }
 

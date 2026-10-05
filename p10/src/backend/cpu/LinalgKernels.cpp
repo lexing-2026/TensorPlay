@@ -601,7 +601,7 @@ void apply_lu_factor(const Tensor& input, const Tensor& pivots, const Tensor& in
 std::tuple<Tensor, Tensor, Tensor> lu_factor_ex_impl(
         const Tensor& A, bool /*pivot*/, bool check_errors, const char* api_name) {
     require_lapack(api_name);
-    square_check_inputs(A, "linalg.lu_factor_ex");
+    check_is_matrix(A, api_name);
     const auto batch = batch_shape_of(A);
     const int64_t k = std::min(A.size(-2), A.size(-1));
     Tensor LU = clone_batched_column_major(A);
@@ -653,10 +653,6 @@ std::tuple<Tensor, Tensor, Tensor> linalg_det_internal_kernel(const Tensor& A) {
         }
     });
     return {result, LU_tensor, pivots_tensor};
-}
-
-Tensor linalg_det_kernel(const Tensor& A) {
-    return std::get<0>(linalg_det_internal_kernel(A));
 }
 
 std::tuple<Tensor, Tensor, Tensor> linalg_det_internal_out_kernel(
@@ -718,11 +714,6 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_slogdet_internal_kernel(
         }
     });
     return {sign, logabsdet, LU_tensor, pivots_tensor};
-}
-
-std::tuple<Tensor, Tensor> linalg_slogdet_kernel(const Tensor& A) {
-    auto values = linalg_slogdet_internal_kernel(A);
-    return {std::get<0>(values), std::get<1>(values)};
 }
 
 std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_slogdet_internal_out_kernel(
@@ -846,12 +837,6 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_solve_ex_internal_out_kernel(
     return {result, LU, pivots, info};
 }
 
-Tensor linalg_solve_kernel(const Tensor& A, const Tensor& B, bool left) {
-    auto [result, info] = linalg_solve_ex_kernel(A, B, left, false);
-    linalg_check_errors(info, "linalg.solve", A.dim() == 2);
-    return result;
-}
-
 // linalg_solve_ex_out with result pre-filled with the identity).
 std::tuple<Tensor, Tensor> linalg_inv_ex_kernel(const Tensor& A, bool check_errors) {
     // batch_shape_of here collapsed 2-D inputs to a 0-D scalar and made
@@ -872,12 +857,6 @@ std::tuple<Tensor, Tensor> linalg_inv_ex_kernel(const Tensor& A, bool check_erro
     auto [inv, info] = linalg_solve_ex_kernel(A, identity, /*left=*/true, false);
     if (check_errors) linalg_check_errors(info, "linalg.inv_ex", A.dim() == 2);
     return {inv, info};
-}
-
-Tensor linalg_inv_kernel(const Tensor& A) {
-    auto [result, info] = linalg_inv_ex_kernel(A, false);
-    linalg_check_errors(info, "linalg.inv", A.dim() == 2);
-    return result;
 }
 
 // ------------------------------------------------------------------ potrf --
@@ -922,12 +901,6 @@ std::tuple<Tensor, Tensor> linalg_cholesky_ex_kernel(const Tensor& A, bool upper
     });
     if (check_errors) linalg_check_errors(info, api, A.dim() == 2);
     return {L.contiguous(), info};
-}
-
-Tensor linalg_cholesky_kernel(const Tensor& A, bool upper) {
-    auto [L, info] = linalg_cholesky_ex_kernel(A, upper, false);
-    linalg_check_errors(info, "linalg.cholesky", A.dim() == 2);
-    return L;
 }
 
 // --------------------------------------------------------- triangular solve
@@ -1176,14 +1149,6 @@ std::tuple<Tensor, Tensor> linalg_eigh_internal_kernel(const Tensor& A,
 }
 
 // Public entries: schema passes UPLO as a string.
-std::tuple<Tensor, Tensor> linalg_eigh_kernel(const Tensor& A, const std::string& UPLO) {
-    return linalg_eigh_internal_kernel(A, UPLO, true);
-}
-
-Tensor linalg_eigvalsh_kernel(const Tensor& A, const std::string& UPLO) {
-    return std::get<0>(linalg_eigh_internal_kernel(A, UPLO, false));
-}
-
 std::tuple<Tensor, Tensor> linalg_eigh_internal_out_kernel(
         const Tensor& A, const std::string& UPLO, bool compute_v, Tensor& values,
         Tensor& vectors) {
@@ -1550,15 +1515,6 @@ std::tuple<Tensor, Tensor, Tensor> linalg_svd_internal_kernel(
         const std::optional<std::string>& driver) {
     check_cpu_svd_driver(driver);
     return svd_impl(A, full_matrices, compute_uv);
-}
-
-std::tuple<Tensor, Tensor, Tensor> linalg_svd_kernel(const Tensor& A, bool full_matrices,
-                                                     const std::optional<std::string>& driver) {
-    return linalg_svd_internal_kernel(A, full_matrices, true, driver);
-}
-
-Tensor linalg_svdvals_kernel(const Tensor& A, const std::optional<std::string>& driver) {
-    return std::get<1>(linalg_svd_internal_kernel(A, false, false, driver));
 }
 
 std::tuple<Tensor, Tensor, Tensor> linalg_svd_internal_out_kernel(
@@ -2109,56 +2065,18 @@ Tensor ldl_solve_impl(const Tensor& LD, const Tensor& pivots, const Tensor& B,
 
 // ------------------------------------------------------------ lu with unpack
 
+// A = P L U for any m x n matrix: the packed factorization unpacked into its
+// permutation and its two triangles.
 std::tuple<Tensor, Tensor, Tensor> linalg_lu_kernel(const Tensor& A, bool pivot) {
     require_lapack("linalg.lu");
     if (!pivot) {
         TP_THROW(RuntimeError, "linalg.lu: LU without pivoting is not implemented");
     }
-    square_check_inputs(A, "linalg.lu");
     Tensor LU_tensor;
     Tensor pivots_tensor;
     std::tie(LU_tensor, pivots_tensor, std::ignore) =
-        lu_factor_ex_impl(A, pivot, false, "linalg.lu_factor_ex");
-    const int64_t m = A.size(-2);
-    const int64_t n = A.size(-1);
-    const int64_t kk = std::min(m, n);
-    const auto batch = batch_shape_of(A);
-    const int64_t bs = linear_batch_size(batch);
-    Tensor P = Tensor::zeros(cat_batch(batch, std::vector<int64_t>{m, m}), A.dtype(), A.device());
-    Tensor L = Tensor::zeros(cat_batch(batch, std::vector<int64_t>{m, kk}), A.dtype(), A.device());
-    Tensor U = Tensor::zeros(cat_batch(batch, std::vector<int64_t>{kk, n}), A.dtype(), A.device());
-    run_linalg(A.dtype(), [&](auto tag) {
-        using T = std::remove_pointer_t<decltype(tag)>;
-        const auto* lu_all = LU_tensor.data_ptr<T>();  // column-major (*, m, n), lda = m
-        const auto* piv = pivots_tensor.data_ptr<int32_t>();
-        auto* p_out = P.data_ptr<T>();
-        auto* l_out = L.data_ptr<T>();
-        auto* u_out = U.data_ptr<T>();
-        for (int64_t b = 0; b < bs; ++b) {
-            const T* lu = &lu_all[b * m * n];
-            // Permutation from the ipiv swap sequence applied to identity rows.
-            std::vector<int64_t> perm(static_cast<size_t>(m));
-            for (int64_t i = 0; i < m; ++i) perm[i] = i;
-            for (int64_t i = 0; i < kk; ++i) {
-                const int64_t p = piv[b * kk + i] - 1;
-                if (p != i) std::swap(perm[i], perm[p]);
-            }
-            T* pm = &p_out[b * m * m];
-            std::memset(pm, 0, sizeof(T) * static_cast<size_t>(m) * static_cast<size_t>(m));
-            for (int64_t j = 0; j < m; ++j) pm[j * m + perm[j]] = T(1);
-            T* lm = &l_out[b * m * kk];
-            for (int64_t col = 0; col < kk; ++col)
-                for (int64_t row = 0; row < m; ++row)
-                    lm[col * m + row] =
-                        row < col ? T(0) : (row == col ? T(1) : lu[col * m + row]);
-            T* um = &u_out[b * kk * n];
-            for (int64_t col = 0; col < n; ++col)
-                for (int64_t row = 0; row < kk; ++row)
-                    um[col * kk + row] =
-                        row <= col && col < n ? lu[col * m + row] : T(0);
-        }
-    });
-    return {P, L, U};
+        lu_factor_ex_impl(A, pivot, false, "linalg.lu");
+    return ops::lu_unpack(LU_tensor, pivots_tensor, true, true);
 }
 
 // --------------------------------------------------------------- diagonal --
@@ -2242,13 +2160,6 @@ Tensor linalg_diagonal_kernel(const Tensor& A, int64_t offset, int64_t dim1, int
 
 // ------------------------------------------------------- public composites --
 
-std::tuple<Tensor, Tensor> linalg_lu_factor_kernel(const Tensor& A, bool pivot) {
-    auto [LU, pivots, info] =
-        lu_factor_ex_impl(A, pivot, false, "linalg.lu_factor");
-    (void)info;
-    return {LU, pivots};
-}
-
 std::tuple<Tensor, Tensor, Tensor> linalg_lu_factor_ex_kernel(const Tensor& A,
                                                               bool pivot,
                                                               bool check_errors) {
@@ -2271,41 +2182,29 @@ std::tuple<Tensor, Tensor, Tensor> linalg_ldl_factor_ex_kernel(const Tensor& A,
 
 TENSORPLAY_LIBRARY_IMPL(CPU, LinalgKernels) {
     m.impl("_linalg_check_errors", linalg_check_errors_kernel);
-    m.impl("linalg_cholesky", linalg_cholesky_kernel);
     m.impl("linalg_cholesky_ex", linalg_cholesky_ex_kernel);
-    m.impl("linalg_inv", linalg_inv_kernel);
     m.impl("linalg_inv_ex", linalg_inv_ex_kernel);
     m.impl("_linalg_det", linalg_det_internal_kernel);
     m.impl("_linalg_det.result", linalg_det_internal_out_kernel);
-    m.impl("linalg_det", linalg_det_kernel);
     m.impl("_linalg_slogdet", linalg_slogdet_internal_kernel);
     m.impl("_linalg_slogdet.sign", linalg_slogdet_internal_out_kernel);
-    m.impl("linalg_slogdet", linalg_slogdet_kernel);
-    m.impl("linalg_solve", linalg_solve_kernel);
     m.impl("_linalg_solve_ex", linalg_solve_ex_internal_kernel);
     m.impl("_linalg_solve_ex.result", linalg_solve_ex_internal_out_kernel);
-    m.impl("linalg_solve_ex", linalg_solve_ex_kernel);
-    m.impl("linalg_lu_factor", linalg_lu_factor_kernel);
     m.impl("linalg_lu_factor_ex", linalg_lu_factor_ex_kernel);
     m.impl("linalg_lu", linalg_lu_kernel);
     m.impl("linalg_lu_solve", linalg_lu_solve_kernel);
     m.impl("linalg_solve_triangular", linalg_solve_triangular_kernel);
     m.impl("_linalg_eigh", linalg_eigh_internal_kernel);
     m.impl("_linalg_eigh.eigenvalues", linalg_eigh_internal_out_kernel);
-    m.impl("linalg_eigh", linalg_eigh_kernel);
     m.impl("linalg_eigh.eigvals", linalg_eigh_eigvals_out_kernel);
-    m.impl("linalg_eigvalsh", linalg_eigvalsh_kernel);
     m.impl("linalg_eigvalsh.out", linalg_eigvalsh_out_kernel);
     m.impl("linalg_eig", linalg_eig_kernel);
     m.impl("linalg_eig.out", linalg_eig_out_kernel);
-    m.impl("linalg_eigvals", linalg_eigvals_kernel);
     m.impl("_linalg_eigvals", linalg_eigvals_kernel);
     m.impl("linalg_eigvals.out", linalg_eigvals_out_kernel);
     m.impl("_linalg_svd", linalg_svd_internal_kernel);
     m.impl("_linalg_svd.U", linalg_svd_internal_out_kernel);
-    m.impl("linalg_svd", linalg_svd_kernel);
     m.impl("linalg_svd.U", linalg_svd_out_kernel);
-    m.impl("linalg_svdvals", linalg_svdvals_kernel);
     m.impl("linalg_svdvals.out", linalg_svdvals_out_kernel);
     m.impl("linalg_lstsq", linalg_lstsq_kernel);
     m.impl("linalg_polar", linalg_polar_kernel);

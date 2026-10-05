@@ -3113,8 +3113,7 @@
 - func: linalg_cholesky(Tensor A, *, bool upper=False) -> Tensor
   variants: function
   dispatch:
-    CPU: linalg_cholesky_kernel
-    CUDA: linalg_cholesky_kernel_cuda
+    Composite: linalg_cholesky_native
 
 - func: linalg_cholesky_ex(Tensor A, *, bool upper=False, bool check_errors=False) -> (Tensor L, Tensor info)
   variants: function
@@ -3125,8 +3124,7 @@
 - func: linalg_inv(Tensor A) -> Tensor
   variants: function
   dispatch:
-    CPU: linalg_inv_kernel
-    CUDA: linalg_inv_kernel_cuda
+    Composite: linalg_inv_native
 
 - func: linalg_inv_ex(Tensor A, *, bool check_errors=False) -> (Tensor result, Tensor info)
   variants: function
@@ -3137,32 +3135,27 @@
 - func: linalg_det(Tensor A) -> Tensor
   variants: function
   dispatch:
-    CPU: linalg_det_kernel
-    CUDA: linalg_det_kernel_cuda
+    Composite: linalg_det_native
 
 - func: linalg_slogdet(Tensor A) -> (Tensor sign, Tensor logabsdet)
   variants: function
   dispatch:
-    CPU: linalg_slogdet_kernel
-    CUDA: linalg_slogdet_kernel_cuda
+    Composite: linalg_slogdet_native
 
 - func: linalg_solve(Tensor A, Tensor B, *, bool left=True) -> Tensor
   variants: function
   dispatch:
-    CPU: linalg_solve_kernel
-    CUDA: linalg_solve_kernel_cuda
+    Composite: linalg_solve_native
 
 - func: linalg_solve_ex(Tensor A, Tensor B, *, bool left=True, bool check_errors=False) -> (Tensor result, Tensor info)
   variants: function
   dispatch:
-    CPU: linalg_solve_ex_kernel
-    CUDA: linalg_solve_ex_kernel_cuda
+    Composite: linalg_solve_ex_native
 
 - func: linalg_lu_factor(Tensor A, *, bool pivot=True) -> (Tensor LU, Tensor pivots)
   variants: function
   dispatch:
-    CPU: linalg_lu_factor_kernel
-    CUDA: linalg_lu_factor_kernel_cuda
+    Composite: linalg_lu_factor_native
 
 - func: linalg_lu_factor_ex(Tensor A, *, bool pivot=True, bool check_errors=False) -> (Tensor LU, Tensor pivots, Tensor info)
   variants: function
@@ -3191,14 +3184,12 @@
 - func: linalg_eigh(Tensor A, str UPLO="L") -> (Tensor eigenvalues, Tensor eigenvectors)
   variants: function
   dispatch:
-    CPU: linalg_eigh_kernel
-    CUDA: linalg_eigh_kernel_cuda
+    Composite: linalg_eigh_native
 
 - func: linalg_eigvalsh(Tensor A, str UPLO="L") -> Tensor
   variants: function
   dispatch:
-    CPU: linalg_eigvalsh_kernel
-    CUDA: linalg_eigvalsh_kernel_cuda
+    Composite: linalg_eigvalsh_native
 
 - func: linalg_eig(Tensor A) -> (Tensor eigenvalues, Tensor eigenvectors)
   variants: function
@@ -3209,20 +3200,17 @@
 - func: linalg_eigvals(Tensor A) -> Tensor
   variants: function
   dispatch:
-    CPU: linalg_eigvals_kernel
-    CUDA: linalg_eigvals_kernel_cuda
+    Composite: linalg_eigvals_native
 
 - func: linalg_svd(Tensor A, bool full_matrices=True, *, str? driver=None) -> (Tensor U, Tensor S, Tensor Vh)
   variants: function
   dispatch:
-    CPU: linalg_svd_kernel
-    CUDA: linalg_svd_kernel_cuda
+    Composite: linalg_svd_native
 
 - func: linalg_svdvals(Tensor A, *, str? driver=None) -> Tensor
   variants: function
   dispatch:
-    CPU: linalg_svdvals_kernel
-    CUDA: linalg_svdvals_kernel_cuda
+    Composite: linalg_svdvals_native
 
 - func: linalg_lstsq(Tensor A, Tensor B, float? rcond=None, *, str? driver=None) -> (Tensor solution, Tensor residuals, Tensor rank, Tensor coefficients)
   variants: function
@@ -4681,7 +4669,7 @@
     CPU: svd_cpu
     CUDA: svd_cuda
 
-- func: triangular_solve(Tensor self, Tensor A, bool upper=False, bool transpose=False, bool unitriangular=False) -> (Tensor solution, Tensor cloned_coefficient)
+- func: triangular_solve(Tensor self, Tensor A, bool upper=True, bool transpose=False, bool unitriangular=False) -> (Tensor solution, Tensor cloned_coefficient)
   variants: function, method
   dispatch:
     CPU: triangular_solve_cpu

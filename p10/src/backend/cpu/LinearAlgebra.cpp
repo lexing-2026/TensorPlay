@@ -997,22 +997,6 @@ Tensor& linalg_pinv_native_cpu_atol_rtol_tensor_out(
                          hermitian), out);
 }
 
-Tensor linalg_pinv_native_cpu_float(
-    const Tensor& input, std::optional<double> atol,
-    std::optional<double> rtol, bool hermitian) {
-    std::optional<Tensor> atol_tensor;
-    std::optional<Tensor> rtol_tensor;
-    if (atol.has_value()) {
-        atol_tensor = Tensor::full({}, Scalar(*atol), DType::Float64,
-                                   input.device());
-    }
-    if (rtol.has_value()) {
-        rtol_tensor = Tensor::full({}, Scalar(*rtol), DType::Float64,
-                                   input.device());
-    }
-    return linalg_pinv_native_cpu(input, atol_tensor, rtol_tensor, hermitian);
-}
-
 Tensor& linalg_pinv_native_cpu_float_out(
     const Tensor& input, std::optional<double> atol,
     std::optional<double> rtol, bool hermitian, Tensor& out) {
@@ -1239,11 +1223,8 @@ TENSORPLAY_LIBRARY_IMPL(CPU, NativeLinearAlgebra) {
     m.impl("linalg_pinv.atol_rtol_tensor", linalg_pinv_native_cpu);
     m.impl("linalg_pinv.atol_rtol_tensor_out",
            linalg_pinv_native_cpu_atol_rtol_tensor_out);
-    m.impl("linalg_pinv.atol_rtol_float", linalg_pinv_native_cpu_float);
     m.impl("linalg_pinv.atol_rtol_float_out",
            linalg_pinv_native_cpu_float_out);
-    m.impl("linalg_pinv", linalg_pinv_native_cpu_rcond);
-    m.impl("linalg_pinv.rcond_tensor", linalg_pinv_native_cpu_rcond_tensor);
     m.impl("linalg_pinv.out", linalg_pinv_native_cpu_rcond_out);
     m.impl("linalg_pinv.out_rcond_tensor",
            linalg_pinv_native_cpu_rcond_tensor_out);
