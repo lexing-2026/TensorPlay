@@ -12,6 +12,7 @@
 #include "TypePromotion.h"
 #include "CompositeCommon.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
+#include "Autograd.h"
 #include "cpu/Lapack.h"
 
 #include <algorithm>
@@ -115,17 +116,17 @@ Tensor norm_scalar_opt_dtype_native(const Tensor& self, const std::optional<Scal
                                     DType dtype) {
     if (p.has_value()) {
         Tensor r = ops::norm(self, p->toDouble());
-        return r.to(dtype);
+        return tpx::to(r, dtype);
     }
     Tensor r = ops::norm(self, 2.0);
-    return r.to(dtype);
+    return tpx::to(r, dtype);
 }
 
 Tensor norm_scalar_opt_dim_dtype_native(const Tensor& self, const std::optional<Scalar>& p,
                                         const std::vector<int64_t>& dim, bool keepdim,
                                         DType dtype) {
     Tensor r = ops::norm(self, dim, p.has_value() ? p->toDouble() : 2.0, keepdim);
-    return r.to(dtype);
+    return tpx::to(r, dtype);
 }
 
 Tensor& norm_out_native(const Tensor& self, const std::optional<Scalar>& p,
@@ -152,7 +153,7 @@ Tensor prod_dim_int_native(const Tensor& self, int64_t dim, bool keepdim,
     // Forward to the registered int-list reduction; calling the int-dim
     // overload here would dispatch back to this very kernel.
     Tensor r = ops::prod(self, std::vector<int64_t>{dim}, keepdim);
-    if (dtype.has_value() && r.dtype() != *dtype) r = r.to(*dtype);
+    if (dtype.has_value() && r.dtype() != *dtype) r = tpx::to(r, *dtype);
     return r;
 }
 
@@ -667,7 +668,7 @@ std::tuple<Tensor, Tensor> geqrf_composite(const Tensor& self) {
 
 // ---- matmul dtype overloads --------------------------------------------------
 Tensor mm_dtype_native(const Tensor& self, const Tensor& mat2, DType out_dtype) {
-    return ops::mm(self, mat2).to(out_dtype);
+    return tpx::to(ops::mm(self, mat2), out_dtype);
 }
 
 Tensor& mm_dtype_out_native(const Tensor& self, const Tensor& mat2, DType out_dtype,
@@ -677,7 +678,7 @@ Tensor& mm_dtype_out_native(const Tensor& self, const Tensor& mat2, DType out_dt
 
 Tensor addmm_dtype_native(const Tensor& self, const Tensor& mat1, const Tensor& mat2,
                           DType out_dtype, const Scalar& beta, const Scalar& alpha) {
-    return ops::addmm(self, mat1, mat2, beta, alpha).to(out_dtype);
+    return tpx::to(ops::addmm(self, mat1, mat2, beta, alpha), out_dtype);
 }
 
 Tensor& addmm_dtype_out_native(const Tensor& self, const Tensor& mat1, const Tensor& mat2,
@@ -689,7 +690,7 @@ Tensor& addmm_dtype_out_native(const Tensor& self, const Tensor& mat1, const Ten
 }
 
 Tensor bmm_dtype_native(const Tensor& self, const Tensor& mat2, DType out_dtype) {
-    return ops::bmm(self, mat2).to(out_dtype);
+    return tpx::to(ops::bmm(self, mat2), out_dtype);
 }
 
 Tensor& bmm_dtype_out_native(const Tensor& self, const Tensor& mat2, DType out_dtype,
@@ -699,7 +700,7 @@ Tensor& bmm_dtype_out_native(const Tensor& self, const Tensor& mat2, DType out_d
 
 Tensor baddbmm_dtype_native(const Tensor& self, const Tensor& batch1, const Tensor& batch2,
                             DType out_dtype, const Scalar& beta, const Scalar& alpha) {
-    return ops::baddbmm(self, batch1, batch2, beta, alpha).to(out_dtype);
+    return tpx::to(ops::baddbmm(self, batch1, batch2, beta, alpha), out_dtype);
 }
 
 Tensor& baddbmm_dtype_out_native(const Tensor& self, const Tensor& batch1, const Tensor& batch2,

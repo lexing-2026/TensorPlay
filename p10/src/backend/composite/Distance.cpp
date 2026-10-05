@@ -6,6 +6,7 @@
 #include "Exception.h"
 #include "TypePromotion.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
+#include "Autograd.h"
 
 #include <cstdint>
 #include <limits>
@@ -26,8 +27,10 @@ Tensor cosine_similarity_native(const Tensor& x1, const Tensor& x2,
     if (!(eps >= 0)) {
         TP_THROW(RuntimeError, "eps must be non-negative, got: ", eps);
     }
-    Tensor a = x1.dtype() == common ? x1 : x1.to(common);
-    Tensor b = x2.dtype() == common ? x2 : x2.to(common);
+    // The conversions record themselves, so a gradient reaches each operand
+    // in its own type.
+    Tensor a = tpx::to(x1, common);
+    Tensor b = tpx::to(x2, common);
     const Tensor n1 = ops::clamp_min(ops::norm(a, {dim}, 2.0, true), Scalar(eps));
     const Tensor n2 = ops::clamp_min(ops::norm(b, {dim}, 2.0, true), Scalar(eps));
     return ops::sum(ops::mul(ops::div(a, n1), ops::div(b, n2)), {dim}, false);
@@ -53,8 +56,10 @@ Tensor cdist_native(const Tensor& x1, const Tensor& x2, double p,
                  "cdist(): expected floating-point inputs, got ",
                  toString(common));
     }
-    Tensor a = x1.dtype() == common ? x1 : x1.to(common);
-    Tensor b = x2.dtype() == common ? x2 : x2.to(common);
+    // The conversions record themselves, so a gradient reaches each operand
+    // in its own type.
+    Tensor a = tpx::to(x1, common);
+    Tensor b = tpx::to(x2, common);
     const bool batched = a.dim() == 3;
     if (!batched) {
         a = ops::unsqueeze(a, 0);

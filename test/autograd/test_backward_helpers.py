@@ -180,6 +180,23 @@ class BackwardHelperOps(unittest.TestCase):
             # Pairs (0,1): 5, (0,2): 4, (1,2): 3; each row gathers unit vectors away from the others.
             self._check(grad.cpu(), tp.tensor([[-0.6, -1.8], [1.6, 0.8], [-1.0, 1.0]], dtype=tp.float64), tol=1e-12)
 
+    def test_results_asked_for_in_another_type_still_differentiate(self):
+        # A reduction or product answering in a requested type, and a
+        # similarity of operands of two types, pass their gradients back to
+        # each operand in its own type.
+        ops = tp.ops.tp
+        x = tp.tensor([[1.0, 2.0, 2.0], [3.0, 0.0, 4.0]], requires_grad=True)
+        (grad,) = tp.autograd.grad(ops.norm.ScalarOpt_dim_dtype(x, 2, [1], False, dtype=tp.float64).sum(), [x])
+        self.assertEqual(grad.dtype, tp.float32)
+        self._check(grad, tp.tensor([[1 / 3, 2 / 3, 2 / 3], [0.6, 0.0, 0.8]]))
+        (grad,) = tp.autograd.grad(tp.prod(x[:, :2] + 1, 1, dtype=tp.float64).sum(), [x])
+        self._check(grad, tp.tensor([[3.0, 2.0, 0.0], [1.0, 4.0, 0.0]]))
+        y = tp.tensor([[2.0, 0.0, 0.0], [0.0, 0.0, 5.0]], dtype=tp.float64, requires_grad=True)
+        gx, gy = tp.autograd.grad(tp.nn.functional.cosine_similarity(x, y).sum(), [x, y])
+        self.assertEqual((gx.dtype, gy.dtype), (tp.float32, tp.float64))
+        # Row 1: x = (3, 0, 4), y along the third axis: d cos/dx = (y/|y| - cos x/|x|)/|x|.
+        self._check(gx[1], tp.tensor([-0.096, 0.0, 0.072]), tol=1e-6)
+
 
 if __name__ == "__main__":
     unittest.main()
