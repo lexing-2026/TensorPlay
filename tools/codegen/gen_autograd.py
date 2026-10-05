@@ -629,6 +629,30 @@ MANUAL_DERIVATIVES: dict[str, dict] = {
     "rnn_relu": {"saved": ["input", "hx", "params", "has_biases", "num_layers",
                            "dropout_p", "training", "bidirectional",
                            "batch_first"]},
+    # Factorizations with several differentiable outputs (LinalgBackward.h):
+    # the node receives one gradient per output.  `saved_outputs` are handed
+    # to the node after the saved inputs, in the order listed.
+    "_linalg_svd": {"saved": ["full_matrices", "compute_uv"],
+                    "saved_outputs": ["U", "S", "Vh"],
+                    "node": "LinalgSvdBackward"},
+    "_linalg_eigh": {"saved": ["compute_v"],
+                     "saved_outputs": ["eigenvalues", "eigenvectors"],
+                     "node": "LinalgEighBackward"},
+    "linalg_eig": {"saved": ["A"],
+                   "saved_outputs": ["eigenvalues", "eigenvectors"]},
+    "linalg_qr": {"saved": ["mode"], "saved_outputs": ["Q", "R"]},
+    "linalg_lu": {"saved": ["pivot"], "saved_outputs": ["P", "L", "U"],
+                  "output_differentiability": [False, True, True]},
+    "lu_unpack": {"saved": ["LU_data"],
+                  "output_differentiability": [False, True, True]},
+    "_linalg_slogdet": {"saved": ["A"], "saved_outputs": ["sign"],
+                        "output_differentiability": [True, True, False, False],
+                        "node": "LinalgSlogdetBackward"},
+    "linalg_lstsq": {"saved": ["A", "B"], "saved_outputs": ["solution"],
+                     "output_differentiability": [True, True, False, False]},
+    "triangular_solve": {"saved": ["self", "A", "upper", "transpose",
+                                   "unitriangular"],
+                         "saved_outputs": ["solution"]},
 }
 
 # Ops whose backward node is provided hand-written elsewhere; skip emitting a
@@ -822,15 +846,31 @@ def load_derivatives(path: str, native_by_opname: dict[str, NativeFunction]) \
         native = sorted(cand, key=lambda n: len(n.overload_name))[0]
         saved = [a for a in native.args if a.name in spec["saved"]]
         members = [(a.name, node_member_type(a.type)) for a in saved]
+        # Outputs the node reads are handed to it after the forward ran, in
+        # the order listed.
+        saved_outputs = list(spec.get("saved_outputs", ()))
+        if saved_outputs:
+            from .api_types import tuple_element_cpp_types, tuple_element_names
+            names = tuple_element_names(native)
+            types = tuple_element_cpp_types(native)
+            for name in saved_outputs:
+                if name not in names:
+                    raise ValueError(
+                        f"manual derivative for '{base}' saves the unknown "
+                        f"output '{name}'")
+                members.append(
+                    (name, saved_output_member_type(types[names.index(name)])))
         prev = out.get(native.func_name)
         out[native.func_name] = OpDerivatives(
             func=native, node_name=spec.get("node", autograd_node_name(base)),
             formulas={}, grad_slots=native.tensor_args,
             members=members,
-            used_input_names=set(spec["saved"]), used_output_names=set(),
+            used_input_names=set(spec["saved"]),
+            used_output_names=set(saved_outputs),
             fw_formulas=prev.fw_formulas if prev else {},
             differentiable_outputs=(
-                prev.differentiable_outputs if prev else None),
+                spec.get("output_differentiability")
+                or (prev.differentiable_outputs if prev else None)),
             fw_required_tangent=prev.fw_required_tangent if prev else [],
             fw_required_primal=prev.fw_required_primal if prev else [],
         )

@@ -229,7 +229,8 @@ def _node_ctor_args(dv: OpDerivatives, f: NativeFunction,
     arg_names = {a.name for a in f.args}
     # Manual nodes (empty formulas, hand-written structs) are not extended.
     args: list[str] = []
-    out_index = {n: i for i, n in enumerate(tuple_element_names(f))}
+    out_index = ({n: i for i, n in enumerate(tuple_element_names(f))}
+                 if f.cpp_return_kind == 'tuple' else {})
     for m, _t in dv.members:
         if m in dv.used_input_names:
             if (m == 'self' and f.func_name.endswith('_')
@@ -239,12 +240,14 @@ def _node_ctor_args(dv: OpDerivatives, f: NativeFunction,
                 args.append('__tp_original_self.value()')
             else:
                 args.append(m)
-        elif m == 'result':
+        elif m == 'result' and m not in out_index:
             expr = 'result'
             if dv.node_name == 'ReluBackward':
                 expr += '.detach()'
             args.append(expr)
         elif m in out_index:
+            # A tuple element, `result` included when an output carries that
+            # name, is read out of the core call's tuple.
             expr = f'std::get<{out_index[m]}>({core_result_var or "core_result"})'
             if dv.node_name == 'ReluBackward':
                 expr += '.detach()'

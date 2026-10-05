@@ -826,6 +826,50 @@
 - name: linalg_matrix_exp(Tensor self) -> Tensor
   self: matrix_exp_backward(self, grad)
 
+# Factorizations and solvers (LinalgBackward.h).  The pivots, the packed
+# factors a solver hands back for reuse and the info codes carry no gradient.
+- name: _linalg_det(Tensor A) -> (Tensor result, Tensor LU, Tensor pivots)
+  A: linalg_det_backward(grad, result, A)
+  output_differentiability: [True, False, False]
+
+- name: linalg_inv_ex(Tensor A, *, bool check_errors=False) -> (Tensor result, Tensor info)
+  A: linalg_inv_backward(grad, result)
+  output_differentiability: [True, False]
+
+- name: linalg_pinv.atol_rtol_tensor(Tensor self, *, Tensor? atol=None, Tensor? rtol=None, bool hermitian=False) -> Tensor
+  self: pinv_backward(grad, result, self)
+
+- name: linalg_lu_factor_ex(Tensor A, *, bool pivot=True, bool check_errors=False) -> (Tensor LU, Tensor pivots, Tensor info)
+  A: lu_factor_ex_backward(grad, LU, pivots, pivot)
+  output_differentiability: [True, False, False]
+
+- name: linalg_lu_solve(Tensor LU, Tensor pivots, Tensor B, *, bool left=True, bool adjoint=False) -> Tensor
+  LU: linalg_lu_solve_LU(grad, LU, pivots, result, left, adjoint)
+  B: linalg_lu_solve_B(grad, LU, pivots, left, adjoint)
+
+- name: _linalg_solve_ex(Tensor A, Tensor B, *, bool left=True, bool check_errors=False) -> (Tensor result, Tensor LU, Tensor pivots, Tensor info)
+  A: std::get<0>(linalg_solve_backward(grad, result, A, B, LU, pivots, left, grad_input_mask))
+  B: std::get<1>(linalg_solve_backward(grad, result, A, B, LU, pivots, left, grad_input_mask))
+  output_differentiability: [True, False, False, False]
+
+- name: linalg_solve_triangular(Tensor A, Tensor B, *, bool upper, bool left=True, bool unitriangular=False) -> Tensor
+  A: std::get<0>(linalg_solve_triangular_backward(grad, A, result, upper, left, unitriangular, grad_input_mask))
+  B: std::get<1>(linalg_solve_triangular_backward(grad, A, result, upper, left, unitriangular, grad_input_mask))
+
+- name: linalg_cholesky_ex(Tensor A, *, bool upper=False, bool check_errors=False) -> (Tensor L, Tensor info)
+  A: cholesky_backward(grad, upper, L)
+  output_differentiability: [True, False]
+
+- name: cholesky(Tensor self, bool upper=False) -> Tensor
+  self: cholesky_backward(grad, upper, result)
+
+- name: cholesky_solve(Tensor self, Tensor input2, bool upper=False) -> Tensor
+  self: std::get<0>(cholesky_solve_backward(grad, self, input2, result, upper, grad_input_mask))
+  input2: std::get<1>(cholesky_solve_backward(grad, self, input2, result, upper, grad_input_mask))
+
+- name: cholesky_inverse(Tensor self, bool upper=False) -> Tensor
+  self: cholesky_inverse_backward(grad, self, upper, result)
+
 - name: prelu(Tensor self, Tensor weight) -> Tensor
   self: std::get<0>(prelu_backward(grad, self, weight))
   weight: std::get<1>(prelu_backward(grad, self, weight))
