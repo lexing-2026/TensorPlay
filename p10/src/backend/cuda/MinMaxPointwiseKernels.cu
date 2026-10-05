@@ -184,7 +184,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, PointwiseKernels) {
     m.impl("fmax", fmax_cuda);
     m.impl("fmin", fmin_cuda);
     m.impl("ldexp", ldexp_cuda);
-    m.impl("ldexp.Tensor", ldexp_cuda);
 }
 
 } // namespace cuda

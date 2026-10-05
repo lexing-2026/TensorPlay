@@ -443,7 +443,9 @@ Tensor rot90_cpu(const Tensor& self, int64_t k, const std::vector<int64_t>& dims
     }
 }
 
-std::vector<Tensor> meshgrid_cpu(const std::vector<Tensor>& tensors, const std::string& indexing) {
+// One view per input, stretched over the grid; the stretch is the differentiable
+// expand, so each grid sums its gradient back onto its input.
+std::vector<Tensor> meshgrid_composite(const std::vector<Tensor>& tensors, const std::string& indexing) {
     size_t k = tensors.size();
     if (k == 0) {
         TP_THROW(RuntimeError, "meshgrid expects a non-empty TensorList");
@@ -479,7 +481,8 @@ std::vector<Tensor> meshgrid_cpu(const std::vector<Tensor>& tensors, const std::
     std::vector<int64_t> view_shape(k, 1);
     for (size_t i = 0; i < k; ++i) {
         view_shape[i] = sizes[i];
-        grids.push_back(order[i].view(view_shape).expand(sizes));
+        grids.push_back(
+            tpx::ops::expand(tpx::ops::view(order[i], view_shape), sizes, false));
         view_shape[i] = 1;
     }
     if (indexing == "xy" && k >= 2) {
@@ -834,6 +837,7 @@ Tensor diag_composite(const Tensor& self, int64_t diagonal) {
 
 TENSORPLAY_LIBRARY_IMPL(Composite, ShapeOpsComposites) {
     m.impl("diag", diag_composite);
+    m.impl("meshgrid", meshgrid_composite);
 }
 
 TENSORPLAY_LIBRARY_IMPL(CPU, ShapeOpsKernels) {
@@ -844,7 +848,6 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ShapeOpsKernels) {
     m.impl("roll", roll_cpu);
     m.impl("flip", flip_cpu);
     m.impl("rot90", rot90_cpu);
-    m.impl("meshgrid", meshgrid_cpu);
     m.impl("broadcast_tensors", broadcast_tensors_cpu);
     m.impl("block_diag", block_diag_cpu);
     m.impl("pixel_shuffle", pixel_shuffle_cpu);

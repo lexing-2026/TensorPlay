@@ -98,7 +98,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, ClampKernels) {
     m.impl("clamp_max.Scalar", clamp_max_scalar_cuda);
     m.impl("clamp_min.Tensor", clamp_min_tensor_cuda);
     m.impl("clamp_max.Tensor", clamp_max_tensor_cuda);
-    m.impl("clip", clip_cuda);
 }
 
 }  // namespace cuda

@@ -3906,8 +3906,7 @@
 - func: clip(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor
   variants: function, method
   dispatch:
-    CPU: clip_cpu
-    CUDA: clip_cuda
+    Composite: clip_alias
   tags: pointwise
 
 - func: clamp_(Tensor(a!) self, Scalar? min=None, Scalar? max=None) -> Tensor(a!)
@@ -4384,8 +4383,7 @@
 - func: meshgrid(Tensor[] tensors, str indexing="ij") -> Tensor[]
   variants: function
   dispatch:
-    CPU: meshgrid_cpu
-    CUDA: meshgrid_cuda
+    Composite: meshgrid_composite
 
 - func: greater(Tensor self, Tensor other) -> Tensor
   variants: function, method
@@ -4465,8 +4463,7 @@
 - func: fix(Tensor self) -> Tensor
   variants: function, method
   dispatch:
-    CPU: fix_cpu
-    CUDA: fix_cuda
+    Composite: fix_alias
 
 - func: digamma(Tensor self) -> Tensor
   device_check: NoCheck
@@ -9501,8 +9498,7 @@
 - func: arctan2(Tensor self, Tensor other) -> Tensor
   variants: method, function
   dispatch:
-    CPU: atan2_cpu
-    CUDA: atan2_kernel_cuda
+    Composite: arctan2_alias
 - func: arctan2.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
   device_check: NoCheck
   variants: function

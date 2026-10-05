@@ -659,12 +659,6 @@ Tensor deg2rad_cpu(const Tensor& self) {
 Tensor rad2deg_cpu(const Tensor& self) {
     return float_math_kernel(self, [](double x) { return x * (180.0 / M_PI); }, "rad2deg");
 }
-Tensor fix_cpu(const Tensor& self) {
-    return dtype_unary_kernel(self, [](auto x) -> decltype(x) {
-        if constexpr (std::is_floating_point_v<decltype(x)>) return std::trunc(x);
-        else return x;
-    }, "fix");
-}
 Tensor erfinv_cpu(const Tensor& self) {
     return float_math_kernel(self, [](double x) {
         return special_math::calc_erfinv(x);
@@ -1321,7 +1315,6 @@ TENSORPLAY_LIBRARY_IMPL(CPU, OpsKernels) {
     m.impl("sinc", sinc_cpu);
     m.impl("deg2rad", deg2rad_cpu);
     m.impl("rad2deg", rad2deg_cpu);
-    m.impl("fix", fix_cpu);
     m.impl("erfinv", erfinv_cpu);
     m.impl("logit", logit_cpu);
     m.impl("digamma", digamma_cpu);
@@ -1334,7 +1327,6 @@ TENSORPLAY_LIBRARY_IMPL(CPU, OpsKernels) {
     m.impl("copysign.Scalar", copysign_scalar_cpu);
     m.impl("hypot", hypot_cpu);
     m.impl("atan2", atan2_cpu);
-    m.impl("arctan2", atan2_cpu);
     m.impl("nextafter", nextafter_cpu);
     m.impl("gcd", gcd_cpu);
     m.impl("lcm", lcm_cpu);
@@ -1345,7 +1337,6 @@ TENSORPLAY_LIBRARY_IMPL(CPU, OpsKernels) {
     m.impl("clamp_max.Scalar", clamp_max_scalar_cpu);
     m.impl("clamp_min.Tensor", clamp_min_tensor_cpu);
     m.impl("clamp_max.Tensor", clamp_max_tensor_cpu);
-    m.impl("clip", clip_cpu);
     // Activations
     m.impl("selu", selu_cpu);
     m.impl("celu", celu_cpu);

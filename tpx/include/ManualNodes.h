@@ -857,6 +857,90 @@ inline Tensor pow_backward_exponent(const Tensor& grad, const Tensor& self,
                       grad * ops::conj(result * self.log()));
 }
 
+// A derivative the operator does not provide: asking for it fails instead of
+// handing back nothing, so a missing gradient is never mistaken for zero.
+[[noreturn]] inline Tensor not_implemented_grad(const char* what) {
+    TP_THROW(NotImplementedError, "the derivative for ", what, " is not implemented");
+}
+
+// pow_backward_exponent (number base): d(c^b)/db = c^b * log(c).  A zero
+// base contributes nothing where the exponent is non-negative, the same
+// convention as a zero tensor base.
+inline Tensor pow_backward_exponent(const Tensor& grad, const Scalar& base,
+                                    const Tensor& exponent,
+                                    const Tensor& result) {
+    const Tensor log_base =
+        ops::log(ops::full({}, base, result.dtype(), result.device()));
+    Tensor out = grad * ops::conj(result * log_base);
+    if (!base.isComplex() && base.toDouble() == 0.0) {
+        out = ops::where(ops::ge(exponent, Scalar(0)), ops::zeros_like(out), out);
+    }
+    return out;
+}
+
+// clamp with tensor bounds.  Inside the bounds the value passes through; a
+// value sitting exactly on a bound shares its gradient with that bound, and
+// when the bounds are reversed (min > max) the result is max everywhere, so
+// max takes the whole gradient and min none.
+inline Tensor clamp_tensor_backward_self(const Tensor& grad, const Tensor& self,
+                                         const std::optional<Tensor>& min,
+                                         const std::optional<Tensor>& max) {
+    const bool has_min = min.has_value() && min->defined();
+    const bool has_max = max.has_value() && max->defined();
+    const Tensor zero = ops::zeros_like(grad);
+    if (has_min && has_max) {
+        const Tensor min_lt_max = ops::lt(*min, *max);
+        const Tensor tie = ops::logical_and(
+            ops::logical_or(ops::eq(self, *min), ops::eq(self, *max)), min_lt_max);
+        const Tensor inactive =
+            ops::logical_or(ops::lt(self, *min), ops::gt(self, *max));
+        return ops::where(inactive, zero, ops::where(tie, grad / 2, grad));
+    }
+    if (has_min) {
+        return ops::where(ops::lt(self, *min), zero,
+                          ops::where(ops::eq(self, *min), grad / 2, grad));
+    }
+    if (has_max) {
+        return ops::where(ops::gt(self, *max), zero,
+                          ops::where(ops::eq(self, *max), grad / 2, grad));
+    }
+    return grad;
+}
+
+inline Tensor clamp_tensor_backward_min(const Tensor& grad, const Tensor& self,
+                                        const std::optional<Tensor>& min,
+                                        const std::optional<Tensor>& max) {
+    const Tensor zero = ops::zeros_like(grad);
+    if (max.has_value() && max->defined()) {
+        const Tensor min_lt_max = ops::lt(*min, *max);
+        const Tensor min_eq_max = ops::eq(*min, *max);
+        const Tensor active = ops::logical_or(
+            ops::logical_and(min_lt_max, ops::le(self, *min)),
+            ops::logical_and(min_eq_max, ops::lt(self, *min)));
+        return ops::where(active, ops::where(ops::eq(self, *min), grad / 2, grad), zero);
+    }
+    return ops::where(ops::gt(self, *min), zero,
+                      ops::where(ops::eq(self, *min), grad / 2, grad));
+}
+
+inline Tensor clamp_tensor_backward_max(const Tensor& grad, const Tensor& self,
+                                        const std::optional<Tensor>& min,
+                                        const std::optional<Tensor>& max) {
+    const Tensor zero = ops::zeros_like(grad);
+    if (min.has_value() && min->defined()) {
+        const Tensor min_lt_max = ops::lt(*min, *max);
+        const Tensor min_eq_max = ops::eq(*min, *max);
+        const Tensor active = ops::logical_or(
+            ops::logical_or(ops::lt(*max, *min),
+                            ops::logical_and(min_lt_max, ops::ge(self, *max))),
+            ops::logical_and(min_eq_max, ops::gt(self, *max)));
+        const Tensor split = ops::logical_and(ops::eq(self, *max), min_lt_max);
+        return ops::where(active, ops::where(split, grad / 2, grad), zero);
+    }
+    return ops::where(ops::lt(self, *max), zero,
+                      ops::where(ops::eq(self, *max), grad / 2, grad));
+}
+
 // log1p backward: grad / (self + 1).conj()
 inline Tensor log1p_backward(const Tensor& grad, const Tensor& self) {
     return grad / ops::conj(self + 1);

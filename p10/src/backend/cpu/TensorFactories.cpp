@@ -6,6 +6,7 @@
 #include "TypePromotion.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
+#include <algorithm>
 #include <optional>
 
 namespace tensorplay::cpu {
@@ -20,18 +21,19 @@ Tensor vander_native_cpu(const Tensor& x, std::optional<int64_t> N,
     const int64_t columns = N.value_or(x.size(0));
     if (columns < 0) TP_THROW(RuntimeError, "N must be non-negative.");
 
-    // integer tensors to Long.
+    // Integer inputs count in Long.  The first column is all ones and each
+    // later one multiplies in x once more, so the powers are a running
+    // product along the row -- built from differentiable ops, nothing is
+    // written into place.
     const DType dtype = promoteTypes(x.dtype(), DType::Int64);
-    // TensorPlay's low-level fill kernel is contiguous-only; constructing the
-    // trying to fill a strided select view.
-    Tensor result = ops::full({x.size(0), columns}, Scalar(1), dtype,
-                              std::optional<Device>(x.device()), false, false);
+    const std::optional<Device> device(x.device());
+    Tensor result = ops::ones({x.size(0), std::min<int64_t>(columns, 1)}, dtype,
+                              device);
     if (columns > 1) {
-        Tensor tail = ops::slice(result, 1, 1, std::nullopt, 1);
-        Tensor powers = ops::expand(
-            ops::unsqueeze(x, 1), {x.size(0), columns - 1}, false);
-        ops::copy_(tail, powers, false);
-        ops::copy_(tail, ops::cumprod(tail, 1, std::nullopt), false);
+        Tensor powers = ops::cumprod(
+            ops::expand(ops::unsqueeze(x, 1), {x.size(0), columns - 1}, false),
+            1, dtype);
+        result = ops::cat({result, powers}, 1);
     }
     return increasing ? result : ops::flip(result, {1});
 }

@@ -108,7 +108,7 @@ Tensor& clamp_tensor_out(const Tensor& self, const std::optional<Tensor>& min,
 
 Tensor clip_tensor(const Tensor& self, const std::optional<Tensor>& min,
                    const std::optional<Tensor>& max) {
-    return clamp_tensor(self, min, max);
+    return ops::clamp(self, min, max);
 }
 
 Tensor& clip__tensor(Tensor& self, const std::optional<Tensor>& min,

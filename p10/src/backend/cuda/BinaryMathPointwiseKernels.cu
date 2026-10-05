@@ -722,7 +722,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, PointwiseKernels) {
         m.impl("clamp.Tensor", clamp_tensor_cuda);
     m.impl("clamp_.Tensor", clamp_tensor__cuda);
     m.impl("clamp.Tensor_out", clamp_tensor_out_cuda);
-    m.impl("clip.Tensor", clamp_tensor_cuda);
     m.impl("clip_.Tensor", clamp_tensor__cuda);
     m.impl("clip.Tensor_out", clamp_tensor_out_cuda);
 
@@ -730,7 +729,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, PointwiseKernels) {
     m.impl("pow.Tensor_Scalar", pow_scalar_kernel_cuda);
     m.impl("pow.Scalar", pow_scalar_tensor_kernel_cuda);
     m.impl("atan2", atan2_kernel_cuda);
-    m.impl("arctan2", atan2_kernel_cuda);
 
     m.impl("lerp", lerp_scalar_kernel_cuda);
     m.impl("lerp.Tensor", lerp_tensor_kernel_cuda);

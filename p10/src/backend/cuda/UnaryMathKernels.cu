@@ -88,12 +88,6 @@ Tensor rad2deg_cuda(const Tensor& self) {
     return float_math_cuda(self, HFn30{}, "rad2deg");
 }
 
-Tensor fix_cuda(const Tensor& self) {
-    return dtype_unary_cuda(self,
-                            HFn31{},
-                            "fix");
-}
-
 Tensor erfinv_cuda(const Tensor& self) {
     // CUDA has no native erfinv; use the Cephes calc_erfinv from SpecialMath.h
     // host-only ::erfinv — linking that from device code leaves an undefined
@@ -283,7 +277,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, UnaryMathKernels) {
     m.impl("sinc", sinc_cuda);
     m.impl("deg2rad", deg2rad_cuda);
     m.impl("rad2deg", rad2deg_cuda);
-    m.impl("fix", fix_cuda);
     m.impl("erfinv", erfinv_cuda);
     m.impl("logit", logit_cuda);
     m.impl("digamma", digamma_cuda);

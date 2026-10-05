@@ -197,6 +197,92 @@ class BackwardHelperOps(unittest.TestCase):
         # Row 1: x = (3, 0, 4), y along the third axis: d cos/dx = (y/|y| - cos x/|x|)/|x|.
         self._check(gx[1], tp.tensor([-0.096, 0.0, 0.072]), tol=1e-6)
 
+    def test_powers_of_two_differentiate_in_value_and_exponent(self):
+        ln2 = 0.6931471805599453
+        f64 = tp.float64
+        for device in ["cpu"] + (["cuda"] if tp.cuda.is_available() else []):
+            e = tp.tensor([0.0, 1.0, -1.0], dtype=f64, device=device, requires_grad=True)
+            (grad,) = tp.autograd.grad(tp.pow(2.0, e).sum(), [e])
+            self._check(grad.cpu(), tp.tensor([ln2, 2 * ln2, ln2 / 2], dtype=f64), tol=1e-12)
+            # A zero base gives nothing where the exponent is non-negative.
+            e = tp.tensor([0.0, 2.0], dtype=f64, device=device, requires_grad=True)
+            (grad,) = tp.autograd.grad(tp.pow(0.0, e).sum(), [e])
+            self._check(grad.cpu(), tp.tensor([0.0, 0.0], dtype=f64))
+            # ldexp(x, k) = x * 2^k.
+            x = tp.tensor([3.0, -1.5], dtype=f64, device=device, requires_grad=True)
+            k = tp.tensor([2.0, -1.0], dtype=f64, device=device, requires_grad=True)
+            gx, gk = tp.autograd.grad(tp.ldexp(x, k).sum(), [x, k])
+            self._check(gx.cpu(), tp.tensor([4.0, 0.5], dtype=f64), tol=1e-12)
+            self._check(gk.cpu(), tp.tensor([12 * ln2, -0.75 * ln2], dtype=f64), tol=1e-12)
+            # The power is taken in the type the pair promotes to.
+            wide = tp.ldexp(tp.ones(2, device=device), tp.ones(2, dtype=f64, device=device))
+            self.assertEqual(wide.dtype, f64)
+
+    def test_incomplete_gamma_differentiates_in_its_second_argument(self):
+        f64 = tp.float64
+        for device in ["cpu"] + (["cuda"] if tp.cuda.is_available() else []):
+            a = tp.tensor([2.0, 3.0], dtype=f64, device=device)
+            x = tp.tensor([1.0, 2.0], dtype=f64, device=device, requires_grad=True)
+            # d/dx P(a, x) = x^(a-1) e^-x / Gamma(a); the complement is its negative.
+            density = tp.tensor([0.36787944117144233, 0.2706705664732254], dtype=f64)
+            (grad,) = tp.autograd.grad(tp.igamma(a, x).sum(), [x])
+            self._check(grad.cpu(), density, tol=1e-12)
+            (grad,) = tp.autograd.grad(tp.igammac(a, x).sum(), [x])
+            self._check(grad.cpu(), -density, tol=1e-12)
+            # The first argument has no derivative: asking for it fails.
+            a.requires_grad_(True)
+            with self.assertRaises(NotImplementedError):
+                tp.autograd.grad(tp.igamma(a, x).sum(), [a])
+
+    def test_tensor_bounds_share_the_gradient_at_a_tie(self):
+        for device in ["cpu"] + (["cuda"] if tp.cuda.is_available() else []):
+            for clamp in (tp.clamp, tp.clip):
+                x = tp.tensor([-2.0, 0.0, 0.5, 1.0, 3.0], device=device, requires_grad=True)
+                lo = tp.tensor([-1.0, 0.0, -1.0, -1.0, -1.0], device=device, requires_grad=True)
+                hi = tp.ones(5, device=device, requires_grad=True)
+                gx, glo, ghi = tp.autograd.grad(clamp(x, lo, hi).sum(), [x, lo, hi])
+                # Below, on the lower bound, inside, on the upper bound, above.
+                self._check(gx.cpu(), tp.tensor([0.0, 0.5, 1.0, 0.5, 0.0]))
+                self._check(glo.cpu(), tp.tensor([1.0, 0.5, 0.0, 0.0, 0.0]))
+                self._check(ghi.cpu(), tp.tensor([0.0, 0.0, 0.0, 0.5, 1.0]))
+
+    def test_other_spellings_differentiate_like_the_operator_they_name(self):
+        f64 = tp.float64
+        for device in ["cpu"] + (["cuda"] if tp.cuda.is_available() else []):
+            y = tp.tensor([1.0, -2.0], dtype=f64, device=device, requires_grad=True)
+            x = tp.tensor([1.0, 0.5], dtype=f64, device=device, requires_grad=True)
+            gy, gx = tp.autograd.grad(tp.arctan2(y, x).sum(), [y, x])
+            # d atan2(y, x) = (x dy - y dx) / (x^2 + y^2).
+            self._check(gy.cpu(), tp.tensor([0.5, 0.5 / 4.25], dtype=f64), tol=1e-12)
+            self._check(gx.cpu(), tp.tensor([-0.5, 2.0 / 4.25], dtype=f64), tol=1e-12)
+            z = tp.tensor([-2.0, 0.5, 3.0], device=device, requires_grad=True)
+            (grad,) = tp.autograd.grad(tp.clip(z, -1.0, 1.0).sum(), [z])
+            self._check(grad.cpu(), tp.tensor([0.0, 1.0, 0.0]))
+            (grad,) = tp.autograd.grad(tp.fix(z * 2).sum(), [z])
+            self._check(grad.cpu(), tp.zeros(3))
+
+    def test_grids_and_powers_of_a_vector_differentiate(self):
+        f64 = tp.float64
+        for device in ["cpu"] + (["cuda"] if tp.cuda.is_available() else []):
+            a = tp.tensor([1.0, 2.0], dtype=f64, device=device, requires_grad=True)
+            b = tp.tensor([3.0, 4.0, 5.0], dtype=f64, device=device, requires_grad=True)
+            for indexing in ("ij", "xy"):
+                ga, gb = tp.meshgrid(a, b, indexing=indexing)
+                da, db = tp.autograd.grad(ga.sum() + 2 * gb.sum(), [a, b])
+                # Each entry of a spans a row of three, each entry of b a column of two.
+                self._check(da.cpu(), tp.tensor([3.0, 3.0], dtype=f64))
+                self._check(db.cpu(), tp.tensor([4.0, 4.0, 4.0], dtype=f64))
+            da, db = tp.autograd.grad(tp.cartesian_prod(a, b).sum(), [a, b])
+            self._check(da.cpu(), tp.tensor([3.0, 3.0], dtype=f64))
+            self._check(db.cpu(), tp.tensor([2.0, 2.0, 2.0], dtype=f64))
+            # Rows (a^2, a, 1): the derivative of a row's sum is 2a + 1.
+            (grad,) = tp.autograd.grad(tp.vander(a, 3).sum(), [a])
+            self._check(grad.cpu(), tp.tensor([3.0, 5.0], dtype=f64))
+            self.assertEqual(tp.vander(a.detach(), 3).tolist(), [[1.0, 1.0, 1.0], [4.0, 2.0, 1.0]])
+            ints = tp.tensor([2, 3], device=device)
+            self.assertEqual(tp.vander(ints, 2, increasing=True).dtype, tp.int64)
+            self.assertEqual(tp.vander(ints, 0).shape, (2, 0))
+
 
 if __name__ == "__main__":
     unittest.main()

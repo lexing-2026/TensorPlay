@@ -1313,6 +1313,34 @@
   self: pow_backward_self(grad, self, exponent)
   exponent: pow_backward_exponent(grad, self, exponent, result)
 
+# A number raised to a tensor: only the exponent carries a gradient.
+- name: pow.Scalar(Scalar self, Tensor exponent) -> Tensor
+  exponent: pow_backward_exponent(grad, self, exponent, result)
+
+# self * 2^other: the value is scaled by the same power of two, and the
+# exponent moves the result by the result itself times ln 2.
+- name: ldexp(Tensor self, Tensor other) -> Tensor
+  self: ldexp(grad, other)
+  other: grad * result * 0.6931471805599453
+
+# The lower incomplete gamma function and its complement are differentiated
+# in their second argument only.
+- name: igamma(Tensor self, Tensor other) -> Tensor
+  self: not_implemented_grad("igamma with respect to its first argument")
+  other: grad * exp((self - 1) * log(other) - other - lgamma(self))
+
+- name: igammac(Tensor self, Tensor other) -> Tensor
+  self: not_implemented_grad("igammac with respect to its first argument")
+  other: -grad * exp((self - 1) * log(other) - other - lgamma(self))
+
+# Tensor bounds: inside them the value passes through, a value sitting on a
+# bound shares its gradient with it, and reversed bounds hand everything to
+# max (the result is max there).
+- name: clamp.Tensor(Tensor self, Tensor? min=None, Tensor? max=None) -> Tensor
+  self: clamp_tensor_backward_self(grad, self, min, max)
+  min: clamp_tensor_backward_min(grad, self, min, max)
+  max: clamp_tensor_backward_max(grad, self, min, max)
+
 - name: prod(Tensor self, *, ScalarType dtype=Undefined) -> Tensor
   self: prod_backward(grad, self, result)
 

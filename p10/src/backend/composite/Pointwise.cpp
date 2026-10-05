@@ -76,8 +76,17 @@ Tensor& xlog1py__native(Tensor& self, const Tensor& other) {
     return self;
 }
 
+// The power of two is taken in the type the pair promotes to: an integral or
+// single-precision value meets it in single precision (the exponent may
+// widen that), while wider and reduced floating values keep their own type
+// for the base so the exponent alone decides any further promotion.
 Tensor ldexp_native(const Tensor& self, const Tensor& other) {
-    return ops::mul(self, ops::exp2(other.to(self.dtype())));
+    const DType self_dtype = self.dtype();
+    const Tensor power =
+        isIntegralType(self_dtype, /*includeBool=*/true) || self_dtype == DType::Float32
+            ? ops::pow(Scalar(2.0), other)
+            : ops::pow(ops::full({}, Scalar(2.0), self_dtype, self.device()), other);
+    return ops::mul(self, power);
 }
 
 Tensor& ldexp__native(Tensor& self, const Tensor& other) {
@@ -228,6 +237,19 @@ Tensor repeat_interleave_int_native(const Tensor& self, int64_t repeats,
     return input.clone(kContiguous).flatten(dim, dim + 1);
 }
 
+Tensor arctan2_alias(const Tensor& self, const Tensor& other) {
+    return ops::atan2(self, other);
+}
+
+Tensor fix_alias(const Tensor& self) {
+    return ops::trunc(self);
+}
+
+Tensor clip_alias(const Tensor& self, const std::optional<Scalar>& min,
+                  const std::optional<Scalar>& max) {
+    return ops::clamp(self, min, max);
+}
+
 TENSORPLAY_LIBRARY_IMPL(Composite, PointwiseComposite) {
     m.impl("xlogy", xlogy_native);
     m.impl("xlogy_", xlogy__native);
@@ -245,8 +267,11 @@ TENSORPLAY_LIBRARY_IMPL(Composite, PointwiseComposite) {
     m.impl("frexp", frexp_native);
     m.impl("igamma", igamma_native);
     m.impl("igammac", igammac_native);
-    // arctan2/arctan2_ route to the native atan2 kernels; the composite
-    // wrappers above are no longer registered for them.
+    // Spellings of other operators answer through those operators, so they
+    // are differentiated the same way.
+    m.impl("arctan2", arctan2_alias);
+    m.impl("fix", fix_alias);
+    m.impl("clip", clip_alias);
     m.impl("repeat_interleave.self_Tensor", repeat_interleave_tensor_native);
     m.impl("repeat_interleave.self_int", repeat_interleave_int_native);
 }

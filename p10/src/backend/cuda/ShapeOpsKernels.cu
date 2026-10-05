@@ -667,51 +667,6 @@ Tensor rot90_cuda(const Tensor& self, int64_t k, const std::vector<int64_t>& dim
     }
 }
 
-std::vector<Tensor> meshgrid_cuda(const std::vector<Tensor>& tensors, const std::string& indexing) {
-    size_t k = tensors.size();
-    if (k == 0) {
-        TP_THROW(RuntimeError, "meshgrid expects a non-empty TensorList");
-    }
-    if (indexing != "ij" && indexing != "xy") {
-        TP_THROW(RuntimeError, "meshgrid: indexing must be 'ij' or 'xy', got " + indexing);
-    }
-    const Device& device = tensors[0].device();
-    for (size_t i = 0; i < k; ++i) {
-        const Tensor& t = tensors[i];
-        if (!(t.device() == device)) {
-            TP_THROW(RuntimeError, "meshgrid expects all tensors to have the same device");
-        }
-        if (t.dim() > 1) {
-            TP_THROW(RuntimeError,
-                     "meshgrid: expected 0-D or 1-D tensors");
-        }
-    }
-    for (size_t i = 1; i < k; ++i) {
-        if (tensors[i].dtype() != tensors[0].dtype()) {
-            TP_THROW(RuntimeError, "meshgrid expects all tensors to have the same dtype");
-        }
-    }
-    std::vector<Tensor> order(tensors.begin(), tensors.end());
-    if (indexing == "xy" && k >= 2) {
-        std::swap(order[0], order[1]);
-    }
-    std::vector<int64_t> sizes;
-    sizes.reserve(k);
-    for (const Tensor& t : order) sizes.push_back(t.numel());
-    std::vector<Tensor> grids;
-    grids.reserve(k);
-    std::vector<int64_t> view_shape(k, 1);
-    for (size_t i = 0; i < k; ++i) {
-        view_shape[i] = sizes[i];
-        grids.push_back(order[i].view(view_shape).expand(sizes));
-        view_shape[i] = 1;
-    }
-    if (indexing == "xy" && k >= 2) {
-        std::swap(grids[0], grids[1]);
-    }
-    return grids;
-}
-
 std::vector<Tensor> broadcast_tensors_cuda(const std::vector<Tensor>& tensors) {
     // CompositeImplicit implementation of broadcast_tensors_cpu: device-generic
     // expand views; no CUDA-specific code required.
@@ -1068,7 +1023,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, ShapeOpsKernels) {
     m.impl("flip", flip_cuda);
     m.impl("roll", roll_cuda);
     m.impl("rot90", rot90_cuda);
-    m.impl("meshgrid", meshgrid_cuda);
     m.impl("broadcast_tensors", broadcast_tensors_cuda);
     m.impl("block_diag", block_diag_cuda);
     m.impl("pixel_shuffle", pixel_shuffle_cuda);
