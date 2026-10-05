@@ -530,29 +530,25 @@ RPC & 408 & RPC 绑定 &  & \\
 \item \textbf{Contract}：值、数据类型、步幅和错误行为与引用完全匹配，包括异常类型——“契约”轨道。
 \end{itemize}
 
-完整的单进程运行在 163 秒内报告 \textbf{9 failed, 2{,}305 通过，263 跳过}。 263 个跳过是环境性的，而不是结构性的：162 个需要缺少 CUDA 硬件（模块级 \texttt{skipif} 防护），其余需要未安装的可选包。这 9 个失败位于两个文件中——抗锯齿/最近精确上采样模式 (6) 和 einsum 收缩阶边缘情况 (3)——并报告为开放项而不是隐藏项。
+完整的单进程运行在 488 秒内报告 \textbf{5{,}706 通过，14 跳过，0 失败}。 这 14 个跳过是环境性的，而不是结构性的：它们要求未安装的可选包，由模块级 \texttt{skipif} 防护。整套没有失败，因此图~\ref{fig:testoutcomes} 的失败段为空——早先版本里抗锯齿/最近精确上采样模式与 einsum 收缩阶边缘情况这两组失败已经修掉，这里记录的是当前状态而不是一个待办清单。
 
 \begin{figure}[H]
 \centering
 \begin{tikzpicture}[every node/.style={font=\scriptsize}]
-% horizontal stacked bar of test outcomes (widths precomputed: 9.6 * n/5688)
+% horizontal stacked bar of test outcomes (widths precomputed: 9.6 * n/5720)
+% the run is green, so there is no failed segment to draw
 \def\totalw{9.6}
-\def\wp{8.5867}
-\def\ws{0.9797}
-\def\wf{0.0335}
+\def\wp{9.5765}
+\def\ws{0.0235}
 \fill[tpgreen!25] (0,0.55) rectangle (\wp,1.05);
 \draw[tpgreen] (0,0.55) rectangle (\wp,1.05);
 \fill[gray!25] (\wp,0.55) rectangle (\wp+\ws,1.05);
 \draw[gray] (\wp,0.55) rectangle (\wp+\ws,1.05);
-\fill[red!25] (\wp+\ws,0.55) rectangle (\wp+\ws+\wf,1.05);
-\draw[red!70!black] (\wp+\ws,0.55) rectangle (\wp+\ws+\wf,1.05);
-\node[tpgreen!70!black] at (\wp/2,0.8) {passed 2{,}305};
-\node[gray] at (\wp+\ws/2,1.35) {skipped (env) 263};
+\node[tpgreen!70!black] at (\wp/2,0.8) {passed 5{,}706};
+\node[gray, anchor=west] at (\wp+\ws+0.15,1.35) {skipped (env) 14, failed 0};
 \draw[gray] (\wp+\ws/2,1.15) -- (\wp+\ws/2,1.05);
-\node[red!70!black, anchor=west] at (\wp+\ws+0.15,1.35) {failed 9};
-\draw[red!70!black] (\wp+\ws+\wf,1.15) -- (\wp+\ws+\wf,1.05);
 \node[anchor=east,gray] at (0,0.3) {outcome of one full-suite run:};
-\node[anchor=west,gray] at (\totalw+0.2,0.3) {2{,}577 total};
+\node[anchor=west,gray] at (\totalw+0.2,0.3) {5{,}720 total};
 \end{tikzpicture}
 \qquad
 \begin{tikzpicture}[every node/.style={font=\scriptsize}]
@@ -571,7 +567,7 @@ RPC & 408 & RPC 绑定 &  & \\
 }
 \draw[->,gray] (-0.1,0) -- (2.35,0);
 \end{tikzpicture}
-\caption{左：全套运行的结果 (163\,s)。右：每个轨道收集到的测试数；三个后缀族共 49 个文件、1{,}071 个测试，全树 245 个文件、5{,}688 个测试。}
+\caption{左：全套运行的结果 (488\,s)。右：每个轨道收集到的测试数；三个后缀族共 49 个文件、1{,}071 个测试，全树 245 个文件。}
 \label{fig:testoutcomes}
 \end{figure}
 
