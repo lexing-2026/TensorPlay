@@ -50,6 +50,8 @@ extern Tensor amax_dim_kernel(const Tensor& self,
 extern Tensor amin_dim_kernel(const Tensor& self,
                               const std::vector<int64_t>& dim,
                               bool keepdim);
+extern std::tuple<Tensor, Tensor> aminmax_dim_kernel(
+    const Tensor& self, const std::vector<int64_t>& dim, bool keepdim);
 extern Tensor var_dim_kernel(const Tensor& self,
                              const std::vector<int64_t>& dim,
                              int64_t correction, bool keepdim);

@@ -574,7 +574,12 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
         }
     }
 
-    const int max_threads = sizeof(AccT) > 4 ? 256 : kMaxReduceThreads;
+    // Only the 16-byte element type trades thread budget for occupancy;
+    // every other accumulator keeps the full ceiling.
+    const int max_threads =
+        std::is_same<InputT, tensorplay::complex<double>>::value
+            ? 256
+            : kMaxReduceThreads;
     // Block shape in both mappings: block.x is sized from the per-output
     // extent and block.y from the output count, so a block always covers whole
     // rows.  block.x targets kElemsPerLane elements per lane - one or two per
@@ -1048,8 +1053,9 @@ struct ReduceOp {
 
 template <typename InputT, typename AccT, typename OutputT, typename Ops,
           int ValuesPerThread, int InputVecSize>
-__global__ void reduce_kernel(ReduceOp<InputT, AccT, OutputT, Ops,
-                                       ValuesPerThread, InputVecSize> op) {
+__global__ void __launch_bounds__(kMaxReduceThreads, 4)
+reduce_kernel(ReduceOp<InputT, AccT, OutputT, Ops,
+                       ValuesPerThread, InputVecSize> op) {
     op.run();
 }
 
@@ -1237,6 +1243,171 @@ struct PackedArgMaxOps {
         const unsigned idx =
             ~static_cast<unsigned>(value & 0xFFFFFFFFull);
         return static_cast<int64_t>(static_cast<int32_t>(idx));
+    }
+};
+
+// Monotone float -> uint32 map shared by the packed extremum forms: IEEE
+// total order on the normalized bits (NaN family collapses to canonical
+// qNaN, -0 folds onto +0).
+__device__ __forceinline__ unsigned extremum_value_key(float value) {
+    unsigned bits = __float_as_uint(value);
+    if ((bits & 0x7FFFFFFFu) > 0x7F800000u) {
+        bits = 0x7FC00000u;  // NaN family -> canonical qNaN
+    } else if (bits == 0x80000000u) {
+        bits = 0u;           // fold -0 onto +0
+    }
+    const unsigned sign = static_cast<unsigned>(static_cast<int>(bits) >> 31);
+    return bits ^ (0x80000000u | (0x7FFFFFFFu & sign));
+}
+
+// Inverse of extremum_value_key: top bit set means the source was
+// non-negative (only the sign bit was flipped); otherwise every bit was.
+__device__ __forceinline__ float extremum_key_value(unsigned key) {
+    const unsigned bits = (key & 0x80000000u) ? key ^ 0x80000000u : ~key;
+    return __uint_as_float(bits);
+}
+
+// Fused value+index extremum for max(dim)/min(dim): the whole reduction
+// state is ONE 64-bit word — [stored value key (high 32) | ~index (low 32)]
+// — selected with a plain integer compare.  One u64 shuffle per fold level
+// replaces the two-shuffle pair tree an (value, int64) accumulator needs,
+// and the NaN/tie rules live in the encoding instead of comparator branches:
+//   * extremum_value_key is order-preserving, so integer max on the key is
+//     float max; the min form stores ~key and takes integer min;
+//   * qNaN outranks +inf for max and (via inversion) every finite key for
+//     min — a NaN wins immediately and never moves off, with the first NaN
+//     winning ties through the index half;
+//   * ~index in the low half keeps the smaller index on equal keys (first
+//     occurrence), for both directions;
+//   * max form never sees key 0 or all-ones (both encode NaNs, which pack
+//     to qNaN), so 0 / ~0ull serve as identities for max / min.
+// Row length must fit int32 (host-side guard).  The value reconstructs
+// exactly: float16/bfloat16 round-trip through float losslessly.
+template <typename OutputT, bool kIsMax>
+struct PackedExtremumOps {
+    using acc_type = unsigned long long;
+
+    __device__ static unsigned long long pack(float value, int64_t index) {
+        unsigned key = extremum_value_key(value);
+        if constexpr (!kIsMax) key = ~key;
+        return (static_cast<unsigned long long>(key) << 32) |
+               static_cast<unsigned>(~static_cast<unsigned>(index));
+    }
+
+    template <typename V>
+    __device__ unsigned long long reduce(
+            unsigned long long acc, V value, int64_t index) const {
+        const unsigned long long candidate = pack(
+            static_cast<float>(value), index);
+        if constexpr (kIsMax) return candidate > acc ? candidate : acc;
+        else return candidate < acc ? candidate : acc;
+    }
+
+    __device__ unsigned long long combine(unsigned long long a,
+                                          unsigned long long b) const {
+        if constexpr (kIsMax) return a > b ? a : b;
+        else return a < b ? a : b;
+    }
+
+    __device__ OutputT project(unsigned long long word) const {
+        unsigned key = static_cast<unsigned>(word >> 32);
+        if constexpr (!kIsMax) key = ~key;
+        return static_cast<OutputT>(extremum_key_value(key));
+    }
+
+    __device__ int64_t project_second(unsigned long long word) const {
+        const unsigned idx =
+            ~static_cast<unsigned>(word & 0xFFFFFFFFull);
+        return static_cast<int64_t>(static_cast<int32_t>(idx));
+    }
+};
+
+// Packed argmin: the max form with every key inverted, so integer min picks
+// the smallest value and the first NaN / first occurrence rules carry over.
+struct PackedArgMinOps {
+    using acc_type = unsigned long long;
+
+    template <typename V>
+    __device__ unsigned long long reduce(
+            unsigned long long acc, V value, int64_t index) const {
+        unsigned key = extremum_value_key(static_cast<float>(value));
+        const unsigned long long candidate =
+            (static_cast<unsigned long long>(~key) << 32) |
+            static_cast<unsigned>(~static_cast<unsigned>(index));
+        return candidate < acc ? candidate : acc;
+    }
+
+    __device__ unsigned long long combine(unsigned long long a,
+                                          unsigned long long b) const {
+        return a < b ? a : b;
+    }
+
+    __device__ int64_t project(unsigned long long value) const {
+        const unsigned idx =
+            ~static_cast<unsigned>(value & 0xFFFFFFFFull);
+        return static_cast<int64_t>(static_cast<int32_t>(idx));
+    }
+};
+
+// Fused min+max for aminmax: ONE 64-bit word carries both extremum keys —
+// [max key (high 32) | stored min key (low 32)] — so a single shuffle chain
+// per fold level serves two reductions that would otherwise each re-read the
+// whole input.  Each half is its own independent extremum scan:
+//   * the high half keeps extremum_value_key as-is (order-preserving), so
+//     integer max selects the largest value and canonical qNaN outranks +inf;
+//   * the low half stores ~key (order-reversing), so the same integer max
+//     selects the smallest value; NaN maps to all-ones there, outranking
+//     every finite stored key, mirroring "a NaN claims both outputs";
+//   * no real key lands on 0 or all-ones (the float key map never emits
+//     either), so 0ull is the identity for both halves at once.
+// The per-half max combine is componentwise, hence associative and
+// order-independent.  Float family only (the key map is a float encoding);
+// row length must fit int32 (host-side guard).
+template <typename OutputT>
+struct PackedAminMaxOps {
+    using acc_type = unsigned long long;
+
+    __device__ static unsigned long long pack(float value) {
+        const unsigned key = extremum_value_key(value);
+        const unsigned min_stored =
+            (key == 0xFFC00000u) ? 0xFFFFFFFFu : ~key;
+        return (static_cast<unsigned long long>(key) << 32) | min_stored;
+    }
+
+    __device__ static unsigned long long half_max(unsigned long long a,
+                                                  unsigned long long b) {
+        const unsigned a_hi = static_cast<unsigned>(a >> 32);
+        const unsigned b_hi = static_cast<unsigned>(b >> 32);
+        const unsigned hi = a_hi > b_hi ? a_hi : b_hi;
+        const unsigned a_lo = static_cast<unsigned>(a);
+        const unsigned b_lo = static_cast<unsigned>(b);
+        const unsigned lo = a_lo > b_lo ? a_lo : b_lo;
+        return (static_cast<unsigned long long>(hi) << 32) | lo;
+    }
+
+    template <typename V>
+    __device__ unsigned long long reduce(
+            unsigned long long acc, V value, int64_t) const {
+        return half_max(acc, pack(static_cast<float>(value)));
+    }
+
+    __device__ unsigned long long combine(unsigned long long a,
+                                          unsigned long long b) const {
+        return half_max(a, b);
+    }
+
+    __device__ OutputT project(unsigned long long word) const {
+        return static_cast<OutputT>(extremum_key_value(
+            static_cast<unsigned>(word >> 32)));
+    }
+
+    __device__ OutputT project_second(unsigned long long word) const {
+        const unsigned stored = static_cast<unsigned>(word);
+        if (stored == 0xFFFFFFFFu) {
+            // the all-ones min slot encodes the winning NaN
+            return static_cast<OutputT>(extremum_key_value(0xFFC00000u));
+        }
+        return static_cast<OutputT>(extremum_key_value(~stored));
     }
 };
 

@@ -14,7 +14,10 @@ std::tuple<Tensor, Tensor> aminmax_cuda(const Tensor& self, const std::vector<in
         }
         zero_numel_check_dims(self, dim, "aminmax");
     }
-    return {amin_cuda2(self, dim, keepdim), amax_cuda2(self, dim, keepdim)};
+    // Both extreme values come out of a single pass next door; the min/max
+    // pair of launches would re-read the input for a key the accumulator
+    // already holds.
+    return aminmax_dim_kernel(self, dim, keepdim);
 }
 
 

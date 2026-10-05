@@ -479,11 +479,83 @@ Tensor argmin_same_dtype(
         const Tensor& input, const ReductionSpec& spec, bool keepdim) {
     static_assert(!std::is_same_v<T, bool>, "argmin is not implemented for bool");
     using ValueT = same_dtype_acc_t<T>;
+    // Same packed-u64 fast path as argmax, with the key inverted for the
+    // min direction (identical winners — value asc / first occurrence).
+    if constexpr (std::is_same_v<ValueT, float>) {
+        if (spec.reduced_numel <= ((int64_t{1} << 31) - 1)) {
+            return run_reduction_typed<T, unsigned long long, int64_t>(
+                input, spec, keepdim, DType::Int64,
+                reduction::PackedArgMinOps{}, ~0ull);
+        }
+    }
     using StateT = ArgPair<ValueT>;
     using Ops = ArgOps<ValueT, false>;
     return run_reduction_typed<T, StateT, int64_t>(
         input, spec, keepdim, DType::Int64, Ops{},
         StateT{reduction::reduction_upper_bound<ValueT>(), 0});
+}
+
+// max(dim)/min(dim): the value and its index come out of one pass.  The
+// float family with an int32-fitting logical extent runs the packed-u64
+// form (one shuffle chain carries both outputs); every other dtype keeps
+// the two-pass composition — extreme values, then the arg pass — over the
+// same first-occurrence tie rule.
+template <typename T, bool kIsMax>
+std::tuple<Tensor, Tensor> extremum_with_indices_same_dtype(
+        const Tensor& input, const ReductionSpec& spec, bool keepdim) {
+    using ValueT = same_dtype_acc_t<T>;
+    Tensor indices = Tensor::empty(
+        reduction_output_shape(input, spec, keepdim), DType::Int64,
+        input.device());
+    if constexpr (std::is_same_v<ValueT, float>) {
+        if (spec.reduced_numel <= ((int64_t{1} << 31) - 1)) {
+            Tensor values = run_reduction_typed<T, unsigned long long, T>(
+                input, spec, keepdim, input.dtype(),
+                reduction::PackedExtremumOps<T, kIsMax>{},
+                kIsMax ? 0ull : 0xFFFFFFFFFFFFFFFFull, &indices);
+            return {values, indices};
+        }
+    }
+    Tensor values = minmax_same_dtype<T, kIsMax>(input, spec, keepdim);
+    Tensor idx = kIsMax ? argmax_same_dtype<T>(input, spec, keepdim)
+                        : argmin_same_dtype<T>(input, spec, keepdim);
+    return {values, idx};
+}
+
+// Dtype-dispatch-friendly entry points (the macro fixes only <T>).
+template <typename T>
+std::tuple<Tensor, Tensor> max_with_indices_same_dtype(
+        const Tensor& input, const ReductionSpec& spec, bool keepdim) {
+    return extremum_with_indices_same_dtype<T, true>(input, spec, keepdim);
+}
+
+template <typename T>
+std::tuple<Tensor, Tensor> min_with_indices_same_dtype(
+        const Tensor& input, const ReductionSpec& spec, bool keepdim) {
+    return extremum_with_indices_same_dtype<T, false>(input, spec, keepdim);
+}
+
+// aminmax: both extreme values out of one pass.  The float family with an
+// int32-fitting logical extent runs the packed two-keys-per-word form (one
+// shuffle chain carries both outputs); every other dtype keeps the pair of
+// value passes.
+template <typename T>
+std::tuple<Tensor, Tensor> aminmax_same_dtype(
+        const Tensor& input, const ReductionSpec& spec, bool keepdim) {
+    using ValueT = same_dtype_acc_t<T>;
+    if constexpr (std::is_same_v<ValueT, float>) {
+        if (spec.reduced_numel <= ((int64_t{1} << 31) - 1)) {
+            Tensor min_values = Tensor::empty(
+                reduction_output_shape(input, spec, keepdim), input.dtype(),
+                input.device());
+            Tensor max_values = run_reduction_typed<T, unsigned long long, T>(
+                input, spec, keepdim, input.dtype(),
+                reduction::PackedAminMaxOps<T>{}, 0ull, &min_values);
+            return {min_values, max_values};
+        }
+    }
+    return {min_same_dtype<T>(input, spec, keepdim),
+            max_same_dtype<T>(input, spec, keepdim)};
 }
 
 #define TP_DISPATCH_REDUCTION(FN, DTYPE, ...) \
@@ -575,6 +647,13 @@ Tensor amin_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim,
                        bool keepdim) {
     const ReductionSpec spec = make_reduction_spec(self, dim);
     TP_DISPATCH_REDUCTION(min_same_dtype, self.dtype(), self, spec, keepdim);
+}
+
+std::tuple<Tensor, Tensor> aminmax_dim_kernel(const Tensor& self,
+                                              const std::vector<int64_t>& dim,
+                                              bool keepdim) {
+    const ReductionSpec spec = make_reduction_spec(self, dim);
+    TP_DISPATCH_REDUCTION(aminmax_same_dtype, self.dtype(), self, spec, keepdim);
 }
 
 Tensor nansum_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim,
@@ -737,8 +816,6 @@ Tensor prod_kernel(const Tensor& self, DType dtype) {
 
 // Max
 std::tuple<Tensor, Tensor> max_dim_kernel(const Tensor& self, int64_t dim0, bool keepdim) {
-    // existing min/max reduction machinery; indices from the ArgOps pass.
-    // Both share the same first-occurrence tie rule (strict >).
     const int64_t nd = self.dim();
     TP_CHECK(nd > 0, "max(): Expected input to have at least one dimension");
     const int64_t dim = dim0 < 0 ? dim0 + nd : dim0;
@@ -747,23 +824,17 @@ std::tuple<Tensor, Tensor> max_dim_kernel(const Tensor& self, int64_t dim0, bool
     if (self.size(dim) == 0) {
         TP_THROW(IndexError, "max(): Expected reduction dim ", dim, " to have non-zero size.");
     }
-    const ReductionSpec spec = make_reduction_spec(self, {dim});
     if (self.dtype() == DType::Bool) {
-        // argmax has no Bool instantiation (ptxas time); max over bool is
-        // equally exotic on CUDA -- fail loudly instead of desyncing the pair.
         TP_THROW(NotImplementedError, "max(dim) not implemented for Bool on CUDA");
     }
+    const ReductionSpec spec = make_reduction_spec(self, {dim});
     // The dispatch macros expand to a returning switch; route them through an
     // immediately-invoked lambda to capture both outputs.
-    Tensor values = [&]() -> Tensor {
-        TP_DISPATCH_REDUCTION(max_same_dtype, self.dtype(), self, spec, keepdim);
-        return Tensor();
+    return [&]() -> std::tuple<Tensor, Tensor> {
+        TP_DISPATCH_REDUCTION_NO_BOOL(
+            max_with_indices_same_dtype, self.dtype(), self, spec, keepdim);
+        TP_THROW(NotImplementedError, "max(dim): unsupported dtype");
     }();
-    Tensor indices = [&]() -> Tensor {
-        TP_DISPATCH_REDUCTION_NO_BOOL(argmax_same_dtype, self.dtype(), self, spec, keepdim);
-        return Tensor();
-    }();
-    return {values, indices};
 }
 
 Tensor max_kernel(const Tensor& self) {
@@ -789,19 +860,15 @@ std::tuple<Tensor, Tensor> min_dim_kernel(const Tensor& self, int64_t dim0, bool
     if (self.size(dim) == 0) {
         TP_THROW(IndexError, "min(): Expected reduction dim ", dim, " to have non-zero size.");
     }
-    const ReductionSpec spec = make_reduction_spec(self, {dim});
     if (self.dtype() == DType::Bool) {
         TP_THROW(NotImplementedError, "min(dim) not implemented for Bool on CUDA");
     }
-    Tensor values = [&]() -> Tensor {
-        TP_DISPATCH_REDUCTION(min_same_dtype, self.dtype(), self, spec, keepdim);
-        return Tensor();
+    const ReductionSpec spec = make_reduction_spec(self, {dim});
+    return [&]() -> std::tuple<Tensor, Tensor> {
+        TP_DISPATCH_REDUCTION_NO_BOOL(
+            min_with_indices_same_dtype, self.dtype(), self, spec, keepdim);
+        TP_THROW(NotImplementedError, "min(dim): unsupported dtype");
     }();
-    Tensor indices = [&]() -> Tensor {
-        TP_DISPATCH_REDUCTION_NO_BOOL(argmin_same_dtype, self.dtype(), self, spec, keepdim);
-        return Tensor();
-    }();
-    return {values, indices};
 }
 
 Tensor min_kernel(const Tensor& self) {
