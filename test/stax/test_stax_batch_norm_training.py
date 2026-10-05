@@ -54,8 +54,9 @@ def test_training_batch_norm_matches_eager(device, shape, monkeypatch):
 @pytest.mark.parametrize("momentum", [0.1, None])
 def test_training_batch_norm_counts_its_batches(device, momentum):
     # The count of batches seen moves with every compiled training step --
-    # with no momentum the running statistics are averaged by it -- and a
-    # region calling a model it closes over updates that model once per call.
+    # with no momentum the running statistics are averaged by it, and one
+    # compiled region serves every count -- and a region calling a model it
+    # closes over updates that model once per call.
     tp.manual_seed(0)
     norm = nn.BatchNorm1d(4, momentum=momentum).to(device)
     ref = copy.deepcopy(norm)
@@ -71,6 +72,7 @@ def test_training_batch_norm_counts_its_batches(device, momentum):
         if momentum is not None:
             compiled[1](x).sum().backward()
             closing_ref(x).sum().backward()
+    assert len(compiled[0]._tensorplay_cache) == 1
     pairs = [(norm, ref)] + ([(closing, closing_ref)] if momentum is not None else [])
     for mine, theirs in pairs:
         assert mine.num_batches_tracked.item() == theirs.num_batches_tracked.item() == 3

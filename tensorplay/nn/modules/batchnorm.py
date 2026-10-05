@@ -173,6 +173,16 @@ class _BatchNorm(_NormBase):
             if self.num_batches_tracked is not None:  # type: ignore[has-type]
                 self.num_batches_tracked.add_(1)  # type: ignore[has-type]
                 if self.momentum is None:  # use cumulative moving average
+                    if tensorplay.compiler.is_compiling():
+                        return _cumulative_batch_norm(
+                            input,
+                            self.running_mean,
+                            self.running_var,
+                            self.weight,
+                            self.bias,
+                            self.num_batches_tracked,
+                            self.eps,
+                        )
                     exponential_average_factor = 1.0 / float(self.num_batches_tracked)
                 else:  # use exponential moving average
                     exponential_average_factor = self.momentum
@@ -759,6 +769,26 @@ class SyncBatchNorm(_BatchNorm):
         for name, child in module.named_children():
             module_output.add_module(name, cls.convert_sync_batchnorm(child, process_group))
         return module_output
+
+
+def _cumulative_batch_norm(input, running_mean, running_var, weight, bias, count, eps):
+    """Training batch norm whose running statistics average every batch seen.
+
+    Each batch weighs one over the batch count, a number that changes every
+    step.  Read out of the counter as a Python number it would be fixed into
+    the compiled region and force a new one on the next step, so it stays a
+    tensor here: a momentum of one leaves exactly the batch's own statistics
+    in scratch buffers, and those are folded into the running ones with that
+    weight.
+    """
+
+    batch_mean = tensorplay.zeros_like(running_mean)
+    batch_var = tensorplay.zeros_like(running_var)
+    output = F.batch_norm(input, batch_mean, batch_var, weight, bias, True, 1.0, eps)
+    share = (1.0 / count).to(running_mean.dtype)
+    running_mean.lerp_(batch_mean, share)
+    running_var.lerp_(batch_var, share)
+    return output
 
 
 def _sync_batch_norm(input, weight, bias, running_mean, running_var,
