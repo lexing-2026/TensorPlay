@@ -234,6 +234,9 @@
 - name: embedding(Tensor weight, Tensor indices, int padding_idx=-1, bool scale_grad_by_freq=false, bool sparse=false) -> Tensor
   weight: tensorplay::tpx::ops::embedding_dense_backward(grad, indices, weight.size(0), padding_idx, scale_grad_by_freq)
 
+- name: embedding_dense_backward(Tensor grad_output, Tensor indices, SymInt num_weights, SymInt padding_idx, bool scale_grad_by_freq) -> Tensor
+  grad_output: embedding_dense_double_backward(grad, indices, num_weights, padding_idx, scale_grad_by_freq)
+
 # (tools/autograd/derivatives.yaml): reshape falls back to a copy when the
 # incoming grad is not viewable, so non-contiguous grads never error here.
 - name: view(Tensor self, SymInt[] size) -> Tensor
@@ -357,6 +360,22 @@
 
 - name: diagonal(Tensor self, int offset=0, int dim1=0, int dim2=1) -> Tensor
   self: diagonal_backward(grad, self.shape(), offset, dim1, dim2)
+
+# Reshaping kernels: each is linear in grad_output, and its adjoint is the
+# forward view applied to the incoming gradient.
+- name: unfold_backward(Tensor grad_output, SymInt[] input_sizes, int dim, int size, int step) -> Tensor
+  grad_output: unfold(grad, dim, size, step)
+
+- name: diagonal_backward(Tensor grad_output, SymInt[] input_sizes, int offset, int dim1, int dim2) -> Tensor
+  grad_output: diagonal(grad, offset, dim1, dim2)
+
+- name: permute_backward(Tensor grad_output, Tensor self, int[] dims) -> Tensor
+  grad_output: permute(grad, dims)
+  self: zeros_like(self)
+
+- name: squeeze_backward(Tensor grad_output, Tensor self) -> Tensor
+  grad_output: squeeze(grad)
+  self: zeros_like(self)
 
 - name: sin(Tensor self) -> Tensor
   self: grad * self.cos().conj()
@@ -517,7 +536,7 @@
   input: adaptive_avg_pool3d_backward(grad, input)
 
 - name: adaptive_avg_pool2d(Tensor input, int[] output_size) -> Tensor
-  input: adaptive_avg_pool2d_backward(grad, input)
+  input: adaptive_avg_pool2d_backward_any(grad, input)
 
 # backward scatters onto the saved indices instead of recomputing the argmax.
 - name: adaptive_max_pool2d_with_indices(Tensor input, int[] output_size) -> (Tensor output, Tensor indices)
@@ -541,6 +560,58 @@
 
 - name: max_unpool3d(Tensor self, Tensor indices, int[] output_size, int[] stride, int[] padding) -> Tensor
   self: max_unpool3d_backward(grad, indices, output_size)
+
+# The backward kernels of the pooling family are linear in grad_output and read
+# the forward input only for its shape or through the argmax indices, so their
+# derivative in grad_output is the adjoint: the forward pool for averages, a
+# gather at the saved indices for maxima, a scatter-add for unpooling.
+- name: max_pool2d_with_indices_backward(Tensor grad_output, Tensor input, int[] kernel_size, int[] stride=[], int[] padding=[], int[] dilation=[], bool ceil_mode=false, Tensor? indices=None) -> Tensor
+  grad_output: max_pool_with_indices_double_backward(grad, input, kernel_size, stride, padding, dilation, ceil_mode, indices, 2)
+  input: zeros_like(input)
+
+- name: max_pool3d_with_indices_backward(Tensor grad_output, Tensor input, int[] kernel_size, int[] stride=[], int[] padding=[], int[] dilation=[], bool ceil_mode=false, Tensor? indices=None) -> Tensor
+  grad_output: max_pool_with_indices_double_backward(grad, input, kernel_size, stride, padding, dilation, ceil_mode, indices, 3)
+  input: zeros_like(input)
+
+- name: avg_pool2d_backward(Tensor grad_output, Tensor input, int[] kernel_size, int[] stride=[], int[] padding=[], bool ceil_mode=false, bool count_include_pad=true, int? divisor_override=None) -> Tensor
+  grad_output: avg_pool2d(grad, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override)
+  input: zeros_like(input)
+
+- name: avg_pool3d_backward(Tensor grad_output, Tensor input, int[] kernel_size, int[] stride=[], int[] padding=[], bool ceil_mode=false, bool count_include_pad=true, int? divisor_override=None) -> Tensor
+  grad_output: avg_pool3d(grad, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override)
+  input: zeros_like(input)
+
+- name: adaptive_avg_pool2d_backward(Tensor grad_output, Tensor input) -> Tensor
+  grad_output: adaptive_avg_pool2d(grad, trailing_extents(grad_output.shape(), 2))
+  input: zeros_like(input)
+
+- name: adaptive_avg_pool3d_backward(Tensor grad_output, Tensor input) -> Tensor
+  grad_output: adaptive_avg_pool3d(grad, trailing_extents(grad_output.shape(), 3))
+  input: zeros_like(input)
+
+- name: adaptive_max_pool2d_with_indices_backward(Tensor grad_output, Tensor input, int[] output_size, Tensor indices) -> Tensor
+  grad_output: max_pool_double_backward(grad, indices, 2)
+  input: zeros_like(input)
+
+# adaptive_max_pool3d keeps no indices; the helper recomputes the windows'
+# argmax from the input the way the kernel scans them.
+- name: adaptive_max_pool3d_backward(Tensor grad_output, Tensor input) -> Tensor
+  grad_output: adaptive_max_pool3d_double_backward(grad, input, grad_output.shape())
+  input: zeros_like(input)
+
+- name: fractional_max_pool2d_backward(Tensor grad_output, Tensor self, int[] kernel_size, int[] output_size, Tensor indices) -> Tensor
+  grad_output: max_pool_double_backward(grad, indices, 2)
+  self: zeros_like(self)
+
+- name: fractional_max_pool3d_backward(Tensor grad_output, Tensor self, int[] kernel_size, int[] output_size, Tensor indices) -> Tensor
+  grad_output: max_pool_double_backward(grad, indices, 3)
+  self: zeros_like(self)
+
+- name: max_unpool2d_backward(Tensor grad_output, Tensor indices, int[] output_size) -> Tensor
+  grad_output: max_pool_scatter(grad, indices, output_size, 2)
+
+- name: max_unpool3d_backward(Tensor grad_output, Tensor indices, int[] output_size) -> Tensor
+  grad_output: max_pool_scatter(grad, indices, output_size, 3)
 
 # corresponding *_backward with an output_mask selecting the needed result.
 # The masked-out slot is returned as zeros and never consumed.
@@ -603,6 +674,19 @@
   weight: _embedding_bag_dense_backward(grad, indices, offset2bag, bag_size, max_indices, weight.size(0), scale_grad_by_freq, mode, per_sample_weights, padding_idx)
   per_sample_weights: embedding_bag_psw_backward(grad, weight, indices, offsets, offset2bag, per_sample_weights, mode, padding_idx)
 
+# The bag backward adds bag rows into table rows; the transpose reads table
+# rows back into bags.  A per-sample weight's slope dots a bag row with a table
+# row.
+- name: _embedding_bag_dense_backward(Tensor grad_output, Tensor indices, Tensor offset2bag, Tensor bag_size, Tensor maximum_indices, SymInt num_weights, bool scale_grad_by_freq, int mode, Tensor? per_sample_weights=None, int padding_idx=-1) -> Tensor
+  grad_output: embedding_bag_dense_double_backward(grad, indices, offset2bag, bag_size, maximum_indices, num_weights, scale_grad_by_freq, mode, per_sample_weights, padding_idx)
+  per_sample_weights: embedding_bag_dense_double_backward_per_sample_weights(grad, grad_output, indices, offset2bag, num_weights, scale_grad_by_freq, mode, padding_idx)
+
+# The per-sample-weight gradient dots each bag row with its table row, so its
+# derivatives scatter the incoming per-position gradient the other way.
+- name: _embedding_bag_per_sample_weights_backward(Tensor grad_output, Tensor weight, Tensor indices, Tensor offsets, Tensor offset2bag, int mode, int padding_idx=-1) -> Tensor
+  grad_output: embedding_bag_psw_double_backward_grad_output(grad, weight, indices, offset2bag, grad_output.shape(), padding_idx)
+  weight: embedding_bag_psw_double_backward_weight(grad, grad_output, indices, offset2bag, weight.shape(), padding_idx)
+
 - name: conv2d(Tensor input, Tensor weight, Tensor? bias=None, int[] stride=[], int[] padding=[], int[] dilation=[], int groups=1) -> Tensor
   input: conv2d_grad_input(grad, input, weight, stride, padding, dilation, groups)
   weight: conv2d_grad_weight(grad, input, weight, stride, padding, dilation, groups)
@@ -639,6 +723,12 @@
 
 - name: col2im(Tensor self, int[] output_size, int[] kernel_size, int[] dilation, int[] padding, int[] stride) -> Tensor
   self: col2im_backward(grad, self.shape(), output_size, kernel_size, dilation, padding, stride)
+
+- name: im2col_backward(Tensor grad_output, int[] input_size, int[] kernel_size, int[] dilation, int[] padding, int[] stride) -> Tensor
+  grad_output: im2col(grad, kernel_size, dilation, padding, stride)
+
+- name: col2im_backward(Tensor grad_output, int[] input_size, int[] output_size, int[] kernel_size, int[] dilation, int[] padding, int[] stride) -> Tensor
+  grad_output: col2im(grad, output_size, kernel_size, dilation, padding, stride)
 
 # Vision ROI / deformable operators. nms and box_iou are intentionally
 # non-differentiable and therefore have no entries here.
@@ -687,6 +777,47 @@
 
 - name: circular_pad_nd(Tensor self, int[] pad) -> Tensor
   self: circular_pad_nd_backward(grad, self, pad)
+
+# Padding backward kernels are linear in grad_output and use self only for its
+# shape: the adjoint of cropping the padded gradient back is padding again.
+- name: reflection_pad_nd_backward(Tensor grad_output, Tensor self, int[] pad) -> Tensor
+  grad_output: reflection_pad_nd(grad, pad)
+  self: zeros_like(self)
+
+- name: replication_pad_nd_backward(Tensor grad_output, Tensor self, int[] pad) -> Tensor
+  grad_output: replication_pad_nd(grad, pad)
+  self: zeros_like(self)
+
+- name: circular_pad_nd_backward(Tensor grad_output, Tensor self, int[] pad) -> Tensor
+  grad_output: circular_pad_nd(grad, pad)
+  self: zeros_like(self)
+
+- name: constant_pad_nd_backward(Tensor grad_output, int[] pad) -> Tensor
+  grad_output: constant_pad_nd(grad, pad, Scalar(0))
+
+- name: reflection_pad1d_backward(Tensor grad_output, Tensor self, SymInt[2] padding) -> Tensor
+  grad_output: reflection_pad1d(grad, padding)
+  self: zeros_like(self)
+
+- name: replication_pad1d_backward(Tensor grad_output, Tensor self, SymInt[2] padding) -> Tensor
+  grad_output: replication_pad1d(grad, padding)
+  self: zeros_like(self)
+
+- name: reflection_pad2d_backward(Tensor grad_output, Tensor self, SymInt[4] padding) -> Tensor
+  grad_output: reflection_pad2d(grad, padding)
+  self: zeros_like(self)
+
+- name: replication_pad2d_backward(Tensor grad_output, Tensor self, SymInt[4] padding) -> Tensor
+  grad_output: replication_pad2d(grad, padding)
+  self: zeros_like(self)
+
+- name: reflection_pad3d_backward(Tensor grad_output, Tensor self, SymInt[6] padding) -> Tensor
+  grad_output: reflection_pad3d(grad, padding)
+  self: zeros_like(self)
+
+- name: replication_pad3d_backward(Tensor grad_output, Tensor self, SymInt[6] padding) -> Tensor
+  grad_output: replication_pad3d(grad, padding)
+  self: zeros_like(self)
 
 - name: sigmoid(Tensor self) -> Tensor
   self: sigmoid_backward(grad, result)
@@ -1021,6 +1152,45 @@
 
 - name: upsample_trilinear3d(Tensor self, int[] output_size, bool align_corners, float? scales_d=None, float? scales_h=None, float? scales_w=None) -> Tensor
   self: upsample_trilinear3d_backward(grad, output_size, self.shape(), align_corners, scales_d, scales_h, scales_w)
+
+# Upsampling backward kernels are linear in grad_output: the adjoint of the
+# backward (a sum over the output cells each input cell fed) is the forward
+# interpolation of the incoming gradient.
+- name: upsample_nearest1d_backward(Tensor grad_output, SymInt[1] output_size, SymInt[3] input_size, float? scales=None) -> Tensor
+  grad_output: upsample_nearest1d(grad, output_size, scales)
+
+- name: upsample_nearest2d_backward(Tensor grad_output, SymInt[2] output_size, SymInt[4] input_size, float? scales_h=None, float? scales_w=None) -> Tensor
+  grad_output: upsample_nearest2d(grad, output_size, scales_h, scales_w)
+
+- name: upsample_nearest3d_backward(Tensor grad_output, SymInt[3] output_size, SymInt[5] input_size, float? scales_d=None, float? scales_h=None, float? scales_w=None) -> Tensor
+  grad_output: upsample_nearest3d(grad, output_size, scales_d, scales_h, scales_w)
+
+- name: _upsample_nearest_exact1d_backward(Tensor grad_output, SymInt[1] output_size, SymInt[3] input_size, float? scales=None) -> Tensor
+  grad_output: _upsample_nearest_exact1d(grad, output_size, scales)
+
+- name: _upsample_nearest_exact2d_backward(Tensor grad_output, SymInt[2] output_size, SymInt[4] input_size, float? scales_h=None, float? scales_w=None) -> Tensor
+  grad_output: _upsample_nearest_exact2d(grad, output_size, scales_h, scales_w)
+
+- name: _upsample_nearest_exact3d_backward(Tensor grad_output, SymInt[3] output_size, SymInt[5] input_size, float? scales_d=None, float? scales_h=None, float? scales_w=None) -> Tensor
+  grad_output: _upsample_nearest_exact3d(grad, output_size, scales_d, scales_h, scales_w)
+
+- name: upsample_linear1d_backward(Tensor grad_output, SymInt[1] output_size, SymInt[3] input_size, bool align_corners, float? scales=None) -> Tensor
+  grad_output: upsample_linear1d(grad, output_size, align_corners, scales)
+
+- name: upsample_bilinear2d_backward(Tensor grad_output, SymInt[2] output_size, SymInt[4] input_size, bool align_corners, float? scales_h=None, float? scales_w=None) -> Tensor
+  grad_output: upsample_bilinear2d(grad, output_size, align_corners, scales_h, scales_w)
+
+- name: _upsample_bilinear2d_aa_backward(Tensor grad_output, SymInt[2] output_size, SymInt[4] input_size, bool align_corners, float? scales_h=None, float? scales_w=None) -> Tensor
+  grad_output: _upsample_bilinear2d_aa(grad, output_size, align_corners, scales_h, scales_w)
+
+- name: upsample_bicubic2d_backward(Tensor grad_output, SymInt[2] output_size, SymInt[4] input_size, bool align_corners, float? scales_h=None, float? scales_w=None) -> Tensor
+  grad_output: upsample_bicubic2d(grad, output_size, align_corners, scales_h, scales_w)
+
+- name: _upsample_bicubic2d_aa_backward(Tensor grad_output, SymInt[2] output_size, SymInt[4] input_size, bool align_corners, float? scales_h=None, float? scales_w=None) -> Tensor
+  grad_output: _upsample_bicubic2d_aa(grad, output_size, align_corners, scales_h, scales_w)
+
+- name: upsample_trilinear3d_backward(Tensor grad_output, SymInt[3] output_size, SymInt[5] input_size, bool align_corners, float? scales_d=None, float? scales_h=None, float? scales_w=None) -> Tensor
+  grad_output: upsample_trilinear3d(grad, output_size, align_corners, scales_d, scales_h, scales_w)
 
 - name: masked_fill(Tensor self, Tensor mask, Scalar value) -> Tensor
   self: masked_fill(grad, mask, 0)

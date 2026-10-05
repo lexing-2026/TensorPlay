@@ -44,7 +44,7 @@ inline int64_t pooling_output_shape(int64_t input, int64_t kernel,
     if (kernel <= 0) {
         TP_THROW(ValueError, "avg_pool3d: kernel_size must be greater than zero");
     }
-    if (pad > (kernel - 1) / 2) {
+    if (pad > kernel / 2) {
         TP_THROW(ValueError,
                  "avg_pool3d: pad should be at most half of the kernel size");
     }
@@ -110,7 +110,7 @@ Pool3dParams check_pool3d_args(const Tensor& input,
                      ": kernel_size and stride must be greater than zero");
         }
         if (padding_values[d] < 0 ||
-            padding_values[d] > (kernel[d] - 1) / 2) {
+            padding_values[d] > kernel[d] / 2) {
             TP_THROW(ValueError, std::string(op) +
                      ": padding must be non-negative and at most half the kernel");
         }

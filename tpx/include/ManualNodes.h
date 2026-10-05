@@ -1847,3 +1847,4 @@ struct StdMeanBackward : public Node {
 #include "SpecialBackward.h"
 #include "ActivationBackward.h"
 #include "LossBackward.h"
+#include "ShapeKernelBackward.h"
