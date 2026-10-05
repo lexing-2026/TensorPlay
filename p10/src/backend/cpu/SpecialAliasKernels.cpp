@@ -1,13 +1,12 @@
-// CPU-side registration for the special_* operator family.
+// The special_* operator family, registered once for every backend.
 //
 // Each special_<name> op shares its schema and numerics with the
-// de-prefixed <name> operator. Two wiring flavors:
-//   - direct reference: an existing CPU kernel with external linkage and
-//     an identical signature is registered under the special name;
-//   - adapter: a thin wrapper (namespace tensorplay::special_alias) that
-//     converts argument types where they differ, lifts Scalars to
-//     0-dim tensors, and routes through the dispatcher to the twin
-//     operator; out-variants rebind the out tensor to the result.
+// de-prefixed <name> operator.  The adapters (namespace
+// tensorplay::special_alias) convert argument types where they differ, lift
+// Scalars to 0-dim tensors, and call the twin operator through its public
+// entry point, which records the twin's derivative; out-variants rebind the
+// out tensor to the result.  The twin's own kernel serves each device, so
+// the family is a composite and no backend registers it directly.
 
 #include "Tensor.h"
 #include "Dispatcher.h"
@@ -16,32 +15,15 @@
 #include "Exception.h"
 #include "TypePromotion.h"
 
-#include "tensorplay/ops/TensorRedispatchGenerated.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
-#include <cmath>
+#include <algorithm>
+#include <functional>
 #include <optional>
 #include <vector>
 #include "OutWrite.h"
 
 namespace tensorplay {
-
-// Existing CPU kernels referenced directly below.
-namespace cpu {
-Tensor digamma_cpu(const Tensor& self);
-Tensor erf_kernel(const Tensor& self);
-Tensor erfc_kernel(const Tensor& self);
-Tensor erfinv_cpu(const Tensor& self);
-Tensor exp2_cpu(const Tensor& self);
-Tensor expm1_kernel(const Tensor& self);
-Tensor igamma_cpu(const Tensor& self, const Tensor& other);
-Tensor igammac_cpu(const Tensor& self, const Tensor& other);
-Tensor lgamma_kernel(const Tensor& self);
-Tensor i0_cpu(const Tensor& self);
-Tensor log1p_kernel(const Tensor& self);
-Tensor sinc_cpu(const Tensor& self);
-Tensor xlogy_cpu(const Tensor& self, const Tensor& other);
-}  // namespace cpu
 
 namespace special_alias {
 
@@ -59,7 +41,7 @@ std::optional<Scalar> eps_to_scalar(const std::optional<double>& eps) {
     return std::nullopt;
 }
 
-// Adapter prototypes (the CUDA registration unit declares these too).
+// Adapter prototypes.
 Tensor alias_entr(const Tensor& self);
 Tensor& alias_entr_out(const Tensor& self, Tensor& out);
 Tensor alias_ndtri(const Tensor& self);
@@ -233,7 +215,7 @@ Tensor& alias_spherical_bessel_j0_out(const Tensor& x, Tensor& out);
 
 // special_entr -> entr
 Tensor alias_entr(const Tensor& self) {
-    return detail::redispatch_entr_function(self);
+    return ops::entr(self);
 }
 
 Tensor& alias_entr_out(const Tensor& self, Tensor& out) {
@@ -243,7 +225,7 @@ Tensor& alias_entr_out(const Tensor& self, Tensor& out) {
 
 // special_ndtri -> ndtri
 Tensor alias_ndtri(const Tensor& self) {
-    return detail::redispatch_ndtri_function(self);
+    return ops::ndtri(self);
 }
 
 Tensor& alias_ndtri_out(const Tensor& self, Tensor& out) {
@@ -253,7 +235,7 @@ Tensor& alias_ndtri_out(const Tensor& self, Tensor& out) {
 
 // special_log_ndtr -> log_ndtr
 Tensor alias_log_ndtr(const Tensor& self) {
-    return detail::redispatch_log_ndtr_function(self);
+    return ops::log_ndtr(self);
 }
 
 Tensor& alias_log_ndtr_out(const Tensor& self, Tensor& out) {
@@ -263,7 +245,7 @@ Tensor& alias_log_ndtr_out(const Tensor& self, Tensor& out) {
 
 // special_expm1 -> expm1
 Tensor alias_expm1(const Tensor& self) {
-    return detail::redispatch_expm1_function(self);
+    return ops::expm1(self);
 }
 
 Tensor& alias_expm1_out(const Tensor& self, Tensor& out) {
@@ -273,7 +255,7 @@ Tensor& alias_expm1_out(const Tensor& self, Tensor& out) {
 
 // special_exp2 -> exp2
 Tensor alias_exp2(const Tensor& self) {
-    return detail::redispatch_exp2_function(self);
+    return ops::exp2(self);
 }
 
 Tensor& alias_exp2_out(const Tensor& self, Tensor& out) {
@@ -283,7 +265,7 @@ Tensor& alias_exp2_out(const Tensor& self, Tensor& out) {
 
 // special_psi -> digamma
 Tensor alias_psi(const Tensor& self) {
-    return detail::redispatch_digamma_function(self);
+    return ops::digamma(self);
 }
 
 Tensor& alias_psi_out(const Tensor& self, Tensor& out) {
@@ -293,7 +275,7 @@ Tensor& alias_psi_out(const Tensor& self, Tensor& out) {
 
 // special_digamma -> digamma
 Tensor alias_digamma(const Tensor& self) {
-    return detail::redispatch_digamma_function(self);
+    return ops::digamma(self);
 }
 
 Tensor& alias_digamma_out(const Tensor& self, Tensor& out) {
@@ -303,7 +285,7 @@ Tensor& alias_digamma_out(const Tensor& self, Tensor& out) {
 
 // special_gammaln -> lgamma
 Tensor alias_gammaln(const Tensor& self) {
-    return detail::redispatch_lgamma_function(self);
+    return ops::lgamma(self);
 }
 
 Tensor& alias_gammaln_out(const Tensor& self, Tensor& out) {
@@ -313,7 +295,7 @@ Tensor& alias_gammaln_out(const Tensor& self, Tensor& out) {
 
 // special_erf -> erf
 Tensor alias_erf(const Tensor& self) {
-    return detail::redispatch_erf_function(self);
+    return ops::erf(self);
 }
 
 Tensor& alias_erf_out(const Tensor& self, Tensor& out) {
@@ -323,7 +305,7 @@ Tensor& alias_erf_out(const Tensor& self, Tensor& out) {
 
 // special_erfc -> erfc
 Tensor alias_erfc(const Tensor& self) {
-    return detail::redispatch_erfc_function(self);
+    return ops::erfc(self);
 }
 
 Tensor& alias_erfc_out(const Tensor& self, Tensor& out) {
@@ -333,7 +315,7 @@ Tensor& alias_erfc_out(const Tensor& self, Tensor& out) {
 
 // special_erfcx -> erfcx
 Tensor alias_erfcx(const Tensor& self) {
-    return detail::redispatch_erfcx_function(self);
+    return ops::erfcx(self);
 }
 
 Tensor& alias_erfcx_out(const Tensor& self, Tensor& out) {
@@ -343,7 +325,7 @@ Tensor& alias_erfcx_out(const Tensor& self, Tensor& out) {
 
 // special_erfinv -> erfinv
 Tensor alias_erfinv(const Tensor& self) {
-    return detail::redispatch_erfinv_function(self);
+    return ops::erfinv(self);
 }
 
 Tensor& alias_erfinv_out(const Tensor& self, Tensor& out) {
@@ -353,7 +335,7 @@ Tensor& alias_erfinv_out(const Tensor& self, Tensor& out) {
 
 // special_ndtr -> ndtr
 Tensor alias_ndtr(const Tensor& self) {
-    return detail::redispatch_ndtr_function(self);
+    return ops::ndtr(self);
 }
 
 Tensor& alias_ndtr_out(const Tensor& self, Tensor& out) {
@@ -363,15 +345,15 @@ Tensor& alias_ndtr_out(const Tensor& self, Tensor& out) {
 
 // special_xlog1py -> xlog1py
 Tensor alias_xlog1py(const Tensor& self, const Tensor& other) {
-    return detail::redispatch_xlog1py_function(self, other);
+    return ops::xlog1py(self, other);
 }
 
 Tensor alias_xlog1py_self_scalar(const Scalar& self, const Tensor& other) {
-    return detail::redispatch_xlog1py_function(scalar_like(self, other), other);
+    return ops::xlog1py(scalar_like(self, other), other);
 }
 
 Tensor alias_xlog1py_other_scalar(const Tensor& self, const Scalar& other) {
-    return detail::redispatch_xlog1py_function(self, scalar_like(other, self));
+    return ops::xlog1py(self, scalar_like(other, self));
 }
 
 Tensor& alias_xlog1py_out(const Tensor& self, const Tensor& other, Tensor& out) {
@@ -391,15 +373,15 @@ Tensor& alias_xlog1py_other_scalar_out(const Tensor& self, const Scalar& other, 
 
 // special_xlogy -> xlogy
 Tensor alias_xlogy(const Tensor& self, const Tensor& other) {
-    return detail::redispatch_xlogy_function(self, other);
+    return ops::xlogy(self, other);
 }
 
 Tensor alias_xlogy_self_scalar(const Scalar& self, const Tensor& other) {
-    return detail::redispatch_xlogy_function(scalar_like(self, other), other);
+    return ops::xlogy(scalar_like(self, other), other);
 }
 
 Tensor alias_xlogy_other_scalar(const Tensor& self, const Scalar& other) {
-    return detail::redispatch_xlogy_function(self, scalar_like(other, self));
+    return ops::xlogy(self, scalar_like(other, self));
 }
 
 Tensor& alias_xlogy_out(const Tensor& self, const Tensor& other, Tensor& out) {
@@ -419,15 +401,15 @@ Tensor& alias_xlogy_other_scalar_out(const Tensor& self, const Scalar& other, Te
 
 // special_zeta -> zeta
 Tensor alias_zeta(const Tensor& self, const Tensor& other) {
-    return detail::redispatch_zeta_function(self, other);
+    return ops::zeta(self, other);
 }
 
 Tensor alias_zeta_self_scalar(const Scalar& self, const Tensor& other) {
-    return detail::redispatch_zeta_function(scalar_like(self, other), other);
+    return ops::zeta(scalar_like(self, other), other);
 }
 
 Tensor alias_zeta_other_scalar(const Tensor& self, const Scalar& other) {
-    return detail::redispatch_zeta_function(self, scalar_like(other, self));
+    return ops::zeta(self, scalar_like(other, self));
 }
 
 Tensor& alias_zeta_out(const Tensor& self, const Tensor& other, Tensor& out) {
@@ -447,7 +429,7 @@ Tensor& alias_zeta_other_scalar_out(const Tensor& self, const Scalar& other, Ten
 
 // special_i0 -> i0
 Tensor alias_i0(const Tensor& self) {
-    return detail::redispatch_i0_function(self);
+    return ops::i0(self);
 }
 
 Tensor& alias_i0_out(const Tensor& self, Tensor& out) {
@@ -457,7 +439,7 @@ Tensor& alias_i0_out(const Tensor& self, Tensor& out) {
 
 // special_i0e -> i0e
 Tensor alias_i0e(const Tensor& self) {
-    return detail::redispatch_i0e_function(self);
+    return ops::i0e(self);
 }
 
 Tensor& alias_i0e_out(const Tensor& self, Tensor& out) {
@@ -467,7 +449,7 @@ Tensor& alias_i0e_out(const Tensor& self, Tensor& out) {
 
 // special_i1 -> i1
 Tensor alias_i1(const Tensor& self) {
-    return detail::redispatch_i1_function(self);
+    return ops::i1(self);
 }
 
 Tensor& alias_i1_out(const Tensor& self, Tensor& out) {
@@ -477,7 +459,7 @@ Tensor& alias_i1_out(const Tensor& self, Tensor& out) {
 
 // special_i1e -> i1e
 Tensor alias_i1e(const Tensor& self) {
-    return detail::redispatch_i1e_function(self);
+    return ops::i1e(self);
 }
 
 Tensor& alias_i1e_out(const Tensor& self, Tensor& out) {
@@ -487,7 +469,7 @@ Tensor& alias_i1e_out(const Tensor& self, Tensor& out) {
 
 // special_logit -> logit
 Tensor alias_logit(const Tensor& self, std::optional<double> eps) {
-    return detail::redispatch_logit_function(self, eps_to_scalar(eps));
+    return ops::logit(self, eps_to_scalar(eps));
 }
 
 Tensor& alias_logit_out(const Tensor& self, std::optional<double> eps, Tensor& out) {
@@ -497,7 +479,7 @@ Tensor& alias_logit_out(const Tensor& self, std::optional<double> eps, Tensor& o
 
 // special_polygamma -> polygamma
 Tensor alias_polygamma(int64_t n, const Tensor& self) {
-    return detail::redispatch_polygamma_function(n, self);
+    return ops::polygamma(n, self);
 }
 
 Tensor& alias_polygamma_out(int64_t n, const Tensor& self, Tensor& out) {
@@ -505,12 +487,31 @@ Tensor& alias_polygamma_out(int64_t n, const Tensor& self, Tensor& out) {
     return out;
 }
 
-// special_logsumexp -> logsumexp
+// special_logsumexp -> logsumexp.  Several dimensions reduce one after
+// another, the highest first so the remaining indices stay valid when the
+// reduced dimensions are dropped; an empty list reduces every dimension.
 Tensor alias_logsumexp(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim) {
-    TP_CHECK(dim.size() == 1,
-             "special_logsumexp(): expected exactly one reduction dimension, got",
-             dim.size());
-    return detail::redispatch_logsumexp_function(self, dim[0], keepdim);
+    const int64_t rank = self.dim();
+    std::vector<int64_t> dims;
+    if (dim.empty()) {
+        for (int64_t d = 0; d < rank; ++d) dims.push_back(d);
+    } else {
+        for (int64_t d : dim) {
+            const int64_t bound = std::max<int64_t>(rank, 1);
+            TP_CHECK(d >= -bound && d < bound, "special_logsumexp(): dimension ", d,
+                     " out of range for a ", rank, "-D tensor");
+            const int64_t wrapped = d < 0 ? d + bound : d;
+            TP_CHECK(std::find(dims.begin(), dims.end(), wrapped) == dims.end(),
+                     "special_logsumexp(): dimension ", wrapped,
+                     " appears multiple times in the list of dims");
+            dims.push_back(wrapped);
+        }
+    }
+    if (dims.empty()) return ops::logsumexp(self, 0, keepdim);
+    std::sort(dims.begin(), dims.end(), std::greater<int64_t>());
+    Tensor result = self;
+    for (int64_t d : dims) result = ops::logsumexp(result, d, keepdim);
+    return result;
 }
 
 Tensor& alias_logsumexp_out(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim, Tensor& out) {
@@ -520,7 +521,7 @@ Tensor& alias_logsumexp_out(const Tensor& self, const std::vector<int64_t>& dim,
 
 // special_expit -> sigmoid
 Tensor alias_expit(const Tensor& self) {
-    return detail::redispatch_sigmoid_function(self);
+    return ops::sigmoid(self);
 }
 
 Tensor& alias_expit_out(const Tensor& self, Tensor& out) {
@@ -530,7 +531,7 @@ Tensor& alias_expit_out(const Tensor& self, Tensor& out) {
 
 // special_sinc -> sinc
 Tensor alias_sinc(const Tensor& self) {
-    return detail::redispatch_sinc_function(self);
+    return ops::sinc(self);
 }
 
 Tensor& alias_sinc_out(const Tensor& self, Tensor& out) {
@@ -538,24 +539,9 @@ Tensor& alias_sinc_out(const Tensor& self, Tensor& out) {
     return out;
 }
 
-// special_round -> round
+// special_round -> round.decimals
 Tensor alias_round(const Tensor& self, int64_t decimals) {
-    if (decimals == 0) {
-        return detail::redispatch_round_function(self);
-    }
-    TP_CHECK(isFloatingType(self.dtype()),
-             "special_round(): decimals != 0 is only supported for floating-point tensors");
-    const bool narrow = self.dtype() != DType::Float64;
-    const Tensor work = narrow ? self.to(DType::Float32) : self;
-    const bool inverse = decimals < 0;
-    const Scalar factor(
-        std::pow(10.0, static_cast<double>(inverse ? -decimals : decimals)));
-    const Tensor scaled =
-        inverse ? ops::div(work, factor) : ops::mul(work, factor);
-    const Tensor rounded = ops::round(scaled);
-    const Tensor result =
-        inverse ? ops::mul(rounded, factor) : ops::div(rounded, factor);
-    return narrow ? result.to(work.dtype()) : result;
+    return ops::round(self, decimals);
 }
 
 Tensor& alias_round_out(const Tensor& self, int64_t decimals, Tensor& out) {
@@ -565,7 +551,7 @@ Tensor& alias_round_out(const Tensor& self, int64_t decimals, Tensor& out) {
 
 // special_log1p -> log1p
 Tensor alias_log1p(const Tensor& self) {
-    return detail::redispatch_log1p_function(self);
+    return ops::log1p(self);
 }
 
 Tensor& alias_log1p_out(const Tensor& self, Tensor& out) {
@@ -575,7 +561,7 @@ Tensor& alias_log1p_out(const Tensor& self, Tensor& out) {
 
 // special_log_softmax -> log_softmax
 Tensor alias_log_softmax(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
-    return detail::redispatch_log_softmax_function(self, dim, dtype.value_or(DType::Undefined));
+    return ops::log_softmax(self, dim, dtype.value_or(DType::Undefined));
 }
 
 // special_gammainc -> gammainc
@@ -585,7 +571,7 @@ Tensor& alias_gammainc_out(const Tensor& self, const Tensor& other, Tensor& out)
 }
 
 Tensor alias_gammainc(const Tensor& self, const Tensor& other) {
-    return detail::redispatch_gammainc_function(self, other);
+    return ops::gammainc(self, other);
 }
 
 // special_gammaincc -> gammaincc
@@ -595,12 +581,12 @@ Tensor& alias_gammaincc_out(const Tensor& self, const Tensor& other, Tensor& out
 }
 
 Tensor alias_gammaincc(const Tensor& self, const Tensor& other) {
-    return detail::redispatch_gammaincc_function(self, other);
+    return ops::gammaincc(self, other);
 }
 
 // special_multigammaln -> mvlgamma
 Tensor alias_multigammaln(const Tensor& self, int64_t p) {
-    return detail::redispatch_mvlgamma_function(self, p);
+    return ops::mvlgamma(self, p);
 }
 
 Tensor& alias_multigammaln_out(const Tensor& self, int64_t p, Tensor& out) {
@@ -610,12 +596,12 @@ Tensor& alias_multigammaln_out(const Tensor& self, int64_t p, Tensor& out) {
 
 // special_softmax -> softmax
 Tensor alias_softmax(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
-    return detail::redispatch_softmax_function(self, dim, dtype.value_or(DType::Undefined));
+    return ops::softmax(self, dim, dtype.value_or(DType::Undefined));
 }
 
 // special_airy_ai -> airy_ai
 Tensor alias_airy_ai(const Tensor& x) {
-    return detail::redispatch_airy_ai_function(x);
+    return ops::airy_ai(x);
 }
 
 Tensor& alias_airy_ai_out(const Tensor& x, Tensor& out) {
@@ -625,7 +611,7 @@ Tensor& alias_airy_ai_out(const Tensor& x, Tensor& out) {
 
 // special_bessel_j0 -> bessel_j0
 Tensor alias_bessel_j0(const Tensor& self) {
-    return detail::redispatch_bessel_j0_function(self);
+    return ops::bessel_j0(self);
 }
 
 Tensor& alias_bessel_j0_out(const Tensor& self, Tensor& out) {
@@ -635,7 +621,7 @@ Tensor& alias_bessel_j0_out(const Tensor& self, Tensor& out) {
 
 // special_bessel_j1 -> bessel_j1
 Tensor alias_bessel_j1(const Tensor& self) {
-    return detail::redispatch_bessel_j1_function(self);
+    return ops::bessel_j1(self);
 }
 
 Tensor& alias_bessel_j1_out(const Tensor& self, Tensor& out) {
@@ -645,7 +631,7 @@ Tensor& alias_bessel_j1_out(const Tensor& self, Tensor& out) {
 
 // special_bessel_y0 -> bessel_y0
 Tensor alias_bessel_y0(const Tensor& self) {
-    return detail::redispatch_bessel_y0_function(self);
+    return ops::bessel_y0(self);
 }
 
 Tensor& alias_bessel_y0_out(const Tensor& self, Tensor& out) {
@@ -655,7 +641,7 @@ Tensor& alias_bessel_y0_out(const Tensor& self, Tensor& out) {
 
 // special_bessel_y1 -> bessel_y1
 Tensor alias_bessel_y1(const Tensor& self) {
-    return detail::redispatch_bessel_y1_function(self);
+    return ops::bessel_y1(self);
 }
 
 Tensor& alias_bessel_y1_out(const Tensor& self, Tensor& out) {
@@ -665,15 +651,15 @@ Tensor& alias_bessel_y1_out(const Tensor& self, Tensor& out) {
 
 // special_chebyshev_polynomial_t -> chebyshev_polynomial_t
 Tensor alias_chebyshev_polynomial_t(const Tensor& x, const Tensor& n) {
-    return detail::redispatch_chebyshev_polynomial_t_function(x, n);
+    return ops::chebyshev_polynomial_t(x, n);
 }
 
 Tensor alias_chebyshev_polynomial_t_x_scalar(const Scalar& x, const Tensor& n) {
-    return detail::redispatch_chebyshev_polynomial_t_function(scalar_like(x, n), n);
+    return ops::chebyshev_polynomial_t(scalar_like(x, n), n);
 }
 
 Tensor alias_chebyshev_polynomial_t_n_scalar(const Tensor& x, const Scalar& n) {
-    return detail::redispatch_chebyshev_polynomial_t_function(x, scalar_like(n, x));
+    return ops::chebyshev_polynomial_t(x, scalar_like(n, x));
 }
 
 Tensor& alias_chebyshev_polynomial_t_out(const Tensor& x, const Tensor& n, Tensor& out) {
@@ -693,15 +679,15 @@ Tensor& alias_chebyshev_polynomial_t_n_scalar_out(const Tensor& x, const Scalar&
 
 // special_chebyshev_polynomial_u -> chebyshev_polynomial_u
 Tensor alias_chebyshev_polynomial_u(const Tensor& x, const Tensor& n) {
-    return detail::redispatch_chebyshev_polynomial_u_function(x, n);
+    return ops::chebyshev_polynomial_u(x, n);
 }
 
 Tensor alias_chebyshev_polynomial_u_x_scalar(const Scalar& x, const Tensor& n) {
-    return detail::redispatch_chebyshev_polynomial_u_function(scalar_like(x, n), n);
+    return ops::chebyshev_polynomial_u(scalar_like(x, n), n);
 }
 
 Tensor alias_chebyshev_polynomial_u_n_scalar(const Tensor& x, const Scalar& n) {
-    return detail::redispatch_chebyshev_polynomial_u_function(x, scalar_like(n, x));
+    return ops::chebyshev_polynomial_u(x, scalar_like(n, x));
 }
 
 Tensor& alias_chebyshev_polynomial_u_out(const Tensor& x, const Tensor& n, Tensor& out) {
@@ -721,15 +707,15 @@ Tensor& alias_chebyshev_polynomial_u_n_scalar_out(const Tensor& x, const Scalar&
 
 // special_chebyshev_polynomial_v -> chebyshev_polynomial_v
 Tensor alias_chebyshev_polynomial_v(const Tensor& x, const Tensor& n) {
-    return detail::redispatch_chebyshev_polynomial_v_function(x, n);
+    return ops::chebyshev_polynomial_v(x, n);
 }
 
 Tensor alias_chebyshev_polynomial_v_x_scalar(const Scalar& x, const Tensor& n) {
-    return detail::redispatch_chebyshev_polynomial_v_function(scalar_like(x, n), n);
+    return ops::chebyshev_polynomial_v(scalar_like(x, n), n);
 }
 
 Tensor alias_chebyshev_polynomial_v_n_scalar(const Tensor& x, const Scalar& n) {
-    return detail::redispatch_chebyshev_polynomial_v_function(x, scalar_like(n, x));
+    return ops::chebyshev_polynomial_v(x, scalar_like(n, x));
 }
 
 Tensor& alias_chebyshev_polynomial_v_out(const Tensor& x, const Tensor& n, Tensor& out) {
@@ -749,15 +735,15 @@ Tensor& alias_chebyshev_polynomial_v_n_scalar_out(const Tensor& x, const Scalar&
 
 // special_chebyshev_polynomial_w -> chebyshev_polynomial_w
 Tensor alias_chebyshev_polynomial_w(const Tensor& x, const Tensor& n) {
-    return detail::redispatch_chebyshev_polynomial_w_function(x, n);
+    return ops::chebyshev_polynomial_w(x, n);
 }
 
 Tensor alias_chebyshev_polynomial_w_x_scalar(const Scalar& x, const Tensor& n) {
-    return detail::redispatch_chebyshev_polynomial_w_function(scalar_like(x, n), n);
+    return ops::chebyshev_polynomial_w(scalar_like(x, n), n);
 }
 
 Tensor alias_chebyshev_polynomial_w_n_scalar(const Tensor& x, const Scalar& n) {
-    return detail::redispatch_chebyshev_polynomial_w_function(x, scalar_like(n, x));
+    return ops::chebyshev_polynomial_w(x, scalar_like(n, x));
 }
 
 Tensor& alias_chebyshev_polynomial_w_out(const Tensor& x, const Tensor& n, Tensor& out) {
@@ -777,15 +763,15 @@ Tensor& alias_chebyshev_polynomial_w_n_scalar_out(const Tensor& x, const Scalar&
 
 // special_hermite_polynomial_h -> hermite_polynomial_h
 Tensor alias_hermite_polynomial_h(const Tensor& x, const Tensor& n) {
-    return detail::redispatch_hermite_polynomial_h_function(x, n);
+    return ops::hermite_polynomial_h(x, n);
 }
 
 Tensor alias_hermite_polynomial_h_x_scalar(const Scalar& x, const Tensor& n) {
-    return detail::redispatch_hermite_polynomial_h_function(scalar_like(x, n), n);
+    return ops::hermite_polynomial_h(scalar_like(x, n), n);
 }
 
 Tensor alias_hermite_polynomial_h_n_scalar(const Tensor& x, const Scalar& n) {
-    return detail::redispatch_hermite_polynomial_h_function(x, scalar_like(n, x));
+    return ops::hermite_polynomial_h(x, scalar_like(n, x));
 }
 
 Tensor& alias_hermite_polynomial_h_out(const Tensor& x, const Tensor& n, Tensor& out) {
@@ -805,15 +791,15 @@ Tensor& alias_hermite_polynomial_h_n_scalar_out(const Tensor& x, const Scalar& n
 
 // special_hermite_polynomial_he -> hermite_polynomial_he
 Tensor alias_hermite_polynomial_he(const Tensor& x, const Tensor& n) {
-    return detail::redispatch_hermite_polynomial_he_function(x, n);
+    return ops::hermite_polynomial_he(x, n);
 }
 
 Tensor alias_hermite_polynomial_he_x_scalar(const Scalar& x, const Tensor& n) {
-    return detail::redispatch_hermite_polynomial_he_function(scalar_like(x, n), n);
+    return ops::hermite_polynomial_he(scalar_like(x, n), n);
 }
 
 Tensor alias_hermite_polynomial_he_n_scalar(const Tensor& x, const Scalar& n) {
-    return detail::redispatch_hermite_polynomial_he_function(x, scalar_like(n, x));
+    return ops::hermite_polynomial_he(x, scalar_like(n, x));
 }
 
 Tensor& alias_hermite_polynomial_he_out(const Tensor& x, const Tensor& n, Tensor& out) {
@@ -833,15 +819,15 @@ Tensor& alias_hermite_polynomial_he_n_scalar_out(const Tensor& x, const Scalar& 
 
 // special_laguerre_polynomial_l -> laguerre_polynomial_l
 Tensor alias_laguerre_polynomial_l(const Tensor& x, const Tensor& n) {
-    return detail::redispatch_laguerre_polynomial_l_function(x, n);
+    return ops::laguerre_polynomial_l(x, n);
 }
 
 Tensor alias_laguerre_polynomial_l_x_scalar(const Scalar& x, const Tensor& n) {
-    return detail::redispatch_laguerre_polynomial_l_function(scalar_like(x, n), n);
+    return ops::laguerre_polynomial_l(scalar_like(x, n), n);
 }
 
 Tensor alias_laguerre_polynomial_l_n_scalar(const Tensor& x, const Scalar& n) {
-    return detail::redispatch_laguerre_polynomial_l_function(x, scalar_like(n, x));
+    return ops::laguerre_polynomial_l(x, scalar_like(n, x));
 }
 
 Tensor& alias_laguerre_polynomial_l_out(const Tensor& x, const Tensor& n, Tensor& out) {
@@ -861,15 +847,15 @@ Tensor& alias_laguerre_polynomial_l_n_scalar_out(const Tensor& x, const Scalar& 
 
 // special_legendre_polynomial_p -> legendre_polynomial_p
 Tensor alias_legendre_polynomial_p(const Tensor& x, const Tensor& n) {
-    return detail::redispatch_legendre_polynomial_p_function(x, n);
+    return ops::legendre_polynomial_p(x, n);
 }
 
 Tensor alias_legendre_polynomial_p_x_scalar(const Scalar& x, const Tensor& n) {
-    return detail::redispatch_legendre_polynomial_p_function(scalar_like(x, n), n);
+    return ops::legendre_polynomial_p(scalar_like(x, n), n);
 }
 
 Tensor alias_legendre_polynomial_p_n_scalar(const Tensor& x, const Scalar& n) {
-    return detail::redispatch_legendre_polynomial_p_function(x, scalar_like(n, x));
+    return ops::legendre_polynomial_p(x, scalar_like(n, x));
 }
 
 Tensor& alias_legendre_polynomial_p_out(const Tensor& x, const Tensor& n, Tensor& out) {
@@ -889,7 +875,7 @@ Tensor& alias_legendre_polynomial_p_n_scalar_out(const Tensor& x, const Scalar& 
 
 // special_modified_bessel_i0 -> modified_bessel_i0
 Tensor alias_modified_bessel_i0(const Tensor& self) {
-    return detail::redispatch_modified_bessel_i0_function(self);
+    return ops::modified_bessel_i0(self);
 }
 
 Tensor& alias_modified_bessel_i0_out(const Tensor& self, Tensor& out) {
@@ -899,7 +885,7 @@ Tensor& alias_modified_bessel_i0_out(const Tensor& self, Tensor& out) {
 
 // special_modified_bessel_i1 -> modified_bessel_i1
 Tensor alias_modified_bessel_i1(const Tensor& self) {
-    return detail::redispatch_modified_bessel_i1_function(self);
+    return ops::modified_bessel_i1(self);
 }
 
 Tensor& alias_modified_bessel_i1_out(const Tensor& self, Tensor& out) {
@@ -909,7 +895,7 @@ Tensor& alias_modified_bessel_i1_out(const Tensor& self, Tensor& out) {
 
 // special_modified_bessel_k0 -> modified_bessel_k0
 Tensor alias_modified_bessel_k0(const Tensor& self) {
-    return detail::redispatch_modified_bessel_k0_function(self);
+    return ops::modified_bessel_k0(self);
 }
 
 Tensor& alias_modified_bessel_k0_out(const Tensor& self, Tensor& out) {
@@ -919,7 +905,7 @@ Tensor& alias_modified_bessel_k0_out(const Tensor& self, Tensor& out) {
 
 // special_modified_bessel_k1 -> modified_bessel_k1
 Tensor alias_modified_bessel_k1(const Tensor& self) {
-    return detail::redispatch_modified_bessel_k1_function(self);
+    return ops::modified_bessel_k1(self);
 }
 
 Tensor& alias_modified_bessel_k1_out(const Tensor& self, Tensor& out) {
@@ -929,7 +915,7 @@ Tensor& alias_modified_bessel_k1_out(const Tensor& self, Tensor& out) {
 
 // special_scaled_modified_bessel_k0 -> scaled_modified_bessel_k0
 Tensor alias_scaled_modified_bessel_k0(const Tensor& x) {
-    return detail::redispatch_scaled_modified_bessel_k0_function(x);
+    return ops::scaled_modified_bessel_k0(x);
 }
 
 Tensor& alias_scaled_modified_bessel_k0_out(const Tensor& x, Tensor& out) {
@@ -939,7 +925,7 @@ Tensor& alias_scaled_modified_bessel_k0_out(const Tensor& x, Tensor& out) {
 
 // special_scaled_modified_bessel_k1 -> scaled_modified_bessel_k1
 Tensor alias_scaled_modified_bessel_k1(const Tensor& x) {
-    return detail::redispatch_scaled_modified_bessel_k1_function(x);
+    return ops::scaled_modified_bessel_k1(x);
 }
 
 Tensor& alias_scaled_modified_bessel_k1_out(const Tensor& x, Tensor& out) {
@@ -949,15 +935,15 @@ Tensor& alias_scaled_modified_bessel_k1_out(const Tensor& x, Tensor& out) {
 
 // special_shifted_chebyshev_polynomial_t -> shifted_chebyshev_polynomial_t
 Tensor alias_shifted_chebyshev_polynomial_t(const Tensor& x, const Tensor& n) {
-    return detail::redispatch_shifted_chebyshev_polynomial_t_function(x, n);
+    return ops::shifted_chebyshev_polynomial_t(x, n);
 }
 
 Tensor alias_shifted_chebyshev_polynomial_t_x_scalar(const Scalar& x, const Tensor& n) {
-    return detail::redispatch_shifted_chebyshev_polynomial_t_function(scalar_like(x, n), n);
+    return ops::shifted_chebyshev_polynomial_t(scalar_like(x, n), n);
 }
 
 Tensor alias_shifted_chebyshev_polynomial_t_n_scalar(const Tensor& x, const Scalar& n) {
-    return detail::redispatch_shifted_chebyshev_polynomial_t_function(x, scalar_like(n, x));
+    return ops::shifted_chebyshev_polynomial_t(x, scalar_like(n, x));
 }
 
 Tensor& alias_shifted_chebyshev_polynomial_t_out(const Tensor& x, const Tensor& n, Tensor& out) {
@@ -977,15 +963,15 @@ Tensor& alias_shifted_chebyshev_polynomial_t_n_scalar_out(const Tensor& x, const
 
 // special_shifted_chebyshev_polynomial_u -> shifted_chebyshev_polynomial_u
 Tensor alias_shifted_chebyshev_polynomial_u(const Tensor& x, const Tensor& n) {
-    return detail::redispatch_shifted_chebyshev_polynomial_u_function(x, n);
+    return ops::shifted_chebyshev_polynomial_u(x, n);
 }
 
 Tensor alias_shifted_chebyshev_polynomial_u_x_scalar(const Scalar& x, const Tensor& n) {
-    return detail::redispatch_shifted_chebyshev_polynomial_u_function(scalar_like(x, n), n);
+    return ops::shifted_chebyshev_polynomial_u(scalar_like(x, n), n);
 }
 
 Tensor alias_shifted_chebyshev_polynomial_u_n_scalar(const Tensor& x, const Scalar& n) {
-    return detail::redispatch_shifted_chebyshev_polynomial_u_function(x, scalar_like(n, x));
+    return ops::shifted_chebyshev_polynomial_u(x, scalar_like(n, x));
 }
 
 Tensor& alias_shifted_chebyshev_polynomial_u_out(const Tensor& x, const Tensor& n, Tensor& out) {
@@ -1005,15 +991,15 @@ Tensor& alias_shifted_chebyshev_polynomial_u_n_scalar_out(const Tensor& x, const
 
 // special_shifted_chebyshev_polynomial_v -> shifted_chebyshev_polynomial_v
 Tensor alias_shifted_chebyshev_polynomial_v(const Tensor& x, const Tensor& n) {
-    return detail::redispatch_shifted_chebyshev_polynomial_v_function(x, n);
+    return ops::shifted_chebyshev_polynomial_v(x, n);
 }
 
 Tensor alias_shifted_chebyshev_polynomial_v_x_scalar(const Scalar& x, const Tensor& n) {
-    return detail::redispatch_shifted_chebyshev_polynomial_v_function(scalar_like(x, n), n);
+    return ops::shifted_chebyshev_polynomial_v(scalar_like(x, n), n);
 }
 
 Tensor alias_shifted_chebyshev_polynomial_v_n_scalar(const Tensor& x, const Scalar& n) {
-    return detail::redispatch_shifted_chebyshev_polynomial_v_function(x, scalar_like(n, x));
+    return ops::shifted_chebyshev_polynomial_v(x, scalar_like(n, x));
 }
 
 Tensor& alias_shifted_chebyshev_polynomial_v_out(const Tensor& x, const Tensor& n, Tensor& out) {
@@ -1033,15 +1019,15 @@ Tensor& alias_shifted_chebyshev_polynomial_v_n_scalar_out(const Tensor& x, const
 
 // special_shifted_chebyshev_polynomial_w -> shifted_chebyshev_polynomial_w
 Tensor alias_shifted_chebyshev_polynomial_w(const Tensor& x, const Tensor& n) {
-    return detail::redispatch_shifted_chebyshev_polynomial_w_function(x, n);
+    return ops::shifted_chebyshev_polynomial_w(x, n);
 }
 
 Tensor alias_shifted_chebyshev_polynomial_w_x_scalar(const Scalar& x, const Tensor& n) {
-    return detail::redispatch_shifted_chebyshev_polynomial_w_function(scalar_like(x, n), n);
+    return ops::shifted_chebyshev_polynomial_w(scalar_like(x, n), n);
 }
 
 Tensor alias_shifted_chebyshev_polynomial_w_n_scalar(const Tensor& x, const Scalar& n) {
-    return detail::redispatch_shifted_chebyshev_polynomial_w_function(x, scalar_like(n, x));
+    return ops::shifted_chebyshev_polynomial_w(x, scalar_like(n, x));
 }
 
 Tensor& alias_shifted_chebyshev_polynomial_w_out(const Tensor& x, const Tensor& n, Tensor& out) {
@@ -1061,7 +1047,7 @@ Tensor& alias_shifted_chebyshev_polynomial_w_n_scalar_out(const Tensor& x, const
 
 // special_spherical_bessel_j0 -> spherical_bessel_j0
 Tensor alias_spherical_bessel_j0(const Tensor& x) {
-    return detail::redispatch_spherical_bessel_j0_function(x);
+    return ops::spherical_bessel_j0(x);
 }
 
 Tensor& alias_spherical_bessel_j0_out(const Tensor& x, Tensor& out) {
@@ -1071,7 +1057,7 @@ Tensor& alias_spherical_bessel_j0_out(const Tensor& x, Tensor& out) {
 
 }  // namespace special_alias
 
-TENSORPLAY_LIBRARY_IMPL(CPU, SpecialAliasOps) {
+TENSORPLAY_LIBRARY_IMPL(Composite, SpecialAliasOps) {
     using namespace special_alias;
 
     m.impl("special_entr", alias_entr);
@@ -1080,23 +1066,23 @@ TENSORPLAY_LIBRARY_IMPL(CPU, SpecialAliasOps) {
     m.impl("special_ndtri.out", alias_ndtri_out);
     m.impl("special_log_ndtr", alias_log_ndtr);
     m.impl("special_log_ndtr.out", alias_log_ndtr_out);
-    m.impl("special_expm1", cpu::expm1_kernel);  // direct: expm1_kernel
+    m.impl("special_expm1", alias_expm1);
     m.impl("special_expm1.out", alias_expm1_out);
-    m.impl("special_exp2", cpu::exp2_cpu);  // direct: exp2_cpu
+    m.impl("special_exp2", alias_exp2);
     m.impl("special_exp2.out", alias_exp2_out);
-    m.impl("special_psi", cpu::digamma_cpu);  // direct: digamma_cpu
+    m.impl("special_psi", alias_psi);
     m.impl("special_psi.out", alias_psi_out);
-    m.impl("special_digamma", cpu::digamma_cpu);  // direct: digamma_cpu
+    m.impl("special_digamma", alias_digamma);
     m.impl("special_digamma.out", alias_digamma_out);
-    m.impl("special_gammaln", cpu::lgamma_kernel);  // direct: lgamma_kernel
+    m.impl("special_gammaln", alias_gammaln);
     m.impl("special_gammaln.out", alias_gammaln_out);
-    m.impl("special_erf", cpu::erf_kernel);  // direct: erf_kernel
+    m.impl("special_erf", alias_erf);
     m.impl("special_erf.out", alias_erf_out);
-    m.impl("special_erfc", cpu::erfc_kernel);  // direct: erfc_kernel
+    m.impl("special_erfc", alias_erfc);
     m.impl("special_erfc.out", alias_erfc_out);
     m.impl("special_erfcx", alias_erfcx);
     m.impl("special_erfcx.out", alias_erfcx_out);
-    m.impl("special_erfinv", cpu::erfinv_cpu);  // direct: erfinv_cpu
+    m.impl("special_erfinv", alias_erfinv);
     m.impl("special_erfinv.out", alias_erfinv_out);
     m.impl("special_ndtr", alias_ndtr);
     m.impl("special_ndtr.out", alias_ndtr_out);
@@ -1106,7 +1092,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, SpecialAliasOps) {
     m.impl("special_xlog1py.out", alias_xlog1py_out);
     m.impl("special_xlog1py.self_scalar_out", alias_xlog1py_self_scalar_out);
     m.impl("special_xlog1py.other_scalar_out", alias_xlog1py_other_scalar_out);
-    m.impl("special_xlogy", cpu::xlogy_cpu);  // direct: xlogy_cpu
+    m.impl("special_xlogy", alias_xlogy);
     m.impl("special_xlogy.self_scalar", alias_xlogy_self_scalar);
     m.impl("special_xlogy.other_scalar", alias_xlogy_other_scalar);
     m.impl("special_xlogy.out", alias_xlogy_out);
@@ -1118,7 +1104,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, SpecialAliasOps) {
     m.impl("special_zeta.out", alias_zeta_out);
     m.impl("special_zeta.self_scalar_out", alias_zeta_self_scalar_out);
     m.impl("special_zeta.other_scalar_out", alias_zeta_other_scalar_out);
-    m.impl("special_i0", cpu::i0_cpu);  // direct: i0_cpu
+    m.impl("special_i0", alias_i0);
     m.impl("special_i0.out", alias_i0_out);
     m.impl("special_i0e", alias_i0e);
     m.impl("special_i0e.out", alias_i0e_out);
@@ -1134,17 +1120,17 @@ TENSORPLAY_LIBRARY_IMPL(CPU, SpecialAliasOps) {
     m.impl("special_logsumexp.out", alias_logsumexp_out);
     m.impl("special_expit", alias_expit);
     m.impl("special_expit.out", alias_expit_out);
-    m.impl("special_sinc", cpu::sinc_cpu);  // direct: sinc_cpu
+    m.impl("special_sinc", alias_sinc);
     m.impl("special_sinc.out", alias_sinc_out);
     m.impl("special_round", alias_round);
     m.impl("special_round.out", alias_round_out);
-    m.impl("special_log1p", cpu::log1p_kernel);  // direct: log1p_kernel
+    m.impl("special_log1p", alias_log1p);
     m.impl("special_log1p.out", alias_log1p_out);
     m.impl("special_log_softmax", alias_log_softmax);
     m.impl("special_gammainc.out", alias_gammainc_out);
-    m.impl("special_gammainc", cpu::igamma_cpu);  // direct: igamma_cpu
+    m.impl("special_gammainc", alias_gammainc);
     m.impl("special_gammaincc.out", alias_gammaincc_out);
-    m.impl("special_gammaincc", cpu::igammac_cpu);  // direct: igammac_cpu
+    m.impl("special_gammaincc", alias_gammaincc);
     m.impl("special_multigammaln", alias_multigammaln);
     m.impl("special_multigammaln.out", alias_multigammaln_out);
     m.impl("special_softmax", alias_softmax);

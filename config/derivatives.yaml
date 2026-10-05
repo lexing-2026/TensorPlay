@@ -1540,6 +1540,58 @@
 - name: modified_bessel_i0(Tensor self) -> Tensor
   self: grad * modified_bessel_i1(self)
 
+# The exponentially scaled e^-|x| I0(x) differentiates to e^-|x| I1(x) minus
+# sgn(x) times itself.  The first-order functions divide by x, whose 0/0 at the
+# origin the helpers replace by the finite limit.
+- name: i0e(Tensor self) -> Tensor
+  self: grad * (i1e(self) - sgn(self) * result)
+
+- name: i1(Tensor self) -> Tensor
+  self: i1_backward(grad, self, result)
+
+- name: i1e(Tensor self) -> Tensor
+  self: i1e_backward(grad, self, result)
+
+- name: modified_bessel_i1(Tensor self) -> Tensor
+  self: i1_backward(grad, self, result)
+
+# K0' = -K1 and K1' = -(K0 + K1 / x).
+- name: modified_bessel_k0(Tensor self) -> Tensor
+  self: grad * -modified_bessel_k1(self)
+
+- name: modified_bessel_k1(Tensor self) -> Tensor
+  self: grad * -(modified_bessel_k0(self) + result * reciprocal(self))
+
+# J0' = -J1 and Y0' = -Y1; the first-order functions follow J1' = J0 - J1 / x
+# and Y1' = Y0 - Y1 / x.
+- name: bessel_j0(Tensor self) -> Tensor
+  self: grad * -bessel_j1(self)
+
+- name: bessel_j1(Tensor self) -> Tensor
+  self: bessel_j1_backward(grad, self, result)
+
+- name: bessel_y0(Tensor self) -> Tensor
+  self: grad * -bessel_y1(self)
+
+- name: bessel_y1(Tensor self) -> Tensor
+  self: bessel_y1_backward(grad, self, result)
+
+# d/dq zeta(s, q) = -s zeta(s + 1, q); the order s has no closed-form
+# derivative.
+- name: zeta(Tensor self, Tensor other) -> Tensor
+  self: not_implemented_grad("zeta with respect to its first argument")
+  other: grad * -self * zeta(self + 1, other)
+
+# The regularized incomplete gamma functions differentiate in x to plus and
+# minus the gamma density x^(a-1) e^-x / Gamma(a).
+- name: gammainc(Tensor a, Tensor x) -> Tensor
+  a: not_implemented_grad("gammainc with respect to its first argument")
+  x: grad * exp((a - 1) * log(x) - x - lgamma(a))
+
+- name: gammaincc(Tensor a, Tensor x) -> Tensor
+  a: not_implemented_grad("gammaincc with respect to its first argument")
+  x: -grad * exp((a - 1) * log(x) - x - lgamma(a))
+
 # d/dx exp(x^2)erfc(x) = 2x*erfcx(x) - 2/sqrt(pi)
 - name: erfcx(Tensor self) -> Tensor
   self: (2.0 * self * result - 1.1283791670955126) * grad

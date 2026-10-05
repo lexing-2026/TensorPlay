@@ -1740,3 +1740,4 @@ struct StdMeanBackward : public Node {
 
 #include "RNNBackward.h"
 #include "LinalgBackward.h"
+#include "SpecialBackward.h"

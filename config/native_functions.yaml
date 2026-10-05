@@ -10531,8 +10531,7 @@
 - func: special_entr(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: entr_cpu
-    CUDA: entr_cuda
+    Composite: alias_entr
   tags: pointwise
 - func: special_entr.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -10540,8 +10539,7 @@
 - func: special_ndtri(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: ndtri_cpu
-    CUDA: ndtri_cuda
+    Composite: alias_ndtri
   tags: pointwise
 - func: special_ndtri.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -10549,8 +10547,7 @@
 - func: special_log_ndtr(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: log_ndtr_cpu
-    CUDA: log_ndtr_cuda
+    Composite: alias_log_ndtr
   tags: pointwise
 - func: special_log_ndtr.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -10558,14 +10555,13 @@
 - func: special_expm1(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: expm1_kernel
+    Composite: alias_expm1
 - func: special_expm1.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: special_exp2(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: exp2_cpu
-    CUDA: exp2_cuda
+    Composite: alias_exp2
 - func: special_exp2.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: special_psi(Tensor self) -> Tensor
@@ -10575,8 +10571,7 @@
 - func: special_digamma(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: digamma_cpu
-    CUDA: digamma_cuda
+    Composite: alias_digamma
 - func: special_digamma.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: special_gammaln(Tensor self) -> Tensor
@@ -10586,20 +10581,19 @@
 - func: special_erf(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: erf_kernel
+    Composite: alias_erf
 - func: special_erf.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: special_erfc(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: erfc_kernel
+    Composite: alias_erfc
 - func: special_erfc.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: special_erfcx(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: erfcx_cpu
-    CUDA: erfcx_cuda
+    Composite: alias_erfcx
   tags: pointwise
 - func: special_erfcx.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -10607,23 +10601,20 @@
 - func: special_erfinv(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: erfinv_cpu
-    CUDA: erfinv_cuda
+    Composite: alias_erfinv
 - func: special_erfinv.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: special_ndtr(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: ndtr_cpu
-    CUDA: ndtr_cuda
+    Composite: alias_ndtr
 - func: special_ndtr.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: special_xlog1py(Tensor self, Tensor other) -> Tensor
   device_check: NoCheck
   variants: function
   dispatch:
-    CPU: xlog1py_cpu
-    CUDA: xlog1py_cuda
+    Composite: alias_xlog1py
   tags: pointwise
 - func: special_xlog1py.self_scalar(Scalar self, Tensor other) -> Tensor
   device_check: NoCheck
@@ -10649,8 +10640,7 @@
   device_check: NoCheck
   variants: function
   dispatch:
-    CPU: xlogy_cpu
-    CUDA: xlogy_cuda
+    Composite: alias_xlogy
 - func: special_xlogy.self_scalar(Scalar self, Tensor other) -> Tensor
   device_check: NoCheck
   variants: function
@@ -10670,8 +10660,7 @@
   device_check: NoCheck
   variants: function
   dispatch:
-    CPU: zeta_cpu
-    CUDA: zeta_cuda
+    Composite: alias_zeta
   tags: pointwise
 - func: special_zeta.self_scalar(Scalar self, Tensor other) -> Tensor
   device_check: NoCheck
@@ -10696,15 +10685,13 @@
 - func: special_i0(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: i0_cpu
-    CUDA: i0_cuda
+    Composite: alias_i0
 - func: special_i0.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: special_i0e(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: i0e_cpu
-    CUDA: i0e_cuda
+    Composite: alias_i0e
   tags: pointwise
 - func: special_i0e.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -10712,8 +10699,7 @@
 - func: special_i1(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: i1_cpu
-    CUDA: i1_cuda
+    Composite: alias_i1
   tags: pointwise
 - func: special_i1.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -10721,8 +10707,7 @@
 - func: special_i1e(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: i1e_cpu
-    CUDA: i1e_cuda
+    Composite: alias_i1e
   tags: pointwise
 - func: special_i1e.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -10730,22 +10715,19 @@
 - func: special_logit(Tensor self, float? eps=None) -> Tensor
   variants: function
   dispatch:
-    CPU: logit_cpu
-    CUDA: logit_cuda
+    Composite: alias_logit
 - func: special_logit.out(Tensor self, float? eps=None, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: special_polygamma(int n, Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: polygamma_cpu
-    CUDA: polygamma_cuda
+    Composite: alias_polygamma
 - func: special_polygamma.out(int n, Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: special_logsumexp(Tensor self, int[1] dim, bool keepdim=False) -> Tensor
   variants: function
   dispatch:
-    CPU: logsumexp_cpu
-    CUDA: logsumexp_cuda2
+    Composite: alias_logsumexp
 - func: special_logsumexp.out(Tensor self, int[1] dim, bool keepdim=False, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: special_expit(Tensor self) -> Tensor
@@ -10755,40 +10737,37 @@
 - func: special_sinc(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: sinc_cpu
-    CUDA: sinc_cuda
+    Composite: alias_sinc
 - func: special_sinc.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: special_round(Tensor self, *, int decimals=0) -> Tensor
   variants: function
   dispatch:
-    CPU: round_kernel
+    Composite: alias_round
 - func: special_round.out(Tensor self, *, int decimals=0, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: special_log1p(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: log1p_kernel
+    Composite: alias_log1p
 - func: special_log1p.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: special_log_softmax(Tensor self, int dim, *, ScalarType? dtype=None) -> Tensor
   variants: function
   dispatch:
-    CPU: log_softmax_kernel
+    Composite: alias_log_softmax
 - func: special_gammainc.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: special_gammainc(Tensor self, Tensor other) -> Tensor
   variants: function
   dispatch:
-    CPU: gammainc_cpu
-    CUDA: gammainc_cuda
+    Composite: alias_gammainc
 - func: special_gammaincc.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: special_gammaincc(Tensor self, Tensor other) -> Tensor
   variants: function
   dispatch:
-    CPU: gammaincc_cpu
-    CUDA: gammaincc_cuda
+    Composite: alias_gammaincc
 - func: special_multigammaln(Tensor self, int p) -> Tensor
   variants: function
 - func: special_multigammaln.out(Tensor self, int p, *, Tensor(a!) out) -> Tensor(a!)
@@ -10796,7 +10775,7 @@
 - func: special_softmax(Tensor self, int dim, ScalarType? dtype=None) -> Tensor
   variants: function
   dispatch:
-    CPU: softmax_kernel
+    Composite: alias_softmax
 - func: fft_fft.out(Tensor self, SymInt? n=None, int dim=-1, str? norm=None, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: fft_ifft.out(Tensor self, SymInt? n=None, int dim=-1, str? norm=None, *, Tensor(a!) out) -> Tensor(a!)
@@ -11260,8 +11239,7 @@
 - func: special_airy_ai(Tensor x) -> Tensor
   variants: function
   dispatch:
-    CPU: airy_ai_cpu
-    CUDA: airy_ai_cuda
+    Composite: alias_airy_ai
   tags: pointwise
 - func: special_airy_ai.out(Tensor x, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -11269,8 +11247,7 @@
 - func: special_bessel_j0(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: bessel_j0_cpu
-    CUDA: bessel_j0_cuda
+    Composite: alias_bessel_j0
   tags: pointwise
 - func: special_bessel_j0.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -11278,8 +11255,7 @@
 - func: special_bessel_j1(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: bessel_j1_cpu
-    CUDA: bessel_j1_cuda
+    Composite: alias_bessel_j1
   tags: pointwise
 - func: special_bessel_j1.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -11287,8 +11263,7 @@
 - func: special_bessel_y0(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: bessel_y0_cpu
-    CUDA: bessel_y0_cuda
+    Composite: alias_bessel_y0
   tags: pointwise
 - func: special_bessel_y0.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -11296,8 +11271,7 @@
 - func: special_bessel_y1(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: bessel_y1_cpu
-    CUDA: bessel_y1_cuda
+    Composite: alias_bessel_y1
   tags: pointwise
 - func: special_bessel_y1.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -11306,8 +11280,7 @@
   device_check: NoCheck
   variants: function
   dispatch:
-    CPU: chebyshev_polynomial_t_cpu
-    CUDA: chebyshev_polynomial_t_cuda
+    Composite: alias_chebyshev_polynomial_t
   tags: pointwise
 - func: special_chebyshev_polynomial_t.x_scalar(Scalar x, Tensor n) -> Tensor
   device_check: NoCheck
@@ -11333,8 +11306,7 @@
   device_check: NoCheck
   variants: function
   dispatch:
-    CPU: chebyshev_polynomial_u_cpu
-    CUDA: chebyshev_polynomial_u_cuda
+    Composite: alias_chebyshev_polynomial_u
   tags: pointwise
 - func: special_chebyshev_polynomial_u.x_scalar(Scalar x, Tensor n) -> Tensor
   device_check: NoCheck
@@ -11360,8 +11332,7 @@
   device_check: NoCheck
   variants: function
   dispatch:
-    CPU: chebyshev_polynomial_v_cpu
-    CUDA: chebyshev_polynomial_v_cuda
+    Composite: alias_chebyshev_polynomial_v
   tags: pointwise
 - func: special_chebyshev_polynomial_v.x_scalar(Scalar x, Tensor n) -> Tensor
   device_check: NoCheck
@@ -11387,8 +11358,7 @@
   device_check: NoCheck
   variants: function
   dispatch:
-    CPU: chebyshev_polynomial_w_cpu
-    CUDA: chebyshev_polynomial_w_cuda
+    Composite: alias_chebyshev_polynomial_w
   tags: pointwise
 - func: special_chebyshev_polynomial_w.x_scalar(Scalar x, Tensor n) -> Tensor
   device_check: NoCheck
@@ -11414,8 +11384,7 @@
   device_check: NoCheck
   variants: function
   dispatch:
-    CPU: hermite_polynomial_h_cpu
-    CUDA: hermite_polynomial_h_cuda
+    Composite: alias_hermite_polynomial_h
   tags: pointwise
 - func: special_hermite_polynomial_h.x_scalar(Scalar x, Tensor n) -> Tensor
   device_check: NoCheck
@@ -11441,8 +11410,7 @@
   device_check: NoCheck
   variants: function
   dispatch:
-    CPU: hermite_polynomial_he_cpu
-    CUDA: hermite_polynomial_he_cuda
+    Composite: alias_hermite_polynomial_he
   tags: pointwise
 - func: special_hermite_polynomial_he.x_scalar(Scalar x, Tensor n) -> Tensor
   device_check: NoCheck
@@ -11468,8 +11436,7 @@
   device_check: NoCheck
   variants: function
   dispatch:
-    CPU: laguerre_polynomial_l_cpu
-    CUDA: laguerre_polynomial_l_cuda
+    Composite: alias_laguerre_polynomial_l
   tags: pointwise
 - func: special_laguerre_polynomial_l.x_scalar(Scalar x, Tensor n) -> Tensor
   device_check: NoCheck
@@ -11495,8 +11462,7 @@
   device_check: NoCheck
   variants: function
   dispatch:
-    CPU: legendre_polynomial_p_cpu
-    CUDA: legendre_polynomial_p_cuda
+    Composite: alias_legendre_polynomial_p
   tags: pointwise
 - func: special_legendre_polynomial_p.x_scalar(Scalar x, Tensor n) -> Tensor
   device_check: NoCheck
@@ -11521,8 +11487,7 @@
 - func: special_modified_bessel_i0(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: modified_bessel_i0_cpu
-    CUDA: modified_bessel_i0_cuda
+    Composite: alias_modified_bessel_i0
   tags: pointwise
 - func: special_modified_bessel_i0.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -11530,8 +11495,7 @@
 - func: special_modified_bessel_i1(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: modified_bessel_i1_cpu
-    CUDA: modified_bessel_i1_cuda
+    Composite: alias_modified_bessel_i1
   tags: pointwise
 - func: special_modified_bessel_i1.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -11539,8 +11503,7 @@
 - func: special_modified_bessel_k0(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: modified_bessel_k0_cpu
-    CUDA: modified_bessel_k0_cuda
+    Composite: alias_modified_bessel_k0
   tags: pointwise
 - func: special_modified_bessel_k0.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -11548,8 +11511,7 @@
 - func: special_modified_bessel_k1(Tensor self) -> Tensor
   variants: function
   dispatch:
-    CPU: modified_bessel_k1_cpu
-    CUDA: modified_bessel_k1_cuda
+    Composite: alias_modified_bessel_k1
   tags: pointwise
 - func: special_modified_bessel_k1.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -11557,8 +11519,7 @@
 - func: special_scaled_modified_bessel_k0(Tensor x) -> Tensor
   variants: function
   dispatch:
-    CPU: scaled_modified_bessel_k0_cpu
-    CUDA: scaled_modified_bessel_k0_cuda
+    Composite: alias_scaled_modified_bessel_k0
   tags: pointwise
 - func: special_scaled_modified_bessel_k0.out(Tensor x, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -11566,8 +11527,7 @@
 - func: special_scaled_modified_bessel_k1(Tensor x) -> Tensor
   variants: function
   dispatch:
-    CPU: scaled_modified_bessel_k1_cpu
-    CUDA: scaled_modified_bessel_k1_cuda
+    Composite: alias_scaled_modified_bessel_k1
   tags: pointwise
 - func: special_scaled_modified_bessel_k1.out(Tensor x, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -11576,8 +11536,7 @@
   device_check: NoCheck
   variants: function
   dispatch:
-    CPU: shifted_chebyshev_polynomial_t_cpu
-    CUDA: shifted_chebyshev_polynomial_t_cuda
+    Composite: alias_shifted_chebyshev_polynomial_t
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_t.x_scalar(Scalar x, Tensor n) -> Tensor
   device_check: NoCheck
@@ -11603,8 +11562,7 @@
   device_check: NoCheck
   variants: function
   dispatch:
-    CPU: shifted_chebyshev_polynomial_u_cpu
-    CUDA: shifted_chebyshev_polynomial_u_cuda
+    Composite: alias_shifted_chebyshev_polynomial_u
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_u.x_scalar(Scalar x, Tensor n) -> Tensor
   device_check: NoCheck
@@ -11630,8 +11588,7 @@
   device_check: NoCheck
   variants: function
   dispatch:
-    CPU: shifted_chebyshev_polynomial_v_cpu
-    CUDA: shifted_chebyshev_polynomial_v_cuda
+    Composite: alias_shifted_chebyshev_polynomial_v
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_v.x_scalar(Scalar x, Tensor n) -> Tensor
   device_check: NoCheck
@@ -11657,8 +11614,7 @@
   device_check: NoCheck
   variants: function
   dispatch:
-    CPU: shifted_chebyshev_polynomial_w_cpu
-    CUDA: shifted_chebyshev_polynomial_w_cuda
+    Composite: alias_shifted_chebyshev_polynomial_w
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_w.x_scalar(Scalar x, Tensor n) -> Tensor
   device_check: NoCheck
@@ -11683,8 +11639,7 @@
 - func: special_spherical_bessel_j0(Tensor x) -> Tensor
   variants: function
   dispatch:
-    CPU: spherical_bessel_j0_cpu
-    CUDA: spherical_bessel_j0_cuda
+    Composite: alias_spherical_bessel_j0
   tags: pointwise
 - func: special_spherical_bessel_j0.out(Tensor x, *, Tensor(a!) out) -> Tensor(a!)
   variants: function

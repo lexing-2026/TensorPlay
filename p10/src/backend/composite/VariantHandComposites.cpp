@@ -10,6 +10,7 @@
 #include "Quantizer.h"
 #include "Scalar.h"
 #include "TypePromotion.h"
+#include "DTypeNames.h"
 #include "CompositeCommon.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include "Autograd.h"
@@ -347,10 +348,23 @@ std::tuple<Tensor, Tensor> aminmax_out_native(const Tensor& self,
     return {min, max};
 }
 
+// x rounded to a multiple of 10^-decimals.  Only the exact power of ten is
+// ever applied: a non-negative count scales up, rounds and divides back down,
+// a negative count divides first and scales back up.  Half and bfloat16
+// inputs round in float32.
 Tensor round_decimals_native(const Tensor& self, int64_t decimals) {
-    Tensor scaled = self * Scalar(std::pow(10.0, static_cast<double>(decimals)));
-    Tensor r = ops::round(scaled);
-    return r * Scalar(std::pow(10.0, static_cast<double>(-decimals)));
+    if (decimals == 0) return ops::round(self);
+    TP_CHECK(isFloatingType(self.dtype()),
+             "round(): decimals != 0 is only supported for floating-point tensors, got ",
+             scalarTypeName(self.dtype()));
+    const DType dtype = self.dtype();
+    const bool widen = dtype == DType::Float16 || dtype == DType::BFloat16;
+    const Tensor work = widen ? ops::to(self, DType::Float32) : self;
+    const Scalar ten_pow(std::pow(10.0, static_cast<double>(decimals < 0 ? -decimals : decimals)));
+    const Tensor rounded = decimals < 0
+        ? ops::mul(ops::round(ops::div(work, ten_pow)), ten_pow)
+        : ops::div(ops::round(ops::mul(work, ten_pow)), ten_pow);
+    return widen ? ops::to(rounded, dtype) : rounded;
 }
 
 Tensor& round__decimals_native(Tensor& self, int64_t decimals) {
