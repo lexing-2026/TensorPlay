@@ -21,12 +21,34 @@ inline int64_t wrap_scan_dim(int64_t dim, int64_t ndim) {
 // The direction is a template parameter rather than a kernel argument: the
 // comparison sits in the innermost loop of the shared-memory scan, where a
 // runtime flag costs a select per step.
+//
+// Two merge disciplines share the NaN rules:
+//  - A NaN in the incoming state wins immediately and the scan never moves
+//    off it (later ordinary values keep the first NaN's index).
+//  - A NaN already held blocks any update.
+// They differ on ties.  The pairwise merge leaves the later segment holding
+// its own index, which resolves equal values to the last occurrence once the
+// scan folds left-to-right.  The running update compares the accumulator
+// against a fresh element and must move the index to that element explicitly.
+
 template <typename T, bool kIsMax>
-__device__ inline void cum_extremum_update(const T lhs, T& rhs,
-                                           int64_t lhs_idx, int64_t& rhs_idx) {
+__device__ inline void cum_extremum_merge(const T lhs, T& rhs,
+                                          int64_t lhs_idx, int64_t& rhs_idx) {
     const bool lhs_nan = reduce_value_is_nan(lhs);
     const bool rhs_nan = reduce_value_is_nan(rhs);
     if (!rhs_nan && (lhs_nan || (kIsMax ? lhs > rhs : lhs < rhs))) {
+        rhs = lhs;
+        rhs_idx = lhs_idx;
+    }
+}
+
+template <typename T, bool kIsMax>
+__device__ inline void cum_extremum_running_update(const T lhs, T& rhs,
+                                                   int64_t lhs_idx,
+                                                   int64_t& rhs_idx) {
+    const bool lhs_nan = reduce_value_is_nan(lhs);
+    const bool rhs_nan = reduce_value_is_nan(rhs);
+    if (lhs_nan || (!rhs_nan && (kIsMax ? lhs >= rhs : lhs <= rhs))) {
         rhs = lhs;
         rhs_idx = lhs_idx;
     }
@@ -49,13 +71,7 @@ __global__ void cummaxmin_scan_kernel(int64_t n_slices, int64_t d_size, int64_t 
         ip[0] = 0;
         for (int64_t j = 1; j < d_size; ++j) {
             const T current = s2p[j * inner];
-            double cur = static_cast<double>(current);
-            double b = static_cast<double>(best);
-            if (cur != cur || (b == b &&
-                (kIsMax ? cur >= b : cur <= b))) {
-                best = current;
-                bi = j;
-            }
+            cum_extremum_running_update<T, kIsMax>(current, best, j, bi);
             vp[j * inner] = best;
             ip[j * inner] = bi;
         }
@@ -103,8 +119,8 @@ __global__ void cummaxmin_innermost_scan_kernel(
             row_indices[threadIdx.x] = col1 < row_size ? col1 : 0;
             row_indices[blockDim.x + threadIdx.x] = col2 < row_size ? col2 : 0;
             if (row_exists && threadIdx.x == 0) {
-                cum_extremum_update<T, kIsMax>(block_total, row_values[0],
-                                               block_index, row_indices[0]);
+                cum_extremum_merge<T, kIsMax>(block_total, row_values[0],
+                                              block_index, row_indices[0]);
             }
             __syncthreads();
 
@@ -112,8 +128,8 @@ __global__ void cummaxmin_innermost_scan_kernel(
                 const int base = (threadIdx.x / stride) * (2 * stride) + stride;
                 const int target = base + (threadIdx.x % stride);
                 const int source = base - 1;
-                cum_extremum_update<T, kIsMax>(row_values[source], row_values[target],
-                                               row_indices[source], row_indices[target]);
+                cum_extremum_merge<T, kIsMax>(row_values[source], row_values[target],
+                                              row_indices[source], row_indices[target]);
                 __syncthreads();
             }
 
