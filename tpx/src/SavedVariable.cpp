@@ -1,6 +1,8 @@
 #include "SavedVariable.h"
 
+#include "Autograd.h"
 #include "Exception.h"
+#include "GradMode.h"
 
 #include <utility>
 #include <vector>
@@ -28,7 +30,7 @@ void pop_saved_variable_hooks() {
     g_hooks.pop_back();
 }
 
-void SavedVariable::save(const Tensor& tensor) {
+void SavedVariable::save(const Tensor& tensor, bool is_output) {
     if (!tensor.defined()) {
         data_ = Tensor();
         packed_.reset();
@@ -37,14 +39,27 @@ void SavedVariable::save(const Tensor& tensor) {
         return;
     }
     hooks_ = current_saved_variable_hooks();
-    data_ = tensor;
+    data_ = is_output ? tensor.detach() : tensor;
     saved_version_ = tensor.unsafeGetTensorImpl()->version();
     if (hooks_) {
-        packed_ = hooks_->pack(tensor);
+        packed_ = hooks_->pack(data_);
         data_ = Tensor();
     } else {
         packed_.reset();
     }
+}
+
+Tensor SavedVariable::unpack_output(const std::shared_ptr<Node>& owner,
+                                    uint32_t output_nr) const {
+    Tensor value = unpack();
+    if (!value.defined() || !owner || !GradMode::is_enabled() ||
+        !isFloatingOrComplexType(value.dtype())) {
+        return value;
+    }
+    Tensor attached = value.detach();
+    impl::set_requires_grad(attached, true);
+    impl::set_grad_fn(attached, owner, output_nr);
+    return attached;
 }
 
 Tensor SavedVariable::unpack() const {

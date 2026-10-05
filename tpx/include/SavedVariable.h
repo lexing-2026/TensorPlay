@@ -9,6 +9,8 @@
 namespace tensorplay {
 namespace tpx {
 
+class Node;
+
 class TENSORPLAY_API SavedVariableHooks {
 public:
     virtual ~SavedVariableHooks() = default;
@@ -33,7 +35,19 @@ public:
     // store them directly (`self_(self)`).
     SavedVariable(const Tensor& tensor) { save(tensor); }
 
-    void save(const Tensor& tensor);
+    // A node's own output is kept as a detached alias: the same data and
+    // version counter, without the autograd metadata whose grad_fn is that
+    // very node.  Holding the output itself would keep it, the node and the
+    // graph behind it alive in a cycle once the caller drops the output
+    // without running backward.
+    SavedVariable(const Tensor& tensor, bool is_output) { save(tensor, is_output); }
+
+    void save(const Tensor& tensor, bool is_output = false);
+
+    // A saved output for the node that produced it.  A recorded backward
+    // (create_graph) hands out an alias attached to `owner` at `output_nr`,
+    // so a second derivative also flows through the output.
+    Tensor unpack_output(const std::shared_ptr<Node>& owner, uint32_t output_nr) const;
 
     // Returns the saved tensor, or an undefined Tensor if nothing was saved.
     // Throws RuntimeError when the saved tensor was modified in-place after

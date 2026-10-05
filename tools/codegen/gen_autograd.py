@@ -342,7 +342,8 @@ class Emitter:
 
     def __init__(self, tensor_syms: set[str], member_names: set[str],
                  tensor_member_names: set[str] = frozenset(),
-                 native_op_names: set[str] = frozenset()):
+                 native_op_names: set[str] = frozenset(),
+                 attribute_members: dict[str, tuple[str, str]] | None = None):
         self.tensor_syms = set(tensor_syms) | _GRAD_SYMBOLS
         self.members = set(member_names)
         # Saved forward tensors become SavedVariable members and are unpacked
@@ -350,6 +351,10 @@ class Emitter:
         # those locals so every use goes through the version check.
         self.tensor_members = set(tensor_member_names)
         self.native_op_names = set(native_op_names)
+        # `arg.attr()` of a tensor saved only by its attributes reads the
+        # member holding that attribute.
+        self.attributes = {key: member
+                           for member, key in (attribute_members or {}).items()}
 
     def op_name(self, name: str) -> str:
         if "::" not in name and name in self.native_op_names:
@@ -420,6 +425,9 @@ class Emitter:
                 return f"Scalar({args})" if args else "Scalar()"
             return f"{self.op_name(e.callee)}({args})"
         if isinstance(e, Method):
+            if (isinstance(e.receiver, Var) and not e.args
+                    and (e.receiver.name, e.name) in self.attributes):
+                return f"{self.attributes[(e.receiver.name, e.name)]}_"
             recv = self.emit(e.receiver)
             base = e.name[:-1] if e.name.endswith("_") and e.name[:-1] in TENSOR_METHODS else e.name
             args = ", ".join(self.emit(a) for a in e.args)
@@ -451,9 +459,10 @@ class Emitter:
 
 def render_formula(expr: Expr, tensor_syms: set[str], member_names: set[str],
                    tensor_member_names: set[str] = frozenset(),
-                   native_op_names: set[str] = frozenset()) -> str:
+                   native_op_names: set[str] = frozenset(),
+                   attribute_members: dict[str, tuple[str, str]] | None = None) -> str:
     return Emitter(tensor_syms, member_names, tensor_member_names,
-                   native_op_names).emit(expr)
+                   native_op_names, attribute_members).emit(expr)
 
 
 def _iter_call_nodes(expr: Expr):
@@ -520,6 +529,12 @@ class OpDerivatives:
     members: list[tuple[str, str]]      # saved state: (member name, C++ type)
     used_input_names: set[str] = field(default_factory=set)
     used_output_names: set[str] = field(default_factory=set)
+    # Members holding one attribute of a forward tensor the formulas read
+    # nothing else of: member name -> (argument, attribute method).
+    attribute_members: dict[str, tuple[str, str]] = field(default_factory=dict)
+    # Saved tensors only some gradient slots read: member name -> the slot
+    # arguments whose wanting a gradient is the reason to keep it.
+    conditional_members: dict[str, list[str]] = field(default_factory=dict)
     # All forward outputs are marked non-differentiable: the autograd wrapper
     # still registers (so the dispatch chain resolves) but builds no backward
     # node and leaves the outputs detached.
@@ -653,11 +668,68 @@ MANUAL_DERIVATIVES: dict[str, dict] = {
     "triangular_solve": {"saved": ["self", "A", "upper", "transpose",
                                    "unitriangular"],
                          "saved_outputs": ["solution"]},
+    # The node keeps the input's geometry, not the input.
+    "as_strided": {"saved": ["self", "size", "stride", "storage_offset"],
+                   "node": "AsStridedBackward"},
 }
 
 # Ops whose backward node is provided hand-written elsewhere; skip emitting a
 # generated class even though derivatives exist.
 EXTERNAL_NODES: set[str] = set()
+
+
+# Tensor attributes a node can hold in place of the tensor, with the member
+# type each is stored as.
+ATTRIBUTE_METHODS: dict[str, str] = {
+    "shape": "std::vector<int64_t>",
+    "sizes": "std::vector<int64_t>",
+    "dtype": "DType",
+    "scalar_type": "DType",
+    "numel": "int64_t",
+    "dim": "int64_t",
+    "device": "Device",
+}
+
+
+def tensor_uses(expr: Expr, name: str) -> tuple[set[str], bool]:
+    """The attributes of `name` a formula reads, and whether it reads the
+    tensor's values anywhere else."""
+    found: set[str] = set()
+    value_use = False
+
+    def walk(e: Expr) -> None:
+        nonlocal value_use
+        if (isinstance(e, Method) and isinstance(e.receiver, Var)
+                and e.receiver.name == name and not e.args
+                and e.name in ATTRIBUTE_METHODS):
+            found.add(e.name)
+            return
+        if isinstance(e, Var):
+            if e.name == name:
+                value_use = True
+            return
+        if isinstance(e, (Neg, Paren, Not)):
+            walk(e.value)
+        elif isinstance(e, Ternary):
+            walk(e.cond)
+            walk(e.then)
+            walk(e.other)
+        elif isinstance(e, Call):
+            for a in e.args:
+                walk(a)
+        elif isinstance(e, Braced):
+            for a in e.items:
+                walk(a)
+        elif isinstance(e, Method):
+            walk(e.receiver)
+            for a in e.args:
+                walk(a)
+        elif isinstance(e, BinOp):
+            walk(e.left)
+            walk(e.right)
+
+    walk(expr)
+    return found, value_use
 
 
 def saved_output_member_type(cpp_type: str) -> str:
@@ -704,10 +776,36 @@ def compute_op_derivatives(func: NativeFunction, raw_formulas: dict[str, str],
         collect_vars(e, used)
     used &= arg_names | output_names
 
+    # What a formula measures of a forward tensor (its shape, type, element
+    # count, ...) is held as that attribute; the tensor itself is kept only
+    # for the slots that read its values, so a tensor that is only measured
+    # may be freed or updated in place before the backward pass.
     members: list[tuple[str, str]] = []
+    attribute_members: dict[str, tuple[str, str]] = {}
+    value_readers: dict[str, list[str]] = {}
     for a in func.args:
-        if a.name in used:
+        if a.name not in used:
+            continue
+        t = a.type
+        # The in-place self qualifies too: an in-place op keeps its shape and
+        # type, and its node shares the out-of-place spelling's layout.
+        if not (t.is_tensor_like and not t.is_list and not t.is_opt):
             members.append((a.name, node_member_type(a.type)))
+            continue
+        attributes: set[str] = set()
+        readers: list[str] = []
+        for slot, e in parsed.items():
+            found, reads_value = tensor_uses(e, a.name)
+            attributes |= found
+            if reads_value:
+                readers.append(slot)
+        for attr in sorted(attributes):
+            member = f"{a.name}_{attr}"
+            members.append((member, ATTRIBUTE_METHODS[attr]))
+            attribute_members[member] = (a.name, attr)
+        if readers:
+            members.append((a.name, node_member_type(a.type)))
+            value_readers[a.name] = readers
     if func.cpp_return_kind == "tuple":
         from .api_types import tuple_element_cpp_types, tuple_element_names
         cpp_types = tuple_element_cpp_types(func)
@@ -723,11 +821,36 @@ def compute_op_derivatives(func: NativeFunction, raw_formulas: dict[str, str],
         a for a in func.args
         if (a.type.is_tensor_like and not a.type.is_list) or a.type.is_mutable_ref
     ]
+    # A saved tensor that only some slots read is kept only when one of
+    # those inputs wants a gradient, so a product with a constant factor does
+    # not hold on to the factor that receives no gradient.
+    conditional_members: dict[str, list[str]] = {}
+    formula_slots = [a.name for a in grad_slots if a.name in parsed]
+    if len(formula_slots) > 1:
+        for m, t in members:
+            if t != "Tensor":
+                continue
+            if m in value_readers:
+                if any(n not in formula_slots for n in value_readers[m]):
+                    continue  # read by a formula that is not a gradient slot
+                readers = [n for n in formula_slots if n in value_readers[m]]
+            else:
+                # A saved output: every slot whose formula names it.
+                readers = []
+                for n in formula_slots:
+                    names: set[str] = set()
+                    collect_vars(parsed[n], names)
+                    if m in names:
+                        readers.append(n)
+            if readers and len(readers) < len(formula_slots):
+                conditional_members[m] = readers
     return OpDerivatives(
         func=func, node_name=node_name, formulas=parsed,
         grad_slots=grad_slots, members=members,
         used_input_names={m for m, _ in members} & arg_names,
         used_output_names={m for m, _ in members} & output_names,
+        attribute_members=attribute_members,
+        conditional_members=conditional_members,
         differentiable_outputs=differentiable_outputs,
         fw_formulas=fw_formulas,
         fw_required_tangent=fw_required_tangent,
@@ -741,6 +864,9 @@ def load_derivatives(path: str, native_by_opname: dict[str, NativeFunction]) \
     from .model import parse_schema, parse_derivatives_yaml
 
     out: dict[str, OpDerivatives] = {}
+    # The backward formulas of every entry, for the in-place spellings that
+    # differentiate like their functional twin.
+    raw_by_op: dict[str, tuple[dict[str, str], list[bool] | None]] = {}
     seen_names: set[str] = set()
     for item in parse_derivatives_yaml(path):
         # One entry per schema: a second one would silently replace the
@@ -814,6 +940,8 @@ def load_derivatives(path: str, native_by_opname: dict[str, NativeFunction]) \
                             f"'{name}' is neither a schema argument "
                             f"{sorted(arg_names)} nor a declared output")
                     fw_raw[name] = formula
+        if raw:
+            raw_by_op[op] = (dict(raw), output_differentiability)
         if raw or fw_raw:
             out[op] = compute_op_derivatives(
                 native, raw, fw_raw=fw_raw or None,
@@ -834,6 +962,34 @@ def load_derivatives(path: str, native_by_opname: dict[str, NativeFunction]) \
                 non_differentiable_output=True,
                 differentiable_outputs=output_differentiability,
             )
+
+    # An in-place spelling without an entry of its own differentiates like
+    # the functional operator with its signature: the wrapper captures the
+    # input before the update for formulas that read `self`, and `result` is
+    # the updated tensor.  Without this the in-place call recorded nothing
+    # and backward treated it as the identity.
+    def signature(fn: NativeFunction) -> list[tuple[str, str]]:
+        return [(a.name, str(a.type).replace("(a!)", "")) for a in fn.args]
+
+    functional_by_base: dict[str, list[NativeFunction]] = {}
+    for fn in native_by_opname.values():
+        functional_by_base.setdefault(fn.base_name, []).append(fn)
+    for op, native in native_by_opname.items():
+        base = native.base_name
+        if (op in out or not base.endswith("_") or base.startswith("_foreach")
+                or base.endswith("__") or not native.args
+                or not native.args[0].type.is_mutable_ref
+                or native.cpp_return_kind != "mut_ref"):
+            continue
+        twins = [fn for fn in functional_by_base.get(base[:-1], ())
+                 if fn.func_name in raw_by_op and signature(fn) == signature(native)]
+        if not twins:
+            continue
+        twin_raw, differentiability = raw_by_op[twins[0].func_name]
+        # The twin's node serves both spellings.
+        out[op] = compute_op_derivatives(
+            native, twin_raw, node_name=out[twins[0].func_name].node_name,
+            differentiable_outputs=differentiability)
 
     # Manual (hand-written) backwards: register their saved-state layout so
     # wrapper generation treats them uniformly.  Forward-mode formulas parsed
@@ -931,8 +1087,20 @@ def generate_autograd_nodes(
         # does not produce); only one that was defined and is now gone has
         # been released.
         arg_names = {a.name for a in f.args}
-        output_tensor_members = [m for m, _t in dv.members
-                                 if m in tensor_members and m not in arg_names]
+        saved_outputs = [m for m, _t in dv.members
+                         if m in tensor_members and m not in arg_names]
+        # The output index each saved output had in the forward's result.
+        output_index = {"result": 0}
+        if f.cpp_return_kind == "tuple":
+            from .api_types import tuple_element_names
+            output_index.update(
+                {n: i for i, n in enumerate(tuple_element_names(f))})
+        # An input kept only for some slots is likewise undefined from the
+        # start when none of those slots wanted a gradient.
+        output_tensor_members = saved_outputs + [
+            m for m, _t in dv.members
+            if m in tensor_members and m in arg_names
+            and m in dv.conditional_members]
 
         lines.append(f"struct {dv.node_name} : public Node {{")
         for m, t in dv.members:
@@ -944,7 +1112,10 @@ def generate_autograd_nodes(
             lines.append(f"    bool {m}_saved_undefined_;")
         lines.append("")
         ctor_args = [f"{t} {m}" for m, t in dv.members]
-        ctor_inits = [f"{m}_({m})" for m, _ in dv.members]
+        # A saved output is held without its autograd metadata (no cycle
+        # through this node).
+        ctor_inits = [f"{m}_({m}, true)" if m in saved_outputs else f"{m}_({m})"
+                      for m, _ in dv.members]
         ctor_inits += [f"{m}_saved_undefined_(!{m}.defined())"
                        for m in output_tensor_members]
         lines.append(f"    explicit {dv.node_name}({', '.join(ctor_args)})")
@@ -970,7 +1141,11 @@ def generate_autograd_nodes(
         if tensor_members:
             lines.append("")
             for m, _t in dv.members:
-                if m in tensor_members:
+                if m in saved_outputs:
+                    lines.append(
+                        f"        const Tensor {m}_sv = {m}_.unpack_output("
+                        f"shared_from_this(), {output_index.get(m, 0)});")
+                elif m in tensor_members:
                     lines.append(f"        const Tensor {m}_sv = {m}_.unpack();")
             # A backward pass without retain_graph releases saved state once
             # the walk finishes. Re-entering such a node must not touch the
@@ -1008,7 +1183,7 @@ def generate_autograd_nodes(
         cse_temps: dict[str, str] = {}
         call_counts: dict[str, int] = {}
         em = Emitter(tensor_syms, member_names, tensor_members,
-                     native_op_names)
+                     native_op_names, dv.attribute_members)
         for slot_idx, a in enumerate(dv.grad_slots):
             expr = dv.formulas.get(a.name)
             if expr is None:
@@ -1028,7 +1203,8 @@ def generate_autograd_nodes(
             if expr is None:
                 continue
             txt = render_formula(expr, tensor_syms, member_names,
-                                 tensor_members, native_op_names)
+                                 tensor_members, native_op_names,
+                                 dv.attribute_members)
             for t in sorted(cse_temps, key=len, reverse=True):
                 if t in txt:
                     cse_slots.setdefault(cse_temps[t], []).append(slot_idx)
@@ -1062,7 +1238,8 @@ def generate_autograd_nodes(
                 lines.append("        grads.push_back(Tensor());")
                 continue
             txt = render_formula(expr, tensor_syms, member_names,
-                                 tensor_members, native_op_names)
+                                 tensor_members, native_op_names,
+                                 dv.attribute_members)
             # Splice shared temporaries into the rendered formula (longest
             # first so nested shared calls splice cleanly). Guarded temps
             # splice in as an optional dereference.

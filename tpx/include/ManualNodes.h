@@ -215,6 +215,22 @@ inline Tensor repeat_backward(Tensor grad, const std::vector<int64_t>& repeats,
     return grad;
 }
 
+// The backward of a slice / select: the gradient placed into zeros of the
+// input's shape. Reading only the input's sizes keeps the node from saving
+// the input, which a view of it may rewrite in place afterwards.
+inline Tensor slice_backward_sizes(const Tensor& grad, const std::vector<int64_t>& self_sizes,
+                                   int64_t dim, std::optional<int64_t> start,
+                                   std::optional<int64_t> end, int64_t step) {
+    const Tensor zeros = ops::zeros(self_sizes, grad.dtype(), grad.device());
+    return ops::slice_scatter(zeros, grad, dim, start, end, step);
+}
+
+inline Tensor select_backward_sizes(const Tensor& grad, const std::vector<int64_t>& self_sizes,
+                                    int64_t dim, int64_t index) {
+    const Tensor zeros = ops::zeros(self_sizes, grad.dtype(), grad.device());
+    return ops::select_scatter(zeros, grad, dim, index);
+}
+
 // Unsqueeze backward helper.
 // exactly the size-1 dims that the forward removed; dims listed but not
 // squeezed (size != 1) pass through untouched.  Ascending sequential
@@ -259,32 +275,6 @@ inline Tensor value_selecting_reduction_backward(const Tensor& grad, int64_t dim
     Tensor mask = ops::eq(idx, pos);
     if (mask.dtype() != g.dtype()) mask = mask.to(g.dtype());
     return ops::mul(g, mask);
-}
-
-// Derivative of mean(dim, keepdim): re-insert the reduced dims, scale by the
-// kept-element count, then EXPAND back to self's shape.  The expansion must
-// be a recorded op (ExpandBackward -> sum_to_size): a bare broadcast would
-// leave singleton dims in the gradient shape, silently corrupting
-// second-order results.
-inline Tensor broadcast_mean_backward(const Tensor& grad, const Tensor& self,
-                                      const std::vector<int64_t>& dims, bool keepdim) {
-    Tensor g = grad;
-    if (!keepdim) {
-        std::vector<int64_t> sorted;
-        sorted.reserve(dims.size());
-        for (auto d : dims) {
-            const int64_t dd = d < 0 ? d + static_cast<int64_t>(self.dim()) : d;
-            TP_CHECK(dd >= 0 && dd < self.dim(), "Dimension out of range");
-            sorted.push_back(dd);
-        }
-        std::sort(sorted.begin(), sorted.end());
-        for (auto d : sorted) g = ops::unsqueeze(g, d);
-    }
-    const double count =
-        static_cast<double>(self.numel()) / static_cast<double>(g.numel());
-    Tensor scaled = ops::div(g, Scalar(count));
-    return ops::expand(scaled,
-                       static_cast<std::vector<int64_t>>(self.shape()));
 }
 
 // block_diag backward: scatter each output-block gradient back to its input.
@@ -340,33 +330,144 @@ struct GraphRoot : public Node {
     variable_list inputs_;
 };
 
-struct AsStridedBackward : public Node {
-    std::vector<int64_t> input_shape_;
-    std::vector<int64_t> view_size_;
-    std::vector<int64_t> view_stride_;
-    std::optional<int64_t> storage_offset_;
-    DType dtype_;
-    Device device_;
+// as_strided backward.  Both the input and the view are windows onto one
+// storage, so the gradient is assembled there: the view's gradient is
+// scattered into a flat buffer laid out like the shared storage, then read
+// back through the input's own geometry.  A view that touches an element
+// more than once sums every contribution to it; an input that touches one
+// more than once shares it equally among its occurrences.  Both geometries
+// are absolute on the storage, so a strided or offset input reads back the
+// right elements.
+namespace as_strided_bwd_detail {
 
-    AsStridedBackward(Size input_shape, std::vector<int64_t> view_size, std::vector<int64_t> view_stride, std::optional<int64_t> storage_offset, DType dtype, Device device)
-        : input_shape_(static_cast<std::vector<int64_t>>(input_shape)), 
-          view_size_(std::move(view_size)), 
-          view_stride_(std::move(view_stride)), 
-          storage_offset_(storage_offset), 
-          dtype_(dtype), 
-          device_(device) {}
+// Whether a strided layout may visit an element twice: with the strides
+// sorted, each must step past everything the smaller ones can reach.
+inline bool maybe_overlapping(const std::vector<int64_t>& sizes,
+                              const std::vector<int64_t>& strides) {
+    std::vector<size_t> order(sizes.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(),
+              [&](size_t a, size_t b) { return strides[a] < strides[b]; });
+    int64_t reach = 0;
+    for (size_t i : order) {
+        if (strides[i] <= reach) return true;
+        reach += strides[i] * (sizes[i] - 1);
+    }
+    return false;
+}
+
+// Elements a layout needs from the start of the buffer.
+inline int64_t min_storage_size(const std::vector<int64_t>& sizes,
+                                const std::vector<int64_t>& strides, int64_t offset) {
+    int64_t size = offset + 1;
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        if (sizes[i] == 0) return offset;
+        size += (sizes[i] - 1) * strides[i];
+    }
+    return size;
+}
+
+}  // namespace as_strided_bwd_detail
+
+inline Tensor as_strided_backward(Tensor grad, const std::vector<int64_t>& input_sizes,
+                                  const std::vector<int64_t>& input_strides,
+                                  int64_t input_offset, const std::vector<int64_t>& view_sizes,
+                                  const std::vector<int64_t>& view_strides,
+                                  int64_t view_offset) {
+    using namespace as_strided_bwd_detail;
+    const auto empty_grad = [&] {
+        return ops::zeros(input_sizes, grad.dtype(), grad.device());
+    };
+    // The view's geometry with unit dimensions dropped and broadcast
+    // (stride-0) dimensions summed out of the gradient.
+    std::vector<int64_t> out_sizes, out_strides;
+    for (int64_t i = grad.dim() - 1; i >= 0; --i) {
+        const int64_t size = view_sizes[static_cast<size_t>(i)];
+        const int64_t stride = view_strides[static_cast<size_t>(i)];
+        if (size == 0) return empty_grad();
+        if (size == 1) {
+            grad = ops::squeeze(grad, i);
+        } else if (stride == 0) {
+            grad = ops::sum(grad, std::vector<int64_t>{i}, false);
+        } else {
+            out_sizes.insert(out_sizes.begin(), size);
+            out_strides.insert(out_strides.begin(), stride);
+        }
+    }
+    std::vector<int64_t> in_sizes, in_strides;
+    for (size_t i = 0; i < input_sizes.size(); ++i) {
+        if (input_sizes[i] == 0) return empty_grad();
+        if (input_sizes[i] != 1) {
+            in_sizes.push_back(input_sizes[i]);
+            in_strides.push_back(input_strides[i]);
+        }
+    }
+    const bool out_overlap = maybe_overlapping(out_sizes, out_strides);
+    const bool in_overlap = maybe_overlapping(in_sizes, in_strides);
+
+    // The buffer starts at whichever window starts first.
+    const int64_t shared_offset = std::min(input_offset, view_offset);
+    const int64_t in_offset = input_offset - shared_offset;
+    const int64_t out_offset = view_offset - shared_offset;
+    const int64_t base_size =
+        std::max(min_storage_size(in_sizes, in_strides, in_offset),
+                 min_storage_size(out_sizes, out_strides, out_offset));
+    Tensor storage = ops::zeros({base_size}, grad.dtype(), grad.device());
+
+    // A recorded backward (create_graph) scatters with index_add so the
+    // second derivative sees through it; so does an overlapping view, whose
+    // repeated elements must accumulate.
+    const bool record = GradMode::is_enabled();
+    Tensor positions;
+    if (out_overlap || in_overlap || record) {
+        positions = ops::arange(Scalar(static_cast<int64_t>(0)), Scalar(base_size),
+                                Scalar(static_cast<int64_t>(1)), DType::Int64,
+                                grad.device());
+    }
+    if (out_overlap || record) {
+        const Tensor out_index = ops::reshape(
+            positions.as_strided(out_sizes, out_strides, out_offset), {-1});
+        storage = ops::index_add(storage, 0, out_index, ops::reshape(grad, {-1}));
+    } else {
+        storage.as_strided(out_sizes, out_strides, out_offset).copy_(grad);
+    }
+    if (in_overlap) {
+        const Tensor in_index = ops::reshape(
+            positions.as_strided(in_sizes, in_strides, in_offset), {-1});
+        const Tensor count = ops::index_add(
+            ops::zeros({base_size}, grad.dtype(), grad.device()), 0, in_index,
+            ops::expand(ops::ones({1}, grad.dtype(), grad.device()),
+                        {in_index.numel()}));
+        // Elements the input never reads divide 0 by 0; nothing reads them.
+        storage = ops::div(storage, count);
+    }
+    return ops::as_strided(storage, input_sizes, input_strides, in_offset);
+}
+
+struct AsStridedBackward : public Node {
+    std::vector<int64_t> input_sizes_;
+    std::vector<int64_t> input_strides_;
+    int64_t input_offset_;
+    std::vector<int64_t> view_sizes_;
+    std::vector<int64_t> view_strides_;
+    int64_t view_offset_;
+
+    // `storage_offset` is absolute on the storage; without one the view
+    // starts where the input does.
+    AsStridedBackward(const Tensor& self, std::vector<int64_t> size,
+                      std::vector<int64_t> stride, std::optional<int64_t> storage_offset)
+        : input_sizes_(static_cast<std::vector<int64_t>>(self.shape())),
+          input_strides_(self.strides()),
+          input_offset_(static_cast<int64_t>(
+              self.unsafeGetTensorImpl()->storage_offset())),
+          view_sizes_(std::move(size)),
+          view_strides_(std::move(stride)),
+          view_offset_(storage_offset.value_or(input_offset_)) {}
 
     variable_list apply(variable_list&& inputs) override {
         if (inputs.empty() || !inputs[0].defined()) return {Tensor()};
-        Tensor grad = inputs[0];
-        
-        Tensor grad_input = Tensor::zeros(input_shape_, dtype_, device_);
-
-        // Create view of grad_input and accumulate gradient
-        // We use p10 methods directly to avoid autograd overhead here
-        grad_input.as_strided(view_size_, view_stride_, storage_offset_).add_(grad);
-
-        return {grad_input};
+        return {as_strided_backward(inputs[0], input_sizes_, input_strides_, input_offset_,
+                                    view_sizes_, view_strides_, view_offset_)};
     }
 };
 
@@ -1484,8 +1585,10 @@ inline Tensor mean_backward(const Tensor& grad,
     } else {
         for (auto d : dims) count *= sizes[d];
     }
-    return ops::div(sum_backward(grad, sizes, dims, keepdim),
-                    Scalar(static_cast<double>(count)));
+    // Scaling the reduced gradient before it is expanded divides each value
+    // once rather than once per element it is broadcast to.
+    return sum_backward(ops::div(grad, Scalar(static_cast<double>(count))), sizes, dims,
+                        keepdim);
 }
 
 // self keeps grad except at overwritten positions (unless accumulate);

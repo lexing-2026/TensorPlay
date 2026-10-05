@@ -223,21 +223,51 @@ def _emit_autocast_block(lines, f, arg_types):
     lines.append('    }')
 
 
+def _records_inplace_update(f: NativeFunction,
+                            derivatives: dict[str, OpDerivatives]) -> bool:
+    """An in-place op whose wrapper attaches a backward node to the updated
+    tensor.  What the node learns about that tensor's inputs (its edges and
+    the attributes the formulas measure) is taken before the update, which
+    may change the tensor's shape."""
+    dv = derivatives.get(f.func_name)
+    return (f.cpp_return_kind == 'mut_ref' and f.base_name.endswith('_')
+            and any(a.name == 'self' for a in f.args)
+            and (f.func_name == 'relu_'
+                 or (dv is not None and not dv.non_differentiable_output)))
+
+
+def _hoisted_attributes(dv: OpDerivatives, f: NativeFunction) -> list[tuple[str, str, str, str]]:
+    """(member, type, argument, attribute) for the attributes of a mutated
+    argument the formulas measure; read before the update."""
+    mutated = {a.name for a in f.mutable_args if a.type.is_mutable_ref}
+    types = dict(dv.members)
+    return [(m, types[m], arg, attr)
+            for m, (arg, attr) in dv.attribute_members.items() if arg in mutated]
+
+
 def _node_ctor_args(dv: OpDerivatives, f: NativeFunction,
-                    core_result_var: str | None) -> list[str]:
+                    core_result_var: str | None,
+                    hoisted: bool = False) -> list[str]:
     """Ordered constructor arguments for the backward node."""
     arg_names = {a.name for a in f.args}
     # Manual nodes (empty formulas, hand-written structs) are not extended.
     args: list[str] = []
     out_index = ({n: i for i, n in enumerate(tuple_element_names(f))}
                  if f.cpp_return_kind == 'tuple' else {})
+    pre_update = ({m for m, *_ in _hoisted_attributes(dv, f)} if hoisted else set())
     for m, _t in dv.members:
-        if m in dv.used_input_names:
-            if (m == 'self' and f.func_name.endswith('_')
+        if m in pre_update:
+            args.append(f'std::move(*__tp_pre_{m})')
+        elif m in dv.attribute_members:
+            # A tensor the formulas only measure hands over that attribute.
+            arg, attr = dv.attribute_members[m]
+            args.append(f'{arg}.{attr}()')
+        elif m in dv.used_input_names:
+            if (m == 'self' and f.base_name.endswith('_')
                     and any(a.name == 'self' for a in f.args)):
                 # Pre-mutation capture is hoisted by the wrapper; the live
                 # `self` already holds the update.
-                args.append('__tp_original_self.value()')
+                args.append('__tp_original_self.value_or(Tensor())')
             else:
                 args.append(m)
         elif m == 'result' and m not in out_index:
@@ -257,6 +287,15 @@ def _node_ctor_args(dv: OpDerivatives, f: NativeFunction,
             args.append(expr)
         else:
             args.append(m)
+        readers = dv.conditional_members.get(m)
+        if readers:
+            # Kept only when an input whose gradient reads it wants one.
+            arg_types = {a.name: a.type for a in f.args}
+            wanted = " || ".join(
+                f'({n}.has_value() && {n}->requires_grad())' if arg_types[n].is_opt
+                else f'{n}.requires_grad()'
+                for n in readers)
+            args[-1] = f'(({wanted}) ? Tensor({args[-1]}) : Tensor())'
     return args
 
 
@@ -332,11 +371,18 @@ def _emit_leaf_checks(lines, f):
             lines.append('    }')
 
 
-def _emit_edges(lines, f):
+def _emit_edges(lines, f, into: str | None = None):
+    """Attach the inputs' edges to `grad_fn`, or gather them into the
+    already declared vector `into`."""
     list_args = [a.name for a in f.args if a.type.is_tensor_like and a.type.is_list]
     tensor_args = [a.name for a in f.args if a.type.is_tensor_like]
-    if list_args:
-        lines.append('        std::vector<Edge> autograd_edges;')
+    if into is not None and not list_args:
+        lines.append(f'        {into} = collect_next_edges({", ".join(tensor_args)});')
+    elif list_args:
+        if into is not None:
+            lines.append(f'        std::vector<Edge>& autograd_edges = {into};')
+        else:
+            lines.append('        std::vector<Edge> autograd_edges;')
         for a in f.args:
             t = a.type
             if t.is_tensor_like and t.is_list:
@@ -351,7 +397,8 @@ def _emit_edges(lines, f):
                     lines.append(f'        if ({a.name}.has_value()) collect_next_edges_helper(autograd_edges, *{a.name});')
                 else:
                     lines.append(f'        collect_next_edges_helper(autograd_edges, {a.name});')
-        lines.append('        grad_fn->add_next_edge_list(std::move(autograd_edges));')
+        if into is None:
+            lines.append('        grad_fn->add_next_edge_list(std::move(autograd_edges));')
     else:
         lines.append(
             f'        grad_fn->add_next_edge_list(collect_next_edges({", ".join(tensor_args)}));')
@@ -500,21 +547,44 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
             _emit_requires_grad_detection(lines, f)
             _emit_leaf_checks(lines, f)
             # In-place ops whose derivative references `self` must evaluate
-            # the slope at the PRE-mutation value.  Capture the
-            # clone before the core call; _node_ctor_args splices it in.
+            # the slope at the PRE-mutation value -- overloaded spellings
+            # (mul_.Tensor) included.  Capture the clone before the core
+            # call; _node_ctor_args splices it in.
             _dv_pre = derivatives.get(f.func_name)
             if (_dv_pre is not None and _dv_pre.formulas
                     and f.base_name.endswith('_')
-                    and f.func_name.endswith('_')
                     and 'self' in _dv_pre.used_input_names
                     and any(a.name == 'self' for a in f.args)):
                 lines.append('    std::optional<Tensor> __tp_original_self;')
-                lines.append('    if (requires_grad) {')
+                # Kept only for the slots that read it: no clone when none
+                # of their inputs wants a gradient.
+                _readers = _dv_pre.conditional_members.get('self')
+                _cond = 'requires_grad'
+                if _readers:
+                    _types = {a.name: a.type for a in f.args}
+                    _cond += ' && (' + ' || '.join(
+                        f'({n}.has_value() && {n}->requires_grad())' if _types[n].is_opt
+                        else f'{n}.requires_grad()' for n in _readers) + ')'
+                lines.append(f'    if ({_cond}) {{')
                 lines.append('        const bool __tp_prev_gm = GradMode::is_enabled();')
                 lines.append('        GradMode::set_enabled(false);')
                 lines.append('        __tp_original_self = self.clone();')
                 lines.append('        GradMode::set_enabled(__tp_prev_gm);')
                 lines.append('    }')
+
+        # An update may reshape the tensor (squeeze_, t_): the edges and the
+        # measured attributes describe it as the formulas' input, before.
+        _hoist_inplace = has_ag and _records_inplace_update(f, derivatives)
+        if _hoist_inplace:
+            _dv_pre = derivatives.get(f.func_name)
+            for m, mtype, arg, attr in (_hoisted_attributes(_dv_pre, f)
+                                        if _dv_pre is not None else []):
+                lines.append(f'    std::optional<{mtype}> __tp_pre_{m};')
+                lines.append(f'    if (requires_grad) __tp_pre_{m} = {arg}.{attr}();')
+            lines.append('    std::vector<Edge> __tp_inplace_edges;')
+            lines.append('    if (requires_grad) {')
+            _emit_edges(lines, f, into='__tp_inplace_edges')
+            lines.append('    }')
 
         # ---- core invocation ----------------------------------------------
         core_call = _core_call_expr(f)
@@ -530,6 +600,13 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
                 lines.append(f'    {ret_type} result = {core_call};')
         elif kind in ('mut_ref', 'void'):
             lines.append(f'    {core_call};')
+            _dv_res = derivatives.get(f.func_name)
+            if (kind == 'mut_ref' and has_ag and _dv_res is not None
+                    and 'result' in _dv_res.used_output_names):
+                # An in-place op's result is the updated tensor itself.
+                _alias = next((a.name for a in f.mutable_args if a.type.is_mutable_ref),
+                              f.args[0].name)
+                lines.append(f'    const Tensor& result = {_alias};')
 
         # ---- InplaceOrView semantics ---------------------------------------
         # InplaceOrView semantics: in-place ops bump their version counter
@@ -585,14 +662,17 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
                     f'        grad_fn = std::make_shared<ReluBackward>({f.args[0].name}.detach());')
             else:
                 dv = derivatives[f.func_name]
-                ctor_args = _node_ctor_args(dv, f, 'core_result')
+                ctor_args = _node_ctor_args(dv, f, 'core_result', hoisted=_hoist_inplace)
                 lines.append(
                     f'        grad_fn = std::make_shared<{dv.node_name}>({", ".join(ctor_args)});')
             if f.returns_view_of_input and _self is not None and kind == 'value':
                 lines.append(
                     f'        grad_fn->set_view_fn(result.unsafeGetTensorImpl()->'
                     f'storage().is_same({_self.name}.unsafeGetTensorImpl()->storage()));')
-            _emit_edges(lines, f)
+            if _hoist_inplace:
+                lines.append('        grad_fn->add_next_edge_list(std::move(__tp_inplace_edges));')
+            else:
+                _emit_edges(lines, f)
             lines.append('    }')
         elif _is_list_view:
             # Multi-output view op: one shared node and one output slot per
@@ -673,7 +753,15 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
         elif kind == 'mut_ref':
             alias = next((a.name for a in f.mutable_args if a.type.is_mutable_ref),
                          f.args[0].name)
-            if has_ag:
+            if has_ag and f.is_view_op and f.base_name.endswith('_'):
+                # An update of the tensor's own geometry (t_, squeeze_)
+                # writes no element of a base it may view: the view takes the
+                # node as its history and the base keeps its own.
+                lines.append(f'    if (requires_grad) tensorplay::tpx::impl::set_requires_grad({alias}, true);')
+                lines.append(f'    if (requires_grad && {alias}.defined()) {{')
+                lines.append(f'        tensorplay::tpx::impl::set_grad_fn({alias}, grad_fn);')
+                lines.append('    }')
+            elif has_ag:
                 lines.append(f'    if (requires_grad) tensorplay::tpx::impl::set_requires_grad({alias}, true);')
                 lines.append(f'    if (requires_grad && {alias}.defined()) {{')
                 lines.append(

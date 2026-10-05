@@ -128,10 +128,6 @@
   other: mul_tensor_backward(grad, self, other.dtype())
   result: other_t * self_p + self_t * other_p
 
-- name: mul_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
-  self: grad * ops::conj(other)
-  other: grad * ops::conj(self)
-
 - name: mul_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
   self: grad * scalar_conj_if_complex(other)
 
@@ -139,10 +135,6 @@
   self: div_tensor_self_backward(grad, other, self.dtype())
   other: div_tensor_other_backward(grad, self, other)
   result: (self_t - other_t * result) / other_p
-
-- name: div_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
-  self: grad / ops::conj(other)
-  other: -(grad * self) * ops::conj(self / other / other)
 
 - name: div_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
   self: grad / scalar_conj_if_complex(other)
@@ -254,11 +246,11 @@
   self: grad
 
 - name: select.int(Tensor self, int dim, SymInt index) -> Tensor
-  self: tensorplay::tpx::ops::select_backward(grad, self, dim, index)
+  self: select_backward_sizes(grad, self.shape(), dim, index)
   result: auto_linear
 
 - name: slice.Tensor(Tensor self, int dim=0, SymInt? start=None, SymInt? end=None, SymInt step=1) -> Tensor
-  self: tensorplay::tpx::ops::slice_backward(grad, self, dim, start, end, step)
+  self: slice_backward_sizes(grad, self.shape(), dim, start, end, step)
   result: auto_linear
 
 # The two scatter-back ops above are linear in grad_output, and their own
@@ -430,8 +422,9 @@
 - name: mean.dim(Tensor self, int[] dim, bool keepdim=false, *, ScalarType dtype=Undefined) -> Tensor
   # Recordable composition (unsqueeze reduced dims back in + scale by the
   # kept-element count); the former opaque mean_dim_backward kernel broke
-  # double-backward the same way matmul's did.
-  self: tensorplay::tpx::broadcast_mean_backward(grad, self, dim, keepdim)
+  # double-backward the same way matmul's did.  Only the input's shape is
+  # read, so the input itself is not kept for the backward pass.
+  self: mean_backward(grad, self.shape(), dim, keepdim)
 
 # native that composes dispatched ops).  Same structure here: a recordable
 # tpx-level helper so create_graph sees through max/min(dim).
@@ -441,8 +434,10 @@
 - name: min.dim(Tensor self, int64_t dim, bool keepdim=False) -> (Tensor values, Tensor indices)
   self: tensorplay::tpx::value_selecting_reduction_backward(grad, dim, indices, self, keepdim)
 
+# The reduced dimensions come back as size-one axes and the gradient expands
+# over them: recordable, and only the input's shape is kept.
 - name: sum.dim_IntList(Tensor self, int[] dim, bool keepdim=false, *, ScalarType dtype=Undefined) -> Tensor
-  self: _sum_dim_backward(grad, self, dim, keepdim)
+  self: sum_backward(grad, self.shape(), dim, keepdim)
   result: auto_linear
 
 - name: reshape(Tensor self, int[] shape) -> Tensor
@@ -954,13 +949,10 @@
 # expressed with TensorPlay-native operators.
 # ===========================================================================
 
-# derivatives.yaml:1096 (in-place shares the functional rule)
-- name: masked_fill_(Tensor(a!) self, Tensor mask, Scalar value) -> Tensor(a!)
-  self: grad.masked_fill(mask, 0)
-
-# derivatives.yaml:1101 (value grad omitted: needs masked_fill_backward helper)
+# The filled value receives the gradient of every position it was written to.
 - name: masked_fill.Tensor(Tensor self, Tensor mask, Tensor value) -> Tensor
   self: grad.masked_fill(mask, 0)
+  value: sum(where(mask, grad, Scalar(0)))
 
 # derivatives.yaml:1818/1822
 - name: tril(Tensor self, int diagonal=0) -> Tensor

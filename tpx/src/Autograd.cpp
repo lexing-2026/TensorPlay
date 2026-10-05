@@ -69,12 +69,13 @@ std::shared_ptr<Node> grad_fn(const Tensor& t) {
         }
         GradMode::set_enabled(previous_grad_mode);
     } else {
-        const int64_t base_offset = static_cast<int64_t>(
-            base.unsafeGetTensorImpl()->storage_offset());
-        const int64_t relative_offset = meta->view_storage_offset() - base_offset;
+        // The view's current geometry, absolute on the storage it shares
+        // with the base: an in-place update of the view's own shape
+        // (t_, squeeze_) is part of what the view now reads.
         refreshed = std::make_shared<AsStridedBackward>(
-            base.shape(), meta->view_sizes(), meta->view_strides(),
-            std::optional<int64_t>(relative_offset), base.dtype(), base.device());
+            base, static_cast<std::vector<int64_t>>(t.shape()), t.strides(),
+            std::optional<int64_t>(
+                static_cast<int64_t>(t.unsafeGetTensorImpl()->storage_offset())));
         refreshed->set_view_fn(true);
         refreshed->add_next_edge_list(collect_next_edges(base));
     }
@@ -645,32 +646,8 @@ void backward(const Tensor& tensor, const Tensor& gradient, bool retain_graph, b
 Tensor as_strided(const Tensor& self, const std::vector<int64_t>& size,
                   const std::vector<int64_t>& stride,
                   std::optional<int64_t> storage_offset) {
-    const bool requires_grad =
-        GradMode::is_enabled() && !InferenceMode::is_enabled() &&
-        self.requires_grad() && !autograd_dispatch_excluded();
-    std::shared_ptr<Node> grad_fn;
-    if (requires_grad) {
-        const int64_t base_offset = static_cast<int64_t>(
-            self.unsafeGetTensorImpl()->storage_offset());
-        const int64_t view_offset = storage_offset.value_or(base_offset);
-        grad_fn = std::make_shared<AsStridedBackward>(
-            self.shape(), size, stride,
-            std::optional<int64_t>(view_offset - base_offset),
-            self.dtype(), self.device());
-        grad_fn->set_view_fn(true);
-        grad_fn->add_next_edge_list(collect_next_edges(self));
-    }
-
-    Tensor result = self.as_strided(size, stride, storage_offset);
-    // regardless of grad mode); detach_() must reject it.
-    if (result.defined()) {
-        result.unsafeGetTensorImpl()->set_is_view(true);
-    }
-    if (requires_grad && result.defined()) {
-        impl::set_view_metadata(result, self);
-        impl::set_grad_fn(result, grad_fn);
-    }
-    return result;
+    // The dispatched operator records the view and its backward.
+    return ops::as_strided(self, size, stride, storage_offset);
 }
 
 Tensor narrow(const Tensor& self, int64_t dim, int64_t start, int64_t length) {

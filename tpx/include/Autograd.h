@@ -49,6 +49,11 @@ inline void set_grad_fn(const Tensor& t, std::shared_ptr<Node> grad_fn, uint32_t
     if (auto* meta = get_or_create_autograd_meta(t)) {
         meta->set_grad_fn(std::move(grad_fn));
         meta->set_output_nr(output_nr);
+        // A view handed a node of its own keeps it until the storage it
+        // shares changes again.
+        if (meta->has_view_info()) {
+            meta->set_attr_version(t.unsafeGetTensorImpl()->version());
+        }
     }
 }
 

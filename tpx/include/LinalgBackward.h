@@ -588,8 +588,8 @@ struct LinalgSvdBackward : public Node {
     SavedVariable Vh_;
 
     LinalgSvdBackward(bool full_matrices, bool compute_uv, Tensor U, Tensor S, Tensor Vh)
-        : full_matrices_(full_matrices), compute_uv_(compute_uv), U_(std::move(U)),
-          S_(std::move(S)), Vh_(std::move(Vh)) {}
+        : full_matrices_(full_matrices), compute_uv_(compute_uv), U_(U, true),
+          S_(S, true), Vh_(Vh, true) {}
 
     size_t num_inputs() const override { return 3; }
 
@@ -602,9 +602,9 @@ struct LinalgSvdBackward : public Node {
         TP_CHECK(compute_uv_,
                  "linalg.svd: the singular values alone are not differentiable; "
                  "compute the singular vectors as well (compute_uv=True)");
-        Tensor U = U_.unpack();
-        const Tensor S = S_.unpack();
-        Tensor Vh = Vh_.unpack();
+        Tensor U = U_.unpack_output(shared_from_this(), 0);
+        const Tensor S = S_.unpack_output(shared_from_this(), 1);
+        Tensor Vh = Vh_.unpack_output(shared_from_this(), 2);
         if (full_matrices_) {
             const int64_t k = S.size(-1);
             U = ops::narrow(U, -1, 0, k);
@@ -630,8 +630,8 @@ struct LinalgEighBackward : public Node {
     SavedVariable eigenvectors_;
 
     LinalgEighBackward(bool compute_v, Tensor eigenvalues, Tensor eigenvectors)
-        : compute_v_(compute_v), eigenvalues_(std::move(eigenvalues)),
-          eigenvectors_(std::move(eigenvectors)) {}
+        : compute_v_(compute_v), eigenvalues_(eigenvalues, true),
+          eigenvectors_(eigenvectors, true) {}
 
     size_t num_inputs() const override { return 2; }
 
@@ -643,8 +643,9 @@ struct LinalgEighBackward : public Node {
         TP_CHECK(compute_v_,
                  "linalg.eigh: the eigenvalues alone are not differentiable; compute the "
                  "eigenvectors as well (compute_v=True)");
-        return {linalg_eig_backward(gL, gV, eigenvalues_.unpack(), eigenvectors_.unpack(),
-                                    true)};
+        const auto self = shared_from_this();
+        return {linalg_eig_backward(gL, gV, eigenvalues_.unpack_output(self, 0),
+                                    eigenvectors_.unpack_output(self, 1), true)};
     }
 
     void release_variables() override {
@@ -662,8 +663,8 @@ struct LinalgEigBackward : public Node {
     SavedVariable eigenvectors_;
 
     LinalgEigBackward(const Tensor& A, Tensor eigenvalues, Tensor eigenvectors)
-        : input_dtype_(A.dtype()), eigenvalues_(std::move(eigenvalues)),
-          eigenvectors_(std::move(eigenvectors)) {}
+        : input_dtype_(A.dtype()), eigenvalues_(eigenvalues, true),
+          eigenvectors_(eigenvectors, true) {}
 
     size_t num_inputs() const override { return 2; }
 
@@ -672,8 +673,8 @@ struct LinalgEigBackward : public Node {
         const Tensor gL = input_at(inputs, 0);
         const Tensor gV = input_at(inputs, 1);
         if (!gL.defined() && !gV.defined()) return {Tensor()};
-        Tensor gA = linalg_eig_backward(gL, gV, eigenvalues_.unpack(),
-                                        eigenvectors_.unpack(), false);
+        Tensor gA = linalg_eig_backward(gL, gV, eigenvalues_.unpack_output(shared_from_this(), 0),
+                                        eigenvectors_.unpack_output(shared_from_this(), 1), false);
         if (!isComplexType(input_dtype_) && isComplexType(gA.dtype())) gA = ops::real(gA);
         return {gA};
     }
@@ -692,7 +693,7 @@ struct LinalgQrBackward : public Node {
     SavedVariable R_;
 
     LinalgQrBackward(std::string mode, Tensor Q, Tensor R)
-        : mode_(std::move(mode)), Q_(std::move(Q)), R_(std::move(R)) {}
+        : mode_(std::move(mode)), Q_(Q, true), R_(R, true) {}
 
     size_t num_inputs() const override { return 2; }
 
@@ -701,7 +702,9 @@ struct LinalgQrBackward : public Node {
         const Tensor gQ = input_at(inputs, 0);
         const Tensor gR = input_at(inputs, 1);
         if (!gQ.defined() && !gR.defined()) return {Tensor()};
-        return {linalg_qr_backward(gQ, gR, Q_.unpack(), R_.unpack(), mode_)};
+        const auto self = shared_from_this();
+        return {linalg_qr_backward(gQ, gR, Q_.unpack_output(self, 0), R_.unpack_output(self, 1),
+                                   mode_)};
     }
 
     void release_variables() override {
@@ -719,7 +722,7 @@ struct LinalgLuBackward : public Node {
     SavedVariable U_;
 
     LinalgLuBackward(bool pivot, Tensor P, Tensor L, Tensor U)
-        : pivot_(pivot), P_(std::move(P)), L_(std::move(L)), U_(std::move(U)) {}
+        : pivot_(pivot), P_(P, true), L_(L, true), U_(U, true) {}
 
     size_t num_inputs() const override { return 3; }
 
@@ -728,7 +731,9 @@ struct LinalgLuBackward : public Node {
         const Tensor gL = input_at(inputs, 1);
         const Tensor gU = input_at(inputs, 2);
         if (!gL.defined() && !gU.defined()) return {Tensor()};
-        return {linalg_lu_backward(gL, gU, P_.unpack(), L_.unpack(), U_.unpack(), pivot_)};
+        const auto self = shared_from_this();
+        return {linalg_lu_backward(gL, gU, P_.unpack_output(self, 0), L_.unpack_output(self, 1),
+                                   U_.unpack_output(self, 2), pivot_)};
     }
 
     void release_variables() override {
@@ -763,7 +768,7 @@ struct LinalgSlogdetBackward : public Node {
     SavedVariable A_;
     SavedVariable sign_;
 
-    LinalgSlogdetBackward(Tensor A, Tensor sign) : A_(std::move(A)), sign_(std::move(sign)) {}
+    LinalgSlogdetBackward(Tensor A, Tensor sign) : A_(std::move(A)), sign_(sign, true) {}
 
     size_t num_inputs() const override { return 2; }
 
@@ -772,7 +777,8 @@ struct LinalgSlogdetBackward : public Node {
         const Tensor g_sign = input_at(inputs, 0);
         const Tensor g_logabsdet = input_at(inputs, 1);
         if (!g_sign.defined() && !g_logabsdet.defined()) return {Tensor()};
-        return {slogdet_backward(g_sign, g_logabsdet, A_.unpack(), sign_.unpack())};
+        return {slogdet_backward(g_sign, g_logabsdet, A_.unpack(),
+                                 sign_.unpack_output(shared_from_this(), 0))};
     }
 
     void release_variables() override {
@@ -789,7 +795,7 @@ struct LinalgLstsqBackward : public Node {
     SavedVariable solution_;
 
     LinalgLstsqBackward(Tensor A, Tensor B, Tensor solution)
-        : A_(std::move(A)), B_(std::move(B)), solution_(std::move(solution)) {}
+        : A_(std::move(A)), B_(std::move(B)), solution_(solution, true) {}
 
     size_t num_inputs() const override { return 2; }
 
@@ -800,7 +806,8 @@ struct LinalgLstsqBackward : public Node {
         const bool A_needed = should_compute_output(0);
         const bool B_needed = should_compute_output(1);
         auto [gA, gB] = linalg_lstsq_backward(gX, gL, A_.unpack(), B_.unpack(),
-                                              solution_.unpack(), A_needed, B_needed);
+                                              solution_.unpack_output(shared_from_this(), 0),
+                                              A_needed, B_needed);
         return {gA, gB};
     }
 
@@ -824,7 +831,7 @@ struct TriangularSolveBackward : public Node {
     TriangularSolveBackward(Tensor self, Tensor A, bool upper, bool transpose,
                             bool unitriangular, Tensor solution)
         : self_(std::move(self)), A_(std::move(A)), upper_(upper), transpose_(transpose),
-          unitriangular_(unitriangular), solution_(std::move(solution)) {}
+          unitriangular_(unitriangular), solution_(solution, true) {}
 
     size_t num_inputs() const override { return 2; }
 
@@ -835,8 +842,9 @@ struct TriangularSolveBackward : public Node {
         const bool b_needed = should_compute_output(0);
         const bool a_needed = should_compute_output(1);
         auto [gb, ga] = triangular_solve_backward(
-            g_solution, g_coefficient, self_.unpack(), A_.unpack(), solution_.unpack(),
-            upper_, transpose_, unitriangular_, b_needed, a_needed);
+            g_solution, g_coefficient, self_.unpack(), A_.unpack(),
+            solution_.unpack_output(shared_from_this(), 0), upper_, transpose_, unitriangular_,
+            b_needed, a_needed);
         return {gb, ga};
     }
 

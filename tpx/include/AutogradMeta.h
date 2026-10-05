@@ -57,9 +57,6 @@ private:
 
     bool has_view_info_ = false;
     tensorplay::Tensor view_base_;
-    std::vector<int64_t> view_sizes_;
-    std::vector<int64_t> view_strides_;
-    int64_t view_storage_offset_ = 0;
     uint32_t attr_version_ = 0;
     CreationMeta creation_meta_ = CreationMeta::DEFAULT;
     std::function<tensorplay::Tensor(const tensorplay::Tensor&)> view_fn_;
@@ -104,10 +101,6 @@ public:
         std::function<tensorplay::Tensor(const tensorplay::Tensor&)> view_fn = {}) {
         has_view_info_ = true;
         view_base_ = base;
-        view_sizes_ = static_cast<std::vector<int64_t>>(view.shape());
-        view_strides_ = view.strides();
-        view_storage_offset_ = static_cast<int64_t>(
-            view.unsafeGetTensorImpl()->storage_offset());
         attr_version_ = view.unsafeGetTensorImpl()->version();
         creation_meta_ = creation_meta;
         view_fn_ = std::move(view_fn);
@@ -115,9 +108,6 @@ public:
 
     bool has_view_info() const { return has_view_info_; }
     const tensorplay::Tensor& view_base() const { return view_base_; }
-    const std::vector<int64_t>& view_sizes() const { return view_sizes_; }
-    const std::vector<int64_t>& view_strides() const { return view_strides_; }
-    int64_t view_storage_offset() const { return view_storage_offset_; }
     uint32_t attr_version() const { return attr_version_; }
     void set_attr_version(uint32_t version) { attr_version_ = version; }
     CreationMeta creation_meta() const { return creation_meta_; }

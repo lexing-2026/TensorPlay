@@ -7,12 +7,44 @@
 
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace tensorplay {
 namespace composite {
 
 namespace ops = tensorplay::tpx::ops;
+
+// The shape-changing updates (t_, transpose_, squeeze_, unsqueeze_) move no
+// element: the tensor takes the geometry the matching view would have over
+// its own storage.
+namespace {
+
+// Wraps a dimension the way the view ops do: a 0-d tensor accepts -1 and 0.
+int64_t wrap_view_dim(int64_t dim, int64_t ndim) {
+    const int64_t n = ndim > 0 ? ndim : 1;
+    if (dim < -n || dim >= n) {
+        TP_THROW(IndexError, "Dimension out of range (expected to be in range of [",
+                 -n, ", ", n - 1, "], but got ", dim, ")");
+    }
+    return dim < 0 ? dim + n : dim;
+}
+
+// Drops the dimensions `drop` marks, provided they have size one.
+Tensor& squeeze_marked(Tensor& self, const std::vector<bool>& drop) {
+    std::vector<int64_t> sizes;
+    std::vector<int64_t> strides;
+    for (int64_t i = 0; i < self.dim(); ++i) {
+        if (!(drop[i] && self.size(i) == 1)) {
+            sizes.push_back(self.size(i));
+            strides.push_back(self.stride(i));
+        }
+    }
+    ops::as_strided_(self, sizes, strides);
+    return self;
+}
+
+} // namespace
 
 Tensor& inplace_copysign_dd_Tensor(Tensor& self, const Tensor& other) {
     ops::copy_(self, ops::copysign(self, other));
@@ -90,28 +122,53 @@ Tensor& inplace_mvlgamma_(Tensor& self, int64_t p) {
 }
 
 Tensor& inplace_squeeze_(Tensor& self) {
-    ops::copy_(self, ops::squeeze(self));
-    return self;
+    return squeeze_marked(self, std::vector<bool>(self.dim(), true));
 }
 
 Tensor& inplace_squeeze_dd_dim(Tensor& self, int64_t dim) {
-    ops::copy_(self, ops::squeeze(self, dim));
-    return self;
+    const int64_t ndim = self.dim();
+    dim = wrap_view_dim(dim, ndim);
+    std::vector<bool> drop(ndim, false);
+    if (ndim > 0) drop[dim] = true;
+    return squeeze_marked(self, drop);
 }
 
 Tensor& inplace_squeeze_dd_dims(Tensor& self, const std::vector<int64_t>& dim) {
-    ops::copy_(self, ops::squeeze(self, dim));
+    const int64_t ndim = self.dim();
+    std::vector<bool> drop(ndim, false);
+    for (int64_t d : dim) {
+        const int64_t w = wrap_view_dim(d, ndim);
+        if (ndim == 0) continue;
+        if (drop[w]) {
+            TP_THROW(RuntimeError, "dim ", w,
+                     " appears multiple times in the list of dims");
+        }
+        drop[w] = true;
+    }
+    return squeeze_marked(self, drop);
+}
+
+Tensor& inplace_transpose_(Tensor& self, int64_t dim0, int64_t dim1) {
+    const int64_t ndim = self.dim();
+    dim0 = wrap_view_dim(dim0, ndim);
+    dim1 = wrap_view_dim(dim1, ndim);
+    if (dim0 == dim1) {
+        return self;
+    }
+    std::vector<int64_t> sizes = static_cast<std::vector<int64_t>>(self.shape());
+    std::vector<int64_t> strides = self.strides();
+    std::swap(sizes[dim0], sizes[dim1]);
+    std::swap(strides[dim0], strides[dim1]);
+    ops::as_strided_(self, sizes, strides);
     return self;
 }
 
 Tensor& inplace_t_(Tensor& self) {
-    ops::copy_(self, ops::t(self));
-    return self;
-}
-
-Tensor& inplace_transpose_(Tensor& self, int64_t dim0, int64_t dim1) {
-    ops::copy_(self, ops::transpose(self, dim0, dim1));
-    return self;
+    if (self.dim() > 2) {
+        TP_THROW(RuntimeError, "t_() expects a tensor with <= 2 dimensions, but self is ",
+                 self.dim(), "D");
+    }
+    return inplace_transpose_(self, 0, self.dim() < 2 ? 0 : 1);
 }
 
 Tensor& inplace_fix_(Tensor& self) {
@@ -120,7 +177,14 @@ Tensor& inplace_fix_(Tensor& self) {
 }
 
 Tensor& inplace_unsqueeze_(Tensor& self, int64_t dim) {
-    ops::copy_(self, ops::unsqueeze(self, dim));
+    const int64_t ndim = self.dim();
+    dim = wrap_view_dim(dim, ndim + 1);
+    std::vector<int64_t> sizes = static_cast<std::vector<int64_t>>(self.shape());
+    std::vector<int64_t> strides = self.strides();
+    const int64_t stride = dim >= ndim ? 1 : sizes[dim] * strides[dim];
+    sizes.insert(sizes.begin() + dim, 1);
+    strides.insert(strides.begin() + dim, stride);
+    ops::as_strided_(self, sizes, strides);
     return self;
 }
 
@@ -345,13 +409,11 @@ Tensor& inplace_less_dd_Tensor(Tensor& self, const Tensor& other) {
 }
 
 Tensor& inplace_swapaxes_(Tensor& self, int64_t axis0, int64_t axis1) {
-    ops::copy_(self, ops::swapaxes(self, axis0, axis1));
-    return self;
+    return ops::transpose_(self, axis0, axis1);
 }
 
 Tensor& inplace_swapdims_(Tensor& self, int64_t dim0, int64_t dim1) {
-    ops::copy_(self, ops::swapdims(self, dim0, dim1));
-    return self;
+    return ops::transpose_(self, dim0, dim1);
 }
 
 Tensor& inplace_fmod_dd_Scalar(Tensor& self, const Scalar& other) {
