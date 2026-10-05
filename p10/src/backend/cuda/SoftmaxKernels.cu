@@ -23,6 +23,36 @@
 namespace tensorplay {
 namespace cuda {
 
+namespace {
+
+// Softmax over the single element of a 0-dim tensor reduces to a constant:
+// probability 1, or log-probability 0.  The fill goes through the dispatched
+// factory: the single element lives in device memory, which no host-side
+// store may touch.
+template <typename scalar_t>
+Tensor softmax_scalar_result(const Tensor& self, bool log_mode) {
+  return Tensor::full(std::vector<int64_t>{},
+                      Scalar(log_mode ? 0.0 : 1.0), self.dtype(), self.device());
+}
+
+Tensor softmax_scalar_result_dispatch(const Tensor& self, bool log_mode) {
+  switch (self.dtype()) {
+    case DType::Float32:
+      return softmax_scalar_result<float>(self, log_mode);
+    case DType::Float64:
+      return softmax_scalar_result<double>(self, log_mode);
+    case DType::Float16:
+      return softmax_scalar_result<Half>(self, log_mode);
+    case DType::BFloat16:
+      return softmax_scalar_result<BFloat16>(self, log_mode);
+    default:
+      TP_THROW(NotImplementedError,
+               "softmax: unsupported dtype on this GPU backend");
+  }
+}
+
+}  // namespace
+
 #ifdef USE_CUDNN
 
 Tensor softmax_native_impl(const Tensor& self, int64_t dim, bool log_mode);
@@ -35,7 +65,15 @@ bool softmax_native_fast_path(const Tensor& self, Tensor& result,
 
 Tensor cudnn_softmax(const Tensor& self, int64_t dim, bool log) {
     int64_t ndim = self.dim();
+    if (ndim == 0) {
+        return softmax_scalar_result_dispatch(self, log);
+    }
     if (dim < 0) dim += ndim;
+    if (dim < 0 || dim >= ndim) {
+        TP_THROW(RuntimeError,
+                 "Dimension out of range (expected to be in range of [",
+                 -ndim, ", ", ndim - 1, "], but got ", dim - ndim, ")");
+    }
     // The DNN softmax call below is only wired for 4-byte element types;
     // reduced-precision inputs would be described with a mismatched element
     // size and read/written out of bounds.  Route them to the native kernel,
@@ -55,6 +93,12 @@ Tensor cudnn_softmax(const Tensor& self, int64_t dim, bool log) {
     for(int i=dim+1; i<ndim; ++i) inner_size *= input.size(i);
 
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(input.shape()), input.dtype(), input.device());
+
+    // An empty iteration space has nothing to normalize, and the DNN call
+    // below does not accept zero-sized descriptors.
+    if (input.numel() == 0) {
+        return result;
+    }
 
     // A contiguous row along the fast dimension is a single-pass kernel in
     // this unit; the DNN library path stays for strided/spatial layouts.
@@ -179,9 +223,12 @@ inline int softmax_log2_ceil(int value) {
 }
 
 // Row length the wave kernel is built around: one lane per wave slot, at most
-// this many elements per lane.
+// this many elements per lane.  32 x 32 = 1024: past it the 64 accumulator
+// slots per lane would cost more in lost occupancy than the shared-memory
+// round trip they save, and the register-resident row kernel is faster there
+// (2048-wide rows measure 0.9x reference on it vs 1.1x on the wave tier).
 constexpr int kWaveLanes = 32;
-constexpr int kWaveElemsPerLane = 16;
+constexpr int kWaveElemsPerLane = 32;
 
 inline int softmax_wave_size() {
   static int wave = []() {
@@ -343,20 +390,25 @@ void launch_wave_softmax(scalar_t* dst, const scalar_t* src, int64_t batch_count
 
 // The wave kernel covers rows laid out along the fastest dimension with a
 // bounded row length; anything else (strided rows, very long rows, huge
-// batches) stays on the block kernel below.
+// batches) stays on the block kernels below.
 //
-// The row length is capped by what one lane has to hold: at sixteen elements
-// per lane the register-resident variants stay near forty registers and the
-// machine stays fully occupied, while longer rows spill into triple-digit
-// register counts and cost more in lost occupancy than they gain in reduced
-// block-reduce work.  Rows past the cap go to the block-per-row kernel, which
-// spreads the same row over more threads and keeps the whole slice in
-// registers at a fraction of the pressure.
+// The row length caps at kMaxRowLength: one lane then holds at most
+// kWaveElemsPerLane accumulator slots, past which the register-resident
+// slice costs more in lost occupancy than the shared-memory round trip it
+// avoids.  The slots live in acc_t, so wider accumulators lower the cap
+// through the byte budget below and keep the same per-lane register count.
+// Rows past the cap go to the block-per-row kernels, which spread the same
+// row over more threads and keep the whole slice in registers at a fraction
+// of the pressure.
 template <typename scalar_t, typename acc_t, bool LOG_MODE>
 bool try_wave_softmax(const Tensor& self, Tensor& result, int64_t softmax_size,
                       int64_t rows) {
   constexpr int64_t kMaxRowLength = kWaveLanes * kWaveElemsPerLane;
+  constexpr int64_t kMaxRowBytes = 8192;
   if (softmax_size <= 0 || softmax_size > kMaxRowLength) return false;
+  if (softmax_size * static_cast<int64_t>(sizeof(acc_t)) > kMaxRowBytes) {
+    return false;
+  }
   if (rows * softmax_size > static_cast<int64_t>(INT32_MAX)) return false;
   if (!self.is_contiguous() || !result.is_contiguous()) return false;
   launch_wave_softmax<scalar_t, acc_t, LOG_MODE>(
@@ -913,22 +965,36 @@ bool softmax_native_fast_path(const Tensor& self, Tensor& result,
 
 
 Tensor softmax_native_impl(const Tensor& self, int64_t dim, bool log_mode) {
-  int64_t dim_idx = dim < 0 ? dim + self.dim() : dim;
+  if (self.dim() == 0) {
+    return softmax_scalar_result_dispatch(self, log_mode);
+  }
+  if (dim < 0) dim += self.dim();
+  if (dim < 0 || dim >= self.dim()) {
+    TP_THROW(RuntimeError,
+             "Dimension out of range (expected to be in range of [",
+             -self.dim(), ", ", self.dim() - 1, "], but got ",
+             dim - self.dim(), ")");
+  }
+  // The row kernels below address the input with a contiguous-layout index.
+  Tensor input = self.is_contiguous() ? self : self.contiguous();
   Tensor result = Tensor::empty(
-      static_cast<std::vector<int64_t>>(self.shape()), self.dtype(),
-      self.device());
-  switch (self.dtype()) {
+      static_cast<std::vector<int64_t>>(input.shape()), input.dtype(),
+      input.device());
+  if (input.numel() == 0) {
+    return result;
+  }
+  switch (input.dtype()) {
     case DType::Float32:
-      softmax_dim_dispatch<float, float>(self, result, dim_idx, log_mode);
+      softmax_dim_dispatch<float, float>(input, result, dim, log_mode);
       break;
     case DType::Float64:
-      softmax_dim_dispatch<double, double>(self, result, dim_idx, log_mode);
+      softmax_dim_dispatch<double, double>(input, result, dim, log_mode);
       break;
     case DType::Float16:
-      softmax_dim_dispatch<Half, float>(self, result, dim_idx, log_mode);
+      softmax_dim_dispatch<Half, float>(input, result, dim, log_mode);
       break;
     case DType::BFloat16:
-      softmax_dim_dispatch<BFloat16, float>(self, result, dim_idx, log_mode);
+      softmax_dim_dispatch<BFloat16, float>(input, result, dim, log_mode);
       break;
     default:
       TP_THROW(NotImplementedError,
