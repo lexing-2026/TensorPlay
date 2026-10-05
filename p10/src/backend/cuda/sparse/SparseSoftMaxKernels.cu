@@ -430,12 +430,15 @@ void sparse_coo_softmax(Tensor& output, const Tensor& input, int64_t dim) {
 
     if (dim >= sparse_dim) {
         // The softmax dim is inside the dense payload: reduce the values
-        // with the dense kernels along the payload-relative dim.
+        // with the dense kernels along the payload-relative dim.  The dense
+        // result replaces the shell's values storage outright; copying
+        // elementwise would double the memory traffic of the whole op.
         const int64_t values_dim = dim - sparse_dim + 1;
         Tensor new_values = LogSoftMax
             ? ops_log_softmax(values, values_dim)
             : ops_softmax(values, values_dim);
-        out_values.copy_(new_values);
+        output = Tensor::make_sparse_coo_tensor(out_indices, new_values, sizes,
+                                                true);
         return;
     }
 
@@ -493,7 +496,8 @@ void sparse_coo_softmax_backward(Tensor& grad_input, const Tensor& grad,
                                            dim - sparse_dim + 1)
                 : ops_softmax_backward(grad_values, out_values,
                                        dim - sparse_dim + 1);
-            values.copy_(r);
+            grad_input = Tensor::make_sparse_coo_tensor(indices, r, sizes,
+                                                        true);
         } else {
             // Coordinates differ per entry: fall back to one dense backward
             // per matched output row, looked up by flattened coordinate.
