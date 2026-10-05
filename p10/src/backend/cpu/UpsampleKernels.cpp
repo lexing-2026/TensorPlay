@@ -8,10 +8,12 @@
 #include "Dispatcher.h"
 #include "Utils.h"
 #include "Parallel.h"
+#include "MemoryFormat.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include <cmath>
 #include <algorithm>
 #include "OutWrite.h"
+#include "cpu/UpsampleKernels.h"
 
 namespace tensorplay {
 namespace cpu {
@@ -165,6 +167,27 @@ Tensor upsample_nearest1d_cpu(const Tensor& self, const std::vector<int64_t>& ou
 
 Tensor upsample_nearest2d_cpu(const Tensor& self, const std::vector<int64_t>& output_size,
                               std::optional<double> scales_h, std::optional<double> scales_w) {
+    // Channels-last frames copy whole channel spans per output pixel; the
+    // span is the tier-compiled vectorized dimension (cpu/UpsampleKernels.h).
+    // Non-vectorized dtypes keep the NCHW path below.
+    if (self.numel() > 0 && output_size.size() >= 2 &&
+        output_size[0] > 0 && output_size[1] > 0 &&
+        self.is_contiguous(MemoryFormat::ChannelsLast) &&
+        (self.dtype() == DType::Float32 || self.dtype() == DType::Float64)) {
+        const int64_t N = self.size(0), C = self.size(1);
+        const int64_t H1 = self.size(2), W1 = self.size(3);
+        const int64_t H2 = output_size[0], W2 = output_size[1];
+        Tensor result = Tensor::empty(out_shape(self, output_size), self.dtype(), self.device());
+        result = result.as_strided(out_shape(self, output_size),
+                                   get_channels_last_strides(out_shape(self, output_size)), 0);
+        const double sh = compute_scales_value_f(scales_h, H1, H2);
+        const double sw = compute_scales_value_f(scales_w, W1, W2);
+        upsample_nearest2d_cl_stub(DeviceType::CPU, self.data_ptr(), result.data_ptr(),
+                                   N, C, H1, W1, H2, W2, sh, sw,
+                                   static_cast<int>(self.dtype()));
+        return result;
+    }
+
     Tensor in = self.is_contiguous() ? self : self.contiguous();
     Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
     const int64_t N = in.size(0), C = in.size(1);
@@ -275,6 +298,38 @@ Tensor upsample_linear1d_cpu(const Tensor& self, const std::vector<int64_t>& out
 
 Tensor upsample_bilinear2d_cpu(const Tensor& self, const std::vector<int64_t>& output_size,
                                bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w) {
+    // Channels-last frames blend four channel spans per output pixel with
+    // the tier-compiled vectorized dimension (cpu/UpsampleKernels.h); the
+    // area-pixel scales come from the same helpers as the NCHW frame, so the
+    // per-pixel weights round identically.  Non-vectorized dtypes keep the
+    // NCHW path below.
+    if (self.numel() > 0 && output_size.size() >= 2 &&
+        output_size[0] > 0 && output_size[1] > 0 &&
+        self.is_contiguous(MemoryFormat::ChannelsLast) &&
+        (self.dtype() == DType::Float32 || self.dtype() == DType::Float64)) {
+        const int64_t N = self.size(0), C = self.size(1);
+        const int64_t H1 = self.size(2), W1 = self.size(3);
+        const int64_t H2 = output_size[0], W2 = output_size[1];
+        Tensor result = Tensor::empty(out_shape(self, output_size), self.dtype(), self.device());
+        result = result.as_strided(out_shape(self, output_size),
+                                   get_channels_last_strides(out_shape(self, output_size)), 0);
+        const int dt = static_cast<int>(self.dtype());
+        if (self.dtype() == DType::Float32) {
+            const float rheight = area_pixel_compute_scale_f(H1, H2, align_corners, scales_h);
+            const float rwidth = area_pixel_compute_scale_f(W1, W2, align_corners, scales_w);
+            upsample_bilinear2d_cl_stub(DeviceType::CPU, self.data_ptr(), result.data_ptr(),
+                                        N, C, H1, W1, H2, W2, align_corners ? 1 : 0,
+                                        static_cast<double>(rheight), static_cast<double>(rwidth), dt);
+        } else {
+            const double rheight = area_pixel_compute_scale_f(H1, H2, align_corners, scales_h);
+            const double rwidth = area_pixel_compute_scale_f(W1, W2, align_corners, scales_w);
+            upsample_bilinear2d_cl_stub(DeviceType::CPU, self.data_ptr(), result.data_ptr(),
+                                        N, C, H1, W1, H2, W2, align_corners ? 1 : 0,
+                                        rheight, rwidth, dt);
+        }
+        return result;
+    }
+
     Tensor in = self.is_contiguous() ? self : self.contiguous();
     Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
     const int64_t batchsize = in.size(0), channels = in.size(1);
@@ -1501,6 +1556,9 @@ Tensor& upsample_nearest_exact3d_backward_grad_input_cpu(const Tensor& grad_outp
                                                         std::move(input_size), scales_d, scales_h, scales_w));
     return grad_input;
 }
+
+DEFINE_DISPATCH(upsample_nearest2d_cl_stub);
+DEFINE_DISPATCH(upsample_bilinear2d_cl_stub);
 
 TENSORPLAY_LIBRARY_IMPL(CPU, UpsampleKernels) {
     m.impl("upsample_nearest1d", upsample_nearest1d_cpu);
