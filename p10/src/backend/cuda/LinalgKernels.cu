@@ -264,6 +264,23 @@ struct CusolverTraits<float> {
                                   int lwork, int* info) {
         return cusolverDnSorgqr(h, m, n, k, a, lda, tau, work, lwork, info);
     }
+    static cusolverStatus_t ormqr_bufferSize(cusolverDnHandle_t h,
+                                             cublasSideMode_t side,
+                                             cublasOperation_t trans, int m,
+                                             int n, int k, const float* a,
+                                             int lda, const float* tau,
+                                             const float* c, int ldc, int* lw) {
+        return cusolverDnSormqr_bufferSize(h, side, trans, m, n, k, a, lda, tau,
+                                           c, ldc, lw);
+    }
+    static cusolverStatus_t ormqr(cusolverDnHandle_t h, cublasSideMode_t side,
+                                  cublasOperation_t trans, int m, int n, int k,
+                                  const float* a, int lda, const float* tau,
+                                  float* c, int ldc, float* work, int lwork,
+                                  int* info) {
+        return cusolverDnSormqr(h, side, trans, m, n, k, a, lda, tau, c, ldc,
+                                work, lwork, info);
+    }
     static cusolverStatus_t syevd_bufferSize(cusolverDnHandle_t h,
                                              cusolverEigMode_t jobz, char uplo,
                                              int n, const float* a, int lda,
@@ -345,6 +362,24 @@ struct CusolverTraits<double> {
                                   double* a, int lda, const double* tau,
                                   double* work, int lwork, int* info) {
         return cusolverDnDorgqr(h, m, n, k, a, lda, tau, work, lwork, info);
+    }
+    static cusolverStatus_t ormqr_bufferSize(cusolverDnHandle_t h,
+                                             cublasSideMode_t side,
+                                             cublasOperation_t trans, int m,
+                                             int n, int k, const double* a,
+                                             int lda, const double* tau,
+                                             const double* c, int ldc,
+                                             int* lw) {
+        return cusolverDnDormqr_bufferSize(h, side, trans, m, n, k, a, lda, tau,
+                                           c, ldc, lw);
+    }
+    static cusolverStatus_t ormqr(cusolverDnHandle_t h, cublasSideMode_t side,
+                                  cublasOperation_t trans, int m, int n, int k,
+                                  const double* a, int lda, const double* tau,
+                                  double* c, int ldc, double* work, int lwork,
+                                  int* info) {
+        return cusolverDnDormqr(h, side, trans, m, n, k, a, lda, tau, c, ldc,
+                                work, lwork, info);
     }
     static cusolverStatus_t syevd_bufferSize(cusolverDnHandle_t h,
                                              cusolverEigMode_t jobz, char uplo,
@@ -870,6 +905,45 @@ void apply_orgqr(Tensor& Q_cm, const Tensor& tau) {
     }
 }
 
+// C <- op(Q) C, with Q held implicitly by the geqrf output (QR_cm, tau).
+// Applies from the left over every batch of the column-major C buffer.
+template <typename scalar_t>
+void apply_ormqr(const Tensor& QR_cm, const Tensor& tau, Tensor& C_cm,
+                 bool transpose) {
+    using Tr = CusolverTraits<scalar_t>;
+    auto* a = QR_cm.data_ptr<scalar_t>();
+    auto* tau_ptr = tau.data_ptr<scalar_t>();
+    auto* c = C_cm.data_ptr<scalar_t>();
+    const int64_t a_ms = matrix_stride_of(QR_cm);
+    const int64_t tau_stride = tau.dim() > 1 ? tau.size(-1) : tau.numel();
+    const int64_t c_ms = matrix_stride_of(C_cm);
+    const int64_t batch = batch_count_of(C_cm);
+    const int m = static_cast<int>(C_cm.size(-2));
+    const int n = static_cast<int>(C_cm.size(-1));
+    const int k = static_cast<int>(tau.size(-1));
+    const int lda = std::max(1, static_cast<int>(QR_cm.size(-2)));
+    const int ldc = std::max(1, m);
+    const auto handle = CUDAContext::getCusolverDnHandle();
+    const cublasSideMode_t side = CUBLAS_SIDE_LEFT;
+    const cublasOperation_t trans = transpose ? CUBLAS_OP_T : CUBLAS_OP_N;
+    int lwork = 0;
+    CUSOLVER_CHECK(Tr::ormqr_bufferSize(handle, side, trans, m, n, k, a, lda,
+                                        tau_ptr, c, ldc, &lwork));
+    Tensor work = Tensor::empty({std::max(lwork, 1)}, C_cm.dtype(),
+                                C_cm.device());
+    scalar_t* work_ptr =
+        Tr::is_float ? reinterpret_cast<scalar_t*>(static_cast<void*>(work.data_ptr<float>()))
+                     : reinterpret_cast<scalar_t*>(static_cast<void*>(work.data_ptr<double>()));
+    Tensor dev_info = Tensor::zeros({batch}, DType::Int32, C_cm.device());
+    auto* info_data = dev_info.data_ptr<int32_t>();
+    for (int64_t i = 0; i < batch; ++i) {
+        CUSOLVER_CHECK(Tr::ormqr(handle, side, trans, m, n, k, &a[i * a_ms], lda,
+                                 &tau_ptr[i * tau_stride], &c[i * c_ms], ldc,
+                                 work_ptr, lwork, &info_data[i]));
+    }
+    check_infos(dev_info, "linalg.lstsq", C_cm.dim() == 2);
+}
+
 template <typename scalar_t>
 __global__ void triu_extract_kernel(const scalar_t* src, scalar_t* dst,
                                     int64_t ld_src, int64_t rows, int64_t cols,
@@ -1166,9 +1240,29 @@ Tensor linalg_solve_triangular_kernel_cuda(const Tensor& A, const Tensor& B,
 
 // ------------------------------------------------------------------ lstsq --
 
+// Squares and sums the trailing rows of the column-major working RHS. After
+// the QR solve those rows hold Q^T B below the solution block, i.e. the
+// residual vector of every right-hand side.
+template <typename scalar_t>
+__global__ void lstsq_residual_kernel(const scalar_t* b_cm, scalar_t* res,
+                                      int64_t ldb, int64_t nrhs,
+                                      int64_t row_begin, int64_t row_end,
+                                      int64_t count) {
+    const int64_t idx =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= count) return;
+    const int64_t i = idx / nrhs;
+    const int64_t col = idx % nrhs;
+    const scalar_t* column = b_cm + i * ldb * nrhs + col * ldb;
+    scalar_t acc = scalar_t(0);
+    for (int64_t r = row_begin; r < row_end; ++r) acc += column[r] * column[r];
+    res[idx] = acc;
+}
+
 std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_lstsq_kernel_cuda(
         const Tensor& A, const Tensor& B, std::optional<double> rcond,
         const std::optional<std::string>& driver_opt) {
+    (void)rcond;  // the QR driver assumes full column rank, so no cutoff
     const char* api = "linalg.lstsq";
     const std::string driver = driver_opt.value_or("gels");
     if (driver != "gels") {
@@ -1176,120 +1270,152 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_lstsq_kernel_cuda(
                  "' is not supported on CUDA; only 'gels' is implemented");
     }
     check_is_matrix(A, api);
-    check_is_matrix(B, api);
+    if (B.dim() < 1) {
+        TP_THROW(RuntimeError, api, ": B must have at least 1 dimension");
+    }
+    const int64_t dim_diff = A.dim() - B.dim();
+    if (dim_diff < 0 || dim_diff > 1) {
+        TP_THROW(RuntimeError, api,
+                 ": A and B must have compatible numbers of dimensions");
+    }
+    if (A.device() != B.device()) {
+        TP_THROW(DeviceMismatchError, api, ": A and B must be on the same device");
+    }
+    if (A.dtype() != B.dtype()) {
+        TP_THROW(RuntimeError, api, ": A and B must have the same dtype, but got ",
+                 scalarTypeName(A.dtype()), " and ", scalarTypeName(B.dtype()));
+    }
+    bool vector_case = B.dim() == 1;
+    if (!vector_case && A.dim() - 1 == B.dim()) {
+        vector_case = true;
+        for (int64_t i = 0; i < A.dim() - 1; ++i) {
+            if (A.size(i) != B.size(i)) {
+                vector_case = false;
+                break;
+            }
+        }
+    }
+    Tensor B_2d = vector_case ? B.unsqueeze(-1) : B;
+    if (A.size(-2) != B_2d.size(-2)) {
+        TP_THROW(RuntimeError, api, ": A and B have incompatible row dimensions: ",
+                 A.size(-2), " and ", B_2d.size(-2));
+    }
+
     const int64_t m = A.size(-2);
     const int64_t n = A.size(-1);
-    if (m < n) {
-        TP_THROW(RuntimeError, api,
-                 ": The input tensor A should have at least as many rows as columns.");
-    }
-    (void)rcond;
-
-    const auto batch = broadcast_batch(A, B);
-    const int64_t nrhs = B.size(-1);
-    const int64_t ldb = std::max(m, n);
+    const auto batch = broadcast_batch(A, B_2d);
+    const int64_t nrhs = B_2d.size(-1);
+    const int64_t ldb = std::max<int64_t>({int64_t{1}, m, n});
     const int64_t bs = linear_batch_size(batch);
 
-    Tensor A_cm = clone_batched_column_major(expand_to_batch(A, batch));
+    // The RHS lives in a column-major working buffer with max(m, n) rows: the
+    // strided copy fills the first m rows, a tall system later overwrites rows
+    // n..m-1 with the residual vectors, and a wide one zeroes its tail so the
+    // free components of Z vanish before Q multiplies back onto it.
     Tensor B_cm = empty_column_major(cat_batch(batch, {ldb, nrhs}),
                                      B.dtype(), B.device());
-    run_real(B.dtype(), [&](auto tag) {
-        using T = std::remove_pointer_t<decltype(tag)>;
-        // Zero-fill the padded buffer, then copy B into its top m rows.
-        cudaMemsetAsync(B_cm.data_ptr(), 0, sizeof(T) * B_cm.numel(),
-                        getCurrentCUDAStream().stream());
-        Tensor b_exp = expand_to_batch(B, batch).contiguous();
-        cudaMemcpy2DAsync(
-            B_cm.data_ptr<T>(), sizeof(T) * ldb, b_exp.data_ptr<T>(),
-            sizeof(T) * nrhs, sizeof(T) * m, nrhs, cudaMemcpyDeviceToDevice,
-            getCurrentCUDAStream().stream());
-        Tensor tau = Tensor::zeros(cat_batch(batch, {n}), A.dtype(), A.device());
-        apply_geqrf<T>(A_cm, tau);
-        // Apply Q^T to the padded RHS from the left.
-        {
-            using Tr = CusolverTraits<T>;
-            const auto handle = CUDAContext::getCusolverDnHandle();
-            int lwork = 0;
-            CUSOLVER_CHECK(
-                Tr::orgqr_bufferSize(handle, static_cast<int>(ldb),
-                                     static_cast<int>(nrhs), static_cast<int>(n),
-                                     A_cm.data_ptr<T>(), static_cast<int>(m),
-                                     tau.data_ptr<T>(), &lwork));
-            Tensor work = Tensor::empty({std::max(lwork, 1)}, A.dtype(), A.device());
-            Tensor dev_info = Tensor::zeros({bs}, DType::Int32, A.device());
-            for (int64_t i = 0; i < bs; ++i) {
-                if constexpr (std::is_same_v<T, float>) {
-                    CUSOLVER_CHECK(cusolverDnSormqr(
-                        handle, CUBLAS_SIDE_LEFT, CUBLAS_OP_T,
-                        static_cast<int>(ldb), static_cast<int>(nrhs),
-                        static_cast<int>(n), A_cm.data_ptr<float>() + i * m * n,
-                        static_cast<int>(m), tau.data_ptr<float>() + i * n,
-                        B_cm.data_ptr<float>() + i * ldb * nrhs,
-                        static_cast<int>(ldb), work.data_ptr<float>(), lwork,
-                        dev_info.data_ptr<int32_t>() + i));
-                } else {
-                    CUSOLVER_CHECK(cusolverDnDormqr(
-                        handle, CUBLAS_SIDE_LEFT, CUBLAS_OP_T,
-                        static_cast<int>(ldb), static_cast<int>(nrhs),
-                        static_cast<int>(n), A_cm.data_ptr<double>() + i * m * n,
-                        static_cast<int>(m), tau.data_ptr<double>() + i * n,
-                        B_cm.data_ptr<double>() + i * ldb * nrhs,
-                        static_cast<int>(ldb), work.data_ptr<double>(), lwork,
-                        dev_info.data_ptr<int32_t>() + i));
-                }
-            }
-        }
-        // Solve R X = Y with the leading n x n upper triangle.
-        {
+    B_cm.slice(-2, 0, m).copy_(expand_to_batch(B_2d, batch));
+
+    if (m > 0 && n > 0 && nrhs > 0) {
+        run_real(B.dtype(), [&](auto tag) {
+            using T = std::remove_pointer_t<decltype(tag)>;
             const T alpha = T(1);
             const auto handle = CUDAContext::getCublasHandle();
-            for (int64_t i = 0; i < bs; ++i) {
-                if constexpr (std::is_same_v<T, float>) {
-                    CUBLAS_CHECK(cublasStrsm(
-                        handle, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_UPPER,
-                        CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT, static_cast<int>(n),
-                        static_cast<int>(nrhs), &alpha,
-                        A_cm.data_ptr<float>() + i * m * n, static_cast<int>(m),
-                        B_cm.data_ptr<float>() + i * ldb * nrhs,
-                        static_cast<int>(ldb)));
-                } else {
-                    CUBLAS_CHECK(cublasDtrsm(
-                        handle, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_UPPER,
-                        CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT, static_cast<int>(n),
-                        static_cast<int>(nrhs), &alpha,
-                        A_cm.data_ptr<double>() + i * m * n, static_cast<int>(m),
-                        B_cm.data_ptr<double>() + i * ldb * nrhs,
-                        static_cast<int>(ldb)));
+            if (m >= n) {
+                Tensor A_cm =
+                    clone_batched_column_major(expand_to_batch(A, batch));
+                Tensor tau = Tensor::zeros(cat_batch(batch, {n}), A.dtype(),
+                                           A.device());
+                apply_geqrf<T>(A_cm, tau);
+                // B <- Q^T B over all m rows, then R X = Y on the leading n
+                // rows leaves the residual vectors in rows n..m-1.
+                apply_ormqr<T>(A_cm, tau, B_cm, true);
+                for (int64_t i = 0; i < bs; ++i) {
+                    if constexpr (std::is_same_v<T, float>) {
+                        CUBLAS_CHECK(cublasStrsm(
+                            handle, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_UPPER,
+                            CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT,
+                            static_cast<int>(n), static_cast<int>(nrhs), &alpha,
+                            A_cm.data_ptr<float>() + i * matrix_stride_of(A_cm),
+                            static_cast<int>(m),
+                            B_cm.data_ptr<float>() + i * ldb * nrhs,
+                            static_cast<int>(ldb)));
+                    } else {
+                        CUBLAS_CHECK(cublasDtrsm(
+                            handle, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_UPPER,
+                            CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT,
+                            static_cast<int>(n), static_cast<int>(nrhs), &alpha,
+                            A_cm.data_ptr<double>() + i * matrix_stride_of(A_cm),
+                            static_cast<int>(m),
+                            B_cm.data_ptr<double>() + i * ldb * nrhs,
+                            static_cast<int>(ldb)));
+                    }
                 }
+            } else {
+                // Wide system: factor A^H = Q R, solve R^H Z = B into the
+                // first m rows (the zero tail completes Z), then X = Q Z.
+                Tensor Ah_cm =
+                    clone_batched_column_major(expand_to_batch(A, batch).mH());
+                Tensor tau = Tensor::zeros(cat_batch(batch, {m}), A.dtype(),
+                                           A.device());
+                apply_geqrf<T>(Ah_cm, tau);
+                for (int64_t i = 0; i < bs; ++i) {
+                    if constexpr (std::is_same_v<T, float>) {
+                        CUBLAS_CHECK(cublasStrsm(
+                            handle, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_UPPER,
+                            CUBLAS_OP_T, CUBLAS_DIAG_NON_UNIT,
+                            static_cast<int>(m), static_cast<int>(nrhs), &alpha,
+                            Ah_cm.data_ptr<float>() + i * matrix_stride_of(Ah_cm),
+                            static_cast<int>(n),
+                            B_cm.data_ptr<float>() + i * ldb * nrhs,
+                            static_cast<int>(ldb)));
+                    } else {
+                        CUBLAS_CHECK(cublasDtrsm(
+                            handle, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_UPPER,
+                            CUBLAS_OP_T, CUBLAS_DIAG_NON_UNIT,
+                            static_cast<int>(m), static_cast<int>(nrhs), &alpha,
+                            Ah_cm.data_ptr<double>() + i * matrix_stride_of(Ah_cm),
+                            static_cast<int>(n),
+                            B_cm.data_ptr<double>() + i * ldb * nrhs,
+                            static_cast<int>(ldb)));
+                    }
+                }
+                // The untouched tail rows hold the free components of Z;
+                // zero them so Q multiplies onto the exact minimizer.
+                B_cm.slice(-2, m, n).zero_();
+                apply_ormqr<T>(Ah_cm, tau, B_cm, false);
             }
-        }
-    });
+        });
+    }
+
     Tensor solution = B_cm.contiguous().slice(-2, 0, n).contiguous();
+    if (vector_case) solution = solution.squeeze(-1);
+
     Tensor residuals;
     if (m > n) {
         residuals = Tensor::empty(cat_batch(batch, {nrhs}), B.dtype(), B.device());
-        Tensor B_h = B_cm.contiguous().to(Device(DeviceType::CPU), B.dtype());
-        run_real(B.dtype(), [&](auto tag) {
-            using T = std::remove_pointer_t<decltype(tag)>;
-            const T* b = B_h.data_ptr<T>();
-            std::vector<T> res(static_cast<size_t>(bs * nrhs), T(0));
-            for (int64_t i = 0; i < bs; ++i)
-                for (int64_t c = 0; c < nrhs; ++c)
-                    for (int64_t r_ = n; r_ < ldb; ++r_) {
-                        const T v = b[i * ldb * nrhs + c * ldb + r_];
-                        res[i * nrhs + c] += v * v;
-                    }
-            Tensor staged = Tensor::tensor(res);
-            cudaMemcpyAsync(residuals.data_ptr(), staged.data_ptr(),
-                            sizeof(T) * bs * nrhs, cudaMemcpyHostToDevice,
-                            getCurrentCUDAStream().stream());
-        });
+        const int64_t count = bs * nrhs;
+        if (count > 0) {
+            run_real(B.dtype(), [&](auto tag) {
+                using T = std::remove_pointer_t<decltype(tag)>;
+                const int block = 256;
+                const int grid =
+                    static_cast<int>((count + block - 1) / block);
+                lstsq_residual_kernel<T><<<grid, block, 0,
+                                           getCurrentCUDAStream().stream()>>>(
+                    B_cm.data_ptr<T>(), residuals.data_ptr<T>(), ldb, nrhs, n,
+                    m, count);
+            });
+        }
     } else {
-        residuals = Tensor::empty(cat_batch(batch, {0}), B.dtype(), B.device());
+        residuals = Tensor::empty({0}, B.dtype(), B.device());
     }
-    Tensor rank = Tensor::full(batch, Scalar(static_cast<int64_t>(n)),
-                               DType::Int64, B.device());
-    return {solution, residuals, rank, solution};
+    // The QR driver assumes full rank: no per-batch rank and no singular
+    // values are reported.
+    Tensor rank = Tensor::empty({0}, DType::Int64, B.device());
+    Tensor singular_values =
+        Tensor::empty({0}, B.dtype(), B.device());
+    return {solution, residuals, rank, singular_values};
 }
 
 // -------------------------------------------------------- lu with unpack ---
