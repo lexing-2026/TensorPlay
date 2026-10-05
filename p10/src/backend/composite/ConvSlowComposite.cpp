@@ -1,7 +1,8 @@
 // Rank-specific "slow" convolution spellings.
 //
-// These entries are the explicit single-group, unit-dilation layer entry
-// points; the math routes through the rank-generic convolution kernels that
+// These entries are the explicit single-group layer entry points (unit
+// dilation except for the dilated and transposed spellings); the math routes
+// through the rank-generic convolution kernels that
 // the dispatcher already owns, so every backend those kernels support is
 // available and no per-operator math is duplicated.  The explicit kernel
 // size arguments are validated against the weight shape as a consistency
@@ -190,6 +191,45 @@ Tensor& slow_conv_transpose2d_out_native(
     return out;
 }
 
+Tensor slow_conv_transpose3d_native(
+    const Tensor& self, const Tensor& weight,
+    const std::vector<int64_t>& kernel_size, const std::optional<Tensor>& bias,
+    const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+    const std::vector<int64_t>& output_padding,
+    const std::vector<int64_t>& dilation) {
+    check_kernel_size(kernel_size, weight, "slow_conv_transpose3d");
+    return ops::conv_transpose3d(
+        self, weight, bias,
+        fill_stride_or_padding(stride, 3, "slow_conv_transpose3d"),
+        fill_stride_or_padding(padding, 3, "slow_conv_transpose3d"),
+        fill_stride_or_padding(output_padding, 3, "slow_conv_transpose3d"), 1,
+        fill_stride_or_padding(dilation, 3, "slow_conv_transpose3d"));
+}
+
+Tensor slow_conv_dilated2d_native(
+    const Tensor& self, const Tensor& weight,
+    const std::vector<int64_t>& kernel_size, const std::optional<Tensor>& bias,
+    const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+    const std::vector<int64_t>& dilation) {
+    check_kernel_size(kernel_size, weight, "slow_conv_dilated2d");
+    return ops::conv2d(self, weight, bias,
+                       fill_stride_or_padding(stride, 2, "slow_conv_dilated2d"),
+                       fill_stride_or_padding(padding, 2, "slow_conv_dilated2d"),
+                       fill_stride_or_padding(dilation, 2, "slow_conv_dilated2d"), 1);
+}
+
+Tensor slow_conv_dilated3d_native(
+    const Tensor& self, const Tensor& weight,
+    const std::vector<int64_t>& kernel_size, const std::optional<Tensor>& bias,
+    const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+    const std::vector<int64_t>& dilation) {
+    check_kernel_size(kernel_size, weight, "slow_conv_dilated3d");
+    return ops::conv3d(self, weight, bias,
+                       fill_stride_or_padding(stride, 3, "slow_conv_dilated3d"),
+                       fill_stride_or_padding(padding, 3, "slow_conv_dilated3d"),
+                       fill_stride_or_padding(dilation, 3, "slow_conv_dilated3d"), 1);
+}
+
 }  // namespace composite
 }  // namespace tensorplay
 
@@ -208,4 +248,7 @@ TENSORPLAY_LIBRARY_IMPL(Composite, ConvSlowComposite) {
     m.impl("slow_conv3d_forward.output", slow_conv3d_forward_output_native);
     m.impl("slow_conv_transpose2d", slow_conv_transpose2d_native);
     m.impl("slow_conv_transpose2d.out", slow_conv_transpose2d_out_native);
+    m.impl("slow_conv_transpose3d", slow_conv_transpose3d_native);
+    m.impl("slow_conv_dilated2d", slow_conv_dilated2d_native);
+    m.impl("slow_conv_dilated3d", slow_conv_dilated3d_native);
 }

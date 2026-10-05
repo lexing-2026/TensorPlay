@@ -14,8 +14,8 @@ Tensor interop_conv_depthwise3d_cuda(
         const std::vector<int64_t>& padding,
         const std::vector<int64_t>& dilation) {
     (void)kernel_size;
-    return dispatch_cuda<Tensor>("conv3d", self, weight, bias, stride, padding,
-                                 dilation, weight.size(0));
+    return ops::conv3d(self, weight, bias, stride, padding, dilation,
+                       self.size(-4));
 }
 
 } // namespace

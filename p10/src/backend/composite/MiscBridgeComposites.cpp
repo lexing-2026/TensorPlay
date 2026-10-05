@@ -201,11 +201,11 @@ Tensor _dim_arange_impl(const Tensor& like, int64_t dim) {
     return ops::arange(Scalar(like.size(dim)), DType::Int64, like.device());
 }
 
-// ---- _masked_scale
+// ---- _masked_scale: the kept entries scaled, the dropped ones zero.
 Tensor _masked_scale_impl(const Tensor& self, const Tensor& mask, double scale) {
     return ops::mul(self, ops::where(mask.to(DType::Bool),
                                      ops::full({}, Scalar(scale), self.dtype(), self.device()),
-                                     ops::full({}, Scalar(1.0), self.dtype(), self.device())));
+                                     ops::full({}, Scalar(0.0), self.dtype(), self.device())));
 }
 
 // ---- _mkldnn_transpose / _to_sparse bridges route to the registered kernels

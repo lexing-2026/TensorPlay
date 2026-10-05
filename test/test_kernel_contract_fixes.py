@@ -409,3 +409,49 @@ def test_cuda_binary_math_broadcasts_like_cpu():
         got = fn(a.cuda(), b.cuda(), wide.cuda())
         assert tuple(got.shape) == tuple(want.shape) and got.dtype == want.dtype
         assert _close(got, want)
+
+
+@cuda_only
+def test_cuda_depthwise_spelling_takes_an_absent_bias_and_one_group_per_channel():
+    # The depthwise spelling answers like the grouped convolution it names --
+    # without a bias, and for a weight that widens each input channel into
+    # several outputs.
+    tp.manual_seed(0)
+    x = tp.randn(2, 3, 7, 7, device="cuda", requires_grad=True)
+    w = tp.randn(6, 1, 3, 3, device="cuda", requires_grad=True)
+    got = ops._conv_depthwise2d.default(x, w, [3, 3], None, [1, 1], [1, 1], [1, 1])
+    want = tp.nn.functional.conv2d(x, w, padding=1, groups=3)
+    assert _close(got, want)
+    gx, gw = tp.autograd.grad(got.square().sum(), [x, w])
+    ex, ew = tp.autograd.grad(want.square().sum(), [x, w])
+    assert _close(gx, ex, 1e-4) and _close(gw, ew, 1e-4)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_dilated_and_transposed_spellings_answer_like_the_convolution(device):
+    tp.manual_seed(0)
+    x = tp.randn(2, 3, 7, 7, device=device, requires_grad=True)
+    w = tp.randn(4, 3, 3, 3, device=device)
+    got = ops.slow_conv_dilated2d.default(x, w, [3, 3], None, [1, 1], [2, 2], [2, 2])
+    want = tp.nn.functional.conv2d(x, w, padding=2, dilation=2)
+    assert _close(got, want, 1e-4)
+    (gx,) = tp.autograd.grad(got.sum(), [x])
+    (ex,) = tp.autograd.grad(want.sum(), [x])
+    assert _close(gx, ex, 1e-4)
+    x3 = tp.randn(1, 2, 5, 5, 5, device=device)
+    w3 = tp.randn(2, 3, 3, 3, 3, device=device)
+    got = ops.slow_conv_dilated3d.default(x3, w3.transpose(0, 1).contiguous(), [3, 3, 3], None, [1, 1, 1], [1, 1, 1], [1, 1, 1])
+    assert _close(got, tp.nn.functional.conv3d(x3, w3.transpose(0, 1).contiguous(), padding=1), 1e-4)
+    got = ops.slow_conv_transpose3d.default(x3, w3, [3, 3, 3], None, [1, 1, 1], [0, 0, 0], [0, 0, 0], [1, 1, 1])
+    assert _close(got, tp.nn.functional.conv_transpose3d(x3, w3), 1e-4)
+
+
+@cuda_only
+def test_cuda_fused_dropout_keeps_with_the_probability_given():
+    tp.manual_seed(0)
+    x = tp.ones(20000, device="cuda")
+    out, mask = tp._C._fused_dropout(x, 0.9)
+    assert mask.dtype == tp.uint8
+    kept = mask.float().mean().item()
+    assert 0.88 < kept < 0.92
+    assert _close(out, mask.float() / 0.9)

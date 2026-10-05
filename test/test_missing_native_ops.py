@@ -304,30 +304,62 @@ def test_safe_softmax_zeroes_fully_masked_rows():
     assert out.tolist() == [[0.0, 0.0], [0.5, 0.5]]
 
 
-def test_masked_softmax_restricts_and_zeroes_rejected_entries():
-    x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
-    mask = tp.tensor([[True, False], [True, True]])
-    out = tp._C._masked_softmax(x, mask, -1, None)
-    # Row 0 keeps only its selected entry, so its probability is 1 there;
-    # row 1 reduces the ordinary softmax of the full row.
-    _allclose(out, tp.tensor([[1.0, 0.0], [0.268941, 0.731059]]))
+MASK_DEVICES = ["cpu"] + (["cuda"] if tp.cuda.is_available() else [])
 
-    # A row the mask rejects entirely answers zeros, not NaN.
-    empty = tp._C._masked_softmax(x, tp.zeros(2, 2, dtype=tp.bool), -1, None)
+
+@pytest.mark.parametrize("device", MASK_DEVICES)
+def test_masked_softmax_leaves_out_the_marked_entries(device):
+    # The mask marks the entries to leave out.
+    x = tp.tensor([[1.0, 2.0], [3.0, 4.0]], device=device)
+    mask = tp.tensor([[False, True], [False, False]], device=device)
+    out = tp._C._masked_softmax(x, mask, -1, None)
+    # Row 0 keeps only its first entry, so its probability is 1 there;
+    # row 1 keeps both and is the ordinary softmax of the full row.
+    _allclose(out.cpu(), tp.tensor([[1.0, 0.0], [0.268941, 0.731059]]))
+
+    # A row the mask leaves out entirely answers zeros, not NaN.
+    empty = tp._C._masked_softmax(x, tp.ones(2, 2, dtype=tp.bool, device=device), -1, None)
     assert empty.tolist() == [[0.0, 0.0], [0.0, 0.0]]
 
     # Omitting the reduction axis defaults to the last one.
     default = tp._C._masked_softmax(x, mask, None, None)
-    _allclose(default, out)
+    _allclose(default.cpu(), out.cpu())
+
+
+@pytest.mark.parametrize("device", MASK_DEVICES)
+def test_masked_softmax_padding_mask_covers_every_head_and_query(device):
+    # A (B, L) padding mask with mask_type 1 leaves the same keys out for
+    # every head and query of its batch entry.
+    x = tp.zeros(2, 3, 2, 2, device=device)
+    pad = tp.tensor([[False, True], [False, False]], device=device)
+    out = tp._C._masked_softmax(x, pad, -1, 1).cpu()
+    assert out[0].tolist() == [[[1.0, 0.0], [1.0, 0.0]]] * 3
+    assert out[1].tolist() == [[[0.5, 0.5], [0.5, 0.5]]] * 3
 
 
 def test_masked_softmax_backward_matches_the_masked_correction():
     x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
-    mask = tp.tensor([[True, False], [True, True]])
+    mask = tp.tensor([[False, True], [False, False]])
     out = tp._C._masked_softmax(x, mask, -1, None)
     grad = tp.tensor([[1.0, 2.0], [0.5, 1.5]])
     g = tp._C._masked_softmax_backward(grad, out, mask, -1)
     _allclose(g, tp.tensor([[0.0, 0.0], [-0.196612, 0.196612]]))
+
+
+def test_masked_tensor_softmax_normalizes_over_the_present_entries():
+    from tensorplay.masked import masked_tensor
+
+    x = tp.tensor([[1.0, 2.0, 3.0, 4.0]])
+    present = tp.tensor([[True, True, False, True]])
+    out = masked_tensor(x, present).softmax(-1)
+    _allclose(out.get_data()[present], tp.tensor([0.0420100, 0.1141952, 0.8437947]))
+
+
+@pytest.mark.parametrize("device", MASK_DEVICES)
+def test_masked_scale_zeroes_what_the_mask_drops(device):
+    x = tp.ones(4, device=device)
+    mask = tp.tensor([1, 0, 1, 0], dtype=tp.uint8, device=device)
+    assert tp._C._masked_scale(x, mask, 2.0).tolist() == [2.0, 0.0, 2.0, 0.0]
 
 
 # ------------------------------------------------------------ reductions / misc

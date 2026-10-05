@@ -15,8 +15,8 @@ Tensor& interop_slow_conv_transpose2d_out_cuda(
         const std::vector<int64_t>& output_padding,
         const std::vector<int64_t>& dilation, Tensor& out) {
     (void)kernel_size;
-    write_out(out, dispatch_cuda<Tensor>("conv_transpose2d", input, weight, bias, stride,
-                                padding, output_padding, int64_t(1), dilation));
+    write_out(out, ops::conv_transpose2d(input, weight, bias, stride, padding,
+                                         output_padding, 1, dilation));
     return out;
 }
 

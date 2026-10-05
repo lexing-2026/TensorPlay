@@ -14,8 +14,7 @@ Tensor interop__slow_conv2d_forward_cuda(
         const std::vector<int64_t>& padding) {
     (void)kernel_size;
     const std::vector<int64_t> dilation{1, 1};
-    return dispatch_cuda<Tensor>("conv2d", self, weight, bias, stride, padding,
-                                 dilation, int64_t(1));
+    return ops::conv2d(self, weight, bias, stride, padding, dilation, 1);
 }
 
 
@@ -26,8 +25,8 @@ Tensor& interop__slow_conv2d_forward_output_cuda(
         const std::vector<int64_t>& padding, Tensor& output) {
     (void)kernel_size;
     const std::vector<int64_t> dilation{1, 1};
-    write_out(output, dispatch_cuda<Tensor>("conv2d", self, weight, bias, stride,
-                                   padding, dilation, int64_t(1)));
+    write_out(output, ops::conv2d(self, weight, bias, stride, padding,
+                                  dilation, 1));
     return output;
 }
 
@@ -40,15 +39,9 @@ std::tuple<Tensor, Tensor, Tensor> interop__slow_conv2d_backward_grad_input_cuda
         Tensor& grad_weight, Tensor& grad_bias) {
     (void)kernel_size;
     const std::vector<int64_t> dilation{1, 1};
-    write_out(grad_input, dispatch_cuda<Tensor>("conv2d_grad_input", grad_output, self,
-                                      weight, stride, padding, dilation,
-                                      int64_t(1)));
-    write_out(grad_weight, dispatch_cuda<Tensor>("conv2d_grad_weight", grad_output, self,
-                                       weight, stride, padding, dilation,
-                                       int64_t(1)));
-    write_out(grad_bias, dispatch_cuda<Tensor>("conv2d_grad_bias", grad_output, self,
-                                      weight, stride, padding, dilation,
-                                      int64_t(1)));
+    write_out(grad_input, ops::conv2d_grad_input(grad_output, self, weight, stride, padding, dilation, 1));
+    write_out(grad_weight, ops::conv2d_grad_weight(grad_output, self, weight, stride, padding, dilation, 1));
+    write_out(grad_bias, ops::conv2d_grad_bias(grad_output, self, weight, stride, padding, dilation, 1));
     return std::make_tuple(grad_input, grad_weight, grad_bias);
 }
 
@@ -65,17 +58,11 @@ interop__slow_conv2d_backward_output_mask_cuda(
     const bool want_i = output_mask.size() > 0 && output_mask[0];
     const bool want_w = output_mask.size() > 1 && output_mask[1];
     const bool want_b = output_mask.size() > 2 && output_mask[2];
-    Tensor gi = want_i ? dispatch_cuda<Tensor>("conv2d_grad_input", grad_output,
-                                               self, weight, stride, padding,
-                                               dilation, int64_t(1))
+    Tensor gi = want_i ? ops::conv2d_grad_input(grad_output, self, weight, stride, padding, dilation, 1)
                        : Tensor();
-    Tensor gw = want_w ? dispatch_cuda<Tensor>("conv2d_grad_weight", grad_output,
-                                               self, weight, stride, padding,
-                                               dilation, int64_t(1))
+    Tensor gw = want_w ? ops::conv2d_grad_weight(grad_output, self, weight, stride, padding, dilation, 1)
                        : Tensor();
-    Tensor gb = want_b ? dispatch_cuda<Tensor>("conv2d_grad_bias", grad_output,
-                                              self, weight, stride, padding,
-                                              dilation, int64_t(1))
+    Tensor gb = want_b ? ops::conv2d_grad_bias(grad_output, self, weight, stride, padding, dilation, 1)
                        : Tensor();
     return std::make_tuple(gi, gw, gb);
 }

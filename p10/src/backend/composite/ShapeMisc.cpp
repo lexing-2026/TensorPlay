@@ -160,36 +160,47 @@ Tensor _safe_softmax_native(const Tensor& self, int64_t dim,
     return ops::where(masked_rows, Scalar(0.0), out);
 }
 
-// _masked_softmax: softmax over the entries the mask selects; rejected
-// positions contribute nothing and stay zero in the output.  Rejected
-// logits are replaced with -inf before the reduction so their exponential
-// underflows to zero instead of poisoning the row, and the mask is applied
-// to the result again so rejected positions answer exactly zero.
+// A softmax that leaves out the positions the mask marks.  Those take no
+// part in the normalization and answer zero, as does every position of a row
+// the mask leaves out entirely.  A padding mask (type 1) holds one row per
+// batch entry, (B, L), and covers every head and query of a (B, H, L, L)
+// input; an attention mask (type 0) is (L, L) and broadcasts as it is.
+Tensor masked_softmax_dropped(const Tensor& self, const Tensor& mask,
+                              std::optional<int64_t> mask_type) {
+    TP_CHECK(mask.dtype() == DType::Bool, "Mask should be a boolean tensor");
+    if (mask_type.has_value() && *mask_type == 1 && mask.dim() == 2 &&
+        self.dim() == 4) {
+        TP_CHECK(self.size(0) == mask.size(0) && self.size(2) == mask.size(1),
+                 "For mask_type == 1 mask shape should be (B, L)");
+        return ops::view(mask, {mask.size(0), 1, 1, mask.size(1)});
+    }
+    return mask;
+}
+
 Tensor _masked_softmax_native(const Tensor& self, const Tensor& mask,
                               std::optional<int64_t> dim,
                               std::optional<int64_t> mask_type) {
-    (void)mask_type;
     const int64_t d = dim.has_value() ? *dim : -1;
+    const Tensor dropped = masked_softmax_dropped(self, mask, mask_type);
     Tensor neg_inf =
         ops::full_like(self, Scalar(-std::numeric_limits<double>::infinity()));
-    Tensor masked = ops::where(mask, self, neg_inf);
-    Tensor out = ops::softmax(masked, d, DType::Undefined);
-    return ops::where(mask, out, ops::zeros_like(self));
+    Tensor out = ops::softmax(ops::where(dropped, neg_inf, self), d, DType::Undefined);
+    return ops::where(dropped, ops::zeros_like(self), out);
 }
 
-// Gradient of the masked softmax: rejected positions pass nothing through,
-// and the selected positions carry the usual softmax correction
-// o * (g - <g, o>) with both vectors restricted to the selected entries.
+// Gradient of the masked softmax: dropped positions pass nothing through,
+// and the kept ones carry the usual softmax correction o * (g - <g, o>) with
+// both vectors restricted to the kept entries.
 Tensor _masked_softmax_backward_native(const Tensor& grad_output,
                                        const Tensor& output,
                                        const Tensor& mask,
                                        std::optional<int64_t> dim) {
     const int64_t d = dim.has_value() ? *dim : -1;
-    Tensor g = ops::where(mask, grad_output, ops::zeros_like(grad_output));
-    Tensor o = ops::where(mask, output, ops::zeros_like(output));
+    Tensor g = ops::where(mask, ops::zeros_like(grad_output), grad_output);
+    Tensor o = ops::where(mask, ops::zeros_like(output), output);
     Tensor dot = ops::sum(ops::mul(g, o), {d}, true);
-    return ops::where(mask, ops::mul(o, ops::sub(g, dot)),
-                      ops::zeros_like(grad_output));
+    return ops::where(mask, ops::zeros_like(grad_output),
+                      ops::mul(o, ops::sub(g, dot)));
 }
 
 Tensor _logcumsumexp_native(const Tensor& self, int64_t dim) {

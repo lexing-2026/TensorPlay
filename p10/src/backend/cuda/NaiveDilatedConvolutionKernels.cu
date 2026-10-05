@@ -14,8 +14,7 @@ Tensor interop_slow_conv_dilated2d_cuda(
         const std::vector<int64_t>& padding,
         const std::vector<int64_t>& dilation) {
     (void)kernel_size;
-    return dispatch_cuda<Tensor>("conv2d", self, weight, bias, stride, padding,
-                                 dilation, int64_t(1));
+    return ops::conv2d(self, weight, bias, stride, padding, dilation, 1);
 }
 
 
@@ -26,8 +25,7 @@ Tensor interop_slow_conv_dilated3d_cuda(
         const std::vector<int64_t>& padding,
         const std::vector<int64_t>& dilation) {
     (void)kernel_size;
-    return dispatch_cuda<Tensor>("conv3d", self, weight, bias, stride, padding,
-                                 dilation, int64_t(1));
+    return ops::conv3d(self, weight, bias, stride, padding, dilation, 1);
 }
 
 } // namespace

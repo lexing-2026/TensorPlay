@@ -9,7 +9,8 @@ namespace {
 
 // ---------------------------------------------------------------------------
 // Depthwise / slow convolution spellings.  tp's conv2d/conv3d kernels take
-// groups natively; the depthwise spellings derive groups from the weight.
+// groups natively; a depthwise convolution has one group per input channel,
+// each widened to weight.size(0) / channels outputs.
 // ---------------------------------------------------------------------------
 
 Tensor interop__conv_depthwise2d_cuda(const Tensor& self, const Tensor& weight,
@@ -19,8 +20,8 @@ Tensor interop__conv_depthwise2d_cuda(const Tensor& self, const Tensor& weight,
                                       const std::vector<int64_t>& padding,
                                       const std::vector<int64_t>& dilation) {
     (void)kernel_size;
-    return dispatch_cuda<Tensor>("conv2d", self, weight, bias, stride, padding,
-                                 dilation, weight.size(0));
+    return ops::conv2d(self, weight, bias, stride, padding, dilation,
+                       self.size(-3));
 }
 
 
@@ -31,8 +32,8 @@ Tensor& interop__conv_depthwise2d_out_cuda(
         const std::vector<int64_t>& padding,
         const std::vector<int64_t>& dilation, Tensor& out) {
     (void)kernel_size;
-    write_out(out, dispatch_cuda<Tensor>("conv2d", self, weight, bias, stride, padding,
-                                dilation, weight.size(0)));
+    write_out(out, ops::conv2d(self, weight, bias, stride, padding, dilation,
+                               self.size(-3)));
     return out;
 }
 
