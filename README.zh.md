@@ -104,7 +104,8 @@
 </details>
 
 <div align="center">
-    <iframe src="https://player.bilibili.com/player.html?bvid=BV1JcaD64E8H&page=1" scrolling="no" border="0" frameborder="no" framespacing="0" allowfullscreen="true" width="100%" height="500" style="max-width: 960px; display: block; margin: 0 auto;"></iframe>
+    <video src="https://github.com/user-attachments/assets/e4ba112d-62a3-4639-aa7f-2e2b050a9b4d" controls preload="metadata" width="100%" style="max-width: 960px; display: block; margin: 0 auto; border-radius: 8px;"></video>
+    <p><sub><a href="https://www.bilibili.com/video/BV1JcaD64E8H">在 B 站观看完整影片</a></sub></p>
 </div>
 
 TensorPlay 是一个面向学习者的深度学习框架：它融合了类 NumPy 的张量计算与 GPU 加速，并配以建立在显式计算图（DAG）之上的自动微分引擎来训练神经网络。整个技术栈——Python API、C++ 核心、CUDA 内核、编译器——都写成可以从头读到尾：模型与硬件之间没有黑盒。

@@ -103,7 +103,8 @@
 </details>
 
 <div align="center">
-    <iframe src="https://player.bilibili.com/player.html?bvid=BV1JcaD64E8H&page=1" scrolling="no" border="0" frameborder="no" framespacing="0" allowfullscreen="true" width="100%" height="500" style="max-width: 960px; display: block; margin: 0 auto;"></iframe>
+    <video src="https://github.com/user-attachments/assets/e4ba112d-62a3-4639-aa7f-2e2b050a9b4d" controls preload="metadata" width="100%" style="max-width: 960px; display: block; margin: 0 auto; border-radius: 8px;"></video>
+    <p><sub><a href="https://www.bilibili.com/video/BV1JcaD64E8H">Watch the full film on Bilibili</a></sub></p>
 </div>
 
 --------------------------------------------------------------------------------
