@@ -1,7 +1,6 @@
 """Inverses, linear solves and least squares."""
 import operator
 
-import tensorplay
 from tensorplay import _C
 from tensorplay._C import (
     linalg_inv_ex,
@@ -10,8 +9,7 @@ from tensorplay._C import (
     linalg_solve_triangular as solve_triangular,
 )
 
-from ._common import LstsqResult, SlogdetResult, as_index, check_floating, eps_of
-from ._decompositions import eigh, svd
+from ._common import LstsqResult, SlogdetResult, as_index, check_floating
 
 __all__ = [
     "det",
@@ -70,39 +68,18 @@ def lstsq(A, B, rcond=None, *, driver=None):
 def pinv(A, *, atol=None, rtol=None, hermitian=False):
     """pinv(A, *, atol=None, rtol=None, hermitian=False) -> Tensor
 
-    Moore-Penrose pseudo-inverse built from the SVD, with singular values at
-    or below ``atol + rtol * sigma_max`` treated as zero.
+    Moore-Penrose pseudo-inverse.  Singular values (eigenvalue magnitudes
+    when ``hermitian``) at or below ``max(atol, rtol * sigma_max)`` are
+    treated as zero; ``rtol`` defaults to ``eps * max(m, n)``, or to zero
+    when only a positive ``atol`` is given.  The tolerances may be floats or
+    tensors that broadcast against the batch.
     """
     check_floating(A, "pinv")
     if A.dim() < 2:
         raise ValueError("linalg.pinv: input must contain matrices")
     if hermitian and A.shape[-1] != A.shape[-2]:
         raise ValueError("linalg.pinv: hermitian input must be square")
-    eps = eps_of(A.dtype)
-    max_mn = max(A.shape[-2], A.shape[-1])
-    atol_val = 0.0 if atol is None else float(atol)
-    rtol_val = (eps * max_mn) if rtol is None else float(rtol)
-    if hermitian:
-        eig = eigh(A)
-        values = eig.eigenvalues
-        vectors = eig.eigenvectors
-        magnitude = values.abs()
-        cutoff = atol_val + rtol_val * magnitude.max(dim=-1, keepdim=True).values
-        keep = magnitude > cutoff
-        safe_values = tensorplay.where(
-            keep, values, tensorplay.ones_like(values)
-        )
-        inverse_values = tensorplay.where(
-            keep, 1.0 / safe_values, tensorplay.zeros_like(values)
-        )
-        vectors_h = _C.conj_physical(vectors).transpose(-2, -1)
-        return (vectors * inverse_values.unsqueeze(-2)) @ vectors_h
-    U, S, Vh = svd(A, full_matrices=False)
-    cutoff = atol_val + rtol_val * S.max(dim=-1, keepdim=True).values
-    S_inv = tensorplay.where(S > cutoff, 1.0 / S.clamp_min(1e-300), 0.0)
-    V = _C.conj_physical(Vh).transpose(-2, -1)
-    Uh = _C.conj_physical(U).transpose(-2, -1)
-    return V @ (S_inv.unsqueeze(-1) * Uh)
+    return _C.linalg_pinv(A, atol=atol, rtol=rtol, hermitian=hermitian)
 
 
 def tensorinv(A, ind=2):
