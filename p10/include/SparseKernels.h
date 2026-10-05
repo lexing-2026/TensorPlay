@@ -112,6 +112,22 @@ Tensor spdiags_cuda(const Tensor& diagonals, const Tensor& offsets,
 Tensor sparse_mul_cuda(const Tensor& self, const Tensor& other);
 Tensor sparse_add_cuda(const Tensor& self, const Tensor& other);
 
+// Sparse COO softmax family.  The sparse-dim variant reduces over pools of
+// stored entries; the dense-part variant delegates to the dense kernels.
+Tensor _sparse_softmax_cuda(const Tensor& input, int64_t dim, bool half_to_float);
+Tensor _sparse_softmax_int_cuda(const Tensor& input, int64_t dim,
+                                std::optional<DType> dtype);
+Tensor _sparse_log_softmax_cuda(const Tensor& input, int64_t dim, bool half_to_float);
+Tensor _sparse_log_softmax_int_cuda(const Tensor& input, int64_t dim,
+                                    std::optional<DType> dtype);
+Tensor _sparse_softmax_backward_data_cuda(const Tensor& grad,
+                                          const Tensor& output, int64_t dim,
+                                          const Tensor& input);
+Tensor _sparse_log_softmax_backward_data_cuda(const Tensor& grad,
+                                              const Tensor& output,
+                                              int64_t dim,
+                                              const Tensor& input);
+
 } // namespace cuda
 #endif
 } // namespace tensorplay

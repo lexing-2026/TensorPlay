@@ -203,6 +203,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/sparse/SparseCsrTensorMathKernels.cu
         src/backend/cuda/sparse/SparseBinaryOpIntersectionKernels.cu
         src/backend/cuda/sparse/SparseMatMulKernels.cu
+        src/backend/cuda/sparse/SparseSoftMaxKernels.cu
         src/backend/cuda/EmbeddingSparseBackwardKernels.cu
         src/backend/cuda/SpdiagsKernels.cu
         src/backend/cuda/SemiStructuredKernels.cu

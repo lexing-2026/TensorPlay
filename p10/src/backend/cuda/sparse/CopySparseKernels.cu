@@ -39,6 +39,13 @@ TENSORPLAY_LIBRARY_IMPL(SparseCUDA, CopySparseKernels) {
     m.impl("sparse_sum", sparse_sum_cuda);
     m.impl("sparse_add", sparse_add_cuda);
     m.impl("sparse_mul", sparse_mul_cuda);
+    m.impl("_sparse_softmax", _sparse_softmax_cuda);
+    m.impl("_sparse_softmax.int", _sparse_softmax_int_cuda);
+    m.impl("_sparse_log_softmax", _sparse_log_softmax_cuda);
+    m.impl("_sparse_log_softmax.int", _sparse_log_softmax_int_cuda);
+    m.impl("_sparse_softmax_backward_data", _sparse_softmax_backward_data_cuda);
+    m.impl("_sparse_log_softmax_backward_data",
+           _sparse_log_softmax_backward_data_cuda);
 }
 
 } // namespace cuda
