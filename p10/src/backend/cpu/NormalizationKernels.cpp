@@ -372,6 +372,81 @@ static void check_dims(const Tensor& input, int64_t expected_dim, const char* na
     }
 }
 
+// Double-precision backward of group norm: rows are independent, so a plain
+// per-row walk with row-local moments (or the saved ones) is enough; the
+// single-precision kernel below is the tuned path.
+static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cpu_f64(
+        const Tensor& grad_output, const Tensor& input, int64_t G,
+        const std::optional<Tensor>& weight_opt, const std::optional<Tensor>& bias_opt,
+        double eps, const Tensor* mean_opt, const Tensor* rstd_opt,
+        const std::vector<bool>* output_mask) {
+    const int64_t N = input.size(0), C = input.size(1);
+    const int64_t D = C / G;
+    int64_t S = 1;
+    for (int64_t d = 2; d < input.dim(); ++d) S *= input.size(d);
+    const bool has_weight = weight_opt.has_value() && weight_opt->defined();
+    const bool has_bias = bias_opt.has_value() && bias_opt->defined();
+    const bool want_input = output_mask == nullptr || output_mask->empty() || (*output_mask)[0];
+    const bool want_weight = has_weight &&
+        (output_mask == nullptr || output_mask->size() <= 1 || (*output_mask)[1]);
+    const bool want_bias = output_mask == nullptr
+        ? has_bias : (output_mask->size() > 2 && (*output_mask)[2]);
+    const Tensor go = grad_output.contiguous();
+    const Tensor in = input.contiguous();
+    const Tensor w_t = has_weight ? weight_opt->contiguous() : Tensor();
+    Tensor grad_input = want_input ? Tensor::zeros_like(in) : Tensor();
+    Tensor grad_weight = want_weight ? Tensor::zeros_like(*weight_opt) : Tensor();
+    Tensor grad_bias = want_bias ? Tensor::zeros({C}, input.dtype(), input.device()) : Tensor();
+    if (N == 0) return std::make_tuple(grad_input, grad_weight, grad_bias);
+    const double* dy = go.data_ptr<double>();
+    const double* x = in.data_ptr<double>();
+    const double* w = has_weight ? w_t.data_ptr<double>() : nullptr;
+    double* gi = want_input ? grad_input.data_ptr<double>() : nullptr;
+    double* gw = want_weight ? grad_weight.data_ptr<double>() : nullptr;
+    double* gb = want_bias ? grad_bias.data_ptr<double>() : nullptr;
+    const double M = static_cast<double>(D * S);
+    for (int64_t row = 0; row < N * G; ++row) {
+        const int64_t n = row / G, g = row % G;
+        const double* xr = x + (n * C + g * D) * S;
+        const double* dr = dy + (n * C + g * D) * S;
+        double mean, inv_std;
+        if (mean_opt) {
+            mean = normalization_stats_read(*mean_opt, row);
+            inv_std = normalization_stats_read(*rstd_opt, row);
+        } else {
+            double sum = 0.0, sq = 0.0;
+            for (int64_t i = 0; i < D * S; ++i) { sum += xr[i]; sq += xr[i] * xr[i]; }
+            mean = sum / M;
+            inv_std = 1.0 / std::sqrt(sq / M - mean * mean + eps);
+        }
+        double s_dy = 0.0, s_dy_xhat = 0.0;
+        for (int64_t d = 0; d < D; ++d) {
+            const int64_t c = g * D + d;
+            double sd = 0.0, sx = 0.0;
+            for (int64_t s = 0; s < S; ++s) {
+                const double y = dr[d * S + s];
+                sd += y;
+                sx += y * (xr[d * S + s] - mean) * inv_std;
+            }
+            if (gb) gb[c] += sd;
+            if (gw) gw[c] += sx;
+            const double wc = w ? w[c] : 1.0;
+            s_dy += wc * sd;
+            s_dy_xhat += wc * sx;
+        }
+        if (!gi) continue;
+        double* gr = gi + (n * C + g * D) * S;
+        for (int64_t d = 0; d < D; ++d) {
+            const double wc = w ? w[g * D + d] : 1.0;
+            for (int64_t s = 0; s < S; ++s) {
+                const double x_hat = (xr[d * S + s] - mean) * inv_std;
+                gr[d * S + s] = inv_std / M * (M * dr[d * S + s] * wc - s_dy - x_hat * s_dy_xhat);
+            }
+        }
+    }
+    return std::make_tuple(grad_input, grad_weight, grad_bias);
+}
+
 // Backward for GroupNorm.  The native entry point supplies the saved moments;
 // the public helper passes null moments and computes them in this kernel.
 static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cpu_impl(
@@ -400,9 +475,14 @@ static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cpu_impl(
         TP_THROW(RuntimeError, "group_norm_backward: spatial dimensions must be positive");
     int64_t group_size = D * spatial_size; // Normalization size
 
-    if (input.dtype() != DType::Float32) TP_THROW(NotImplementedError, "group_norm_backward only supports Float32");
+    if (input.dtype() != DType::Float32 && input.dtype() != DType::Float64)
+        TP_THROW(NotImplementedError, "group_norm_backward only supports Float32 and Float64");
     if (grad_output.dtype() != input.dtype())
         TP_THROW(RuntimeError, "group_norm_backward: grad_output dtype must match input dtype");
+    if (input.dtype() == DType::Float64) {
+        return group_norm_backward_cpu_f64(grad_output, input, G, weight_opt, bias_opt, eps,
+                                           mean_opt, rstd_opt, output_mask);
+    }
 
     const bool has_weight = weight_opt.has_value() && weight_opt->defined();
     const bool has_bias = bias_opt.has_value() && bias_opt->defined();
@@ -976,8 +1056,35 @@ static Tensor group_norm_cpu_impl(
                 }
             }
         });
+    } else if (input.dtype() == DType::Float64) {
+        double* out_ptr = out.data_ptr<double>();
+        const double* in_ptr = input_c.data_ptr<double>();
+        const double* w_ptr = (weight_opt.has_value() && weight_opt->defined()) ? weight_opt->data_ptr<double>() : nullptr;
+        const double* b_ptr = (bias_opt.has_value() && bias_opt->defined()) ? bias_opt->data_ptr<double>() : nullptr;
+        for (int64_t row = 0; row < N * num_groups; ++row) {
+            const int64_t c_start = (row % num_groups) * channels_per_group;
+            const int64_t offset = (row / num_groups) * C * spatial_size + c_start * spatial_size;
+            const double* group = in_ptr + offset;
+            double* group_out = out_ptr + offset;
+            double sum = 0.0, sq_sum = 0.0;
+            for (int64_t i = 0; i < inner_size; ++i) {
+                sum += group[i];
+                sq_sum += group[i] * group[i];
+            }
+            const double mean = sum / inner_size;
+            const double inv_std = 1.0 / std::sqrt(sq_sum / inner_size - mean * mean + eps);
+            if (mean_out) normalization_stats_write(*mean_out, row, mean);
+            if (rstd_out) normalization_stats_write(*rstd_out, row, inv_std);
+            for (int64_t c = 0; c < channels_per_group; ++c) {
+                const double w = w_ptr ? w_ptr[c_start + c] : 1.0;
+                const double b = b_ptr ? b_ptr[c_start + c] : 0.0;
+                for (int64_t s = 0; s < spatial_size; ++s)
+                    group_out[c * spatial_size + s] =
+                        (group[c * spatial_size + s] - mean) * inv_std * w + b;
+            }
+        }
     } else {
-        TP_THROW(NotImplementedError, "group_norm only supports Float32");
+        TP_THROW(NotImplementedError, "group_norm only supports Float32 and Float64");
     }
     
     return out;

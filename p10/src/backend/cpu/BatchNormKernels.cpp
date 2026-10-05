@@ -299,8 +299,8 @@ void bn_stats_contiguous(const Tensor& input, std::vector<double>& mean,
 // Affine apply over contiguous planes: out = x * alpha[c] + beta[c].
 template <typename scalar_t, typename opmath_t>
 void bn_apply_contiguous_typed(const Tensor& input, Tensor& out,
-                               const std::vector<float>& alpha,
-                               const std::vector<float>& beta) {
+                               const std::vector<double>& alpha,
+                               const std::vector<double>& beta) {
     const int64_t N = input.size(0);
     const int64_t C = input.size(1);
     const int64_t S = input.numel() / (N * C);
@@ -311,15 +311,15 @@ void bn_apply_contiguous_typed(const Tensor& input, Tensor& out,
     parallel_for(0, N * C, 1, [&](int64_t rb, int64_t re) {
         for (int64_t rc = rb; rc < re; ++rc) {
             const int64_t c = rc % C;
-            const float a = alpha[c];
-            const float b = beta[c];
+            const double a = alpha[c];
+            const double b = beta[c];
             const scalar_t* ip = in + rc * S;
             scalar_t* op = outp + rc * S;
             if constexpr (native) {
                 if constexpr (std::is_same_v<scalar_t, float>) {
 #if defined(__x86_64__)
                     if (norm_row::avx512_ok()) {
-                        norm_row::plane_affine_f32_512(ip, op, S, a, b);
+                        norm_row::plane_affine_f32_512(ip, op, S, static_cast<float>(a), static_cast<float>(b));
                         continue;
                     }
 #endif
@@ -329,7 +329,8 @@ void bn_apply_contiguous_typed(const Tensor& input, Tensor& out,
                 for (int64_t i = 0; i < S; ++i) op[i] = static_cast<scalar_t>(static_cast<opmath_t>(ip[i]) * av + bv);
             } else {
                 for (int64_t i = 0; i < S; ++i) {
-                    const opmath_t v = static_cast<opmath_t>(ip[i]) * a + b;
+                    const opmath_t v = static_cast<opmath_t>(ip[i]) * static_cast<opmath_t>(a) +
+                                       static_cast<opmath_t>(b);
                     op[i] = static_cast<scalar_t>(v);
                 }
             }
@@ -338,7 +339,7 @@ void bn_apply_contiguous_typed(const Tensor& input, Tensor& out,
 }
 
 void bn_apply_contiguous(const Tensor& input, Tensor& out,
-                         const std::vector<float>& alpha, const std::vector<float>& beta) {
+                         const std::vector<double>& alpha, const std::vector<double>& beta) {
     switch (input.dtype()) {
         case DType::Float32: bn_apply_contiguous_typed<float, float>(input, out, alpha, beta); break;
         case DType::Float64: bn_apply_contiguous_typed<double, double>(input, out, alpha, beta); break;
@@ -481,13 +482,19 @@ void bn_stats_channels_last(const Tensor& input, std::vector<double>& mean,
 
 template <typename scalar_t, typename opmath_t>
 void bn_apply_channels_last_typed(const Tensor& input, Tensor& out,
-                                  const std::vector<float>& alpha,
-                                  const std::vector<float>& beta) {
+                                  const std::vector<double>& alpha,
+                                  const std::vector<double>& beta) {
     const int64_t C = input.size(1);
     const int64_t N = input.numel() / C;
     const scalar_t* in = input.data_ptr<scalar_t>();
     scalar_t* outp = out.data_ptr<scalar_t>();
     constexpr bool native = std::is_same_v<scalar_t, opmath_t>;
+    // The vectorized single-precision rows take their coefficients as floats.
+    std::vector<float> alpha_f, beta_f;
+    if constexpr (std::is_same_v<scalar_t, float>) {
+        alpha_f.assign(alpha.begin(), alpha.end());
+        beta_f.assign(beta.begin(), beta.end());
+    }
 
     parallel_for(0, N, 1, [&](int64_t b, int64_t e) {
         for (int64_t i = b; i < e; ++i) {
@@ -497,15 +504,20 @@ void bn_apply_channels_last_typed(const Tensor& input, Tensor& out,
                 if constexpr (std::is_same_v<scalar_t, float>) {
 #if defined(__x86_64__)
                     if (norm_row::avx512_ok() && C >= 16) {
-                        bn_affine_f32x16(op, ip, alpha.data(), beta.data(), C);
+                        bn_affine_f32x16(op, ip, alpha_f.data(), beta_f.data(), C);
                         continue;
                     }
 #endif
                 }
-                for (int64_t c = 0; c < C; ++c) op[c] = static_cast<opmath_t>(ip[c]) * alpha[c] + beta[c];
+                for (int64_t c = 0; c < C; ++c) {
+                    op[c] = static_cast<opmath_t>(ip[c]) * static_cast<opmath_t>(alpha[c]) +
+                            static_cast<opmath_t>(beta[c]);
+                }
             } else {
                 for (int64_t c = 0; c < C; ++c) {
-                    op[c] = static_cast<scalar_t>(static_cast<opmath_t>(ip[c]) * alpha[c] + beta[c]);
+                    op[c] = static_cast<scalar_t>(static_cast<opmath_t>(ip[c]) *
+                                                      static_cast<opmath_t>(alpha[c]) +
+                                                  static_cast<opmath_t>(beta[c]));
                 }
             }
         }
@@ -513,7 +525,7 @@ void bn_apply_channels_last_typed(const Tensor& input, Tensor& out,
 }
 
 void bn_apply_channels_last(const Tensor& input, Tensor& out,
-                            const std::vector<float>& alpha, const std::vector<float>& beta) {
+                            const std::vector<double>& alpha, const std::vector<double>& beta) {
     switch (input.dtype()) {
         case DType::Float32: bn_apply_channels_last_typed<float, float>(input, out, alpha, beta); break;
         case DType::Float64: bn_apply_channels_last_typed<double, double>(input, out, alpha, beta); break;
@@ -606,13 +618,13 @@ static Tensor batch_norm_cpu_impl(
 
     // Fold the normalization into per-channel affine coefficients:
     // y = (x - mean) / sqrt(var + eps) * w + b = x * alpha + beta.
-    std::vector<float> alpha(C), beta(C);
+    std::vector<double> alpha(C), beta(C);
     for (int64_t c = 0; c < C; ++c) {
         const double invstd = 1.0 / std::sqrt(var[c] + eps);
         const double w = weight_opt.has_value() && weight_opt->defined() ? stats_at(*weight_opt, c) : 1.0;
         const double b = bias_opt.has_value() && bias_opt->defined() ? stats_at(*bias_opt, c) : 0.0;
-        alpha[c] = static_cast<float>(invstd * w);
-        beta[c] = static_cast<float>(b - mean[c] * invstd * w);
+        alpha[c] = invstd * w;
+        beta[c] = b - mean[c] * invstd * w;
     }
 
     Tensor out = empty_like_format(input);
@@ -980,13 +992,13 @@ void bn_backward_channels_last(const Tensor& grad_output, const Tensor& input,
             const void* inb = input.data_ptr();
             const void* dyb = grad_output.data_ptr();
             void* gxb = grad_input.data_ptr();
-            const auto wrow = [&](int64_t c) -> float {
-                return has_w ? static_cast<float>(stats_at(*weight_opt, c)) : 1.0f;
+            const auto wrow = [&](int64_t c) -> double {
+                return has_w ? stats_at(*weight_opt, c) : 1.0;
             };
             parallel_for(0, N, 1, [&](int64_t b, int64_t e) {
                 for (int64_t i = b; i < e; ++i) {
                     for (int64_t c = 0; c < C; ++c) {
-                        const double w = static_cast<double>(wrow(c));
+                        const double w = wrow(c);
                         double y, x;
                         if (f64) {
                             y = static_cast<const double*>(dyb)[i * C + c];

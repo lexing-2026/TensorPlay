@@ -153,8 +153,14 @@ Tensor conv_transpose1d_grad_bias_cuda(const Tensor& grad_output, const Tensor& 
                                        const std::vector<int64_t>& output_padding,
                                        int64_t groups,
                                        const std::vector<int64_t>& dilation) {
-    return conv_transpose2d_grad_bias_cuda(grad_output, input, weight, stride, padding,
-                                           output_padding, groups, dilation);
+    Tensor go2 = grad_output.unsqueeze(2);
+    Tensor in2 = input.unsqueeze(2);
+    Tensor w2 = weight.unsqueeze(2);
+    std::vector<int64_t> s2 = {1, stride.empty() ? 1 : stride[0]};
+    std::vector<int64_t> p2 = {0, padding.empty() ? 0 : padding[0]};
+    std::vector<int64_t> op2 = {0, output_padding.empty() ? 0 : output_padding[0]};
+    std::vector<int64_t> d2 = {1, dilation.empty() ? 1 : dilation[0]};
+    return conv_transpose2d_grad_bias_cuda(go2, in2, w2, s2, p2, op2, groups, d2);
 }
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, Conv1dKernels) {
