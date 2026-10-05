@@ -996,7 +996,7 @@ def generate_autograd_nodes(
             lines.append("        grad_input_mask.reserve(next_edges().size());")
             for slot_idx in range(n_slots):
                 lines.append(
-                    f"        grad_input_mask.push_back(next_edges()[{slot_idx}].is_valid());")
+                    f"        grad_input_mask.push_back(should_compute_output({slot_idx}));")
 
         # Common-subexpression elimination: identical Call sub-expressions
         # shared across gradient slots are evaluated once (generalizes
@@ -1044,7 +1044,7 @@ def generate_autograd_nodes(
             users = cse_slots.get(temp, [])
             if n_slots > 1 and users:
                 cond = " || ".join(
-                    f"next_edges()[{i}].is_valid()" for i in users)
+                    f"should_compute_output({i})" for i in users)
                 lines.append(f"        auto {temp}_compute = [&] {{ return {txt}; }};")
                 lines.append(
                     f"        std::optional<decltype({temp}_compute())> {temp}_val;")
@@ -1084,7 +1084,7 @@ def generate_autograd_nodes(
             # always valid.
             if n_slots > 1:
                 lines.append(f"        Tensor {var};")
-                lines.append(f"        if (next_edges()[{slot_idx}].is_valid()) {{")
+                lines.append(f"        if (should_compute_output({slot_idx})) {{")
                 lines.append(f"            {var} = {txt};")
                 lines.append("        }")
             else:

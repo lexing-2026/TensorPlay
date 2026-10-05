@@ -255,6 +255,18 @@ void Engine::execute_task(ReadyQueue::NodeTask&& task, ReadyQueue& cpu_queue,
     }
 }
 
+// The graph task's execution plan is fixed before any node runs, so the
+// lookup reads it without the task's lock, as evaluate_function does.
+bool Node::should_compute_output(size_t i) const {
+    if (i >= next_edges_.size()) return false;
+    const Edge& next = next_edges_[i];
+    if (!next.is_valid()) return false;
+    const GraphTask* task = current_graph_task;
+    if (task == nullptr || task->exec_info_.empty()) return true;
+    const auto it = task->exec_info_.find(next.function.get());
+    return it != task->exec_info_.end() && it->second.should_execute();
+}
+
 void Engine::queue_callback(std::function<void()> callback) {
     TP_CHECK(static_cast<bool>(callback), "queue_callback requires a callable");
     TP_CHECK(current_graph_task != nullptr,

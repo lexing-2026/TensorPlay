@@ -124,9 +124,9 @@ def test_group_norm_codegen_shares_backward_and_marks_saved_statistics():
         "struct NativeGroupNormBackward : public Node {", 1
     )[1].split("struct InstanceNormBackward : public Node {", 1)[0]
     assert group_norm_node.count("ops::native_group_norm_backward(") == 1
-    assert "grad_input_mask.push_back(next_edges()[0].is_valid())" in group_norm_node
-    assert "grad_input_mask.push_back(next_edges()[1].is_valid())" in group_norm_node
-    assert "grad_input_mask.push_back(next_edges()[2].is_valid())" in group_norm_node
+    assert "grad_input_mask.push_back(should_compute_output(0))" in group_norm_node
+    assert "grad_input_mask.push_back(should_compute_output(1))" in group_norm_node
+    assert "grad_input_mask.push_back(should_compute_output(2))" in group_norm_node
 
     wrappers = generate_tpx_ops_cpp(
         funcs, autocast_ops=set(), derivatives=derivatives,

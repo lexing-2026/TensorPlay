@@ -106,6 +106,14 @@ public:
 
     const std::vector<Edge>& next_edges() const { return next_edges_; }
 
+    // Whether the gradient for forward input `i` is wanted by the backward
+    // pass running this node: its edge leads somewhere and, when grad() asked
+    // for only some inputs, what lies behind the edge is on the way to one of
+    // them.  A formula is evaluated only for the inputs this answers yes for,
+    // so an input nobody asked about never reaches a formula that would
+    // refuse it.
+    bool should_compute_output(size_t i) const;
+
     // The stream this node consumes its inputs on: the recorded stream of
     // the first input edge that carries one, preferring an accelerator
     // device when present.  The engine switches the evaluating worker to this

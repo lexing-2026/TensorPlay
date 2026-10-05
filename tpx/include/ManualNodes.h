@@ -486,12 +486,16 @@ struct MatmulBackward : public Node {
         const bool self_vector = self.dim() == 1;
         const bool other_vector = other.dim() == 1;
 
+        // A side whose gradient nobody wants costs no product.
+        const bool want_self = should_compute_output(0);
+        const bool want_other = should_compute_output(1);
+
         if (isComplexType(self.dtype())) {
             // The complex adjoint is the conjugate transpose.  The complex
             // branch delegates to the retained helper ops because its view
             // operations are not recordable yet.
-            return {ops::matmul_backward_self(grad, self, other),
-                    ops::matmul_backward_other(grad, self, other)};
+            return {want_self ? ops::matmul_backward_self(grad, self, other) : Tensor(),
+                    want_other ? ops::matmul_backward_other(grad, self, other) : Tensor()};
         }
 
         // Normalize vectors into matrix space before applying the batched
@@ -530,23 +534,29 @@ struct MatmulBackward : public Node {
             return out;
         };
 
-        Tensor grad_for_self = grad_m;
-        if (grad_for_self.dtype() != other_m.dtype())
-            grad_for_self = grad_for_self.to(other_m.dtype());
-        Tensor grad_self = ops::matmul(grad_for_self, adjoint(other_m));
-        grad_self = reduce_to(grad_self, self_m);
-        if (self_vector) grad_self = ops::squeeze(grad_self, 0);
-        if (grad_self.dtype() != self.dtype())
-            grad_self = grad_self.to(self.dtype());
+        Tensor grad_self;
+        if (want_self) {
+            Tensor grad_for_self = grad_m;
+            if (grad_for_self.dtype() != other_m.dtype())
+                grad_for_self = grad_for_self.to(other_m.dtype());
+            grad_self = ops::matmul(grad_for_self, adjoint(other_m));
+            grad_self = reduce_to(grad_self, self_m);
+            if (self_vector) grad_self = ops::squeeze(grad_self, 0);
+            if (grad_self.dtype() != self.dtype())
+                grad_self = grad_self.to(self.dtype());
+        }
 
-        Tensor grad_for_other = grad_m;
-        if (grad_for_other.dtype() != self_m.dtype())
-            grad_for_other = grad_for_other.to(self_m.dtype());
-        Tensor grad_other = ops::matmul(adjoint(self_m), grad_for_other);
-        grad_other = reduce_to(grad_other, other_m);
-        if (other_vector) grad_other = ops::squeeze(grad_other, -1);
-        if (grad_other.dtype() != other.dtype())
-            grad_other = grad_other.to(other.dtype());
+        Tensor grad_other;
+        if (want_other) {
+            Tensor grad_for_other = grad_m;
+            if (grad_for_other.dtype() != self_m.dtype())
+                grad_for_other = grad_for_other.to(self_m.dtype());
+            grad_other = ops::matmul(adjoint(self_m), grad_for_other);
+            grad_other = reduce_to(grad_other, other_m);
+            if (other_vector) grad_other = ops::squeeze(grad_other, -1);
+            if (grad_other.dtype() != other.dtype())
+                grad_other = grad_other.to(other.dtype());
+        }
 
         return {grad_self, grad_other};
     }

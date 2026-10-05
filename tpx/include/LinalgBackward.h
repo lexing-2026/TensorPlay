@@ -797,8 +797,8 @@ struct LinalgLstsqBackward : public Node {
         using linalg_bwd_detail::input_at;
         const Tensor gX = input_at(inputs, 0);
         const Tensor gL = input_at(inputs, 1);
-        const bool A_needed = next_edges().size() > 0 && next_edges()[0].is_valid();
-        const bool B_needed = next_edges().size() > 1 && next_edges()[1].is_valid();
+        const bool A_needed = should_compute_output(0);
+        const bool B_needed = should_compute_output(1);
         auto [gA, gB] = linalg_lstsq_backward(gX, gL, A_.unpack(), B_.unpack(),
                                               solution_.unpack(), A_needed, B_needed);
         return {gA, gB};
@@ -832,8 +832,8 @@ struct TriangularSolveBackward : public Node {
         using linalg_bwd_detail::input_at;
         const Tensor g_solution = input_at(inputs, 0);
         const Tensor g_coefficient = input_at(inputs, 1);
-        const bool b_needed = next_edges().size() > 0 && next_edges()[0].is_valid();
-        const bool a_needed = next_edges().size() > 1 && next_edges()[1].is_valid();
+        const bool b_needed = should_compute_output(0);
+        const bool a_needed = should_compute_output(1);
         auto [gb, ga] = triangular_solve_backward(
             g_solution, g_coefficient, self_.unpack(), A_.unpack(), solution_.unpack(),
             upper_, transpose_, unitriangular_, b_needed, a_needed);

@@ -123,6 +123,27 @@ class TestConversion(unittest.TestCase):
         self.assertEqual(x.grad.dtype, tp.float32)
         self.assertEqual(x.grad.tolist(), [1.0, 1.0, 1.0])
 
+    def test_grad_of_one_input_never_evaluates_another_inputs_formula(self):
+        # igamma has no derivative in its order.  Asking only for the gradient
+        # in x must not reach that formula although the order requires grad
+        # too; a backward() that wants both still reports it.
+        a = tp.tensor([2.0], dtype=tp.float64, requires_grad=True)
+        x = tp.tensor([1.0], dtype=tp.float64, requires_grad=True)
+        (gx,) = tp.autograd.grad(tp.igamma(a, x).sum(), x)
+        # d/dx P(2, x) = x e^-x.
+        self.assertAlmostEqual(gx.item(), 0.36787944117144233, places=12)
+        with self.assertRaisesRegex(RuntimeError, "first argument"):
+            tp.igamma(a, x).sum().backward()
+
+    def test_grad_of_one_factor_leaves_the_other_untouched(self):
+        a = tp.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+        b = tp.tensor([[0.5], [0.25]], requires_grad=True)
+        (ga,) = tp.autograd.grad((a @ b).sum(), a)
+        self.assertEqual(ga.tolist(), [[0.5, 0.25], [0.5, 0.25]])
+        self.assertIsNone(b.grad)
+        (gb,) = tp.autograd.grad((a @ b).sum(), b)
+        self.assertEqual(gb.tolist(), [[4.0], [6.0]])
+
 
 if __name__ == '__main__':
     unittest.main()
