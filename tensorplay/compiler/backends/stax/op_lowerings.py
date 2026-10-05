@@ -1825,6 +1825,18 @@ for _op in ("bitwise_left_shift", "bitwise_right_shift"):
         LOWERINGS[f"{_op}.{_overload}"] = _binary_on(_op, real=False)
 for _op in ("logical_and", "logical_or", "logical_xor"):
     LOWERINGS[f"{_op}.default"] = _binary_on(_op, real=False, out_bool=True, to_bool=True)
+#: The symbol spellings of the bitwise operations: the language reads these as
+#: operators rather than names, and behind each is the bitwise operation it is
+#: spelled with.
+for _dunder, _bitwise in (
+    ("__and__", "bitwise_and"),
+    ("__or__", "bitwise_or"),
+    ("__xor__", "bitwise_xor"),
+    ("__lshift__", "bitwise_left_shift"),
+    ("__rshift__", "bitwise_right_shift"),
+):
+    for _overload in ("Tensor", "Scalar"):
+        LOWERINGS[f"{_dunder}.{_overload}"] = _binary_on(_bitwise, real=False)
 
 
 @register_lowering(tp_ops.ldexp, broadcast=True, type_promotion_kind=None)
@@ -2777,6 +2789,13 @@ for _op_name in ("conj", "_conj", "resolve_conj", "resolve_neg", "detach", "alia
     _packet = getattr(tp.ops.tp, _op_name, None)
     if _packet is not None:
         LOWERINGS[f"{_op_name}.default"] = _real_identity(_packet.default)
+
+#: A value handed to a region is retagged as one the region owns: the values
+#: and the sharing underneath are the ones it already has, so what is asked
+#: for is the value itself.
+@register("lift.default", "lift_fresh.default")
+def lift(x, *args, **kwargs):
+    return x
 
 
 @register("slice_backward.default")
@@ -5368,6 +5387,22 @@ def _max_pool_checks(x, size, kernel, ndim, window):
     )
 
 
+_fallback_adaptive_max_pool2d = fallback_handler(tp_ops.adaptive_max_pool2d.default)
+
+
+@register("adaptive_max_pool2d.default")
+def adaptive_max_pool2d(x, output_size):
+    """The largest value of each window, the window grown to fit a shape.
+
+    The window's shape is not given: it is the one that makes the asked-for
+    output shape out of the input's, and saying which positions it covers is
+    the walk this lowering does not write -- so the call is handed over to the
+    kernel that owns that walk.
+    """
+
+    return _fallback_adaptive_max_pool2d(x, output_size)
+
+
 @register("max_pool2d.default", "max_pool3d.default")
 def lower_max_poolnd(x, kernel_size, stride=(), padding=0, dilation=1,
                      ceil_mode=False, **kwargs):
@@ -6983,6 +7018,29 @@ def _register_writing_forms() -> None:
         (("sub_.Tensor", "sub_.Scalar"), "sub.Tensor"),
         (("mul_.Tensor", "mul_.Scalar"), "mul.Tensor"),
         (("add_.Tensor", "add_.Scalar"), "add.Tensor"),
+        (("bitwise_and_.Tensor", "bitwise_and_.Scalar"), "bitwise_and.Tensor"),
+        (("bitwise_or_.Tensor", "bitwise_or_.Scalar"), "bitwise_or.Tensor"),
+        (("bitwise_xor_.Tensor", "bitwise_xor_.Scalar"), "bitwise_xor.Tensor"),
+        (("bitwise_not_.default",), "bitwise_not.default"),
+        (
+            ("bitwise_left_shift_.Tensor", "bitwise_left_shift_.Tensor_Scalar"),
+            "bitwise_left_shift.Tensor",
+        ),
+        (
+            ("bitwise_right_shift_.Tensor", "bitwise_right_shift_.Tensor_Scalar"),
+            "bitwise_right_shift.Tensor",
+        ),
+        (("logical_and_.default",), "logical_and.default"),
+        (("logical_not_.default",), "logical_not.default"),
+        (("logical_or_.default",), "logical_or.default"),
+        (("logical_xor_.default",), "logical_xor.default"),
+        (("relu_.default",), "relu.default"),
+        (("sigmoid_.default",), "sigmoid.default"),
+        (("__iand__.Tensor", "__iand__.Scalar"), "__and__.Tensor"),
+        (("__ior__.Tensor", "__ior__.Scalar"), "__or__.Tensor"),
+        (("__ixor__.Tensor", "__ixor__.Scalar"), "__xor__.Tensor"),
+        (("__ilshift__.Tensor", "__ilshift__.Scalar"), "__lshift__.Tensor"),
+        (("__irshift__.Tensor", "__irshift__.Scalar"), "__rshift__.Tensor"),
     ):
         if key not in LOWERINGS:
             continue
@@ -7773,6 +7831,27 @@ def empty_strided(
 
 
 register("empty_strided.default")(empty_strided)
+
+
+@register("new_empty_strided.default")
+def new_empty_strided(
+    x: Any, size: Any, stride: Any, *, dtype: Any = None, layout: Any = None,
+    device: Any = None, pin_memory: Any = None,
+) -> Any:
+    """A place to write, asked of another value.
+
+    What is not said about the type and where the value lives is taken from
+    the value asked of, since that is the one thing the ask names; the rest is
+    the same place ``empty_strided`` makes.
+    """
+
+    if dtype is None:
+        dtype = x.get_dtype()
+    if device is None:
+        device = x.get_device()
+    return empty_strided(
+        size, stride, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory
+    )
 
 
 def _new_like(
@@ -8602,6 +8681,30 @@ def philox_rand(
     return random_values_node, offset_node
 
 
+_fallback_randn_default = fallback_handler(tp_ops.randn.default)
+_fallback_randn_generator = fallback_handler(tp_ops.randn.generator)
+
+
+@register("randn.default", "randn.generator")
+def randn(*args: Any, **kwargs: Any) -> Any:
+    """Normal values handed to the framework rather than drawn here.
+
+    A draw the graph cannot write -- one naming a generator of its own, or
+    one made while draws are being read by the generator they belong to --
+    is a call the framework answers with the values the program would have
+    drawn without it.  A draw the pass that rewrites random operations was
+    meant to catch and did not is a program in two minds, and is said so.
+    """
+
+    if kwargs.get("generator") is not None:
+        return _fallback_randn_generator(*args, **kwargs)
+    if config.fallback_random or kwargs.get("pin_memory"):
+        kwargs.pop("generator", None)
+        kwargs.pop("pin_memory", None)
+        return _fallback_randn_default(*args, **kwargs)
+    raise AssertionError("should have been handled in replace_random.py")
+
+
 def to_dtype_bitcast(x: Any, dtype: Any, *, copy: bool = False) -> Any:
     """The same bits read as another element type, without moving them.
 
@@ -8735,6 +8838,17 @@ def sym_stride(a: Any, dim: Any) -> Any:
     """
 
     return a.get_stride()[dim]
+
+
+@register_lowering(tp_ops.sym_numel.default)
+def sym_numel(a: Any) -> Any:
+    """How many positions a value has, as a number rather than as a read.
+
+    The count of a shape is a product of what the shape already says, so the
+    answer is there before the value is: no part of it is read from memory.
+    """
+
+    return a.get_numel()
 
 
 @register_lowering(tp_ops.lift_fresh_copy.default)
@@ -8931,8 +9045,10 @@ for _name in ("segment_reduce", "_segment_reduce_backward"):
 
 #: A scatter that reduces says which of several values landing on the same
 #: position wins -- a meaning rather than a walk, which is why it is asked of
-#: the framework together rather than written here.
-for _name in ("scatter_reduce_",):
+#: the framework together rather than written here.  The indexed form of the
+#: same question is asked of a list of positions at once, and is handed over
+#: for the same reason.
+for _name in ("scatter_reduce_", "index_reduce"):
     _op = getattr(tp_ops, _name, None)
     if _op is None:
         continue
@@ -10158,6 +10274,21 @@ def lower_as_strided(
         sympy.expand(storage_offset),
     )
     return TensorBox(ir.ReinterpretView(data=storage, layout=new_layout))
+
+
+@register_lowering("as_strided_scatter.default", type_promotion_kind=None)
+def as_strided_scatter(self: Any, src: Any, size: Any, stride: Any, storage_offset: Any = None) -> Any:
+    """The values of another written into a shape of its own, re-read.
+
+    The value is not changed where it was asked for: what is written is a copy
+    of it, laid out as it was and read at the shape and distances asked for,
+    with the other value written into the positions that shape names.
+    """
+
+    output = clone(self)
+    output_view = lower_as_strided(output, size, stride, storage_offset)
+    lower_copy_(output_view, src)
+    return output
 
 
 # ---------------------------------------------------------------------------

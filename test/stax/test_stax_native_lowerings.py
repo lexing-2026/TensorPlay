@@ -288,3 +288,23 @@ def test_compiled_inputs_that_start_inside_their_storage():
     fn = lambda t: F.scaled_dot_product_attention(t[None, None], t[None, None], t[None, None]) * 2
     assert x.storage_offset() != 0
     assert tp.allclose(tp.compile(fn)(x), fn(x), atol=1e-4)
+
+
+def test_registered_lowerings_serve_the_new_operators():
+    from tensorplay.compiler.backends.stax.op_lowerings import LOWERINGS
+
+    for key in (
+        "__and__.Tensor", "__or__.Scalar", "__xor__.Tensor",
+        "__lshift__.Tensor", "__rshift__.Scalar",
+        "lift.default", "lift_fresh.default", "adaptive_max_pool2d.default",
+        "new_empty_strided.default", "sym_numel.default",
+        "as_strided_scatter.default", "randn.default", "randn.generator",
+        "bitwise_and_.Tensor", "bitwise_not_.default", "logical_and_.default",
+        "relu_.default", "sigmoid_.default", "__iand__.Tensor",
+        "__irshift__.Scalar", "index_reduce.default", "index_reduce.out",
+    ):
+        assert key in LOWERINGS, key
+
+    gate = tp.compile(lambda a, b: a & b, backend="stax")
+    x, y = tp.tensor([5, 6, 9]), tp.tensor([3, 2, 12])
+    assert gate(x, y).tolist() == (x & y).tolist()
