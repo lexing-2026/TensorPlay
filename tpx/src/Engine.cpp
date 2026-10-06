@@ -16,6 +16,11 @@
 #include <optional>
 
 namespace tensorplay {
+#ifdef USE_CUDA
+namespace cuda {
+void setDeviceCached(int device_index);
+}
+#endif
 namespace tpx {
 
 thread_local int g_nested_depth = 0;
@@ -225,6 +230,11 @@ void Engine::execute_task(ReadyQueue::NodeTask&& task, ReadyQueue& cpu_queue,
     if (engine_trace_enabled()) fprintf(stderr, "[tp-engine] exec node %s\n", task.fn_->name().c_str());
     try {
         GraphTaskGuard graph_guard(&graph);
+        std::optional<::tensorplay::transform::TransformStateGuard> transforms_guard;
+        if (!graph.transform_state_.layers.empty() ||
+            graph.transform_state_.disabled_depth != 0) {
+            transforms_guard.emplace(graph.transform_state_);
+        }
         // The dispatch-mode snapshot is empty in the common case (no Python
         // dispatch modes active); skip installing a guard so the per-node
         // execution avoids copying an (empty) vector.
@@ -240,6 +250,7 @@ void Engine::execute_task(ReadyQueue::NodeTask&& task, ReadyQueue& cpu_queue,
         // graph may return and take the graph with it: nothing here may reach
         // for it once the call is back.
         if (task_device >= 0) {
+            cuda::setDeviceCached(task_device);
             graph.note_cuda_stream(cuda::getCurrentCUDAStream(task_device));
         }
 #endif

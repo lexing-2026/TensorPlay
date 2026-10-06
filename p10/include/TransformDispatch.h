@@ -12,6 +12,27 @@
 namespace tensorplay {
 namespace transform {
 
+// The interpreter stack and dispatch keys travel together across worker threads.
+struct P10_API TransformState {
+    std::vector<Layer> layers;
+    int64_t next_level = 0;
+    size_t disabled_depth = 0;
+    impl::LocalDispatchKeySet dispatch_keys;
+};
+
+P10_API TransformState get_transform_state();
+P10_API void set_transform_state(TransformState state);
+
+class P10_API TransformStateGuard {
+public:
+    explicit TransformStateGuard(TransformState state);
+    ~TransformStateGuard();
+    TransformStateGuard(const TransformStateGuard&) = delete;
+    TransformStateGuard& operator=(const TransformStateGuard&) = delete;
+private:
+    TransformState saved_;
+};
+
 class P10_API DisableTransformsGuard {
 public:
     DisableTransformsGuard();

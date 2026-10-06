@@ -14,6 +14,7 @@
 #include "Node.h"
 #include "InputBuffer.h"
 #include "PythonDispatchModeTLS.h"
+#include "TransformDispatch.h"
 #ifdef USE_CUDA
 #include "CUDARuntime.h"
 #endif
@@ -43,6 +44,8 @@ struct GraphTask {
     // install them so backward operators reach the same modes.
     ::tensorplay::impl::DispatchModeState dispatch_modes_ =
         ::tensorplay::impl::DispatchModeTLS::get_state();
+    ::tensorplay::transform::TransformState transform_state_ =
+        ::tensorplay::transform::get_transform_state();
 
     // Monotonic id for TP_ENGINE_TRACE correlation across concurrent or
     // nested graphs. Zero cost when tracing is off.

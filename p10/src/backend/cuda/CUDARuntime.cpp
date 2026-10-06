@@ -167,9 +167,12 @@ int currentDevice() {
 }
 
 void setDeviceCached(int device_index) {
-    if (currentDevice() == device_index) return;
+    // A queried ordinal does not bind a context on a fresh worker thread.
+    static thread_local bool device_selected = false;
+    if (currentDevice() == device_index && device_selected) return;
     checkCuda(cudaSetDevice(device_index), "cudaSetDevice");
     t_cached_device = device_index;
+    device_selected = true;
 }
 
 int deviceCount() {

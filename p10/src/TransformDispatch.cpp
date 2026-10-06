@@ -46,6 +46,26 @@ int64_t normalize_dim(int64_t dim, int64_t ndim) {
 
 } // namespace
 
+TransformState get_transform_state() {
+    return {layers, next_level, disabled_depth, impl::tls_local_dispatch_key_set()};
+}
+
+void set_transform_state(TransformState state) {
+    layers = std::move(state.layers);
+    next_level = state.next_level;
+    disabled_depth = state.disabled_depth;
+    impl::force_tls_local_dispatch_key_set(state.dispatch_keys);
+}
+
+TransformStateGuard::TransformStateGuard(TransformState state)
+    : saved_(get_transform_state()) {
+    set_transform_state(std::move(state));
+}
+
+TransformStateGuard::~TransformStateGuard() {
+    set_transform_state(std::move(saved_));
+}
+
 DynamicLayerFrontGuard::DynamicLayerFrontGuard() {
     TP_CHECK(!layers.empty(), "dynamic front dispatch requires an active layer");
     auto& layer = layers.back();
