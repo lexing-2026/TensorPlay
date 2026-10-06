@@ -844,9 +844,11 @@ def _gradcheck_helper(
         _off = 0
         for _o in out_tuple:
             if _o.is_complex():
+                # _flat interleaves (re, im) per element: the real rows sit
+                # at even offsets and the imaginary rows at odd ones.
                 _m = _o.numel()
-                row_perm.extend(range(_off, _off + _m))
-                row_perm.extend(range(_off + _m, _off + 2 * _m))
+                row_perm.extend(range(_off, _off + 2 * _m, 2))
+                row_perm.extend(range(_off + 1, _off + 2 * _m, 2))
                 _off += 2 * _m
             else:
                 row_perm.extend(range(_off, _off + _o.numel()))

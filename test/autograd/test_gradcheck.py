@@ -105,6 +105,31 @@ class TestGradgradcheck(unittest.TestCase):
         x = tp.rand(3, dtype=tp.float64, requires_grad=True)
         self.assertTrue(gradgradcheck(lambda t: t.exp().sum(dim=0), x))
 
+    def test_complex_outputs_of_several_elements_pass(self):
+        # The numerical and analytical Jacobians must order the real and
+        # imaginary rows of a multi-element complex output alike.
+        tp.manual_seed(17)
+        z = tp.randn(3, dtype=tp.complex128).requires_grad_(True)
+        for fn in (lambda t: t * t, lambda t: t.exp(), lambda t: t.conj(), lambda t: t.sgn()):
+            self.assertTrue(gradcheck(fn, z))
+
+    def test_complex_output_with_wrong_backward_raises(self):
+        class BadSquare(tp.autograd.Function):
+            @staticmethod
+            def forward(ctx, inp):
+                ctx.save_for_backward(inp)
+                return inp * inp
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                (inp,) = ctx.saved_tensors
+                # Wrong: the conjugate of 2z, not of z.
+                return grad_output * inp.conj()
+
+        z = tp.randn(3, dtype=tp.complex128).requires_grad_(True)
+        with self.assertRaises(GradcheckError):
+            gradcheck(BadSquare.apply, z)
+
 
 if __name__ == "__main__":
     unittest.main()
