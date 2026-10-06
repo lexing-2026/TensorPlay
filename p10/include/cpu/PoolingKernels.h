@@ -24,9 +24,11 @@ namespace cpu {
 // PoolingKernels.cpp, and each channel accumulates its window in the same
 // order, so both memory formats produce identical values.
 //
-// The max kernels also fill `ind`, a dense NCHW int64 tensor of the winning
-// position's offset within each (n, c) input plane (ih * W + iw); the 3d
-// kernels use channels-last-3d index order instead (see below).  A NaN in
+// The max kernels also fill `ind`, a channels-last (channels-last-3d for the
+// 3d kernels) strided int64 tensor of the winning position's offset within
+// each (n, c) input plane (ih * W + iw; d*H*W + h*W + w in 3d): channel c's
+// winner for output position o lives at ind[o * C + c], so the scan writes
+// every index densely.  A NaN in
 // the window becomes the maximum and carries the offset of the last NaN in
 // scan order; a window with no in-bounds position keeps the -1 sentinel, the
 // same contract the scalar max-pool frames follow.
@@ -49,6 +51,18 @@ using max_pool2d_cl_fn = void (*)(const void* in, void* out, int64_t* ind,
                                   int64_t sH, int64_t sW,
                                   int64_t pH, int64_t pW,
                                   int64_t dH, int64_t dW, int dtype);
+
+// Backward of the channels-last max pool: scatters each grad_output channel
+// lane onto the saved argmax position.  `gout` is NHWC contiguous, `gin` is
+// an NHWC-viewed zero-filled buffer, and `ind` is the channels-last int64
+// index tensor the forward stub filled (channel c's index for output
+// position o lives at ind[o * C + c]).  Contributions accumulate in output
+// (H, W) scan order, matching the scalar scatter frame.
+using max_pool2d_backward_cl_fn = void (*)(const void* gout,
+                                           const int64_t* ind, void* gin,
+                                           int64_t N, int64_t C,
+                                           int64_t H, int64_t W,
+                                           int64_t oH, int64_t oW, int dtype);
 
 // Channels-last-3d (NDHWC) variant of the max-pool core.  Same value and
 // index contract as max_pool2d_cl_fn, with the winning position stored as
@@ -94,6 +108,7 @@ using adaptive_max_pool2d_cl_fn = void (*)(const void* in, void* out,
 
 DECLARE_DISPATCH(avg_pool2d_cl_fn, avg_pool2d_cl_stub)
 DECLARE_DISPATCH(max_pool2d_cl_fn, max_pool2d_cl_stub)
+DECLARE_DISPATCH(max_pool2d_backward_cl_fn, max_pool2d_backward_cl_stub)
 DECLARE_DISPATCH(max_pool3d_cl_fn, max_pool3d_cl_stub)
 DECLARE_DISPATCH(max_pool3d_backward_cl_fn, max_pool3d_backward_cl_stub)
 DECLARE_DISPATCH(adaptive_avg_pool2d_cl_fn, adaptive_avg_pool2d_cl_stub)
