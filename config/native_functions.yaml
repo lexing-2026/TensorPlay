@@ -1625,13 +1625,13 @@
     CPU: cumulative_trapezoid_cpu
     CUDA: cumulative_trapezoid_cuda
 
-- func: _trapezoid_backward(Tensor grad, Tensor? x, int[] ysizes, Scalar dx, int dim) -> Tensor
+- func: _trapezoid_backward(Tensor grad_output, Tensor? x, int[] ysizes, Scalar dx, int dim) -> Tensor
   variants: function
   dispatch:
     CPU: trapezoid_backward_cpu
     CUDA: trapezoid_backward_cuda
 
-- func: _cumulative_trapezoid_backward(Tensor grad, Tensor? x, Scalar dx, int dim) -> Tensor
+- func: _cumulative_trapezoid_backward(Tensor grad_output, Tensor? x, Scalar dx, int dim) -> Tensor
   variants: function
   dispatch:
     CPU: cumulative_trapezoid_backward_cpu
@@ -2627,7 +2627,7 @@
     CUDA: _ctc_loss_cuda
   tags: dynamic_output_shape
 
-- func: _ctc_loss_backward(Tensor grad, Tensor log_probs, Tensor targets, Tensor input_lengths, Tensor target_lengths, Tensor neg_log_likelihood, Tensor log_alpha, int blank, bool zero_infinity) -> Tensor
+- func: _ctc_loss_backward(Tensor grad_output, Tensor log_probs, Tensor targets, Tensor input_lengths, Tensor target_lengths, Tensor neg_log_likelihood, Tensor log_alpha, int blank, bool zero_infinity) -> Tensor
   variants: function
   dispatch:
     CPU: _ctc_loss_backward_cpu
@@ -2907,49 +2907,49 @@
     CPU: fft_irfft2_cpu
     CUDA: fft_irfft2_cuda
 
-- func: fft_fft2_backward(Tensor grad, Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
+- func: fft_fft2_backward(Tensor grad_output, Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
   variants: function
   dispatch:
     CPU: fft_fft2_backward_cpu
     CUDA: fft_fft2_backward_cuda
 
-- func: fft_ifft2_backward(Tensor grad, Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
+- func: fft_ifft2_backward(Tensor grad_output, Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
   variants: function
   dispatch:
     CPU: fft_ifft2_backward_cpu
     CUDA: fft_ifft2_backward_cuda
 
-- func: fft_rfft2_backward(Tensor grad, Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
+- func: fft_rfft2_backward(Tensor grad_output, Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
   variants: function
   dispatch:
     CPU: fft_rfft2_backward_cpu
     CUDA: fft_rfft2_backward_cuda
 
-- func: fft_irfft2_backward(Tensor grad, Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
+- func: fft_irfft2_backward(Tensor grad_output, Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
   variants: function
   dispatch:
     CPU: fft_irfft2_backward_cpu
     CUDA: fft_irfft2_backward_cuda
 
-- func: fft_fft_backward(Tensor grad, Tensor self, int dim, str norm) -> Tensor
+- func: fft_fft_backward(Tensor grad_output, Tensor self, int dim, str norm) -> Tensor
   variants: function
   dispatch:
     CPU: fft_fft_backward_cpu
     CUDA: fft_fft_backward_cuda
 
-- func: fft_ifft_backward(Tensor grad, Tensor self, int dim, str norm) -> Tensor
+- func: fft_ifft_backward(Tensor grad_output, Tensor self, int dim, str norm) -> Tensor
   variants: function
   dispatch:
     CPU: fft_ifft_backward_cpu
     CUDA: fft_ifft_backward_cuda
 
-- func: fft_rfft_backward(Tensor grad, Tensor self, int dim, str norm) -> Tensor
+- func: fft_rfft_backward(Tensor grad_output, Tensor self, int dim, str norm, int n=-1) -> Tensor
   variants: function
   dispatch:
     CPU: fft_rfft_backward_cpu
     CUDA: fft_rfft_backward_cuda
 
-- func: fft_irfft_backward(Tensor grad, Tensor self, int dim, str norm) -> Tensor
+- func: fft_irfft_backward(Tensor grad_output, Tensor self, int dim, str norm) -> Tensor
   variants: function
   dispatch:
     CPU: fft_irfft_backward_cpu
@@ -5126,7 +5126,7 @@
     CPU: sparse_semi_structured_mask_grad_cpu
     CUDA: sparse_semi_structured_mask_grad_cuda
 
-- func: _sparse_semi_structured_gather_grad(Tensor grad, Tensor packed, Tensor meta) -> Tensor
+- func: _sparse_semi_structured_gather_grad(Tensor grad_output, Tensor packed, Tensor meta) -> Tensor
   variants: function
   dispatch:
     CPU: sparse_semi_structured_gather_grad_cpu
@@ -8481,7 +8481,7 @@
   variants: function
 - func: _sparse_sum.dim_dtype(Tensor self, int[1] dim, *, ScalarType dtype) -> Tensor
   variants: function
-- func: _sparse_sum_backward(Tensor grad, Tensor self, int[] dim) -> Tensor
+- func: _sparse_sum_backward(Tensor grad_output, Tensor self, int[] dim) -> Tensor
   variants: function
 - func: _sparse_csr_sum.dim_dtype(Tensor self, int[1] dim, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor
   variants: function
@@ -11071,7 +11071,7 @@
   tags: view_copy
 - func: segment_reduce(Tensor data, str reduce, *, Tensor? lengths=None, Tensor? indices=None, Tensor? offsets=None, int axis=0, bool unsafe=False, Scalar? initial=None) -> Tensor
   variants: function
-- func: _segment_reduce_backward(Tensor grad, Tensor output, Tensor data, str reduce, *, Tensor? lengths=None, Tensor? offsets=None, int axis=0, Scalar? initial=None) -> Tensor
+- func: _segment_reduce_backward(Tensor grad_output, Tensor output, Tensor data, str reduce, *, Tensor? lengths=None, Tensor? offsets=None, int axis=0, Scalar? initial=None) -> Tensor
   variants: function
 - func: _segment_reduce(Tensor data, str reduce, *, Tensor? lengths=None, Tensor? offsets=None, int axis=0, Scalar? initial=None) -> Tensor
   variants: function

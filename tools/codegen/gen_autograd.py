@@ -542,6 +542,9 @@ class OpDerivatives:
     # node and leaves the outputs detached.
     non_differentiable_output: bool = False
     differentiable_outputs: list[bool] | None = None
+    # Inputs declared `non_differentiable`: read for their shape or values
+    # only, so they never make the output require a gradient.
+    non_differentiable_args: frozenset[str] = frozenset()
     # Forward-mode derivatives: output name -> jvp formula over each
     # argument's primal value "{arg}_p" and tangent "{arg}_t".
     fw_formulas: dict[str, Expr] = field(default_factory=dict)
@@ -694,6 +697,19 @@ MANUAL_DERIVATIVES: dict[str, dict] = {
     "native_layer_norm_backward": {
         "saved": ["grad_out", "input", "normalized_shape", "mean", "rstd", "weight", "bias"],
         "node": "NativeLayerNormBackwardBackward"},
+    # Multi-output backward kernels with no derivative of their own
+    # (MiscKernelBackward.h): a pass that needs one raises.
+    "deform_conv2d_backward": {"saved": [], "node": "DeformConv2dBackwardBackward"},
+    "_scaled_dot_product_flash_attention_for_cpu_backward": {
+        "saved": [], "node": "ScaledDotProductFlashAttentionForCpuBackwardBackward"},
+    "_scaled_dot_product_attention_backward_with_lse": {
+        "saved": [], "node": "ScaledDotProductAttentionBackwardWithLseBackward"},
+    "_flash_attention_backward": {"saved": [], "node": "FlashAttentionBackwardBackward"},
+    "_efficient_attention_backward": {"saved": [], "node": "EfficientAttentionBackwardBackward"},
+    "scaled_dot_product_attention_backward": {
+        "saved": [], "node": "ScaledDotProductAttentionBackwardBackward"},
+    "grid_sampler_2d_backward": {"saved": [], "node": "GridSampler2dBackwardBackward"},
+    "grid_sampler_3d_backward": {"saved": [], "node": "GridSampler3dBackwardBackward"},
     "linalg_lu": {"saved": ["pivot"], "saved_outputs": ["P", "L", "U"],
                   "output_differentiability": [False, True, True]},
     "lu_unpack": {"saved": ["LU_data"],
@@ -907,14 +923,14 @@ def load_derivatives(path: str, native_by_opname: dict[str, NativeFunction]) \
     raw_by_op: dict[str, tuple[dict[str, str], list[bool] | None]] = {}
     seen_names: set[str] = set()
     for item in parse_derivatives_yaml(path):
-        # One entry per schema: a second one would silently replace the
-        # first, and the two need not agree.
-        schema_key = "".join(item["name"].split())
-        if schema_key in seen_names:
-            raise ValueError(f"derivatives.yaml defines '{item['name']}' more than once")
-        seen_names.add(schema_key)
         f = parse_schema(item["name"])
         op = f.func_name
+        # One entry per operator: a second one would silently replace the
+        # first, and the two need not agree.  Keyed by the operator rather
+        # than the spelled schema, which can differ in defaults alone.
+        if op in seen_names:
+            raise ValueError(f"derivatives.yaml defines '{op}' more than once")
+        seen_names.add(op)
         native = native_by_opname.get(op)
         if native is None:
             continue
@@ -941,6 +957,7 @@ def load_derivatives(path: str, native_by_opname: dict[str, NativeFunction]) \
         arg_names = {a.name for a in native.args}
         raw: dict[str, str] = {}
         fw_raw: dict[str, str] = {}
+        non_differentiable: set[str] = set()
 
         def split_names(raw_names: str) -> tuple[str, ...]:
             """Given "foo, bar", return ("foo", "bar")."""
@@ -969,7 +986,10 @@ def load_derivatives(path: str, native_by_opname: dict[str, NativeFunction]) \
                             f"Derivative key '{key}' for '{op}' mixes the "
                             f"argument '{names[0]}' with the unknown name "
                             f"'{name}'")
-                    raw[name] = formula
+                    if formula.strip() == "non_differentiable":
+                        non_differentiable.add(name)
+                    else:
+                        raw[name] = formula
             else:
                 for name in names:
                     if name not in output_keys:
@@ -984,6 +1004,7 @@ def load_derivatives(path: str, native_by_opname: dict[str, NativeFunction]) \
             out[op] = compute_op_derivatives(
                 native, raw, fw_raw=fw_raw or None,
                 differentiable_outputs=output_differentiability)
+            out[op].non_differentiable_args = frozenset(non_differentiable)
         elif output_differentiability is not None and not any(
                 output_differentiability):
             # Non-differentiable output: register the autograd wrapper so the

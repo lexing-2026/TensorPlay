@@ -110,34 +110,14 @@ inline int64_t infer_ft_real_to_complex_onesided_size(int64_t real_size) {
 
 // slice from 0 when larger, zero-pad at the end when smaller.
 Tensor resize_input_dim(const Tensor& contig, int64_t dim, int64_t want) {
-    std::vector<int64_t> sizes = sizes_of(contig);
-    const int64_t have = sizes[dim];
+    const int64_t have = contig.size(dim);
     if (have == want) return contig;
     TP_CHECK(want > 0, "resize_fft_input: invalid target length");
-    const size_t elem = contig.itemsize();
-    std::vector<int64_t> out_sizes = sizes;
+    if (have > want) return contig.narrow(dim, 0, want).contiguous();
+    std::vector<int64_t> out_sizes = sizes_of(contig);
     out_sizes[dim] = want;
-    Tensor out = have > want ? Tensor(out_sizes, contig.dtype())
-                             : Tensor::zeros(out_sizes, contig.dtype(), contig.device());
-    const char* src = static_cast<const char*>(contig.data_ptr());
-    char* dst = static_cast<char*>(out.data_ptr());
-    const int nd = (int)sizes.size();
-    std::vector<int64_t> strides(nd, 0);
-    { int64_t acc = 1; for (int i = nd - 1; i >= 0; --i) { strides[i] = acc; acc *= sizes[i]; } }
-    int64_t outer = 1;
-    for (int i = 0; i < nd; ++i) if (i != dim) outer *= sizes[i];
-    const int64_t copy_n = std::min(have, want);
-    std::vector<int64_t> counter(nd, 0);
-    for (int64_t o = 0; o < outer; ++o) {
-        int64_t off = 0;
-        for (int i = 0; i < nd; ++i) if (i != dim) off += counter[i] * strides[i];
-        std::memcpy(dst + off * elem, src + off * elem, elem * copy_n);
-        for (int i = nd - 1; i >= 0; --i) {
-            if (i == dim) continue;
-            if (++counter[i] < sizes[i]) break;
-            counter[i] = 0;
-        }
-    }
+    Tensor out = Tensor::zeros(out_sizes, contig.dtype(), contig.device());
+    out.narrow(dim, 0, have).copy_(contig);
     return out;
 }
 
@@ -366,32 +346,29 @@ namespace {
 // backward is [zero-fill the twosided spectrum, c2c INVERSE with the forward's
 // normalization, take the real part].
 template <typename T>
-Tensor rfft_backward_core(const Tensor& grad, int64_t input_len, int64_t dim,
-                          fft_norm_mode mode) {
+Tensor rfft_backward_core(const Tensor& grad, int64_t signal_len, int64_t input_len,
+                          int64_t dim, fft_norm_mode mode) {
     Tensor g = grad.contiguous();
-    std::vector<int64_t> gsizes = sizes_of(g);
-    const int64_t bins = gsizes[dim];
-    std::vector<int64_t> full_sizes = gsizes;
-    full_sizes[dim] = input_len;
-    Tensor full(full_sizes, g.dtype());
-    full.zero_();
-    if (bins == input_len) {
-        // grad already covers every bin: plain inverse c2c.
-        Tensor t = core_c2c<T>(g, dim, input_len, mode, /*forward=*/false);
-        return extract_real_part<T>(t);
-    }
-    full.slice(dim, 0, bins).copy_(g);
-    Tensor t = core_c2c<T>(full, dim, input_len, mode, /*forward=*/false);
-    return extract_real_part<T>(t);
+    std::vector<int64_t> full_sizes = sizes_of(g);
+    const int64_t bins = std::min(full_sizes[dim], signal_len);
+    full_sizes[dim] = signal_len;
+    Tensor full = Tensor::zeros(full_sizes, g.dtype(), g.device());
+    full.narrow(dim, 0, bins).copy_(g.narrow(dim, 0, bins));
+    Tensor t = core_c2c<T>(full, dim, signal_len, mode, /*forward=*/false);
+    // The forward zero-padded or truncated the input to signal_len first.
+    return resize_input_dim(extract_real_part<T>(t), dim, input_len);
 }
 }  // namespace
 
-Tensor fft_rfft_backward_cpu(const Tensor& grad, const Tensor& self, int64_t dim, const std::string& norm) {
+Tensor fft_rfft_backward_cpu(const Tensor& grad, const Tensor& self, int64_t dim,
+                             const std::string& norm, int64_t n) {
     dim = wrap_dim(dim, self.dim());
     const auto mode = norm_from_string(norm, true);
+    const int64_t input_len = self.size(dim);
+    const int64_t signal_len = n > 0 ? n : input_len;
     if (grad.dtype() == DType::ComplexFloat)
-        return rfft_backward_core<float>(grad, self.size(dim), dim, mode);
-    return rfft_backward_core<double>(grad, self.size(dim), dim, mode);
+        return rfft_backward_core<float>(grad, signal_len, input_len, dim, mode);
+    return rfft_backward_core<double>(grad, signal_len, input_len, dim, mode);
 }
 
 namespace {
@@ -404,13 +381,14 @@ Tensor irfft_backward_core(const Tensor& grad, int64_t freq_bins, int64_t dim,
     Tensor g = grad.contiguous();
     Tensor t = core_r2c<T>(g, dim, mode, /*onesided=*/true);
     const int64_t got_bins = sizes_of(t)[dim];
-    const int64_t double_length = freq_bins - got_bins;
+    const int64_t double_length = g.size(dim) - got_bins;
     if (double_length > 0) {
         // bins 1 .. N - onesided_length receive their conjugate counterpart twice.
         Tensor scaled = t.slice(dim, 1, 1 + double_length).mul(Scalar(2.0));
         t.slice(dim, 1, 1 + double_length).copy_(scaled);
     }
-    return t;
+    // The forward zero-padded or truncated the bins to N / 2 + 1 first.
+    return resize_input_dim(t, dim, freq_bins);
 }
 }  // namespace
 
@@ -561,9 +539,12 @@ void unpad_scatter_time_axis(const T* padded_grad, int64_t batch, int64_t padded
 template <typename T>
 void fill_win_full(std::vector<T>& win_full, const std::optional<Tensor>& window,
                    int64_t win_length, int64_t n_fft) {
-    // window of win_length < n_fft is zero-padded on both sides.
+    // window of win_length < n_fft is zero-padded on both sides; without one
+    // the rectangle is win_length wide.
+    const int64_t left = (n_fft - win_length) / 2;
+    win_full.assign(n_fft, T(0));
     if (!window.has_value()) {
-        win_full.assign(n_fft, T(1));
+        std::fill(win_full.begin() + left, win_full.begin() + left + win_length, T(1));
         return;
     }
     Tensor w = window->contiguous();
@@ -579,8 +560,6 @@ void fill_win_full(std::vector<T>& win_full, const std::optional<Tensor>& window
         const T* p = static_cast<const T*>(w.data_ptr());
         for (int64_t i = 0; i < win_length; ++i) tmp[i] = p[i];
     }
-    win_full.assign(n_fft, T(0));
-    const int64_t left = (n_fft - win_length) / 2;
     for (int64_t i = 0; i < win_length; ++i) win_full[left + i] = tmp[i];
 }
 
@@ -729,8 +708,12 @@ Tensor istft_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t win,
         TP_CHECK(fft_size == n_fft, "istft: frequency dim must equal n_fft when onesided=False");
     }
 
-    // rectangular ones only when the window is absent.
-    std::vector<T> win_full(n_fft, window.has_value() ? T(0) : T(1));
+    // a win-wide rectangle when the window is absent, centered like a window.
+    std::vector<T> win_full(n_fft, T(0));
+    if (!window.has_value()) {
+        const int64_t left = (n_fft - win) / 2;
+        std::fill(win_full.begin() + left, win_full.begin() + left + win, T(1));
+    }
     {
         std::vector<T> tmp(win);
         if (window.has_value()) {

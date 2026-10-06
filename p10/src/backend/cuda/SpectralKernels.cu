@@ -181,7 +181,7 @@ Tensor resize_last_dim(const Tensor& contig, int64_t want) {
     TP_CHECK(want > 0, "resize: invalid length");
     std::vector<int64_t> out_sizes = sizes;
     out_sizes.back() = want;
-    Tensor out = have > want ? Tensor(out_sizes, contig.dtype())
+    Tensor out = have > want ? Tensor(out_sizes, contig.dtype(), contig.device())
                              : Tensor::zeros(out_sizes, contig.dtype(), contig.device());
     const int64_t lines = have > want ? out.numel() / want : contig.numel() / have;
     auto stream = getCurrentCUDAStream().stream();
@@ -308,11 +308,24 @@ __global__ void window_fill_kernel(T* w, int64_t n, int64_t L,
 
 namespace {
 
+// Both accept a real or a complex dtype: transforms size real buffers from
+// real signals as well as from spectra, and complex buffers from either.
+inline bool is_double_precision(DType dt) {
+    return dt == DType::Float64 || dt == DType::ComplexDouble;
+}
 inline DType real_dtype_of(DType dt) {
-    return dt == DType::ComplexDouble ? DType::Float64 : DType::Float32;
+    return is_double_precision(dt) ? DType::Float64 : DType::Float32;
 }
 inline DType complex_dtype_of(DType dt) {
-    return dt == DType::Float64 ? DType::ComplexDouble : DType::ComplexFloat;
+    return is_double_precision(dt) ? DType::ComplexDouble : DType::ComplexFloat;
+}
+
+// The packed (lines, n) result of a transform over the last dimension of `x`,
+// viewed with x's leading dimensions.
+Tensor with_batch_shape(const Tensor& packed, const Tensor& x, int64_t n) {
+    std::vector<int64_t> sizes = sizes_of(x);
+    sizes.back() = n;
+    return packed.reshape(sizes);
 }
 
 // ---------------------------------------------------------------------------
@@ -372,7 +385,7 @@ Tensor core_c2c_impl(const Tensor& x, int64_t n_eff, fft_norm_mode mode, bool fo
         }
         CUDA_CHECK(cudaGetLastError());
     }
-    return packed;
+    return with_batch_shape(packed, x, n_eff);
 }
 
 // ---------------------------------------------------------------------------
@@ -427,7 +440,7 @@ Tensor core_r2c_impl(const Tensor& x, int64_t n_eff, fft_norm_mode mode) {
         }
         CUDA_CHECK(cudaGetLastError());
     }
-    return spec;
+    return with_batch_shape(spec, x, n_out);
 }
 
 // ---------------------------------------------------------------------------
@@ -441,7 +454,15 @@ __global__ void copy_strided_c2c_kernel(int64_t lines, int64_t cols, int64_t src
     if (line >= lines) return;
     const C* s = src + line * src_stride;
     C* d = dst + line * cols;
-    for (int64_t i = threadIdx.x; i < cols; i += blockDim.x) d[i] = s[i];
+    // Bins past the input's end are zero, as if the input had been zero-padded.
+    for (int64_t i = threadIdx.x; i < cols; i += blockDim.x) {
+        if (i < src_stride) {
+            d[i] = s[i];
+        } else {
+            d[i].x = 0;
+            d[i].y = 0;
+        }
+    }
 }
 
 template <bool IsDouble>
@@ -451,7 +472,6 @@ Tensor core_c2r_impl(const Tensor& x, int64_t n_eff, fft_norm_mode mode) {
     const LineInfo li = last_dim_lines(sizes_of(x));
     const int64_t bins_in = x.size(-1);
     const int64_t bins_needed = n_eff / 2 + 1;
-    TP_CHECK(bins_in >= bins_needed, "irfft: not enough frequency bins");
 
     auto stream = getCurrentCUDAStream().stream();
     Tensor cols({li.lines, bins_needed}, x.dtype(), x.device());
@@ -496,7 +516,7 @@ Tensor core_c2r_impl(const Tensor& x, int64_t n_eff, fft_norm_mode mode) {
         }
         CUDA_CHECK(cudaGetLastError());
     }
-    return out;
+    return with_batch_shape(out, x, n_eff);
 }
 
 }  // namespace
@@ -708,28 +728,31 @@ Tensor fft_ifft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t di
 // take real part].
 namespace {
 template <bool IsDouble>
-Tensor rfft_backward_core_cuda(const Tensor& g, int64_t input_len, fft_norm_mode mode) {
-    const int64_t bins = g.size(-1);
+Tensor rfft_backward_core_cuda(const Tensor& g, int64_t signal_len, fft_norm_mode mode) {
+    const int64_t bins = std::min(g.size(-1), signal_len);
     std::vector<int64_t> sizes = sizes_of(g);
-    sizes.back() = input_len;
+    sizes.back() = signal_len;
     Tensor full = Tensor::zeros(sizes, g.dtype(), g.device());
-    if (bins < input_len) full.slice(-1, 0, bins).copy_(g);
-    else full.copy_(g);
+    full.slice(-1, 0, bins).copy_(g.slice(-1, 0, bins));
     Tensor t = g.dtype() == DType::ComplexDouble
-        ? core_c2c_impl<true>(full, input_len, mode, /*forward=*/false)
-        : core_c2c_impl<false>(full, input_len, mode, /*forward=*/false);
+        ? core_c2c_impl<true>(full, signal_len, mode, /*forward=*/false)
+        : core_c2c_impl<false>(full, signal_len, mode, /*forward=*/false);
     return extract_real_part_cuda<IsDouble>(t);
 }
 }  // namespace
 
-Tensor fft_rfft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t dim, const std::string& norm) {
+Tensor fft_rfft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t dim,
+                              const std::string& norm, int64_t n) {
     dim = wrap_dim(dim, self.dim());
     auto [g, inv] = prepare_lastdim(grad, dim);
     const int64_t input_len = self.size(dim);
+    const int64_t signal_len = n > 0 ? n : input_len;
     const auto mode = norm_from_string(norm, true);
     Tensor out = g.dtype() == DType::ComplexDouble
-        ? rfft_backward_core_cuda<true>(g, input_len, mode)
-        : rfft_backward_core_cuda<false>(g, input_len, mode);
+        ? rfft_backward_core_cuda<true>(g, signal_len, mode)
+        : rfft_backward_core_cuda<false>(g, signal_len, mode);
+    // The forward zero-padded or truncated the input to signal_len first.
+    out = resize_last_dim<float>(out, input_len);
     return finish_layout(std::move(out), inv);
 }
 
@@ -901,7 +924,7 @@ Tensor stft_cuda_impl(const Tensor& work, int64_t n_fft, int64_t hop, int64_t wi
     const int64_t batch = wsizes[0];
     const int64_t plen = wsizes[1];
     const int64_t n_frames = 1 + (plen - n_fft) / hop;
-    const int64_t n_freq = infer_onesided(n_fft);
+    const int64_t n_freq = onesided ? infer_onesided(n_fft) : n_fft;
 
     Tensor win_t = Tensor::zeros({n_fft}, real_dtype_of(work.dtype()), work.device());
     {
@@ -946,7 +969,10 @@ Tensor stft_cuda_impl(const Tensor& work, int64_t n_fft, int64_t hop, int64_t wi
     }
 
     const auto mode = normalized ? fft_norm_mode::by_root_n : fft_norm_mode::none;
-    Tensor spec = core_r2c_impl<IsDouble>(frames, n_fft, mode);
+    Tensor spec = onesided
+        ? core_r2c_impl<IsDouble>(frames, n_fft, mode)
+        : core_c2c_impl<IsDouble>(promote_real_for_c2c_cuda<IsDouble>(frames), n_fft, mode,
+                                  /*forward=*/true);
     TP_CHECK(spec.size(-1) == n_freq, "stft: unexpected spectrum width");
 
     // transpose into output layout (batch, freq, frames)
@@ -967,7 +993,7 @@ Tensor stft_cuda_impl(const Tensor& work, int64_t n_fft, int64_t hop, int64_t wi
         }
         CUDA_CHECK(cudaGetLastError());
     }
-    return out_c;
+    return was_1d ? out_c.reshape({n_freq, n_frames}) : out_c;
 }
 
 Tensor stft_cuda(const Tensor& self, int64_t n_fft, std::optional<int64_t> hop_length,
@@ -1215,8 +1241,9 @@ __global__ void ola_scatter_kernel(int64_t batch, int64_t frames, int64_t n_fft,
     const int64_t t = line % frames;
     const T* fr = tf + line * n_fft;
     T* row = xg + b * padded_len + t * hop;
+    // Neighbouring frames overlap whenever hop < n_fft.
     for (int64_t k = threadIdx.x; k < n_fft; k += blockDim.x) {
-        row[k] += fr[k] * win[k];
+        atomicAdd(&row[k], fr[k] * win[k]);
     }
 }
 
@@ -1233,6 +1260,8 @@ __global__ void unpad_gather_kernel(int64_t batch, int64_t padded_len, int64_t p
     for (int64_t j = threadIdx.x; j < len; j += blockDim.x) {
         orow[j] = prow[pad + j];
     }
+    // The reflected halves add onto values other threads just stored.
+    __syncthreads();
     if (!reflect) return;
     const int64_t period = (2 * len - 2) > 1 ? (2 * len - 2) : 1;
     for (int64_t i = threadIdx.x; i < pad; i += blockDim.x) {
@@ -1255,7 +1284,7 @@ Tensor stft_backward_cuda_impl(const Tensor& grad_output, const Tensor& self, in
     using R = typename CudaTypes<IsDouble>::R;
     using C = typename CudaTypes<IsDouble>::C;
     std::vector<int64_t> gsizes = sizes_of(grad_output);
-    const int64_t n_freq = infer_onesided(n_fft);
+    const int64_t n_freq = onesided ? infer_onesided(n_fft) : n_fft;
     const int64_t frames = gsizes.back();
     const int64_t gfreq = gsizes[gsizes.size() - 2];
     TP_CHECK(gfreq == n_freq, "stft_backward: frequency dim mismatch");
@@ -1288,20 +1317,22 @@ Tensor stft_backward_cuda_impl(const Tensor& grad_output, const Tensor& self, in
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // gather grad columns into packed (batch*frames, bins): reuse the spec
-    // transpose kernel (grad layout (batch, freq, frames) -> (frames, freq))
+    // gather grad columns into packed (batch*frames, bins): the spec transpose
+    // kernel with its two extents swapped maps (batch, freq, frames) to
+    // (batch, frames, freq).
+    const Tensor grad_contig = grad_output.contiguous();
     Tensor cols(std::vector<int64_t>{batch * frames, n_freq}, complex_dtype_of(self.dtype()), self.device());
     {
         auto stream = getCurrentCUDAStream().stream();
         if constexpr (IsDouble) {
             transpose_spec_kernel<double, cufftDoubleComplex><<<(batch * n_freq * frames + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                batch, n_freq, frames,
-                reinterpret_cast<const cufftDoubleComplex*>(grad_output.contiguous().data_ptr()),
+                batch, frames, n_freq,
+                reinterpret_cast<const cufftDoubleComplex*>(grad_contig.data_ptr()),
                 reinterpret_cast<cufftDoubleComplex*>(cols.data_ptr()));
         } else {
             transpose_spec_kernel<float, cufftComplex><<<(batch * n_freq * frames + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                batch, n_freq, frames,
-                reinterpret_cast<const cufftComplex*>(grad_output.contiguous().data_ptr()),
+                batch, frames, n_freq,
+                reinterpret_cast<const cufftComplex*>(grad_contig.data_ptr()),
                 reinterpret_cast<cufftComplex*>(cols.data_ptr()));
         }
         CUDA_CHECK(cudaGetLastError());
@@ -1309,10 +1340,12 @@ Tensor stft_backward_cuda_impl(const Tensor& grad_output, const Tensor& self, in
 
     // twosided spectrum from the onesided grad, run the INVERSE c2c carrying
     // the forward's normalization, then project to the real part.
-    Tensor full = Tensor::zeros(std::vector<int64_t>{batch * frames, n_fft},
-                                complex_dtype_of(self.dtype()), self.device());
-    if (n_freq < n_fft) full.slice(-1, 0, n_freq).copy_(cols);
-    else full.copy_(cols);
+    Tensor full = cols;
+    if (n_freq < n_fft) {
+        full = Tensor::zeros(std::vector<int64_t>{batch * frames, n_fft},
+                             complex_dtype_of(self.dtype()), self.device());
+        full.slice(-1, 0, n_freq).copy_(cols);
+    }
     Tensor ctime = core_c2c_impl<IsDouble>(full, n_fft, mode, /*forward=*/false);
     Tensor tf = Tensor::empty(std::vector<int64_t>{batch * frames, n_fft},
                               self.dtype(), self.device());
@@ -1358,7 +1391,7 @@ Tensor stft_backward_cuda_impl(const Tensor& grad_output, const Tensor& self, in
         auto stream = getCurrentCUDAStream().stream();
         if (!center) {
             CUDA_CHECK(cudaMemcpyAsync(out.data_ptr(), xg.data_ptr(),
-                                       sizeof(R) * orig_len,
+                                       sizeof(R) * batch * orig_len,
                                        cudaMemcpyDeviceToDevice, stream));
         } else if (self.dtype() == DType::Float64) {
             unpad_gather_kernel<double><<<batch, kThreads, 0, stream>>>(

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from tools.codegen.gen_structured import _render_header, validate_structured
 from tools.codegen.gen_autograd import generate_autograd_nodes, load_derivatives
 from tools.codegen.gen_tpx import generate_tpx_ops_cpp
@@ -109,6 +111,44 @@ def test_python_bridge_only_expands_shape_lists():
     assert _is_variadic_shape_list(reshape, "function")
     assert not _is_variadic_shape_list(sparse_size, "function")
     assert not _is_variadic_shape_list(as_strided, "function")
+
+
+def test_derivatives_reject_a_second_entry_for_the_same_operator(tmp_path):
+    # Two spellings of one schema (here differing only in a default) would
+    # leave whichever entry is read last in charge.
+    funcs = parse_native_yaml(str(ROOT / "config" / "native_functions.yaml"))
+    path = tmp_path / "derivatives.yaml"
+    path.write_text(
+        "- name: flip(Tensor self, int[] dims) -> Tensor\n"
+        "  self: grad.flip(dims)\n"
+        "\n"
+        "- name: flip(Tensor self, int[] dims=[]) -> Tensor\n"
+        "  self: flip(grad, dims)\n"
+    )
+    with pytest.raises(ValueError, match="'flip' more than once"):
+        load_derivatives(str(path), {function.func_name: function for function in funcs})
+
+
+def test_non_differentiable_inputs_do_not_make_the_output_require_grad():
+    # A backward kernel reads its forward input for the shape alone: the
+    # declaration keeps that input out of the gradient slots and out of the
+    # requires_grad test, so calling the kernel on a leaf yields a constant.
+    funcs = parse_native_yaml(str(ROOT / "config" / "native_functions.yaml"))
+    derivatives = load_derivatives(
+        str(ROOT / "config" / "derivatives.yaml"),
+        {function.func_name: function for function in funcs},
+    )
+    entry = derivatives["fft_fft2_backward"]
+    assert entry.non_differentiable_args == {"self"}
+    assert set(entry.formulas) == {"grad_output"}
+
+    wrappers = generate_tpx_ops_cpp(
+        funcs, autocast_ops=set(), derivatives=derivatives,
+        native_op_names={function.cpp_name for function in funcs},
+    )
+    wrapper = wrappers.split("Tensor fft_fft2_backward(", 1)[1].split("\n}\n", 1)[0]
+    assert "grad_output.requires_grad()" in wrapper
+    assert "self.requires_grad()" not in wrapper
 
 
 def test_group_norm_codegen_shares_backward_and_marks_saved_statistics():

@@ -307,9 +307,14 @@ def _has_autograd(f: NativeFunction, derivatives: dict[str, OpDerivatives]) -> b
     )
 
 
-def _emit_requires_grad_detection(lines, f):
+def _emit_requires_grad_detection(lines, f, skip=frozenset()):
+    """Whether any input the derivatives cover wants a gradient; arguments
+    in ``skip`` (declared non-differentiable) never make the output require
+    one."""
     checks = []
     for a in f.args:
+        if a.name in skip:
+            continue
         t = a.type
         if t.is_tensor_like and not t.is_list and not t.is_opt:
             checks.append(f'{a.name}.requires_grad()')
@@ -544,7 +549,9 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
 
         # ---- gradient bookkeeping -----------------------------------------
         if has_ag or _is_list_view:
-            _emit_requires_grad_detection(lines, f)
+            _dv_nd = derivatives.get(f.func_name)
+            _emit_requires_grad_detection(
+                lines, f, _dv_nd.non_differentiable_args if _dv_nd is not None else frozenset())
             _emit_leaf_checks(lines, f)
             # In-place ops whose derivative references `self` must evaluate
             # the slope at the PRE-mutation value -- overloaded spellings

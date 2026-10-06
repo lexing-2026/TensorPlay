@@ -67,7 +67,7 @@
 # the mask would do, so only the gradient that arrives for the output is
 # answered.
 - name: native_dropout_backward(Tensor grad_output, Tensor mask, float scale) -> Tensor
-  grad_output: native_dropout_double_backward(grad, grad_output, mask, scale)
+  grad_output: native_dropout_backward(grad, mask, scale)
 
 # Alpha dropout keeps the kept-elements slope at `a`; the affine offset b
 # contributes no gradient. a = 1/sqrt((alpha^2 p + 1)(1 - p)) is recomputed
@@ -77,6 +77,14 @@
 
 - name: native_feature_dropout(Tensor input, float p) -> (Tensor output, Tensor mask)
   input: _feature_dropout_backward(grad, mask, p)
+
+# Both backward kernels scale the incoming gradient by the saved mask, so
+# their own derivative applies the same scaling.
+- name: _alpha_dropout_backward(Tensor grad_output, Tensor mask, float p) -> Tensor
+  grad_output: _alpha_dropout_backward(grad, mask, p)
+
+- name: _feature_dropout_backward(Tensor grad_output, Tensor mask, float p) -> Tensor
+  grad_output: _feature_dropout_backward(grad, mask, p)
 
 - name: add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
   self: grad
@@ -206,6 +214,10 @@
 - name: clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor
   self: clamp_backward(grad, self, min, max)
 
+- name: clamp_backward(Tensor grad_output, Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor
+  grad_output: clamp_backward(grad, self, min, max)
+  self: zeros_like(grad)
+
 # Explicit derivative formulas for generated autograd nodes.
 - name: clamp_min(Tensor self, Scalar min) -> Tensor
   self: where(self > min, grad, zeros_like(self))
@@ -315,6 +327,11 @@
 - name: _sparse_semi_structured_to_dense(Tensor packed, Tensor meta) -> Tensor
   packed: _sparse_semi_structured_gather_grad(grad, packed, meta)
 
+# Gathering the kept entries of a dense gradient is the adjoint of expanding
+# packed values to dense, so its own derivative expands again.
+- name: _sparse_semi_structured_gather_grad(Tensor grad_output, Tensor packed, Tensor meta) -> Tensor
+  grad_output: _sparse_semi_structured_to_dense(grad, meta)
+
 - name: _sparse_semi_structured_mm(Tensor mat1, Tensor mat1_meta, Tensor mat2, *, ScalarType? out_dtype=None) -> Tensor
   mat1: _sparse_semi_structured_gather_grad(grad.to(mat2.dtype()).mm(mat2.t()), mat1, mat1_meta)
   mat2: _sparse_semi_structured_mm_right(grad.t().to(mat1.dtype()), mat1, mat1_meta).t()
@@ -355,6 +372,18 @@
   self: inner_backward_self(grad, self, other)
   other: inner_backward_other(grad, self, other)
 
+# Each backward kernel is bilinear in the incoming gradient and the other
+# operand and does not read the operand it differentiates.
+- name: inner_backward_self(Tensor grad_output, Tensor self, Tensor other) -> Tensor
+  grad_output: inner(grad, other)
+  other: inner_backward_other(grad_output, grad, other)
+  self: non_differentiable
+
+- name: inner_backward_other(Tensor grad_output, Tensor self, Tensor other) -> Tensor
+  grad_output: inner(self, grad)
+  self: inner_backward_self(grad_output, self, grad)
+  other: non_differentiable
+
 - name: movedim(Tensor self, int[] source, int[] destination) -> Tensor
   self: movedim(grad, destination, source)
 
@@ -387,8 +416,9 @@
 
 - name: abs(Tensor self) -> Tensor
   # |z| maps C->R; conj(conj(z)/|z|) == z/|z| == sgn(z), so the plain sgn form
-  # already carries the conjugated Jacobian.
-  self: grad * self.sign()
+  # already carries the conjugated Jacobian.  sgn, not sign: sgn differentiates
+  # again (its own entry), which a complex input's curvature needs.
+  self: grad * self.sgn()
   result: auto_element_wise
 
 # Rounding ops are piecewise-constant: zero gradient, but the entry keeps the
@@ -499,10 +529,27 @@
 - name: multilabel_margin_loss_forward(Tensor self, Tensor target, int reduction) -> (Tensor output, Tensor is_target)
   self: multilabel_margin_loss_backward(grad, self, target, reduction, is_target)
 
+# The backward kernels below have no derivative of their own; a second pass
+# through one raises instead of treating the missing term as zero.
+- name: multi_margin_loss_backward(Tensor grad_output, Tensor self, Tensor target, Scalar p, Scalar margin, Tensor? weight=None, int reduction=1) -> Tensor
+  grad_output: not_implemented_grad("multi_margin_loss_backward")
+  self: not_implemented_grad("multi_margin_loss_backward")
+  weight: not_implemented_grad("multi_margin_loss_backward")
+
+- name: multilabel_margin_loss_backward(Tensor grad_output, Tensor self, Tensor target, int reduction, Tensor is_target) -> Tensor
+  grad_output: not_implemented_grad("multilabel_margin_loss_backward")
+  self: not_implemented_grad("multilabel_margin_loss_backward")
+
 # CTC: grad flows only to log_probs; the backward consumes the saved forward
 # outputs (raw per-sequence NLL keeps +inf for impossible alignments so the
 - name: _ctc_loss(Tensor log_probs, Tensor targets, Tensor input_lengths, Tensor target_lengths, int blank=0, bool zero_infinity=False) -> (Tensor neg_log_likelihood, Tensor log_alpha)
   log_probs: _ctc_loss_backward(grad, log_probs, targets, input_lengths, target_lengths, neg_log_likelihood, log_alpha, blank, zero_infinity)
+
+- name: _ctc_loss_backward(Tensor grad_output, Tensor log_probs, Tensor targets, Tensor input_lengths, Tensor target_lengths, Tensor neg_log_likelihood, Tensor log_alpha, int blank, bool zero_infinity) -> Tensor
+  grad_output: not_implemented_grad("_ctc_loss_backward")
+  log_probs: not_implemented_grad("_ctc_loss_backward")
+  neg_log_likelihood: not_implemented_grad("_ctc_loss_backward")
+  log_alpha: not_implemented_grad("_ctc_loss_backward")
 
 - name: mse_loss(Tensor self, Tensor target, int reduction=1) -> Tensor
   self: mse_loss_backward(grad, self, target, reduction)
@@ -836,6 +883,20 @@
 - name: ps_roi_pool(Tensor input, Tensor rois, float spatial_scale, int pooled_height, int pooled_width) -> Tensor
   input: ps_roi_pool_backward(grad, rois, spatial_scale, pooled_height, pooled_width, input.shape())
 
+# The ROI backward kernels have no derivative of their own.
+- name: roi_align_backward(Tensor grad_output, Tensor rois, float spatial_scale, int pooled_height, int pooled_width, int sampling_ratio, bool aligned, int[] input_size) -> Tensor
+  grad_output: not_implemented_grad("roi_align_backward")
+
+- name: roi_pool_backward(Tensor grad_output, Tensor input, Tensor rois, float spatial_scale, int pooled_height, int pooled_width) -> Tensor
+  grad_output: not_implemented_grad("roi_pool_backward")
+  input: not_implemented_grad("roi_pool_backward")
+
+- name: ps_roi_align_backward(Tensor grad_output, Tensor rois, float spatial_scale, int pooled_height, int pooled_width, int sampling_ratio, int[] input_size) -> Tensor
+  grad_output: not_implemented_grad("ps_roi_align_backward")
+
+- name: ps_roi_pool_backward(Tensor grad_output, Tensor rois, float spatial_scale, int pooled_height, int pooled_width, int[] input_size) -> Tensor
+  grad_output: not_implemented_grad("ps_roi_pool_backward")
+
 - name: deform_conv2d(Tensor input, Tensor weight, Tensor offset, Tensor mask, Tensor? bias, int[2] stride, int[2] padding, int[2] dilation, int groups, int offset_groups, bool use_mask) -> Tensor
   input: std::get<0>(deform_conv2d_backward(grad, input, weight, offset, mask, bias, stride, padding, dilation, groups, offset_groups, use_mask, {true, false, false, false, false}))
   weight: std::get<1>(deform_conv2d_backward(grad, input, weight, offset, mask, bias, stride, padding, dilation, groups, offset_groups, use_mask, {false, true, false, false, false}))
@@ -1117,6 +1178,12 @@
 # captured before the update, so the formula is the functional one.
 - name: rrelu_with_noise_(Tensor(a!) self, Tensor(b!) noise, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False, Generator? generator=None) -> Tensor(a!)
   self: rrelu_with_noise_backward(grad, self, noise, lower, upper, training, false)
+
+# self_is_result is false here: the second pass differentiates an
+# out-of-place call whose self is the input itself.
+- name: rrelu_with_noise_backward(Tensor grad_output, Tensor self, Tensor noise, Scalar lower, Scalar upper, bool training, bool self_is_result) -> Tensor
+  grad_output: rrelu_with_noise_backward(grad, self, noise, lower, upper, training, false)
+  self: zeros_like(grad)
 
 # the numerically stable branch split (no exp overflow for large |self|).
 - name: log_sigmoid(Tensor self) -> Tensor
@@ -1486,9 +1553,6 @@
   max: where(self < max, zeros_like(grad), where(eq(self, max), grad / 2, grad))
 
 # TensorTransformations.cpp:36 flip is an involution.
-- name: flip(Tensor self, int[] dims) -> Tensor
-  self: grad.flip(dims)
-
 # PixelShuffle.cpp pair are inverses of each other.
 - name: pixel_shuffle(Tensor self, int upscale_factor) -> Tensor
   self: tensorplay::tpx::ops::pixel_unshuffle(grad, upscale_factor)
@@ -1628,13 +1692,58 @@
   self: tensorplay::tpx::ops::fft_ifft_backward(grad, self, dim, norm)
 
 - name: fft_rfft(Tensor self, SymInt n=-1, int dim=-1, str norm="backward") -> Tensor
-  self: tensorplay::tpx::ops::fft_rfft_backward(grad, self, dim, norm)
+  self: tensorplay::tpx::ops::fft_rfft_backward(grad, self, dim, norm, n)
 
 - name: fft_irfft(Tensor self, SymInt n=-1, int dim=-1, str norm="backward") -> Tensor
   self: tensorplay::tpx::ops::fft_irfft_backward(grad, self, dim, norm)
 
+# Each spectral backward kernel applies the adjoint of its transform and is
+# linear in the incoming gradient, so differentiating it applies the
+# transform itself.  The input enters only through its shape.
+- name: fft_fft_backward(Tensor grad_output, Tensor self, int dim, str norm) -> Tensor
+  grad_output: tensorplay::tpx::ops::fft_fft(grad, size_along(grad_output.sizes(), dim), dim, norm)
+  self: non_differentiable
+
+- name: fft_ifft_backward(Tensor grad_output, Tensor self, int dim, str norm) -> Tensor
+  grad_output: tensorplay::tpx::ops::fft_ifft(grad, size_along(grad_output.sizes(), dim), dim, norm)
+  self: non_differentiable
+
+- name: fft_rfft_backward(Tensor grad_output, Tensor self, int dim, str norm, int n=-1) -> Tensor
+  grad_output: tensorplay::tpx::ops::fft_rfft(grad, n, dim, norm)
+  self: non_differentiable
+
+- name: fft_irfft_backward(Tensor grad_output, Tensor self, int dim, str norm) -> Tensor
+  grad_output: tensorplay::tpx::ops::fft_irfft(grad, size_along(grad_output.sizes(), dim), dim, norm)
+  self: non_differentiable
+
+- name: fft_fft2_backward(Tensor grad_output, Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
+  grad_output: tensorplay::tpx::ops::fft_fft2(grad, s, dim, norm)
+  self: non_differentiable
+
+- name: fft_ifft2_backward(Tensor grad_output, Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
+  grad_output: tensorplay::tpx::ops::fft_ifft2(grad, s, dim, norm)
+  self: non_differentiable
+
+- name: fft_rfft2_backward(Tensor grad_output, Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
+  grad_output: tensorplay::tpx::ops::fft_rfft2(grad, s, dim, norm)
+  self: non_differentiable
+
+- name: fft_irfft2_backward(Tensor grad_output, Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
+  grad_output: tensorplay::tpx::ops::fft_irfft2(grad, s, dim, norm)
+  self: non_differentiable
+
 - name: stft(Tensor self, int n_fft, int? hop_length=None, int? win_length=None, Tensor? window=None, bool center=True, str pad_mode="reflect", bool normalized=False, bool onesided=True, bool return_complex=True) -> Tensor
   self: tensorplay::tpx::ops::stft_backward(grad, self, n_fft, hop_length, win_length, window, center, pad_mode, normalized, onesided)
+  window: stft_window_backward(grad, self, n_fft, hop_length, win_length, window, center, pad_mode, normalized, onesided)
+
+# stft_backward applies the adjoint of the windowed, framed transform and is
+# linear in the incoming gradient, so differentiating it runs the transform;
+# with respect to the window it is stft's own window gradient with the roles
+# of the gradient and the signal exchanged.
+- name: stft_backward(Tensor grad_output, Tensor self, int n_fft, int? hop_length=None, int? win_length=None, Tensor? window=None, bool center=True, str pad_mode="reflect", bool normalized=False, bool onesided=True) -> Tensor
+  grad_output: tensorplay::tpx::ops::stft(grad, n_fft, hop_length, win_length, window, center, pad_mode, normalized, onesided, true)
+  window: stft_window_backward(grad_output, grad, n_fft, hop_length, win_length, window, center, pad_mode, normalized, onesided)
+  self: non_differentiable
 
 - name: flip(Tensor self, int[] dims=[]) -> Tensor
   self: tensorplay::tpx::ops::flip(grad, dims)
@@ -1801,26 +1910,41 @@
 # reversed cumsum of grad times the same weights.
 - name: trapezoid(Tensor y, Tensor? x=None, *, Scalar dx=1, int dim=-1) -> Tensor
   y: _trapezoid_backward(grad, x, y.shape(), dx, dim)
+  x: trapezoid_x_backward(grad, y, x, dim)
 
 - name: cumulative_trapezoid(Tensor y, Tensor? x=None, *, Scalar dx=1, int dim=-1) -> Tensor
   y: _cumulative_trapezoid_backward(grad, x, dx, dim)
+  x: cumulative_trapezoid_x_backward(grad, y, x, dim)
+
+# Both backward kernels weight the incoming gradient by the trapezoid rule's
+# coefficients, so differentiating one integrates again; with respect to the
+# sample points it is the integral's own x-gradient with the roles of the
+# gradient and the samples exchanged.
+- name: _trapezoid_backward(Tensor grad_output, Tensor? x, int[] ysizes, Scalar dx, int dim) -> Tensor
+  grad_output: trapezoid(grad, x, dx, dim)
+  x: trapezoid_x_backward(grad_output, grad, x, dim)
+
+- name: _cumulative_trapezoid_backward(Tensor grad_output, Tensor? x, Scalar dx, int dim) -> Tensor
+  grad_output: cumulative_trapezoid(grad, x, dx, dim)
+  x: cumulative_trapezoid_x_backward(grad_output, grad, x, dim)
 
 - name: scatter_reduce(Tensor self, int dim, Tensor index, Tensor src, str reduce, *, bool include_self=True) -> Tensor
-  self: _scatter_reduce_backward_self(grad, self, dim, index, src, reduce, include_self)
-  src: _scatter_reduce_backward_src(grad, self, dim, index, src, reduce, include_self)
+  self: scatter_reduce_backward_self_recordable(grad, self, dim, index, src, reduce, include_self)
+  src: scatter_reduce_backward_src_recordable(grad, self, dim, index, src, reduce, include_self)
 
 - name: index_reduce(Tensor self, int dim, Tensor index, Tensor source, str reduce, *, bool include_self=True) -> Tensor
-  self: _index_reduce_backward_self(grad, self, dim, index, source, reduce, include_self)
-  source: _index_reduce_backward_src(grad, self, dim, index, source, reduce, include_self)
+  self: index_reduce_backward_self_recordable(grad, self, dim, index, source, reduce, include_self)
+  source: index_reduce_backward_src_recordable(grad, self, dim, index, source, reduce, include_self)
 
 # with M = X - weighted_avg. dL/dX = G_M - rowsum(G_M) * (w / wsum) where
 # G_M = ((grad + grad^T) M diag(w)) / fact. corrcoef chains through the clip
 # mask, the D^-1 C D^-1 normalization and cov's formula.
 - name: cov(Tensor self, *, int correction=1, Tensor? fweights=None, Tensor? aweights=None) -> Tensor
-  self: _cov_backward(grad, self, correction, fweights, aweights)
+  self: cov_backward_recordable(grad, self, correction, fweights, aweights)
+  aweights: cov_aweights_backward(grad, self, correction, fweights, aweights)
 
 - name: corrcoef(Tensor self) -> Tensor
-  self: _corrcoef_backward(grad, self)
+  self: corrcoef_backward_recordable(grad, self)
 
 # ===========================================================================
 # Native backward completion batch.
@@ -2222,6 +2346,11 @@
 - name: segment_reduce(Tensor data, str reduce, *, Tensor? lengths=None, Tensor? indices=None, Tensor? offsets=None, int axis=0, bool unsafe=False, Scalar? initial=None) -> Tensor
   data: _segment_reduce_backward(grad, result, data, reduce, lengths, offsets, axis, initial)
 
+- name: _segment_reduce_backward(Tensor grad_output, Tensor output, Tensor data, str reduce, *, Tensor? lengths=None, Tensor? offsets=None, int axis=0, Scalar? initial=None) -> Tensor
+  grad_output: not_implemented_grad("_segment_reduce_backward")
+  output: not_implemented_grad("_segment_reduce_backward")
+  data: not_implemented_grad("_segment_reduce_backward")
+
 - name: _trilinear(Tensor i1, Tensor i2, Tensor i3, int[] expand1, int[] expand2, int[] expand3, int[] sumdim, int unroll_dim=1) -> Tensor
   i1: std::get<0>(_trilinear_backward(grad, i1, i2, i3, expand1, expand2, expand3, sumdim, {true, false, false}))
   i2: std::get<1>(_trilinear_backward(grad, i1, i2, i3, expand1, expand2, expand3, sumdim, {false, true, false}))
@@ -2235,11 +2364,25 @@
 - name: _sparse_log_softmax(Tensor self, int dim, bool half_to_float) -> Tensor
   self: _sparse_log_softmax_backward_data(grad, result, dim, self)
 
+- name: _sparse_softmax_backward_data(Tensor grad_output, Tensor output, int dim, Tensor self) -> Tensor
+  grad_output: not_implemented_grad("_sparse_softmax_backward_data")
+  output: not_implemented_grad("_sparse_softmax_backward_data")
+  self: not_implemented_grad("_sparse_softmax_backward_data")
+
+- name: _sparse_log_softmax_backward_data(Tensor grad_output, Tensor output, int dim, Tensor self) -> Tensor
+  grad_output: not_implemented_grad("_sparse_log_softmax_backward_data")
+  output: not_implemented_grad("_sparse_log_softmax_backward_data")
+  self: not_implemented_grad("_sparse_log_softmax_backward_data")
+
 - name: _sparse_sum(Tensor self) -> Tensor
   self: grad.sparse_mask(self)
 
 - name: _sparse_sum.dim(Tensor self, int[1] dim) -> Tensor
   self: _sparse_sum_backward(grad, self, dim)
+
+- name: _sparse_sum_backward(Tensor grad_output, Tensor self, int[] dim) -> Tensor
+  grad_output: not_implemented_grad("_sparse_sum_backward")
+  self: not_implemented_grad("_sparse_sum_backward")
 
 - name: _spdiags(Tensor diagonals, Tensor offsets, int[] shape, int? layout=None) -> Tensor
   output_differentiability: [False]
