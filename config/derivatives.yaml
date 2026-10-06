@@ -663,12 +663,12 @@
 # corresponding *_backward with an output_mask selecting the needed result.
 # The masked-out slot is returned as zeros and never consumed.
 - name: grid_sampler_2d(Tensor input, Tensor grid, int interpolation_mode, int padding_mode, bool align_corners) -> Tensor
-  input: std::get<0>(grid_sampler_2d_backward(grad, input, grid, interpolation_mode, padding_mode, align_corners, {true, false}))
-  grid: std::get<1>(grid_sampler_2d_backward(grad, input, grid, interpolation_mode, padding_mode, align_corners, {false, true}))
+  input: std::get<0>(grid_sampler_2d_backward(grad, input, grid, interpolation_mode, padding_mode, align_corners, grad_input_mask))
+  grid: std::get<1>(grid_sampler_2d_backward(grad, input, grid, interpolation_mode, padding_mode, align_corners, grad_input_mask))
 
 - name: grid_sampler_3d(Tensor input, Tensor grid, int interpolation_mode, int padding_mode, bool align_corners) -> Tensor
-  input: std::get<0>(grid_sampler_3d_backward(grad, input, grid, interpolation_mode, padding_mode, align_corners, {true, false}))
-  grid: std::get<1>(grid_sampler_3d_backward(grad, input, grid, interpolation_mode, padding_mode, align_corners, {false, true}))
+  input: std::get<0>(grid_sampler_3d_backward(grad, input, grid, interpolation_mode, padding_mode, align_corners, grad_input_mask))
+  grid: std::get<1>(grid_sampler_3d_backward(grad, input, grid, interpolation_mode, padding_mode, align_corners, grad_input_mask))
 
 - name: batch_norm(Tensor input, Tensor? weight, Tensor? bias, Tensor? running_mean, Tensor? running_var, bool training, float momentum, float eps) -> Tensor
   input: std::get<0>(batch_norm_backward(grad, input, weight, running_mean, running_var, training, eps))

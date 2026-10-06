@@ -63,8 +63,6 @@ TPX_UNDIFFERENTIATED_KERNEL_NODE(EfficientAttentionBackwardBackward, 4,
                                  "_efficient_attention_backward")
 TPX_UNDIFFERENTIATED_KERNEL_NODE(ScaledDotProductAttentionBackwardBackward, 3,
                                  "scaled_dot_product_attention_backward")
-TPX_UNDIFFERENTIATED_KERNEL_NODE(GridSampler2dBackwardBackward, 2, "grid_sampler_2d_backward")
-TPX_UNDIFFERENTIATED_KERNEL_NODE(GridSampler3dBackwardBackward, 2, "grid_sampler_3d_backward")
 
 #undef TPX_UNDIFFERENTIATED_KERNEL_NODE
 

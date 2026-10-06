@@ -1850,3 +1850,4 @@ struct StdMeanBackward : public Node {
 #include "ShapeKernelBackward.h"
 #include "ConvNormBackward.h"
 #include "MiscKernelBackward.h"
+#include "GridSamplerBackward.h"

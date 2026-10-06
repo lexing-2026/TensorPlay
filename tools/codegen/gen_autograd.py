@@ -697,6 +697,15 @@ MANUAL_DERIVATIVES: dict[str, dict] = {
     "native_layer_norm_backward": {
         "saved": ["grad_out", "input", "normalized_shape", "mean", "rstd", "weight", "bias"],
         "node": "NativeLayerNormBackwardBackward"},
+    # The grid sampler backwards differentiate again (GridSamplerBackward.h).
+    "grid_sampler_2d_backward": {
+        "saved": ["grad_output", "input", "grid", "interpolation_mode", "padding_mode",
+                  "align_corners"],
+        "node": "GridSampler2dBackwardBackward"},
+    "grid_sampler_3d_backward": {
+        "saved": ["grad_output", "input", "grid", "interpolation_mode", "padding_mode",
+                  "align_corners"],
+        "node": "GridSampler3dBackwardBackward"},
     # Multi-output backward kernels with no derivative of their own
     # (MiscKernelBackward.h): a pass that needs one raises.
     "deform_conv2d_backward": {"saved": [], "node": "DeformConv2dBackwardBackward"},
@@ -708,8 +717,6 @@ MANUAL_DERIVATIVES: dict[str, dict] = {
     "_efficient_attention_backward": {"saved": [], "node": "EfficientAttentionBackwardBackward"},
     "scaled_dot_product_attention_backward": {
         "saved": [], "node": "ScaledDotProductAttentionBackwardBackward"},
-    "grid_sampler_2d_backward": {"saved": [], "node": "GridSampler2dBackwardBackward"},
-    "grid_sampler_3d_backward": {"saved": [], "node": "GridSampler3dBackwardBackward"},
     "linalg_lu": {"saved": ["pivot"], "saved_outputs": ["P", "L", "U"],
                   "output_differentiability": [False, True, True]},
     "lu_unpack": {"saved": ["LU_data"],
