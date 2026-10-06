@@ -35,7 +35,7 @@ constexpr int kDefaultValuesPerThread = 4;
 constexpr int kMaxCachedReduceDevices = 64;
 // Bump when the header-only launch path changes; this also keeps generated
 // CUDA objects from silently reusing an older reduction implementation.
-constexpr int kReductionEngineRevision = 6;
+constexpr int kReductionEngineRevision = 10;
 
 // Per-device launch geometry, queried once via cudaDeviceGetAttribute and
 // cached: cudaGetDeviceProperties costs ~1ms per call on the target GPU and
@@ -101,6 +101,16 @@ struct default_accumulation_type<Half> {
 template <>
 struct default_accumulation_type<BFloat16> {
     using type = float;
+};
+
+template <>
+struct default_accumulation_type<tensorplay::complex<Half>> {
+    using type = tensorplay::complex<float>;
+};
+
+template <>
+struct default_accumulation_type<tensorplay::complex<BFloat16>> {
+    using type = tensorplay::complex<float>;
 };
 
 template <>
@@ -220,6 +230,22 @@ __device__ __forceinline__ ArgPair<T> reduce_warp_shuffle_down(
     return {
         reduce_warp_shuffle_down(value.value, mask, offset),
         reduce_warp_shuffle_down(value.index, mask, offset)};
+}
+
+// Pair accumulator for a fused aminmax: both extrema ride through every
+// shuffle level as one struct, so a single pass serves both outputs.
+template <typename AccT>
+struct MinMaxPair {
+    AccT min_val;
+    AccT max_val;
+};
+
+template <typename AccT>
+__device__ __forceinline__ MinMaxPair<AccT> reduce_warp_shuffle_down(
+        MinMaxPair<AccT> value, unsigned long long mask, int offset) {
+    return {
+        reduce_warp_shuffle_down(value.min_val, mask, offset),
+        reduce_warp_shuffle_down(value.max_val, mask, offset)};
 }
 
 // The count rides along every shuffle and every shared-memory staging step, so
@@ -523,8 +549,11 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
 
     if (reduction_on_fastest_dimension &&
         config.input_strides[0] == 1 && config.num_inputs >= 128) {
-        // vec=8 instantiations triple reduce_kernel PTX for negligible gain.
-        config.input_vec_size = 4;
+        // 16-bit types load eight elements per instruction (one 16B vector,
+        // matching the 32-bit types' vec4); wider types keep vec4.  vec8 is
+        // only instantiated for Half/BFloat16 so the PTX growth stays out of
+        // the 32/64-bit instantiations.
+        config.input_vec_size = (sizeof(InputT) == 2) ? 8 : 4;
         const size_t vector_bytes = sizeof(InputT) * static_cast<size_t>(config.input_vec_size);
         const bool aligned = reduction_pointer_aligned(iter, vector_bytes);
         // The per-output row base is the sum over non-reduced dims of
@@ -755,19 +784,37 @@ struct has_second_project<Ops, std::void_t<decltype(
     std::declval<const Ops&>().project_second(
         std::declval<typename Ops::acc_type>()))>> : std::true_type {};
 
+// Index-carrying ops (argmax/argmin, max/min with indices) define
+// translate_idx so a 32-bit split can rebase sub-iteration indices onto the
+// original reduction space before combining partials.
+template <typename Ops, typename = void>
+struct has_translate_idx : std::false_type {};
+template <typename Ops>
+struct has_translate_idx<Ops, std::void_t<decltype(
+    std::declval<const Ops&>().translate_idx(
+        std::declval<typename Ops::acc_type>(),
+        std::declval<int64_t>()))>> : std::true_type {};
+
 template <typename InputT, typename AccT, typename OutputT, typename Ops,
-          int ValuesPerThread, int InputVecSize>
+          int ValuesPerThread, int InputVecSize, typename SecondOutputT = OutputT>
 struct ReduceOp {
     ReduceConfig config;
     const InputT* input;
     OutputT* output;
-    OutputT* output2;
+    SecondOutputT* output2;
     AccT* partials;
     unsigned long long* counters;
     unsigned long long* flags;
     unsigned long long tag;
     AccT identity;
     Ops ops;
+    // 32-bit split support: non-32-bit iterators recurse over sub-iterators
+    // that share this accumulator buffer; each sub-launch rebases its index
+    // space by base_idx and only the final sub-iteration projects to output.
+    AccT* acc_buf;
+    int64_t base_idx;
+    bool accumulate;
+    bool final_output;
 
     template <int NRED>
     __device__ __forceinline__ AccT reduce_unit(
@@ -982,12 +1029,51 @@ struct ReduceOp {
         // gated on it. Without the gate, small reductions dereference null
         // staging pointers (illegal address on the first max/sum of a tiny
         // tensor).
-        auto store_out = [&](int64_t out, const AccT& value) {
+        auto store_out = [&](int64_t out, const AccT& raw_value) {
             const int64_t off = config.output_offset(out);
-            output[off] = ops.project(value);
-            if (output2 != nullptr) {
-                if constexpr (has_second_project<Ops>::value) {
-                    output2[off] = ops.project_second(value);
+            AccT value = raw_value;
+            if (acc_buf != nullptr) {
+                // The output dtype cannot hold the accumulator (Welford
+                // state, arg pairs, packed words, narrow outputs): stage the
+                // raw accumulator in a dedicated buffer and only project on
+                // the final sub-iteration.
+                if (accumulate) {
+                    if constexpr (has_translate_idx<Ops>::value) {
+                        value = ops.translate_idx(value, base_idx);
+                    }
+                    value = ops.combine(acc_buf[off], value);
+                }
+                if (final_output) {
+                    output[off] = ops.project(value);
+                    if (output2 != nullptr) {
+                        if constexpr (has_second_project<Ops>::value) {
+                            output2[off] = ops.project_second(value);
+                        }
+                    }
+                } else {
+                    acc_buf[off] = value;
+                }
+            } else {
+                // The output buffer itself holds the running accumulator.
+                if (accumulate) {
+                    if constexpr (has_translate_idx<Ops>::value) {
+                        value = ops.translate_idx(value, base_idx);
+                    }
+                    if constexpr (std::is_convertible_v<OutputT, AccT>) {
+                        value = ops.combine(static_cast<AccT>(output[off]), value);
+                    }
+                }
+                if (final_output) {
+                    output[off] = ops.project(value);
+                    if (output2 != nullptr) {
+                        if constexpr (has_second_project<Ops>::value) {
+                            output2[off] = ops.project_second(value);
+                        }
+                    }
+                } else if constexpr (std::is_convertible_v<AccT, OutputT>) {
+                    // Keep the raw accumulator (not the projected result) so
+                    // the next sub-iteration can combine with it.
+                    output[off] = static_cast<OutputT>(value);
                 }
             }
         };
@@ -1052,22 +1138,75 @@ struct ReduceOp {
 };
 
 template <typename InputT, typename AccT, typename OutputT, typename Ops,
-          int ValuesPerThread, int InputVecSize>
+          int ValuesPerThread, int InputVecSize, typename SecondOutputT = OutputT>
 __global__ void __launch_bounds__(kMaxReduceThreads, 4)
-reduce_kernel(ReduceOp<InputT, AccT, OutputT, Ops,
-                       ValuesPerThread, InputVecSize> op) {
+reduce_kernel(ReduceOp<InputT, AccT, OutputT, Ops, ValuesPerThread,
+                    InputVecSize, SecondOutputT> op) {
     op.run();
 }
 
+// Flattened offset of a 32-bit sub-iterator's start inside the original
+// reduction index space.  Reduced dims are reordered to the front, so the
+// base is the sum over reduced dims of view_offset * product of faster
+// reduced extents.
+inline int64_t reduction_base_offset(
+        const TensorIterator& iter, const TensorIterator& sub_iter) {
+    int64_t base = 0;
+    int64_t multiplier = 1;
+    const int nrd = iter.num_reduce_dims();
+    for (int d = 0; d < nrd; ++d) {
+        base += sub_iter.view_offsets()[d] * multiplier;
+        multiplier *= iter.shape()[d];
+    }
+    return base;
+}
+
 template <typename InputT, typename AccT, typename OutputT, typename Ops,
-          int ValuesPerThread, int InputVecSize>
+          int ValuesPerThread, int InputVecSize, typename SecondOutputT = OutputT>
 inline void launch_reduce(
-        TensorIterator& iter, Ops ops, AccT identity, OutputT* output2 = nullptr) {
+        TensorIterator& iter, Ops ops, AccT identity, SecondOutputT* output2 = nullptr,
+        AccT* acc_buf = nullptr, int64_t base_idx = 0) {
     ReduceConfig config = make_reduce_config<InputT, AccT, OutputT>(iter);
     if (config.num_outputs == 0 || config.num_inputs == 0) return;
+
     if (!iter.can_use_32bit_indexing()) {
-        TP_THROW(NotImplementedError,
-                 "CUDA reduction requires 32-bit TensorIterator indexing");
+        // Split the iteration space into 32-bit sub-iterators and accumulate
+        // the partials.  When the output dtype can hold the accumulator (same
+        // width, convertible), the output buffer doubles as the accumulation
+        // buffer; otherwise a dedicated AccT buffer stages the partials and
+        // the final sub-iteration projects them.
+        constexpr bool can_accumulate_in_output =
+            (sizeof(AccT) <= sizeof(OutputT)) &&
+            std::is_convertible_v<AccT, OutputT> &&
+            !(std::is_same_v<InputT, Half> && std::is_same_v<OutputT, Half>) &&
+            !(std::is_same_v<InputT, BFloat16> && std::is_same_v<OutputT, BFloat16>) &&
+            !(std::is_same_v<InputT, tensorplay::complex<Half>> &&
+              std::is_same_v<OutputT, tensorplay::complex<Half>>);
+        DataPtr owned_acc;
+        if (!can_accumulate_in_output && acc_buf == nullptr) {
+            owned_acc = getAllocator(DeviceType::CUDA)->allocate(
+                sizeof(AccT) * static_cast<size_t>(iter.num_output_elements()),
+                iter.device());
+            acc_buf = static_cast<AccT*>(owned_acc.get());
+        }
+        for (auto& sub_iter : iter.with_32bit_indexing()) {
+            const int64_t sub_base = reduction_base_offset(iter, sub_iter);
+            // A split can shrink the reduced extent below the vectorization
+            // floor, so re-derive the vector width for this sub-iterator
+            // instead of assuming the parent's.
+            const auto sub_config = make_reduce_config<InputT, AccT, OutputT>(sub_iter);
+            if (sub_config.input_vec_size == 8) {
+                launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, 8, SecondOutputT>(
+                    sub_iter, ops, identity, output2, acc_buf, sub_base);
+            } else if (sub_config.input_vec_size == 4) {
+                launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, 4, SecondOutputT>(
+                    sub_iter, ops, identity, output2, acc_buf, sub_base);
+            } else {
+                launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, 1, SecondOutputT>(
+                    sub_iter, ops, identity, output2, acc_buf, sub_base);
+            }
+        }
+        return;
     }
 
     const auto stream = getCurrentCUDAStream().stream();
@@ -1085,7 +1224,7 @@ inline void launch_reduce(
         shared_bytes = std::max(shared_bytes,
             static_cast<int>(config.num_threads * sizeof(AccT)));
     }
-    ReduceOp<InputT, AccT, OutputT, Ops, ValuesPerThread, InputVecSize> reduction{
+    ReduceOp<InputT, AccT, OutputT, Ops, ValuesPerThread, InputVecSize, SecondOutputT> reduction{
         config,
         static_cast<const InputT*>(iter.data_ptr(1)),
         static_cast<OutputT*>(iter.data_ptr(0)),
@@ -1095,7 +1234,11 @@ inline void launch_reduce(
         nullptr,
         0,
         identity,
-        ops};
+        ops,
+        acc_buf,
+        base_idx,
+        iter.should_accumulate(),
+        iter.is_final_output()};
 
     DataPtr partial_buffer;
     if (config.global_reduce) {
@@ -1123,7 +1266,7 @@ inline void launch_reduce(
         reduction.tag = tag_counter.fetch_add(1, std::memory_order_relaxed);
     }
 
-    reduce_kernel<InputT, AccT, OutputT, Ops, ValuesPerThread, InputVecSize>
+    reduce_kernel<InputT, AccT, OutputT, Ops, ValuesPerThread, InputVecSize, SecondOutputT>
         <<<grid, block, shared_bytes, stream>>>(reduction);
     checkCuda(cudaGetLastError(), "CUDA reduction kernel launch");
 }
@@ -1174,6 +1317,7 @@ struct MinMaxOps {
 template <typename AccT, bool MaxMode>
 struct ArgOps {
     using pair_type = ArgPair<AccT>;
+    using acc_type = ArgPair<AccT>;
 
     __device__ pair_type reduce(pair_type acc, AccT value, int64_t index) const {
         return better(acc, pair_type{value, index}) ? acc : pair_type{value, index};
@@ -1182,6 +1326,9 @@ struct ArgOps {
         return better(a, b) ? a : b;
     }
     __device__ int64_t project(pair_type value) const { return value.index; }
+    __device__ pair_type translate_idx(pair_type value, int64_t base_idx) const {
+        return {value.value, value.index + base_idx};
+    }
 
     __device__ bool better(pair_type a, pair_type b) const {
         if (reduce_isnan(a.value)) {
@@ -1192,6 +1339,83 @@ struct ArgOps {
         if (a.value == b.value) return a.index < b.index;
         if constexpr (MaxMode) return a.value > b.value;
         else return a.value < b.value;
+    }
+};
+
+// Generic single-pass extremum with indices for non-float accumulators: one
+// ArgPair rides through the reduction and both the value and the first
+// occurrence index come out of the same read.  This is the pair-tree sibling
+// of PackedExtremumOps (float family); it carries the identical NaN/tie rules.
+template <typename ScalarT, typename AccT, typename OutputT, bool MaxMode>
+struct ExtremumOps {
+    using pair_type = ArgPair<AccT>;
+    using acc_type = ArgPair<AccT>;
+
+    __device__ pair_type reduce(pair_type acc, ScalarT value, int64_t index) const {
+        return better(acc, pair_type{static_cast<AccT>(value), index})
+            ? acc : pair_type{static_cast<AccT>(value), index};
+    }
+    __device__ pair_type combine(pair_type a, pair_type b) const {
+        return better(a, b) ? a : b;
+    }
+    __device__ OutputT project(pair_type value) const {
+        return static_cast<OutputT>(value.value);
+    }
+    __device__ int64_t project_second(pair_type value) const {
+        return value.index;
+    }
+    __device__ pair_type translate_idx(pair_type value, int64_t base_idx) const {
+        return {value.value, value.index + base_idx};
+    }
+
+    __device__ bool better(pair_type a, pair_type b) const {
+        if (reduce_isnan(a.value)) {
+            if (reduce_isnan(b.value)) return a.index < b.index;
+            return true;
+        }
+        if (reduce_isnan(b.value)) return false;
+        if (a.value == b.value) return a.index < b.index;
+        if constexpr (MaxMode) return a.value > b.value;
+        else return a.value < b.value;
+    }
+};
+
+// Fused min+max for non-float aminmax: a MinMaxPair accumulator carries both
+// extrema through one pass.  NaN semantics match MinMaxOps (a NaN claims its side
+// and sticks).  The float family uses PackedAminMaxOps instead.
+template <typename ScalarT, typename AccT, typename OutputT>
+struct MinMaxPairOps {
+    using pair_type = MinMaxPair<AccT>;
+    using acc_type = MinMaxPair<AccT>;
+
+    __device__ pair_type reduce(pair_type acc, ScalarT value, int64_t) const {
+        const AccT converted = static_cast<AccT>(value);
+        return combine(acc, pair_type{converted, converted});
+    }
+    __device__ pair_type combine(pair_type a, pair_type b) const {
+        AccT min_val = a.min_val;
+        AccT max_val = a.max_val;
+        if (reduce_isnan(min_val)) {
+            // keep NaN
+        } else if (reduce_isnan(b.min_val)) {
+            min_val = b.min_val;
+        } else if (b.min_val < min_val) {
+            min_val = b.min_val;
+        }
+        if (reduce_isnan(max_val)) {
+            // keep NaN
+        } else if (reduce_isnan(b.max_val)) {
+            max_val = b.max_val;
+        } else if (b.max_val > max_val) {
+            max_val = b.max_val;
+        }
+        return {min_val, max_val};
+    }
+    __device__ OutputT project(pair_type value) const {
+        return static_cast<OutputT>(value.max_val);
+    }
+    __device__ OutputT project_second(pair_type value) const {
+        return static_cast<OutputT>(value.min_val);
     }
 };
 
@@ -1289,9 +1513,21 @@ struct PackedExtremumOps {
 
     __device__ static unsigned long long pack(float value, int64_t index) {
         unsigned key = extremum_value_key(value);
-        if constexpr (!kIsMax) key = ~key;
-        return (static_cast<unsigned long long>(key) << 32) |
-               static_cast<unsigned>(~static_cast<unsigned>(index));
+        if constexpr (!kIsMax) {
+            // Integer-min direction: store the order-preserving key directly
+            // (smaller value -> smaller key) and rebase NaN to key 0, below
+            // every finite key, so a NaN wins immediately.  The low half
+            // stores the plain index: on equal keys integer min keeps the
+            // smaller index (first occurrence).
+            if (reduce_isnan(value)) key = 0u;
+            return (static_cast<unsigned long long>(key) << 32) |
+                   static_cast<unsigned>(static_cast<unsigned>(index));
+        } else {
+            // Integer-max direction: NaN already maps to the largest key
+            // (canonical qNaN beats +inf); ~index keeps the smaller index.
+            return (static_cast<unsigned long long>(key) << 32) |
+                   static_cast<unsigned>(~static_cast<unsigned>(index));
+        }
     }
 
     template <typename V>
@@ -1310,30 +1546,41 @@ struct PackedExtremumOps {
     }
 
     __device__ OutputT project(unsigned long long word) const {
-        unsigned key = static_cast<unsigned>(word >> 32);
-        if constexpr (!kIsMax) key = ~key;
+        const unsigned key = static_cast<unsigned>(word >> 32);
+        // The min direction stores the key un-inverted; key 0 encodes the
+        // winning NaN and extremum_key_value(0) reconstructs a NaN bit
+        // pattern, so no special case is needed here.
         return static_cast<OutputT>(extremum_key_value(key));
     }
 
     __device__ int64_t project_second(unsigned long long word) const {
+        if constexpr (!kIsMax) {
+            return static_cast<int64_t>(
+                static_cast<unsigned>(word & 0xFFFFFFFFull));
+        }
         const unsigned idx =
             ~static_cast<unsigned>(word & 0xFFFFFFFFull);
         return static_cast<int64_t>(static_cast<int32_t>(idx));
     }
 };
 
-// Packed argmin: the max form with every key inverted, so integer min picks
-// the smallest value and the first NaN / first occurrence rules carry over.
+// Packed argmin: the integer-min form of the extremum key map.  The high
+// half stores the order-preserving key directly (smaller value -> smaller
+// key), NaNs rebase to key 0 (below every finite key, so a NaN wins at
+// once), and the low half stores the plain index so equal keys fall through
+// to the first occurrence.
 struct PackedArgMinOps {
     using acc_type = unsigned long long;
 
     template <typename V>
     __device__ unsigned long long reduce(
             unsigned long long acc, V value, int64_t index) const {
-        unsigned key = extremum_value_key(static_cast<float>(value));
+        const float converted = static_cast<float>(value);
+        unsigned key = extremum_value_key(converted);
+        if (reduce_isnan(converted)) key = 0u;
         const unsigned long long candidate =
-            (static_cast<unsigned long long>(~key) << 32) |
-            static_cast<unsigned>(~static_cast<unsigned>(index));
+            (static_cast<unsigned long long>(key) << 32) |
+            static_cast<unsigned>(static_cast<unsigned>(index));
         return candidate < acc ? candidate : acc;
     }
 
@@ -1343,9 +1590,8 @@ struct PackedArgMinOps {
     }
 
     __device__ int64_t project(unsigned long long value) const {
-        const unsigned idx =
-            ~static_cast<unsigned>(value & 0xFFFFFFFFull);
-        return static_cast<int64_t>(static_cast<int32_t>(idx));
+        return static_cast<int64_t>(
+            static_cast<unsigned>(value & 0xFFFFFFFFull));
     }
 };
 
@@ -1429,9 +1675,10 @@ struct AnyOps {
     __device__ OutputT project(int value) const { return static_cast<OutputT>(value != 0); }
 };
 
-template <typename ScalarT, typename AccT, typename OutputT>
+template <typename ScalarT, typename AccT, typename OutputT,
+          typename FactorT = typename tensorplay::scalar_value_type<AccT>::type>
 struct MeanOps {
-    AccT factor;
+    FactorT factor;
     __device__ AccT reduce(AccT acc, ScalarT value, int64_t) const {
         return acc + static_cast<AccT>(value);
     }

@@ -142,8 +142,11 @@ using reduction::AllOps;
 using reduction::AnyOps;
 using reduction::AbsMaxOps;
 using reduction::AbsMinOps;
+using reduction::ExtremumOps;
 using reduction::MeanOps;
 using reduction::MinMaxOps;
+using reduction::MinMaxPair;
+using reduction::MinMaxPairOps;
 using reduction::NanSumOps;
 using reduction::NormOps;
 using reduction::NormOneOps;
@@ -233,11 +236,12 @@ Tensor reduction_view(
 }
 
 template <typename InputT, typename AccT, typename OutputT, typename Ops,
-          int ValuesPerThread = reduction::kDefaultValuesPerThread>
+          int ValuesPerThread = reduction::kDefaultValuesPerThread,
+          typename SecondOutputT = OutputT>
 Tensor run_reduction_typed(
         const Tensor& input, const ReductionSpec& spec, bool keepdim,
         DType output_dtype, Ops ops, AccT identity, Tensor* second_output = nullptr) {
-    static_assert(reduction::kReductionEngineRevision == 6);
+    static_assert(reduction::kReductionEngineRevision == 10);
     Tensor result = Tensor::empty(
         reduction_output_shape(input, spec, keepdim), output_dtype, input.device());
     if (input.numel() == 0 || result.numel() == 0) return result;
@@ -245,13 +249,16 @@ Tensor run_reduction_typed(
     Tensor viewed = reduction_view(result, input, spec, keepdim);
     TensorIterator iter = TensorIterator::reduce_op(viewed, input);
     const auto config = reduction::make_reduce_config<InputT, AccT, OutputT>(iter);
-    OutputT* second_ptr =
-        second_output == nullptr ? nullptr : second_output->data_ptr<OutputT>();
-    if (config.input_vec_size == 4) {
-        reduction::launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, 4>(
+    SecondOutputT* second_ptr =
+        second_output == nullptr ? nullptr : second_output->data_ptr<SecondOutputT>();
+    if (config.input_vec_size == 8) {
+        reduction::launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, 8, SecondOutputT>(
+            iter, ops, identity, second_ptr);
+    } else if (config.input_vec_size == 4) {
+        reduction::launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, 4, SecondOutputT>(
             iter, ops, identity, second_ptr);
     } else {
-        reduction::launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, 1>(
+        reduction::launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, 1, SecondOutputT>(
             iter, ops, identity, second_ptr);
     }
     return result;
@@ -261,37 +268,37 @@ template <typename T>
 using same_dtype_acc_t = std::conditional_t<
     is_half_like_v<T>, float, default_accumulation_t<T>>;
 
-template <typename T>
+template <typename T, typename OutT = T>
 Tensor sum_same_dtype(
         const Tensor& input, const ReductionSpec& spec, bool keepdim, DType dtype) {
     using AccT = same_dtype_acc_t<T>;
     if (input.numel() == 0) {
         return Tensor::zeros(reduction_output_shape(input, spec, keepdim), dtype, input.device());
     }
-    return run_reduction_typed<T, AccT, T>(
-        input, spec, keepdim, dtype, SumOps<T, AccT, T>{}, AccT(0));
+    return run_reduction_typed<T, AccT, OutT>(
+        input, spec, keepdim, dtype, SumOps<T, AccT, OutT>{}, AccT(0));
 }
 
-template <typename T>
+template <typename T, typename OutT = T>
 Tensor nansum_same_dtype(
         const Tensor& input, const ReductionSpec& spec, bool keepdim, DType dtype) {
     using AccT = same_dtype_acc_t<T>;
     if (input.numel() == 0) {
         return Tensor::zeros(reduction_output_shape(input, spec, keepdim), dtype, input.device());
     }
-    return run_reduction_typed<T, AccT, T>(
-        input, spec, keepdim, dtype, NanSumOps<T, AccT, T>{}, AccT(0));
+    return run_reduction_typed<T, AccT, OutT>(
+        input, spec, keepdim, dtype, NanSumOps<T, AccT, OutT>{}, AccT(0));
 }
 
-template <typename T>
+template <typename T, typename OutT = T>
 Tensor prod_same_dtype(
         const Tensor& input, const ReductionSpec& spec, bool keepdim, DType dtype) {
     using AccT = same_dtype_acc_t<T>;
     if (input.numel() == 0) {
         return Tensor::ones(reduction_output_shape(input, spec, keepdim), dtype, input.device());
     }
-    return run_reduction_typed<T, AccT, T>(
-        input, spec, keepdim, dtype, ProdOps<T, AccT, T>{}, AccT(1));
+    return run_reduction_typed<T, AccT, OutT>(
+        input, spec, keepdim, dtype, ProdOps<T, AccT, OutT>{}, AccT(1));
 }
 
 template <typename T, bool MaxMode>
@@ -342,7 +349,7 @@ Tensor any_same_dtype(
         input, spec, keepdim, DType::Bool, AnyOps<T, int, bool>{}, 0);
 }
 
-template <typename T>
+template <typename T, typename OutT = T>
 Tensor mean_same_dtype(
         const Tensor& input, const ReductionSpec& spec, bool keepdim, DType dtype) {
     using AccT = same_dtype_acc_t<T>;
@@ -351,9 +358,10 @@ Tensor mean_same_dtype(
             reduction_output_shape(input, spec, keepdim),
             Scalar(std::numeric_limits<float>::quiet_NaN()), dtype, input.device());
     }
-    const AccT factor = AccT(1) / static_cast<AccT>(spec.reduced_numel);
-    return run_reduction_typed<T, AccT, T>(
-        input, spec, keepdim, dtype, MeanOps<T, AccT, T>{factor}, AccT(0));
+    using FactorT = typename tensorplay::scalar_value_type<AccT>::type;
+    const FactorT factor = FactorT(1) / static_cast<FactorT>(spec.reduced_numel);
+    return run_reduction_typed<T, AccT, OutT>(
+        input, spec, keepdim, dtype, MeanOps<T, AccT, OutT>{factor}, AccT(0));
 }
 
 template <typename T>
@@ -497,9 +505,8 @@ Tensor argmin_same_dtype(
 
 // max(dim)/min(dim): the value and its index come out of one pass.  The
 // float family with an int32-fitting logical extent runs the packed-u64
-// form (one shuffle chain carries both outputs); every other dtype keeps
-// the two-pass composition — extreme values, then the arg pass — over the
-// same first-occurrence tie rule.
+// form (one shuffle chain carries both outputs); every other dtype runs a
+// pair accumulator through the same single pass with identical NaN/tie rules.
 template <typename T, bool kIsMax>
 std::tuple<Tensor, Tensor> extremum_with_indices_same_dtype(
         const Tensor& input, const ReductionSpec& spec, bool keepdim) {
@@ -509,17 +516,24 @@ std::tuple<Tensor, Tensor> extremum_with_indices_same_dtype(
         input.device());
     if constexpr (std::is_same_v<ValueT, float>) {
         if (spec.reduced_numel <= ((int64_t{1} << 31) - 1)) {
-            Tensor values = run_reduction_typed<T, unsigned long long, T>(
+            Tensor values = run_reduction_typed<T, unsigned long long, T,
+                reduction::PackedExtremumOps<T, kIsMax>,
+                reduction::kDefaultValuesPerThread, int64_t>(
                 input, spec, keepdim, input.dtype(),
                 reduction::PackedExtremumOps<T, kIsMax>{},
                 kIsMax ? 0ull : 0xFFFFFFFFFFFFFFFFull, &indices);
             return {values, indices};
         }
     }
-    Tensor values = minmax_same_dtype<T, kIsMax>(input, spec, keepdim);
-    Tensor idx = kIsMax ? argmax_same_dtype<T>(input, spec, keepdim)
-                        : argmin_same_dtype<T>(input, spec, keepdim);
-    return {values, idx};
+    using StateT = reduction::ArgPair<ValueT>;
+    using Ops = reduction::ExtremumOps<T, ValueT, T, kIsMax>;
+    const ValueT identity = kIsMax
+        ? reduction::reduction_lower_bound<ValueT>()
+        : reduction::reduction_upper_bound<ValueT>();
+    Tensor values = run_reduction_typed<T, StateT, T, Ops,
+        reduction::kDefaultValuesPerThread, int64_t>(
+        input, spec, keepdim, input.dtype(), Ops{}, StateT{identity, 0}, &indices);
+    return {values, indices};
 }
 
 // Dtype-dispatch-friendly entry points (the macro fixes only <T>).
@@ -537,8 +551,8 @@ std::tuple<Tensor, Tensor> min_with_indices_same_dtype(
 
 // aminmax: both extreme values out of one pass.  The float family with an
 // int32-fitting logical extent runs the packed two-keys-per-word form (one
-// shuffle chain carries both outputs); every other dtype keeps the pair of
-// value passes.
+// shuffle chain carries both outputs); every other dtype carries a
+// MinMaxPair accumulator through the same single read.
 template <typename T>
 std::tuple<Tensor, Tensor> aminmax_same_dtype(
         const Tensor& input, const ReductionSpec& spec, bool keepdim) {
@@ -554,8 +568,17 @@ std::tuple<Tensor, Tensor> aminmax_same_dtype(
             return {min_values, max_values};
         }
     }
-    return {min_same_dtype<T>(input, spec, keepdim),
-            max_same_dtype<T>(input, spec, keepdim)};
+    Tensor min_values = Tensor::empty(
+        reduction_output_shape(input, spec, keepdim), input.dtype(),
+        input.device());
+    using StateT = reduction::MinMaxPair<ValueT>;
+    using Ops = reduction::MinMaxPairOps<T, ValueT, T>;
+    Tensor max_values = run_reduction_typed<T, StateT, T>(
+        input, spec, keepdim, input.dtype(), Ops{},
+        StateT{reduction::reduction_upper_bound<ValueT>(),
+               reduction::reduction_lower_bound<ValueT>()},
+        &min_values);
+    return {min_values, max_values};
 }
 
 #define TP_DISPATCH_REDUCTION(FN, DTYPE, ...) \
@@ -614,23 +637,35 @@ Tensor sum_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool 
     if (out_dtype == DType::Undefined) {
         out_dtype = isIntegralType(self.dtype(), true) ? DType::Int64 : self.dtype();
     }
-    Tensor input = self.dtype() == out_dtype ? self : self.to(out_dtype);
-    const ReductionSpec spec = make_reduction_spec(input, dim);
-    if (input.dtype() == DType::ComplexHalf || input.dtype() == DType::BComplex32) {
-        Tensor promoted = input.to(DType::ComplexFloat);
-        const ReductionSpec promoted_spec = make_reduction_spec(promoted, dim);
-        Tensor reduced = sum_same_dtype<tensorplay::complex<float>>(
-            promoted, promoted_spec, keepdim, DType::ComplexFloat);
-        return reduced.to(out_dtype);
+    const ReductionSpec spec = make_reduction_spec(self, dim);
+    // Cast-and-reduce in a single kernel for the promoted dtype pairs: the
+    // generic engine reads the narrow input and accumulates in the wider
+    // type, so no materialized copy is needed.
+    if (self.dtype() == DType::Float16 && out_dtype == DType::Float32) {
+        return sum_same_dtype<Half, float>(self, spec, keepdim, out_dtype);
     }
+    if (self.dtype() == DType::BFloat16 && out_dtype == DType::Float32) {
+        return sum_same_dtype<BFloat16, float>(self, spec, keepdim, out_dtype);
+    }
+    if (self.dtype() == DType::ComplexHalf || self.dtype() == DType::BComplex32) {
+        // Accumulate in complex<float> without promoting the input first.
+        if (out_dtype == DType::ComplexFloat) {
+            return sum_same_dtype<tensorplay::complex<Half>, tensorplay::complex<float>>(
+                self, spec, keepdim, out_dtype);
+        }
+        return sum_same_dtype<tensorplay::complex<Half>, tensorplay::complex<Half>>(
+            self, spec, keepdim, out_dtype);
+    }
+    Tensor input = self.dtype() == out_dtype ? self : self.to(out_dtype);
+    const ReductionSpec input_spec = make_reduction_spec(input, dim);
     // Complex accumulates in its own width via the generic ops (+ only).
     if (input.dtype() == DType::ComplexFloat) {
-        return sum_same_dtype<tensorplay::complex<float>>(input, spec, keepdim, out_dtype);
+        return sum_same_dtype<tensorplay::complex<float>>(input, input_spec, keepdim, out_dtype);
     }
     if (input.dtype() == DType::ComplexDouble) {
-        return sum_same_dtype<tensorplay::complex<double>>(input, spec, keepdim, out_dtype);
+        return sum_same_dtype<tensorplay::complex<double>>(input, input_spec, keepdim, out_dtype);
     }
-    TP_DISPATCH_REDUCTION(sum_same_dtype, input.dtype(), input, spec, keepdim, out_dtype);
+    TP_DISPATCH_REDUCTION(sum_same_dtype, input.dtype(), input, input_spec, keepdim, out_dtype);
 }
 
 Tensor sum_kernel(const Tensor& self, DType dtype) {
@@ -662,24 +697,32 @@ Tensor nansum_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim,
     if (out_dtype == DType::Undefined) {
         out_dtype = isFloatingOrComplexType(self.dtype()) ? self.dtype() : DType::Int64;
     }
-    Tensor input = self.dtype() == out_dtype ? self : self.to(out_dtype);
-    const ReductionSpec spec = make_reduction_spec(input, dim);
-    if (input.dtype() == DType::ComplexHalf || input.dtype() == DType::BComplex32) {
-        Tensor promoted = input.to(DType::ComplexFloat);
-        const ReductionSpec promoted_spec = make_reduction_spec(promoted, dim);
-        Tensor reduced = nansum_same_dtype<tensorplay::complex<float>>(
-            promoted, promoted_spec, keepdim, DType::ComplexFloat);
-        return reduced.to(out_dtype);
+    const ReductionSpec spec = make_reduction_spec(self, dim);
+    if (self.dtype() == DType::Float16 && out_dtype == DType::Float32) {
+        return nansum_same_dtype<Half, float>(self, spec, keepdim, out_dtype);
     }
+    if (self.dtype() == DType::BFloat16 && out_dtype == DType::Float32) {
+        return nansum_same_dtype<BFloat16, float>(self, spec, keepdim, out_dtype);
+    }
+    if (self.dtype() == DType::ComplexHalf || self.dtype() == DType::BComplex32) {
+        if (out_dtype == DType::ComplexFloat) {
+            return nansum_same_dtype<tensorplay::complex<Half>, tensorplay::complex<float>>(
+                self, spec, keepdim, out_dtype);
+        }
+        return nansum_same_dtype<tensorplay::complex<Half>, tensorplay::complex<Half>>(
+            self, spec, keepdim, out_dtype);
+    }
+    Tensor input = self.dtype() == out_dtype ? self : self.to(out_dtype);
+    const ReductionSpec input_spec = make_reduction_spec(input, dim);
     if (input.dtype() == DType::ComplexFloat) {
         return nansum_same_dtype<tensorplay::complex<float>>(
-            input, spec, keepdim, out_dtype);
+            input, input_spec, keepdim, out_dtype);
     }
     if (input.dtype() == DType::ComplexDouble) {
         return nansum_same_dtype<tensorplay::complex<double>>(
-            input, spec, keepdim, out_dtype);
+            input, input_spec, keepdim, out_dtype);
     }
-    TP_DISPATCH_REDUCTION(nansum_same_dtype, input.dtype(), input, spec, keepdim, out_dtype);
+    TP_DISPATCH_REDUCTION(nansum_same_dtype, input.dtype(), input, input_spec, keepdim, out_dtype);
 }
 
 // Mean
@@ -688,48 +731,32 @@ Tensor mean_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool
     if (out_dtype == DType::Undefined) {
         out_dtype = isFloatingOrComplexType(self.dtype()) ? self.dtype() : DType::Float32;
     }
+    const ReductionSpec spec = make_reduction_spec(self, dim);
+    if (self.dtype() == DType::Float16 && out_dtype == DType::Float32) {
+        return mean_same_dtype<Half, float>(self, spec, keepdim, out_dtype);
+    }
+    if (self.dtype() == DType::BFloat16 && out_dtype == DType::Float32) {
+        return mean_same_dtype<BFloat16, float>(self, spec, keepdim, out_dtype);
+    }
     if (isComplexType(self.dtype())) {
-        // mean = sum * (1/n); MeanOps' host-side factor path is real-only.
-        Tensor s = sum_dim_kernel(self, dim, keepdim, out_dtype);
-        int64_t count = 1;
-        if (dim.empty()) {
-            count = self.numel();
-        } else {
-            for (int64_t d : dim) {
-                const int64_t dd = d < 0 ? d + static_cast<int64_t>(self.dim()) : d;
-                count *= self.size(dd);
+        // Single-pass complex mean: MeanOps accumulates the complex sum and
+        // scales it by a real factor (1/count) on projection.
+        if (self.dtype() == DType::ComplexHalf || self.dtype() == DType::BComplex32) {
+            if (out_dtype == DType::ComplexFloat) {
+                return mean_same_dtype<tensorplay::complex<Half>, tensorplay::complex<float>>(
+                    self, spec, keepdim, out_dtype);
             }
+            return mean_same_dtype<tensorplay::complex<Half>, tensorplay::complex<Half>>(
+                self, spec, keepdim, out_dtype);
         }
-        if (count <= 0) {
-            return Tensor::full(
-                static_cast<std::vector<int64_t>>(s.shape()),
-                Scalar(std::numeric_limits<double>::quiet_NaN()),
-                out_dtype, self.device());
+        if (self.dtype() == DType::ComplexFloat) {
+            return mean_same_dtype<tensorplay::complex<float>>(self, spec, keepdim, out_dtype);
         }
-        const bool reduced_output =
-            out_dtype == DType::ComplexHalf || out_dtype == DType::BComplex32;
-        Tensor scaled = reduced_output ? s.to(DType::ComplexFloat) : s;
-        if (scaled.numel() == 0) return s;
-        auto stream = getCurrentCUDAStream().stream();
-        int64_t n = scaled.numel();
-        dim3 grid((unsigned)((n + 255) / 256)), block(256);
-        if (scaled.dtype() == DType::ComplexFloat) {
-            scale_complex_kernel<float><<<grid, block, 0, stream>>>(
-                n, static_cast<const tensorplay::complex<float>*>(scaled.data_ptr()),
-                tensorplay::complex<float>(static_cast<float>(1.0 / count)),
-                static_cast<tensorplay::complex<float>*>(scaled.data_ptr()));
-        } else {
-            scale_complex_kernel<double><<<grid, block, 0, stream>>>(
-                n, static_cast<const tensorplay::complex<double>*>(scaled.data_ptr()),
-                tensorplay::complex<double>(1.0 / static_cast<double>(count)),
-                static_cast<tensorplay::complex<double>*>(scaled.data_ptr()));
-        }
-        CUDA_CHECK(cudaGetLastError());
-        return reduced_output ? scaled.to(out_dtype) : scaled;
+        return mean_same_dtype<tensorplay::complex<double>>(self, spec, keepdim, out_dtype);
     }
     Tensor input = self.dtype() == out_dtype ? self : self.to(out_dtype);
-    const ReductionSpec spec = make_reduction_spec(input, dim);
-    TP_DISPATCH_FLOAT_REDUCTION(mean_same_dtype, input.dtype(), input, spec, keepdim, out_dtype);
+    const ReductionSpec input_spec = make_reduction_spec(input, dim);
+    TP_DISPATCH_FLOAT_REDUCTION(mean_same_dtype, input.dtype(), input, input_spec, keepdim, out_dtype);
 }
 
 Tensor mean_dim_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self,
@@ -792,22 +819,30 @@ Tensor prod_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool
     if (out_dtype == DType::Undefined) {
         out_dtype = isIntegralType(self.dtype(), true) ? DType::Int64 : self.dtype();
     }
-    Tensor input = self.dtype() == out_dtype ? self : self.to(out_dtype);
-    const ReductionSpec spec = make_reduction_spec(input, dim);
-    if (input.dtype() == DType::ComplexHalf || input.dtype() == DType::BComplex32) {
-        Tensor promoted = input.to(DType::ComplexFloat);
-        const ReductionSpec promoted_spec = make_reduction_spec(promoted, dim);
-        Tensor reduced = prod_same_dtype<tensorplay::complex<float>>(
-            promoted, promoted_spec, keepdim, DType::ComplexFloat);
-        return reduced.to(out_dtype);
+    const ReductionSpec spec = make_reduction_spec(self, dim);
+    if (self.dtype() == DType::Float16 && out_dtype == DType::Float32) {
+        return prod_same_dtype<Half, float>(self, spec, keepdim, out_dtype);
     }
+    if (self.dtype() == DType::BFloat16 && out_dtype == DType::Float32) {
+        return prod_same_dtype<BFloat16, float>(self, spec, keepdim, out_dtype);
+    }
+    if (self.dtype() == DType::ComplexHalf || self.dtype() == DType::BComplex32) {
+        if (out_dtype == DType::ComplexFloat) {
+            return prod_same_dtype<tensorplay::complex<Half>, tensorplay::complex<float>>(
+                self, spec, keepdim, out_dtype);
+        }
+        return prod_same_dtype<tensorplay::complex<Half>, tensorplay::complex<Half>>(
+            self, spec, keepdim, out_dtype);
+    }
+    Tensor input = self.dtype() == out_dtype ? self : self.to(out_dtype);
+    const ReductionSpec input_spec = make_reduction_spec(input, dim);
     if (input.dtype() == DType::ComplexFloat) {
-        return prod_same_dtype<tensorplay::complex<float>>(input, spec, keepdim, out_dtype);
+        return prod_same_dtype<tensorplay::complex<float>>(input, input_spec, keepdim, out_dtype);
     }
     if (input.dtype() == DType::ComplexDouble) {
-        return prod_same_dtype<tensorplay::complex<double>>(input, spec, keepdim, out_dtype);
+        return prod_same_dtype<tensorplay::complex<double>>(input, input_spec, keepdim, out_dtype);
     }
-    TP_DISPATCH_REDUCTION(prod_same_dtype, input.dtype(), input, spec, keepdim, out_dtype);
+    TP_DISPATCH_REDUCTION(prod_same_dtype, input.dtype(), input, input_spec, keepdim, out_dtype);
 }
 
 Tensor prod_kernel(const Tensor& self, DType dtype) {
@@ -824,14 +859,11 @@ std::tuple<Tensor, Tensor> max_dim_kernel(const Tensor& self, int64_t dim0, bool
     if (self.size(dim) == 0) {
         TP_THROW(IndexError, "max(): Expected reduction dim ", dim, " to have non-zero size.");
     }
-    if (self.dtype() == DType::Bool) {
-        TP_THROW(NotImplementedError, "max(dim) not implemented for Bool on CUDA");
-    }
     const ReductionSpec spec = make_reduction_spec(self, {dim});
     // The dispatch macros expand to a returning switch; route them through an
     // immediately-invoked lambda to capture both outputs.
     return [&]() -> std::tuple<Tensor, Tensor> {
-        TP_DISPATCH_REDUCTION_NO_BOOL(
+        TP_DISPATCH_REDUCTION(
             max_with_indices_same_dtype, self.dtype(), self, spec, keepdim);
         TP_THROW(NotImplementedError, "max(dim): unsupported dtype");
     }();
@@ -860,12 +892,9 @@ std::tuple<Tensor, Tensor> min_dim_kernel(const Tensor& self, int64_t dim0, bool
     if (self.size(dim) == 0) {
         TP_THROW(IndexError, "min(): Expected reduction dim ", dim, " to have non-zero size.");
     }
-    if (self.dtype() == DType::Bool) {
-        TP_THROW(NotImplementedError, "min(dim) not implemented for Bool on CUDA");
-    }
     const ReductionSpec spec = make_reduction_spec(self, {dim});
     return [&]() -> std::tuple<Tensor, Tensor> {
-        TP_DISPATCH_REDUCTION_NO_BOOL(
+        TP_DISPATCH_REDUCTION(
             min_with_indices_same_dtype, self.dtype(), self, spec, keepdim);
         TP_THROW(NotImplementedError, "min(dim): unsupported dtype");
     }();
