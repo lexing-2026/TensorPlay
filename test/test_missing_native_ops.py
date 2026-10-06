@@ -52,6 +52,22 @@ def test_prelu_per_channel_weight_gradient_is_per_channel():
     assert w.grad.tolist() == [-3.0, -7.0]
 
 
+def test_prelu_records_a_second_order_graph_for_both_inputs():
+    x = tp.tensor([[-2.0, 3.0]], dtype=tp.float64, requires_grad=True)
+    w = tp.tensor([0.5], dtype=tp.float64, requires_grad=True)
+
+    gx, gw = tp.autograd.grad(
+        [F.prelu(x, w).sum()], [x, w], create_graph=True)
+    gxx, gxw = tp.autograd.grad(
+        [gx.sum()], [x, w], retain_graph=True, allow_unused=True)
+    gwx, gww = tp.autograd.grad([gw.sum()], [x, w], allow_unused=True)
+
+    assert gxx is None
+    assert gxw.tolist() == [1.0]
+    assert gwx.tolist() == [[1.0, 0.0]]
+    assert gww is None
+
+
 # ------------------------------------------------------------------ determinants
 
 

@@ -148,9 +148,22 @@ inline std::tuple<Tensor, Tensor> prelu_backward(const Tensor& grad,
                                                  const Tensor& self,
                                                  const Tensor& weight) {
     if (!grad.defined()) return {Tensor(), Tensor()};
-    auto parts = ops::_prelu_kernel_backward(
-        grad, self, prelu_broadcast_weight(self, weight));
-    const Tensor& per_element = std::get<1>(parts);
+    const Tensor broadcast_weight = prelu_broadcast_weight(self, weight);
+    Tensor grad_input;
+    Tensor per_element;
+    if (GradMode::is_enabled()) {
+        // Recompose the fused kernel from differentiable primitives while a
+        // higher-order graph is being recorded.
+        const Tensor nonnegative = ops::ge(self, Scalar(0));
+        grad_input = ops::where(nonnegative, grad,
+                                ops::mul(grad, broadcast_weight));
+        per_element = ops::where(nonnegative, ops::zeros_like(self),
+                                 ops::mul(grad, self));
+    } else {
+        auto parts = ops::_prelu_kernel_backward(grad, self, broadcast_weight);
+        grad_input = std::get<0>(parts);
+        per_element = std::get<1>(parts);
+    }
 
     const auto weight_shape = static_cast<std::vector<int64_t>>(weight.shape());
     Tensor grad_weight;
@@ -168,7 +181,7 @@ inline std::tuple<Tensor, Tensor> prelu_backward(const Tensor& grad,
     if (static_cast<std::vector<int64_t>>(grad_weight.shape()) != weight_shape) {
         grad_weight = ops::reshape(grad_weight, weight_shape);
     }
-    return {std::get<0>(parts), grad_weight};
+    return {grad_input, grad_weight};
 }
 
 inline Tensor maybe_multiply(const Tensor& t, const Scalar& s) {
