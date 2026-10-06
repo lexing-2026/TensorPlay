@@ -5145,3 +5145,136 @@ def rnn_relu_input(input, hx, params, has_biases, num_layers, dropout, train, bi
         bidirectional, batch_first, _rnn_cell(ops.relu.default),
     )
     return out, ops.stack.default(final_hiddens, 0)
+
+
+# The special-function spellings share one computation layer: the base names
+# and their "special_" aliases route to the same prims, which promote integer
+# inputs to a floating type before evaluating.
+
+
+@register_decomposition(ops.bessel_j0.default)
+def bessel_j0(self):
+    return prims.bessel_j0(self)
+
+
+@register_decomposition(ops.bessel_j1.default)
+def bessel_j1(self):
+    return prims.bessel_j1(self)
+
+
+@register_decomposition(ops.spherical_bessel_j0.default)
+def spherical_bessel_j0(self):
+    return prims.spherical_bessel_j0(self)
+
+
+@register_decomposition(ops.digamma.default)
+def digamma(self):
+    return prims.digamma(self)
+
+
+@register_decomposition(ops.erf.default)
+def erf(self):
+    return prims.erf(self)
+
+
+@register_decomposition(ops.erfc.default)
+def erfc(self):
+    return prims.erfc(self)
+
+
+@register_decomposition(ops.erfinv.default)
+def erfinv(self):
+    return prims.erf_inv(self)
+
+
+@register_decomposition(ops.i0.default)
+def i0(self):
+    return prims.bessel_i0(self)
+
+
+@register_decomposition(ops.i0e.default)
+def i0e(self):
+    return prims.bessel_i0e(self)
+
+
+@register_decomposition(ops.i1.default)
+def i1(self):
+    return prims.bessel_i1(self)
+
+
+@register_decomposition(ops.i1e.default)
+def i1e(self):
+    return prims.bessel_i1e(self)
+
+
+@register_decomposition(ops.lgamma.default)
+def lgamma(self):
+    return prims.lgamma(self)
+
+
+@register_decomposition(ops.igamma.default)
+def igamma(self, other):
+    return prims.igamma(self, other)
+
+
+@register_decomposition(ops.igammac.default)
+def igammac(self, other):
+    return prims.igammac(self, other)
+
+
+@register_decomposition(ops.zeta.default)
+def zeta(self, other):
+    return prims.zeta(self, other)
+
+
+@register_decomposition(ops.special_bessel_j0.default)
+def special_bessel_j0(self):
+    return prims.bessel_j0(self)
+
+
+@register_decomposition(ops.special_bessel_j1.default)
+def special_bessel_j1(self):
+    return prims.bessel_j1(self)
+
+
+@register_decomposition(ops.special_spherical_bessel_j0.default)
+def special_spherical_bessel_j0(self):
+    return prims.spherical_bessel_j0(self)
+
+
+@register_decomposition(ops.special_erfcx.default)
+def special_erfcx(self):
+    return prims.erfcx(self)
+
+
+@register_decomposition(ops.special_i0e.default)
+def special_i0e(self):
+    return prims.bessel_i0e(self)
+
+
+@register_decomposition(ops.special_i1.default)
+def special_i1(self):
+    return prims.bessel_i1(self)
+
+
+@register_decomposition(ops.special_i1e.default)
+def special_i1e(self):
+    return prims.bessel_i1e(self)
+
+
+@register_decomposition(ops.special_ndtri.default)
+def special_ndtri(self):
+    return prims.ndtri(self)
+
+
+@register_decomposition(ops.special_ndtr.default)
+def special_ndtr(self):
+    # M_SQRT1_2 is the value of 1 / sqrt(2).
+    M_SQRT1_2 = 0.707106781186547524400844362104849039
+    scaled = self * M_SQRT1_2
+    return (1 + ops.erf(scaled)) * 0.5
+
+
+@register_decomposition(ops.special_zeta.default)
+def special_zeta(self, other):
+    return prims.zeta(self, other)

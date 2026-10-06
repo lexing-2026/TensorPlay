@@ -437,6 +437,33 @@ SAMPLES = {
          True, 1, 0.0, False, False, False),
         {},
     ),
+    # Special functions; the ranges keep inputs away from poles and the
+    # boundaries of erfinv/ndtri, and zeta's first argument stays above one.
+    "bessel_j0.default": lambda: ((_t(2, 3, low=-2.0, high=2.0),), {}),
+    "bessel_j1.default": lambda: ((_t(2, 3, low=-2.0, high=2.0),), {}),
+    "spherical_bessel_j0.default": lambda: ((_t(2, 3, low=-2.0, high=2.0),), {}),
+    "digamma.default": lambda: ((_t(2, 3, low=0.5, high=3.0),), {}),
+    "erf.default": lambda: ((_t(2, 3, low=-2.0, high=2.0),), {}),
+    "erfc.default": lambda: ((_t(2, 3, low=-2.0, high=2.0),), {}),
+    "erfinv.default": lambda: ((_t(2, 3, low=-0.9, high=0.9),), {}),
+    "i0.default": lambda: ((_t(2, 3, low=-2.0, high=2.0),), {}),
+    "i0e.default": lambda: ((_t(2, 3, low=-2.0, high=2.0),), {}),
+    "i1.default": lambda: ((_t(2, 3, low=-2.0, high=2.0),), {}),
+    "i1e.default": lambda: ((_t(2, 3, low=-2.0, high=2.0),), {}),
+    "lgamma.default": lambda: ((_t(2, 3, low=0.5, high=3.0),), {}),
+    "igamma.default": lambda: ((_t(2, 3, low=0.5, high=3.0), _t(2, 3, low=0.5, high=3.0)), {}),
+    "igammac.default": lambda: ((_t(2, 3, low=0.5, high=3.0), _t(2, 3, low=0.5, high=3.0)), {}),
+    "zeta.default": lambda: ((_t(2, 3, low=1.5, high=4.0), _t(2, 3, low=0.5, high=2.0)), {}),
+    "special_bessel_j0.default": lambda: ((_t(2, 3, low=-2.0, high=2.0),), {}),
+    "special_bessel_j1.default": lambda: ((_t(2, 3, low=-2.0, high=2.0),), {}),
+    "special_spherical_bessel_j0.default": lambda: ((_t(2, 3, low=-2.0, high=2.0),), {}),
+    "special_erfcx.default": lambda: ((_t(2, 3, low=-2.0, high=2.0),), {}),
+    "special_i0e.default": lambda: ((_t(2, 3, low=-2.0, high=2.0),), {}),
+    "special_i1.default": lambda: ((_t(2, 3, low=-2.0, high=2.0),), {}),
+    "special_i1e.default": lambda: ((_t(2, 3, low=-2.0, high=2.0),), {}),
+    "special_ndtr.default": lambda: ((_t(2, 3, low=-2.0, high=2.0),), {}),
+    "special_ndtri.default": lambda: ((_t(2, 3, low=0.05, high=0.95),), {}),
+    "special_zeta.default": lambda: ((_t(2, 3, low=1.5, high=4.0), _t(2, 3, low=0.5, high=2.0)), {}),
 }
 
 # Overloads whose kernels exist only on specific devices; exercised by the
