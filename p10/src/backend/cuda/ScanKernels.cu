@@ -9,6 +9,8 @@
 
 #include <cuda_runtime.h>
 
+#include <thrust/iterator/transform_iterator.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -23,6 +25,8 @@
 
 namespace tensorplay {
 namespace cuda {
+
+Tensor flip_cuda(const Tensor& self, const std::vector<int64_t>& dims);
 
 namespace {
 
@@ -370,6 +374,383 @@ bool scan_flat_product_with_cub(const Tensor& input, Tensor& output) {
     return scan_with_cached_workspace<T>(input, output, true, launch);
 }
 
+template <typename T>
+constexpr bool is_direct_cub_scan_v =
+    std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t> ||
+    std::is_same_v<T, float> || std::is_same_v<T, double>;
+
+template <typename T>
+constexpr bool is_widen_cub_scan_v =
+    std::is_same_v<T, Half> || std::is_same_v<T, BFloat16> ||
+    std::is_same_v<T, int8_t> || std::is_same_v<T, int16_t> ||
+    std::is_same_v<T, uint8_t> || std::is_same_v<T, uint16_t>;
+
+template <typename T>
+using scan_cub_compute_t = std::conditional_t<
+    (std::is_same_v<T, Half> || std::is_same_v<T, BFloat16>),
+    float,
+    std::conditional_t<
+        (std::is_same_v<T, int8_t> || std::is_same_v<T, int16_t> ||
+         std::is_same_v<T, uint8_t> || std::is_same_v<T, uint16_t>),
+        int32_t, T>>;
+
+template <typename T, typename ComputeT>
+__global__ void scan_cast_kernel(int64_t n, const T* in, ComputeT* out) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; i < n; i += stride) out[i] = static_cast<ComputeT>(in[i]);
+}
+
+template <typename T, typename Op>
+__global__ void scan_transform_first_kernel(const T* prev, const T* cur,
+                                            T* first, Op op) {
+    *first = op(*prev, *cur);
+}
+
+template <typename T, typename Op>
+__global__ void scan_apply_carry_kernel(int64_t n, const T* carry, T* data,
+                                        Op op) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; i < n; i += stride) data[i] = op(*carry, data[i]);
+}
+
+// CUB's device scan only accepts int-sized item counts, so oversized flat
+// scans proceed in chunks of at most 2^30 items.  Each chunk after the first
+// is seeded with the carry produced by the previous chunk: the first element
+// of the chunk is `op(previous_last, current_first)`, and the remaining
+// elements are an inclusive scan of the rest combined with that carry.
+template <typename T, typename Op>
+void scan_flat_chunked_with_cub(const Tensor& input, Tensor& output, Op op,
+                                cudaStream_t stream) {
+    const int64_t n = input.numel();
+    constexpr int max_cub_size = std::numeric_limits<int>::max() / 2 + 1;
+    const T* in = input.data_ptr<T>();
+    T* out = output.data_ptr<T>();
+    size_t tmp_bytes = 0;
+    CUDA_CHECK(cub::DeviceScan::InclusiveScan(
+        nullptr, tmp_bytes, in, out, op, max_cub_size, stream));
+    auto storage = getAllocator(DeviceType::CUDA)->allocate(
+        std::max<size_t>(tmp_bytes, 1), input.device());
+    int64_t i = 0;
+    while (i < n) {
+        const int size_cub =
+            static_cast<int>(std::min<int64_t>(n - i, max_cub_size));
+        if (i == 0) {
+            CUDA_CHECK(cub::DeviceScan::InclusiveScan(
+                storage.get(), tmp_bytes, in, out, op, size_cub, stream));
+        } else {
+            scan_transform_first_kernel<T, Op><<<1, 1, 0, stream>>>(
+                out - 1, in, out, op);
+            if (size_cub > 1) {
+                CUDA_CHECK(cub::DeviceScan::InclusiveScan(
+                    storage.get(), tmp_bytes, in + 1, out + 1, op,
+                    size_cub - 1, stream));
+                const int blocks = static_cast<int>(
+                    (size_cub - 1 + kThreads - 1) / kThreads);
+                scan_apply_carry_kernel<T, Op><<<blocks, kThreads, 0, stream>>>(
+                    size_cub - 1, out, out + 1, op);
+            }
+        }
+        i += size_cub;
+        in += size_cub;
+        out += size_cub;
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename T, typename ComputeT, typename Op>
+bool scan_flat_widen_with_cub(const Tensor& input, Tensor& output, Op op,
+                              cudaStream_t stream) {
+    const int64_t n = input.numel();
+    const auto device = input.device();
+    const DType compute_dtype =
+        std::is_same_v<ComputeT, float> ? DType::Float32 : DType::Int32;
+    Tensor compute_in = Tensor::empty({n}, compute_dtype, device);
+    Tensor compute_out = Tensor::empty({n}, compute_dtype, device);
+    const int blocks = static_cast<int>((n + kThreads - 1) / kThreads);
+    scan_cast_kernel<T, ComputeT><<<blocks, kThreads, 0, stream>>>(
+        n, input.data_ptr<T>(), compute_in.data_ptr<ComputeT>());
+    if (n <= std::numeric_limits<int>::max()) {
+        if (!scan_flat_with_cub<ComputeT>(compute_in, compute_out, op)) {
+            return false;
+        }
+    } else {
+        scan_flat_chunked_with_cub<ComputeT>(compute_in, compute_out, op,
+                                             stream);
+    }
+    scan_cast_kernel<ComputeT, T><<<blocks, kThreads, 0, stream>>>(
+        n, compute_out.data_ptr<ComputeT>(), output.data_ptr<T>());
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+template <typename T, typename Op>
+bool scan_flat_try_cub(const Tensor& input, Tensor& output, Op op,
+                       cudaStream_t stream) {
+    if constexpr (is_direct_cub_scan_v<T>) {
+        if (input.numel() <= std::numeric_limits<int>::max()) {
+            return scan_flat_with_cub<T>(input, output, op);
+        }
+        scan_flat_chunked_with_cub<T>(input, output, op, stream);
+        return true;
+    } else if constexpr (is_widen_cub_scan_v<T>) {
+        using ComputeT = scan_cub_compute_t<T>;
+        return scan_flat_widen_with_cub<T, ComputeT>(input, output, op,
+                                                     stream);
+    } else {
+        return false;
+    }
+}
+
+template <typename T, bool Product>
+bool scan_flat_try_cub_arithmetic(const Tensor& input, Tensor& output,
+                                  cudaStream_t stream) {
+    if constexpr (is_direct_cub_scan_v<T>) {
+        if (input.numel() <= std::numeric_limits<int>::max()) {
+            if constexpr (Product) {
+                return scan_flat_product_with_cub<T>(input, output);
+            } else {
+                return scan_flat_sum_with_cub<T>(input, output);
+            }
+        }
+        if constexpr (Product) {
+            scan_flat_chunked_with_cub<T>(
+                input, output, scan_arithmetic_op<T, true>{}, stream);
+        } else {
+            scan_flat_chunked_with_cub<T>(
+                input, output, scan_arithmetic_op<T, false>{}, stream);
+        }
+        return true;
+    } else if constexpr (is_widen_cub_scan_v<T>) {
+        using ComputeT = scan_cub_compute_t<T>;
+        const int64_t n = input.numel();
+        const auto device = input.device();
+        const DType compute_dtype =
+            std::is_same_v<ComputeT, float> ? DType::Float32 : DType::Int32;
+        Tensor compute_in = Tensor::empty({n}, compute_dtype, device);
+        Tensor compute_out = Tensor::empty({n}, compute_dtype, device);
+        const int blocks = static_cast<int>((n + kThreads - 1) / kThreads);
+        scan_cast_kernel<T, ComputeT><<<blocks, kThreads, 0, stream>>>(
+            n, input.data_ptr<T>(), compute_in.data_ptr<ComputeT>());
+        if (n <= std::numeric_limits<int>::max()) {
+            if constexpr (Product) {
+                if (!scan_flat_product_with_cub<ComputeT>(compute_in,
+                                                          compute_out)) {
+                    return false;
+                }
+            } else {
+                if (!scan_flat_sum_with_cub<ComputeT>(compute_in,
+                                                      compute_out)) {
+                    return false;
+                }
+            }
+        } else {
+            if constexpr (Product) {
+                scan_flat_chunked_with_cub<ComputeT>(
+                    compute_in, compute_out, scan_arithmetic_op<ComputeT, true>{},
+                    stream);
+            } else {
+                scan_flat_chunked_with_cub<ComputeT>(
+                    compute_in, compute_out, scan_arithmetic_op<ComputeT, false>{},
+                    stream);
+            }
+        }
+        scan_cast_kernel<ComputeT, T><<<blocks, kThreads, 0, stream>>>(
+            n, compute_out.data_ptr<ComputeT>(), output.data_ptr<T>());
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    } else {
+        return false;
+    }
+}
+
+template <typename T, bool nonzero>
+struct scan_transform_functor {
+    __host__ __device__ __forceinline__ T operator()(T value) const {
+        if constexpr (!nonzero) {
+            return value;
+        } else {
+            return value != T(0) ? T(1) : T(0);
+        }
+    }
+};
+
+template <int Size>
+constexpr int scan_deterministic_block_threads() {
+    if constexpr (Size >= 16) {
+        return 128;
+    } else if constexpr (Size >= 8) {
+        return 256;
+    } else {
+        return 512;
+    }
+}
+
+template <int BLOCK_THREADS, int ITEMS_PER_THREAD, bool nonzero, typename T>
+__global__ void scan_calc_block_sums(const T* d_in, T* agg, int64_t nelem,
+                                     int iters_per_cta) {
+    using BlockLoad = cub::BlockLoad<
+        T, BLOCK_THREADS, ITEMS_PER_THREAD, cub::BLOCK_LOAD_STRIPED>;
+    using BlockReduce = cub::BlockReduce<T, BLOCK_THREADS>;
+    __shared__ union {
+        typename BlockLoad::TempStorage load;
+        typename BlockReduce::TempStorage reduce;
+    } temp_storage;
+    const int64_t offset = static_cast<int64_t>(BLOCK_THREADS) *
+        ITEMS_PER_THREAD * iters_per_cta * blockIdx.x;
+    int64_t remaining = nelem - offset;
+    if (remaining <= 0) return;
+    d_in += offset;
+    scan_transform_functor<T, nonzero> functor;
+    thrust::transform_iterator<scan_transform_functor<T, nonzero>, const T*>
+        iter_in(d_in, functor);
+    T data[ITEMS_PER_THREAD];
+    T agg_val = T(0);
+    for (int i = 0; i < iters_per_cta; ++i) {
+        if (remaining >= BLOCK_THREADS * ITEMS_PER_THREAD) {
+            BlockLoad(temp_storage.load).Load(iter_in, data);
+            __syncthreads();
+            agg_val += BlockReduce(temp_storage.reduce).Sum(data);
+        } else {
+            BlockLoad(temp_storage.load).Load(iter_in, data, remaining, T(0));
+            __syncthreads();
+            agg_val += BlockReduce(temp_storage.reduce).Sum(data);
+        }
+        iter_in += BLOCK_THREADS * ITEMS_PER_THREAD;
+        remaining -= BLOCK_THREADS * ITEMS_PER_THREAD;
+        if (remaining <= 0) {
+            if (nonzero && threadIdx.x == 0) agg[blockIdx.x] = agg_val;
+            return;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) agg[blockIdx.x] = agg_val;
+}
+
+template <int BLOCK_THREADS, int ITEMS_PER_THREAD, typename T>
+__global__ void scan_final_kernel(const T* d_in, T* d_out, T* agg,
+                                  int64_t nelem, int iters_per_cta) {
+const int64_t offset = static_cast<int64_t>(BLOCK_THREADS) *
+        ITEMS_PER_THREAD * iters_per_cta * blockIdx.x;
+    int64_t remaining = nelem - offset;
+    if (remaining <= 0) return;
+    d_in += offset;
+    d_out += offset;
+    using BlockLoad = cub::BlockLoad<
+        T, BLOCK_THREADS, ITEMS_PER_THREAD, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
+    using BlockStore = cub::BlockStore<
+        T, BLOCK_THREADS, ITEMS_PER_THREAD, cub::BLOCK_STORE_WARP_TRANSPOSE>;
+    using BlockScan = cub::BlockScan<
+        T, BLOCK_THREADS, cub::BLOCK_SCAN_WARP_SCANS>;
+    using BlockReduce = cub::BlockReduce<T, BLOCK_THREADS>;
+    __shared__ union {
+        typename BlockLoad::TempStorage load;
+        typename BlockStore::TempStorage store;
+        typename BlockScan::TempStorage scan;
+        typename BlockReduce::TempStorage reduce;
+    } temp_storage;
+    T agg_data = T(0);
+    if (threadIdx.x < blockIdx.x) agg_data = agg[threadIdx.x];
+    for (unsigned i = threadIdx.x + blockDim.x; i < blockIdx.x;
+         i += blockDim.x) {
+        agg_data += agg[i];
+    }
+    T aggregate = BlockReduce(temp_storage.reduce).Sum(agg_data);
+    __syncthreads();
+    struct scan_prefix_callback {
+        T running_total;
+        __device__ __forceinline__ T operator()(T block_aggregate) {
+            const T old = running_total;
+            running_total += block_aggregate;
+            return old;
+        }
+    } prefix_op{aggregate};
+    T data[ITEMS_PER_THREAD];
+    for (int i = 0; i < iters_per_cta; ++i) {
+        if (remaining >= BLOCK_THREADS * ITEMS_PER_THREAD) {
+            BlockLoad(temp_storage.load).Load(d_in, data);
+        } else {
+#pragma unroll
+            for (int j = 0; j < ITEMS_PER_THREAD; ++j) data[j] = T(0);
+            BlockLoad(temp_storage.load).Load(d_in, data, remaining);
+        }
+        __syncthreads();
+        BlockScan(temp_storage.scan).InclusiveSum(data, data, prefix_op);
+        __syncthreads();
+        if (remaining >= BLOCK_THREADS * ITEMS_PER_THREAD) {
+            BlockStore(temp_storage.store).Store(d_out, data);
+        } else {
+            BlockStore(temp_storage.store).Store(d_out, data, remaining);
+        }
+        d_in += BLOCK_THREADS * ITEMS_PER_THREAD;
+        d_out += BLOCK_THREADS * ITEMS_PER_THREAD;
+        remaining -= BLOCK_THREADS * ITEMS_PER_THREAD;
+        if (remaining <= 0) return;
+        __syncthreads();
+    }
+}
+
+template <typename T>
+bool scan_flat_deterministic_impl(const Tensor& input, Tensor& output,
+                                  cudaStream_t stream) {
+    const int64_t n = input.numel();
+    constexpr int BLOCK_THREADS =
+        scan_deterministic_block_threads<sizeof(T)>();
+    constexpr int ITEMS_PER_THREAD = 16;
+    int64_t grid_size =
+        (n + BLOCK_THREADS * ITEMS_PER_THREAD - 1) /
+        (BLOCK_THREADS * ITEMS_PER_THREAD);
+    if (grid_size == 0) return true;
+    int num_sms = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(
+        &num_sms, cudaDevAttrMultiProcessorCount, currentDevice()));
+    num_sms = std::max(num_sms, 1);
+    const int64_t iters_per_cta = (grid_size + num_sms - 1) / num_sms;
+    grid_size = std::min<int64_t>(num_sms, grid_size);
+    Tensor agg = Tensor::empty({grid_size}, input.dtype(), input.device());
+    scan_calc_block_sums<BLOCK_THREADS, ITEMS_PER_THREAD, false, T>
+        <<<static_cast<unsigned>(grid_size), BLOCK_THREADS, 0, stream>>>(
+            input.data_ptr<T>(), agg.data_ptr<T>(), n,
+            static_cast<int>(iters_per_cta));
+    CUDA_CHECK(cudaGetLastError());
+    scan_final_kernel<BLOCK_THREADS, ITEMS_PER_THREAD, T>
+        <<<static_cast<unsigned>(grid_size), BLOCK_THREADS, 0, stream>>>(
+            input.data_ptr<T>(), output.data_ptr<T>(), agg.data_ptr<T>(), n,
+            static_cast<int>(iters_per_cta));
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+template <typename T>
+bool scan_flat_deterministic(const Tensor& input, Tensor& output,
+                             cudaStream_t stream) {
+    if constexpr (std::is_same_v<T, float> ||
+                  std::is_same_v<T, double> ||
+                  std::is_same_v<T, int32_t> ||
+                  std::is_same_v<T, int64_t>) {
+        return scan_flat_deterministic_impl<T>(input, output, stream);
+    } else if constexpr (std::is_same_v<T, Half> ||
+                         std::is_same_v<T, BFloat16>) {
+        using ComputeT = float;
+        const int64_t n = input.numel();
+        Tensor compute_in =
+            Tensor::empty({n}, DType::Float32, input.device());
+        Tensor compute_out =
+            Tensor::empty({n}, DType::Float32, input.device());
+        const int blocks = static_cast<int>((n + kThreads - 1) / kThreads);
+        scan_cast_kernel<T, ComputeT><<<blocks, kThreads, 0, stream>>>(
+            n, input.data_ptr<T>(), compute_in.data_ptr<ComputeT>());
+        scan_flat_deterministic_impl<ComputeT>(compute_in, compute_out,
+                                               stream);
+        scan_cast_kernel<ComputeT, T><<<blocks, kThreads, 0, stream>>>(
+            n, compute_out.data_ptr<ComputeT>(), output.data_ptr<T>());
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+    return false;
+}
+
 template <typename T, typename Op>
 __global__ void scan_row_kernel(int64_t n_rows, int64_t d_size,
                                 const T* in, T* out, T init_val, Op op) {
@@ -586,20 +967,33 @@ Tensor scan_entry(const Tensor& self, int64_t dim, T init_val, Op op) {
     outer_inner(static_cast<std::vector<int64_t>>(self_c.shape()), dim, outer, inner);
     int64_t slices = outer * inner;
     auto stream = getCurrentCUDAStream().stream();
-    if (inner == 1 && d_size >= 16 && d_size < 512) {
+    if (inner == 1 && d_size >= 2 && d_size < 512) {
         launch_short_rows_scan<T>(outer, d_size, self_c.data_ptr<T>(), result.data_ptr<T>(), init_val, op, stream);
         CUDA_CHECK(cudaGetLastError());
         return result;
     }
     if (inner == 1 && outer == 1 && d_size >= 512 && d_size <= 8192) {
-        if constexpr (std::is_same_v<T, double>) {
-            if constexpr (std::is_same_v<Op, scan_arithmetic_op<T, false>>) {
-                if (scan_flat_sum_with_cub<T>(self_c, result)) return result;
-            } else if constexpr (std::is_same_v<Op, scan_arithmetic_op<T, true>>) {
-                if (scan_flat_product_with_cub<T>(self_c, result)) return result;
-            } else if (scan_flat_with_cub<T>(self_c, result, op)) {
+        if constexpr (std::is_same_v<Op, scan_arithmetic_op<T, false>>) {
+            if (globalContext().deterministicAlgorithms() &&
+                (std::is_same_v<T, float> ||
+                 std::is_same_v<T, double> ||
+                 std::is_same_v<T, Half> ||
+                 std::is_same_v<T, BFloat16>)) {
+                if (scan_flat_deterministic<T>(self_c, result, stream)) {
+                    return result;
+                }
+            }
+            if (scan_flat_try_cub_arithmetic<T, false>(self_c, result,
+                                                       stream)) {
                 return result;
             }
+        } else if constexpr (std::is_same_v<Op, scan_arithmetic_op<T, true>>) {
+            if (scan_flat_try_cub_arithmetic<T, true>(self_c, result,
+                                                      stream)) {
+                return result;
+            }
+        } else if (scan_flat_try_cub<T>(self_c, result, op, stream)) {
+            return result;
         }
         constexpr int kScanBlockThreads = 512;
         scan_register_block_kernel<T, Op, kScanBlockThreads, 4><<<
@@ -621,10 +1015,25 @@ Tensor scan_entry(const Tensor& self, int64_t dim, T init_val, Op op) {
     }
     if (inner == 1 && outer == 1 && d_size >= 512) {
         if constexpr (std::is_same_v<Op, scan_arithmetic_op<T, false>>) {
-            if (scan_flat_sum_with_cub<T>(self_c, result)) return result;
+            if (globalContext().deterministicAlgorithms() &&
+                (std::is_same_v<T, float> ||
+                 std::is_same_v<T, double> ||
+                 std::is_same_v<T, Half> ||
+                 std::is_same_v<T, BFloat16>)) {
+                if (scan_flat_deterministic<T>(self_c, result, stream)) {
+                    return result;
+                }
+            }
+            if (scan_flat_try_cub_arithmetic<T, false>(self_c, result,
+                                                       stream)) {
+                return result;
+            }
         } else if constexpr (std::is_same_v<Op, scan_arithmetic_op<T, true>>) {
-            if (scan_flat_product_with_cub<T>(self_c, result)) return result;
-        } else if (scan_flat_with_cub<T>(self_c, result, op)) {
+            if (scan_flat_try_cub_arithmetic<T, true>(self_c, result,
+                                                      stream)) {
+                return result;
+            }
+        } else if (scan_flat_try_cub<T>(self_c, result, op, stream)) {
             return result;
         }
     }
@@ -669,31 +1078,6 @@ Tensor scan_entry(const Tensor& self, int64_t dim, T init_val, Op op) {
     return result;
 }
 
-template <typename ComplexT, bool Product>
-Tensor scan_complex_entry(const Tensor& self, int64_t dim) {
-    Tensor self_c = self.contiguous();
-    Tensor result = Tensor::empty(
-        static_cast<std::vector<int64_t>>(self_c.shape()),
-        self_c.dtype(), self_c.device());
-    const int64_t d_size = self_c.size(dim);
-    if (d_size == 0 || self_c.numel() == 0) return result;
-
-    int64_t outer = 1;
-    int64_t inner = 1;
-    outer_inner(static_cast<std::vector<int64_t>>(self_c.shape()), dim, outer, inner);
-    const int64_t slices = outer * inner;
-    const auto stream = getCurrentCUDAStream().stream();
-    const ComplexT init_value = Product ? ComplexT(1, 0) : ComplexT(0, 0);
-    using Op = scan_arithmetic_op<ComplexT, Product>;
-    scan_kernel<ComplexT, Op>
-        <<<(slices + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-            slices, d_size, inner,
-            static_cast<const ComplexT*>(self_c.data_ptr()),
-            static_cast<ComplexT*>(result.data_ptr()), init_value, Op{});
-    CUDA_CHECK(cudaGetLastError());
-    return result;
-}
-
 }
 
 Tensor cumsum_cuda(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
@@ -712,10 +1096,14 @@ Tensor cumsum_cuda(const Tensor& self, int64_t dim, std::optional<DType> dtype) 
             out_dtype == DType::ComplexDouble ? DType::ComplexDouble : DType::ComplexFloat;
         Tensor compute_src = src.dtype() == compute_dtype ? src : src.to(compute_dtype);
         if (compute_dtype == DType::ComplexDouble) {
-            return scan_complex_entry<tensorplay::complex<double>, false>(compute_src, dim)
+            return scan_entry<tensorplay::complex<double>>(
+                       compute_src, dim, tensorplay::complex<double>(0, 0),
+                       scan_arithmetic_op<tensorplay::complex<double>, false>{})
                 .to(out_dtype);
         }
-        return scan_complex_entry<tensorplay::complex<float>, false>(compute_src, dim)
+        return scan_entry<tensorplay::complex<float>>(
+                   compute_src, dim, tensorplay::complex<float>(0, 0),
+                   scan_arithmetic_op<tensorplay::complex<float>, false>{})
             .to(out_dtype);
     }
 #define TP_CS_CASE(ctype, name) \
@@ -758,10 +1146,14 @@ Tensor cumprod_cuda(const Tensor& self, int64_t dim, std::optional<DType> dtype)
             out_dtype == DType::ComplexDouble ? DType::ComplexDouble : DType::ComplexFloat;
         Tensor compute_src = src.dtype() == compute_dtype ? src : src.to(compute_dtype);
         if (compute_dtype == DType::ComplexDouble) {
-            return scan_complex_entry<tensorplay::complex<double>, true>(compute_src, dim)
+            return scan_entry<tensorplay::complex<double>>(
+                       compute_src, dim, tensorplay::complex<double>(1, 0),
+                       scan_arithmetic_op<tensorplay::complex<double>, true>{})
                 .to(out_dtype);
         }
-        return scan_complex_entry<tensorplay::complex<float>, true>(compute_src, dim)
+        return scan_entry<tensorplay::complex<float>>(
+                   compute_src, dim, tensorplay::complex<float>(1, 0),
+                   scan_arithmetic_op<tensorplay::complex<float>, true>{})
             .to(out_dtype);
     }
 #define TP_CP_CASE(ctype, name) \
@@ -841,65 +1233,47 @@ Tensor logcumsumexp_cuda(const Tensor& self, int64_t dim, std::optional<DType> d
 #undef TP_LC_CASE
 }
 
-namespace {
-
-template <typename T, typename AccT>
-__global__ void cumsum_backward_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
-                                       const T* in, T* out) {
-    int64_t si = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; si < n_slices; si += stride) {
-        int64_t o = si / inner, in2 = si % inner;
-        const T* sp = in + o * d_size * inner + in2;
-        T* dp = out + o * d_size * inner + in2;
-        AccT acc = static_cast<AccT>(0);
-        for (int64_t j = d_size - 1; j >= 0; --j) {
-            acc += static_cast<AccT>(sp[j * inner]);
-            dp[j * inner] = static_cast<T>(acc);
-        }
-    }
-}
-
-}
-
 Tensor cumsum_backward_cuda(const Tensor& grad, int64_t dim) {
     int64_t nd = grad.dim();
     dim = wrap_scan_dim(dim, nd);
     Tensor g = grad.contiguous();
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(g.shape()), g.dtype(), g.device());
     if (nd == 0) {
+        Tensor result = Tensor::empty({}, g.dtype(), g.device());
         result.copy_(g);
         return result;
     }
     int64_t d_size = g.size(dim);
-    if (d_size == 0 || g.numel() == 0) return result;
-    int64_t outer = 1, inner = 1;
-    outer_inner(static_cast<std::vector<int64_t>>(g.shape()), dim, outer, inner);
-    int64_t slices = outer * inner;
-    auto stream = getCurrentCUDAStream().stream();
-#define TP_CSB_CASE(ctype, acc_type, name) \
+    if (d_size == 0 || g.numel() == 0) {
+        return Tensor::empty(static_cast<std::vector<int64_t>>(g.shape()),
+                             g.dtype(), g.device());
+    }
+    // A reverse inclusive scan along `dim`: flip, scan forward, flip back.
+    // This runs the same parallel engines as cumsum instead of walking each
+    // slice serially.
+    Tensor flipped = flip_cuda(g, {dim});
+    Tensor scanned;
+#define TP_CSB_CASE(ctype, name) \
     case DType::name: \
-        cumsum_backward_kernel<ctype, acc_type><<<(slices + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-            slices, d_size, inner, g.data_ptr<ctype>(), result.data_ptr<ctype>()); \
+        scanned = scan_entry<ctype>(flipped, dim, static_cast<ctype>(0), \
+                                    scan_arithmetic_op<ctype, false>{}); \
         break;
     switch (g.dtype()) {
-        TP_CSB_CASE(uint8_t, uint8_t, UInt8)
-        TP_CSB_CASE(int8_t, int8_t, Int8)
-        TP_CSB_CASE(int16_t, int16_t, Int16)
-        TP_CSB_CASE(int32_t, int32_t, Int32)
-        TP_CSB_CASE(int64_t, int64_t, Int64)
-        TP_CSB_CASE(uint16_t, uint16_t, UInt16)
-        TP_CSB_CASE(uint32_t, uint32_t, UInt32)
-        TP_CSB_CASE(uint64_t, uint64_t, UInt64)
-        TP_CSB_CASE(float, float, Float32)
-        TP_CSB_CASE(double, double, Float64)
-        TP_CSB_CASE(Half, float, Float16)
-        TP_CSB_CASE(BFloat16, float, BFloat16)
+        TP_CSB_CASE(uint8_t, UInt8)
+        TP_CSB_CASE(int8_t, Int8)
+        TP_CSB_CASE(int16_t, Int16)
+        TP_CSB_CASE(int32_t, Int32)
+        TP_CSB_CASE(int64_t, Int64)
+        TP_CSB_CASE(uint16_t, UInt16)
+        TP_CSB_CASE(uint32_t, UInt32)
+        TP_CSB_CASE(uint64_t, UInt64)
+        TP_CSB_CASE(float, Float32)
+        TP_CSB_CASE(double, Float64)
+        TP_CSB_CASE(Half, Float16)
+        TP_CSB_CASE(BFloat16, BFloat16)
         default: TP_THROW(TypeError, "cumsum_backward: unsupported dtype");
     }
 #undef TP_CSB_CASE
-    CUDA_CHECK(cudaGetLastError());
-    return result;
+    return flip_cuda(scanned, {dim});
 }
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, ScanKernels) {
