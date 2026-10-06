@@ -433,6 +433,51 @@ inline Tensor corrcoef_backward_recordable(const Tensor& grad, const Tensor& sel
 }
 
 // ---------------------------------------------------------------------------
+// The primitive transforms
+// ---------------------------------------------------------------------------
+
+// The one-sided real-to-complex transform is the complex transform of the
+// real signal with the upper half of the last transformed dimension dropped.
+// Its adjoint pads that half back with zeros, runs the complex transform of
+// the other direction (same scaling) and keeps the real part.
+inline Tensor fft_r2c_backward(const Tensor& grad, const std::vector<int64_t>& dim,
+                               int64_t normalization, bool onesided,
+                               int64_t last_dim_size) {
+    Tensor full = grad;
+    if (onesided) {
+        const int64_t ndim = grad.dim();
+        const int64_t last = misc_bwd_detail::wrap(dim.back(), ndim);
+        const int64_t missing = last_dim_size - grad.size(last);
+        if (missing > 0) {
+            std::vector<int64_t> pad(static_cast<size_t>(2 * (ndim - last)), 0);
+            pad.back() = missing;
+            full = ops::constant_pad_nd(grad, pad, 0);
+        }
+    }
+    return ops::real(ops::_fft_c2c(full, dim, normalization, /*forward=*/false));
+}
+
+// The complex-to-real transform reads a one-sided spectrum and fills the
+// rest by conjugate symmetry.  Its adjoint is the one-sided real-to-complex
+// transform, with every entry that also stands for its mirrored partner
+// (indices 1 .. n - (n / 2 + 1) along the last dimension) counted twice.
+inline Tensor fft_c2r_backward(const Tensor& grad, const std::vector<int64_t>& dim,
+                               int64_t normalization) {
+    Tensor result = ops::_fft_r2c(grad, dim, normalization, /*onesided=*/true);
+    const int64_t ndim = grad.dim();
+    const int64_t last = misc_bwd_detail::wrap(dim.back(), ndim);
+    const int64_t half = result.size(last);
+    const int64_t doubled = grad.size(last) - half;
+    if (doubled <= 0) return result;
+    Tensor weight = ops::ones({half}, grad.dtype(), grad.device());
+    Tensor mirrored = ops::narrow(weight, 0, 1, doubled);
+    ops::fill_(mirrored, 2);
+    std::vector<int64_t> shape(static_cast<size_t>(ndim), 1);
+    shape[static_cast<size_t>(last)] = half;
+    return ops::mul(result, ops::view(weight, shape));
+}
+
+// ---------------------------------------------------------------------------
 // stft with respect to the window
 // ---------------------------------------------------------------------------
 

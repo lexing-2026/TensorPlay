@@ -1735,6 +1735,21 @@
   grad_output: tensorplay::tpx::ops::fft_irfft2(grad, s, dim, norm)
   self: non_differentiable
 
+# The primitive transforms are linear.  A complex transform's adjoint is the
+# transform of the other direction with the same scaling; the real ones also
+# account for the half spectrum (see the helpers).
+- name: _fft_r2c(Tensor self, int[] dim, int normalization, bool onesided) -> Tensor
+  self: fft_r2c_backward(grad, dim, normalization, onesided, size_along(self.sizes(), dim.back()))
+  result: auto_linear
+
+- name: _fft_c2r(Tensor self, int[] dim, int normalization, SymInt last_dim_size) -> Tensor
+  self: fft_c2r_backward(grad, dim, normalization)
+  result: auto_linear
+
+- name: _fft_c2c(Tensor self, SymInt[] dim, int normalization, bool forward) -> Tensor
+  self: tensorplay::tpx::ops::_fft_c2c(grad, dim, normalization, !forward)
+  result: auto_linear
+
 - name: stft(Tensor self, int n_fft, int? hop_length=None, int? win_length=None, Tensor? window=None, bool center=True, str pad_mode="reflect", bool normalized=False, bool onesided=True, bool return_complex=True) -> Tensor
   self: tensorplay::tpx::ops::stft_backward(grad, self, n_fft, hop_length, win_length, window, center, pad_mode, normalized, onesided)
   window: stft_window_backward(grad, self, n_fft, hop_length, win_length, window, center, pad_mode, normalized, onesided)

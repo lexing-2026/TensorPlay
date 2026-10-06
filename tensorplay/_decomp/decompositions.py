@@ -6141,8 +6141,11 @@ def special_zeta(self, other):
 
 # The FFT transforms decompose onto three prims (real-to-complex,
 # complex-to-complex, complex-to-real) wrapped in type promotion, input
-# resizing, and normalization.  A transform axis of size -1 in `n`/`s`
-# means "keep the current length"; an omitted `n`/`s` resizes nothing.
+# resizing, and normalization.  Each prim transforms every listed dimension
+# in one call and leaves the result unscaled in either direction, so the
+# normalization is applied here exactly once.  A transform axis of size -1
+# in `n`/`s` means "keep the current length"; an omitted `n`/`s` resizes
+# nothing.
 
 _FFT_NORM_VALUES = {None, "forward", "backward", "ortho"}
 
@@ -6205,9 +6208,6 @@ def _fft_c2r(input, n, dim, norm, forward):
     if forward:
         input = prims.conj(input)
     output = prims.fft_c2r(input, dim=list(dims), last_dim_size=last_dim_size)
-    # The c2r prim routes to the user-facing inverse kernel, which already
-    # normalizes by the output length; undo it for a bare transform.
-    output = output * last_dim_size
     return _fft_apply_norm(output, norm, last_dim_size, forward)
 
 
@@ -6240,11 +6240,6 @@ def _fft_c2c(input, n, dim, norm, forward):
     if n is not None:
         input = _fft_resize_input(input, dims, (n,))
     ret = prims.fft_c2c(input, dim=list(dims), forward=forward)
-    if not forward:
-        # The complex transform prim routes to the user-facing kernels, whose
-        # inverse already carries the 1/N factor; undo it so the caller sees a
-        # bare transform and applies the requested normalization exactly once.
-        ret = ret * dim_size
     return _fft_apply_norm(ret, norm, dim_size, forward)
 
 
@@ -6300,17 +6295,8 @@ def _fft_fftn_c2c(input, shape, dim, norm, forward):
             f"fftn expects a complex input tensor, but got {input.dtype}"
         )
     x = _fft_resize_input(input, dim, shape)
-    # A multi-axis transform is the composition of one-axis transforms; the
-    # transform prim handles a single axis per call.
-    ret = x
-    signal_numel = 1
-    for d in dim:
-        ret = prims.fft_c2c(ret, dim=[d], forward=forward)
-        signal_numel *= ret.shape[d]
-    if not forward:
-        # Undo the inverse kernel's built-in 1/N before caller-side norm.
-        ret = ret * signal_numel
-    return _fft_apply_norm(ret, norm, signal_numel, forward)
+    ret = prims.fft_c2c(x, dim=list(dim), forward=forward)
+    return _fft_apply_norm(ret, norm, _fft_prod(shape), forward)
 
 
 @register_decomposition(ops.fft_fft.default)
@@ -6372,12 +6358,7 @@ def fft_rfftn(input, s=None, dim=None, norm=None):
     shape, dims = _fft_canonicalize_shape_and_dims(input, s, dim)
     input = _fft_maybe_promote(input)
     input = _fft_resize_input(input, dims, shape)
-    # The real transform runs first while the data is still real; the other
-    # axes are ordinary complex transforms of the truncated spectrum (the
-    # axes are independent, so the order does not matter).
-    out = prims.fft_r2c(input, dim=[dims[-1]], onesided=True)
-    for d in dims[:-1]:
-        out = prims.fft_c2c(out, dim=[d], forward=True)
+    out = prims.fft_r2c(input, dim=list(dims), onesided=True)
     return _fft_apply_norm(out, norm, _fft_prod(shape), forward=True)
 
 
@@ -6397,12 +6378,7 @@ def fft_ihfftn(input, s=None, dim=None, norm=None):
         tmp = _fft_apply_norm(tmp, norm, shape[0], forward=False)
         return prims.conj(tmp)
     tmp = prims.conj_physical(tmp)
-    signal_numel = 1
-    for d in dims[:-1]:
-        tmp = prims.fft_c2c(tmp, dim=[d], forward=False)
-        # Undo the inverse kernel's built-in 1/N per axis.
-        signal_numel *= tmp.shape[d]
-    tmp = tmp * signal_numel
+    tmp = prims.fft_c2c(tmp, dim=list(dims[:-1]), forward=False)
     return _fft_apply_norm(tmp, norm, _fft_prod(shape), forward=False)
 
 
@@ -6426,13 +6402,7 @@ def fft_irfftn(input, s=None, dim=None, norm=None):
     shape, dims, last_dim_size = _fft_canonicalize_c2r_shape_and_dims(input, s, dim)
     input = _fft_maybe_promote(input, require_complex=True)
     input = _fft_resize_input(input, dims, shape)
-    tmp = input
-    for d in dims[:-1]:
-        tmp = prims.fft_c2c(tmp, dim=[d], forward=False)
-        # Undo the inverse kernel's built-in 1/N per axis.
-        tmp = tmp * tmp.shape[d]
-    out = prims.fft_c2r(tmp, dim=[dims[-1]], last_dim_size=last_dim_size)
-    out = out * last_dim_size
+    out = prims.fft_c2r(input, dim=list(dims), last_dim_size=last_dim_size)
     return _fft_apply_norm(out, norm, _fft_prod(out.shape[d] for d in dims), forward=False)
 
 
@@ -6442,13 +6412,11 @@ def fft_hfftn(input, s=None, dim=None, norm=None):
     input = _fft_maybe_promote(input, require_complex=True)
     input = _fft_resize_input(input, dims, shape)
     tmp = input
-    for d in dims[:-1]:
-        tmp = prims.fft_c2c(tmp, dim=[d], forward=True)
-    tmp = _fft_apply_norm(tmp, norm, _fft_prod(shape[:-1]), forward=True)
+    if len(dims) > 1:
+        tmp = prims.fft_c2c(tmp, dim=list(dims[:-1]), forward=True)
     tmp = prims.conj_physical(tmp)
     out = prims.fft_c2r(tmp, dim=[dims[-1]], last_dim_size=last_dim_size)
-    out = out * last_dim_size
-    return _fft_apply_norm(out, norm, last_dim_size, forward=True)
+    return _fft_apply_norm(out, norm, _fft_prod(shape[:-1]) * last_dim_size, forward=True)
 
 
 @register_decomposition(ops.fft_fft2.default)

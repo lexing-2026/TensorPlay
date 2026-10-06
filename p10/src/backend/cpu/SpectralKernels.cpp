@@ -239,7 +239,8 @@ Tensor fft_fft_cpu(const Tensor& self, int64_t n, int64_t dim, const std::string
     dim = wrap_dim(dim, x_in.dim());
     const int64_t N = sizes_of(x_in)[dim];
     const int64_t n_eff = n > 0 ? n : N;
-    TP_CHECK(n_eff >= 1, "Invalid number of data points specified");
+    TP_CHECK(n == -1 || n >= 1, "Invalid number of data points (", n, ") specified");
+    TP_CHECK(n_eff >= 1, "Invalid number of data points (", n_eff, ") specified");
     const auto mode = norm_from_string(norm, /*forward=*/true);
     if (x_in.dtype() == DType::ComplexFloat)
         return core_c2c<float>(x_in, dim, n_eff, mode, true);
@@ -252,7 +253,8 @@ Tensor fft_ifft_cpu(const Tensor& self, int64_t n, int64_t dim, const std::strin
     dim = wrap_dim(dim, x_in.dim());
     const int64_t N = sizes_of(x_in)[dim];
     const int64_t n_eff = n > 0 ? n : N;
-    TP_CHECK(n_eff >= 1, "Invalid number of data points specified");
+    TP_CHECK(n == -1 || n >= 1, "Invalid number of data points (", n, ") specified");
+    TP_CHECK(n_eff >= 1, "Invalid number of data points (", n_eff, ") specified");
     const auto mode = norm_from_string(norm, false);
     if (x_in.dtype() == DType::ComplexFloat)
         return core_c2c<float>(x_in, dim, n_eff, mode, false);
@@ -266,7 +268,8 @@ Tensor fft_rfft_cpu(const Tensor& self, int64_t n, int64_t dim, const std::strin
     Tensor x = self.contiguous();
     const int64_t N = sizes_of(x)[dim];
     const int64_t n_eff = n > 0 ? n : N;
-    TP_CHECK(n_eff >= 1, "Invalid number of data points specified");
+    TP_CHECK(n == -1 || n >= 1, "Invalid number of data points (", n, ") specified");
+    TP_CHECK(n_eff >= 1, "Invalid number of data points (", n_eff, ") specified");
     if (n > 0 && n != N) x = resize_input_dim(x, dim, n);
     const auto mode = norm_from_string(norm, true);
     if (x.dtype() == DType::Float32)
@@ -281,7 +284,8 @@ Tensor fft_irfft_cpu(const Tensor& self, int64_t n, int64_t dim, const std::stri
     Tensor x = self.contiguous();
     const int64_t F = sizes_of(x)[dim];
     const int64_t n_eff = n > 0 ? n : 2 * (F - 1);
-    TP_CHECK(n_eff >= 1, "Invalid number of data points specified");
+    TP_CHECK(n == -1 || n >= 1, "Invalid number of data points (", n, ") specified");
+    TP_CHECK(n_eff >= 1, "Invalid number of data points (", n_eff, ") specified");
     const auto mode = norm_from_string(norm, false);
     if (x.dtype() == DType::ComplexFloat)
         return core_c2r<float>(x, dim, n_eff, mode);

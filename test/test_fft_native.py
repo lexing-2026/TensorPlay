@@ -109,9 +109,9 @@ def test_fft2_native_autograd(operation):
 
 # --- Decomposition coverage -------------------------------------------------
 #
-# These overloads have no CPU eager kernels; the dispatcher lowers them to the
-# decomposition table, which composes the 1-D transform prims.  Each identity
-# below is checked against numpy so the composed transforms stay honest.
+# Compiled graphs run these decompositions, which compose the unscaled
+# transform prims with explicit normalization.  Each identity below is
+# checked against numpy so the composed transforms stay honest.
 
 
 def _decomp_fn(name):
