@@ -53,6 +53,18 @@ __global__ void nanmedian_select_flat_kernel(
     if (threadIdx.x == 0) result[0] = median;
 }
 
+template <typename T>
+__global__ void nanmedian_count_nan_kernel(int64_t n, const T* input,
+                                           unsigned long long* out) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    unsigned long long local = 0;
+    for (; i < n; i += stride) {
+        local += reduce_value_is_nan(input[i]) ? 1 : 0;
+    }
+    if (local != 0) atomicAdd(out, local);
+}
+
 
 template <typename T, typename index_t>
 __global__ void median_select_dim_kernel(
@@ -390,6 +402,46 @@ Tensor nanmedian_cuda(const Tensor& self) {
         return result.fill_(Scalar(std::numeric_limits<int64_t>::lowest()));
     }
     Tensor input = self.to(work_dt).contiguous().reshape({self.numel()});
+    // The flat selection kernel is single-block; a full radix sort spreads
+    // across the whole GPU and directly yields the median for large inputs.
+    constexpr int64_t kNanMedianSortThreshold = int64_t{1} << 20;
+    if (input.numel() > kNanMedianSortThreshold) {
+        auto sorted_pair = sort_cuda(input, 0, false);
+        Tensor sorted = std::get<0>(sorted_pair);
+        if (isFloatingType(work_dt)) {
+            Tensor nan_count_t =
+                Tensor::zeros({}, DType::UInt64, input.device());
+            const int blocks = static_cast<int>(
+                (input.numel() + kThreads - 1) / kThreads);
+            const auto stream = getCurrentCUDAStream().stream();
+#define TP_NANMEDIAN_COUNT_CASE(ctype, name_)                          \
+    case DType::name_:                                                 \
+        nanmedian_count_nan_kernel<ctype><<<blocks, kThreads, 0, stream>>>( \
+            input.numel(), input.data_ptr<ctype>(),                    \
+            nan_count_t.data_ptr<unsigned long long>());                \
+        break;
+            switch (work_dt) {
+                TP_NANMEDIAN_COUNT_CASE(float, Float32)
+                TP_NANMEDIAN_COUNT_CASE(double, Float64)
+                TP_NANMEDIAN_COUNT_CASE(Half, Float16)
+                TP_NANMEDIAN_COUNT_CASE(BFloat16, BFloat16)
+                default: break;
+            }
+#undef TP_NANMEDIAN_COUNT_CASE
+            CUDA_CHECK(cudaGetLastError());
+            const int64_t nan_count =
+                static_cast<int64_t>(nan_count_t.item().toDouble());
+            const int64_t valid = input.numel() - nan_count;
+            if (valid == 0) {
+                Tensor nan_result = Tensor::full(
+                    {}, Scalar(std::numeric_limits<double>::quiet_NaN()),
+                    work_dt, input.device());
+                return work_dt == out_dt ? nan_result : nan_result.to(out_dt);
+            }
+            return sorted.select(0, (valid - 1) / 2);
+        }
+        return sorted.select(0, (input.numel() - 1) / 2);
+    }
     Tensor result = Tensor::empty({}, work_dt, self.device());
     auto stream = getCurrentCUDAStream().stream();
     const bool flat32 =

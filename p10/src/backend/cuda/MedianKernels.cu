@@ -59,6 +59,8 @@ __global__ void median_select_kernel(int64_t n, const T* input, T* output) {
 }
 
 Tensor median_kernel(const Tensor& self) {
+    extern std::tuple<Tensor, Tensor> sort_cuda(const Tensor& self, int64_t dim,
+                                                bool descending);
     Tensor flat = self.contiguous().reshape({-1});
     const int64_t n = flat.numel();
     if (n == 0) {
@@ -91,6 +93,24 @@ Tensor median_kernel(const Tensor& self) {
         isIntegralType(flat.dtype()) ||
         flat.dtype() == DType::Float16 || flat.dtype() == DType::BFloat16 ||
         flat.dtype() == DType::Float32 || flat.dtype() == DType::Float64;
+    // The single-block radix selector reads the whole input once per radix
+    // digit, which caps throughput at one SM.  For large flat medians a full
+    // multi-SM radix sort is faster and the median falls straight out of the
+    // sorted order.
+    constexpr int64_t kMedianSortThreshold = int64_t{1} << 20;
+    if (selection_supported && n > kMedianSortThreshold) {
+        auto sorted_pair = sort_cuda(flat, 0, false);
+        Tensor sorted = std::get<0>(sorted_pair);
+        if (isFloatingType(flat.dtype())) {
+            const Scalar last = sorted.select(0, n - 1).item();
+            if (std::isnan(last.toDouble())) {
+                return Tensor::full(
+                    {}, Scalar(std::numeric_limits<double>::quiet_NaN()),
+                    flat.dtype(), flat.device());
+            }
+        }
+        return sorted.select(0, (n - 1) / 2);
+    }
     if (selection_supported) {
         Tensor result = Tensor::empty({}, flat.dtype(), flat.device());
         auto stream = getCurrentCUDAStream().stream();
@@ -123,8 +143,6 @@ Tensor median_kernel(const Tensor& self) {
         }
         return result;
     }
-    extern std::tuple<Tensor, Tensor> sort_cuda(const Tensor& self, int64_t dim,
-                                                bool descending);
     Tensor sorted = std::get<0>(sort_cuda(flat, 0, false));
     return sorted.select(0, (n - 1) / 2);
 }
