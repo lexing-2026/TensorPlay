@@ -6,6 +6,7 @@
 #include "cpu/PoolingKernels.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include <vector>
+#include <cstdint>
 #include <cmath>
 #include <algorithm>
 #include <limits>
@@ -319,8 +320,7 @@ Tensor avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
                               ceil_mode, count_include_pad, divisor_override).squeeze(0);
     }
     if (input.dim() != 4) TP_THROW(RuntimeError, "avg_pool2d: Expected 4D input");
-    
-    const Tensor input_c = input.contiguous();
+
     int64_t N = input.size(0);
     int64_t C = input.size(1);
     int64_t H_in = input.size(2);
@@ -362,6 +362,9 @@ Tensor avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
         return out;
     }
 
+    // The NCHW scalar frame pools a contiguous buffer; the copy is paid
+    // only on this fallback path, never by the channels-last frame above.
+    const Tensor input_c = input.contiguous();
     Tensor out = Tensor::empty({N, C, H_out, W_out}, input.dtype(), input.device());
 
     TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "avg_pool2d", [&]() {
@@ -416,12 +419,11 @@ Tensor adaptive_avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
         return adaptive_avg_pool2d_cpu(input.unsqueeze(0), output_size).squeeze(0);
     }
     if (input.dim() != 4) TP_THROW(RuntimeError, "adaptive_avg_pool2d: Expected 4D input");
-    
-    const Tensor input_c = input.contiguous();
-    int64_t N = input_c.size(0);
-    int64_t C = input_c.size(1);
-    int64_t H_in = input_c.size(2);
-    int64_t W_in = input_c.size(3);
+
+    int64_t N = input.size(0);
+    int64_t C = input.size(1);
+    int64_t H_in = input.size(2);
+    int64_t W_in = input.size(3);
     
     int64_t H_out, W_out;
     std::tie(H_out, W_out) = get_pair(output_size);
@@ -441,6 +443,9 @@ Tensor adaptive_avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
         return out;
     }
 
+    // The NCHW scalar frame pools a contiguous buffer; the copy is paid
+    // only on this fallback path, never by the channels-last frame above.
+    const Tensor input_c = input.contiguous();
     Tensor out = Tensor::empty({N, C, H_out, W_out}, input.dtype(), input.device());
 
     TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "adaptive_avg_pool2d", [&]() {
@@ -1290,9 +1295,8 @@ std::tuple<Tensor, Tensor> max_pool3d_with_indices_cpu(
         return std::make_tuple(std::get<0>(r).squeeze(0), std::get<1>(r).squeeze(0));
     }
     if (input.dim() != 5) TP_THROW(RuntimeError, "max_pool3d_with_indices: Expected 5D input");
-    const Tensor input_c = input.contiguous();
-    const int64_t N = input_c.size(0), C = input_c.size(1);
-    const int64_t D_in = input_c.size(2), H_in = input_c.size(3), W_in = input_c.size(4);
+    const int64_t N = input.size(0), C = input.size(1);
+    const int64_t D_in = input.size(2), H_in = input.size(3), W_in = input.size(4);
 
     const auto ks = expand_pool_param(kernel_size, "max_pool3d kernel_size", 3, 1);
     const auto st = expand_pool_param(stride.empty() ? ks : stride, "max_pool3d stride", 3, ks[0]);
@@ -1309,6 +1313,33 @@ std::tuple<Tensor, Tensor> max_pool3d_with_indices_cpu(
     if (D_out <= 0 || H_out <= 0 || W_out <= 0)
         TP_THROW(RuntimeError, "max_pool3d: Calculated output size is too small");
 
+    // Channels-last-3d frame pools the NDHWC buffer in place; the channel
+    // span is the tier-compiled vectorized dimension (cpu/PoolingKernels.h).
+    // Values come back channels-last-3d; indices carry the same winners as
+    // the scalar frame but in channels-last-3d order (dense per output
+    // position), which is what keeps the scan's index traffic dense.  The
+    // vectorized index lanes are same-width integers, so a float input whose
+    // (D, H, W) volume overflows int32 stays on the scalar path.
+    if (input.is_contiguous(MemoryFormat::ChannelsLast3d) &&
+        (input.dtype() == DType::Float32 || input.dtype() == DType::Float64) &&
+        (input.dtype() != DType::Float32 ||
+         D_in * H_in * W_in <= int64_t(std::numeric_limits<int32_t>::max()))) {
+        const std::vector<int64_t> out_sizes = {N, C, D_out, H_out, W_out};
+        Tensor out = Tensor::empty(out_sizes, input.dtype(), input.device());
+        out = out.as_strided(out_sizes, get_channels_last_strides(out_sizes), 0);
+        Tensor indices = Tensor::empty(out_sizes, DType::Int64, input.device());
+        indices = indices.as_strided(out_sizes, get_channels_last_strides(out_sizes), 0);
+        max_pool3d_cl_stub(DeviceType::CPU, input.data_ptr(), out.data_ptr(),
+                           indices.data_ptr<int64_t>(),
+                           N, C, D_in, H_in, W_in, D_out, H_out, W_out,
+                           kD, kH, kW, sD, sH, sW, pD, pH, pW, dD, dH, dW,
+                           static_cast<int>(input.dtype()));
+        return std::make_tuple(out, indices);
+    }
+
+    // The NCDHW scalar frame pools a contiguous buffer; the copy is paid
+    // only on this fallback path, never by the channels-last-3d frame above.
+    const Tensor input_c = input.contiguous();
     Tensor out = Tensor::empty({N, C, D_out, H_out, W_out}, input.dtype(), input.device());
     Tensor indices = Tensor::empty({N, C, D_out, H_out, W_out}, DType::Int64, input.device());
 
@@ -1523,6 +1554,29 @@ Tensor max_pool3d_with_indices_backward_cpu(
     }
     if (grad_output.dim() != 5 || input.dim() != 5)
         TP_THROW(RuntimeError, "max_pool3d_with_indices_backward: Expected 5D input and grad_output");
+    // Channels-last-3d frame: scatter each grad_output position's channel
+    // block straight onto the argmax positions of an NDHWC-viewed zero
+    // buffer, skipping the NCDW materialization of grad_output the scalar
+    // path below pays for.  The saved indices must come from the
+    // channels-last-3d forward (channels-last-3d order) so their reads run
+    // densely; dense NCDHW indices take the scalar path.  Accumulation
+    // order per input element matches the scalar frame, so gradients are
+    // bit-identical.
+    if (grad_output.is_contiguous(MemoryFormat::ChannelsLast3d) &&
+        indices.is_contiguous(MemoryFormat::ChannelsLast3d) &&
+        (input.dtype() == DType::Float32 || input.dtype() == DType::Float64) &&
+        grad_output.dtype() == input.dtype()) {
+        const std::vector<int64_t> sizes = input.shape();
+        Tensor grad_input = Tensor::zeros(sizes, input.dtype(), input.device());
+        grad_input = grad_input.as_strided(sizes, get_channels_last_strides(sizes), 0);
+        max_pool3d_backward_cl_stub(DeviceType::CPU, grad_output.data_ptr(),
+                                    indices.data_ptr<int64_t>(), grad_input.data_ptr(),
+                                    input.size(0), input.size(1),
+                                    input.size(2), input.size(3), input.size(4),
+                                    grad_output.size(2), grad_output.size(3), grad_output.size(4),
+                                    static_cast<int>(input.dtype()));
+        return grad_input;
+    }
     Tensor grad_input = Tensor::zeros(static_cast<std::vector<int64_t>>(input.shape()), input.dtype(), input.device());
     const Tensor go = grad_output.contiguous();
     const Tensor idx = indices.contiguous();
@@ -1704,6 +1758,8 @@ Tensor adaptive_max_pool3d_backward_cpu(const Tensor& grad_output, const Tensor&
 
 DEFINE_DISPATCH(avg_pool2d_cl_stub);
 DEFINE_DISPATCH(max_pool2d_cl_stub);
+DEFINE_DISPATCH(max_pool3d_cl_stub);
+DEFINE_DISPATCH(max_pool3d_backward_cl_stub);
 DEFINE_DISPATCH(adaptive_avg_pool2d_cl_stub);
 DEFINE_DISPATCH(adaptive_max_pool2d_cl_stub);
 
