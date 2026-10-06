@@ -65,15 +65,66 @@ class TestGradcheck(unittest.TestCase):
         x = tp.tensor([1.0, 2.0], dtype=tp.float64, requires_grad=True)
         self.assertTrue(gradcheck(lambda t: (t * t).sum(), x, check_undefined_grad=True))
 
-    def test_unsupported_flags_raise_not_implemented(self):
-        x = tp.tensor([1.0], dtype=tp.float64, requires_grad=True)
+    def test_forward_ad_check_passes_and_catches_a_wrong_forward_formula(self):
+        class BadJvp(tp.autograd.Function):
+            @staticmethod
+            def forward(ctx, inp):
+                ctx.save_for_backward(inp)
+                return inp * inp
 
-        with self.assertRaises(NotImplementedError):
-            gradcheck(lambda t: t.sum(), x, check_forward_ad=True)
-        with self.assertRaises(NotImplementedError):
-            gradcheck(lambda t: t.sum(), x, check_batched_grad=True)
-        with self.assertRaises(NotImplementedError):
-            gradcheck(lambda t: t.sum(), x, fast_mode=True)
+            @staticmethod
+            def backward(ctx, grad_output):
+                (inp,) = ctx.saved_tensors
+                return 2 * inp * grad_output
+
+            @staticmethod
+            def jvp(ctx, tangent):
+                # Wrong: the tangent of x^2 is 2x t, not 3t.
+                return 3 * tangent
+
+        x = tp.rand(3, dtype=tp.float64, requires_grad=True)
+        y = tp.rand(3, dtype=tp.float64, requires_grad=True)
+        self.assertTrue(gradcheck(lambda a, b: (a * b).sin(), (x, y), check_forward_ad=True))
+        self.assertTrue(gradcheck(BadJvp.apply, x))
+        with self.assertRaises(GradcheckError):
+            gradcheck(BadJvp.apply, x, check_forward_ad=True)
+
+    def test_fast_mode_passes_and_catches_a_wrong_backward(self):
+        class BadPow(tp.autograd.Function):
+            @staticmethod
+            def forward(ctx, inp):
+                ctx.save_for_backward(inp)
+                return inp.pow(2)
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                (inp,) = ctx.saved_tensors
+                return grad_output * 3 * inp
+
+        x = tp.rand(4, dtype=tp.float64, requires_grad=True)
+        z = tp.randn(3, dtype=tp.complex128, requires_grad=True)
+        self.assertTrue(gradcheck(lambda t: t.exp() * t, x, fast_mode=True))
+        self.assertTrue(gradcheck(lambda t: t.exp() * t, x, fast_mode=True, check_forward_ad=True))
+        self.assertTrue(gradcheck(lambda t: t * t.exp(), z, fast_mode=True))
+        with self.assertRaises(GradcheckError):
+            gradcheck(BadPow.apply, x, fast_mode=True)
+
+    def test_batched_gradients_are_checked_through_vmap(self):
+        x = tp.rand(3, dtype=tp.float64, requires_grad=True)
+        y = tp.rand(3, dtype=tp.float64, requires_grad=True)
+        self.assertTrue(gradcheck(lambda a, b: (a * b).sin(), (x, y), check_batched_grad=True))
+        self.assertTrue(gradcheck(lambda a, b: (a * b).sin(), (x, y), check_forward_ad=True,
+                                  check_batched_forward_grad=True))
+
+    def test_flags_that_need_a_mode_require_it(self):
+        x = tp.tensor([1.0], dtype=tp.float64, requires_grad=True)
+        with self.assertRaises(AssertionError):
+            gradcheck(lambda t: t.sum(), x, check_backward_ad=False)
+        with self.assertRaises(AssertionError):
+            gradcheck(lambda t: t.sum(), x, check_batched_grad=True, check_backward_ad=False,
+                      check_forward_ad=True)
+        with self.assertRaises(AssertionError):
+            gradcheck(lambda t: t.sum(), x, check_batched_forward_grad=True)
 
 
 class TestGradgradcheck(unittest.TestCase):
@@ -112,6 +163,37 @@ class TestGradgradcheck(unittest.TestCase):
         z = tp.randn(3, dtype=tp.complex128).requires_grad_(True)
         for fn in (lambda t: t * t, lambda t: t.exp(), lambda t: t.conj(), lambda t: t.sgn()):
             self.assertTrue(gradcheck(fn, z))
+
+    def test_real_inputs_beside_complex_ones_are_checked(self):
+        class BadMul(tp.autograd.Function):
+            @staticmethod
+            def forward(ctx, z, r):
+                ctx.save_for_backward(z, r)
+                return z * r
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                z, r = ctx.saved_tensors
+                # The complex input's gradient is right; the real one's is
+                # three times too large.
+                return grad_output * r, (grad_output * z.conj()).real * 3
+
+        z = tp.randn(2, dtype=tp.complex128, requires_grad=True)
+        r = tp.rand(2, dtype=tp.float64, requires_grad=True)
+        self.assertTrue(gradcheck(lambda a, b: a * b, (z, r)))
+        with self.assertRaises(GradcheckError):
+            gradcheck(BadMul.apply, (z, r))
+
+    def test_complex_inputs_check_their_forward_gradients(self):
+        z = tp.randn(3, dtype=tp.complex128, requires_grad=True)
+        self.assertTrue(gradcheck(lambda t: t * t.exp(), z, check_forward_ad=True))
+
+    def test_second_derivatives_check_forward_over_reverse_and_batches(self):
+        x = tp.rand(3, dtype=tp.float64, requires_grad=True)
+        self.assertTrue(gradgradcheck(lambda a: a.sin() * a, x, check_fwd_over_rev=True))
+        self.assertTrue(gradgradcheck(lambda a: a.sin() * a, x, check_batched_grad=True))
+        self.assertTrue(gradgradcheck(lambda a: a.sin() * a, x, fast_mode=True))
+        self.assertTrue(gradgradcheck(lambda a: a.sin() * a, x, gen_non_contig_grad_outputs=True))
 
     def test_complex_output_with_wrong_backward_raises(self):
         class BadSquare(tp.autograd.Function):
