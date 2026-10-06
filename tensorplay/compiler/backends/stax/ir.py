@@ -6755,7 +6755,7 @@ class ExternKernel(InputsKernel):
 
         share_inputs = _share_args
         if share_inputs is None:
-            schema = getattr(kernel, "_schema", None)
+            schema = _parsed_schema(kernel)
             share_inputs = (
                 schema is not None
                 and not schema.is_mutable
@@ -10308,7 +10308,7 @@ class FallbackKernel(ExternKernelAlloc):
         # args that are mutated AND returned from the op
         self.mutation_names: list = []
 
-        schema = getattr(self.op_overload, "_schema", None)
+        schema = _parsed_schema(self.op_overload)
 
         # Only three kinds of operation can be handed through like this:
         # - functional ops
@@ -10470,7 +10470,7 @@ class FallbackKernel(ExternKernelAlloc):
         the operation would be called with.
         """
 
-        schema = getattr(self.op_overload, "_schema", None)
+        schema = _parsed_schema(self.op_overload)
         if schema is None:
             return bool(self.alias_names or self.mutation_names)
         return bool(schema.is_mutable or schema._is_view_op())
@@ -10484,7 +10484,7 @@ class FallbackKernel(ExternKernelAlloc):
         it recorded.
         """
 
-        schema = getattr(self.op_overload, "_schema", None)
+        schema = _parsed_schema(self.op_overload)
         if schema is not None and schema.is_mutable and self.alias_names == (
             self.mutation_names or []
         ):
@@ -10660,7 +10660,7 @@ class FallbackKernel(ExternKernelAlloc):
         know that.
         """
 
-        schema = getattr(kernel, "_schema", None)
+        schema = _parsed_schema(kernel)
         if schema is None:
             return args, kwargs, False
 
@@ -11188,13 +11188,14 @@ class _CollectiveKernel(FallbackKernel):
         if self.op_overload is None or not hasattr(self.op_overload, "_schema"):
             raise AssertionError("Setting cpp kernel needs a valid op_overload")
         kernel = self.op_overload
+        schema = _parsed_schema(kernel)
         if cpp_kernel_name is not None:
             self.cpp_kernel_name = cpp_kernel_name
         else:
-            self.cpp_kernel_name = kernel._schema.name
+            self.cpp_kernel_name = schema.name if schema is not None else kernel.name
 
         self.ordered_kwargs_for_cpp_kernel = [
-            x.name for x in kernel._schema.arguments if x.kwarg_only
+            x.name for x in (schema.arguments if schema is not None else ()) if x.kwarg_only
         ]
 
     @classmethod
@@ -11738,6 +11739,18 @@ class MemoryCheckKernel(FallbackKernel):
         wrapper.writeline(call)
 
 
+
+
+def _parsed_schema(op: Any) -> Any:
+    """The parsed contract an operation carries, or None.
+
+    A dispatcher operation carries its schema parsed; a library operation a
+    program defines for itself carries the text it was declared with, which
+    says nothing this backend reads about aliasing or arguments.
+    """
+
+    schema = getattr(op, "_schema", None)
+    return None if isinstance(schema, str) else schema
 
 
 def _schema_mutates_and_returns_first_arg(schema) -> bool:

@@ -766,8 +766,8 @@ class CustomOpDef:
             captured = _capture_call(self, args, kwargs)
             if captured is not None:
                 return captured
-        tracer = _recording_tracer()
-        if tracer is not None:
+        mode = _recording_mode()
+        if mode is not None:
             # A library operation is a node in a graph just as an operation
             # reached through the dispatcher is, and the operation that reads
             # randomness takes its position from a pair of tensors rather than
@@ -778,14 +778,21 @@ class CustomOpDef:
             # The recording is done here rather than by handing the call to a
             # mode on the stack: a mode that stands values in for real ones
             # answers a call by making it again, and that call is this one.
-            out = self._eager_call(args, kwargs)
-            tracer.record(self, args, kwargs, out)
+            #
+            # The body runs with the recording mode off the stack, as an
+            # operator's kernel runs inside a mode's handler: the operations
+            # it makes belong to this node, and recording or decomposing them
+            # again would put them in the graph twice -- or, for a body that
+            # calls the operation this one decomposes from, never finish.
+            with _modes_popped_through(mode):
+                out = self._eager_call(args, kwargs)
+            mode.tracer.record(self, args, kwargs, out)
             return out
         return self._eager_call(args, kwargs)
 
 
-def _recording_tracer() -> Any:
-    """The tracer of a graph being traced, where there is one.
+def _recording_mode() -> Any:
+    """The innermost mode that records into a graph being traced, if any.
 
     A mode on the stack is not by itself a recorder: a mode that stands values
     in for real ones answers an operation by running it against the stand-ins,
@@ -803,8 +810,25 @@ def _recording_tracer() -> Any:
     for mode in reversed(_get_current_dispatch_mode_stack()):
         tracer = getattr(mode, "tracer", None)
         if tracer is not None and hasattr(tracer, "record"):
-            return tracer
+            return mode
     return None
+
+
+@contextlib.contextmanager
+def _modes_popped_through(mode: Any):
+    """Take ``mode`` and every mode above it off the stack for the block."""
+
+    popped = []
+    try:
+        while True:
+            top = tensorplay._C._pop_dispatch_mode()
+            popped.append(top)
+            if top is mode:
+                break
+        yield
+    finally:
+        for top in reversed(popped):
+            tensorplay._C._push_dispatch_mode(top)
 
 
 def _first_device_key(values: tuple[Any, ...]) -> str | None:

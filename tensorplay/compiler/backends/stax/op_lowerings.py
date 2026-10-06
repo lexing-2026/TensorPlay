@@ -8750,7 +8750,7 @@ def _view_dtype(x: Any, dtype: Any) -> Any:
 
     if _is_complex(dtype) or _is_complex(x.get_dtype()):
         return TensorBox.create(
-            ir.ComplexView.create(tp_ops.view.dtype.default, x, dtype)
+            ir.ComplexView.create(tp_ops.view.dtype, x, dtype)
         )
     return to_dtype_bitcast(x, dtype)
 
