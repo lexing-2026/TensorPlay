@@ -35,10 +35,25 @@ __device__ inline double rsqrt(double value) {
 
 } // namespace math_compat
 
-// Keep the metadata conservative enough for CUDA's pre-13 kernel argument
-// ILP=4 loop below: a 512-thread block covers a 64K chunk in 32 iterations
-// instead of 256 scalar iterations with the old 256-thread kernel.
-constexpr int32_t kMaxTensorsPerLaunch = 32;
+// CUDA 13 guarantees a 32 KiB device-kernel argument space; older toolkits
+// cap device-kernel arguments at 4 KiB.  Per-launch tensor capacity follows
+// that split: the wide branch packs far more tensors into one grouped
+// launch, which cuts the launch count on optimizer-style lists of many
+// small tensors; the narrow branch keeps the fixed batch that fits the
+// small budget.  ILP=4 loop below: a 512-thread block covers a 64K chunk in
+// 32 iterations instead of 256 scalar iterations with a 256-thread kernel.
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+template <int Depth>
+constexpr int kMaxTensorsForDepth =
+    Depth == 1 ? 770 :
+    (Depth == 2 ? 448 :
+     (Depth == 3 ? 336 :
+      (Depth == 4 ? 252 :
+       (Depth == 5 ? 210 : 0))));
+#else
+template <int Depth>
+constexpr int kMaxTensorsForDepth = 32;
+#endif
 constexpr int32_t kMaxBlocksPerLaunch = 320;
 constexpr int64_t kChunkSize = 65536;
 constexpr int32_t kILP = 4;
@@ -142,13 +157,14 @@ inline bool eligible_ternary(const std::vector<Tensor>& first,
 
 template <int Depth>
 struct TensorListMetadata {
-    const void* addresses[Depth][kMaxTensorsPerLaunch]{};
-    int64_t numel_for_tensor[kMaxTensorsPerLaunch]{};
+    static constexpr int kMaxTensors = kMaxTensorsForDepth<Depth>;
+    const void* addresses[Depth][kMaxTensors]{};
+    int64_t numel_for_tensor[kMaxTensors]{};
     int32_t block_to_tensor[kMaxBlocksPerLaunch]{};
     int32_t block_to_chunk[kMaxBlocksPerLaunch]{};
     // Used only by ScalarList overloads.  Keeping it in the same metadata
-    float scalar_values_float[kMaxTensorsPerLaunch]{};
-    double scalar_values_double[kMaxTensorsPerLaunch]{};
+    float scalar_values_float[kMaxTensors]{};
+    double scalar_values_double[kMaxTensors]{};
     int32_t scalar_value_kind = 0;
 };
 
@@ -332,7 +348,7 @@ void launch_impl(const std::array<const std::vector<Tensor>*, Depth>& lists,
             const int32_t chunks = static_cast<int32_t>(
                 (numel + kChunkSize - 1) / kChunkSize);
             if (tensor_slots == 0 || next_chunk == 0) {
-                if (tensor_slots == kMaxTensorsPerLaunch ||
+                if (tensor_slots == TensorListMetadata<Depth>::kMaxTensors ||
                     block_count == kMaxBlocksPerLaunch) {
                     break;
                 }

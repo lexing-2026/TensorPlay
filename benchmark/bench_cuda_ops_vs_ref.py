@@ -149,6 +149,29 @@ def build_cases(dev, dtype):
     C.append(("adaptive_avg_pool2d.7",
               lambda tx=tx: F.adaptive_avg_pool2d(tx, [7]),
               lambda x=x: torch.nn.functional.adaptive_avg_pool2d(x, 7)))
+    # ---- 多张量 foreach 家族（Foreach*Kernels.cu）----
+    # 优化器规模的张量组：尺寸按 5 种典型参数张量循环铺开，列表越长越
+    # 能体现单次分组启动相对逐张量启动的差距。
+    for count in (120, 400):
+        fa = [torch.randn(*[(4096, 4096), (2048, 1024), (1024, 1024),
+                            (4096,), (512, 4096)][i % 5],
+                          generator=g, device=dev, dtype=dtype)
+              for i in range(count)]
+        fb = [torch.randn_like(t) for t in fa]
+        ta = [T(t) for t in fa]
+        tb = [T(t) for t in fb]
+        C.append((f"foreach_norm.list{count}",
+                  lambda ta=ta: tp._foreach_norm(ta, 2),
+                  lambda fa=fa: torch._foreach_norm(fa, 2)))
+        C.append((f"foreach_add_.list{count}",
+                  lambda ta=ta, tb=tb: tp._foreach_add_(ta, tb, alpha=0.1),
+                  lambda fa=fa, fb=fb: torch._foreach_add_(fa, fb, alpha=0.1)))
+        C.append((f"foreach_mul_.list{count}",
+                  lambda ta=ta: tp._foreach_mul_(ta, 0.9),
+                  lambda fa=fa: torch._foreach_mul_(fa, 0.9)))
+        C.append((f"foreach_copy_.list{count}",
+                  lambda ta=ta, tb=tb: tp._foreach_copy_(ta, tb),
+                  lambda fa=fa, fb=fb: torch._foreach_copy_(fa, fb)))
     return C
 
 
