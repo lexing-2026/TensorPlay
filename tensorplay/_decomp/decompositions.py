@@ -4770,3 +4770,378 @@ def narrow_copy(self, dim, start, length):
 @register_decomposition(ops.view_copy.default)
 def view_copy(self, size):
     return prims.clone(view(self, list(size)), memory_format=tp.contiguous_format)
+
+
+# ---------------------------------------------------------------------------
+# Activations, losses, and the backward passes built on scatter
+#
+# Reduction labels follow the eager convention: 0 keeps one value per
+# position, 1 divides by the total weight, 2 adds everything up.
+# ---------------------------------------------------------------------------
+
+_RED_NONE, _RED_MEAN, _RED_SUM = 0, 1, 2
+
+
+@register_decomposition(ops.sigmoid.default)
+def sigmoid(self):
+    compute = _computation_dtype(self.dtype)
+    x = prims.convert_element_type(self, compute)
+    return prims.convert_element_type(1 / (1 + tp.exp(-x)), self.dtype)
+
+
+@register_decomposition(ops.tanh.default)
+def tanh(self):
+    return prims.tanh(self)
+
+
+@register_decomposition(ops.atanh.default)
+def atanh(self):
+    return prims.atanh(self)
+
+
+@register_decomposition(ops.relu.default)
+def relu(self):
+    return ops.clamp_min.default(self, 0)
+
+
+@register_decomposition(ops.relu6.default)
+def relu6(self):
+    return ops.clamp.default(self, 0, 6)
+
+
+_SELU_ALPHA = 1.6732632423543772
+_SELU_SCALE = 1.0507009873554805
+
+
+@register_decomposition(ops.selu.default)
+def selu(self):
+    return ops.elu.default(self, _SELU_ALPHA, _SELU_SCALE, 1.0)
+
+
+# The fill value and the normalization factor keep the kept entries' second
+# moment at one and send the dropped entries to a fixed negative point.
+_ALPHA_DROPOUT_SATURATION = 1.7580993408473766
+
+
+@register_decomposition(ops.alpha_dropout.default)
+def alpha_dropout(input, p=0.5, train=True):
+    if p < 0 or p > 1:
+        raise RuntimeError(f"dropout probability has to be between 0 and 1, but got {p}")
+    if p == 0 or not train or input.numel() == 0:
+        return input
+    if p == 1:
+        return input * 0
+    alpha = _ALPHA_DROPOUT_SATURATION
+    a = 1.0 / math.sqrt((alpha * alpha * p + 1) * (1 - p))
+    compute = _computation_dtype(input.dtype)
+    x = prims.convert_element_type(input, compute)
+    keep = prims.convert_element_type(ops.rand_like.default(input) > p, compute)
+    saturation = alpha * a
+    b = (keep - 1) * saturation + saturation * p
+    return prims.convert_element_type(x * (keep * a) + b, input.dtype)
+
+
+@register_decomposition(ops.prelu.default)
+def prelu(self, weight):
+    if weight.numel() == 1:
+        if self.ndim == 0 and weight.ndim == 1:
+            weight = weight.reshape(())
+        return ops.where.self(self > 0, self, self * weight)
+    if weight.ndim != 1:
+        raise RuntimeError("prelu: weight must be a scalar or a vector")
+    if self.ndim < 2:
+        raise RuntimeError("prelu: per-channel weights need at least 2 dimensions")
+    if weight.shape[0] != self.shape[1]:
+        raise RuntimeError(
+            f"prelu: weight of shape {list(weight.shape)} cannot be broadcast "
+            f"to input of shape {list(self.shape)}"
+        )
+    shape = [1] * self.ndim
+    shape[1] = weight.shape[0]
+    return ops.where.self(self > 0, self, self * weight.reshape(shape))
+
+
+@register_decomposition(ops.margin_ranking_loss.default)
+def margin_ranking_loss(input1, input2, target, margin=0):
+    return ops.clamp.default(margin - target * (input1 - input2), 0).mean()
+
+
+@register_decomposition(ops.hinge_embedding_loss.default)
+def hinge_embedding_loss(input, target, margin=1.0):
+    zeros = ops.zeros_like.default(input)
+    margin_part = ops.where.self(target != 1, ops.clamp_min.default(margin - input, 0), zeros)
+    self_part = ops.where.self(target != -1, input, zeros)
+    return (margin_part + self_part).mean()
+
+
+@register_decomposition(ops.nll_loss.default)
+def nll_loss(self, target, weight=None, reduction=_RED_MEAN, ignore_index=-100):
+    if not (self.ndim > 0 and self.ndim <= 2):
+        raise RuntimeError(f"input tensor should be 1D or 2D, got {self.ndim}D")
+    if target.ndim > 1:
+        raise RuntimeError(
+            f"0D or 1D target tensor expected, multi-target not supported, got {target.ndim}D"
+        )
+    if self.ndim != 1 or target.ndim != 0:
+        if self.shape[0] != target.shape[0]:
+            raise RuntimeError(
+                f"size mismatch (got input: {list(self.shape)}, target: {list(target.shape)})"
+            )
+    n_classes = self.shape[-1]
+    if weight is not None and not (weight.ndim == 1 and weight.numel() == n_classes):
+        raise RuntimeError(
+            f"weight tensor should be defined either for all {n_classes} classes or no classes "
+            f"but got weight tensor of shape: {list(weight.shape)}"
+        )
+    return _nll_forward(self, target, weight, reduction, ignore_index)
+
+
+def _softmax_amax(x, dim):
+    # amax has no identity, so an empty axis cannot be reduced.  One -inf
+    # rides along: it never wins for a non-empty axis and gives the empty
+    # axis the identity of max.
+    d = canonicalize_dim(x.ndim, dim)
+    if x.shape[d] == 0:
+        pad_shape = list(x.shape)
+        pad_shape[d] = 1
+        x = ops.cat.default((x, ops.new_full.default(x, pad_shape, float("-inf"))), dim)
+    return ops.amax.default(x, [d], True)
+
+
+@register_decomposition(ops._softmax.default)
+def _softmax(self, dim, half_to_float):
+    if half_to_float and self.dtype != tp.float16:
+        raise RuntimeError(f"half_to_float is True but self.dtype is {self.dtype}, expected float16")
+    compute = _computation_dtype(self.dtype)
+    x = prims.convert_element_type(self, compute)
+    x_max = _softmax_amax(x, dim)
+    unnormalized = tp.exp(x - x_max)
+    result = unnormalized / ops.sum.dim_IntList(unnormalized, [dim], True)
+    if not half_to_float:
+        result = prims.convert_element_type(result, self.dtype)
+    return result
+
+
+@register_decomposition(ops._log_softmax.default)
+def _log_softmax(self, dim, half_to_float):
+    if half_to_float and self.dtype != tp.float16:
+        raise RuntimeError(f"half_to_float is True but self.dtype is {self.dtype}, expected float16")
+    compute = _computation_dtype(self.dtype)
+    x = prims.convert_element_type(self, compute)
+    x_max = _softmax_amax(x, dim)
+    shifted = x - x_max
+    shifted_logsumexp = tp.log(ops.sum.dim_IntList(tp.exp(shifted), [dim], True))
+    result = shifted - shifted_logsumexp
+    if not half_to_float:
+        result = prims.convert_element_type(result, self.dtype)
+    return result
+
+
+@register_decomposition(ops._fused_dropout.default)
+def _fused_dropout(self, p, generator=None):
+    if generator is not None:
+        raise AssertionError(f"generator must be None for _fused_dropout, got {generator}")
+    compute = _computation_dtype(self.dtype)
+    x = prims.convert_element_type(self, compute)
+    mask = prims.convert_element_type(ops.rand_like.default(x) < p, tp.uint8)
+    scale = 1.0 / p
+    res = prims.convert_element_type(mask, compute) * x * scale
+    return (prims.convert_element_type(res, self.dtype), mask)
+
+
+@register_decomposition(ops.embedding.default)
+def embedding(weight, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False):
+    if weight.ndim != 2:
+        raise RuntimeError(f"'weight' must be 2-D, got {weight.ndim}-D")
+    if indices.ndim == 0:
+        # index_select requires a vector, so a scalar index goes in as a
+        # one-element vector and the lookup result loses the row axis.
+        out = ops.index_select.default(weight, 0, ops.reshape.default(indices, [-1]))
+        return squeeze(out, 0)
+    if indices.ndim == 1:
+        return ops.index_select.default(weight, 0, indices)
+    flat = ops.index_select.default(weight, 0, ops.reshape.default(indices, [-1]))
+    return view(flat, list(indices.shape) + list(weight.shape[1:]))
+
+
+@register_decomposition(ops.batch_norm_backward.default)
+def batch_norm_backward(grad_output, input, weight=None, running_mean=None, running_var=None, training=True, eps=1e-5):
+    if input.ndim < 2:
+        raise RuntimeError(f"rank of the input must be at least 2, got {input.ndim}")
+    input_dtype = input.dtype
+    weight_dtype = weight.dtype if weight is not None else input_dtype
+    compute = _computation_dtype(input_dtype)
+    grad_out = prims.convert_element_type(grad_output, compute)
+    x = prims.convert_element_type(input, compute)
+
+    axis = 1
+    num_features = reduce(operator.mul, input.shape, 1) / input.shape[axis]
+    reduction_axes = [i for i in range(input.ndim) if i != axis]
+    broadcast_mask = [1] * input.ndim
+    broadcast_mask[axis] = input.shape[axis]
+
+    def per_channel(t):
+        return ops.reshape.default(t, broadcast_mask)
+
+    if training:
+        mean = ops.mean.dim(x, reduction_axes, True)
+        var = ops.mean.dim(x * x, reduction_axes, True) - mean * mean
+        invstd = ops.rsqrt.default(var + eps)
+    else:
+        mean = per_channel(
+            running_mean if running_mean is not None else ops.zeros(input.shape[axis])
+        ).to(compute)
+        var = running_var if running_var is not None else ops.zeros(input.shape[axis])
+        invstd = ops.rsqrt.default(per_channel(var).to(compute) + eps)
+
+    norm = 1.0 / num_features
+    grad_output_sum = ops.sum.dim_IntList(grad_out, reduction_axes, True)
+    dot_p = ops.sum.dim_IntList(grad_out * (x - mean), reduction_axes, True)
+
+    grad_mean = grad_output_sum * norm
+    proj_scale = dot_p * norm * invstd * invstd
+    if weight is None:
+        grad_scale = invstd * 1.0
+    else:
+        grad_scale = invstd * per_channel(prims.convert_element_type(weight, compute))
+
+    if training:
+        proj = (x - mean) * proj_scale
+        grad_input = ((grad_out - proj) - grad_mean) * grad_scale
+    else:
+        grad_input = grad_out * grad_scale
+
+    grad_weight = dot_p * invstd if weight is not None else None
+    grad_bias = grad_output_sum if weight is not None else None
+
+    grad_input = prims.convert_element_type(grad_input, grad_output.dtype)
+    if grad_weight is not None:
+        grad_weight = prims.convert_element_type(squeeze(grad_weight, reduction_axes), weight_dtype)
+    if grad_bias is not None:
+        grad_bias = prims.convert_element_type(squeeze(grad_bias, reduction_axes), weight_dtype)
+    return grad_input, grad_weight, grad_bias
+
+
+@register_decomposition(ops.max_pool2d_with_indices_backward.default)
+def max_pool2d_with_indices_backward(grad_output, self, kernel_size, stride=[], padding=[], dilation=[], ceil_mode=False, indices=None):
+    if indices is None:
+        indices = ops.max_pool2d_with_indices.default(
+            self, kernel_size, stride, padding, dilation, ceil_mode
+        )[1]
+    is_batched = self.ndim == 4
+    if not is_batched:
+        self = unsqueeze(self, 0)
+        grad_output = unsqueeze(grad_output, 0)
+        indices = unsqueeze(indices, 0)
+
+    batch_size, channels = self.shape[0], self.shape[1]
+    in_height, in_width = self.shape[-2], self.shape[-1]
+    out_height, out_width = grad_output.shape[-2], grad_output.shape[-1]
+
+    # Overlapping windows pile several gradients onto one input position,
+    # so reduced precision accumulates in float32.
+    accum = tp.float32 if grad_output.dtype in (tp.float16, tp.bfloat16) else grad_output.dtype
+    grad_input_flat = ops.zeros(
+        [batch_size * channels, in_height * in_width], dtype=accum, device=grad_output.device
+    )
+    grad_output_flat = ops.reshape.default(grad_output, [batch_size * channels, out_height * out_width])
+    indices_flat = ops.reshape.default(indices, [batch_size * channels, out_height * out_width])
+    if accum != grad_output.dtype:
+        grad_output_flat = prims.convert_element_type(grad_output_flat, accum)
+    grad_input_flat = ops.scatter_add.default(grad_input_flat, 1, indices_flat, grad_output_flat)
+    grad_input = ops.reshape.default(grad_input_flat, [batch_size, channels, in_height, in_width])
+    if accum != grad_output.dtype:
+        grad_input = prims.convert_element_type(grad_input, grad_output.dtype)
+    if not is_batched:
+        grad_input = squeeze(grad_input, 0)
+    return grad_input
+
+
+def _gather_rnn_params(params, has_biases):
+    # The flat parameter list holds one group per direction per layer:
+    # [w_ih, w_hh, b_ih, b_hh] with biases, [w_ih, w_hh] without.
+    group_size = 4 if has_biases else 2
+    if len(params) % group_size != 0:
+        raise RuntimeError(
+            f"len(params)={len(params)} is not divisible by group_size={group_size}"
+        )
+    return [tuple(params[i : i + group_size]) for i in range(0, len(params), group_size)]
+
+
+def _one_layer_rnn(inp, hidden, params, has_biases, hidden_fn, reverse=False):
+    ih_weight, hh_weight = params[0], params[1]
+    ih_bias = params[2] if has_biases else None
+    hh_bias = params[3] if has_biases else None
+
+    precomputed_input = ops.linear.default(inp, ih_weight, ih_bias)
+    if reverse:
+        precomputed_input = prims.rev(precomputed_input, [0])
+    cur_hidden = unsqueeze(hidden, 0)
+    step_output = []
+    for i in ops.unbind.default(precomputed_input, 0):
+        cur_hidden = hidden_fn(i, cur_hidden, hh_weight, hh_bias)
+        step_output.append(cur_hidden)
+    if reverse:
+        step_output.reverse()
+    out = ops.cat.default(step_output, 0)
+    return out, squeeze(cur_hidden, 0)
+
+
+def _rnn_helper(input, hidden, params, has_biases, num_layers, dropout, train, bidirectional, batch_first, hidden_fn):
+    if batch_first:
+        input = transpose(input, 0, 1)
+    final_hiddens = []
+    params = _gather_rnn_params(params, has_biases)
+    for i in range(num_layers):
+        if bidirectional:
+            cur_params, cur_hidden = params[2 * i], hidden[2 * i]
+            bidir_params, bidir_hidden = params[2 * i + 1], hidden[2 * i + 1]
+        else:
+            cur_params, cur_hidden = params[i], hidden[i]
+            bidir_params, bidir_hidden = None, None
+
+        fwd_inp, fwd_hidden = _one_layer_rnn(input, cur_hidden, cur_params, has_biases, hidden_fn)
+        final_hiddens.append(fwd_hidden)
+
+        if bidirectional:
+            bwd_inp, bwd_hidden = _one_layer_rnn(
+                input, bidir_hidden, bidir_params, has_biases, hidden_fn, reverse=True
+            )
+            final_hiddens.append(bwd_hidden)
+            input = ops.cat.default([fwd_inp, bwd_inp], fwd_inp.ndim - 1)
+        else:
+            input = fwd_inp
+
+        if dropout != 0 and train and i < num_layers - 1:
+            input = ops.dropout.default(input, dropout, True)
+
+    if batch_first:
+        input = transpose(input, 0, 1)
+    return input, final_hiddens
+
+
+def _rnn_cell(hidden_fn):
+    def cell(i, cur_hidden, hh_weight, hh_bias):
+        return hidden_fn(ops.linear.default(cur_hidden, hh_weight, hh_bias) + i)
+
+    return cell
+
+
+@register_decomposition(ops.rnn_tanh.input)
+def rnn_tanh_input(input, hx, params, has_biases, num_layers, dropout, train, bidirectional, batch_first):
+    hidden = list(ops.unbind.default(hx, 0))
+    out, final_hiddens = _rnn_helper(
+        input, hidden, params, has_biases, num_layers, dropout, train,
+        bidirectional, batch_first, _rnn_cell(prims.tanh),
+    )
+    return out, ops.stack.default(final_hiddens, 0)
+
+
+@register_decomposition(ops.rnn_relu.input)
+def rnn_relu_input(input, hx, params, has_biases, num_layers, dropout, train, bidirectional, batch_first):
+    hidden = list(ops.unbind.default(hx, 0))
+    out, final_hiddens = _rnn_helper(
+        input, hidden, params, has_biases, num_layers, dropout, train,
+        bidirectional, batch_first, _rnn_cell(ops.relu.default),
+    )
+    return out, ops.stack.default(final_hiddens, 0)

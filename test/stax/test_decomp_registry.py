@@ -1,3 +1,5 @@
+import math
+
 import pytest
 
 import tensorplay as tp
@@ -20,6 +22,12 @@ def _t(*shape, low=-2.0, high=2.0):
 
 def _unit(*shape):
     return tp.rand(*shape) * 0.8 + 0.1
+
+
+def _pool2d_backward_sample():
+    inp = tp.randn(2, 3, 6, 6)
+    indices = ops.max_pool2d_with_indices.default(inp, [2, 2], [2, 2])[1]
+    return (tp.randn(2, 3, 3, 3), inp, [2, 2], [2, 2]), {"indices": indices}
 
 
 # Sample inputs per overload name: (args, kwargs).  Inputs stay away from
@@ -394,6 +402,41 @@ SAMPLES = {
     "tp_margin_ranking_loss.default": lambda: (
         (_t(5), _t(5), tp.tensor([1.0, -1.0, 1.0, 1.0, -1.0]), 0.2, 1), {}
     ),
+    # Activations, losses, and their backward plumbing.
+    "sigmoid.default": lambda: ((_t(2, 3),), {}),
+    "tanh.default": lambda: ((_t(2, 3),), {}),
+    "atanh.default": lambda: ((tp.tanh(_t(2, 3)),), {}),
+    "relu.default": lambda: ((_t(2, 3),), {}),
+    "relu6.default": lambda: ((_t(2, 3, low=-8.0, high=8.0),), {}),
+    "selu.default": lambda: ((_t(2, 3),), {}),
+    "prelu.default": lambda: ((_t(2, 3, 4, 5), _unit(3)), {}),
+    "margin_ranking_loss.default": lambda: (
+        (_t(4), _t(4), tp.tensor([1.0, -1.0, 1.0, -1.0])), {"margin": 0.5},
+    ),
+    "hinge_embedding_loss.default": lambda: (
+        (_t(4), tp.tensor([1.0, -1.0, 0.0, 1.0])), {"margin": 1.0},
+    ),
+    "nll_loss.default": lambda: ((_t(4, 8), tp.tensor([1, 0, 3, 2])), {}),
+    "_softmax.default": lambda: ((_t(2, 3, 4), 1, False), {}),
+    "_log_softmax.default": lambda: ((_t(2, 3, 4), 1, False), {}),
+    "embedding.default": lambda: (
+        (tp.randn(10, 4), tp.tensor([[0, 1, 2], [7, 8, 9]])), {},
+    ),
+    "batch_norm_backward.default": lambda: (
+        (tp.randn(3, 4, 5, 5), tp.randn(3, 4, 5, 5), _unit(4), _t(4), _unit(4)),
+        {"training": True, "eps": 1e-5},
+    ),
+    "max_pool2d_with_indices_backward.default": _pool2d_backward_sample,
+    "rnn_tanh.input": lambda: (
+        (_t(5, 3, 4), _t(1, 3, 2), [_t(2, 4), _t(2, 2), _unit(2), _unit(2)],
+         True, 1, 0.0, False, False, False),
+        {},
+    ),
+    "rnn_relu.input": lambda: (
+        (_t(5, 3, 4), _t(1, 3, 2), [_t(2, 4), _t(2, 2), _unit(2), _unit(2)],
+         True, 1, 0.0, False, False, False),
+        {},
+    ),
 }
 
 # Overloads whose kernels exist only on specific devices; exercised by the
@@ -670,6 +713,119 @@ def test_empty_strided_metadata(kwargs):
     assert tuple(got.stride()) == tuple(expected.stride())
 
 
+def test_nll_loss_decomposition_reductions_and_ignore_index():
+    get_decompositions([])
+    fn = decomposition_table[ops.nll_loss.default]
+    scores = _t(4, 6)
+    target = tp.tensor([0, 3, 5, 2])
+    weight = _unit(6)
+    for reduction in (0, 1, 2):
+        got = fn(scores, target, None, reduction, -100)
+        expected = ops.nll_loss.default(scores, target, None, reduction, -100)
+        assert tp.allclose(got[0], expected[0], rtol=1e-5, atol=1e-6)
+    got = fn(scores, target, weight, 2, -100)
+    expected = ops.nll_loss.default(scores, target, weight, 2, -100)
+    assert tp.allclose(got[0], expected[0], rtol=1e-5, atol=1e-6)
+    ignored = tp.tensor([0, -100, 5, 2])
+    got = fn(scores, ignored, None, 0, -100)
+    expected = ops.nll_loss.default(scores, ignored, None, 0, -100)
+    assert tp.allclose(got[0], expected[0], rtol=1e-5, atol=1e-6)
+
+
+def test_alpha_dropout_decomposition_edges():
+    get_decompositions([])
+    fn = decomposition_table[ops.alpha_dropout.default]
+    x = _t(4, 5)
+    assert tp.equal(fn(x, 0.0, True), x)
+    assert tp.equal(fn(x, 0.5, False), x)
+    assert tp.equal(fn(x, 1.0, True), x * 0)
+    with pytest.raises(RuntimeError):
+        fn(x, 1.5, True)
+    with pytest.raises(RuntimeError):
+        ops.alpha_dropout.default(x, 1.5, True)
+    # Every element lands on one of the two support points of the
+    # inverted-dropout rescaling.
+    alpha = 1.7580993408473766
+    p = 0.5
+    a = 1.0 / math.sqrt((alpha * alpha * p + 1) * (1 - p))
+    saturation = alpha * a
+    out = fn(x, p, True)
+    kept = (out - x * a - saturation * p).abs() < 1e-5
+    dropped = (out - saturation * (p - 1)).abs() < 1e-5
+    assert tp.all(kept | dropped)
+
+
+def test_fused_dropout_decomposition_membership():
+    get_decompositions([])
+    fn = decomposition_table[ops._fused_dropout.default]
+    x = _t(3, 7)
+    res, mask = fn(x, 0.4, None)
+    assert mask.dtype == tp.uint8 and res.dtype == x.dtype
+    active = mask != 0
+    kept = (res - x * 2.5).abs() < 1e-5
+    assert tp.all(tp.where(active, kept, res == 0))
+    with pytest.raises(AssertionError):
+        fn(x, 0.4, "generator")
+
+
+def test_batch_norm_backward_decomposition_training_and_eval():
+    get_decompositions([])
+    fn = decomposition_table[ops.batch_norm_backward.default]
+    grad = _t(2, 4, 3, 3)
+    x = _t(2, 4, 3, 3)
+    weight = _unit(4)
+    running_mean = _t(4)
+    running_var = _unit(4)
+    for training in (True, False):
+        got = fn(grad, x, weight, running_mean, running_var, training, 1e-5)
+        expected = ops.batch_norm_backward.default(
+            grad, x, weight, running_mean, running_var, training, 1e-5
+        )
+        for g, e in zip(got, expected):
+            assert g.dtype == e.dtype
+            assert tp.allclose(g, e, rtol=1e-4, atol=1e-5)
+
+
+def test_softmax_decomposition_reduces_an_empty_dimension():
+    get_decompositions([])
+    x = tp.randn(2, 0, 3)
+    for op in (ops._softmax.default, ops._log_softmax.default):
+        got = decomposition_table[op](x, 1, False)
+        expected = op(x, 1, False)
+        assert tuple(got.shape) == tuple(expected.shape) == (2, 0, 3)
+    half = tp.randn(2, 3).to(tp.float16)
+    assert decomposition_table[ops._softmax.default](half, 1, False).dtype == tp.float16
+
+
+def test_rnn_decomposition_matches_the_eager_loop():
+    get_decompositions([])
+    # Bidirectional, batch-first, biased: the input is (batch, time, features).
+    hx = _t(2, 3, 2)
+    params = [_t(2, 4), _t(2, 2), _unit(2), _unit(2),
+              _t(2, 4), _t(2, 2), _unit(2), _unit(2)]
+    for op in (ops.rnn_tanh.input, ops.rnn_relu.input):
+        fn = decomposition_table[op]
+        xb = _t(3, 5, 4)
+        got = fn(xb, hx, params, True, 1, 0.0, False, True, True)
+        expected = op(xb, hx, params, True, 1, 0.0, False, True, True)
+        for g, e in zip(got, expected):
+            assert tp.allclose(g, e, rtol=1e-4, atol=1e-5)
+    # Two layers without biases: the input is (time, batch, features) and
+    # hx stacks one hidden per layer per direction.  The second layer sees
+    # the two directions' outputs concatenated, so its input weights are
+    # twice as wide.
+    x = _t(5, 3, 4)
+    hx = _t(4, 3, 2)
+    params = [_t(2, 4), _t(2, 2), _t(2, 4), _t(2, 2),
+              _t(2, 4), _t(2, 2), _t(2, 4), _t(2, 2)]
+    for op in (ops.rnn_tanh.input, ops.rnn_relu.input):
+        fn = decomposition_table[op]
+        got = fn(x, hx, params, False, 2, 0.0, False, True, False)
+        expected = op(x, hx, params, False, 2, 0.0, False, True, False)
+        for g, e in zip(got, expected):
+            assert tp.allclose(g, e, rtol=1e-4, atol=1e-5)
+
+
 def test_fused_rms_norm_against_formula_and_autograd():
     # No CPU kernel serves these overloads; the oracle is the formula itself
     # and its autograd gradient.
@@ -740,6 +896,7 @@ def test_every_functional_decomposition_has_a_sample():
             "empty_like.default", "new_empty.default", "_chunk_cat.default",
             "_fused_rms_norm.default", "_fused_rms_norm_backward.default",
             "dropout.default", "native_dropout.default", "native_layer_norm.default",
+            "alpha_dropout.default", "_fused_dropout.default",
             "new_empty_strided.default", "randn.default", "sym_numel.default",
             "empty_strided.default", "pad_sequence.default",
         }
