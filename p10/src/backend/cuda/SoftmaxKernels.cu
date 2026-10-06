@@ -151,17 +151,20 @@ Tensor log_softmax_kernel_cudnn(const Tensor& self, int64_t dim, DType dtype) {
 // keep the numerics of the library path; reduced-precision inputs compute
 // in fp32, matching the upcast the DNN descriptor path applies.
 
-template <typename scalar_t, typename compute_t>
+template <typename scalar_t, typename compute_t, typename out_t>
 __global__ void softmax_dim_kernel(
-    scalar_t* out, const scalar_t* in, int64_t rows, int64_t softmax_size,
+    out_t* out, const scalar_t* in, int64_t rows, int64_t softmax_size,
     int64_t inner_size, bool log_mode) {
-  const int64_t row = static_cast<int64_t>(blockIdx.x);
+  // The grid is two-dimensional so a row count past the 32-bit launch limit
+  // still addresses every (outer, inner) row without an overflowing cast.
+  const int64_t row =
+      static_cast<int64_t>(blockIdx.y) * gridDim.x + blockIdx.x;
   if (row >= rows) return;
   const int64_t outer = row / inner_size;
   const int64_t inner = row % inner_size;
   const scalar_t* row_in =
       in + outer * softmax_size * inner_size + inner;
-  scalar_t* row_out = out + outer * softmax_size * inner_size + inner;
+  out_t* row_out = out + outer * softmax_size * inner_size + inner;
 
   __shared__ compute_t tile[1024];
   const int tid = static_cast<int>(threadIdx.x);
@@ -200,7 +203,7 @@ __global__ void softmax_dim_kernel(
     const compute_t v =
         static_cast<compute_t>(row_in[j * inner_size]) - row_max - denom;
     row_out[j * inner_size] =
-        static_cast<scalar_t>(log_mode ? v : std::exp(v));
+        static_cast<out_t>(log_mode ? v : std::exp(v));
   }
 }
 
@@ -257,8 +260,8 @@ __device__ __forceinline__ void wave_butterfly_reduce(acc_t* values) {
 }
 
 template <typename scalar_t, typename acc_t, int LOG2_ELEMENTS, bool LOG_MODE,
-          int HW_WAVE>
-__global__ void softmax_wave_forward(scalar_t* dst, const scalar_t* src,
+          int HW_WAVE, typename out_t>
+__global__ void softmax_wave_forward(out_t* dst, const scalar_t* src,
                                      int batch_count, int stride,
                                      int element_count) {
   constexpr int kNextPow2 = 1 << LOG2_ELEMENTS;
@@ -326,19 +329,19 @@ __global__ void softmax_wave_forward(scalar_t* dst, const scalar_t* src,
           // Elements stay raw: subtract the max and the log normalizer.
           const acc_t v =
               elems[i][it] - max_value[i] - std::log(sum[i]);
-          dst[i * element_count + it * kWAVE] = static_cast<scalar_t>(v);
+          dst[i * element_count + it * kWAVE] = static_cast<out_t>(v);
         } else {
           // Elements hold exp(x - max) from the accumulation pass.
           dst[i * element_count + it * kWAVE] =
-              static_cast<scalar_t>(elems[i][it] / sum[i]);
+              static_cast<out_t>(elems[i][it] / sum[i]);
         }
       }
     }
   }
 }
 
-template <typename scalar_t, typename acc_t, bool LOG_MODE>
-void launch_wave_softmax(scalar_t* dst, const scalar_t* src, int64_t batch_count,
+template <typename scalar_t, typename acc_t, bool LOG_MODE, typename out_t>
+void launch_wave_softmax(out_t* dst, const scalar_t* src, int64_t batch_count,
                          int64_t element_count, cudaStream_t stream) {
   const int log2_elements = softmax_log2_ceil(static_cast<int>(element_count));
   const int next_pow2 = 1 << log2_elements;
@@ -356,13 +359,13 @@ void launch_wave_softmax(scalar_t* dst, const scalar_t* src, int64_t batch_count
 #define TP_LAUNCH_WAVE_SOFTMAX(L2E)                                          \
   do {                                                                       \
     if (hw_wave == 64) {                                                     \
-      softmax_wave_forward<scalar_t, acc_t, L2E, LOG_MODE, 64>               \
+      softmax_wave_forward<scalar_t, acc_t, L2E, LOG_MODE, 64, out_t>               \
           <<<static_cast<unsigned>(blocks), threads, 0, stream>>>(           \
               dst, src, static_cast<int>(batch_count),                       \
               static_cast<int>(element_count),                               \
               static_cast<int>(element_count));                              \
     } else {                                                                 \
-      softmax_wave_forward<scalar_t, acc_t, L2E, LOG_MODE, 32>               \
+      softmax_wave_forward<scalar_t, acc_t, L2E, LOG_MODE, 32, out_t>               \
           <<<static_cast<unsigned>(blocks), threads, 0, stream>>>(           \
               dst, src, static_cast<int>(batch_count),                       \
               static_cast<int>(element_count),                               \
@@ -400,7 +403,8 @@ void launch_wave_softmax(scalar_t* dst, const scalar_t* src, int64_t batch_count
 // Rows past the cap go to the block-per-row kernels, which spread the same
 // row over more threads and keep the whole slice in registers at a fraction
 // of the pressure.
-template <typename scalar_t, typename acc_t, bool LOG_MODE>
+template <typename scalar_t, typename acc_t, bool LOG_MODE,
+          typename out_t = scalar_t>
 bool try_wave_softmax(const Tensor& self, Tensor& result, int64_t softmax_size,
                       int64_t rows) {
   constexpr int64_t kMaxRowLength = kWaveLanes * kWaveElemsPerLane;
@@ -411,8 +415,8 @@ bool try_wave_softmax(const Tensor& self, Tensor& result, int64_t softmax_size,
   }
   if (rows * softmax_size > static_cast<int64_t>(INT32_MAX)) return false;
   if (!self.is_contiguous() || !result.is_contiguous()) return false;
-  launch_wave_softmax<scalar_t, acc_t, LOG_MODE>(
-      result.data_ptr<scalar_t>(), self.data_ptr<scalar_t>(), rows,
+  launch_wave_softmax<scalar_t, acc_t, LOG_MODE, out_t>(
+      result.data_ptr<out_t>(), self.data_ptr<scalar_t>(), rows,
       softmax_size, getCurrentCUDAStream().stream());
   return true;
 }
@@ -537,8 +541,9 @@ __device__ __forceinline__ SoftmaxMS<compute_t> softmax_block_reduce_ms(
   return scratch[0];
 }
 
-template <typename scalar_t, typename compute_t, int PACKS, bool LOG_MODE>
-__global__ void softmax_reg_packed_kernel(scalar_t* __restrict__ out,
+template <typename scalar_t, typename compute_t, int PACKS, bool LOG_MODE,
+          typename out_t>
+__global__ void softmax_reg_packed_kernel(out_t* __restrict__ out,
                                           const scalar_t* __restrict__ in,
                                           int classes, int packets) {
   constexpr int kPack = 16 / static_cast<int>(sizeof(scalar_t));
@@ -546,7 +551,7 @@ __global__ void softmax_reg_packed_kernel(scalar_t* __restrict__ out,
   __shared__ SoftmaxMS<compute_t> reduce_ms[kWave];
   const int tid = static_cast<int>(threadIdx.x);
   const scalar_t* row = in + static_cast<int64_t>(blockIdx.x) * classes;
-  scalar_t* row_out = out + static_cast<int64_t>(blockIdx.x) * classes;
+  out_t* row_out = out + static_cast<int64_t>(blockIdx.x) * classes;
 
   SoftmaxPack<scalar_t, kPack> v[PACKS];
   const SoftmaxPack<scalar_t, kPack>* src =
@@ -595,25 +600,43 @@ __global__ void softmax_reg_packed_kernel(scalar_t* __restrict__ out,
           SoftmaxMS<compute_t>{thread_max, thread_sum}, reduce_ms);
   const compute_t norm = LOG_MODE ? std::log(ms.s) : compute_t(1) / ms.s;
 
-  SoftmaxPack<scalar_t, kPack>* dst =
-      reinterpret_cast<SoftmaxPack<scalar_t, kPack>*>(row_out);
+  if constexpr (std::is_same_v<out_t, scalar_t>) {
+    SoftmaxPack<scalar_t, kPack>* dst =
+        reinterpret_cast<SoftmaxPack<scalar_t, kPack>*>(row_out);
 #pragma unroll
-  for (int i = 0; i < PACKS; ++i) {
-    const int slot = tid + i * static_cast<int>(blockDim.x);
-    if (slot < packets) {
-      SoftmaxPack<scalar_t, kPack> r;
+    for (int i = 0; i < PACKS; ++i) {
+      const int slot = tid + i * static_cast<int>(blockDim.x);
+      if (slot < packets) {
+        SoftmaxPack<scalar_t, kPack> r;
 #pragma unroll
-      for (int k = 0; k < kPack; ++k) {
-        const compute_t x = static_cast<compute_t>(v[i].v[k]) - ms.m;
-        r.v[k] = static_cast<scalar_t>(LOG_MODE ? x - norm : std::exp(x) * norm);
+        for (int k = 0; k < kPack; ++k) {
+          const compute_t x = static_cast<compute_t>(v[i].v[k]) - ms.m;
+          r.v[k] = static_cast<scalar_t>(LOG_MODE ? x - norm : std::exp(x) * norm);
+        }
+        softmax_store_stream(dst + slot, r);
       }
-      softmax_store_stream(dst + slot, r);
+    }
+  } else {
+    // A widened output type cannot reuse the input's packet grid; the same
+    // slots go out as scalar stores.
+#pragma unroll
+    for (int i = 0; i < PACKS; ++i) {
+      const int slot = tid + i * static_cast<int>(blockDim.x);
+      if (slot < packets) {
+#pragma unroll
+        for (int k = 0; k < kPack; ++k) {
+          const compute_t x = static_cast<compute_t>(v[i].v[k]) - ms.m;
+          row_out[slot * kPack + k] =
+              static_cast<out_t>(LOG_MODE ? x - norm : std::exp(x) * norm);
+        }
+      }
     }
   }
 }
 
-template <typename scalar_t, typename compute_t, int REG, bool LOG_MODE>
-__global__ void softmax_reg_scalar_kernel(scalar_t* __restrict__ out,
+template <typename scalar_t, typename compute_t, int REG, bool LOG_MODE,
+          typename out_t>
+__global__ void softmax_reg_scalar_kernel(out_t* __restrict__ out,
                                           const scalar_t* __restrict__ in,
                                           int classes) {
   constexpr int kWave = 32;
@@ -621,7 +644,7 @@ __global__ void softmax_reg_scalar_kernel(scalar_t* __restrict__ out,
   __shared__ compute_t reduce_sum[kWave];
   const int tid = static_cast<int>(threadIdx.x);
   const scalar_t* row = in + static_cast<int64_t>(blockIdx.x) * classes;
-  scalar_t* row_out = out + static_cast<int64_t>(blockIdx.x) * classes;
+  out_t* row_out = out + static_cast<int64_t>(blockIdx.x) * classes;
 
   scalar_t v[REG];
 #pragma unroll
@@ -659,7 +682,7 @@ __global__ void softmax_reg_scalar_kernel(scalar_t* __restrict__ out,
     if (slot < classes) {
       const compute_t x = static_cast<compute_t>(v[i]) - thread_max;
       row_out[slot] =
-          static_cast<scalar_t>(LOG_MODE ? x - norm : std::exp(x) * norm);
+          static_cast<out_t>(LOG_MODE ? x - norm : std::exp(x) * norm);
     }
   }
 }
@@ -675,7 +698,8 @@ bool softmax_launch_feasible(KernelT kernel, int threads) {
   return err == cudaSuccess && blocks_per_sm > 0;
 }
 
-template <typename scalar_t, typename compute_t, bool LOG_MODE>
+template <typename scalar_t, typename compute_t, bool LOG_MODE,
+          typename out_t = scalar_t>
 bool try_reg_softmax(const Tensor& self, Tensor& result,
                      int64_t softmax_size, int64_t rows) {
   constexpr int kPack = 16 / static_cast<int>(sizeof(scalar_t));
@@ -683,7 +707,7 @@ bool try_reg_softmax(const Tensor& self, Tensor& result,
     return false;
   if (!self.is_contiguous() || !result.is_contiguous()) return false;
   const scalar_t* in = self.data_ptr<scalar_t>();
-  scalar_t* out = result.data_ptr<scalar_t>();
+  out_t* out = result.data_ptr<out_t>();
   const bool aligned =
       (reinterpret_cast<uintptr_t>(in) % 16 == 0) &&
       (reinterpret_cast<uintptr_t>(out) % 16 == 0);
@@ -700,19 +724,19 @@ bool try_reg_softmax(const Tensor& self, Tensor& result,
     const int packets = static_cast<int>(softmax_size / kPack);
     if (packets <= 256) {
       const int threads = static_cast<int>(wave_round(packets));
-      softmax_reg_packed_kernel<scalar_t, compute_t, 1, LOG_MODE>
+      softmax_reg_packed_kernel<scalar_t, compute_t, 1, LOG_MODE, out_t>
           <<<grid, threads, 0, stream>>>(out, in,
                                          static_cast<int>(softmax_size),
                                          packets);
     } else if (packets <= 512) {
       const int threads = static_cast<int>(wave_round((packets + 1) / 2));
-      softmax_reg_packed_kernel<scalar_t, compute_t, 2, LOG_MODE>
+      softmax_reg_packed_kernel<scalar_t, compute_t, 2, LOG_MODE, out_t>
           <<<grid, threads, 0, stream>>>(out, in,
                                          static_cast<int>(softmax_size),
                                          packets);
     } else if (packets <= 2048) {
       const int threads = static_cast<int>(wave_round((packets + 3) / 4));
-      softmax_reg_packed_kernel<scalar_t, compute_t, 4, LOG_MODE>
+      softmax_reg_packed_kernel<scalar_t, compute_t, 4, LOG_MODE, out_t>
           <<<grid, threads, 0, stream>>>(out, in,
                                          static_cast<int>(softmax_size),
                                          packets);
@@ -723,11 +747,12 @@ bool try_reg_softmax(const Tensor& self, Tensor& result,
       // takes over.
       if (threads > 512 &&
           !softmax_launch_feasible(
-              softmax_reg_packed_kernel<scalar_t, compute_t, 8, LOG_MODE>,
+              softmax_reg_packed_kernel<scalar_t, compute_t, 8, LOG_MODE,
+                                        out_t>,
               threads)) {
         return false;
       }
-      softmax_reg_packed_kernel<scalar_t, compute_t, 8, LOG_MODE>
+      softmax_reg_packed_kernel<scalar_t, compute_t, 8, LOG_MODE, out_t>
           <<<grid, threads, 0, stream>>>(out, in,
                                          static_cast<int>(softmax_size),
                                          packets);
@@ -742,11 +767,12 @@ bool try_reg_softmax(const Tensor& self, Tensor& result,
         wave_round((softmax_size + 15) / 16));
     if (threads > 512 &&
         !softmax_launch_feasible(
-            softmax_reg_scalar_kernel<scalar_t, compute_t, 16, LOG_MODE>,
+            softmax_reg_scalar_kernel<scalar_t, compute_t, 16, LOG_MODE,
+                                      out_t>,
             threads)) {
       return false;
     }
-    softmax_reg_scalar_kernel<scalar_t, compute_t, 16, LOG_MODE>
+    softmax_reg_scalar_kernel<scalar_t, compute_t, 16, LOG_MODE, out_t>
         <<<grid, threads, 0, stream>>>(out, in,
                                        static_cast<int>(softmax_size));
   }
@@ -760,9 +786,13 @@ bool try_reg_softmax(const Tensor& self, Tensor& result,
 // merged max when combined — so the whole row is read once for both moments
 // instead of once per moment. Total traffic is one read for the moments, one
 // read + one write for the output; a per-moment two-pass flow reads the row
-// an additional time.
-template <typename scalar_t, typename compute_t, bool LOG_MODE>
-__global__ void softmax_wide_kernel(scalar_t* __restrict__ out,
+// an additional time. Row starts that sit off the 16-byte alignment (odd
+// slice offsets, row lengths that are not a packet multiple — typical
+// vocabulary sizes) split the row into a scalar head, an aligned packet
+// body and a scalar tail; both edges fold into the same online pair and are
+// written back scalar.
+template <typename scalar_t, typename compute_t, bool LOG_MODE, typename out_t>
+__global__ void softmax_wide_kernel(out_t* __restrict__ out,
                                     const scalar_t* __restrict__ in,
                                     int classes) {
   constexpr int kPack = 16 / static_cast<int>(sizeof(scalar_t));
@@ -773,16 +803,25 @@ __global__ void softmax_wide_kernel(scalar_t* __restrict__ out,
   constexpr int kWave = 32;
   __shared__ SoftmaxMS<compute_t> reduce_ms[kWave];
   const int tid = static_cast<int>(threadIdx.x);
-  const int packets = classes / kPack;
   const int64_t row_base = static_cast<int64_t>(blockIdx.x) * classes;
+  const scalar_t* row_in = in + row_base;
+  out_t* row_out = out + row_base;
+  const auto align_head = [](const void* p) {
+    return static_cast<int>(
+        (16 - reinterpret_cast<uintptr_t>(p) % 16) % 16 /
+        static_cast<int>(sizeof(scalar_t)));
+  };
+  const int head_in = align_head(row_in);
+  const int body_in = classes - head_in;
+  const int packets = body_in / kPack;
+  const int tail_in = body_in - packets * kPack;
+  const int edge_in = head_in + tail_in;
+  const scalar_t pad = -std::numeric_limits<scalar_t>::infinity();
   const SoftmaxPack<scalar_t, kPack>* src =
-      reinterpret_cast<const SoftmaxPack<scalar_t, kPack>*>(in + row_base);
-  SoftmaxPack<scalar_t, kPack>* dst =
-      reinterpret_cast<SoftmaxPack<scalar_t, kPack>*>(out + row_base);
+      reinterpret_cast<const SoftmaxPack<scalar_t, kPack>*>(row_in + head_in);
 
   SoftmaxMS<compute_t> acc{
       -std::numeric_limits<compute_t>::infinity(), compute_t(0)};
-  const scalar_t pad = -std::numeric_limits<scalar_t>::infinity();
   const int stride = static_cast<int>(blockDim.x) * kChunkPackets;
   for (int base = tid; base < packets; base += stride) {
     SoftmaxPack<scalar_t, kPack> vc[kChunkPackets];
@@ -822,35 +861,76 @@ __global__ void softmax_wide_kernel(scalar_t* __restrict__ out,
     acc = softmax_ms_combine(
         acc, SoftmaxMS<compute_t>{chunk_max, chunk_sum});
   }
+  // The scalar head and tail fold into the same online pair. A lone -inf
+  // element carries a zero sum, exactly like a padded packet slot; any NaN
+  // poisons the sum through the combine, matching the packet path.
+  for (int e = tid; e < edge_in; e += static_cast<int>(blockDim.x)) {
+    const int logical = e < head_in ? e : classes - tail_in + (e - head_in);
+    const compute_t x = static_cast<compute_t>(row_in[logical]);
+    acc = softmax_ms_combine(
+        acc, x == -std::numeric_limits<compute_t>::infinity()
+                 ? SoftmaxMS<compute_t>{-std::numeric_limits<compute_t>::infinity(),
+                                        compute_t(0)}
+                 : SoftmaxMS<compute_t>{x, compute_t(1)});
+  }
   const SoftmaxMS<compute_t> ms = softmax_block_reduce_ms<compute_t>(acc, reduce_ms);
   const compute_t norm = LOG_MODE ? std::log(ms.s) : compute_t(1) / ms.s;
 
-  for (int slot = tid; slot < packets; slot += static_cast<int>(blockDim.x)) {
-    const SoftmaxPack<scalar_t, kPack> v = softmax_load_stream(src + slot);
-    SoftmaxPack<scalar_t, kPack> r;
+  if constexpr (std::is_same_v<out_t, scalar_t>) {
+    const int head_out = align_head(row_out);
+    if (head_in == head_out) {
+      // Fresh results share the input's per-row phase, so the write pass
+      // keeps the same packet grid as the read.
+      auto* dst = reinterpret_cast<SoftmaxPack<scalar_t, kPack>*>(
+          row_out + head_out);
+      for (int slot = tid; slot < packets; slot += static_cast<int>(blockDim.x)) {
+        const SoftmaxPack<scalar_t, kPack> v = softmax_load_stream(src + slot);
+        SoftmaxPack<scalar_t, kPack> r;
 #pragma unroll
-    for (int k = 0; k < kPack; ++k) {
-      const compute_t x = static_cast<compute_t>(v.v[k]) - ms.m;
-      r.v[k] = static_cast<scalar_t>(LOG_MODE ? x - norm : std::exp(x) * norm);
+        for (int k = 0; k < kPack; ++k) {
+          const compute_t x = static_cast<compute_t>(v.v[k]) - ms.m;
+          r.v[k] = static_cast<scalar_t>(LOG_MODE ? x - norm : std::exp(x) * norm);
+        }
+        softmax_store_stream(dst + slot, r);
+      }
+      for (int e = tid; e < edge_in; e += static_cast<int>(blockDim.x)) {
+        const int logical = e < head_in ? e : classes - tail_in + (e - head_in);
+        const compute_t x = static_cast<compute_t>(row_in[logical]) - ms.m;
+        row_out[logical] =
+            static_cast<out_t>(LOG_MODE ? x - norm : std::exp(x) * norm);
+      }
+    } else {
+      // The two row starts disagree on the alignment phase: the re-read
+      // stays vectorized, but every store goes out scalar.
+      for (int e = tid; e < classes; e += static_cast<int>(blockDim.x)) {
+        const compute_t x = static_cast<compute_t>(row_in[e]) - ms.m;
+        row_out[e] =
+            static_cast<out_t>(LOG_MODE ? x - norm : std::exp(x) * norm);
+      }
     }
-    softmax_store_stream(dst + slot, r);
+  } else {
+    // A widened output type has its own element size and no shared packet
+    // grid; the whole row goes out scalar.
+    for (int e = tid; e < classes; e += static_cast<int>(blockDim.x)) {
+      const compute_t x = static_cast<compute_t>(row_in[e]) - ms.m;
+      row_out[e] =
+          static_cast<out_t>(LOG_MODE ? x - norm : std::exp(x) * norm);
+    }
   }
 }
 
-template <typename scalar_t, typename compute_t, bool LOG_MODE>
+template <typename scalar_t, typename compute_t, bool LOG_MODE,
+          typename out_t = scalar_t>
 bool try_wide_softmax(const Tensor& self, Tensor& result,
                       int64_t softmax_size, int64_t rows) {
-  constexpr int kPack = 16 / static_cast<int>(sizeof(scalar_t));
   if (softmax_size < 2049 || softmax_size > INT32_MAX || rows > INT32_MAX)
     return false;
-  if (softmax_size % kPack != 0) return false;
   if (!self.is_contiguous() || !result.is_contiguous()) return false;
   const scalar_t* in = self.data_ptr<scalar_t>();
-  scalar_t* out = result.data_ptr<scalar_t>();
-  if ((reinterpret_cast<uintptr_t>(in) % 16 != 0) ||
-      (reinterpret_cast<uintptr_t>(out) % 16 != 0)) {
-    return false;
-  }
+  out_t* out = result.data_ptr<out_t>();
+  // Misaligned row starts and row lengths that are not a packet multiple
+  // stay on this kernel: the block splits each row into a scalar head, an
+  // aligned packet body and a scalar tail.
   // Blocks spread one row per block, so rows below a couple of waves per
   // SM leave the rest of the machine idle; wider blocks then put more
   // loads in flight per SM, which is what feeds a pure streaming kernel.
@@ -863,7 +943,7 @@ bool try_wide_softmax(const Tensor& self, Tensor& result,
   }
   const int threads =
       rows * 2 < properties.multiProcessorCount ? 1024 : 512;
-  softmax_wide_kernel<scalar_t, compute_t, LOG_MODE>
+  softmax_wide_kernel<scalar_t, compute_t, LOG_MODE, out_t>
       <<<static_cast<unsigned>(rows), threads, 0,
          getCurrentCUDAStream().stream()>>>(out, in,
                                             static_cast<int>(softmax_size));
@@ -871,9 +951,222 @@ bool try_wide_softmax(const Tensor& self, Tensor& result,
   return true;
 }
 
+// --- Spatial softmax for slices that sit off the fast dimension ---
+//
+// The row kernels above address a slice with a stride of `inner_size`, so
+// threads of a warp land `inner_size` elements apart and every 32-element
+// transaction carries one useful value.  Here the roles flip: threads that
+// share threadIdx.y each own one inner slice (consecutive threads read
+// consecutive addresses), and the x-threads of the block cooperatively
+// reduce the softmax dim of that slice.
+
+// Block reduction along the x axis only.  Threads that share threadIdx.y
+// collapse their partials through a halved-stride tree inside their own
+// scratch row; other y rows use disjoint scratch.  blockDim.x must be a
+// power of two, which the launch configuration below guarantees.
+template <typename compute_t, bool kIsMax>
+__device__ __forceinline__ compute_t softmax_spatial_reduce_x(
+    compute_t* shared, compute_t value) {
+  compute_t* row = shared + static_cast<int64_t>(threadIdx.y) * blockDim.x;
+  const int x = static_cast<int>(threadIdx.x);
+  // A leading barrier keeps the previous pass's reads of the scratch row
+  // ahead of this pass's writes; every thread of the block arrives.
+  __syncthreads();
+  row[x] = value;
+  int offset = static_cast<int>(blockDim.x) / 2;
+  while (offset > 0) {
+    __syncthreads();
+    if (x < offset) {
+      const compute_t other = row[x + offset];
+      value = kIsMax ? (other > value ? other : value) : (value + other);
+      row[x] = value;
+    }
+    offset >>= 1;
+  }
+  __syncthreads();
+  const compute_t result = row[0];
+  // No trailing barrier: the next pass opens with one, and a thread cannot
+  // reach it before it has read row[0] here.
+  return result;
+}
+
+template <typename scalar_t, typename compute_t, bool LOG_MODE, typename out_t>
+__global__ void softmax_spatial_kernel(
+    out_t* __restrict__ out, const scalar_t* __restrict__ in,
+    int64_t outer_size, int64_t dim_size, int64_t inner_size) {
+  extern __shared__ unsigned char softmax_spatial_smem[];
+  compute_t* shared = reinterpret_cast<compute_t*>(softmax_spatial_smem);
+  const int64_t outer_stride = dim_size * inner_size;
+  const int64_t dim_stride = inner_size;
+  // The inner axis is tiled in whole rows of y-threads.  Threads past the
+  // last element ride through the barriers with identity partials, so every
+  // thread of the block executes the same barrier sequence; their loads and
+  // stores are gated off and their results discarded.
+  const int64_t inner_tiles =
+      (inner_size + static_cast<int64_t>(blockDim.y) - 1) /
+      static_cast<int64_t>(blockDim.y);
+
+  for (int64_t outer_index = static_cast<int64_t>(blockIdx.x);
+       outer_index < outer_size;
+       outer_index += static_cast<int64_t>(gridDim.x)) {
+    const int64_t outer_offset = outer_index * outer_stride;
+    for (int64_t tile = static_cast<int64_t>(blockIdx.y); tile < inner_tiles;
+         tile += static_cast<int64_t>(gridDim.y)) {
+      const int64_t inner_index =
+          tile * static_cast<int64_t>(blockDim.y) + threadIdx.y;
+      const bool active = inner_index < inner_size;
+      // Inactive threads still need a valid base address for the loads they
+      // will run and discard.
+      const int64_t data_offset = outer_offset + (active ? inner_index : 0);
+      const int x = static_cast<int>(threadIdx.x);
+
+      if (blockDim.x > 1) {
+        compute_t thread_max = -std::numeric_limits<compute_t>::infinity();
+        if (active) {
+          for (int64_t d = x; d < dim_size;
+               d += static_cast<int64_t>(blockDim.x)) {
+            const compute_t v =
+                static_cast<compute_t>(in[data_offset + d * dim_stride]);
+            thread_max = v > thread_max ? v : thread_max;
+          }
+        }
+        const compute_t row_max =
+            softmax_spatial_reduce_x<compute_t, true>(shared, thread_max);
+
+        compute_t thread_sum = compute_t(0);
+        if (active) {
+          for (int64_t d = x; d < dim_size;
+               d += static_cast<int64_t>(blockDim.x)) {
+            thread_sum +=
+                std::exp(static_cast<compute_t>(in[data_offset + d * dim_stride]) -
+                         row_max);
+          }
+        }
+        const compute_t denom = std::log(
+            softmax_spatial_reduce_x<compute_t, false>(shared, thread_sum));
+
+        if (active) {
+          for (int64_t d = x; d < dim_size;
+               d += static_cast<int64_t>(blockDim.x)) {
+            const compute_t v =
+                static_cast<compute_t>(in[data_offset + d * dim_stride]) -
+                row_max - denom;
+            out[data_offset + d * dim_stride] =
+                static_cast<out_t>(LOG_MODE ? v : std::exp(v));
+          }
+        }
+      } else {
+        // One thread per slice: no block reduction to coordinate.
+        compute_t thread_max = -std::numeric_limits<compute_t>::infinity();
+        if (active) {
+          for (int64_t d = 0; d < dim_size; ++d) {
+            const compute_t v =
+                static_cast<compute_t>(in[data_offset + d * dim_stride]);
+            thread_max = v > thread_max ? v : thread_max;
+          }
+        }
+        compute_t thread_sum = compute_t(0);
+        if (active) {
+          for (int64_t d = 0; d < dim_size; ++d) {
+            thread_sum +=
+                std::exp(static_cast<compute_t>(in[data_offset + d * dim_stride]) -
+                         thread_max);
+          }
+        }
+        const compute_t denom = std::log(thread_sum);
+        if (active) {
+          for (int64_t d = 0; d < dim_size; ++d) {
+            const compute_t v =
+                static_cast<compute_t>(in[data_offset + d * dim_stride]) -
+                thread_max - denom;
+            out[data_offset + d * dim_stride] =
+                static_cast<out_t>(LOG_MODE ? v : std::exp(v));
+          }
+        }
+      }
+    }
+  }
+}
+
+template <typename scalar_t, typename compute_t, bool LOG_MODE,
+          typename out_t = scalar_t>
+bool try_spatial_softmax(const Tensor& self, Tensor& result,
+                         int64_t outer_size, int64_t softmax_size,
+                         int64_t inner_size) {
+  if (outer_size == 0 || softmax_size == 0 || inner_size == 0) return false;
+  if (!self.is_contiguous() || !result.is_contiguous()) return false;
+  // Block geometry: y-threads cover the inner axis; x-threads team up on the
+  // reduction only while the inner axis alone cannot fill a block and the
+  // dim is long enough to feed a team.
+  constexpr int kMaxThreads = 1024;
+  const int inner_threads =
+      static_cast<int>(inner_size < kMaxThreads ? inner_size : kMaxThreads);
+  int dim_threads = 1;
+  if (inner_threads <= 64 && softmax_size >= 64) {
+    while (inner_threads * dim_threads <= kMaxThreads &&
+           dim_threads <= softmax_size) {
+      dim_threads *= 2;
+    }
+    dim_threads /= 2;
+  }
+  dim3 block(static_cast<unsigned>(dim_threads),
+             static_cast<unsigned>(inner_threads));
+
+  // Occupancy probe: shrink the block until the driver reports at least one
+  // resident block for this instantiation and shared footprint.  An exhausted
+  // (1, 1) block falls back to the caller's generic kernel.
+  int per_sm = 0;
+  auto kernel = softmax_spatial_kernel<scalar_t, compute_t, LOG_MODE, out_t>;
+  size_t smem = 0;
+  while (true) {
+    smem = block.x > 1
+        ? static_cast<size_t>(block.x) * block.y * sizeof(compute_t)
+        : 0;
+    cudaError_t err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &per_sm, kernel, static_cast<int>(block.x * block.y), smem);
+    if (err == cudaSuccess && per_sm > 0) break;
+    // A failed probe leaves a sticky per-thread error that would poison the
+    // next call; clear it before retrying with a smaller block.
+    if (err != cudaSuccess) cudaGetLastError();
+    if (block.x == 1 && block.y == 1) return false;
+    if (block.y > 1) {
+      block.y /= 2;
+    } else {
+      block.x /= 2;
+    }
+  }
+  static thread_local cudaDeviceProp properties{};
+  static thread_local int queried_device = -1;
+  const int current = currentDevice();
+  if (queried_device != current) {
+    CUDA_CHECK(cudaGetDeviceProperties(&properties, current));
+    queried_device = current;
+  }
+  const int64_t max_active =
+      static_cast<int64_t>(per_sm) * properties.multiProcessorCount;
+  // Tile the inner axis first and spend the remaining resident blocks on the
+  // outer axis; both counts stay far below the hardware launch limits after
+  // the caps, so the narrowing casts below are safe.
+  int64_t inner_blocks = (inner_size + block.y - 1) / block.y;
+  if (inner_blocks > max_active) inner_blocks = max_active;
+  int64_t outer_blocks = (max_active + inner_blocks - 1) / inner_blocks;
+  if (outer_blocks > outer_size) outer_blocks = outer_size;
+  const dim3 grid(static_cast<unsigned>(outer_blocks),
+                  static_cast<unsigned>(inner_blocks));
+  smem = block.x > 1
+      ? static_cast<size_t>(block.x) * block.y * sizeof(compute_t)
+      : 0;
+  softmax_spatial_kernel<scalar_t, compute_t, LOG_MODE, out_t>
+      <<<grid, block, smem, getCurrentCUDAStream().stream()>>>(
+          result.data_ptr<out_t>(), self.data_ptr<scalar_t>(), outer_size,
+          softmax_size, inner_size);
+  CUDA_CHECK(cudaGetLastError());
+  return true;
+}
+
 }  // namespace
 
-template <typename scalar_t, typename compute_t>
+template <typename scalar_t, typename compute_t, typename out_t = scalar_t>
 void softmax_dim_dispatch(const Tensor& self, Tensor& result, int64_t dim,
                           bool log_mode) {
   // One thread block per (outer, inner) row; the kernel splits blockIdx
@@ -886,34 +1179,61 @@ void softmax_dim_dispatch(const Tensor& self, Tensor& result, int64_t dim,
   if (inner_size == 1) {
     // Fast dimension: wave-resident kernel, one hardware wave per row.
     const bool wave = log_mode
-        ? try_wave_softmax<scalar_t, compute_t, true>(self, result,
-                                                      softmax_size, rows)
-        : try_wave_softmax<scalar_t, compute_t, false>(self, result,
-                                                       softmax_size, rows);
+        ? try_wave_softmax<scalar_t, compute_t, true, out_t>(self, result,
+                                                             softmax_size,
+                                                             rows)
+        : try_wave_softmax<scalar_t, compute_t, false, out_t>(self, result,
+                                                              softmax_size,
+                                                              rows);
     if (wave) return;
     // Longer contiguous rows keep the whole slice in registers: one read
     // pass and one write pass regardless of row length.
     const bool reg = log_mode
-        ? try_reg_softmax<scalar_t, compute_t, true>(self, result,
-                                                     softmax_size, rows)
-        : try_reg_softmax<scalar_t, compute_t, false>(self, result,
-                                                      softmax_size, rows);
+        ? try_reg_softmax<scalar_t, compute_t, true, out_t>(self, result,
+                                                            softmax_size,
+                                                            rows)
+        : try_reg_softmax<scalar_t, compute_t, false, out_t>(self, result,
+                                                             softmax_size,
+                                                             rows);
     if (reg) return;
     // Rows beyond the register budget: two streaming vector passes, with
     // both moments folded into a single read.
     const bool wide = log_mode
-        ? try_wide_softmax<scalar_t, compute_t, true>(self, result,
-                                                      softmax_size, rows)
-        : try_wide_softmax<scalar_t, compute_t, false>(self, result,
-                                                       softmax_size, rows);
+        ? try_wide_softmax<scalar_t, compute_t, true, out_t>(self, result,
+                                                             softmax_size,
+                                                             rows)
+        : try_wide_softmax<scalar_t, compute_t, false, out_t>(self, result,
+                                                              softmax_size,
+                                                              rows);
     if (wide) return;
   }
+  if (inner_size != 1) {
+    // Spatial tier: consecutive threads own consecutive inner slices, so the
+    // strided loads of the generic kernel below become coalesced, and the
+    // inner axis finally contributes parallelism of its own.
+    const bool spatial = log_mode
+        ? try_spatial_softmax<scalar_t, compute_t, true, out_t>(self, result,
+                                                                rows,
+                                                                softmax_size,
+                                                                inner_size)
+        : try_spatial_softmax<scalar_t, compute_t, false, out_t>(self, result,
+                                                                 rows,
+                                                                 softmax_size,
+                                                                 inner_size);
+    if (spatial) return;
+  }
   constexpr int kThreads = 256;
-  softmax_dim_kernel<scalar_t, compute_t>
-      <<<static_cast<unsigned>(rows * inner_size), kThreads, 0,
+  const int64_t launch_rows = rows * inner_size;
+  const unsigned grid_x =
+      launch_rows > INT32_MAX ? static_cast<unsigned>(INT32_MAX)
+                              : static_cast<unsigned>(launch_rows);
+  const unsigned grid_y =
+      static_cast<unsigned>((launch_rows + grid_x - 1) / grid_x);
+  softmax_dim_kernel<scalar_t, compute_t, out_t>
+      <<<dim3(grid_x, grid_y), kThreads, 0,
          getCurrentCUDAStream().stream()>>>(
-          result.data_ptr<scalar_t>(), self.data_ptr<scalar_t>(),
-          rows * inner_size, softmax_size, inner_size, log_mode);
+          result.data_ptr<out_t>(), self.data_ptr<scalar_t>(),
+          launch_rows, softmax_size, inner_size, log_mode);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1011,6 +1331,35 @@ Tensor softmax_kernel_native(const Tensor& self, int64_t dim, DType dtype) {
 Tensor log_softmax_kernel_native(const Tensor& self, int64_t dim, DType dtype) {
   (void)dtype;
   return softmax_native_impl(self, dim, true);
+}
+
+// The half_to_float out-variant: reduced-precision input, fp32 result.  The
+// accumulator is float throughout and every store lands in the wider output
+// directly, so no intermediate rounding through the input dtype occurs.
+// Writes go into the caller's output tensor.
+void softmax_half_to_float_native(const Tensor& self, Tensor& out,
+                                  int64_t dim, bool log_mode) {
+  if (self.dim() == 0) {
+    write_out(out, softmax_scalar_result_dispatch(self, log_mode));
+    return;
+  }
+  if (dim < 0) dim += self.dim();
+  if (dim < 0 || dim >= self.dim()) {
+    TP_THROW(RuntimeError,
+             "Dimension out of range (expected to be in range of [",
+             -self.dim(), ", ", self.dim() - 1, "], but got ",
+             dim - self.dim(), ")");
+  }
+  Tensor input = self.is_contiguous() ? self : self.contiguous();
+  if (input.numel() == 0) return;
+  switch (input.dtype()) {
+    case DType::Float16:
+      softmax_dim_dispatch<Half, float, float>(input, out, dim, log_mode);
+      break;
+    default:
+      TP_THROW(NotImplementedError,
+               "softmax: unsupported dtype on this GPU backend");
+  }
 }
 
 namespace {
@@ -1290,8 +1639,15 @@ Tensor& _log_softmax_backward_data_out_cuda(const Tensor& grad_output,
 Tensor& _softmax_out_cuda(const Tensor& self, int64_t dim, bool half_to_float,
                           Tensor& out) {
   if (half_to_float) {
-    TP_THROW(RuntimeError,
-             "softmax with half to float conversion is not supported on this backend");
+    if (self.dtype() != DType::Float16) {
+      TP_THROW(RuntimeError, "conversion is supported for Half type only");
+    }
+    if (out.dtype() != DType::Float32) {
+      TP_THROW(TypeError,
+               "half_to_float softmax expects a float32 out tensor");
+    }
+    softmax_half_to_float_native(self, out, dim, /*log_mode=*/false);
+    return out;
   }
   write_out(out, softmax_native_impl(self, dim, false));
   return out;
@@ -1300,8 +1656,15 @@ Tensor& _softmax_out_cuda(const Tensor& self, int64_t dim, bool half_to_float,
 Tensor& _log_softmax_out_cuda(const Tensor& self, int64_t dim,
                               bool half_to_float, Tensor& out) {
   if (half_to_float) {
-    TP_THROW(RuntimeError,
-             "log_softmax with half to float conversion is not supported on this backend");
+    if (self.dtype() != DType::Float16) {
+      TP_THROW(RuntimeError, "conversion is supported for Half type only");
+    }
+    if (out.dtype() != DType::Float32) {
+      TP_THROW(TypeError,
+               "half_to_float log_softmax expects a float32 out tensor");
+    }
+    softmax_half_to_float_native(self, out, dim, /*log_mode=*/true);
+    return out;
   }
   write_out(out, softmax_native_impl(self, dim, true));
   return out;
