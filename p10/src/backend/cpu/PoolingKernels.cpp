@@ -164,9 +164,8 @@ Tensor avg_pool3d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
                               divisor_override).squeeze(0);
     }
     if (input.dim() != 5) TP_THROW(RuntimeError, "avg_pool3d: Expected 5D input");
-    const Tensor input_c = input.contiguous();
-    int64_t N = input_c.size(0), C = input_c.size(1);
-    const int64_t D = input_c.size(2), H = input_c.size(3), W = input_c.size(4);
+    const int64_t N = input.size(0), C = input.size(1);
+    const int64_t D = input.size(2), H = input.size(3), W = input.size(4);
     const int64_t kd = kernel_size[0], kh = kernel_size[1], kw = kernel_size[2];
     const int64_t sd = stride[0], sh = stride[1], sw = stride[2];
     const int64_t pd_ = padding[0], ph = padding[1], pw = padding[2];
@@ -177,6 +176,22 @@ Tensor avg_pool3d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
     const int64_t oD = out_size(D, kd, sd, pd_);
     const int64_t oH = out_size(H, kh, sh, ph);
     const int64_t oW = out_size(W, kw, sw, pw);
+    if (oD <= 0 || oH <= 0 || oW <= 0)
+        TP_THROW(RuntimeError, "avg_pool3d: Calculated output size is too small");
+    if (input.is_contiguous(MemoryFormat::ChannelsLast3d) &&
+        (input.dtype() == DType::Float32 || input.dtype() == DType::Float64)) {
+        const std::vector<int64_t> out_sizes = {N, C, oD, oH, oW};
+        Tensor out = Tensor::empty(out_sizes, input.dtype(), input.device());
+        out = out.as_strided(out_sizes, get_channels_last_strides(out_sizes), 0);
+        avg_pool3d_cl_stub(
+            DeviceType::CPU, input.data_ptr(), out.data_ptr(),
+            N, C, D, H, W, oD, oH, oW, kd, kh, kw, sd, sh, sw,
+            pd_, ph, pw, count_include_pad,
+            divisor_override.has_value() ? *divisor_override : 0,
+            static_cast<int>(input.dtype()));
+        return out;
+    }
+    const Tensor input_c = input.contiguous();
     Tensor out = Tensor::empty({N, C, oD, oH, oW}, input.dtype(), input.device());
     TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "avg_pool3d", [&]() {
         scalar_t* out_ptr = out.data_ptr<scalar_t>();
@@ -968,6 +983,22 @@ Tensor avg_pool3d_backward_cpu(const Tensor& grad_output, const Tensor& input,
     const int64_t kd = kernel_size[0], kh = kernel_size[1], kw = kernel_size[2];
     const int64_t sd = stride[0], sh = stride[1], sw = stride[2];
     const int64_t pd_ = padding[0], ph = padding[1], pw = padding[2];
+    if (grad_output.is_contiguous(MemoryFormat::ChannelsLast3d) &&
+        input.is_contiguous(MemoryFormat::ChannelsLast3d) &&
+        (input.dtype() == DType::Float32 || input.dtype() == DType::Float64) &&
+        grad_output.dtype() == input.dtype()) {
+        const std::vector<int64_t> sizes = input.shape();
+        Tensor grad_input = Tensor::zeros(sizes, input.dtype(), input.device());
+        grad_input = grad_input.as_strided(
+            sizes, get_channels_last_strides(sizes), 0);
+        avg_pool3d_backward_cl_stub(
+            DeviceType::CPU, grad_output.data_ptr(), grad_input.data_ptr(),
+            N, C, D, H, W, oD, oH, oW, kd, kh, kw, sd, sh, sw,
+            pd_, ph, pw, count_include_pad,
+            divisor_override.has_value() ? *divisor_override : 0,
+            static_cast<int>(input.dtype()));
+        return grad_input;
+    }
     Tensor grad_input = Tensor::zeros({N, C, D, H, W}, input.dtype(), input.device());
     const Tensor grad_output_c = grad_output.contiguous();
     TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "avg_pool3d_backward", [&]() {
@@ -1855,6 +1886,8 @@ Tensor adaptive_max_pool3d_backward_cpu(const Tensor& grad_output, const Tensor&
 }
 
 DEFINE_DISPATCH(avg_pool2d_cl_stub);
+DEFINE_DISPATCH(avg_pool3d_cl_stub);
+DEFINE_DISPATCH(avg_pool3d_backward_cl_stub);
 DEFINE_DISPATCH(max_pool2d_cl_stub);
 DEFINE_DISPATCH(max_pool2d_backward_cl_stub);
 DEFINE_DISPATCH(max_pool3d_cl_stub);

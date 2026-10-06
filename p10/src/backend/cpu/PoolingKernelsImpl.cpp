@@ -99,6 +99,147 @@ void avg_pool2d_cl_typed(const T* in, T* out,
     });
 }
 
+template <typename T>
+void avg_pool3d_cl_typed(const T* in, T* out,
+                         int64_t N, int64_t C,
+                         int64_t D, int64_t H, int64_t W,
+                         int64_t oD, int64_t oH, int64_t oW,
+                         int64_t kD, int64_t kH, int64_t kW,
+                         int64_t sD, int64_t sH, int64_t sW,
+                         int64_t pD, int64_t pH, int64_t pW,
+                         bool count_include_pad, int64_t divisor_override) {
+    using Vec = tensorplay::vec::Vectorized<T>;
+    constexpr int64_t V = Vec::size();
+    const int64_t len = C - (C % V);
+    const int64_t items = N * oD * oH * oW;
+    parallel_for(0, items, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t item = begin; item < end; ++item) {
+            const int64_t ow = item % oW;
+            const int64_t oh = (item / oW) % oH;
+            const int64_t od = (item / (oW * oH)) % oD;
+            const int64_t n = item / (oW * oH * oD);
+            T* out_lane = out + item * C;
+            int64_t d0 = od * sD - pD;
+            int64_t h0 = oh * sH - pH;
+            int64_t w0 = ow * sW - pW;
+            const int64_t d1 = std::min(d0 + kD, D + pD);
+            const int64_t h1 = std::min(h0 + kH, H + pH);
+            const int64_t w1 = std::min(w0 + kW, W + pW);
+            const int64_t d_start = std::max(d0, int64_t(0));
+            const int64_t h_start = std::max(h0, int64_t(0));
+            const int64_t w_start = std::max(w0, int64_t(0));
+            const int64_t d_end = std::min(d1, D);
+            const int64_t h_end = std::min(h1, H);
+            const int64_t w_end = std::min(w1, W);
+            const int64_t pool_size = (d1 - d0) * (h1 - h0) * (w1 - w0);
+            const int64_t count = (d_end - d_start) * (h_end - h_start) *
+                                  (w_end - w_start);
+            const int64_t divisor = divisor_override != 0
+                ? divisor_override
+                : (count_include_pad ? pool_size : count);
+            int64_t c = 0;
+            for (; c < len; c += V) Vec(T(0)).store(out_lane + c);
+            for (; c < C; ++c) out_lane[c] = T(0);
+            if (d_start >= d_end || h_start >= h_end || w_start >= w_end) {
+                continue;
+            }
+            for (int64_t d = d_start; d < d_end; ++d) {
+                for (int64_t h = h_start; h < h_end; ++h) {
+                    const T* row = in + ((n * D + d) * H + h) * W * C;
+                    for (int64_t w = w_start; w < w_end; ++w) {
+                        const T* in_lane = row + w * C;
+                        int64_t c2 = 0;
+                        for (; c2 < len; c2 += V) {
+                            (Vec::loadu(out_lane + c2) +
+                             Vec::loadu(in_lane + c2)).store(out_lane + c2);
+                        }
+                        for (; c2 < C; ++c2) out_lane[c2] += in_lane[c2];
+                    }
+                }
+            }
+            const T divisor_value = static_cast<T>(divisor);
+            c = 0;
+            for (; c < len; c += V) {
+                (Vec::loadu(out_lane + c) / Vec(divisor_value))
+                    .store(out_lane + c);
+            }
+            for (; c < C; ++c) out_lane[c] /= divisor_value;
+        }
+    });
+}
+
+template <typename T>
+void avg_pool3d_backward_cl_typed(const T* gout, T* gin,
+                                  int64_t N, int64_t C,
+                                  int64_t D, int64_t H, int64_t W,
+                                  int64_t oD, int64_t oH, int64_t oW,
+                                  int64_t kD, int64_t kH, int64_t kW,
+                                  int64_t sD, int64_t sH, int64_t sW,
+                                  int64_t pD, int64_t pH, int64_t pW,
+                                  bool count_include_pad,
+                                  int64_t divisor_override) {
+    using Vec = tensorplay::vec::Vectorized<T>;
+    constexpr int64_t V = Vec::size();
+    const int64_t len = C - (C % V);
+    parallel_for(0, N, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t n = begin; n < end; ++n) {
+            T* gin_n = gin + n * D * H * W * C;
+            const T* gout_n = gout + n * oD * oH * oW * C;
+            for (int64_t od = 0; od < oD; ++od) {
+                const int64_t d0 = od * sD - pD;
+                const int64_t d1 = std::min(d0 + kD, D + pD);
+                const int64_t d_start = std::max(d0, int64_t(0));
+                const int64_t d_end = std::min(d1, D);
+                for (int64_t oh = 0; oh < oH; ++oh) {
+                    const int64_t h0 = oh * sH - pH;
+                    const int64_t h1 = std::min(h0 + kH, H + pH);
+                    const int64_t h_start = std::max(h0, int64_t(0));
+                    const int64_t h_end = std::min(h1, H);
+                    for (int64_t ow = 0; ow < oW; ++ow) {
+                        const int64_t w0 = ow * sW - pW;
+                        const int64_t w1 = std::min(w0 + kW, W + pW);
+                        const int64_t w_start = std::max(w0, int64_t(0));
+                        const int64_t w_end = std::min(w1, W);
+                        const int64_t pool_size = (d1 - d0) * (h1 - h0) *
+                                                  (w1 - w0);
+                        const int64_t count = (d_end - d_start) *
+                                              (h_end - h_start) *
+                                              (w_end - w_start);
+                        const int64_t divisor = divisor_override != 0
+                            ? divisor_override
+                            : (count_include_pad ? pool_size : count);
+                        if (d_start >= d_end || h_start >= h_end ||
+                            w_start >= w_end || divisor <= 0) {
+                            continue;
+                        }
+                        const T* gout_lane = gout_n +
+                            ((od * oH + oh) * oW + ow) * C;
+                        const Vec divisor_vec(static_cast<T>(divisor));
+                        for (int64_t d = d_start; d < d_end; ++d) {
+                            for (int64_t h = h_start; h < h_end; ++h) {
+                                T* row = gin_n + ((d * H + h) * W + w_start) * C;
+                                for (int64_t w = w_start; w < w_end; ++w) {
+                                    int64_t c = 0;
+                                    for (; c < len; c += V) {
+                                        (Vec::loadu(row + c) +
+                                         Vec::loadu(gout_lane + c) /
+                                             divisor_vec).store(row + c);
+                                    }
+                                    for (; c < C; ++c) {
+                                        row[c] += gout_lane[c] /
+                                                  static_cast<T>(divisor);
+                                    }
+                                    row += C;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
 // Max-reduction update for one window position.  A NaN takes the maximum
 // (carrying its own bit pattern, so the last NaN in scan order wins), the
 // same contract the scalar max-pool frames follow.  `mask` carries all-bits
@@ -885,6 +1026,64 @@ void avg_pool2d_cl_impl(const void* in, void* out,
     }
 }
 
+void avg_pool3d_cl_impl(const void* in, void* out,
+                        int64_t N, int64_t C,
+                        int64_t D, int64_t H, int64_t W,
+                        int64_t oD, int64_t oH, int64_t oW,
+                        int64_t kD, int64_t kH, int64_t kW,
+                        int64_t sD, int64_t sH, int64_t sW,
+                        int64_t pD, int64_t pH, int64_t pW,
+                        bool count_include_pad, int64_t divisor_override,
+                        int dtype) {
+    switch (static_cast<DType>(dtype)) {
+        case DType::Float32:
+            avg_pool3d_cl_typed<float>(
+                static_cast<const float*>(in), static_cast<float*>(out),
+                N, C, D, H, W, oD, oH, oW, kD, kH, kW,
+                sD, sH, sW, pD, pH, pW, count_include_pad, divisor_override);
+            break;
+        case DType::Float64:
+            avg_pool3d_cl_typed<double>(
+                static_cast<const double*>(in), static_cast<double*>(out),
+                N, C, D, H, W, oD, oH, oW, kD, kH, kW,
+                sD, sH, sW, pD, pH, pW, count_include_pad, divisor_override);
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "avg_pool3d: channels-last kernel supports only float "
+                     "and double");
+    }
+}
+
+void avg_pool3d_backward_cl_impl(const void* gout, void* gin,
+                                 int64_t N, int64_t C,
+                                 int64_t D, int64_t H, int64_t W,
+                                 int64_t oD, int64_t oH, int64_t oW,
+                                 int64_t kD, int64_t kH, int64_t kW,
+                                 int64_t sD, int64_t sH, int64_t sW,
+                                 int64_t pD, int64_t pH, int64_t pW,
+                                 bool count_include_pad, int64_t divisor_override,
+                                 int dtype) {
+    switch (static_cast<DType>(dtype)) {
+        case DType::Float32:
+            avg_pool3d_backward_cl_typed<float>(
+                static_cast<const float*>(gout), static_cast<float*>(gin),
+                N, C, D, H, W, oD, oH, oW, kD, kH, kW,
+                sD, sH, sW, pD, pH, pW, count_include_pad, divisor_override);
+            break;
+        case DType::Float64:
+            avg_pool3d_backward_cl_typed<double>(
+                static_cast<const double*>(gout), static_cast<double*>(gin),
+                N, C, D, H, W, oD, oH, oW, kD, kH, kW,
+                sD, sH, sW, pD, pH, pW, count_include_pad, divisor_override);
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "avg_pool3d_backward: channels-last kernel supports "
+                     "only float and double");
+    }
+}
+
 void max_pool2d_cl_impl(const void* in, void* out, int64_t* ind,
                         int64_t N, int64_t C, int64_t H, int64_t W,
                         int64_t oH, int64_t oW,
@@ -1053,6 +1252,8 @@ void adaptive_max_pool2d_cl_impl(const void* in, void* out, int64_t* ind,
 // REGISTER_DISPATCH, which would otherwise null its slot (opt-in design).
 #ifndef CPU_CAPABILITY_AVX512
 REGISTER_DISPATCH(avg_pool2d_cl_stub, &avg_pool2d_cl_impl);
+REGISTER_DISPATCH(avg_pool3d_cl_stub, &avg_pool3d_cl_impl);
+REGISTER_DISPATCH(avg_pool3d_backward_cl_stub, &avg_pool3d_backward_cl_impl);
 REGISTER_DISPATCH(max_pool2d_cl_stub, &max_pool2d_cl_impl);
 REGISTER_DISPATCH(max_pool2d_backward_cl_stub, &max_pool2d_backward_cl_impl);
 REGISTER_DISPATCH(max_pool3d_cl_stub, &max_pool3d_cl_impl);
@@ -1066,6 +1267,9 @@ REGISTER_DISPATCH(adaptive_max_pool3d_backward_cl_stub,
                   &adaptive_max_pool3d_backward_cl_impl);
 #else
 ALSO_REGISTER_AVX512_DISPATCH(avg_pool2d_cl_stub, &avg_pool2d_cl_impl);
+ALSO_REGISTER_AVX512_DISPATCH(avg_pool3d_cl_stub, &avg_pool3d_cl_impl);
+ALSO_REGISTER_AVX512_DISPATCH(avg_pool3d_backward_cl_stub,
+                              &avg_pool3d_backward_cl_impl);
 ALSO_REGISTER_AVX512_DISPATCH(max_pool2d_cl_stub, &max_pool2d_cl_impl);
 ALSO_REGISTER_AVX512_DISPATCH(max_pool2d_backward_cl_stub,
                               &max_pool2d_backward_cl_impl);
