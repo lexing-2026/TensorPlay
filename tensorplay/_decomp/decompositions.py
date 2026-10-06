@@ -13,7 +13,7 @@ import math
 import operator
 import sys
 from collections.abc import Callable
-from functools import reduce
+from functools import partial, reduce
 from typing import Any
 
 import tensorplay as tp
@@ -5057,10 +5057,18 @@ def max_pool2d_with_indices_backward(grad_output, self, kernel_size, stride=[], 
     return grad_input
 
 
-def _gather_rnn_params(params, has_biases):
+def _gather_rnn_params(params, has_biases, has_projections=False):
     # The flat parameter list holds one group per direction per layer:
-    # [w_ih, w_hh, b_ih, b_hh] with biases, [w_ih, w_hh] without.
-    group_size = 4 if has_biases else 2
+    # [w_ih, w_hh, b_ih, b_hh] with biases, [w_ih, w_hh] without; a
+    # projection layer appends w_hr to each group.
+    if has_biases and has_projections:
+        group_size = 5
+    elif has_biases:
+        group_size = 4
+    elif has_projections:
+        group_size = 3
+    else:
+        group_size = 2
     if len(params) % group_size != 0:
         raise RuntimeError(
             f"len(params)={len(params)} is not divisible by group_size={group_size}"
@@ -5087,11 +5095,10 @@ def _one_layer_rnn(inp, hidden, params, has_biases, hidden_fn, reverse=False):
     return out, squeeze(cur_hidden, 0)
 
 
-def _rnn_helper(input, hidden, params, has_biases, num_layers, dropout, train, bidirectional, batch_first, hidden_fn):
+def _rnn_helper(input, hidden, params, has_biases, num_layers, dropout, train, bidirectional, batch_first, layer_fn):
     if batch_first:
         input = transpose(input, 0, 1)
     final_hiddens = []
-    params = _gather_rnn_params(params, has_biases)
     for i in range(num_layers):
         if bidirectional:
             cur_params, cur_hidden = params[2 * i], hidden[2 * i]
@@ -5100,12 +5107,12 @@ def _rnn_helper(input, hidden, params, has_biases, num_layers, dropout, train, b
             cur_params, cur_hidden = params[i], hidden[i]
             bidir_params, bidir_hidden = None, None
 
-        fwd_inp, fwd_hidden = _one_layer_rnn(input, cur_hidden, cur_params, has_biases, hidden_fn)
+        fwd_inp, fwd_hidden = layer_fn(input, cur_hidden, cur_params, has_biases)
         final_hiddens.append(fwd_hidden)
 
         if bidirectional:
-            bwd_inp, bwd_hidden = _one_layer_rnn(
-                input, bidir_hidden, bidir_params, has_biases, hidden_fn, reverse=True
+            bwd_inp, bwd_hidden = layer_fn(
+                input, bidir_hidden, bidir_params, has_biases, reverse=True
             )
             final_hiddens.append(bwd_hidden)
             input = ops.cat.default([fwd_inp, bwd_inp], fwd_inp.ndim - 1)
@@ -5127,12 +5134,61 @@ def _rnn_cell(hidden_fn):
     return cell
 
 
+def _gru_cell(inp, cur_hidden, hh_weight, hh_bias):
+    # inp holds the three precomputed input gates (batch, 3*hidden); the
+    # hidden gates come from the current state and reset scales them.
+    chunked_igates = tp.chunk(inp, 3, dim=1)
+    chunked_hgates = tp.chunk(ops.linear.default(cur_hidden, hh_weight, hh_bias), 3, dim=2)
+    reset_gate = tp.sigmoid(chunked_hgates[0] + chunked_igates[0])
+    input_gate = tp.sigmoid(chunked_hgates[1] + chunked_igates[1])
+    new_gate = tp.tanh(chunked_igates[2] + chunked_hgates[2] * reset_gate)
+    return (cur_hidden - new_gate) * input_gate + new_gate
+
+
+def _lstm_cell(inp, hx, cx, hh_weight, hh_bias, hr_weight):
+    gates = ops.linear.default(hx, hh_weight, hh_bias) + inp
+    in_gate, forget_gate, cell_gate, out_gate = tp.chunk(gates, 4, dim=2)
+    in_gate = tp.sigmoid(in_gate)
+    forget_gate = tp.sigmoid(forget_gate)
+    cell_gate = tp.tanh(cell_gate)
+    out_gate = tp.sigmoid(out_gate)
+    cy = forget_gate * cx + in_gate * cell_gate
+    hy = out_gate * tp.tanh(cy)
+    if hr_weight is not None:
+        hy = ops.linear.default(hy, hr_weight, None)
+    return hy, cy
+
+
+def _one_layer_lstm(inp, hidden, params, has_biases, reverse=False):
+    ih_weight, hh_weight = params[0], params[1]
+    ih_bias = params[2] if has_biases else None
+    hh_bias = params[3] if has_biases else None
+    # A projection layer carries w_hr as the last group entry: position 4
+    # with biases, position 2 without.
+    hr_weight = params[4] if len(params) == 5 else params[2] if len(params) == 3 else None
+
+    hx = unsqueeze(hidden[0], 0)
+    cx = unsqueeze(hidden[1], 0)
+    precomputed_input = ops.linear.default(inp, ih_weight, ih_bias)
+    if reverse:
+        precomputed_input = prims.rev(precomputed_input, [0])
+    step_output = []
+    for i in ops.unbind.default(precomputed_input, 0):
+        hx, cx = _lstm_cell(i, hx, cx, hh_weight, hh_bias, hr_weight)
+        step_output.append(hx)
+    if reverse:
+        step_output.reverse()
+    out = ops.cat.default(step_output, 0)
+    return out, (squeeze(hx, 0), squeeze(cx, 0))
+
+
 @register_decomposition(ops.rnn_tanh.input)
 def rnn_tanh_input(input, hx, params, has_biases, num_layers, dropout, train, bidirectional, batch_first):
     hidden = list(ops.unbind.default(hx, 0))
+    params = _gather_rnn_params(params, has_biases)
     out, final_hiddens = _rnn_helper(
         input, hidden, params, has_biases, num_layers, dropout, train,
-        bidirectional, batch_first, _rnn_cell(prims.tanh),
+        bidirectional, batch_first, partial(_one_layer_rnn, hidden_fn=_rnn_cell(prims.tanh)),
     )
     return out, ops.stack.default(final_hiddens, 0)
 
@@ -5140,9 +5196,36 @@ def rnn_tanh_input(input, hx, params, has_biases, num_layers, dropout, train, bi
 @register_decomposition(ops.rnn_relu.input)
 def rnn_relu_input(input, hx, params, has_biases, num_layers, dropout, train, bidirectional, batch_first):
     hidden = list(ops.unbind.default(hx, 0))
+    params = _gather_rnn_params(params, has_biases)
     out, final_hiddens = _rnn_helper(
         input, hidden, params, has_biases, num_layers, dropout, train,
-        bidirectional, batch_first, _rnn_cell(ops.relu.default),
+        bidirectional, batch_first, partial(_one_layer_rnn, hidden_fn=_rnn_cell(ops.relu.default)),
+    )
+    return out, ops.stack.default(final_hiddens, 0)
+
+
+@register_decomposition(ops.lstm.input)
+def lstm_input(input, hx, params, has_biases, num_layers, dropout, train, bidirectional, batch_first):
+    if len(hx) != 2:
+        raise RuntimeError(f"lstm expects two hidden states, got {len(hx)}")
+    has_projections = hx[0].size(2) != hx[1].size(2)
+    params = _gather_rnn_params(params, has_biases, has_projections)
+    hidden = list(zip(hx[0], hx[1]))
+    out, final_hiddens = _rnn_helper(
+        input, hidden, params, has_biases, num_layers, dropout, train,
+        bidirectional, batch_first, _one_layer_lstm,
+    )
+    final_h = list(zip(*final_hiddens))
+    return out, ops.stack.default(final_h[0], 0), ops.stack.default(final_h[1], 0)
+
+
+@register_decomposition(ops.gru.input)
+def gru_input(input, hx, params, has_biases, num_layers, dropout, train, bidirectional, batch_first):
+    params = _gather_rnn_params(params, has_biases)
+    hidden = list(ops.unbind.default(hx, 0))
+    out, final_hiddens = _rnn_helper(
+        input, hidden, params, has_biases, num_layers, dropout, train,
+        bidirectional, batch_first, partial(_one_layer_rnn, hidden_fn=_gru_cell),
     )
     return out, ops.stack.default(final_hiddens, 0)
 

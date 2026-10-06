@@ -437,6 +437,18 @@ SAMPLES = {
          True, 1, 0.0, False, False, False),
         {},
     ),
+    # The gated RNNs fuse their gates into the input linear, so w_ih is
+    # (3H or 4H, features) and hx carries one hidden per state per direction.
+    "lstm.input": lambda: (
+        (_t(5, 3, 4), [_t(1, 3, 2), _t(1, 3, 2)],
+         [_t(8, 4), _t(8, 2), _unit(8), _unit(8)], True, 1, 0.0, False, False, False),
+        {},
+    ),
+    "gru.input": lambda: (
+        (_t(5, 3, 4), _t(1, 3, 2), [_t(6, 4), _t(6, 2), _unit(6), _unit(6)],
+         True, 1, 0.0, False, False, False),
+        {},
+    ),
     # Special functions; the ranges keep inputs away from poles and the
     # boundaries of erfinv/ndtri, and zeta's first argument stays above one.
     "bessel_j0.default": lambda: ((_t(2, 3, low=-2.0, high=2.0),), {}),
@@ -851,6 +863,43 @@ def test_rnn_decomposition_matches_the_eager_loop():
         expected = op(x, hx, params, False, 2, 0.0, False, True, False)
         for g, e in zip(got, expected):
             assert tp.allclose(g, e, rtol=1e-4, atol=1e-5)
+
+
+def test_gated_rnn_decomposition_matches_the_eager_loop():
+    get_decompositions([])
+    # The gates are fused into the input linear, so a group is
+    # [w_ih (4H, F), w_hh (4H, H), b_ih, b_hh] for lstm and (3H, ...) for gru;
+    # hx carries one hidden per direction (lstm: per state too).
+    xb = _t(3, 5, 4)
+    hx = _t(2, 3, 2)
+    hc = _t(2, 3, 2)
+    lstm_params = [_t(8, 4), _t(8, 2), _unit(8), _unit(8)] * 2
+    got = decomposition_table[ops.lstm.input](
+        xb, [hx, hc], lstm_params, True, 1, 0.0, False, True, True)
+    expected = ops.lstm.input(
+        xb, [hx, hc], lstm_params, True, 1, 0.0, False, True, True)
+    for g, e in zip(got, expected):
+        assert tp.allclose(g, e, rtol=1e-4, atol=1e-5)
+
+    gru_params = [_t(6, 4), _t(6, 2), _unit(6), _unit(6)] * 2
+    got = decomposition_table[ops.gru.input](
+        xb, hx, gru_params, True, 1, 0.0, False, True, True)
+    expected = ops.gru.input(
+        xb, hx, gru_params, True, 1, 0.0, False, True, True)
+    for g, e in zip(got, expected):
+        assert tp.allclose(g, e, rtol=1e-4, atol=1e-5)
+
+    # Two layers: the second layer's input width is the first layer's hidden
+    # width, not the raw feature count.
+    x = _t(5, 3, 4)
+    lstm_params = [_t(8, 4), _t(8, 2), _unit(8), _unit(8),
+                   _t(8, 2), _t(8, 2), _unit(8), _unit(8)]
+    got = decomposition_table[ops.lstm.input](
+        x, [hx, hc], lstm_params, True, 2, 0.0, False, False, False)
+    expected = ops.lstm.input(
+        x, [hx, hc], lstm_params, True, 2, 0.0, False, False, False)
+    for g, e in zip(got, expected):
+        assert tp.allclose(g, e, rtol=1e-4, atol=1e-5)
 
 
 def test_fused_rms_norm_against_formula_and_autograd():
