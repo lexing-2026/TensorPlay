@@ -88,6 +88,20 @@ inline int scan_log_num_threads_x(int64_t num_rows, int64_t row_size) {
 }
 
 
+inline int cummax_max_grid_x() {
+    static thread_local int cached = -1;
+    static thread_local int device = -1;
+    const int current = currentDevice();
+    if (device != current) {
+        cudaDeviceProp props;
+        CUDA_CHECK(cudaGetDeviceProperties(&props, current));
+        cached = props.maxGridSize[0];
+        device = current;
+    }
+    return cached;
+}
+
+
 template <typename T, bool kIsMax>
 __global__ void cummaxmin_innermost_scan_kernel(
     int64_t num_rows, int64_t row_size, const T* in, T* vals, int64_t* idxs,
@@ -179,7 +193,7 @@ void launch_cummaxmin_innermost(const Tensor& input, Tensor& values, Tensor& ind
     const dim3 block(static_cast<unsigned>(num_threads_x),
                      static_cast<unsigned>(num_threads_y));
     const dim3 grid(static_cast<unsigned>(std::min<int64_t>(
-        (num_rows + num_threads_y - 1) / num_threads_y, 65535)));
+        (num_rows + num_threads_y - 1) / num_threads_y, cummax_max_grid_x())));
     const size_t shared_bytes = 2 * 512 * (sizeof(T) + sizeof(int64_t));
     cummaxmin_innermost_scan_kernel<T, kIsMax><<<grid, block, shared_bytes, stream>>>(
         num_rows, row_size, input.data_ptr<T>(), values.data_ptr<T>(),
