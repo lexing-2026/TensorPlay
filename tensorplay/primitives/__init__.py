@@ -21,9 +21,9 @@ from functools import partial, reduce
 from typing import Any, Optional, Union
 
 import tensorplay
+import tensorplay.functional as _tp_functional
 from tensorplay import library as _prims_library
 from tensorplay import special as _tp_special
-from tensorplay import fft as _tp_fft
 
 from . import common as utils
 from .common import (
@@ -2241,10 +2241,7 @@ def _fft_r2c_tp(
     onesided: bool,
 ) -> TensorLikeType:
     dim = utils.canonicalize_dims(input.ndim, dim)
-    last_dim = dim[-1]
-    if onesided:
-        return _tp_fft.rfft(input, dim=last_dim)
-    return _tp_fft.fft(input, dim=last_dim)
+    return _tp_functional._fft_r2c(input, list(dim), 0, onesided)
 
 
 _fft_r2c_doc = """
@@ -2276,10 +2273,7 @@ def _fft_c2c_meta(
 
 def _fft_c2c_tp(input, *, dim, forward):
     dim = utils.canonicalize_dims(input.ndim, dim)
-    last_dim = dim[-1]
-    if forward:
-        return _tp_fft.fft(input, dim=last_dim)
-    return _tp_fft.ifft(input, dim=last_dim)
+    return _tp_functional._fft_c2c(input, list(dim), 0, forward)
 
 
 fft_c2c = _make_prim(
@@ -2308,8 +2302,7 @@ def _fft_c2r_meta(
 
 def _fft_c2r_tp(input, *, dim, last_dim_size):
     dim = utils.canonicalize_dims(input.ndim, dim)
-    last_dim = dim[-1]
-    return _tp_fft.irfft(input, n=last_dim_size, dim=last_dim)
+    return _tp_functional._fft_c2r(input, list(dim), 0, last_dim_size)
 
 
 _fft_c2r_doc = "Performs a complex to real Inverse Fast Fourier Transform"
