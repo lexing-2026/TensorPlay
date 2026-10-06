@@ -522,6 +522,9 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
         for (const auto& hook : func->tensor_pre_hooks()) {
             vars = hook(std::move(vars));
         }
+        for (const auto& entry : func->retains_grad_hooks()) {
+            vars = entry.second(std::move(vars));
+        }
         for (const auto& hook : func->pre_hooks()) {
             vars = hook(std::move(vars));
         }

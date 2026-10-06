@@ -39,14 +39,22 @@ inline void set_grad(const Tensor& t, const Tensor& grad) {
     if (auto* meta = get_or_create_autograd_meta(t)) meta->set_grad(grad);
 }
 
-inline void retain_grad(const Tensor& t) {
-    if (auto* meta = get_or_create_autograd_meta(t)) meta->set_retains_grad(true);
-}
+// Keeps the gradient a non-leaf receives in its .grad (a leaf keeps it
+// already); refuses a tensor that does not require grad.
+TENSORPLAY_API void retain_grad(const Tensor& t);
+
+// After the node producing `t` changed (an in-place step, a view's node
+// rebuilt), moves the hook keeping its retained gradient from `previous`
+// (slot `previous_nr`) onto the current node.
+TENSORPLAY_API void move_retains_grad_hook(const Tensor& t, const std::shared_ptr<Node>& previous,
+                                           uint32_t previous_nr);
 
 TENSORPLAY_API std::shared_ptr<Node> grad_fn(const Tensor& t);
 
 inline void set_grad_fn(const Tensor& t, std::shared_ptr<Node> grad_fn, uint32_t output_nr = 0) {
     if (auto* meta = get_or_create_autograd_meta(t)) {
+        std::shared_ptr<Node> previous = meta->retains_grad() ? meta->grad_fn() : nullptr;
+        const uint32_t previous_nr = meta->output_nr();
         meta->set_grad_fn(std::move(grad_fn));
         meta->set_output_nr(output_nr);
         // A view handed a node of its own keeps it until the storage it
@@ -54,6 +62,7 @@ inline void set_grad_fn(const Tensor& t, std::shared_ptr<Node> grad_fn, uint32_t
         if (meta->has_view_info()) {
             meta->set_attr_version(t.unsafeGetTensorImpl()->version());
         }
+        if (meta->retains_grad()) move_retains_grad_hook(t, previous, previous_nr);
     }
 }
 
@@ -150,7 +159,10 @@ TENSORPLAY_API Tensor to(const Tensor& self, Device device, DType dtype, bool no
 TENSORPLAY_API Tensor record_conversion(const Tensor& self, Tensor result);
 
 TENSORPLAY_API void backward(const Tensor& tensor, const Tensor& gradient = {}, bool retain_graph = false, bool create_graph = false);
-TENSORPLAY_API void backward(const std::vector<Tensor>& tensors, const std::vector<Tensor>& gradients = {}, bool retain_graph = false, bool create_graph = false);
+// With `inputs`, only those tensors accumulate gradient -- into .grad, a
+// non-leaf among them as if it retained its gradient -- and only the part
+// of the graph leading to them runs.
+TENSORPLAY_API void backward(const std::vector<Tensor>& tensors, const std::vector<Tensor>& gradients = {}, bool retain_graph = false, bool create_graph = false, const std::vector<Tensor>& inputs = {});
 
 // Computes and returns the sum of gradients of outputs w.r.t. the inputs.
 // If allow_unused is False, specifying inputs that were not used to compute outputs will raise an error.

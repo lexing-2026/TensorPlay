@@ -1519,6 +1519,16 @@ void init_autograd(py::module_& m) {
                 return hook(std::move(grads));
             });
         }, py::arg("hook"))
+        .def("_add_tensor_pre_hook", [](tensorplay::tpx::Node& self,
+                                        std::function<std::vector<tensorplay::tpx::Tensor>(
+                                            std::vector<tensorplay::tpx::Tensor>)> hook) {
+            // A hook a tensor registers on the gradient its node receives;
+            // it runs before the retained-gradient hooks and the node's own.
+            self.add_tensor_pre_hook([hook](std::vector<tensorplay::tpx::Tensor>&& grads) {
+                py::gil_scoped_acquire gil;
+                return hook(std::move(grads));
+            });
+        }, py::arg("hook"))
         .def("add_post_hook", [](tensorplay::tpx::Node& self,
                                  std::function<std::vector<tensorplay::tpx::Tensor>(
                                      const std::vector<tensorplay::tpx::Tensor>&,
@@ -2304,16 +2314,18 @@ void init_autograd(py::module_& m) {
             return true;
         });
 
-    autograd.def("backward", [](const std::vector<Tensor>& tensors, std::optional<std::vector<Tensor>> grad_tensors, std::optional<bool> retain_graph, bool create_graph) {
+    autograd.def("backward", [](const std::vector<Tensor>& tensors, std::optional<std::vector<Tensor>> grad_tensors, std::optional<bool> retain_graph, bool create_graph, std::optional<std::vector<Tensor>> inputs) {
         bool keep_graph = retain_graph.value_or(create_graph);
         std::vector<Tensor> grads;
         if (grad_tensors) grads = *grad_tensors;
+        std::vector<Tensor> only;
+        if (inputs) only = *inputs;
         // The engine may evaluate nodes on worker threads that need the GIL
         // for Python-backed autograd functions; the initiating thread must
         // not hold it while it waits for the graph to drain.
         py::gil_scoped_release release;
-        tensorplay::tpx::backward(tensors, grads, keep_graph, create_graph);
-    }, "tensors"_a, "grad_tensors"_a = py::none(), "retain_graph"_a = py::none(), "create_graph"_a = false);
+        tensorplay::tpx::backward(tensors, grads, keep_graph, create_graph, only);
+    }, "tensors"_a, "grad_tensors"_a = py::none(), "retain_graph"_a = py::none(), "create_graph"_a = false, "inputs"_a = py::none());
 
     autograd.def("queue_callback", [](py::function callback) {
         PyObject* raw_callback = callback.ptr();

@@ -1,6 +1,7 @@
 #pragma once
 #include <vector>
 #include <memory>
+#include <unordered_map>
 #include <cstdint>
 #include <functional>
 #include <typeinfo>
@@ -161,6 +162,11 @@ public:
         tensor_pre_hooks().push_back(std::move(hook));
     }
     const std::vector<PreHookFn>& pre_hooks() const { return pre_hooks_; }
+    // One hook per output slot whose tensor retains its gradient
+    // (retain_grad); the engine runs them after the tensor hooks, so the
+    // retained gradient is the one those hooks hand on, and before the
+    // node's own pre-hooks.
+    std::unordered_map<uint32_t, PreHookFn>& retains_grad_hooks() { return retains_grad_hooks_; }
     const std::vector<PostHookFn>& post_hooks() const { return post_hooks_; }
 
     // Debug metadata for anomaly mode, created lazily on first access.
@@ -204,6 +210,7 @@ protected:
 private:
     std::vector<PreHookFn> tensor_pre_hooks_;
     std::vector<PreHookFn> pre_hooks_;
+    std::unordered_map<uint32_t, PreHookFn> retains_grad_hooks_;
     std::vector<PostHookFn> post_hooks_;
     std::unique_ptr<AnomalyMetadata> anomaly_metadata_ = nullptr;
 };

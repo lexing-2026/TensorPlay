@@ -2433,18 +2433,28 @@ void init_tensor(py::module_& m) {
         }, "stream"_a)
 #endif
         .def("retain_grad", [](Tensor& self) { tensorplay::tpx::impl::retain_grad(self); })
-        .def("backward", [](Tensor& self, std::optional<Tensor> gradient, std::optional<bool> retain_graph, bool create_graph) {
+        .def("backward", [](Tensor& self, std::optional<Tensor> gradient, std::optional<bool> retain_graph, bool create_graph, py::object inputs) {
              bool keep_graph = retain_graph.value_or(create_graph);
+             // `inputs` is one tensor or a sequence of them.
+             std::vector<Tensor> only;
+             if (!inputs.is_none()) {
+                 if (py::isinstance<Tensor>(inputs)) {
+                     only.push_back(py::cast<Tensor>(inputs));
+                 } else {
+                     only = py::cast<std::vector<Tensor>>(inputs);
+                 }
+                 if (only.empty()) {
+                     TP_THROW(RuntimeError, "`inputs` argument to `backward()` cannot be empty.");
+                 }
+             }
+             std::vector<Tensor> grads;
+             if (gradient) grads.push_back(*gradient);
              // The engine may run Python-backed nodes on worker threads that
              // need the GIL; the initiating thread must not hold it while it
              // waits for the graph to drain.
              py::gil_scoped_release release;
-             if (gradient) {
-                 tensorplay::tpx::backward(self, *gradient, keep_graph, create_graph);
-             } else {
-                 tensorplay::tpx::backward(self, Tensor(), keep_graph, create_graph);
-             }
-        }, "gradient"_a = py::none(), "retain_graph"_a = py::none(), "create_graph"_a = false)
+             tensorplay::tpx::backward({self}, grads, keep_graph, create_graph, only);
+        }, "gradient"_a = py::none(), "retain_graph"_a = py::none(), "create_graph"_a = false, "inputs"_a = py::none())
         .def("detach", static_cast<Tensor (Tensor::*)() const>(&Tensor::detach))
         .def("_is_view", [](const Tensor& self) {
             return self.defined() && self.unsafeGetTensorImpl()->is_view();

@@ -155,7 +155,9 @@ def register_hook(self, hook):
         # consults every time it runs.
         self._add_tensor_pre_hook(pre_hook)
     else:
-        self.grad_fn.add_pre_hook(pre_hook)
+        # A tensor hook on its node runs before the node keeps a retained
+        # gradient, so .grad holds what the hooks hand on.
+        self.grad_fn._add_tensor_pre_hook(pre_hook)
 
     handle = RemovableHandle(hooks_dict)
     hooks_dict[handle.id] = hook

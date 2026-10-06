@@ -79,9 +79,57 @@ std::shared_ptr<Node> grad_fn(const Tensor& t) {
         refreshed->set_view_fn(true);
         refreshed->add_next_edge_list(collect_next_edges(base));
     }
+    std::shared_ptr<Node> previous = meta->retains_grad() ? meta->grad_fn() : nullptr;
     meta->set_grad_fn(std::move(refreshed));
     meta->set_attr_version(current_version);
+    if (meta->retains_grad()) move_retains_grad_hook(t, previous, meta->output_nr());
     return meta->grad_fn();
+}
+
+namespace {
+// Adds each gradient a node receives for `output_nr` into the .grad of the
+// tensor it produced.  The tensor is held weakly -- the node is reachable
+// from it -- and the gradient is handed on unchanged.  The first gradient is
+// copied, so a later in-place step of the backward cannot change it.
+Node::PreHookFn retains_grad_hook(const Tensor& t, uint32_t output_nr) {
+    weak_intrusive_ptr<TensorImpl> weak(t.unsafeGetTensorImpl());
+    return [weak, output_nr](variable_list&& grads) -> variable_list {
+        if (output_nr >= grads.size() || !grads[output_nr].defined()) return std::move(grads);
+        intrusive_ptr<TensorImpl> owner = weak.lock();
+        if (!owner) return std::move(grads);
+        const Tensor self(std::move(owner));
+        auto* meta = get_autograd_meta(self);
+        if (meta == nullptr) return std::move(grads);
+        const Tensor& incoming = grads[output_nr];
+        const Tensor current = meta->grad();
+        meta->set_grad(current.defined() ? ops::add(current, incoming) : ops::clone(incoming));
+        return std::move(grads);
+    };
+}
+} // namespace
+
+void retain_grad(const Tensor& t) {
+    if (!t.requires_grad()) {
+        TP_THROW(RuntimeError, "can't retain_grad on Tensor that has requires_grad=False");
+    }
+    std::shared_ptr<Node> fn = grad_fn(t);
+    if (!fn) return;
+    auto* meta = get_or_create_autograd_meta(t);
+    if (meta == nullptr || meta->retains_grad()) return;
+    const uint32_t nr = output_nr(t);
+    fn->retains_grad_hooks()[nr] = retains_grad_hook(t, nr);
+    meta->set_retains_grad(true);
+}
+
+void move_retains_grad_hook(const Tensor& t, const std::shared_ptr<Node>& previous,
+                            uint32_t previous_nr) {
+    auto* meta = get_autograd_meta(t);
+    if (meta == nullptr || !meta->retains_grad()) return;
+    const std::shared_ptr<Node> current = meta->grad_fn();
+    const uint32_t nr = meta->output_nr();
+    if (current == previous && nr == previous_nr) return;
+    if (previous) previous->retains_grad_hooks().erase(previous_nr);
+    if (current) current->retains_grad_hooks()[nr] = retains_grad_hook(t, nr);
 }
 
 void set_requires_grad(const Tensor& t, bool requires_grad) {
@@ -468,15 +516,16 @@ bool is_view_of_leaf(const Tensor& t) {
 }
 } // namespace impl
 
-void backward(const std::vector<Tensor>& tensors, const std::vector<Tensor>& gradients, bool retain_graph, bool create_graph) {
+void backward(const std::vector<Tensor>& tensors, const std::vector<Tensor>& gradients, bool retain_graph, bool create_graph,
+              const std::vector<Tensor>& inputs) {
     if (!gradients.empty() && tensors.size() != gradients.size()) {
         TP_THROW(RuntimeError, "Mismatch in tensors and gradients size");
     }
 
     std::vector<Edge> roots;
-    std::vector<Tensor> inputs;
+    std::vector<Tensor> root_grads;
     roots.reserve(tensors.size());
-    inputs.reserve(tensors.size());
+    root_grads.reserve(tensors.size());
 
     for (size_t i = 0; i < tensors.size(); ++i) {
         const auto& tensor = tensors[i];
@@ -498,7 +547,7 @@ void backward(const std::vector<Tensor>& tensors, const std::vector<Tensor>& gra
             // kernels on the current stream as soon as the root is consumed.
             grad = Tensor::ones_like(tensor);
         }
-        inputs.push_back(grad);
+        root_grads.push_back(grad);
 
         // Prepare root
         if (auto fn = impl::grad_fn(tensor)) {
@@ -517,8 +566,32 @@ void backward(const std::vector<Tensor>& tensors, const std::vector<Tensor>& gra
         }
     }
 
-    Engine::get_default_engine().execute(roots, inputs, retain_graph, create_graph,
-                                         /*accumulate_grad=*/true, /*outputs=*/{});
+    // Named inputs restrict the pass to the graph leading to them; the
+    // engine runs their nodes, so a leaf's accumulator fills its .grad and a
+    // non-leaf's node hands its gradient to the retained-gradient hook.
+    std::vector<Edge> output_edges;
+    output_edges.reserve(inputs.size());
+    for (const auto& input : inputs) {
+        if (!input.requires_grad()) {
+            TP_THROW(RuntimeError, "One of the differentiated Tensors does not require grad");
+        }
+        if (auto fn = impl::grad_fn(input)) {
+            impl::retain_grad(input);
+            output_edges.emplace_back(fn, impl::output_nr(input));
+        } else if (auto* meta = impl::get_autograd_meta(input)) {
+            std::shared_ptr<Node> acc = meta->grad_accumulator();
+            if (!acc) {
+                acc = std::make_shared<AccumulateGrad>(input);
+                meta->set_grad_accumulator(acc);
+            }
+            output_edges.emplace_back(std::move(acc), 0);
+        } else {
+            TP_THROW(RuntimeError, "Could not determine gradient edge for input");
+        }
+    }
+
+    Engine::get_default_engine().execute(roots, root_grads, retain_graph, create_graph,
+                                         /*accumulate_grad=*/true, output_edges);
 }
 
 std::vector<Tensor> grad(

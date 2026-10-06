@@ -7,7 +7,8 @@ As of now, we only support autograd for floating point :class:`Tensor` types (
 half, float, double and bfloat16) and complex :class:`Tensor` types (cfloat, cdouble).
 """
 
-from collections.abc import Sequence
+import warnings
+from collections.abc import Mapping, Sequence
 from typing import Optional, Union
 
 import tensorplay
@@ -76,7 +77,7 @@ def _as_tuple(value, length=None):
     return tuple(value)
 
 
-def _make_grads(outputs, grads):
+def _make_grads(outputs, grads, is_grads_batched=False):
     if len(outputs) != len(grads):
         raise RuntimeError(
             "The number of grad_outputs must match the number of outputs"
@@ -102,7 +103,21 @@ def _make_grads(outputs, grads):
                 "gradients can be either Tensors or None, but got "
                 + type(grad_output).__name__
             )
-        if tuple(grad_output.shape) != tuple(output.shape):
+        grad_shape = tuple(grad_output.shape)
+        if is_grads_batched:
+            grad_shape = grad_shape[1:]
+        if grad_shape != tuple(output.shape):
+            if is_grads_batched:
+                raise RuntimeError(
+                    "If `is_grads_batched=True`, we interpret the first "
+                    "dimension of each grad_output as the batch dimension. "
+                    "The sizes of the remaining dimensions are expected to match "
+                    f"the shape of corresponding output, but a mismatch was "
+                    f"detected: grad_output[{index}] has a shape of "
+                    f"{grad_shape} and output[{index}] has a shape of "
+                    f"{tuple(output.shape)}. If you only want some tensors in "
+                    "`grad_output` to be considered batched, consider using vmap."
+                )
             raise RuntimeError(
                 f"Mismatch in shape: grad_output[{index}] has a shape of "
                 f"{grad_output.shape} and output[{index}] has a shape of "
@@ -117,18 +132,78 @@ def _make_grads(outputs, grads):
     return tuple(result)
 
 
+def _inputs_tuple(inputs, caller):
+    """The tensors named by ``inputs``: one tensor, a sequence, or a dict's values."""
+    if isinstance(inputs, tensorplay.Tensor):
+        return (inputs,)
+    if type(inputs) is dict:
+        return tuple(inputs.values())
+    if isinstance(inputs, Mapping):
+        raise TypeError(
+            f"`inputs` argument to `{caller}()` must be a dict, not "
+            f"{type(inputs).__name__}. Other Mapping types are not supported."
+        )
+    return tuple(inputs)
+
+
 def backward(
     tensors: _TensorOrTensorsOrGradEdge,
     grad_tensors: Optional[_TensorOrTensors] = None,
     retain_graph: Optional[bool] = None,
     create_graph: bool = False,
+    grad_variables: Optional[_TensorOrTensors] = None,
+    inputs: Optional[_TensorOrTensorsOrGradEdge] = None,
 ) -> None:
+    r"""Compute the sum of gradients of given tensors with respect to graph leaves.
+
+    The gradients are accumulated in the leaves' ``.grad``.  If any of
+    ``tensors`` is non-scalar and requires gradient, ``grad_tensors`` gives
+    the "vector" of the vector-Jacobian product for each of them (``None``
+    for scalars and tensors that do not need one).
+
+    Args:
+        tensors (Sequence[Tensor] or Tensor): Tensors whose derivative is computed.
+        grad_tensors (Sequence[Tensor or None] or Tensor, optional): The
+            "vector" in the vector-Jacobian product, usually gradients w.r.t.
+            each element of corresponding tensors.
+        retain_graph (bool, optional): If ``False``, the graph used to compute
+            the grad will be freed. Defaults to the value of ``create_graph``.
+        create_graph (bool, optional): If ``True``, the graph of the derivative
+            is constructed, allowing higher order derivative products.
+        grad_variables (Sequence[Tensor or None] or Tensor, optional): Deprecated
+            spelling of ``grad_tensors``.
+        inputs (Sequence[Tensor] or Tensor or dict, optional): Tensors w.r.t.
+            which the gradient will be accumulated into ``.grad``.  All other
+            tensors are ignored, and only the part of the graph that leads to
+            these runs.  A non-leaf named here keeps its gradient as if it
+            had called :meth:`~tensorplay.Tensor.retain_grad`.  A dict (e.g.
+            ``dict(model.named_parameters())``) names its values.
+    """
+    if grad_variables is not None:
+        warnings.warn(
+            "`grad_variables` is deprecated. Use `grad_tensors` instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        if grad_tensors is None:
+            grad_tensors = grad_variables
+        else:
+            raise RuntimeError(
+                "`grad_tensors` and `grad_variables` (deprecated) "
+                "arguments both passed to `backward()`. Please only "
+                "use `grad_tensors`."
+            )
+    inputs_tuple = None
+    if inputs is not None:
+        inputs_tuple = _inputs_tuple(inputs, "backward")
+        if len(inputs_tuple) == 0:
+            raise RuntimeError("`inputs` argument to `backward()` cannot be empty.")
     outputs = _as_tuple(tensors)
     grad_tuple = _as_tuple(grad_tensors, len(outputs))
     grad_tuple = _make_grads(outputs, grad_tuple)
     if retain_graph is None:
         retain_graph = create_graph
-    _backward(outputs, grad_tuple, retain_graph, create_graph)
+    _backward(outputs, grad_tuple, retain_graph, create_graph, inputs_tuple)
 
 
 def grad(
@@ -137,8 +212,11 @@ def grad(
     grad_outputs: Optional[_TensorOrTensors] = None,
     retain_graph: Optional[bool] = None,
     create_graph: bool = False,
+    only_inputs: bool = True,
     allow_unused: Optional[bool] = None,
-) -> tuple[Optional[tensorplay.Tensor], ...]:
+    is_grads_batched: bool = False,
+    materialize_grads: bool = False,
+):
     r"""Compute and return the sum of gradients of outputs with respect to the inputs.
 
     ``grad_outputs`` should be a sequence of length matching ``output``
@@ -167,23 +245,77 @@ def grad(
         create_graph (bool, optional): If ``True``, graph of the derivative will
             be constructed, allowing to compute higher order derivative products.
             Default: ``False``.
+        only_inputs (bool, optional): Deprecated and ignored; gradients are
+            only ever returned for ``inputs``.
         allow_unused (Optional[bool], optional): If ``False``, specifying inputs
             that were not used when computing outputs (and therefore their grad is
             always zero) is an error. Defaults to the value of ``materialize_grads``.
+        is_grads_batched (bool, optional): If ``True``, the first dimension of
+            each tensor in ``grad_outputs`` is a batch dimension: one
+            vector-Jacobian product is computed per entry, in a single
+            :func:`tensorplay.vmap` over the backward pass.  Default: ``False``.
+        materialize_grads (bool, optional): If ``True``, the gradient of an
+            unused input is returned as zeros instead of ``None``.  Default:
+            ``False``.
 
+    Returns a tuple with one gradient per input, or a dict keyed like
+    ``inputs`` when ``inputs`` is a dict.
     """
+    if materialize_grads and allow_unused is False:
+        raise ValueError(
+            "Expected allow_unused to be True or not passed when materialize_grads=True, "
+            "but got: allow_unused=False."
+        )
+    if allow_unused is None:
+        allow_unused = materialize_grads
+    if not only_inputs:
+        warnings.warn(
+            "only_inputs argument is deprecated and is ignored now "
+            "(defaults to True). To accumulate gradient for other "
+            "parts of the graph, please use tensorplay.autograd.backward.",
+            FutureWarning,
+            stacklevel=2,
+        )
+    named = inputs if type(inputs) is dict else None
     outputs = _as_tuple(outputs)
-    inputs = _as_tuple(inputs)
+    inputs_tuple = _inputs_tuple(inputs, "grad")
+    if len(inputs_tuple) == 0:
+        raise RuntimeError("grad requires non-empty inputs.")
 
     if retain_graph is None:
         retain_graph = create_graph
-    if allow_unused is None:
-        allow_unused = False
 
     grad_outputs = _make_grads(
-        outputs, _as_tuple(grad_outputs, len(outputs))
+        outputs, _as_tuple(grad_outputs, len(outputs)), is_grads_batched
     )
-    return _grad(outputs, inputs, grad_outputs, retain_graph, create_graph, allow_unused)
+    if is_grads_batched:
+        # One vector-Jacobian product per entry of the batch dimension.  An
+        # unused input has no gradient in any of them; vmap cannot return
+        # None, so its slot is filled while batching and emptied after.
+        unused: set[int] = set()
+
+        def vjp(*batch):
+            got = _grad(outputs, inputs_tuple, batch, retain_graph, create_graph, allow_unused)
+            filled = []
+            for index, (g, inp) in enumerate(zip(got, inputs_tuple)):
+                if g is None:
+                    unused.add(index)
+                    g = tensorplay.zeros_like(inp)
+                filled.append(g)
+            return tuple(filled)
+
+        result = tensorplay.vmap(vjp)(*grad_outputs)
+        result = tuple(None if i in unused else r for i, r in enumerate(result))
+    else:
+        result = _grad(outputs, inputs_tuple, grad_outputs, retain_graph, create_graph, allow_unused)
+    if materialize_grads:
+        result = tuple(
+            r if r is not None else tensorplay.zeros_like(inp, requires_grad=create_graph)
+            for r, inp in zip(result, inputs_tuple)
+        )
+    if named is not None:
+        return dict(zip(named.keys(), result))
+    return result
 
 
 from .anomaly_mode import detect_anomaly, set_detect_anomaly  # noqa: E402
