@@ -711,12 +711,19 @@ MANUAL_DERIVATIVES: dict[str, dict] = {
     "deform_conv2d_backward": {"saved": [], "node": "DeformConv2dBackwardBackward"},
     "_scaled_dot_product_flash_attention_for_cpu_backward": {
         "saved": [], "node": "ScaledDotProductFlashAttentionForCpuBackwardBackward"},
-    "_scaled_dot_product_attention_backward_with_lse": {
-        "saved": [], "node": "ScaledDotProductAttentionBackwardWithLseBackward"},
     "_flash_attention_backward": {"saved": [], "node": "FlashAttentionBackwardBackward"},
     "_efficient_attention_backward": {"saved": [], "node": "EfficientAttentionBackwardBackward"},
+    # The attention backwards differentiate again at dropout_p == 0
+    # (SdpaBackward.h), recomposed from the operands with recordable
+    # primitives.
     "scaled_dot_product_attention_backward": {
-        "saved": [], "node": "ScaledDotProductAttentionBackwardBackward"},
+        "saved": ["grad_output", "query", "key", "value", "attn_mask",
+                  "dropout_p", "is_causal", "scale", "enable_gqa"],
+        "node": "ScaledDotProductAttentionBackwardBackward"},
+    "_scaled_dot_product_attention_backward_with_lse": {
+        "saved": ["grad_output", "query", "key", "value", "output", "logsumexp",
+                  "is_causal", "impl"],
+        "node": "ScaledDotProductAttentionBackwardWithLseBackward"},
     "linalg_lu": {"saved": ["pivot"], "saved_outputs": ["P", "L", "U"],
                   "output_differentiability": [False, True, True]},
     "lu_unpack": {"saved": ["LU_data"],

@@ -1,6 +1,7 @@
 #pragma once
 // Second derivatives through the spectral, integration, scatter/index
-// reduction and covariance backward kernels.
+// reduction and covariance backward kernels.  The scaled-dot-product
+// attention backwards differentiate in SdpaBackward.h.
 //
 // Under create_graph the first backward pass runs these kernels on tensors
 // that belong to a graph.  The formulas next to the kernels' schemas in
@@ -56,13 +57,9 @@ private:
 TPX_UNDIFFERENTIATED_KERNEL_NODE(DeformConv2dBackwardBackward, 5, "deform_conv2d_backward")
 TPX_UNDIFFERENTIATED_KERNEL_NODE(ScaledDotProductFlashAttentionForCpuBackwardBackward, 3,
                                  "_scaled_dot_product_flash_attention_for_cpu_backward")
-TPX_UNDIFFERENTIATED_KERNEL_NODE(ScaledDotProductAttentionBackwardWithLseBackward, 3,
-                                 "_scaled_dot_product_attention_backward_with_lse")
 TPX_UNDIFFERENTIATED_KERNEL_NODE(FlashAttentionBackwardBackward, 3, "_flash_attention_backward")
 TPX_UNDIFFERENTIATED_KERNEL_NODE(EfficientAttentionBackwardBackward, 4,
                                  "_efficient_attention_backward")
-TPX_UNDIFFERENTIATED_KERNEL_NODE(ScaledDotProductAttentionBackwardBackward, 3,
-                                 "scaled_dot_product_attention_backward")
 
 #undef TPX_UNDIFFERENTIATED_KERNEL_NODE
 
