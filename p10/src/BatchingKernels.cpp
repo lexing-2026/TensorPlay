@@ -151,14 +151,22 @@ std::pair<Tensor, Tensor> broadcast_values(const Operand& left,
     return {std::move(left_value), std::move(right_value)};
 }
 
+// The key the step below a batch rule dispatches at.  An op that records
+// nothing (sign, the fills, the composites) has no autograd kernel: its own
+// wrapper goes straight to the backend, and so does the step here.
+DispatchKey next_key(const OperatorHandle& handle, DispatchKey key) {
+    return is_autograd_key(key) && !handle.getKernel(key) ? toBackendKey(key) : key;
+}
+
 template <typename Return, typename... Args>
 Return call_next(const char* op, const Tensor& device_source, Args... args) {
     DispatchKey dispatch_key = dispatchKeyForTensorArgs(args...);
     if (dispatch_key == DispatchKey::EndOfKeys) {
         dispatch_key = computeDispatchKey(device_source.device());
     }
+    const OperatorHandle handle = Dispatcher::singleton().findHandle(op);
     return DispatchStub<Return, Args...>::call(
-        std::string(op), dispatch_key,
+        handle, next_key(handle, dispatch_key),
         std::forward<Args>(args)...);
 }
 
@@ -1141,6 +1149,154 @@ TP_BATCH_UNARY(batch_erfc, "erfc")
 TP_BATCH_UNARY(batch_log1p, "log1p")
 TP_BATCH_UNARY(batch_expm1, "expm1")
 TP_BATCH_UNARY(batch_bitwise_not, "bitwise_not")
+// The conjugations, signs and reciprocals the backward formulas read.
+TP_BATCH_UNARY(batch_conj, "conj")
+TP_BATCH_UNARY(batch_resolve_conj, "resolve_conj")
+TP_BATCH_UNARY(batch_conj_physical, "conj_physical")
+TP_BATCH_UNARY(batch_conj_view, "_conj")
+TP_BATCH_UNARY(batch_sgn, "sgn")
+TP_BATCH_UNARY(batch_sign, "sign")
+TP_BATCH_UNARY(batch_reciprocal, "reciprocal")
+TP_BATCH_UNARY(batch_square, "square")
+
+TP_BATCH_UNARY(batch_real, "real")
+TP_BATCH_UNARY(batch_imag, "imag")
+TP_BATCH_UNARY(batch_angle, "angle")
+TP_BATCH_UNARY(batch_alias, "alias")
+TP_BATCH_UNARY(batch_detach, "detach")
+// view_as_real appends the (real, imaginary) dimension after the others.
+TP_BATCH_UNARY(batch_view_as_real, "view_as_real")
+TP_BATCH_UNARY(batch_acos, "acos")
+TP_BATCH_UNARY(batch_acosh, "acosh")
+TP_BATCH_UNARY(batch_asin, "asin")
+TP_BATCH_UNARY(batch_asinh, "asinh")
+TP_BATCH_UNARY(batch_atan, "atan")
+TP_BATCH_UNARY(batch_atanh, "atanh")
+TP_BATCH_UNARY(batch_tan, "tan")
+TP_BATCH_UNARY(batch_deg2rad, "deg2rad")
+TP_BATCH_UNARY(batch_rad2deg, "rad2deg")
+TP_BATCH_UNARY(batch_digamma, "digamma")
+TP_BATCH_UNARY(batch_lgamma, "lgamma")
+TP_BATCH_UNARY(batch_erfinv, "erfinv")
+TP_BATCH_UNARY(batch_exp2, "exp2")
+TP_BATCH_UNARY(batch_log2, "log2")
+TP_BATCH_UNARY(batch_log10, "log10")
+TP_BATCH_UNARY(batch_frac, "frac")
+TP_BATCH_UNARY(batch_sinc, "sinc")
+TP_BATCH_UNARY(batch_i0, "i0")
+TP_BATCH_UNARY(batch_isinf, "isinf")
+TP_BATCH_UNARY(batch_isnan, "isnan")
+TP_BATCH_UNARY(batch_isneginf, "isneginf")
+TP_BATCH_UNARY(batch_isposinf, "isposinf")
+TP_BATCH_UNARY(batch_signbit, "signbit")
+TP_BATCH_UNARY(batch_hardsigmoid, "hardsigmoid")
+TP_BATCH_UNARY(batch_hardswish, "hardswish")
+TP_BATCH_UNARY(batch_mish, "mish")
+TP_BATCH_UNARY(batch_silu, "silu")
+TP_BATCH_UNARY(batch_special_entr, "special_entr")
+TP_BATCH_UNARY(batch_special_erfcx, "special_erfcx")
+TP_BATCH_UNARY(batch_special_i0e, "special_i0e")
+TP_BATCH_UNARY(batch_special_i1, "special_i1")
+TP_BATCH_UNARY(batch_special_i1e, "special_i1e")
+TP_BATCH_UNARY(batch_special_ndtri, "special_ndtri")
+
+// view_as_complex folds the last dimension, so the batch's goes first.
+Tensor batch_view_as_complex(const Tensor& input) {
+    Operand operand = unwrap_operand(input);
+    TP_CHECK(operand.bdim.has_value(), "unary batch rule received an unbatched operand");
+    TP_CHECK(operand.value.dim() > 1, "Input tensor must have one or more dimensions");
+    Tensor value = move_to_front(operand.value, *operand.bdim);
+    Tensor result = call_next<Tensor, const Tensor&>("view_as_complex", value, value);
+    return make_batched(result, 0, operand.level);
+}
+
+// A pointwise op whose other arguments are not tensors keeps its operand's
+// batch dimension and hands those arguments on unchanged.
+template <typename... Extra>
+Tensor unary_with(const char* op, const Tensor& input, Extra... extra) {
+    return unary_impl(input, [&](const Tensor& value) {
+        return call_next<Tensor, const Tensor&, Extra...>(op, value, value, extra...);
+    });
+}
+
+Tensor batch_celu(const Tensor& input, const Scalar& alpha) {
+    return unary_with<const Scalar&>("celu", input, alpha);
+}
+
+Tensor batch_elu(const Tensor& input, const Scalar& alpha, const Scalar& scale,
+                 const Scalar& input_scale) {
+    return unary_with<const Scalar&, const Scalar&, const Scalar&>(
+        "elu", input, alpha, scale, input_scale);
+}
+
+Tensor batch_gelu(const Tensor& input, const std::string& approximate) {
+    return unary_with<const std::string&>("gelu", input, approximate);
+}
+
+Tensor batch_hardshrink(const Tensor& input, const Scalar& lambd) {
+    return unary_with<const Scalar&>("hardshrink", input, lambd);
+}
+
+Tensor batch_softshrink(const Tensor& input, const Scalar& lambd) {
+    return unary_with<const Scalar&>("softshrink", input, lambd);
+}
+
+Tensor batch_hardtanh(const Tensor& input, const Scalar& min_val, const Scalar& max_val) {
+    return unary_with<const Scalar&, const Scalar&>("hardtanh", input, min_val, max_val);
+}
+
+Tensor batch_leaky_relu(const Tensor& input, const Scalar& negative_slope) {
+    return unary_with<const Scalar&>("leaky_relu", input, negative_slope);
+}
+
+Tensor batch_softplus(const Tensor& input, const Scalar& beta, const Scalar& threshold) {
+    return unary_with<const Scalar&, const Scalar&>("softplus", input, beta, threshold);
+}
+
+Tensor batch_threshold(const Tensor& input, const Scalar& threshold, const Scalar& value) {
+    return unary_with<const Scalar&, const Scalar&>("threshold", input, threshold, value);
+}
+
+Tensor batch_logit(const Tensor& input, const std::optional<Scalar>& eps) {
+    return unary_with<const std::optional<Scalar>&>("logit", input, eps);
+}
+
+Tensor batch_mvlgamma(const Tensor& input, int64_t p) {
+    return unary_with<int64_t>("mvlgamma", input, p);
+}
+
+Tensor batch_round_decimals(const Tensor& input, int64_t decimals) {
+    return unary_with<int64_t>("round.decimals", input, decimals);
+}
+
+Tensor batch_nan_to_num(const Tensor& input, const Scalar& nan,
+                        const std::optional<Scalar>& posinf,
+                        const std::optional<Scalar>& neginf) {
+    return unary_with<const Scalar&, const std::optional<Scalar>&, const std::optional<Scalar>&>(
+        "nan_to_num", input, nan, posinf, neginf);
+}
+
+// A tensor filled like its operand keeps the operand's batch dimension.
+// The dispatched schema leaves requires_grad to the caller's wrapper.
+Tensor fill_like(const char* op, const Tensor& self, DType dtype,
+                 std::optional<Device> device) {
+    return unary_impl(self, [&](const Tensor& value) {
+        return call_next<Tensor, const Tensor&, DType, std::optional<Device>>(
+            op, value, value, dtype, device);
+    });
+}
+
+Tensor batch_zeros_like(const Tensor& self, DType dtype, std::optional<Device> device) {
+    return fill_like("zeros_like", self, dtype, device);
+}
+
+Tensor batch_ones_like(const Tensor& self, DType dtype, std::optional<Device> device) {
+    return fill_like("ones_like", self, dtype, device);
+}
+
+Tensor batch_empty_like(const Tensor& self, DType dtype, std::optional<Device> device) {
+    return fill_like("empty_like", self, dtype, device);
+}
 
 TP_BATCH_BINARY(batch_mul, "mul.Tensor")
 TP_BATCH_BINARY(batch_div, "div.Tensor")
@@ -2054,7 +2210,7 @@ struct BatchRulePlumbing<Function, Random, Return (*)(Args...)> {
         if constexpr (!Random) {
             if (!(participates_at_level(args, layer.level) || ...)) {
                 return DispatchStub<Return, Args...>::call(
-                    handle, dispatchKeyForTensorArgs(args...),
+                    handle, next_key(handle, dispatchKeyForTensorArgs(args...)),
                     std::forward<Args>(args)...);
             }
         }
@@ -2143,6 +2299,70 @@ void register_batch_rules(tensorplay::Library& library) {
     register_batch_rule<&batch_exp>(library, "exp");
     register_batch_rule<&batch_log>(library, "log");
     register_batch_rule<&batch_sin>(library, "sin");
+    register_batch_rule<&batch_conj>(library, "conj");
+    register_batch_rule<&batch_resolve_conj>(library, "resolve_conj");
+    register_batch_rule<&batch_conj_physical>(library, "conj_physical");
+    register_batch_rule<&batch_conj_view>(library, "_conj");
+    register_batch_rule<&batch_sgn>(library, "sgn");
+    register_batch_rule<&batch_sign>(library, "sign");
+    register_batch_rule<&batch_reciprocal>(library, "reciprocal");
+    register_batch_rule<&batch_square>(library, "square");
+    register_batch_rule<&batch_real>(library, "real");
+    register_batch_rule<&batch_imag>(library, "imag");
+    register_batch_rule<&batch_angle>(library, "angle");
+    register_batch_rule<&batch_alias>(library, "alias");
+    register_batch_rule<&batch_detach>(library, "detach");
+    register_batch_rule<&batch_view_as_real>(library, "view_as_real");
+    register_batch_rule<&batch_view_as_complex>(library, "view_as_complex");
+    register_batch_rule<&batch_acos>(library, "acos");
+    register_batch_rule<&batch_acosh>(library, "acosh");
+    register_batch_rule<&batch_asin>(library, "asin");
+    register_batch_rule<&batch_asinh>(library, "asinh");
+    register_batch_rule<&batch_atan>(library, "atan");
+    register_batch_rule<&batch_atanh>(library, "atanh");
+    register_batch_rule<&batch_tan>(library, "tan");
+    register_batch_rule<&batch_deg2rad>(library, "deg2rad");
+    register_batch_rule<&batch_rad2deg>(library, "rad2deg");
+    register_batch_rule<&batch_digamma>(library, "digamma");
+    register_batch_rule<&batch_lgamma>(library, "lgamma");
+    register_batch_rule<&batch_erfinv>(library, "erfinv");
+    register_batch_rule<&batch_exp2>(library, "exp2");
+    register_batch_rule<&batch_log2>(library, "log2");
+    register_batch_rule<&batch_log10>(library, "log10");
+    register_batch_rule<&batch_frac>(library, "frac");
+    register_batch_rule<&batch_sinc>(library, "sinc");
+    register_batch_rule<&batch_i0>(library, "i0");
+    register_batch_rule<&batch_isinf>(library, "isinf");
+    register_batch_rule<&batch_isnan>(library, "isnan");
+    register_batch_rule<&batch_isneginf>(library, "isneginf");
+    register_batch_rule<&batch_isposinf>(library, "isposinf");
+    register_batch_rule<&batch_signbit>(library, "signbit");
+    register_batch_rule<&batch_hardsigmoid>(library, "hardsigmoid");
+    register_batch_rule<&batch_hardswish>(library, "hardswish");
+    register_batch_rule<&batch_mish>(library, "mish");
+    register_batch_rule<&batch_silu>(library, "silu");
+    register_batch_rule<&batch_special_entr>(library, "special_entr");
+    register_batch_rule<&batch_special_erfcx>(library, "special_erfcx");
+    register_batch_rule<&batch_special_i0e>(library, "special_i0e");
+    register_batch_rule<&batch_special_i1>(library, "special_i1");
+    register_batch_rule<&batch_special_i1e>(library, "special_i1e");
+    register_batch_rule<&batch_special_ndtri>(library, "special_ndtri");
+    register_batch_rule<&batch_celu>(library, "celu");
+    register_batch_rule<&batch_elu>(library, "elu");
+    register_batch_rule<&batch_gelu>(library, "gelu");
+    register_batch_rule<&batch_hardshrink>(library, "hardshrink");
+    register_batch_rule<&batch_softshrink>(library, "softshrink");
+    register_batch_rule<&batch_hardtanh>(library, "hardtanh");
+    register_batch_rule<&batch_leaky_relu>(library, "leaky_relu");
+    register_batch_rule<&batch_softplus>(library, "softplus");
+    register_batch_rule<&batch_threshold>(library, "threshold");
+    register_batch_rule<&batch_logit>(library, "logit");
+    register_batch_rule<&batch_mvlgamma>(library, "mvlgamma");
+    register_batch_rule<&batch_round_decimals>(library, "round.decimals");
+    register_batch_rule<&batch_nan_to_num>(library, "nan_to_num");
+    register_batch_rule<&batch_zeros_like>(library, "zeros_like");
+    register_batch_rule<&batch_ones_like>(library, "ones_like");
+    register_batch_rule<&batch_empty_like>(library, "empty_like");
     register_batch_rule<&batch_cos>(library, "cos");
     register_batch_rule<&batch_sinh>(library, "sinh");
     register_batch_rule<&batch_cosh>(library, "cosh");
