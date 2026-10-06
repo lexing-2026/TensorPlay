@@ -1111,20 +1111,53 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                         '                return _captured',
                         f'        return _C.{name}({", ".join(kw_call)})',
                     ]
-                out_capture = _out_capture_lines(
-                    name, pos_names,
-                    [_param_name(a) for a in f.args if a.kwonly],
-                    indent='        ')
-                if fwd is not None:
-                    lines.append(
-                        f'    if out is not None:')
-                    lines += out_capture
-                    lines.append(
-                        f'        return _C.{name}({", ".join(fwd + ["out=out"])})')
-                else:
+                # Some operators expose an out overload with only a subset
+                # of the ordinary options (for example, frequency grids
+                # accept only n, d, and out).  Route those calls through the
+                # actual overload instead of forwarding unsupported options.
+                out_schema_args = [
+                    a for a in out_variant.args if a.name != 'out'
+                ] if out_variant is not None else []
+                ordinary_args = {a.name: a for a in f.args}
+                out_subset = (
+                    name in ('fft_fftfreq', 'fft_rfftfreq')
+                    and out_variant is not None
+                    and len(out_schema_args) < len(f.args)
+                    and all(a.name in ordinary_args for a in out_schema_args)
+                    and [a.name for a in out_schema_args]
+                    == [a.name for a in f.args
+                        if a.name in {x.name for x in out_schema_args}]
+                )
+                if out_subset and out_schema_args:
+                    out_pos = [_param_name(a) for a in out_schema_args
+                               if not a.kwonly]
+                    out_kw = [
+                        f'{a.python_name}={_param_name(a)}'
+                        for a in out_schema_args if a.kwonly
+                    ]
+                    out_forward = out_pos + out_kw + ['out=out']
+                    out_capture = _out_capture_lines(
+                        name, out_pos, [a.python_name for a in out_schema_args
+                                        if a.kwonly], indent='        ')
                     lines.append('    if out is not None:')
                     lines += out_capture
-                    lines.append(f'        return _C.{name}({kw}, out=out)')
+                    lines.append(
+                        f'        return _C.{name}({", ".join(out_forward)})')
+                else:
+                    out_capture = _out_capture_lines(
+                        name, pos_names,
+                        [_param_name(a) for a in f.args if a.kwonly],
+                        indent='        ')
+                    if fwd is not None:
+                        lines.append(
+                            f'    if out is not None:')
+                        lines += out_capture
+                        lines.append(
+                            f'        return _C.{name}({", ".join(fwd + ["out=out"])})')
+                    else:
+                        lines.append('    if out is not None:')
+                        lines += out_capture
+                        lines.append(f'        return _C.{name}({kw}, out=out)')
                 _capture_line(
                     lines,
                     name,

@@ -14889,10 +14889,10 @@ def fft_ihfftn(input, s=None, dim=None, norm=None, *, out=None):
 def fft_fftfreq(n, d=1.0, *, dtype=None, layout=None, device=None, pin_memory=None, out=None):
     if out is not None:
         if _capturing():
-            _captured = _capture_call(fft_fftfreq, (n, d), {'dtype': dtype, 'layout': layout, 'device': device, 'pin_memory': pin_memory, 'out': out})
+            _captured = _capture_call(fft_fftfreq, (n, d), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.fft_fftfreq(n=n, d=d, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory, out=out)
+        return _C.fft_fftfreq(n, d, out=out)
     if _capturing():
         _captured = _capture_call(fft_fftfreq, (n, d), {'dtype': dtype, 'layout': layout, 'device': device, 'pin_memory': pin_memory})
         if _captured is not None:
@@ -14902,10 +14902,10 @@ def fft_fftfreq(n, d=1.0, *, dtype=None, layout=None, device=None, pin_memory=No
 def fft_rfftfreq(n, d=1.0, *, dtype=None, layout=None, device=None, pin_memory=None, out=None):
     if out is not None:
         if _capturing():
-            _captured = _capture_call(fft_rfftfreq, (n, d), {'dtype': dtype, 'layout': layout, 'device': device, 'pin_memory': pin_memory, 'out': out})
+            _captured = _capture_call(fft_rfftfreq, (n, d), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.fft_rfftfreq(n=n, d=d, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory, out=out)
+        return _C.fft_rfftfreq(n, d, out=out)
     if _capturing():
         _captured = _capture_call(fft_rfftfreq, (n, d), {'dtype': dtype, 'layout': layout, 'device': device, 'pin_memory': pin_memory})
         if _captured is not None:
