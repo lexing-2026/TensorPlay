@@ -486,6 +486,24 @@ SAMPLES = {
     "fft_ifft2.default": lambda: ((tp.complex(_t(4, 6), _t(4, 6)),), {}),
     "fft_rfft2.default": lambda: ((_t(4, 6),), {}),
     "fft_irfft2.default": lambda: ((tp.complex(_t(4, 4), _t(4, 4)),), {}),
+    # Resampling; the explicit-scale calls keep output sizes consistent with
+    # floor(input * scale), which the gather indices assume.
+    "upsample_nearest1d.default": lambda: ((_t(1, 2, 4), [8]), {}),
+    "upsample_nearest2d.default": lambda: ((_t(1, 2, 3, 4), [7, 8]), {}),
+    "upsample_nearest3d.default": lambda: ((_t(1, 2, 2, 3, 4), [5, 6, 7]), {}),
+    "_upsample_nearest_exact1d.default": lambda: ((_t(1, 2, 4), [8], 2.0), {}),
+    "_upsample_nearest_exact2d.default": lambda: ((_t(1, 2, 3, 4), [4, 8], 1.5, 2.0), {}),
+    "_upsample_nearest_exact3d.default": lambda: ((_t(1, 2, 2, 3, 4), [5, 6, 7]), {}),
+    "upsample_nearest1d.vec": lambda: ((_t(1, 2, 4), None, (2.0,)), {}),
+    "upsample_nearest2d.vec": lambda: ((_t(1, 2, 3, 4), None, (1.5, 2.0)), {}),
+    "upsample_nearest3d.vec": lambda: ((_t(1, 2, 2, 3, 4), [5, 6, 7], None), {}),
+    "_upsample_nearest_exact1d.vec": lambda: ((_t(1, 2, 4), None, (2.0,)), {}),
+    "_upsample_nearest_exact2d.vec": lambda: ((_t(1, 2, 3, 4), [7, 8], None), {}),
+    "_upsample_nearest_exact3d.vec": lambda: ((_t(1, 2, 2, 3, 4), None, (1.0, 2.0, 1.5)), {}),
+    "upsample_bicubic2d.default": lambda: ((_t(1, 2, 4, 5), [7, 8], False), {}),
+    "upsample_bicubic2d.vec": lambda: ((_t(1, 2, 4, 5), None, False, (1.5, 2.0)), {}),
+    "_upsample_bilinear2d_aa.vec": lambda: ((_t(1, 2, 4, 5), [7, 8], False, None), {}),
+    "_upsample_bicubic2d_aa.vec": lambda: ((_t(1, 2, 4, 5), None, False, (1.5, 2.0)), {}),
 }
 
 # Overloads whose kernels exist only on specific devices; exercised by the
@@ -992,6 +1010,9 @@ def test_every_functional_decomposition_has_a_sample():
             "fft_irfftn.default", "fft_hfftn.default", "fft_ihfftn.default",
             "fft_hfft2.default", "fft_ihfft2.default",
             "fft_fftshift.default", "fft_ifftshift.default",
+            # Anti-aliased lanczos has no CPU kernel at any level; its vec
+            # decomposition only unpacks the scale factors onto the default op.
+            "_upsample_lanczos2d_aa.vec",
         }
         and str(o).split(".", 1)[1] not in DEVICE_SPECIFIC
         and not any(a.is_out for a in o._schema.arguments)

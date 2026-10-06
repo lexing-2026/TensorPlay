@@ -2690,6 +2690,208 @@ def upsample_nearest2d_backward(grad_output, output_size, input_size, scales_h=N
     return grad
 
 
+def _upsample_nearest_indices(input, output_size, scales, exact):
+    # Per-axis gather indices.  The pixel-exact variant centres samples on
+    # half-pixels; the plain variant floors the scaled position.  Truncation
+    # toward zero matches rounding because the scaled position never goes
+    # below -0.5.
+    offset = 0.5 if exact else 0.0
+    num_spatial = len(output_size)
+    indices = []
+    for d in range(num_spatial):
+        osize = output_size[d]
+        isize = int(input.shape[-num_spatial + d])
+        scale = (
+            isize / (isize * scales[d])
+            if scales[d] is not None and scales[d] > 0
+            else isize / osize
+        )
+        position = tp.arange(osize, dtype=tp.float32, device=input.device)
+        idx = ((position + offset) * scale).to(tp.int64)
+        for _ in range(num_spatial - 1 - d):
+            idx = idx.unsqueeze(-1)
+        indices.append(idx)
+    return indices
+
+
+def _upsample_nearest(input, output_size, scales, exact=False):
+    indices = _upsample_nearest_indices(input, output_size, scales, exact)
+    return ops.index.Tensor(input, [None, None] + indices).contiguous()
+
+
+@register_decomposition(ops.upsample_nearest1d.default)
+def upsample_nearest1d(self, output_size, scales=None):
+    return _upsample_nearest(self, list(output_size), [scales])
+
+
+@register_decomposition(ops._upsample_nearest_exact1d.default)
+def upsample_nearest_exact1d(self, output_size, scales=None):
+    return _upsample_nearest(self, list(output_size), [scales], exact=True)
+
+
+@register_decomposition(ops.upsample_nearest2d.default)
+def upsample_nearest2d(self, output_size, scales_h=None, scales_w=None):
+    return _upsample_nearest(self, list(output_size), [scales_h, scales_w])
+
+
+@register_decomposition(ops._upsample_nearest_exact2d.default)
+def upsample_nearest_exact2d(self, output_size, scales_h=None, scales_w=None):
+    return _upsample_nearest(self, list(output_size), [scales_h, scales_w], exact=True)
+
+
+@register_decomposition(ops.upsample_nearest3d.default)
+def upsample_nearest3d(self, output_size, scales_d=None, scales_h=None, scales_w=None):
+    return _upsample_nearest(self, list(output_size), [scales_d, scales_h, scales_w])
+
+
+@register_decomposition(ops._upsample_nearest_exact3d.default)
+def upsample_nearest_exact3d(self, output_size, scales_d=None, scales_h=None, scales_w=None):
+    return _upsample_nearest(self, list(output_size), [scales_d, scales_h, scales_w], exact=True)
+
+
+@register_decomposition([ops.upsample_nearest1d.vec, ops.upsample_nearest2d.vec, ops.upsample_nearest3d.vec])
+def upsample_nearest_vec(input, output_size, scale_factors):
+    size = _upsample_output_size(input, output_size, scale_factors)
+    scales = list(scale_factors) if scale_factors else [None] * len(size)
+    return _upsample_nearest(input, size, scales)
+
+
+@register_decomposition([ops._upsample_nearest_exact1d.vec, ops._upsample_nearest_exact2d.vec, ops._upsample_nearest_exact3d.vec])
+def upsample_nearest_exact_vec(input, output_size, scale_factors):
+    size = _upsample_output_size(input, output_size, scale_factors)
+    scales = list(scale_factors) if scale_factors else [None] * len(size)
+    return _upsample_nearest(input, size, scales, exact=True)
+
+
+def _cubic_convolution1(x, a):
+    return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0
+
+
+def _cubic_convolution2(x, a):
+    return ((a * x - 5.0 * a) * x + 8.0 * a) * x - 4.0 * a
+
+
+def _cubic_coefficients(t):
+    # Weights for the four neighbours at offsets -1..2; the kernel uses
+    # a = -0.75.  Values beyond one pixel use the outer lobe formula.
+    a = -0.75
+    return (
+        _cubic_convolution2(t + 1.0, a),
+        _cubic_convolution1(t, a),
+        _cubic_convolution1(1.0 - t, a),
+        _cubic_convolution2(2.0 - t, a),
+    )
+
+
+def _sum_tensors(tensors):
+    return reduce(lambda a, b: a + b, tensors)
+
+
+def _weight_precision(weights):
+    # Fixed-point shift that keeps uint8 accumulation exact in int16.
+    stacked = ops.stack.default(list(weights), 0)
+    max_weight = ops.amax.default(stacked, list(range(stacked.dim())))
+    precisions = tp.arange(22, device=max_weight.device)
+    values = 0.5 + max_weight * ops.bitwise_left_shift.Scalar_Tensor(1, precisions + 1)
+    mask = values >= (1 << 15)
+    return 22 - ops.sum.default(mask.to(tp.int64))
+
+
+def _sum_weights_uint8(sources, weights, precision):
+    total = _sum_tensors(
+        s.to(tp.int32) * c.to(tp.int32) for s, c in zip(sources, weights)
+    ) + ops.bitwise_left_shift.Scalar_Tensor(1, precision - 1)
+    total = ops.bitwise_right_shift.Tensor(total, precision)
+    return ops.clamp.default(total, 0, 255).to(tp.uint8)
+
+
+@register_decomposition(ops.upsample_bicubic2d.default)
+def upsample_bicubic2d(self, output_size, align_corners, scales_h=None, scales_w=None):
+    in_h, in_w = int(self.shape[-2]), int(self.shape[-1])
+    out_h, out_w = list(output_size)
+    h_scale = _upsample_scale(in_h, out_h, align_corners, scales_h)
+    w_scale = _upsample_scale(in_w, out_w, align_corners, scales_w)
+    compute = _computation_dtype(self.dtype) if self.is_floating_point() else tp.get_default_dtype()
+    x = self.to(compute)
+
+    i = tp.arange(out_h, device=self.device).to(compute)
+    j = tp.arange(out_w, device=self.device).to(compute)
+    y_float = i * h_scale if align_corners else (i + 0.5) * h_scale - 0.5
+    x_float = j * w_scale if align_corners else (j + 0.5) * w_scale - 0.5
+    y_float = y_float.unsqueeze(-1)
+
+    y = y_float.floor()
+    xw = x_float.floor()
+    yscale = tp.clamp(y_float - y, 0.0, 1.0)
+    xscale = tp.clamp(x_float - xw, 0.0, 1.0)
+    y = y.to(tp.int64)
+    xw = xw.to(tp.int64)
+
+    weights_x = _cubic_coefficients(xscale)
+    weights_y = _cubic_coefficients(yscale)
+
+    precision_x = precision_y = None
+    if self.dtype == tp.uint8:
+        precision_x = _weight_precision(weights_x)
+        precision_y = _weight_precision(weights_y)
+        weights_x = [
+            (w * ops.bitwise_left_shift.Scalar_Tensor(1, precision_x)
+             + ops.sign.default(w) * 0.5).to(tp.int16)
+            for w in weights_x
+        ]
+        weights_y = [
+            (w * ops.bitwise_left_shift.Scalar_Tensor(1, precision_y)
+             + ops.sign.default(w) * 0.5).to(tp.int16)
+            for w in weights_y
+        ]
+
+    def load_bounded(ys, xs):
+        y_idx = tp.clamp(ys, 0, in_h - 1)
+        x_idx = tp.clamp(xs, 0, in_w - 1)
+        return ops.index.Tensor(x, [None, None, y_idx, x_idx])
+
+    def interp_x(ys):
+        sources = [load_bounded(ys, xw + o) for o in (-1, 0, 1, 2)]
+        if self.dtype == tp.uint8:
+            return _sum_weights_uint8(sources, weights_x, precision_x)
+        return _sum_tensors(s * w for s, w in zip(sources, weights_x))
+
+    sources_y = [interp_x(y + o) for o in (-1, 0, 1, 2)]
+    if self.dtype == tp.uint8:
+        result = _sum_weights_uint8(sources_y, weights_y, precision_y)
+    else:
+        result = _sum_tensors(s * w for s, w in zip(sources_y, weights_y))
+    return result.to(self.dtype).contiguous()
+
+
+@register_decomposition(ops.upsample_bicubic2d.vec)
+def upsample_bicubic2d_vec(input, output_size, align_corners, scale_factors):
+    size = _upsample_output_size(input, output_size, scale_factors)
+    scales = list(scale_factors) if scale_factors else [None, None]
+    return upsample_bicubic2d(input, size, align_corners, scales[0], scales[1])
+
+
+def _upsample_aa_default(op, input, output_size, align_corners, scale_factors):
+    size = _upsample_output_size(input, output_size, scale_factors)
+    scales = list(scale_factors) if scale_factors else [None, None]
+    return op(input, size, align_corners, scales[0], scales[1])
+
+
+@register_decomposition(ops._upsample_bilinear2d_aa.vec)
+def _upsample_bilinear2d_aa_vec(input, output_size, align_corners, scale_factors):
+    return _upsample_aa_default(ops._upsample_bilinear2d_aa.default, input, output_size, align_corners, scale_factors)
+
+
+@register_decomposition(ops._upsample_bicubic2d_aa.vec)
+def _upsample_bicubic2d_aa_vec(input, output_size, align_corners, scale_factors):
+    return _upsample_aa_default(ops._upsample_bicubic2d_aa.default, input, output_size, align_corners, scale_factors)
+
+
+@register_decomposition(ops._upsample_lanczos2d_aa.vec)
+def _upsample_lanczos2d_aa_vec(input, output_size, align_corners, scale_factors):
+    return _upsample_aa_default(ops._upsample_lanczos2d_aa.default, input, output_size, align_corners, scale_factors)
+
+
 # ---------------------------------------------------------------------------
 # Sliding blocks and unpooling
 # ---------------------------------------------------------------------------
