@@ -1560,6 +1560,252 @@ Tensor batch_cumsum(const Tensor& input, int64_t dim,
     return make_batched(result, *operand.bdim, operand.level);
 }
 
+// Signal axes belong to each sample; the hidden batch axis is never transformed.
+std::vector<int64_t> fft_batch_dims(const std::vector<int64_t>& dims,
+                                  int64_t rank, int64_t bdim) {
+    std::vector<int64_t> physical;
+    physical.reserve(dims.size());
+    for (int64_t dim : dims) {
+        const int64_t logical = normalize_dim(dim, rank);
+        physical.push_back(logical < bdim ? logical : logical + 1);
+    }
+    return physical;
+}
+
+Tensor batch_fft_1d(const char* op, const Tensor& input, int64_t n,
+                    int64_t dim, const std::string& norm) {
+    Operand operand = unwrap_operand(input);
+    const auto physical = fft_batch_dims({dim}, input.dim(), *operand.bdim);
+    Tensor result = call_next<Tensor, const Tensor&, int64_t, int64_t,
+                              const std::string&>(
+        op, operand.value, operand.value, n, physical[0], norm);
+    return make_batched(result, *operand.bdim, operand.level);
+}
+
+#define TP_BATCH_FFT_1D(NAME) \
+    Tensor batch_##NAME(const Tensor& input, int64_t n, int64_t dim, \
+                        const std::string& norm) { \
+        return batch_fft_1d(#NAME, input, n, dim, norm); \
+    }
+TP_BATCH_FFT_1D(fft_fft)
+TP_BATCH_FFT_1D(fft_ifft)
+TP_BATCH_FFT_1D(fft_rfft)
+TP_BATCH_FFT_1D(fft_irfft)
+#undef TP_BATCH_FFT_1D
+
+#define TP_BATCH_FFT_HERMITIAN_1D(NAME) \
+    Tensor batch_##NAME(const Tensor& input, std::optional<int64_t> n, \
+                        int64_t dim, const std::optional<std::string>& norm) { \
+        Operand operand = unwrap_operand(input); \
+        const auto physical = fft_batch_dims({dim}, input.dim(), *operand.bdim); \
+        Tensor result = call_next<Tensor, const Tensor&, std::optional<int64_t>, \
+                                  int64_t, const std::optional<std::string>&>( \
+            #NAME, operand.value, operand.value, n, physical[0], norm); \
+        return make_batched(result, *operand.bdim, operand.level); \
+    }
+TP_BATCH_FFT_HERMITIAN_1D(fft_hfft)
+TP_BATCH_FFT_HERMITIAN_1D(fft_ihfft)
+#undef TP_BATCH_FFT_HERMITIAN_1D
+
+template <typename Norm>
+Tensor batch_fft_2d(const char* op, const Tensor& input,
+                    const std::optional<std::vector<int64_t>>& shape,
+                    const std::vector<int64_t>& dim, const Norm& norm) {
+    Operand operand = unwrap_operand(input);
+    const auto physical = fft_batch_dims(dim, input.dim(), *operand.bdim);
+    Tensor result = call_next<Tensor, const Tensor&,
+                              const std::optional<std::vector<int64_t>>&,
+                              const std::vector<int64_t>&, const Norm&>(
+        op, operand.value, operand.value, shape, physical, norm);
+    return make_batched(result, *operand.bdim, operand.level);
+}
+
+#define TP_BATCH_FFT_2D(NAME, NORM) \
+    Tensor batch_##NAME(const Tensor& input, \
+                        const std::optional<std::vector<int64_t>>& shape, \
+                        const std::vector<int64_t>& dim, const NORM& norm) { \
+        return batch_fft_2d(#NAME, input, shape, dim, norm); \
+    }
+TP_BATCH_FFT_2D(fft_fft2, std::string)
+TP_BATCH_FFT_2D(fft_ifft2, std::string)
+TP_BATCH_FFT_2D(fft_rfft2, std::string)
+TP_BATCH_FFT_2D(fft_irfft2, std::string)
+TP_BATCH_FFT_2D(fft_hfft2, std::optional<std::string>)
+TP_BATCH_FFT_2D(fft_ihfft2, std::optional<std::string>)
+#undef TP_BATCH_FFT_2D
+
+Tensor batch_fft_nd(const char* op, const Tensor& input,
+                    const std::optional<std::vector<int64_t>>& shape,
+                    const std::optional<std::vector<int64_t>>& dim,
+                    const std::optional<std::string>& norm) {
+    Operand operand = unwrap_operand(input);
+    const int64_t rank = input.dim();
+    std::vector<int64_t> logical;
+    if (dim.has_value()) {
+        logical = *dim;
+    } else {
+        const int64_t count = shape.has_value() ? shape->size() : rank;
+        TP_CHECK(count <= rank, "Got shape with ", count,
+                 " values but input tensor only has ", rank, " dimensions.");
+        logical.resize(static_cast<size_t>(count));
+        std::iota(logical.begin(), logical.end(), rank - count);
+    }
+    const std::optional<std::vector<int64_t>> physical =
+        fft_batch_dims(logical, rank, *operand.bdim);
+    Tensor result = call_next<Tensor, const Tensor&,
+                              const std::optional<std::vector<int64_t>>&,
+                              const std::optional<std::vector<int64_t>>&,
+                              const std::optional<std::string>&>(
+        op, operand.value, operand.value, shape, physical, norm);
+    return make_batched(result, *operand.bdim, operand.level);
+}
+
+#define TP_BATCH_FFT_ND(NAME) \
+    Tensor batch_##NAME(const Tensor& input, \
+                        const std::optional<std::vector<int64_t>>& shape, \
+                        const std::optional<std::vector<int64_t>>& dim, \
+                        const std::optional<std::string>& norm) { \
+        return batch_fft_nd(#NAME, input, shape, dim, norm); \
+    }
+TP_BATCH_FFT_ND(fft_fftn)
+TP_BATCH_FFT_ND(fft_ifftn)
+TP_BATCH_FFT_ND(fft_rfftn)
+TP_BATCH_FFT_ND(fft_irfftn)
+TP_BATCH_FFT_ND(fft_hfftn)
+TP_BATCH_FFT_ND(fft_ihfftn)
+#undef TP_BATCH_FFT_ND
+
+#define TP_BATCH_FFT_PRIMITIVE(NAME, LAST_TYPE) \
+    Tensor batch_##NAME(const Tensor& input, const std::vector<int64_t>& dim, \
+                        int64_t normalization, LAST_TYPE last) { \
+        Operand operand = unwrap_operand(input); \
+        const auto physical = fft_batch_dims(dim, input.dim(), *operand.bdim); \
+        Tensor result = call_next<Tensor, const Tensor&, \
+                                  const std::vector<int64_t>&, int64_t, LAST_TYPE>( \
+            #NAME, operand.value, operand.value, physical, normalization, last); \
+        return make_batched(result, *operand.bdim, operand.level); \
+    }
+TP_BATCH_FFT_PRIMITIVE(_fft_c2c, bool)
+TP_BATCH_FFT_PRIMITIVE(_fft_r2c, bool)
+TP_BATCH_FFT_PRIMITIVE(_fft_c2r, int64_t)
+#undef TP_BATCH_FFT_PRIMITIVE
+
+#define TP_BATCH_FFT_SHIFT(NAME) \
+    Tensor batch_##NAME(const Tensor& input, \
+                        const std::optional<std::vector<int64_t>>& dim) { \
+        Operand operand = unwrap_operand(input); \
+        std::vector<int64_t> logical; \
+        if (dim.has_value()) logical = *dim; \
+        else { \
+            logical.resize(static_cast<size_t>(input.dim())); \
+            std::iota(logical.begin(), logical.end(), int64_t{0}); \
+        } \
+        const std::optional<std::vector<int64_t>> physical = \
+            fft_batch_dims(logical, input.dim(), *operand.bdim); \
+        Tensor result = call_next<Tensor, const Tensor&, \
+                                  const std::optional<std::vector<int64_t>>&>( \
+            #NAME, operand.value, operand.value, physical); \
+        return make_batched(result, *operand.bdim, operand.level); \
+    }
+TP_BATCH_FFT_SHIFT(fft_fftshift)
+TP_BATCH_FFT_SHIFT(fft_ifftshift)
+#undef TP_BATCH_FFT_SHIFT
+
+// Reverse transforms may map the incoming gradient, the signal, or both.
+template <typename... Extra>
+Tensor batch_fft_backward(const char* op, const Tensor& grad, const Tensor& self,
+                          int64_t dim, const std::string& norm, Extra... extra) {
+    auto aligned = align_tensor_list({grad, self});
+    const int64_t physical = normalize_dim(dim, self.dim()) + 1;
+    Tensor result = call_next<Tensor, const Tensor&, const Tensor&, int64_t,
+                              const std::string&, Extra...>(
+        op, aligned.first[0], aligned.first[0], aligned.first[1], physical, norm,
+        extra...);
+    return make_batched(result, 0, aligned.second);
+}
+
+#define TP_BATCH_FFT_BACKWARD(NAME) \
+    Tensor batch_##NAME(const Tensor& grad, const Tensor& self, int64_t dim, \
+                        const std::string& norm) { \
+        return batch_fft_backward(#NAME, grad, self, dim, norm); \
+    }
+TP_BATCH_FFT_BACKWARD(fft_fft_backward)
+TP_BATCH_FFT_BACKWARD(fft_ifft_backward)
+TP_BATCH_FFT_BACKWARD(fft_irfft_backward)
+#undef TP_BATCH_FFT_BACKWARD
+
+Tensor batch_fft_rfft_backward(const Tensor& grad, const Tensor& self, int64_t dim,
+                               const std::string& norm, int64_t n) {
+    return batch_fft_backward("fft_rfft_backward", grad, self, dim, norm, n);
+}
+
+#define TP_BATCH_FFT_BACKWARD_2D(NAME) \
+    Tensor batch_##NAME(const Tensor& grad, const Tensor& self, \
+                        const std::optional<std::vector<int64_t>>& shape, \
+                        const std::vector<int64_t>& dim, const std::string& norm) { \
+        auto aligned = align_tensor_list({grad, self}); \
+        const auto physical = fft_batch_dims(dim, self.dim(), 0); \
+        Tensor result = call_next<Tensor, const Tensor&, const Tensor&, \
+                                  const std::optional<std::vector<int64_t>>&, \
+                                  const std::vector<int64_t>&, const std::string&>( \
+            #NAME, aligned.first[0], aligned.first[0], aligned.first[1], \
+            shape, physical, norm); \
+        return make_batched(result, 0, aligned.second); \
+    }
+TP_BATCH_FFT_BACKWARD_2D(fft_fft2_backward)
+TP_BATCH_FFT_BACKWARD_2D(fft_ifft2_backward)
+TP_BATCH_FFT_BACKWARD_2D(fft_rfft2_backward)
+TP_BATCH_FFT_BACKWARD_2D(fft_irfft2_backward)
+#undef TP_BATCH_FFT_BACKWARD_2D
+
+Tensor batch_constant_pad_nd(const Tensor& input, const std::vector<int64_t>& pad,
+                              const Scalar& value) {
+    Operand operand = unwrap_operand(input);
+    TP_CHECK(pad.size() <= static_cast<size_t>(2 * input.dim()),
+             "Padding length must not exceed twice the input dimension");
+    Tensor front = move_to_front(operand.value, *operand.bdim);
+    Tensor result = call_next<Tensor, const Tensor&, const std::vector<int64_t>&,
+                              const Scalar&>("constant_pad_nd", front, front, pad, value);
+    return make_batched(result, 0, operand.level);
+}
+
+Tensor batch_constant_pad_nd_backward(const Tensor& input,
+                                      const std::vector<int64_t>& pad) {
+    Operand operand = unwrap_operand(input);
+    Tensor front = move_to_front(operand.value, *operand.bdim);
+    Tensor result = call_next<Tensor, const Tensor&, const std::vector<int64_t>&>(
+        "constant_pad_nd_backward", front, front, pad);
+    return make_batched(result, 0, operand.level);
+}
+
+Tensor batch_slice_backward(const Tensor& grad, const Tensor& self, int64_t dim,
+                            std::optional<int64_t> start,
+                            std::optional<int64_t> end, int64_t step) {
+    auto aligned = align_tensor_list({grad, self});
+    Tensor result = call_next<Tensor, const Tensor&, const Tensor&, int64_t,
+                              std::optional<int64_t>, std::optional<int64_t>, int64_t>(
+        "slice_backward", aligned.first[0], aligned.first[0], aligned.first[1],
+        normalize_dim(dim, self.dim()) + 1, start, end, step);
+    return make_batched(result, 0, aligned.second);
+}
+
+Tensor batch_roll(const Tensor& input, const std::vector<int64_t>& shifts,
+                  const std::vector<int64_t>& dims) {
+    Operand operand = unwrap_operand(input);
+    Tensor front = move_to_front(operand.value, *operand.bdim);
+    std::vector<int64_t> physical = fft_batch_dims(dims, input.dim(), 0);
+    const auto shape = static_cast<std::vector<int64_t>>(front.shape());
+    if (dims.empty()) {
+        front = tpx::ops::reshape(front, {front.size(0), input.numel()});
+        physical = {1};
+    }
+    Tensor result = call_next<Tensor, const Tensor&, const std::vector<int64_t>&,
+                              const std::vector<int64_t>&>(
+        "roll", front, front, shifts, physical);
+    if (dims.empty()) result = tpx::ops::reshape(result, shape);
+    return make_batched(result, 0, operand.level);
+}
+
 // An empty list reduces every dimension of each sample, never the batch one,
 // so it is spelled out before the dimensions move past the batch dimension.
 Tensor batch_logsumexp(const Tensor& input, const std::vector<int64_t>& dim, bool keepdim) {
@@ -2461,6 +2707,41 @@ void register_batch_rules(tensorplay::Library& library) {
     register_batch_rule<&batch_where_scalar>(library, "where.Scalar");
     register_batch_rule<&batch_clamp>(library, "clamp");
     register_batch_rule<&batch_cumsum>(library, "cumsum");
+    register_batch_rule<&batch_fft_fft>(library, "fft_fft");
+    register_batch_rule<&batch_fft_ifft>(library, "fft_ifft");
+    register_batch_rule<&batch_fft_rfft>(library, "fft_rfft");
+    register_batch_rule<&batch_fft_irfft>(library, "fft_irfft");
+    register_batch_rule<&batch_fft_hfft>(library, "fft_hfft");
+    register_batch_rule<&batch_fft_ihfft>(library, "fft_ihfft");
+    register_batch_rule<&batch_fft_fft2>(library, "fft_fft2");
+    register_batch_rule<&batch_fft_ifft2>(library, "fft_ifft2");
+    register_batch_rule<&batch_fft_rfft2>(library, "fft_rfft2");
+    register_batch_rule<&batch_fft_irfft2>(library, "fft_irfft2");
+    register_batch_rule<&batch_fft_hfft2>(library, "fft_hfft2");
+    register_batch_rule<&batch_fft_ihfft2>(library, "fft_ihfft2");
+    register_batch_rule<&batch_fft_fftn>(library, "fft_fftn");
+    register_batch_rule<&batch_fft_ifftn>(library, "fft_ifftn");
+    register_batch_rule<&batch_fft_rfftn>(library, "fft_rfftn");
+    register_batch_rule<&batch_fft_irfftn>(library, "fft_irfftn");
+    register_batch_rule<&batch_fft_hfftn>(library, "fft_hfftn");
+    register_batch_rule<&batch_fft_ihfftn>(library, "fft_ihfftn");
+    register_batch_rule<&batch__fft_c2c>(library, "_fft_c2c");
+    register_batch_rule<&batch__fft_r2c>(library, "_fft_r2c");
+    register_batch_rule<&batch__fft_c2r>(library, "_fft_c2r");
+    register_batch_rule<&batch_fft_fftshift>(library, "fft_fftshift");
+    register_batch_rule<&batch_fft_ifftshift>(library, "fft_ifftshift");
+    register_batch_rule<&batch_fft_fft_backward>(library, "fft_fft_backward");
+    register_batch_rule<&batch_fft_ifft_backward>(library, "fft_ifft_backward");
+    register_batch_rule<&batch_fft_rfft_backward>(library, "fft_rfft_backward");
+    register_batch_rule<&batch_fft_irfft_backward>(library, "fft_irfft_backward");
+    register_batch_rule<&batch_fft_fft2_backward>(library, "fft_fft2_backward");
+    register_batch_rule<&batch_fft_ifft2_backward>(library, "fft_ifft2_backward");
+    register_batch_rule<&batch_fft_rfft2_backward>(library, "fft_rfft2_backward");
+    register_batch_rule<&batch_fft_irfft2_backward>(library, "fft_irfft2_backward");
+    register_batch_rule<&batch_constant_pad_nd>(library, "constant_pad_nd");
+    register_batch_rule<&batch_constant_pad_nd_backward>(library, "constant_pad_nd_backward");
+    register_batch_rule<&batch_slice_backward>(library, "slice_backward");
+    register_batch_rule<&batch_roll>(library, "roll");
     register_batch_rule<&batch_logsumexp>(library, "logsumexp");
     register_batch_rule<&batch_all_dim>(library, "all.dim");
     register_batch_rule<&batch_max_dim>(library, "max.dim");

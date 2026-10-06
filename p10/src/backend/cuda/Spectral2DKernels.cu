@@ -438,15 +438,17 @@ Tensor c2r_plane(const Tensor& input, int64_t output_width, FFTNorm norm,
     output_sizes.back() = output_width;
     Tensor output(output_sizes, real_dtype(input.dtype()), input.device());
     if (batch > 0) {
+        // The transform may overwrite its complex input during execution.
+        Tensor signal = input.clone();
         cufftHandle plan = acquire_plan(std::is_same_v<T, double> ? CUFFT_Z2D : CUFFT_C2R,
                                         height, output_width, batch, bins, output_width);
         if constexpr (std::is_same_v<T, double>) {
             TP_SPECTRAL2D_CUFFT_CHECK(cufftExecZ2D(
-                plan, static_cast<cufftDoubleComplex*>(input.data_ptr()),
+                plan, static_cast<cufftDoubleComplex*>(signal.data_ptr()),
                 static_cast<cufftDoubleReal*>(output.data_ptr())));
         } else {
             TP_SPECTRAL2D_CUFFT_CHECK(cufftExecC2R(
-                plan, static_cast<cufftComplex*>(input.data_ptr()),
+                plan, static_cast<cufftComplex*>(signal.data_ptr()),
                 static_cast<cufftReal*>(output.data_ptr())));
         }
     }

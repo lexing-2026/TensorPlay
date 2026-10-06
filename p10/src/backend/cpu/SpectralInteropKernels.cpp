@@ -10,6 +10,7 @@
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "OutWrite.h"
+#include "Parallel.h"
 #include "pocketfft_hdronly.h"
 
 #include <algorithm>
@@ -22,6 +23,11 @@ namespace tensorplay {
 namespace cpu {
 
 namespace {
+
+size_t fft_threads(const Tensor& self) {
+    if (self.numel() <= parallel::GRAIN_SIZE || parallel::in_parallel_region()) return 1;
+    return static_cast<size_t>(parallel::get_num_threads());
+}
 
 std::vector<int64_t> wrap_transform_dims(const Tensor& self,
                                          const std::vector<int64_t>& dims) {
@@ -144,11 +150,11 @@ Tensor _fft_c2c_cpu(const Tensor& self, const std::vector<int64_t>& dim,
     if (self.dtype() == DType::ComplexFloat) {
         pocketfft::c2c<float>(shape, byte_strides(self), byte_strides(out), axes, forward,
                               complex_data<float>(self), complex_data<float>(out),
-                              compute_fct<float>(sizes, dims, normalization));
+                              compute_fct<float>(sizes, dims, normalization), fft_threads(self));
     } else {
         pocketfft::c2c<double>(shape, byte_strides(self), byte_strides(out), axes, forward,
                                complex_data<double>(self), complex_data<double>(out),
-                               compute_fct<double>(sizes, dims, normalization));
+                               compute_fct<double>(sizes, dims, normalization), fft_threads(self));
     }
     return out;
 }
@@ -177,13 +183,13 @@ Tensor _fft_r2c_cpu(const Tensor& self, const std::vector<int64_t>& dim,
         pocketfft::r2c<double>(shape, byte_strides(self), byte_strides(out), axes, true,
                                static_cast<const double*>(self.data_ptr()),
                                complex_data<double>(out),
-                               compute_fct<double>(sizes, dims, normalization));
+                               compute_fct<double>(sizes, dims, normalization), fft_threads(self));
         if (!onesided) fill_with_conjugate_symmetry<double>(out, dims);
     } else {
         pocketfft::r2c<float>(shape, byte_strides(self), byte_strides(out), axes, true,
                               static_cast<const float*>(self.data_ptr()),
                               complex_data<float>(out),
-                              compute_fct<float>(sizes, dims, normalization));
+                              compute_fct<float>(sizes, dims, normalization), fft_threads(self));
         if (!onesided) fill_with_conjugate_symmetry<float>(out, dims);
     }
     return out;
@@ -213,12 +219,12 @@ Tensor _fft_c2r_cpu(const Tensor& self, const std::vector<int64_t>& dim,
         pocketfft::c2r<double>(shape, byte_strides(self), byte_strides(out), axes, false,
                                complex_data<double>(self),
                                static_cast<double*>(out.data_ptr()),
-                               compute_fct<double>(out_sizes, dims, normalization));
+                               compute_fct<double>(out_sizes, dims, normalization), fft_threads(self));
     } else {
         pocketfft::c2r<float>(shape, byte_strides(self), byte_strides(out), axes, false,
                               complex_data<float>(self),
                               static_cast<float*>(out.data_ptr()),
-                              compute_fct<float>(out_sizes, dims, normalization));
+                              compute_fct<float>(out_sizes, dims, normalization), fft_threads(self));
     }
     return out;
 }
