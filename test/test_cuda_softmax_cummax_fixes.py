@@ -6,6 +6,7 @@ import numpy as np
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tensorplay as tp
+import tensorplay.functional as F
 
 
 def _numpy_softmax(x, axis):
@@ -146,6 +147,154 @@ class TestCUDASoftmaxWaveWidths(unittest.TestCase):
         # 64-bit accumulators halve the wave row cap: 1024 stays on the
         # shuffle path, 1025 moves to the block kernels.
         self._check([512, 1000, 1024, 1025, 2048], tp.float64, 1e-12)
+
+
+class TestCUDASoftmaxWideOddRows(unittest.TestCase):
+    """Rows past the register budget whose length is not a multiple of the
+    vector packet width (typical vocabulary sizes) and whose storage starts
+    off the 16-byte alignment: the streaming tier must handle them with a
+    scalar head and tail instead of dropping to the strided fallback."""
+
+    def setUp(self):
+        if not tp.cuda.is_available():
+            self.skipTest("CUDA not available")
+        self.device = "cuda"
+
+    def _check(self, width, dtype, tol, rows=6):
+        base = np.random.randn(rows, width).astype(np.float32)
+        base[:, 0] = -np.inf  # a lone -inf must contribute a zero sum
+        base[rows - 1, width - 1] = -np.inf  # tail edge
+        base[1, width // 2] = np.nan  # NaN poisons the whole row
+        x = tp.tensor(base, device=self.device, dtype=dtype)
+        got = _to_numpy(tp.softmax(x, dim=1))
+        ref = _numpy_softmax(base, axis=1)
+        np.testing.assert_allclose(
+            got, ref, atol=tol, rtol=tol, equal_nan=True,
+            err_msg=f"softmax width={width} dtype={dtype}")
+        got_log = _to_numpy(tp.log_softmax(x, dim=1))
+        ref_log = _numpy_log_softmax(base, axis=1)
+        np.testing.assert_allclose(
+            got_log, ref_log, atol=tol, rtol=tol, equal_nan=True,
+            err_msg=f"log_softmax width={width} dtype={dtype}")
+
+    def test_odd_widths_past_register_budget(self):
+        # Widths land in the streaming tier with every residue mod the
+        # packet width (4 for f32/f64, 8 for f16/bf16).
+        self._check(16391, tp.float32, 1e-5)
+        self._check(50257, tp.float32, 1e-5)
+        self._check(16385, tp.float64, 1e-12)
+        self._check(50001, tp.float64, 1e-12)
+        self._check(16393, tp.float16, 2e-3)
+        self._check(50257, tp.float16, 2e-3)
+        self._check(50257, tp.bfloat16, 2e-2)
+
+    def test_misaligned_storage_offset(self):
+        # A contiguous slice view starts the first row (and every row after,
+        # when the width keeps a remainder) off the packet alignment; the
+        # input and output phases then disagree and stores fall back scalar.
+        for width, dtype, tol in ((17000, tp.float32, 1e-5),
+                                  (50257, tp.float16, 2e-3)):
+            flat_np = np.random.randn(6 * width + 7).astype(np.float32)
+            flat = tp.tensor(flat_np, device=self.device, dtype=dtype)
+            x = flat[7:7 + 6 * width].reshape(6, width)
+            base = flat_np[7:].reshape(6, width)
+            self.assertTrue(x.is_contiguous())
+            got = _to_numpy(tp.softmax(x, dim=1))
+            ref = _numpy_softmax(base, axis=1)
+            np.testing.assert_allclose(
+                got, ref, atol=tol, rtol=tol,
+                err_msg=f"softmax offset width={width} dtype={dtype}")
+
+
+class TestCUDASoftmaxSpatialInnerDims(unittest.TestCase):
+    """Slices that sit off the fast dimension: the spatial tier gives each
+    inner slice its own y-thread row while an x-team reduces the softmax
+    dim, so consecutive threads read consecutive addresses and the inner
+    axis contributes parallelism instead of stride gaps."""
+
+    def setUp(self):
+        if not tp.cuda.is_available():
+            self.skipTest("CUDA not available")
+        self.device = "cuda"
+
+    def _check(self, shape, dim, dtype, tol, poison=False):
+        base = np.random.randn(*shape).astype(np.float32)
+        if poison:
+            flat = base.reshape(-1)
+            flat[0] = -np.inf
+            flat[flat.size // 2] = np.nan
+        x = tp.tensor(base, device=self.device, dtype=dtype)
+        got = _to_numpy(tp.softmax(x, dim=dim))
+        ref = _numpy_softmax(base, axis=dim)
+        np.testing.assert_allclose(
+            got, ref, atol=tol, rtol=tol, equal_nan=poison,
+            err_msg=f"softmax shape={shape} dim={dim} dtype={dtype}")
+        got_log = _to_numpy(tp.log_softmax(x, dim=dim))
+        ref_log = _numpy_log_softmax(base, axis=dim)
+        np.testing.assert_allclose(
+            got_log, ref_log, atol=tol, rtol=tol, equal_nan=poison,
+            err_msg=f"log_softmax shape={shape} dim={dim} dtype={dtype}")
+
+    def test_half_spatial_geometries(self):
+        # A long dim teams x-threads on the reduction (inner small enough
+        # that the block doubles x-threads in), a one-thread-per-slice face
+        # whose last inner tile is only partly populated, a small odd face,
+        # and a wide channel-last face.
+        for shape, dim in (((2, 512, 32, 3), 1), ((2, 8, 2050, 5), 1),
+                           ((3, 17, 7), 1), ((2, 16, 1024, 1024), 1)):
+            self._check(shape, dim, tp.float16, 2e-3)
+
+    def test_bfloat16_spatial_channel_last(self):
+        self._check((2, 64, 256, 256), 1, tp.bfloat16, 2e-2)
+
+    def test_poisoned_rows(self):
+        self._check((4, 128, 33), 1, tp.float16, 2e-3, poison=True)
+
+
+class TestCUDASoftmaxHalfToFloat(unittest.TestCase):
+    """The _softmax.out out-variant with half_to_float: fp16 input, fp32
+    result.  Every store lands directly in the wider dtype, so the output
+    keeps the float accumulator's precision instead of rounding through
+    fp16."""
+
+    def setUp(self):
+        if not tp.cuda.is_available():
+            self.skipTest("CUDA not available")
+        self.device = "cuda"
+
+    def _check(self, shape, dim, tol):
+        base = np.random.randn(*shape).astype(np.float32)
+        x = tp.tensor(base, device=self.device, dtype=tp.float16)
+        out = tp.empty(x.shape, dtype=tp.float32, device=self.device)
+        got = F._softmax(x, dim, True, out=out)
+        self.assertEqual(got.dtype, tp.float32)
+        ref = _numpy_softmax(base, axis=dim)
+        np.testing.assert_allclose(
+            got.cpu().numpy(), ref, atol=tol, rtol=tol,
+            err_msg=f"softmax half_to_float shape={shape} dim={dim}")
+        out_log = tp.empty(x.shape, dtype=tp.float32, device=self.device)
+        got_log = F._log_softmax(x, dim, True, out=out_log)
+        self.assertEqual(got_log.dtype, tp.float32)
+        ref_log = _numpy_log_softmax(base, axis=dim)
+        np.testing.assert_allclose(
+            got_log.cpu().numpy(), ref_log, atol=tol, rtol=tol,
+            err_msg=f"log_softmax half_to_float shape={shape} dim={dim}")
+
+    def test_all_tiers(self):
+        # Wave-resident rows, register-resident rows, the streaming vocab
+        # width and a spatial face (inner > 1) all accept the widened output.
+        self._check((33, 512), 1, 2e-3)
+        self._check((33, 2048), 1, 2e-3)
+        self._check((6, 50257), 1, 2e-3)
+        self._check((2, 8, 128, 5), 1, 2e-3)
+
+    def test_requires_half_input(self):
+        x = tp.randn(4, 8, device=self.device)
+        out = tp.empty((4, 8), dtype=tp.float32, device=self.device)
+        with self.assertRaises(RuntimeError):
+            F._softmax(x, 1, True, out=out)
+        with self.assertRaises(RuntimeError):
+            F._log_softmax(x, 1, True, out=out)
 
 
 class TestCUDACummaxExtremum(unittest.TestCase):
