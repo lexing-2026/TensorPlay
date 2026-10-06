@@ -9,6 +9,7 @@
 #include "CUDALoops.cuh"
 
 #include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
 
 #include <cuda_runtime.h>
 
@@ -50,54 +51,6 @@ inline void outer_inner(const std::vector<int64_t>& shape, int64_t dim,
       TP_THROW(RuntimeError, std::string("CUDA Error: ") + cudaGetErrorString(error)); \
     } \
   } while (0)
-
-template <typename T>
-__global__ void sort_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
-                            bool descending, const T* in, T* vals, int64_t* idxs) {
-    int64_t si = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; si < n_slices; si += stride) {
-        int64_t o = si / inner, in2 = si % inner;
-        const T* sp = in + o * d_size * inner + in2;
-        T* vb = vals + o * d_size * inner + in2;
-        int64_t* ib = idxs + o * d_size * inner + in2;
-        for (int64_t j = 0; j < d_size; ++j) {
-            vb[j * inner] = sp[j * inner];
-            ib[j * inner] = j;
-        }
-        auto less = [&](int64_t a, int64_t b) {
-            T va = vb[a * inner], vbv = vb[b * inner];
-            bool lt = va < vbv, gt = va > vbv;
-            return descending ? gt : lt;
-        };
-        auto swap_pair = [&](int64_t a, int64_t b) {
-            T tv = vb[a * inner];
-            vb[a * inner] = vb[b * inner];
-            vb[b * inner] = tv;
-            int64_t ti = ib[a * inner];
-            ib[a * inner] = ib[b * inner];
-            ib[b * inner] = ti;
-        };
-        auto sift_down = [&](int64_t start, int64_t end) {
-            int64_t root = start;
-            while (2 * root + 1 <= end) {
-                int64_t child = 2 * root + 1;
-                if (child + 1 <= end && less(child, child + 1)) ++child;
-                if (less(root, child)) {
-                    swap_pair(root, child);
-                    root = child;
-                } else {
-                    break;
-                }
-            }
-        };
-        for (int64_t st = d_size / 2 - 1; st >= 0; --st) sift_down(st, d_size - 1);
-        for (int64_t end = d_size - 1; end > 0; --end) {
-            swap_pair(0, end);
-            sift_down(0, end - 1);
-        }
-    }
-}
 
 template <typename T>
 struct SortRadixTraits : topk_detail::TopKRadixTraits<T> {};
@@ -366,12 +319,12 @@ template <typename T>
 __global__ void sort_radix_pack_kernel(int64_t n, int64_t d_size, int64_t inner,
                                        const T* in,
                                        typename SortRadixTraits<T>::key_type* keys,
-                                       int64_t* pos) {
+                                       int64_t* pos, int64_t slice_base) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < n; i += stride) {
-        const int64_t slice = i / d_size;
-        const int64_t j = i - slice * d_size;
+        const int64_t slice = slice_base + i / d_size;
+        const int64_t j = i - (i / d_size) * d_size;
         const int64_t o = slice / inner;
         const int64_t in2 = slice - o * inner;
         const int64_t src = (o * d_size + j) * inner + in2;
@@ -383,12 +336,13 @@ __global__ void sort_radix_pack_kernel(int64_t n, int64_t d_size, int64_t inner,
 template <typename T>
 __global__ void sort_radix_unpack_kernel(int64_t n, int64_t d_size, int64_t inner,
                                          typename SortRadixTraits<T>::key_type const* keys,
-                                         const int64_t* pos, T* vals, int64_t* idxs) {
+                                         const int64_t* pos, T* vals, int64_t* idxs,
+                                         int64_t slice_base) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < n; i += stride) {
-        const int64_t slice = i / d_size;
-        const int64_t j = i - slice * d_size;
+        const int64_t slice = slice_base + i / d_size;
+        const int64_t j = i - (i / d_size) * d_size;
         const int64_t o = slice / inner;
         const int64_t in2 = slice - o * inner;
         const int64_t dst = (o * d_size + j) * inner + in2;
@@ -418,7 +372,7 @@ void sort_radix_impl(const Tensor& self_c, Tensor& values, Tensor& indices,
     const int blocks = static_cast<int>((n + kThreads - 1) / kThreads);
     sort_radix_pack_kernel<T><<<blocks, kThreads, 0, stream>>>(
         n, d_size, inner, static_cast<const T*>(self_c.data_ptr()),
-        keys_a.data_ptr<Key>(), pos_a.data_ptr<int64_t>());
+        keys_a.data_ptr<Key>(), pos_a.data_ptr<int64_t>(), 0);
     const int n_items = static_cast<int>(n);
     if (slices != 1) {
         // Several independent runs need their segment bounds; a single run
@@ -481,7 +435,95 @@ void sort_radix_impl(const Tensor& self_c, Tensor& values, Tensor& indices,
     }
     sort_radix_unpack_kernel<T><<<blocks, kThreads, 0, stream>>>(
         n, d_size, inner, key_buf.Current(), pos_buf.Current(),
-        static_cast<T*>(values.data_ptr()), indices.data_ptr<int64_t>());
+        static_cast<T*>(values.data_ptr()), indices.data_ptr<int64_t>(), 0);
+}
+
+// One chunk of the oversized sort.  `slice_base` is the first slice (in the
+// flattened outer*inner space) covered by this chunk; the pack/unpack kernels
+// use it to map the chunk's linear element indices back to the strided
+// tensor layout, so chunks may split across outer rows.
+template <typename T>
+void sort_radix_chunk(const T* in, T* vals, int64_t* idxs,
+                      int64_t d_size, int64_t inner, int64_t slice_base,
+                      int64_t n_chunk, bool descending,
+                      const Device& device, cudaStream_t stream) {
+    using Key = typename SortRadixTraits<T>::key_type;
+    const DType key_dtype = sizeof(Key) == 8 ? DType::UInt64 : DType::UInt32;
+    Tensor keys_a = Tensor::empty({n_chunk}, key_dtype, device);
+    Tensor keys_b = Tensor::empty({n_chunk}, key_dtype, device);
+    Tensor pos_in = Tensor::empty({n_chunk}, DType::Int64, device);
+    Tensor pos_out = Tensor::empty({n_chunk}, DType::Int64, device);
+    const int64_t nsegments = n_chunk / d_size;
+    Tensor offsets = Tensor::empty({nsegments + 1}, DType::Int32, device);
+    const int blocks = static_cast<int>((n_chunk + kThreads - 1) / kThreads);
+    sort_radix_pack_kernel<T><<<blocks, kThreads, 0, stream>>>(
+        n_chunk, d_size, inner, in, keys_a.data_ptr<Key>(),
+        pos_in.data_ptr<int64_t>(), slice_base);
+    const int off_blocks =
+        static_cast<int>((nsegments + 1 + kThreads - 1) / kThreads);
+    sort_radix_fill_offsets_kernel<<<off_blocks, kThreads, 0, stream>>>(
+        static_cast<int>(nsegments) + 1, d_size, offsets.data_ptr<int32_t>());
+    const int n_items = static_cast<int>(n_chunk);
+    const int n_segments = static_cast<int>(nsegments);
+    const int bits = SortRadixTraits<T>::bit_count;
+    size_t tmp_bytes = 0;
+    cudaError_t err = descending
+        ? cub::DeviceSegmentedRadixSort::SortPairsDescending(
+              nullptr, tmp_bytes, keys_a.data_ptr<Key>(), keys_b.data_ptr<Key>(),
+              pos_in.data_ptr<int64_t>(), pos_out.data_ptr<int64_t>(),
+              n_items, n_segments, offsets.data_ptr<int32_t>(),
+              offsets.data_ptr<int32_t>() + 1, 0, bits, stream)
+        : cub::DeviceSegmentedRadixSort::SortPairs(
+              nullptr, tmp_bytes, keys_a.data_ptr<Key>(), keys_b.data_ptr<Key>(),
+              pos_in.data_ptr<int64_t>(), pos_out.data_ptr<int64_t>(),
+              n_items, n_segments, offsets.data_ptr<int32_t>(),
+              offsets.data_ptr<int32_t>() + 1, 0, bits, stream);
+    CUDA_CHECK(err);
+    Tensor tmp = Tensor::empty(
+        {static_cast<int64_t>(std::max<size_t>(tmp_bytes, 1))}, DType::UInt8,
+        device);
+    err = descending
+        ? cub::DeviceSegmentedRadixSort::SortPairsDescending(
+              tmp.data_ptr(), tmp_bytes, keys_a.data_ptr<Key>(),
+              keys_b.data_ptr<Key>(), pos_in.data_ptr<int64_t>(),
+              pos_out.data_ptr<int64_t>(), n_items, n_segments,
+              offsets.data_ptr<int32_t>(), offsets.data_ptr<int32_t>() + 1,
+              0, bits, stream)
+        : cub::DeviceSegmentedRadixSort::SortPairs(
+              tmp.data_ptr(), tmp_bytes, keys_a.data_ptr<Key>(),
+              keys_b.data_ptr<Key>(), pos_in.data_ptr<int64_t>(),
+              pos_out.data_ptr<int64_t>(), n_items, n_segments,
+              offsets.data_ptr<int32_t>(), offsets.data_ptr<int32_t>() + 1,
+              0, bits, stream);
+    CUDA_CHECK(err);
+    sort_radix_unpack_kernel<T><<<blocks, kThreads, 0, stream>>>(
+        n_chunk, d_size, inner, keys_b.data_ptr<Key>(),
+        pos_out.data_ptr<int64_t>(), vals, idxs, slice_base);
+}
+
+template <typename T>
+void sort_radix_impl_large(const Tensor& self_c, Tensor& values, Tensor& indices,
+                           int64_t d_size, int64_t slices, int64_t inner,
+                           bool descending) {
+    const int64_t n = self_c.numel();
+    const auto device = self_c.device();
+    auto stream = getCurrentCUDAStream().stream();
+    const int64_t intmax = static_cast<int64_t>(std::numeric_limits<int>::max());
+    const int64_t nbatch = (std::min(n, intmax) / d_size) * d_size;
+    TP_CHECK(nbatch > 0, "sort: cannot sort dimension of length ", d_size);
+    int64_t remaining = n;
+    int64_t slice_base = 0;
+    while (remaining > 0) {
+        const int64_t n_chunk = std::min(remaining, nbatch);
+        const int64_t nsegments = n_chunk / d_size;
+        sort_radix_chunk<T>(
+            self_c.data_ptr<T>(), values.data_ptr<T>(),
+            indices.data_ptr<int64_t>(), d_size, inner, slice_base, n_chunk,
+            descending, device, stream);
+        remaining -= n_chunk;
+        slice_base += nsegments;
+    }
+    (void)slices;
 }
 
 // Keys-only radix sort for callers that never look at the permutation:
@@ -500,7 +542,7 @@ void sort_keys_radix_impl(const Tensor& self_c, Tensor& values,
     const int blocks = static_cast<int>((n + kThreads - 1) / kThreads);
     sort_radix_pack_kernel<T><<<blocks, kThreads, 0, stream>>>(
         n, d_size, inner, static_cast<const T*>(self_c.data_ptr()),
-        keys_a.data_ptr<Key>(), static_cast<int64_t*>(nullptr));
+        keys_a.data_ptr<Key>(), static_cast<int64_t*>(nullptr), 0);
     cub::DoubleBuffer<Key> key_buf(keys_a.data_ptr<Key>(), keys_b.data_ptr<Key>());
     const int n_items = static_cast<int>(n);
     const int bits = SortRadixTraits<T>::bit_count;
@@ -514,7 +556,7 @@ void sort_keys_radix_impl(const Tensor& self_c, Tensor& values,
         tmp.data_ptr(), tmp_bytes, key_buf, n_items, 0, bits, stream));
     sort_radix_unpack_kernel<T><<<blocks, kThreads, 0, stream>>>(
         n, d_size, inner, key_buf.Current(), static_cast<const int64_t*>(nullptr),
-        static_cast<T*>(values.data_ptr()), static_cast<int64_t*>(nullptr));
+        static_cast<T*>(values.data_ptr()), static_cast<int64_t*>(nullptr), 0);
     (void)slices;
 }
 
@@ -609,34 +651,16 @@ std::tuple<Tensor, Tensor> sort_cuda(const Tensor& self, int64_t dim, bool desce
     Tensor indices = Tensor::empty(static_cast<std::vector<int64_t>>(self_c.shape()), DType::Int64, self_c.device());
     int64_t slices = outer * inner;
     if (slices == 0 || d_size == 0) return {values, indices};
+    if (d_size == 1) {
+        values.copy_(self_c);
+        indices.zero_();
+        return {values, indices};
+    }
     auto stream = getCurrentCUDAStream().stream();
     if (self_c.numel() <= std::numeric_limits<int>::max() &&
         d_size >= 2 && d_size <= 4096 && slices > 1) {
-        constexpr int64_t kMaxStridedInner = 16;
-        if (inner > kMaxStridedInner) {
-            std::vector<int64_t> order(static_cast<size_t>(nd));
-            for (int64_t d = 0; d < nd; ++d) order[static_cast<size_t>(d)] = d;
-            std::swap(order[static_cast<size_t>(dim)],
-                      order[static_cast<size_t>(nd - 1)]);
-            Tensor staged = self_c.permute(order).contiguous();
-            Tensor staged_values = Tensor::empty(
-                static_cast<std::vector<int64_t>>(staged.shape()),
-                staged.dtype(), staged.device());
-            Tensor staged_indices = Tensor::empty(
-                static_cast<std::vector<int64_t>>(staged.shape()),
-                DType::Int64, staged.device());
-            sort_block_radix_entry(staged, staged_values, staged_indices,
-                                   slices, d_size, 1, descending);
-            std::vector<int64_t> inverse(static_cast<size_t>(nd));
-            for (int64_t d = 0; d < nd; ++d) {
-                inverse[static_cast<size_t>(order[static_cast<size_t>(d)])] = d;
-            }
-            values.copy_(staged_values.permute(inverse));
-            indices.copy_(staged_indices.permute(inverse));
-        } else {
-            sort_block_radix_entry(self_c, values, indices,
-                                   slices, d_size, inner, descending);
-        }
+        sort_block_radix_entry(self_c, values, indices,
+                               slices, d_size, inner, descending);
         CUDA_CHECK(cudaGetLastError());
         return {values, indices};
     }
@@ -645,17 +669,15 @@ std::tuple<Tensor, Tensor> sort_cuda(const Tensor& self, int64_t dim, bool desce
         CUDA_CHECK(cudaGetLastError());
         return {values, indices};
     }
-#define TP_SORT_CASE(ctype, name) \
+#define TP_RADIX_LARGE_CASE(ctype, name) \
     case DType::name: \
-        sort_kernel<ctype><<<(slices + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-            slices, d_size, inner, descending, self_c.data_ptr<ctype>(), \
-            values.data_ptr<ctype>(), indices.data_ptr<int64_t>()); \
+        sort_radix_impl_large<ctype>(self_c, values, indices, d_size, slices, inner, descending); \
         break;
     switch (self_c.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_SORT_CASE)
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_RADIX_LARGE_CASE)
         default: TP_THROW(TypeError, "sort: unsupported dtype");
     }
-#undef TP_SORT_CASE
+#undef TP_RADIX_LARGE_CASE
     CUDA_CHECK(cudaGetLastError());
     return {values, indices};
 }
@@ -678,6 +700,10 @@ static Tensor sort_values_only_cuda(const Tensor& self, int64_t dim) {
     outer_inner(static_cast<std::vector<int64_t>>(self_c.shape()), dim, outer, inner);
     const int64_t slices = outer * inner;
     if (slices == 0 || d_size == 0) return values;
+    if (d_size == 1) {
+        values.copy_(self_c);
+        return values;
+    }
     TP_CHECK(self_c.numel() <= std::numeric_limits<int>::max(),
              "sort: input is too large for the radix sort");
     switch (self_c.dtype()) {
