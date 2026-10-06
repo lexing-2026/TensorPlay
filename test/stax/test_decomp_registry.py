@@ -579,6 +579,12 @@ SAMPLES = {
     "any.dims": lambda: ((tp.rand(2, 3, 4) > 0.5, [0, 1], False), {}),
     "cumsum.default": lambda: ((tp.randn(2, 3, 4), 1), {}),
     "cumprod.default": lambda: ((tp.randn(2, 3, 4) * 0.5, 1), {}),
+    # The CPU flash walk routes through the math attention and rebuilds the
+    # log-sum-exp over the masked scores; small magnitudes keep the two
+    # log-summation orders inside the tolerance.
+    "_scaled_dot_product_flash_attention_for_cpu.default": lambda: (
+        (tp.rand(1, 2, 4, 8) * 0.5, tp.rand(1, 2, 4, 8) * 0.5,
+         tp.rand(1, 2, 4, 8) * 0.5, 0.0, False), {}),
     # Pooling; window maxima and indices are picked exactly, so the comparison
     # is bit-stable even on random inputs.
     "max_pool2d_with_indices.default": lambda: (

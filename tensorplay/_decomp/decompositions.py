@@ -7102,3 +7102,49 @@ def grid_sampler_2d(a, grid, interpolation_mode, padding_mode, align_corners):
 
     coeffs = tuple(get_coeff(ofs) for ofs in range(4))
     return _sum_tensors(s * w for s, w in zip(coeffs, _cubic_coefficients(ty)))
+
+
+@register_decomposition(ops._scaled_dot_product_flash_attention_for_cpu.default)
+def scaled_dot_product_flash_attention_for_cpu(query, key, value, dropout_p=0.0,
+                                               is_causal=False, *, attn_mask=None,
+                                               scale=None):
+    if not query.is_floating_point():
+        raise RuntimeError(
+            f"query must be FP32, FP64, BF16, FP16 but got {query.dtype}"
+        )
+    if not (query.dim() == 4 and key.dim() == 4 and value.dim() == 4):
+        raise RuntimeError(
+            f"q, k, v must be a 4 dimensional tensor, got {query.dim()}, "
+            f"{key.dim()}, {value.dim()}"
+        )
+    if dropout_p != 0.0:
+        raise RuntimeError(f"dropout probability must be zero, got {dropout_p}")
+    if not (query.shape[3] == value.shape[3] and key.shape[3] == value.shape[3]):
+        raise RuntimeError("q, k, v should have the same head size")
+    output, _ = ops._scaled_dot_product_attention_math.default(
+        query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
+        is_causal=is_causal, dropout_mask=None, scale=scale,
+        enable_gqa=int(query.shape[1]) != int(key.shape[1]),
+    )
+    # The eager kernel hands back the log-sum-exp over the keys; rebuild it
+    # from the same masked scores the math walk attends with.
+    scale_factor = scale if scale is not None else 1.0 / math.sqrt(int(query.shape[3]))
+    scores = ops.matmul.default(query, ops.transpose.default(key, -1, -2)) * scale_factor
+    if attn_mask is not None:
+        if attn_mask.dtype == tp.bool:
+            raise RuntimeError(
+                "sdpa cpu flash: attn_mask must be float32 or the query dtype"
+            )
+        scores = scores + attn_mask
+    if is_causal:
+        queries = tp.arange(int(query.shape[-2]), device=query.device)
+        keys = tp.arange(int(key.shape[-2]), device=query.device)
+        future = (keys.unsqueeze(-2) > queries.unsqueeze(-1)).to(tp.bool)
+        scores = ops.masked_fill.Scalar(scores, ops.expand.default(future, list(scores.shape)), float("-inf"))
+    lse = ops.logsumexp.default(scores, [-1])
+    # Replaying the permute-copy-permute keeps the returned view the same one
+    # the eager kernel answers with.
+    output = ops.permute.default(output, [2, 0, 1, 3])
+    output = ops.clone.default(output, memory_format=tp.contiguous_format)
+    output = ops.permute.default(output, [1, 2, 0, 3])
+    return output, lse
