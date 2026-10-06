@@ -146,9 +146,30 @@ __global__ void foreach_norm_partial_kernel(
     if (end > count) end = count;
 
     M value = M(0);
-    for (int64_t i = begin + threadIdx.x; i < end; i += blockDim.x) {
-        const M x = static_cast<M>(metadata.inputs[tensor][i]);
-        value += x * x;
+    const T* input = metadata.inputs[tensor];
+    // Packed fast path: four contiguous elements per thread per round.  The
+    // chunk size and chunk starts are multiples of 4, so a tensor whose length
+    // is a multiple of 4 and whose base is aligned keeps every chunk aligned
+    // too; other tensors fall back to the scalar walk.  Half-precision rows
+    // otherwise pay four times the load instructions per byte moved.
+    if (count % foreach_mta::kILP == 0 &&
+        foreach_mta::is_aligned(input + begin)) {
+        using Vec = foreach_mta::AlignedVec<T>;
+        const Vec* packed_input = reinterpret_cast<const Vec*>(input);
+        for (int64_t v = begin / foreach_mta::kILP + threadIdx.x;
+             v < end / foreach_mta::kILP; v += blockDim.x) {
+            const Vec quad = packed_input[v];
+#pragma unroll
+            for (int lane = 0; lane < foreach_mta::kILP; ++lane) {
+                const M x = static_cast<M>(quad.values[lane]);
+                value += x * x;
+            }
+        }
+    } else {
+        for (int64_t i = begin + threadIdx.x; i < end; i += blockDim.x) {
+            const M x = static_cast<M>(input[i]);
+            value += x * x;
+        }
     }
 
     __shared__ M values[kNormThreads];

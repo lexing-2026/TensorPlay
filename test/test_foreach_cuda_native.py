@@ -71,6 +71,22 @@ def test_foreach_norm_chunk_boundaries_and_offset_slice(dtype):
         assert abs(norm.item() - want) < 0.01
 
 
+def test_foreach_norm_packed_rounds_match_scalar_walk_and_keep_nan():
+    values = [
+        _cuda([1.0] * 65540),            # aligned: one full chunk plus a 4 tail
+        _cuda([3.0] * 4),                # aligned: a single packed round
+        _cuda([1.0] * 65540)[2:],        # offset base takes the scalar walk
+        _cuda([float("nan"), 1.0] * 4),  # NaN survives the packed reduction
+    ]
+
+    norms = tp._foreach_norm(values, 2)
+
+    assert abs(norms[0].item() - math.sqrt(65540)) < 0.01
+    assert norms[1].item() == 6.0
+    assert abs(norms[2].item() - math.sqrt(65538)) < 0.01
+    assert math.isnan(norms[3].item())
+
+
 def test_foreach_norm_preserves_autograd_fallback():
     value = tp.tensor([3.0, 4.0], device="cuda", requires_grad=True)
     norm = tp._foreach_norm([value], 2)[0]
