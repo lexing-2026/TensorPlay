@@ -709,13 +709,15 @@ MANUAL_DERIVATIVES: dict[str, dict] = {
     # Multi-output backward kernels with no derivative of their own
     # (MiscKernelBackward.h): a pass that needs one raises.
     "deform_conv2d_backward": {"saved": [], "node": "DeformConv2dBackwardBackward"},
-    "_scaled_dot_product_flash_attention_for_cpu_backward": {
-        "saved": [], "node": "ScaledDotProductFlashAttentionForCpuBackwardBackward"},
     "_flash_attention_backward": {"saved": [], "node": "FlashAttentionBackwardBackward"},
     "_efficient_attention_backward": {"saved": [], "node": "EfficientAttentionBackwardBackward"},
     # The attention backwards differentiate again at dropout_p == 0
     # (SdpaBackward.h), recomposed from the operands with recordable
     # primitives.
+    "_scaled_dot_product_flash_attention_for_cpu_backward": {
+        "saved": ["grad_out", "query", "key", "value", "dropout_p", "is_causal",
+                  "attn_mask", "scale"],
+        "node": "ScaledDotProductFlashAttentionForCpuBackwardBackward"},
     "scaled_dot_product_attention_backward": {
         "saved": ["grad_output", "query", "key", "value", "attn_mask",
                   "dropout_p", "is_causal", "scale", "enable_gqa"],

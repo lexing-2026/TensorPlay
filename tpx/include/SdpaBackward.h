@@ -391,6 +391,73 @@ struct ScaledDotProductAttentionBackwardBackward : public Node {
     }
 };
 
+// The derivative of _scaled_dot_product_flash_attention_for_cpu_backward:
+// gradients for the incoming gradient, the query, the key, the value, the
+// saved output, the constant and the mask, in schema order.  The composed
+// math recomputes the probabilities from the operands, so the saved output
+// and the constant -- both functions of those operands -- take none.
+// dropout_p == 0 only, as for the other spellings.
+struct ScaledDotProductFlashAttentionForCpuBackwardBackward : public Node {
+    SavedVariable grad_out_;
+    SavedVariable query_;
+    SavedVariable key_;
+    SavedVariable value_;
+    double dropout_p_;
+    bool is_causal_;
+    std::optional<Tensor> attn_mask_;
+    std::optional<double> scale_;
+
+    ScaledDotProductFlashAttentionForCpuBackwardBackward(
+        Tensor grad_out, Tensor query, Tensor key, Tensor value, double dropout_p,
+        bool is_causal, std::optional<Tensor> attn_mask, std::optional<double> scale)
+        : grad_out_(std::move(grad_out)), query_(std::move(query)),
+          key_(std::move(key)), value_(std::move(value)), dropout_p_(dropout_p),
+          is_causal_(is_causal), attn_mask_(std::move(attn_mask)), scale_(scale) {}
+
+    size_t num_inputs() const override { return 3; }
+
+    variable_list apply(variable_list&& inputs) override {
+        const Tensor adj_query = inputs.size() > 0 ? inputs[0] : Tensor();
+        const Tensor adj_key = inputs.size() > 1 ? inputs[1] : Tensor();
+        const Tensor adj_value = inputs.size() > 2 ? inputs[2] : Tensor();
+        variable_list grads(7);
+        if (!adj_query.defined() && !adj_key.defined() && !adj_value.defined()) {
+            return grads;
+        }
+        if (dropout_p_ != 0.0) {
+            TP_THROW(NotImplementedError,
+                     "_scaled_dot_product_flash_attention_for_cpu_backward: the "
+                     "second derivative is not defined when dropout_p != 0");
+        }
+        const Tensor go = grad_out_.unpack();
+        const Tensor q = query_.unpack();
+        const Tensor k = key_.unpack();
+        const Tensor v = value_.unpack();
+        if (!go.defined() || !q.defined() || !k.defined() || !v.defined()) {
+            return grads;
+        }
+        const sdpa_bwd_detail::MathAdjoints r =
+            sdpa_bwd_detail::sdpa_math_double_backward(
+                go, q, k, v, attn_mask_, is_causal_, scale_,
+                /*enable_gqa=*/q.size(1) != k.size(1), adj_query, adj_key, adj_value);
+        if (should_compute_output(0)) grads[0] = r.grad_output;
+        if (should_compute_output(1)) grads[1] = r.grad_query;
+        if (should_compute_output(2)) grads[2] = r.grad_key;
+        if (should_compute_output(3)) grads[3] = r.grad_value;
+        if (should_compute_output(6)) grads[6] = r.grad_mask;
+        return grads;
+    }
+
+    void release_variables() override {
+        Node::release_variables();
+        grad_out_.reset_data();
+        query_.reset_data();
+        key_.reset_data();
+        value_.reset_data();
+        attn_mask_.reset();
+    }
+};
+
 // The derivative of _scaled_dot_product_attention_backward_with_lse:
 // gradients for the incoming gradient, the query, the key, the value, the
 // saved output and the constant, in schema order.  The probabilities the

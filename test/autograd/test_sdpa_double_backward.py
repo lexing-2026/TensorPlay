@@ -106,8 +106,7 @@ def test_math_backward_differentiates_twice_with_bool_mask(device):
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_attention_differentiates_twice_end_to_end(device, is_causal):
     # The math backend keeps the call on the composed entry whose derivative
-    # is the math backward; the fused entries a plain call would otherwise
-    # pick differentiate only once.
+    # is the math backward.
     q = leaf(2, 2, 5, 4, device=device, seed=19)
     k = leaf(2, 2, 6, 4, device=device, seed=20)
     v = leaf(2, 2, 6, 4, device=device, seed=21)
@@ -131,6 +130,23 @@ def test_attention_differentiates_twice_end_to_end_grouped(device):
                                               enable_gqa=True)
 
     assert gradgradcheck(fn, (q, k, v), atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_fused_cpu_attention_differentiates_twice_end_to_end(is_causal):
+    # A plain CPU call takes the fused entry; its backward differentiates
+    # through the composed math, the saved output and constant taking none.
+    q = leaf(2, 2, 5, 4, device="cpu", seed=38)
+    k = leaf(2, 2, 6, 4, device="cpu", seed=39)
+    v = leaf(2, 2, 6, 4, device="cpu", seed=40)
+    mask = leaf(5, 6, device="cpu", seed=41)
+
+    def fn(query, key, value, attn_mask):
+        return F.scaled_dot_product_attention(
+            query, key, value, attn_mask=None if is_causal else attn_mask,
+            is_causal=is_causal)
+
+    assert gradgradcheck(fn, (q, k, v, mask), atol=1e-5, rtol=1e-4)
 
 
 @CUDA

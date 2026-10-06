@@ -143,13 +143,13 @@ def test_ctc_loss_second_pass_raises():
 
 
 def test_multi_output_kernel_second_pass_raises():
-    q = rand(1, 2, 4, 8, seed=9)
-    k = rand(1, 2, 4, 8, seed=10)
-    v = rand(1, 2, 4, 8, seed=11)
-    out, _ = _C._scaled_dot_product_flash_attention_for_cpu(q, k, v)
-    with pytest.raises(NotImplementedError,
-                       match="_scaled_dot_product_flash_attention_for_cpu_backward"):
-        second_pass(out.sum(), [q, k, v])
+    x = rand(1, 1, 4, 4, seed=9)
+    w = rand(1, 1, 3, 3, seed=10)
+    offset = rand(1, 18, 4, 4, seed=11)
+    mask = rand(1, 9, 4, 4, seed=12)
+    out = _C.deform_conv2d(x, w, offset, mask, None, [1, 1], [1, 1], [1, 1], 1, 1, True)
+    with pytest.raises(NotImplementedError, match="deform_conv2d_backward"):
+        second_pass(out.sum(), [x, w, offset, mask])
 
 
 def test_first_pass_through_undifferentiated_kernel_still_works():

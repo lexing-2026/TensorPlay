@@ -55,8 +55,6 @@ private:
     };
 
 TPX_UNDIFFERENTIATED_KERNEL_NODE(DeformConv2dBackwardBackward, 5, "deform_conv2d_backward")
-TPX_UNDIFFERENTIATED_KERNEL_NODE(ScaledDotProductFlashAttentionForCpuBackwardBackward, 3,
-                                 "_scaled_dot_product_flash_attention_for_cpu_backward")
 TPX_UNDIFFERENTIATED_KERNEL_NODE(FlashAttentionBackwardBackward, 3, "_flash_attention_backward")
 TPX_UNDIFFERENTIATED_KERNEL_NODE(EfficientAttentionBackwardBackward, 4,
                                  "_efficient_attention_backward")
