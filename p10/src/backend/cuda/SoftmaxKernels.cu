@@ -4,6 +4,7 @@
 #include "CUDAContext.h"
 #include "Exception.h"
 #include "CUDNNUtils.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 #ifdef USE_CUDNN
 #include <cudnn.h>
 #endif
@@ -1240,7 +1241,35 @@ void softmax_dim_dispatch(const Tensor& self, Tensor& result, int64_t dim,
 bool softmax_native_fast_path(const Tensor& self, Tensor& result,
                               int64_t outer_size, int64_t softmax_size,
                               int64_t inner_size, bool log_mode) {
-  if (inner_size != 1 || outer_size == 0 || softmax_size <= 0) return false;
+  if (outer_size == 0 || softmax_size <= 0) return false;
+  if (inner_size != 1) {
+    // Rows strided along the fast dimension: the native spatial tier first,
+    // the DNN library call below stays as the fallback for the layouts the
+    // launch probe declines.
+    switch (self.dtype()) {
+      case DType::Float32:
+        return log_mode
+            ? try_spatial_softmax<float, float, true>(self, result,
+                                                      outer_size, softmax_size,
+                                                      inner_size)
+            : try_spatial_softmax<float, float, false>(self, result,
+                                                       outer_size,
+                                                       softmax_size,
+                                                       inner_size);
+      case DType::Float64:
+        return log_mode
+            ? try_spatial_softmax<double, double, true>(self, result,
+                                                        outer_size,
+                                                        softmax_size,
+                                                        inner_size)
+            : try_spatial_softmax<double, double, false>(self, result,
+                                                         outer_size,
+                                                         softmax_size,
+                                                         inner_size);
+      default:
+        return false;
+    }
+  }
   switch (self.dtype()) {
     case DType::Float32: {
       if (log_mode) {
@@ -1372,7 +1401,8 @@ template <typename scalar_t, typename compute_t, bool LOG_MODE>
 __global__ void softmax_backward_data_kernel(
     scalar_t* grad_in, const scalar_t* grad, const scalar_t* out,
     int64_t rows, int64_t softmax_size, int64_t inner_size) {
-  const int64_t row = static_cast<int64_t>(blockIdx.x);
+  const int64_t row =
+      static_cast<int64_t>(blockIdx.y) * gridDim.x + blockIdx.x;
   if (row >= rows) return;
   const int64_t outer = row / inner_size;
   const int64_t inner = row % inner_size;
@@ -1478,6 +1508,143 @@ bool try_softmax_bwd_reg(scalar_t* grad_in, const scalar_t* grad,
   return true;
 }
 
+// Wide-row backward: rows beyond the register tier stream both operands in
+// aligned packets with streaming hints, so both passes over the row stay
+// bandwidth-bound.  Packet bodies require the three row starts to share one
+// alignment phase; a mismatched row keeps the same two-pass shape with scalar
+// accesses.
+template <typename scalar_t, typename compute_t, bool LOG_MODE>
+__global__ void softmax_bwd_wide_kernel(scalar_t* __restrict__ grad_in,
+                                        const scalar_t* __restrict__ grad,
+                                        const scalar_t* __restrict__ out,
+                                        int classes) {
+  constexpr int kPack = 16 / static_cast<int>(sizeof(scalar_t));
+  constexpr int kChunkPackets = 16 / kPack < 1 ? 1 : 16 / kPack;
+  constexpr int kWave = 32;
+  __shared__ compute_t reduce[kWave];
+  const int tid = static_cast<int>(threadIdx.x);
+  const int64_t row_base = static_cast<int64_t>(blockIdx.x) * classes;
+  const scalar_t* row_grad = grad + row_base;
+  const scalar_t* row_out = out + row_base;
+  scalar_t* row_in = grad_in + row_base;
+
+  const auto align_head = [](const void* p) {
+    return static_cast<int>(
+        (16 - reinterpret_cast<uintptr_t>(p) % 16) % 16 /
+        static_cast<int>(sizeof(scalar_t)));
+  };
+  const int head = align_head(row_grad);
+  const bool packed =
+      head == align_head(row_out) && head == align_head(row_in);
+  const int body = classes - head;
+  const int packets = body / kPack;
+  const int tail = body - packets * kPack;
+  const int edge = head + tail;
+  const SoftmaxPack<scalar_t, kPack>* src_g =
+      reinterpret_cast<const SoftmaxPack<scalar_t, kPack>*>(row_grad + head);
+  const SoftmaxPack<scalar_t, kPack>* src_o =
+      reinterpret_cast<const SoftmaxPack<scalar_t, kPack>*>(row_out + head);
+
+  compute_t thread_sum = compute_t(0);
+  if (packed) {
+    const int stride = static_cast<int>(blockDim.x) * kChunkPackets;
+    for (int base = tid; base < packets; base += stride) {
+#pragma unroll
+      for (int c = 0; c < kChunkPackets; ++c) {
+        const int slot = base + c * static_cast<int>(blockDim.x);
+        if (slot < packets) {
+          const SoftmaxPack<scalar_t, kPack> vg =
+              softmax_load_stream(src_g + slot);
+          if constexpr (LOG_MODE) {
+#pragma unroll
+            for (int k = 0; k < kPack; ++k) {
+              thread_sum += static_cast<compute_t>(vg.v[k]);
+            }
+          } else {
+            const SoftmaxPack<scalar_t, kPack> vo =
+                softmax_load_stream(src_o + slot);
+#pragma unroll
+            for (int k = 0; k < kPack; ++k) {
+              thread_sum += static_cast<compute_t>(vg.v[k]) *
+                            static_cast<compute_t>(vo.v[k]);
+            }
+          }
+        }
+      }
+    }
+  }
+  for (int e = tid; e < (packed ? edge : classes);
+       e += static_cast<int>(blockDim.x)) {
+    const int logical =
+        packed ? (e < head ? e : classes - tail + (e - head)) : e;
+    const compute_t g = static_cast<compute_t>(row_grad[logical]);
+    thread_sum += LOG_MODE
+        ? g
+        : g * static_cast<compute_t>(row_out[logical]);
+  }
+  thread_sum = softmax_block_reduce<compute_t, false>(thread_sum, reduce);
+  const compute_t factor = thread_sum;
+
+  if (packed) {
+    auto* dst = reinterpret_cast<SoftmaxPack<scalar_t, kPack>*>(row_in + head);
+    for (int slot = tid; slot < packets; slot += static_cast<int>(blockDim.x)) {
+      const SoftmaxPack<scalar_t, kPack> vg =
+          softmax_load_stream(src_g + slot);
+      const SoftmaxPack<scalar_t, kPack> vo =
+          softmax_load_stream(src_o + slot);
+      SoftmaxPack<scalar_t, kPack> r;
+#pragma unroll
+      for (int k = 0; k < kPack; ++k) {
+        const compute_t g = static_cast<compute_t>(vg.v[k]);
+        const compute_t o = static_cast<compute_t>(vo.v[k]);
+        r.v[k] = static_cast<scalar_t>(
+            LOG_MODE ? g - std::exp(o) * factor : o * (g - factor));
+      }
+      softmax_store_stream(dst + slot, r);
+    }
+  }
+  for (int e = tid; e < (packed ? edge : classes);
+       e += static_cast<int>(blockDim.x)) {
+    const int logical =
+        packed ? (e < head ? e : classes - tail + (e - head)) : e;
+    const compute_t g = static_cast<compute_t>(row_grad[logical]);
+    const compute_t o = static_cast<compute_t>(row_out[logical]);
+    row_in[logical] = static_cast<scalar_t>(
+        LOG_MODE ? g - std::exp(o) * factor : o * (g - factor));
+  }
+}
+
+// Takes the contiguous rows the register tier declines; the caller falls
+// back to the strided kernel when the launch geometry does not fit.
+template <typename scalar_t, typename compute_t>
+bool try_softmax_bwd_wide(scalar_t* grad_in, const scalar_t* grad,
+                          const scalar_t* out, int64_t classes, int64_t rows,
+                          bool log_mode, cudaStream_t stream) {
+  constexpr int kRegCap = 16 * 512;
+  if (classes <= kRegCap || classes > INT32_MAX || rows > INT32_MAX)
+    return false;
+  static thread_local cudaDeviceProp properties{};
+  static thread_local int queried_device = -1;
+  const int current = currentDevice();
+  if (queried_device != current) {
+    CUDA_CHECK(cudaGetDeviceProperties(&properties, current));
+    queried_device = current;
+  }
+  const int threads =
+      rows * 2 < properties.multiProcessorCount ? 1024 : 512;
+  if (log_mode) {
+    softmax_bwd_wide_kernel<scalar_t, compute_t, true>
+        <<<static_cast<unsigned>(rows), threads, 0, stream>>>(
+            grad_in, grad, out, static_cast<int>(classes));
+  } else {
+    softmax_bwd_wide_kernel<scalar_t, compute_t, false>
+        <<<static_cast<unsigned>(rows), threads, 0, stream>>>(
+            grad_in, grad, out, static_cast<int>(classes));
+  }
+  CUDA_CHECK(cudaGetLastError());
+  return true;
+}
+
 // grad_output drives the result dtype; reduced-width inputs accumulate and
 // compute in float.  grad_output may carry float32 for a half input (the
 // half_to_float forward path), in which case the result casts back to the
@@ -1532,23 +1699,42 @@ Tensor softmax_backward_native_impl(const Tensor& grad_output,
     switch (gc.dtype()) {
       case DType::Float32:
         reg_done = try_softmax_bwd_reg<float, float>(
-            result_work.data_ptr<float>(), gc.data_ptr<float>(),
-            oc.data_ptr<float>(), dim_size, rows, log_mode, stream);
+                       result_work.data_ptr<float>(), gc.data_ptr<float>(),
+                       oc.data_ptr<float>(), dim_size, rows, log_mode,
+                       stream) ||
+                   try_softmax_bwd_wide<float, float>(
+                       result_work.data_ptr<float>(), gc.data_ptr<float>(),
+                       oc.data_ptr<float>(), dim_size, rows, log_mode,
+                       stream);
         break;
       case DType::Float64:
         reg_done = try_softmax_bwd_reg<double, double>(
-            result_work.data_ptr<double>(), gc.data_ptr<double>(),
-            oc.data_ptr<double>(), dim_size, rows, log_mode, stream);
+                       result_work.data_ptr<double>(), gc.data_ptr<double>(),
+                       oc.data_ptr<double>(), dim_size, rows, log_mode,
+                       stream) ||
+                   try_softmax_bwd_wide<double, double>(
+                       result_work.data_ptr<double>(), gc.data_ptr<double>(),
+                       oc.data_ptr<double>(), dim_size, rows, log_mode,
+                       stream);
         break;
       case DType::Float16:
         reg_done = try_softmax_bwd_reg<Half, float>(
-            result_work.data_ptr<Half>(), gc.data_ptr<Half>(),
-            oc.data_ptr<Half>(), dim_size, rows, log_mode, stream);
+                       result_work.data_ptr<Half>(), gc.data_ptr<Half>(),
+                       oc.data_ptr<Half>(), dim_size, rows, log_mode,
+                       stream) ||
+                   try_softmax_bwd_wide<Half, float>(
+                       result_work.data_ptr<Half>(), gc.data_ptr<Half>(),
+                       oc.data_ptr<Half>(), dim_size, rows, log_mode, stream);
         break;
       case DType::BFloat16:
         reg_done = try_softmax_bwd_reg<BFloat16, float>(
-            result_work.data_ptr<BFloat16>(), gc.data_ptr<BFloat16>(),
-            oc.data_ptr<BFloat16>(), dim_size, rows, log_mode, stream);
+                       result_work.data_ptr<BFloat16>(), gc.data_ptr<BFloat16>(),
+                       oc.data_ptr<BFloat16>(), dim_size, rows, log_mode,
+                       stream) ||
+                   try_softmax_bwd_wide<BFloat16, float>(
+                       result_work.data_ptr<BFloat16>(), gc.data_ptr<BFloat16>(),
+                       oc.data_ptr<BFloat16>(), dim_size, rows, log_mode,
+                       stream);
         break;
       default:
         break;
@@ -1561,18 +1747,24 @@ Tensor softmax_backward_native_impl(const Tensor& grad_output,
     }
   }
 
+  const unsigned bwd_grid_x =
+      rows > INT32_MAX ? static_cast<unsigned>(INT32_MAX)
+                       : static_cast<unsigned>(rows);
+  const unsigned bwd_grid_y =
+      static_cast<unsigned>((rows + bwd_grid_x - 1) / bwd_grid_x);
+
   #define TP_SOFTMAX_BWD_LAUNCH(ctype, acc)                                \
   if (log_mode) {                                                          \
     constexpr bool LOG_MODE = true;                                        \
     softmax_backward_data_kernel<ctype, acc, LOG_MODE>                     \
-        <<<static_cast<unsigned>(rows), threads, 0,                        \
+        <<<dim3(bwd_grid_x, bwd_grid_y), threads, 0,                       \
            getCurrentCUDAStream().stream()>>>(                             \
             result_work.data_ptr<ctype>(), gc.data_ptr<ctype>(),           \
             oc.data_ptr<ctype>(), rows, dim_size, inner);                  \
   } else {                                                                 \
     constexpr bool LOG_MODE = false;                                       \
     softmax_backward_data_kernel<ctype, acc, LOG_MODE>                     \
-        <<<static_cast<unsigned>(rows), threads, 0,                        \
+        <<<dim3(bwd_grid_x, bwd_grid_y), threads, 0,                       \
            getCurrentCUDAStream().stream()>>>(                             \
             result_work.data_ptr<ctype>(), gc.data_ptr<ctype>(),           \
             oc.data_ptr<ctype>(), rows, dim_size, inner);                  \
@@ -1670,7 +1862,295 @@ Tensor& _log_softmax_out_cuda(const Tensor& self, int64_t dim,
   return out;
 }
 
+namespace ops = tensorplay::tpx::ops;
+
+namespace {
+
+// Fused masked softmax for rows laid out along the fastest dimension: the
+// mask is consulted while the row statistics are gathered, so dropped
+// entries never materialize as -inf logits and no masked_fill temporary is
+// needed.  One warp owns one row; each lane strides the row with a 32-wide
+// step, so the row must stay within the per-lane register budget of the
+// caller's launch bound.  A row whose entries are all dropped carries no
+// probability mass and answers zero; a row whose kept entries are all -inf
+// still divides zero mass and answers NaN, like the unfused rewrite.
+template <typename scalar_t, typename compute_t>
+__global__ void masked_softmax_wave_kernel(scalar_t* __restrict__ out,
+                                           const scalar_t* __restrict__ in,
+                                           const bool* __restrict__ mask,
+                                           int elements, int64_t rows) {
+  constexpr int kWave = 32;
+  const unsigned full = 0xffffffffu;
+  const int lane = static_cast<int>(threadIdx.x) % kWave;
+  const int warp = static_cast<int>(threadIdx.x) / kWave;
+  const int warps_per_block = static_cast<int>(blockDim.x) / kWave;
+  const int64_t block_rows = static_cast<int64_t>(gridDim.x) * warps_per_block;
+  for (int64_t row = static_cast<int64_t>(blockIdx.x) * warps_per_block + warp;
+       row < rows; row += block_rows) {
+    const int64_t base = row * elements;
+    const scalar_t* row_in = in + base;
+    const bool* row_mask = mask + base;
+    scalar_t* row_out = out + base;
+
+    compute_t m = -std::numeric_limits<compute_t>::infinity();
+    unsigned kept = 0u;
+    for (int j = lane; j < elements; j += kWave) {
+      if (row_mask[j]) continue;
+      kept = 1u;
+      const compute_t x = static_cast<compute_t>(row_in[j]);
+      m = x > m ? x : m;
+    }
+#pragma unroll
+    for (int offset = kWave / 2; offset > 0; offset /= 2) {
+      const compute_t other = __shfl_xor_sync(full, m, offset, kWave);
+      m = other > m ? other : m;
+      kept |= __shfl_xor_sync(full, kept, offset, kWave);
+    }
+    if (!kept) {
+      // Every entry dropped: no probability mass, answer zero everywhere.
+      for (int j = lane; j < elements; j += kWave) row_out[j] = scalar_t(0);
+      continue;
+    }
+    compute_t s = compute_t(0);
+    for (int j = lane; j < elements; j += kWave) {
+      if (row_mask[j]) continue;
+      s += std::exp(static_cast<compute_t>(row_in[j]) - m);
+    }
+#pragma unroll
+    for (int offset = kWave / 2; offset > 0; offset /= 2) {
+      s += __shfl_xor_sync(full, s, offset, kWave);
+    }
+    const compute_t inv = compute_t(1) / s;
+    for (int j = lane; j < elements; j += kWave) {
+      row_out[j] = row_mask[j]
+          ? scalar_t(0)
+          : static_cast<scalar_t>(
+                std::exp(static_cast<compute_t>(row_in[j]) - m) * inv);
+    }
+  }
+}
+
+// Fused masked backward: the dot product runs over the kept entries only and
+// dropped positions answer zero, matching the unfused rewrite where both
+// operands are zeroed under the mask first.
+template <typename scalar_t, typename compute_t>
+__global__ void masked_softmax_bwd_wave_kernel(
+    scalar_t* __restrict__ grad_in, const scalar_t* __restrict__ grad,
+    const scalar_t* __restrict__ out, const bool* __restrict__ mask,
+    int elements, int64_t rows) {
+  constexpr int kWave = 32;
+  const unsigned full = 0xffffffffu;
+  const int lane = static_cast<int>(threadIdx.x) % kWave;
+  const int warp = static_cast<int>(threadIdx.x) / kWave;
+  const int warps_per_block = static_cast<int>(blockDim.x) / kWave;
+  const int64_t block_rows = static_cast<int64_t>(gridDim.x) * warps_per_block;
+  for (int64_t row = static_cast<int64_t>(blockIdx.x) * warps_per_block + warp;
+       row < rows; row += block_rows) {
+    const int64_t base = row * elements;
+    const scalar_t* row_grad = grad + base;
+    const scalar_t* row_out = out + base;
+    const bool* row_mask = mask + base;
+    scalar_t* row_in = grad_in + base;
+
+    compute_t partial = compute_t(0);
+    for (int j = lane; j < elements; j += kWave) {
+      if (row_mask[j]) continue;
+      partial += static_cast<compute_t>(row_grad[j]) *
+                 static_cast<compute_t>(row_out[j]);
+    }
+#pragma unroll
+    for (int offset = kWave / 2; offset > 0; offset /= 2) {
+      partial += __shfl_xor_sync(full, partial, offset, kWave);
+    }
+    const compute_t dot = partial;
+    for (int j = lane; j < elements; j += kWave) {
+      if (row_mask[j]) {
+        row_in[j] = scalar_t(0);
+        continue;
+      }
+      const compute_t g = static_cast<compute_t>(row_grad[j]);
+      const compute_t o = static_cast<compute_t>(row_out[j]);
+      row_in[j] = static_cast<scalar_t>(o * (g - dot));
+    }
+  }
+}
+
+// The mask a caller may hand over for a padding mask (type 1): one row per
+// batch entry, (B, L), covering every head and query of a (B, H, L, L)
+// input.  Anything else is used as it is and left to broadcasting.
+Tensor masked_softmax_mask_view(const Tensor& self, const Tensor& mask,
+                                std::optional<int64_t> mask_type) {
+  if (mask_type.has_value() && *mask_type == 1 && mask.dim() == 2 &&
+      self.dim() == 4) {
+    TP_CHECK(self.size(0) == mask.size(0) && self.size(2) == mask.size(1),
+             "For mask_type == 1 mask shape should be (B, L)");
+    return ops::view(mask,
+                     {mask.size(0), 1, 1, mask.size(1)});
+  }
+  return mask;
+}
+
+template <typename scalar_t, typename compute_t>
+bool launch_masked_softmax_wave(const Tensor& self, Tensor& result,
+                                const Tensor& mask, int64_t elements) {
+  const int64_t rows = self.numel() / elements;
+  constexpr int kWave = 32;
+  const int threads = 128;
+  const int warps_per_block = threads / kWave;
+  const unsigned grid = static_cast<unsigned>(
+      (rows + warps_per_block - 1) / warps_per_block);
+  masked_softmax_wave_kernel<scalar_t, compute_t>
+      <<<grid, threads, 0, getCurrentCUDAStream().stream()>>>(
+          result.data_ptr<scalar_t>(), self.data_ptr<scalar_t>(),
+          mask.data_ptr<bool>(), static_cast<int>(elements), rows);
+  CUDA_CHECK(cudaGetLastError());
+  return true;
+}
+
+template <typename scalar_t, typename compute_t>
+bool launch_masked_softmax_bwd_wave(const Tensor& grad, const Tensor& output,
+                                    const Tensor& mask, Tensor& result,
+                                    int64_t elements) {
+  const int64_t rows = grad.numel() / elements;
+  constexpr int kWave = 32;
+  const int threads = 128;
+  const int warps_per_block = threads / kWave;
+  const unsigned grid = static_cast<unsigned>(
+      (rows + warps_per_block - 1) / warps_per_block);
+  masked_softmax_bwd_wave_kernel<scalar_t, compute_t>
+      <<<grid, threads, 0, getCurrentCUDAStream().stream()>>>(
+          result.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+          output.data_ptr<scalar_t>(), mask.data_ptr<bool>(),
+          static_cast<int>(elements), rows);
+  CUDA_CHECK(cudaGetLastError());
+  return true;
+}
+
+bool masked_softmax_can_fuse(const Tensor& self, const Tensor& mask,
+                             int64_t d) {
+  if (self.dim() < 1 || d != self.dim() - 1) return false;
+  const int64_t elements = self.size(d);
+  if (elements <= 0 || elements > 1024) return false;
+  if (elements * static_cast<int64_t>(self.itemsize()) > 8192) return false;
+  if (self.numel() == 0 || self.numel() / elements > INT32_MAX) return false;
+  if (!self.is_contiguous() || !mask.is_contiguous()) return false;
+  if (mask.dim() != self.dim()) return false;
+  return static_cast<std::vector<int64_t>>(mask.shape()) ==
+         static_cast<std::vector<int64_t>>(self.shape());
+}
+
+}  // namespace
+
+Tensor _masked_softmax_cuda(const Tensor& self, const Tensor& mask,
+                            std::optional<int64_t> dim,
+                            std::optional<int64_t> mask_type) {
+  TP_CHECK(mask.dtype() == DType::Bool, "Mask should be a boolean tensor");
+  const int64_t nd = self.dim();
+  int64_t d = -1;
+  if (dim.has_value()) {
+    d = *dim < 0 ? *dim + nd : *dim;
+  }
+  if (nd >= 1 && (dim.has_value() ? d : nd - 1) == nd - 1 &&
+      masked_softmax_can_fuse(self, mask, nd - 1)) {
+    Tensor result = Tensor::empty(
+        static_cast<std::vector<int64_t>>(self.shape()), self.dtype(),
+        self.device());
+    const int64_t elements = self.size(nd - 1);
+    switch (self.dtype()) {
+      case DType::Float32:
+        launch_masked_softmax_wave<float, float>(self, result, mask, elements);
+        break;
+      case DType::Float64:
+        launch_masked_softmax_wave<double, double>(self, result, mask,
+                                                   elements);
+        break;
+      case DType::Float16:
+        launch_masked_softmax_wave<Half, float>(self, result, mask, elements);
+        break;
+      case DType::BFloat16:
+        launch_masked_softmax_wave<BFloat16, float>(self, result, mask,
+                                                    elements);
+        break;
+      default:
+        TP_THROW(NotImplementedError,
+                 "masked_softmax: unsupported dtype on this GPU backend");
+    }
+    return result;
+  }
+  // Same rewrite the backend-neutral composite performs: mask the logits to
+  // -inf, normalize, then answer zero wherever the mask drops an entry.
+  const Tensor dropped = masked_softmax_mask_view(self, mask, mask_type);
+  Tensor neg_inf =
+      ops::full_like(self, Scalar(-std::numeric_limits<double>::infinity()));
+  Tensor out = ops::softmax(ops::where(dropped, neg_inf, self), dim.value_or(-1),
+                            DType::Undefined);
+  return ops::where(dropped, ops::zeros_like(self), out);
+}
+
+Tensor _masked_softmax_backward_cuda(const Tensor& grad_output,
+                                     const Tensor& output, const Tensor& mask,
+                                     std::optional<int64_t> dim) {
+  TP_CHECK(mask.dtype() == DType::Bool, "Mask should be a boolean tensor");
+  const int64_t nd = grad_output.dim();
+  int64_t d = -1;
+  if (dim.has_value()) {
+    d = *dim < 0 ? *dim + nd : *dim;
+  }
+  const bool can_fuse =
+      nd >= 1 && (dim.has_value() ? d : nd - 1) == nd - 1 &&
+      grad_output.is_contiguous() && output.is_contiguous() &&
+      mask.is_contiguous() && mask.dim() == nd &&
+      static_cast<std::vector<int64_t>>(mask.shape()) ==
+          static_cast<std::vector<int64_t>>(grad_output.shape()) &&
+      static_cast<std::vector<int64_t>>(output.shape()) ==
+          static_cast<std::vector<int64_t>>(grad_output.shape());
+  if (can_fuse) {
+    const int64_t elements = grad_output.size(nd - 1);
+    if (elements > 0 && elements <= 1024 &&
+        elements * static_cast<int64_t>(grad_output.itemsize()) <= 8192 &&
+        grad_output.numel() / elements <= INT32_MAX &&
+        grad_output.dtype() == output.dtype()) {
+      Tensor result = Tensor::empty(
+          static_cast<std::vector<int64_t>>(grad_output.shape()),
+          grad_output.dtype(), grad_output.device());
+      switch (grad_output.dtype()) {
+        case DType::Float32:
+          launch_masked_softmax_bwd_wave<float, float>(
+              grad_output, output, mask, result, elements);
+          break;
+        case DType::Float64:
+          launch_masked_softmax_bwd_wave<double, double>(
+              grad_output, output, mask, result, elements);
+          break;
+        case DType::Float16:
+          launch_masked_softmax_bwd_wave<Half, float>(grad_output, output,
+                                                      mask, result, elements);
+          break;
+        case DType::BFloat16:
+          launch_masked_softmax_bwd_wave<BFloat16, float>(grad_output, output,
+                                                          mask, result,
+                                                          elements);
+          break;
+        default:
+          TP_THROW(NotImplementedError,
+                   "masked_softmax: unsupported dtype on this GPU backend");
+      }
+      return result;
+    }
+  }
+  // Unfused rewrite: zero both operands under the mask, take the dot over
+  // the kept entries, and let dropped positions pass nothing through.
+  Tensor g = ops::where(mask, ops::zeros_like(grad_output), grad_output);
+  Tensor o = ops::where(mask, ops::zeros_like(output), output);
+  Tensor dot = ops::sum(ops::mul(g, o), {dim.value_or(-1)}, true);
+  return ops::where(mask, ops::zeros_like(grad_output),
+                    ops::mul(o, ops::sub(g, dot)));
+}
+
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, SoftmaxKernels) {
+    m.impl("_masked_softmax", _masked_softmax_cuda);
+    m.impl("_masked_softmax_backward", _masked_softmax_backward_cuda);
     m.impl("_softmax.out", _softmax_out_cuda);
     m.impl("_log_softmax.out", _log_softmax_out_cuda);
     m.impl("_softmax_backward_data", _softmax_backward_data_cuda);
