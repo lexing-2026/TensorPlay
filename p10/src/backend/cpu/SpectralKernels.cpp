@@ -182,7 +182,7 @@ Tensor core_r2c(const Tensor& contig, int64_t dim, fft_norm_mode mode, bool ones
     return out;
 }
 
-// _fft_c2r analogue: input holds n/2+1 Hermitian bins, output length out_len.
+// The input holds n/2+1 Hermitian bins; the real output has length out_len.
 template <typename T>
 Tensor core_c2r(const Tensor& contig, int64_t dim, int64_t out_len, fft_norm_mode mode) {
     using C = complex<T>;
@@ -211,7 +211,7 @@ Tensor core_c2r(const Tensor& contig, int64_t dim, int64_t out_len, fft_norm_mod
 // ---------------------------------------------------------------------------
 
 namespace {
-// with a zero imaginary part (SpectralOps.cpp fft_r2c "fft"/"ifft" entry).
+// with a zero imaginary part.
 template <typename T>
 Tensor materialize_real_as_complex(const Tensor& x) {
     using C = complex<T>;
@@ -346,7 +346,7 @@ Tensor fft_ifft_backward_cpu(const Tensor& grad, const Tensor& self, int64_t dim
 }
 
 namespace {
-// :5135): view onesided r2c as [zero-fill imag, c2c forward, drop half], so the
+// View one-sided r2c as [zero-fill imag, c2c forward, drop half], so the
 // backward is [zero-fill the twosided spectrum, c2c INVERSE with the forward's
 // normalization, take the real part].
 template <typename T>

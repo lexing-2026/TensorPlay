@@ -390,7 +390,7 @@ Tensor core_c2c_impl(const Tensor& x, int64_t n_eff, fft_norm_mode mode, bool fo
 }
 
 // ---------------------------------------------------------------------------
-// spectrum (N/2+1 bins), matching infer_ft_real_to_complex_onesided_size.
+// A real signal's one-sided spectrum has N/2+1 bins.
 // ---------------------------------------------------------------------------
 
 template <bool IsDouble>
@@ -523,9 +523,8 @@ Tensor core_c2r_impl(const Tensor& x, int64_t n_eff, fft_norm_mode mode) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// native/SpectralOps.cpp fft_c2c / fft_r2c / fft_c2r (:215-330):
-//   n defaults to size(dim); resize_fft_input slices from 0 or zero-pads;
-//   norm_from_string picks the output factor per direction.
+// The signal length defaults to size(dim); resizing slices from zero or pads
+// with zeros. The normalization string selects the output factor by direction.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -546,7 +545,7 @@ Tensor finish_layout(Tensor&& t, const std::vector<int64_t>& inv_perm) {
 
 namespace {
 
-// zero-imaginary complex copy (SpectralOps.cpp fft_r2c "fft"/"ifft" path).
+// Materialize a real signal as complex values with zero imaginary components.
 template <bool IsDouble>
 __global__ void real_to_cplx_kernel(
     int64_t n, const typename CudaTypes<IsDouble>::R* __restrict__ src,
@@ -791,7 +790,7 @@ Tensor fft_irfft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t d
 }
 
 // ---------------------------------------------------------------------------
-// (:1879-2010): bartlett/blackman/hamming/hann computed over the periodic
+// Bartlett/Blackman/Hamming/Hann windows are computed over the periodic
 // length L = window_length + (periodic ? 1 : 0), hann = hamming(0.5, 0.5).
 // ---------------------------------------------------------------------------
 
@@ -845,10 +844,10 @@ Tensor blackman_window_cuda(int64_t window_length, bool periodic, std::optional<
 }
 
 // ---------------------------------------------------------------------------
-//   stft (:940-1030): center pad -> time2col (as_strided) -> window mul ->
+//   stft: center pad -> time2col (as_strided) -> window mul ->
 //                     batched rfft/c2c with by_root_n normalization ->
 //                     transpose to (..., freq, frames)
-//   istft (:1046-1250): c2c/c2r with by_n (or by_root_n when normalized) ->
+//   istft: c2c/c2r with by_n (or by_root_n when normalized) ->
 //                     window mul -> overlap-add (unfold_backward) ->
 //                     envelope division -> crop / length pad
 //   stft_backward: adjoint — conj-symmetry fill + unscaled inverse + real
@@ -1126,7 +1125,7 @@ Tensor istft_cuda_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t 
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // norm = normalized ? by_root_n : by_n, SpectralOps.cpp:1160)
+    // Normalization divides by sqrt(n_fft) when enabled, otherwise by n_fft.
     const int64_t bins = n_fft / 2 + 1;
     Tensor cols({batch * frames, bins}, input.dtype(), input.device());
     {
