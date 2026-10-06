@@ -82,19 +82,19 @@ def _embedding_bag_forward_only(weight, indices, offsets, scale_grad_by_freq=Fal
             return _captured
     return _C._embedding_bag_forward_only(weight, indices, offsets, scale_grad_by_freq, mode, sparse, per_sample_weights, include_last_offset, padding_idx)
 
-def _embedding_bag_dense_backward(grad, indices, offset2bag, bag_size, maximum_indices, num_weights, scale_grad_by_freq, mode, per_sample_weights=None, padding_idx=-1):
+def _embedding_bag_dense_backward(grad_output, indices, offset2bag, bag_size, maximum_indices, num_weights, scale_grad_by_freq, mode, per_sample_weights=None, padding_idx=-1):
     if _capturing():
-        _captured = _capture_call(_embedding_bag_dense_backward, (grad, indices, offset2bag, bag_size, maximum_indices, num_weights, scale_grad_by_freq, mode, per_sample_weights, padding_idx), {})
+        _captured = _capture_call(_embedding_bag_dense_backward, (grad_output, indices, offset2bag, bag_size, maximum_indices, num_weights, scale_grad_by_freq, mode, per_sample_weights, padding_idx), {})
         if _captured is not None:
             return _captured
-    return _C._embedding_bag_dense_backward(grad, indices, offset2bag, bag_size, maximum_indices, num_weights, scale_grad_by_freq, mode, per_sample_weights, padding_idx)
+    return _C._embedding_bag_dense_backward(grad_output, indices, offset2bag, bag_size, maximum_indices, num_weights, scale_grad_by_freq, mode, per_sample_weights, padding_idx)
 
-def _embedding_bag_per_sample_weights_backward(grad, weight, indices, offsets, offset2bag, mode, padding_idx=-1):
+def _embedding_bag_per_sample_weights_backward(grad_output, weight, indices, offsets, offset2bag, mode, padding_idx=-1):
     if _capturing():
-        _captured = _capture_call(_embedding_bag_per_sample_weights_backward, (grad, weight, indices, offsets, offset2bag, mode, padding_idx), {})
+        _captured = _capture_call(_embedding_bag_per_sample_weights_backward, (grad_output, weight, indices, offsets, offset2bag, mode, padding_idx), {})
         if _captured is not None:
             return _captured
-    return _C._embedding_bag_per_sample_weights_backward(grad, weight, indices, offsets, offset2bag, mode, padding_idx)
+    return _C._embedding_bag_per_sample_weights_backward(grad_output, weight, indices, offsets, offset2bag, mode, padding_idx)
 
 def convolution(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups):
     if _capturing():
@@ -1779,25 +1779,25 @@ def cumulative_trapezoid(y, x=None, dx=1, dim=-1):
         dx = tensorplay.Scalar(dx)
     return _C.cumulative_trapezoid(y, x, dx=dx, dim=dim)
 
-def _trapezoid_backward(grad, x, ysizes, dx, dim):
+def _trapezoid_backward(grad_output, x, ysizes, dx, dim):
     if _capturing():
-        _captured = _capture_call(_trapezoid_backward, (grad, x, ysizes, dx, dim), {})
+        _captured = _capture_call(_trapezoid_backward, (grad_output, x, ysizes, dx, dim), {})
         if _captured is not None:
             return _captured
     if isinstance(ysizes, int) and not isinstance(ysizes, bool):
         ysizes = [ysizes]
     if not isinstance(dx, (tensorplay.Scalar, tensorplay.Tensor)):
         dx = tensorplay.Scalar(dx)
-    return _C._trapezoid_backward(grad, x, ysizes, dx, dim)
+    return _C._trapezoid_backward(grad_output, x, ysizes, dx, dim)
 
-def _cumulative_trapezoid_backward(grad, x, dx, dim):
+def _cumulative_trapezoid_backward(grad_output, x, dx, dim):
     if _capturing():
-        _captured = _capture_call(_cumulative_trapezoid_backward, (grad, x, dx, dim), {})
+        _captured = _capture_call(_cumulative_trapezoid_backward, (grad_output, x, dx, dim), {})
         if _captured is not None:
             return _captured
     if not isinstance(dx, (tensorplay.Scalar, tensorplay.Tensor)):
         dx = tensorplay.Scalar(dx)
-    return _C._cumulative_trapezoid_backward(grad, x, dx, dim)
+    return _C._cumulative_trapezoid_backward(grad_output, x, dx, dim)
 
 def gradient(input, spacing=[], dim=[], edge_order=1):
     if _capturing():
@@ -3190,12 +3190,12 @@ def _ctc_loss(log_probs, targets, input_lengths, target_lengths, blank=0, zero_i
             return _captured
     return _C._ctc_loss(log_probs, targets, input_lengths, target_lengths, blank, zero_infinity)
 
-def _ctc_loss_backward(grad, log_probs, targets, input_lengths, target_lengths, neg_log_likelihood, log_alpha, blank, zero_infinity):
+def _ctc_loss_backward(grad_output, log_probs, targets, input_lengths, target_lengths, neg_log_likelihood, log_alpha, blank, zero_infinity):
     if _capturing():
-        _captured = _capture_call(_ctc_loss_backward, (grad, log_probs, targets, input_lengths, target_lengths, neg_log_likelihood, log_alpha, blank, zero_infinity), {})
+        _captured = _capture_call(_ctc_loss_backward, (grad_output, log_probs, targets, input_lengths, target_lengths, neg_log_likelihood, log_alpha, blank, zero_infinity), {})
         if _captured is not None:
             return _captured
-    return _C._ctc_loss_backward(grad, log_probs, targets, input_lengths, target_lengths, neg_log_likelihood, log_alpha, blank, zero_infinity)
+    return _C._ctc_loss_backward(grad_output, log_probs, targets, input_lengths, target_lengths, neg_log_likelihood, log_alpha, blank, zero_infinity)
 
 def mse_loss(input, target, reduction=1, *, out=None):
     if out is not None:
@@ -3657,77 +3657,77 @@ def fft_irfft2(input, s=None, dim=[-2,-1], norm='backward', *, out=None):
             return _captured
     return _C.fft_irfft2(self=input, s=s, dim=dim, norm=norm)
 
-def fft_fft2_backward(grad, input, s=None, dim=[-2,-1], norm='backward'):
+def fft_fft2_backward(grad_output, input, s=None, dim=[-2,-1], norm='backward'):
     if _capturing():
-        _captured = _capture_call(fft_fft2_backward, (grad, input, s, dim, norm), {})
+        _captured = _capture_call(fft_fft2_backward, (grad_output, input, s, dim, norm), {})
         if _captured is not None:
             return _captured
     if isinstance(s, int) and not isinstance(s, bool):
         s = [s]
     if isinstance(dim, int) and not isinstance(dim, bool):
         dim = [dim]
-    return _C.fft_fft2_backward(grad, input, s, dim, norm)
+    return _C.fft_fft2_backward(grad_output, input, s, dim, norm)
 
-def fft_ifft2_backward(grad, input, s=None, dim=[-2,-1], norm='backward'):
+def fft_ifft2_backward(grad_output, input, s=None, dim=[-2,-1], norm='backward'):
     if _capturing():
-        _captured = _capture_call(fft_ifft2_backward, (grad, input, s, dim, norm), {})
+        _captured = _capture_call(fft_ifft2_backward, (grad_output, input, s, dim, norm), {})
         if _captured is not None:
             return _captured
     if isinstance(s, int) and not isinstance(s, bool):
         s = [s]
     if isinstance(dim, int) and not isinstance(dim, bool):
         dim = [dim]
-    return _C.fft_ifft2_backward(grad, input, s, dim, norm)
+    return _C.fft_ifft2_backward(grad_output, input, s, dim, norm)
 
-def fft_rfft2_backward(grad, input, s=None, dim=[-2,-1], norm='backward'):
+def fft_rfft2_backward(grad_output, input, s=None, dim=[-2,-1], norm='backward'):
     if _capturing():
-        _captured = _capture_call(fft_rfft2_backward, (grad, input, s, dim, norm), {})
+        _captured = _capture_call(fft_rfft2_backward, (grad_output, input, s, dim, norm), {})
         if _captured is not None:
             return _captured
     if isinstance(s, int) and not isinstance(s, bool):
         s = [s]
     if isinstance(dim, int) and not isinstance(dim, bool):
         dim = [dim]
-    return _C.fft_rfft2_backward(grad, input, s, dim, norm)
+    return _C.fft_rfft2_backward(grad_output, input, s, dim, norm)
 
-def fft_irfft2_backward(grad, input, s=None, dim=[-2,-1], norm='backward'):
+def fft_irfft2_backward(grad_output, input, s=None, dim=[-2,-1], norm='backward'):
     if _capturing():
-        _captured = _capture_call(fft_irfft2_backward, (grad, input, s, dim, norm), {})
+        _captured = _capture_call(fft_irfft2_backward, (grad_output, input, s, dim, norm), {})
         if _captured is not None:
             return _captured
     if isinstance(s, int) and not isinstance(s, bool):
         s = [s]
     if isinstance(dim, int) and not isinstance(dim, bool):
         dim = [dim]
-    return _C.fft_irfft2_backward(grad, input, s, dim, norm)
+    return _C.fft_irfft2_backward(grad_output, input, s, dim, norm)
 
-def fft_fft_backward(grad, input, dim, norm):
+def fft_fft_backward(grad_output, input, dim, norm):
     if _capturing():
-        _captured = _capture_call(fft_fft_backward, (grad, input, dim, norm), {})
+        _captured = _capture_call(fft_fft_backward, (grad_output, input, dim, norm), {})
         if _captured is not None:
             return _captured
-    return _C.fft_fft_backward(grad, input, dim, norm)
+    return _C.fft_fft_backward(grad_output, input, dim, norm)
 
-def fft_ifft_backward(grad, input, dim, norm):
+def fft_ifft_backward(grad_output, input, dim, norm):
     if _capturing():
-        _captured = _capture_call(fft_ifft_backward, (grad, input, dim, norm), {})
+        _captured = _capture_call(fft_ifft_backward, (grad_output, input, dim, norm), {})
         if _captured is not None:
             return _captured
-    return _C.fft_ifft_backward(grad, input, dim, norm)
+    return _C.fft_ifft_backward(grad_output, input, dim, norm)
 
-def fft_rfft_backward(grad, input, dim, norm):
+def fft_rfft_backward(grad_output, input, dim, norm, n=-1):
     if _capturing():
-        _captured = _capture_call(fft_rfft_backward, (grad, input, dim, norm), {})
+        _captured = _capture_call(fft_rfft_backward, (grad_output, input, dim, norm, n), {})
         if _captured is not None:
             return _captured
-    return _C.fft_rfft_backward(grad, input, dim, norm)
+    return _C.fft_rfft_backward(grad_output, input, dim, norm, n)
 
-def fft_irfft_backward(grad, input, dim, norm):
+def fft_irfft_backward(grad_output, input, dim, norm):
     if _capturing():
-        _captured = _capture_call(fft_irfft_backward, (grad, input, dim, norm), {})
+        _captured = _capture_call(fft_irfft_backward, (grad_output, input, dim, norm), {})
         if _captured is not None:
             return _captured
-    return _C.fft_irfft_backward(grad, input, dim, norm)
+    return _C.fft_irfft_backward(grad_output, input, dim, norm)
 
 def hann_window(window_length, periodic=True, dtype=None, *, device=None, layout=None, pin_memory=None):
     if _capturing():
@@ -6791,12 +6791,12 @@ def _sparse_semi_structured_mask_grad(grad, packed, meta):
             return _captured
     return _C._sparse_semi_structured_mask_grad(grad, packed, meta)
 
-def _sparse_semi_structured_gather_grad(grad, packed, meta):
+def _sparse_semi_structured_gather_grad(grad_output, packed, meta):
     if _capturing():
-        _captured = _capture_call(_sparse_semi_structured_gather_grad, (grad, packed, meta), {})
+        _captured = _capture_call(_sparse_semi_structured_gather_grad, (grad_output, packed, meta), {})
         if _captured is not None:
             return _captured
-    return _C._sparse_semi_structured_gather_grad(grad, packed, meta)
+    return _C._sparse_semi_structured_gather_grad(grad_output, packed, meta)
 
 def _sparse_semi_structured_mm(mat1, mat1_meta, mat2, out_dtype=None):
     if _capturing():
@@ -11836,14 +11836,14 @@ def _sparse_sum(input, dim=None):
         return _C._sparse_sum(input)
     return _C._sparse_sum(input, dim)
 
-def _sparse_sum_backward(grad, input, dim):
+def _sparse_sum_backward(grad_output, input, dim):
     if _capturing():
-        _captured = _capture_call(_sparse_sum_backward, (grad, input, dim), {})
+        _captured = _capture_call(_sparse_sum_backward, (grad_output, input, dim), {})
         if _captured is not None:
             return _captured
     if isinstance(dim, int) and not isinstance(dim, bool):
         dim = [dim]
-    return _C._sparse_sum_backward(grad, input, dim)
+    return _C._sparse_sum_backward(grad_output, input, dim)
 
 def _sparse_csr_sum(input, dim, keepdim=False, dtype=None):
     if _capturing():
@@ -15150,14 +15150,14 @@ def segment_reduce(data, reduce, lengths=None, indices=None, offsets=None, axis=
         initial = tensorplay.Scalar(initial)
     return _C.segment_reduce(data, reduce, lengths=lengths, indices=indices, offsets=offsets, axis=axis, unsafe=unsafe, initial=initial)
 
-def _segment_reduce_backward(grad, output, data, reduce, lengths=None, offsets=None, axis=0, initial=None):
+def _segment_reduce_backward(grad_output, output, data, reduce, lengths=None, offsets=None, axis=0, initial=None):
     if _capturing():
-        _captured = _capture_call(_segment_reduce_backward, (grad, output, data, reduce, lengths, offsets, axis, initial), {})
+        _captured = _capture_call(_segment_reduce_backward, (grad_output, output, data, reduce, lengths, offsets, axis, initial), {})
         if _captured is not None:
             return _captured
     if initial is not None and not isinstance(initial, (tensorplay.Scalar, tensorplay.Tensor)):
         initial = tensorplay.Scalar(initial)
-    return _C._segment_reduce_backward(grad, output, data, reduce, lengths=lengths, offsets=offsets, axis=axis, initial=initial)
+    return _C._segment_reduce_backward(grad_output, output, data, reduce, lengths=lengths, offsets=offsets, axis=axis, initial=initial)
 
 def _segment_reduce(data, reduce, lengths=None, offsets=None, axis=0, initial=None):
     if _capturing():

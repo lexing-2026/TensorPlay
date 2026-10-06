@@ -155,6 +155,7 @@ set(P10_SOURCES
     src/backend/composite/WeightNorm.cpp
     src/backend/composite/Pointwise.cpp
     src/backend/composite/Reduction.cpp
+    src/backend/composite/Spectral.cpp
     src/backend/meta/MetaKernels.cpp
     src/backend/composite/RNN.cpp
     src/backend/composite/TensorAdvancedIndexing.cpp
@@ -1017,7 +1018,7 @@ if(WIN32)
 endif()
 if(USE_VULKAN)
     # The vendored trees come in two layouts: a flattened snapshot (headers
-    # at the tree root) and a restored upstream clone (headers under
+    # at the tree root) and a restored source tree (headers under
     # include/); list both roots so either checkout resolves.
     target_include_directories(p10 SYSTEM PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/vulkan-headers"

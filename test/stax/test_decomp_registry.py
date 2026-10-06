@@ -498,6 +498,18 @@ SAMPLES = {
     "fft_ifft2.default": lambda: ((tp.complex(_t(4, 6), _t(4, 6)),), {}),
     "fft_rfft2.default": lambda: ((_t(4, 6),), {}),
     "fft_irfft2.default": lambda: ((tp.complex(_t(4, 4), _t(4, 4)),), {}),
+    "fft_hfft.default": lambda: ((tp.complex(_t(5), _t(5)),), {}),
+    "fft_ihfft.default": lambda: ((_t(8),), {"n": 6, "norm": "ortho"}),
+    "fft_fftn.default": lambda: ((tp.complex(_t(3, 4, 5), _t(3, 4, 5)),), {}),
+    "fft_ifftn.default": lambda: ((_t(3, 4, 5),), {"s": [4, 3], "norm": "forward"}),
+    "fft_rfftn.default": lambda: ((_t(3, 4, 6),), {"dim": [0, 2]}),
+    "fft_irfftn.default": lambda: ((tp.complex(_t(3, 4, 4), _t(3, 4, 4)),), {}),
+    "fft_hfftn.default": lambda: ((tp.complex(_t(3, 4, 4), _t(3, 4, 4)),), {"norm": "ortho"}),
+    "fft_ihfftn.default": lambda: ((_t(3, 4, 6),), {}),
+    "fft_hfft2.default": lambda: ((tp.complex(_t(4, 4), _t(4, 4)),), {"s": [3, 5]}),
+    "fft_ihfft2.default": lambda: ((_t(4, 6),), {}),
+    "fft_fftshift.default": lambda: ((_t(4, 5),), {}),
+    "fft_ifftshift.default": lambda: ((_t(4, 5),), {"dim": [1]}),
     # Resampling; the explicit-scale calls keep output sizes consistent with
     # floor(input * scale), which the gather indices assume.
     "upsample_nearest1d.default": lambda: ((_t(1, 2, 4), [8]), {}),
@@ -1261,13 +1273,6 @@ def test_every_functional_decomposition_has_a_sample():
             # Batch norm legit forms have no CPU eager kernels; the walk is
             # shared with native_batch_norm and exercised against it below.
             "_native_batch_norm_legit.default", "_native_batch_norm_legit.no_stats",
-            # Transforms without CPU eager kernels; validated through the
-            # round-trip identities in the fft test module instead.
-            "fft_hfft.default", "fft_ihfft.default",
-            "fft_fftn.default", "fft_ifftn.default", "fft_rfftn.default",
-            "fft_irfftn.default", "fft_hfftn.default", "fft_ihfftn.default",
-            "fft_hfft2.default", "fft_ihfft2.default",
-            "fft_fftshift.default", "fft_ifftshift.default",
             # Anti-aliased lanczos has no CPU kernel at any level; its vec
             # decomposition only unpacks the scale factors onto the default op.
             "_upsample_lanczos2d_aa.vec",

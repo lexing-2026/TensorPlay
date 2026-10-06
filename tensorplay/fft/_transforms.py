@@ -1,30 +1,31 @@
 """Forward and inverse discrete Fourier transforms.
 
-The 1-D and 2-D transforms dispatch straight to the compiled spectral
-kernels.  The n-D and Hermitian families compose those kernels while keeping
-the same axis and normalization conventions.
+Every transform is a native op: the 1-D and 2-D families have their own
+kernels, and the n-D and Hermitian families compose them natively, so
+gradients, ``out=`` and compiled capture behave the same for all of them.
 """
 from tensorplay import (
-    fft_fft as _c2c_fwd,
-    fft_fft2 as _fft2_native,
-    fft_ifft as _c2c_inv,
-    fft_ifft2 as _ifft2_native,
-    fft_irfft as _c2r,
-    fft_irfft2 as _irfft2_native,
-    fft_rfft as _r2c,
-    fft_rfft2 as _rfft2_native,
+    fft_fft as _fft,
+    fft_fft2 as _fft2,
+    fft_fftn as _fftn,
+    fft_hfft as _hfft,
+    fft_hfft2 as _hfft2,
+    fft_hfftn as _hfftn,
+    fft_ifft as _ifft,
+    fft_ifft2 as _ifft2,
+    fft_ifftn as _ifftn,
+    fft_ihfft as _ihfft,
+    fft_ihfft2 as _ihfft2,
+    fft_ihfftn as _ihfftn,
+    fft_irfft as _irfft,
+    fft_irfft2 as _irfft2,
+    fft_irfftn as _irfftn,
+    fft_rfft as _rfft,
+    fft_rfft2 as _rfft2,
+    fft_rfftn as _rfftn,
 )
 
-from ._helpers import (
-    apply_c2c,
-    conj,
-    default_dims,
-    norm_mode,
-    normalize_dims,
-    split_last_dim,
-    transform_size,
-    transform_sizes,
-)
+from ._helpers import int_list, norm_arg, signal_length
 
 __all__ = [
     "fft",
@@ -48,43 +49,6 @@ __all__ = [
 ]
 
 
-def _copy_to_out(result, out):
-    if out is not None:
-        if out.dtype != result.dtype:
-            raise TypeError(
-                f"out has dtype {out.dtype}, but the result has dtype {result.dtype}"
-            )
-        if out.device != result.device:
-            raise RuntimeError(
-                f"out is on {out.device}, but the result is on {result.device}"
-            )
-        if tuple(out.shape) != tuple(result.shape):
-            out.resize_(result.shape)
-        out.copy_(result)
-        return out
-    return result
-
-
-def _reverse_norm(norm):
-    """The tag of the opposite-direction transform with the same scaling.
-
-    A Hermitian transform runs the real transform of the other direction, so
-    it keeps the caller's scaling by swapping ``"backward"`` and
-    ``"forward"``."""
-    mode = norm_mode(norm)
-    return {"backward": "forward", "forward": "backward"}.get(mode, mode)
-
-
-def _one_dim(input, n, dim, op, name, norm):
-    if input.dim() < 1:
-        raise ValueError(f"{name} expects an input with at least one dimension")
-    dims = normalize_dims(dim, input.dim())
-    if len(dims) != 1:
-        raise ValueError(f"{name} expects exactly one transform dimension")
-    axis = dims[0]
-    return op(input, transform_size(n), axis, norm_mode(norm))
-
-
 # ---------------------------------------------------------------------------
 # 1-D transforms
 # ---------------------------------------------------------------------------
@@ -99,26 +63,22 @@ def fft(input, n=None, dim=-1, norm=None, *, out=None):
         norm (str, optional): ``"backward"``, ``"forward"`` or ``"ortho"``.
             Default: ``None`` (= ``"backward"``)
     """
-    result = _one_dim(input, n, dim, _c2c_fwd, "fft", norm)
-    return _copy_to_out(result, out)
+    return _fft(input, signal_length(n), dim, norm_arg(norm), out=out)
 
 
 def ifft(input, n=None, dim=-1, norm=None, *, out=None):
     """Computes the one-dimensional inverse discrete Fourier transform."""
-    result = _one_dim(input, n, dim, _c2c_inv, "ifft", norm)
-    return _copy_to_out(result, out)
+    return _ifft(input, signal_length(n), dim, norm_arg(norm), out=out)
 
 
 def rfft(input, n=None, dim=-1, norm=None, *, out=None):
     """Computes the one-dimensional FFT of real input, one-sided output."""
-    result = _one_dim(input, n, dim, _r2c, "rfft", norm)
-    return _copy_to_out(result, out)
+    return _rfft(input, signal_length(n), dim, norm_arg(norm), out=out)
 
 
 def irfft(input, n=None, dim=-1, norm=None, *, out=None):
     """Computes the inverse of :func:`rfft`; :attr:`n` is the output length."""
-    result = _one_dim(input, n, dim, _c2r, "irfft", norm)
-    return _copy_to_out(result, out)
+    return _irfft(input, signal_length(n), dim, norm_arg(norm), out=out)
 
 
 def hfft(input, n=None, dim=-1, norm=None, *, out=None):
@@ -127,8 +87,7 @@ def hfft(input, n=None, dim=-1, norm=None, *, out=None):
     Equivalent to :func:`irfft` applied to ``input.conj()``; :attr:`n` is the
     output length (default ``2 * (input.size(dim) - 1)``).
     """
-    result = _one_dim(conj(input), n, dim, _c2r, "hfft", _reverse_norm(norm))
-    return _copy_to_out(result, out)
+    return _hfft(input, n, dim, norm, out=out)
 
 
 def ihfft(input, n=None, dim=-1, norm=None, *, out=None):
@@ -138,8 +97,7 @@ def ihfft(input, n=None, dim=-1, norm=None, *, out=None):
     as an inverse transform; :attr:`n` zero-pads/truncates the input along
     :attr:`dim`.
     """
-    result = conj(_one_dim(input, n, dim, _r2c, "ihfft", _reverse_norm(norm)))
-    return _copy_to_out(result, out)
+    return _ihfft(input, n, dim, norm, out=out)
 
 
 # ---------------------------------------------------------------------------
@@ -148,46 +106,27 @@ def ihfft(input, n=None, dim=-1, norm=None, *, out=None):
 
 def fft2(input, s=None, dim=(-2, -1), norm=None, *, out=None):
     """Computes the two-dimensional discrete Fourier transform."""
-    dims = normalize_dims(dim, input.dim())
-    if len(dims) != 2:
-        raise ValueError("fft2 expects exactly two transformed dimensions")
-    sizes = transform_sizes(s, 2) if s is not None else None
-    result = _fft2_native(
-        input, sizes, dims, norm_mode(norm))
-    return _copy_to_out(result, out)
+    return _fft2(input, int_list(s), int_list(dim), norm_arg(norm), out=out)
 
 
 def ifft2(input, s=None, dim=(-2, -1), norm=None, *, out=None):
     """Computes the two-dimensional inverse discrete Fourier transform."""
-    dims = normalize_dims(dim, input.dim())
-    if len(dims) != 2:
-        raise ValueError("ifft2 expects exactly two transformed dimensions")
-    sizes = transform_sizes(s, 2) if s is not None else None
-    result = _ifft2_native(
-        input, sizes, dims, norm_mode(norm))
-    return _copy_to_out(result, out)
+    return _ifft2(input, int_list(s), int_list(dim), norm_arg(norm), out=out)
 
 
 def fftn(input, s=None, dim=None, norm=None, *, out=None):
-    """Computes the N-dimensional discrete Fourier transform over :attr:`dim`."""
-    dims = default_dims(input, s) if dim is None else normalize_dims(dim, input.dim())
-    if len(dims) == 2:
-        result = fft2(input, s, dims, norm)
-    else:
-        sizes = transform_sizes(s, len(dims))
-        result = apply_c2c(input, dims, sizes, norm_mode(norm), forward=True)
-    return _copy_to_out(result, out)
+    """Computes the N-dimensional discrete Fourier transform over :attr:`dim`.
+
+    :attr:`dim` defaults to the last ``len(s)`` dimensions when :attr:`s` is
+    given and to every dimension otherwise; an entry of ``-1`` in :attr:`s`
+    keeps that dimension's length.
+    """
+    return _fftn(input, int_list(s), int_list(dim), norm, out=out)
 
 
 def ifftn(input, s=None, dim=None, norm=None, *, out=None):
     """Computes the N-dimensional inverse discrete Fourier transform."""
-    dims = default_dims(input, s) if dim is None else normalize_dims(dim, input.dim())
-    if len(dims) == 2:
-        result = ifft2(input, s, dims, norm)
-    else:
-        sizes = transform_sizes(s, len(dims))
-        result = apply_c2c(input, dims, sizes, norm_mode(norm), forward=False)
-    return _copy_to_out(result, out)
+    return _ifftn(input, int_list(s), int_list(dim), norm, out=out)
 
 
 # ---------------------------------------------------------------------------
@@ -196,88 +135,49 @@ def ifftn(input, s=None, dim=None, norm=None, *, out=None):
 
 def rfft2(input, s=None, dim=(-2, -1), norm=None, *, out=None):
     """Computes the two-dimensional FFT of real input."""
-    dims = normalize_dims(dim, input.dim())
-    if len(dims) != 2:
-        raise ValueError("rfft2 expects exactly two transformed dimensions")
-    sizes = transform_sizes(s, 2) if s is not None else None
-    result = _rfft2_native(
-        input, sizes, dims, norm_mode(norm))
-    return _copy_to_out(result, out)
+    return _rfft2(input, int_list(s), int_list(dim), norm_arg(norm), out=out)
 
 
 def irfft2(input, s=None, dim=(-2, -1), norm=None, *, out=None):
     """Computes the inverse of :func:`rfft2`."""
-    dims = normalize_dims(dim, input.dim())
-    if len(dims) != 2:
-        raise ValueError("irfft2 expects exactly two transformed dimensions")
-    sizes = transform_sizes(s, 2) if s is not None else None
-    result = _irfft2_native(
-        input, sizes, dims, norm_mode(norm))
-    return _copy_to_out(result, out)
+    return _irfft2(input, int_list(s), int_list(dim), norm_arg(norm), out=out)
 
 
 def rfftn(input, s=None, dim=None, norm=None, *, out=None):
     """N-dimensional FFT of real input; one-sided along the last listed dim."""
-    dims = default_dims(input, s) if dim is None else normalize_dims(dim, input.dim())
-    if len(dims) == 2:
-        result = rfft2(input, s, dims, norm)
-    else:
-        sizes = transform_sizes(s, len(dims))
-        rest_dims, last_dim = dims[:-1], dims[-1]
-        rest_sizes, last_size = sizes[:-1], sizes[-1]
-        out_t = _r2c(input, transform_size(last_size), last_dim, norm_mode(norm))
-        result = apply_c2c(out_t, rest_dims, rest_sizes, norm_mode(norm), forward=True)
-    return _copy_to_out(result, out)
+    return _rfftn(input, int_list(s), int_list(dim), norm, out=out)
 
 
 def irfftn(input, s=None, dim=None, norm=None, *, out=None):
-    """Inverse of :func:`rfftn`; :attr:`s[-1]` is the real output size."""
-    dims = default_dims(input, s) if dim is None else normalize_dims(dim, input.dim())
-    if len(dims) == 2:
-        result = irfft2(input, s, dims, norm)
-    else:
-        rest_dims, last_dim, rest_sizes, last_size = split_last_dim(input, s, dims)
-        out_t = _c2r(input, transform_size(last_size), last_dim, norm_mode(norm))
-        result = apply_c2c(out_t, rest_dims, rest_sizes, norm_mode(norm), forward=False)
-    return _copy_to_out(result, out)
+    """Inverse of :func:`rfftn`; :attr:`s[-1]` is the real output size
+    (default ``2 * (input.size(dim[-1]) - 1)``)."""
+    return _irfftn(input, int_list(s), int_list(dim), norm, out=out)
 
 
 # ---------------------------------------------------------------------------
-# Hermitian n-D families
+# Hermitian 2-D / n-D families
 # ---------------------------------------------------------------------------
 
 def hfft2(input, s=None, dim=(-2, -1), norm=None, *, out=None):
-    """Two-dimensional inverse of a Hermitian-symmetric spectrum; real output."""
-    return hfftn(input, s, dim, norm, out=out)
+    """Two-dimensional FFT of a Hermitian-symmetric spectrum; real output."""
+    return _hfft2(input, int_list(s), int_list(dim), norm, out=out)
 
 
 def ihfft2(input, s=None, dim=(-2, -1), norm=None, *, out=None):
     """Two-dimensional counterpart of :func:`ihfft`."""
-    return ihfftn(input, s, dim, norm, out=out)
+    return _ihfft2(input, int_list(s), int_list(dim), norm, out=out)
 
 
 def hfftn(input, s=None, dim=None, norm=None, *, out=None):
     """N-dimensional FFT of a Hermitian-symmetric spectrum; real output.
 
-    Applies :func:`fft` over the leading transformed dimensions, then
+    The forward transform over the leading transformed dimensions, then
     :func:`hfft` (conjugate + complex-to-real) along the final one.
     """
-    dims = default_dims(input, s) if dim is None else normalize_dims(dim, input.dim())
-    rest_dims, last_dim, rest_sizes, last_size = split_last_dim(input, s, dims)
-    result = apply_c2c(
-        input, rest_dims, rest_sizes, norm_mode(norm), forward=True)
-    result = _c2r(
-        conj(result), transform_size(last_size), last_dim, _reverse_norm(norm))
-    return _copy_to_out(result, out)
+    return _hfftn(input, int_list(s), int_list(dim), norm, out=out)
 
 
 def ihfftn(input, s=None, dim=None, norm=None, *, out=None):
     """Inverse of :func:`hfftn`: :func:`ihfft` along the final transformed
-    dimension, then :func:`ifft` over the remaining dimensions."""
-    dims = default_dims(input, s) if dim is None else normalize_dims(dim, input.dim())
-    rest_dims, last_dim, rest_sizes, last_size = split_last_dim(input, s, dims)
-    result = _r2c(
-        input, transform_size(last_size), last_dim, _reverse_norm(norm))
-    result = apply_c2c(
-        conj(result), rest_dims, rest_sizes, norm_mode(norm), forward=False)
-    return _copy_to_out(result, out)
+    dimension, then the inverse transform over the remaining dimensions."""
+    return _ihfftn(input, int_list(s), int_list(dim), norm, out=out)

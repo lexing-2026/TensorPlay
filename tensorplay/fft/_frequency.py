@@ -1,97 +1,45 @@
 """Frequency-grid construction and spectrum re-ordering helpers."""
-import operator
+from tensorplay import (
+    fft_fftfreq as _fftfreq,
+    fft_fftshift as _fftshift,
+    fft_ifftshift as _ifftshift,
+    fft_rfftfreq as _rfftfreq,
+)
 
-from tensorplay import arange, cat
-from tensorplay._C import DType
-
-from ._helpers import normalize_dims
+from ._helpers import int_list
 
 __all__ = ["fftfreq", "rfftfreq", "fftshift", "ifftshift"]
 
 
-def _copy_to_out(result, out):
-    if out is None:
-        return result
-    if out.dtype != result.dtype:
-        raise TypeError(
-            f"out has dtype {out.dtype}, but the result has dtype {result.dtype}"
-        )
-    if out.device != result.device:
-        raise RuntimeError(
-            f"out is on {out.device}, but the result is on {result.device}"
-        )
-    if tuple(out.shape) != tuple(result.shape):
-        out.resize_(result.shape)
-    out.copy_(result)
-    return out
-
-
-def fftfreq(n, d=1.0, *, dtype=DType.float32, device=None, out=None):
-    """DFT sample frequencies (cycles/unit): ``[0, 1, ..., n/2-1, -n/2, ..., -1] / (n*d)``.
+def fftfreq(n, d=1.0, *, out=None, dtype=None, layout=None, device=None,
+            requires_grad=False):
+    """DFT sample frequencies (cycles/unit): ``[0, 1, ..., (n-1)//2, -(n//2), ..., -1] / (n*d)``.
 
     Args:
         n (int): window length
         d (float, optional): sample spacing. Default: 1.0
-        dtype / device: forwarded to the factory ops. Default: float32/CPU
+        dtype / layout / device: of the result. Default: the default
+            floating dtype, on the CPU
     """
-    try:
-        n = operator.index(n)
-    except TypeError as exc:
-        raise TypeError(f"n must be an integer, got {type(n).__name__}") from exc
-    if n <= 0:
-        raise ValueError(f"n must be positive, got {n}")
-    if d == 0:
-        raise ValueError("d must be non-zero")
-    pos = arange((n + 1) // 2, dtype=dtype, device=device)
-    neg = arange(-(n // 2), 0, dtype=dtype, device=device)
-    result = cat([pos, neg]) * (1.0 / (n * d))
-    return _copy_to_out(result, out)
+    result = _fftfreq(n, d, dtype=dtype, layout=layout, device=device, out=out)
+    return result.requires_grad_() if requires_grad else result
 
 
-def rfftfreq(n, d=1.0, *, dtype=DType.float32, device=None, out=None):
+def rfftfreq(n, d=1.0, *, out=None, dtype=None, layout=None, device=None,
+             requires_grad=False):
     """Sample frequencies for :func:`rfft`/one-sided transforms: ``[0..n//2] / (n*d)``."""
-    try:
-        n = operator.index(n)
-    except TypeError as exc:
-        raise TypeError(f"n must be an integer, got {type(n).__name__}") from exc
-    if n <= 0:
-        raise ValueError(f"n must be positive, got {n}")
-    if d == 0:
-        raise ValueError("d must be non-zero")
-    val = 1.0 / (n * d)
-    result = arange(n // 2 + 1, dtype=dtype, device=device) * val
-    return _copy_to_out(result, out)
-
-
-def _shift_dims(input, dim):
-    ndim = input.dim()
-    if dim is None:
-        return list(range(ndim))
-    return normalize_dims(dim, ndim)
+    result = _rfftfreq(n, d, dtype=dtype, layout=layout, device=device, out=out)
+    return result.requires_grad_() if requires_grad else result
 
 
 def fftshift(input, dim=None):
     """Re-orders an N-D FFT output so the zero-frequency term is centered.
 
-    Shifts by ``+n // 2`` along each (or the given) dimension(s).
+    Rolls by ``n // 2`` along each (or the given) dimension(s).
     """
-    out = input
-    for d in _shift_dims(input, dim):
-        n = out.size(d)
-        if n < 2:
-            continue
-        k = n // 2
-        out = cat([out.narrow(d, k, n - k), out.narrow(d, 0, k)], dim=d)
-    return out
+    return _fftshift(input, int_list(dim))
 
 
 def ifftshift(input, dim=None):
-    """Inverse of :func:`fftshift`; shifts by ``-(n // 2)`` (odd-safe)."""
-    out = input
-    for d in _shift_dims(input, dim):
-        n = out.size(d)
-        if n < 2:
-            continue
-        k = n // 2
-        out = cat([out.narrow(d, n - k, k), out.narrow(d, 0, n - k)], dim=d)
-    return out
+    """Inverse of :func:`fftshift`; rolls by ``(n + 1) // 2`` (odd-safe)."""
+    return _ifftshift(input, int_list(dim))
