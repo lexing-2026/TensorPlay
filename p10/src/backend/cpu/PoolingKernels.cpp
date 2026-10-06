@@ -1669,12 +1669,31 @@ Tensor adaptive_max_pool3d_impl(const Tensor& input,
         return out.squeeze(0);
     }
     if (input.dim() != 5) TP_THROW(RuntimeError, "adaptive_max_pool3d: Expected 5D input");
-    const Tensor input_c = input.contiguous();
-    const int64_t N = input_c.size(0), C = input_c.size(1);
-    const int64_t D = input_c.size(2), H = input_c.size(3), W = input_c.size(4);
+    const int64_t N = input.size(0), C = input.size(1);
+    const int64_t D = input.size(2), H = input.size(3), W = input.size(4);
     const int64_t oD = output_size[0], oH = output_size[1], oW = output_size[2];
     if (oD <= 0 || oH <= 0 || oW <= 0)
         TP_THROW(RuntimeError, "adaptive_max_pool3d: Invalid output size");
+    // Channels-last-3d frame pools the NDHWC buffer in place; the channel
+    // span is the tier-compiled vectorized dimension (cpu/PoolingKernels.h).
+    // Winners publish densely into a channels-last-3d index tensor, matching
+    // the fixed-shape frame; the NCDHW frame below fills its dense NCDHW
+    // indices only when requested.
+    if (input.is_contiguous(MemoryFormat::ChannelsLast3d) &&
+        (input.dtype() == DType::Float32 || input.dtype() == DType::Float64)) {
+        const std::vector<int64_t> out_sizes = {N, C, oD, oH, oW};
+        Tensor out = Tensor::empty(out_sizes, input.dtype(), input.device());
+        out = out.as_strided(out_sizes, get_channels_last_strides(out_sizes), 0);
+        Tensor indices = Tensor::empty(out_sizes, DType::Int64, input.device());
+        indices = indices.as_strided(out_sizes, get_channels_last_strides(out_sizes), 0);
+        adaptive_max_pool3d_cl_stub(DeviceType::CPU, input.data_ptr(),
+                                    out.data_ptr(), indices.data_ptr<int64_t>(),
+                                    N, C, D, H, W, oD, oH, oW,
+                                    static_cast<int>(input.dtype()));
+        if (indices_out) *indices_out = indices;
+        return out;
+    }
+    const Tensor input_c = input.contiguous();
     Tensor out = Tensor::empty({N, C, oD, oH, oW}, input.dtype(), input.device());
     Tensor indices;
     if (indices_out) {
@@ -1755,6 +1774,32 @@ Tensor adaptive_max_pool3d_backward_cpu(const Tensor& grad_output, const Tensor&
                                                 input.unsqueeze(0)).squeeze(0);
     if (grad_output.dim() != 5 || input.dim() != 5)
         TP_THROW(RuntimeError, "adaptive_max_pool3d_backward: Expected 5D input and grad_output");
+    // Channels-last-3d frame: each output pixel re-finds its per-lane argmax
+    // with the forward sweep over the NDHWC input and adds its grad_output
+    // channel block straight onto the argmax positions of an NDHWC-viewed
+    // zero buffer, skipping the NCDHW materializations the scalar path below
+    // pays for.  Accumulation order per input element matches the scalar
+    // frame, so gradients are bit-identical.
+    if (grad_output.is_contiguous(MemoryFormat::ChannelsLast3d) &&
+        input.is_contiguous(MemoryFormat::ChannelsLast3d) &&
+        (input.dtype() == DType::Float32 || input.dtype() == DType::Float64) &&
+        grad_output.dtype() == input.dtype()) {
+        const std::vector<int64_t> sizes = input.shape();
+        Tensor grad_input = Tensor::zeros(sizes, input.dtype(), input.device());
+        grad_input = grad_input.as_strided(sizes, get_channels_last_strides(sizes), 0);
+        adaptive_max_pool3d_backward_cl_stub(DeviceType::CPU,
+                                             grad_output.data_ptr(),
+                                             input.data_ptr(),
+                                             grad_input.data_ptr(),
+                                             input.size(0), input.size(1),
+                                             input.size(2), input.size(3),
+                                             input.size(4),
+                                             grad_output.size(2),
+                                             grad_output.size(3),
+                                             grad_output.size(4),
+                                             static_cast<int>(input.dtype()));
+        return grad_input;
+    }
     const Tensor input_c = input.contiguous();
     const Tensor go = grad_output.contiguous();
     const int64_t N = input_c.size(0), C = input_c.size(1);
@@ -1817,6 +1862,8 @@ DEFINE_DISPATCH(max_pool3d_backward_cl_stub);
 DEFINE_DISPATCH(adaptive_avg_pool2d_cl_stub);
 DEFINE_DISPATCH(adaptive_max_pool2d_cl_stub);
 DEFINE_DISPATCH(adaptive_max_pool2d_backward_cl_stub);
+DEFINE_DISPATCH(adaptive_max_pool3d_cl_stub);
+DEFINE_DISPATCH(adaptive_max_pool3d_backward_cl_stub);
 
 TENSORPLAY_LIBRARY_IMPL(CPU, PoolingKernels) {
     m.impl("avg_pool2d", avg_pool2d_cpu);

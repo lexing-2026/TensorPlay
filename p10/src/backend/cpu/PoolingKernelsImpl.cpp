@@ -600,6 +600,264 @@ void adaptive_max_pool2d_cl_typed(const T* in, T* out, int64_t* ind,
     });
 }
 
+// Adaptive channels-last-3d max pool.  Workers own single output pixels and
+// each pixel's window is derived from the input/output extents with the same
+// start/end arithmetic as the NCDHW frame, always covering at least one
+// position; the sweep, the NaN/tie predicate and the dense channels-last-3d
+// index publish match the fixed-shape frame bit for bit.
+template <typename T>
+void adaptive_max_pool3d_cl_typed(const T* in, T* out, int64_t* ind,
+                                  int64_t N, int64_t C,
+                                  int64_t D, int64_t H, int64_t W,
+                                  int64_t oD, int64_t oH, int64_t oW) {
+    using Vec = tensorplay::vec::Vectorized<T>;
+    using I = vec::int_same_size_t<T>;
+    using iVec = tensorplay::vec::Vectorized<I>;
+    constexpr int64_t V = Vec::size();
+    static_assert(iVec::size() == V, "index lanes must follow value lanes");
+    const int64_t len = C - (C % V);
+    const T lo = std::numeric_limits<T>::is_iec559
+        ? -std::numeric_limits<T>::infinity()
+        : std::numeric_limits<T>::lowest();
+    const int64_t tasks = N * oD * oH * oW;
+    parallel_for(0, tasks, 1, [&](int64_t begin, int64_t end) {
+        std::unique_ptr<I[]> idxstate(new I[C > 0 ? C : 1]);
+        int64_t rest = begin;
+        int64_t ow = rest % oW; rest /= oW;
+        int64_t oh = rest % oH; rest /= oH;
+        int64_t od = rest % oD; rest /= oD;
+        int64_t n = rest;
+        for (int64_t task = begin; task < end; ++task) {
+            T* out_lane = out + task * C;
+            int64_t* ind_lane = ind + task * C;
+            const int64_t ds = od * D / oD;
+            const int64_t de = 1 + (((od + 1) * D) - 1) / oD;
+            const int64_t hs = oh * H / oH;
+            const int64_t he = 1 + (((oh + 1) * H) - 1) / oH;
+            const int64_t ws = ow * W / oW;
+            const int64_t we = 1 + (((ow + 1) * W) - 1) / oW;
+            const iVec minus1(I(-1));
+            {
+                int64_t c = 0;
+                for (; c < len; c += V) {
+                    Vec(lo).store(out_lane + c);
+                    minus1.store(idxstate.get() + c);
+                }
+                for (; c < C; ++c) {
+                    out_lane[c] = lo;
+                    idxstate[c] = I(-1);
+                }
+            }
+            for (int64_t kd = ds; kd < de; ++kd) {
+                const T* slice = in + (n * D + kd) * H * W * C;
+                for (int64_t kh = hs; kh < he; ++kh) {
+                    const T* row = slice + kh * W * C;
+                    for (int64_t kw = ws; kw < we; ++kw) {
+                        const T* in_lane = row + kw * C;
+                        const I off = I((kd * H + kh) * W + kw);
+                        const iVec off_vec(off);
+                        int64_t c2 = 0;
+                        for (; c2 < len; c2 += V) {
+                            const Vec maxv = Vec::loadu(out_lane + c2);
+                            const Vec val = Vec::loadu(in_lane + c2);
+                            // A NaN takes the maximum, like the NCDHW frame;
+                            // the same mask drives the value and index blend.
+                            const Vec mask = (val != val) | (val > maxv);
+                            Vec::blendv(maxv, val, mask).store(out_lane + c2);
+                            // All-ones float lanes are all-ones integer bits,
+                            // so the mask crosses to the index blend
+                            // unchanged.
+                            const iVec imask = vec::cast<I>(mask);
+                            const iVec cur = iVec::loadu(idxstate.get() + c2);
+                            iVec::blendv(cur, off_vec, imask)
+                                .store(idxstate.get() + c2);
+                        }
+                        for (; c2 < C; ++c2) {
+                            const T v = in_lane[c2];
+                            if ((v != v) || (v > out_lane[c2])) {
+                                out_lane[c2] = v;
+                                idxstate[c2] = off;
+                            }
+                        }
+                    }
+                }
+            }
+            for (int64_t c = 0; c < C; ++c) {
+                ind_lane[c] = int64_t(idxstate[c]);
+            }
+            ++ow;
+            if (ow == oW) {
+                ow = 0;
+                if (++oh == oH) {
+                    oh = 0;
+                    if (++od == oD) {
+                        od = 0;
+                        ++n;
+                    }
+                }
+            }
+        }
+    });
+}
+
+// Scatter twin of the NCDHW adaptive backward: each output pixel re-finds
+// its per-lane argmax with the forward sweep and predicate, then adds its
+// grad_output lane onto that position of the NDHWC grad_input.  Output
+// pixels run in the scalar frame's (D, H, W) lexicographic order, so
+// overlapping windows accumulate in the same sequence and gradients match
+// the NCDHW frame bit for bit.
+template <typename T>
+void adaptive_max_pool3d_backward_cl_typed(const T* gout, const T* in, T* gin,
+                                           int64_t N, int64_t C,
+                                           int64_t D, int64_t H, int64_t W,
+                                           int64_t oD, int64_t oH, int64_t oW) {
+    using Vec = tensorplay::vec::Vectorized<T>;
+    using I = vec::int_same_size_t<T>;
+    using iVec = tensorplay::vec::Vectorized<I>;
+    constexpr int64_t V = Vec::size();
+    static_assert(iVec::size() == V, "index lanes must follow value lanes");
+    const int64_t len = C - (C % V);
+    const T lo = std::numeric_limits<T>::is_iec559
+        ? -std::numeric_limits<T>::infinity()
+        : std::numeric_limits<T>::lowest();
+    const int64_t in_vol = D * H * W;
+    const int64_t out_vol = oD * oH * oW;
+    parallel_for(0, N, 1, [&](int64_t begin, int64_t end) {
+        T gbuf[V];
+        std::unique_ptr<T[]> maxstate(new T[C > 0 ? C : 1]);
+        std::unique_ptr<I[]> idxstate(new I[C > 0 ? C : 1]);
+        for (int64_t n = begin; n < end; ++n) {
+            const T* in_n = in + n * in_vol * C;
+            const T* go_n = gout + n * out_vol * C;
+            T* gi_n = gin + n * in_vol * C;
+            for (int64_t od = 0; od < oD; ++od) {
+                const int64_t ds = od * D / oD;
+                const int64_t de = 1 + (((od + 1) * D) - 1) / oD;
+                for (int64_t oh = 0; oh < oH; ++oh) {
+                    const int64_t hs = oh * H / oH;
+                    const int64_t he = 1 + (((oh + 1) * H) - 1) / oH;
+                    for (int64_t ow = 0; ow < oW; ++ow) {
+                        const int64_t ws = ow * W / oW;
+                        const int64_t we = 1 + (((ow + 1) * W) - 1) / oW;
+                        const int64_t o = (od * oH + oh) * oW + ow;
+                        const T* go_lane = go_n + o * C;
+                        const iVec minus1(I(-1));
+                        {
+                            int64_t c = 0;
+                            for (; c < len; c += V) {
+                                Vec(lo).store(maxstate.get() + c);
+                                minus1.store(idxstate.get() + c);
+                            }
+                            for (; c < C; ++c) {
+                                maxstate[c] = lo;
+                                idxstate[c] = I(-1);
+                            }
+                        }
+                        for (int64_t kd = ds; kd < de; ++kd) {
+                            const T* slice = in_n + kd * H * W * C;
+                            for (int64_t kh = hs; kh < he; ++kh) {
+                                const T* row = slice + kh * W * C;
+                                for (int64_t kw = ws; kw < we; ++kw) {
+                                    const T* in_lane = row + kw * C;
+                                    const I off = I((kd * H + kh) * W + kw);
+                                    const iVec off_vec(off);
+                                    int64_t c2 = 0;
+                                    for (; c2 < len; c2 += V) {
+                                        const Vec maxv =
+                                            Vec::loadu(maxstate.get() + c2);
+                                        const Vec val =
+                                            Vec::loadu(in_lane + c2);
+                                        const Vec mask =
+                                            (val != val) | (val > maxv);
+                                        Vec::blendv(maxv, val, mask)
+                                            .store(maxstate.get() + c2);
+                                        const iVec imask = vec::cast<I>(mask);
+                                        const iVec cur =
+                                            iVec::loadu(idxstate.get() + c2);
+                                        iVec::blendv(cur, off_vec, imask)
+                                            .store(idxstate.get() + c2);
+                                    }
+                                    for (; c2 < C; ++c2) {
+                                        const T v = in_lane[c2];
+                                        if ((v != v) || (v > maxstate[c2])) {
+                                            maxstate[c2] = v;
+                                            idxstate[c2] = off;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        int64_t c2 = 0;
+                        for (; c2 < len; c2 += V) {
+                            Vec::loadu(go_lane + c2).store(gbuf);
+                            for (int64_t l = 0; l < V; ++l) {
+                                const int64_t max_idx =
+                                    int64_t(idxstate[c2 + l]);
+                                if (max_idx >= 0) {
+                                    gi_n[max_idx * C + c2 + l] += gbuf[l];
+                                }
+                            }
+                        }
+                        for (; c2 < C; ++c2) {
+                            const int64_t max_idx = int64_t(idxstate[c2]);
+                            if (max_idx >= 0) {
+                                gi_n[max_idx * C + c2] += go_lane[c2];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+void adaptive_max_pool3d_cl_impl(const void* in, void* out, int64_t* ind,
+                                 int64_t N, int64_t C,
+                                 int64_t D, int64_t H, int64_t W,
+                                 int64_t oD, int64_t oH, int64_t oW, int dtype) {
+    switch (static_cast<DType>(dtype)) {
+        case DType::Float32:
+            adaptive_max_pool3d_cl_typed<float>(
+                static_cast<const float*>(in), static_cast<float*>(out), ind,
+                N, C, D, H, W, oD, oH, oW);
+            break;
+        case DType::Float64:
+            adaptive_max_pool3d_cl_typed<double>(
+                static_cast<const double*>(in), static_cast<double*>(out), ind,
+                N, C, D, H, W, oD, oH, oW);
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "adaptive_max_pool3d: channels-last kernel supports only "
+                     "float and double");
+    }
+}
+
+void adaptive_max_pool3d_backward_cl_impl(const void* gout, const void* in,
+                                          void* gin,
+                                          int64_t N, int64_t C,
+                                          int64_t D, int64_t H, int64_t W,
+                                          int64_t oD, int64_t oH, int64_t oW,
+                                          int dtype) {
+    switch (static_cast<DType>(dtype)) {
+        case DType::Float32:
+            adaptive_max_pool3d_backward_cl_typed<float>(
+                static_cast<const float*>(gout), static_cast<const float*>(in),
+                static_cast<float*>(gin), N, C, D, H, W, oD, oH, oW);
+            break;
+        case DType::Float64:
+            adaptive_max_pool3d_backward_cl_typed<double>(
+                static_cast<const double*>(gout),
+                static_cast<const double*>(in), static_cast<double*>(gin),
+                N, C, D, H, W, oD, oH, oW);
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "adaptive_max_pool3d_backward: channels-last kernel "
+                     "supports only float and double");
+    }
+}
+
 void avg_pool2d_cl_impl(const void* in, void* out,
                         int64_t N, int64_t C, int64_t H, int64_t W,
                         int64_t oH, int64_t oW,
@@ -803,6 +1061,9 @@ REGISTER_DISPATCH(adaptive_avg_pool2d_cl_stub, &adaptive_avg_pool2d_cl_impl);
 REGISTER_DISPATCH(adaptive_max_pool2d_cl_stub, &adaptive_max_pool2d_cl_impl);
 REGISTER_DISPATCH(adaptive_max_pool2d_backward_cl_stub,
                   &adaptive_max_pool2d_backward_cl_impl);
+REGISTER_DISPATCH(adaptive_max_pool3d_cl_stub, &adaptive_max_pool3d_cl_impl);
+REGISTER_DISPATCH(adaptive_max_pool3d_backward_cl_stub,
+                  &adaptive_max_pool3d_backward_cl_impl);
 #else
 ALSO_REGISTER_AVX512_DISPATCH(avg_pool2d_cl_stub, &avg_pool2d_cl_impl);
 ALSO_REGISTER_AVX512_DISPATCH(max_pool2d_cl_stub, &max_pool2d_cl_impl);
@@ -817,6 +1078,10 @@ ALSO_REGISTER_AVX512_DISPATCH(adaptive_max_pool2d_cl_stub,
                               &adaptive_max_pool2d_cl_impl);
 ALSO_REGISTER_AVX512_DISPATCH(adaptive_max_pool2d_backward_cl_stub,
                               &adaptive_max_pool2d_backward_cl_impl);
+ALSO_REGISTER_AVX512_DISPATCH(adaptive_max_pool3d_cl_stub,
+                              &adaptive_max_pool3d_cl_impl);
+ALSO_REGISTER_AVX512_DISPATCH(adaptive_max_pool3d_backward_cl_stub,
+                              &adaptive_max_pool3d_backward_cl_impl);
 #endif
 
 } // namespace cpu
