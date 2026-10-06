@@ -105,3 +105,98 @@ def test_fft2_native_autograd(operation):
         expected = getattr(tp, backward_name)(gradient, value, [3, 4], [1, 2], "ortho")
         np.testing.assert_allclose(
             as_numpy(value.grad), as_numpy(expected), rtol=2e-5, atol=2e-5)
+
+
+# --- Decomposition coverage -------------------------------------------------
+#
+# These overloads have no CPU eager kernels; the dispatcher lowers them to the
+# decomposition table, which composes the 1-D transform prims.  Each identity
+# below is checked against numpy so the composed transforms stay honest.
+
+
+def _decomp_fn(name):
+    from tensorplay._decomp import decomposition_table, get_decompositions
+    from tensorplay._ops import NATIVE_NAMESPACE
+
+    get_decompositions([])
+    packet, overload = name.split(".")
+    op = getattr(getattr(tp.ops, NATIVE_NAMESPACE), packet)
+    return decomposition_table[getattr(op, overload)]
+
+
+@pytest.mark.parametrize("norm", ["backward", "forward", "ortho"])
+def test_fft_decomp_fftn_ifftn(norm):
+    rng = np.random.default_rng(21)
+    array = rng.standard_normal((3, 4, 6), dtype=np.float64)
+    value = as_tensor(array)
+    got = as_numpy(_decomp_fn("fft_fftn.default")(value, None, (-2, -1), norm=norm))
+    np.testing.assert_allclose(
+        got, np.fft.fftn(array, axes=(-2, -1), norm=norm), rtol=1e-10, atol=1e-10)
+    back = as_numpy(_decomp_fn("fft_ifftn.default")(value, None, (-2, -1), norm=norm))
+    np.testing.assert_allclose(
+        back, np.fft.ifftn(array, axes=(-2, -1), norm=norm), rtol=1e-10, atol=1e-10)
+
+
+@pytest.mark.parametrize("norm", ["backward", "forward", "ortho"])
+def test_fft_decomp_rfftn_irfftn(norm):
+    rng = np.random.default_rng(22)
+    array = rng.standard_normal((3, 4, 6), dtype=np.float64)
+    got = as_numpy(_decomp_fn("fft_rfftn.default")(as_tensor(array), None, (-2, -1), norm=norm))
+    np.testing.assert_allclose(
+        got, np.fft.rfftn(array, axes=(-2, -1), norm=norm), rtol=1e-10, atol=1e-10)
+    back = as_numpy(_decomp_fn("fft_irfftn.default")(
+        as_tensor(got), (4, 6), (-2, -1), norm=norm))
+    np.testing.assert_allclose(back, array, rtol=1e-10, atol=1e-10)
+
+
+@pytest.mark.parametrize("norm", ["backward", "forward", "ortho"])
+def test_fft_decomp_hfft_ihfft(norm):
+    rng = np.random.default_rng(23)
+    array = rng.standard_normal((12,), dtype=np.float64)
+    spectrum = _decomp_fn("fft_ihfft.default")(as_tensor(array), None, norm=norm)
+    np.testing.assert_allclose(
+        as_numpy(spectrum), np.fft.ihfft(array, norm=norm), rtol=1e-10, atol=1e-10)
+    back = _decomp_fn("fft_hfft.default")(spectrum, None, norm=norm)
+    np.testing.assert_allclose(as_numpy(back), array, rtol=1e-9, atol=1e-9)
+
+
+@pytest.mark.parametrize("norm", ["backward", "forward", "ortho"])
+def test_fft_decomp_hfftn_ihfftn(norm):
+    import scipy.fft as sp_fft
+
+    rng = np.random.default_rng(24)
+    array = rng.standard_normal((3, 4, 6), dtype=np.float64)
+    spectrum = _decomp_fn("fft_ihfftn.default")(as_tensor(array), None, (-2, -1), norm=norm)
+    np.testing.assert_allclose(
+        as_numpy(spectrum), sp_fft.ihfftn(array, axes=(-2, -1), norm=norm),
+        rtol=1e-10, atol=1e-10)
+    back = _decomp_fn("fft_hfftn.default")(spectrum, (4, 6), (-2, -1), norm=norm)
+    np.testing.assert_allclose(as_numpy(back), array, rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(
+        as_numpy(back), sp_fft.hfftn(as_numpy(spectrum), s=(4, 6), axes=(-2, -1), norm=norm),
+        rtol=1e-10, atol=1e-10)
+
+
+@pytest.mark.parametrize("norm", ["backward", "forward", "ortho"])
+def test_fft_decomp_hfft2_ihfft2(norm):
+    import scipy.fft as sp_fft
+
+    rng = np.random.default_rng(25)
+    array = rng.standard_normal((4, 6), dtype=np.float64)
+    spectrum = _decomp_fn("fft_ihfft2.default")(as_tensor(array), norm=norm)
+    np.testing.assert_allclose(
+        as_numpy(spectrum), sp_fft.ihfft2(array, norm=norm), rtol=1e-10, atol=1e-10)
+    back = _decomp_fn("fft_hfft2.default")(spectrum, s=(4, 6), norm=norm)
+    np.testing.assert_allclose(as_numpy(back), array, rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(
+        as_numpy(back), sp_fft.hfft2(as_numpy(spectrum), s=(4, 6), norm=norm),
+        rtol=1e-10, atol=1e-10)
+
+
+def test_fft_decomp_fftshift_ifftshift():
+    for n in (4, 5):
+        array = np.arange(n, dtype=np.float64)
+        shifted = as_numpy(_decomp_fn("fft_fftshift.default")(as_tensor(array)))
+        np.testing.assert_array_equal(shifted, np.fft.fftshift(array))
+        back = as_numpy(_decomp_fn("fft_ifftshift.default")(as_tensor(shifted)))
+        np.testing.assert_array_equal(back, array)

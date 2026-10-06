@@ -5361,3 +5361,363 @@ def special_ndtr(self):
 @register_decomposition(ops.special_zeta.default)
 def special_zeta(self, other):
     return prims.zeta(self, other)
+
+
+# The FFT transforms decompose onto three prims (real-to-complex,
+# complex-to-complex, complex-to-real) wrapped in type promotion, input
+# resizing, and normalization.  A transform axis of size -1 in `n`/`s`
+# means "keep the current length"; an omitted `n`/`s` resizes nothing.
+
+_FFT_NORM_VALUES = {None, "forward", "backward", "ortho"}
+
+
+def _fft_apply_norm(x, norm, signal_numel, forward):
+    if norm not in _FFT_NORM_VALUES:
+        raise RuntimeError(f"Invalid normalization mode: {norm}")
+    if norm == "ortho":
+        return x * (1 / math.sqrt(signal_numel))
+    normalize = (not forward and (norm is None or norm == "backward")) or (
+        forward and norm == "forward"
+    )
+    return x * (1 / signal_numel) if normalize else x
+
+
+def _fft_promote_type(dtype, require_complex):
+    if dtype.is_complex:
+        return dtype
+    if not dtype.is_floating_point:
+        dtype = tp.get_default_dtype()
+    if dtype not in (tp.float32, tp.float64):
+        raise RuntimeError(
+            f"fft transforms expect float32 or float64 inputs, but got {dtype}"
+        )
+    if require_complex:
+        dtype = tp.complex128 if dtype == tp.float64 else tp.complex64
+    return dtype
+
+
+def _fft_maybe_promote(t, require_complex=False):
+    new_type = _fft_promote_type(t.dtype, require_complex)
+    return prims.convert_element_type(t, new_type) if new_type != t.dtype else t
+
+
+def _fft_resize_input(x, dims, sizes):
+    # Grow or trim x along dims so each size matches; growth zero-pads the
+    # end of the axis, trim keeps the leading elements.
+    must_copy = False
+    x_sizes = x.shape
+    pad_amount = [0] * len(x_sizes) * 2
+    for i in range(len(dims)):
+        if sizes[i] == -1:
+            continue
+        if x_sizes[dims[i]] < sizes[i]:
+            must_copy = True
+            pad_amount[len(pad_amount) - 2 * dims[i] - 1] = sizes[i] - x_sizes[dims[i]]
+        if x_sizes[dims[i]] > sizes[i]:
+            x = ops.narrow.default(x, dims[i], 0, sizes[i])
+    return ops.constant_pad_nd.default(x, pad_amount, 0) if must_copy else x
+
+
+def _fft_c2r(input, n, dim, norm, forward):
+    input = _fft_maybe_promote(input, require_complex=True)
+    dims = (canonicalize_dim(input.ndim, dim, wrap_scalar=False),)
+    last_dim_size = n if n is not None else 2 * (input.shape[dim] - 1)
+    if last_dim_size < 1:
+        raise RuntimeError(f"Invalid number of data points ({last_dim_size}) specified")
+    if n is not None:
+        input = _fft_resize_input(input, dims, (last_dim_size // 2 + 1,))
+    if forward:
+        input = prims.conj(input)
+    output = prims.fft_c2r(input, dim=list(dims), last_dim_size=last_dim_size)
+    # The c2r prim routes to the user-facing inverse kernel, which already
+    # normalizes by the output length; undo it for a bare transform.
+    output = output * last_dim_size
+    return _fft_apply_norm(output, norm, last_dim_size, forward)
+
+
+def _fft_r2c(input, n, dim, norm, forward, onesided):
+    if input.dtype.is_complex:
+        raise RuntimeError(
+            f"fft expects a floating point input tensor, but got {input.dtype}"
+        )
+    input = _fft_maybe_promote(input)
+    dims = (canonicalize_dim(input.ndim, dim, wrap_scalar=False),)
+    dim_size = n if n is not None else input.shape[dim]
+    if dim_size < 1:
+        raise RuntimeError(f"Invalid number of data points ({dim_size}) specified")
+    if n is not None:
+        input = _fft_resize_input(input, dims, (n,))
+    ret = prims.fft_r2c(input, dim=list(dims), onesided=onesided)
+    ret = _fft_apply_norm(ret, norm, dim_size, forward)
+    return ret if forward else prims.conj(ret)
+
+
+def _fft_c2c(input, n, dim, norm, forward):
+    if not input.dtype.is_complex:
+        raise RuntimeError(
+            f"fft expects a complex input tensor, but got {input.dtype}"
+        )
+    dims = (canonicalize_dim(input.ndim, dim, wrap_scalar=False),)
+    dim_size = n if n is not None else input.shape[dim]
+    if dim_size < 1:
+        raise RuntimeError(f"Invalid number of data points ({dim_size}) specified")
+    if n is not None:
+        input = _fft_resize_input(input, dims, (n,))
+    ret = prims.fft_c2c(input, dim=list(dims), forward=forward)
+    if not forward:
+        # The complex transform prim routes to the user-facing kernels, whose
+        # inverse already carries the 1/N factor; undo it so the caller sees a
+        # bare transform and applies the requested normalization exactly once.
+        ret = ret * dim_size
+    return _fft_apply_norm(ret, norm, dim_size, forward)
+
+
+def _fft_canonicalize_shape_and_dims(input, shape, dim):
+    input_dim = input.ndim
+    input_sizes = input.shape
+    ret_dims = None
+    if dim is not None:
+        if not isinstance(dim, (list, tuple)):
+            dim = (dim,)
+        ret_dims = canonicalize_dims(input_dim, list(dim), wrap_scalar=False)
+        if len(set(ret_dims)) != len(ret_dims):
+            raise RuntimeError("FFT dims must be unique")
+    if shape is not None:
+        if not isinstance(shape, (list, tuple)):
+            shape = (shape,)
+        if dim is not None and len(dim) != len(shape):
+            raise RuntimeError(
+                "When given, dim and shape arguments must have the same length"
+            )
+        transform_ndim = len(shape)
+        if transform_ndim > input_dim:
+            raise RuntimeError(
+                f"Got shape with {transform_ndim} values but input tensor "
+                f"only has {input_dim} dimensions."
+            )
+        if dim is None:
+            ret_dims = tuple(range(input_dim - transform_ndim, input_dim))
+        ret_shape = tuple(
+            s if s != -1 else input_sizes[d] for s, d in zip(shape, ret_dims)
+        )
+    elif dim is None:
+        ret_dims = tuple(range(input_dim))
+        ret_shape = tuple(input_sizes)
+    else:
+        ret_shape = tuple(input_sizes[d] for d in ret_dims)
+    for n in ret_shape:
+        if n <= 0:
+            raise RuntimeError(f"Invalid number of data points ({n}) specified")
+    return ret_shape, ret_dims
+
+
+def _fft_prod(xs):
+    prod = 1
+    for x in xs:
+        prod *= x
+    return prod
+
+
+def _fft_fftn_c2c(input, shape, dim, norm, forward):
+    if not input.dtype.is_complex:
+        raise RuntimeError(
+            f"fftn expects a complex input tensor, but got {input.dtype}"
+        )
+    x = _fft_resize_input(input, dim, shape)
+    # A multi-axis transform is the composition of one-axis transforms; the
+    # transform prim handles a single axis per call.
+    ret = x
+    signal_numel = 1
+    for d in dim:
+        ret = prims.fft_c2c(ret, dim=[d], forward=forward)
+        signal_numel *= ret.shape[d]
+    if not forward:
+        # Undo the inverse kernel's built-in 1/N before caller-side norm.
+        ret = ret * signal_numel
+    return _fft_apply_norm(ret, norm, signal_numel, forward)
+
+
+@register_decomposition(ops.fft_fft.default)
+def fft_fft(input, n=-1, dim=-1, norm="backward"):
+    n = None if n == -1 else n
+    if input.dtype.is_complex:
+        return _fft_c2c(input, n, dim, norm, forward=True)
+    return _fft_r2c(input, n, dim, norm, forward=True, onesided=False)
+
+
+@register_decomposition(ops.fft_ifft.default)
+def fft_ifft(input, n=-1, dim=-1, norm="backward"):
+    n = None if n == -1 else n
+    if input.dtype.is_complex:
+        return _fft_c2c(input, n, dim, norm, forward=False)
+    return _fft_r2c(input, n, dim, norm, forward=False, onesided=False)
+
+
+@register_decomposition(ops.fft_rfft.default)
+def fft_rfft(input, n=-1, dim=-1, norm="backward"):
+    return _fft_r2c(input, None if n == -1 else n, dim, norm, forward=True, onesided=True)
+
+
+@register_decomposition(ops.fft_irfft.default)
+def fft_irfft(input, n=-1, dim=-1, norm="backward"):
+    return _fft_c2r(input, None if n == -1 else n, dim, norm, forward=False)
+
+
+@register_decomposition(ops.fft_hfft.default)
+def fft_hfft(input, n=None, dim=-1, norm=None):
+    return _fft_c2r(input, n, dim, norm, forward=True)
+
+
+@register_decomposition(ops.fft_ihfft.default)
+def fft_ihfft(input, n=None, dim=-1, norm=None):
+    return _fft_r2c(input, n, dim, norm, forward=False, onesided=True)
+
+
+@register_decomposition(ops.fft_fftn.default)
+def fft_fftn(input, s=None, dim=None, norm=None):
+    shape, dims = _fft_canonicalize_shape_and_dims(input, s, dim)
+    x = _fft_maybe_promote(input, require_complex=True)
+    return _fft_fftn_c2c(x, shape, dims, norm, forward=True)
+
+
+@register_decomposition(ops.fft_ifftn.default)
+def fft_ifftn(input, s=None, dim=None, norm=None):
+    shape, dims = _fft_canonicalize_shape_and_dims(input, s, dim)
+    x = _fft_maybe_promote(input, require_complex=True)
+    return _fft_fftn_c2c(x, shape, dims, norm, forward=False)
+
+
+@register_decomposition(ops.fft_rfftn.default)
+def fft_rfftn(input, s=None, dim=None, norm=None):
+    if input.dtype.is_complex:
+        raise RuntimeError(
+            f"rfftn expects a real-valued input tensor, but got {input.dtype}"
+        )
+    shape, dims = _fft_canonicalize_shape_and_dims(input, s, dim)
+    input = _fft_maybe_promote(input)
+    input = _fft_resize_input(input, dims, shape)
+    # The real transform runs first while the data is still real; the other
+    # axes are ordinary complex transforms of the truncated spectrum (the
+    # axes are independent, so the order does not matter).
+    out = prims.fft_r2c(input, dim=[dims[-1]], onesided=True)
+    for d in dims[:-1]:
+        out = prims.fft_c2c(out, dim=[d], forward=True)
+    return _fft_apply_norm(out, norm, _fft_prod(shape), forward=True)
+
+
+@register_decomposition(ops.fft_ihfftn.default)
+def fft_ihfftn(input, s=None, dim=None, norm=None):
+    if input.dtype.is_complex:
+        raise RuntimeError(
+            f"ihfftn expects a real-valued input tensor, but got {input.dtype}"
+        )
+    shape, dims = _fft_canonicalize_shape_and_dims(input, s, dim)
+    if len(shape) == 0:
+        raise RuntimeError("ihfftn must transform at least one axis")
+    input = _fft_maybe_promote(input)
+    input = _fft_resize_input(input, dims, shape)
+    tmp = prims.fft_r2c(input, dim=[dims[-1]], onesided=True)
+    if len(dims) == 1:
+        tmp = _fft_apply_norm(tmp, norm, shape[0], forward=False)
+        return prims.conj(tmp)
+    tmp = prims.conj_physical(tmp)
+    signal_numel = 1
+    for d in dims[:-1]:
+        tmp = prims.fft_c2c(tmp, dim=[d], forward=False)
+        # Undo the inverse kernel's built-in 1/N per axis.
+        signal_numel *= tmp.shape[d]
+    tmp = tmp * signal_numel
+    return _fft_apply_norm(tmp, norm, _fft_prod(shape), forward=False)
+
+
+def _fft_canonicalize_c2r_shape_and_dims(input, s, dim):
+    shape, dims = _fft_canonicalize_shape_and_dims(input, s, dim)
+    if len(shape) == 0:
+        raise RuntimeError("irfftn must transform at least one axis")
+    if s is None or s[-1] == -1:
+        last_dim_size = 2 * (input.shape[dims[-1]] - 1)
+    else:
+        last_dim_size = shape[-1]
+    if last_dim_size < 1:
+        raise RuntimeError(f"Invalid number of data points ({last_dim_size}) specified")
+    shape_list = list(shape)
+    shape_list[-1] = last_dim_size // 2 + 1
+    return tuple(shape_list), dims, last_dim_size
+
+
+@register_decomposition(ops.fft_irfftn.default)
+def fft_irfftn(input, s=None, dim=None, norm=None):
+    shape, dims, last_dim_size = _fft_canonicalize_c2r_shape_and_dims(input, s, dim)
+    input = _fft_maybe_promote(input, require_complex=True)
+    input = _fft_resize_input(input, dims, shape)
+    tmp = input
+    for d in dims[:-1]:
+        tmp = prims.fft_c2c(tmp, dim=[d], forward=False)
+        # Undo the inverse kernel's built-in 1/N per axis.
+        tmp = tmp * tmp.shape[d]
+    out = prims.fft_c2r(tmp, dim=[dims[-1]], last_dim_size=last_dim_size)
+    out = out * last_dim_size
+    return _fft_apply_norm(out, norm, _fft_prod(out.shape[d] for d in dims), forward=False)
+
+
+@register_decomposition(ops.fft_hfftn.default)
+def fft_hfftn(input, s=None, dim=None, norm=None):
+    shape, dims, last_dim_size = _fft_canonicalize_c2r_shape_and_dims(input, s, dim)
+    input = _fft_maybe_promote(input, require_complex=True)
+    input = _fft_resize_input(input, dims, shape)
+    tmp = input
+    for d in dims[:-1]:
+        tmp = prims.fft_c2c(tmp, dim=[d], forward=True)
+    tmp = _fft_apply_norm(tmp, norm, _fft_prod(shape[:-1]), forward=True)
+    tmp = prims.conj_physical(tmp)
+    out = prims.fft_c2r(tmp, dim=[dims[-1]], last_dim_size=last_dim_size)
+    out = out * last_dim_size
+    return _fft_apply_norm(out, norm, last_dim_size, forward=True)
+
+
+@register_decomposition(ops.fft_fft2.default)
+def fft_fft2(input, s=None, dim=(-2, -1), norm="backward"):
+    return fft_fftn(input, s=s, dim=dim, norm=norm)
+
+
+@register_decomposition(ops.fft_ifft2.default)
+def fft_ifft2(input, s=None, dim=(-2, -1), norm="backward"):
+    return fft_ifftn(input, s=s, dim=dim, norm=norm)
+
+
+@register_decomposition(ops.fft_rfft2.default)
+def fft_rfft2(input, s=None, dim=(-2, -1), norm="backward"):
+    return fft_rfftn(input, s=s, dim=dim, norm=norm)
+
+
+@register_decomposition(ops.fft_irfft2.default)
+def fft_irfft2(input, s=None, dim=(-2, -1), norm="backward"):
+    return fft_irfftn(input, s=s, dim=dim, norm=norm)
+
+
+@register_decomposition(ops.fft_hfft2.default)
+def fft_hfft2(input, s=None, dim=(-2, -1), norm=None):
+    return fft_hfftn(input, s=s, dim=dim, norm=norm)
+
+
+@register_decomposition(ops.fft_ihfft2.default)
+def fft_ihfft2(input, s=None, dim=(-2, -1), norm=None):
+    return fft_ihfftn(input, s=s, dim=dim, norm=norm)
+
+
+@register_decomposition(ops.fft_fftshift.default)
+def fft_fftshift(input, dim=None):
+    dims = list(range(input.ndim)) if dim is None else (
+        [dim] if not isinstance(dim, (list, tuple)) else list(dim)
+    )
+    shift = [input.shape[d] // 2 for d in dims]
+    return ops.roll.default(input, shift, dims)
+
+
+@register_decomposition(ops.fft_ifftshift.default)
+def fft_ifftshift(input, dim=None):
+    dims = list(range(input.ndim)) if dim is None else (
+        [dim] if not isinstance(dim, (list, tuple)) else list(dim)
+    )
+    shift = [(input.shape[d] + 1) // 2 for d in dims]
+    return ops.roll.default(input, shift, dims)

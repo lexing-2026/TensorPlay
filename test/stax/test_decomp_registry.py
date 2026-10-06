@@ -476,6 +476,16 @@ SAMPLES = {
     "special_ndtr.default": lambda: ((_t(2, 3, low=-2.0, high=2.0),), {}),
     "special_ndtri.default": lambda: ((_t(2, 3, low=0.05, high=0.95),), {}),
     "special_zeta.default": lambda: ((_t(2, 3, low=1.5, high=4.0), _t(2, 3, low=0.5, high=2.0)), {}),
+    # Transforms; the inverse forms round-trip through the prims and lose a
+    # little precision, so their comparison relies on the allclose branch.
+    "fft_fft.default": lambda: ((_t(8),), {}),
+    "fft_ifft.default": lambda: ((tp.complex(_t(8), _t(8)),), {}),
+    "fft_rfft.default": lambda: ((_t(8),), {}),
+    "fft_irfft.default": lambda: ((tp.complex(_t(5), _t(5)),), {}),
+    "fft_fft2.default": lambda: ((_t(4, 6),), {}),
+    "fft_ifft2.default": lambda: ((tp.complex(_t(4, 6), _t(4, 6)),), {}),
+    "fft_rfft2.default": lambda: ((_t(4, 6),), {}),
+    "fft_irfft2.default": lambda: ((tp.complex(_t(4, 4), _t(4, 4)),), {}),
 }
 
 # Overloads whose kernels exist only on specific devices; exercised by the
@@ -946,7 +956,7 @@ def test_decomposition_matches_operator(name):
             continue
         assert g.dtype == e.dtype, (g.dtype, e.dtype)
         assert tuple(g.shape) == tuple(e.shape), (tuple(g.shape), tuple(e.shape))
-        if e.dtype == tp.bool or not e.is_floating_point():
+        if e.dtype == tp.bool or (not e.is_floating_point() and not e.is_complex()):
             assert tp.equal(g, e)
         else:
             assert tp.allclose(g, e, rtol=1e-5, atol=1e-6, equal_nan=True)
@@ -975,6 +985,13 @@ def test_every_functional_decomposition_has_a_sample():
             "alpha_dropout.default", "_fused_dropout.default",
             "new_empty_strided.default", "randn.default", "sym_numel.default",
             "empty_strided.default", "pad_sequence.default",
+            # Transforms without CPU eager kernels; validated through the
+            # round-trip identities in the fft test module instead.
+            "fft_hfft.default", "fft_ihfft.default",
+            "fft_fftn.default", "fft_ifftn.default", "fft_rfftn.default",
+            "fft_irfftn.default", "fft_hfftn.default", "fft_ihfftn.default",
+            "fft_hfft2.default", "fft_ihfft2.default",
+            "fft_fftshift.default", "fft_ifftshift.default",
         }
         and str(o).split(".", 1)[1] not in DEVICE_SPECIFIC
         and not any(a.is_out for a in o._schema.arguments)
