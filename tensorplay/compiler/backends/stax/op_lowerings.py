@@ -58,6 +58,7 @@ from .ir import (
     Constant,
     IndexingConstant,
     DeviceCopy,
+    DynamicScalar,
     MutationLayoutSHOULDREMOVE,
     ExpandView,
     FixedLayout,
@@ -67,6 +68,7 @@ from .ir import (
     Pointwise,
     Reduction,
     ReinterpretView,
+    resolve_unbacked_bindings,
     SliceView,
     SqueezeView,
     MutableBox,
@@ -10286,6 +10288,215 @@ def as_strided_scatter(self: Any, src: Any, size: Any, stride: Any, storage_offs
     output_view = lower_as_strided(output, size, stride, storage_offset)
     lower_copy_(output_view, src)
     return output
+
+
+# Small schema variants share the view and allocation paths above.  Keeping
+# these registrations explicit lets captured graphs retain their native names.
+@register("_assert_scalar.default", "_assert_tensor_metadata.default")
+def _lower_metadata_assert(*args: Any, **kwargs: Any) -> None:
+    return None
+
+
+@register("_efficientzerotensor.default")
+def _lower_efficientzerotensor(
+    size: Any,
+    *,
+    dtype: Any = None,
+    layout: Any = None,
+    device: Any = None,
+    pin_memory: Any = False,
+) -> Any:
+    del layout, pin_memory
+    dtype = dtype or tp.get_default_dtype()
+    return _full(0, decode_device(device), dtype, list(size))
+
+
+@register("_local_scalar_dense.default")
+def _lower_local_scalar_dense(data: Any) -> Any:
+    bindings = resolve_unbacked_bindings(
+        V.graph.sizevars.shape_env,
+        V.graph.current_node.meta.get("unbacked_bindings"),
+    )
+    if bindings is None or len(bindings) != 1:
+        raise AssertionError(bindings)
+    symbol, keypath = next(iter(bindings.items()))
+    dynamic = DynamicScalar(symbol, keypath, data)
+    dynamic.name = V.graph.register_buffer(dynamic)
+    V.graph.register_operation(dynamic)
+    value = V.graph.current_node.meta.get("val")
+    if isinstance(value, (tp.SymInt, tp.SymFloat, tp.SymBool)):
+        return value.node.expr
+    return sympy.sympify(value)
+
+
+@register("_neg_view.default")
+def _lower_neg_view(x: Any) -> Any:
+    return LOWERINGS["neg.default"](x)
+
+
+@register("_unsafe_index.Tensor")
+def _lower_unsafe_index(x: Any, indices: Any) -> Any:
+    return index_impl(x, indices, check=False)
+
+
+@register("as_strided_.default")
+def _lower_as_strided_(x: Any, size: Any, stride: Any, storage_offset: Any = None) -> Any:
+    value = lower_as_strided(x, size, stride, storage_offset)
+    x.data = value.data
+    return x
+
+
+@register("as_strided_copy.default")
+def _lower_as_strided_copy(
+    x: Any, size: Any, stride: Any, storage_offset: Any = None
+) -> Any:
+    return clone(lower_as_strided(x, size, stride, storage_offset))
+
+
+_fallback_bernoulli = fallback_handler(tp_ops.bernoulli.default)
+_fallback_bernoulli_p = fallback_handler(tp_ops.bernoulli.p)
+LOWERINGS["bernoulli.default"] = _fallback_bernoulli
+LOWERINGS["bernoulli.p"] = _fallback_bernoulli_p
+LOWERINGS["bernoulli_.Tensor"] = fallback_handler(tp_ops.bernoulli_.Tensor)
+LOWERINGS["bernoulli_.float"] = fallback_handler(tp_ops.bernoulli_.float)
+
+
+@register("detach_.default")
+def _lower_detach_(x: Any) -> Any:
+    return x
+
+
+@register("diagonal_copy.default")
+def _lower_diagonal_copy(
+    x: Any, offset: Any = 0, dim1: Any = 0, dim2: Any = 1
+) -> Any:
+    return clone(lower_diagonal(x, offset, dim1, dim2))
+
+
+@register("empty.default", "empty.memory_format")
+def _lower_empty(
+    *size: Any,
+    dtype: Any = None,
+    layout: Any = None,
+    device: Any = None,
+    pin_memory: Any = None,
+    memory_format: Any = None,
+) -> Any:
+    del memory_format
+    if len(size) == 1 and isinstance(size[0], (list, tuple)):
+        size = tuple(size[0])
+    return empty_strided(
+        list(size), None, dtype=dtype, layout=layout,
+        device=decode_device(device), pin_memory=pin_memory,
+    )
+
+
+@register("empty_like.default")
+def _lower_empty_like(
+    x: Any,
+    *,
+    dtype: Any = None,
+    layout: Any = None,
+    device: Any = None,
+    pin_memory: Any = False,
+    memory_format: Any = None,
+) -> Any:
+    del memory_format
+    return empty_strided(
+        list(x.get_size()), None, dtype=dtype or x.get_dtype(), layout=layout,
+        device=decode_device(device) if device is not None else x.get_device(),
+        pin_memory=pin_memory,
+    )
+
+
+@register("expand_as.default")
+def _lower_expand_as(x: Any, y: Any) -> Any:
+    return lower_expand(x, y.get_size())
+
+
+@register("fill_.Scalar", "fill_.Tensor")
+def _lower_fill_(x: Any, value: Any) -> Any:
+    return mutate_to(x, _full(value, x.get_device(), x.get_dtype(), list(x.get_size())))
+
+
+_fallback_fractional_max_pool2d = fallback_handler(tp_ops.fractional_max_pool2d.default)
+_fallback_fractional_max_pool3d = fallback_handler(tp_ops.fractional_max_pool3d.default)
+LOWERINGS["fractional_max_pool2d.default"] = _fallback_fractional_max_pool2d
+LOWERINGS["fractional_max_pool3d.default"] = _fallback_fractional_max_pool3d
+
+
+@register("glu.default")
+def _lower_glu(x: Any, dim: Any = -1) -> Any:
+    dim = normalize_dim(dim, len(x.get_size()))
+    half = V.graph.sizevars.guard_int(x.get_size()[dim]) // 2
+    left = _slice(x, dim, 0, half, 1)
+    right = _slice(x, dim, half, 2 * half, 1)
+    return lower_mul(left, LOWERINGS["sigmoid.default"](right))
+
+
+_fallback_mkldnn_rnn_layer = fallback_handler(tp_ops.mkldnn_rnn_layer.default)
+LOWERINGS["mkldnn_rnn_layer.default"] = _fallback_mkldnn_rnn_layer
+
+_fallback_native_dropout = fallback_handler(tp_ops.native_dropout.default)
+LOWERINGS["native_dropout.default"] = _fallback_native_dropout
+
+_fallback_rand = fallback_handler(tp_ops.rand.default)
+_fallback_rand_generator = fallback_handler(tp_ops.rand.generator)
+LOWERINGS["rand.default"] = _fallback_rand
+LOWERINGS["rand.generator"] = _fallback_rand_generator
+
+
+@register("scalar_tensor.default")
+def _lower_scalar_tensor(
+    data: Any, *, dtype: Any = None, device: Any = None, pin_memory: Any = False
+) -> Any:
+    return tensor(data, dtype=dtype, device=device, pin_memory=pin_memory)
+
+
+LOWERINGS["special_erf.default"] = LOWERINGS["erf.default"]
+
+
+@register("squeeze_.default", "squeeze_.dim", "squeeze_.dims")
+def _lower_squeeze_(x: Any, dim: Any = None) -> Any:
+    value = lower_squeeze(x, dim)
+    x.data = value.data
+    return x
+
+
+@register("squeeze_copy.default", "squeeze_copy.dim", "squeeze_copy.dims")
+def _lower_squeeze_copy(x: Any, dim: Any = None) -> Any:
+    return clone(lower_squeeze(x, dim))
+
+
+@register("sym_constrain_range.default")
+def _lower_sym_constrain_range(a: Any, min: Any = None, max: Any = None) -> None:
+    del a, min, max
+    return None
+
+
+@register("unbind.default", "unbind.int")
+def _lower_unbind(x: Any, dim: Any = 0) -> list[Any]:
+    dim = normalize_dim(dim, len(x.get_size()))
+    extent = V.graph.sizevars.guard_int(x.get_size()[dim])
+    return [lower_select(x, dim, index) for index in range(extent)]
+
+
+@register("unsqueeze_.default")
+def _lower_unsqueeze_(x: Any, dim: Any) -> Any:
+    value = lower_unsqueeze(x, dim)
+    x.data = value.data
+    return x
+
+
+_fallback_jagged_to_padded_dense = fallback_handler(tp_ops._jagged_to_padded_dense_forward.default)
+_fallback_padded_dense_to_jagged = fallback_handler(tp_ops._padded_dense_to_jagged_forward.default)
+LOWERINGS["_jagged_to_padded_dense_forward.default"] = _fallback_jagged_to_padded_dense
+LOWERINGS["_padded_dense_to_jagged_forward.default"] = _fallback_padded_dense_to_jagged
+
+_fallback_weight_int4pack = fallback_handler(tp_ops._weight_int4pack_mm_for_cpu.default)
+_fallback_weight_int8pack = fallback_handler(tp_ops._weight_int8pack_mm.default)
+LOWERINGS["_weight_int4pack_mm_for_cpu.default"] = _fallback_weight_int4pack
+LOWERINGS["_weight_int8pack_mm.default"] = _fallback_weight_int8pack
 
 
 # ---------------------------------------------------------------------------

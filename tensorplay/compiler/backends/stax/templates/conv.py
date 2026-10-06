@@ -1162,7 +1162,7 @@ def convert_1x1_conv_to_mm(x, weight, bias):
     return result.permute(result_permute)
 
 
-@register_lowering(framework.convolution)
+@register_lowering([framework.convolution, framework._convolution])
 def _convolution(
     x,
     weight,
