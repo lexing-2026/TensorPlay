@@ -6436,6 +6436,23 @@ def where(condition):
     return [ops.select.int(flat, 1, d) for d in range(condition.dim())]
 
 
+def _broadcast_shapes(a, b):
+    sa = tuple(int(s) for s in a)
+    sb = tuple(int(s) for s in b)
+    n = max(len(sa), len(sb))
+    sa = (1,) * (n - len(sa)) + sa
+    sb = (1,) * (n - len(sb)) + sb
+    shape = []
+    for x, y in zip(sa, sb):
+        if x != y and x != 1 and y != 1:
+            raise RuntimeError(
+                f"The size of tensor a ({x}) must match the size of tensor b "
+                f"({y}) at non-singleton dimension {len(shape)}"
+            )
+        shape.append(max(x, y))
+    return shape
+
+
 _COMPLEX_OF = {
     tp.float16: tp.complex32,
     tp.float32: tp.complex64,
@@ -6454,19 +6471,7 @@ def _complex_from_parts(real, imag):
             f"Expected object of scalar type {real.dtype} but got scalar type "
             f"{imag.dtype} for second argument"
         )
-    sa = tuple(int(s) for s in real.shape)
-    sb = tuple(int(s) for s in imag.shape)
-    n = max(len(sa), len(sb))
-    sa = (1,) * (n - len(sa)) + sa
-    sb = (1,) * (n - len(sb)) + sb
-    shape = []
-    for x, y in zip(sa, sb):
-        if x != y and x != 1 and y != 1:
-            raise RuntimeError(
-                f"The size of tensor a ({x}) must match the size of tensor b "
-                f"({y}) at non-singleton dimension {len(shape)}"
-            )
-        shape.append(max(x, y))
+    shape = _broadcast_shapes(real.shape, imag.shape)
     interleaved = ops.stack.default(
         (ops.expand.default(real, shape), ops.expand.default(imag, shape)), -1
     )
@@ -6719,3 +6724,222 @@ def _adaptive_avg_pool2d(input, output_size):
     vals, length_w = maybe_mask(vals, length_w, range_max_w, -1)
     total = ops.sum.dim_IntList(vals, [3, 5])
     return total / (length_h * length_w)
+
+
+# ---------------------------------------------------------------------------
+# Distances, random reads and grid sampling
+# ---------------------------------------------------------------------------
+
+
+@register_decomposition(ops.pairwise_distance.default)
+def pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
+    return ops.linalg_vector_norm.default(x1 - x2 + eps, p, [-1], keepdim)
+
+
+@register_decomposition(ops.pdist.default)
+def pdist(a, p=2):
+    if a.dim() != 2:
+        raise RuntimeError(f"pdist only supports 2D tensors, got: {a.dim()}D")
+    if p < 0:
+        raise RuntimeError("pdist only supports non-negative p values")
+    if p == 2:
+        # |x - y|^2 = |x|^2 + |y|^2 - 2 x.y, read off one gram matrix.
+        aTa = ops.mm.default(a, ops.transpose.default(a, 0, 1))
+        aTa_diag = ops.diag.default(aTa)
+        t = ops.sqrt.default(
+            ops.clamp.default(aTa_diag + aTa_diag.unsqueeze(-1) - 2 * aTa, min=0)
+        )
+    else:
+        t = ops.linalg_vector_norm.default(a.unsqueeze(1) - a, p, [2], False)
+    i = ops.triu_indices.default(
+        int(t.shape[0]), int(t.shape[1]), 1, dtype=tp.int64, device=a.device
+    )
+    rows = ops.select.int(i, 0, 0) * int(t.shape[0]) + ops.select.int(i, 0, 1)
+    return ops.index_select.default(ops.reshape.default(t, [-1]), 0, rows)
+
+
+def _normal_impl(mean, std, size=None, *, generator=None, dtype=None,
+                 device=None, layout=None, pin_memory=None):
+    _no_generator("normal", generator)
+    if layout is not None and getattr(layout, "name", layout) != "strided":
+        raise RuntimeError(f"layout must be None or the strided layout, got {layout}")
+    if not isinstance(std, tp.Tensor) and std < 0:
+        raise RuntimeError(f"normal expects std >= 0.0, but found std {std}")
+    if size is None:
+        tensors = [t for t in (mean, std) if isinstance(t, tp.Tensor)]
+        if not tensors:
+            raise RuntimeError(
+                "normal expects that either mean or std is a tensor, or size is defined"
+            )
+        shape = tensors[0].shape
+        for t in tensors[1:]:
+            shape = _broadcast_shapes(shape, t.shape)
+        target = tp.result_type(mean, std)
+        device = tensors[0].device
+    else:
+        if isinstance(mean, tp.Tensor) or isinstance(std, tp.Tensor):
+            raise RuntimeError(
+                "normal expects mean and std to be scalars when size is defined"
+            )
+        shape = list(size)
+        target = dtype if dtype is not None else tp.get_default_dtype()
+        device = device if device is not None else tp.get_default_device()
+    samples = prims.normal(
+        list(shape), mean=0.0, std=1.0, dtype=target, device=device,
+        requires_grad=False,
+    )
+    return std * samples + mean
+
+
+@register_decomposition(ops.normal.Tensor_Tensor)
+def normal_tensor_tensor(mean, std, *, generator=None):
+    return _normal_impl(mean, std, generator=generator)
+
+
+@register_decomposition(ops.normal.Tensor_float)
+def normal_tensor_float(mean, std=1, *, generator=None):
+    return _normal_impl(mean, std, generator=generator)
+
+
+@register_decomposition(ops.normal.float_Tensor)
+def normal_float_tensor(mean, std, *, generator=None):
+    return _normal_impl(mean, std, generator=generator)
+
+
+@register_decomposition(ops.normal.float_float)
+def normal_float_float(mean=0, std=1, size=None, *, generator=None, dtype=None,
+                       layout=None, device=None, pin_memory=None):
+    return _normal_impl(mean, std, size, generator=generator, dtype=dtype,
+                        device=device, layout=layout, pin_memory=pin_memory)
+
+
+@register_decomposition(ops.normal_functional.default)
+def normal_functional(self, mean=0, std=1, *, generator=None):
+    return _normal_impl(
+        mean, std, list(self.shape), generator=generator, dtype=self.dtype,
+        device=self.device,
+    )
+
+
+@register_decomposition(ops.grid_sampler_2d.default)
+def grid_sampler_2d(a, grid, interpolation_mode, padding_mode, align_corners):
+    if interpolation_mode not in (0, 1, 2):
+        raise RuntimeError(f"Invalid interpolation mode {interpolation_mode}")
+    if padding_mode not in (0, 1, 2):
+        raise RuntimeError(f"Invalid padding mode {padding_mode}")
+
+    def unnormalize(coords, size):
+        # [-1, 1] maps onto [0, size - 1] with corner alignment and onto
+        # [-0.5, size - 0.5] without it.
+        mul = (size * 0.5 - 0.5) if align_corners else (size * 0.5)
+        ofs = size * 0.5 - 0.5
+        return coords * mul + ofs
+
+    def reflect_coordinates(coords, twice_low, twice_high):
+        if twice_low == twice_high:
+            return ops.zeros_like.default(coords)
+        coords_min = twice_low / 2
+        coords_span = (twice_high - twice_low) / 2
+        coords2 = (coords - coords_min).abs()
+        extra = ops.fmod.Scalar(coords2, coords_span)
+        flips = ops.floor.default(coords2 / coords_span).to(tp.int8)
+        return ops.where.self(
+            (flips & 1) == 0, extra + coords_min, coords_span + coords_min - extra
+        )
+
+    def compute_coordinates(coords, size):
+        if padding_mode == 0:
+            return coords
+        if padding_mode == 1:
+            return tp.clamp(coords, 0, size - 1)
+        if align_corners:
+            coords_reflected = reflect_coordinates(coords, 0, 2 * (size - 1))
+        else:
+            coords_reflected = reflect_coordinates(coords, -1, 2 * size - 1)
+        return tp.clamp(coords_reflected, 0, size - 1)
+
+    def compute_source_index(coords, size):
+        return compute_coordinates(unnormalize(coords, size), size)
+
+    N, C, iH, iW = a.shape
+    _, oH, oW, two = grid.shape
+    if two != 2:
+        raise RuntimeError(f"grid last dimension must be 2 (for x,y coords), got {two}")
+
+    def in_bounds_cond(xs, ys):
+        return ops.logical_and.default(
+            0 <= xs,
+            ops.logical_and.default(
+                xs < iW, ops.logical_and.default(0 <= ys, ys < iH)
+            ),
+        )
+
+    n_idx = ops.reshape.default(tp.arange(N, device=a.device), [N, 1, 1, 1])
+    c_idx = ops.reshape.default(tp.arange(C, device=a.device), [1, C, 1, 1])
+
+    def clip(xs, ys, ws):
+        # Reads outside the image land at (0, 0) with weight zero, so the
+        # gather stays in bounds and contributes nothing.
+        cond = in_bounds_cond(xs, ys)
+        out = []
+        for t in (ops.to.dtype(xs, tp.int64), ops.to.dtype(ys, tp.int64), ws):
+            if isinstance(t, tp.Tensor):
+                picked = ops.where.ScalarOther(cond, t, 0)
+            else:
+                picked = ops.where.Scalar(cond, t, 0)
+            out.append(ops.reshape.default(picked, [N, 1, oH, oW]))
+        return tuple(out)
+
+    def get_summand(ix, iy, w):
+        idx_x, idx_y, w_ = clip(ix, iy, w)
+        return ops.index.Tensor(a, [n_idx, c_idx, idx_y, idx_x]) * w_
+
+    x = ops.select.int(grid, -1, 0)
+    y = ops.select.int(grid, -1, 1)
+
+    if interpolation_mode == 0:
+        ix = compute_source_index(x, iW)
+        iy = compute_source_index(y, iH)
+        ix_nw, iy_nw = ops.floor.default(ix), ops.floor.default(iy)
+        ix_ne, iy_sw = ix_nw + 1, iy_nw + 1
+        w_nw = (ix_ne - ix) * (iy_sw - iy)
+        w_ne = (ix - ix_nw) * (iy_sw - iy)
+        w_sw = (ix_ne - ix) * (iy - iy_nw)
+        w_se = (ix - ix_nw) * (iy - iy_nw)
+        return _sum_tensors(
+            get_summand(ix, iy, w)
+            for ix, iy, w in (
+                (ix_nw, iy_nw, w_nw),
+                (ix_ne, iy_nw, w_ne),
+                (ix_nw, iy_sw, w_sw),
+                (ix_ne, iy_sw, w_se),
+            )
+        )
+    if interpolation_mode == 1:
+        ix = compute_source_index(x, iW)
+        iy = compute_source_index(y, iH)
+        return get_summand(ops.round.default(ix), ops.round.default(iy), 1)
+    # Bicubic: the grid drives the sample positions directly; reflection and
+    # clamping happen per read.
+    ix = unnormalize(x, iW)
+    iy = unnormalize(y, iH)
+    ix_nw, iy_nw = ops.floor.default(ix), ops.floor.default(iy)
+    # The grid stays unexpanded, so the fractional parts carry a singleton
+    # channel dim to broadcast against the gathered values.
+    tx = (ix - ix_nw).unsqueeze(1)
+    ty = (iy - iy_nw).unsqueeze(1)
+
+    def get_value_bounded(ix_, iy_):
+        return get_summand(
+            compute_coordinates(ix_, iW), compute_coordinates(iy_, iH), 1
+        )
+
+    def get_coeff(ofs):
+        iy_ofs = iy_nw + (ofs - 1)
+        cs = tuple(
+            get_value_bounded(ix_nw + delta, iy_ofs) for delta in (-1, 0, 1, 2)
+        )
+        return _sum_tensors(s * w for s, w in zip(cs, _cubic_coefficients(tx)))
+
+    coeffs = tuple(get_coeff(ofs) for ofs in range(4))
+    return _sum_tensors(s * w for s, w in zip(coeffs, _cubic_coefficients(ty)))

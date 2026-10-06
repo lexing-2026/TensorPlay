@@ -544,6 +544,13 @@ SAMPLES = {
     "_euclidean_dist.default": lambda: ((tp.randn(3, 5), tp.randn(3, 5)), {}),
     "_to_copy.default": lambda: ((tp.randn(2, 3),), {"dtype": tp.float64}),
     "_adaptive_avg_pool2d.default": lambda: ((tp.randn(2, 3, 6, 5), [2, 2]), {}),
+    # Distances and grid sampling; the grid stays inside roughly one pixel so
+    # the gathered reads exercise in-bounds and zero-weight corners alike.
+    "pairwise_distance.default": lambda: ((tp.randn(4, 3), tp.randn(4, 3)), {"p": 2.0}),
+    "pdist.default": lambda: ((tp.randn(6, 3),), {"p": 2}),
+    "grid_sampler_2d.default": lambda: ((tp.randn(2, 3, 4, 5),
+                                         tp.rand(2, 6, 7, 2) * 1.6 - 0.8,
+                                         0, 0, False), {}),
     # Pooling; window maxima and indices are picked exactly, so the comparison
     # is bit-stable even on random inputs.
     "max_pool2d_with_indices.default": lambda: (
@@ -1075,6 +1082,37 @@ def test_predicate_factory_and_blas_decompositions_follow_their_contracts():
     assert tp.equal(got, 62 * tp.ones(2, 2, dtype=tp.int64))
 
 
+def test_normal_decompositions_read_a_standard_normal_and_affine_it():
+    get_decompositions([])
+    # A large draw recovers the affine parameters; the walk scales and shifts
+    # a standard normal read.
+    samples = decomposition_table[ops.normal.float_float](
+        2.0, 0.5, [200000], dtype=tp.float32)
+    assert abs(samples.mean().item() - 2.0) < 0.02
+    assert abs(samples.std().item() - 0.5) < 0.02
+
+    # Tensor parameters shape the draw by broadcasting and promote the dtype.
+    got = decomposition_table[ops.normal.Tensor_Tensor](
+        tp.full([2, 1], 3.0), tp.full([1, 2], 0.5))
+    assert tuple(got.shape) == (2, 2)
+    assert got.dtype == tp.float32
+
+    res = decomposition_table[ops.normal_functional.default](
+        tp.empty(3, 4, dtype=tp.float32), 0.0, 1.0)
+    assert tuple(res.shape) == (3, 4)
+    assert res.dtype == tp.float32
+
+    with pytest.raises(RuntimeError):
+        decomposition_table[ops.normal.float_float](0.0, -1.0, [3])
+    with pytest.raises(AssertionError):
+        decomposition_table[ops.normal.float_float](0.0, 1.0, [3], generator=True)
+    with pytest.raises(RuntimeError):
+        decomposition_table[ops.pdist.default](tp.randn(3), 2)
+    with pytest.raises(RuntimeError):
+        decomposition_table[ops.grid_sampler_2d.default](
+            tp.randn(2, 3, 4, 5), tp.randn(2, 6, 7, 2), 3, 0, False)
+
+
 def test_fused_rms_norm_against_formula_and_autograd():
     # No CPU kernel serves these overloads; the oracle is the formula itself
     # and its autograd gradient.
@@ -1164,6 +1202,12 @@ def test_every_functional_decomposition_has_a_sample():
             # Anti-aliased lanczos has no CPU kernel at any level; its vec
             # decomposition only unpacks the scale factors onto the default op.
             "_upsample_lanczos2d_aa.vec",
+            # The normal family draws random values; an eager comparison would
+            # compare two different draws, so the walk is checked against the
+            # distribution instead (below).
+            "normal.Tensor_Tensor", "normal.Tensor_float",
+            "normal.float_Tensor", "normal.float_float",
+            "normal_functional.default",
         }
         and str(o).split(".", 1)[1] not in DEVICE_SPECIFIC
         and not any(a.is_out for a in o._schema.arguments)
