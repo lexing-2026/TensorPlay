@@ -2176,6 +2176,196 @@ def _stat_shape(stat, input, axis):
     return stat.reshape(shape)
 
 
+def _batch_norm_stat_dims(input):
+    # Channel 1 plus every spatial dim: the batch norm statistics reduce the
+    # batch and the spatial extent, keeping one value per channel.
+    return [0] + list(range(2, input.dim()))
+
+
+def _batch_norm_stat_shape(input, dims):
+    return [int(s) for i, s in enumerate(input.shape) if i not in dims]
+
+
+def _batch_norm_helper(input, weight, bias, running_mean, running_var,
+                       training, momentum, eps, functional):
+    dims = _batch_norm_stat_dims(input)
+    compute = _computation_dtype(input.dtype)
+    new_running_mean = running_mean
+    new_running_var = running_var
+    if training:
+        input_acc = input.to(dtype=compute)
+        biased_var, mean = ops.var_mean.default(
+            input_acc, dims, unbiased=False, keepdim=True
+        )
+        rstd = tp.rsqrt(biased_var + eps)
+        output = (input_acc - mean) * rstd
+        save_mean = ops.reshape.default(mean, _batch_norm_stat_shape(input, dims))
+        save_rstd = ops.reshape.default(rstd, _batch_norm_stat_shape(input, dims))
+        if running_mean is not None:
+            new_running_mean = momentum * save_mean + (1 - momentum) * running_mean
+            if not functional:
+                running_mean.copy_(new_running_mean)
+        if running_var is not None:
+            n = input.numel() / int(input.shape[1])
+            # The running spread keeps the unbiased estimate, recovered from
+            # the biased one by the factor n/(n-1).
+            unbiased_var = ops.reshape.default(
+                biased_var, _batch_norm_stat_shape(input, dims)
+            ) * (n / (n - 1))
+            new_running_var = momentum * unbiased_var + (1 - momentum) * running_var
+            if not functional:
+                running_var.copy_(new_running_var)
+    else:
+        if running_mean is None or running_var is None:
+            raise RuntimeError("running_mean and running_var must not be None in eval mode")
+        running_mean = running_mean.to(dtype=compute, copy=True)
+        new_running_mean = running_mean
+        running_var = running_var.to(dtype=compute, copy=True)
+        new_running_var = running_var
+        mean = running_mean
+        invstd = tp.rsqrt(running_var + eps)
+        # Backends outside the CPU path reuse the running statistics as the
+        # saved ones; the CPU kernel reports empty saved stats because the
+        # backward pass recomputes the inverse spread from running_var.
+        if input.device.type != "cpu":
+            save_mean = running_mean
+            save_rstd = invstd
+        else:
+            save_mean = input.new_zeros((0,))
+            save_rstd = input.new_zeros((0,))
+        mean = _to_rank(mean, input.dim() - 1)
+        invstd = _to_rank(invstd, input.dim() - 1)
+        output = (input - mean) * invstd
+
+    if weight is not None:
+        output = output * _to_rank(ops.reshape.default(weight, [-1]), input.dim() - 1)
+    if bias is not None:
+        output = output + _to_rank(ops.reshape.default(bias, [-1]), input.dim() - 1)
+
+    if input.device.type == "cpu":
+        save_mean = save_mean.to(dtype=input.dtype)
+        save_rstd = save_rstd.to(dtype=input.dtype)
+    return (
+        output.to(dtype=input.dtype),
+        save_mean,
+        save_rstd,
+        new_running_mean,
+        new_running_var,
+    )
+
+
+@register_decomposition(ops.native_batch_norm.default)
+def native_batch_norm(input, weight, bias, running_mean, running_var,
+                      training, momentum, eps):
+    output, save_mean, save_rstd, _, _ = _batch_norm_helper(
+        input, weight, bias, running_mean, running_var, training, momentum, eps, False
+    )
+    return output, save_mean, save_rstd
+
+
+@register_decomposition(ops._native_batch_norm_legit.default)
+def _native_batch_norm_legit(input, weight, bias, running_mean, running_var,
+                             training, momentum, eps):
+    output, save_mean, save_rstd, _, _ = _batch_norm_helper(
+        input, weight, bias, running_mean, running_var, training, momentum, eps, False
+    )
+    return output, save_mean, save_rstd
+
+
+@register_decomposition(ops._native_batch_norm_legit.no_stats)
+def _native_batch_norm_legit_no_stats(input, weight, bias, training, momentum, eps):
+    output, save_mean, save_rstd, _, _ = _batch_norm_helper(
+        input, weight, bias, None, None, training, momentum, eps, False
+    )
+    return output, save_mean, save_rstd
+
+
+@register_decomposition(ops._native_batch_norm_legit_no_training.default)
+def _native_batch_norm_legit_no_training(input, weight, bias, running_mean,
+                                         running_var, momentum, eps):
+    return _native_batch_norm_legit(
+        input, weight, bias, running_mean, running_var, False, momentum, eps
+    )
+
+
+def _batch_norm_reserve(input):
+    # Placeholder the cudnn kernels size their forward-state scratch from;
+    # the composite walk needs no state, so it stays empty.
+    return tp.empty(0, dtype=tp.uint8, device=input.device)
+
+
+@register_decomposition(ops._batch_norm_with_update.default)
+def _batch_norm_with_update(input, weight, bias, running_mean, running_var,
+                            momentum, eps):
+    output, save_mean, save_rstd, _, _ = _batch_norm_helper(
+        input, weight, bias, running_mean, running_var, True, momentum, eps, False
+    )
+    return output, save_mean, save_rstd, _batch_norm_reserve(input)
+
+
+@register_decomposition(ops._batch_norm_no_update.default)
+def _batch_norm_no_update(input, weight, bias, running_mean, running_var,
+                          momentum, eps):
+    output, save_mean, save_rstd, _, _ = _batch_norm_helper(
+        input, weight, bias, running_mean, running_var, False, momentum, eps, False
+    )
+    return output, save_mean, save_rstd, _batch_norm_reserve(input)
+
+
+@register_decomposition(ops.native_layer_norm.default)
+def native_layer_norm(input, normalized_shape, weight, bias, eps):
+    normalized_shape = tuple(int(s) for s in normalized_shape)
+    normalized_ndim = len(normalized_shape)
+    if normalized_ndim < 1:
+        raise RuntimeError(
+            "Expected normalized_shape to be at least 1-dimensional, i.e., "
+            f"containing at least one element, but got normalized_shape = {list(normalized_shape)}"
+        )
+    if weight is not None and tuple(weight.shape) != normalized_shape:
+        raise RuntimeError(
+            "Expected weight to be of same shape as normalized_shape, but got "
+            f"weight of shape {tuple(weight.shape)} and normalized_shape = {list(normalized_shape)}"
+        )
+    if bias is not None and tuple(bias.shape) != normalized_shape:
+        raise RuntimeError(
+            "Expected bias to be of same shape as normalized_shape, but got "
+            f"bias of shape {tuple(bias.shape)} and normalized_shape = {list(normalized_shape)}"
+        )
+    if input.dim() < normalized_ndim or tuple(input.shape[input.dim() - normalized_ndim:]) != normalized_shape:
+        raise RuntimeError(
+            f"Given normalized_shape={list(normalized_shape)}, expected input with shape "
+            f"{list(normalized_shape)}, but got input of size {tuple(input.shape)}"
+        )
+    if input.is_complex():
+        raise RuntimeError("native_layer_norm does not support complex inputs")
+
+    input = input.contiguous()
+    if weight is not None:
+        weight = weight.contiguous()
+    if bias is not None:
+        bias = bias.contiguous()
+
+    axis = input.dim() - normalized_ndim
+    dims = list(range(axis, input.dim()))
+    compute = _computation_dtype(input.dtype)
+    a_acc = input.to(dtype=compute)
+    biased_var, mean = ops.var_mean.default(a_acc, dims, unbiased=False, keepdim=True)
+    rstd = tp.rsqrt(biased_var + eps)
+    out = (a_acc - mean) * rstd
+
+    if weight is None and bias is not None:
+        out = out + bias
+    elif weight is not None and bias is None:
+        out = out * weight
+    elif weight is not None and bias is not None:
+        out = out * weight + bias
+
+    out = out.to(dtype=input.dtype)
+    # The row statistics keep the computation precision the walk ran in; only
+    # the normalized output drops back to the stored precision.
+    return out, ops.reshape.default(mean, [-1]), ops.reshape.default(rstd, [-1])
+
+
 @register_decomposition(ops.native_batch_norm_backward.default)
 def native_batch_norm_backward(grad_out, input, weight, running_mean, running_var,
                                save_mean, save_invstd, train, eps, output_mask):
@@ -5222,6 +5412,231 @@ def batch_norm_backward(grad_output, input, weight=None, running_mean=None, runn
     if grad_bias is not None:
         grad_bias = prims.convert_element_type(squeeze(grad_bias, reduction_axes), weight_dtype)
     return grad_input, grad_weight, grad_bias
+
+
+_INT_DTYPE_BITS = {
+    tp.int8: 8, tp.uint8: 8, tp.int16: 16, tp.int32: 32, tp.int64: 64,
+}
+
+_INT_DTYPE_MIN = {
+    tp.int8: -(1 << 7), tp.uint8: 0, tp.int16: -(1 << 15),
+    tp.int32: -(1 << 31), tp.int64: -(1 << 63),
+}
+
+
+def _pooling_output_shape(input_size, kernel_size, pad, stride, dilation, ceil_mode):
+    if stride == 0:
+        raise RuntimeError("stride should not be zero")
+    if pad < 0:
+        raise RuntimeError(f"pad must be non-negative, but got pad: {pad}")
+    if pad > ((kernel_size - 1) * dilation + 1) // 2:
+        raise RuntimeError(
+            f"pad should be at most half of effective kernel size, but got pad={pad}, "
+            f"kernel_size={kernel_size} and dilation={dilation}"
+        )
+    if not ceil_mode:
+        return (input_size + 2 * pad - dilation * (kernel_size - 1) - 1) // stride + 1
+    output_size = (
+        input_size + 2 * pad - dilation * (kernel_size - 1) - 1 + stride - 1
+    ) // stride + 1
+    if (output_size - 1) * stride >= input_size + pad:
+        output_size -= 1
+    return output_size
+
+
+def _max_pool_nd_with_indices(self, kernel_size, stride, padding, dilation,
+                              ceil_mode, n_dim):
+    def expand(value, default=None):
+        if not isinstance(value, (list, tuple)):
+            return [value] * n_dim
+        if not value:
+            if default is None:
+                raise RuntimeError("an empty size list requires a default")
+            return list(default)
+        return value * n_dim if len(value) == 1 else list(value)
+
+    ks = expand(kernel_size)
+    st = expand(stride, ks)
+    pa = expand(padding, [0] * n_dim)
+    di = expand(dilation, [1] * n_dim)
+
+    if self.dim() not in (n_dim + 1, n_dim + 2):
+        raise RuntimeError(f"Expected {n_dim + 1}D or {n_dim + 2}D input, got {self.dim()}D")
+
+    is_batched = self.dim() == n_dim + 2
+    if not is_batched:
+        self = unsqueeze(self, 0)
+
+    input_sizes = [int(s) for s in self.shape[-n_dim:]]
+    output_sizes = [
+        _pooling_output_shape(input_sizes[d], ks[d], pa[d], st[d], di[d], ceil_mode)
+        for d in range(n_dim)
+    ]
+
+    # Padding is placed with a sentinel no real element can reach so it never
+    # wins the max.  For integers the type minimum is a reachable value and
+    # would tie in the argmax, so the input is widened first and the sentinel
+    # sits one below the minimum of the original type.
+    dtype = self.dtype
+    promoted = False
+    if dtype == tp.bool:
+        fill_value = 0.0
+    elif dtype.is_floating_point:
+        fill_value = float("-inf")
+    else:
+        bits = _INT_DTYPE_BITS[dtype]
+        if bits < 32:
+            self = self.to(dtype=tp.int32)
+        elif bits < 64:
+            self = self.to(dtype=tp.int64)
+        fill_value = float(_INT_DTYPE_MIN[dtype] - 1) if bits < 64 else float(_INT_DTYPE_MIN[dtype])
+        promoted = True
+
+    # Ceil mode lets the last window overhang the (padded) extent, so the
+    # right side of each dim may need more than the symmetric padding.
+    pad_args = []
+    for d in reversed(range(n_dim)):
+        needed = (output_sizes[d] - 1) * st[d] + (ks[d] - 1) * di[d] + 1
+        right = max(0, needed - (input_sizes[d] + 2 * pa[d])) + pa[d]
+        pad_args.extend([pa[d], right])
+    x = ops.constant_pad_nd.default(self, pad_args, fill_value)
+
+    # One index plane per spatial dim: entry [out_pos, ker_pos] points at the
+    # input position that window element reads.  The planes broadcast into the
+    # Cartesian product of all dims, so the gather below pulls every pooling
+    # window at once.
+    idx_tensors = []
+    for d in range(n_dim):
+        out_pos = tp.arange(output_sizes[d], dtype=tp.int64, device=self.device).unsqueeze(1)
+        ker_pos = tp.arange(ks[d], dtype=tp.int64, device=self.device).unsqueeze(0)
+        idx = out_pos * st[d] + ker_pos * di[d]
+        shape = [1] * (2 * n_dim)
+        shape[2 * d] = output_sizes[d]
+        shape[2 * d + 1] = ks[d]
+        idx_tensors.append(ops.reshape.default(idx, shape))
+
+    # (N, C, out_0, k_0, out_1, k_1, ..., out_{n-1}, k_{n-1})
+    windows = ops.index.Tensor(x, [None, None] + idx_tensors)
+
+    perm = [0, 1]
+    perm += [2 + 2 * d for d in range(n_dim)]
+    perm += [3 + 2 * d for d in range(n_dim)]
+    windows = ops.permute.default(windows, perm)
+    out_shape = [int(s) for s in windows.shape[:2 + n_dim]]
+    windows = ops.reshape.default(windows, out_shape + [-1])
+    values, local_argmax = ops.max.dim(windows, -1)
+
+    # Expand the flat position inside the window into one offset per dim.
+    kernel_pos = []
+    remaining = local_argmax
+    for d in range(n_dim):
+        divisor = 1
+        for dd in range(d + 1, n_dim):
+            divisor *= ks[dd]
+        kernel_pos.append(remaining // divisor)
+        remaining = remaining % divisor
+
+    # Fold per-dim input coordinates (window origin plus kernel offset, minus
+    # padding) into the flat index the backward pass scatters through.
+    orig_coords = []
+    for d in range(n_dim):
+        shape = [1] * (2 + n_dim)
+        shape[2 + d] = output_sizes[d]
+        out_pos = tp.arange(output_sizes[d], dtype=tp.int64, device=self.device).reshape(shape)
+        orig_coords.append(out_pos * st[d] + kernel_pos[d] * di[d] - pa[d])
+
+    flat_indices = orig_coords[0]
+    for d in range(1, n_dim):
+        flat_indices = flat_indices * input_sizes[d] + orig_coords[d]
+
+    if promoted:
+        values = values.to(dtype)
+    if not is_batched:
+        values = values.squeeze(0)
+        flat_indices = flat_indices.squeeze(0)
+    return values, flat_indices
+
+
+@register_decomposition(ops.max_pool2d_with_indices.default)
+def max_pool2d_with_indices(self, kernel_size, stride=[], padding=[],
+                            dilation=[], ceil_mode=False):
+    return _max_pool_nd_with_indices(
+        self, kernel_size, stride, padding, dilation, ceil_mode, 2
+    )
+
+
+@register_decomposition(ops.max_pool3d_with_indices.default)
+def max_pool3d_with_indices(self, kernel_size, stride=[], padding=[],
+                            dilation=[], ceil_mode=False):
+    return _max_pool_nd_with_indices(
+        self, kernel_size, stride, padding, dilation, ceil_mode, 3
+    )
+
+
+@register_decomposition(ops.adaptive_max_pool2d.default)
+def adaptive_max_pool2d(input, output_size):
+    if input.dim() not in (3, 4):
+        raise RuntimeError(
+            f"adaptive_max_pool2d(): Expected 3D or 4D tensor, but got {input.dim()}D"
+        )
+    for i in range(1, input.dim()):
+        if int(input.shape[i]) <= 0:
+            raise RuntimeError(
+                "adaptive_max_pool2d(): Expected input to have non-zero size for "
+                f"non-batch dimensions, but input has sizes {tuple(input.shape)} "
+                f"with dimension {i} being empty"
+            )
+
+    h_in = int(input.shape[-2])
+    w_in = int(input.shape[-1])
+    h_out, w_out = output_size
+
+    if h_out == 0 or w_out == 0:
+        output_shape = [int(s) for s in input.shape[:-2]] + [h_out, w_out]
+        return input.new_empty(output_shape)
+
+    # Global pooling: one max over the whole spatial extent.
+    if h_out == 1 and w_out == 1:
+        return ops.amax.default(input, [-2, -1], True)
+
+    if h_in % h_out == 0 and w_in % w_out == 0:
+        kernel_size = [h_in // h_out, w_in // w_out]
+        return ops.max_pool2d.default(input, kernel_size)
+
+    return NotImplemented
+
+
+@register_decomposition(ops.adaptive_max_pool3d.default)
+def adaptive_max_pool3d(input, output_size):
+    if input.dim() not in (4, 5):
+        raise RuntimeError(
+            f"adaptive_max_pool3d(): Expected 4D or 5D tensor, but got {input.dim()}D"
+        )
+    for i in range(1, input.dim()):
+        if int(input.shape[i]) <= 0:
+            raise RuntimeError(
+                "adaptive_max_pool3d(): Expected input to have non-zero size for "
+                f"non-batch dimensions, but input has sizes {tuple(input.shape)} "
+                f"with dimension {i} being empty"
+            )
+
+    d_in = int(input.shape[-3])
+    h_in = int(input.shape[-2])
+    w_in = int(input.shape[-1])
+    d_out, h_out, w_out = output_size
+
+    if d_out == 0 or h_out == 0 or w_out == 0:
+        output_shape = [int(s) for s in input.shape[:-3]] + [d_out, h_out, w_out]
+        return input.new_empty(output_shape)
+
+    if d_out == 1 and h_out == 1 and w_out == 1:
+        return ops.amax.default(input, [-3, -2, -1], True)
+
+    if d_in % d_out == 0 and h_in % h_out == 0 and w_in % w_out == 0:
+        kernel_size = [d_in // d_out, h_in // h_out, w_in // w_out]
+        return ops.max_pool3d.default(input, kernel_size)
+
+    return NotImplemented
 
 
 @register_decomposition(ops.max_pool2d_with_indices_backward.default)

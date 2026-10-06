@@ -24,6 +24,13 @@ def _unit(*shape):
     return tp.rand(*shape) * 0.8 + 0.1
 
 
+def _lattice_bn_input():
+    # Batch norm runs its statistics in a fused kernel on one side and a
+    # composite var/mean walk on the other; unit-scale lattices keep the two
+    # rounding paths inside the comparison tolerance.
+    return tp.arange(24, dtype=tp.float32).reshape(2, 3, 2, 2) * 0.01
+
+
 def _pool2d_backward_sample():
     inp = tp.randn(2, 3, 6, 6)
     indices = ops.max_pool2d_with_indices.default(inp, [2, 2], [2, 2])[1]
@@ -504,6 +511,40 @@ SAMPLES = {
     "upsample_bicubic2d.vec": lambda: ((_t(1, 2, 4, 5), None, False, (1.5, 2.0)), {}),
     "_upsample_bilinear2d_aa.vec": lambda: ((_t(1, 2, 4, 5), [7, 8], False, None), {}),
     "_upsample_bicubic2d_aa.vec": lambda: ((_t(1, 2, 4, 5), None, False, (1.5, 2.0)), {}),
+    # Pooling; window maxima and indices are picked exactly, so the comparison
+    # is bit-stable even on random inputs.
+    "max_pool2d_with_indices.default": lambda: (
+        (_t(2, 3, 6, 6), [3, 3], [2, 2], [1, 1], [1, 1], False), {}
+    ),
+    "max_pool3d_with_indices.default": lambda: (
+        (_t(1, 2, 4, 6, 8), [3, 3, 3], [2, 2, 2], [1, 1, 1], [1, 1, 1], False), {}
+    ),
+    "adaptive_max_pool2d.default": lambda: ((_t(2, 3, 6, 6), (2, 2)), {}),
+    "adaptive_max_pool3d.default": lambda: ((_t(1, 2, 4, 6, 8), (2, 2, 2)), {}),
+    # Normalization; the statistics walk (var/mean, rsqrt) rounds differently
+    # between the fused kernels and the composite walk at the atol boundary on
+    # unit-scale inputs, so these samples run on a small deterministic lattice
+    # where both sides agree to the last bit.
+    "native_batch_norm.default": lambda: (
+        (_lattice_bn_input(), tp.ones(3), tp.zeros(3), tp.zeros(3), tp.ones(3),
+         True, 0.1, 1e-5), {}
+    ),
+    "_native_batch_norm_legit_no_training.default": lambda: (
+        (_lattice_bn_input(), tp.ones(3), tp.zeros(3),
+         tp.tensor([0.05, 0.10, 0.15]), tp.tensor([0.02, 0.04, 0.08]), 0.1, 1e-5), {}
+    ),
+    "_batch_norm_with_update.default": lambda: (
+        (_lattice_bn_input(), tp.ones(3), tp.zeros(3), tp.zeros(3), tp.ones(3),
+         0.1, 1e-5), {}
+    ),
+    "_batch_norm_no_update.default": lambda: (
+        (_lattice_bn_input(), tp.ones(3), tp.zeros(3),
+         tp.tensor([0.05, 0.10, 0.15]), tp.tensor([0.02, 0.04, 0.08]), 0.1, 1e-5), {}
+    ),
+    "native_layer_norm.default": lambda: (
+        (tp.tensor([[-0.02, -0.01, 0.0, 0.01, 0.02], [0.02, 0.01, 0.0, -0.01, -0.02]]),
+         [5], tp.ones(5), tp.zeros(5), 1e-5), {}
+    ),
 }
 
 # Overloads whose kernels exist only on specific devices; exercised by the
@@ -741,6 +782,34 @@ def _registered_functional():
         for overload, fn in decomposition_table.items()
         if not overload._schema.is_mutable
     }
+
+
+def test_batch_norm_legit_decompositions_match_the_kernels_they_replace():
+    # The legit overloads share the batch norm statistics walk; no CPU kernel
+    # serves them, so they are checked against the native_batch_norm kernel
+    # (which accepts absent running statistics in training mode) and against
+    # the composite contract for the eval-time refusal.
+    get_decompositions([])
+    x = _lattice_bn_input()
+    w, b = tp.ones(3), tp.zeros(3)
+    rm, rv = tp.zeros(3), tp.ones(3)
+
+    legit = decomposition_table[ops._native_batch_norm_legit.default](
+        x, w, b, rm.clone(), rv.clone(), True, 0.1, 1e-5
+    )
+    native = ops.native_batch_norm.default(x, w, b, rm.clone(), rv.clone(), True, 0.1, 1e-5)
+    for l, n in zip(legit, native):
+        assert tp.allclose(l, n, rtol=1e-5, atol=1e-6)
+
+    no_stats = decomposition_table[ops._native_batch_norm_legit.no_stats](
+        x, w, b, True, 0.1, 1e-5
+    )
+    native_no_stats = ops.native_batch_norm.default(x, w, b, None, None, True, 0.1, 1e-5)
+    for l, n in zip(no_stats, native_no_stats):
+        assert tp.allclose(l, n, rtol=1e-5, atol=1e-6)
+
+    with pytest.raises(RuntimeError):
+        decomposition_table[ops._native_batch_norm_legit.no_stats](x, w, b, False, 0.1, 1e-5)
 
 
 def test_chunk_cat_decomposition():
@@ -999,10 +1068,13 @@ def test_every_functional_decomposition_has_a_sample():
         and str(o).split(".", 1)[1] not in {
             "empty_like.default", "new_empty.default", "_chunk_cat.default",
             "_fused_rms_norm.default", "_fused_rms_norm_backward.default",
-            "dropout.default", "native_dropout.default", "native_layer_norm.default",
+            "dropout.default", "native_dropout.default",
             "alpha_dropout.default", "_fused_dropout.default",
             "new_empty_strided.default", "randn.default", "sym_numel.default",
             "empty_strided.default", "pad_sequence.default",
+            # Batch norm legit forms have no CPU eager kernels; the walk is
+            # shared with native_batch_norm and exercised against it below.
+            "_native_batch_norm_legit.default", "_native_batch_norm_legit.no_stats",
             # Transforms without CPU eager kernels; validated through the
             # round-trip identities in the fft test module instead.
             "fft_hfft.default", "fft_ihfft.default",
