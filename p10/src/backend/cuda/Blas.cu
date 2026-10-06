@@ -8,6 +8,7 @@
 #include "CUDAContext.h"
 #include "CUDARuntime.h"
 #include "CudaGemm.h"
+#include "../BlasComposite.h"
 #include "Exception.h"
 #include "Scalar.h"
 #include "Utils.h"
@@ -52,9 +53,11 @@ inline dim3 element_grid(int64_t work) {
     return dim3(static_cast<unsigned>((work + kThreads - 1) / kThreads));
 }
 
-void require_float(const Tensor& t, const char* who) {
-    if (!isFloatingType(t.dtype()))
-        TP_THROW(TypeError, who, ": only floating-point tensors are supported");
+// Whether all three operands are floating -- what the kernels here serve,
+// mixed precisions included; complex, whole-number and truth-value operands
+// are composed from the products.
+bool all_floating(const Tensor& self, const Tensor& a, const Tensor& b) {
+    return isFloatingType(self.dtype()) && isFloatingType(a.dtype()) && isFloatingType(b.dtype());
 }
 
 // out[i] = beta * self_b[i] + alpha * vec1[i/k] * vec2[i%k]; operands are
@@ -95,8 +98,9 @@ void launch_addr(const Tensor& self_b, const Tensor& v1, const Tensor& v2,
 
 Tensor addmv_cuda(const Tensor& self, const Tensor& mat, const Tensor& vec,
                   const Scalar& beta, const Scalar& alpha) {
-    require_float(mat, "addmv");
-    require_float(vec, "addmv");
+    if (!all_floating(self, mat, vec)) {
+        return blas_composite::addmv(self, mat, vec, beta, alpha);
+    }
     if (mat.dim() != 2) TP_THROW(RuntimeError, "addmv: mat must be a matrix");
     if (vec.dim() != 1) TP_THROW(RuntimeError, "addmv: vec must be a vector");
     const int64_t m = mat.size(0), k = mat.size(1);
@@ -134,8 +138,9 @@ Tensor addmv_cuda(const Tensor& self, const Tensor& mat, const Tensor& vec,
 Tensor addbmm_cuda(const Tensor& self, const Tensor& batch1, const Tensor& batch2,
                    const Scalar& beta_arg, const Scalar& alpha) {
     Scalar beta = beta_arg;
-    require_float(batch1, "addbmm");
-    require_float(batch2, "addbmm");
+    if (!all_floating(self, batch1, batch2)) {
+        return blas_composite::addbmm(self, batch1, batch2, beta, alpha);
+    }
     if (batch1.dim() != 3) TP_THROW(RuntimeError, "batch1 must be a 3D tensor");
     if (batch2.dim() != 3) TP_THROW(RuntimeError, "batch2 must be a 3D tensor");
     if (batch1.size(0) != batch2.size(0) || batch1.size(2) != batch2.size(1)) {
@@ -176,10 +181,13 @@ Tensor addbmm_cuda(const Tensor& self, const Tensor& batch1, const Tensor& batch
 
 Tensor addr_cuda(const Tensor& self, const Tensor& vec1, const Tensor& vec2,
                  const Scalar& beta, const Scalar& alpha) {
-    require_float(vec1, "addr");
-    require_float(vec2, "addr");
+    if (!all_floating(self, vec1, vec2)) {
+        return blas_composite::addr(self, vec1, vec2, beta, alpha);
+    }
     const int64_t m = vec1.numel(), k = vec2.numel();
     const DType dt = promoteTypes(promoteTypes(vec1.dtype(), vec2.dtype()), self.dtype());
+    blas_composite::check_scalar(dt, beta, "beta");
+    blas_composite::check_scalar(dt, alpha, "alpha");
     const DType cdt = (dt == DType::Float64) ? DType::Float64 : DType::Float32;
     const Tensor v1 = vec1.contiguous().to(cdt);
     const Tensor v2 = vec2.contiguous().to(cdt);
@@ -244,8 +252,7 @@ Tensor vdot_cuda(const Tensor& a_in, const Tensor& b_in) {
                 reinterpret_cast<const hipComplex*>(a.data_ptr<tensorplay::complex<float>>()), 1,
                 reinterpret_cast<const hipComplex*>(bmatch.data_ptr<tensorplay::complex<float>>()), 1,
                 &out_c));
-            result.data_ptr<tensorplay::complex<float>>()[0] =
-                tensorplay::complex<float>(out_c.x, out_c.y);
+            result = Tensor::full({}, Scalar(tensorplay::complex<float>(out_c.x, out_c.y)), dt, a.device());
 #else
             cuComplex out;
             CUBLAS_CHECK(cublasCdotc(
@@ -253,8 +260,7 @@ Tensor vdot_cuda(const Tensor& a_in, const Tensor& b_in) {
                 reinterpret_cast<const cuComplex*>(a.data_ptr<tensorplay::complex<float>>()), 1,
                 reinterpret_cast<const cuComplex*>(bmatch.data_ptr<tensorplay::complex<float>>()), 1,
                 &out));
-            result.data_ptr<tensorplay::complex<float>>()[0] =
-                tensorplay::complex<float>(out.x, out.y);
+            result = Tensor::full({}, Scalar(tensorplay::complex<float>(out.x, out.y)), dt, a.device());
 #endif
             return result;
         }
@@ -266,8 +272,7 @@ Tensor vdot_cuda(const Tensor& a_in, const Tensor& b_in) {
                 reinterpret_cast<const hipDoubleComplex*>(a.data_ptr<tensorplay::complex<double>>()), 1,
                 reinterpret_cast<const hipDoubleComplex*>(bmatch.data_ptr<tensorplay::complex<double>>()), 1,
                 &out_z));
-            result.data_ptr<tensorplay::complex<double>>()[0] =
-                tensorplay::complex<double>(out_z.x, out_z.y);
+            result = Tensor::full({}, Scalar(tensorplay::complex<double>(out_z.x, out_z.y)), dt, a.device());
 #else
             cuDoubleComplex out;
             CUBLAS_CHECK(cublasZdotc(
@@ -275,8 +280,7 @@ Tensor vdot_cuda(const Tensor& a_in, const Tensor& b_in) {
                 reinterpret_cast<const cuDoubleComplex*>(a.data_ptr<tensorplay::complex<double>>()), 1,
                 reinterpret_cast<const cuDoubleComplex*>(bmatch.data_ptr<tensorplay::complex<double>>()), 1,
                 &out));
-            result.data_ptr<tensorplay::complex<double>>()[0] =
-                tensorplay::complex<double>(out.x, out.y);
+            result = Tensor::full({}, Scalar(tensorplay::complex<double>(out.x, out.y)), dt, a.device());
 #endif
             return result;
         }

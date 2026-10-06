@@ -14,6 +14,7 @@
 #include "Utils.h"
 #include "Complex.h"
 #include "cpu/BlockGemm.h"
+#include "../BlasComposite.h"
 
 #include <functional>
 #include <memory>
@@ -56,9 +57,11 @@ using namespace tensorplay::parallel;
 
 namespace {
 
-void require_float(const Tensor& t, const char* who) {
-    if (!isFloatingType(t.dtype()))
-        TP_THROW(TypeError, who, ": only floating-point tensors are supported");
+// Whether all three operands are floating -- what the kernels here serve,
+// mixed precisions included; complex, whole-number and truth-value operands
+// are composed from the products.
+bool all_floating(const Tensor& self, const Tensor& a, const Tensor& b) {
+    return isFloatingType(self.dtype()) && isFloatingType(a.dtype()) && isFloatingType(b.dtype());
 }
 
 bool is_cplx(DType d) {
@@ -144,8 +147,9 @@ void addbmm_epilogue(Tensor& out, const Tensor& self_acc, const Tensor& work,
 
 Tensor addmv_cpu(const Tensor& self, const Tensor& mat, const Tensor& vec,
                  const Scalar& beta, const Scalar& alpha) {
-    require_float(mat, "addmv");
-    require_float(vec, "addmv");
+    if (!all_floating(self, mat, vec)) {
+        return blas_composite::addmv(self, mat, vec, beta, alpha);
+    }
     if (mat.dim() != 2) TP_THROW(RuntimeError, "addmv: mat must be a matrix");
     if (vec.dim() != 1) TP_THROW(RuntimeError, "addmv: vec must be a vector");
     const int64_t m = mat.size(0), k = mat.size(1);
@@ -160,21 +164,23 @@ Tensor addmv_cpu(const Tensor& self, const Tensor& mat, const Tensor& vec,
     if (dt == cdt) {
         // Native GEMV.  y is seeded with the broadcast self and beta is
         // applied by the call itself; beta == 0 leaves y unread, so the seed
-        // copy is skipped and the output buffer stays uninitialized.
+        // copy is skipped and the output buffer stays uninitialized.  Every
+        // operand is read at the compute dtype, whatever precision it came in.
         Tensor result = beta_v != 0.0
-            ? detail::contiguous_clone(self.expand({m}))
+            ? detail::contiguous_clone((self.dtype() == dt ? self : self.to(dt)).expand({m}))
             : Tensor::empty({m}, dt, mat.device());
-        Tensor xc = vec.is_contiguous() ? vec : detail::contiguous_clone(vec);
-        Tensor a_input = mat;
+        Tensor xc = vec.dtype() == dt ? vec : vec.to(dt);
+        if (!xc.is_contiguous()) xc = detail::contiguous_clone(xc);
+        Tensor a_input = mat.dtype() == dt ? mat : mat.to(dt);
         int64_t lda = k;
         bool trans = false;
-        if (mat.is_contiguous()) {
+        if (a_input.is_contiguous()) {
             lda = k;
-        } else if (mat.stride(0) == 1 && mat.stride(1) == m) {
+        } else if (a_input.stride(0) == 1 && a_input.stride(1) == m) {
             trans = true;
             lda = m;
         } else {
-            a_input = detail::contiguous_clone(mat);
+            a_input = detail::contiguous_clone(a_input);
             lda = k;
         }
         if (dt == DType::Float32) {
@@ -218,8 +224,9 @@ Tensor addmv_cpu(const Tensor& self, const Tensor& mat, const Tensor& vec,
 Tensor addbmm_cpu(const Tensor& self, const Tensor& batch1, const Tensor& batch2,
                   const Scalar& beta_arg, const Scalar& alpha) {
     Scalar beta = beta_arg;
-    require_float(batch1, "addbmm");
-    require_float(batch2, "addbmm");
+    if (!all_floating(self, batch1, batch2)) {
+        return blas_composite::addbmm(self, batch1, batch2, beta, alpha);
+    }
     if (batch1.dim() != 3) TP_THROW(RuntimeError, "batch1 must be a 3D tensor");
     if (batch2.dim() != 3) TP_THROW(RuntimeError, "batch2 must be a 3D tensor");
     if (batch1.size(0) != batch2.size(0) || batch1.size(2) != batch2.size(1)) {
@@ -324,10 +331,13 @@ Tensor addbmm_cpu(const Tensor& self, const Tensor& batch1, const Tensor& batch2
 
 Tensor addr_cpu(const Tensor& self, const Tensor& vec1, const Tensor& vec2,
                 const Scalar& beta, const Scalar& alpha) {
-    require_float(vec1, "addr");
-    require_float(vec2, "addr");
+    if (!all_floating(self, vec1, vec2)) {
+        return blas_composite::addr(self, vec1, vec2, beta, alpha);
+    }
     const int64_t m = vec1.numel(), k = vec2.numel();
     const DType dt = promoteTypes(promoteTypes(vec1.dtype(), vec2.dtype()), self.dtype());
+    blas_composite::check_scalar(dt, beta, "beta");
+    blas_composite::check_scalar(dt, alpha, "alpha");
     const DType cdt = (dt == DType::Float64) ? DType::Float64 : DType::Float32;
     const Tensor v1 = vec1.contiguous().to(cdt);
     const Tensor v2 = vec2.contiguous().to(cdt);

@@ -813,15 +813,30 @@ Tensor dot_kernel_cuda(const Tensor& self, const Tensor& other) {
         return zero_matmul_output_cuda(result);
     }
 
+    // cuBLAS steps through each vector by its stride; a vector it cannot
+    // step through (stride 0 from an expand) is laid out densely first.
+    const auto operand = [n](const Tensor& t, int& inc) {
+        const int64_t stride = n == 1 ? 1 : t.stride(0);
+        if (stride > 0 && stride <= std::numeric_limits<int>::max()) {
+            inc = static_cast<int>(stride);
+            return t;
+        }
+        inc = 1;
+        return t.contiguous();
+    };
+    int incx = 1, incy = 1;
+    const Tensor x = operand(self, incx);
+    const Tensor y = operand(other, incy);
+
     switch (dtype) {
         case DType::Float32:
             CUBLAS_CHECK(cublasSdot(CUDAContext::getCublasHandle(), static_cast<int>(n),
-                                    self.data_ptr<float>(), 1, other.data_ptr<float>(), 1,
+                                    x.data_ptr<float>(), incx, y.data_ptr<float>(), incy,
                                     result.data_ptr<float>()));
             return result;
         case DType::Float64:
             CUBLAS_CHECK(cublasDdot(CUDAContext::getCublasHandle(), static_cast<int>(n),
-                                    self.data_ptr<double>(), 1, other.data_ptr<double>(), 1,
+                                    x.data_ptr<double>(), incx, y.data_ptr<double>(), incy,
                                     result.data_ptr<double>()));
             return result;
         case DType::Float16:
@@ -829,8 +844,8 @@ Tensor dot_kernel_cuda(const Tensor& self, const Tensor& other) {
             // FP32 accumulation contract, native storage for the scalar.
             CUBLAS_CHECK(cublasDotEx(
                 CUDAContext::getCublasHandle(), static_cast<int>(n),
-                self.data_ptr(), dot_cublas_type(dtype), 1,
-                other.data_ptr(), dot_cublas_type(dtype), 1,
+                x.data_ptr(), dot_cublas_type(dtype), incx,
+                y.data_ptr(), dot_cublas_type(dtype), incy,
                 result.data_ptr(), dot_cublas_type(dtype), CUDA_R_32F));
             return result;
         }

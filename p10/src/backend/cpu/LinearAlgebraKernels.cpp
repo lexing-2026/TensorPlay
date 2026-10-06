@@ -1981,7 +1981,11 @@ static double dot_f64_avx2(const double* a, const double* b, int64_t n) {
     return total;
 }
 
-Tensor dot_kernel(const Tensor& self, const Tensor& other) {
+Tensor dot_kernel(const Tensor& self_in, const Tensor& other_in) {
+    // The loops below walk dense memory; a strided view (a column, a
+    // stepped slice) is read through its own layout first.
+    const Tensor self = self_in.contiguous();
+    const Tensor other = other_in.contiguous();
     if (self.dim() != 1 || other.dim() != 1) {
         TP_THROW(RuntimeError, "1D tensors expected, but got ", self.dim(), "D and ",
                  other.dim(), "D tensors");

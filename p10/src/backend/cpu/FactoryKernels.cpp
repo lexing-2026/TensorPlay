@@ -181,6 +181,7 @@ Tensor& fill_kernel(Tensor& self, const Scalar& value) {
         }
         switch (self.dtype()) {
             TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(OP_CASE)
+            TENSORPLAY_FORALL_FP8_TYPES(OP_CASE)
             default: TP_THROW(NotImplementedError, "fill_ not implemented for this dtype");
         }
         #undef OP_CASE
@@ -204,6 +205,7 @@ Tensor& fill_kernel(Tensor& self, const Scalar& value) {
     }
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(OP_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(OP_CASE)
         default: TP_THROW(NotImplementedError, "fill_ not implemented for this dtype");
     }
     #undef OP_CASE
