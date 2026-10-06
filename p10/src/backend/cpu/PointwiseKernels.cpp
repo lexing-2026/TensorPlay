@@ -1671,8 +1671,9 @@ Tensor rrelu_with_noise_backward_kernel_impl(const Tensor& grad_output, const Te
             ctype* yp = result.data_ptr<ctype>(); \
             parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
                 for (int64_t i = begin; i < end; ++i) { \
+                    using M = activation_math_t<ctype>; \
                     yp[i] = static_cast<ctype>( \
-                        static_cast<float>(gp[i]) * static_cast<float>(np[i])); \
+                        static_cast<M>(gp[i]) * static_cast<M>(np[i])); \
                 } \
             }); \
             break; \

@@ -841,6 +841,17 @@ Tensor dot_kernel_cuda(const Tensor& self, const Tensor& other) {
     }
 }
 
+namespace {
+
+// Rows of the flattened (rows, n) operand: every dimension but the last.
+int64_t inner_rows(const Tensor& t) {
+    int64_t rows = 1;
+    for (int64_t d = 0; d + 1 < t.dim(); ++d) rows *= t.size(d);
+    return rows;
+}
+
+}  // namespace
+
 Tensor inner_kernel_cuda(const Tensor& self, const Tensor& other) {
     // promotion); otherwise this is tensordot over the last dimension.
     if (self.dim() == 0 || other.dim() == 0) {
@@ -856,8 +867,9 @@ Tensor inner_kernel_cuda(const Tensor& self, const Tensor& other) {
         return dot_kernel_cuda(self, other);
     }
 
-    Tensor a = self.reshape({-1, n});
-    Tensor b = other.reshape({-1, n});
+    // Explicit row counts: a zero-width last dimension leaves -1 ambiguous.
+    Tensor a = self.reshape({inner_rows(self), n});
+    Tensor b = other.reshape({inner_rows(other), n});
     std::vector<int64_t> out_shape;
     for (size_t i = 0; i + 1 < self.shape().size(); ++i) out_shape.push_back(self.shape()[i]);
     for (size_t i = 0; i + 1 < other.shape().size(); ++i) out_shape.push_back(other.shape()[i]);
@@ -877,36 +889,30 @@ Tensor outer_kernel_cuda(const Tensor& self, const Tensor& vec2) {
     return self.unsqueeze(1).mul(vec2.unsqueeze(0));
 }
 
+// inner(A, B) == A2 @ B2^T over the flattened (rows, n) operands; a scalar
+// operand scales the other instead.  Each gradient comes back in its
+// operand's shape, a scalar operand's being the full contraction of
+// grad_output with the other operand.
 Tensor inner_backward_self_kernel_cuda(const Tensor& grad_output, const Tensor& self, const Tensor& other) {
-    if (self.dim() == 0 || other.dim() == 0) {
-        return grad_output * other;
-    }
-    const int64_t n = std::max<int64_t>(self.size(-1), 1);
-    const int64_t prod_a = std::max<int64_t>(self.numel() / n, 1);
-    const int64_t prod_b = std::max<int64_t>(other.numel() / n, 1);
-    // inner(A, B) == A2 @ B2^T with A2=(prod_a, N), B2=(prod_b, N), so
-    // dA2 = grad2 @ B2 -- exactly matmul_backward_self on the flattened pair.
-    Tensor grad2 = grad_output.reshape({prod_a, prod_b});
-    Tensor other2 = other.reshape({-1, n});
-    Tensor da2 = matmul_kernel_cuda(grad2, other2);
-    Tensor grad = sum_to_shape_cuda(da2, static_cast<std::vector<int64_t>>(self.shape()));
-    return grad.reshape(static_cast<std::vector<int64_t>>(self.shape()));
+    const std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(self.shape());
+    if (self.dim() == 0) return (grad_output * other).sum().reshape(shape);
+    if (other.dim() == 0) return grad_output * other;
+    const int64_t rows_a = inner_rows(self);
+    const int64_t rows_b = inner_rows(other);
+    // dA2 = grad2 @ B2.
+    Tensor grad2 = grad_output.reshape({rows_a, rows_b});
+    return matmul_kernel_cuda(grad2, other.reshape({rows_b, other.size(-1)})).reshape(shape);
 }
 
 Tensor inner_backward_other_kernel_cuda(const Tensor& grad_output, const Tensor& self, const Tensor& other) {
-    if (self.dim() == 0 || other.dim() == 0) {
-        return grad_output * self;
-    }
-    const int64_t n = std::max<int64_t>(self.size(-1), 1);
-    const int64_t prod_a = std::max<int64_t>(self.numel() / n, 1);
-    const int64_t prod_b = std::max<int64_t>(other.numel() / n, 1);
-    // dB2^T = A2^T @ grad2 -- exactly matmul_backward_other on the flat pair.
-    Tensor grad2 = grad_output.reshape({prod_a, prod_b});
-    Tensor self2 = self.reshape({-1, n});
-    Tensor db2t = matmul_kernel_cuda(transpose_last_two_view_cuda(self2), grad2);
-    Tensor db2 = transpose_last_two_view_cuda(db2t);
-    Tensor grad = sum_to_shape_cuda(db2, static_cast<std::vector<int64_t>>(other.shape()));
-    return grad.reshape(static_cast<std::vector<int64_t>>(other.shape()));
+    const std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(other.shape());
+    if (other.dim() == 0) return (grad_output * self).sum().reshape(shape);
+    if (self.dim() == 0) return grad_output * self;
+    const int64_t rows_a = inner_rows(self);
+    const int64_t rows_b = inner_rows(other);
+    // dB2 = grad2^T @ A2.
+    Tensor grad2 = grad_output.reshape({rows_a, rows_b});
+    return matmul_kernel_cuda(transpose_last_two_view_cuda(grad2), self.reshape({rows_a, self.size(-1)})).reshape(shape);
 }
 
 // F.linear on CUDA: flatten the leading dims, run one cuBLASLt GEMM with the

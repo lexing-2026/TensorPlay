@@ -66,7 +66,41 @@ Tensor reciprocal_cuda(const Tensor& self) {
     return float_math_cuda(self, HFn25{}, "reciprocal");
 }
 
+namespace {
+
+// z/|z| for nonzero z, zero at the origin; NaN flows through the division.
+struct ComplexSgnOp {
+    template <typename T>
+    __device__ tensorplay::complex<T> operator()(tensorplay::complex<T> z) const {
+        if (z.real() == T(0) && z.imag() == T(0)) return tensorplay::complex<T>(T(0), T(0));
+        const T r = ::hypot(z.real(), z.imag());
+        return tensorplay::complex<T>(z.real() / r, z.imag() / r);
+    }
+};
+
+}  // namespace
+
 Tensor sgn_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) {
+        if (self.dtype() != DType::ComplexFloat &&
+            self.dtype() != DType::ComplexDouble)
+            TP_THROW(NotImplementedError, "CUDA sgn: half complexes not supported");
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), self.dtype(),
+            self.device());
+        const int64_t n = self.numel();
+        if (n == 0) return result;
+        auto stream = getCurrentCUDAStream().stream();
+        Tensor sc = self.contiguous();
+        if (self.dtype() == DType::ComplexFloat)
+            cuda::cplx::launch_unary<float>(
+                n, sc.data_ptr(), result.data_ptr(), ComplexSgnOp{}, stream);
+        else
+            cuda::cplx::launch_unary<double>(
+                n, sc.data_ptr(), result.data_ptr(), ComplexSgnOp{}, stream);
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
     return dtype_unary_cuda(self,
                             HFn26{},
                             "sgn");
