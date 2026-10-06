@@ -1044,6 +1044,16 @@ Tensor adaptive_avg_pool3d_cpu(const Tensor& input, const std::vector<int64_t>& 
     const int64_t N = input.size(0), C = input.size(1);
     const int64_t D = input.size(2), H = input.size(3), W = input.size(4);
     const int64_t oD = output_size[0], oH = output_size[1], oW = output_size[2];
+    if (input.is_contiguous(MemoryFormat::ChannelsLast3d) &&
+        (input.dtype() == DType::Float32 || input.dtype() == DType::Float64)) {
+        const std::vector<int64_t> out_sizes = {N, C, oD, oH, oW};
+        Tensor out = Tensor::empty(out_sizes, input.dtype(), input.device());
+        out = out.as_strided(out_sizes, get_channels_last_strides(out_sizes), 0);
+        adaptive_avg_pool3d_cl_stub(DeviceType::CPU, input.data_ptr(), out.data_ptr(),
+                                    N, C, D, H, W, oD, oH, oW,
+                                    static_cast<int>(input.dtype()));
+        return out;
+    }
     Tensor out = Tensor::empty({N, C, oD, oH, oW}, input.dtype(), input.device());
     const Tensor input_c = input.contiguous();
     TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "adaptive_avg_pool3d", [&]() {
@@ -1088,6 +1098,18 @@ Tensor adaptive_avg_pool3d_backward_cpu(const Tensor& grad_output, const Tensor&
     const int64_t N = input.size(0), C = input.size(1);
     const int64_t D = input.size(2), H = input.size(3), W = input.size(4);
     const int64_t oD = grad_output.size(2), oH = grad_output.size(3), oW = grad_output.size(4);
+    if (input.is_contiguous(MemoryFormat::ChannelsLast3d) &&
+        grad_output.is_contiguous(MemoryFormat::ChannelsLast3d) &&
+        input.dtype() == grad_output.dtype() &&
+        (input.dtype() == DType::Float32 || input.dtype() == DType::Float64)) {
+        const std::vector<int64_t> sizes = input.shape();
+        Tensor grad_input = Tensor::zeros(sizes, input.dtype(), input.device());
+        grad_input = grad_input.as_strided(sizes, get_channels_last_strides(sizes), 0);
+        adaptive_avg_pool3d_backward_cl_stub(
+            DeviceType::CPU, grad_output.data_ptr(), grad_input.data_ptr(),
+            N, C, D, H, W, oD, oH, oW, static_cast<int>(input.dtype()));
+        return grad_input;
+    }
     Tensor grad_input = Tensor::zeros({N, C, D, H, W}, input.dtype(), input.device());
     const Tensor grad_output_c = grad_output.contiguous();
     TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "adaptive_avg_pool3d_backward", [&]() {
@@ -1893,6 +1915,8 @@ DEFINE_DISPATCH(max_pool2d_backward_cl_stub);
 DEFINE_DISPATCH(max_pool3d_cl_stub);
 DEFINE_DISPATCH(max_pool3d_backward_cl_stub);
 DEFINE_DISPATCH(adaptive_avg_pool2d_cl_stub);
+DEFINE_DISPATCH(adaptive_avg_pool3d_cl_stub);
+DEFINE_DISPATCH(adaptive_avg_pool3d_backward_cl_stub);
 DEFINE_DISPATCH(adaptive_max_pool2d_cl_stub);
 DEFINE_DISPATCH(adaptive_max_pool2d_backward_cl_stub);
 DEFINE_DISPATCH(adaptive_max_pool3d_cl_stub);

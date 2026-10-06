@@ -652,6 +652,113 @@ void adaptive_avg_pool2d_cl_typed(const T* in, T* out,
 }
 
 template <typename T>
+void adaptive_avg_pool3d_cl_typed(const T* in, T* out,
+                                  int64_t N, int64_t C,
+                                  int64_t D, int64_t H, int64_t W,
+                                  int64_t oD, int64_t oH, int64_t oW) {
+    using Vec = tensorplay::vec::Vectorized<T>;
+    constexpr int64_t V = Vec::size();
+    const int64_t len = C - (C % V);
+    const int64_t items = N * oD * oH * oW;
+    parallel_for(0, items, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t item = begin; item < end; ++item) {
+            const int64_t ow = item % oW;
+            const int64_t oh = (item / oW) % oH;
+            const int64_t od = (item / (oW * oH)) % oD;
+            const int64_t n = item / (oW * oH * oD);
+            const int64_t id0 = (od * D) / oD;
+            const int64_t id1 = ((od + 1) * D + oD - 1) / oD;
+            const int64_t ih0 = (oh * H) / oH;
+            const int64_t ih1 = ((oh + 1) * H + oH - 1) / oH;
+            const int64_t iw0 = (ow * W) / oW;
+            const int64_t iw1 = ((ow + 1) * W + oW - 1) / oW;
+            T* out_lane = out + item * C;
+
+            int64_t c = 0;
+            for (; c < len; c += V) Vec(T(0)).store(out_lane + c);
+            for (; c < C; ++c) out_lane[c] = T(0);
+
+            for (int64_t id = id0; id < id1; ++id) {
+                for (int64_t ih = ih0; ih < ih1; ++ih) {
+                    const T* row = in + ((n * D + id) * H + ih) * W * C;
+                    for (int64_t iw = iw0; iw < iw1; ++iw) {
+                        const T* in_lane = row + iw * C;
+                        int64_t c2 = 0;
+                        for (; c2 < len; c2 += V) {
+                            (Vec::loadu(out_lane + c2) + Vec::loadu(in_lane + c2))
+                                .store(out_lane + c2);
+                        }
+                        for (; c2 < C; ++c2) out_lane[c2] += in_lane[c2];
+                    }
+                }
+            }
+
+            const T divisor = static_cast<T>((id1 - id0) * (ih1 - ih0) * (iw1 - iw0));
+            c = 0;
+            for (; c < len; c += V) {
+                (Vec::loadu(out_lane + c) / Vec(divisor)).store(out_lane + c);
+            }
+            for (; c < C; ++c) out_lane[c] /= divisor;
+        }
+    });
+}
+
+template <typename T>
+void adaptive_avg_pool3d_backward_cl_typed(const T* gout, T* gin,
+                                           int64_t N, int64_t C,
+                                           int64_t D, int64_t H, int64_t W,
+                                           int64_t oD, int64_t oH, int64_t oW) {
+    using Vec = tensorplay::vec::Vectorized<T>;
+    constexpr int64_t V = Vec::size();
+    const int64_t len = C - (C % V);
+    parallel_for(0, N, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t n = begin; n < end; ++n) {
+            T* gin_n = gin + n * D * H * W * C;
+            const T* gout_n = gout + n * oD * oH * oW * C;
+            for (int64_t od = 0; od < oD; ++od) {
+                const int64_t id0 = (od * D) / oD;
+                const int64_t id1 = ((od + 1) * D + oD - 1) / oD;
+                for (int64_t oh = 0; oh < oH; ++oh) {
+                    const int64_t ih0 = (oh * H) / oH;
+                    const int64_t ih1 = ((oh + 1) * H + oH - 1) / oH;
+                    for (int64_t ow = 0; ow < oW; ++ow) {
+                        const int64_t iw0 = (ow * W) / oW;
+                        const int64_t iw1 = ((ow + 1) * W + oW - 1) / oW;
+                        const T* go_lane = gout_n + ((od * oH + oh) * oW + ow) * C;
+                        const T divisor = static_cast<T>((id1 - id0) * (ih1 - ih0) * (iw1 - iw0));
+                        int64_t c = 0;
+                        for (; c < len; c += V) {
+                            const Vec grad_vec = Vec::loadu(go_lane + c) / Vec(divisor);
+                            for (int64_t id = id0; id < id1; ++id) {
+                                for (int64_t ih = ih0; ih < ih1; ++ih) {
+                                    T* gin_lane = gin_n + ((id * H + ih) * W + iw0) * C + c;
+                                    for (int64_t iw = iw0; iw < iw1; ++iw) {
+                                        (Vec::loadu(gin_lane) + grad_vec).store(gin_lane);
+                                        gin_lane += C;
+                                    }
+                                }
+                            }
+                        }
+                        for (; c < C; ++c) {
+                            const T grad_scalar = go_lane[c] / divisor;
+                            for (int64_t id = id0; id < id1; ++id) {
+                                for (int64_t ih = ih0; ih < ih1; ++ih) {
+                                    T* gin_lane = gin_n + ((id * H + ih) * W + iw0) * C + c;
+                                    for (int64_t iw = iw0; iw < iw1; ++iw) {
+                                        *gin_lane += grad_scalar;
+                                        gin_lane += C;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+template <typename T>
 void adaptive_max_pool2d_cl_typed(const T* in, T* out, int64_t* ind,
                                   int64_t N, int64_t C, int64_t H, int64_t W,
                                   int64_t oH, int64_t oW) {
@@ -1200,6 +1307,52 @@ void adaptive_avg_pool2d_cl_impl(const void* in, void* out,
     }
 }
 
+void adaptive_avg_pool3d_cl_impl(const void* in, void* out,
+                                 int64_t N, int64_t C,
+                                 int64_t D, int64_t H, int64_t W,
+                                 int64_t oD, int64_t oH, int64_t oW,
+                                 int dtype) {
+    switch (static_cast<DType>(dtype)) {
+        case DType::Float32:
+            adaptive_avg_pool3d_cl_typed<float>(
+                static_cast<const float*>(in), static_cast<float*>(out),
+                N, C, D, H, W, oD, oH, oW);
+            break;
+        case DType::Float64:
+            adaptive_avg_pool3d_cl_typed<double>(
+                static_cast<const double*>(in), static_cast<double*>(out),
+                N, C, D, H, W, oD, oH, oW);
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "adaptive_avg_pool3d: channels-last kernel supports "
+                     "only float and double");
+    }
+}
+
+void adaptive_avg_pool3d_backward_cl_impl(const void* gout, void* gin,
+                                          int64_t N, int64_t C,
+                                          int64_t D, int64_t H, int64_t W,
+                                          int64_t oD, int64_t oH, int64_t oW,
+                                          int dtype) {
+    switch (static_cast<DType>(dtype)) {
+        case DType::Float32:
+            adaptive_avg_pool3d_backward_cl_typed<float>(
+                static_cast<const float*>(gout), static_cast<float*>(gin),
+                N, C, D, H, W, oD, oH, oW);
+            break;
+        case DType::Float64:
+            adaptive_avg_pool3d_backward_cl_typed<double>(
+                static_cast<const double*>(gout), static_cast<double*>(gin),
+                N, C, D, H, W, oD, oH, oW);
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "adaptive_avg_pool3d_backward: channels-last kernel "
+                     "supports only float and double");
+    }
+}
+
 void adaptive_max_pool2d_backward_cl_impl(const void* gout, const int64_t* ind,
                                           void* gin,
                                           int64_t N, int64_t C,
@@ -1259,6 +1412,9 @@ REGISTER_DISPATCH(max_pool2d_backward_cl_stub, &max_pool2d_backward_cl_impl);
 REGISTER_DISPATCH(max_pool3d_cl_stub, &max_pool3d_cl_impl);
 REGISTER_DISPATCH(max_pool3d_backward_cl_stub, &max_pool3d_backward_cl_impl);
 REGISTER_DISPATCH(adaptive_avg_pool2d_cl_stub, &adaptive_avg_pool2d_cl_impl);
+REGISTER_DISPATCH(adaptive_avg_pool3d_cl_stub, &adaptive_avg_pool3d_cl_impl);
+REGISTER_DISPATCH(adaptive_avg_pool3d_backward_cl_stub,
+                  &adaptive_avg_pool3d_backward_cl_impl);
 REGISTER_DISPATCH(adaptive_max_pool2d_cl_stub, &adaptive_max_pool2d_cl_impl);
 REGISTER_DISPATCH(adaptive_max_pool2d_backward_cl_stub,
                   &adaptive_max_pool2d_backward_cl_impl);
@@ -1278,6 +1434,10 @@ ALSO_REGISTER_AVX512_DISPATCH(max_pool3d_backward_cl_stub,
                               &max_pool3d_backward_cl_impl);
 ALSO_REGISTER_AVX512_DISPATCH(adaptive_avg_pool2d_cl_stub,
                               &adaptive_avg_pool2d_cl_impl);
+ALSO_REGISTER_AVX512_DISPATCH(adaptive_avg_pool3d_cl_stub,
+                              &adaptive_avg_pool3d_cl_impl);
+ALSO_REGISTER_AVX512_DISPATCH(adaptive_avg_pool3d_backward_cl_stub,
+                              &adaptive_avg_pool3d_backward_cl_impl);
 ALSO_REGISTER_AVX512_DISPATCH(adaptive_max_pool2d_cl_stub,
                               &adaptive_max_pool2d_cl_impl);
 ALSO_REGISTER_AVX512_DISPATCH(adaptive_max_pool2d_backward_cl_stub,
