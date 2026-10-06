@@ -35,7 +35,7 @@ constexpr int kDefaultValuesPerThread = 4;
 constexpr int kMaxCachedReduceDevices = 64;
 // Bump when the header-only launch path changes; this also keeps generated
 // CUDA objects from silently reusing an older reduction implementation.
-constexpr int kReductionEngineRevision = 12;
+constexpr int kReductionEngineRevision = 13;
 
 // Per-device launch geometry, queried once via cudaDeviceGetAttribute and
 // cached: cudaGetDeviceProperties costs ~1ms per call on the target GPU and
@@ -290,6 +290,7 @@ struct ReduceConfig {
     int num_threads = kWarpSize;
     int input_vec_size = 1;
     int input_head = 0;
+    int output_vec_size = 1;
     bool vectorize_input = false;
     // Vec loads stay inside the fastest reduced chunk (no crossing of the
     // outer reduced dims' holes), so units need a coordinate decomposition.
@@ -325,9 +326,9 @@ struct ReduceConfig {
     }
 
     __host__ __device__ int64_t output_idx() const {
-        return static_cast<int64_t>(blockIdx.x) * step_output +
+        return (static_cast<int64_t>(blockIdx.x) * step_output +
             static_cast<int64_t>(threadIdx.x) * output_mult[0] +
-            static_cast<int64_t>(threadIdx.y) * output_mult[1];
+            static_cast<int64_t>(threadIdx.y) * output_mult[1]) * output_vec_size;
     }
 
     __device__ __forceinline__ int64_t input_base_offset(int64_t output) const {
@@ -611,12 +612,29 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
         }
     }
 
+    if (!reduction_on_fastest_dimension &&
+        config.input_strides[config.num_reduce_dims] == 1) {
+        int width = 4;
+        auto restrict_width = [&](uint64_t value) {
+            while (value % width != 0) width /= 2;
+        };
+        restrict_width(reinterpret_cast<uintptr_t>(iter.data_ptr(1)) / sizeof(InputT));
+        restrict_width(config.shape[config.num_reduce_dims]);
+        for (int dim = 0; dim < config.ndim; ++dim) {
+            if (dim != config.num_reduce_dims) {
+                restrict_width(config.input_strides[dim]);
+            }
+        }
+        config.output_vec_size = width;
+        dim0 /= width;
+    }
+
     // Only the 16-byte element type trades thread budget for occupancy;
     // every other accumulator keeps the full ceiling.
     const int max_threads =
-        std::is_same<InputT, tensorplay::complex<double>>::value
+        (std::is_same<InputT, tensorplay::complex<double>>::value
             ? 256
-            : kMaxReduceThreads;
+            : kMaxReduceThreads) / config.output_vec_size;
     // Block shape in both mappings: block.x is sized from the per-output
     // extent and block.y from the output count, so a block always covers whole
     // rows.  block.x targets kElemsPerLane elements per lane - one or two per
@@ -633,9 +651,10 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
     constexpr int kElemsPerLane = 8;
     const int want_width = reduction_last_pow2(std::max<int64_t>(
         2, std::min<int64_t>(kWarpSize, config.num_inputs / kElemsPerLane)));
-    const int dim0_pow2 =
-        std::min(want_width, reduction_last_pow2(config.num_inputs));
-    const int dim1_pow2 = reduction_last_pow2(config.num_outputs);
+    const int dim0_pow2 = reduction_on_fastest_dimension
+        ? std::min(want_width, reduction_last_pow2(config.num_inputs))
+        : std::min(kWarpSize, reduction_last_pow2(dim0));
+    const int dim1_pow2 = reduction_last_pow2(dim1);
     config.block_width = std::min(dim0_pow2, kWarpSize);
     const int max_height =
         std::max(1, max_threads / std::max(1, config.block_width));
@@ -714,8 +733,8 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
             // scheduled output block), ctas2/ctas3 bound the split so each
             // thread keeps >= min_values_per_thread(16) elements but no more
             // than max_values_per_thread(256).
-            const int64_t grid_x = (config.num_outputs + config.step_output - 1) /
-                                   config.step_output;
+            const int64_t output_step = config.step_output * config.output_vec_size;
+            const int64_t grid_x = (config.num_outputs + output_step - 1) / output_step;
             const int64_t ctas_per_output1 = (target_grid + grid_x - 1) / grid_x;
             const int64_t ctas_per_output2 = (values_per_thread_elems + 15) / 16;
             const int64_t ctas_per_output3 = (values_per_thread_elems + 255) / 256;
@@ -1018,6 +1037,76 @@ struct ReduceOp {
         }
     }
 
+    template <int NRED, int OutputVecSize>
+    __device__ __forceinline__ std::array<AccT, OutputVecSize>
+    thread_reduce_outputs_nt(int64_t output_index) const {
+        AccT values[ValuesPerThread][OutputVecSize];
+        #pragma unroll
+        for (int i = 0; i < ValuesPerThread; ++i) {
+            #pragma unroll
+            for (int j = 0; j < OutputVecSize; ++j) values[i][j] = identity;
+        }
+        using Vec = aligned_vector<InputT, OutputVecSize>;
+        const InputT* row = input + config.input_base_offset(output_index);
+        int64_t index = config.input_idx();
+        const int64_t step = config.step_input;
+        while (index + (ValuesPerThread - 1) * step < config.num_inputs) {
+            Vec loaded[ValuesPerThread];
+            #pragma unroll
+            for (int i = 0; i < ValuesPerThread; ++i) {
+                loaded[i] = *reinterpret_cast<const Vec*>(row +
+                    config.template input_offset_nt<NRED>(index + i * step));
+            }
+            #pragma unroll
+            for (int i = 0; i < ValuesPerThread; ++i) {
+                #pragma unroll
+                for (int j = 0; j < OutputVecSize; ++j) {
+                    values[i][j] = ops.reduce(values[i][j], loaded[i].val[j], index + i * step);
+                }
+            }
+            index += ValuesPerThread * step;
+        }
+        #pragma unroll
+        for (int i = 0; i < ValuesPerThread; ++i) {
+            if (index < config.num_inputs) {
+                const Vec loaded = *reinterpret_cast<const Vec*>(row +
+                    config.template input_offset_nt<NRED>(index));
+                #pragma unroll
+                for (int j = 0; j < OutputVecSize; ++j) {
+                    values[i][j] = ops.reduce(values[i][j], loaded.val[j], index);
+                }
+                index += step;
+            }
+        }
+        std::array<AccT, OutputVecSize> result;
+        #pragma unroll
+        for (int j = 0; j < OutputVecSize; ++j) {
+            result[j] = values[0][j];
+            #pragma unroll
+            for (int i = 1; i < ValuesPerThread; ++i) {
+                result[j] = ops.combine(result[j], values[i][j]);
+            }
+        }
+        return result;
+    }
+
+    template <int OutputVecSize>
+    __device__ __forceinline__ std::array<AccT, OutputVecSize>
+    thread_reduce_outputs(int64_t output_index) const {
+        if constexpr (OutputVecSize == 1) {
+            return {thread_reduce(output_index)};
+        } else {
+            switch (config.num_reduce_dims) {
+                case 1: return thread_reduce_outputs_nt<1, OutputVecSize>(output_index);
+                case 2: return thread_reduce_outputs_nt<2, OutputVecSize>(output_index);
+                case 3: return thread_reduce_outputs_nt<3, OutputVecSize>(output_index);
+                case 4: return thread_reduce_outputs_nt<4, OutputVecSize>(output_index);
+                default: return thread_reduce_outputs_nt<0, OutputVecSize>(output_index);
+            }
+        }
+    }
+
+    template <int OutputVecSize>
     __device__ __forceinline__ void run() {
         extern __shared__ unsigned char shared_raw[];
         AccT* shared = reinterpret_cast<AccT*>(shared_raw);
@@ -1034,18 +1123,23 @@ struct ReduceOp {
             *(volatile unsigned long long*)(flags + blockIdx.x) = tag;
         }
         const int64_t output_index = config.output_idx();
-        AccT value = identity;
+        std::array<AccT, OutputVecSize> values;
+        #pragma unroll
+        for (int j = 0; j < OutputVecSize; ++j) values[j] = identity;
         __shared__ bool is_last_block;
 
         if (output_index < config.num_outputs && config.input_idx() < config.num_input_units) {
-            value = thread_reduce(output_index);
+            values = thread_reduce_outputs<OutputVecSize>(output_index);
         }
 
-        if (config.should_block_x_reduce()) {
-            value = block_x_reduce(value, identity, config, ops, shared);
-        }
-        if (config.should_block_y_reduce()) {
-            value = block_y_reduce(value, config, ops, shared);
+        #pragma unroll
+        for (int j = 0; j < OutputVecSize; ++j) {
+            if (config.should_block_x_reduce()) {
+                values[j] = block_x_reduce(values[j], identity, config, ops, shared);
+            }
+            if (config.should_block_y_reduce()) {
+                values[j] = block_y_reduce(values[j], config, ops, shared);
+            }
         }
 
         // NB: the fold/staging paths below require the global-reduce buffers
@@ -1109,7 +1203,10 @@ struct ReduceOp {
             // receives exactly one value per CTA.
             const bool writes = config.should_store(output_index);
             if (writes) {
-                partials[config.staging_offset(blockIdx.y)] = value;
+                #pragma unroll
+                for (int j = 0; j < OutputVecSize; ++j) {
+                    partials[config.staging_offset(blockIdx.y) * OutputVecSize + j] = values[j];
+                }
             }
             __threadfence();  // make the writes globally visible
             __syncthreads();  // ... and complete before the arrival count moves
@@ -1135,29 +1232,33 @@ struct ReduceOp {
                 // x would merge different outputs into one.  So the lanes take
                 // turns over the CTA partials of their own output, and the
                 // cross-lane folds follow the same split.
-                value = identity;
-                if (config.should_block_x_reduce()) {
-                    const int64_t step = static_cast<int64_t>(blockDim.x) * blockDim.y;
-                    for (int64_t cta = threadIdx.x + threadIdx.y * blockDim.x;
-                         cta < config.ctas_per_output; cta += step) {
-                        value = ops.combine(value,
-                            partials[config.staging_offset(cta)]);
+                #pragma unroll
+                for (int j = 0; j < OutputVecSize; ++j) {
+                    AccT value = identity;
+                    if (config.should_block_x_reduce()) {
+                        const int64_t step = static_cast<int64_t>(blockDim.x) * blockDim.y;
+                        for (int64_t cta = threadIdx.x + threadIdx.y * blockDim.x;
+                             cta < config.ctas_per_output; cta += step) {
+                            value = ops.combine(value,
+                                partials[config.staging_offset(cta) * OutputVecSize + j]);
+                        }
+                    } else {
+                        for (int64_t cta = threadIdx.y; cta < config.ctas_per_output;
+                             cta += blockDim.y) {
+                            value = ops.combine(value,
+                                partials[config.staging_offset(cta) * OutputVecSize + j]);
+                        }
                     }
-                } else {
-                    for (int64_t cta = threadIdx.y; cta < config.ctas_per_output;
-                         cta += blockDim.y) {
-                        value = ops.combine(value,
-                            partials[config.staging_offset(cta)]);
+                    value = block_y_reduce(value, config, ops, shared);
+                    if (config.should_block_x_reduce()) {
+                        value = block_x_reduce(value, identity, config, ops, shared);
                     }
+                    if (writes) store_out(output_index + j, value);
                 }
-                value = block_y_reduce(value, config, ops, shared);
-                if (config.should_block_x_reduce()) {
-                    value = block_x_reduce(value, identity, config, ops, shared);
-                }
-                if (writes) store_out(output_index, value);
             }
         } else if (config.should_store(output_index)) {
-            store_out(output_index, value);
+            #pragma unroll
+            for (int j = 0; j < OutputVecSize; ++j) store_out(output_index + j, values[j]);
         }
     }
 };
@@ -1167,7 +1268,13 @@ template <typename InputT, typename AccT, typename OutputT, typename Ops,
 __global__ void __launch_bounds__(kMaxReduceThreads, 4)
 reduce_kernel(ReduceOp<InputT, AccT, OutputT, Ops, ValuesPerThread,
                     InputVecSize, SecondOutputT> op) {
-    op.run();
+    if constexpr (InputVecSize == 1) {
+        if (op.config.output_vec_size == 4) op.template run<4>();
+        else if (op.config.output_vec_size == 2) op.template run<2>();
+        else op.template run<1>();
+    } else {
+        op.template run<1>();
+    }
 }
 
 // Flattened offset of a 32-bit sub-iterator's start inside the original
@@ -1216,19 +1323,23 @@ inline void launch_reduce(
         }
         for (auto& sub_iter : iter.with_32bit_indexing()) {
             const int64_t sub_base = reduction_base_offset(iter, sub_iter);
+            const int64_t output_offset = static_cast<OutputT*>(sub_iter.data_ptr(0)) -
+                static_cast<OutputT*>(iter.data_ptr(0));
+            AccT* sub_acc = acc_buf == nullptr ? nullptr : acc_buf + output_offset;
+            SecondOutputT* sub_output2 = output2 == nullptr ? nullptr : output2 + output_offset;
             // A split can shrink the reduced extent below the vectorization
             // floor, so re-derive the vector width for this sub-iterator
             // instead of assuming the parent's.
             const auto sub_config = make_reduce_config<InputT, AccT, OutputT>(sub_iter);
             if (sub_config.input_vec_size == 8) {
                 launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, 8, SecondOutputT>(
-                    sub_iter, ops, identity, output2, acc_buf, sub_base);
+                    sub_iter, ops, identity, sub_output2, sub_acc, sub_base);
             } else if (sub_config.input_vec_size == 4) {
                 launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, 4, SecondOutputT>(
-                    sub_iter, ops, identity, output2, acc_buf, sub_base);
+                    sub_iter, ops, identity, sub_output2, sub_acc, sub_base);
             } else {
                 launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, 1, SecondOutputT>(
-                    sub_iter, ops, identity, output2, acc_buf, sub_base);
+                    sub_iter, ops, identity, sub_output2, sub_acc, sub_base);
             }
         }
         return;
@@ -1237,8 +1348,9 @@ inline void launch_reduce(
     const auto stream = getCurrentCUDAStream().stream();
     const dim3 block(config.block_width, config.block_height, 1);
     const dim3 grid(
-        static_cast<unsigned int>((config.num_outputs + config.step_output - 1) /
-                                  config.step_output),
+        static_cast<unsigned int>((config.num_outputs +
+                                  config.step_output * config.output_vec_size - 1) /
+                                  (config.step_output * config.output_vec_size)),
         static_cast<unsigned int>(config.global_reduce ? config.ctas_per_output : 1),
         1);
     int shared_bytes = config.shared_memory_size(sizeof(AccT));
@@ -1273,8 +1385,7 @@ inline void launch_reduce(
         // the flag holding this launch's unique tag — no cudaMemsetAsync, no
         // reliance on allocator-held state, and stale content from prior
         // launches can never match the tag.
-        size_t slots = static_cast<size_t>(config.num_outputs) *
-                       config.ctas_per_output;
+        size_t slots = static_cast<size_t>(grid.x) * grid.y * config.output_vec_size;
         if (!config.should_block_x_reduce()) {
             slots *= static_cast<size_t>(config.block_width);
         }
