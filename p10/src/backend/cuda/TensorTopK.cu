@@ -836,8 +836,26 @@ void launch_topk_cuda(const Tensor& input, Tensor& values, Tensor& indices,
     return;
   }
 
-  const bool use_multiblock = topk_should_use_multiblock(rows, cols) &&
+  bool use_multiblock = topk_should_use_multiblock(rows, cols) &&
       !(rows <= 512 && cols <= 4096);
+  if (use_multiblock) {
+    // The multi-block pipeline addresses every (row, tile) pair with 32-bit
+    // block ids.  If the tile count would overflow uint32, fall back to the
+    // single-block path instead of raising.
+    const uint32_t row_count = static_cast<uint32_t>(rows);
+    const uint32_t column_count = static_cast<uint32_t>(cols);
+    const int items_per_thread =
+        topk_multiblock_items_per_thread(row_count, column_count);
+    const int items_per_block = items_per_thread * topk_multiblock_threads;
+    const uint64_t blocks_per_row =
+        (static_cast<uint64_t>(column_count) + items_per_block - 1) /
+        items_per_block;
+    const uint64_t block_count64 =
+        static_cast<uint64_t>(row_count) * blocks_per_row;
+    if (block_count64 > std::numeric_limits<uint32_t>::max()) {
+      use_multiblock = false;
+    }
+  }
   if (use_multiblock) {
     launch_multiblock_topk<T>(input, values, indices, rows, cols, k, inner,
                               largest, sorted);
