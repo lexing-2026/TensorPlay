@@ -576,6 +576,7 @@ set(TP_CPU_KERNEL_SRCS
     src/backend/cpu/RangeKernelsImpl.cpp
     src/backend/cpu/PoolingKernelsImpl.cpp
     src/backend/cpu/UpsampleKernelsImpl.cpp
+    src/backend/cpu/GridSamplerKernelsImpl.cpp
 )
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
     # (TP_CXX_AVX512_FOUND): only build the tier when the compiler accepts

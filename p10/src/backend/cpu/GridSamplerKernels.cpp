@@ -9,7 +9,9 @@
 #include "Parallel.h"
 #include "Half.h"
 #include "BFloat16.h"
+#include "MemoryFormat.h"
 #include "../GridSamplerInline.h"
+#include "cpu/GridSamplerKernels.h"
 #include <vector>
 #include <tuple>
 #include <cmath>
@@ -534,6 +536,30 @@ Tensor grid_sampler_2d_cpu(const Tensor& input, const Tensor& grid,
         TP_THROW(RuntimeError, "grid_sampler_2d: grid must be (N, H_out, W_out, 2) with matching N");
     if (interpolation_mode == Interp::Bicubic && input.size(2) * input.size(3) == 0)
         TP_THROW(RuntimeError, "grid_sampler_2d: bicubic requires non-empty input spatial dims");
+    // Channels-last frame: the channel axis is contiguous and carries the
+    // vector blocks, so the tier-compiled kernel (cpu/GridSamplerKernels.h)
+    // loads whole channel neighbourhoods per output pixel and tap. Bicubic
+    // keeps the scalar frame.
+    if (interpolation_mode != Interp::Bicubic &&
+        input.numel() > 0 && grid.numel() > 0 &&
+        grid.size(1) > 0 && grid.size(2) > 0 &&
+        input.is_contiguous(MemoryFormat::ChannelsLast) && grid.is_contiguous() &&
+        input.dtype() == grid.dtype() &&
+        (input.dtype() == DType::Float32 || input.dtype() == DType::Float64)) {
+        const int64_t N = input.size(0), C = input.size(1);
+        const int64_t H = input.size(2), W = input.size(3);
+        const int64_t oH = grid.size(1), oW = grid.size(2);
+        Tensor result = Tensor::empty({N, C, oH, oW}, input.dtype(), input.device());
+        result = result.as_strided({N, C, oH, oW},
+                                   get_channels_last_strides({N, C, oH, oW}), 0);
+        grid_sample2d_cl_stub(DeviceType::CPU, input.data_ptr(), grid.data_ptr(),
+                              result.data_ptr(), N, C, H, W, oH, oW,
+                              static_cast<int>(interpolation_mode),
+                              static_cast<int>(padding_mode),
+                              align_corners ? 1 : 0,
+                              static_cast<int>(input.dtype()));
+        return result;
+    }
     const Tensor ic = input.contiguous();
     const Tensor gc = grid.contiguous();
     const int im = static_cast<int>(interpolation_mode);
@@ -610,6 +636,8 @@ std::tuple<Tensor, Tensor> grid_sampler_3d_backward_cpu(
         default: TP_THROW(TypeError, "grid_sampler_3d_backward: unsupported dtype");
     }
 }
+
+DEFINE_DISPATCH(grid_sample2d_cl_stub);
 
 TENSORPLAY_LIBRARY_IMPL(CPU, GridSamplerKernels) {
     m.impl("grid_sampler_2d", grid_sampler_2d_cpu);
