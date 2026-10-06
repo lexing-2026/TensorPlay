@@ -76,7 +76,7 @@ Tensor binary_cross_entropy_with_logits_cpu(const Tensor& self, const Tensor& ta
 }
 
 Tensor hinge_embedding_loss_cpu(const Tensor& input, const Tensor& target, const Scalar& margin) {
-    // target == 1 -> x ; else relu(margin - x); mean.
+    // where(t != 1, relu(margin - x), 0) + where(t != -1, x, 0); mean.
     Tensor x = input.contiguous().to(DType::Float64);
     Tensor t = target.contiguous().to(DType::Float64).expand(shape_of(x)).contiguous();
     double mg = margin.toDouble();
@@ -85,7 +85,8 @@ Tensor hinge_embedding_loss_cpu(const Tensor& input, const Tensor& target, const
     const double* tp = t.data_ptr<double>();
     double total = 0;
     for (int64_t i = 0; i < n; ++i)
-        total += (tp[i] == 1.0) ? xp[i] : std::max(0.0, mg - xp[i]);
+        total += ((tp[i] != 1.0) ? std::max(0.0, mg - xp[i]) : 0.0)
+               + ((tp[i] != -1.0) ? xp[i] : 0.0);
     double mean = n > 0 ? total / static_cast<double>(n) : 0.0;
     DType out_dt = input.dtype() == DType::Float64 ? DType::Float64 : DType::Float32;
     return Tensor::full({}, Scalar(mean), out_dt, input.device());

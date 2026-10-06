@@ -173,7 +173,9 @@ Tensor hinge_embedding_loss_cuda(const Tensor& input, const Tensor& target, cons
             .add_const_input(pr.second)
             .build();
         gpu_kernel(iter, [margin_value] __host__ __device__(double x, double t) -> double {
-            return (t == 1.0) ? x : ::fmax(0.0, margin_value - x);
+            // where(t != 1, relu(margin - x), 0) + where(t != -1, x, 0)
+            return ((t != 1.0) ? ::fmax(0.0, margin_value - x) : 0.0)
+                 + ((t != -1.0) ? x : 0.0);
         });
         CUDA_CHECK(cudaGetLastError());
     }
