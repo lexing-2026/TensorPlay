@@ -816,14 +816,17 @@ std::tuple<Tensor, Tensor> adaptive_max_pool2d_with_indices_cpu(const Tensor& in
 
     // Channels-last frames pool the NHWC buffer in place; the channel span
     // is the tier-compiled vectorized dimension (cpu/PoolingKernels.h).
-    // Values come back channels-last, indices stay dense NCHW int64 exactly
-    // like the scalar frame below.  Other dtypes take the NCHW path.
+    // Values come back channels-last, and the indices carry the same winners
+    // as the scalar frame but in channels-last order (dense per output
+    // position), which is what keeps the scan's index traffic dense.  Other
+    // dtypes take the NCHW path.
     if (input.is_contiguous(MemoryFormat::ChannelsLast) &&
         (input.dtype() == DType::Float32 || input.dtype() == DType::Float64)) {
-        Tensor out = Tensor::empty({N, C, H_out, W_out}, input.dtype(), input.device());
-        out = out.as_strided({N, C, H_out, W_out},
-                             get_channels_last_strides({N, C, H_out, W_out}), 0);
-        Tensor indices = Tensor::empty({N, C, H_out, W_out}, DType::Int64, input.device());
+        const std::vector<int64_t> out_sizes = {N, C, H_out, W_out};
+        Tensor out = Tensor::empty(out_sizes, input.dtype(), input.device());
+        out = out.as_strided(out_sizes, get_channels_last_strides(out_sizes), 0);
+        Tensor indices = Tensor::empty(out_sizes, DType::Int64, input.device());
+        indices = indices.as_strided(out_sizes, get_channels_last_strides(out_sizes), 0);
         adaptive_max_pool2d_cl_stub(DeviceType::CPU, input.data_ptr(),
                                     out.data_ptr(), indices.data_ptr<int64_t>(),
                                     N, C, H_in, W_in, H_out, W_out,
@@ -892,6 +895,30 @@ Tensor adaptive_max_pool2d_with_indices_backward_cpu(const Tensor& grad_output, 
     }
     if (grad_output.dim() != 4 || input.dim() != 4)
         TP_THROW(RuntimeError, "adaptive_max_pool2d_with_indices_backward: Expected 4D input and grad_output");
+    // Channels-last frame: the scatter is driven by the saved indices alone,
+    // so the channels-last max-pool scatter applies verbatim.  The saved
+    // indices must come from the channels-last forward (channels-last order)
+    // so their reads run densely; dense NCHW indices take the scalar path.
+    // Accumulation order per input element matches the scalar frame, so
+    // gradients are bit-identical.
+    if (grad_output.is_contiguous(MemoryFormat::ChannelsLast) &&
+        indices.is_contiguous(MemoryFormat::ChannelsLast) &&
+        (input.dtype() == DType::Float32 || input.dtype() == DType::Float64) &&
+        grad_output.dtype() == input.dtype()) {
+        const std::vector<int64_t> sizes = input.shape();
+        Tensor grad_input = Tensor::zeros(sizes, input.dtype(), input.device());
+        grad_input = grad_input.as_strided(sizes, get_channels_last_strides(sizes), 0);
+        adaptive_max_pool2d_backward_cl_stub(DeviceType::CPU,
+                                             grad_output.data_ptr(),
+                                             indices.data_ptr<int64_t>(),
+                                             grad_input.data_ptr(),
+                                             input.size(0), input.size(1),
+                                             input.size(2), input.size(3),
+                                             grad_output.size(2),
+                                             grad_output.size(3),
+                                             static_cast<int>(input.dtype()));
+        return grad_input;
+    }
     Tensor grad_input = Tensor::zeros(static_cast<std::vector<int64_t>>(input.shape()), input.dtype(), input.device());
     const Tensor go = grad_output.contiguous();
     const Tensor idx = indices.contiguous();
@@ -1789,6 +1816,7 @@ DEFINE_DISPATCH(max_pool3d_cl_stub);
 DEFINE_DISPATCH(max_pool3d_backward_cl_stub);
 DEFINE_DISPATCH(adaptive_avg_pool2d_cl_stub);
 DEFINE_DISPATCH(adaptive_max_pool2d_cl_stub);
+DEFINE_DISPATCH(adaptive_max_pool2d_backward_cl_stub);
 
 TENSORPLAY_LIBRARY_IMPL(CPU, PoolingKernels) {
     m.impl("avg_pool2d", avg_pool2d_cpu);

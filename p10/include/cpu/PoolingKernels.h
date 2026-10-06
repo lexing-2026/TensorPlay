@@ -106,6 +106,17 @@ using adaptive_max_pool2d_cl_fn = void (*)(const void* in, void* out,
                                            int64_t H, int64_t W,
                                            int64_t oH, int64_t oW, int dtype);
 
+// Backward of the channels-last adaptive max pool: the scatter is driven by
+// the saved indices alone, so it shares the channels-last max-pool scatter
+// kernel; the stub keeps adaptive dispatch separate from the fixed-shape op.
+using adaptive_max_pool2d_backward_cl_fn = void (*)(const void* gout,
+                                                    const int64_t* ind,
+                                                    void* gin,
+                                                    int64_t N, int64_t C,
+                                                    int64_t H, int64_t W,
+                                                    int64_t oH, int64_t oW,
+                                                    int dtype);
+
 DECLARE_DISPATCH(avg_pool2d_cl_fn, avg_pool2d_cl_stub)
 DECLARE_DISPATCH(max_pool2d_cl_fn, max_pool2d_cl_stub)
 DECLARE_DISPATCH(max_pool2d_backward_cl_fn, max_pool2d_backward_cl_stub)
@@ -113,6 +124,8 @@ DECLARE_DISPATCH(max_pool3d_cl_fn, max_pool3d_cl_stub)
 DECLARE_DISPATCH(max_pool3d_backward_cl_fn, max_pool3d_backward_cl_stub)
 DECLARE_DISPATCH(adaptive_avg_pool2d_cl_fn, adaptive_avg_pool2d_cl_stub)
 DECLARE_DISPATCH(adaptive_max_pool2d_cl_fn, adaptive_max_pool2d_cl_stub)
+DECLARE_DISPATCH(adaptive_max_pool2d_backward_cl_fn,
+                 adaptive_max_pool2d_backward_cl_stub)
 
 } // namespace cpu
 } // namespace tensorplay
