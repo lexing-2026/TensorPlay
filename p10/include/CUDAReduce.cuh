@@ -35,7 +35,7 @@ constexpr int kDefaultValuesPerThread = 4;
 constexpr int kMaxCachedReduceDevices = 64;
 // Bump when the header-only launch path changes; this also keeps generated
 // CUDA objects from silently reusing an older reduction implementation.
-constexpr int kReductionEngineRevision = 11;
+constexpr int kReductionEngineRevision = 12;
 
 // Per-device launch geometry, queried once via cudaDeviceGetAttribute and
 // cached: cudaGetDeviceProperties costs ~1ms per call on the target GPU and
@@ -289,6 +289,7 @@ struct ReduceConfig {
     int block_height = 1;
     int num_threads = kWarpSize;
     int input_vec_size = 1;
+    int input_head = 0;
     bool vectorize_input = false;
     // Vec loads stay inside the fastest reduced chunk (no crossing of the
     // outer reduced dims' holes), so units need a coordinate decomposition.
@@ -556,10 +557,15 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
         config.input_vec_size = (sizeof(InputT) == 2) ? 8 : 4;
         const size_t vector_bytes = sizeof(InputT) * static_cast<size_t>(config.input_vec_size);
         const bool aligned = reduction_pointer_aligned(iter, vector_bytes);
+        const size_t address = reinterpret_cast<uintptr_t>(iter.data_ptr(1));
+        const int head = aligned
+            ? 0
+            : static_cast<int>((vector_bytes - (address % vector_bytes)) /
+                               sizeof(InputT));
         // The per-output row base is the sum over non-reduced dims of
         // coordinate * stride, so those strides must keep every row start on
         // a vector boundary, not just the storage pointer.
-        bool rows_aligned = aligned;
+        bool rows_aligned = true;
         for (int dim = config.num_reduce_dims; dim < config.ndim; ++dim) {
             rows_aligned = rows_aligned &&
                 (config.input_strides[dim] % config.input_vec_size == 0);
@@ -575,8 +581,10 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
         if (config.num_reduce_dims == 1) {
             if (rows_aligned) {
                 config.vectorize_input = true;
+                config.input_head = head;
                 config.num_input_units =
-                    (config.num_inputs + config.input_vec_size - 1) / config.input_vec_size;
+                    (config.num_inputs - config.input_head + config.input_vec_size - 1) /
+                    config.input_vec_size;
                 dim0 = config.num_input_units;
             } else {
                 config.input_vec_size = 1;
@@ -867,7 +875,8 @@ struct ReduceOp {
         // thread_reduce loop shape.
         const bool can_vec = InputVecSize > 1 &&
             config.input_strides[0] == 1 && config.vectorize_input;
-        const bool can_vec_full = can_vec && config.num_inputs % InputVecSize == 0;
+        const bool can_vec_full = can_vec && config.input_head == 0 &&
+            config.num_inputs % InputVecSize == 0;
         // Multi-dim reduction rows contain holes between the outer chunks;
         // units are still chunk-aligned (host-side gate), so each unit is one
         // vec load whose row-relative address comes from the per-unit
@@ -948,11 +957,13 @@ struct ReduceOp {
                 // InputVecSize > 1 the host only enables vectorization when
                 // the fastest row is contiguous, so unit*InputVecSize is the
                 // exact element base of each unit.
-                const int64_t full_units = config.num_inputs / InputVecSize;
+                const int64_t full_units =
+                    (config.num_inputs - config.input_head) / InputVecSize;
                 while (unit + static_cast<int64_t>(ValuesPerThread - 1) * step < full_units) {
                     #pragma unroll
                     for (int i = 0; i < ValuesPerThread; ++i) {
                         const int64_t logical_base =
+                            config.input_head +
                             (unit + static_cast<int64_t>(i) * step) * InputVecSize;
                         const Vec loaded = *reinterpret_cast<const Vec*>(
                             row + config.template input_offset_nt<NRED>(logical_base));
@@ -965,11 +976,25 @@ struct ReduceOp {
                 }
             }
             while (unit < end) {
-                values[0] = reduce_unit<NRED>(values[0], row, unit, unit * InputVecSize);
+                values[0] = reduce_unit<NRED>(
+                    values[0], row, unit,
+                    config.input_head + unit * InputVecSize);
                 // Threads stride by step_input; a plain ++unit makes every lane
                 // walk into its neighbours' units (each element counted
                 // (num_inputs - lane) times -> triangular sums).
                 unit += step;
+            }
+        }
+
+        if (InputVecSize > 1 && config.input_head > 0 &&
+            (config.input_mult[1] == 0 || threadIdx.y == 0) &&
+            blockIdx.y == 0) {
+            #pragma unroll
+            for (int i = 0; i < InputVecSize; ++i) {
+                if (i < config.input_head && i < config.num_inputs &&
+                    threadIdx.x == i) {
+                    values[0] = ops.reduce(values[0], row[i], i);
+                }
             }
         }
 
@@ -1603,7 +1628,7 @@ struct PackedArgMinOps {
 //     integer max selects the largest value and canonical qNaN outranks +inf;
 //   * the low half stores ~key (order-reversing), so the same integer max
 //     selects the smallest value; NaN maps to all-ones there, outranking
-//     every finite stored key, mirroring "a NaN claims both outputs";
+//     every finite stored key, so a NaN claims both outputs;
 //   * no real key lands on 0 or all-ones (the float key map never emits
 //     either), so 0ull is the identity for both halves at once.
 // The per-half max combine is componentwise, hence associative and
