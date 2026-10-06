@@ -75,7 +75,7 @@ def test_unaligned_reduction_nan_and_product(dtype):
 @pytest.mark.parametrize("dtype", [tp.float16, tp.bfloat16, tp.float32, tp.float64, tp.int64])
 @pytest.mark.parametrize("columns, stride, offset", [(128, 128, 0), (130, 136, 2), (129, 129, 1), (4, 8, 0)])
 def test_reduction_across_contiguous_outputs(dtype, columns, stride, offset):
-    for rows in (17, 257, 16385):
+    for rows in (17, 257, 16385, 32769):
         values = np.arange(rows * stride + 8) % 7 - 3
         storage = tp.tensor(values, dtype=dtype, device="cuda")
         view = tp.as_strided(storage, [rows, columns], [stride, 1], offset)
@@ -98,8 +98,9 @@ def test_reduction_across_contiguous_outputs(dtype, columns, stride, offset):
 
 
 @pytest.mark.parametrize("dtype", [tp.float32, tp.float64, tp.complex64, tp.complex128])
-def test_output_groups_with_multiple_reduced_dimensions(dtype):
-    values = (np.arange(5 * 9 * 7 * 16) % 11 - 5).reshape(5, 9, 7, 16)
+@pytest.mark.parametrize("reduced_extent", [7, 8193])
+def test_output_groups_with_multiple_reduced_dimensions(dtype, reduced_extent):
+    values = (np.arange(5 * 9 * reduced_extent * 16) % 11 - 5).reshape(5, 9, reduced_extent, 16)
     if dtype in (tp.complex64, tp.complex128):
         values = values + 1j * (values % 3)
     tensor = tp.tensor(values, dtype=dtype, device="cuda")
@@ -108,16 +109,16 @@ def test_output_groups_with_multiple_reduced_dimensions(dtype):
 
 
 def test_output_groups_nan_and_moments():
-    values = (np.arange(1025 * 8) % 7 - 3).astype(np.float32).reshape(1025, 8)
+    values = (np.arange(32769 * 8) % 7 - 3).astype(np.float32).reshape(32769, 8)
     values[0, 0] = np.nan
     values[1, 0] = np.nan
     values[-1, 7] = np.nan
     tensor = tp.tensor(values, device="cuda")
     maximum, indices = tensor.max(dim=0)
-    np.testing.assert_array_equal(indices.cpu().numpy()[[0, 7]], [0, 1024])
+    np.testing.assert_array_equal(indices.cpu().numpy()[[0, 7]], [0, 32768])
     assert np.isnan(maximum.cpu().numpy()[[0, 7]]).all()
     minimum, indices = tensor.min(dim=0)
-    np.testing.assert_array_equal(indices.cpu().numpy()[[0, 7]], [0, 1024])
+    np.testing.assert_array_equal(indices.cpu().numpy()[[0, 7]], [0, 32768])
     assert np.isnan(minimum.cpu().numpy()[[0, 7]]).all()
     np.testing.assert_allclose(tp.nansum(tensor, dim=[0]).cpu().numpy(), np.nansum(values, axis=0))
     variance, mean = tp.var_mean(tensor, dim=[0], correction=0)
