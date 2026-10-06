@@ -65,6 +65,16 @@ def _copy_to_out(result, out):
     return result
 
 
+def _reverse_norm(norm):
+    """The tag of the opposite-direction transform with the same scaling.
+
+    A Hermitian transform runs the real transform of the other direction, so
+    it keeps the caller's scaling by swapping ``"backward"`` and
+    ``"forward"``."""
+    mode = norm_mode(norm)
+    return {"backward": "forward", "forward": "backward"}.get(mode, mode)
+
+
 def _one_dim(input, n, dim, op, name, norm):
     if input.dim() < 1:
         raise ValueError(f"{name} expects an input with at least one dimension")
@@ -117,17 +127,18 @@ def hfft(input, n=None, dim=-1, norm=None, *, out=None):
     Equivalent to :func:`irfft` applied to ``input.conj()``; :attr:`n` is the
     output length (default ``2 * (input.size(dim) - 1)``).
     """
-    result = _one_dim(conj(input), n, dim, _c2r, "hfft", norm)
+    result = _one_dim(conj(input), n, dim, _c2r, "hfft", _reverse_norm(norm))
     return _copy_to_out(result, out)
 
 
 def ihfft(input, n=None, dim=-1, norm=None, *, out=None):
     """Computes the inverse of :func:`hfft`; one-sided complex output.
 
-    Equivalent to :func:`rfft` applied to ``input.conj()``; :attr:`n`
-    zero-pads/truncates the real input along :attr:`dim`.
+    Equivalent to the conjugate of :func:`rfft` of the real input, scaled
+    as an inverse transform; :attr:`n` zero-pads/truncates the input along
+    :attr:`dim`.
     """
-    result = _one_dim(conj(input), n, dim, _r2c, "ihfft", norm)
+    result = conj(_one_dim(input, n, dim, _r2c, "ihfft", _reverse_norm(norm)))
     return _copy_to_out(result, out)
 
 
@@ -248,25 +259,25 @@ def ihfft2(input, s=None, dim=(-2, -1), norm=None, *, out=None):
 def hfftn(input, s=None, dim=None, norm=None, *, out=None):
     """N-dimensional FFT of a Hermitian-symmetric spectrum; real output.
 
-    Applies :func:`hfft` (conjugate + complex-to-real) along the final
-    transformed dimension, then :func:`ifft` over the remaining dimensions.
+    Applies :func:`fft` over the leading transformed dimensions, then
+    :func:`hfft` (conjugate + complex-to-real) along the final one.
     """
     dims = default_dims(input, s) if dim is None else normalize_dims(dim, input.dim())
     rest_dims, last_dim, rest_sizes, last_size = split_last_dim(input, s, dims)
-    result = _c2r(
-        conj(input), transform_size(last_size), last_dim, norm_mode(norm))
     result = apply_c2c(
-        result, rest_dims, rest_sizes, norm_mode(norm), forward=False)
+        input, rest_dims, rest_sizes, norm_mode(norm), forward=True)
+    result = _c2r(
+        conj(result), transform_size(last_size), last_dim, _reverse_norm(norm))
     return _copy_to_out(result, out)
 
 
 def ihfftn(input, s=None, dim=None, norm=None, *, out=None):
     """Inverse of :func:`hfftn`: :func:`ihfft` along the final transformed
-    dimension, then :func:`fft` over the remaining dimensions."""
+    dimension, then :func:`ifft` over the remaining dimensions."""
     dims = default_dims(input, s) if dim is None else normalize_dims(dim, input.dim())
     rest_dims, last_dim, rest_sizes, last_size = split_last_dim(input, s, dims)
     result = _r2c(
-        conj(input), transform_size(last_size), last_dim, norm_mode(norm))
+        input, transform_size(last_size), last_dim, _reverse_norm(norm))
     result = apply_c2c(
-        result, rest_dims, rest_sizes, norm_mode(norm), forward=True)
+        conj(result), rest_dims, rest_sizes, norm_mode(norm), forward=False)
     return _copy_to_out(result, out)
