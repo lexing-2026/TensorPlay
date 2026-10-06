@@ -5,6 +5,7 @@
 
 #include "Tensor.h"
 #include "CUDARuntime.h"
+#include "CUDAReduce.cuh"
 #include "Dispatcher.h"
 #include "Utils.h"
 #include "CUDAGenerator.h"
@@ -14,6 +15,7 @@
 #include <limits>
 #include <tuple>
 #include <type_traits>
+#include <vector>
 
 namespace tensorplay {
 namespace cuda {
@@ -109,6 +111,211 @@ Tensor one_hot_cuda(const Tensor& self, int64_t num_classes) {
     sizes.push_back(1);
     return eq_kernel_cuda(self.view(sizes), index).to(DType::Int64);
 }
+
+namespace {
+
+enum class HashMode { XorSum = 0 };
+
+template <typename InputT>
+struct XorHashOps {
+    using acc_type = unsigned long long;
+
+    __device__ static acc_type value_bits(InputT value) {
+        if constexpr (std::is_same_v<InputT, double>) {
+            return static_cast<acc_type>(__double_as_longlong(value));
+        } else if constexpr (std::is_same_v<InputT, float> ||
+                             std::is_same_v<InputT, Half> ||
+                             std::is_same_v<InputT, BFloat16>) {
+            return static_cast<acc_type>(__double_as_longlong(
+                static_cast<double>(value)));
+        } else {
+            return static_cast<acc_type>(value);
+        }
+    }
+
+    __device__ acc_type reduce(acc_type acc, InputT value, int64_t) const {
+        return acc ^ value_bits(value);
+    }
+    __device__ acc_type combine(acc_type a, acc_type b) const {
+        return a ^ b;
+    }
+    __device__ uint64_t project(acc_type value) const {
+        return static_cast<uint64_t>(value);
+    }
+};
+
+template <typename InputT>
+void launch_hash_tensor_reduce(TensorIterator& iter) {
+    const auto config = reduction::make_reduce_config<InputT,
+                                                       unsigned long long,
+                                                       uint64_t>(iter);
+    XorHashOps<InputT> ops;
+    if (config.input_vec_size == 8) {
+        reduction::launch_reduce<InputT, unsigned long long, uint64_t,
+                                 XorHashOps<InputT>, 4, 8>(
+            iter, ops, 0ull);
+    } else if (config.input_vec_size == 4) {
+        reduction::launch_reduce<InputT, unsigned long long, uint64_t,
+                                 XorHashOps<InputT>, 4, 4>(
+            iter, ops, 0ull);
+    } else {
+        reduction::launch_reduce<InputT, unsigned long long, uint64_t,
+                                 XorHashOps<InputT>, 4, 1>(
+            iter, ops, 0ull);
+    }
+}
+
+std::vector<int64_t> hash_output_shape(const Tensor& input,
+                                       const std::vector<bool>& mask,
+                                       bool keepdim) {
+    std::vector<int64_t> shape;
+    const auto input_shape = static_cast<std::vector<int64_t>>(input.shape());
+    shape.reserve(input_shape.size());
+    for (size_t dim = 0; dim < input_shape.size(); ++dim) {
+        if (mask[dim]) {
+            if (keepdim) shape.push_back(1);
+        } else {
+            shape.push_back(input_shape[dim]);
+        }
+    }
+    return shape;
+}
+
+Tensor hash_reduction_view(const Tensor& result, const Tensor& input,
+                           const std::vector<bool>& mask, bool keepdim) {
+    if (input.dim() == 0) return result;
+    const auto input_shape = static_cast<std::vector<int64_t>>(input.shape());
+    const auto result_strides = static_cast<std::vector<int64_t>>(result.strides());
+    std::vector<int64_t> strides(input_shape.size(), 0);
+    size_t result_dim = 0;
+    for (size_t dim = 0; dim < input_shape.size(); ++dim) {
+        if (!mask[dim]) {
+            strides[dim] = keepdim ? result_strides[dim]
+                                   : result_strides[result_dim++];
+        }
+    }
+    return result.as_strided(input_shape, strides, std::nullopt);
+}
+
+void hash_tensor_check_cuda(const Tensor& input,
+                            const std::vector<int64_t>& dims,
+                            int64_t mode) {
+    if (mode != static_cast<int64_t>(HashMode::XorSum)) {
+        TP_THROW(RuntimeError, "Unknown hash_tensor mode: ", mode);
+    }
+    if (input.numel() == 0) {
+        TP_CHECK(!dims.empty(),
+                 "hash_tensor: Expected reduction dim to be specified for "
+                 "input.numel() == 0. Specify the reduction dim with the "
+                 "'dim' argument.");
+    }
+    for (int64_t dim : dims) {
+        if (input.dim() == 0) {
+            TP_CHECK(dim == 0 || dim == -1,
+                     "hash_tensor: Expected reduction dim -1 or 0 for scalar "
+                     "but got ", dim);
+        } else {
+            const int64_t wrapped = dim < 0 ? dim + input.dim() : dim;
+            TP_CHECK(wrapped >= 0 && wrapped < input.dim(),
+                     "hash_tensor: dimension out of range");
+            TP_CHECK(input.size(wrapped) != 0,
+                     "hash_tensor: Expected reduction dim ", dim,
+                     " to have non-zero size.");
+        }
+    }
+}
+
+void hash_tensor_into_cuda(const Tensor& input,
+                           const std::vector<int64_t>& dims,
+                           bool keepdim, int64_t mode, Tensor& result) {
+    hash_tensor_check_cuda(input, dims, mode);
+    if (result.dtype() != DType::UInt64) {
+        TP_THROW(RuntimeError,
+                 "hash_tensor: expected the result to have dtype uint64");
+    }
+
+    const int64_t ndim = input.dim();
+    std::vector<bool> mask(static_cast<size_t>(ndim), false);
+    std::vector<int64_t> wrapped_dims;
+    if (dims.empty()) {
+        wrapped_dims.reserve(static_cast<size_t>(ndim));
+        for (int64_t dim = 0; dim < ndim; ++dim) wrapped_dims.push_back(dim);
+    } else {
+        wrapped_dims.reserve(dims.size());
+        for (int64_t dim : dims) {
+            wrapped_dims.push_back(dim < 0 ? dim + ndim : dim);
+        }
+    }
+    for (int64_t dim : wrapped_dims) {
+        if (dim >= 0 && dim < ndim) mask[static_cast<size_t>(dim)] = true;
+    }
+
+    if (input.numel() == 0) {
+        result.fill_(Scalar(static_cast<uint64_t>(0)));
+        return;
+    }
+
+    Tensor viewed = hash_reduction_view(result, input, mask, keepdim);
+    TensorIterator iter = TensorIterator::reduce_op(viewed, input);
+#define TP_HASH_CUDA_CASE(ctype, name) \
+    case DType::name: \
+        launch_hash_tensor_reduce<ctype>(iter); \
+        break;
+    switch (input.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_HASH_CUDA_CASE)
+        default:
+            TP_THROW(NotImplementedError,
+                     "hash_tensor: unsupported input dtype");
+    }
+#undef TP_HASH_CUDA_CASE
+}
+
+Tensor hash_tensor_cuda(const Tensor& input, const std::vector<int64_t>& dims,
+                        bool keepdim, int64_t mode) {
+    hash_tensor_check_cuda(input, dims, mode);
+    const int64_t ndim = input.dim();
+    std::vector<bool> mask(static_cast<size_t>(ndim), false);
+    if (dims.empty()) {
+        for (int64_t dim = 0; dim < ndim; ++dim) mask[static_cast<size_t>(dim)] = true;
+    } else {
+        for (int64_t dim : dims) {
+            const int64_t wrapped = dim < 0 ? dim + ndim : dim;
+            if (wrapped >= 0 && wrapped < ndim) mask[static_cast<size_t>(wrapped)] = true;
+        }
+    }
+    Tensor result = Tensor::empty(hash_output_shape(input, mask, keepdim),
+                                  DType::UInt64, input.device());
+    hash_tensor_into_cuda(input, dims, keepdim, mode, result);
+    return result;
+}
+
+Tensor& hash_tensor_out_cuda(const Tensor& input,
+                             const std::vector<int64_t>& dims,
+                             bool keepdim, int64_t mode, Tensor& result) {
+    if (!result.defined()) {
+        result = hash_tensor_cuda(input, dims, keepdim, mode);
+        return result;
+    }
+    hash_tensor_check_cuda(input, dims, mode);
+    const int64_t ndim = input.dim();
+    std::vector<bool> mask(static_cast<size_t>(ndim), false);
+    if (dims.empty()) {
+        for (int64_t dim = 0; dim < ndim; ++dim) mask[static_cast<size_t>(dim)] = true;
+    } else {
+        for (int64_t dim : dims) {
+            const int64_t wrapped = dim < 0 ? dim + ndim : dim;
+            if (wrapped >= 0 && wrapped < ndim) mask[static_cast<size_t>(wrapped)] = true;
+        }
+    }
+    TP_CHECK(static_cast<std::vector<int64_t>>(result.shape()) ==
+                 hash_output_shape(input, mask, keepdim),
+             "hash_tensor.out: the result shape must match the input reduced "
+             "over the requested dims");
+    hash_tensor_into_cuda(input, dims, keepdim, mode, result);
+    return result;
+}
+
+} // anonymous namespace
 
 namespace {
 
@@ -314,6 +521,8 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, MiscKernels) {
     m.impl("corrcoef", corrcoef_cuda);
     m.impl("_cov_backward", cov_backward_cuda);
     m.impl("_corrcoef_backward", corrcoef_backward_cuda);
+    m.impl("hash_tensor", hash_tensor_cuda);
+    m.impl("hash_tensor.out", hash_tensor_out_cuda);
     m.impl("is_set_to", is_set_to_cuda);
 }
 
