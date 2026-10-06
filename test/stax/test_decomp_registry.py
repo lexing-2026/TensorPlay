@@ -31,6 +31,11 @@ def _lattice_bn_input():
     return tp.arange(24, dtype=tp.float32).reshape(2, 3, 2, 2) * 0.01
 
 
+def _lat(*shape):
+    # Same idea as the batch norm lattice, at any shape.
+    return tp.arange(math.prod(shape), dtype=tp.float32).reshape(shape) * 0.01
+
+
 def _pool2d_backward_sample():
     inp = tp.randn(2, 3, 6, 6)
     indices = ops.max_pool2d_with_indices.default(inp, [2, 2], [2, 2])[1]
@@ -551,6 +556,29 @@ SAMPLES = {
     "grid_sampler_2d.default": lambda: ((tp.randn(2, 3, 4, 5),
                                          tp.rand(2, 6, 7, 2) * 1.6 - 0.8,
                                          0, 0, False), {}),
+    # Reductions.  Corrections stay integral in the samples: the eager
+    # var/std kernels truncate a fractional correction to an integer while
+    # the walks apply it as a true divisor.
+    "sum.default": lambda: ((tp.randn(2, 3, 4),), {}),
+    "sum.dim_IntList": lambda: ((tp.randn(2, 3, 4), [0, 2], True), {}),
+    "mean.default": lambda: ((tp.randn(2, 3, 4),), {}),
+    "mean.dim": lambda: ((tp.randn(2, 3, 4), [1], False), {}),
+    "prod.default": lambda: ((tp.rand(2, 3) + 0.5,), {}),
+    "prod.dim_int": lambda: ((tp.rand(2, 3, 4) + 0.5, 1), {}),
+    "prod.dim_IntList": lambda: ((tp.rand(2, 3, 4) + 0.5, [0, 1], True), {}),
+    "var.default": lambda: ((_lat(2, 3, 4),), {"correction": 1}),
+    "var.dim": lambda: ((_lat(2, 3, 4), [0, 2], 0, True), {}),
+    "var.correction": lambda: ((_lat(2, 3, 4), [1]), {"correction": 2, "keepdim": True}),
+    "var_mean.default": lambda: ((_lat(2, 3, 4), [1, 2], False), {}),
+    "var_mean.dim": lambda: ((_lat(2, 3, 4), [0], True, False), {}),
+    "var_mean.correction": lambda: ((_lat(2, 3, 4),), {"correction": 0}),
+    "amax.default": lambda: ((tp.randn(2, 3, 4), [1], True), {}),
+    "amin.default": lambda: ((tp.randn(2, 3, 4), [0, 1]), {}),
+    "any.default": lambda: ((tp.tensor([[True, False], [False, False]]),), {}),
+    "any.dim": lambda: ((tp.tensor([[True, False], [False, False]]), 0, True), {}),
+    "any.dims": lambda: ((tp.rand(2, 3, 4) > 0.5, [0, 1], False), {}),
+    "cumsum.default": lambda: ((tp.randn(2, 3, 4), 1), {}),
+    "cumprod.default": lambda: ((tp.randn(2, 3, 4) * 0.5, 1), {}),
     # Pooling; window maxima and indices are picked exactly, so the comparison
     # is bit-stable even on random inputs.
     "max_pool2d_with_indices.default": lambda: (
@@ -1111,6 +1139,41 @@ def test_normal_decompositions_read_a_standard_normal_and_affine_it():
     with pytest.raises(RuntimeError):
         decomposition_table[ops.grid_sampler_2d.default](
             tp.randn(2, 3, 4, 5), tp.randn(2, 6, 7, 2), 3, 0, False)
+
+
+def test_reduction_decompositions_follow_their_contracts():
+    get_decompositions([])
+    # Bool sums and products accumulate in int64.
+    got = decomposition_table[ops.sum.default](
+        tp.tensor([[True, False], [True, True]]))
+    assert got.dtype == tp.int64 and got.item() == 3
+    got = decomposition_table[ops.prod.dim_IntList](
+        tp.tensor([[True, False], [True, True]]), [1])
+    assert got.dtype == tp.int64 and tp.equal(got, tp.tensor([0, 1], dtype=tp.int64))
+
+    # any keeps the legacy uint8 mask spelling.
+    got = decomposition_table[ops.any.default](tp.tensor([2, 0, 5], dtype=tp.uint8))
+    assert got.dtype == tp.uint8 and got.item() == 1
+
+    # mean refuses integer inputs.
+    with pytest.raises(RuntimeError):
+        decomposition_table[ops.mean.default](tp.ones(3, dtype=tp.int64))
+
+    # An empty dim list reduces every dimension.
+    x = tp.randn(2, 3, 4)
+    got = decomposition_table[ops.sum.dim_IntList](x, [])
+    assert tp.allclose(got, ops.sum.dim_IntList(x, [0, 1, 2]), rtol=1e-5, atol=1e-6)
+
+    # Scans over a 0-d tensor answer the value itself.
+    got = decomposition_table[ops.cumsum.default](tp.tensor(2.5), 0)
+    assert got.dim() == 0 and got.item() == 2.5
+    got = decomposition_table[ops.cumprod.default](tp.tensor(3.0), 0)
+    assert got.dim() == 0 and got.item() == 3.0
+
+    # The cumsum mask reproduces a sequential scan exactly on a lattice.
+    x = _lat(2, 4)
+    got = decomposition_table[ops.cumsum.default](x, 1)
+    assert tp.equal(got, ops.cumsum.default(x, 1))
 
 
 def test_fused_rms_norm_against_formula_and_autograd():

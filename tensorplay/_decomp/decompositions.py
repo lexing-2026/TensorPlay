@@ -1395,6 +1395,165 @@ def std_mean_correction(self, dim=None, *, correction=None, keepdim=False):
     return _std_mean(self, dim, _correction(correction), keepdim)
 
 
+# ---------------------------------------------------------------------------
+# Reductions
+# ---------------------------------------------------------------------------
+
+
+def _reduction_dims(a, dim):
+    if dim is None or (isinstance(dim, (list, tuple)) and len(dim) == 0):
+        return list(range(a.dim()))
+    if isinstance(dim, int):
+        return [canonicalize_dim(a.dim(), dim)]
+    return canonicalize_dims(a.dim(), list(dim))
+
+
+def _kept_shape(a, dims):
+    return [int(a.shape[i]) if i not in dims else 1 for i in range(a.dim())]
+
+
+def _int_like_dtype(a):
+    # Bool and integer sums and products accumulate in int64.
+    if a.dtype == tp.bool or (not a.dtype.is_floating_point and not a.dtype.is_complex):
+        return tp.int64
+    return a.dtype
+
+
+@register_decomposition([ops.sum.default, ops.sum.dim_IntList, ops.sum.IntList_out])
+def sum_reduce(a, dim=None, keepdim=False, *, dtype=None):
+    dims = _reduction_dims(a, dim)
+    result = prims.sum(a.to(dtype if dtype is not None else _int_like_dtype(a)), dims)
+    if keepdim:
+        result = ops.reshape.default(result, _kept_shape(a, dims))
+    return result
+
+
+@register_decomposition([ops.prod.default, ops.prod.dim_int, ops.prod.dim_IntList,
+                         ops.prod.int_out])
+def prod_reduce(a, dim=None, keepdim=False, *, dtype=None):
+    dims = _reduction_dims(a, dim)
+    result = prims.prod(a.to(dtype if dtype is not None else _int_like_dtype(a)), dims)
+    if keepdim:
+        result = ops.reshape.default(result, _kept_shape(a, dims))
+    return result
+
+
+@register_decomposition([ops.mean.default, ops.mean.dim, ops.mean.out, ops.mean.dtype_out])
+def mean_reduce(a, dim=None, keepdim=False, *, dtype=None):
+    if dtype is None:
+        dtype = a.dtype
+    if not (dtype.is_floating_point or dtype.is_complex):
+        raise RuntimeError(
+            "mean(): could not infer output dtype. Input dtype must be either "
+            f"a floating point or complex dtype. Got: {dtype}"
+        )
+    dims = _reduction_dims(a, dim)
+    total = prims.sum(a.to(_computation_dtype(a.dtype)), dims)
+    nelem = 1
+    for d in dims:
+        nelem *= int(a.shape[d])
+    result = total / nelem
+    if keepdim:
+        result = ops.reshape.default(result, _kept_shape(a, dims))
+    return result.to(dtype)
+
+
+def _var_reduce_common(a, dim, correction, keepdim):
+    result_dtype = a.abs().dtype if a.is_complex() else a.dtype
+    result = _var(a.to(_computation_dtype(a.dtype)), tuple(_reduction_dims(a, dim)),
+                  correction, keepdim)
+    return result.to(result_dtype)
+
+
+@register_decomposition(ops.var.default)
+def var_reduce(a, correction=1):
+    return _var_reduce_common(a, None, correction, False)
+
+
+@register_decomposition(ops.var.dim)
+def var_reduce_dim(a, dim, correction=1, keepdim=False):
+    return _var_reduce_common(a, dim, correction, keepdim)
+
+
+@register_decomposition([ops.var.correction, ops.var.out])
+def var_reduce_correction(a, dim=None, *, correction=None, keepdim=False):
+    return _var_reduce_common(a, dim, _correction(correction), keepdim)
+
+
+def _var_mean_reduce_common(a, dim, correction, keepdim):
+    return _var_reduce_common(a, dim, correction, keepdim), mean_reduce(a, dim, keepdim)
+
+
+@register_decomposition(ops.var_mean.default)
+def var_mean_reduce(a, dim=[], unbiased=True, keepdim=False):
+    return _var_mean_reduce_common(a, dim, _correction(None, unbiased), keepdim)
+
+
+@register_decomposition(ops.var_mean.dim)
+def var_mean_reduce_dim(a, dim, unbiased=True, keepdim=False):
+    return _var_mean_reduce_common(a, dim, _correction(None, unbiased), keepdim)
+
+
+@register_decomposition(ops.var_mean.correction)
+def var_mean_reduce_correction(a, dim=None, *, correction=None, keepdim=False):
+    return _var_mean_reduce_common(a, dim, _correction(correction), keepdim)
+
+
+@register_decomposition([ops.amax.default, ops.amax.out])
+def amax_reduce(a, dim=[], keepdim=False):
+    dims = _reduction_dims(a, dim)
+    result = prims.amax(a, dims)
+    if keepdim:
+        result = ops.reshape.default(result, _kept_shape(a, dims))
+    return result
+
+
+@register_decomposition([ops.amin.default, ops.amin.out])
+def amin_reduce(a, dim=[], keepdim=False):
+    dims = _reduction_dims(a, dim)
+    result = prims.amin(a, dims)
+    if keepdim:
+        result = ops.reshape.default(result, _kept_shape(a, dims))
+    return result
+
+
+@register_decomposition([ops.any.default, ops.any.dim, ops.any.dims, ops.any.out,
+                         ops.any.dims_out, ops.any.all_out])
+def any_reduce(a, dim=None, keepdim=False):
+    dims = _reduction_dims(a, dim)
+    result = ops.ne.Scalar(prims.sum(a.to(tp.int64), dims), 0)
+    if keepdim:
+        result = ops.reshape.default(result, _kept_shape(a, dims))
+    # A uint8 answer preserves the legacy mask spelling.
+    return result.to(tp.uint8) if a.dtype == tp.uint8 else result
+
+
+def _cumsumprod_common(reduce_fn, init, a, dim, dtype):
+    ndim = a.dim()
+    dim = canonicalize_dim(ndim, dim)
+    if ndim == 0:
+        return a if dtype is None else a.to(dtype)
+    # A row is included in the answer at position j when its index i <= j:
+    # the triangular mask turns the running scan into one masked reduction.
+    a_usq = a.unsqueeze(dim + 1)
+    rg = tp.arange(int(a_usq.shape[dim]), device=a.device)
+    mask = rg.unsqueeze(1) <= rg
+    for _ in range(ndim - dim - 1):
+        mask = mask.unsqueeze(-1)
+    masked = ops.where.ScalarOther(mask, a_usq, init)
+    return reduce_fn(masked, [dim], False, dtype=dtype)
+
+
+@register_decomposition(ops.cumsum.default)
+def cumsum_reduce(a, dim=0, dtype=None):
+    return _cumsumprod_common(sum_reduce, 0, a, dim, dtype)
+
+
+@register_decomposition(ops.cumprod.default)
+def cumprod_reduce(a, dim, dtype=None):
+    return _cumsumprod_common(prod_reduce, 1, a, dim, dtype)
+
+
 _QUANTILE_INTERPOLATIONS = ("linear", "lower", "higher", "midpoint", "nearest")
 
 
