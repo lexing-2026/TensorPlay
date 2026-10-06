@@ -2292,6 +2292,17 @@ static void softmax_strided_f64_512_unit(const SoftmaxStridedCtx<LogMode>& c, in
 
 template <bool LogMode>
 static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType out_dtype) {
+    // A 0-dim input holds one normalization unit: the softmax dim does not
+    // exist on the scalar shape, so the value normalizes as a one-element
+    // row (softmax answers 1, log-softmax 0) and the scalar shape returns.
+    if (self.dim() == 0) {
+        const int64_t d = dim < 0 ? dim + 1 : dim;
+        if (d != 0) {
+            TP_THROW(IndexError, format_dim_range(1, dim));
+        }
+        Tensor row = self.to(out_dtype).view({1});
+        return softmax_fused_kernel_impl<LogMode>(row, 0, out_dtype).view({});
+    }
     Tensor input = self.to(out_dtype);
     int64_t d = dim < 0 ? dim + input.dim() : dim;
     if (d < 0 || d >= input.dim()) {
