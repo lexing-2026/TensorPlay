@@ -6338,3 +6338,384 @@ def fft_ifftshift(input, dim=None):
     )
     shift = [(input.shape[d] + 1) // 2 for d in dims]
     return ops.roll.default(input, shift, dims)
+
+
+# ---------------------------------------------------------------------------
+# Predicates, scalar reads, factories and BLAS glue
+# ---------------------------------------------------------------------------
+
+
+@register_decomposition(ops.is_same_size.default)
+def is_same_size(a, b):
+    return a.shape == b.shape
+
+
+@register_decomposition(ops.is_complex.default)
+def is_complex(input):
+    return input.dtype.is_complex
+
+
+@register_decomposition(ops.isreal.default)
+def isreal(a):
+    if a.dtype.is_complex:
+        return ops.eq.Scalar(ops.imag.default(a), 0)
+    return ops.ones_like.default(a, dtype=tp.bool)
+
+
+@register_decomposition(ops.item.default)
+def item(a):
+    if a.numel() != 1:
+        raise RuntimeError(
+            f"Can't convert a tensor with {a.numel()} elements to a number"
+        )
+    # Read the element without dispatching item again: the read is the very
+    # operation this decomposition replaces.
+    return a.reshape(1).tolist()[0]
+
+
+def _where_promoted(pred, a, b):
+    if pred.dtype != tp.bool:
+        raise RuntimeError(f"expected predicate to be bool, got {pred.dtype}")
+    target = tp.result_type(a, b)
+    a = ops.to.dtype(a, target)
+    b = ops.to.dtype(b, target)
+    if target == tp.bool:
+        return ops.logical_or.default(
+            ops.logical_and.default(a, pred),
+            ops.logical_and.default(b, ops.logical_not.default(pred)),
+        )
+    # Selection as two zero-filled halves; the fill is exact for every value
+    # except that a negative zero on the taken side comes out positive.
+    return ops.masked_fill.Scalar(
+        a, ops.logical_not.default(pred), 0
+    ) + ops.masked_fill.Scalar(b, pred, 0)
+
+
+@register_decomposition(ops.where.self)
+def where_self(condition, self, other):
+    return _where_promoted(condition, self, other)
+
+
+@register_decomposition(ops.where.ScalarSelf)
+def where_scalar_self(condition, self, other):
+    return _where_promoted(
+        condition, ops.scalar_tensor.default(self, dtype=other.dtype), other
+    )
+
+
+@register_decomposition(ops.where.ScalarOther)
+def where_scalar_other(condition, self, other):
+    return _where_promoted(
+        condition, self, ops.scalar_tensor.default(other, dtype=self.dtype)
+    )
+
+
+@register_decomposition(ops.where.Scalar)
+def where_scalar(condition, self, other):
+    def weak(value):
+        if isinstance(value, bool):
+            return tp.bool
+        if isinstance(value, int):
+            return tp.int64
+        if isinstance(value, float):
+            return tp.float64
+        return tp.complex128
+
+    return _where_promoted(
+        condition,
+        ops.scalar_tensor.default(self, dtype=weak(self)),
+        ops.scalar_tensor.default(other, dtype=weak(other)),
+    )
+
+
+@register_decomposition(ops.where.default)
+def where(condition):
+    # Flat row indices per coordinate: the nonzero rows already come out
+    # sorted, so selecting column d yields the indices along dimension d.
+    flat = ops.nonzero.default(condition)
+    return [ops.select.int(flat, 1, d) for d in range(condition.dim())]
+
+
+_COMPLEX_OF = {
+    tp.float16: tp.complex32,
+    tp.float32: tp.complex64,
+    tp.float64: tp.complex128,
+}
+
+
+def _complex_from_parts(real, imag):
+    if real.dtype not in _COMPLEX_OF or imag.dtype not in _COMPLEX_OF:
+        raise RuntimeError(
+            "Expected both inputs to be Half, Float or Double tensors but got "
+            f"{real.dtype} and {imag.dtype}"
+        )
+    if real.dtype != imag.dtype:
+        raise RuntimeError(
+            f"Expected object of scalar type {real.dtype} but got scalar type "
+            f"{imag.dtype} for second argument"
+        )
+    sa = tuple(int(s) for s in real.shape)
+    sb = tuple(int(s) for s in imag.shape)
+    n = max(len(sa), len(sb))
+    sa = (1,) * (n - len(sa)) + sa
+    sb = (1,) * (n - len(sb)) + sb
+    shape = []
+    for x, y in zip(sa, sb):
+        if x != y and x != 1 and y != 1:
+            raise RuntimeError(
+                f"The size of tensor a ({x}) must match the size of tensor b "
+                f"({y}) at non-singleton dimension {len(shape)}"
+            )
+        shape.append(max(x, y))
+    interleaved = ops.stack.default(
+        (ops.expand.default(real, shape), ops.expand.default(imag, shape)), -1
+    )
+    # The reinterpreting view folds the trailing pair into a size-one dim;
+    # reshape it back to the broadcast shape.
+    return ops.reshape.default(
+        ops.view.dtype(interleaved, _COMPLEX_OF[real.dtype]), shape
+    )
+
+
+@register_decomposition(ops.complex.default)
+def complex_op(real, imag):
+    return _complex_from_parts(real, imag)
+
+
+@register_decomposition(ops.polar.default)
+def polar(abs, angle):
+    return _complex_from_parts(abs * ops.cos.default(angle), abs * ops.sin.default(angle))
+
+
+@register_decomposition(ops.conj_physical.default)
+def conj_physical(input):
+    if not input.dtype.is_complex:
+        return input
+    return prims.conj_physical(input)
+
+
+def _number_dtype(value):
+    if isinstance(value, bool):
+        return tp.bool
+    if isinstance(value, int):
+        return tp.int64
+    if isinstance(value, float):
+        return tp.get_default_dtype()
+    return tp.complex64
+
+
+@register_decomposition([ops.full.default, ops.full.out])
+def full(size, fill_value, *, dtype=None, device=None, pin_memory=False,
+         requires_grad=False):
+    dtype = dtype if dtype is not None else _number_dtype(fill_value)
+    e = ops.empty.default(
+        list(size), dtype=dtype, device=device, pin_memory=pin_memory,
+        requires_grad=requires_grad,
+    )
+    return ops.fill.Scalar(e, fill_value)
+
+
+@register_decomposition([ops.bucketize.Tensor, ops.bucketize.Scalar])
+def bucketize(self, boundaries, *, out_int32=False, right=False):
+    if boundaries.dim() != 1:
+        raise RuntimeError(
+            f"boundaries tensor must be 1 dimension but got dim({boundaries.dim()})"
+        )
+    if not isinstance(self, tp.Tensor):
+        self = ops.scalar_tensor.default(self, dtype=boundaries.dtype)
+    out_dtype = tp.int32 if out_int32 else tp.int64
+    n_boundaries = int(boundaries.shape[-1])
+    if n_boundaries == 0:
+        return ops.zeros_like.default(self, dtype=out_dtype)
+    # Each step of the binary search runs over every element at once; the
+    # iteration count is the search depth, with a flag tensor freezing the
+    # elements whose search has already terminated.
+    start = ops.zeros.default(list(self.shape), dtype=tp.int64, device=self.device)
+    end = start + n_boundaries
+    mid = start + ops.floor_divide.Scalar(end - start, 2)
+    mid_val = ops.index.Tensor(boundaries, [mid])
+    cond_mid = mid_val > self if right else mid_val >= self
+    start = ops.where.self(cond_mid, start, mid + 1)
+    if n_boundaries > 1:
+        cond_update = ops.ones_like.default(self, dtype=tp.bool)
+        for _ in range(int(math.log2(n_boundaries))):
+            end = ops.where.self(cond_mid & cond_update, mid, end)
+            cond_update = start < end
+            mid = ops.where.ScalarOther(
+                cond_update, start + ops.floor_divide.Scalar(end - start, 2), 0
+            )
+            mid_val = ops.index.Tensor(boundaries, [mid])
+            cond_mid = mid_val > self if right else mid_val >= self
+            start = ops.where.self(
+                ops.logical_not.default(cond_mid) & cond_update, mid + 1, start
+            )
+    return ops.to.dtype(start, out_dtype)
+
+
+@register_decomposition([ops.addmm.default, ops.addmm.out])
+def addmm(self, mat1, mat2, *, beta=1, alpha=1):
+    if not self.is_floating_point() and not self.is_complex():
+        beta = int(beta)
+        alpha = int(alpha)
+    out = alpha * ops.mm.default(mat1, mat2)
+    if beta == 0:
+        return out
+    # The product is the leading addend so the result carries its contiguous
+    # layout rather than the possibly strided ``self``.
+    return out + beta * self
+
+
+@register_decomposition([ops.addmm.dtype, ops.addmm.dtype_out])
+def addmm_dtype(self, mat1, mat2, out_dtype, *, beta=1, alpha=1):
+    out = alpha * ops.mm.dtype(mat1, mat2, out_dtype)
+    if beta == 0:
+        return out
+    return out + beta * ops.to.dtype(self, out_dtype)
+
+
+@register_decomposition([ops._addmm_activation.default, ops._addmm_activation.out])
+def _addmm_activation(self, mat1, mat2, *, beta=1, alpha=1, use_gelu=False):
+    out = addmm(self, mat1, mat2, beta=beta, alpha=alpha)
+    if use_gelu:
+        return ops.gelu.default(out)
+    return ops.relu.default(out)
+
+
+@register_decomposition([ops.addmv.default, ops.addmv.out])
+def addmv(self, mat, vec, *, beta=1, alpha=1):
+    if self.dtype != mat.dtype or mat.dtype != vec.dtype:
+        raise RuntimeError(
+            f"addmv input tensors must have the same dtype, but got {self.dtype}, "
+            f"{mat.dtype}, and {vec.dtype}"
+        )
+    if not self.is_floating_point() and not self.is_complex():
+        beta = int(beta)
+        alpha = int(alpha)
+    out = alpha * ops.mv.default(mat, vec)
+    if beta == 0:
+        return out
+    if out.numel() == 0:
+        return beta * self
+    return out + beta * self
+
+
+@register_decomposition(ops.dist.default)
+def dist(self, other, p=2):
+    return ops.norm.Scalar(self - other, p)
+
+
+@register_decomposition(ops._euclidean_dist.default)
+def _euclidean_dist(x1, x2):
+    # |a - b|^2 = |a|^2 + |b|^2 - 2 a.b, evaluated as one matmul over rows
+    # extended with the norms and a column of ones.
+    x1_norm = ops.sum.dim_IntList(ops.pow.Tensor_Scalar(x1, 2), [-1], True)
+    x1_pad = ops.ones_like.default(x1_norm)
+    x2_norm = ops.sum.dim_IntList(ops.pow.Tensor_Scalar(x2, 2), [-1], True)
+    x2_pad = ops.ones_like.default(x2_norm)
+    x1_ = ops.cat.default((x1 * -2, x1_norm, x1_pad), -1)
+    x2_ = ops.cat.default((x2, x2_pad, x2_norm), -1)
+    result = ops.matmul.default(x1_, ops.transpose.default(x2_, -1, -2))
+    return ops.sqrt.default(ops.clamp.default(result, min=0))
+
+
+@register_decomposition(ops._to_copy.default)
+def _to_copy(self, *, dtype=None, layout=None, device=None, pin_memory=None,
+             non_blocking=False, memory_format=None):
+    if layout is not None and getattr(layout, "name", layout) != "strided":
+        raise RuntimeError(f"layout must be None or the strided layout, got {layout}")
+    if pin_memory:
+        raise RuntimeError("pin_memory=True is not supported in _to_copy decomposition")
+    if dtype is None and device is None and memory_format is None:
+        return self.clone()
+    x = self
+    if device is not None and device != x.device:
+        # When both dtype and device change, convert on the source device when
+        # moving to the host, and on the destination device otherwise.
+        if dtype is not None and device.type == "cpu":
+            x = prims.convert_element_type(x, dtype)
+            dtype = None
+        x = prims.device_put(x, device, non_blocking)
+    if dtype is not None:
+        x = prims.convert_element_type(x, dtype)
+    if memory_format is not None:
+        x = ops.clone.default(x, memory_format=memory_format)
+    return x
+
+
+@register_decomposition(ops._adaptive_avg_pool2d.default)
+def _adaptive_avg_pool2d(input, output_size):
+    if input.dim() not in (3, 4):
+        raise RuntimeError(
+            f"adaptive_avg_pool2d(): Expected 3D or 4D tensor, but got {input.dim()}"
+        )
+    if any(d == 0 for d in input.shape[-2:]):
+        raise RuntimeError(
+            "adaptive_avg_pool2d(): Expected input to have non-zero size for "
+            f"non-batch dimensions, but input has shape {tuple(input.shape)}."
+        )
+    out_h, out_w = int(output_size[-2]), int(output_size[-1])
+
+    # When every window has the same size the pooling is a strided average.
+    if int(input.shape[-2]) % out_h == 0 and int(input.shape[-1]) % out_w == 0:
+        stride = [int(input.shape[-2]) // out_h, int(input.shape[-1]) // out_w]
+        kernel = [
+            int(input.shape[-2]) - (out_h - 1) * stride[0],
+            int(input.shape[-1]) - (out_w - 1) * stride[1],
+        ]
+        return ops.avg_pool2d.default(input, kernel, stride)
+
+    def start_index(a, b, c):
+        return ops.floor_divide.Scalar(a * c, b)
+
+    def end_index(a, b, c):
+        return ops.floor_divide.Scalar((a + 1) * c + b - 1, b)
+
+    def compute_idx(in_size, out_size):
+        orange = ops.arange.end(out_size, dtype=tp.int64)
+        i0 = start_index(orange, out_size, in_size)
+        # Window lengths vary unless the split is uniform; the longest one is
+        # known analytically, so the index plane is padded to that width.
+        maxlength = in_size // out_size + 1
+        in_size_mod = in_size % out_size
+        adaptive = not (in_size_mod == 0 or out_size % in_size_mod == 0)
+        if adaptive:
+            maxlength += 1
+        elif in_size_mod == 0:
+            maxlength -= 1
+        range_max = ops.arange.end(maxlength, dtype=tp.int64)
+        idx = i0.unsqueeze(-1) + range_max
+        if adaptive:
+            # Rows shorter than the pad width read a clamped last position;
+            # the mask below drops those reads from the average.
+            idx = ops.minimum.default(
+                idx, ops.scalar_tensor.default(in_size - 1, dtype=idx.dtype)
+            )
+            length = end_index(orange, out_size, in_size) - i0
+        else:
+            length = maxlength
+        return idx, length, range_max, adaptive
+
+    idxh, length_h, range_max_h, adaptive_h = compute_idx(
+        int(input.shape[-2]), out_h
+    )
+    idxw, length_w, range_max_w, adaptive_w = compute_idx(
+        int(input.shape[-1]), out_w
+    )
+
+    vals = ops.index.Tensor(input, [None, None, _to_rank(idxh, 4), idxw])
+    if not adaptive_h and not adaptive_w:
+        return ops.mean.dim(vals, [-3, -1])
+
+    def maybe_mask(vals, length, range_max, dim):
+        if isinstance(length, int):
+            return vals, length
+        mask = range_max >= length.unsqueeze(-1)
+        if dim == -2:
+            mask = _to_rank(mask, 4)
+        vals = ops.masked_fill.Scalar(vals, mask, 0.0)
+        return vals, _to_rank(length, -dim)
+
+    vals, length_h = maybe_mask(vals, length_h, range_max_h, -2)
+    vals, length_w = maybe_mask(vals, length_w, range_max_w, -1)
+    total = ops.sum.dim_IntList(vals, [3, 5])
+    return total / (length_h * length_w)

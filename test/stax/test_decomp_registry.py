@@ -511,6 +511,39 @@ SAMPLES = {
     "upsample_bicubic2d.vec": lambda: ((_t(1, 2, 4, 5), None, False, (1.5, 2.0)), {}),
     "_upsample_bilinear2d_aa.vec": lambda: ((_t(1, 2, 4, 5), [7, 8], False, None), {}),
     "_upsample_bicubic2d_aa.vec": lambda: ((_t(1, 2, 4, 5), None, False, (1.5, 2.0)), {}),
+    # Predicates, scalar reads, factories and BLAS glue.  The entries that
+    # answer python values go through the scalar branch of the matcher.
+    "is_same_size.default": lambda: ((tp.randn(2, 3), tp.randn(2, 3)), {}),
+    "is_complex.default": lambda: ((tp.randn(2, 3).to(tp.complex64),), {}),
+    "isreal.default": lambda: ((tp.randn(2, 3).to(tp.complex64),), {}),
+    "item.default": lambda: ((tp.tensor([3.5]),), {}),
+    "where.self": lambda: ((tp.tensor([[True, False], [True, True]]),
+                            tp.randn(2, 2), tp.randn(2, 2)), {}),
+    "where.ScalarSelf": lambda: ((tp.tensor([[True, False], [True, True]]), 1.5,
+                                  tp.randn(2, 2)), {}),
+    "where.ScalarOther": lambda: ((tp.tensor([[True, False], [True, True]]),
+                                   tp.randn(2, 2), 2.5), {}),
+    "where.Scalar": lambda: ((tp.tensor([[True, False], [True, True]]), 1.5, 2.5), {}),
+    "where.default": lambda: ((tp.tensor([[True, False], [True, False]]),), {}),
+    "complex.default": lambda: ((tp.randn(2, 3), tp.randn(2, 3)), {}),
+    "polar.default": lambda: ((tp.rand(2, 3), tp.rand(2, 3) * 3.0), {}),
+    "conj_physical.default": lambda: ((tp.randn(2, 3).to(tp.complex64),), {}),
+    "full.default": lambda: (([2, 3], 2.5), {}),
+    "bucketize.Tensor": lambda: ((tp.tensor([[0.05, 0.3, 0.7, 0.95, 1.2]]),
+                                  tp.tensor([0.1, 0.5, 0.9])), {}),
+    "bucketize.Scalar": lambda: ((0.35, tp.tensor([0.1, 0.5, 0.9])), {}),
+    "addmm.default": lambda: ((tp.randn(2, 3), tp.randn(2, 4), tp.randn(4, 3)),
+                              {"beta": 2.0, "alpha": 3.0}),
+    "addmm.dtype": lambda: ((tp.randn(2, 3), tp.randn(2, 4), tp.randn(4, 3), tp.float64),
+                            {"beta": 2, "alpha": 3}),
+    "_addmm_activation.default": lambda: ((tp.randn(2, 3), tp.randn(2, 4), tp.randn(4, 3)),
+                                          {"use_gelu": True}),
+    "addmv.default": lambda: ((tp.randn(3), tp.randn(3, 4), tp.randn(4)),
+                              {"beta": 2.0, "alpha": 0.5}),
+    "dist.default": lambda: ((tp.randn(3, 5), tp.randn(3, 5)), {"p": 2.0}),
+    "_euclidean_dist.default": lambda: ((tp.randn(3, 5), tp.randn(3, 5)), {}),
+    "_to_copy.default": lambda: ((tp.randn(2, 3),), {"dtype": tp.float64}),
+    "_adaptive_avg_pool2d.default": lambda: ((tp.randn(2, 3, 6, 5), [2, 2]), {}),
     # Pooling; window maxima and indices are picked exactly, so the comparison
     # is bit-stable even on random inputs.
     "max_pool2d_with_indices.default": lambda: (
@@ -999,6 +1032,49 @@ def test_gated_rnn_decomposition_matches_the_eager_loop():
         assert tp.allclose(g, e, rtol=1e-4, atol=1e-5)
 
 
+def test_predicate_factory_and_blas_decompositions_follow_their_contracts():
+    get_decompositions([])
+    with pytest.raises(RuntimeError):
+        decomposition_table[ops.item.default](tp.tensor([1.0, 2.0]))
+    with pytest.raises(RuntimeError):
+        decomposition_table[ops.complex.default](
+            tp.randn(2), tp.randn(2, dtype=tp.float64))
+    with pytest.raises(RuntimeError):
+        decomposition_table[ops.complex.default](
+            tp.randn(2, dtype=tp.int64), tp.randn(2, dtype=tp.int64))
+    with pytest.raises(RuntimeError):
+        decomposition_table[ops.addmv.default](
+            tp.randn(3), tp.randn(3, 4, dtype=tp.float64), tp.randn(4, dtype=tp.float64))
+    with pytest.raises(RuntimeError):
+        decomposition_table[ops.bucketize.Tensor](tp.randn(2), tp.randn(2, 2))
+    with pytest.raises(RuntimeError):
+        decomposition_table[ops._to_copy.default](tp.randn(2), pin_memory=True)
+    with pytest.raises(RuntimeError):
+        decomposition_table[ops.where.self](tp.randn(2, 2), tp.randn(2, 2), tp.randn(2, 2))
+
+    # An empty boundary list answers zero everywhere, in the result dtype.
+    got = decomposition_table[ops.bucketize.Tensor](tp.randn(2, 2), tp.zeros(0))
+    assert got.dtype == tp.int64
+    assert tp.equal(got, tp.zeros(2, 2, dtype=tp.int64))
+
+    # A uniform window split is the strided average.
+    x = tp.randn(2, 3, 6, 6)
+    got = decomposition_table[ops._adaptive_avg_pool2d.default](x, [2, 3])
+    assert tp.equal(got, ops._adaptive_avg_pool2d.default(x, [2, 3]))
+
+    # _to_copy with no conversion options is a clone.
+    x = tp.randn(2, 3)
+    got = decomposition_table[ops._to_copy.default](x)
+    assert tp.equal(got, x)
+
+    # Integer addmm casts the scalars so the product stays integral: the
+    # matmul sums 2*3 twice over the reduction dim, then 5*12 + 2*self.
+    got = decomposition_table[ops.addmm.default](
+        tp.ones(2, 2, dtype=tp.int64), 2 * tp.ones(2, 2, dtype=tp.int64),
+        3 * tp.ones(2, 2, dtype=tp.int64), beta=2, alpha=5)
+    assert tp.equal(got, 62 * tp.ones(2, 2, dtype=tp.int64))
+
+
 def test_fused_rms_norm_against_formula_and_autograd():
     # No CPU kernel serves these overloads; the oracle is the formula itself
     # and its autograd gradient.
@@ -1040,6 +1116,9 @@ def test_decomposition_matches_operator(name):
     for g, e in zip(got, expected):
         if e is None:
             assert g is None
+            continue
+        if isinstance(e, (bool, int, float, complex)):
+            assert g == e, (g, e)
             continue
         assert g.dtype == e.dtype, (g.dtype, e.dtype)
         assert tuple(g.shape) == tuple(e.shape), (tuple(g.shape), tuple(e.shape))
