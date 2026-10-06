@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <limits>
 #include <memory>
 
@@ -646,6 +647,125 @@ void adaptive_avg_pool2d_cl_typed(const T* in, T* out,
             }
             for (; c < C; ++c) {
                 out_lane[c] = out_lane[c] / dv;
+            }
+        }
+    });
+}
+
+template <typename T>
+void adaptive_avg_pool2d_backward_cl_typed(const T* gout, T* gin,
+                                           int64_t N, int64_t C,
+                                           int64_t H, int64_t W,
+                                           int64_t oH, int64_t oW) {
+    using Vec = tensorplay::vec::Vectorized<T>;
+    constexpr int64_t V = Vec::size();
+    const int64_t len = C - (C % V);
+    if (N == 0 || C == 0 || H == 0 || W == 0) return;
+
+    // Integral reductions partition the input into disjoint windows. Each
+    // window can initialize its gradient directly without an extra zero pass.
+    if (oH > 0 && oW > 0 && H % oH == 0 && W % oW == 0) {
+        const int64_t kh = H / oH;
+        const int64_t kw = W / oW;
+        const T divisor = static_cast<T>(kh * kw);
+        const int64_t pixel_grain = std::max(int64_t(1), GRAIN_SIZE / C);
+        parallel_for(0, N * H * W, pixel_grain, [&](int64_t begin, int64_t end) {
+            auto grad_arr = std::make_unique<T[]>(C);
+            T* grad = grad_arr.get();
+            int64_t item = begin;
+            while (item < end) {
+                const int64_t row = item / W;
+                const int64_t row_end = std::min(end, (row + 1) * W);
+                const int64_t n = row / H;
+                const int64_t oh = (row % H) / kh;
+                int64_t ow = (item % W) / kw;
+                for (; item < row_end; ++ow) {
+                    const int64_t span_end = std::min(row_end, row * W + (ow + 1) * kw);
+                    const T* go_lane = gout + ((n * oH + oh) * oW + ow) * C;
+                    int64_t c = 0;
+                    for (; c < len; c += V) {
+                        (Vec(T(0)) + Vec::loadu(go_lane + c) / Vec(divisor)).store(grad + c);
+                    }
+                    for (; c < C; ++c) grad[c] = T(0) + go_lane[c] / divisor;
+                    T* gi_lane = gin + item * C;
+                    if (C == 1) {
+                        std::fill_n(gi_lane, span_end - item, grad[0]);
+                    } else {
+                        for (int64_t pixel = item; pixel < span_end; ++pixel) {
+                            c = 0;
+                            for (; c < len; c += V) {
+                                Vec::loadu(grad + c).store(gi_lane + c);
+                            }
+                            for (; c < C; ++c) gi_lane[c] = grad[c];
+                            gi_lane += C;
+                        }
+                    }
+                    item = span_end;
+                }
+            }
+        });
+        return;
+    }
+
+    // Width bounds are shared by all output rows and batches.
+    auto width_bounds = std::make_unique<int64_t[]>(2 * oW);
+    for (int64_t ow = 0; ow < oW; ++ow) {
+        width_bounds[2 * ow] = (ow * W) / oW;
+        width_bounds[2 * ow + 1] = ((ow + 1) * W + oW - 1) / oW;
+    }
+    // Output windows may overlap; each batch keeps its output scan order.
+    parallel_for(0, N, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t n = begin; n < end; ++n) {
+            T* gin_n = gin + n * H * W * C;
+            const T* gout_n = gout + n * oH * oW * C;
+            std::memset(gin_n, 0, H * W * C * sizeof(T));
+            for (int64_t oh = 0; oh < oH; ++oh) {
+                const int64_t ih0 = (oh * H) / oH;
+                const int64_t ih1 = ((oh + 1) * H + oH - 1) / oH;
+                for (int64_t ow = 0; ow < oW; ++ow) {
+                    const int64_t iw0 = width_bounds[2 * ow];
+                    const int64_t iw1 = width_bounds[2 * ow + 1];
+                    const T* go_lane = gout_n + (oh * oW + ow) * C;
+                    const T divisor = static_cast<T>((ih1 - ih0) * (iw1 - iw0));
+                    int64_t c = 0;
+                    // Keep four channel vectors in registers across the window.
+                    for (; c + 4 * V <= len; c += 4 * V) {
+                        const Vec g0 = Vec::loadu(go_lane + c) / Vec(divisor);
+                        const Vec g1 = Vec::loadu(go_lane + c + V) / Vec(divisor);
+                        const Vec g2 = Vec::loadu(go_lane + c + 2 * V) / Vec(divisor);
+                        const Vec g3 = Vec::loadu(go_lane + c + 3 * V) / Vec(divisor);
+                        for (int64_t ih = ih0; ih < ih1; ++ih) {
+                            T* gi_lane = gin_n + (ih * W + iw0) * C + c;
+                            for (int64_t iw = iw0; iw < iw1; ++iw) {
+                                (Vec::loadu(gi_lane) + g0).store(gi_lane);
+                                (Vec::loadu(gi_lane + V) + g1).store(gi_lane + V);
+                                (Vec::loadu(gi_lane + 2 * V) + g2).store(gi_lane + 2 * V);
+                                (Vec::loadu(gi_lane + 3 * V) + g3).store(gi_lane + 3 * V);
+                                gi_lane += C;
+                            }
+                        }
+                    }
+                    for (; c < len; c += V) {
+                        const Vec grad = Vec::loadu(go_lane + c) / Vec(divisor);
+                        for (int64_t ih = ih0; ih < ih1; ++ih) {
+                            T* gi_lane = gin_n + (ih * W + iw0) * C + c;
+                            for (int64_t iw = iw0; iw < iw1; ++iw) {
+                                (Vec::loadu(gi_lane) + grad).store(gi_lane);
+                                gi_lane += C;
+                            }
+                        }
+                    }
+                    for (; c < C; ++c) {
+                        const T grad = go_lane[c] / divisor;
+                        for (int64_t ih = ih0; ih < ih1; ++ih) {
+                            T* gi_lane = gin_n + (ih * W + iw0) * C + c;
+                            for (int64_t iw = iw0; iw < iw1; ++iw) {
+                                *gi_lane += grad;
+                                gi_lane += C;
+                            }
+                        }
+                    }
+                }
             }
         }
     });
@@ -1307,6 +1427,28 @@ void adaptive_avg_pool2d_cl_impl(const void* in, void* out,
     }
 }
 
+void adaptive_avg_pool2d_backward_cl_impl(const void* gout, void* gin,
+                                          int64_t N, int64_t C,
+                                          int64_t H, int64_t W,
+                                          int64_t oH, int64_t oW, int dtype) {
+    switch (static_cast<DType>(dtype)) {
+        case DType::Float32:
+            adaptive_avg_pool2d_backward_cl_typed<float>(
+                static_cast<const float*>(gout), static_cast<float*>(gin),
+                N, C, H, W, oH, oW);
+            break;
+        case DType::Float64:
+            adaptive_avg_pool2d_backward_cl_typed<double>(
+                static_cast<const double*>(gout), static_cast<double*>(gin),
+                N, C, H, W, oH, oW);
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "adaptive_avg_pool2d_backward: channels-last kernel "
+                     "supports only float and double");
+    }
+}
+
 void adaptive_avg_pool3d_cl_impl(const void* in, void* out,
                                  int64_t N, int64_t C,
                                  int64_t D, int64_t H, int64_t W,
@@ -1412,6 +1554,8 @@ REGISTER_DISPATCH(max_pool2d_backward_cl_stub, &max_pool2d_backward_cl_impl);
 REGISTER_DISPATCH(max_pool3d_cl_stub, &max_pool3d_cl_impl);
 REGISTER_DISPATCH(max_pool3d_backward_cl_stub, &max_pool3d_backward_cl_impl);
 REGISTER_DISPATCH(adaptive_avg_pool2d_cl_stub, &adaptive_avg_pool2d_cl_impl);
+REGISTER_DISPATCH(adaptive_avg_pool2d_backward_cl_stub,
+                  &adaptive_avg_pool2d_backward_cl_impl);
 REGISTER_DISPATCH(adaptive_avg_pool3d_cl_stub, &adaptive_avg_pool3d_cl_impl);
 REGISTER_DISPATCH(adaptive_avg_pool3d_backward_cl_stub,
                   &adaptive_avg_pool3d_backward_cl_impl);
@@ -1434,6 +1578,8 @@ ALSO_REGISTER_AVX512_DISPATCH(max_pool3d_backward_cl_stub,
                               &max_pool3d_backward_cl_impl);
 ALSO_REGISTER_AVX512_DISPATCH(adaptive_avg_pool2d_cl_stub,
                               &adaptive_avg_pool2d_cl_impl);
+ALSO_REGISTER_AVX512_DISPATCH(adaptive_avg_pool2d_backward_cl_stub,
+                              &adaptive_avg_pool2d_backward_cl_impl);
 ALSO_REGISTER_AVX512_DISPATCH(adaptive_avg_pool3d_cl_stub,
                               &adaptive_avg_pool3d_cl_impl);
 ALSO_REGISTER_AVX512_DISPATCH(adaptive_avg_pool3d_backward_cl_stub,

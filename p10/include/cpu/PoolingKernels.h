@@ -118,6 +118,11 @@ using adaptive_avg_pool2d_cl_fn = void (*)(const void* in, void* out,
                                            int64_t N, int64_t C,
                                            int64_t H, int64_t W,
                                            int64_t oH, int64_t oW, int dtype);
+using adaptive_avg_pool2d_backward_cl_fn = void (*)(const void* gout, void* gin,
+                                                    int64_t N, int64_t C,
+                                                    int64_t H, int64_t W,
+                                                    int64_t oH, int64_t oW,
+                                                    int dtype);
 using adaptive_avg_pool3d_cl_fn = void (*)(const void* in, void* out,
                                            int64_t N, int64_t C,
                                            int64_t D, int64_t H, int64_t W,
@@ -177,6 +182,8 @@ DECLARE_DISPATCH(max_pool2d_backward_cl_fn, max_pool2d_backward_cl_stub)
 DECLARE_DISPATCH(max_pool3d_cl_fn, max_pool3d_cl_stub)
 DECLARE_DISPATCH(max_pool3d_backward_cl_fn, max_pool3d_backward_cl_stub)
 DECLARE_DISPATCH(adaptive_avg_pool2d_cl_fn, adaptive_avg_pool2d_cl_stub)
+DECLARE_DISPATCH(adaptive_avg_pool2d_backward_cl_fn,
+                 adaptive_avg_pool2d_backward_cl_stub)
 DECLARE_DISPATCH(adaptive_avg_pool3d_cl_fn, adaptive_avg_pool3d_cl_stub)
 DECLARE_DISPATCH(adaptive_avg_pool3d_backward_cl_fn,
                  adaptive_avg_pool3d_backward_cl_stub)

@@ -711,8 +711,6 @@ Tensor avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
 
 Tensor adaptive_avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input) {
     if (grad_output.dim() != 4 || input.dim() != 4) TP_THROW(RuntimeError, "adaptive_avg_pool2d_backward: Expected 4D input and grad_output");
-    // Operands are read through a raw pointer in row-major order below.
-    const Tensor grad_output_c = grad_output.contiguous();
     
     int64_t N = input.size(0);
     int64_t C = input.size(1);
@@ -722,6 +720,19 @@ Tensor adaptive_avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor&
     int64_t H_out = grad_output.size(2);
     int64_t W_out = grad_output.size(3);
 
+    if (input.is_contiguous(MemoryFormat::ChannelsLast) &&
+        grad_output.is_contiguous(MemoryFormat::ChannelsLast) &&
+        input.dtype() == grad_output.dtype() &&
+        (input.dtype() == DType::Float32 || input.dtype() == DType::Float64)) {
+        const std::vector<int64_t> sizes = input.shape();
+        Tensor grad_input = Tensor::empty(sizes, input.dtype(), input.device());
+        grad_input = grad_input.as_strided(sizes, get_channels_last_strides(sizes), 0);
+        adaptive_avg_pool2d_backward_cl_stub(
+            DeviceType::CPU, grad_output.data_ptr(), grad_input.data_ptr(),
+            N, C, H_in, W_in, H_out, W_out, static_cast<int>(input.dtype()));
+        return grad_input;
+    }
+    const Tensor grad_output_c = grad_output.contiguous();
     Tensor grad_input = Tensor::zeros(static_cast<std::vector<int64_t>>(input.shape()), input.dtype(), input.device());
 
     TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "adaptive_avg_pool2d_backward", [&]() {
@@ -1915,6 +1926,7 @@ DEFINE_DISPATCH(max_pool2d_backward_cl_stub);
 DEFINE_DISPATCH(max_pool3d_cl_stub);
 DEFINE_DISPATCH(max_pool3d_backward_cl_stub);
 DEFINE_DISPATCH(adaptive_avg_pool2d_cl_stub);
+DEFINE_DISPATCH(adaptive_avg_pool2d_backward_cl_stub);
 DEFINE_DISPATCH(adaptive_avg_pool3d_cl_stub);
 DEFINE_DISPATCH(adaptive_avg_pool3d_backward_cl_stub);
 DEFINE_DISPATCH(adaptive_max_pool2d_cl_stub);
