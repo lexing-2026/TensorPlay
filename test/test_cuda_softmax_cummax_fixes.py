@@ -361,5 +361,117 @@ class TestCUDACummaxExtremum(unittest.TestCase):
         self.assertEqual(indices.cpu().numpy()[1, 1], 0)
 
 
+class TestCUDAMaskedSoftmax(unittest.TestCase):
+    """Fused masked softmax: the mask rides along with the row statistics, so
+    the result must match the masked-fill rewrite for every mask shape the
+    dispatcher accepts, including rows the mask drops entirely."""
+
+    def setUp(self):
+        self.device = "cuda" if tp.cuda.is_available() else "cpu"
+
+    def _reference(self, x, mask):
+        logits = np.where(mask, -np.inf, np.asarray(x, dtype=np.float64))
+        if logits.ndim == 0:
+            out = logits
+        else:
+            out = _numpy_softmax(logits, axis=-1)
+        return np.where(mask, 0.0, out)
+
+    def test_fused_matches_masked_fill(self):
+        rng = np.random.default_rng(7)
+        for shape, dtype, tol in (
+                ((3, 16), tp.float32, 1e-6),
+                ((2, 4, 8, 32), tp.float32, 1e-6),
+                ((2, 4, 8, 32), tp.float16, 2e-3),
+                ((2, 4, 8, 32), tp.bfloat16, 1e-2),
+                ((2, 3, 7), tp.float64, 1e-12)):
+            x = rng.standard_normal(shape)
+            mask = rng.random(shape) < 0.3
+            mask.reshape(-1)[0] = True
+            tx = tp.tensor(x, device=self.device, dtype=dtype)
+            tm = tp.tensor(mask, device=self.device)
+            got = _to_numpy(F._masked_softmax(tx, tm, -1, 2))
+            ref = self._reference(x, mask)
+            np.testing.assert_allclose(
+                got, ref, atol=tol, rtol=tol,
+                err_msg=f"masked_softmax {shape} {dtype}")
+
+    def test_all_dropped_rows_answer_zero(self):
+        rng = np.random.default_rng(11)
+        x = rng.standard_normal((4, 8))
+        mask = np.zeros((4, 8), dtype=bool)
+        mask[1] = True          # one fully dropped row
+        mask[3, 0] = True       # one partially dropped row
+        tx = tp.tensor(x, device=self.device, dtype=tp.float32)
+        tm = tp.tensor(mask, device=self.device)
+        got = _to_numpy(F._masked_softmax(tx, tm, -1, 2))
+        self.assertTrue(np.all(got[1] == 0.0))
+        ref = self._reference(x, mask)
+        np.testing.assert_allclose(got, ref, atol=1e-6, rtol=1e-6)
+
+    def test_kept_entries_all_neg_inf_answer_nan(self):
+        x = np.zeros((2, 6), dtype=np.float32)
+        x[1] = -np.inf          # kept entries are all -inf: zero mass, NaN
+        mask = np.zeros((2, 6), dtype=bool)
+        mask[0, 0] = True
+        tx = tp.tensor(x, device=self.device, dtype=tp.float32)
+        tm = tp.tensor(mask, device=self.device)
+        got = _to_numpy(F._masked_softmax(tx, tm, -1, 2))
+        self.assertFalse(np.isnan(got[0]).any())
+        self.assertTrue(np.isnan(got[1]).all())
+
+    def test_long_rows_take_the_unfused_rewrite(self):
+        rng = np.random.default_rng(13)
+        shape = (2, 2048)       # past the fused tier's row-length bound
+        x = rng.standard_normal(shape)
+        mask = rng.random(shape) < 0.4
+        tx = tp.tensor(x, device=self.device, dtype=tp.float32)
+        tm = tp.tensor(mask, device=self.device)
+        got = _to_numpy(F._masked_softmax(tx, tm, -1, 2))
+        ref = self._reference(x, mask)
+        np.testing.assert_allclose(got, ref, atol=1e-6, rtol=1e-6)
+
+    def test_padding_mask_broadcasts_over_heads(self):
+        rng = np.random.default_rng(17)
+        b, h, l = 2, 4, 6
+        x = rng.standard_normal((b, h, l, l))
+        mask = rng.random((b, l)) < 0.3
+        tx = tp.tensor(x, device=self.device, dtype=tp.float32)
+        tm = tp.tensor(mask, device=self.device)
+        got = _to_numpy(F._masked_softmax(tx, tm, -1, 1))
+        ref = self._reference(x, mask.reshape(b, 1, 1, l))
+        np.testing.assert_allclose(got, ref, atol=1e-6, rtol=1e-6)
+
+    def test_backward_matches_operand_masking(self):
+        rng = np.random.default_rng(19)
+        for dtype in (tp.float32, tp.float16):
+            x = rng.standard_normal((2, 4, 16))
+            mask = rng.random((2, 4, 16)) < 0.3
+            mask[0, 0] = True      # one fully dropped row
+            tx = tp.tensor(x, device=self.device, dtype=dtype)
+            tm = tp.tensor(mask, device=self.device)
+            out = F._masked_softmax(tx, tm, -1, 2)
+            g = rng.standard_normal((2, 4, 16))
+            tg = tp.tensor(g, device=self.device, dtype=dtype)
+            got = _to_numpy(F._masked_softmax_backward(tg, out, tm, -1))
+            x64 = x.astype(np.float64)
+            out64 = out.cpu().float().numpy().astype(np.float64)
+            g64 = g.astype(np.float64)
+            g64 = np.where(mask, 0.0, g64)
+            o64 = np.where(mask, 0.0, out64)
+            dot = (g64 * o64).sum(axis=-1, keepdims=True)
+            ref = np.where(mask, 0.0, o64 * (g64 - dot))
+            tol = 1e-6 if dtype == tp.float32 else 2e-3
+            np.testing.assert_allclose(
+                got, ref, atol=tol, rtol=tol,
+                err_msg=f"masked_softmax_backward {dtype}")
+
+    def test_rejects_non_bool_mask(self):
+        tx = tp.tensor(np.zeros((2, 4), np.float32), device=self.device)
+        tm = tp.tensor(np.zeros((2, 4), np.int64), device=self.device)
+        with self.assertRaises(RuntimeError):
+            F._masked_softmax(tx, tm, -1, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
