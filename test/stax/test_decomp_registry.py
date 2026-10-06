@@ -150,6 +150,32 @@ SAMPLES = {
     "slice_backward.default": lambda: ((_t(3, 2), _t(3, 5), 1, 1, 5, 2), {}),
     "diagonal_backward.default": lambda: ((_t(3), [3, 4], 0, 0, 1), {}),
     "unfold_backward.default": lambda: ((_t(3, 3), [7], 0, 3, 2), {}),
+    "alias.default": lambda: ((_t(2, 3),), {}),
+    "clone.default": lambda: ((_t(2, 3),), {}),
+    "unsqueeze.default": lambda: ((_t(2, 3), 1), {}),
+    "squeeze.default": lambda: ((_t(1, 3, 1),), {}),
+    "squeeze.dim": lambda: ((_t(1, 3, 1), 0), {}),
+    "squeeze.dims": lambda: ((_t(1, 3, 1), [0, 2]), {}),
+    "permute.default": lambda: ((_t(2, 3, 4), [2, 0, 1]), {}),
+    "expand.default": lambda: ((_t(1, 3), [4, 3]), {}),
+    "flip.default": lambda: ((_t(2, 3), [0, 1]), {}),
+    "slice.Tensor": lambda: ((_t(5, 4), 0, 1, 4, 2), {}),
+    "slice_scatter.default": lambda: ((_t(5, 4), _t(2, 4), 0, 1, 4, 2), {}),
+    "split_with_sizes.default": lambda: ((_t(6, 3), [2, 1, 3], 0), {}),
+    "unfold.default": lambda: ((_t(6), 0, 3, 2), {}),
+    "diagonal.default": lambda: ((_t(3, 4),), {"offset": 1}),
+    "diagonal_scatter.default": lambda: ((_t(3, 4), _t(3), 1, 0, 1), {}),
+    "view.default": lambda: ((_t(2, 6), [3, 4]), {}),
+    "cat.default": lambda: (([_t(2, 3), _t(1, 3)], 0), {}),
+    "meshgrid.default": lambda: (([_t(2), _t(3)], "ij"), {}),
+    "meshgrid.indexing": lambda: (([_t(2), _t(3)],), {"indexing": "xy"}),
+    "constant_pad_nd.default": lambda: ((_t(2, 3), [1, 2], 0.5), {}),
+    "repeat.default": lambda: ((_t(2, 3), [2, 1, 2]), {}),
+    "tril_indices.default": lambda: ((4, 5, -1), {}),
+    "triu_indices.default": lambda: ((4, 5, 1), {}),
+    "permute_copy.default": lambda: ((_t(2, 3, 4), [2, 0, 1]), {}),
+    "narrow_copy.default": lambda: ((_t(4, 6), 1, 1, 3), {}),
+    "view_copy.default": lambda: ((_t(2, 6), [4, 3]), {}),
     # fills and statistics
     "masked_fill.default": lambda: ((_t(4), tp.tensor([True, False, True, False]), 9.0), {}),
     "masked_fill.Scalar": lambda: ((_t(4), tp.tensor([True, False, True, False]), 9.0), {}),
@@ -619,6 +645,31 @@ def test_chunk_cat_decomposition():
     assert tp.equal(got, expected)
 
 
+def test_pad_sequence_decomposition_pads_to_the_longest_sequence():
+    # No native kernel serves this overload; the expected values are written
+    # out: sequences line up along their own axis, padded on one side.
+    get_decompositions([])
+    fn = decomposition_table[ops.pad_sequence.default]
+    seqs = [tp.tensor([1.0, 2.0, 3.0]), tp.tensor([4.0]), tp.tensor([5.0, 6.0])]
+    assert tp.equal(fn(seqs, False, 0.0, "right"), tp.tensor([[1.0, 4.0, 5.0], [2.0, 0.0, 6.0], [3.0, 0.0, 0.0]]))
+    assert tp.equal(fn(seqs, True, -1.0, "left"), tp.tensor([[1.0, 2.0, 3.0], [-1.0, -1.0, 4.0], [-1.0, 5.0, 6.0]]))
+    with_trailing = [tp.tensor([[1.0, 10.0], [2.0, 20.0]]), tp.tensor([[3.0, 30.0]])]
+    assert tp.equal(
+        fn(with_trailing, False, 9.0, "right"),
+        tp.tensor([[[1.0, 10.0], [3.0, 30.0]], [[2.0, 20.0], [9.0, 9.0]]]),
+    )
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"dtype": tp.float64}])
+def test_empty_strided_metadata(kwargs):
+    get_decompositions([])
+    expected = ops.empty_strided.default([4, 1], [1, 4], **kwargs)
+    got = decomposition_table[ops.empty_strided.default]([4, 1], [1, 4], **kwargs)
+    assert got.dtype == expected.dtype
+    assert tuple(got.shape) == tuple(expected.shape)
+    assert tuple(got.stride()) == tuple(expected.stride())
+
+
 def test_fused_rms_norm_against_formula_and_autograd():
     # No CPU kernel serves these overloads; the oracle is the formula itself
     # and its autograd gradient.
@@ -690,6 +741,7 @@ def test_every_functional_decomposition_has_a_sample():
             "_fused_rms_norm.default", "_fused_rms_norm_backward.default",
             "dropout.default", "native_dropout.default", "native_layer_norm.default",
             "new_empty_strided.default", "randn.default", "sym_numel.default",
+            "empty_strided.default", "pad_sequence.default",
         }
         and str(o).split(".", 1)[1] not in DEVICE_SPECIFIC
         and not any(a.is_out for a in o._schema.arguments)

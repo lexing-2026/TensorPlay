@@ -11,12 +11,20 @@ from __future__ import annotations
 
 import math
 import operator
+import sys
 from collections.abc import Callable
 from functools import reduce
 from typing import Any
 
 import tensorplay as tp
 from tensorplay._ops import NATIVE_NAMESPACE
+from tensorplay.primitives.common import (
+    canonicalize_dim,
+    canonicalize_dims,
+    infer_size,
+    is_contiguous_or_false,
+    make_contiguous_strides_for,
+)
 
 from . import register_decomposition
 
@@ -4078,3 +4086,687 @@ def log_normal_(self, mean=1, std=2, generator=None):
     _no_generator("log_normal_", generator)
     n = ops.randn_like(self)
     return self.copy_(ops.exp(std * n + mean))
+
+
+# ---------------------------------------------------------------------------
+# Views and their copies
+#
+# A view is expressed as a strided window on the buffer it came from: sizes,
+# strides and a storage offset.  The copy form of a view op materializes the
+# same window into a fresh contiguous buffer.
+# ---------------------------------------------------------------------------
+
+
+def _view_strided(a, size, stride, storage_offset):
+    return a.as_strided(list(size), list(stride), storage_offset)
+
+
+@register_decomposition(ops.alias.default)
+def alias(a):
+    return prims.view_of(a)
+
+
+@register_decomposition(ops.clone.default)
+def clone(a, *, memory_format=None):
+    return prims.clone(a, memory_format=memory_format)
+
+
+@register_decomposition(ops.unsqueeze.default)
+def unsqueeze(a, dim):
+    # The new axis has length one, so a zero stride addresses it correctly.
+    dim = canonicalize_dim(a.ndim + 1, dim)
+    size = list(a.shape)
+    stride = list(a.stride())
+    size.insert(dim, 1)
+    stride.insert(dim, 0)
+    return _view_strided(a, size, stride, a.storage_offset())
+
+
+def _squeeze_all(a):
+    dims = tuple(i for i, length in enumerate(a.shape) if length == 1)
+    if dims:
+        return prims.squeeze(a, list(dims))
+    return prims.view_of(a)
+
+
+@register_decomposition([ops.squeeze.default, ops.squeeze.dim, ops.squeeze.dims])
+def squeeze(a, dim=None):
+    if dim is None:
+        return _squeeze_all(a)
+    if a.ndim == 0:
+        dims = (dim,) if isinstance(dim, int) else tuple(dim)
+        if dims not in ((), (0,)):
+            raise RuntimeError(f"Expected dims to be empty or (0,) for 0-dim tensor, got {dims}")
+        return prims.view_of(a)
+    dims = (dim,) if isinstance(dim, int) else tuple(dim)
+    dims = canonicalize_dims(a.ndim, dims)
+    # Axes that are not of length one pass through untouched.
+    dims = tuple(d for d in dims if a.shape[d] == 1)
+    if not dims:
+        return prims.view_of(a)
+    if len(dims) == 1:
+        return prims.squeeze(a, list(dims))
+    for d in sorted(dims, reverse=True):
+        a = prims.squeeze(a, [d])
+    return a
+
+
+@register_decomposition(ops.permute.default)
+def permute(a, dims):
+    return prims.transpose(a, canonicalize_dims(a.ndim, dims))
+
+
+@register_decomposition(ops.expand.default)
+def expand(a, size, *, implicit=False):
+    if len(size) < len(a.shape):
+        raise RuntimeError("expand: the requested shape has too few dimensions!")
+    offset = len(size) - len(a.shape)
+    shape_ = list(size)
+    for idx, x in enumerate(a.shape):
+        requested = shape_[idx + offset]
+        if requested == -1:
+            # A request of -1 keeps the incoming length; a leading axis the
+            # tensor does not reach has nothing to keep.
+            shape_[idx + offset] = x
+        else:
+            if x != 1 and requested != x:
+                raise RuntimeError(
+                    f"expand: attempting to expand a dimension of length {x} -> {requested}!"
+                )
+            shape_[idx + offset] = requested
+    for i in range(offset):
+        if shape_[i] == -1:
+            raise RuntimeError(
+                f"The expanded size of the tensor ({shape_[i]}) isn't allowed "
+                f"in a leading, non-existing dimension {i}"
+            )
+    return prims.broadcast_in_dim(
+        a, shape_, tuple(range(offset, offset + len(a.shape)))
+    )
+
+
+@register_decomposition(ops.flip.default)
+def flip(a, dims=()):
+    dims = canonicalize_dims(a.ndim, dims)
+    if len(set(dims)) != len(dims):
+        raise RuntimeError("flip: dims may not repeat")
+    if a.ndim == 0:
+        return prims.clone(a)
+    return prims.rev(a, list(dims))
+
+
+@register_decomposition(ops.slice.Tensor)
+def slice_forward(self, dim=0, start=None, end=None, step=1):
+    if self.ndim == 0:
+        raise RuntimeError("slice() cannot be applied to a 0-dim tensor.")
+    dim = canonicalize_dim(self.ndim, dim)
+    sizes = list(self.shape)
+    strides = list(self.stride())
+    if step <= 0:
+        raise RuntimeError("slice step must be positive")
+    start_val = 0 if start is None else start
+    end_val = sys.maxsize if end is None else end
+    if start_val < 0:
+        start_val += sizes[dim]
+    if end_val < 0:
+        end_val += sizes[dim]
+    if start_val < 0:
+        start_val = 0
+    elif start_val > sizes[dim]:
+        start_val = sizes[dim]
+    if end_val == sys.maxsize:
+        end_val = sizes[dim]
+    elif end_val < start_val:
+        end_val = start_val
+    elif end_val > sizes[dim]:
+        end_val = sizes[dim]
+    storage_offset = self.storage_offset() + start_val * strides[dim]
+    length = end_val - start_val
+    sizes[dim] = (length + step - 1) // step
+    strides[dim] *= step
+    return _view_strided(self, sizes, strides, storage_offset)
+
+
+@register_decomposition(ops.slice_scatter.default)
+def slice_scatter(self, src, dim=0, start=None, end=None, step=1):
+    dim = canonicalize_dim(self.ndim, dim)
+    result = _clone_preserving_strides(self)
+    window = slice_forward(result, dim, start, end, step)
+    if tuple(window.shape) != tuple(src.shape):
+        raise RuntimeError(
+            f"expected src to have a size equal to the target slice. "
+            f"src size = {tuple(src.shape)}, slice size = {tuple(window.shape)}"
+        )
+    prims.copy_to(window, src)
+    return result
+
+
+@register_decomposition(ops.split_with_sizes.default)
+def split_with_sizes(self, split_sizes, dim=0):
+    for split_size in split_sizes:
+        if split_size < 0:
+            raise RuntimeError(
+                "split_with_sizes expects split_sizes have only non-negative entries"
+            )
+    dim = canonicalize_dim(self.ndim, dim)
+    total = sum(split_sizes)
+    if total != self.shape[dim]:
+        raise RuntimeError(
+            f"Split sizes add up to {total} but got the tensor's size of {self.shape[dim]}"
+        )
+    splits = []
+    offset = self.storage_offset()
+    stride = list(self.stride())
+    for split_size in split_sizes:
+        new_shape = list(self.shape)
+        new_shape[dim] = split_size
+        splits.append(_view_strided(self, new_shape, stride, offset))
+        offset += stride[dim] * split_size
+    return splits
+
+
+def _get_unfold_shape_stride(a_shape, a_stride, dimension, size, step):
+    a_ndim = len(a_shape)
+    dim = canonicalize_dim(a_ndim, dimension, wrap_scalar=True)
+    max_size = 1 if a_ndim == 0 else a_shape[dim]
+    last_stride = 1 if a_ndim == 0 else a_stride[dim]
+    if size > max_size:
+        raise RuntimeError(
+            f"Maximum size for tensor at dimension {dim} is {max_size} but size is {size}"
+        )
+    if step <= 0:
+        raise RuntimeError(f"Step is {step} but must be > 0")
+    shape = list(a_shape)
+    strides = list(a_stride)
+    shape.append(size)
+    strides.append(last_stride)
+    if dim < a_ndim:
+        shape[dim] = (shape[dim] - size) // step + 1
+        strides[dim] *= step
+    return shape, strides
+
+
+@register_decomposition(ops.unfold.default)
+def unfold(self, dimension, size, step):
+    shape, strides = _get_unfold_shape_stride(
+        self.shape, self.stride(), dimension, size, step
+    )
+    return _view_strided(self, shape, strides, self.storage_offset())
+
+
+@register_decomposition(ops.diagonal.default)
+def diagonal(self, offset=0, dim1=0, dim2=1):
+    num_dims = self.ndim
+    dim1 = canonicalize_dim(num_dims, dim1)
+    dim2 = canonicalize_dim(num_dims, dim2)
+    if dim1 == dim2:
+        raise RuntimeError(f"diagonal dimensions cannot be identical {dim1}, {dim2}")
+    storage_offset = self.storage_offset()
+    if offset >= 0:
+        diag_size = tp.sym_max(tp.sym_min(self.shape[dim1], self.shape[dim2] - offset), 0)
+        storage_offset += offset * self.stride()[dim2]
+    else:
+        diag_size = tp.sym_max(tp.sym_min(self.shape[dim1] + offset, self.shape[dim2]), 0)
+        storage_offset -= offset * self.stride()[dim1]
+    sizes = [s for i, s in enumerate(self.shape) if i not in (dim1, dim2)]
+    sizes.append(diag_size)
+    strides = [s for i, s in enumerate(self.stride()) if i not in (dim1, dim2)]
+    strides.append(self.stride()[dim1] + self.stride()[dim2])
+    return _view_strided(self, sizes, strides, storage_offset)
+
+
+def _clone_preserving_strides(a):
+    buffer = prims.empty_strided(
+        list(a.shape),
+        list(a.stride()),
+        dtype=a.dtype,
+        device=a.device,
+        requires_grad=False,
+    )
+    prims.copy_to(buffer, a)
+    return buffer
+
+
+@register_decomposition(ops.diagonal_scatter.default)
+def diagonal_scatter(input, src, offset=0, dim1=0, dim2=1):
+    # Internal overlap (a length above one carried on a zero stride) forbids
+    # keeping the strides: the writes below would land on aliased positions,
+    # so the scatter goes through a contiguous buffer instead.
+    if any(sz > 1 and st == 0 for sz, st in zip(input.shape, input.stride())):
+        out = prims.clone(input, memory_format=tp.contiguous_format)
+    else:
+        out = _clone_preserving_strides(input)
+    diag = diagonal(out, offset, dim1, dim2)
+    if tuple(diag.shape) != tuple(src.shape):
+        raise RuntimeError(
+            f"expected src to have a size equal to the diagonal of the input."
+            f"Got {tuple(src.shape)} for a diagonal of shape {tuple(diag.shape)}"
+        )
+    prims.copy_to(diag, src)
+    return out
+
+
+def _dims_collapsible(a, start, end):
+    """Whether collapsing ``start..end`` (inclusive) keeps the buffer a view.
+
+    Length-one axes impose nothing on the strides, so only the axes longer
+    than one take part: walking inward, each stride must equal the next
+    stride scaled by the sizes it spans.
+    """
+    shape = list(a.shape)
+    strides = list(a.stride())
+    pairs = [
+        (shape[i], strides[i]) for i in range(start, end + 1) if shape[i] != 1
+    ]
+    for (outer_size, outer_stride), (inner_size, inner_stride) in zip(
+        pairs, pairs[1:]
+    ):
+        if outer_stride != inner_stride * inner_size:
+            return False
+    return True
+
+
+def _reshape_view_core_alg(a, shape):
+    # Dimensions of the requested shape are built left to right: incoming
+    # axes are collapsed until one stretch covers a requested length, which
+    # is then carved out with a split.  Tail length-one axes are appended by
+    # splitting the last axis so the inner stride stays the original one.
+    idx = 0
+    a_ = a
+    for length in shape:
+        if idx >= a_.ndim:
+            if length != 1:
+                raise RuntimeError(
+                    f"Cannot unsqueeze dimension with length {length}, expected 1"
+                )
+            last_dim = a_.ndim - 1
+            a_ = prims.split_dim(a_, last_dim, a_.shape[last_dim])
+            idx += 1
+            continue
+        if length == a_.shape[idx]:
+            idx += 1
+            continue
+        accum = a_.shape[idx]
+        end = idx
+        while accum % length != 0:
+            end += 1
+            if end >= a_.ndim:
+                raise RuntimeError(
+                    f"Cannot view a tensor with shape {list(a.shape)} and strides "
+                    f"{list(a.stride())} as a tensor with shape {list(shape)}!"
+                )
+            accum *= a_.shape[end]
+        if end != idx:
+            if not _dims_collapsible(a_, idx, end):
+                raise RuntimeError(
+                    f"view size is not compatible with input tensor's size and stride "
+                    f"(at dimension {idx}, required length {length})"
+                )
+            a_ = prims.collapse_view(a_, idx, end)
+        if accum != length:
+            a_ = prims.split_dim(a_, idx, length)
+        idx += 1
+    while idx < a_.ndim:
+        if a_.shape[idx] != 1:
+            raise RuntimeError(
+                f"a.size({idx}) expected to be 1 but got {a_.shape[idx]}"
+            )
+        a_ = prims.squeeze(a_, [idx])
+    if a_ is a:
+        return prims.view_of(a)
+    return a_
+
+
+@register_decomposition(ops.view.default)
+def view(a, size):
+    shape = infer_size(list(size), a.numel())
+    if a.numel() == 0:
+        return _view_strided(a, shape, make_contiguous_strides_for(shape), a.storage_offset())
+    if a.ndim == 0:
+        _a = a
+        for length in shape:
+            if length != 1:
+                raise RuntimeError(
+                    f"Cannot reshape 0-dim tensor: shape dimension must be 1, got {length}"
+                )
+            _a = unsqueeze(_a, -1)
+        return _a if _a is not a else prims.view_of(a)
+    if len(shape) == 0:
+        _a = a
+        for length in a.shape:
+            if length != 1:
+                raise RuntimeError(
+                    f"Cannot reshape to 0-dim tensor: shape dimension must be 1, got {length}"
+                )
+            _a = squeeze(_a, -1)
+        return _a if _a is not a else prims.view_of(a)
+    if is_contiguous_or_false(a):
+        if len(shape) == 1 and a.ndim > 1:
+            return _view_strided(a, [a.numel()], [1], a.storage_offset())
+        if len(shape) == 2 and a.ndim == 1:
+            return _view_strided(a, shape, [shape[1], 1], a.storage_offset())
+    shape_numel = reduce(operator.mul, shape, 1)
+    if a.numel() != shape_numel:
+        raise RuntimeError(
+            f"shape '{list(shape)}' is invalid for input of size {a.numel()}"
+        )
+    return _reshape_view_core_alg(a, shape)
+
+
+@register_decomposition(ops.cat.default)
+def cat(tensors, dim=0):
+    if len(tensors) == 0:
+        raise ValueError("cat expects at least one tensor, but received zero!")
+    # A 1-D zero-length input may ride along with any rank; every other
+    # input must agree on the rank of the output.
+    example = next((t for t in tensors if t.ndim != 1), tensors[0])
+    for i, t in enumerate(tensors):
+        if t.ndim != 1 and t.ndim != example.ndim:
+            raise RuntimeError(
+                f"Number of dimensions of tensors must match.  Expected "
+                f"{example.ndim}-D tensors, but got {t.ndim}-D for tensor number {i} in the list"
+            )
+    filtered = []
+    for i, t in enumerate(tensors):
+        if len(example.shape) != len(t.shape):
+            if t.ndim != 1:
+                raise AssertionError(f"tensor.ndim should be 1 at this point, got {t.ndim}")
+            if t.shape[0] != 0:
+                raise RuntimeError(
+                    f"Number of dimensions of tensors must match.  Expected "
+                    f"{example.ndim}-D tensors, but got 1-D for tensor number {i} in the list"
+                )
+        else:
+            if t.ndim == 1 and t.shape[0] == 0:
+                continue
+            filtered.append(t)
+    if len(filtered) == 0:
+        t = tensors[0]
+        return prims.empty_strided(
+            [0], [1], dtype=t.dtype, device=t.device, requires_grad=False
+        )
+    dim = canonicalize_dim(filtered[0].ndim, dim)
+    return prims.clone(prims.cat(filtered, dim), memory_format=tp.contiguous_format)
+
+
+@register_decomposition([ops.meshgrid.default, ops.meshgrid.indexing])
+def meshgrid(tensors, indexing="ij"):
+    if len(tensors) == 0:
+        raise RuntimeError("meshgrid expects a non-empty TensorList")
+    for i in range(len(tensors) - 1):
+        if tensors[i].dtype != tensors[i + 1].dtype:
+            raise RuntimeError("meshgrid expects all tensors to have the same dtype")
+        if tensors[i].device != tensors[i + 1].device:
+            raise RuntimeError("meshgrid expects all tensors to have the same device")
+    swap_first_two = False
+    if indexing == "xy":
+        swap_first_two = len(tensors) >= 2
+        if swap_first_two:
+            tensors = (tensors[1], tensors[0], *tensors[2:])
+    elif indexing != "ij":
+        raise RuntimeError(
+            f'meshgrid: indexing must be one of "xy" or "ij", but received: {indexing}'
+        )
+    for t in tensors:
+        if t.ndim > 1:
+            raise RuntimeError(f"meshgrid: Expected 0D or 1D tensor in the tensor list but got: {t}")
+    result_shape = [t.numel() for t in tensors]
+    grids = []
+    for i, t in enumerate(tensors):
+        if t.ndim == 0:
+            t = unsqueeze(t, 0)
+        grids.append(prims.broadcast_in_dim(t, result_shape, (i,)))
+    if swap_first_two:
+        grids[0], grids[1] = grids[1], grids[0]
+    return grids
+
+
+@register_decomposition(ops.constant_pad_nd.default)
+def constant_pad_nd(self, pad, value=0):
+    if len(pad) % 2 != 0:
+        raise RuntimeError(f"Length of pad must be even but instead it equals {len(pad)}")
+    input_sizes = list(self.shape)
+    l_inp = len(input_sizes)
+    l_pad = len(pad) // 2
+    l_diff = l_inp - l_pad
+    if l_inp < l_pad:
+        raise RuntimeError(
+            "Length of pad should be no more than twice the number of "
+            f"dimensions of the input. Pad length is {len(pad)} while the input has "
+            f"{l_inp} dimensions."
+        )
+    c_input = self
+    for i in range(l_diff, l_inp):
+        pad_idx = 2 * (l_inp - i - 1)
+        if pad[pad_idx] < 0:
+            c_input = ops.narrow.default(
+                c_input, i, -pad[pad_idx], c_input.shape[i] + pad[pad_idx]
+            )
+        if pad[pad_idx + 1] < 0:
+            c_input = ops.narrow.default(
+                c_input, i, 0, c_input.shape[i] + pad[pad_idx + 1]
+            )
+    if all(p < 0 for p in pad):
+        return prims.clone(c_input)
+    if value == 0 and self.dtype == tp.bool:
+        value = False
+    for i in range(l_diff, l_inp):
+        pad_idx = 2 * (l_inp - i - 1)
+        left = max(pad[pad_idx], 0)
+        right = max(pad[pad_idx + 1], 0)
+        if left == 0 and right == 0:
+            continue
+        parts = []
+        if left > 0:
+            left_shape = list(c_input.shape)
+            left_shape[i] = left
+            parts.append(tp.full(left_shape, value, dtype=self.dtype, device=self.device))
+        parts.append(c_input)
+        if right > 0:
+            right_shape = list(c_input.shape)
+            right_shape[i] = right
+            parts.append(tp.full(right_shape, value, dtype=self.dtype, device=self.device))
+        c_input = ops.cat.default(parts, i)
+    return prims.clone(c_input, memory_format=tp.contiguous_format)
+
+
+@register_decomposition(ops.repeat.default)
+def repeat(a, repeats):
+    if len(repeats) < len(a.shape):
+        raise RuntimeError(
+            "Number of dimensions of repeat dims can not be smaller than "
+            "number of dimensions of tensor"
+        )
+    if len(repeats) == 0:
+        return prims.clone(a)
+    num_new_dimensions = len(repeats) - a.ndim
+    padded_shape = [1] * num_new_dimensions + list(a.shape)
+    target_shape = [
+        padded_size * repeat_size
+        for padded_size, repeat_size in zip(padded_shape, repeats)
+    ]
+    if 0 in repeats:
+        return prims.empty_strided(
+            target_shape,
+            make_contiguous_strides_for(target_shape),
+            dtype=a.dtype,
+            device=a.device,
+            requires_grad=False,
+        )
+    # The tiled buffer is first described as an interleaved layout (one axis
+    # per tile count and one per incoming length, the length axes appended
+    # in order), then read in stride order and re-strided to the target.
+    urtensor_shape = list(target_shape)
+    urtensor_stride = make_contiguous_strides_for(target_shape)
+    for dim, dim_size in enumerate(padded_shape):
+        urtensor_shape, urtensor_stride = _get_unfold_shape_stride(
+            urtensor_shape, urtensor_stride, dim, dim_size, max(dim_size, 1)
+        )
+    enumerated_stride = sorted(
+        enumerate(urtensor_stride), key=operator.itemgetter(1), reverse=True
+    )
+    permute_order = [i for i, _ in enumerated_stride]
+    repeat_xtensor = expand(a, urtensor_shape)
+    cloned_result = prims.clone(repeat_xtensor, memory_format=tp.contiguous_format)
+    permuted_result = permute(cloned_result, permute_order)
+    if not is_contiguous_or_false(permuted_result):
+        permuted_result = prims.clone(
+            permuted_result, memory_format=tp.contiguous_format
+        )
+    return _view_strided(
+        permuted_result,
+        target_shape,
+        make_contiguous_strides_for(target_shape),
+        permuted_result.storage_offset(),
+    )
+
+
+def _trilu_checks(name, row, col, dtype):
+    if row < 0:
+        raise RuntimeError(f"row must be non-negative, got {row}")
+    if col < 0:
+        raise RuntimeError(f"col must be non-negative, got {col}")
+    if dtype not in (tp.int32, tp.int64):
+        raise RuntimeError(f'"{name}" not implemented for {dtype}')
+
+
+def _get_tril_sizes(row, col, offset):
+    if row == 0 or col == 0:
+        return 0, 0, 0
+    m_first_row = min(col, 1 + offset) if offset > 0 else int(row + offset > 0)
+    m_last_row = max(0, min(col, row + offset))
+    n_row_all = max(0, min(row, row + offset))
+    n_row_trapezoid = m_last_row - m_first_row + 1
+    # Elements in the top trapezoid: rows of lengths m_first_row..m_last_row.
+    trapezoid_size = (m_first_row + m_last_row) * n_row_trapezoid // 2
+    diff_row = n_row_all - n_row_trapezoid
+    rectangle_size = max(0, diff_row * col)
+    return trapezoid_size, rectangle_size, m_first_row
+
+
+def _get_triu_sizes(row, col, offset):
+    if row == 0 or col == 0:
+        return 0, 0, 0
+    m_first_row = max(0, col - offset) if offset > 0 else col
+    rectangle_size = max(0, min(row, -offset) * col)
+    trapezoid_size_tril, rectangle_size_tril, _ = _get_tril_sizes(row, col, offset - 1)
+    triu_size = row * col - (trapezoid_size_tril + rectangle_size_tril)
+    trapezoid_size = triu_size - rectangle_size
+    return trapezoid_size, rectangle_size, m_first_row
+
+
+@register_decomposition(ops.tril_indices.default)
+def tril_indices(row, col, offset=0, *, dtype=tp.int64, device=None, pin_memory=False):
+    _trilu_checks("tril_indices", row, col, dtype)
+    trapezoid_size, rectangle_size, m_first_row = _get_tril_sizes(row, col, offset)
+    row_offset = max(0, -offset)
+
+    # Linear positions of the top trapezoid invert back to (row, column):
+    # the cumulative count up to row r is r*(2*m_first_row + r - 1)/2, so the
+    # row is the floor of the positive root of r^2 + (2*m_first_row - 1)*r - 2x = 0.
+    xs1 = ops.arange.start_step(0, trapezoid_size, 1, dtype=tp.float64, device=device)
+    b = m_first_row - 0.5
+    row_inds1 = tp.floor(-b + tp.sqrt(b * b + 2 * xs1))
+    col_inds1 = tp.floor(xs1 - (2 * m_first_row - 1 + row_inds1) * row_inds1 * 0.5)
+    row_inds1 = prims.convert_element_type(row_inds1 + row_offset, dtype)
+    col_inds1 = prims.convert_element_type(col_inds1, dtype)
+
+    # The bottom rectangle is a full row of columns per position, starting
+    # one row below where the trapezoid's widest row ended.
+    xs2 = ops.arange.start_step(0, rectangle_size, 1, dtype=dtype, device=device)
+    row_inds2 = xs2 // col + (col - m_first_row + 1 + row_offset)
+    col_inds2 = xs2 % col
+
+    return ops.stack.default(
+        (ops.cat.default((row_inds1, row_inds2)), ops.cat.default((col_inds1, col_inds2)))
+    )
+
+
+@register_decomposition(ops.triu_indices.default)
+def triu_indices(row, col, offset=0, *, dtype=tp.int64, device=None, pin_memory=False):
+    _trilu_checks("triu_indices", row, col, dtype)
+    trapezoid_size, rectangle_size, m_first_row = _get_triu_sizes(row, col, offset)
+    col_offset = max(0, offset)
+
+    # The top rectangle is a full row of columns per position.
+    xs2 = ops.arange.start_step(0, rectangle_size, 1, dtype=dtype, device=device)
+    row_inds2 = xs2 // col
+    col_inds2 = xs2 % col
+
+    # Bottom trapezoid: rows of lengths m_first_row downward; the row solves
+    # r^2 - (2*m_first_row - 1)*r + 2x = 0 counted from the rectangle's end.
+    xs1 = ops.arange.start_step(0, trapezoid_size, 1, dtype=tp.float64, device=device)
+    b = -0.5 - m_first_row
+    row_inds1 = tp.floor(-b - tp.sqrt(b * b - 2 * xs1))
+    col_inds1 = tp.floor(xs1 - ((2 * m_first_row - 1 - row_inds1) * row_inds1) * 0.5)
+    row_inds1 = prims.convert_element_type(row_inds1, dtype)
+    col_inds1 = prims.convert_element_type(col_inds1, dtype)
+
+    if col:
+        row_inds1 = row_inds1 + (rectangle_size // col)
+    col_inds1 = col_inds1 + col_offset
+
+    return ops.stack.default(
+        (ops.cat.default((row_inds2, row_inds1)), ops.cat.default((col_inds2, col_inds1)))
+    )
+
+
+@register_decomposition(ops.empty_strided.default)
+def empty_strided(size, stride, *, dtype=None, device=None, pin_memory=False):
+    return prims.empty_strided(
+        list(size),
+        list(stride),
+        dtype=dtype if dtype is not None else tp.get_default_dtype(),
+        device=device if device is not None else tp.get_default_device(),
+        requires_grad=False,
+    )
+
+
+@register_decomposition(ops.pad_sequence.default)
+def pad_sequence(sequences, batch_first=False, padding_value=0.0, padding_side="right"):
+    if len(sequences) == 0:
+        raise RuntimeError("received an empty list of sequences")
+    if padding_side not in ("left", "right"):
+        raise RuntimeError(
+            f"Expected padding_side to be one of left or right, but got {padding_side}."
+        )
+    sequences_size = len(sequences)
+    max_size = sequences[0].shape
+    trailing_dims = tuple(max_size[1:])
+    max_len = reduce(tp.sym_max, (x.shape[0] for x in sequences))
+    out_dims = (
+        (sequences_size, max_len) if batch_first else (max_len, sequences_size)
+    ) + trailing_dims
+    out = ops.new_full.default(sequences[0], list(out_dims), padding_value)
+    dim_paddings = (0, 0) * len(trailing_dims)
+    for i in range(sequences_size):
+        currseq = prims.convert_element_type(sequences[i], out.dtype)
+        pad_amount = max_len - currseq.shape[0]
+        if padding_side == "right":
+            row = ops.constant_pad_nd.default(
+                currseq, dim_paddings + (0, pad_amount), padding_value
+            )
+        else:
+            row = ops.constant_pad_nd.default(
+                currseq, dim_paddings + (pad_amount, 0), padding_value
+            )
+        out = ops.select_scatter.default(out, row, 0 if batch_first else 1, i)
+    return out
+
+
+@register_decomposition(ops.permute_copy.default)
+def permute_copy(self, dims):
+    return prims.clone(permute(self, dims), memory_format=tp.contiguous_format)
+
+
+@register_decomposition(ops.narrow_copy.default)
+def narrow_copy(self, dim, start, length):
+    return prims.clone(
+        ops.narrow.default(self, dim, start, length),
+        memory_format=tp.contiguous_format,
+    )
+
+
+@register_decomposition(ops.view_copy.default)
+def view_copy(self, size):
+    return prims.clone(view(self, list(size)), memory_format=tp.contiguous_format)

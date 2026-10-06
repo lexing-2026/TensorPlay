@@ -589,7 +589,10 @@ def infer_size(shape: ShapeType, numel: int) -> tuple[int, ...]:
         )
         shape = list(shape)
         shape[dim] = numel // newsize
-        check(shape[dim] >= 0)
+        check(
+            shape[dim] >= 0,
+            lambda: f"shape '{list(shape)}' is invalid for input of size {numel}",
+        )
     return tuple(shape)
 
 
