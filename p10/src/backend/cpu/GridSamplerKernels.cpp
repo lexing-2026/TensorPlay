@@ -538,10 +538,8 @@ Tensor grid_sampler_2d_cpu(const Tensor& input, const Tensor& grid,
         TP_THROW(RuntimeError, "grid_sampler_2d: bicubic requires non-empty input spatial dims");
     // Channels-last frame: the channel axis is contiguous and carries the
     // vector blocks, so the tier-compiled kernel (cpu/GridSamplerKernels.h)
-    // loads whole channel neighbourhoods per output pixel and tap. Bicubic
-    // keeps the scalar frame.
-    if (interpolation_mode != Interp::Bicubic &&
-        input.numel() > 0 && grid.numel() > 0 &&
+    // loads whole channel neighbourhoods per output pixel and tap.
+    if (input.numel() > 0 && grid.numel() > 0 &&
         grid.size(1) > 0 && grid.size(2) > 0 &&
         input.is_contiguous(MemoryFormat::ChannelsLast) && grid.is_contiguous() &&
         input.dtype() == grid.dtype() &&
@@ -579,6 +577,47 @@ std::tuple<Tensor, Tensor> grid_sampler_2d_backward_cpu(
         const std::vector<bool>& output_mask) {
     if (input.dim() != 4 || grid.dim() != 4)
         TP_THROW(RuntimeError, "grid_sampler_2d_backward: expected 4D input and grid");
+    // Channels-last frame: the channel axis carries the vector blocks on both
+    // sides (grad_output and input read per output/input pixel, grad_input
+    // scattered the same way). grad_grid's per-channel sum stays sequential,
+    // so the frames stay bit-identical.
+    const bool need_gi = output_mask.size() > 0 && output_mask[0];
+    const bool need_gg = output_mask.size() > 1 && output_mask[1];
+    if (grad_output.numel() > 0 && grid.numel() > 0 &&
+        grid.size(1) > 0 && grid.size(2) > 0 &&
+        input.is_contiguous(MemoryFormat::ChannelsLast) &&
+        grad_output.dim() == 4 &&
+        grad_output.size(0) == input.size(0) && grad_output.size(1) == input.size(1) &&
+        grad_output.size(2) == grid.size(1) && grad_output.size(3) == grid.size(2) &&
+        grid.is_contiguous() &&
+        input.dtype() == grid.dtype() && grad_output.dtype() == grid.dtype() &&
+        (input.dtype() == DType::Float32 || input.dtype() == DType::Float64)) {
+        const int64_t N = input.size(0), C = input.size(1);
+        const int64_t H = input.size(2), W = input.size(3);
+        const int64_t oH = grid.size(1), oW = grid.size(2);
+        Tensor grad_input = need_gi
+            ? Tensor::zeros({N, C, H, W}, input.dtype(), input.device())
+            : Tensor::empty({N, C, H, W}, input.dtype(), input.device());
+        if (need_gi)
+            grad_input = grad_input.as_strided(
+                {N, C, H, W}, get_channels_last_strides({N, C, H, W}), 0);
+        Tensor grad_grid = need_gg
+            ? Tensor::empty({N, oH, oW, 2}, grid.dtype(), grid.device())
+            : Tensor::zeros({N, oH, oW, 2}, grid.dtype(), grid.device());
+        const Tensor go_cl = grad_output.contiguous(
+            static_cast<int64_t>(MemoryFormat::ChannelsLast));
+        grid_sample2d_backward_cl_stub(DeviceType::CPU,
+                                       go_cl.data_ptr(), input.data_ptr(), grid.data_ptr(),
+                                       need_gi ? grad_input.data_ptr() : nullptr,
+                                       grad_grid.data_ptr(),
+                                       N, C, H, W, oH, oW,
+                                       static_cast<int>(interpolation_mode),
+                                       static_cast<int>(padding_mode),
+                                       align_corners ? 1 : 0,
+                                       static_cast<int>(input.dtype()),
+                                       need_gi ? 1 : 0, need_gg ? 1 : 0);
+        return {grad_input, grad_grid};
+    }
     const Tensor goc = grad_output.contiguous();
     const Tensor ic = input.contiguous();
     const Tensor gc = grid.contiguous();
@@ -638,6 +677,7 @@ std::tuple<Tensor, Tensor> grid_sampler_3d_backward_cpu(
 }
 
 DEFINE_DISPATCH(grid_sample2d_cl_stub);
+DEFINE_DISPATCH(grid_sample2d_backward_cl_stub);
 
 TENSORPLAY_LIBRARY_IMPL(CPU, GridSamplerKernels) {
     m.impl("grid_sampler_2d", grid_sampler_2d_cpu);
