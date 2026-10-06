@@ -645,23 +645,40 @@ Tensor avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
     if (divisor_override.has_value() && *divisor_override == 0)
         TP_THROW(RuntimeError, "divisor must be not zero");
     if (grad_output.dim() != 4 || input.dim() != 4) TP_THROW(RuntimeError, "avg_pool2d_backward: Expected 4D input and grad_output");
-    const Tensor input_c = input.contiguous();
-    const Tensor grad_output_c = grad_output.contiguous();
 
-    int64_t N = input_c.size(0);
-    int64_t C = input_c.size(1);
-    int64_t H_in = input_c.size(2);
-    int64_t W_in = input_c.size(3);
-    
+    int64_t N = input.size(0);
+    int64_t C = input.size(1);
+    int64_t H_in = input.size(2);
+    int64_t W_in = input.size(3);
     int64_t H_out = grad_output.size(2);
     int64_t W_out = grad_output.size(3);
-
     int64_t kH, kW;
     std::tie(kH, kW) = get_pair(kernel_size);
     int64_t sH, sW;
     std::tie(sH, sW) = get_pair_from_kernel(stride, kernel_size);
     int64_t pH, pW;
     std::tie(pH, pW) = get_pair(padding, 0);
+
+    if (input.is_contiguous(MemoryFormat::ChannelsLast) &&
+        grad_output.is_contiguous(MemoryFormat::ChannelsLast) &&
+        input.dtype() == grad_output.dtype() &&
+        (input.dtype() == DType::Float32 || input.dtype() == DType::Float64)) {
+        const std::vector<int64_t> sizes = input.shape();
+        Tensor grad_input = C >= 128 && N * H_in * W_in > 0
+            ? Tensor::empty(sizes, input.dtype(), input.device())
+            : Tensor::zeros(sizes, input.dtype(), input.device());
+        grad_input = grad_input.as_strided(sizes, get_channels_last_strides(sizes), 0);
+        avg_pool2d_backward_cl_stub(
+            DeviceType::CPU, grad_output.data_ptr(), grad_input.data_ptr(),
+            N, C, H_in, W_in, H_out, W_out, kH, kW, sH, sW, pH, pW,
+            count_include_pad,
+            divisor_override.has_value() ? *divisor_override : 0,
+            static_cast<int>(input.dtype()));
+        return grad_input;
+    }
+
+    const Tensor input_c = input.contiguous();
+    const Tensor grad_output_c = grad_output.contiguous();
 
     Tensor grad_input = Tensor::zeros(static_cast<std::vector<int64_t>>(input.shape()), input.dtype(), input.device());
 
@@ -1919,6 +1936,7 @@ Tensor adaptive_max_pool3d_backward_cpu(const Tensor& grad_output, const Tensor&
 }
 
 DEFINE_DISPATCH(avg_pool2d_cl_stub);
+DEFINE_DISPATCH(avg_pool2d_backward_cl_stub);
 DEFINE_DISPATCH(avg_pool3d_cl_stub);
 DEFINE_DISPATCH(avg_pool3d_backward_cl_stub);
 DEFINE_DISPATCH(max_pool2d_cl_stub);

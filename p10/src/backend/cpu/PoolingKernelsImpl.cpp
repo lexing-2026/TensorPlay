@@ -241,6 +241,179 @@ void avg_pool3d_backward_cl_typed(const T* gout, T* gin,
     });
 }
 
+template <typename T>
+void avg_pool2d_backward_cl_typed(const T* gout, T* gin,
+                                  int64_t N, int64_t C,
+                                  int64_t H, int64_t W,
+                                  int64_t oH, int64_t oW,
+                                  int64_t kH, int64_t kW,
+                                  int64_t sH, int64_t sW,
+                                  int64_t pH, int64_t pW,
+                                  bool count_include_pad,
+                                  int64_t divisor_override) {
+    using Vec = tensorplay::vec::Vectorized<T>;
+    constexpr int64_t V = Vec::size();
+    const int64_t len = C - (C % V);
+    if (C < 128) {
+        parallel_for(0, N, 1, [&](int64_t begin, int64_t end) {
+            auto delta_arr = std::make_unique<T[]>(C > 0 ? C : 1);
+            T* delta = delta_arr.get();
+            for (int64_t n = begin; n < end; ++n) {
+                T* gin_n = gin + n * H * W * C;
+                const T* gout_n = gout + n * oH * oW * C;
+                for (int64_t oh = 0; oh < oH; ++oh) {
+                    const int64_t h0 = oh * sH - pH;
+                    const int64_t h1 = std::min(h0 + kH, H + pH);
+                    const int64_t h_start = std::max(h0, int64_t(0));
+                    const int64_t h_end = std::min(h1, H);
+                    for (int64_t ow = 0; ow < oW; ++ow) {
+                        const int64_t w0 = ow * sW - pW;
+                        const int64_t w1 = std::min(w0 + kW, W + pW);
+                        const int64_t w_start = std::max(w0, int64_t(0));
+                        const int64_t w_end = std::min(w1, W);
+                        if (h_start >= h_end || w_start >= w_end) continue;
+                        const int64_t pool_size = (h1 - h0) * (w1 - w0);
+                        const int64_t count = (h_end - h_start) * (w_end - w_start);
+                        const int64_t divisor = divisor_override != 0
+                            ? divisor_override
+                            : (count_include_pad ? pool_size : count);
+                        const T* gout_lane = gout_n + (oh * oW + ow) * C;
+                        const Vec divisor_vec(static_cast<T>(divisor));
+                        int64_t c = 0;
+                        for (; c < len; c += V) {
+                            (Vec::loadu(gout_lane + c) / divisor_vec)
+                                .store(delta + c);
+                        }
+                        for (; c < C; ++c) {
+                            delta[c] = gout_lane[c] / static_cast<T>(divisor);
+                        }
+                        for (int64_t ih = h_start; ih < h_end; ++ih) {
+                            T* gin_lane = gin_n + (ih * W + w_start) * C;
+                            for (int64_t iw = w_start; iw < w_end; ++iw) {
+                                c = 0;
+                                for (; c < len; c += V) {
+                                    (Vec::loadu(gin_lane + c) +
+                                     Vec::loadu(delta + c)).store(gin_lane + c);
+                                }
+                                for (; c < C; ++c) gin_lane[c] += delta[c];
+                                gin_lane += C;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        return;
+    }
+    auto floor_div = [](int64_t value, int64_t divisor) {
+        int64_t result = value / divisor;
+        if (value < 0 && value % divisor != 0) --result;
+        return result;
+    };
+    std::unique_ptr<int64_t[]> h_begin(new int64_t[H > 0 ? H : 1]);
+    std::unique_ptr<int64_t[]> h_end(new int64_t[H > 0 ? H : 1]);
+    std::unique_ptr<int64_t[]> w_begin(new int64_t[W > 0 ? W : 1]);
+    std::unique_ptr<int64_t[]> w_end(new int64_t[W > 0 ? W : 1]);
+    for (int64_t ih = 0; ih < H; ++ih) {
+        h_begin[ih] = std::max(int64_t(0),
+                               floor_div(ih + pH - kH, sH) + 1);
+        h_end[ih] = std::min(oH, floor_div(ih + pH, sH) + 1);
+    }
+    for (int64_t iw = 0; iw < W; ++iw) {
+        w_begin[iw] = std::max(int64_t(0),
+                               floor_div(iw + pW - kW, sW) + 1);
+        w_end[iw] = std::min(oW, floor_div(iw + pW, sW) + 1);
+    }
+
+    std::unique_ptr<int64_t[]> divisors(
+        new int64_t[oH * oW > 0 ? oH * oW : 1]);
+    for (int64_t oh = 0; oh < oH; ++oh) {
+        const int64_t h0 = oh * sH - pH;
+        const int64_t h1 = std::min(h0 + kH, H + pH);
+        const int64_t h_start = std::max(h0, int64_t(0));
+        const int64_t h_stop = std::min(h1, H);
+        for (int64_t ow = 0; ow < oW; ++ow) {
+            const int64_t w0 = ow * sW - pW;
+            const int64_t w1 = std::min(w0 + kW, W + pW);
+            const int64_t w_start = std::max(w0, int64_t(0));
+            const int64_t w_stop = std::min(w1, W);
+            const int64_t pool_size = (h1 - h0) * (w1 - w0);
+            const int64_t count = (h_stop - h_start) * (w_stop - w_start);
+            divisors[oh * oW + ow] = divisor_override != 0
+                ? divisor_override
+                : (count_include_pad ? pool_size : count);
+        }
+    }
+
+    const bool reuse_divisions = kH > 1 || kW > 1;
+    std::unique_ptr<T[]> scaled;
+    if (reuse_divisions) {
+        const int64_t scaled_items = N * oH * oW;
+        scaled = std::make_unique<T[]>(
+            scaled_items * C > 0 ? scaled_items * C : 1);
+        parallel_for(0, scaled_items, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t item = begin; item < end; ++item) {
+                const int64_t ow = item % oW;
+                const int64_t oh = (item / oW) % oH;
+                const int64_t divisor = divisors[oh * oW + ow];
+                const Vec divisor_vec(static_cast<T>(divisor));
+                const T* gout_lane = gout + item * C;
+                T* scaled_lane = scaled.get() + item * C;
+                int64_t c = 0;
+                for (; c < len; c += V) {
+                    (Vec::loadu(gout_lane + c) / divisor_vec)
+                        .store(scaled_lane + c);
+                }
+                for (; c < C; ++c) {
+                    scaled_lane[c] = gout_lane[c] / static_cast<T>(divisor);
+                }
+            }
+        });
+    }
+
+    parallel_for(0, N * H * W, 1, [&](int64_t begin, int64_t end) {
+        auto accum_arr = std::make_unique<T[]>(C);
+        T* accum = accum_arr.get();
+        for (int64_t item = begin; item < end; ++item) {
+            const int64_t iw = item % W;
+            const int64_t ih = (item / W) % H;
+            const int64_t n = item / (H * W);
+            const T* gout_n = gout + n * oH * oW * C;
+            int64_t c = 0;
+            for (; c < len; c += V) Vec(T(0)).store(accum + c);
+            for (; c < C; ++c) accum[c] = T(0);
+
+            for (int64_t oh = h_begin[ih]; oh < h_end[ih]; ++oh) {
+                for (int64_t ow = w_begin[iw]; ow < w_end[iw]; ++ow) {
+                    const int64_t output_item = n * oH * oW + oh * oW + ow;
+                    const T* add_lane = reuse_divisions
+                        ? scaled.get() + output_item * C
+                        : gout_n + (oh * oW + ow) * C;
+                    const int64_t divisor = divisors[oh * oW + ow];
+                    const Vec divisor_vec(static_cast<T>(divisor));
+                    c = 0;
+                    for (; c < len; c += V) {
+                        const Vec update = reuse_divisions
+                            ? Vec::loadu(add_lane + c)
+                            : Vec::loadu(add_lane + c) / divisor_vec;
+                        (Vec::loadu(accum + c) + update)
+                            .store(accum + c);
+                    }
+                    for (; c < C; ++c) {
+                        accum[c] += reuse_divisions
+                            ? add_lane[c]
+                            : add_lane[c] / static_cast<T>(divisor);
+                    }
+                }
+            }
+            T* gin_lane = gin + item * C;
+            c = 0;
+            for (; c < len; c += V) Vec::loadu(accum + c).store(gin_lane + c);
+            for (; c < C; ++c) gin_lane[c] = accum[c];
+        }
+    });
+}
+
 // Max-reduction update for one window position.  A NaN takes the maximum
 // (carrying its own bit pattern, so the last NaN in scan order wins), the
 // same contract the scalar max-pool frames follow.  `mask` carries all-bits
@@ -1311,6 +1484,35 @@ void avg_pool3d_backward_cl_impl(const void* gout, void* gin,
     }
 }
 
+void avg_pool2d_backward_cl_impl(const void* gout, void* gin,
+                                 int64_t N, int64_t C,
+                                 int64_t H, int64_t W,
+                                 int64_t oH, int64_t oW,
+                                 int64_t kH, int64_t kW,
+                                 int64_t sH, int64_t sW,
+                                 int64_t pH, int64_t pW,
+                                 bool count_include_pad,
+                                 int64_t divisor_override, int dtype) {
+    switch (static_cast<DType>(dtype)) {
+        case DType::Float32:
+            avg_pool2d_backward_cl_typed<float>(
+                static_cast<const float*>(gout), static_cast<float*>(gin),
+                N, C, H, W, oH, oW, kH, kW, sH, sW, pH, pW,
+                count_include_pad, divisor_override);
+            break;
+        case DType::Float64:
+            avg_pool2d_backward_cl_typed<double>(
+                static_cast<const double*>(gout), static_cast<double*>(gin),
+                N, C, H, W, oH, oW, kH, kW, sH, sW, pH, pW,
+                count_include_pad, divisor_override);
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "avg_pool2d_backward: channels-last kernel supports "
+                     "only float and double");
+    }
+}
+
 void max_pool2d_cl_impl(const void* in, void* out, int64_t* ind,
                         int64_t N, int64_t C, int64_t H, int64_t W,
                         int64_t oH, int64_t oW,
@@ -1547,6 +1749,7 @@ void adaptive_max_pool2d_cl_impl(const void* in, void* out, int64_t* ind,
 // REGISTER_DISPATCH, which would otherwise null its slot (opt-in design).
 #ifndef CPU_CAPABILITY_AVX512
 REGISTER_DISPATCH(avg_pool2d_cl_stub, &avg_pool2d_cl_impl);
+REGISTER_DISPATCH(avg_pool2d_backward_cl_stub, &avg_pool2d_backward_cl_impl);
 REGISTER_DISPATCH(avg_pool3d_cl_stub, &avg_pool3d_cl_impl);
 REGISTER_DISPATCH(avg_pool3d_backward_cl_stub, &avg_pool3d_backward_cl_impl);
 REGISTER_DISPATCH(max_pool2d_cl_stub, &max_pool2d_cl_impl);
@@ -1567,6 +1770,8 @@ REGISTER_DISPATCH(adaptive_max_pool3d_backward_cl_stub,
                   &adaptive_max_pool3d_backward_cl_impl);
 #else
 ALSO_REGISTER_AVX512_DISPATCH(avg_pool2d_cl_stub, &avg_pool2d_cl_impl);
+ALSO_REGISTER_AVX512_DISPATCH(avg_pool2d_backward_cl_stub,
+                              &avg_pool2d_backward_cl_impl);
 ALSO_REGISTER_AVX512_DISPATCH(avg_pool3d_cl_stub, &avg_pool3d_cl_impl);
 ALSO_REGISTER_AVX512_DISPATCH(avg_pool3d_backward_cl_stub,
                               &avg_pool3d_backward_cl_impl);
