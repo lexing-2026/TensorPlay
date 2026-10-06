@@ -242,6 +242,7 @@ inline void* conv_alpha_ptr(DType dtype, float& alpha, double& alpha_d) {
 Tensor conv3d_cuda(const Tensor& input, const Tensor& weight, const Tensor& bias,
                    const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg,
                    const std::vector<int64_t>& dilation_arg, int64_t groups) {
+    convolution::check_conv_shapes(input, weight, bias, groups, false);
     convolution::check_conv_geometry(input, weight, stride_arg, padding_arg,
                                      dilation_arg, "conv3d");
 #ifdef USE_CUDNN

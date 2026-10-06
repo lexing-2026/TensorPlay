@@ -1,4 +1,5 @@
 #include "Tensor.h"
+#include "Convolution.h"
 #include "Dispatcher.h"
 #include "Context.h"
 #include "Exception.h"
@@ -291,6 +292,7 @@ Tensor conv_transpose2d_cuda(const Tensor& input, const Tensor& weight, const Te
                              const std::vector<int64_t>& padding_arg,
                              const std::vector<int64_t>& output_padding_arg, int64_t groups,
                              const std::vector<int64_t>& dilation_arg) {
+    convolution::check_conv_shapes(input, weight, bias, groups, true);
 #ifdef USE_CUDNN
     auto stride = expand_param_if_needed(stride_arg, 2, 1);
     auto padding = expand_param_if_needed(padding_arg, 2, 0);
@@ -393,6 +395,7 @@ Tensor conv_transpose3d_cuda(const Tensor& input, const Tensor& weight, const Te
                              const std::vector<int64_t>& padding_arg,
                              const std::vector<int64_t>& output_padding_arg, int64_t groups,
                              const std::vector<int64_t>& dilation_arg) {
+    convolution::check_conv_shapes(input, weight, bias, groups, true);
 #ifdef USE_CUDNN
     auto stride = expand_param_if_needed(stride_arg, 3, 1);
     auto padding = expand_param_if_needed(padding_arg, 3, 0);

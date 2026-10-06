@@ -3150,6 +3150,7 @@ static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg,
 Tensor conv2d_cpu(const Tensor& input, const Tensor& weight, const Tensor& bias,
                   const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                   const std::vector<int64_t>& dilation, int64_t groups) {
+    convolution::check_conv_shapes(input, weight, bias, groups, false);
     // Reduced-precision inputs run the engine natively when it can and fall
     // back to a full-precision round trip inside the impl otherwise; no
     // caller-side widening.
@@ -3160,6 +3161,7 @@ Tensor conv2d_relu_cpu(const Tensor& input, const Tensor& weight, const std::opt
                        const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                        const std::vector<int64_t>& dilation, int64_t groups) {
     const Tensor bias = bias_opt.has_value() ? *bias_opt : Tensor();
+    convolution::check_conv_shapes(input, weight, bias, groups, false);
     return conv2d_cpu_impl(input, weight, bias, stride, padding, dilation, groups, true);
 }
 
@@ -3170,6 +3172,7 @@ Tensor conv1d_cpu(const Tensor& input, const Tensor& weight, const Tensor& bias,
     
     if (input.dim() != 3) TP_THROW(RuntimeError, "conv1d: Expected 3D input (N, C, L)");
     if (weight.dim() != 3) TP_THROW(RuntimeError, "conv1d: Expected 3D weight");
+    convolution::check_conv_shapes(input, weight, bias, groups, false);
     
     Tensor in_2d = input.unsqueeze(2);
     Tensor w_2d = weight.unsqueeze(2);
@@ -3191,6 +3194,7 @@ Tensor conv3d_cpu(const Tensor& input_arg, const Tensor& weight_arg, const Tenso
     Tensor weight = weight_arg.contiguous();
 
     if (input.dim() != 5 || weight.dim() != 5) TP_THROW(RuntimeError, "conv3d: Expected 5D input and weight");
+    convolution::check_conv_shapes(input, weight, bias, groups, false);
 
     int64_t N = input.size(0);
     int64_t C_in = input.size(1);
@@ -3876,6 +3880,7 @@ Tensor conv_transpose2d_cpu(const Tensor& input_arg, const Tensor& weight_arg, c
     // adopts it when the deconvolution path claims the call; the kernels
     // below address activations as row-major and fall back to the canonical
     // layout instead.
+    convolution::check_conv_shapes(input_arg, weight_arg, bias, groups, true);
     const bool use_cl = conv2d_use_channels_last(input_arg, weight_arg);
     Tensor input = contiguous_in(input_arg, use_cl);
     const Tensor weight = weight_arg.contiguous();
@@ -4010,6 +4015,7 @@ Tensor conv_transpose2d_cpu(const Tensor& input_arg, const Tensor& weight_arg, c
 
 Tensor conv_transpose3d_cpu(const Tensor& input, const Tensor& weight, const Tensor& bias, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& output_padding_arg, int64_t groups, const std::vector<int64_t>& dilation_arg) {
     if (input.dim() != 5 || weight.dim() != 5) TP_THROW(RuntimeError, "conv_transpose3d: Expected 5D input and weight");
+    convolution::check_conv_shapes(input, weight, bias, groups, true);
 
     if (conv_is_low_precision(input.dtype())) {
         return conv_transpose3d_cpu(input.to(DType::Float32), weight.to(DType::Float32),
@@ -6522,6 +6528,7 @@ Tensor conv_transpose1d_cpu(const Tensor& input, const Tensor& weight, const Ten
                             const std::vector<int64_t>& dilation) {
     if (input.dim() != 3) TP_THROW(RuntimeError, "conv_transpose1d: Expected 3D input (N, C, L)");
     if (weight.dim() != 3) TP_THROW(RuntimeError, "conv_transpose1d: Expected 3D weight");
+    convolution::check_conv_shapes(input, weight, bias, groups, true);
 
     Tensor in_2d = input.unsqueeze(2);
     Tensor w_2d = weight.unsqueeze(2);

@@ -199,6 +199,7 @@ __global__ void conv2d_grad_bias_strided_kernel(
 
 
 static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const Tensor& bias, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups, bool fused_relu) {
+    convolution::check_conv_shapes(input, weight, bias, groups, false);
     convolution::check_conv_geometry(input, weight, stride_arg, padding_arg,
                                      dilation_arg, "conv2d");
 #if defined(USE_ROCM)

@@ -1,4 +1,5 @@
 #include "Tensor.h"
+#include "Convolution.h"
 #include "Dispatcher.h"
 #include "Exception.h"
 
@@ -54,6 +55,7 @@ Tensor conv1d_cuda(const Tensor& input, const Tensor& weight, const Tensor& bias
                    const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                    const std::vector<int64_t>& dilation, int64_t groups) {
     if (input.dim() != 3) TP_THROW(RuntimeError, "conv1d: Expected 3D input (N, C, L)");
+    convolution::check_conv_shapes(input, weight, bias, groups, false);
     Tensor in2 = input.unsqueeze(2);
     Tensor w2 = weight.unsqueeze(2);
     std::vector<int64_t> s2 = {1, stride.empty() ? 1 : stride[0]};
@@ -103,6 +105,7 @@ Tensor conv_transpose1d_cuda(const Tensor& input, const Tensor& weight, const Te
                              const std::vector<int64_t>& padding,
                              const std::vector<int64_t>& output_padding, int64_t groups,
                              const std::vector<int64_t>& dilation) {
+    convolution::check_conv_shapes(input, weight, bias, groups, true);
     Tensor in2 = input.unsqueeze(2);
     Tensor w2 = weight.unsqueeze(2);
     std::vector<int64_t> s2 = {1, stride.empty() ? 1 : stride[0]};

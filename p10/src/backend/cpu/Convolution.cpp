@@ -127,6 +127,64 @@ void check_conv_geometry(const Tensor& input, const Tensor& weight,
              "). Kernel size can't be greater than actual input size");
 }
 
+namespace {
+
+std::string sizes_text(const Tensor& t) {
+    std::string out = "[";
+    for (int64_t i = 0; i < t.dim(); ++i) {
+        if (i) out += ", ";
+        out += std::to_string(t.size(i));
+    }
+    return out + "]";
+}
+
+} // namespace
+
+void check_conv_shapes(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                       int64_t groups, bool transposed) {
+    if (groups <= 0) {
+        TP_THROW(RuntimeError, "non-positive groups is not supported");
+    }
+    const int64_t wd = weight.dim();
+    // An unbatched input carries its channels first.
+    const int64_t channel_dim = input.dim() == wd - 1 ? 0 : 1;
+    if (wd < 3 || input.dim() <= channel_dim) {
+        return;  // the rank checks of each kernel report these
+    }
+    const std::string w = sizes_text(weight);
+    const int64_t w0 = weight.size(0);
+    if (w0 < groups) {
+        TP_THROW(RuntimeError, "Given groups=" + std::to_string(groups) +
+                 ", expected weight to be at least " + std::to_string(groups) +
+                 " at dimension 0, but got weight of size " + w + " instead");
+    }
+    if (w0 % groups != 0) {
+        TP_THROW(RuntimeError, "Given groups=" + std::to_string(groups) +
+                 ", expected weight to be divisible by " + std::to_string(groups) +
+                 " at dimension 0, but got weight of size " + w + " instead");
+    }
+    const int64_t channels = input.size(channel_dim);
+    const int64_t expected_channels = transposed ? w0 : weight.size(1) * groups;
+    const int64_t out_channels = transposed ? weight.size(1) * groups : w0;
+    const std::string given = transposed ? std::string("Given transposed=1, weight of size ")
+                                         : "Given groups=" + std::to_string(groups) +
+                                               ", weight of size ";
+    if (channels != expected_channels) {
+        TP_THROW(RuntimeError, given + w + ", expected input" + sizes_text(input) +
+                 " to have " + std::to_string(expected_channels) + " channels, but got " +
+                 std::to_string(channels) + " channels instead");
+    }
+    // An empty bias stands for no bias in the kernels.
+    if (bias.defined() && bias.numel() > 0 &&
+        (bias.dim() != 1 || bias.size(0) != out_channels)) {
+        TP_THROW(RuntimeError, std::string(transposed ? "Given transposed=1, weight of size "
+                                                      : "Given weight of size ") +
+                 w + ", expected bias to be 1-dimensional with " +
+                 std::to_string(out_channels) + " elements, but got bias of size " +
+                 sizes_text(bias) + " instead");
+    }
+}
+
 } // namespace convolution
 
 namespace cpu {

@@ -202,5 +202,15 @@ P10_API void check_conv_geometry(const Tensor& input, const Tensor& weight,
                                  const std::vector<int64_t>& dilation,
                                  const char* name);
 
+// Agreement of the operands with `groups`, checked before a kernel indexes
+// anything: the weight's leading dimension must split into the groups, the
+// input must carry the channels the weight reads, and a bias must hold one
+// value per output channel.  `transposed` swaps the roles of the weight's
+// two channel dimensions; an input one dimension short of the weight is
+// unbatched, and an empty bias stands for none.  Raises RuntimeError naming
+// the mismatch.
+P10_API void check_conv_shapes(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                               int64_t groups, bool transposed);
+
 } // namespace convolution
 } // namespace tensorplay
