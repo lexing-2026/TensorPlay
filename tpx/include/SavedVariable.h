@@ -2,6 +2,7 @@
 
 #include "Macros.h"
 #include "Tensor.h"
+#include "ForwardGrad.h"
 
 #include <cstdint>
 #include <memory>
@@ -63,13 +64,20 @@ public:
         data_ = Tensor();
         packed_.reset();
         hooks_.reset();
+        fw_grad_.reset();
         saved_version_ = 0;
     }
 
     bool defined() const { return data_.defined() || hooks_ != nullptr; }
 
 private:
+    // `value` with the tangent a saved output had, when it had one.
+    Tensor with_fw_grad(const Tensor& value) const;
+
     Tensor data_;
+    // The tangent of a saved output, held where the level that owns it can
+    // clear it.
+    std::shared_ptr<ForwardGrad> fw_grad_;
     std::shared_ptr<void> packed_;
     std::shared_ptr<SavedVariableHooks> hooks_;
     uint32_t saved_version_ = 0;

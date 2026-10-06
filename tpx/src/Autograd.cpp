@@ -1,4 +1,5 @@
 #include "Autograd.h"
+#include "ForwardFallback.h"
 #include "TensorImpl.h"
 #include "AccumulateGrad.h"
 #include "Engine.h"
@@ -9,8 +10,11 @@
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include "tensorplay/ops/AutogradNodesGenerated.h"
 #ifdef USE_CUDA
+#include "CUDAGenerator.h"
 #include "CUDARuntime.h"
 #endif
+
+#include <set>
 
 namespace tensorplay {
 namespace tpx {
@@ -240,6 +244,180 @@ void set_fw_grad(const Tensor& t, const Tensor& new_grad, uint64_t level,
     auto* meta = get_or_create_autograd_meta(t);
     TP_CHECK(meta != nullptr, "cannot attach a forward gradient to this tensor");
     meta->set_fw_grad(new_grad, t, level, is_inplace_op);
+}
+
+std::vector<Tensor> fw_grads_from_backward(const char* op_name,
+                                           const std::vector<Tensor>& inputs,
+                                           const ForwardRerun& rerun) {
+    // Under the caller's grad mode, a primal that is part of the caller's
+    // graph stays in it, so the tangent is differentiable in it too; any
+    // other primal becomes a fresh leaf.  Only inputs with a tangent are
+    // differentiated; the rest run as they are.
+    const bool caller_records = GradMode::is_enabled();
+    std::vector<Tensor> args;
+    args.reserve(inputs.size());
+    std::vector<Tensor> diff_inputs, tangents;
+    bool needs_graph = false;
+    for (const Tensor& in : inputs) {
+        const Tensor tangent = in.defined() ? fw_grad(in, 0) : Tensor();
+        if (!tangent.defined() || !isFloatingOrComplexType(in.dtype())) {
+            args.push_back(in);
+            continue;
+        }
+        Tensor primal = to_non_opt_primal(in);
+        if (caller_records && primal.requires_grad()) {
+            needs_graph = true;
+        } else {
+            primal = primal.detach();
+            set_requires_grad(primal, true);
+        }
+        needs_graph = needs_graph || (caller_records && tangent.requires_grad());
+        diff_inputs.push_back(primal);
+        tangents.push_back(tangent);
+        args.push_back(std::move(primal));
+    }
+    TP_CHECK(!InferenceMode::is_enabled() || diff_inputs.empty(),
+             "Trying to use forward AD with ", op_name,
+             " in inference mode, which records no backward to take its tangent from.");
+
+    // The products are recorded whatever the caller's mode: forward AD
+    // answers under no_grad too.
+    struct ModeRestore {
+        bool previous;
+        ~ModeRestore() { GradMode::set_enabled(previous); }
+    } restore{caller_records};
+    GradMode::set_enabled(true);
+
+    const std::vector<Tensor> outs = rerun(args);
+    std::vector<Tensor> result(outs.size());
+    if (diff_inputs.empty()) return result;
+
+    std::vector<Tensor> roots, cotangents;
+    std::vector<size_t> where;
+    for (size_t i = 0; i < outs.size(); ++i) {
+        const Tensor& out = outs[i];
+        if (!out.defined() || !out.requires_grad()) continue;
+        Tensor u = ops::zeros_like(out);
+        set_requires_grad(u, true);
+        roots.push_back(out);
+        cotangents.push_back(std::move(u));
+        where.push_back(i);
+    }
+    if (roots.empty()) return result;
+
+    // vjp(u) = J^H u, recorded; its derivative in u along t is J t.
+    const std::vector<Tensor> vjp = tensorplay::tpx::grad(
+        roots, diff_inputs, cotangents,
+        /*retain_graph=*/true, /*create_graph=*/true, /*allow_unused=*/true);
+    std::vector<Tensor> products, product_tangents;
+    for (size_t k = 0; k < vjp.size(); ++k) {
+        if (vjp[k].defined() && vjp[k].requires_grad()) {
+            products.push_back(vjp[k]);
+            product_tangents.push_back(tangents[k]);
+        }
+    }
+    std::vector<Tensor> jt;
+    if (!products.empty()) {
+        jt = tensorplay::tpx::grad(products, cotangents, product_tangents,
+                                   /*retain_graph=*/needs_graph, /*create_graph=*/needs_graph,
+                                   /*allow_unused=*/true);
+    }
+    GradMode::set_enabled(caller_records);
+    // A backward that hands its gradient straight through (clone, a copy)
+    // returns the input tangent itself; the output gets its own, so an
+    // in-place update of one does not write the other.
+    auto shares_an_input_tangent = [&](const Tensor& r) {
+        for (const Tensor& t : tangents) {
+            if (r.unsafeGetTensorImpl()->storage().is_same(t.unsafeGetTensorImpl()->storage())) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (size_t j = 0; j < where.size(); ++j) {
+        const size_t i = where[j];
+        if (j < jt.size() && jt[j].defined()) {
+            result[i] = shares_an_input_tangent(jt[j]) ? jt[j].clone() : jt[j];
+        } else {
+            result[i] = ops::zeros_like(outs[i]);
+        }
+    }
+    return result;
+}
+
+RandomReplay::RandomReplay(const std::vector<Tensor>& inputs,
+                           const std::optional<Generator>& generator)
+    : generator_(generator) {
+    cpu_state_ = (generator_ ? *generator_ : default_generator()).get_state();
+#ifdef USE_CUDA
+    std::set<int> devices;
+    for (const Tensor& t : inputs) {
+        if (t.defined() && t.device().is_cuda()) {
+            devices.insert(t.device().index() >= 0 ? static_cast<int>(t.device().index())
+                                                   : tensorplay::cuda::currentDevice());
+        }
+    }
+    for (int device : devices) {
+        tensorplay::cuda::CUDAGuard guard(device);
+        cuda_states_.emplace_back(device, tensorplay::cuda::get_rng_state());
+    }
+#else
+    (void)inputs;
+#endif
+}
+
+std::vector<Tensor> RandomReplay::run(const std::function<std::vector<Tensor>()>& fn) const {
+    // Generators are handles: this one shares the stream it names.
+    Generator cpu = generator_ ? *generator_ : default_generator();
+    struct Streams {
+        Generator cpu;
+        Tensor cpu_state;
+        std::vector<std::pair<int, Tensor>> cuda_states;
+        ~Streams() {
+            cpu.set_state(cpu_state);
+#ifdef USE_CUDA
+            for (const auto& [device, state] : cuda_states) {
+                tensorplay::cuda::CUDAGuard guard(device);
+                tensorplay::cuda::set_rng_state(state);
+            }
+#endif
+        }
+    } now{cpu, cpu.get_state(), {}};
+#ifdef USE_CUDA
+    for (const auto& [device, state] : cuda_states_) {
+        tensorplay::cuda::CUDAGuard guard(device);
+        now.cuda_states.emplace_back(device, tensorplay::cuda::get_rng_state());
+        tensorplay::cuda::set_rng_state(state);
+    }
+#endif
+    cpu.set_state(cpu_state_);
+    return fn();
+}
+
+void set_output_fw_grad(const Tensor& out, const Tensor& tangent) {
+    if (!tangent.defined() || !out.defined() || !isFloatingOrComplexType(out.dtype())) return;
+    if (is_fw_grad_defined(out, 0)) return;
+    set_fw_grad(out, tangent.dtype() == out.dtype() ? tangent : tangent.to(out.dtype()),
+                /* level */ 0, /* is_inplace_op */ false);
+}
+
+void set_inplace_fw_grad(const Tensor& self, const Tensor& tangent) {
+    if (!tangent.defined() || !self.defined() || !isFloatingOrComplexType(self.dtype())) return;
+    const Tensor value = tangent.dtype() == self.dtype() ? tangent : tangent.to(self.dtype());
+    Tensor existing = fw_grad(self, 0);
+    if (existing.defined()) {
+        if (existing.unsafeGetTensorImpl() != value.unsafeGetTensorImpl()) {
+            ops::copy_(existing, value);
+        }
+        return;
+    }
+    set_fw_grad(self, value, /* level */ 0, /* is_inplace_op */ true);
+}
+
+void refuse_forward_ad(const char* op_name, bool out_variant) {
+    TP_THROW(NotImplementedError, "Trying to use forward AD with ", op_name,
+             " that does not support it because ",
+             out_variant ? "it is an out= function." : "it has not been implemented yet.");
 }
 
 Tensor to_non_opt_fw_grad(const Tensor& t) {

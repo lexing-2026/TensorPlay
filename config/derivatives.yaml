@@ -256,6 +256,7 @@
 
 - name: clone(Tensor self, *, MemoryFormat? memory_format=None) -> Tensor
   self: grad
+  result: auto_linear
 
 - name: contiguous(Tensor self, *, MemoryFormat memory_format=Contiguous) -> Tensor
   self: grad
@@ -419,7 +420,8 @@
   # already carries the conjugated Jacobian.  sgn, not sign: sgn differentiates
   # again (its own entry), which a complex input's curvature needs.
   self: grad * self.sgn()
-  result: auto_element_wise
+  # A real |z| keeps the real part of the complex product.
+  result: handle_r_to_c(result.dtype(), self_t.conj() * self_p.sgn())
 
 # Rounding ops are piecewise-constant: zero gradient, but the entry keeps the
 # graph connected so consumers (e.g. grid_sample nearest d/dgrid) still get a
@@ -1173,6 +1175,7 @@
 # Scalar upper=0.3333333333333333, bool training=False, bool inplace=False)
 - name: rrelu_with_noise(Tensor self, Tensor(b!) noise, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False, Generator? generator=None) -> Tensor
   self: rrelu_with_noise_backward(grad, self, noise, lower, upper, training, false)
+  result: auto_element_wise
 
 # In-place overloads share the functional node; ``self`` is the value
 # captured before the update, so the formula is the functional one.
@@ -1582,7 +1585,7 @@
 - name: polar(Tensor abs, Tensor angle) -> Tensor
   abs: real(grad.conj() * (result / result.abs()))
   angle: -imag(grad.conj() * result)
-  result: complex(abs_t * cos(angle) - angle_t * abs_p * sin(angle), abs_t * sin(angle) + angle_t * abs_p * cos(angle))
+  result: complex(abs_t * cos(angle_p) - angle_t * abs_p * sin(angle_p), abs_t * sin(angle_p) + angle_t * abs_p * cos(angle_p))
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
@@ -2262,6 +2265,50 @@
 - name: ne.Tensor(Tensor self, Tensor other) -> Tensor
   output_differentiability: [False]
 
+# Updating a tensor with a comparison's 0/1 values leaves it constant in
+# everything that went into it.
+- name: eq_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  self: zeros_like(grad)
+
+- name: eq_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  self: zeros_like(grad)
+  other: zeros_like(grad)
+
+- name: ge_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  self: zeros_like(grad)
+
+- name: ge_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  self: zeros_like(grad)
+  other: zeros_like(grad)
+
+- name: gt_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  self: zeros_like(grad)
+
+- name: gt_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  self: zeros_like(grad)
+  other: zeros_like(grad)
+
+- name: le_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  self: zeros_like(grad)
+
+- name: le_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  self: zeros_like(grad)
+  other: zeros_like(grad)
+
+- name: lt_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  self: zeros_like(grad)
+
+- name: lt_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  self: zeros_like(grad)
+  other: zeros_like(grad)
+
+- name: ne_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  self: zeros_like(grad)
+
+- name: ne_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  self: zeros_like(grad)
+  other: zeros_like(grad)
+
 # Logical and bitwise outputs carry no gradient but their autograd wrappers
 # must exist so dispatch under an active transform layer resolves.
 - name: logical_and(Tensor self, Tensor other) -> Tensor
@@ -2389,6 +2436,11 @@
 
 - name: hash_tensor(Tensor self, int[1] dim=[], *, bool keepdim=False, int mode=0) -> Tensor
   output_differentiability: [False]
+
+# The primal of a dual hands its gradient to the dual unchanged, so a tangent
+# computed from primals is differentiable in them.
+- name: _fw_primal(Tensor(a) self, int level) -> Tensor(a)
+  self: grad
 
 # Dual-tensor creation for forward-mode AD: the dual aliases the primal, so
 # the backward node forwards the gradient to the primal unchanged.  The

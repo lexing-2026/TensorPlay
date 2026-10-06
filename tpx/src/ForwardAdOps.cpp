@@ -86,15 +86,14 @@ TENSORPLAY_LIBRARY_IMPL(Composite, ForwardAdComposite) {
 // The composite fallthrough only covers backend keys, but dispatch can land
 // directly on the autograd keys (e.g. a vmap batch rule re-dispatching below
 // the transform on a payload whose keyset names AutogradCPU).  The same
-// storage-level kernels serve there: these ops carry no backward formulas,
-// so there is no autograd bookkeeping to add.
+// storage-level kernel serves there: _unpack_dual carries no backward
+// formula, so there is no autograd bookkeeping to add.  (_fw_primal has one;
+// its generated autograd kernel redispatches to the composite kernel.)
 TENSORPLAY_LIBRARY_IMPL(AutogradCPU, ForwardAdAutogradCPU) {
-    m.impl("_fw_primal", fw_primal_native);
     m.impl("_unpack_dual", unpack_dual_native);
 }
 
 TENSORPLAY_LIBRARY_IMPL(AutogradCUDA, ForwardAdAutogradCUDA) {
-    m.impl("_fw_primal", fw_primal_native);
     m.impl("_unpack_dual", unpack_dual_native);
 }
 
