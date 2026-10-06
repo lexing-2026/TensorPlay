@@ -78,6 +78,24 @@ def build_cases(dev, dtype):
     C.append(("softmax.backward",
               lambda tx=tx, ty=ty: F._softmax_backward_data(ty, tx, -1, None),
               lambda x=x, y=y: torch._softmax_backward_data(y, x, -1, dtype)))
+    # ---- spatial softmax（inner>1：NHWC 通道维做 softmax，dim=1）----
+    for shape in [(8, 64, 512, 512), (2, 512, 32, 32), (4, 1024, 64, 64)]:
+        x = r(*shape)
+        tx = T(x)
+        C.append((f"softmax.dim1.spatial{shape}", lambda tx=tx: F.softmax(tx, 1),
+                  lambda x=x: torch.softmax(x, 1)))
+        C.append((f"log_softmax.dim1.spatial{shape}",
+                  lambda tx=tx: F.log_softmax(tx, 1),
+                  lambda x=x: torch.log_softmax(x, 1)))
+    # ---- 词表级大行（不整除向量化宽度的典型 vocab）----
+    for shape in [(2048, 50257)]:
+        x = r(*shape)
+        tx = T(x)
+        C.append((f"softmax.vocab{shape}", lambda tx=tx: F.softmax(tx, -1),
+                  lambda x=x: torch.softmax(x, -1)))
+        C.append((f"log_softmax.vocab{shape}",
+                  lambda tx=tx: F.log_softmax(tx, -1),
+                  lambda x=x: torch.log_softmax(x, -1)))
     # ---- 归约家族（Reduce*Kernels.cu / ReductionKernels.cu）----
     for shape in [(4096, 4096), (1024, 1024, 64)]:
         x = r(*shape)
