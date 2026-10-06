@@ -765,24 +765,43 @@ namespace {
         return s;
     }
 
+    // A complex value reads as its real part, the sign of its imaginary
+    // part and that part's magnitude, then ``j``: ``1.5-0.25j``.
+    template <typename R>
+    std::string format_complex(R re, R im, const PrintOptions& options) {
+        const bool negative = std::signbit(im) && !std::isnan(im);
+        return format_float(re, options) + (negative ? "-" : "+") +
+               format_float(negative ? -im : im, options) + "j";
+    }
+
+    // One element as it is printed.  Half precision, bfloat16 and the fp8
+    // formats print through float, like the wider floating types.
+    template <typename T>
+    std::string format_element(const T& value, const PrintOptions& options) {
+        if constexpr (std::is_same_v<T, bool>) {
+            return value ? "True" : "False";
+        } else if constexpr (is_complex_type<T>::value) {
+            using R = typename T::value_type;
+            if constexpr (std::is_floating_point_v<R>) {
+                return format_complex(value.real(), value.imag(), options);
+            } else {
+                return format_complex(static_cast<float>(value.real()),
+                                      static_cast<float>(value.imag()), options);
+            }
+        } else if constexpr (std::is_integral_v<T>) {
+            return std::to_string(value);
+        } else if constexpr (std::is_floating_point_v<T>) {
+            return format_float(value, options);
+        } else {
+            return format_float(static_cast<float>(value), options);
+        }
+    }
+
     template <typename T>
     void print_data_recursive(std::ostream& os, const T* data, const std::vector<int64_t>& sizes, const std::vector<int64_t>& strides, int64_t dim, int64_t indent, const PrintOptions& options, bool summarizing) {
-        if (sizes.empty()) { // Scalar 0-dim
-             if constexpr (std::is_floating_point_v<T>) {
-                os << format_float(*data, options);
-            } else {
-                os << *data;
-            }
-            return;
-        }
-
-        if (dim == sizes.size()) {
-             // Should not happen if sizes is not empty and logic is correct, but base case for recursion
-             if constexpr (std::is_floating_point_v<T>) {
-                os << format_float(*data, options);
-            } else {
-                os << *data;
-            }
+        if (sizes.empty() || dim == static_cast<int64_t>(sizes.size())) {
+            // A 0-dim tensor, or the element a recursion bottoms out at.
+            os << format_element(*data, options);
             return;
         }
 
@@ -796,22 +815,13 @@ namespace {
             
             for (int64_t i = 0; i < count; ++i) {
                 if (i > 0) os << ", ";
-                if constexpr (std::is_floating_point_v<T>) {
-                    os << format_float(data[i * stride], options);
-                } else {
-                    os << (std::is_same_v<T, bool> ? (data[i * stride] ? "True" : "False") : std::to_string(data[i * stride]));
-                }
+                os << format_element(data[i * stride], options);
             }
-            
+
             if (summarize_dim) {
                 os << ", ...";
                 for (int64_t i = size - options.edge_items; i < size; ++i) {
-                    os << ", ";
-                    if constexpr (std::is_floating_point_v<T>) {
-                        os << format_float(data[i * stride], options);
-                    } else {
-                        os << (std::is_same_v<T, bool> ? (data[i * stride] ? "True" : "False") : std::to_string(data[i * stride]));
-                    }
+                    os << ", " << format_element(data[i * stride], options);
                 }
             }
             os << "]";
@@ -953,11 +963,49 @@ std::string Tensor::toString() const {
         case DType::Float8_e8m0fnu:
             print_data_recursive(ss, tensor_to_print.data_ptr<Float8_e8m0fnu>(), current_sizes, current_strides, 0, 7, options, summarizing);
             break;
+        case DType::Float16:
+            print_data_recursive(ss, tensor_to_print.data_ptr<Half>(), current_sizes, current_strides, 0, 7, options, summarizing);
+            break;
+        case DType::BFloat16:
+            print_data_recursive(ss, tensor_to_print.data_ptr<BFloat16>(), current_sizes, current_strides, 0, 7, options, summarizing);
+            break;
+        case DType::Int8:
+            print_data_recursive(ss, tensor_to_print.data_ptr<int8_t>(), current_sizes, current_strides, 0, 7, options, summarizing);
+            break;
+        case DType::Int16:
+            print_data_recursive(ss, tensor_to_print.data_ptr<int16_t>(), current_sizes, current_strides, 0, 7, options, summarizing);
+            break;
         case DType::Int32:
             print_data_recursive(ss, tensor_to_print.data_ptr<int32_t>(), current_sizes, current_strides, 0, 7, options, summarizing);
             break;
         case DType::Int64:
             print_data_recursive(ss, tensor_to_print.data_ptr<int64_t>(), current_sizes, current_strides, 0, 7, options, summarizing);
+            break;
+        case DType::UInt8:
+            print_data_recursive(ss, tensor_to_print.data_ptr<uint8_t>(), current_sizes, current_strides, 0, 7, options, summarizing);
+            break;
+        case DType::UInt16:
+            print_data_recursive(ss, tensor_to_print.data_ptr<uint16_t>(), current_sizes, current_strides, 0, 7, options, summarizing);
+            break;
+        case DType::UInt32:
+            print_data_recursive(ss, tensor_to_print.data_ptr<uint32_t>(), current_sizes, current_strides, 0, 7, options, summarizing);
+            break;
+        case DType::UInt64:
+            print_data_recursive(ss, tensor_to_print.data_ptr<uint64_t>(), current_sizes, current_strides, 0, 7, options, summarizing);
+            break;
+        // Inside a Tensor member the static ``complex`` factory hides the
+        // element type of that name; the qualified spelling reaches it.
+        case DType::ComplexHalf:
+            print_data_recursive(ss, tensor_to_print.data_ptr<::tensorplay::complex<Half>>(), current_sizes, current_strides, 0, 7, options, summarizing);
+            break;
+        case DType::ComplexFloat:
+            print_data_recursive(ss, tensor_to_print.data_ptr<::tensorplay::complex<float>>(), current_sizes, current_strides, 0, 7, options, summarizing);
+            break;
+        case DType::ComplexDouble:
+            print_data_recursive(ss, tensor_to_print.data_ptr<::tensorplay::complex<double>>(), current_sizes, current_strides, 0, 7, options, summarizing);
+            break;
+        case DType::BComplex32:
+            print_data_recursive(ss, tensor_to_print.data_ptr<::tensorplay::complex<BFloat16>>(), current_sizes, current_strides, 0, 7, options, summarizing);
             break;
         case DType::Bool:
             print_data_recursive(ss, tensor_to_print.data_ptr<bool>(), current_sizes, current_strides, 0, 7, options, summarizing);

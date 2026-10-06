@@ -4,12 +4,20 @@
 namespace tensorplay {
 namespace cuda {
 
+// Complex values have no order: lt/le/gt/ge refuse them by name.
+inline void check_orderable(DType dtype) {
+    if (isComplexType(dtype)) {
+        TP_THROW(NotImplementedError, "comparison not implemented for '", toString(dtype), "'");
+    }
+}
+
 template <bool AllowFloat8, typename Functor>
 Tensor comparison_op_kernel(const Tensor& self, const Tensor& other, Functor functor) {
     std::vector<int64_t> out_shape = broadcast_shapes(
         static_cast<std::vector<int64_t>>(self.shape()),
         static_cast<std::vector<int64_t>>(other.shape()));
     DType common_dtype = promoteTypes(self.dtype(), other.dtype());
+    check_orderable(common_dtype);
     Tensor result = Tensor::empty(out_shape, DType::Bool, self.device());
     Tensor a = (self.dtype() == common_dtype) ? self : self.to(common_dtype);
     Tensor b = (other.dtype() == common_dtype) ? other : other.to(common_dtype);
@@ -46,6 +54,7 @@ Tensor comparison_op_kernel(const Tensor& self, const Tensor& other, Functor fun
 template <bool AllowFloat8, typename Functor>
 Tensor comparison_scalar_op_kernel(const Tensor& self, Scalar other, Functor functor) {
     DType common = result_type_with_scalar_cuda(self, other);
+    check_orderable(common);
     Tensor in = (self.dtype() == common) ? self : self.to(common);
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(in.shape()), DType::Bool, self.device());
     if (in.numel() == 0) return result;
@@ -151,7 +160,7 @@ Tensor gt_kernel_cuda(const Tensor& self, const Tensor& other) { return comparis
 Tensor ge_kernel_cuda(const Tensor& self, const Tensor& other) { return comparison_op_kernel<false>(self, other, GeFunctor()); }
 
 Tensor eq_scalar_kernel_cuda(const Tensor& self, const Scalar& other) {
-    if (other.isComplex()) {
+    if (other.isComplex() || isComplexType(self.dtype())) {
         DType rd = isComplexType(self.dtype())
             ? self.dtype()
             : (isFloatingType(self.dtype())
@@ -163,7 +172,7 @@ Tensor eq_scalar_kernel_cuda(const Tensor& self, const Scalar& other) {
     return comparison_scalar_op_kernel<true>(self, other, EqFunctor());
 }
 Tensor ne_scalar_kernel_cuda(const Tensor& self, const Scalar& other) {
-    if (other.isComplex()) {
+    if (other.isComplex() || isComplexType(self.dtype())) {
         DType rd = isComplexType(self.dtype())
             ? self.dtype()
             : (isFloatingType(self.dtype())
