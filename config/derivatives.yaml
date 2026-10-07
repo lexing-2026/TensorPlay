@@ -531,12 +531,12 @@
 - name: multilabel_margin_loss_forward(Tensor self, Tensor target, int reduction) -> (Tensor output, Tensor is_target)
   self: multilabel_margin_loss_backward(grad, self, target, reduction, is_target)
 
-# The backward kernels below have no derivative of their own; a second pass
-# through one raises instead of treating the missing term as zero.
+# multi_margin_loss_backward is linear in grad_output and in the target
+# class weight; in self only the p == 2 hinge has curvature.
 - name: multi_margin_loss_backward(Tensor grad_output, Tensor self, Tensor target, Scalar p, Scalar margin, Tensor? weight=None, int reduction=1) -> Tensor
-  grad_output: not_implemented_grad("multi_margin_loss_backward")
-  self: not_implemented_grad("multi_margin_loss_backward")
-  weight: not_implemented_grad("multi_margin_loss_backward")
+  grad_output: multi_margin_loss_double_backward_grad_output(grad, grad_output, self, target, p, margin, weight, reduction)
+  self: multi_margin_loss_double_backward_self(grad, grad_output, self, target, p, margin, weight, reduction)
+  weight: multi_margin_loss_double_backward_weight(grad, grad_output, self, target, p, margin, weight, reduction)
 
 - name: multilabel_margin_loss_backward(Tensor grad_output, Tensor self, Tensor target, int reduction, Tensor is_target) -> Tensor
   grad_output: multilabel_margin_loss_backward(grad, self, target, reduction, is_target)
@@ -547,6 +547,8 @@
 - name: _ctc_loss(Tensor log_probs, Tensor targets, Tensor input_lengths, Tensor target_lengths, int blank=0, bool zero_infinity=False) -> (Tensor neg_log_likelihood, Tensor log_alpha)
   log_probs: _ctc_loss_backward(grad, log_probs, targets, input_lengths, target_lengths, neg_log_likelihood, log_alpha, blank, zero_infinity)
 
+# No derivative of its own; a second pass raises instead of treating the
+# missing term as zero.
 - name: _ctc_loss_backward(Tensor grad_output, Tensor log_probs, Tensor targets, Tensor input_lengths, Tensor target_lengths, Tensor neg_log_likelihood, Tensor log_alpha, int blank, bool zero_infinity) -> Tensor
   grad_output: not_implemented_grad("_ctc_loss_backward")
   log_probs: not_implemented_grad("_ctc_loss_backward")

@@ -223,6 +223,106 @@ inline Tensor margin_ranking_loss_target_backward(const Tensor& grad, const Tens
     return loss_bwd_detail::mean_scaled(ops::mul(grad, slope), reduction, input1.numel());
 }
 
+// multi margin: row t with target y holds the hinge terms
+// z_d = margin - x_y + x_d (d != y), and the backward kernel emits
+// h_d = s * w_y * go_t * (p == 1 ? 1 : 2 z_d) on the active terms (z_d > 0)
+// with h_y = -sum_d h_d, where s = 1 / C (or 1 / (N C) under mean).  The
+// helpers view every input as N rows of C classes (a 0-d input is one class).
+namespace loss_bwd_detail {
+
+struct MarginRows {
+    int64_t nframe;
+    int64_t dim;
+};
+
+inline MarginRows margin_rows(const Tensor& self) {
+    return {self.dim() <= 1 ? 1 : self.size(0), self.dim() == 0 ? 1 : self.size(-1)};
+}
+
+inline Tensor margin_target_column(const Tensor& target, int64_t nframe) {
+    return ops::reshape(ops::to(target, DType::Int64), {nframe, 1});
+}
+
+// Row-wise reduction of grad * kernel(grad_output), shaped like grad_output.
+inline Tensor margin_row_contraction(const Tensor& grad, const Tensor& slope,
+                                     const Tensor& grad_output, int64_t reduction,
+                                     const MarginRows& rows) {
+    const Tensor product = ops::reshape(ops::mul(grad, slope), {rows.nframe, rows.dim});
+    const bool per_row = reduction == 0 && grad_output.dim() > 0;
+    const Tensor reduced = per_row ? ops::sum(product, {1}) : ops::sum(product);
+    return ops::reshape(reduced, grad_output.shape());
+}
+
+}  // namespace loss_bwd_detail
+
+// The kernel is linear in grad_output: the slot contracts grad with the
+// kernel evaluated at a unit grad_output, per row or over the whole input.
+inline Tensor multi_margin_loss_double_backward_grad_output(
+    const Tensor& grad, const Tensor& grad_output, const Tensor& self, const Tensor& target,
+    const Scalar& p, const Scalar& margin, const std::optional<Tensor>& weight,
+    int64_t reduction) {
+    const auto rows = loss_bwd_detail::margin_rows(self);
+    const Tensor slope = ops::multi_margin_loss_backward(ops::ones_like(grad_output), self,
+                                                         target, p, margin, weight, reduction);
+    return loss_bwd_detail::margin_row_contraction(grad, slope, grad_output, reduction, rows);
+}
+
+// p == 1 is piecewise linear in x, so its Hessian vanishes.  For p == 2 each
+// active term contributes c (e_d - e_y)(e_d - e_y)^T with c = 2 s w_y go_t,
+// so the product with grad is c (grad_d - grad_y) on d and minus the row sum
+// of those values on y.
+inline Tensor multi_margin_loss_double_backward_self(
+    const Tensor& grad, const Tensor& grad_output, const Tensor& self, const Tensor& target,
+    const Scalar& p, const Scalar& margin, const std::optional<Tensor>& weight,
+    int64_t reduction) {
+    if (p.to<int64_t>() == 1) return ops::zeros_like(self);
+    const auto rows = loss_bwd_detail::margin_rows(self);
+    const Tensor tgt = loss_bwd_detail::margin_target_column(target, rows.nframe);
+    const Tensor x = ops::reshape(self, {rows.nframe, rows.dim});
+    const Tensor gg = ops::reshape(grad, {rows.nframe, rows.dim});
+    const Tensor z = ops::add(ops::sub(x, ops::gather(x, 1, tgt)), Scalar(margin.toDouble()));
+    const Tensor cols = ops::reshape(
+        ops::arange(Scalar(rows.dim), DType::Int64, self.device()), {1, rows.dim});
+    const Tensor active = ops::mul(loss_bwd_detail::mask_like(ops::gt(z, Scalar(0.0)), x),
+                                   loss_bwd_detail::mask_like(ops::ne(cols, tgt), x));
+
+    const double scale = reduction == 1
+                             ? 2.0 / (static_cast<double>(rows.nframe) * rows.dim)
+                             : 2.0 / static_cast<double>(rows.dim);
+    const bool per_row = reduction == 0 && grad_output.dim() > 0;
+    Tensor coef = ops::mul(per_row ? ops::reshape(grad_output, {rows.nframe, 1})
+                                   : ops::reshape(grad_output, std::vector<int64_t>{}),
+                           Scalar(scale));
+    if (weight.has_value() && weight->defined()) {
+        const Tensor w_target = ops::index_select(ops::reshape(*weight, {rows.dim}), 0,
+                                                  ops::reshape(tgt, {rows.nframe}));
+        coef = ops::mul(coef, ops::reshape(w_target, {rows.nframe, 1}));
+    }
+
+    const Tensor off_target =
+        ops::mul(ops::mul(ops::sub(gg, ops::gather(gg, 1, tgt)), active), coef);
+    const Tensor on_target = ops::neg(ops::sum(off_target, {1}, true));
+    return ops::reshape(ops::scatter_add(off_target, 1, tgt, on_target), self.shape());
+}
+
+// The kernel is linear in w_y: every row adds its contraction of grad with
+// the unweighted kernel output into the weight entry of its target class.
+inline Tensor multi_margin_loss_double_backward_weight(
+    const Tensor& grad, const Tensor& grad_output, const Tensor& self, const Tensor& target,
+    const Scalar& p, const Scalar& margin, const std::optional<Tensor>& weight,
+    int64_t reduction) {
+    if (!weight.has_value() || !weight->defined()) return Tensor();
+    const auto rows = loss_bwd_detail::margin_rows(self);
+    const Tensor unweighted = ops::multi_margin_loss_backward(grad_output, self, target, p,
+                                                              margin, std::nullopt, reduction);
+    const Tensor per_row = ops::sum(
+        ops::reshape(ops::mul(grad, unweighted), {rows.nframe, rows.dim}), {1});
+    const Tensor index = ops::reshape(ops::to(target, DType::Int64), {rows.nframe});
+    const Tensor acc = ops::index_add(
+        ops::zeros({rows.dim}, weight->dtype(), weight->device()), 0, index, per_row);
+    return ops::reshape(acc, weight->shape());
+}
+
 // cosine embedding: d loss / d cos for each row, with the mean's 1 / rows.
 inline Tensor cosine_loss_slope(const Tensor& cosine, const Tensor& target, double margin,
                                 int64_t reduction) {

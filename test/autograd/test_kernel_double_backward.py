@@ -125,12 +125,44 @@ def second_pass(loss, inputs):
     return tp.autograd.grad(total, inputs)
 
 
-def test_multi_margin_loss_second_pass_raises():
-    x = rand(3, 5, seed=6)
-    target = tp.tensor([0, 2, 4])
-    loss = F.multi_margin_loss(x, target)
-    with pytest.raises(NotImplementedError, match="multi_margin_loss_backward"):
-        second_pass(loss, [x])
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("p", [1, 2])
+@pytest.mark.parametrize("reduction", ["none", "mean", "sum"])
+@pytest.mark.parametrize("weighted", [False, True])
+def test_multi_margin_loss_differentiates_twice(device, p, reduction, weighted):
+    x = rand(4, 5, device=device, seed=6)
+    target = tp.tensor([0, 2, 4, 2]).to(device)
+    w = (tp.rand(5, dtype=tp.float64) + 0.5).to(device) if weighted else None
+    check(lambda t: F.multi_margin_loss(t, target, p=p, margin=0.7, weight=w,
+                                        reduction=reduction), [x])
+
+
+@pytest.mark.parametrize("p", [1, 2])
+@pytest.mark.parametrize("reduction", ["none", "mean", "sum"])
+def test_multi_margin_loss_backward_slots(p, reduction):
+    x = rand(3, 4, seed=7)
+    target = tp.tensor([1, 0, 3])
+    w = rand(4, seed=8).abs().detach().requires_grad_(True)
+    go = rand(*([3] if reduction == "none" else []), seed=9)
+    red = {"none": 0, "mean": 1, "sum": 2}[reduction]
+
+    def fn(g, t, wt):
+        return _C.multi_margin_loss_backward(g, t, target, p, 0.6, wt, red)
+
+    assert gradcheck(fn, (go, x, w), atol=1e-6, rtol=1e-4)
+    assert gradgradcheck(fn, (go, x, w), atol=1e-6, rtol=1e-4)
+
+
+def test_multi_margin_loss_double_backward_shapes():
+    for x, target in ((rand(5, seed=10), tp.tensor([3])),
+                      (rand(5, seed=10), tp.tensor(3)),
+                      (rand(seed=11), tp.tensor(0))):
+        check(lambda t: F.multi_margin_loss(t, target, p=2, reduction="none"), [x])
+    empty = tp.zeros(0, 3, dtype=tp.float64).requires_grad_(True)
+    loss = F.multi_margin_loss(empty, tp.zeros(0, dtype=tp.int64), p=2, reduction="sum")
+    (g,) = tp.autograd.grad(loss, [empty], create_graph=True)
+    (gg,) = tp.autograd.grad((g * g).sum(), [empty], allow_unused=True)
+    assert gg is None or gg.shape == empty.shape
 
 
 def test_multilabel_margin_loss_differentiates_twice():
@@ -164,11 +196,16 @@ def test_multi_output_kernel_second_pass_raises():
 def test_first_pass_through_undifferentiated_kernel_still_works():
     # Only a pass that needs the missing derivative raises: a gradient taken
     # with create_graph and then used as data is fine.
-    x = rand(3, 5, seed=12)
-    target = tp.tensor([1, 0, 3])
-    (g,) = tp.autograd.grad(F.multi_margin_loss(x, target), x, create_graph=True)
+    tp.manual_seed(12)
+    x = tp.randn(6, 2, 4, dtype=tp.float64).log_softmax(2).detach().requires_grad_(True)
+    targets = tp.tensor([[1, 2], [3, 1]])
+
+    def loss():
+        return F.ctc_loss(x, targets, tp.tensor([6, 6]), tp.tensor([2, 2]))
+
+    (g,) = tp.autograd.grad(loss(), x, create_graph=True)
     assert g.requires_grad
-    expected = tp.autograd.grad(F.multi_margin_loss(x, target), x)[0]
+    expected = tp.autograd.grad(loss(), x)[0]
     np.testing.assert_allclose(g.detach().numpy(), expected.numpy())
 
 
