@@ -141,52 +141,6 @@ inline Tensor adaptive_avg_pool2d_backward_any(const Tensor& grad, const Tensor&
     return ops::adaptive_avg_pool2d_backward(grad, input);
 }
 
-// Flat in-volume argmax offsets of adaptive_max_pool3d, which keeps no
-// indices.  The bins are the floor / ceil windows of the pool; a box maximum
-// splits into three one-axis maxima (W, then H, then D) that carry the offset
-// along, and a tie goes to the first element in row-major order like the
-// kernel's.
-inline Tensor adaptive_max_pool3d_indices(const Tensor& input,
-                                          const std::vector<int64_t>& output_shape) {
-    Tensor value = ops::detach(input);
-    const bool batched = value.dim() == 5;
-    if (!batched) value = ops::unsqueeze(value, 0);
-    const std::vector<int64_t> in_shape = value.shape();
-    const std::vector<int64_t> out_size = trailing_extents(output_shape, 3);
-
-    Tensor offset = ops::reshape(
-        ops::arange(Scalar(static_cast<int64_t>(0)),
-                    Scalar(in_shape[2] * in_shape[3] * in_shape[4]),
-                    Scalar(static_cast<int64_t>(1)), DType::Int64, value.device()),
-        {1, 1, in_shape[2], in_shape[3], in_shape[4]});
-    offset = ops::contiguous(ops::expand(offset, in_shape));
-
-    for (int64_t axis = 4; axis >= 2; --axis) {
-        const int64_t extent = in_shape[axis];
-        const int64_t bins = out_size[axis - 2];
-        std::vector<Tensor> values, offsets;
-        values.reserve(static_cast<size_t>(bins));
-        offsets.reserve(static_cast<size_t>(bins));
-        for (int64_t o = 0; o < bins; ++o) {
-            const int64_t start = o * extent / bins;
-            const int64_t end = 1 + ((o + 1) * extent - 1) / bins;
-            const Tensor window = ops::narrow(value, axis, start, end - start);
-            const Tensor window_offset = ops::narrow(offset, axis, start, end - start);
-            const Tensor arg = std::get<1>(ops::max(window, axis, true));
-            values.push_back(ops::gather(window, axis, arg));
-            offsets.push_back(ops::gather(window_offset, axis, arg));
-        }
-        value = ops::cat(values, axis);
-        offset = ops::cat(offsets, axis);
-    }
-    return batched ? offset : ops::squeeze(offset, 0);
-}
-
-inline Tensor adaptive_max_pool3d_double_backward(const Tensor& grad, const Tensor& input,
-                                                  const std::vector<int64_t>& output_shape) {
-    return max_pool_double_backward(grad, adaptive_max_pool3d_indices(input, output_shape), 3);
-}
-
 inline Tensor adaptive_max_pool2d_double_backward(const Tensor& grad, const Tensor& input,
                                                   const std::vector<int64_t>& output_shape) {
     const Tensor detached = ops::detach(input);
