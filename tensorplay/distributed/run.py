@@ -1,6 +1,6 @@
 #
 # The agent-based elastic launcher. ``main`` is the console entry point
-# (tensorrun-style); it parses CLI arguments into a
+# (``tprun``); it parses CLI arguments into a
 # ``tensorplay.distributed.launcher.LaunchConfig`` and delegates to the
 # elastic agent, which handles rendezvous, worker monitoring, restarts, and
 # scale-up/scale-down re-rendezvous. Single-node jobs run through the same
@@ -158,7 +158,7 @@ def run(args=None):
 
 def get_args_parser() -> argparse.ArgumentParser:
     """Argument parser mirroring the documented launcher CLI."""
-    parser = argparse.ArgumentParser(add_help=True)
+    parser = argparse.ArgumentParser(add_help=True, prog="tprun")
     parser.add_argument(
         "--nnodes",
         action="store",

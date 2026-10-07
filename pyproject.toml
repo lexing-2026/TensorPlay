@@ -77,6 +77,12 @@ Changelog = "https://github.com/lexing-2026/TensorPlay/releases"
 Documentation = "https://tensorplay.cn"
 Contributing = "https://github.com/lexing-2026/TensorPlay/blob/main/CONTRIBUTING.md"
 
+[project.scripts]
+# Elastic launcher CLI: delegates to the agent-based launcher in
+# tensorplay.distributed.run, the same path ``python -m
+# tensorplay.distributed.run`` takes.
+tprun = "tensorplay.distributed.run:main"
+
 [[tool.dynamic-metadata]]
 # Delegates to tools/metadata/version.py which resolves the version from
 # TENSORPLAY_BUILD_VERSION / TENSORPLAY_BUILD_NUMBER (release), PKG-INFO
