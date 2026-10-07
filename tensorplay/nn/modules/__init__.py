@@ -159,6 +159,9 @@ from .pooling import (
 )
 from .sparse import Embedding, EmbeddingBag
 from .multihead_attention import MultiheadAttention, NonDynamicallyQuantizableLinear
+from .rotary import RotaryEmbedding, apply_rotary_emb
+from .causal_attention import GroupedQueryAttention
+from .latent_attention import MultiheadLatentAttention
 from .rnn import (
     GRU,
     GRUCell,
@@ -235,6 +238,7 @@ __all__ = [
     "GRUCell",
     "GaussianNLLLoss",
     "GroupNorm",
+    "GroupedQueryAttention",
     "Hardshrink",
     "Hardsigmoid",
     "Hardswish",
@@ -287,6 +291,7 @@ __all__ = [
     "MultiLabelSoftMarginLoss",
     "MultiMarginLoss",
     "MultiheadAttention",
+    "MultiheadLatentAttention",
     "NLLLoss",
     "NonDynamicallyQuantizableLinear",
     "PReLU",
@@ -310,6 +315,7 @@ __all__ = [
     "ReplicationPad1d",
     "ReplicationPad2d",
     "ReplicationPad3d",
+    "RotaryEmbedding",
     "SELU",
     "Sequential",
     "SiLU",
@@ -339,6 +345,7 @@ __all__ = [
     "ZeroPad1d",
     "ZeroPad2d",
     "ZeroPad3d",
+    "apply_rotary_emb",
 ]
 
 # Please keep this list sorted
