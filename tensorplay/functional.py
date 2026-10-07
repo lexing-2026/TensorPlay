@@ -3321,18 +3321,18 @@ def adaptive_max_pool2d_with_indices_backward(grad_output, input, output_size, i
         output_size = [output_size]
     return _C.adaptive_max_pool2d_with_indices_backward(grad_output, input, output_size, indices)
 
-def adaptive_max_pool3d_backward(grad_output, input, *, out=None):
+def adaptive_max_pool3d_backward(grad_output, input, indices, *, out=None):
     if out is not None:
         if _capturing():
-            _captured = _capture_call(adaptive_max_pool3d_backward, (grad_output, input), {'out': out})
+            _captured = _capture_call(adaptive_max_pool3d_backward, (grad_output, input, indices), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.adaptive_max_pool3d_backward(grad_output=grad_output, input=input, out=out)
+        return _C.adaptive_max_pool3d_backward(grad_output=grad_output, input=input, indices=indices, out=out)
     if _capturing():
-        _captured = _capture_call(adaptive_max_pool3d_backward, (grad_output, input), {})
+        _captured = _capture_call(adaptive_max_pool3d_backward, (grad_output, input, indices), {})
         if _captured is not None:
             return _captured
-    return _C.adaptive_max_pool3d_backward(grad_output=grad_output, input=input)
+    return _C.adaptive_max_pool3d_backward(grad_output=grad_output, input=input, indices=indices)
 
 def batch_norm(input, weight, bias, running_mean, running_var, training, momentum, eps):
     if _capturing():

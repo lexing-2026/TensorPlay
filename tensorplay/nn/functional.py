@@ -4066,42 +4066,6 @@ def lp_pool3d(
     return (tensorplay.sign(out) * relu(tensorplay.abs(out))).mul(kd * kw * kh).pow(1.0 / norm_type)
 
 
-def _adaptive_window_bounds(in_size, out_size):
-    starts = [i * in_size // out_size for i in range(out_size)]
-    ends = [-((-(i + 1) * in_size) // out_size) for i in range(out_size)]
-    return starts, ends
-
-
-def _adaptive_max_pool2d_wi(x4, oH, oW):
-    """Values + indices for adaptive 2-D max pooling (loop over cells)."""
-    with tensorplay.no_grad():
-        N, C, H, W = x4.shape
-        hs_list, he_list = _adaptive_window_bounds(H, oH)
-        ws_list, we_list = _adaptive_window_bounds(W, oW)
-        vals, idxs = [], []
-        for i in range(oH):
-            for j in range(oW):
-                win = x4[:, :, hs_list[i]:he_list[i], ws_list[j]:we_list[j]].contiguous()
-                a = he_list[i] - hs_list[i]
-                b = we_list[j] - ws_list[j]
-                t = win.reshape(N, C, a, b)
-                cv, ci = _C.topk(t, 1, -1, True, True, 0)
-                cv = cv.view(N, C, a, 1)
-                ci = ci.view(N, C, a, 1)
-                # topk kernel is last-dim only: swap the window axis to last.
-                rv, ri = _C.topk(cv.transpose(3, 2), 1, -1, True, True, 0)
-                ri = ri.view(N, C)
-                sel = ri.view(N, C, 1, 1).eq(
-                    tensorplay.arange(a, dtype=DType.int64,
-                                      device=x4.device).view(1, 1, -1, 1))
-                col = tensorplay.where(sel, ci, ci * 0).sum(2).view(N, C)
-                vals.append(rv.view(N, C))
-                idxs.append((hs_list[i] + ri) * W + (ws_list[j] + col))
-        v = tensorplay.stack(vals, dim=2).reshape(N, C, oH, oW)
-        ix = tensorplay.stack(idxs, dim=2).reshape(N, C, oH, oW)
-        return v, ix
-
-
 def adaptive_max_pool2d_with_indices(input: Tensor, output_size, return_indices: bool = True):
     r"""Applies a 2D adaptive max pooling over an input signal composed of
     several input planes, returning ``(output, indices)``.
@@ -4133,30 +4097,6 @@ def adaptive_max_pool1d_with_indices(input: Tensor, output_size, return_indices:
     return values, indices
 
 
-def _adaptive_max_values_3d(x5, od, oh, ow):
-    N, C, D, H, W = x5.shape
-    hs, he = _adaptive_window_bounds(D, od)
-    vs, ixs = [], []
-    for d in range(od):
-        dsz = he[d] - hs[d]
-        sl = x5[:, :, hs[d]:he[d], :, :].reshape(N * C * dsz, 1, H, W)
-        pv = _C.adaptive_max_pool2d(sl, [oh, ow]).reshape(N, C, dsz, oh, ow)
-        _, pi = _adaptive_max_pool2d_wi(sl.reshape(N * C * dsz, H, W).unsqueeze(1), oh, ow)
-        pi = pi.reshape(N, C, dsz, oh, ow)
-        # max is associative: reduce the depth window after pooling (H, W).
-        vs.append(_C.max(pv, dim=2)[0])
-        # argmax kernel mishandles non-last dims: bring dsz to the end.
-        zt = pv.transpose(2, 4).contiguous().reshape(N * C * oh * ow, dsz)
-        _, zt_idx = _C.topk(zt, 1, -1, True, True, 0)
-        # rows are (n, c, w_out, h_out) after the transpose: undo it.
-        z = zt_idx.reshape(N, C, ow, oh).transpose(2, 3)
-        sel = z.unsqueeze(2).eq(tensorplay.arange(dsz, dtype=DType.int64,
-                                                 device=x5.device).view(1, 1, -1, 1, 1))
-        win_idx = (pi * sel).sum(2) + (hs[d] + z) * (H * W)
-        ixs.append(win_idx)
-    return tensorplay.stack(vs, dim=2), tensorplay.stack(ixs, dim=2)
-
-
 def adaptive_max_pool3d(input: Tensor, output_size, return_indices: bool = False):
     r"""adaptive_max_pool3d(input, output_size, return_indices=False)
 
@@ -4166,10 +4106,10 @@ def adaptive_max_pool3d(input: Tensor, output_size, return_indices: bool = False
     See :class:`~tensorplay.nn.AdaptiveMaxPool3d` for details.
     """
     od, oh, ow = _triple(output_size)
+    values, indices = _C.adaptive_max_pool3d(input, [od, oh, ow])
     if return_indices:
-        return adaptive_max_pool3d_with_indices(input, (od, oh, ow))
-    # through adaptive_max_pool3d_backward.
-    return _C.adaptive_max_pool3d(input, [od, oh, ow])
+        return values, indices
+    return values
 
 
 def adaptive_max_pool3d_with_indices(input: Tensor, output_size, return_indices: bool = True):
@@ -4181,12 +4121,7 @@ def adaptive_max_pool3d_with_indices(input: Tensor, output_size, return_indices:
     od, oh, ow = _triple(output_size)
     unbatched = input.dim() == 4
     x = input.unsqueeze(0) if unbatched else input
-    N, C, D, H, W = x.shape
-    with tensorplay.no_grad():
-        _values, indices = _adaptive_max_values_3d(x, od, oh, ow)
-    # Values come from the native kernel so autograd flows through
-    # adaptive_max_pool3d_backward; indices stay a no-grad int64 tensor.
-    values = _C.adaptive_max_pool3d(x, [od, oh, ow])
+    values, indices = _C.adaptive_max_pool3d(x, [od, oh, ow])
     if unbatched:
         return values.squeeze(0), indices.squeeze(0)
     return values, indices

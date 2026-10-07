@@ -5786,14 +5786,23 @@ def adaptive_max_pool3d(input, output_size):
 
     if d_out == 0 or h_out == 0 or w_out == 0:
         output_shape = [int(s) for s in input.shape[:-3]] + [d_out, h_out, w_out]
-        return input.new_empty(output_shape)
+        return (
+            input.new_empty(output_shape),
+            input.new_empty(output_shape, dtype=tp.int64),
+        )
 
+    # Global pooling: one max over the whole spatial extent.  argmax on the
+    # flattened spatial volume yields the same linear offsets the native
+    # kernel records.
     if d_out == 1 and h_out == 1 and w_out == 1:
-        return ops.amax.default(input, [-3, -2, -1], True)
+        values = ops.amax.default(input, [-3, -2, -1], True)
+        indices = ops.argmax.default(input.flatten(-3), -1, False)
+        indices = indices.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        return values, indices
 
     if d_in % d_out == 0 and h_in % h_out == 0 and w_in % w_out == 0:
         kernel_size = [d_in // d_out, h_in // h_out, w_in // w_out]
-        return ops.max_pool3d.default(input, kernel_size)
+        return ops.max_pool3d_with_indices.default(input, kernel_size)
 
     return NotImplemented
 

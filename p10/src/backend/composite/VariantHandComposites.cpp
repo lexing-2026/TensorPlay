@@ -15,6 +15,7 @@
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include "Autograd.h"
 #include "cpu/Lapack.h"
+#include "cpu/PoolingKernels.h"
 
 #include <algorithm>
 #include <array>
@@ -801,10 +802,44 @@ Tensor& adaptive_max_pool2d_backward_gi_native(const Tensor& grad_output, const 
 }
 
 Tensor& adaptive_max_pool3d_backward_gi_native(const Tensor& grad_output, const Tensor& self,
-                                               const Tensor& indices, Tensor& grad_input) {
-    (void)indices;
+                                                const Tensor& indices, Tensor& grad_input) {
+    if (grad_input.defined() && self.device().type() == DeviceType::CPU &&
+        self.dim() == 5 && grad_output.dim() == 5 && indices.dim() == 5 &&
+        (self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        self.dtype() == grad_output.dtype() && self.dtype() == grad_input.dtype() &&
+        indices.dtype() == DType::Int64 && self.device() == grad_output.device() &&
+        self.device() == indices.device() && self.device() == grad_input.device() &&
+        static_cast<std::vector<int64_t>>(grad_output.shape()) ==
+            static_cast<std::vector<int64_t>>(indices.shape()) &&
+        static_cast<std::vector<int64_t>>(grad_input.shape()) ==
+            static_cast<std::vector<int64_t>>(self.shape()) &&
+        !grad_input.unsafeGetTensorImpl()->storage().is_same(
+            self.unsafeGetTensorImpl()->storage()) &&
+        !grad_input.unsafeGetTensorImpl()->storage().is_same(
+            grad_output.unsafeGetTensorImpl()->storage()) &&
+        !grad_input.unsafeGetTensorImpl()->storage().is_same(
+            indices.unsafeGetTensorImpl()->storage()) &&
+        grad_output.is_contiguous(MemoryFormat::ChannelsLast3d) &&
+        indices.is_contiguous(MemoryFormat::ChannelsLast3d) &&
+        grad_input.is_contiguous(MemoryFormat::ChannelsLast3d)) {
+        if (grad_input.numel() > 0) {
+            std::memset(grad_input.data_ptr(), 0, grad_input.numel() *
+                        (self.dtype() == DType::Float32 ? sizeof(float) : sizeof(double)));
+        }
+        cpu::max_pool3d_backward_cl_stub(DeviceType::CPU,
+                                        grad_output.data_ptr(),
+                                        indices.data_ptr<int64_t>(),
+                                        grad_input.data_ptr(),
+                                        self.size(0), self.size(1),
+                                        self.size(2), self.size(3), self.size(4),
+                                        grad_output.size(2), grad_output.size(3),
+                                        grad_output.size(4),
+                                        static_cast<int>(self.dtype()));
+        return grad_input;
+    }
     return write_exact_out("adaptive_max_pool3d_backward",
-                           ops::adaptive_max_pool3d_backward(grad_output, self),
+                           ops::max_pool3d_with_indices_backward(
+                               grad_output, self, {}, {}, {}, {}, false, indices),
                            grad_input);
 }
 

@@ -108,47 +108,6 @@ __global__ void adaptive_max_pool3d_fwd_kernel(
     }
 }
 
-template <typename T, typename M>
-__global__ void adaptive_max_pool3d_bwd_kernel(
-    int64_t total, int64_t D, int64_t H, int64_t W,
-    int64_t oD, int64_t oH, int64_t oW,
-    const T* __restrict__ input, const T* __restrict__ grad_output,
-    T* __restrict__ grad_input) {
-    int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
-    const int64_t stride = (int64_t)blockDim.x * gridDim.x;
-    const int64_t out_spatial = oD * oH * oW;
-    for (; i < total; i += stride) {
-        const int64_t w = i % oW;
-        const int64_t h = (i / oW) % oH;
-        const int64_t d = (i / (oW * oH)) % oD;
-        const int64_t nc = i / out_spatial;
-        const T* vol = input + nc * D * H * W;
-        const int64_t ds = d * D / oD;
-        const int64_t de = 1 + (((d + 1) * D) - 1) / oD;
-        const int64_t hs = h * H / oH;
-        const int64_t he = 1 + (((h + 1) * H) - 1) / oH;
-        const int64_t ws = w * W / oW;
-        const int64_t we = 1 + (((w + 1) * W) - 1) / oW;
-        M max_val = -std::numeric_limits<M>::infinity();
-        int64_t max_idx = -1;
-        for (int64_t z = ds; z < de; ++z) {
-            for (int64_t y = hs; y < he; ++y) {
-                for (int64_t x = ws; x < we; ++x) {
-                    const int64_t idx = (z * H + y) * W + x;
-                    const M val = static_cast<M>(vol[idx]);
-                    if ((val > max_val) || ::isnan(val)) {
-                        max_val = val;
-                        max_idx = idx;
-                    }
-                }
-            }
-        }
-        if (max_idx >= 0) {
-            gpuAtomicAdd(grad_input + nc * D * H * W + max_idx, grad_output[i]);
-        }
-    }
-}
-
 }
 
 #define POOL_CUDA_DISPATCH(ctype, name, ...)                                \
@@ -216,58 +175,9 @@ std::tuple<Tensor, Tensor> adaptive_max_pool3d_with_indices_cuda(
     return std::make_tuple(out, indices);
 }
 
-Tensor adaptive_max_pool3d_cuda(const Tensor& input,
-                                 const std::vector<int64_t>& output_size) {
-    return std::get<0>(adaptive_max_pool3d_with_indices_cuda(input, output_size));
-}
-
-Tensor adaptive_max_pool3d_backward_cuda(const Tensor& grad_output,
-                                          const Tensor& input) {
-    if (grad_output.dim() == 4 && input.dim() == 4) {
-        return adaptive_max_pool3d_backward_cuda(
-                   grad_output.unsqueeze(0), input.unsqueeze(0)).squeeze(0);
-    }
-    if (grad_output.dim() != 5 || input.dim() != 5) {
-        TP_THROW(RuntimeError,
-                 "adaptive_max_pool3d_backward: Expected 5D input and grad_output");
-    }
-    const Tensor input_c = input.contiguous();
-    const Tensor go = grad_output.contiguous();
-    const int64_t N = input_c.size(0), C = input_c.size(1);
-    const int64_t D = input_c.size(2), H = input_c.size(3), W = input_c.size(4);
-    const int64_t oD = go.size(2), oH = go.size(3), oW = go.size(4);
-    Tensor grad_input = Tensor::zeros(
-        {N, C, D, H, W}, input.dtype(), input.device());
-    const int64_t total = go.numel();
-    const int threads = 256;
-    const int64_t blocks = pool_grid_blocks(total, threads);
-    const auto stream = getCurrentCUDAStream().stream();
-    switch (input.dtype()) {
-        POOL_CUDA_DISPATCH(float, Float32,
-            adaptive_max_pool3d_bwd_kernel<float, M><<<blocks, threads, 0, stream>>>(
-                total, D, H, W, oD, oH, oW,
-                input_c.data_ptr<float>(), go.data_ptr<float>(),
-                grad_input.data_ptr<float>()))
-        POOL_CUDA_DISPATCH(double, Float64,
-            adaptive_max_pool3d_bwd_kernel<double, M><<<blocks, threads, 0, stream>>>(
-                total, D, H, W, oD, oH, oW,
-                input_c.data_ptr<double>(), go.data_ptr<double>(),
-                grad_input.data_ptr<double>()))
-        POOL_CUDA_DISPATCH(tensorplay::Half, Float16,
-            (adaptive_max_pool3d_bwd_kernel<tensorplay::Half, M><<<blocks, threads, 0, stream>>>(
-                total, D, H, W, oD, oH, oW,
-                input_c.data_ptr<tensorplay::Half>(), go.data_ptr<tensorplay::Half>(),
-                grad_input.data_ptr<tensorplay::Half>())))
-        POOL_CUDA_DISPATCH(tensorplay::BFloat16, BFloat16,
-            (adaptive_max_pool3d_bwd_kernel<tensorplay::BFloat16, M><<<blocks, threads, 0, stream>>>(
-                total, D, H, W, oD, oH, oW,
-                input_c.data_ptr<tensorplay::BFloat16>(), go.data_ptr<tensorplay::BFloat16>(),
-                grad_input.data_ptr<tensorplay::BFloat16>())))
-        default:
-            TP_THROW(NotImplementedError,
-                     "adaptive_max_pool3d_backward CUDA supports Float32/Float64/Float16/BFloat16 only");
-    }
-    return grad_input;
+std::tuple<Tensor, Tensor> adaptive_max_pool3d_cuda(
+    const Tensor& input, const std::vector<int64_t>& output_size) {
+    return adaptive_max_pool3d_with_indices_cuda(input, output_size);
 }
 
 Tensor adaptive_max_pool3d_with_indices_backward_cuda(
@@ -340,6 +250,14 @@ std::tuple<Tensor, Tensor> interop_adaptive_max_pool3d_out_cuda(
     write_pooling_out("adaptive_max_pool3d", std::get<0>(result), out);
     write_pooling_out("adaptive_max_pool3d", std::get<1>(result), indices);
     return {out, indices};
+}
+
+// The scatter is driven by the indices the forward saved: one linear offset
+// into each (D, H, W) volume per output element.
+Tensor adaptive_max_pool3d_backward_cuda(const Tensor& grad_output,
+                                         const Tensor& input,
+                                         const Tensor& indices) {
+    return adaptive_max_pool3d_with_indices_backward_cuda(grad_output, input, indices);
 }
 
 Tensor& interop_adaptive_max_pool3d_backward_grad_input_cuda(

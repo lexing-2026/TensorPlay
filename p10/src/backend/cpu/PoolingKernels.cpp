@@ -8,6 +8,7 @@
 #include <vector>
 #include <cstdint>
 #include <cmath>
+#include <cstring>
 #include <algorithm>
 #include <limits>
 #include <optional>
@@ -1757,18 +1758,20 @@ Tensor adaptive_max_pool3d_impl(const Tensor& input,
         TP_THROW(RuntimeError, "adaptive_max_pool3d: Invalid output size");
     // Channels-last-3d frame pools the NDHWC buffer in place; the channel
     // span is the tier-compiled vectorized dimension (cpu/PoolingKernels.h).
-    // Winners publish densely into a channels-last-3d index tensor, matching
-    // the fixed-shape frame; the NCDHW frame below fills its dense NCDHW
-    // indices only when requested.
     if (input.is_contiguous(MemoryFormat::ChannelsLast3d) &&
         (input.dtype() == DType::Float32 || input.dtype() == DType::Float64)) {
         const std::vector<int64_t> out_sizes = {N, C, oD, oH, oW};
         Tensor out = Tensor::empty(out_sizes, input.dtype(), input.device());
         out = out.as_strided(out_sizes, get_channels_last_strides(out_sizes), 0);
-        Tensor indices = Tensor::empty(out_sizes, DType::Int64, input.device());
-        indices = indices.as_strided(out_sizes, get_channels_last_strides(out_sizes), 0);
+        Tensor indices;
+        int64_t* idxp = nullptr;
+        if (indices_out) {
+            indices = Tensor::empty(out_sizes, DType::Int64, input.device());
+            indices = indices.as_strided(out_sizes, get_channels_last_strides(out_sizes), 0);
+            idxp = indices.data_ptr<int64_t>();
+        }
         adaptive_max_pool3d_cl_stub(DeviceType::CPU, input.data_ptr(),
-                                    out.data_ptr(), indices.data_ptr<int64_t>(),
+                                    out.data_ptr(), idxp,
                                     N, C, D, H, W, oD, oH, oW,
                                     static_cast<int>(input.dtype()));
         if (indices_out) *indices_out = indices;
@@ -1835,9 +1838,9 @@ std::tuple<Tensor, Tensor> adaptive_max_pool3d_with_indices_cpu(
     return {out, indices};
 }
 
-Tensor adaptive_max_pool3d_cpu(const Tensor& input,
-                               const std::vector<int64_t>& output_size) {
-    return adaptive_max_pool3d_impl(input, output_size, nullptr);
+std::tuple<Tensor, Tensor> adaptive_max_pool3d_cpu(const Tensor& input,
+                                                   const std::vector<int64_t>& output_size) {
+    return adaptive_max_pool3d_with_indices_cpu(input, output_size);
 }
 
 std::tuple<Tensor, Tensor> adaptive_max_pool3d_out_cpu(
@@ -1849,85 +1852,38 @@ std::tuple<Tensor, Tensor> adaptive_max_pool3d_out_cpu(
     return {out, indices};
 }
 
-Tensor adaptive_max_pool3d_backward_cpu(const Tensor& grad_output, const Tensor& input) {
+// The scatter is driven by the indices the forward saved: one linear offset
+// into each (D, H, W) volume per output element.
+Tensor adaptive_max_pool3d_backward_cpu(const Tensor& grad_output, const Tensor& input,
+                                        const Tensor& indices) {
     if (grad_output.dim() == 4 && input.dim() == 4)
-        return adaptive_max_pool3d_backward_cpu(grad_output.unsqueeze(0),
-                                                input.unsqueeze(0)).squeeze(0);
+        return adaptive_max_pool3d_backward_cpu(grad_output.unsqueeze(0), input.unsqueeze(0),
+                                                indices.unsqueeze(0)).squeeze(0);
     if (grad_output.dim() != 5 || input.dim() != 5)
         TP_THROW(RuntimeError, "adaptive_max_pool3d_backward: Expected 5D input and grad_output");
-    // Channels-last-3d frame: each output pixel re-finds its per-lane argmax
-    // with the forward sweep over the NDHWC input and adds its grad_output
-    // channel block straight onto the argmax positions of an NDHWC-viewed
-    // zero buffer, skipping the NCDHW materializations the scalar path below
-    // pays for.  Accumulation order per input element matches the scalar
-    // frame, so gradients are bit-identical.
-    if (grad_output.is_contiguous(MemoryFormat::ChannelsLast3d) &&
-        input.is_contiguous(MemoryFormat::ChannelsLast3d) &&
-        (input.dtype() == DType::Float32 || input.dtype() == DType::Float64) &&
-        grad_output.dtype() == input.dtype()) {
-        const std::vector<int64_t> sizes = input.shape();
-        Tensor grad_input = Tensor::zeros(sizes, input.dtype(), input.device());
-        grad_input = grad_input.as_strided(sizes, get_channels_last_strides(sizes), 0);
-        adaptive_max_pool3d_backward_cl_stub(DeviceType::CPU,
-                                             grad_output.data_ptr(),
-                                             input.data_ptr(),
-                                             grad_input.data_ptr(),
-                                             input.size(0), input.size(1),
-                                             input.size(2), input.size(3),
-                                             input.size(4),
-                                             grad_output.size(2),
-                                             grad_output.size(3),
-                                             grad_output.size(4),
-                                             static_cast<int>(input.dtype()));
-        return grad_input;
-    }
-    const Tensor input_c = input.contiguous();
+    Tensor grad_input = Tensor::zeros(static_cast<std::vector<int64_t>>(input.shape()),
+                                      input.dtype(), input.device());
+    if (grad_input.numel() == 0) return grad_input;
     const Tensor go = grad_output.contiguous();
-    const int64_t N = input_c.size(0), C = input_c.size(1);
-    const int64_t D = input_c.size(2), H = input_c.size(3), W = input_c.size(4);
-    const int64_t oD = go.size(2), oH = go.size(3), oW = go.size(4);
-    Tensor grad_input = Tensor::zeros({N, C, D, H, W}, input.dtype(), input.device());
+    const Tensor idx = indices.contiguous();
     TP_DISPATCH_ALL_TYPES(input.dtype(), "adaptive_max_pool3d_backward", [&]() {
         scalar_t* gi = grad_input.data_ptr<scalar_t>();
         const scalar_t* gop = go.data_ptr<scalar_t>();
-        const scalar_t* ip = input_c.data_ptr<scalar_t>();
-        const int64_t in_plane = D * H * W;
-        const int64_t out_plane = oD * oH * oW;
-        // Scatter: parallel over (n, c) planes (race free).
-        parallel_for(0, N * C, 1, [&](int64_t begin, int64_t end) {
+        const int64_t* idxp = idx.data_ptr<int64_t>();
+        const int64_t plane = input.size(2) * input.size(3) * input.size(4);
+        const int64_t out_plane = go.size(2) * go.size(3) * go.size(4);
+        const int64_t NC = go.size(0) * go.size(1);
+        // Parallel over (n, c) volumes: one thread owns every output element of
+        // a volume, so no two threads accumulate into the same plane.
+        parallel_for(0, NC, 1, [&](int64_t begin, int64_t end) {
             for (int64_t nc = begin; nc < end; ++nc) {
-                const scalar_t* vol = ip + nc * in_plane;
-                scalar_t* gvol = gi + nc * in_plane;
+                scalar_t* gi_base = gi + nc * plane;
                 const scalar_t* go_base = gop + nc * out_plane;
-                for (int64_t d = 0; d < oD; ++d) {
-                    const int64_t ds = d * D / oD;
-                    const int64_t de = 1 + (((d + 1) * D) - 1) / oD;
-                    for (int64_t h = 0; h < oH; ++h) {
-                        const int64_t hs = h * H / oH;
-                        const int64_t he = 1 + (((h + 1) * H) - 1) / oH;
-                        for (int64_t w = 0; w < oW; ++w) {
-                            const int64_t ws = w * W / oW;
-                            const int64_t we = 1 + (((w + 1) * W) - 1) / oW;
-                            scalar_t max_val = std::numeric_limits<scalar_t>::is_iec559
-                                ? -std::numeric_limits<scalar_t>::infinity()
-                                : std::numeric_limits<scalar_t>::lowest();
-                            int64_t max_idx = -1;
-                            for (int64_t z = ds; z < de; ++z)
-                            for (int64_t y = hs; y < he; ++y) {
-                                const int64_t row_off = (z * H + y) * W;
-                                const scalar_t* row = vol + row_off;
-                                for (int64_t x = ws; x < we; ++x) {
-                                    const scalar_t val = row[x];
-                                    if ((val > max_val) || std::isnan(val)) {
-                                        max_val = val;
-                                        max_idx = row_off + x;
-                                    }
-                                }
-                            }
-                            if (max_idx != -1)
-                                gvol[max_idx] += go_base[(d * oH + h) * oW + w];
-                        }
-                    }
+                const int64_t* idx_base = idxp + nc * out_plane;
+                for (int64_t i = 0; i < out_plane; ++i) {
+                    const int64_t max_idx = idx_base[i];
+                    if (max_idx < 0) continue;
+                    gi_base[max_idx] += go_base[i];
                 }
             }
         });

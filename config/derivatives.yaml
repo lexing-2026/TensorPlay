@@ -593,8 +593,9 @@
 - name: adaptive_max_pool2d_with_indices(Tensor input, int[] output_size) -> (Tensor output, Tensor indices)
   input: adaptive_max_pool2d_with_indices_backward(grad, input, output_size, indices)
 
-- name: adaptive_max_pool3d(Tensor input, int[] output_size) -> Tensor
-  input: adaptive_max_pool3d_backward(grad, input)
+- name: adaptive_max_pool3d(Tensor input, int[] output_size) -> (Tensor output, Tensor indices)
+  input: adaptive_max_pool3d_backward(grad, input, indices)
+  output_differentiability: [True, False]
 
 # argmax positions; kernel_size is unused by the backward.
 - name: fractional_max_pool2d(Tensor self, int[] kernel_size, int[] output_size, Tensor random_samples) -> (Tensor output, Tensor indices)
@@ -648,10 +649,10 @@
   grad_output: adaptive_max_pool2d_double_backward(grad, input, grad_output.shape())
   input: zeros_like(input)
 
-# adaptive_max_pool3d keeps no indices; the helper recomputes the windows'
-# argmax from the input the way the kernel scans them.
-- name: adaptive_max_pool3d_backward(Tensor grad_output, Tensor input) -> Tensor
-  grad_output: adaptive_max_pool3d_double_backward(grad, input, grad_output.shape())
+# The scatter onto the saved positions; its derivative in grad_output is the
+# adjoint gather at those same positions.
+- name: adaptive_max_pool3d_backward(Tensor grad_output, Tensor input, Tensor indices) -> Tensor
+  grad_output: max_pool_double_backward(grad, indices, 3)
   input: zeros_like(input)
 
 - name: fractional_max_pool2d_backward(Tensor grad_output, Tensor self, int[] kernel_size, int[] output_size, Tensor indices) -> Tensor
@@ -2421,10 +2422,13 @@
 - name: segment_reduce(Tensor data, str reduce, *, Tensor? lengths=None, Tensor? indices=None, Tensor? offsets=None, int axis=0, bool unsafe=False, Scalar? initial=None) -> Tensor
   data: _segment_reduce_backward(grad, result, data, reduce, lengths, offsets, axis, initial)
 
+# The scatter's slope depends only on the data, so the transpose contracts
+# grad against the slope the same kernel produces for a unit gradient; the
+# scatter itself is a step function of the reduced result.
 - name: _segment_reduce_backward(Tensor grad_output, Tensor output, Tensor data, str reduce, *, Tensor? lengths=None, Tensor? offsets=None, int axis=0, Scalar? initial=None) -> Tensor
-  grad_output: not_implemented_grad("_segment_reduce_backward")
-  output: not_implemented_grad("_segment_reduce_backward")
-  data: not_implemented_grad("_segment_reduce_backward")
+  grad_output: segment_reduce_backward_grad_output(grad, output, data, reduce, lengths, offsets, axis, initial)
+  output: zeros_like(output)
+  data: segment_reduce_backward_data(data, reduce)
 
 - name: _trilinear(Tensor i1, Tensor i2, Tensor i3, int[] expand1, int[] expand2, int[] expand3, int[] sumdim, int unroll_dim=1) -> Tensor
   i1: std::get<0>(_trilinear_backward(grad, i1, i2, i3, expand1, expand2, expand3, sumdim, {true, false, false}))
@@ -2455,9 +2459,11 @@
 - name: _sparse_sum.dim(Tensor self, int[1] dim) -> Tensor
   self: _sparse_sum_backward(grad, self, dim)
 
+# Broadcasting the reduced gradient back onto the stored coordinates is the
+# transpose of summing them, so its derivative in grad_output is that sum.
 - name: _sparse_sum_backward(Tensor grad_output, Tensor self, int[] dim) -> Tensor
-  grad_output: not_implemented_grad("_sparse_sum_backward")
-  self: not_implemented_grad("_sparse_sum_backward")
+  grad_output: sparse_sum_backward_double_backward(grad, self, dim)
+  self: sparse_sum_backward_double_backward_self(self)
 
 - name: _spdiags(Tensor diagonals, Tensor offsets, int[] shape, int? layout=None) -> Tensor
   output_differentiability: [False]

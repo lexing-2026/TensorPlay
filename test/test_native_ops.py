@@ -198,6 +198,22 @@ class TestMaxPool3d(unittest.TestCase):
                                           err_msg=f"max_pool3d_with_indices indices ({dev})")
             assert_reference_close(x.grad, x_t.grad, msg=f"max_pool3d_with_indices bwd ({dev})", rtol=1e-4, atol=1e-5)
 
+    def test_channels_last_3d_backward(self):
+        rng = np.random.default_rng(89)
+        data = rng.standard_normal((2, 17, 7, 6, 5)).astype(np.float32)
+        x = tp.tensor(data).contiguous(memory_format=tp.channels_last_3d)
+        x.requires_grad_(True)
+        ref_x = torch.tensor(data).contiguous(memory_format=torch.channels_last_3d)
+        ref_x.requires_grad_(True)
+        values, indices = F.max_pool3d_with_indices(x, 3, stride=2, padding=1)
+        ref_values, ref_indices = torch_F.max_pool3d_with_indices(
+            ref_x, 3, stride=2, padding=1)
+        grad = rng.standard_normal(tuple(ref_values.shape)).astype(np.float32)
+        values.backward(tp.tensor(grad).contiguous(memory_format=tp.channels_last_3d))
+        ref_values.backward(torch.tensor(grad).contiguous(memory_format=torch.channels_last_3d))
+        np.testing.assert_array_equal(to_numpy(indices), ref_indices.detach().numpy())
+        np.testing.assert_allclose(to_numpy(x.grad), ref_x.grad.numpy(), rtol=0, atol=0)
+
     def test_module(self):
         for dev in reference_devices():
             torch.manual_seed(13)
@@ -281,6 +297,87 @@ class TestAdaptiveMaxPool3d(unittest.TestCase):
             assert_reference_close(vals, ref_v, msg=f"adaptive_max_pool3d indices fwd ({dev})", rtol=1e-4, atol=1e-5)
             np.testing.assert_array_equal(to_numpy(idx), ref_i.numpy(),
                                           err_msg=f"adaptive_max_pool3d indices ({dev})")
+
+    def test_channels_last_3d_native(self):
+        rng = np.random.default_rng(73)
+        for dtype, channels in ((np.float32, 3), (np.float32, 17), (np.float64, 9)):
+            data = rng.standard_normal((2, channels, 4, 3, 5)).astype(dtype)
+            data[:, 0] = -np.inf
+            data[:, 1] = 0
+            data[0, 2, 0, 0, 0] = np.nan
+            data[0, 2, 0, 0, 1] = np.nan
+            x = tp.tensor(data).contiguous(memory_format=tp.channels_last_3d)
+            ref_x = torch.tensor(data).contiguous(memory_format=torch.channels_last_3d)
+            for size in ((2, 2, 3), (1, 1, 1), (5, 4, 6)):
+                ref_v, ref_i = torch_F.adaptive_max_pool3d(ref_x, size, return_indices=True)
+                values = tp.ops.tp.adaptive_max_pool3d.default(x, list(size))[0]
+                result = tp.ops.tp.adaptive_max_pool3d.out(
+                    x, list(size), out=tp.empty(tuple(ref_v.shape), dtype=x.dtype),
+                    indices=tp.empty(tuple(ref_v.shape), dtype=tp.int64))
+                np.testing.assert_allclose(to_numpy(values), ref_v.numpy(), rtol=0, atol=0)
+                np.testing.assert_allclose(to_numpy(result[0]), ref_v.numpy(), rtol=0, atol=0)
+                np.testing.assert_array_equal(to_numpy(result[1]), ref_i.numpy())
+                public_v, public_i = F.adaptive_max_pool3d(x, size, return_indices=True)
+                self.assertTrue(public_v.is_contiguous(memory_format=tp.channels_last_3d))
+                self.assertTrue(public_i.is_contiguous(memory_format=tp.channels_last_3d))
+                np.testing.assert_allclose(to_numpy(public_v), ref_v.numpy(), rtol=0, atol=0)
+                np.testing.assert_array_equal(to_numpy(public_i), ref_i.numpy())
+
+    def test_channels_last_3d_backward(self):
+        rng = np.random.default_rng(79)
+        for dtype in (np.float32, np.float64):
+            data = rng.standard_normal((2, 17, 5, 4, 6)).astype(dtype)
+            x = tp.tensor(data).contiguous(memory_format=tp.channels_last_3d)
+            ref_x = torch.tensor(data).contiguous(memory_format=torch.channels_last_3d)
+            for size in ((3, 2, 4), (1, 1, 1), (6, 5, 7)):
+                grad = rng.standard_normal((2, 17, *size)).astype(dtype)
+                go = tp.tensor(grad).contiguous(memory_format=tp.channels_last_3d)
+                ref_v, ref_i = torch_F.adaptive_max_pool3d(ref_x, size, return_indices=True)
+                ref_go = torch.tensor(grad).contiguous(memory_format=torch.channels_last_3d)
+                want = torch.ops.aten.adaptive_max_pool3d_backward(ref_go, ref_x, ref_i)
+                idx = tp.tensor(ref_i.numpy()).contiguous(memory_format=tp.channels_last_3d)
+                got = tp.ops.tp.adaptive_max_pool3d_backward.default(go, x, idx)
+                np.testing.assert_allclose(to_numpy(got), want.numpy(), rtol=0, atol=0)
+                public_x = tp.tensor(data).contiguous(memory_format=tp.channels_last_3d)
+                public_x.requires_grad_(True)
+                public_v, public_i = F.adaptive_max_pool3d(public_x, size, return_indices=True)
+                public_v.backward(go)
+                np.testing.assert_array_equal(to_numpy(public_i), ref_i.numpy())
+                np.testing.assert_allclose(to_numpy(public_x.grad), want.numpy(), rtol=0, atol=0)
+
+    def test_channels_last_3d_saved_indices_backward(self):
+        rng = np.random.default_rng(83)
+        for dtype, channels in ((np.float32, 3), (np.float32, 17), (np.float64, 9)):
+            data = rng.standard_normal((2, channels, 5, 4, 6)).astype(dtype)
+            data[:, 0] = -np.inf
+            data[0, 1, 0, 0, 0] = np.nan
+            data[0, 1, 0, 0, 1] = np.nan
+            x = tp.tensor(data).contiguous(memory_format=tp.channels_last_3d)
+            ref_x = torch.tensor(data).contiguous(memory_format=torch.channels_last_3d)
+            for size in ((3, 2, 4), (6, 5, 7)):
+                grad = rng.standard_normal((2, channels, *size)).astype(dtype)
+                go = tp.tensor(grad).contiguous(memory_format=tp.channels_last_3d)
+                ref_go = torch.tensor(grad).contiguous(memory_format=torch.channels_last_3d)
+                _, ref_idx = torch_F.adaptive_max_pool3d(ref_x, size, return_indices=True)
+                idx = tp.tensor(ref_idx.numpy()).contiguous(memory_format=tp.channels_last_3d)
+                pristine = idx.clone()
+                dest = tp.empty(data.shape, dtype=x.dtype).contiguous(
+                    memory_format=tp.channels_last_3d)
+                result = tp.ops.tp.adaptive_max_pool3d_backward.grad_input(
+                    go, x, idx, grad_input=dest)
+                want = torch.ops.aten.adaptive_max_pool3d_backward(ref_go, ref_x, ref_idx)
+                np.testing.assert_allclose(to_numpy(result), want.numpy(), rtol=0, atol=0)
+                idx.zero_()
+                redirected = tp.ops.tp.adaptive_max_pool3d_backward.grad_input(
+                    go, x, idx, grad_input=dest)
+                ref_idx.zero_()
+                redirected_ref = torch.ops.aten.adaptive_max_pool3d_backward(
+                    ref_go, ref_x, ref_idx)
+                np.testing.assert_allclose(
+                    to_numpy(redirected), redirected_ref.numpy(), rtol=0, atol=0)
+                np.testing.assert_allclose(to_numpy(
+                    tp.ops.tp.adaptive_max_pool3d_backward.default(go, x, pristine)),
+                    want.numpy(), rtol=0, atol=0)
 
     def test_module(self):
         for dev in reference_devices():

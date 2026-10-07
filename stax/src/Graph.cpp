@@ -907,8 +907,9 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                 result = tpx::ops::adaptive_max_pool2d(
                     value(node.inputs[0]), output_size);
             } else {
-                result = tpx::ops::adaptive_max_pool3d(
+                auto pooled = tpx::ops::adaptive_max_pool3d(
                     value(node.inputs[0]), output_size);
+                result = std::get<0>(pooled);
             }
         } else if (node.op_type == "max_pool1d" ||
                    node.op_type == "max_pool2d" ||

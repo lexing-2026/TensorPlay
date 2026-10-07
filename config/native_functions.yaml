@@ -2502,8 +2502,9 @@
     CPU: adaptive_max_pool2d_with_indices_cpu
     CUDA: adaptive_max_pool2d_with_indices_cuda
 
-# floor/ceil bin bounds identical to adaptive avg pool 3d.
-- func: adaptive_max_pool3d(Tensor input, int[] output_size) -> Tensor
+# floor/ceil bin bounds identical to adaptive avg pool 3d.  The argmax comes
+# back with the values so autograd scatters onto it instead of rescanning.
+- func: adaptive_max_pool3d(Tensor input, int[] output_size) -> (Tensor output, Tensor indices)
   variants: function
   dispatch:
     CPU: adaptive_max_pool3d_cpu
@@ -2697,7 +2698,7 @@
     CPU: adaptive_max_pool2d_with_indices_backward_cpu
     CUDA: adaptive_max_pool2d_with_indices_backward_cuda
 
-- func: adaptive_max_pool3d_backward(Tensor grad_output, Tensor input) -> Tensor
+- func: adaptive_max_pool3d_backward(Tensor grad_output, Tensor input, Tensor indices) -> Tensor
   variants: function
   dispatch:
     CPU: adaptive_max_pool3d_backward_cpu
