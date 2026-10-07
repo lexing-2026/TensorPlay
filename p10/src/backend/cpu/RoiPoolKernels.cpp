@@ -286,13 +286,11 @@ static Tensor ps_roi_pool_backward_cpu_impl(
                 for (int64_t c = 0; c < channels; ++c) {
                     for (int64_t ph = 0; ph < pooled_height; ++ph) {
                         for (int64_t pw = 0; pw < pooled_width; ++pw) {
-                            // Backward clamps to [0, size] like the forward bin
-                            // arithmetic of the max variant.
+                            // Same bins as the forward pass, so the backward is
+                            // the adjoint of the averaging it inverts.
                             PoolBin bin;
-                            bin.hstart = clamp_to(static_cast<int64_t>(std::floor(static_cast<double>(ph) * box.bin_size_h)) + box.start_h, H);
-                            bin.hend = clamp_to(static_cast<int64_t>(std::ceil(static_cast<double>(ph + 1) * box.bin_size_h)) + box.start_h, H);
-                            bin.wstart = clamp_to(static_cast<int64_t>(std::floor(static_cast<double>(pw) * box.bin_size_w)) + box.start_w, W);
-                            bin.wend = clamp_to(static_cast<int64_t>(std::ceil(static_cast<double>(pw + 1) * box.bin_size_w)) + box.start_w, W);
+                            fill_ps_pool_bin(bin, ph, pw, box.start_h, box.start_w, H, W,
+                                             box.bin_size_h, box.bin_size_w);
                             if (bin.hend <= bin.hstart || bin.wend <= bin.wstart) continue;
                             const int64_t c_in = (c * pooled_height + ph) * pooled_width + pw;
                             storage_t* g_c = g_b + c_in * H * W;

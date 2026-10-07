@@ -224,6 +224,153 @@ def test_ps_roi_align_differentiates_twice(device, sampling_ratio, empty):
     assert gradgradcheck(back, (go,), atol=1e-6, rtol=1e-4)
 
 
+def pool_boxes(device, empty=False):
+    if empty:
+        return tp.zeros(0, 5, dtype=tp.float64).to(device)
+    rows = [[0, 0.3, 0.6, 4.2, 5.1],
+            [1, 1.7, 0.2, 7.9, 6.6],
+            [0, -1.5, 3.0, 9.5, 8.4],
+            [1, 2.0, 2.0, 2.4, 2.6],
+            [0, 0.0, 0.0, 7.0, 7.0],
+            [1, 6.0, 6.0, 8.0, 8.0]]
+    return tp.tensor(rows, dtype=tp.float64).to(device)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("empty", [False, True])
+def test_roi_pool_differentiates_twice(device, empty):
+    x = rand(2, 3, 7, 8, device=device, seed=19)
+    rois = pool_boxes(device, empty)
+
+    check(lambda t: _C.roi_pool(t, rois, 0.9, 2, 3) ** 2, [x])
+    go = rand(rois.shape[0], 3, 2, 3, device=device, seed=20)
+    back = lambda g: _C.roi_pool_backward(g, x, rois, 0.9, 2, 3)
+    assert gradcheck(back, (go,), atol=1e-6, rtol=1e-4)
+    assert gradgradcheck(back, (go,), atol=1e-6, rtol=1e-4)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("empty", [False, True])
+def test_ps_roi_pool_differentiates_twice(device, empty):
+    x = rand(2, 12, 7, 8, device=device, seed=21)
+    rois = pool_boxes(device, empty)
+
+    check(lambda t: _C.ps_roi_pool(t, rois, 0.9, 2, 3) ** 2, [x])
+    go = rand(rois.shape[0], 3, 2, 3, device=device, seed=22)
+    back = lambda g: _C.ps_roi_pool_backward(g, rois, 0.9, 2, 3, [2, 12, 7, 8])
+    assert gradcheck(back, (go,), atol=1e-6, rtol=1e-4)
+    assert gradgradcheck(back, (go,), atol=1e-6, rtol=1e-4)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_ps_roi_pool_backward_is_the_forward_adjoint(device):
+    # Averaging a bin and scattering over the same bin are transposes, so the
+    # inner product of an output tangent with the pooled input equals the inner
+    # product of the input with the pooled tangent.
+    x = rand(2, 12, 7, 8, device=device, seed=23)
+    rois = pool_boxes(device)
+    y = _C.ps_roi_pool(x, rois, 0.9, 2, 3)
+    u = rand(y.shape, device=device, seed=24)
+    np.testing.assert_allclose(
+        float((y * u).sum()),
+        float((x * _C.ps_roi_pool_backward(u, rois, 0.9, 2, 3, [2, 12, 7, 8])).sum()),
+        rtol=1e-9, atol=1e-9)
+
+
+def segment_boundaries(device, boundary):
+    if boundary == "lengths":
+        return {"lengths": tp.tensor([[2, 3], [1, 4]], dtype=tp.int64).to(device)}
+    return {"offsets": tp.tensor([[0, 2, 5], [0, 1, 5]], dtype=tp.int64).to(device)}
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("reduce", ["sum", "mean", "max", "min"])
+@pytest.mark.parametrize("boundary", ["lengths", "offsets"])
+def test_segment_reduce_differentiates_twice(device, reduce, boundary):
+    x = rand(2, 5, 3, device=device, seed=25)
+    check(lambda t: (tp.segment_reduce(t, reduce, axis=1, **segment_boundaries(device, boundary)) ** 2).sum(),
+          [x])
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("reduce", ["sum", "mean"])
+def test_segment_reduce_backward_slots(device, reduce):
+    x = rand(2, 5, 3, device=device, seed=26)
+    lengths = tp.tensor([[2, 3], [1, 4]], dtype=tp.int64).to(device)
+    y = tp.segment_reduce(x, reduce, axis=1, lengths=lengths)
+    go = rand(y.shape, device=device, seed=27)
+
+    def back(g):
+        return _C._segment_reduce_backward(g, y, x, reduce, lengths=lengths, axis=1)
+
+    assert gradcheck(back, (go,), atol=1e-6, rtol=1e-4)
+    assert gradgradcheck(back, (go,), atol=1e-6, rtol=1e-4)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_segment_reduce_empty_segment_second_pass(device):
+    x = rand(2, 5, device=device, seed=29)
+    lengths = tp.tensor([5, 0], dtype=tp.int64).to(device)
+    out = tp.segment_reduce(x, "sum", axis=0, lengths=lengths)
+    (g,) = tp.autograd.grad(out.sum(), [x], create_graph=True)
+    assert float(g.abs().sum()) == 0.0  # the empty segment scatters nothing
+    (gg,) = tp.autograd.grad(g.sum(), [x], allow_unused=True)
+    assert gg is None or float(gg.abs().sum()) == 0.0
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_segment_reduce_prod_data_slot_raises(device):
+    x = rand(4, device=device, seed=28)
+    lengths = tp.tensor([2, 2], dtype=tp.int64).to(device)
+    y = tp.segment_reduce(x, "prod", axis=0, lengths=lengths)
+    (g,) = tp.autograd.grad(y.sum(), [x], create_graph=True)
+    with pytest.raises(NotImplementedError, match="product reduction"):
+        tp.autograd.grad(g.sum(), [x])
+
+
+def sparse_grid_case(device="cpu"):
+    """A (3, 4) COO tensor whose rows hold 2, 2 and 1 stored entries."""
+    indices = tp.tensor([[0, 1, 1, 2, 0], [0, 1, 3, 0, 2]])
+    values = tp.tensor([1.0, 2.0, -1.5, 4.0, 0.5], dtype=tp.float64)
+    return tp.sparse_coo_tensor(indices, values, (3, 4)).to(device)
+
+
+def test_sparse_sum_backward_transposes_to_the_sum():
+    x = sparse_grid_case().detach().clone().requires_grad_(True)
+    go = sparse_grid_case().detach().clone().requires_grad_(True)
+    v = sparse_grid_case(seed=3).detach()
+    g = _C._sparse_sum_backward(go, x, [0])
+    total = (v.to_dense() * g.to_dense()).sum()
+    (gg,) = tp.autograd.grad(total, [go])
+    # Each reduced cell collects the incoming gradient of every stored cell
+    # that folded into it, which is exactly what summing v over its row gives.
+    expected = _C._sparse_sum(v, [0])
+    np.testing.assert_allclose(gg.to_dense().numpy()[1, 1], v.to_dense().numpy()[1, 1])
+    np.testing.assert_allclose(gg.to_dense().numpy()[2, 0], v.to_dense().numpy()[2, 0])
+    np.testing.assert_allclose(gg.to_dense().numpy(), expected.to_dense().numpy())
+
+
+def test_sparse_sum_backward_dense_result_scales_with_the_cell_count():
+    x = sparse_grid_case().detach().clone().requires_grad_(True)
+    go = tp.tensor(2.0, dtype=tp.float64, requires_grad=True)
+    g = _C._sparse_sum_backward(go, x, [0, 1])
+    (gg,) = tp.autograd.grad(g.to_dense().sum(), [go])
+    assert float(gg) == 5.0  # one broadcast cell per stored entry
+
+
+@pytest.mark.parametrize("dim", [[0], [1], [0, 1]])
+def test_sparse_sum_dim_second_pass_runs(dim):
+    x = sparse_grid_case().detach().clone().requires_grad_(True)
+    out = _C._sparse_sum(x, dim)
+    total = out.to_dense().sum() if out.is_sparse else out.sum()
+    (g,) = tp.autograd.grad(total, [x], create_graph=True)
+    # Both slots of the broadcast are the identity on a zero contraction.
+    (gx,) = tp.autograd.grad(g.to_dense().sum(), [x], allow_unused=True)
+    assert gx is None or float(gx.to_dense().sum()) == 0.0
+    (gu,) = tp.autograd.grad(g.to_dense().sum(), [out], allow_unused=True)
+    assert gu is None or float(gu.to_dense().sum() if gu.is_sparse else gu.sum()) == 0.0
+
+
 def test_ctc_loss_second_pass_raises():
     tp.manual_seed(8)
     log_probs = tp.randn(6, 2, 4, dtype=tp.float64).log_softmax(2).detach().requires_grad_(True)

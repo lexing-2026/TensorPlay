@@ -901,13 +901,16 @@
 - name: ps_roi_align_backward(Tensor grad_output, Tensor rois, float spatial_scale, int pooled_height, int pooled_width, int sampling_ratio, int[] input_size) -> Tensor
   grad_output: ps_roi_align(grad, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio)
 
-# The remaining ROI backward kernels have no derivative of their own.
+# roi_pool selects the bin maximum and routes the gradient to that one pixel,
+# so the backward is linear in grad_output and constant in the input.
 - name: roi_pool_backward(Tensor grad_output, Tensor input, Tensor rois, float spatial_scale, int pooled_height, int pooled_width) -> Tensor
-  grad_output: not_implemented_grad("roi_pool_backward")
-  input: not_implemented_grad("roi_pool_backward")
+  grad_output: roi_pool_backward(grad, input, rois, spatial_scale, pooled_height, pooled_width)
+  input: zeros_like(input)
 
+# ps_roi_pool averages each bin, and its backward scatters over the same bins,
+# which is the transpose of that averaging.
 - name: ps_roi_pool_backward(Tensor grad_output, Tensor rois, float spatial_scale, int pooled_height, int pooled_width, int[] input_size) -> Tensor
-  grad_output: not_implemented_grad("ps_roi_pool_backward")
+  grad_output: ps_roi_pool(grad, rois, spatial_scale, pooled_height, pooled_width)
 
 - name: deform_conv2d(Tensor input, Tensor weight, Tensor offset, Tensor mask, Tensor? bias, int[2] stride, int[2] padding, int[2] dilation, int groups, int offset_groups, bool use_mask) -> Tensor
   input: std::get<0>(deform_conv2d_backward(grad, input, weight, offset, mask, bias, stride, padding, dilation, groups, offset_groups, use_mask, {true, false, false, false, false}))
