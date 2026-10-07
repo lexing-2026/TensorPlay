@@ -1250,6 +1250,30 @@ void adaptive_max_pool3d_cl_typed(const T* in, T* out, int64_t* ind,
     });
 }
 
+// Type dispatcher for the channels-last-3d forward frame: the indices of every
+// lane are recorded alongside the maxima, as the NCDHW frame does.
+void adaptive_max_pool3d_cl_impl(const void* in, void* out, int64_t* ind,
+                                 int64_t N, int64_t C,
+                                 int64_t D, int64_t H, int64_t W,
+                                 int64_t oD, int64_t oH, int64_t oW, int dtype) {
+    switch (static_cast<DType>(dtype)) {
+        case DType::Float32:
+            adaptive_max_pool3d_cl_typed<float, /*WithIndices=*/true>(
+                static_cast<const float*>(in), static_cast<float*>(out), ind,
+                N, C, D, H, W, oD, oH, oW);
+            break;
+        case DType::Float64:
+            adaptive_max_pool3d_cl_typed<double, /*WithIndices=*/true>(
+                static_cast<const double*>(in), static_cast<double*>(out), ind,
+                N, C, D, H, W, oD, oH, oW);
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "adaptive_max_pool3d: channels-last kernel supports only "
+                     "float and double");
+    }
+}
+
 void avg_pool2d_cl_impl(const void* in, void* out,
                         int64_t N, int64_t C, int64_t H, int64_t W,
                         int64_t oH, int64_t oW,
