@@ -237,22 +237,26 @@ def pool_boxes(device, empty=False):
 
 
 @pytest.mark.parametrize("device", DEVICES)
-def test_roi_pool_second_pass_matches_two_first_order_passes(device):
-    # The backward gathers each bin's gradient from its argmax cell, so for a
-    # pooled tangent w the second pass of (y * y).sum() is 2 * Bᵀ(B w) again.
+def test_roi_pool_second_pass_raises(device):
+    # The backward scatters each output gradient onto the input's argmax cell,
+    # so its own derivative in grad_output would be a gather at those same
+    # cells.  Every kernel re-derives argmax positions from the tensor it
+    # pools, so no composition computes that gather: the second pass fails
+    # loudly instead of silently gathering at the tangent's own argmax.
     x = rand(2, 3, 7, 8, device=device, seed=19)
     rois = pool_boxes(device)
 
     def pool(t):
         return _C.roi_pool(t, rois, 0.9, 2, 3)
 
-    w = rand(*x.shape, device=device, seed=20)
-    # One ordinary pass gives Bᵀ(B w); the graph pass has to be twice it.
-    (expected,) = tp.autograd.grad((pool(x) * pool(w)).sum(), [x])
     (g,) = tp.autograd.grad((pool(x) ** 2).sum(), [x], create_graph=True)
-    (gg,) = tp.autograd.grad((g * w).sum(), [x])
-    np.testing.assert_allclose(gg.detach().cpu().numpy(),
-                               (2 * expected).detach().cpu().numpy(), rtol=1e-9, atol=1e-9)
+    with pytest.raises(NotImplementedError, match="roi_pool_backward"):
+        tp.autograd.grad((g * g).sum(), [x])
+
+    go = rand(6, 3, 2, 3, device=device, seed=20)
+    back = lambda t: _C.roi_pool_backward(t, x, rois, 0.9, 2, 3)
+    with pytest.raises(NotImplementedError, match="roi_pool_backward"):
+        tp.autograd.grad(back(go).sum(), [go])
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -261,7 +265,9 @@ def test_roi_pool_backward_input_slot_is_a_step_function(device):
     # backward sends nothing to the input.
     x = rand(2, 3, 7, 8, device=device, seed=19)
     rois = pool_boxes(device)
-    go = rand(6, 3, 2, 3, device=device, seed=31)
+    # The incoming gradient is a constant here: differentiating the backward
+    # call in grad_output has no derivative and would fail loudly instead.
+    go = rand(6, 3, 2, 3, device=device, seed=31).detach()
     back = lambda g: _C.roi_pool_backward(g, x, rois, 0.9, 2, 3)
     (gx,) = tp.autograd.grad(back(go).sum(), [x])
     zeros = np.zeros(tuple(gx.shape))

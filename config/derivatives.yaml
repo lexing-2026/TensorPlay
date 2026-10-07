@@ -902,12 +902,13 @@
   grad_output: ps_roi_align(grad, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio)
 
 # roi_pool's backward scatters each output gradient onto the bin's argmax
-# pixel (a transpose of the forward's gather), so it is linear in grad_output
-# and constant in the input.  Its own derivative in grad_output is therefore
-# the adjoint of that scatter: the forward gather applied to the incoming
-# gradient, recomputing the same argmax from the input.
+# pixel, so it is linear in grad_output and constant in the input.  Its own
+# derivative in grad_output would be the adjoint gather at the input's argmax
+# positions, but every available kernel re-derives those positions from the
+# tensor it pools, so no composition of them computes the gather; the second
+# derivative therefore fails loudly instead of returning wrong values.
 - name: roi_pool_backward(Tensor grad_output, Tensor input, Tensor rois, float spatial_scale, int pooled_height, int pooled_width) -> Tensor
-  grad_output: roi_pool(grad, rois, spatial_scale, pooled_height, pooled_width)
+  grad_output: not_implemented_grad("roi_pool_backward")
   input: zeros_like(input)
 
 # ps_roi_pool averages each bin, and its backward scatters over the same bins,
