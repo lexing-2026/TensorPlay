@@ -642,6 +642,10 @@
   grad_output: max_pool_double_backward(grad, indices, 2)
   input: zeros_like(input)
 
+- name: adaptive_max_pool2d_backward(Tensor grad_output, Tensor input) -> Tensor
+  grad_output: adaptive_max_pool2d_double_backward(grad, input, grad_output.shape())
+  input: zeros_like(input)
+
 # adaptive_max_pool3d keeps no indices; the helper recomputes the windows'
 # argmax from the input the way the kernel scans them.
 - name: adaptive_max_pool3d_backward(Tensor grad_output, Tensor input) -> Tensor

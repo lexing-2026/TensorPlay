@@ -83,6 +83,22 @@ def test_masked_scatter_backward_records_its_adjoint():
     assert weights_grad.tolist() == [1.0, 0.0, 1.0, 0.0]
 
 
+def test_adaptive_max_pool2d_backward_records_its_adjoint():
+    x = tp.tensor([[[[1.0, 4.0, 2.0, 3.0],
+                     [5.0, 0.0, 6.0, 7.0],
+                     [8.0, 9.0, 1.0, 2.0],
+                     [3.0, 4.0, 5.0, 6.0]]]],
+                  dtype=tp.float64, requires_grad=True)
+    weights = tp.tensor([[[[1.0, 2.0], [3.0, 4.0]]]],
+                        dtype=tp.float64, requires_grad=True)
+
+    output = F.adaptive_max_pool2d(x, (2, 2))
+    (x_grad,) = tp.autograd.grad([(output * weights).sum()], [x], create_graph=True)
+    (weights_grad,) = tp.autograd.grad([x_grad.sum()], [weights])
+
+    assert weights_grad.tolist() == [[[[1.0, 1.0], [1.0, 1.0]]]]
+
+
 # ------------------------------------------------------------------ determinants
 
 

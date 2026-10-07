@@ -187,6 +187,17 @@ inline Tensor adaptive_max_pool3d_double_backward(const Tensor& grad, const Tens
     return max_pool_double_backward(grad, adaptive_max_pool3d_indices(input, output_shape), 3);
 }
 
+inline Tensor adaptive_max_pool2d_double_backward(const Tensor& grad, const Tensor& input,
+                                                  const std::vector<int64_t>& output_shape) {
+    const Tensor detached = ops::detach(input);
+    const bool batched = detached.dim() == 4;
+    const Tensor value = batched ? detached : ops::unsqueeze(detached, 0);
+    const std::vector<int64_t> pooled_shape = trailing_extents(output_shape, 2);
+    const Tensor indices = std::get<1>(ops::adaptive_max_pool2d_with_indices(
+        value, pooled_shape));
+    return max_pool_double_backward(grad, batched ? indices : ops::squeeze(indices, 0), 2);
+}
+
 // embedding_dense_backward differentiated in grad_output: the kernel adds
 // row i of grad_output into table row indices[i] (dividing by the row's
 // occurrence count under scale_grad_by_freq, and skipping padding_idx), so
