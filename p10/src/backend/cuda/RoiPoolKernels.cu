@@ -209,13 +209,13 @@ __global__ void ps_roi_pool_backward_kernel(
         const RoiBoxCuda box = scaled_roi_box_cuda(rv, spatial_scale, pooled_height, pooled_width, false);
         if (box.batch < 0 || box.batch >= N) continue;
         const int64_t hstart = clamp_idx(
-            static_cast<int64_t>(floor(static_cast<double>(ph) * box.bin_size_h)) + box.start_h, H);
+            static_cast<int64_t>(floor(static_cast<double>(ph) * box.bin_size_h)) + box.start_h, H - 1);
         const int64_t hend = clamp_idx(
-            static_cast<int64_t>(ceil(static_cast<double>(ph + 1) * box.bin_size_h)) + box.start_h, H);
+            static_cast<int64_t>(ceil(static_cast<double>(ph + 1) * box.bin_size_h)) + box.start_h, H - 1);
         const int64_t wstart = clamp_idx(
-            static_cast<int64_t>(floor(static_cast<double>(pw) * box.bin_size_w)) + box.start_w, W);
+            static_cast<int64_t>(floor(static_cast<double>(pw) * box.bin_size_w)) + box.start_w, W - 1);
         const int64_t wend = clamp_idx(
-            static_cast<int64_t>(ceil(static_cast<double>(pw + 1) * box.bin_size_w)) + box.start_w, W);
+            static_cast<int64_t>(ceil(static_cast<double>(pw + 1) * box.bin_size_w)) + box.start_w, W - 1);
         if (hend <= hstart || wend <= wstart) continue;
         const int64_t c_in = (c * pooled_height + ph) * pooled_width + pw;
         storage_t* g_c = grad_input + (box.batch * C + c_in) * H * W;
