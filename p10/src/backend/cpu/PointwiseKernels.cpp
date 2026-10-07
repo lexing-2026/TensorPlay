@@ -3149,12 +3149,16 @@ Tensor lerp_tensor_kernel(const Tensor& self, const Tensor& end, const Tensor& w
 
     // Single pass over three dense same-shape operands; the generic
     // composition below spends several full-tensor passes and temporaries.
+    // lerp_tensor_fast lives in the x86 section above, so the other
+    // architectures keep the general composition.
     if (self.dtype() == common_dtype && end.dtype() == common_dtype &&
         weight.dtype() == common_dtype) {
+#if defined(__x86_64__)
         Tensor result;
         if (lerp_tensor_fast(self, end, weight, result)) {
             return result;
         }
+#endif
     }
 
     // result = self + weight * (end - self)

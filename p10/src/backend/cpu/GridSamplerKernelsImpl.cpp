@@ -29,7 +29,7 @@ using Vec = Vectorized<T>;
 // Bilinear
 // ---------------------------------------------------------------------------
 template <typename T, int PADDING>
-__attribute__((optimize("-ffp-contract=off")))
+TP_NO_FP_CONTRACT
 void grid_sample2d_bilinear_cl(const T* inp, const T* grid, T* out,
                                int64_t N, int64_t C, int64_t H, int64_t W,
                                int64_t oH, int64_t oW, bool align_corners) {
@@ -101,7 +101,7 @@ void grid_sample2d_bilinear_cl(const T* inp, const T* grid, T* out,
 // Nearest
 // ---------------------------------------------------------------------------
 template <typename T, int PADDING>
-__attribute__((optimize("-ffp-contract=off")))
+TP_NO_FP_CONTRACT
 void grid_sample2d_nearest_cl(const T* inp, const T* grid, T* out,
                               int64_t N, int64_t C, int64_t H, int64_t W,
                               int64_t oH, int64_t oW, bool align_corners) {
@@ -150,7 +150,7 @@ void grid_sample2d_nearest_cl(const T* inp, const T* grid, T* out,
 // Bicubic
 // ---------------------------------------------------------------------------
 template <typename T, int PADDING>
-__attribute__((optimize("-ffp-contract=off")))
+TP_NO_FP_CONTRACT
 void grid_sample2d_bicubic_cl(const T* inp, const T* grid, T* out,
                               int64_t N, int64_t C, int64_t H, int64_t W,
                               int64_t oH, int64_t oW, bool align_corners) {
@@ -251,7 +251,7 @@ void grid_sample2d_bicubic_cl(const T* inp, const T* grid, T* out,
 // the per-channel sum in ascending channel order, so within a block the
 // vector lanes are extracted and summed sequentially.
 template <typename T, int PADDING>
-__attribute__((optimize("-ffp-contract=off")))
+TP_NO_FP_CONTRACT
 void grid_sample2d_backward_bilinear_cl(const T* gout, const T* inp, const T* grid,
                                         T* ginp, T* ggrid,
                                         int64_t N, int64_t C, int64_t H, int64_t W,
@@ -401,7 +401,7 @@ void grid_sample2d_backward_bilinear_cl(const T* gout, const T* inp, const T* gr
 // Backward (nearest)
 // ---------------------------------------------------------------------------
 template <typename T, int PADDING>
-__attribute__((optimize("-ffp-contract=off")))
+TP_NO_FP_CONTRACT
 void grid_sample2d_backward_nearest_cl(const T* gout, const T* inp, const T* grid,
                                        T* ginp, T* ggrid,
                                        int64_t N, int64_t C, int64_t H, int64_t W,
@@ -456,7 +456,7 @@ void grid_sample2d_backward_nearest_cl(const T* gout, const T* inp, const T* gri
 // Backward (bicubic)
 // ---------------------------------------------------------------------------
 template <typename T, int PADDING>
-__attribute__((optimize("-ffp-contract=off")))
+TP_NO_FP_CONTRACT
 void grid_sample2d_backward_bicubic_cl(const T* gout, const T* inp, const T* grid,
                                        T* ginp, T* ggrid,
                                        int64_t N, int64_t C, int64_t H, int64_t W,

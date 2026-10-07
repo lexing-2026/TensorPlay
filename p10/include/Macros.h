@@ -48,3 +48,11 @@
 #else
 #define TP_ALWAYS_INLINE inline __attribute__((always_inline))
 #endif
+
+// Disable FMA contraction for a function: GCC/Clang take the optimize
+// attribute, MSVC's default /fp:precise already keeps the operations apart.
+#if defined(_MSC_VER) && !defined(__clang__)
+#define TP_NO_FP_CONTRACT
+#else
+#define TP_NO_FP_CONTRACT __attribute__((optimize("-ffp-contract=off")))
+#endif

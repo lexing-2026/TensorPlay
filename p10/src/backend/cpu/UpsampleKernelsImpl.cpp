@@ -100,7 +100,7 @@ void upsample_nearest2d_cl_typed(const T* in, T* out,
 // copies (which compile with FMA) keep the same per-operation rounding as
 // the base-tier scalar frame, which has no FMA available.
 template <typename T>
-__attribute__((optimize("-ffp-contract=off")))
+TP_NO_FP_CONTRACT
 void upsample_bilinear2d_cl_typed(const T* in, T* out,
                                   int64_t N, int64_t C, int64_t H, int64_t W,
                                   int64_t oH, int64_t oW,
