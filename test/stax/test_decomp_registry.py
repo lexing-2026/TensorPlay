@@ -1220,6 +1220,42 @@ def test_registry_loads():
     assert len(decomposition_table) > 0
 
 
+# Interpolation forms each answer a weighted sum of the operand values they
+# gather.  When the weights nearly cancel, the sum lands near zero while every
+# gathered corner stays at full magnitude, so the absolute error follows the
+# corner size rather than the size of the result.  A flat absolute tolerance
+# sized for a unit result then decides the outcome by which element the draw
+# happened to push through a cancellation, and the two sides round the same
+# sum in a different order.  For these overloads the absolute tolerance is
+# scaled by the operand magnitude instead: the weights sum to one, so the
+# worst case is one round-off per tap, and thirty-two taps cover the widest
+# spread these forms reach (measured at about sixteen) with room to spare.
+_TAP_SCALED = {
+    "grid_sampler_2d.default",
+    "upsample_linear1d.default",
+    "upsample_bilinear2d.default",
+    "upsample_trilinear3d.default",
+    "upsample_bicubic2d.default",
+    "upsample_linear1d.vec",
+    "upsample_bilinear2d.vec",
+    "upsample_trilinear3d.vec",
+}
+_EPS32 = 2.0 ** -24
+_TAPS = 32
+
+
+def _atol(name, args):
+    if name not in _TAP_SCALED:
+        return 1e-6
+    scale = 1.0
+    for operand in args:
+        if isinstance(operand, tp.Tensor) and operand.is_floating_point():
+            reach = operand.abs().max().item()
+            if reach > scale:
+                scale = reach
+    return max(1e-6, _TAPS * _EPS32 * scale)
+
+
 @pytest.mark.parametrize("name", sorted(SAMPLES))
 def test_decomposition_matches_operator(name):
     get_decompositions([])
@@ -1232,6 +1268,7 @@ def test_decomposition_matches_operator(name):
     expected = list(expected) if isinstance(expected, (list, tuple)) else [expected]
     got = list(got) if isinstance(got, (list, tuple)) else [got]
     assert len(got) == len(expected)
+    atol = _atol(name, args)
     for g, e in zip(got, expected):
         if e is None:
             assert g is None
@@ -1244,7 +1281,7 @@ def test_decomposition_matches_operator(name):
         if e.dtype == tp.bool or (not e.is_floating_point() and not e.is_complex()):
             assert tp.equal(g, e)
         else:
-            assert tp.allclose(g, e, rtol=1e-5, atol=1e-6, equal_nan=True)
+            assert tp.allclose(g, e, rtol=1e-5, atol=atol, equal_nan=True)
 
 
 @pytest.mark.parametrize("name", ["empty_like.default", "new_empty.default"])
