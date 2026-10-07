@@ -2858,7 +2858,7 @@ static void apply_fused_relu_inplace(Tensor& out) {
     float* relu_ptr = out.data_ptr<float>();
     const int64_t numel = out.numel();
     parallel_for(0, numel, /*grain=*/8192, [&](int64_t begin, int64_t end) {
-        #ifdef _OPENMP
+        #if defined(_OPENMP) && !(defined(_MSC_VER) && !defined(__clang__))
         #pragma omp simd
         #endif
         for (int64_t i = begin; i < end; ++i) {
@@ -3119,7 +3119,7 @@ static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg,
                  float b = b_ptr[nc % C_out];
                  float* out_n_c = out_ptr + nc * out_spatial;
 
-                 #ifdef _OPENMP
+                 #if defined(_OPENMP) && !(defined(_MSC_VER) && !defined(__clang__))
                  #pragma omp simd
                  #endif
                  for (int64_t i = 0; i < out_spatial; ++i) {
