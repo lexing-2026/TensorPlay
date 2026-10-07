@@ -511,5 +511,79 @@ inline Tensor stft_window_backward(const Tensor& grad, const Tensor& self, int64
     return tpx::to(gw, window->dtype());
 }
 
+// ---------------------------------------------------------------------------
+// segment_reduce backward
+// ---------------------------------------------------------------------------
+//
+// The backward scatters each segment's output gradient over that segment with
+// a slope that reads only the data and the segment's length: 1 for sum,
+// 1 / length for mean, 1 / ties for the extremes, and the product of the
+// segment's other entries for prod.  Running the same kernel with a unit
+// output gradient evaluates exactly that slope, so the transpose of the
+// scatter contracts the incoming gradient against it with a segment sum.
+
+inline Tensor segment_reduce_backward_slope(
+        const Tensor& output, const Tensor& data, const std::string& reduce,
+        const std::optional<Tensor>& lengths, const std::optional<Tensor>& offsets,
+        int64_t axis, const std::optional<Scalar>& initial) {
+    return ops::_segment_reduce_backward(ops::ones_like(output), output, data, reduce,
+                                         lengths, offsets, axis, initial);
+}
+
+inline Tensor segment_reduce_backward_grad_output(
+        const Tensor& grad, const Tensor& output, const Tensor& data,
+        const std::string& reduce, const std::optional<Tensor>& lengths,
+        const std::optional<Tensor>& offsets, int64_t axis,
+        const std::optional<Scalar>& initial) {
+    const Tensor slope = segment_reduce_backward_slope(output, data, reduce, lengths,
+                                                       offsets, axis, initial);
+    // initial stays at the sum's own identity: the caller's initial seeds the
+    // reduction itself and never reaches the scatter.
+    return ops::segment_reduce(ops::mul(grad, slope), std::string("sum"), lengths,
+                               std::nullopt, offsets, axis, false,
+                               std::optional<Scalar>(Scalar(0.0)));
+}
+
+// The scatter is a step function of the data for every reduction but prod,
+// whose slope is the product of the segment's other entries and therefore has
+// a nonzero second derivative.
+inline Tensor segment_reduce_backward_data(const Tensor& data, const std::string& reduce) {
+    if (reduce == "prod") {
+        TP_THROW(NotImplementedError,
+                 "segment_reduce: the product reduction has no second "
+                 "derivative with respect to the input");
+    }
+    return ops::zeros_like(data);
+}
+
+// ---------------------------------------------------------------------------
+// _sparse_sum_backward
+// ---------------------------------------------------------------------------
+//
+// The backward broadcasts the reduced gradient back onto the input's stored
+// coordinates, so its transpose is the reduction itself.  When every sparse
+// dim was folded away the reduced gradient is dense and the transpose is the
+// plain dense sum over those dims; dims inside the values payload map one to
+// one and leave the reduced gradient as it is.
+
+inline Tensor sparse_sum_backward_double_backward(const Tensor& grad, const Tensor& self,
+                                                 const std::vector<int64_t>& dim) {
+    if (grad.is_sparse()) return ops::_sparse_sum(grad, dim);
+    std::vector<int64_t> summed;
+    for (int64_t d : dim) {
+        const int64_t wrapped = misc_bwd_detail::wrap(d, self.dim());
+        if (wrapped < self.sparse_dim()) summed.push_back(wrapped);
+    }
+    return summed.empty() ? grad : ops::sum(grad, summed);
+}
+
+// The backward only reads the input's coordinates and sizes, so its
+// derivative in the input is a sparse zero carrying the input's structure.
+inline Tensor sparse_sum_backward_double_backward_self(const Tensor& self) {
+    return Tensor::make_sparse_coo_tensor(self._indices().clone(),
+                                          ops::zeros_like(self._values()), self.shape(),
+                                          self.is_coalesced());
+}
+
 }  // namespace tpx
 }  // namespace tensorplay
