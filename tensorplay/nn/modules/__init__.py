@@ -173,6 +173,9 @@ from .kimi_delta import (
     chunk_kimi_delta_rule,
     recurrent_kimi_delta_rule,
 )
+from .compressed_attention import CompressedSparseAttention
+from .causal_encoder_decoder import CrossAttention, CausalEncoderDecoder
+from .modern_block import SwiGLUMLP, TransformerBlock
 from .rnn import (
     GRU,
     GRUCell,
@@ -213,10 +216,12 @@ __all__ = [
     "Bilinear",
     "CELU",
     "CTCLoss",
+    "CausalEncoderDecoder",
     "ChannelShuffle",
     "CircularPad1d",
     "CircularPad2d",
     "CircularPad3d",
+    "CompressedSparseAttention",
     "ConstantPad1d",
     "ConstantPad2d",
     "ConstantPad3d",
@@ -228,6 +233,7 @@ __all__ = [
     "ConvTranspose3d",
     "CosineEmbeddingLoss",
     "CosineSimilarity",
+    "CrossAttention",
     "CrossEntropyLoss",
     "CrossMapLRN2d",
     "DepthwiseConv2d",
@@ -342,11 +348,13 @@ __all__ = [
     "Softplus",
     "Softshrink",
     "Softsign",
+    "SwiGLUMLP",
     "SyncBatchNorm",
     "Tanh",
     "Tanhshrink",
     "Threshold",
     "Transformer",
+    "TransformerBlock",
     "TransformerDecoder",
     "TransformerDecoderLayer",
     "TransformerEncoder",
