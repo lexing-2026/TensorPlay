@@ -68,6 +68,21 @@ def test_prelu_records_a_second_order_graph_for_both_inputs():
     assert gww is None
 
 
+def test_masked_scatter_backward_records_its_adjoint():
+    base = tp.tensor([0.0, 0.0, 0.0, 0.0], dtype=tp.float64)
+    source = tp.tensor([2.0, 3.0], dtype=tp.float64, requires_grad=True)
+    mask = tp.tensor([True, False, True, False])
+    weights = tp.tensor([1.0, 2.0, 3.0, 4.0], dtype=tp.float64,
+                        requires_grad=True)
+
+    output = tp.masked_scatter(base, mask, source)
+    (source_grad,) = tp.autograd.grad(
+        [(output * weights).sum()], [source], create_graph=True)
+    (weights_grad,) = tp.autograd.grad([source_grad.sum()], [weights])
+
+    assert weights_grad.tolist() == [1.0, 0.0, 1.0, 0.0]
+
+
 # ------------------------------------------------------------------ determinants
 
 

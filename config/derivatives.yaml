@@ -2004,6 +2004,10 @@
   self: masked_fill(grad, mask, Scalar(0))
   source: masked_scatter_backward(grad, mask, source.shape())
 
+- name: masked_scatter_backward(Tensor grad_output, Tensor mask, SymInt[] sizes) -> Tensor
+  grad_output: zeros_like(grad_output).masked_scatter(mask, grad)
+  mask: non_differentiable
+
 # --- scatter-family view ops (derivatives.yaml:1240-1270) ------------------
 
 - name: diag_embed(Tensor self, int offset=0, int dim1=0, int dim2=1) -> Tensor
