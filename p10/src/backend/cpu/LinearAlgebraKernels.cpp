@@ -1881,7 +1881,9 @@ Tensor mv_kernel(const Tensor& self, const Tensor& vec) {
 // Wide multiply-add reductions for dot: independent accumulators hide FMA
 // latency and lanes collapse once at the end; the scalar tail keeps any
 // remainder.  Each carries its own target attribute so the TU keeps
-// compiling without global ISA flags.
+// compiling without global ISA flags.  They are called from the x86-only
+// branch of dot_kernel below, so the definitions stay behind the same guard.
+#if defined(__x86_64__)
 __attribute__((target("avx512f,fma")))
 static float dot_f32_avx512(const float* a, const float* b, int64_t n) {
     __m512 s0 = _mm512_setzero_ps();
@@ -1980,6 +1982,7 @@ static double dot_f64_avx2(const double* a, const double* b, int64_t n) {
     for (; i < n; ++i) total += a[i] * b[i];
     return total;
 }
+#endif  // __x86_64__
 
 Tensor dot_kernel(const Tensor& self_in, const Tensor& other_in) {
     // The loops below walk dense memory; a strided view (a column, a

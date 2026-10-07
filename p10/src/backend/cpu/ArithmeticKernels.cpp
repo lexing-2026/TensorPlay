@@ -56,6 +56,11 @@ Tensor& relu_inplace_kernel(Tensor& self);
 // Zen4-class CPUs run zmm natively; the build carries no global -mavx512f so
 // these carry their own target attribute and are gated by cpuid at runtime.
 // native fused multiply-add path, while mul/div are single IEEE ops.
+
+// Operation codes shared by the runtime-dispatched x86 kernels below and the
+// generic binary callers later in this file; the enum itself is portable.
+enum : int { BIN_ADD = 0, BIN_MUL = 1, BIN_DIV = 2 };
+
 #if defined(__x86_64__)
 namespace {
 
@@ -73,8 +78,6 @@ inline bool cpu_has_avx2f() {
                            __builtin_cpu_supports("fma") != 0;
     return ok;
 }
-
-enum : int { BIN_ADD = 0, BIN_MUL = 1, BIN_DIV = 2 };
 
 __attribute__((target("avx512f,fma")))
 void binary_f32_avx512(int code, const float* a, const float* b, float* y,
