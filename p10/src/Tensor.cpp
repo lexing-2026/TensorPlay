@@ -1344,7 +1344,9 @@ namespace detail {
 Tensor clone_impl(const Tensor& self, std::optional<MemoryFormat> memory_format) {
     if (!self.defined()) return Tensor();
     if (self.is_sparse()) {
-        if (memory_format.has_value()) {
+        if (memory_format.has_value() &&
+            *memory_format != MemoryFormat::Contiguous &&
+            *memory_format != MemoryFormat::Preserve) {
             TP_THROW(RuntimeError, "unsupported memory format option ",
                      toString(*memory_format));
         }
