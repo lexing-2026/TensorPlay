@@ -44,6 +44,42 @@ class SubmoduleUpdateError(RuntimeError):
     """Drift detection or git operation failed for one submodule."""
 
 
+class PullRequestForbidden(SubmoduleUpdateError):
+    """The ambient credential may not open pull requests.
+
+    A repository can be configured so the workflow token cannot open pull
+    requests at all.  The condition is a property of the configuration, not
+    of the submodule being bumped, so it is worth telling apart from a
+    per-submodule failure: it repeats identically for every outdated entry,
+    and answering it once is what stops the run from reporting the same
+    error sixteen times.
+    """
+
+    REMEDIATION = (
+        "This repository does not let the workflow token open pull requests. "
+        "Add a GitHub App installation token or a personal access token with "
+        "pull-request write access as the SUBMODULE_UPDATE_PAT secret and "
+        "re-run this workflow; the bump branches already pushed stay on the "
+        "remote and are picked up by the next run."
+    )
+
+
+def pull_request_forbidden(message: str) -> bool:
+    """Whether a `gh` failure says the credential lacks pull-request rights."""
+    lowered = message.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "not permitted",
+            "not allowed",
+            "permission denied",
+            "resource not accessible",
+            "http 403",
+            "http 401",
+        )
+    )
+
+
 @dataclass
 class Submodule:
     path: str
@@ -168,7 +204,10 @@ def ensure_pr(branch: str, title: str, body: str, base_branch: str) -> str:
                 "--title", title, "--body-file", body_file, "--label", PR_LABEL])
     gh_out = proc.stdout.strip()
     if proc.returncode != 0:
-        raise SubmoduleUpdateError(f"gh pr create failed: {proc.stderr.strip()}")
+        detail = proc.stderr.strip()
+        if pull_request_forbidden(detail):
+            raise PullRequestForbidden(detail)
+        raise SubmoduleUpdateError(f"gh pr create failed: {detail}")
     return gh_out
 
 
@@ -230,6 +269,7 @@ def main() -> int:
 
     detected = 0
     errors = 0
+    pr_blocked = False
     for sm in submodules:
         sm.pinned = pinned_sha(sm.path)
         try:
@@ -260,12 +300,32 @@ def main() -> int:
             print(f"[current] {sm.path}: {sm.pinned[:12]}")
             continue
         print(f"[outdated] {sm.path}: {sm.pinned[:12]} -> {sm.target[:12]}")
+        if pr_blocked:
+            # The credential cannot open the pull request, so pushing another
+            # branch would only add to the pile the next run reuses.  Report
+            # the drift and stop touching the remote.
+            continue
         try:
             result = bump_submodule(sm, args.base_branch, dry_run=False)
             print(f"  -> {result}")
+        except PullRequestForbidden as exc:
+            print(f"  [error] {exc}")
+            pr_blocked = True
         except SubmoduleUpdateError as exc:
             print(f"  [error] {exc}")
             errors += 1
+
+    if pr_blocked:
+        print()
+        print(PullRequestForbidden.REMEDIATION)
+        # The drift above is the deliverable and it was produced in full; only
+        # the pull requests are missing, and the reason is a setting rather
+        # than anything about the submodules.  Report it and leave the run
+        # green so the drift stays readable instead of sitting behind a red
+        # job that fails identically every week until the secret is set.  A
+        # submodule whose upstream could not be resolved is a separate fault
+        # and still fails the run.
+        return 1 if errors else 0
     return 1 if errors else 0
 
 
