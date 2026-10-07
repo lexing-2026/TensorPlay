@@ -412,13 +412,14 @@ def test_sparse_sum_dim_second_pass_runs(dim):
     assert gu is None or float(gu.to_dense().sum() if gu.is_sparse else gu.sum()) == 0.0
 
 
-def test_ctc_loss_second_pass_raises():
+def test_ctc_loss_second_pass_runs():
     tp.manual_seed(8)
     log_probs = tp.randn(6, 2, 4, dtype=tp.float64).log_softmax(2).detach().requires_grad_(True)
     targets = tp.tensor([[1, 2], [3, 1]])
     loss = F.ctc_loss(log_probs, targets, tp.tensor([6, 6]), tp.tensor([2, 2]))
-    with pytest.raises(NotImplementedError, match="_ctc_loss_backward"):
-        second_pass(loss, [log_probs])
+    (second,) = second_pass(loss, [log_probs])
+    assert second.shape == log_probs.shape
+    assert np.isfinite(second.numpy()).all()
 
 
 def test_multi_output_kernel_second_pass_raises():
