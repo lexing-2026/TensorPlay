@@ -559,9 +559,9 @@ std::pair<Tensor, Tensor> var_mean_kernel_impl(const Tensor& self,
     return {var, mean};
 }
 
-REGISTER_DISPATCH(var_mean_stub, &var_mean_kernel_impl)
-
 }  // namespace
+
+REGISTER_DISPATCH(var_mean_stub, &var_mean_kernel_impl);
 
 } // namespace cpu
 } // namespace tensorplay
