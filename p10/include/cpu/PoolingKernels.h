@@ -171,18 +171,6 @@ using adaptive_max_pool3d_cl_fn = void (*)(const void* in, void* out,
                                            int64_t oD, int64_t oH, int64_t oW,
                                            int dtype);
 
-// Backward of the adaptive channels-last-3d max pool: re-finds each lane's
-// argmax with the forward sweep (the op chain carries no saved indices) and
-// adds the grad_output lane onto that position of the NDHWC grad_input,
-// accumulating in the scalar frame's output scan order.
-using adaptive_max_pool3d_backward_cl_fn = void (*)(const void* gout,
-                                                    const void* in, void* gin,
-                                                    int64_t N, int64_t C,
-                                                    int64_t D, int64_t H,
-                                                    int64_t W,
-                                                    int64_t oD, int64_t oH,
-                                                    int64_t oW, int dtype);
-
 DECLARE_DISPATCH(avg_pool2d_cl_fn, avg_pool2d_cl_stub)
 DECLARE_DISPATCH(avg_pool2d_backward_cl_fn, avg_pool2d_backward_cl_stub)
 DECLARE_DISPATCH(avg_pool3d_cl_fn, avg_pool3d_cl_stub)
@@ -201,8 +189,6 @@ DECLARE_DISPATCH(adaptive_max_pool2d_cl_fn, adaptive_max_pool2d_cl_stub)
 DECLARE_DISPATCH(adaptive_max_pool2d_backward_cl_fn,
                  adaptive_max_pool2d_backward_cl_stub)
 DECLARE_DISPATCH(adaptive_max_pool3d_cl_fn, adaptive_max_pool3d_cl_stub)
-DECLARE_DISPATCH(adaptive_max_pool3d_backward_cl_fn,
-                 adaptive_max_pool3d_backward_cl_stub)
 
 } // namespace cpu
 } // namespace tensorplay

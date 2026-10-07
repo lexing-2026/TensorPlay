@@ -1906,7 +1906,6 @@ DEFINE_DISPATCH(adaptive_avg_pool3d_backward_cl_stub);
 DEFINE_DISPATCH(adaptive_max_pool2d_cl_stub);
 DEFINE_DISPATCH(adaptive_max_pool2d_backward_cl_stub);
 DEFINE_DISPATCH(adaptive_max_pool3d_cl_stub);
-DEFINE_DISPATCH(adaptive_max_pool3d_backward_cl_stub);
 
 TENSORPLAY_LIBRARY_IMPL(CPU, PoolingKernels) {
     m.impl("avg_pool2d", avg_pool2d_cpu);
