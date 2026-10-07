@@ -77,9 +77,11 @@
     <a href="https://github.com/lexing-2026/TensorPlay/actions/workflows/trunk.yml">
         <img src="https://img.shields.io/badge/build-passing-23347A?style=flat-square&labelColor=11B5D1&logo=githubactions&logoColor=white" alt="Build">
     </a>
+    <!-- tp-stats:tests-badge:begin -->
     <a href="https://github.com/lexing-2026/TensorPlay/actions/workflows/trunk.yml">
-        <img src="https://img.shields.io/badge/tests-5680%20passed-23347A?style=flat-square&labelColor=11B5D1&logo=pytest&logoColor=white" alt="Tests">
+        <img src="https://img.shields.io/badge/tests-3659%20defined-23347A?style=flat-square&labelColor=11B5D1&logo=pytest&logoColor=white" alt="Tests">
     </a>
+    <!-- tp-stats:tests-badge:end -->
 </p>
 
 <!-- 社区 -->
@@ -465,7 +467,7 @@ print(out[0].tolist())   # 提示词及其续写
 - **微观与子系统**：GEMM、优化器 step、dataloader、序列化、autograd Function 开销、自定义算子调用开销、LLaMA 端到端
 - **报告**：每个脚本输出 JSON 报告（`--json-out`）——吞吐、延迟分位数、编译开销——可直接绘图并用于[白皮书](docs/whitepaper/main.pdf)评估
 
-实测亮点（见[白皮书](docs/whitepaper/main.pdf) §9，对应当前 `main` 的快照）：dispatcher 在 CPU、CUDA 与 Vulkan 路径上都只增加不到 1% 的开销；CUDA 后端覆盖 1,262 个独立算子（CPU 面 1,233 个的 97%）；Vulkan 教学后端交付 224 个算子，背后是 102 个文件、6.8k 行 GLSL shader。pytest 套件共收集 5,680 个测试。
+实测亮点（见[白皮书](docs/whitepaper/main.pdf) §9，对应当前 `main` 的快照）：dispatcher 在 CPU、CUDA 与 Vulkan 路径上都只增加不到 1% 的开销；CUDA 后端覆盖 1,262 个独立算子（CPU 面 1,233 个的 97%）；Vulkan 教学后端交付 224 个算子，背后是 102 个文件、6.8k 行 GLSL shader。pytest 套件共定义 <!-- tp-stats:tests-collected:begin -->3,659<!-- tp-stats:tests-collected:end --> 个测试函数。
 
 脚本与方法论：[benchmark/README.md](benchmark/README.md)。
 

@@ -77,9 +77,11 @@
     <a href="https://github.com/lexing-2026/TensorPlay/actions/workflows/trunk.yml">
         <img src="https://img.shields.io/badge/build-passing-23347A?style=flat-square&labelColor=11B5D1&logo=githubactions&logoColor=white" alt="Build">
     </a>
+    <!-- tp-stats:tests-badge:begin -->
     <a href="https://github.com/lexing-2026/TensorPlay/actions/workflows/trunk.yml">
-        <img src="https://img.shields.io/badge/tests-5680%20passed-23347A?style=flat-square&labelColor=11B5D1&logo=pytest&logoColor=white" alt="Tests">
+        <img src="https://img.shields.io/badge/tests-3659%20defined-23347A?style=flat-square&labelColor=11B5D1&logo=pytest&logoColor=white" alt="Tests">
     </a>
+    <!-- tp-stats:tests-badge:end -->
 </p>
 
 <!-- Community -->
@@ -467,7 +469,7 @@ The [benchmark/](benchmark/) suite measures what a readable framework costs — 
 - **Micro and subsystem**: GEMM, optimizer steps, dataloader, serialization, autograd Function overhead, custom-op call overhead, LLaMA end-to-end
 - **Reports**: every script emits a JSON report (`--json-out`) — throughput, latency percentiles, compile cost — ready for plotting and for the [white paper](docs/whitepaper/main.pdf) evaluation
 
-Measured highlights from the [white paper](docs/whitepaper/main.pdf), §9 — a snapshot of current `main`: the dispatcher adds the same sub-1% sliver on CPU, CUDA and Vulkan paths; the CUDA backend covers 1,262 unique ops (97% of the CPU surface, 1,233 ops); the Vulkan teaching backend ships 224 ops backed by 6.8k lines of GLSL shaders across 102 files. The pytest suite collects 5,680 tests.
+Measured highlights from the [white paper](docs/whitepaper/main.pdf), §9 — a snapshot of current `main`: the dispatcher adds the same sub-1% sliver on CPU, CUDA and Vulkan paths; the CUDA backend covers 1,262 unique ops (97% of the CPU surface, 1,233 ops); the Vulkan teaching backend ships 224 ops backed by 6.8k lines of GLSL shaders across 102 files. The pytest suite defines <!-- tp-stats:tests-collected:begin -->3,659<!-- tp-stats:tests-collected:end --> test functions.
 
 Scripts and methodology: [benchmark/README.md](benchmark/README.md).
 
