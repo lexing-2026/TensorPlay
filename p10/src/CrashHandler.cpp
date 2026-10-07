@@ -41,6 +41,20 @@ int slot_for(int signum) {
   return -1;
 }
 
+// Signal name for the crash banner: strsignal is a POSIX facility, so the
+// Windows build falls back to the constant names of the handled signals.
+const char* signal_name(int signum) {
+#if defined(_WIN32)
+  switch (signum) {
+    case SIGILL: return "SIGILL";
+    case SIGSEGV: return "SIGSEGV";
+    default: return "signal";
+  }
+#else
+  return strsignal(signum);
+#endif
+}
+
 void crash_handler(int signum) {
   const int slot = slot_for(signum);
   void (*old_action)(int) = nullptr;
@@ -56,7 +70,7 @@ void crash_handler(int signum) {
       stderr,
       "Process %d crashed with signal %s (%d):\n",
       static_cast<int>(getpid()),
-      strsignal(signum),
+      signal_name(signum),
       signum);
   const std::string trace = capture_stacktrace_unconditional();
   fwrite(trace.data(), 1, trace.size(), stderr);
