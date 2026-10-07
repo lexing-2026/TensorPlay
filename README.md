@@ -132,8 +132,9 @@ TensorPlay is a learner-first deep learning framework. It combines NumPy-style t
     - [Adjusting Build Options (Optional)](#adjusting-build-options-optional)
 - [Getting Started](#getting-started)
   - [Automatic Differentiation](#automatic-differentiation)
-  - [Defining a Neural Network](#defining-a-neural-network)
+  - [Defining a Language Model](#defining-a-language-model)
   - [Training Loop](#training-loop)
+  - [Generating Text](#generating-text)
 - [Benchmarks](#benchmarks)
 - [Testing](#testing)
 - [Resources](#resources)
@@ -158,7 +159,7 @@ At a granular level, TensorPlay consists of the following components:
 | **p10** | C++ core engine: tensor storage and memory management, foundational CPU and CUDA kernels |
 | **tpx** | Autograd layer: explicit computation-graph construction and backward execution, fully decoupled from the core |
 | **stax** | JIT compiler playground: static graph capture and operator fusion experiments, including native lowering of custom ops |
-| **tensorplay.nn** | Neural network building blocks: `Module`, `Linear`, `Conv2d`, activations, losses, container abstractions |
+| **tensorplay.nn** | Neural network building blocks: `Module`, `Linear`, `Conv2d`, activations, losses, containers — plus the modern LLM stack: rotary embeddings, grouped-query / latent / compressed-sparse attention, delta-rule linear attention, KV caches, autoregressive generation |
 | **tensorplay.optim** | Optimizers (SGD, Adam, AdamW) with learning-rate scheduling and weight decay |
 | **tensorplay.utils.data** | `Dataset` / `DataLoader` with multi-worker batching, prefetching and shuffling |
 | **tensorplay.library** | First-class custom operators: register ops, attach fake/meta and autograd formulas, bring your own Triton kernels |
@@ -360,50 +361,97 @@ print(x.grad)
 
 Under the hood, TPX records each operation into an explicit DAG and replays the chain rule node by node: $\dfrac{\partial \mathcal{L}}{\partial x} = \dfrac{\partial \mathcal{L}}{\partial z} \cdot \dfrac{\partial z}{\partial x}$ — every edge of that graph is code you can step through.
 
-### Defining a Neural Network
+### Defining a Language Model
+
+`tensorplay.nn` ships the building blocks modern decoder-only LLMs are made of — rotary embeddings, grouped-query attention, SwiGLU feed-forward, RMSNorm — as composable modules. A `TransformerBlock` wraps any *token mixer* (attention, linear attention, …) in the pre-norm residual wiring, so the mixer is the only thing you choose per layer:
 
 ```python
 import tensorplay as tp
-from tensorplay.nn import Module, Linear, ReLU, Sigmoid
+from tensorplay import nn
+from tensorplay.nn.cache import DynamicCache
 
-class MLP(Module):
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+
+class DecoderLayer(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int, num_kv_heads: int, layer_idx: int):
         super().__init__()
-        self.fc1 = Linear(input_dim, hidden_dim)
-        self.relu = ReLU()
-        self.fc2 = Linear(hidden_dim, output_dim)
-        self.sigmoid = Sigmoid()
+        mixer = nn.GroupedQueryAttention(
+            hidden_size, num_heads, num_kv_heads=num_kv_heads,
+            qk_norm=True, layer_idx=layer_idx,
+        )
+        self.block = nn.TransformerBlock(hidden_size, mixer)
 
-    def forward(self, x: tp.Tensor) -> tp.Tensor:
-        x = self.relu(self.fc1(x))
-        return self.sigmoid(self.fc2(x))
+    def forward(self, x, position_ids=None, past_key_values=None):
+        return self.block(x, position_ids=position_ids, past_key_values=past_key_values)
 
-model = MLP(10, 32, 1)
+
+class TinyLM(nn.Module):
+    def __init__(self, vocab_size=256, hidden_size=128, num_layers=4, num_heads=8, num_kv_heads=2):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.embed = nn.Embedding(vocab_size, hidden_size)
+        self.layers = nn.ModuleList(
+            [DecoderLayer(hidden_size, num_heads, num_kv_heads, i) for i in range(num_layers)]
+        )
+        self.norm = nn.RMSNorm(hidden_size)
+        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+
+    def forward(self, input_ids, position_ids=None, past_key_values=None):
+        x = self.embed(input_ids)
+        for layer in self.layers:
+            x = layer(x, position_ids=position_ids, past_key_values=past_key_values)
+        return self.lm_head(self.norm(x))
+
+    def create_empty_cache(self):
+        return DynamicCache()
+
+
+model = TinyLM()
 print(model)  # auto-generated architecture visualization
 ```
 
+Rotary embeddings and per-head query/key RMS normalization live inside each mixer, and each layer files its key/value pairs into its own slot of the shared cache — the model itself never touches cache internals.
+
 ### Training Loop
 
+Training a causal LM is ordinary next-token prediction: shift the inputs by one position and apply cross-entropy over the vocabulary.
+
 ```python
-from tensorplay.nn import MSELoss
-from tensorplay.optim import SGD
-from tensorplay.utils.data import DataLoader, TensorDataset
+from tensorplay.nn import CrossEntropyLoss
+from tensorplay.optim import AdamW
 
-train_data = TensorDataset(tp.randn(100, 10), tp.randn(100, 1))
-train_loader = DataLoader(dataset=train_data, batch_size=8, shuffle=True)
+criterion = CrossEntropyLoss()
+optimizer = AdamW(model.parameters(), lr=3e-4)
 
-model = MLP(10, 32, 1)
-criterion = MSELoss()
-optimizer = SGD(model.parameters(), lr=0.01)
+for step in range(200):
+    tokens = (tp.arange(65).unsqueeze(0) + 3 * step) % model.vocab_size  # toy corpus
+    logits = model(tokens[:, :-1])          # predict the next token at every position
+    loss = criterion(logits.reshape(-1, model.vocab_size), tokens[:, 1:].reshape(-1))
 
-for epoch in range(3):
-    for batch_x, batch_y in train_loader:
-        optimizer.zero_grad()
-        predictions = model(batch_x)
-        loss = criterion(predictions, batch_y)
-        loss.backward()
-        optimizer.step()
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    if step % 50 == 0:
+        print(f"step {step}: loss {loss.item():.3f}")
 ```
+
+### Generating Text
+
+`generate` drives the decode loop: one prefill pass over the prompt, then single-token steps against the cache. Sampling controls — temperature, top-k, nucleus (top-p), repetition penalty, early stop on EOS — are keyword arguments.
+
+```python
+from tensorplay.nn.generation import generate
+
+prompt = (tp.arange(8) % model.vocab_size).unsqueeze(0)   # [batch, seq]
+out = generate(
+    model, prompt,
+    max_new_tokens=16, do_sample=True, temperature=0.8, top_k=50,
+)
+print(out[0].tolist())   # the prompt, continued
+```
+
+Because `GroupedQueryAttention` shares two KV heads across eight query heads, the cache holds a quarter of the key/value pairs a full multi-head model would. The cache itself is swappable: `DynamicCache` grows token by token, while `StaticCache`, `SlidingWindowCache`, `PagedCache`, `QuantizedCache` and the linear-attention `LinearStateCache` cover static allocation, windowed context, paged serving, quantized storage and recurrent state. Pick one in `create_empty_cache()` or pass it to `generate` explicitly.
+
+Beyond GQA, the mixer shelf includes `MultiheadLatentAttention` (low-rank latent KV compression), `GatedDeltaNet` / `KimiDeltaAttention` (delta-rule linear attention holding a fixed-size recurrent state per head) and `CompressedSparseAttention` (sliding window plus compressed KV entries selected by a lightning indexer); `CausalEncoderDecoder` stacks a decoder over an encoder for encoder–decoder models. For multi-process launching, `tprun` starts `--nproc-per-node` copies of your training script wired for distributed runs.
 
 Structured tutorials — linear regression from scratch, MNIST CNN classification, custom datasets, model saving/loading with `.mega` + `state_dict` — live at [tensorplay.cn](https://www.tensorplay.cn/en/guide/tutorials). Deep dives, one pillar per post — dispatch, autograd engine, tensor storage, compiler — live in the [blog series](docs/blogs/00-index.md).
 

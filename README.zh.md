@@ -131,8 +131,9 @@ TensorPlay 是一个面向学习者的深度学习框架：它融合了类 NumPy
     - [调整构建选项（可选）](#调整构建选项可选)
 - [快速上手](#快速上手)
   - [自动微分](#自动微分)
-  - [定义神经网络](#定义神经网络)
+  - [定义一个语言模型](#定义一个语言模型)
   - [训练循环](#训练循环)
+  - [文本生成](#文本生成)
 - [基准测试](#基准测试)
 - [测试](#测试)
 - [资源](#资源)
@@ -157,7 +158,7 @@ TensorPlay 是一个面向学习者的深度学习框架：它融合了类 NumPy
 | **p10** | C++ 核心引擎：张量存储与内存管理、基础的 CPU 与 CUDA 内核实现 |
 | **tpx** | 自动微分层：显式构建计算图并执行反向传播，与核心完全解耦 |
 | **stax** | JIT 编译器试验场：静态图捕获与算子融合实验，支持自定义算子的原生下沉 |
-| **tensorplay.nn** | 神经网络构件：`Module`、`Linear`、`Conv2d`、激活函数、损失函数与容器抽象 |
+| **tensorplay.nn** | 神经网络构件：`Module`、`Linear`、`Conv2d`、激活函数、损失函数与容器抽象——以及现代 LLM 全家桶：旋转位置编码、分组查询/潜在/压缩稀疏注意力、delta 规则线性注意力、KV 缓存、自回归生成 |
 | **tensorplay.optim** | 优化器（SGD、Adam、AdamW），支持学习率调度与权重衰减 |
 | **tensorplay.utils.data** | `Dataset` / `DataLoader`：多 worker 批处理、预取 (prefetch) 与自动打乱 |
 | **tensorplay.library** | 一等公民的自定义算子：注册算子、挂接 fake/meta 与自动微分公式、接入自有 Triton kernel |
@@ -358,50 +359,97 @@ print(x.grad)
 
 在底层，TPX 把每个操作记录进一张显式的 DAG，并逐节点重放链式法则：$\dfrac{\partial \mathcal{L}}{\partial x} = \dfrac{\partial \mathcal{L}}{\partial z} \cdot \dfrac{\partial z}{\partial x}$ —— 图的每一条边都是你可以单步调试的代码。
 
-### 定义神经网络
+### 定义一个语言模型
+
+`tensorplay.nn` 内置了现代 decoder-only 大语言模型的全部构件——旋转位置编码、分组查询注意力、SwiGLU 前馈、RMSNorm——全部是可组合的模块。`TransformerBlock` 把任意一个「token 混合器」（注意力、线性注意力……）包进 pre-norm 残差结构，每一层你只需要挑选混合器本身：
 
 ```python
 import tensorplay as tp
-from tensorplay.nn import Module, Linear, ReLU, Sigmoid
+from tensorplay import nn
+from tensorplay.nn.cache import DynamicCache
 
-class MLP(Module):
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+
+class DecoderLayer(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int, num_kv_heads: int, layer_idx: int):
         super().__init__()
-        self.fc1 = Linear(input_dim, hidden_dim)
-        self.relu = ReLU()
-        self.fc2 = Linear(hidden_dim, output_dim)
-        self.sigmoid = Sigmoid()
+        mixer = nn.GroupedQueryAttention(
+            hidden_size, num_heads, num_kv_heads=num_kv_heads,
+            qk_norm=True, layer_idx=layer_idx,
+        )
+        self.block = nn.TransformerBlock(hidden_size, mixer)
 
-    def forward(self, x: tp.Tensor) -> tp.Tensor:
-        x = self.relu(self.fc1(x))
-        return self.sigmoid(self.fc2(x))
+    def forward(self, x, position_ids=None, past_key_values=None):
+        return self.block(x, position_ids=position_ids, past_key_values=past_key_values)
 
-model = MLP(10, 32, 1)
+
+class TinyLM(nn.Module):
+    def __init__(self, vocab_size=256, hidden_size=128, num_layers=4, num_heads=8, num_kv_heads=2):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.embed = nn.Embedding(vocab_size, hidden_size)
+        self.layers = nn.ModuleList(
+            [DecoderLayer(hidden_size, num_heads, num_kv_heads, i) for i in range(num_layers)]
+        )
+        self.norm = nn.RMSNorm(hidden_size)
+        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+
+    def forward(self, input_ids, position_ids=None, past_key_values=None):
+        x = self.embed(input_ids)
+        for layer in self.layers:
+            x = layer(x, position_ids=position_ids, past_key_values=past_key_values)
+        return self.lm_head(self.norm(x))
+
+    def create_empty_cache(self):
+        return DynamicCache()
+
+
+model = TinyLM()
 print(model)  # 自动生成层结构可视化
 ```
 
+旋转位置编码与逐头 query/key RMS 归一化都在混合器内部完成，每层把自己的 key/value 写进共享缓存中属于自己的槽位——模型本身完全不接触缓存内部结构。
+
 ### 训练循环
 
+训练因果语言模型就是普通的下一词预测：输入右移一位，在词表维度上做交叉熵。
+
 ```python
-from tensorplay.nn import MSELoss
-from tensorplay.optim import SGD
-from tensorplay.utils.data import DataLoader, TensorDataset
+from tensorplay.nn import CrossEntropyLoss
+from tensorplay.optim import AdamW
 
-train_data = TensorDataset(tp.randn(100, 10), tp.randn(100, 1))
-train_loader = DataLoader(dataset=train_data, batch_size=8, shuffle=True)
+criterion = CrossEntropyLoss()
+optimizer = AdamW(model.parameters(), lr=3e-4)
 
-model = MLP(10, 32, 1)
-criterion = MSELoss()
-optimizer = SGD(model.parameters(), lr=0.01)
+for step in range(200):
+    tokens = (tp.arange(65).unsqueeze(0) + 3 * step) % model.vocab_size  # 玩具语料
+    logits = model(tokens[:, :-1])          # 在每个位置预测下一个 token
+    loss = criterion(logits.reshape(-1, model.vocab_size), tokens[:, 1:].reshape(-1))
 
-for epoch in range(3):
-    for batch_x, batch_y in train_loader:
-        optimizer.zero_grad()
-        predictions = model(batch_x)
-        loss = criterion(predictions, batch_y)
-        loss.backward()
-        optimizer.step()
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    if step % 50 == 0:
+        print(f"step {step}: loss {loss.item():.3f}")
 ```
+
+### 文本生成
+
+`generate` 驱动解码循环：对提示词做一次 prefill，之后每步只向缓存喂入一个 token。采样控制——temperature、top-k、nucleus（top-p）、重复惩罚、EOS 早停——都是关键字参数。
+
+```python
+from tensorplay.nn.generation import generate
+
+prompt = (tp.arange(8) % model.vocab_size).unsqueeze(0)   # [batch, seq]
+out = generate(
+    model, prompt,
+    max_new_tokens=16, do_sample=True, temperature=0.8, top_k=50,
+)
+print(out[0].tolist())   # 提示词及其续写
+```
+
+`GroupedQueryAttention` 让八个 query 头共享两个 KV 头，缓存只需保存全多头模型四分之一的 key/value。缓存本身可替换：`DynamicCache` 逐 token 增长，`StaticCache`、`SlidingWindowCache`、`PagedCache`、`QuantizedCache` 与线性注意力的 `LinearStateCache` 分别覆盖静态分配、窗口上下文、分页服务、量化存储与循环状态。在 `create_empty_cache()` 里挑一个，或者直接传给 `generate`。
+
+除 GQA 之外，混合器货架上还有 `MultiheadLatentAttention`（低秩潜在 KV 压缩）、`GatedDeltaNet` / `KimiDeltaAttention`（delta 规则线性注意力，每头维护定长循环状态）与 `CompressedSparseAttention`（滑动窗口加压缩 KV 条目，由 lightning indexer 挑选）；`CausalEncoderDecoder` 把解码器摞在编码器之上，构成 encoder–decoder 模型。多进程启动用 `tprun`：以 `--nproc-per-node` 拉起训练脚本副本并接好分布式。
 
 体系化教程——从零开始的线性回归、MNIST CNN 图像分类、自定义数据集、`.mega` + `state_dict` 模型保存与加载——见 [tensorplay.cn](https://www.tensorplay.cn/zh/guide/tutorials)。深度长文，一篇一个支柱——dispatch、autograd 引擎、张量存储、编译器——见[博客系列](docs/blogs/00-index.md)。
 
