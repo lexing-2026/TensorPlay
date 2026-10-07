@@ -59,7 +59,7 @@ static Tensor ps_roi_align_cpu_impl(const Tensor& input, const Tensor& rois,
     const int64_t W = input.size(3);
     const int64_t R = rois.size(0);
     const int64_t channels = C / (pooled_height * pooled_width);
-    Tensor output = Tensor::empty({R, channels, pooled_height, pooled_width},
+    Tensor output = Tensor::zeros({R, channels, pooled_height, pooled_width},
                                   input.dtype(), input.device());
     if (R == 0 || output.numel() == 0) return output;
 

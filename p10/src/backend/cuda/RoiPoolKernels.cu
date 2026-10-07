@@ -322,7 +322,7 @@ Tensor ps_roi_pool_cuda(const Tensor& input, const Tensor& rois, double spatial_
     const int64_t N = ic.size(0), C = ic.size(1), H = ic.size(2), W = ic.size(3);
     const int64_t R = rc.size(0);
     const int64_t channels = C / (pooled_height * pooled_width);
-    Tensor output = Tensor::empty({R, channels, pooled_height, pooled_width}, ic.dtype(), ic.device());
+    Tensor output = Tensor::zeros({R, channels, pooled_height, pooled_width}, ic.dtype(), ic.device());
     const int64_t nthreads = R * channels * pooled_height * pooled_width;
     if (nthreads == 0) return output;
     dim3 block(kThreads);
