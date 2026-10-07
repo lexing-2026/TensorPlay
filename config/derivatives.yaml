@@ -2451,14 +2451,14 @@
   self: _sparse_log_softmax_backward_data(grad, result, dim, self)
 
 - name: _sparse_softmax_backward_data(Tensor grad_output, Tensor output, int dim, Tensor self) -> Tensor
-  grad_output: not_implemented_grad("_sparse_softmax_backward_data")
-  output: not_implemented_grad("_sparse_softmax_backward_data")
-  self: not_implemented_grad("_sparse_softmax_backward_data")
+  grad_output: sparse_softmax_double_backward_grad_output(grad, grad_output, output, dim, false)
+  output: sparse_softmax_double_backward_output(grad, grad_output, output, dim, false)
+  self: Tensor()
 
 - name: _sparse_log_softmax_backward_data(Tensor grad_output, Tensor output, int dim, Tensor self) -> Tensor
-  grad_output: not_implemented_grad("_sparse_log_softmax_backward_data")
-  output: not_implemented_grad("_sparse_log_softmax_backward_data")
-  self: not_implemented_grad("_sparse_log_softmax_backward_data")
+  grad_output: sparse_softmax_double_backward_grad_output(grad, grad_output, output, dim, true)
+  output: sparse_softmax_double_backward_output(grad, grad_output, output, dim, true)
+  self: Tensor()
 
 - name: _sparse_sum(Tensor self) -> Tensor
   self: grad.sparse_mask(self)
