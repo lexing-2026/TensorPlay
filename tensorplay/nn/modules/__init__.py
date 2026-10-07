@@ -162,6 +162,17 @@ from .multihead_attention import MultiheadAttention, NonDynamicallyQuantizableLi
 from .rotary import RotaryEmbedding, apply_rotary_emb
 from .causal_attention import GroupedQueryAttention
 from .latent_attention import MultiheadLatentAttention
+from .gated_delta import (
+    GatedDeltaNet,
+    GatedRMSNorm,
+    chunk_gated_delta_rule,
+    recurrent_gated_delta_rule,
+)
+from .kimi_delta import (
+    KimiDeltaAttention,
+    chunk_kimi_delta_rule,
+    recurrent_kimi_delta_rule,
+)
 from .rnn import (
     GRU,
     GRUCell,
@@ -236,6 +247,8 @@ __all__ = [
     "GLU",
     "GRU",
     "GRUCell",
+    "GatedDeltaNet",
+    "GatedRMSNorm",
     "GaussianNLLLoss",
     "GroupNorm",
     "GroupedQueryAttention",
@@ -250,6 +263,7 @@ __all__ = [
     "InstanceNorm2d",
     "InstanceNorm3d",
     "KLDivLoss",
+    "KimiDeltaAttention",
     "L1Loss",
     "LPPool1d",
     "LPPool2d",
@@ -346,6 +360,10 @@ __all__ = [
     "ZeroPad2d",
     "ZeroPad3d",
     "apply_rotary_emb",
+    "chunk_gated_delta_rule",
+    "chunk_kimi_delta_rule",
+    "recurrent_gated_delta_rule",
+    "recurrent_kimi_delta_rule",
 ]
 
 # Please keep this list sorted
