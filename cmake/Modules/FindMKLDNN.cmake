@@ -154,19 +154,23 @@ set_target_properties(dnnl PROPERTIES EXCLUDE_FROM_ALL ON)
 # Route the sgemm dispatch through the CBLAS interface of the MKL the build
 # already links.  Without it the optimized sgemm copy-kernel path stays
 # dormant and convolution backward-weights GEMMs execute on the portable
-# reference loop.
-# Route the sgemm dispatch through the CBLAS interface of the MKL the build
-# already links.  Without it the optimized sgemm copy-kernel path stays
-# dormant and convolution backward-weights GEMMs execute on the portable
 # reference loop.  The compile objects live on the per-engine targets; the
 # published dnnl name is an aggregate wrapper.
-foreach(_tp_dnnl_tgt dnnl_cpu dnnl_graph_cpu)
-    if(TARGET ${_tp_dnnl_tgt})
-        target_compile_definitions(${_tp_dnnl_tgt} PRIVATE USE_MKL USE_CBLAS)
-        target_include_directories(${_tp_dnnl_tgt} PRIVATE ${MKL_INCLUDE_DIRS})
-        target_link_libraries(${_tp_dnnl_tgt} PRIVATE ${MKL_LIBRARIES})
-    endif()
-endforeach()
+#
+# The routing needs the MKL headers, because defining USE_MKL makes the
+# gemm bridge include mkl_cblas.h.  Targets without an MKL (the arm64 lanes
+# build against OpenBLAS) keep the default dispatch instead: handing the
+# engine an unresolved include path aborts the configure step, and forcing
+# USE_MKL without the headers aborts the compile.
+if(MKL_INCLUDE_DIR)
+    foreach(_tp_dnnl_tgt dnnl_cpu dnnl_graph_cpu)
+        if(TARGET ${_tp_dnnl_tgt})
+            target_compile_definitions(${_tp_dnnl_tgt} PRIVATE USE_MKL USE_CBLAS)
+            target_include_directories(${_tp_dnnl_tgt} PRIVATE ${MKL_INCLUDE_DIRS})
+            target_link_libraries(${_tp_dnnl_tgt} PRIVATE ${MKL_LIBRARIES})
+        endif()
+    endforeach()
+endif()
 
 # GCC emits a handful of known warnings inside oneDNN; keep the build log clean.
 if(NOT APPLE AND CMAKE_COMPILER_IS_GNUCC)

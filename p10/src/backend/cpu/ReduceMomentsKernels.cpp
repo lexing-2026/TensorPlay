@@ -15,7 +15,9 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#if defined(CPU_CAPABILITY_AVX512) || defined(CPU_CAPABILITY_AVX2)
 #include <immintrin.h>
+#endif
 
 namespace tensorplay {
 namespace cpu {

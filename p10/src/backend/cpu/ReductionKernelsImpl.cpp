@@ -2583,11 +2583,12 @@ Tensor sum_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
         // The leading-rows kernel stores every output element exactly once,
         // so it allocates its own result and runs before the zero-filled
         // buffer below (whose memset it would otherwise render waste).
-        bool try_leading = false;
+        // try_sum_leading_rows is defined in the x86 section above, so only
+        // the x86 tiers have a leading-rows route at all; the other
+        // architectures reach the iterator below instead.
 #if defined(__x86_64__)
-        try_leading = !reduce_avx512_available();
-#endif
-        if (dims.size() == 1 && input.dtype() == out_dtype && try_leading) {
+        if (!reduce_avx512_available() && dims.size() == 1 &&
+            input.dtype() == out_dtype) {
             const int64_t dim = dims[0] < 0 ? dims[0] + ndim : dims[0];
             if (std::optional<Tensor> leading =
                     try_sum_leading_rows(input, out_shape, dim)) {
@@ -2600,6 +2601,7 @@ Tensor sum_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
                 }
             }
         }
+#endif
 
         Tensor out = Tensor::zeros(out_shape, out_dtype, self.device());
         std::vector<bool> mask(ndim, false);
