@@ -12,7 +12,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef _WIN32
+#include <process.h>  // getpid via _getpid
+#define getpid _getpid
+#else
 #include <unistd.h>
+#endif
 
 #include "Stacktrace.h"
 
