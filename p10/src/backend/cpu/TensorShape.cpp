@@ -20,7 +20,7 @@ Tensor concatenate_native_cpu(const std::vector<Tensor>& tensors, int64_t dim) {
 }
 
 Tensor diagflat_native_cpu(const Tensor& self, int64_t offset) {
-    Tensor flat = ops::view(ops::contiguous(self, 0), {-1});
+    Tensor flat = ops::reshape(self, {-1});
     return ops::diag(flat, offset);
 }
 
