@@ -449,7 +449,7 @@ print(out[0].tolist())   # 提示词及其续写
 
 `GroupedQueryAttention` 让八个 query 头共享两个 KV 头，缓存只需保存全多头模型四分之一的 key/value。缓存本身可替换：`DynamicCache` 逐 token 增长，`StaticCache`、`SlidingWindowCache`、`PagedCache`、`QuantizedCache` 与线性注意力的 `LinearStateCache` 分别覆盖静态分配、窗口上下文、分页服务、量化存储与循环状态。在 `create_empty_cache()` 里挑一个，或者直接传给 `generate`。
 
-除 GQA 之外，混合器货架上还有 `MultiheadLatentAttention`（低秩潜在 KV 压缩）、`GatedDeltaNet` / `KimiDeltaAttention`（delta 规则线性注意力，每头维护定长循环状态）与 `CompressedSparseAttention`（滑动窗口加压缩 KV 条目，由 lightning indexer 挑选）；`CausalEncoderDecoder` 把解码器摞在编码器之上，构成 encoder–decoder 模型。多进程启动用 `tprun`：以 `--nproc-per-node` 拉起训练脚本副本并接好分布式。
+除 GQA 之外，还可以直接换用 `MultiheadLatentAttention`（低秩潜在 KV 压缩）、`GatedDeltaNet` / `KimiDeltaAttention`（delta 规则线性注意力，每头维护定长循环状态）与 `CompressedSparseAttention`（滑动窗口加压缩 KV 条目，由 lightning indexer 挑选）；`CausalEncoderDecoder` 把解码器摞在编码器之上，构成 encoder–decoder 模型。多进程启动用 `tprun`：以 `--nproc-per-node` 拉起训练脚本副本并接好分布式。
 
 体系化教程——从零开始的线性回归、MNIST CNN 图像分类、自定义数据集、`.mega` + `state_dict` 模型保存与加载——见 [tensorplay.cn](https://www.tensorplay.cn/zh/guide/tutorials)。深度长文，一篇一个支柱——dispatch、autograd 引擎、张量存储、编译器——见[博客系列](docs/blogs/00-index.md)。
 
