@@ -706,6 +706,15 @@ MANUAL_DERIVATIVES: dict[str, dict] = {
         "saved": ["grad_output", "input", "grid", "interpolation_mode", "padding_mode",
                   "align_corners"],
         "node": "GridSampler3dBackwardBackward"},
+    # The loss records both saved states and the sequence likelihood.
+    "_ctc_loss": {
+        "saved": ["log_probs", "targets", "input_lengths", "target_lengths", "blank", "zero_infinity"],
+        "saved_outputs": ["neg_log_likelihood", "log_alpha"],
+        "node": "CtcLossBackward"},
+    "_ctc_loss_backward": {
+        "saved": ["grad_output", "log_probs", "targets", "input_lengths", "target_lengths",
+                  "neg_log_likelihood", "log_alpha", "blank", "zero_infinity"],
+        "node": "CtcLossBackwardBackward"},
     # Multi-output backward kernels with no derivative of their own
     # (MiscKernelBackward.h): a pass that needs one raises.
     "deform_conv2d_backward": {"saved": [], "node": "DeformConv2dBackwardBackward"},

@@ -1860,6 +1860,7 @@ struct StdMeanBackward : public Node {
 #include "SpecialBackward.h"
 #include "ActivationBackward.h"
 #include "SparseSoftmaxBackward.h"
+#include "CtcBackward.h"
 #include "LossBackward.h"
 #include "ShapeKernelBackward.h"
 #include "ConvNormBackward.h"

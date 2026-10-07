@@ -542,18 +542,8 @@
   grad_output: multilabel_margin_loss_backward(grad, self, target, reduction, is_target)
   self: zeros_like(self)
 
-# CTC: grad flows only to log_probs; the backward consumes the saved forward
-# outputs (raw per-sequence NLL keeps +inf for impossible alignments so the
-- name: _ctc_loss(Tensor log_probs, Tensor targets, Tensor input_lengths, Tensor target_lengths, int blank=0, bool zero_infinity=False) -> (Tensor neg_log_likelihood, Tensor log_alpha)
-  log_probs: _ctc_loss_backward(grad, log_probs, targets, input_lengths, target_lengths, neg_log_likelihood, log_alpha, blank, zero_infinity)
-
-# No derivative of its own; a second pass raises instead of treating the
-# missing term as zero.
-- name: _ctc_loss_backward(Tensor grad_output, Tensor log_probs, Tensor targets, Tensor input_lengths, Tensor target_lengths, Tensor neg_log_likelihood, Tensor log_alpha, int blank, bool zero_infinity) -> Tensor
-  grad_output: not_implemented_grad("_ctc_loss_backward")
-  log_probs: not_implemented_grad("_ctc_loss_backward")
-  neg_log_likelihood: not_implemented_grad("_ctc_loss_backward")
-  log_alpha: not_implemented_grad("_ctc_loss_backward")
+# CTC uses manual nodes for the two forward outputs and the dynamic-program
+# adjoints of the backward kernel.
 
 - name: mse_loss(Tensor self, Tensor target, int reduction=1) -> Tensor
   self: mse_loss_backward(grad, self, target, reduction)
