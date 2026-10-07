@@ -272,9 +272,13 @@ Tensor sparse_add_cuda(const Tensor& self, const Tensor& other) {
     }
     Tensor a = self.is_coalesced() ? self : self.coalesce();
     Tensor b = other.is_coalesced() ? other : other.coalesce();
-    if (a._values().dim() != 1 || b._values().dim() != 1) {
+    if (a.sparse_dim() != b.sparse_dim() || a._values().dim() != b._values().dim()) {
         TP_THROW(RuntimeError,
-                 "sparse.add(): hybrid COO tensors are not supported");
+                 "sparse.add(): sparse dimensions and value shapes must match");
+    }
+    for (int64_t d = 1; d < a._values().dim(); ++d) {
+        TP_CHECK(a._values().size(d) == b._values().size(d),
+                 "sparse.add(): sparse dimensions and value shapes must match");
     }
     Tensor cat_indices = Tensor::cat({a._indices(), b._indices()}, 1);
     Tensor cat_values = Tensor::cat({a._values(), b._values()}, 0);

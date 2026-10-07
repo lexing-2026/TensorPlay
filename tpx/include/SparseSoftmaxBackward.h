@@ -139,6 +139,14 @@ inline Tensor pool_sum(const Tensor& payload, const Tensor& pattern, int64_t dim
 
 }  // namespace sparse_softmax_detail
 
+inline Tensor coo_to_dense_backward(const Tensor& grad, const Tensor& self) {
+    if (!self.is_sparse()) return grad;
+    if (self.is_sparse_compressed()) return ops::sparse_mask(grad, self);
+    Tensor pattern = sparse_softmax_detail::canonical(self);
+    return sparse_softmax_detail::from_values(
+        pattern, sparse_softmax_detail::values_at(grad, pattern));
+}
+
 inline Tensor sparse_softmax_double_backward_grad_output(
     const Tensor& grad, const Tensor& grad_output, const Tensor& output,
     int64_t dim, bool logarithmic) {

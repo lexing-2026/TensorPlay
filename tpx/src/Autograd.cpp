@@ -472,6 +472,9 @@ void AutogradMeta::accum_grad(const tensorplay::Tensor& grad) {
         } else {
             grad_ = grad.clone();
         }
+    } else if (grad_.is_sparse() && grad.is_sparse() &&
+               !grad_.is_sparse_compressed() && !grad.is_sparse_compressed()) {
+        grad_ = ops::sparse_add(grad_, grad);
     } else if (!GradMode::is_enabled()) {
         // First-order accumulation keeps the stored tensor's identity:
         // handles to `.grad` taken earlier observe the running sum.

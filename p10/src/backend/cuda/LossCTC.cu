@@ -215,7 +215,8 @@ __global__ void ctc_loss_backward_log_beta_gpu_kernel(
                              std::exp(lb2 - lbmax) +
                              std::exp(lb3 - lbmax)) + lbmax +
                     log_probs[(t * batch_size + b) * num_labels + current_char];
-            } else if (valid_batch && s < states) {
+            } else if (valid_batch && s < states &&
+                       (s >= 2 * target_length + 1 || t >= input_length)) {
                 log_beta[batch_beta_offset + t * states + s] = neginf;
             }
         }

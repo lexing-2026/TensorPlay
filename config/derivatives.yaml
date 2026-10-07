@@ -1791,7 +1791,7 @@
   self: tensorplay::tpx::ops::neg(grad)
 
 - name: to_dense(Tensor self) -> Tensor
-  self: grad.sparse_mask(self)
+  self: coo_to_dense_backward(grad, self)
 
 # silu 旧式 `grad * self.sigmoid() * (self + 1)` 漏 (1 - sigmoid) 因子，
 # 有限差分验证: x=0.49 处旧值 0.9239 vs 真值 0.7354。
@@ -2434,6 +2434,10 @@
 
 # ---------------------------------------------------------------------------
 # Sparse ops
+- name: sparse_add(Tensor self, Tensor other) -> Tensor
+  self: grad
+  other: grad
+
 - name: _sparse_softmax(Tensor self, int dim, bool half_to_float) -> Tensor
   self: _sparse_softmax_backward_data(grad, result, dim, self)
 

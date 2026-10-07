@@ -35,7 +35,10 @@ inline bool can_accumulate_inplace(const Tensor& v) {
 // worker thread whose TLS does not describe this GraphTask.
 inline void accumulate(std::vector<Tensor>& buffer, size_t pos, Tensor&& var, bool grad_mode) {
     auto& old_var = buffer[pos];
-    if (grad_mode) {
+    if (old_var.is_sparse() && var.is_sparse() &&
+        !old_var.is_sparse_compressed() && !var.is_sparse_compressed()) {
+        buffer[pos] = tensorplay::tpx::ops::sparse_add(old_var, var);
+    } else if (grad_mode) {
         // Under GradMode (e.g. create_graph backward) accumulate through the
         // autograd-aware ops so the second-order graph is built.
         buffer[pos] = tensorplay::tpx::ops::add(old_var, var);
