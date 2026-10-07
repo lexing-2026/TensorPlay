@@ -57,10 +57,15 @@ class PullRequestForbidden(SubmoduleUpdateError):
 
     REMEDIATION = (
         "This repository does not let the workflow token open pull requests. "
-        "Add a GitHub App installation token or a personal access token with "
-        "pull-request write access as the SUBMODULE_UPDATE_PAT secret and "
-        "re-run this workflow; the bump branches already pushed stay on the "
-        "remote and are picked up by the next run."
+        "Turn on \"Allow GitHub Actions to create and approve pull requests\" "
+        "under Settings -> Actions -> General -> Workflow permissions and "
+        "re-run this workflow; the credential is what the refusal names, and "
+        "a token supplied through SUBMODULE_UPDATE_PAT does not get past it. "
+        "Note that a pull request opened by the workflow token does not "
+        "trigger repository workflows, so add a token with pull-request "
+        "write access there as well if the bump PRs should run the "
+        "lint and smoke-build gates. The bump branches already pushed stay "
+        "on the remote and are picked up by the next run."
     )
 
 

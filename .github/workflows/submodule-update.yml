@@ -4,10 +4,20 @@ name: submodule-update
 # default branch and opens one Conventional-Commit PR per outdated submodule
 # (see tools/submodule_updater.py).
 #
-# PRs are created through gh.  Pull requests opened with the default
-# GITHUB_TOKEN do not trigger repository workflows, so to let the bump PRs run
-# the lint/smoke-build gates automatically, provide a GitHub App or PAT token
-# in the SUBMODULE_UPDATE_PAT secret; it is used instead of GITHUB_TOKEN.
+# Two separate things stand between this bot and a green bump PR, and they
+# are fixed in different places.
+#
+# Creating the PR at all needs the repository setting "Allow GitHub Actions
+# to create and approve pull requests" (Settings -> Actions -> General ->
+# Workflow permissions).  With it off the workflow token is refused before
+# it reaches the API, whatever secrets this workflow carries.
+#
+# Running the gates on the PR is a different problem: a pull request opened
+# by the workflow token does not trigger repository workflows, so lint and
+# smoke-build stay unscheduled on it.  To have them run, provide a GitHub App
+# installation token or a personal access token with pull-request write
+# access as the SUBMODULE_UPDATE_PAT secret; it is used instead of the
+# workflow token when present.
 
 on:
   schedule:
