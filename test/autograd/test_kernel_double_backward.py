@@ -174,6 +174,56 @@ def test_multilabel_margin_loss_differentiates_twice():
     assert gg.shape == x.shape
 
 
+def roi_boxes(device, empty=False):
+    if empty:
+        return tp.zeros(0, 5, dtype=tp.float64).to(device)
+    rows = [[0, 0.3, 0.6, 4.2, 5.1],
+            [1, 1.7, 0.2, 7.9, 6.6],
+            [0, -1.5, 3.0, 9.5, 8.4],
+            [1, 2.0, 2.0, 2.4, 2.6],
+            [5, 0.0, 0.0, 3.0, 3.0]]
+    return tp.tensor(rows, dtype=tp.float64).to(device)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("sampling_ratio", [0, 2])
+@pytest.mark.parametrize("aligned", [False, True])
+@pytest.mark.parametrize("empty", [False, True])
+def test_roi_align_differentiates_twice(device, sampling_ratio, aligned, empty):
+    x = rand(2, 3, 7, 8, device=device, seed=15)
+    rois = roi_boxes(device, empty)
+
+    def fn(t):
+        out = _C.roi_align(t, rois, 0.9, 2, 3, sampling_ratio, aligned)
+        return out * out
+
+    check(fn, [x])
+    go = rand(rois.shape[0], 3, 2, 3, device=device, seed=16)
+    back = lambda g: _C.roi_align_backward(g, rois, 0.9, 2, 3, sampling_ratio, aligned,
+                                           [2, 3, 7, 8])
+    assert gradcheck(back, (go,), atol=1e-6, rtol=1e-4)
+    assert gradgradcheck(back, (go,), atol=1e-6, rtol=1e-4)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("sampling_ratio", [0, 2])
+@pytest.mark.parametrize("empty", [False, True])
+def test_ps_roi_align_differentiates_twice(device, sampling_ratio, empty):
+    x = rand(2, 12, 7, 8, device=device, seed=17)
+    rois = roi_boxes(device, empty)
+
+    def fn(t):
+        out = _C.ps_roi_align(t, rois, 0.9, 2, 3, sampling_ratio)
+        return out * out
+
+    check(fn, [x])
+    go = rand(rois.shape[0], 2, 2, 3, device=device, seed=18)
+    back = lambda g: _C.ps_roi_align_backward(g, rois, 0.9, 2, 3, sampling_ratio,
+                                              [2, 12, 7, 8])
+    assert gradcheck(back, (go,), atol=1e-6, rtol=1e-4)
+    assert gradgradcheck(back, (go,), atol=1e-6, rtol=1e-4)
+
+
 def test_ctc_loss_second_pass_raises():
     tp.manual_seed(8)
     log_probs = tp.randn(6, 2, 4, dtype=tp.float64).log_softmax(2).detach().requires_grad_(True)

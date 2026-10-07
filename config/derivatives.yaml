@@ -891,16 +891,19 @@
 - name: ps_roi_pool(Tensor input, Tensor rois, float spatial_scale, int pooled_height, int pooled_width) -> Tensor
   input: ps_roi_pool_backward(grad, rois, spatial_scale, pooled_height, pooled_width, input.shape())
 
-# The ROI backward kernels have no derivative of their own.
+# roi_align and ps_roi_align are linear in the input, and their backward
+# kernels scatter with exactly the bilinear weights the forward gathers with,
+# so the backward differentiates in grad_output to the forward itself.
 - name: roi_align_backward(Tensor grad_output, Tensor rois, float spatial_scale, int pooled_height, int pooled_width, int sampling_ratio, bool aligned, int[] input_size) -> Tensor
-  grad_output: not_implemented_grad("roi_align_backward")
+  grad_output: roi_align(grad, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio, aligned)
 
+- name: ps_roi_align_backward(Tensor grad_output, Tensor rois, float spatial_scale, int pooled_height, int pooled_width, int sampling_ratio, int[] input_size) -> Tensor
+  grad_output: ps_roi_align(grad, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio)
+
+# The remaining ROI backward kernels have no derivative of their own.
 - name: roi_pool_backward(Tensor grad_output, Tensor input, Tensor rois, float spatial_scale, int pooled_height, int pooled_width) -> Tensor
   grad_output: not_implemented_grad("roi_pool_backward")
   input: not_implemented_grad("roi_pool_backward")
-
-- name: ps_roi_align_backward(Tensor grad_output, Tensor rois, float spatial_scale, int pooled_height, int pooled_width, int sampling_ratio, int[] input_size) -> Tensor
-  grad_output: not_implemented_grad("ps_roi_align_backward")
 
 - name: ps_roi_pool_backward(Tensor grad_output, Tensor rois, float spatial_scale, int pooled_height, int pooled_width, int[] input_size) -> Tensor
   grad_output: not_implemented_grad("ps_roi_pool_backward")
