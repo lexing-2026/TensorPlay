@@ -16,6 +16,12 @@ Tensor constant(const Tensor& like, int64_t length, double value) {
     return Tensor::full({length}, Scalar(value), like.dtype(), like.device());
 }
 
+Tensor recorded_zero(const Tensor& input) {
+    Tensor mask = Tensor::full(static_cast<std::vector<int64_t>>(input.shape()),
+                               Scalar(true), DType::Bool, input.device());
+    return ops::masked_fill(input, mask, Scalar(0));
+}
+
 Tensor shift(const Tensor& row, int64_t amount, double fill) {
     const int64_t count = std::min<int64_t>(std::abs(amount), row.size(0));
     Tensor padding = constant(row, count, fill);
@@ -121,7 +127,7 @@ Tensor class_sum(const Tensor& state_values, const Tensor& labels, const Tensor&
 
 Tensor pad_frames(std::vector<Tensor> rows, const Tensor& lp) {
     while (static_cast<int64_t>(rows.size()) < lp.size(0))
-        rows.push_back(ops::mul(ops::select(lp, 0, static_cast<int64_t>(rows.size())), Scalar(0)));
+        rows.push_back(recorded_zero(ops::select(lp, 0, static_cast<int64_t>(rows.size()))));
     return ops::stack(rows, 0);
 }
 
@@ -204,7 +210,7 @@ variable_list backward_adjoints(const Tensor& adj, const Tensor& go, const Tenso
         if (zero_infinity) normalizer = ops::where(ignored, Scalar(0), normalizer);
         auto beta = betas(emissions, seq);
         Tensor carry = constant(lp, seq.labels.numel(), 0);
-        Tensor dg = ops::mul(gr, Scalar(0)), dn = ops::mul(normalizer, Scalar(0));
+        Tensor dg = recorded_zero(gr), dn = recorded_zero(normalizer);
         std::vector<Tensor> rows, alpha_rows;
         for (int64_t t = 0; t < seq.length; ++t) {
             Tensor frame = ops::select(batch, 0, t), v = ops::select(incoming, 0, t);
