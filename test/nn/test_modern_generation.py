@@ -5,7 +5,14 @@ import unittest
 import tensorplay as tp
 import tensorplay.nn as nn
 import tensorplay.nn.functional as F
-from tensorplay.nn.cache import DynamicCache, LinearStateCache
+from tensorplay.nn.cache import (
+    DynamicCache,
+    LinearStateCache,
+    PagedCache,
+    QuantizedCache,
+    SlidingWindowCache,
+    StaticCache,
+)
 from tensorplay.nn.generation import _apply_repetition_penalty, generate, top_k_top_p_filtering
 
 
@@ -91,6 +98,74 @@ class TestLinearStateCache(unittest.TestCase):
         self.assertIs(cache.recurrent_states[0], state)
         cache.reset()
         self.assertFalse(cache.has_previous_state(0))
+
+
+class TestCacheFamilies(unittest.TestCase):
+    """Every cache family must be interchangeable for plain attention use."""
+
+    def setUp(self):
+        tp.manual_seed(11)
+        self.k1 = tp.randn(2, 2, 4, 6)
+        self.v1 = tp.randn(2, 2, 4, 6)
+        self.k2 = tp.randn(2, 2, 3, 6)
+        self.v2 = tp.randn(2, 2, 3, 6)
+        self.ref_k = tp.cat([self.k1, self.k2], dim=2)
+
+    def test_static_cache(self):
+        cache = StaticCache(max_seq_len=16)
+        ck, cv = cache.update(self.k1, self.v1)
+        self.assertTrue(tp.equal(ck, self.k1))
+        ck, cv = cache.update(self.k2, self.v2)
+        self.assertTrue(tp.equal(ck, self.ref_k))
+        self.assertEqual(cache.get_seq_length(), 7)
+        with self.assertRaises(RuntimeError):
+            cache.update(tp.randn(2, 2, 10, 6), tp.randn(2, 2, 10, 6))
+
+    def test_sliding_window_evicts(self):
+        cache = SlidingWindowCache(window_size=5)
+        cache.update(self.k1, self.v1)
+        ck, _ = cache.update(self.k2, self.v2)
+        self.assertEqual(ck.shape[2], 5)
+        self.assertTrue(tp.allclose(ck[:, :, :2], self.k1[:, :, 2:]))
+        self.assertTrue(tp.allclose(ck[:, :, 2:], self.k2))
+        self.assertEqual(cache.get_seq_length(), 7)
+        self.assertEqual(cache.positions[0][0, 0].item(), 2)
+
+    def test_sliding_window_superset_matches_dynamic(self):
+        window = SlidingWindowCache(window_size=32)
+        ck, _ = window.update(self.k1, self.v1)
+        ck, _ = window.update(self.k2, self.v2)
+        self.assertTrue(tp.allclose(ck, self.ref_k))
+
+    def test_paged_cache_rows_are_independent(self):
+        cache = PagedCache(block_size=2, num_blocks=8)
+        ck, cv = cache.update(self.k1, self.v1)
+        self.assertTrue(tp.allclose(ck, self.k1))
+        ck, cv = cache.update(self.k2, self.v2)
+        self.assertTrue(tp.allclose(ck, self.ref_k))
+        self.assertEqual(cache.get_seq_length(), 7)
+        with self.assertRaises(RuntimeError):
+            cache.update(tp.randn(2, 2, 20, 6), tp.randn(2, 2, 20, 6))
+
+    def test_quantized_cache_bounded_error(self):
+        cache = QuantizedCache()
+        ck, _ = cache.update(self.k1, self.v1)
+        ck, _ = cache.update(self.k2, self.v2)
+        self.assertEqual(ck.shape, self.ref_k.shape)
+        err = (ck - self.ref_k).abs().max().item()
+        self.assertLess(err, 0.05 * self.ref_k.abs().max().item() + 1e-6)
+
+    def test_generate_equivalence_across_caches(self):
+        tp.manual_seed(7)
+        model = CachedTinyModel(32, 16)
+        with tp.no_grad():
+            model.head.weight.mul_(100.0)
+        ids = tp.randint(0, 32, (3, 6))
+        base = generate(model, ids, max_new_tokens=8, use_cache=False)
+        caches = [DynamicCache(), StaticCache(32), PagedCache(4, 16), QuantizedCache()]
+        for cache in caches:
+            out = generate(model, ids, max_new_tokens=8, past_key_values=cache)
+            self.assertTrue(tp.equal(out, base), msg=type(cache).__name__)
 
 
 class TestGenerateLoop(unittest.TestCase):
