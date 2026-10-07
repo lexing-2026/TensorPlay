@@ -1253,5 +1253,9 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, ViewKernels) {
     m.impl("unbind", unbind_kernel_cuda);
 }
 
+TENSORPLAY_LIBRARY_IMPL(SparseCUDA, ViewSparseKernels) {
+    m.impl("clone", clone_kernel_cuda);
+}
+
 } // namespace cuda
 } // namespace tensorplay

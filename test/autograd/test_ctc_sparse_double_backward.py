@@ -69,7 +69,7 @@ def test_sparse_backward_independent_slots(device, logarithmic, dim):
                              shape, is_coalesced=True).detach().requires_grad_(True)
     output = tp.sparse_coo_tensor(indices, leaf([[.2, .4], [.8, .6], [.3, .5], [.7, .5]], device),
                                  shape, is_coalesced=True).detach().requires_grad_(True)
-    structural = output.detach().clone().requires_grad_(True)
+    structural = output.detach().to("cpu").to(device).requires_grad_(True)
     kernel = tp._C._sparse_log_softmax_backward_data if logarithmic else tp._C._sparse_softmax_backward_data
     fn = lambda g, o: kernel(g, o, dim, structural).to_dense()
     check_sparse(fn, (go, output))
@@ -227,3 +227,20 @@ def test_sparse_uncoalesced_support(device):
     expected = tp.autograd.grad(fn(gc, xc), (gc, xc), cotangent)
     for a, b in zip(actual, expected):
         np.testing.assert_allclose(array(a.to_dense()), array(b.to_dense()), atol=1e-12)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_sparse_leaf_accumulates_recorded_gradients(device):
+    x = tp.sparse_coo_tensor(tp.tensor([[0, 0, 1, 1], [0, 2, 0, 1]], device=device),
+                            leaf([-.4, .7, .2, -.3], device), (2, 3),
+                            is_coalesced=True).detach().requires_grad_(True)
+    loss = (tp._C._sparse_softmax(x, 1, False).to_dense() ** 2).sum()
+    expected = tp.autograd.grad(loss, x, create_graph=True, retain_graph=True)[0]
+    loss.backward(create_graph=True, retain_graph=True)
+    loss.backward(create_graph=True, retain_graph=True)
+    np.testing.assert_allclose(array(x.grad.to_dense()), 2 * array(expected.to_dense()), atol=1e-12)
+    second_expected = tp.autograd.grad(expected.to_dense().sum(), x, retain_graph=True)[0]
+    second_actual = tp.autograd.grad(x.grad.to_dense().sum(), x)[0]
+    np.testing.assert_allclose(array(second_actual.to_dense()),
+                               2 * array(second_expected.to_dense()), atol=1e-12)
+    x.grad = None

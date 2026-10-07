@@ -467,7 +467,9 @@ void AutogradMeta::accum_grad(const tensorplay::Tensor& grad) {
         // gradient that fans out (an addend's gradient reaching two leaves,
         // or a leaf and a buffered interior node) is deep-copied, so later
         // in-place updates of this slot or of the other holder stay private.
-        if (!GradMode::is_enabled() && grad.impl().use_count() <= 1) {
+        if (grad.is_sparse() && !grad.is_sparse_compressed()) {
+            grad_ = GradMode::is_enabled() ? grad.clone() : grad;
+        } else if (!GradMode::is_enabled() && grad.impl().use_count() <= 1) {
             grad_ = grad;
         } else {
             grad_ = grad.clone();
