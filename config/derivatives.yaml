@@ -539,8 +539,8 @@
   weight: not_implemented_grad("multi_margin_loss_backward")
 
 - name: multilabel_margin_loss_backward(Tensor grad_output, Tensor self, Tensor target, int reduction, Tensor is_target) -> Tensor
-  grad_output: not_implemented_grad("multilabel_margin_loss_backward")
-  self: not_implemented_grad("multilabel_margin_loss_backward")
+  grad_output: multilabel_margin_loss_backward(grad, self, target, reduction, is_target)
+  self: zeros_like(self)
 
 # CTC: grad flows only to log_probs; the backward consumes the saved forward
 # outputs (raw per-sequence NLL keeps +inf for impossible alignments so the

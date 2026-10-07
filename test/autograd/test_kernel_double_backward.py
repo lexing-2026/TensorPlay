@@ -133,6 +133,15 @@ def test_multi_margin_loss_second_pass_raises():
         second_pass(loss, [x])
 
 
+def test_multilabel_margin_loss_differentiates_twice():
+    x = rand(2, 5, seed=14)
+    target = tp.tensor([[0, 2, -1, -1, -1], [1, 4, 3, -1, -1]])
+    loss = F.multilabel_margin_loss(x, target)
+    (g,) = tp.autograd.grad(loss, [x], create_graph=True)
+    (gg,) = tp.autograd.grad((g * g).sum(), [x])
+    assert gg.shape == x.shape
+
+
 def test_ctc_loss_second_pass_raises():
     tp.manual_seed(8)
     log_probs = tp.randn(6, 2, 4, dtype=tp.float64).log_softmax(2).detach().requires_grad_(True)
