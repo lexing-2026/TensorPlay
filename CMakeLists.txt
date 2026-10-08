@@ -267,7 +267,8 @@ if(USE_CUDA)
             
             # List of DLLs to bundle
             # The wheel must carry every runtime DLL behind the import
-            # libraries linked into p10; users' machines have no toolkit.
+            # libraries linked into p10 and _C (nvjpeg backs the image IO
+            # bindings); users' machines have no toolkit.
             # We use glob to find versioned DLLs (e.g. cublas64_11.dll)
             set(CUDA_DLL_PATTERNS
                 "cudart64_*.dll"
@@ -279,6 +280,7 @@ if(USE_CUDA)
                 "cusparse64_*.dll"
                 "nvrtc*64_*.dll"
                 "nvJitLink_*.dll"
+                "nvjpeg64_*.dll"
             )
             
             foreach(PATTERN ${CUDA_DLL_PATTERNS})
