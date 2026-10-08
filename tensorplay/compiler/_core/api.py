@@ -562,10 +562,6 @@ def compile(
                     kwargs,
                     fullgraph=fullgraph,
                     backend_kwargs=backend_kwargs,
-                    # An autograd artifact reads recorded values off the nodes
-                    # while it runs, so a training region keeps them; an
-                    # inference artifact consumes none and drops them here.
-                    preserve_recorded_values=bool(grad_state[0]),
                     region_key=make_region_key(
                         target_cache,
                         model if _is_module_like(model) else None,
@@ -1079,7 +1075,6 @@ def _compile_region(
     fullgraph: bool,
     backend_kwargs: dict[str, Any],
     region_key: str | None = None,
-    preserve_recorded_values: bool = False,
 ) -> tuple[Callable[..., Any], GraphModule]:
     devices = _generator_devices(example_inputs, example_kwargs)
     stored = load_region(region_key, model)
@@ -1197,8 +1192,7 @@ def _compile_region(
         raise TypeError(
             f"compiler backend returned {type(compiled)!r}; expected a callable"
         )
-    if not preserve_recorded_values:
-        _release_recorded_values(graph_module)
+    _release_recorded_values(graph_module)
     return compiled, graph_module
 
 
@@ -1229,6 +1223,33 @@ def _generator_devices(
     return devices
 
 
+class _RecordedTensorMetadata:
+    """Small tensor description retained for diagnostics after compilation."""
+
+    __slots__ = ("shape", "dtype", "device", "requires_grad", "stride")
+
+    def __init__(self, value: Any) -> None:
+        shape = getattr(value, "shape", ())
+        self.shape = tuple(shape() if callable(shape) else shape)
+        self.dtype = getattr(value, "dtype", None)
+        self.device = getattr(value, "device", None)
+        self.requires_grad = bool(getattr(value, "requires_grad", False))
+        stride = getattr(value, "stride", ())
+        self.stride = tuple(stride() if callable(stride) else stride)
+
+    def size(self, dim: int | None = None) -> Any:
+        return self.shape if dim is None else self.shape[dim]
+
+    def dim(self) -> int:
+        return len(self.shape)
+
+    def numel(self) -> int:
+        result = 1
+        for size in self.shape:
+            result *= int(size)
+        return result
+
+
 def _release_recorded_values(graph_module: Any) -> None:
     """Drop execution artifacts that capture-time propagation parked on nodes.
 
@@ -1249,17 +1270,23 @@ def _release_recorded_values(graph_module: Any) -> None:
         return
 
     def strip(value: Any) -> Any:
-        return None if isinstance(value, Tensor) else value
+        if isinstance(value, Tensor):
+            return _RecordedTensorMetadata(value)
+        if isinstance(value, tuple):
+            return tuple(strip(item) for item in value)
+        if isinstance(value, list):
+            return [strip(item) for item in value]
+        if isinstance(value, dict):
+            return {key: strip(item) for key, item in value.items()}
+        return value
 
     for node in nodes:
         meta = getattr(node, "meta", None)
         if not meta:
             continue
         value = meta.get("val")
-        if isinstance(value, Tensor):
-            meta["val"] = None
-        elif isinstance(value, tuple):
-            meta["val"] = tuple(strip(item) for item in value)
+        if value is not None:
+            meta["val"] = strip(value)
 
 
 _SHAPE_GUARD_ATTRS = frozenset({"shape", "len", "ndim"})

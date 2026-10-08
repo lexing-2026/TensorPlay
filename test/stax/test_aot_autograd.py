@@ -78,3 +78,19 @@ def test_aot_graphs_are_operator_level():
     a = tp.randn(3, requires_grad=True)
     compiled(a).sum().backward()
     assert a.grad is not None
+
+
+def test_compiled_graphs_release_recorded_tensors():
+    def fn(value):
+        return (value.sin().cos().exp()).sum()
+
+    compiled = tp.compile(fn, backend="aot_eager")
+    value = tp.randn(8, 16, requires_grad=True)
+    compiled(value).backward()
+
+    lowering = next(iter(compiled._tensorplay_cache.values()))
+    for graph in lowering._tensorplay_aot_graphs:
+        assert all(
+            not isinstance(node.meta.get("val"), tp.Tensor)
+            for node in graph.graph.nodes
+        )

@@ -399,6 +399,9 @@ def aot_function(
             fw_module, out_spec, _ = _trace_forward(fn, primals, decompositions)
             fw_module = _functionalize(fw_module, _trace_inputs(primals))
         compiled_fw = inference_compiler(fw_module, primals)
+        from .api import _release_recorded_values
+
+        _release_recorded_values(fw_module)
 
         def run_inference(*args: Any) -> Any:
             with tensorplay.no_grad():
@@ -451,6 +454,10 @@ def aot_function(
     _mark_user_outputs(fw_module, num_fwd)
     _mark_user_outputs(bw_module, 0)
     compiled_fw = fw_compiler(fw_module, fw_inputs)
+    from .api import _release_recorded_values
+
+    _release_recorded_values(joint)
+    _release_recorded_values(fw_module)
     compiled_bw_box: list[Any] = []
     fw_codegen = getattr(compiled_fw, "_tensorplay_codegen", None)
 
@@ -515,6 +522,7 @@ def aot_function(
             )
             if not compiled_bw_box:
                 compiled_bw_box.append(bw_compiler(bw_module, inputs))
+                _release_recorded_values(bw_module)
                 run_training._tensorplay_backward_codegen = getattr(
                     compiled_bw_box[0], "_tensorplay_codegen", None
                 )
