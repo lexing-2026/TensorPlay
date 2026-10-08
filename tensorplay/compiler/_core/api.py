@@ -1132,6 +1132,7 @@ def _compile_region(
             tracer._node_samples.clear()
             tracer.sample_inputs.clear()
             tracer._samples.clear()
+            _release_recorded_values(graph_module)
 
     # Capture, propagation and lowering all execute the program to record or
     # measure it.  The generator they advance belongs to the caller, so the
@@ -1229,7 +1230,10 @@ def _generator_devices(
 class _RecordedTensorMetadata:
     """Small tensor description retained for diagnostics after compilation."""
 
-    __slots__ = ("shape", "dtype", "device", "requires_grad", "stride")
+    __slots__ = (
+        "shape", "dtype", "device", "requires_grad", "_stride", "_defined",
+        "_storage_id", "_storage_offset",
+    )
 
     def __init__(self, value: Any) -> None:
         shape = getattr(value, "shape", ())
@@ -1238,7 +1242,24 @@ class _RecordedTensorMetadata:
         self.device = getattr(value, "device", None)
         self.requires_grad = bool(getattr(value, "requires_grad", False))
         stride = getattr(value, "stride", ())
-        self.stride = tuple(stride() if callable(stride) else stride)
+        self._stride = tuple(stride() if callable(stride) else stride)
+        defined = getattr(value, "defined", None)
+        self._defined = not callable(defined) or bool(defined())
+        try:
+            self._storage_id = value.untyped_storage().data_ptr()
+            self._storage_offset = value.storage_offset()
+        except (AttributeError, RuntimeError):
+            self._storage_id = None
+            self._storage_offset = 0
+
+    def stride(self, dim: int | None = None) -> Any:
+        return self._stride if dim is None else self._stride[dim]
+
+    def defined(self) -> bool:
+        return self._defined
+
+    def storage_offset(self) -> int:
+        return self._storage_offset
 
     def size(self, dim: int | None = None) -> Any:
         return self.shape if dim is None else self.shape[dim]
@@ -1287,6 +1308,7 @@ def _release_recorded_values(graph_module: Any) -> None:
         meta = getattr(node, "meta", None)
         if not meta:
             continue
+        meta.pop("widened_source", None)
         value = meta.get("val")
         if value is not None:
             meta["val"] = strip(value)

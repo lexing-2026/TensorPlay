@@ -1,4 +1,6 @@
 import operator
+import gc
+import weakref
 
 import tensorplay as tp
 from tensorplay.graph import Graph, GraphModule
@@ -53,3 +55,29 @@ def test_shape_prop_wraps_node_execution_errors() -> None:
         assert "truediv" in str(exc)
     else:
         raise AssertionError("shape propagation must report the failing node")
+
+
+def test_metadata_only_propagation_releases_values() -> None:
+    module = _module_with_tuple_output()
+    value = tp.ones(8)
+    reference = weakref.ref(value)
+    result = ShapeProp(module, record_values=False).propagate(value)
+    recorded = module.graph.output_node.meta["val"]
+    assert recorded[0].shape == (8,)
+    assert recorded[0].stride() == (1,)
+    assert recorded[0].defined()
+    del value, result
+    gc.collect()
+    assert reference() is None
+
+
+def test_weak_implementation_reference_outlives_python_wrapper() -> None:
+    value = tp.ones(4, requires_grad=True)
+    result = value.sin()
+    reference = tp._C._WeakTensorRef(value)
+    del value
+    gc.collect()
+    assert not reference.expired()
+    del result
+    gc.collect()
+    assert reference.expired()

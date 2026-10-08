@@ -95,7 +95,15 @@ class _ShapePropInterpreter(Interpreter):
                 f"ShapeProp error for: node={node.format_node()} with meta={node.meta}"
             ) from exc
 
-        node.meta["val"] = value
+        if self.record_values:
+            node.meta["val"] = value
+        else:
+            from tensorplay.compiler._core.api import _RecordedTensorMetadata
+
+            node.meta["val"] = map_aggregate(
+                value,
+                lambda item: _RecordedTensorMetadata(item) if _is_tensor(item) else item,
+            )
         node.meta["type"] = type(value)
         node.type = type(value)
 
@@ -125,7 +133,10 @@ class ShapeProp(_ShapePropInterpreter, PassBase):
         self,
         module_or_inputs: GraphModule | Sequence[Any] | None = None,
         fake_mode: Any = None,
+        *,
+        record_values: bool = True,
     ) -> None:
+        self.record_values = record_values
         self.example_inputs = (
             ()
             if module_or_inputs is None or isinstance(module_or_inputs, GraphModule)

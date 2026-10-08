@@ -383,6 +383,17 @@ def _lower_stax_region(
             return result[0]
         return result
 
+    def boxed_call(args):
+        _enter_lowered_graph_scope()
+        try:
+            result = module_call(args)
+        finally:
+            _exit_lowered_graph_scope()
+        if single_output and isinstance(result, tuple) and len(result) == 1:
+            return result[0]
+        return result
+
+    compiled._tensorplay_boxed_call = boxed_call  # type: ignore[attr-defined]
     compiled._tensorplay_module_call = module_call  # type: ignore[attr-defined]
     # The report is on what the caller actually receives, which is this and not
     # the module behind it -- a caller asking which route produced its callable

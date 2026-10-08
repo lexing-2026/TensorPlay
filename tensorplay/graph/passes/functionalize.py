@@ -540,8 +540,9 @@ class _Functionalizer:
 
 def _is_tensor(value: Any) -> bool:
     import tensorplay
+    from tensorplay.compiler._core.api import _RecordedTensorMetadata
 
-    return isinstance(value, tensorplay.Tensor)
+    return isinstance(value, (tensorplay.Tensor, _RecordedTensorMetadata))
 
 
 def _storage_key(value: Any) -> Any:
@@ -549,6 +550,10 @@ def _storage_key(value: Any) -> Any:
     keys = set()
     for tensor in tensors:
         if _is_tensor(tensor):
+            if hasattr(tensor, "_storage_id"):
+                if tensor._storage_id is not None:
+                    keys.add(tensor._storage_id)
+                continue
             try:
                 keys.add(tensor.untyped_storage().data_ptr())
             except Exception:  # noqa: BLE001 - storage-less tensors alias nothing

@@ -8,8 +8,8 @@ the dispatcher -- including the ones the autograd engine runs inside
 The result is a graph over the op contract, independent of the Python code
 that produced it (control flow is resolved by the concrete run).
 
-Tensors map to graph values by tensor identity; the trace keeps every
-tracked tensor alive, so an identity is never reused while it is mapped.
+Tensors map to graph values by tensor identity. A trace may retain concrete
+values or record only metadata with non-owning implementation references.
 Tensors the traced code did not receive as inputs and did not compute (module
 parameters, captured globals) become ``get_attr`` constants of the module.
 """
@@ -46,10 +46,11 @@ class DispatchTracer:
     #: an operator that would hand back a stand-in hands back its result.
     records_real_values = True
 
-    def __init__(self) -> None:
+    def __init__(self, *, record_values: bool = True) -> None:
         self.graph = Graph()
         self.root = _ConstantHolder()
-        # impl identity -> (tensor kept alive, node producing it)
+        self.record_values = record_values
+        # impl identity -> (tensor or non-owning implementation reference, node)
         self._tracked: dict[int, tuple[Any, Node]] = {}
         self._constant_count = 0
         self._proxy_mode: Any = None
@@ -83,14 +84,34 @@ class DispatchTracer:
     # -- tensor tracking ----------------------------------------------------
 
     def track(self, tensor: Any, node: Node) -> None:
-        self._tracked[tensor._impl_id] = (tensor, node)
-        node.meta["val"] = tensor
+        reference = tensor if self.record_values else tensorplay._C._WeakTensorRef(tensor)
+        self._tracked[tensor._impl_id] = (reference, node)
+        node.meta["val"] = self.recorded_value(tensor)
         node.meta["tensor_meta"] = _tensor_meta(tensor)
 
-    def node_for(self, tensor: Any) -> Node:
+    def recorded_value(self, value: Any) -> Any:
+        if self.record_values:
+            return value
+        from tensorplay.compiler._core.api import _RecordedTensorMetadata
+        from ..node import map_aggregate
+
+        return map_aggregate(
+            value, lambda item: _RecordedTensorMetadata(item) if _is_tensor(item) else item
+        )
+
+    def _producer(self, tensor: Any) -> Node | None:
         entry = self._tracked.get(tensor._impl_id)
-        if entry is not None:
-            return entry[1]
+        if entry is None:
+            return None
+        if not self.record_values and entry[0].expired():
+            self._tracked.pop(tensor._impl_id, None)
+            return None
+        return entry[1]
+
+    def node_for(self, tensor: Any) -> Node:
+        node = self._producer(tensor)
+        if node is not None:
+            return node
         return self._constant(tensor)
 
     def producer(self, tensor: Any) -> Node | None:
@@ -101,8 +122,7 @@ class DispatchTracer:
         graph.
         """
 
-        entry = self._tracked.get(tensor._impl_id)
-        return entry[1] if entry is not None else None
+        return self._producer(tensor)
 
     def _subgraph(self, module: GraphModule) -> Node:
         """A graph handed to an operation, read off the module that holds it.
@@ -156,8 +176,8 @@ class DispatchTracer:
         """
 
         if _is_tensor(value):
-            entry = self._tracked.get(value._impl_id)
-            return entry[1] if entry is not None else value
+            node = self._producer(value)
+            return node if node is not None else value
         if isinstance(value, GraphModule):
             return self._subgraph(value)
         if isinstance(value, tuple):
@@ -181,7 +201,7 @@ class DispatchTracer:
         if _is_tensor(out):
             self.track(out, node)
         elif isinstance(out, (tuple, list)):
-            node.meta["val"] = out
+            node.meta["val"] = self.recorded_value(out)
             for index, item in enumerate(out):
                 if _is_tensor(item):
                     element = self.graph.create_node(
@@ -192,7 +212,7 @@ class DispatchTracer:
                     element = self.graph.create_node(
                         "call_function", operator.getitem, (node, index), {}
                     )
-                    element.meta["val"] = item
+                    element.meta["val"] = self.recorded_value(item)
                     for inner_index, inner in enumerate(item):
                         if _is_tensor(inner):
                             leaf = self.graph.create_node(

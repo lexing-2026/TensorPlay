@@ -127,6 +127,7 @@ class TENSORPLAY_API Engine {
 private:
 public:
     static Engine& get_default_engine();
+    static bool current_graph_task_keep_graph();
 
     ~Engine();
 

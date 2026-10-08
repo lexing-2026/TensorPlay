@@ -288,6 +288,10 @@ bool Node::should_compute_output(size_t i) const {
     return it != task->exec_info_.end() && it->second.should_execute();
 }
 
+bool Engine::current_graph_task_keep_graph() {
+    return current_graph_task == nullptr || current_graph_task->keep_graph_;
+}
+
 void Engine::queue_callback(std::function<void()> callback) {
     TP_CHECK(static_cast<bool>(callback), "queue_callback requires a callable");
     TP_CHECK(current_graph_task != nullptr,

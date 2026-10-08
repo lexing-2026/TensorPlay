@@ -167,7 +167,7 @@ def _trace_inputs(primals: Sequence[Any]) -> list[Any]:
 
 
 def _trace_forward(fn: Callable[..., Any], primals: Sequence[Any], decompositions):
-    tracer = DispatchTracer()
+    tracer = DispatchTracer(record_values=True)
     trace_primals = _trace_inputs(primals)
     _placeholders(tracer, trace_primals, "primals")
     with tensorplay.random.fork_rng(devices=_trace_devices(primals)):
@@ -197,7 +197,7 @@ def _trace_joint(fn: Callable[..., Any], primals: Sequence[Any], decompositions)
     from tensorplay.primitives.common import CUDARngStateHelper
     from tensorplay.utils._dispatch import _disable_current_modes
 
-    tracer = _TaggingTracer()
+    tracer = _TaggingTracer(record_values=False)
     trace_primals = _trace_inputs(primals)
     primal_nodes = _placeholders(tracer, trace_primals, "primals")
     diff_inputs = [p for p in trace_primals if _is_tensor(p) and p.requires_grad]
@@ -278,8 +278,14 @@ def _functionalize(gm: GraphModule, example_inputs: Sequence[Any]) -> GraphModul
 
     functional = functionalize(gm)
     _release_recorded_values(gm)
+    _release_recorded_values(functional)
+    joint_graph = any(node.meta.get("is_backward") for node in functional.graph.nodes)
+    mutations = any(
+        getattr(node.target, "_opname", None) == "copy_"
+        for node in functional.graph.nodes
+    )
     with tensorplay.no_grad():
-        ShapeProp(list(example_inputs))(functional)
+        ShapeProp(list(example_inputs), record_values=not joint_graph or mutations)(functional)
     return functional
 
 
@@ -289,8 +295,11 @@ def _functionalize(gm: GraphModule, example_inputs: Sequence[Any]) -> GraphModul
 
 
 def _call(compiled: Callable[..., Any], args: Sequence[Any]) -> tuple[Any, ...]:
-    if getattr(compiled, "_boxed_call", False):
-        result = compiled(list(args))
+    boxed = getattr(compiled, "_tensorplay_boxed_call", None)
+    if boxed is not None:
+        result = boxed(args if isinstance(args, list) else list(args))
+    elif getattr(compiled, "_boxed_call", False):
+        result = compiled(args if isinstance(args, list) else list(args))
     else:
         result = compiled(*args)
     if isinstance(result, (tuple, list)):
@@ -525,11 +534,16 @@ def aot_function(
             inputs = bw_example_inputs(
                 _restore_saved(ctx, saved_names), named, ctx.run_primals
             )
+            keep_graph = tensorplay._C._autograd._get_current_graph_task_keep_graph()
+            ctx.maybe_clear_saved_tensors()
+            if not keep_graph:
+                ctx.saved_plain = ()
+                ctx.run_primals = None
             if not compiled_bw_box:
                 from tensorplay.graph.passes.shape_prop import ShapeProp
 
                 with tensorplay.no_grad():
-                    ShapeProp(inputs)(bw_module)
+                    ShapeProp(inputs, record_values=False)(bw_module)
                 compiled_bw_box.append(bw_compiler(bw_module, inputs))
                 _release_recorded_values(bw_module)
                 run_training._tensorplay_backward_codegen = getattr(
@@ -550,9 +564,8 @@ def aot_function(
             # The values the context holds for its backward are released by
             # the engine, which knows whether the graph is kept for another
             # pass.
-            ctx.saved_plain = ()
-            ctx.diff_output_metas = None
-            ctx.run_primals = None
+            if not keep_graph:
+                ctx.diff_output_metas = None
             return out
 
     def run_training(*args: Any) -> Any:
@@ -645,7 +658,7 @@ def aot_module_simplified(
     )
 
     class _AotForward:
-        """Callable wrapper whose codegen reports mirror the compiled artifact.
+        """Callable wrapper exposing the compiled artifact's codegen reports.
 
         The compiled forward and backward artifacts report which route
         produced them; the wrapper a caller holds is not one of those, so a

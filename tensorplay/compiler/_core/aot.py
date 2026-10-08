@@ -387,6 +387,12 @@ def _snapshot_inputs_read_after_write(
         value = primal.meta.get("val")
         if isinstance(value, tensorplay.Tensor):
             snap.meta["val"] = value.clone()
+        elif _is_tensor_val(value):
+            import copy
+
+            snapshot_meta = copy.copy(value)
+            snapshot_meta._storage_id = object()
+            snap.meta["val"] = snapshot_meta
         primal.replace_all_uses_with(
             snap, delete_user_cb=lambda u, s=snap, w=its_writes: u is not s and u not in w
         )

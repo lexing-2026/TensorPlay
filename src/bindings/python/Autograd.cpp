@@ -2314,6 +2314,15 @@ void init_autograd(py::module_& m) {
             return true;
         });
 
+    autograd.def("_get_current_graph_task_keep_graph",
+                 &tensorplay::tpx::Engine::current_graph_task_keep_graph);
+    using WeakTensorRef = tensorplay::weak_intrusive_ptr<tensorplay::TensorImpl>;
+    py::class_<WeakTensorRef>(m, "_WeakTensorRef")
+        .def(py::init([](const Tensor& tensor) {
+            return WeakTensorRef(tensor.unsafeGetTensorImpl());
+        }))
+        .def("expired", &WeakTensorRef::expired);
+
     autograd.def("backward", [](const std::vector<Tensor>& tensors, std::optional<std::vector<Tensor>> grad_tensors, std::optional<bool> retain_graph, bool create_graph, std::optional<std::vector<Tensor>> inputs) {
         bool keep_graph = retain_graph.value_or(create_graph);
         std::vector<Tensor> grads;

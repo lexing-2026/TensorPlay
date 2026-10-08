@@ -118,3 +118,34 @@ def test_compiled_calls_do_not_keep_inputs(cache_enabled, monkeypatch):
         del value
         gc.collect()
         assert all(ref() is None for ref in refs)
+
+
+@pytest.mark.parametrize("backend", ["aot_eager", "stax"])
+def test_backward_retained_graph_can_be_reused(backend):
+    value = tp.randn(16, requires_grad=True)
+    expected = value.cos()
+    compiled = tp.compile(lambda x: x.sin().sum(), backend=backend)
+    result = compiled(value)
+    result.backward(retain_graph=True)
+    assert _max_diff(value.grad, expected) < 1e-5
+    value.grad = None
+    result.backward()
+    assert _max_diff(value.grad, expected) < 1e-5
+
+
+def test_boxed_call_consumes_the_original_input_list():
+    from tensorplay.compiler._core.aot_autograd import _call
+
+    def fn(*args):
+        raise AssertionError("expected boxed entry")
+
+    def boxed(args):
+        result = args[0] + 1
+        args.clear()
+        return result
+
+    fn._tensorplay_boxed_call = boxed
+    inputs = [tp.ones(2)]
+    result, = _call(fn, inputs)
+    assert inputs == []
+    assert result.tolist() == [2., 2.]

@@ -83,7 +83,9 @@ def _widened_from(value: Any):
     if node is None or _SOURCE_VERSION not in node.meta:
         return None
     source_node = node.args[0]
-    source = getattr(source_node, "meta", {}).get("val")
+    source = node.meta.get("widened_source")
+    if source is None:
+        source = getattr(source_node, "meta", {}).get("val")
     if not _is_tensor(source) or tracer.producer(source) is not source_node:
         return None
     if source._version != node.meta[_SOURCE_VERSION]:
@@ -151,6 +153,7 @@ def _cast_rule(func: Any, has_device: bool) -> Callable[..., Any]:
         node = tracer.producer(out)
         if node is not None and out is not x:
             node.meta[_SOURCE_VERSION] = version
+            node.meta["widened_source"] = x
         return out
 
     return rule

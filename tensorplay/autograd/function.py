@@ -204,6 +204,11 @@ class _Context:
             if isinstance(getattr(self, name, None), tuple):
                 setattr(self, name, ())
 
+    def maybe_clear_saved_tensors(self) -> None:
+        """Release saved values when this backward does not retain its graph."""
+        if not _autograd._get_current_graph_task_keep_graph():
+            self.release_saved()
+
     @property
     def to_save(self):
         return self._saved_tensors
