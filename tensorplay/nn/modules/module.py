@@ -2756,6 +2756,11 @@ class Module:
 
         See :func:`tensorplay.compile` for details on the arguments for this function.
         """
-        # capture and backend selection. Passing the module itself lets the
-        # frontend see its forward signature and registered submodules.
-        self._compiled_call_impl = tensorplay.compile(self, *args, **kwargs)
+        # The module object lets the capture frontend use its fixed forward
+        # signature and registered state.  A disabled compile must retain the
+        # underlying call path, otherwise assigning the module itself here
+        # would make _wrapped_call_impl call itself recursively.
+        if kwargs.get("disable", False):
+            self._compiled_call_impl = self._call_impl
+        else:
+            self._compiled_call_impl = tensorplay.compile(self, *args, **kwargs)

@@ -47,6 +47,18 @@ def test_compile_uses_single_public_entrypoint_and_stax_backend():
     )
 
 
+def test_module_compile_disable_does_not_recurse():
+    class AddOne(tp.nn.Module):
+        def forward(self, value):
+            return value + 1
+
+    module = AddOne()
+    assert module.compile(disable=True) is None
+    assert module._compiled_call_impl.__self__ is module
+    assert module._compiled_call_impl.__func__ is module._call_impl.__func__
+    assert module(tp.tensor([1.0, 2.0])).tolist() == [2.0, 3.0]
+
+
 def test_custom_backend_receives_graph_module_and_caches_specializations():
     calls = []
 
