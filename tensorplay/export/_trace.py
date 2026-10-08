@@ -639,7 +639,9 @@ def _apply_dynamic_shape_constraints(
             + solver.pretty_print()
         )
 
-    placeholders = {node.name: node for node in graph_module.graph.placeholders}
+    # Keyed by the argument each placeholder receives: a placeholder renamed
+    # away from a builtin (``input`` -> ``input_0``) still targets its argument.
+    placeholders = {str(node.target): node for node in graph_module.graph.placeholders}
     identity_to_name = {
         id(value): name
         for name, value in combined_args.items()
@@ -880,6 +882,14 @@ def _capture(
     meta["num_mutations"] = len(mutations)
     meta["out_spec"] = user_out_spec
     meta["in_spec"] = tree_flatten((tuple(args), dict(kwargs)))[1]
+    # The flat program is called by placeholder name (its signature, its
+    # example inputs, its user inputs), so each placeholder receives the value
+    # passed under its own name.
+    renamed = [node for node in placeholders if node.target != node.name]
+    for node in renamed:
+        node.target = node.name
+    if renamed:
+        graph_module.recompile()
     graph_module.signature = _flat_signature(
         graph_module, tracer.state_targets, examples
     )

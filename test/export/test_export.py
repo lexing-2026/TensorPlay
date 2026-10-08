@@ -292,6 +292,17 @@ def test_rank_and_count_of_a_computed_value_run_in_the_program():
     assert program.module()(tp.randn(5, 3, 4)).shape == (5, 3, 4)
 
 
+def test_arguments_named_like_builtins_bind_by_name():
+    # nn layers take ``input``, which the graph renames away from the builtin.
+    model = tp.nn.Linear(3, 2)
+    x = tp.randn(4, 3)
+    program = tp_export.export(model, x)
+    expected = model(x).tolist()
+    assert program(x).tolist() == expected
+    assert program.module()(x).tolist() == expected
+    assert program.module()(input=x).tolist() == expected
+
+
 def test_call_exported_matches_eager():
     model = MLP()
     x = tp.randn(2, 4)

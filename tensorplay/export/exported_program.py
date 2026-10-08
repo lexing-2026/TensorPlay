@@ -135,6 +135,11 @@ def _unlift_exported_program_lifted_states(program: "ExportedProgram") -> GraphM
     new_graph = Graph()
     val_map: dict[Any, Any] = {}
     examples = program.example_inputs
+    user_signature = program.graph_module.meta.get("user_signature")
+    # The unlifted module is called with the callable's own arguments, which
+    # the user placeholders follow in order; a placeholder renamed away from a
+    # builtin (``input`` -> ``input_0``) receives its argument again.
+    arguments = iter(user_signature.parameters if user_signature is not None else ())
     for node in old_graph.placeholders:
         spec = state_by_name.get(node.name)
         if spec is not None:
@@ -145,11 +150,11 @@ def _unlift_exported_program_lifted_states(program: "ExportedProgram") -> GraphM
             default = node.args[0] if node.args else inspect.Parameter.empty
             if node.name in examples:
                 default = examples[node.name]
-            val_map[node] = new_graph.placeholder(node.name, default)
+            argument = next(arguments, node.name)
+            val_map[node] = new_graph.placeholder(argument, default)
     output_value = new_graph.graph_copy(old_graph, val_map)
     new_graph.output(output_value)
 
-    user_signature = program.graph_module.meta.get("user_signature")
     unlifted = GraphModule(root, new_graph, user_signature)
     unlifted.meta = dict(program.graph_module.meta)
     unlifted.meta.pop("state_targets", None)
