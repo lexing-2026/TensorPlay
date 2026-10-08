@@ -431,9 +431,9 @@ std::tuple<Tensor, Tensor> welford_var_mean_same_dtype(
     using Ops = WelfordOps<AccT, T, IndexT>;
     const auto shape = reduction_output_shape(input, spec, keepdim);
     if (input.numel() == 0) {
-        const Scalar nan(Scalar(std::numeric_limits<float>::quiet_NaN()));
-        return {Tensor::full(shape, nan, input.dtype(), input.device()),
-                Tensor::full(shape, nan, input.dtype(), input.device())};
+        const Scalar nan_value{std::numeric_limits<float>::quiet_NaN()};
+        return {Tensor::full(shape, nan_value, input.dtype(), input.device()),
+                Tensor::full(shape, nan_value, input.dtype(), input.device())};
     }
     Tensor mean = Tensor::empty(shape, input.dtype(), input.device());
     Tensor var = run_reduction_typed<T, StateT, T>(
