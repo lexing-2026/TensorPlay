@@ -81,8 +81,11 @@ struct InputBuffer {
     explicit InputBuffer(size_t size)
         : buffer(size),
           opt_accum_streams(size),
-          ready_events(size),
-          ready_streams(size) {}
+          ready_streams(size)
+#ifdef USE_CUDA
+          , ready_events(size)
+#endif
+    {}
     InputBuffer(variable_list&& inputs) : buffer(std::move(inputs)) {}
     InputBuffer(InputBuffer&&) = default;
     InputBuffer& operator=(InputBuffer&&) = default;
@@ -224,11 +227,13 @@ struct InputBuffer {
     // The stream used for accumulation when a slot receives multiple
     // producers.
     std::vector<std::optional<Stream>> opt_accum_streams;
+    // The streams the ready events were recorded on.
+    std::vector<std::optional<Stream>> ready_streams;
+#ifdef USE_CUDA
     // Events the consumer must wait on before reading each slot; updated as
     // producers accumulate.
     std::vector<std::optional<cuda::CUDAEvent>> ready_events;
-    // The streams the ready events were recorded on.
-    std::vector<std::optional<Stream>> ready_streams;
+#endif
     // The stream the consumer is moved to once its slots have started
     // filling.  Nothing in this engine moves a consumer yet, so it stays
     // empty and the stream passed to add() is the one used.
