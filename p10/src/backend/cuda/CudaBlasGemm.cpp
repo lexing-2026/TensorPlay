@@ -113,6 +113,7 @@ struct GemmPlan {
     std::vector<cublasLtMatmulHeuristicResult_t> candidates;
     bool autotuned = false;
     size_t workspace_size = 0;
+    size_t workspace_limit = 32 * 1024 * 1024;
     // Scratch storage is resolved per matmul call from shared_workspace().
 
     // Tuning-context resolution for this plan, valid for the database
@@ -310,11 +311,10 @@ std::shared_ptr<GemmPlan> get_gemm_plan(DType dtype, int64_t M, int64_t N, int64
     CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&plan->c_desc, cuda_type, N, M, N));
 
     CUBLASLT_CHECK(cublasLtMatmulPreferenceCreate(&plan->pref));
-    size_t workspace_size = 32 * 1024 * 1024;
+    size_t workspace_size = plan->workspace_limit;
     CUBLASLT_CHECK(cublasLtMatmulPreferenceSetAttribute(plan->pref,
                                                          CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                                          &workspace_size, sizeof(workspace_size)));
-    plan->workspace_size = workspace_size;
 
     // Ask for several candidates; the first execution micro-autotunes them.
     constexpr int kMaxCandidates = 8;
@@ -327,6 +327,9 @@ std::shared_ptr<GemmPlan> get_gemm_plan(DType dtype, int64_t M, int64_t N, int64
         TP_THROW(RuntimeError, "cuBLASLt: no heuristic algorithm found");
     }
     plan->candidates.resize(returned);
+    for (const auto& candidate : plan->candidates) {
+        plan->workspace_size = std::max(plan->workspace_size, candidate.workspaceSize);
+    }
 
     cache.emplace(key, plan);
     return plan;
@@ -445,7 +448,7 @@ bool algoRunsOnPlan(const GemmPlan& plan, const cublasLtMatmulAlgo_t& algo) {
                                    plan.c_desc, plan.c_desc, &algo,
                                    &result) == CUBLAS_STATUS_SUCCESS &&
            result.state == CUBLAS_STATUS_SUCCESS &&
-           result.workspaceSize <= plan.workspace_size;
+           result.workspaceSize <= plan.workspace_limit;
 }
 
 // Times `samples` back-to-back executions of one candidate after a single
@@ -622,9 +625,21 @@ const cublasLtMatmulAlgo_t* tunable_select(GemmPlan& plan, DType dtype,
         }
     }
 
-    return plan.tunable_choice == GemmPlan::TunableChoice::UseAlgo
-               ? &plan.tunable_algo
-               : nullptr;
+    if (plan.tunable_choice == GemmPlan::TunableChoice::UseAlgo) {
+        cublasLtMatmulHeuristicResult_t result{};
+        CUBLASLT_CHECK(cublasLtMatmulAlgoCheck(
+            CUDAContext::getCublasLtHandle(), plan.matmul_desc,
+            plan.a_desc, plan.b_desc, plan.c_desc, plan.c_desc,
+            &plan.tunable_algo, &result));
+        if (result.state != CUBLAS_STATUS_SUCCESS ||
+            result.workspaceSize > plan.workspace_limit) {
+            plan.tunable_choice = GemmPlan::TunableChoice::UseDefault;
+            return nullptr;
+        }
+        plan.workspace_size = std::max(plan.workspace_size, result.workspaceSize);
+        return &plan.tunable_algo;
+    }
+    return nullptr;
 }
 
 void check_cublas_gemm_dtype(DType t) {
