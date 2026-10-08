@@ -16,9 +16,13 @@ Tensor cached_cast(DType to_type, const Tensor& arg, DeviceType device_type) {
             arg.stride(0) == 1 && arg.stride(1) == arg.size(0)) {
             // Stable-key cache: the view's data_ptr aliases the parent
             // parameter's storage and views share its version counter.
-            Tensor hit = cache_lookup_ptr(arg.data_ptr(), arg);
-            if (hit.defined()) {
-                return hit.t();
+            bool can_cache_view = is_autocast_cache_enabled() &&
+                to_type == get_lower_precision_fp_from_device_type(device_type);
+            if (can_cache_view) {
+                Tensor hit = cache_lookup_ptr(arg.data_ptr(), arg);
+                if (hit.defined() && hit.dtype() == to_type) {
+                    return hit.t();
+                }
             }
             Tensor dense = arg.t();
             Tensor casted = cached_cast(to_type, dense, device_type);
@@ -26,7 +30,9 @@ Tensor cached_cast(DType to_type, const Tensor& arg, DeviceType device_type) {
                 if (!casted.is_contiguous()) {
                     casted = casted.contiguous();
                 }
-                cache_store_ptr(arg.data_ptr(), arg, casted);
+                if (can_cache_view) {
+                    cache_store_ptr(arg.data_ptr(), arg, casted);
+                }
                 return casted.t();
             }
         }

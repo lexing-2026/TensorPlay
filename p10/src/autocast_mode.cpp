@@ -57,6 +57,13 @@ struct CacheEntry {
 
 thread_local std::unordered_map<TensorImpl*, CacheEntry> t_cached_casts;
 
+struct PtrEntry {
+    Tensor casted;
+    uint32_t version;
+    std::vector<int64_t> sizes;
+};
+thread_local std::unordered_map<const void*, PtrEntry> t_ptr_cached_casts;
+
 constexpr size_t kCacheSoftLimit = 4096;
 
 void prune_expired(std::unordered_map<TensorImpl*, CacheEntry>& cache) {
@@ -119,6 +126,7 @@ void set_autocast_cache_enabled(bool enabled) {
 
 void clear_cache() {
     t_cached_casts.clear();
+    t_ptr_cached_casts.clear();
 }
 
 Tensor cache_lookup(const TensorImpl* key) {
@@ -147,15 +155,6 @@ void cache_store(TensorImpl* key, const Tensor& source, const Tensor& casted) {
         CacheEntry{weak_intrusive_ptr<TensorImpl>(source.impl()), casted,
                    source.unsafeGetTensorImpl()->version()});
 }
-
-namespace {
-struct PtrEntry {
-    Tensor casted;
-    uint32_t version;
-    std::vector<int64_t> sizes;
-};
-thread_local std::unordered_map<const void*, PtrEntry> t_ptr_cached_casts;
-} // anonymous namespace
 
 Tensor cache_lookup_ptr(const void* key, const Tensor& probe) {
     auto& cache = t_ptr_cached_casts;
