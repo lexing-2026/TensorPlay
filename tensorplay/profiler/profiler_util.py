@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import collections
+import math
 from dataclasses import dataclass
 
 import tensorplay
 
 from ._utils import (
     event_gpu_us,
+    event_out_bytes,
     nested_cuda_us,
+    nested_output_bytes,
     nested_spans,
     self_cuda_us,
     self_times,
@@ -22,6 +25,294 @@ class Interval:
 
     start: float
     end: float
+
+
+def _format_time(time_us):
+    """Render a microsecond duration in the unit its magnitude asks for."""
+
+    if time_us >= 1000.0 * 1000.0:
+        return f"{time_us / (1000.0 * 1000.0):.3f}s"
+    if time_us >= 1000.0:
+        return f"{time_us / 1000.0:.3f}ms"
+    return f"{time_us:.3f}us"
+
+
+def _format_time_share(time_us, total_time_us):
+    """Render one duration as a share of another."""
+
+    if not total_time_us:
+        return "NaN" if not time_us else "inf%"
+    return f"{time_us * 100.0 / total_time_us:.2f}%"
+
+
+def _format_memory(nbytes):
+    """Render a byte count in the unit its magnitude asks for."""
+
+    kb, mb, gb = 1024, 1024 * 1024, 1024 * 1024 * 1024
+    if abs(nbytes) >= gb:
+        return f"{nbytes * 1.0 / gb:.2f} GB"
+    if abs(nbytes) >= mb:
+        return f"{nbytes * 1.0 / mb:.2f} MB"
+    if abs(nbytes) >= kb:
+        return f"{nbytes * 1.0 / kb:.2f} KB"
+    return f"{nbytes} B"
+
+
+#: How much of a microsecond count one unit of each spelling a caller may ask
+#: every time column to be printed in.
+_TIME_UNIT_SCALE = {"s": 1e-6, "ms": 1e-3, "us": 1.0}
+
+#: The units a flop count may be shown in, three orders of magnitude apart.
+_FLOPS_UNITS = ("FLOPs", "KFLOPs", "MFLOPs", "GFLOPs", "TFLOPs", "PFLOPs")
+
+#: Width of every column whose contents have a fixed maximum length.
+_COLUMN_WIDTH = 12
+
+#: Gap between two columns, and between a table's edge and its text.
+_SPACING = 2
+
+
+def _auto_scale_flops(flops):
+    """Pick the unit a positive flop count reads best in, and its divisor."""
+
+    exponent = max(0.0, min(math.log10(flops) / 3.0, float(len(_FLOPS_UNITS) - 1)))
+    return pow(10, math.floor(exponent) * -3.0), _FLOPS_UNITS[int(exponent)]
+
+
+def _override_time_unit(time_us, default_str, time_unit):
+    """Render a duration in a unit the caller chose, or in the default one."""
+
+    if time_unit is None:
+        return default_str
+    if time_unit not in _TIME_UNIT_SCALE:
+        raise ValueError(f"unsupported time_unit: {time_unit}")
+    return f"{time_us * _TIME_UNIT_SCALE[time_unit]:.3f}{time_unit}"
+
+
+def _trim_path(path, width):
+    """Keep the end of a source location, which is the part that names it."""
+
+    if len(path) <= width:
+        return path
+    trimmed = path[len(path) - width:]
+    return "..." + trimmed[3:] if len(trimmed) > 3 else trimmed
+
+
+def _device_label(events):
+    """The kind of device a device-time column should be titled with."""
+
+    for event in events:
+        name = getattr(event, "use_device", None)
+        if name:
+            return str(name).upper()
+    return "CUDA"
+
+
+def _sort_value(event, key):
+    """One row's value for a sort key, or a complaint that there is none."""
+
+    value = getattr(event, key, None)
+    if value is None:
+        raise ValueError(f"unsupported sort_by: {key}")
+    return value
+
+
+def _build_table(
+    events,
+    sort_by=None,
+    header=None,
+    row_limit=100,
+    max_src_column_width=75,
+    max_name_column_width=55,
+    max_shapes_column_width=80,
+    with_flops=False,
+    top_level_events_only=False,
+    time_unit=None,
+):
+    """Render a summary of events as a fixed-width table, one row per event.
+
+    A column is present only when some row has something to put in it: a
+    recording with no device work has no device columns, one that captured no
+    shapes has no shapes column, and one with no stacks has no source column.
+    Names, shapes and source locations are only as wide as their contents need
+    them to be, up to the width a caller caps them at; longer text is cut with
+    an ellipsis rather than pushing the rest of the row out of alignment.
+
+    Both single events and aggregated groups render through this, because both
+    answer the same questions about themselves -- how much of the recording is
+    this, how long did it take, how often, what did it work on -- and a reader
+    should not have to learn two layouts to read either one.
+    """
+
+    events = list(events)
+    if not events:
+        return ""
+    if sort_by is not None:
+        key = (
+            sort_by.replace("cuda", "device")
+            .replace("xpu", "device")
+            .replace("privateuse1", "device")
+        )
+        events = sorted(events, key=lambda evt: _sort_value(evt, key), reverse=True)
+    rows = [
+        event
+        for event in events
+        if not (top_level_events_only and getattr(event, "cpu_parent", None) is not None)
+    ]
+    if row_limit is not None and row_limit >= 0:
+        rows = rows[:row_limit]
+    if not rows:
+        return ""
+
+    device = _device_label(rows)
+    has_device_time = any(evt.self_device_time_total > 0 for evt in rows)
+    has_memory = any(getattr(evt, "output_bytes", 0) > 0 for evt in rows)
+    has_input_shapes = any(getattr(evt, "input_shapes", None) for evt in rows)
+    stacks = [stack for stack in (getattr(evt, "stack", None) for evt in rows) if stack]
+    has_stack = bool(stacks)
+
+    name_width = max(len(str(evt.key)) for evt in rows) + _SPACING * 2
+    if max_name_column_width is not None:
+        name_width = min(name_width, max_name_column_width)
+    shapes_width = max(
+        len(str(getattr(evt, "input_shapes", "") or "")) for evt in rows
+    ) + _SPACING * 2
+    if max_shapes_column_width is not None:
+        shapes_width = min(shapes_width, max_shapes_column_width)
+    src_width = None
+    if has_stack:
+        src_width = max(max(len(str(entry)) for entry in stack) for stack in stacks)
+        src_width += _SPACING * 2
+        if max_src_column_width is not None:
+            src_width = min(src_width, max_src_column_width)
+
+    columns = [("Name", name_width, "<"), ("Self CPU %", _COLUMN_WIDTH, ">")]
+    columns += [
+        ("Self CPU", _COLUMN_WIDTH, ">"),
+        ("CPU total %", _COLUMN_WIDTH, ">"),
+        ("CPU total", _COLUMN_WIDTH, ">"),
+        ("CPU time avg", _COLUMN_WIDTH, ">"),
+    ]
+    if has_device_time:
+        columns += [
+            (f"Self {device}", _COLUMN_WIDTH, ">"),
+            (f"Self {device} %", _COLUMN_WIDTH, ">"),
+            (f"{device} total", _COLUMN_WIDTH, ">"),
+            (f"{device} time avg", _COLUMN_WIDTH, ">"),
+        ]
+    if has_memory:
+        columns += [
+            ("Output Mem", _COLUMN_WIDTH, ">"),
+            ("Self Output Mem", _COLUMN_WIDTH, ">"),
+        ]
+    columns += [("# of Calls", _COLUMN_WIDTH, ">")]
+    if has_input_shapes:
+        columns.append(("Input Shapes", shapes_width, "<"))
+
+    flops_scale = None
+    if with_flops:
+        # Scaling is decided by the smallest count on show, so the unit reads
+        # the same for every row rather than changing under the reader.
+        raw_flops = [evt.flops for evt in rows if evt.flops > 0]
+        if raw_flops:
+            flops_scale, flops_unit = _auto_scale_flops(min(raw_flops))
+            columns.append((f"Total {flops_unit}", _COLUMN_WIDTH, ">"))
+    if has_stack:
+        columns.append(("Source Location", src_width, "<"))
+
+    # A title wider than its column would push the titles after it out of line
+    # with the rows they title, so the column grows to hold the title instead.
+    columns = [
+        (title, max(width, len(title) + _SPACING), align)
+        for title, width, align in columns
+    ]
+
+    row_format = "".join(
+        "{:" + align + str(width) + "}" + " " * _SPACING for _title, width, align in columns
+    )
+    header_sep = "".join(
+        "-" * width + " " * _SPACING for _title, width, _align in columns
+    )
+
+    sum_self_cpu = sum(evt.self_cpu_time_total for evt in rows)
+    sum_self_device = (
+        sum(evt.self_device_time_total for evt in rows) if has_device_time else 0.0
+    )
+
+    lines = []
+    if header is not None:
+        lines.append("=" * len(header_sep))
+        lines.append(str(header))
+    if top_level_events_only:
+        lines.append("=" * len(header_sep))
+        lines.append("Nested spans are omitted; only outermost operations are shown.")
+    lines.append(header_sep)
+    lines.append(row_format.format(*[title for title, _w, _a in columns]))
+    lines.append(header_sep)
+
+    empty_row = [""] * len(columns)
+    for event in rows:
+        name = str(event.key)
+        if max_name_column_width is not None and len(name) >= max_name_column_width:
+            name = name[: max_name_column_width - 3] + "..."
+        self_cpu = event.self_cpu_time_total
+        cpu_total = event.cpu_time_total
+        values = [
+            name,
+            _format_time_share(self_cpu, sum_self_cpu),
+            _override_time_unit(self_cpu, _format_time(self_cpu), time_unit),
+            # A span that ends before its work is done measures no wall-clock
+            # time of its own, so its share of the wall clock is not a share.
+            "0.00%" if event.is_async else _format_time_share(cpu_total, sum_self_cpu),
+            _override_time_unit(cpu_total, _format_time(cpu_total), time_unit),
+            _override_time_unit(event.cpu_time, _format_time(event.cpu_time), time_unit),
+        ]
+        if has_device_time:
+            self_device = event.self_device_time_total
+            device_total = event.device_time_total
+            values += [
+                _override_time_unit(
+                    self_device, _format_time(self_device), time_unit
+                ),
+                _format_time_share(self_device, sum_self_device),
+                _override_time_unit(device_total, _format_time(device_total), time_unit),
+                _override_time_unit(
+                    event.device_time, _format_time(event.device_time), time_unit
+                ),
+            ]
+        if has_memory:
+            values += [
+                _format_memory(event.nested_output_bytes),
+                _format_memory(event.output_bytes),
+            ]
+        values.append(event.count)
+        if has_input_shapes:
+            values.append(str(event.input_shapes or "")[:shapes_width])
+        if flops_scale is not None:
+            values.append("--" if event.flops <= 0 else f"{event.flops * flops_scale:8.3f}")
+        stack = getattr(event, "stack", None)
+        if has_stack:
+            values.append(_trim_path(str(stack[0]), src_width) if stack else "")
+        lines.append(row_format.format(*values))
+        # The frames under the first one are what a reader asks for next, and
+        # putting them on rows of their own is what keeps the row above intact.
+        if has_stack and stack and len(stack) > 1:
+            for entry in stack[1:]:
+                lines.append(
+                    row_format.format(*empty_row[:-1] + [_trim_path(str(entry), src_width)])
+                )
+
+    lines.append(header_sep)
+    lines.append(
+        f"Self CPU time total: "
+        f"{_override_time_unit(sum_self_cpu, _format_time(sum_self_cpu), time_unit)}"
+    )
+    if has_device_time:
+        lines.append(
+            f"Self {device} time total: "
+            f"{_override_time_unit(sum_self_device, _format_time(sum_self_device), time_unit)}"
+        )
+    return "\n".join(lines) + "\n"
 
 
 class FunctionEventAvg:
@@ -43,6 +334,9 @@ class FunctionEventAvg:
         self_cuda_us=0.0,
         stack=None,
         flops=0,
+        output_bytes=0,
+        nested_output_bytes=0,
+        use_device=None,
     ):
         self.name = name
         self.key = name
@@ -59,6 +353,17 @@ class FunctionEventAvg:
         self.kernel_count = kernel_count
         self.self_cuda_us = self_cuda_us
         self.flops = flops
+        # Output allocation volume this group's events asked for, both as
+        # recorded (output_bytes) and including what they dispatched inside
+        # them (nested_output_bytes).
+        self.output_bytes = output_bytes
+        self.nested_output_bytes = nested_output_bytes
+        self.use_device = use_device
+        self.is_async = False
+        # A group is a summary rather than a span, so it has no place in the
+        # nesting of any one of its events.
+        self.cpu_parent = None
+        self.device_type = _device_type("cpu")
 
     @property
     def avg_us(self):
@@ -107,6 +412,12 @@ class FunctionEventAvg:
     @property
     def self_device_time_total(self):
         return self.self_cuda_us
+
+    @property
+    def device_time(self):
+        """Device time per call, the average a repeated cost is read as."""
+
+        return self.cuda_us / self.count if self.count else 0.0
 
     def __repr__(self):
         return (
@@ -251,16 +562,22 @@ class _DeviceKernelTable:
         if sort_by is not None:
             self.sort(sort_by)
         rows = self.rows if row_limit is None or row_limit < 0 else self.rows[:row_limit]
-        header = f"{'Name':<40}{'Kind':>5}{'Calls':>7}{'Total us':>12}{'Avg us':>11}{'Min us':>11}{'Max us':>11}"
+        header = (
+            f"{'Name':<40}{'Kind':>5}{'Calls':>7}{'Total us':>12}{'Total %':>8}"
+            f"{'Avg us':>11}{'Min us':>11}{'Max us':>11}"
+        )
         lines = [header, "-" * len(header)]
         for row in rows:
+            share = row.total_us / self.total_cuda_us * 100.0 if self.total_cuda_us else 0.0
             lines.append(
-                f"{row.name:<40}{row.kind:>5}{row.count:>7}"
-                f"{row.total_us:>12.2f}{row.avg_us / 1000.0:>11.2f}"
-                f"{row.min_ns / 1000.0:>11.2f}{row.max_ns / 1000.0:>11.2f}"
+                f"{row.name:<40}{row.kind:>5}{row.count:>7}{row.total_us:>12.2f}"
+                f"{share:>7.1f}%{row.avg_us:>11.2f}"
+                f"{row.min_us:>11.2f}{row.max_us:>11.2f}"
             )
         lines.append("-" * len(header))
-        lines.append(f"{'Total':<40}{'':>5}{len(self.rows):>7}{self.total_cuda_us:>12.2f}")
+        lines.append(
+            f"{'Total':<40}{'':>5}{len(self.rows):>7}{self.total_cuda_us:>12.2f}"
+        )
         return "\n".join(lines)
 
 
@@ -274,25 +591,37 @@ class _FunctionsTable:
         group_by_stack_n=0,
         sort_by=None,
         with_flops=False,
+        use_device=None,
     ):
+        self.use_device = getattr(events, "use_device", None) or use_device
+        gpu_activities = getattr(events, "gpu_activities", ())
         events = list(events)
         self._events = events
         self._group_by_input_shape = group_by_input_shape
         self._group_by_stack_n = group_by_stack_n
         self_ns = self_times(events)
         self_cuda = self_cuda_us(events)
+        own_bytes = [event_out_bytes(event) for event in events]
+        nested_bytes = nested_output_bytes(events)
+        # A span's device time is the work it dispatched as well as its own, so
+        # that an annotation around a piece of work is not reported as having
+        # cost the device nothing.  Where no device activity was collected to
+        # add up, the span's own timed event is all there is, so it stands in.
+        device_us = nested_cuda_us(events, gpu_activities)
         aggregate = collections.OrderedDict()
         has_gpu = False
         has_flops = False
 
-        for event, own_ns, own_cuda_us in zip(events, self_ns, self_cuda):
+        for index, (event, own_ns, own_cuda_us) in enumerate(
+            zip(events, self_ns, self_cuda)
+        ):
             if len(event) < 9:
                 continue
             name, kind = event[0], event[1]
             start_ns, end_ns = event[2], event[3]
             shapes = event[5] if len(event) > 5 else None
             kernel_count = event[11] if len(event) > 11 else 0
-            gpu_us = event_gpu_us(event)
+            gpu_us = max(event_gpu_us(event), device_us[index])
             if len(event) > 8 and event[8] is not None and event[8] >= 0:
                 has_gpu = True
             if end_ns <= start_ns:
@@ -310,7 +639,7 @@ class _FunctionsTable:
                 key += (tuple(stack[-group_by_stack_n:]) if stack else None,)
             row = aggregate.get(key)
             if row is None:
-                row = [0, 0, None, None, 0, 0.0, 0.0, 0, 0]
+                row = [0, 0, None, None, 0, 0.0, 0.0, 0, 0, 0, 0]
                 aggregate[key] = row
             duration = end_ns - start_ns
             row[0] += 1
@@ -322,6 +651,8 @@ class _FunctionsTable:
             row[6] += own_cuda_us
             row[7] += kernel_count
             row[8] += flops
+            row[9] += own_bytes[index]
+            row[10] += nested_bytes[index]
 
         total_ns = sum(row[1] for row in aggregate.values())
         self.has_gpu = has_gpu
@@ -330,7 +661,19 @@ class _FunctionsTable:
         self.total_ns = total_ns
         self.rows = []
         for key, values in sorted(aggregate.items(), key=lambda item: -item[1][4]):
-            count, total, minimum, maximum, own_ns, cuda_us, own_cuda_us, kernels, flops = values
+            (
+                count,
+                total,
+                minimum,
+                maximum,
+                own_ns,
+                cuda_us,
+                own_cuda_us,
+                kernels,
+                flops,
+                output_bytes,
+                nested_bytes,
+            ) = values
             shapes = key[2] if group_by_input_shape and len(key) > 2 else None
             stack_index = 2 + int(group_by_input_shape)
             stack = key[stack_index] if group_by_stack_n and len(key) > stack_index else None
@@ -350,6 +693,9 @@ class _FunctionsTable:
                     own_cuda_us,
                     stack,
                     flops,
+                    output_bytes,
+                    nested_bytes,
+                    self.use_device,
                 )
             )
         self.total_cuda_us = sum(row.cuda_us for row in self.rows)
@@ -377,8 +723,12 @@ class _FunctionsTable:
             "name": lambda row: row.name,
             "self_cuda_time": lambda row: row.self_cuda_us,
             "self_cuda_time_total": lambda row: row.self_cuda_us,
+            "self_device_time": lambda row: row.self_cuda_us,
+            "self_device_time_total": lambda row: row.self_cuda_us,
             "cuda_time": lambda row: row.cuda_us,
             "cuda_time_total": lambda row: row.cuda_us,
+            "device_time": lambda row: row.device_time,
+            "device_time_total": lambda row: row.cuda_us,
             "flops": lambda row: row.flops,
             "total_flops": lambda row: row.flops,
         }
@@ -387,31 +737,38 @@ class _FunctionsTable:
         self.rows.sort(key=keys[sort_by], reverse=sort_by != "name")
         return self
 
-    def table(self, sort_by=None, row_limit=-1, **_kwargs):
+    def table(
+        self,
+        sort_by=None,
+        row_limit=-1,
+        header=None,
+        max_src_column_width=75,
+        max_name_column_width=55,
+        max_shapes_column_width=80,
+        top_level_events_only=False,
+        time_unit=None,
+    ):
+        """Render the groups as a table, one row per group.
+
+        The options are the ones :func:`_build_table` takes; a group is a
+        summary of several spans rather than a span, so the ones that select
+        spans (``top_level_events_only``) have nothing to select and are
+        ignored.
+        """
+
         if sort_by is not None:
             self.sort(sort_by)
-        rows = self.rows if row_limit is None or row_limit < 0 else self.rows[:row_limit]
-        header = f"{'Name':<28}{'Calls':>7}{'Self us':>10}{'Self %':>8}{'Total us':>10}"
-        show_flops = self.with_flops and self.has_flops
-        if show_flops:
-            header += f"{'Total Flops':>18}"
-        if self.has_gpu:
-            header += f"{'Self CUDA us':>13}{'CUDA Total us':>15}{'#K':>6}"
-        lines = [header, "-" * len(header)]
-        for row in rows:
-            line = f"{row.name:<28}{row.count:>7}{row.self_us:>10.2f}{row.self_pct:>7.1f}%{row.total_us:>10.2f}"
-            if show_flops:
-                line += f"{row.flops:>18,}"
-            if self.has_gpu:
-                line += f"{row.self_cuda_us:>13.2f}{row.cuda_us:>15.2f}{row.kernel_count:>6}"
-            lines.append(line)
-        lines.append("-" * len(header))
-        lines.append(f"Self CPU time total: {self.total_ns / 1e3:.2f} us")
-        if show_flops:
-            lines.append(f"Total Flops: {self.total_flops:,}")
-        if self.has_gpu:
-            lines.append(f"Self CUDA time total: {self.total_cuda_us:.2f} us")
-        return "\n".join(lines)
+        return _build_table(
+            self.rows,
+            header=header,
+            row_limit=row_limit,
+            max_src_column_width=max_src_column_width,
+            max_name_column_width=max_name_column_width,
+            max_shapes_column_width=max_shapes_column_width,
+            with_flops=self.with_flops and self.has_flops,
+            top_level_events_only=top_level_events_only,
+            time_unit=time_unit,
+        )
 
     def total_average(self):
         if not self.rows:
@@ -493,6 +850,15 @@ class FunctionEvent:
         self.cpu_interval = Interval(self.start_ns / 1e3, self.end_ns / 1e3)
         self.self_ns = self_ns
         self.self_cuda_us = self_cuda_us
+        # A single span is one occurrence, which is what a row for it counts.
+        self.count = 1
+        self.cpu_parent = None
+        self.use_device = None
+        # Output allocation volume this span asked for, as recorded and as
+        # accumulated over what it dispatched inside it.  Recorded only when
+        # shape capture was on, so zero means either none or not asked for.
+        self.output_bytes = max(int(self.out_bytes or 0), 0)
+        self.nested_output_bytes = self.output_bytes
 
     @property
     def key(self):
@@ -537,6 +903,12 @@ class FunctionEvent:
     @property
     def self_device_time_total(self):
         return self.self_cuda_time_total
+
+    @property
+    def device_time(self):
+        """Device time per call, which for a single span is its whole device time."""
+
+        return self.device_time_total
 
     def __repr__(self):
         return f"<FunctionEvent {self.name} {self.cpu_time:.2f}us>"
@@ -704,6 +1076,7 @@ class EventList(list):
         mem_events=None,
         samples=None,
         with_stack=False,
+        use_device=None,
     ):
         super().__init__(raw)
         self.base_ns = base_ns
@@ -711,6 +1084,7 @@ class EventList(list):
         self.mem_events = mem_events if mem_events is not None else []
         self.samples = samples if samples is not None else []
         self.with_stack = with_stack
+        self.use_device = use_device or ("cuda" if self.gpu_activities else None)
         self.with_flops = False
         self._function_events = None
         self._device_time = None
@@ -737,6 +1111,11 @@ class EventList(list):
     def __call__(self):
         return self.function_events
 
+    def __str__(self):
+        """The recording as a table, which is what a reader printing one wants."""
+
+        return self.table()
+
     @property
     def function_events(self):
         if self._function_events is None:
@@ -744,6 +1123,7 @@ class EventList(list):
             own_cuda_us = self_cuda_us(self)
             children = nested_spans(self)
             device_us = nested_cuda_us(self, self.gpu_activities)
+            bytes_nested = nested_output_bytes(self)
             # Every event is built before any is given its children, because a
             # child is an event and an event is what a list of children holds.
             built = [
@@ -754,6 +1134,12 @@ class EventList(list):
             ]
             for index, kids in enumerate(children):
                 built[index].cpu_children = [built[c] for c in kids]
+                built[index].nested_output_bytes = bytes_nested[index]
+                built[index].use_device = self.use_device
+                # The span a span is nested in is the one that opened it, which
+                # the children say by naming it.
+                for child in kids:
+                    built[child].cpu_parent = built[index]
             self._function_events = built
         return self._function_events
 
@@ -779,12 +1165,18 @@ class EventList(list):
         include_python_functions=False,
         with_flops=False,
     ):
+        # Nothing is captured that would separate one overload of a name from
+        # another, and no python-function spans are recorded, so both switches
+        # name groupings this recording cannot make; they are accepted because a
+        # caller may be passing them without knowing, not because they do
+        # anything here.
         del group_by_overload_name, include_python_functions
         return _FunctionsTable(
             self,
             group_by_input_shape=group_by_input_shape,
             group_by_stack_n=group_by_stack_n,
             with_flops=bool(with_flops) or bool(self.with_flops),
+            use_device=self.use_device,
         )
 
     def device_kernels(self, sort_by=None):
@@ -798,8 +1190,38 @@ class EventList(list):
 
         return _DeviceKernelTable(self.gpu_activities, sort_by=sort_by)
 
-    def table(self, sort_by=None, row_limit=100, **kwargs):
-        return self.key_averages().table(sort_by=sort_by, row_limit=row_limit, **kwargs)
+    def table(
+        self,
+        sort_by=None,
+        row_limit=100,
+        header=None,
+        max_src_column_width=75,
+        max_name_column_width=55,
+        max_shapes_column_width=80,
+        top_level_events_only=False,
+        time_unit=None,
+    ):
+        """One row per collected span, rather than per name.
+
+        Aggregation is a choice the caller makes with
+        :meth:`key_averages`; asking this list itself leaves every span on a row
+        of its own, which is the only view in which the per-span captures --
+        the shapes it was given, the frames it was called from, the memory it
+        allocated -- can be shown against the span they belong to.
+        """
+
+        return _build_table(
+            self.function_events,
+            sort_by=sort_by,
+            header=header,
+            row_limit=row_limit,
+            max_src_column_width=max_src_column_width,
+            max_name_column_width=max_name_column_width,
+            max_shapes_column_width=max_shapes_column_width,
+            with_flops=self.with_flops,
+            top_level_events_only=top_level_events_only,
+            time_unit=time_unit,
+        )
 
     def export_chrome_trace(self, path, torch_compat=False, **kwargs):
         from ._chrome_trace_export import export_chrome_trace

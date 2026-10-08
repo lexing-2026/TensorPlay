@@ -88,9 +88,64 @@ def dtype_name(value):
         return None
 
 
+def nested_sums(children, own):
+    """For each span, ``own`` plus the totals of every span nested in it.
+
+    A parent's total is only complete once every span inside it is complete, so
+    the walk repeats until a pass finds nothing left to add.  Doing it by rounds
+    rather than by walking children first is what keeps a parent that appears
+    before its own children -- which containment does not prevent, since both
+    can open at the same instant -- from being settled with the partial totals
+    of a child that has not been reached yet.
+    """
+
+    totals = list(own)
+    for _ in range(len(children)):
+        changed = False
+        for index, kids in enumerate(children):
+            nested = own[index] + sum(totals[child] for child in kids)
+            if nested != totals[index]:
+                totals[index] = nested
+                changed = True
+        if not changed:
+            break
+    return totals
+
+
+def event_out_bytes(event):
+    """Return one span's own output allocation volume in bytes.
+
+    Zero when the session recorded none: the volume is stamped on a span when
+    shape capture is on, so zero means either that the operation allocated
+    nothing or that nothing was asked of it.
+    """
+
+    if len(event) <= 9 or event[9] is None:
+        return 0
+    return max(int(event[9]), 0)
+
+
+def nested_output_bytes(events, children=None):
+    """For each span, the output allocation volume of itself and its children.
+
+    A span that is asked about is often a region rather than an operation, so
+    the volume that belongs to it is the whole of what was allocated under it;
+    the volume of one operation is its own.
+    """
+
+    own = [event_out_bytes(event) for event in events]
+    if children is None:
+        children = nested_spans(events)
+    return nested_sums(children, own)
+
+
 __all__ = [
     "dtype_name",
     "event_gpu_us",
+    "event_out_bytes",
+    "nested_output_bytes",
+    "nested_spans",
+    "nested_sums",
     "rank_world",
     "self_cuda_us",
     "self_times",
@@ -179,34 +234,6 @@ def nested_cuda_us(events, gpu_activities=()):
         (own.get(event[13], 0.0) if len(event) > 13 else 0.0)
         for event in events
     ]
-    # A child's total has to be complete before it is added to its parent, so
-    # the walk visits children first.  Sorting by width would not do it: a
-    # parent is never shorter than a child, but two spans on one thread can be
-    # the same width, and a same-width sibling visited in the wrong order would
-    # be added to a parent whose own total is still being built.
-    remaining = [i for i, c in enumerate(children) if c]
-    settled = set()
-    while remaining:
-        progressed = False
-        still: list[int] = []
-        for index in remaining:
-            kids = children[index]
-            if all(c in settled for c in kids):
-                for c in kids:
-                    totals[index] += totals[c]
-                settled.add(index)
-                progressed = True
-            else:
-                still.append(index)
-        if not progressed:
-            # A cycle cannot be built by span containment, but a malformed
-            # event list should not spin: settle what is left on its own terms.
-            for index in still:
-                for c in children[index]:
-                    totals[index] += totals[c]
-                settled.add(index)
-            break
-        remaining = still
-    return totals
+    return nested_sums(children, totals)
 
 

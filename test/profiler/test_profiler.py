@@ -717,13 +717,22 @@ class TestFlops:
         assert row.flops == 2*64*32*48
         assert table.total_flops == 2*64*32*48
         text = table.table()
-        assert "Total Flops" in text
-        assert f"{2*64*32*48:,}" in text
+        # The unit is chosen from the smallest count on show, so every row of
+        # the report reads in the same one.
+        assert "Total KFLOPs" in text
+        assert f"{2*64*32*48/1e3:.3f}" in text
+
+    def test_flops_column_scales_to_unit(self):
+        prof = self._run(
+            lambda: tp.randn([2048, 2048]).mm(tp.randn([2048, 2048])),
+        )
+        assert "Total GFLOPs" in prof.key_averages().table()
 
     def test_no_column_without_flag(self):
         with tp_prof.profile(record_shapes=True) as prof:
             tp.randn([4, 4]).mm(tp.randn([4, 4]))
         assert "Total Flops" not in prof.key_averages().table()
+        assert "Total KFLOPs" not in prof.key_averages().table()
 
     def test_event_attribute_and_sort(self):
         prof = self._run(
@@ -848,6 +857,143 @@ class TestKeyAveragesGpuColumns:
         # unknown keys still raise; cuda keys parse without GPU data
         rows = prof.key_averages(sort_by="cuda_time").rows
         assert rows
+
+    def test_sort_by_device_key_accepted(self):
+        with tp_prof.profile() as prof:
+            tp.ones([2]).add(tp.ones([2]))
+        rows = prof.key_averages(sort_by="self_device_time_total").rows
+        assert rows
+
+
+class TestTableColumns:
+    """A column is printed when the recording has something to put in it."""
+
+    def _session(self, **kwargs):
+        prof = tp_prof.profile(**kwargs)
+        with prof:
+            with tp_prof.record_function("outer"):
+                with tp_prof.record_function("inner"):
+                    tp.randn([8, 16]).matmul(tp.randn([16, 8]))
+        return prof
+
+    def test_shared_columns_always_present(self):
+        text = self._session().table()
+        for title in ("Name", "Self CPU %", "Self CPU", "CPU total %",
+                      "CPU total", "CPU time avg", "# of Calls"):
+            assert title in text, title
+        assert "Self CPU time total" in text
+
+    def test_header_and_rows_line_up(self):
+        prof = self._session(record_shapes=True, with_flops=True, with_stack=True)
+        rows = prof.table().splitlines()
+        header = next(line for line in rows if "Source Location" in line)
+        # Every title sits above the column it names, so the header is exactly
+        # as wide as the rule under it and the rows under that.
+        assert len(header) == len(rows[0])
+        assert all(len(line) == len(rows[0]) for line in rows[1:3])
+
+    def test_input_shapes_column_only_with_capture(self):
+        assert "Input Shapes" not in self._session().table()
+        text = self._session(record_shapes=True).table()
+        assert "Input Shapes" in text
+        assert "[8, 16]" in text
+
+    def test_source_location_column_only_with_stack(self):
+        assert "Source Location" not in self._session().table()
+        text = self._session(with_stack=True).table()
+        assert "Source Location" in text
+        assert "test_profiler.py" in text
+
+    def test_stack_frames_continue_under_their_row(self):
+        text = self._session(with_stack=True).table()
+        lines = [line for line in text.splitlines() if "test_profiler.py" in line]
+        # A row that has a source location of its own has numbers before it; a
+        # continuation row -- one frame of the same call chain -- has every
+        # column before the source column blank.
+        offset = text.splitlines()[1].index("Source Location")
+        leading = [line[:offset] for line in lines]
+        assert any(part.strip() for part in leading)
+        assert any(not part.strip() for part in leading)
+
+    def test_output_memory_columns_with_capture(self):
+        assert "Output Mem" not in self._session().table()
+        text = self._session(record_shapes=True).table()
+        assert "Output Mem" in text and "Self Output Mem" in text
+
+    def test_nested_output_memory_covers_children(self):
+        prof = self._session(record_shapes=True)
+        rows = {e.key: e for e in prof.events.function_events}
+        outer, inner = rows["outer"], rows["inner"]
+        # An annotation allocates nothing itself; the region it wraps allocates
+        # whatever the operations inside it did.
+        assert outer.output_bytes == 0 and inner.output_bytes == 0
+        assert outer.nested_output_bytes == inner.nested_output_bytes > 0
+
+    def test_long_names_truncate_instead_of_shifting(self):
+        long_name = "z" * 90
+        with tp_prof.profile() as prof:
+            with tp_prof.record_function(long_name):
+                tp.ones([2]).add(tp.ones([2]))
+        text = prof.table(max_name_column_width=30)
+        row = [line for line in text.splitlines() if "zzz" in line][0]
+        assert long_name[:27] + "..." in row
+        # Everything past the name stays inside the column the header names.
+        assert row[30:].split()[-1].isdigit() or not row[30:].split()
+
+    def test_time_unit_applies_to_every_time_column(self):
+        text = self._session().table(time_unit="ms")
+        assert "ms" in text
+        assert "us" not in text
+        assert self._session().table(time_unit="us").count("us") > 0
+
+    def test_unknown_time_unit_rejected(self):
+        with pytest.raises(ValueError):
+            self._session().table(time_unit="minutes")
+
+    def test_unknown_sort_key_rejected(self):
+        with pytest.raises(ValueError):
+            self._session().table(sort_by="nonexistent_column")
+
+    def test_header_and_top_level_notice(self):
+        prof = self._session()
+        text = prof.table(header="my run", top_level_events_only=True)
+        assert "my run" in text
+        assert "Nested spans are omitted" in text
+        # Only the outermost operations survive the selection.
+        assert "inner" not in text
+        assert "outer" in text
+
+    def test_empty_recording_renders_nothing(self):
+        with tp_prof.profile() as prof:
+            pass
+        assert prof.table() == ""
+
+    def test_key_averages_and_raw_tables_share_the_layout(self):
+        prof = self._session(record_shapes=True)
+        for title in ("Self CPU %", "CPU time avg", "# of Calls", "Input Shapes"):
+            assert title in prof.table()
+            assert title in prof.key_averages(group_by_input_shape=True).table()
+
+    def test_kernel_table_average_is_in_microseconds(self):
+        if not tp.cuda.is_available():
+            pytest.skip("needs a device")
+        # The device collector allocates its record buffers on its first use and
+        # records nothing during that session, so warm it before measuring.
+        with tp_prof.profile(activities=[tp_prof.ProfilerActivity.CPU,
+                                        tp_prof.ProfilerActivity.CUDA]):
+            tp.randn([64, 64]).matmul(tp.randn([64, 64]))
+        with tp_prof.profile(activities=[tp_prof.ProfilerActivity.CPU,
+                                        tp_prof.ProfilerActivity.CUDA]) as prof:
+            tp.randn([64, 64]).matmul(tp.randn([64, 64]))
+        table = prof.device_kernels()
+        if not table.rows:
+            pytest.skip("device collector reported no activity this session")
+        row = table.rows[0]
+        line = next(ln for ln in table.table().splitlines() if row.name in ln)
+        # The average column shares its unit with the total it averages over.
+        fields = line.split()
+        assert float(fields[-3]) == pytest.approx(fields[-4] / row.count, rel=1e-3)
+        assert float(fields[-3]) == pytest.approx(row.total_us / row.count, rel=1e-3)
 
 
 class TestTorchCrossReference:

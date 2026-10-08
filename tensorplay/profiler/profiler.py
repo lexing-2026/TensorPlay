@@ -319,6 +319,11 @@ class profile:
             self._entered = False
         return False
 
+    def __str__(self):
+        """The recording as a table; printing a session prints what it saw."""
+
+        return str(self._ensure_events())
+
     def kineto_results(self):
         """The device's own record of what it did, in a form meant to be read.
 
@@ -370,11 +375,35 @@ class profile:
 
         return self._ensure_events().device_kernels(sort_by=sort_by)
 
-    def table(self, sort_by=None, row_limit=100, **kwargs):
-        return self.key_averages().table(
+    def table(
+        self,
+        sort_by=None,
+        row_limit=100,
+        header=None,
+        max_src_column_width=75,
+        max_name_column_width=55,
+        max_shapes_column_width=80,
+        top_level_events_only=False,
+        time_unit=None,
+    ):
+        """Render the session's spans, one row per span.
+
+        Every span gets a row rather than one row per name, so the per-span
+        captures the session holds -- the shapes an operation was given, the
+        frames it was called from, the memory it allocated -- can be printed
+        against the span they describe.  :meth:`key_averages` is the aggregated
+        view of the same recording.
+        """
+
+        return self._ensure_events().table(
             sort_by=sort_by,
             row_limit=row_limit,
-            **kwargs,
+            header=header,
+            max_src_column_width=max_src_column_width,
+            max_name_column_width=max_name_column_width,
+            max_shapes_column_width=max_shapes_column_width,
+            top_level_events_only=top_level_events_only,
+            time_unit=time_unit,
         )
 
     def total_average(self):
