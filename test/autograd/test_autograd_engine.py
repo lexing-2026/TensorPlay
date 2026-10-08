@@ -1,3 +1,6 @@
+import os
+import subprocess
+import sys
 import unittest
 import tensorplay as tp
 
@@ -139,6 +142,26 @@ class TestConversion(unittest.TestCase):
         self.assertIsNone(b.grad)
         (gb,) = tp.autograd.grad((a @ b).sum(), b)
         self.assertEqual(gb.tolist(), [[4.0], [6.0]])
+
+
+class TestEngineTrace(unittest.TestCase):
+    def test_value_trace_prints_complex_gradients(self):
+        # TP_ENGINE_TRACE=3 prints gradient values, and the level is read once
+        # per process, hence the child.  A complex gradient has to print rather
+        # than fail the backward it describes.
+        code = (
+            "import tensorplay as tp\n"
+            "x = tp.ones(3, requires_grad=True)\n"
+            "(x.to(tp.complex64) * (1 + 2j)).real.sum().backward()\n"
+            "print(x.grad.tolist())\n"
+        )
+        env = dict(os.environ, TP_ENGINE_TRACE="3")
+        proc = subprocess.run([sys.executable, "-c", code], env=env,
+                              capture_output=True, text=True, timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertEqual(proc.stdout.strip(), "[1.0, 1.0, 1.0]")
+        # RealBackward hands its input on as complex(grad, 0).
+        self.assertIn("1.000000+0.000000j", proc.stderr)
 
 
 if __name__ == '__main__':

@@ -134,7 +134,17 @@ struct EngineTrace {
         const int64_t total = flat.numel();
         const int64_t show = std::min<int64_t>(total, 8);
         for (int64_t i = 0; i < show; ++i) {
-            vals += std::to_string(flat.select(0, i).item().toDouble());
+            const Scalar v = flat.select(0, i).item();
+            if (v.isComplex()) {
+                // toDouble() rejects complex values; the trace must not
+                // throw out of the backward it is describing.
+                const std::complex<double> c = v.to<std::complex<double>>();
+                vals += std::to_string(c.real());
+                if (c.imag() >= 0) vals += "+";
+                vals += std::to_string(c.imag()) + "j";
+            } else {
+                vals += std::to_string(v.toDouble());
+            }
             if (i + 1 < show) vals += ",";
         }
         if (total > show) vals += ",...";
