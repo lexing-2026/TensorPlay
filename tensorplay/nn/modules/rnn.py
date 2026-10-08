@@ -65,7 +65,8 @@ def _lstm_cell(input, hidden, params, pre_compute_input=False):
 
     gates = F.linear(hx, w_hh, b_hh) + (
         input if pre_compute_input else F.linear(input, w_ih, b_ih))
-    H = hx.size(1)
+    # The gates are as wide as the cell state; a projected hx is narrower.
+    H = cx.size(1)
     # narrow (not chunk) keeps the autograd graph: chunk has no registered
     # derivative, while narrow is a differentiable view on every backend.
     ingate = gates.narrow(1, 0, H).sigmoid()
