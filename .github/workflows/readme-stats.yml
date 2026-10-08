@@ -64,12 +64,30 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add README.md README.zh.md
-          git commit -m "docs(readme): refresh the measured suite size"
+          git commit -m "docs: refresh the measured suite size"
           # A concurrent push to main can land between the checkout and here;
           # rebase onto it and try again rather than failing the run.
           for attempt in 1 2 3; do
-            if git push; then
+            if git push 2> push.err; then
               echo "pushed the refreshed statistics"
+              exit 0
+            fi
+            cat push.err >&2
+            # Branch protection refusing the workflow token is a property of
+            # the repository settings, not of this measurement: report the
+            # drift once and how to land it instead of turning main red.
+            if grep -q "GH006" push.err; then
+              msg="main is protected against the workflow token; run python tools/update_readme_stats.py and commit README.md README.zh.md"
+              echo "::warning title=README statistics are stale::$msg"
+              {
+                echo "### README statistics are stale"
+                echo
+                echo "$msg."
+                echo
+                echo '```diff'
+                git show --format= -- README.md
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
             echo "push attempt $attempt failed; rebasing onto origin"
