@@ -1164,6 +1164,8 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
                 out.append("        int matches = 0;")
                 for k, p in enumerate(probes):
                     kinds_c = ", ".join(str(kc) for kc in p["kinds"])
+                    if not kinds_c:
+                        kinds_c = "0"
                     out.append(
                         f'        static const unsigned char tpx_kinds_{k}[] '
                         f"= {{{kinds_c}}};")
