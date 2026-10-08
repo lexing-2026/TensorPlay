@@ -59,6 +59,15 @@ class Value:
     def rank(self) -> int | None:
         return None if self.shape is None else len(self.shape)
 
+    def __index__(self) -> int:
+        # A value only exists once the model runs (an extent along a dynamic
+        # axis, say); an argument the ONNX node fixes at export time cannot
+        # take one.
+        raise TypeError(
+            f"{self.name!r} is computed when the model runs, but this argument "
+            "must be a fixed integer in the exported graph"
+        )
+
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"Value({self.name!r}, shape={self.shape}, dtype={self.dtype})"
 
@@ -75,6 +84,10 @@ class GraphBuilder:
         self._used_names: set[str] = set()
         self._counters: dict[str, int] = {}
         self._constant_cache: dict[tuple, str] = {}
+        #: Per-axis extents of a value that the exported graph fixes, ``None``
+        #: on the axes that vary at runtime.  Unset, every sampled extent is
+        #: taken as fixed.
+        self.static_dims: Callable[[Value], Sequence[int | None] | None] | None = None
 
     # -- naming -------------------------------------------------------------
 
@@ -171,7 +184,9 @@ def _sanitize(name: str) -> str:
 class OpContext:
     """Argument access plus emission helpers handed to every handler."""
 
-    __slots__ = ("b", "node_name", "params", "args", "kwargs", "out_shape", "out_dtype")
+    __slots__ = (
+        "b", "node_name", "params", "args", "kwargs", "out_shape", "out_dtype", "sample"
+    )
 
     def __init__(
         self,
@@ -182,6 +197,7 @@ class OpContext:
         kwargs: dict[str, Any],
         out_shape: tuple | None = None,
         out_dtype: np.dtype | None = None,
+        sample: Any = None,
     ) -> None:
         self.b = builder
         self.node_name = node_name
@@ -190,6 +206,8 @@ class OpContext:
         self.kwargs = dict(kwargs)
         self.out_shape = out_shape
         self.out_dtype = out_dtype
+        #: What the node produced when the graph ran on the example inputs.
+        self.sample = sample
 
     # -- argument access ----------------------------------------------------
 
@@ -285,8 +303,7 @@ class OpContext:
         return self.op(op_type, [self.x], **attrs)
 
     def binary(self, op_type: str) -> str:
-        other = self.get(self.params[1])
-        return self.op(op_type, [self.x, self.cast_like(other, self.x)])
+        return self.op(op_type, list(_binary_operands(self, self.x, self.get(self.params[1]))))
 
 
 class _Missing:
@@ -491,6 +508,136 @@ def _float_dtype(ctx: OpContext, value: Any) -> np.dtype:
     return dtype
 
 
+_KIND_ORDER = {"b": 0, "u": 1, "i": 1, "f": 2, "c": 3}
+
+
+def _common_dtype(ctx: OpContext, operands: Sequence[Any]) -> np.dtype | None:
+    """The dtype a binary op computes in, or ``None`` when it is not known.
+
+    ONNX requires both operands of an arithmetic node to share one type, while
+    the captured program mixes them freely (a float tensor times an extent,
+    an integer tensor divided into a float).  Arithmetic computes in the dtype
+    it produced; a comparison computes in the widest kind among its operands,
+    and within that kind a tensor operand settles the width rather than a
+    scalar does.
+    """
+
+    if ctx.out_dtype is not None and ctx.out_dtype.kind != "b":
+        return ctx.out_dtype
+    found: list[tuple[np.dtype, bool]] = []
+    for value in operands:
+        if isinstance(value, str):
+            return None
+        dtype = ctx.dtype(value)
+        if dtype is None:
+            return None
+        found.append((dtype, isinstance(value, Value) and bool(value.shape)))
+    if not found:
+        return None
+    top = max(_KIND_ORDER.get(dtype.kind, -1) for dtype, _ in found)
+    widest = [dtype for dtype, _ in found if _KIND_ORDER.get(dtype.kind, -1) == top]
+    tensors = [
+        dtype
+        for dtype, is_tensor in found
+        if is_tensor and _KIND_ORDER.get(dtype.kind, -1) == top
+    ]
+    result = (tensors or widest)[0]
+    for dtype in tensors[1:]:
+        result = np.promote_types(result, dtype)
+    return np.dtype(result)
+
+
+def _coerce(ctx: OpContext, value: Any, dtype: np.dtype) -> str:
+    """Name for ``value`` in ``dtype``: constants are made in it, values cast."""
+
+    if isinstance(value, Value):
+        if value.dtype is None or value.dtype == dtype:
+            return value.name
+        return _cast(ctx, value, dtype)
+    if isinstance(value, str):
+        return value
+    return ctx.b.constant(value, dtype=dtype, name_hint=f"{ctx.node_name}_const")
+
+
+def _binary_operands(ctx: OpContext, left: Any, right: Any) -> tuple[str, str]:
+    dtype = _common_dtype(ctx, (left, right))
+    if dtype is None:
+        return ctx.name(left), ctx.cast_like(right, left)
+    return _coerce(ctx, left, dtype), _coerce(ctx, right, dtype)
+
+
+def _fixed_dims(ctx: OpContext, value: Any) -> list[int | None]:
+    """Each extent of ``value`` the exported graph fixes; ``None`` where the
+    extent varies at runtime (it follows a dynamic axis of an input)."""
+
+    shape = ctx.shape(value)
+    if shape is None:
+        raise UnsupportedOperatorError(
+            f"{ctx.node_name}: the shape of the input is unknown; export with "
+            "example inputs so shapes can be propagated"
+        )
+    fixed: Sequence[int | None] | None = shape
+    if isinstance(value, Value) and ctx.b.static_dims is not None:
+        fixed = ctx.b.static_dims(value)
+    if fixed is None or len(fixed) != len(shape):
+        return [None] * len(shape)
+    return [
+        None if known is None else int(size) for size, known in zip(shape, fixed)
+    ]
+
+
+def _dims(ctx: OpContext, value: Any, axes: Sequence[int] | None = None) -> list[Any]:
+    """The extents of ``value`` on ``axes`` (all by default), as the exported
+    graph knows them.
+
+    An extent the graph fixes is a plain ``int``; one that varies at runtime
+    is read off the tensor with ``Shape`` and arrives as a 0-d int64
+    :class:`Value`, so arithmetic and reshapes built on it follow the actual
+    input.
+    """
+
+    fixed = _fixed_dims(ctx, value)
+    dims: list[Any] = []
+    shape_name = None
+    for axis in range(len(fixed)) if axes is None else axes:
+        if fixed[axis] is not None:
+            dims.append(fixed[axis])
+            continue
+        if shape_name is None:
+            shape_name = ctx.op("Shape", [value])
+        index = ctx.b.constant(np.asarray(axis, dtype=np.int64), name_hint="axis")
+        extent = ctx.op("Gather", [shape_name, index], axis=0)
+        dims.append(Value(extent, (), np.int64))
+    return dims
+
+
+def _shape_tensor(ctx: OpContext, dims: Sequence[Any], hint: str = "shape") -> str:
+    """A 1-D int64 shape input made from fixed ints and runtime extents."""
+
+    if not any(isinstance(item, Value) for item in dims):
+        return ctx.b.int64_1d([int(item) for item in dims], f"{ctx.node_name}_{hint}")
+    pieces: list[str] = []
+    run: list[int] = []
+    for item in dims:
+        if not isinstance(item, Value):
+            run.append(int(item))
+            continue
+        if run:
+            pieces.append(ctx.b.int64_1d(run, f"{ctx.node_name}_{hint}"))
+            run = []
+        extent = _coerce(ctx, item, np.dtype(np.int64))
+        if not item.shape:
+            extent = _unsqueeze(ctx, extent, [0])
+        pieces.append(extent)
+    if run:
+        pieces.append(ctx.b.int64_1d(run, f"{ctx.node_name}_{hint}"))
+    return ctx.op("Concat", pieces, axis=0)
+
+
+def _is_tensor_like(value: Any) -> bool:
+    return hasattr(value, "shape") and hasattr(value, "numpy")
+
+
 # ---------------------------------------------------------------------------
 # Pointwise unary ops
 # ---------------------------------------------------------------------------
@@ -571,24 +718,33 @@ for _name, _onnx_op in _SIMPLE_BINARY.items():
     )
 
 
-def _scaled_other(ctx: OpContext) -> str:
-    """Second operand, pre-multiplied by ``alpha`` when one was given."""
+def _scaled_operands(ctx: OpContext) -> tuple[str, str]:
+    """Both operands, the second pre-multiplied by ``alpha`` when one was given."""
 
-    other = ctx.cast_like(ctx.get("other"), ctx.x)
+    left, other = _binary_operands(ctx, ctx.x, ctx.get("other"))
     alpha = ctx.get("alpha", 1)
     if alpha is None or float(alpha) == 1.0:
-        return other
-    return ctx.op("Mul", [other, ctx.cast_like(float(alpha), ctx.x)])
+        return left, other
+    dtype = _common_dtype(ctx, (ctx.x, ctx.get("other")))
+    scale = (
+        ctx.cast_like(float(alpha), ctx.x)
+        if dtype is None
+        else _coerce(ctx, float(alpha), dtype)
+    )
+    return left, ctx.op("Mul", [other, scale])
 
 
 @register("add", "input other alpha")
-def _handle_add(ctx: OpContext) -> str:
-    return ctx.op("Add", [ctx.x, _scaled_other(ctx)])
+def _handle_add(ctx: OpContext) -> Any:
+    if isinstance(ctx.x, (list, tuple)):
+        # ``x.shape[:2] + (-1,)``: sequences of extents concatenate.
+        return tuple(ctx.x) + tuple(ctx.get("other"))
+    return ctx.op("Add", list(_scaled_operands(ctx)))
 
 
 @register("sub", "input other alpha")
 def _handle_sub(ctx: OpContext) -> str:
-    return ctx.op("Sub", [ctx.x, _scaled_other(ctx)])
+    return ctx.op("Sub", list(_scaled_operands(ctx)))
 
 
 alias("subtract", "sub")
@@ -598,20 +754,20 @@ alias("subtract", "sub")
 def _handle_remainder(ctx: OpContext) -> str:
     """``x - floor(x / y) * y``: the result takes the divisor's sign."""
 
-    other = ctx.cast_like(ctx.get("other"), ctx.x)
-    dtype = ctx.dtype(ctx.x)
+    left, other = _binary_operands(ctx, ctx.x, ctx.get("other"))
+    dtype = _common_dtype(ctx, (ctx.x, ctx.get("other"))) or ctx.dtype(ctx.x)
     if dtype is not None and dtype.kind in "iu":
         # Integer Mod already rounds the quotient towards negative infinity.
-        return ctx.op("Mod", [ctx.x, other], fmod=0)
-    quotient = ctx.op("Floor", [ctx.op("Div", [ctx.x, other])])
-    return ctx.op("Sub", [ctx.x, ctx.op("Mul", [quotient, other])])
+        return ctx.op("Mod", [left, other], fmod=0)
+    quotient = ctx.op("Floor", [ctx.op("Div", [left, other])])
+    return ctx.op("Sub", [left, ctx.op("Mul", [quotient, other])])
 
 
 @register("fmod", "input other")
 def _handle_fmod(ctx: OpContext) -> str:
     """``x - trunc(x / y) * y``, which is what ``Mod(fmod=1)`` computes."""
 
-    return ctx.op("Mod", [ctx.x, ctx.cast_like(ctx.get("other"), ctx.x)], fmod=1)
+    return ctx.op("Mod", list(_binary_operands(ctx, ctx.x, ctx.get("other"))), fmod=1)
 
 
 @register("ne", "input other")
@@ -621,13 +777,13 @@ def _handle_ne(ctx: OpContext) -> str:
 
 @register("floordiv", "input other")
 def _handle_floordiv(ctx: OpContext) -> str:
-    other = ctx.cast_like(ctx.get("other"), ctx.x)
-    dtype = ctx.dtype(ctx.x)
+    left, other = _binary_operands(ctx, ctx.x, ctx.get("other"))
+    dtype = _common_dtype(ctx, (ctx.x, ctx.get("other"))) or ctx.dtype(ctx.x)
     if dtype is not None and dtype.kind in "iu":
-        as_float = _cast(ctx, ctx.x, np.float32)
+        as_float = _cast(ctx, left, np.float32)
         divided = ctx.op("Div", [as_float, _cast(ctx, other, np.float32)])
         return _cast(ctx, ctx.op("Floor", [divided]), dtype)
-    return ctx.op("Floor", [ctx.op("Div", [ctx.x, other])])
+    return ctx.op("Floor", [ctx.op("Div", [left, other])])
 
 
 alias("floor_divide", "floordiv")
@@ -900,6 +1056,24 @@ def _variadic_ints(ctx: OpContext, param: str) -> list[int]:
     return [int(value)]
 
 
+def _variadic_dims(ctx: OpContext, param: str) -> list[Any]:
+    """Like :func:`_variadic_ints`, but runtime extents stay :class:`Value`."""
+
+    def settle(item: Any) -> Any:
+        return item if isinstance(item, Value) else int(item)
+
+    value = ctx.get(param)
+    if isinstance(value, (list, tuple)):
+        return [settle(item) for item in value]
+    index = ctx.params.index(param)
+    tail = ctx.args[index:]
+    if tail:
+        return [settle(item) for item in tail]
+    if value is None:
+        return []
+    return [settle(value)]
+
+
 @register("sum", "input dim keepdim dtype")
 def _handle_sum(ctx: OpContext) -> str:
     return _reduce_sum(ctx, ctx.x, ctx.get("dim"), bool(ctx.get("keepdim", False)))
@@ -1145,10 +1319,18 @@ def _handle_sort(ctx: OpContext) -> list[str]:
 
 @register("reshape", "input shape")
 def _handle_reshape(ctx: OpContext) -> str:
-    return _reshape(ctx, ctx.x, _variadic_ints(ctx, "shape"))
+    return ctx.op("Reshape", [ctx.x, _shape_tensor(ctx, _variadic_dims(ctx, "shape"))])
 
 
 alias("view", "reshape", params="input shape")
+
+
+def _leading(fixed: Sequence[int | None]) -> list[int]:
+    """Extents a ``Reshape`` keeps in place: one that varies is copied (0)."""
+
+    return [0 if size is None else size for size in fixed]
+
+
 @register("flatten", "input start_dim end_dim")
 def _handle_flatten(ctx: OpContext) -> str:
     """ONNX ``Flatten`` always yields a 2-D tensor, so only the ``start_dim=1``
@@ -1164,22 +1346,33 @@ def _handle_flatten(ctx: OpContext) -> str:
             return _reshape(ctx, ctx.x, [-1])
         if start == 1:
             return ctx.op("Flatten", [ctx.x], axis=1)
-    shape = ctx.shape(ctx.x)
-    merged = int(np.prod(shape[start : end + 1])) if end >= start else 1
-    new_shape = list(shape[:start]) + [merged] + list(shape[end + 1 :])
-    return _reshape(ctx, ctx.x, new_shape)
+    fixed = _fixed_dims(ctx, ctx.x)
+    span = fixed[start : end + 1]
+    if None in span:
+        merged = -1
+    else:
+        merged = int(np.prod(span)) if end >= start else 1
+    new_shape = (
+        _leading(fixed[:start])
+        + [merged]
+        + _dims(ctx, ctx.x, range(end + 1, rank))
+    )
+    return ctx.op("Reshape", [ctx.x, _shape_tensor(ctx, new_shape)])
 
 
 @register("unflatten", "input dim sizes")
 def _handle_unflatten(ctx: OpContext) -> str:
     rank = ctx.rank(ctx.x)
     dim = _normalize_axis(ctx.get("dim"), rank)
-    shape = list(ctx.shape(ctx.x))
+    fixed = _fixed_dims(ctx, ctx.x)
     sizes = _as_int_list(ctx.get("sizes"))
-    if -1 in sizes:
+    if -1 in sizes and fixed[dim] is not None:
         known = int(np.prod([size for size in sizes if size != -1])) or 1
-        sizes = [shape[dim] // known if size == -1 else size for size in sizes]
-    return _reshape(ctx, ctx.x, shape[:dim] + sizes + shape[dim + 1 :])
+        sizes = [fixed[dim] // known if size == -1 else size for size in sizes]
+    new_shape = (
+        _leading(fixed[:dim]) + sizes + _dims(ctx, ctx.x, range(dim + 1, rank))
+    )
+    return ctx.op("Reshape", [ctx.x, _shape_tensor(ctx, new_shape)])
 
 
 @register("transpose", "input dim0 dim1")
@@ -1233,15 +1426,13 @@ def _handle_unsqueeze(ctx: OpContext) -> str:
 
 @register("expand", "input size implicit")
 def _handle_expand(ctx: OpContext) -> str:
-    sizes = _variadic_ints(ctx, "size")
-    shape = ctx.shape(ctx.x)
-    if shape is not None:
-        offset = len(sizes) - len(shape)
-        sizes = [
-            int(shape[index - offset]) if size == -1 else size
-            for index, size in enumerate(sizes)
-        ]
-    return ctx.op("Expand", [ctx.x, ctx.b.int64_1d(sizes, f"{ctx.node_name}_shape")])
+    # ``Expand`` broadcasts both ways, so an extent of 1 keeps the input's own
+    # extent on that axis: ``-1`` becomes 1 and holds for any input size.
+    sizes = [
+        1 if not isinstance(size, Value) and size == -1 else size
+        for size in _variadic_dims(ctx, "size")
+    ]
+    return ctx.op("Expand", [ctx.x, _shape_tensor(ctx, sizes)])
 
 
 alias("broadcast_to", "expand", params="input size")
@@ -1259,8 +1450,7 @@ def _handle_repeat(ctx: OpContext) -> str:
     rank = ctx.rank(ctx.x)
     data: Any = ctx.x
     if len(repeats) > rank:
-        shape = list(ctx.shape(ctx.x))
-        data = _reshape(ctx, ctx.x, [1] * (len(repeats) - rank) + shape)
+        data = _unsqueeze(ctx, ctx.x, list(range(len(repeats) - rank)))
     return ctx.op(
         "Tile", [data, ctx.b.int64_1d(repeats, f"{ctx.node_name}_repeats")]
     )
@@ -1414,7 +1604,13 @@ def _handle_pixel_unshuffle(ctx: OpContext) -> str:
     # ONNX SpaceToDepth interleaves the channel axis in the opposite order
     # (DCR), so the required layout is spelled out explicitly.
     factor = int(ctx.get("downscale_factor"))
-    batch, channels, height, width = (int(size) for size in ctx.shape(ctx.x))
+    batch, channels, height, width = _fixed_dims(ctx, ctx.x)
+    (batch,) = _leading([batch])
+    if None in (channels, height, width):
+        raise UnsupportedOperatorError(
+            f"{ctx.node_name}: pixel_unshuffle exports only with fixed channel "
+            "and spatial extents"
+        )
     split = _reshape(
         ctx,
         ctx.x,
@@ -1869,9 +2065,7 @@ def _handle_interpolate(ctx: OpContext) -> str:
     empty = ctx.b.constant(np.zeros((0,), dtype=np.float32), name_hint="resize_roi")
     if size is not None:
         sizes = _pair_attr(size, spatial)
-        shape = ctx.shape(ctx.x)
-        target = [int(shape[0]), int(shape[1])] + sizes
-        sizes_name = ctx.b.int64_1d(target, f"{ctx.node_name}_sizes")
+        sizes_name = _shape_tensor(ctx, _dims(ctx, ctx.x)[:2] + sizes, "sizes")
         empty_scales = ctx.b.constant(
             np.zeros((0,), dtype=np.float32), name_hint="resize_scales"
         )
@@ -2077,6 +2271,70 @@ for _guard_name, _guard_params in (
 
 
 # ---------------------------------------------------------------------------
+# Tensor metadata
+# ---------------------------------------------------------------------------
+
+
+@register("getattr", "input name default", module="builtins", methods=False)
+def _handle_getattr(ctx: OpContext) -> Any:
+    """A tensor attribute read on a value the graph computed.
+
+    Extents come back as :func:`_dims` gives them: fixed ones as ints, ones
+    that vary at runtime as values read with ``Shape``.  Metadata ONNX keeps
+    fixed in the graph (dtype, device, ...) is what the example run produced.
+    """
+
+    data, attribute = ctx.x, ctx.get("name")
+    if attribute == "shape":
+        return tuple(_dims(ctx, data))
+    if attribute == "ndim":
+        return ctx.rank(data)
+    if attribute in ("T", "mT"):
+        rank = ctx.rank(data)
+        perm = list(range(rank))
+        if attribute == "T":
+            perm.reverse()
+        elif rank >= 2:
+            perm[-2], perm[-1] = perm[-1], perm[-2]
+        else:
+            raise UnsupportedOperatorError(
+                f"{ctx.node_name}: mT needs a tensor of rank 2 or more, got {rank}"
+            )
+        return ctx.op("Transpose", [data], perm=perm)
+    if ctx.sample is not None and not _is_tensor_like(ctx.sample):
+        return ctx.sample
+    raise UnsupportedOperatorError(
+        f"{ctx.node_name}: the tensor attribute {attribute!r} has no ONNX "
+        "lowering; read shape, ndim, T, mT or fixed metadata such as dtype"
+    )
+
+
+@register_method("size", "input dim")
+def _handle_size(ctx: OpContext) -> Any:
+    dim = ctx.get("dim")
+    if dim is None:
+        return tuple(_dims(ctx, ctx.x))
+    return _dims(ctx, ctx.x, [_normalize_axis(dim, ctx.rank(ctx.x))])[0]
+
+
+@register_method("dim", "input")
+@register_method("ndimension", "input")
+def _handle_dim(ctx: OpContext) -> int:
+    return ctx.rank(ctx.x)
+
+
+@register("numel", "input")
+@register_method("nelement", "input")
+def _handle_numel(ctx: OpContext) -> Any:
+    fixed = _fixed_dims(ctx, ctx.x)
+    if None not in fixed:
+        return int(np.prod(fixed, dtype=np.int64))
+    return Value(
+        ctx.op("ReduceProd", [ctx.op("Shape", [ctx.x])], keepdims=0), (), np.int64
+    )
+
+
+# ---------------------------------------------------------------------------
 # Indexing
 # ---------------------------------------------------------------------------
 
@@ -2086,7 +2344,7 @@ def _handle_getitem(ctx: OpContext) -> Any:
     data = ctx.x
     key = ctx.get("index")
     if isinstance(data, (list, tuple)):
-        return data[int(key)]
+        return data[key] if isinstance(key, slice) else data[int(key)]
     keys = key if isinstance(key, tuple) else (key,)
     rank = ctx.rank(data)
     explicit = sum(1 for item in keys if item is not None and item is not Ellipsis)

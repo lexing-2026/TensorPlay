@@ -143,6 +143,18 @@ class TestElementwise:
     @pytest.mark.parametrize(
         "fn",
         [
+            lambda x: (x > 0).long() * 0.5,
+            lambda x: (x > 0).long() / 2,
+            lambda x: (x > 0).long() + x,
+        ],
+        ids=["int_times_float", "int_true_divide", "int_plus_float"],
+    )
+    def test_mixed_operands_compute_in_the_result_dtype(self, fn):
+        _export_fn(fn, tp.randn(2, 3))
+
+    @pytest.mark.parametrize(
+        "fn",
+        [
             lambda x: tp.abs(x),
             lambda x: tp.exp(x),
             lambda x: tp.sqrt(tp.abs(x)),
@@ -861,6 +873,99 @@ class TestOpsetAndDynamicShapes:
         program = export(M(), tp.randn((2, 4)), dynamic_shapes={"x": {0: batch}})
         model = onnx_export(program)
         assert model.graph.input[0].type.tensor_type.shape.dim[0].dim_param == "batch"
+
+
+class _Attention(tp.nn.Module):
+    """Reads its extents off a computed value, as transformer blocks do."""
+
+    def __init__(self, dim=8, heads=2):
+        super().__init__()
+        self.heads = heads
+        self.norm = tp.nn.LayerNorm(dim)
+        self.qkv = tp.nn.Linear(dim, dim * 3)
+        self.proj = tp.nn.Linear(dim, dim)
+
+    def forward(self, x):
+        x = self.norm(x)
+        b, n, c = x.shape
+        qkv = self.qkv(x).reshape(b, n, 3, self.heads, c // self.heads)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn = tp.softmax(q @ k.transpose(-2, -1), dim=-1)
+        return self.proj((attn @ v).transpose(1, 2).reshape(b, n, c))
+
+
+def _run_batches(model, module, make_input, batches):
+    session = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    for batch in batches:
+        data = make_input(batch)
+        with tp.no_grad():
+            expected = module(data).numpy()
+        actual = session.run(None, {"x": data.numpy()})[0]
+        np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)
+
+
+class TestShapeReads:
+    def test_shape_of_a_computed_value_folds_to_a_constant(self):
+        model = _export_fn(lambda x: (lambda y: y * y.shape[0])(tp.relu(x)), tp.randn(2, 4))
+        assert "Shape" not in _op_types(model)
+
+    def test_shape_unpacking_feeds_a_reshape(self):
+        module = _Attention().eval()
+        model = _export(module, tp.randn(2, 5, 8))
+        assert "Shape" not in _op_types(model)
+
+    def test_dynamic_batch_is_read_at_runtime(self):
+        module = _Attention().eval()
+        program = export(module, tp.randn(2, 5, 8))
+        model = onnx_export(
+            program,
+            input_names=["x"],
+            dynamic_axes={"x": {0: "batch"}},
+            verify=True,
+        )
+        # Only the batch extent varies; the token and channel extents stay
+        # constants of the exported graph.
+        assert _op_types(model).count("Shape") == 1
+        _run_batches(model, module, lambda batch: tp.randn(batch, 5, 8), (1, 2, 4))
+
+    @pytest.mark.parametrize(
+        "fn",
+        [
+            lambda y: y * y.size(1),
+            lambda y: y.reshape(y.size()[0], -1),
+            lambda y: y * y.dim() + y.ndim,
+            lambda y: y * y.numel(),
+            lambda y: y.reshape(y.shape[:1] + (-1,)),
+            lambda y: y.flatten(1).T,
+            lambda y: y.to(y.dtype) / y.shape[-1],
+        ],
+        ids=["size_dim", "size_all", "rank", "numel", "shape_slice", "T", "dtype"],
+    )
+    def test_metadata_reads(self, fn):
+        _export_fn(lambda x: fn(tp.relu(x)), tp.randn(2, 3, 4))
+
+    @pytest.mark.parametrize(
+        "fn",
+        [
+            lambda y: y * y.shape[0],
+            lambda y: y * y.numel(),
+            lambda y: y.reshape(y.shape[:1] + (-1,)),
+            lambda y: y.flatten(2),
+            lambda y: y.unflatten(2, (2, 2)),
+            lambda y: y.expand(-1, -1, -1).repeat(1, 2, 1, 1)[0],
+        ],
+        ids=["scale", "numel", "shape_slice", "flatten", "unflatten", "expand_repeat"],
+    )
+    def test_dynamic_batch_through_shape_dependent_ops(self, fn):
+        module = _as_module(lambda x: fn(tp.relu(x)))
+        program = export(module, tp.randn(2, 3, 4))
+        model = onnx_export(
+            program, input_names=["x"], dynamic_axes={"x": {0: "batch"}}, verify=True
+        )
+        _run_batches(model, module, lambda batch: tp.randn(batch, 3, 4), (1, 3))
 
 
 class TestUnsupported:

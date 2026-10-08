@@ -13,6 +13,7 @@ lowerings that differ only by rank or shape (``Gemm`` vs ``MatMul``,
 
 from __future__ import annotations
 
+import math
 import warnings
 from typing import Any, Mapping, Sequence
 
@@ -113,19 +114,47 @@ def _propagate_metadata(
 
 
 def _annotate(result: Any, sample: Any) -> Any:
-    """Attach the sampled shape/dtype to the value(s) a handler produced."""
+    """Attach the sampled shape/dtype to the value(s) a handler produced.
+
+    A handler names an ONNX value with a string; anything else it returns
+    (a :class:`Value`, or a plain Python value such as a fixed extent) is
+    already what later nodes consume.
+    """
 
     if isinstance(result, (list, tuple)):
         samples = sample if isinstance(sample, (list, tuple)) else ()
-        return [
+        annotated = [
             _annotate(item, samples[index] if index < len(samples) else None)
             for index, item in enumerate(result)
         ]
-    if isinstance(result, Value):
+        return tuple(annotated) if isinstance(result, tuple) else annotated
+    if not isinstance(result, str):
         return result
-    if not _is_tensor(sample):
-        return Value(result)
-    return Value(result, _size_to_tuple(sample.shape), _numpy_dtype(sample))
+    if _is_tensor(sample):
+        return Value(result, _size_to_tuple(sample.shape), _numpy_dtype(sample))
+    if _is_scalar(sample):
+        return Value(result, (), _to_numpy(sample).dtype)
+    return Value(result)
+
+
+def _is_scalar(value: Any) -> bool:
+    return isinstance(value, (bool, int, float))
+
+
+def _holds(value: Any, predicate: Any) -> bool:
+    """Whether ``value`` or anything nested in its containers satisfies ``predicate``."""
+
+    if predicate(value):
+        return True
+    if isinstance(value, (list, tuple)):
+        return any(_holds(item, predicate) for item in value)
+    if isinstance(value, dict):
+        return any(_holds(item, predicate) for item in value.values())
+    if isinstance(value, slice):
+        return any(
+            _holds(item, predicate) for item in (value.start, value.stop, value.step)
+        )
+    return False
 
 
 def _numpy_dtype(tensor: Any) -> Any:
@@ -143,6 +172,61 @@ def _numpy_dtype(tensor: Any) -> Any:
         return _to_numpy(tensor).dtype
     except Exception:  # noqa: BLE001 - exotic dtypes stay unannotated
         return None
+
+
+#: Initializers at most this large keep their data in the graph shape inference
+#: sees: shape vectors, axes and scalars, which inference reads.  Larger ones
+#: (weights) are only typed, which is all inference needs from them.
+_INFERENCE_DATA_LIMIT = 64
+
+
+def _infer_partial_shapes(
+    builder: GraphBuilder, graph_inputs: Sequence[Any]
+) -> dict[str, list[int | None]]:
+    """Per-value extents ONNX shape inference finds in the graph built so far.
+
+    An extent comes back as an ``int`` where inference settles it and ``None``
+    where it stays symbolic or unknown.
+    """
+
+    initializers: list[Any] = []
+    typed: list[Any] = []
+    for tensor in builder.initializers:
+        if math.prod(tensor.dims) <= _INFERENCE_DATA_LIMIT:
+            initializers.append(tensor)
+        else:
+            typed.append(
+                helper.make_tensor_value_info(
+                    tensor.name, tensor.data_type, list(tensor.dims)
+                )
+            )
+    graph = helper.make_graph(
+        builder.nodes,
+        builder.name,
+        list(graph_inputs) + typed,
+        [],
+        initializer=initializers,
+        value_info=builder.value_info,
+    )
+    opset = [helper.make_opsetid("", builder.opset)]
+    model = helper.make_model(graph, opset_imports=opset)
+    model.ir_version = helper.find_min_ir_version_for(opset, ignore_unknown=True)
+    try:
+        inferred = shape_inference.infer_shapes(
+            model, check_type=False, strict_mode=False, data_prop=True
+        )
+    except Exception:  # noqa: BLE001 - every extent then counts as dynamic
+        return {}
+    shapes: dict[str, list[int | None]] = {}
+    for info in (*inferred.graph.input, *inferred.graph.value_info):
+        tensor_type = info.type.tensor_type
+        if not tensor_type.HasField("shape"):
+            continue
+        shapes[info.name] = [
+            dim.dim_value if dim.HasField("dim_value") else None
+            for dim in tensor_type.shape.dim
+        ]
+    return shapes
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +263,35 @@ class _Converter:
         )
         self.graph_inputs: list[Any] = []
         self.eager_outputs: Any = None
+        self._inferred: tuple[int, dict[str, list[int | None]]] | None = None
+        self.builder.static_dims = self._static_dims
+
+    # -- extents ------------------------------------------------------------
+
+    def _static_dims(self, value: Value) -> list[int | None] | None:
+        """Which extents of ``value`` the exported graph fixes.
+
+        Without a dynamic input axis every sampled extent is fixed.  With one,
+        ONNX shape inference over the graph built so far decides: an extent it
+        settles to a number is fixed in the exported model, and any other
+        (symbolic, or beyond what inference can follow) is read at runtime.
+        """
+
+        if value.shape is None:
+            return None
+        if not any(
+            dim.HasField("dim_param")
+            for info in self.graph_inputs
+            for dim in info.type.tensor_type.shape.dim
+        ):
+            return list(value.shape)
+        return self._inferred_shapes().get(value.name)
+
+    def _inferred_shapes(self) -> dict[str, list[int | None]]:
+        count = len(self.builder.nodes)
+        if self._inferred is None or self._inferred[0] != count:
+            self._inferred = (count, _infer_partial_shapes(self.builder, self.graph_inputs))
+        return self._inferred[1]
 
     # -- helpers ------------------------------------------------------------
 
@@ -296,6 +409,17 @@ class _Converter:
 
         args = [self._resolve(arg) for arg in node.args]
         kwargs = {key: self._resolve(value) for key, value in node.kwargs.items()}
+        sample = self.samples.get(node.name)
+
+        if (
+            sample is not None
+            and not _holds(sample, _is_tensor)
+            and not _holds((args, kwargs), lambda item: isinstance(item, Value))
+        ):
+            # Python arithmetic on fixed extents (``c // heads``, indexing a
+            # shape tuple, ...) touches no value the model computes, so what
+            # it produced on the example inputs is what it always produces.
+            return sample
 
         if node.op == "call_function":
             module, name = self._target_id(node.target)
@@ -313,15 +437,20 @@ class _Converter:
                 "a supported operator"
             )
         handler, params = entry
-        sample = self.samples.get(node.name)
+        out_shape = out_dtype = None
+        if _is_tensor(sample):
+            out_shape, out_dtype = _size_to_tuple(sample.shape), _numpy_dtype(sample)
+        elif _is_scalar(sample):
+            out_shape, out_dtype = (), _to_numpy(sample).dtype
         context = OpContext(
             self.builder,
             node.name,
             params,
             args,
             kwargs,
-            out_shape=_size_to_tuple(sample.shape) if _is_tensor(sample) else None,
-            out_dtype=_numpy_dtype(sample) if _is_tensor(sample) else None,
+            out_shape=out_shape,
+            out_dtype=out_dtype,
+            sample=sample,
         )
         try:
             result = handler(context)
