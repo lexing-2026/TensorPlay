@@ -425,6 +425,23 @@ jobs:
             ncpu="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)"
             export MAX_JOBS=$(( ncpu > 1 ? ncpu - 1 : 1 ))
           fi
+          # sccache keys hash the absolute paths in compiler arguments and
+          # preprocessed source. The checkout, the runner temp dir (the
+          # Linux build venv) and the interpreter prefix (the pip-installed
+          # cuDNN headers on Windows) sit at different roots across runners
+          # and Python versions, so strip them and let lanes share entries.
+          # The build scripts restart the server, which reads this at start.
+          basedirs=("$GITHUB_WORKSPACE" "$RUNNER_TEMP")
+          if [[ -n "${pythonLocation:-}" ]]; then
+            basedirs+=("$pythonLocation")
+          fi
+          sep=':'
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            sep=';'
+          fi
+          SCCACHE_BASEDIRS="$(IFS="$sep"; echo "${basedirs[*]}")"
+          export SCCACHE_BASEDIRS
+          echo "SCCACHE_BASEDIRS=$SCCACHE_BASEDIRS"
           case "$RUNNER_OS" in
             Linux)  bash .github/ci/linux/build.sh ;;
             macOS)  bash .github/ci/macos/build.sh ;;
@@ -444,6 +461,15 @@ jobs:
           unpacked="$(mktemp -d)"
           python3 -m zipfile -e "${wheels[0]}" "$unpacked"
           python3 tools/check_isa_tier_leaks.py "$unpacked/tensorplay/lib/libp10.so"
+
+      # Python resolves the extension's DLLs from tensorplay/lib and System32
+      # only. A DLL linked through its import library but left out of the
+      # wheel builds fine here, where the toolkit is installed, and fails
+      # every import elsewhere with an error that names no DLL.
+      - name: Check the wheel for DLLs it does not ship
+        if: ${{ runner.os == 'Windows' }}
+        shell: bash
+        run: python tools/check_wheel_dlls.py dist/*.whl
 
       - name: Compiler cache statistics
         if: always()
