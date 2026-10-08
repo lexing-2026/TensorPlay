@@ -566,6 +566,45 @@ set_source_files_properties(${GEN_CPP} ${GEN_TPX_OPS_CPP}
 # NB: every kernel in this list MUST register an AVX2 kernel via
 # REGISTER_DISPATCH (its DEFAULT-only registration is not enough when
 # HAVE_AVX2_CPU_DEFINITION is defined).
+#
+# Note [Linking ISA-tier kernel copies]
+# An ISA copy is compiled with its ISA flags for the whole TU, so every inline
+# function or template instantiation it does not inline (std::vector's fill
+# constructor, Tensor accessors, ...) is emitted as a weak definition that may
+# use those instructions.  The linker keeps the first definition it meets: an
+# AVX512 copy placed ahead of the baseline objects becomes the one every
+# caller uses, dispatched or not, and a CPU without AVX512 dies with SIGILL
+# (dot() did, through its partial-sum vector).  The DEFAULT copies are
+# baseline code and stay object libraries; the ISA copies are compiled as
+# p10's own sources through one-line wrappers and appended after every other
+# p10 source (tpx's included), least demanding tier first.  The static
+# Windows archive keeps the same member order, which /WHOLEARCHIVE follows.
+function(tp_add_cpu_kernel_isa_tier TIER)
+    # ARGN: the ISA compile options of the tier.
+    foreach(KERNEL_SRC ${TP_CPU_KERNEL_SRCS})
+        get_filename_component(KERNEL_NAME ${KERNEL_SRC} NAME_WE)
+        set(_wrapper "${CMAKE_CURRENT_BINARY_DIR}/cpu_kernel_tiers/${KERNEL_NAME}.${TIER}.cpp")
+        set(IMPL "${CMAKE_CURRENT_SOURCE_DIR}/${KERNEL_SRC}")
+        file(CONFIGURE OUTPUT "${_wrapper}" CONTENT "#include \"@IMPL@\"\n" @ONLY)
+        set(_defs CPU_CAPABILITY_${TIER} CPU_CAPABILITY=${TIER})
+        # ComplexKernels owns the DispatchStub definitions; only its DEFAULT
+        # copy emits them.
+        if(KERNEL_NAME STREQUAL "ComplexKernels")
+            list(APPEND _defs TP_COMPLEX_KERNELS_NO_DISPATCH_DEFINITION)
+        endif()
+        set_source_files_properties("${_wrapper}" PROPERTIES
+            COMPILE_DEFINITIONS "${_defs}"
+            COMPILE_OPTIONS "${ARGN}"
+            SKIP_UNITY_BUILD_INCLUSION ON)
+        set_property(GLOBAL APPEND PROPERTY TP_P10_ISA_TIER_SOURCES "${_wrapper}")
+    endforeach()
+endfunction()
+function(tp_p10_append_isa_tier_sources)
+    get_property(_sources GLOBAL PROPERTY TP_P10_ISA_TIER_SOURCES)
+    if(_sources)
+        target_sources(p10 PRIVATE ${_sources})
+    endif()
+endfunction()
 set(TP_CPU_KERNEL_SRCS
     src/backend/cpu/ReductionKernelsImpl.cpp
     src/backend/cpu/EmbeddingBagKernelsImpl.cpp
@@ -625,57 +664,14 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
                 TP_COMPLEX_KERNELS_DEFINE_DISPATCH)
         endif()
         add_dependencies(p10_kernel_default_${KERNEL_NAME} generate_code)
-        add_library(p10_kernel_avx2_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
-        set_target_properties(p10_kernel_avx2_${KERNEL_NAME} PROPERTIES
-            POSITION_INDEPENDENT_CODE ON)
-        if(MSVC)
-            target_compile_options(p10_kernel_avx2_${KERNEL_NAME} PRIVATE /bigobj)
-        endif()
-        target_compile_definitions(p10_kernel_avx2_${KERNEL_NAME} PRIVATE
-            P10_EXPORTS CPU_CAPABILITY_AVX2 CPU_CAPABILITY=AVX2 HAVE_AVX2_CPU_DEFINITION)
-        if(TP_CXX_AVX512_FOUND)
-            target_compile_definitions(p10_kernel_avx2_${KERNEL_NAME} PRIVATE
-                HAVE_AVX512_CPU_DEFINITION)
-        endif()
-        target_compile_options(p10_kernel_avx2_${KERNEL_NAME} PRIVATE ${TP_AVX2_TIER_FLAGS})
-        if(KERNEL_NAME STREQUAL "ComplexKernels")
-            target_compile_definitions(p10_kernel_avx2_${KERNEL_NAME} PRIVATE
-                TP_COMPLEX_KERNELS_NO_DISPATCH_DEFINITION)
-        endif()
-        target_include_directories(p10_kernel_avx2_${KERNEL_NAME} PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
-        target_compile_definitions(p10_kernel_avx2_${KERNEL_NAME} PRIVATE
-            ${BLAS_COMPILE_DEFS})
-        add_dependencies(p10_kernel_avx2_${KERNEL_NAME} generate_code)
         list(APPEND TP_CPU_KERNEL_DEFAULT_OBJS $<TARGET_OBJECTS:p10_kernel_default_${KERNEL_NAME}>)
-        list(APPEND TP_CPU_KERNEL_AVX2_OBJS $<TARGET_OBJECTS:p10_kernel_avx2_${KERNEL_NAME}>)
-        if(TP_CXX_AVX512_FOUND)
-            add_library(p10_kernel_avx512_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
-            set_target_properties(p10_kernel_avx512_${KERNEL_NAME} PROPERTIES
-                POSITION_INDEPENDENT_CODE ON)
-            if(MSVC)
-                target_compile_options(p10_kernel_avx512_${KERNEL_NAME} PRIVATE /bigobj)
-            endif()
-            target_compile_definitions(p10_kernel_avx512_${KERNEL_NAME} PRIVATE
-                P10_EXPORTS CPU_CAPABILITY_AVX512 CPU_CAPABILITY=AVX512 HAVE_AVX512_CPU_DEFINITION HAVE_AVX2_CPU_DEFINITION)
-            # Same flag set as the AVX512 capability entry.
-            target_compile_options(p10_kernel_avx512_${KERNEL_NAME} PRIVATE
-                ${TP_AVX512_TIER_FLAGS})
-            if(KERNEL_NAME STREQUAL "ComplexKernels")
-                target_compile_definitions(p10_kernel_avx512_${KERNEL_NAME} PRIVATE
-                    TP_COMPLEX_KERNELS_NO_DISPATCH_DEFINITION)
-            endif()
-            target_include_directories(p10_kernel_avx512_${KERNEL_NAME} PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
-            target_compile_definitions(p10_kernel_avx512_${KERNEL_NAME} PRIVATE
-                ${BLAS_COMPILE_DEFS})
-            add_dependencies(p10_kernel_avx512_${KERNEL_NAME} generate_code)
-            list(APPEND TP_CPU_KERNEL_AVX512_OBJS $<TARGET_OBJECTS:p10_kernel_avx512_${KERNEL_NAME}>)
-        endif()
     endforeach()
-    list(APPEND P10_SOURCES ${TP_CPU_KERNEL_DEFAULT_OBJS} ${TP_CPU_KERNEL_AVX2_OBJS})
+    list(APPEND P10_SOURCES ${TP_CPU_KERNEL_DEFAULT_OBJS})
+    # Linked after all baseline code; see Note [Linking ISA-tier kernel copies].
+    tp_add_cpu_kernel_isa_tier(AVX2 ${TP_AVX2_TIER_FLAGS})
     if(TP_CXX_AVX512_FOUND)
-        list(APPEND P10_SOURCES ${TP_CPU_KERNEL_AVX512_OBJS})
+        # Same flag set as the AVX512 capability entry.
+        tp_add_cpu_kernel_isa_tier(AVX512 ${TP_AVX512_TIER_FLAGS})
     endif()
 elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(powerpc|ppc)64")
     # PowerPC: one DEFAULT copy plus one VSX copy. VSX is a baseline feature
@@ -702,28 +698,11 @@ elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(powerpc|ppc)64")
         endif()
         add_dependencies(p10_kernel_default_${KERNEL_NAME} generate_code)
         list(APPEND TP_CPU_KERNEL_DEFAULT_OBJS $<TARGET_OBJECTS:p10_kernel_default_${KERNEL_NAME}>)
-        if(TP_CXX_VSX_FOUND)
-            add_library(p10_kernel_vsx_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
-            set_target_properties(p10_kernel_vsx_${KERNEL_NAME} PROPERTIES
-                POSITION_INDEPENDENT_CODE ON)
-            target_compile_definitions(p10_kernel_vsx_${KERNEL_NAME} PRIVATE
-                P10_EXPORTS CPU_CAPABILITY_VSX CPU_CAPABILITY=VSX HAVE_VSX_CPU_DEFINITION)
-            target_compile_options(p10_kernel_vsx_${KERNEL_NAME} PRIVATE ${TP_CXX_VSX_FLAGS})
-            if(KERNEL_NAME STREQUAL "ComplexKernels")
-                target_compile_definitions(p10_kernel_vsx_${KERNEL_NAME} PRIVATE
-                    TP_COMPLEX_KERNELS_NO_DISPATCH_DEFINITION)
-            endif()
-            target_include_directories(p10_kernel_vsx_${KERNEL_NAME} PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
-            target_compile_definitions(p10_kernel_vsx_${KERNEL_NAME} PRIVATE
-                ${BLAS_COMPILE_DEFS})
-            add_dependencies(p10_kernel_vsx_${KERNEL_NAME} generate_code)
-            list(APPEND TP_CPU_KERNEL_VSX_OBJS $<TARGET_OBJECTS:p10_kernel_vsx_${KERNEL_NAME}>)
-        endif()
     endforeach()
     list(APPEND P10_SOURCES ${TP_CPU_KERNEL_DEFAULT_OBJS})
     if(TP_CXX_VSX_FOUND)
-        list(APPEND P10_SOURCES ${TP_CPU_KERNEL_VSX_OBJS})
+        # Linked after all baseline code; see Note [Linking ISA-tier kernel copies].
+        tp_add_cpu_kernel_isa_tier(VSX ${TP_CXX_VSX_FLAGS})
     endif()
 elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "s390x|S390")
     # s390x: one DEFAULT copy plus one ZVECTOR copy (the vector extension).
@@ -749,28 +728,11 @@ elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "s390x|S390")
         endif()
         add_dependencies(p10_kernel_default_${KERNEL_NAME} generate_code)
         list(APPEND TP_CPU_KERNEL_DEFAULT_OBJS $<TARGET_OBJECTS:p10_kernel_default_${KERNEL_NAME}>)
-        if(TP_CXX_ZVECTOR_FOUND)
-            add_library(p10_kernel_zvector_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
-            set_target_properties(p10_kernel_zvector_${KERNEL_NAME} PROPERTIES
-                POSITION_INDEPENDENT_CODE ON)
-            target_compile_definitions(p10_kernel_zvector_${KERNEL_NAME} PRIVATE
-                P10_EXPORTS CPU_CAPABILITY_ZVECTOR CPU_CAPABILITY=ZVECTOR HAVE_ZVECTOR_CPU_DEFINITION)
-            target_compile_options(p10_kernel_zvector_${KERNEL_NAME} PRIVATE ${TP_CXX_ZVECTOR_FLAGS})
-            if(KERNEL_NAME STREQUAL "ComplexKernels")
-                target_compile_definitions(p10_kernel_zvector_${KERNEL_NAME} PRIVATE
-                    TP_COMPLEX_KERNELS_NO_DISPATCH_DEFINITION)
-            endif()
-            target_include_directories(p10_kernel_zvector_${KERNEL_NAME} PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
-            target_compile_definitions(p10_kernel_zvector_${KERNEL_NAME} PRIVATE
-                ${BLAS_COMPILE_DEFS})
-            add_dependencies(p10_kernel_zvector_${KERNEL_NAME} generate_code)
-            list(APPEND TP_CPU_KERNEL_ZVECTOR_OBJS $<TARGET_OBJECTS:p10_kernel_zvector_${KERNEL_NAME}>)
-        endif()
     endforeach()
     list(APPEND P10_SOURCES ${TP_CPU_KERNEL_DEFAULT_OBJS})
     if(TP_CXX_ZVECTOR_FOUND)
-        list(APPEND P10_SOURCES ${TP_CPU_KERNEL_ZVECTOR_OBJS})
+        # Linked after all baseline code; see Note [Linking ISA-tier kernel copies].
+        tp_add_cpu_kernel_isa_tier(ZVECTOR ${TP_CXX_ZVECTOR_FLAGS})
     endif()
 elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
     # aarch64: one DEFAULT copy plus SVE256/SVE128 copies compiled against
@@ -805,32 +767,13 @@ elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
         endif()
         add_dependencies(p10_kernel_default_${KERNEL_NAME} generate_code)
         list(APPEND TP_CPU_KERNEL_DEFAULT_OBJS $<TARGET_OBJECTS:p10_kernel_default_${KERNEL_NAME}>)
-        if(TP_CXX_SVE256_FOUND)
-            foreach(SVE_VL 256 128)
-                add_library(p10_kernel_sve${SVE_VL}_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
-                set_target_properties(p10_kernel_sve${SVE_VL}_${KERNEL_NAME} PROPERTIES
-                    POSITION_INDEPENDENT_CODE ON)
-                target_compile_definitions(p10_kernel_sve${SVE_VL}_${KERNEL_NAME} PRIVATE
-                    P10_EXPORTS CPU_CAPABILITY_SVE${SVE_VL} CPU_CAPABILITY=SVE${SVE_VL}
-                    HAVE_SVE_CPU_DEFINITION)
-                target_compile_options(p10_kernel_sve${SVE_VL}_${KERNEL_NAME} PRIVATE
-                    ${TP_CXX_SVE${SVE_VL}_FLAGS})
-                if(KERNEL_NAME STREQUAL "ComplexKernels")
-                    target_compile_definitions(p10_kernel_sve${SVE_VL}_${KERNEL_NAME} PRIVATE
-                        TP_COMPLEX_KERNELS_NO_DISPATCH_DEFINITION)
-                endif()
-                target_include_directories(p10_kernel_sve${SVE_VL}_${KERNEL_NAME} PRIVATE
-                    ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
-                target_compile_definitions(p10_kernel_sve${SVE_VL}_${KERNEL_NAME} PRIVATE
-                    ${BLAS_COMPILE_DEFS})
-                add_dependencies(p10_kernel_sve${SVE_VL}_${KERNEL_NAME} generate_code)
-                list(APPEND TP_CPU_KERNEL_SVE${SVE_VL}_OBJS $<TARGET_OBJECTS:p10_kernel_sve${SVE_VL}_${KERNEL_NAME}>)
-            endforeach()
-        endif()
     endforeach()
     list(APPEND P10_SOURCES ${TP_CPU_KERNEL_DEFAULT_OBJS})
     if(TP_CXX_SVE256_FOUND)
-        list(APPEND P10_SOURCES ${TP_CPU_KERNEL_SVE256_OBJS} ${TP_CPU_KERNEL_SVE128_OBJS})
+        # Linked after all baseline code; see Note [Linking ISA-tier kernel copies].
+        foreach(SVE_VL 128 256)
+            tp_add_cpu_kernel_isa_tier(SVE${SVE_VL} ${TP_CXX_SVE${SVE_VL}_FLAGS})
+        endforeach()
     endif()
 elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
     # riscv64: one DEFAULT copy plus RVVM2/RVVM1 copies compiled against
@@ -858,53 +801,15 @@ elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
         endif()
         add_dependencies(p10_kernel_default_${KERNEL_NAME} generate_code)
         list(APPEND TP_CPU_KERNEL_DEFAULT_OBJS $<TARGET_OBJECTS:p10_kernel_default_${KERNEL_NAME}>)
-        if(TP_CXX_RVVM2_FOUND)
-            foreach(RVV_VL 256 128)
-                add_library(p10_kernel_rvvm${RVV_VL}_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
-                set_target_properties(p10_kernel_rvvm${RVV_VL}_${KERNEL_NAME} PROPERTIES
-                    POSITION_INDEPENDENT_CODE ON)
-                target_compile_definitions(p10_kernel_rvvm${RVV_VL}_${KERNEL_NAME} PRIVATE
-                    P10_EXPORTS CPU_CAPABILITY_RVVM${RVV_VL} CPU_CAPABILITY=RVVM${RVV_VL}
-                    HAVE_RVV_CPU_DEFINITION)
-                target_compile_options(p10_kernel_rvvm${RVV_VL}_${KERNEL_NAME} PRIVATE
-                    ${TP_CXX_RVVM${RVV_VL}_FLAGS})
-                if(KERNEL_NAME STREQUAL "ComplexKernels")
-                    target_compile_definitions(p10_kernel_rvvm${RVV_VL}_${KERNEL_NAME} PRIVATE
-                        TP_COMPLEX_KERNELS_NO_DISPATCH_DEFINITION)
-                endif()
-                target_include_directories(p10_kernel_rvvm${RVV_VL}_${KERNEL_NAME} PRIVATE
-                    ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
-                target_compile_definitions(p10_kernel_rvvm${RVV_VL}_${KERNEL_NAME} PRIVATE
-                    ${BLAS_COMPILE_DEFS})
-                add_dependencies(p10_kernel_rvvm${RVV_VL}_${KERNEL_NAME} generate_code)
-                list(APPEND TP_CPU_KERNEL_RVVM${RVV_VL}_OBJS $<TARGET_OBJECTS:p10_kernel_rvvm${RVV_VL}_${KERNEL_NAME}>)
-            endforeach()
-        elseif(TP_CXX_RVVM1_FOUND)
-            add_library(p10_kernel_rvvm128_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
-            set_target_properties(p10_kernel_rvvm128_${KERNEL_NAME} PROPERTIES
-                POSITION_INDEPENDENT_CODE ON)
-            target_compile_definitions(p10_kernel_rvvm128_${KERNEL_NAME} PRIVATE
-                P10_EXPORTS CPU_CAPABILITY_RVVM1 CPU_CAPABILITY=RVVM1
-                HAVE_RVV_CPU_DEFINITION)
-            target_compile_options(p10_kernel_rvvm128_${KERNEL_NAME} PRIVATE
-                ${TP_CXX_RVVM1_FLAGS})
-            if(KERNEL_NAME STREQUAL "ComplexKernels")
-                target_compile_definitions(p10_kernel_rvvm128_${KERNEL_NAME} PRIVATE
-                    TP_COMPLEX_KERNELS_NO_DISPATCH_DEFINITION)
-            endif()
-            target_include_directories(p10_kernel_rvvm128_${KERNEL_NAME} PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
-            target_compile_definitions(p10_kernel_rvvm128_${KERNEL_NAME} PRIVATE
-                ${BLAS_COMPILE_DEFS})
-            add_dependencies(p10_kernel_rvvm128_${KERNEL_NAME} generate_code)
-            list(APPEND TP_CPU_KERNEL_RVVM128_OBJS $<TARGET_OBJECTS:p10_kernel_rvvm128_${KERNEL_NAME}>)
-        endif()
     endforeach()
     list(APPEND P10_SOURCES ${TP_CPU_KERNEL_DEFAULT_OBJS})
+    # Linked after all baseline code; see Note [Linking ISA-tier kernel copies].
     if(TP_CXX_RVVM2_FOUND)
-        list(APPEND P10_SOURCES ${TP_CPU_KERNEL_RVVM256_OBJS} ${TP_CPU_KERNEL_RVVM128_OBJS})
+        foreach(RVV_VL 128 256)
+            tp_add_cpu_kernel_isa_tier(RVVM${RVV_VL} ${TP_CXX_RVVM${RVV_VL}_FLAGS})
+        endforeach()
     elseif(TP_CXX_RVVM1_FOUND)
-        list(APPEND P10_SOURCES ${TP_CPU_KERNEL_RVVM128_OBJS})
+        tp_add_cpu_kernel_isa_tier(RVVM1 ${TP_CXX_RVVM1_FLAGS})
     endif()
 else()
     # Targets without the x86 ISA tiers still need one copy of each kernel, or
@@ -934,6 +839,15 @@ else()
     endforeach()
 endif()
 add_library(p10 ${P10_SOURCES})
+# The ISA-tier copies join last, after the sources other directories add to
+# p10 (tpx); see Note [Linking ISA-tier kernel copies].
+if(CMAKE_VERSION VERSION_LESS 3.19)
+    # No deferred calls: the tiers still follow every p10 source here.
+    tp_p10_append_isa_tier_sources()
+else()
+    cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"
+        CALL tp_p10_append_isa_tier_sources)
+endif()
 # Enable UNITY_BUILD for faster compilation
 set_target_properties(p10 PROPERTIES UNITY_BUILD OFF)
 if(MSVC)
