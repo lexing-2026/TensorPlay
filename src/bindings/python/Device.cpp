@@ -627,10 +627,10 @@ void init_device(py::module_& m) {
         out["popcnt"] = __builtin_cpu_supports("popcnt") != 0;
 #elif defined(__aarch64__)
         out["neon"] = true;
-        const bool sve_bf16 = tensorplay::cpu::tp_cpu_has_arm_sve_bf16();
+        const bool sve_bf16 = tp_cpu_has_arm_sve_bf16();
         out["sve"] = sve_bf16;
         out["sve_bf16"] = sve_bf16;
-        const int sve_bits = tensorplay::cpu::tp_cpu_sve_vector_length_bits();
+        const int sve_bits = tp_cpu_sve_vector_length_bits();
         if (sve_bits > 0) {
             out["sve_max_length"] = sve_bits;
         }
