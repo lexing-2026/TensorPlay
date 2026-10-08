@@ -73,3 +73,12 @@ def test_insert_deferred_runtime_asserts_removes_unused_range_constraints():
 
     assert range_node not in graph_module.graph.nodes
     graph_module.graph.lint()
+
+
+def test_symbolic_inequality_stays_symbolic():
+    _, symbol, value, _, _ = _symbolic_placeholder()
+
+    unequal = value != 1
+
+    assert not isinstance(unequal, bool)
+    assert unequal.expr == sympy.Ne(symbol, 1)

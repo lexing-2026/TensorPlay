@@ -177,6 +177,11 @@ class SymNode:
             return self.eq(other)
         return self.eq(other)
 
+    def __ne__(self, other: object) -> bool:
+        # Without it Python negates ``__eq__`` through ``bool()``, deciding the
+        # comparison on the spot instead of keeping it symbolic.
+        return self.ne(other)
+
     def __bool__(self) -> bool:
         return bool(self.guard_bool())
 
