@@ -374,7 +374,9 @@ class Proxy:
     exits, and a missing sample raises like ``FakeItemVariable``.
     """
 
-    __slots__ = ("node", "tracer", "__dict__")
+    # Weak references let a module keep track of the parameters it was last
+    # run with (an RNN's flat weights) when a trace hands it proxies instead.
+    __slots__ = ("node", "tracer", "__dict__", "__weakref__")
 
     def __init__(self, node: Node, tracer: Any = None) -> None:
         if tracer is None:

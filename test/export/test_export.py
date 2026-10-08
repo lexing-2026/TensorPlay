@@ -461,6 +461,37 @@ def test_capture_leaves_inputs_state_and_generators_alone():
     assert tp.random.get_rng_state().tolist() == state.tolist()
 
 
+@pytest.mark.parametrize(
+    "make",
+    [
+        lambda: tp.nn.LSTM(4, 6, batch_first=True),
+        lambda: tp.nn.LSTM(4, 6, num_layers=2, bidirectional=True, proj_size=3),
+        lambda: tp.nn.GRU(4, 6, batch_first=True),
+        lambda: tp.nn.RNN(4, 6, num_layers=2),
+    ],
+)
+def test_recurrent_modules_export_with_a_dynamic_batch(make):
+    # The modules hold weak references to the weights they last ran with,
+    # which a trace hands them as proxies.
+    class M(tp.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rnn = make()
+
+        def forward(self, x):
+            return self.rnn(x)[0]
+
+    model = M().eval()
+    axis = 0 if model.rnn.batch_first else 1
+    shape = [5, 5, 4]
+    shape[axis] = 2
+    program = tp_export.export(model, tp.randn(*shape), dynamic_shapes={"x": {axis: tp_export.Dim("batch")}})
+    shape[axis] = 3
+    x = tp.randn(*shape)
+    with tp.no_grad():
+        assert program(x).tolist() == model(x).tolist()
+
+
 def test_refine_dynamic_shapes_from_suggested_fixes():
     spec = {"x": {0: tp_export.Dim("dx"), 1: tp_export.Dim("dy")}}
     refined = tp_export.refine_dynamic_shapes_from_suggested_fixes(
