@@ -128,6 +128,48 @@ def test_tracer_without_samples_keeps_symbolic_shape():
     assert "sample_inputs" not in gm.meta
 
 
+def test_assert_raises_eagerly_and_is_recorded_by_symbolic_trace():
+    tp._assert(True, "unused")
+    with pytest.raises(AssertionError, match="zero"):
+        tp._assert(tp.tensor(0.0), "zero")
+
+    def fn(x):
+        tp._assert(x.dim() == 2, "rank two")
+        return x * 2
+
+    gm = tp.graph.symbolic_trace(fn)
+    assert tp._assert in [n.target for n in gm.graph.nodes]
+    assert gm(tp.ones(1, 2)).tolist() == [[2.0, 2.0]]
+    with pytest.raises(AssertionError, match="rank two"):
+        gm(tp.ones(2))
+
+
+def _checked(x):
+    tp._assert((x > 0).all(), "positive")
+    return x.log()
+
+
+def _checked_async(x):
+    tp._assert_async((x > 0).all())
+    return x.log()
+
+
+@pytest.mark.parametrize(
+    ("fn", "message"),
+    [(_checked, "positive"), (_checked_async, "single nonzero value")],
+)
+def test_compiled_checks_on_values_run_with_the_program(fn, message):
+    compiled = tp.compile(fn, fullgraph=True)
+    assert compiled(tp.ones(3)).tolist() == [0.0, 0.0, 0.0]
+    with pytest.raises(RuntimeError, match=message):
+        compiled(-tp.ones(3))
+
+
+def test_compiled_assert_fails_on_its_first_call_like_python():
+    with pytest.raises(AssertionError, match="positive"):
+        tp.compile(_checked, fullgraph=True)(-tp.ones(3))
+
+
 def test_compiler_gate_keeps_scalar_symbolic():
     """UPV-native path: gate() values flow as tensor proxies; one spec."""
 

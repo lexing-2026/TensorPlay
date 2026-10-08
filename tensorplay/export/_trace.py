@@ -215,6 +215,29 @@ class ExportTracer(Tracer):
             return value
         return None
 
+    def evaluate_call(
+        self, function: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> Any:
+        """Settle a call at capture instead of recording it, else ``NotImplemented``.
+
+        An assertion on sizes is a gate like ``if``: decided from the
+        example and kept as a condition the program was captured under.
+        One on tensor data cannot be decided here and stays in the program.
+        """
+
+        import tensorplay
+
+        if function is not tensorplay._assert:
+            return NotImplemented
+        bound = dict(zip(("condition", "message"), args), **kwargs)
+        condition = bound.get("condition")
+        decided = self.symbolic_gate(condition, "bool") if isinstance(condition, Proxy) else None
+        if decided is None:
+            return NotImplemented
+        if not decided:
+            raise AssertionError(bound.get("message"))
+        return None
+
     def iter(self, proxy: Proxy) -> Any:
         """Iterate a computed sequence, or a tensor along its first extent."""
 

@@ -274,6 +274,28 @@ def test_guard_on_a_named_dimension_suggests_the_fix():
             _export_fn(fixes, tp.randn(6, 3), spec)
 
 
+def test_assertions_on_sizes_are_guards_and_on_values_checks():
+    def sized(x):
+        tp._assert(x.shape[0] == 4, "four rows")
+        return x + 1
+
+    with pytest.raises(tp_export.ConstraintsExceededError, match="batch = 4"):
+        _export_fn(sized, tp.randn(4, 3), {"x": {0: tp_export.Dim("batch")}})
+    program = _export_fn(sized, tp.randn(4, 3), {"x": {0: tp_export.Dim.AUTO}})
+    assert tp._assert not in [node.target for node in program.graph_module.graph.nodes]
+    with pytest.raises(RuntimeError, match="captured under x.size\\(\\)\\[0\\] == 4"):
+        program(tp.randn(5, 3))
+
+    def valued(x):
+        tp._assert((x > 0).all(), "positive")
+        return x.log()
+
+    program = _export_fn(valued, tp.rand(4, 3) + 0.5, {"x": {0: tp_export.Dim("batch")}})
+    assert program(tp.ones(6, 3)).shape == (6, 3)
+    with pytest.raises(AssertionError, match="positive"):
+        program(-tp.ones(6, 3))
+
+
 def test_guard_excluding_size_one_is_asserted_at_runtime():
     program = _export_fn(
         lambda x: x * 2 if x.shape[0] != 1 else x,

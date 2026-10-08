@@ -1043,6 +1043,20 @@ class TestShapeReads:
         with pytest.raises(ValueError, match="'x' axis 0"):
             onnx_export(program, input_names=["x"], dynamic_axes={"x": {0: "batch"}})
 
+    def test_value_checks_do_not_become_onnx_nodes(self):
+        def fn(x):
+            tp._assert((x > 0).all(), "positive")
+            return x.log()
+
+        module = _as_module(fn)
+        model = onnx_export(
+            (module, tp.rand(2, 3) + 0.5),
+            input_names=["x"],
+            dynamic_axes={"x": {0: "batch"}},
+            verify=True,
+        )
+        assert [node.op_type for node in model.graph.node] == ["Log"]
+
 
 class TestUnsupported:
     def test_unknown_operator_names_the_target(self):

@@ -421,6 +421,33 @@ class Tracer:
             self._execute_node(proxy.node)
         return proxy
 
+    def evaluate_call(
+        self, function: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]
+    ) -> Any:
+        """Record a call as something other than itself, else ``NotImplemented``.
+
+        An assertion on a tensor this trace runs is about values the program
+        computes, so it can only be answered when the program runs.  It is
+        kept as the check every backend carries out, message and all; asking
+        it in Python here would answer it once, for the example.
+        """
+
+        import tensorplay
+
+        if function is not tensorplay._assert:
+            return NotImplemented
+        bound = dict(zip(("condition", "message"), args), **kwargs)
+        condition = bound.get("condition")
+        sample = condition.sample if isinstance(condition, Proxy) else None
+        if not isinstance(sample, tensorplay.Tensor):
+            return NotImplemented
+        if not sample:
+            raise AssertionError(bound.get("message"))
+        check = tensorplay.ops.tp._assert_async.msg
+        return self.create_proxy(
+            "call_function", check, (condition, str(bound.get("message"))), {}
+        )
+
     @staticmethod
     def _makes_a_settled_tensor(node: Node) -> bool:
         """Whether ``node`` is a factory call fixed by its arguments alone.

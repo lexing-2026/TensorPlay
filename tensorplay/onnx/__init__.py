@@ -19,6 +19,8 @@ from typing import Any, Mapping, Sequence
 
 from onnx import TensorProto, checker, helper, numpy_helper, shape_inference
 
+import tensorplay as tp
+
 from ..export import ExportedProgram, export as tp_export
 from ..export.dynamic_shapes import _DimHint, _DimHintType
 from ..graph._utils import _iter_nodes
@@ -564,18 +566,18 @@ _RUNTIME_CHECKS = frozenset(
 
 
 def _runtime_checks(graph: Any) -> set[Any]:
-    """The program's runtime checks of its sizes, and what only they consume.
+    """The program's runtime checks, and what only they consume.
 
     The checks guard eager runs of the program; an ONNX model declares its
-    dimensions instead, so neither they nor the size arithmetic feeding them
-    become ONNX nodes.
+    dimensions instead, and ONNX has no operator that fails a run, so
+    neither they nor the computation feeding them become ONNX nodes.
     """
 
     checks: set[Any] = set()
     for node in reversed(list(graph.nodes)):
         if node.op not in ("call_function", "call_method"):
             continue
-        is_check = (
+        is_check = node.target is tp._assert or (
             getattr(node.target, "__module__", None) == "tensorplay.export._trace"
             and getattr(node.target, "__name__", None) in _RUNTIME_CHECKS
         )

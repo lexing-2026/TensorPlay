@@ -631,12 +631,52 @@ def unique(input, sorted=True, return_inverse=False, return_counts=False):
         return values, inverse
     return values
 
+
+def _assert(condition: object, message: object) -> None:
+    r"""Python's ``assert`` as a call, so graph capture can record it."""
+    if type(condition) is not Tensor and overrides.has_tensorplay_function(
+        (condition,)
+    ):
+        return overrides.handle_tensorplay_function(
+            _assert, (condition,), condition, message
+        )
+    if not condition:
+        raise AssertionError(message)
+
 from ._shape_funcs import *
 from ._composite_funcs import *
 from ._einsum import einsum
 from .utils.comparison import allclose
 
 from ._ops import ops as ops
+
+
+def _register_checks() -> None:
+    """Keep checks in captured graphs although nothing reads their result."""
+
+    from . import functional
+    from .graph.node import _side_effectful_targets
+
+    native = ops.tp
+    _side_effectful_targets.update({
+        _assert,
+        functional._assert_async,
+        functional._assert_scalar,
+        functional._assert_tensor_metadata,
+        functional.sym_constrain_range,
+        functional.sym_constrain_range_for_size,
+        native._assert_async.default,
+        native._assert_async.msg,
+        native._assert_scalar.default,
+        native._assert_tensor_metadata.default,
+        native.sym_constrain_range.default,
+        native.sym_constrain_range_for_size.default,
+    })
+
+
+_register_checks()
+del _register_checks
+
 from . import _stax
 from .compiler._core import compile
 from . import compiler
@@ -1512,9 +1552,17 @@ else:
         "vision",
     }
 
-    # Public single names that live inside a lazily loaded module.
+    # Public single names that live inside a lazily loaded module.  The
+    # structural control flow operators land here: their modules reach back
+    # into the package surface through the graph and nn layers, and the
+    # symbolic-shape layer they build on pulls in sympy, which is by far the
+    # most expensive import in the package.  Nothing outside this file
+    # touches the operators during initialization, so first use pays for
+    # them.
     _lazy_attrs = {
         "vmap": ("func", "vmap"),
+        "cond": ("_higher_order_ops", "cond"),
+        "while_loop": ("_higher_order_ops", "while_loop"),
         "OutOfMemoryError": ("cuda", "OutOfMemoryError"),
     }
 
@@ -1524,7 +1572,11 @@ else:
             return importlib.import_module(f".{name}", __name__)
         if name in _lazy_attrs:
             module, attr = _lazy_attrs[name]
-            return getattr(importlib.import_module(f".{module}", __name__), attr)
+            value = getattr(importlib.import_module(f".{module}", __name__), attr)
+            # Bind into the package globals so the eager operators cost a
+            # dict lookup per call rather than an import machinery round trip.
+            globals()[name] = value
+            return value
         raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
@@ -1706,6 +1758,9 @@ _polish_public_surface()
 
 
 # Structural control flow operators; map and scan stay under
-# tensorplay._higher_order_ops.  Imported last: the operator modules reach
-# back into the package surface through the graph and nn layers.
-from tensorplay._higher_order_ops import cond as cond, while_loop as while_loop
+# tensorplay._higher_order_ops.  ``cond`` and ``while_loop`` bind through the
+# package ``__getattr__`` above rather than an import here: the operator
+# modules reach back into the package surface through the graph and nn layers,
+# so binding them during initialization both closes that cycle and forces the
+# symbolic-shape machinery (and sympy with it) into every session that never
+# runs a control flow operator.

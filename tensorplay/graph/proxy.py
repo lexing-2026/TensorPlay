@@ -824,6 +824,11 @@ class Proxy:
         if len(tracers) != 1:
             raise TraceError("a graph operation cannot combine different tracers")
         tracer = tracers[0]
+        evaluate = getattr(tracer, "evaluate_call", None)
+        if evaluate is not None:
+            result = evaluate(function, args, kwargs)
+            if result is not NotImplemented:
+                return result
         method_name = getattr(function, "__name__", None)
         if getattr(function, "__tensorplay_method__", False) and method_name:
             return tracer.create_proxy("call_method", method_name, args, kwargs)
