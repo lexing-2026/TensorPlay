@@ -64,8 +64,9 @@ class PullRequestForbidden(SubmoduleUpdateError):
         "Note that a pull request opened by the workflow token does not "
         "trigger repository workflows, so add a token with pull-request "
         "write access there as well if the bump PRs should run the "
-        "lint and smoke-build gates. The bump branches already pushed stay "
-        "on the remote and are picked up by the next run."
+        "lint and smoke-build gates. Bump branches pushed by a run that hit "
+        "this refusal are not lost: the next run finds each one already at "
+        "its target commit and opens the missing pull request."
     )
 
 
@@ -234,7 +235,15 @@ def bump_submodule(sm: Submodule, base_branch: str, dry_run: bool) -> str:
         raise
     proc = run(["git", "diff", "--cached", "--quiet"])
     if proc.returncode == 0:
-        return "no change (already at target)"
+        # The bump already sits in this branch, so there is nothing to commit
+        # and push.  When the branch came from the remote it was pushed by an
+        # earlier run whose pull request could not be opened; reconcile that
+        # pull request now instead of reporting success and leaving the
+        # branch on the remote with nothing pointing at it.
+        git("checkout", base_branch)
+        if not exists:
+            return "no change (already at target)"
+        return ensure_pr(branch, title, pr_body(sm), base_branch)
     git("-c", f"user.name={GIT_USER_NAME}", "-c", f"user.email={GIT_USER_EMAIL}",
         "commit", "-m", title)
     git("push", "-u", "origin", branch)
