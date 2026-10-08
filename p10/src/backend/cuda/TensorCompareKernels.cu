@@ -9,7 +9,6 @@
 
 #include <cuda_runtime.h>
 #include <algorithm>
-#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -40,11 +39,14 @@ struct AssertMessage {
     char text[kAssertMessageCapacity];
 };
 
+// A failed check faults the launch rather than calling assert(), which a
+// release build compiles out: the check would print its message and let the
+// program carry on.  The fault surfaces at the next synchronisation.
 template <typename T>
 __global__ void assert_async_kernel_impl(const T* input, AssertMessage message) {
     if (input[0] == static_cast<T>(0)) {
         printf("%s\n", message.text);
-        assert(false);
+        __trap();
     }
 }
 
@@ -54,7 +56,7 @@ __global__ void assert_async_complex_kernel_impl(
     if (static_cast<float>(input[0].real()) == 0.0f &&
         static_cast<float>(input[0].imag()) == 0.0f) {
         printf("%s\n", message.text);
-        assert(false);
+        __trap();
     }
 }
 
