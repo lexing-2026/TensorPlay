@@ -1,6 +1,8 @@
-#if defined(USE_CUDNN) && __has_include(<cudnn_frontend.h>)
+#if defined(USE_CUDNN) && __has_include(<cudnn_frontend.h>) && \
+    __has_include(<cudnn_frontend_find_plan.h>)
 #define TP_HAS_CUDNN_FRONTEND 1
 #include <cudnn_frontend.h>
+#include <cudnn_frontend_find_plan.h>
 namespace fe = cudnn_frontend;
 #endif
 #include "cudnn/ConvShared.h"
@@ -25,7 +27,6 @@ namespace fe = cudnn_frontend;
 #include <cstdint>
 #include <optional>
 #include <algorithm>
-#include <cudnn_frontend_find_plan.h>
 
 namespace tensorplay {
 namespace cuda {
