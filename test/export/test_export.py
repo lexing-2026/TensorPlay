@@ -277,6 +277,21 @@ def test_exported_program_state_and_parameters():
     assert isinstance(next(program.parameters()), tp.nn.Parameter)
 
 
+def test_rank_and_count_of_a_computed_value_run_in_the_program():
+    # Only inputs carry example values during capture, so these reads on an
+    # intermediate are recorded; they must record the count, not the method.
+    class M(tp.nn.Module):
+        def forward(self, x):
+            y = tp.relu(x)
+            return y * y.dim() + y.numel() + y.ndim
+
+    model = M()
+    x = tp.randn(2, 3, 4)
+    program = tp_export.export(model, x)
+    assert program(x).tolist() == model(x).tolist()
+    assert program.module()(tp.randn(5, 3, 4)).shape == (5, 3, 4)
+
+
 def test_call_exported_matches_eager():
     model = MLP()
     x = tp.randn(2, 4)

@@ -590,7 +590,9 @@ class Proxy:
         sample = self._sample()
         if sample is not None:
             return sample.dim()
-        return self._property("dim")
+        # Read as the attribute, not the method: a recorded read of ``dim``
+        # would hand the program the bound method instead of the count.
+        return self._property("ndim")
 
     def numel(self) -> Any:
         """How many values this value stands for."""
@@ -598,7 +600,11 @@ class Proxy:
         sample = self._sample()
         if sample is not None:
             return sample.numel()
-        return self._property("numel")
+        self.tracer.metadata_touches.add((self.node.name, "numel"))
+        val = (getattr(self.node, "meta", None) or {}).get("val")
+        if val is not None:
+            return val.numel()
+        return self.tracer.create_proxy("call_method", "numel", (self,), {})
 
     @property
     def ndim(self) -> Any:
@@ -611,10 +617,6 @@ class Proxy:
     @property
     def device(self) -> "Proxy":
         return self._property("device")
-
-    @property
-    def ndim(self) -> "Proxy":
-        return self._property("ndim")
 
     @property
     def requires_grad(self) -> "Proxy":
