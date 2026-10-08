@@ -204,9 +204,10 @@ elif sys.platform.startswith('linux'):
     def _preload_cuda_deps(err=None):
         if err is not None:
             message = str(err)
-            cuda_error = any(
+            # The package later rebinds any() to the tensor reduction.
+            cuda_error = builtins.any(
                 token in message
-                for token in ('libcud', 'libcublas', 'libcurand', 'libnvrtc')
+                for token in ('libcud', 'libcublas', 'libcurand', 'libnvrtc', 'libnvjpeg')
             )
             if not cuda_error:
                 raise err
@@ -219,6 +220,9 @@ elif sys.platform.startswith('linux'):
             ('cuda_nvrtc', 'libnvrtc.so.*[0-9]', False),
             ('cuda_runtime', 'libcudart.so.*[0-9]', True),
             ('curand', 'libcurand.so.*[0-9]', True),
+            # The image IO bindings link nvjpeg; a toolkit without it
+            # surfaces the honest missing-soname error on the retry.
+            ('nvjpeg', 'libnvjpeg.so.*[0-9]', False),
         ):
             _preload_cuda_lib(lib_folder, lib_name, required=required)
 
