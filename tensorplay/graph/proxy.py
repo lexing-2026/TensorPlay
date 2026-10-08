@@ -554,6 +554,12 @@ class Proxy:
                 return symbolic
         if sample is not None:
             return getattr(sample, name)
+        # A tracer that runs the program on an example knows the metadata of
+        # the values it computes as well as of its inputs.
+        hook = getattr(self.tracer, "known_metadata", None)
+        known = None if hook is None else hook(self, name)
+        if known is not None:
+            return known
         if name in ("shape", "size", "stride", "ndim", "dim", "numel", "nelement"):
             meta = getattr(self.node, "meta", None) or {}
             val = meta.get("val")

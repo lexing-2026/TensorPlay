@@ -83,15 +83,19 @@ def test_export_rejects_data_dependent_control_flow():
         tp_export.export(fn, tp.ones(3))
 
 
-def test_export_rejects_iteration_over_traced_value():
+def test_export_unrolls_iteration_over_a_fixed_extent():
     def fn(x):
         total = x
-        for chunk in x:
+        for chunk in x.relu():
             total = total + chunk
         return total
 
-    with pytest.raises(GraphCaptureError, match="iterat"):
-        tp_export.export(fn, tp.ones(3))
+    x = tp.randn(3, 2)
+    program = tp_export.export(fn, x)
+    assert program(x).tolist() == fn(x).tolist()
+    # Iterating along a dimension declared dynamic fixes it.
+    with pytest.raises(tp_export.ConstraintsExceededError, match="batch = 3"):
+        tp_export.export(fn, x, dynamic_shapes={"x": {0: tp_export.Dim("batch")}})
 
 
 def test_dynamic_shapes_validation_and_normalization():
@@ -310,6 +314,129 @@ def test_sequence_dynamic_shapes_name_the_forward_arguments():
     assert program.module()(input=tp.randn(7, 3)).shape == (7, 2)
     with pytest.raises(RuntimeError, match="runtime assertion failed"):
         program(tp.randn(1, 3))
+
+
+def test_computed_values_answer_metadata_like_eager_values():
+    def fn(x):
+        y = x.relu() @ x.t()
+        if y.shape[0] == y.shape[1] and y.dim() == 2 and y.dtype == x.dtype and y.is_floating_point():
+            return y.flatten() * y.numel()
+        return y
+
+    x = tp.randn(3, 2)
+    program = tp_export.export(fn, x)
+    assert program(x).tolist() == fn(x).tolist()
+
+
+_F = tp.nn.functional
+
+
+def _accumulated(x):
+    y = x.relu()
+    y += x
+    return y
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda x: x.relu().reshape(-1, 4),
+        lambda x: x.transpose(0, 1).flatten(1),
+        lambda x: x.unsqueeze(1).expand(-1, 3, -1, -1),
+        lambda x: tp.cat([x, x * 2], 0),
+        lambda x: tp.stack([x, x], 1),
+        lambda x: x.sum(1, keepdim=True) + x,
+        lambda x: x[:, 1:, ::2],
+        lambda x: x[1:],
+        lambda x: x @ x.transpose(1, 2),
+        lambda x: _F.conv1d(x, tp.ones(3, 6, 2)),
+        lambda x: _F.max_pool1d(x, 2),
+        lambda x: _F.interpolate(x, scale_factor=2),
+        lambda x: x.chunk(2, dim=1)[1],
+        lambda x: x.split([2, 4], dim=1)[1],
+        lambda x: _F.pad(x, (1, 1)),
+        lambda x: x.repeat(2, 1, 1),
+        lambda x: x.permute(2, 0, 1).contiguous().view(4, -1),
+        lambda x: tp.einsum("bij,bkj->bik", x, x),
+        lambda x: _F.scaled_dot_product_attention(x, x, x),
+        lambda x: x.max(dim=1).values,
+        lambda x: x.mean((1, 2)),
+        lambda x: x.unbind(1)[0],
+        lambda x: _F.linear(x, tp.ones(5, 4)),
+        lambda x: x.narrow(1, 1, 3),
+        lambda x: x.index_select(1, tp.tensor([0, 2])),
+        lambda x: tp.zeros(x.shape[0] * 2, 3),
+        _accumulated,
+    ],
+)
+def test_computed_extents_follow_a_dynamic_dimension(fn):
+    def decided(x):
+        y = fn(x)
+        # Every extent is decided on: a varying one is kept as a guard, and
+        # one export could not derive would refuse the decision.
+        return y * 2 if all(extent > 0 for extent in y.shape) else y
+
+    program = _export_fn(decided, tp.randn(4, 6, 4), {"x": {0: tp_export.Dim.AUTO}})
+    for batch in (3, 6):
+        x = tp.randn(batch, 6, 4)
+        assert program(x).tolist() == decided(x).tolist()
+
+
+def test_extents_sized_by_tensor_data_are_read_but_not_decided_on():
+    def reads(x):
+        found = (x > 0).nonzero()
+        return found.reshape(found.shape[0], -1).float() * found.shape[1]
+
+    program = tp_export.export(reads, tp.randn(4, 3))
+    x = tp.randn(5, 3)
+    assert program(x).tolist() == reads(x).tolist()
+
+    def decides(x):
+        found = (x > 0).nonzero()
+        return found * 2 if found.shape[0] > 1 else found
+
+    with pytest.raises(GraphCaptureError, match="values of a tensor"):
+        tp_export.export(decides, tp.randn(4, 3))
+
+
+def test_shape_rules_relate_the_dimensions_they_combine():
+    class Add(tp.nn.Module):
+        def forward(self, x, y):
+            return x + y
+
+    x, y = tp.randn(4, 3), tp.randn(4, 3)
+    named = {"x": {0: tp_export.Dim("a")}, "y": {0: tp_export.Dim("b")}}
+    with pytest.raises(tp_export.ConstraintsExceededError, match="a = b"):
+        tp_export.export(Add(), x, y, dynamic_shapes=named)
+
+    auto = {"x": {0: tp_export.Dim.AUTO}, "y": {0: tp_export.Dim.AUTO}}
+    program = tp_export.export(Add(), x, y, dynamic_shapes=auto)
+    assert program(tp.randn(6, 3), tp.randn(6, 3)).shape == (6, 3)
+    # Broadcasting would run, but the program was captured with equal sizes.
+    with pytest.raises(RuntimeError, match="runtime assertion failed"):
+        program(tp.randn(6, 3), tp.randn(1, 3))
+
+
+def test_capture_leaves_inputs_state_and_generators_alone():
+    class M(tp.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = tp.nn.BatchNorm1d(3)
+
+        def forward(self, x):
+            y = self.norm(x * 2)
+            y.add_(1)
+            return tp.nn.functional.dropout(y, 0.5, True)
+
+    model = M().train()
+    x = tp.randn(4, 3)
+    before = x.clone()
+    mean = model.norm.running_mean.clone()
+    state = tp.random.get_rng_state().clone()
+    tp_export.export(model, x)
+    assert x.tolist() == before.tolist()
+    assert model.norm.running_mean.tolist() == mean.tolist()
+    assert tp.random.get_rng_state().tolist() == state.tolist()
 
 
 def test_refine_dynamic_shapes_from_suggested_fixes():

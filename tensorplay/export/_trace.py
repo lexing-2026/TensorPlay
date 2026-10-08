@@ -21,6 +21,7 @@ from .graph_signature import (
 )
 
 if TYPE_CHECKING:
+    from ._example_run import ExampleRun
     from ._symbolic_dims import SymbolicDims
 
 __all__ = ["ExportTracer", "draft_export", "export", "export_for_training"]
@@ -78,6 +79,18 @@ def _resolve_attribute(root: Any, target: str) -> Any:
     return value
 
 
+def _forked_generators() -> Any:
+    """Restore every random generator in use when the block ends."""
+
+    import tensorplay as tp
+
+    devices: list[int] = []
+    cuda = getattr(tp, "cuda", None)
+    if cuda is not None and cuda.is_available() and cuda.is_initialized():
+        devices = list(range(cuda.device_count()))
+    return tp.random.fork_rng(devices=devices)
+
+
 class ExportTracer(Tracer):
     """Tracer that lifts module state into graph inputs.
 
@@ -108,65 +121,119 @@ class ExportTracer(Tracer):
         self._call_keys: set[tuple[Any, ...]] = set()
         #: The dimensions declared dynamic, sized by symbols during capture.
         self.symbolic_dims = symbolic_dims
-        # placeholder name -> the extents its shape reads hand the program
+        #: What each recorded value is on the example, while the trace runs.
+        self.example_run: ExampleRun | None = None
+        # lifted placeholder name -> the parameter, buffer or constant it lifts
+        self._state_values: dict[str, Any] = {}
+        #: Inputs the program read a fixed extent of a value computed from:
+        #: the program holds only at the example's sizes of their undeclared
+        #: dimensions.
+        self.fixed_inputs: set[str] = set()
+        # node name -> the extents its shape reads hand the program
         self._symbolic_shapes: dict[str, tuple[Any, ...]] = {}
 
-    # -- dynamic dimensions ---------------------------------------------------
+    # -- shapes of the values the program computes ----------------------------
+
+    def _shaped(self, proxy: Proxy) -> Any:
+        from ._example_run import MISSING
+
+        run = self.example_run
+        if run is None:
+            return MISSING
+        return run.value(proxy.node)
 
     def symbolic_shape(self, proxy: Proxy) -> tuple[Any, ...] | None:
-        """The extents of an input with dimensions declared dynamic.
+        """The extents of a value, as the program reads them.
 
-        A fixed extent is the example's int.  A dynamic one is a value of the
-        graph, read off the input when the program runs, whose example is the
-        dimension's symbol, so what the program computes from it stays
-        symbolic and what it decides on it is kept as a guard.
+        A fixed extent is the example's int.  One that depends on a dimension
+        declared dynamic is a value of the graph, read off the value when the
+        program runs, whose example is its expression in the symbols, so what
+        the program computes from it stays symbolic and what it decides on it
+        is kept as a guard.  ``None`` leaves the read to the input's example.
         """
 
-        dims = self.symbolic_dims
+        from ._shape_rules import Shaped
+
         node = proxy.node
-        if dims is None or node.op != "placeholder":
+        value = self._shaped(proxy)
+        if not isinstance(value, Shaped):
             return None
-        sites = dims.sites.get(str(node.target))
-        if not sites:
-            return None
+        if any(isinstance(extent, int) for extent in value.extents):
+            self.fixed_inputs |= value.origins
+        if all(isinstance(extent, int) for extent in value.extents):
+            if self._node_samples.get(node.name) is not None:
+                return None
+            import tensorplay as tp
+
+            return tp.Size(value.extents)
         shape = self._symbolic_shapes.get(node.name)
         if shape is None:
             from ..graph.experimental.sym_node import SymInt
 
             read = None
             extents: list[Any] = []
-            for axis, size in enumerate(self._node_samples[node.name].shape):
-                site = sites.get(axis)
-                if site is None:
-                    extents.append(int(size))
+            for axis, extent in enumerate(value.extents):
+                if isinstance(extent, int):
+                    extents.append(extent)
                     continue
                 if read is None:
                     read = self.create_proxy("call_function", getattr, (proxy, "shape"), {})
-                extent = self.create_proxy("call_function", operator.getitem, (read, axis), {})
-                expr, example = site
-                self._node_samples[extent.node.name] = SymInt(expr, None, int, example)
-                extents.append(extent)
+                item = self.create_proxy("call_function", operator.getitem, (read, axis), {})
+                example = self.symbolic_dims.example(extent)
+                self._node_samples[item.node.name] = SymInt(extent, None, int, example)
+                extents.append(item)
             shape = self._symbolic_shapes[node.name] = tuple(extents)
         return shape
 
-    def symbolic_gate(self, proxy: Proxy, kind: str) -> Any:
-        """Decide a Python gate on a symbolic size from its example, keeping it."""
+    def known_metadata(self, proxy: Proxy, name: str) -> Any:
+        """The dtype, device or rank of a computed value, from its example;
+        ``None`` for anything else."""
 
-        if self.symbolic_dims is None:
+        from ._shape_rules import Shaped
+
+        value = self._shaped(proxy)
+        if not isinstance(value, Shaped) or name not in ("dtype", "device", "ndim"):
             return None
+        return value.rank if name == "ndim" else getattr(value.example, name)
+
+    def symbolic_gate(self, proxy: Proxy, kind: str) -> Any:
+        """Decide a Python gate on a size from its example, keeping it.
+
+        A gate on a fact about a tensor that is not its size -- its dtype,
+        whether it is contiguous -- is answered from the example as it is.
+        """
+
         from ..graph.experimental.sym_node import SymNode
 
         sample = self._node_samples.get(proxy.node.name)
-        if not isinstance(sample, SymNode) or sample.hint is None:
+        if isinstance(sample, SymNode) and sample.hint is not None:
+            return self.symbolic_dims.decide(proxy.node, sample, kind)
+        if sample is not None:
             return None
-        return self.symbolic_dims.decide(proxy.node, sample, kind)
+        value = self._shaped(proxy)
+        if isinstance(value, (bool, int, float, str)):
+            return value
+        return None
+
+    def iter(self, proxy: Proxy) -> Any:
+        """Iterate a computed sequence, or a tensor along its first extent."""
+
+        from ._shape_rules import Shaped
+
+        value = self._shaped(proxy)
+        if isinstance(value, (tuple, list)):
+            return (proxy[index] for index in range(len(value)))
+        if isinstance(value, Shaped) and value.extents:
+            return (proxy[index] for index in range(len(proxy)))
+        from ..graph.proxy import TraceError
+
+        raise TraceError("symbolic graph values cannot be iterated")
 
     def _propagate_symbolic(self, node: Node) -> None:
         """Size arithmetic on symbolic extents (``b * n``, ``b > 1``) symbolically.
 
-        Only calls over sizes and Python scalars are evaluated; anything that
-        touches a tensor stays a node without an example, as in the rest of
-        this capture.
+        Only calls over sizes and Python scalars are evaluated here, into
+        samples a gate can decide on; calls on tensors are the example run's.
         """
 
         from ..graph.experimental.sym_node import SymNode
@@ -202,6 +269,8 @@ class ExportTracer(Tracer):
             node.meta["state_kind"] = kind
             node.meta["state_persistent"] = persistent
             self.state_targets[target] = (node, kind, persistent)
+            # Read now: while the trace runs the module hands out stand-ins.
+            self._state_values[node.name] = value
 
     def _patch_constants(self, root: Any) -> None:
         for target, (node, kind, _persistent) in self.state_targets.items():
@@ -301,17 +370,33 @@ class ExportTracer(Tracer):
         self._forward_patches.clear()
 
     def trace(self, root: Any, sample_inputs: dict[str, Any] | None = None) -> GraphModule:
+        from ._example_run import ExampleRun
+        from ._symbolic_dims import SymbolicDims
+
         self.root = root
-        if callable(getattr(root, "named_modules", None)):
-            self._register_state(root)
-            self._patch_constants(root)
-            self._wrap_child_forwards(root)
-            try:
+        if self.symbolic_dims is None:
+            self.symbolic_dims = SymbolicDims()
+        self.example_run = ExampleRun(
+            self.symbolic_dims, self._node_samples, lambda node: self._state_values[node.name]
+        )
+        try:
+            # The example run draws from the generators as the program would;
+            # the caller's streams are left where they were.
+            with _forked_generators():
+                if callable(getattr(root, "named_modules", None)):
+                    self._register_state(root)
+                    self._patch_constants(root)
+                    self._wrap_child_forwards(root)
+                    try:
+                        return super().trace(root, sample_inputs)
+                    finally:
+                        self._restore_child_forwards()
+                        self._restore_constants()
                 return super().trace(root, sample_inputs)
-            finally:
-                self._restore_child_forwards()
-                self._restore_constants()
-        return super().trace(root, sample_inputs)
+        finally:
+            self.example_run.release()
+            self.example_run = None
+            self._state_values.clear()
 
     def create_proxy(
         self,
@@ -325,10 +410,22 @@ class ExportTracer(Tracer):
             if entry is not None:
                 return Proxy(entry[0], self)
         proxy = super().create_proxy(kind, target, args, kwargs)
+        node = proxy.node
         if self._module_stack:
-            proxy.node.meta["nn_module_stack"] = self._module_stack
-        if self.symbolic_dims is not None and kind in ("call_function", "call_method"):
-            self._propagate_symbolic(proxy.node)
+            node.meta["nn_module_stack"] = self._module_stack
+        if kind in ("call_function", "call_method") and self.example_run is not None:
+            import sympy
+
+            from ..graph.experimental.sym_node import SymInt, SymNode
+
+            self._propagate_symbolic(node)
+            if not isinstance(self._node_samples.get(node.name), SymNode):
+                value = self.example_run.record(node)
+                if isinstance(value, sympy.Basic) and value.free_symbols:
+                    # A size the program computed: decided on like any other.
+                    self._node_samples[node.name] = SymInt(
+                        value, None, int, self.symbolic_dims.example(value)
+                    )
         return proxy
 
 
@@ -711,20 +808,110 @@ def _assert_shape_guard(value: Any, expected: Any, guard: str) -> None:
         )
 
 
-def _assert_guards(graph_module: GraphModule, guards: list[Any]) -> None:
-    """Check, when the program runs, the guards its capture took on dynamic sizes."""
+def _assert_guards(graph_module: GraphModule, guards: list[Any], dims: SymbolicDims) -> None:
+    """Check, when the program runs, the guards its capture took on dynamic sizes.
+
+    A guard the program decided on a value it computed is checked on that
+    value.  One a shape rule took is a condition on the input sizes alone, and
+    is computed from them.
+    """
 
     if not guards:
         return
     from ._symbolic_dims import render
 
     graph = graph_module.graph
+    inputs = {str(node.target): node for node in graph.placeholders}
+    reads: dict[Any, Any] = {}
+
+    def read(symbol: Any) -> Any:
+        if symbol not in reads:
+            name, axis, scale, offset = dims.source(symbol)
+            shape = graph.call_function(getattr, (inputs[name], "shape"))
+            value = graph.call_function(operator.getitem, (shape, axis))
+            if offset:
+                value = graph.call_function(operator.sub, (value, offset))
+            if scale != 1:
+                value = graph.call_function(operator.floordiv, (value, scale))
+            reads[symbol] = value
+        return reads[symbol]
+
     with graph.inserting_before(graph.output_node):
         for guard in guards:
-            graph.call_function(
-                _assert_shape_guard, (guard.node, guard.expected, render(guard.fact))
-            )
+            if guard.node is None:
+                value, expected = _computed(graph, guard.fact, read), True
+            else:
+                value, expected = guard.node, guard.expected
+            graph.call_function(_assert_shape_guard, (value, expected, render(guard.fact)))
     graph_module.recompile()
+
+
+def _computed(graph: Any, expr: Any, read: Callable[[Any], Any]) -> Any:
+    """Nodes computing ``expr`` from the input sizes its symbols stand for."""
+
+    import sympy
+
+    def emit(expr: Any) -> Any:
+        if expr in (sympy.true, sympy.false):
+            return bool(expr)
+        if expr.is_Integer:
+            return int(expr)
+        if expr.is_Symbol:
+            return read(expr)
+        if isinstance(expr, (sympy.floor, sympy.ceiling)):
+            numerator, denominator = sympy.fraction(sympy.together(expr.args[0]))
+            if isinstance(expr, sympy.floor):
+                return call(operator.floordiv, numerator, denominator)
+            negated = call(operator.floordiv, -numerator, denominator)
+            return graph.call_function(operator.neg, (negated,))
+        if isinstance(expr, sympy.logic.boolalg.Boolean):
+            return relation(expr)
+        numerator, denominator = sympy.fraction(sympy.together(expr))
+        if denominator != 1:
+            return call(operator.truediv, numerator, denominator)
+        if isinstance(expr, sympy.Add):
+            return fold(operator.add, expr.args)
+        if isinstance(expr, sympy.Mul):
+            return fold(operator.mul, expr.args)
+        if isinstance(expr, sympy.Pow) and expr.args[1].is_Integer and expr.args[1] >= 0:
+            return call(operator.pow, *expr.args)
+        if isinstance(expr, sympy.Mod):
+            return call(operator.mod, *expr.args)
+        if isinstance(expr, (sympy.Min, sympy.Max)):
+            return fold(min if isinstance(expr, sympy.Min) else max, expr.args)
+        raise NotImplementedError(f"cannot compute {expr} in the program")
+
+    def relation(expr: Any) -> Any:
+        relations = {
+            sympy.Eq: operator.eq,
+            sympy.Ne: operator.ne,
+            sympy.Lt: operator.lt,
+            sympy.Le: operator.le,
+            sympy.Gt: operator.gt,
+            sympy.Ge: operator.ge,
+        }
+        for kind, function in relations.items():
+            if isinstance(expr, kind):
+                return call(function, *expr.args)
+        if isinstance(expr, sympy.And):
+            return fold(operator.and_, expr.args)
+        if isinstance(expr, sympy.Or):
+            return fold(operator.or_, expr.args)
+        if isinstance(expr, sympy.Not):
+            return graph.call_function(operator.not_, (emit(expr.args[0]),))
+        raise NotImplementedError(f"cannot compute {expr} in the program")
+
+    def call(function: Any, *operands: Any) -> Any:
+        return graph.call_function(function, tuple(emit(operand) for operand in operands))
+
+    def fold(function: Any, operands: Any) -> Any:
+        values = [emit(operand) for operand in operands]
+        result = values[0]
+        for value in values[1:]:
+            result = graph.call_function(function, (result, value))
+        return result
+
+    return emit(expr)
 
 
 def _apply_dynamic_shape_constraints(
@@ -998,11 +1185,12 @@ def _capture(
     if normalized is None:
         names = [node.name for node in placeholders]
         normalized = _normalize_dynamic_shapes(dynamic_shapes, names, model, args, kwargs)
-    if symbolic_dims is not None:
-        _assert_guards(graph_module, symbolic_dims.settle())
+    dims = tracer.symbolic_dims
+    _assert_guards(graph_module, dims.settle(), dims)
 
     meta = graph_module.meta
     meta["user_signature"] = graph_module.signature
+    meta["fixed_inputs"] = tuple(sorted(tracer.fixed_inputs))
     meta["state_targets"] = dict(tracer.state_targets)
     constants: dict[str, Any] = {}
     for target, (_node, kind, persistent) in tracer.state_targets.items():

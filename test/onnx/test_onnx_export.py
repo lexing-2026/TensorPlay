@@ -969,9 +969,8 @@ class TestShapeReads:
 
     def test_dynamic_batch_is_read_at_runtime(self):
         module = _Attention().eval()
-        program = export(module, tp.randn(2, 5, 8))
         model = onnx_export(
-            program,
+            (module, tp.randn(2, 5, 8)),
             input_names=["x"],
             dynamic_axes={"x": {0: "batch"}},
             verify=True,
@@ -1011,11 +1010,38 @@ class TestShapeReads:
     )
     def test_dynamic_batch_through_shape_dependent_ops(self, fn):
         module = _as_module(lambda x: fn(tp.relu(x)))
-        program = export(module, tp.randn(2, 3, 4))
         model = onnx_export(
-            program, input_names=["x"], dynamic_axes={"x": {0: "batch"}}, verify=True
+            (module, tp.randn(2, 3, 4)),
+            input_names=["x"],
+            dynamic_axes={"x": {0: "batch"}},
+            verify=True,
         )
         _run_batches(model, module, lambda batch: tp.randn(batch, 3, 4), (1, 3))
+
+    def test_branches_on_computed_shapes_under_dynamic_axes(self):
+        def fn(x):
+            y = tp.relu(x)
+            b, n, c = y.shape
+            if n > 2 and c == 4 and y.dtype == tp.float32:
+                y = y.reshape(b, n * c)
+            return y / y.shape[-1]
+
+        module = _as_module(fn)
+        model = onnx_export(
+            (module, tp.randn(2, 3, 4)),
+            input_names=["x"],
+            dynamic_axes={"x": {0: "batch"}},
+            verify=True,
+        )
+        _run_batches(model, module, lambda batch: tp.randn(batch, 3, 4), (1, 5))
+
+    def test_dynamic_axes_reject_a_program_that_read_the_fixed_size(self):
+        # Exported without dynamic dimensions, the program read the batch as
+        # the example's 2; a model taking any batch would compute with 2.
+        module = _Attention().eval()
+        program = export(module, tp.randn(2, 5, 8))
+        with pytest.raises(ValueError, match="'x' axis 0"):
+            onnx_export(program, input_names=["x"], dynamic_axes={"x": {0: "batch"}})
 
 
 class TestUnsupported:

@@ -498,7 +498,10 @@ class _Converter:
     def convert(self) -> Any:
         placeholder_index = 0
         outputs: list[Value] = []
+        checks = _runtime_checks(self.graph_module.graph)
         for node in self.graph_module.graph.nodes:
+            if node in checks:
+                continue
             if node.op == "placeholder":
                 if node.name in self.state_values:
                     # lifted state becomes a constant, not a graph input
@@ -555,6 +558,32 @@ class _Converter:
         )
 
 
+_RUNTIME_CHECKS = frozenset(
+    {"_assert_dim_range", "_assert_dims_equal", "_assert_shape_guard", "_assert_dim_relation"}
+)
+
+
+def _runtime_checks(graph: Any) -> set[Any]:
+    """The program's runtime checks of its sizes, and what only they consume.
+
+    The checks guard eager runs of the program; an ONNX model declares its
+    dimensions instead, so neither they nor the size arithmetic feeding them
+    become ONNX nodes.
+    """
+
+    checks: set[Any] = set()
+    for node in reversed(list(graph.nodes)):
+        if node.op not in ("call_function", "call_method"):
+            continue
+        is_check = (
+            getattr(node.target, "__module__", None) == "tensorplay.export._trace"
+            and getattr(node.target, "__name__", None) in _RUNTIME_CHECKS
+        )
+        if is_check or (node.users and all(user in checks for user in node.users)):
+            checks.add(node)
+    return checks
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -567,8 +596,10 @@ def _to_exported_program(
     output_names: Sequence[str] | None = None,
 ) -> tuple[ExportedProgram, Any]:
     if isinstance(model, ExportedProgram):
+        declared = _dynamic_shapes_to_dynamic_axes(model, input_names)
         if dynamic_axes is None:
-            dynamic_axes = _dynamic_shapes_to_dynamic_axes(model, input_names)
+            return model, declared
+        _check_declared_axes(model, dynamic_axes, declared or {}, input_names)
         return model, dynamic_axes
     if isinstance(model, (list, tuple)) and model:
         callable_, *rest = model
@@ -775,6 +806,67 @@ def _dynamic_axes_to_dynamic_shapes(
     return shapes or None
 
 
+def _onnx_input_names(
+    program: ExportedProgram, input_names: Sequence[str] | None
+) -> dict[str, str]:
+    """Each argument of the program by the name of the ONNX input it becomes:
+    ``input_names`` in order, else the input placeholder's name."""
+
+    user_inputs = set(program.graph_signature.user_inputs)
+    placeholders = [
+        node for node in program.graph_module.graph.placeholders if node.name in user_inputs
+    ]
+    # User placeholders follow the callable's arguments in order.
+    signature = program.graph_module.meta.get("user_signature")
+    arguments = list(signature.parameters) if signature is not None else []
+    onnx_names: dict[str, str] = {}
+    for index, node in enumerate(placeholders):
+        argument = arguments[index] if index < len(arguments) else str(node.target)
+        named = input_names is not None and index < len(input_names)
+        onnx_names[argument] = input_names[index] if named else node.name
+    return onnx_names
+
+
+def _check_declared_axes(
+    program: ExportedProgram,
+    dynamic_axes: Mapping[str, Any],
+    declared: Mapping[str, Mapping[int, str]],
+    input_names: Sequence[str] | None,
+) -> None:
+    """Reject ``dynamic_axes`` that let an input vary where the program fixed it.
+
+    A program reads the shapes of the values it computes at the sizes its
+    declaration allows: an extent of an input it did not declare dynamic is the
+    example's in everything computed from it.  Marking that ONNX input dynamic
+    would export a model that is wrong at every other size -- unless the
+    program never read such an extent, as a stack of layers that only maps its
+    input does not.
+    """
+
+    read = program.graph_module.meta.get("fixed_inputs")
+    if read is None:
+        return
+    fixed: list[str] = []
+    for argument, onnx_name in _onnx_input_names(program, input_names).items():
+        axes = dynamic_axes.get(onnx_name)
+        if axes is None or argument not in read:
+            continue
+        allowed = declared.get(onnx_name, {})
+        for axis in axes:
+            if int(axis) not in allowed:
+                fixed.append(f"{onnx_name!r} axis {int(axis)} (argument {argument!r})")
+    if fixed:
+        raise ValueError(
+            "dynamic_axes marks "
+            + ", ".join(fixed)
+            + " as varying, but the program was exported with those dimensions fixed "
+            "and reads shapes that depend on them, so it holds only at the example's "
+            "sizes. Export it with "
+            "dynamic_shapes declaring them (Dim.DYNAMIC, or a named Dim), or pass "
+            "(model, *args) to this export to capture it with these axes."
+        )
+
+
 def _dynamic_shapes_to_dynamic_axes(
     program: ExportedProgram, input_names: Sequence[str] | None
 ) -> dict | None:
@@ -788,18 +880,7 @@ def _dynamic_shapes_to_dynamic_axes(
     dynamic_shapes = program.dynamic_shapes
     if not dynamic_shapes:
         return None
-    user_inputs = set(program.graph_signature.user_inputs)
-    placeholders = [
-        node for node in program.graph_module.graph.placeholders if node.name in user_inputs
-    ]
-    # User placeholders follow the callable's arguments in order.
-    signature = program.graph_module.meta.get("user_signature")
-    arguments = list(signature.parameters) if signature is not None else []
-    onnx_names: dict[str, str] = {}
-    for index, node in enumerate(placeholders):
-        argument = arguments[index] if index < len(arguments) else str(node.target)
-        named = input_names is not None and index < len(input_names)
-        onnx_names[argument] = input_names[index] if named else node.name
+    onnx_names = _onnx_input_names(program, input_names)
     result: dict[str, dict[int, str]] = {}
     for argument, dims in dynamic_shapes.items():
         axes: dict[int, str] = {}
