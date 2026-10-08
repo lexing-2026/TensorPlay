@@ -734,9 +734,10 @@ private:
         return nullptr;
     }
 
-    // Graph-pool counterpart of takeCachedLocked.  No coalescing and no
-    // address index: pool blocks are parked per size and reused same-stream
-    // only, which is enough because the pool is short-lived and private.
+    // Graph-pool counterpart of takeCachedLocked: parked blocks are reused
+    // same-stream only.  A taken block must also leave the address index,
+    // otherwise freeing a physically adjacent block would coalesce into this
+    // still-live one and hand its memory out again.
     std::shared_ptr<Block> takeGraphPoolLocked(uint64_t pool_id, size_t rounded,
                                                cudaStream_t allocation_stream) {
         auto pit = pools_.find(pool_id);
@@ -750,6 +751,7 @@ private:
                 auto block = *bucket_it;
                 bucket.erase(bucket_it);
                 if (bucket.empty()) pmap.erase(it);
+                pool.free_by_addr.erase(reinterpret_cast<uintptr_t>(block->ptr));
                 if (block->size > rounded) {
                     auto remainder = std::make_shared<Block>();
                     remainder->ptr = static_cast<char*>(block->ptr) + rounded;

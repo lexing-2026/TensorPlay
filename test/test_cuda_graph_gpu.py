@@ -146,6 +146,57 @@ def test_pool_reset_frees_after_last_user():
     )
 
 
+def test_pool_reuse_never_aliases_live_block():
+    device = _cuda_device()
+    n = 1 << 20  # 4 MiB: one fresh large segment owned by the pool
+    g = tp.cuda.CUDAGraph()
+    with tp.cuda.graph(g):
+        big = tp.empty((n,), dtype=tp.float32, device=device)
+        del big
+        # ``a`` reuses the front of the parked segment, ``b`` the remainder.
+        a = tp.empty((n // 2,), dtype=tp.float32, device=device)
+        b = tp.empty((n // 2,), dtype=tp.float32, device=device)
+        # Freeing ``b`` must not coalesce it with the still-live ``a``.
+        del b
+        c = tp.empty((n // 2,), dtype=tp.float32, device=device)
+        a_ptr, c_ptr = a.data_ptr(), c.data_ptr()
+    assert a_ptr != c_ptr, "graph pool handed out a live block again"
+    del a, c
+    g.reset()
+
+
+def test_make_graphed_callables_silu_after_pool_reuse():
+    device = _cuda_device()
+    tp.manual_seed(0)
+    net = tp.nn.Sequential(
+        tp.nn.Conv2d(8, 16, 3, padding=1),
+        tp.nn.GroupNorm(4, 16),
+        tp.nn.SiLU(),
+        tp.nn.Conv2d(16, 16, 3, padding=1),
+        tp.nn.GroupNorm(4, 16),
+        tp.nn.SiLU(),
+        tp.nn.Conv2d(16, 8, 3, padding=1),
+    ).to(device)
+    x = tp.randn((32, 8, 28, 28), device=device, requires_grad=True)
+    graphed = make_graphed_callables(net, (x,))
+    weight = net[0].weight
+    for _ in range(2):
+        x_live = tp.randn((32, 8, 28, 28), device=device, requires_grad=True)
+        weight.grad = None
+        out = graphed(x_live)
+        out.square().sum().backward()
+        got = (out.detach().clone(), x_live.grad.clone(), weight.grad.clone())
+
+        # Reference: the class forward, bypassing the graphed replacement.
+        x_ref = x_live.detach().clone().requires_grad_(True)
+        weight.grad = None
+        y = tp.nn.Sequential.forward(net, x_ref)
+        y.square().sum().backward()
+        want = (y.detach(), x_ref.grad, weight.grad)
+        for g, w in zip(got, want):
+            assert tp.allclose(g, w, atol=1e-3, rtol=1e-3)
+
+
 def test_custom_stream_and_error_modes():
     device = _cuda_device()
     stream = tp.cuda.Stream()
@@ -377,7 +428,8 @@ def test_make_graphed_callables_matches_eager():
 
     x.grad = None
     W.grad = None
-    out_eager = fn(x)
+    # The class forward: ``fn.forward`` now dispatches to the graphed replay.
+    out_eager = Fn.forward(fn, x)
     out_eager.sum().backward()
     assert tp.allclose(out, out_eager.detach())
     assert x_grad_graphed is not None and x.grad is not None
