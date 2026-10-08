@@ -381,6 +381,27 @@ jobs:
             echo "$runtime_root/bin" >> "$GITHUB_PATH"
           fi
 
+      # The hosted Linux runners carry 16 GB of RAM and a 3 GB swap file. The
+      # ptxas of ReductionKernels.cu alone climbs past 14 GB, so beside the
+      # second compile job it starves the runner until GitHub drops it ("lost
+      # communication with the server", around step 998 of the cu130 build).
+      # The temporary disk has room to spare: back the build with real swap.
+      - name: Add swap for the CUDA build
+        if: ${{ runner.os == 'Linux' && inputs.cuda != 'cpu' && runner.environment == 'github-hosted' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          swap_dir=/
+          if [[ -d /mnt ]] && (( $(df -BG --output=avail /mnt | tail -1 | tr -dc 0-9) >= 40 )); then
+            swap_dir=/mnt
+          fi
+          swapfile="${swap_dir%/}/tp-build.swap"
+          sudo fallocate -l 24G "$swapfile"
+          sudo chmod 600 "$swapfile"
+          sudo mkswap "$swapfile" >/dev/null
+          sudo swapon "$swapfile"
+          free -m
+
       - name: Build wheel
         shell: bash
         env:
