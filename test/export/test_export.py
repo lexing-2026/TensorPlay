@@ -226,6 +226,92 @@ def test_dynamic_shapes_conflicting_dim_definitions_raise():
         )
 
 
+def _export_fn(fn, x, dynamic_shapes):
+    class M(tp.nn.Module):
+        def forward(self, x):
+            return fn(x)
+
+    return tp_export.export(M(), x, dynamic_shapes=dynamic_shapes)
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda x: x + x.shape[0],
+        lambda x: x.reshape(x.shape[0] * x.shape[1]),
+        lambda x: x * x.numel() + x.size(0) // 2,
+        lambda x: x.new_zeros(x.shape) + x.size()[0],
+    ],
+    ids=["add", "reshape", "numel_floordiv", "new_zeros"],
+)
+def test_dynamic_dimension_reads_follow_the_runtime_size(fn):
+    program = _export_fn(fn, tp.randn(4, 3), {"x": {0: tp_export.Dim("batch")}})
+    for batch in (4, 7):
+        x = tp.randn(batch, 3)
+        assert program(x).tolist() == fn(x).tolist()
+
+
+def test_guard_on_a_named_dimension_suggests_the_fix():
+    spec = {"x": {0: tp_export.Dim("batch")}}
+
+    def fn(x):
+        return x * 2 if x.shape[0] > 4 else x
+
+    with pytest.raises(tp_export.ConstraintsExceededError, match="batch > 4") as caught:
+        _export_fn(fn, tp.randn(6, 3), spec)
+    assert "batch = Dim('batch', min=5)" in str(caught.value)
+    refined = tp_export.refine_dynamic_shapes_from_suggested_fixes(str(caught.value), spec)
+    program = _export_fn(fn, tp.randn(6, 3), refined)
+    assert program(tp.randn(9, 3)).shape == (9, 3)
+
+    # int() and len() must hand Python a number, which fixes the dimension.
+    for fixes in (lambda x: x[: int(x.shape[0])], lambda x: x * len(x)):
+        with pytest.raises(tp_export.ConstraintsExceededError, match="batch = 6"):
+            _export_fn(fixes, tp.randn(6, 3), spec)
+
+
+def test_guard_excluding_size_one_is_asserted_at_runtime():
+    program = _export_fn(
+        lambda x: x * 2 if x.shape[0] != 1 else x,
+        tp.randn(4, 3),
+        {"x": {0: tp_export.Dim("batch")}},
+    )
+    assert program(tp.randn(5, 3)).shape == (5, 3)
+    with pytest.raises(RuntimeError, match="runtime assertion failed.*batch != 1"):
+        program(tp.randn(1, 3))
+
+
+def test_dim_hints_narrow_or_fix_as_declared():
+    def gate(x):
+        return x * 2 if x.shape[0] > 2 else x
+
+    program = _export_fn(gate, tp.randn(4, 3), {"x": {0: tp_export.Dim.DYNAMIC}})
+    x = tp.randn(6, 3)
+    assert program(x).tolist() == gate(x).tolist()
+    with pytest.raises(RuntimeError, match="runtime assertion failed"):
+        program(tp.randn(2, 3))
+
+    def fixed(x):
+        return x * 2 if x.shape[0] == 4 else x
+
+    with pytest.raises(tp_export.ConstraintsExceededError, match="Dim.DYNAMIC"):
+        _export_fn(fixed, tp.randn(4, 3), {"x": {0: tp_export.Dim.DYNAMIC}})
+    program = _export_fn(fixed, tp.randn(4, 3), {"x": {0: tp_export.Dim.AUTO}})
+    with pytest.raises(RuntimeError, match="runtime assertion failed"):
+        program(tp.randn(5, 3))
+
+
+def test_sequence_dynamic_shapes_name_the_forward_arguments():
+    model = tp.nn.Linear(3, 2)
+    batch = tp_export.Dim("batch", min=2)
+    program = tp_export.export(model, tp.randn(4, 3), dynamic_shapes=({0: batch},))
+    assert program.dynamic_shapes == {"input": {0: batch}}
+    assert program(tp.randn(7, 3)).shape == (7, 2)
+    assert program.module()(input=tp.randn(7, 3)).shape == (7, 2)
+    with pytest.raises(RuntimeError, match="runtime assertion failed"):
+        program(tp.randn(1, 3))
+
+
 def test_refine_dynamic_shapes_from_suggested_fixes():
     spec = {"x": {0: tp_export.Dim("dx"), 1: tp_export.Dim("dy")}}
     refined = tp_export.refine_dynamic_shapes_from_suggested_fixes(

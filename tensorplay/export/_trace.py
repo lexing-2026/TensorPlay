@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import inspect
+import operator
 from collections.abc import Mapping
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from ..graph import GraphCaptureError, GraphModule, Node, Proxy, Tracer
 from .dynamic_shapes import AdditionalInputs, ConstraintsExceededError, Dim, ShapesCollection, _DimHint
@@ -18,6 +19,9 @@ from .graph_signature import (
     OutputSpec,
     TensorArgument,
 )
+
+if TYPE_CHECKING:
+    from ._symbolic_dims import SymbolicDims
 
 __all__ = ["ExportTracer", "draft_export", "export", "export_for_training"]
 
@@ -88,7 +92,11 @@ class ExportTracer(Tracer):
     nodes) are recorded for later hierarchy reconstruction.
     """
 
-    def __init__(self, concrete_args: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        concrete_args: dict[str, Any] | None = None,
+        symbolic_dims: SymbolicDims | None = None,
+    ) -> None:
         super().__init__(concrete_args)
         # qualified attribute path -> (placeholder node, kind, persistent)
         self.state_targets: dict[str, tuple[Node, str, bool]] = {}
@@ -98,6 +106,92 @@ class ExportTracer(Tracer):
         self._forward_patches: list[tuple[Any, Any]] = []
         self.module_calls: list[dict[str, Any]] = []
         self._call_keys: set[tuple[Any, ...]] = set()
+        #: The dimensions declared dynamic, sized by symbols during capture.
+        self.symbolic_dims = symbolic_dims
+        # placeholder name -> the extents its shape reads hand the program
+        self._symbolic_shapes: dict[str, tuple[Any, ...]] = {}
+
+    # -- dynamic dimensions ---------------------------------------------------
+
+    def symbolic_shape(self, proxy: Proxy) -> tuple[Any, ...] | None:
+        """The extents of an input with dimensions declared dynamic.
+
+        A fixed extent is the example's int.  A dynamic one is a value of the
+        graph, read off the input when the program runs, whose example is the
+        dimension's symbol, so what the program computes from it stays
+        symbolic and what it decides on it is kept as a guard.
+        """
+
+        dims = self.symbolic_dims
+        node = proxy.node
+        if dims is None or node.op != "placeholder":
+            return None
+        sites = dims.sites.get(str(node.target))
+        if not sites:
+            return None
+        shape = self._symbolic_shapes.get(node.name)
+        if shape is None:
+            from ..graph.experimental.sym_node import SymInt
+
+            read = None
+            extents: list[Any] = []
+            for axis, size in enumerate(self._node_samples[node.name].shape):
+                site = sites.get(axis)
+                if site is None:
+                    extents.append(int(size))
+                    continue
+                if read is None:
+                    read = self.create_proxy("call_function", getattr, (proxy, "shape"), {})
+                extent = self.create_proxy("call_function", operator.getitem, (read, axis), {})
+                expr, example = site
+                self._node_samples[extent.node.name] = SymInt(expr, None, int, example)
+                extents.append(extent)
+            shape = self._symbolic_shapes[node.name] = tuple(extents)
+        return shape
+
+    def symbolic_gate(self, proxy: Proxy, kind: str) -> Any:
+        """Decide a Python gate on a symbolic size from its example, keeping it."""
+
+        if self.symbolic_dims is None:
+            return None
+        from ..graph.experimental.sym_node import SymNode
+
+        sample = self._node_samples.get(proxy.node.name)
+        if not isinstance(sample, SymNode) or sample.hint is None:
+            return None
+        return self.symbolic_dims.decide(proxy.node, sample, kind)
+
+    def _propagate_symbolic(self, node: Node) -> None:
+        """Size arithmetic on symbolic extents (``b * n``, ``b > 1``) symbolically.
+
+        Only calls over sizes and Python scalars are evaluated; anything that
+        touches a tensor stays a node without an example, as in the rest of
+        this capture.
+        """
+
+        from ..graph.experimental.sym_node import SymNode
+        from ..graph.tracer import _UNRESOLVED
+
+        values = self.resolve_sample((node.args, node.kwargs))
+        if values is _UNRESOLVED:
+            return
+        leaves: list[Any] = []
+
+        def collect(value: Any) -> None:
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    collect(item)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    collect(item)
+            else:
+                leaves.append(value)
+
+        collect(values)
+        if any(isinstance(leaf, SymNode) for leaf in leaves) and not any(
+            hasattr(leaf, "shape") for leaf in leaves
+        ):
+            self._execute_node(node)
 
     def _register_state(self, root: Any) -> None:
         for target, (kind, persistent) in _collect_attributes(root).items():
@@ -233,6 +327,8 @@ class ExportTracer(Tracer):
         proxy = super().create_proxy(kind, target, args, kwargs)
         if self._module_stack:
             proxy.node.meta["nn_module_stack"] = self._module_stack
+        if self.symbolic_dims is not None and kind in ("call_function", "call_method"):
+            self._propagate_symbolic(proxy.node)
         return proxy
 
 
@@ -607,6 +703,30 @@ def _assert_dim_relation(
     return size_derived
 
 
+def _assert_shape_guard(value: Any, expected: Any, guard: str) -> None:
+    if value != expected:
+        raise ConstraintsExceededError(
+            f"runtime assertion failed: the program was captured under {guard}, "
+            f"which these inputs do not satisfy (got {value!r}, expected {expected!r})"
+        )
+
+
+def _assert_guards(graph_module: GraphModule, guards: list[Any]) -> None:
+    """Check, when the program runs, the guards its capture took on dynamic sizes."""
+
+    if not guards:
+        return
+    from ._symbolic_dims import render
+
+    graph = graph_module.graph
+    with graph.inserting_before(graph.output_node):
+        for guard in guards:
+            graph.call_function(
+                _assert_shape_guard, (guard.node, guard.expected, render(guard.fact))
+            )
+    graph_module.recompile()
+
+
 def _apply_dynamic_shape_constraints(
     graph_module: GraphModule,
     combined_args: Mapping[str, Any],
@@ -840,16 +960,33 @@ def _capture(
     dynamic_shapes: Any,
 ) -> ExportedProgram:
     from ..graph._pytree import tree_flatten
-    from .dynamic_shapes import _combine_args
+    from .dynamic_shapes import _check_dynamic_shapes, _combine_args
 
-    tracer = ExportTracer()
     target = model.forward if callable(getattr(model, "forward", None)) else model
     try:
-        bound = inspect.signature(target).bind_partial(*args, **kwargs)
+        signature = inspect.signature(target)
+        bound = signature.bind_partial(*args, **kwargs)
         bound.apply_defaults()
         sample_inputs = dict(bound.arguments)
     except (TypeError, ValueError):
+        signature = None
         sample_inputs = None
+    # The specification names the callable's own arguments (a sequence lists
+    # them in order), never the lifted state ahead of them.
+    normalized = (
+        _normalize_dynamic_shapes(
+            dynamic_shapes, list(signature.parameters), model, args, kwargs
+        )
+        if signature is not None
+        else None
+    )
+    symbolic_dims = None
+    if normalized and sample_inputs is not None:
+        from ._symbolic_dims import SymbolicDims
+
+        _check_dynamic_shapes(sample_inputs, normalized)
+        symbolic_dims = SymbolicDims.from_spec(sample_inputs, normalized)
+    tracer = ExportTracer(symbolic_dims=symbolic_dims)
     from tensorplay.compiler import _exporting_context
 
     with _exporting_context():
@@ -857,9 +994,12 @@ def _capture(
     attributes = _collect_attributes(model)
     _validate_graph(graph_module, attributes)
     placeholders = graph_module.graph.placeholders
-    names = [node.name for node in placeholders]
     examples = _bind_examples(graph_module, args, kwargs)
-    normalized = _normalize_dynamic_shapes(dynamic_shapes, names, model, args, kwargs)
+    if normalized is None:
+        names = [node.name for node in placeholders]
+        normalized = _normalize_dynamic_shapes(dynamic_shapes, names, model, args, kwargs)
+    if symbolic_dims is not None:
+        _assert_guards(graph_module, symbolic_dims.settle())
 
     meta = graph_module.meta
     meta["user_signature"] = graph_module.signature

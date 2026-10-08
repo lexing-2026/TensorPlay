@@ -548,6 +548,10 @@ class Proxy:
 
         sample = self._sample()
         self.tracer.metadata_touches.add((self.node.name, name))
+        if name == "shape":
+            symbolic = self._symbolic_shape()
+            if symbolic is not None:
+                return symbolic
         if sample is not None:
             return getattr(sample, name)
         if name in ("shape", "size", "stride", "ndim", "dim", "numel", "nelement"):
@@ -556,6 +560,24 @@ class Proxy:
             if val is not None:
                 return getattr(val, name)
         return self.tracer.create_proxy("call_function", getattr, (self, name), {})
+
+    def _symbolic_shape(self) -> tuple[Any, ...] | None:
+        """The extents of this value as a tracer that sizes values symbolically
+        sees them: fixed extents as ints, varying ones as values of the graph.
+        ``None`` when the tracer fixes every extent from the example."""
+
+        hook = getattr(self.tracer, "symbolic_shape", None)
+        return None if hook is None else hook(self)
+
+    def _symbolic_gate(self, kind: str) -> Any:
+        """The outcome of a ``kind`` gate a symbolic tracer decides, else ``None``.
+
+        Such a tracer answers from the example and keeps the answer as a
+        condition the program was captured under.
+        """
+
+        hook = getattr(self.tracer, "symbolic_gate", None)
+        return None if hook is None else hook(self, kind)
 
     @property
     def shape(self) -> Any:
@@ -597,6 +619,13 @@ class Proxy:
     def numel(self) -> Any:
         """How many values this value stands for."""
 
+        symbolic = self._symbolic_shape()
+        if symbolic is not None:
+            self.tracer.metadata_touches.add((self.node.name, "numel"))
+            count: Any = 1
+            for size in symbolic:
+                count = count * size
+            return count
         sample = self._sample()
         if sample is not None:
             return sample.numel()
@@ -631,6 +660,9 @@ class Proxy:
         )
 
     def __bool__(self) -> bool:
+        decided = self._symbolic_gate("bool")
+        if decided is not None:
+            return bool(decided)
         scalar = self._scalar_sample()
         if scalar is not None:
             return bool(self._specialize("bool", scalar))
@@ -642,6 +674,9 @@ class Proxy:
         )
 
     def __index__(self) -> int:
+        decided = self._symbolic_gate("index")
+        if decided is not None:
+            return int(decided)
         scalar = self._scalar_sample()
         if scalar is None:
             raise GraphCaptureError(
@@ -654,6 +689,9 @@ class Proxy:
         # CPython but is deprecated ("may be removed"), so numeric gates do
         # NOT smuggle symbolic scalars through __int__ — use the explicit
         # ``tensorplay.graph.gate`` entry point instead,
+        decided = self._symbolic_gate("int")
+        if decided is not None:
+            return int(decided)
         scalar = self._scalar_sample()
         if scalar is None:
             raise GraphCaptureError("int(Proxy) is not supported during graph capture")
@@ -661,6 +699,9 @@ class Proxy:
         return int(scalar)
 
     def __float__(self) -> float:
+        decided = self._symbolic_gate("float")
+        if decided is not None:
+            return float(decided)
         scalar = self._scalar_sample()
         if scalar is None:
             raise GraphCaptureError(
@@ -672,6 +713,9 @@ class Proxy:
     def __len__(self) -> int:
         sample = self._sample()
         self.tracer.metadata_touches.add((self.node.name, "len"))
+        symbolic = self._symbolic_shape()
+        if symbolic:
+            return operator.index(symbolic[0])
         if sample is not None:
             if hasattr(sample, "__len__"):
                 try:
