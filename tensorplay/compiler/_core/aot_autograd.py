@@ -176,6 +176,7 @@ def _trace_forward(fn: Callable[..., Any], primals: Sequence[Any], decomposition
     flat_out, out_spec = tree_flatten(out)
     tracer.graph.output(tuple(tracer.map_value(v) for v in flat_out))
     tracer.graph.eliminate_dead_code()
+    tracer._tracked.clear()
     return GraphModule(tracer.root, tracer.graph), out_spec, flat_out
 
 
@@ -250,6 +251,7 @@ def _trace_joint(fn: Callable[..., Any], primals: Sequence[Any], decompositions)
     bwd_values =[None if g is None else tracer.map_value(g) for g in grads]
     tracer.graph.output(tuple(fwd_values + bwd_values))
     tracer.graph.eliminate_dead_code()
+    tracer._tracked.clear()
     joint = GraphModule(tracer.root, tracer.graph)
     return (
         joint,
@@ -272,8 +274,10 @@ def _functionalize(gm: GraphModule, example_inputs: Sequence[Any]) -> GraphModul
 
     from tensorplay.graph.passes.functionalize import functionalize
     from tensorplay.graph.passes.shape_prop import ShapeProp
+    from .api import _release_recorded_values
 
     functional = functionalize(gm)
+    _release_recorded_values(gm)
     with tensorplay.no_grad():
         ShapeProp(list(example_inputs))(functional)
     return functional
@@ -458,6 +462,7 @@ def aot_function(
 
     _release_recorded_values(joint)
     _release_recorded_values(fw_module)
+    _release_recorded_values(bw_module)
     compiled_bw_box: list[Any] = []
     fw_codegen = getattr(compiled_fw, "_tensorplay_codegen", None)
 
@@ -521,6 +526,10 @@ def aot_function(
                 _restore_saved(ctx, saved_names), named, ctx.run_primals
             )
             if not compiled_bw_box:
+                from tensorplay.graph.passes.shape_prop import ShapeProp
+
+                with tensorplay.no_grad():
+                    ShapeProp(inputs)(bw_module)
                 compiled_bw_box.append(bw_compiler(bw_module, inputs))
                 _release_recorded_values(bw_module)
                 run_training._tensorplay_backward_codegen = getattr(
@@ -612,6 +621,9 @@ def aot_module_simplified(
     """
 
     names, read_state, substitute = _state_access(module)
+    from .api import _release_recorded_values
+
+    _release_recorded_values(module)
     count = len(names)
 
     def flat_fn(*flat: Any) -> Any:

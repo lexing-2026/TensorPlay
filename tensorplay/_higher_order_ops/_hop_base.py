@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import threading
+import weakref
 from collections.abc import Callable
 from typing import Any, Optional
 
@@ -330,7 +331,11 @@ class FakeTensorMode:
     def mark(self, tensor: Any) -> Any:
         """Record ``tensor`` as standing for the value it was made from."""
 
-        _FAKE_CONSTANTS[id(tensor)] = tensor
+        if isinstance(tensor, Tensor):
+            _FAKE_CONSTANTS[id(tensor)] = tensor
+        elif isinstance(tensor, (tuple, list)):
+            for value in tensor:
+                self.mark(value)
         return tensor
 
     def __tensorplay_dispatch__(self, func, types, args=(), kwargs=None):
@@ -365,10 +370,9 @@ _ACTIVE_FAKE_MODE: contextvars.ContextVar[Optional["FakeTensorMode"]] = (
 
 #: What each stand-in stands for, held beside the values rather than on them.
 #: A tensor carries no room of its own for a note saying what it is standing
-#: in for, and a stand-in outlives the region that made it -- a graph captured
-#: under one is read long after that region has closed -- so the table is not
-#: scoped to a region either.
-_FAKE_CONSTANTS: dict[int, Any] = {}
+#: in for.  Entries last as long as their tensors do; recording a value does
+#: not extend the lifetime of its storage.
+_FAKE_CONSTANTS: weakref.WeakValueDictionary[int, Any] = weakref.WeakValueDictionary()
 
 
 def is_fake_tensor(t: Any) -> bool:

@@ -1,4 +1,6 @@
 import copy
+import gc
+import weakref
 
 import pytest
 
@@ -86,7 +88,7 @@ def test_compiled_graphs_release_recorded_tensors():
 
     compiled = tp.compile(fn, backend="aot_eager")
     value = tp.randn(8, 16, requires_grad=True)
-    compiled(value).backward()
+    result = compiled(value)
 
     lowering = next(iter(compiled._tensorplay_cache.values()))
     for graph in lowering._tensorplay_aot_graphs:
@@ -94,3 +96,25 @@ def test_compiled_graphs_release_recorded_tensors():
             not isinstance(node.meta.get("val"), tp.Tensor)
             for node in graph.graph.nodes
         )
+    result.backward()
+    for graph in lowering._tensorplay_aot_graphs:
+        assert all(
+            not isinstance(node.meta.get("val"), tp.Tensor)
+            for node in graph.graph.nodes
+        )
+
+
+@pytest.mark.parametrize("cache_enabled", [True, False])
+def test_compiled_calls_do_not_keep_inputs(cache_enabled, monkeypatch):
+    import tensorplay.compiler.config as config
+
+    monkeypatch.setattr(config, "force_disable_caches", not cache_enabled)
+    compiled = tp.compile(lambda value: value.sin().sum(), backend="stax")
+    refs = []
+    for _ in range(3):
+        value = tp.randn(8, requires_grad=True)
+        refs.append(weakref.ref(value))
+        compiled(value).backward()
+        del value
+        gc.collect()
+        assert all(ref() is None for ref in refs)

@@ -7,11 +7,34 @@ formulas, and the shape of a captured graph (one opaque node per operator
 call, with the branch bodies attached as subgraphs).
 """
 
+import gc
+import weakref
+
 import pytest
 
 import tensorplay as tp
 from tensorplay._higher_order_ops import map, scan
 from tensorplay._higher_order_ops.utils import make_fx
+
+
+def test_fake_tensor_tracking_does_not_own_storage():
+    from tensorplay._higher_order_ops._hop_base import (
+        FakeTensorMode,
+        is_fake_tensor,
+        maybe_get_fake_constant,
+    )
+
+    mode = FakeTensorMode()
+    first = tp.ones(4)
+    second = tp.ones(8)
+    values = (first, [second])
+    assert mode.mark(values) is values
+    assert is_fake_tensor(first) and is_fake_tensor(second)
+    assert maybe_get_fake_constant(first) is first
+    refs = [weakref.ref(first), weakref.ref(second)]
+    del first, second, values
+    gc.collect()
+    assert all(ref() is None for ref in refs)
 
 
 # ---------------------------------------------------------------------------

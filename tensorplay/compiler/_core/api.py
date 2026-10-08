@@ -1129,6 +1129,9 @@ def _compile_region(
                     "TensorPlay could not capture the requested compiler region"
                 ) from exc
             store_region(region_key, graph_module)
+            tracer._node_samples.clear()
+            tracer.sample_inputs.clear()
+            tracer._samples.clear()
 
     # Capture, propagation and lowering all execute the program to record or
     # measure it.  The generator they advance belongs to the caller, so the
@@ -1166,7 +1169,7 @@ def _compile_region(
             # reason to reject an otherwise compilable region.
             # Propagation executes the graph: it must not count as a call either.
             try:
-                with _preserve_module_state(model):
+                with _preserve_module_state(model), tensorplay.no_grad():
                     ShapeProp(backend_inputs)(graph_module)
             except (GraphCaptureError, RuntimeError):
                 pass
@@ -1287,6 +1290,9 @@ def _release_recorded_values(graph_module: Any) -> None:
         value = meta.get("val")
         if value is not None:
             meta["val"] = strip(value)
+    samples = getattr(graph_module, "meta", {}).get("sample_inputs")
+    if samples is not None:
+        graph_module.meta["sample_inputs"] = strip(samples)
 
 
 _SHAPE_GUARD_ATTRS = frozenset({"shape", "len", "ndim"})
