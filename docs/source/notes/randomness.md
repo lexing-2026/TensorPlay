@@ -243,7 +243,7 @@ uninitialized tensor, allocate it explicitly instead — for example with
 {meth}`tensorplay.zeros` — and the result becomes reproducible.
 
 Note that {func}`tensorplay.use_deterministic_algorithms` only gates the
-algorithms it lists on the {doc}`deterministic` page; it does not change what
+algorithms it lists on the {doc}`deterministic page <../deterministic>`; it does not change what
 {meth}`tensorplay.empty` returns.
 
 ## DataLoader

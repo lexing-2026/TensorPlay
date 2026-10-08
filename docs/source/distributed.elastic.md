@@ -119,8 +119,8 @@ records the terminal outcome per role.
     tensorplay.distributed.elastic.rendezvous.RendezvousSettings
     tensorplay.distributed.elastic.rendezvous.DynamicRendezvousHandler
     tensorplay.distributed.elastic.rendezvous.StaticTCPRendezvous
-    tensorplay.distributed.elastic.rendezvous.C10dRendezvousBackend
     tensorplay.distributed.elastic.rendezvous.P10dRendezvousBackend
+    tensorplay.distributed.elastic.rendezvous.TpRendezvousBackend
     tensorplay.distributed.elastic.rendezvous.create_handler
 ```
 
@@ -140,9 +140,10 @@ in `config`. {class}`~tensorplay.distributed.elastic.rendezvous.StaticTCPRendezv
 implements the simplest backend over a static TCP store (fixed membership),
 {class}`~tensorplay.distributed.elastic.rendezvous.DynamicRendezvousHandler`
 is the dynamic variant used by the etcd/tcp backends that allow membership to
-change, and {class}`~tensorplay.distributed.elastic.rendezvous.C10dRendezvousBackend`
-backed by a process-group store and its XPU counterpart
-{class}`~tensorplay.distributed.elastic.rendezvous.P10dRendezvousBackend`.
+change, while {class}`~tensorplay.distributed.elastic.rendezvous.P10dRendezvousBackend`
+and {class}`~tensorplay.distributed.elastic.rendezvous.TpRendezvousBackend`
+run over the key/value stores the process group already provides
+(`TCPStore`, `FileStore`), so a rendezvous needs no third-party service.
 {func}`~tensorplay.distributed.elastic.rendezvous.create_handler` builds a
 handler from a backend name and parameters.
 

@@ -818,7 +818,7 @@ Handlers that support dumping:
 +------------------------------------+------------------------+---------------------------------------------------+
 | ``FlightRecorderHandler``          | ``fr_trace``           | CPU + NCCL flight-recorder tables.                |
 +------------------------------------+------------------------+---------------------------------------------------+
-| ``CommsFlightRecorderHandler``    | ``torchcomms_fr_trace``| Communication-layer flight-recorder tables.     |
+| ``CommsFlightRecorderHandler``     | ``torchcomms_fr_trace``| Communication-layer flight-recorder tables.       |
 +------------------------------------+------------------------+---------------------------------------------------+
 | ``WaitCountersHandler``            | ``wait_counters``      | Wait counter JSON for all ranks.                  |
 +------------------------------------+------------------------+---------------------------------------------------+
