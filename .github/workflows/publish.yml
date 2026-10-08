@@ -421,3 +421,11 @@ jobs:
 
       - name: Publish CPU wheels to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # A run that is refused part way through leaves the wheels it
+          # already uploaded on PyPI, and the index answers "File already
+          # exists" for each of them, so the repair dispatch that is meant to
+          # finish the upload dies on the first file that already landed.
+          # Skipping what is there is what makes that dispatch able to
+          # complete a partial release.
+          skip-existing: true
