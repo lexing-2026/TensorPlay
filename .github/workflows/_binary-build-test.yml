@@ -411,6 +411,19 @@ jobs:
             *) echo "Unsupported runner OS: $RUNNER_OS" >&2; exit 1 ;;
           esac
 
+      # A weak function the linker took from an AVX2/AVX512 kernel copy runs
+      # those instructions outside the dispatcher and kills CPUs without them
+      # (Note [Linking ISA-tier kernel copies] in p10/CMakeLists.txt).
+      - name: Check the wheel for leaked ISA-tier code
+        if: ${{ runner.os == 'Linux' && runner.arch == 'X64' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheels=(dist/*.whl)
+          unpacked="$(mktemp -d)"
+          python3 -m zipfile -e "${wheels[0]}" "$unpacked"
+          python3 tools/check_isa_tier_leaks.py "$unpacked/tensorplay/lib/libp10.so"
+
       - name: Compiler cache statistics
         if: always()
         shell: bash
