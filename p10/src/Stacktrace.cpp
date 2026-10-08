@@ -45,12 +45,14 @@ struct SymbolHelper {
     }
 };
 
-std::string get_stacktrace() {
+// DbgHelp is single-threaded, so every capture runs under this lock.
+static std::mutex& symbol_mutex() {
     static std::mutex mtx;
-    std::lock_guard<std::mutex> lock(mtx);
-    if (!stacktrace_enabled()) {
-        return "";
-    }
+    return mtx;
+}
+
+// The capture itself, with no switch on it; the caller holds symbol_mutex().
+static std::string capture_stacktrace() {
     static SymbolHelper* symHelper = new SymbolHelper(); // Initialized once, never destroyed
 
     void* stack[64];
@@ -86,6 +88,24 @@ std::string get_stacktrace() {
         }
     }
     return ss.str();
+}
+
+std::string get_stacktrace() {
+    if (!stacktrace_enabled()) {
+        return "";
+    }
+    std::lock_guard<std::mutex> lock(symbol_mutex());
+    return capture_stacktrace();
+}
+
+std::string capture_stacktrace_unconditional() {
+    // A thread that faulted inside DbgHelp still holds the lock; waiting for it
+    // would hang the dying process instead of letting it exit.
+    std::unique_lock<std::mutex> lock(symbol_mutex(), std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return "C++ Stack Trace: unavailable, the symbolizer was busy.\n";
+    }
+    return capture_stacktrace();
 }
 
 #else // non-Windows
