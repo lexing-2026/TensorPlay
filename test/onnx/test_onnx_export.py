@@ -874,6 +874,56 @@ class TestOpsetAndDynamicShapes:
         model = onnx_export(program)
         assert model.graph.input[0].type.tensor_type.shape.dim[0].dim_param == "batch"
 
+    def test_program_dynamic_shapes_follow_renamed_inputs(self):
+        # ``input`` is renamed in the graph, and input_names renames it again.
+        program = export(
+            tp.nn.Linear(4, 2),
+            tp.randn((3, 4)),
+            dynamic_shapes={"input": {0: Dim("batch")}},
+        )
+        for names, expected in ((None, "input_0"), (["features"], "features")):
+            model = onnx_export(program, input_names=names)
+            (graph_input,) = model.graph.input
+            assert graph_input.name == expected
+            assert graph_input.type.tensor_type.shape.dim[0].dim_param == "batch"
+
+        hinted = export(
+            tp.nn.Linear(4, 2), tp.randn((3, 4)), dynamic_shapes={"input": {0: Dim.DYNAMIC}}
+        )
+        model = onnx_export(hinted)
+        assert model.graph.input[0].type.tensor_type.shape.dim[0].dim_param == "input_dim_0"
+
+    def test_dynamic_axes_reach_the_capture(self):
+        def fn(x):
+            return x + x.shape[0]
+
+        model = onnx_export(
+            (_as_module(fn), tp.randn(2, 4)),
+            input_names=["x"],
+            output_names=["y"],
+            dynamic_axes={"x": {0: "batch"}, "y": {0: "batch"}},
+            verify=True,
+        )
+        session = ort.InferenceSession(
+            model.SerializeToString(), providers=["CPUExecutionProvider"]
+        )
+        for batch in (1, 5):
+            data = tp.randn(batch, 4)
+            np.testing.assert_allclose(
+                session.run(None, {"x": data.numpy()})[0], fn(data).numpy()
+            )
+
+    def test_dynamic_axes_reject_a_program_that_fixes_them(self):
+        def fn(x):
+            return x * 2 if x.shape[0] == 2 else x
+
+        with pytest.raises(RuntimeError, match="Dim.DYNAMIC"):
+            onnx_export(
+                (_as_module(fn), tp.randn(2, 4)),
+                input_names=["x"],
+                dynamic_axes={"x": {0: "batch"}},
+            )
+
 
 class _Attention(tp.nn.Module):
     """Reads its extents off a computed value, as transformer blocks do."""

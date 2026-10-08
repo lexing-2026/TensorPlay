@@ -20,6 +20,7 @@ from typing import Any, Mapping, Sequence
 from onnx import TensorProto, checker, helper, numpy_helper, shape_inference
 
 from ..export import ExportedProgram, export as tp_export
+from ..export.dynamic_shapes import _DimHint, _DimHintType
 from ..graph._utils import _iter_nodes
 from . import _external_data, _passes, errors, testing, utils, verification
 from ._composite_ops import (
@@ -559,23 +560,32 @@ class _Converter:
 # ---------------------------------------------------------------------------
 
 
-def _to_exported_program(model: Any, dynamic_axes: Any) -> tuple[ExportedProgram, Any]:
+def _to_exported_program(
+    model: Any,
+    dynamic_axes: Any,
+    input_names: Sequence[str] | None = None,
+    output_names: Sequence[str] | None = None,
+) -> tuple[ExportedProgram, Any]:
     if isinstance(model, ExportedProgram):
-        if dynamic_axes is None and model.dynamic_shapes:
-            dynamic_axes = _dynamic_shapes_to_dynamic_axes(
-                model.dynamic_shapes, model.graph_signature.user_inputs
-            )
+        if dynamic_axes is None:
+            dynamic_axes = _dynamic_shapes_to_dynamic_axes(model, input_names)
         return model, dynamic_axes
     if isinstance(model, (list, tuple)) and model:
         callable_, *rest = model
         kwargs: dict[str, Any] = {}
         if rest and isinstance(rest[-1], dict):
             kwargs = dict(rest.pop())
-        if "dynamic_shapes" in kwargs and dynamic_axes is None:
-            dynamic_axes = _dynamic_shapes_to_dynamic_axes(
-                kwargs["dynamic_shapes"], None
+        if dynamic_axes and "dynamic_shapes" not in kwargs:
+            # The capture has to know which input extents vary, or a program
+            # that reads them would keep the example's sizes.
+            dynamic_shapes = _dynamic_axes_to_dynamic_shapes(
+                callable_, rest, kwargs, dynamic_axes, input_names, output_names
             )
+            if dynamic_shapes:
+                kwargs["dynamic_shapes"] = dynamic_shapes
         program = tp_export(callable_, *rest, **kwargs)
+        if dynamic_axes is None:
+            dynamic_axes = _dynamic_shapes_to_dynamic_axes(program, input_names)
         return program, dynamic_axes
     raise TypeError(
         "expected an ExportedProgram or a (model, *args, kwargs) sequence, got "
@@ -645,7 +655,9 @@ def export(
         The :class:`onnx.ModelProto` when ``f`` is ``None``, else ``None``.
     """
 
-    program, dynamic_axes = _to_exported_program(exported_program, dynamic_axes)
+    program, dynamic_axes = _to_exported_program(
+        exported_program, dynamic_axes, input_names, output_names
+    )
     opset = DEFAULT_OPSET_VERSION if opset_version is None else int(opset_version)
     if opset < MIN_OPSET_VERSION:
         raise ValueError(
@@ -729,21 +741,74 @@ def _producer_version() -> str:
         return "dev"
 
 
-def _dynamic_shapes_to_dynamic_axes(
-    dynamic_shapes: Mapping[str, Mapping[int, Any]],
-    user_inputs: Sequence[str] | None,
-) -> dict | None:
-    """Translate ``export(dynamic_shapes=...)`` into ONNX ``dynamic_axes``."""
+def _dynamic_axes_to_dynamic_shapes(
+    model: Any,
+    args: Sequence[Any],
+    kwargs: Mapping[str, Any],
+    dynamic_axes: Mapping[str, Any],
+    input_names: Sequence[str] | None,
+    output_names: Sequence[str] | None,
+) -> dict[str, dict[int, Any]] | None:
+    """Translate ONNX ``dynamic_axes`` into ``export(dynamic_shapes=...)``.
 
+    Every axis named for an input becomes ``Dim.DYNAMIC``: dynamic, with the
+    range left for export to settle, and an error if the program fixes it.
+    Inputs are named by ``input_names`` in argument order, or by their
+    argument names.
+    """
+
+    from ..export import Dim
+    from ..export.dynamic_shapes import _combine_args
+
+    arguments = list(_combine_args(model, tuple(args), kwargs))
+    by_name = {
+        (input_names[index] if input_names and index < len(input_names) else name): name
+        for index, name in enumerate(arguments)
+    }
+    outputs = set(output_names or ())
+    shapes: dict[str, dict[int, Any]] = {}
+    for name, axes in dynamic_axes.items():
+        argument = by_name.get(name, name if name in arguments else None)
+        if name in outputs or argument is None or axes is None:
+            continue
+        shapes[argument] = {int(axis): Dim.DYNAMIC for axis in axes}
+    return shapes or None
+
+
+def _dynamic_shapes_to_dynamic_axes(
+    program: ExportedProgram, input_names: Sequence[str] | None
+) -> dict | None:
+    """The ONNX ``dynamic_axes`` a program's ``dynamic_shapes`` declare.
+
+    The specification names the program's arguments; the axes name the ONNX
+    inputs those arguments become (``input_names`` in order, else the input
+    placeholders' names).
+    """
+
+    dynamic_shapes = program.dynamic_shapes
     if not dynamic_shapes:
         return None
-    names = list(user_inputs or dynamic_shapes.keys())
+    user_inputs = set(program.graph_signature.user_inputs)
+    placeholders = [
+        node for node in program.graph_module.graph.placeholders if node.name in user_inputs
+    ]
+    # User placeholders follow the callable's arguments in order.
+    signature = program.graph_module.meta.get("user_signature")
+    arguments = list(signature.parameters) if signature is not None else []
+    onnx_names: dict[str, str] = {}
+    for index, node in enumerate(placeholders):
+        argument = arguments[index] if index < len(arguments) else str(node.target)
+        named = input_names is not None and index < len(input_names)
+        onnx_names[argument] = input_names[index] if named else node.name
     result: dict[str, dict[int, str]] = {}
-    for index, (argument, dims) in enumerate(dynamic_shapes.items()):
+    for argument, dims in dynamic_shapes.items():
         axes: dict[int, str] = {}
-        for axis, spec in dims.items():
-            if hasattr(spec, "name"):
+        entries = dims.items() if isinstance(dims, Mapping) else enumerate(dims or ())
+        for axis, spec in entries:
+            if hasattr(spec, "name") and not isinstance(spec, int):
                 axes[int(axis)] = str(spec.name)
+            elif isinstance(spec, _DimHint) and spec.type is not _DimHintType.STATIC:
+                axes[int(axis)] = f"{argument}_dim_{int(axis)}"
         if axes:
-            result[names[index] if index < len(names) else argument] = axes
+            result[onnx_names.get(argument, argument)] = axes
     return result or None

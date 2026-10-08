@@ -2257,6 +2257,7 @@ def _guard_noop(ctx: OpContext) -> None:
 for _guard_name, _guard_params in (
     ("_assert_dim_range", "tensor index min max name"),
     ("_assert_dims_equal", "tensor_a index_a tensor_b index_b name"),
+    ("_assert_shape_guard", "value expected guard"),
     (
         "_assert_dim_relation",
         "tensor_root index_root tensor_derived index_derived scale offset name",
