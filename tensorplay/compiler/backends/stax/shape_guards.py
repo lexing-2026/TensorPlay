@@ -54,8 +54,13 @@ def build_input_guard(graph):
     bindings = {}
     checks = []
     layouts = []
+    scalars = []
     for index, name in enumerate(graph.graph_input_names):
         value = graph.graph_inputs.get(name)
+        if isinstance(value, sympy.Symbol):
+            bindings.setdefault(value, f"args[{index}]")
+        if isinstance(value, sympy.Basic):
+            scalars.append((index, value))
         if not hasattr(value, "get_size"):
             continue
         sizes, strides = value.get_size(), value.get_stride()
@@ -80,6 +85,10 @@ def build_input_guard(graph):
                 checks.append(f"args[{index}].{kind}()[{dim}] == ({rendered(expr)})")
                 if kind == "size" and sympy.sympify(expr).free_symbols:
                     checks.append(f"args[{index}].size()[{dim}] >= 2")
+    for index, expression in scalars:
+        checks.append(f"args[{index}] == ({rendered(expression)})")
+        if expression.free_symbols:
+            checks.append(f"args[{index}] >= 2")
     for guard in graph.shape_env.guards:
         checks.append(f"({rendered(guard.expr)})")
     for assertions in graph.shape_env.deferred_runtime_asserts.values():

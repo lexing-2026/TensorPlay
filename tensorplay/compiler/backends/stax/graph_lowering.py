@@ -2138,6 +2138,8 @@ class GraphLowering(Interpreter):
         name = self.qualify_name(target)
 
         if not _is_tensor(example):
+            if self.shape_env is not None and self.current_node.meta.get("symbolic_scalar"):
+                example = self.shape_env.create_symbol(int(example), name)
             # A value rather than a tensor: recorded so that a step which asks
             # what this input is learns that it is not a tensor, and returned
             # unchanged so that whatever asked for it can use it.
@@ -2363,7 +2365,7 @@ class GraphLowering(Interpreter):
                 self.graph_outputs.append(ir.NoneAsConstantBuffer())
                 continue
             self.graph_outputs.append(
-                self.realize_input(value) if isinstance(value, IRNode) else value
+                self.realize_input(value)
             )
         self._separate_aliased_outputs()
         self.single_output = len(self.graph_outputs) == 1

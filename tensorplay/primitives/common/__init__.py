@@ -885,16 +885,21 @@ def elementwise_dtypes(*_args, type_promotion_kind) -> tuple[dtype, dtype]:
     floating point and complex dtypes up ("op math") unless the promotion
     kind disables it.
     """
+    import sympy
+
     args = _args
     highest_type: type = bool
     for x in args:
-        if not isinstance(x, (*Number, TensorLike)):
+        if not isinstance(x, (*Number, TensorLike, sympy.Basic)):
             raise ValueError(
                 f"Unexpected type {str(type(x))} when computing elementwise "
                 f"type promotion!"
             )
         if isinstance(x, Number):
             highest_type = get_higher_type(highest_type, number_type(x))
+        elif isinstance(x, sympy.Basic):
+            scalar_type = bool if x.kind is sympy.core.kind.BooleanKind else int if x.is_integer else float
+            highest_type = get_higher_type(highest_type, scalar_type)
         else:
             highest_type = get_higher_type(highest_type, dtype_to_type(x.dtype))
 

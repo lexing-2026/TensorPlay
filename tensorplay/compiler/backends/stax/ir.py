@@ -6933,6 +6933,12 @@ class ExternKernel(InputsKernel):
         one copy per value; a caller that can write what it is given must not.
         """
 
+        if x is None:
+            return NoneAsConstantBuffer()
+        if isinstance(x, (sympy.Expr, sympy.logic.boolalg.Boolean, int)):
+            return ShapeAsConstantBuffer(expr=x)
+        if isinstance(x, ShapeAsConstantBuffer):
+            return x
         if isinstance(x, TensorBox):
             return cls.realize_input(x.data, allow_shared=allow_shared)
         if isinstance(x, ConstantBuffer):
