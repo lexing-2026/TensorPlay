@@ -1003,6 +1003,7 @@ def _adapt_backend_to_region(
     # rather see as their parts; the trace writes those in their parts.
     backend_decompositions = getattr(compiler_fn, "trace_decompositions", None)
     adapted = aot_autograd(
+        dynamic_shapes=backend_kwargs.get("dynamic") is True,
         fw_compiler=forward_compiler,
         bw_compiler=forward_compiler,
         # Keep the cheapest cut of forward values and let the backward

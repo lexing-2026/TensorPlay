@@ -36,9 +36,12 @@ another guarded artifact. Sizes zero and one have separate specializations.
 `strict_native=True` raises when a region cannot be generated instead of
 executing its graph as a fallback.
 
-Training currently captures native gradient formulas with concrete saved
-sizes. Changing a training input's shape or strides therefore recaptures the
-forward and backward region. Symbolic graph capture is available through
+Training preserves saved dimensions as symbolic scalar values for pointwise
+operations, sum/mean reductions, broadcasting and reshape/expand derivatives.
+Compatible sizes reuse one forward artifact and one backward artifact; each
+forward invocation saves its own dimensions for the later backward call.
+Gradient formulas that still save concrete shape metadata or scalar operands select guarded
+specializations when that metadata changes. Symbolic graph capture is available through
 `make_graph(..., tracing_mode="symbolic")`; storage-free fake tracing and
 data-dependent output extents remain unsupported by that capture entry point.
 Tensor inputs nested in containers and call-outs with concrete output metadata

@@ -40,6 +40,7 @@ _AOT_KWARGS = frozenset(
         "partition_fn",
         "decompositions",
         "keep_inference_input_mutations",
+        "dynamic_shapes",
     }
 )
 

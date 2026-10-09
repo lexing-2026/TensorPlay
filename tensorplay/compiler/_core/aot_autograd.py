@@ -134,6 +134,20 @@ class _TaggingTracer(DispatchTracer):
 
     backward = False
 
+    def __init__(self, *, record_values=False, dynamic_shapes=False):
+        super().__init__(record_values=record_values)
+        self.dynamic_shapes = dynamic_shapes
+        self.native_shape_nodes = {}
+        self.native_shape_values = {}
+        self.static_autograd_metadata = False
+
+    def map_operands(self, value):
+        if self.dynamic_shapes and isinstance(value, tensorplay.SymInt):
+            from tensorplay.graph.experimental._symbolic_dispatch import map_native_symbol
+
+            return map_native_symbol(self, value)
+        return super().map_operands(value)
+
     def record(self, func, args, kwargs, out):
         before = len(list(self.graph.nodes))
         node = super().record(func, args, kwargs, out)
@@ -180,7 +194,7 @@ def _trace_forward(fn: Callable[..., Any], primals: Sequence[Any], decomposition
     return GraphModule(tracer.root, tracer.graph), out_spec, flat_out
 
 
-def _trace_joint(fn: Callable[..., Any], primals: Sequence[Any], decompositions):
+def _trace_joint(fn: Callable[..., Any], primals: Sequence[Any], decompositions, *, dynamic_shapes=False):
     """Trace forward + backward into one tagged joint graph.
 
     Returns ``(joint, out_spec, flat_out, num_fwd_outputs, trace_primals,
@@ -197,7 +211,12 @@ def _trace_joint(fn: Callable[..., Any], primals: Sequence[Any], decompositions)
     from tensorplay.primitives.common import CUDARngStateHelper
     from tensorplay.utils._dispatch import _disable_current_modes
 
-    tracer = _TaggingTracer(record_values=False)
+    tracer = _TaggingTracer(record_values=False, dynamic_shapes=dynamic_shapes)
+    mode_type = ProxyTensorDispatchMode
+    if dynamic_shapes:
+        from tensorplay.graph.experimental._symbolic_dispatch import SymbolicDispatchMode
+
+        mode_type = SymbolicDispatchMode
     trace_primals = _trace_inputs(primals)
     primal_nodes = _placeholders(tracer, trace_primals, "primals")
     diff_inputs = [p for p in trace_primals if _is_tensor(p) and p.requires_grad]
@@ -219,7 +238,7 @@ def _trace_joint(fn: Callable[..., Any], primals: Sequence[Any], decompositions)
         PhiloxStateTracker.record_state(fwd_seed, fwd_base_offset, "forward")
         PhiloxStateTracker.record_state(bwd_seed, bwd_base_offset, "backward")
     with tensorplay.random.fork_rng(devices=_trace_devices(primals)):
-        with ProxyTensorDispatchMode(tracer, decompositions):
+        with mode_type(tracer, decompositions):
             with tensorplay.enable_grad():
                 out = fn(*trace_primals)
             flat_out, out_spec = tree_flatten(out)
@@ -253,6 +272,7 @@ def _trace_joint(fn: Callable[..., Any], primals: Sequence[Any], decompositions)
     tracer.graph.eliminate_dead_code()
     tracer._tracked.clear()
     joint = GraphModule(tracer.root, tracer.graph)
+    joint.meta["static_autograd_metadata"] = tracer.static_autograd_metadata
     return (
         joint,
         out_spec,
@@ -353,6 +373,7 @@ def aot_function(
     partition_fn: Callable[..., Any] | None = None,
     decompositions: Mapping[Any, Callable[..., Any]] | None = None,
     keep_inference_input_mutations: bool = False,
+    dynamic_shapes: bool = False,
 ) -> Callable[..., Any]:
     """Compile ``fn(*primals)`` (flat primals) with an AOT forward/backward."""
 
@@ -378,6 +399,7 @@ def aot_function(
             partition_fn=partition_fn,
             decompositions=decompositions,
             keep_inference_input_mutations=keep_inference_input_mutations,
+            dynamic_shapes=dynamic_shapes,
         )
 
         def run_flattened(*args: Any) -> Any:
@@ -443,8 +465,9 @@ def aot_function(
         _tangent_names,
         _diff_outputs,
     ) = _trace_joint(
-        fn, primals, decompositions
+        fn, primals, decompositions, dynamic_shapes=dynamic_shapes
     )
+    static_autograd_metadata = joint.meta.get("static_autograd_metadata", False)
     joint = _functionalize(
         joint, _trace_inputs(trace_primals) + [t.clone() for t in tangents]
     )
@@ -607,7 +630,10 @@ def aot_function(
             for i, shape, stride in metadata
         ) and (guard is None or guard(*(args[i] for i in fw_input_order)))
 
-    run_training._tensorplay_guard = training_guard
+    run_training._tensorplay_guard = (
+        (lambda *args: guard is None or guard(*(args[i] for i in fw_input_order)))
+        if dynamic_shapes and not static_autograd_metadata else training_guard
+    )
     return run_training
 
 
@@ -644,6 +670,7 @@ def aot_module_simplified(
     partition_fn: Callable[..., Any] | None = None,
     decompositions: Mapping[Any, Callable[..., Any]] | None = None,
     keep_inference_input_mutations: bool = False,
+    dynamic_shapes: bool = False,
     **_: Any,
 ) -> Callable[..., Any]:
     """Compile a module whose parameters and buffers become graph inputs.
@@ -660,11 +687,18 @@ def aot_module_simplified(
     _release_recorded_values(module)
     count = len(names)
 
+    def call_module(*args):
+        if dynamic_shapes and isinstance(module, GraphModule):
+            from tensorplay.graph.experimental._symbolic_dispatch import SymbolicGraphInterpreter
+
+            return SymbolicGraphInterpreter(module).run(*args)
+        return module(*args)
+
     def flat_fn(*flat: Any) -> Any:
         if count == 0:
-            return module(*flat)
+            return call_module(*flat)
         with substitute(dict(zip(names, flat[:count]))):
-            return module(*flat[count:])
+            return call_module(*flat[count:])
 
     example = read_state() + list(example_inputs)
     compiled = aot_function(
@@ -676,6 +710,7 @@ def aot_module_simplified(
         partition_fn=partition_fn,
         decompositions=decompositions,
         keep_inference_input_mutations=keep_inference_input_mutations,
+        dynamic_shapes=dynamic_shapes,
     )
 
     class _AotForward:

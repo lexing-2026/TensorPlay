@@ -29,8 +29,10 @@ Tensor dispatch_shape(const char* name, const Tensor& value,
 std::vector<SymInt> symbolic_sizes(const Tensor& value) {
     std::vector<SymInt> result;
     result.reserve(value.dim());
+    const auto keys = tensorplay::impl::tls_local_dispatch_key_set();
+    const bool tracing = keys.included.has(DispatchKey::Python) && !keys.excluded.has(DispatchKey::Python);
     for (int64_t axis = 0; axis < value.dim(); ++axis) {
-        result.push_back(Tensor::sym_size(value, axis));
+        result.push_back(tracing ? Tensor::sym_size(value, axis) : SymInt(value.size(axis)));
     }
     return result;
 }

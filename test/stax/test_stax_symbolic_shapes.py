@@ -158,7 +158,7 @@ def test_shape_branch_guards_reuse_both_sides():
 
 
 @pytest.mark.parametrize("device", DEVICES)
-def test_training_recaptures_saved_shapes_before_backward(device):
+def test_training_reuses_forward_and_backward_across_sizes(device):
     artifacts = []
     fn = lambda x: (x * x).mean()
     compiled = tp.compile(fn, backend=_counting_backend(artifacts), dynamic=True, strict_native=True)
@@ -170,9 +170,10 @@ def test_training_recaptures_saved_shapes_before_backward(device):
         expected.backward()
         assert tp.allclose(actual, expected)
         assert tp.allclose(x.grad, ref.grad)
+    assert len(artifacts) == 2
 
 
-def test_training_fallback_recaptures_saved_shapes(monkeypatch):
+def test_training_fallback_reuses_saved_symbolic_shapes(monkeypatch):
     from tensorplay.compiler.backends.stax.graph_lowering import GraphLowering
 
     def cannot_generate(self):
@@ -180,13 +181,95 @@ def test_training_fallback_recaptures_saved_shapes(monkeypatch):
 
     monkeypatch.setattr(GraphLowering, "compile_to_module", cannot_generate)
     fn = lambda x: (x * x).mean()
-    compiled = tp.compile(fn, dynamic=True)
+    artifacts = []
+    compiled = tp.compile(fn, backend=_counting_backend(artifacts), dynamic=True)
     for size in (3, 7, 3):
         x = tp.randn(size).requires_grad_()
         ref = x.detach().clone().requires_grad_()
         compiled(x).backward()
         fn(ref).backward()
         assert tp.allclose(x.grad, ref.grad)
+    assert len(artifacts) == 2
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda x: (x * x).sum(),
+        lambda x: (x * x).sum(-1),
+        lambda x: (x * x).mean(0),
+        lambda x: (x * x).mean(-1, keepdim=True),
+        lambda x: (x * x).reshape(x.shape[0], -1),
+        lambda x: (x * x).reshape(x.numel()),
+        lambda x: (x * x).flatten(),
+        lambda x: tp.reshape(x * x, (x.numel(),)),
+        lambda x: x.sum(-1, keepdim=True).expand(x.shape),
+    ],
+)
+@pytest.mark.parametrize("expanded_tangent", [False, True])
+def test_training_shape_formulas_reuse_artifacts(fn, device, expanded_tangent):
+    artifacts = []
+    compiled = tp.compile(fn, backend=_counting_backend(artifacts), dynamic=True, strict_native=True)
+    pending = []
+    for rows, cols in ((3, 7), (5, 11), (2, 4)):
+        x = tp.randn(rows, cols, device=device).requires_grad_()
+        ref = x.detach().clone().requires_grad_()
+        actual, expected = compiled(x), fn(ref)
+        assert actual.shape == expected.shape
+        assert tp.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+        pending.append((x, ref, actual, expected))
+    for x, ref, actual, expected in reversed(pending):
+        tangent = tp.ones((), device=device).expand(actual.shape) if expanded_tangent else tp.randn_like(actual)
+        actual.backward(tangent)
+        expected.backward(tangent)
+        assert tp.allclose(x.grad, ref.grad, atol=1e-5, rtol=1e-5)
+    assert len(artifacts) == 2
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("transpose", [False, True])
+def test_training_broadcast_and_layout_reuse(device, transpose):
+    artifacts = []
+    fn = lambda x, y: ((x + y) * (x + y)).mean()
+    compiled = tp.compile(fn, backend=_counting_backend(artifacts), dynamic=True, strict_native=True)
+    for rows, cols in ((3, 7), (5, 11), (2, 4)):
+        base = tp.randn(cols, rows, device=device).t() if transpose else tp.randn(rows, cols, device=device)
+        x, y = base.requires_grad_(), tp.randn(cols, device=device).requires_grad_()
+        refs = [v.detach().clone().requires_grad_() for v in (x, y)]
+        actual, expected = compiled(x, y), fn(*refs)
+        actual.backward()
+        expected.backward()
+        assert tp.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+        for value, ref in zip((x, y), refs):
+            assert tp.allclose(value.grad, ref.grad, atol=1e-5, rtol=1e-5)
+    assert len(artifacts) == 2
+
+
+@pytest.mark.parametrize("fn", [lambda x: x.var(), lambda x: x.var(-1).sum(), lambda x: (x / x.shape[0]).sum()])
+def test_training_specializes_concrete_saved_metadata(fn):
+    artifacts = []
+    compiled = tp.compile(fn, backend=_counting_backend(artifacts), dynamic=True)
+    for size in (3, 7, 3):
+        x = tp.randn(size, 4).requires_grad_()
+        ref = x.detach().clone().requires_grad_()
+        compiled(x).backward()
+        fn(ref).backward()
+        assert tp.allclose(x.grad, ref.grad, atol=1e-5, rtol=1e-5)
+    assert len(artifacts) == 4
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_symbolic_scalar_results_reuse_artifacts(device):
+    artifacts = []
+    fn = lambda x: (x / x.shape[0], x.shape[0] * x.shape[1])
+    compiled = tp.compile(fn, backend=_counting_backend(artifacts), dynamic=True, strict_native=True)
+    for rows, cols in ((3, 7), (5, 11), (2, 4)):
+        x = tp.randn(rows, cols, device=device)
+        actual, count = compiled(x)
+        assert tp.allclose(actual, fn(x)[0], atol=1e-5, rtol=1e-5)
+        assert count == x.numel()
+    assert len(artifacts) == 1
 
 
 def test_nested_inputs_specialize_concrete_captured_metadata():

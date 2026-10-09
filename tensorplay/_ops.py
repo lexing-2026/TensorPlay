@@ -13,12 +13,15 @@ Two kinds of entries resolve here:
 from __future__ import annotations
 
 import types
+from contextvars import ContextVar
 from typing import Any
 
 import tensorplay
 import tensorplay._C as _C
 
 _active_tracer_getter: Any = None
+
+_symbolic_call_mode = ContextVar("tensorplay_symbolic_call_mode", default=None)
 
 _FLOAT_WIDTH = {
     tensorplay.float16: 0,
@@ -167,6 +170,9 @@ class OpOverload:
             if captured is not None:
                 return captured
         args = _align_eager_dtypes(self._opname, args)
+        mode = _symbolic_call_mode.get()
+        if mode is not None:
+            return mode.call_with_symbolic_args(self, args, kwargs)
         return _C._call_overload(self._key, args, kwargs)
 
     @property
