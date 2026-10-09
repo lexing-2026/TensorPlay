@@ -15,6 +15,14 @@ from tensorplay.graph.experimental import sympy_functions as sf
 _NAMES = ("IntInfinity", "NegativeIntInfinity")
 
 
+def test_integer_bounds_remain_integer_under_powers():
+    extent = sympy.Symbol("extent", integer=True, positive=True)
+    bounds = sf.bound_sympy(extent**2)
+    assert bounds.is_int
+    assert bounds.lower == 1
+    assert bounds.upper is sf.int_oo
+
+
 @pytest.fixture
 def taken_names():
     """The two registry entries, taken over for the length of one test.

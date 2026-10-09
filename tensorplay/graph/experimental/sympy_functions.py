@@ -231,7 +231,7 @@ class ValueRanges(Generic[_T]):
         if isinstance(upper, sympy.Integer) and lower == -sympy.oo:
             lower = -int_oo
         # NB: [-int_oo, -int_oo] and [int_oo, int_oo] are allowed
-        integer_types = (sympy.Integer, _IntegerInfinityKind)
+        integer_types = (sympy.Integer, IntegerInfinity, NegativeIntegerInfinity)
         is_int_lower = isinstance(lower, integer_types)
         is_int_upper = isinstance(upper, integer_types)
 

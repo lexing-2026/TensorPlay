@@ -69,6 +69,19 @@ def test_explicit_names_are_sanitized_and_uniquified():
     g.lint()
 
 
+def test_inserted_conversion_precedes_existing_users():
+    graph = Graph()
+    x = graph.placeholder("x")
+    y = graph.call_function(operator.neg, (x,))
+    graph.output(y)
+    with graph.inserting_after(x):
+        converted = graph.call_method("float", (x,))
+        x.replace_all_uses_with(converted, lambda user: user is not converted)
+    assert list(graph.nodes) == [x, converted, y, graph.output_node]
+    assert y.args == (converted,)
+    graph.lint()
+
+
 def test_output_replaces_previous_output_node():
     g = Graph()
     x = g.placeholder("x")

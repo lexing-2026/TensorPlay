@@ -399,7 +399,8 @@ class _NodeList(list[Node]):
         """
 
         graph = self.graph
-        index = len(self)
+        values = tuple(values)
+        index = len(self) - len(values)
         for node in values:
             node.graph = graph
             node._erased = False
