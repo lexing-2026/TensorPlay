@@ -318,6 +318,52 @@ std::vector<int64_t> parse_int64_list(PyObject* obj) {
     return python_c::tpx_py_intlist(obj);
 }
 
+namespace {
+
+const char* const shape_names[] = {"self", "size"};
+OpEntry symbolic_expand = {"expand", "", shape_names, 2, 2, "", nullptr};
+OpEntry symbolic_reshape = {"reshape", "", shape_names, 2, 2, "", nullptr};
+const char* const divisor_names[] = {"self", "other"};
+OpEntry symbolic_div = {"div.Scalar", "", divisor_names, 2, 2, "", nullptr};
+
+Tensor symbolic_shape_call(const OpEntry& entry, const Tensor& self,
+                           const std::vector<SymInt>& sizes) {
+    ModeCall call(entry);
+    call.set_arg(0, python_c::tpx_py_wrap(self));
+    call.set_arg(1, python_c::tpx_py_wrap_symintlist(sizes));
+    return convert_result(call.invoke(), [](PyObject* result) {
+        return python_c::tpx_py_tensor(result);
+    });
+}
+
+Tensor symbolic_expand_call(const Tensor& self, const std::vector<SymInt>& sizes) {
+    return symbolic_shape_call(symbolic_expand, self, sizes);
+}
+
+Tensor symbolic_reshape_call(const Tensor& self, const std::vector<SymInt>& sizes) {
+    return symbolic_shape_call(symbolic_reshape, self, sizes);
+}
+
+Tensor symbolic_div_call(const Tensor& self, const SymInt& divisor) {
+    ModeCall call(symbolic_div);
+    call.set_arg(0, python_c::tpx_py_wrap(self));
+    call.set_arg(1, python_c::tpx_py_wrap_symint(divisor));
+    return convert_result(call.invoke(), [](PyObject* result) {
+        return python_c::tpx_py_tensor(result);
+    });
+}
+
+struct RegisterSymbolicCalls {
+    RegisterSymbolicCalls() {
+        auto& dispatcher = Dispatcher::singleton();
+        dispatcher.registerKernel("_symbolic.expand", DispatchKey::Python, &symbolic_expand_call);
+        dispatcher.registerKernel("_symbolic.reshape", DispatchKey::Python, &symbolic_reshape_call);
+        dispatcher.registerKernel("_symbolic.div", DispatchKey::Python, &symbolic_div_call);
+    }
+} register_symbolic_calls;
+
+} // namespace
+
 std::optional<Tensor> parse_optional_tensor(PyObject* obj) {
     if (obj == Py_None) return std::nullopt;
     return python_c::tpx_py_tensor(obj);

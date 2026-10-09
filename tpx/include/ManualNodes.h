@@ -2,6 +2,7 @@
 #include "Node.h"
 #include "Autograd.h"
 #include "SavedVariable.h"
+#include "SymbolicShapes.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include <array>
 #include <optional>
@@ -563,21 +564,17 @@ struct CopySlices : public Node {
 // cast in the manual node so a float32 reduction of an fp16/bf16 tensor does
 // not leak a float32 gradient into the leaf or into the SDPA backward node.
 struct MeanBackward : public Node {
-    SavedVariable self_;
+    std::vector<SymInt> sizes_;
+    DType dtype_;
 
-    explicit MeanBackward(Tensor self) : self_(std::move(self)) {}
+    explicit MeanBackward(Tensor self)
+        : sizes_(symbolic_sizes(self)), dtype_(self.dtype()) {}
 
     variable_list apply(variable_list&& inputs) override {
         if (inputs.empty() || !inputs[0].defined()) return {Tensor()};
-        const Tensor self = self_.unpack();
-        Tensor grad = inputs[0].expand(self.shape());
-        if (grad.dtype() != self.dtype()) grad = grad.to(self.dtype());
-        return {grad / Scalar(static_cast<float>(self.numel()))};
-    }
-
-    void release_variables() override {
-        Node::release_variables();
-        self_.reset_data();
+        Tensor grad = inputs[0];
+        if (grad.dtype() != dtype_) grad = grad.to(dtype_);
+        return {mean_backward_symint(grad, sizes_, {}, false)};
     }
 };
 

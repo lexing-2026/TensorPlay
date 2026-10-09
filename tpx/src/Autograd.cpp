@@ -627,12 +627,7 @@ std::vector<Edge> collect_next_edges(const Tensor& t) {
         // Record the forward shape on every edge regardless of target kind:
         // the engine reduces broadcast-inflated grads back to it.  The dtype
         // casts floating gradients to it before the consumer node runs.
-        // Dimension-by-dimension copy: no intermediate Size/vector materialize.
-        const size_t ndim = t.dim();
-        std::vector<int64_t> shape(ndim);
-        for (size_t i = 0; i < ndim; ++i) {
-            shape[i] = t.size(i);
-        }
+        auto shape = symbolic_sizes(t);
         const DType dt = t.dtype();
         auto fill_metadata = [&](Edge& edge) {
             edge.grad_dtype = dt;

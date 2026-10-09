@@ -108,9 +108,7 @@
   self: threshold_backward(grad, result, 0)
   other: threshold_backward(grad, result, 0)
 
-# Cross.cpp/CrossKernel.cpp use the same conjugate-aware formulas as
-# default while delegating the actual three-component calculation to the same
-# native backend kernel.
+# Cross products use conjugated operands in their vector-Jacobian products.
 - name: cross(Tensor self, Tensor other, int? dim=None) -> Tensor
   self: tensorplay::tpx::ops::cross(tensorplay::tpx::ops::conj(other), grad, dim)
   other: tensorplay::tpx::ops::cross(grad, tensorplay::tpx::ops::conj(self), dim)
@@ -249,10 +247,10 @@
 - name: embedding_dense_backward(Tensor grad_output, Tensor indices, SymInt num_weights, SymInt padding_idx, bool scale_grad_by_freq) -> Tensor
   grad_output: embedding_dense_double_backward(grad, indices, num_weights, padding_idx, scale_grad_by_freq)
 
-# (tools/autograd/derivatives.yaml): reshape falls back to a copy when the
+# Reshape falls back to a copy when the
 # incoming grad is not viewable, so non-contiguous grads never error here.
 - name: view(Tensor self, SymInt[] size) -> Tensor
-  self: grad.reshape(self.shape())
+  self: reshape_symint(grad, self.sym_sizes())
 
 - name: clone(Tensor self, *, MemoryFormat? memory_format=None) -> Tensor
   self: grad
@@ -311,7 +309,6 @@
 
 # Native F.linear (CPU kernel; other backends fall through to the composite).
 # Per-slot compositions keep double-backward alive.
-# linear_backward contract (tools/autograd/derivatives.yaml:2388-2391).
 - name: linear(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor
   input: linear_backward_input(grad, input, weight)
   weight: linear_backward_weight(grad, input, weight)
@@ -462,7 +459,7 @@
   self: -0.5 * grad * result.pow(3).conj()
 
 - name: sum(Tensor self, *, ScalarType dtype=Undefined) -> Tensor
-  self: expand(grad, self.shape())
+  self: expand_symint(grad, self.sym_sizes())
   result: auto_linear
 
 - name: mean(Tensor self, *, ScalarType dtype=Undefined) -> Tensor
@@ -475,7 +472,7 @@
   # kept-element count); the former opaque mean_dim_backward kernel broke
   # double-backward the same way matmul's did.  Only the input's shape is
   # read, so the input itself is not kept for the backward pass.
-  self: mean_backward(grad, self.shape(), dim, keepdim)
+  self: mean_backward_symint(grad, self.sym_sizes(), dim, keepdim)
 
 # native that composes dispatched ops).  Same structure here: a recordable
 # tpx-level helper so create_graph sees through max/min(dim).
@@ -488,11 +485,11 @@
 # The reduced dimensions come back as size-one axes and the gradient expands
 # over them: recordable, and only the input's shape is kept.
 - name: sum.dim_IntList(Tensor self, int[] dim, bool keepdim=false, *, ScalarType dtype=Undefined) -> Tensor
-  self: sum_backward(grad, self.shape(), dim, keepdim)
+  self: sum_backward_symint(grad, self.sym_sizes(), dim, keepdim)
   result: auto_linear
 
 - name: reshape(Tensor self, int[] shape) -> Tensor
-  self: grad.reshape(self.shape())
+  self: reshape_symint(grad, self.sym_sizes())
 
 - name: log_softmax(Tensor self, int dim, ScalarType dtype=Undefined) -> Tensor
   self: _log_softmax_backward_data(grad, result, dim, self.dtype())
@@ -1374,7 +1371,6 @@
   self: grad.masked_fill(mask, 0)
   value: sum(where(mask, grad, Scalar(0)))
 
-# derivatives.yaml:1818/1822
 - name: tril(Tensor self, int diagonal=0) -> Tensor
   self: grad.tril(diagonal)
 
@@ -1385,12 +1381,11 @@
 - name: cumsum(Tensor self, int dim, ScalarType? dtype=None) -> Tensor
   self: tensorplay::tpx::ops::flip(tensorplay::tpx::ops::cumsum(tensorplay::tpx::ops::flip(grad, {dim}), dim), {dim})
 
-# gather_backward composite (TensorAdvancedIndexing.cpp:2118):
+# The gather gradient scatters into a zero-initialized input shape:
 # new_zeros(self.sizes()).scatter_add_(dim, index, grad)
 - name: gather(Tensor self, int dim, Tensor index) -> Tensor
   self: zeros_like(self).scatter_add(dim, index, grad)
 
-# derivatives.yaml:1529-1531
 - name: scatter_add(Tensor self, int dim, Tensor index, Tensor src) -> Tensor
   self: grad
   src: grad.gather(dim, index)
@@ -1399,7 +1394,7 @@
 - name: index_select(Tensor self, int dim, Tensor index) -> Tensor
   self: zeros_like(self).index_add(dim, index, grad)
 
-# derivatives.yaml:864+ self: grad; source: grad.index_select(dim, index)
+# The source gradient gathers along the indexed dimension.
 - name: index_add(Tensor self, int dim, Tensor index, Tensor source) -> Tensor
   self: grad
   source: tensorplay::tpx::ops::index_select(grad, dim, index)
@@ -1409,7 +1404,7 @@
 # TensorPlay-native operators; otherwise omitted (no entry = no autograd).
 # ===========================================================================
 
-# derivatives.yaml rsub: other - alpha*self
+# Reverse subtraction computes other - alpha*self.
 - name: rsub.Tensor(Tensor self, Tensor other, Scalar alpha=1) -> Tensor
   self: neg(grad) * alpha
   other: grad
@@ -1417,7 +1412,7 @@
 - name: rsub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor
   self: neg(grad) * alpha
 
-# BinaryOps.cpp true_divide shares div's rules.
+# True division shares div's rules.
 - name: true_divide.Tensor(Tensor self, Tensor other) -> Tensor
   self: grad / other
   other: -(grad * result) / other
@@ -1499,12 +1494,12 @@
 - name: positive(Tensor self) -> Tensor
   self: grad
 
-# BinaryOps.cpp fmod: d/dother = -grad * trunc(self/other)
+# fmod: d/dother = -grad * trunc(self/other)
 - name: fmod.Tensor(Tensor self, Tensor other) -> Tensor
   self: grad
   other: -(trunc(self / other) * grad)
 
-# UnaryOps.cpp reciprocal: -grad / self^2
+# Reciprocal: -grad / self^2
 - name: reciprocal(Tensor self) -> Tensor
   self: -grad * (result * result).conj()
 
@@ -1519,7 +1514,7 @@
   self: where(logical_and(eq(self, 0), le(other, -1)), zeros_like(grad), xlog1py(grad, other))
   other: self * grad / (other + 1)
 
-# BinaryOps.cpp logaddexp
+# Log-add-exp
 - name: logaddexp(Tensor self, Tensor other) -> Tensor
   self: grad * sigmoid(self - other)
   other: grad * sigmoid(other - self)
@@ -1562,15 +1557,15 @@
   self: where(self > max, zeros_like(grad), where(eq(self, max), grad / 2, grad))
   max: where(self < max, zeros_like(grad), where(eq(self, max), grad / 2, grad))
 
-# TensorTransformations.cpp:36 flip is an involution.
-# PixelShuffle.cpp pair are inverses of each other.
+# Flip is an involution.
+# Pixel shuffle and unshuffle are inverses of each other.
 - name: pixel_shuffle(Tensor self, int upscale_factor) -> Tensor
   self: tensorplay::tpx::ops::pixel_unshuffle(grad, upscale_factor)
 
 - name: pixel_unshuffle(Tensor self, int downscale_factor) -> Tensor
   self: tensorplay::tpx::ops::pixel_shuffle(grad, downscale_factor)
 
-# ReduceOps.cpp:1578 logsumexp
+# Log-sum-exp uses normalized exponential weights.
 - name: logsumexp(Tensor self, int[1] dim, bool keepdim=false) -> Tensor
   self: logsumexp_backward(grad, self, result, dim, keepdim)
 
@@ -1773,7 +1768,7 @@
 - name: flip(Tensor self, int[] dims=[]) -> Tensor
   self: tensorplay::tpx::ops::flip(grad, dims)
 
-# TensorTransformations.cpp rot90 is an involution up to sign:
+# Quarter rotations reverse by rotating in the opposite direction:
 # differentiates as grad.rot90(-k, dims).
 - name: rot90(Tensor self, int k=1, int[] dims=[0,1]) -> Tensor
   self: tensorplay::tpx::ops::rot90(grad, -k, dims)
@@ -1873,7 +1868,7 @@
   real: grad.real()
   imag: grad.imag()
 
-# conjugated Jacobians; see FunctionsManual.cpp.
+# conjugated Jacobians.
 - name: pow.Tensor_Tensor(Tensor self, Tensor exponent) -> Tensor
   self: pow_backward_self(grad, self, exponent)
   exponent: pow_backward_exponent(grad, self, exponent, result)
@@ -1910,14 +1905,13 @@
   self: prod_backward(grad, self, result)
 
 # ---- Shape & view derivative formulas
-# `repeat_backward(grad, repeats, self.sym_sizes())`); the helpers are ports
 
 - name: expand(Tensor self, int[] size, *, bool implicit=False) -> Tensor
-  self: sum_to_size(grad, self.shape())
+  self: sum_to_symint(grad, self.sym_sizes())
   result: auto_linear
 
 - name: expand_as(Tensor self, Tensor other) -> Tensor
-  self: sum_to_size(grad, self.shape())
+  self: sum_to_symint(grad, self.sym_sizes())
   result: auto_linear
 
 - name: repeat(Tensor self, int[] repeats) -> Tensor
@@ -1973,11 +1967,10 @@
 
 # ===========================================================================
 # Native backward completion batch.
-# FunctionsManual.cpp).  Helper functions live in tpx/include/ManualNodes.h;
-# implementations are the same compositions), so values and performance
+# Helper functions compose differentiable operations.
 # ===========================================================================
 
-# --- scatter / index family (derivatives.yaml:856-880, 1090-1110) ---------
+# --- scatter / index family ------------------------------------------------
 
 - name: index.Tensor(Tensor self, Tensor?[] indices) -> Tensor
   self: index_backward(grad.new_zeros_symint(self.sym_sizes(), self.options()), indices, grad)
@@ -2015,7 +2008,7 @@
   grad_output: zeros_like(grad_output).masked_scatter(mask, grad)
   mask: non_differentiable
 
-# --- scatter-family view ops (derivatives.yaml:1240-1270) ------------------
+# --- scatter-family view ops ------------------------------------------------
 
 - name: diag_embed(Tensor self, int offset=0, int dim1=0, int dim2=1) -> Tensor
   self: diagonal(grad, offset, dim1, dim2)
@@ -2035,7 +2028,7 @@
   self: diagonal_scatter(grad, zeros_like(src), offset, dim1, dim2)
   src: diagonal(grad, offset, dim1, dim2)
 
-# --- blas-family (derivatives.yaml:190-210): beta/alpha elide via
+# --- blas-family: beta/alpha elide via
 # maybe_multiply. ------------------------------------------------------------
 
 - name: addbmm(Tensor self, Tensor batch1, Tensor batch2, *, Scalar beta=1, Scalar alpha=1) -> Tensor
@@ -2053,7 +2046,7 @@
   vec1: maybe_multiply(mv(grad, vec2), alpha)
   vec2: maybe_multiply(mv(t(grad), vec1), alpha)
 
-# --- pointwise / special (derivatives.yaml:1300-1560) ----------------------
+# --- pointwise / special ----------------------------------------------------
 
 - name: logaddexp2(Tensor self, Tensor other) -> Tensor
   self: grad * sigmoid((self - other) * 0.6931471805599453)
@@ -2159,7 +2152,7 @@
   self: where(ne(self, other), grad, zeros_like(grad))
   other: zeros_like(other)
 
-# --- reductions (derivatives.yaml:1138-1230) --------------------------------
+# --- reductions ------------------------------------------------------------
 
 - name: max(Tensor self) -> Tensor
   self: evenly_distribute_backward(grad, self, result)

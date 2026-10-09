@@ -266,7 +266,7 @@ def _node_ctor_args(dv: OpDerivatives, f: NativeFunction,
         elif m in dv.attribute_members:
             # A tensor the formulas only measure hands over that attribute.
             arg, attr = dv.attribute_members[m]
-            args.append(f'{arg}.{attr}()')
+            args.append(f'symbolic_sizes({arg})' if attr == 'sym_sizes' else f'{arg}.{attr}()')
         elif m in dv.used_input_names:
             if (m == 'self' and f.base_name.endswith('_')
                     and any(a.name == 'self' for a in f.args)):

@@ -7,6 +7,7 @@
 #include "DType.h"
 #include "Macros.h"
 #include "Stream.h"
+#include "SymInt.h"
 
 namespace tensorplay {
 namespace tpx {
@@ -19,7 +20,7 @@ struct TENSORPLAY_API Edge {
     // (broadcast-inflated) shape are sum-reduced back to it before reaching
     // the consumer node.  `has_shape_hint` distinguishes a recorded scalar
     // shape () from "no hint" -- both are empty vectors.
-    std::vector<int64_t> shape_hint;
+    std::vector<SymInt> shape_hint;
     bool has_shape_hint = false;
     // Dtype of the forward input this edge was created from. The engine casts
     // validate_outputs contract); this is what lets an fp32 gradient produced
@@ -47,7 +48,7 @@ struct TENSORPLAY_API Edge {
     Edge(std::shared_ptr<Node> function, uint32_t input_nr)
         : function(std::move(function)), input_nr(input_nr) {}
     Edge(std::shared_ptr<Node> function, uint32_t input_nr,
-         std::vector<int64_t> shape_hint_)
+         std::vector<SymInt> shape_hint_)
         : function(std::move(function)), input_nr(input_nr),
           shape_hint(std::move(shape_hint_)), has_shape_hint(true) {}
 

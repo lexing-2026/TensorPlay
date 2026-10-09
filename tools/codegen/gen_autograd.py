@@ -760,6 +760,7 @@ EXTERNAL_NODES: set[str] = set()
 # Tensor attributes a node can hold in place of the tensor, with the member
 # type each is stored as.
 ATTRIBUTE_METHODS: dict[str, str] = {
+    "sym_sizes": "std::vector<SymInt>",
     "shape": "std::vector<int64_t>",
     "sizes": "std::vector<int64_t>",
     "dtype": "DType",

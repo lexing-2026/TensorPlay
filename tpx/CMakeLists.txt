@@ -11,6 +11,7 @@ set(TPX_SOURCES
     src/ForwardAdOps.cpp
     src/ForwardGrad.cpp
     src/SavedVariable.cpp
+    src/SymbolicShapes.cpp
     ${GEN_TPX_OPS_CPP}
     ${GEN_TPX_AUTOGRAD_REG_CPP}
     ${GEN_AUTOCAST_CPP}

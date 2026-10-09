@@ -405,7 +405,7 @@ void GraphTask::init_to_execute(Node& graph_root, const edge_list& outputs,
 // doesn't match the recorded forward-input shape of its destination slot.
 // Without this, gradients of broadcast operands keep their broadcast-inflated
 // shape mid-graph and break consumers expecting the operand's true shape.
-static Tensor sum_to_shape(const Tensor& grad, const std::vector<int64_t>& target) {
+Tensor sum_to_symint(const Tensor& grad, const std::vector<SymInt>& target) {
     // broadcast-inflated (target==1) dims with keepdim=true, then view down
     // to the exact target rank.
     if (target.empty()) {
@@ -418,16 +418,16 @@ static Tensor sum_to_shape(const Tensor& grad, const std::vector<int64_t>& targe
         // feeding a (1,) leaf): reshape up when element counts line up --
         // broadcast-compatible -- otherwise hand the grad through untouched.
         int64_t target_numel = 1;
-        for (const auto d : target) target_numel *= d;
+        for (const auto& d : target) target_numel *= d.guard_int(__FILE__, __LINE__);
         if (grad.numel() == target_numel) {
-            return ops::reshape(grad, target);
+            return reshape_symint(grad, target);
         }
         return grad;
     }
     std::vector<int64_t> reduce_dims;
     for (int64_t i = 0; i < leading; ++i) reduce_dims.push_back(i);
     for (int64_t i = leading; i < static_cast<int64_t>(grad.dim()); ++i) {
-        if (target[static_cast<size_t>(i - leading)] == 1 &&
+        if (target[static_cast<size_t>(i - leading)].guard_int(__FILE__, __LINE__) == 1 &&
             grad.size(i) != 1) {
             reduce_dims.push_back(i);
         }
@@ -435,7 +435,7 @@ static Tensor sum_to_shape(const Tensor& grad, const std::vector<int64_t>& targe
     Tensor cur = reduce_dims.empty()
         ? grad : ops::sum(grad, reduce_dims, /*keepdim=*/true);
     if (leading > 0) {
-        cur = ops::reshape(cur, target);
+        cur = reshape_symint(cur, target);
     }
     return cur;
 }
@@ -603,7 +603,7 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
                     // output shape into a vector here would cost one heap
                     // allocation per gradient output per node.
                     for (size_t d = 0; d < hint.size(); ++d) {
-                        if (outputs[i].size(d) != hint[d]) {
+                        if (outputs[i].size(d) != hint[d].guard_int(__FILE__, __LINE__)) {
                             shape_ok = false;
                             break;
                         }
@@ -612,7 +612,7 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
                     shape_ok = false;
                 }
                 if (!shape_ok) {
-                    outputs[i] = sum_to_shape(outputs[i], hint);
+                    outputs[i] = sum_to_symint(outputs[i], hint);
                 }
             }
             // validate_outputs): a floating gradient crossing an edge must be

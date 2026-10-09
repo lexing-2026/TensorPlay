@@ -170,7 +170,7 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
 @register_generator("PythonDispatch")
 def _gen_python_dispatch(ctx: CodegenContext) -> None:
     from .gen_python_dispatch import generate_python_dispatch_cpp
-    source, skipped = generate_python_dispatch_cpp(ctx.funcs)
+    source, skipped = generate_python_dispatch_cpp(ctx.funcs, ctx.derivatives)
     if skipped:
         raise SystemExit(
             "Python dispatch kernels cannot be generated for:\n  "

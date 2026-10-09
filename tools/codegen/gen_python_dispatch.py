@@ -156,7 +156,7 @@ def _kernel_args(f: NativeFunction):
     return [a for a in f.args if a.name != "requires_grad"]
 
 
-def _emit_kernel(out: list[str], f: NativeFunction) -> str:
+def _emit_kernel(out: list[str], f: NativeFunction, derivative=None) -> str:
     sym = _symbol(f.func_name)
     args = _kernel_args(f)
     ret = cpp_return_type(f)
@@ -181,14 +181,20 @@ def _emit_kernel(out: list[str], f: NativeFunction) -> str:
     signature = ", ".join(stub_arg_type_for(f.base_name, a) for a in args)
     names = ", ".join(_cpp_string(a.python_name) for a in args) or "nullptr"
     num_positional = sum(1 for a in args if not a.kwonly)
+    tags = set(f.tags)
+    if derivative is not None and any(
+        attr in {"shape", "sizes", "numel"}
+        for _, attr in derivative.attribute_members.values()
+    ):
+        tags.add("static_autograd_metadata")
     out.append(f"const char* const argnames_{sym}[] = {{{names}}};")
     out.append(
         f"OpEntry entry_{sym} = {{{_cpp_string(f.func_name)}, "
         f"{_cpp_string(f.schema)}, argnames_{sym}, {len(args)}, "
-        f"{num_positional}, {_cpp_string(','.join(sorted(f.tags)))}, nullptr}};")
+        f"{num_positional}, {_cpp_string(','.join(sorted(tags)))}, nullptr}};")
     out.append(f"{ret} kernel_{sym}({', '.join(params)}) {{")
     differentiable = [a.name for a in args if a.type.is_tensor_like]
-    if differentiable and not mutable and kind not in ("void", "mut_ref"):
+    if differentiable and not mutable and any(r.type.is_tensor_like for r in f.returns) and kind not in ("void", "mut_ref"):
         # Differentiated through its composite kernel when it has no
         # derivative of its own (see implicit_autograd_kernel).  The guard
         # variable is spelled to stay clear of every schema argument name.
@@ -219,7 +225,7 @@ def _emit_kernel(out: list[str], f: NativeFunction) -> str:
             f'static_cast<{ret} (*)({signature})>(&kernel_{sym}));')
 
 
-def generate_python_dispatch_cpp(funcs: list[NativeFunction]) -> tuple[str, list[str]]:
+def generate_python_dispatch_cpp(funcs: list[NativeFunction], derivatives=None) -> tuple[str, list[str]]:
     """Return the generated translation unit and the skipped handles."""
 
     out: list[str] = [
@@ -242,7 +248,7 @@ def generate_python_dispatch_cpp(funcs: list[NativeFunction]) -> tuple[str, list
         seen.add(f.func_name)
         body: list[str] = []
         try:
-            registration = _emit_kernel(body, f)
+            registration = _emit_kernel(body, f, (derivatives or {}).get(f.func_name))
         except UnsupportedPythonDispatch as exc:
             skipped.append(f"{f.func_name}: {exc}")
             continue
