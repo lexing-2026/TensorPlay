@@ -5204,12 +5204,8 @@ class Reduction(Loops):
                 if dst_dtype == tp.bool:
                     return bool(val)
                 elif is_float_dtype(dst_dtype):
-                    if not isinstance(val, float):
-                        raise AssertionError(type(val))
                     return float(val)
                 else:
-                    if not isinstance(val, int):
-                        raise AssertionError(type(val))
                     return int(val)
 
             rtypes_to_inits = {

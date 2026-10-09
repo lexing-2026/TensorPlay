@@ -200,7 +200,8 @@ def _lower_stax_region(
     """
     strict = bool(strict_native)
     dynamic_shapes = bool(dynamic is True)
-    training = getattr(graph_module.root, "training", False) or any(
+    is_backward = bool(graph_module.meta.get("aot_backward", False))
+    training = is_backward or getattr(graph_module.root, "training", False) or any(
         getattr(value, "requires_grad", False) for value in example_inputs
     )
     try:
@@ -237,12 +238,12 @@ def _lower_stax_region(
     graph = GraphLowering(
         graph_module,
         example_inputs,
-        shape_env=ShapeEnv() if dynamic_shapes else None,
+        shape_env=ShapeEnv(duck_shape=not is_backward) if dynamic_shapes else None,
         cpp_wrapper=use_cuda_codegen,
         aot_mode=training,
         extern_node_serializer=None,
         is_inference=not training,
-        is_backward=False,
+        is_backward=is_backward,
     )
     # Everything from here on is being done about this region, and anything
     # asked along the way -- what a kernel reads, how big an extent is, what a

@@ -1355,7 +1355,7 @@ def _std(self, dims, correction, keepdim):
     # Low-precision inputs reduce in float32; complex inputs give real results.
     result_dtype = self.abs().dtype if self.is_complex() else self.dtype
     opmath = _computation_dtype(self.dtype)
-    return tp.sqrt(_var(self.to(opmath), dims, correction, keepdim)).to(result_dtype)
+    return tp.sqrt(ops.var.correction(self.to(opmath), dims, correction=correction, keepdim=keepdim)).to(result_dtype)
 
 
 @register_decomposition(ops.std.default)
@@ -3784,8 +3784,8 @@ def unflatten(self, dim, sizes):
     if self.dim() == 0:
         raise RuntimeError("Cannot unflatten a 0-d tensor")
     dim = dim % self.dim()
-    shape = list(self.shape)
-    return self.view(tuple(shape[:dim] + list(sizes) + shape[dim + 1:]))
+    shape = [ops.sym_size.int(self, axis) for axis in range(self.dim())]
+    return ops.view.default(self, shape[:dim] + list(sizes) + shape[dim + 1:])
 
 
 @register_decomposition(ops.tile.default)

@@ -306,6 +306,7 @@ std::pair<Tensor, Tensor> var_mean_kernel_impl(const Tensor& self,
     }
     int64_t n_red = 1;
     for (const int64_t dim : red_dims) n_red *= self.size(dim);
+    const double divisor = std::max(0.0, static_cast<double>(n_red) - correction);
     // Map each input dim to its output slot: with keepdim the size-1
     // reduced slots keep their position, without it the surviving dims
     // pack densely.
@@ -351,7 +352,7 @@ std::pair<Tensor, Tensor> var_mean_kernel_impl(const Tensor& self,
                 for (const auto& ps : partials) welford_merge(total, ps);
                 mp[0] = static_cast<T>(total.mean);
                 vp[0] = static_cast<T>(total.m2 /
-                    (static_cast<double>(total.n) - correction));
+                    divisor);
             } else {
                 // Exactly one reduced dim.
                 const int64_t d = red_dims[0];
@@ -400,7 +401,7 @@ std::pair<Tensor, Tensor> var_mean_kernel_impl(const Tensor& self,
                                     }
                                 for (int64_t j = 0; j < inner; ++j)
                                     vp[base + j] = static_cast<T>(acc2[static_cast<size_t>(j)] /
-                                        (static_cast<double>(d_size) - correction));
+                                        divisor);
                             }
                         });
                     } else {
@@ -454,7 +455,7 @@ std::pair<Tensor, Tensor> var_mean_kernel_impl(const Tensor& self,
                                 m2 += squares[static_cast<size_t>(ti * inner + j)];
                             mp[j] = static_cast<T>(mean_buf[static_cast<size_t>(j)]);
                             vp[j] = static_cast<T>(m2 /
-                                (static_cast<double>(d_size) - correction));
+                                divisor);
                         }
                     }
                 } else {
@@ -473,7 +474,7 @@ std::pair<Tensor, Tensor> var_mean_kernel_impl(const Tensor& self,
                                 });
                             mp[oi] = static_cast<T>(s.mean);
                             vp[oi] = static_cast<T>(s.m2 /
-                                (static_cast<double>(s.n) - correction));
+                                divisor);
                         }
                     });
                 }
@@ -534,7 +535,7 @@ std::pair<Tensor, Tensor> var_mean_kernel_impl(const Tensor& self,
                 }
                 mp[oi] = static_cast<output_t>(mean_value);
                 vp[oi] = static_cast<output_t>(
-                    m2 / (static_cast<double>(n_red) - correction));
+                    m2 / divisor);
             }
         });
     };

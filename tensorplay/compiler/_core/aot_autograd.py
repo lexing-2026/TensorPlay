@@ -495,6 +495,7 @@ def aot_function(
     # results go to the engine, which lays each gradient out for its leaf.
     _mark_user_outputs(fw_module, num_fwd)
     _mark_user_outputs(bw_module, 0)
+    bw_module.meta["aot_backward"] = True
     compiled_fw = fw_compiler(fw_module, fw_inputs)
     from .api import _release_recorded_values
 

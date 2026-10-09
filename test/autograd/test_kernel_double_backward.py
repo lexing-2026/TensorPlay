@@ -34,6 +34,22 @@ def test_clamp_differentiates_twice(device):
 
 
 @pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("correction", [0, 1])
+@pytest.mark.parametrize("std", [False, True])
+@pytest.mark.parametrize("dim", [None, -1])
+def test_variance_differentiates_twice(device, correction, std, dim):
+    x = rand(2, 3, device=device, seed=7)
+
+    def fn(value):
+        method = value.std if std else value.var
+        if dim is None:
+            return method(correction=correction)
+        return method(dim, correction=correction)
+
+    check(fn, [x])
+
+
+@pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("shapes", [((3, 4), (5, 4)), ((2, 3, 4), (4,)), ((), (3, 2)), ((4,), ())])
 def test_inner_differentiates_twice(device, shapes):
     a = rand(*shapes[0], device=device, seed=1)

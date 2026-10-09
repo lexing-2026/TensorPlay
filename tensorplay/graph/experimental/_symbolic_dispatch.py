@@ -15,6 +15,10 @@ class SymbolicGraphInterpreter(Interpreter):
     """Execute shape methods through operators that preserve scalar expressions."""
 
     def call_function(self, target, args, kwargs):
+        if target is operator.getitem and isinstance(args[0], tp.Tensor):
+            result = self.basic_index(*args)
+            if result is not NotImplemented:
+                return result
         scalar_ops = {operator.add: "add", operator.sub: "sub", operator.mul: "mul", operator.truediv: "div"}
         scalar_op = next((name for func, name in scalar_ops.items() if target is func), None)
         if scalar_op is not None and len(args) == 2:
@@ -35,9 +39,44 @@ class SymbolicGraphInterpreter(Interpreter):
             return self.call_method("flatten", args, kwargs)
         return super().call_function(target, args, kwargs)
 
+    def basic_index(self, value, index):
+        items = index if isinstance(index, tuple) else (index,)
+        integer_types = (int, tp.SymInt)
+        if any(
+            isinstance(item, bool) or not isinstance(item, (*integer_types, slice, type(None), type(Ellipsis)))
+            for item in items
+        ):
+            return NotImplemented
+        if any(
+            bound is not None and not isinstance(bound, integer_types)
+            for item in items if isinstance(item, slice)
+            for bound in (item.start, item.stop, item.step)
+        ):
+            return NotImplemented
+        consumed = sum(item is not None and item is not Ellipsis for item in items)
+        if consumed > value.ndim or sum(item is Ellipsis for item in items) > 1:
+            return NotImplemented
+        ellipsis_axes = value.ndim - consumed
+        axis = 0
+        for item in items:
+            if item is Ellipsis:
+                axis += ellipsis_axes
+            elif item is None:
+                value = tp.ops.tp.unsqueeze.default(value, axis)
+                axis += 1
+            elif isinstance(item, slice):
+                value = tp.ops.tp.slice.Tensor(value, axis, item.start, item.stop, 1 if item.step is None else item.step)
+                axis += 1
+            else:
+                value = tp.ops.tp.select.int(value, axis, item)
+        return value
+
     def call_method(self, target, args, kwargs):
         value, *rest = args
         if isinstance(value, tp.Tensor):
+            if target == "repeat":
+                repeats = rest[0] if len(rest) == 1 and isinstance(rest[0], (list, tuple)) else rest
+                return tp.ops.tp.repeat.default(value, repeats, **kwargs)
             if target in ("reshape_as", "view_as", "expand_as"):
                 other = rest[0]
                 sizes = [tp.ops.tp.sym_size.int(other, axis) for axis in range(other.ndim)]
@@ -137,8 +176,14 @@ class SymbolicDispatchMode(ProxyTensorDispatchMode):
             if any(value.requires_grad for value in tensors):
                 for index, argument in enumerate(func._schema.arguments):
                     value = args[index] if index < len(args) else kwargs.get(argument.name)
-                    if str(argument.type) == "Scalar" and isinstance(value, tp.SymInt) and value.is_symbolic():
-                        self.tracer.static_autograd_metadata = True
+                    if str(argument.type) == "Scalar" or f"autograd_saved_arg:{argument.name}" in func._tags:
+                        saved_symbols = []
+                        map_aggregate(
+                            value,
+                            lambda x: saved_symbols.append(x) if isinstance(x, tp.SymInt) and x.is_symbolic() else None,
+                        )
+                        if saved_symbols:
+                            self.tracer.static_autograd_metadata = True
         pending = [func, args, kwargs, False]
         self._pending_calls.append(pending)
         try:
@@ -164,6 +209,16 @@ class SymbolicDispatchMode(ProxyTensorDispatchMode):
             map_aggregate((args, kwargs), lambda x: tensors.append(x) if isinstance(x, tp.Tensor) else None)
             if any(value.requires_grad for value in tensors):
                 self.tracer.static_autograd_metadata = True
+        if (
+            not self.tracer.backward
+            and "autograd_variance_count" in func._tags
+            and any(isinstance(value, tp.Tensor) and value.requires_grad for value in args)
+        ):
+            for index, argument in enumerate(func._schema.arguments):
+                if argument.name == "correction":
+                    correction = args[index] if index < len(args) else kwargs.get(argument.name, 1)
+                    if correction is not None and (not isinstance(correction, int) or correction > 1):
+                        self.tracer.static_autograd_metadata = True
         if func is tp.ops.tp.sym_size.int:
             source = self.tracer.node_for(args[0])
             key = (source, args[1])

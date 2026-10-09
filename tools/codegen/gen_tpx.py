@@ -250,6 +250,10 @@ def _hoisted_attributes(dv: OpDerivatives, f: NativeFunction) -> list[tuple[str,
             for m, (arg, attr) in dv.attribute_members.items() if arg in mutated]
 
 
+def _attribute_expr(argument: str, attribute: str) -> str:
+    return f'symbolic_sizes({argument})' if attribute == 'sym_sizes' else f'{argument}.{attribute}()'
+
+
 def _node_ctor_args(dv: OpDerivatives, f: NativeFunction,
                     core_result_var: str | None,
                     hoisted: bool = False) -> list[str]:
@@ -266,7 +270,7 @@ def _node_ctor_args(dv: OpDerivatives, f: NativeFunction,
         elif m in dv.attribute_members:
             # A tensor the formulas only measure hands over that attribute.
             arg, attr = dv.attribute_members[m]
-            args.append(f'symbolic_sizes({arg})' if attr == 'sym_sizes' else f'{arg}.{attr}()')
+            args.append(_attribute_expr(arg, attr))
         elif m in dv.used_input_names:
             if (m == 'self' and f.base_name.endswith('_')
                     and any(a.name == 'self' for a in f.args)):
@@ -853,7 +857,7 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
             for m, mtype, arg, attr in (_hoisted_attributes(_dv_pre, f)
                                         if _dv_pre is not None else []):
                 lines.append(f'    std::optional<{mtype}> __tp_pre_{m};')
-                lines.append(f'    if (requires_grad) __tp_pre_{m} = {arg}.{attr}();')
+                lines.append(f'    if (requires_grad) __tp_pre_{m} = {_attribute_expr(arg, attr)};')
             lines.append('    std::vector<Edge> __tp_inplace_edges;')
             lines.append('    if (requires_grad) {')
             _emit_edges(lines, f, into='__tp_inplace_edges')

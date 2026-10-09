@@ -188,8 +188,12 @@ def _emit_kernel(out: list[str], f: NativeFunction, derivative=None) -> str:
     ):
         tags.add("static_autograd_metadata")
     if derivative is not None and f.base_name in {"var", "std", "var_mean", "std_mean"}:
-        # Reduction counts in these gradient helpers are stored as plain numbers.
-        tags.add("static_autograd_metadata")
+        tags.add("autograd_variance_count")
+    if derivative is not None:
+        saved_names = {name for name, _ in derivative.members}
+        for argument in args:
+            if not argument.type.is_tensor_like and argument.name in saved_names:
+                tags.add(f"autograd_saved_arg:{argument.python_name}")
     out.append(f"const char* const argnames_{sym}[] = {{{names}}};")
     out.append(
         f"OpEntry entry_{sym} = {{{_cpp_string(f.func_name)}, "

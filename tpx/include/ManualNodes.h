@@ -1130,17 +1130,16 @@ inline Tensor restore_reduced_dims(const Tensor& output,
                                    bool keepdim) {
     if (keepdim) return output;
     const int64_t total = output.dim() + static_cast<int64_t>(dims.size());
-    std::vector<int64_t> target(total, -1);
+    std::vector<bool> mask(total, false);
     for (auto i : dims) {
         if (i < 0) i += total;
-        target[i] = 1;
+        mask[i] = true;
     }
-    int64_t j = 0;
-    for (int64_t d = 0; d < output.dim(); ++d) {
-        while (j < total && target[j] != -1) ++j;
-        target[j++] = output.size(d);
+    Tensor result = output;
+    for (int64_t d = 0; d < total; ++d) {
+        if (mask[d]) result = ops::unsqueeze(result, d);
     }
-    return ops::reshape(output, target);
+    return result;
 }
 
 // Scale a gradient by the number of contributing elements.
@@ -1544,16 +1543,17 @@ inline Tensor trace_backward(const Tensor& grad, const Tensor& self) {
            grad;
 }
 
-// var backward (dim-list flavor; empty dims == full reduction), with TP's
-// integer correction.
+// Variance gradients scale centered values by the reduction count minus correction.
 inline Tensor var_backward(Tensor grad, const Tensor& self,
                            std::vector<int64_t> dims, int64_t correction,
                            bool keepdim) {
     const int64_t nd = self.dim();
     dims = wrap_dims(dims, nd);
+    const auto sizes = symbolic_sizes(self);
+    SymInt count(1);
+    for (const auto d : dims.empty() ? all_dims(nd) : dims) count *= sizes[d];
+    const SymInt dof = count - correction;
     if (nd == 0 || dims.empty()) {
-        const double dof = static_cast<double>(self.numel()) -
-                           static_cast<double>(correction);
         if (dof <= 0) {
             const Tensor mean = ops::mean(self);
             const Tensor nan_t = ops::full_like(
@@ -1562,14 +1562,10 @@ inline Tensor var_backward(Tensor grad, const Tensor& self,
                 self, Scalar(std::numeric_limits<double>::infinity()));
             return grad * ops::where(ops::eq(self, mean), nan_t, inf_t);
         }
-        return ops::mul(grad * (self - ops::mean(self)), Scalar(2.0 / dof));
+        return div_symint(grad * (self - ops::mean(self)) * 2, dof);
     }
     if (!keepdim && nd > 1) grad = restore_reduced_dims(grad, dims, keepdim);
-    int64_t rnumel = 1;
-    for (auto d : dims) rnumel *= self.size(d);
-    const double dof = static_cast<double>(rnumel) - static_cast<double>(correction);
-    return ops::mul(grad * (self - ops::mean(self, dims, true)),
-                    Scalar(2.0 / dof));
+    return div_symint(grad * (self - ops::mean(self, dims, true)) * 2, dof);
 }
 
 // std backward.
@@ -1790,14 +1786,14 @@ struct VarMeanBackward : public Node {
         const Tensor gmean = inputs.size() > 1 ? inputs[1] : Tensor();
         if (!gvar.defined() && !gmean.defined()) return {Tensor()};
         const Tensor self = self_.unpack();
-        const auto sizes = static_cast<std::vector<int64_t>>(self.shape());
+        const auto sizes = symbolic_sizes(self);
         const int64_t correction = unbiased_ ? 1 : 0;
         Tensor gself;
         if (gvar.defined()) {
             gself = var_backward(gvar, self, dims_, correction, keepdim_);
         }
         if (gmean.defined()) {
-            Tensor aux = mean_backward(gmean, sizes, dims_, keepdim_);
+            Tensor aux = mean_backward_symint(gmean, sizes, dims_, keepdim_);
             gself = gself.defined() ? gself + aux : std::move(aux);
         }
         return {gself};
@@ -1828,7 +1824,7 @@ struct StdMeanBackward : public Node {
         const Tensor gmean = inputs.size() > 1 ? inputs[1] : Tensor();
         if (!gstd.defined() && !gmean.defined()) return {Tensor()};
         const Tensor self = self_.unpack();
-        const auto sizes = static_cast<std::vector<int64_t>>(self.shape());
+        const auto sizes = symbolic_sizes(self);
         const int64_t correction = unbiased_ ? 1 : 0;
         Tensor gself;
         if (gstd.defined()) {
@@ -1837,7 +1833,7 @@ struct StdMeanBackward : public Node {
             gself = std_backward(stdv, gstd, self, dims_, correction, keepdim_);
         }
         if (gmean.defined()) {
-            Tensor aux = mean_backward(gmean, sizes, dims_, keepdim_);
+            Tensor aux = mean_backward_symint(gmean, sizes, dims_, keepdim_);
             gself = gself.defined() ? gself + aux : std::move(aux);
         }
         return {gself};

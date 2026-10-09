@@ -323,6 +323,7 @@ namespace {
 const char* const shape_names[] = {"self", "size"};
 OpEntry symbolic_expand = {"expand", "", shape_names, 2, 2, "", nullptr};
 OpEntry symbolic_reshape = {"reshape", "", shape_names, 2, 2, "", nullptr};
+OpEntry symbolic_new_zeros = {"new_zeros", "", shape_names, 2, 2, "", nullptr};
 const char* const divisor_names[] = {"self", "other"};
 OpEntry symbolic_div = {"div.Scalar", "", divisor_names, 2, 2, "", nullptr};
 
@@ -344,6 +345,10 @@ Tensor symbolic_reshape_call(const Tensor& self, const std::vector<SymInt>& size
     return symbolic_shape_call(symbolic_reshape, self, sizes);
 }
 
+Tensor symbolic_new_zeros_call(const Tensor& self, const std::vector<SymInt>& sizes) {
+    return symbolic_shape_call(symbolic_new_zeros, self, sizes);
+}
+
 Tensor symbolic_div_call(const Tensor& self, const SymInt& divisor) {
     ModeCall call(symbolic_div);
     call.set_arg(0, python_c::tpx_py_wrap(self));
@@ -358,6 +363,7 @@ struct RegisterSymbolicCalls {
         auto& dispatcher = Dispatcher::singleton();
         dispatcher.registerKernel("_symbolic.expand", DispatchKey::Python, &symbolic_expand_call);
         dispatcher.registerKernel("_symbolic.reshape", DispatchKey::Python, &symbolic_reshape_call);
+        dispatcher.registerKernel("_symbolic.new_zeros", DispatchKey::Python, &symbolic_new_zeros_call);
         dispatcher.registerKernel("_symbolic.div", DispatchKey::Python, &symbolic_div_call);
     }
 } register_symbolic_calls;

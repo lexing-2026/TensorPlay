@@ -22,6 +22,7 @@ import itertools
 import logging
 import math
 import operator
+import sys
 import warnings
 from numbers import Number
 from collections.abc import Sequence
@@ -3121,11 +3122,28 @@ def lower_mean(x, dim=None, keepdim=False, dtype=None, **kwargs):
     elif isinstance(dim, (int, sympy.Integer)):
         dim = [dim]
     dtype = _resolve_dtype(dtype, x.get_dtype())
-    count = sympy.prod(x.get_size()[normalize_dim(d, len(x.get_size()))] for d in dim)
+    count = sympy.sympify(sympy.prod(x.get_size()[normalize_dim(d, len(x.get_size()))] for d in dim))
     total = make_reduction(
         x, dim, keepdim, dtype, x.get_device(), "sum"
     )
     return pointwise(lambda v: ops.truediv(v, ops.index_expr(count, dtype)), total)
+
+
+def _scale_variance(m2, count, correction):
+    dtype = m2.get_dtype()
+    count = sympy.sympify(count)
+
+    def scale(value):
+        n = ops.to_dtype(ops.index_expr(count, tp.int64), dtype)
+        c = ops.constant(correction, dtype)
+        return ops.truediv(value, ops.maximum(ops.constant(0, dtype), ops.sub(n, c)))
+
+    return pointwise(scale, m2)
+
+
+@register("var.default")
+def lower_var_default(x, correction=1):
+    return lower_var(x, correction=correction)
 
 
 @register("var.dim", "var.correction")
@@ -3145,7 +3163,9 @@ def lower_var(x, dim=None, correction=1, keepdim=False, **kwargs):
         dim = list(range(len(x.get_size())))
     elif isinstance(dim, (int, sympy.Integer)):
         dim = [dim]
-    dtype = x.get_dtype()
+    output_dtype = x.get_dtype()
+    dtype = _accumulation_dtype(output_dtype)
+    x = cast_to(x, dtype)
     device = x.get_device()
     size = list(x.get_size())
     rank = len(size)
@@ -3169,18 +3189,7 @@ def lower_var(x, dim=None, correction=1, keepdim=False, **kwargs):
         reduction_type="welford_reduce",
     )
     m2.realize()
-    n_elems = prod(red_ranges)
-    denom = Max(sympy.Integer(n_elems) - sympy.sympify(correction), 0)
-    m2_loader = m2.make_loader()
-
-    var = Pointwise.create(
-        device=device,
-        dtype=dtype,
-        inner_fn=lambda index: ops.truediv(
-            m2_loader(index), ops.constant(float(denom), tp.float32)
-        ),
-        ranges=out_ranges,
-    )
+    var = cast_to(_scale_variance(m2, sympy.prod(red_ranges), correction), output_dtype)
     if keepdim:
         kept = [1 if d in dim else size[d] for d in range(rank)]
 
@@ -3213,6 +3222,9 @@ def lower_var_mean(x, dim=None, unbiased=True, keepdim=False, *, correction=None
     val = node_val(index=0)
     if val is not None and getattr(val, "dtype", None) is not None:
         dtype = val.dtype
+    output_dtype = dtype
+    dtype = _accumulation_dtype(dtype)
+    x = cast_to(x, dtype)
     device = x.get_device()
     size = list(x.get_size())
     rank = len(size)
@@ -3237,21 +3249,11 @@ def lower_var_mean(x, dim=None, unbiased=True, keepdim=False, *, correction=None
     )
     mean.realize()
     m2.realize()
-    n_elems = prod(red_ranges)
     if correction is None:
         # Unstated, the variance is the unbiased one.
         correction = 1 if (unbiased is None or unbiased) else 0
-    denom = Max(sympy.Integer(n_elems) - sympy.sympify(correction), 0)
-    m2_loader = m2.make_loader()
-
-    var = Pointwise.create(
-        device=device,
-        dtype=dtype,
-        inner_fn=lambda index: ops.truediv(
-            m2_loader(index), ops.constant(float(denom), tp.float32)
-        ),
-        ranges=out_ranges,
-    )
+    var = cast_to(_scale_variance(m2, sympy.prod(red_ranges), correction), output_dtype)
+    mean = cast_to(mean, output_dtype)
     if keepdim:
         kept = [1 if d in dim else size[d] for d in range(rank)]
 

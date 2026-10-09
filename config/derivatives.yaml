@@ -13,15 +13,15 @@
   result: auto_linear
 
 - name: squeeze(Tensor self) -> Tensor
-  self: tensorplay::tpx::ops::squeeze_backward(grad, self)
+  self: unsqueeze_to_symint(grad, self.sym_sizes())
   result: auto_linear
 
 - name: squeeze.dim(Tensor self, int dim) -> Tensor
-  self: unsqueeze_to(grad, {dim}, self.shape())
+  self: unsqueeze_to_symint(grad, {dim}, self.sym_sizes())
   result: auto_linear
 
 - name: squeeze.dims(Tensor self, int[] dim) -> Tensor
-  self: unsqueeze_to(grad, dim, self.shape())
+  self: unsqueeze_to_symint(grad, dim, self.sym_sizes())
   result: auto_linear
 
 - name: unsqueeze(Tensor self, int dim) -> Tensor
@@ -260,11 +260,11 @@
   self: grad
 
 - name: select.int(Tensor self, int dim, SymInt index) -> Tensor
-  self: select_backward_sizes(grad, self.shape(), dim, index)
+  self: select_backward_symint(grad, self.sym_sizes(), dim, index)
   result: auto_linear
 
 - name: slice.Tensor(Tensor self, int dim=0, SymInt? start=None, SymInt? end=None, SymInt step=1) -> Tensor
-  self: slice_backward_sizes(grad, self.shape(), dim, start, end, step)
+  self: slice_backward_symint(grad, self.sym_sizes(), dim, start, end, step)
   result: auto_linear
 
 # The two scatter-back ops above are linear in grad_output, and their own
@@ -289,7 +289,7 @@
 # Unflatten is a view; backward is the
 # inverse reshape, recorded through reshape's own derivative.
 - name: unflatten.int(Tensor self, int dim, int[] sizes) -> Tensor
-  self: grad.reshape(self.shape())
+  self: reshape_symint(grad, self.sym_sizes())
 
 # matmul's backward branches on the input dims (dot / vec@mat / mat@vec /
 # batched), which the formula DSL cannot express.  The hand-written node in
@@ -386,7 +386,7 @@
   self: movedim(grad, destination, source)
 
 - name: diagonal(Tensor self, int offset=0, int dim1=0, int dim2=1) -> Tensor
-  self: diagonal_backward(grad, self.shape(), offset, dim1, dim2)
+  self: diagonal_backward_symint(grad, self.sym_sizes(), offset, dim1, dim2)
 
 # Reshaping kernels: each is linear in grad_output, and its adjoint is the
 # forward view applied to the incoming gradient.
@@ -1003,10 +1003,10 @@
   weight: grad * (end - self)
 
 - name: var(Tensor self, int correction=1) -> Tensor
-  self: grad * 2 * (self - self.mean()) / (self.numel() - correction)
+  self: var_backward(grad, self, {}, correction, false)
 
 - name: std(Tensor self, int correction=1) -> Tensor
-  self: grad * (self - self.mean()) / (result * (self.numel() - correction))
+  self: std_backward(result, grad, self, {}, correction, false)
 
 - name: scaled_dot_product_attention(Tensor query, Tensor key, Tensor value, Tensor? attn_mask=None, float dropout_p=0.0, bool is_causal=False, *, float? scale=None, bool enable_gqa=False) -> Tensor
   query: std::get<0>(scaled_dot_product_attention_backward(grad, query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa))
@@ -1915,7 +1915,7 @@
   result: auto_linear
 
 - name: repeat(Tensor self, int[] repeats) -> Tensor
-  self: repeat_backward(grad, repeats, self.shape())
+  self: repeat_backward_symint(grad, repeats, self.sym_sizes())
 
 - name: fill.Scalar(Tensor self, Scalar value) -> Tensor
   self: tensorplay::tpx::ops::zeros_like(grad)

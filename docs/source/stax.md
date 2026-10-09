@@ -40,11 +40,19 @@ another guarded artifact. Sizes zero and one have separate specializations.
 executing its graph as a fallback.
 
 Training preserves saved dimensions as symbolic scalar values for pointwise
-operations, sum/mean reductions, broadcasting and reshape/expand derivatives.
+operations, sum/mean reductions, broadcasting, reshape/expand, squeeze,
+slice/select, unflatten, diagonal and repeat derivatives. Variance and standard
+deviation derivatives, including combined mean outputs, compute reduction counts
+from runtime dimensions. Zero standard deviation masks the incoming variance
+gradient, and zero repeats restore a zero gradient of the original input shape.
 Compatible sizes reuse one forward artifact and one backward artifact; each
 forward invocation saves its own dimensions for the later backward call.
-Gradient formulas that still save concrete shape metadata or scalar operands select guarded
-specializations when that metadata changes. Symbolic graph capture is available through
+Gradient formulas that still save concrete shape metadata, scalar operands or
+shape-derived operator arguments select guarded specializations when that metadata
+changes. Variance corrections greater than one also select specializations to
+preserve decisions about nonpositive degrees of freedom. Backward input dimensions
+are independent even when their sample values happen to coincide.
+Symbolic graph capture is available through
 `make_graph(..., tracing_mode="symbolic")`; storage-free fake tracing and
 data-dependent output extents remain unsupported by that capture entry point.
 Tensor inputs nested in containers and call-outs with concrete output metadata

@@ -332,7 +332,7 @@ def test_training_broadcast_and_layout_reuse(device, transpose):
     assert len(artifacts) == 2
 
 
-@pytest.mark.parametrize("fn", [lambda x: x.var(), lambda x: x.var(-1).sum(), lambda x: (x / x.shape[0]).sum()])
+@pytest.mark.parametrize("fn", [lambda x: x.var(correction=5), lambda x: (x / x.shape[0]).sum()])
 def test_training_specializes_concrete_saved_metadata(fn):
     artifacts = []
     compiled = tp.compile(fn, backend=_counting_backend(artifacts), dynamic=True)
@@ -342,6 +342,166 @@ def test_training_specializes_concrete_saved_metadata(fn):
         compiled(x).backward()
         fn(ref).backward()
         assert tp.allclose(x.grad, ref.grad, atol=1e-5, rtol=1e-5)
+    assert len(artifacts) == 4
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda x: (x * x).unsqueeze(1).squeeze(),
+        lambda x: (x * x).unsqueeze(1).squeeze(1),
+        lambda x: (x * x).unsqueeze(1).squeeze([1]),
+        lambda x: (x * x).squeeze(0),
+        lambda x: (x * x)[:, 1:-1:2],
+        lambda x: (x * x)[-1],
+        lambda x: (x * x).select(1, -1),
+        lambda x: (x * x).repeat(2, 3),
+        lambda x: (x * x).repeat(2, 1, 3),
+        lambda x: (x * x)[None, -1, ..., 1:-1:2],
+        lambda x: (x * x).unflatten(1, (1, -1)),
+        lambda x: (x * x).diagonal(1),
+    ],
+)
+@pytest.mark.parametrize("expanded_tangent", [False, True])
+def test_training_view_gradients_keep_runtime_dimensions(fn, device, expanded_tangent):
+    artifacts = []
+    compiled = tp.compile(fn, backend=_counting_backend(artifacts), dynamic=True, strict_native=True)
+    pending = []
+    for rows, cols in ((3, 7), (5, 11), (4, 8)):
+        x = tp.randn(rows, cols, device=device).requires_grad_()
+        ref = x.detach().clone().requires_grad_()
+        actual, expected = compiled(x), fn(ref)
+        assert tp.allclose(actual, expected)
+        pending.append((x, ref, actual, expected))
+    for x, ref, actual, expected in reversed(pending):
+        tangent = tp.ones((), device=device).expand(actual.shape) if expanded_tangent else tp.randn_like(actual)
+        actual.backward(tangent)
+        expected.backward(tangent)
+        assert tp.allclose(x.grad, ref.grad, atol=1e-5, rtol=1e-5)
+    assert len(artifacts) == 2
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("fn", [lambda x: x.std(), lambda x: x.std(-1, keepdim=True)])
+def test_training_zero_standard_deviation_has_zero_gradient(fn, device):
+    artifacts = []
+    compiled = tp.compile(fn, backend=_counting_backend(artifacts), dynamic=True, strict_native=True)
+    for shape in ((3, 7), (5, 11), (4, 8)):
+        x = tp.ones(shape, device=device).requires_grad_()
+        actual = compiled(x)
+        assert tp.equal(actual, tp.zeros_like(actual))
+        actual.backward(tp.ones_like(actual))
+        assert tp.equal(x.grad, tp.zeros_like(x))
+    assert len(artifacts) == 2
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_training_zero_repeats_restore_dynamic_input_shape(device):
+    artifacts = []
+    compiled = tp.compile(lambda x: x.repeat(0, 2), backend=_counting_backend(artifacts),
+                          dynamic=True, strict_native=True)
+    for rows, cols in ((3, 7), (5, 11), (4, 8)):
+        x = tp.randn(rows, cols, device=device).requires_grad_()
+        result = compiled(x)
+        assert tuple(result.shape) == (0, cols * 2)
+        result.backward(tp.ones_like(result))
+        assert tp.equal(x.grad, tp.zeros_like(x))
+    assert len(artifacts) == 2
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("correction", [0, 1, 5])
+@pytest.mark.parametrize("std", [False, True])
+def test_training_variance_guards_degrees_of_freedom(device, correction, std):
+    fn = lambda x: x.std(correction=correction) if std else x.var(correction=correction)
+    compiled = tp.compile(fn, dynamic=True, strict_native=True)
+    for count in (0, 1, 3, 7, 1, 3):
+        x = tp.arange(count, dtype=tp.float32, device=device).requires_grad_()
+        ref = x.detach().clone().requires_grad_()
+        actual, expected = compiled(x), fn(ref)
+        assert tp.allclose(actual, expected, equal_nan=True)
+        actual.backward()
+        expected.backward()
+        assert tp.allclose(x.grad, ref.grad, equal_nan=True)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda x: x.var(),
+        lambda x: x.std(),
+        lambda x: x.var(-1),
+        lambda x: x.std(0, keepdim=True),
+        lambda x: x.var((0, 1), correction=0),
+        lambda x: x.std(-1, correction=0),
+        lambda x: tp.var_mean(x, dim=0),
+        lambda x: tp.std_mean(x, dim=-1, keepdim=True),
+    ],
+)
+def test_training_variance_gradients_reuse_runtime_counts(fn, device):
+    artifacts = []
+    compiled = tp.compile(fn, backend=_counting_backend(artifacts), dynamic=True, strict_native=True)
+    pending = []
+    for rows, cols in ((3, 7), (5, 11), (4, 8)):
+        x = tp.randn(rows, cols, device=device).requires_grad_()
+        ref = x.detach().clone().requires_grad_()
+        actual, expected = compiled(x), fn(ref)
+        actuals = actual if isinstance(actual, tuple) else (actual,)
+        expecteds = expected if isinstance(expected, tuple) else (expected,)
+        assert all(tp.allclose(a, e, atol=1e-6, rtol=1e-5) for a, e in zip(actuals, expecteds))
+        pending.append((x, ref, actuals, expecteds))
+    for x, ref, actuals, expecteds in reversed(pending):
+        tangents = [tp.randn_like(value) for value in actuals]
+        tp.autograd.backward(actuals, tangents)
+        tp.autograd.backward(expecteds, tangents)
+        assert tp.allclose(x.grad, ref.grad, atol=1e-5, rtol=1e-5)
+    assert len(artifacts) == 2
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", [tp.float16, tp.bfloat16])
+@pytest.mark.parametrize("fn", [lambda x: x.var(), lambda x: x.std(), lambda x: tp.var_mean(x)])
+def test_dynamic_low_precision_variance_uses_wide_accumulation(device, dtype, fn):
+    artifacts = []
+    compiled = tp.compile(fn, backend=_counting_backend(artifacts), dynamic=True, strict_native=True)
+    for count in (70000, 80000):
+        x = tp.randn(count, dtype=dtype, device=device).requires_grad_()
+        ref = x.detach().clone().requires_grad_()
+        actual, expected = compiled(x), fn(ref)
+        actuals = actual if isinstance(actual, tuple) else (actual,)
+        expecteds = expected if isinstance(expected, tuple) else (expected,)
+        for a, e in zip(actuals, expecteds):
+            assert a.dtype == e.dtype
+            assert tp.allclose(a, e, atol=2e-4, rtol=2e-3)
+        tangents = [tp.ones_like(a) for a in actuals]
+        tp.autograd.backward(actuals, tangents)
+        tp.autograd.backward(expecteds, tangents)
+        assert tp.allclose(x.grad, ref.grad, atol=1e-6, rtol=2e-2)
+    assert len(artifacts) == 2
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda x: (x * x)[:, x.shape[1] // 2 :],
+        lambda x: (x * x)[x.shape[0] - 1],
+        lambda x: (x * x).repeat(x.shape[0], 1),
+    ],
+)
+def test_training_specializes_symbolic_saved_operator_arguments(fn, device):
+    artifacts = []
+    compiled = tp.compile(fn, backend=_counting_backend(artifacts), dynamic=True, strict_native=True)
+    for rows, cols in ((3, 7), (5, 11), (3, 7)):
+        x = tp.randn(rows, cols, device=device).requires_grad_()
+        ref = x.detach().clone().requires_grad_()
+        actual, expected = compiled(x), fn(ref)
+        tangent = tp.randn_like(actual)
+        actual.backward(tangent)
+        expected.backward(tangent)
+        assert tp.allclose(x.grad, ref.grad)
     assert len(artifacts) == 4
 
 
