@@ -1653,6 +1653,11 @@ class GraphLowering(Interpreter):
         the receiver leads the inputs and the name is all there is to call by.
         """
 
+        if self.shape_env is not None:
+            # Output metadata for a call-out is obtained from its example.
+            # Keep that metadata valid until symbolic inference covers it.
+            for symbol in tuple(self.shape_env.backed_var_to_val):
+                self.shape_env.guarding_hint_or_throw(symbol)
         args = list(realized_args)
         call_method = node.op == "call_method"
         if call_method:
@@ -2281,6 +2286,10 @@ class GraphLowering(Interpreter):
         args = pytree.tree_map(self._materialize_embedded_tensor, args)
         kwargs = pytree.tree_map(self._materialize_embedded_tensor, kwargs)
         name = target_name(target)
+        if getattr(target, "__module__", None) in ("operator", "_operator") and all(
+            isinstance(arg, (int, float, bool, sympy.Basic)) for arg in args
+        ):
+            return target(*args, **kwargs)
         if name == "getitem" and args and isinstance(args[0], (list, tuple)):
             # Indexing a result tuple is answered here rather than called out
             # to: a value that is already computed is addressed, not recomputed.

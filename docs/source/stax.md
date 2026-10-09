@@ -11,6 +11,39 @@ backends.
 
 This module is TensorPlay-specific.
 
+## Dynamic shapes
+
+Use `tensorplay.compile(fn, backend="stax", dynamic=True)` to keep input
+extents symbolic. Shape reads through `shape`, `size()` and `numel()` remain
+expressions; generated CPU and CUDA kernels bind their extents and inferred
+strides from the tensors supplied on each call. Pointwise operations,
+reductions and reshapes can reuse an artifact across compatible sizes.
+
+```python
+import tensorplay as tp
+
+def flatten_rows(x):
+    return x.reshape(x.size(0), -1) * 2
+
+compiled = tp.compile(flatten_rows, dynamic=True, strict_native=True)
+compiled(tp.randn(3, 7))
+compiled(tp.randn(5, 11))
+```
+
+Reuse checks the shape decisions and layout relations made during capture and
+lowering. A different branch, broadcast pattern or stride arrangement selects
+another guarded artifact. Sizes zero and one have separate specializations.
+`strict_native=True` raises when a region cannot be generated instead of
+executing its graph as a fallback.
+
+Training currently captures native gradient formulas with concrete saved
+sizes. Changing a training input's shape or strides therefore recaptures the
+forward and backward region. Symbolic graph capture is available through
+`make_graph(..., tracing_mode="symbolic")`; storage-free fake tracing and
+data-dependent output extents remain unsupported by that capture entry point.
+Tensor inputs nested in containers and call-outs with concrete output metadata
+use guarded specializations rather than sharing an artifact across sizes.
+
 ## Functions
 
 ```{eval-rst}

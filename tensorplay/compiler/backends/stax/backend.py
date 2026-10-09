@@ -145,12 +145,10 @@ def stax(
     return wrapped
 
 
-# This backend lowers operator overloads, never the Python functions a capture
-# happened to call.  A region with nothing to differentiate is therefore traced
-# down to the operators it runs before it is handed over, exactly as a training
-# region is: a function's name does not say which overload it reached, nor what
-# a composite is made of.
+# Operator tracing resolves composites and overloads before lowering. Symbolic
+# inference also accepts canonical calls so size expressions remain graph values.
 stax.lowers_operator_graphs = True
+stax.supports_symbolic_shapes = True
 
 
 def _trace_decompositions():

@@ -594,8 +594,20 @@ def aot_function(
     run_training._tensorplay_codegen = fw_codegen  # type: ignore[attr-defined]
     run_training._tensorplay_backward_codegen = None  # type: ignore[attr-defined]
     guard = getattr(compiled_fw, "_tensorplay_guard", None)
-    if guard is not None:
-        run_training._tensorplay_guard = lambda *args: guard(*(args[i] for i in fw_input_order))
+    # Joint capture evaluates native gradient formulas with concrete
+    # metadata. Their saved sizes require a new joint graph when changed.
+    metadata = tuple(
+        (i, tuple(value.shape), tuple(value.stride()))
+        for i, value in enumerate(primals) if _is_tensor(value)
+    )
+
+    def training_guard(*args):
+        return all(
+            tuple(args[i].shape) == shape and tuple(args[i].stride()) == stride
+            for i, shape, stride in metadata
+        ) and (guard is None or guard(*(args[i] for i in fw_input_order)))
+
+    run_training._tensorplay_guard = training_guard
     return run_training
 
 

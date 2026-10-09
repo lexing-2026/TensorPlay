@@ -544,7 +544,10 @@ def compile(
                 backend_variants.clear()
             store_compiled = cache_enabled
             if compiled_fn is None:
-                if len(cache) >= specialization_limit:
+                variant_count = len(cache) + sum(
+                    max(0, len(variants) - 1) for variants in backend_variants.values()
+                )
+                if variant_count >= specialization_limit:
                     if fullgraph or compiler_config.fail_on_recompile_limit_hit:
                         raise RuntimeError(
                             "TensorPlay compile specialization limit reached"
@@ -960,16 +963,20 @@ def _adapt_backend_to_region(
     """Match a backend to the region being compiled.
 
     Training regions are routed through ahead-of-time autograd so parameters
-    are lifted into explicit inputs before the backend sees them (the same
-    pipeline the reference ``compile_fx`` runs).  Inference regions go to the
-    backend directly unless it declares ``lowers_operator_graphs``: such a
-    backend is handed the operator-level trace of every region, with nothing
-    to differentiate in an inference one.
+    are lifted into explicit inputs before the backend sees them. Inference
+    regions normally receive an operator trace when the backend requests it.
+    A backend supporting symbolic capture can use the canonical graph directly
+    to preserve shape expressions; container inputs still require flattening.
     """
 
+    symbolic_inference = (
+        getattr(graph_module, "meta", {}).get("symbolic_shapes")
+        and getattr(compiler_fn, "supports_symbolic_shapes", False)
+        and not graph_module.meta.get("static_shape_params")
+    )
     if not _region_is_training(
         example_inputs, example_kwargs, graph_module
-    ) and not getattr(compiler_fn, "lowers_operator_graphs", False):
+    ) and (not getattr(compiler_fn, "lowers_operator_graphs", False) or symbolic_inference):
         return compiler_fn
     from .aot_autograd import min_cut_rematerialization_partition
     from .common import aot_autograd
@@ -1105,7 +1112,15 @@ def _compile_region(
                 tensorplay.random.fork_rng(devices=devices):
             try:
                 with _compiler_context(), _preserve_module_state(model):
-                    tracer = Tracer(execute=True)
+                    samples = _bind_sample_arguments(model, example_inputs, example_kwargs)
+                    if backend_kwargs.get("dynamic") is True and getattr(
+                        compiler_fn, "supports_symbolic_shapes", False
+                    ):
+                        from tensorplay.graph.experimental._symbolic_trace import SymbolicShapeTracer
+
+                        tracer = SymbolicShapeTracer(samples or {})
+                    else:
+                        tracer = Tracer(execute=True)
                     # An operator that stands for a region of the program -- rather
                     # than for one operation -- has to be told that a capture is
                     # running, or it runs itself and the region it stands for is
@@ -1119,9 +1134,7 @@ def _compile_region(
                     with tracer.proxy_mode:
                         graph_module = tracer.trace(
                             model,
-                            sample_inputs=_bind_sample_arguments(
-                                model, example_inputs, example_kwargs
-                            ),
+                            sample_inputs=samples,
                         )
                     # Default capture pipeline: canonicalize operators, then constant
                     # folding, then decomposition, common-subexpression elimination
@@ -1214,6 +1227,23 @@ def _compile_region(
         raise TypeError(
             f"compiler backend returned {type(compiled)!r}; expected a callable"
         )
+    if graph_module.meta.get("symbolic_shapes"):
+        from tensorplay.compiler.backends.stax.shape_guards import build_capture_guard
+
+        capture_guard = build_capture_guard(graph_module)
+        backend_guard = getattr(compiled, "_tensorplay_guard", None)
+
+        def check(*args, **kwargs):
+            values = graph_module.signature.bind(*args, **kwargs)
+            values.apply_defaults()
+            ordered = [
+                values.arguments[node.target] for node in graph_module.graph.placeholders
+            ]
+            return capture_guard(ordered) and (
+                backend_guard is None or backend_guard(*args, **kwargs)
+            )
+
+        compiled._tensorplay_guard = check
     _release_recorded_values(graph_module)
     return compiled, graph_module
 
@@ -1412,6 +1442,8 @@ def _extract_shape_guard_params(graph_module: GraphModule) -> frozenset[str]:
     """
 
     touches = getattr(graph_module, "meta", {}).get("metadata_touches") or ()
+    if graph_module.meta.get("symbolic_shapes"):
+        return frozenset(graph_module.meta.get("static_shape_params", ()))
     names = {name for name, attr in touches if attr in _SHAPE_GUARD_ATTRS}
     if not names or graph_module.signature is None:
         return frozenset()

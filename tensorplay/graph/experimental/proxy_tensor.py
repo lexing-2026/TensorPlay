@@ -550,9 +550,9 @@ def make_graph(
     )
     if tracing_mode not in {"real", "fake", "symbolic"}:
         raise ValueError(f"unknown tracing mode {tracing_mode!r}")
-    if tracing_mode in {"fake", "symbolic"}:
+    if tracing_mode == "fake":
         raise NotImplementedError(
-            f"{tracing_mode} tensor materialization requires symbolic shape support"
+            "fake tracing requires storage-free tensor materialization"
         )
     dynamic_shapes = _resolve_dynamic_shapes(f, dynamic_shapes)
     session = MakeGraphTracer(decomposition_table)
@@ -563,9 +563,18 @@ def make_graph(
         try:
             fn = _positional_signature(f, args, kwargs)
             samples = _bind_sample_inputs(fn, args, kwargs)
-            tracer = PythonKeyTracer(decomposition_table=decomposition_table, execute=False)
+            if tracing_mode == "symbolic":
+                from ._symbolic_trace import SymbolicShapeTracer
+
+                tracer = SymbolicShapeTracer(samples, decomposition_table=decomposition_table)
+            else:
+                tracer = PythonKeyTracer(decomposition_table=decomposition_table, execute=False)
             tracer.dynamic_shapes = dynamic_shapes
-            graph_module = dispatch_trace(fn, tracer, samples)
+            if tracing_mode == "symbolic":
+                with tracer.proxy_mode:
+                    graph_module = tracer.trace(fn, sample_inputs=samples)
+            else:
+                graph_module = dispatch_trace(fn, tracer, samples)
             graph_module.meta["tracing_mode"] = tracing_mode
             return graph_module
         finally:

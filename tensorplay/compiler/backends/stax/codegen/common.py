@@ -218,9 +218,7 @@ def get_device_op_overrides(device: str) -> DeviceOpOverrides:
 class PythonPrinter(_PythonPrinter):
     """Writes an expression as this project's own code rather than as sympy's.
 
-    Two differences from the printer it inherits, both of them about how a value
-    is spelled rather than about what it is: a size is simplified first, because
-    an expression written as an unsimplified formula is a formula a reader has to
+    A size is simplified first, because an unsimplified formula is one a reader has to
     simplify to check, and a remainder is always parenthesised, because ``a % b *
     c`` means something different from ``a % (b * c)`` and a printer that guessed
     would be guessing which was meant.
@@ -228,6 +226,10 @@ class PythonPrinter(_PythonPrinter):
 
     def _print_str(self, expr: str) -> str:
         return expr
+
+    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        left, right = (self._print(arg) for arg in expr.args)
+        return f"(({left}) // ({right}))"
 
     def _print_ModularIndexing(self, expr: sympy.Expr) -> str:
         x, div, mod = (

@@ -18,6 +18,35 @@ class _GuardPrinter(PythonCodePrinter):
         return f"((({value}) // ({divisor})) % ({modulus}))"
 
 
+def build_capture_guard(module):
+    """Check the decisions and fixed dimensions used during shape capture."""
+
+    dims = module.meta.get("symbolic_dims")
+    if dims is None:
+        return None
+    printer = _GuardPrinter()
+    positions = {node.target: i for i, node in enumerate(module.graph.placeholders)}
+    replacements = {}
+    assignments = []
+    checks = []
+    for symbol in dims.symbols:
+        name, axis, scale, offset = dims.source(symbol)
+        replacement = sympy.Symbol(f"capture_{len(replacements)}")
+        replacements[symbol] = replacement
+        assignments.append(f"    {replacement} = (args[{positions[name]}].size()[{axis}] - {offset}) // {scale}")
+    for guard in dims.guards:
+        expression = guard.fact.xreplace(replacements)
+        if expression.free_symbols - set(replacements.values()):
+            raise NotImplementedError("shape decision depends on an unbound dimension")
+        checks.append(f"({printer.doprint(expression)})")
+    for name, axis, size in module.meta.get("static_shape_dims", ()):
+        checks.append(f"args[{positions[name]}].size()[{axis}] == {size}")
+    namespace = {"math": math}
+    source = "\n".join(["def check(args):", *assignments, "    return " + (" and ".join(checks) or "True")])
+    exec(compile(source, "<capture-guards>", "exec"), namespace)
+    return namespace["check"]
+
+
 def build_input_guard(graph):
     """Compile a check over input metadata, without retaining sample tensors."""
 
@@ -62,10 +91,11 @@ def build_input_guard(graph):
     namespace = {"math": math}
     exec(compile(source, "<shape-guards>", "exec"), namespace)
     check = namespace["check"]
+    capture_guard = build_capture_guard(graph.module)
 
     def validate(args):
         try:
-            return bool(check(args))
+            return bool(check(args)) and (capture_guard is None or bool(capture_guard(args)))
         except (AttributeError, IndexError, TypeError, ValueError, ZeroDivisionError):
             return False
 

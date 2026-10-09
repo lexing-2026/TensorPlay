@@ -2499,8 +2499,8 @@ def reshape(x: TensorBox, new_size) -> TensorBox:
     view says so and the elements are moved when the value is laid down.
     """
 
-    old_size = tuple(int(s) for s in x.get_size())
-    new_size = tuple(int(s) for s in new_size)
+    old_size = tuple(_extent(s) for s in x.get_size())
+    new_size = tuple(_extent(s) for s in new_size)
     if old_size == new_size:
         return x
     node = _underlying(x)
@@ -2556,10 +2556,15 @@ def _reinterpret_consecutive(node, new_size):
 
 
 def _resolve_size(size, numel):
-    size = [int(s) for s in size]
+    size = [_extent(s) for s in size]
+    if size.count(-1) > 1:
+        raise ValueError("only one dimension can be inferred")
     if -1 in size:
-        known = prod(s for s in size if s != -1)
-        size[size.index(-1)] = numel // max(known, 1)
+        known = sympy.prod(s for s in size if s != -1)
+        V.graph.sizevars.check(sympy.Ne(known, 0))
+        V.graph.sizevars.check(sympy.Eq(sympy.Mod(numel, known), 0))
+        size[size.index(-1)] = sympy.simplify(FloorDiv(numel, known))
+    V.graph.sizevars.check_equals(sympy.prod(size), numel)
     return size
 
 
@@ -2573,11 +2578,11 @@ def lower_flatten(x, start_dim=0, end_dim=-1):
     # Flatten merges the axes in ``[start_dim, end_dim]`` into one: the
     # leading and trailing axes stay as they are, and the merged axis holds
     # the product of the extents it spans.
-    size = [int(s) for s in x.get_size()]
+    size = [_extent(s) for s in x.get_size()]
     rank = len(size)
     start = normalize_dim(start_dim, rank)
     end = normalize_dim(end_dim, rank)
-    merged = prod(size[start : end + 1])
+    merged = sympy.prod(size[start : end + 1])
     return reshape(x, size[:start] + [merged] + size[end + 1 :])
 
 
@@ -2659,7 +2664,7 @@ def lower_expand(x, size, *args, **kwargs):
     # one needs no memory and no copy.  The view that says so has to be the one
     # that knows how a shorter shape lines up with a longer one, since a value
     # of fewer dimensions is lined up by its innermost axes.
-    return ExpandView.create(x, [int(s) for s in size])
+    return ExpandView.create(x, [_extent(s) for s in size])
 
 
 @register("broadcast_tensors.default")
@@ -3113,7 +3118,7 @@ def lower_sum_to_size(x, size):
     return view(total, size)
 
 
-@register("mean.dim")
+@register("mean", "mean.dim")
 def lower_mean(x, dim=None, keepdim=False, dtype=None, **kwargs):
     if dim is None or (isinstance(dim, (list, tuple)) and len(dim) == 0):
         dim = list(range(len(x.get_size())))

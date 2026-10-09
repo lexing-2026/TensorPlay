@@ -190,6 +190,8 @@ class BoundVars:
             # translated into the symbolic language the range analysis uses.
             if isinstance(value, Expr):
                 return bound_sympy(value.to_sympy()).upper
+            if isinstance(value, sympy.Expr):
+                return bound_sympy(value).upper
             return value
 
         self.loop_body = loop_body
