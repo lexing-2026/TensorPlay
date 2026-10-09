@@ -12268,8 +12268,10 @@ class View(GenericView):
         )
 
         if new_stride_symint is not None:
+            from tensorplay.graph.experimental.sym_node import SymNode
+
             new_stride = [
-                s.node.expr if hasattr(s, "node") else sympy.Integer(s)
+                s.expr if isinstance(s, SymNode) else sympy.Integer(s)
                 for s in new_stride_symint
             ]
             new_layout = FixedLayout(

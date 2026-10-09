@@ -973,16 +973,20 @@ class SizeVarAllocator:
         return [self.guard_int(xi) for xi in x]
 
     def to_symint_or_int(self, x):
-        """The value of a shape, as a plain number where it is one.
+        """Wrap an expression so layout decisions record their constraints."""
 
-        A shape that is a plain number is returned as it is.  Anything else is
-        returned as it is too, rather than forced into a number, because the
-        caller has to be able to tell the two apart.
-        """
-
-        if isinstance(x, (Expr, int)):
+        if isinstance(x, int):
             return x
-        raise AssertionError(f"expected Expr or int, got {x}")
+        if not isinstance(x, Expr):
+            raise AssertionError(f"expected Expr or int, got {x}")
+        x = self.remove_precomputed_replacements(self.simplify(x))
+        if isinstance(x, (int, sympy.Integer)):
+            return int(x)
+        try:
+            hint = self.guarding_hint_or_throw(x)
+        except Exception:
+            hint = None
+        return self.shape_env.create_symintnode(x, hint=hint)
 
     def to_symints_or_ints(self, x):
         """The values of a sequence of shapes, one at a time."""
