@@ -1099,8 +1099,6 @@ class ShapeEnv:
             self.var_to_range[symbol] = ValueRanges(lower, sympy.oo)
             self.var_to_hint_override[symbol] = hint
             self._duck_symbols.setdefault(int(hint), symbol)
-            if self._suppress_guards == 0:
-                self.guards.append(ShapeGuard(sympy.Eq(symbol, hint), source))
         if constraint_dim is not None and isinstance(constraint_dim, StrictMinMaxConstraint):
             self._constrain_range(symbol, constraint_dim.vr.lower, constraint_dim.vr.upper)
         self.counter["create_symbol"] += 1
@@ -1241,10 +1239,27 @@ class ShapeEnv:
                     )
                 )
         symbolic_strides: list[Int] = []
+        candidates: dict[int, Any] = {}
+        inferred_strides: dict[int, Any] = {}
+        for value, neg_index in sorted((int(value), -i) for i, value in enumerate(strides)):
+            index = -neg_index
+            contiguous = index + 1 < len(sizes) and value == int(sizes[index + 1]) * int(strides[index + 1])
+            if value in (0, 1) and not contiguous:
+                inferred = value
+            elif value in candidates:
+                inferred = candidates[value]
+            else:
+                policy = DimDynamic.STATIC if all(isinstance(size, int) for size in symbolic_sizes) else DimDynamic.DUCK
+                inferred = self.create_symintnode(
+                    self.create_symbol(value, _Source(f"{_source_name(source)}.stride[{index}]", index), policy),
+                    hint=value,
+                )
+            inferred_strides[index] = inferred
+            candidates[int(sizes[index]) * value] = symbolic_sizes[index] * inferred
         for index, value in enumerate(strides):
             policy = dynamic_strides[index] if index < len(dynamic_strides) else DimDynamic.INFER_STRIDE
             if policy is DimDynamic.INFER_STRIDE:
-                symbolic_strides.append(int(value))
+                symbolic_strides.append(inferred_strides[index])
             else:
                 symbolic_strides.append(
                     self.create_symintnode(
@@ -1382,18 +1397,8 @@ class ShapeEnv:
             expr = sympy.sympify(expr)
 
         result = self.replace(expr)
-        if unbacked_only:
-            result = result.xreplace(
-                {
-                    k: v
-                    for k, v in self.backed_var_to_val.items()
-                    if k not in self.unbacked_var_to_val
-                }
-            )
         if compute_hint:
             result = result.xreplace(self.backed_var_to_val)
-        else:
-            result = result.subs(self.backed_var_to_val)
 
         if not result.free_symbols:
             if result.is_number or result.is_Boolean:
@@ -1553,12 +1558,15 @@ class ShapeEnv:
 
     def guarding_hint_or_throw(self, expr: sympy.Expr | int) -> int | bool:
         value = self._maybe_evaluate_static(expr)
+        if value is not None:
+            return value
+        expression = self.replace(expr)
+        value = self._maybe_evaluate_static(expression, compute_hint=True)
         if value is None:
-            expression = self.replace(expr)
-            if isinstance(expression, sympy.Symbol) and expression in self.var_to_hint_override:
-                return self.var_to_hint_override[expression]
             raise GuardOnDataDependentSymNode(expression, f"cannot guard {expression}")
-        self.guards.append(ShapeGuard(sympy.Eq(self.replace(expr), value)))
+        fact = expression if value is True else sympy.Not(expression) if value is False else sympy.Eq(expression, value)
+        if not self._suppress_guards:
+            self.guards.append(ShapeGuard(fact))
         return value
 
     def guard_int(self, expr: sympy.Expr | int) -> int:
@@ -1590,7 +1598,7 @@ class ShapeEnv:
         return self._maybe_evaluate_static(expr) is not None or self.replace(expr) in self.var_to_hint_override
 
     def optimization_hint(self, expr: sympy.Expr, fallback: int | None = None) -> int:
-        value = self._maybe_evaluate_static(expr)
+        value = self._maybe_evaluate_static(expr, compute_hint=True)
         if value is not None:
             return int(value)
         expression = self.replace(expr)
@@ -1634,7 +1642,12 @@ class ShapeEnv:
             if fallback_value is not _unspecified:
                 return fallback_value
             raise GuardOnDataDependentSymNode(result, f"cannot evaluate {result}")
-        return _primitive(result)
+        value = _primitive(result)
+        if not values and not self._suppress_guards and self._maybe_evaluate_static(expr) is None:
+            expression = self.replace(expr)
+            fact = expression if value is True else sympy.Not(expression) if value is False else sympy.Eq(expression, value)
+            self.guards.append(ShapeGuard(fact))
+        return value
 
     def evaluate_symexpr(self, code: str) -> int | float | bool:
         namespace = dict(SYMPY_INTERP)
