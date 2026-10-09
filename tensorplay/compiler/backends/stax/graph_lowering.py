@@ -627,7 +627,7 @@ class GraphLowering(Interpreter):
         self.device_node_mapping: dict = {}
         self.graph_outputs: list[Any] = []
         # The shape environment of the region, and the questions asked of it.
-        self.sizevars = SizeVarAllocator()
+        self.sizevars = SizeVarAllocator(shape_env)
         # Whether the layouts here may be chosen rather than taken as they are
         # given, which is what makes a call of the kind that gains from a
         # particular layout be laid out for it.
@@ -849,6 +849,16 @@ class GraphLowering(Interpreter):
         size = [sympy.Integer(i) for i in ex.size()]
         stride = [sympy.Integer(i) for i in ex.stride()]
         return size, stride
+
+    def symbolic_sizes_strides_storage_offset(self, ex, source):
+        """Describe an input layout with symbols and inferred stride products."""
+
+        from tensorplay.graph.experimental.sym_node import SymNode
+
+        sizes, strides, offset = self.shape_env.create_symbolic_sizes_strides_storage_offset(ex, source)
+        def expression(value):
+            return value.expr if isinstance(value, SymNode) else sympy.sympify(value)
+        return [expression(v) for v in sizes], [expression(v) for v in strides], expression(offset)
 
     def get_training_phase(self) -> str:
         """Which of the three passes over a region this is.
@@ -2130,7 +2140,11 @@ class GraphLowering(Interpreter):
             self.graph_input_names.append(name)
             return example
 
-        sizes, strides = self.static_sizes_strides(example)
+        if self.shape_env is None:
+            sizes, strides = self.static_sizes_strides(example)
+            offset = sympy.Integer(example.storage_offset())
+        else:
+            sizes, strides, offset = self.symbolic_sizes_strides_storage_offset(example, name)
         buffer = InputBuffer(
             name=name,
             layout=FixedLayout(example.device, example.dtype, sizes, strides),
@@ -2145,7 +2159,7 @@ class GraphLowering(Interpreter):
         self.name_to_buffer[buffer.name] = buffer
         self.buffers.append(buffer)
         self.graph_inputs[name] = tensor
-        self.graph_input_storage_offsets[name] = sympy.Integer(example.storage_offset())
+        self.graph_input_storage_offsets[name] = offset
         self.graph_inputs_original[name] = buffer
         self.graph_input_names.append(name)
         return tensor

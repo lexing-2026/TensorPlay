@@ -234,10 +234,12 @@ def _lower_stax_region(
         decompose_auto_functionalized(graph_module.graph)
         graph_module.recompile()
 
+    from tensorplay.graph.experimental.symbolic_shapes import ShapeEnv
+
     graph = GraphLowering(
         graph_module,
         example_inputs,
-        shape_env=None,
+        shape_env=ShapeEnv() if dynamic_shapes else None,
         cpp_wrapper=use_cuda_codegen,
         aot_mode=training,
         extern_node_serializer=None,
@@ -321,12 +323,17 @@ def _lower_stax_region(
     # which one this one happens to use -- and a region that produced one result
     # produces that result, rather than a sequence holding it.
     module_call = compiled_module.call
+    input_guard = None
+    if dynamic_shapes:
+        from .shape_guards import build_input_guard
+
+        input_guard = build_input_guard(graph)
     single_output = bool(getattr(graph, "single_output", False))
     # The generated entry point takes the region's arguments as one sequence,
     # in the order the region's placeholders stand.  The artifact is reached
     # through the same signature the region was captured under, so keyword
     # and default arguments are bound back to their parameter names and
-    # re-ordered into that sequence, mirroring the capture-time binding.
+    # re-ordered into that sequence using the captured signature.
     signature = graph_module.signature
 
     # A call that hands every captured argument by position, in the order
@@ -344,7 +351,7 @@ def _lower_stax_region(
     ] == placeholder_names and len(signature.parameters) == len(placeholder_names)
     num_placeholders = len(placeholder_names)
 
-    def compiled(*args, **kwargs):
+    def ordered_inputs(args, kwargs):
         if signature is None or (
             positional and not kwargs and len(args) == num_placeholders
         ):
@@ -366,6 +373,12 @@ def _lower_stax_region(
                         f"compiled region is missing a value for "
                         f"captured argument {parameter_name!r}"
                     )
+        return ordered
+
+    def compiled(*args, **kwargs):
+        ordered = ordered_inputs(args, kwargs)
+        if input_guard is not None and not input_guard(ordered):
+            raise RuntimeError("compiled shape constraints do not hold for these inputs")
         # A list rather than a tuple, because the written-out code empties what
         # it is given once it has taken it -- which is how a caller that holds
         # the same values does not keep them alive for the call.
@@ -384,6 +397,8 @@ def _lower_stax_region(
         return result
 
     def boxed_call(args):
+        if input_guard is not None and not input_guard(args):
+            raise RuntimeError("compiled shape constraints do not hold for these inputs")
         _enter_lowered_graph_scope()
         try:
             result = module_call(args)
@@ -395,6 +410,9 @@ def _lower_stax_region(
 
     compiled._tensorplay_boxed_call = boxed_call  # type: ignore[attr-defined]
     compiled._tensorplay_module_call = module_call  # type: ignore[attr-defined]
+    if input_guard is not None:
+        compiled._tensorplay_input_guard = input_guard
+        compiled._tensorplay_guard = lambda *args, **kwargs: input_guard(ordered_inputs(args, kwargs))
     # The report is on what the caller actually receives, which is this and not
     # the module behind it -- a caller asking which route produced its callable
     # would otherwise be told nothing, since the module is not what it holds.

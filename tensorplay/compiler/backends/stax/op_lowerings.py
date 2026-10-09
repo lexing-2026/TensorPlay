@@ -3120,11 +3120,11 @@ def lower_mean(x, dim=None, keepdim=False, dtype=None, **kwargs):
     elif isinstance(dim, (int, sympy.Integer)):
         dim = [dim]
     dtype = _resolve_dtype(dtype, x.get_dtype())
-    count = prod(x.get_size()[normalize_dim(d, len(x.get_size()))] for d in dim)
+    count = sympy.prod(x.get_size()[normalize_dim(d, len(x.get_size()))] for d in dim)
     total = make_reduction(
         x, dim, keepdim, dtype, x.get_device(), "sum"
     )
-    return pointwise(lambda v: ops.truediv(v, ops.constant(float(count), tp.float32)), total)
+    return pointwise(lambda v: ops.truediv(v, ops.index_expr(count, dtype)), total)
 
 
 @register("var.dim", "var.correction")

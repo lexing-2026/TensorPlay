@@ -407,6 +407,7 @@ def compile(
     cache_enabled = not compiler_config.force_disable_caches
     compile_attempts = 0
     cache: dict[Any, Callable[..., Any]] = {}
+    backend_variants: dict[Any, list[Callable[..., Any]]] = {}
     guard_chains: dict[Any, GuardChain] = {}
     lock = threading.RLock()
     last_quick_key: Any = object()
@@ -526,6 +527,21 @@ def compile(
                     grad_state,
                 )
                 compiled_fn = cache.get(key) if cache_enabled else None
+            if compiled_fn is not None:
+                check = getattr(compiled_fn, "_tensorplay_guard", None)
+                if check is not None and not check(*args, **kwargs):
+                    key = (
+                        _input_signature(args, kwargs, dynamic=specialization_dynamic),
+                        _guard_component(args, kwargs, _value_signature),
+                        data_component,
+                        grad_state,
+                    )
+                    compiled_fn = next((
+                        variant for variant in backend_variants.get(key, ())
+                        if variant is not compiled_fn and getattr(variant, "_tensorplay_guard")(*args, **kwargs)
+                    ), None)
+            if not cache:
+                backend_variants.clear()
             store_compiled = cache_enabled
             if compiled_fn is None:
                 if len(cache) >= specialization_limit:
@@ -596,6 +612,8 @@ def compile(
                 )
                 if store_compiled:
                     cache[key] = compiled_fn
+                    if getattr(compiled_fn, "_tensorplay_guard", None) is not None:
+                        backend_variants.setdefault(key, []).append(compiled_fn)
                     guard_chains[key] = build_guard_chain(
                         key,
                         args=args,

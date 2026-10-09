@@ -397,6 +397,9 @@ def aot_function(
             if hasattr(inner, name):
                 setattr(run_flattened, name, getattr(inner, name))
         run_flattened._tensorplay_flattened = inner  # type: ignore[attr-defined]
+        guard = getattr(inner, "_tensorplay_guard", None)
+        if guard is not None:
+            run_flattened._tensorplay_guard = lambda *args: guard(*tree_flatten(tuple(args))[0])
         return run_flattened
 
     del keep_inference_input_mutations  # mutations stay in the traced graph order
@@ -425,6 +428,9 @@ def aot_function(
             compiled_fw, "_tensorplay_codegen", None
         )  # type: ignore[attr-defined]
         run_inference._tensorplay_backward_codegen = None  # type: ignore[attr-defined]
+        guard = getattr(compiled_fw, "_tensorplay_guard", None)
+        if guard is not None:
+            run_inference._tensorplay_guard = guard
         return run_inference
 
     (
@@ -587,6 +593,9 @@ def aot_function(
     run_training._tensorplay_aot_graphs = (joint, fw_module, bw_module)  # type: ignore[attr-defined]
     run_training._tensorplay_codegen = fw_codegen  # type: ignore[attr-defined]
     run_training._tensorplay_backward_codegen = None  # type: ignore[attr-defined]
+    guard = getattr(compiled_fw, "_tensorplay_guard", None)
+    if guard is not None:
+        run_training._tensorplay_guard = lambda *args: guard(*(args[i] for i in fw_input_order))
     return run_training
 
 
@@ -689,6 +698,13 @@ def aot_module_simplified(
 
         def __getattr__(self, name: str) -> Any:
             return getattr(self._compiled, name)
+
+        def _tensorplay_guard(self, *args: Any, **kwargs: Any) -> bool:
+            guard = getattr(self._compiled, "_tensorplay_guard", None)
+            return guard is None or guard(
+                *self._read_state(),
+                *self._bind_graph_inputs(self._module, args, kwargs),
+            )
 
     return _AotForward(compiled, module, read_state, _bind_graph_inputs)
 
