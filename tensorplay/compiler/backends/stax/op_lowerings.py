@@ -386,7 +386,7 @@ def _record_symbolic_input_source(tensor, dim, expr, kind) -> None:
         return
 
     if not isinstance(tensor.data, StorageBox) or not isinstance(
-        tensor.data.data, InputBuffer
+        tensor.data.data, ir.InputBuffer
     ):
         return
 
@@ -395,7 +395,6 @@ def _record_symbolic_input_source(tensor, dim, expr, kind) -> None:
         return
 
     V.graph.symbolic_input_sources.setdefault(expr, (name, kind, int(dim)))
-    from .ir import InputBuffer
 
 
 def unsupported_input_tensor(t, node=None) -> bool:
@@ -2674,26 +2673,21 @@ def lower_broadcast_tensors(tensors):
     return list(broadcast_tensors(*tensors))
 
 
-def _slice(x, dim, start, end, step):
-    size = list(x.get_size())
-    dim = normalize_dim(dim, len(size))
-    extent = size[dim]
-    start = 0 if start is None else int(start)
-    end = extent if end is None else int(end)
-    if start < 0:
-        start += extent
-    if end < 0:
-        end += extent
-    start = max(0, min(start, extent))
-    end = max(start, min(end, extent))
-    step = int(step or 1)
-    new_size = list(size)
-    new_size[dim] = (end - start + step - 1) // step
+def _slice(x, dim, start, end, step, *, clamp=True):
+    dim = _validate_dim(x, dim)
+    extent = x.get_size()[dim]
+    step = sympy.expand(1 if step is None else step)
+    if not V.graph.sizevars.guard_or_false(sympy.Gt(step, 0)):
+        raise NotImplementedError("slice step must be a known positive integer")
+    if clamp:
+        start_index = _compute_slice_index(start, extent, 0)
+        end_index = extent if end == 2**63 - 1 else _compute_slice_index(end, extent, extent)
+        if start_index is None or end_index is None:
+            return fallback_handler(tp_ops.slice.Tensor)(x, dim, start, end, step)
+        start, end = start_index, _clamp_slice_end_to_start(end_index, start_index)
     if start == 0 and step == 1 and end == extent:
         return x
-    return SliceView.create(
-        _underlying(x), dim, start, end, step, clamp=True
-    )
+    return SliceView.create(_underlying(x), dim, start, end, step, clamp=False)
 
 
 @register("slice.Tensor")
@@ -2719,20 +2713,18 @@ def lower_basic_getitem(x, index):
 
     if not isinstance(index, tuple):
         index = (index,)
-    basic = (int, slice, type(None), type(Ellipsis))
+    basic = (int, sympy.Expr, slice, type(None), type(Ellipsis))
     if any(isinstance(i, bool) or not isinstance(i, basic) for i in index):
         return None
     for part in index:
         if isinstance(part, slice):
             for bound in (part.start, part.stop, part.step):
-                if bound is not None and not isinstance(bound, int):
+                if bound is not None and not isinstance(bound, (int, sympy.Expr)):
                     return None
-            if part.step is not None and part.step <= 0:
+            if part.step is not None and not V.graph.sizevars.guard_or_false(sympy.Gt(part.step, 0)):
                 return None
     size = list(x.get_size())
-    if _static_ints(size) is None:
-        return None
-    consumed = sum(1 for i in index if isinstance(i, (int, slice)))
+    consumed = sum(1 for i in index if isinstance(i, (int, sympy.Expr, slice)))
     if sum(1 for i in index if i is Ellipsis) > 1 or consumed > len(size):
         return None
     expanded = []
@@ -2748,12 +2740,12 @@ def lower_basic_getitem(x, index):
         if part is None:
             result = _as_box(LOWERINGS["unsqueeze.default"](result, dim))
             dim += 1
-        elif isinstance(part, int):
+        elif isinstance(part, (int, sympy.Expr)):
             result = _as_box(lower_select(result, dim, part))
         else:
             if part != slice(None):
                 result = _as_box(
-                    _slice(result, dim, part.start, part.stop, part.step or 1)
+                    _slice(result, dim, part.start, part.stop, part.step)
                 )
             dim += 1
     return result
@@ -2764,11 +2756,15 @@ def lower_select(x, dim, index):
     """One position along an axis, the axis dropped: a window, no copy."""
 
     size = list(x.get_size())
-    dim = normalize_dim(int(dim), len(size))
-    index = int(index)
-    if index < 0:
-        index += int(size[dim])
-    window = _slice(x, dim, index, index + 1, 1)
+    dim = _validate_dim(x, dim)
+    index = sympy.expand(index)
+    if V.graph.sizevars.guard_or_false(sympy.Lt(index, 0)):
+        index += size[dim]
+    elif not V.graph.sizevars.guard_or_false(sympy.Ge(index, 0)):
+        return select_fallback(x, dim, index)
+    if not V.graph.sizevars.guard_or_false(sympy.And(sympy.Ge(index, 0), sympy.Lt(index, size[dim]))):
+        return select_fallback(x, dim, index)
+    window = _slice(x, dim, index, index + 1, 1, clamp=False)
     new_size = size[:dim] + size[dim + 1 :]
     return View.create(_underlying(window), new_size)
 
@@ -7585,40 +7581,9 @@ def unsqueeze(x: Any, dim: Any) -> Any:
 
 
 def select(x: Any, dim: Any, idx: Any) -> Any:
-    """One position along one axis, with that axis gone.
+    """Select one position using the guarded view lowering."""
 
-    Taking a position out is a slice of one followed by a shape that no longer
-    has room for it, and both halves matter: the slice says which value, the
-    shape says that the axis is not there any more.  An index named from the
-    back is the same position, and which one it is cannot be answered until the
-    axis length is known, so a negative index is resolved here rather than being
-    carried into the slice.
-
-    A position whose value is not known until the program runs cannot be turned
-    into either half here -- the shape would be a guess -- so it is left to the
-    framework rather than being written down as though it were known.
-    """
-
-    idx = sympy.expand(idx)
-    size = sympy.expand(x.get_size()[dim])
-    actual_index = None
-
-    if V.graph.sizevars.guard_or_false(sympy.Lt(idx, 0)):
-        actual_index = idx + size
-    elif V.graph.sizevars.guard_or_false(sympy.Ge(idx, 0)):
-        actual_index = idx
-
-    if actual_index is not None:
-        if has_free_unbacked_symbols(idx):
-            # A shape written down before the program runs would be a guess,
-            # and a guess about which position is read is a guess about the
-            # values themselves.  So the position is resolved where it is read.
-            return fallback_select(x, dim, idx)
-
-        slice_result = _slice(x, dim, actual_index, actual_index + 1, 1)
-        return lower_squeeze(slice_result, dim)
-
-    return fallback_select(x, dim, idx)
+    return lower_select(x, dim, idx)
 
 
 #: These are one sort and a read from it, and are written as such when the sort

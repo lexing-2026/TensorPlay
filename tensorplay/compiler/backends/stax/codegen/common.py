@@ -231,6 +231,12 @@ class PythonPrinter(_PythonPrinter):
         left, right = (self._print(arg) for arg in expr.args)
         return f"(({left}) // ({right}))"
 
+    def _print_Max(self, expr: sympy.Expr) -> str:
+        return f"max({', '.join(map(self._print, expr.args))})"
+
+    def _print_Min(self, expr: sympy.Expr) -> str:
+        return f"min({', '.join(map(self._print, expr.args))})"
+
     def _print_ModularIndexing(self, expr: sympy.Expr) -> str:
         x, div, mod = (
             self.parenthesize(arg, PRECEDENCE["Atom"] - 0.5)

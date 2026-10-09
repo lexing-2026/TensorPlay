@@ -17,7 +17,10 @@ Use `tensorplay.compile(fn, backend="stax", dynamic=True)` to keep input
 extents symbolic. Shape reads through `shape`, `size()` and `numel()` remain
 expressions; generated CPU and CUDA kernels bind their extents and inferred
 strides from the tensors supplied on each call. Pointwise operations,
-reductions and reshapes can reuse an artifact across compatible sizes.
+reductions, reshapes and basic indexing can reuse an artifact across compatible sizes.
+Slices preserve symbolic lengths, strides and offsets, including positive steps,
+negative bounds and bounds computed from input sizes. Integer indexing and
+`select` guard index validity; returned views retain shared storage with their inputs.
 
 ```python
 import tensorplay as tp

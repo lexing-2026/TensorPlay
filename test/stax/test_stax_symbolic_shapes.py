@@ -101,7 +101,7 @@ def test_inferred_reshape_dimension_uses_runtime_integer_division(device):
 
 
 @pytest.mark.parametrize("device", DEVICES)
-def test_call_out_consumers_recheck_example_layouts(device):
+def test_slice_consumers_reuse_symbolic_layouts(device):
     artifacts = []
     fn = lambda x: x[:, 1:] * 2
     compiled = tp.compile(fn, backend=_counting_backend(artifacts), dynamic=True, strict_native=True)
@@ -110,7 +110,93 @@ def test_call_out_consumers_recheck_example_layouts(device):
         actual, expected = compiled(x), fn(x)
         assert actual.shape == expected.shape
         assert tp.equal(actual, expected)
+    assert len(artifacts) == 1
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda x: x[1:, ::2] + 1,
+        lambda x: (x * 2)[:, 1:-1:2] + 3,
+        lambda x: x[..., None, 1:-1] * 2,
+        lambda x: x[:, -3:] * 2,
+        lambda x: x[1] + 2,
+        lambda x: x[-1] + 2,
+        lambda x: x.select(-1, -1) * 3,
+        lambda x: x[:, x.shape[1] // 2 :] - 1,
+        lambda x: x[:, : x.shape[1] - 1 : 2] + 3,
+        lambda x: x[x.shape[0] - 1] * 2,
+        lambda x: tp.ops.tp.slice.Tensor(x, 1, 1, None, 2) + 1,
+    ],
+)
+@pytest.mark.parametrize("transpose", [False, True])
+def test_dynamic_indexing_reuses_generated_kernels(fn, device, transpose):
+    artifacts = []
+    compiled = tp.compile(fn, backend=_counting_backend(artifacts), dynamic=True, strict_native=True)
+    for rows, cols in ((3, 7), (5, 11), (4, 8)):
+        x = tp.randn(cols, rows, device=device).t() if transpose else tp.randn(rows, cols, device=device)
+        actual, expected = compiled(x), fn(x)
+        assert actual.shape == expected.shape
+        assert tp.allclose(actual, expected)
+    assert len(artifacts) == 1
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("fn", [lambda x: x[:, 1::2], lambda x: x[-1], lambda x: x[:, -2:]])
+def test_dynamic_indexing_outputs_preserve_storage(fn, device):
+    artifacts = []
+    compiled = tp.compile(fn, backend=_counting_backend(artifacts), dynamic=True, strict_native=True)
+    for rows, cols in ((3, 7), (5, 11), (2, 4)):
+        x = tp.randn(rows, cols, device=device)
+        actual, expected = compiled(x), fn(x)
+        assert tp.equal(actual, expected)
+        assert actual.stride() == expected.stride()
+        assert actual.storage_offset() == expected.storage_offset()
+        assert actual.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()
+    assert len(artifacts) == 1
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("fn", [lambda x: x[:, 2:6] * 2, lambda x: x[:, -6:-2:2] + 1])
+def test_dynamic_slice_clamping_keeps_valid_cached_artifacts(fn, device):
+    artifacts = []
+    compiled = tp.compile(fn, backend=_counting_backend(artifacts), dynamic=True, strict_native=True)
+    for cols in (9, 11, 5, 7, 9, 5):
+        x = tp.randn(3, cols, device=device)
+        actual, expected = compiled(x), fn(x)
+        assert actual.shape == expected.shape
+        assert tp.equal(actual, expected)
     assert len(artifacts) == 2
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("fn", [lambda x: x[:, 2:6] * 2, lambda x: x[:, -6:-2:2] + 1])
+def test_dynamic_slices_cover_empty_and_singleton_results(fn, device):
+    artifacts = []
+    compiled = tp.compile(fn, backend=_counting_backend(artifacts), dynamic=True, strict_native=True)
+    for cols in (9, 4, 3, 2, 1, 0):
+        x = tp.randn(3, cols, device=device)
+        actual, expected = compiled(x), fn(x)
+        assert actual.shape == expected.shape
+        assert tp.equal(actual, expected)
+    count = len(artifacts)
+    x = tp.randn(3, 9, device=device)
+    assert tp.equal(compiled(x), fn(x))
+    assert len(artifacts) == count
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("index", [3, -4])
+def test_dynamic_selection_guards_out_of_range_indices(device, index):
+    artifacts = []
+    compiled = tp.compile(lambda x: x[index] * 2, backend=_counting_backend(artifacts), dynamic=True, strict_native=True)
+    for rows in (5, 7):
+        x = tp.randn(rows, 4, device=device)
+        assert tp.equal(compiled(x), x[index] * 2)
+    assert len(artifacts) == 1
+    with pytest.raises((IndexError, RuntimeError)):
+        compiled(tp.randn(3, 4, device=device))
 
 
 def test_interpreted_fallback_still_checks_captured_shape_branches(monkeypatch):

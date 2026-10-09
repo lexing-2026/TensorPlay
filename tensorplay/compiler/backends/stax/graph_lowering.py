@@ -23,7 +23,7 @@ from typing import Any
 
 import sympy
 import tensorplay as tp
-from ....graph.experimental.sympy_functions import OrderedSet
+from ....graph.experimental.sympy_functions import FloorDiv, OrderedSet
 from tensorplay.utils import _pytree as pytree
 
 from . import config, ir
@@ -88,6 +88,7 @@ from .loops import (
     set_ops_handler,
 )
 from .op_lowerings import (
+    _record_symbolic_input_source,
     fallback_node_due_to_unsupported_type,
     find_lowering,
     load_lowering_modules,
@@ -2169,6 +2170,9 @@ class GraphLowering(Interpreter):
         self.graph_input_storage_offsets[name] = offset
         self.graph_inputs_original[name] = buffer
         self.graph_input_names.append(name)
+        for kind, expressions in (("size", sizes), ("stride", strides)):
+            for dim, expr in enumerate(expressions):
+                _record_symbolic_input_source(tensor, dim, expr, kind)
         return tensor
 
     def _materialize_embedded_tensor(self, value):
@@ -2291,6 +2295,8 @@ class GraphLowering(Interpreter):
         if getattr(target, "__module__", None) in ("operator", "_operator") and all(
             isinstance(arg, (int, float, bool, sympy.Basic)) for arg in args
         ):
+            if target is operator.floordiv and all(sympy.sympify(arg).is_integer for arg in args):
+                return FloorDiv(*args)
             return target(*args, **kwargs)
         if name == "getitem" and args and isinstance(args[0], (list, tuple)):
             # Indexing a result tuple is answered here rather than called out

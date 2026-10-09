@@ -78,7 +78,6 @@ from .utils import (
     sympy_product,
     sympy_subs,
 )
-from .codegen.index_expr import _lift, floordiv
 
 
 def convert_shape_to_tp(lst) -> list:
@@ -12559,11 +12558,8 @@ class SliceView(View):
         if clamp:
             start, end = cls.normalize_start_end(x, dim, start, end)
 
-        # How many elements the slice keeps, which is the span rounded up to a
-        # whole number of steps.  The span is lifted into the index algebra
-        # first, so a slice of settled extents has a settled size: a size left
-        # as a division would be a number nobody can read an extent out of.
-        new_size[dim] = floordiv(_lift(end - start + (step - 1)), _lift(step))
+        # The span rounded up by the step is the number of positions kept.
+        new_size[dim] = FloorDiv(end - start + (step - 1), step)
 
         if is_storage_and_layout(x):
             # The elements are still where they were, so the dimension is
