@@ -1,5 +1,18 @@
 # tensorplay.compiler
 
+## Autograd limitations
+
+In v1.1.0, regions compiled with STAX or an AOT autograd backend support
+first-order reverse-mode gradients. They do not support second-order gradients
+(double backward). A first gradient computed with `create_graph=True` has the
+correct value, but differentiating it again raises `RuntimeError` with an
+explicit message about this limitation.
+
+Run the original function without compilation when computing Hessians,
+Hessian-vector products, or other higher-order derivatives. Operator support
+for higher-order gradients in eager execution does not extend to compiled
+regions.
+
 ## Classes
 
 ```{eval-rst}
