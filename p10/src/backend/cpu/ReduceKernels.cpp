@@ -212,13 +212,7 @@ Tensor amax_cpu(const Tensor& self, const std::vector<int64_t>& dim_in,
     if (resolved.empty()) {
         for (int64_t i = 0; i < self.dim(); ++i) resolved.push_back(i);
     }
-    return reduce_dims_impl<double>(
-        self, resolved, keepdim, self.dtype(),
-        -std::numeric_limits<double>::infinity(),
-        [](double acc, double value) {
-            return (value != value || value > acc) ? value : acc;
-        },
-        [](double acc) { return acc; });
+    return extrema_dim_stub(DeviceType::CPU, self, resolved, keepdim, true);
 }
 
 Tensor amin_cpu(const Tensor& self, const std::vector<int64_t>& dim_in,
@@ -228,13 +222,7 @@ Tensor amin_cpu(const Tensor& self, const std::vector<int64_t>& dim_in,
     if (resolved.empty()) {
         for (int64_t i = 0; i < self.dim(); ++i) resolved.push_back(i);
     }
-    return reduce_dims_impl<double>(
-        self, resolved, keepdim, self.dtype(),
-        std::numeric_limits<double>::infinity(),
-        [](double acc, double value) {
-            return (value != value || value < acc) ? value : acc;
-        },
-        [](double acc) { return acc; });
+    return extrema_dim_stub(DeviceType::CPU, self, resolved, keepdim, false);
 }
 
 std::tuple<Tensor, Tensor> aminmax_cpu(

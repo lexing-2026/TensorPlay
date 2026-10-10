@@ -14,6 +14,7 @@ namespace cpu {
 
 DEFINE_DISPATCH(sum_stub);
 DEFINE_DISPATCH(sum_dim_stub);
+DEFINE_DISPATCH(extrema_dim_stub);
 DEFINE_DISPATCH(max_stub);
 DEFINE_DISPATCH(max_dim_stub);
 DEFINE_DISPATCH(min_stub);

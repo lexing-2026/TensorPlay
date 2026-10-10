@@ -3084,6 +3084,72 @@ inline T nan_min(T a, T b) {
     return b < a ? b : a;
 }
 
+template <typename T>
+struct ExtremaValuesOps {
+    bool maximum_value;
+    T combine(T a, T b) const { return maximum_value ? nan_max(a, b) : nan_min(a, b); }
+    T reduce(T a, T b, int64_t) const { return combine(a, b); }
+    T project(T value) const { return value; }
+    T translate_idx(T value, int64_t) const { return value; }
+};
+
+template <typename T>
+T extrema_identity(bool maximum_value) {
+    if constexpr (std::is_floating_point_v<T> ||
+                  std::is_same_v<T, Half> || std::is_same_v<T, BFloat16>) {
+        return maximum_value ? -std::numeric_limits<T>::infinity()
+                             : std::numeric_limits<T>::infinity();
+    } else {
+        return maximum_value ? std::numeric_limits<T>::lowest()
+                             : std::numeric_limits<T>::max();
+    }
+}
+
+Tensor extrema_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
+                              bool keepdim, bool maximum_value) {
+    const int64_t ndim = self.dim();
+    std::vector<bool> mask(ndim, false);
+    std::vector<int64_t> resolved;
+    for (int64_t dim : dims) {
+        const int64_t rank = std::max<int64_t>(1, ndim);
+        TP_CHECK_INDEX(dim >= -rank && dim < rank,
+                       "reduction dimension out of range");
+        if (ndim == 0) continue;
+        if (dim < 0) dim += ndim;
+        TP_CHECK(!mask[dim], "reduction dimension appears more than once");
+        mask[dim] = true;
+        resolved.push_back(dim);
+    }
+    Tensor result = Tensor::empty(compute_reduction_shape(self, resolved, keepdim),
+                                  self.dtype(), self.device());
+    if (result.numel() == 0) return result;
+    Tensor viewed = review_reduce_result(result, ndim, mask, keepdim);
+    TensorIterator iter = TensorIterator::reduce_op(viewed, self);
+#define TP_EXTREMA_CASE(ctype, name) \
+    case DType::name: \
+        if constexpr (std::is_integral_v<ctype> && sizeof(ctype) == 8) { \
+            binary_kernel_reduce(iter, ExtremaValuesOps<ctype>{maximum_value}, \
+                                 extrema_identity<ctype>(maximum_value)); \
+        } else if (maximum_value) { \
+            binary_kernel_reduce_vec(iter, \
+                [](ctype a, ctype b) -> ctype { return nan_max(a, b); }, \
+                [](Vectorized<ctype> a, Vectorized<ctype> b) { return maximum(a, b); }, \
+                static_cast<double>(extrema_identity<ctype>(true))); \
+        } else { \
+            binary_kernel_reduce_vec(iter, \
+                [](ctype a, ctype b) -> ctype { return nan_min(a, b); }, \
+                [](Vectorized<ctype> a, Vectorized<ctype> b) { return minimum(a, b); }, \
+                static_cast<double>(extrema_identity<ctype>(false))); \
+        } \
+        break;
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_EXTREMA_CASE)
+        default: TP_THROW(TypeError, "extrema reduction: unsupported dtype");
+    }
+#undef TP_EXTREMA_CASE
+    return result;
+}
+
 // Whole-tensor extremum folds over a contiguous buffer, seeded from the first
 // element so no identity value is needed. Seeding also keeps the Int64/UInt64
 // minima exact: the identity-only pair tracking exists because a double
@@ -4242,6 +4308,7 @@ Tensor median_kernel_impl(const Tensor& self) {
 #endif
 REGISTER_SUM_DISPATCH(sum_stub, &sum_kernel_impl);
 REGISTER_SUM_DISPATCH(sum_dim_stub, &sum_dim_kernel_impl);
+REGISTER_SUM_DISPATCH(extrema_dim_stub, &extrema_dim_kernel_impl);
 #undef REGISTER_SUM_DISPATCH
 REGISTER_DISPATCH(max_stub, &max_kernel_impl);
 REGISTER_DISPATCH(max_dim_stub, &max_dim_kernel_impl);

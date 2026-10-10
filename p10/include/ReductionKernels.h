@@ -55,6 +55,9 @@ DECLARE_DISPATCH(min_fn, min_stub)
 using min_dim_fn = std::tuple<Tensor, Tensor> (*)(const Tensor&, int64_t, bool);
 DECLARE_DISPATCH(min_dim_fn, min_dim_stub)
 
+using extrema_dim_fn = Tensor (*)(const Tensor&, const std::vector<int64_t>&, bool, bool);
+DECLARE_DISPATCH(extrema_dim_fn, extrema_dim_stub)
+
 using prod_fn = Tensor (*)(const Tensor&, DType);
 DECLARE_DISPATCH(prod_fn, prod_stub)
 
