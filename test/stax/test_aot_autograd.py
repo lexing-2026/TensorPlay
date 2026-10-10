@@ -72,6 +72,35 @@ def test_input_gradients():
     assert _max_diff(gb, b.grad) < 1e-6
 
 
+@pytest.mark.parametrize(
+    "backend", ["aot_eager", "aot_eager_default_partitioner", "stax"]
+)
+@pytest.mark.parametrize("operation", ["sin", "exp", "composed"])
+@pytest.mark.parametrize("tangent_requires_grad", [False, True])
+def test_compiled_double_backward_reports_unsupported(
+    backend, operation, tangent_requires_grad
+):
+    def fn(value):
+        if operation == "sin":
+            return value.sin()
+        if operation == "exp":
+            return value.exp()
+        return value.sin().exp()
+
+    value = tp.tensor([0.3, 0.7], requires_grad=True)
+    tangent = tp.tensor([0.5, 1.5], requires_grad=tangent_requires_grad)
+    expected, = tp.autograd.grad(fn(value), value, tangent, create_graph=True)
+    compiled = tp.compile(fn, backend=backend)
+    actual, = tp.autograd.grad(compiled(value), value, tangent, create_graph=True)
+
+    assert _max_diff(actual, expected) < 1e-6
+    assert actual.requires_grad
+    targets = (value, tangent) if tangent_requires_grad else (value,)
+    for target in targets:
+        with pytest.raises(RuntimeError, match="do not support second-order gradients"):
+            tp.autograd.grad(actual.sum(), target, retain_graph=True)
+
+
 def test_aot_graphs_are_operator_level():
     def fn(a):
         return (a * 2).exp()

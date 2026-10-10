@@ -564,6 +564,8 @@ def aot_function(
             inputs = bw_example_inputs(
                 _restore_saved(ctx, saved_names), named, ctx.run_primals
             )
+            recording = tensorplay.is_grad_enabled()
+            primals_for_grad = ctx.run_primals if recording else ()
             keep_graph = tensorplay._C._autograd._get_current_graph_task_keep_graph()
             ctx.maybe_clear_saved_tensors()
             if not keep_graph:
@@ -579,7 +581,30 @@ def aot_function(
                 run_training._tensorplay_backward_codegen = getattr(
                     compiled_bw_box[0], "_tensorplay_codegen", None
                 )
-            grads = iter(_call(compiled_bw_box[0], inputs))
+            if recording:
+                num_backward_inputs = len(inputs)
+
+                class CompiledFunctionBackward(Function):
+                    @staticmethod
+                    def forward(double_ctx, *args):
+                        return _call(
+                            compiled_bw_box[0], list(args[:num_backward_inputs])
+                        )
+
+                    @staticmethod
+                    def backward(double_ctx, *args):
+                        raise RuntimeError(
+                            "Compiled regions do not support second-order gradients "
+                            "(double backward). Run the function without compilation "
+                            "to compute higher-order derivatives."
+                        )
+
+                # The saved intermediates were computed without recording.
+                # Connect the first gradients to the original inputs so a
+                # second differentiation reaches the explicit error handler.
+                grads = iter(CompiledFunctionBackward.apply(*inputs, *primals_for_grad))
+            else:
+                grads = iter(_call(compiled_bw_box[0], inputs))
             reached = iter(grad_reached)
             out = []
             for needed in grad_mask:
