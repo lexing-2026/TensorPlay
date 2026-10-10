@@ -56,6 +56,31 @@ def _compiler_context() -> Any:
     return compiler_context(require_native=True)
 
 
+def _stride_signature(value: Any, *, dynamic: bool) -> tuple[Any, ...]:
+    stride = getattr(value, "stride", ())
+    strides = tuple(stride() if callable(stride) else stride)
+    if not dynamic:
+        return strides
+    sizes = value.shape
+    candidates = {}
+    inferred = [None] * len(strides)
+    # Express dense strides through dimensions so changing sizes can reuse
+    # a specialization while changing storage order cannot.
+    for stride, neg_index in sorted((s, -i) for i, s in enumerate(strides)):
+        index = -neg_index
+        contiguous = (
+            index + 1 < len(sizes)
+            and stride == sizes[index + 1] * strides[index + 1]
+        )
+        if stride in (0, 1) and not contiguous:
+            expression = stride
+        else:
+            expression = candidates.get(stride, ("stride", index, stride))
+        inferred[index] = expression
+        candidates[sizes[index] * stride] = ("size", index, expression)
+    return tuple(inferred)
+
+
 def _tensor_signature(value: Any, *, dynamic: bool) -> tuple[Any, ...] | None:
     module_name = type(value).__module__
     if not module_name.startswith("tensorplay"):
@@ -86,6 +111,7 @@ def _tensor_signature(value: Any, *, dynamic: bool) -> tuple[Any, ...] | None:
         repr(dtype),
         repr(device),
         bool(requires_grad),
+        _stride_signature(value, dynamic=dynamic),
     )
 
 
@@ -166,7 +192,10 @@ def _quick_value_signature(value: Any, *, dynamic: bool) -> Any:
             getattr(device, "index", None),
         )
         requires_grad = getattr(value, "requires_grad", False)
-        return (type(value), shape_key, dtype, device_key, bool(requires_grad))
+        return (
+            type(value), shape_key, dtype, device_key, bool(requires_grad),
+            _stride_signature(value, dynamic=dynamic),
+        )
     if value is None or isinstance(value, (bool, int, float, str, bytes)):
         return (type(value), value)
     if isinstance(value, tuple):
@@ -231,6 +260,16 @@ def _arg_fingerprint(value: Any) -> Any:
         )
     if value is None or isinstance(value, (bool, int, float, str, bytes)):
         return ("v", type(value).__name__, value)
+    if isinstance(value, (tuple, list)):
+        return (type(value), tuple(_arg_fingerprint(item) for item in value))
+    if isinstance(value, dict):
+        return (
+            dict,
+            tuple(sorted(
+                ((_arg_fingerprint(key), _arg_fingerprint(item)) for key, item in value.items()),
+                key=repr,
+            )),
+        )
     return ("o", id(value))
 
 

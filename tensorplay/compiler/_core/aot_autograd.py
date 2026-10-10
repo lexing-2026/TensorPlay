@@ -174,10 +174,26 @@ def _trace_inputs(primals: Sequence[Any]) -> list[Any]:
     updates (running statistics, caches) away from the caller's tensors.
     """
 
-    return [
-        p.detach().clone().requires_grad_(p.requires_grad) if _is_tensor(p) else p
-        for p in primals
-    ]
+    from tensorplay.primitives.common import compute_required_storage_length
+
+    copies = []
+    for primal in primals:
+        if not _is_tensor(primal):
+            copies.append(primal)
+            continue
+        detached = primal.detach()
+        if primal.layout == tensorplay.strided:
+            size = compute_required_storage_length(
+                primal.shape, primal.stride(), primal.storage_offset()
+            )
+            buffer = detached.as_strided((size,), (1,), 0).clone()
+            copied = buffer.as_strided(
+                primal.shape, primal.stride(), primal.storage_offset()
+            )
+        else:
+            copied = detached.clone()
+        copies.append(copied.requires_grad_(primal.requires_grad))
+    return copies
 
 
 def _trace_forward(fn: Callable[..., Any], primals: Sequence[Any], decompositions):

@@ -4,7 +4,7 @@ set of guard conditions over its inputs, and a failed cache lookup can be
 explained condition-by-condition ("why did this recompile happen?").
 
 TensorPlay keeps its specialization cache keyed on structured metadata
-signatures (type, shape, dtype, device, and requires_grad).  This module derives *expression objects*
+signatures (type, shape, dtype, device, requires_grad, and stride).  This module derives *expression objects*
 from those signatures so that
 
 * each condition is introspectable (``guard.expr`` renders like
@@ -80,7 +80,7 @@ def _summarize_guards(expected: Any, path: str, out: List[Guard], depth: int) ->
         tag = expected[0]
         rest = expected[1:]
         names = {
-            "tensor": ("pytype", "shape", "dtype", "device", "requires_grad"),
+            "tensor": ("pytype", "shape", "dtype", "device", "requires_grad", "stride"),
         }.get(tag)
         for index, item in enumerate(rest):
             name = names[index] if names and index < len(names) else f"field{index}"
