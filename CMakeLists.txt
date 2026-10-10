@@ -1589,9 +1589,13 @@ target_include_directories(_C PRIVATE
 
 if(USE_ROCM)
     # Staged headers must win over the repo originals, hence BEFORE.
+    # The CUDA backend root is mirrored for the same reason as on the
+    # p10 target: a binding TU naming one of its headers by bare name
+    # would otherwise reach the untranslated original.
     target_include_directories(_C BEFORE PRIVATE
         ${TP_HIP_STAGING}/p10/include
         ${TP_HIP_STAGING}/src
+        ${TP_HIP_STAGING}/p10/src/backend/cuda
     )
     target_include_directories(_C PRIVATE ${TP_HIP_INCLUDE_DIRS})
     target_link_libraries(_C PRIVATE ${TP_HIP_LIBRARIES})

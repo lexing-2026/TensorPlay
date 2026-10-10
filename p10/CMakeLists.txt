@@ -905,7 +905,16 @@ if(USE_ROCM)
     target_include_directories(p10 BEFORE PUBLIC
         $<BUILD_INTERFACE:${TP_HIP_STAGING}/p10/include>
     )
-    target_include_directories(p10 BEFORE PRIVATE ${TP_HIP_STAGING}/src)
+    # The staging tree mirrors the CUDA backend root the target searches
+    # below.  A TU in a backend subdirectory reaches its neighbours by bare
+    # name, and without the staged root those names fall through to the
+    # untranslated originals, which then pull in CUDA headers this lane
+    # does not have.  Sibling lookups that climb out of the backend with
+    # ".." land on the staged copy for the same reason.
+    target_include_directories(p10 BEFORE PRIVATE
+        ${TP_HIP_STAGING}/src
+        ${TP_HIP_STAGING}/p10/src/backend/cuda
+    )
     target_include_directories(p10 SYSTEM PRIVATE ${TP_HIP_INCLUDE_DIRS})
 endif()
 # Backend-internal cross-directory includes (e.g. backend/vulkan/... from
