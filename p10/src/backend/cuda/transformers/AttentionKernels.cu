@@ -93,7 +93,10 @@ Tensor sdpa_gemm_native(
 // because its tile shape and its register budget belong to it alone.  A wide
 // precision otherwise reaches a schedule that writes its score matrix out and
 // reads it back twice, which for a wide context costs more than the operands
-// themselves.
+// themselves.  The schedule is built from instructions the AMD toolchain does
+// not have, so on that toolchain it is absent and both arms below fall back to
+// the composite.
+#if !defined(USE_ROCM)
 Tensor sdpa_wide_tiled_cuda(const Tensor& query, const Tensor& key,
                             const Tensor& value, bool is_causal);
 // The same schedule with the row log-sum-exp written out, for the fused entry
@@ -101,6 +104,7 @@ Tensor sdpa_wide_tiled_cuda(const Tensor& query, const Tensor& key,
 Tensor sdpa_wide_tiled_cuda_with_lse(const Tensor& query, const Tensor& key,
                                    const Tensor& value, bool is_causal,
                                    Tensor& lse);
+#endif
 
 namespace {
 
@@ -2756,7 +2760,11 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key,
       break;
 #endif
     case composite::FusedSdpaSchedule::kWideTiled:
+#if !defined(USE_ROCM)
       return sdpa_wide_tiled_cuda(query, key, value, is_causal);
+#else
+      break;
+#endif
     case composite::FusedSdpaSchedule::kCrossGemm:
       // A context of another length in a precision the tiled schedule has no
       // tiles for.  The two reduced precisions have tiles, so they went to
@@ -2877,10 +2885,12 @@ std::tuple<Tensor, Tensor> sdpa_kernel_cuda_with_lse(
                                        /*enable_gqa=*/false);
       }
 #endif
+#if !defined(USE_ROCM)
       Tensor lse;
       Tensor output =
           sdpa_wide_tiled_cuda_with_lse(query, key, value, is_causal, lse);
       return {output, lse};
+#endif
     }
   }
 #if defined(TP_HAS_NATIVE_CUTE_FLASH)

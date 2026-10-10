@@ -442,6 +442,23 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/InplaceCompletionKernels.cu
     )
     if(USE_ROCM)
+        # The wide-tiled fused schedule walks its operands with the
+        # asynchronous shared/global copy instruction and derives the shared
+        # window address from a generic-address conversion intrinsic, neither
+        # of which the AMD toolchain has; the schedule that draws them from is
+        # compiled out on this lane and the caller falls back (see
+        # AttentionKernels.cu).  The one-file-per-leaf fused schedule is the
+        # same story: it is written against the tensor-core kernels of one
+        # architecture generation and has no counterpart here, and nothing on
+        # this lane reaches it.
+        list(REMOVE_ITEM TP_CUDA_BACKEND_SOURCES
+            src/backend/cuda/transformers/WideTiledAttention.cu
+            src/backend/cuda/transformers/FlashFwdDispatch.cpp)
+        foreach(_tp_src IN LISTS TP_CUDA_BACKEND_SOURCES)
+            if(_tp_src MATCHES "^src/backend/cuda/transformers/flash_")
+                list(REMOVE_ITEM TP_CUDA_BACKEND_SOURCES ${_tp_src})
+            endif()
+        endforeach()
         # Compile the hipify-staged translations instead of the originals.
         tp_map_sources(TP_CUDA_BACKEND_SOURCES ${TP_CUDA_BACKEND_SOURCES})
         list(APPEND P10_SOURCES ${TP_CUDA_BACKEND_SOURCES})

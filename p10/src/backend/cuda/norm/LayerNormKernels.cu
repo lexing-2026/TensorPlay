@@ -49,9 +49,13 @@ inline unsigned ln_bwd_threads_for(int64_t N) {
 
 // Store with an evict-first hint: the grad-input output is not re-read inside
 // the backward pass, so keeping it out of L2 preserves row data for the
-// column-gradient kernel that follows.
+// column-gradient kernel that follows.  The hint is advisory: a toolchain
+// without the cache-hint intrinsic stores plainly, with the same result.
 template <typename V>
 __device__ inline void ln_stream_store(V* dst, const V& v) {
+#if defined(USE_ROCM)
+    *dst = v;
+#else
     if constexpr (sizeof(V) == 16) {
         __stcs(reinterpret_cast<uint4*>(dst),
                *reinterpret_cast<const uint4*>(&v));
@@ -61,6 +65,7 @@ __device__ inline void ln_stream_store(V* dst, const V& v) {
     } else {
         *dst = v;
     }
+#endif
 }
 
 template <typename T, int VecSize>

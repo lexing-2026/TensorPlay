@@ -438,19 +438,29 @@ struct alignas(sizeof(T) * V) SoftmaxPack {
 };
 
 // Row data moves exactly once in each direction and is never revisited, so
-// the streaming hints keep it out of the L2 working set of other blocks.
+// the streaming hints keep it out of the L2 working set of other blocks.  The
+// hint is advisory: a toolchain without the cache-hint intrinsics copies
+// plainly, with the same result.
 template <typename T, int V>
 __device__ __forceinline__ SoftmaxPack<T, V> softmax_load_stream(
     const SoftmaxPack<T, V>* p) {
   SoftmaxPack<T, V> r;
+#if defined(USE_ROCM)
+  r = *p;
+#else
   *reinterpret_cast<uint4*>(&r) = __ldcs(reinterpret_cast<const uint4*>(p));
+#endif
   return r;
 }
 
 template <typename T, int V>
 __device__ __forceinline__ void softmax_store_stream(SoftmaxPack<T, V>* p,
                                                      const SoftmaxPack<T, V>& r) {
+#if defined(USE_ROCM)
+  *p = r;
+#else
   __stcs(reinterpret_cast<uint4*>(p), *reinterpret_cast<const uint4*>(&r));
+#endif
 }
 
 template <typename compute_t, bool kIsMax>
