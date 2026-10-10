@@ -338,7 +338,13 @@ std::shared_ptr<GemmPlan> get_gemm_plan(DType dtype, int64_t M, int64_t N, int64
 // ---------------------------------------------------------------------------
 // TunableOp support: serialize, reconstruct and validate cuBLASLt algorithms
 // so a measured winner survives the process that measured it.
+//
+// The AMD math library exposes heuristics and the matmul call but no
+// per-algorithm configuration, reconstruction or validation surface, so the
+// whole persistence layer is compiled out there and the heuristic top
+// choice runs for every call.
 // ---------------------------------------------------------------------------
+#if !defined(USE_ROCM)
 
 // The configuration fields that identify one cuBLASLt algorithm. The
 // serialized name is the persistence key recorded in the results file.
@@ -451,6 +457,8 @@ bool algoRunsOnPlan(const GemmPlan& plan, const cublasLtMatmulAlgo_t& algo) {
            result.workspaceSize <= plan.workspace_limit;
 }
 
+#endif  // !USE_ROCM
+
 // Times `samples` back-to-back executions of one candidate after a single
 // untimed warm-up that doubles as the support probe. Returns the average
 // milliseconds per execution, or a negative value when the candidate failed
@@ -503,6 +511,25 @@ const cublasLtMatmulAlgo_t* tunable_select(GemmPlan& plan, DType dtype,
                                            const void* a_ptr, const void* b_ptr,
                                            Tensor& result, void* alpha_ptr,
                                            void* beta_ptr, double beta) {
+#if defined(USE_ROCM)
+    // No per-algorithm configuration surface on this lane, so there is
+    // nothing to select, record or rebuild: the plan's top heuristic
+    // candidate runs for every call.
+    (void)plan;
+    (void)dtype;
+    (void)M;
+    (void)N;
+    (void)K;
+    (void)has_bias;
+    (void)other_transposed;
+    (void)a_ptr;
+    (void)b_ptr;
+    (void)result;
+    (void)alpha_ptr;
+    (void)beta_ptr;
+    (void)beta;
+    return nullptr;
+#else
     auto& ctx = tunable::TuningContext::get();
     ctx.ensureInitialized();
 
@@ -640,6 +667,7 @@ const cublasLtMatmulAlgo_t* tunable_select(GemmPlan& plan, DType dtype,
         return &plan.tunable_algo;
     }
     return nullptr;
+#endif  // !USE_ROCM
 }
 
 void check_cublas_gemm_dtype(DType t) {
