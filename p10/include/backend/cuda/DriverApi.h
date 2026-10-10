@@ -15,6 +15,18 @@ namespace driver {
 template <typename Fn>
 Fn resolve_symbol(const char* name) {
     void* symbol = nullptr;
+#if defined(USE_ROCM)
+    // The AMD runtime exposes a single unversioned query: it looks the
+    // requested API base name up in the loaded runtime library, which is
+    // the exact counterpart of the two CUDA queries below (there is no
+    // versioned form and nothing is deprecated on this side).
+    hipDriverEntryPointQueryResult query{};
+    if (hipGetDriverEntryPoint(name, &symbol, hipEnableDefault, &query) ==
+            hipSuccess &&
+        query == hipDriverEntryPointSuccess && symbol != nullptr) {
+        return reinterpret_cast<Fn>(symbol);
+    }
+#else
     cudaDriverEntryPointQueryResult query{};
 #if defined(CUDA_VERSION) && (CUDA_VERSION >= 12050)
     if (cudaGetDriverEntryPointByVersion(name, &symbol, 12000, cudaEnableDefault,
@@ -29,6 +41,7 @@ Fn resolve_symbol(const char* name) {
         query == cudaDriverEntryPointSuccess && symbol != nullptr) {
         return reinterpret_cast<Fn>(symbol);
     }
+#endif
 #endif
     return nullptr;
 }
