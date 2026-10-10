@@ -658,6 +658,26 @@ static void mm_into_impl(const Tensor& self_p, const Tensor& mat2_p,
         return;
     }
 
+    if (isFloatingType(self_p.dtype())) {
+        auto matrix_layout = [](const Tensor& tensor) {
+            return (tensor.stride(1) == 1 &&
+                    tensor.stride(0) >= std::max<int64_t>(1, tensor.size(1))) ||
+                   (tensor.stride(0) == 1 &&
+                    tensor.stride(1) >= std::max<int64_t>(1, tensor.size(0)));
+        };
+        const bool copy_a = !matrix_layout(self_p);
+        const bool copy_b = !matrix_layout(mat2_p);
+        if (copy_a || copy_b) {
+            // Packed matrix kernels require non-overlapping rows or columns.
+            // Materialize expanded and irregular views before selecting a
+            // kernel so they can use the same optimized products as dense inputs.
+            Tensor a = copy_a ? detail::contiguous_clone(self_p) : self_p;
+            Tensor b = copy_b ? detail::contiguous_clone(mat2_p) : mat2_p;
+            mm_into_impl(a, b, result);
+            return;
+        }
+    }
+
     if (self_p.dtype() == DType::Float16) {
         // fp16 matmul drops to a reference kernel (measured ~800x slower than
         // (its shgemm fallback converts the same way); do the same.
