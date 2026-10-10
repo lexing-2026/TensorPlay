@@ -38,6 +38,13 @@ endfunction()
 function(tp_map_sources out_var)
   set(_mapped)
   foreach(_src IN LISTS ARGN)
+    # Generated sources arrive as absolute build-tree paths. They are written
+    # after the configure-time hipify pass, so no staged copy exists; keep
+    # them as they are instead of re-rooting them under the source dir.
+    if(IS_ABSOLUTE "${_src}")
+      list(APPEND _mapped "${_src}")
+      continue()
+    endif()
     tp_hipify_path(_hip "${_src}")
     # Sources may be relative to the repo root or to a staged subdir
     # (p10/); accept whichever layout the staging tree actually has.
