@@ -4,6 +4,7 @@
 #include "CudaTunable.h"
 
 #include "CUDARuntime.h"
+#include "CUDAContext.h"
 #include "Exception.h"
 
 #include <cublasLt.h>
@@ -210,7 +211,15 @@ void ensureValidatorsLocked(TuningContext::Impl& impl) {
     device_id << prop.major << '.' << prop.minor << ':' << prop.name;
     impl.validators["TP_TUNABLEOP_FORMAT"] = kFileFormatVersion;
     impl.validators["CUDA_DEVICE"] = device_id.str();
+#if defined(USE_ROCM)
+    // The AMD math library reports its version through the plan handle
+    // rather than a free function.
+    int plan_library_version = 0;
+    hipblasLtGetVersion(CUDAContext::getCublasLtHandle(), &plan_library_version);
+    impl.validators["HIPBLASLT_VERSION"] = std::to_string(plan_library_version);
+#else
     impl.validators["CUBLASLT_VERSION"] = std::to_string(cublasLtGetVersion());
+#endif
     impl.validators_cached = true;
 }
 
