@@ -101,7 +101,7 @@ __global__ void loss_sq_diff_partial_kernel(int64_t n, const T* x, const T* t,
     }
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+        acc += __shfl_down_sync(0xffffffffffffffffull, acc, offset);
     }
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -111,7 +111,7 @@ __global__ void loss_sq_diff_partial_kernel(int64_t n, const T* x, const T* t,
         T total = (lane < kLossReduceBlock / 32) ? warp_partials[lane] : T(0);
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
-            total += __shfl_down_sync(0xffffffffu, total, offset);
+            total += __shfl_down_sync(0xffffffffffffffffull, total, offset);
         }
         if (lane == 0) partials[blockIdx.x] = total;
     }
@@ -127,7 +127,7 @@ __global__ void loss_finish_partials_kernel(int64_t count, const T* partials,
     }
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+        acc += __shfl_down_sync(0xffffffffffffffffull, acc, offset);
     }
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -137,7 +137,7 @@ __global__ void loss_finish_partials_kernel(int64_t count, const T* partials,
         T total = (lane < kLossReduceBlock / 32) ? warp_partials[lane] : T(0);
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
-            total += __shfl_down_sync(0xffffffffu, total, offset);
+            total += __shfl_down_sync(0xffffffffffffffffull, total, offset);
         }
         if (lane == 0) out[0] = static_cast<T>(total * static_cast<T>(scale));
     }

@@ -457,7 +457,7 @@ template <typename compute_t, bool kIsMax>
 __device__ __forceinline__ compute_t softmax_block_reduce(
     compute_t value, compute_t* scratch) {
   constexpr int kWave = 32;
-  const unsigned mask = 0xffffffffu;
+  const unsigned long long mask = 0xffffffffffffffffull;
   const int lane = static_cast<int>(threadIdx.x) % kWave;
   const int warp = static_cast<int>(threadIdx.x) / kWave;
 #pragma unroll
@@ -511,7 +511,7 @@ template <typename compute_t>
 __device__ __forceinline__ SoftmaxMS<compute_t> softmax_block_reduce_ms(
     SoftmaxMS<compute_t> value, SoftmaxMS<compute_t>* scratch) {
   constexpr int kWave = 32;
-  const unsigned mask = 0xffffffffu;
+  const unsigned long long mask = 0xffffffffffffffffull;
   const int lane = static_cast<int>(threadIdx.x) % kWave;
   const int warp = static_cast<int>(threadIdx.x) / kWave;
 #pragma unroll
@@ -1880,7 +1880,7 @@ __global__ void masked_softmax_wave_kernel(scalar_t* __restrict__ out,
                                            const bool* __restrict__ mask,
                                            int elements, int64_t rows) {
   constexpr int kWave = 32;
-  const unsigned full = 0xffffffffu;
+  const unsigned long long full = 0xffffffffffffffffull;
   const int lane = static_cast<int>(threadIdx.x) % kWave;
   const int warp = static_cast<int>(threadIdx.x) / kWave;
   const int warps_per_block = static_cast<int>(blockDim.x) / kWave;
@@ -1939,7 +1939,7 @@ __global__ void masked_softmax_bwd_wave_kernel(
     const scalar_t* __restrict__ out, const bool* __restrict__ mask,
     int elements, int64_t rows) {
   constexpr int kWave = 32;
-  const unsigned full = 0xffffffffu;
+  const unsigned long long full = 0xffffffffffffffffull;
   const int lane = static_cast<int>(threadIdx.x) % kWave;
   const int warp = static_cast<int>(threadIdx.x) / kWave;
   const int warps_per_block = static_cast<int>(blockDim.x) / kWave;

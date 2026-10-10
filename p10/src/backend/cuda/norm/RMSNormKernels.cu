@@ -81,10 +81,10 @@ __device__ inline RmsWelfordData<Acc> rms_welford_warp_reduce(
 #pragma unroll
     for (int offset = kRmsWarpSize / 2; offset > 0; offset >>= 1) {
         RmsWelfordData<Acc> other;
-        other.mean = __shfl_down_sync(0xffffffffu, value.mean, offset);
-        other.m2 = __shfl_down_sync(0xffffffffu, value.m2, offset);
-        other.n = __shfl_down_sync(0xffffffffu, value.n, offset);
-        other.nf = __shfl_down_sync(0xffffffffu, value.nf, offset);
+        other.mean = __shfl_down_sync(0xffffffffffffffffull, value.mean, offset);
+        other.m2 = __shfl_down_sync(0xffffffffffffffffull, value.m2, offset);
+        other.n = __shfl_down_sync(0xffffffffffffffffull, value.n, offset);
+        other.nf = __shfl_down_sync(0xffffffffffffffffull, value.nf, offset);
         value = rms_welford_combine(value, other);
     }
     return value;
@@ -111,7 +111,7 @@ template <typename Acc>
 __device__ inline Acc rms_sum_warp_reduce(Acc value) {
 #pragma unroll
     for (int offset = kRmsWarpSize / 2; offset > 0; offset >>= 1) {
-        value += __shfl_down_sync(0xffffffffu, value, offset);
+        value += __shfl_down_sync(0xffffffffffffffffull, value, offset);
     }
     return value;
 }
@@ -476,7 +476,7 @@ __device__ __forceinline__ void rms_gamma_helper(
     }
 #pragma unroll
     for (int k = 0; k < rows_per_thread; ++k) {
-        const Acc row_rstd = __shfl_sync(0xffffffffu, warp_rstd, k);
+        const Acc row_rstd = __shfl_sync(0xffffffffffffffffull, warp_rstd, k);
         sum += grad_regs[k] * input_regs[k] * row_rstd;
     }
 }
@@ -520,7 +520,7 @@ __global__ void rms_gamma_kernel(
             if (lane < BlockY) value = shared[lane * padded_x + x];
 #pragma unroll
             for (int delta = BlockY / 2; delta > 0; delta >>= 1) {
-                value += __shfl_xor_sync(0xffffffffu, value, delta);
+                value += __shfl_xor_sync(0xffffffffffffffffull, value, delta);
             }
             const int64_t output_x =
                 static_cast<int64_t>(blockIdx.x) * BlockX + x;

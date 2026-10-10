@@ -615,8 +615,8 @@ __global__ void layer_norm_grad_cols_kernel(
         __syncwarp();
 #pragma unroll
         for (int i = 0; i < ROWS_PER_THREAD; ++i) {
-            const ACC mn = __shfl_sync(0xffffffffu, warp_mean, i);
-            const ACC rd = __shfl_sync(0xffffffffu, warp_rstd, i);
+            const ACC mn = __shfl_sync(0xffffffffffffffffull, warp_mean, i);
+            const ACC rd = __shfl_sync(0xffffffffffffffffull, warp_rstd, i);
             const int64_t r = m0 + ty * ROWS_PER_THREAD + i;
             if (r < M && col_ok) {
                 const ACC dy = static_cast<ACC>(dY[r * N + col]);
@@ -643,8 +643,8 @@ __global__ void layer_norm_grad_cols_kernel(
             }
 #pragma unroll
             for (int delta = BDY / 2; delta > 0; delta >>= 1) {
-                rdg += __shfl_xor_sync(0xffffffffu, rdg, delta);
-                rdb += __shfl_xor_sync(0xffffffffu, rdb, delta);
+                rdg += __shfl_xor_sync(0xffffffffffffffffull, rdg, delta);
+                rdb += __shfl_xor_sync(0xffffffffffffffffull, rdb, delta);
             }
             const int64_t out_col =
                 static_cast<int64_t>(blockIdx.x) * 32 + i;

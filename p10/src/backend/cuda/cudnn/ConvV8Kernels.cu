@@ -52,7 +52,7 @@ __global__ void conv2d_grad_bias_reduce_kernel(
     }
 
     for (int offset = 16; offset > 0; offset >>= 1) {
-        value += __shfl_down_sync(0xffffffffu, value, offset);
+        value += __shfl_down_sync(0xffffffffffffffffull, value, offset);
     }
     __shared__ AccT warp_values[32];
     const int lane = threadIdx.x & 31;
@@ -64,7 +64,7 @@ __global__ void conv2d_grad_bias_reduce_kernel(
         const int warp_count = (blockDim.x + 31) / 32;
         value = lane < warp_count ? warp_values[lane] : AccT(0);
         for (int offset = 16; offset > 0; offset >>= 1) {
-            value += __shfl_down_sync(0xffffffffu, value, offset);
+            value += __shfl_down_sync(0xffffffffffffffffull, value, offset);
         }
         if (lane == 0) grad_bias[channel] = static_cast<OutputT>(value);
     }
@@ -98,7 +98,7 @@ __global__ void conv2d_grad_bias_vec_half_kernel(
     }
 
     for (int offset = 16; offset > 0; offset >>= 1) {
-        value += __shfl_down_sync(0xffffffffu, value, offset);
+        value += __shfl_down_sync(0xffffffffffffffffull, value, offset);
     }
     __shared__ float warp_values[32];
     const int lane = threadIdx.x & 31;
@@ -110,7 +110,7 @@ __global__ void conv2d_grad_bias_vec_half_kernel(
         const int warp_count = (blockDim.x + 31) / 32;
         value = lane < warp_count ? warp_values[lane] : 0.0f;
         for (int offset = 16; offset > 0; offset >>= 1) {
-            value += __shfl_down_sync(0xffffffffu, value, offset);
+            value += __shfl_down_sync(0xffffffffffffffffull, value, offset);
         }
         if (lane == 0) grad_bias[channel] = static_cast<OutputT>(value);
     }
@@ -140,7 +140,7 @@ __global__ void conv2d_grad_bias_half2_kernel(
     }
 
     for (int offset = 16; offset > 0; offset >>= 1) {
-        value += __shfl_down_sync(0xffffffffu, value, offset);
+        value += __shfl_down_sync(0xffffffffffffffffull, value, offset);
     }
     __shared__ float warp_values[32];
     const int lane = threadIdx.x & 31;
@@ -152,7 +152,7 @@ __global__ void conv2d_grad_bias_half2_kernel(
         const int warp_count = (blockDim.x + 31) / 32;
         value = lane < warp_count ? warp_values[lane] : 0.0f;
         for (int offset = 16; offset > 0; offset >>= 1) {
-            value += __shfl_down_sync(0xffffffffu, value, offset);
+            value += __shfl_down_sync(0xffffffffffffffffull, value, offset);
         }
         if (lane == 0) grad_bias[channel] = static_cast<OutputT>(value);
     }
@@ -180,7 +180,7 @@ __global__ void conv2d_grad_bias_strided_kernel(
     }
 
     for (int offset = 16; offset > 0; offset >>= 1) {
-        value += __shfl_down_sync(0xffffffffu, value, offset);
+        value += __shfl_down_sync(0xffffffffffffffffull, value, offset);
     }
     __shared__ AccT warp_values[32];
     const int lane = threadIdx.x & 31;
@@ -192,7 +192,7 @@ __global__ void conv2d_grad_bias_strided_kernel(
         const int warp_count = (blockDim.x + 31) / 32;
         value = lane < warp_count ? warp_values[lane] : AccT(0);
         for (int offset = 16; offset > 0; offset >>= 1) {
-            value += __shfl_down_sync(0xffffffffu, value, offset);
+            value += __shfl_down_sync(0xffffffffffffffffull, value, offset);
         }
         if (lane == 0) grad_bias[channel] = static_cast<OutputT>(value);
     }

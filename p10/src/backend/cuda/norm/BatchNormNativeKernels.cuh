@@ -42,19 +42,19 @@ __device__ __forceinline__ float bn_sqrt(float v) { return ::sqrtf(v); }
 __device__ __forceinline__ double bn_sqrt(double v) { return ::sqrt(v); }
 
 __device__ __forceinline__ float bn_warp_shfl_down(float v, int offset) {
-    return __shfl_down_sync(0xffffffffu, v, offset);
+    return __shfl_down_sync(0xffffffffffffffffull, v, offset);
 }
 __device__ __forceinline__ double bn_warp_shfl_down(double v, int offset) {
-    return __shfl_down_sync(0xffffffffu, v, offset);
+    return __shfl_down_sync(0xffffffffffffffffull, v, offset);
 }
 __device__ __forceinline__ float bn_warp_shfl_xor(float v, int offset) {
-    return __shfl_xor_sync(0xffffffffu, v, offset);
+    return __shfl_xor_sync(0xffffffffffffffffull, v, offset);
 }
 __device__ __forceinline__ double bn_warp_shfl_xor(double v, int offset) {
-    return __shfl_xor_sync(0xffffffffu, v, offset);
+    return __shfl_xor_sync(0xffffffffffffffffull, v, offset);
 }
 __device__ __forceinline__ int bn_warp_shfl_xor(int v, int offset) {
-    return __shfl_xor_sync(0xffffffffu, v, offset);
+    return __shfl_xor_sync(0xffffffffffffffffull, v, offset);
 }
 
 // Index of the most significant set bit.

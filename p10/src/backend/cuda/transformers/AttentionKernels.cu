@@ -280,7 +280,7 @@ __global__ void sdpa_fused_short_kernel(
     const int lane = tid & 31;
     float mx = -INFINITY;
     for (int j = lane; j < T; j += 32) mx = max(mx, s_s[row * tstride + j]);
-    mx = __shfl_sync(0xffffffffu, warpReduceMax(mx), 0);
+    mx = __shfl_sync(0xffffffffffffffffull, warpReduceMax(mx), 0);
     float sum = 0.f;
     for (int j = lane; j < T; j += 32) {
       const float score = s_s[row * tstride + j];
@@ -288,7 +288,7 @@ __global__ void sdpa_fused_short_kernel(
       s_s[row * tstride + j] = p;
       sum += p;
     }
-    sum = __shfl_sync(0xffffffffu, warpReduceSum(sum), 0);
+    sum = __shfl_sync(0xffffffffffffffffull, warpReduceSum(sum), 0);
     const float inv = (sum > 0.f) ? (1.f / sum) : 0.f;
     for (int j = lane; j < T; j += 32) s_s[row * tstride + j] *= inv;
     if (lane == 0 && lse_out != nullptr) lse_out[bh * T + row] = mx + logf(sum);

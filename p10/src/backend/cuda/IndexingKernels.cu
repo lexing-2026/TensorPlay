@@ -197,7 +197,7 @@ __global__ void nonzero_count_kernel(int64_t n, const T* x, int32_t* total,
     const int lane = threadIdx.x & 31;
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-        mine += __shfl_down_sync(0xffffffffu, mine, off);
+        mine += __shfl_down_sync(0xffffffffffffffffull, mine, off);
     }
     __shared__ int warp_totals[BLOCK / 32];
     const int warp = threadIdx.x >> 5;
@@ -228,7 +228,7 @@ __global__ void nonzero_block_offsets(int32_t blocks, int32_t* per_block) {
         const int lane = threadIdx.x & 31;
 #pragma unroll
         for (int off = 1; off < 32; off <<= 1) {
-            const int32_t other = __shfl_up_sync(0xffffffffu, incl, off);
+            const int32_t other = __shfl_up_sync(0xffffffffffffffffull, incl, off);
             if (lane >= off) incl += other;
         }
         if (lane == 31) warp_sums[threadIdx.x >> 5] = incl;
@@ -288,7 +288,7 @@ __global__ void nonzero_flag_kernel(int64_t n, const T* x, int64_t* flat,
     int inclusive = mine;
 #pragma unroll
     for (int off = 1; off < 32; off <<= 1) {
-        const int other = __shfl_up_sync(0xffffffffu, inclusive, off);
+        const int other = __shfl_up_sync(0xffffffffffffffffull, inclusive, off);
         if (lane >= off) inclusive += other;
     }
     if (lane == 31) warp_totals[warp] = inclusive;

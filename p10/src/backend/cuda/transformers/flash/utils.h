@@ -114,7 +114,7 @@ struct Allreduce {
     template<typename T, typename Operator>
     static __device__ __forceinline__ T run(T x, Operator &op) {
         constexpr int OFFSET = THREADS / 2;
-        x = op(x, __shfl_xor_sync(uint32_t(-1), x, OFFSET));
+        x = op(x, __shfl_xor_sync(static_cast<unsigned long long>(-1), x, OFFSET));
         return Allreduce<OFFSET>::run(x, op);
     }
 };
@@ -125,7 +125,7 @@ template<>
 struct Allreduce<2> {
 template<typename T, typename Operator> 
 static __device__ __forceinline__ T run(T x, Operator &op) {
-    x = op(x, __shfl_xor_sync(uint32_t(-1), x, 1));
+    x = op(x, __shfl_xor_sync(static_cast<unsigned long long>(-1), x, 1));
     return x;
 }
 };
@@ -242,10 +242,10 @@ __forceinline__ __device__ auto convert_acc_to_Aregs(Tensor const& tCrA) {
         float f03 = tCrA(4 * g + 3);
         unsigned long long e0 = ((unsigned long long)__float_as_uint(f00) << 32) | (unsigned long long)__float_as_uint(f02);
         unsigned long long e1 = ((unsigned long long)__float_as_uint(f01) << 32) | (unsigned long long)__float_as_uint(f03);
-        unsigned long long v0 = __shfl_sync(0xffffffff, e0, lq + d / 2);
-        unsigned long long v1 = __shfl_sync(0xffffffff, e1, lq + d / 2);
-        unsigned long long v2 = __shfl_sync(0xffffffff, e0, lq + d / 2 + 2);
-        unsigned long long v3 = __shfl_sync(0xffffffff, e1, lq + d / 2 + 2);
+        unsigned long long v0 = __shfl_sync(0xffffffffffffffffull, e0, lq + d / 2);
+        unsigned long long v1 = __shfl_sync(0xffffffffffffffffull, e1, lq + d / 2);
+        unsigned long long v2 = __shfl_sync(0xffffffffffffffffull, e0, lq + d / 2 + 2);
+        unsigned long long v3 = __shfl_sync(0xffffffffffffffffull, e1, lq + d / 2 + 2);
         unsigned long long sel_lo = (d % 2 == 0) ? v0 : v1;
         unsigned long long sel_hi = (d % 2 == 0) ? v2 : v3;
         out(4 * g + 0) = __uint_as_float(uint32_t(sel_lo >> 32));

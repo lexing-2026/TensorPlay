@@ -1055,7 +1055,7 @@ template <typename T>
 __device__ inline T embedding_warp_reduce_sum(T value) {
 #pragma unroll
     for (int offset = kEmbeddingWarpSize / 2; offset > 0; offset >>= 1) {
-        value += __shfl_down_sync(0xffffffffu, value, offset);
+        value += __shfl_down_sync(0xffffffffffffffffull, value, offset);
     }
     return value;
 }
