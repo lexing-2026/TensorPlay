@@ -651,6 +651,7 @@ static void mm_into_impl(const Tensor& self_p, const Tensor& mat2_p,
     const int64_t M = self_p.size(0);
     const int64_t K = self_p.size(1);
     const int64_t N = mat2_p.size(1);
+    if (result.numel() == 0) return;
     if (K == 0) {
         // oneDNN and some BLAS implementations leave C untouched for a
         // beta*C + 0 and beta is zero for mm.

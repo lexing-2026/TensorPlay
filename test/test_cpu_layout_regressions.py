@@ -4,6 +4,13 @@ import pytest
 import tensorplay as tp
 
 
+@pytest.mark.parametrize("shape", [(0, 4, 3), (3, 4, 0), (3, 0, 4)])
+def test_empty_matrix_products(shape):
+    rows, inner, columns = shape
+    result = tp.ones(rows, inner) @ tp.ones(inner, columns)
+    np.testing.assert_array_equal(result.numpy(), np.zeros((rows, columns)))
+
+
 @pytest.mark.parametrize("dtype", [tp.float16, tp.bfloat16, tp.float32, tp.float64])
 @pytest.mark.parametrize("expanded_operand", ["left", "right", "both"])
 def test_expanded_matrices_use_dense_product_semantics(dtype, expanded_operand):
