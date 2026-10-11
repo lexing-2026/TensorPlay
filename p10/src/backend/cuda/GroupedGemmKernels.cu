@@ -17,10 +17,16 @@
 
 #include <cuda_runtime.h>
 
+// The ragged grouped GEMM rides on the tensor-core GEMM library's grouped
+// schedule, which this toolchain does not ship; the entry point below reports
+// the configuration as outside its envelope there and the caller falls back to
+// the per-group math-library path.
+#if !defined(USE_ROCM)
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm_grouped.h"
 #include "cutlass/gemm/kernel/default_gemm_grouped.h"
 #include "cutlass/gemm/threadblock/threadblock_swizzle.h"
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -31,6 +37,8 @@ namespace tensorplay {
 namespace cuda {
 
 namespace {
+
+#if !defined(USE_ROCM)
 
 #define CUDA_CHECK(condition)                                                \
     do {                                                                     \
@@ -427,10 +435,21 @@ bool run_simt_grouped_gemm(const Tensor& offs_dev, const void* a_ptr,
 
 }  // namespace
 
+#endif  // !USE_ROCM
+
 bool try_grouped_gemm_tensor_op(const Tensor& self, const Tensor& mat2,
                                 const Tensor& offs, Tensor& out,
                                 const int64_t* ends_host,
                                 int64_t max_group_rows) {
+#if defined(USE_ROCM)
+    (void)self;
+    (void)mat2;
+    (void)offs;
+    (void)out;
+    (void)ends_host;
+    (void)max_group_rows;
+    return false;
+#else
     const int64_t groups = mat2.size(0);
     const int64_t k_dim = self.size(1);
     const int64_t n_dim = mat2.size(2);
@@ -533,6 +552,7 @@ bool try_grouped_gemm_tensor_op(const Tensor& self, const Tensor& mat2,
                               float>(
         offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, m_total, k_dim,
         n_dim, /*b_col=*/false, 128, 64, sm_count, stream);
+#endif  // !USE_ROCM
 }
 
 }  // namespace cuda
