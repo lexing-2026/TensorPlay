@@ -1589,6 +1589,27 @@
       "bytes_moved": 16793600
     },
     {
+      "bytes_moved": 6423552,
+      "category": "normalization",
+      "flops": 0,
+      "input_shapes": [
+        [
+          8,
+          64,
+          28,
+          28
+        ],
+        [
+          64
+        ],
+        [
+          64
+        ]
+      ],
+      "name": "group-norm[8x64x28x28]",
+      "seconds": 0.00074
+    },
+    {
       "name": "batch-norm[8x64x28x28]",
       "category": "normalization",
       "input_shapes": [
