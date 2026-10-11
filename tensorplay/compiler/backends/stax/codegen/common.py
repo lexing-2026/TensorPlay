@@ -31,7 +31,8 @@ from enum import Enum, auto
 from abc import ABC, abstractmethod
 from itertools import chain
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Generic, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Generic, NamedTuple
+from typing_extensions import TypeVar
 
 import sympy
 from sympy.printing.python import PythonPrinter as _PythonPrinter
