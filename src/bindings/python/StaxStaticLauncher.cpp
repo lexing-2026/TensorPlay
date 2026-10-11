@@ -79,7 +79,7 @@ CUdeviceptr device_pointer(PyObject* obj) {
         if (raw == static_cast<unsigned long long>(-1) && PyErr_Occurred()) {
             return 0;
         }
-        return static_cast<CUdeviceptr>(raw);
+        return reinterpret_cast<CUdeviceptr>(raw);
     }
     if (Py_IsNone(obj)) {
         return 0;
@@ -104,7 +104,7 @@ CUdeviceptr device_pointer(PyObject* obj) {
     if (address == static_cast<unsigned long long>(-1) && PyErr_Occurred()) {
         return 0;
     }
-    return static_cast<CUdeviceptr>(address);
+    return reinterpret_cast<CUdeviceptr>(address);
 }
 
 int64_t as_int64(PyObject* obj) {
