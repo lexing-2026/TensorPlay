@@ -61,11 +61,19 @@ inline bool engine_trace_enabled() {
 inline bool current_cuda_stream_is_capturing() {
 #ifdef USE_CUDA
     if (tensorplay::cuda::deviceCount() == 0) return false;
+#if defined(USE_ROCM)
+    hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+    const hipError_t error = hipStreamIsCapturing(
+        tensorplay::cuda::getCurrentCUDAStream().stream(), &status);
+    return error == hipSuccess &&
+           status == hipStreamCaptureStatusActive;
+#else
     cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
     const cudaError_t error = cudaStreamIsCapturing(
         tensorplay::cuda::getCurrentCUDAStream().stream(), &status);
     return error == cudaSuccess &&
            status == cudaStreamCaptureStatusActive;
+#endif
 #else
     return false;
 #endif
