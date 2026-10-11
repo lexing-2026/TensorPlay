@@ -225,6 +225,14 @@ using cudnnConvolutionBwdFilterAlgo_t = miopenConvBwdWeightsAlgorithm_t;
 #define CUDNN_CONVOLUTION_BWD_FILTER_ALGO_IMPLICIT_GEMM \
     miopenConvolutionBwdWeightsAlgoImplicitGEMM
 
+// The solution queries below report a single solution each, so the bound the
+// callers size their result array with is one on this side.  It is the array
+// bound and the requested count together, so it keeps every call site that
+// passes the constant correct without a per-site guard.
+#define CUDNN_CONVOLUTION_FWD_ALGO_COUNT 1
+#define CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT 1
+#define CUDNN_CONVOLUTION_BWD_FILTER_ALGO_COUNT 1
+
 // MIOpen's perf record stores the algorithm in a union shared by the three
 // directions; these structs mirror the shape the kernels read (.algo,
 // .status, .time, .memory).
