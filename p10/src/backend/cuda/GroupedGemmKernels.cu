@@ -433,9 +433,9 @@ bool run_simt_grouped_gemm(const Tensor& offs_dev, const void* a_ptr,
         n_dim, sm_count, stream);
 }
 
-}  // namespace
-
 #endif  // !USE_ROCM
+
+}  // namespace
 
 bool try_grouped_gemm_tensor_op(const Tensor& self, const Tensor& mat2,
                                 const Tensor& offs, Tensor& out,
