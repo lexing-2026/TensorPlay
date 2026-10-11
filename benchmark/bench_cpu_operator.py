@@ -52,9 +52,15 @@ def _array(dtype, value):
     raise ValueError(f"unknown input kind: {kind}")
 
 
-def _factory(dtype, operation, specs):
+def _factory(dtype, tp_dtype, operation, specs):
     def make():
-        tensors = tuple(tp.tensor(_array(dtype, value)) for value in specs)
+        tensors = []
+        for value in specs:
+            array = _array(dtype, value)
+            if value[0] in ("integer", "offsets", "boolean"):
+                tensors.append(tp.tensor(array))
+            else:
+                tensors.append(tp.tensor(array, dtype=tp_dtype))
         return lambda: operation(*tensors)
 
     return make
@@ -83,7 +89,7 @@ def _count_flops(fn):
         return 0
 
 
-_ITEMSIZE = {"f32": 4, "f64": 8}
+_ITEMSIZE = {"f32": 4, "f64": 8, "bf16": 2}
 
 # Zero-copy view operators and short-circuit reductions touch no data (or
 # a data-independent subset), so a streaming-bytes estimate would be wrong.
@@ -114,12 +120,19 @@ def _estimate_bytes(specs, itemsize):
 
 
 def build_cases(dtype, suite):
+    # ``dtype`` is the benchmark's dtype name; the numpy storage type and the
+    # framework tensor type differ for bfloat16, which numpy has no native
+    # element type for.
+    np_dtype = np.float32 if dtype in ("f32", "bf16") else np.float64
+    tp_dtype = {"f32": tp.float32, "f64": tp.float64, "bf16": tp.bfloat16}[dtype]
     cases = []
 
     def add(name, category, operation, specs, *, long_only=False):
         if long_only and suite == "short":
             return
-        cases.append((name, category, _factory(dtype, operation, specs), specs))
+        cases.append(
+            (name, category, _factory(np_dtype, tp_dtype, operation, specs), specs)
+        )
 
     # Binary family: same-shape, broadcast,
     # scalar, comparison, logical and ternary arithmetic operators.
@@ -138,6 +151,8 @@ def build_cases(dtype, suite):
         lambda a: F.add(a, 1.25), (binary,))
     add("mul-scalar[8x16x32]", "binary",
         lambda a: F.mul(a, 1.25), (binary,))
+    add("add-relu[8x16x32]", "binary",
+        lambda a, b: pF.relu(F.add(a, b)), (binary, binary2))
 
     broadcast_a = _spec("normal", (32, 1, 64), 3)
     broadcast_b = _spec("normal", (1, 16, 64), 4)
@@ -258,6 +273,20 @@ def build_cases(dtype, suite):
         lambda a: F.all(a, dim=1), (boolean_matrix,))
     add("any-dim1[1024x1024]", "reduction",
         lambda a: F.any(a, dim=1), (boolean_matrix,))
+    add("amax[1M]", "reduction", lambda a: F.amax(a), (vector,))
+    add("amin[1M]", "reduction", lambda a: F.amin(a), (vector,))
+    add("logsumexp[1024x1024]", "reduction",
+        lambda a: F.logsumexp(a, dim=1), (matrix,))
+    add("cumprod[1024x1024]", "reduction",
+        lambda a: F.cumprod(a, dim=1), (matrix,))
+    add("flip[1024x1024]", "reduction",
+        lambda a: F.flip(a, [0]), (matrix,))
+    add("roll[1024x1024]", "reduction",
+        lambda a: F.roll(a, 1, 0), (matrix,))
+    add("kthvalue[1024x1024]", "reduction",
+        lambda a: F.kthvalue(a, 3, dim=1)[0], (matrix,))
+    add("mode[1024x1024]", "reduction",
+        lambda a: F.mode(a, dim=1)[0], (matrix,))
 
     # Matrix multiplication family used by addmm/mm/matmul/bmm tests.
     for index, (m, k, n) in enumerate(((128, 256, 128), (256, 256, 256))):
@@ -327,10 +356,24 @@ def build_cases(dtype, suite):
         ("softsign", lambda a: pF.softsign(a)),
         ("tanhshrink", lambda a: pF.tanhshrink(a)),
         ("hardtanh", lambda a: pF.hardtanh(a)),
+        ("rrelu", lambda a: pF.rrelu(a)),
+        ("hardshrink", lambda a: F.hardshrink(a, 0.5)),
+        ("softshrink", lambda a: F.softshrink(a, 0.5)),
+        ("threshold", lambda a: F.threshold(a, 0.5, 0.0)),
+        ("digamma", lambda a: F.digamma(a + 2.0)),
+        ("erfinv", lambda a: F.erfinv(a * 0.5)),
+        ("lgamma", lambda a: F.lgamma(a + 2.0)),
+        ("logit", lambda a: F.logit(a * 0.5 + 0.5)),
+        ("sgn", lambda a: F.sgn(a)),
+        ("nan_to_num", lambda a: F.nan_to_num(a)),
     )
     for index, (name, operation) in enumerate(activations):
         add(f"{name}[256k]", "activation", operation,
             (_spec("normal", (1 << 18,), 501 + index),))
+    prelu_weight = _spec("normal", (1,), 514)
+    add("prelu[256k]", "activation",
+        lambda a, w: pF.prelu(a, w),
+        (_spec("normal", (1 << 18,), 515), prelu_weight))
     norm_input = _spec("normal", (1024, 1024), 520)
     add("softmax[1024x1024]", "normalization",
         lambda a: F.softmax(a, dim=-1), (norm_input,))
@@ -418,6 +461,21 @@ def build_cases(dtype, suite):
     add("adaptive-max-pool3d[2x8x16x16x16]", "pool",
         lambda a: pF.adaptive_max_pool3d(a, (4, 4, 4)),
         (conv3d_input,), long_only=True)
+    convt1d_input = _spec("normal", (8, 16, 128), 610)
+    convt1d_weight = _spec("normal", (16, 8, 3), 611)
+    add("conv-transpose1d[8x16x128]", "convolution",
+        lambda a, w: pF.conv_transpose1d(a, w),
+        (convt1d_input, convt1d_weight))
+    convt2d_input = _spec("normal", (8, 16, 28, 28), 612)
+    convt2d_weight = _spec("normal", (16, 8, 3, 3), 613)
+    add("conv-transpose2d[8x16x28x28]", "convolution",
+        lambda a, w: pF.conv_transpose2d(a, w),
+        (convt2d_input, convt2d_weight))
+    convt3d_input = _spec("normal", (2, 16, 16, 16, 16), 614)
+    convt3d_weight = _spec("normal", (16, 8, 3, 3, 3), 615)
+    add("conv-transpose3d[2x16x16x16x16]", "convolution",
+        lambda a, w: pF.conv_transpose3d(a, w),
+        (convt3d_input, convt3d_weight), long_only=True)
 
     # Indexing/layout family: embedding, gather, concat, views and sorting.
     table = _spec("normal", (4096, 128), 700)
@@ -439,6 +497,28 @@ def build_cases(dtype, suite):
     gather_dim1_indices = _spec("integer", (4096, 128), 707, upper=512)
     add("gather-dim1[4096x128]", "indexing",
         lambda a, i: F.gather(a, 1, i), (index_matrix, gather_dim1_indices))
+    take_input = _spec("normal", (4096,), 720)
+    take_indices = _spec("integer", (1024,), 721, upper=4096)
+    add("take[1024]", "indexing",
+        lambda a, i: F.take(a, i), (take_input, take_indices))
+    index_add_input = _spec("normal", (128, 64), 722)
+    index_add_indices = _spec("integer", (64,), 723, upper=128)
+    add("index-add[128x64]", "indexing",
+        lambda a, i, v: F.index_add(a, 0, i, v),
+        (index_add_input, index_add_indices, _spec("normal", (64, 64), 724)))
+    scatter_input = _spec("normal", (128, 64), 725)
+    scatter_indices = _spec("integer", (128, 64), 726, upper=128)
+    add("scatter[128x64]", "indexing",
+        lambda a, i, v: F.scatter(a, 0, i, v),
+        (scatter_input, scatter_indices, _spec("normal", (128, 64), 727)))
+    masked_input = _spec("normal", (1 << 18,), 728)
+    masked_mask = _spec("boolean", (1 << 18,), 729)
+    add("masked-fill[256k]", "indexing",
+        lambda a, m: F.masked_fill(a, m, 0.5), (masked_input, masked_mask))
+    add("nonzero[128x64]", "indexing",
+        lambda a: F.nonzero(a), (_spec("normal", (128, 64), 730),))
+    add("unique[256k]", "indexing",
+        lambda a: F.unique(a), (_spec("normal", (1 << 18,), 731),))
     layout = _spec("normal", (32, 64, 28, 28), 708)
     add("cat-dim0[2x32x64x28x28]", "layout",
         lambda a: F.cat([a, a], dim=0), (layout,))
@@ -471,6 +551,24 @@ def build_cases(dtype, suite):
     add("repeat[64x1024]", "layout",
         lambda a: F.repeat(a, (64, 1)),
         (_spec("normal", (1, 1024), 712),))
+    strided_layout = _spec("normal", (64, 64), 713)
+    add("as-strided[64x64]", "layout",
+        lambda a: F.as_strided(a, (64, 64), (1, 64)), (strided_layout,))
+    triangular_layout = _spec("normal", (128, 128), 714)
+    add("tril[128x128]", "layout",
+        lambda a: F.tril(a), (triangular_layout,))
+    add("triu[128x128]", "layout",
+        lambda a: F.triu(a), (triangular_layout,))
+    add("trace[128x128]", "layout",
+        lambda a: F.trace(a), (triangular_layout,))
+    add("flipud[128x128]", "layout",
+        lambda a: F.flipud(a), (triangular_layout,))
+    cdist_a = _spec("normal", (64, 16), 715)
+    cdist_b = _spec("normal", (32, 16), 716)
+    add("cdist[64x16+32x16]", "layout",
+        lambda a, b: F.cdist(a, b), (cdist_a, cdist_b))
+    add("pdist[64x16]", "layout",
+        lambda a: F.pdist(a), (_spec("normal", (64, 16), 717),))
 
     # Ternary/select/sort family.
     misc = _spec("normal", (1 << 18,), 800)
@@ -502,7 +600,7 @@ def build_cases(dtype, suite):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--suite", choices=("short", "long", "all"), default="short")
-    parser.add_argument("--dtype", choices=("f32", "f64"), default="f32")
+    parser.add_argument("--dtype", choices=("f32", "f64", "bf16"), default="f32")
     parser.add_argument("--reps", type=int, default=5)
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--flops", action="store_true",
@@ -513,10 +611,9 @@ def main():
         parser.error("reps must be positive and threads must be non-negative")
     if args.threads and hasattr(tp, "set_num_threads"):
         tp.set_num_threads(args.threads)
-    dtype = np.float32 if args.dtype == "f32" else np.float64
     suite = "long" if args.suite == "all" else args.suite
     measurements = []
-    cases = build_cases(dtype, suite)
+    cases = build_cases(args.dtype, suite)
     print(f"suite={suite} dtype={args.dtype} cases={len(cases)}")
     for name, category, factory, specs in cases:
         fn = factory()
