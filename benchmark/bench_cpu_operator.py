@@ -594,6 +594,168 @@ def build_cases(dtype, suite):
     add("sort[2048x2048]", "sorting",
         lambda a: F.sort(a, dim=1)[0], (long_sort,), long_only=True)
 
+    # Close the remaining reference-suite gaps: bitwise shifts, 3D
+    # convolution and pooling in the short suite, fractional max pooling,
+    # sigmoid and clone.  Then go beyond the reference by measuring
+    # operators it does not cover at all.
+    bitwise_a = _spec("integer", (8, 16, 32), 900, upper=1024)
+    bitwise_b = _spec("integer", (8, 16, 32), 901, upper=8)
+    add("asr[8x16x32]", "binary",
+        lambda a, b: F.bitwise_right_shift(a, b), (bitwise_a, bitwise_b))
+    add("lsl[8x16x32]", "binary",
+        lambda a, b: F.bitwise_left_shift(a, b), (bitwise_a, bitwise_b))
+    add("fmax[256k]", "binary",
+        lambda a, b: F.fmax(a, b),
+        (_spec("normal", (1 << 18,), 902), _spec("normal", (1 << 18,), 903)))
+    add("fmin[256k]", "binary",
+        lambda a, b: F.fmin(a, b),
+        (_spec("normal", (1 << 18,), 904), _spec("normal", (1 << 18,), 905)))
+    add("hypot[256k]", "binary",
+        lambda a, b: F.hypot(a, b),
+        (_spec("normal", (1 << 18,), 906), _spec("normal", (1 << 18,), 907)))
+    add("copysign[256k]", "binary",
+        lambda a, b: F.copysign(a, b),
+        (_spec("normal", (1 << 18,), 908), _spec("normal", (1 << 18,), 909)))
+    add("xlogy[256k]", "binary",
+        lambda a, b: F.xlogy(a + 1.0, b + 1.0),
+        (_spec("normal", (1 << 18,), 910), _spec("normal", (1 << 18,), 911)))
+    add("logaddexp[256k]", "binary",
+        lambda a, b: F.logaddexp(a, b),
+        (_spec("normal", (1 << 18,), 912), _spec("normal", (1 << 18,), 913)))
+    add("logaddexp2[256k]", "binary",
+        lambda a, b: F.logaddexp2(a, b),
+        (_spec("normal", (1 << 18,), 914), _spec("normal", (1 << 18,), 915)))
+    add("igamma[256k]", "binary",
+        lambda a, b: F.igamma(a + 2.0, b + 2.0),
+        (_spec("normal", (1 << 18,), 916), _spec("normal", (1 << 18,), 917)))
+    add("igammac[256k]", "binary",
+        lambda a, b: F.igammac(a + 2.0, b + 2.0),
+        (_spec("normal", (1 << 18,), 918), _spec("normal", (1 << 18,), 919)))
+    add("zeta[256k]", "binary",
+        lambda a, b: F.zeta(a + 2.0, b + 2.0),
+        (_spec("normal", (1 << 18,), 920), _spec("normal", (1 << 18,), 921)))
+    add("lerp[256k]", "binary",
+        lambda a, b: F.lerp(a, b, 0.5),
+        (_spec("normal", (1 << 18,), 922), _spec("normal", (1 << 18,), 923)))
+    add("sigmoid[256k]", "activation",
+        lambda a: pF.sigmoid(a), (_spec("normal", (1 << 18,), 924),))
+    add("glu[256k]", "activation",
+        lambda a: pF.glu(a, dim=-1), (_spec("normal", (1 << 18,), 925),))
+    add("bitwise-not[256k]", "unary",
+        lambda a: F.bitwise_not(a), (_spec("integer", (1 << 18,), 926, upper=1024),))
+    unary_extra = (
+        ("deg2rad", lambda a: F.deg2rad(a)),
+        ("rad2deg", lambda a: F.rad2deg(a)),
+        ("sinc", lambda a: F.sinc(a)),
+        ("mvlgamma", lambda a: F.mvlgamma(a + 3.0, 2)),
+        ("polygamma", lambda a: F.polygamma(1, a + 2.0)),
+        ("signbit", lambda a: F.signbit(a)),
+        ("isnan", lambda a: F.isnan(a)),
+        ("isinf", lambda a: F.isinf(a)),
+        ("isfinite", lambda a: F.isfinite(a)),
+        ("logical-not", lambda a: F.logical_not(a)),
+        ("real", lambda a: F.real(a)),
+        ("imag", lambda a: F.imag(a)),
+        ("conj", lambda a: F.conj(a)),
+        ("angle", lambda a: F.angle(a)),
+    )
+    for index, (name, operation) in enumerate(unary_extra):
+        add(f"{name}[256k]", "unary", operation,
+            (_spec("normal", (1 << 18,), 930 + index),))
+
+    clone_input = _spec("normal", (1 << 18,), 950)
+    add("clone[256k]", "layout", lambda a: a.clone(), (clone_input,))
+    add("flatten[1M]", "layout",
+        lambda a: F.flatten(a), (_spec("normal", (32, 28, 28, 64), 951),))
+    add("ravel[1M]", "layout",
+        lambda a: F.ravel(a), (_spec("normal", (32, 28, 28, 64), 952),))
+    add("view[1M]", "layout",
+        lambda a: F.view(a, (256, 4096)), (_spec("normal", (1024, 1024), 953),))
+    add("squeeze[256k]", "layout",
+        lambda a: F.squeeze(a), (_spec("normal", (1, 64, 1, 28), 954),))
+    add("unsqueeze[256k]", "layout",
+        lambda a: F.unsqueeze(a, 0), (_spec("normal", (64, 28), 955),))
+    add("narrow[256k]", "layout",
+        lambda a: F.narrow(a, 1, 10, 100), (_spec("normal", (1024, 1024), 956),))
+    add("tile[256k]", "layout",
+        lambda a: F.tile(a, (2, 2)), (_spec("normal", (64, 64), 957),))
+    add("repeat-interleave[256k]", "layout",
+        lambda a: F.repeat_interleave(a, 3), (_spec("normal", (1024,), 958),))
+    add("expand-as[256k]", "layout",
+        lambda a, b: F.expand_as(a, b),
+        (_spec("normal", (1, 1024), 959), _spec("normal", (64, 1024), 960)))
+    add("hstack[256k]", "layout",
+        lambda a, b: F.hstack([a, b]),
+        (_spec("normal", (64, 32), 961), _spec("normal", (64, 32), 962)))
+    add("vstack[256k]", "layout",
+        lambda a, b: F.vstack([a, b]),
+        (_spec("normal", (32, 64), 963), _spec("normal", (32, 64), 964)))
+    add("kron[256k]", "layout",
+        lambda a, b: F.kron(a, b),
+        (_spec("normal", (16, 16), 965), _spec("normal", (16, 16), 966)))
+    add("t[256k]", "layout",
+        lambda a: F.t(a), (_spec("normal", (64, 32), 967),))
+    add("rot90[256k]", "layout",
+        lambda a: F.rot90(a, 1, [0, 1]), (_spec("normal", (32, 28, 28, 64), 968),))
+    add("fliplr[256k]", "layout",
+        lambda a: F.fliplr(a), (_spec("normal", (128, 128), 969),))
+    add("pixel-shuffle[256k]", "layout",
+        lambda a: pF.pixel_shuffle(a, 2), (_spec("normal", (8, 16, 28, 28), 970),))
+    add("pixel-unshuffle[256k]", "layout",
+        lambda a: pF.pixel_unshuffle(a, 2), (_spec("normal", (8, 16, 28, 28), 971),))
+    add("unique-consecutive[256k]", "layout",
+        lambda a: F.unique_consecutive(a), (_spec("normal", (1024,), 972),))
+    add("isclose[256k]", "layout",
+        lambda a, b: F.isclose(a, b),
+        (_spec("normal", (1 << 18,), 973), _spec("normal", (1 << 18,), 974)))
+    add("allclose[256k]", "layout",
+        lambda a, b: F.allclose(a, b),
+        (_spec("normal", (1 << 18,), 975), _spec("normal", (1 << 18,), 976)))
+    add("msort[256k]", "sorting",
+        lambda a: F.msort(a), (_spec("normal", (1024,), 977),))
+    add("count-nonzero[1M]", "reduction",
+        lambda a: F.count_nonzero(a), (_spec("normal", (1024, 1024), 978),))
+    add("argwhere[128x64]", "indexing",
+        lambda a: F.argwhere(a), (_spec("normal", (128, 64), 979),))
+    add("searchsorted[256k]", "indexing",
+        lambda a, b: F.searchsorted(a, b),
+        (_spec("normal", (1024,), 980), _spec("normal", (256,), 981)))
+    sorted_source = _spec("normal", (1024,), 982)
+    add("bucketize[256k]", "indexing",
+        lambda a, b: F.bucketize(a, b),
+        (_spec("normal", (256,), 983), sorted_source))
+    add("bincount[256k]", "indexing",
+        lambda a: F.bincount(a), (_spec("integer", (1024,), 984, upper=64),))
+    add("one-hot[256k]", "indexing",
+        lambda a: F.one_hot(a, 10), (_spec("integer", (256,), 985, upper=10),))
+    add("pairwise-distance[64x16]", "distance",
+        lambda a, b: pF.pairwise_distance(a, b),
+        (_spec("normal", (64, 16), 986), _spec("normal", (64, 16), 987)))
+    add("cosine-similarity[64x16]", "distance",
+        lambda a, b: pF.cosine_similarity(a, b, dim=1),
+        (_spec("normal", (64, 16), 988), _spec("normal", (64, 16), 989)))
+    add("fractional-max-pool2d[8x64x28x28]", "pool",
+        lambda a: pF.fractional_max_pool2d(a, 2, output_size=(7, 7)),
+        (_spec("normal", (8, 64, 28, 28), 990),))
+    add("fractional-max-pool3d[2x8x16x16x16]", "pool",
+        lambda a: pF.fractional_max_pool3d(a, 2, output_size=(4, 4, 4)),
+        (_spec("normal", (2, 8, 16, 16, 16), 991),))
+    add("softmax2d[8x16x28x28]", "normalization",
+        lambda a: F.softmax(a, dim=1),
+        (_spec("normal", (8, 16, 28, 28), 992),))
+    add("conv3d-3[2x8x16x16x16]", "convolution",
+        lambda a, w: pF.conv3d(a, w, None, stride=1, padding=1),
+        (conv3d_input, conv3d_weight))
+    add("conv-transpose3d[2x16x16x16x16]", "convolution",
+        lambda a, w: pF.conv_transpose3d(a, w),
+        (convt3d_input, convt3d_weight))
+    add("max-pool3d[2x8x16x16x16]", "pool",
+        lambda a: pF.max_pool3d(a, 2), (conv3d_input,))
+    add("avg-pool3d[2x8x16x16x16]", "pool",
+        lambda a: pF.avg_pool3d(a, 2), (conv3d_input,))
+    add("adaptive-max-pool3d[2x8x16x16x16]", "pool",
+        lambda a: pF.adaptive_max_pool3d(a, (4, 4, 4)), (conv3d_input,))
+
     return cases
 
 
