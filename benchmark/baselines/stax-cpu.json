@@ -10,13 +10,13 @@
       "batch": 64,
       "features": 256,
       "hidden": 512,
-      "eager_seconds": 0.00021340900002542185,
-      "compiled_seconds": 0.0003260000000864238,
-      "compile_seconds": 0.00359909200005859,
-      "first_pass_seconds": 5.361415495000074,
-      "speedup": 0.6546288342602647,
+      "eager_seconds": 0.0003089959999442726,
+      "compiled_seconds": 0.0002537419999271151,
+      "compile_seconds": 0.001850997999952142,
+      "first_pass_seconds": 0.005023887999982435,
+      "speedup": 1.1381138055645588,
       "codegens": [
-        "stax-cpu"
+        "stax-native"
       ]
     },
     {
@@ -25,13 +25,13 @@
       "batch": 128,
       "features": 512,
       "hidden": 1024,
-      "eager_seconds": 0.0018270870000378636,
-      "compiled_seconds": 0.0018898959999660292,
-      "compile_seconds": 0.00042043700000249373,
-      "first_pass_seconds": 1.8929751359999045,
-      "speedup": 0.9667658961502144,
+      "eager_seconds": 0.001087064999978793,
+      "compiled_seconds": 0.001089179000018703,
+      "compile_seconds": 0.00014073199997710617,
+      "first_pass_seconds": 0.007255724999936319,
+      "speedup": 1.0114036741983896,
       "codegens": [
-        "stax-cpu"
+        "stax-native"
       ]
     },
     {
@@ -40,13 +40,13 @@
       "batch": 128,
       "features": 512,
       "hidden": 1024,
-      "eager_seconds": 0.0018919890001143358,
-      "compiled_seconds": 0.0010516070001358457,
-      "compile_seconds": 0.00038906800000404473,
-      "first_pass_seconds": 1.9075002549998317,
-      "speedup": 1.799140743519138,
+      "eager_seconds": 0.0011418369999773859,
+      "compiled_seconds": 0.001866716999984419,
+      "compile_seconds": 0.00012947700002996498,
+      "first_pass_seconds": 0.013349156000003859,
+      "speedup": 0.8709115198696386,
       "codegens": [
-        "stax-cpu"
+        "stax-native"
       ]
     },
     {
@@ -55,13 +55,13 @@
       "batch": 64,
       "features": 1024,
       "hidden": 1024,
-      "eager_seconds": 0.001083608000044478,
-      "compiled_seconds": 0.0011218789998110879,
-      "compile_seconds": 0.00033582900005058036,
-      "first_pass_seconds": 1.9174618429999555,
-      "speedup": 0.9658866956480564,
+      "eager_seconds": 0.001069111999981942,
+      "compiled_seconds": 0.0010557360000120752,
+      "compile_seconds": 0.0001293070000087937,
+      "first_pass_seconds": 0.02262027400001898,
+      "speedup": 0.9854115886276031,
       "codegens": [
-        "stax-cpu"
+        "stax-native"
       ]
     },
     {
@@ -70,13 +70,13 @@
       "batch": 64,
       "features": 1024,
       "hidden": 1024,
-      "eager_seconds": 0.0011272689998804708,
-      "compiled_seconds": 0.0012019089999739663,
-      "compile_seconds": 0.000303708000046754,
-      "first_pass_seconds": 1.9077981010000258,
-      "speedup": 0.9378987925915255,
+      "eager_seconds": 0.0011463549999461975,
+      "compiled_seconds": 0.0011353239999607467,
+      "compile_seconds": 0.0001253679999990709,
+      "first_pass_seconds": 0.00722416600001452,
+      "speedup": 1.0609330296367594,
       "codegens": [
-        "stax-cpu"
+        "stax-native"
       ]
     },
     {
@@ -85,13 +85,13 @@
       "batch": 32,
       "features": 1024,
       "hidden": 2048,
-      "eager_seconds": 0.0010976639998716564,
-      "compiled_seconds": 0.0011818610000773333,
-      "compile_seconds": 0.00034812099988812406,
-      "first_pass_seconds": 1.9484579259999464,
-      "speedup": 0.9287589655634905,
+      "eager_seconds": 0.0019342730000744268,
+      "compiled_seconds": 0.001305231000060303,
+      "compile_seconds": 0.00012602699996477895,
+      "first_pass_seconds": 0.010591178000026957,
+      "speedup": 0.996278758989097,
       "codegens": [
-        "stax-cpu"
+        "stax-native"
       ]
     },
     {
@@ -100,13 +100,13 @@
       "batch": 64,
       "features": 256,
       "hidden": 512,
-      "eager_seconds": 0.00021987100012665906,
-      "compiled_seconds": 0.00031266499991033925,
-      "compile_seconds": 0.00036372999988998345,
-      "first_pass_seconds": 1.9061513560000094,
-      "speedup": 0.7032159026104934,
+      "eager_seconds": 0.0006213769999021679,
+      "compiled_seconds": 0.00030713199998899654,
+      "compile_seconds": 0.00011407300002019838,
+      "first_pass_seconds": 0.007135091000009197,
+      "speedup": 1.116253743744473,
       "codegens": [
-        "stax-cpu"
+        "stax-native"
       ]
     },
     {
@@ -115,13 +115,13 @@
       "batch": 64,
       "features": 256,
       "hidden": 256,
-      "eager_seconds": 0.00016345500011993863,
-      "compiled_seconds": 0.0002621000000999629,
-      "compile_seconds": 0.00031259499996849627,
-      "first_pass_seconds": 1.9852844960000766,
-      "speedup": 0.6236360170072421,
+      "eager_seconds": 0.00026501399997869157,
+      "compiled_seconds": 0.0002772870000171679,
+      "compile_seconds": 0.00010170299998435439,
+      "first_pass_seconds": 0.005343535000008615,
+      "speedup": 1.0267260198942736,
       "codegens": [
-        "stax-cpu"
+        "stax-native"
       ]
     },
     {
@@ -130,13 +130,13 @@
       "batch": 256,
       "features": 64,
       "hidden": 512,
-      "eager_seconds": 0.0001679639999565552,
-      "compiled_seconds": 0.0002497769999081356,
-      "compile_seconds": 0.00033959500001401466,
-      "first_pass_seconds": 1.851576272000102,
-      "speedup": 0.6724558306742812,
+      "eager_seconds": 0.00035021200005758146,
+      "compiled_seconds": 0.00034304999996948027,
+      "compile_seconds": 9.765599997990648e-05,
+      "first_pass_seconds": 0.004200379000053545,
+      "speedup": 1.0629408847308026,
       "codegens": [
-        "stax-cpu"
+        "stax-native"
       ]
     },
     {
@@ -145,13 +145,13 @@
       "batch": 128,
       "features": 512,
       "hidden": 1024,
-      "eager_seconds": 0.0008446800000001531,
-      "compiled_seconds": 0.0009513899999546993,
-      "compile_seconds": 0.0003598129999318189,
-      "first_pass_seconds": 1.9063330550000046,
-      "speedup": 0.8878377952683681,
+      "eager_seconds": 0.0010581310000361555,
+      "compiled_seconds": 0.0009437680000701221,
+      "compile_seconds": 0.00010858299998517396,
+      "first_pass_seconds": 7.424388946000022,
+      "speedup": 1.0273793952671024,
       "codegens": [
-        "stax-cpu"
+        "stax-fused-cpu-segments"
       ]
     }
   ]

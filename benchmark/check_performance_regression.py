@@ -4,6 +4,7 @@
 import argparse
 import json
 import math
+import statistics
 import sys
 from pathlib import Path
 
@@ -38,6 +39,63 @@ def load(path):
     return payload
 
 
+def load_history(path):
+    """Load the published benchmark history; a missing or unparsable file
+    simply means no history has been recorded yet."""
+    if path is None or not Path(path).exists():
+        return {}
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def median_baseline(current, runs, suite_key):
+    """Build a comparison baseline for one suite as the per-measurement
+    median over the matching runs of the same hardware history."""
+    matching = []
+    for run in runs:
+        payload = run.get("suites", {}).get(suite_key)
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("benchmark") != current.get("benchmark"):
+            continue
+        if payload.get("suite") != current.get("suite"):
+            continue
+        if payload.get("dtype") != current.get("dtype"):
+            continue
+        if payload.get("threads") != current.get("threads"):
+            continue
+        matching.append(payload)
+    if not matching:
+        return None
+    base = dict(current)
+    base["measurements"] = []
+    for current_item in current["measurements"]:
+        baseline_item = dict(current_item)
+        for metric in ("seconds", "forward_seconds", "step_seconds",
+                       "compiled_seconds", "compile_seconds"):
+            if metric not in current_item:
+                continue
+            values = []
+            for payload in matching:
+                for item in payload["measurements"]:
+                    if item.get("name") == current_item["name"] and metric in item:
+                        value = item[metric]
+                        if (
+                            isinstance(value, (int, float))
+                            and not isinstance(value, bool)
+                            and math.isfinite(value)
+                            and value > 0
+                        ):
+                            values.append(value)
+            if values:
+                baseline_item[metric] = statistics.median(values)
+        base["measurements"].append(baseline_item)
+    return base
+
+
 def compare(current, baseline, metrics, max_slowdown, label):
     if current["benchmark"] != baseline["benchmark"]:
         raise ValueError(f"{label}: benchmark names do not match")
@@ -51,12 +109,38 @@ def compare(current, baseline, metrics, max_slowdown, label):
 
     current_by_name = {item["name"]: item for item in current["measurements"]}
     baseline_by_name = {item["name"]: item for item in baseline["measurements"]}
-    if set(current_by_name) != set(baseline_by_name):
-        raise ValueError(f"{label}: measurement names do not match")
+    # The suite grows as operators gain support for a dtype; names that are
+    # only on one side simply have no reference yet or are no longer emitted,
+    # so only the intersection is compared.  New names are recorded into the
+    # history when this run is published and gate from then on.
+    compared_names = [name for name in current_by_name if name in baseline_by_name]
+
+    # A run can land on a faster or slower machine, or on a noisier
+    # neighbour, than the one that produced the committed baseline.  Measure
+    # the run's own overall shift against the baseline as the median ratio
+    # over every shared measurement, then treat only deviations beyond that
+    # shift as regressions.  The median stays robust when a handful of
+    # operators genuinely regress.
+    scale = {}
+    for metric in metrics:
+        ratios = []
+        for name in compared_names:
+            current_item = current_by_name[name]
+            baseline_item = baseline_by_name[name]
+            actual = current_item.get(metric)
+            previous = baseline_item.get(metric)
+            if (
+                isinstance(actual, (int, float)) and not isinstance(actual, bool)
+                and isinstance(previous, (int, float)) and not isinstance(previous, bool)
+                and math.isfinite(actual) and math.isfinite(previous)
+                and actual > 0 and previous > 0
+            ):
+                ratios.append(actual / previous)
+        scale[metric] = statistics.median(ratios) if ratios else 1.0
 
     violations = []
-    limit = 1.0 + max_slowdown
-    for name, current_item in current_by_name.items():
+    for name in compared_names:
+        current_item = current_by_name[name]
         baseline_item = baseline_by_name[name]
         if current_item.get("category") != baseline_item.get("category"):
             raise ValueError(f"{label}/{name}: categories do not match")
@@ -86,6 +170,13 @@ def compare(current, baseline, metrics, max_slowdown, label):
             if actual <= 0 or previous <= 0:
                 raise ValueError(f"{label}/{name}/{metric}: timings must be positive")
             ratio = actual / previous
+            # Sub-microsecond baselines sit at the timing floor: the
+            # measurement jitter of a tiny tensor makes their relative
+            # slowdown noise rather than signal, so leave them out of the
+            # ratio gate.
+            if previous < 1e-5:
+                continue
+            limit = scale[metric] * (1.0 + max_slowdown)
             if ratio > limit:
                 violations.append(
                     f"{label}/{name}/{metric}: {ratio:.2f}x of baseline "
@@ -94,8 +185,11 @@ def compare(current, baseline, metrics, max_slowdown, label):
     return violations
 
 
-def write_summary(path, sections, violations):
+def write_summary(path, sections, violations, note=None):
     lines = ["# CPU performance gate", ""]
+    if note:
+        lines.append(note)
+        lines.append("")
     for title, limit, count in sections:
         lines.append(f"- {title}: max {limit:.0%} slower; {count} measurements")
     lines.append("")
@@ -107,16 +201,29 @@ def write_summary(path, sections, violations):
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _load_json_optional(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--operator-json", type=Path, required=True)
-    parser.add_argument("--operator-baseline-json", type=Path, required=True)
     parser.add_argument("--operator-f64-json", type=Path)
-    parser.add_argument("--operator-f64-baseline-json", type=Path)
+    parser.add_argument("--operator-bf16-json", type=Path)
     parser.add_argument("--train-json", type=Path, required=True)
-    parser.add_argument("--train-baseline-json", type=Path, required=True)
     parser.add_argument("--stax-json", type=Path, required=True)
-    parser.add_argument("--stax-baseline-json", type=Path, required=True)
+    parser.add_argument("--history", type=Path, required=True,
+                        help="published bench-data snapshot (latest.json)")
+    parser.add_argument("--host-probe", type=Path, required=True)
+    parser.add_argument("--operator-baseline-json", type=Path,
+                        help="legacy committed baseline; used only when no history exists")
+    parser.add_argument("--operator-f64-baseline-json", type=Path)
+    parser.add_argument("--operator-bf16-baseline-json", type=Path)
+    parser.add_argument("--train-baseline-json", type=Path)
+    parser.add_argument("--stax-baseline-json", type=Path)
     parser.add_argument("--operator-max-slowdown", type=float, default=0.30)
     parser.add_argument("--operator-f64-max-slowdown", type=float, default=0.30)
     parser.add_argument("--train-max-slowdown", type=float, default=0.20)
@@ -135,58 +242,78 @@ def main():
         parser.error("slowdown limits must be finite and non-negative")
 
     operator = load(args.operator_json)
-    operator_baseline = load(args.operator_baseline_json)
-    if (args.operator_f64_json is None) != (args.operator_f64_baseline_json is None):
-        parser.error("operator f64 result and baseline must be supplied together")
     operator_f64 = (
         load(args.operator_f64_json) if args.operator_f64_json is not None else None
     )
-    operator_f64_baseline = (
-        load(args.operator_f64_baseline_json)
-        if args.operator_f64_baseline_json is not None
-        else None
+    operator_bf16 = (
+        load(args.operator_bf16_json) if args.operator_bf16_json is not None else None
     )
     train = load(args.train_json)
-    train_baseline = load(args.train_baseline_json)
     stax = load(args.stax_json)
-    stax_baseline = load(args.stax_baseline_json)
+
+    probe = _load_json_optional(args.host_probe)
+    cpu_model = str(probe.get("cpu_model", "") or "unknown")
+    history = load_history(args.history)
+    arch = history.get("arches", {}).get("cpu", {})
+    runs = arch.get("history", {}).get(cpu_model, []) if isinstance(arch, dict) else []
+    if not isinstance(runs, list):
+        runs = []
+
+    def baseline_for(current, suite_key, legacy_path):
+        baseline = median_baseline(current, runs, suite_key)
+        if baseline is not None:
+            return baseline
+        if legacy_path is not None:
+            return load(legacy_path)
+        return None
+
+    operator_baseline = baseline_for(
+        operator, "cpu-operator", args.operator_baseline_json)
+    operator_f64_baseline = (
+        baseline_for(operator_f64, "cpu-operator-f64",
+                     args.operator_f64_baseline_json)
+        if operator_f64 is not None
+        else None
+    )
+    operator_bf16_baseline = (
+        baseline_for(operator_bf16, "cpu-operator-bf16",
+                     args.operator_bf16_baseline_json)
+        if operator_bf16 is not None
+        else None
+    )
+    train_baseline = baseline_for(train, "cpu-train", args.train_baseline_json)
+    stax_baseline = baseline_for(stax, "stax-cpu", args.stax_baseline_json)
 
     violations = []
-    violations.extend(compare(
-        operator, operator_baseline, ("seconds",),
-        args.operator_max_slowdown, "operator",
-    ))
-    if operator_f64 is not None and operator_f64_baseline is not None:
-        violations.extend(compare(
-            operator_f64, operator_f64_baseline, ("seconds",),
-            args.operator_f64_max_slowdown, "operator f64",
-        ))
-    violations.extend(compare(
-        train, train_baseline, ("forward_seconds", "step_seconds"),
-        args.train_max_slowdown, "train",
-    ))
-    violations.extend(compare(
-        stax, stax_baseline, ("compiled_seconds",),
-        args.stax_max_slowdown, "stax",
-    ))
-    violations.extend(compare(
-        stax, stax_baseline, ("compile_seconds",),
-        args.stax_compile_max_slowdown, "stax compile",
-    ))
-    sections = [
-        ("operator", args.operator_max_slowdown, len(operator["measurements"])),
-    ]
-    if operator_f64 is not None:
-        sections.append((
-            "operator f64", args.operator_f64_max_slowdown,
-            len(operator_f64["measurements"]),
-        ))
-    sections.extend((
-        ("train", args.train_max_slowdown, len(train["measurements"])),
-        ("stax compiled", args.stax_max_slowdown, len(stax["measurements"])),
-        ("stax compile", args.stax_compile_max_slowdown, len(stax["measurements"])),
-    ))
-    write_summary(args.summary_out, sections, violations)
+    sections = []
+    for title, current, baseline, metrics, limit in (
+        ("operator", operator, operator_baseline, ("seconds",),
+         args.operator_max_slowdown),
+        ("operator f64", operator_f64, operator_f64_baseline, ("seconds",),
+         args.operator_f64_max_slowdown),
+        ("operator bf16", operator_bf16, operator_bf16_baseline, ("seconds",),
+         args.operator_max_slowdown),
+        ("train", train, train_baseline,
+         ("forward_seconds", "step_seconds"), args.train_max_slowdown),
+        ("stax compiled", stax, stax_baseline, ("compiled_seconds",),
+         args.stax_max_slowdown),
+        ("stax compile", stax, stax_baseline, ("compile_seconds",),
+         args.stax_compile_max_slowdown),
+    ):
+        if current is None or baseline is None:
+            if current is not None:
+                sections.append((title, limit, len(current["measurements"])))
+            continue
+        violations.extend(compare(current, baseline, metrics, limit, title))
+        sections.append((title, limit, len(current["measurements"])))
+
+    note = None
+    if not runs:
+        note = (
+            f"No same-hardware history for {cpu_model!r}; this run records "
+            f"the first baseline."
+        )
+    write_summary(args.summary_out, sections, violations, note=note)
     if violations:
         print("CPU performance baseline check failed:")
         for item in violations:

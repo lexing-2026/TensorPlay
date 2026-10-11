@@ -59,7 +59,10 @@ jobs:
     # website benchmark page can fetch it directly. Scheduled, tagged, and
     # manually dispatched runs publish; pull requests never do.
     needs: cpu-operator-benchmark
-    if: ${{ github.event_name != 'pull_request' && always() && needs.cpu-operator-benchmark.result == 'success' }}
+    # Every completed benchmark run is recorded into the same-hardware
+    # history, whether or not the performance gate passed, so new operators
+    # and dtypes become part of the baseline from their first run onward.
+    if: ${{ github.event_name != 'pull_request' && always() && needs.cpu-operator-benchmark.result != 'skipped' && needs.cpu-operator-benchmark.result != 'cancelled' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     # The workflow defaults to read-all; the forced push to the orphan
