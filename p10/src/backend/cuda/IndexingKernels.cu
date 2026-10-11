@@ -20,7 +20,7 @@
 // indexing input cannot corrupt memory silently.  Negative values wrap into
 // range afterwards, matching advanced-indexing semantics.
 #define TP_INDEX_RANGE_GUARD(iv, row)                 \
-    if ((iv) < -(row) || (iv) >= (row)) { __trap(); } \
+    if ((iv) < -(row) || (iv) >= (row)) { TP_DEVICE_TRAP(); } \
     if ((iv) < 0) { (iv) += (row); }
 #include <string>
 

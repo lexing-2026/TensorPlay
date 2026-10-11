@@ -46,7 +46,7 @@ template <typename T>
 __global__ void assert_async_kernel_impl(const T* input, AssertMessage message) {
     if (input[0] == static_cast<T>(0)) {
         printf("%s\n", message.text);
-        __trap();
+        TP_DEVICE_TRAP();
     }
 }
 
@@ -56,7 +56,7 @@ __global__ void assert_async_complex_kernel_impl(
     if (static_cast<float>(input[0].real()) == 0.0f &&
         static_cast<float>(input[0].imag()) == 0.0f) {
         printf("%s\n", message.text);
-        __trap();
+        TP_DEVICE_TRAP();
     }
 }
 

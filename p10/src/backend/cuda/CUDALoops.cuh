@@ -61,6 +61,16 @@ constexpr int loop_block_work_size() {
 // an internal closure type whose call operator cannot be introspected.
 #define GPU_LAMBDA __host__ __device__
 
+// A device-side invariant violation faults the launch rather than returning,
+// so the failure surfaces at the next synchronisation instead of letting the
+// kernel carry on with a state it could not reach legitimately.  The fault
+// instruction is spelled differently by the two toolchains.
+#if defined(USE_ROCM)
+#define TP_DEVICE_TRAP() __builtin_trap()
+#else
+#define TP_DEVICE_TRAP() __trap()
+#endif
+
 inline void loop_launch_check(const char* what) {
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
