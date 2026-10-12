@@ -16,6 +16,25 @@ DEVICES = ['cpu', 'cuda'] if tp.cuda.is_available() else ['cpu']
 
 
 @pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('dtype', ['qint8', 'quint8', 'qint32'])
+def test_quantized_rectification_preserves_grid_and_codes(device, dtype):
+    codes = {'qint8': [-128, -12, -1, 0, 32, 127],
+             'quint8': [0, 12, 136, 137, 200, 255],
+             'qint32': [-2147483648, -12, 0, 12344, 12345, 2147483647]}[dtype]
+    zp = {'qint8': 5, 'quint8': 137, 'qint32': 12345}[dtype]
+    storage = {'qint8': 'int8', 'quint8': 'uint8', 'qint32': 'int32'}[dtype]
+    actual = tp._C._make_per_tensor_quantized_tensor(
+        tp.tensor(codes, dtype=getattr(tp, storage), device=device).reshape(2, 3), .03, zp).T
+    expected = torch._make_per_tensor_quantized_tensor(
+        torch.tensor(codes, dtype=getattr(torch, storage)).reshape(2, 3), .03, zp).T
+    output = nnq.ReLU()(actual)
+    np.testing.assert_array_equal(output.int_repr().cpu().numpy(), torch.relu(expected).int_repr().numpy())
+    np.testing.assert_array_equal(actual.int_repr().cpu().numpy(), expected.int_repr().numpy())
+    assert output.dtype == actual.dtype and output.q_scale() == .03 and output.q_zero_point() == zp
+    assert nnq.ReLU()(actual[:0]).shape == (0, 2)
+
+
+@pytest.mark.parametrize('device', DEVICES)
 @pytest.mark.parametrize('unsigned', [False, True])
 @pytest.mark.parametrize('K', [0, 3, 31, 32, 65])
 @pytest.mark.parametrize('relu', [False, True])

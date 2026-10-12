@@ -6,6 +6,14 @@
 namespace tensorplay::cuda {
 namespace {
 
+template<class T>
+__global__ void relu_codes(const T* input, T* output, int64_t size, int64_t zp) {
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < size; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        output[i] = static_cast<T>(static_cast<int64_t>(input[i]) < zp ? zp : input[i]);
+    }
+}
+
 __global__ void pack_codes(const int8_t* weight, int8_t* packed, int64_t* offsets,
                            int64_t N, int64_t K, int64_t padded_K) {
     const int64_t n = blockIdx.x;
@@ -126,6 +134,26 @@ void launch(const Tensor& x, const Tensor& columns, const Tensor& packed,
     else packed_gemm<int8_t,Y><<<grid, block, 0, stream>>>(columns.data_ptr<int8_t>(), packed.data_ptr<int8_t>(), offsets.data_ptr<int64_t>(), scales.data_ptr<float>(), zps.data_ptr<int64_t>(), bias ? bias->data_ptr<float>() : nullptr, out.data_ptr<Y>(), g, xs, xz, ys, yz, 0, relu, output_float);
 }
 } // namespace
+
+Tensor quantized_code_relu_cuda(const Tensor& input) {
+    CUDAGuard guard(input.device());
+    const int64_t zp = quantized::q_zero_point(input);
+    const Tensor x = input.contiguous();
+    Tensor out = Tensor::empty(input.shape(), input.dtype(), input.device());
+    if (input.numel()) {
+        const int blocks = static_cast<int>(std::min<int64_t>((input.numel() + 255) / 256, 65535));
+        const auto stream = getCurrentCUDAStream().stream();
+        switch (input.dtype()) {
+            case DType::QInt8: relu_codes<<<blocks,256,0,stream>>>(x.data_ptr<int8_t>(),out.data_ptr<int8_t>(),input.numel(),zp); break;
+            case DType::QUInt8: relu_codes<<<blocks,256,0,stream>>>(x.data_ptr<uint8_t>(),out.data_ptr<uint8_t>(),input.numel(),zp); break;
+            case DType::QInt32: relu_codes<<<blocks,256,0,stream>>>(x.data_ptr<int32_t>(),out.data_ptr<int32_t>(),input.numel(),zp); break;
+            default: TP_THROW(TypeError, "Rectification requires quantized integer input");
+        }
+        checkCuda(cudaGetLastError(), "Integer rectification");
+    }
+    out.impl()->set_quantizer(input.impl()->quantizer());
+    return out;
+}
 
 std::tuple<Tensor, Tensor> _quantized_weight_prepack_cuda(const Tensor& weight) {
     CUDAGuard guard(weight.device());

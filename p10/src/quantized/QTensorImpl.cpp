@@ -71,11 +71,9 @@ void validate_per_channel_qparams(const Tensor& scales,
                                            .contiguous();
         const float* zero_point_data = zero_points_cpu.data_ptr<float>();
         for (int64_t i = 0; i < zero_points_cpu.numel(); ++i) {
-            if (!std::isfinite(zero_point_data[i]) ||
-                zero_point_data[i] < static_cast<float>(range.first) ||
-                zero_point_data[i] > static_cast<float>(range.second)) {
+            if (!std::isfinite(zero_point_data[i])) {
                 TP_THROW(ValueError, op,
-                         ": zero_points are outside the quantized range");
+                         ": floating zero_points must be finite");
             }
         }
     } else {

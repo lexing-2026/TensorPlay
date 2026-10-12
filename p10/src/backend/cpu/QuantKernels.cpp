@@ -2314,10 +2314,23 @@ Tensor quantized_relu_cpu(const Tensor& self) {
     // On the affine grid the negative half-space is the code segment below
     // the zero point, so relu is an integer max against the zero point.
     const int64_t zp = quantized::q_zero_point(self);
-    return quantized_unary_code_cpu(
-        self, "quantized_relu", [zp](int8_t v) {
-            return static_cast<int8_t>(std::max<int64_t>(v, zp));
+    const Tensor input = self.contiguous();
+    Tensor out = Tensor::empty(self.shape(), self.dtype(), self.device());
+    auto apply = [&]<class T>() {
+        const T* x = input.data_ptr<T>();
+        T* y = out.data_ptr<T>();
+        parallel::parallel_for(0, self.numel(), 32768, [&](int64_t begin, int64_t end) {
+            for (int64_t i = begin; i < end; ++i) y[i] = static_cast<T>(std::max<int64_t>(x[i], zp));
         });
+    };
+    switch (self.dtype()) {
+        case DType::QInt8: apply.template operator()<int8_t>(); break;
+        case DType::QUInt8: apply.template operator()<uint8_t>(); break;
+        case DType::QInt32: apply.template operator()<int32_t>(); break;
+        default: TP_THROW(TypeError, "Rectification requires quantized integer input");
+    }
+    out.impl()->set_quantizer(self.impl()->quantizer());
+    return out;
 }
 
 Tensor quantized_relu6_cpu(const Tensor& self) {
