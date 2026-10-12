@@ -11,6 +11,9 @@
 #include "cpu/vec/vec.h"
 
 #include <cstdint>
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 
 namespace tensorplay {
 namespace cpu {
@@ -201,17 +204,70 @@ void sparse_addmm_kernel_impl(const Tensor& out, const Tensor& self,
             for (; j < N; ++j) {
                 out_row[j] = beta_v * self_row[j] + scale0 * dense0[j];
             }
-            for (int64_t e = row_start + 1; e < row_end; ++e) {
-                const scalar_t scale = alpha_v * value_data[e];
-                const scalar_t* dense_row = dense_data + col_data[e] * N;
+
+            // Process the remaining nonzeros in groups of four.  Fusing four
+            // sparse contributions per output pass quarters the L1 traffic on
+            // the output row and keeps four dense loads in flight.  The
+            // next group's leading dense row is prefetched while the current
+            // group is consumed, hiding the L3 latency of row switches.
+            int64_t e = row_start + 1;
+            for (; e + 3 < row_end; e += 4) {
+                const scalar_t s0 = alpha_v * value_data[e];
+                const scalar_t s1 = alpha_v * value_data[e + 1];
+                const scalar_t s2 = alpha_v * value_data[e + 2];
+                const scalar_t s3 = alpha_v * value_data[e + 3];
+                const scalar_t* d0 = dense_data + col_data[e] * N;
+                const scalar_t* d1 = dense_data + col_data[e + 1] * N;
+                const scalar_t* d2 = dense_data + col_data[e + 2] * N;
+                const scalar_t* d3 = dense_data + col_data[e + 3] * N;
+#if defined(__x86_64__) || defined(__i386__)
+                if (e + 4 < row_end) {
+                    _mm_prefetch(
+                        reinterpret_cast<const char*>(
+                            dense_data + col_data[e + 4] * N),
+                        _MM_HINT_T0);
+                }
+#endif
                 int64_t k = 0;
                 for (; k + vec_size <= N; k += vec_size) {
-                    (Vec::loadu(out_row + k) +
-                     Vec(scale) * Vec::loadu(dense_row + k))
+                    Vec acc = Vec::loadu(out_row + k);
+                    acc = acc + Vec(s0) * Vec::loadu(d0 + k);
+                    acc = acc + Vec(s1) * Vec::loadu(d1 + k);
+                    acc = acc + Vec(s2) * Vec::loadu(d2 + k);
+                    acc = acc + Vec(s3) * Vec::loadu(d3 + k);
+                    acc.store(out_row + k);
+                }
+                for (; k < N; ++k) {
+                    out_row[k] += s0 * d0[k] + s1 * d1[k] +
+                                  s2 * d2[k] + s3 * d3[k];
+                }
+            }
+            for (; e + 1 < row_end; e += 2) {
+                const scalar_t s0 = alpha_v * value_data[e];
+                const scalar_t s1 = alpha_v * value_data[e + 1];
+                const scalar_t* d0 = dense_data + col_data[e] * N;
+                const scalar_t* d1 = dense_data + col_data[e + 1] * N;
+                int64_t k = 0;
+                for (; k + vec_size <= N; k += vec_size) {
+                    Vec acc = Vec::loadu(out_row + k);
+                    acc = acc + Vec(s0) * Vec::loadu(d0 + k);
+                    acc = acc + Vec(s1) * Vec::loadu(d1 + k);
+                    acc.store(out_row + k);
+                }
+                for (; k < N; ++k) {
+                    out_row[k] += s0 * d0[k] + s1 * d1[k];
+                }
+            }
+            if (e < row_end) {
+                const scalar_t s = alpha_v * value_data[e];
+                const scalar_t* d = dense_data + col_data[e] * N;
+                int64_t k = 0;
+                for (; k + vec_size <= N; k += vec_size) {
+                    (Vec::loadu(out_row + k) + Vec(s) * Vec::loadu(d + k))
                         .store(out_row + k);
                 }
                 for (; k < N; ++k) {
-                    out_row[k] += scale * dense_row[k];
+                    out_row[k] += s * d[k];
                 }
             }
         }
