@@ -43,9 +43,17 @@ class _ConvNd(QuantizedState, nn.Module):
     def weight(self):
         return self._packed_params.weight
 
+    @weight.setter
+    def weight(self, value):
+        self.set_weight_bias(value, self.bias)
+
     @property
     def bias(self):
         return self._packed_params.bias
+
+    @bias.setter
+    def bias(self, value):
+        self.set_weight_bias(self.weight, value)
 
     @property
     def weight_scale(self):

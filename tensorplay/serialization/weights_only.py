@@ -17,6 +17,11 @@ class WeightsOnlyUnpickler(pickle.Unpickler):
         return self._persistent_load_fn(saved_id)
 
     def find_class(self, module, name):
+        from _compat_pickle import IMPORT_MAPPING, NAME_MAPPING
+        if (module, name) in NAME_MAPPING:
+            module, name = NAME_MAPPING[(module, name)]
+        elif module in IMPORT_MAPPING:
+            module = IMPORT_MAPPING[module]
         if module in {"os", "posix", "nt", "subprocess", "sys"}:
             raise pickle.UnpicklingError(
                 f"Unsupported global: GLOBAL {module}.{name} was not allowlisted"

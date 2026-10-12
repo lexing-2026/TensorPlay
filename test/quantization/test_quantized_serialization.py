@@ -70,21 +70,22 @@ def test_invalid_channel_metadata():
 
 
 @pytest.mark.parametrize('legacy', [False, True])
-def test_float_channel_grid_checkpoint(legacy):
+@pytest.mark.parametrize('device', DEVICES)
+def test_float_channel_grid_checkpoint(legacy, device):
     q = torch.quantize_per_channel(torch.randn(3, 4), torch.tensor([.1, .2, .3]),
                                    torch.tensor([.25, -.5, 1.75]), 0, torch.quint8)
     stream = io.BytesIO()
     torch.save(q, stream, _use_new_zipfile_serialization=not legacy)
     stream.seek(0)
-    actual = tp.load(stream)
+    actual = tp.load(stream, map_location=device)
     assert actual.qscheme() == tp.per_channel_affine_float_qparams
-    np.testing.assert_array_equal(actual.int_repr().numpy(), q.int_repr().numpy())
+    np.testing.assert_array_equal(actual.int_repr().cpu().numpy(), q.int_repr().numpy())
     stream = io.BytesIO()
     tp.save(actual, stream, _use_new_zipfile_serialization=not legacy)
     stream.seek(0)
     restored = tp.load(stream)
-    np.testing.assert_array_equal(restored.q_per_channel_zero_points().numpy(), q.q_per_channel_zero_points().numpy())
-    np.testing.assert_array_equal(restored.dequantize().numpy(), actual.dequantize().numpy())
+    np.testing.assert_array_equal(restored.q_per_channel_zero_points().cpu().numpy(), q.q_per_channel_zero_points().numpy())
+    np.testing.assert_array_equal(restored.dequantize().cpu().numpy(), actual.dequantize().cpu().numpy())
 
 
 class _QuantizedGridState:

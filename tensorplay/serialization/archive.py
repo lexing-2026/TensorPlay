@@ -619,9 +619,9 @@ class _ReaderState:
         self.swap_bytes = False
 
     def resolve_location(self, location: str):
-        from .common import resolve_map_location
+        from .common import resolve_restore_location
 
-        return resolve_map_location(self.map_location, location)
+        return resolve_restore_location(self.map_location, location)
 
 
 class _RootedZipReader:

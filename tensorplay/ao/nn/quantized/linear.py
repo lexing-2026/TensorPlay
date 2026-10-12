@@ -66,6 +66,8 @@ class QuantizedLinear(QuantizedState, nn.Module):
     def forward(self, x):
         if x.dtype == tp.int8:
             x = _C._make_per_tensor_quantized_tensor(x, self.input_scale, self.input_zero_point)
+        if x.dtype not in (tp.qint8, tp.quint8):
+            raise TypeError('Quantized linear requires signed or unsigned 8-bit quantized input')
         return self._packed_params.run(x, self.out_scale, self.out_zero_point, relu=self._FUSED_RELU)
 
     def extra_repr(self):

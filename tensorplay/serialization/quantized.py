@@ -12,7 +12,8 @@ def rebuild_quantized_tensor(codes, params):
         axis = int(axis)
         if not 0 <= axis < codes.dim():
             raise ValueError('Quantized checkpoint channel axis exceeds the tensor rank')
-        floating = scheme == 'per_channel_affine_float_qparams'
+        floating = (scheme == 'per_channel_affine_float_qparams' or
+                    isinstance(zero_points, tp.Tensor) and zero_points.is_floating_point())
         scales = tp.as_tensor(scales, dtype=tp.float32 if floating else tp.float64, device=codes.device)
         zero_points = tp.as_tensor(zero_points, dtype=tp.float32 if floating else tp.int64, device=codes.device)
         if scales.dim() != 1 or zero_points.dim() != 1 or scales.numel() != codes.size(axis) or zero_points.numel() != codes.size(axis):
