@@ -1,0 +1,212 @@
+#include "QuantPacked.h"
+#include "Dispatcher.h"
+#include "CUDARuntime.h"
+#include <cuda_runtime.h>
+
+namespace tensorplay::cuda {
+namespace {
+
+__global__ void pack_codes(const int8_t* weight, int8_t* packed, int64_t* offsets,
+                           int64_t N, int64_t K, int64_t padded_K) {
+    const int64_t n = blockIdx.x;
+    int64_t sum = 0;
+    for (int64_t k = threadIdx.x; k < padded_K; k += blockDim.x) {
+        const int8_t code = k < K ? weight[n * K + k] : 0;
+        packed[n * padded_K + k] = code;
+        sum += code;
+    }
+    __shared__ int64_t partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (int step = 128; step; step /= 2) {
+        if (threadIdx.x < step) partial[threadIdx.x] += partial[threadIdx.x + step];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) offsets[n] = partial[0];
+}
+
+template<class X>
+__global__ void make_columns(const X* input, int8_t* columns,
+                              quant::PackedDeviceGeometry g, int64_t xz, int shift) {
+    const int64_t total = g.groups * g.rows * g.padded_K;
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < total; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int64_t k = i % g.padded_K, row = (i / g.padded_K) % g.rows;
+        if (k >= g.K) { columns[i] = 0; continue; }
+        const int64_t group = i / (g.padded_K * g.rows);
+        int64_t kp = k % g.kernel_elements, pos = row % g.spatial;
+        int64_t index = 0, multiplier = 1;
+        bool inside = true;
+        for (int64_t d = g.rank - 1; d >= 0; --d) {
+            const int64_t coordinate = (pos % g.out[d]) * g.stride[d] - g.padding[d] + (kp % g.kernel[d]) * g.dilation[d];
+            pos /= g.out[d]; kp /= g.kernel[d];
+            inside = inside && coordinate >= 0 && coordinate < g.in[d];
+            index += coordinate * multiplier; multiplier *= g.in[d];
+        }
+        const int64_t channel = group * (g.channels / g.groups) + k / g.kernel_elements;
+        const int code = inside ? input[((row / g.spatial) * g.channels + channel) * g.input_spatial + index] : xz;
+        columns[i] = static_cast<int8_t>(code - shift);
+    }
+}
+
+__device__ int dot4(int a, int b, int acc) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+    return __dp4a(a, b, acc);
+#else
+    for (int s = 0; s < 32; s += 8) acc += static_cast<int8_t>(a >> s) * static_cast<int8_t>(b >> s);
+    return acc;
+#endif
+}
+
+template<class X, class Y>
+__global__ void packed_gemm(const X* input, const int8_t* weight,
+                            const int64_t* offsets, const float* scales, const int64_t* zps,
+                            const float* bias, Y* out, quant::PackedDeviceGeometry g,
+                            double xs, int64_t xz, double ys, int64_t yz,
+                            int shift, bool relu, bool output_float) {
+    __shared__ int8_t xtile[16][32];
+    __shared__ int8_t wtile[16][32];
+    const int64_t row = static_cast<int64_t>(blockIdx.y) * 16 + threadIdx.y;
+    const int64_t group = blockIdx.z;
+    const int64_t n_per_group = g.outputs / g.groups;
+    const int64_t local_n = static_cast<int64_t>(blockIdx.x) * 16 + threadIdx.x;
+    const int64_t n = group * n_per_group + local_n;
+    int64_t acc = 0, row_sum = 0;
+    for (int64_t k0 = 0; k0 < g.padded_K; k0 += 32) {
+        for (int j = 0; j < 2; ++j) {
+            const int64_t k = k0 + threadIdx.x + j * 16;
+            const int64_t xindex = g.linear ? row * g.K + k : (group * g.rows + row) * g.padded_K + k;
+            xtile[threadIdx.y][threadIdx.x + j * 16] = (row < g.rows && k < g.K)
+                ? static_cast<int8_t>(static_cast<int>(input[xindex]) - shift) : 0;
+            const int64_t wn = group * n_per_group + static_cast<int64_t>(blockIdx.x) * 16 + threadIdx.y;
+            wtile[threadIdx.y][threadIdx.x + j * 16] = (wn < (group + 1) * n_per_group)
+                ? weight[wn * g.padded_K + k] : 0;
+        }
+        __syncthreads();
+        int part = 0, sum = 0;
+#pragma unroll
+        for (int k = 0; k < 32; k += 4) {
+            const int a = *reinterpret_cast<const int*>(&xtile[threadIdx.y][k]);
+            const int b = *reinterpret_cast<const int*>(&wtile[threadIdx.x][k]);
+            part = dot4(a, b, part);
+            sum = dot4(a, 0x01010101, sum);
+        }
+        acc += part; row_sum += sum;
+        __syncthreads();
+    }
+    if (row >= g.rows || local_n >= n_per_group) return;
+    acc = acc - xz * offsets[n] - zps[n] * row_sum + g.K * xz * zps[n];
+    double value = static_cast<double>(acc) * xs * scales[n] + (bias ? bias[n] : 0.);
+    if (relu) value = fmax(value, 0.);
+    const int64_t index = g.linear ? row * g.outputs + n : ((row / g.spatial) * g.outputs + n) * g.spatial + row % g.spatial;
+    if (output_float) out[index] = static_cast<Y>(value);
+    else {
+        const double lo = std::is_same_v<Y, uint8_t> ? 0. : -128.;
+        out[index] = static_cast<Y>(fmin(lo + 255., fmax(lo, nearbyint(value / ys) + yz)));
+    }
+}
+
+template<class X, class Y>
+void launch(const Tensor& x, const Tensor& columns, const Tensor& packed,
+            const Tensor& offsets, const Tensor& scales, const Tensor& zps,
+            const std::optional<Tensor>& bias, Tensor& out,
+            const quant::PackedGeometry& g, double ys, int64_t yz, bool relu, bool output_float) {
+    const int shift = x.dtype() == DType::QUInt8 ? 128 : 0;
+    const int64_t xz = quantized::q_zero_point(x) - shift;
+    const double xs = quantized::q_scale(x);
+    const dim3 block(16, 16), grid((g.outputs / g.groups + 15) / 16, (g.rows + 15) / 16, g.groups);
+    const auto stream = getCurrentCUDAStream().stream();
+    if (g.linear) packed_gemm<X,Y><<<grid, block, 0, stream>>>(x.data_ptr<X>(), packed.data_ptr<int8_t>(), offsets.data_ptr<int64_t>(), scales.data_ptr<float>(), zps.data_ptr<int64_t>(), bias ? bias->data_ptr<float>() : nullptr, out.data_ptr<Y>(), g, xs, xz, ys, yz, shift, relu, output_float);
+    else packed_gemm<int8_t,Y><<<grid, block, 0, stream>>>(columns.data_ptr<int8_t>(), packed.data_ptr<int8_t>(), offsets.data_ptr<int64_t>(), scales.data_ptr<float>(), zps.data_ptr<int64_t>(), bias ? bias->data_ptr<float>() : nullptr, out.data_ptr<Y>(), g, xs, xz, ys, yz, 0, relu, output_float);
+}
+} // namespace
+
+std::tuple<Tensor, Tensor> _quantized_weight_prepack_cuda(const Tensor& weight) {
+    CUDAGuard guard(weight.device());
+    const auto [K, padded_K] = quant::packed_weight_shape(weight);
+    const Tensor w = weight.contiguous();
+    Tensor packed = Tensor::empty({weight.size(0), padded_K}, DType::Int8, weight.device());
+    Tensor offsets = Tensor::empty({weight.size(0)}, DType::Int64, weight.device());
+    if (weight.size(0)) pack_codes<<<weight.size(0), 256, 0, getCurrentCUDAStream().stream()>>>(w.data_ptr<int8_t>(), packed.data_ptr<int8_t>(), offsets.data_ptr<int64_t>(), weight.size(0), K, padded_K);
+    checkCuda(cudaGetLastError(), "Integer weight packing");
+    return {packed, offsets};
+}
+
+Tensor _quantized_packed_run_cuda(
+    const Tensor& input, const Tensor& packed, const Tensor& offsets,
+    const Tensor& scales, const Tensor& zero_points, const std::optional<Tensor>& bias,
+    const std::vector<int64_t>& weight_sizes, double output_scale, int64_t output_zero_point,
+    const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+    const std::vector<int64_t>& dilation, int64_t groups, bool relu, bool output_float) {
+    CUDAGuard guard(input.device());
+    const auto g = quant::packed_geometry(input, packed, offsets, scales, zero_points, bias,
+        weight_sizes, stride, padding, dilation, groups, output_scale, output_zero_point, output_float);
+    const Tensor x = input.contiguous();
+    const bool unsigned_input = input.dtype() == DType::QUInt8;
+    Tensor out = Tensor::empty(g.shape, output_float ? DType::Float32 : (unsigned_input ? DType::UInt8 : DType::Int8), input.device());
+    Tensor columns = Tensor::empty({0}, DType::Int8, input.device());
+    if (out.numel()) {
+        if (!g.linear && g.K) {
+            columns = Tensor::empty({g.groups, g.rows, g.padded_K}, DType::Int8, input.device());
+            const int blocks = static_cast<int>(std::min<int64_t>((columns.numel() + 255) / 256, 65535));
+            const auto stream = getCurrentCUDAStream().stream();
+            const int64_t xz = quantized::q_zero_point(input);
+            if (unsigned_input) make_columns<uint8_t><<<blocks,256,0,stream>>>(x.data_ptr<uint8_t>(), columns.data_ptr<int8_t>(), g, xz, 128);
+            else make_columns<int8_t><<<blocks,256,0,stream>>>(x.data_ptr<int8_t>(), columns.data_ptr<int8_t>(), g, xz, 0);
+        }
+        if (output_float) {
+            if (unsigned_input) launch<uint8_t,float>(x, columns, packed, offsets, scales, zero_points, bias, out, g, output_scale, output_zero_point, relu, true);
+            else launch<int8_t,float>(x, columns, packed, offsets, scales, zero_points, bias, out, g, output_scale, output_zero_point, relu, true);
+        } else if (unsigned_input) launch<uint8_t,uint8_t>(x, columns, packed, offsets, scales, zero_points, bias, out, g, output_scale, output_zero_point, relu, false);
+        else launch<int8_t,int8_t>(x, columns, packed, offsets, scales, zero_points, bias, out, g, output_scale, output_zero_point, relu, false);
+        checkCuda(cudaGetLastError(), "Packed integer compute");
+    }
+    if (output_float) return out;
+    return quantized::make_qtensor(out, make_per_tensor_affine_quantizer(output_scale, output_zero_point, input.dtype()), input.dtype());
+}
+
+template<class X>
+__global__ void bn_relu_codes(const X* x, X* out, const float* weight, const float* bias,
+                               const float* mean, const float* var, int64_t total, int64_t C,
+                               int64_t spatial, float eps, double xs, int64_t xz, double ys, int64_t yz) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int64_t c = (i / spatial) % C;
+    const float inv = 1.f / sqrtf(var[c] + eps);
+    const float gamma = weight ? weight[c] : 1.f;
+    const float alpha = inv * gamma * (xs / ys);
+    const float beta = ((bias ? bias[c] : 0.f) - mean[c] * inv * gamma) / ys;
+    const float value = fmaf(alpha, static_cast<float>(static_cast<int64_t>(x[i]) - xz), beta);
+    out[i] = static_cast<X>(fmin(std::is_same_v<X, uint8_t> ? 255. : 127.,
+                                fmax(static_cast<double>(yz), nearbyint(static_cast<double>(value)) + yz)));
+}
+
+Tensor quantized_batch_norm_relu_cuda(
+    const Tensor& input, const std::optional<Tensor>& weight, const std::optional<Tensor>& bias,
+    const Tensor& mean, const Tensor& var, double eps, double output_scale, int64_t output_zero_point) {
+    CUDAGuard guard(input.device());
+    quant::check_bn_relu(input, weight, bias, mean, var, eps, output_scale, output_zero_point);
+    const Tensor x = input.contiguous(), m = mean.contiguous(), v = var.contiguous();
+    const Tensor w = weight ? weight->contiguous() : Tensor(), b = bias ? bias->contiguous() : Tensor();
+    const bool unsigned_input = input.dtype() == DType::QUInt8;
+    Tensor out = Tensor::empty(input.shape(), unsigned_input ? DType::UInt8 : DType::Int8, input.device());
+    int64_t spatial = 1;
+    for (int64_t d = 2; d < input.dim(); ++d) spatial *= input.size(d);
+    if (input.numel()) {
+        const auto stream = getCurrentCUDAStream().stream();
+        const int blocks = static_cast<int>((input.numel() + 255) / 256);
+        const double xs = quantized::q_scale(input);
+        const int64_t xz = quantized::q_zero_point(input);
+        if (unsigned_input) bn_relu_codes<uint8_t><<<blocks,256,0,stream>>>(x.data_ptr<uint8_t>(), out.data_ptr<uint8_t>(), weight ? w.data_ptr<float>() : nullptr, bias ? b.data_ptr<float>() : nullptr, m.data_ptr<float>(), v.data_ptr<float>(), input.numel(), input.size(1), spatial, eps, xs, xz, output_scale, output_zero_point);
+        else bn_relu_codes<int8_t><<<blocks,256,0,stream>>>(x.data_ptr<int8_t>(), out.data_ptr<int8_t>(), weight ? w.data_ptr<float>() : nullptr, bias ? b.data_ptr<float>() : nullptr, m.data_ptr<float>(), v.data_ptr<float>(), input.numel(), input.size(1), spatial, eps, xs, xz, output_scale, output_zero_point);
+        checkCuda(cudaGetLastError(), "Fused normalization rectifier");
+    }
+    return quantized::make_qtensor(out, make_per_tensor_affine_quantizer(output_scale, output_zero_point, input.dtype()), input.dtype());
+}
+
+TENSORPLAY_LIBRARY_IMPL(CUDA, QuantPacked) {
+    m.impl("quantized_batch_norm_relu", quantized_batch_norm_relu_cuda);
+    m.impl("_quantized_weight_prepack", _quantized_weight_prepack_cuda);
+    m.impl("_quantized_packed_run", _quantized_packed_run_cuda);
+}
+} // namespace tensorplay::cuda

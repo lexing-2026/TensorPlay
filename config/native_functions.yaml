@@ -11664,3 +11664,12 @@
   variants: function
 - func: _propagate_xla_data(Tensor input, Tensor output) -> ()
   variants: function
+
+- func: _quantized_weight_prepack(Tensor weight) -> (Tensor packed, Tensor offsets)
+  variants: function
+
+- func: _quantized_packed_run(Tensor input, Tensor packed, Tensor offsets, Tensor scales, Tensor zero_points, Tensor? bias, int[] weight_sizes, float output_scale, int output_zero_point, int[] stride=[], int[] padding=[], int[] dilation=[], int groups=1, bool relu=False, bool output_float=False) -> Tensor
+  variants: function
+
+- func: quantized_batch_norm_relu(Tensor input, Tensor? weight, Tensor? bias, Tensor mean, Tensor var, float eps, float output_scale, int output_zero_point) -> Tensor
+  variants: function

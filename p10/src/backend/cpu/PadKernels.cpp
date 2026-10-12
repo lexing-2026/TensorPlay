@@ -277,6 +277,12 @@ Tensor pad_mode_forward(const Tensor& self, const std::vector<int64_t>& pad, Pad
     PadNdPlan p = pad_plan(src, pad);
     Tensor out = Tensor::empty(p.dst_sizes, src.dtype(), src.device());
     switch (src.dtype()) {
+        case DType::Int8:
+            pad_gather_dispatch<int8_t>(src.data_ptr<int8_t>(), out.data_ptr<int8_t>(), p, mode);
+            break;
+        case DType::UInt8:
+            pad_gather_dispatch<uint8_t>(src.data_ptr<uint8_t>(), out.data_ptr<uint8_t>(), p, mode);
+            break;
         case DType::Float32:
             pad_gather_dispatch<float>(src.data_ptr<float>(), out.data_ptr<float>(), p, mode);
             break;
@@ -291,7 +297,7 @@ Tensor pad_mode_forward(const Tensor& self, const std::vector<int64_t>& pad, Pad
                                           mode);
             break;
         default:
-            TP_THROW(NotImplementedError, "non-constant padding only supports floating dtypes");
+            TP_THROW(NotImplementedError, "non-constant padding requires floating or 8-bit integer storage");
     }
     return out;
 }
