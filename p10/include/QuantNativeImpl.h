@@ -8,6 +8,8 @@
 #include <numeric>
 #ifdef TP_QUANT_CUDA
 #include "CUDARuntime.h"
+#include "CUDAContext.h"
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 #define TP_QN_DEVICE __device__
 #define TP_QN_DETAIL cuda_native
@@ -513,12 +515,49 @@ Tensor fp16_linear(const Tensor& input, const Tensor& weight, const std::optiona
     const float* px = x.data_ptr<float>(); const Half* pw = w.data_ptr<Half>();
     const float* pb = bias ? b.data_ptr<float>() : nullptr; float* py = y.data_ptr<float>();
 #ifdef TP_QUANT_CUDA
-    apply(y.numel(), [=] TP_QN_DEVICE (int64_t i) {
-        float sum = 0;
-        for (int64_t j = 0; j < k; ++j) sum += px[i / n * k + j] * static_cast<float>(pw[i % n * k + j]);
-        if (pb) sum += pb[i % n];
-        py[i] = relu ? ::fmaxf(sum, 0.f) : sum;
-    });
+    if (y.numel() && k>0) {
+        const int64_t rows=x.numel()/k;
+        TP_CHECK(rows<=2147483647 && n<=2147483647 && k<=2147483647, "Half linear matrix dimensions exceed the BLAS index range");
+        struct WideWeight { Tensor source,wide; uint32_t version=0; uintptr_t stream=0; };
+        thread_local std::array<WideWeight,16> cache;
+        thread_local size_t next=0;
+        const auto stream=tensorplay::cuda::getCurrentCUDAStream().stream();
+        const uintptr_t stream_key=reinterpret_cast<uintptr_t>(stream);
+        Tensor wide;
+        for (const auto& entry:cache) {
+            if (entry.source.defined() && weight.impl()->version_counter().is_enabled() && entry.source.impl()==weight.impl() &&
+                entry.version==weight._version() && entry.stream==stream_key) { wide=entry.wide; break; }
+        }
+        if (!wide.defined()) {
+            wide=w.to(DType::Float32);
+            if (weight.impl()->version_counter().is_enabled() && wide.numel()<=1024*1024) cache[next++%cache.size()]={weight,wide,weight._version(),stream_key};
+        }
+        const auto handle=tensorplay::cuda::CUDAContext::getCublasHandle();
+        auto checked=[](cublasStatus_t status) {
+            TP_CHECK(status==CUBLAS_STATUS_SUCCESS, "Half linear BLAS call failed with status ",static_cast<int>(status));
+        };
+        struct RestoreMode {
+            cublasHandle_t handle; cublasMath_t math=CUBLAS_DEFAULT_MATH; cublasPointerMode_t pointer=CUBLAS_POINTER_MODE_HOST;
+            ~RestoreMode() { cublasSetMathMode(handle,math); cublasSetPointerMode(handle,pointer); }
+        } restore{handle};
+        checked(cublasGetMathMode(handle,&restore.math));
+        checked(cublasGetPointerMode(handle,&restore.pointer));
+        checked(cublasSetStream(handle,stream));
+        checked(cublasSetMathMode(handle,CUBLAS_PEDANTIC_MATH));
+        checked(cublasSetPointerMode(handle,CUBLAS_POINTER_MODE_HOST));
+        const float alpha=1.f,beta=0.f;
+        checked(cublasSgemm(handle,CUBLAS_OP_T,CUBLAS_OP_N,n,rows,k,&alpha,
+            wide.data_ptr<float>(),k,px,k,&beta,py,n));
+        if (pb || relu) apply(y.numel(), [=] TP_QN_DEVICE (int64_t i) {
+            const float value=py[i]+(pb ? pb[i%n] : 0.f);
+            py[i]=relu ? ::fmaxf(value,0.f) : value;
+        });
+    } else {
+        apply(y.numel(), [=] TP_QN_DEVICE (int64_t i) {
+            const float value=pb ? pb[i%n] : 0.f;
+            py[i]=relu ? ::fmaxf(value,0.f) : value;
+        });
+    }
 #else
     parallel::parallel_for(0, y.numel(), std::max<int64_t>(1, 32768 / std::max<int64_t>(k, 1)), [&](int64_t first, int64_t last) {
         tensorplay::cpu::quantized_fp16_linear_stub(DeviceType::CPU, px, pw, pb, py, first, last, n, k, relu);
@@ -540,6 +579,38 @@ Tensor max_pool(const Tensor& input,const std::vector<int64_t>& kernel,const std
 }
 #endif
 
+#ifndef TP_QUANT_CUDA
+Tensor int4_prepack(const Tensor& input, int64_t inner_tiles) {
+    TP_CHECK(input.dim()==2 && input.dtype()==DType::Int32, "Int4 packing requires an integer matrix");
+    TP_CHECK(input.size(0)%16==0 && input.size(1)%2==0, "Int4 packing requires output channels divisible by sixteen and an even feature count");
+    const Tensor x=input.contiguous();
+    Tensor y=Tensor::empty({input.size(0),input.size(1)/2},DType::UInt8,input.device());
+    cpu::quantized_int4_pack_stub(DeviceType::CPU,x.data_ptr<int32_t>(),y.data_ptr<uint8_t>(),input.size(0),input.size(1));
+    return y;
+}
+
+Tensor int4_mm(const Tensor& input,const Tensor& weight,int64_t group,const Tensor& parameters) {
+    TP_CHECK(input.dim()==2 && (input.dtype()==DType::Float32 || input.dtype()==DType::Float16 || input.dtype()==DType::BFloat16) && input.is_contiguous(),
+        "Int4 multiplication requires a contiguous floating matrix");
+    TP_CHECK(weight.dim()==2 && weight.dtype()==DType::UInt8 && weight.is_contiguous() && weight.device()==input.device(),
+        "Int4 weights must be a contiguous unsigned byte matrix on the input device");
+    const int64_t m=input.size(0),n=weight.size(0),k=input.size(1);
+    TP_CHECK(weight.size(1)==k/2 && k%2==0 && n%16==0, "Int4 packed weight dimensions do not match the input");
+    TP_CHECK((group==32 || group==64 || group==128 || group==256) && k%group==0, "Int4 group size must divide the feature count and be thirty two, sixty four, one hundred twenty eight or two hundred fifty six");
+    TP_CHECK(parameters.dim()==3 && parameters.size(0)==k/group && parameters.size(1)==n && parameters.size(2)==2 && parameters.dtype()==input.dtype() && parameters.device()==input.device(),
+        "Int4 parameters must contain scale and zero per feature group and output channel");
+    const Tensor params=parameters.contiguous();
+    Tensor y=Tensor::empty({m,n},input.dtype(),input.device());
+    cpu::quantized_int4_mm_stub(DeviceType::CPU,input.data_ptr(),weight.data_ptr<uint8_t>(),params.data_ptr(),y.data_ptr(),input.dtype(),m,n,k,group);
+    return y;
+}
+
+Tensor int4_mm_tensor_group(const Tensor& input,const Tensor& weight,const Tensor& group,const Tensor& parameters) {
+    TP_CHECK(group.numel()==1 && group.dtype()==DType::Int64, "Int4 group size must be one signed sixty four bit integer");
+    return int4_mm(input,weight,group.item<int64_t>(),parameters);
+}
+#endif
+
 } // namespace TP_QN_DETAIL
 } // namespace tensorplay::quant
 #include "QuantEmbeddingImpl.h"
@@ -547,6 +618,7 @@ Tensor max_pool(const Tensor& input,const std::vector<int64_t>& kernel,const std
 #include "QuantRecurrentImpl.h"
 #include "QuantResizeImpl.h"
 #include "QuantBatchNormImpl.h"
+#include "QuantWrappedImpl.h"
 namespace tensorplay::quant {
 
 Tensor TP_QN_NAME(batch_norm)(const Tensor& input, const std::optional<Tensor>& weight,
@@ -582,7 +654,30 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, QuantNative) {
     m.impl("quantized_max_pool3d", TP_QN_DETAIL::max_pool);
 #else
 TENSORPLAY_LIBRARY_IMPL(CPU, QuantNative) {
+    m.impl("fbgemm_pack_quantized_matrix.KN", TP_QN_DETAIL::legacy_integer_pack_sizes);
+    m.impl("fbgemm_pack_gemm_matrix_fp16", TP_QN_DETAIL::wrapped_half_prepack);
+    m.impl("fbgemm_linear_fp16_weight_fp32_activation", TP_QN_DETAIL::legacy_half_linear);
+    m.impl("fbgemm_linear_fp16_weight_fp32_activation.out", TP_QN_DETAIL::legacy_half_linear_out);
+    m.impl("fbgemm_linear_fp16_weight", TP_QN_DETAIL::legacy_half_linear_bias);
+    m.impl("fbgemm_linear_fp16_weight.out", TP_QN_DETAIL::legacy_half_linear_bias_out);
+    m.impl("fbgemm_pack_quantized_matrix", TP_QN_DETAIL::legacy_integer_pack);
+    m.impl("fbgemm_linear_quantize_weight", TP_QN_DETAIL::legacy_quantize_weight);
+    m.impl("fbgemm_linear_int8_weight_fp32_activation", TP_QN_DETAIL::legacy_integer_linear);
+    m.impl("fbgemm_linear_int8_weight", TP_QN_DETAIL::legacy_integer_linear);
+    m.impl("quantized_lstm_cell", TP_QN_DETAIL::legacy_lstm_cell);
+    m.impl("quantized_gru_cell", TP_QN_DETAIL::legacy_gru_cell);
+    m.impl("quantized_rnn_relu_cell", TP_QN_DETAIL::legacy_relu_cell);
+    m.impl("quantized_rnn_tanh_cell", TP_QN_DETAIL::legacy_tanh_cell);
+    m.impl("_wrapped_linear_prepack", TP_QN_DETAIL::wrapped_prepack);
+    m.impl("_wrapped_quantized_linear_prepacked", TP_QN_DETAIL::wrapped_linear_prepacked);
+    m.impl("_quantized_wrapped_linear", TP_QN_DETAIL::wrapped_linear);
+    m.impl("_quantized_wrapped_half_prepack", TP_QN_DETAIL::wrapped_half_prepack);
+    m.impl("_quantized_wrapped_half_linear", TP_QN_DETAIL::wrapped_half_linear);
+    m.impl("_convert_weight_to_int4pack_for_cpu", TP_QN_DETAIL::int4_prepack);
+    m.impl("_weight_int4pack_mm_for_cpu", TP_QN_DETAIL::int4_mm);
+    m.impl("_quantized_int4_mm", TP_QN_DETAIL::int4_mm_tensor_group);
 #endif
+    m.impl("_quantized_recurrent_step", TP_QN_DETAIL::recurrent_step_checked);
     m.impl("_quantized_recurrent_cell", TP_QN_DETAIL::recurrent_cell);
     m.impl("_quantized_recurrent", TP_QN_DETAIL::recurrent);
     m.impl("quantized_convolution", TP_QN_DETAIL::convolution);

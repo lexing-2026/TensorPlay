@@ -3,6 +3,7 @@
 #include "cpu/vec/vec_convert.h"
 #include "QuantElementwise.h"
 #include "QuantRowwise.h"
+#include "Parallel.h"
 #ifndef CPU_CAPABILITY_AVX512
 #include "cpu/vec/vec256/vec256_qint.h"
 #endif
@@ -10,6 +11,91 @@
 namespace tensorplay::cpu {
 inline namespace CPU_CAPABILITY {
 namespace {
+constexpr int int4_columns = vec::Vectorized<float>::size() * 4;
+
+void int4_pack_impl(const int32_t* src, uint8_t* dst, int64_t n, int64_t k) {
+    const int64_t blocks = (n + int4_columns - 1) / int4_columns;
+    parallel::parallel_for(0, blocks, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t block = begin; block < end; ++block) {
+            const int64_t first = block * int4_columns;
+            const int64_t width = std::min<int64_t>(int4_columns, n-first);
+            for (int64_t feature = 0; feature < k; ++feature)
+                for (int64_t lane = 0; lane < width/2; ++lane) {
+#if defined(CPU_CAPABILITY_AVX2) || defined(CPU_CAPABILITY_AVX512)
+                    const int64_t low = width == int4_columns ? lane : lane*2;
+                    const int64_t high = width == int4_columns ? lane+width/2 : lane*2+1;
+#else
+                    const int64_t low = lane*2, high = lane*2+1;
+#endif
+                    dst[first*k/2 + feature*width/2 + lane] =
+                        static_cast<uint8_t>(src[(first+low)*k+feature]) |
+                        (static_cast<uint8_t>(src[(first+high)*k+feature]) << 4);
+                }
+        }
+    });
+}
+
+template<class T>
+void int4_mm_codes(const T* x, const uint8_t* packed, const T* params, T* output,
+        int64_t m, int64_t n, int64_t k, int64_t group) {
+    using FV = vec::Vectorized<float>;
+    constexpr int lanes = FV::size(), columns = int4_columns;
+    const int64_t nb = (n+columns-1)/columns, mb = (m+3)/4;
+    parallel::parallel_for(0, mb*nb, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t task = begin; task < end; ++task) {
+            const int64_t row = task/nb*4, first = task%nb*columns;
+            const int width = std::min<int64_t>(columns,n-first), rows = std::min<int64_t>(4,m-row);
+            const int vectors = (width+lanes-1)/lanes;
+            FV acc[4][4];
+            for (int r=0;r<rows;++r) for (int c=0;c<vectors;++c) acc[r][c]=FV(0.f);
+            FV scales[4], zeros[4];
+            for (int64_t feature=0;feature<k;++feature) {
+                if (feature%group==0) {
+                    for (int c=0;c<vectors;++c) {
+                        alignas(64) float s[lanes]{}, z[lanes]{};
+                        for (int lane=0;lane<lanes && c*lanes+lane<width;++lane) {
+                            const int64_t index=(feature/group*n+first+c*lanes+lane)*2;
+                            s[lane]=static_cast<float>(params[index]); z[lane]=static_cast<float>(params[index+1]);
+                        }
+                        scales[c]=FV::loadu(s); zeros[c]=FV::loadu(z);
+                    }
+                }
+                for (int c=0;c<vectors;++c) {
+                    alignas(64) float codes[lanes]{};
+                    for (int lane=0;lane<lanes && c*lanes+lane<width;++lane) {
+                        const int col=c*lanes+lane;
+#if defined(CPU_CAPABILITY_AVX2) || defined(CPU_CAPABILITY_AVX512)
+                        const int byte=width==columns ? col%(width/2) : col/2;
+                        const int shift=width==columns ? (col>=width/2)*4 : (col%2)*4;
+#else
+                        const int byte=col/2, shift=(col%2)*4;
+#endif
+                        codes[lane]=static_cast<float>(((packed[first*k/2+feature*width/2+byte]>>shift)&15)-8);
+                    }
+                    const FV weight=vec::fmadd(FV::loadu(codes),scales[c],zeros[c]);
+                    for (int r=0;r<rows;++r)
+                        acc[r][c]=vec::fmadd(FV(static_cast<float>(x[(row+r)*k+feature])),weight,acc[r][c]);
+                }
+            }
+            for (int r=0;r<rows;++r) for (int c=0;c<vectors;++c) {
+                alignas(64) float values[lanes]; acc[r][c].store(values);
+                for (int lane=0;lane<lanes && c*lanes+lane<width;++lane)
+                    output[(row+r)*n+first+c*lanes+lane]=static_cast<T>(values[lane]);
+            }
+        }
+    });
+}
+
+void int4_mm_impl(const void* x, const uint8_t* packed, const void* params, void* output,
+        DType dtype, int64_t m, int64_t n, int64_t k, int64_t group) {
+    switch (dtype) {
+        case DType::Float32: int4_mm_codes(static_cast<const float*>(x),packed,static_cast<const float*>(params),static_cast<float*>(output),m,n,k,group); break;
+        case DType::Float16: int4_mm_codes(static_cast<const Half*>(x),packed,static_cast<const Half*>(params),static_cast<Half*>(output),m,n,k,group); break;
+        case DType::BFloat16: int4_mm_codes(static_cast<const BFloat16*>(x),packed,static_cast<const BFloat16*>(params),static_cast<BFloat16*>(output),m,n,k,group); break;
+        default: break;
+    }
+}
+
 template<class Q>
 void batch_norm_codes(const void* xx, void* yy, int64_t channels,
         const float* alpha, const float* beta, int64_t xz, int64_t yz, bool relu) {
@@ -211,6 +297,8 @@ void embedding_impl(const uint8_t* w, const int64_t* indices, const int64_t* off
 }
 
 #ifndef CPU_CAPABILITY_AVX512
+REGISTER_DISPATCH(quantized_int4_pack_stub, &int4_pack_impl);
+REGISTER_DISPATCH(quantized_int4_mm_stub, &int4_mm_impl);
 REGISTER_DISPATCH(quantized_batch_norm_stub, &batch_norm_impl);
 REGISTER_DISPATCH(quantized_bilinear_stub, &bilinear_impl);
 REGISTER_DISPATCH(quantized_clip_stub, &clip_impl);
@@ -219,6 +307,8 @@ REGISTER_DISPATCH(quantized_binary_stub, &binary_impl);
 REGISTER_DISPATCH(quantized_embedding_stub, &embedding_impl);
 REGISTER_DISPATCH(quantized_fp16_linear_stub, &fp16_linear_impl);
 #else
+ALSO_REGISTER_AVX512_DISPATCH(quantized_int4_pack_stub, &int4_pack_impl);
+ALSO_REGISTER_AVX512_DISPATCH(quantized_int4_mm_stub, &int4_mm_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_batch_norm_stub, &batch_norm_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_bilinear_stub, &bilinear_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_clip_stub, &clip_impl);

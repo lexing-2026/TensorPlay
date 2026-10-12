@@ -416,3 +416,101 @@ def test_batch_norm_all_grids_ranks_and_empty(device, dtype, zp, rank, relu, emp
         assert actual.is_contiguous(memory_format=tp.channels_last if rank == 4 else tp.channels_last_3d)
     with pytest.raises(Exception):
         getattr(tp.ops.quantized, name)(x, None, native[1], native[2], native[3], 1e-5, .07, zp)
+
+
+@pytest.mark.parametrize('dtype', ['float32', 'float16', 'bfloat16'])
+@pytest.mark.parametrize('channels', [16, 32, 48, 64, 80])
+@pytest.mark.parametrize('group', [32, 64, 128, 256])
+def test_native_int4_packed_layout_and_multiply(dtype, channels, group):
+    rng = np.random.default_rng(124)
+    features = group*2
+    codes = rng.integers(0, 16, size=(channels, features), dtype='int32')
+    packed = tp._C._convert_weight_to_int4pack_for_cpu(tp.tensor(codes), 2)
+    expected_packed = torch._convert_weight_to_int4pack_for_cpu(torch.tensor(codes), 2)
+    np.testing.assert_array_equal(packed.numpy(), expected_packed.numpy())
+    data = rng.normal(0, .2, size=(5, features)).astype('float32')
+    params = rng.uniform(-.05, .05, size=(2, channels, 2)).astype('float32')
+    x = tp.tensor(data, dtype=getattr(tp, dtype))
+    r = torch.tensor(data, dtype=getattr(torch, dtype))
+    p = tp.tensor(params, dtype=getattr(tp, dtype))
+    rp = torch.tensor(params, dtype=getattr(torch, dtype))
+    actual = tp.ops.quantized.int4mm_packed_weight_cpu(x, packed, tp.tensor(group), p)
+    expected = torch.ops.quantized.int4mm_packed_weight_cpu(r, expected_packed, torch.tensor(group), rp)
+    atol, rtol = {'float32': (2e-5, 2e-5), 'float16': (2e-4, 2e-3), 'bfloat16': (2e-3, 2e-2)}[dtype]
+    np.testing.assert_allclose(actual.float().numpy(), expected.float().numpy(), atol=atol, rtol=rtol)
+
+
+def test_wrapped_native_integer_linear_and_persistent_payload():
+    rng = np.random.default_rng(125)
+    x = rng.uniform(-1, 1, size=(3, 37)).astype('float32')
+    w = rng.uniform(-1, 1, size=(11, 37)).astype('float32')
+    b = rng.normal(0, .1, size=11).astype('float32')
+    native = [tp.tensor(v) for v in (x, .03, 61, w, .03, 0, b, .07, 117)]
+    reference = [torch.tensor(v) for v in (x, .03, 61, w, .03, 0, b, .07, 117)]
+    actual = tp.ops._quantized.wrapped_quantized_linear(*native, 11)
+    expected = torch.ops._quantized.wrapped_quantized_linear(*reference, 11)
+    np.testing.assert_allclose(actual.numpy(), expected.numpy(), atol=.07, rtol=0)
+    packed = tp.ops._quantized._wrapped_linear_prepack(*native[3:7])
+    assert isinstance(packed, tp.Tensor) and packed.dtype == tp.uint8
+    stream = io.BytesIO(); tp.save(packed, stream); stream.seek(0)
+    loaded = tp.load(stream, weights_only=False)
+    output = tp.ops._quantized._wrapped_quantized_linear_prepacked(*native[:3], loaded, *native[7:], 11)
+    np.testing.assert_array_equal(output.numpy(), actual.numpy())
+
+
+def test_wrapped_native_half_linear_and_legacy_rejection():
+    rng = np.random.default_rng(126)
+    x = rng.normal(0, .2, size=(3, 37)).astype('float32')
+    w = rng.normal(0, .2, size=(11, 37)).astype('float32')
+    b = rng.normal(0, .1, size=11).astype('float32')
+    packed = tp.ops._quantized.wrapped_fbgemm_pack_gemm_matrix_fp16(tp.tensor(w))
+    rp = torch.ops._quantized.wrapped_fbgemm_pack_gemm_matrix_fp16(torch.tensor(w))
+    actual = tp.ops._quantized.wrapped_fbgemm_linear_fp16_weight(tp.tensor(x), packed, tp.tensor(b), 11)
+    expected = torch.ops._quantized.wrapped_fbgemm_linear_fp16_weight(torch.tensor(x), rp, torch.tensor(b), 11)
+    np.testing.assert_allclose(actual.numpy(), expected.numpy(), atol=2e-5, rtol=2e-5)
+    for name in ('linear_prepack_legacy', 'linear_prepack_fp16_legacy'):
+        with pytest.raises(RuntimeError):
+            getattr(tp.ops.quantized, name)(tp.tensor(w))
+    for name in ('linear_unpack', 'linear_unpack_fp16'):
+        with pytest.raises(RuntimeError):
+            getattr(tp.ops.quantized, name).legacy(packed)
+
+
+@pytest.mark.parametrize('mode,name,gates', [(0, 'rnn_relu', 1), (1, 'rnn_tanh', 1), (2, 'lstm', 4), (3, 'gru', 3)])
+def test_dynamic_cell_uses_persistent_packed_parameters(mode, name, gates):
+    rng = np.random.default_rng(127)
+    x = rng.normal(0, .2, size=(3, 7)).astype('float32')
+    h = rng.normal(0, .2, size=(3, 5)).astype('float32')
+    c = rng.normal(0, .2, size=(3, 5)).astype('float32')
+    wi, ri = pair(rng.integers(-50, 51, size=(gates*5, 7)), 'int8', 'cpu', scale=.005, zp=0)
+    wh, rh = pair(rng.integers(-50, 51, size=(gates*5, 5)), 'int8', 'cpu', scale=.005, zp=0)
+    bi = rng.normal(0, .1, size=gates*5).astype('float32')
+    bh = rng.normal(0, .1, size=gates*5).astype('float32')
+    pi = tp.ops.quantized.linear_prepack(wi, tp.tensor(bi))
+    ph = tp.ops.quantized.linear_prepack(wh, tp.tensor(bh))
+    rp = torch.ops.quantized.linear_prepack(ri, torch.tensor(bi))
+    rq = torch.ops.quantized.linear_prepack(rh, torch.tensor(bh))
+    hx = [tp.tensor(h), tp.tensor(c)] if mode == 2 else tp.tensor(h)
+    rx = [torch.tensor(h), torch.tensor(c)] if mode == 2 else torch.tensor(h)
+    op = 'quantized_' + name + '_cell_dynamic'
+    actual = getattr(tp.ops.quantized, op)(tp.tensor(x), hx, pi, ph, tp.tensor(bi), tp.tensor(bh))
+    expected = getattr(torch.ops.quantized, op)(torch.tensor(x), rx, rp, rq, torch.tensor(bi), torch.tensor(bh))
+    for a, b in zip(actual if mode == 2 else [actual], expected if mode == 2 else [expected]):
+        np.testing.assert_allclose(a.numpy(), b.numpy(), atol=2e-6, rtol=2e-5)
+    params = tp.ops.quantized.make_quantized_cell_params_dynamic(pi, ph, tp.tensor(bi), tp.tensor(bh), True)
+    np.testing.assert_array_equal(params.linear_ih(tp.tensor(x)).numpy(), pi.run(
+        tp.quantize_per_tensor_dynamic(tp.tensor(x), tp.quint8, True), output_float=True).numpy())
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_half_linear_cache_invalidates_after_weight_mutation(device):
+    rng = np.random.default_rng(128)
+    data = rng.normal(0, .2, size=(7, 37)).astype('float32')
+    raw = rng.normal(0, .2, size=(19, 37)).astype('float32')
+    x = tp.tensor(data, device=device)
+    weight = tp._C._quantized_fp16_prepack(tp.tensor(raw, device=device))
+    for factor in (1., -1.):
+        weight.copy_(tp.tensor(raw*factor, device=device, dtype=tp.float16))
+        actual = tp._C._quantized_fp16_linear(x, weight, None)
+        expected = torch.nn.functional.linear(torch.tensor(data), torch.tensor(raw*factor).half().float())
+        np.testing.assert_allclose(actual.cpu().numpy(), expected.numpy(), atol=2e-6, rtol=2e-5)

@@ -11726,3 +11726,18 @@
   variants: function
 - func: _quantized_recurrent(Tensor input, Tensor hidden, Tensor? cell, Tensor[] weights, Tensor[] biases, int num_layers, float dropout, bool training, bool bidirectional, bool batch_first, int mode, bool reduce_range=True, Tensor? batch_sizes=None) -> (Tensor, Tensor, Tensor)
   variants: function
+
+- func: _quantized_int4_mm(Tensor input, Tensor weight, Tensor group_size, Tensor scale_and_zero) -> Tensor
+  variants: function
+
+- func: _quantized_wrapped_linear(Tensor input, Tensor input_scale, Tensor input_zero_point, Tensor weight, Tensor weight_scale, Tensor weight_zero_point, Tensor bias, Tensor output_scale, Tensor output_zero_point, int out_channels) -> Tensor
+  variants: function
+
+- func: _quantized_wrapped_half_prepack(Tensor weight) -> Tensor
+  variants: function
+
+- func: _quantized_wrapped_half_linear(Tensor input, Tensor weight, Tensor bias, int out_channels) -> Tensor
+  variants: function
+
+- func: _quantized_recurrent_step(Tensor input_gates, Tensor hidden_gates, Tensor hidden, Tensor? cell, int mode) -> (Tensor, Tensor)
+  variants: function

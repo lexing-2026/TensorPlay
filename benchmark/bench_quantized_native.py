@@ -6,6 +6,9 @@ from pathlib import Path
 import platform
 import statistics
 import subprocess
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import time
 import numpy as np
 import torch
@@ -80,6 +83,18 @@ def run(device,repetitions):
             reference=lambda:torch.quantize_per_tensor(torch.nn.functional.linear(rx,weight,rb),.2,119,torch.quint8)
             kind='floating'
         record('linear',(m,n,k),native,reference,kind)
+    if device=='cuda':
+        for m,n,k in ((1,512,1024),(32,256,512),(256,512,1024)):
+            codes=rng.integers(-63,64,size=(m,k),dtype='int8')
+            weights=rng.integers(-63,64,size=(n,k),dtype='int8')
+            x=tp._C._make_per_tensor_quantized_tensor(tp.tensor(codes,device=device),.03,0)
+            r=torch._make_per_tensor_quantized_tensor(torch.tensor(codes,device=device),.03,0)
+            w=tp._C._make_per_tensor_quantized_tensor(tp.tensor(weights,device=device),.02,0)
+            rw=torch._make_per_tensor_quantized_tensor(torch.tensor(weights,device=device),.02,0)
+            packed=PackedWeight(w)
+            rp=torch.ops.quantized.linear_prepack(rw,None)
+            record('linear_signed',(m,n,k),lambda:packed.run(x,.2,0),
+                lambda:torch.ops.quantized.linear(r,rp,.2,0))
     return records
 
 

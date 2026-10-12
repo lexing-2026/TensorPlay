@@ -6,6 +6,11 @@
 #include <cstdint>
 
 namespace tensorplay::cpu {
+using quantized_int4_pack_fn = void (*)(const int32_t*, uint8_t*, int64_t, int64_t);
+using quantized_int4_mm_fn = void (*)(const void*, const uint8_t*, const void*, void*,
+    DType, int64_t, int64_t, int64_t, int64_t);
+DECLARE_DISPATCH(quantized_int4_pack_fn, quantized_int4_pack_stub)
+DECLARE_DISPATCH(quantized_int4_mm_fn, quantized_int4_mm_stub)
 using quantized_batch_norm_fn = void (*)(const void*, void*, int64_t, DType,
     const float*, const float*, int64_t, int64_t, bool);
 DECLARE_DISPATCH(quantized_batch_norm_fn, quantized_batch_norm_stub)

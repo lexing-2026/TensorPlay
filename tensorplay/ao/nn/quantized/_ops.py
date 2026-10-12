@@ -92,6 +92,16 @@ def _conv(input, packed_weight, *parameters, relu=False):
     return packed_weight.run(input,scale,zero_point,relu)
 
 
+def _legacy(*args,**kwargs):
+    raise RuntimeError('Legacy packed tensors require regeneration with the current packing interface')
+
+
+def _conv_unpack_sizes(packed):
+    weight,bias=packed.unpack()
+    return (list(weight.shape),None if bias is None else list(bias.shape),
+        packed.stride,packed.padding,packed.dilation,packed.groups)
+
+
 def _conv_add(input,accum,packed,scale,zero_point,relu=False):
     if packed.transposed or len(packed.stride) != 2:
         raise ValueError('Residual convolution requires ordinary two dimensional weights')
@@ -165,10 +175,34 @@ def _embedding(bits,weight,indices,pruned_weights=False):
     return _C._quantized_embedding(packed,indices,bits)
 
 
+class CellParams:
+    def __init__(self,wi,wh,bi=None,bh=None,reduce_range=False):
+        self.wi,self.wh,self.bi,self.bh=wi,wh,bi,bh
+        self.reduce_range=bool(reduce_range)
+
+    def linear_ih(self,input):
+        return _linear_dynamic(input,self.wi,self.reduce_range)
+
+    def linear_hh(self,input):
+        return _linear_dynamic(input,self.wh,self.reduce_range)
+
+    def b_ih(self):
+        return self.bi
+
+    def b_hh(self):
+        return self.bh
+
+
 def _recurrent_cell(mode,input,hx,wi,wh,bi,bh):
     h,c=hx if mode==2 else (hx,None)
-    result=_C._quantized_recurrent_cell(input,h,c,wi.weight,wh.weight,bi,bh,mode,False)
+    result=_C._quantized_recurrent_step(_linear_dynamic(input,wi,True),
+        _linear_dynamic(h,wh,True),h,c,mode)
     return result if mode==2 else result[0]
+
+
+def _cell_params_float(wi,wh,bi,bh):
+    return CellParams(PackedWeight(_C.quantize_per_tensor_dynamic(wi,tp.qint8,False),bi),
+        PackedWeight(_C.quantize_per_tensor_dynamic(wh,tp.qint8,False),bh),bi,bh,False)
 
 
 _packets = None
@@ -218,9 +252,19 @@ def _build_packets():
                 add(prefix+'_'+field,lambda packed,attr=attr:getattr(packed,attr))
     add('conv2d_add',_conv_add)
     add('conv2d_add_relu',partial(_conv_add,relu=True))
+    add('conv_prepack',partial(_conv_prepack,2))
+    add('conv_unpack',lambda packed:packed.unpack())
+    add('conv2d_unpack_sizes',_conv_unpack_sizes)
+    add('linear_prepack_legacy',_legacy);add('linear_prepack_fp16_legacy',_legacy)
+    add('_wrapped_linear_prepack',_C._wrapped_linear_prepack)
+    add('_wrapped_quantized_linear_prepacked',_C._wrapped_quantized_linear_prepacked)
+    add('wrapped_quantized_linear',_C._quantized_wrapped_linear)
+    add('wrapped_fbgemm_pack_gemm_matrix_fp16',_C._quantized_wrapped_half_prepack)
+    add('wrapped_fbgemm_linear_fp16_weight',_C._quantized_wrapped_half_linear)
+    add('int4mm_packed_weight_cpu',_C._quantized_int4_mm)
     add('linear_prepack',PackedWeight);add('linear_prepack_fp16',PackedHalfWeight)
     for suffix in ('','_fp16'):
-        add('linear_unpack'+suffix,lambda packed:packed._weight_bias())
+        add('linear_unpack'+suffix,lambda packed:packed._weight_bias(),legacy=_legacy)
     add('linear',_linear);add('linear_relu',partial(_linear,relu=True))
     add('linear_leaky_relu',lambda input,packed,scale,zp,negative_slope:packed.run(
         input,scale,zp,activation=1,negative_slope=negative_slope))
@@ -243,6 +287,9 @@ def _build_packets():
         if bits!=2:
             add(prefix,partial(_embedding_bag,bits))
             add('embedding_'+name,partial(_embedding,bits))
+    add('make_quantized_cell_params_dynamic',CellParams)
+    add('make_quantized_cell_params_fp16',lambda wi,wh:CellParams(wi,wh))
+    add('make_quantized_cell_params',_cell_params_float)
     for mode,name in ((0,'rnn_relu'),(1,'rnn_tanh'),(2,'lstm'),(3,'gru')):
         add('quantized_'+name+'_cell_dynamic',partial(_recurrent_cell,mode))
     return entries

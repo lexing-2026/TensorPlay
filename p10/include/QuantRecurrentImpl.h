@@ -17,7 +17,24 @@ struct RecurrentLinear {
         TP_CHECK(w.dim() == 2, "Recurrent weights must be matrices");
         if (w.dtype() == DType::Float16) return;
         TP_CHECK(w.dtype() == DType::QInt8 && w.impl()->quantizer(), "Recurrent weights require signed integer grids or half storage");
-        std::tie(packed, offsets) = TP_QR_FN(_quantized_weight_prepack)(w);
+        struct CachedWeight { Tensor source, packed, offsets; uint32_t version=0; uintptr_t stream=0; };
+        thread_local std::array<CachedWeight,16> cache;
+        thread_local size_t next=0;
+#ifdef TP_QUANT_CUDA
+        const uintptr_t stream=reinterpret_cast<uintptr_t>(tensorplay::cuda::getCurrentCUDAStream().stream());
+#else
+        const uintptr_t stream=0;
+#endif
+        const uint32_t version=w._version();
+        for (const auto& entry:cache) {
+            if (entry.source.defined() && w.impl()->version_counter().is_enabled() && entry.source.impl()==w.impl() && entry.version==version && entry.stream==stream) {
+                packed=entry.packed; offsets=entry.offsets; break;
+            }
+        }
+        if (!packed.defined()) {
+            std::tie(packed, offsets) = TP_QR_FN(_quantized_weight_prepack)(w);
+            if (w.impl()->version_counter().is_enabled() && packed.numel() <= 4*1024*1024) cache[next++%cache.size()]={w,packed,offsets,version,stream};
+        }
         if (w.impl()->quantizer()->qscheme() == kPerTensorAffine) {
             scales = Tensor::empty({w.size(0)}, DType::Float32, w.device());
             zps = Tensor::empty({w.size(0)}, DType::Int64, w.device());
@@ -34,7 +51,7 @@ struct RecurrentLinear {
         Tensor qx = x.numel() ? TP_QR_FN(quantize_per_tensor_dynamic)(x, DType::QUInt8, reduce_range)
             : TP_QR_FN(quantize_per_tensor)(x, .1, 0, DType::QUInt8);
         return TP_QR_FN(_quantized_packed_run)(qx, packed, offsets, scales, zps, bias,
-            weight.shape(), 1., 0, {}, {}, {}, 1, false, true);
+            weight.shape(), 1., 0, {}, {}, {}, 1, false, true, 0, 0., std::nullopt);
     }
 };
 
@@ -73,6 +90,20 @@ std::tuple<Tensor,Tensor> recurrent_step(const Tensor& gates, const Tensor& hidd
     apply(h.numel(), RecurrentStep{a.data_ptr<float>(),b.data_ptr<float>(),h.data_ptr<float>(),
         mode == 2 ? c.data_ptr<float>() : nullptr,hy.data_ptr<float>(),mode == 2 ? cy.data_ptr<float>() : nullptr,hidden.size(1),static_cast<int>(mode)});
     return {hy,cy};
+}
+
+std::tuple<Tensor,Tensor> recurrent_step_checked(const Tensor& gates,const Tensor& hidden_gates,
+        const Tensor& hidden,const std::optional<Tensor>& cell,int64_t mode) {
+    Guard guard(hidden);
+    TP_CHECK(mode>=0 && mode<=3 && hidden.dim()==2 && hidden.dtype()==DType::Float32,
+        "Recurrent state requires a floating batch matrix and a valid cell mode");
+    const int64_t width=hidden.size(1),count=mode==2 ? 4 : mode==3 ? 3 : 1;
+    for (const Tensor* value:{&gates,&hidden_gates})
+        TP_CHECK(value->dim()==2 && value->size(0)==hidden.size(0) && value->size(1)==width*count && value->dtype()==hidden.dtype() && value->device()==hidden.device(),
+            "Recurrent gates must match the state batch, gate count, dtype and device");
+    TP_CHECK(mode!=2 || (cell && cell->shape()==hidden.shape() && cell->device()==hidden.device() && cell->dtype()==hidden.dtype()),
+        "Long-memory recurrence requires a matching cell state");
+    return recurrent_step(gates,hidden_gates,hidden,cell.value_or(Tensor()),mode);
 }
 
 std::tuple<Tensor,Tensor> recurrent_cell(const Tensor& input, const Tensor& hidden, const std::optional<Tensor>& cell,
