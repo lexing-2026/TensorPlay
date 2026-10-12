@@ -135,7 +135,7 @@ void launch(const Tensor& x, const Tensor& columns, const Tensor& packed,
 }
 } // namespace
 
-Tensor quantized_code_relu_cuda(const Tensor& input) {
+Tensor quantized_relu_cuda(const Tensor& input) {
     CUDAGuard guard(input.device());
     const int64_t zp = quantized::q_zero_point(input);
     const Tensor x = input.contiguous();

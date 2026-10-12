@@ -10,7 +10,7 @@
 #include <type_traits>
 
 namespace tensorplay::cuda {
-Tensor quantized_code_relu_cuda(const Tensor& input);
+Tensor quantized_relu_cuda(const Tensor& input);
 }
 
 namespace tensorplay::quant {
