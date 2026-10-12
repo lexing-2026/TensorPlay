@@ -131,6 +131,7 @@ enum class ScalarType : int8_t {
     QInt8,
     QUInt8,
     QInt32,
+    QUInt2x4,
     Undefined,
     Float8_e4m3fnuz,
     Float8_e5m2fnuz,
@@ -151,7 +152,7 @@ using DType = ScalarType;
 
 inline bool isQuantizedType(ScalarType type) {
     return type == ScalarType::QInt8 || type == ScalarType::QUInt8 ||
-           type == ScalarType::QInt32;
+           type == ScalarType::QInt32 || type == ScalarType::QUInt2x4;
 }
 
 inline bool isQIntType(ScalarType type) {
@@ -203,7 +204,8 @@ inline bool isFloatingOrComplexType(ScalarType type) {
 inline bool isUnsignedType(ScalarType type) {
     return type == ScalarType::UInt8 || type == ScalarType::UInt16 ||
            type == ScalarType::UInt32 || type == ScalarType::UInt64 ||
-           type == ScalarType::QUInt8 || type == ScalarType::Float8_e8m0fnu;
+           type == ScalarType::QUInt8 || type == ScalarType::QUInt2x4 ||
+           type == ScalarType::Float8_e8m0fnu;
 }
 
 inline bool isBooleanType(ScalarType type) {
@@ -243,6 +245,7 @@ inline bool isSignedType(ScalarType type) {
         case ScalarType::QInt8:
         case ScalarType::QUInt8:
         case ScalarType::QInt32:
+        case ScalarType::QUInt2x4:
             break;
         case ScalarType::Undefined:
         case ScalarType::NumOptions:
@@ -260,6 +263,8 @@ inline ScalarType toUnderlyingStorageType(ScalarType type) {
             return ScalarType::UInt8;
         case ScalarType::QInt32:
             return ScalarType::Int32;
+        case ScalarType::QUInt2x4:
+            return ScalarType::UInt8;
         default:
             return type;
     }
@@ -369,7 +374,8 @@ inline constexpr bool is_complex_type_v =
 #define TENSORPLAY_FORALL_QINT_TYPES(_) \
     _(int8_t, QInt8)                   \
     _(uint8_t, QUInt8)                 \
-    _(int32_t, QInt32)
+    _(int32_t, QInt32)                 \
+    _(uint8_t, QUInt2x4)
 
 #define TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_QINTS(_) \
     TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_FP8(_)       \
@@ -404,6 +410,38 @@ inline size_t elementSize(ScalarType type) {
             return 0;
     }
 #undef TENSORPLAY_DTYPE_SIZE
+}
+
+// Sub-byte quantized dtypes (QUInt2x4 packs 4 logical elements per storage
+// byte). Itemsize is still 1, so the standard element*itemsize formula
+// over-counts; divide by this packing factor.
+inline int64_t subByteElementPerByte(ScalarType type) {
+    switch (type) {
+        case ScalarType::QUInt2x4:
+            return 4;
+        default:
+            return 1;
+    }
+}
+
+// Storage size of a dense tensor: rows before the most inner dim each hold
+// ceil(cols / element_per_byte) bytes, so a trailing partial byte per row is
+// still allocated. For non-sub-byte dtypes this reduces to numel * itemsize.
+inline int64_t subByteStorageSize(const std::vector<int64_t>& sizes,
+                                  ScalarType type) {
+    const int64_t element_per_byte = subByteElementPerByte(type);
+    const int64_t dtype_itemsize =
+        static_cast<int64_t>(elementSize(type));
+    if (sizes.empty()) {
+        return dtype_itemsize;
+    }
+    const int64_t cols = sizes.back();
+    const int64_t bytes_per_row = cols * dtype_itemsize;
+    int64_t rows = 1;
+    for (size_t i = 0; i + 1 < sizes.size(); ++i) {
+        rows *= sizes[i];
+    }
+    return rows * ((bytes_per_row + element_per_byte - 1) / element_per_byte);
 }
 
 inline ScalarType opaqueScalarType(ScalarType type) {

@@ -33,6 +33,15 @@ struct alignas(4) qint32 {
   explicit qint32(int32_t val) : val_(val) {}
 };
 
+// quint2x4 is for un-signed 2 bit quantized Tensors that are packed to byte
+// boundary.
+struct alignas(1) quint2x4 {
+  using underlying = uint8_t;
+  uint8_t val_;
+  quint2x4() = default;
+  explicit quint2x4(uint8_t val) : val_(val) {}
+};
+
 // Quantize one float value for an affine grid of the underlying type's
 // full range; the caller passes the already-reciprocal multiplier.
 template <typename T>

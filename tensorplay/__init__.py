@@ -327,6 +327,7 @@ undefined = DType.undefined
 qint8 = DType.qint8
 quint8 = DType.quint8
 qint32 = DType.qint32
+quint2x4 = DType.quint2x4
 float8_e4m3fn = DType.float8_e4m3fn
 float8_e4m3fnuz = DType.float8_e4m3fnuz
 float8_e5m2 = DType.float8_e5m2
@@ -460,7 +461,7 @@ __all__ = [
     "Layout", "sparse_coo", "sparse_csr", "sparse_csc", "sparse_bsr", "sparse_bsc", "strided",
     "uint8", "int8", "int16", "uint16", "uint32", "uint64", "int32", "int64",
     "float16", "bfloat16", "float32", "float64", "complex32", "complex64", "complex128", "bcomplex32", "bool",
-    "qint8", "quint8", "qint32", "QScheme", "per_tensor_affine", "per_channel_affine",
+    "qint8", "quint8", "qint32", "quint2x4", "QScheme", "per_tensor_affine", "per_channel_affine",
     "per_tensor_symmetric", "per_channel_symmetric", "per_channel_affine_float_qparams",
     "half", "float", "double", "short", "int", "long", "cfloat", "cdouble", "chalf",
     "save", "load", "inspect_checkpoint", "as_tensor",

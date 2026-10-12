@@ -1,7 +1,7 @@
 #include "QuantNative.h"
 #include "QuantKernels.h"
-#include "QIntTypes.h"
 #include "QuantElementwise.h"
+#include "QIntTypes.h"
 #include "Convolution.h"
 #include "Exception.h"
 #include "Parallel.h"
@@ -138,6 +138,8 @@ std::pair<int64_t, int64_t> quantized_bounds(DType dtype) {
         case DType::QInt32:
             return {std::numeric_limits<int32_t>::min(),
                     std::numeric_limits<int32_t>::max()};
+        case DType::QUInt2x4:
+            return {0, 3};
         default:
             TP_THROW(TypeError,
                      "per-channel quantization requires a quantized dtype");
@@ -421,6 +423,73 @@ Tensor dequantize_per_tensor_qint8_cpu(const Tensor& self, double scale,
     return out;
 }
 
+// 2-bit affine quantization packs four 2-bit codes into one storage byte.
+// The loop body below follows the sub-byte packing layout: index 0 sits in the
+// lowest 2 bits, index 1 in the next 2 bits, and so on, so four consecutive
+// elements fill one byte and a trailing partial byte per row is still
+// allocated.
+Tensor quantize_per_tensor_quint2x4_cpu(const Tensor& self, double scale,
+                                        int64_t zero_point, int64_t quant_min,
+                                        int64_t quant_max) {
+    check_qparams(scale, zero_point, quant_min, quant_max);
+    check_storage_range(quant_min, quant_max, 0, 255);
+    Tensor input = promote_to_compute_dtype(self);
+    Tensor out = Tensor::empty(self.shape(), DType::QUInt2x4, self.device());
+    const float* const rdata = input.const_data_ptr<float>();
+    auto qdata = reinterpret_cast<uint8_t*>(out.data_ptr<quint2x4>());
+    const int64_t numel = input.numel();
+    constexpr int64_t elem_per_byte = 4;
+    constexpr int64_t bit_width = 2;
+    const float scale_f = static_cast<float>(scale);
+    const float zero_point_f = static_cast<float>(zero_point);
+    for (int64_t i = 0; i < numel; ++i) {
+        const float inv_scale =
+            scale_f == 0 ? 1.0f : 1.0f / scale_f;
+        int64_t qvalue =
+            lrintf(std::nearbyint(rdata[i] * inv_scale) + zero_point_f);
+        qvalue = std::max(quant_min, std::min(qvalue, quant_max));
+
+        // We pack sub-byte values and align them to a byte.
+        // Eg. for 2-bit values, index 0 is packed in the lower 2 bits,
+        // index 1 in the next 2 bits, index 2 in the next 2 bits, and
+        // index 3 in the upper 2 bits.
+        if (i % elem_per_byte == 0) {
+            qdata[i / elem_per_byte] = static_cast<uint8_t>(qvalue);
+        } else {
+            qdata[i / elem_per_byte] |=
+                static_cast<uint8_t>(qvalue << ((i % elem_per_byte) * bit_width));
+        }
+    }
+    out.impl()->set_quantizer(
+        make_per_tensor_affine_quantizer(scale, zero_point, DType::QUInt2x4));
+    return out;
+}
+
+Tensor dequantize_per_tensor_quint2x4_cpu(const Tensor& self, double scale,
+                                          int64_t zero_point) {
+    if (self.dtype() != DType::QUInt2x4) {
+        TP_THROW(TypeError, "dequantize(): expected a QUInt2x4 tensor");
+    }
+    make_per_tensor_affine_quantizer(scale, zero_point, DType::QUInt2x4);
+    const Tensor input = self.is_contiguous() ? self : self.contiguous();
+    Tensor out = Tensor::empty(self.shape(), DType::Float32, self.device());
+    float* rdata = out.data_ptr<float>();
+    const uint8_t* qdata =
+        reinterpret_cast<const uint8_t*>(input.const_data_ptr<quint2x4>());
+    const int64_t numel = input.numel();
+    constexpr int64_t elem_per_byte = 4;
+    constexpr int64_t bit_width = 2;
+    const float scale_f = static_cast<float>(scale);
+    const float zero_point_f = static_cast<float>(zero_point);
+    for (int64_t i = 0; i < numel; ++i) {
+        uint8_t qvalue = qdata[i / elem_per_byte];
+        qvalue >>= (i % elem_per_byte) * bit_width;
+        qvalue &= (1 << bit_width) - 1;
+        rdata[i] = (static_cast<float>(qvalue) - zero_point_f) * scale_f;
+    }
+    return out;
+}
+
 Tensor quantize_per_tensor_dtype_cpu(const Tensor& self, double scale,
                                      int64_t zero_point, DType dtype) {
     if (self.dtype() != DType::Float32) {
@@ -436,6 +505,9 @@ Tensor quantize_per_tensor_dtype_cpu(const Tensor& self, double scale,
                 self, scale, zero_point, 0, 255);
         case DType::QInt32:
             return quantize_per_tensor_qint32_cpu(self, scale, zero_point);
+        case DType::QUInt2x4:
+            return quantize_per_tensor_quint2x4_cpu(
+                self, scale, zero_point, 0, 3);
         default:
             TP_THROW(TypeError, "quantize(): unsupported quantized dtype ",
                      toString(dtype));
@@ -456,6 +528,8 @@ Tensor dequantize_per_tensor_dtype_cpu(const Tensor& self, double scale,
             return dequantize_per_tensor_quint8_cpu(self, scale, zero_point);
         case DType::QInt32:
             return dequantize_per_tensor_qint32_cpu(self, scale, zero_point);
+        case DType::QUInt2x4:
+            return dequantize_per_tensor_quint2x4_cpu(self, scale, zero_point);
         default:
             TP_THROW(TypeError, "dequantize(): unsupported quantized dtype ",
                      toString(dtype));
@@ -726,6 +800,178 @@ Tensor quantized_binary_cpu(
 
 } // namespace
 
+namespace {
+
+// Native integer-domain quantized 2d convolution.  The accumulation stays in
+// the Int64 domain over (in_q - in_zero_point) * (w_q - w_zero_point)
+// products and is requantized once at the output with the same rounding
+// contract as the CUDA kernel.
+Tensor quantized_conv2d_cpu_native(
+    const Tensor& input, const Tensor& weight, const Tensor& bias_f,
+    double input_scale, int64_t input_zero_point, double weight_scale,
+    int64_t weight_zero_point, double out_scale, int64_t out_zero_point,
+    const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+    const std::vector<int64_t>& dilation, int64_t groups) {
+    const int64_t N = input.size(0), C = input.size(1);
+    const int64_t H = input.size(2), W = input.size(3);
+    const int64_t M = weight.size(0), Cg = weight.size(1);
+    const int64_t kH = weight.size(2), kW = weight.size(3);
+    const int64_t sH = stride.empty() ? 1 : stride[0];
+    const int64_t sW = stride.size() > 1 ? stride[1] : sH;
+    const int64_t pH = padding.empty() ? 0 : padding[0];
+    const int64_t pW = padding.size() > 1 ? padding[1] : pH;
+    const int64_t dH = dilation.empty() ? 1 : dilation[0];
+    const int64_t dW = dilation.size() > 1 ? dilation[1] : dH;
+    const int64_t per_group_out = M / groups;
+    const int64_t OH = (H + 2 * pH - dH * (kH - 1) - 1) / sH + 1;
+    const int64_t OW = (W + 2 * pW - dW * (kW - 1) - 1) / sW + 1;
+
+    Tensor out = Tensor::empty({N, M, OH, OW}, DType::QInt8, input.device());
+    const int8_t* in_ptr = input.data_ptr<int8_t>();
+    const int8_t* w_ptr = weight.data_ptr<int8_t>();
+    const float* b_ptr =
+        bias_f.defined() ? bias_f.data_ptr<float>() : nullptr;
+    int8_t* out_ptr = out.data_ptr<int8_t>();
+    const double inv_out = 1.0 / out_scale;
+    const int64_t total = N * M * OH * OW;
+
+    parallel::parallel_for(
+        0, total, /*grain_size=*/8,
+        [&](int64_t begin, int64_t end) {
+            for (int64_t idx = begin; idx < end; ++idx) {
+                const int64_t ow = idx % OW;
+                const int64_t oh = (idx / OW) % OH;
+                const int64_t m = (idx / (OW * OH)) % M;
+                const int64_t n = idx / (OW * OH * M);
+                const int64_t g = m / per_group_out;
+                const int64_t in_c_base = g * Cg;
+                int64_t acc = 0;
+                for (int64_t kh = 0; kh < kH; ++kh) {
+                    const int64_t ih = oh * sH - pH + kh * dH;
+                    if (ih < 0 || ih >= H) continue;
+                    for (int64_t kw = 0; kw < kW; ++kw) {
+                        const int64_t iw = ow * sW - pW + kw * dW;
+                        if (iw < 0 || iw >= W) continue;
+                        for (int64_t c = 0; c < Cg; ++c) {
+                            const int8_t xv = in_ptr[((n * C +
+                                                     in_c_base + c) * H +
+                                                    ih) *
+                                                       W +
+                                                   iw];
+                            const int8_t wv = w_ptr[((m * Cg + c) * kH + kh) *
+                                                    kW +
+                                                    kw];
+                            acc +=
+                                static_cast<int64_t>(xv - input_zero_point) *
+                                static_cast<int64_t>(wv - weight_zero_point);
+                        }
+                    }
+                }
+                double y = static_cast<double>(acc) *
+                           (input_scale * weight_scale);
+                if (b_ptr != nullptr) {
+                    y += static_cast<double>(b_ptr[m]);
+                }
+                out_ptr[idx] = requantize_value(y, inv_out, out_zero_point);
+            }
+        });
+    out.impl()->set_quantizer(make_per_tensor_affine_quantizer(
+        out_scale, out_zero_point, DType::QInt8));
+    return out;
+}
+
+// Native integer-domain quantized 3d convolution.
+Tensor quantized_conv3d_cpu_native(
+    const Tensor& input, const Tensor& weight, const Tensor& bias_f,
+    double input_scale, int64_t input_zero_point, double weight_scale,
+    int64_t weight_zero_point, double out_scale, int64_t out_zero_point,
+    const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+    const std::vector<int64_t>& dilation, int64_t groups) {
+    const int64_t N = input.size(0), C = input.size(1);
+    const int64_t D = input.size(2), H = input.size(3), W = input.size(4);
+    const int64_t M = weight.size(0), Cg = weight.size(1);
+    const int64_t kD = weight.size(2), kH = weight.size(3), kW = weight.size(4);
+    const int64_t sD = stride.empty() ? 1 : stride[0];
+    const int64_t sH = stride.size() > 1 ? stride[1] : sD;
+    const int64_t sW = stride.size() > 2 ? stride[2] : sD;
+    const int64_t pD = padding.empty() ? 0 : padding[0];
+    const int64_t pH = padding.size() > 1 ? padding[1] : pD;
+    const int64_t pW = padding.size() > 2 ? padding[2] : pD;
+    const int64_t dD = dilation.empty() ? 1 : dilation[0];
+    const int64_t dH = dilation.size() > 1 ? dilation[1] : dD;
+    const int64_t dW = dilation.size() > 2 ? dilation[2] : dD;
+    const int64_t per_group_out = M / groups;
+    const int64_t OD = (D + 2 * pD - dD * (kD - 1) - 1) / sD + 1;
+    const int64_t OH = (H + 2 * pH - dH * (kH - 1) - 1) / sH + 1;
+    const int64_t OW = (W + 2 * pW - dW * (kW - 1) - 1) / sW + 1;
+
+    Tensor out = Tensor::empty({N, M, OD, OH, OW}, DType::QInt8,
+                               input.device());
+    const int8_t* in_ptr = input.data_ptr<int8_t>();
+    const int8_t* w_ptr = weight.data_ptr<int8_t>();
+    const float* b_ptr =
+        bias_f.defined() ? bias_f.data_ptr<float>() : nullptr;
+    int8_t* out_ptr = out.data_ptr<int8_t>();
+    const double inv_out = 1.0 / out_scale;
+    const int64_t total = N * M * OD * OH * OW;
+
+    parallel::parallel_for(
+        0, total, /*grain_size=*/8,
+        [&](int64_t begin, int64_t end) {
+            for (int64_t idx = begin; idx < end; ++idx) {
+                const int64_t ow = idx % OW;
+                const int64_t oh = (idx / OW) % OH;
+                const int64_t od = (idx / (OW * OH)) % OD;
+                const int64_t m = (idx / (OW * OH * OD)) % M;
+                const int64_t n = idx / (OW * OH * OD * M);
+                const int64_t g = m / per_group_out;
+                const int64_t in_c_base = g * Cg;
+                int64_t acc = 0;
+                for (int64_t kd = 0; kd < kD; ++kd) {
+                    const int64_t id = od * sD - pD + kd * dD;
+                    if (id < 0 || id >= D) continue;
+                    for (int64_t kh = 0; kh < kH; ++kh) {
+                        const int64_t ih = oh * sH - pH + kh * dH;
+                        if (ih < 0 || ih >= H) continue;
+                        for (int64_t kw = 0; kw < kW; ++kw) {
+                            const int64_t iw = ow * sW - pW + kw * dW;
+                            if (iw < 0 || iw >= W) continue;
+                            for (int64_t c = 0; c < Cg; ++c) {
+                                const int8_t xv =
+                                    in_ptr[(((n * C + in_c_base + c) * D +
+                                             id) *
+                                                H +
+                                            ih) *
+                                               W +
+                                           iw];
+                                const int8_t wv =
+                                    w_ptr[(((m * Cg + c) * kD + kd) * kH +
+                                           kh) *
+                                              kW +
+                                          kw];
+                                acc += static_cast<int64_t>(
+                                           xv - input_zero_point) *
+                                       static_cast<int64_t>(
+                                           wv - weight_zero_point);
+                            }
+                        }
+                    }
+                }
+                double y = static_cast<double>(acc) *
+                             (input_scale * weight_scale);
+                if (b_ptr != nullptr) {
+                    y += static_cast<double>(b_ptr[m]);
+                }
+                out_ptr[idx] = requantize_value(y, inv_out, out_zero_point);
+            }
+        });
+    out.impl()->set_quantizer(make_per_tensor_affine_quantizer(
+        out_scale, out_zero_point, DType::QInt8));
+    return out;
+}
+
+} // namespace
+
 Tensor quantized_add_cpu(
     const Tensor& a, const Tensor& b,
     double a_scale, int64_t a_zero_point,
@@ -794,31 +1040,60 @@ Tensor quantized_conv2d_cpu(
     if (!(out_scale > 0.0)) {
         TP_THROW(ValueError, "quantized_conv2d(): out_scale must be positive");
     }
-    // Dequantize both operands, run the float convolution (the bias already
-    // lives in the float domain), then requantize into the output qparams.
-    Tensor x = dequantize_per_tensor_qint8_cpu(
-        input, input_scale, input_zero_point);
-    Tensor w = dequantize_per_tensor_qint8_cpu(
-        weight, weight_scale, weight_zero_point);
-    Tensor acc = conv2d_cpu(
-        x, w,
-        bias.has_value() ? bias->to(DType::Float32).contiguous()
-                         : Tensor(),
-        stride, padding, dilation, groups);
-
-    Tensor out = Tensor::empty(
-        static_cast<std::vector<int64_t>>(acc.shape()), DType::QInt8,
-        input.device());
-    const float* pa = acc.data_ptr<float>();
-    int8_t* po = out.data_ptr<int8_t>();
-    const int64_t numel = acc.numel();
-    const double inv_out = 1.0 / out_scale;
-    for (int64_t i = 0; i < numel; ++i) {
-        po[i] = requantize_value(pa[i], inv_out, out_zero_point);
+    if (input.dim() != 4 || weight.dim() != 4) {
+        TP_THROW(ValueError,
+                 "quantized_conv2d(): expected 4d activations and weights");
     }
-    out.impl()->set_quantizer(make_per_tensor_affine_quantizer(
-        out_scale, out_zero_point, DType::QInt8));
-    return out;
+    const int64_t C = input.size(1);
+    const int64_t M = weight.size(0);
+    const int64_t Cg = weight.size(1);
+    if (groups <= 0 || M % groups != 0 || C % groups != 0) {
+        TP_THROW(ValueError, "quantized_conv2d(): invalid groups");
+    }
+    if (Cg != C / groups) {
+        TP_THROW(ValueError,
+                 "quantized_conv2d(): weight channels do not match groups");
+    }
+    Tensor bias_f;
+    if (bias.has_value()) {
+        if (!isFloatingType(bias->dtype()) || bias->dim() != 1 ||
+            bias->size(0) != M) {
+            TP_THROW(ValueError,
+                     "quantized_conv2d(): bias must be a 1-D floating tensor "
+                     "of length out_channels");
+        }
+        bias_f = bias->to(DType::Float32).contiguous();
+    }
+    const Tensor in = input.is_contiguous() ? input : input.contiguous();
+    const Tensor w = weight.is_contiguous() ? weight : weight.contiguous();
+    const int64_t H = input.size(2), W = input.size(3);
+    const int64_t kH = w.size(2), kW = w.size(3);
+    const int64_t sH = stride.empty() ? 1 : stride[0];
+    const int64_t sW = stride.size() > 1 ? stride[1] : sH;
+    const int64_t pH = padding.empty() ? 0 : padding[0];
+    const int64_t pW = padding.size() > 1 ? padding[1] : pH;
+    const int64_t dH = dilation.empty() ? 1 : dilation[0];
+    const int64_t dW = dilation.size() > 1 ? dilation[1] : dH;
+    const int64_t OH = (H + 2 * pH - dH * (kH - 1) - 1) / sH + 1;
+    const int64_t OW = (W + 2 * pW - dW * (kW - 1) - 1) / sW + 1;
+    if (OH > 0 && OW > 0) {
+        Tensor out = Tensor::empty({input.size(0), M, OH, OW}, DType::QInt8,
+                                   input.device());
+        if (conv2d_onednn_qint8(
+                in, w, bias_f, input_scale, input_zero_point, weight_scale,
+                weight_zero_point, out_scale, out_zero_point, {sH, sW}, pH,
+                pH, pW, pW, {dH, dW}, groups, out)) {
+            out.impl()->set_quantizer(make_per_tensor_affine_quantizer(
+                out_scale, out_zero_point, DType::QInt8));
+            return out;
+        }
+    }
+    // The accumulation runs in the integer domain over the quantized codes;
+    // no intermediate dequantization to the float domain happens.
+    return quantized_conv2d_cpu_native(
+        in, w, bias_f, input_scale, input_zero_point, weight_scale,
+        weight_zero_point, out_scale, out_zero_point, stride, padding,
+        dilation, groups);
 }
 
 // ---------------------------------------------------------------------------
@@ -2018,6 +2293,22 @@ int64_t q_per_channel_axis_cpu(const Tensor& self) {
 
 Tensor int_repr_cpu(const Tensor& self) {
     quantized::require_quantized(self, "int_repr");
+    // 2-bit codes are packed four per storage byte; the integer
+    // representation is the packed byte sequence itself, one element per
+    // storage byte, with the trailing partial byte preserved.
+    if (self.dtype() == DType::QUInt2x4) {
+        const Tensor input = self.is_contiguous() ? self : self.contiguous();
+        const int64_t bit_width = 2;
+        const int64_t out_size = (input.numel() * bit_width + 7) / 8;
+        Tensor dst = Tensor::empty({out_size}, DType::UInt8, input.device());
+        const uint8_t* qdata = reinterpret_cast<const uint8_t*>(
+            input.const_data_ptr<quint2x4>());
+        uint8_t* ddata = dst.data_ptr<uint8_t>();
+        for (int64_t i = 0; i < dst.numel(); ++i) {
+            ddata[i] = qdata[i];
+        }
+        return dst;
+    }
     return quantized::strip_quantizer(self).clone();
 }
 
@@ -2355,30 +2646,38 @@ Tensor quantized_conv3d_cpu(
     if (!(out_scale > 0.0)) {
         TP_THROW(ValueError, "quantized_conv3d(): out_scale must be positive");
     }
-    // Dequantize both operands, run the float 3d convolution (the bias is
-    // already in the float domain), then requantize into the output qparams.
-    Tensor x = dequantize_per_tensor_qint8_cpu(
-        input, input_scale, input_zero_point);
-    Tensor w = dequantize_per_tensor_qint8_cpu(
-        weight, weight_scale, weight_zero_point);
-    Tensor acc = conv3d_cpu(
-        x, w,
-        bias.has_value() ? bias->to(DType::Float32).contiguous() : Tensor(),
-        stride, padding, dilation, groups);
-
-    Tensor out = Tensor::empty(
-        static_cast<std::vector<int64_t>>(acc.shape()), DType::QInt8,
-        input.device());
-    const float* pa = acc.data_ptr<float>();
-    int8_t* po = out.data_ptr<int8_t>();
-    const int64_t numel = acc.numel();
-    const double inv_out = 1.0 / out_scale;
-    for (int64_t i = 0; i < numel; ++i) {
-        po[i] = requantize_value(pa[i], inv_out, out_zero_point);
+    if (input.dim() != 5 || weight.dim() != 5) {
+        TP_THROW(ValueError,
+                 "quantized_conv3d(): expected 5d activations and weights");
     }
-    out.impl()->set_quantizer(make_per_tensor_affine_quantizer(
-        out_scale, out_zero_point, DType::QInt8));
-    return out;
+    const int64_t C = input.size(1);
+    const int64_t M = weight.size(0);
+    const int64_t Cg = weight.size(1);
+    if (groups <= 0 || M % groups != 0 || C % groups != 0) {
+        TP_THROW(ValueError, "quantized_conv3d(): invalid groups");
+    }
+    if (Cg != C / groups) {
+        TP_THROW(ValueError,
+                 "quantized_conv3d(): weight channels do not match groups");
+    }
+    Tensor bias_f;
+    if (bias.has_value()) {
+        if (!isFloatingType(bias->dtype()) || bias->dim() != 1 ||
+            bias->size(0) != M) {
+            TP_THROW(ValueError,
+                     "quantized_conv3d(): bias must be a 1-D floating tensor "
+                     "of length out_channels");
+        }
+        bias_f = bias->to(DType::Float32).contiguous();
+    }
+    const Tensor in = input.is_contiguous() ? input : input.contiguous();
+    const Tensor w = weight.is_contiguous() ? weight : weight.contiguous();
+    // The accumulation runs in the integer domain over the quantized codes;
+    // no intermediate dequantization to the float domain happens.
+    return quantized_conv3d_cpu_native(
+        in, w, bias_f, input_scale, input_zero_point, weight_scale,
+        weight_zero_point, out_scale, out_zero_point, stride, padding,
+        dilation, groups);
 }
 
 TENSORPLAY_LIBRARY_IMPL(CPU, QuantKernels) {

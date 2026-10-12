@@ -32,7 +32,7 @@ def rebuild_qtensor(storage, storage_offset, size, stride, params, requires_grad
 
 
 def quantized_tensor_reduction(tensor):
-    storage_dtype = {tp.qint8: tp.int8, tp.quint8: tp.uint8, tp.qint32: tp.int32}[tensor.dtype]
+    storage_dtype = {tp.qint8: tp.int8, tp.quint8: tp.uint8, tp.qint32: tp.int32, tp.quint2x4: tp.uint8}[tensor.dtype]
     codes = tp.empty((0,), dtype=storage_dtype, device=tensor.device)
     codes.set_(tensor.untyped_storage(), tensor.storage_offset(), tensor.shape, tensor.stride())
     scheme = tensor.qscheme()

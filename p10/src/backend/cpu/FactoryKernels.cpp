@@ -24,9 +24,8 @@ Tensor& fill_kernel(Tensor& self, const Scalar& value);
 Tensor allocate_cpu_tensor(const std::vector<int64_t>& size, DType dtype, bool pin_memory) {
 #ifdef USE_CUDA
     if (pin_memory) {
-        int64_t numel = 1;
-        for (int64_t value : size) numel *= value;
-        const size_t nbytes = static_cast<size_t>(numel) * elementSize(dtype);
+        const size_t nbytes = static_cast<size_t>(
+            subByteStorageSize(size, dtype));
         Storage storage(nbytes, getPinnedMemoryAllocator(), Device(DeviceType::CPU));
         return Tensor(storage, size, dtype);
     }
