@@ -96,3 +96,52 @@ def test_eval_fusion_named_forward_and_nonaffine(device):
     fused = fuse_modules(model, ['conv', 'bn', 'relu'])
     np.testing.assert_allclose(fused(x).detach().cpu().numpy(), expected.detach().cpu().numpy(), atol=1e-6)
     assert isinstance(fused.bn, tp.nn.Identity)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('kind', ['Embedding', 'sum', 'mean', 'max'])
+def test_embedding_training_grid_gradients_and_checkpoint(device, kind):
+    from tensorplay.ao.quantization import default_embedding_qat_qconfig, get_embedding_qat_module_mappings
+    bag = kind != 'Embedding'
+    cls = qat.EmbeddingBag if bag else qat.Embedding
+    ref_cls = torch.ao.nn.qat.EmbeddingBag if bag else torch.ao.nn.qat.Embedding
+    kwargs = {'mode': kind, 'include_last_offset': True} if bag else {}
+    actual = cls(7, 4, padding_idx=0, qconfig=default_embedding_qat_qconfig, **kwargs).to(device)
+    expected = ref_cls(7, 4, padding_idx=0, qconfig=torch.ao.quantization.default_embedding_qat_qconfig, **kwargs).to(device)
+    actual.load_state_dict({k: tp.tensor(v.cpu().tolist(), device=device, dtype=getattr(tp, str(v.dtype).split('.')[-1])) for k, v in expected.state_dict().items()})
+    indices = [0, 1, 3, 3, 4, 6]
+    x = tp.tensor(indices, dtype=tp.int64, device=device)
+    r = torch.tensor(indices, dtype=torch.int64, device=device)
+    if bag:
+        a = actual(x, tp.tensor([0, 2, 6], dtype=tp.int64, device=device))
+        b = expected(r, torch.tensor([0, 2, 6], dtype=torch.int64, device=device))
+    else:
+        a, b = actual(x), expected(r)
+    a.square().sum().backward(); b.square().sum().backward()
+    np.testing.assert_allclose(a.detach().cpu().numpy(), b.detach().cpu().numpy(), atol=1e-6)
+    np.testing.assert_allclose(actual.weight.grad.cpu().numpy(), expected.weight.grad.cpu().numpy(), atol=1e-5)
+    fresh = cls(7, 4, padding_idx=0, qconfig=default_embedding_qat_qconfig, **kwargs).to(device)
+    fresh.load_state_dict(actual.state_dict())
+    assert fresh.weight_fake_quant.scale.numel() == 7
+    floating = actual.to_float()
+    floating.qconfig = default_embedding_qat_qconfig
+    prepared = prepare_qat(floating, mapping=get_embedding_qat_module_mappings())
+    assert isinstance(prepared, cls)
+    assert prepared(x, tp.tensor([0, 2, 6], dtype=tp.int64, device=device)).shape == a.shape if bag else prepared(x).shape == a.shape
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_dynamic_qat_requires_current_call_statistics(device):
+    from tensorplay.ao.quantization import default_dynamic_qat_qconfig
+    actual = qat.dynamic.Linear(4, 3, qconfig=default_dynamic_qat_qconfig).to(device)
+    expected = torch.ao.nn.qat.dynamic.Linear(4, 3, qconfig=torch.ao.quantization.default_dynamic_qat_qconfig).to(device)
+    actual.load_state_dict({k: tp.tensor(v.cpu().tolist(), device=device, dtype=getattr(tp, str(v.dtype).split('.')[-1])) for k, v in expected.state_dict().items()})
+    values = np.random.default_rng(48).normal(size=(3, 4)).astype('float32')
+    x = tp.tensor(values, device=device, requires_grad=True)
+    r = torch.tensor(values, device=device, requires_grad=True)
+    a, b = actual(x), expected(r)
+    a.square().sum().backward(); b.square().sum().backward()
+    np.testing.assert_allclose(a.detach().cpu().numpy(), b.detach().cpu().numpy(), atol=1e-6)
+    np.testing.assert_allclose(actual.weight.grad.cpu().numpy(), expected.weight.grad.cpu().numpy(), atol=1e-5)
+    with pytest.raises(ValueError):
+        qat.dynamic.Linear(4, 3, qconfig=default_qat_qconfig)

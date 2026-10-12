@@ -23,6 +23,7 @@ __all__ = [
     "get_default_dynamic_quant_module_mappings",
     "get_default_qat_module_mappings",
     "get_default_static_quant_module_mappings",
+    "get_embedding_qat_module_mappings",
 ]
 
 # Default map for swapping float modules to quantized ones
@@ -88,6 +89,7 @@ DEFAULT_STATIC_QUANT_MODULE_MAPPINGS[nniqat.LinearBn1d] = nnq.Linear
 # Default map for swapping dynamic modules
 DEFAULT_DYNAMIC_QUANT_MODULE_MAPPINGS: dict = {
     nn.Linear: nnqd.Linear,
+    nnqat.dynamic.Linear: nnqd.Linear,
     nni.LinearReLU: nniq.dynamic.LinearReLU,
 }
 
@@ -100,6 +102,13 @@ def get_default_static_quant_module_mappings() -> dict:
 def get_default_qat_module_mappings() -> dict:
     """Get module mapping for quantization-aware training."""
     return copy.deepcopy(DEFAULT_QAT_MODULE_MAPPINGS)
+
+
+def get_embedding_qat_module_mappings() -> dict:
+    mapping = get_default_qat_module_mappings()
+    mapping[nn.Embedding] = nnqat.Embedding
+    mapping[nn.EmbeddingBag] = nnqat.EmbeddingBag
+    return mapping
 
 
 def get_default_dynamic_quant_module_mappings() -> dict:

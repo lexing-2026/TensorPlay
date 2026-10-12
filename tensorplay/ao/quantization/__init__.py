@@ -120,3 +120,6 @@ __all__ += ['default_qat_qconfig', 'default_per_channel_qat_qconfig', 'prepare_q
 from .fake_quantize import default_fused_act_fake_quant, default_fused_wt_fake_quant, default_fused_per_channel_wt_fake_quant
 from .qconfig import default_qat_qconfig_v2, default_dynamic_qat_qconfig, get_default_qconfig, get_default_qat_qconfig
 __all__ += ['default_fused_act_fake_quant', 'default_fused_wt_fake_quant', 'default_fused_per_channel_wt_fake_quant', 'default_qat_qconfig_v2', 'default_dynamic_qat_qconfig', 'get_default_qconfig', 'get_default_qat_qconfig']
+from .qconfig import default_embedding_qat_qconfig, float_qparams_weight_only_qconfig, per_channel_dynamic_qconfig
+from .quantization_mappings import get_embedding_qat_module_mappings
+__all__ += ['default_embedding_qat_qconfig', 'float_qparams_weight_only_qconfig', 'per_channel_dynamic_qconfig', 'get_embedding_qat_module_mappings']

@@ -4,5 +4,6 @@ from __future__ import annotations
 
 from .conv import Conv1d, Conv2d, Conv3d  # noqa: F401
 from .linear import Linear  # noqa: F401
+from .embedding_ops import Embedding, EmbeddingBag
 
-__all__ = ["Linear", "Conv1d", "Conv2d", "Conv3d"]
+__all__ = ["Linear", "Conv1d", "Conv2d", "Conv3d", "Embedding", "EmbeddingBag"]

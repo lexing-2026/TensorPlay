@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
-from .modules import Conv1d, Conv2d, Conv3d, Linear  # noqa: F401
+from .modules import Conv1d, Conv2d, Conv3d, Linear, Embedding, EmbeddingBag
+from . import dynamic
 
-__all__ = ["Linear", "Conv1d", "Conv2d", "Conv3d"]
+__all__ = ["Linear", "Conv1d", "Conv2d", "Conv3d", "Embedding", "EmbeddingBag"]

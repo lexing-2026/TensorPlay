@@ -143,3 +143,10 @@ def get_default_qat_qconfig(backend='x86', version=1):
 
 
 __all__ += ['default_qat_qconfig_v2', 'default_dynamic_qat_qconfig', 'get_default_qconfig', 'get_default_qat_qconfig']
+
+from .observer import default_placeholder_observer, default_float_qparams_observer
+from .fake_quantize import default_embedding_fake_quant
+float_qparams_weight_only_qconfig = QConfig(default_placeholder_observer, default_float_qparams_observer)
+default_embedding_qat_qconfig = QConfig(default_placeholder_observer, default_embedding_fake_quant)
+per_channel_dynamic_qconfig = QConfig(default_dynamic_quant_observer, default_per_channel_weight_observer)
+__all__ += ['float_qparams_weight_only_qconfig', 'default_embedding_qat_qconfig', 'per_channel_dynamic_qconfig']

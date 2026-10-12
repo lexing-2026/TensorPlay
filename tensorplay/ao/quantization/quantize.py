@@ -18,7 +18,7 @@ import inspect
 from tensorplay import nn
 
 from .fake_quantize import FakeQuantize, FakeQuantizeBase
-from .observer import ObserverBase
+from .observer import ObserverBase, UniformQuantizationObserverBase
 from .quantization_mappings import (
     get_default_dynamic_quant_module_mappings,
     get_default_static_quant_module_mappings,
@@ -108,7 +108,7 @@ def _add_observer_(module, qconfig_spec=None):
         ):
             return
         module.activation_post_process = module.qconfig.activation()
-        if getattr(module, '_qat_prepared', False) and isinstance(module.activation_post_process, ObserverBase):
+        if getattr(module, '_qat_prepared', False) and isinstance(module.activation_post_process, UniformQuantizationObserverBase):
             module.activation_post_process = FakeQuantize(observer=module.activation_post_process)
         module.register_forward_hook(_observer_forward_hook, prepend=True)
         module.input_activation_post_process = module.qconfig.activation()
