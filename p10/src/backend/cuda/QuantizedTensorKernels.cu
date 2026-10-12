@@ -110,7 +110,7 @@ Tensor _make_per_channel_quantized_tensor_cuda(const Tensor& self,
                  "_make_per_channel_quantized_tensor(): scales size must "
                  "match the quantized dimension");
     }
-    Tensor sc = scale.to(DType::Float64).contiguous();
+    Tensor sc = scale.to(DType::Float64).to(Device(DeviceType::CPU)).contiguous();
     const double* sp = sc.data_ptr<double>();
     for (int64_t i = 0; i < sc.numel(); ++i) {
         if (!(sp[i] > 0.0)) {

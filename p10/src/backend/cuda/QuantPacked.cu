@@ -66,10 +66,14 @@ __global__ void packed_gemm(const X* input, const int8_t* weight,
                             int shift, bool relu, bool output_float) {
     __shared__ int8_t xtile[16][32];
     __shared__ int8_t wtile[16][32];
-    const int64_t row = static_cast<int64_t>(blockIdx.y) * 16 + threadIdx.y;
-    const int64_t group = blockIdx.z;
     const int64_t n_per_group = g.outputs / g.groups;
-    const int64_t local_n = static_cast<int64_t>(blockIdx.x) * 16 + threadIdx.x;
+    const int64_t channel_tiles = (n_per_group + 15) / 16;
+    const int64_t row_tiles = (g.rows + 15) / 16;
+    const int64_t channel_tile = blockIdx.x % channel_tiles;
+    const int64_t row_tile = (blockIdx.x / channel_tiles) % row_tiles;
+    const int64_t group = blockIdx.x / (channel_tiles * row_tiles);
+    const int64_t row = row_tile * 16 + threadIdx.y;
+    const int64_t local_n = channel_tile * 16 + threadIdx.x;
     const int64_t n = group * n_per_group + local_n;
     int64_t acc = 0, row_sum = 0;
     for (int64_t k0 = 0; k0 < g.padded_K; k0 += 32) {
@@ -78,7 +82,7 @@ __global__ void packed_gemm(const X* input, const int8_t* weight,
             const int64_t xindex = g.linear ? row * g.K + k : (group * g.rows + row) * g.padded_K + k;
             xtile[threadIdx.y][threadIdx.x + j * 16] = (row < g.rows && k < g.K)
                 ? static_cast<int8_t>(static_cast<int>(input[xindex]) - shift) : 0;
-            const int64_t wn = group * n_per_group + static_cast<int64_t>(blockIdx.x) * 16 + threadIdx.y;
+            const int64_t wn = group * n_per_group + channel_tile * 16 + threadIdx.y;
             wtile[threadIdx.y][threadIdx.x + j * 16] = (wn < (group + 1) * n_per_group)
                 ? weight[wn * g.padded_K + k] : 0;
         }
@@ -114,7 +118,9 @@ void launch(const Tensor& x, const Tensor& columns, const Tensor& packed,
     const int shift = x.dtype() == DType::QUInt8 ? 128 : 0;
     const int64_t xz = quantized::q_zero_point(x) - shift;
     const double xs = quantized::q_scale(x);
-    const dim3 block(16, 16), grid((g.outputs / g.groups + 15) / 16, (g.rows + 15) / 16, g.groups);
+    const int64_t tiles = ((g.outputs / g.groups + 15) / 16) * ((g.rows + 15) / 16) * g.groups;
+    TP_CHECK(tiles <= 2147483647, "Packed output exceeds the supported launch size");
+    const dim3 block(16, 16), grid(static_cast<unsigned int>(tiles));
     const auto stream = getCurrentCUDAStream().stream();
     if (g.linear) packed_gemm<X,Y><<<grid, block, 0, stream>>>(x.data_ptr<X>(), packed.data_ptr<int8_t>(), offsets.data_ptr<int64_t>(), scales.data_ptr<float>(), zps.data_ptr<int64_t>(), bias ? bias->data_ptr<float>() : nullptr, out.data_ptr<Y>(), g, xs, xz, ys, yz, shift, relu, output_float);
     else packed_gemm<int8_t,Y><<<grid, block, 0, stream>>>(columns.data_ptr<int8_t>(), packed.data_ptr<int8_t>(), offsets.data_ptr<int64_t>(), scales.data_ptr<float>(), zps.data_ptr<int64_t>(), bias ? bias->data_ptr<float>() : nullptr, out.data_ptr<Y>(), g, xs, xz, ys, yz, 0, relu, output_float);
