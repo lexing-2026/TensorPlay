@@ -80,19 +80,21 @@ def test_dynamic_linear_pair_saturation_and_chunk_tails(device,features,reduce_r
 @pytest.mark.parametrize('dtype,zp',TYPES[:2])
 @pytest.mark.parametrize('relu',[False,True])
 @pytest.mark.parametrize('weight_zp',[0,-3])
-def test_large_integer_linear_affine_correction_and_weight_mutation(device,dtype,zp,relu,weight_zp):
+@pytest.mark.parametrize('rows',[1,2,4,32])
+@pytest.mark.parametrize('outputs,features',[(9,33),(128,512)])
+def test_large_integer_linear_affine_correction_and_weight_mutation(device,dtype,zp,relu,weight_zp,rows,outputs,features):
     from tensorplay.ao.nn.quantized.packed import PackedWeight
     rng=np.random.default_rng(981)
-    values=rng.integers(-110,111,size=(32,512)).astype(dtype)
+    values=rng.integers(-110,111,size=(rows,features)).astype(dtype)
     x,_=pair(values,dtype,device,scale=.03,zp=zp)
-    biases=rng.normal(0,.3,size=128).astype('float32')
-    weight_codes=rng.integers(-128,128,size=(128,512),dtype='int8')
+    biases=rng.normal(0,.3,size=outputs).astype('float32')
+    weight_codes=rng.integers(-128,128,size=(outputs,features),dtype='int8')
     weight,_=pair(weight_codes,'int8',device,scale=.02,zp=weight_zp)
     packed=PackedWeight(weight,tp.tensor(biases,device=device))
     for iteration in range(2):
         if iteration:
             weight_zp=-3 if weight_zp==0 else 0
-            weight_codes=rng.integers(-128,128,size=(128,512),dtype='int8')
+            weight_codes=rng.integers(-128,128,size=(outputs,features),dtype='int8')
             weight,_=pair(weight_codes,'int8',device,scale=.02,zp=weight_zp)
             replacement=PackedWeight(weight,tp.tensor(biases,device=device))
             packed.packed.copy_(replacement.packed)

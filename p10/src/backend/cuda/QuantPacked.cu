@@ -181,6 +181,54 @@ __global__ void packed_gemm(const X* input, const int8_t* weight,
 }
 
 template<class X, class Y>
+__global__ void packed_gemv(const X* input,const int8_t* weight,const int64_t* offsets,
+        const float* scales,const int64_t* zps,const float* bias,Y* out,quant::PackedDeviceGeometry g,
+        double xs,int64_t xz,double ys,int64_t yz,int shift,bool relu,bool output_float) {
+    const int lane=threadIdx.x%32,warp=threadIdx.x/32;
+    const int64_t n=static_cast<int64_t>(blockIdx.x)*8+warp,row=blockIdx.y;
+    if (n>=g.outputs) return;
+    int64_t acc=0,sum=0;
+    for (int64_t k=lane*4;k<g.K;k+=128) {
+        int a=0,b=0;
+        if (g.K%4==0) {
+            a=*reinterpret_cast<const int*>(input+row*g.K+k);
+            if (shift) a^=static_cast<int>(0x80808080u);
+            b=*reinterpret_cast<const int*>(weight+n*g.padded_K+k);
+        } else {
+            for (int j=0;j<4 && k+j<g.K;++j) {
+                a|=static_cast<int>(static_cast<uint8_t>(static_cast<int>(input[row*g.K+k+j])-shift))<<(j*8);
+                b|=static_cast<int>(static_cast<uint8_t>(weight[n*g.padded_K+k+j]))<<(j*8);
+            }
+        }
+        if (output_float && shift==128) {
+            for (int pair=0;pair<4;pair+=2) {
+                const int i0=static_cast<int8_t>(a>>(pair*8))+shift;
+                const int i1=static_cast<int8_t>(a>>((pair+1)*8))+shift;
+                const int product=i0*static_cast<int8_t>(b>>(pair*8))+i1*static_cast<int8_t>(b>>((pair+1)*8));
+                acc+=min(32767,max(-32768,product));
+            }
+        } else acc+=dot4(a,b,0);
+        sum+=dot4(a,0x01010101,0);
+    }
+    for (int step=16;step;step/=2) {
+        acc+=__shfl_down_sync(0xffffffffu,acc,step);
+        sum+=__shfl_down_sync(0xffffffffu,sum,step);
+    }
+    if (lane) return;
+    if (output_float && shift==128) acc-=shift*offsets[n];
+    acc=acc-xz*offsets[n]-zps[n]*sum+g.K*xz*zps[n];
+    const int64_t index=row*g.outputs+n;
+    double value=quant::packed_real_value(acc,xs,scales[n],bias ? bias[n] : 0.f,output_float);
+    value=quant::packed_activation(value,index,g);
+    if (relu) value=fmax(value,0.);
+    if (output_float) out[index]=static_cast<Y>(value);
+    else {
+        const double lo=std::is_same_v<Y,uint8_t> ? 0. : -128.;
+        out[index]=static_cast<Y>(fmin(lo+255.,fmax(lo,nearbyint(value/ys)+yz)));
+    }
+}
+
+template<class X, class Y>
 void launch(const Tensor& x, const Tensor& columns, const Tensor& packed,
             const Tensor& offsets, const Tensor& scales, const Tensor& zps,
             const std::optional<Tensor>& bias, Tensor& out,
@@ -192,6 +240,12 @@ void launch(const Tensor& x, const Tensor& columns, const Tensor& packed,
     TP_CHECK(tiles <= 2147483647, "Packed output exceeds the supported launch size");
     const dim3 block(16, 16), grid(static_cast<unsigned int>(tiles));
     const auto stream = getCurrentCUDAStream().stream();
+    if (g.linear && g.rows<=4) {
+        packed_gemv<X,Y><<<dim3(static_cast<unsigned>((g.outputs+7)/8),static_cast<unsigned>(g.rows)),256,0,stream>>>(
+            x.data_ptr<X>(),packed.data_ptr<int8_t>(),offsets.data_ptr<int64_t>(),scales.data_ptr<float>(),
+            zps.data_ptr<int64_t>(),bias ? bias->data_ptr<float>() : nullptr,out.data_ptr<Y>(),g,xs,xz,ys,yz,shift,relu,output_float);
+        return;
+    }
     if (g.linear) packed_gemm<X,Y><<<grid, block, 0, stream>>>(x.data_ptr<X>(), packed.data_ptr<int8_t>(), offsets.data_ptr<int64_t>(), scales.data_ptr<float>(), zps.data_ptr<int64_t>(), bias ? bias->data_ptr<float>() : nullptr, out.data_ptr<Y>(), g, xs, xz, ys, yz, shift, relu, output_float);
     else packed_gemm<int8_t,Y><<<grid, block, 0, stream>>>(columns.data_ptr<int8_t>(), packed.data_ptr<int8_t>(), offsets.data_ptr<int64_t>(), scales.data_ptr<float>(), zps.data_ptr<int64_t>(), bias ? bias->data_ptr<float>() : nullptr, out.data_ptr<Y>(), g, xs, xz, ys, yz, 0, relu, output_float);
 }
