@@ -145,9 +145,20 @@ def test_clone_and_factory_packets_carry_grid_and_layout(device, per_channel, ch
         args = [list(x.shape), x] if name == 'empty_quantized' else [x]
         refs = [list(r.shape), r] if name == 'empty_quantized' else [r]
         options = {'memory_format': amf} if name != 'empty_like' else {}
-        reference_options = {'memory_format': rmf} if name != 'empty_like' else {}
+        reference_options = {'memory_format': rmf} if name == 'clone' else {}
         actual = resolve(tp.ops.tp, name)(*args, **options, **({'device': device} if name == 'empty_quantized' else {}))
-        expected = resolve(torch.ops.aten, name)(*refs, **reference_options)
+        if name == 'empty_quantized':
+            if per_channel:
+                expected = torch.ops.aten._empty_per_channel_affine_quantized.default(
+                    list(r.shape), scales=r.q_per_channel_scales(),
+                    zero_points=r.q_per_channel_zero_points(), axis=r.q_per_channel_axis(),
+                    dtype=r.dtype, memory_format=rmf)
+            else:
+                expected = torch.ops.aten._empty_affine_quantized.default(
+                    list(r.shape), dtype=r.dtype, scale=r.q_scale(),
+                    zero_point=r.q_zero_point(), memory_format=rmf)
+        else:
+            expected = resolve(torch.ops.aten, name)(*refs, **reference_options)
         if name != 'clone':
             actual.copy_(x)
             expected.copy_(r)
