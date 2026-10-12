@@ -47,7 +47,19 @@ Tensor activation(const Tensor& input, double scale, int64_t zp, quant::Activati
         const int blocks = static_cast<int>(std::min<int64_t>((input.numel() + 4095) / 4096, 4096));
         const auto stream = getCurrentCUDAStream().stream();
         const float inverse_scale = 1.f / static_cast<float>(scale);
-        switch (input.dtype()) {
+        if (fn.op == 7 && scale == quantized::q_scale(input) && zp == xz) {
+            auto clip = [&]<class T>() {
+                const int64_t lo = quant::encode<T>(fn.slope, inverse_scale, zp);
+                const T hi = quant::encode<T>(fn.alpha, inverse_scale, zp);
+                relu6_codes<<<blocks,256,0,stream>>>(x.data_ptr<T>(), out.data_ptr<T>(), input.numel(), lo, hi);
+            };
+            switch (input.dtype()) {
+                case DType::QInt8: clip.template operator()<int8_t>(); break;
+                case DType::QUInt8: clip.template operator()<uint8_t>(); break;
+                case DType::QInt32: clip.template operator()<int32_t>(); break;
+                default: TP_THROW(TypeError, "Clipping requires quantized integer input");
+            }
+        } else switch (input.dtype()) {
             case DType::QInt8: activation_codes<<<blocks,256,0,stream>>>(x.data_ptr<int8_t>(),out.data_ptr<int8_t>(),input.numel(),xs,xz,inverse_scale,zp,fn); break;
             case DType::QUInt8: activation_codes<<<blocks,256,0,stream>>>(x.data_ptr<uint8_t>(),out.data_ptr<uint8_t>(),input.numel(),xs,xz,inverse_scale,zp,fn); break;
             case DType::QInt32: activation_codes<<<blocks,256,0,stream>>>(x.data_ptr<int32_t>(),out.data_ptr<int32_t>(),input.numel(),xs,xz,inverse_scale,zp,fn); break;

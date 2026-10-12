@@ -349,6 +349,7 @@ def test_channels_last_activation_prelu_and_moments(device, dtype, zp, rank):
     x, r = x.contiguous(memory_format=fmt), r.contiguous(memory_format=rfmt)
     w, rw = pair(device, dtype, zp, shape=(1, 4) + (1,) * rank)
     for operation, args, rargs in [('relu', (), ()), ('sigmoid', (), ()),
+                                   ('hardtanh', (-.6, .7), (-.6, .7)),
                                    ('_prelu_kernel', (w,), (rw,))]:
         actual = resolve(tp.ops.tp, operation)(x, *args)
         expected = resolve(torch.ops.aten, operation)(r, *rargs)

@@ -67,7 +67,24 @@ Tensor activation_cpu(const Tensor& input, double scale, int64_t zp, Activation 
     const auto format = quant::activation_format(input);
     const Tensor x = input.contiguous(static_cast<int64_t>(format));
     Tensor out = quant::activation_output(input, format);
-    if (input.dtype() == DType::QInt8 || input.dtype() == DType::QUInt8) {
+    if (fn.op == 7 && scale == quantized::q_scale(input) && zp == input_zp) {
+        auto clip = [&]<class T>() {
+            const int64_t lo = encode<T>(fn.slope, inverse_scale, zp);
+            const int64_t hi = encode<T>(fn.alpha, inverse_scale, zp);
+            const auto* src = x.data_ptr<T>();
+            auto* dst = out.data_ptr<T>();
+            parallel::parallel_for(0, input.numel(), 32768, [&](int64_t begin, int64_t end) {
+                cpu::quantized_clip_stub(DeviceType::CPU, src + begin, dst + begin,
+                                         end - begin, input.dtype(), lo, hi);
+            });
+        };
+        switch (input.dtype()) {
+            case DType::QInt8: clip.template operator()<int8_t>(); break;
+            case DType::QUInt8: clip.template operator()<uint8_t>(); break;
+            case DType::QInt32: clip.template operator()<int32_t>(); break;
+            default: TP_THROW(TypeError, "Clipping requires quantized integer input");
+        }
+    } else if (input.dtype() == DType::QInt8 || input.dtype() == DType::QUInt8) {
         const auto& cached = activation_table(input, inverse_scale, zp, fn);
         const auto* src = static_cast<const uint8_t*>(x.data_ptr());
         auto* dst = static_cast<uint8_t*>(out.data_ptr());

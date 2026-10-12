@@ -37,7 +37,6 @@ Tensor activation(const Tensor& self, int operation, double a, double b) {
         scale = static_cast<float>(scale);
     }
     if (operation == 10) return Tensor::quantized_relu(self);
-    if (operation == 7) return with_quantizer(storage_view(self).clamp(scalar_code(self, Scalar(a)), scalar_code(self, Scalar(b))), self);
     const quant::Activation fn{operation, static_cast<float>(a), static_cast<float>(b)};
     if (self.device().is_cpu()) return quant::activation_cpu(self, scale, zp, fn);
 #ifdef USE_CUDA
