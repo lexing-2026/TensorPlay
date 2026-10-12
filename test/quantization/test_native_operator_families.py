@@ -76,6 +76,37 @@ def test_dynamic_linear_pair_saturation_and_chunk_tails(device,features,reduce_r
     np.testing.assert_array_equal(actual.cpu().numpy(),exact)
 
 
+@pytest.mark.parametrize('device',DEVICES)
+@pytest.mark.parametrize('dtype,zp',TYPES[:2])
+@pytest.mark.parametrize('relu',[False,True])
+@pytest.mark.parametrize('weight_zp',[0,-3])
+def test_large_integer_linear_affine_correction_and_weight_mutation(device,dtype,zp,relu,weight_zp):
+    from tensorplay.ao.nn.quantized.packed import PackedWeight
+    rng=np.random.default_rng(981)
+    values=rng.integers(-110,111,size=(32,512)).astype(dtype)
+    x,_=pair(values,dtype,device,scale=.03,zp=zp)
+    biases=rng.normal(0,.3,size=128).astype('float32')
+    weight_codes=rng.integers(-128,128,size=(128,512),dtype='int8')
+    weight,_=pair(weight_codes,'int8',device,scale=.02,zp=weight_zp)
+    packed=PackedWeight(weight,tp.tensor(biases,device=device))
+    for iteration in range(2):
+        if iteration:
+            weight_zp=-3 if weight_zp==0 else 0
+            weight_codes=rng.integers(-128,128,size=(128,512),dtype='int8')
+            weight,_=pair(weight_codes,'int8',device,scale=.02,zp=weight_zp)
+            replacement=PackedWeight(weight,tp.tensor(biases,device=device))
+            packed.packed.copy_(replacement.packed)
+            packed.offsets.copy_(replacement.offsets)
+            packed.zero_points.copy_(replacement.zero_points)
+        actual=packed.run(x,.2,zp,relu=relu)
+        accumulator=(values.astype('int64')-zp)@(weight_codes.astype('int64')-weight_zp).T
+        real=accumulator*.03*np.float64(np.float32(.02))+biases
+        if relu: real=np.maximum(real,0.)
+        lo=np.iinfo(dtype).min;hi=np.iinfo(dtype).max
+        expected=np.clip(np.rint(real/.2)+zp,lo,hi).astype(dtype)
+        np.testing.assert_array_equal(actual.int_repr().cpu().numpy(),expected)
+
+
 @pytest.mark.parametrize('device', DEVICES)
 @pytest.mark.parametrize('dtype,zp', TYPES)
 @pytest.mark.parametrize('value', [-100., -.3, 0., .3, 100.])

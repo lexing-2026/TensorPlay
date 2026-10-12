@@ -44,8 +44,10 @@ int64_t dynamic_dot_impl(const uint8_t* x,const int8_t* w,int64_t size) {
     return total;
 }
 
-void dynamic_block_impl(const uint8_t* x,const int8_t* w,int64_t* totals,
-        int64_t size,int64_t weight_stride,int64_t rows,int64_t columns) {
+template<int Rows,int Columns>
+void dynamic_block_codes(const uint8_t* x,const int8_t* w,int64_t* totals,
+        int64_t size,int64_t weight_stride) {
+    constexpr int rows=Rows,columns=Columns;
     std::fill(totals,totals+8,0);
     int64_t k=0;
 #if defined(CPU_CAPABILITY_AVX2) || defined(CPU_CAPABILITY_AVX512)
@@ -59,16 +61,20 @@ void dynamic_block_impl(const uint8_t* x,const int8_t* w,int64_t* totals,
 #ifdef CPU_CAPABILITY_AVX512
             __m512i weights[4];
             for (int c=0;c<columns;++c) weights[c]=_mm512_loadu_si512(w+c*weight_stride+k);
+            #pragma GCC unroll 2
             for (int r=0;r<rows;++r) {
                 const auto values=_mm512_loadu_si512(x+r*size+k);
+                #pragma GCC unroll 4
                 for (int c=0;c<columns;++c)
                     accum[r][c]=accum[r][c]+V(_mm512_madd_epi16(_mm512_maddubs_epi16(values,weights[c]),_mm512_set1_epi16(1)));
             }
 #else
             __m256i weights[4];
             for (int c=0;c<columns;++c) weights[c]=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(w+c*weight_stride+k));
+            #pragma GCC unroll 2
             for (int r=0;r<rows;++r) {
                 const auto values=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(x+r*size+k));
+                #pragma GCC unroll 4
                 for (int c=0;c<columns;++c)
                     accum[r][c]=accum[r][c]+V(_mm256_madd_epi16(_mm256_maddubs_epi16(values,weights[c]),_mm256_set1_epi16(1)));
             }
@@ -86,6 +92,20 @@ void dynamic_block_impl(const uint8_t* x,const int8_t* w,int64_t* totals,
         if (k+1<size) value+=static_cast<int>(x[r*size+k+1])*w[c*weight_stride+k+1];
         totals[r*4+c]+=std::clamp(value,-32768,32767);
     }
+}
+
+void dynamic_block_impl(const uint8_t* x,const int8_t* w,int64_t* totals,
+        int64_t size,int64_t weight_stride,int64_t rows,int64_t columns) {
+    auto run=[&]<int Rows>() {
+        switch (columns) {
+            case 1: dynamic_block_codes<Rows,1>(x,w,totals,size,weight_stride); break;
+            case 2: dynamic_block_codes<Rows,2>(x,w,totals,size,weight_stride); break;
+            case 3: dynamic_block_codes<Rows,3>(x,w,totals,size,weight_stride); break;
+            default: dynamic_block_codes<Rows,4>(x,w,totals,size,weight_stride); break;
+        }
+    };
+    if (rows==1) run.template operator()<1>();
+    else run.template operator()<2>();
 }
 
 #if defined(__GNUC__) && !defined(__clang__)
@@ -181,16 +201,20 @@ void int4_mm_codes(const T* x, const uint8_t* packed, const T* params, T* output
     parallel::parallel_for(0, mb*nb, 1, [&](int64_t begin, int64_t end) {
         for (int64_t task = begin; task < end; ++task) {
             const int64_t row = task/nb*4, first = task%nb*columns;
-            const int width = std::min<int64_t>(columns,n-first), rows = std::min<int64_t>(4,m-row);
-            const int vectors = (width+lanes-1)/lanes;
+            const int active_width = std::min<int64_t>(columns,n-first), active_rows = std::min<int64_t>(4,m-row);
+            auto compute=[&]<int Rows,bool Full>() {
+            const int width=Full ? columns : active_width,rows=Full ? Rows : active_rows;
+            const int vectors = Full ? 4 : (width+lanes-1)/lanes;
             FV acc[4][4];
             for (int r=0;r<rows;++r) for (int c=0;c<vectors;++c) acc[r][c]=FV(0.f);
             FV scales[4], zeros[4];
+            int64_t next_scale=0,group_index=0;
             for (int64_t feature=0;feature<k;++feature) {
-                if (feature%group==0) {
+                if (feature==next_scale) {
+                    #pragma GCC unroll 4
                     for (int c=0;c<vectors;++c) {
                         if (c*lanes+lanes<=width) {
-                            const int64_t index=(feature/group*n+first+c*lanes)*2;
+                            const int64_t index=(group_index*n+first+c*lanes)*2;
                             FV a,b;
                             if constexpr (std::is_same_v<T,float>) {
                                 a=FV::loadu(params+index); b=FV::loadu(params+index+lanes);
@@ -204,18 +228,21 @@ void int4_mm_codes(const T* x, const uint8_t* packed, const T* params, T* output
                         }
                         alignas(64) float s[lanes]{}, z[lanes]{};
                         for (int lane=0;lane<lanes && c*lanes+lane<width;++lane) {
-                            const int64_t index=(feature/group*n+first+c*lanes+lane)*2;
+                            const int64_t index=(group_index*n+first+c*lanes+lane)*2;
                             s[lane]=static_cast<float>(params[index]); z[lane]=static_cast<float>(params[index+1]);
                         }
                         scales[c]=FV::loadu(s); zeros[c]=FV::loadu(z);
                     }
+                    next_scale+=group;
+                    ++group_index;
                 }
                 FV activation[4];
                 for (int r=0;r<rows;++r) activation[r]=FV(static_cast<float>(x[(row+r)*k+feature]));
+                #pragma GCC unroll 4
                 for (int c=0;c<vectors;++c) {
                     FV code_vector;
 #if defined(CPU_CAPABILITY_AVX2) || defined(CPU_CAPABILITY_AVX512)
-                    if (width==columns) {
+                    if constexpr (Full) {
                         const int offset=c%(vectors/2)*lanes,shift=(c>=vectors/2)*4;
                         const auto* src=packed+first*k/2+feature*width/2+offset;
 #ifdef CPU_CAPABILITY_AVX512
@@ -244,6 +271,7 @@ void int4_mm_codes(const T* x, const uint8_t* packed, const T* params, T* output
                     code_vector=FV::loadu(codes);
                     }
                     const FV weight=vec::fmadd(code_vector,scales[c],zeros[c]);
+                    #pragma GCC unroll 4
                     for (int r=0;r<rows;++r)
                         acc[r][c]=vec::fmadd(activation[r],weight,acc[r][c]);
                 }
@@ -253,6 +281,15 @@ void int4_mm_codes(const T* x, const uint8_t* packed, const T* params, T* output
                 for (int lane=0;lane<lanes && c*lanes+lane<width;++lane)
                     output[(row+r)*n+first+c*lanes+lane]=static_cast<T>(values[lane]);
             }
+            };
+            if (active_width==columns) {
+                switch (active_rows) {
+                    case 1: compute.template operator()<1,true>(); break;
+                    case 2: compute.template operator()<2,true>(); break;
+                    case 3: compute.template operator()<3,true>(); break;
+                    default: compute.template operator()<4,true>(); break;
+                }
+            } else compute.template operator()<4,false>();
         }
     });
 }

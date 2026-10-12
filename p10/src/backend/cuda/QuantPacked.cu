@@ -2,8 +2,10 @@
 #include "QuantNative.h"
 #include "Dispatcher.h"
 #include "CUDARuntime.h"
+#include "CUDAContext.h"
 #include "QuantElementwise.h"
 #include <cuda_runtime.h>
+#include <array>
 
 namespace tensorplay::cuda {
 namespace {
@@ -193,6 +195,112 @@ void launch(const Tensor& x, const Tensor& columns, const Tensor& packed,
     if (g.linear) packed_gemm<X,Y><<<grid, block, 0, stream>>>(x.data_ptr<X>(), packed.data_ptr<int8_t>(), offsets.data_ptr<int64_t>(), scales.data_ptr<float>(), zps.data_ptr<int64_t>(), bias ? bias->data_ptr<float>() : nullptr, out.data_ptr<Y>(), g, xs, xz, ys, yz, shift, relu, output_float);
     else packed_gemm<int8_t,Y><<<grid, block, 0, stream>>>(columns.data_ptr<int8_t>(), packed.data_ptr<int8_t>(), offsets.data_ptr<int64_t>(), scales.data_ptr<float>(), zps.data_ptr<int64_t>(), bias ? bias->data_ptr<float>() : nullptr, out.data_ptr<Y>(), g, xs, xz, ys, yz, 0, relu, output_float);
 }
+
+template<class X>
+__global__ void prepare_integer_rows(const X* x,int8_t* signed_x,int64_t* sums,int64_t rows,int64_t k) {
+    const int64_t row=blockIdx.x;
+    int64_t sum=0;
+    for (int64_t col=threadIdx.x;col<k;col+=blockDim.x) {
+        const int value=static_cast<int>(x[row*k+col])-(std::is_same_v<X,uint8_t> ? 128 : 0);
+        if (signed_x) signed_x[row*k+col]=static_cast<int8_t>(value);
+        sum+=value;
+    }
+    __shared__ int64_t partial[256];
+    partial[threadIdx.x]=sum;
+    __syncthreads();
+    for (int step=128;step;step/=2) {
+        if (threadIdx.x<step) partial[threadIdx.x]+=partial[threadIdx.x+step];
+        __syncthreads();
+    }
+    if (!threadIdx.x && sums) sums[row]=partial[0];
+}
+
+template<class Y,bool Symmetric>
+__global__ void integer_product_epilogue(const int32_t* raw,const int64_t* sums,
+        const int64_t* offsets,const float* scales,const int64_t* zps,const float* bias,Y* out,
+        quant::PackedDeviceGeometry g,double xs,int64_t xz,double ys,int64_t yz,bool relu) {
+    for (int64_t i=static_cast<int64_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+        i<g.rows*g.outputs;i+=static_cast<int64_t>(gridDim.x)*blockDim.x) {
+        const int64_t n=i%g.outputs,row=i/g.outputs;
+        int64_t acc=raw[i];
+        if (xz) acc-=xz*offsets[n];
+        if constexpr (!Symmetric) acc-=zps[n]*sums[row]-g.K*xz*zps[n];
+        double value=quant::packed_real_value(acc,xs,scales[n],bias ? bias[n] : 0.f,false);
+        value=quant::packed_activation(value,i,g);
+        if (relu) value=fmax(value,0.);
+        const double lo=std::is_same_v<Y,uint8_t> ? 0. : -128.;
+        out[i]=static_cast<Y>(fmin(lo+255.,fmax(lo,nearbyint(value/ys)+yz)));
+    }
+}
+
+bool symmetric_zero_points(const Tensor& zps) {
+    struct Entry { Tensor source; uint32_t version=0; uintptr_t stream=0; bool symmetric=false; };
+    thread_local std::array<Entry,32> cache;
+    thread_local size_t next=0;
+    const bool cacheable=zps.impl()->version_counter().is_enabled();
+    const uint32_t version=cacheable ? zps._version() : 0;
+    const uintptr_t stream=reinterpret_cast<uintptr_t>(getCurrentCUDAStream().stream());
+    for (const auto& entry:cache)
+        if (cacheable && entry.source.defined() && entry.source.impl()==zps.impl()
+            && entry.version==version && entry.stream==stream) return entry.symmetric;
+    const Tensor host=zps.to(Device(DeviceType::CPU)).contiguous();
+    const auto* values=host.data_ptr<int64_t>();
+    bool symmetric=true;
+    for (int64_t i=0;i<host.numel();++i) if (values[i]) { symmetric=false; break; }
+    if (cacheable && zps.numel()<=65536) cache[next++%cache.size()]={zps,version,stream,symmetric};
+    return symmetric;
+}
+
+bool integer_product(const Tensor& x,const Tensor& packed,const Tensor& offsets,const Tensor& scales,
+        const Tensor& zps,const std::optional<Tensor>& bias,Tensor& out,const quant::PackedGeometry& g,
+        double ys,int64_t yz,bool relu,bool output_float) {
+    if (!g.linear || output_float || g.K==0 || g.K>65536 || g.K%4 || g.outputs%4 || g.rows<8
+        || g.rows*g.outputs*g.K<1048576 || g.rows>2147483647 || g.outputs>2147483647) return false;
+    const auto stream=getCurrentCUDAStream().stream();
+    const bool symmetric=symmetric_zero_points(zps);
+    Tensor sums=Tensor::empty({symmetric ? 0 : g.rows},DType::Int64,x.device());
+    Tensor signed_x;
+    const bool unsigned_input=x.dtype()==DType::QUInt8;
+    if (unsigned_input) {
+        signed_x=Tensor::empty(x.shape(),DType::Int8,x.device());
+        prepare_integer_rows<<<g.rows,256,0,stream>>>(x.data_ptr<uint8_t>(),signed_x.data_ptr<int8_t>(),symmetric ? nullptr : sums.data_ptr<int64_t>(),g.rows,g.K);
+    } else if (!symmetric) prepare_integer_rows<<<g.rows,256,0,stream>>>(x.data_ptr<int8_t>(),nullptr,sums.data_ptr<int64_t>(),g.rows,g.K);
+    Tensor raw=Tensor::empty({g.rows,g.outputs},DType::Int32,x.device());
+    const auto handle=CUDAContext::getCublasHandle();
+    auto checked=[](cublasStatus_t status) {
+        TP_CHECK(status==CUBLAS_STATUS_SUCCESS,"Integer matrix BLAS call failed with status ",static_cast<int>(status));
+    };
+    struct RestoreMode {
+        cublasHandle_t handle; cublasMath_t math=CUBLAS_DEFAULT_MATH; cublasPointerMode_t pointer=CUBLAS_POINTER_MODE_HOST;
+        ~RestoreMode() { cublasSetMathMode(handle,math); cublasSetPointerMode(handle,pointer); }
+    } restore{handle};
+    checked(cublasGetMathMode(handle,&restore.math)); checked(cublasGetPointerMode(handle,&restore.pointer));
+    checked(cublasSetStream(handle,stream)); checked(cublasSetMathMode(handle,CUBLAS_DEFAULT_MATH));
+    checked(cublasSetPointerMode(handle,CUBLAS_POINTER_MODE_HOST));
+    const int32_t alpha=1,beta=0;
+    const auto status=cublasGemmEx(handle,CUBLAS_OP_T,CUBLAS_OP_N,g.outputs,g.rows,g.K,&alpha,
+        packed.data_ptr<int8_t>(),CUDA_R_8I,g.padded_K,unsigned_input ? signed_x.data_ptr<int8_t>() : x.data_ptr<int8_t>(),
+        CUDA_R_8I,g.K,&beta,raw.data_ptr<int32_t>(),CUDA_R_32I,g.outputs,CUBLAS_COMPUTE_32I,CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (status==CUBLAS_STATUS_NOT_SUPPORTED) return false;
+    checked(status);
+    const int blocks=static_cast<int>(std::min<int64_t>((out.numel()+255)/256,65535));
+    const double xs=quantized::q_scale(x);
+    const int64_t xz=quantized::q_zero_point(x)-(unsigned_input ? 128 : 0);
+    auto launch_epilogue=[&]<class Y,bool Symmetric>() {
+        integer_product_epilogue<Y,Symmetric><<<blocks,256,0,stream>>>(raw.data_ptr<int32_t>(),
+            Symmetric ? nullptr : sums.data_ptr<int64_t>(),offsets.data_ptr<int64_t>(),scales.data_ptr<float>(),
+            zps.data_ptr<int64_t>(),bias ? bias->data_ptr<float>() : nullptr,out.data_ptr<Y>(),g,xs,xz,ys,yz,relu);
+    };
+    if (unsigned_input) {
+        if (symmetric) launch_epilogue.template operator()<uint8_t,true>();
+        else launch_epilogue.template operator()<uint8_t,false>();
+    } else {
+        if (symmetric) launch_epilogue.template operator()<int8_t,true>();
+        else launch_epilogue.template operator()<int8_t,false>();
+    }
+    checkCuda(cudaGetLastError(),"Integer matrix epilogue");
+    return true;
+}
 } // namespace
 
 Tensor quantized_relu_cuda(const Tensor& input) {
@@ -296,7 +404,8 @@ Tensor _quantized_packed_run_cuda(
     const bool unsigned_input = input.dtype() == DType::QUInt8;
     Tensor out = Tensor::empty(g.shape, output_float ? DType::Float32 : (unsigned_input ? DType::UInt8 : DType::Int8), input.device());
     Tensor columns = Tensor::empty({0}, DType::Int8, input.device());
-    if (out.numel()) {
+    if (out.numel() && !integer_product(x,packed,offsets,scales,zero_points,bias,out,g,
+        output_scale,output_zero_point,relu,output_float)) {
         if (!g.linear && g.K) {
             columns = Tensor::empty({g.groups, g.rows, g.padded_K}, DType::Int8, input.device());
             const int blocks = static_cast<int>(std::min<int64_t>((columns.numel() + 255) / 256, 65535));

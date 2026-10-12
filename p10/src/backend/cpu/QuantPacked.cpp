@@ -136,26 +136,32 @@ int64_t dot_scalar(const X* x, const int8_t* w, int64_t K) {
 
 #ifdef USE_ONEDNN
 struct IntegerProduct {
-    dnnl::memory::desc src, weight, dst;
+    dnnl::memory::desc src, weight, dst,logical_weight;
     dnnl::matmul product;
+    dnnl::memory weight_memory;
+    Tensor weight_source;
+    uint32_t weight_version=0;
     dnnl::memory::desc scratch_desc;
     std::vector<uint8_t> scratch;
     IntegerProduct(const std::array<int64_t, 6>& key) {
         using DT = dnnl::memory::data_type;
         src = dnnl::memory::desc({key[0], key[2]}, key[4] ? DT::u8 : DT::s8, {key[2], 1});
-        weight = dnnl::memory::desc({key[2], key[1]}, DT::s8, {1, key[3]});
+        logical_weight = dnnl::memory::desc({key[2], key[1]}, DT::s8, {1, key[3]});
+        weight = dnnl::memory::desc({key[2], key[1]}, DT::s8,dnnl::memory::format_tag::any);
         dst = dnnl::memory::desc({key[0], key[1]}, DT::s32, {key[1], 1});
         dnnl::primitive_attr attr;
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
         const auto desc = dnnl::matmul::primitive_desc(OneDNNContext::get_engine(), src, weight, dst, attr);
         product = dnnl::matmul(desc);
+        weight=desc.weights_desc();
+        weight_memory=dnnl::memory(weight,OneDNNContext::get_engine());
         scratch_desc = desc.scratchpad_desc();
         scratch.resize(scratch_desc.get_size());
     }
 };
 
 template<class X>
-bool linear_integer_product(const X* x, const int8_t* w, const int64_t* offsets,
+bool linear_integer_product(const X* x, const Tensor& packed, const int64_t* offsets,
         const float* scales, const int64_t* zps, const float* bias,
         const quant::PackedGeometry& g, Tensor& out, double xs, int64_t xz,
         double ys, int64_t yz, bool relu, bool output_float) {
@@ -179,13 +185,24 @@ bool linear_integer_product(const X* x, const int8_t* w, const int64_t* offsets,
     Tensor acc = Tensor::empty({g.rows, g.outputs}, DType::Int32, out.device());
     auto& engine = OneDNNContext::get_engine();
     auto& stream = OneDNNContext::get_stream();
+    const bool cacheable=packed.impl()->version_counter().is_enabled();
+    const uint32_t version=cacheable ? packed._version() : 0;
+    if (!cacheable || !kernel.weight_source.defined() || kernel.weight_source.impl()!=packed.impl()
+        || kernel.weight_version!=version) {
+        auto original=dnnl::memory(kernel.logical_weight,engine,const_cast<int8_t*>(packed.data_ptr<int8_t>()));
+        dnnl::reorder(original,kernel.weight_memory).execute(stream,original,kernel.weight_memory);
+        kernel.weight_source=packed;
+        kernel.weight_version=version;
+    }
     kernel.product.execute(stream, {
         {DNNL_ARG_SRC, dnnl::memory(kernel.src, engine, const_cast<X*>(x))},
-        {DNNL_ARG_WEIGHTS, dnnl::memory(kernel.weight, engine, const_cast<int8_t*>(w))},
+        {DNNL_ARG_WEIGHTS, kernel.weight_memory},
         {DNNL_ARG_DST, dnnl::memory(kernel.dst, engine, acc.data_ptr())},
         {DNNL_ARG_SCRATCHPAD, dnnl::memory(kernel.scratch_desc, engine, kernel.scratch.data())}});
     stream.wait();
     const auto* raw = acc.data_ptr<int32_t>();
+    auto* dst_float=output_float ? out.data_ptr<float>() : nullptr;
+    auto* dst_codes=output_float ? nullptr : out.data_ptr<X>();
     parallel::parallel_for(0, g.rows, 8, [&](int64_t begin, int64_t end) {
         for (int64_t row = begin; row < end; ++row) {
             int64_t sum = 0;
@@ -196,10 +213,10 @@ bool linear_integer_product(const X* x, const int8_t* w, const int64_t* offsets,
                 double value = quant::packed_real_value(value_i,xs,scales[n],bias ? bias[n] : 0.f,output_float);
                 value = quant::packed_activation(value, index, g);
                 if (relu) value = std::max(value, 0.);
-                if (output_float) out.data_ptr<float>()[index] = static_cast<float>(value);
+                if (output_float) dst_float[index] = static_cast<float>(value);
                 else {
                     constexpr int64_t lo = std::is_same_v<X, uint8_t> ? 0 : -128;
-                    out.data_ptr<X>()[index] = static_cast<X>(std::clamp(std::nearbyint(value / ys) + yz, static_cast<double>(lo), static_cast<double>(lo + 255)));
+                    dst_codes[index] = static_cast<X>(std::clamp(std::nearbyint(value / ys) + yz, static_cast<double>(lo), static_cast<double>(lo + 255)));
                 }
             }
         }
@@ -271,9 +288,10 @@ template<class X>
 void linear_vnni(const X* x, const int8_t* w, const int64_t* offsets,
         const float* scales, const int64_t* zps, const float* bias,
         const quant::PackedGeometry& g, Tensor& out, double xs, int64_t xz,
-        double ys, int64_t yz, bool relu, bool output_float) {
+        double ys, int64_t yz, bool relu, bool output_float,bool saturating) {
     const int64_t row_tiles = (g.rows + 1) / 2, column_tiles = (g.outputs + 63) / 64;
-    const bool saturating=output_float && std::is_same_v<X,uint8_t>;
+    auto* dst_float=output_float ? out.data_ptr<float>() : nullptr;
+    auto* dst_codes=output_float ? nullptr : out.data_ptr<X>();
     auto store = [&](int64_t row, int64_t n, int64_t dot, int64_t sum) {
         const int64_t shift = std::is_same_v<X, int8_t> ? 128 : 0;
         const int64_t acc = dot - (xz + shift) * offsets[n] - zps[n] * sum + g.K * xz * zps[n];
@@ -281,10 +299,10 @@ void linear_vnni(const X* x, const int8_t* w, const int64_t* offsets,
         const int64_t index = row * g.outputs + n;
         value = quant::packed_activation(value, index, g);
         if (relu) value = std::max(value, 0.);
-        if (output_float) out.data_ptr<float>()[index] = static_cast<float>(value);
+        if (output_float) dst_float[index] = static_cast<float>(value);
         else {
             constexpr int64_t lo = std::is_same_v<X, uint8_t> ? 0 : -128;
-            out.data_ptr<X>()[index] = static_cast<X>(std::clamp(std::nearbyint(value / ys) + yz, static_cast<double>(lo), static_cast<double>(lo + 255)));
+            dst_codes[index] = static_cast<X>(std::clamp(std::nearbyint(value / ys) + yz, static_cast<double>(lo), static_cast<double>(lo + 255)));
         }
     };
     const int64_t tasks = row_tiles * column_tiles;
@@ -343,18 +361,24 @@ void run(const Tensor& input, const Tensor& packed, const Tensor& offsets,
     const float* bp = bias ? bias->data_ptr<float>() : nullptr;
     const int64_t xz = quantized::q_zero_point(input);
     const double xs = quantized::q_scale(input);
-    const bool saturating = g.linear && output_float && std::is_same_v<X,uint8_t>;
+    bool saturating=false;
+    if constexpr (std::is_same_v<X,uint8_t>) {
+        if (g.linear && output_float)
+            for (int64_t i=0;i<input.numel();++i) if (xp[i]>127) { saturating=true; break; }
+    }
 #ifdef USE_ONEDNN
-    if (!saturating && linear_integer_product(xp, wp, col, sc, wz, bp, g, out, xs, xz, ys, yz, relu, output_float)) return;
+    if (!saturating && linear_integer_product(xp, packed, col, sc, wz, bp, g, out, xs, xz, ys, yz, relu, output_float)) return;
 #endif
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
     static const bool vnni = __builtin_cpu_supports("avxvnni");
     if (g.linear && (vnni || saturating)) {
-        linear_vnni(xp, wp, col, sc, wz, bp, g, out, xs, xz, ys, yz, relu, output_float);
+        linear_vnni(xp, wp, col, sc, wz, bp, g, out, xs, xz, ys, yz, relu, output_float,saturating);
         return;
     }
 #endif
     const int64_t n_per_group = g.outputs / g.groups;
+    auto* dst_float=output_float ? out.data_ptr<float>() : nullptr;
+    auto* dst_codes=output_float ? nullptr : out.data_ptr<X>();
     const int64_t workers = std::max<int64_t>(1, parallel::get_num_threads());
     const int64_t tile_rows = g.linear
         ? std::max<int64_t>(1, std::min<int64_t>(32, (g.rows + workers - 1) / workers))
@@ -396,11 +420,11 @@ void run(const Tensor& input, const Tensor& packed, const Tensor& offsets,
                     const int64_t index = g.linear ? row * g.outputs + n : ((row / g.spatial) * g.outputs + n) * g.spatial + row % g.spatial;
                     value = quant::packed_activation(value, index, g);
                     if (relu) value = std::max(value, 0.);
-                    if (output_float) out.data_ptr<float>()[index] = static_cast<float>(value);
+                    if (output_float) dst_float[index] = static_cast<float>(value);
                     else {
                         constexpr int64_t lo = std::is_same_v<X, uint8_t> ? 0 : -128;
                         const double code = std::nearbyint(value / ys) + yz;
-                        out.data_ptr<X>()[index] = static_cast<X>(std::clamp(code, static_cast<double>(lo), static_cast<double>(lo + 255)));
+                        dst_codes[index] = static_cast<X>(std::clamp(code, static_cast<double>(lo), static_cast<double>(lo + 255)));
                     }
                 }
             }
