@@ -89,6 +89,17 @@ def run(device,repetitions):
             kind='floating'
         record('linear',(m,n,k),native,reference,kind)
     if device=='cpu':
+        for bits in (2,4):
+            dtype=getattr(tp,'quint4x2' if bits==4 else 'quint2x4')
+            rdtype=getattr(torch,'quint4x2' if bits==4 else 'quint2x4')
+            for size in (65536,1048577):
+                values=rng.uniform(-1,4,size=size).astype('float32')
+                x,r=tp.tensor(values),torch.tensor(values)
+                native=lambda:tp.quantize_per_tensor(x,.03,1,dtype)
+                reference=lambda:torch.quantize_per_tensor(r,.03,1,rdtype)
+                record('quantize_'+str(bits)+'bit',(size,),native,reference,tolerance=0)
+                q,rq=native(),reference()
+                record('dequantize_'+str(bits)+'bit',(size,),lambda:q.dequantize(),lambda:rq.dequantize(),tolerance=0)
         for channels,spatial in ((32,16),(128,56)):
             shape=(4,channels,spatial,spatial)
             x,r=code_pair(rng.integers(0,256,size=shape,dtype='uint8'),.03,119,device)
