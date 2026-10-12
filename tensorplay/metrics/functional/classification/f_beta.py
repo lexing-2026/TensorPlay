@@ -19,7 +19,7 @@ from tensorplay.metrics.functional.classification.stat_scores import (
     _multilabel_stat_scores_tensor_validation,
     _multilabel_stat_scores_update,
 )
-from tensorplay.metrics.utilities.compute import _adjust_weights_safe_divide, _safe_divide
+from tensorplay.metrics.utilities.compute import _adjust_weights_safe_divide, _safe_divide, _safe_sum_dim
 from tensorplay.metrics.utilities.enums import ClassificationTask
 
 
@@ -39,9 +39,9 @@ def _fbeta_reduce(
     if average == "binary":
         return _safe_divide((1 + beta2) * tp, (1 + beta2) * tp + beta2 * fn + fp, zero_division)
     if average == "micro":
-        tp = tp.sum(dim=0 if multidim_average == "global" else 1)
-        fn = fn.sum(dim=0 if multidim_average == "global" else 1)
-        fp = fp.sum(dim=0 if multidim_average == "global" else 1)
+        tp = _safe_sum_dim(tp, 0 if multidim_average == "global" else 1)
+        fn = _safe_sum_dim(fn, 0 if multidim_average == "global" else 1)
+        fp = _safe_sum_dim(fp, 0 if multidim_average == "global" else 1)
         return _safe_divide((1 + beta2) * tp, (1 + beta2) * tp + beta2 * fn + fp, zero_division)
 
     fbeta_score = _safe_divide((1 + beta2) * tp, (1 + beta2) * tp + beta2 * fn + fp, zero_division)

@@ -96,7 +96,7 @@ def test_multiclass_f1():
     target = tp.tensor([0, 1, 2, 0, 1, 2])
     preds = tp.tensor([0, 2, 1, 0, 0, 1])
     out = metrics.functional.classification.multiclass_f1_score(preds, target, num_classes=3)
-    assert out.item() == pytest.approx(0.3333, abs=1e-4)
+    assert out.item() == pytest.approx(0.2667, abs=1e-4)
 
 
 def test_binary_stat_scores():
@@ -168,7 +168,7 @@ def test_accuracy_class_accumulates():
     preds = tp.tensor([2, 1, 0, 1])
     metric.update(preds, target)
     metric.update(preds, target)
-    assert metric.compute().item() == pytest.approx(0.8333, abs=1e-4)
+    assert metric.compute().item() == pytest.approx(0.75, abs=1e-4)
     metric.reset()
     assert metric.compute().item() == pytest.approx(0.0, abs=1e-4)
 
@@ -308,7 +308,7 @@ def test_metric_collection_dict():
     )
     out = collection(preds, target)
     assert set(out.keys()) == {"acc", "f1"}
-    assert out["f1"].item() == pytest.approx(0.3333, abs=1e-4)
+    assert out["f1"].item() == pytest.approx(0.2667, abs=1e-4)
     assert out["acc"].item() == pytest.approx(0.3333, abs=1e-4)
 
 

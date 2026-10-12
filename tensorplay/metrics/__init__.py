@@ -17,11 +17,11 @@ Covered domains in this snapshot:
   symmetric MAPE) as both class-based and functional APIs
 """
 
+from tensorplay.metrics import functional
+from tensorplay.metrics.metric import CompositionalMetric, Metric
 from tensorplay.metrics.aggregation import CatMetric, MaxMetric, MeanMetric, MinMetric, SumMetric
 from tensorplay.metrics.collections import MetricCollection
-from tensorplay.metrics.metric import CompositionalMetric, Metric
 from tensorplay.metrics import classification
-from tensorplay.metrics import functional
 from tensorplay.metrics import regression
 
 __all__ = [
