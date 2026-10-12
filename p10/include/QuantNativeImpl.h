@@ -435,8 +435,10 @@ Tensor matmul(const Tensor& a, const Tensor& b, double scale, int64_t zp) {
     TP_CHECK(a.dim() >= 1 && b.dim() >= 1, "Matrix operands must have at least one dimension");
     const int64_t m = a.dim() == 1 ? 1 : a.size(a.dim() - 2), k = a.size(a.dim() - 1), n = b.dim() == 1 ? 1 : b.size(b.dim() - 1);
     TP_CHECK(k == b.size(b.dim() == 1 ? 0 : b.dim() - 2), "Matrix inner dimensions do not match");
-    std::vector<int64_t> ashape(a.shape().begin(), a.shape().end() - std::min<int64_t>(a.dim(), 2));
-    std::vector<int64_t> bshape(b.shape().begin(), b.shape().end() - std::min<int64_t>(b.dim(), 2));
+    auto ashape=static_cast<std::vector<int64_t>>(a.shape());
+    auto bshape=static_cast<std::vector<int64_t>>(b.shape());
+    ashape.resize(a.dim()-std::min<int64_t>(a.dim(),2));
+    bshape.resize(b.dim()-std::min<int64_t>(b.dim(),2));
     auto shape = broadcast_shape(ashape, bshape);
     Broadcast batch{}; batch.rank = static_cast<int>(shape.size());
     int64_t sa = 1, sb = 1;
@@ -485,6 +487,7 @@ Tensor prelu(const Tensor& input, const Tensor& weight, double scale, int64_t zp
 
 Tensor unary(const Tensor& input, double scale, int64_t zp, int64_t op, double a, double b) {
     TP_CHECK(op >= 0 && op <= 9, "Invalid unary operation");
+    if (op==8 || op==9) scale=static_cast<float>(scale);
     return TP_QN_NAME(activation)(input, scale, zp, {static_cast<int>(op), static_cast<float>(a), static_cast<float>(b)});
 }
 

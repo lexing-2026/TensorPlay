@@ -63,6 +63,13 @@ struct RecurrentLinear {
 struct RecurrentStep {
     const float *input, *recurrent, *hidden, *cell; float *hy, *cy; int64_t width; int mode;
     TP_QN_DEVICE float sigmoid(float x) const { return 1.f / (1.f + ::expf(-x)); }
+    TP_QN_DEVICE float product(float a,float b) const {
+#ifdef TP_QUANT_CUDA
+        return __fmul_rn(a,b);
+#else
+        return a*b;
+#endif
+    }
     TP_QN_DEVICE void operator()(int64_t i) const {
         const int gates = mode == 2 ? 4 : mode == 3 ? 3 : 1;
         const int64_t base = i / width * gates * width + i % width;
@@ -71,13 +78,13 @@ struct RecurrentStep {
             const float forgetgate = sigmoid(input[base+width] + recurrent[base+width]);
             const float candidate = ::tanhf(input[base+2*width] + recurrent[base+2*width]);
             const float outgate = sigmoid(input[base+3*width] + recurrent[base+3*width]);
-            const float value = forgetgate * cell[i] + ingate * candidate;
-            cy[i] = value; hy[i] = outgate * ::tanhf(value);
+            const float value = product(forgetgate,cell[i]) + product(ingate,candidate);
+            cy[i] = value; hy[i] = product(outgate,::tanhf(value));
         } else if (mode == 3) {
             const float reset = sigmoid(recurrent[base] + input[base]);
             const float update = sigmoid(recurrent[base+width] + input[base+width]);
-            const float candidate = ::tanhf(input[base+2*width] + recurrent[base+2*width] * reset);
-            hy[i] = (hidden[i] - candidate) * update + candidate;
+            const float candidate = ::tanhf(input[base+2*width] + product(recurrent[base+2*width],reset));
+            hy[i] = product(hidden[i]-candidate,update) + candidate;
         } else {
             const float value = input[base] + recurrent[base];
             hy[i] = mode == 0 ? (value < 0.f ? 0.f : value) : ::tanhf(value);

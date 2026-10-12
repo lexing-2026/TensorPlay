@@ -113,6 +113,7 @@ Tensor relu6_cpu(const Tensor& input) { return rectify_cpu(input, true); }
 } // namespace tensorplay::quant
 
 namespace tensorplay::cpu {
+DEFINE_DISPATCH(quantized_dynamic_dot_stub);
 DEFINE_DISPATCH(quantized_recurrent_step_stub);
 DEFINE_DISPATCH(quantized_int4_pack_stub);
 DEFINE_DISPATCH(quantized_int4_mm_stub);
@@ -191,7 +192,7 @@ bool linear_integer_product(const X* x, const int8_t* w, const int64_t* offsets,
             for (int64_t n = 0; n < g.outputs; ++n) {
                 const int64_t index = row * g.outputs + n;
                 const int64_t value_i = static_cast<int64_t>(raw[index]) - xz * offsets[n] - zps[n] * sum + g.K * xz * zps[n];
-                double value = static_cast<double>(value_i) * xs * scales[n] + (bias ? bias[n] : 0.);
+                double value = quant::packed_real_value(value_i,xs,scales[n],bias ? bias[n] : 0.f,output_float);
                 value = quant::packed_activation(value, index, g);
                 if (relu) value = std::max(value, 0.);
                 if (output_float) out.data_ptr<float>()[index] = static_cast<float>(value);
@@ -274,7 +275,7 @@ void linear_vnni(const X* x, const int8_t* w, const int64_t* offsets,
     auto store = [&](int64_t row, int64_t n, int64_t dot, int64_t sum) {
         const int64_t shift = std::is_same_v<X, int8_t> ? 128 : 0;
         const int64_t acc = dot - (xz + shift) * offsets[n] - zps[n] * sum + g.K * xz * zps[n];
-        double value = static_cast<double>(acc) * xs * scales[n] + (bias ? bias[n] : 0.);
+        double value = quant::packed_real_value(acc,xs,scales[n],bias ? bias[n] : 0.f,output_float);
         const int64_t index = row * g.outputs + n;
         value = quant::packed_activation(value, index, g);
         if (relu) value = std::max(value, 0.);
@@ -334,12 +335,13 @@ void run(const Tensor& input, const Tensor& packed, const Tensor& offsets,
     const float* bp = bias ? bias->data_ptr<float>() : nullptr;
     const int64_t xz = quantized::q_zero_point(input);
     const double xs = quantized::q_scale(input);
+    const bool saturating = g.linear && output_float && std::is_same_v<X,uint8_t>;
 #ifdef USE_ONEDNN
-    if (linear_integer_product(xp, wp, col, sc, wz, bp, g, out, xs, xz, ys, yz, relu, output_float)) return;
+    if (!saturating && linear_integer_product(xp, wp, col, sc, wz, bp, g, out, xs, xz, ys, yz, relu, output_float)) return;
 #endif
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
     static const bool vnni = __builtin_cpu_supports("avxvnni");
-    if (g.linear && vnni) {
+    if (g.linear && vnni && !saturating) {
         linear_vnni(xp, wp, col, sc, wz, bp, g, out, xs, xz, ys, yz, relu, output_float);
         return;
     }
@@ -378,8 +380,11 @@ void run(const Tensor& input, const Tensor& packed, const Tensor& offsets,
                 int64_t row_sum = 0;
                 for (int64_t k = 0; k < g.K; ++k) row_sum += xr[k];
                 for (int64_t n = group * n_per_group; n < (group + 1) * n_per_group; ++n) {
-                    const int64_t acc = dot(xr, wp + n * g.padded_K, g.K) - xz * col[n] - wz[n] * row_sum + g.K * xz * wz[n];
-                    double value = static_cast<double>(acc) * xs * sc[n] + (bp ? bp[n] : 0.);
+                    const int64_t raw = saturating
+                        ? quantized_dynamic_dot_stub(DeviceType::CPU,reinterpret_cast<const uint8_t*>(xr),wp+n*g.padded_K,g.K)
+                        : dot(xr,wp+n*g.padded_K,g.K);
+                    const int64_t acc = raw - xz * col[n] - wz[n] * row_sum + g.K * xz * wz[n];
+                    double value = quant::packed_real_value(acc,xs,sc[n],bp ? bp[n] : 0.f,output_float);
                     const int64_t index = g.linear ? row * g.outputs + n : ((row / g.spatial) * g.outputs + n) * g.spatial + row % g.spatial;
                     value = quant::packed_activation(value, index, g);
                     if (relu) value = std::max(value, 0.);

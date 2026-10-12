@@ -5,6 +5,7 @@
 #include "TypePromotion.h"
 #include "Utils.h"
 #include "SparseKernels.h"
+#include "Quantizer.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -333,6 +334,11 @@ void cast_contiguous(dst_t* dst, const src_t* src, int64_t len) {
 
 
 Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
+    if (self.impl()->quantizer() && src_in.impl()->quantizer()) {
+        TP_CHECK(self.dtype()==src_in.dtype() && self.impl()->quantizer()->qscheme()==src_in.impl()->quantizer()->qscheme(),
+            "Quantized copy requires matching dtype and quantization scheme");
+        self.impl()->set_quantizer(src_in.impl()->quantizer());
+    }
     if (!self.device().is_cpu()) {
         throw std::runtime_error("copy_kernel (CPU) called with non-CPU destination");
     }

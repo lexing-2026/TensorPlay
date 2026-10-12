@@ -150,15 +150,24 @@ __global__ void packed_gemm(const X* input, const int8_t* weight,
         for (int k = 0; k < 32; k += 4) {
             const int a = *reinterpret_cast<const int*>(&xtile[threadIdx.y][k]);
             const int b = *reinterpret_cast<const int*>(&wtile[threadIdx.x][k]);
-            part = dot4(a, b, part);
+            if (g.linear && output_float && shift==128) {
+#pragma unroll
+                for (int pair=0;pair<4;pair+=2) {
+                    const int v0=static_cast<int>(xtile[threadIdx.y][k+pair])+shift;
+                    const int v1=static_cast<int>(xtile[threadIdx.y][k+pair+1])+shift;
+                    const int pair_sum=v0*wtile[threadIdx.x][k+pair]+v1*wtile[threadIdx.x][k+pair+1];
+                    part+=min(32767,max(-32768,pair_sum));
+                }
+            } else part = dot4(a, b, part);
             sum = dot4(a, 0x01010101, sum);
         }
         acc += part; row_sum += sum;
         __syncthreads();
     }
     if (row >= g.rows || local_n >= n_per_group) return;
+    if (g.linear && output_float && shift==128) acc-=shift*offsets[n];
     acc = acc - xz * offsets[n] - zps[n] * row_sum + g.K * xz * zps[n];
-    double value = static_cast<double>(acc) * xs * scales[n] + (bias ? bias[n] : 0.);
+    double value = quant::packed_real_value(acc,xs,scales[n],bias ? bias[n] : 0.f,output_float);
     const int64_t index = g.linear ? row * g.outputs + n : ((row / g.spatial) * g.outputs + n) * g.spatial + row % g.spatial;
     value = quant::packed_activation(value, index, g);
     if (relu) value = fmax(value, 0.);

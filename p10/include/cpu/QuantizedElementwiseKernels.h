@@ -6,6 +6,8 @@
 #include <cstdint>
 
 namespace tensorplay::cpu {
+using quantized_dynamic_dot_fn = int64_t (*)(const uint8_t*,const int8_t*,int64_t);
+DECLARE_DISPATCH(quantized_dynamic_dot_fn, quantized_dynamic_dot_stub)
 using quantized_recurrent_step_fn = void (*)(const float*,const float*,const float*,
     const float*,float*,float*,int64_t,int64_t,int);
 DECLARE_DISPATCH(quantized_recurrent_step_fn, quantized_recurrent_step_stub)

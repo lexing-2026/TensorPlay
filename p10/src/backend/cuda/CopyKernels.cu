@@ -6,6 +6,7 @@
 #include "TensorIterator.h"
 #include "CUDALoops.cuh"
 #include "Complex.h"
+#include "Quantizer.h"
 #include <cuda_runtime.h>
 #include <vector>
 #include <algorithm>
@@ -453,6 +454,11 @@ bool transpose_layout_is_strided_outer_4d(const Tensor& self, const Tensor& src)
 }  // namespace
 
 Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
+    if (self.impl()->quantizer() && src_in.impl()->quantizer()) {
+        TP_CHECK(self.dtype()==src_in.dtype() && self.impl()->quantizer()->qscheme()==src_in.impl()->quantizer()->qscheme(),
+            "Quantized copy requires matching dtype and quantization scheme");
+        self.impl()->set_quantizer(src_in.impl()->quantizer());
+    }
     // The source broadcasts to the destination's shape; a source that does
     // not is refused rather than copied in some flattened order.
     const Tensor src = src_in.shape() == self.shape()

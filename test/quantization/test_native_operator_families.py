@@ -24,6 +24,58 @@ def same(actual, expected, tolerance=0):
                                expected.int_repr().numpy().astype('int64'), atol=tolerance, rtol=0)
 
 
+@pytest.mark.parametrize('device',DEVICES)
+@pytest.mark.parametrize('channel',[False,True])
+@pytest.mark.parametrize('strided',[False,True])
+def test_quantized_copy_transfers_source_grid(device,channel,strided):
+    values=np.arange(30,dtype='float32').reshape(5,6)*.03
+    if channel:
+        scales=np.array([.02,.04,.06,.08,.1],dtype='float64')
+        zps=np.array([-2,-1,0,1,2],dtype='int64')
+        source=tp.quantize_per_channel(tp.tensor(values,device=device),
+            tp.tensor(scales,device=device),tp.tensor(zps,device=device),0,tp.qint8)
+        destination=tp.quantize_per_channel(tp.zeros((5,6),device=device),
+            tp.ones(5,device=device,dtype=tp.float64),tp.zeros(5,device=device,dtype=tp.int64),0,tp.qint8)
+    else:
+        source=tp.quantize_per_tensor(tp.tensor(values,device=device),.03,-3,tp.qint8)
+        destination=tp.quantize_per_tensor(tp.zeros((5,6),device=device),1.,0,tp.qint8)
+    if strided:
+        source=source[:,::2]
+        destination=destination[:,::2]
+    address=destination.data_ptr()
+    destination.copy_(source)
+    assert destination.data_ptr()==address
+    np.testing.assert_array_equal(destination.int_repr().cpu().numpy(),source.int_repr().cpu().numpy())
+    np.testing.assert_array_equal(destination.dequantize().cpu().numpy(),source.dequantize().cpu().numpy())
+
+
+@pytest.mark.parametrize('device',DEVICES)
+@pytest.mark.parametrize('features',[1,31,32,33,8193])
+@pytest.mark.parametrize('reduce_range',[False,True])
+def test_dynamic_linear_pair_saturation_and_chunk_tails(device,features,reduce_range):
+    values=np.linspace(-1,7,3*features,dtype='float32').reshape(3,features)
+    codes=np.tile(np.array([[127],[-128],[101]],dtype='int8'),(1,features))
+    weight,reference=pair(codes,'int8',device,scale=.015,zp=0)
+    bias=np.array([.3,-.4,.5],dtype='float32')
+    packed=tp.ops.quantized.linear_prepack(weight,tp.tensor(bias,device=device))
+    rp=torch.ops.quantized.linear_prepack(reference,torch.tensor(bias))
+    actual=tp.ops.quantized.linear_dynamic(tp.tensor(values,device=device),packed,reduce_range)
+    expected=torch.ops.quantized.linear_dynamic(torch.tensor(values),rp,reduce_range)
+    np.testing.assert_allclose(actual.cpu().numpy(),expected.numpy(),rtol=0,atol=1e-6)
+    grid=tp._C.quantize_per_tensor_dynamic(tp.tensor(values,device=device),tp.quint8,reduce_range)
+    q=grid.int_repr().cpu().numpy().astype('int64')
+    w=codes.astype('int64')
+    accumulator=np.zeros((3,3),dtype='int64')
+    for k in range(0,features,2):
+        pair_sum=q[:,k,None]*w[None,:,k]
+        if k+1<features: pair_sum+=q[:,k+1,None]*w[None,:,k+1]
+        accumulator+=np.clip(pair_sum,-32768,32767)
+    accumulator-=grid.q_zero_point()*w.sum(axis=1)
+    factor=np.float32(np.float32(grid.q_scale())*np.float32(.015))
+    exact=(accumulator.astype('float32').astype('float64')*np.float64(factor)+bias.astype('float64')).astype('float32')
+    np.testing.assert_array_equal(actual.cpu().numpy(),exact)
+
+
 @pytest.mark.parametrize('device', DEVICES)
 @pytest.mark.parametrize('dtype,zp', TYPES)
 @pytest.mark.parametrize('value', [-100., -.3, 0., .3, 100.])
@@ -96,13 +148,17 @@ def test_pooling_all_grids(device,dtype,zp,rank,batched,kind):
     x,r=x.transpose(-1,-2) if rank>1 else x, r.transpose(-1,-2) if rank>1 else r
     if kind=='avg':
         y=getattr(F,f'avg_pool{rank}d')(x,3,2,1,True,False)
-        e=getattr(torch.nn.functional,f'avg_pool{rank}d')(r,3,2,1,True,False)
+        e=getattr(torch.nn.functional,f'avg_pool{rank}d')(
+            r.unsqueeze(0) if rank==3 and not batched else r,3,2,1,True,False)
+        if rank==3 and not batched: e=e.squeeze(0)
     elif kind=='adaptive':
         y=getattr(F,f'adaptive_avg_pool{rank}d')(x,(3,)*rank)
         e=getattr(torch.nn.functional,f'adaptive_avg_pool{rank}d')(r,(3,)*rank)
     else:
         y=getattr(tp._C,f'quantized_max_pool{rank}d')(x,[3]*rank,[2]*rank,[1]*rank,[2]*rank,True)
-        e=getattr(torch.nn.functional,f'max_pool{rank}d')(r,3,2,1,2,True)
+        e=getattr(torch.nn.functional,f'max_pool{rank}d')(
+            r.unsqueeze(0) if rank==3 and not batched else r,3,2,1,2,True)
+        if rank==3 and not batched: e=e.squeeze(0)
     same(y,e,1 if kind!='max' else 0)
 
 
@@ -339,10 +395,11 @@ def test_public_operator_packets_and_packed_queries(device):
 @pytest.mark.parametrize('device', DEVICES)
 @pytest.mark.parametrize('operation', ['linear_leaky_relu', 'linear_tanh'])
 @pytest.mark.parametrize('dtype,zp', TYPES[:2])
-def test_packed_linear_fused_activation(device, operation, dtype, zp):
+@pytest.mark.parametrize('weight_zp', [-3,0])
+def test_packed_linear_fused_activation(device, operation, dtype, zp,weight_zp):
     rng = np.random.default_rng(110)
     x, r = pair(rng.integers(0, 70, size=(3, 37)), dtype, device, scale=.05, zp=zp)
-    w, rw = pair(rng.integers(-60, 60, size=(11, 37)), 'int8', device, scale=.03, zp=-3)
+    w, rw = pair(rng.integers(-60, 60, size=(11, 37)), 'int8', device, scale=.03, zp=weight_zp)
     bias = rng.normal(0, .1, size=11).astype('float32')
     packed = tp.ops.quantized.linear_prepack(w, tp.tensor(bias, device=device))
     args = (.07, zp, .17) if operation.endswith('leaky_relu') else (.07, zp)
@@ -351,7 +408,7 @@ def test_packed_linear_fused_activation(device, operation, dtype, zp):
     real = torch.nn.functional.leaky_relu(real, .17) if operation.endswith('leaky_relu') else torch.tanh(real)
     expected = torch.quantize_per_tensor(real, .07, zp, r.dtype)
     same(actual, expected, 1)
-    if dtype == 'uint8':
+    if dtype == 'uint8' and weight_zp==0:
         saved = torch.backends.quantized.engine
         try:
             torch.backends.quantized.engine = 'onednn'

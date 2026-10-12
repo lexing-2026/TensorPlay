@@ -13,16 +13,55 @@ inline namespace CPU_CAPABILITY {
 namespace {
 constexpr int int4_columns = vec::Vectorized<float>::size() * 4;
 
+int64_t dynamic_dot_impl(const uint8_t* x,const int8_t* w,int64_t size) {
+    int64_t total=0,k=0;
+#if defined(CPU_CAPABILITY_AVX2) || defined(CPU_CAPABILITY_AVX512)
+    using V=vec::Vectorized<int32_t>;
+    constexpr int bytes=V::size()*4;
+    while (k+bytes<=size) {
+        const int64_t stop=std::min<int64_t>(k+8192,size-size%bytes);
+        V accum(0);
+        for (;k<stop;k+=bytes) {
+#ifdef CPU_CAPABILITY_AVX512
+            const auto a=_mm512_loadu_si512(x+k),b=_mm512_loadu_si512(w+k);
+            accum=accum+V(_mm512_madd_epi16(_mm512_maddubs_epi16(a,b),_mm512_set1_epi16(1)));
+#else
+            const auto a=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(x+k));
+            const auto b=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(w+k));
+            accum=accum+V(_mm256_madd_epi16(_mm256_maddubs_epi16(a,b),_mm256_set1_epi16(1)));
+#endif
+        }
+        alignas(64) int32_t lanes[V::size()];
+        accum.store(lanes);
+        for (const auto value:lanes) total+=value;
+    }
+#endif
+    for (;k<size;k+=2) {
+        int value=static_cast<int>(x[k])*w[k];
+        if (k+1<size) value+=static_cast<int>(x[k+1])*w[k+1];
+        total+=std::clamp(value,-32768,32767);
+    }
+    return total;
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC push_options
+#pragma GCC optimize ("fp-contract=off")
+#endif
 void recurrent_step_impl(const float* input,const float* recurrent,const float* hidden,
         const float* cell,float* hy,float* cy,int64_t rows,int64_t width,int mode) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
     using V=vec::Vectorized<float>;
     const V one(1.f),zero(0.f);
     const int gates=mode==2 ? 4 : mode==3 ? 3 : 1;
     auto sigmoid=[&](V value) { return (one+(-value).exp()).reciprocal(); };
     for (int64_t row=0;row<rows;++row) {
         const int64_t start=row*gates*width,state=row*width;
-        for (int64_t col=0;col<width;col+=V::size()) {
-            const int64_t count=std::min<int64_t>(V::size(),width-col),base=start+col;
+        int64_t col=0;
+        for (;col+V::size()<=width;col+=V::size()) {
+            const int64_t count=V::size(),base=start+col;
             auto a=[&](int gate) { return V::loadu(input+base+gate*width,count); };
             auto b=[&](int gate) { return V::loadu(recurrent+base+gate*width,count); };
             V value;
@@ -42,8 +81,30 @@ void recurrent_step_impl(const float* input,const float* recurrent,const float* 
             }
             value.store(hy+state+col,count);
         }
+        for (;col<width;++col) {
+            const int64_t base=start+col,index=state+col;
+            auto a=[&](int gate) { return input[base+gate*width]; };
+            auto b=[&](int gate) { return recurrent[base+gate*width]; };
+            auto sigmoid_scalar=[](float value) { return 1.f/(1.f+::expf(-value)); };
+            if (mode==2) {
+                const float i=sigmoid_scalar(a(0)+b(0)),f=sigmoid_scalar(a(1)+b(1));
+                const float g=::tanhf(a(2)+b(2)),o=sigmoid_scalar(a(3)+b(3));
+                cy[index]=f*cell[index]+i*g;
+                hy[index]=o*::tanhf(cy[index]);
+            } else if (mode==3) {
+                const float reset=sigmoid_scalar(b(0)+a(0)),update=sigmoid_scalar(b(1)+a(1));
+                const float candidate=::tanhf(a(2)+b(2)*reset);
+                hy[index]=(hidden[index]-candidate)*update+candidate;
+            } else {
+                const float value=a(0)+b(0);
+                hy[index]=mode==0 ? std::max(value,0.f) : ::tanhf(value);
+            }
+        }
     }
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC pop_options
+#endif
 
 void int4_pack_impl(const int32_t* src, uint8_t* dst, int64_t n, int64_t k) {
     const int64_t blocks = (n + int4_columns - 1) / int4_columns;
@@ -330,6 +391,7 @@ void embedding_impl(const uint8_t* w, const int64_t* indices, const int64_t* off
 
 #ifndef CPU_CAPABILITY_AVX512
 REGISTER_DISPATCH(quantized_recurrent_step_stub, &recurrent_step_impl);
+REGISTER_DISPATCH(quantized_dynamic_dot_stub, &dynamic_dot_impl);
 REGISTER_DISPATCH(quantized_int4_pack_stub, &int4_pack_impl);
 REGISTER_DISPATCH(quantized_int4_mm_stub, &int4_mm_impl);
 REGISTER_DISPATCH(quantized_batch_norm_stub, &batch_norm_impl);
@@ -341,6 +403,7 @@ REGISTER_DISPATCH(quantized_embedding_stub, &embedding_impl);
 REGISTER_DISPATCH(quantized_fp16_linear_stub, &fp16_linear_impl);
 #else
 ALSO_REGISTER_AVX512_DISPATCH(quantized_recurrent_step_stub, &recurrent_step_impl);
+ALSO_REGISTER_AVX512_DISPATCH(quantized_dynamic_dot_stub, &dynamic_dot_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_int4_pack_stub, &int4_pack_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_int4_mm_stub, &int4_mm_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_batch_norm_stub, &batch_norm_impl);
