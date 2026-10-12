@@ -109,7 +109,7 @@ std::tuple<Tensor,Tensor,double,int64_t> legacy_quantize_weight(const Tensor& we
     auto extrema = Tensor::aminmax(weight.reshape({weight.numel()}), {}, false);
     float minimum = std::min(std::get<0>(extrema).item().to<float>(), 0.f);
     float maximum = std::max(std::get<1>(extrema).item().to<float>(), 0.f);
-    TP_CHECK(minimum <= maximum, "weight quantization requires an ordered finite range");
+    TP_CHECK(minimum <= maximum, "weight quantization requires an ordered range");
     double scale = (static_cast<double>(maximum) - minimum) / 255;
     if (static_cast<float>(scale) == 0.f || std::isinf(1.f / static_cast<float>(scale))) scale = .1;
     constexpr float cutoff = 6.1e-5f;
