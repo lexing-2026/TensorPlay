@@ -1405,10 +1405,10 @@ std::tuple<Tensor, Tensor> fake_quantize_per_channel_affine_cachemask_cpu(
     Tensor out = Tensor::empty(self.shape(), self.dtype(), self.device());
     Tensor mask = Tensor::empty(self.shape(), DType::Bool, self.device());
     const Tensor input = self.is_contiguous() ? self : self.contiguous();
-    Tensor sc = scale.to(DType::Float64).contiguous();
+    Tensor sc = scale.to(DType::Float32).contiguous();
     Tensor zpi = zp_is_float ? zero_point.to(DType::Float64).contiguous()
                              : zero_point.to(DType::Int64).contiguous();
-    const double* sc_ptr = sc.data_ptr<double>();
+    const float* sc_ptr = sc.data_ptr<float>();
     const double* zpf_ptr = zp_is_float ? zpi.data_ptr<double>() : nullptr;
     const int64_t* zp_ptr = zp_is_float ? nullptr : zpi.data_ptr<int64_t>();
     const bool zp_float_flag = zp_is_float;
@@ -1426,12 +1426,11 @@ std::tuple<Tensor, Tensor> fake_quantize_per_channel_affine_cachemask_cpu(
         const int64_t c = (stride_on_axis == 0)
                               ? 0
                               : (i / stride_on_axis) % channels;
-        const double inv_scale = 1.0 / sc_ptr[c];
+        const float inv_scale = 1.0f / sc_ptr[c];
         const double raw =
             zp_float_flag
-                ? std::lrint(static_cast<double>(raw_in) * inv_scale +
-                             zpf_ptr[c])
-                : std::nearbyint(static_cast<double>(raw_in) * inv_scale) +
+                ? std::lrintf(static_cast<float>(zpf_ptr[c]) + static_cast<float>(raw_in * inv_scale))
+                : std::nearbyint(raw_in * inv_scale) +
                       static_cast<double>(zp_ptr[c]);
         const int64_t q = std::min<int64_t>(
             quant_max,
@@ -1439,8 +1438,9 @@ std::tuple<Tensor, Tensor> fake_quantize_per_channel_affine_cachemask_cpu(
         const double zpv = zp_float_flag
                                ? zpf_ptr[c]
                                : static_cast<double>(zp_ptr[c]);
-        const double y =
-            (static_cast<double>(q) - zpv) * sc_ptr[c];
+        const double y = zp_float_flag
+            ? static_cast<float>((static_cast<float>(q) - static_cast<float>(zpv)) * sc_ptr[c])
+            : static_cast<float>(q - zp_ptr[c]) * sc_ptr[c];
         return {y, raw >= static_cast<double>(quant_min) &&
                        raw <= static_cast<double>(quant_max)};
     };

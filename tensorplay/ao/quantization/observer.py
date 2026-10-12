@@ -164,7 +164,7 @@ class UniformQuantizationObserverBase(ObserverBase):
         zero_point = tensorplay.zeros(min_val_neg.size(), dtype=tensorplay.int64, device=device)
         if self.qscheme == tensorplay.per_tensor_symmetric or self.qscheme == tensorplay.per_channel_symmetric:
             max_val_pos = tensorplay.maximum(-min_val_neg, max_val_pos)
-            scale = max_val_pos / (float(quant_max - quant_min) / 2)
+            scale = _qparam_div(max_val_pos, float(quant_max - quant_min) / 2)
             scale = tensorplay.maximum(scale, self.eps)
             if self.dtype in [tensorplay.quint8, tensorplay.uint8]:
                 if self.has_customized_qrange:
@@ -174,11 +174,11 @@ class UniformQuantizationObserverBase(ObserverBase):
             elif self.dtype == tensorplay.uint16:
                 zero_point = zero_point.new_full(zero_point.size(), 2 ** 15)
         elif self.qscheme == tensorplay.per_channel_affine_float_qparams:
-            scale = (max_val - min_val) / float(quant_max - quant_min)
+            scale = _qparam_div(max_val - min_val, float(quant_max - quant_min))
             scale = tensorplay.where(scale > self.eps, scale, tensorplay.ones_like(scale))
             zero_point = -1 * min_val / scale
         else:
-            scale = (max_val_pos - min_val_neg) / float(quant_max - quant_min)
+            scale = _qparam_div(max_val_pos - min_val_neg, float(quant_max - quant_min))
             scale = tensorplay.maximum(scale, self.eps)
             zero_point = quant_min - tensorplay.round(min_val_neg / scale).to(tensorplay.int)
             zero_point = tensorplay.clamp(zero_point, quant_min, quant_max)
@@ -698,3 +698,9 @@ def load_observer_state_dict(model, obs_dict):
     state = model.state_dict()
     state.update(obs_dict)
     model.load_state_dict(state)
+
+
+def _qparam_div(value, denominator):
+    if value.device.type == 'cuda':
+        return value * (1.0 / denominator)
+    return value / denominator
