@@ -11681,3 +11681,46 @@
 
 - func: quantized_batch_norm_relu(Tensor input, Tensor? weight, Tensor? bias, Tensor mean, Tensor var, float eps, float output_scale, int output_zero_point) -> Tensor
   variants: function
+
+- func: quantized_binary(Tensor a, Tensor b, float scale, int zero_point, int operation, bool relu=False) -> Tensor
+  variants: function
+- func: quantized_scalar(Tensor input, float value, int operation, bool relu=False) -> Tensor
+  variants: function
+- func: quantized_softmax(Tensor input, int dim, float scale, int zero_point) -> Tensor
+  variants: function
+- func: quantized_matmul(Tensor a, Tensor b, float scale, int zero_point) -> Tensor
+  variants: function
+- func: quantized_prelu(Tensor input, Tensor weight, float scale, int zero_point) -> Tensor
+  variants: function
+- func: quantized_avg_pool(Tensor input, int[] kernel_size, int[] stride=[], int[] padding=[], bool ceil_mode=False, bool count_include_pad=True, int? divisor_override=None) -> Tensor
+  variants: function
+- func: quantized_adaptive_avg_pool(Tensor input, int[] output_size) -> Tensor
+  variants: function
+- func: quantized_dropout(Tensor input, float scale, int zero_point, float p=0.5, bool training=False) -> Tensor
+  variants: function
+- func: _quantized_fp16_prepack(Tensor weight) -> Tensor
+  variants: function
+- func: _quantized_fp16_linear(Tensor input, Tensor weight, Tensor? bias=None, bool relu=False) -> Tensor
+  variants: function
+
+- func: quantized_unary(Tensor input, float scale, int zero_point, int operation, float a=0.0, float b=1.0) -> Tensor
+  variants: function
+
+- func: _quantized_rowwise_pack(Tensor weight, int bit_width=8, bool optimized_qparams=False, int nbins=200, float ratio=0.16, Tensor? rowwise_min_max=None) -> Tensor
+  variants: function
+- func: _quantized_rowwise_unpack(Tensor weight, int bit_width=8) -> Tensor
+  variants: function
+- func: _quantized_embedding_weight_pack(Tensor weight) -> Tensor
+  variants: function
+- func: _quantized_embedding(Tensor weight, Tensor indices, int bit_width=8) -> Tensor
+  variants: function
+- func: _quantized_embedding_bag(Tensor weight, Tensor indices, int bit_width=8, Tensor? offsets=None, Tensor? per_sample_weights=None, Tensor? compressed_indices_mapping=None, bool include_last_offset=False, bool pruned_weights=False) -> Tensor
+  variants: function
+
+- func: quantized_convolution(Tensor input, Tensor weight, Tensor? bias, float scale, int zero_point, int[] stride=[], int[] padding=[], int[] dilation=[], int groups=1, bool transposed=False, int[] output_padding=[], bool relu=False, bool output_float=False) -> Tensor
+  variants: function
+
+- func: _quantized_recurrent_cell(Tensor input, Tensor hidden, Tensor? cell, Tensor weight_ih, Tensor weight_hh, Tensor? bias_ih, Tensor? bias_hh, int mode, bool reduce_range=True) -> (Tensor, Tensor)
+  variants: function
+- func: _quantized_recurrent(Tensor input, Tensor hidden, Tensor? cell, Tensor[] weights, Tensor[] biases, int num_layers, float dropout, bool training, bool bidirectional, bool batch_first, int mode, bool reduce_range=True, Tensor? batch_sizes=None) -> (Tensor, Tensor, Tensor)
+  variants: function

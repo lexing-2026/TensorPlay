@@ -150,3 +150,8 @@ float_qparams_weight_only_qconfig = QConfig(default_placeholder_observer, defaul
 default_embedding_qat_qconfig = QConfig(default_placeholder_observer, default_embedding_fake_quant)
 per_channel_dynamic_qconfig = QConfig(default_dynamic_quant_observer, default_per_channel_weight_observer)
 __all__ += ['float_qparams_weight_only_qconfig', 'default_embedding_qat_qconfig', 'per_channel_dynamic_qconfig']
+
+float16_dynamic_qconfig = QConfig(
+    PlaceholderObserver.with_args(dtype=tensorplay.float16, is_dynamic=True),
+    PlaceholderObserver.with_args(dtype=tensorplay.float16))
+__all__ += ['float16_dynamic_qconfig']

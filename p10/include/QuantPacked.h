@@ -129,3 +129,22 @@ inline void check_bn_relu(const Tensor& input, const std::optional<Tensor>& weig
     }
 }
 } // namespace tensorplay::quant
+
+
+namespace tensorplay::cpu {
+std::tuple<Tensor,Tensor> _quantized_weight_prepack_cpu(const Tensor&);
+Tensor _quantized_packed_run_cpu(const Tensor&,const Tensor&,const Tensor&,const Tensor&,const Tensor&,
+    const std::optional<Tensor>&,const std::vector<int64_t>&,double,int64_t,const std::vector<int64_t>&,
+    const std::vector<int64_t>&,const std::vector<int64_t>&,int64_t,bool,bool);
+}
+
+#ifdef USE_CUDA
+
+namespace tensorplay::cuda {
+std::tuple<Tensor,Tensor> _quantized_weight_prepack_cuda(const Tensor&);
+Tensor _quantized_packed_run_cuda(const Tensor&,const Tensor&,const Tensor&,const Tensor&,const Tensor&,
+    const std::optional<Tensor>&,const std::vector<int64_t>&,double,int64_t,const std::vector<int64_t>&,
+    const std::vector<int64_t>&,const std::vector<int64_t>&,int64_t,bool,bool);
+}
+
+#endif

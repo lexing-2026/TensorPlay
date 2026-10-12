@@ -1,3 +1,4 @@
+#include "QuantNative.h"
 #include "QuantKernels.h"
 #include "CUDARuntime.h"
 #include "Exception.h"
@@ -49,18 +50,7 @@ Tensor quantized_max_pool2d_cuda(
     const Tensor& self, const std::vector<int64_t>& kernel_size,
     const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
     const std::vector<int64_t>& dilation, bool ceil_mode) {
-    // The window maximum is order-preserving in the quantized domain, so the
-    // pooling runs on an Int8 view of the code storage and the output is
-    // re-wrapped with the input quantizer untouched.
-    if (self.dtype() != DType::QInt8) {
-        TP_THROW(TypeError, "quantized_max_pool2d(): expected a QInt8 tensor");
-    }
-    Tensor codes = quantized::strip_quantizer(self);
-    Tensor out_codes =
-        max_pool2d_cuda(codes, kernel_size, stride, padding, dilation,
-                        ceil_mode);
-    return quantized::make_qtensor(out_codes, self.impl()->quantizer(),
-                                   DType::QInt8);
+    return quant::pool_cuda(self,kernel_size,stride,padding,dilation,ceil_mode,false,std::nullopt,2);
 }
 
 Tensor quantized_conv2d_cuda(

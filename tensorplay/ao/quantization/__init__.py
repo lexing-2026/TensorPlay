@@ -123,3 +123,5 @@ __all__ += ['default_fused_act_fake_quant', 'default_fused_wt_fake_quant', 'defa
 from .qconfig import default_embedding_qat_qconfig, float_qparams_weight_only_qconfig, per_channel_dynamic_qconfig
 from .quantization_mappings import get_embedding_qat_module_mappings
 __all__ += ['default_embedding_qat_qconfig', 'float_qparams_weight_only_qconfig', 'per_channel_dynamic_qconfig', 'get_embedding_qat_module_mappings']
+
+from .qconfig import float16_dynamic_qconfig as float16_dynamic_qconfig

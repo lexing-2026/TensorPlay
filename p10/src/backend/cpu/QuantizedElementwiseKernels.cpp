@@ -1,5 +1,8 @@
 #include "cpu/QuantizedElementwiseKernels.h"
 #include "cpu/vec/vec.h"
+#include "cpu/vec/vec_convert.h"
+#include "QuantElementwise.h"
+#include "QuantRowwise.h"
 #ifndef CPU_CAPABILITY_AVX512
 #include "cpu/vec/vec256/vec256_qint.h"
 #endif
@@ -42,14 +45,110 @@ void lookup_impl(const uint8_t* x, uint8_t* y, int64_t size, const float* table)
     }
     for (; i < size; ++i) y[i] = static_cast<uint8_t>(table[x[i]]);
 }
+template<class Q>
+void binary_codes(const void* aa, const void* bb, void* yy, int64_t size,
+        double as, int64_t az, double bs, int64_t bz, double ys, int64_t yz, int op, bool relu) {
+    using T = typename Q::underlying;
+    using QV = vec::Vectorized<Q>;
+    using FV = vec::Vectorized<float>;
+    const T* a = static_cast<const T*>(aa); const T* b = static_cast<const T*>(bb); T* y = static_cast<T*>(yy);
+    const FV asc(as), azp(az), bsc(bs), bzp(bz), zero(0.f);
+    const FV lower((std::numeric_limits<T>::lowest() - yz) * static_cast<float>(ys));
+    const FV upper((std::numeric_limits<T>::max() - yz) * static_cast<float>(ys));
+    int64_t i = 0;
+    for (; i + QV::size() <= size; i += QV::size()) {
+        auto av = QV::loadu(a + i).dequantize(asc, azp);
+        auto bv = QV::loadu(b + i).dequantize(bsc, bzp);
+        for (size_t j = 0; j < av.size(); ++j) {
+            switch (op) {
+                case 0: av[j] = av[j] + bv[j]; break;
+                case 1: av[j] = av[j] - bv[j]; break;
+                case 2: av[j] = av[j] * bv[j]; break;
+                default: av[j] = av[j] / bv[j]; break;
+            }
+            if (relu) av[j] = vec::maximum(av[j], zero);
+            av[j] = vec::minimum(vec::maximum(av[j], lower), upper);
+        }
+        QV::quantize(av, ys, yz, 1.f / static_cast<float>(ys)).store(y + i);
+    }
+    for (; i < size; ++i) {
+        const float av = static_cast<float>(static_cast<int64_t>(a[i]) - az) * static_cast<float>(as);
+        const float bv = static_cast<float>(static_cast<int64_t>(b[i]) - bz) * static_cast<float>(bs);
+        float v;
+        switch (op) { case 0: v = av + bv; break; case 1: v = av - bv; break; case 2: v = av * bv; break; default: v = av / bv; }
+        if (relu) v = std::fmax(v, 0.f);
+        y[i] = quant::encode<T>(v, 1.f / static_cast<float>(ys), yz);
+    }
+}
+
+void binary_impl(const void* a, const void* b, void* y, int64_t size, DType dtype,
+        double as, int64_t az, double bs, int64_t bz, double ys, int64_t yz, int op, bool relu) {
+    if (dtype == DType::QInt8) binary_codes<qint8>(a,b,y,size,as,az,bs,bz,ys,yz,op,relu);
+    else if (dtype == DType::QUInt8) binary_codes<quint8>(a,b,y,size,as,az,bs,bz,ys,yz,op,relu);
+}
+
+void fp16_linear_impl(const float* x, const Half* w, const float* bias, float* y,
+        int64_t first, int64_t last, int64_t n, int64_t k, bool relu) {
+    using FV = vec::Vectorized<float>;
+    using HV = vec::Vectorized<Half>;
+    constexpr int width = FV::size();
+    static_assert(HV::size() == 2 * width);
+    for (int64_t i = first; i < last; ++i) {
+        const float* row = x + i / n * k; const Half* weight = w + i % n * k;
+        FV sum0(0.f), sum1(0.f); int64_t j = 0;
+        for (; j + HV::size() <= k; j += HV::size()) {
+            const auto values = vec::convert<float,2>(vec::VectorizedN<Half,1>(HV::loadu(weight + j)));
+            sum0 = vec::fmadd(FV::loadu(row + j), values[0], sum0);
+            sum1 = vec::fmadd(FV::loadu(row + j + width), values[1], sum1);
+        }
+        alignas(64) float lanes[width]; (sum0 + sum1).store(lanes);
+        float sum = 0.f;
+        for (int lane = 0; lane < width; ++lane) sum += lanes[lane];
+        for (; j < k; ++j) sum += row[j] * static_cast<float>(weight[j]);
+        if (bias) sum += bias[i % n];
+        y[i] = relu ? std::fmax(sum, 0.f) : sum;
+    }
+}
+
+void embedding_impl(const uint8_t* w, const int64_t* indices, const int64_t* offsets,
+        const int64_t* mapping, const float* weights, float* y, int64_t first_bag, int64_t last_bag,
+        int64_t bags, int64_t count, int64_t fixed, int64_t columns, int64_t width, int64_t bits, bool embedding) {
+    using FV = vec::Vectorized<float>;
+    constexpr int lanes = FV::size();
+    for (int64_t bag = first_bag; bag < last_bag; ++bag) {
+        const int64_t first = embedding ? bag : (offsets ? offsets[bag] : bag * fixed);
+        const int64_t last = embedding ? bag + 1 : (offsets ? (bag + 1 < bags ? offsets[bag+1] : count) : first + fixed);
+        for (int64_t col = 0; col < columns; col += lanes) {
+            FV sum(0.f); const int take = static_cast<int>(std::min<int64_t>(lanes, columns - col));
+            for (int64_t j = first; j < last; ++j) {
+                const int64_t row_index = mapping ? mapping[indices[j]] : indices[j];
+                if (row_index == -1) continue;
+                const uint8_t* row = w + row_index * width; float scale, bias;
+                quant::row_grid(row, width, bits, scale, bias);
+                const float weight = weights ? weights[j] : 1.f;
+                alignas(64) float codes[lanes]{};
+                for (int c = 0; c < take; ++c) codes[c] = quant::row_code(row, col + c, bits);
+                sum = vec::fmadd(FV::loadu(codes), FV(scale * weight), sum + FV(bias * weight));
+            }
+            sum.store(y + bag * columns + col, take);
+        }
+    }
+}
+
 }
 }
 
 #ifndef CPU_CAPABILITY_AVX512
 REGISTER_DISPATCH(quantized_clip_stub, &clip_impl);
 REGISTER_DISPATCH(quantized_lookup_stub, &lookup_impl);
+REGISTER_DISPATCH(quantized_binary_stub, &binary_impl);
+REGISTER_DISPATCH(quantized_embedding_stub, &embedding_impl);
+REGISTER_DISPATCH(quantized_fp16_linear_stub, &fp16_linear_impl);
 #else
 ALSO_REGISTER_AVX512_DISPATCH(quantized_clip_stub, &clip_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_lookup_stub, &lookup_impl);
+ALSO_REGISTER_AVX512_DISPATCH(quantized_binary_stub, &binary_impl);
+ALSO_REGISTER_AVX512_DISPATCH(quantized_embedding_stub, &embedding_impl);
+ALSO_REGISTER_AVX512_DISPATCH(quantized_fp16_linear_stub, &fp16_linear_impl);
 #endif
 }

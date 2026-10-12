@@ -83,33 +83,20 @@ class QFunctional(nn.Module):
 
     def add_relu(self, a, b):
         scale, zero_point = self._fixed()
-        return F.relu(F.add(a, b, scale, zero_point))
+        return F.add_relu(a, b, scale, zero_point)
 
     def add_scalar(self, x, scalar):
-        # The scalar is placed on the same affine grid as the operand, so the
-        # integer-domain addition is exact.
-        import tensorplay
-
-        scale, zero_point = self._fixed()
-        other = tensorplay.quantize_per_tensor(
-            tensorplay.tensor(scalar), scale, zero_point, tensorplay.qint8)
-        return F.add(x, other, scale, zero_point)
+        return F.add_scalar(x, scalar)
 
     def mul_scalar(self, x, scalar):
-        import tensorplay
+        return F.mul_scalar(x, scalar)
 
-        scale, zero_point = self._fixed()
-        other = tensorplay.quantize_per_tensor(
-            tensorplay.tensor(scalar), scale, zero_point, tensorplay.qint8)
-        return F.mul(x, other, scale, zero_point)
+    def matmul(self, x, y):
+        return F.matmul(x, y, *self._fixed())
 
     def forward(self, x, y):
         return self.add(x, y)
 
 
-class FXFloatFunctional(QFunctional):
-    """Alias of :class:`QFunctional` for graph-captured workflows."""
-
-
-class FXFloatFunctional(QFunctional):
-    """Alias of :class:`QFunctional` for graph-captured workflows."""
+class FXFloatFunctional(FloatFunctional):
+    """Floating operation wrappers for graph-captured workflows."""

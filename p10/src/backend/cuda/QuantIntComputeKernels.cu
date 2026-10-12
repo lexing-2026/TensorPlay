@@ -1,3 +1,4 @@
+#include "QuantNative.h"
 // Quantized integer compute ops for the CUDA backend: the quantized linear
 // layer, the four elementwise binary ops over QInt8 tensors with per-tensor
 // scales, and quantized_clamp.  Split from QuantKernels.cu so edits to the
@@ -435,9 +436,8 @@ Tensor quantized_add_cuda(
     double a_scale, int64_t a_zero_point,
     double b_scale, int64_t b_zero_point,
     double out_scale, int64_t out_zero_point) {
-    return quantized_binary_cuda_impl(a, b, a_scale, a_zero_point, b_scale,
-                                      b_zero_point, out_scale, out_zero_point,
-                                      0);
+    return quant::binary_cuda(a, b, a_scale, a_zero_point, b_scale, b_zero_point,
+                              out_scale, out_zero_point, 0);
 }
 
 Tensor quantized_sub_cuda(
@@ -445,9 +445,8 @@ Tensor quantized_sub_cuda(
     double a_scale, int64_t a_zero_point,
     double b_scale, int64_t b_zero_point,
     double out_scale, int64_t out_zero_point) {
-    return quantized_binary_cuda_impl(a, b, a_scale, a_zero_point, b_scale,
-                                      b_zero_point, out_scale, out_zero_point,
-                                      1);
+    return quant::binary_cuda(a, b, a_scale, a_zero_point, b_scale, b_zero_point,
+                              out_scale, out_zero_point, 1);
 }
 
 Tensor quantized_mul_cuda(
@@ -455,9 +454,8 @@ Tensor quantized_mul_cuda(
     double a_scale, int64_t a_zero_point,
     double b_scale, int64_t b_zero_point,
     double out_scale, int64_t out_zero_point) {
-    return quantized_binary_cuda_impl(a, b, a_scale, a_zero_point, b_scale,
-                                      b_zero_point, out_scale, out_zero_point,
-                                      2);
+    return quant::binary_cuda(a, b, a_scale, a_zero_point, b_scale, b_zero_point,
+                              out_scale, out_zero_point, 2);
 }
 
 Tensor quantized_div_cuda(
@@ -465,39 +463,19 @@ Tensor quantized_div_cuda(
     double a_scale, int64_t a_zero_point,
     double b_scale, int64_t b_zero_point,
     double out_scale, int64_t out_zero_point) {
-    return quantized_binary_cuda_impl(a, b, a_scale, a_zero_point, b_scale,
-                                      b_zero_point, out_scale, out_zero_point,
-                                      3);
+    return quant::binary_cuda(a, b, a_scale, a_zero_point, b_scale, b_zero_point,
+                              out_scale, out_zero_point, 3);
 }
 
 Tensor quantized_clamp_cuda(
     const Tensor& self, double self_scale, int64_t self_zero_point,
     double out_scale, int64_t out_zero_point,
     const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
-    if (self.dtype() != DType::Int8) {
-        TP_THROW(TypeError, "quantized_clamp(): expected an Int8 tensor");
-    }
-    if (!(out_scale > 0.0)) {
-        TP_THROW(ValueError, "quantized_clamp(): out_scale must be positive");
-    }
-    const Tensor sc = self.is_contiguous() ? self : self.contiguous();
-    Tensor out = Tensor::empty(self.shape(), DType::QInt8, self.device());
-
-    const int64_t numel = self.numel();
-    const int threads = 256;
-    const int blocks = static_cast<int>((numel + threads - 1) / threads);
-    quantized_clamp_kernel<<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-        numel, sc.data_ptr<int8_t>(), out.data_ptr<int8_t>(),
-        static_cast<float>(self_scale), static_cast<float>(self_zero_point),
-        static_cast<float>(1.0 / out_scale),
-        static_cast<float>(out_zero_point),
-        min.has_value() ? 1 : 0, max.has_value() ? 1 : 0,
-        min.has_value() ? static_cast<float>(min->toDouble()) : 0.0f,
-        max.has_value() ? static_cast<float>(max->toDouble()) : 0.0f);
-    checkCuda(cudaGetLastError(), "CUDA quantized_clamp kernel");
-    out.impl()->set_quantizer(make_per_tensor_affine_quantizer(
-        out_scale, out_zero_point, DType::QInt8));
-    return out;
+    TP_CHECK(min || max, "Clamp requires at least one bound");
+    make_per_tensor_affine_quantizer(self_scale, self_zero_point, self.dtype());
+    return quant::activation_cuda(self, out_scale, out_zero_point,
+        {7, min ? static_cast<float>(min->toDouble()) : -std::numeric_limits<float>::infinity(),
+             max ? static_cast<float>(max->toDouble()) : std::numeric_limits<float>::infinity()});
 }
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, QuantIntComputeKernels) {

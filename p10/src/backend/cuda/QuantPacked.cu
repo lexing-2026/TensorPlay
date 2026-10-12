@@ -343,3 +343,9 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, QuantPacked) {
     m.impl("_quantized_packed_run", _quantized_packed_run_cuda);
 }
 } // namespace tensorplay::cuda
+
+namespace tensorplay::quant {
+Tensor activation_cuda(const Tensor& input, double scale, int64_t zero_point, Activation fn) {
+    return tensorplay::cuda::activation(input, scale, zero_point, fn);
+}
+}

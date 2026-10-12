@@ -114,3 +114,13 @@ def get_embedding_qat_module_mappings() -> dict:
 def get_default_dynamic_quant_module_mappings() -> dict:
     """Get module mapping for post-training dynamic quantization."""
     return copy.deepcopy(DEFAULT_DYNAMIC_QUANT_MODULE_MAPPINGS)
+
+for _rank in (1, 2, 3):
+    DEFAULT_STATIC_QUANT_MODULE_MAPPINGS[getattr(nn, f'ConvTranspose{_rank}d')] = getattr(nnq, f'ConvTranspose{_rank}d')
+for _float, _quantized in ((nn.Embedding, nnq.Embedding), (nn.EmbeddingBag, nnq.EmbeddingBag)):
+    DEFAULT_STATIC_QUANT_MODULE_MAPPINGS[_float] = _quantized
+    DEFAULT_STATIC_QUANT_MODULE_MAPPINGS[getattr(nnqat, _float.__name__)] = _quantized
+    DEFAULT_DYNAMIC_QUANT_MODULE_MAPPINGS[_float] = _quantized
+
+for _name in ('RNN', 'LSTM', 'GRU', 'RNNCell', 'LSTMCell', 'GRUCell'):
+    DEFAULT_DYNAMIC_QUANT_MODULE_MAPPINGS[getattr(nn, _name)] = getattr(nnqd, _name)

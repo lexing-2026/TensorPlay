@@ -1,3 +1,4 @@
+#include "QuantNative.h"
 #include "QuantKernels.h"
 #include "QuantElementwise.h"
 #include "Convolution.h"
@@ -729,8 +730,8 @@ Tensor quantized_add_cpu(
     double a_scale, int64_t a_zero_point,
     double b_scale, int64_t b_zero_point,
     double out_scale, int64_t out_zero_point) {
-    return quantized_binary_cpu(a, b, a_scale, a_zero_point, b_scale,
-                                b_zero_point, out_scale, out_zero_point, 0);
+    return quant::binary_cpu(a, b, a_scale, a_zero_point, b_scale, b_zero_point,
+                              out_scale, out_zero_point, 0);
 }
 
 Tensor quantized_sub_cpu(
@@ -738,8 +739,8 @@ Tensor quantized_sub_cpu(
     double a_scale, int64_t a_zero_point,
     double b_scale, int64_t b_zero_point,
     double out_scale, int64_t out_zero_point) {
-    return quantized_binary_cpu(a, b, a_scale, a_zero_point, b_scale,
-                                b_zero_point, out_scale, out_zero_point, 1);
+    return quant::binary_cpu(a, b, a_scale, a_zero_point, b_scale, b_zero_point,
+                              out_scale, out_zero_point, 1);
 }
 
 Tensor quantized_mul_cpu(
@@ -747,8 +748,8 @@ Tensor quantized_mul_cpu(
     double a_scale, int64_t a_zero_point,
     double b_scale, int64_t b_zero_point,
     double out_scale, int64_t out_zero_point) {
-    return quantized_binary_cpu(a, b, a_scale, a_zero_point, b_scale,
-                                b_zero_point, out_scale, out_zero_point, 2);
+    return quant::binary_cpu(a, b, a_scale, a_zero_point, b_scale, b_zero_point,
+                              out_scale, out_zero_point, 2);
 }
 
 Tensor quantized_div_cpu(
@@ -756,61 +757,27 @@ Tensor quantized_div_cpu(
     double a_scale, int64_t a_zero_point,
     double b_scale, int64_t b_zero_point,
     double out_scale, int64_t out_zero_point) {
-    return quantized_binary_cpu(a, b, a_scale, a_zero_point, b_scale,
-                                b_zero_point, out_scale, out_zero_point, 3);
+    return quant::binary_cpu(a, b, a_scale, a_zero_point, b_scale, b_zero_point,
+                              out_scale, out_zero_point, 3);
 }
 
 Tensor quantized_clamp_cpu(
     const Tensor& self, double self_scale, int64_t self_zero_point,
     double out_scale, int64_t out_zero_point,
     const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
-    if (self.dtype() != DType::QInt8) {
-        TP_THROW(TypeError, "quantized_clamp(): expected a QInt8 tensor");
-    }
-    if (!(out_scale > 0.0)) {
-        TP_THROW(ValueError, "quantized_clamp(): out_scale must be positive");
-    }
-    const Tensor sc = self.is_contiguous() ? self : self.contiguous();
-    Tensor out = Tensor::empty(self.shape(), DType::QInt8, self.device());
-
-    const bool has_min = min.has_value();
-    const bool has_max = max.has_value();
-    const double lo = has_min ? min->toDouble() : 0.0;
-    const double hi = has_max ? max->toDouble() : 0.0;
-
-    const int8_t* in = sc.data_ptr<int8_t>();
-    int8_t* outp = out.data_ptr<int8_t>();
-    const int64_t numel = self.numel();
-    const double inv_out = 1.0 / out_scale;
-
-    for (int64_t i = 0; i < numel; ++i) {
-        double y = (static_cast<double>(in[i]) -
-                    static_cast<double>(self_zero_point)) * self_scale;
-        if (has_min && y < lo) y = lo;
-        if (has_max && y > hi) y = hi;
-        outp[i] = requantize_value(y, inv_out, out_zero_point);
-    }
-    out.impl()->set_quantizer(make_per_tensor_affine_quantizer(
-        out_scale, out_zero_point, DType::QInt8));
-    return out;
+    TP_CHECK(min || max, "Clamp requires at least one bound");
+    make_per_tensor_affine_quantizer(self_scale, self_zero_point, self.dtype());
+    return quant::activation_cpu(self, out_scale, out_zero_point,
+        {7, min ? static_cast<float>(min->toDouble()) : -std::numeric_limits<float>::infinity(),
+             max ? static_cast<float>(max->toDouble()) : std::numeric_limits<float>::infinity()});
 }
 
 Tensor quantized_max_pool2d_cpu(
     const Tensor& self, const std::vector<int64_t>& kernel_size,
     const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
     const std::vector<int64_t>& dilation, bool ceil_mode) {
-    // The window maximum is order-preserving in the quantized domain, so the
-    // pooling runs on an Int8 view of the code storage and the output is
-    // re-wrapped with the input quantizer untouched.
-    if (self.dtype() != DType::QInt8) {
-        TP_THROW(TypeError, "quantized_max_pool2d(): expected a QInt8 tensor");
-    }
-    Tensor codes = quantized::strip_quantizer(self);
-    Tensor out_codes =
-        max_pool2d_cpu(codes, kernel_size, stride, padding, dilation,
-                       ceil_mode);
-    return quantized::make_qtensor(out_codes, self.impl()->quantizer(),
-                                   DType::QInt8);
+    return quant::pool_cpu(self, kernel_size, stride, padding, dilation,
+                           ceil_mode, false, std::nullopt, 2);
 }
 
 Tensor quantized_conv2d_cpu(
@@ -2305,66 +2272,29 @@ Tensor quantized_tanh_cpu(const Tensor& self, double out_scale,
 Tensor quantized_cat_cpu(const std::vector<Tensor>& tensors, int64_t dim,
                          std::optional<double> scale,
                          std::optional<int64_t> zero_point) {
-    return quantized_cat_impl_cpu(tensors, dim, scale, zero_point, false);
+    return quant::cat_cpu(tensors, dim, scale, zero_point, false);
 }
 
 Tensor quantized_cat_relu_cpu(const std::vector<Tensor>& tensors, int64_t dim,
                               std::optional<double> scale,
                               std::optional<int64_t> zero_point) {
-    return quantized_cat_impl_cpu(tensors, dim, scale, zero_point, true);
+    return quant::cat_cpu(tensors, dim, scale, zero_point, true);
 }
 
 Tensor quantized_max_pool1d_cpu(
     const Tensor& self, const std::vector<int64_t>& kernel_size,
     const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
     const std::vector<int64_t>& dilation, bool ceil_mode) {
-    if (self.dtype() != DType::QInt8) {
-        TP_THROW(TypeError,
-                 "quantized_max_pool1d(): expected a QInt8 tensor");
-    }
-    if (self.dim() != 3) {
-        TP_THROW(ValueError,
-                 "quantized_max_pool1d(): expected a 3d input");
-    }
-    if (kernel_size.size() != 1 || padding.size() != 1 ||
-        dilation.size() != 1) {
-        TP_THROW(ValueError,
-                 "quantized_max_pool1d(): kernel_size, padding and dilation "
-                 "must have one element");
-    }
-    // The single spatial axis is lifted into a 2d window and the 2d pooling
-    // kernel runs on the code storage; the input quantizer is inherited.
-    const int64_t n = self.size(0), c = self.size(1), l = self.size(2);
-    const int64_t k = kernel_size[0];
-    const int64_t s = stride.empty() ? k : stride[0];
-    Tensor codes =
-        quantized::strip_quantizer(self).contiguous().view({n, c, 1, l});
-    Tensor pooled =
-        max_pool2d_cpu(codes, {1, k}, {1, s}, {0, padding[0]},
-                       {1, dilation[0]}, ceil_mode);
-    Tensor out = pooled.view(
-        {n, c, static_cast<std::vector<int64_t>>(pooled.shape())[3]});
-    return quantized::make_qtensor(out, self.impl()->quantizer(),
-                                   DType::QInt8);
+    return quant::pool_cpu(self, kernel_size, stride, padding, dilation,
+                           ceil_mode, false, std::nullopt, 2);
 }
 
 Tensor quantized_max_pool3d_cpu(
     const Tensor& self, const std::vector<int64_t>& kernel_size,
     const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
     const std::vector<int64_t>& dilation, bool ceil_mode) {
-    if (self.dtype() != DType::QInt8) {
-        TP_THROW(TypeError,
-                 "quantized_max_pool3d(): expected a QInt8 tensor");
-    }
-    // The window maximum is order-preserving in the quantized domain, so the
-    // pooling runs on the code storage and the output inherits the input
-    // quantizer.
-    Tensor codes = quantized::strip_quantizer(self).contiguous();
-    Tensor out =
-        max_pool3d_cpu(codes, kernel_size, stride, padding, dilation,
-                       ceil_mode);
-    return quantized::make_qtensor(out, self.impl()->quantizer(),
-                                   DType::QInt8);
+    return quant::pool_cpu(self, kernel_size, stride, padding, dilation,
+                           ceil_mode, false, std::nullopt, 2);
 }
 
 Tensor quantized_conv1d_cpu(

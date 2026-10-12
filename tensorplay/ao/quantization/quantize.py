@@ -241,12 +241,15 @@ def quantize_dynamic(model, qconfig_spec=None, mapping=None, inplace=False, dtyp
         mapping = get_default_dynamic_quant_module_mappings()
     if not inplace:
         model = copy.deepcopy(model)
-    from tensorplay import qint8
-    from .qconfig import default_dynamic_qconfig
-    if dtype is not None and dtype != qint8:
-        raise ValueError('Dynamic integer linear conversion requires signed 8-bit weights')
+    from tensorplay import qint8, quint8, float16, nn
+    from .qconfig import default_dynamic_qconfig, float16_dynamic_qconfig, float_qparams_weight_only_qconfig
+    if dtype is not None and dtype not in (qint8, quint8, float16):
+        raise ValueError('Dynamic conversion requires integer or half weights')
+    default_dynamic_qconfig = (float16_dynamic_qconfig if dtype == float16 else
+                              float_qparams_weight_only_qconfig if dtype == quint8 else default_dynamic_qconfig)
     if qconfig_spec is None:
-        qconfig_spec = {source: default_dynamic_qconfig for source in mapping}
+        qconfig_spec = {source: default_dynamic_qconfig for source in mapping
+                        if (source in (nn.Embedding, nn.EmbeddingBag)) == (dtype == quint8)}
     elif not isinstance(qconfig_spec, dict):
         qconfig_spec = {source: default_dynamic_qconfig for source in qconfig_spec}
     model.eval()

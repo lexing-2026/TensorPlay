@@ -136,3 +136,25 @@ class QuantizedState:
                 missing_keys.append(key)
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
                                      missing_keys, unexpected_keys, error_msgs)
+
+
+class PackedHalfWeight(nn.Module):
+    """Half storage with float accumulation and persistent native weights."""
+
+    def __init__(self, weight, bias=None):
+        super().__init__()
+        self.register_buffer('weight', None)
+        self.register_buffer('bias', None)
+        self.set_weight_bias(weight, bias)
+
+    def set_weight_bias(self, weight, bias):
+        if bias is not None and (bias.dim() != 1 or bias.numel() != weight.size(0)):
+            raise ValueError('Bias must contain one value per output channel')
+        self.weight = _C._quantized_fp16_prepack(weight.detach())
+        self.bias = bias.detach().to(device=weight.device, dtype=tp.float32).contiguous() if bias is not None else None
+
+    def _weight_bias(self):
+        return self.weight, self.bias
+
+    def run(self, input, relu=False):
+        return _C._quantized_fp16_linear(input, self.weight, self.bias, relu)

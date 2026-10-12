@@ -52,6 +52,7 @@ set(P10_SOURCES
     src/backend/cpu/QuantNormalizationKernels.cpp
     src/backend/cpu/QuantConvPacking.cpp
     src/backend/cpu/QuantPacked.cpp
+    src/backend/cpu/QuantNative.cpp
     src/quantized/QTensorImpl.cpp
     src/backend/cpu/ForwardKernels.cpp
     src/backend/cpu/FactoryKernels.cpp
@@ -219,6 +220,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/QuantIntComputeKernels.cu
         src/backend/cuda/QuantGemmKernels.cu
         src/backend/cuda/QuantPacked.cu
+        src/backend/cuda/QuantNative.cu
         src/backend/cuda/ForwardKernels.cu
         src/backend/cuda/FactoryKernels.cu
         src/backend/cuda/EmbeddingKernels.cu

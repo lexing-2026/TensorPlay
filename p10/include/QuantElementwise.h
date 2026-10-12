@@ -26,6 +26,10 @@ struct Activation {
             case 3: return ::fminf(::fmaxf(x + 3.f, 0.f), 6.f) / 6.f;
             case 4: return 1.f / (1.f + ::expf(-x));
             case 5: return ::tanhf(x);
+            case 6: return x > slope ? x : alpha;
+            case 7: return ::fminf(::fmaxf(x, slope), alpha);
+            case 8: return x * .5f * (1.f + ::erff(x * .7071067811865475f));
+            case 9: return x * .5f * (1.f + ::tanhf(.7978845608028654f * (x + .044715f * x * x * x)));
             default: return x;
         }
     }
@@ -47,6 +51,10 @@ TP_QE_HD T encode(float value, float inverse_scale, int64_t zero_point) {
 
 Tensor activation_cpu(const Tensor& input, double scale, int64_t zero_point,
                       Activation activation);
+#ifdef USE_CUDA
+Tensor activation_cuda(const Tensor& input, double scale, int64_t zero_point,
+                       Activation activation);
+#endif
 Tensor relu6_cpu(const Tensor& input);
 Tensor relu_cpu(const Tensor& input);
 }

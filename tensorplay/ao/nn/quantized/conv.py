@@ -144,3 +144,70 @@ class Conv2d(_ConvNd):
 
 class Conv3d(_ConvNd):
     _RANK = 3
+
+
+class _ConvTransposeNd(_ConvNd):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0,
+                 output_padding=0, groups=1, bias=True, dilation=1, padding_mode='zeros',
+                 out_scale=1., out_zero_point=0):
+        nn.Module.__init__(self)
+        if groups <= 0 or in_channels % groups or out_channels % groups:
+            raise ValueError('Channels must be divisible by positive groups')
+        if padding_mode != 'zeros':
+            raise ValueError('Transposed convolution supports zero padding')
+        self.in_channels, self.out_channels = int(in_channels), int(out_channels)
+        self.kernel_size = _pair(kernel_size, self._RANK)
+        self.stride, self.padding = _pair(stride, self._RANK), _pair(padding, self._RANK)
+        self.dilation, self.output_padding = _pair(dilation, self._RANK), _pair(output_padding, self._RANK)
+        self.groups, self.padding_mode = int(groups), padding_mode
+        self.input_scale = self.input_zero_point = None
+        self.out_scale, self.out_zero_point = float(out_scale), int(out_zero_point)
+        self.register_buffer('_weight', _C.quantize_per_tensor(
+            tp.zeros((in_channels, out_channels // groups) + self.kernel_size), 1., 0, tp.qint8))
+        self.register_buffer('_bias', tp.zeros(out_channels) if bias else None)
+
+    @property
+    def weight(self):
+        return self._weight
+
+    @property
+    def bias(self):
+        return self._bias
+
+    def set_weight_bias(self, weight, bias):
+        expected = (self.in_channels, self.out_channels // self.groups) + self.kernel_size
+        if tuple(weight.shape) != expected or weight.dtype != tp.qint8 or weight.qscheme() != tp.per_tensor_affine:
+            raise ValueError('Transposed weights require the declared shape and a signed tensor grid')
+        if bias is not None and (bias.dim() != 1 or bias.numel() != self.out_channels):
+            raise ValueError('Bias must contain one value per output channel')
+        self._weight = weight.contiguous()
+        self._bias = None if bias is None else bias.detach().float().to(weight.device).contiguous()
+
+    def forward(self, x):
+        return _C.quantized_convolution(x, self.weight, self.bias, self.out_scale, self.out_zero_point,
+            self.stride, self.padding, self.dilation, self.groups, True, self.output_padding)
+
+    @classmethod
+    def from_float(cls, mod, use_precomputed_fake_quant=False):
+        observer = getattr(mod, 'activation_post_process', None)
+        scale, zp = observer.calculate_qparams() if observer is not None else (1., 0)
+        result = cls(mod.in_channels, mod.out_channels, mod.kernel_size, mod.stride,
+                     mod.padding, mod.output_padding, mod.groups, mod.bias is not None,
+                     mod.dilation, mod.padding_mode, float(scale), int(zp))
+        result.set_weight_bias(quantize_module_weight(mod, use_precomputed_fake_quant), mod.bias)
+        return result
+
+
+class ConvTranspose1d(_ConvTransposeNd):
+    _RANK = 1
+
+
+class ConvTranspose2d(_ConvTransposeNd):
+    _RANK = 2
+
+
+class ConvTranspose3d(_ConvTransposeNd):
+    _RANK = 3
+
+
+__all__ += ['ConvTranspose1d', 'ConvTranspose2d', 'ConvTranspose3d']

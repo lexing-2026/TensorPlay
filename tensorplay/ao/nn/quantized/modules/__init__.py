@@ -36,3 +36,5 @@ from tensorplay.ao.nn.quantized import (  # noqa: F401
     Sigmoid,
     Tanh,
 )
+
+from tensorplay.ao.nn.quantized import ConvTranspose1d, ConvTranspose2d, ConvTranspose3d, Embedding, EmbeddingBag, EmbeddingPackedParams

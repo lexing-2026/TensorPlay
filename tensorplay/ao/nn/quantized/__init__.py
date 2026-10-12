@@ -56,3 +56,7 @@ __all__ = [
     "QFunctional",
     "FXFloatFunctional",
 ]
+
+from .conv import ConvTranspose1d, ConvTranspose2d, ConvTranspose3d
+from .embedding_ops import Embedding, EmbeddingBag, EmbeddingPackedParams
+__all__ += ['ConvTranspose1d', 'ConvTranspose2d', 'ConvTranspose3d', 'Embedding', 'EmbeddingBag', 'EmbeddingPackedParams']
