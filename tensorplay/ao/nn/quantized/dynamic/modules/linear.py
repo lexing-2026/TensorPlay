@@ -49,7 +49,8 @@ class Linear(nn.Module):
     def forward(self, x):
         if x.is_quantized():
             x = x.dequantize()
-        quantized = tensorplay._C.quantize_per_tensor_dynamic(x, tensorplay.quint8, self.reduce_range)
+        quantized = (tensorplay._C.quantize_per_tensor_dynamic(x, tensorplay.quint8, self.reduce_range)
+                     if x.numel() else tensorplay._C.quantize_per_tensor(x, .1, 0, tensorplay.quint8))
         return self._packed_params.run(quantized, relu=self._FUSED_RELU, output_float=True).to(x.dtype)
 
     @classmethod

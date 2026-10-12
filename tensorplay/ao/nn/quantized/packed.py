@@ -123,7 +123,7 @@ class QuantizedState:
         for name in ('input_scale', 'input_zero_point', 'out_scale', 'out_zero_point'):
             value = getattr(self, name, None)
             if value is not None:
-                destination[prefix + name] = tp.tensor(value)
+                destination[prefix + name] = tp.tensor(value, dtype=tp.int64 if 'zero_point' in name else tp.float64)
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                               missing_keys, unexpected_keys, error_msgs):
@@ -132,5 +132,7 @@ class QuantizedState:
             if key in state_dict:
                 value = state_dict.pop(key)
                 setattr(self, name, int(value) if 'zero_point' in name else float(value))
+            elif strict and getattr(self, name, None) is not None:
+                missing_keys.append(key)
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
                                      missing_keys, unexpected_keys, error_msgs)

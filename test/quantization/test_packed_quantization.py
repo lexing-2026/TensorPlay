@@ -117,16 +117,18 @@ def test_dynamic_linear_global_grid(device):
 
 @pytest.mark.parametrize('device', DEVICES)
 @pytest.mark.parametrize('bias', [False, True])
-def test_packed_full_model_save_copy_and_device(device, bias):
+@pytest.mark.parametrize('legacy', [False, True])
+def test_packed_full_model_save_copy_and_device(device, bias, legacy):
     qweight = tp._C.quantize_per_tensor(tp.randn(4, 5), .03, -7, tp.qint8)
     model = nnq.Linear(5, 4, qweight=qweight, bias=tp.randn(4) if bias else None,
                        out_scale=.07, out_zero_point=31).to(device)
     x = tp._C.quantize_per_tensor(tp.randn(2, 5, device=device), .02, 93, tp.quint8)
     expected = model(x).int_repr().cpu().numpy()
     stream = io.BytesIO()
-    tp.save(model, stream)
+    tp.save(model, stream, _use_new_zipfile_serialization=not legacy)
     stream.seek(0)
-    restored = tp.load(stream, weights_only=False)
+    with tp.serialization.safe_globals([nnq.Linear, PackedWeight]):
+        restored = tp.load(stream)
     for result in (restored, copy.deepcopy(model), model.cpu().to(device)):
         assert result.qweight.q_zero_point() == -7
         np.testing.assert_array_equal(result(x).int_repr().cpu().numpy(), expected)
@@ -214,6 +216,20 @@ def test_dynamic_fused_eager_conversion(device):
     qx = tp._C.quantize_per_tensor_dynamic(x, tp.quint8, True)
     expected = (qx.dequantize() @ result[0].weight.dequantize().T + result[0].bias).relu()
     np.testing.assert_allclose(result(x).cpu().numpy(), expected.cpu().numpy(), atol=1e-6)
+    assert result(tp.empty(0, 5, device=device)).shape == (0, 4)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_dynamic_root_and_configuration_override(device):
+    from tensorplay.ao.quantization import quantize_dynamic, default_per_channel_qconfig
+    floating = tp.nn.Linear(5, 4).to(device)
+    result = quantize_dynamic(floating, {tp.nn.Linear: default_per_channel_qconfig})
+    assert isinstance(result, nnq.dynamic.Linear)
+    assert not result.training
+    assert result.weight.qscheme() == tp.per_channel_affine
+    floating.qconfig = None
+    untouched = quantize_dynamic(floating)
+    assert type(untouched) is tp.nn.Linear
 
 
 @pytest.mark.parametrize('device', DEVICES)
@@ -232,3 +248,43 @@ def test_integer_reflection_padding(device, rank):
     expected = result[1]._packed_params.run(padded, result[1].out_scale, result[1].out_zero_point,
                                            (1,) * rank, (0,) * rank, (1,) * rank)
     np.testing.assert_array_equal(result[1](qx).int_repr().cpu().numpy(), expected.int_repr().cpu().numpy())
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_packed_accumulation_exceeds_int32(device):
+    K = 131072
+    x = tp._C._make_per_tensor_quantized_tensor(tp.full((2, K), 255, dtype=tp.uint8, device=device), 1., 0)
+    w = tp._C._make_per_tensor_quantized_tensor(tp.full((1, K), 127, dtype=tp.int8, device=device), 1., -128)
+    packed = PackedWeight(w)
+    result = packed.run(x, 1.e8, 0)
+    expected = round(K * 255 * 255 / 1.e8)
+    np.testing.assert_array_equal(result.int_repr().cpu().numpy(), np.full((2, 1), expected))
+
+
+@pytest.mark.skipif('cuda' not in DEVICES, reason='Requires a CUDA device')
+def test_packed_cuda_large_leading_dimension():
+    rows = 1048592
+    x = tp._C.quantize_per_tensor(tp.empty(rows, 0, device='cuda'), .1, 0, tp.quint8)
+    w = tp._C.quantize_per_tensor(tp.empty(1, 0, device='cuda'), .1, 0, tp.qint8)
+    packed = PackedWeight(w, tp.tensor([.3], device='cuda'))
+    result = packed.run(x, .01, 129)
+    assert result.shape == (rows, 1)
+    codes = result.int_repr()
+    assert int(codes.min()) == 159 and int(codes.max()) == 159
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_checkpoint_preserves_scalar_precision_and_strictness(device):
+    weight = tp._C.quantize_per_tensor(tp.zeros(1, 1, device=device), 1., 0, tp.qint8)
+    module = nnq.Linear(1, 1, qweight=weight, bias=tp.tensor([.15], device=device),
+                        out_scale=.3, out_zero_point=66)
+    x = tp._C.quantize_per_tensor(tp.zeros(2, 1, device=device), .1, 0, tp.quint8)
+    state = module.state_dict()
+    fresh = nnq.Linear(1, 1).to(device)
+    fresh.load_state_dict(state)
+    assert fresh.out_scale == .3
+    np.testing.assert_array_equal(fresh(x).int_repr().cpu().numpy(), module(x).int_repr().cpu().numpy())
+    incomplete = dict(state)
+    del incomplete['out_scale']
+    with pytest.raises(RuntimeError):
+        fresh.load_state_dict(incomplete)

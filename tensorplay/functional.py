@@ -15893,6 +15893,35 @@ def _propagate_xla_data(input, output):
             return _captured
     return _C._propagate_xla_data(input, output)
 
+def _quantized_weight_prepack(weight):
+    if _capturing():
+        _captured = _capture_call(_quantized_weight_prepack, (weight,), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantized_weight_prepack(weight)
+
+def _quantized_packed_run(input, packed, offsets, scales, zero_points, bias, weight_sizes, output_scale, output_zero_point, stride=[], padding=[], dilation=[], groups=1, relu=False, output_float=False):
+    if _capturing():
+        _captured = _capture_call(_quantized_packed_run, (input, packed, offsets, scales, zero_points, bias, weight_sizes, output_scale, output_zero_point, stride, padding, dilation, groups, relu, output_float), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(weight_sizes, int) and not isinstance(weight_sizes, bool):
+        weight_sizes = [weight_sizes]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C._quantized_packed_run(input, packed, offsets, scales, zero_points, bias, weight_sizes, output_scale, output_zero_point, stride, padding, dilation, groups, relu, output_float)
+
+def quantized_batch_norm_relu(input, weight, bias, mean, var, eps, output_scale, output_zero_point):
+    if _capturing():
+        _captured = _capture_call(quantized_batch_norm_relu, (input, weight, bias, mean, var, eps, output_scale, output_zero_point), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_batch_norm_relu(input, weight, bias, mean, var, eps, output_scale, output_zero_point)
+
 try:
     _C.install_factory_fast_paths(_C, {
         'empty': empty, 'zeros': zeros, 'ones': ones,
