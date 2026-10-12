@@ -589,7 +589,9 @@ void moment_codes(const void* input, void* output, int64_t count, int64_t rows,
         const double denominator = std::max(static_cast<double>(count) - correction, 0.);
         const double mean = static_cast<double>(sum) / count, unbiased = static_cast<double>(sum) / denominator;
         const double variance = std::max(square_sum / denominator - 2. * mean * unbiased + mean * mean * count / denominator, 0.);
-        y[row] = quant::encode<T>(static_cast<float>(std::sqrt(variance) * scale), 1.f / static_cast<float>(scale), zp);
+        const float value = static_cast<float>(std::sqrt(variance) * scale);
+        y[row] = std::isnan(value) ? (sizeof(T) == 4 ? std::numeric_limits<T>::lowest() : T(0)) :
+            quant::encode<T>(value, 1.f / static_cast<float>(scale), zp);
     }
 }
 
@@ -600,6 +602,25 @@ void moment_impl(const void* x, void* y, int64_t count, int64_t rows, DType dtyp
         case DType::QUInt8: moment_codes<quint8>(x,y,count,rows,scale,zp,deviation,correction); break;
         case DType::QInt32: moment_codes<qint32>(x,y,count,rows,scale,zp,deviation,correction); break;
         default: break;
+    }
+}
+
+void sigmoid_codes(const int32_t* x, int32_t* y, int64_t size, float scale, int64_t zp,
+                   double output_scale, int64_t output_zp) {
+    using QV = vec::Vectorized<qint32>;
+    using FV = vec::Vectorized<float>;
+    const FV input_scale(scale), input_zero(static_cast<float>(zp)), one(1.f);
+    const float inverse = 1.f / static_cast<float>(output_scale);
+    int64_t i = 0;
+    for (; i + QV::size() <= size; i += QV::size()) {
+        auto values = QV::loadu(x + i).dequantize(input_scale, input_zero);
+        for (auto& value : values) value = (one + value.neg().exp()).reciprocal();
+        QV::quantize(values, static_cast<float>(output_scale), output_zp, inverse).store(y + i);
+    }
+    for (; i < size; ++i) {
+        const float real = static_cast<float>(static_cast<int64_t>(x[i]) - zp) * scale;
+        const float value = static_cast<float>(1.0f / (1.0 + std::exp(-real)));
+        y[i] = quant::encode<int32_t>(value, inverse, output_zp);
     }
 }
 
@@ -771,6 +792,7 @@ REGISTER_DISPATCH(quantized_batch_norm_stub, &batch_norm_impl);
 REGISTER_DISPATCH(quantized_bilinear_stub, &bilinear_impl);
 REGISTER_DISPATCH(quantized_clip_stub, &clip_impl);
 REGISTER_DISPATCH(quantized_prelu_stub, &prelu_impl);
+REGISTER_DISPATCH(quantized_sigmoid_stub, &sigmoid_codes);
 REGISTER_DISPATCH(quantized_moment_stub, &moment_impl);
 REGISTER_DISPATCH(quantized_lookup_stub, &lookup_impl);
 REGISTER_DISPATCH(quantized_binary_stub, &binary_impl);
@@ -789,6 +811,7 @@ ALSO_REGISTER_AVX512_DISPATCH(quantized_batch_norm_stub, &batch_norm_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_bilinear_stub, &bilinear_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_clip_stub, &clip_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_prelu_stub, &prelu_impl);
+ALSO_REGISTER_AVX512_DISPATCH(quantized_sigmoid_stub, &sigmoid_codes);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_moment_stub, &moment_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_lookup_stub, &lookup_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_binary_stub, &binary_impl);

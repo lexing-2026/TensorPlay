@@ -96,6 +96,11 @@ Tensor activation_cpu(const Tensor& input, double scale, int64_t zp, Activation 
         const auto* src = x.data_ptr<int32_t>();
         auto* dst = out.data_ptr<int32_t>();
         parallel::parallel_for(0, input.numel(), 32768, [&](int64_t begin, int64_t end) {
+            if (fn.op == 4) {
+                cpu::quantized_sigmoid_stub(DeviceType::CPU, src + begin, dst + begin,
+                    end - begin, input_scale, input_zp, scale, zp);
+                return;
+            }
             for (int64_t i = begin; i < end; ++i)
                 dst[i] = encode<int32_t>(fn(static_cast<float>(static_cast<int64_t>(src[i]) - input_zp) * input_scale), inverse_scale, zp);
         });
@@ -144,6 +149,7 @@ DEFINE_DISPATCH(quantized_batch_norm_stub);
 DEFINE_DISPATCH(quantized_bilinear_stub);
 DEFINE_DISPATCH(quantized_clip_stub);
 DEFINE_DISPATCH(quantized_prelu_stub);
+DEFINE_DISPATCH(quantized_sigmoid_stub);
 DEFINE_DISPATCH(quantized_moment_stub);
 DEFINE_DISPATCH(quantized_lookup_stub);
 DEFINE_DISPATCH(quantized_binary_stub);

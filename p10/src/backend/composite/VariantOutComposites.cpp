@@ -35,6 +35,7 @@ Tensor& out_wrap_adaptive_avg_pool2d_out(const Tensor& self, const std::vector<i
 }
 
 Tensor& out_wrap_adaptive_avg_pool3d_out(const Tensor& self, const std::vector<int64_t>& output_size, Tensor& out) {
+    if (isQuantizedType(self.dtype())) { out = ops::adaptive_avg_pool3d(self, output_size); return out; }
     write_out(out, ops::adaptive_avg_pool3d(self, output_size));
     return out;
 }
@@ -538,7 +539,13 @@ Tensor& out_wrap_reflection_pad1d_out(const Tensor& self, const std::vector<int6
 }
 
 Tensor& out_wrap_reflection_pad2d_out(const Tensor& self, const std::vector<int64_t>& padding, Tensor& out) {
-    if (isQuantizedType(self.dtype())) out.impl()->set_quantizer(quantized::quantizer_of(self));
+    if (isQuantizedType(self.dtype())) {
+        Tensor result = ops::reflection_pad2d(self, padding);
+        if (out.sizes().vec() != result.sizes().vec()) out.resize_(result.sizes().vec());
+        Tensor target = quantized::storage_view(out);
+        target.copy_(quantized::storage_view(result));
+        return out;
+    }
 
     write_out(out, ops::reflection_pad2d(self, padding));
     return out;

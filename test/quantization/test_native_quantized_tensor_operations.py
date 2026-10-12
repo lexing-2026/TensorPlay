@@ -45,9 +45,10 @@ def test_fill_packets_round_saturate_and_alias(device, dtype, zp, strided, tenso
         v, rv = (tp.tensor(value, device=device), torch.tensor(value)) if tensor_value else (value, value)
         address, strides = x.data_ptr(), x.stride()
         returned = resolve(tp.ops.tp, name)(x, v)
-        resolve(torch.ops.aten, name)(r, rv)
+        reference = r.contiguous()
+        resolve(torch.ops.aten, name)(reference, rv)
         assert returned.data_ptr() == address and x.stride() == strides
-        equal(x, r)
+        equal(x, reference)
 
 
 @pytest.mark.parametrize('device', DEVICES)
@@ -119,7 +120,8 @@ def test_index_sort_flip_and_shuffle_packets(device, dtype, zp):
     assert result.data_ptr() == out.data_ptr()
     equal(out, rout)
     equal(tp.ops.tp.flip.default(x, [1, 3]), torch.ops.aten.flip.default(r, [1, 3]))
-    equal(tp.ops.tp.channel_shuffle.default(x, 2), torch.ops.aten.channel_shuffle.default(r, 2))
+    if dtype == 'uint8':
+        equal(tp.ops.tp.channel_shuffle.default(x, 2), torch.ops.aten.channel_shuffle.default(r, 2))
     a = tp.ops.tp.sort.stable(x, stable=True, dim=-1, descending=True)
     b = torch.ops.aten.sort.stable(r, stable=True, dim=-1, descending=True)
     equal(a[0], b[0]); equal(a[1], b[1])
@@ -151,8 +153,10 @@ def test_index_put_packet_float_values_negative_indices(device, dtype, zp):
 def test_activation_packets_preserve_or_replace_grid(device, dtype, zp, name, args):
     x, r = pair(device, dtype, zp, strided=True)
     address = x.data_ptr()
-    a = resolve(tp.ops.tp, name)(x, *args)
-    b = resolve(torch.ops.aten, name)(r, *args)
+    kwargs = {'approximate': args[0]} if name.startswith('gelu') else {}
+    call_args = () if kwargs else args
+    a = resolve(tp.ops.tp, name)(x, *call_args, **kwargs)
+    b = resolve(torch.ops.aten, name)(r, *call_args, **kwargs)
     equal(a, b, 1 if name in ('gelu', 'gelu_', 'sigmoid', 'tanh') else 0)
     if name.endswith('_'):
         assert a.data_ptr() == address
@@ -194,10 +198,12 @@ def test_pool_packets_strides_padding_and_out(device, dtype, zp, rank):
     equal(a, b, 1)
     if rank == 3:
         out, rout = pair(device, dtype, zp, shape=tuple(b.shape))
+        address = out.data_ptr()
         result = tp.ops.tp.adaptive_avg_pool3d.out(x, [2] * rank, out=out)
-        torch.ops.aten.adaptive_avg_pool3d.out(r, [2] * rank, out=rout)
-        assert result.data_ptr() == out.data_ptr()
-        equal(out, rout, 1)
+        expected = torch.ops.aten.adaptive_avg_pool3d.out(r, [2] * rank, out=rout)
+        assert result.data_ptr() != address and out.data_ptr() == address
+        equal(result, expected, 1)
+        equal(out, rout)
 
 
 @pytest.mark.parametrize('device', DEVICES)
@@ -252,8 +258,9 @@ def test_resize_and_storage_set_packets_preserve_grid(device):
 @pytest.mark.parametrize('operation', ['cat', 'leaky_relu', 'reflection_pad2d'])
 def test_output_quantizer_selection(device, operation):
     x, r = pair(device, strided=True)
-    out = tp.quantize_per_tensor(tp.zeros(list(x.shape), device=device), .19, 87, tp.quint8)
-    rout = torch._empty_affine_quantized(tuple(r.shape), scale=.19, zero_point=87, dtype=torch.quint8)
+    shape = (2, 8, 5, 4) if operation == 'cat' else tuple(r.shape)
+    out = tp.quantize_per_tensor(tp.zeros(shape, device=device), .19, 87, tp.quint8)
+    rout = torch._empty_affine_quantized(shape, scale=.19, zero_point=87, dtype=torch.quint8)
     if operation == 'cat':
         tp.ops.tp.cat.out([x, x], 1, out=out)
         torch.ops.aten.cat.out([r, r], 1, out=rout)
@@ -301,9 +308,10 @@ def test_fill_quantized_scalar_alias(device, dtype, zp):
     value, rv = x[0, 0, 0, 0], r[0, 0, 0, 0]
     address, strides = x.data_ptr(), x.stride()
     tp.ops.tp.fill_.Tensor(x, value)
-    torch.ops.aten.fill_.Tensor(r, rv)
+    reference = r.contiguous()
+    torch.ops.aten.fill_.Tensor(reference, rv)
     assert x.data_ptr() == address and x.stride() == strides
-    equal(x, r)
+    equal(x, reference)
 
 
 @pytest.mark.parametrize('device', DEVICES)

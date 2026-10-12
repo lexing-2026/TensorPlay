@@ -22,7 +22,7 @@ Tensor with_quantizer(const Tensor& codes, const Tensor& self) {
     return out;
 }
 
-namespace { Scalar scalar_code(const Tensor& self, const Scalar& value); }
+namespace { Scalar scalar_code(const Tensor& self, const Scalar& value, bool copy_rounding = false); }
 
 Tensor activation(const Tensor& self, int operation, double a, double b) {
     double scale = q_scale(self);
@@ -46,14 +46,25 @@ Tensor activation(const Tensor& self, int operation, double a, double b) {
 }
 
 namespace {
-Scalar scalar_code(const Tensor& self, const Scalar& value) {
+Scalar scalar_code(const Tensor& self, const Scalar& value, bool copy_rounding) {
     const float v = static_cast<float>(value.toDouble());
     const float inverse = 1.f / static_cast<float>(q_scale(self));
     const int64_t zp = q_zero_point(self);
+    if (copy_rounding && std::isnan(v)) {
+        return Scalar(static_cast<int64_t>(self.dtype() == DType::QInt8 ? INT8_MAX :
+            self.dtype() == DType::QUInt8 ? UINT8_MAX : INT32_MIN));
+    }
     switch (self.dtype()) {
         case DType::QInt8: return Scalar(static_cast<int64_t>(quant::encode<int8_t>(v, inverse, zp)));
         case DType::QUInt8: return Scalar(static_cast<int64_t>(quant::encode<uint8_t>(v, inverse, zp)));
-        case DType::QInt32: return Scalar(static_cast<int64_t>(quant::encode<int32_t>(v, inverse, zp)));
+        case DType::QInt32: {
+            if (copy_rounding) {
+                const float position = std::nearbyint(v * inverse) + static_cast<float>(zp);
+                return Scalar(static_cast<int64_t>(std::clamp(static_cast<double>(position),
+                    static_cast<double>(INT32_MIN), static_cast<double>(INT32_MAX))));
+            }
+            return Scalar(static_cast<int64_t>(quant::encode<int32_t>(v, inverse, zp)));
+        }
         default: TP_THROW(TypeError, "scalar encoding requires byte or word quantization");
     }
 }
@@ -95,7 +106,7 @@ Tensor& fill(Tensor& self, const Scalar& value) {
         return self;
     }
     Tensor codes = storage_view(self);
-    codes.fill_(scalar_code(self, value));
+    codes.fill_(scalar_code(self, value, true));
     return self;
 }
 

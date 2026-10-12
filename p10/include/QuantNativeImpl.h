@@ -594,8 +594,9 @@ struct MomentInnerCodes {
         const double unbiased = static_cast<double>(sum) / den;
         const double raw_variance = square_sum / den - 2. * mean * unbiased + mean * mean * count / den;
         const double variance = raw_variance < 0. ? 0. : raw_variance;
-        y[i] = encode<T>(static_cast<float>(::sqrt(variance) * scale),
-                        1.f / static_cast<float>(scale), zp);
+        const float value = static_cast<float>(::sqrt(variance) * scale);
+        y[i] = value != value ? (sizeof(T) == 4 ? std::numeric_limits<T>::lowest() : T(0)) :
+            encode<T>(value, 1.f / static_cast<float>(scale), zp);
     }
 };
 
@@ -659,7 +660,8 @@ struct StdStridedCodes {
         const double raw_denominator = static_cast<double>(count) - correction;
         const double denominator = raw_denominator < 0. ? 0. : raw_denominator;
         const float value = static_cast<float>(::sqrt(m2 / denominator));
-        y[group] = encode<T>(value, 1.f / static_cast<float>(scale), zp);
+        y[group] = value != value ? (sizeof(T) == 4 ? std::numeric_limits<T>::lowest() : std::numeric_limits<T>::max()) :
+            encode<T>(value, 1.f / static_cast<float>(scale), zp);
     }
 };
 
