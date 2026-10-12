@@ -1,5 +1,6 @@
 #include "QuantNative.h"
 #include "QuantKernels.h"
+#include "QIntTypes.h"
 #include "QuantElementwise.h"
 #include "Convolution.h"
 #include "Exception.h"
