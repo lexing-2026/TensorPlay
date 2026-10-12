@@ -378,3 +378,18 @@ def test_channels_last_pool_output_layout(device, dtype, zp, rank, strided):
         expected = resolve(torch.ops.aten, name)(r, *args)
         equal(actual, expected, 1)
         assert actual.stride() == expected.stride()
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('shape', [(), (2, 4, 2, 2, 2, 2)])
+def test_prelu_scalar_and_high_rank_float_weights(device, shape):
+    x, r = pair(device, shape=shape)
+    for count in ([1] if not shape else [1, 4]):
+        values = np.linspace(.1, .4, count, dtype='float32')
+        w, rw = tp.tensor(values, device=device), torch.tensor(values)
+        equal(tp.ops.tp._prelu_kernel.default(x, w), torch.ops.aten._prelu_kernel.default(r, rw))
+    w, rw = pair(device, shape=(1,))
+    with pytest.raises((RuntimeError, TypeError)):
+        torch.ops.aten._prelu_kernel.default(r, rw)
+    with pytest.raises((RuntimeError, TypeError)):
+        tp.ops.tp._prelu_kernel.default(x, w)

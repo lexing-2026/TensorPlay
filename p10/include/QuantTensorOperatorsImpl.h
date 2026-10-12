@@ -194,9 +194,6 @@ Tensor& cat_out(const std::vector<Tensor>& tensors, int64_t dim, Tensor& out) {
 
 Tensor prelu(const Tensor& self, const Tensor& weight) {
     q_scale(self);
-    q_scale(weight);
-    TP_CHECK(weight.dtype() == self.dtype() && weight.device() == self.device(),
-             "Parametric rectification requires a slope with the input dtype and device");
     return Tensor::quantized_prelu(self, weight, q_scale(self), q_zero_point(self));
 }
 

@@ -499,7 +499,10 @@ struct PreluCodes {
 };
 
 Tensor prelu(const Tensor& input, const Tensor& weight, double scale, int64_t zp) {
-    Guard guard(input); validate(input); validate(weight);
+    Guard guard(input); validate(input);
+    if (input.dim() < 1 || input.dim() > 5)
+        return Tensor::quantize_per_tensor(input.dequantize().prelu(weight), scale, zp, DType::QUInt8);
+    validate(weight);
     TP_CHECK(input.dim() > 0, "Parametric rectification requires nonscalar input");
     TP_CHECK(input.dtype() == weight.dtype() && input.device() == weight.device(), "Input and slope must share dtype and device");
     Tensor slope = weight;
