@@ -11,6 +11,43 @@ namespace tensorplay::cpu {
 inline namespace CPU_CAPABILITY {
 namespace {
 template<class Q>
+void bilinear_codes(const void* aa, const void* bb, const void* cc, const void* dd,
+        void* yy, int64_t size, float h, float w, int64_t zp) {
+    using T = typename Q::underlying;
+    using QV = vec::Vectorized<Q>;
+    using FV = vec::Vectorized<float>;
+    const auto *a = static_cast<const T*>(aa), *b = static_cast<const T*>(bb),
+        *c = static_cast<const T*>(cc), *d = static_cast<const T*>(dd);
+    auto* y = static_cast<T*>(yy);
+    const FV one(1.f), zero(0.f), hv(h), h0(1.f-h), wv(w), w0(1.f-w), z(zp);
+    int64_t i = 0;
+    for (; i + QV::size() <= size; i += QV::size()) {
+        auto av = QV::loadu(a+i).dequantize(one, zero);
+        const auto bv = QV::loadu(b+i).dequantize(one, zero);
+        const auto cv = QV::loadu(c+i).dequantize(one, zero);
+        const auto dv = QV::loadu(d+i).dequantize(one, zero);
+        for (size_t j = 0; j < av.size(); ++j)
+            av[j] = h0 * (w0 * av[j] + wv * bv[j]) + hv * (w0 * cv[j] + wv * dv[j]) - z;
+        QV::quantize(av, 1.f, zp, 1.f).store(y+i);
+    }
+    for (; i < size; ++i) {
+        const float value = (1.f-h) * ((1.f-w) * a[i] + w * b[i])
+            + h * ((1.f-w) * c[i] + w * d[i]);
+        y[i] = quant::encode<T>(value-static_cast<float>(zp), 1.f, zp);
+    }
+}
+
+void bilinear_impl(const void* a, const void* b, const void* c, const void* d,
+        void* y, int64_t size, DType dtype, float h, float w, int64_t zp) {
+    switch (dtype) {
+        case DType::QInt8: bilinear_codes<qint8>(a,b,c,d,y,size,h,w,zp); break;
+        case DType::QUInt8: bilinear_codes<quint8>(a,b,c,d,y,size,h,w,zp); break;
+        case DType::QInt32: bilinear_codes<qint32>(a,b,c,d,y,size,h,w,zp); break;
+        default: break;
+    }
+}
+
+template<class Q>
 void clip(const void* input, void* output, int64_t size, int64_t lo, int64_t hi) {
     using V = vec::Vectorized<Q>;
     using T = typename Q::underlying;
@@ -139,12 +176,14 @@ void embedding_impl(const uint8_t* w, const int64_t* indices, const int64_t* off
 }
 
 #ifndef CPU_CAPABILITY_AVX512
+REGISTER_DISPATCH(quantized_bilinear_stub, &bilinear_impl);
 REGISTER_DISPATCH(quantized_clip_stub, &clip_impl);
 REGISTER_DISPATCH(quantized_lookup_stub, &lookup_impl);
 REGISTER_DISPATCH(quantized_binary_stub, &binary_impl);
 REGISTER_DISPATCH(quantized_embedding_stub, &embedding_impl);
 REGISTER_DISPATCH(quantized_fp16_linear_stub, &fp16_linear_impl);
 #else
+ALSO_REGISTER_AVX512_DISPATCH(quantized_bilinear_stub, &bilinear_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_clip_stub, &clip_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_lookup_stub, &lookup_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_binary_stub, &binary_impl);

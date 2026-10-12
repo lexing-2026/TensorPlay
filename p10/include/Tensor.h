@@ -256,6 +256,9 @@ public:
     }
     
     void* data_ptr() const;
+    const void* const_data_ptr() const { return data_ptr(); }
+    template<typename T>
+    const T* const_data_ptr() const { return data_ptr<T>(); }
     
     // Borrows the implementation handle; the Tensor keeps ownership.
     const intrusive_ptr<TensorImpl>& unsafeGetTensorImpl() const { return impl_; }

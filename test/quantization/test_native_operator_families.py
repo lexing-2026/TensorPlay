@@ -191,3 +191,94 @@ def test_transposed_convolution_geometry(device,rank,groups):
         torch.tensor(b),stride=2,padding=1,output_padding=1,groups=groups,dilation=2)
     expected=torch.quantize_per_tensor(real,.07,119,torch.quint8)
     same(y,expected,1)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('dtype,zp', TYPES)
+@pytest.mark.parametrize('operation', ['add_scalar', 'add_scalar_relu', 'mul_scalar', 'mul_scalar_relu'])
+def test_scalar_out_replaces_grid_preserves_storage(device, dtype, zp, operation):
+    x,r = pair(np.arange(74).reshape(2,37), dtype, device, zp=zp)
+    out,ref = pair(np.zeros((37,2)), dtype, device, scale=.3, zp=zp)
+    out,ref = out.T, ref.T
+    pointer = out.data_ptr()
+    value = -7.3
+    result = getattr(F,operation)(x,value,out=out)
+    expected = getattr(torch.ops.quantized,operation+'_out')(r,value,ref)
+    assert result.data_ptr() == pointer and out.data_ptr() == pointer
+    same(out,expected,1)
+    same(result,expected,1)
+
+
+@pytest.mark.parametrize('device',DEVICES)
+@pytest.mark.parametrize('dtype,zp',TYPES)
+@pytest.mark.parametrize('rank,mode',[(2,'nearest'),(2,'nearest-exact'),(2,'bilinear'),
+                                    (3,'nearest'),(3,'nearest-exact')])
+@pytest.mark.parametrize('layout',['contiguous','strided','channels_last'])
+@pytest.mark.parametrize('sizing',['size','scale','recomputed'])
+def test_resize_integer_storage_and_layout(device,dtype,zp,rank,mode,layout,sizing):
+    shape=(2,37)+(5,7) if rank==2 else (2,5,3,5,7)
+    x,r=pair(np.arange(np.prod(shape)).reshape(shape)%173,dtype,device,zp=zp)
+    if layout=='strided': x,r=x.transpose(-1,-2),r.transpose(-1,-2)
+    if layout=='channels_last':
+        x=x.contiguous(memory_format=tp.channels_last if rank==2 else tp.channels_last_3d)
+        r=r.contiguous(memory_format=torch.channels_last if rank==2 else torch.channels_last_3d)
+    args={'size':tuple(9-d for d in range(rank))} if sizing=='size' else {
+        'scale_factor':tuple(1.73+.1*d for d in range(rank)),
+        'recompute_scale_factor':sizing=='recomputed'}
+    if mode=='bilinear': args['align_corners']=False
+    y=tp.nn.functional.interpolate(x,mode=mode,**args)
+    expected=torch.nn.functional.interpolate(r,mode=mode,**args)
+    same(y,expected,1 if mode=='bilinear' else 0)
+    if layout=='channels_last':
+        assert y.is_contiguous(memory_format=tp.channels_last if rank==2 else tp.channels_last_3d)
+
+
+@pytest.mark.parametrize('device',DEVICES)
+@pytest.mark.parametrize('kind',['LSTM','GRU'])
+@pytest.mark.parametrize('dtype',['int8','half'])
+@pytest.mark.parametrize('packed',[False,True])
+@pytest.mark.parametrize('bidirectional',[False,True])
+def test_recurrent_multilayer_states_and_packed_order(device,kind,dtype,packed,bidirectional):
+    rng=np.random.default_rng(172)
+    options=dict(num_layers=2,batch_first=True,bidirectional=bidirectional)
+    native=getattr(tp.ao.nn.quantized.dynamic,kind)(7,11,**options,
+        dtype=tp.qint8 if dtype=='int8' else tp.float16).to(device).eval()
+    reference=getattr(torch.ao.nn.quantized.dynamic,kind)(7,11,**options,
+        dtype=torch.qint8 if dtype=='int8' else torch.float16).eval()
+    parameters={}
+    for name in native._weight_names:
+        values=rng.normal(0,.15,size=tuple(getattr(native,name).shape)).astype('float32')
+        if dtype=='int8':
+            codes=np.clip(np.rint(values/.005),-128,127).astype('int8')
+            weight,ref=pair(codes,'int8',device,scale=.005,zp=0)
+        else:
+            weight=tp._C._quantized_fp16_prepack(tp.tensor(values,device=device))
+            ref=torch.tensor(values.astype('float16').astype('float32'))
+        setattr(native,name,weight)
+        parameters[name]=ref
+    for name in native._bias_names:
+        values=rng.normal(0,.05,size=tuple(getattr(native,name).shape)).astype('float32')
+        setattr(native,name,tp.tensor(values,device=device));parameters[name]=torch.tensor(values)
+    reference.set_weight_bias(parameters)
+    values=rng.normal(size=(3,5,7)).astype('float32')
+    x,rx=tp.tensor(values,device=device),torch.tensor(values)
+    if packed:
+        lengths=[2,5,3]
+        x=tp.nn.utils.rnn.pack_padded_sequence(x,lengths,batch_first=True,enforce_sorted=False)
+        rx=torch.nn.utils.rnn.pack_padded_sequence(rx,lengths,batch_first=True,enforce_sorted=False)
+    shape=(2*(2 if bidirectional else 1),3,11)
+    values=rng.normal(size=shape).astype('float32')
+    h,rh=tp.tensor(values,device=device),torch.tensor(values)
+    if kind=='LSTM':
+        values=rng.normal(size=shape).astype('float32')
+        h,rh=(h,tp.tensor(values,device=device)),(rh,torch.tensor(values))
+    y,state=native(x,h);expected,refstate=reference(rx,rh)
+    actual=y.data if packed else y;expected=expected.data if packed else expected
+    np.testing.assert_allclose(actual.cpu().numpy(),expected.detach().numpy(),atol=3e-5,rtol=3e-5)
+    for actual,expected in zip(state if kind=='LSTM' else (state,),refstate if kind=='LSTM' else (refstate,)):
+        np.testing.assert_allclose(actual.cpu().numpy(),expected.detach().numpy(),atol=3e-5,rtol=3e-5)
+    other=getattr(tp.ao.nn.quantized.dynamic,kind)(7,11,**options,
+        dtype=tp.qint8 if dtype=='int8' else tp.float16).to(device).eval()
+    other.load_state_dict(native.state_dict())
+    result,_=other(x,h)
+    np.testing.assert_array_equal((result.data if packed else result).cpu().numpy(),(y.data if packed else y).cpu().numpy())

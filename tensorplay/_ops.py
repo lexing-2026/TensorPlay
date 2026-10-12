@@ -334,6 +334,12 @@ class _OpNamespace(types.ModuleType):
             native = getattr(_C, opname, None)
             if native is not None:
                 return native
+        if self.ns in ('quantized', '_quantized'):
+            from tensorplay.ao.nn.quantized._ops import get_packet
+            packet = get_packet(opname)
+            if packet is not None:
+                setattr(self, opname, packet)
+                return packet
         full_name = f"{self.ns}::{opname}"
         if tensorplay.library.has_op(full_name):
             return tensorplay.library.get_op(full_name)
@@ -350,7 +356,7 @@ class _Ops(types.ModuleType):
     __file__ = "_ops.py"
 
     def __getattr__(self, name: str) -> _OpNamespace:
-        if name.startswith("_"):
+        if name.startswith("_") and name != '_quantized':
             raise AttributeError(name)
         namespace = _OpNamespace(name)
         setattr(self, name, namespace)

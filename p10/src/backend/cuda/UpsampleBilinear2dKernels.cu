@@ -1,3 +1,4 @@
+#include "QuantNative.h"
 // Upsampling CUDA kernels: bilinear interpolation of 2-D planes together with the
 // antialiased 2-D path, whose separable filter tables serve both the
 // bilinear and the bicubic entry points.
@@ -101,6 +102,7 @@ __global__ void upsample_bilinear2d_backward_out_frame(
 }
 
 Tensor upsample_bilinear2d_cuda(const Tensor& self, const std::vector<int64_t>& output_size, bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w) {
+    if (self.impl()->quantizer()) return quant::resize_cuda(self, output_size, {scales_h, scales_w}, false, true, align_corners);
     Tensor in = self.is_contiguous() ? self : self.contiguous();
     Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
     const int64_t batchsize = in.size(0), channels = in.size(1);

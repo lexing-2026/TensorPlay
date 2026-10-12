@@ -1,3 +1,4 @@
+#include "QuantNative.h"
 // Upsampling kernels.
 //
 // Tensors must be contiguous NCW / NCHW / NCDHW.  The linear/bicubic backwards
@@ -167,6 +168,7 @@ Tensor upsample_nearest1d_cpu(const Tensor& self, const std::vector<int64_t>& ou
 
 Tensor upsample_nearest2d_cpu(const Tensor& self, const std::vector<int64_t>& output_size,
                               std::optional<double> scales_h, std::optional<double> scales_w) {
+    if (self.impl()->quantizer()) return quant::resize_cpu(self, output_size, {scales_h, scales_w}, false, false, false);
     // Channels-last frames copy whole channel spans per output pixel; the
     // span is the tier-compiled vectorized dimension (cpu/UpsampleKernels.h).
     // Non-vectorized dtypes keep the NCHW path below.
@@ -224,6 +226,7 @@ Tensor upsample_nearest2d_cpu(const Tensor& self, const std::vector<int64_t>& ou
 
 Tensor upsample_nearest3d_cpu(const Tensor& self, const std::vector<int64_t>& output_size,
                               std::optional<double> scales_d, std::optional<double> scales_h, std::optional<double> scales_w) {
+    if (self.impl()->quantizer()) return quant::resize_cpu(self, output_size, {scales_d, scales_h, scales_w}, false, false, false);
     Tensor in = self.is_contiguous() ? self : self.contiguous();
     Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
     const int64_t N = in.size(0), C = in.size(1);
@@ -298,6 +301,7 @@ Tensor upsample_linear1d_cpu(const Tensor& self, const std::vector<int64_t>& out
 
 Tensor upsample_bilinear2d_cpu(const Tensor& self, const std::vector<int64_t>& output_size,
                                bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w) {
+    if (self.impl()->quantizer()) return quant::resize_cpu(self, output_size, {scales_h, scales_w}, false, true, align_corners);
     // Channels-last frames blend four channel spans per output pixel with
     // the tier-compiled vectorized dimension (cpu/UpsampleKernels.h); the
     // area-pixel scales come from the same helpers as the NCHW frame, so the
@@ -981,6 +985,7 @@ Tensor _upsample_nearest_exact1d_cpu(const Tensor& self, const std::vector<int64
 
 Tensor _upsample_nearest_exact2d_cpu(const Tensor& self, const std::vector<int64_t>& output_size,
                                      std::optional<double> scales_h, std::optional<double> scales_w) {
+    if (self.impl()->quantizer()) return quant::resize_cpu(self, output_size, {scales_h, scales_w}, true, false, false);
     Tensor in = self.is_contiguous() ? self : self.contiguous();
     Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
     const int64_t N = in.size(0), C = in.size(1);
@@ -1013,6 +1018,7 @@ Tensor _upsample_nearest_exact2d_cpu(const Tensor& self, const std::vector<int64
 Tensor _upsample_nearest_exact3d_cpu(const Tensor& self, const std::vector<int64_t>& output_size,
                                      std::optional<double> scales_d, std::optional<double> scales_h,
                                      std::optional<double> scales_w) {
+    if (self.impl()->quantizer()) return quant::resize_cpu(self, output_size, {scales_d, scales_h, scales_w}, true, false, false);
     Tensor in = self.is_contiguous() ? self : self.contiguous();
     Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
     const int64_t N = in.size(0), C = in.size(1);

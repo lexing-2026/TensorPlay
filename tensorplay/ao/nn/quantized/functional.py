@@ -160,22 +160,22 @@ def mul_relu(a, b, scale=None, zero_point=None, out=None):
 
 def add_scalar(x, value, out=None):
     from tensorplay import _C
-    return _result(_C.quantized_scalar(x, float(value), 0), out)
+    return _C.quantized_scalar_out(x, float(value), 0, out, False) if out is not None else _C.quantized_scalar(x, float(value), 0)
 
 
 def add_scalar_relu(x, value, out=None):
     from tensorplay import _C
-    return _result(_C.quantized_scalar(x, float(value), 0, True), out)
+    return _C.quantized_scalar_out(x, float(value), 0, out, True) if out is not None else _C.quantized_scalar(x, float(value), 0, True)
 
 
 def mul_scalar(x, value, out=None):
     from tensorplay import _C
-    return _result(_C.quantized_scalar(x, float(value), 2), out)
+    return _C.quantized_scalar_out(x, float(value), 2, out, False) if out is not None else _C.quantized_scalar(x, float(value), 2)
 
 
 def mul_scalar_relu(x, value, out=None):
     from tensorplay import _C
-    return _result(_C.quantized_scalar(x, float(value), 2, True), out)
+    return _C.quantized_scalar_out(x, float(value), 2, out, True) if out is not None else _C.quantized_scalar(x, float(value), 2, True)
 
 
 def matmul(a, b, scale, zero_point):
@@ -214,6 +214,56 @@ def celu(x, scale, zero_point, alpha=1.0):
 def dropout(x, scale, zero_point, p=0.5, training=False):
     from tensorplay import _C
     return _C.quantized_dropout(x, float(scale), int(zero_point), float(p), bool(training))
+
+
+def interpolate(input, size=None, scale_factor=None, mode='nearest', align_corners=None,
+                recompute_scale_factor=None, antialias=False):
+    """Resize integer storage while preserving the input affine grid."""
+    from tensorplay import _C
+    import math
+    _qparams(input)
+    rank = input.dim() - 2
+    if rank not in (2, 3) or (size is None) == (scale_factor is None):
+        raise ValueError('Quantized resize requires four or five dimensions and exactly one size or scale factor')
+    if antialias:
+        raise ValueError('Antialiased resize does not accept quantized input')
+    if size is not None:
+        if recompute_scale_factor:
+            raise ValueError('Recomputing scale requires a scale factor')
+        sizes = _spatial(size, rank)
+        scales = [None] * rank
+    else:
+        scales = list(scale_factor) if isinstance(scale_factor, (tuple, list)) else [float(scale_factor)] * rank
+        if len(scales) != rank or any(not math.isfinite(float(s)) or float(s) <= 0 for s in scales):
+            raise ValueError('Scale factors must be finite positive values for every spatial dimension')
+        sizes = [math.floor(input.size(d+2) * float(scales[d])) for d in range(rank)]
+        if recompute_scale_factor or mode == 'area':
+            scales = [None] * rank
+    if len(sizes) != rank or any(int(s) <= 0 for s in sizes):
+        raise ValueError('Resize output dimensions must be positive')
+    if mode in ('nearest', 'nearest-exact'):
+        if align_corners is not None:
+            raise ValueError('Nearest resize does not accept corner alignment')
+        name = ('_upsample_nearest_exact' if mode == 'nearest-exact' else 'upsample_nearest') + f'{rank}d'
+        return getattr(_C, name)(input, sizes, *scales)
+    if mode == 'bilinear' and rank == 2:
+        return _C.upsample_bilinear2d(input, sizes, bool(align_corners), *scales)
+    if mode == 'area':
+        if align_corners is not None:
+            raise ValueError('Area resize does not accept corner alignment')
+        return _C.quantized_adaptive_avg_pool(input, sizes)
+    raise ValueError('Quantized resize supports nearest, nearest-exact, area, and two dimensional bilinear modes')
+
+
+upsample = interpolate
+
+
+def upsample_nearest(input, size=None, scale_factor=None):
+    return interpolate(input, size, scale_factor)
+
+
+def upsample_bilinear(input, size=None, scale_factor=None):
+    return interpolate(input, size, scale_factor, 'bilinear', True)
 
 
 def _spatial(value, rank):

@@ -11686,6 +11686,8 @@
   variants: function
 - func: quantized_scalar(Tensor input, float value, int operation, bool relu=False) -> Tensor
   variants: function
+- func: quantized_scalar_out(Tensor input, float value, int operation, Tensor(a!) out, bool relu=False) -> Tensor(a!)
+  variants: function
 - func: quantized_softmax(Tensor input, int dim, float scale, int zero_point) -> Tensor
   variants: function
 - func: quantized_matmul(Tensor a, Tensor b, float scale, int zero_point) -> Tensor

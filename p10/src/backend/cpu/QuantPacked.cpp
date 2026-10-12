@@ -110,6 +110,7 @@ Tensor relu6_cpu(const Tensor& input) { return rectify_cpu(input, true); }
 } // namespace tensorplay::quant
 
 namespace tensorplay::cpu {
+DEFINE_DISPATCH(quantized_bilinear_stub);
 DEFINE_DISPATCH(quantized_clip_stub);
 DEFINE_DISPATCH(quantized_lookup_stub);
 DEFINE_DISPATCH(quantized_binary_stub);

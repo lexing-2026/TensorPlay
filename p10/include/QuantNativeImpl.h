@@ -223,6 +223,16 @@ Tensor scalar(const Tensor& input, double value, int64_t op, bool relu) {
     return y;
 }
 
+Tensor& scalar_out(const Tensor& input, double value, int64_t op, Tensor& out, bool relu) {
+    validate(out);
+    TP_CHECK(out.dtype() == input.dtype() && out.device() == input.device()
+        && out.shape() == input.shape(), "Scalar output shape, dtype and device must match the input");
+    Tensor result = scalar(input, value, op, relu);
+    out.impl()->set_quantizer(result.impl()->quantizer());
+    out.copy_(result);
+    return out;
+}
+
 template<class T>
 struct CatCodes {
     const T* x; T* y; int64_t chunk, inner, width, offset, xz, yz; float scale, inverse; bool relu;
@@ -535,7 +545,13 @@ Tensor max_pool(const Tensor& input,const std::vector<int64_t>& kernel,const std
 #include "QuantEmbeddingImpl.h"
 #include "QuantConvolutionImpl.h"
 #include "QuantRecurrentImpl.h"
+#include "QuantResizeImpl.h"
 namespace tensorplay::quant {
+
+Tensor TP_QN_NAME(resize)(const Tensor& input, const std::vector<int64_t>& sizes,
+        const std::vector<std::optional<double>>& scales, bool exact, bool bilinear, bool align) {
+    return TP_QN_DETAIL::resize(input, sizes, scales, exact, bilinear, align);
+}
 
 Tensor TP_QN_NAME(binary)(const Tensor& a, const Tensor& b, double as, int64_t az, double bs, int64_t bz,
                          double ys, int64_t yz, int op, bool relu) {
@@ -571,6 +587,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, QuantNative) {
     m.impl("quantized_unary", TP_QN_DETAIL::unary);
     m.impl("quantized_binary", TP_QN_DETAIL::binary_op);
     m.impl("quantized_scalar", TP_QN_DETAIL::scalar);
+    m.impl("quantized_scalar_out", TP_QN_DETAIL::scalar_out);
     m.impl("quantized_softmax", TP_QN_DETAIL::softmax);
     m.impl("quantized_matmul", TP_QN_DETAIL::matmul);
     m.impl("quantized_prelu", TP_QN_DETAIL::prelu);

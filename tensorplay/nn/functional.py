@@ -1137,6 +1137,10 @@ def interpolate(
     captured = _capture_call(interpolate, (input, size, scale_factor, mode, align_corners, recompute_scale_factor, antialias), {})
     if captured is not None:
         return captured
+    if input.is_quantized():
+        from tensorplay.ao.nn.quantized.functional import interpolate as quantized_interpolate
+        return quantized_interpolate(input, size, scale_factor, mode, align_corners,
+                                    recompute_scale_factor, antialias)
     if size is None and scale_factor is None:
         raise ValueError("need to define size or scale_factor")
     if size is not None and scale_factor is not None:

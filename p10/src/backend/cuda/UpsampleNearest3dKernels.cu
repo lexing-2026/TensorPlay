@@ -1,3 +1,4 @@
+#include "QuantNative.h"
 // Upsampling CUDA kernels: nearest-neighbour sampling of 3-D volumes, together with the
 // exact (half-pixel) variant of the same family.
 //
@@ -88,6 +89,7 @@ __global__ void upsample_nearest3d_backward_out_frame(
 // ===========================================================================
 
 Tensor upsample_nearest3d_cuda(const Tensor& self, const std::vector<int64_t>& output_size, std::optional<double> scales_d, std::optional<double> scales_h, std::optional<double> scales_w) {
+    if (self.impl()->quantizer()) return quant::resize_cuda(self, output_size, {scales_d, scales_h, scales_w}, false, false, false);
     Tensor in = self.is_contiguous() ? self : self.contiguous();
     Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
     const int64_t N = in.size(0), C = in.size(1);
@@ -177,6 +179,7 @@ __global__ void upsample_nearest_exact3d_backward_out_frame(
 Tensor _upsample_nearest_exact3d_cuda(const Tensor& self, const std::vector<int64_t>& output_size,
                                       std::optional<double> scales_d, std::optional<double> scales_h,
                                       std::optional<double> scales_w) {
+    if (self.impl()->quantizer()) return quant::resize_cuda(self, output_size, {scales_d, scales_h, scales_w}, true, false, false);
     Tensor in = self.is_contiguous() ? self : self.contiguous();
     Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
     const int64_t N = in.size(0), C = in.size(1);

@@ -1,3 +1,4 @@
+#include "QuantNative.h"
 // Upsampling CUDA kernels: nearest-neighbour sampling of 2-D planes, including the
 // integer-scale, rational-scale and exact (half-pixel) variants.
 //
@@ -153,6 +154,7 @@ __global__ void upsample_nearest2d_backward_out_frame(
 }
 
 Tensor upsample_nearest2d_cuda(const Tensor& self, const std::vector<int64_t>& output_size, std::optional<double> scales_h, std::optional<double> scales_w) {
+    if (self.impl()->quantizer()) return quant::resize_cuda(self, output_size, {scales_h, scales_w}, false, false, false);
     Tensor in = self.is_contiguous() ? self : self.contiguous();
     Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
     const int64_t N = in.size(0), C = in.size(1);
@@ -322,6 +324,7 @@ __global__ void upsample_nearest_exact2d_backward_out_frame(
 
 Tensor _upsample_nearest_exact2d_cuda(const Tensor& self, const std::vector<int64_t>& output_size,
                                       std::optional<double> scales_h, std::optional<double> scales_w) {
+    if (self.impl()->quantizer()) return quant::resize_cuda(self, output_size, {scales_h, scales_w}, true, false, false);
     Tensor in = self.is_contiguous() ? self : self.contiguous();
     Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
     const int64_t N = in.size(0), C = in.size(1);
