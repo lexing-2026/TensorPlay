@@ -442,7 +442,7 @@ Tensor _quantized_packed_run_cpu(
     if (output_float) return out;
     Tensor result = quantized::make_qtensor(out, make_per_tensor_affine_quantizer(output_scale, output_zero_point, input.dtype()), input.dtype());
     if (residual && result.numel()) {
-        Tensor destination = residual->contiguous(MemoryFormat::ChannelsLast);
+        Tensor destination = residual->contiguous(static_cast<int64_t>(MemoryFormat::ChannelsLast));
         destination.impl()->set_quantizer(result.impl()->quantizer());
         destination.copy_(result);
         return destination;

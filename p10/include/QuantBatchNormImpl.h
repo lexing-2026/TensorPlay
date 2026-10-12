@@ -16,7 +16,7 @@ Tensor batch_norm(const Tensor& input, const std::optional<Tensor>& weight,
     Tensor logical = input;
     while (logical.dim() < 4) logical = logical.unsqueeze(-1);
     const auto format = logical.dim() == 4 ? MemoryFormat::ChannelsLast : MemoryFormat::ChannelsLast3d;
-    const Tensor x = logical.contiguous(format), w = weight->contiguous(), b = bias->contiguous(),
+    const Tensor x = logical.contiguous(static_cast<int64_t>(format)), w = weight->contiguous(), b = bias->contiguous(),
         m = mean.contiguous(), v = var.contiguous();
     Tensor y = output(input, logical.shape(), scale, zp);
     y = y.as_strided(logical.shape(), get_channels_last_strides(logical.shape()), 0);
