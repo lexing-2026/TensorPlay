@@ -34,6 +34,7 @@ def test_execution_audit_tracks_native_aliases_and_restores_packets():
     assert tp.ops.quantized.cat is original and F._quantized_elu is alias
     assert 'quantized_cat' in by_name['quantized::cat']['test_evidence']['cpu']['native_entries']
     assert 'quantized_elu' in by_name['quantized::celu']['test_evidence']['cpu']['native_entries']
+    assert by_name['quantized::celu']['test_evidence']['cpu']['native_returned'] == 1
     assert by_name['_quantized::add']['validation'] == 'exercised_in_passed_tests'
     assert by_name['quantized::add']['validation'] == 'pending'
 
@@ -70,3 +71,4 @@ def test_execution_audit_distinguishes_rejection_from_return():
     assert entries[0]['validation'] == 'rejection_tested'
     evidence = entries[0]['test_evidence']['cpu']
     assert evidence['returned'] == 0 and evidence['raised'] == 1
+    assert evidence['native_returned'] == 0

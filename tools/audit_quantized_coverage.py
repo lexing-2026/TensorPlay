@@ -53,7 +53,8 @@ class ExecutionAudit:
     def __init__(self, entries):
         self.entries = {entry['operator']: entry for entry in entries}
         self.observed = defaultdict(lambda: defaultdict(lambda: {
-            'tests': set(), 'native_entries': set(), 'returned': 0, 'raised': 0}))
+            'tests': set(), 'native_entries': set(), 'returned': 0, 'raised': 0,
+            'native_returned': 0}))
         self.current = None
         self.events = []
         self.native_stack = []
@@ -176,6 +177,7 @@ class ExecutionAudit:
                     evidence['tests'].add(report.nodeid)
                     evidence['native_entries'].update(calls)
                     evidence['raised' if raised else 'returned'] += 1
+                    evidence['native_returned'] += int(not raised and bool(calls))
         self.current, self.events = None, []
 
     def attach(self):
@@ -215,8 +217,7 @@ def main():
     result['device_evidence'] = {
         device: dict(
             returned=sum(bool(entry.get('test_evidence', {}).get(device, {}).get('returned')) for entry in entries),
-            native_returned=sum(bool(entry.get('test_evidence', {}).get(device, {}).get('returned'))
-                and bool(entry.get('test_evidence', {}).get(device, {}).get('native_entries')) for entry in entries),
+            native_returned=sum(bool(entry.get('test_evidence', {}).get(device, {}).get('native_returned')) for entry in entries),
             rejection_tested=sum(bool(entry.get('test_evidence', {}).get(device, {}).get('raised')) for entry in entries))
         for device in ('cpu', 'cuda', 'metadata')}
     args.output.write_text(json.dumps(result, indent=2) + '\n')
