@@ -15,6 +15,10 @@ DECLARE_DISPATCH(quantized_dynamic_dot_fn, quantized_dynamic_dot_stub)
 using quantized_dynamic_block_fn = void (*)(const uint8_t*,const int8_t*,int64_t*,
     int64_t,int64_t,int64_t,int64_t);
 DECLARE_DISPATCH(quantized_dynamic_block_fn, quantized_dynamic_block_stub)
+using quantized_linear_epilogue_fn = void (*)(const int32_t*, const int64_t*,
+    const float*, const int64_t*, const float*, void*, DType, int64_t, int64_t,
+    int64_t, int64_t, double, double, int64_t, bool, bool, int64_t, double);
+DECLARE_DISPATCH(quantized_linear_epilogue_fn, quantized_linear_epilogue_stub)
 using quantized_recurrent_step_fn = void (*)(const float*,const float*,const float*,
     const float*,float*,float*,int64_t,int64_t,int);
 DECLARE_DISPATCH(quantized_recurrent_step_fn, quantized_recurrent_step_stub)

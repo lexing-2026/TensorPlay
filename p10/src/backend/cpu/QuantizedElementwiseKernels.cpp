@@ -3,6 +3,7 @@
 #include "cpu/vec/vec_convert.h"
 #include "QuantElementwise.h"
 #include "QuantRowwise.h"
+#include "QuantPacked.h"
 #include "Parallel.h"
 #include <cfenv>
 #ifndef CPU_CAPABILITY_AVX512
@@ -161,6 +162,59 @@ void dynamic_block_impl(const uint8_t* x,const int8_t* w,int64_t* totals,
     };
     if (rows==1) run.template operator()<1>();
     else run.template operator()<2>();
+}
+
+template<class X>
+void linear_epilogue_codes(const int32_t* raw, const int64_t* offsets,
+        const float* scales, const int64_t* zps, const float* bias, void* output,
+        int64_t count, int64_t sum, int64_t k, int64_t xz, double xs, double ys,
+        int64_t yz, bool relu, bool output_float, int64_t activation, double slope) {
+    using IV = vec::Vectorized<int64_t>;
+    using DV = vec::Vectorized<double>;
+    using FV = vec::Vectorized<float>;
+    constexpr int lanes = DV::size();
+    constexpr double lo = std::is_same_v<X, uint8_t> ? 0. : -128.;
+    auto* real_output = output_float ? static_cast<float*>(output) : nullptr;
+    auto* code_output = output_float ? nullptr : static_cast<X*>(output);
+    int64_t n = 0;
+    if (!output_float && activation != 2 && std::fegetround() == FE_TONEAREST) {
+        const IV zero_point(xz), channel_sum(k * xz - sum);
+        const DV input_scale(xs), output_scale(ys), output_zero(yz), zero(0.);
+        const DV minimum(lo), maximum(lo + 255.), negative_slope(slope);
+        for (; n + lanes <= count; n += lanes) {
+            const IV accumulator = vec::convert<int64_t>(vec::Vectorized<int32_t>::loadu(raw + n, lanes))
+                - zero_point * IV::loadu(offsets + n) + channel_sum * IV::loadu(zps + n);
+            DV value = vec::convert<double>(accumulator) * input_scale
+                * vec::convert<double>(FV::loadu(scales + n, lanes));
+            if (bias) value = value + vec::convert<double>(FV::loadu(bias + n, lanes));
+            if (activation == 1) value = DV::blendv(value * negative_slope, value, value >= zero);
+            if (relu) value = vec::maximum(value, zero);
+            const DV codes = vec::minimum(maximum, vec::maximum(minimum, (value / output_scale).round() + output_zero));
+            alignas(64) double values[lanes];
+            codes.store(values);
+            for (int lane = 0; lane < lanes; ++lane) code_output[n + lane] = static_cast<X>(values[lane]);
+        }
+    }
+    for (; n < count; ++n) {
+        const int64_t accumulator = static_cast<int64_t>(raw[n]) - xz * offsets[n]
+            - zps[n] * sum + k * xz * zps[n];
+        double value = quant::packed_real_value(accumulator, xs, scales[n], bias ? bias[n] : 0.f, output_float);
+        if (activation == 1) value = value >= 0. ? value : value * slope;
+        else if (activation == 2) value = ::tanh(value);
+        if (relu) value = std::max(value, 0.);
+        if (output_float) real_output[n] = static_cast<float>(value);
+        else code_output[n] = static_cast<X>(std::clamp(std::nearbyint(value / ys) + yz, lo, lo + 255.));
+    }
+}
+
+void linear_epilogue_impl(const int32_t* raw, const int64_t* offsets,
+        const float* scales, const int64_t* zps, const float* bias, void* output,
+        DType dtype, int64_t count, int64_t sum, int64_t k, int64_t xz, double xs,
+        double ys, int64_t yz, bool relu, bool output_float, int64_t activation, double slope) {
+    if (dtype == DType::QUInt8) linear_epilogue_codes<uint8_t>(raw, offsets, scales, zps, bias,
+        output, count, sum, k, xz, xs, ys, yz, relu, output_float, activation, slope);
+    else linear_epilogue_codes<int8_t>(raw, offsets, scales, zps, bias,
+        output, count, sum, k, xz, xs, ys, yz, relu, output_float, activation, slope);
 }
 
 #if defined(__GNUC__) && !defined(__clang__)
@@ -568,6 +622,7 @@ REGISTER_DISPATCH(quantized_subbyte_unpack_stub, &subbyte_unpack_impl);
 REGISTER_DISPATCH(quantized_recurrent_step_stub, &recurrent_step_impl);
 REGISTER_DISPATCH(quantized_dynamic_dot_stub, &dynamic_dot_impl);
 REGISTER_DISPATCH(quantized_dynamic_block_stub, &dynamic_block_impl);
+REGISTER_DISPATCH(quantized_linear_epilogue_stub, &linear_epilogue_impl);
 REGISTER_DISPATCH(quantized_int4_pack_stub, &int4_pack_impl);
 REGISTER_DISPATCH(quantized_int4_mm_stub, &int4_mm_impl);
 REGISTER_DISPATCH(quantized_batch_norm_stub, &batch_norm_impl);
@@ -583,6 +638,7 @@ ALSO_REGISTER_AVX512_DISPATCH(quantized_subbyte_unpack_stub, &subbyte_unpack_imp
 ALSO_REGISTER_AVX512_DISPATCH(quantized_recurrent_step_stub, &recurrent_step_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_dynamic_dot_stub, &dynamic_dot_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_dynamic_block_stub, &dynamic_block_impl);
+ALSO_REGISTER_AVX512_DISPATCH(quantized_linear_epilogue_stub, &linear_epilogue_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_int4_pack_stub, &int4_pack_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_int4_mm_stub, &int4_mm_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_batch_norm_stub, &batch_norm_impl);

@@ -81,7 +81,7 @@ def test_dynamic_linear_pair_saturation_and_chunk_tails(device,features,reduce_r
 @pytest.mark.parametrize('relu',[False,True])
 @pytest.mark.parametrize('weight_zp',[0,-3])
 @pytest.mark.parametrize('rows',[1,2,4,32])
-@pytest.mark.parametrize('outputs,features',[(9,33),(128,512)])
+@pytest.mark.parametrize('outputs,features',[(9,33),(128,512),(129,1025)])
 def test_large_integer_linear_affine_correction_and_weight_mutation(device,dtype,zp,relu,weight_zp,rows,outputs,features):
     from tensorplay.ao.nn.quantized.packed import PackedWeight
     rng=np.random.default_rng(981)
@@ -107,6 +107,24 @@ def test_large_integer_linear_affine_correction_and_weight_mutation(device,dtype
         lo=np.iinfo(dtype).min;hi=np.iinfo(dtype).max
         expected=np.clip(np.rint(real/.2)+zp,lo,hi).astype(dtype)
         np.testing.assert_array_equal(actual.int_repr().cpu().numpy(),expected)
+
+
+@pytest.mark.parametrize('device',DEVICES)
+@pytest.mark.parametrize('dtype,zp',[('int8',127),('uint8',255)])
+@pytest.mark.parametrize('features',[65535,65536,65537])
+def test_integer_linear_affine_accumulator_exceeds_signed_word(device,dtype,zp,features):
+    from tensorplay.ao.nn.quantized.packed import PackedWeight
+    codes=np.full((8,features),np.iinfo(dtype).min,dtype=dtype)
+    weight_codes=np.full((5,features),-128,dtype='int8')
+    x,_=pair(codes,dtype,device,scale=.01,zp=zp)
+    weight,_=pair(weight_codes,'int8',device,scale=.01,zp=127)
+    packed=PackedWeight(weight)
+    actual=packed.run(x,1e4,0)
+    acc=(codes.astype('int64')-zp)@(weight_codes.astype('int64')-127).T
+    assert np.all(acc>np.iinfo('int32').max)
+    expected=np.clip(np.rint(acc*.01*np.float64(np.float32(.01))/1e4),
+                     np.iinfo(dtype).min,np.iinfo(dtype).max).astype(dtype)
+    np.testing.assert_array_equal(actual.int_repr().cpu().numpy(),expected)
 
 
 @pytest.mark.parametrize('device', DEVICES)
@@ -450,11 +468,12 @@ def test_public_operator_packets_and_packed_queries(device):
 @pytest.mark.parametrize('operation', ['linear_leaky_relu', 'linear_tanh'])
 @pytest.mark.parametrize('dtype,zp', TYPES[:2])
 @pytest.mark.parametrize('weight_zp', [-3,0])
-def test_packed_linear_fused_activation(device, operation, dtype, zp,weight_zp):
+@pytest.mark.parametrize('rows,outputs,features',[(3,11,37),(32,127,513)])
+def test_packed_linear_fused_activation(device, operation, dtype, zp,weight_zp,rows,outputs,features):
     rng = np.random.default_rng(110)
-    x, r = pair(rng.integers(0, 70, size=(3, 37)), dtype, device, scale=.05, zp=zp)
-    w, rw = pair(rng.integers(-60, 60, size=(11, 37)), 'int8', device, scale=.03, zp=weight_zp)
-    bias = rng.normal(0, .1, size=11).astype('float32')
+    x, r = pair(rng.integers(0, 70, size=(rows, features)), dtype, device, scale=.05, zp=zp)
+    w, rw = pair(rng.integers(-60, 60, size=(outputs, features)), 'int8', device, scale=.03, zp=weight_zp)
+    bias = rng.normal(0, .1, size=outputs).astype('float32')
     packed = tp.ops.quantized.linear_prepack(w, tp.tensor(bias, device=device))
     args = (.07, zp, .17) if operation.endswith('leaky_relu') else (.07, zp)
     actual = getattr(tp.ops.quantized, operation)(x, packed, *args)

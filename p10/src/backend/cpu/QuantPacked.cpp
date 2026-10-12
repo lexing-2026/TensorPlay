@@ -117,6 +117,7 @@ DEFINE_DISPATCH(quantized_subbyte_pack_stub);
 DEFINE_DISPATCH(quantized_subbyte_unpack_stub);
 DEFINE_DISPATCH(quantized_dynamic_dot_stub);
 DEFINE_DISPATCH(quantized_dynamic_block_stub);
+DEFINE_DISPATCH(quantized_linear_epilogue_stub);
 DEFINE_DISPATCH(quantized_recurrent_step_stub);
 DEFINE_DISPATCH(quantized_int4_pack_stub);
 DEFINE_DISPATCH(quantized_int4_mm_stub);
@@ -203,24 +204,18 @@ bool linear_integer_product(const X* x, const Tensor& packed, const int64_t* off
         {DNNL_ARG_SCRATCHPAD, dnnl::memory(kernel.scratch_desc, engine, kernel.scratch.data())}});
     stream.wait();
     const auto* raw = acc.data_ptr<int32_t>();
-    auto* dst_float=output_float ? out.data_ptr<float>() : nullptr;
-    auto* dst_codes=output_float ? nullptr : out.data_ptr<X>();
     parallel::parallel_for(0, g.rows, 8, [&](int64_t begin, int64_t end) {
         for (int64_t row = begin; row < end; ++row) {
             int64_t sum = 0;
             for (int64_t k = 0; k < g.K; ++k) sum += x[row * g.K + k];
-            for (int64_t n = 0; n < g.outputs; ++n) {
-                const int64_t index = row * g.outputs + n;
-                const int64_t value_i = static_cast<int64_t>(raw[index]) - xz * offsets[n] - zps[n] * sum + g.K * xz * zps[n];
-                double value = quant::packed_real_value(value_i,xs,scales[n],bias ? bias[n] : 0.f,output_float);
-                value = quant::packed_activation(value, index, g);
-                if (relu) value = std::max(value, 0.);
-                if (output_float) dst_float[index] = static_cast<float>(value);
-                else {
-                    constexpr int64_t lo = std::is_same_v<X, uint8_t> ? 0 : -128;
-                    dst_codes[index] = static_cast<X>(std::clamp(std::nearbyint(value / ys) + yz, static_cast<double>(lo), static_cast<double>(lo + 255)));
-                }
-            }
+            const int64_t index = row * g.outputs;
+            void* destination = output_float
+                ? static_cast<void*>(out.data_ptr<float>() + index)
+                : static_cast<void*>(out.data_ptr<X>() + index);
+            quantized_linear_epilogue_stub(DeviceType::CPU, raw + index, offsets, scales, zps,
+                bias, destination, std::is_same_v<X, uint8_t> ? DType::QUInt8 : DType::QInt8,
+                g.outputs, sum, g.K, xz, xs, ys, yz, relu, output_float,
+                g.activation, g.negative_slope);
         }
     });
     return true;
