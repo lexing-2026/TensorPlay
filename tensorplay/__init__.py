@@ -464,6 +464,7 @@ __all__ = [
     "per_tensor_symmetric", "per_channel_symmetric", "per_channel_affine_float_qparams",
     "half", "float", "double", "short", "int", "long", "cfloat", "cdouble", "chalf",
     "save", "load", "inspect_checkpoint", "as_tensor",
+    "quantized_lstm", "quantized_gru",
     "no_grad", "enable_grad", "set_grad_enabled", "is_grad_enabled",
     "is_inference_mode_enabled",
     "allclose", "index",
@@ -1564,6 +1565,8 @@ else:
     # touches the operators during initialization, so first use pays for
     # them.
     _lazy_attrs = {
+        "quantized_lstm": ("ao.nn.quantized._ops", "quantized_lstm"),
+        "quantized_gru": ("ao.nn.quantized._ops", "quantized_gru"),
         "vmap": ("func", "vmap"),
         "cond": ("_higher_order_ops", "cond"),
         "while_loop": ("_higher_order_ops", "while_loop"),
