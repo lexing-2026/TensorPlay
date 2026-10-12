@@ -1,3 +1,4 @@
+#include "QuantTensorOperators.h"
 // Hand-written overload wiring: entries whose argument shapes differ from
 // any registered sibling in ways the mechanical matcher rejects, but whose
 // semantics are a plain forward to an already-registered kernel.
@@ -178,6 +179,8 @@ std::optional<std::vector<int64_t>> correction_reduce_dims(
 
 Tensor std_correction_native(const Tensor& self, const std::optional<std::vector<int64_t>>& dim,
                              const std::optional<Scalar>& correction, bool keepdim) {
+    if (isQuantizedType(self.dtype())) return quantized::moment(self, dim.value_or(std::vector<int64_t>{}), keepdim, true, correction.has_value() ? correction->toDouble() : 1.);
+
     const int64_t c = correction.has_value() ? correction->to<int64_t>() : 1;
     const auto dims = correction_reduce_dims(self, dim, keepdim);
     if (dims.has_value()) {
@@ -294,6 +297,8 @@ std::tuple<Tensor, Tensor> median_dim_values_native(const Tensor& self, int64_t 
 std::tuple<Tensor, Tensor> sort_stable_native(const Tensor& self,
                                               std::optional<bool> stable, int64_t dim,
                                               bool descending) {
+    if (isQuantizedType(self.dtype())) { quantized::q_scale(self); auto result = sort_stable_native(quantized::storage_view(self), stable, dim, descending); return {quantized::with_quantizer(std::get<0>(result), self), std::get<1>(result)}; }
+
     (void)stable;
     return ops::sort(self, dim, descending);
 }

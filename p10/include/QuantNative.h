@@ -9,6 +9,9 @@ std::tuple<Tensor,Tensor,Tensor> recurrent_packed_##backend(const Tensor&,const 
     const std::vector<Tensor>&,const std::vector<bool>&,int64_t,double,bool,bool,bool, \
     int64_t,const std::optional<Tensor>&);
 TP_DECLARE_PACKED_RECURRENCE(cpu)
+Tensor std_strided_cpu(const Tensor&, const std::vector<int64_t>&, bool, double);
+Tensor moment_inner_cpu(const Tensor&, const std::vector<int64_t>&, bool, bool, double);
+Tensor grid_sample_cpu(const Tensor&, const Tensor&, int64_t, int64_t, bool);
 Tensor batch_norm_cpu(const Tensor&, const std::optional<Tensor>&, const std::optional<Tensor>&,
     const Tensor&, const Tensor&, double, double, int64_t, bool);
 Tensor resize_cpu(const Tensor&, const std::vector<int64_t>&,
@@ -22,6 +25,9 @@ Tensor pool_cpu(const Tensor&, const std::vector<int64_t>&,
                 const std::vector<int64_t>&, bool, bool, std::optional<int64_t>, int);
 #ifdef USE_CUDA
 TP_DECLARE_PACKED_RECURRENCE(cuda)
+Tensor std_strided_cuda(const Tensor&, const std::vector<int64_t>&, bool, double);
+Tensor moment_inner_cuda(const Tensor&, const std::vector<int64_t>&, bool, bool, double);
+Tensor grid_sample_cuda(const Tensor&, const Tensor&, int64_t, int64_t, bool);
 Tensor batch_norm_cuda(const Tensor&, const std::optional<Tensor>&, const std::optional<Tensor>&,
     const Tensor&, const Tensor&, double, double, int64_t, bool);
 Tensor resize_cuda(const Tensor&, const std::vector<int64_t>&,

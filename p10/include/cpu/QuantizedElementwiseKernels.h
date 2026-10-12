@@ -33,6 +33,12 @@ DECLARE_DISPATCH(quantized_batch_norm_fn, quantized_batch_norm_stub)
 using quantized_bilinear_fn = void (*)(const void*, const void*, const void*, const void*,
     void*, int64_t, DType, float, float, int64_t);
 DECLARE_DISPATCH(quantized_bilinear_fn, quantized_bilinear_stub)
+using quantized_moment_fn = void (*)(const void*, void*, int64_t, int64_t, DType,
+    double, int64_t, bool, double);
+DECLARE_DISPATCH(quantized_moment_fn, quantized_moment_stub)
+using quantized_prelu_fn = void (*)(const void*, const void*, void*, int64_t, bool, DType,
+    int64_t, int64_t, int64_t, int64_t, float);
+DECLARE_DISPATCH(quantized_prelu_fn, quantized_prelu_stub)
 using quantized_clip_fn = void (*)(const void*, void*, int64_t, DType, int64_t, int64_t);
 using quantized_lookup_fn = void (*)(const uint8_t*, uint8_t*, int64_t, const float*);
 using quantized_binary_fn = void (*)(const void*, const void*, void*, int64_t, DType,

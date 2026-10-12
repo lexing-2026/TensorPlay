@@ -468,29 +468,232 @@ Tensor matmul(const Tensor& a, const Tensor& b, double scale, int64_t zp) {
 
 template<class T>
 struct PreluCodes {
-    const T *x, *w; T* y; int64_t channels, inner, weights, xz, wz, yz, one; float multiplier;
+    const T *x, *w; T* y; Broadcast geometry; int64_t xz, wz, yz, one; float multiplier;
     TP_QN_DEVICE void operator()(int64_t i) const {
-        const int64_t a = static_cast<int64_t>(x[i]) - xz;
-        const int64_t b = static_cast<int64_t>(w[weights == 1 ? 0 : i / inner % channels]) - wz;
-        const double v = static_cast<double>(a > 0 ? a : 0) * one + static_cast<double>(a < 0 ? a : 0) * b;
-        y[i] = encode<T>(static_cast<float>(v), multiplier, yz);
+        int64_t xi, wi; geometry.indices(i, xi, wi);
+        const int64_t a = static_cast<int64_t>(x[xi]) - xz;
+        const int64_t b = static_cast<int64_t>(w[wi]) - wz;
+        const int32_t value = static_cast<int32_t>((a > 0 ? a : 0) * one + (a < 0 ? a : 0) * b);
+        y[i] = encode<T>(static_cast<float>(value), multiplier, yz);
     }
 };
 
 Tensor prelu(const Tensor& input, const Tensor& weight, double scale, int64_t zp) {
     Guard guard(input); validate(input); validate(weight);
-    TP_CHECK(input.dim() > 0 && weight.dim() <= 1, "Parametric rectification requires nonscalar input and scalar or vector weight");
+    TP_CHECK(input.dim() > 0, "Parametric rectification requires nonscalar input");
     TP_CHECK(input.dtype() == weight.dtype() && input.device() == weight.device(), "Input and slope must share dtype and device");
-    const int64_t channels = input.dim() > 1 ? input.size(1) : 1;
-    TP_CHECK(weight.numel() == 1 || weight.numel() == channels, "Slope count must be one or equal the channel count");
-    int64_t inner = 1;
-    for (int d = 2; d < input.dim(); ++d) inner *= input.size(d);
-    if (input.dim() == 1) inner = input.numel();
-    Tensor x = input.contiguous(), w = weight.contiguous(), y = output(input, input.shape(), scale, zp);
-    const float ws = quantized::q_scale(weight), multiplier = static_cast<float>(quantized::q_scale(input)) * ws / static_cast<float>(scale);
-    const int64_t wz = quantized::q_zero_point(weight);
-    codes(input.dtype(), [&]<class T>() { apply(y.numel(), PreluCodes<T>{x.data_ptr<T>(), w.data_ptr<T>(), y.data_ptr<T>(), channels, inner,
-        weight.numel(), quantized::q_zero_point(input), wz, zp, static_cast<int64_t>(encode<T>(1.f, 1.f / ws, wz)) - wz, multiplier}); });
+    Tensor slope = weight;
+    if (input.dim() != weight.dim()) {
+        std::vector<int64_t> shape(input.dim(), 1);
+        if (input.dim() > 1) shape[1] = weight.numel();
+        slope = weight.reshape(shape);
+    }
+    TP_CHECK(broadcast_shape(input.shape(), slope.shape()) == input.sizes().vec(),
+             "Slope dimensions must broadcast to the input shape");
+    Tensor x = input.contiguous(), w = slope.contiguous(), y = output(input, input.shape(), scale, zp);
+    const float ws = quantized::q_scale(weight), multiplier = static_cast<float>(quantized::q_scale(input)) * ws * (1.f / static_cast<float>(scale));
+    const int64_t wz = quantized::q_zero_point(weight), xz = quantized::q_zero_point(input);
+    const auto geometry = broadcast(x, w, input.sizes().vec());
+    codes(input.dtype(), [&]<class T>() {
+        const int64_t one = static_cast<int64_t>(encode<T>(1.f, 1.f / ws, wz)) - wz;
+#ifndef TP_QUANT_CUDA
+        if (w.numel() == 1 || w.sizes().vec() == input.sizes().vec()) {
+            parallel::parallel_for(0, y.numel(), 32768, [&](int64_t first, int64_t last) {
+                cpu::quantized_prelu_stub(DeviceType::CPU, x.data_ptr<T>() + first,
+                    w.data_ptr<T>() + (w.numel() == 1 ? 0 : first), y.data_ptr<T>() + first,
+                    last - first, w.numel() == 1, input.dtype(), xz, wz, zp, one, multiplier);
+            });
+            return;
+        }
+        bool channel_weight = input.dim() > 1 && w.size(1) == input.size(1);
+        for (int d = 0; d < w.dim(); ++d) if (d != 1 && w.size(d) != 1) channel_weight = false;
+        if (channel_weight) {
+            int64_t inner = 1;
+            for (int d = 2; d < input.dim(); ++d) inner *= input.size(d);
+            if (inner) parallel::parallel_for(0, y.numel() / inner, 1, [&](int64_t first, int64_t last) {
+                for (int64_t row = first; row < last; ++row)
+                    cpu::quantized_prelu_stub(DeviceType::CPU, x.data_ptr<T>() + row * inner,
+                        w.data_ptr<T>() + row % input.size(1), y.data_ptr<T>() + row * inner,
+                        inner, true, input.dtype(), xz, wz, zp, one, multiplier);
+            });
+            return;
+        }
+#endif
+        apply(y.numel(), PreluCodes<T>{x.data_ptr<T>(), w.data_ptr<T>(), y.data_ptr<T>(), geometry, xz, wz, zp, one, multiplier});
+    });
+    return y;
+}
+
+template<class T>
+struct MomentInnerCodes {
+    const T* x; T* y; int64_t count, zp; double scale, correction; bool deviation;
+    TP_QN_DEVICE void operator()(int64_t i) const {
+        int64_t sum = 0;
+        double square_sum = 0.;
+        for (int64_t j = 0; j < count; ++j) {
+            const int64_t code = x[i * count + j];
+            sum += code;
+            square_sum += static_cast<double>(code) * code;
+        }
+        if (!deviation) {
+            y[i] = static_cast<T>(::nearbyintf(static_cast<float>(sum) / count));
+            return;
+        }
+        const double den = ::fmax(static_cast<double>(count) - correction, 0.);
+        const double mean = static_cast<double>(sum) / count;
+        const double unbiased = static_cast<double>(sum) / den;
+        const double variance = ::fmax(square_sum / den - 2. * mean * unbiased + mean * mean * count / den, 0.);
+        y[i] = encode<T>(static_cast<float>(::sqrt(variance) * scale),
+                        1.f / static_cast<float>(scale), zp);
+    }
+};
+
+Tensor moment_inner(const Tensor& input, const std::vector<int64_t>& dims,
+                    bool keepdim, bool deviation, double correction) {
+    Guard guard(input); validate(input);
+    auto shape = input.sizes().vec();
+    int64_t count = 1;
+    for (auto d : dims) { count *= input.size(d); shape[d] = 1; }
+    if (!keepdim) for (auto d = dims.rbegin(); d != dims.rend(); ++d) shape.erase(shape.begin() + *d);
+    Tensor y = output(input, shape, quantized::q_scale(input), quantized::q_zero_point(input));
+#ifndef TP_QUANT_CUDA
+    const auto* source = static_cast<const uint8_t*>(input.data_ptr());
+    auto* destination = static_cast<uint8_t*>(y.data_ptr());
+    parallel::parallel_for(0, y.numel(), std::max<int64_t>(1, 32768 / std::max<int64_t>(count, 1)), [&](int64_t first, int64_t last) {
+        cpu::quantized_moment_stub(DeviceType::CPU, source + first * count * input.itemsize(),
+            destination + first * y.itemsize(), count, last - first, input.dtype(),
+            quantized::q_scale(input), quantized::q_zero_point(input), deviation, correction);
+    });
+#else
+    codes(input.dtype(), [&]<class T>() {
+        apply(y.numel(), MomentInnerCodes<T>{input.data_ptr<T>(), y.data_ptr<T>(), count,
+            quantized::q_zero_point(input), quantized::q_scale(input), correction, deviation});
+    });
+#endif
+    return y;
+}
+
+struct MomentStrides {
+    int reduced_rank = 0, output_rank = 0;
+    int64_t reduced_sizes[64]{}, reduced_strides[64]{}, output_sizes[64]{}, output_strides[64]{};
+    TP_QN_DEVICE int64_t offset(int64_t group, int64_t element) const {
+        int64_t result = 0;
+        for (int d = output_rank - 1; d >= 0; --d) {
+            result += group % output_sizes[d] * output_strides[d]; group /= output_sizes[d];
+        }
+        for (int d = reduced_rank - 1; d >= 0; --d) {
+            result += element % reduced_sizes[d] * reduced_strides[d]; element /= reduced_sizes[d];
+        }
+        return result;
+    }
+};
+
+template<class T>
+struct StdStridedCodes {
+    const T* x; T* y; MomentStrides strides; int64_t count, zp; double scale, correction;
+    TP_QN_DEVICE void operator()(int64_t group) const {
+        double mean = 0., m2 = 0.;
+        for (int64_t j = 0; j < count; ++j) {
+            const float value = static_cast<float>(static_cast<int64_t>(x[strides.offset(group, j)]) - zp) * static_cast<float>(scale);
+            const double delta = static_cast<double>(value) - mean;
+            mean += delta / (j + 1);
+            m2 += delta * (static_cast<double>(value) - mean);
+        }
+        const double denominator = ::fmax(static_cast<double>(count) - correction, 0.);
+        const float value = static_cast<float>(::sqrt(m2 / denominator));
+        y[group] = encode<T>(value, 1.f / static_cast<float>(scale), zp);
+    }
+};
+
+Tensor std_strided(const Tensor& input, const std::vector<int64_t>& dims, bool keepdim, double correction) {
+    Guard guard(input); validate(input);
+    TP_CHECK(input.dim() <= 64, "Reduction rank exceeds 64 dimensions");
+    MomentStrides strides{};
+    auto shape = input.sizes().vec();
+    int64_t count = 1;
+    for (int d = 0; d < input.dim(); ++d) {
+        if (std::find(dims.begin(), dims.end(), d) != dims.end()) {
+            strides.reduced_sizes[strides.reduced_rank] = input.size(d);
+            strides.reduced_strides[strides.reduced_rank++] = input.stride(d);
+            count *= input.size(d); shape[d] = 1;
+        } else {
+            strides.output_sizes[strides.output_rank] = input.size(d);
+            strides.output_strides[strides.output_rank++] = input.stride(d);
+        }
+    }
+    if (!keepdim) for (auto d = dims.rbegin(); d != dims.rend(); ++d)
+        if (input.dim()) shape.erase(shape.begin() + *d);
+    const double scale = quantized::q_scale(input);
+    const int64_t zp = quantized::q_zero_point(input);
+    Tensor y = output(input, shape, scale, zp);
+    codes(input.dtype(), [&]<class T>() {
+        apply(y.numel(), StdStridedCodes<T>{input.data_ptr<T>(), y.data_ptr<T>(), strides, count, zp, scale, correction});
+    });
+    return y;
+}
+
+struct GridSampleCodes {
+    const uint8_t* x; const float* grid; uint8_t* y;
+    int64_t channels, height, width, out_height, out_width, xs[4], gs[4], zp;
+    int padding; bool align;
+    TP_QN_DEVICE float coordinate(float v, int64_t size) const {
+        v = align ? ((v + 1.f) / 2.f) * (size - 1) : ((v + 1.f) * size - 1.f) / 2.f;
+        if (padding == 2) {
+            const float low = align ? 0.f : -.5f;
+            const float span = align ? size - 1.f : static_cast<float>(size);
+            if (span == 0.f) v = 0.f;
+            else {
+                const float distance = ::fabsf(v - low);
+                const float extra = ::fmodf(distance, span);
+                const float flips = ::floorf(distance / span);
+                v = ::fmodf(flips, 2.f) == 0.f ? extra + low : span - extra + low;
+            }
+        }
+        if (padding) v = ::fminf(size - 1.f, ::fmaxf(v, 0.f));
+        if (!std::isfinite(v) || v < -2147483648.f || v > 2147483520.f) v = -100.f;
+        return v;
+    }
+    TP_QN_DEVICE float sample(int64_t base, int64_t h, int64_t w) const {
+        return h >= 0 && h < height && w >= 0 && w < width ? x[base + h * xs[2] + w * xs[3]] : zp;
+    }
+    TP_QN_DEVICE void operator()(int64_t i) const {
+        const int64_t w = i % out_width, h = i / out_width % out_height;
+        const int64_t c = i / (out_width * out_height) % channels;
+        const int64_t n = i / (out_width * out_height * channels);
+        const int64_t gi = n * gs[0] + h * gs[1] + w * gs[2];
+        const float ix = coordinate(grid[gi], width), iy = coordinate(grid[gi + gs[3]], height);
+        const int64_t left = static_cast<int64_t>(::floorf(ix)), top = static_cast<int64_t>(::floorf(iy));
+        const float nw = (left + 1 - ix) * (top + 1 - iy);
+        const float ne = (ix - left) * (top + 1 - iy);
+        const float sw = (left + 1 - ix) * (iy - top);
+        const float se = (ix - left) * (iy - top);
+        const int64_t base = n * xs[0] + c * xs[1];
+        float result = sample(base, top, left) * nw;
+        result += sample(base, top, left + 1) * ne;
+        result += sample(base, top + 1, left) * sw;
+        result += sample(base, top + 1, left + 1) * se;
+        y[i] = static_cast<uint8_t>(::nearbyintf(result));
+    }
+};
+
+Tensor grid_sample(const Tensor& input, const Tensor& grid, int64_t interpolation,
+                   int64_t padding, bool align) {
+    Guard guard(input); validate(input);
+    TP_CHECK(input.dtype() == DType::QUInt8, "Grid sampling requires unsigned byte quantization");
+    TP_CHECK(interpolation == 0, "Quantized grid sampling supports bilinear interpolation only");
+    TP_CHECK(padding >= 0 && padding <= 2, "Invalid grid sampling padding mode");
+    TP_CHECK(grid.dtype() == DType::Float32 && grid.device() == input.device(),
+             "Grid sampling requires a Float32 grid on the input device");
+    TP_CHECK(input.dim() == 4 && grid.dim() == 4 && grid.size(0) == input.size(0) && grid.size(3) == 2,
+             "Grid sampling requires four-dimensional input and a matching two-coordinate grid");
+    TP_CHECK(input.size(2) > 0 && input.size(3) > 0, "Grid sampling requires nonempty input spatial dimensions");
+    Tensor y = output(input, {input.size(0), input.size(1), grid.size(1), grid.size(2)},
+                      quantized::q_scale(input), quantized::q_zero_point(input));
+    GridSampleCodes fn{input.data_ptr<uint8_t>(), grid.data_ptr<float>(), y.data_ptr<uint8_t>(),
+                      input.size(1), input.size(2), input.size(3), grid.size(1), grid.size(2),
+                      {}, {}, quantized::q_zero_point(input), static_cast<int>(padding), align};
+    for (int d = 0; d < 4; ++d) { fn.xs[d] = input.stride(d); fn.gs[d] = grid.stride(d); }
+    apply(y.numel(), fn);
     return y;
 }
 
@@ -660,6 +863,18 @@ Tensor TP_QN_NAME(binary)(const Tensor& a, const Tensor& b, double as, int64_t a
 Tensor TP_QN_NAME(cat)(const std::vector<Tensor>& xs, int64_t dim, std::optional<double> scale,
                       std::optional<int64_t> zp, bool relu) {
     return TP_QN_DETAIL::cat(xs, dim, scale, zp, relu);
+}
+Tensor TP_QN_NAME(std_strided)(const Tensor& x, const std::vector<int64_t>& dims,
+        bool keepdim, double correction) {
+    return TP_QN_DETAIL::std_strided(x, dims, keepdim, correction);
+}
+Tensor TP_QN_NAME(moment_inner)(const Tensor& x, const std::vector<int64_t>& dims,
+        bool keepdim, bool deviation, double correction) {
+    return TP_QN_DETAIL::moment_inner(x, dims, keepdim, deviation, correction);
+}
+Tensor TP_QN_NAME(grid_sample)(const Tensor& x, const Tensor& grid, int64_t interpolation,
+        int64_t padding, bool align) {
+    return TP_QN_DETAIL::grid_sample(x, grid, interpolation, padding, align);
 }
 Tensor TP_QN_NAME(pool)(const Tensor& x, const std::vector<int64_t>& kernel,
         const std::vector<int64_t>& stride, const std::vector<int64_t>& pad,

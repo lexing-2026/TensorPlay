@@ -1,3 +1,4 @@
+#include "QuantTensorOperators.h"
 // Advanced index selection operators - CPU kernels.
 #include "Tensor.h"
 #include "Dispatcher.h"
@@ -79,6 +80,8 @@ Tensor take_along_dim_composite(const Tensor& self, const Tensor& indices, std::
 // each index tensor contributes its byte offset inside the iterator kernel.
 Tensor index_cpu(const Tensor& self,
                  const std::vector<std::optional<Tensor>>& indices) {
+    if (isQuantizedType(self.dtype())) { quantized::q_scale(self); return quantized::with_quantizer(index_cpu(quantized::storage_view(self), indices), self); }
+
     indexing::native::AdvancedIndex info(self, indices);
     Tensor output;
     TensorIteratorConfig config;
@@ -164,6 +167,8 @@ void index_put_kernel(TensorIterator& iter, const indexing::native::AdvancedInde
 Tensor& index_put_impl_cpu(Tensor& self,
                            const std::vector<std::optional<Tensor>>& indices,
                            const Tensor& values, bool accumulate, bool unsafe) {
+    if (isQuantizedType(self.dtype())) return quantized::index_put(self, indices, values, accumulate, unsafe);
+
     (void)unsafe;
     TP_CHECK_INDEX(indices.size() <= static_cast<size_t>(self.dim()),
                    "too many indices for tensor of dimension ", self.dim());

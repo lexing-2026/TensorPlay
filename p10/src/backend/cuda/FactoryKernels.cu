@@ -1,3 +1,4 @@
+#include "QuantTensorOperators.h"
 #include "Tensor.h"
 #include "QuantizedViews.h"
 #include "Dispatcher.h"
@@ -28,6 +29,8 @@ inline void fill_iter(TensorIteratorBase& iter, T value) {
 }
 
 Tensor& fill_kernel(Tensor& self, const Scalar& value) {
+    if (isQuantizedType(self.dtype())) return quantized::fill(self, value);
+
     int64_t n = self.numel();
     if (n == 0) return self;
     

@@ -47,7 +47,8 @@ void subbyte_pack(const float* input,uint8_t* output,int64_t size,float inverse,
 
 void subbyte_pack_impl(const float* input,uint8_t* output,int64_t size,float inverse,float zp,int bits) {
     if (bits==4) subbyte_pack<4>(input,output,size,inverse,zp);
-    else subbyte_pack<2>(input,output,size,inverse,zp);
+    else if (bits==2) subbyte_pack<2>(input,output,size,inverse,zp);
+    else subbyte_pack<1>(input,output,size,inverse,zp);
 }
 
 template<int Bits>
@@ -66,7 +67,8 @@ void subbyte_unpack(const uint8_t* input,float* output,int64_t size,float scale,
 
 void subbyte_unpack_impl(const uint8_t* input,float* output,int64_t size,float scale,float zp,int bits) {
     if (bits==4) subbyte_unpack<4>(input,output,size,scale,zp);
-    else subbyte_unpack<2>(input,output,size,scale,zp);
+    else if (bits==2) subbyte_unpack<2>(input,output,size,scale,zp);
+    else subbyte_unpack<1>(input,output,size,scale,zp);
 }
 
 int64_t dynamic_dot_impl(const uint8_t* x,const int8_t* w,int64_t size) {
@@ -301,8 +303,8 @@ void int4_pack_impl(const int32_t* src, uint8_t* dst, int64_t n, int64_t k) {
     });
 }
 
-template<class T>
-void int4_mm_codes(const T* x, const uint8_t* packed, const T* params, T* output,
+template<class T, class X = T>
+void int4_mm_codes(const X* x, const uint8_t* packed, const T* params, T* output,
         int64_t m, int64_t n, int64_t k, int64_t group) {
     using FV = vec::Vectorized<float>;
     constexpr int lanes = FV::size(), columns = int4_columns;
@@ -408,7 +410,28 @@ void int4_mm_impl(const void* x, const uint8_t* packed, const void* params, void
     switch (dtype) {
         case DType::Float32: int4_mm_codes(static_cast<const float*>(x),packed,static_cast<const float*>(params),static_cast<float*>(output),m,n,k,group); break;
         case DType::Float16: int4_mm_codes(static_cast<const Half*>(x),packed,static_cast<const Half*>(params),static_cast<Half*>(output),m,n,k,group); break;
-        case DType::BFloat16: int4_mm_codes(static_cast<const BFloat16*>(x),packed,static_cast<const BFloat16*>(params),static_cast<BFloat16*>(output),m,n,k,group); break;
+        case DType::BFloat16: {
+            const auto* input = static_cast<const BFloat16*>(x);
+            if (m < 8) {
+                int4_mm_codes(input,packed,static_cast<const BFloat16*>(params),static_cast<BFloat16*>(output),m,n,k,group);
+                break;
+            }
+            // Convert each activation once, then reuse the full-precision
+            // values across output tiles without changing accumulation order.
+            thread_local std::vector<float> real;
+            real.resize(m * k);
+            using V = vec::Vectorized<BFloat16>;
+            int64_t i = 0;
+            for (; i + V::size() <= m * k; i += V::size()) {
+                const auto values = vec::convert<float,2>(vec::VectorizedN<BFloat16,1>(V::loadu(input + i)));
+                values[0].store(real.data() + i);
+                values[1].store(real.data() + i + vec::Vectorized<float>::size());
+            }
+            for (; i < m * k; ++i) real[i] = static_cast<float>(input[i]);
+            int4_mm_codes<BFloat16,float>(real.data(),packed,static_cast<const BFloat16*>(params),
+                static_cast<BFloat16*>(output),m,n,k,group);
+            break;
+        }
         default: break;
     }
 }
@@ -496,9 +519,128 @@ void clip(const void* input, void* output, int64_t size, int64_t lo, int64_t hi)
     const auto* x = static_cast<const T*>(input);
     auto* y = static_cast<T*>(output);
     int64_t i = 0;
-    for (; i + V::size() <= size; i += V::size())
-        V::loadu(x + i).relu6(lower, upper).store(y + i);
-    if (i < size) V::loadu(x + i, size - i).relu6(lower, upper).store(y + i, size - i);
+    if (hi == std::numeric_limits<T>::max()) {
+        for (; i + V::size() <= size; i += V::size()) V::loadu(x + i).relu(lower).store(y + i);
+        if (i < size) V::loadu(x + i, size - i).relu(lower).store(y + i, size - i);
+    } else {
+        for (; i + V::size() <= size; i += V::size()) V::loadu(x + i).relu6(lower, upper).store(y + i);
+        if (i < size) V::loadu(x + i, size - i).relu6(lower, upper).store(y + i, size - i);
+    }
+}
+
+template<class Q>
+void moment_codes(const void* input, void* output, int64_t count, int64_t rows,
+                  double scale, int64_t zp, bool deviation, double correction) {
+    using T = typename Q::underlying;
+    using QV = vec::Vectorized<Q>;
+    using IV = vec::Vectorized<qint32>;
+    using FV = vec::Vectorized<float>;
+    const auto* x = static_cast<const T*>(input);
+    auto* y = static_cast<T*>(output);
+    for (int64_t row = 0; row < rows; ++row) {
+        const auto* values = x + row * count;
+        int64_t sum = 0, integer_square_sum = 0;
+        double square_sum = 0.;
+        int64_t i = 0;
+        if constexpr (sizeof(T) == 1) {
+            const QV zero(Q(static_cast<T>(0)));
+            while (i + QV::size() <= count) {
+                const int64_t stop = std::min<int64_t>(i + 32768, count - count % QV::size());
+                typename QV::int_vec_return_type totals, squares;
+                for (size_t j = 0; j < totals.size(); ++j) { totals[j] = IV(qint32(0)); squares[j] = IV(qint32(0)); }
+                for (; i < stop; i += QV::size()) {
+                    const auto codes = QV::loadu(values + i).widening_subtract(zero);
+                    for (size_t j = 0; j < totals.size(); ++j) {
+                        totals[j] = totals[j] + codes[j];
+                        if (deviation) squares[j] = squares[j] + codes[j] * codes[j];
+                    }
+                }
+                alignas(64) int32_t lanes[IV::size()];
+                for (size_t j = 0; j < totals.size(); ++j) {
+                    totals[j].store(lanes);
+                    for (const auto value : lanes) sum += value;
+                    if (deviation) {
+                        squares[j].store(lanes);
+                        for (const auto value : lanes) integer_square_sum += value;
+                    }
+                }
+            }
+            for (; i < count; ++i) { sum += values[i]; integer_square_sum += static_cast<int64_t>(values[i]) * values[i]; }
+            square_sum = static_cast<double>(integer_square_sum);
+        } else {
+            for (int64_t j = 0; j < count; ++j) sum += values[j];
+            if (deviation) {
+                float total = 0.f;
+#if defined(CPU_CAPABILITY_AVX2) || defined(CPU_CAPABILITY_AVX512)
+                FV squares(0.f);
+                for (; i + FV::size() <= count; i += FV::size()) {
+                    const FV v = vec::convert<float>(vec::Vectorized<int32_t>::loadu(values + i));
+                    squares = squares + v * v;
+                }
+                alignas(64) float lanes[FV::size()];
+                squares.store(lanes);
+                for (const auto value : lanes) total += value;
+#endif
+                for (; i < count; ++i) { const float v = static_cast<float>(values[i]); total += v * v; }
+                square_sum = total;
+            }
+        }
+        if (!deviation) { y[row] = static_cast<T>(std::nearbyint(static_cast<float>(sum) / count)); continue; }
+        const double denominator = std::max(static_cast<double>(count) - correction, 0.);
+        const double mean = static_cast<double>(sum) / count, unbiased = static_cast<double>(sum) / denominator;
+        const double variance = std::max(square_sum / denominator - 2. * mean * unbiased + mean * mean * count / denominator, 0.);
+        y[row] = quant::encode<T>(static_cast<float>(std::sqrt(variance) * scale), 1.f / static_cast<float>(scale), zp);
+    }
+}
+
+void moment_impl(const void* x, void* y, int64_t count, int64_t rows, DType dtype,
+                 double scale, int64_t zp, bool deviation, double correction) {
+    switch (dtype) {
+        case DType::QInt8: moment_codes<qint8>(x,y,count,rows,scale,zp,deviation,correction); break;
+        case DType::QUInt8: moment_codes<quint8>(x,y,count,rows,scale,zp,deviation,correction); break;
+        case DType::QInt32: moment_codes<qint32>(x,y,count,rows,scale,zp,deviation,correction); break;
+        default: break;
+    }
+}
+
+template<class Q>
+void prelu_codes(const void* input, const void* weight, void* output, int64_t size,
+                 bool scalar_weight, int64_t xz, int64_t wz, int64_t yz, int64_t one, float multiplier) {
+    using T = typename Q::underlying;
+    using V = vec::Vectorized<Q>;
+    using IV = vec::Vectorized<qint32>;
+    const auto* x = static_cast<const T*>(input);
+    const auto* w = static_cast<const T*>(weight);
+    auto* y = static_cast<T*>(output);
+    const V input_zero(Q(static_cast<T>(xz))), weight_zero(Q(static_cast<T>(wz)));
+    const IV unit(qint32(static_cast<int32_t>(one)));
+    int64_t i = 0;
+    for (; i + V::size() <= size; i += V::size()) {
+        const V a = V::loadu(x + i);
+        const V b = scalar_weight ? V(Q(w[0])) : V::loadu(w + i);
+        auto positive = a.maximum(input_zero).widening_subtract(input_zero);
+        const auto negative = a.minimum(input_zero).widening_subtract(input_zero);
+        const auto slope = b.widening_subtract(weight_zero);
+        for (size_t j = 0; j < positive.size(); ++j)
+            positive[j] = positive[j] * unit + negative[j] * slope[j];
+        V::requantize_from_int(positive, multiplier, yz).store(y + i);
+    }
+    for (; i < size; ++i) {
+        const int64_t a = static_cast<int64_t>(x[i]) - xz;
+        const int64_t b = static_cast<int64_t>(w[scalar_weight ? 0 : i]) - wz;
+        const int32_t value = static_cast<int32_t>(std::max<int64_t>(a, 0) * one + std::min<int64_t>(a, 0) * b);
+        y[i] = quant::encode<T>(static_cast<float>(value), multiplier, yz);
+    }
+}
+
+void prelu_impl(const void* x, const void* w, void* y, int64_t size, bool scalar_weight,
+                DType dtype, int64_t xz, int64_t wz, int64_t yz, int64_t one, float multiplier) {
+    switch (dtype) {
+        case DType::QInt8: prelu_codes<qint8>(x,w,y,size,scalar_weight,xz,wz,yz,one,multiplier); break;
+        case DType::QUInt8: prelu_codes<quint8>(x,w,y,size,scalar_weight,xz,wz,yz,one,multiplier); break;
+        case DType::QInt32: prelu_codes<qint32>(x,w,y,size,scalar_weight,xz,wz,yz,one,multiplier); break;
+        default: break;
+    }
 }
 
 void clip_impl(const void* x, void* y, int64_t size, DType dtype, int64_t lo, int64_t hi) {
@@ -628,6 +770,8 @@ REGISTER_DISPATCH(quantized_int4_mm_stub, &int4_mm_impl);
 REGISTER_DISPATCH(quantized_batch_norm_stub, &batch_norm_impl);
 REGISTER_DISPATCH(quantized_bilinear_stub, &bilinear_impl);
 REGISTER_DISPATCH(quantized_clip_stub, &clip_impl);
+REGISTER_DISPATCH(quantized_prelu_stub, &prelu_impl);
+REGISTER_DISPATCH(quantized_moment_stub, &moment_impl);
 REGISTER_DISPATCH(quantized_lookup_stub, &lookup_impl);
 REGISTER_DISPATCH(quantized_binary_stub, &binary_impl);
 REGISTER_DISPATCH(quantized_embedding_stub, &embedding_impl);
@@ -644,6 +788,8 @@ ALSO_REGISTER_AVX512_DISPATCH(quantized_int4_mm_stub, &int4_mm_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_batch_norm_stub, &batch_norm_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_bilinear_stub, &bilinear_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_clip_stub, &clip_impl);
+ALSO_REGISTER_AVX512_DISPATCH(quantized_prelu_stub, &prelu_impl);
+ALSO_REGISTER_AVX512_DISPATCH(quantized_moment_stub, &moment_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_lookup_stub, &lookup_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_binary_stub, &binary_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_embedding_stub, &embedding_impl);

@@ -1,3 +1,4 @@
+#include "QuantTensorOperators.h"
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
@@ -52,6 +53,8 @@ bool mean_needs_opmath(DType out_dtype) {
 } // namespace
 
 Tensor mean_kernel(const Tensor& self, DType dtype) {
+    if (isQuantizedType(self.dtype())) return quantized::moment(self, {}, false, false, 1., dtype);
+
     DType out_dtype = (dtype == DType::Undefined) ? (isFloatingOrComplexType(self.dtype()) ? self.dtype() : DType::Float32) : dtype;
     if (mean_needs_opmath(out_dtype)) {
         Tensor s = sum_kernel(self, DType::Float32);
@@ -62,6 +65,8 @@ Tensor mean_kernel(const Tensor& self, DType dtype) {
 }
 
 Tensor mean_dim_kernel(const Tensor& self, const std::vector<int64_t>& dims, bool keepdim, DType dtype) {
+    if (isQuantizedType(self.dtype())) return quantized::moment(self, dims, keepdim, false, 1., dtype);
+
     DType out_dtype = (dtype == DType::Undefined) ? (isFloatingOrComplexType(self.dtype()) ? self.dtype() : DType::Float32) : dtype;
 
     int64_t count = 1;
@@ -111,6 +116,8 @@ Tensor mean_dim_backward_kernel(const Tensor& grad_output, const Tensor& self,
 }
 
 Tensor max_kernel(const Tensor& self) {
+    if (isQuantizedType(self.dtype())) return quantized::extrema(self, true);
+
     return max_stub(DeviceType::CPU, self);
 }
 
@@ -140,14 +147,20 @@ Tensor sum_dim_backward_kernel(const Tensor& grad_output, const Tensor& self,
 }
 
 std::tuple<Tensor, Tensor> max_dim_kernel(const Tensor& self, int64_t dim, bool keepdim) {
+    if (isQuantizedType(self.dtype())) return quantized::extrema_dim(self, dim, keepdim, true);
+
     return max_dim_stub(DeviceType::CPU, self, dim, keepdim);
 }
 
 Tensor min_kernel(const Tensor& self) {
+    if (isQuantizedType(self.dtype())) return quantized::extrema(self, false);
+
     return min_stub(DeviceType::CPU, self);
 }
 
 std::tuple<Tensor, Tensor> min_dim_kernel(const Tensor& self, int64_t dim, bool keepdim) {
+    if (isQuantizedType(self.dtype())) return quantized::extrema_dim(self, dim, keepdim, false);
+
     return min_dim_stub(DeviceType::CPU, self, dim, keepdim);
 }
 
@@ -201,10 +214,14 @@ Tensor var_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, int64
 }
 
 Tensor std_kernel(const Tensor& self, int64_t correction) {
+    if (isQuantizedType(self.dtype())) return quantized::moment(self, {}, false, true, correction);
+
     return var_kernel(self, correction).sqrt();
 }
 
 Tensor std_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, int64_t correction, bool keepdim) {
+    if (isQuantizedType(self.dtype())) return quantized::moment(self, dim, keepdim, true, correction);
+
     return var_dim_kernel(self, dim, correction, keepdim).sqrt();
 }
 

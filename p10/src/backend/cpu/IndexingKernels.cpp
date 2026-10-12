@@ -1,3 +1,4 @@
+#include "QuantTensorOperators.h"
 // High-throughput indexing, masking, scan, and sorting operators.
 #include "Tensor.h"
 #include "Dispatcher.h"
@@ -91,6 +92,8 @@ Tensor normalize_index_cpu(const Tensor& index, int64_t upper_bound,
 // ---------------------------------------------------------------------------
 
 Tensor masked_fill_cpu(const Tensor& self, const Tensor& mask, const Scalar& value) {
+    if (isQuantizedType(self.dtype())) { Tensor result = self.clone(); quantized::masked_fill(result, mask, value); return result; }
+
     if (mask.dtype() != DType::Bool) {
         TP_THROW(TypeError, "masked_fill only supports boolean masks");
     }
@@ -123,6 +126,8 @@ Tensor masked_fill_cpu(const Tensor& self, const Tensor& mask, const Scalar& val
 }
 
 Tensor& masked_fill__cpu(Tensor& self, const Tensor& mask, const Scalar& value) {
+    if (isQuantizedType(self.dtype())) return quantized::masked_fill(self, mask, value);
+
     Tensor r = masked_fill_cpu(self, mask, value);
     self.copy_(r);
     return self;
@@ -164,7 +169,7 @@ Tensor triangular_mask_kernel(const Tensor& self, int64_t diagonal) {
     int64_t batch = self.numel() / (rows * cols);
     int64_t stride_rc = rows * cols;
     // Clamp k into [-rows, cols] so the per-row boundary below cannot
-    // overflow, mirroring the saturated keep ranges.
+    // overflow, using the saturated keep ranges.
     if (diagonal < -rows) diagonal = -rows;
     if (diagonal > cols) diagonal = cols;
     // Each row splits at one boundary into a zero run and a copy run, so a
@@ -849,6 +854,8 @@ Tensor& scatter_add_inplace_cpu(Tensor& self, int64_t dim, const Tensor& index, 
 // ---------------------------------------------------------------------------
 
 Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
+    if (isQuantizedType(self.dtype())) { quantized::q_scale(self); return quantized::with_quantizer(index_select_cpu(quantized::storage_view(self), dim, index), self); }
+
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
     if (index.dim() != 1) TP_THROW(IndexError, "index_select(): index should be a vector");

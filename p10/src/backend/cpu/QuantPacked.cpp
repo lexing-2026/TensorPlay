@@ -124,6 +124,8 @@ DEFINE_DISPATCH(quantized_int4_mm_stub);
 DEFINE_DISPATCH(quantized_batch_norm_stub);
 DEFINE_DISPATCH(quantized_bilinear_stub);
 DEFINE_DISPATCH(quantized_clip_stub);
+DEFINE_DISPATCH(quantized_prelu_stub);
+DEFINE_DISPATCH(quantized_moment_stub);
 DEFINE_DISPATCH(quantized_lookup_stub);
 DEFINE_DISPATCH(quantized_binary_stub);
 DEFINE_DISPATCH(quantized_embedding_stub);
@@ -303,7 +305,8 @@ void linear_vnni(const X* x, const int8_t* w, const int64_t* offsets,
         }
     };
     const int64_t tasks = row_tiles * column_tiles;
-    const int64_t grain = g.rows * g.outputs * g.K < 1048576 ? tasks : 1;
+    const int64_t parallel_work = output_float ? 131072 : 1048576;
+    const int64_t grain = g.rows * g.outputs * g.K < parallel_work ? tasks : 1;
     parallel::parallel_for(0, tasks, grain, [&](int64_t begin, int64_t end) {
         for (int64_t task = begin; task < end; ++task) {
             const int64_t row = (task / column_tiles) * 2;

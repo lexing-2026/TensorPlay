@@ -1,3 +1,4 @@
+#include "QuantTensorOperators.h"
 #include "Tensor.h"
 #include "QuantizedViews.h"
 #include "Complex.h"
@@ -164,6 +165,8 @@ Tensor full_kernel(const std::vector<int64_t>& size, Scalar fill_value, DType dt
 }
 
 Tensor& fill_kernel(Tensor& self, const Scalar& value) {
+    if (isQuantizedType(self.dtype())) return quantized::fill(self, value);
+
     if (self.numel() == 0) return self;
     // Dense storage fills in one sweep; any other layout walks its strides.
     // Chunks are handed to the intra-op pool once the element count clears
