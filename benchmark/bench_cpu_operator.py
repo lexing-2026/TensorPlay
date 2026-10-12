@@ -18,6 +18,14 @@ import numpy as np
 import tensorplay as tp
 import tensorplay.functional as F
 import tensorplay.nn.functional as pF
+from tensorplay.ao.nn import quantized as _qnn
+from tensorplay.ao.quantization import (
+    HistogramObserver,
+    MinMaxObserver,
+    MovingAverageMinMaxObserver,
+    MovingAveragePerChannelMinMaxObserver,
+    PerChannelMinMaxObserver,
+)
 
 
 def _spec(kind, shape, seed=0, upper=None):
@@ -90,6 +98,12 @@ def _count_flops(fn):
 
 
 _ITEMSIZE = {"f32": 4, "f64": 8, "bf16": 2}
+
+
+def _histogram_calculate_qparams(a):
+    observer = HistogramObserver()
+    observer(a)
+    return observer.calculate_qparams()
 
 # Zero-copy view operators and short-circuit reductions touch no data (or
 # a data-independent subset), so a streaming-bytes estimate would be wrong.
@@ -755,6 +769,240 @@ def build_cases(dtype, suite):
         lambda a: pF.avg_pool3d(a, 2), (conv3d_input,))
     add("adaptive-max-pool3d[2x8x16x16x16]", "pool",
         lambda a: pF.adaptive_max_pool3d(a, (4, 4, 4)), (conv3d_input,))
+
+    # In-place variants of the unary and binary families.  The factory
+    # materialises fresh tensors per probe, so mutating them in place is
+    # safe and exercises the same code path as the out-of-place form.
+    inplace_unary = (
+        ("abs", "normal", lambda a: a.abs_()),
+        ("acos", "bounded", lambda a: a.acos_()),
+        ("asin", "bounded", lambda a: a.asin_()),
+        ("atan", "normal", lambda a: a.atan_()),
+        ("bernoulli", "normal", lambda a: a.bernoulli_()),
+        ("cauchy", "normal", lambda a: a.cauchy_()),
+        ("ceil", "normal", lambda a: a.ceil_()),
+        ("cos", "normal", lambda a: a.cos_()),
+        ("cosh", "bounded", lambda a: a.cosh_()),
+        ("digamma", "greater_one", lambda a: a.digamma_()),
+        ("erf", "normal", lambda a: a.erf_()),
+        ("erfc", "normal", lambda a: a.erfc_()),
+        ("exp", "bounded", lambda a: a.exp_()),
+        ("expm1", "bounded", lambda a: a.expm1_()),
+        ("exponential", "normal", lambda a: a.exponential_()),
+        ("floor", "normal", lambda a: a.floor_()),
+        ("frac", "normal", lambda a: a.frac_()),
+        ("log", "positive", lambda a: a.log_()),
+        ("log10", "positive", lambda a: a.log10_()),
+        ("log1p", "bounded", lambda a: a.log1p_()),
+        ("log2", "positive", lambda a: a.log2_()),
+        ("logit", "normal", lambda a: a.mul_(0.25).add_(0.5).logit_()),
+        ("nan_to_num", "normal", lambda a: a.nan_to_num_()),
+        ("neg", "normal", lambda a: a.neg_()),
+        ("normal", "normal", lambda a: a.normal_()),
+        ("random", "normal", lambda a: a.random_()),
+        ("reciprocal", "positive", lambda a: a.reciprocal_()),
+        ("relu", "normal", lambda a: a.relu_()),
+        ("round", "normal", lambda a: a.round_()),
+        ("rsqrt", "positive", lambda a: a.rsqrt_()),
+        ("sigmoid", "normal", lambda a: a.sigmoid_()),
+        ("sign", "normal", lambda a: a.sign_()),
+        ("sin", "normal", lambda a: a.sin_()),
+        ("sqrt", "positive", lambda a: a.sqrt_()),
+        ("tan", "bounded", lambda a: a.tan_()),
+        ("tanh", "normal", lambda a: a.tanh_()),
+        ("trunc", "normal", lambda a: a.trunc_()),
+        ("uniform", "normal", lambda a: a.uniform_()),
+        ("zero", "normal", lambda a: a.zero_()),
+        ("fill", "normal", lambda a: a.fill_(0.5)),
+        ("square", "normal", lambda a: a.square_()),
+    )
+    for index, (name, kind, operation) in enumerate(inplace_unary):
+        add(f"{name}_[256k]", "unary", operation,
+            (_spec(kind, (1 << 18,), 1200 + index),))
+    inplace_binary_a = _spec("normal", (8, 16, 32), 1250)
+    inplace_binary_b = _spec("normal", (8, 16, 32), 1251)
+    add("add_[8x16x32]", "binary",
+        lambda a, b: a.add_(b), (inplace_binary_a, inplace_binary_b))
+    add("mul_[8x16x32]", "binary",
+        lambda a, b: a.mul_(b), (inplace_binary_a, inplace_binary_b))
+    add("sub_[8x16x32]", "binary",
+        lambda a, b: a.sub_(b), (inplace_binary_a, inplace_binary_b))
+    add("div_[8x16x32]", "binary",
+        lambda a, b: a.div_(b + 1.5), (inplace_binary_a, inplace_binary_b))
+    copy_dst = _spec("normal", (1 << 18,), 1253)
+    copy_src = _spec("normal", (1 << 18,), 1254)
+    add("copy_[256k]", "layout",
+        lambda a, b: a.copy_(b), (copy_dst, copy_src))
+
+    # Dtype conversion and the quantization entry points the framework
+    # provides.  Per-tensor and per-channel quantization accept only Float32
+    # input, so the other dtype passes skip them.
+    add("half[256k]", "misc",
+        lambda a: a.half(), (_spec("normal", (1 << 18,), 1255),))
+    add("long[256k]", "misc",
+        lambda a: a.long(), (_spec("normal", (1 << 18,), 1256),))
+    add("float[256k]", "misc",
+        lambda a: a.float(), (_spec("normal", (1 << 18,), 1257),))
+    add("fake-quantize[256k]", "misc",
+        lambda a: F.fake_quantize_per_tensor_affine(a, 0.1, 0, 0, 255),
+        (_spec("normal", (1 << 18,), 1257),))
+
+    def _float32_only(fn):
+        def wrapped(a, *args):
+            if a.dtype != tp.float32:
+                raise NotImplementedError("quantization requires Float32 input")
+            return fn(a, *args)
+        return wrapped
+
+    add("quantize-per-tensor[256k]", "misc",
+        _float32_only(lambda a: tp.quantize_per_tensor(a, 0.1, 0, tp.quint8)),
+        (_spec("normal", (1 << 18,), 1258),))
+    quant_channel_input = _spec("normal", (64, 1024), 1259)
+    add("quantize-per-channel[256k]", "misc",
+        _float32_only(lambda a: tp.quantize_per_channel(
+            a,
+            tp.tensor(np.full(64, 0.1, dtype=np.float32)),
+            tp.tensor(np.zeros(64, dtype=np.int64)),
+            0,
+            tp.qint8,
+        )),
+        (quant_channel_input,))
+
+    # Quantized observation, fake-quantization and quantized operator entry
+    # points.  The observers and fake quant run on every dtype; the
+    # quantized operators only accept Float32 storage, so the other passes
+    # skip them.
+    observer_input = _spec("normal", (8, 64, 28, 28), 1260)
+    add("minmax-observer[8x64x28x28]", "quantization",
+        lambda a: MinMaxObserver()(a), (observer_input,))
+    add("histogram-observer[8x64x28x28]", "quantization",
+        lambda a: HistogramObserver()(a), (observer_input,))
+    add("moving-average-minmax-observer[8x64x28x28]", "quantization",
+        lambda a: MovingAverageMinMaxObserver()(a), (observer_input,))
+    add("moving-average-per-channel-minmax-observer[8x64x28x28]", "quantization",
+        lambda a: MovingAveragePerChannelMinMaxObserver()(a), (observer_input,))
+    add("per-channel-minmax-observer[8x64x28x28]", "quantization",
+        lambda a: PerChannelMinMaxObserver()(a), (observer_input,))
+    add("quantized-linear[64x128]", "quantization",
+        _float32_only(lambda a: _qnn.Linear(128, 64)(
+            tp.quantize_per_tensor(a, 0.1, 0, tp.quint8))),
+        (_spec("normal", (64, 128), 1261),))
+    add("quantized-conv1d[8x16x128]", "quantization",
+        _float32_only(lambda a: _qnn.Conv1d(16, 32, 3)(
+            tp.quantize_per_tensor(a, 0.1, 0, tp.quint8))),
+        (_spec("normal", (8, 16, 128), 1262),))
+    add("quantized-conv2d[8x16x28x28]", "quantization",
+        _float32_only(lambda a: _qnn.Conv2d(16, 32, 3)(
+            tp.quantize_per_tensor(a, 0.1, 0, tp.quint8))),
+        (_spec("normal", (8, 16, 28, 28), 1263),))
+    add("quantized-max-pool2d[8x16x28x28]", "quantization",
+        _float32_only(lambda a: _qnn.MaxPool2d(2)(
+            tp.quantize_per_tensor(a, 0.1, 0, tp.qint8))),
+        (_spec("normal", (8, 16, 28, 28), 1264),))
+    add("quantized-batchnorm2d[8x16x28x28]", "quantization",
+        _float32_only(lambda a: _qnn.BatchNorm2d(16)(
+            tp.quantize_per_tensor(a, 0.1, 0, tp.qint8))),
+        (_spec("normal", (8, 16, 28, 28), 1268),))
+    quant_dynamic_weight = _spec("normal", (64, 128), 1270)
+    add("quantized-linear-dynamic[64x128]", "quantization",
+        _float32_only(lambda a, w: F.quantized_linear_dynamic(
+            a,
+            tp.quantize_per_tensor(w, 0.1, 0, tp.qint8),
+            tp.tensor(np.full(64, 0.1, dtype=np.float32)),
+            tp.tensor(np.zeros(64, dtype=np.int64)))),
+        (_spec("normal", (64, 128), 1269), quant_dynamic_weight))
+    add("quantized-relu[256k]", "quantization",
+        _float32_only(lambda a: F.quantized_relu(
+            tp.quantize_per_tensor(a, 0.1, 0, tp.qint8))),
+        (_spec("normal", (1 << 18,), 1271),))
+    quant_cat_input = _spec("normal", (32, 128), 1272)
+    add("quantized-cat[2x32x128]", "quantization",
+        _float32_only(lambda a: F.quantized_cat(
+            [tp.quantize_per_tensor(a, 0.1, 0, tp.qint8),
+             tp.quantize_per_tensor(a, 0.1, 0, tp.qint8)],
+            0, 0.1, 0)),
+        (quant_cat_input,))
+    add("dequantize-per-tensor[256k]", "quantization",
+        _float32_only(lambda a: F.dequantize(
+            tp.quantize_per_tensor(a, 0.1, 0, tp.qint8))),
+        (_spec("normal", (1 << 18,), 1273),))
+    add("dequantize-per-channel[256k]", "quantization",
+        _float32_only(lambda a: F.dequantize(
+            tp.quantize_per_channel(
+                a,
+                tp.tensor(np.full(64, 0.1, dtype=np.float32)),
+                tp.tensor(np.zeros(64, dtype=np.int64)),
+                0,
+                tp.qint8,
+            ))),
+        (_spec("normal", (64, 1024), 1274),))
+    add("quantize-per-tensor-dynamic[256k]", "quantization",
+        _float32_only(lambda a: F.quantize_per_tensor_dynamic(
+            a, tp.qint8, False)),
+        (_spec("normal", (1 << 18,), 1275),))
+    add("quantized-layer-norm[8x1024]", "quantization",
+        _float32_only(lambda a: F.quantized_layer_norm(
+            tp.quantize_per_tensor(a, 0.1, 0, tp.qint8),
+            1024,
+            tp.tensor(np.ones(1024, dtype=np.float32)),
+            tp.tensor(np.zeros(1024, dtype=np.float32)),
+            1e-5, 0.1, 0)),
+        (_spec("normal", (8, 1024), 1276),))
+    add("quantized-group-norm[2x8x8x8]", "quantization",
+        _float32_only(lambda a: F.quantized_group_norm(
+            tp.quantize_per_tensor(a, 0.1, 0, tp.qint8),
+            2,
+            tp.tensor(np.ones(8, dtype=np.float32)),
+            tp.tensor(np.zeros(8, dtype=np.float32)),
+            1e-5, 0.1, 0)),
+        (_spec("normal", (2, 8, 8, 8), 1277),))
+    add("quantized-instance-norm[2x8x16x16]", "quantization",
+        _float32_only(lambda a: F.quantized_instance_norm(
+            tp.quantize_per_tensor(a, 0.1, 0, tp.qint8),
+            tp.tensor(np.ones(8, dtype=np.float32)),
+            tp.tensor(np.zeros(8, dtype=np.float32)),
+            1e-5, 0.1, 0)),
+        (_spec("normal", (2, 8, 16, 16), 1278),))
+    add("quantized-batchnorm1d[8x16x128]", "quantization",
+        _float32_only(lambda a: F.quantized_batch_norm(
+            tp.quantize_per_tensor(a, 0.1, 0, tp.qint8),
+            tp.tensor(np.ones(16, dtype=np.float32)),
+            tp.tensor(np.zeros(16, dtype=np.float32)),
+            tp.tensor(np.zeros(16, dtype=np.float32)),
+            tp.tensor(np.ones(16, dtype=np.float32)),
+            1e-5, 0.1, 0)),
+        (_spec("normal", (8, 16, 128), 1279),))
+    add("quantized-sigmoid[256k]", "quantization",
+        _float32_only(lambda a: F.quantized_sigmoid(
+            tp.quantize_per_tensor(a, 0.1, 0, tp.qint8), 0.1, 0)),
+        (_spec("normal", (1 << 18,), 1280),))
+    add("quantized-tanh[256k]", "quantization",
+        _float32_only(lambda a: F.quantized_tanh(
+            tp.quantize_per_tensor(a, 0.1, 0, tp.qint8), 0.1, 0)),
+        (_spec("normal", (1 << 18,), 1281),))
+    add("quantized-elu[256k]", "quantization",
+        _float32_only(lambda a: F.quantized_elu(
+            tp.quantize_per_tensor(a, 0.1, 0, tp.qint8), 0.1, 0, 1.0)),
+        (_spec("normal", (1 << 18,), 1282),))
+    add("quantized-leaky-relu[256k]", "quantization",
+        _float32_only(lambda a: F.quantized_leaky_relu(
+            tp.quantize_per_tensor(a, 0.1, 0, tp.qint8), 0.1, 0.1, 0)),
+        (_spec("normal", (1 << 18,), 1283),))
+    add("quantized-clamp[256k]", "quantization",
+        _float32_only(lambda a: F.quantized_clamp(
+            tp.quantize_per_tensor(a, 0.1, 0, tp.qint8),
+            0.1, 0, 0.1, 0, 0, 255)),
+        (_spec("normal", (1 << 18,), 1284),))
+    add("quantized-max-pool1d[8x16x128]", "quantization",
+        _float32_only(lambda a: F.quantized_max_pool1d(
+            tp.quantize_per_tensor(a, 0.1, 0, tp.qint8), 2, 2, 0, 1, False)),
+        (_spec("normal", (8, 16, 128), 1285),))
+    add("quantized-max-pool3d[2x8x8x8x8]", "quantization",
+        _float32_only(lambda a: F.quantized_max_pool3d(
+            tp.quantize_per_tensor(a, 0.1, 0, tp.qint8), 2, 2, 0, 1, False)),
+        (_spec("normal", (2, 8, 8, 8, 8), 1286),))
+    add("histogram-observer-calculate-qparams[8x64x28x28]", "quantization",
+        lambda a: _histogram_calculate_qparams(a), (observer_input,))
 
     return cases
 
