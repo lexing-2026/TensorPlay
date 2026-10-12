@@ -46,6 +46,9 @@ def run(device,repetitions):
     def record(name,shape,native,reference,kind='integer',tolerance=1):
         a,b=native(),reference()
         synchronize()
+        if a.is_quantized() and b.is_quantized:
+            if a.q_scale()!=b.q_scale() or a.q_zero_point()!=b.q_zero_point():
+                raise AssertionError(f'{name} output affine grids differ')
         ac=a.int_repr().cpu().numpy() if a.is_quantized() else a.cpu().numpy()
         bc=b.int_repr().cpu().numpy() if b.is_quantized else b.cpu().numpy()
         error=float(np.max(np.abs(ac.astype('float64')-bc.astype('float64')),initial=0))
@@ -59,7 +62,7 @@ def run(device,repetitions):
         x,r=code_pair(rng.integers(0,256,size=size,dtype='uint8'),.07,119,device)
         if device=='cpu':
             operations=[('relu',lambda:tp._C.quantized_relu(x),lambda:torch.relu(r)),
-                ('tanh',lambda:tp._C.quantized_tanh(x,1/256,128),lambda:torch.tanh(r)),
+                ('tanh',lambda:tp._C.quantized_tanh(x,2/256,128),lambda:torch.tanh(r)),
                 ('hardswish',lambda:tp._C.quantized_hardswish(x,.07,119),lambda:torch.ops.quantized.hardswish(r,.07,119)),
                 ('add_scalar',lambda:tp._C.quantized_scalar(x,.21,0),lambda:torch.ops.quantized.add_scalar(r,.21))]
             for name,a,b in operations:
