@@ -42,6 +42,14 @@ struct alignas(1) quint2x4 {
   explicit quint2x4(uint8_t val) : val_(val) {}
 };
 
+// Two unsigned four-bit codes share one storage byte, low code first.
+struct alignas(1) quint4x2 {
+  using underlying = uint8_t;
+  uint8_t val_;
+  quint4x2() = default;
+  explicit quint4x2(uint8_t val) : val_(val) {}
+};
+
 // Quantize one float value for an affine grid of the underlying type's
 // full range; the caller passes the already-reciprocal multiplier.
 template <typename T>

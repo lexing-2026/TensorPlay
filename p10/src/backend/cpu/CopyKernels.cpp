@@ -352,6 +352,19 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
         return self;
     }
 
+    if (subByteElementPerByte(self.dtype())>1 || subByteElementPerByte(src.dtype())>1) {
+        const auto strides=SizesAndStrides::compute_contiguous_strides(static_cast<std::vector<int64_t>>(self.shape()));
+        TP_CHECK(self.dtype()==src.dtype() && src_in.shape()==self.shape()
+            && static_cast<std::vector<int64_t>>(self.strides())==strides
+            && static_cast<std::vector<int64_t>>(src.strides())==strides,
+            "Packed quantized copy requires matching dtype, shape and contiguous layout");
+        if (src.device().is_cpu()) {
+            const int64_t pack=subByteElementPerByte(self.dtype());
+            std::memcpy(self.data_ptr(),src.data_ptr(),static_cast<size_t>((self.numel()+pack-1)/pack));
+            return self;
+        }
+    }
+
     if (src.device().is_cuda()) {
 #ifdef USE_CUDA
         cuda::CUDAGuard device_guard(src.device());
@@ -370,7 +383,8 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
             src_ready.copy_(src);
         }
 
-        const size_t nbytes = self.numel() * self.itemsize();
+        const int64_t pack=subByteElementPerByte(self.dtype());
+        const size_t nbytes = ((self.numel()+pack-1)/pack) * self.itemsize();
         const auto self_rm_strides = SizesAndStrides::compute_contiguous_strides(
             static_cast<std::vector<int64_t>>(self.shape()));
         if (static_cast<std::vector<int64_t>>(self.strides()) == self_rm_strides) {

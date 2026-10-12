@@ -81,20 +81,26 @@ Tensor rowwise_pack(const Tensor& weight, int64_t bits, bool optimized, int64_t 
 
 Tensor embedding_weight_pack(const Tensor& weight) {
     Guard guard(weight);
-    TP_CHECK(weight.dim() == 2 && weight.dtype() == DType::QUInt8 && weight.impl()->quantizer()
+    TP_CHECK(weight.dim() == 2 && (weight.dtype() == DType::QUInt8 || weight.dtype() == DType::QUInt4x2) && weight.impl()->quantizer()
         && weight.impl()->quantizer()->qscheme() == kPerChannelAffineFloatQParams
         && quantized::q_per_channel_axis(weight) == 0, "Embedding weights require unsigned row codes with floating affine parameters on axis zero");
     Tensor x = weight.contiguous();
     Tensor scales = quantized::q_per_channel_scales(weight).to(DType::Float32).contiguous();
     Tensor zps = quantized::q_per_channel_zero_points(weight).to(DType::Float32).contiguous();
-    const int64_t columns = weight.size(1), width = columns + 8;
+    const int bits=weight.dtype()==DType::QUInt4x2 ? 4 : 8;
+    const int64_t columns = (weight.size(1)+(8/bits)-1)/(8/bits), width = columns + (bits==8 ? 8 : 4);
     Tensor y = Tensor::empty({weight.size(0), width}, DType::UInt8, weight.device());
     const uint8_t* src = x.data_ptr<uint8_t>(); uint8_t* dst = y.data_ptr<uint8_t>();
     const float *ss = scales.data_ptr<float>(), *zz = zps.data_ptr<float>();
     apply(weight.size(0), [=] TP_QN_DEVICE (int64_t row) {
         for (int64_t j = 0; j < columns; ++j) dst[row * width + j] = src[row * columns + j];
-        put_float(dst + row * width + columns, ss[row]);
-        put_float(dst + row * width + columns + 4, -zz[row] * ss[row]);
+        if (bits==8) {
+            put_float(dst + row * width + columns, ss[row]);
+            put_float(dst + row * width + columns + 4, -zz[row] * ss[row]);
+        } else {
+            put_half(dst + row * width + columns, ss[row]);
+            put_half(dst + row * width + columns + 2, -zz[row] * ss[row]);
+        }
     });
     return y;
 }

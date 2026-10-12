@@ -29,6 +29,7 @@ const char* dtype_name(DType dtype) {
         case DType::QUInt8: return "quint8";
         case DType::QInt32: return "qint32";
         case DType::QUInt2x4: return "quint2x4";
+        case DType::QUInt4x2: return "quint4x2";
         case DType::Bool: return "bool";
         default: return "undefined";
     }
@@ -96,6 +97,7 @@ void init_dtype(py::module_& m) {
         .value("quint8", DType::QUInt8)
         .value("qint32", DType::QInt32)
         .value("quint2x4", DType::QUInt2x4)
+        .value("quint4x2", DType::QUInt4x2)
         .value("bool", DType::Bool)
         .value("undefined", DType::Undefined)
         .def("__str__", [](DType d) { return dtype_repr(d); })
@@ -171,6 +173,7 @@ void init_dtype(py::module_& m) {
     m.attr("quint8") = DType::QUInt8;
     m.attr("qint32") = DType::QInt32;
     m.attr("quint2x4") = DType::QUInt2x4;
+    m.attr("quint4x2") = DType::QUInt4x2;
     m.attr("bool") = DType::Bool;
     m.attr("undefined") = DType::Undefined;
 
@@ -198,7 +201,7 @@ void init_dtype(py::module_& m) {
             DType::Float8_e5m2,    DType::Float8_e5m2fnuz,
             DType::Float8_e8m0fnu,
             DType::QInt8,     DType::QUInt8,   DType::QInt32,   DType::Bool,
-            DType::QUInt2x4,
+            DType::QUInt2x4, DType::QUInt4x2,
         };
         py::list out;
         for (DType d : kAll) {

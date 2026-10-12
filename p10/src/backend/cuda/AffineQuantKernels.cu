@@ -18,6 +18,67 @@ namespace cuda {
 
 namespace {
 
+template<int Bits,bool Quantize,bool Channel>
+__global__ void subbyte_affine_kernel(const float* real,const uint8_t* packed,float* output,uint8_t* codes,
+        int64_t size,float scale,float zp,const float* scales,const float* zeros,int64_t stride,int64_t channels) {
+    constexpr int pack=8/Bits,mask=(1<<Bits)-1;
+    const int64_t bytes=(size+pack-1)/pack;
+    for (int64_t byte=static_cast<int64_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+            byte<bytes;byte+=static_cast<int64_t>(gridDim.x)*blockDim.x) {
+        uint8_t value=0;
+        for (int lane=0;lane<pack && byte*pack+lane<size;++lane) {
+            const int64_t i=byte*pack+lane;
+            float s=scale,z=zp;
+            if constexpr (Channel) { const int64_t c=(i/stride)%channels; s=scales[c]; z=zeros[c]; }
+            if constexpr (Quantize) {
+                const float inverse=s==0.f ? 1.f : 1.f/s;
+                const float position=__fmul_rn(real[i],inverse);
+                const float q=Channel ? nearbyintf(__fadd_rn(position,z)) : __fadd_rn(nearbyintf(position),z);
+                uint8_t code=0;
+                if constexpr (Channel) {
+                    const int64_t wide=q>=-0x1p63f && q<0x1p63f ? static_cast<int64_t>(q) : INT64_MIN;
+                    const int32_t narrow=static_cast<int32_t>(static_cast<uint32_t>(wide));
+                    code=static_cast<uint8_t>(narrow<0 ? 0 : (narrow>mask ? mask : narrow));
+                } else if (q>=-0x1p63f && q<0x1p63f) code=static_cast<uint8_t>(fminf(mask,fmaxf(0.f,q)));
+                value|=code<<(lane*Bits);
+            } else output[i]=__fmul_rn(__fadd_rn(static_cast<float>((packed[byte]>>(lane*Bits))&mask),-z),s);
+        }
+        if constexpr (Quantize) codes[byte]=value;
+    }
+}
+
+template<bool Quantize,bool Channel>
+Tensor subbyte_affine_cuda(const Tensor& self,DType dtype,double scale,int64_t zp,
+        const Tensor& scales=Tensor(),const Tensor& zeros=Tensor(),int64_t axis=0) {
+    const Tensor input=self.contiguous();
+    Tensor out=Tensor::empty(self.shape(),Quantize ? dtype : DType::Float32,self.device());
+    Tensor sc,z;
+    int64_t stride=1,channels=0;
+    if constexpr (Channel) {
+        sc=scales.to(DType::Float32).contiguous(); z=zeros.to(DType::Float32).contiguous();
+        channels=sc.numel();
+        for (int64_t d=axis+1;d<self.dim();++d) stride*=self.size(d);
+    }
+    if (self.numel()) {
+        const int bits=dtype==DType::QUInt4x2 ? 4 : 2,pack=8/bits;
+        const int blocks=static_cast<int>(std::min<int64_t>(((self.numel()+pack-1)/pack+255)/256,65535));
+        auto launch=[&]<int Bits>() {
+            subbyte_affine_kernel<Bits,Quantize,Channel><<<blocks,256,0,getCurrentCUDAStream().stream()>>>(
+                Quantize ? input.data_ptr<float>() : nullptr,Quantize ? nullptr : static_cast<const uint8_t*>(input.data_ptr()),
+                Quantize ? nullptr : out.data_ptr<float>(),Quantize ? static_cast<uint8_t*>(out.data_ptr()) : nullptr,
+                self.numel(),static_cast<float>(scale),static_cast<float>(zp),Channel ? sc.data_ptr<float>() : nullptr,
+                Channel ? z.data_ptr<float>() : nullptr,stride,channels);
+        };
+        if (bits==4) launch.template operator()<4>(); else launch.template operator()<2>();
+        checkCuda(cudaGetLastError(),"Sub-byte affine kernel");
+    }
+    if constexpr (Quantize) {
+        if constexpr (Channel) out.impl()->set_quantizer(make_per_channel_affine_quantizer(sc,z,axis,dtype));
+        else out.impl()->set_quantizer(make_per_tensor_affine_quantizer(scale,zp,dtype));
+    }
+    return out;
+}
+
 __global__ void quantize_per_tensor_kernel(
     int64_t numel,
     const float* input,
@@ -168,7 +229,8 @@ QuantInputs prepare_quantize(const Tensor& self, int64_t axis = 0) {
 Tensor empty_quantized_codes(const std::vector<int64_t>& size, DType dtype,
                              const Device& device,
                              std::optional<int64_t> memory_format) {
-    Tensor codes(size, underlying_storage_type(dtype), device);
+    Tensor allocation(size,dtype,device);
+    Tensor codes(allocation.impl()->storage(),size,allocation.strides(),underlying_storage_type(dtype),0);
     const MemoryFormat format = static_cast<MemoryFormat>(
         memory_format.value_or(static_cast<int64_t>(MemoryFormat::Contiguous)));
     if (format == MemoryFormat::ChannelsLast ||
@@ -473,6 +535,12 @@ Tensor quantize_per_channel_dtype_cuda(const Tensor& self,
                  toString(self.dtype()));
     }
     switch (dtype) {
+        case DType::QUInt2x4:
+        case DType::QUInt4x2:
+            check_per_channel_inputs_cuda(self,scales,zero_points,axis,"quantize()");
+            TP_CHECK(isFloatingType(zero_points.dtype()),"Sub-byte per-channel quantization requires floating zero points");
+            make_per_channel_affine_quantizer(scales,zero_points,axis,dtype);
+            return subbyte_affine_cuda<true,true>(self,dtype,0.,0,scales,zero_points,axis);
         case DType::QInt8:
             return quantize_per_channel_cuda_impl<int8_t>(
                 self, scales, zero_points, axis, dtype);
@@ -493,6 +561,11 @@ Tensor dequantize_per_channel_dtype_cuda(const Tensor& self,
                                          const Tensor& zero_points,
                                          int64_t axis, DType dtype) {
     switch (dtype) {
+        case DType::QUInt2x4:
+        case DType::QUInt4x2:
+            check_per_channel_inputs_cuda(self,scales,zero_points,axis,"dequantize()");
+            TP_CHECK(isFloatingType(zero_points.dtype()),"Sub-byte per-channel quantization requires floating zero points");
+            return subbyte_affine_cuda<false,true>(self,dtype,0.,0,scales,zero_points,axis);
         case DType::QInt8:
             return dequantize_per_channel_cuda_impl<int8_t>(
                 self, scales, zero_points, axis, dtype);
@@ -670,6 +743,10 @@ Tensor quantize_per_tensor_dtype_cuda(const Tensor& self, double scale,
                  toString(self.dtype()));
     }
     switch (dtype) {
+        case DType::QUInt2x4:
+        case DType::QUInt4x2:
+            make_per_tensor_affine_quantizer(scale,zero_point,dtype);
+            return subbyte_affine_cuda<true,false>(self,dtype,scale,zero_point);
         case DType::QInt8:
             return quantize_per_tensor_qint8_cuda(
                 self, scale, zero_point, -128, 127);
@@ -692,6 +769,9 @@ Tensor quantize_per_tensor_cuda(const Tensor& self, double scale,
 Tensor dequantize_per_tensor_dtype_cuda(const Tensor& self, double scale,
                                         int64_t zero_point, DType dtype) {
     switch (dtype) {
+        case DType::QUInt2x4:
+        case DType::QUInt4x2:
+            return subbyte_affine_cuda<false,false>(self,dtype,scale,zero_point);
         case DType::QInt8:
             return dequantize_per_tensor_qint8_cuda(self, scale, zero_point);
         case DType::QUInt8:

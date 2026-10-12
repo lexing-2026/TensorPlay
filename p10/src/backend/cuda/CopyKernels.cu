@@ -474,9 +474,18 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
     bool src_cuda = src_dev.is_cuda();
     auto stream = getCurrentCUDAStream(static_cast<int>(dst_dev.index()));
 
+    if (subByteElementPerByte(self.dtype())>1 || subByteElementPerByte(src.dtype())>1) {
+        const auto strides=SizesAndStrides::compute_contiguous_strides(static_cast<std::vector<int64_t>>(self.shape()));
+        TP_CHECK(self.dtype()==src.dtype() && src_in.shape()==self.shape()
+            && static_cast<std::vector<int64_t>>(self.strides())==strides
+            && static_cast<std::vector<int64_t>>(src.strides())==strides,
+            "Packed quantized copy requires matching dtype, shape and contiguous layout");
+    }
+
     // Optimize: Contiguous copy (both src and dst must be contiguous AND same dtype)
     if (self.dtype() == src.dtype() && self.is_contiguous() && src.is_contiguous()) {
-        size_t nbytes = self.numel() * self.itemsize();
+        const int64_t pack=subByteElementPerByte(self.dtype());
+        size_t nbytes = ((self.numel()+pack-1)/pack) * self.itemsize();
         if (src_cuda && src_dev.index() != dst_dev.index()) {
             // Establish both directions of the lifetime/order relationship:
             // destination work waits for prior source work, and the source

@@ -6,6 +6,10 @@
 #include <cstdint>
 
 namespace tensorplay::cpu {
+using quantized_subbyte_pack_fn = void (*)(const float*,uint8_t*,int64_t,float,float,int);
+using quantized_subbyte_unpack_fn = void (*)(const uint8_t*,float*,int64_t,float,float,int);
+DECLARE_DISPATCH(quantized_subbyte_pack_fn, quantized_subbyte_pack_stub)
+DECLARE_DISPATCH(quantized_subbyte_unpack_fn, quantized_subbyte_unpack_stub)
 using quantized_dynamic_dot_fn = int64_t (*)(const uint8_t*,const int8_t*,int64_t);
 DECLARE_DISPATCH(quantized_dynamic_dot_fn, quantized_dynamic_dot_stub)
 using quantized_dynamic_block_fn = void (*)(const uint8_t*,const int8_t*,int64_t*,

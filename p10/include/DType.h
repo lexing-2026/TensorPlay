@@ -136,6 +136,7 @@ enum class ScalarType : int8_t {
     Float8_e4m3fnuz,
     Float8_e5m2fnuz,
     Float8_e8m0fnu,
+    QUInt4x2,
     NumOptions,
 
     Byte = UInt8,
@@ -152,7 +153,8 @@ using DType = ScalarType;
 
 inline bool isQuantizedType(ScalarType type) {
     return type == ScalarType::QInt8 || type == ScalarType::QUInt8 ||
-           type == ScalarType::QInt32 || type == ScalarType::QUInt2x4;
+           type == ScalarType::QInt32 || type == ScalarType::QUInt2x4 ||
+           type == ScalarType::QUInt4x2;
 }
 
 inline bool isQIntType(ScalarType type) {
@@ -205,6 +207,7 @@ inline bool isUnsignedType(ScalarType type) {
     return type == ScalarType::UInt8 || type == ScalarType::UInt16 ||
            type == ScalarType::UInt32 || type == ScalarType::UInt64 ||
            type == ScalarType::QUInt8 || type == ScalarType::QUInt2x4 ||
+           type == ScalarType::QUInt4x2 ||
            type == ScalarType::Float8_e8m0fnu;
 }
 
@@ -246,6 +249,7 @@ inline bool isSignedType(ScalarType type) {
         case ScalarType::QUInt8:
         case ScalarType::QInt32:
         case ScalarType::QUInt2x4:
+        case ScalarType::QUInt4x2:
             break;
         case ScalarType::Undefined:
         case ScalarType::NumOptions:
@@ -264,6 +268,7 @@ inline ScalarType toUnderlyingStorageType(ScalarType type) {
         case ScalarType::QInt32:
             return ScalarType::Int32;
         case ScalarType::QUInt2x4:
+        case ScalarType::QUInt4x2:
             return ScalarType::UInt8;
         default:
             return type;
@@ -375,7 +380,8 @@ inline constexpr bool is_complex_type_v =
     _(int8_t, QInt8)                   \
     _(uint8_t, QUInt8)                 \
     _(int32_t, QInt32)                 \
-    _(uint8_t, QUInt2x4)
+    _(uint8_t, QUInt2x4)               \
+    _(uint8_t, QUInt4x2)
 
 #define TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_QINTS(_) \
     TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_FP8(_)       \
@@ -419,6 +425,8 @@ inline int64_t subByteElementPerByte(ScalarType type) {
     switch (type) {
         case ScalarType::QUInt2x4:
             return 4;
+        case ScalarType::QUInt4x2:
+            return 2;
         default:
             return 1;
     }

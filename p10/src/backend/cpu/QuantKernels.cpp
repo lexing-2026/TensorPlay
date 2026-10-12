@@ -1,6 +1,7 @@
 #include "QuantNative.h"
 #include "QuantKernels.h"
 #include "QuantElementwise.h"
+#include "cpu/QuantizedElementwiseKernels.h"
 #include "QIntTypes.h"
 #include "Convolution.h"
 #include "Exception.h"
@@ -12,6 +13,7 @@
 #include "Utils.h"
 
 #include <cmath>
+#include <cfenv>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -144,6 +146,8 @@ std::pair<int64_t, int64_t> quantized_bounds(DType dtype) {
                     std::numeric_limits<int32_t>::max()};
         case DType::QUInt2x4:
             return {0, 3};
+        case DType::QUInt4x2:
+            return {0, 15};
         default:
             TP_THROW(TypeError,
                      "per-channel quantization requires a quantized dtype");
@@ -427,153 +431,80 @@ Tensor dequantize_per_tensor_qint8_cpu(const Tensor& self, double scale,
     return out;
 }
 
-// 2-bit affine quantization packs four 2-bit codes into one storage byte.
-// The loop body below follows the sub-byte packing layout: index 0 sits in the
-// lowest 2 bits, index 1 in the next 2 bits, and so on, so four consecutive
-// elements fill one byte and a trailing partial byte per row is still
-// allocated.
-//
-// AVX2 paths process 8 elements per iteration: the affine grid position is
-// computed with _MM_FROUND_CUR_DIRECTION, which follows the MXCSR rounding
-// mode exactly like std::nearbyint, so the packed bytes are bit-identical to
-// the scalar loop.
-#if defined(__x86_64__)
-namespace {
-
-__attribute__((target("avx2")))
-void quantize_quint2x4_avx2(const float* rdata, uint8_t* qdata, int64_t numel,
-                            float inv_scale, float zero_point) {
-    const __m256 v_inv = _mm256_set1_ps(inv_scale);
-    const __m256 v_zp = _mm256_set1_ps(zero_point);
-    const __m256i v_zero = _mm256_setzero_si256();
-    const __m256i v_three = _mm256_set1_epi32(3);
-    int64_t i = 0;
-    int64_t byte = 0;
-    for (; i + 8 <= numel; i += 8, byte += 2) {
-        const __m256 x = _mm256_loadu_ps(rdata + i);
-        const __m256 r = _mm256_round_ps(
-            _mm256_add_ps(_mm256_mul_ps(x, v_inv), v_zp),
-            _MM_FROUND_CUR_DIRECTION);
-        __m256i qi = _mm256_cvtps_epi32(r);
-        qi = _mm256_max_epi32(v_zero, _mm256_min_epi32(qi, v_three));
-        alignas(32) int32_t qbuf[8];
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(qbuf), qi);
-        qdata[byte] = static_cast<uint8_t>(
-            qbuf[0] | (qbuf[1] << 2) | (qbuf[2] << 4) | (qbuf[3] << 6));
-        qdata[byte + 1] = static_cast<uint8_t>(
-            qbuf[4] | (qbuf[5] << 2) | (qbuf[6] << 4) | (qbuf[7] << 6));
-    }
-    for (; i < numel; ++i) {
-        const int64_t qv =
-            lrintf(std::nearbyint(rdata[i] * inv_scale) + zero_point);
-        const int q = qv < 0 ? 0 : (qv > 3 ? 3 : static_cast<int>(qv));
-        if ((i & 3) == 0) {
-            qdata[i >> 2] = static_cast<uint8_t>(q);
-        } else {
-            qdata[i >> 2] |= static_cast<uint8_t>(q << ((i & 3) * 2));
-        }
-    }
-}
-
-__attribute__((target("avx2")))
-void dequantize_quint2x4_avx2(const uint8_t* qdata, float* rdata, int64_t numel,
-                              float scale, float zero_point) {
-    const __m256 v_scale = _mm256_set1_ps(scale);
-    const __m256 v_zp = _mm256_set1_ps(zero_point);
-    int64_t i = 0;
-    int64_t byte = 0;
-    for (; i + 8 <= numel; i += 8, byte += 2) {
-        const uint8_t b0 = qdata[byte];
-        const uint8_t b1 = qdata[byte + 1];
-        alignas(32) int32_t qbuf[8] = {
-            b0 & 3, (b0 >> 2) & 3, (b0 >> 4) & 3, (b0 >> 6) & 3,
-            b1 & 3, (b1 >> 2) & 3, (b1 >> 4) & 3, (b1 >> 6) & 3,
-        };
-        const __m256i qi =
-            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qbuf));
-        const __m256 f = _mm256_mul_ps(
-            _mm256_sub_ps(_mm256_cvtepi32_ps(qi), v_zp), v_scale);
-        _mm256_storeu_ps(rdata + i, f);
-    }
-    for (; i < numel; ++i) {
-        const uint8_t qv = qdata[i >> 2];
-        const int c = (qv >> ((i & 3) * 2)) & 3;
-        rdata[i] = (static_cast<float>(c) - zero_point) * scale;
-    }
-}
-
-} // namespace
-#endif // __x86_64__
-
-Tensor quantize_per_tensor_quint2x4_cpu(const Tensor& self, double scale,
-                                        int64_t zero_point, int64_t quant_min,
-                                        int64_t quant_max) {
-    check_qparams(scale, zero_point, quant_min, quant_max);
-    check_storage_range(quant_min, quant_max, 0, 255);
-    Tensor input = promote_to_compute_dtype(self);
-    Tensor out = Tensor::empty(self.shape(), DType::QUInt2x4, self.device());
-    const float* const rdata = input.const_data_ptr<float>();
-    auto qdata = reinterpret_cast<uint8_t*>(out.data_ptr<quint2x4>());
-    const int64_t numel = input.numel();
-    const float scale_f = static_cast<float>(scale);
-    const float zero_point_f = static_cast<float>(zero_point);
-    const float inv_scale = scale_f == 0 ? 1.0f : 1.0f / scale_f;
-#if defined(__x86_64__)
-    if (numel >= 32 && __builtin_cpu_supports("avx2")) {
-        quantize_quint2x4_avx2(rdata, qdata, numel, inv_scale, zero_point_f);
-    } else
-#endif
-    {
-        for (int64_t i = 0; i < numel; ++i) {
-            int64_t qvalue =
-                lrintf(std::nearbyint(rdata[i] * inv_scale) + zero_point_f);
-            qvalue = std::max(quant_min, std::min(qvalue, quant_max));
-
-            // We pack sub-byte values and align them to a byte.
-            // Eg. for 2-bit values, index 0 is packed in the lower 2 bits,
-            // index 1 in the next 2 bits, index 2 in the next 2 bits, and
-            // index 3 in the upper 2 bits.
-            if ((i & 3) == 0) {
-                qdata[i >> 2] = static_cast<uint8_t>(qvalue);
-            } else {
-                qdata[i >> 2] |=
-                    static_cast<uint8_t>(qvalue << ((i & 3) * 2));
-            }
-        }
-    }
-    out.impl()->set_quantizer(
-        make_per_tensor_affine_quantizer(scale, zero_point, DType::QUInt2x4));
+// Logical elements fill a continuous bit stream, least significant code first.
+Tensor quantize_per_tensor_subbyte_cpu(const Tensor& self,double scale,int64_t zero_point,DType dtype) {
+    auto grid=make_per_tensor_affine_quantizer(scale,zero_point,dtype);
+    const Tensor input=promote_to_compute_dtype(self);
+    Tensor out=Tensor::empty(self.shape(),dtype,self.device());
+    const int bits=dtype==DType::QUInt4x2 ? 4 : 2,pack=8/bits;
+    const int64_t bytes=(input.numel()+pack-1)/pack;
+    const auto* src=input.const_data_ptr<float>();
+    auto* dst=static_cast<uint8_t*>(out.data_ptr());
+    const float scale_f=static_cast<float>(scale);
+    const float inverse=scale_f==0.f ? 1.f : 1.f/scale_f;
+    auto pack_range=[&](int64_t begin,int64_t end) {
+        quantized_subbyte_pack_stub(DeviceType::CPU,src+begin*pack,dst+begin,
+            std::min(input.numel(),end*pack)-begin*pack,inverse,static_cast<float>(zero_point),bits);
+    };
+    if (std::fegetround()==FE_TONEAREST) parallel::parallel_for(0,bytes,8192,pack_range);
+    else pack_range(0,bytes);
+    out.impl()->set_quantizer(std::move(grid));
     return out;
 }
 
-Tensor dequantize_per_tensor_quint2x4_cpu(const Tensor& self, double scale,
-                                          int64_t zero_point) {
-    if (self.dtype() != DType::QUInt2x4) {
-        TP_THROW(TypeError, "dequantize(): expected a QUInt2x4 tensor");
-    }
-    make_per_tensor_affine_quantizer(scale, zero_point, DType::QUInt2x4);
-    const Tensor input = self.is_contiguous() ? self : self.contiguous();
-    Tensor out = Tensor::empty(self.shape(), DType::Float32, self.device());
-    float* rdata = out.data_ptr<float>();
-    const uint8_t* qdata =
-        reinterpret_cast<const uint8_t*>(input.const_data_ptr<quint2x4>());
-    const int64_t numel = input.numel();
-    const float scale_f = static_cast<float>(scale);
-    const float zero_point_f = static_cast<float>(zero_point);
-#if defined(__x86_64__)
-    if (numel >= 32 && __builtin_cpu_supports("avx2")) {
-        dequantize_quint2x4_avx2(
-            qdata, rdata, numel, scale_f, zero_point_f);
-    } else
-#endif
-    {
-        for (int64_t i = 0; i < numel; ++i) {
-            uint8_t qvalue = qdata[i >> 2];
-            qvalue >>= (i & 3) * 2;
-            qvalue &= 3;
-            rdata[i] = (static_cast<float>(qvalue) - zero_point_f) * scale_f;
+Tensor dequantize_per_tensor_subbyte_cpu(const Tensor& self,double scale,int64_t zero_point) {
+    const Tensor input=self.contiguous();
+    Tensor out=Tensor::empty(self.shape(),DType::Float32,self.device());
+    const int bits=self.dtype()==DType::QUInt4x2 ? 4 : 2,pack=8/bits;
+    const int64_t bytes=(input.numel()+pack-1)/pack;
+    const auto* src=static_cast<const uint8_t*>(input.const_data_ptr());
+    auto* dst=out.data_ptr<float>();
+    auto unpack_range=[&](int64_t begin,int64_t end) {
+        quantized_subbyte_unpack_stub(DeviceType::CPU,src+begin,dst+begin*pack,
+            std::min(input.numel(),end*pack)-begin*pack,static_cast<float>(scale),static_cast<float>(zero_point),bits);
+    };
+    if (std::fegetround()==FE_TONEAREST) parallel::parallel_for(0,bytes,8192,unpack_range);
+    else unpack_range(0,bytes);
+    return out;
+}
+
+Tensor per_channel_subbyte_cpu(const Tensor& self,const Tensor& scales,const Tensor& zero_points,
+        int64_t axis,DType dtype,bool quantize) {
+    check_per_channel_inputs(self,scales,zero_points,axis,quantize ? "quantize()" : "dequantize()");
+    TP_CHECK(isFloatingType(zero_points.dtype()),"Sub-byte per-channel quantization requires floating zero points");
+    auto grid=make_per_channel_affine_quantizer(scales,zero_points,axis,dtype);
+    const Tensor input=self.contiguous(),sc=scales.to(DType::Float32).contiguous(),zp=zero_points.to(DType::Float32).contiguous();
+    const auto* scale=sc.data_ptr<float>();
+    const auto* zero=zp.data_ptr<float>();
+    Tensor out=Tensor::empty(self.shape(),quantize ? dtype : DType::Float32,self.device());
+    const int bits=dtype==DType::QUInt4x2 ? 4 : 2,pack=8/bits,mask=(1<<bits)-1;
+    int64_t stride=1;
+    for (int64_t d=axis+1;d<self.dim();++d) stride*=self.size(d);
+    const int64_t channels=sc.numel(),bytes=(self.numel()+pack-1)/pack;
+    const auto* real=quantize ? input.data_ptr<float>() : nullptr;
+    const auto* codes=quantize ? nullptr : static_cast<const uint8_t*>(input.data_ptr());
+    auto* output=quantize ? nullptr : out.data_ptr<float>();
+    auto* packed=quantize ? static_cast<uint8_t*>(out.data_ptr()) : nullptr;
+    auto channel_range=[&](int64_t begin,int64_t end) {
+        for (int64_t byte=begin;byte<end;++byte) {
+            uint8_t value=0;
+            for (int lane=0;lane<pack && byte*pack+lane<self.numel();++lane) {
+                const int64_t i=byte*pack+lane,c=(i/stride)%channels;
+                if (quantize) {
+                    const float inverse=scale[c]==0.f ? 1.f : 1.f/scale[c];
+                    const float position=std::nearbyint(real[i]*inverse+zero[c]);
+                    const int64_t wide=position>=-0x1p63f && position<0x1p63f
+                        ? static_cast<int64_t>(position) : std::numeric_limits<int64_t>::min();
+                    const int32_t q=static_cast<int32_t>(static_cast<uint32_t>(wide));
+                    value|=static_cast<uint8_t>(std::clamp(q,0,mask))<<(lane*bits);
+                } else output[i]=(static_cast<float>((codes[byte]>>(lane*bits))&mask)-zero[c])*scale[c];
+            }
+            if (quantize) packed[byte]=value;
         }
-    }
+    };
+    if (std::fegetround()==FE_TONEAREST) parallel::parallel_for(0,bytes,8192,channel_range);
+    else channel_range(0,bytes);
+    if (quantize) out.impl()->set_quantizer(std::move(grid));
     return out;
 }
 
@@ -593,8 +524,8 @@ Tensor quantize_per_tensor_dtype_cpu(const Tensor& self, double scale,
         case DType::QInt32:
             return quantize_per_tensor_qint32_cpu(self, scale, zero_point);
         case DType::QUInt2x4:
-            return quantize_per_tensor_quint2x4_cpu(
-                self, scale, zero_point, 0, 3);
+        case DType::QUInt4x2:
+            return quantize_per_tensor_subbyte_cpu(self,scale,zero_point,dtype);
         default:
             TP_THROW(TypeError, "quantize(): unsupported quantized dtype ",
                      toString(dtype));
@@ -616,7 +547,8 @@ Tensor dequantize_per_tensor_dtype_cpu(const Tensor& self, double scale,
         case DType::QInt32:
             return dequantize_per_tensor_qint32_cpu(self, scale, zero_point);
         case DType::QUInt2x4:
-            return dequantize_per_tensor_quint2x4_cpu(self, scale, zero_point);
+        case DType::QUInt4x2:
+            return dequantize_per_tensor_subbyte_cpu(self,scale,zero_point);
         default:
             TP_THROW(TypeError, "dequantize(): unsupported quantized dtype ",
                      toString(dtype));
@@ -639,6 +571,9 @@ Tensor quantize_per_channel_dtype_cpu(const Tensor& self,
                  toString(self.dtype()));
     }
     switch (dtype) {
+        case DType::QUInt2x4:
+        case DType::QUInt4x2:
+            return per_channel_subbyte_cpu(self,scales,zero_points,axis,dtype,true);
         case DType::QInt8:
             return quantize_per_channel_cpu_impl<int8_t>(
                 self, scales, zero_points, axis, dtype);
@@ -659,6 +594,9 @@ Tensor dequantize_per_channel_dtype_cpu(const Tensor& self,
                                         const Tensor& zero_points, int64_t axis,
                                         DType dtype) {
     switch (dtype) {
+        case DType::QUInt2x4:
+        case DType::QUInt4x2:
+            return per_channel_subbyte_cpu(self,scales,zero_points,axis,dtype,false);
         case DType::QInt8:
             return dequantize_per_channel_cpu_impl<int8_t>(
                 self, scales, zero_points, axis, dtype);
@@ -2381,21 +2319,12 @@ int64_t q_per_channel_axis_cpu(const Tensor& self) {
 
 Tensor int_repr_cpu(const Tensor& self) {
     quantized::require_quantized(self, "int_repr");
-    // 2-bit codes are packed four per storage byte; the integer
-    // representation is the packed byte sequence itself, one element per
-    // storage byte, with the trailing partial byte preserved.
-    if (self.dtype() == DType::QUInt2x4) {
-        const Tensor input = self.is_contiguous() ? self : self.contiguous();
-        const int64_t bit_width = 2;
-        const int64_t out_size = (input.numel() * bit_width + 7) / 8;
-        Tensor dst = Tensor::empty({out_size}, DType::UInt8, input.device());
-        const uint8_t* qdata = reinterpret_cast<const uint8_t*>(
-            input.const_data_ptr<quint2x4>());
-        uint8_t* ddata = dst.data_ptr<uint8_t>();
-        for (int64_t i = 0; i < dst.numel(); ++i) {
-            ddata[i] = qdata[i];
-        }
-        return dst;
+    if (subByteElementPerByte(self.dtype())>1) {
+        const Tensor input=self.contiguous();
+        const int64_t pack=subByteElementPerByte(self.dtype());
+        const int64_t count=(input.numel()+pack-1)/pack;
+        Tensor bytes(input.impl()->storage(),{count},{1},DType::UInt8,input.storage_offset());
+        return bytes.clone();
     }
     return quantized::strip_quantizer(self).clone();
 }

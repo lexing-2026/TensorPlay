@@ -25,6 +25,8 @@ std::pair<int64_t, int64_t> quantized_range(DType dtype) {
                     std::numeric_limits<int32_t>::max()};
         case DType::QUInt2x4:
             return {0, 3};
+        case DType::QUInt4x2:
+            return {0, 15};
         default:
             TP_THROW(TypeError,
                      "quantized qparams require a quantized dtype");
@@ -349,6 +351,7 @@ ScalarType underlying_storage_type(DType dtype) {
         case DType::QInt32:
             return DType::Int32;
         case DType::QUInt2x4:
+        case DType::QUInt4x2:
             return DType::UInt8;
         default:
             TP_CHECK(isQuantizedType(dtype),

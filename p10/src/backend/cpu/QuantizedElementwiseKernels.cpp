@@ -4,6 +4,7 @@
 #include "QuantElementwise.h"
 #include "QuantRowwise.h"
 #include "Parallel.h"
+#include <cfenv>
 #ifndef CPU_CAPABILITY_AVX512
 #include "cpu/vec/vec256/vec256_qint.h"
 #endif
@@ -12,6 +13,60 @@ namespace tensorplay::cpu {
 inline namespace CPU_CAPABILITY {
 namespace {
 constexpr int int4_columns = vec::Vectorized<float>::size() * 4;
+
+template<int Bits>
+void subbyte_pack(const float* input,uint8_t* output,int64_t size,float inverse,float zp) {
+    using V=vec::Vectorized<float>;
+    constexpr int lanes=V::size(),pack=8/Bits,maximum=(1<<Bits)-1;
+    const V inv(inverse),zero_point(zp),lo(0.f),hi(static_cast<float>(maximum)),limit(0x1p63f);
+    int64_t i=0;
+    const int64_t vector_end=std::fegetround()==FE_TONEAREST ? size : 0;
+    for (;i+lanes<=vector_end;i+=lanes) {
+        alignas(64) float codes[lanes];
+        const V code=(V::loadu(input+i)*inv).round()+zero_point;
+        const V valid=(code>=limit.neg())&(code<limit);
+        V::blendv(lo,vec::minimum(hi,vec::maximum(lo,code)),valid).store(codes);
+        for (int c=0;c<lanes;c+=pack) {
+            uint8_t value=0;
+            for (int j=0;j<pack;++j) value|=static_cast<uint8_t>(codes[c+j])<<(j*Bits);
+            output[(i+c)/pack]=value;
+        }
+    }
+    for (;i<size;i+=pack) {
+        uint8_t value=0;
+        for (int c=0;c<pack && i+c<size;++c) {
+            const float position=std::nearbyint(input[i+c]*inverse)+zp;
+            const float code=position>=-0x1p63f && position<0x1p63f
+                ? std::clamp(position,0.f,static_cast<float>(maximum)) : 0.f;
+            value|=static_cast<uint8_t>(code)<<(c*Bits);
+        }
+        output[i/pack]=value;
+    }
+}
+
+void subbyte_pack_impl(const float* input,uint8_t* output,int64_t size,float inverse,float zp,int bits) {
+    if (bits==4) subbyte_pack<4>(input,output,size,inverse,zp);
+    else subbyte_pack<2>(input,output,size,inverse,zp);
+}
+
+template<int Bits>
+void subbyte_unpack(const uint8_t* input,float* output,int64_t size,float scale,float zp) {
+    using V=vec::Vectorized<float>;
+    constexpr int lanes=V::size(),pack=8/Bits,mask=(1<<Bits)-1;
+    const V multiplier(scale),zero_point(zp);
+    int64_t i=0;
+    for (;i+lanes<=size;i+=lanes) {
+        alignas(64) float codes[lanes];
+        for (int c=0;c<lanes;++c) codes[c]=(input[(i+c)/pack]>>((c%pack)*Bits))&mask;
+        ((V::loadu(codes)-zero_point)*multiplier).store(output+i);
+    }
+    for (;i<size;++i) output[i]=(static_cast<float>((input[i/pack]>>((i%pack)*Bits))&mask)-zp)*scale;
+}
+
+void subbyte_unpack_impl(const uint8_t* input,float* output,int64_t size,float scale,float zp,int bits) {
+    if (bits==4) subbyte_unpack<4>(input,output,size,scale,zp);
+    else subbyte_unpack<2>(input,output,size,scale,zp);
+}
 
 int64_t dynamic_dot_impl(const uint8_t* x,const int8_t* w,int64_t size) {
     int64_t total=0,k=0;
@@ -508,6 +563,8 @@ void embedding_impl(const uint8_t* w, const int64_t* indices, const int64_t* off
 }
 
 #ifndef CPU_CAPABILITY_AVX512
+REGISTER_DISPATCH(quantized_subbyte_pack_stub, &subbyte_pack_impl);
+REGISTER_DISPATCH(quantized_subbyte_unpack_stub, &subbyte_unpack_impl);
 REGISTER_DISPATCH(quantized_recurrent_step_stub, &recurrent_step_impl);
 REGISTER_DISPATCH(quantized_dynamic_dot_stub, &dynamic_dot_impl);
 REGISTER_DISPATCH(quantized_dynamic_block_stub, &dynamic_block_impl);
@@ -521,6 +578,8 @@ REGISTER_DISPATCH(quantized_binary_stub, &binary_impl);
 REGISTER_DISPATCH(quantized_embedding_stub, &embedding_impl);
 REGISTER_DISPATCH(quantized_fp16_linear_stub, &fp16_linear_impl);
 #else
+ALSO_REGISTER_AVX512_DISPATCH(quantized_subbyte_pack_stub, &subbyte_pack_impl);
+ALSO_REGISTER_AVX512_DISPATCH(quantized_subbyte_unpack_stub, &subbyte_unpack_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_recurrent_step_stub, &recurrent_step_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_dynamic_dot_stub, &dynamic_dot_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_dynamic_block_stub, &dynamic_block_impl);

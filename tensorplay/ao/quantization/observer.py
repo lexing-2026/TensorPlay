@@ -132,7 +132,7 @@ class UniformQuantizationObserverBase(ObserverBase):
         self.register_buffer('eps', tensorplay.tensor([eps], **factory_kwargs))
         if self.qscheme not in (tensorplay.per_tensor_affine, tensorplay.per_tensor_symmetric, tensorplay.per_channel_affine, tensorplay.per_channel_symmetric, tensorplay.per_channel_affine_float_qparams):
             raise AssertionError('Default Observer only works for per_tensor_affine, per_tensor_symmetric, per_channel_affine, per_channel_symmetric and per_channel_float_qparams quantization scheme')
-        _ALLOWED_DTYPES = (tensorplay.qint8, tensorplay.quint8, tensorplay.qint32, tensorplay.int8, tensorplay.uint8, tensorplay.int16, tensorplay.int32, tensorplay.float8_e5m2, tensorplay.float8_e4m3fn, tensorplay.uint16)
+        _ALLOWED_DTYPES = (tensorplay.qint8, tensorplay.quint8, tensorplay.quint4x2, tensorplay.qint32, tensorplay.int8, tensorplay.uint8, tensorplay.int16, tensorplay.int32, tensorplay.float8_e5m2, tensorplay.float8_e4m3fn, tensorplay.uint16)
         if self.dtype not in _ALLOWED_DTYPES:
             raise AssertionError(f'Default Observer only works for {_ALLOWED_DTYPES} data type')
         self.has_customized_qrange = quant_min is not None and quant_max is not None
@@ -677,6 +677,7 @@ default_per_channel_weight_observer = PerChannelMinMaxObserver.with_args(dtype=t
 default_histogram_observer = HistogramObserver.with_args(quant_min=0, quant_max=127)
 default_dynamic_quant_observer = PlaceholderObserver.with_args(dtype=tensorplay.quint8, quant_min=0, quant_max=255, is_dynamic=True)
 default_float_qparams_observer = PerChannelMinMaxObserver.with_args(dtype=tensorplay.quint8, qscheme=tensorplay.per_channel_affine_float_qparams)
+default_float_qparams_observer_4bit = PerChannelMinMaxObserver.with_args(dtype=tensorplay.quint4x2, qscheme=tensorplay.per_channel_affine_float_qparams,ch_axis=0)
 default_fixed_qparams_range_neg1to1_observer = FixedQParamsObserver.with_args(scale=2./256, zero_point=128)
 default_fixed_qparams_range_0to1_observer = FixedQParamsObserver.with_args(scale=1./256, zero_point=0)
 default_placeholder_observer = PlaceholderObserver
