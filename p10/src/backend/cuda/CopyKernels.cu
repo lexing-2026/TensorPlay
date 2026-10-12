@@ -475,15 +475,15 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
     auto stream = getCurrentCUDAStream(static_cast<int>(dst_dev.index()));
 
     if (subByteElementPerByte(self.dtype())>1 || subByteElementPerByte(src.dtype())>1) {
-        const auto strides=SizesAndStrides::compute_contiguous_strides(static_cast<std::vector<int64_t>>(self.shape()));
+        const auto strides=static_cast<std::vector<int64_t>>(self.strides());
         TP_CHECK(self.dtype()==src.dtype() && src_in.shape()==self.shape()
-            && static_cast<std::vector<int64_t>>(self.strides())==strides
+            && SizesAndStrides::is_non_overlapping_and_dense(self.shape(),strides)
             && static_cast<std::vector<int64_t>>(src.strides())==strides,
-            "Packed quantized copy requires matching dtype, shape and contiguous layout");
+            "Packed quantized copy requires matching dtype, shape and dense layout");
     }
 
     // Optimize: Contiguous copy (both src and dst must be contiguous AND same dtype)
-    if (self.dtype() == src.dtype() && self.is_contiguous() && src.is_contiguous()) {
+    if (self.dtype() == src.dtype() && ((self.is_contiguous() && src.is_contiguous()) || subByteElementPerByte(self.dtype())>1)) {
         const int64_t pack=subByteElementPerByte(self.dtype());
         size_t nbytes = ((self.numel()+pack-1)/pack) * self.itemsize();
         if (src_cuda && src_dev.index() != dst_dev.index()) {

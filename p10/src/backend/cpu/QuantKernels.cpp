@@ -434,8 +434,11 @@ Tensor dequantize_per_tensor_qint8_cpu(const Tensor& self, double scale,
 // Logical elements fill a continuous bit stream, least significant code first.
 Tensor quantize_per_tensor_subbyte_cpu(const Tensor& self,double scale,int64_t zero_point,DType dtype) {
     auto grid=make_per_tensor_affine_quantizer(scale,zero_point,dtype);
-    const Tensor input=promote_to_compute_dtype(self);
+    const bool channels_last=(self.dim()==4 && self.is_contiguous(MemoryFormat::ChannelsLast))
+        || (self.dim()==5 && self.is_contiguous(MemoryFormat::ChannelsLast3d));
+    const Tensor input=channels_last ? self : promote_to_compute_dtype(self);
     Tensor out=Tensor::empty(self.shape(),dtype,self.device());
+    if (channels_last) out=out.as_strided(self.shape(),get_channels_last_strides(self.shape()),0);
     const int bits=dtype==DType::QUInt4x2 ? 4 : 2,pack=8/bits;
     const int64_t bytes=(input.numel()+pack-1)/pack;
     const auto* src=input.const_data_ptr<float>();
@@ -453,8 +456,11 @@ Tensor quantize_per_tensor_subbyte_cpu(const Tensor& self,double scale,int64_t z
 }
 
 Tensor dequantize_per_tensor_subbyte_cpu(const Tensor& self,double scale,int64_t zero_point) {
-    const Tensor input=self.contiguous();
+    const bool channels_last=(self.dim()==4 && self.is_contiguous(MemoryFormat::ChannelsLast))
+        || (self.dim()==5 && self.is_contiguous(MemoryFormat::ChannelsLast3d));
+    const Tensor input=channels_last ? self : self.contiguous();
     Tensor out=Tensor::empty(self.shape(),DType::Float32,self.device());
+    if (channels_last) out=out.as_strided(self.shape(),get_channels_last_strides(self.shape()),0);
     const int bits=self.dtype()==DType::QUInt4x2 ? 4 : 2,pack=8/bits;
     const int64_t bytes=(input.numel()+pack-1)/pack;
     const auto* src=static_cast<const uint8_t*>(input.const_data_ptr());
@@ -2320,7 +2326,7 @@ int64_t q_per_channel_axis_cpu(const Tensor& self) {
 Tensor int_repr_cpu(const Tensor& self) {
     quantized::require_quantized(self, "int_repr");
     if (subByteElementPerByte(self.dtype())>1) {
-        const Tensor input=self.contiguous();
+        const Tensor& input=self;
         const int64_t pack=subByteElementPerByte(self.dtype());
         const int64_t count=(input.numel()+pack-1)/pack;
         Tensor bytes(input.impl()->storage(),{count},{1},DType::UInt8,input.storage_offset());

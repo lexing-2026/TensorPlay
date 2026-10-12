@@ -353,11 +353,11 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
     }
 
     if (subByteElementPerByte(self.dtype())>1 || subByteElementPerByte(src.dtype())>1) {
-        const auto strides=SizesAndStrides::compute_contiguous_strides(static_cast<std::vector<int64_t>>(self.shape()));
+        const auto strides=static_cast<std::vector<int64_t>>(self.strides());
         TP_CHECK(self.dtype()==src.dtype() && src_in.shape()==self.shape()
-            && static_cast<std::vector<int64_t>>(self.strides())==strides
+            && SizesAndStrides::is_non_overlapping_and_dense(self.shape(),strides)
             && static_cast<std::vector<int64_t>>(src.strides())==strides,
-            "Packed quantized copy requires matching dtype, shape and contiguous layout");
+            "Packed quantized copy requires matching dtype, shape and dense layout");
         if (src.device().is_cpu()) {
             const int64_t pack=subByteElementPerByte(self.dtype());
             std::memcpy(self.data_ptr(),src.data_ptr(),static_cast<size_t>((self.numel()+pack-1)/pack));
@@ -378,7 +378,7 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
             static_cast<std::vector<int64_t>>(src.shape()));
         const bool src_row_major =
             static_cast<std::vector<int64_t>>(src.strides()) == cuda_rm_strides;
-        if (!src_row_major || src.dtype() != self.dtype()) {
+        if (subByteElementPerByte(self.dtype())==1 && (!src_row_major || src.dtype() != self.dtype())) {
             src_ready = Tensor(static_cast<std::vector<int64_t>>(src.shape()), self.dtype(), src.device());
             src_ready.copy_(src);
         }
@@ -387,7 +387,7 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
         const size_t nbytes = ((self.numel()+pack-1)/pack) * self.itemsize();
         const auto self_rm_strides = SizesAndStrides::compute_contiguous_strides(
             static_cast<std::vector<int64_t>>(self.shape()));
-        if (static_cast<std::vector<int64_t>>(self.strides()) == self_rm_strides) {
+        if (pack>1 || static_cast<std::vector<int64_t>>(self.strides()) == self_rm_strides) {
             cuda::checkCuda(cudaMemcpyAsync(self.data_ptr(), src_ready.data_ptr(), nbytes,
                                             cudaMemcpyDeviceToHost, stream.stream()),
                             "cudaMemcpyAsync (D2H)");

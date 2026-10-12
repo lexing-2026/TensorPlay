@@ -35,6 +35,36 @@ def test_subbyte_cpu_calling_thread_rounding_mode(bits,mode,size):
 
 @pytest.mark.parametrize('device',DEVICES)
 @pytest.mark.parametrize('bits',[2,4])
+@pytest.mark.parametrize('shape',[(2,3,2,5),(2,3,2,2,5)])
+def test_subbyte_channels_last_layout_clone_transfer_and_checkpoint(device,bits,shape):
+    values=np.random.default_rng(510).uniform(-1,4,size=shape).astype('float32')
+    format_name='channels_last' if len(shape)==4 else 'channels_last_3d'
+    native=tp.tensor(values,device=device).contiguous(memory_format=getattr(tp,format_name))
+    reference=torch.tensor(values).contiguous(memory_format=getattr(torch,format_name))
+    dtype=getattr(tp,'quint4x2' if bits==4 else 'quint2x4')
+    rdtype=getattr(torch,'quint4x2' if bits==4 else 'quint2x4')
+    actual=tp.quantize_per_tensor(native,.25,1,dtype)
+    expected=torch.quantize_per_tensor(reference,.25,1,rdtype)
+    pack=8//bits
+    expected_bytes=torch.empty(0,dtype=torch.uint8).set_(expected.untyped_storage(),0,
+                         ((expected.numel()+pack-1)//pack,),(1,)).numpy()
+    stream=io.BytesIO()
+    tp.save(actual,stream)
+    stream.seek(0)
+    for result in (actual,actual.clone(),actual.cpu(),tp.load(stream)):
+        assert tuple(result.stride())==tuple(expected.stride())
+        np.testing.assert_array_equal(result.int_repr().cpu().numpy(),expected_bytes)
+        decoded=result.dequantize()
+        assert tuple(decoded.stride())==tuple(expected.dequantize().stride())
+        np.testing.assert_array_equal(decoded.cpu().numpy(),expected.dequantize().numpy())
+    if device=='cpu' and tp.cuda.is_available():
+        moved=actual.cuda().cpu()
+        assert tuple(moved.stride())==tuple(expected.stride())
+        np.testing.assert_array_equal(moved.int_repr().numpy(),expected_bytes)
+
+
+@pytest.mark.parametrize('device',DEVICES)
+@pytest.mark.parametrize('bits',[2,4])
 @pytest.mark.parametrize('shape',[(),(0,),(1,),(3,),(3,5),(2,33),(4097,)])
 @pytest.mark.parametrize('zp',[0,1])
 def test_subbyte_affine_rounding_tail_and_grid(device,bits,shape,zp):

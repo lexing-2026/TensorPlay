@@ -6,8 +6,10 @@
 #include "Utils.h"
 
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <utility>
@@ -50,8 +52,11 @@ __global__ void subbyte_affine_kernel(const float* real,const uint8_t* packed,fl
 template<bool Quantize,bool Channel>
 Tensor subbyte_affine_cuda(const Tensor& self,DType dtype,double scale,int64_t zp,
         const Tensor& scales=Tensor(),const Tensor& zeros=Tensor(),int64_t axis=0) {
-    const Tensor input=self.contiguous();
+    const bool channels_last=!Channel && ((self.dim()==4 && self.is_contiguous(MemoryFormat::ChannelsLast))
+        || (self.dim()==5 && self.is_contiguous(MemoryFormat::ChannelsLast3d)));
+    const Tensor input=channels_last ? self : self.contiguous();
     Tensor out=Tensor::empty(self.shape(),Quantize ? dtype : DType::Float32,self.device());
+    if (channels_last) out=out.as_strided(self.shape(),get_channels_last_strides(self.shape()),0);
     Tensor sc,z;
     int64_t stride=1,channels=0;
     if constexpr (Channel) {

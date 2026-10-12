@@ -49,7 +49,7 @@ int64_t q_per_channel_axis_cuda(const Tensor& self) {
 Tensor int_repr_cuda(const Tensor& self) {
     quantized::require_quantized(self, "int_repr");
     if (subByteElementPerByte(self.dtype())>1) {
-        const Tensor input=self.contiguous();
+        const Tensor& input=self;
         const int64_t pack=subByteElementPerByte(self.dtype());
         const int64_t count=(input.numel()+pack-1)/pack;
         Tensor bytes(input.impl()->storage(),{count},{1},DType::UInt8,input.storage_offset());
