@@ -88,12 +88,10 @@ class FakeQuantize(FakeQuantizeBase):
         self.is_dynamic = obs.is_dynamic
         self.ch_axis = getattr(obs, 'ch_axis', -1)
         self.is_per_channel = is_per_channel(self.qscheme)
-        limits = {tp.qint8: (-128, 127), tp.int8: (-128, 127),
-                  tp.quint8: (0, 255), tp.uint8: (0, 255)}
-        if self.dtype not in limits:
-            raise ValueError('Simulated quantization requires an 8-bit integer dtype')
-        lo, hi = limits[self.dtype]
-        if self.quant_min < lo or self.quant_max > hi:
+        storage_dtype = {tp.qint8: tp.int8, tp.quint8: tp.uint8,
+                         tp.qint32: tp.int32}.get(self.dtype, self.dtype)
+        limits = tp.iinfo(storage_dtype)
+        if self.quant_min < limits.min or self.quant_max > limits.max:
             raise ValueError('Quantization range exceeds the dtype bounds')
         zp_dtype = tp.float32 if self.qscheme == tp.per_channel_affine_float_qparams else tp.int32
         device = next(obs.buffers(), tp.tensor(0)).device
@@ -250,3 +248,8 @@ __all__ = [name for name in globals() if name.startswith('default_')] + [
     'fake_quantize_per_tensor', 'fake_quantize_per_channel',
     'enable_fake_quant', 'disable_fake_quant', 'enable_observer', 'disable_observer',
 ]
+
+default_fused_act_fake_quant = FusedMovingAvgObsFakeQuantize.with_args(quant_min=0, quant_max=255, reduce_range=True)
+default_fused_wt_fake_quant = FusedMovingAvgObsFakeQuantize.with_args(dtype=tp.qint8, qscheme=tp.per_tensor_symmetric, quant_min=-128, quant_max=127)
+default_fused_per_channel_wt_fake_quant = FusedMovingAvgObsFakeQuantize.with_args(observer=MovingAveragePerChannelMinMaxObserver, dtype=tp.qint8, qscheme=tp.per_channel_symmetric, quant_min=-128, quant_max=127, ch_axis=0)
+__all__ += ['default_fused_act_fake_quant', 'default_fused_wt_fake_quant', 'default_fused_per_channel_wt_fake_quant']

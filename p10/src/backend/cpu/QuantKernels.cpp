@@ -960,18 +960,16 @@ void check_real_dtype(const Tensor& self, const char* op) {
 // value and whether the raw grid position landed inside [quant_min,
 // quant_max].  ACum is the compute type (float or double).
 template <typename T, typename ACum>
-inline std::pair<T, bool> fake_quant_element(T x, ACum inv_scale,
+inline std::pair<T, bool> fake_quant_element(T x, float scale,
                                              int64_t zero_point,
                                              int64_t quant_min,
                                              int64_t quant_max) {
+    const float inv_scale = 1.0f / scale;
     const ACum raw = std::nearbyint(static_cast<ACum>(x) * inv_scale) +
                      static_cast<ACum>(zero_point);
-    const int64_t q = std::min<int64_t>(
-        quant_max, std::max<int64_t>(quant_min,
-                                     static_cast<int64_t>(raw)));
-    return {static_cast<T>((static_cast<ACum>(q) -
-                            static_cast<ACum>(zero_point)) *
-                           (static_cast<ACum>(1.0) / inv_scale)),
+    const int64_t q = static_cast<int64_t>(std::fmin(
+        static_cast<double>(quant_max), std::fmax(static_cast<double>(quant_min), static_cast<double>(raw))));
+    return {static_cast<T>(static_cast<float>(q - zero_point) * scale),
             raw >= static_cast<ACum>(quant_min) &&
                 raw <= static_cast<ACum>(quant_max)};
 }
@@ -999,8 +997,8 @@ std::tuple<Tensor, Tensor> fake_quantize_per_tensor_affine_cachemask_cpu(
             float* op = out.data_ptr<float>();
             bool* mp = mask.data_ptr<bool>();
             for (int64_t i = 0; i < numel; ++i) {
-                auto r = fake_quant_element<float, double>(
-                    in[i], inv_scale, zero_point, quant_min, quant_max);
+                auto r = fake_quant_element<float, float>(
+                    in[i], static_cast<float>(scale), zero_point, quant_min, quant_max);
                 op[i] = r.first;
                 mp[i] = r.second;
             }
@@ -1012,7 +1010,7 @@ std::tuple<Tensor, Tensor> fake_quantize_per_tensor_affine_cachemask_cpu(
             bool* mp = mask.data_ptr<bool>();
             for (int64_t i = 0; i < numel; ++i) {
                 auto r = fake_quant_element<double, double>(
-                    in[i], inv_scale, zero_point, quant_min, quant_max);
+                    in[i], static_cast<float>(scale), zero_point, quant_min, quant_max);
                 op[i] = r.first;
                 mp[i] = r.second;
             }
@@ -1024,7 +1022,7 @@ std::tuple<Tensor, Tensor> fake_quantize_per_tensor_affine_cachemask_cpu(
             bool* mp = mask.data_ptr<bool>();
             for (int64_t i = 0; i < numel; ++i) {
                 auto r = fake_quant_element<Half, float>(
-                    in[i], static_cast<float>(inv_scale), zero_point,
+                    in[i], static_cast<float>(scale), zero_point,
                     quant_min, quant_max);
                 op[i] = r.first;
                 mp[i] = r.second;
@@ -1037,7 +1035,7 @@ std::tuple<Tensor, Tensor> fake_quantize_per_tensor_affine_cachemask_cpu(
             bool* mp = mask.data_ptr<bool>();
             for (int64_t i = 0; i < numel; ++i) {
                 auto r = fake_quant_element<BFloat16, float>(
-                    in[i], static_cast<float>(inv_scale), zero_point,
+                    in[i], static_cast<float>(scale), zero_point,
                     quant_min, quant_max);
                 op[i] = r.first;
                 mp[i] = r.second;
@@ -1130,8 +1128,8 @@ _fake_quantize_per_tensor_affine_cachemask_tensor_qparams_cpu(
             const float* in = input.data_ptr<float>();
             float* op = out.data_ptr<float>();
             for (int64_t i = 0; i < numel; ++i) {
-                auto r = fake_quant_element<float, double>(
-                    in[i], 1.0 / scale_val, zero_point_val, quant_min,
+                auto r = fake_quant_element<float, float>(
+                    in[i], static_cast<float>(scale_val), zero_point_val, quant_min,
                     quant_max);
                 op[i] = r.first;
                 mp[i] = r.second;
@@ -1143,7 +1141,7 @@ _fake_quantize_per_tensor_affine_cachemask_tensor_qparams_cpu(
             double* op = out.data_ptr<double>();
             for (int64_t i = 0; i < numel; ++i) {
                 auto r = fake_quant_element<double, double>(
-                    in[i], 1.0 / scale_val, zero_point_val, quant_min,
+                    in[i], static_cast<float>(scale_val), zero_point_val, quant_min,
                     quant_max);
                 op[i] = r.first;
                 mp[i] = r.second;
@@ -1155,7 +1153,7 @@ _fake_quantize_per_tensor_affine_cachemask_tensor_qparams_cpu(
             Half* op = out.data_ptr<Half>();
             for (int64_t i = 0; i < numel; ++i) {
                 auto r = fake_quant_element<Half, float>(
-                    in[i], static_cast<float>(1.0 / scale_val),
+                    in[i], static_cast<float>(scale_val),
                     zero_point_val, quant_min, quant_max);
                 op[i] = r.first;
                 mp[i] = r.second;
@@ -1167,7 +1165,7 @@ _fake_quantize_per_tensor_affine_cachemask_tensor_qparams_cpu(
             BFloat16* op = out.data_ptr<BFloat16>();
             for (int64_t i = 0; i < numel; ++i) {
                 auto r = fake_quant_element<BFloat16, float>(
-                    in[i], static_cast<float>(1.0 / scale_val),
+                    in[i], static_cast<float>(scale_val),
                     zero_point_val, quant_min, quant_max);
                 op[i] = r.first;
                 mp[i] = r.second;
@@ -1432,9 +1430,8 @@ std::tuple<Tensor, Tensor> fake_quantize_per_channel_affine_cachemask_cpu(
                 ? std::lrintf(static_cast<float>(zpf_ptr[c]) + static_cast<float>(raw_in * inv_scale))
                 : std::nearbyint(raw_in * inv_scale) +
                       static_cast<double>(zp_ptr[c]);
-        const int64_t q = std::min<int64_t>(
-            quant_max,
-            std::max<int64_t>(quant_min, static_cast<int64_t>(raw)));
+        const int64_t q = static_cast<int64_t>(std::fmin(static_cast<double>(quant_max),
+            std::fmax(static_cast<double>(quant_min), raw)));
         const double zpv = zp_float_flag
                                ? zpf_ptr[c]
                                : static_cast<double>(zp_ptr[c]);

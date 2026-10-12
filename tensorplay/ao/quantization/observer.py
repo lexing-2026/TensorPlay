@@ -364,7 +364,7 @@ class HistogramObserver(UniformQuantizationObserverBase):
         self.register_buffer('histogram', tensorplay.zeros(self.bins, **factory_kwargs))
         self.register_buffer('min_val', tensorplay.tensor(float('inf'), **factory_kwargs))
         self.register_buffer('max_val', tensorplay.tensor(float('-inf'), **factory_kwargs))
-        self.dst_nbins = 2 ** (32 if self.dtype in (tensorplay.qint32, tensorplay.int32) else 8)
+        self.dst_nbins = 2 ** (32 if self.dtype in (tensorplay.qint32, tensorplay.int32) else 8 if self.dtype in (tensorplay.qint8, tensorplay.quint8) else tensorplay.iinfo(self.dtype).bits)
         self.upsample_rate = 16
 
     def _get_norm(self, delta_begin, delta_end, density):

@@ -39,7 +39,6 @@ class QuantStub(nn.Module):
         # float while nudging values toward the quantized grid.
         if hasattr(self, 'activation_post_process'):
             return x
-        self.fake_quant.record(x)
         scale, zero_point = self.fake_quant.scale, self.fake_quant.zero_point
         if not self.training and self.fake_quant.frozen:
             # Inference path: produce a native quantized tensor carrying

@@ -117,3 +117,6 @@ from .qconfig import default_qat_qconfig, default_per_channel_qat_qconfig
 from .quantize import prepare_qat, quantize_qat
 from .fuse_modules import fuse_modules_qat
 __all__ += ['default_qat_qconfig', 'default_per_channel_qat_qconfig', 'prepare_qat', 'quantize_qat', 'fuse_modules_qat']
+from .fake_quantize import default_fused_act_fake_quant, default_fused_wt_fake_quant, default_fused_per_channel_wt_fake_quant
+from .qconfig import default_qat_qconfig_v2, default_dynamic_qat_qconfig, get_default_qconfig, get_default_qat_qconfig
+__all__ += ['default_fused_act_fake_quant', 'default_fused_wt_fake_quant', 'default_fused_per_channel_wt_fake_quant', 'default_qat_qconfig_v2', 'default_dynamic_qat_qconfig', 'get_default_qconfig', 'get_default_qat_qconfig']

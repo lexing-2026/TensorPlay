@@ -19,6 +19,7 @@ from .observer import (
     default_dynamic_quant_observer,
     default_observer,
     default_weight_observer,
+    default_per_channel_weight_observer,
 )
 
 __all__ = [
@@ -97,8 +98,8 @@ class QConfigMapping:
 default_qconfig = QConfig(activation=default_observer, weight=default_weight_observer)
 
 default_per_channel_qconfig = QConfig(
-    activation=MovingAverageMinMaxObserver.with_args(dtype=tensorplay.qint8),
-    weight=PerChannelMinMaxObserver.with_args(ch_axis=0),
+    activation=default_observer,
+    weight=default_per_channel_weight_observer,
 )
 
 default_dynamic_qconfig = QConfig(
@@ -106,14 +107,39 @@ default_dynamic_qconfig = QConfig(
     weight=default_weight_observer,
 )
 
-default_weight_only_qconfig = QConfig(
-    activation=PlaceholderObserver.with_args(dtype=tensorplay.qint8, is_dynamic=False),
-    weight=PerChannelMinMaxObserver.with_args(ch_axis=0),
-)
-
-
 from .fake_quantize import default_fake_quant, default_weight_fake_quant, default_per_channel_weight_fake_quant
+
+default_weight_only_qconfig = QConfig(activation=nn.Identity, weight=default_weight_fake_quant)
 
 default_qat_qconfig = QConfig(activation=default_fake_quant, weight=default_weight_fake_quant)
 default_per_channel_qat_qconfig = QConfig(activation=default_fake_quant, weight=default_per_channel_weight_fake_quant)
 __all__ += ['default_qat_qconfig', 'default_per_channel_qat_qconfig']
+
+from .observer import HistogramObserver, default_per_channel_weight_observer
+from .fake_quantize import (
+    FakeQuantize, FusedMovingAvgObsFakeQuantize, default_dynamic_fake_quant,
+    default_fused_act_fake_quant, default_fused_wt_fake_quant,
+    default_fused_per_channel_wt_fake_quant,
+)
+
+default_qat_qconfig_v2 = QConfig(default_fused_act_fake_quant, default_fused_wt_fake_quant)
+default_dynamic_qat_qconfig = QConfig(default_dynamic_fake_quant, default_weight_fake_quant)
+
+
+def get_default_qconfig(backend='x86', version=0):
+    if backend not in ('x86', 'fbgemm', 'qnnpack', 'onednn') or version != 0:
+        raise ValueError('Unsupported calibration configuration backend or version')
+    return QConfig(HistogramObserver.with_args(reduce_range=backend in ('x86', 'fbgemm')),
+                   default_weight_observer if backend == 'qnnpack' else default_per_channel_weight_observer)
+
+
+def get_default_qat_qconfig(backend='x86', version=1):
+    if backend not in ('x86', 'fbgemm', 'qnnpack', 'onednn') or version not in (0, 1):
+        raise ValueError('Unsupported training configuration backend or version')
+    cls = FusedMovingAvgObsFakeQuantize if version else FakeQuantize
+    weights = ((default_fused_wt_fake_quant if backend == 'qnnpack' else default_fused_per_channel_wt_fake_quant)
+               if version else (default_weight_fake_quant if backend == 'qnnpack' else default_per_channel_weight_fake_quant))
+    return QConfig(cls.with_args(quant_min=0, quant_max=255, reduce_range=backend in ('x86', 'fbgemm')), weights)
+
+
+__all__ += ['default_qat_qconfig_v2', 'default_dynamic_qat_qconfig', 'get_default_qconfig', 'get_default_qat_qconfig']

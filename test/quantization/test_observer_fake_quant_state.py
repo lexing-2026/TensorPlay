@@ -108,3 +108,59 @@ def test_fused_moving_average(device, channel):
         a.sum().backward(); b.sum().backward()
         np.testing.assert_allclose(a.detach().cpu().numpy(), b.detach().cpu().numpy(), atol=1e-6)
         np.testing.assert_array_equal(x.grad.cpu().numpy(), r.grad.cpu().numpy())
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('dtype', ['float32', 'float64', 'float16', 'bfloat16'])
+def test_tensor_mask_precision_and_infinities(device, dtype):
+    values = np.array([-float('inf'), -2.55, -1.25, -.15, .15, 1.25, 2.55, float('inf')], dtype='float32')
+    x = tp.tensor(values, device=device, dtype=getattr(tp, dtype), requires_grad=True)
+    r = torch.tensor(values, device=device, dtype=getattr(torch, dtype), requires_grad=True)
+    a = fq.fake_quantize_per_tensor(x, .1, 0, -25, 25)
+    b = torch.fake_quantize_per_tensor_affine(r, .1, 0, -25, 25)
+    a.sum().backward(); b.sum().backward()
+    np.testing.assert_array_equal(a.detach().float().cpu().numpy(), b.detach().float().cpu().numpy())
+    np.testing.assert_array_equal(x.grad.float().cpu().numpy(), r.grad.float().cpu().numpy())
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('channel', [False, True])
+def test_learnable_grid_gradients(device, channel):
+    from tensorplay.ao.quantization._learnable_fake_quantize import _LearnableFakeQuantize
+    from torch.ao.quantization._learnable_fake_quantize import _LearnableFakeQuantize as Ref
+    kwargs = {'quant_min': -8, 'quant_max': 7, 'scale': .5, 'zero_point': 0., 'use_grad_scaling': True}
+    if channel:
+        kwargs['channel_len'] = 2
+    actual = _LearnableFakeQuantize(obs.PerChannelMinMaxObserver if channel else obs.MinMaxObserver, dtype=tp.qint8, **kwargs).to(device)
+    expected = Ref(torch.ao.quantization.PerChannelMinMaxObserver if channel else torch.ao.quantization.MinMaxObserver, dtype=torch.qint8, **kwargs).to(device)
+    actual.enable_param_learning(); expected.enable_param_learning()
+    x = tp.tensor([[-6., -.7, .8], [-1.3, 2., 8.]], device=device, requires_grad=True)
+    r = torch.tensor([[-6., -.7, .8], [-1.3, 2., 8.]], device=device, requires_grad=True)
+    a, b = actual(x), expected(r)
+    a.sum().backward(); b.sum().backward()
+    for lhs, rhs in [(a.detach(), b.detach()), (x.grad, r.grad), (actual.scale.grad, expected.scale.grad), (actual.zero_point.grad, expected.zero_point.grad)]:
+        np.testing.assert_allclose(lhs.cpu().numpy(), rhs.cpu().numpy(), atol=1e-6)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('dtype', ['int16', 'uint16', 'qint32'])
+def test_wide_grid_fake_quant(device, dtype):
+    actual = fq.FakeQuantize(dtype=getattr(tp, dtype)).to(device)
+    expected = torch.ao.quantization.FakeQuantize(dtype=getattr(torch, dtype)).to(device)
+    values = np.array([-20., -.13, 0., .17, 50.], dtype='float32')
+    a = actual(tp.tensor(values, device=device))
+    b = expected(torch.tensor(values, device=device))
+    np.testing.assert_allclose(a.cpu().numpy(), b.cpu().numpy(), atol=1e-6)
+
+
+@pytest.mark.parametrize('backend', ['x86', 'fbgemm', 'qnnpack', 'onednn'])
+@pytest.mark.parametrize('version', [0, 1])
+def test_training_configuration_presets(backend, version):
+    from tensorplay.ao.quantization import get_default_qat_qconfig
+    actual = get_default_qat_qconfig(backend, version)
+    expected = torch.ao.quantization.get_default_qat_qconfig(backend, version)
+    for factory, ref_factory in [(actual.activation, expected.activation), (actual.weight, expected.weight)]:
+        module, ref = factory(), ref_factory()
+        assert type(module).__name__ == type(ref).__name__
+        assert module.quant_min == ref.quant_min and module.quant_max == ref.quant_max
+        assert str(module.qscheme).split('.')[-1] == str(ref.qscheme).split('.')[-1]

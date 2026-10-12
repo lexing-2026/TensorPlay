@@ -63,14 +63,14 @@ __global__ void fake_quant_per_tensor_kernel_double(
     int64_t zero_point, int64_t quant_min, int64_t quant_max) {
     const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= numel) return;
-    const double inv_scale = 1.0 / scale;
-    const double raw = nearbyint(input[i] * inv_scale) +
+    const float scale_f = static_cast<float>(scale);
+    const float inv_scale = 1.0f / scale_f;
+    const float raw = nearbyint(input[i] * inv_scale) +
                        static_cast<double>(zero_point);
     const int64_t q = static_cast<int64_t>(fmin(
         static_cast<double>(quant_max),
         fmax(static_cast<double>(quant_min), raw)));
-    output[i] = (static_cast<double>(q) - static_cast<double>(zero_point)) *
-                scale;
+    output[i] = static_cast<float>(q - zero_point) * scale_f;
     mask[i] = raw >= static_cast<double>(quant_min) &&
               raw <= static_cast<double>(quant_max);
 }
