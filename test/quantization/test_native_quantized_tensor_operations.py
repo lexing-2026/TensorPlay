@@ -336,3 +336,44 @@ def test_batch_norm_coefficients_track_parameter_mutations():
             references[changed].add_(.03)
         equal(tp.ops.quantized.batch_norm2d(x, *parameters, 1e-5, .07, 119),
               torch.ops.quantized.batch_norm2d(r, *references, 1e-5, .07, 119))
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('dtype,zp', TYPES)
+@pytest.mark.parametrize('rank', [2, 3])
+def test_channels_last_activation_prelu_and_moments(device, dtype, zp, rank):
+    shape = (2, 4) + (5,) * rank
+    x, r = pair(device, dtype, zp, shape=shape)
+    fmt = tp.channels_last if rank == 2 else tp.channels_last_3d
+    rfmt = torch.channels_last if rank == 2 else torch.channels_last_3d
+    x, r = x.contiguous(memory_format=fmt), r.contiguous(memory_format=rfmt)
+    w, rw = pair(device, dtype, zp, shape=(1, 4) + (1,) * rank)
+    for operation, args, rargs in [('relu', (), ()), ('sigmoid', (), ()),
+                                   ('_prelu_kernel', (w,), (rw,))]:
+        actual = resolve(tp.ops.tp, operation)(x, *args)
+        expected = resolve(torch.ops.aten, operation)(r, *rargs)
+        equal(actual, expected, 1 if operation == 'sigmoid' else 0)
+        assert actual.stride() == expected.stride()
+    equal(tp.ops.tp.mean.dim(x, [-1], True), torch.ops.aten.mean.dim(r, [-1], True))
+    equal(tp.ops.tp.std.correction(x, [-1], correction=.5, keepdim=True),
+          torch.ops.aten.std.correction(r, [-1], correction=.5, keepdim=True))
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('dtype,zp', TYPES)
+@pytest.mark.parametrize('rank', [2, 3])
+@pytest.mark.parametrize('strided', [False, True])
+def test_channels_last_pool_output_layout(device, dtype, zp, rank, strided):
+    x, r = pair(device, dtype, zp, shape=(2, 4) + (5,) * rank)
+    fmt = tp.channels_last if rank == 2 else tp.channels_last_3d
+    rfmt = torch.channels_last if rank == 2 else torch.channels_last_3d
+    x, r = x.contiguous(memory_format=fmt), r.contiguous(memory_format=rfmt)
+    if strided:
+        x, r = x[..., ::2], r[..., ::2]
+    operations = [(f'avg_pool{rank}d', ([3] * rank, [2] * rank, [1] * rank, True, False, None)),
+                  (f'_adaptive_avg_pool{rank}d', ([2] * rank,))]
+    for name, args in operations:
+        actual = resolve(tp.ops.tp, name)(x, *args)
+        expected = resolve(torch.ops.aten, name)(r, *args)
+        equal(actual, expected, 1)
+        assert actual.stride() == expected.stride()

@@ -36,19 +36,49 @@ Tensor batch_norm(const Tensor& input, const std::optional<Tensor>& weight,
         m = mean.contiguous(), v = var.contiguous();
     Tensor y = output(input, logical.shape(), scale, zp);
     y = y.as_strided(logical.shape(), get_channels_last_strides(logical.shape()), 0);
-    y.impl()->set_quantizer(make_per_tensor_affine_quantizer(scale, zp, input.dtype()));
-    Tensor alpha = Tensor::empty({channels}, DType::Float32, input.device());
-    Tensor beta = Tensor::empty({channels}, DType::Float32, input.device());
+    Tensor alpha, beta;
+#ifndef TP_QUANT_CUDA
+    struct Coefficients {
+        std::array<Tensor,4> parameters;
+        std::array<uint32_t,4> versions{};
+        double input_scale = 0., output_scale = 0., epsilon = 0.;
+        Tensor alpha, beta;
+    };
+    thread_local std::array<Coefficients,16> cache;
+    thread_local size_t next = 0;
+    const std::array<Tensor,4> parameters{*weight, *bias, mean, var};
+    std::array<uint32_t,4> versions{};
+    bool cacheable = channels <= 65536;
+    for (int i = 0; i < 4; ++i) {
+        cacheable = cacheable && parameters[i].impl()->version_counter().is_enabled();
+        if (parameters[i].impl()->version_counter().is_enabled()) versions[i] = parameters[i]._version();
+    }
+    if (cacheable) for (const auto& entry : cache) {
+        bool match = entry.alpha.defined() && entry.versions == versions &&
+            entry.input_scale == quantized::q_scale(input) && entry.output_scale == scale && entry.epsilon == eps;
+        for (int i = 0; i < 4; ++i) match = match && entry.parameters[i].impl() == parameters[i].impl();
+        if (match) { alpha = entry.alpha; beta = entry.beta; break; }
+    }
+#endif
+    const bool compute_coefficients = !alpha.defined();
+    if (compute_coefficients) {
+        alpha = Tensor::empty({channels}, DType::Float32, input.device());
+        beta = Tensor::empty({channels}, DType::Float32, input.device());
+    }
     auto* ap = alpha.data_ptr<float>(); auto* bp = beta.data_ptr<float>();
     const auto *wp = w.data_ptr<float>(), *biasp = b.data_ptr<float>(),
         *mp = m.data_ptr<float>(), *vp = v.data_ptr<float>();
     const double xs = quantized::q_scale(input);
     const int64_t xz = quantized::q_zero_point(input);
-    apply(channels, [=] TP_QN_DEVICE (int64_t c) {
+    if (compute_coefficients) apply(channels, [=] TP_QN_DEVICE (int64_t c) {
         const float inv = 1. / ::sqrt(vp[c] + static_cast<float>(eps));
         ap[c] = inv * wp[c] * (xs / scale);
         bp[c] = (biasp[c] - mp[c] * inv * wp[c]) / scale;
     });
+#ifndef TP_QUANT_CUDA
+    if (compute_coefficients && cacheable) cache[next++ % cache.size()] =
+        {parameters, versions, xs, scale, eps, alpha, beta};
+#endif
     codes(input.dtype(), [&]<class T>() {
         const auto* src = x.data_ptr<T>(); auto* dst = y.data_ptr<T>();
 #ifdef TP_QUANT_CUDA

@@ -1,6 +1,7 @@
 #pragma once
 #include "QuantNative.h"
 #include "Dispatcher.h"
+#include "DispatchStub.h"
 #include "Parallel.h"
 #include "Half.h"
 #include <algorithm>
@@ -109,8 +110,8 @@ Broadcast broadcast(const Tensor& a, const Tensor& b, const std::vector<int64_t>
     for (int d = g.rank - 1; d >= 0; --d) {
         g.dims[d] = shape[d];
         const int ad = d - (g.rank - a.dim()), bd = d - (g.rank - b.dim());
-        if (ad >= 0) { g.a[d] = a.size(ad) == 1 ? 0 : sa; sa *= a.size(ad); }
-        if (bd >= 0) { g.b[d] = b.size(bd) == 1 ? 0 : sb; sb *= b.size(bd); }
+        if (ad >= 0) { g.a[d] = a.size(ad) == 1 ? 0 : a.stride(ad); sa *= a.size(ad); }
+        if (bd >= 0) { g.b[d] = b.size(bd) == 1 ? 0 : b.stride(bd); sb *= b.size(bd); }
     }
     return g;
 }
@@ -290,13 +291,17 @@ Tensor cat(const std::vector<Tensor>& inputs, int64_t dim, std::optional<double>
 struct PoolGeometry {
     int rank, mode; int64_t in[3]{1,1,1}, out[3]{1,1,1}, kernel[3]{1,1,1}, stride[3]{1,1,1}, pad[3]{}, dilation[3]{1,1,1};
     int64_t in_size = 1, out_size = 1, zp, divisor; bool include_pad;
+    int64_t channels = 1, batch_stride = 0, channel_stride = 0, spatial_strides[3]{};
+    bool channels_last = false;
 };
 
 template<class T>
 struct PoolCodes {
     const T* x; T* y; PoolGeometry g;
     TP_QN_DEVICE void operator()(int64_t i) const {
-        int64_t start[3]{}, end[3]{1,1,1}, count = 1, valid = 1, p = i % g.out_size;
+        const int64_t outer = g.channels_last ? i / (g.channels * g.out_size) * g.channels + i % g.channels : i / g.out_size;
+        int64_t start[3]{}, end[3]{1,1,1}, count = 1, valid = 1;
+        int64_t p = g.channels_last ? i / g.channels % g.out_size : i % g.out_size;
         for (int d = g.rank - 1; d >= 0; --d) {
             const int64_t o = p % g.out[d]; p /= g.out[d];
             if (g.mode == 1) {
@@ -317,12 +322,12 @@ struct PoolCodes {
                 if (end[d] > g.in[d]) end[d] = g.in[d];
             }
         }
-        const T* row = x + i / g.out_size * g.in_size;
+        const T* row = x + outer / g.channels * g.batch_stride + outer % g.channels * g.channel_stride;
         int64_t sum = 0, maximum = std::numeric_limits<T>::lowest();
         for (int64_t a = start[0]; a < end[0]; a += g.dilation[0])
             for (int64_t b = start[1]; b < end[1]; b += g.dilation[1])
                 for (int64_t c = start[2]; c < end[2]; c += g.dilation[2]) {
-                    const int64_t code = row[(a * g.in[1] + b) * g.in[2] + c];
+                    const int64_t code = row[a * g.spatial_strides[0] + b * g.spatial_strides[1] + c * g.spatial_strides[2]];
                     if (code > maximum) maximum = code;
                     sum += code - g.zp;
                 }
@@ -359,6 +364,7 @@ Tensor pool(const Tensor& input, const std::vector<int64_t>& kernel,
     for (int d = 0; d < rank; ++d) {
         const int j = 3 - rank + d;
         g.in[j] = input.size(input.dim() - rank + d);
+        g.spatial_strides[j] = input.stride(input.dim() - rank + d);
         TP_CHECK(g.in[j] > 0, "Pooling input spatial dimensions must be positive");
         if (mode == 1) {
             TP_CHECK(kernel[d] >= 0, "Adaptive output dimensions must be nonnegative");
@@ -378,8 +384,22 @@ Tensor pool(const Tensor& input, const std::vector<int64_t>& kernel,
     // Coordinates occupy the last spatial slots, keeping every dimensional
     // variant on the same three-axis iteration without synthetic padding.
     g.rank = 3;
-    Tensor x = input.contiguous(), y = output(input, shape, quantized::q_scale(input), g.zp);
-    codes(input.dtype(), [&]<class T>() { apply(y.numel(), PoolCodes<T>{x.data_ptr<T>(), y.data_ptr<T>(), g}); });
+    auto format = activation_format(input);
+    if (mode == 0 && rank == 3 && input.dim() == 5)
+        format = MemoryFormat::ChannelsLast3d;
+    else if (format != MemoryFormat::Contiguous && !input.impl()->is_contiguous_in(format))
+        format = MemoryFormat::Contiguous;
+    g.channels_last = format != MemoryFormat::Contiguous;
+    const int channel_dim = input.dim() - rank - 1;
+    g.channels = input.size(channel_dim);
+    g.channel_stride = input.stride(channel_dim);
+    g.batch_stride = channel_dim ? input.stride(0) : 0;
+    Tensor y = output(input, shape, quantized::q_scale(input), g.zp);
+    if (g.channels_last) {
+        Tensor formatted(y.impl()->storage(), shape, get_channels_last_strides(shape), input.dtype(), 0);
+        formatted.impl()->set_quantizer(y.impl()->quantizer()); y = formatted;
+    }
+    codes(input.dtype(), [&]<class T>() { apply(y.numel(), PoolCodes<T>{input.data_ptr<T>(), y.data_ptr<T>(), g}); });
     return y;
 }
 
@@ -474,7 +494,7 @@ struct PreluCodes {
         const int64_t a = static_cast<int64_t>(x[xi]) - xz;
         const int64_t b = static_cast<int64_t>(w[wi]) - wz;
         const int32_t value = static_cast<int32_t>((a > 0 ? a : 0) * one + (a < 0 ? a : 0) * b);
-        y[i] = encode<T>(static_cast<float>(value), multiplier, yz);
+        y[xi] = encode<T>(static_cast<float>(value), multiplier, yz);
     }
 };
 
@@ -490,7 +510,11 @@ Tensor prelu(const Tensor& input, const Tensor& weight, double scale, int64_t zp
     }
     TP_CHECK(broadcast_shape(input.shape(), slope.shape()) == input.sizes().vec(),
              "Slope dimensions must broadcast to the input shape");
-    Tensor x = input.contiguous(), w = slope.contiguous(), y = output(input, input.shape(), scale, zp);
+    const auto format = activation_format(input);
+    Tensor x = input.contiguous(static_cast<int64_t>(format));
+    Tensor w = slope.contiguous(static_cast<int64_t>(format));
+    Tensor y = activation_output(input, format);
+    y.impl()->set_quantizer(make_per_tensor_affine_quantizer(scale, zp, input.dtype()));
     const float ws = quantized::q_scale(weight), multiplier = static_cast<float>(quantized::q_scale(input)) * ws * (1.f / static_cast<float>(scale));
     const int64_t wz = quantized::q_zero_point(weight), xz = quantized::q_zero_point(input);
     const auto geometry = broadcast(x, w, input.sizes().vec());
@@ -508,6 +532,16 @@ Tensor prelu(const Tensor& input, const Tensor& weight, double scale, int64_t zp
         bool channel_weight = input.dim() > 1 && w.size(1) == input.size(1);
         for (int d = 0; d < w.dim(); ++d) if (d != 1 && w.size(d) != 1) channel_weight = false;
         if (channel_weight) {
+            if (format != MemoryFormat::Contiguous) {
+                const int64_t channels = input.size(1);
+                if (channels) parallel::parallel_for(0, y.numel() / channels, std::max<int64_t>(1, 32768 / channels), [&](int64_t first, int64_t last) {
+                    for (int64_t row = first; row < last; ++row)
+                        cpu::quantized_prelu_stub(DeviceType::CPU, x.data_ptr<T>() + row * channels,
+                            w.data_ptr<T>(), y.data_ptr<T>() + row * channels,
+                            channels, false, input.dtype(), xz, wz, zp, one, multiplier);
+                });
+                return;
+            }
             int64_t inner = 1;
             for (int d = 2; d < input.dim(); ++d) inner *= input.size(d);
             if (inner) parallel::parallel_for(0, y.numel() / inner, 1, [&](int64_t first, int64_t last) {

@@ -64,8 +64,9 @@ Tensor activation_cpu(const Tensor& input, double scale, int64_t zp, Activation 
     const float input_scale = static_cast<float>(quantized::q_scale(input));
     const int64_t input_zp = quantized::q_zero_point(input);
     const float inverse_scale = 1.f / static_cast<float>(scale);
-    const Tensor x = input.contiguous();
-    Tensor out = Tensor::empty(input.shape(), input.dtype(), input.device());
+    const auto format = quant::activation_format(input);
+    const Tensor x = input.contiguous(static_cast<int64_t>(format));
+    Tensor out = quant::activation_output(input, format);
     if (input.dtype() == DType::QInt8 || input.dtype() == DType::QUInt8) {
         const auto& cached = activation_table(input, inverse_scale, zp, fn);
         const auto* src = static_cast<const uint8_t*>(x.data_ptr());
@@ -89,8 +90,9 @@ Tensor activation_cpu(const Tensor& input, double scale, int64_t zp, Activation 
 Tensor rectify_cpu(const Tensor& input, bool clamp_six) {
     const double scale = quantized::q_scale(input);
     const int64_t zp = quantized::q_zero_point(input);
-    const Tensor x = input.contiguous();
-    Tensor out = Tensor::empty(input.shape(), input.dtype(), input.device());
+    const auto format = quant::activation_format(input);
+    const Tensor x = input.contiguous(static_cast<int64_t>(format));
+    Tensor out = quant::activation_output(input, format);
     auto apply = [&]<class T>() {
         const T hi = clamp_six ? encode<T>(6.f, 1.f / static_cast<float>(scale), zp) : std::numeric_limits<T>::max();
         const auto* src = x.data_ptr<T>(); auto* dst = out.data_ptr<T>();

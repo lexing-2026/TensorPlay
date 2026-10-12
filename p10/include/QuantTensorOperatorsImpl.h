@@ -144,7 +144,7 @@ Tensor moment(const Tensor& self, const std::vector<int64_t>& dimensions, bool k
     for (auto d : dims) if (self.dim()) count *= self.size(d);
     const bool inner = dims.empty() || (dims.back() == self.dim() - 1 &&
         dims.back() - dims.front() + 1 == static_cast<int64_t>(dims.size()));
-    if (self.is_contiguous() && inner && count > 0 &&
+    if (self.impl()->is_contiguous_in(MemoryFormat::Contiguous) && inner && count > 0 &&
         (!standard_deviation || count != 1 || correction == 0.)) {
         if (self.device().is_cpu()) return quant::moment_inner_cpu(self, dims, keepdim, standard_deviation, correction);
 #ifdef USE_CUDA

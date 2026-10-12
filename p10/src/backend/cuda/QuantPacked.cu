@@ -40,8 +40,9 @@ Tensor activation(const Tensor& input, double scale, int64_t zp, quant::Activati
     auto grid = make_per_tensor_affine_quantizer(scale, zp, input.dtype());
     const float xs = static_cast<float>(quantized::q_scale(input));
     const int64_t xz = quantized::q_zero_point(input);
-    const Tensor x = input.contiguous();
-    Tensor out = Tensor::empty(input.shape(), input.dtype(), input.device());
+    const auto format = quant::activation_format(input);
+    const Tensor x = input.contiguous(static_cast<int64_t>(format));
+    Tensor out = quant::activation_output(input, format);
     if (input.numel()) {
         const int blocks = static_cast<int>(std::min<int64_t>((input.numel() + 4095) / 4096, 4096));
         const auto stream = getCurrentCUDAStream().stream();
@@ -360,8 +361,9 @@ bool integer_product(const Tensor& x,const Tensor& packed,const Tensor& offsets,
 Tensor quantized_relu_cuda(const Tensor& input) {
     CUDAGuard guard(input.device());
     const int64_t zp = quantized::q_zero_point(input);
-    const Tensor x = input.contiguous();
-    Tensor out = Tensor::empty(input.shape(), input.dtype(), input.device());
+    const auto format = quant::activation_format(input);
+    const Tensor x = input.contiguous(static_cast<int64_t>(format));
+    Tensor out = quant::activation_output(input, format);
     if (input.numel()) {
         const int blocks = static_cast<int>(std::min<int64_t>((input.numel() + 255) / 256, 65535));
         const auto stream = getCurrentCUDAStream().stream();
@@ -381,8 +383,9 @@ Tensor quantized_relu6_cuda(const Tensor& input) {
     CUDAGuard guard(input.device());
     const int64_t zp = quantized::q_zero_point(input);
     const float inverse_scale = 1.f / static_cast<float>(quantized::q_scale(input));
-    const Tensor x = input.contiguous();
-    Tensor out = Tensor::empty(input.shape(), input.dtype(), input.device());
+    const auto format = quant::activation_format(input);
+    const Tensor x = input.contiguous(static_cast<int64_t>(format));
+    Tensor out = quant::activation_output(input, format);
     if (input.numel()) {
         const int blocks = static_cast<int>(std::min<int64_t>((input.numel() + 255) / 256, 65535));
         const auto stream = getCurrentCUDAStream().stream();
