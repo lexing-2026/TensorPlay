@@ -31,6 +31,9 @@ def test_training_outputs_gradients_and_state(device, name):
         activation=torch.ao.quantization.default_fake_quant,
         weight=torch.ao.quantization.default_per_channel_weight_fake_quant)
     expected = getattr(torch.ao.nn.intrinsic.qat if fused else torch.ao.nn.qat, name)(*args, qconfig=reference_config).to(device)
+    if name == 'LinearBn1d':
+        with torch.no_grad():
+            expected.bias.copy_(torch.tensor([-.2, .1, .3], device=device))
     actual.load_state_dict({k: tp.tensor(v.cpu().tolist(), device=device, dtype=getattr(tp, str(v.dtype).split(".")[-1])) for k, v in expected.state_dict().items()})
     values = np.random.default_rng(42).normal(size=shape).astype('float32')
     for _ in range(2):
