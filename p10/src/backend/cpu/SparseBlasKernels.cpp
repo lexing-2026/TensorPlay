@@ -166,6 +166,7 @@ Tensor sparse_sampled_addmm_sparse_csr_cpu(
 }
 
 DEFINE_DISPATCH(sampled_addmm_stub);
+DEFINE_DISPATCH(sparse_addmm_stub);
 
 } // namespace cpu
 } // namespace tensorplay

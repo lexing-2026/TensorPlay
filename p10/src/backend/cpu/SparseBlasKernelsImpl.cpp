@@ -124,7 +124,115 @@ void sampled_addmm_kernel_impl(const Tensor& mat1, const Tensor& mat2_t,
     });
 }
 
+// Dense-out SpMM with seed: out = beta*self + alpha*mat1@mat2.  `self` is a
+// contiguous (M, N) seed (already broadcast by the caller); `dense` is a
+// contiguous (K, N) right operand.  Rows are the parallel unit; the vector
+// loop accumulates the per-row nonzero contributions into the output row.
+// Complex lanes fall back to a scalar loop (no vector registers exist for
+// them in the per-ISA tier).
+template <typename scalar_t, typename index_t>
+void sparse_addmm_kernel_impl(const Tensor& out, const Tensor& self,
+                              const Tensor& crow, const Tensor& col,
+                              const Tensor& values, const Tensor& dense,
+                              const Scalar& beta, const Scalar& alpha) {
+    const int64_t M = out.size(0);
+    const int64_t N = out.size(1);
+    if (M == 0 || N == 0) {
+        return;
+    }
+    const scalar_t beta_v = beta.to<scalar_t>();
+    const scalar_t alpha_v = alpha.to<scalar_t>();
+    const index_t* crow_data = crow.data_ptr<index_t>();
+    const index_t* col_data = col.data_ptr<index_t>();
+    const scalar_t* value_data = values.data_ptr<scalar_t>();
+    const scalar_t* dense_data = dense.data_ptr<scalar_t>();
+    const scalar_t* self_data = self.data_ptr<scalar_t>();
+    scalar_t* out_data = out.data_ptr<scalar_t>();
+
+    if constexpr (is_complex_type_v<scalar_t>) {
+        parallel_for(0, M, std::max<int64_t>(1, 32768 / N),
+                 [&](int64_t begin, int64_t end) {
+            for (int64_t m = begin; m < end; ++m) {
+                scalar_t* out_row = out_data + m * N;
+                const scalar_t* self_row = self_data + m * N;
+                for (int64_t j = 0; j < N; ++j) {
+                    out_row[j] = beta_v * self_row[j];
+                }
+                for (int64_t e = crow_data[m]; e < crow_data[m + 1]; ++e) {
+                    const scalar_t scale = alpha_v * value_data[e];
+                    const scalar_t* dense_row = dense_data + col_data[e] * N;
+                    for (int64_t j = 0; j < N; ++j) {
+                        out_row[j] += scale * dense_row[j];
+                    }
+                }
+            }
+        });
+        return;
+    }
+
+    using Vec = tensorplay::vec::Vectorized<scalar_t>;
+    const int64_t vec_size = Vec::size();
+
+    parallel_for(0, M, std::max<int64_t>(1, 32768 / N),
+                 [&](int64_t begin, int64_t end) {
+        for (int64_t m = begin; m < end; ++m) {
+            scalar_t* out_row = out_data + m * N;
+            const scalar_t* self_row = self_data + m * N;
+            const int64_t row_start = crow_data[m];
+            const int64_t row_end = crow_data[m + 1];
+            if (row_start == row_end) {
+                int64_t j = 0;
+                for (; j + vec_size <= N; j += vec_size) {
+                    (Vec::loadu(self_row + j) * Vec(beta_v)).store(out_row + j);
+                }
+                for (; j < N; ++j) {
+                    out_row[j] = beta_v * self_row[j];
+                }
+                continue;
+            }
+            const scalar_t scale0 = alpha_v * value_data[row_start];
+            const scalar_t* dense0 = dense_data + col_data[row_start] * N;
+            int64_t j = 0;
+            for (; j + vec_size <= N; j += vec_size) {
+                (Vec::loadu(self_row + j) * Vec(beta_v) +
+                 Vec(scale0) * Vec::loadu(dense0 + j))
+                    .store(out_row + j);
+            }
+            for (; j < N; ++j) {
+                out_row[j] = beta_v * self_row[j] + scale0 * dense0[j];
+            }
+            for (int64_t e = row_start + 1; e < row_end; ++e) {
+                const scalar_t scale = alpha_v * value_data[e];
+                const scalar_t* dense_row = dense_data + col_data[e] * N;
+                int64_t k = 0;
+                for (; k + vec_size <= N; k += vec_size) {
+                    (Vec::loadu(out_row + k) +
+                     Vec(scale) * Vec::loadu(dense_row + k))
+                        .store(out_row + k);
+                }
+                for (; k < N; ++k) {
+                    out_row[k] += scale * dense_row[k];
+                }
+            }
+        }
+    });
+}
+
 } // namespace
+
+void sparse_addmm_sparse_csr_kernel(const Tensor& out, const Tensor& self,
+                                    const Tensor& crow, const Tensor& col,
+                                    const Tensor& values, const Tensor& dense,
+                                    const Scalar& beta, const Scalar& alpha) {
+    dispatch_sampled_dtype(values.dtype(), [&](auto tag) {
+        using scalar_t = typename decltype(tag)::type;
+        dispatch_sampled_index(crow.dtype(), [&](auto itag) {
+            using index_t = typename decltype(itag)::type;
+            sparse_addmm_kernel_impl<scalar_t, index_t>(
+                out, self, crow, col, values, dense, beta, alpha);
+        });
+    });
+}
 
 void sampled_addmm_sparse_csr_kernel(const Tensor& mat1, const Tensor& mat2_t,
                                      const Scalar& beta, const Scalar& alpha,
@@ -141,8 +249,10 @@ void sampled_addmm_sparse_csr_kernel(const Tensor& mat1, const Tensor& mat2_t,
 
 #ifndef CPU_CAPABILITY_AVX512
 REGISTER_DISPATCH(sampled_addmm_stub, &sampled_addmm_sparse_csr_kernel)
+REGISTER_DISPATCH(sparse_addmm_stub, &sparse_addmm_sparse_csr_kernel)
 #else
 ALSO_REGISTER_AVX512_DISPATCH(sampled_addmm_stub, &sampled_addmm_sparse_csr_kernel)
+ALSO_REGISTER_AVX512_DISPATCH(sparse_addmm_stub, &sparse_addmm_sparse_csr_kernel)
 #endif
 
 } // namespace CPU_CAPABILITY

@@ -22,5 +22,14 @@ using sampled_addmm_fn = void (*)(const Tensor& mat1, const Tensor& mat2_t,
                                   const Tensor& result);
 DECLARE_DISPATCH(sampled_addmm_fn, sampled_addmm_stub)
 
+// Dense-out SpMM with seed: out = beta*self + alpha*mat1@mat2, where `mat1`
+// is CSR and `self`/`out` are contiguous (M, N), `dense` is contiguous
+// (K, N), and `crow`/`col`/`values` hold the CSR parts of `mat1`.
+using sparse_addmm_fn = void (*)(const Tensor& out, const Tensor& self,
+                                 const Tensor& crow, const Tensor& col,
+                                 const Tensor& values, const Tensor& dense,
+                                 const Scalar& beta, const Scalar& alpha);
+DECLARE_DISPATCH(sparse_addmm_fn, sparse_addmm_stub)
+
 } // namespace cpu
 } // namespace tensorplay

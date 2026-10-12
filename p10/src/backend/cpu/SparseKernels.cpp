@@ -1,4 +1,5 @@
 #include "SparseKernels.h"
+#include "cpu/SparseBlasKernels.h"
 #include "Parallel.h"
 #include "Utils.h"
 
@@ -1307,7 +1308,7 @@ Tensor _sparse_addmm_cpu(const Tensor& self, const Tensor& mat1,
                  rows, "x", inner, " and ", mat2.size(0), "x", cols, ")");
     }
 
-    Tensor self_b = broadcast_addmm_seed_cpu(self, rows, cols);
+    Tensor self_b = broadcast_addmm_seed_cpu(self, rows, cols).contiguous();
     Tensor out = Tensor::empty({rows, cols}, mat1.dtype(), mat1.device());
 
     Tensor crow;
@@ -1324,41 +1325,10 @@ Tensor _sparse_addmm_cpu(const Tensor& self, const Tensor& mat1,
         col = csr._col_indices().contiguous();
         values = csr._values().contiguous();
     }
-    const int64_t* crow_ptr = crow.data_ptr<int64_t>();
-    const int64_t* col_ptr = col.data_ptr<int64_t>();
     Tensor dense_c = mat2.contiguous();
-    const int64_t dense_stride0 = dense_c.stride(0);
-    const int64_t dense_stride1 = dense_c.stride(1);
 
-    dispatch_dtype(mat1.dtype(), [&](auto tag) {
-        using scalar_t = typename decltype(tag)::type;
-        const scalar_t beta_v = beta.to<scalar_t>();
-        const scalar_t alpha_v = alpha.to<scalar_t>();
-        const scalar_t* value_ptr = values.data_ptr<scalar_t>();
-        const scalar_t* dense_ptr = dense_c.data_ptr<scalar_t>();
-        scalar_t* out_ptr = out.data_ptr<scalar_t>();
-        const scalar_t* self_ptr = self_b.data_ptr<scalar_t>();
-        const int64_t self_stride0 = self_b.stride(0);
-        const int64_t self_stride1 = self_b.stride(1);
-
-        parallel::parallel_for(0, rows, parallel::GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-            for (int64_t i = begin; i < end; ++i) {
-                scalar_t* out_row = out_ptr + i * cols;
-                const scalar_t* self_row = self_ptr + i * self_stride0;
-                for (int64_t j = 0; j < cols; ++j) {
-                    out_row[j] = beta_v * self_row[j * self_stride1];
-                }
-                for (int64_t t = crow_ptr[i]; t < crow_ptr[i + 1]; ++t) {
-                    const scalar_t scale = alpha_v * value_ptr[t];
-                    const scalar_t* dense_row =
-                        dense_ptr + col_ptr[t] * dense_stride0;
-                    for (int64_t j = 0; j < cols; ++j) {
-                        out_row[j] += scale * dense_row[j * dense_stride1];
-                    }
-                }
-            }
-        });
-    });
+    sparse_addmm_stub(DeviceType::CPU, out, self_b, crow, col, values,
+                      dense_c, beta, alpha);
     return out;
 }
 
