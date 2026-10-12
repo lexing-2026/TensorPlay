@@ -232,6 +232,27 @@ def test_rowwise_pack_unpack_and_sparse_bags(device,bits,optimized):
 
 
 @pytest.mark.parametrize('device',DEVICES)
+@pytest.mark.parametrize('bits',[2,4])
+def test_rowwise_half_metadata_rounding_and_byte_order(device,bits):
+    values=np.array([0.,.3,-.3,.1001,-.1001,2**-24,2**-14,
+        2**-14-2**-24,1.+2**-11,1.+3*2**-11,65504.,-65504.],dtype='float32')
+    weights=np.repeat(values[:,None],8,axis=1)
+    packed=F.rowwise_prepack(tp.tensor(weights,device=device),bits)
+    expected=getattr(torch.ops.quantized,f'embedding_bag_{bits}bit_prepack')(torch.tensor(weights))
+    np.testing.assert_array_equal(packed.cpu().numpy(),expected.numpy())
+
+
+@pytest.mark.parametrize('device',DEVICES)
+@pytest.mark.parametrize('batched',[False,True])
+def test_native_max_pool2d_expands_singleton_kernel(device,batched):
+    shape=(2,3,5,7) if batched else (3,5,7)
+    x,r=pair(np.arange(np.prod(shape)).reshape(shape)%97,'int8',device)
+    actual=tp._C.quantized_max_pool2d(x,[2],[],[0],[1],False)
+    expected=torch.nn.functional.max_pool2d(r,2)
+    same(actual,expected)
+
+
+@pytest.mark.parametrize('device',DEVICES)
 @pytest.mark.parametrize('rank',[1,2,3])
 @pytest.mark.parametrize('groups',[1,2])
 def test_transposed_convolution_geometry(device,rank,groups):

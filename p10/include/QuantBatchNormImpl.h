@@ -20,6 +20,7 @@ Tensor batch_norm(const Tensor& input, const std::optional<Tensor>& weight,
         const std::optional<Tensor>& bias, const Tensor& mean, const Tensor& var,
         double eps, double scale, int64_t zp, bool relu) {
     Guard guard(input);
+    if (!quantized::is_quantized(input)) TP_THROW(TypeError,"Normalization requires quantized input");
     TP_CHECK(weight && bias, "Normalization requires weight and bias");
     validate(input);
     if (!input.numel()) return input.clone();

@@ -1023,7 +1023,8 @@ Tensor quantized_max_pool2d_cpu(
     const Tensor& self, const std::vector<int64_t>& kernel_size,
     const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
     const std::vector<int64_t>& dilation, bool ceil_mode) {
-    return quant::pool_cpu(self, kernel_size, stride, padding, dilation,
+    const auto kernel=kernel_size.size()==1 ? std::vector<int64_t>(2,kernel_size[0]) : kernel_size;
+    return quant::pool_cpu(self, kernel, stride, padding, dilation,
                            ceil_mode, false, std::nullopt, 2);
 }
 
