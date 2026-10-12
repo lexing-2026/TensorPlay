@@ -53,6 +53,9 @@ TORCH_PROTOCOL_VERSION = 1001
 # ---------------------------------------------------------------------------
 
 _TORCH_STORAGE_DTYPES = {
+    'QInt8Storage': 'int8',
+    'QUInt8Storage': 'uint8',
+    'QInt32Storage': 'int32',
     "DoubleStorage": "float64",
     "FloatStorage": "float32",
     "HalfStorage": "float16",
@@ -366,9 +369,14 @@ def _make_global_resolver():
         return _parse_device(text)
 
     def resolve(module: str, name: str):
+        if module == 'tensorplay.serialization.quantized' and name == 'rebuild_quantized_tensor':
+            from .quantized import rebuild_quantized_tensor
+            return rebuild_quantized_tensor
         if module == __name__ and name == "_StorageType":
             return _StorageType
         if module == "torch":
+            if name in ('per_tensor_affine', 'per_channel_affine', 'per_channel_affine_float_qparams'):
+                return name
             if name.endswith("Storage"):
                 return _StorageType(name)
             if name in {"strided", "sparse_coo", "sparse_csr", "sparse_csc",
@@ -388,6 +396,9 @@ def _make_global_resolver():
         if module == "torch.serialization" and name == "_get_layout":
             return lambda layout: layout
         if module == "torch._utils":
+            if name == '_rebuild_qtensor':
+                from .quantized import rebuild_qtensor
+                return rebuild_qtensor
             if name == "_rebuild_tensor_v2":
                 return _rebuild_tensor_v2
             if name == "_rebuild_tensor_v3":
@@ -757,7 +768,6 @@ def _read_magic_number_stream(
         state.swap_bytes = little_endian != (sys.byteorder == "little")
 
     pending: "OrderedDict[str, dict]" = OrderedDict()
-    deferred_views: list = []
 
     def persistent_load(saved_id):
         if not isinstance(saved_id, tuple) or not saved_id or saved_id[0] != "storage":
@@ -796,16 +806,25 @@ def _read_magic_number_stream(
             pending[key] = slot
         if view_metadata is not None:
             view_key, offset, view_numel = view_metadata
-            deferred_views.append((str(view_key), key, int(offset), int(view_numel)))
+            view_key = str(view_key)
+            if view_key not in pending:
+                pending[view_key] = {
+                    'dtype': slot['dtype'], 'location': slot['location'],
+                    'numel': int(view_numel),
+                    'tensor': slot['tensor'].as_strided([int(view_numel)], [1], int(offset)),
+                }
+            slot = pending[view_key]
         return _PendingStorage(slot, state)
 
-    unpickler = _WeightsOnlyUnpickler(
+    from .weights_only import StorageMetadataUnpickler
+    object_position = fileobj.tell()
+    unpickler = StorageMetadataUnpickler(
         fileobj,
         persistent_load=persistent_load,
         resolve_global=_make_global_resolver(),
         **load_args,
     )
-    result = unpickler.load()
+    unpickler.load()
 
     # Storage payloads follow the pickle stream, consumed in the order of the
     stored_keys = _WeightsOnlyUnpickler(
@@ -842,14 +861,13 @@ def _read_magic_number_stream(
         key = str(key)
         if key in pending:
             fill(pending[key])
-    for view_key, root_key, offset, view_numel in deferred_views:
-        base = pending[root_key]["tensor"]
-        pending[view_key] = {
-            "dtype": pending[root_key]["dtype"],
-            "location": pending[root_key]["location"],
-            "numel": view_numel,
-            "tensor": base.as_strided([view_numel], [1], offset),
-        }
+    payload_end = fileobj.tell()
+    fileobj.seek(object_position)
+    result = _WeightsOnlyUnpickler(
+        fileobj, persistent_load=persistent_load,
+        resolve_global=_make_global_resolver(), **load_args,
+    ).load()
+    fileobj.seek(payload_end)
     return _convert_numpy_leaves(result)
 
 
@@ -1044,8 +1062,6 @@ def _storage_bytes(tensor, storage_nbytes: int) -> bytes:
     detach = getattr(tensor, "detach", None)
     if callable(detach):
         tensor = detach()
-    if tensor.device.type != tp.DeviceType.CPU:
-        tensor = tensor.to(tp.Device(tp.DeviceType.CPU))
     storage = tensor.untyped_storage()
     actual_nbytes = _storage_nbytes(storage)
     if actual_nbytes != storage_nbytes:
@@ -1054,8 +1070,10 @@ def _storage_bytes(tensor, storage_nbytes: int) -> bytes:
         )
     if storage_nbytes == 0:
         return b""
-    raw = tp.empty((0,), dtype=_tp_dtype("uint8"))
+    raw = tp.empty((0,), dtype=_tp_dtype("uint8"), device=tensor.device)
     raw.set_(storage, 0, [storage_nbytes], [1])
+    if raw.device.type != tp.DeviceType.CPU:
+        raw = raw.cpu()
     return raw.numpy().tobytes()
 
 
@@ -1093,6 +1111,9 @@ def _serialize_object(obj: Any, pickle_protocol: int, *, legacy: bool = False):
         return _PTStorageRef(record["key"])
 
     def reduce_tensor(tensor):
+        if tensor.is_quantized():
+            from .quantized import quantized_tensor_reduction
+            return quantized_tensor_reduction(tensor)
         ref = storage_record(tensor)
         shape = [int(dim) for dim in tensor.shape]
         stride = [int(step) for step in tensor.stride()]
@@ -1425,10 +1446,14 @@ def describe_torch_file(fileobj: BinaryIO) -> dict:
 
 def _make_inspect_resolver(rebuild_stub):
     def resolve(module: str, name: str):
+        if module == 'tensorplay.serialization.quantized' and name == 'rebuild_quantized_tensor':
+            return lambda codes, params: {'quantized_codes': codes, 'grid': params}
+        if module == 'torch' and name in ('per_tensor_affine', 'per_channel_affine', 'per_channel_affine_float_qparams'):
+            return name
         if module == "torch" and name.endswith("Storage"):
             return _StorageType(name)
         if module == "torch._utils" and name in {
-            "_rebuild_tensor_v2", "_rebuild_tensor_v3", "_rebuild_tensor"
+            "_rebuild_tensor_v2", "_rebuild_tensor_v3", "_rebuild_tensor", "_rebuild_qtensor"
         }:
             return rebuild_stub
         if module == "torch._utils" and name == "_rebuild_parameter_with_state":
