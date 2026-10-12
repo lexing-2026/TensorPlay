@@ -443,3 +443,20 @@ def test_word_activation_fine_output_grids(device, operation, scale):
     x = tp._C._make_per_tensor_quantized_tensor(tp.tensor(codes, device=device), scale, -11)
     r = torch._make_per_tensor_quantized_tensor(torch.tensor(codes), scale, -11)
     equal(resolve(tp.ops.tp, operation)(x), resolve(torch.ops.aten, operation)(r))
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('rank', [2, 3])
+@pytest.mark.parametrize('channels_last', [False, True])
+@pytest.mark.parametrize('code', [400000000, 1000000000, 2147483600, -2147483600])
+def test_pool_word_accumulator_width_and_conversion(device, rank, channels_last, code):
+    codes = np.full((1, 4) + (4,) * rank, code, dtype='int32')
+    x = tp._C._make_per_tensor_quantized_tensor(tp.tensor(codes, device=device), .07, -11)
+    r = torch._make_per_tensor_quantized_tensor(torch.tensor(codes), .07, -11)
+    if channels_last:
+        x = x.contiguous(memory_format=tp.channels_last if rank == 2 else tp.channels_last_3d)
+        r = r.contiguous(memory_format=torch.channels_last if rank == 2 else torch.channels_last_3d)
+    equal(resolve(tp.ops.tp, f'avg_pool{rank}d')(x, [3] * rank, [2] * rank, [1] * rank),
+          resolve(torch.ops.aten, f'avg_pool{rank}d')(r, [3] * rank, [2] * rank, [1] * rank))
+    equal(resolve(tp.ops.tp, f'_adaptive_avg_pool{rank}d')(x, [2] * rank),
+          resolve(torch.ops.aten, f'_adaptive_avg_pool{rank}d')(r, [2] * rank))

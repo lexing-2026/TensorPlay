@@ -316,18 +316,35 @@ struct PoolCodes {
             }
         }
         const T* row = x + outer / g.channels * g.batch_stride + outer % g.channels * g.channel_stride;
-        int64_t sum = 0, maximum = std::numeric_limits<T>::lowest();
+        int64_t raw_sum = 0, maximum = std::numeric_limits<T>::lowest();
+        uint32_t wrapped_sum = 0;
+        const bool raw_adaptive = g.mode == 1 && !g.channels_last;
         for (int64_t a = start[0]; a < end[0]; a += g.dilation[0])
             for (int64_t b = start[1]; b < end[1]; b += g.dilation[1])
                 for (int64_t c = start[2]; c < end[2]; c += g.dilation[2]) {
                     const int64_t code = row[a * g.spatial_strides[0] + b * g.spatial_strides[1] + c * g.spatial_strides[2]];
-                    if (code > maximum) maximum = code;
-                    sum += code - g.zp;
+                    if (g.mode == 2) {
+                        if (code > maximum) maximum = code;
+                    } else if (raw_adaptive) raw_sum += code;
+                    else wrapped_sum += static_cast<uint32_t>(code) - static_cast<uint32_t>(g.zp);
                 }
         if (g.mode == 2) y[i] = static_cast<T>(maximum);
-        else {
+        else if (raw_adaptive) {
+            float inverse = 1.f;
+            for (int d = 0; d < 3; ++d) inverse /= static_cast<float>(end[d] - start[d]);
+            const float code = ::nearbyintf(static_cast<float>(raw_sum) * inverse);
+            if constexpr (sizeof(T) == 4)
+                y[i] = code >= 0x1p31f || code < -0x1p31f ? std::numeric_limits<T>::lowest() : static_cast<T>(code);
+            else y[i] = static_cast<T>(code);
+        } else {
             const int64_t divisor = g.divisor ? g.divisor : (g.mode == 1 || !g.include_pad ? valid : count);
+            const int32_t sum = static_cast<int32_t>(wrapped_sum);
+#ifdef TP_QUANT_CUDA
+            const double code = divisor ? ::nearbyintf(__fadd_rn(
+                __fmul_rn(static_cast<float>(sum), 1.f / divisor), static_cast<float>(g.zp))) : g.zp;
+#else
             const double code = divisor ? ::nearbyintf(static_cast<float>(sum) * (1.f / divisor) + static_cast<float>(g.zp)) : g.zp;
+#endif
             y[i] = static_cast<T>(::fmin(static_cast<double>(std::numeric_limits<T>::max()), ::fmax(static_cast<double>(std::numeric_limits<T>::lowest()), code)));
         }
     }
