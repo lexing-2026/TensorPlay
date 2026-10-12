@@ -1,4 +1,5 @@
 #include "Tensor.h"
+#include "QuantizedViews.h"
 #include "Complex.h"
 #include "Dispatcher.h"
 #include "Generator.h"
@@ -736,6 +737,7 @@ Tensor randn_like_kernel(const Tensor& self, DType dtype, std::optional<Device> 
 Tensor empty_like_kernel(const Tensor& self, DType dtype, std::optional<Device> device) {
     if (dtype == DType::Undefined) dtype = self.dtype();
     Device dev = device.has_value() ? *device : self.device();
+    if (self.impl()->has_quantizer()) return quantized::empty_like(self, dtype, dev);
     return empty_kernel(static_cast<std::vector<int64_t>>(self.shape()), dtype, dev, false);
 }
 

@@ -1,4 +1,5 @@
 #include "Tensor.h"
+#include "QuantizedViews.h"
 #include "Dispatcher.h"
 #include "CUDARuntime.h"
 #include "Exception.h"
@@ -184,6 +185,7 @@ Tensor ones_like_kernel(const Tensor& self, DType dtype, std::optional<Device> d
 Tensor empty_like_kernel(const Tensor& self, DType dtype, std::optional<Device> device) {
     if (dtype == DType::Undefined) dtype = self.dtype();
     Device dev = device.has_value() ? *device : self.device();
+    if (self.impl()->has_quantizer()) return quantized::empty_like(self, dtype, dev);
     const auto shape = static_cast<std::vector<int64_t>>(self.shape());
     Tensor result = empty_kernel(shape, dtype, dev, false);
     // The layout follows the strides the tensor has, however it got them: one
@@ -681,14 +683,21 @@ Tensor empty_memory_format_stub(const std::vector<int64_t>& size,
                                 std::optional<Device> device,
                                 std::optional<bool> pin_memory,
                                 std::optional<int64_t> memory_format) {
-    (void)memory_format;
     if (layout.has_value() && *layout != 5) {
         TP_THROW(NotImplementedError,
                  "empty is only implemented for strided (dense) layout tensors");
     }
-    return empty_kernel(size, resolve_factory_dtype(dtype),
-                        device.value_or(Device(DeviceType::CUDA)),
-                        pin_memory.value_or(false));
+    const DType dt = resolve_factory_dtype(dtype);
+    Tensor out = empty_kernel(size, dt, device.value_or(Device(DeviceType::CUDA)),
+                              pin_memory.value_or(false));
+    const auto format = static_cast<MemoryFormat>(memory_format.value_or(
+        static_cast<int64_t>(MemoryFormat::Contiguous)));
+    TP_CHECK(format != MemoryFormat::Preserve, "empty: preserve memory format is unsupported");
+    if (format == MemoryFormat::ChannelsLast || format == MemoryFormat::ChannelsLast3d) {
+        out = out.as_strided(size, get_channels_last_strides(size));
+    }
+    if (isQuantizedType(dt)) out.impl()->set_quantizer(make_unknown_quantizer(dt));
+    return out;
 }
 
 Tensor full_stub(const std::vector<int64_t>& size, const Scalar& fill_value,
