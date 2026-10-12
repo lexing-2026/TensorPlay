@@ -4,11 +4,49 @@
 #include "CUDARuntime.h"
 #include "CUDAContext.h"
 #include "QuantElementwise.h"
+#include "DispatchStub.h"
 #include <cuda_runtime.h>
 #include <array>
 
 namespace tensorplay::cuda {
 namespace {
+
+__device__ float sigmoid_exponential(float d) {
+    if (d < -104.f) return 0.f;
+    if (d > 100.f) return CUDART_INF_F;
+    const int q = __float2int_rn(__fmul_rn(d, 1.4426950408889634f));
+    const float fq = static_cast<float>(q);
+    float s = __fmaf_rn(fq, -.693145751953125f, d);
+    s = __fmaf_rn(fq, -1.428606765330187045e-6f, s);
+    float u = .000198527617612853646f;
+    u = __fmaf_rn(u, s, .00139304355252534151f);
+    u = __fmaf_rn(u, s, .00833336077630519867f);
+    u = __fmaf_rn(u, s, .0416664853692054749f);
+    u = __fmaf_rn(u, s, .166666671633720398f);
+    u = __fmaf_rn(u, s, .5f);
+    u = __fadd_rn(1.f, __fmaf_rn(__fmul_rn(s, s), u, s));
+    const int half = q >> 1;
+    const float a = __int_as_float((half + 127) << 23);
+    const float b = __int_as_float((q - half + 127) << 23);
+    return __fmul_rn(__fmul_rn(u, a), b);
+}
+
+__global__ void sigmoid_word_codes(const int32_t* input, int32_t* output, int64_t size,
+        float scale, int64_t zp, float inverse_scale, int64_t output_zp, int64_t vector_end) {
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < size; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        float value;
+        if (i < vector_end) {
+            const float real = __fmul_rn(__fsub_rn(__int2float_rn(input[i]), static_cast<float>(zp)), scale);
+            value = __fdiv_rn(1.f, __fadd_rn(1.f, sigmoid_exponential(-real)));
+        } else {
+            const float real = static_cast<float>((static_cast<double>(input[i]) - zp) * scale);
+            const float exponential = static_cast<float>(::exp(-static_cast<double>(real)));
+            value = static_cast<float>(1. / (1. + static_cast<double>(exponential)));
+        }
+        output[i] = quant::encode<int32_t>(value, inverse_scale, output_zp);
+    }
+}
 
 template<class T>
 __global__ void activation_codes(const T* input, T* output, int64_t size,
@@ -59,6 +97,15 @@ Tensor activation(const Tensor& input, double scale, int64_t zp, quant::Activati
                 case DType::QInt32: clip.template operator()<int32_t>(); break;
                 default: TP_THROW(TypeError, "Clipping requires quantized integer input");
             }
+        } else if (fn.op == 4 && input.dtype() == DType::QInt32) {
+            int lanes = 8;
+#if defined(__x86_64__) || defined(_M_X64)
+            if (cpu::get_cpu_capability() == cpu::CPUCapability::AVX512) lanes = 16;
+#endif
+            const int64_t vector_end = input.impl()->is_contiguous_in(format)
+                ? input.numel() / (2 * lanes) * (2 * lanes) : 0;
+            sigmoid_word_codes<<<blocks,256,0,stream>>>(x.data_ptr<int32_t>(), out.data_ptr<int32_t>(),
+                input.numel(), xs, xz, inverse_scale, zp, vector_end);
         } else switch (input.dtype()) {
             case DType::QInt8: activation_codes<<<blocks,256,0,stream>>>(x.data_ptr<int8_t>(),out.data_ptr<int8_t>(),input.numel(),xs,xz,inverse_scale,zp,fn); break;
             case DType::QUInt8: activation_codes<<<blocks,256,0,stream>>>(x.data_ptr<uint8_t>(),out.data_ptr<uint8_t>(),input.numel(),xs,xz,inverse_scale,zp,fn); break;

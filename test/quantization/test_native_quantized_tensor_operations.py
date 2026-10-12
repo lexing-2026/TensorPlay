@@ -401,3 +401,13 @@ def test_prelu_scalar_and_high_rank_float_weights(device, shape):
         torch.ops.aten._prelu_kernel.default(r, rw)
     with pytest.raises((RuntimeError, TypeError)):
         tp.ops.tp._prelu_kernel.default(x, w)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('size', [1, 7, 15, 16, 17, 31, 32, 33, 200])
+@pytest.mark.parametrize('strided', [False, True])
+def test_sigmoid_word_vector_blocks_and_scalar_tails(device, size, strided):
+    x, r = pair(device, 'int32', -11, shape=(size * (2 if strided else 1),))
+    if strided:
+        x, r = x[::2], r[::2]
+    equal(tp.ops.tp.sigmoid.default(x), torch.ops.aten.sigmoid.default(r))

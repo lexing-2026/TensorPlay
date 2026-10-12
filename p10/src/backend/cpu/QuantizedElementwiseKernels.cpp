@@ -606,19 +606,23 @@ void moment_impl(const void* x, void* y, int64_t count, int64_t rows, DType dtyp
 }
 
 void sigmoid_codes(const int32_t* x, int32_t* y, int64_t size, float scale, int64_t zp,
-                   double output_scale, int64_t output_zp) {
+                   double output_scale, int64_t output_zp, bool vectorize) {
     using QV = vec::Vectorized<qint32>;
     using FV = vec::Vectorized<float>;
     const FV input_scale(scale), input_zero(static_cast<float>(zp)), one(1.f);
     const float inverse = 1.f / static_cast<float>(output_scale);
+    const int64_t vector_end = vectorize ? size / (2 * QV::size()) * (2 * QV::size()) : 0;
     int64_t i = 0;
-    for (; i + QV::size() <= size; i += QV::size()) {
+    for (; i < vector_end; i += QV::size()) {
         auto values = QV::loadu(x + i).dequantize(input_scale, input_zero);
         for (auto& value : values) value = (one + value.neg().exp()).reciprocal();
-        QV::quantize(values, static_cast<float>(output_scale), output_zp, inverse).store(y + i);
+        alignas(64) float real[QV::size()];
+        values[0].store(real);
+        for (int lane = 0; lane < QV::size(); ++lane)
+            y[i + lane] = quant::encode<int32_t>(real[lane], inverse, output_zp);
     }
     for (; i < size; ++i) {
-        const float real = static_cast<float>(static_cast<int64_t>(x[i]) - zp) * scale;
+        const float real = static_cast<float>((static_cast<double>(x[i]) - zp) * scale);
         const float value = static_cast<float>(1.0f / (1.0 + std::exp(-real)));
         y[i] = quant::encode<int32_t>(value, inverse, output_zp);
     }

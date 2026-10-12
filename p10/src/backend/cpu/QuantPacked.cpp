@@ -98,7 +98,8 @@ Tensor activation_cpu(const Tensor& input, double scale, int64_t zp, Activation 
         parallel::parallel_for(0, input.numel(), 32768, [&](int64_t begin, int64_t end) {
             if (fn.op == 4) {
                 cpu::quantized_sigmoid_stub(DeviceType::CPU, src + begin, dst + begin,
-                    end - begin, input_scale, input_zp, scale, zp);
+                    end - begin, input_scale, input_zp, scale, zp,
+                    input.impl()->is_contiguous_in(format));
                 return;
             }
             for (int64_t i = begin; i < end; ++i)
