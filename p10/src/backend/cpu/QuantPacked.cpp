@@ -114,6 +114,7 @@ Tensor relu6_cpu(const Tensor& input) { return rectify_cpu(input, true); }
 
 namespace tensorplay::cpu {
 DEFINE_DISPATCH(quantized_dynamic_dot_stub);
+DEFINE_DISPATCH(quantized_dynamic_block_stub);
 DEFINE_DISPATCH(quantized_recurrent_step_stub);
 DEFINE_DISPATCH(quantized_int4_pack_stub);
 DEFINE_DISPATCH(quantized_int4_mm_stub);
@@ -272,6 +273,7 @@ void linear_vnni(const X* x, const int8_t* w, const int64_t* offsets,
         const quant::PackedGeometry& g, Tensor& out, double xs, int64_t xz,
         double ys, int64_t yz, bool relu, bool output_float) {
     const int64_t row_tiles = (g.rows + 1) / 2, column_tiles = (g.outputs + 63) / 64;
+    const bool saturating=output_float && std::is_same_v<X,uint8_t>;
     auto store = [&](int64_t row, int64_t n, int64_t dot, int64_t sum) {
         const int64_t shift = std::is_same_v<X, int8_t> ? 128 : 0;
         const int64_t acc = dot - (xz + shift) * offsets[n] - zps[n] * sum + g.K * xz * zps[n];
@@ -296,7 +298,13 @@ void linear_vnni(const X* x, const int8_t* w, const int64_t* offsets,
             for (int r = 0; r < rows; ++r) for (int64_t k = 0; k < g.K; ++k) sums[r] += x[(row + r) * g.K + k];
             for (int64_t n = n0; n < n1; n += 4) {
                 const int64_t columns = std::min<int64_t>(4, n1 - n);
-                if (rows == 2) {
+                if (saturating) {
+                    int64_t totals[2][4];
+                    quantized_dynamic_block_stub(DeviceType::CPU,reinterpret_cast<const uint8_t*>(x+row*g.K),
+                        w+n*g.padded_K,&totals[0][0],g.K,g.padded_K,rows,columns);
+                    for (int r=0;r<rows;++r) for (int c=0;c<columns;++c)
+                        store(row+r,n+c,totals[r][c],sums[r]);
+                } else if (rows == 2) {
                     int64_t totals[2][4];
                     block_vnni<X,2>(x + row * g.K, w + n * g.padded_K, g.K, g.padded_K, columns, totals);
                     for (int r = 0; r < 2; ++r) for (int c = 0; c < columns; ++c) store(row + r, n + c, totals[r][c], sums[r]);
@@ -341,7 +349,7 @@ void run(const Tensor& input, const Tensor& packed, const Tensor& offsets,
 #endif
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
     static const bool vnni = __builtin_cpu_supports("avxvnni");
-    if (g.linear && vnni && !saturating) {
+    if (g.linear && (vnni || saturating)) {
         linear_vnni(xp, wp, col, sc, wz, bp, g, out, xs, xz, ys, yz, relu, output_float);
         return;
     }

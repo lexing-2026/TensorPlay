@@ -8,6 +8,9 @@
 namespace tensorplay::cpu {
 using quantized_dynamic_dot_fn = int64_t (*)(const uint8_t*,const int8_t*,int64_t);
 DECLARE_DISPATCH(quantized_dynamic_dot_fn, quantized_dynamic_dot_stub)
+using quantized_dynamic_block_fn = void (*)(const uint8_t*,const int8_t*,int64_t*,
+    int64_t,int64_t,int64_t,int64_t);
+DECLARE_DISPATCH(quantized_dynamic_block_fn, quantized_dynamic_block_stub)
 using quantized_recurrent_step_fn = void (*)(const float*,const float*,const float*,
     const float*,float*,float*,int64_t,int64_t,int);
 DECLARE_DISPATCH(quantized_recurrent_step_fn, quantized_recurrent_step_stub)
@@ -17,7 +20,7 @@ using quantized_int4_mm_fn = void (*)(const void*, const uint8_t*, const void*, 
 DECLARE_DISPATCH(quantized_int4_pack_fn, quantized_int4_pack_stub)
 DECLARE_DISPATCH(quantized_int4_mm_fn, quantized_int4_mm_stub)
 using quantized_batch_norm_fn = void (*)(const void*, void*, int64_t, DType,
-    const float*, const float*, int64_t, int64_t, bool);
+    const float*, const float*, int64_t, int64_t, bool, int64_t);
 DECLARE_DISPATCH(quantized_batch_norm_fn, quantized_batch_norm_stub)
 using quantized_bilinear_fn = void (*)(const void*, const void*, const void*, const void*,
     void*, int64_t, DType, float, float, int64_t);

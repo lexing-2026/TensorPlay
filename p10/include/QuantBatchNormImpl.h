@@ -56,9 +56,8 @@ Tensor batch_norm(const Tensor& input, const std::optional<Tensor>& weight,
 #else
         const int64_t rows = y.numel() / channels;
         parallel::parallel_for(0, rows, std::max<int64_t>(1, 32768 / channels), [&](int64_t first, int64_t last) {
-            for (int64_t row = first; row < last; ++row)
-                cpu::quantized_batch_norm_stub(DeviceType::CPU, src+row*channels, dst+row*channels,
-                    channels, input.dtype(), ap, bp, xz, zp, relu);
+            cpu::quantized_batch_norm_stub(DeviceType::CPU, src+first*channels, dst+first*channels,
+                channels, input.dtype(), ap, bp, xz, zp, relu,last-first);
         });
 #endif
     });

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <numeric>
+#include <cstring>
 #ifdef TP_QUANT_CUDA
 #include "CUDARuntime.h"
 #include "CUDAContext.h"
@@ -209,6 +210,14 @@ Tensor scalar(const Tensor& input, double value, int64_t op, bool relu) {
         y = output(input, input.shape(), ys, yz);
         ScalarCodes<T> fn{x.data_ptr<T>(), y.data_ptr<T>(), mode, delta, z, yz, static_cast<float>(s / ys), relu};
 #ifndef TP_QUANT_CUDA
+        if (mode==0) {
+            parallel::parallel_for(0,y.numel(),32768,[&](int64_t first,int64_t last) {
+                if (relu) cpu::quantized_clip_stub(DeviceType::CPU,fn.x+first,fn.y+first,last-first,
+                    input.dtype(),yz,hi);
+                else std::memcpy(fn.y+first,fn.x+first,static_cast<size_t>(last-first)*sizeof(T));
+            });
+            return;
+        }
         if constexpr (sizeof(T) == 1) {
             std::array<float, 256> table{};
             for (int q = 0; q < 256; ++q) table[q] = static_cast<uint8_t>(fn.value(static_cast<T>(q)));

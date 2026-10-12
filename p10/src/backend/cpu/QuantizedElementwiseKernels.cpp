@@ -44,6 +44,50 @@ int64_t dynamic_dot_impl(const uint8_t* x,const int8_t* w,int64_t size) {
     return total;
 }
 
+void dynamic_block_impl(const uint8_t* x,const int8_t* w,int64_t* totals,
+        int64_t size,int64_t weight_stride,int64_t rows,int64_t columns) {
+    std::fill(totals,totals+8,0);
+    int64_t k=0;
+#if defined(CPU_CAPABILITY_AVX2) || defined(CPU_CAPABILITY_AVX512)
+    using V=vec::Vectorized<int32_t>;
+    constexpr int bytes=V::size()*4;
+    while (k+bytes<=size) {
+        const int64_t stop=std::min<int64_t>(k+8192,size-size%bytes);
+        V accum[2][4];
+        for (int r=0;r<2;++r) for (int c=0;c<4;++c) accum[r][c]=V(0);
+        for (;k<stop;k+=bytes) {
+#ifdef CPU_CAPABILITY_AVX512
+            __m512i weights[4];
+            for (int c=0;c<columns;++c) weights[c]=_mm512_loadu_si512(w+c*weight_stride+k);
+            for (int r=0;r<rows;++r) {
+                const auto values=_mm512_loadu_si512(x+r*size+k);
+                for (int c=0;c<columns;++c)
+                    accum[r][c]=accum[r][c]+V(_mm512_madd_epi16(_mm512_maddubs_epi16(values,weights[c]),_mm512_set1_epi16(1)));
+            }
+#else
+            __m256i weights[4];
+            for (int c=0;c<columns;++c) weights[c]=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(w+c*weight_stride+k));
+            for (int r=0;r<rows;++r) {
+                const auto values=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(x+r*size+k));
+                for (int c=0;c<columns;++c)
+                    accum[r][c]=accum[r][c]+V(_mm256_madd_epi16(_mm256_maddubs_epi16(values,weights[c]),_mm256_set1_epi16(1)));
+            }
+#endif
+        }
+        alignas(64) int32_t lanes[V::size()];
+        for (int r=0;r<rows;++r) for (int c=0;c<columns;++c) {
+            accum[r][c].store(lanes);
+            for (const auto value:lanes) totals[r*4+c]+=value;
+        }
+    }
+#endif
+    for (;k<size;k+=2) for (int r=0;r<rows;++r) for (int c=0;c<columns;++c) {
+        int value=static_cast<int>(x[r*size+k])*w[c*weight_stride+k];
+        if (k+1<size) value+=static_cast<int>(x[r*size+k+1])*w[c*weight_stride+k+1];
+        totals[r*4+c]+=std::clamp(value,-32768,32767);
+    }
+}
+
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC push_options
 #pragma GCC optimize ("fp-contract=off")
@@ -145,6 +189,19 @@ void int4_mm_codes(const T* x, const uint8_t* packed, const T* params, T* output
             for (int64_t feature=0;feature<k;++feature) {
                 if (feature%group==0) {
                     for (int c=0;c<vectors;++c) {
+                        if (c*lanes+lanes<=width) {
+                            const int64_t index=(feature/group*n+first+c*lanes)*2;
+                            FV a,b;
+                            if constexpr (std::is_same_v<T,float>) {
+                                a=FV::loadu(params+index); b=FV::loadu(params+index+lanes);
+                            } else {
+                                using TV=vec::Vectorized<T>;
+                                const auto values=vec::convert<float,2>(vec::VectorizedN<T,1>(TV::loadu(params+index)));
+                                a=values[0]; b=values[1];
+                            }
+                            std::tie(scales[c],zeros[c])=vec::deinterleave2(a,b);
+                            continue;
+                        }
                         alignas(64) float s[lanes]{}, z[lanes]{};
                         for (int lane=0;lane<lanes && c*lanes+lane<width;++lane) {
                             const int64_t index=(feature/group*n+first+c*lanes+lane)*2;
@@ -153,7 +210,26 @@ void int4_mm_codes(const T* x, const uint8_t* packed, const T* params, T* output
                         scales[c]=FV::loadu(s); zeros[c]=FV::loadu(z);
                     }
                 }
+                FV activation[4];
+                for (int r=0;r<rows;++r) activation[r]=FV(static_cast<float>(x[(row+r)*k+feature]));
                 for (int c=0;c<vectors;++c) {
+                    FV code_vector;
+#if defined(CPU_CAPABILITY_AVX2) || defined(CPU_CAPABILITY_AVX512)
+                    if (width==columns) {
+                        const int offset=c%(vectors/2)*lanes,shift=(c>=vectors/2)*4;
+                        const auto* src=packed+first*k/2+feature*width/2+offset;
+#ifdef CPU_CAPABILITY_AVX512
+                        auto values=_mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(src)));
+                        values=_mm512_and_si512(_mm512_srli_epi32(values,shift),_mm512_set1_epi32(15));
+                        code_vector=FV(_mm512_cvtepi32_ps(_mm512_sub_epi32(values,_mm512_set1_epi32(8))));
+#else
+                        auto values=_mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(src)));
+                        values=_mm256_and_si256(_mm256_srli_epi32(values,shift),_mm256_set1_epi32(15));
+                        code_vector=FV(_mm256_cvtepi32_ps(_mm256_sub_epi32(values,_mm256_set1_epi32(8))));
+#endif
+                    } else
+#endif
+                    {
                     alignas(64) float codes[lanes]{};
                     for (int lane=0;lane<lanes && c*lanes+lane<width;++lane) {
                         const int col=c*lanes+lane;
@@ -165,9 +241,11 @@ void int4_mm_codes(const T* x, const uint8_t* packed, const T* params, T* output
 #endif
                         codes[lane]=static_cast<float>(((packed[first*k/2+feature*width/2+byte]>>shift)&15)-8);
                     }
-                    const FV weight=vec::fmadd(FV::loadu(codes),scales[c],zeros[c]);
+                    code_vector=FV::loadu(codes);
+                    }
+                    const FV weight=vec::fmadd(code_vector,scales[c],zeros[c]);
                     for (int r=0;r<rows;++r)
-                        acc[r][c]=vec::fmadd(FV(static_cast<float>(x[(row+r)*k+feature])),weight,acc[r][c]);
+                        acc[r][c]=vec::fmadd(activation[r],weight,acc[r][c]);
                 }
             }
             for (int r=0;r<rows;++r) for (int c=0;c<vectors;++c) {
@@ -191,12 +269,14 @@ void int4_mm_impl(const void* x, const uint8_t* packed, const void* params, void
 
 template<class Q>
 void batch_norm_codes(const void* xx, void* yy, int64_t channels,
-        const float* alpha, const float* beta, int64_t xz, int64_t yz, bool relu) {
+        const float* alpha, const float* beta, int64_t xz, int64_t yz, bool relu,int64_t rows) {
     using T = typename Q::underlying;
     using QV = vec::Vectorized<Q>;
     using FV = vec::Vectorized<float>;
-    const auto* x = static_cast<const T*>(xx); auto* y = static_cast<T*>(yy);
     const FV one(1.f), zero(0.f), zp(static_cast<float>(xz));
+    for (int64_t row=0;row<rows;++row) {
+    const auto* x = static_cast<const T*>(xx)+row*channels;
+    auto* y = static_cast<T*>(yy)+row*channels;
     int64_t c = 0;
     for (; c + QV::size() <= channels; c += QV::size()) {
         auto values = QV::loadu(x+c).dequantize(one, zp);
@@ -212,14 +292,15 @@ void batch_norm_codes(const void* xx, void* yy, int64_t channels,
         if (relu) value = std::max(value, 0.f);
         y[c] = quant::encode<T>(value, 1.f, yz);
     }
+    }
 }
 
 void batch_norm_impl(const void* x, void* y, int64_t channels, DType dtype,
-        const float* alpha, const float* beta, int64_t xz, int64_t yz, bool relu) {
+        const float* alpha, const float* beta, int64_t xz, int64_t yz, bool relu,int64_t rows) {
     switch (dtype) {
-        case DType::QInt8: batch_norm_codes<qint8>(x,y,channels,alpha,beta,xz,yz,relu); break;
-        case DType::QUInt8: batch_norm_codes<quint8>(x,y,channels,alpha,beta,xz,yz,relu); break;
-        case DType::QInt32: batch_norm_codes<qint32>(x,y,channels,alpha,beta,xz,yz,relu); break;
+        case DType::QInt8: batch_norm_codes<qint8>(x,y,channels,alpha,beta,xz,yz,relu,rows); break;
+        case DType::QUInt8: batch_norm_codes<quint8>(x,y,channels,alpha,beta,xz,yz,relu,rows); break;
+        case DType::QInt32: batch_norm_codes<qint32>(x,y,channels,alpha,beta,xz,yz,relu,rows); break;
         default: break;
     }
 }
@@ -392,6 +473,7 @@ void embedding_impl(const uint8_t* w, const int64_t* indices, const int64_t* off
 #ifndef CPU_CAPABILITY_AVX512
 REGISTER_DISPATCH(quantized_recurrent_step_stub, &recurrent_step_impl);
 REGISTER_DISPATCH(quantized_dynamic_dot_stub, &dynamic_dot_impl);
+REGISTER_DISPATCH(quantized_dynamic_block_stub, &dynamic_block_impl);
 REGISTER_DISPATCH(quantized_int4_pack_stub, &int4_pack_impl);
 REGISTER_DISPATCH(quantized_int4_mm_stub, &int4_mm_impl);
 REGISTER_DISPATCH(quantized_batch_norm_stub, &batch_norm_impl);
@@ -404,6 +486,7 @@ REGISTER_DISPATCH(quantized_fp16_linear_stub, &fp16_linear_impl);
 #else
 ALSO_REGISTER_AVX512_DISPATCH(quantized_recurrent_step_stub, &recurrent_step_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_dynamic_dot_stub, &dynamic_dot_impl);
+ALSO_REGISTER_AVX512_DISPATCH(quantized_dynamic_block_stub, &dynamic_block_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_int4_pack_stub, &int4_pack_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_int4_mm_stub, &int4_mm_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_batch_norm_stub, &batch_norm_impl);
