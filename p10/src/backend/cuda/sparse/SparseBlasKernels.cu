@@ -146,11 +146,33 @@ FlatCsr flatten_csr(const Tensor& csr) {
 Tensor& sparse_sampled_addmm_out_sparse_csr_cuda(
     const Tensor& self, const Tensor& mat1, const Tensor& mat2,
     const Scalar& beta, const Scalar& alpha, Tensor& result) {
-    if (!self.is_sparse_csr() || self.dense_dim() != 0 ||
-        result.dense_dim() != 0) {
+    if (!self.is_sparse_csr() || self.dense_dim() != 0) {
         TP_THROW(RuntimeError,
                  "sparse_sampled_addmm: expected non-hybrid sparse CSR "
-                 "self/result");
+                 "self");
+    }
+    if (&result != &self || !result.is_sparse_csr() ||
+        !result._values().is_contiguous()) {
+        // Rebuild `result` to carry self's sparsity pattern and shape.  The
+        // components are cloned so later in-place updates never alias self
+        // and the kernel always writes into contiguous storage.  This also
+        // turns the strided seed created by the function variant into a CSR
+        // tensor before any layout validation runs.
+        Tensor crow = self._crow_indices().contiguous().clone();
+        Tensor col = self._col_indices().contiguous().clone();
+        Tensor values = self._values().contiguous().clone();
+        result.unsafeGetTensorImpl()->set_sparse_compressed_state(
+            crow.unsafeGetTensorImpl(), col.unsafeGetTensorImpl(),
+            values.unsafeGetTensorImpl(),
+            static_cast<std::vector<int64_t>>(self.shape()),
+            TensorImpl::kSparseCSRLayout, {0, 0});
+        result.unsafeGetTensorImpl()->set_sizes_contiguous(
+            static_cast<std::vector<int64_t>>(self.shape()));
+    }
+    if (result.dense_dim() != 0) {
+        TP_THROW(RuntimeError,
+                 "sparse_sampled_addmm: expected non-hybrid sparse CSR "
+                 "result");
     }
     if (mat1.is_sparse() || mat2.is_sparse() ||
         !result.is_sparse_csr()) {

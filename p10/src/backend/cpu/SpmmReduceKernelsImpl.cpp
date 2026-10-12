@@ -87,29 +87,50 @@ inline void reduce_row(const scalar_t* other_data, const index_t* col,
                        int64_t row_end, int64_t K, int reduce, bool need_arg,
                        int64_t nnz, scalar_t* out_ptr, index_t* arg_ptr) {
     const int64_t count = row_end - row_start;
+    const int64_t vec_size = Vec::size();
+    // Sum/mean outputs arrive pre-zeroed from the entry point; only the
+    // amax/amin rows need re-initialization to the opposite infinities.
     if (reduce == 2) {
-        for (int64_t k = 0; k < K; ++k) out_ptr[k] = neg_inf<scalar_t>();
+        const Vec init = Vec(neg_inf<scalar_t>());
+        int64_t k = 0;
+        for (; k + vec_size <= K; k += vec_size) init.store(out_ptr + k);
+        for (; k < K; ++k) out_ptr[k] = neg_inf<scalar_t>();
     } else if (reduce == 3) {
-        for (int64_t k = 0; k < K; ++k) out_ptr[k] = pos_inf<scalar_t>();
-    } else {
-        for (int64_t k = 0; k < K; ++k) out_ptr[k] = scalar_t(0);
-    }
-    if (need_arg) {
-        for (int64_t k = 0; k < K; ++k) arg_ptr[k] = static_cast<index_t>(nnz);
+        const Vec init = Vec(pos_inf<scalar_t>());
+        int64_t k = 0;
+        for (; k + vec_size <= K; k += vec_size) init.store(out_ptr + k);
+        for (; k < K; ++k) out_ptr[k] = pos_inf<scalar_t>();
     }
     if (count == 0) {
         return;
     }
 
     if (reduce == 0 || reduce == 1) {
-        const int64_t vec_size = Vec::size();
+        const int64_t kVLEN = vec_size * 4;
         for (int64_t e = row_start; e < row_end; ++e) {
             const int64_t c = col[e];
             const scalar_t v = values[e];
+            const Vec v_vec = Vec(v);
             const scalar_t* other_row = other_data + c * K;
             int64_t k = 0;
+            // Four-way unroll: each stored element reads the output row
+            // once per four vectors instead of once per vector.
+            for (; k + kVLEN <= K; k += kVLEN) {
+                Vec acc0 = Vec::loadu(out_ptr + k);
+                Vec acc1 = Vec::loadu(out_ptr + k + vec_size);
+                Vec acc2 = Vec::loadu(out_ptr + k + vec_size * 2);
+                Vec acc3 = Vec::loadu(out_ptr + k + vec_size * 3);
+                acc0 = acc0 + v_vec * Vec::loadu(other_row + k);
+                acc1 = acc1 + v_vec * Vec::loadu(other_row + k + vec_size);
+                acc2 = acc2 + v_vec * Vec::loadu(other_row + k + vec_size * 2);
+                acc3 = acc3 + v_vec * Vec::loadu(other_row + k + vec_size * 3);
+                acc0.store(out_ptr + k);
+                acc1.store(out_ptr + k + vec_size);
+                acc2.store(out_ptr + k + vec_size * 2);
+                acc3.store(out_ptr + k + vec_size * 3);
+            }
             for (; k + vec_size <= K; k += vec_size) {
-                const Vec prod = Vec(v) * Vec::loadu(other_row + k);
+                const Vec prod = v_vec * Vec::loadu(other_row + k);
                 (Vec::loadu(out_ptr + k) + prod).store(out_ptr + k);
             }
             for (; k < K; ++k) {
@@ -126,14 +147,40 @@ inline void reduce_row(const scalar_t* other_data, const index_t* col,
     // amax/amin: vectorized compare when no arg is needed; scalar with arg
     // tracking when autograd asks for the winning index.
     if (!need_arg) {
-        const int64_t vec_size = Vec::size();
+        const int64_t kVLEN = vec_size * 4;
         for (int64_t e = row_start; e < row_end; ++e) {
             const int64_t c = col[e];
             const scalar_t v = values[e];
+            const Vec v_vec = Vec(v);
             const scalar_t* other_row = other_data + c * K;
             int64_t k = 0;
+            for (; k + kVLEN <= K; k += kVLEN) {
+                const Vec prod0 = v_vec * Vec::loadu(other_row + k);
+                const Vec prod1 =
+                    v_vec * Vec::loadu(other_row + k + vec_size);
+                const Vec prod2 =
+                    v_vec * Vec::loadu(other_row + k + vec_size * 2);
+                const Vec prod3 =
+                    v_vec * Vec::loadu(other_row + k + vec_size * 3);
+                const Vec cur0 = Vec::loadu(out_ptr + k);
+                const Vec cur1 = Vec::loadu(out_ptr + k + vec_size);
+                const Vec cur2 = Vec::loadu(out_ptr + k + vec_size * 2);
+                const Vec cur3 = Vec::loadu(out_ptr + k + vec_size * 3);
+                (reduce == 2 ? tensorplay::vec::maximum(cur0, prod0)
+                             : tensorplay::vec::minimum(cur0, prod0))
+                    .store(out_ptr + k);
+                (reduce == 2 ? tensorplay::vec::maximum(cur1, prod1)
+                             : tensorplay::vec::minimum(cur1, prod1))
+                    .store(out_ptr + k + vec_size);
+                (reduce == 2 ? tensorplay::vec::maximum(cur2, prod2)
+                             : tensorplay::vec::minimum(cur2, prod2))
+                    .store(out_ptr + k + vec_size * 2);
+                (reduce == 2 ? tensorplay::vec::maximum(cur3, prod3)
+                             : tensorplay::vec::minimum(cur3, prod3))
+                    .store(out_ptr + k + vec_size * 3);
+            }
             for (; k + vec_size <= K; k += vec_size) {
-                const Vec prod = Vec(v) * Vec::loadu(other_row + k);
+                const Vec prod = v_vec * Vec::loadu(other_row + k);
                 const Vec cur = Vec::loadu(out_ptr + k);
                 (reduce == 2 ? tensorplay::vec::maximum(cur, prod)
                              : tensorplay::vec::minimum(cur, prod))
@@ -222,7 +269,8 @@ void spmm_reduce_backward_input_kernel_impl(
     const index_t* row_data = row.data_ptr<index_t>();
 
     using Vec = tensorplay::vec::Vectorized<scalar_t>;
-    parallel_for(0, nnz, 1, [&](int64_t begin, int64_t end) {
+    parallel_for(0, nnz, std::max<int64_t>(1, 32768 / K),
+                 [&](int64_t begin, int64_t end) {
         for (int64_t i = begin; i < end; ++i) {
             const int64_t r = row_data[i];
             const int64_t c = col_data[i];
@@ -267,7 +315,8 @@ void spmm_reduce_backward_input_arg_kernel_impl(
     Tensor grad = Tensor::empty({M, K}, grad_out.dtype(), grad_out.device());
     scalar_t* grad_data = grad.data_ptr<scalar_t>();
 
-    parallel_for(0, M, 1, [&](int64_t begin, int64_t end) {
+    parallel_for(0, M, std::max<int64_t>(1, 32768 / K),
+                 [&](int64_t begin, int64_t end) {
         for (int64_t m = begin; m < end; ++m) {
             const scalar_t* grad_out_row = grad_out_data + m * K;
             const index_t* arg_row = arg_data + m * K;
@@ -315,7 +364,8 @@ void spmm_reduce_backward_other_kernel_impl(
     const index_t* row_data = row.data_ptr<index_t>();
     const scalar_t* values_data = values.data_ptr<scalar_t>();
 
-    parallel_for(0, N, 1, [&](int64_t begin, int64_t end) {
+    parallel_for(0, N, std::max<int64_t>(1, 32768 / K),
+                 [&](int64_t begin, int64_t end) {
         for (int64_t n = begin; n < end; ++n) {
             scalar_t* grad_other_row = grad_other_data + n * K;
             for (int64_t p = ccol_data[n]; p < ccol_data[n + 1]; ++p) {

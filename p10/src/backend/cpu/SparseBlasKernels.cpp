@@ -100,6 +100,30 @@ void sparse_sampled_addmm_check_inputs(const Tensor& self,
 Tensor& sparse_sampled_addmm_out_sparse_csr_cpu(
     const Tensor& self, const Tensor& mat1, const Tensor& mat2,
     const Scalar& beta, const Scalar& alpha, Tensor& result) {
+    if (!self.is_sparse_csr()) {
+        TP_THROW(RuntimeError,
+                 "sparse_sampled_addmm: expected self to be a sparse CSR "
+                 "tensor, got layout ",
+                 (self.is_sparse() ? "sparse" : "strided"));
+    }
+    if (&result != &self || !result.is_sparse_csr() ||
+        !result._values().is_contiguous()) {
+        // Rebuild `result` to carry self's sparsity pattern and shape.  The
+        // components are cloned so later in-place updates never alias self
+        // and the kernel always writes into contiguous storage.  This also
+        // turns the strided seed created by the function variant into a CSR
+        // tensor before any layout validation runs.
+        Tensor crow = self._crow_indices().contiguous().clone();
+        Tensor col = self._col_indices().contiguous().clone();
+        Tensor values = self._values().contiguous().clone();
+        result.unsafeGetTensorImpl()->set_sparse_compressed_state(
+            crow.unsafeGetTensorImpl(), col.unsafeGetTensorImpl(),
+            values.unsafeGetTensorImpl(),
+            static_cast<std::vector<int64_t>>(self.shape()),
+            TensorImpl::kSparseCSRLayout, {0, 0});
+        result.unsafeGetTensorImpl()->set_sizes_contiguous(
+            static_cast<std::vector<int64_t>>(self.shape()));
+    }
     sparse_sampled_addmm_check_inputs(self, mat1, mat2, result);
     const DType dtype = self.dtype();
     if (dtype != DType::Float32 && dtype != DType::Float64 &&
@@ -114,20 +138,6 @@ Tensor& sparse_sampled_addmm_out_sparse_csr_cpu(
         TP_THROW(DeviceMismatchError,
                  "sparse_sampled_addmm: all operands must be on the same "
                  "device");
-    }
-
-    if (&result != &self || !result._values().is_contiguous()) {
-        // Rebuild `result` to carry self's sparsity pattern and shape.  The
-        // components are cloned so later in-place updates never alias self
-        // and the kernel always writes into contiguous storage.
-        Tensor crow = self._crow_indices().contiguous().clone();
-        Tensor col = self._col_indices().contiguous().clone();
-        Tensor values = self._values().contiguous().clone();
-        result.unsafeGetTensorImpl()->set_sparse_compressed_state(
-            crow.unsafeGetTensorImpl(), col.unsafeGetTensorImpl(),
-            values.unsafeGetTensorImpl(),
-            static_cast<std::vector<int64_t>>(self.shape()),
-            TensorImpl::kSparseCSRLayout, {0, 0});
     }
 
     const int64_t nnz = self._values().size(-1);

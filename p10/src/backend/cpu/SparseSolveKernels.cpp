@@ -39,8 +39,8 @@ struct SparseLU {
     std::vector<int64_t> L_colptr;
     std::vector<int64_t> L_rowidx;
     std::vector<compute_t> L_val;
-    std::vector<int64_t> U_rowptr;
-    std::vector<int64_t> U_colidx;
+    std::vector<int64_t> U_colptr;
+    std::vector<int64_t> U_rowidx;
     std::vector<compute_t> U_val;
     std::vector<int64_t> perm;  // PA[i, :] == A[perm[i], :]
 };
@@ -56,23 +56,29 @@ SparseLU<compute_t> sparse_lu_factor(const std::vector<int64_t>& colptr,
     SparseLU<compute_t> lu;
     lu.n = n;
     lu.L_colptr.assign(n + 1, 0);
-    lu.U_rowptr.assign(n + 1, 0);
+    lu.U_colptr.assign(n + 1, 0);
     lu.perm.resize(n);
     for (int64_t i = 0; i < n; ++i) lu.perm[i] = i;
+    // inv_perm[original_row] is the current position of that row; it keeps
+    // the column scatter consistent after row swaps.
+    std::vector<int64_t> inv_perm(n);
+    for (int64_t i = 0; i < n; ++i) inv_perm[i] = i;
 
     std::vector<compute_t> x(n, compute_t(0));
     std::vector<int64_t> nz_rows;
     std::vector<uint8_t> in_list(static_cast<size_t>(n), 0);
 
     for (int64_t j = 0; j < n; ++j) {
-        // Gather column j of A into the elimination vector.
+        // Gather column j of A into the elimination vector, placing each
+        // original row at its current permuted position.
         for (int64_t p = colptr[j]; p < colptr[j + 1]; ++p) {
-            const int64_t r = row[p];
-            if (x[r] == compute_t(0) && !in_list[static_cast<size_t>(r)]) {
-                in_list[static_cast<size_t>(r)] = 1;
-                nz_rows.push_back(r);
+            const int64_t pos = inv_perm[row[p]];
+            if (x[pos] == compute_t(0) &&
+                !in_list[static_cast<size_t>(pos)]) {
+                in_list[static_cast<size_t>(pos)] = 1;
+                nz_rows.push_back(pos);
             }
-            x[r] = val[p];
+            x[pos] = val[p];
         }
 
         // Sparse forward solve: update x[i] -= L[i][k] * x[k] for k < j.
@@ -107,18 +113,40 @@ SparseLU<compute_t> sparse_lu_factor(const std::vector<int64_t>& colptr,
         if (piv_row < 0) {
             TP_THROW(RuntimeError, "_spsolve(): matrix is singular");
         }
-        lu.perm[j] = piv_row;
         if (piv_row != j) {
             std::swap(lu.perm[j], lu.perm[static_cast<size_t>(piv_row)]);
+            inv_perm[lu.perm[j]] = j;
+            inv_perm[lu.perm[static_cast<size_t>(piv_row)]] = piv_row;
             std::swap(x[j], x[static_cast<size_t>(piv_row)]);
+            // The swapped rows carry their multipliers from earlier L
+            // columns along with them, so exchange those entries too.
+            for (int64_t k = 0; k < j; ++k) {
+                int64_t idx_j = -1;
+                int64_t idx_piv = -1;
+                for (int64_t q = lu.L_colptr[k]; q < lu.L_colptr[k + 1];
+                     ++q) {
+                    if (lu.L_rowidx[q] == j) {
+                        idx_j = q;
+                    } else if (lu.L_rowidx[q] == piv_row) {
+                        idx_piv = q;
+                    }
+                }
+                if (idx_j >= 0 && idx_piv >= 0) {
+                    std::swap(lu.L_val[idx_j], lu.L_val[idx_piv]);
+                } else if (idx_j >= 0) {
+                    lu.L_rowidx[idx_j] = piv_row;
+                } else if (idx_piv >= 0) {
+                    lu.L_rowidx[idx_piv] = j;
+                }
+            }
         }
         const compute_t pivot_val = x[j];
 
-        // Store row j of U (entries at columns >= j).
-        lu.U_rowptr[j] = static_cast<int64_t>(lu.U_colidx.size());
+        // Store column j of U (entries at rows <= j).
+        lu.U_colptr[j] = static_cast<int64_t>(lu.U_rowidx.size());
         for (int64_t i : nz_rows) {
-            if (i < j || x[i] == compute_t(0)) continue;
-            lu.U_colidx.push_back(i);
+            if (i > j || x[i] == compute_t(0)) continue;
+            lu.U_rowidx.push_back(i);
             lu.U_val.push_back(x[i]);
         }
 
@@ -130,6 +158,8 @@ SparseLU<compute_t> sparse_lu_factor(const std::vector<int64_t>& colptr,
             lu.L_rowidx.push_back(i);
             lu.L_val.push_back(x[i] / pivot_val);
         }
+        // Close column j so the next forward solve can see it.
+        lu.L_colptr[j + 1] = static_cast<int64_t>(lu.L_rowidx.size());
 
         // Reset the elimination vector.
         for (int64_t i : nz_rows) {
@@ -139,7 +169,7 @@ SparseLU<compute_t> sparse_lu_factor(const std::vector<int64_t>& colptr,
         nz_rows.clear();
     }
     lu.L_colptr[n] = static_cast<int64_t>(lu.L_rowidx.size());
-    lu.U_rowptr[n] = static_cast<int64_t>(lu.U_colidx.size());
+    lu.U_colptr[n] = static_cast<int64_t>(lu.U_rowidx.size());
     return lu;
 }
 
@@ -159,19 +189,28 @@ void lu_solve_one(const SparseLU<compute_t>& lu,
             y[static_cast<size_t>(lu.L_rowidx[q])] -= lu.L_val[q] * yk;
         }
     }
-    // Back substitution: U x = y.
-    for (int64_t i = n - 1; i >= 0; --i) {
-        compute_t sum = compute_t(0);
+    // Back substitution: U x = y.  U is stored by columns, so each
+    // column is applied from the bottom up: normalize the diagonal, then
+    // eliminate its contribution from the rows above.
+    for (int64_t i = 0; i < n; ++i) {
+        x[static_cast<size_t>(i)] = y[static_cast<size_t>(i)];
+    }
+    for (int64_t j = n - 1; j >= 0; --j) {
         compute_t diag = compute_t(0);
-        for (int64_t q = lu.U_rowptr[i]; q < lu.U_rowptr[i + 1]; ++q) {
-            const int64_t c = lu.U_colidx[q];
-            if (c == i) {
+        for (int64_t q = lu.U_colptr[j]; q < lu.U_colptr[j + 1]; ++q) {
+            if (lu.U_rowidx[q] == j) {
                 diag = lu.U_val[q];
-            } else if (c > i) {
-                sum += lu.U_val[q] * x[static_cast<size_t>(c)];
+                break;
             }
         }
-        x[static_cast<size_t>(i)] = (y[static_cast<size_t>(i)] - sum) / diag;
+        x[static_cast<size_t>(j)] /= diag;
+        const compute_t xj = x[static_cast<size_t>(j)];
+        for (int64_t q = lu.U_colptr[j]; q < lu.U_colptr[j + 1]; ++q) {
+            const int64_t i = lu.U_rowidx[q];
+            if (i < j) {
+                x[static_cast<size_t>(i)] -= lu.U_val[q] * xj;
+            }
+        }
     }
 }
 
