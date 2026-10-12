@@ -435,6 +435,12 @@ REGISTER_DISPATCH(spmm_reduce_backward_input_stub,
                   &spmm_reduce_backward_input_kernel)
 REGISTER_DISPATCH(spmm_reduce_backward_other_stub,
                   &spmm_reduce_backward_other_kernel)
+#else
+ALSO_REGISTER_AVX512_DISPATCH(spmm_reduce_stub, &spmm_reduce_kernel)
+ALSO_REGISTER_AVX512_DISPATCH(spmm_reduce_backward_input_stub,
+                             &spmm_reduce_backward_input_kernel)
+ALSO_REGISTER_AVX512_DISPATCH(spmm_reduce_backward_other_stub,
+                             &spmm_reduce_backward_other_kernel)
 #endif
 
 } // namespace CPU_CAPABILITY
