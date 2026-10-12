@@ -8,7 +8,7 @@ def rebuild_quantized_tensor(codes, params):
         scheme, dtype, size, stride, offset, grid, _ = params
         if isinstance(dtype, str):
             try:
-                dtype = {'quint2x4': tp.quint2x4, 'quint4x2': tp.quint4x2}[dtype]
+                dtype = {'quint2x4': tp.quint2x4, 'quint4x2': tp.quint4x2, 'quint1x8': tp.quint1x8}[dtype]
             except KeyError:
                 raise ValueError('Unsupported packed quantized checkpoint dtype') from None
         if scheme == 'per_tensor_affine':
@@ -57,7 +57,7 @@ def rebuild_qtensor(storage, storage_offset, size, stride, params, requires_grad
 
 
 def quantized_tensor_reduction(tensor):
-    if tensor.dtype in (tp.quint2x4, tp.quint4x2):
+    if tensor.dtype in (tp.quint2x4, tp.quint4x2, tp.quint1x8):
         codes = tp.empty((0,), dtype=tp.uint8, device=tensor.device)
         codes.set_(tensor.untyped_storage(), 0, (tensor.untyped_storage().nbytes(),), (1,))
         scheme = tensor.qscheme()
@@ -68,11 +68,11 @@ def quantized_tensor_reduction(tensor):
                                   tensor.q_per_channel_zero_points(), tensor.q_per_channel_axis())
         else:
             raise ValueError('Unsupported packed quantized checkpoint grid')
-        dtype_name = 'quint4x2' if tensor.dtype == tp.quint4x2 else 'quint2x4'
+        dtype_name = 'quint4x2' if tensor.dtype == tp.quint4x2 else 'quint2x4' if tensor.dtype == tp.quint2x4 else 'quint1x8'
         params = (name, dtype_name, tuple(tensor.shape), tuple(tensor.stride()),
                   tensor.storage_offset(), grid, 'packed_affine')
         return rebuild_quantized_tensor, (codes, params)
-    storage_dtype = {tp.qint8: tp.int8, tp.quint8: tp.uint8, tp.qint32: tp.int32, tp.quint2x4: tp.uint8}[tensor.dtype]
+    storage_dtype = {tp.qint8: tp.int8, tp.quint8: tp.uint8, tp.qint32: tp.int32, tp.quint2x4: tp.uint8, tp.quint1x8: tp.uint8}[tensor.dtype]
     codes = tp.empty((0,), dtype=storage_dtype, device=tensor.device)
     codes.set_(tensor.untyped_storage(), tensor.storage_offset(), tensor.shape, tensor.stride())
     scheme = tensor.qscheme()

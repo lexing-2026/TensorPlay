@@ -1,0 +1,302 @@
+{
+  "timestamp": "2026-10-12T22:23:41.416336+00:00",
+  "commit": "8089c9c26b4425d51d9d9c0276631bb96c545887",
+  "processor": "x86_64",
+  "threads": 4,
+  "repetitions": 50,
+  "reference_version": "2.13.0+cu130",
+  "results": [
+    {
+      "operator": "quantize_1bit",
+      "device": "cpu",
+      "shape": [
+        65536
+      ],
+      "native_us": 26.20254,
+      "reference_us": 49.22508,
+      "speedup": 1.87863771985464,
+      "max_error": 0.0
+    },
+    {
+      "operator": "dequantize_1bit",
+      "device": "cpu",
+      "shape": [
+        65536
+      ],
+      "native_us": 16.28402,
+      "reference_us": 21.206100000000003,
+      "speedup": 1.3022644285624803,
+      "max_error": 0.0
+    },
+    {
+      "operator": "quantize_1bit",
+      "device": "cpu",
+      "shape": [
+        1048577
+      ],
+      "native_us": 111.73328,
+      "reference_us": 219.53952,
+      "speedup": 1.964853443844126,
+      "max_error": 0.0
+    },
+    {
+      "operator": "dequantize_1bit",
+      "device": "cpu",
+      "shape": [
+        1048577
+      ],
+      "native_us": 68.38083999999999,
+      "reference_us": 116.60969999999999,
+      "speedup": 1.7052978582889593,
+      "max_error": 0.0
+    },
+    {
+      "operator": "quantize_1bit",
+      "device": "cpu",
+      "shape": [
+        1024,
+        1024
+      ],
+      "native_us": 109.72004000000001,
+      "reference_us": 188.95506,
+      "speedup": 1.7221563171139929,
+      "max_error": 0.0
+    },
+    {
+      "operator": "dequantize_1bit",
+      "device": "cpu",
+      "shape": [
+        1024,
+        1024
+      ],
+      "native_us": 68.66682,
+      "reference_us": 85.77342,
+      "speedup": 1.2491246864206031,
+      "max_error": 0.0
+    },
+    {
+      "operator": "bitnet_linear",
+      "device": "cpu",
+      "shape": [
+        2,
+        512,
+        1024
+      ],
+      "native_us": 393.22844,
+      "reference_us": 98.49132,
+      "speedup": 0.2504684554352173,
+      "max_error": 7.152557373046875e-07
+    },
+    {
+      "operator": "bitnet_linear_cached",
+      "device": "cpu",
+      "shape": [
+        2,
+        512,
+        1024
+      ],
+      "native_us": 8.41538,
+      "reference_us": 98.65593999999999,
+      "speedup": 11.723289976210221,
+      "max_error": 7.152557373046875e-07
+    },
+    {
+      "operator": "bitnet_linear",
+      "device": "cpu",
+      "shape": [
+        32,
+        256,
+        512
+      ],
+      "native_us": 285.2339,
+      "reference_us": 101.7182,
+      "speedup": 0.3566132917580975,
+      "max_error": 0.0
+    },
+    {
+      "operator": "bitnet_linear_cached",
+      "device": "cpu",
+      "shape": [
+        32,
+        256,
+        512
+      ],
+      "native_us": 17.06166,
+      "reference_us": 101.69386,
+      "speedup": 5.960373140714327,
+      "max_error": 0.0
+    },
+    {
+      "operator": "bitnet_linear",
+      "device": "cpu",
+      "shape": [
+        256,
+        512,
+        1024
+      ],
+      "native_us": 658.9954399999999,
+      "reference_us": 660.4086199999999,
+      "speedup": 1.0021444457946478,
+      "max_error": 4.76837158203125e-07
+    },
+    {
+      "operator": "bitnet_linear_cached",
+      "device": "cpu",
+      "shape": [
+        256,
+        512,
+        1024
+      ],
+      "native_us": 158.4703,
+      "reference_us": 652.5954800000001,
+      "speedup": 4.118093295715349,
+      "max_error": 4.76837158203125e-07
+    },
+    {
+      "operator": "quantize_1bit",
+      "device": "cuda",
+      "shape": [
+        65536
+      ],
+      "native_us": 2.91344,
+      "reference_us": 54.54234,
+      "speedup": 18.720941567356803,
+      "max_error": 0.0
+    },
+    {
+      "operator": "dequantize_1bit",
+      "device": "cuda",
+      "shape": [
+        65536
+      ],
+      "native_us": 3.4819799999999996,
+      "reference_us": 35.49138,
+      "speedup": 10.192873020522807,
+      "max_error": 0.0
+    },
+    {
+      "operator": "quantize_1bit",
+      "device": "cuda",
+      "shape": [
+        1048577
+      ],
+      "native_us": 4.83322,
+      "reference_us": 74.19844,
+      "speedup": 15.351761351645488,
+      "max_error": 0.0
+    },
+    {
+      "operator": "dequantize_1bit",
+      "device": "cuda",
+      "shape": [
+        1048577
+      ],
+      "native_us": 24.15434,
+      "reference_us": 51.0207,
+      "speedup": 2.1122787871661983,
+      "max_error": 0.0
+    },
+    {
+      "operator": "quantize_1bit",
+      "device": "cuda",
+      "shape": [
+        1024,
+        1024
+      ],
+      "native_us": 4.847440000000001,
+      "reference_us": 75.74914,
+      "speedup": 15.62662766326143,
+      "max_error": 0.0
+    },
+    {
+      "operator": "dequantize_1bit",
+      "device": "cuda",
+      "shape": [
+        1024,
+        1024
+      ],
+      "native_us": 24.099899999999998,
+      "reference_us": 51.41168,
+      "speedup": 2.133273582048058,
+      "max_error": 0.0
+    },
+    {
+      "operator": "bitnet_linear",
+      "device": "cuda",
+      "shape": [
+        2,
+        512,
+        1024
+      ],
+      "native_us": 245.48936,
+      "reference_us": 130.41508,
+      "speedup": 0.5312453460304756,
+      "max_error": 0.0
+    },
+    {
+      "operator": "bitnet_linear_cached",
+      "device": "cuda",
+      "shape": [
+        2,
+        512,
+        1024
+      ],
+      "native_us": 15.58422,
+      "reference_us": 131.26013999999998,
+      "speedup": 8.422631354023492,
+      "max_error": 0.0
+    },
+    {
+      "operator": "bitnet_linear",
+      "device": "cuda",
+      "shape": [
+        32,
+        256,
+        512
+      ],
+      "native_us": 246.30944,
+      "reference_us": 131.16852,
+      "speedup": 0.5325354968124648,
+      "max_error": 2.384185791015625e-07
+    },
+    {
+      "operator": "bitnet_linear_cached",
+      "device": "cuda",
+      "shape": [
+        32,
+        256,
+        512
+      ],
+      "native_us": 21.19908,
+      "reference_us": 130.41754,
+      "speedup": 6.152037729939225,
+      "max_error": 2.384185791015625e-07
+    },
+    {
+      "operator": "bitnet_linear",
+      "device": "cuda",
+      "shape": [
+        256,
+        512,
+        1024
+      ],
+      "native_us": 249.39491999999998,
+      "reference_us": 131.8938,
+      "speedup": 0.5288551988147955,
+      "max_error": 0.0008213520050048828
+    },
+    {
+      "operator": "bitnet_linear_cached",
+      "device": "cuda",
+      "shape": [
+        256,
+        512,
+        1024
+      ],
+      "native_us": 68.76226,
+      "reference_us": 129.75068,
+      "speedup": 1.8869461242257015,
+      "max_error": 0.0008213520050048828
+    }
+  ]
+}

@@ -137,6 +137,7 @@ enum class ScalarType : int8_t {
     Float8_e5m2fnuz,
     Float8_e8m0fnu,
     QUInt4x2,
+    QUInt1x8,
     NumOptions,
 
     Byte = UInt8,
@@ -154,7 +155,7 @@ using DType = ScalarType;
 inline bool isQuantizedType(ScalarType type) {
     return type == ScalarType::QInt8 || type == ScalarType::QUInt8 ||
            type == ScalarType::QInt32 || type == ScalarType::QUInt2x4 ||
-           type == ScalarType::QUInt4x2;
+           type == ScalarType::QUInt4x2 || type == ScalarType::QUInt1x8;
 }
 
 inline bool isQIntType(ScalarType type) {
@@ -207,7 +208,7 @@ inline bool isUnsignedType(ScalarType type) {
     return type == ScalarType::UInt8 || type == ScalarType::UInt16 ||
            type == ScalarType::UInt32 || type == ScalarType::UInt64 ||
            type == ScalarType::QUInt8 || type == ScalarType::QUInt2x4 ||
-           type == ScalarType::QUInt4x2 ||
+           type == ScalarType::QUInt4x2 || type == ScalarType::QUInt1x8 ||
            type == ScalarType::Float8_e8m0fnu;
 }
 
@@ -250,6 +251,7 @@ inline bool isSignedType(ScalarType type) {
         case ScalarType::QInt32:
         case ScalarType::QUInt2x4:
         case ScalarType::QUInt4x2:
+        case ScalarType::QUInt1x8:
             break;
         case ScalarType::Undefined:
         case ScalarType::NumOptions:
@@ -269,6 +271,7 @@ inline ScalarType toUnderlyingStorageType(ScalarType type) {
             return ScalarType::Int32;
         case ScalarType::QUInt2x4:
         case ScalarType::QUInt4x2:
+        case ScalarType::QUInt1x8:
             return ScalarType::UInt8;
         default:
             return type;
@@ -381,7 +384,8 @@ inline constexpr bool is_complex_type_v =
     _(uint8_t, QUInt8)                 \
     _(int32_t, QInt32)                 \
     _(uint8_t, QUInt2x4)               \
-    _(uint8_t, QUInt4x2)
+    _(uint8_t, QUInt4x2)               \
+    _(uint8_t, QUInt1x8)
 
 #define TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_QINTS(_) \
     TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_FP8(_)       \
@@ -427,6 +431,8 @@ inline int64_t subByteElementPerByte(ScalarType type) {
             return 4;
         case ScalarType::QUInt4x2:
             return 2;
+        case ScalarType::QUInt1x8:
+            return 8;
         default:
             return 1;
     }

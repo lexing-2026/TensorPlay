@@ -132,7 +132,7 @@ class UniformQuantizationObserverBase(ObserverBase):
         self.register_buffer('eps', tensorplay.tensor([eps], **factory_kwargs))
         if self.qscheme not in (tensorplay.per_tensor_affine, tensorplay.per_tensor_symmetric, tensorplay.per_channel_affine, tensorplay.per_channel_symmetric, tensorplay.per_channel_affine_float_qparams):
             raise AssertionError('Default Observer only works for per_tensor_affine, per_tensor_symmetric, per_channel_affine, per_channel_symmetric and per_channel_float_qparams quantization scheme')
-        _ALLOWED_DTYPES = (tensorplay.qint8, tensorplay.quint8, tensorplay.quint4x2, tensorplay.qint32, tensorplay.int8, tensorplay.uint8, tensorplay.int16, tensorplay.int32, tensorplay.float8_e5m2, tensorplay.float8_e4m3fn, tensorplay.uint16)
+        _ALLOWED_DTYPES = (tensorplay.qint8, tensorplay.quint8, tensorplay.quint4x2, tensorplay.quint1x8, tensorplay.qint32, tensorplay.int8, tensorplay.uint8, tensorplay.int16, tensorplay.int32, tensorplay.float8_e5m2, tensorplay.float8_e4m3fn, tensorplay.uint16)
         if self.dtype not in _ALLOWED_DTYPES:
             raise AssertionError(f'Default Observer only works for {_ALLOWED_DTYPES} data type')
         self.has_customized_qrange = quant_min is not None and quant_max is not None
