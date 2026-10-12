@@ -282,3 +282,137 @@ def test_recurrent_multilayer_states_and_packed_order(device,kind,dtype,packed,b
     other.load_state_dict(native.state_dict())
     result,_=other(x,h)
     np.testing.assert_array_equal((result.data if packed else result).cpu().numpy(),(y.data if packed else y).cpu().numpy())
+
+
+@pytest.mark.parametrize('device',DEVICES)
+@pytest.mark.parametrize('rank',[1,2,3])
+@pytest.mark.parametrize('transposed',[False,True])
+@pytest.mark.parametrize('groups',[1,2])
+def test_dynamic_convolution_requantizes_input_grid(device,rank,transposed,groups):
+    rng=np.random.default_rng(512)
+    name=('ConvTranspose' if transposed else 'Conv')+f'{rank}d'
+    options=dict(stride=2,padding=1,dilation=2,groups=groups)
+    if transposed: options['output_padding']=1
+    native=getattr(tp.ao.nn.quantized.dynamic,name)(4,6,2,**options).to(device)
+    shape=(4,6//groups)+(2,)*rank if transposed else (6,4//groups)+(2,)*rank
+    weight=rng.integers(-37,38,size=shape,dtype='int8')
+    qw,rw=pair(weight,'int8',device,scale=.02,zp=-3)
+    bias=rng.normal(0,.1,size=6).astype('float32')
+    native.set_weight_bias(qw,tp.tensor(bias,device=device))
+    x=rng.normal(size=(2,4)+(5,)*rank).astype('float32')
+    packed_name=('conv_transpose' if transposed else 'conv')+f'{rank}d_prepack'
+    arguments=[rw,torch.tensor(bias),[2]*rank,[1]*rank]
+    if transposed: arguments.append([1]*rank)
+    arguments.extend([[2]*rank,groups])
+    packed=getattr(torch.ops.quantized,packed_name)(*arguments)
+    expected=getattr(torch.ops.quantized,('conv_transpose' if transposed else 'conv')+f'{rank}d_dynamic')(
+        torch.tensor(x),packed,True)
+    result=native(tp.tensor(x,device=device))
+    grid=tp._C.quantize_per_tensor_dynamic(tp.tensor(x,device=device),tp.quint8,True)
+    np.testing.assert_allclose(result.cpu().numpy(),expected.numpy(),atol=grid.q_scale()+1e-6,rtol=0)
+    second=getattr(tp.ao.nn.quantized.dynamic,name)(4,6,2,**options).to(device)
+    second.load_state_dict(native.state_dict())
+    np.testing.assert_array_equal(second(tp.tensor(x,device=device)).cpu().numpy(),result.cpu().numpy())
+
+
+@pytest.mark.parametrize('device',DEVICES)
+def test_public_operator_packets_and_packed_queries(device):
+    x,r=pair(np.arange(74).reshape(2,37),'uint8',device,zp=119)
+    for name in ('add','add_relu','mul','mul_relu'):
+        fn=getattr(tp.ops.quantized,name);ref=getattr(torch.ops.quantized,name)
+        same(fn(x,x,.2,119),ref(r,r,.2,119),1)
+        same(fn.Scalar(x,-3.7),ref.Scalar(r,-3.7),1)
+        same(fn.Scalar2(-3.7,x),ref.Scalar2(-3.7,r),1)
+        out,_=pair(np.zeros((2,37)),'uint8',device,scale=.13,zp=87)
+        result=fn.out(x,x,out)
+        assert result.data_ptr()==out.data_ptr()
+        same(out,ref(r,r,.13,87),1)
+    w,rw=pair(np.arange(11*37).reshape(11,37)%73,'int8',device,scale=.03,zp=-2)
+    b=tp.zeros(11,device=device)
+    packed=tp.ops.quantized.linear_prepack(w,b)
+    recovered,bias=tp.ops.quantized.linear_unpack(packed)
+    same(recovered,rw)
+    same(tp.ops.quantized.linear(x,packed,.07,119),torch.ops.quantized.linear(
+        r,torch.ops.quantized.linear_prepack(rw,torch.zeros(11)),.07,119),1)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('operation', ['linear_leaky_relu', 'linear_tanh'])
+@pytest.mark.parametrize('dtype,zp', TYPES[:2])
+def test_packed_linear_fused_activation(device, operation, dtype, zp):
+    rng = np.random.default_rng(110)
+    x, r = pair(rng.integers(0, 70, size=(3, 37)), dtype, device, scale=.05, zp=zp)
+    w, rw = pair(rng.integers(-60, 60, size=(11, 37)), 'int8', device, scale=.03, zp=-3)
+    bias = rng.normal(0, .1, size=11).astype('float32')
+    packed = tp.ops.quantized.linear_prepack(w, tp.tensor(bias, device=device))
+    args = (.07, zp, .17) if operation.endswith('leaky_relu') else (.07, zp)
+    actual = getattr(tp.ops.quantized, operation)(x, packed, *args)
+    real = torch.nn.functional.linear(r.dequantize(), rw.dequantize(), torch.tensor(bias))
+    real = torch.nn.functional.leaky_relu(real, .17) if operation.endswith('leaky_relu') else torch.tanh(real)
+    expected = torch.quantize_per_tensor(real, .07, zp, r.dtype)
+    same(actual, expected, 1)
+    if dtype == 'uint8':
+        saved = torch.backends.quantized.engine
+        try:
+            torch.backends.quantized.engine = 'onednn'
+            rp = torch.ops.quantized.linear_prepack(rw, torch.tensor(bias))
+            same(actual, getattr(torch.ops.quantized, operation)(r, rp, *args), 1)
+        finally:
+            torch.backends.quantized.engine = saved
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('relu', [False, True])
+@pytest.mark.parametrize('channels_last', [False, True])
+def test_packed_convolution_fused_residual(device, relu, channels_last):
+    rng = np.random.default_rng(118)
+    x, r = pair(rng.integers(0, 100, size=(2, 4, 5, 6)), 'uint8', device, scale=.03, zp=51)
+    w, rw = pair(rng.integers(-20, 20, size=(6, 2, 3, 3)), 'int8', device, scale=.02, zp=0)
+    accum, ra = pair(rng.integers(0, 150, size=(2, 6, 5, 6)), 'uint8', device, scale=.08, zp=75)
+    if channels_last:
+        accum = accum.contiguous(memory_format=tp.channels_last)
+        ra = ra.contiguous(memory_format=torch.channels_last)
+    pointer = accum.data_ptr()
+    packed = tp.ops.quantized.conv2d_prepack(w, None, [1, 1], [1, 1], [1, 1], 2)
+    name = 'conv2d_add_relu' if relu else 'conv2d_add'
+    real = torch.nn.functional.conv2d(r.dequantize(), rw.dequantize(), padding=1, groups=2) + ra.dequantize()
+    if relu:
+        real = real.relu()
+    expected = torch.quantize_per_tensor(real, .06, 63, torch.quint8)
+    actual = getattr(tp.ops.quantized, name)(x, accum, packed, .06, 63)
+    same(actual, expected, 1)
+    assert actual.is_contiguous(memory_format=tp.channels_last)
+    if channels_last:
+        assert actual.data_ptr() == pointer
+        assert accum.q_scale() == .06 and accum.q_zero_point() == 63
+    saved = torch.backends.quantized.engine
+    try:
+        torch.backends.quantized.engine = 'onednn'
+        rp = torch.ops.quantized.conv2d_prepack(rw, None, [1, 1], [1, 1], [1, 1], 2)
+        same(actual, getattr(torch.ops.quantized, name)(r, ra, rp, .06, 63), 1)
+    finally:
+        torch.backends.quantized.engine = saved
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('dtype,zp', TYPES)
+@pytest.mark.parametrize('rank', [2, 3, 4, 5])
+@pytest.mark.parametrize('relu', [False, True])
+@pytest.mark.parametrize('empty', [False, True])
+def test_batch_norm_all_grids_ranks_and_empty(device, dtype, zp, rank, relu, empty):
+    rng = np.random.default_rng(120)
+    shape = (0 if empty else 2, 37) + (3,) * (rank-2)
+    x, r = pair(rng.integers(0, 200, size=shape), dtype, device, scale=.03, zp=zp)
+    params = [rng.normal(0, .2, size=37).astype('float32') for _ in range(3)]
+    params.append(rng.uniform(.1, 2, size=37).astype('float32'))
+    native = [tp.tensor(v, device=device) for v in params]
+    reference = [torch.tensor(v) for v in params]
+    dimensions = 1 if rank < 4 else rank-2
+    name = f'batch_norm{dimensions}d' + ('_relu' if relu else '')
+    actual = getattr(tp.ops.quantized, name)(x, *native, 1e-5, .07, zp)
+    expected = getattr(torch.ops.quantized, name)(r, *reference, 1e-5, .07, zp)
+    same(actual, expected, 1)
+    if not empty and rank >= 4:
+        assert actual.is_contiguous(memory_format=tp.channels_last if rank == 4 else tp.channels_last_3d)
+    with pytest.raises(Exception):
+        getattr(tp.ops.quantized, name)(x, None, native[1], native[2], native[3], 1e-5, .07, zp)

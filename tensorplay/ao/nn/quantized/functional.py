@@ -256,6 +256,7 @@ def interpolate(input, size=None, scale_factor=None, mode='nearest', align_corne
 
 
 upsample = interpolate
+__all__ += ['interpolate', 'upsample', 'upsample_nearest', 'upsample_bilinear']
 
 
 def upsample_nearest(input, size=None, scale_factor=None):

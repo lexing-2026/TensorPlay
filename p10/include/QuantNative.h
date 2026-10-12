@@ -3,6 +3,8 @@
 #include <vector>
 
 namespace tensorplay::quant {
+Tensor batch_norm_cpu(const Tensor&, const std::optional<Tensor>&, const std::optional<Tensor>&,
+    const Tensor&, const Tensor&, double, double, int64_t, bool);
 Tensor resize_cpu(const Tensor&, const std::vector<int64_t>&,
     const std::vector<std::optional<double>>&, bool, bool, bool);
 Tensor binary_cpu(const Tensor&, const Tensor&, double, int64_t, double, int64_t,
@@ -13,6 +15,8 @@ Tensor pool_cpu(const Tensor&, const std::vector<int64_t>&,
                 const std::vector<int64_t>&, const std::vector<int64_t>&,
                 const std::vector<int64_t>&, bool, bool, std::optional<int64_t>, int);
 #ifdef USE_CUDA
+Tensor batch_norm_cuda(const Tensor&, const std::optional<Tensor>&, const std::optional<Tensor>&,
+    const Tensor&, const Tensor&, double, double, int64_t, bool);
 Tensor resize_cuda(const Tensor&, const std::vector<int64_t>&,
     const std::vector<std::optional<double>>&, bool, bool, bool);
 Tensor binary_cuda(const Tensor&, const Tensor&, double, int64_t, double, int64_t,

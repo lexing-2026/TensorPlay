@@ -11,6 +11,41 @@ namespace tensorplay::cpu {
 inline namespace CPU_CAPABILITY {
 namespace {
 template<class Q>
+void batch_norm_codes(const void* xx, void* yy, int64_t channels,
+        const float* alpha, const float* beta, int64_t xz, int64_t yz, bool relu) {
+    using T = typename Q::underlying;
+    using QV = vec::Vectorized<Q>;
+    using FV = vec::Vectorized<float>;
+    const auto* x = static_cast<const T*>(xx); auto* y = static_cast<T*>(yy);
+    const FV one(1.f), zero(0.f), zp(static_cast<float>(xz));
+    int64_t c = 0;
+    for (; c + QV::size() <= channels; c += QV::size()) {
+        auto values = QV::loadu(x+c).dequantize(one, zp);
+        for (size_t j = 0; j < values.size(); ++j) {
+            const int64_t offset = c + j * FV::size();
+            values[j] = vec::fmadd(FV::loadu(alpha+offset), values[j], FV::loadu(beta+offset));
+            if (relu) values[j] = vec::maximum(values[j], zero);
+        }
+        QV::quantize(values, 1.f, yz, 1.f).store(y+c);
+    }
+    for (; c < channels; ++c) {
+        float value = alpha[c] * static_cast<float>(static_cast<int64_t>(x[c])-xz) + beta[c];
+        if (relu) value = std::max(value, 0.f);
+        y[c] = quant::encode<T>(value, 1.f, yz);
+    }
+}
+
+void batch_norm_impl(const void* x, void* y, int64_t channels, DType dtype,
+        const float* alpha, const float* beta, int64_t xz, int64_t yz, bool relu) {
+    switch (dtype) {
+        case DType::QInt8: batch_norm_codes<qint8>(x,y,channels,alpha,beta,xz,yz,relu); break;
+        case DType::QUInt8: batch_norm_codes<quint8>(x,y,channels,alpha,beta,xz,yz,relu); break;
+        case DType::QInt32: batch_norm_codes<qint32>(x,y,channels,alpha,beta,xz,yz,relu); break;
+        default: break;
+    }
+}
+
+template<class Q>
 void bilinear_codes(const void* aa, const void* bb, const void* cc, const void* dd,
         void* yy, int64_t size, float h, float w, int64_t zp) {
     using T = typename Q::underlying;
@@ -176,6 +211,7 @@ void embedding_impl(const uint8_t* w, const int64_t* indices, const int64_t* off
 }
 
 #ifndef CPU_CAPABILITY_AVX512
+REGISTER_DISPATCH(quantized_batch_norm_stub, &batch_norm_impl);
 REGISTER_DISPATCH(quantized_bilinear_stub, &bilinear_impl);
 REGISTER_DISPATCH(quantized_clip_stub, &clip_impl);
 REGISTER_DISPATCH(quantized_lookup_stub, &lookup_impl);
@@ -183,6 +219,7 @@ REGISTER_DISPATCH(quantized_binary_stub, &binary_impl);
 REGISTER_DISPATCH(quantized_embedding_stub, &embedding_impl);
 REGISTER_DISPATCH(quantized_fp16_linear_stub, &fp16_linear_impl);
 #else
+ALSO_REGISTER_AVX512_DISPATCH(quantized_batch_norm_stub, &batch_norm_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_bilinear_stub, &bilinear_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_clip_stub, &clip_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_lookup_stub, &lookup_impl);

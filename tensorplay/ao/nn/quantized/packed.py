@@ -110,11 +110,12 @@ class PackedWeight(nn.Module):
                                      missing_keys, unexpected_keys, error_msgs)
 
     def run(self, input, out_scale=1., out_zero_point=0, stride=(), padding=(),
-            dilation=(), groups=1, relu=False, output_float=False):
+            dilation=(), groups=1, relu=False, output_float=False, activation=0, negative_slope=0., residual=None):
         return _C._quantized_packed_run(input, self.packed, self.offsets, self.scales,
                                        self.zero_points, self.bias, list(self.weight.shape),
                                        float(out_scale), int(out_zero_point), list(stride),
-                                       list(padding), list(dilation), groups, relu, output_float)
+                                       list(padding), list(dilation), groups, relu, output_float,
+                                       int(activation), float(negative_slope), residual)
 
 
 class QuantizedState:

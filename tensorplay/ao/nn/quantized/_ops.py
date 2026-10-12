@@ -92,6 +92,13 @@ def _conv(input, packed_weight, *parameters, relu=False):
     return packed_weight.run(input,scale,zero_point,relu)
 
 
+def _conv_add(input,accum,packed,scale,zero_point,relu=False):
+    if packed.transposed or len(packed.stride) != 2:
+        raise ValueError('Residual convolution requires ordinary two dimensional weights')
+    return packed.storage.run(input,scale,zero_point,packed.stride,packed.padding,
+        packed.dilation,packed.groups,relu,residual=accum)
+
+
 def _conv_prepack(rank,weight,bias,stride,padding,dilation,groups):
     if weight.dim() != rank+2:
         raise ValueError('Convolution weight rank does not match the operator')
@@ -209,10 +216,15 @@ def _build_packets():
             for field in ('stride','padding','output_padding','dilation','groups','transpose'):
                 attr='transposed' if field=='transpose' else field
                 add(prefix+'_'+field,lambda packed,attr=attr:getattr(packed,attr))
+    add('conv2d_add',_conv_add)
+    add('conv2d_add_relu',partial(_conv_add,relu=True))
     add('linear_prepack',PackedWeight);add('linear_prepack_fp16',PackedHalfWeight)
     for suffix in ('','_fp16'):
         add('linear_unpack'+suffix,lambda packed:packed._weight_bias())
     add('linear',_linear);add('linear_relu',partial(_linear,relu=True))
+    add('linear_leaky_relu',lambda input,packed,scale,zp,negative_slope:packed.run(
+        input,scale,zp,activation=1,negative_slope=negative_slope))
+    add('linear_tanh',lambda input,packed,scale,zp:packed.run(input,scale,zp,activation=2))
     add('linear_dynamic',_linear_dynamic);add('linear_relu_dynamic',partial(_linear_dynamic,relu=True))
     add('linear_dynamic_fp16',_linear_dynamic)
     add('linear_relu_dynamic_fp16',partial(_linear_dynamic,relu=True))

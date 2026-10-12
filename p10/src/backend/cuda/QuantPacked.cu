@@ -1,4 +1,5 @@
 #include "QuantPacked.h"
+#include "QuantNative.h"
 #include "Dispatcher.h"
 #include "CUDARuntime.h"
 #include "QuantElementwise.h"
@@ -158,8 +159,9 @@ __global__ void packed_gemm(const X* input, const int8_t* weight,
     if (row >= g.rows || local_n >= n_per_group) return;
     acc = acc - xz * offsets[n] - zps[n] * row_sum + g.K * xz * zps[n];
     double value = static_cast<double>(acc) * xs * scales[n] + (bias ? bias[n] : 0.);
-    if (relu) value = fmax(value, 0.);
     const int64_t index = g.linear ? row * g.outputs + n : ((row / g.spatial) * g.outputs + n) * g.spatial + row % g.spatial;
+    value = quant::packed_activation(value, index, g);
+    if (relu) value = fmax(value, 0.);
     if (output_float) out[index] = static_cast<Y>(value);
     else {
         const double lo = std::is_same_v<Y, uint8_t> ? 0. : -128.;
@@ -262,10 +264,25 @@ Tensor _quantized_packed_run_cuda(
     const Tensor& scales, const Tensor& zero_points, const std::optional<Tensor>& bias,
     const std::vector<int64_t>& weight_sizes, double output_scale, int64_t output_zero_point,
     const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
-    const std::vector<int64_t>& dilation, int64_t groups, bool relu, bool output_float) {
+    const std::vector<int64_t>& dilation, int64_t groups, bool relu, bool output_float,
+    int64_t activation, double negative_slope, const std::optional<Tensor>& residual) {
     CUDAGuard guard(input.device());
-    const auto g = quant::packed_geometry(input, packed, offsets, scales, zero_points, bias,
+    auto g = quant::packed_geometry(input, packed, offsets, scales, zero_points, bias,
         weight_sizes, stride, padding, dilation, groups, output_scale, output_zero_point, output_float);
+    TP_CHECK(activation >= 0 && activation <= 2 && std::isfinite(negative_slope), "Invalid packed activation parameters");
+    TP_CHECK(activation == 0 || g.linear, "Packed activation requires linear weights");
+    g.activation = activation; g.negative_slope = negative_slope;
+    Tensor residual_codes;
+    if (residual) {
+        TP_CHECK(!g.linear && g.rank == 2 && !output_float && residual->shape() == g.shape &&
+            residual->device() == input.device() && residual->dtype() == input.dtype(),
+            "Convolution residual must match the output shape, device and quantized dtype");
+        residual_codes = residual->contiguous();
+        g.residual = residual_codes.data_ptr();
+        g.residual_scale = quantized::q_scale(*residual);
+        g.residual_zero_point = quantized::q_zero_point(*residual);
+        g.residual_unsigned = residual->dtype() == DType::QUInt8;
+    }
     const Tensor x = input.contiguous();
     const bool unsigned_input = input.dtype() == DType::QUInt8;
     Tensor out = Tensor::empty(g.shape, output_float ? DType::Float32 : (unsigned_input ? DType::UInt8 : DType::Int8), input.device());
@@ -287,7 +304,14 @@ Tensor _quantized_packed_run_cuda(
         checkCuda(cudaGetLastError(), "Packed integer compute");
     }
     if (output_float) return out;
-    return quantized::make_qtensor(out, make_per_tensor_affine_quantizer(output_scale, output_zero_point, input.dtype()), input.dtype());
+    Tensor result = quantized::make_qtensor(out, make_per_tensor_affine_quantizer(output_scale, output_zero_point, input.dtype()), input.dtype());
+    if (residual && result.numel()) {
+        Tensor destination = residual->contiguous(MemoryFormat::ChannelsLast);
+        destination.impl()->set_quantizer(result.impl()->quantizer());
+        destination.copy_(result);
+        return destination;
+    }
+    return result;
 }
 
 template<class X>
@@ -309,24 +333,8 @@ __global__ void bn_relu_codes(const X* x, X* out, const float* weight, const flo
 Tensor quantized_batch_norm_relu_cuda(
     const Tensor& input, const std::optional<Tensor>& weight, const std::optional<Tensor>& bias,
     const Tensor& mean, const Tensor& var, double eps, double output_scale, int64_t output_zero_point) {
-    CUDAGuard guard(input.device());
-    quant::check_bn_relu(input, weight, bias, mean, var, eps, output_scale, output_zero_point);
-    const Tensor x = input.contiguous(), m = mean.contiguous(), v = var.contiguous();
-    const Tensor w = weight ? weight->contiguous() : Tensor(), b = bias ? bias->contiguous() : Tensor();
-    const bool unsigned_input = input.dtype() == DType::QUInt8;
-    Tensor out = Tensor::empty(input.shape(), unsigned_input ? DType::UInt8 : DType::Int8, input.device());
-    int64_t spatial = 1;
-    for (int64_t d = 2; d < input.dim(); ++d) spatial *= input.size(d);
-    if (input.numel()) {
-        const auto stream = getCurrentCUDAStream().stream();
-        const int blocks = static_cast<int>((input.numel() + 255) / 256);
-        const double xs = quantized::q_scale(input);
-        const int64_t xz = quantized::q_zero_point(input);
-        if (unsigned_input) bn_relu_codes<uint8_t><<<blocks,256,0,stream>>>(x.data_ptr<uint8_t>(), out.data_ptr<uint8_t>(), weight ? w.data_ptr<float>() : nullptr, bias ? b.data_ptr<float>() : nullptr, m.data_ptr<float>(), v.data_ptr<float>(), input.numel(), input.size(1), spatial, eps, xs, xz, output_scale, output_zero_point);
-        else bn_relu_codes<int8_t><<<blocks,256,0,stream>>>(x.data_ptr<int8_t>(), out.data_ptr<int8_t>(), weight ? w.data_ptr<float>() : nullptr, bias ? b.data_ptr<float>() : nullptr, m.data_ptr<float>(), v.data_ptr<float>(), input.numel(), input.size(1), spatial, eps, xs, xz, output_scale, output_zero_point);
-        checkCuda(cudaGetLastError(), "Fused normalization rectifier");
-    }
-    return quantized::make_qtensor(out, make_per_tensor_affine_quantizer(output_scale, output_zero_point, input.dtype()), input.dtype());
+    return quant::batch_norm_cuda(input, weight, bias, mean, var,
+        eps, output_scale, output_zero_point, true);
 }
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, QuantPacked) {

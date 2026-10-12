@@ -49,6 +49,7 @@ set(P10_SOURCES
     src/backend/cpu/SparseKernels.cpp
     src/backend/cpu/SemiStructuredKernels.cpp
     src/backend/cpu/QuantKernels.cpp
+    src/backend/cpu/QuantBatchNormKernels.cpp
     src/backend/cpu/QuantNormalizationKernels.cpp
     src/backend/cpu/QuantConvPacking.cpp
     src/backend/cpu/QuantPacked.cpp
@@ -212,6 +213,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/SpdiagsKernels.cu
         src/backend/cuda/SemiStructuredKernels.cu
         src/backend/cuda/QuantKernels.cu
+        src/backend/cuda/QuantBatchNormKernels.cu
         src/backend/cuda/QuantNormalizationKernels.cu
         src/backend/cuda/AffineQuantKernels.cu
         src/backend/cuda/FakeQuantKernels.cu

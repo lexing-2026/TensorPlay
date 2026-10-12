@@ -6,6 +6,9 @@
 #include <cstdint>
 
 namespace tensorplay::cpu {
+using quantized_batch_norm_fn = void (*)(const void*, void*, int64_t, DType,
+    const float*, const float*, int64_t, int64_t, bool);
+DECLARE_DISPATCH(quantized_batch_norm_fn, quantized_batch_norm_stub)
 using quantized_bilinear_fn = void (*)(const void*, const void*, const void*, const void*,
     void*, int64_t, DType, float, float, int64_t);
 DECLARE_DISPATCH(quantized_bilinear_fn, quantized_bilinear_stub)

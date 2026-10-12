@@ -22,7 +22,28 @@ struct PackedDeviceGeometry {
     int64_t in[3]{1, 1, 1}, out[3]{1, 1, 1}, kernel[3]{1, 1, 1};
     int64_t stride[3]{1, 1, 1}, padding[3]{0, 0, 0}, dilation[3]{1, 1, 1};
     bool linear = true;
+    int64_t activation = 0;
+    double negative_slope = 0.;
+    const void* residual = nullptr;
+    double residual_scale = 1.;
+    int64_t residual_zero_point = 0;
+    bool residual_unsigned = false;
 };
+
+#if defined(__CUDACC__)
+__host__ __device__
+#endif
+inline double packed_activation(double value, int64_t index, const PackedDeviceGeometry& g) {
+    if (g.residual) {
+        const int64_t code = g.residual_unsigned
+            ? static_cast<const uint8_t*>(g.residual)[index]
+            : static_cast<const int8_t*>(g.residual)[index];
+        value += (code - g.residual_zero_point) * g.residual_scale;
+    }
+    if (g.activation == 1) return value >= 0. ? value : value * g.negative_slope;
+    if (g.activation == 2) return ::tanh(value);
+    return value;
+}
 
 struct PackedGeometry : PackedDeviceGeometry {
     std::vector<int64_t> shape;
@@ -109,33 +130,13 @@ inline std::pair<int64_t, int64_t> packed_weight_shape(const Tensor& weight) {
 
 } // namespace tensorplay::quant
 
-namespace tensorplay::quant {
-inline void check_bn_relu(const Tensor& input, const std::optional<Tensor>& weight,
-                           const std::optional<Tensor>& bias, const Tensor& mean,
-                           const Tensor& var, double eps, double scale, int64_t zp) {
-    TP_CHECK(input.dtype() == DType::QInt8 || input.dtype() == DType::QUInt8,
-             "Fused normalization requires an 8-bit quantized input");
-    TP_CHECK(input.dim() == 4 || input.dim() == 5, "Fused normalization requires a four or five dimensional input");
-    const int64_t lo = input.dtype() == DType::QUInt8 ? 0 : -128;
-    TP_CHECK(std::isfinite(eps) && eps >= 0 && std::isfinite(scale) && scale > 0 && zp >= lo && zp <= lo + 255,
-             "Invalid fused normalization epsilon or output parameters");
-    for (const Tensor* p : {&mean, &var}) {
-        TP_CHECK(p->device() == input.device() && p->dtype() == DType::Float32 && p->numel() == input.size(1),
-                 "Normalization statistics must be float channel vectors on the input device");
-    }
-    for (const auto* p : {&weight, &bias}) {
-        if (*p) TP_CHECK((*p)->device() == input.device() && (*p)->dtype() == DType::Float32 && (*p)->numel() == input.size(1),
-                         "Normalization affine parameters must be float channel vectors on the input device");
-    }
-}
-} // namespace tensorplay::quant
 
 
 namespace tensorplay::cpu {
 std::tuple<Tensor,Tensor> _quantized_weight_prepack_cpu(const Tensor&);
 Tensor _quantized_packed_run_cpu(const Tensor&,const Tensor&,const Tensor&,const Tensor&,const Tensor&,
     const std::optional<Tensor>&,const std::vector<int64_t>&,double,int64_t,const std::vector<int64_t>&,
-    const std::vector<int64_t>&,const std::vector<int64_t>&,int64_t,bool,bool);
+    const std::vector<int64_t>&,const std::vector<int64_t>&,int64_t,bool,bool,int64_t,double,const std::optional<Tensor>&);
 }
 
 #ifdef USE_CUDA
@@ -144,7 +145,7 @@ namespace tensorplay::cuda {
 std::tuple<Tensor,Tensor> _quantized_weight_prepack_cuda(const Tensor&);
 Tensor _quantized_packed_run_cuda(const Tensor&,const Tensor&,const Tensor&,const Tensor&,const Tensor&,
     const std::optional<Tensor>&,const std::vector<int64_t>&,double,int64_t,const std::vector<int64_t>&,
-    const std::vector<int64_t>&,const std::vector<int64_t>&,int64_t,bool,bool);
+    const std::vector<int64_t>&,const std::vector<int64_t>&,int64_t,bool,bool,int64_t,double,const std::optional<Tensor>&);
 }
 
 #endif

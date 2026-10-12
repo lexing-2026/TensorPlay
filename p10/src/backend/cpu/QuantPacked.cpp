@@ -1,10 +1,13 @@
 #include "QuantPacked.h"
+#include "QuantNative.h"
 #include "Dispatcher.h"
 #include "Parallel.h"
 #include "QuantElementwise.h"
 #include "cpu/QuantizedElementwiseKernels.h"
 #include <array>
 #include <cfenv>
+#include "OneDNNContext.h"
+#include <map>
 #include <cstring>
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
@@ -110,12 +113,13 @@ Tensor relu6_cpu(const Tensor& input) { return rectify_cpu(input, true); }
 } // namespace tensorplay::quant
 
 namespace tensorplay::cpu {
+DEFINE_DISPATCH(quantized_batch_norm_stub);
 DEFINE_DISPATCH(quantized_bilinear_stub);
 DEFINE_DISPATCH(quantized_clip_stub);
 DEFINE_DISPATCH(quantized_lookup_stub);
 DEFINE_DISPATCH(quantized_binary_stub);
-DEFINE_DISPATCH(quantized_fp16_linear_stub);
 DEFINE_DISPATCH(quantized_embedding_stub);
+DEFINE_DISPATCH(quantized_fp16_linear_stub);
 namespace {
 
 template<class X>
@@ -124,6 +128,80 @@ int64_t dot_scalar(const X* x, const int8_t* w, int64_t K) {
     for (int64_t k = 0; k < K; ++k) sum += static_cast<int64_t>(x[k]) * w[k];
     return sum;
 }
+
+#ifdef USE_ONEDNN
+struct IntegerProduct {
+    dnnl::memory::desc src, weight, dst;
+    dnnl::matmul product;
+    dnnl::memory::desc scratch_desc;
+    std::vector<uint8_t> scratch;
+    IntegerProduct(const std::array<int64_t, 6>& key) {
+        using DT = dnnl::memory::data_type;
+        src = dnnl::memory::desc({key[0], key[2]}, key[4] ? DT::u8 : DT::s8, {key[2], 1});
+        weight = dnnl::memory::desc({key[2], key[1]}, DT::s8, {1, key[3]});
+        dst = dnnl::memory::desc({key[0], key[1]}, DT::s32, {key[1], 1});
+        dnnl::primitive_attr attr;
+        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+        const auto desc = dnnl::matmul::primitive_desc(OneDNNContext::get_engine(), src, weight, dst, attr);
+        product = dnnl::matmul(desc);
+        scratch_desc = desc.scratchpad_desc();
+        scratch.resize(scratch_desc.get_size());
+    }
+};
+
+template<class X>
+bool linear_integer_product(const X* x, const int8_t* w, const int64_t* offsets,
+        const float* scales, const int64_t* zps, const float* bias,
+        const quant::PackedGeometry& g, Tensor& out, double xs, int64_t xz,
+        double ys, int64_t yz, bool relu, bool output_float) {
+    // The raw product fits signed 32-bit storage for this K bound. Affine
+    // corrections widen to 64 bits, including arbitrary weight zero points.
+    if (!OneDNNContext::is_enabled() || !g.linear || g.K == 0 || g.K > 65536 ||
+        g.rows < 8 || g.rows * g.outputs * g.K < 1048576) return false;
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    if (!__builtin_cpu_supports("avxvnni") && !__builtin_cpu_supports("avx512vnni")) return false;
+#endif
+    thread_local std::map<std::array<int64_t, 6>, std::unique_ptr<IntegerProduct>> cache;
+    const std::array<int64_t, 6> key{g.rows, g.outputs, g.K, g.padded_K,
+        std::is_same_v<X, uint8_t>, parallel::get_num_threads()};
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+        if (cache.size() >= 32) cache.clear();
+        try { it = cache.emplace(key, std::make_unique<IntegerProduct>(key)).first; }
+        catch (const dnnl::error&) { return false; }
+    }
+    auto& kernel = *it->second;
+    Tensor acc = Tensor::empty({g.rows, g.outputs}, DType::Int32, out.device());
+    auto& engine = OneDNNContext::get_engine();
+    auto& stream = OneDNNContext::get_stream();
+    kernel.product.execute(stream, {
+        {DNNL_ARG_SRC, dnnl::memory(kernel.src, engine, const_cast<X*>(x))},
+        {DNNL_ARG_WEIGHTS, dnnl::memory(kernel.weight, engine, const_cast<int8_t*>(w))},
+        {DNNL_ARG_DST, dnnl::memory(kernel.dst, engine, acc.data_ptr())},
+        {DNNL_ARG_SCRATCHPAD, dnnl::memory(kernel.scratch_desc, engine, kernel.scratch.data())}});
+    stream.wait();
+    const auto* raw = acc.data_ptr<int32_t>();
+    parallel::parallel_for(0, g.rows, 8, [&](int64_t begin, int64_t end) {
+        for (int64_t row = begin; row < end; ++row) {
+            int64_t sum = 0;
+            for (int64_t k = 0; k < g.K; ++k) sum += x[row * g.K + k];
+            for (int64_t n = 0; n < g.outputs; ++n) {
+                const int64_t index = row * g.outputs + n;
+                const int64_t value_i = static_cast<int64_t>(raw[index]) - xz * offsets[n] - zps[n] * sum + g.K * xz * zps[n];
+                double value = static_cast<double>(value_i) * xs * scales[n] + (bias ? bias[n] : 0.);
+                value = quant::packed_activation(value, index, g);
+                if (relu) value = std::max(value, 0.);
+                if (output_float) out.data_ptr<float>()[index] = static_cast<float>(value);
+                else {
+                    constexpr int64_t lo = std::is_same_v<X, uint8_t> ? 0 : -128;
+                    out.data_ptr<X>()[index] = static_cast<X>(std::clamp(std::nearbyint(value / ys) + yz, static_cast<double>(lo), static_cast<double>(lo + 255)));
+                }
+            }
+        }
+    });
+    return true;
+}
+#endif
 
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 template<class X>
@@ -194,8 +272,9 @@ void linear_vnni(const X* x, const int8_t* w, const int64_t* offsets,
         const int64_t shift = std::is_same_v<X, int8_t> ? 128 : 0;
         const int64_t acc = dot - (xz + shift) * offsets[n] - zps[n] * sum + g.K * xz * zps[n];
         double value = static_cast<double>(acc) * xs * scales[n] + (bias ? bias[n] : 0.);
-        if (relu) value = std::max(value, 0.);
         const int64_t index = row * g.outputs + n;
+        value = quant::packed_activation(value, index, g);
+        if (relu) value = std::max(value, 0.);
         if (output_float) out.data_ptr<float>()[index] = static_cast<float>(value);
         else {
             constexpr int64_t lo = std::is_same_v<X, uint8_t> ? 0 : -128;
@@ -252,6 +331,9 @@ void run(const Tensor& input, const Tensor& packed, const Tensor& offsets,
     const float* bp = bias ? bias->data_ptr<float>() : nullptr;
     const int64_t xz = quantized::q_zero_point(input);
     const double xs = quantized::q_scale(input);
+#ifdef USE_ONEDNN
+    if (linear_integer_product(xp, wp, col, sc, wz, bp, g, out, xs, xz, ys, yz, relu, output_float)) return;
+#endif
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
     static const bool vnni = __builtin_cpu_supports("avxvnni");
     if (g.linear && vnni) {
@@ -295,8 +377,9 @@ void run(const Tensor& input, const Tensor& packed, const Tensor& offsets,
                 for (int64_t n = group * n_per_group; n < (group + 1) * n_per_group; ++n) {
                     const int64_t acc = dot(xr, wp + n * g.padded_K, g.K) - xz * col[n] - wz[n] * row_sum + g.K * xz * wz[n];
                     double value = static_cast<double>(acc) * xs * sc[n] + (bp ? bp[n] : 0.);
-                    if (relu) value = std::max(value, 0.);
                     const int64_t index = g.linear ? row * g.outputs + n : ((row / g.spatial) * g.outputs + n) * g.spatial + row % g.spatial;
+                    value = quant::packed_activation(value, index, g);
+                    if (relu) value = std::max(value, 0.);
                     if (output_float) out.data_ptr<float>()[index] = static_cast<float>(value);
                     else {
                         constexpr int64_t lo = std::is_same_v<X, uint8_t> ? 0 : -128;
@@ -331,49 +414,45 @@ Tensor _quantized_packed_run_cpu(
     const Tensor& scales, const Tensor& zero_points, const std::optional<Tensor>& bias,
     const std::vector<int64_t>& weight_sizes, double output_scale, int64_t output_zero_point,
     const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
-    const std::vector<int64_t>& dilation, int64_t groups, bool relu, bool output_float) {
-    const auto g = quant::packed_geometry(input, packed, offsets, scales, zero_points, bias,
+    const std::vector<int64_t>& dilation, int64_t groups, bool relu, bool output_float,
+    int64_t activation, double negative_slope, const std::optional<Tensor>& residual) {
+    auto g = quant::packed_geometry(input, packed, offsets, scales, zero_points, bias,
         weight_sizes, stride, padding, dilation, groups, output_scale, output_zero_point, output_float);
+    TP_CHECK(activation >= 0 && activation <= 2 && std::isfinite(negative_slope), "Invalid packed activation parameters");
+    TP_CHECK(activation == 0 || g.linear, "Packed activation requires linear weights");
+    g.activation = activation; g.negative_slope = negative_slope;
+    Tensor residual_codes;
+    if (residual) {
+        TP_CHECK(!g.linear && g.rank == 2 && !output_float && residual->shape() == g.shape &&
+            residual->device() == input.device() && residual->dtype() == input.dtype(),
+            "Convolution residual must match the output shape, device and quantized dtype");
+        residual_codes = residual->contiguous();
+        g.residual = residual_codes.data_ptr();
+        g.residual_scale = quantized::q_scale(*residual);
+        g.residual_zero_point = quantized::q_zero_point(*residual);
+        g.residual_unsigned = residual->dtype() == DType::QUInt8;
+    }
     const Tensor x = input.contiguous();
     const DType storage = output_float ? DType::Float32 : (input.dtype() == DType::QUInt8 ? DType::UInt8 : DType::Int8);
     Tensor out = Tensor::empty(g.shape, storage, input.device());
     if (input.dtype() == DType::QUInt8) run<uint8_t>(x, packed, offsets, scales, zero_points, bias, g, out, output_scale, output_zero_point, relu, output_float);
     else run<int8_t>(x, packed, offsets, scales, zero_points, bias, g, out, output_scale, output_zero_point, relu, output_float);
     if (output_float) return out;
-    return quantized::make_qtensor(out, make_per_tensor_affine_quantizer(output_scale, output_zero_point, input.dtype()), input.dtype());
+    Tensor result = quantized::make_qtensor(out, make_per_tensor_affine_quantizer(output_scale, output_zero_point, input.dtype()), input.dtype());
+    if (residual && result.numel()) {
+        Tensor destination = residual->contiguous(MemoryFormat::ChannelsLast);
+        destination.impl()->set_quantizer(result.impl()->quantizer());
+        destination.copy_(result);
+        return destination;
+    }
+    return result;
 }
 
 Tensor quantized_batch_norm_relu_cpu(
     const Tensor& input, const std::optional<Tensor>& weight, const std::optional<Tensor>& bias,
     const Tensor& mean, const Tensor& var, double eps, double output_scale, int64_t output_zero_point) {
-    quant::check_bn_relu(input, weight, bias, mean, var, eps, output_scale, output_zero_point);
-    const Tensor x = input.contiguous(), m = mean.contiguous(), v = var.contiguous();
-    const Tensor w = weight ? weight->contiguous() : Tensor(), b = bias ? bias->contiguous() : Tensor();
-    const bool unsigned_input = input.dtype() == DType::QUInt8;
-    Tensor out = Tensor::empty(input.shape(), unsigned_input ? DType::UInt8 : DType::Int8, input.device());
-    const double xs = quantized::q_scale(input);
-    const int64_t xz = quantized::q_zero_point(input), C = input.size(1);
-    int64_t spatial = 1;
-    for (int64_t d = 2; d < input.dim(); ++d) spatial *= input.size(d);
-    std::vector<float> alpha(C), beta(C);
-    for (int64_t c = 0; c < C; ++c) {
-        const float inv = 1.f / std::sqrt(v.data_ptr<float>()[c] + static_cast<float>(eps));
-        const float gamma = weight ? w.data_ptr<float>()[c] : 1.f;
-        alpha[c] = inv * gamma * (xs / output_scale);
-        beta[c] = ((bias ? b.data_ptr<float>()[c] : 0.f) - m.data_ptr<float>()[c] * inv * gamma) / output_scale;
-    }
-    parallel::parallel_for(0, input.numel(), 32768, [&](int64_t begin, int64_t end) {
-        for (int64_t i = begin; i < end; ++i) {
-            const int64_t c = (i / spatial) % C;
-            const int code = unsigned_input ? x.data_ptr<uint8_t>()[i] : x.data_ptr<int8_t>()[i];
-            const float value = std::fma(alpha[c], static_cast<float>(code - xz), beta[c]);
-            const double q = std::clamp(std::nearbyint(static_cast<double>(value)) + output_zero_point,
-                                        static_cast<double>(output_zero_point), unsigned_input ? 255. : 127.);
-            if (unsigned_input) out.data_ptr<uint8_t>()[i] = static_cast<uint8_t>(q);
-            else out.data_ptr<int8_t>()[i] = static_cast<int8_t>(q);
-        }
-    });
-    return quantized::make_qtensor(out, make_per_tensor_affine_quantizer(output_scale, output_zero_point, input.dtype()), input.dtype());
+    return quant::batch_norm_cpu(input, weight, bias, mean, var,
+        eps, output_scale, output_zero_point, true);
 }
 
 TENSORPLAY_LIBRARY_IMPL(CPU, QuantPacked) {

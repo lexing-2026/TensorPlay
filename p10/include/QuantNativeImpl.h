@@ -546,7 +546,14 @@ Tensor max_pool(const Tensor& input,const std::vector<int64_t>& kernel,const std
 #include "QuantConvolutionImpl.h"
 #include "QuantRecurrentImpl.h"
 #include "QuantResizeImpl.h"
+#include "QuantBatchNormImpl.h"
 namespace tensorplay::quant {
+
+Tensor TP_QN_NAME(batch_norm)(const Tensor& input, const std::optional<Tensor>& weight,
+        const std::optional<Tensor>& bias, const Tensor& mean, const Tensor& var,
+        double eps, double scale, int64_t zp, bool relu) {
+    return TP_QN_DETAIL::batch_norm(input, weight, bias, mean, var, eps, scale, zp, relu);
+}
 
 Tensor TP_QN_NAME(resize)(const Tensor& input, const std::vector<int64_t>& sizes,
         const std::vector<std::optional<double>>& scales, bool exact, bool bilinear, bool align) {
