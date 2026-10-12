@@ -80,7 +80,7 @@ struct RecurrentStep {
             hy[i] = (hidden[i] - candidate) * update + candidate;
         } else {
             const float value = input[base] + recurrent[base];
-            hy[i] = mode == 0 ? ::fmaxf(value, 0.f) : ::tanhf(value);
+            hy[i] = mode == 0 ? (value < 0.f ? 0.f : value) : ::tanhf(value);
         }
     }
 };
@@ -92,8 +92,19 @@ std::tuple<Tensor,Tensor> recurrent_step(const Tensor& gates, const Tensor& hidd
     Tensor hy = Tensor::empty(hidden.shape(), DType::Float32, hidden.device());
     Tensor cy = mode == 2 ? Tensor::empty(cell.shape(), DType::Float32, cell.device())
                          : Tensor::empty({0}, DType::Float32, hidden.device());
+#ifdef TP_QUANT_CUDA
     apply(h.numel(), RecurrentStep{a.data_ptr<float>(),b.data_ptr<float>(),h.data_ptr<float>(),
         mode == 2 ? c.data_ptr<float>() : nullptr,hy.data_ptr<float>(),mode == 2 ? cy.data_ptr<float>() : nullptr,hidden.size(1),static_cast<int>(mode)});
+#else
+    const int64_t width=hidden.size(1),count=mode==2 ? 4 : mode==3 ? 3 : 1;
+    parallel::parallel_for(0,hidden.size(0),std::max<int64_t>(1,32768/std::max<int64_t>(1,count*width)),
+        [&](int64_t first,int64_t last) {
+            cpu::quantized_recurrent_step_stub(DeviceType::CPU,a.data_ptr<float>()+first*count*width,
+                b.data_ptr<float>()+first*count*width,h.data_ptr<float>()+first*width,
+                mode==2 ? c.data_ptr<float>()+first*width : nullptr,hy.data_ptr<float>()+first*width,
+                mode==2 ? cy.data_ptr<float>()+first*width : nullptr,last-first,width,static_cast<int>(mode));
+        });
+#endif
     return {hy,cy};
 }
 

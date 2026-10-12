@@ -13,6 +13,38 @@ inline namespace CPU_CAPABILITY {
 namespace {
 constexpr int int4_columns = vec::Vectorized<float>::size() * 4;
 
+void recurrent_step_impl(const float* input,const float* recurrent,const float* hidden,
+        const float* cell,float* hy,float* cy,int64_t rows,int64_t width,int mode) {
+    using V=vec::Vectorized<float>;
+    const V one(1.f),zero(0.f);
+    const int gates=mode==2 ? 4 : mode==3 ? 3 : 1;
+    auto sigmoid=[&](V value) { return (one+(-value).exp()).reciprocal(); };
+    for (int64_t row=0;row<rows;++row) {
+        const int64_t start=row*gates*width,state=row*width;
+        for (int64_t col=0;col<width;col+=V::size()) {
+            const int64_t count=std::min<int64_t>(V::size(),width-col),base=start+col;
+            auto a=[&](int gate) { return V::loadu(input+base+gate*width,count); };
+            auto b=[&](int gate) { return V::loadu(recurrent+base+gate*width,count); };
+            V value;
+            if (mode==2) {
+                const V ingate=sigmoid(a(0)+b(0)),forgetgate=sigmoid(a(1)+b(1));
+                const V candidate=(a(2)+b(2)).tanh(),outgate=sigmoid(a(3)+b(3));
+                const V next=forgetgate*V::loadu(cell+state+col,count)+ingate*candidate;
+                next.store(cy+state+col,count);
+                value=outgate*next.tanh();
+            } else if (mode==3) {
+                const V reset=sigmoid(b(0)+a(0)),update=sigmoid(b(1)+a(1));
+                const V candidate=(a(2)+b(2)*reset).tanh();
+                value=(V::loadu(hidden+state+col,count)-candidate)*update+candidate;
+            } else {
+                value=a(0)+b(0);
+                value=mode==0 ? vec::maximum(value,zero) : value.tanh();
+            }
+            value.store(hy+state+col,count);
+        }
+    }
+}
+
 void int4_pack_impl(const int32_t* src, uint8_t* dst, int64_t n, int64_t k) {
     const int64_t blocks = (n + int4_columns - 1) / int4_columns;
     parallel::parallel_for(0, blocks, 1, [&](int64_t begin, int64_t end) {
@@ -297,6 +329,7 @@ void embedding_impl(const uint8_t* w, const int64_t* indices, const int64_t* off
 }
 
 #ifndef CPU_CAPABILITY_AVX512
+REGISTER_DISPATCH(quantized_recurrent_step_stub, &recurrent_step_impl);
 REGISTER_DISPATCH(quantized_int4_pack_stub, &int4_pack_impl);
 REGISTER_DISPATCH(quantized_int4_mm_stub, &int4_mm_impl);
 REGISTER_DISPATCH(quantized_batch_norm_stub, &batch_norm_impl);
@@ -307,6 +340,7 @@ REGISTER_DISPATCH(quantized_binary_stub, &binary_impl);
 REGISTER_DISPATCH(quantized_embedding_stub, &embedding_impl);
 REGISTER_DISPATCH(quantized_fp16_linear_stub, &fp16_linear_impl);
 #else
+ALSO_REGISTER_AVX512_DISPATCH(quantized_recurrent_step_stub, &recurrent_step_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_int4_pack_stub, &int4_pack_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_int4_mm_stub, &int4_mm_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_batch_norm_stub, &batch_norm_impl);

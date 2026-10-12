@@ -6,6 +6,9 @@
 #include <cstdint>
 
 namespace tensorplay::cpu {
+using quantized_recurrent_step_fn = void (*)(const float*,const float*,const float*,
+    const float*,float*,float*,int64_t,int64_t,int);
+DECLARE_DISPATCH(quantized_recurrent_step_fn, quantized_recurrent_step_stub)
 using quantized_int4_pack_fn = void (*)(const int32_t*, uint8_t*, int64_t, int64_t);
 using quantized_int4_mm_fn = void (*)(const void*, const uint8_t*, const void*, void*,
     DType, int64_t, int64_t, int64_t, int64_t);

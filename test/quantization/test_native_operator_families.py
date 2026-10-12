@@ -601,3 +601,35 @@ def test_native_sequence_accepts_persistent_cell_params(device,mode,name,gates,h
     for overload in ('input_legacy','data_legacy'):
         with pytest.raises(RuntimeError):
             getattr(op,overload)(*args,**extra)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('mode', [0,1,2,3])
+@pytest.mark.parametrize('width', [1,15,16,17,37,128])
+def test_recurrent_gate_vector_tails_and_special_values(device,mode,width):
+    rng=np.random.default_rng(131)
+    count=4 if mode==2 else 3 if mode==3 else 1
+    a=rng.normal(0,2,size=(3,count*width)).astype('float32')
+    b=rng.normal(0,2,size=a.shape).astype('float32')
+    h=rng.normal(0,.2,size=(3,width)).astype('float32')
+    c=rng.normal(0,.2,size=h.shape).astype('float32')
+    a[0,0]=np.nan
+    a[-1,-1]=np.inf
+    x,y,state,cell=(torch.tensor(v) for v in (a,b,h,c))
+    if mode==2:
+        i,f,g,o=(x+y).chunk(4,1)
+        next_c=f.sigmoid()*cell+i.sigmoid()*g.tanh()
+        expected=(o.sigmoid()*next_c.tanh(),next_c)
+    elif mode==3:
+        xi,xu,xn=x.chunk(3,1)
+        yi,yu,yn=y.chunk(3,1)
+        reset=(xi+yi).sigmoid()
+        update=(xu+yu).sigmoid()
+        candidate=(xn+yn*reset).tanh()
+        expected=((state-candidate)*update+candidate,)
+    else:
+        expected=(torch.relu(x+y) if mode==0 else torch.tanh(x+y),)
+    actual=tp._C._quantized_recurrent_step(tp.tensor(a,device=device),tp.tensor(b,device=device),
+        tp.tensor(h,device=device),tp.tensor(c,device=device) if mode==2 else None,mode)
+    for value,reference in zip(actual,expected):
+        np.testing.assert_allclose(value.cpu().numpy(),reference.numpy(),atol=2e-6,rtol=2e-5,equal_nan=True)
