@@ -231,7 +231,7 @@ def quantize(model, run_fn, run_args, mapping=None, inplace=False):
     return convert(prepared, mapping=mapping, inplace=True)
 
 
-def quantize_dynamic(model, qconfig_spec=None, mapping=None, inplace=False):
+def quantize_dynamic(model, qconfig_spec=None, mapping=None, inplace=False, dtype=None):
     """Swap modules for their dynamic-quantization counterparts.
 
     No calibration is performed: dynamic modules quantize activations at
@@ -241,27 +241,17 @@ def quantize_dynamic(model, qconfig_spec=None, mapping=None, inplace=False):
         mapping = get_default_dynamic_quant_module_mappings()
     if not inplace:
         model = copy.deepcopy(model)
-    _dynamic_swap(model, mapping, qconfig_spec)
-    return model
-
-
-def _dynamic_swap(module, mapping, qconfig_spec):
-    for name, child in module.named_children():
-        _dynamic_swap(child, mapping, qconfig_spec)
-        swapped = _dynamic_target(child, mapping, qconfig_spec)
-        if swapped is not child:
-            module._modules[name] = swapped
-
-
-def _dynamic_target(module, mapping, qconfig_spec):
-    for source_type, target_type in mapping.items():
-        if isinstance(module, source_type):
-            if qconfig_spec is not None and not any(
-                _matches(module, spec) for spec in qconfig_spec
-            ):
-                return module
-            return target_type.from_float(module)
-    return module
+    from tensorplay import qint8
+    from .qconfig import default_dynamic_qconfig
+    if dtype is not None and dtype != qint8:
+        raise ValueError('Dynamic integer linear conversion requires signed 8-bit weights')
+    if qconfig_spec is None:
+        qconfig_spec = {source: default_dynamic_qconfig for source in mapping}
+    elif not isinstance(qconfig_spec, dict):
+        qconfig_spec = {source: default_dynamic_qconfig for source in qconfig_spec}
+    model.eval()
+    propagate_qconfig_(model, qconfig_spec)
+    return convert(model, mapping=mapping, inplace=True)
 
 
 def add_quant_dequant(module):

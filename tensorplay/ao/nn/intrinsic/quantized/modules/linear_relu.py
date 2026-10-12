@@ -16,14 +16,11 @@ class LinearReLU(QuantizedLinear):
     """
 
     _FLOAT_MODULE = _FloatLinearReLU
-
-    def forward(self, x):
-        return QuantizedLinear.forward(self, x).relu()
+    _FUSED_RELU = True
 
     def _get_name(self):
         return "QuantizedLinearReLU"
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
-        base = getattr(mod, "op", mod)
-        return super().from_float(base, None, None)
+        return super().from_float(mod, use_precomputed_fake_quant=use_precomputed_fake_quant)

@@ -6,6 +6,7 @@ operator.
 """
 
 from .modules import *  # noqa: F403
+from . import dynamic
 
 __all__ = [
     "BNReLU2d",

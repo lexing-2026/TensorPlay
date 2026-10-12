@@ -88,6 +88,7 @@ DEFAULT_STATIC_QUANT_MODULE_MAPPINGS[nniqat.LinearBn1d] = nnq.Linear
 # Default map for swapping dynamic modules
 DEFAULT_DYNAMIC_QUANT_MODULE_MAPPINGS: dict = {
     nn.Linear: nnqd.Linear,
+    nni.LinearReLU: nniq.dynamic.LinearReLU,
 }
 
 

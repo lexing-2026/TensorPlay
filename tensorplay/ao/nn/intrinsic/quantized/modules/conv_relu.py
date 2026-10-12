@@ -1,7 +1,7 @@
 """Quantized convolutions fused with a rectifier.
 
-The base convolution kernel emits a quantized output; the rectifier runs in
-the integer domain and keeps the same affine parameters.
+Integer convolution, output quantization and rectification share a native
+compute epilogue.
 """
 
 from __future__ import annotations
@@ -16,25 +16,19 @@ from ....quantized.conv import Conv1d, Conv2d, Conv3d
 __all__ = ["ConvReLU1d", "ConvReLU2d", "ConvReLU3d"]
 
 
-def _relu_forward(base_cls, self, x):
-    out = base_cls.forward(self, x)
-    return tp._C.quantized_relu(out) if out.is_quantized() else out.relu()
-
-
 class ConvReLU1d(Conv1d):
     """A ConvReLU1d module fused from Conv1d and ReLU modules."""
 
     _FLOAT_MODULE = _FloatConvReLU1d
 
-    def forward(self, x):
-        return _relu_forward(Conv1d, self, x)
+    _FUSED_RELU = True
 
     def _get_name(self):
         return "QuantizedConvReLU1d"
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
-        return super().from_float(getattr(mod, "op", mod))
+        return super().from_float(mod, use_precomputed_fake_quant=use_precomputed_fake_quant)
 
 
 class ConvReLU2d(Conv2d):
@@ -42,15 +36,14 @@ class ConvReLU2d(Conv2d):
 
     _FLOAT_MODULE = _FloatConvReLU2d
 
-    def forward(self, x):
-        return _relu_forward(Conv2d, self, x)
+    _FUSED_RELU = True
 
     def _get_name(self):
         return "QuantizedConvReLU2d"
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
-        return super().from_float(getattr(mod, "op", mod))
+        return super().from_float(mod, use_precomputed_fake_quant=use_precomputed_fake_quant)
 
 
 class ConvReLU3d(Conv3d):
@@ -58,12 +51,11 @@ class ConvReLU3d(Conv3d):
 
     _FLOAT_MODULE = _FloatConvReLU3d
 
-    def forward(self, x):
-        return _relu_forward(Conv3d, self, x)
+    _FUSED_RELU = True
 
     def _get_name(self):
         return "QuantizedConvReLU3d"
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
-        return super().from_float(getattr(mod, "op", mod))
+        return super().from_float(mod, use_precomputed_fake_quant=use_precomputed_fake_quant)
