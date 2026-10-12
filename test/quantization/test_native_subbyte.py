@@ -9,6 +9,20 @@ import tensorplay as tp
 DEVICES=['cpu']+(['cuda'] if tp.cuda.is_available() else [])
 
 
+@pytest.mark.parametrize('device',DEVICES)
+@pytest.mark.parametrize('bits',[2,4])
+@pytest.mark.parametrize('axis,scales,zeros',[
+    (-1,[1.,1.],[0.,0.]),(2,[1.,1.],[0.,0.]),
+    (0,[1.],[0.,0.]),(0,[1.,1.],[0.]),(0,[[1.,1.]],[0.,0.])])
+def test_subbyte_checkpoint_rejects_invalid_channel_grid(device,bits,axis,scales,zeros):
+    from tensorplay.serialization.quantized import rebuild_quantized_tensor
+    dtype_name='quint4x2' if bits==4 else 'quint2x4'
+    params=('per_channel_affine_float_qparams',dtype_name,(2,4),(4,1),0,
+            (tp.tensor(scales),tp.tensor(zeros),axis),'packed_affine')
+    with pytest.raises(ValueError,match='axis|grid length'):
+        rebuild_quantized_tensor(tp.zeros(4,dtype=tp.uint8,device=device),params)
+
+
 @pytest.mark.parametrize('bits',[2,4])
 @pytest.mark.parametrize('mode',[0x400,0x800,0xc00])
 @pytest.mark.parametrize('size',[65,65537])
