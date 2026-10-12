@@ -1,177 +1,252 @@
-"""FakeQuantize: simulated quantization with a straight-through estimator.
+"""Stateful simulated quantization with native rounding masks."""
 
-The forward pass maps values through the real affine Int8 grid using the
-native fake-quantization kernels.  The backward pass passes gradients through
-where the input lies inside the representable range and blocks them
-"""
-
-import tensorplay
-from tensorplay._C import (
-    fake_quantize_per_channel_affine as _fake_quantize_per_channel_affine,
-    fake_quantize_per_tensor_affine as _fake_quantize_per_tensor_affine,
-)
-from tensorplay.autograd.function import Function
+import tensorplay as tp
 from tensorplay import nn
+from tensorplay.autograd.function import Function
+from tensorplay import _C
+from .observer import (
+    ObserverBase, MovingAverageMinMaxObserver, MovingAveragePerChannelMinMaxObserver,
+    FixedQParamsObserver, _with_args, is_per_channel, QUANT_MIN, QUANT_MAX,
+    default_fixed_qparams_range_neg1to1_observer,
+    default_fixed_qparams_range_0to1_observer,
+)
 
-from .observer import QUANT_MAX, QUANT_MIN
 
-__all__ = ["FakeQuantize", "fake_quantize_per_tensor"]
-
-
-class _FakeQuantizeSTE(Function):
+class _TensorFakeQuant(Function):
     @staticmethod
     def forward(ctx, x, scale, zero_point, quant_min, quant_max):
-        y = _fake_quantize_per_tensor_affine(
-            self=x, scale=scale, zero_point=zero_point,
-            quant_min=quant_min, quant_max=quant_max)
-        # Real-domain bounds of the representable grid; gradient flows only
-        # for inputs inside them (outside, quantization is saturated and a
-        # straight-through would invent slope that the true function lacks).
-        ctx.lo = (quant_min - zero_point) * scale
-        ctx.hi = (quant_max - zero_point) * scale
-        ctx.save_for_backward(x)
-        return y
+        output, mask = _C.fake_quantize_per_tensor_affine_cachemask(
+            x, float(scale), int(zero_point), quant_min, quant_max)
+        ctx.save_for_backward(mask)
+        return output
 
     @staticmethod
-    def backward(ctx, grad_x, *_rest):
-        # The engine delivers one gradient slot per forward argument; only
-        # the first (w.r.t. ``x``) is differentiable here.
-        (x,) = ctx.saved_tensors
-        in_range = x.clamp(min=ctx.lo, max=ctx.hi) == x
-        grad_input = tensorplay.where(
-            in_range, grad_x, tensorplay.zeros_like(grad_x))
-        return (grad_input, None, None, None, None)
+    def backward(ctx, grad, *_rest):
+        return (_C.fake_quantize_per_tensor_affine_cachemask_backward(
+            grad, ctx.saved_tensors[0]), None, None, None, None)
 
 
-def fake_quantize_per_tensor(x, scale, zero_point,
-                             quant_min=QUANT_MIN, quant_max=QUANT_MAX):
-    """Applies fake quantization with fixed affine parameters."""
-    return _FakeQuantizeSTE.apply(x, float(scale), int(zero_point),
-                                  int(quant_min), int(quant_max))
+class _ChannelFakeQuant(Function):
+    @staticmethod
+    def forward(ctx, x, scale, zero_point, axis, quant_min, quant_max):
+        output, mask = _C.fake_quantize_per_channel_affine_cachemask(
+            x, scale, zero_point, axis, quant_min, quant_max)
+        ctx.save_for_backward(mask)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad, *_rest):
+        return (_C.fake_quantize_per_channel_affine_cachemask_backward(
+            grad, ctx.saved_tensors[0]), None, None, None, None, None)
 
 
-class FakeQuantize(nn.Module):
-    """Calibrating / simulating module.
+def fake_quantize_per_tensor(x, scale, zero_point, quant_min=QUANT_MIN, quant_max=QUANT_MAX):
+    return _TensorFakeQuant.apply(x, scale, zero_point, quant_min, quant_max)
 
-    With no qparams set, the first forward pass derives scale/zero_point
-    from its observer over incoming batches; call :meth:`freeze` to stop
-    recalibrating.  With explicit scale/zero_point arguments it is stateless.
-    """
 
-    def __init__(self, observer=None, scale=None, zero_point=None,
-                 disable_observer=False):
+def fake_quantize_per_channel(x, scales, zero_points, axis=0, quant_min=QUANT_MIN, quant_max=QUANT_MAX):
+    zp = zero_points.float() if zero_points.dtype.is_floating_point else zero_points.to(tp.int32)
+    return _ChannelFakeQuant.apply(x, scales.float(), zp, axis, quant_min, quant_max)
+
+
+class FakeQuantizeBase(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer('fake_quant_enabled', tp.tensor([1], dtype=tp.uint8))
+        self.register_buffer('observer_enabled', tp.tensor([1], dtype=tp.uint8))
+
+    def enable_fake_quant(self, enabled=True):
+        self.fake_quant_enabled.fill_(int(enabled))
+
+    def disable_fake_quant(self):
+        self.enable_fake_quant(False)
+
+    def enable_observer(self, enabled=True):
+        self.observer_enabled.fill_(int(enabled))
+
+    def disable_observer(self):
+        self.enable_observer(False)
+
+    with_args = classmethod(_with_args)
+
+
+class FakeQuantize(FakeQuantizeBase):
+    def __init__(self, observer=MovingAverageMinMaxObserver, quant_min=None,
+                 quant_max=None, is_dynamic=False, scale=None, zero_point=None,
+                 disable_observer=False, **observer_kwargs):
         super().__init__()
         if observer is None:
-            from .observer import MinMaxObserver
-            observer = MinMaxObserver()
-        self.observer = observer
-        self.scale = scale
-        self.zero_point = zero_point
-        self.frozen = scale is not None
-        # When True, calibration is suspended: forward keeps fake-quantizing
-        # FakeQuantize.disable_observer).
-        self.disable_observer = bool(disable_observer)
+            observer = MovingAverageMinMaxObserver
+        if quant_min is not None and quant_max is not None:
+            observer_kwargs.update(quant_min=quant_min, quant_max=quant_max)
+        observer_kwargs['is_dynamic'] = is_dynamic
+        self.activation_post_process = (observer if isinstance(observer, ObserverBase)
+                                        else observer(**observer_kwargs))
+        obs = self.activation_post_process
+        self.dtype, self.qscheme = obs.dtype, obs.qscheme
+        self.quant_min, self.quant_max = obs.quant_min, obs.quant_max
+        self.is_dynamic = obs.is_dynamic
+        self.ch_axis = getattr(obs, 'ch_axis', -1)
+        self.is_per_channel = is_per_channel(self.qscheme)
+        limits = {tp.qint8: (-128, 127), tp.int8: (-128, 127),
+                  tp.quint8: (0, 255), tp.uint8: (0, 255)}
+        if self.dtype not in limits:
+            raise ValueError('Simulated quantization requires an 8-bit integer dtype')
+        lo, hi = limits[self.dtype]
+        if self.quant_min < lo or self.quant_max > hi:
+            raise ValueError('Quantization range exceeds the dtype bounds')
+        zp_dtype = tp.float32 if self.qscheme == tp.per_channel_affine_float_qparams else tp.int32
+        device = next(obs.buffers(), tp.tensor(0)).device
+        self.register_buffer('scale', tp.ones(1, dtype=tp.float32, device=device))
+        self.register_buffer('zero_point', tp.zeros(1, dtype=zp_dtype, device=device))
+        if scale is not None:
+            if zero_point is None:
+                raise ValueError('Explicit scale requires zero_point')
+            self._update_qparams(tp.as_tensor(scale, device=device).reshape(-1),
+                                 tp.as_tensor(zero_point, device=device).reshape(-1))
+        if disable_observer or scale is not None:
+            self.disable_observer()
+
+    @property
+    def observer(self):
+        return self.activation_post_process
+
+    @property
+    def frozen(self):
+        return not bool(self.observer_enabled[0])
+
+    @property
+    def scales(self):
+        return self.scale
+
+    @property
+    def zero_points(self):
+        return self.zero_point
+
+    def _update_qparams(self, scale, zero_point):
+        self.scale.resize_(scale.shape).copy_(scale.to(self.scale.device))
+        self.zero_point.resize_(zero_point.shape).copy_(zero_point.to(self.zero_point.device))
 
     def record(self, x):
-        if not self.frozen and not self.disable_observer:
-            self.observer.record(x)
+        # Boolean assignment is retained for callers using the earlier flag API.
+        disabled = self.__dict__.get('disable_observer', False) is True
+        if bool(self.observer_enabled[0]) and not disabled:
+            self.activation_post_process(x.detach())
+            self._update_qparams(*self.calculate_qparams())
+        return x
 
     def freeze(self):
-        """Stops calibration and fixes the current derived qparams."""
-        if self.scale is None:
-            self.scale, self.zero_point = self.observer.calculate_qparams()
-        self.frozen = True
+        if bool(self.observer_enabled[0]):
+            self._update_qparams(*self.calculate_qparams())
+        self.enable_observer(False)
 
     def calculate_qparams(self):
-        if self.scale is not None:
-            return self.scale, self.zero_point
-        return self.observer.calculate_qparams()
+        return self.activation_post_process.calculate_qparams()
 
     def forward(self, x):
         self.record(x)
-        scale, zero_point = self.calculate_qparams()
-        return fake_quantize_per_tensor(x, scale, zero_point)
+        if not bool(self.fake_quant_enabled[0]):
+            return x
+        if self.is_per_channel:
+            return fake_quantize_per_channel(x, self.scale, self.zero_point,
+                                             self.ch_axis, self.quant_min, self.quant_max)
+        return fake_quantize_per_tensor(x, self.scale, self.zero_point,
+                                        self.quant_min, self.quant_max)
 
-class PerChannelFakeQuantize(nn.Module):
-    """Per-channel fake quantization with range-masked STE.
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        for name in ('scale', 'zero_point'):
+            if prefix + name in state_dict:
+                getattr(self, name).resize_(state_dict[prefix + name].shape)
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                     missing_keys, unexpected_keys, error_msgs)
 
-    ``ch_axis`` selects the quantized dimension; scale/zero_point may be
-    given explicitly (tensors of length n) or derived from a
-    PerChannelMinMaxObserver over incoming batches.
-    """
 
-    def __init__(self, ch_axis=0, observer=None, scales=None, zero_points=None,
-                 disable_observer=False):
-        super().__init__()
+class PerChannelFakeQuantize(FakeQuantize):
+    def __init__(self, ch_axis=0, observer=None, scales=None, zero_points=None, **kwargs):
         if observer is None:
-            from .observer import PerChannelMinMaxObserver
-            observer = PerChannelMinMaxObserver(ch_axis=ch_axis)
-        self.observer = observer
-        self.ch_axis = ch_axis
-        self.scales = scales
-        self.zero_points = zero_points
-        self.frozen = scales is not None
-        self.disable_observer = bool(disable_observer)
+            observer = MovingAveragePerChannelMinMaxObserver.with_args(
+                dtype=tp.qint8, qscheme=tp.per_channel_symmetric, ch_axis=ch_axis)
+        super().__init__(observer=observer, scale=scales, zero_point=zero_points, **kwargs)
 
-    def record(self, x):
-        if not self.frozen and not self.disable_observer:
-            self.observer.record(x)
+
+class FixedQParamsFakeQuantize(FakeQuantize):
+    def __init__(self, observer):
+        super().__init__(observer=observer)
+        if type(self.activation_post_process) is not FixedQParamsObserver:
+            raise ValueError('A fixed parameter observer is required')
+        self._update_qparams(*self.activation_post_process.calculate_qparams())
 
     def calculate_qparams(self):
-        if self.scales is not None:
-            return self.scales, self.zero_points
-        return self.observer.calculate_qparams()
+        return self.scale, self.zero_point
+
+
+class _FusedFakeQuant(Function):
+    @staticmethod
+    def forward(ctx, x, observer_on, fake_quant_on, running_min, running_max,
+                scale, zero_point, averaging_const, quant_min, quant_max,
+                ch_axis, per_channel, symmetric):
+        output, mask = _C._fused_moving_avg_obs_fq_helper(
+            x, observer_on, fake_quant_on, running_min, running_max, scale,
+            zero_point, averaging_const, quant_min, quant_max, ch_axis,
+            per_channel, symmetric)
+        ctx.save_for_backward(mask)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad, *_rest):
+        return (_C.fake_quantize_per_tensor_affine_cachemask_backward(
+            grad, ctx.saved_tensors[0]),) + (None,) * 12
+
+
+class FusedMovingAvgObsFakeQuantize(FakeQuantize):
+    def __init__(self, observer=MovingAverageMinMaxObserver, quant_min=0, quant_max=255, **kwargs):
+        super().__init__(observer, quant_min, quant_max, **kwargs)
+        if not isinstance(self.observer, (MovingAverageMinMaxObserver, MovingAveragePerChannelMinMaxObserver)):
+            raise ValueError('A moving average observer is required')
+        self.fake_quant_enabled = self.fake_quant_enabled.long()
+        self.observer_enabled = self.observer_enabled.long()
+        self.is_symmetric_quant = self.qscheme in (tp.per_tensor_symmetric, tp.per_channel_symmetric)
 
     def forward(self, x):
-        self.record(x)
-        scales, zero_points = self.calculate_qparams()
-        return fake_quantize_per_channel(x, scales.float(),
-                                         zero_points.long(),
-                                         axis=self.ch_axis)
+        return _FusedFakeQuant.apply(
+            x, self.observer_enabled, self.fake_quant_enabled,
+            self.observer.min_val, self.observer.max_val, self.scale, self.zero_point,
+            self.observer.averaging_constant, self.quant_min, self.quant_max,
+            self.ch_axis, self.is_per_channel, self.is_symmetric_quant)
 
 
-def fake_quantize_per_channel(x, scales, zero_points, axis=0,
-                              quant_min=QUANT_MIN, quant_max=QUANT_MAX):
-    """Applies per-channel fake quantization with fixed affine parameters.
-
-    Gradient passes through where ``x`` lies inside its channel's
-    representable real range [qmin-zp, qmax-zp]*scale, else zero.
-    """
-    axis = axis % x.dim()
-    shape = [1] * x.dim()
-    shape[axis] = x.size(axis)
-    scales1 = scales.to(tensorplay.float32)
-    zps1 = (zero_points.to(tensorplay.float32)
-            if zero_points.dtype.is_floating_point
-            else zero_points.to(tensorplay.int64))
-
-    y = _fake_quantize_per_channel_affine(
-        self=x, scale=scales1, zero_point=zps1, axis=axis,
-        quant_min=quant_min, quant_max=quant_max)
-    # Broadcast per-channel real-domain bounds for the STE mask.
-    lo_b = ((quant_min - zps1.to(scales1.dtype)) * scales1).reshape(shape) \
-        .expand(x.shape).contiguous()
-    hi_b = ((quant_max - zps1.to(scales1.dtype)) * scales1).reshape(shape) \
-        .expand(x.shape).contiguous()
-
-    class _STE(Function):
-        @staticmethod
-        def forward(ctx, xin, lo, hi):
-            ctx.x = xin
-            ctx.lo = lo
-            ctx.hi = hi
-            return y
-
-        @staticmethod
-        def backward(ctx, grad_x, *_rest):
-            # In-range iff (x-lo)*(x-hi) <= 0; clamp() only takes scalars.
-            signed = (ctx.x - ctx.lo) * (ctx.x - ctx.hi)
-            in_range = signed <= tensorplay.zeros_like(signed)
-            return (tensorplay.where(in_range, grad_x,
-                                     tensorplay.zeros_like(grad_x)),
-                    None, None)
-
-    return _STE.apply(x, lo_b, hi_b)
+def enable_fake_quant(module):
+    if isinstance(module, FakeQuantizeBase):
+        module.enable_fake_quant()
 
 
-__all__.extend(["PerChannelFakeQuantize", "fake_quantize_per_channel"])
+def disable_fake_quant(module):
+    if isinstance(module, FakeQuantizeBase):
+        module.disable_fake_quant()
+
+
+def enable_observer(module):
+    if isinstance(module, FakeQuantizeBase):
+        module.enable_observer()
+
+
+def disable_observer(module):
+    if isinstance(module, FakeQuantizeBase):
+        module.disable_observer()
+
+
+default_fake_quant = FakeQuantize.with_args(quant_min=0, quant_max=255, reduce_range=True)
+default_weight_fake_quant = FakeQuantize.with_args(dtype=tp.qint8, qscheme=tp.per_tensor_symmetric, quant_min=-128, quant_max=127)
+default_per_channel_weight_fake_quant = FakeQuantize.with_args(observer=MovingAveragePerChannelMinMaxObserver, dtype=tp.qint8, qscheme=tp.per_channel_symmetric, quant_min=-128, quant_max=127, ch_axis=0)
+default_dynamic_fake_quant = FakeQuantize.with_args(dtype=tp.quint8, quant_min=0, quant_max=255, is_dynamic=True, averaging_constant=1)
+default_fixed_qparams_range_neg1to1_fake_quant = FixedQParamsFakeQuantize.with_args(observer=default_fixed_qparams_range_neg1to1_observer)
+default_fixed_qparams_range_0to1_fake_quant = FixedQParamsFakeQuantize.with_args(observer=default_fixed_qparams_range_0to1_observer)
+default_embedding_fake_quant = FakeQuantize.with_args(observer=MovingAveragePerChannelMinMaxObserver, dtype=tp.quint8, qscheme=tp.per_channel_affine_float_qparams, ch_axis=0, averaging_constant=1)
+
+__all__ = [name for name in globals() if name.startswith('default_')] + [
+    'FakeQuantizeBase', 'FakeQuantize', 'PerChannelFakeQuantize',
+    'FixedQParamsFakeQuantize', 'FusedMovingAvgObsFakeQuantize',
+    'fake_quantize_per_tensor', 'fake_quantize_per_channel',
+    'enable_fake_quant', 'disable_fake_quant', 'enable_observer', 'disable_observer',
+]

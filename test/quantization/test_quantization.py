@@ -25,16 +25,18 @@ from tensorplay.ao.quantization import (
 
 class TestObservers(unittest.TestCase):
     def test_minmax(self):
-        obs = MinMaxObserver()
+        obs = MinMaxObserver(dtype=tp.qint8)
         obs(tp.tensor([0.0, 1.0]))
         obs(tp.tensor([-2.0, 0.5]))
         scale, zero_point = obs.calculate_qparams()
         # range [-2, 1] over [-128, 127]
-        self.assertAlmostEqual(scale, 3.0 / 255.0, places=7)
-        self.assertEqual(zero_point, int(round(-128 - (-2.0) / scale)))
+        self.assertAlmostEqual(float(scale), 3.0 / 255.0, places=7)
+        self.assertEqual(zero_point, int(round(-128 - (-2.0) / float(scale))))
         obs.reset()
-        with self.assertRaises(RuntimeError):
-            obs.calculate_qparams()
+        with self.assertWarns(UserWarning):
+            scale, zp = obs.calculate_qparams()
+        self.assertEqual(float(scale), 1.)
+        self.assertEqual(int(zp), 0)
 
     def test_moving_average(self):
         obs = MovingAverageMinMaxObserver(averaging_constant=0.5)
@@ -42,7 +44,7 @@ class TestObservers(unittest.TestCase):
         obs(tp.tensor([0.0, 20.0]))
         # EMA: min stays 0, max = 0.5*10 + 0.5*20
         _, _ = obs.calculate_qparams()
-        self.assertAlmostEqual(obs.max_val, 15.0, places=6)
+        self.assertAlmostEqual(float(obs.max_val), 15.0, places=6)
 
     def test_per_channel(self):
         obs = PerChannelMinMaxObserver(ch_axis=0)
@@ -65,7 +67,7 @@ class TestObservers(unittest.TestCase):
         self.assertAlmostEqual(float(scales[1]), 6.0 / 255.0, places=7)
 
     def test_histogram_filters_outliers(self):
-        obs = HistogramObserver(bins=512)
+        obs = HistogramObserver(bins=512, dtype=tp.qint8)
         body = tp.randn(10000).mul_(0.01)
         outlier = tp.tensor([50.0])
         obs(tp.cat([body, outlier]))
@@ -77,7 +79,7 @@ class TestObservers(unittest.TestCase):
         raw_scale = 100.0 / 255.0
         self.assertGreater(scale, 0.0)
         self.assertLess(scale, raw_scale)
-        self.assertEqual(zero_point, int(round(-128 - 0.0 / scale)))
+        self.assertEqual(zero_point, int(round(-128 - 0.0 / float(scale))))
 
     def test_fixed_and_placeholder(self):
         fixed = FixedQParamsObserver(scale=0.5, zero_point=3)
@@ -160,9 +162,9 @@ class TestStubsAndQuantizedLinear(unittest.TestCase):
                               zero_point=stub.fake_quant.zero_point)
         x = data[0]  # in-distribution: bounded by the calibrated range
         q = stub(x)
-        self.assertEqual(q.dtype, tp.qint8)
+        self.assertEqual(q.dtype, tp.quint8)
         self.assertTrue(q.is_quantized())
-        self.assertAlmostEqual(q.q_scale(), stub.fake_quant.scale, places=7)
+        self.assertAlmostEqual(q.q_scale(), float(stub.fake_quant.scale), places=7)
         self.assertEqual(q.q_zero_point(), stub.fake_quant.zero_point)
         back = dequant(q)
         self.assertTrue(float((back - x).abs().max().item()) < 0.2)

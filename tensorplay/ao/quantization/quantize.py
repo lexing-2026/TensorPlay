@@ -16,7 +16,7 @@ import copy
 
 from tensorplay import nn
 
-from .fake_quantize import FakeQuantize
+from .fake_quantize import FakeQuantize, FakeQuantizeBase
 from .observer import ObserverBase
 from .quantization_mappings import (
     get_default_dynamic_quant_module_mappings,
@@ -67,11 +67,12 @@ def propagate_qconfig_(module, qconfig_dict=None):
 
 
 def _observer_forward_hook(module, input, output):
-    module.activation_post_process(output)
-    return output
+    module.activation_post_process.to(output.device)
+    return module.activation_post_process(output)
 
 
 def _observer_forward_pre_hook(module, input):
+    module.input_activation_post_process.to(input[0].device)
     module.input_activation_post_process(input[0])
     return input
 
@@ -80,7 +81,7 @@ def _is_observer_machinery(child) -> bool:
     """Whether ``child`` is an embedded calibration module rather than a
     real submodule.  A wrapper carrying only such modules (for example a
     stub with its inner fake-quantize) still qualifies as a leaf."""
-    return isinstance(child, (FakeQuantize, ObserverBase))
+    return isinstance(child, (FakeQuantizeBase, ObserverBase))
 
 
 def _add_observer_(module, qconfig_spec=None):
@@ -109,6 +110,7 @@ def _add_observer_(module, qconfig_spec=None):
         module.register_forward_pre_hook(_observer_forward_pre_hook, prepend=True)
         if getattr(module, "weight", None) is not None and module.qconfig.weight is not None:
             module.weight_observer = module.qconfig.weight()
+            module.weight_observer.to(module.weight.device)
             module.weight_observer(module.weight.detach())
         return
     for child in module.children():

@@ -108,3 +108,8 @@ __all__ = [
     "quantize_dynamic",
     "fuse_modules",
 ]
+
+from .fake_quantize import *
+from .fake_quantize import __all__ as _fake_quant_exports
+from .observer import (ObserverBase, UniformQuantizationObserverBase, RecordingObserver, NoopObserver, ReuseInputObserver, default_per_channel_weight_observer, default_histogram_observer, default_float_qparams_observer, default_fixed_qparams_range_neg1to1_observer, default_fixed_qparams_range_0to1_observer)
+__all__ += _fake_quant_exports + ['ObserverBase', 'UniformQuantizationObserverBase', 'RecordingObserver', 'NoopObserver', 'ReuseInputObserver', 'default_per_channel_weight_observer', 'default_histogram_observer', 'default_float_qparams_observer', 'default_fixed_qparams_range_neg1to1_observer', 'default_fixed_qparams_range_0to1_observer']

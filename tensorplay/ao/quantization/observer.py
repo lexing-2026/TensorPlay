@@ -1,622 +1,700 @@
-"""Observers for post-training quantization calibration.
-
-An Observer records activation/weight ranges during calibration passes and
-derives affine Int8 quantization parameters (scale, zero_point) from them,
-
-Usage:
-    obs = MinMaxObserver()
-    for batch in calibration_data:
-        obs(batch)          # or obs.record(batch)
-    scale, zero_point = obs.calculate_qparams()
-"""
-
+"""Calibration statistics and uniform quantization parameter selection."""
 import math
+import warnings
 from collections import OrderedDict
-
+from functools import partial
 import tensorplay
 from tensorplay import nn
 
-__all__ = [
-    "ObserverBase",
-    "MinMaxObserver",
-    "MovingAverageMinMaxObserver",
-    "PerChannelMinMaxObserver",
-    "MovingAveragePerChannelMinMaxObserver",
-    "HistogramObserver",
-    "FixedQParamsObserver",
-    "PlaceholderObserver",
-    "with_args",
-    "default_observer",
-    "default_weight_observer",
-    "default_dynamic_quant_observer",
-    "get_observer_state_dict",
-    "load_observer_state_dict",
-]
-
-# Int8 affine range used across the quantization stack.
 QUANT_MIN = -128
 QUANT_MAX = 127
 
+def is_per_tensor(qscheme):
+    return qscheme == tensorplay.per_tensor_affine or qscheme == tensorplay.per_tensor_symmetric
+
+def is_per_channel(qscheme):
+    return qscheme in [tensorplay.per_channel_affine, tensorplay.per_channel_affine_float_qparams, tensorplay.per_channel_symmetric]
+
+def check_min_max_valid(min_val, max_val):
+    if min_val.numel() == 0 or max_val.numel() == 0:
+        warnings.warn('must run observer before calling calculate_qparams. ' + 'Returning default values.', stacklevel=2)
+        return False
+    if min_val.dim() == 0 or max_val.dim() == 0:
+        if min_val == float('inf') and max_val == float('-inf'):
+            warnings.warn('must run observer before calling calculate_qparams. ' + 'Returning default values.', stacklevel=2)
+            return False
+        if min_val > max_val:
+            raise AssertionError(f'min {min_val} should be less than max {max_val}')
+    elif tensorplay.any(min_val > max_val):
+        raise AssertionError(f'min {min_val} should be less than max {max_val}')
+    return True
+
+def calculate_qmin_qmax(quant_min, quant_max, has_customized_qrange, dtype, reduce_range):
+    if has_customized_qrange:
+        if dtype in [tensorplay.qint32, tensorplay.int32]:
+            initial_quant_min, initial_quant_max = (0, 2 ** 32 - 1)
+        else:
+            initial_quant_min, initial_quant_max = (0, 255)
+        custom_quant_min, custom_quant_max = (quant_min, quant_max)
+        if custom_quant_min is not None and custom_quant_max is not None:
+            initial_quant_min, initial_quant_max = (custom_quant_min, custom_quant_max)
+        qrange_len = initial_quant_max - initial_quant_min + 1
+        if dtype in [tensorplay.qint8, tensorplay.int8]:
+            if not 0 < qrange_len <= 256:
+                raise AssertionError('quantization range should be positive and not exceed the maximum bit range (=256).')
+        elif dtype in [tensorplay.qint32, tensorplay.int32]:
+            if not 0 < qrange_len <= 2 ** 32:
+                raise AssertionError('quantization range should be positive and not exceed the maximum bit range (=4294967296).')
+        if reduce_range:
+            quant_min, quant_max = (quant_min // 2, quant_max // 2)
+    elif dtype in [tensorplay.qint8, tensorplay.int8]:
+        if reduce_range:
+            quant_min, quant_max = (-64, 63)
+        else:
+            quant_min, quant_max = (-128, 127)
+    elif dtype in [tensorplay.quint8, tensorplay.uint8]:
+        if reduce_range:
+            quant_min, quant_max = (0, 127)
+        else:
+            quant_min, quant_max = (0, 255)
+    elif dtype in [tensorplay.qint32, tensorplay.int32]:
+        quant_min, quant_max = (-1 * 2 ** 31, 2 ** 31 - 1)
+    elif dtype == tensorplay.uint16:
+        quant_min, quant_max = (0, 2 ** 16 - 1)
+    elif dtype == tensorplay.int16:
+        quant_min, quant_max = (-2 ** 15, 2 ** 15 - 1)
+    else:
+        quant_min, quant_max = (0, 15)
+    return (quant_min, quant_max)
+
+def validate_qmin_qmax(quant_min, quant_max):
+    if not quant_min <= 0 <= quant_max:
+        raise AssertionError('Used-specified quantization range must include 0.')
+    if quant_min >= quant_max:
+        raise AssertionError('qmin must be strictly less than qmax for user-specified quantization range.')
 
 class _PartialWrapper:
-    """
-    observer classes be specialized with constructor arguments while staying
-    callable as ``observer_cls(**kwargs)``."""
 
-    def __init__(self, impl, **kwargs):
-        self.impl = impl
-        self.kwargs = kwargs
+    def __init__(self, p):
+        self.p = p
+        self.callable_args = {}
 
-    def __call__(self, *args, **kwargs):
-        merged = dict(self.kwargs)
-        merged.update(kwargs)
-        return self.impl(*args, **merged)
-
-    def with_args(self, **kwargs):
-        merged = dict(self.kwargs)
-        merged.update(kwargs)
-        return _PartialWrapper(self.impl, **merged)
+    def __call__(self, *args, **keywords):
+        for arg_name in self.callable_args:
+            if arg_name not in keywords:
+                keywords = {**keywords, arg_name: self.callable_args[arg_name]()}
+        return self.p(*args, **keywords)
 
     def __repr__(self):
-        return f"{self.impl.__name__}({', '.join(f'{k}={v!r}' for k, v in self.kwargs.items())})"
+        return self.p.__repr__() + self.callable_args.__repr__()
 
+    def with_args(self, **kwargs):
+        return _with_args(self, **kwargs)
 
-def with_args(**kwargs):
-    """Decorator form: ``@with_args(quant_min=0)`` specializes an observer."""
-    def decorator(cls_or_fn):
-        return _PartialWrapper(cls_or_fn, **kwargs)
-    return decorator
+    def with_callable_args(self, **kwargs):
+        result = _PartialWrapper(p=self.p)
+        result.callable_args = {**self.callable_args, **kwargs}
+        return result
 
+def _with_args(cls_or_self, **kwargs):
+    r = _PartialWrapper(partial(cls_or_self, **kwargs))
+    return r
 
-def _as_float_tensor(value):
-    if isinstance(value, tensorplay.Tensor):
-        return value.to(tensorplay.float32)
-    return tensorplay.as_tensor(float(value), dtype=tensorplay.float32)
-
+def _with_callable_args(cls_or_self, **kwargs):
+    r = _PartialWrapper(partial(cls_or_self))
+    return r.with_callable_args(**kwargs)
 
 class ObserverBase(nn.Module):
-    """Base class: fixed Int8 range, dtype bookkeeping, qparam derivation."""
 
-    def __init__(self, dtype=tensorplay.int8, quant_min=QUANT_MIN,
-                 quant_max=QUANT_MAX, eps=None):
+    def __init__(self, dtype, is_dynamic=False):
         super().__init__()
         self.dtype = dtype
-        self.quant_min = quant_min
-        self.quant_max = quant_max
-        self.eps = 1.1920928955078125e-07 if eps is None else eps
+        self.is_dynamic = is_dynamic
 
-    @classmethod
-    def with_args(cls, **kwargs):
-        return _PartialWrapper(cls, **kwargs)
+    def forward(self, x):
+        pass
 
-    def observation_state(self):
-        """Serializable calibration state (tensors / numbers / None).
+    def calculate_qparams(self, **kwargs):
+        pass
+    with_args = classmethod(_with_args)
+    with_callable_args = classmethod(_with_callable_args)
 
-        Observers keep their statistics as plain attributes rather than
-        registered buffers, so ``state_dict()`` cannot see them; this pair
-        is what get/load_observer_state_dict persist.
-        """
-        return {"min_val": self.min_val, "max_val": self.max_val}
+class UniformQuantizationObserverBase(ObserverBase):
+    _version = 3
 
-    def load_observation_state(self, state):
-        self.min_val = state["min_val"]
-        self.max_val = state["max_val"]
+    def __init__(self, dtype=tensorplay.quint8, qscheme=tensorplay.per_tensor_affine, reduce_range=False, quant_min=None, quant_max=None, factory_kwargs=None, eps=tensorplay.finfo(tensorplay.float32).eps, is_dynamic=False, **kwargs):
+        factory_kwargs = tensorplay.nn.factory_kwargs(factory_kwargs)
+        super().__init__(dtype=dtype, is_dynamic=is_dynamic, **kwargs)
+        self.qscheme = qscheme
+        if reduce_range:
+            warnings.warn('Please use quant_min and quant_max to specify the range for observers.                     reduce_range will be deprecated in a future release of quantization.', stacklevel=2)
+        self.reduce_range = reduce_range
+        self.register_buffer('eps', tensorplay.tensor([eps], **factory_kwargs))
+        if self.qscheme not in (tensorplay.per_tensor_affine, tensorplay.per_tensor_symmetric, tensorplay.per_channel_affine, tensorplay.per_channel_symmetric, tensorplay.per_channel_affine_float_qparams):
+            raise AssertionError('Default Observer only works for per_tensor_affine, per_tensor_symmetric, per_channel_affine, per_channel_symmetric and per_channel_float_qparams quantization scheme')
+        _ALLOWED_DTYPES = (tensorplay.qint8, tensorplay.quint8, tensorplay.qint32, tensorplay.int8, tensorplay.uint8, tensorplay.int16, tensorplay.int32, tensorplay.float8_e5m2, tensorplay.float8_e4m3fn, tensorplay.uint16)
+        if self.dtype not in _ALLOWED_DTYPES:
+            raise AssertionError(f'Default Observer only works for {_ALLOWED_DTYPES} data type')
+        self.has_customized_qrange = quant_min is not None and quant_max is not None
+        if self.has_customized_qrange:
+            validate_qmin_qmax(quant_min, quant_max)
+        self.quant_min, self.quant_max = calculate_qmin_qmax(quant_min, quant_max, self.has_customized_qrange, self.dtype, self.reduce_range)
 
-    @staticmethod
-    def _calculate_qparams(min_val, max_val, quant_min=QUANT_MIN,
-                           quant_max=QUANT_MAX):
-        min_val = float(min_val)
-        max_val = float(max_val)
-        min_val = min(0.0, min_val)
-        max_val = max(0.0, max_val)
-        # Include zero in the range so that 0 maps exactly to zero_point.
-        span = max_val - min_val
-        if span == 0.0:
-            scale = 1.0
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        version = local_metadata.get('version', None)
+        if version is None or version == 1:
+            eps = tensorplay.tensor([tensorplay.finfo(tensorplay.float32).eps])
+            state_dict[prefix + 'eps'] = eps
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+
+    def _validate_qmin_qmax(self, quant_min, quant_max):
+        if not quant_min <= 0 <= quant_max:
+            raise AssertionError('Used-specified quantization range must include 0.')
+        if quant_min >= quant_max:
+            raise AssertionError('qmin must be strictly less than qmax for user-specified quantization range.')
+
+    def _derive_qparams(self, min_val, max_val):
+        if not check_min_max_valid(min_val, max_val):
+            return (tensorplay.tensor([1.0], device=min_val.device.type), tensorplay.tensor([0], device=min_val.device.type))
+        quant_min, quant_max = (self.quant_min, self.quant_max)
+        min_val_neg = tensorplay.minimum(min_val, tensorplay.zeros_like(min_val))
+        max_val_pos = tensorplay.maximum(max_val, tensorplay.zeros_like(max_val))
+        device = min_val_neg.device
+        scale = tensorplay.ones(min_val_neg.size(), dtype=tensorplay.float32, device=device)
+        zero_point = tensorplay.zeros(min_val_neg.size(), dtype=tensorplay.int64, device=device)
+        if self.qscheme == tensorplay.per_tensor_symmetric or self.qscheme == tensorplay.per_channel_symmetric:
+            max_val_pos = tensorplay.maximum(-min_val_neg, max_val_pos)
+            scale = max_val_pos / (float(quant_max - quant_min) / 2)
+            scale = tensorplay.maximum(scale, self.eps)
+            if self.dtype in [tensorplay.quint8, tensorplay.uint8]:
+                if self.has_customized_qrange:
+                    zero_point = zero_point.new_full(zero_point.size(), (quant_min + quant_max) // 2)
+                else:
+                    zero_point = zero_point.new_full(zero_point.size(), 128)
+            elif self.dtype == tensorplay.uint16:
+                zero_point = zero_point.new_full(zero_point.size(), 2 ** 15)
+        elif self.qscheme == tensorplay.per_channel_affine_float_qparams:
+            scale = (max_val - min_val) / float(quant_max - quant_min)
+            scale = tensorplay.where(scale > self.eps, scale, tensorplay.ones_like(scale))
+            zero_point = -1 * min_val / scale
         else:
-            scale = span / float(quant_max - quant_min)
-        # Guard against a degenerate scale (empty/degenerate range).
-        if not math.isfinite(scale) or scale == 0.0:
-            scale = 1.0
-        zero_point = int(round(quant_min - min_val / scale))
-        zero_point = max(quant_min, min(quant_max, zero_point))
-        return scale, zero_point
+            scale = (max_val_pos - min_val_neg) / float(quant_max - quant_min)
+            scale = tensorplay.maximum(scale, self.eps)
+            zero_point = quant_min - tensorplay.round(min_val_neg / scale).to(tensorplay.int)
+            zero_point = tensorplay.clamp(zero_point, quant_min, quant_max)
+        if scale.dim() == 0:
+            scale = scale.reshape(1)
+        if zero_point.dim() == 0:
+            zero_point = zero_point.reshape(1)
+        return (scale, zero_point)
 
+    def reset_min_max_vals(self):
+        raise NotImplementedError('Cannot reset min/max values in the given observer.')
 
-class MinMaxObserver(ObserverBase):
-    """Tracks the running min/max of observed tensors; per-tensor params."""
+class MinMaxObserver(UniformQuantizationObserverBase):
 
-    def __init__(self, dtype=tensorplay.int8, quant_min=QUANT_MIN,
-                 quant_max=QUANT_MAX, eps=None):
-        super().__init__(dtype=dtype, quant_min=quant_min,
-                         quant_max=quant_max, eps=eps)
-        self.min_val = None
-        self.max_val = None
+    def __init__(self, dtype=tensorplay.quint8, qscheme=tensorplay.per_tensor_affine, reduce_range=False, quant_min=None, quant_max=None, factory_kwargs=None, eps=tensorplay.finfo(tensorplay.float32).eps, is_dynamic=False, **kwargs):
+        if not is_per_tensor(qscheme):
+            raise NotImplementedError("MinMaxObserver's qscheme only support per_tensor_symmetric                     and per_tensor_affine.")
+        super().__init__(dtype=dtype, qscheme=qscheme, reduce_range=reduce_range, quant_min=quant_min, quant_max=quant_max, factory_kwargs=factory_kwargs, eps=eps, is_dynamic=is_dynamic, **kwargs)
+        factory_kwargs = tensorplay.nn.factory_kwargs(factory_kwargs)
+        self.register_buffer('min_val', tensorplay.tensor(float('inf'), **factory_kwargs))
+        self.register_buffer('max_val', tensorplay.tensor(float('-inf'), **factory_kwargs))
+        if self.qscheme == tensorplay.per_tensor_symmetric and self.reduce_range and (self.dtype == tensorplay.quint8):
+            raise NotImplementedError('Cannot reduce range for symmetric                                        quantization for quint8')
 
-    def record(self, x):
-        with tensorplay.no_grad():
-            current_min = float(x.min().item())
-            current_max = float(x.max().item())
-        if self.min_val is None:
-            self.min_val = current_min
-            self.max_val = current_max
-        else:
-            self.min_val = min(self.min_val, current_min)
-            self.max_val = max(self.max_val, current_max)
-        return x
-
-    def reset(self):
-        self.min_val = None
-        self.max_val = None
-
-    __call__ = record
+    def forward(self, x_orig):
+        if x_orig.numel() == 0:
+            return x_orig
+        x = x_orig.detach()
+        x = x.to(self.min_val.dtype)
+        min_val_cur, max_val_cur = tensorplay.aminmax(x)
+        min_val = tensorplay.minimum(min_val_cur, self.min_val)
+        max_val = tensorplay.maximum(max_val_cur, self.max_val)
+        self.min_val.copy_(min_val)
+        self.max_val.copy_(max_val)
+        return x_orig
 
     def calculate_qparams(self):
-        if self.min_val is None:
-            raise RuntimeError(
-                "MinMaxObserver has not observed any tensors; run "
-                "calibration data through it before calculate_qparams()")
-        return self._calculate_qparams(self.min_val, self.max_val,
-                                       self.quant_min, self.quant_max)
+        return self._derive_qparams(self.min_val, self.max_val)
 
+    def extra_repr(self):
+        return f'min_val={self.min_val}, max_val={self.max_val}'
 
-class MovingAverageMinMaxObserver(ObserverBase):
-    """Exponential moving average of min/max, as used for QAT-style
-    calibration on streamed data."""
+    def reset_min_max_vals(self):
+        self.min_val.fill_(float('inf'))
+        self.max_val.fill_(float('-inf'))
 
-    def __init__(self, averaging_constant=0.01, dtype=tensorplay.int8,
-                 quant_min=QUANT_MIN, quant_max=QUANT_MAX, eps=None):
-        super().__init__(dtype=dtype, quant_min=quant_min,
-                         quant_max=quant_max, eps=eps)
-        if not 0.0 < averaging_constant <= 1.0:
-            raise ValueError("averaging_constant must be in (0, 1]")
+class MovingAverageMinMaxObserver(MinMaxObserver):
+
+    def __init__(self, averaging_constant=0.01, dtype=tensorplay.quint8, qscheme=tensorplay.per_tensor_affine, reduce_range=False, quant_min=None, quant_max=None, eps=tensorplay.finfo(tensorplay.float32).eps, is_dynamic=False, **kwargs):
+        if not is_per_tensor(qscheme):
+            raise NotImplementedError(f"MovingAverageMinMaxObserver's qscheme only support                 per_tensor_symmetric and per_tensor_affine.                 but got: {qscheme}")
         self.averaging_constant = averaging_constant
-        self.min_val = None
-        self.max_val = None
+        if is_dynamic and self.averaging_constant != 1:
+            raise NotImplementedError(f"MovingAverageMinMaxObserver doesn't support dynamic quantization for averaging constant of {self.averaging_constant}")
+        super().__init__(dtype=dtype, qscheme=qscheme, reduce_range=reduce_range, quant_min=quant_min, quant_max=quant_max, eps=eps, is_dynamic=is_dynamic, **kwargs)
 
-    def record(self, x):
-        with tensorplay.no_grad():
-            current_min = float(x.min().item())
-            current_max = float(x.max().item())
-        if self.min_val is None:
-            self.min_val = current_min
-            self.max_val = current_max
+    def forward(self, x_orig):
+        if x_orig.numel() == 0:
+            return x_orig
+        x = x_orig.detach()
+        x = x.to(self.min_val.dtype)
+        min_val = self.min_val
+        max_val = self.max_val
+        if min_val == float('inf') and max_val == float('-inf'):
+            min_val, max_val = tensorplay.aminmax(x)
         else:
-            c = self.averaging_constant
-            self.min_val = (1 - c) * self.min_val + c * current_min
-            self.max_val = (1 - c) * self.max_val + c * current_max
-        return x
+            min_val_cur, max_val_cur = tensorplay.aminmax(x)
+            min_val = min_val + self.averaging_constant * (min_val_cur - min_val)
+            max_val = max_val + self.averaging_constant * (max_val_cur - max_val)
+        self.min_val.copy_(min_val)
+        self.max_val.copy_(max_val)
+        return x_orig
 
-    def reset(self):
-        self.min_val = None
-        self.max_val = None
+class PerChannelMinMaxObserver(UniformQuantizationObserverBase):
 
-    __call__ = record
-
-    def calculate_qparams(self):
-        if self.min_val is None:
-            raise RuntimeError(
-                "MovingAverageMinMaxObserver has not observed any tensors")
-        return self._calculate_qparams(self.min_val, self.max_val,
-                                       self.quant_min, self.quant_max)
-
-
-class PerChannelMinMaxObserver(ObserverBase):
-    """Running per-channel min/max along ``ch_axis``; returns per-channel
-    scale/zero_point tensors suitable for quantize_per_channel."""
-
-    def __init__(self, ch_axis=0, dtype=tensorplay.int8, quant_min=QUANT_MIN,
-                 quant_max=QUANT_MAX, eps=None):
-        super().__init__(dtype=dtype, quant_min=quant_min,
-                         quant_max=quant_max, eps=eps)
+    def __init__(self, ch_axis=0, dtype=tensorplay.quint8, qscheme=tensorplay.per_channel_affine, reduce_range=False, quant_min=None, quant_max=None, factory_kwargs=None, eps=tensorplay.finfo(tensorplay.float32).eps, is_dynamic=False, **kwargs):
+        if not is_per_channel(qscheme):
+            raise NotImplementedError("PerChannelMinMaxObserver's qscheme only support                     per_channel_symmetric, per_channel_affine and per_channel_affine_float_qparams.")
+        if is_dynamic:
+            raise NotImplementedError("PerChannelMinMaxObserver doesn't support dynamic quantization")
+        super().__init__(dtype=dtype, qscheme=qscheme, reduce_range=reduce_range, quant_min=quant_min, quant_max=quant_max, factory_kwargs=factory_kwargs, eps=eps, is_dynamic=is_dynamic, **kwargs)
+        factory_kwargs = tensorplay.nn.factory_kwargs(factory_kwargs)
         self.ch_axis = ch_axis
-        self.min_val = None  # list of floats, one per channel
-        self.max_val = None
+        self.register_buffer('min_val', tensorplay.tensor([], **factory_kwargs))
+        self.register_buffer('max_val', tensorplay.tensor([], **factory_kwargs))
+        if self.qscheme == tensorplay.per_channel_symmetric and self.reduce_range and (self.dtype == tensorplay.quint8):
+            raise NotImplementedError('Cannot reduce range for symmetric quantization for quint8')
 
-    def record(self, x):
-        axis = self.ch_axis % x.dim()
-        mins = []
-        maxs = []
-        with tensorplay.no_grad():
-            for c in range(x.size(axis)):
-                # select() drops the channel dim; min()/max() reduce the rest.
-                channel = x.select(axis, c)
-                mins.append(float(channel.min().item()))
-                maxs.append(float(channel.max().item()))
-        if self.min_val is None:
-            self.min_val = mins
-            self.max_val = maxs
+    def forward(self, x_orig):
+        return self._forward(x_orig)
+
+    def _forward(self, x_orig):
+        if x_orig.numel() == 0:
+            return x_orig
+        x = x_orig.detach()
+        min_val = self.min_val
+        max_val = self.max_val
+        x_dim = x.size()
+        new_axis_list = [i for i in range(len(x_dim))]
+        new_axis_list[self.ch_axis] = 0
+        new_axis_list[0] = self.ch_axis
+        y = x.permute(new_axis_list)
+        y = y.to(self.min_val.dtype)
+        y = tensorplay.flatten(y, start_dim=1)
+        if min_val.numel() == 0 or max_val.numel() == 0:
+            min_val, max_val = tensorplay.aminmax(y, dim=1)
         else:
-            self.min_val = [min(a, b) for a, b in zip(self.min_val, mins)]
-            self.max_val = [max(a, b) for a, b in zip(self.max_val, maxs)]
-        return x
-
-    def reset(self):
-        self.min_val = None
-        self.max_val = None
-
-    __call__ = record
+            min_val_cur, max_val_cur = tensorplay.aminmax(y, dim=1)
+            min_val = tensorplay.minimum(min_val_cur, min_val)
+            max_val = tensorplay.maximum(max_val_cur, max_val)
+        self.min_val.resize_(min_val.shape)
+        self.max_val.resize_(max_val.shape)
+        self.min_val.copy_(min_val)
+        self.max_val.copy_(max_val)
+        return x_orig
 
     def calculate_qparams(self):
-        if self.min_val is None:
-            raise RuntimeError("PerChannelMinMaxObserver has not observed tensors")
-        scales = []
-        zero_points = []
-        for lo, hi in zip(self.min_val, self.max_val):
-            s, z = self._calculate_qparams(lo, hi, self.quant_min, self.quant_max)
-            scales.append(s)
-            zero_points.append(z)
-        return (
-            tensorplay.as_tensor(scales, dtype=tensorplay.float32),
-            tensorplay.as_tensor(zero_points, dtype=tensorplay.int64),
-        )
+        return self._derive_qparams(self.min_val, self.max_val)
 
-    def observation_state(self):
-        return {
-            "min_val": None if self.min_val is None
-            else tensorplay.as_tensor(self.min_val, dtype=tensorplay.float32),
-            "max_val": None if self.max_val is None
-            else tensorplay.as_tensor(self.max_val, dtype=tensorplay.float32),
-        }
+    def extra_repr(self):
+        return f'min_val={self.min_val}, max_val={self.max_val}'
 
-    def load_observation_state(self, state):
-        min_val = state["min_val"]
-        max_val = state["max_val"]
-        self.min_val = None if min_val is None else [float(v) for v in min_val]
-        self.max_val = None if max_val is None else [float(v) for v in max_val]
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        for name in ('min_val', 'max_val'):
+            old_name = name.replace('_val', '_vals')
+            if prefix + old_name in state_dict and prefix + name not in state_dict:
+                state_dict[prefix + name] = state_dict.pop(prefix + old_name)
+            if prefix + name in state_dict:
+                getattr(self, name).resize_(state_dict[prefix + name].shape)
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                     missing_keys, unexpected_keys, error_msgs)
 
+    def reset_min_max_vals(self):
+        self.min_val.resize_(0)
+        self.max_val.resize_(0)
 
 class MovingAveragePerChannelMinMaxObserver(PerChannelMinMaxObserver):
-    """Exponential moving average of per-channel min/max values."""
 
-    def __init__(self, averaging_constant=0.01, ch_axis=0,
-                 dtype=tensorplay.int8, quant_min=QUANT_MIN,
-                 quant_max=QUANT_MAX, eps=None):
-        super().__init__(ch_axis=ch_axis, dtype=dtype, quant_min=quant_min,
-                         quant_max=quant_max, eps=eps)
-        if not 0.0 < averaging_constant <= 1.0:
-            raise ValueError("averaging_constant must be in (0, 1]")
+    def __init__(self, averaging_constant=0.01, ch_axis=0, dtype=tensorplay.quint8, qscheme=tensorplay.per_channel_affine, reduce_range=False, quant_min=None, quant_max=None, eps=tensorplay.finfo(tensorplay.float32).eps, is_dynamic=False, **kwargs):
+        if not is_per_channel(qscheme):
+            raise NotImplementedError("MovingAveragePerChannelMinMaxObserver's qscheme only support                     per_channel_symmetric, per_channel_affine and per_channel_affine_float_qparams.")
+        if is_dynamic:
+            raise NotImplementedError("MovingAveragePerChannelMinMaxObserver doesn't support dynamic quantization")
+        super().__init__(ch_axis=ch_axis, dtype=dtype, qscheme=qscheme, reduce_range=reduce_range, quant_min=quant_min, quant_max=quant_max, eps=eps, is_dynamic=is_dynamic, **kwargs)
         self.averaging_constant = averaging_constant
 
-    def record(self, x):
-        axis = self.ch_axis % x.dim()
-        mins = []
-        maxs = []
-        with tensorplay.no_grad():
-            for c in range(x.size(axis)):
-                channel = x.select(axis, c)
-                mins.append(float(channel.min().item()))
-                maxs.append(float(channel.max().item()))
-        if self.min_val is None:
-            self.min_val = mins
-            self.max_val = maxs
+    def forward(self, x_orig):
+        if x_orig.numel() == 0:
+            return x_orig
+        x = x_orig.detach()
+        x = x.to(self.min_val.dtype)
+        min_val = self.min_val
+        max_val = self.max_val
+        x_dim = x.size()
+        new_axis_list = [i for i in range(len(x_dim))]
+        new_axis_list[self.ch_axis] = 0
+        new_axis_list[0] = self.ch_axis
+        y = x.permute(new_axis_list)
+        y = tensorplay.flatten(y, start_dim=1)
+        if min_val.numel() == 0 or max_val.numel() == 0:
+            min_val, max_val = tensorplay.aminmax(y, dim=1)
         else:
-            a = self.averaging_constant
-            self.min_val = [o + a * (n - o)
-                            for o, n in zip(self.min_val, mins)]
-            self.max_val = [o + a * (n - o)
-                            for o, n in zip(self.max_val, maxs)]
-        return x
+            min_val_cur, max_val_cur = tensorplay.aminmax(y, dim=1)
+            min_val = min_val + self.averaging_constant * (min_val_cur - min_val)
+            max_val = max_val + self.averaging_constant * (max_val_cur - max_val)
+        self.min_val.resize_(min_val.shape)
+        self.max_val.resize_(max_val.shape)
+        self.min_val.copy_(min_val)
+        self.max_val.copy_(max_val)
+        return x_orig
 
-    __call__ = record
+class HistogramObserver(UniformQuantizationObserverBase):
 
-
-def _histc(x, bins, lo, hi):
-    """
-
-    Values outside the range are clamped into the edge bins; a degenerate
-    range is widened by an epsilon so every value lands in one bucket.
-    """
-    width = max(hi - lo, 1e-12)
-    bin_width = width / float(bins)
-    idx = ((x - lo) / bin_width).floor().clamp(0, bins - 1)
-    idx = idx.to(tensorplay.int64)
-    return tensorplay.zeros(bins).scatter_add_(
-        0, idx, tensorplay.ones_like(idx.to(tensorplay.float32)))
-
-
-class HistogramObserver(ObserverBase):
-    """Running-histogram observer.
-
-    Records a running histogram of incoming values together with the global
-    min/max; ``calculate_qparams`` narrows the range with an L2-quantization-
-    error search (the norm-minimization formulation) before deriving affine
-    parameters, which filters outliers instead of trusting raw extremes.
-    """
-
-    def __init__(self, bins=2048, dtype=tensorplay.int8,
-                 quant_min=QUANT_MIN, quant_max=QUANT_MAX, eps=None):
-        super().__init__(dtype=dtype, quant_min=quant_min,
-                         quant_max=quant_max, eps=eps)
-        self.bins = int(bins)
-        self.histogram = None   # tp tensor of shape [bins]
-        self.min_val = float("inf")
-        self.max_val = float("-inf")
-        self.dst_nbins = 256
+    def __init__(self, bins=2048, dtype=tensorplay.quint8, qscheme=tensorplay.per_tensor_affine, reduce_range=False, quant_min=None, quant_max=None, factory_kwargs=None, eps=tensorplay.finfo(tensorplay.float32).eps, is_dynamic=False, **kwargs):
+        if not is_per_tensor(qscheme):
+            raise NotImplementedError("HistogramObserver's qscheme only support per_tensor_symmetric                     and per_tensor_affine.")
+        if is_dynamic:
+            raise NotImplementedError("HistogramObserver doesn't support dynamic quantization")
+        super().__init__(dtype=dtype, qscheme=qscheme, reduce_range=reduce_range, quant_min=quant_min, quant_max=quant_max, factory_kwargs=factory_kwargs, eps=eps, is_dynamic=is_dynamic, **kwargs)
+        factory_kwargs = tensorplay.nn.factory_kwargs(factory_kwargs)
+        self.bins = bins
+        self.register_buffer('histogram', tensorplay.zeros(self.bins, **factory_kwargs))
+        self.register_buffer('min_val', tensorplay.tensor(float('inf'), **factory_kwargs))
+        self.register_buffer('max_val', tensorplay.tensor(float('-inf'), **factory_kwargs))
+        self.dst_nbins = 2 ** (32 if self.dtype in (tensorplay.qint32, tensorplay.int32) else 8)
         self.upsample_rate = 16
 
     def _get_norm(self, delta_begin, delta_end, density):
-        # norm = density * integral_{begin,end} x^2 dx over uniform mass.
-        return density * (delta_end ** 3 - delta_begin ** 3) / 3.0
-
-    def reset_histogram(self, x, min_val, max_val):
-        self.min_val = float(min_val)
-        self.max_val = float(max_val)
-        self.histogram = _histc(x, self.bins, self.min_val, self.max_val)
-
-    def _upscale_histogram(self, histogram, orig_min, orig_max,
-                           update_min, update_max):
-        rate = self.upsample_rate
-        bins = self.bins
-        # repeat_interleave equivalent via an index gather: element j lands
-        # at positions [j*rate, (j+1)*rate).
-        gather = tensorplay.as_tensor(
-            [j for j in range(bins) for _ in range(rate)],
-            dtype=tensorplay.int64)
-        upscaled = histogram.index_select(0, gather) / float(rate)
-        fine_bins = bins * rate
-        fine_bin_size = (orig_max - orig_min) / fine_bins
-        mids = tensorplay.linspace(orig_min, orig_max, fine_bins + 1)[:-1] \
-            + 0.5 * fine_bin_size
-        boundaries = tensorplay.linspace(update_min, update_max, bins + 1)
-        buckets = tensorplay.bucketize(mids, boundaries, right=True)
-        buckets = (buckets - 1).clamp(0, bins - 1).to(tensorplay.int64)
-        return tensorplay.zeros(bins).scatter_add_(0, buckets, upscaled)
-
-    def _combine_histograms(self, orig_hist, orig_min, orig_max,
-                            update_hist, update_min, update_max):
-        if update_min == orig_min and update_max == orig_max:
-            return orig_hist + update_hist
-        if orig_min == orig_max:
-            total = float(orig_hist.sum())
-            transformed = _histc(tensorplay.as_tensor(
-                [orig_min]), self.bins, update_min, update_max) * total
-            return transformed + update_hist
-        if update_min > orig_min or update_max < orig_max:
-            raise RuntimeError("HistogramObserver: new range must enclose "
-                               "the old range")
-        transformed = self._upscale_histogram(
-            orig_hist, orig_min, orig_max, update_min, update_max)
-        return update_hist + transformed
-
-    def record(self, x):
-        if x.numel() == 0:
-            return x
-        with tensorplay.no_grad():
-            x_min = float(x.min().item())
-            x_max = float(x.max().item())
-            # uselessness while real inputs get clamped at saturation.
-            if x_min == -float("inf") or x_max == float("inf"):
-                mask = x.abs() != float("inf")
-                x = x[mask]
-                if x.numel() == 0:
-                    return x
-                x_min = float(x.min().item())
-                x_max = float(x.max().item())
-
-            if self.histogram is None:
-                self.reset_histogram(x, x_min, x_max)
-                return x
-
-            new_min = min(self.min_val, x_min)
-            new_max = max(self.max_val, x_max)
-            update_hist = _histc(x, self.bins, new_min, new_max)
-            combined = self._combine_histograms(
-                self.histogram, self.min_val, self.max_val,
-                update_hist, new_min, new_max)
-            self.histogram = combined
-            self.min_val = new_min
-            self.max_val = new_max
-        return x
-
-    __call__ = record
+        norm = (delta_end * delta_end * delta_end - delta_begin * delta_begin * delta_begin) / 3
+        return density * norm
 
     def _compute_quantization_error(self, next_start_bin, next_end_bin):
-        bin_width = (self.max_val - self.min_val) / float(self.bins)
-        dst_bin_width = bin_width * (next_end_bin - next_start_bin + 1) \
-            / float(self.dst_nbins)
+        bin_width = (self.max_val.item() - self.min_val.item()) / self.bins
+        dst_bin_width = bin_width * (next_end_bin - next_start_bin + 1) / self.dst_nbins
         if dst_bin_width == 0.0:
             return 0.0
-        hist_list = self.histogram.tolist()
-        norm = 0.0
-        mid_norm = self._get_norm(-dst_bin_width / 2.0, dst_bin_width / 2.0,
-                                  1.0)
-        for j in range(self.bins):
-            src_begin = (j - next_start_bin) * bin_width
-            src_end = src_begin + bin_width
-            density = hist_list[j] / bin_width
-            dst_of_begin = min(max(int(src_begin // dst_bin_width),
-                                   0), self.dst_nbins - 1)
-            begin_center = (dst_of_begin + 0.5) * dst_bin_width
-            dst_of_end = min(max(int(src_end // dst_bin_width), 0),
-                             self.dst_nbins - 1)
-            end_center = dst_of_end * dst_bin_width + dst_bin_width / 2.0
-            norm += self._get_norm(src_begin - begin_center,
-                                   dst_bin_width / 2.0, density)
-            norm += (dst_of_end - dst_of_begin - 1) * mid_norm * density
-            norm += self._get_norm(-dst_bin_width / 2.0,
-                                   src_end - end_center, density)
-        return norm
+        src_bin = tensorplay.arange(self.bins, device=self.histogram.device)
+        src_bin_begin = (src_bin - next_start_bin) * bin_width
+        src_bin_end = src_bin_begin + bin_width
+        dst_bin_of_begin = tensorplay.clamp(tensorplay.div(src_bin_begin, dst_bin_width, rounding_mode='floor'), 0, self.dst_nbins - 1)
+        dst_bin_of_begin_center = (dst_bin_of_begin + 0.5) * dst_bin_width
+        dst_bin_of_end = tensorplay.clamp(tensorplay.div(src_bin_end, dst_bin_width, rounding_mode='floor'), 0, self.dst_nbins - 1)
+        density = self.histogram / bin_width
+        norm = tensorplay.zeros(self.bins, device=self.histogram.device)
+        delta_begin = src_bin_begin - dst_bin_of_begin_center
+        delta_end = dst_bin_width / 2
+        norm += self._get_norm(delta_begin, tensorplay.ones(self.bins, device=self.histogram.device) * delta_end, density)
+        norm += (dst_bin_of_end - dst_bin_of_begin - 1) * self._get_norm(-dst_bin_width / 2, dst_bin_width / 2, density)
+        dst_bin_of_end_center = dst_bin_of_end * dst_bin_width + dst_bin_width / 2
+        delta_begin = -dst_bin_width / 2
+        delta_end = src_bin_end - dst_bin_of_end_center
+        norm += self._get_norm(delta_begin, delta_end, density)
+        return norm.sum().item()
 
     def _non_linear_param_search(self):
-        """Approximate L2 error minimization over (start_bin, end_bin).
-
-        Follows NormMinimization::NonlinearQuantizationParamsSearch: shrink
-        quantile bounds stepwise and keep moving whichever side buys more
-        error reduction, stopping once the error starts growing.
-        """
-        if self.histogram.size(0) != self.bins:
-            raise RuntimeError("HistogramObserver: bins mismatch")
-        bin_width = (self.max_val - self.min_val) / float(self.bins)
-
-        hist_list = self.histogram.tolist()
-        total = sum(hist_list)
-        csum = []
-        acc = 0.0
-        for h in hist_list:
-            acc += h
-            csum.append(acc)
-
-        stepsize = 1e-5
-        alpha, beta = 0.0, 1.0
-        start_bin, end_bin = 0, self.bins - 1
-        norm_min = float("inf")
-
+        if self.histogram.size()[0] != self.bins:
+            raise AssertionError('bins mismatch')
+        bin_width = (self.max_val - self.min_val) / self.bins
+        total = tensorplay.sum(self.histogram).item()
+        cSum = tensorplay.cumsum(self.histogram, dim=0)
+        stepsize = 1e-05
+        alpha = 0.0
+        beta = 1.0
+        start_bin = 0
+        end_bin = self.bins - 1
+        norm_min = float('inf')
         while alpha < beta:
             next_alpha = alpha + stepsize
             next_beta = beta - stepsize
-            left = start_bin
-            right = end_bin
-            while left < end_bin and csum[left] < next_alpha * total:
-                left += 1
-            while right > start_bin and csum[right] > next_beta * total:
-                right -= 1
-
-            next_start, next_end = start_bin, end_bin
-            if (left - start_bin) > (end_bin - right):
-                next_start = left
+            l = start_bin
+            r = end_bin
+            while l < end_bin and cSum[l] < next_alpha * total:
+                l = l + 1
+            while r > start_bin and cSum[r] > next_beta * total:
+                r = r - 1
+            next_start_bin = start_bin
+            next_end_bin = end_bin
+            if l - start_bin > end_bin - r:
+                next_start_bin = l
                 alpha = next_alpha
             else:
-                next_end = right
+                next_end_bin = r
                 beta = next_beta
-
-            if next_start == start_bin and next_end == end_bin:
+            if next_start_bin == start_bin and next_end_bin == end_bin:
                 continue
-
-            saved_min, saved_max = self.min_val, self.max_val
-            norm = self._compute_quantization_error(next_start, next_end)
-            self.min_val, self.max_val = saved_min, saved_max
-
+            norm = self._compute_quantization_error(next_start_bin, next_end_bin)
             if norm > norm_min:
                 break
             norm_min = norm
-            start_bin, end_bin = next_start, next_end
-
+            start_bin = next_start_bin
+            end_bin = next_end_bin
         new_min = self.min_val + bin_width * start_bin
         new_max = self.min_val + bin_width * (end_bin + 1)
-        return new_min, new_max
+        return (new_min, new_max)
+
+    def _upscale_histogram(self, histogram, orig_min, orig_max, update_min, update_max):
+        histogram = histogram.repeat_interleave(self.upsample_rate) / self.upsample_rate
+        bin_size = (orig_max - orig_min) / (self.bins * self.upsample_rate)
+        mid_points_histogram = tensorplay.linspace(float(orig_min), float(orig_max), self.bins * self.upsample_rate + 1, device=orig_min.device)[:-1].to(histogram.device) + 0.5 * bin_size
+        boundaries_new_histogram = tensorplay.linspace(float(update_min), float(update_max), self.bins + 1, device=update_min.device).to(histogram.device)
+        bucket_assignments = tensorplay.bucketize(mid_points_histogram, boundaries_new_histogram, right=True) - 1
+        bucket_assignments[bucket_assignments >= self.bins] = self.bins - 1
+        bucket_assignments[bucket_assignments < 0] = 0
+        update_histogram = tensorplay.bincount(bucket_assignments, weights=histogram, minlength=self.bins)
+        return update_histogram
+
+    def _combine_histograms(self, orig_hist, orig_min, orig_max, update_hist, update_min, update_max):
+        if update_min == orig_min and update_max == orig_max:
+            return orig_hist + update_hist
+        if orig_min == orig_max:
+            bin_value = tensorplay.sum(orig_hist)
+            transformed_orig_hist = tensorplay.histc(orig_min, bins=self.bins, min=float(update_min), max=float(update_max)) * bin_value
+            return transformed_orig_hist + update_hist
+        if update_min > orig_min:
+            raise AssertionError('update_min must be <= orig_min')
+        if update_max < orig_max:
+            raise AssertionError('update_max must be >= orig_max')
+        transformed_orig_hist = self._upscale_histogram(orig_hist, orig_min, orig_max, update_min, update_max)
+        return update_hist + transformed_orig_hist
+
+    def reset_histogram(self, x, min_val, max_val):
+        self.min_val.resize_(min_val.shape)
+        self.min_val.copy_(min_val)
+        self.max_val.resize_(max_val.shape)
+        self.max_val.copy_(max_val)
+        if min_val.numel() != 1 or max_val.numel() != 1:
+            raise AssertionError('histogram min/max values must be scalar.')
+        new_histogram = tensorplay.histc(x, self.bins, min=float(min_val), max=float(max_val))
+        self.histogram.resize_(new_histogram.shape)
+        self.histogram.copy_(new_histogram)
+
+    def forward(self, x_orig):
+        if x_orig.numel() == 0:
+            return x_orig
+        x = x_orig.detach()
+        x_min, x_max = tensorplay.aminmax(x)
+        if x_min == -tensorplay.inf or x_max == tensorplay.inf:
+            warnings.warn('inf detected in input tensor, ignoring input', stacklevel=2)
+            x = x[x.abs() != tensorplay.inf]
+            if x.numel() == 0:
+                return x_orig
+            x_min, x_max = tensorplay.aminmax(x)
+        current_min = self.min_val
+        current_max = self.max_val
+        is_uninitialized = self.min_val == float('inf') or self.max_val == float('-inf')
+        if is_uninitialized:
+            self.reset_histogram(x, x_min, x_max)
+        else:
+            update_min, update_max = (x_min, x_max)
+            new_min = tensorplay.minimum(current_min, update_min)
+            new_max = tensorplay.maximum(current_max, update_max)
+            new_min, new_max = (new_min.detach(), new_max.detach())
+            update_histogram = tensorplay.histc(x, self.bins, min=float(new_min), max=float(new_max)).to(self.histogram.device)
+            if new_min == current_min and new_max == current_max:
+                combined_histogram = self.histogram + update_histogram
+                self.histogram.resize_(combined_histogram.shape)
+                self.histogram.copy_(combined_histogram)
+            else:
+                combined_histogram = self._combine_histograms(self.histogram, current_min, current_max, update_histogram, new_min, new_max)
+                self.histogram.resize_(combined_histogram.shape)
+                self.histogram.copy_(combined_histogram)
+                self.min_val.resize_(new_min.shape)
+                self.min_val.copy_(new_min)
+                self.max_val.resize_(new_max.shape)
+                self.max_val.copy_(new_max)
+        return x_orig
 
     def calculate_qparams(self):
-        if self.histogram is None:
-            raise RuntimeError(
-                "HistogramObserver has not observed any tensors")
+        is_uninitialized = self.min_val == float('inf') and self.max_val == float('-inf')
+        if is_uninitialized:
+            warnings.warn('must run observer before calling calculate_qparams.                                    Returning default scale and zero point ', stacklevel=2)
+            return (tensorplay.tensor([1.0], device=self.min_val.device.type), tensorplay.tensor([0], device=self.min_val.device.type))
+        if self.bins != len(self.histogram):
+            raise AssertionError('The number of bins in histogram should be equal to the number of bins supplied while making this observer')
         new_min, new_max = self._non_linear_param_search()
-        return self._calculate_qparams(new_min, new_max,
-                                       self.quant_min, self.quant_max)
+        return self._derive_qparams(new_min, new_max)
 
-    def observation_state(self):
-        return {"histogram": self.histogram,
-                "min_val": self.min_val, "max_val": self.max_val}
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        destination[prefix + 'min_val'] = self.min_val
+        destination[prefix + 'max_val'] = self.max_val
 
-    def load_observation_state(self, state):
-        self.histogram = state["histogram"]
-        self.min_val = state["min_val"]
-        self.max_val = state["max_val"]
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        version = local_metadata.get('version', None)
+        if version is None or version < 3:
+            min_val_name, max_val_name = (prefix + 'min_val', prefix + 'max_val')
+            if min_val_name in state_dict:
+                if state_dict[min_val_name].shape == tensorplay.Size([0]):
+                    state_dict[min_val_name] = tensorplay.tensor(float('inf'))
+            if max_val_name in state_dict:
+                if state_dict[max_val_name].shape == tensorplay.Size([0]):
+                    state_dict[max_val_name] = tensorplay.tensor(float('-inf'))
+        local_state = ['min_val', 'max_val']
+        for name in local_state:
+            key = prefix + name
+            if key in state_dict:
+                val = state_dict[key]
+                setattr(self, name, val)
+            elif strict:
+                missing_keys.append(key)
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
-    def reset(self):
-        self.histogram = None
-        self.min_val = float("inf")
-        self.max_val = float("-inf")
-
+    def extra_repr(self):
+        return f'min_val={self.min_val}, max_val={self.max_val}'
 
 class FixedQParamsObserver(ObserverBase):
-    """Reports fixed scale/zero_point without observing data; used when the
-    quantization parameters are dictated by construction (sigmoid/tanh style
-"""
 
-    def __init__(self, scale, zero_point, dtype=tensorplay.int8,
-                 quant_min=QUANT_MIN, quant_max=QUANT_MAX):
-        super().__init__(dtype=dtype, quant_min=quant_min,
-                         quant_max=quant_max)
-        self.scale = float(scale)
-        self.zero_point = int(zero_point)
+    def __init__(self, scale, zero_point, dtype=tensorplay.quint8, qscheme=tensorplay.per_tensor_affine, quant_min=0, quant_max=255, is_dynamic=False, **kwargs):
+        if is_dynamic:
+            raise NotImplementedError("FixedQParamsObserver doesn't support dynamic quantization")
+        super().__init__(dtype=dtype, is_dynamic=is_dynamic, **kwargs)
+        self.quant_min = quant_min
+        self.quant_max = quant_max
+        self.register_buffer('scale', tensorplay.tensor([scale], dtype=tensorplay.float))
+        self.register_buffer('zero_point', tensorplay.tensor([zero_point], dtype=tensorplay.int))
+        self.dtype = dtype
+        self.qscheme = qscheme
 
-    def record(self, x):
-        return x
-
-    __call__ = record
+    def forward(self, X):
+        return X
 
     def calculate_qparams(self):
-        return self.scale, self.zero_point
-
-    def observation_state(self):
-        return {"scale": self.scale, "zero_point": self.zero_point}
-
-    def load_observation_state(self, state):
-        self.scale = float(state["scale"])
-        self.zero_point = int(state["zero_point"])
-
+        return (self.scale, self.zero_point)
 
 class PlaceholderObserver(ObserverBase):
-    """No-op observer that only carries configuration, e.g. for float16
-    "quantization" or dynamic-quantization markers that need no ranges."""
 
-    def __init__(self, dtype=tensorplay.float32, custom_op_name="",
-                 quant_min=None, quant_max=None, eps=None):
-        super().__init__(dtype=dtype,
-                         quant_min=QUANT_MIN if quant_min is None else quant_min,
-                         quant_max=QUANT_MAX if quant_max is None else quant_max,
-                         eps=eps)
+    def __init__(self, dtype=tensorplay.float32, custom_op_name='', compute_dtype=None, quant_min=None, quant_max=None, qscheme=None, eps=None, is_dynamic=False):
+        super().__init__(dtype=dtype, is_dynamic=is_dynamic)
+        if qscheme is None:
+            qscheme = tensorplay.per_tensor_affine
+        if eps is None:
+            eps = tensorplay.finfo(tensorplay.float32).eps
+        self.dtype = dtype
+        self.qscheme = qscheme
+        self.quant_min = quant_min
+        self.quant_max = quant_max
+        self.eps = eps
         self.custom_op = custom_op_name
+        if compute_dtype:
+            is_dynamic = True
+            warnings.warn('Please use `is_dynamic` instead of `compute_dtype`.                     `compute_dtype` will be deprecated in a future release                     of quantization.', stacklevel=2)
 
-    def record(self, x):
+    def forward(self, x):
         return x
 
-    __call__ = record
+    def extra_repr(self):
+        return f'dtype={self.dtype}, is_dynamic={self.is_dynamic}'
 
     def calculate_qparams(self):
-        raise Exception(
-            "calculate_qparams should not be called for PlaceholderObserver")
+        raise Exception('calculate_qparams should not be called for PlaceholderObserver')
+
+class RecordingObserver(ObserverBase):
+    __annotations__ = {'tensor_val': list[tensorplay.Tensor | None]}
+
+    def __init__(self, dtype=tensorplay.quint8):
+        super().__init__(dtype=dtype, is_dynamic=False)
+        self.tensor_val = []
+
+    def forward(self, x):
+        self.tensor_val.append(x.clone())
+        return x
+
+    def calculate_qparams(self):
+        raise Exception('calculate_qparams should not be called for RecordingObserver')
+
+    def get_tensor_value(self):
+        return self.tensor_val
+
+class NoopObserver(ObserverBase):
+
+    def __init__(self, dtype=tensorplay.float16, custom_op_name=''):
+        super().__init__(dtype=dtype, is_dynamic=False)
+        self.dtype = dtype
+        self.custom_op = custom_op_name
+
+    def forward(self, x):
+        return x
+
+    def calculate_qparams(self):
+        raise Exception('calculate_qparams should not be called for NoopObserver')
+
+class ReuseInputObserver(ObserverBase):
+
+    def __init__(self):
+        super().__init__(tensorplay.quint8, is_dynamic=False)
+
+    def forward(self, x):
+        return x
+
+    def calculate_qparams(self):
+        raise Exception('calculate_qparams should not be called for ReuseInputObserver')
 
 
-# Activation grids use unsigned codes; weight grids use signed codes.
-default_observer = MinMaxObserver.with_args(dtype=tensorplay.quint8,
-                                           quant_min=0, quant_max=127)
-default_weight_observer = MinMaxObserver.with_args(dtype=tensorplay.qint8,
-                                                   quant_min=-128,
-                                                   quant_max=127)
-default_dynamic_quant_observer = PlaceholderObserver.with_args(
-    dtype=tensorplay.float32)
+def with_args(**kwargs):
+    return lambda cls: _with_args(cls, **kwargs)
 
 
-def _iter_observers(model):
-    """Yields (path, observer) for every ObserverBase reachable from the
-    module tree — either as a submodule itself or mounted on an attribute
-    (e.g. ``QuantStub.fake_quant.observer``)."""
-    for name, module in model.named_modules():
-        if isinstance(module, ObserverBase):
-            yield name, module
-            continue
-        obs = getattr(module, "observer", None)
-        if isinstance(obs, ObserverBase):
-            yield f"{name}.observer", obs
+def _record(self, x):
+    return self(x)
+
+
+def _observation_state(self):
+    return self.state_dict()
+
+
+def _load_observation_state(self, state):
+    return self.load_state_dict(state)
+
+
+def _legacy_qparams(min_val, max_val, quant_min=QUANT_MIN, quant_max=QUANT_MAX):
+    lo, hi = min(float(min_val), 0.), max(float(max_val), 0.)
+    scale = max((hi - lo) / (quant_max - quant_min), 1.1920928955078125e-7)
+    return scale, max(quant_min, min(quant_max, quant_min - round(lo / scale)))
+
+
+ObserverBase.record = _record
+ObserverBase.observation_state = _observation_state
+ObserverBase.load_observation_state = _load_observation_state
+ObserverBase._calculate_qparams = staticmethod(_legacy_qparams)
+MinMaxObserver.reset = MinMaxObserver.reset_min_max_vals
+PerChannelMinMaxObserver.reset = PerChannelMinMaxObserver.reset_min_max_vals
+
+
+def _reset_histogram(self):
+    self.histogram.zero_()
+    self.min_val.fill_(float('inf'))
+    self.max_val.fill_(float('-inf'))
+
+
+HistogramObserver.reset = _reset_histogram
+
+default_observer = MinMaxObserver.with_args(quant_min=0, quant_max=127)
+default_weight_observer = MinMaxObserver.with_args(dtype=tensorplay.qint8, qscheme=tensorplay.per_tensor_symmetric)
+default_per_channel_weight_observer = PerChannelMinMaxObserver.with_args(dtype=tensorplay.qint8, qscheme=tensorplay.per_channel_symmetric)
+default_histogram_observer = HistogramObserver.with_args(quant_min=0, quant_max=127)
+default_dynamic_quant_observer = PlaceholderObserver.with_args(dtype=tensorplay.quint8, quant_min=0, quant_max=255, is_dynamic=True)
+default_float_qparams_observer = PerChannelMinMaxObserver.with_args(dtype=tensorplay.quint8, qscheme=tensorplay.per_channel_affine_float_qparams)
+default_fixed_qparams_range_neg1to1_observer = FixedQParamsObserver.with_args(scale=2./256, zero_point=128)
+default_fixed_qparams_range_0to1_observer = FixedQParamsObserver.with_args(scale=1./256, zero_point=0)
+default_placeholder_observer = PlaceholderObserver
 
 
 def get_observer_state_dict(model):
-    """Collects the calibration state of every observer under ``model``,
-    keyed by module path — the observer counterpart of ``state_dict()``."""
-    od = OrderedDict()
-    for name, observer in _iter_observers(model):
-        for key, value in observer.observation_state().items():
-            od[f"{name}.{key}"] = value
-    return od
+    from .fake_quantize import FakeQuantizeBase
+    state = OrderedDict()
+    for name, module in model.named_modules():
+        if isinstance(module, (ObserverBase, FakeQuantizeBase)):
+            module._save_to_state_dict(state, name + '.' if name else '', False)
+    return state
 
 
 def load_observer_state_dict(model, obs_dict):
-    """Loads observer stats produced by :func:`get_observer_state_dict` back
-    into the matching observers."""
     expected = get_observer_state_dict(model)
-    missing = sorted(set(expected) - set(obs_dict))
-    unexpected = sorted(set(obs_dict) - set(expected))
-    for key in missing:
-        raise Exception(f"Missing keys for observer {key} in state_dict")
-    for key in unexpected:
-        raise Exception(f"Unexpected keys for observer {key} in state_dict")
-
-    by_observer = {}
-    for key, value in obs_dict.items():
-        path, _, param = key.rpartition(".")
-        by_observer.setdefault(path, {})[param] = value
-    for name, observer in _iter_observers(model):
-        if name in by_observer:
-            observer.load_observation_state(by_observer[name])
+    if set(expected) != set(obs_dict):
+        raise RuntimeError('Observer state keys do not match the model')
+    state = model.state_dict()
+    state.update(obs_dict)
+    model.load_state_dict(state)

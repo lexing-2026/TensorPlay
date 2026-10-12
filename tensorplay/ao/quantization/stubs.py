@@ -22,7 +22,11 @@ __all__ = ["QuantStub", "DeQuantStub"]
 class QuantStub(nn.Module):
     def __init__(self, qconfig=None):
         super().__init__()
-        self.fake_quant = FakeQuantize() if qconfig is None else qconfig()
+        if qconfig is not None and hasattr(qconfig, 'activation'):
+            self.qconfig = qconfig
+            self.fake_quant = FakeQuantize(observer=qconfig.activation())
+        else:
+            self.fake_quant = FakeQuantize() if qconfig is None else qconfig()
 
     def record(self, x):
         """Calibration entry point: feeds the batch to the inner FakeQuantize
@@ -33,14 +37,16 @@ class QuantStub(nn.Module):
     def forward(self, x):
         # Calibration / QAT path: simulated quantization keeps the graph
         # float while nudging values toward the quantized grid.
+        if hasattr(self, 'activation_post_process'):
+            return x
         self.fake_quant.record(x)
-        scale, zero_point = self.fake_quant.calculate_qparams()
+        scale, zero_point = self.fake_quant.scale, self.fake_quant.zero_point
         if not self.training and self.fake_quant.frozen:
             # Inference path: produce a native quantized tensor carrying
             # its affine parameters.
-            return _quantize_per_tensor(self=x, scale=scale,
-                                        zero_point=zero_point,
-                                        dtype=tensorplay.qint8)
+            return _quantize_per_tensor(self=x, scale=float(scale),
+                                        zero_point=int(zero_point),
+                                        dtype=self.fake_quant.dtype)
         return self.fake_quant(x)
 
     def freeze(self):
