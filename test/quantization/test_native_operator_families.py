@@ -514,3 +514,27 @@ def test_half_linear_cache_invalidates_after_weight_mutation(device):
         actual = tp._C._quantized_fp16_linear(x, weight, None)
         expected = torch.nn.functional.linear(torch.tensor(data), torch.tensor(raw*factor).half().float())
         np.testing.assert_allclose(actual.cpu().numpy(), expected.numpy(), atol=2e-6, rtol=2e-5)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_recurrent_inference_weights_remain_live_after_mutation(device):
+    rng = np.random.default_rng(129)
+    x = rng.normal(0, .2, size=(3, 7)).astype('float32')
+    h = rng.normal(0, .2, size=(3, 5)).astype('float32')
+    a = rng.integers(-50, 51, size=(5, 7), dtype='int8')
+    b = rng.integers(-50, 51, size=(5, 5), dtype='int8')
+    bias = np.zeros(5, dtype='float32')
+    with tp.inference_mode():
+        wi, ri = pair(a, 'int8', device, scale=.005, zp=0)
+        wh, rh = pair(b, 'int8', device, scale=.005, zp=0)
+        for factor in (1, -1):
+            update, reference = pair(a*factor, 'int8', device, scale=.005, zp=0)
+            wi.copy_(update)
+            actual, _ = tp._C._quantized_recurrent_cell(tp.tensor(x, device=device),
+                tp.tensor(h, device=device), None, wi, wh, tp.tensor(bias, device=device),
+                tp.tensor(bias, device=device), 1, True)
+            pi = torch.ops.quantized.linear_prepack(reference, torch.tensor(bias))
+            ph = torch.ops.quantized.linear_prepack(rh, torch.tensor(bias))
+            expected = torch.ops.quantized.quantized_rnn_tanh_cell_dynamic(
+                torch.tensor(x), torch.tensor(h), pi, ph, torch.tensor(bias), torch.tensor(bias))
+            np.testing.assert_allclose(actual.cpu().numpy(), expected.numpy(), atol=2e-6, rtol=2e-5)

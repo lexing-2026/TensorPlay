@@ -25,15 +25,16 @@ struct RecurrentLinear {
 #else
         const uintptr_t stream=0;
 #endif
-        const uint32_t version=w._version();
+        const bool cacheable=w.impl()->version_counter().is_enabled();
+        const uint32_t version=cacheable ? w._version() : 0;
         for (const auto& entry:cache) {
-            if (entry.source.defined() && w.impl()->version_counter().is_enabled() && entry.source.impl()==w.impl() && entry.version==version && entry.stream==stream) {
+            if (entry.source.defined() && cacheable && entry.source.impl()==w.impl() && entry.version==version && entry.stream==stream) {
                 packed=entry.packed; offsets=entry.offsets; break;
             }
         }
         if (!packed.defined()) {
             std::tie(packed, offsets) = TP_QR_FN(_quantized_weight_prepack)(w);
-            if (w.impl()->version_counter().is_enabled() && packed.numel() <= 4*1024*1024) cache[next++%cache.size()]={w,packed,offsets,version,stream};
+            if (cacheable && packed.numel() <= 4*1024*1024) cache[next++%cache.size()]={w,packed,offsets,version,stream};
         }
         if (w.impl()->quantizer()->qscheme() == kPerTensorAffine) {
             scales = Tensor::empty({w.size(0)}, DType::Float32, w.device());

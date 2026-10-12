@@ -1,6 +1,21 @@
 #pragma once
 
 namespace tensorplay::quant::TP_QN_DETAIL {
+template<class T>
+struct BatchNormCodes {
+    const T* src;
+    T* dst;
+    const float *alpha, *beta;
+    int64_t channels, input_zero_point, output_zero_point;
+    bool relu;
+    TP_QN_DEVICE void operator()(int64_t i) const {
+        const int64_t c = i % channels;
+        float value = alpha[c] * static_cast<float>(static_cast<int64_t>(src[i]) - input_zero_point) + beta[c];
+        if (relu) value = ::fmaxf(value, 0.f);
+        dst[i] = encode<T>(value, 1.f, output_zero_point);
+    }
+};
+
 Tensor batch_norm(const Tensor& input, const std::optional<Tensor>& weight,
         const std::optional<Tensor>& bias, const Tensor& mean, const Tensor& var,
         double eps, double scale, int64_t zp, bool relu) {
@@ -36,12 +51,7 @@ Tensor batch_norm(const Tensor& input, const std::optional<Tensor>& weight,
     codes(input.dtype(), [&]<class T>() {
         const auto* src = x.data_ptr<T>(); auto* dst = y.data_ptr<T>();
 #ifdef TP_QUANT_CUDA
-        apply(y.numel(), [=] TP_QN_DEVICE (int64_t i) {
-            const int64_t c = i % channels;
-            float value = ap[c] * static_cast<float>(static_cast<int64_t>(src[i]) - xz) + bp[c];
-            if (relu) value = ::fmaxf(value, 0.f);
-            dst[i] = encode<T>(value, 1.f, zp);
-        });
+        apply(y.numel(), BatchNormCodes<T>{src,dst,ap,bp,channels,xz,zp,relu});
 #else
         const int64_t rows = y.numel() / channels;
         parallel::parallel_for(0, rows, std::max<int64_t>(1, 32768 / channels), [&](int64_t first, int64_t last) {
