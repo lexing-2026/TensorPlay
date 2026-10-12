@@ -106,7 +106,32 @@ Tensor legacy_integer_pack(const Tensor& weight) {
 std::tuple<Tensor,Tensor,double,int64_t> legacy_quantize_weight(const Tensor& weight) {
     TP_CHECK(weight.dim()==2 && weight.dtype()==DType::Float32 && weight.device().is_cpu(),
         "Weight quantization requires a floating host matrix");
-    Tensor q=cpu::quantize_per_tensor_dynamic_cpu(weight,DType::QInt8,false);
+    auto extrema = Tensor::aminmax(weight.reshape({weight.numel()}), {}, false);
+    float minimum = std::min(std::get<0>(extrema).item().to<float>(), 0.f);
+    float maximum = std::max(std::get<1>(extrema).item().to<float>(), 0.f);
+    TP_CHECK(minimum <= maximum, "weight quantization requires an ordered finite range");
+    double scale = (static_cast<double>(maximum) - minimum) / 255;
+    if (static_cast<float>(scale) == 0.f || std::isinf(1.f / static_cast<float>(scale))) scale = .1;
+    constexpr float cutoff = 6.1e-5f;
+    if (scale < cutoff) {
+        const float original = scale;
+        scale = cutoff;
+        if (minimum == 0.f) maximum = cutoff * 255;
+        else if (maximum == 0.f) minimum = -cutoff * 255;
+        else {
+            const float amplifier = cutoff / original;
+            minimum *= amplifier;
+            maximum *= amplifier;
+        }
+    }
+    const double from_min = -128 - minimum / scale;
+    const double from_max = 127 - maximum / scale;
+    const double error_min = 128 - std::abs(minimum / scale);
+    const double error_max = 127 - std::abs(maximum / scale);
+    const double initial = error_min < error_max ? from_min : from_max;
+    const int64_t zero_point = static_cast<int64_t>(std::nearbyint(std::clamp(initial, -128., 127.)));
+    scale = static_cast<float>(scale);
+    Tensor q=cpu::quantize_per_tensor_cpu(weight,scale,zero_point,DType::QInt8);
     Tensor raw=q.int_repr(),offsets=Tensor::empty({weight.size(0)},DType::Int32,weight.device());
     const Tensor values=raw.contiguous();
     const int64_t k=weight.size(1),zp=quantized::q_zero_point(q);
@@ -115,7 +140,7 @@ std::tuple<Tensor,Tensor,double,int64_t> legacy_quantize_weight(const Tensor& we
         for (int64_t i=0;i<k;++i) sum+=values.data_ptr<int8_t>()[n*k+i];
         offsets.data_ptr<int32_t>()[n]=static_cast<int32_t>(sum);
     }
-    return {raw,offsets,quantized::q_scale(q),zp};
+    return {raw,offsets,scale,zp};
 }
 
 Tensor legacy_integer_linear(const Tensor& input,const Tensor& weight,const Tensor& storage,
@@ -177,13 +202,13 @@ Tensor legacy_half_linear(const Tensor& input,const Tensor& storage,const std::o
 Tensor legacy_half_linear_bias(const Tensor& input,const Tensor& storage,const Tensor& bias) {
     return legacy_half_linear(input,storage,bias);
 }
-Tensor& legacy_half_linear_out(const Tensor& input,const Tensor& storage,const std::optional<Tensor>& bias,Tensor& out) {
+Tensor legacy_half_linear_out(const Tensor& input,const Tensor& storage,const std::optional<Tensor>& bias,Tensor& out) {
     Tensor result=legacy_half_linear(input,storage,bias);
     TP_CHECK(out.dtype()==result.dtype() && out.device()==result.device(), "Half linear output must match the result dtype and device");
     if (out.shape()!=result.shape()) out.resize_(result.shape());
     out.copy_(result); return out;
 }
-Tensor& legacy_half_linear_bias_out(const Tensor& input,const Tensor& storage,const Tensor& bias,Tensor& out) {
+Tensor legacy_half_linear_bias_out(const Tensor& input,const Tensor& storage,const Tensor& bias,Tensor& out) {
     return legacy_half_linear_out(input,storage,bias,out);
 }
 
