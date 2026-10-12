@@ -3,7 +3,18 @@ import tensorplay
 
 from ._construction import _as_index
 
-__all__ = ["add", "addmm", "log_softmax", "mm", "mul", "softmax", "solve", "sum"]
+__all__ = [
+    "add",
+    "addmm",
+    "log_softmax",
+    "mm",
+    "mul",
+    "sampled_addmm",
+    "solve",
+    "spsolve",
+    "softmax",
+    "sum",
+]
 
 
 def _normalize_dims(dim, ndim):
@@ -126,6 +137,26 @@ def addmm(mat, mat1, mat2, *, beta=1.0, alpha=1.0):
     return (mat * beta if beta != 1.0 else mat) + product
 
 
+def sampled_addmm(input, mat1, mat2, *, beta=1.0, alpha=1.0, out=None):
+    """Computes ``beta * input + alpha * (mat1 @ mat2)`` on ``input``'s
+    coordinates.
+
+    ``input`` is a sparse COO/CSR matrix; ``mat1`` and ``mat2`` are dense
+    matrices whose product is evaluated only at the positions stored in
+    ``input``.  The result is a sparse tensor with ``input``'s sparsity
+    pattern.  ``out``, when given, receives the result in place.
+    """
+    if not isinstance(input, tensorplay.Tensor) or not input.is_sparse:
+        raise RuntimeError("sparse.sampled_addmm(): first operand must be sparse")
+    if not isinstance(mat1, tensorplay.Tensor) or not isinstance(
+        mat2, tensorplay.Tensor
+    ):
+        raise TypeError("sparse.sampled_addmm(): matrix operands must be Tensor objects")
+    return tensorplay.sparse_sampled_addmm(
+        input, mat1, mat2, beta=beta, alpha=alpha, out=out
+    )
+
+
 def sum(input, dim=None, dtype=None):
     """Sum of ``input``'s values over ``dim``.
 
@@ -210,3 +241,12 @@ def solve(input, other, *, left=True):
     if other.size(-1) != n:
         raise RuntimeError("sparse.solve(): other has an incompatible trailing dimension")
     return tensorplay.functional._spsolve(input, other, left=False)
+
+
+def spsolve(input, other):
+    """Solves ``input @ X = other`` for a sparse square ``input``.
+
+    This is the same operation as :func:`solve` with ``left=True``, exposed
+    under the name used by the reference sparse API.
+    """
+    return solve(input, other, left=True)

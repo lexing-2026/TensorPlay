@@ -33,7 +33,18 @@ from ._construction import (
 )
 from ._gradcheck import as_sparse_gradcheck
 from ._invariants import check_sparse_tensor_invariants
-from ._ops import add, addmm, log_softmax, mm, mul, softmax, solve, sum
+from ._ops import (
+    add,
+    addmm,
+    log_softmax,
+    mm,
+    mul,
+    sampled_addmm,
+    solve,
+    spsolve,
+    softmax,
+    sum,
+)
 from .semi_structured import (
     SparseSemiStructuredTensor,
     SparseSemiStructuredTensorCUTLASS,
@@ -51,8 +62,10 @@ __all__ = [
     "log_softmax",
     "mm",
     "mul",
-    "softmax",
+    "sampled_addmm",
     "solve",
+    "spsolve",
+    "softmax",
     "sparse_compressed_tensor",
     "sparse_coo_tensor",
     "sparse_csr_tensor",
