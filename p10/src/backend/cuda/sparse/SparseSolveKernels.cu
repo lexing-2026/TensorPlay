@@ -201,7 +201,7 @@ Tensor _spsolve_cuda(const Tensor& A, const Tensor& B, bool left) {
                 parts.values.const_data_ptr<scalar_t>(),
                 parts.crow32.data_ptr<int>(), parts.col32.data_ptr<int>(),
                 b_data + j * n, x_data + j * n, tol, reorder, &singularity));
-            if (singularity != 0) {
+            if (singularity != -1) {
                 TP_THROW(RuntimeError,
                          "_spsolve(): matrix is singular to working "
                          "precision");

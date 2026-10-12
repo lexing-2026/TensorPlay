@@ -113,6 +113,7 @@ std::tuple<Tensor, Tensor> _sparse_mm_reduce_impl_sparse_csr_cpu(
     Tensor crow = self._crow_indices().contiguous();
     Tensor col = self._col_indices().contiguous();
     Tensor val = self._values().contiguous();
+    Tensor other_c = other.is_contiguous() ? other : other.contiguous();
 
     Tensor out = Tensor::zeros({self.size(0), other.size(1)}, other.dtype(),
                                other.device());
@@ -132,7 +133,7 @@ std::tuple<Tensor, Tensor> _sparse_mm_reduce_impl_sparse_csr_cpu(
         arg_out.fill_(nnz);
     }
 
-    spmm_reduce_stub(DeviceType::CPU, out, arg_out, crow, col, val, other,
+    spmm_reduce_stub(DeviceType::CPU, out, arg_out, crow, col, val, other_c,
                      op, need_arg);
     return std::make_tuple(std::move(out), std::move(arg_out));
 }
@@ -145,9 +146,12 @@ std::tuple<Tensor, Tensor> _sparse_mm_reduce_impl_backward_sparse_csr_cpu(
     const int op = get_reduction_enum(reduce);
     const std::array<bool, 2> mask = {output_mask[0], output_mask[1]};
 
-    Tensor crow = self._crow_indices().contiguous();
+Tensor crow = self._crow_indices().contiguous();
     Tensor col = self._col_indices().contiguous();
     Tensor val = self._values().contiguous();
+    Tensor grad_out_c = grad_out.is_contiguous() ? grad_out
+                                                 : grad_out.contiguous();
+    Tensor other_c = other.is_contiguous() ? other : other.contiguous();
 
     // CSC bookkeeping (row indices plus column pointers/permutation) is only
     // needed by the sum/mean grad_other path.
@@ -172,15 +176,15 @@ std::tuple<Tensor, Tensor> _sparse_mm_reduce_impl_backward_sparse_csr_cpu(
             Tensor::zeros_like(self._values()),
             static_cast<std::vector<int64_t>>(self.shape()));
         spmm_reduce_backward_input_stub(
-            DeviceType::CPU, grad_self, grad_out, crow, col, other, arg_out,
-            row, op);
+            DeviceType::CPU, grad_self, grad_out_c, crow, col, other_c,
+            arg_out, row, op);
     }
     Tensor grad_other;
     if (mask[1]) {
         grad_other = Tensor::zeros({other.size(0), other.size(1)},
-                                   other.dtype(), other.device());
+                                    other.dtype(), other.device());
         spmm_reduce_backward_other_stub(
-            DeviceType::CPU, grad_other, grad_out, crow, col, val, arg_out,
+            DeviceType::CPU, grad_other, grad_out_c, crow, col, val, arg_out,
             row, ccol, permute, op);
     }
     return std::make_tuple(std::move(grad_self), std::move(grad_other));
