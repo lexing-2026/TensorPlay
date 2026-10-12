@@ -7,7 +7,7 @@ requires = [
     "PyYAML",
     "ninja",
     "numpy",
-    "cmake<4.0",
+    "cmake<5.0",
 ]
 build-backend = "scikit_build_core.build"
 
@@ -167,7 +167,7 @@ exclude = [
 # requirements-build.txt in sync with [dependency-groups] dev).
 dev = [
     "scikit-build-core>=1.0",
-    "cmake<4.0",
+    "cmake<5.0",
     "ninja",
     "pybind11",
     "PyYAML",
