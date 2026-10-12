@@ -1,12 +1,117 @@
 #include "QuantPacked.h"
 #include "Dispatcher.h"
 #include "Parallel.h"
+#include "QuantElementwise.h"
+#include "cpu/QuantizedElementwiseKernels.h"
+#include <array>
+#include <cfenv>
 #include <cstring>
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
 #endif
 
+namespace tensorplay::quant {
+namespace {
+struct ActivationTable {
+    bool valid = false;
+    Activation fn{0};
+    float scale = 0, inverse_scale = 0;
+    int64_t zero_point = 0, output_zero_point = 0;
+    DType dtype = DType::QInt8;
+    int rounding = 0;
+    std::array<uint8_t, 256> codes{};
+    std::array<float, 256> wide_codes{};
+};
+
+const ActivationTable& activation_table(const Tensor& input,
+        float inverse_scale, int64_t output_zero_point, Activation fn) {
+    // The finite input code domain admits exact evaluation once per grid.
+    // Each calling thread owns a bounded cache; parallel readers share a
+    // completed immutable table for the duration of one invocation.
+    thread_local std::array<ActivationTable, 16> cache;
+    thread_local size_t next = 0;
+    const float scale = static_cast<float>(quantized::q_scale(input));
+    const int64_t zp = quantized::q_zero_point(input);
+    const int rounding = std::fegetround();
+    for (auto& entry : cache) {
+        if (entry.valid && entry.fn == fn && entry.scale == scale &&
+            entry.inverse_scale == inverse_scale && entry.zero_point == zp &&
+            entry.output_zero_point == output_zero_point && entry.dtype == input.dtype() &&
+            entry.rounding == rounding) return entry;
+    }
+    auto& entry = cache[next++ % cache.size()];
+    entry.valid = true; entry.fn = fn; entry.scale = scale;
+    entry.inverse_scale = inverse_scale; entry.zero_point = zp;
+    entry.output_zero_point = output_zero_point; entry.dtype = input.dtype();
+    entry.rounding = rounding;
+    for (int code = 0; code < 256; ++code) {
+        const int value = input.dtype() == DType::QInt8 ? static_cast<int8_t>(code) : code;
+        const float y = fn(static_cast<float>(value - zp) * scale);
+        entry.codes[code] = input.dtype() == DType::QInt8
+            ? static_cast<uint8_t>(encode<int8_t>(y, inverse_scale, output_zero_point))
+            : encode<uint8_t>(y, inverse_scale, output_zero_point);
+        entry.wide_codes[code] = entry.codes[code];
+    }
+    return entry;
+}
+}
+
+Tensor activation_cpu(const Tensor& input, double scale, int64_t zp, Activation fn) {
+    auto grid = make_per_tensor_affine_quantizer(scale, zp, input.dtype());
+    const float input_scale = static_cast<float>(quantized::q_scale(input));
+    const int64_t input_zp = quantized::q_zero_point(input);
+    const float inverse_scale = 1.f / static_cast<float>(scale);
+    const Tensor x = input.contiguous();
+    Tensor out = Tensor::empty(input.shape(), input.dtype(), input.device());
+    if (input.dtype() == DType::QInt8 || input.dtype() == DType::QUInt8) {
+        const auto& cached = activation_table(input, inverse_scale, zp, fn);
+        const auto* src = static_cast<const uint8_t*>(x.data_ptr());
+        auto* dst = static_cast<uint8_t*>(out.data_ptr());
+        parallel::parallel_for(0, input.numel(), 32768, [&](int64_t begin, int64_t end) {
+            cpu::quantized_lookup_stub(DeviceType::CPU, src + begin, dst + begin,
+                                        end - begin, cached.wide_codes.data());
+        });
+    } else if (input.dtype() == DType::QInt32) {
+        const auto* src = x.data_ptr<int32_t>();
+        auto* dst = out.data_ptr<int32_t>();
+        parallel::parallel_for(0, input.numel(), 32768, [&](int64_t begin, int64_t end) {
+            for (int64_t i = begin; i < end; ++i)
+                dst[i] = encode<int32_t>(fn(static_cast<float>(static_cast<int64_t>(src[i]) - input_zp) * input_scale), inverse_scale, zp);
+        });
+    } else TP_THROW(TypeError, "Activation requires quantized integer input");
+    out.impl()->set_quantizer(std::move(grid));
+    return out;
+}
+
+Tensor rectify_cpu(const Tensor& input, bool clamp_six) {
+    const double scale = quantized::q_scale(input);
+    const int64_t zp = quantized::q_zero_point(input);
+    const Tensor x = input.contiguous();
+    Tensor out = Tensor::empty(input.shape(), input.dtype(), input.device());
+    auto apply = [&]<class T>() {
+        const T hi = clamp_six ? encode<T>(6.f, 1.f / static_cast<float>(scale), zp) : std::numeric_limits<T>::max();
+        const auto* src = x.data_ptr<T>(); auto* dst = out.data_ptr<T>();
+        parallel::parallel_for(0, input.numel(), 32768, [&](int64_t begin, int64_t end) {
+            cpu::quantized_clip_stub(DeviceType::CPU, src + begin, dst + begin,
+                                      end - begin, input.dtype(), zp, hi);
+        });
+    };
+    switch (input.dtype()) {
+        case DType::QInt8: apply.template operator()<int8_t>(); break;
+        case DType::QUInt8: apply.template operator()<uint8_t>(); break;
+        case DType::QInt32: apply.template operator()<int32_t>(); break;
+        default: TP_THROW(TypeError, "Rectification requires quantized integer input");
+    }
+    out.impl()->set_quantizer(input.impl()->quantizer());
+    return out;
+}
+Tensor relu_cpu(const Tensor& input) { return rectify_cpu(input, false); }
+Tensor relu6_cpu(const Tensor& input) { return rectify_cpu(input, true); }
+} // namespace tensorplay::quant
+
 namespace tensorplay::cpu {
+DEFINE_DISPATCH(quantized_clip_stub);
+DEFINE_DISPATCH(quantized_lookup_stub);
 namespace {
 
 template<class X>
@@ -37,6 +142,88 @@ int64_t dot_avx2(const X* x, const int8_t* w, int64_t K) {
     }
     return sum + dot_scalar(x + k, w + k, K - k);
 }
+
+template<class X, int Rows>
+__attribute__((target("avx2,avxvnni")))
+void block_vnni(const X* x, const int8_t* w, int64_t K, int64_t padded_K,
+                int64_t columns, int64_t (&totals)[Rows][4]) {
+    int64_t k = 0;
+    for (int r = 0; r < Rows; ++r) for (int c = 0; c < 4; ++c) totals[r][c] = 0;
+    // Each lane accumulates at most 4096 products of unsigned and signed
+    // bytes before widening, including the extrema of both storage ranges.
+    while (k + 32 <= K) {
+        const int64_t stop = std::min(k + 16384, K - K % 32);
+        __m256i accum[Rows][4];
+        for (int r = 0; r < Rows; ++r) for (int c = 0; c < 4; ++c) accum[r][c] = _mm256_setzero_si256();
+        for (; k < stop; k += 32) {
+            __m256i weights[4];
+            #pragma GCC unroll 4
+            for (int c = 0; c < 4; ++c)
+                weights[c] = c < columns ? _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + c * padded_K + k)) : _mm256_setzero_si256();
+            for (int r = 0; r < Rows; ++r) {
+                __m256i values = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + r * K + k));
+                if constexpr (std::is_same_v<X, int8_t>) values = _mm256_xor_si256(values, _mm256_set1_epi8(-128));
+                #pragma GCC unroll 4
+                for (int c = 0; c < 4; ++c)
+                    accum[r][c] = _mm256_dpbusd_epi32(accum[r][c], values, weights[c]);
+            }
+        }
+        alignas(32) int32_t lanes[8];
+        for (int r = 0; r < Rows; ++r) for (int c = 0; c < columns; ++c) {
+            _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), accum[r][c]);
+            for (int lane = 0; lane < 8; ++lane) totals[r][c] += lanes[lane];
+        }
+    }
+    for (; k < K; ++k) for (int r = 0; r < Rows; ++r) for (int c = 0; c < columns; ++c) {
+        const int value = static_cast<int>(x[r * K + k]) + (std::is_same_v<X, int8_t> ? 128 : 0);
+        totals[r][c] += static_cast<int64_t>(value) * w[c * padded_K + k];
+    }
+}
+
+template<class X>
+void linear_vnni(const X* x, const int8_t* w, const int64_t* offsets,
+        const float* scales, const int64_t* zps, const float* bias,
+        const quant::PackedGeometry& g, Tensor& out, double xs, int64_t xz,
+        double ys, int64_t yz, bool relu, bool output_float) {
+    const int64_t row_tiles = (g.rows + 1) / 2, column_tiles = (g.outputs + 63) / 64;
+    auto store = [&](int64_t row, int64_t n, int64_t dot, int64_t sum) {
+        const int64_t shift = std::is_same_v<X, int8_t> ? 128 : 0;
+        const int64_t acc = dot - (xz + shift) * offsets[n] - zps[n] * sum + g.K * xz * zps[n];
+        double value = static_cast<double>(acc) * xs * scales[n] + (bias ? bias[n] : 0.);
+        if (relu) value = std::max(value, 0.);
+        const int64_t index = row * g.outputs + n;
+        if (output_float) out.data_ptr<float>()[index] = static_cast<float>(value);
+        else {
+            constexpr int64_t lo = std::is_same_v<X, uint8_t> ? 0 : -128;
+            out.data_ptr<X>()[index] = static_cast<X>(std::clamp(std::nearbyint(value / ys) + yz, static_cast<double>(lo), static_cast<double>(lo + 255)));
+        }
+    };
+    const int64_t tasks = row_tiles * column_tiles;
+    const int64_t grain = g.rows * g.outputs * g.K < 1048576 ? tasks : 1;
+    parallel::parallel_for(0, tasks, grain, [&](int64_t begin, int64_t end) {
+        for (int64_t task = begin; task < end; ++task) {
+            const int64_t row = (task / column_tiles) * 2;
+            const int64_t n0 = (task % column_tiles) * 64, n1 = std::min(n0 + 64, g.outputs);
+            const int64_t rows = std::min<int64_t>(2, g.rows - row);
+            int64_t sums[4]{};
+            for (int r = 0; r < rows; ++r) for (int64_t k = 0; k < g.K; ++k) sums[r] += x[(row + r) * g.K + k];
+            for (int64_t n = n0; n < n1; n += 4) {
+                const int64_t columns = std::min<int64_t>(4, n1 - n);
+                if (rows == 2) {
+                    int64_t totals[2][4];
+                    block_vnni<X,2>(x + row * g.K, w + n * g.padded_K, g.K, g.padded_K, columns, totals);
+                    for (int r = 0; r < 2; ++r) for (int c = 0; c < columns; ++c) store(row + r, n + c, totals[r][c], sums[r]);
+                } else {
+                    for (int r = 0; r < rows; ++r) {
+                        int64_t totals[1][4];
+                        block_vnni<X,1>(x + (row + r) * g.K, w + n * g.padded_K, g.K, g.padded_K, columns, totals);
+                        for (int c = 0; c < columns; ++c) store(row + r, n + c, totals[0][c], sums[r]);
+                    }
+                }
+            }
+        }
+    });
+}
 #endif
 
 template<class X>
@@ -61,6 +248,13 @@ void run(const Tensor& input, const Tensor& packed, const Tensor& offsets,
     const float* bp = bias ? bias->data_ptr<float>() : nullptr;
     const int64_t xz = quantized::q_zero_point(input);
     const double xs = quantized::q_scale(input);
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    static const bool vnni = __builtin_cpu_supports("avxvnni");
+    if (g.linear && vnni) {
+        linear_vnni(xp, wp, col, sc, wz, bp, g, out, xs, xz, ys, yz, relu, output_float);
+        return;
+    }
+#endif
     const int64_t n_per_group = g.outputs / g.groups;
     const int64_t workers = std::max<int64_t>(1, parallel::get_num_threads());
     const int64_t tile_rows = g.linear

@@ -627,6 +627,7 @@ function(tp_p10_append_isa_tier_sources)
     endif()
 endfunction()
 set(TP_CPU_KERNEL_SRCS
+    src/backend/cpu/QuantizedElementwiseKernels.cpp
     src/backend/cpu/ReductionKernelsImpl.cpp
     src/backend/cpu/EmbeddingBagKernelsImpl.cpp
     src/backend/cpu/ActivationUnaryKernels.cpp

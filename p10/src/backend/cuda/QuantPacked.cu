@@ -1,10 +1,59 @@
 #include "QuantPacked.h"
 #include "Dispatcher.h"
 #include "CUDARuntime.h"
+#include "QuantElementwise.h"
 #include <cuda_runtime.h>
 
 namespace tensorplay::cuda {
 namespace {
+
+template<class T>
+__global__ void activation_codes(const T* input, T* output, int64_t size,
+        float scale, int64_t zp, float inverse_scale, int64_t output_zp,
+        quant::Activation fn) {
+    __shared__ T table[256];
+    if constexpr (sizeof(T) == 1) {
+        const int code = std::is_same_v<T, int8_t>
+            ? static_cast<int8_t>(threadIdx.x) : threadIdx.x;
+        table[threadIdx.x] = quant::encode<T>(fn(static_cast<float>(code - zp) * scale), inverse_scale, output_zp);
+        __syncthreads();
+    }
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < size; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        if constexpr (sizeof(T) == 1) output[i] = table[static_cast<uint8_t>(input[i])];
+        else output[i] = quant::encode<T>(fn(static_cast<float>(static_cast<int64_t>(input[i]) - zp) * scale), inverse_scale, output_zp);
+    }
+}
+
+template<class T>
+__global__ void relu6_codes(const T* input, T* output, int64_t size, int64_t zp, T hi) {
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < size; i += static_cast<int64_t>(gridDim.x) * blockDim.x)
+        output[i] = static_cast<T>(min(static_cast<int64_t>(hi), max(zp, static_cast<int64_t>(input[i]))));
+}
+
+Tensor activation(const Tensor& input, double scale, int64_t zp, quant::Activation fn) {
+    CUDAGuard guard(input.device());
+    auto grid = make_per_tensor_affine_quantizer(scale, zp, input.dtype());
+    const float xs = static_cast<float>(quantized::q_scale(input));
+    const int64_t xz = quantized::q_zero_point(input);
+    const Tensor x = input.contiguous();
+    Tensor out = Tensor::empty(input.shape(), input.dtype(), input.device());
+    if (input.numel()) {
+        const int blocks = static_cast<int>(std::min<int64_t>((input.numel() + 4095) / 4096, 4096));
+        const auto stream = getCurrentCUDAStream().stream();
+        const float inverse_scale = 1.f / static_cast<float>(scale);
+        switch (input.dtype()) {
+            case DType::QInt8: activation_codes<<<blocks,256,0,stream>>>(x.data_ptr<int8_t>(),out.data_ptr<int8_t>(),input.numel(),xs,xz,inverse_scale,zp,fn); break;
+            case DType::QUInt8: activation_codes<<<blocks,256,0,stream>>>(x.data_ptr<uint8_t>(),out.data_ptr<uint8_t>(),input.numel(),xs,xz,inverse_scale,zp,fn); break;
+            case DType::QInt32: activation_codes<<<blocks,256,0,stream>>>(x.data_ptr<int32_t>(),out.data_ptr<int32_t>(),input.numel(),xs,xz,inverse_scale,zp,fn); break;
+            default: TP_THROW(TypeError, "Activation requires quantized integer input");
+        }
+        checkCuda(cudaGetLastError(), "Integer code activation");
+    }
+    out.impl()->set_quantizer(std::move(grid));
+    return out;
+}
 
 template<class T>
 __global__ void relu_codes(const T* input, T* output, int64_t size, int64_t zp) {
@@ -155,6 +204,48 @@ Tensor quantized_relu_cuda(const Tensor& input) {
     return out;
 }
 
+Tensor quantized_relu6_cuda(const Tensor& input) {
+    CUDAGuard guard(input.device());
+    const int64_t zp = quantized::q_zero_point(input);
+    const float inverse_scale = 1.f / static_cast<float>(quantized::q_scale(input));
+    const Tensor x = input.contiguous();
+    Tensor out = Tensor::empty(input.shape(), input.dtype(), input.device());
+    if (input.numel()) {
+        const int blocks = static_cast<int>(std::min<int64_t>((input.numel() + 255) / 256, 65535));
+        const auto stream = getCurrentCUDAStream().stream();
+        switch (input.dtype()) {
+            case DType::QInt8: relu6_codes<<<blocks,256,0,stream>>>(x.data_ptr<int8_t>(),out.data_ptr<int8_t>(),input.numel(),zp,quant::encode<int8_t>(6.f,inverse_scale,zp)); break;
+            case DType::QUInt8: relu6_codes<<<blocks,256,0,stream>>>(x.data_ptr<uint8_t>(),out.data_ptr<uint8_t>(),input.numel(),zp,quant::encode<uint8_t>(6.f,inverse_scale,zp)); break;
+            case DType::QInt32: relu6_codes<<<blocks,256,0,stream>>>(x.data_ptr<int32_t>(),out.data_ptr<int32_t>(),input.numel(),zp,quant::encode<int32_t>(6.f,inverse_scale,zp)); break;
+            default: TP_THROW(TypeError, "Rectification requires quantized integer input");
+        }
+        checkCuda(cudaGetLastError(), "Integer bounded rectification");
+    }
+    out.impl()->set_quantizer(input.impl()->quantizer());
+    return out;
+}
+
+Tensor quantized_leaky_relu_cuda(const Tensor& x, double slope, double scale, int64_t zp) {
+    return activation(x, scale, zp, {0, static_cast<float>(slope)});
+}
+Tensor quantized_elu_cuda(const Tensor& x, double output_scale, int64_t zp,
+                          double alpha, double scale, double input_scale) {
+    return activation(x, output_scale, zp, {1, 0, static_cast<float>(alpha),
+        static_cast<float>(scale), static_cast<float>(input_scale)});
+}
+Tensor quantized_hardswish_cuda(const Tensor& x, double scale, int64_t zp) {
+    return activation(x, scale, zp, {2});
+}
+Tensor quantized_hardsigmoid_cuda(const Tensor& x, double scale, int64_t zp) {
+    return activation(x, scale, zp, {3});
+}
+Tensor quantized_sigmoid_cuda(const Tensor& x, double scale, int64_t zp) {
+    return activation(x, scale, zp, {4});
+}
+Tensor quantized_tanh_cuda(const Tensor& x, double scale, int64_t zp) {
+    return activation(x, scale, zp, {5});
+}
+
 std::tuple<Tensor, Tensor> _quantized_weight_prepack_cuda(const Tensor& weight) {
     CUDAGuard guard(weight.device());
     const auto [K, padded_K] = quant::packed_weight_shape(weight);
@@ -239,6 +330,14 @@ Tensor quantized_batch_norm_relu_cuda(
 }
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, QuantPacked) {
+    m.impl("quantized_relu", quantized_relu_cuda);
+    m.impl("quantized_relu6", quantized_relu6_cuda);
+    m.impl("quantized_leaky_relu", quantized_leaky_relu_cuda);
+    m.impl("quantized_elu", quantized_elu_cuda);
+    m.impl("quantized_hardswish", quantized_hardswish_cuda);
+    m.impl("quantized_hardsigmoid", quantized_hardsigmoid_cuda);
+    m.impl("quantized_sigmoid", quantized_sigmoid_cuda);
+    m.impl("quantized_tanh", quantized_tanh_cuda);
     m.impl("quantized_batch_norm_relu", quantized_batch_norm_relu_cuda);
     m.impl("_quantized_weight_prepack", _quantized_weight_prepack_cuda);
     m.impl("_quantized_packed_run", _quantized_packed_run_cuda);

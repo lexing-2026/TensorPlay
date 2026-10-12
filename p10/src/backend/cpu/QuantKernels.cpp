@@ -1,4 +1,5 @@
 #include "QuantKernels.h"
+#include "QuantElementwise.h"
 #include "Convolution.h"
 #include "Exception.h"
 #include "Parallel.h"
@@ -2144,57 +2145,6 @@ Tensor _make_per_channel_quantized_tensor_cpu(const Tensor& self,
 
 namespace {
 
-// Float-domain elementwise path shared by the requantizing activations.
-template <typename Fn>
-Tensor quantized_unary_float_cpu(const Tensor& self, double out_scale,
-                                 int64_t out_zero_point, const char* op_name,
-                                 Fn&& fn) {
-    if (self.dtype() != DType::QInt8) {
-        TP_THROW(TypeError,
-                 std::string(op_name) + "(): expected a QInt8 tensor");
-    }
-    if (!(out_scale > 0.0)) {
-        TP_THROW(ValueError,
-                 std::string(op_name) + "(): out_scale must be positive");
-    }
-    const Tensor sc = self.is_contiguous() ? self : self.contiguous();
-    Tensor out = Tensor::empty(self.shape(), DType::QInt8, self.device());
-    const int8_t* in = sc.data_ptr<int8_t>();
-    int8_t* po = out.data_ptr<int8_t>();
-    const int64_t numel = self.numel();
-    const double scale = quantized::q_scale(self);
-    const double zp = static_cast<double>(quantized::q_zero_point(self));
-    const double inv_out = 1.0 / out_scale;
-    for (int64_t i = 0; i < numel; ++i) {
-        const double x = (static_cast<double>(in[i]) - zp) * scale;
-        po[i] = requantize_value(fn(x), inv_out, out_zero_point);
-    }
-    out.impl()->set_quantizer(make_per_tensor_affine_quantizer(
-        out_scale, out_zero_point, DType::QInt8));
-    return out;
-}
-
-// Integer-domain elementwise path shared by the order-preserving ops; the
-// input quantizer is attached to the output unchanged.
-template <typename Fn>
-Tensor quantized_unary_code_cpu(const Tensor& self, const char* op_name,
-                                Fn&& fn) {
-    if (self.dtype() != DType::QInt8) {
-        TP_THROW(TypeError,
-                 std::string(op_name) + "(): expected a QInt8 tensor");
-    }
-    const Tensor sc = self.is_contiguous() ? self : self.contiguous();
-    Tensor out = Tensor::empty(self.shape(), DType::QInt8, self.device());
-    const int8_t* in = sc.data_ptr<int8_t>();
-    int8_t* po = out.data_ptr<int8_t>();
-    const int64_t numel = self.numel();
-    for (int64_t i = 0; i < numel; ++i) {
-        po[i] = fn(in[i]);
-    }
-    out.impl()->set_quantizer(self.impl()->quantizer());
-    return out;
-}
-
 Tensor quantized_cat_impl_cpu(const std::vector<Tensor>& tensors, int64_t dim,
                               std::optional<double> scale,
                               std::optional<int64_t> zero_point,
@@ -2311,90 +2261,45 @@ Tensor max_pool3d_cpu(const Tensor& input,
                       const std::vector<int64_t>& dilation, bool ceil_mode);
 
 Tensor quantized_relu_cpu(const Tensor& self) {
-    // On the affine grid the negative half-space is the code segment below
-    // the zero point, so relu is an integer max against the zero point.
-    const int64_t zp = quantized::q_zero_point(self);
-    const Tensor input = self.contiguous();
-    Tensor out = Tensor::empty(self.shape(), self.dtype(), self.device());
-    auto apply = [&]<class T>() {
-        const T* x = input.data_ptr<T>();
-        T* y = out.data_ptr<T>();
-        parallel::parallel_for(0, self.numel(), 32768, [&](int64_t begin, int64_t end) {
-            for (int64_t i = begin; i < end; ++i) y[i] = static_cast<T>(std::max<int64_t>(x[i], zp));
-        });
-    };
-    switch (self.dtype()) {
-        case DType::QInt8: apply.template operator()<int8_t>(); break;
-        case DType::QUInt8: apply.template operator()<uint8_t>(); break;
-        case DType::QInt32: apply.template operator()<int32_t>(); break;
-        default: TP_THROW(TypeError, "Rectification requires quantized integer input");
-    }
-    out.impl()->set_quantizer(self.impl()->quantizer());
-    return out;
+    return quant::relu_cpu(self);
 }
 
 Tensor quantized_relu6_cpu(const Tensor& self) {
-    const double scale = quantized::q_scale(self);
-    const int64_t zp = quantized::q_zero_point(self);
-    // The upper bound is the grid position of the real value 6 under the
-    // input qparams; the lower bound is the zero point itself.
-    const int8_t q_six = requantize_value(6.0, 1.0 / scale, zp);
-    return quantized_unary_code_cpu(
-        self, "quantized_relu6", [zp, q_six](int8_t v) {
-            return static_cast<int8_t>(
-                std::min<int64_t>(std::max<int64_t>(v, zp), q_six));
-        });
+    return quant::relu6_cpu(self);
 }
 
 Tensor quantized_leaky_relu_cpu(const Tensor& self, double negative_slope,
-                                double out_scale, int64_t out_zero_point) {
-    return quantized_unary_float_cpu(
-        self, out_scale, out_zero_point, "quantized_leaky_relu",
-        [negative_slope](double x) {
-            return x > 0.0 ? x : x * negative_slope;
-        });
+                              double out_scale, int64_t out_zero_point) {
+    return quant::activation_cpu(self, out_scale, out_zero_point,
+                                {0, static_cast<float>(negative_slope)});
 }
 
 Tensor quantized_elu_cpu(const Tensor& self, double out_scale,
-                         int64_t out_zero_point, double alpha, double scale,
-                         double input_scale) {
-    // Generalized formula: x >= 0 maps to x * scale, x < 0 maps to
-    // alpha * scale * expm1(x * input_scale).  For the standard ELU both
-    // scale and input_scale are 1.
-    return quantized_unary_float_cpu(
-        self, out_scale, out_zero_point, "quantized_elu",
-        [alpha, scale, input_scale](double x) {
-            return x >= 0.0 ? x * scale
-                            : std::expm1(x * input_scale) * alpha * scale;
-        });
+                        int64_t out_zero_point, double alpha, double scale,
+                        double input_scale) {
+    return quant::activation_cpu(self, out_scale, out_zero_point,
+        {1, 0, static_cast<float>(alpha), static_cast<float>(scale),
+         static_cast<float>(input_scale)});
 }
 
 Tensor quantized_hardswish_cpu(const Tensor& self, double out_scale,
-                               int64_t out_zero_point) {
-    return quantized_unary_float_cpu(
-        self, out_scale, out_zero_point, "quantized_hardswish",
-        [](double x) { return x * std::min(std::max(x + 3.0, 0.0), 6.0) / 6.0; });
+                              int64_t out_zero_point) {
+    return quant::activation_cpu(self, out_scale, out_zero_point, {2});
 }
 
 Tensor quantized_hardsigmoid_cpu(const Tensor& self, double out_scale,
-                                 int64_t out_zero_point) {
-    return quantized_unary_float_cpu(
-        self, out_scale, out_zero_point, "quantized_hardsigmoid",
-        [](double x) { return std::min(std::max(x / 6.0 + 0.5, 0.0), 1.0); });
+                                int64_t out_zero_point) {
+    return quant::activation_cpu(self, out_scale, out_zero_point, {3});
 }
 
 Tensor quantized_sigmoid_cpu(const Tensor& self, double out_scale,
-                             int64_t out_zero_point) {
-    return quantized_unary_float_cpu(
-        self, out_scale, out_zero_point, "quantized_sigmoid",
-        [](double x) { return 1.0 / (1.0 + std::exp(-x)); });
+                            int64_t out_zero_point) {
+    return quant::activation_cpu(self, out_scale, out_zero_point, {4});
 }
 
 Tensor quantized_tanh_cpu(const Tensor& self, double out_scale,
-                          int64_t out_zero_point) {
-    return quantized_unary_float_cpu(
-        self, out_scale, out_zero_point, "quantized_tanh",
-        [](double x) { return std::tanh(x); });
+                         int64_t out_zero_point) {
+    return quant::activation_cpu(self, out_scale, out_zero_point, {5});
 }
 
 Tensor quantized_cat_cpu(const std::vector<Tensor>& tensors, int64_t dim,

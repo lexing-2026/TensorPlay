@@ -5317,6 +5317,7 @@
   variants: function
   dispatch:
     CPU: quantized_relu_cpu
+    CUDA: quantized_relu_cuda
 
 # Quantized relu6 clamps the codes between the zero point and the grid
 # position of the real value 6 under the input qparams.
@@ -5324,11 +5325,13 @@
   variants: function
   dispatch:
     CPU: quantized_relu6_cpu
+    CUDA: quantized_relu6_cuda
 
 - func: quantized_leaky_relu(Tensor self, float negative_slope, float output_scale, int output_zero_point) -> Tensor
   variants: function
   dispatch:
     CPU: quantized_leaky_relu_cpu
+    CUDA: quantized_leaky_relu_cuda
 
 # Generalized ELU: x >= 0 maps to x * scale, x < 0 maps to
 # alpha * scale * expm1(x * input_scale).  The standard ELU passes
@@ -5337,26 +5340,31 @@
   variants: function
   dispatch:
     CPU: quantized_elu_cpu
+    CUDA: quantized_elu_cuda
 
 - func: quantized_hardswish(Tensor self, float output_scale, int output_zero_point) -> Tensor
   variants: function
   dispatch:
     CPU: quantized_hardswish_cpu
+    CUDA: quantized_hardswish_cuda
 
 - func: quantized_hardsigmoid(Tensor self, float output_scale, int output_zero_point) -> Tensor
   variants: function
   dispatch:
     CPU: quantized_hardsigmoid_cpu
+    CUDA: quantized_hardsigmoid_cuda
 
 - func: quantized_sigmoid(Tensor self, float output_scale, int output_zero_point) -> Tensor
   variants: function
   dispatch:
     CPU: quantized_sigmoid_cpu
+    CUDA: quantized_sigmoid_cuda
 
 - func: quantized_tanh(Tensor self, float output_scale, int output_zero_point) -> Tensor
   variants: function
   dispatch:
     CPU: quantized_tanh_cpu
+    CUDA: quantized_tanh_cuda
 
 # Per-tensor affine concatenation.  The output qparams default to the first
 # input's; inputs already carrying them are concatenated at the byte level,
