@@ -14,6 +14,7 @@
 
 namespace tensorplay {
 namespace cpu {
+inline namespace CPU_CAPABILITY {
 
 using namespace tensorplay::parallel;
 
@@ -140,7 +141,10 @@ void sampled_addmm_sparse_csr_kernel(const Tensor& mat1, const Tensor& mat2_t,
 
 #ifndef CPU_CAPABILITY_AVX512
 REGISTER_DISPATCH(sampled_addmm_stub, &sampled_addmm_sparse_csr_kernel)
+#else
+ALSO_REGISTER_AVX512_DISPATCH(sampled_addmm_stub, &sampled_addmm_sparse_csr_kernel)
 #endif
 
+} // namespace CPU_CAPABILITY
 } // namespace cpu
 } // namespace tensorplay
