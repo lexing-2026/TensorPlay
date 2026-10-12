@@ -1,108 +1,72 @@
-"""Quantization-aware convolution modules.
+"""Convolution modules with trainable floating weights on a simulated integer grid."""
 
-Same contract as the linear QAT module: float weights stay trainable while a
-straight-through fake-quantize module simulates the quantized grid on every
-forward pass.
-"""
-
-from __future__ import annotations
-
-import tensorplay
 from tensorplay import nn
 from tensorplay.nn import functional as F
+from .linear import _weight_fake_quant
 
-__all__ = ["Conv1d", "Conv2d", "Conv3d"]
+__all__ = ['Conv1d', 'Conv2d', 'Conv3d']
 
 
-class _ConvNd(nn.Module):
+class _ConvNd:
     _BASE = None
-    _FUNC = None
 
     def __init__(self, in_channels, out_channels, kernel_size, stride=1,
-                 padding=0, dilation=1, groups=1, bias=True, qconfig=None):
-        super().__init__()
-        self.base = self._BASE(
-            in_channels, out_channels, kernel_size, stride=stride,
-            padding=padding, dilation=dilation, groups=groups, bias=bias)
-        if qconfig is None:
-            # Resolved lazily: the quantization package imports this package
-            # at module scope, so an eager import here would be circular.
-            from ....quantization.fake_quantize import PerChannelFakeQuantize
+                 padding=0, dilation=1, groups=1, bias=True, padding_mode='zeros',
+                 qconfig=None, device=None, dtype=None):
+        self._BASE.__init__(self, in_channels, out_channels, kernel_size,
+                            stride, padding, dilation, groups, bias, padding_mode,
+                            device=device, dtype=dtype)
+        self.qconfig, self.weight_fake_quant = _weight_fake_quant(qconfig, self.weight.device)
 
-            self.weight_fake_quant = PerChannelFakeQuantize(ch_axis=0)
-        else:
-            self.weight_fake_quant = qconfig.weight()
-        self.qconfig = qconfig
-
-    @property
-    def weight(self):
-        return self.base.weight
-
-    @weight.setter
-    def weight(self, value):
-        self.base.weight = value
-
-    @property
-    def bias(self):
-        return self.base.bias
-
-    @bias.setter
-    def bias(self, value):
-        self.base.bias = value
+    def _conv_forward(self, input, weight, bias):
+        return _conv_forward(self, input, weight, bias)
 
     def forward(self, input):
-        return self._FUNC(
-            input, self.weight_fake_quant(self.weight), self.bias,
-            stride=self.base.stride, padding=self.base.padding,
-            dilation=self.base.dilation, groups=self.base.groups)
-
-    def _get_name(self):
-        return f"QAT{self._BASE.__name__}"
+        return self._conv_forward(input, self.weight_fake_quant(self.weight), self.bias)
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
-        if not isinstance(mod, cls._BASE):
-            raise TypeError(
-                f"from_float(): expected a {cls._BASE.__name__} module")
-        qconfig = getattr(mod, "qconfig", None)
-        qat_conv = cls(
-            mod.in_channels, mod.out_channels, mod.kernel_size,
-            stride=mod.stride, padding=mod.padding, dilation=mod.dilation,
-            groups=mod.groups, bias=mod.bias is not None, qconfig=qconfig)
-        qat_conv.weight = mod.weight
-        if mod.bias is not None:
-            qat_conv.bias = mod.bias
-        return qat_conv
+        source = getattr(mod, 'op', mod)
+        if not isinstance(source, cls._BASE):
+            raise TypeError(f'Expected a {cls._BASE.__name__} module')
+        result = cls(source.in_channels, source.out_channels, source.kernel_size,
+                     stride=source.stride, padding=source.padding, dilation=source.dilation,
+                     groups=source.groups, bias=source.bias is not None,
+                     padding_mode=source.padding_mode, qconfig=getattr(mod, 'qconfig', None),
+                     device=source.weight.device, dtype=source.weight.dtype)
+        result.weight, result.bias = source.weight, source.bias
+        result._reversed_padding_repeated_twice = source._reversed_padding_repeated_twice
+        result.train(mod.training)
+        return result
 
     def to_float(self):
-        float_conv = self._BASE(
-            self.base.in_channels, self.base.out_channels,
-            self.base.kernel_size, stride=self.base.stride,
-            padding=self.base.padding, dilation=self.base.dilation,
-            groups=self.base.groups, bias=self.base.bias is not None)
-        float_conv.weight = nn.Parameter(self.weight.detach())
-        if self.base.bias is not None:
-            float_conv.bias = nn.Parameter(self.bias.detach())
-        float_conv.train(self.training)
-        return float_conv
+        result = self._BASE(self.in_channels, self.out_channels, self.kernel_size,
+                            self.stride, self.padding, self.dilation, self.groups,
+                            self.bias is not None, self.padding_mode,
+                            device=self.weight.device, dtype=self.weight.dtype)
+        result.weight = nn.Parameter(self.weight.detach())
+        result.bias = nn.Parameter(self.bias.detach()) if self.bias is not None else None
+        result._reversed_padding_repeated_twice = self._reversed_padding_repeated_twice
+        result.train(self.training)
+        return result
 
 
-class Conv1d(_ConvNd):
-    """Quantization-aware 1d convolution."""
-
+class Conv1d(_ConvNd, nn.Conv1d):
     _BASE = nn.Conv1d
-    _FUNC = staticmethod(F.conv1d)
 
 
-class Conv2d(_ConvNd):
-    """Quantization-aware 2d convolution."""
-
+class Conv2d(_ConvNd, nn.Conv2d):
     _BASE = nn.Conv2d
-    _FUNC = staticmethod(F.conv2d)
 
 
-class Conv3d(_ConvNd):
-    """Quantization-aware 3d convolution."""
-
+class Conv3d(_ConvNd, nn.Conv3d):
     _BASE = nn.Conv3d
-    _FUNC = staticmethod(F.conv3d)
+
+
+def _conv_forward(module, input, weight, bias):
+    if module.padding_mode != 'zeros':
+        input = F.pad(input, list(module._reversed_padding_repeated_twice), mode=module.padding_mode)
+    elif module._reversed_padding_repeated_twice is not None:
+        input = F.pad(input, list(module._reversed_padding_repeated_twice))
+    operation = (F.conv1d, F.conv2d, F.conv3d)[weight.dim() - 3]
+    return operation(input, weight, bias, module.stride, module.padding, module.dilation, module.groups)

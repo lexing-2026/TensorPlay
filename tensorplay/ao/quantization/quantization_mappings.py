@@ -12,6 +12,7 @@ from tensorplay.ao.nn import intrinsic as nni
 from tensorplay.ao.nn import qat as nnqat
 from tensorplay.ao.nn import quantized as nnq
 from tensorplay.ao.nn.intrinsic import quantized as nniq
+from tensorplay.ao.nn.intrinsic import qat as nniqat
 from tensorplay.ao.nn.quantized import dynamic as nnqd
 from tensorplay.ao.quantization.stubs import DeQuantStub, QuantStub
 
@@ -64,14 +65,25 @@ DEFAULT_STATIC_QUANT_MODULE_MAPPINGS: dict = {
 
 # Default map for swapping float modules to qat modules
 DEFAULT_QAT_MODULE_MAPPINGS: dict = {
+    nn.Conv1d: nnqat.Conv1d,
     nn.Conv2d: nnqat.Conv2d,
     nn.Conv3d: nnqat.Conv3d,
     nn.Linear: nnqat.Linear,
-    # fused modules
-    nni.ConvReLU2d: nniq.ConvReLU2d,
-    nni.ConvReLU3d: nniq.ConvReLU3d,
-    nni.LinearReLU: nniq.LinearReLU,
+    nni.ConvReLU1d: nniqat.ConvReLU1d,
+    nni.ConvReLU2d: nniqat.ConvReLU2d,
+    nni.ConvReLU3d: nniqat.ConvReLU3d,
+    nni.LinearReLU: nniqat.LinearReLU,
+    nni.LinearBn1d: nniqat.LinearBn1d,
 }
+for _rank in (1, 2, 3):
+    for _relu in ('', 'ReLU'):
+        _name = f'ConvBn{_relu}{_rank}d'
+        DEFAULT_QAT_MODULE_MAPPINGS[getattr(nni, _name)] = getattr(nniqat, _name)
+        DEFAULT_STATIC_QUANT_MODULE_MAPPINGS[getattr(nniqat, _name)] = getattr(nniq if _relu else nnq, f'ConvReLU{_rank}d' if _relu else f'Conv{_rank}d')
+    DEFAULT_STATIC_QUANT_MODULE_MAPPINGS[getattr(nnqat, f'Conv{_rank}d')] = getattr(nnq, f'Conv{_rank}d')
+    DEFAULT_STATIC_QUANT_MODULE_MAPPINGS[getattr(nniqat, f'ConvReLU{_rank}d')] = getattr(nniq, f'ConvReLU{_rank}d')
+DEFAULT_STATIC_QUANT_MODULE_MAPPINGS[nniqat.LinearReLU] = nniq.LinearReLU
+DEFAULT_STATIC_QUANT_MODULE_MAPPINGS[nniqat.LinearBn1d] = nnq.Linear
 
 # Default map for swapping dynamic modules
 DEFAULT_DYNAMIC_QUANT_MODULE_MAPPINGS: dict = {

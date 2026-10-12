@@ -13,6 +13,7 @@ dynamic-quantization counterparts without calibration.
 from __future__ import annotations
 
 import copy
+import inspect
 
 from tensorplay import nn
 
@@ -50,15 +51,16 @@ def propagate_qconfig_(module, qconfig_dict=None):
     child wins over the inherited one.
     """
     qconfig_dict = qconfig_dict or {}
-    for name, child in module.named_children():
-        child.qconfig = (
-            qconfig_dict.get(name)
-            or qconfig_dict.get(type(child).__name__)
-            or qconfig_dict.get(type(child))
-            or getattr(child, "qconfig", None)
-            or getattr(module, "qconfig", None)
-        )
-        propagate_qconfig_(child, None)
+
+    def assign(current, inherited, prefix):
+        config = qconfig_dict.get(type(current), qconfig_dict.get(type(current).__name__, inherited))
+        config = qconfig_dict.get(prefix, config)
+        current.qconfig = getattr(current, 'qconfig', config)
+        for name, child in current.named_children():
+            if not _is_observer_machinery(child):
+                assign(child, current.qconfig, prefix + '.' + name if prefix else name)
+
+    assign(module, qconfig_dict.get('', getattr(module, 'qconfig', None)), '')
 
 
 # ---------------------------------------------------------------------------
@@ -93,22 +95,25 @@ def _add_observer_(module, qconfig_spec=None):
     """
     # The dequantize boundary is swapped out at conversion and carries no
     # calibration of its own.
-    if isinstance(module, DeQuantStub):
+    if isinstance(module, (DeQuantStub, nn.Identity)):
         return
     if getattr(module, "activation_post_process", None) is not None:
         # Already prepared; attaching again would duplicate the hooks.
         return
-    is_leaf = all(_is_observer_machinery(child) for child in module.children())
+    from tensorplay.ao.nn.intrinsic import _FusedModule
+    is_leaf = isinstance(module, _FusedModule) or all(_is_observer_machinery(child) for child in module.children())
     if is_leaf and getattr(module, "qconfig", None) is not None:
         if qconfig_spec is not None and not any(
             _matches(module, spec) for spec in qconfig_spec
         ):
             return
         module.activation_post_process = module.qconfig.activation()
+        if getattr(module, '_qat_prepared', False) and isinstance(module.activation_post_process, ObserverBase):
+            module.activation_post_process = FakeQuantize(observer=module.activation_post_process)
         module.register_forward_hook(_observer_forward_hook, prepend=True)
         module.input_activation_post_process = module.qconfig.activation()
         module.register_forward_pre_hook(_observer_forward_pre_hook, prepend=True)
-        if getattr(module, "weight", None) is not None and module.qconfig.weight is not None:
+        if getattr(module, "weight", None) is not None and module.qconfig.weight is not None and not hasattr(module, "weight_fake_quant"):
             module.weight_observer = module.qconfig.weight()
             module.weight_observer.to(module.weight.device)
             module.weight_observer(module.weight.detach())
@@ -146,7 +151,7 @@ def _resolve_weight_qparams(mod):
     return observer.calculate_qparams()
 
 
-def convert(module, mapping=None, inplace=False, remove_qconfig=True):
+def convert(module, mapping=None, inplace=False, remove_qconfig=True, use_precomputed_fake_quant=False):
     """Swap calibrated float modules for their quantized counterparts.
 
     Each target class must expose ``from_float``; activation qparams the
@@ -157,20 +162,32 @@ def convert(module, mapping=None, inplace=False, remove_qconfig=True):
         module = copy.deepcopy(module)
     if mapping is None:
         mapping = get_default_static_quant_module_mappings()
-    module = _convert(module, mapping)
+    module = _convert(module, mapping, use_precomputed_fake_quant)
     if remove_qconfig:
         _remove_qconfig(module)
     return module
 
 
-def _convert(module, mapping):
-    for name, child in module.named_children():
-        new_child = _convert(child, mapping)
-        if new_child is not child:
-            module._modules[name] = new_child
-    for source_type, target_type in mapping.items():
-        if isinstance(module, source_type):
-            return target_type.from_float(module)
+def _convert(module, mapping, use_precomputed_fake_quant=False):
+    target_type = mapping.get(type(module))
+    if target_type is not None and getattr(module, 'qconfig', None) is not None:
+        kwargs = {}
+        if 'use_precomputed_fake_quant' in inspect.signature(target_type.from_float).parameters:
+            kwargs['use_precomputed_fake_quant'] = use_precomputed_fake_quant
+        result = target_type.from_float(module, **kwargs)
+        if hasattr(module, 'qconfig'):
+            result.qconfig = module.qconfig
+        for hook in module._forward_pre_hooks.values():
+            if hook is not _observer_forward_pre_hook:
+                result.register_forward_pre_hook(hook)
+        for hook in module._forward_hooks.values():
+            if hook is not _observer_forward_hook:
+                result.register_forward_hook(hook)
+        result.train(module.training)
+        return result
+    for name, child in list(module.named_children()):
+        if not _is_observer_machinery(child):
+            module._modules[name] = _convert(child, mapping, use_precomputed_fake_quant)
     return module
 
 
@@ -261,3 +278,31 @@ def add_quant_dequant(module):
     dequant_stub = DeQuantStub()
     holder = nn.Sequential(quant_stub, module, dequant_stub)
     return holder
+
+
+def prepare_qat(model, mapping=None, inplace=False):
+    from .quantization_mappings import get_default_qat_module_mappings
+    if not model.training:
+        raise ValueError('QAT preparation requires training mode')
+    if not inplace:
+        model = copy.deepcopy(model)
+    propagate_qconfig_(model)
+    model = convert(model, mapping=mapping or get_default_qat_module_mappings(),
+                    inplace=True, remove_qconfig=False)
+    for module in model.modules():
+        if not _is_observer_machinery(module):
+            module._qat_prepared = True
+    return prepare(model, inplace=True)
+
+
+def quantize_qat(model, run_fn, run_args, inplace=False):
+    if not inplace:
+        model = copy.deepcopy(model)
+    model.train()
+    model = prepare_qat(model, inplace=True)
+    run_fn(model, *run_args)
+    model.eval()
+    return convert(model, inplace=True)
+
+
+__all__ += ['prepare_qat', 'quantize_qat']

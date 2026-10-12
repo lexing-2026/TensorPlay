@@ -113,3 +113,7 @@ from .fake_quantize import *
 from .fake_quantize import __all__ as _fake_quant_exports
 from .observer import (ObserverBase, UniformQuantizationObserverBase, RecordingObserver, NoopObserver, ReuseInputObserver, default_per_channel_weight_observer, default_histogram_observer, default_float_qparams_observer, default_fixed_qparams_range_neg1to1_observer, default_fixed_qparams_range_0to1_observer)
 __all__ += _fake_quant_exports + ['ObserverBase', 'UniformQuantizationObserverBase', 'RecordingObserver', 'NoopObserver', 'ReuseInputObserver', 'default_per_channel_weight_observer', 'default_histogram_observer', 'default_float_qparams_observer', 'default_fixed_qparams_range_neg1to1_observer', 'default_fixed_qparams_range_0to1_observer']
+from .qconfig import default_qat_qconfig, default_per_channel_qat_qconfig
+from .quantize import prepare_qat, quantize_qat
+from .fuse_modules import fuse_modules_qat
+__all__ += ['default_qat_qconfig', 'default_per_channel_qat_qconfig', 'prepare_qat', 'quantize_qat', 'fuse_modules_qat']

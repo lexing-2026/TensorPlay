@@ -110,3 +110,10 @@ default_weight_only_qconfig = QConfig(
     activation=PlaceholderObserver.with_args(dtype=tensorplay.qint8, is_dynamic=False),
     weight=PerChannelMinMaxObserver.with_args(ch_axis=0),
 )
+
+
+from .fake_quantize import default_fake_quant, default_weight_fake_quant, default_per_channel_weight_fake_quant
+
+default_qat_qconfig = QConfig(activation=default_fake_quant, weight=default_weight_fake_quant)
+default_per_channel_qat_qconfig = QConfig(activation=default_fake_quant, weight=default_per_channel_weight_fake_quant)
+__all__ += ['default_qat_qconfig', 'default_per_channel_qat_qconfig']

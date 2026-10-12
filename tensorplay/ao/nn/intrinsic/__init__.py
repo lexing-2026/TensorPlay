@@ -19,14 +19,24 @@ __all__ = [
 ]
 
 
-class _FusedActivation(nn.Module):
+class _FusedModule(nn.Sequential):
+    pass
+
+
+class _FusedActivation(_FusedModule):
     """Base for operator + relu bundles; subclasses set the operator class."""
 
     _OP_CLASS = None
 
     def __init__(self, *args, **kwargs):
         super().__init__()
-        self.op = self._OP_CLASS(*args, **kwargs)
+        if args and isinstance(args[0], self._OP_CLASS):
+            self.op = args[0]
+        else:
+            self.op = self._OP_CLASS(*args, **kwargs)
+
+    def __getitem__(self, index):
+        return (self.op, nn.ReLU())[index]
 
     def forward(self, input):
         return self.op(input).relu()
@@ -38,7 +48,7 @@ class _FusedActivation(nn.Module):
             mod.in_channels if hasattr(mod, "in_channels") else mod.in_features,
             mod.out_channels if hasattr(mod, "out_channels") else mod.out_features,
             *(
-                mod.kernel_size if hasattr(mod, "kernel_size") else ()
+                (mod.kernel_size,) if hasattr(mod, "kernel_size") else ()
             ),
             **(
                 {
@@ -47,14 +57,19 @@ class _FusedActivation(nn.Module):
                     "dilation": mod.dilation,
                     "groups": mod.groups,
                     "bias": mod.bias is not None,
+                    "padding_mode": mod.padding_mode,
+                    "device": mod.weight.device,
+                    "dtype": mod.weight.dtype,
                 }
                 if hasattr(mod, "stride")
-                else {"bias": mod.bias is not None}
+                else {"bias": mod.bias is not None, "device": mod.weight.device, "dtype": mod.weight.dtype}
             ),
         )
         fused.op.weight = mod.weight
         if mod.bias is not None:
             fused.op.bias = mod.bias
+        if hasattr(mod, "qconfig"):
+            fused.qconfig = mod.qconfig
         fused.train(mod.training)
         return fused
 
@@ -105,3 +120,45 @@ class BNReLU3d(nn.Module):
 
     def forward(self, input):
         return self.relu(self.bn(input))
+
+
+class ConvBn1d(_FusedModule):
+    pass
+
+__all__.append("ConvBn1d")
+
+
+class ConvBnReLU1d(_FusedModule):
+    pass
+
+__all__.append("ConvBnReLU1d")
+
+
+class ConvBn2d(_FusedModule):
+    pass
+
+__all__.append("ConvBn2d")
+
+
+class ConvBnReLU2d(_FusedModule):
+    pass
+
+__all__.append("ConvBnReLU2d")
+
+
+class ConvBn3d(_FusedModule):
+    pass
+
+__all__.append("ConvBn3d")
+
+
+class ConvBnReLU3d(_FusedModule):
+    pass
+
+__all__.append("ConvBnReLU3d")
+
+
+class LinearBn1d(_FusedModule):
+    pass
+
+__all__.append("LinearBn1d")
