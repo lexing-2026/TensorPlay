@@ -459,9 +459,11 @@ def test_public_operator_packets_and_packed_queries(device):
     b=tp.zeros(11,device=device)
     packed=tp.ops.quantized.linear_prepack(w,b)
     recovered,bias=tp.ops.quantized.linear_unpack(packed)
-    same(recovered,rw)
+    rp=torch.ops.quantized.linear_prepack(rw,torch.zeros(11))
+    reference_weight,reference_bias=torch.ops.quantized.linear_unpack(rp)
+    same(recovered,reference_weight)
     same(tp.ops.quantized.linear(x,packed,.07,119),torch.ops.quantized.linear(
-        r,torch.ops.quantized.linear_prepack(rw,torch.zeros(11)),.07,119),1)
+        r,rp,.07,119),1)
 
 
 @pytest.mark.parametrize('device', DEVICES)

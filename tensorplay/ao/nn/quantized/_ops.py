@@ -1,5 +1,7 @@
 """Public operator packets forwarding to native quantized execution."""
 from functools import partial
+import struct
+import warnings
 import tensorplay as tp
 from tensorplay import _C
 from . import functional as F
@@ -48,7 +50,16 @@ class PackedConvolution:
             self.weight, self.bias = self.storage._weight_bias()
 
     def unpack(self):
-        return self.weight, self.bias
+        weight=_unpack_integer_weight(self.weight)
+        rank=weight.dim()-2
+        if not self.transposed:
+            weight=(weight.unsqueeze(2).contiguous(memory_format=tp.channels_last).squeeze(2)
+                    if rank==1 else weight.contiguous(memory_format=tp.channels_last
+                    if rank==2 else tp.channels_last_3d))
+        else:
+            weight=weight.permute(list(range(1,weight.dim()))+[0]).contiguous().permute(
+                [weight.dim()-1]+list(range(weight.dim()-1)))
+        return weight, self.bias
 
     def run(self, input, scale, zero_point, relu=False):
         if self.storage is not None:
@@ -67,6 +78,20 @@ class PackedConvolution:
 
 def _linear(input, packed_weight, output_scale, output_zero_point, relu=False):
     return packed_weight.run(input,output_scale,output_zero_point,relu=relu)
+
+
+def _unpack_integer_weight(weight):
+    if weight.qscheme()==tp.per_tensor_affine:
+        scale=struct.unpack('f',struct.pack('f',weight.q_scale()))[0]
+        return _C._make_per_tensor_quantized_tensor(weight.int_repr(),scale,weight.q_zero_point())
+    return _C._make_per_channel_quantized_tensor(weight.int_repr(),
+        weight.q_per_channel_scales().float().double(),weight.q_per_channel_zero_points().clone(),
+        weight.q_per_channel_axis())
+
+
+def _linear_unpack(packed):
+    weight,bias=packed._weight_bias()
+    return (_unpack_integer_weight(weight) if isinstance(packed,PackedWeight) else weight.float()),bias
 
 
 def _linear_dynamic(input, packed_weight, reduce_range=False, relu=False):
@@ -134,6 +159,10 @@ def _binary_out(name,a,b,out):
 def _scalar(name,a,b,out=None):
     if isinstance(b,tp.Tensor):
         b=b.item()
+    if name=='mul_scalar_relu' and out is not None and b>0:
+        if a.dtype!=out.dtype or a.qscheme()!=out.qscheme():
+            raise ValueError('Scalar operands and output must share dtype and quantization scheme')
+        return F.mul_scalar_relu(a,b)
     return getattr(F,name)(a,b,out=out)
 
 
@@ -144,9 +173,9 @@ def _inplace(result,input,inplace):
 
 
 def _leaky(input,negative_slope,inplace,output_scale,output_zero_point):
-    if inplace and (input.q_scale()!=output_scale or input.q_zero_point()!=output_zero_point):
-        raise ValueError('Inplace activation requires the input affine grid')
-    return _inplace(F.leaky_relu(input,negative_slope,output_scale,output_zero_point),input,inplace)
+    if inplace:
+        warnings.warn('Inplace execution is unavailable for quantized leaky rectifiers', stacklevel=2)
+    return F.leaky_relu(input,negative_slope,output_scale,output_zero_point)
 
 
 def _cat_out(inputs,dim,out,relu=False):
@@ -262,8 +291,9 @@ def _build_packets():
         add(name,partial(_binary,name),out=partial(_binary_out,name),Scalar=scalar,
             Scalar2=lambda b,a,fn=scalar:fn(a,b),Scalar_out=scalar)
         add(name+'_out',partial(_binary_out,name))
-        add(scalar_name,scalar,Tensor=scalar)
-        add(scalar_name+'_out',scalar,Tensor=scalar)
+        tensor_scalar=partial(_scalar,'add_scalar') if name=='add_relu' else scalar
+        add(scalar_name,scalar,Tensor=tensor_scalar)
+        add(scalar_name+'_out',scalar,Tensor=tensor_scalar)
     for name in ('sub','div'):
         add(name,getattr(F,name))
     for name in ('matmul','softmax','prelu','threshold','celu','dropout','sigmoid','tanh','hardswish'):
@@ -308,7 +338,7 @@ def _build_packets():
     add('int4mm_packed_weight_cpu',_C._quantized_int4_mm)
     add('linear_prepack',PackedWeight);add('linear_prepack_fp16',PackedHalfWeight)
     for suffix in ('','_fp16'):
-        add('linear_unpack'+suffix,lambda packed:packed._weight_bias(),legacy=_legacy)
+        add('linear_unpack'+suffix,_linear_unpack,legacy=_legacy)
     add('linear',_linear);add('linear_relu',partial(_linear,relu=True))
     add('linear_leaky_relu',lambda input,packed,scale,zp,negative_slope:packed.run(
         input,scale,zp,activation=1,negative_slope=negative_slope))
