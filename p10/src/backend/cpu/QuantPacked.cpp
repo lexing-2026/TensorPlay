@@ -62,7 +62,10 @@ void run(const Tensor& input, const Tensor& packed, const Tensor& offsets,
     const int64_t xz = quantized::q_zero_point(input);
     const double xs = quantized::q_scale(input);
     const int64_t n_per_group = g.outputs / g.groups;
-    constexpr int64_t tile_rows = 32;
+    const int64_t workers = std::max<int64_t>(1, parallel::get_num_threads());
+    const int64_t tile_rows = g.linear
+        ? std::max<int64_t>(1, std::min<int64_t>(32, (g.rows + workers - 1) / workers))
+        : 32;
     const int64_t tiles = (g.rows + tile_rows - 1) / tile_rows;
     parallel::parallel_for(0, tiles * g.groups, 1, [&](int64_t begin, int64_t end) {
         std::vector<X> columns(g.linear ? 0 : tile_rows * g.K);
