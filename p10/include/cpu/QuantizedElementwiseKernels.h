@@ -5,6 +5,8 @@
 #include "Half.h"
 #include <cstdint>
 
+namespace tensorplay::quant { struct PoolGeometry; }
+
 namespace tensorplay::cpu {
 using quantized_subbyte_pack_fn = void (*)(const float*,uint8_t*,int64_t,float,float,int);
 using quantized_subbyte_unpack_fn = void (*)(const uint8_t*,float*,int64_t,float,float,int);
@@ -36,6 +38,8 @@ DECLARE_DISPATCH(quantized_bilinear_fn, quantized_bilinear_stub)
 using quantized_moment_fn = void (*)(const void*, void*, int64_t, int64_t, DType,
     double, int64_t, bool, double);
 DECLARE_DISPATCH(quantized_moment_fn, quantized_moment_stub)
+using quantized_pool_fn = void (*)(const void*, void*, int64_t, int64_t, DType, const quant::PoolGeometry&);
+DECLARE_DISPATCH(quantized_pool_fn, quantized_pool_stub)
 using quantized_prelu_fn = void (*)(const void*, const void*, void*, int64_t, bool, DType,
     int64_t, int64_t, int64_t, int64_t, float);
 DECLARE_DISPATCH(quantized_prelu_fn, quantized_prelu_stub)

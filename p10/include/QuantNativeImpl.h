@@ -288,13 +288,6 @@ Tensor cat(const std::vector<Tensor>& inputs, int64_t dim, std::optional<double>
     return y;
 }
 
-struct PoolGeometry {
-    int rank, mode; int64_t in[3]{1,1,1}, out[3]{1,1,1}, kernel[3]{1,1,1}, stride[3]{1,1,1}, pad[3]{}, dilation[3]{1,1,1};
-    int64_t in_size = 1, out_size = 1, zp, divisor; bool include_pad;
-    int64_t channels = 1, batch_stride = 0, channel_stride = 0, spatial_strides[3]{};
-    bool channels_last = false;
-};
-
 template<class T>
 struct PoolCodes {
     const T* x; T* y; PoolGeometry g;
@@ -399,7 +392,17 @@ Tensor pool(const Tensor& input, const std::vector<int64_t>& kernel,
         Tensor formatted(y.impl()->storage(), shape, get_channels_last_strides(shape), input.dtype(), 0);
         formatted.impl()->set_quantizer(y.impl()->quantizer()); y = formatted;
     }
-    codes(input.dtype(), [&]<class T>() { apply(y.numel(), PoolCodes<T>{input.data_ptr<T>(), y.data_ptr<T>(), g}); });
+#ifndef TP_QUANT_CUDA
+    if (g.channels_last && g.channel_stride == 1 && g.mode != 2 && g.channels > 0 &&
+        input.itemsize() == 1 && g.in_size <= INT32_MAX / 255) {
+        parallel::parallel_for(0, y.numel() / g.channels, std::max<int64_t>(1, 32768 / g.channels),
+            [&](int64_t first, int64_t last) {
+                cpu::quantized_pool_stub(DeviceType::CPU, input.data_ptr(), y.data_ptr(),
+                    first, last, input.dtype(), g);
+            });
+    } else
+#endif
+        codes(input.dtype(), [&]<class T>() { apply(y.numel(), PoolCodes<T>{input.data_ptr<T>(), y.data_ptr<T>(), g}); });
     return y;
 }
 

@@ -152,6 +152,7 @@ DEFINE_DISPATCH(quantized_clip_stub);
 DEFINE_DISPATCH(quantized_prelu_stub);
 DEFINE_DISPATCH(quantized_sigmoid_stub);
 DEFINE_DISPATCH(quantized_moment_stub);
+DEFINE_DISPATCH(quantized_pool_stub);
 DEFINE_DISPATCH(quantized_lookup_stub);
 DEFINE_DISPATCH(quantized_binary_stub);
 DEFINE_DISPATCH(quantized_embedding_stub);

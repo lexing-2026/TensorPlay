@@ -411,3 +411,24 @@ def test_sigmoid_word_vector_blocks_and_scalar_tails(device, size, strided):
     if strided:
         x, r = x[::2], r[::2]
     equal(tp.ops.tp.sigmoid.default(x), torch.ops.aten.sigmoid.default(r))
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('dtype,zp', TYPES[:2])
+@pytest.mark.parametrize('rank', [2, 3])
+@pytest.mark.parametrize('channels', [7, 8, 9, 16, 17, 33, 129])
+def test_pool_channels_last_vector_blocks_and_tails(device, dtype, zp, rank, channels):
+    x, r = pair(device, dtype, zp, shape=(1, channels) + (5,) * rank)
+    fmt = tp.channels_last if rank == 2 else tp.channels_last_3d
+    rfmt = torch.channels_last if rank == 2 else torch.channels_last_3d
+    x, r = x.contiguous(memory_format=fmt), r.contiguous(memory_format=rfmt)
+    for include_pad, divisor in [(False, None), (True, None), (True, 5)]:
+        args = ([3] * rank, [2] * rank, [1] * rank, True, include_pad, divisor)
+        equal(resolve(tp.ops.tp, f'avg_pool{rank}d')(x, *args),
+              resolve(torch.ops.aten, f'avg_pool{rank}d')(r, *args), 1)
+    equal(resolve(tp.ops.tp, f'_adaptive_avg_pool{rank}d')(x, [2] * rank),
+          resolve(torch.ops.aten, f'_adaptive_avg_pool{rank}d')(r, [2] * rank), 1)
+    if rank == 3:
+        x, r = x[..., ::2], r[..., ::2]
+        equal(tp.ops.tp.avg_pool3d.default(x, [3] * rank, [2] * rank, [1] * rank),
+              torch.ops.aten.avg_pool3d.default(r, [3] * rank, [2] * rank, [1] * rank), 1)

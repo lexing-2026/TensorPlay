@@ -4,6 +4,7 @@
 #include "QuantElementwise.h"
 #include "QuantRowwise.h"
 #include "QuantPacked.h"
+#include "QuantNative.h"
 #include "Parallel.h"
 #include <cfenv>
 #ifndef CPU_CAPABILITY_AVX512
@@ -605,6 +606,82 @@ void moment_impl(const void* x, void* y, int64_t count, int64_t rows, DType dtyp
     }
 }
 
+template<class T>
+void pool_channels_last_codes(const void* input, void* output, int64_t first, int64_t last,
+                             const quant::PoolGeometry& g) {
+    using IV = vec::Vectorized<int32_t>;
+    using FV = vec::Vectorized<float>;
+    constexpr int lanes = IV::size(), block = 4 * lanes;
+    const auto* x = static_cast<const T*>(input);
+    auto* y = static_cast<T*>(output);
+    const FV zero(static_cast<float>(g.zp)), lo(static_cast<float>(std::numeric_limits<T>::lowest())),
+             hi(static_cast<float>(std::numeric_limits<T>::max()));
+    for (int64_t location = first; location < last; ++location) {
+        int64_t p = location % g.out_size, count = 1, valid = 1;
+        int64_t start[3]{}, end[3]{};
+        for (int d = 2; d >= 0; --d) {
+            const int64_t o = p % g.out[d]; p /= g.out[d];
+            if (g.mode == 1) {
+                start[d] = o * g.in[d] / g.out[d];
+                end[d] = ((o + 1) * g.in[d] + g.out[d] - 1) / g.out[d];
+            } else {
+                start[d] = o * g.stride[d] - g.pad[d];
+                end[d] = start[d] + g.kernel[d];
+                count *= std::min(end[d], g.in[d] + g.pad[d]) - start[d];
+            }
+            start[d] = std::max<int64_t>(start[d], 0);
+            end[d] = std::min(end[d], g.in[d]);
+            valid *= end[d] - start[d];
+        }
+        const int64_t divisor = g.divisor ? g.divisor : (g.mode == 1 || !g.include_pad ? valid : count);
+        const FV inverse(divisor ? 1.f / divisor : 0.f);
+        const int32_t initial = static_cast<int32_t>(-g.zp * valid);
+        const auto* row = x + location / g.out_size * g.batch_stride;
+        auto* dst = y + location * g.channels;
+        int64_t channel = 0;
+        for (; channel + lanes <= g.channels;) {
+            const int vectors = static_cast<int>(std::min<int64_t>(4, (g.channels - channel) / lanes));
+            IV sums[4]{IV(initial), IV(initial), IV(initial), IV(initial)};
+            for (int64_t d = start[0]; d < end[0]; ++d)
+                for (int64_t h = start[1]; h < end[1]; ++h)
+                    for (int64_t w = start[2]; w < end[2]; ++w) {
+                        const auto* src = row + d * g.spatial_strides[0] + h * g.spatial_strides[1] +
+                                          w * g.spatial_strides[2] + channel;
+                        for (int v = 0; v < vectors; ++v) {
+#if defined(CPU_CAPABILITY_AVX2) || defined(CPU_CAPABILITY_AVX512)
+                            sums[v] = sums[v] + vec::convert_to_int32<T>(src + v * lanes);
+#else
+                            alignas(64) int32_t values[lanes];
+                            for (int lane = 0; lane < lanes; ++lane) values[lane] = src[v * lanes + lane];
+                            sums[v] = sums[v] + IV::loadu(values);
+#endif
+                        }
+                    }
+            alignas(64) float codes[block];
+            for (int v = 0; v < vectors; ++v)
+                vec::minimum(hi, vec::maximum(lo, (vec::convert<float>(sums[v]) * inverse + zero).round())).store(codes + v * lanes);
+            for (int c = 0; c < vectors * lanes; ++c) dst[channel + c] = static_cast<T>(codes[c]);
+            channel += vectors * lanes;
+        }
+        for (; channel < g.channels; ++channel) {
+            int32_t sum = initial;
+            for (int64_t d = start[0]; d < end[0]; ++d)
+                for (int64_t h = start[1]; h < end[1]; ++h)
+                    for (int64_t w = start[2]; w < end[2]; ++w)
+                        sum += row[d * g.spatial_strides[0] + h * g.spatial_strides[1] + w * g.spatial_strides[2] + channel];
+            const float code = divisor ? std::nearbyint(static_cast<float>(sum) * (1.f / divisor) + static_cast<float>(g.zp)) : g.zp;
+            dst[channel] = static_cast<T>(std::clamp(code, static_cast<float>(std::numeric_limits<T>::lowest()),
+                                                   static_cast<float>(std::numeric_limits<T>::max())));
+        }
+    }
+}
+
+void pool_impl(const void* input, void* output, int64_t first, int64_t last, DType dtype,
+               const quant::PoolGeometry& g) {
+    if (dtype == DType::QInt8) pool_channels_last_codes<int8_t>(input, output, first, last, g);
+    else pool_channels_last_codes<uint8_t>(input, output, first, last, g);
+}
+
 void sigmoid_codes(const int32_t* x, int32_t* y, int64_t size, float scale, int64_t zp,
                    double output_scale, int64_t output_zp, bool vectorize) {
     using QV = vec::Vectorized<qint32>;
@@ -798,6 +875,7 @@ REGISTER_DISPATCH(quantized_clip_stub, &clip_impl);
 REGISTER_DISPATCH(quantized_prelu_stub, &prelu_impl);
 REGISTER_DISPATCH(quantized_sigmoid_stub, &sigmoid_codes);
 REGISTER_DISPATCH(quantized_moment_stub, &moment_impl);
+REGISTER_DISPATCH(quantized_pool_stub, &pool_impl);
 REGISTER_DISPATCH(quantized_lookup_stub, &lookup_impl);
 REGISTER_DISPATCH(quantized_binary_stub, &binary_impl);
 REGISTER_DISPATCH(quantized_embedding_stub, &embedding_impl);
@@ -817,6 +895,7 @@ ALSO_REGISTER_AVX512_DISPATCH(quantized_clip_stub, &clip_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_prelu_stub, &prelu_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_sigmoid_stub, &sigmoid_codes);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_moment_stub, &moment_impl);
+ALSO_REGISTER_AVX512_DISPATCH(quantized_pool_stub, &pool_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_lookup_stub, &lookup_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_binary_stub, &binary_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_embedding_stub, &embedding_impl);
