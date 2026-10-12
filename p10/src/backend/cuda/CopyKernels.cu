@@ -681,6 +681,17 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
                                   .add_input(src_cuda_tensor)
                                   .build();
         switch (self.dtype()) {
+            // The quantized storage width is known, so no numerical cast is
+            // needed when moving codes between strided views.
+            case DType::QInt8:
+                gpu_kernel_nocast(iter, [] __host__ __device__(int8_t v) { return v; });
+                break;
+            case DType::QUInt8:
+                gpu_kernel_nocast(iter, [] __host__ __device__(uint8_t v) { return v; });
+                break;
+            case DType::QInt32:
+                gpu_kernel_nocast(iter, [] __host__ __device__(int32_t v) { return v; });
+                break;
             case DType::ComplexHalf:
                 gpu_kernel(iter, [] __host__ __device__(
                                      tensorplay::complex<Half> v) { return v; });

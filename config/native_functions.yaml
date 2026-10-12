@@ -6971,6 +6971,21 @@
   cpp_no_default_args: ['dtype', 'layout', 'device', 'pin_memory']
 - func: quantized_batch_norm(Tensor input, Tensor? weight, Tensor? bias, Tensor mean, Tensor var, float eps, float output_scale, int output_zero_point) -> Tensor
   variants: function
+- func: quantized_layer_norm(Tensor input, int[] normalized_shape, Tensor? weight, Tensor? bias, float eps, float output_scale, int output_zero_point) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_layer_norm_cpu
+    CUDA: quantized_layer_norm_cuda
+- func: quantized_group_norm(Tensor input, int num_groups, Tensor? weight, Tensor? bias, float eps, float output_scale, int output_zero_point) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_group_norm_cpu
+    CUDA: quantized_group_norm_cuda
+- func: quantized_instance_norm(Tensor input, Tensor? weight, Tensor? bias, float eps, float output_scale, int output_zero_point) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_instance_norm_cpu
+    CUDA: quantized_instance_norm_cuda
 - func: _batch_norm_impl_index(Tensor input, Tensor? weight, Tensor? bias, Tensor? running_mean, Tensor? running_var, bool training, float momentum, float eps, bool cudnn_enabled) -> (Tensor, Tensor, Tensor, Tensor, int)
   variants: function
   tags: maybe_aliasing_or_mutating

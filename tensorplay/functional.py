@@ -9654,6 +9654,29 @@ def quantized_batch_norm(input, weight, bias, mean, var, eps, output_scale, outp
             return _captured
     return _C.quantized_batch_norm(input, weight, bias, mean, var, eps, output_scale, output_zero_point)
 
+def quantized_layer_norm(input, normalized_shape, weight, bias, eps, output_scale, output_zero_point):
+    if _capturing():
+        _captured = _capture_call(quantized_layer_norm, (input, normalized_shape, weight, bias, eps, output_scale, output_zero_point), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(normalized_shape, int) and not isinstance(normalized_shape, bool):
+        normalized_shape = [normalized_shape]
+    return _C.quantized_layer_norm(input, normalized_shape, weight, bias, eps, output_scale, output_zero_point)
+
+def quantized_group_norm(input, num_groups, weight, bias, eps, output_scale, output_zero_point):
+    if _capturing():
+        _captured = _capture_call(quantized_group_norm, (input, num_groups, weight, bias, eps, output_scale, output_zero_point), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_group_norm(input, num_groups, weight, bias, eps, output_scale, output_zero_point)
+
+def quantized_instance_norm(input, weight, bias, eps, output_scale, output_zero_point):
+    if _capturing():
+        _captured = _capture_call(quantized_instance_norm, (input, weight, bias, eps, output_scale, output_zero_point), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_instance_norm(input, weight, bias, eps, output_scale, output_zero_point)
+
 def _batch_norm_impl_index(input, weight, bias, running_mean, running_var, training, momentum, eps, cudnn_enabled):
     if _capturing():
         _captured = _capture_call(_batch_norm_impl_index, (input, weight, bias, running_mean, running_var, training, momentum, eps, cudnn_enabled), {})
