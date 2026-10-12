@@ -84,3 +84,15 @@ def test_lookup_cache_distinguishes_activation_parameters():
             y = F.leaky_relu(x, slope, scale, 3)
             expected = torch.ops.quantized.leaky_relu(r, slope, False, scale, 3)
             np.testing.assert_allclose(y.int_repr().numpy(), expected.int_repr().numpy(), atol=1, rtol=0)
+
+
+@pytest.mark.skipif('cuda' not in DEVICES, reason='Requires a CUDA device')
+@pytest.mark.parametrize('dtype', ['int8', 'uint8', 'int16', 'int32', 'int64', 'float16', 'float32', 'float64'])
+@pytest.mark.parametrize('mode', ['reflect', 'replicate', 'circular'])
+def test_padding_preserves_storage_codes(dtype, mode):
+    data = np.arange(50).reshape(2, 5, 5).astype(dtype)
+    x = tp.tensor(data, device='cuda').transpose(1, 2)
+    r = torch.tensor(data).transpose(1, 2)
+    actual = tp.nn.functional.pad(x, (1, 1, 2, 1), mode=mode)
+    expected = torch.nn.functional.pad(r, (1, 1, 2, 1), mode=mode)
+    np.testing.assert_array_equal(actual.cpu().numpy(), expected.numpy())

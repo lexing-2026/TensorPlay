@@ -140,32 +140,35 @@ void pad_mode_check(const char* name, const Tensor& self, const std::vector<int6
     }
 }
 
-// half/bf16 pads move values without arithmetic, so computing them in float32
 Tensor pad_mode_forward(const Tensor& self, const std::vector<int64_t>& pad, int mode) {
+    CUDAGuard guard(self.device());
     Tensor src = self.is_contiguous() ? self : self.contiguous();
-    const bool lowp = src.dtype() == DType::Float16 || src.dtype() == DType::BFloat16;
-    Tensor work = lowp ? src.to(DType::Float32) : src;
-    PadPlan p = make_plan(work, pad);
+    PadPlan p = make_plan(src, pad);
 
     std::vector<int64_t> dst_sizes(p.dst_sizes, p.dst_sizes + p.ndim);
-    Tensor out = Tensor::empty(dst_sizes, work.dtype(), work.device());
+    Tensor out = Tensor::empty(dst_sizes, src.dtype(), src.device());
 
     const long long total = p.ndim > 0
         ? static_cast<long long>(p.dst_strides[0]) * p.dst_sizes[0]
         : 1;
     const int threads = 256;
     const int blocks = static_cast<int>((total + threads - 1) / threads);
-    if (work.dtype() == DType::Float64) {
-        pad_gather_kernel<double><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-            work.data_ptr<double>(), out.data_ptr<double>(), p, mode);
-    } else {
-        pad_gather_kernel<float><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-            work.data_ptr<float>(), out.data_ptr<float>(), p, mode);
+    if (total == 0) return out;
+    // Padding moves element bit patterns without arithmetic. Dispatch by
+    // storage width to preserve integer codes and floating payloads exactly.
+    const auto stream = getCurrentCUDAStream().stream();
+    switch (elementSize(src.dtype())) {
+        case 1: pad_gather_kernel<uint8_t><<<blocks,threads,0,stream>>>(static_cast<const uint8_t*>(src.data_ptr()),static_cast<uint8_t*>(out.data_ptr()),p,mode); break;
+        case 2: pad_gather_kernel<uint16_t><<<blocks,threads,0,stream>>>(static_cast<const uint16_t*>(src.data_ptr()),static_cast<uint16_t*>(out.data_ptr()),p,mode); break;
+        case 4: pad_gather_kernel<uint32_t><<<blocks,threads,0,stream>>>(static_cast<const uint32_t*>(src.data_ptr()),static_cast<uint32_t*>(out.data_ptr()),p,mode); break;
+        case 8: pad_gather_kernel<uint64_t><<<blocks,threads,0,stream>>>(static_cast<const uint64_t*>(src.data_ptr()),static_cast<uint64_t*>(out.data_ptr()),p,mode); break;
+        case 16: pad_gather_kernel<ulonglong2><<<blocks,threads,0,stream>>>(static_cast<const ulonglong2*>(src.data_ptr()),static_cast<ulonglong2*>(out.data_ptr()),p,mode); break;
+        default: TP_THROW(TypeError, "Unsupported padding storage width");
     }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
         TP_THROW(RuntimeError, std::string("pad CUDA: ") + cudaGetErrorString(err));
-    return lowp ? out.to(src.dtype()) : out;
+    return out;
 }
 
 Tensor pad_mode_backward(const Tensor& grad_output, const Tensor& self,
