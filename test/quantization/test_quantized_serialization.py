@@ -108,3 +108,17 @@ def test_legacy_object_state_observes_loaded_grid():
         restored = tp.load(stream)
     assert restored.scales == [.125, .25]
     assert _QuantizedGridState.restores == 1
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_quantized_tensor_dictionary_key_and_offset(legacy):
+    q = tp._C.quantize_per_tensor(tp.tensor([1., 2., 3.]), .1, 0, tp.qint8)
+    stream = io.BytesIO()
+    tp.save({q: {'weight': q, 'view': q[1:]}}, stream, _use_new_zipfile_serialization=not legacy)
+    stream.seek(0)
+    restored = tp.load(stream)
+    key = next(iter(restored))
+    assert key is restored[key]['weight']
+    view = restored[key]['view']
+    assert view.storage_offset() == 1
+    np.testing.assert_array_equal(view.int_repr().numpy(), q.int_repr().numpy()[1:])

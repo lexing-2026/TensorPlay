@@ -38,6 +38,9 @@ _WeightsOnlyUnpickler = WeightsOnlyUnpickler
 
 
 class _MetadataObject(dict):
+    __hash__ = object.__hash__
+    __eq__ = object.__eq__
+
     def append(self, value):
         pass
 
