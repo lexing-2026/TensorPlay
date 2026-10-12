@@ -13,10 +13,14 @@ namespace tensorplay::quant::TP_QN_DETAIL {
 struct RecurrentLinear {
     Tensor weight, packed, offsets, scales, zps;
     std::optional<Tensor> bias;
-    explicit RecurrentLinear(const Tensor& w, const Tensor& b) : weight(w), bias(b.defined() ? std::optional<Tensor>(b) : std::nullopt) {
+    explicit RecurrentLinear(const Tensor& w, const Tensor& b, const Tensor* storage=nullptr) : weight(w), bias(b.defined() ? std::optional<Tensor>(b) : std::nullopt) {
         TP_CHECK(w.dim() == 2, "Recurrent weights must be matrices");
         if (w.dtype() == DType::Float16) return;
         TP_CHECK(w.dtype() == DType::QInt8 && w.impl()->quantizer(), "Recurrent weights require signed integer grids or half storage");
+        if (storage) {
+            packed=storage[0]; offsets=storage[1]; scales=storage[2]; zps=storage[3];
+            return;
+        }
         struct CachedWeight { Tensor source, packed, offsets; uint32_t version=0; uintptr_t stream=0; };
         thread_local std::array<CachedWeight,16> cache;
         thread_local size_t next=0;
@@ -122,11 +126,12 @@ std::tuple<Tensor,Tensor> recurrent_cell(const Tensor& input, const Tensor& hidd
     return recurrent_step(ih(input,reduce_range),hh(hidden,reduce_range),hidden,cell.value_or(Tensor()),mode);
 }
 
-std::tuple<Tensor,Tensor,Tensor> recurrent(const Tensor& input, const Tensor& hidden,
+std::tuple<Tensor,Tensor,Tensor> recurrent_impl(const Tensor& input, const Tensor& hidden,
         const std::optional<Tensor>& cell, const std::vector<Tensor>& weights,
         const std::vector<Tensor>& biases, int64_t layers, double dropout,
         bool training, bool bidirectional, bool batch_first, int64_t mode,
-        bool reduce_range, const std::optional<Tensor>& batch_sizes) {
+        bool reduce_range, const std::optional<Tensor>& batch_sizes,
+        const std::vector<Tensor>& storage, const std::vector<bool>& ranges) {
     Guard guard(input);
     TP_CHECK(mode >= 0 && mode <= 3 && layers > 0 && dropout >= 0 && dropout <= 1, "Invalid recurrent configuration");
     const int64_t directions = bidirectional ? 2 : 1, gates = mode == 2 ? 4 : mode == 3 ? 3 : 1;
@@ -135,6 +140,9 @@ std::tuple<Tensor,Tensor,Tensor> recurrent(const Tensor& input, const Tensor& hi
         && input.device() == hidden.device() && input.dim() == (packed ? 2 : 3), "Recurrent sequence and states require compatible floating storage");
     TP_CHECK(hidden.size(0) == layers * directions && weights.size() == static_cast<size_t>(2 * layers * directions)
         && (biases.empty() || biases.size() == weights.size()), "Recurrent layer, direction and parameter counts do not match");
+    TP_CHECK((storage.empty() || storage.size()==weights.size()*4) &&
+        (ranges.empty() || ranges.size()==static_cast<size_t>(layers*directions)),
+        "Recurrent packed storage and range flags must match the parameter count");
     TP_CHECK(mode != 2 || (cell && cell->shape() == hidden.shape() && cell->dtype() == DType::Float32 && cell->device() == input.device()), "Long-memory recurrence requires matching cell states");
     Tensor source = packed || !batch_first ? input.contiguous() : input.transpose(0,1).contiguous();
     const int64_t width = hidden.size(2), batch = hidden.size(1);
@@ -163,16 +171,17 @@ std::tuple<Tensor,Tensor,Tensor> recurrent(const Tensor& input, const Tensor& hi
                 && weights[p].size(1) == source.size(source.dim()-1) && weights[p+1].size(0) == gates*width && weights[p+1].size(1) == width,
                 "Recurrent sequence weight dimensions do not match layer widths");
             TP_CHECK(weights[p].device() == input.device() && weights[p+1].device() == input.device(), "Recurrent weights must share the sequence device");
-            RecurrentLinear ih(weights[p],biases.empty()?Tensor():biases[p]);
-            RecurrentLinear hh(weights[p+1],biases.empty()?Tensor():biases[p+1]);
-            Tensor input_gates = ih(source,reduce_range);
+            RecurrentLinear ih(weights[p],biases.empty()?Tensor():biases[p],storage.empty()?nullptr:storage.data()+4*p);
+            RecurrentLinear hh(weights[p+1],biases.empty()?Tensor():biases[p+1],storage.empty()?nullptr:storage.data()+4*(p+1));
+            const bool range=ranges.empty() ? reduce_range : ranges[state];
+            Tensor input_gates = ih(source,range);
             Tensor h = hidden.select(0,state).clone(), c = mode == 2 ? cell->select(0,state).clone() : Tensor();
             for (int64_t iteration = 0; iteration < steps; ++iteration) {
                 const int64_t t = dir == 0 ? iteration : steps-1-iteration, current = sizes[t];
                 Tensor active_h = packed ? h.narrow(0,0,current) : h;
                 Tensor active_c = mode == 2 ? (packed ? c.narrow(0,0,current) : c) : Tensor();
                 Tensor a = packed ? input_gates.narrow(0,offsets[t],current) : input_gates.select(0,t);
-                auto [new_h,new_c] = recurrent_step(a,hh(active_h,reduce_range),active_h,active_c,mode);
+                auto [new_h,new_c] = recurrent_step(a,hh(active_h,range),active_h,active_c,mode);
                 if (packed) { h.narrow(0,0,current).copy_(new_h); if (mode == 2) c.narrow(0,0,current).copy_(new_c); }
                 else { h = new_h; if (mode == 2) c = new_c; }
                 Tensor out = packed ? layer_output.narrow(0,offsets[t],current) : layer_output.select(0,t);
@@ -186,6 +195,15 @@ std::tuple<Tensor,Tensor,Tensor> recurrent(const Tensor& input, const Tensor& hi
     }
     if (!packed && batch_first) source = source.transpose(0,1);
     return {source,hy,cy};
+}
+
+std::tuple<Tensor,Tensor,Tensor> recurrent(const Tensor& input, const Tensor& hidden,
+        const std::optional<Tensor>& cell, const std::vector<Tensor>& weights,
+        const std::vector<Tensor>& biases, int64_t layers, double dropout,
+        bool training, bool bidirectional, bool batch_first, int64_t mode,
+        bool reduce_range, const std::optional<Tensor>& batch_sizes) {
+    return recurrent_impl(input,hidden,cell,weights,biases,layers,dropout,training,
+        bidirectional,batch_first,mode,reduce_range,batch_sizes,{},{});
 }
 }
 #undef TP_QR_FN

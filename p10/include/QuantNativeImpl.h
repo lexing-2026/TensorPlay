@@ -621,6 +621,15 @@ Tensor int4_mm_tensor_group(const Tensor& input,const Tensor& weight,const Tenso
 #include "QuantWrappedImpl.h"
 namespace tensorplay::quant {
 
+std::tuple<Tensor,Tensor,Tensor> TP_QN_NAME(recurrent_packed)(const Tensor& input,
+        const Tensor& hidden,const std::optional<Tensor>& cell,const std::vector<Tensor>& weights,
+        const std::vector<Tensor>& biases,const std::vector<Tensor>& storage,const std::vector<bool>& ranges,
+        int64_t layers,double dropout,bool training,bool bidirectional,bool batch_first,
+        int64_t mode,const std::optional<Tensor>& batch_sizes) {
+    return TP_QN_DETAIL::recurrent_impl(input,hidden,cell,weights,biases,layers,dropout,
+        training,bidirectional,batch_first,mode,false,batch_sizes,storage,ranges);
+}
+
 Tensor TP_QN_NAME(batch_norm)(const Tensor& input, const std::optional<Tensor>& weight,
         const std::optional<Tensor>& bias, const Tensor& mean, const Tensor& var,
         double eps, double scale, int64_t zp, bool relu) {

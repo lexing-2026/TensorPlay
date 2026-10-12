@@ -538,3 +538,66 @@ def test_recurrent_inference_weights_remain_live_after_mutation(device):
             expected = torch.ops.quantized.quantized_rnn_tanh_cell_dynamic(
                 torch.tensor(x), torch.tensor(h), pi, ph, torch.tensor(bias), torch.tensor(bias))
             np.testing.assert_allclose(actual.cpu().numpy(), expected.numpy(), atol=2e-6, rtol=2e-5)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('mode,name,gates', [(2,'lstm',4),(3,'gru',3)])
+@pytest.mark.parametrize('half', [False,True])
+@pytest.mark.parametrize('packed', [False,True])
+@pytest.mark.parametrize('bidirectional', [False,True])
+def test_native_sequence_accepts_persistent_cell_params(device,mode,name,gates,half,packed,bidirectional):
+    rng=np.random.default_rng(130)
+    layers,width,batch,features=2,5,3,7
+    directions=2 if bidirectional else 1
+    data=rng.normal(0,.2,size=(9,features) if packed else (batch,4,features)).astype('float32')
+    hidden=rng.normal(0,.2,size=(layers*directions,batch,width)).astype('float32')
+    cell=rng.normal(0,.2,size=hidden.shape).astype('float32')
+    params,reference_params=[],[]
+    for state in range(layers*directions):
+        size=features if state//directions==0 else width*directions
+        wi=rng.normal(0,.2,size=(gates*width,size)).astype('float32')
+        wh=rng.normal(0,.2,size=(gates*width,width)).astype('float32')
+        bi=rng.normal(0,.1,size=gates*width).astype('float32')
+        bh=rng.normal(0,.1,size=gates*width).astype('float32')
+        if half:
+            pi=tp.ops.quantized.linear_prepack_fp16(tp.tensor(wi,device=device),tp.tensor(bi,device=device))
+            ph=tp.ops.quantized.linear_prepack_fp16(tp.tensor(wh,device=device),tp.tensor(bh,device=device))
+            ri=torch.ops.quantized.linear_prepack_fp16(torch.tensor(wi),torch.tensor(bi))
+            rh=torch.ops.quantized.linear_prepack_fp16(torch.tensor(wh),torch.tensor(bh))
+            params.append(tp.ops.quantized.make_quantized_cell_params_fp16(pi,ph))
+            reference_params.append(torch.ops.quantized.make_quantized_cell_params_fp16(ri,rh))
+        else:
+            qi,ri=pair(np.rint(wi/.005).clip(-128,127),'int8',device,scale=.005,zp=0)
+            qh,rh=pair(np.rint(wh/.005).clip(-128,127),'int8',device,scale=.005,zp=0)
+            pi=tp.ops.quantized.linear_prepack(qi,tp.tensor(bi,device=device))
+            ph=tp.ops.quantized.linear_prepack(qh,tp.tensor(bh,device=device))
+            ri=torch.ops.quantized.linear_prepack(ri,torch.tensor(bi))
+            rh=torch.ops.quantized.linear_prepack(rh,torch.tensor(bh))
+            params.append(tp.ops.quantized.make_quantized_cell_params_dynamic(
+                pi,ph,tp.tensor(bi,device=device),tp.tensor(bh,device=device),bool(state%2)))
+            reference_params.append(torch.ops.quantized.make_quantized_cell_params_dynamic(
+                ri,rh,torch.tensor(bi),torch.tensor(bh),bool(state%2)))
+    hx=[tp.tensor(hidden,device=device),tp.tensor(cell,device=device)] if mode==2 else tp.tensor(hidden,device=device)
+    rhx=[torch.tensor(hidden),torch.tensor(cell)] if mode==2 else torch.tensor(hidden)
+    op=getattr(tp.ops.tp,'quantized_'+name)
+    reference=getattr(torch.ops.aten,'quantized_'+name)
+    extra={'dtype':tp.float16 if half else tp.qint8,'use_dynamic':not half} if mode==2 else {}
+    rextra={'dtype':torch.float16 if half else torch.qint8,'use_dynamic':not half} if mode==2 else {}
+    if packed:
+        bs=tp.tensor([3,3,2,1],dtype=tp.int64)
+        rbs=torch.tensor([3,3,2,1])
+        args=(tp.tensor(data,device=device),bs,hx,params,True,layers,0.,False,bidirectional)
+        actual=op.data(*args,**extra)
+        expected=reference.data(torch.tensor(data),rbs,rhx,reference_params,True,layers,0.,False,bidirectional,**rextra)
+    else:
+        args=(tp.tensor(data,device=device),hx,params,True,layers,0.,False,bidirectional,True)
+        actual=op.input(*args,**extra)
+        expected=reference.input(torch.tensor(data),rhx,reference_params,True,layers,0.,False,bidirectional,True,**rextra)
+    for a,b in zip(actual,expected):
+        np.testing.assert_allclose(a.cpu().numpy(),b.numpy(),atol=3e-6,rtol=3e-5)
+    top=getattr(tp,'quantized_'+name)(*args,**extra)
+    for a,b in zip(top,actual):
+        np.testing.assert_array_equal(a.cpu().numpy(),b.cpu().numpy())
+    for overload in ('input_legacy','data_legacy'):
+        with pytest.raises(RuntimeError):
+            getattr(op,overload)(*args,**extra)

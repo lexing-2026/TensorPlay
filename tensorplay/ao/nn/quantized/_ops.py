@@ -205,6 +205,50 @@ def _cell_params_float(wi,wh,bi,bh):
         PackedWeight(_C.quantize_per_tensor_dynamic(wh,tp.qint8,False),bh),bi,bh,False)
 
 
+def _recurrent_sequence(mode,input,hx,params,has_biases,num_layers,dropout,train,
+                        bidirectional,batch_first=False,batch_sizes=None,dtype=None,use_dynamic=False):
+    h,c=hx if mode==2 else (hx,None)
+    if mode==2 and batch_sizes is None:
+        if not has_biases:
+            raise ValueError('Long-memory quantized sequences require biases')
+        if dtype not in (None,tp.int8,tp.qint8,tp.float16):
+            raise ValueError('Unsupported recurrent weight dtype')
+    weights,biases,storage,ranges=[],[],[],[]
+    for param in params:
+        if not isinstance(param,CellParams):
+            raise TypeError('Quantized sequences require packed cell parameters')
+        ranges.append(param.reduce_range)
+        for linear in (param.wi,param.wh):
+            weight,bias=linear._weight_bias()
+            weights.append(weight)
+            biases.append(bias)
+            if isinstance(linear,PackedWeight):
+                storage.extend((linear.packed,linear.offsets,linear.scales,linear.zero_points))
+            else:
+                storage.extend((weight,weight,weight,weight))
+    output,hy,cy=_C._quantized_recurrent_packed(input,h,c,weights,biases,storage,ranges,
+        num_layers,dropout,train,bidirectional,batch_first,mode,batch_sizes)
+    return (output,hy,cy) if mode==2 else (output,hy)
+
+
+def _recurrent_sequence_data(mode,data,batch_sizes,hx,params,has_biases,num_layers,
+                             dropout,train,bidirectional,**kwargs):
+    return _recurrent_sequence(mode,data,hx,params,has_biases,num_layers,dropout,train,
+        bidirectional,batch_sizes=batch_sizes,**kwargs)
+
+
+def quantized_lstm(input,*args,**kwargs):
+    if args and isinstance(args[0],tp.Tensor):
+        return _recurrent_sequence_data(2,input,*args,**kwargs)
+    return _recurrent_sequence(2,input,*args,**kwargs)
+
+
+def quantized_gru(input,*args,**kwargs):
+    if args and isinstance(args[0],tp.Tensor) and args[0].dtype==tp.int64:
+        return _recurrent_sequence_data(3,input,*args,**kwargs)
+    return _recurrent_sequence(3,input,*args,**kwargs)
+
+
 _packets = None
 
 
@@ -292,6 +336,10 @@ def _build_packets():
     add('make_quantized_cell_params',_cell_params_float)
     for mode,name in ((0,'rnn_relu'),(1,'rnn_tanh'),(2,'lstm'),(3,'gru')):
         add('quantized_'+name+'_cell_dynamic',partial(_recurrent_cell,mode))
+    for mode,name in ((2,'lstm'),(3,'gru')):
+        full=partial(_recurrent_sequence,mode)
+        add('quantized_'+name,full,input=full,data=partial(_recurrent_sequence_data,mode),
+            input_legacy=_legacy,data_legacy=_legacy)
     return entries
 
 
