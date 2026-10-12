@@ -1521,6 +1521,9 @@ Tensor Tensor::to(Device device, bool non_blocking, bool copy) const {
     }
     Tensor t = ops::empty(
         impl_->sizes(), dtype(), device, /*pin_memory=*/false);
+    if (subByteElementPerByte(dtype())>1) {
+        t=t.as_strided(shape(),strides(),0);
+    }
     t.copy_(*this, non_blocking);
     if (impl_->has_quantizer()) {
         t.unsafeGetTensorImpl()->set_quantizer(
@@ -1557,7 +1560,12 @@ Tensor Tensor::to(Device device, DType dtype, bool non_blocking, bool copy) cons
     }
     Tensor t = ops::empty(
         impl_->sizes(), dtype, device, /*pin_memory=*/false);
+    const bool packed=subByteElementPerByte(this->dtype())>1 && dtype==this->dtype();
+    if (packed) t=t.as_strided(shape(),strides(),0);
     t.copy_(*this, non_blocking);
+    if (packed && impl_->has_quantizer()) {
+        t.unsafeGetTensorImpl()->set_quantizer(quantizer_on_device(impl_->quantizer(),device));
+    }
     return t;
 }
 

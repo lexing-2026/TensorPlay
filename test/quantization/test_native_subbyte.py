@@ -51,7 +51,9 @@ def test_subbyte_channels_last_layout_clone_transfer_and_checkpoint(device,bits,
     stream=io.BytesIO()
     tp.save(actual,stream)
     stream.seek(0)
-    for result in (actual,actual.clone(),actual.cpu(),tp.load(stream)):
+    for result in (actual,actual.clone(),actual.cpu(),
+                   actual.to(device='cpu',dtype=dtype,copy=True),
+                   actual.to(memory_format=tp.preserve_format,copy=True),tp.load(stream)):
         assert tuple(result.stride())==tuple(expected.stride())
         np.testing.assert_array_equal(result.int_repr().cpu().numpy(),expected_bytes)
         decoded=result.dequantize()
