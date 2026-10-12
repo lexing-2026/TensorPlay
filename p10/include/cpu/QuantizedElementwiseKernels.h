@@ -43,8 +43,9 @@ DECLARE_DISPATCH(quantized_pool_fn, quantized_pool_stub)
 using quantized_prelu_fn = void (*)(const void*, const void*, void*, int64_t, bool, DType,
     int64_t, int64_t, int64_t, int64_t, float);
 DECLARE_DISPATCH(quantized_prelu_fn, quantized_prelu_stub)
-using quantized_sigmoid_fn = void (*)(const int32_t*, int32_t*, int64_t, float, int64_t, double, int64_t, bool);
-DECLARE_DISPATCH(quantized_sigmoid_fn, quantized_sigmoid_stub)
+using quantized_word_activation_fn = void (*)(const int32_t*, int32_t*, int64_t, float, int64_t, double, int64_t, bool);
+DECLARE_DISPATCH(quantized_word_activation_fn, quantized_sigmoid_stub)
+DECLARE_DISPATCH(quantized_word_activation_fn, quantized_tanh_stub)
 using quantized_clip_fn = void (*)(const void*, void*, int64_t, DType, int64_t, int64_t);
 using quantized_lookup_fn = void (*)(const uint8_t*, uint8_t*, int64_t, const float*);
 using quantized_binary_fn = void (*)(const void*, const void*, void*, int64_t, DType,

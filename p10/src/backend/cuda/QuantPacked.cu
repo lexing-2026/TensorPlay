@@ -5,6 +5,7 @@
 #include "CUDAContext.h"
 #include "QuantElementwise.h"
 #include "DispatchStub.h"
+#include "QuantizedActivationMath.cuh"
 #include <cuda_runtime.h>
 #include <array>
 
@@ -12,6 +13,7 @@ namespace tensorplay::cuda {
 namespace {
 
 __device__ float sigmoid_exponential(float d) {
+    if (d != d) return d;
     if (d < -104.f) return 0.f;
     if (d > 100.f) return CUDART_INF_F;
     const int q = __float2int_rn(__fmul_rn(d, 1.4426950408889634f));
@@ -31,18 +33,105 @@ __device__ float sigmoid_exponential(float d) {
     return __fmul_rn(__fmul_rn(u, a), b);
 }
 
-__global__ void sigmoid_word_codes(const int32_t* input, int32_t* output, int64_t size,
-        float scale, int64_t zp, float inverse_scale, int64_t output_zp, int64_t vector_end) {
+struct ActivationPair { float high, low; };
+
+__device__ ActivationPair activation_pair_add(ActivationPair x, float y) {
+    const float sum = __fadd_rn(x.high, y);
+    const float v = __fsub_rn(sum, x.high);
+    const float error = __fadd_rn(__fsub_rn(x.high, __fsub_rn(sum, v)), __fsub_rn(y, v));
+    return {sum, __fadd_rn(error, x.low)};
+}
+
+__device__ ActivationPair activation_pair_add(ActivationPair x, ActivationPair y) {
+    const float sum = __fadd_rn(x.high, y.high);
+    const float v = __fsub_rn(sum, x.high);
+    const float error = __fadd_rn(__fsub_rn(x.high, __fsub_rn(sum, v)), __fsub_rn(y.high, v));
+    return {sum, __fadd_rn(error, __fadd_rn(x.low, y.low))};
+}
+
+__device__ ActivationPair activation_pair_ordered_add(ActivationPair x, ActivationPair y) {
+    const float sum = __fadd_rn(x.high, y.high);
+    return {sum, __fadd_rn(__fadd_rn(__fadd_rn(__fsub_rn(x.high, sum), y.high), x.low), y.low)};
+}
+
+__device__ ActivationPair activation_pair_multiply(ActivationPair x, float y) {
+    const float product = __fmul_rn(x.high, y);
+    return {product, __fmaf_rn(x.low, y, __fmaf_rn(x.high, y, -product))};
+}
+
+__device__ ActivationPair activation_pair_multiply(ActivationPair x, ActivationPair y) {
+    const float product = __fmul_rn(x.high, y.high);
+    return {product, __fmaf_rn(x.high, y.low, __fmaf_rn(x.low, y.high, __fmaf_rn(x.high, y.high, -product)))};
+}
+
+__device__ ActivationPair activation_pair_square(ActivationPair x) {
+    const float product = __fmul_rn(x.high, x.high);
+    return {product, __fmaf_rn(__fadd_rn(x.high, x.high), x.low, __fmaf_rn(x.high, x.high, -product))};
+}
+
+__device__ ActivationPair activation_pair_reciprocal(ActivationPair x) {
+    const float reciprocal = __fdiv_rn(1.f, x.high);
+    return {reciprocal, __fmul_rn(reciprocal,
+        __fmaf_rn(-x.low, reciprocal, __fmaf_rn(-x.high, reciprocal, 1.f)))};
+}
+
+__device__ ActivationPair activation_pair_divide(ActivationPair numerator, ActivationPair denominator) {
+    const float reciprocal = __fdiv_rn(1.f, denominator.high);
+    const float quotient = __fmul_rn(numerator.high, reciprocal);
+    const float error = __fmaf_rn(reciprocal, numerator.high, -quotient);
+    const float residual = __fmaf_rn(-denominator.low, reciprocal,
+        __fmaf_rn(-denominator.high, reciprocal, 1.f));
+    return {quotient, __fmaf_rn(quotient, residual, __fmaf_rn(numerator.low, reciprocal, error))};
+}
+
+__device__ float tanh_vector_value(float x) {
+    if (x != x) return x;
+    const float magnitude = ::fabsf(x);
+    if (magnitude > 8.664339742f) return ::copysignf(1.f, x);
+    const int q = __float2int_rn(__fmul_rn(magnitude, 1.4426950408889634f));
+    ActivationPair s = activation_pair_add({magnitude, 0.f}, __fmul_rn(static_cast<float>(q), -.693145751953125f));
+    s = activation_pair_add(s, __fmul_rn(static_cast<float>(q), -1.428606765330187045e-6f));
+    float u = .1980960224e-3f;
+    u = __fmaf_rn(u, s.high, .1394256484e-2f);
+    u = __fmaf_rn(u, s.high, .8333456703e-2f);
+    u = __fmaf_rn(u, s.high, .4166637361e-1f);
+    auto t = activation_pair_add(activation_pair_multiply(s, u), .166666659414234245f);
+    t = activation_pair_add(activation_pair_multiply(s, t), .5f);
+    t = activation_pair_add(s, activation_pair_multiply(activation_pair_square(s), t));
+    const float sum = __fadd_rn(1.f, t.high);
+    t = {sum, __fadd_rn(__fadd_rn(__fsub_rn(1.f, sum), t.high), t.low)};
+    const int half = q >> 1;
+    const float a = __int_as_float((half + 127) << 23);
+    const float b = __int_as_float((q - half + 127) << 23);
+    t = {__fmul_rn(__fmul_rn(t.high, a), b), __fmul_rn(__fmul_rn(t.low, a), b)};
+    const auto reciprocal = activation_pair_reciprocal(t);
+    const auto result = activation_pair_divide(
+        activation_pair_ordered_add(t, {-reciprocal.high, -reciprocal.low}),
+        activation_pair_ordered_add(t, reciprocal));
+    return ::copysignf(__fadd_rn(result.high, result.low), x);
+}
+
+__global__ void word_activation_codes(const int32_t* input, int32_t* output, int64_t size,
+        float scale, int64_t zp, float inverse_scale, int64_t output_zp, int64_t vector_end,
+        bool hyperbolic) {
     for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          i < size; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
         float value;
         if (i < vector_end) {
-            const float real = __fmul_rn(__fsub_rn(__int2float_rn(input[i]), static_cast<float>(zp)), scale);
-            value = __fdiv_rn(1.f, __fadd_rn(1.f, sigmoid_exponential(-real)));
+            if (hyperbolic) {
+                const float real = __fmaf_rn(scale, __int2float_rn(input[i]), __fmul_rn(scale, -static_cast<float>(zp)));
+                value = tanh_vector_value(real);
+            } else {
+                const float real = __fmul_rn(__fsub_rn(__int2float_rn(input[i]), static_cast<float>(zp)), scale);
+                value = __fdiv_rn(1.f, __fadd_rn(1.f, sigmoid_exponential(-real)));
+            }
         } else {
             const float real = static_cast<float>((static_cast<double>(input[i]) - zp) * scale);
-            const float exponential = static_cast<float>(::exp(-static_cast<double>(real)));
-            value = static_cast<float>(1. / (1. + static_cast<double>(exponential)));
+            if (hyperbolic) value = activation_math::tanh_scalar(real);
+            else {
+                const float exponential = static_cast<float>(::exp(-static_cast<double>(real)));
+                value = static_cast<float>(1. / (1. + static_cast<double>(exponential)));
+            }
         }
         output[i] = quant::encode<int32_t>(value, inverse_scale, output_zp);
     }
@@ -97,15 +186,15 @@ Tensor activation(const Tensor& input, double scale, int64_t zp, quant::Activati
                 case DType::QInt32: clip.template operator()<int32_t>(); break;
                 default: TP_THROW(TypeError, "Clipping requires quantized integer input");
             }
-        } else if (fn.op == 4 && input.dtype() == DType::QInt32) {
+        } else if ((fn.op == 4 || fn.op == 5) && input.dtype() == DType::QInt32) {
             int lanes = 8;
 #if defined(__x86_64__) || defined(_M_X64)
             if (cpu::get_cpu_capability() == cpu::CPUCapability::AVX512) lanes = 16;
 #endif
             const int64_t vector_end = input.impl()->is_contiguous_in(format)
                 ? input.numel() / (2 * lanes) * (2 * lanes) : 0;
-            sigmoid_word_codes<<<blocks,256,0,stream>>>(x.data_ptr<int32_t>(), out.data_ptr<int32_t>(),
-                input.numel(), xs, xz, inverse_scale, zp, vector_end);
+            word_activation_codes<<<blocks,256,0,stream>>>(x.data_ptr<int32_t>(), out.data_ptr<int32_t>(),
+                input.numel(), xs, xz, inverse_scale, zp, vector_end, fn.op == 5);
         } else switch (input.dtype()) {
             case DType::QInt8: activation_codes<<<blocks,256,0,stream>>>(x.data_ptr<int8_t>(),out.data_ptr<int8_t>(),input.numel(),xs,xz,inverse_scale,zp,fn); break;
             case DType::QUInt8: activation_codes<<<blocks,256,0,stream>>>(x.data_ptr<uint8_t>(),out.data_ptr<uint8_t>(),input.numel(),xs,xz,inverse_scale,zp,fn); break;

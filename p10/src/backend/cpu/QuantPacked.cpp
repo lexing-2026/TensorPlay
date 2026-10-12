@@ -96,10 +96,13 @@ Tensor activation_cpu(const Tensor& input, double scale, int64_t zp, Activation 
         const auto* src = x.data_ptr<int32_t>();
         auto* dst = out.data_ptr<int32_t>();
         parallel::parallel_for(0, input.numel(), 32768, [&](int64_t begin, int64_t end) {
-            if (fn.op == 4) {
-                cpu::quantized_sigmoid_stub(DeviceType::CPU, src + begin, dst + begin,
-                    end - begin, input_scale, input_zp, scale, zp,
-                    input.impl()->is_contiguous_in(format));
+            if (fn.op == 4 || fn.op == 5) {
+                if (fn.op == 4)
+                    cpu::quantized_sigmoid_stub(DeviceType::CPU, src + begin, dst + begin,
+                        end - begin, input_scale, input_zp, scale, zp, input.impl()->is_contiguous_in(format));
+                else
+                    cpu::quantized_tanh_stub(DeviceType::CPU, src + begin, dst + begin,
+                        end - begin, input_scale, input_zp, scale, zp, input.impl()->is_contiguous_in(format));
                 return;
             }
             for (int64_t i = begin; i < end; ++i)
@@ -151,6 +154,7 @@ DEFINE_DISPATCH(quantized_bilinear_stub);
 DEFINE_DISPATCH(quantized_clip_stub);
 DEFINE_DISPATCH(quantized_prelu_stub);
 DEFINE_DISPATCH(quantized_sigmoid_stub);
+DEFINE_DISPATCH(quantized_tanh_stub);
 DEFINE_DISPATCH(quantized_moment_stub);
 DEFINE_DISPATCH(quantized_pool_stub);
 DEFINE_DISPATCH(quantized_lookup_stub);

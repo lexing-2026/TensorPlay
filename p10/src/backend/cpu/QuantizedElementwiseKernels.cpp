@@ -682,17 +682,23 @@ void pool_impl(const void* input, void* output, int64_t first, int64_t last, DTy
     else pool_channels_last_codes<uint8_t>(input, output, first, last, g);
 }
 
-void sigmoid_codes(const int32_t* x, int32_t* y, int64_t size, float scale, int64_t zp,
+template<bool Hyperbolic>
+void word_activation_codes(const int32_t* x, int32_t* y, int64_t size, float scale, int64_t zp,
                    double output_scale, int64_t output_zp, bool vectorize) {
     using QV = vec::Vectorized<qint32>;
     using FV = vec::Vectorized<float>;
     const FV input_scale(scale), input_zero(static_cast<float>(zp)), one(1.f);
+    const FV scaled_zero = input_scale * input_zero.neg();
     const float inverse = 1.f / static_cast<float>(output_scale);
     const int64_t vector_end = vectorize ? size / (2 * QV::size()) * (2 * QV::size()) : 0;
     int64_t i = 0;
     for (; i < vector_end; i += QV::size()) {
-        auto values = QV::loadu(x + i).dequantize(input_scale, input_zero);
-        for (auto& value : values) value = (one + value.neg().exp()).reciprocal();
+        auto values = Hyperbolic ? QV::loadu(x + i).dequantize(input_scale, input_zero, scaled_zero)
+                                 : QV::loadu(x + i).dequantize(input_scale, input_zero);
+        for (auto& value : values) {
+            if constexpr (Hyperbolic) value = value.tanh();
+            else value = (one + value.neg().exp()).reciprocal();
+        }
         alignas(64) float real[QV::size()];
         values[0].store(real);
         for (int lane = 0; lane < QV::size(); ++lane)
@@ -700,7 +706,7 @@ void sigmoid_codes(const int32_t* x, int32_t* y, int64_t size, float scale, int6
     }
     for (; i < size; ++i) {
         const float real = static_cast<float>((static_cast<double>(x[i]) - zp) * scale);
-        const float value = static_cast<float>(1.0f / (1.0 + std::exp(-real)));
+        const float value = Hyperbolic ? std::tanh(real) : static_cast<float>(1.0f / (1.0 + std::exp(-real)));
         y[i] = quant::encode<int32_t>(value, inverse, output_zp);
     }
 }
@@ -873,7 +879,8 @@ REGISTER_DISPATCH(quantized_batch_norm_stub, &batch_norm_impl);
 REGISTER_DISPATCH(quantized_bilinear_stub, &bilinear_impl);
 REGISTER_DISPATCH(quantized_clip_stub, &clip_impl);
 REGISTER_DISPATCH(quantized_prelu_stub, &prelu_impl);
-REGISTER_DISPATCH(quantized_sigmoid_stub, &sigmoid_codes);
+REGISTER_DISPATCH(quantized_sigmoid_stub, &word_activation_codes<false>);
+REGISTER_DISPATCH(quantized_tanh_stub, &word_activation_codes<true>);
 REGISTER_DISPATCH(quantized_moment_stub, &moment_impl);
 REGISTER_DISPATCH(quantized_pool_stub, &pool_impl);
 REGISTER_DISPATCH(quantized_lookup_stub, &lookup_impl);
@@ -893,7 +900,8 @@ ALSO_REGISTER_AVX512_DISPATCH(quantized_batch_norm_stub, &batch_norm_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_bilinear_stub, &bilinear_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_clip_stub, &clip_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_prelu_stub, &prelu_impl);
-ALSO_REGISTER_AVX512_DISPATCH(quantized_sigmoid_stub, &sigmoid_codes);
+ALSO_REGISTER_AVX512_DISPATCH(quantized_sigmoid_stub, &word_activation_codes<false>);
+ALSO_REGISTER_AVX512_DISPATCH(quantized_tanh_stub, &word_activation_codes<true>);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_moment_stub, &moment_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_pool_stub, &pool_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_lookup_stub, &lookup_impl);

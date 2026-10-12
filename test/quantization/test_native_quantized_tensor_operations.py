@@ -356,12 +356,12 @@ def test_channels_last_activation_prelu_and_moments(device, dtype, zp, rank):
     rfmt = torch.channels_last if rank == 2 else torch.channels_last_3d
     x, r = x.contiguous(memory_format=fmt), r.contiguous(memory_format=rfmt)
     w, rw = pair(device, dtype, zp, shape=(1, 4) + (1,) * rank)
-    for operation, args, rargs in [('relu', (), ()), ('sigmoid', (), ()),
+    for operation, args, rargs in [('relu', (), ()), ('sigmoid', (), ()), ('tanh', (), ()),
                                    ('hardtanh', (-.6, .7), (-.6, .7)),
                                    ('_prelu_kernel', (w,), (rw,))]:
         actual = resolve(tp.ops.tp, operation)(x, *args)
         expected = resolve(torch.ops.aten, operation)(r, *rargs)
-        equal(actual, expected, 1 if operation == 'sigmoid' else 0)
+        equal(actual, expected, 1 if operation in ('sigmoid', 'tanh') else 0)
         assert actual.stride() == expected.stride()
     equal(tp.ops.tp.mean.dim(x, [-1], True), torch.ops.aten.mean.dim(r, [-1], True))
     equal(tp.ops.tp.std.correction(x, [-1], correction=.5, keepdim=True),
@@ -406,11 +406,12 @@ def test_prelu_scalar_and_high_rank_float_weights(device, shape):
 @pytest.mark.parametrize('device', DEVICES)
 @pytest.mark.parametrize('size', [1, 7, 15, 16, 17, 31, 32, 33, 200])
 @pytest.mark.parametrize('strided', [False, True])
-def test_sigmoid_word_vector_blocks_and_scalar_tails(device, size, strided):
+@pytest.mark.parametrize('operation', ['sigmoid', 'tanh'])
+def test_word_activation_vector_blocks_and_scalar_tails(device, size, strided, operation):
     x, r = pair(device, 'int32', -11, shape=(size * (2 if strided else 1),))
     if strided:
         x, r = x[::2], r[::2]
-    equal(tp.ops.tp.sigmoid.default(x), torch.ops.aten.sigmoid.default(r))
+    equal(resolve(tp.ops.tp, operation)(x), resolve(torch.ops.aten, operation)(r))
 
 
 @pytest.mark.parametrize('device', DEVICES)
@@ -432,3 +433,13 @@ def test_pool_channels_last_vector_blocks_and_tails(device, dtype, zp, rank, cha
         x, r = x[..., ::2], r[..., ::2]
         equal(tp.ops.tp.avg_pool3d.default(x, [3] * rank, [2] * rank, [1] * rank),
               torch.ops.aten.avg_pool3d.default(r, [3] * rank, [2] * rank, [1] * rank), 1)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('operation', ['sigmoid', 'tanh'])
+@pytest.mark.parametrize('scale', [.005, .07, .5, 2.])
+def test_word_activation_fine_output_grids(device, operation, scale):
+    codes = np.arange(-256, 256, dtype='int32') - 11
+    x = tp._C._make_per_tensor_quantized_tensor(tp.tensor(codes, device=device), scale, -11)
+    r = torch._make_per_tensor_quantized_tensor(torch.tensor(codes), scale, -11)
+    equal(resolve(tp.ops.tp, operation)(x), resolve(torch.ops.aten, operation)(r))
