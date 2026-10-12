@@ -72,6 +72,9 @@ set(P10_SOURCES
     src/backend/cpu/MiscKernels.cpp
     src/backend/cpu/SegmentReduce.cpp
     src/backend/cpu/SparseSoftMax.cpp
+    src/backend/cpu/SparseBlasKernels.cpp
+    src/backend/cpu/SpmmReduceKernels.cpp
+    src/backend/cpu/SparseSolveKernels.cpp
     # TensorShape.cpp, LinearAlgebra.cpp, TensorFactories.cpp, Itertools.cpp.
     src/backend/cpu/UnaryOps.cpp
     src/backend/cpu/Pooling.cpp
@@ -208,6 +211,9 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/sparse/SparseCsrTensorMathKernels.cu
         src/backend/cuda/sparse/SparseBinaryOpIntersectionKernels.cu
         src/backend/cuda/sparse/SparseMatMulKernels.cu
+        src/backend/cuda/sparse/SparseBlasKernels.cu
+        src/backend/cuda/sparse/SpmmReduceKernels.cu
+        src/backend/cuda/sparse/SparseSolveKernels.cu
         src/backend/cuda/sparse/SparseSoftMaxKernels.cu
         src/backend/cuda/EmbeddingSparseBackwardKernels.cu
         src/backend/cuda/SpdiagsKernels.cu
@@ -643,6 +649,8 @@ set(TP_CPU_KERNEL_SRCS
     src/backend/cpu/PoolingKernelsImpl.cpp
     src/backend/cpu/UpsampleKernelsImpl.cpp
     src/backend/cpu/GridSamplerKernelsImpl.cpp
+    src/backend/cpu/SparseBlasKernelsImpl.cpp
+    src/backend/cpu/SpmmReduceKernelsImpl.cpp
 )
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
     # (TP_CXX_AVX512_FOUND): only build the tier when the compiler accepts
@@ -981,7 +989,7 @@ if(USE_VULKAN)
     add_dependencies(p10 vulkan_spv_gen)
 endif()
 if(USE_CUDA)
-    target_link_libraries(p10 PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cufft CUDA::cusolver CUDA::nvrtc)
+    target_link_libraries(p10 PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cufft CUDA::cusolver CUDA::cusparse CUDA::nvrtc)
     # CUPTI headers live in the toolkit's extras/CUPTI/include, which the
     # plain toolkit include dirs do not cover; the imported target does.
     if(TARGET CUDA::cupti)

@@ -962,6 +962,7 @@ TENSORPLAY_LIBRARY_IMPL(SparseCPU, CopySparseKernels) {
     // that is already sparse.
     m.impl("to_sparse", to_sparse_coo_cpu);
     m.impl("sparse_mm", sparse_mm_cpu);
+    m.impl("_sparse_addmm", _sparse_addmm_cpu);
     m.impl("smm", smm_cpu);
     m.impl("sparse_sum", sparse_sum_cpu);
     m.impl("sparse_add", sparse_add_cpu);

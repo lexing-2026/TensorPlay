@@ -1,4 +1,5 @@
 #include "SparseKernels.h"
+#include "Parallel.h"
 #include "Utils.h"
 
 #include <algorithm>
@@ -1220,6 +1221,145 @@ Tensor smm_cpu(const Tensor& self, const Tensor& mat2) {
     }
     Tensor result = Tensor::empty({0}, self.dtype(), self.device());
     return sparse_sspaddmm_cpu(result, self, mat2, Scalar(0.0), Scalar(1.0));
+}
+
+namespace {
+
+// addmm-style broadcast of the dense seed `input` onto (rows, cols): 0-D/1-D
+// seeds expand along trailing dims and singleton axes get stride 0, so the
+// kernel reads one physical element per broadcast dimension.
+Tensor broadcast_addmm_seed_cpu(const Tensor& input, int64_t rows,
+                                int64_t cols) {
+    if (input.dim() == 2 && input.size(0) == rows && input.size(1) == cols) {
+        return input;
+    }
+    if (input.dim() > 2) {
+        TP_THROW(RuntimeError, "_sparse_addmm: self must be at most 2-D, got ",
+                 input.dim(), "-D");
+    }
+    std::vector<int64_t> sizes = {rows, cols};
+    std::vector<int64_t> strides = {0, 0};
+    if (input.dim() == 2) {
+        if (input.size(0) != 1 && input.size(0) != rows) {
+            TP_THROW(RuntimeError,
+                     "_sparse_addmm: self is not broadcastable to ",
+                     rows, "x", cols);
+        }
+        if (input.size(1) != 1 && input.size(1) != cols) {
+            TP_THROW(RuntimeError,
+                     "_sparse_addmm: self is not broadcastable to ",
+                     rows, "x", cols);
+        }
+        strides[0] = input.size(0) == 1 ? 0 : input.stride(0);
+        strides[1] = input.size(1) == 1 ? 0 : input.stride(1);
+    } else if (input.dim() == 1) {
+        if (input.size(0) != 1 && input.size(0) != cols) {
+            TP_THROW(RuntimeError,
+                     "_sparse_addmm: self is not broadcastable to ",
+                     rows, "x", cols);
+        }
+        strides[1] = input.size(0) == 1 ? 0 : input.stride(0);
+    }
+    return input.as_strided(sizes, strides);
+}
+
+} // namespace
+
+// Dense-seeded sparse @ dense: out = beta * self + alpha * (mat1 @ mat2),
+// where mat1 is a 2-D sparse COO/CSR matrix and self/mat2 are dense.  The
+// row-parallel CSR accumulation fuses the seed scaling and the product term
+// into a single pass over the output.
+Tensor _sparse_addmm_cpu(const Tensor& self, const Tensor& mat1,
+                         const Tensor& mat2, const Scalar& beta,
+                         const Scalar& alpha) {
+    if (!mat1.is_sparse()) {
+        TP_THROW(RuntimeError,
+                 "_sparse_addmm(): expected 'mat1' to be a sparse tensor");
+    }
+    if (mat1.dim() != 2) {
+        TP_THROW(RuntimeError,
+                 "_sparse_addmm(): matrices expected, got ", mat1.dim(),
+                 "-D tensor");
+    }
+    if (mat1.sparse_dim() != 2 || mat1._values().dim() != 1) {
+        TP_THROW(RuntimeError,
+                 "_sparse_addmm(): hybrid sparse tensors are not supported");
+    }
+    if (mat2.dim() != 2) {
+        TP_THROW(RuntimeError,
+                 "_sparse_addmm(): matrices expected, got ", mat2.dim(),
+                 "-D tensor");
+    }
+    if (mat1.device() != mat2.device() || mat1.device() != self.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "_sparse_addmm(): all operands must be on the same device");
+    }
+    if (mat2.dtype() != mat1.dtype() || self.dtype() != mat1.dtype()) {
+        TP_THROW(TypeError,
+                 "_sparse_addmm(): all operands must share one dtype");
+    }
+    const int64_t rows = mat1.size(0);
+    const int64_t inner = mat1.size(1);
+    const int64_t cols = mat2.size(1);
+    if (mat2.size(0) != inner) {
+        TP_THROW(RuntimeError,
+                 "_sparse_addmm(): mat1 and mat2 shapes cannot be multiplied (",
+                 rows, "x", inner, " and ", mat2.size(0), "x", cols, ")");
+    }
+
+    Tensor self_b = broadcast_addmm_seed_cpu(self, rows, cols);
+    Tensor out = Tensor::empty({rows, cols}, mat1.dtype(), mat1.device());
+
+    Tensor crow;
+    Tensor col;
+    Tensor values;
+    if (mat1.is_sparse_csr()) {
+        crow = mat1._crow_indices().contiguous();
+        col = mat1._col_indices().contiguous();
+        values = mat1._values().contiguous();
+    } else {
+        Tensor canonical = mat1.is_coalesced() ? mat1 : mat1.coalesce();
+        Tensor csr = coo_to_csr_cpu(canonical, rows);
+        crow = csr._crow_indices().contiguous();
+        col = csr._col_indices().contiguous();
+        values = csr._values().contiguous();
+    }
+    const int64_t* crow_ptr = crow.data_ptr<int64_t>();
+    const int64_t* col_ptr = col.data_ptr<int64_t>();
+    Tensor dense_c = mat2.contiguous();
+    const int64_t dense_stride0 = dense_c.stride(0);
+    const int64_t dense_stride1 = dense_c.stride(1);
+
+    dispatch_dtype(mat1.dtype(), [&](auto tag) {
+        using scalar_t = typename decltype(tag)::type;
+        const scalar_t beta_v = beta.to<scalar_t>();
+        const scalar_t alpha_v = alpha.to<scalar_t>();
+        const scalar_t* value_ptr = values.data_ptr<scalar_t>();
+        const scalar_t* dense_ptr = dense_c.data_ptr<scalar_t>();
+        scalar_t* out_ptr = out.data_ptr<scalar_t>();
+        const scalar_t* self_ptr = self_b.data_ptr<scalar_t>();
+        const int64_t self_stride0 = self_b.stride(0);
+        const int64_t self_stride1 = self_b.stride(1);
+
+        parallel::parallel_for(0, rows, parallel::GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            for (int64_t i = begin; i < end; ++i) {
+                scalar_t* out_row = out_ptr + i * cols;
+                const scalar_t* self_row = self_ptr + i * self_stride0;
+                for (int64_t j = 0; j < cols; ++j) {
+                    out_row[j] = beta_v * self_row[j * self_stride1];
+                }
+                for (int64_t t = crow_ptr[i]; t < crow_ptr[i + 1]; ++t) {
+                    const scalar_t scale = alpha_v * value_ptr[t];
+                    const scalar_t* dense_row =
+                        dense_ptr + col_ptr[t] * dense_stride0;
+                    for (int64_t j = 0; j < cols; ++j) {
+                        out_row[j] += scale * dense_row[j * dense_stride1];
+                    }
+                }
+            }
+        });
+    });
+    return out;
 }
 
 // ---------------------------------------------------------------------------

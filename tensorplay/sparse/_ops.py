@@ -181,8 +181,9 @@ def solve(input, other, *, left=True):
         other (Tensor): dense right-hand side, ``(n,)`` or ``(n, k)``.
         left (bool): when ``False``, solves ``X @ input = other`` instead.
 
-    The factorization runs on the materialized matrix, so the peak memory is
-    that of the dense ``(n, n)`` operand rather than of ``nnz``.
+    The solve runs on the sparse CSR form of ``input`` directly: a native
+    sparse LU factorization (CPU) or cuSOLVER sparse QR (CUDA), so neither the
+    matrix nor the factorization materializes a dense ``(n, n)`` operand.
     """
     input = _require_sparse_matrix(input, "input")
     if input.dim() != 2 or input.size(0) != input.size(1):
@@ -196,15 +197,16 @@ def solve(input, other, *, left=True):
         raise RuntimeError("sparse.solve(): operands must share one device")
     if other.dtype != input.dtype:
         raise TypeError("sparse.solve(): operands must share one dtype")
-    dense = tensorplay.to_dense(input)
+    if not input.is_sparse_csr:
+        input = tensorplay.to_sparse_csr(input)
     if left:
         if other.size(0) != n:
             raise RuntimeError("sparse.solve(): other has an incompatible leading dimension")
-        return tensorplay.linalg.solve(dense, other)
+        return tensorplay.functional._spsolve(input, other, left=True)
+    if other.dim() == 1:
+        if other.size(0) != n:
+            raise RuntimeError("sparse.solve(): other has an incompatible trailing dimension")
+        return tensorplay.functional._spsolve(input, other, left=False)
     if other.size(-1) != n:
         raise RuntimeError("sparse.solve(): other has an incompatible trailing dimension")
-    if other.dim() == 1:
-        return tensorplay.linalg.solve(dense.transpose(-2, -1), other)
-    return tensorplay.linalg.solve(
-        dense.transpose(-2, -1), other.transpose(-2, -1)
-    ).transpose(-2, -1)
+    return tensorplay.functional._spsolve(input, other, left=False)

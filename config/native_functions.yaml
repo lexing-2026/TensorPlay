@@ -8585,14 +8585,29 @@
   tags: pointwise
 - func: _sparse_addmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1) -> Tensor
   variants: function
+  dispatch:
+    CPU: _sparse_addmm_cpu
+    CUDA: _sparse_addmm_cuda
 - func: sparse_sampled_addmm.out(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
   variants: function
+  dispatch:
+    SparseCsrCPU: sparse_sampled_addmm_out_sparse_csr_cpu
+    SparseCsrCUDA: sparse_sampled_addmm_out_sparse_csr_cuda
 - func: sparse_sampled_addmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1) -> Tensor
   variants: function
+  dispatch:
+    SparseCsrCPU: sparse_sampled_addmm_sparse_csr_cpu
+    SparseCsrCUDA: sparse_sampled_addmm_sparse_csr_cuda
 - func: _sparse_mm_reduce_impl(Tensor self, Tensor other, str reduce) -> (Tensor, Tensor)
   variants: function
+  dispatch:
+    SparseCsrCPU: _sparse_mm_reduce_impl_sparse_csr_cpu
+    SparseCsrCUDA: _sparse_mm_reduce_impl_sparse_csr_cuda
 - func: _sparse_mm_reduce_impl_backward(Tensor self, Tensor grad_out, Tensor weight, str reduce, Tensor arg_out, bool[2] output_mask) -> (Tensor, Tensor)
   variants: function
+  dispatch:
+    SparseCsrCPU: _sparse_mm_reduce_impl_backward_sparse_csr_cpu
+    SparseCsrCUDA: _sparse_mm_reduce_impl_backward_sparse_csr_cuda
 - func: addmm.out(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: addmm.dtype(Tensor self, Tensor mat1, Tensor mat2, ScalarType out_dtype, *, Scalar beta=1, Scalar alpha=1) -> Tensor
@@ -11024,6 +11039,9 @@
   variants: function
 - func: _spsolve(Tensor A, Tensor B, *, bool left=True) -> Tensor
   variants: function
+  dispatch:
+    SparseCsrCPU: _spsolve_cpu
+    SparseCsrCUDA: _spsolve_cuda
 - func: linalg_solve.out(Tensor A, Tensor B, *, bool left=True, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: linalg_tensorinv(Tensor self, int ind=2) -> Tensor
