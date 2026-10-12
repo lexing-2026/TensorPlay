@@ -193,6 +193,7 @@ Tensor& std_correction_out_native(const Tensor& self,
                                   const std::optional<std::vector<int64_t>>& dim,
                                   const std::optional<Scalar>& correction, bool keepdim,
                                   Tensor& out) {
+    if (isQuantizedType(self.dtype())) { out = std_correction_native(self, dim, correction, keepdim); return out; }
     return write_reduction_out(
         "std", std_correction_native(self, dim, correction, keepdim), out);
 }

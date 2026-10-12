@@ -421,6 +421,10 @@ Tensor& out_wrap_mean_dtype_out(const Tensor& self, std::optional<DType> dtype, 
 }
 
 Tensor& out_wrap_mean_out(const Tensor& self, const std::optional<std::vector<int64_t>>& dim, bool keepdim, std::optional<DType> dtype, Tensor& out) {
+    if (isQuantizedType(self.dtype())) {
+        out = quantized::moment(self, dim.value_or(std::vector<int64_t>{}), keepdim, false, 1., dtype.value_or(DType::Undefined));
+        return out;
+    }
     write_out(out, ops::mean(self, dim.value_or(std::vector<int64_t>()), keepdim, dtype.value_or(DType::Undefined)));
     return out;
 }

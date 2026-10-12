@@ -833,6 +833,7 @@ Tensor& out_wrap_glu_out(const Tensor& self, int64_t dim, Tensor& out) {
 }
 
 Tensor& out_wrap_hardtanh_out(const Tensor& self, const Scalar& min_val, const Scalar& max_val, Tensor& out) {
+    if (isQuantizedType(self.dtype())) { out = quantized::activation(self, 7, min_val.toDouble(), max_val.toDouble()); return out; }
     write_out(out, ops::hardtanh(self, min_val, max_val));
     return out;
 }

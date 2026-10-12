@@ -526,23 +526,37 @@ Tensor prelu(const Tensor& input, const Tensor& weight, double scale, int64_t zp
 
 template<class T>
 struct MomentInnerCodes {
-    const T* x; T* y; int64_t count, zp; double scale, correction; bool deviation;
+    const T* x; T* y; int64_t count, zp; double scale, correction; bool deviation; int square_lanes;
     TP_QN_DEVICE void operator()(int64_t i) const {
         int64_t sum = 0;
         double square_sum = 0.;
+        float partial[16]{};
         for (int64_t j = 0; j < count; ++j) {
             const int64_t code = x[i * count + j];
             sum += code;
-            square_sum += static_cast<double>(code) * code;
+            if constexpr (sizeof(T) == 4) {
+                const float value = static_cast<float>(code);
+                if (j < count - count % square_lanes) partial[j % square_lanes] += value * value;
+            } else square_sum += static_cast<double>(code) * code;
+        }
+        if constexpr (sizeof(T) == 4) {
+            float total = 0.f;
+            for (int lane = 0; lane < square_lanes; ++lane) total += partial[lane];
+            for (int64_t j = count - count % square_lanes; j < count; ++j) {
+                const float value = static_cast<float>(x[i * count + j]); total += value * value;
+            }
+            square_sum = total;
         }
         if (!deviation) {
             y[i] = static_cast<T>(::nearbyintf(static_cast<float>(sum) / count));
             return;
         }
-        const double den = ::fmax(static_cast<double>(count) - correction, 0.);
+        const double raw_den = static_cast<double>(count) - correction;
+        const double den = raw_den < 0. ? 0. : raw_den;
         const double mean = static_cast<double>(sum) / count;
         const double unbiased = static_cast<double>(sum) / den;
-        const double variance = ::fmax(square_sum / den - 2. * mean * unbiased + mean * mean * count / den, 0.);
+        const double raw_variance = square_sum / den - 2. * mean * unbiased + mean * mean * count / den;
+        const double variance = raw_variance < 0. ? 0. : raw_variance;
         y[i] = encode<T>(static_cast<float>(::sqrt(variance) * scale),
                         1.f / static_cast<float>(scale), zp);
     }
@@ -565,9 +579,15 @@ Tensor moment_inner(const Tensor& input, const std::vector<int64_t>& dims,
             quantized::q_scale(input), quantized::q_zero_point(input), deviation, correction);
     });
 #else
+    int square_lanes = 1;
+#if defined(__x86_64__) || defined(_M_X64)
+    const auto capability = cpu::get_cpu_capability();
+    if (capability == cpu::CPUCapability::AVX512) square_lanes = 16;
+    else if (capability == cpu::CPUCapability::AVX2) square_lanes = 8;
+#endif
     codes(input.dtype(), [&]<class T>() {
         apply(y.numel(), MomentInnerCodes<T>{input.data_ptr<T>(), y.data_ptr<T>(), count,
-            quantized::q_zero_point(input), quantized::q_scale(input), correction, deviation});
+            quantized::q_zero_point(input), quantized::q_scale(input), correction, deviation, square_lanes});
     });
 #endif
     return y;
@@ -599,7 +619,8 @@ struct StdStridedCodes {
             mean += delta / (j + 1);
             m2 += delta * (static_cast<double>(value) - mean);
         }
-        const double denominator = ::fmax(static_cast<double>(count) - correction, 0.);
+        const double raw_denominator = static_cast<double>(count) - correction;
+        const double denominator = raw_denominator < 0. ? 0. : raw_denominator;
         const float value = static_cast<float>(::sqrt(m2 / denominator));
         y[group] = encode<T>(value, 1.f / static_cast<float>(scale), zp);
     }

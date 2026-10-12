@@ -96,10 +96,13 @@ def test_moment_packets_dims_correction_and_out(device, dtype, zp, strided, dims
         equal(a, b)
         out, rout = pair(device, dtype, zp, shape=tuple(b.shape))
         name = 'mean.out' if operation == 'mean' else 'std.correction_out'
+        original = out.int_repr().cpu().numpy().copy()
+        address = out.data_ptr()
         returned = resolve(tp.ops.tp, name)(x, dims, keepdim=True, out=out, **kwargs)
-        resolve(torch.ops.aten, name)(r, dims, keepdim=True, out=rout, **kwargs)
-        assert returned.data_ptr() == out.data_ptr()
-        equal(out, rout)
+        expected = resolve(torch.ops.aten, name)(r, dims, keepdim=True, out=rout, **kwargs)
+        assert returned.data_ptr() != address and out.data_ptr() == address
+        equal(returned, expected)
+        np.testing.assert_array_equal(out.int_repr().cpu().numpy(), original)
 
 
 @pytest.mark.parametrize('device', DEVICES)
@@ -155,16 +158,23 @@ def test_activation_packets_preserve_or_replace_grid(device, dtype, zp, name, ar
         assert a.data_ptr() == address
     if name in ('hardsigmoid', 'hardtanh', 'leaky_relu'):
         out, rout = pair(device, dtype, zp, shape=tuple(b.shape))
+        address = out.data_ptr()
         returned = resolve(tp.ops.tp, name + '.out')(x, *args, out=out)
-        resolve(torch.ops.aten, name + '.out')(r, *args, out=rout)
-        assert returned.data_ptr() == out.data_ptr()
+        expected = resolve(torch.ops.aten, name + '.out')(r, *args, out=rout)
+        if name == 'hardtanh':
+            assert returned.data_ptr() != address and out.data_ptr() == address
+        else:
+            assert returned.data_ptr() == out.data_ptr()
+        equal(returned, expected)
         equal(out, rout)
 
 
 @pytest.mark.parametrize('device', DEVICES)
-def test_prelu_packet_quantized_channel_weights(device):
-    x, r = pair(device, strided=True)
-    codes = np.array([10, 20, 30, 40], dtype='uint8').reshape(1, 4, 1, 1)
+@pytest.mark.parametrize('dtype,zp', TYPES)
+@pytest.mark.parametrize('weight_shape', [(1,), (1, 4, 1, 1), (2, 4, 5, 4), (1, 1, 5, 1)])
+def test_prelu_packet_broadcast_quantized_weights(device, dtype, zp, weight_shape):
+    x, r = pair(device, dtype, zp, strided=True)
+    codes = ((np.arange(np.prod(weight_shape)) * 7) % 63).astype(dtype).reshape(weight_shape)
     w = tp._C._make_per_tensor_quantized_tensor(tp.tensor(codes, device=device), .01, 0)
     rw = torch._make_per_tensor_quantized_tensor(torch.tensor(codes), .01, 0)
     equal(tp.ops.tp._prelu_kernel.default(x, w), torch.ops.aten._prelu_kernel.default(r, rw))
@@ -236,3 +246,93 @@ def test_resize_and_storage_set_packets_preserve_grid(device):
     assert result.untyped_storage().data_ptr() == source.untyped_storage().data_ptr()
     assert x.storage_offset() == r.storage_offset()
     equal(x, r)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('operation', ['cat', 'leaky_relu', 'reflection_pad2d'])
+def test_output_quantizer_selection(device, operation):
+    x, r = pair(device, strided=True)
+    out = tp.quantize_per_tensor(tp.zeros(list(x.shape), device=device), .19, 87, tp.quint8)
+    rout = torch._empty_affine_quantized(tuple(r.shape), scale=.19, zero_point=87, dtype=torch.quint8)
+    if operation == 'cat':
+        tp.ops.tp.cat.out([x, x], 1, out=out)
+        torch.ops.aten.cat.out([r, r], 1, out=rout)
+    elif operation == 'leaky_relu':
+        tp.ops.tp.leaky_relu.out(x, .17, out=out)
+        torch.ops.aten.leaky_relu.out(r, .17, out=rout)
+    else:
+        tp.ops.tp.reflection_pad2d.out(x, [1, 2, 2, 1], out=out)
+        torch.ops.aten.reflection_pad2d.out(r, [1, 2, 2, 1], out=rout)
+    equal(out, rout)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('invalid', ['fill_rank', 'mask_dtype', 'mask_value_rank',
+                                     'repeated_dims', 'accumulate', 'quantized_values',
+                                     'grid_interpolation', 'prelu_float_weight'])
+def test_quantized_tensor_operation_rejections(device, invalid):
+    x, r = pair(device)
+    args = {
+        'fill_rank': ('fill_.Tensor', [tp.ones([1], device=device)], [torch.ones(1)]),
+        'mask_dtype': ('masked_fill_.Scalar', [tp.ones(list(x.shape), device=device), 0.],
+                       [torch.ones(r.shape), 0.]),
+        'mask_value_rank': ('masked_fill_.Tensor', [tp.ones(list(x.shape), dtype=tp.bool, device=device), tp.ones([1], device=device)],
+                            [torch.ones(r.shape, dtype=torch.bool), torch.ones(1)]),
+        'repeated_dims': ('mean.dim', [[1, 1]], [[1, 1]]),
+        'accumulate': ('_index_put_impl_', [[tp.tensor([0], device=device)], tp.tensor(0., device=device), True, False],
+                       [[torch.tensor([0])], torch.tensor(0.), True, False]),
+        'quantized_values': ('_index_put_impl_', [[tp.tensor([0], device=device)], x[0], False, False],
+                             [[torch.tensor([0])], r[0], False, False]),
+        'grid_interpolation': ('grid_sampler_2d', [tp.zeros([2, 2, 2, 2], device=device), 1, 0, False],
+                              [torch.zeros(2, 2, 2, 2), 1, 0, False]),
+        'prelu_float_weight': ('_prelu_kernel', [tp.ones([1], device=device)], [torch.ones(1)]),
+    }
+    name, actual_args, reference_args = args[invalid]
+    with pytest.raises((RuntimeError, ValueError, TypeError, IndexError, NotImplementedError)):
+        resolve(torch.ops.aten, name)(r, *reference_args)
+    with pytest.raises((RuntimeError, ValueError, TypeError, IndexError, NotImplementedError)):
+        resolve(tp.ops.tp, name)(x, *actual_args)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('dtype,zp', TYPES)
+def test_fill_quantized_scalar_alias(device, dtype, zp):
+    x, r = pair(device, dtype, zp, strided=True)
+    value, rv = x[0, 0, 0, 0], r[0, 0, 0, 0]
+    address, strides = x.data_ptr(), x.stride()
+    tp.ops.tp.fill_.Tensor(x, value)
+    torch.ops.aten.fill_.Tensor(r, rv)
+    assert x.data_ptr() == address and x.stride() == strides
+    equal(x, r)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('dtype,zp', TYPES)
+@pytest.mark.parametrize('correction', [0., .5, 4., 7.])
+def test_std_correction_degenerate_denominators(device, dtype, zp, correction):
+    x, r = pair(device, dtype, zp, shape=(2, 4))
+    equal(tp.ops.tp.std.correction(x, [-1], correction=correction),
+          torch.ops.aten.std.correction(r, [-1], correction=correction))
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('dtype,zp', TYPES)
+def test_inner_moments_vector_blocks_and_tails(device, dtype, zp):
+    x, r = pair(device, dtype, zp, shape=(2, 3, 8193))
+    equal(tp.ops.tp.mean.dim(x, [-1], True), torch.ops.aten.mean.dim(r, [-1], True))
+    equal(tp.ops.tp.std.correction(x, [-1], correction=.5, keepdim=True),
+          torch.ops.aten.std.correction(r, [-1], correction=.5, keepdim=True))
+
+
+def test_batch_norm_coefficients_track_parameter_mutations():
+    x, r = pair('cpu')
+    x, r = x.contiguous(memory_format=tp.channels_last), r.contiguous(memory_format=torch.channels_last)
+    data = [np.linspace(.2, .8, 4, dtype='float32'), np.zeros(4, dtype='float32'),
+            np.linspace(-.1, .1, 4, dtype='float32'), np.linspace(.5, 1., 4, dtype='float32')]
+    parameters, references = [tp.tensor(v) for v in data], [torch.tensor(v) for v in data]
+    for changed in [None, 0, 1, 2, 3, None]:
+        if changed is not None:
+            parameters[changed].add_(.03)
+            references[changed].add_(.03)
+        equal(tp.ops.quantized.batch_norm2d(x, *parameters, 1e-5, .07, 119),
+              torch.ops.quantized.batch_norm2d(r, *references, 1e-5, .07, 119))

@@ -683,6 +683,8 @@ Scalar Tensor::item() const {
         TP_THROW(ValueError, "item() only supported for 1-element tensors");
     }
 
+    if (isQuantizedType(dtype())) return dequantize().item();
+
     if (device().type() != DeviceType::CPU) {
         return to(Device(DeviceType::CPU)).item();
     }

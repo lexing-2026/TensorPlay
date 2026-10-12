@@ -90,7 +90,8 @@ Tensor& relu_inplace(Tensor& self) {
 }
 
 Tensor& fill(Tensor& self, const Scalar& value) {
-    if (quantizer_of(self)->qscheme() != kPerTensorAffine) {
+    if (quantizer_of(self)->qscheme() != kPerTensorAffine ||
+        (self.dtype() != DType::QInt8 && self.dtype() != DType::QUInt8 && self.dtype() != DType::QInt32)) {
         self.copy_(Tensor::full(self.sizes().vec(), value, DType::Float32, self.device()));
         return self;
     }
