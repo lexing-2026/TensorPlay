@@ -19,6 +19,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
 namespace tensorplay {
 namespace cpu {
 
@@ -428,6 +432,79 @@ Tensor dequantize_per_tensor_qint8_cpu(const Tensor& self, double scale,
 // lowest 2 bits, index 1 in the next 2 bits, and so on, so four consecutive
 // elements fill one byte and a trailing partial byte per row is still
 // allocated.
+//
+// AVX2 paths process 8 elements per iteration: the affine grid position is
+// computed with _MM_FROUND_CUR_DIRECTION, which follows the MXCSR rounding
+// mode exactly like std::nearbyint, so the packed bytes are bit-identical to
+// the scalar loop.
+#if defined(__x86_64__)
+namespace {
+
+__attribute__((target("avx2")))
+void quantize_quint2x4_avx2(const float* rdata, uint8_t* qdata, int64_t numel,
+                            float inv_scale, float zero_point) {
+    const __m256 v_inv = _mm256_set1_ps(inv_scale);
+    const __m256 v_zp = _mm256_set1_ps(zero_point);
+    const __m256i v_zero = _mm256_setzero_si256();
+    const __m256i v_three = _mm256_set1_epi32(3);
+    int64_t i = 0;
+    int64_t byte = 0;
+    for (; i + 8 <= numel; i += 8, byte += 2) {
+        const __m256 x = _mm256_loadu_ps(rdata + i);
+        const __m256 r = _mm256_round_ps(
+            _mm256_add_ps(_mm256_mul_ps(x, v_inv), v_zp),
+            _MM_FROUND_CUR_DIRECTION);
+        __m256i qi = _mm256_cvtps_epi32(r);
+        qi = _mm256_max_epi32(v_zero, _mm256_min_epi32(qi, v_three));
+        alignas(32) int32_t qbuf[8];
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(qbuf), qi);
+        qdata[byte] = static_cast<uint8_t>(
+            qbuf[0] | (qbuf[1] << 2) | (qbuf[2] << 4) | (qbuf[3] << 6));
+        qdata[byte + 1] = static_cast<uint8_t>(
+            qbuf[4] | (qbuf[5] << 2) | (qbuf[6] << 4) | (qbuf[7] << 6));
+    }
+    for (; i < numel; ++i) {
+        const int64_t qv =
+            lrintf(std::nearbyint(rdata[i] * inv_scale) + zero_point);
+        const int q = qv < 0 ? 0 : (qv > 3 ? 3 : static_cast<int>(qv));
+        if ((i & 3) == 0) {
+            qdata[i >> 2] = static_cast<uint8_t>(q);
+        } else {
+            qdata[i >> 2] |= static_cast<uint8_t>(q << ((i & 3) * 2));
+        }
+    }
+}
+
+__attribute__((target("avx2")))
+void dequantize_quint2x4_avx2(const uint8_t* qdata, float* rdata, int64_t numel,
+                              float scale, float zero_point) {
+    const __m256 v_scale = _mm256_set1_ps(scale);
+    const __m256 v_zp = _mm256_set1_ps(zero_point);
+    int64_t i = 0;
+    int64_t byte = 0;
+    for (; i + 8 <= numel; i += 8, byte += 2) {
+        const uint8_t b0 = qdata[byte];
+        const uint8_t b1 = qdata[byte + 1];
+        alignas(32) int32_t qbuf[8] = {
+            b0 & 3, (b0 >> 2) & 3, (b0 >> 4) & 3, (b0 >> 6) & 3,
+            b1 & 3, (b1 >> 2) & 3, (b1 >> 4) & 3, (b1 >> 6) & 3,
+        };
+        const __m256i qi =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qbuf));
+        const __m256 f = _mm256_mul_ps(
+            _mm256_sub_ps(_mm256_cvtepi32_ps(qi), v_zp), v_scale);
+        _mm256_storeu_ps(rdata + i, f);
+    }
+    for (; i < numel; ++i) {
+        const uint8_t qv = qdata[i >> 2];
+        const int c = (qv >> ((i & 3) * 2)) & 3;
+        rdata[i] = (static_cast<float>(c) - zero_point) * scale;
+    }
+}
+
+} // namespace
+#endif // __x86_64__
+
 Tensor quantize_per_tensor_quint2x4_cpu(const Tensor& self, double scale,
                                         int64_t zero_point, int64_t quant_min,
                                         int64_t quant_max) {
@@ -438,26 +515,30 @@ Tensor quantize_per_tensor_quint2x4_cpu(const Tensor& self, double scale,
     const float* const rdata = input.const_data_ptr<float>();
     auto qdata = reinterpret_cast<uint8_t*>(out.data_ptr<quint2x4>());
     const int64_t numel = input.numel();
-    constexpr int64_t elem_per_byte = 4;
-    constexpr int64_t bit_width = 2;
     const float scale_f = static_cast<float>(scale);
     const float zero_point_f = static_cast<float>(zero_point);
-    for (int64_t i = 0; i < numel; ++i) {
-        const float inv_scale =
-            scale_f == 0 ? 1.0f : 1.0f / scale_f;
-        int64_t qvalue =
-            lrintf(std::nearbyint(rdata[i] * inv_scale) + zero_point_f);
-        qvalue = std::max(quant_min, std::min(qvalue, quant_max));
+    const float inv_scale = scale_f == 0 ? 1.0f : 1.0f / scale_f;
+#if defined(__x86_64__)
+    if (numel >= 32 && __builtin_cpu_supports("avx2")) {
+        quantize_quint2x4_avx2(rdata, qdata, numel, inv_scale, zero_point_f);
+    } else
+#endif
+    {
+        for (int64_t i = 0; i < numel; ++i) {
+            int64_t qvalue =
+                lrintf(std::nearbyint(rdata[i] * inv_scale) + zero_point_f);
+            qvalue = std::max(quant_min, std::min(qvalue, quant_max));
 
-        // We pack sub-byte values and align them to a byte.
-        // Eg. for 2-bit values, index 0 is packed in the lower 2 bits,
-        // index 1 in the next 2 bits, index 2 in the next 2 bits, and
-        // index 3 in the upper 2 bits.
-        if (i % elem_per_byte == 0) {
-            qdata[i / elem_per_byte] = static_cast<uint8_t>(qvalue);
-        } else {
-            qdata[i / elem_per_byte] |=
-                static_cast<uint8_t>(qvalue << ((i % elem_per_byte) * bit_width));
+            // We pack sub-byte values and align them to a byte.
+            // Eg. for 2-bit values, index 0 is packed in the lower 2 bits,
+            // index 1 in the next 2 bits, index 2 in the next 2 bits, and
+            // index 3 in the upper 2 bits.
+            if ((i & 3) == 0) {
+                qdata[i >> 2] = static_cast<uint8_t>(qvalue);
+            } else {
+                qdata[i >> 2] |=
+                    static_cast<uint8_t>(qvalue << ((i & 3) * 2));
+            }
         }
     }
     out.impl()->set_quantizer(
@@ -477,15 +558,21 @@ Tensor dequantize_per_tensor_quint2x4_cpu(const Tensor& self, double scale,
     const uint8_t* qdata =
         reinterpret_cast<const uint8_t*>(input.const_data_ptr<quint2x4>());
     const int64_t numel = input.numel();
-    constexpr int64_t elem_per_byte = 4;
-    constexpr int64_t bit_width = 2;
     const float scale_f = static_cast<float>(scale);
     const float zero_point_f = static_cast<float>(zero_point);
-    for (int64_t i = 0; i < numel; ++i) {
-        uint8_t qvalue = qdata[i / elem_per_byte];
-        qvalue >>= (i % elem_per_byte) * bit_width;
-        qvalue &= (1 << bit_width) - 1;
-        rdata[i] = (static_cast<float>(qvalue) - zero_point_f) * scale_f;
+#if defined(__x86_64__)
+    if (numel >= 32 && __builtin_cpu_supports("avx2")) {
+        dequantize_quint2x4_avx2(
+            qdata, rdata, numel, scale_f, zero_point_f);
+    } else
+#endif
+    {
+        for (int64_t i = 0; i < numel; ++i) {
+            uint8_t qvalue = qdata[i >> 2];
+            qvalue >>= (i & 3) * 2;
+            qvalue &= 3;
+            rdata[i] = (static_cast<float>(qvalue) - zero_point_f) * scale_f;
+        }
     }
     return out;
 }
