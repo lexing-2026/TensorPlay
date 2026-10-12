@@ -107,6 +107,8 @@ measure (see the last section).
     tensorplay.ao.quantization.FixedQParamsObserver
     tensorplay.ao.quantization.FakeQuantize
     tensorplay.ao.quantization.PerChannelFakeQuantize
+    tensorplay.ao.quantization.FixedQParamsFakeQuantize
+    tensorplay.ao.quantization.FusedMovingAvgObsFakeQuantize
     tensorplay.ao.quantization.default_observer
     tensorplay.ao.quantization.default_weight_observer
     tensorplay.ao.quantization.default_dynamic_quant_observer
@@ -126,6 +128,21 @@ which is the module QAT inserts into the graph.
 {func}`~tensorplay.ao.quantization.load_observer_state_dict` save and
 restore calibration results, so a calibration run need not be repeated.
 
+Statistics, epsilon, histogram counts, simulation flags and quantization
+parameters are registered buffers. They follow device moves and survive
+`state_dict` checkpoints. Channel statistics resize when a checkpoint is
+loaded into a fresh observer. Histogram calibration redistributes existing
+counts when the observed range expands and searches the clipping range by
+integrating reconstruction error over the source bins.
+
+`disable_observer()` freezes statistics while retaining the simulated
+rounding. `disable_fake_quant()` returns the floating input while allowing
+statistics to continue updating. The backward mask uses the rounded grid
+position before saturation, including ties and values outside the range.
+`_LearnableFakeQuantize`, available from
+`tensorplay.ao.quantization._learnable_fake_quantize`, additionally trains
+scale and zero point with optional gradient scaling.
+
 ## Configuration and the eager workflow
 
 ```{eval-rst}
@@ -142,10 +159,15 @@ restore calibration results, so a calibration run need not be repeated.
     tensorplay.ao.quantization.QuantStub
     tensorplay.ao.quantization.DeQuantStub
     tensorplay.ao.quantization.prepare
+    tensorplay.ao.quantization.prepare_qat
     tensorplay.ao.quantization.convert
     tensorplay.ao.quantization.quantize
     tensorplay.ao.quantization.quantize_dynamic
+    tensorplay.ao.quantization.quantize_qat
     tensorplay.ao.quantization.fuse_modules
+    tensorplay.ao.quantization.fuse_modules_qat
+    tensorplay.ao.quantization.get_default_qconfig
+    tensorplay.ao.quantization.get_default_qat_qconfig
 ```
 
 A {class}`~tensorplay.ao.quantization.QConfig` pairs an activation observer
@@ -188,6 +210,91 @@ prepare→calibrate (`run_fn`)→convert in one call for eager models;
 step at all. {func}`~tensorplay.ao.quantization.fuse_modules` merges
 adjacent layers (`Conv`+`BN`+`ReLU`, `Linear`+`ReLU`) into the single
 fused modules below, which quantize better than the pieces separately.
+
+For training, use `prepare_qat` on a model in training mode. Use
+`fuse_modules_qat` before preparation to retain batch normalization during
+training. Conv1d/2d/3d and Linear support weight simulation; fused Conv+BN,
+Conv+BN+ReLU, Conv+ReLU, Linear+BN and Linear+ReLU modules retain their
+training behavior. Freezing normalization statistics is independent of
+freezing quantization statistics.
+
+```python
+from tensorplay.ao.quantization import (
+    prepare_qat, convert, default_per_channel_qat_qconfig,
+    disable_observer,
+)
+
+model.train()
+model.qconfig = default_per_channel_qat_qconfig
+trained = prepare_qat(model)
+optimizer = tp.optim.SGD(trained.parameters(), lr=0.01)
+for x, target in training_data:
+    optimizer.zero_grad()
+    loss = loss_fn(trained(x), target)
+    loss.backward()
+    optimizer.step()
+trained.apply(disable_observer)
+inference = convert(trained.eval(), use_precomputed_fake_quant=True)
+```
+
+Construct the optimizer from `trained.parameters()`. Conversion folds
+normalization parameters into the convolution or linear weights. Passing
+`use_precomputed_fake_quant=True` preserves the trained weight grid during
+conversion, including configured code bounds.
+
+## Packed execution and checkpoints
+
+Quantized Linear and Conv1d/2d/3d retain canonical quantized weights and a
+reusable native execution cache. `set_weight_bias` rebuilds the cache when
+weights change. Each inference call uses the activation tensor's scale and
+zero point. Weights support per-tensor and per-output-channel affine grids;
+activations support signed and unsigned 8-bit storage. Grouped convolution
+handles stride, padding and dilation in integer coordinates.
+
+CPU execution uses tiled input gathering and AVX2 integer dot products when
+available. CUDA execution uses shared operand tiles and packed four-byte
+integer dot products. Both accumulate affine corrections in 64-bit integers.
+LinearReLU and ConvReLU apply bias, output rounding and rectification in the
+compute epilogue. BNReLU applies normalization and rectification in one
+native kernel. Dynamic Linear and LinearReLU derive one activation grid
+over the complete input on each call and return floating outputs.
+
+`state_dict` saves canonical weights, bias and output quantization
+parameters. Execution caches are nonpersistent and rebuilt when loading or
+moving a module between devices. Saving a complete module also excludes
+execution caches and rebuilds them during restoration. Create a module
+with the same dimensions and convolution parameters before loading a state
+dictionary; whole-module checkpoints retain those constructor parameters.
+Whole-module loading requires registering the module classes with
+`tensorplay.serialization.safe_globals`. State dictionaries load with the
+default restricted reader.
+
+Quantized tensor checkpoints preserve integer storage, strides, offsets and
+the complete affine grid. Both ZIP and legacy stream formats support
+per-tensor, per-channel and floating-zero-point channel grids. `map_location`
+can restore their storage and metadata onto another device.
+
+`benchmark/bench_quantized_packing.py` measures cached execution, rebuilding
+the weights on every call and fused versus separate rectification. It checks
+integer output equality before timing. The following measurements use a Core
+Ultra 7 265K with four CPU threads and an RTX 3090. Each value is the median
+of five batches of 100 calls, with device synchronization around CUDA timing.
+All inputs, weights and outputs use signed 8-bit affine grids.
+
+| Device | M × N × K | Direct (μs) | Cached (μs) | Rebuild (μs) | Direct / cached |
+| --- | --- | ---: | ---: | ---: | ---: |
+| CPU | 1 × 512 × 1024 | 244.6 | 21.1 | 213.2 | 11.6× |
+| CPU | 32 × 256 × 512 | 520.6 | 48.1 | 113.0 | 10.8× |
+| CPU | 256 × 512 × 1024 | 16361.0 | 1312.5 | 1495.4 | 12.5× |
+| CUDA | 1 × 512 × 1024 | 108.8 | 16.0 | 99.8 | 6.8× |
+| CUDA | 32 × 256 × 512 | 59.0 | 9.8 | 99.5 | 6.0× |
+| CUDA | 256 × 512 × 1024 | 967.8 | 46.5 | 131.1 | 20.8× |
+
+The direct baseline is the existing scalar integer linear operator. Fusion
+removes a separate activation dispatch and output allocation; its total
+latency depends on shape and device. For the 32-row case, fused and separate
+rectification measured 58.3 and 55.2 μs on CPU, and 10.7 and 11.6 μs on CUDA.
+The complete measurements are in `benchmark/quantized_packing_results.json`.
 
 ## Quantized modules
 
@@ -281,6 +388,9 @@ had two or three layers.
     tensorplay.ao.nn.qat.Conv1d
     tensorplay.ao.nn.qat.Conv2d
     tensorplay.ao.nn.qat.Conv3d
+    tensorplay.ao.nn.qat.Embedding
+    tensorplay.ao.nn.qat.EmbeddingBag
+    tensorplay.ao.nn.qat.dynamic.Linear
 ```
 
 For QAT, `tensorplay.ao.nn.qat` provides the float modules with fake

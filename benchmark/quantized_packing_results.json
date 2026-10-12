@@ -1,0 +1,97 @@
+{
+  "threads": 4,
+  "repetitions": 100,
+  "results": [
+    {
+      "device": "cpu",
+      "M": 1,
+      "N": 512,
+      "K": 1024,
+      "microseconds": {
+        "direct": 244.60462969727814,
+        "cached": 21.06470987200737,
+        "rebuilding": 213.23722088709474,
+        "fused_relu": 22.29887992143631,
+        "separate_relu": 21.37147937901318
+      },
+      "direct_over_cached": 11.612057853326059
+    },
+    {
+      "device": "cpu",
+      "M": 32,
+      "N": 256,
+      "K": 512,
+      "microseconds": {
+        "direct": 520.6052598077804,
+        "cached": 48.05607022717595,
+        "rebuilding": 113.02280938252807,
+        "fused_relu": 58.28984081745148,
+        "separate_relu": 55.16428966075182
+      },
+      "direct_over_cached": 10.833288226580281
+    },
+    {
+      "device": "cpu",
+      "M": 256,
+      "N": 512,
+      "K": 1024,
+      "microseconds": {
+        "direct": 16360.99974042736,
+        "cached": 1312.4470005277544,
+        "rebuilding": 1495.3816903289407,
+        "fused_relu": 1427.0655799191445,
+        "separate_relu": 1424.7587404679507
+      },
+      "direct_over_cached": 12.466026996784144
+    },
+    {
+      "device": "cuda",
+      "M": 1,
+      "N": 512,
+      "K": 1024,
+      "microseconds": {
+        "direct": 108.79550012759864,
+        "cached": 16.008829697966576,
+        "rebuilding": 99.80971924960613,
+        "fused_relu": 16.457829624414444,
+        "separate_relu": 17.904809210449457
+      },
+      "direct_over_cached": 6.7959683612236645
+    },
+    {
+      "device": "cuda",
+      "M": 32,
+      "N": 256,
+      "K": 512,
+      "microseconds": {
+        "direct": 58.94702044315636,
+        "cached": 9.788699680939317,
+        "rebuilding": 99.53903965651989,
+        "fused_relu": 10.694839293137193,
+        "separate_relu": 11.595890391618013
+      },
+      "direct_over_cached": 6.021945954470211
+    },
+    {
+      "device": "cuda",
+      "M": 256,
+      "N": 512,
+      "K": 1024,
+      "microseconds": {
+        "direct": 967.7713096607476,
+        "cached": 46.51276976801455,
+        "rebuilding": 131.0902601107955,
+        "fused_relu": 50.11703004129231,
+        "separate_relu": 49.67823042534292
+      },
+      "direct_over_cached": 20.806572356098545
+    }
+  ],
+  "measurement_date": "2026-10-12",
+  "hardware": {
+    "cpu": "Intel Core Ultra 7 265K",
+    "cuda": "NVIDIA GeForce RTX 3090"
+  },
+  "timing": "Median of five batches; CUDA synchronized before and after each batch",
+  "baseline": "Existing scalar integer linear operator"
+}
