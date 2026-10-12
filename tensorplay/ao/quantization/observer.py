@@ -569,9 +569,10 @@ class PlaceholderObserver(ObserverBase):
             "calculate_qparams should not be called for PlaceholderObserver")
 
 
-# Int8 loop (activations unsigned-style range, weights full signed range).
-default_observer = MinMaxObserver.with_args(quant_min=0, quant_max=127)
-default_weight_observer = MinMaxObserver.with_args(dtype=tensorplay.int8,
+# Activation grids use unsigned codes; weight grids use signed codes.
+default_observer = MinMaxObserver.with_args(dtype=tensorplay.quint8,
+                                           quant_min=0, quant_max=127)
+default_weight_observer = MinMaxObserver.with_args(dtype=tensorplay.qint8,
                                                    quant_min=-128,
                                                    quant_max=127)
 default_dynamic_quant_observer = PlaceholderObserver.with_args(

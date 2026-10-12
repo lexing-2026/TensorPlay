@@ -924,7 +924,7 @@ if(USE_ROCM)
     target_include_directories(p10 BEFORE PUBLIC
         $<BUILD_INTERFACE:${TP_HIP_STAGING}/p10/include>
     )
-    # The staging tree mirrors the CUDA backend root the target searches
+    # The staging tree contains the CUDA backend root the target searches
     # below.  A TU in a backend subdirectory reaches its neighbours by bare
     # name, and without the staged root those names fall through to the
     # untranslated originals, which then pull in CUDA headers this lane

@@ -22,6 +22,7 @@ from .conv import Conv1d, Conv2d, Conv3d
 from .functional_modules import FXFloatFunctional, FloatFunctional, QFunctional
 from .linear import QuantizedLinear as Linear
 from .linear import QuantizedLinear as QuantizedLinear
+from .normalization import GroupNorm, InstanceNorm1d, InstanceNorm2d, InstanceNorm3d, LayerNorm
 from .pooling import MaxPool1d, MaxPool2d, MaxPool3d
 from .quantize import DeQuantize, Quantize
 
@@ -33,6 +34,11 @@ __all__ = [
     "Conv3d",
     "BatchNorm2d",
     "BatchNorm3d",
+    "LayerNorm",
+    "GroupNorm",
+    "InstanceNorm1d",
+    "InstanceNorm2d",
+    "InstanceNorm3d",
     "ReLU",
     "ReLU6",
     "ELU",

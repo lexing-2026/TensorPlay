@@ -203,6 +203,11 @@ fused modules below, which quantize better than the pieces separately.
     tensorplay.ao.nn.quantized.Conv3d
     tensorplay.ao.nn.quantized.BatchNorm2d
     tensorplay.ao.nn.quantized.BatchNorm3d
+    tensorplay.ao.nn.quantized.LayerNorm
+    tensorplay.ao.nn.quantized.GroupNorm
+    tensorplay.ao.nn.quantized.InstanceNorm1d
+    tensorplay.ao.nn.quantized.InstanceNorm2d
+    tensorplay.ao.nn.quantized.InstanceNorm3d
     tensorplay.ao.nn.quantized.ReLU
     tensorplay.ao.nn.quantized.ReLU6
     tensorplay.ao.nn.quantized.ELU
@@ -229,6 +234,21 @@ forms of the eager ops at the boundary stubs. `FloatFunctional` /
 `QFunctional` wrap arithmetic (add, cat, mul, ...) so the same model code
 runs its ops through quantized or float kernels;
 `FXFloatFunctional` is the graph-capture-friendly variant.
+
+`LayerNorm`, `GroupNorm`, and `InstanceNorm1d`/`InstanceNorm2d`/`InstanceNorm3d`
+use native CPU and CUDA kernels. They accumulate statistics from integer codes
+and requantize each normalized value without allocating a float copy of the
+input. They accept per-tensor affine `qint8`, `quint8`, and `qint32` inputs,
+preserve the input dtype, and store output `scale` and `zero_point` as buffers
+in the module's state dictionary. Optional affine parameters use `float32`.
+Group and instance normalization require batched inputs of at least three
+dimensions; a four-dimensional channels-last input keeps that layout.
+Instance normalization computes statistics from each input, including in
+evaluation mode.
+
+The default activation observer declares `quint8` with a calibration range
+of `[0, 127]`; the default weight observer declares `qint8`. The dtype refers
+to the quantized tensor, while `int_repr()` exposes its plain integer codes.
 
 ## Fused modules
 
