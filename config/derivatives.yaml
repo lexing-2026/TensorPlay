@@ -2459,6 +2459,10 @@
   grad_output: sparse_sum_backward_double_backward(grad, self, dim)
   self: sparse_sum_backward_double_backward_self(self)
 
+- name: _sparse_mm_reduce_impl(Tensor self, Tensor other, str reduce) -> (Tensor, Tensor)
+  self: "grad.defined() ? std::get<0>(_sparse_mm_reduce_impl_backward(self, grad, other, reduce, ret1, grad_input_mask)) : Tensor()"
+  other: "grad.defined() ? std::get<1>(_sparse_mm_reduce_impl_backward(self, grad, other, reduce, ret1, grad_input_mask)) : Tensor()"
+
 - name: _spdiags(Tensor diagonals, Tensor offsets, int[] shape, int? layout=None) -> Tensor
   output_differentiability: [False]
 
