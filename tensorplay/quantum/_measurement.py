@@ -23,7 +23,12 @@ from ._gates import (
     y_matrix,
     z_matrix,
 )
-from ._helpers import check_pauli_string, n_qubits_of, ordered_wires
+from ._helpers import (
+    DEFAULT_C_DTYPE,
+    check_pauli_string,
+    n_qubits_of,
+    ordered_wires,
+)
 from ._state import unflatten
 
 __all__ = [
@@ -32,6 +37,7 @@ __all__ = [
     "apply_readout_error",
     "commuting_groups",
     "counts_from_indices",
+    "density_from_counts",
     "density_probs",
     "expectation",
     "expectation_from_counts",
@@ -42,6 +48,7 @@ __all__ = [
     "readout_error_matrix",
     "sample_energy",
     "sample_indices",
+    "state_from_counts",
 ]
 
 _PAULI_BUILDERS = {
@@ -657,6 +664,94 @@ def counts_from_indices(indices: tp.Tensor, n_qubits: int) -> tp.Tensor:
     counts = tp.zeros((batch, dim), dtype=tp.float32, device=indices.device)
     weights = tp.ones_like(rows, dtype=tp.float32)
     return counts.scatter_add_(1, rows, weights)
+
+
+def density_from_counts(
+    counts: tp.Tensor, *, pseudocount: float = 0.0, c_dtype=DEFAULT_C_DTYPE
+) -> tp.Tensor:
+    """The density matrix a histogram of basis measurements describes.
+
+    A histogram in the computational basis is the diagonal of a density matrix
+    and nothing else: every off-diagonal term is a phase, and a phase is exactly
+    what a basis measurement throws away.  So what comes back here is the state
+    the measurements cannot rule out, and reading it as the answer to what the
+    system is would be wrong in the one place it matters.
+
+    Args:
+        counts: shots per outcome, shaped ``[batch, 2**n_qubits]``.
+        pseudocount: a floor added to every outcome before normalizing, in the
+            same units as the counts.  It makes the matrix full rank, which a
+            tomography fit wants; it also makes the answer wrong by that much,
+            so it is nothing but what its name says.
+        c_dtype: the precision to build the matrix in.
+
+    Returns:
+        The matrix, shaped ``[batch, 2**n_qubits, 2**n_qubits]``.
+
+    Raises:
+        ValueError: if a row holds no shots at all, or if a count is negative.
+    """
+    _check_histogram(counts, pseudocount)
+    n_columns = counts.shape[-1]
+    weights = counts.to(dtype=tp.float64) + float(pseudocount)
+    probabilities = weights / weights.sum(dim=-1, keepdim=True)
+    return tp.diag_embed(probabilities).to(dtype=c_dtype)
+
+
+def state_from_counts(
+    counts: tp.Tensor, *, pseudocount: float = 0.0, dtype=DEFAULT_C_DTYPE
+) -> tp.Tensor:
+    """The state whose squared amplitudes are the histogram's shares.
+
+    A histogram has no phases to read, so it cannot name a state -- it names a
+    whole family of them, one per phase per amplitude.  What it can name is the
+    member of that family the square roots give: every amplitude real and
+    non-negative, which is the pure state overlapping the measured one the most.
+    Comparing that state with a theory is a comparison of populations; comparing
+    its density matrix with the one measured in a rotated basis is what says
+    anything about the phases.
+
+    Args:
+        counts: shots per outcome, shaped ``[batch, 2**n_qubits]``.
+        pseudocount: a floor added to every outcome, as in
+            :func:`density_from_counts`.  Without one an outcome that never came
+            out stays out of the state, which is the honest reading of a
+            finite number of shots.
+        dtype: the precision to build the state in.
+
+    Returns:
+        The state, shaped ``[batch, 2**n_qubits]``.
+
+    Raises:
+        ValueError: if a row holds no shots at all, or if a count is negative.
+    """
+    _check_histogram(counts, pseudocount)
+    n_columns = counts.shape[-1]
+    weights = counts.reshape(-1, n_columns).to(dtype=tp.float64) + float(pseudocount)
+    # The square roots are already the canonical reading: non-negative, so the
+    # one phase a histogram leaves free is fixed on every amplitude at once, and
+    # two states that share a histogram are the same state up to that phase.
+    amplitudes = tp.sqrt(weights / weights.sum(dim=-1, keepdim=True))
+    flat = amplitudes.reshape(*counts.shape[:-1], n_columns).to(dtype=dtype)
+    # The module's own shape for a state: one axis of size 2 per qubit after the
+    # batch, whatever else the histogram had in front of it.
+    n_qubits = n_columns.bit_length() - 1
+    return flat.reshape(*counts.shape[:-1], *([2] * n_qubits))
+
+
+def _check_histogram(counts: tp.Tensor, pseudocount: float) -> None:
+    """Say what a histogram has to carry before it is read as a state."""
+    if counts.dim() < 1 or counts.shape[-1] < 2:
+        raise ValueError(
+            "a histogram is [batch, 2**n_qubits] over at least two outcomes, got "
+            f"{tuple(counts.shape)}"
+        )
+    if float(counts.min()) < 0.0:
+        raise ValueError("a histogram cannot hold a negative count")
+    if pseudocount < 0.0:
+        raise ValueError(f"a pseudocount is not negative, got {pseudocount}")
+    if counts.to(dtype=tp.float64).sum(dim=-1).min().item() <= 0.0:
+        raise ValueError("a histogram of no shots describes no state")
 
 
 def _read_out(indices: tp.Tensor, matrices: tp.Tensor) -> tp.Tensor:

@@ -328,18 +328,34 @@ def test_the_sampled_energy_is_the_exact_one_at_every_shot_count():
 
 def test_a_readout_that_lies_moves_the_estimate_the_way_it_lies():
     # A readout matrix biases each reported bit, so the estimate of the energy
-    # moves by the bias times what the state contributes -- which is not zero,
-    # and not the same amount for every term.
+    # moves by the bias times what the state contributes -- not zero, and not the
+    # same amount for every term.
+    #
+    # The seed is here because the margins below are stated in units of the noise:
+    # one 200000-shot estimate of this Hamiltonian carries a standard error of
+    # about 5e-4, so anything tighter than that would be a claim about luck. With
+    # the draw fixed the numbers are the same on every run and the margins say
+    # what they mean.
+    tp.manual_seed(20241013)
     state = _bell_like()
     exact = float(tq.energy(state, H2)[0])
     shots = 200_000
-    honest = float(tq.sample_energy(state, H2, shots)[0])
     readout = tp.tensor([[0.97, 0.03], [0.06, 0.94]], dtype=tp.float64)
-    biased = float(tq.sample_energy(state, H2, shots, readout=readout)[0])
-    assert abs(honest - exact) < 1e-3, honest
-    assert abs(biased - exact) > 1e-3, (biased, exact)
-    # The two disagree by much more than the shot noise, and in the direction the
-    # readout pushes: it reports a zero more often than there is one.
+
+    def estimate(readout_matrix=None):
+        return statistics.fmean(
+            float(tq.sample_energy(state, H2, shots, readout=readout_matrix)[0])
+            for _ in range(4)
+        )
+
+    honest = estimate()
+    biased = estimate(readout)
+    # Four estimates average to half the noise again, so three standard errors of
+    # a single one is about six of these.
+    assert abs(honest - exact) < 2e-3, (honest, exact)
+    # The readout reports a zero more often than there is one, and the energy
+    # moves up by far more than the noise can account for.
+    assert abs(biased - exact) > 2e-2, (biased, exact)
     assert biased > honest, (biased, honest)
 
 

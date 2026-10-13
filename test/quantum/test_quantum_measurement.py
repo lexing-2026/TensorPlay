@@ -594,3 +594,105 @@ def test_a_density_observable_wants_a_density_and_a_pauli_word():
         tq.expectation_from_density(tq.to_density(tq.plus_state(1)), "Q")
     with pytest.raises(ValueError):
         tq.expectation_from_density(tp.ones(1, 3, 3, dtype=tp.complex128), "Z")
+
+
+# ---------------------------------------------------------------------------
+# Reading a state back out of a histogram
+# ---------------------------------------------------------------------------
+
+
+def _phased_state():
+    """Two-qubit with amplitudes only on |00> and |11>, and a phase between them."""
+    bell_ish = tq.apply_cnot(
+        tq.apply_ry(tq.apply_h(tq.zeros_state(2, dtype=tp.complex128), 0), 0, 0.7), 0, 1
+    )
+    return tq.apply_s(bell_ish, 0)
+
+
+def test_a_histogram_is_the_diagonal_of_a_density_matrix_and_nothing_else():
+    # The shares come back exactly, and the off-diagonal is zero whatever the
+    # state was: a basis measurement decides each bit on its own, so it never
+    # sees the phase between two outcomes.  The reading that loses the phase is
+    # worth checking with an observable that is not zero to begin with -- <XY>
+    # reads the phase between |00> and |11> and is far from zero here.
+    state = _phased_state()
+    shares = tq.probs(state)
+    density = tq.density_from_counts(shares * 100_000.0, c_dtype=tp.complex128)
+    tp.testing.assert_close(
+        density,
+        tp.diag_embed(shares.to(dtype=tp.complex128)),
+        atol=1e-12,
+        rtol=1e-12,
+    )
+    assert abs(float(tp.trace(density[0]).real) - 1.0) < 1e-12
+
+    assert abs(float(tq.expectation(state, "XY")[0])) > 0.5
+    assert float(tq.expectation_from_density(density, "XY")[0]) == 0.0
+    # Populations are what survives: both routes read the same.
+    for word in ("ZI", "IZ", "ZZ", "II"):
+        tp.testing.assert_close(
+            tq.expectation_from_density(density, word).to(dtype=tp.float64),
+            tq.expectation(state, word),
+            atol=1e-12,
+            rtol=1e-12,
+        )
+
+
+def test_a_histogram_names_the_state_whose_amplitudes_are_its_square_roots():
+    # Every amplitude real and non-negative is the one freedom a histogram has,
+    # spent: two states that share a histogram differ only by phases, and this is
+    # the member of that family the square roots give.
+    shares = tq.probs(_phased_state())
+    counts = shares * 250_000.0
+    state = tq.state_from_counts(counts, dtype=tp.complex128)
+    assert abs(float(tq.norm(state)[0]) - 1.0) < 1e-12
+    tp.testing.assert_close(tq.probs(state), shares, atol=1e-12, rtol=1e-12)
+    amplitudes = tp.flatten(state)[0]
+    assert float(amplitudes.real.min()) >= 0.0
+    assert float(amplitudes.imag.abs().max()) == 0.0
+
+
+def test_an_outcome_that_never_came_out_stays_out():
+    # A finite number of shots is finite: squaring a zero would claim an
+    # amplitude nobody saw, and the state would carry weight where the data says
+    # none was found.  A pseudocount is the way to lift that, and it is exactly
+    # what it says on the tin.
+    counts = tp.tensor([[3.0, 0.0, 1.0, 0.0]])
+    honest = tq.state_from_counts(counts, dtype=tp.complex128)
+    assert float(tq.flatten(honest)[0, 1].abs()) == 0.0
+    assert float(tq.flatten(honest)[0, 3].abs()) == 0.0
+    tp.testing.assert_close(
+        tq.probs(honest)[0],
+        tp.tensor([0.75, 0.0, 0.25, 0.0], dtype=tp.float64),
+        atol=1e-12,
+        rtol=0,
+    )
+
+    floored = tq.state_from_counts(counts, pseudocount=1.0, dtype=tp.complex128)
+    # 4, 1, 2 and 1 out of eight.
+    expected = tp.tensor([0.5, 0.125, 0.25, 0.125], dtype=tp.float64)
+    tp.testing.assert_close(tq.probs(floored)[0], expected, atol=1e-12, rtol=1e-12)
+
+
+def test_a_batch_of_histograms_is_a_batch_of_states():
+    shares = tq.probs(_phased_state())
+    counts = tp.stack([shares * 10.0, shares * 100.0, shares * 1000.0]).reshape(3, 4)
+    density = tq.density_from_counts(counts, c_dtype=tp.complex128)
+    states = tq.state_from_counts(counts, dtype=tp.complex128)
+    assert density.shape == counts.shape + counts.shape[-1:]
+    assert states.shape == (3, 2, 2)
+    for row in range(3):
+        tp.testing.assert_close(tq.probs(states[row: row + 1]), shares, atol=1e-12, rtol=1e-12)
+
+
+def test_a_histogram_of_nothing_is_refused():
+    with pytest.raises(ValueError):
+        tq.density_from_counts(tp.tensor([[0.0, 0.0, 0.0, 0.0]]))
+    with pytest.raises(ValueError):
+        tq.state_from_counts(tp.tensor([[0.0, 0.0, 0.0, 0.0]]))
+    with pytest.raises(ValueError):
+        tq.state_from_counts(tp.tensor([[1.0, -2.0]]))          # a negative count
+    with pytest.raises(ValueError):
+        tq.state_from_counts(tp.tensor([[1.0]]))                 # one outcome
+    with pytest.raises(ValueError):
+        tq.density_from_counts(tp.tensor([[1.0, 2.0]]), pseudocount=-1.0)

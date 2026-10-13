@@ -278,6 +278,28 @@ Give one matrix per wire as `[n, 2, 2]` when the wires were calibrated apart.
 distribution, so an offline histogram can be corrected — or biased, which is
 what it is usually wanted for.
 
+### Reading a state back out of a histogram
+
+A histogram in the computational basis is the diagonal of a density matrix and
+nothing else. `density_from_counts` hands that diagonal back, which is the state
+the measurements cannot rule out and no more: every off-diagonal term is a phase,
+and a basis measurement never sees a phase.
+
+```python
+rho = tq.density_from_counts(counts)                # populations, no phases
+state = tq.state_from_counts(counts)                # the square roots of them
+```
+
+`state_from_counts` names the member of that family a histogram leaves free whose
+amplitudes are real and non-negative, which is the one overlapping the measured
+state the most. Comparing it with a theory compares populations; the phases come
+from histograms taken in rotated bases, which is what `joint_expectation` reads.
+
+An outcome that never came out of a finite number of shots stays out. Pass
+`pseudocount=` to lift every outcome off the floor before normalizing, which
+makes the density matrix full rank for a tomography fit — and makes the answer
+wrong by that much, which is what it says on the tin.
+
 ## Noise
 
 Channels act on density matrices, given as Kraus operators. Each one is a set
@@ -653,9 +675,11 @@ vector.
     tensorplay.quantum.dens2bloch
     tensorplay.quantum.sv2bloch
     tensorplay.quantum.density_to_state
+    tensorplay.quantum.state_from_counts
     tensorplay.quantum.partial_trace
     tensorplay.quantum.probs
     tensorplay.quantum.density_probs
+    tensorplay.quantum.density_from_counts
     tensorplay.quantum.marginal_probs
     tensorplay.quantum.expectation
     tensorplay.quantum.expectation_from_density

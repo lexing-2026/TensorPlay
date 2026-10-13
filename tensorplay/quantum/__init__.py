@@ -159,6 +159,8 @@ from ._hamiltonian import (
     trotter_evolve,
 )
 from ._measurement import (
+    density_from_counts,
+    state_from_counts,
     expectation_from_density,
     apply_measurement_basis,
     apply_pauli_word,
@@ -286,6 +288,7 @@ __all__ = [
     "dagger",
     "dcx_matrix",
     "dens2bloch",
+    "density_from_counts",
     "density_probs",
     "density_to_state",
     "depolarizing_kraus",
@@ -353,6 +356,7 @@ __all__ = [
     "sesolve",
     "single_excitation_matrix",
     "state_from_bases",
+    "state_from_counts",
     "sv2bloch",
     "swap_matrix",
     "sx_matrix",
