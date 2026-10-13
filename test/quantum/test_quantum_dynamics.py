@@ -821,3 +821,81 @@ def test_the_generator_says_what_it_holds():
     assert "n_qubits=2" in repr(generator)
     assert "jumps=1" in repr(generator)
     assert "time-dependent" in repr(Lindbladian(lambda t: None))
+
+
+def _dense_dissipator(jumps, rho, n_qubits):
+    """The dissipator of a set of jump operators, written out densely."""
+    rho = rho[0] if rho.dim() == 3 else rho
+    total = None
+    for entry in jumps:
+        if isinstance(entry, str):
+            rate, word = 1.0, entry
+        elif isinstance(entry, (tuple, list)) and isinstance(entry[0], str):
+            rate, word = entry[1], entry[0]
+        else:
+            wires, operator = entry
+            rate = 1.0 if len(entry) == 2 else entry[2]
+            L = _wide(operator.to(dtype=tp.complex128), wires, n_qubits)
+            term = L @ rho @ L.conj().T - 0.5 * (
+                L.conj().T @ L @ rho + rho @ L.conj().T @ L
+            )
+            total = term if total is None else total + rate * term
+            continue
+        wires = [i for i, letter in enumerate(word) if letter != "I"]
+        L = _wide(tq.pauli_matrix(word, **WIDE), wires, n_qubits)
+        # L^dagger L is the identity for a Pauli word
+        term = L @ rho @ L.conj().T - rho
+        total = term if total is None else total + rate * term
+    return total
+
+
+def test_dissipator_matches_the_pure_dissipation_generator():
+    jumps = ["XI", ([1], tp.tensor([[0.3, 0.2], [0.1, 0.4]], dtype=tp.complex128))]
+    rho = tq.to_density(tq.plus_state(2, dtype=tp.complex128))
+    generated = tq.dissipator(jumps, rho, **WIDE)
+    from_generator = Lindbladian(None, jumps, n_qubits=2, **WIDE).apply(rho)
+    tp.testing.assert_close(generated, from_generator, atol=1e-12, rtol=1e-12)
+
+
+def test_dissipator_matches_the_dense_anticommutator_form():
+    rho = tq.to_density(tq.random_state(2, dtype=tp.complex128))
+    damping = tp.tensor([[0.0, 0.5], [0.0, 0.0]], dtype=tp.complex128)
+    jumps = ["X", ([1], damping), ("Z", 0.3)]
+    got = tq.dissipator(jumps, rho, **WIDE)
+    want = _dense_dissipator(jumps, rho, 2)
+    tp.testing.assert_close(got, tp.tensor(want.reshape(1, 4, 4), dtype=tp.complex128),
+                            atol=1e-12, rtol=1e-12)
+
+
+def test_dissipator_of_a_pauli_word_is_trace_free():
+    rho = tq.to_density(tq.random_state(2, dtype=tp.complex128))
+    out = tq.dissipator(["XI", "IZ"], rho, **WIDE)
+    trace = tp.diagonal(out[0], dim1=0, dim2=1).sum()
+    tp.testing.assert_close(trace, tp.tensor(0.0, dtype=tp.complex128), atol=1e-12, rtol=1e-12)
+
+
+def test_dissipator_reads_the_same_jump_formats():
+    rho = tq.to_density(tq.random_state(2, dtype=tp.complex128))
+    damping = tp.tensor([[0.0, 0.4], [0.0, 0.0]], dtype=tp.complex128)
+    as_word = tq.dissipator(["XI"], rho, **WIDE)
+    as_pair = tq.dissipator([("XI", 1.0)], rho, **WIDE)
+    as_matrix = tq.dissipator([([0], tq.pauli_matrix("XI", **WIDE))], rho, **WIDE)
+    tp.testing.assert_close(as_word, as_pair, atol=1e-12, rtol=1e-12)
+    tp.testing.assert_close(as_word, as_matrix, atol=1e-12, rtol=1e-12)
+
+
+def test_dissipator_rejects_a_malformed_density():
+    with pytest.raises(ValueError):
+        tq.dissipator(["X"], tp.ones((2, 2)))
+
+
+def test_a_diagonal_jump_at_a_fractional_rate_keeps_full_precision():
+    # A diagonal word's dissipator is a scaling; it used to be built in single
+    # precision even for a complex128 register, which rounded rates like 0.3.
+    # It must agree with the dense form to machine precision.
+    rho = tq.to_density(tq.random_state(2, dtype=tp.complex128))
+    got = Lindbladian(None, [("Z", 0.3)], n_qubits=2, **WIDE).apply(rho)
+    z = _wide(tq.pauli_matrix("Z", **WIDE), [0], 2)
+    want = 0.3 * (z @ rho[0] @ z.conj().T - rho[0])
+    tp.testing.assert_close(got, tp.tensor(want.reshape(1, 4, 4), dtype=tp.complex128),
+                            atol=1e-12, rtol=1e-12)

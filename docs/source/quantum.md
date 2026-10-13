@@ -668,6 +668,7 @@ vector.
     tensorplay.quantum.global_phase
     tensorplay.quantum.Lindbladian
     tensorplay.quantum.lindbladian
+    tensorplay.quantum.dissipator
     tensorplay.quantum.mesolve
     tensorplay.quantum.sesolve
     tensorplay.quantum.random_state

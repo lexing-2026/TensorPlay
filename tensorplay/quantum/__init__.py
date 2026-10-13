@@ -38,6 +38,7 @@ Example:
 
 from ._dynamics import (
     Lindbladian,
+    dissipator,
     lindbladian,
     mesolve,
     sesolve,
@@ -305,6 +306,7 @@ __all__ = [
     "density_probs",
     "density_to_state",
     "depolarizing_kraus",
+    "dissipator",
     "ecr_matrix",
     "efficient_su2",
     "encode_w",

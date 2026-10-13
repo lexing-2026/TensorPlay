@@ -38,6 +38,7 @@ from ._state import flatten, to_density
 
 __all__ = [
     "Lindbladian",
+    "dissipator",
     "lindbladian",
     "mesolve",
     "sesolve",
@@ -316,7 +317,12 @@ def _read_jumps(jump_ops, n_qubits: int, device, c_dtype):
                 f"is {n_qubits} wide"
             )
         if _word_is_diagonal(word):
-            factor = _diagonal_scaling(word, n_qubits, device)
+            factor = _diagonal_scaling(
+                word,
+                n_qubits,
+                device,
+                dtype=tp.float64 if c_dtype == tp.complex128 else tp.float32,
+            )
             factor = factor * rate if rate != 1.0 else factor
             scaling = factor if scaling is None else scaling + factor
             n_scaling += 1
@@ -402,7 +408,7 @@ def _series_degree(span: float, tolerance: float = _SERIES_TOLERANCE) -> int:
         order += 1
 
 
-def _diagonal_scaling(word: str, n_qubits: int, device) -> tp.Tensor:
+def _diagonal_scaling(word: str, n_qubits: int, device, dtype) -> tp.Tensor:
     """The factor that stands in for one diagonal jump's whole dissipator.
 
     For ``L = diag(l)`` the dissipator of ``rho`` is
@@ -412,7 +418,7 @@ def _diagonal_scaling(word: str, n_qubits: int, device) -> tp.Tensor:
     are one and the factor is ``l_a l_b - 1``.
     """
     side = 1 << n_qubits
-    signs = _pauli_signs(word, n_qubits, device=device, dtype=tp.float32)
+    signs = _pauli_signs(word, n_qubits, device=device, dtype=dtype)
     return signs.reshape([side, 1]) * signs.reshape([1, side]) - 1.0
 
 
@@ -965,6 +971,75 @@ def lindbladian(
     return Lindbladian(
         hamiltonian, jump_ops, n_qubits=n_qubits, device=device, c_dtype=c_dtype
     )
+
+
+def dissipator(
+    jump_ops,
+    density: tp.Tensor,
+    *,
+    device=None,
+    c_dtype=DEFAULT_C_DTYPE,
+) -> tp.Tensor:
+    """The Lindblad dissipator of ``jump_ops``, applied to ``density``.
+
+    This is the ``sum_j (L_j rho L_j^dagger - 1/2 {L_j^dagger L_j, rho})`` half
+    of a master equation, with the Hamiltonian's commutator left off.  Reading
+    it on its own is how a steady state is checked, how fast a channel decays
+    is measured, or how a custom generator is put together.
+
+    Jump operators are read the way :class:`Lindbladian` reads them: a Pauli
+    word carries unit rate, ``sqrt(gamma) P`` carries ``gamma``, and a matrix
+    names its wires or spans the whole register.
+
+    Args:
+        jump_ops: the dissipative terms, as :class:`Lindbladian` takes them.
+        density: shaped ``[batch, 2**n, 2**n]``.
+        device: where to build the operators.
+        c_dtype: the complex type of the operators.
+
+    Returns:
+        The dissipator's action, in the same layout as ``density``.
+    """
+    density = _as_density(density)
+    batch, dim, _ = density.shape
+    n_qubits = _qubit_count(dim)
+    if tp.is_complex(density):
+        c_dtype = density.dtype
+    device = density.device if device is None else device
+
+    if isinstance(jump_ops, (str, tp.Tensor)):
+        entries = [jump_ops]
+    elif isinstance(jump_ops, tuple) and len(jump_ops) in (2, 3):
+        entries = [jump_ops]
+    else:
+        entries = list(jump_ops)
+    scaling, words, operators, _ = _read_jumps(entries, n_qubits, device, c_dtype)
+
+    flat = density.to(dtype=c_dtype).reshape((batch, *([2] * (2 * n_qubits))))
+    out = tp.zeros_like(flat)
+    if scaling is not None:
+        out = out + flat * scaling.reshape([2] * (2 * n_qubits))
+    for rate, matrix, wires in words:
+        turned = apply_gate(
+            apply_gate(flat, matrix, wires),
+            matrix.conj(),
+            tuple(wire + n_qubits for wire in wires),
+        )
+        # L^dagger L is the identity for a Pauli word, so the anticommutator
+        # term is the whole of rho.
+        out = out + rate * (turned - flat)
+    for rate, operator, gram, wires in operators:
+        bra_wires = tuple(wire + n_qubits for wire in wires)
+        turned = apply_gate(
+            apply_gate(flat, operator, wires), operator.conj(), bra_wires
+        )
+        out = out + rate * (
+            turned
+            - 0.5 * (
+                apply_gate(flat, gram, wires) + apply_gate(flat, gram, bra_wires)
+            )
+        )
+    return out.reshape((batch, dim, dim))
 
 
 def mesolve(
