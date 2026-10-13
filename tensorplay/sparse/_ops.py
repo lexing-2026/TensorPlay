@@ -86,7 +86,13 @@ def mul(self, other):
 
 
 def mm(sparse, dense):
-    """Matrix product of a supported sparse tensor with a dense matrix."""
+    """Matrix product of a supported sparse tensor with a dense matrix.
+
+    The result keeps ``sparse``'s layout: CSR in gives CSR out and COO in is
+    converted to CSR for the fused evaluation, then back to COO.  This routes
+    through the fused reduce (sum) kernel that evaluates only the stored
+    coordinates.
+    """
     if (
         isinstance(sparse, tensorplay.Tensor)
         and type(sparse) is not tensorplay.Tensor
@@ -105,7 +111,16 @@ def mm(sparse, dense):
         raise RuntimeError("sparse.mm(): operands must share one device")
     if sparse.dtype != dense.dtype:
         raise TypeError("sparse.mm(): operands must share one dtype")
-    return tensorplay.sparse_mm(sparse, dense)
+    if sparse.layout == tensorplay.sparse_csr:
+        result, _ = tensorplay.functional._sparse_mm_reduce_impl(sparse, dense, "sum")
+        return result
+    if sparse.layout == tensorplay.sparse_coo:
+        csr = sparse.to_sparse_csr()
+        result, _ = tensorplay.functional._sparse_mm_reduce_impl(csr, dense, "sum")
+        return result.to_sparse()
+    raise NotImplementedError(
+        f"sparse.mm(): layout {sparse.layout} is not supported yet"
+    )
 
 
 def addmm(mat, mat1, mat2, *, beta=1.0, alpha=1.0):
@@ -129,12 +144,13 @@ def addmm(mat, mat1, mat2, *, beta=1.0, alpha=1.0):
         mat2, tensorplay.Tensor
     ):
         raise TypeError("sparse.addmm(): matrix operands must be Tensor objects")
-    product = mm(mat1, mat2) if mat1.is_sparse else tensorplay.mm(mat1, mat2)
-    if alpha != 1.0:
-        product = product * alpha
-    if beta == 0.0:
-        return product
-    return (mat * beta if beta != 1.0 else mat) + product
+    # A sparse ``mat1`` routes through the fused native sparse-addmm kernel
+    # (with registered autograd); a dense ``mat1`` takes the dense path.
+    if mat1.is_sparse:
+        return tensorplay.functional._sparse_addmm(
+            mat, mat1, mat2, beta=beta, alpha=alpha
+        )
+    return tensorplay.addmm(mat, mat1, mat2, beta=beta, alpha=alpha)
 
 
 def sampled_addmm(input, mat1, mat2, *, beta=1.0, alpha=1.0, out=None):
@@ -152,6 +168,14 @@ def sampled_addmm(input, mat1, mat2, *, beta=1.0, alpha=1.0, out=None):
         mat2, tensorplay.Tensor
     ):
         raise TypeError("sparse.sampled_addmm(): matrix operands must be Tensor objects")
+    # The fused sampled-addmm kernel evaluates on CSR patterns; a COO input
+    # is converted for the evaluation and converted back so the result keeps
+    # the input's layout.
+    if input.layout == tensorplay.sparse_coo:
+        result = tensorplay.sparse_sampled_addmm(
+            input.to_sparse_csr(), mat1, mat2, beta=beta, alpha=alpha
+        )
+        return result.to_sparse()
     return tensorplay.sparse_sampled_addmm(
         input, mat1, mat2, beta=beta, alpha=alpha, out=out
     )
