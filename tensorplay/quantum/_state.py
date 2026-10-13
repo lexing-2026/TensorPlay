@@ -12,9 +12,16 @@ from typing import Optional, Sequence
 import tensorplay as tp
 
 from ._gates import _as_complex, pauli_matrix
-from ._helpers import DEFAULT_C_DTYPE, promoted_c_dtype, state_shape
+from ._helpers import (
+    DEFAULT_C_DTYPE,
+    check_wires,
+    n_qubits_of,
+    promoted_c_dtype,
+    state_shape,
+)
 
 __all__ = [
+    "apply_reset",
     "basis_state",
     "bloch2dens",
     "bloch2sv",
@@ -146,6 +153,24 @@ def normalize(state: tp.Tensor, eps: float = 0.0) -> tp.Tensor:
     if eps:
         lengths = tp.clamp(lengths, min=eps)
     return state / lengths.reshape((-1, *([1] * (state.dim() - 1))))
+
+
+def apply_reset(state: tp.Tensor, wire: int) -> tp.Tensor:
+    """Project ``wire`` onto |0> and renormalize the register.
+
+    Resetting a qubit is the non-unitary cousin of measuring it: every branch
+    where the wire reads 1 is discarded, and the rest is scaled back up.  The
+    kept branches carry the probability of the 0 outcome, so the projection
+    changes the norm and ``normalize`` hands back a unit state.
+    """
+    n_qubits = n_qubits_of(state)
+    target = check_wires(wire, n_qubits)
+    w = target[0]
+    dim = 1 << n_qubits
+    bit = (tp.arange(dim, device=state.device) >> (n_qubits - 1 - w)) & 1
+    keep = (bit == 0).to(state.dtype)
+    keep = keep.reshape(1, *([2] * n_qubits))
+    return normalize(state * keep)
 
 
 def inner(state_a: tp.Tensor, state_b: tp.Tensor) -> tp.Tensor:

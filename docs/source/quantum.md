@@ -641,6 +641,8 @@ vector.
     tensorplay.quantum.controlled_matrix
     tensorplay.quantum.apply_controlled
     tensorplay.quantum.apply_chadamard
+    tensorplay.quantum.apply_shadamard
+    tensorplay.quantum.apply_sswap
     tensorplay.quantum.rot_matrix
     tensorplay.quantum.multirz_matrix
     tensorplay.quantum.multirz_eigvals
@@ -656,6 +658,8 @@ vector.
     tensorplay.quantum.xx_plus_yy_matrix
     tensorplay.quantum.xx_minus_yy_matrix
     tensorplay.quantum.single_excitation_matrix
+    tensorplay.quantum.sh_matrix
+    tensorplay.quantum.sswap_matrix
     tensorplay.quantum.dagger
     tensorplay.quantum.expand_to_register
     tensorplay.quantum.zeros_state
@@ -674,6 +678,7 @@ vector.
     tensorplay.quantum.unflatten
     tensorplay.quantum.norm
     tensorplay.quantum.normalize
+    tensorplay.quantum.apply_reset
     tensorplay.quantum.inner
     tensorplay.quantum.fidelity
     tensorplay.quantum.to_density

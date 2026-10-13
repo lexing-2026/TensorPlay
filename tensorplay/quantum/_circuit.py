@@ -100,6 +100,7 @@ def _build_gate_table() -> dict:
         "y": _Gate("y", 1, 0, _on_wire(lambda: _g.y_matrix()), _g.y_matrix),
         "z": _Gate("z", 1, 0, _on_wire(lambda: _g.z_matrix()), _g.z_matrix),
         "h": _Gate("h", 1, 0, _on_wire(lambda: _g.h_matrix()), _g.h_matrix),
+        "sh": _Gate("sh", 1, 0, _on_wire(lambda: _g.sh_matrix()), _g.sh_matrix),
         "sx": _Gate("sx", 1, 0, _on_wire(lambda: _g.sx_matrix()), _g.sx_matrix),
         "s": _Gate("s", 1, 0, _on_wire(lambda: _g.s_matrix()), _g.s_matrix),
         "sdg": _Gate("sdg", 1, 0, _on_wire(lambda: _g.sdg_matrix()), _g.sdg_matrix),
@@ -127,6 +128,9 @@ def _build_gate_table() -> dict:
     )
     table["swap"] = _Gate(
         "swap", 2, 0, lambda s, w, *p: _g.apply_swap(s, *w), _g.swap_matrix
+    )
+    table["sswap"] = _Gate(
+        "sswap", 2, 0, lambda s, w, *p: _g.apply_sswap(s, *w), _g.sswap_matrix
     )
     table["iswap"] = _Gate(
         "iswap", 2, 0, lambda s, w, *p: _g.apply_iswap(s, *w), _g.iswap_matrix

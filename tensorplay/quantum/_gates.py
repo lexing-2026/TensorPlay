@@ -67,8 +67,10 @@ __all__ = [
     "apply_rzz",
     "apply_s",
     "apply_sdg",
+    "apply_shadamard",
     "apply_single_excitation",
     "apply_swap",
+    "apply_sswap",
     "apply_sx",
     "apply_t",
     "apply_tdg",
@@ -108,8 +110,10 @@ __all__ = [
     "rzz_matrix",
     "s_matrix",
     "sdg_matrix",
+    "sh_matrix",
     "single_excitation_matrix",
     "swap_matrix",
+    "sswap_matrix",
     "sx_matrix",
     "t_matrix",
     "tdg_matrix",
@@ -318,6 +322,18 @@ def h_matrix(*, device=None, c_dtype=tp.complex64) -> tp.Tensor:
     return _constant([[half, half], [half, -half]], device=device, c_dtype=c_dtype)
 
 
+def sh_matrix(*, device=None, c_dtype=tp.complex64) -> tp.Tensor:
+    """The ``shadamard`` gate: a quarter-turn rotation around Y.
+
+    The name is a portmanteau of ``s`` and Hadamard, but the matrix is a plain
+    rotation: ``cos(pi/8)`` on the diagonal and ``sin(pi/8)`` off it, which is
+    the same half-angle rotation as ``ry(pi/4)``.
+    """
+    c = math.cos(math.pi / 8)
+    s = math.sin(math.pi / 8)
+    return _constant([[c, -s], [s, c]], device=device, c_dtype=c_dtype)
+
+
 def s_matrix(*, device=None, c_dtype=tp.complex64) -> tp.Tensor:
     """The phase gate: a quarter turn around Z."""
     return _constant([[1, 0], [0, 1j]], device=device, c_dtype=c_dtype)
@@ -360,6 +376,25 @@ def iswap_matrix(*, device=None, c_dtype=tp.complex64) -> tp.Tensor:
     """The iswap gate on ``[first wire, second wire]``."""
     return _constant(
         [[1, 0, 0, 0], [0, 0, 1j, 0], [0, 1j, 0, 0], [0, 0, 0, 1]],
+        device=device,
+        c_dtype=c_dtype,
+    )
+
+
+def sswap_matrix(*, device=None, c_dtype=tp.complex64) -> tp.Tensor:
+    """The square root of swap on ``[first wire, second wire]``.
+
+    Applying it twice swaps the wires, so it is the ``sqrt(SWAP)`` of a swap
+    based exchange: the ``|01>`` and ``|10>`` amplitudes rotate by a quarter
+    turn through each other while the ``|00>`` and ``|11>`` entries stay put.
+    """
+    return _constant(
+        [
+            [1, 0, 0, 0],
+            [0, (1 + 1j) / 2, (1 - 1j) / 2, 0],
+            [0, (1 - 1j) / 2, (1 + 1j) / 2, 0],
+            [0, 0, 0, 1],
+        ],
         device=device,
         c_dtype=c_dtype,
     )
@@ -1029,6 +1064,11 @@ def apply_h(state, wire):
     return _const(state, h_matrix, wire)
 
 
+def apply_shadamard(state, wire):
+    """Apply the quarter-turn Y rotation on ``wire``."""
+    return _const(state, sh_matrix, wire)
+
+
 def apply_s(state, wire, inverse: bool = False):
     """Apply S, or its inverse, on ``wire``."""
     return _const(state, sdg_matrix if inverse else s_matrix, wire)
@@ -1269,6 +1309,11 @@ def apply_swap(state, wire_a, wire_b):
 def apply_iswap(state, wire_a, wire_b):
     """Apply iswap between two qubits."""
     return _const(state, iswap_matrix, [wire_a, wire_b])
+
+
+def apply_sswap(state, wire_a, wire_b):
+    """Apply the square root of swap between two qubits."""
+    return _const(state, sswap_matrix, [wire_a, wire_b])
 
 
 def apply_cswap(state, control, wire_a, wire_b):

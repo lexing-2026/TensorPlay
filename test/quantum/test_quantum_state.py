@@ -395,3 +395,23 @@ def test_the_ball_is_a_qubit_and_three_components():
         tq.bloch2sv(tp.tensor([[1.0, 0.0]]))              # two components
     with pytest.raises(ValueError):
         tq.bloch2dens(tp.tensor([[1.0, 0.0, 0.0, 0.0]]))  # four
+
+
+def test_reset_projects_the_wire_onto_zero():
+    # (|00> + |11>)/sqrt2: either wire reset discards the |11> branch, leaving |00>
+    bell = tq.apply_cnot(tq.apply_h(tq.zeros_state(2, dtype=tp.complex128), 0), 0, 1)
+    ground = tq.basis_state(0, 2, dtype=tp.complex128)
+    tp.testing.assert_close(tq.apply_reset(bell, 0), ground, atol=1e-12, rtol=1e-12)
+    tp.testing.assert_close(tq.apply_reset(bell, 1), ground, atol=1e-12, rtol=1e-12)
+
+
+def test_reset_keeps_the_state_normalized_and_is_idempotent():
+    state = tq.random_state(2, dtype=tp.complex128)
+    reset = tq.apply_reset(state, 1)
+    tp.testing.assert_close(tq.norm(reset), tp.tensor([1.0], dtype=tp.float64), atol=1e-12, rtol=1e-12)
+    tp.testing.assert_close(tq.apply_reset(reset, 1), reset, atol=1e-12, rtol=1e-12)
+
+
+def test_reset_rejects_an_out_of_range_wire():
+    with pytest.raises(IndexError):
+        tq.apply_reset(tq.zeros_state(1), 5)

@@ -1053,3 +1053,40 @@ def test_chadamard_matches_the_generic_controlled_helper():
     named = tq.apply_chadamard(state, 1, 0)
     generic = tq.apply_controlled(state, tq.h_matrix(c_dtype=tp.complex128), [1, 0])
     tp.testing.assert_close(named, generic, atol=1e-12, rtol=1e-12)
+
+
+def test_shadamard_is_the_quarter_turn_y_rotation():
+    c = math.cos(math.pi / 8)
+    s = math.sin(math.pi / 8)
+    want = tp.tensor([[c, -s], [s, c]], dtype=tp.complex128)
+    tp.testing.assert_close(tq.sh_matrix(c_dtype=tp.complex128), want, atol=1e-12, rtol=1e-12)
+    # on a state it is exactly the half-angle rotation ry(pi/4)
+    state = tq.random_state(1, dtype=tp.complex128)
+    tp.testing.assert_close(
+        tq.apply_shadamard(state, 0), tq.apply_ry(state, 0, math.pi / 4),
+        atol=1e-12, rtol=1e-12)
+
+
+def test_sswap_matrix_squares_to_swap():
+    half = 0.5
+    want = tp.tensor(
+        [[1, 0, 0, 0],
+         [0, (1 + 1j) * half, (1 - 1j) * half, 0],
+         [0, (1 - 1j) * half, (1 + 1j) * half, 0],
+         [0, 0, 0, 1]],
+        dtype=tp.complex128,
+    )
+    tp.testing.assert_close(tq.sswap_matrix(c_dtype=tp.complex128), want, atol=1e-12, rtol=1e-12)
+    state = tq.random_state(2, dtype=tp.complex128)
+    twice = tq.apply_sswap(tq.apply_sswap(state, 0, 1), 0, 1)
+    tp.testing.assert_close(twice, tq.apply_swap(state, 0, 1), atol=1e-12, rtol=1e-12)
+
+
+def test_sh_and_sswap_are_in_the_gate_table():
+    assert "sh" in tq.GATE_TABLE
+    assert "sswap" in tq.GATE_TABLE
+    circuit = tq.Circuit(2)
+    circuit.add("sh", wires=[0])
+    circuit.add("sswap", wires=[0, 1])
+    out = circuit(tq.zeros_state(2, dtype=tp.complex128))
+    tp.testing.assert_close(tq.norm(out), tp.tensor([1.0], dtype=tp.float64), atol=1e-6, rtol=1e-6)
