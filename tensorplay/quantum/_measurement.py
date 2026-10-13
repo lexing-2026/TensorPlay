@@ -1,9 +1,11 @@
-"""Probabilities, expectation values, and shot-based sampling.
+"""Probabilities, expectation values, shot-based sampling, and readout error.
 
 Probabilities are the squared amplitudes of the computational basis; they sum
 to one for a normalized state and give the exact measurement distribution.
 Sampling draws from that distribution on whichever device holds the state, so a
-sampled batch never leaves the accelerator.
+sampled batch never leaves the accelerator.  A readout matrix is the one step
+that happens after the state is measured: each shot's reading is decided on its
+own, so the histogram it produces carries the error a device would really add.
 """
 from typing import List, Optional, Sequence
 
