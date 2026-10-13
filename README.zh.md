@@ -161,6 +161,7 @@ TensorPlay 是一个面向学习者的深度学习框架：它融合了类 NumPy
 | **tpx** | 自动微分层：显式构建计算图并执行反向传播，与核心完全解耦 |
 | **stax** | JIT 编译器试验场：静态图捕获与算子融合实验，支持自定义算子的原生下沉 |
 | **tensorplay.nn** | 神经网络构件：`Module`、`Linear`、`Conv2d`、激活函数、损失函数与容器抽象——以及现代 LLM 全家桶：旋转位置编码、分组查询/潜在/压缩稀疏注意力、delta 规则线性注意力、KV 缓存、自回归生成 |
+| **tensorplay.snn** | 原生脉冲神经网络：融合 CPU/CUDA 的 LIF/IF 神经元、15 种 surrogate 梯度、多步 BPTT、脉冲编码器与深度 SNN 层 |
 | **tensorplay.optim** | 优化器（SGD、Adam、AdamW），支持学习率调度与权重衰减 |
 | **tensorplay.utils.data** | `Dataset` / `DataLoader`：多 worker 批处理、预取 (prefetch) 与自动打乱 |
 | **tensorplay.library** | 一等公民的自定义算子：注册算子、挂接 fake/meta 与自动微分公式、接入自有 Triton kernel |
@@ -205,6 +206,25 @@ CPU 与 CUDA 后端刻意做了简化：每个文件一族内核、每个单元�
 #### 无痛扩展
 
 一等公民的自定义算子：用 `tensorplay.library` 注册算子，挂上 fake/meta 公式做形状推断、挂上自动微分公式做反向传播，它就能与整个技术栈协同——包括原生下沉进 Stax 编译器，或接入你自己的 Triton kernel。
+
+### 脉冲神经网络（SNN）
+
+`tensorplay.snn` 提供性能优先、原生实现的脉冲神经网络支持：
+
+- **融合神经元内核** —— LIF / IF / PLIF / ALIF 单步与多步算子均为融合的 CPU/CUDA 内核。多步 BPTT 每次设备只需一次内核启动；膜电位轨迹在反向中重算，无需保存完整前向状态。
+- **15 种原生 surrogate 梯度** —— 直通、sigmoid、fast-sigmoid、分段线性、ATan、Erf、分段二次、分段指数、SuperSpike、nonzero-sign-log-abs、分段 leaky-ReLU、leaky-K-ReLU、S2NN、q-pseudo-spike 与傅里叶级数 surrogate，全部在神经元内核内部求值（融合 LIF 内核支持 0-9，`surrogate_grad` 支持 0-14）。
+- **科研级控制项** —— 逐神经元 `v_reset` 广播且可导、可学习的阈值与衰减、可微的 `v_seq` 电压轨迹、soft/hard reset、`detach_reset`。
+- **深度 SNN 构件** —— `SpikingConv2d`、时间维折叠的 `SpikingBatchNorm1d/2d`、`SeqToANNContainer`、`SpikeLinear`。
+- **编码器与监控** —— Poisson / 延迟 / 加权相位 / 周期 / 高斯调谐曲线编码器、`SpikeMonitor`、脉冲发放率损失。
+- **性能** —— 融合多步算子在 CUDA 上可达 **约 31 Gspikes/s**、CPU 上约 **250 Mspikes/s**（相比 Python 时间循环提速 114 倍）。
+
+```python
+import tensorplay as tp
+from tensorplay import snn
+
+lif = snn.LIFNode(threshold=1.0, decay=0.5, step_mode="m")
+out = lif(tp.rand(8, 4, 16))   # [8, 4, 16] 脉冲序列，融合 BPTT
+```
 
 ## 安装
 

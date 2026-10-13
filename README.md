@@ -162,6 +162,7 @@ At a granular level, TensorPlay consists of the following components:
 | **tpx** | Autograd layer: explicit computation-graph construction and backward execution, fully decoupled from the core |
 | **stax** | JIT compiler playground: static graph capture and operator fusion experiments, including native lowering of custom ops |
 | **tensorplay.nn** | Neural network building blocks: `Module`, `Linear`, `Conv2d`, activations, losses, containers — plus the modern LLM stack: rotary embeddings, grouped-query / latent / compressed-sparse attention, delta-rule linear attention, KV caches, autoregressive generation |
+| **tensorplay.snn** | Native spiking neural networks: fused CPU/CUDA LIF/IF neurons, 15 surrogate gradients, multi-step BPTT, spike encoders and deep-SNN layers |
 | **tensorplay.optim** | Optimizers (SGD, Adam, AdamW) with learning-rate scheduling and weight decay |
 | **tensorplay.utils.data** | `Dataset` / `DataLoader` with multi-worker batching, prefetching and shuffling |
 | **tensorplay.library** | First-class custom operators: register ops, attach fake/meta and autograd formulas, bring your own Triton kernels |
@@ -206,6 +207,25 @@ The autograd engine (TPX) is a standalone library, fully decoupled from the core
 #### Extensions Without Pain
 
 First-class custom operators: register an op with `tensorplay.library`, attach fake/meta formulas for shape inference and an autograd formula for backward, and it composes with the whole stack — including native lowering into the Stax compiler or your own Triton kernels.
+
+### Spiking Neural Networks (SNN)
+
+`tensorplay.snn` provides performance-first, native spiking neural network support:
+
+- **Fused neuron kernels** — LIF / IF / PLIF / ALIF single-step and multi-step operators are fused CPU/CUDA kernels. Multi-step BPTT runs in a single kernel launch per device; the membrane trajectory is recomputed in backward, so no full forward state is stored.
+- **15 native surrogate gradients** — straight-through, sigmoid, fast-sigmoid, piecewise-linear, ATan, Erf, piecewise-quadratic, piecewise-exp, SuperSpike, nonzero-sign-log-abs, piecewise-leaky-ReLU, leaky-K-ReLU, S2NN, q-pseudo-spike and Fourier-series surrogates, evaluated inside the neuron kernels (ids 0-9 in the fused LIF kernels, 0-14 through `surrogate_grad`).
+- **Research-grade controls** — per-neuron `v_reset` broadcasting with gradients, learnable threshold and decay, differentiable `v_seq` voltage trajectories, soft/hard reset, `detach_reset`.
+- **Deep SNN building blocks** — `SpikingConv2d`, time-folded `SpikingBatchNorm1d/2d`, `SeqToANNContainer`, `SpikeLinear`.
+- **Encoders & monitoring** — Poisson / latency / weighted-phase / periodic / Gaussian-tuning-curve encoders, `SpikeMonitor`, spike-rate losses.
+- **Performance** — the fused multi-step operator reaches **~31 Gspikes/s on CUDA** and **~250 Mspikes/s on CPU** (114x over a Python time loop).
+
+```python
+import tensorplay as tp
+from tensorplay import snn
+
+lif = snn.LIFNode(threshold=1.0, decay=0.5, step_mode="m")
+out = lif(tp.rand(8, 4, 16))   # [8, 4, 16] spike train with fused BPTT
+```
 
 ## Installation
 
