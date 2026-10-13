@@ -965,3 +965,67 @@ def test_a_random_register_wider_than_a_gate_is_rejected():
     for n_qubits in (0, 9, 12):
         with pytest.raises(ValueError):
             tq.random_unitary(n_qubits)
+
+
+# ---------------------------------------------------------------------------
+# The half a Pauli rotation costs
+# ---------------------------------------------------------------------------
+
+
+def test_a_pauli_rotation_takes_an_angle_for_a_half_turn():
+    # The convention every other gate here follows: an angle is what half a turn
+    # costs, so a whole turn is 4 * pi and two pi is its square, a global sign.
+    # A rotation that read the angle the other way round -- a whole turn for the
+    # angle given -- would close at pi instead, and every parameter-shift
+    # coefficient built on top of it would be off by a factor of two.
+    state = tq.plus_state(1, dtype=tp.complex128)
+    tp.testing.assert_close(
+        tq.apply_pauli_rotation(state, "X", 4.0 * math.pi), state, atol=1e-12, rtol=1e-12
+    )
+    tp.testing.assert_close(
+        tq.apply_pauli_rotation(state, "X", 2.0 * math.pi), -state, atol=1e-12, rtol=1e-12
+    )
+
+
+def test_a_state_that_owns_the_rotation_picks_up_its_phase_and_nothing_else():
+    # |+> is an eigenvector of X, so the whole of a rotation about X is a phase
+    # on it -- and the phase is exp(-i angle / 2), which is the half stated where
+    # it can be read off a single number.  Any other reading of the angle would
+    # put a different number here.
+    state = tq.plus_state(1, dtype=tp.complex128)
+    for angle in (0.0, 0.3, math.pi / 2, 1.7, 3.0):
+        phase = complex(math.cos(angle / 2), -math.sin(angle / 2))
+        tp.testing.assert_close(
+            tq.apply_pauli_rotation(state, "X", angle),
+            state * phase,
+            atol=1e-12,
+            rtol=1e-12,
+        )
+    assert abs(float(tq.norm(tq.apply_pauli_rotation(state, "X", 1.0))) - 1.0) < 1e-12
+
+
+def test_a_pauli_rotation_is_the_matrix_it_names():
+    # The word route and the matrix route have to be the same gate, since one is
+    # a shorthand for the other: a word acts on the wires it touches, so the
+    # state is compared against that same matrix applied there.
+    state = tq.apply_h(tq.zeros_state(2, dtype=tp.complex128), 0)
+    word = "XY"
+    matrix = tq.pauli_rotation_matrix(word, 0.37, c_dtype=tp.complex128)
+    tp.testing.assert_close(
+        tq.apply_pauli_rotation(state, word, 0.37),
+        tq.apply_gate(state, matrix, [0, 1]),
+        atol=1e-12,
+        rtol=1e-12,
+    )
+
+
+def test_a_rotation_about_the_identity_is_the_phase_it_names():
+    # A word of identities touches no wire, so the whole rotation lands on
+    # nothing and what is left is the phase exp(-i angle / 2) -- the one case
+    # where a Pauli word is not its own inverse's square root being rotated
+    # about.
+    state = tq.plus_state(1, dtype=tp.complex128)
+    angle = 0.9
+    rotated = tq.apply_pauli_rotation(state, "I", angle)
+    expected = state * complex(math.cos(angle / 2), -math.sin(angle / 2))
+    tp.testing.assert_close(rotated, expected, atol=1e-12, rtol=1e-12)

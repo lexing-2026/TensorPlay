@@ -1381,7 +1381,11 @@ def apply_crz(state, control, target, theta):
 
 
 def apply_pauli_rotation(state, word: str, angle):
-    """Apply ``exp(-i * angle * P)`` for the Pauli word ``word``.
+    """Rotate the state by ``exp(-i * angle * P / 2)`` for the Pauli word ``word``.
+
+    The half is the usual one -- an angle is what a half turn costs, so a full
+    turn is ``2 * pi`` -- which is what makes the parameter-shift rule come out
+    in :mod:`tensorplay.quantum._gradients`.
 
     The word is padded with identities on the right, so ``"XY"`` acts on wires
     0 and 1 of a longer register.  Identity factors carry no rotation of their
