@@ -304,3 +304,112 @@ def test_a_custom_rotation_set_drives_the_same_layout():
     # Two rotation layers, two wires each.
     assert [name for name, _ in names].count("p") == 4
     assert ("cx", (0, 1)) in names  # the linear pattern names the lower wire first
+
+
+def test_the_dense_unitary_agrees_with_the_gate_application_in_both_directions():
+    from tensorplay.quantum import basis_state
+
+    for wires in ((0, 1), (1, 0)):
+        circuit = tq.Circuit(2)
+        circuit.add("cx", wires)
+        for index in range(4):
+            entry = basis_state(index, 2)
+            tp.testing.assert_close(
+                circuit.unitary() @ entry.reshape(-1),
+                circuit.apply(entry).reshape(-1),
+                atol=1e-6,
+                rtol=1e-6,
+            )
+
+
+def test_a_multi_controlled_gate_finds_its_wires_in_the_dense_unitary():
+    from tensorplay.quantum import basis_state
+
+    circuit = tq.Circuit(3)
+    circuit.add("mcx", (0, 2, 1))
+    for index in range(8):
+        entry = basis_state(index, 3)
+        tp.testing.assert_close(
+            circuit.unitary() @ entry.reshape(-1),
+            circuit.apply(entry).reshape(-1),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+
+def test_a_circuit_can_drive_a_higher_wire_from_a_lower_one():
+    circuit = tq.Circuit(2)
+    circuit.cx(0, 1)
+    assert circuit.gates()[0][1] == (0, 1)
+    circuit = tq.Circuit(2)
+    circuit.cx(1, 0)
+    assert circuit.gates()[0][1] == (1, 0)
+    # |01> -> |11> when wire 1 drives wire 0, and stays put the other way round.
+    tp.testing.assert_close(
+        _flat(circuit.apply(tq.apply_x(tq.zeros_state(2), 1))),
+        _flat(tq.basis_state(3, 2)),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_the_inverse_of_a_reversed_circuit_still_undoes_it():
+    from tensorplay.quantum import basis_state
+
+    circuit = tq.Circuit(3)
+    circuit.cx(2, 0)
+    circuit.cry(1, 0, 0.3)
+    undone = circuit.inverse()(circuit())
+    tp.testing.assert_close(
+        _flat(undone), _flat(tq.zeros_state(3)), atol=1e-6, rtol=1e-6
+    )
+    for index in range(8):
+        entry = basis_state(index, 3)
+        tp.testing.assert_close(
+            _flat(circuit.inverse().apply(circuit.apply(entry))),
+            _flat(entry),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+
+def test_an_ansatz_trains_down_the_energy_of_a_hamiltonian():
+    h2 = tq.Hamiltonian(
+        [
+            (-1.0523732, "II"),
+            (0.3979374, "IZ"),
+            (-0.3979374, "ZI"),
+            (-0.1809312, "XX"),
+        ]
+    )
+    circuit = tq.real_amplitudes(2, reps=3)
+    optimizer = tp.optim.Adam(circuit.parameters(), lr=0.1)
+    start = float(tq.energy(circuit.state(), h2).sum())
+    for _ in range(400):
+        energy = tq.energy(circuit.state(), h2).sum()
+        optimizer.zero_grad()
+        energy.backward()
+        optimizer.step()
+    end = float(energy)
+    assert end < start
+    # The real-amplitude ansatz reaches the ground state of this Hamiltonian
+    # exactly, so it has little left to find.
+    tp.testing.assert_close(
+        tp.tensor(end), tp.tensor(float(tq.energy(tq.basis_state(1, 2), h2).sum())),
+        atol=0.05,
+        rtol=0.05,
+    )
+
+
+def test_the_fourier_transform_reads_its_phases_from_the_lower_wire():
+    for n_qubits in (2, 3, 4):
+        circuit = tq.qft_circuit(n_qubits)
+        tp.testing.assert_close(
+            circuit.unitary(), tq.qft_matrix(n_qubits), atol=1e-5, rtol=1e-5
+        )
+        tp.testing.assert_close(
+            circuit.unitary() @ circuit.inverse().unitary(),
+            tp.eye(1 << n_qubits, dtype=tq.qft_matrix(n_qubits).dtype),
+            atol=1e-5,
+            rtol=1e-5,
+        )
