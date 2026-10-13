@@ -1257,6 +1257,118 @@ void softmax_impl(const void* x, void* y, DType dtype, int64_t width, int64_t in
     });
 }
 
+float rowwise_loss(const float* x, int64_t size, float lo, float hi, int bits) {
+    lo = static_cast<float>(Half(lo));
+    const float range = hi - lo, qmax = static_cast<float>((1 << bits) - 1);
+    const float scale = range == 0.f ? 1.f : static_cast<float>(Half(range / qmax));
+    const float inverse = scale == 0.f ? 1.f : 1.f / scale;
+    float sum = 0.f;
+    for (int64_t i = 0; i < size; ++i) {
+        const float code = ::fmaxf(0.f, ::fminf(qmax, ::nearbyintf((x[i] - lo) * inverse)));
+        const float error = x[i] - (code * scale + lo);
+        sum += error * error;
+    }
+    return ::sqrtf(sum);
+}
+
+void rowwise_pack_impl(const float* input, const float* ranges, uint8_t* output,
+        int64_t rows, int64_t columns, int64_t width, int64_t bins, int bits,
+        bool optimized, float ratio) {
+    using V = vec::Vectorized<float>;
+    constexpr int lanes = V::size();
+    const int values_per_byte = 8 / bits;
+    parallel::parallel_for(0, rows, 1, [&](int64_t first, int64_t last) {
+        for (int64_t row = first; row < last; ++row) {
+            const float* src = input + row * columns;
+            uint8_t* dst = output + row * width;
+            float lo, hi;
+            if (ranges && !optimized) {
+                lo = ranges[2 * row]; hi = ranges[2 * row + 1];
+            } else if (std::fegetround() == FE_TONEAREST && columns >= lanes) {
+                V minimum(std::numeric_limits<float>::infinity());
+                V maximum(-std::numeric_limits<float>::infinity());
+                int64_t col = 0;
+                for (; col + lanes <= columns; col += lanes) {
+                    const V values = V::loadu(src + col);
+                    minimum = vec::minimum(minimum, values);
+                    maximum = vec::maximum(maximum, values);
+                }
+                alignas(64) float minima[lanes], maxima[lanes];
+                minimum.store(minima); maximum.store(maxima);
+                lo = minima[0]; hi = maxima[0];
+                for (int lane = 1; lane < lanes; ++lane) {
+                    lo = std::min(lo, minima[lane]); hi = std::max(hi, maxima[lane]);
+                }
+                for (; col < columns; ++col) { lo = std::min(lo, src[col]); hi = std::max(hi, src[col]); }
+            } else {
+                lo = src[0]; hi = src[0];
+                for (int64_t col = 1; col < columns; ++col) {
+                    lo = ::fminf(lo, src[col]); hi = ::fmaxf(hi, src[col]);
+                }
+            }
+            if (optimized && bits != 8 && hi > lo) {
+                const float step = (hi - lo) / static_cast<float>(bins);
+                const float threshold = static_cast<float>(bins) * (1.f - ratio) * step;
+                float best = rowwise_loss(src, columns, lo, hi, bits), current = best;
+                float left = lo, right = hi;
+                while (left + threshold < right) {
+                    const float loss_left = rowwise_loss(src, columns, left + step, right, bits);
+                    const float loss_right = rowwise_loss(src, columns, left, right - step, bits);
+                    if (current < loss_left && current < loss_right && current < best) {
+                        best = current; lo = left; hi = right;
+                    }
+                    if (loss_left < loss_right) {
+                        if (left + step == left) break;
+                        left += step; current = loss_left;
+                    } else {
+                        if (right - step == right) break;
+                        right -= step; current = loss_right;
+                    }
+                }
+            }
+            float scale, inverse;
+            if (bits == 8) {
+                scale = (hi - lo) / 255.f;
+                inverse = 255.f / (hi - lo + 1.e-8f);
+            } else {
+                lo = static_cast<float>(Half(lo));
+                scale = hi == lo ? 1.f : static_cast<float>(Half((hi - lo) / ((1 << bits) - 1)));
+                inverse = scale == 0.f ? 1.f : 1.f / scale;
+                if (scale == 0.f || std::isinf(inverse)) scale = inverse = 1.f;
+            }
+            int64_t col = 0;
+            if (std::fegetround() == FE_TONEAREST && lanes >= values_per_byte && lanes % values_per_byte == 0) {
+                alignas(64) float codes[lanes];
+                for (; col + lanes <= columns; col += lanes) {
+                    V values = ((V::loadu(src + col) - V(lo)) * V(inverse)).round();
+                    values = vec::minimum(V(static_cast<float>((1 << bits) - 1)), vec::maximum(V(0.f), values));
+                    values.store(codes);
+                    for (int lane = 0; lane < lanes; lane += values_per_byte) {
+                        uint8_t packed = 0;
+                        for (int v = 0; v < values_per_byte; ++v)
+                            packed |= static_cast<uint8_t>(codes[lane + v]) << (v * bits);
+                        dst[(col + lane) / values_per_byte] = packed;
+                    }
+                }
+            }
+            for (; col < columns; col += values_per_byte) {
+                uint8_t packed = 0;
+                for (int v = 0; v < values_per_byte; ++v) {
+                    const float code = ::nearbyintf((src[col + v] - lo) * inverse);
+                    const uint8_t quantized = static_cast<uint8_t>(::fmaxf(0.f, ::fminf((1 << bits) - 1, code)));
+                    packed |= quantized << (v * bits);
+                }
+                dst[col / values_per_byte] = packed;
+            }
+            if (bits == 8) {
+                quant::put_float(dst + width - 8, scale); quant::put_float(dst + width - 4, lo);
+            } else {
+                quant::put_half(dst + width - 4, scale); quant::put_half(dst + width - 2, lo);
+            }
+        }
+    });
+}
+
 void fp16_linear_impl(const float* x, const Half* w, const float* bias, float* y,
         int64_t first, int64_t last, int64_t n, int64_t k, bool relu) {
     using FV = vec::Vectorized<float>;
@@ -1310,8 +1422,10 @@ void cat_rows_impl(const int8_t* input, int8_t* output, int64_t rows,
         int64_t input_zero_point, double output_scale, int64_t output_zero_point,
         bool same_qparams, bool relu) {
     using QV = vec::Vectorized<qint8>;
+    using FV = vec::Vectorized<float>;
     const int8_t zero = static_cast<int8_t>(output_zero_point);
     const int64_t vector_end = chunk - chunk % QV::size();
+    const bool vector_rounding = std::fegetround() == FE_TONEAREST;
     parallel::parallel_for(0, rows, 1, [&](int64_t first, int64_t last) {
         for (int64_t row = first; row < last; ++row) {
             const int8_t* src = input + row * chunk;
@@ -1330,12 +1444,56 @@ void cat_rows_impl(const int8_t* input, int8_t* output, int64_t rows,
                 }
                 continue;
             }
-            const double inverse_output_scale = 1.0 / output_scale;
-            for (int64_t col = 0; col < chunk; ++col) {
-                const double value =
-                    (static_cast<double>(src[col]) - input_zero_point) * input_scale;
-                const double rounded = std::nearbyint(
-                    value * inverse_output_scale) + output_zero_point;
+            int64_t col = 0;
+            if (vector_rounding) {
+                const float input_scale_f = static_cast<float>(input_scale);
+                const float inverse_output_scale_f = 1.f / static_cast<float>(output_scale);
+                for (; col < vector_end; col += QV::size()) {
+                    auto values = QV::loadu(src + col).dequantize(
+                        FV(input_scale_f),
+                        FV(static_cast<float>(input_zero_point)));
+                    if (relu) {
+                        for (auto& value : values)
+                            value = vec::maximum(value, FV(0.f));
+                    }
+                    QV::quantize(values, static_cast<float>(output_scale),
+                            static_cast<int32_t>(output_zero_point),
+                            inverse_output_scale_f)
+                        .store(dst + col);
+
+                    alignas(64) float approximations[QV::size()];
+                    int value_offset = 0;
+                    for (const auto& value : values) {
+                        const int count = std::min<int>(FV::size(), QV::size() - value_offset);
+                        value.store(approximations + value_offset, count);
+                        value_offset += count;
+                    }
+                    for (int lane = 0; lane < QV::size(); ++lane) {
+                        const float scaled = approximations[lane] * inverse_output_scale_f;
+                        if (scaled < -512.f || scaled > 512.f) continue;
+                        const float fraction = std::fabs(scaled - std::floor(scaled));
+                        const float tolerance = 8.f * std::numeric_limits<float>::epsilon() *
+                            (std::fabs(scaled) + 1.f);
+                        if (fraction < 0.5f - tolerance || fraction > 0.5f + tolerance)
+                            continue;
+
+                        const float exact_value = static_cast<float>(
+                            (static_cast<double>(src[col + lane]) - input_zero_point) * input_scale);
+                        const float rounded = std::nearbyintf(exact_value * inverse_output_scale_f) +
+                            static_cast<float>(output_zero_point);
+                        int8_t code = static_cast<int8_t>(std::clamp(
+                            static_cast<int64_t>(rounded), int64_t(-128), int64_t(127)));
+                        if (relu) code = std::max(code, zero);
+                        dst[col + lane] = code;
+                    }
+                }
+            }
+            const float inverse_output_scale = 1.f / static_cast<float>(output_scale);
+            for (; col < chunk; ++col) {
+                const float value = static_cast<float>(
+                    (static_cast<double>(src[col]) - input_zero_point) * input_scale);
+                const float rounded = std::nearbyintf(
+                    value * inverse_output_scale) + static_cast<float>(output_zero_point);
                 int8_t code = static_cast<int8_t>(std::clamp(
                     static_cast<int64_t>(rounded), int64_t(-128), int64_t(127)));
                 if (relu) code = std::max(code, zero);
@@ -1370,6 +1528,7 @@ REGISTER_DISPATCH(quantized_spatial_mean_stub, &spatial_mean_impl);
 REGISTER_DISPATCH(quantized_pool_stub, &pool_impl);
 REGISTER_DISPATCH(quantized_lookup_stub, &lookup_impl);
 REGISTER_DISPATCH(quantized_softmax_stub, &softmax_impl);
+REGISTER_DISPATCH(quantized_rowwise_pack_stub, &rowwise_pack_impl);
 REGISTER_DISPATCH(quantized_binary_stub, &binary_impl);
 REGISTER_DISPATCH(quantized_embedding_stub, &embedding_impl);
 REGISTER_DISPATCH(quantized_fp16_linear_stub, &fp16_linear_impl);
@@ -1396,6 +1555,7 @@ ALSO_REGISTER_AVX512_DISPATCH(quantized_spatial_mean_stub, &spatial_mean_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_pool_stub, &pool_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_lookup_stub, &lookup_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_softmax_stub, &softmax_impl);
+ALSO_REGISTER_AVX512_DISPATCH(quantized_rowwise_pack_stub, &rowwise_pack_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_binary_stub, &binary_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_embedding_stub, &embedding_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_fp16_linear_stub, &fp16_linear_impl);

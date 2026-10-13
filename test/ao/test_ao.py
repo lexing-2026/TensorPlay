@@ -155,6 +155,25 @@ def test_quantized_cat_rowwise_relu_preserves_concat_offsets_and_tails():
     assert tp.equal(got, want)
 
 
+def test_quantized_cat_mixed_qparams_vector_rows_match_float_reference():
+    a_values = [[float((i % 23) - 11) for i in range(70)] for _ in range(2)]
+    b_values = [[float((i % 13) - 6) for i in range(37)] for _ in range(2)]
+    a = _make_qtensor(a_values, 0.17, 5)
+    b = _make_qtensor(b_values, 0.31, -4)
+    out_scale, out_zp = 0.23, 2
+    got = tp._C.quantized_cat([a, b], 1, out_scale, out_zp)
+    ref = tp.cat([tp.dequantize(a), tp.dequantize(b)], 1)
+    want = tp.quantize_per_tensor(ref, out_scale, out_zp, tp.qint8)
+    assert tp.equal(got, want)
+
+
+def test_quantized_cat_vector_rows_match_float_reference_at_rounding_boundary():
+    a = _make_qtensor([[28.05] * 70], 0.17, -128)
+    got = tp._C.quantized_cat([a], 1, 0.3, 0)
+    want = tp.quantize_per_tensor(tp.dequantize(a), 0.3, 0, tp.qint8)
+    assert tp.equal(got, want)
+
+
 def test_quantized_max_pool2d_all_negative_window_keeps_true_max():
     # A window whose every code is negative must surface the true maximum,
     # not a zero-initialized running value.

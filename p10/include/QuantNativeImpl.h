@@ -8,6 +8,7 @@
 #include <array>
 #include <numeric>
 #include <cstring>
+#include <type_traits>
 #ifdef TP_QUANT_CUDA
 #include "CUDARuntime.h"
 #include "CUDAContext.h"
@@ -258,6 +259,20 @@ struct CatCodes {
     }
 };
 
+template<class T>
+struct CatRows {
+    const T* x; T* y; int64_t chunk, width, offset, xz, yz; float scale, inverse; bool relu;
+    TP_QN_DEVICE void operator()(int64_t row) const {
+        const T* source = x + row * chunk;
+        T* destination = y + row * width + offset;
+        for (int64_t column = 0; column < chunk; ++column) {
+            float value = static_cast<float>(static_cast<int64_t>(source[column]) - xz) * scale;
+            if (relu) value = ::fmaxf(value, 0.f);
+            destination[column] = encode<T>(value, inverse, yz);
+        }
+    }
+};
+
 Tensor cat(const std::vector<Tensor>& inputs, int64_t dim, std::optional<double> scale,
            std::optional<int64_t> zp, bool relu) {
     TP_CHECK(!inputs.empty(), "Concatenation requires at least one operand");
@@ -275,14 +290,37 @@ Tensor cat(const std::vector<Tensor>& inputs, int64_t dim, std::optional<double>
     const double ys = scale.value_or(quantized::q_scale(first));
     const int64_t yz = zp.value_or(quantized::q_zero_point(first));
     Tensor y = output(first, shape, ys, yz);
-    int64_t inner = 1, offset = 0;
+    int64_t outer = 1, inner = 1, offset = 0;
+    for (int d = 0; d < dim; ++d) outer *= first.size(d);
     for (int d = dim + 1; d < first.dim(); ++d) inner *= first.size(d);
     for (const auto& src : inputs) {
         Tensor x = src.contiguous();
         codes(src.dtype(), [&]<class T>() {
-            apply(x.numel(), CatCodes<T>{x.data_ptr<T>(), y.data_ptr<T>(), src.size(dim), inner,
-                shape[dim], offset, quantized::q_zero_point(src), yz,
-                static_cast<float>(quantized::q_scale(src)), 1.f / static_cast<float>(ys), relu});
+            if (inner == 1) {
+#ifdef TP_QUANT_CUDA
+                apply(outer, CatRows<T>{x.data_ptr<T>(), y.data_ptr<T>(), src.size(dim),
+                    shape[dim], offset, quantized::q_zero_point(src), yz,
+                    static_cast<float>(quantized::q_scale(src)), 1.f / static_cast<float>(ys), relu});
+#else
+                if constexpr (std::is_same_v<T, int8_t>) {
+                    const bool same_qparams = quantized::q_scale(src) == ys &&
+                        quantized::q_zero_point(src) == yz;
+                    tensorplay::cpu::quantized_cat_rows_stub(
+                        DeviceType::CPU, x.data_ptr<int8_t>(), y.data_ptr<int8_t>(),
+                        outer, src.size(dim), shape[dim], offset,
+                        quantized::q_scale(src), quantized::q_zero_point(src),
+                        ys, yz, same_qparams, relu);
+                } else {
+                    apply(outer, CatRows<T>{x.data_ptr<T>(), y.data_ptr<T>(), src.size(dim),
+                        shape[dim], offset, quantized::q_zero_point(src), yz,
+                        static_cast<float>(quantized::q_scale(src)), 1.f / static_cast<float>(ys), relu});
+                }
+#endif
+            } else {
+                apply(x.numel(), CatCodes<T>{x.data_ptr<T>(), y.data_ptr<T>(), src.size(dim), inner,
+                    shape[dim], offset, quantized::q_zero_point(src), yz,
+                    static_cast<float>(quantized::q_scale(src)), 1.f / static_cast<float>(ys), relu});
+            }
         });
         offset += src.size(dim);
     }
