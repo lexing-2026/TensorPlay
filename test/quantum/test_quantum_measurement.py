@@ -463,3 +463,62 @@ def test_a_readout_entry_outside_the_unit_interval_is_rejected():
 def test_a_column_count_that_is_not_a_whole_register_is_rejected():
     with pytest.raises(ValueError):
         tq.apply_readout_error(tp.zeros(1, 3), tq.readout_error_matrix(0.1))
+
+
+# ---------------------------------------------------------------------------
+# Column order
+# ---------------------------------------------------------------------------
+
+
+def test_the_marginal_columns_follow_the_wires_as_listed():
+    # |01> has wire 1 set, so it lands in the column that names wire 1 first.
+    state = tq.basis_state(1, 2)
+    leading_one = tq.marginal_probs(state, [1, 0])
+    trailing_one = tq.marginal_probs(state, [0, 1])
+    assert abs(float(leading_one.reshape(-1)[2]) - 1.0) < 1e-6
+    assert abs(float(trailing_one.reshape(-1)[1]) - 1.0) < 1e-6
+
+
+def test_a_marginal_carries_the_same_weights_in_any_order():
+    state = tq.apply_h(tq.zeros_state(3), 0)
+    ascending = tp.sort(tq.marginal_probs(state, [0, 2]).reshape(-1)).values
+    descending = tp.sort(tq.marginal_probs(state, [2, 0]).reshape(-1)).values
+    tp.testing.assert_close(ascending, descending, atol=1e-6, rtol=1e-6)
+
+
+def test_the_sampled_columns_follow_the_wires_as_listed():
+    state = tq.basis_state(1, 2)
+    counts = tq.measure(state, 256, wires=[1, 0])
+    assert abs(float(counts[0, 2]) - 256.0) < 1e-4
+
+
+def test_a_word_read_in_an_unusual_order_still_reads_its_own_wires():
+    # Wire 1 is measured first here, so the histogram column bit that names the
+    # word's factor is the leading one.  Reading the value back has to agree
+    # with the exact expectation either way round.
+    state = tq.apply_h(tq.zeros_state(2), 0)
+    rotated = tq.apply_measurement_basis(state, "ZI")
+    exact = tq.expectation(state, "IZ")
+    for wires in ([0, 1], [1, 0]):
+        counts = tq.measure(rotated, 8192, wires=wires)
+        estimate = tq.expectation_from_counts(counts, "IZ", wires=wires)
+        tp.testing.assert_close(estimate, exact, atol=0.05, rtol=0)
+
+
+def test_a_sub_word_of_the_wires_read_stays_correct():
+    # The word names a wire that is not measured at all, and one that is.
+    state = tq.apply_h(tq.zeros_state(2), 0)
+    counts = tq.measure(state, 8192, wires=[1])
+    estimate = tq.expectation_from_counts(counts, "IZ", wires=[1])
+    tp.testing.assert_close(estimate, tp.tensor([1.0]), atol=0.05, rtol=0)
+
+
+def test_a_marginal_may_span_more_wires_than_a_gate():
+    # A gate's matrix is 2**k by 2**k, so it stops well short of a wide
+    # register; a histogram carries no matrix and reads all of it at once.
+    n_qubits = 10
+    state = tq.basis_state(1, n_qubits)
+    counts = tq.measure(state, 128)
+    assert counts.shape == (1, 1 << n_qubits)
+    tp.testing.assert_close(counts.sum(), tp.tensor(128.0), atol=1e-4, rtol=1e-6)
+    tp.testing.assert_close(counts[0, 1], tp.tensor(128.0), atol=1e-4, rtol=1e-6)

@@ -11880,3 +11880,25 @@
     CPU: quantum_state_probs_cpu
     CUDA: quantum_state_probs_cuda
   tags: core
+
+# |amplitude|**2 marginalized onto the listed qubits: the distribution those
+# qubits give when the rest are ignored.  One pass over the amplitudes, each
+# weight landing in the column its targeted bits name, so no permuted copy of
+# the distribution is built and reduced.
+- func: _quantum_marginal_probs(Tensor state, SymInt[] wires) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantum_marginal_probs_cpu
+    CUDA: quantum_marginal_probs_cuda
+  tags: core
+
+# <psi|P|psi> for a Pauli word given as one code per qubit -- 0 for I, 1 for X,
+# 2 for Y, 3 for Z -- real and per batch entry.  Every row of a Pauli matrix
+# holds a single entry, so the overlap is one pass of two reads per amplitude
+# instead of a rotated state written out and reduced.
+- func: _quantum_pauli_expectation(Tensor state, Tensor word) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantum_pauli_expectation_cpu
+    CUDA: quantum_pauli_expectation_cuda
+  tags: core

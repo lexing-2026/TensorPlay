@@ -99,6 +99,31 @@ def test_expectation_matches_the_host():
     )
 
 
+def test_a_pauli_expectation_with_y_factors_matches_the_host():
+    # The overlap's imaginary half is what a Y factor lands in, so a word with
+    # one in it is the case that tells a right answer from a conjugated one.
+    state = tq.apply_s(tq.apply_h(tq.zeros_state(1), 0), 0)
+    tp.testing.assert_close(
+        _on_device(tq.expectation(state.to(tp.device("cuda")), "Y")),
+        tq.expectation(state, "Y"),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_a_pauli_expectation_of_a_batch_matches_the_host():
+    states = tq.plus_state(3, batch=4)
+    for wire in range(3):
+        states = tq.apply_s(states, wire)
+    for word in ("XXX", "ZZZ", "YZI", "IXY", "III"):
+        tp.testing.assert_close(
+            _on_device(tq.expectation(states.to(tp.device("cuda")), word)),
+            tq.expectation(states, word),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+
 def test_sampling_stays_on_the_device():
     # |+0> puts half its shots on |00> and half on |10>.
     state = tq.apply_h(tq.zeros_state(2), 0)
@@ -138,6 +163,25 @@ def test_sampled_readout_error_matches_the_exact_map():
     counts = counts.to(tp.device("cpu"))
     tp.testing.assert_close(counts.sum(), tp.tensor(20000.0), atol=1e-4, rtol=1e-6)
     tp.testing.assert_close(counts / counts.sum(), exact, atol=0.02, rtol=0)
+
+
+def test_the_marginal_keeps_its_column_order_on_the_device():
+    state = tq.apply_h(tq.zeros_state(3), 0)
+    on_device = tq.marginal_probs(state.to(tp.device("cuda")), [2, 0, 1])
+    tp.testing.assert_close(
+        _on_device(on_device),
+        tq.marginal_probs(state, [2, 0, 1]),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_the_marginal_covers_a_wide_register_on_the_device():
+    state = tq.basis_state(1, 10)
+    counts = tq.measure(state.to(tp.device("cuda")), 512)
+    assert counts.shape == (1, 1024)
+    counts = counts.to(tp.device("cpu"))
+    tp.testing.assert_close(counts[0, 1], tp.tensor(512.0), atol=1e-4, rtol=1e-6)
 
 
 def test_channel_matches_the_host():

@@ -458,8 +458,12 @@ def _read_out(indices: tp.Tensor, matrices: tp.Tensor) -> tp.Tensor:
         bit = n_wires - 1 - position
         prepared = tp.bitwise_and(tp.bitwise_right_shift(indices, bit), 1)
         # The entry at column zero is the chance of being told 0; comparing the
-        # draw against it settles the reported bit in one step.
-        stay_zero = matrices[position][:, 0][prepared]
+        # draw against it settles the reported bit in one step.  The two
+        # thresholds are picked by a select rather than gathered, so the whole
+        # step stays elementwise on whatever device holds the state.
+        stay_zero = tp.where(
+            prepared == 1, matrices[position][1, 0], matrices[position][0, 0]
+        )
         reported = tp.where(draws[position] < stay_zero, 0, 1).to(indices.dtype)
         # A wire moves only where the two readings disagree, so the mask carries
         # the difference rather than the reading itself.
