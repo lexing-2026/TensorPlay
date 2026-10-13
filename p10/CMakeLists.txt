@@ -70,6 +70,7 @@ set(P10_SOURCES
     src/backend/cpu/MarginLossKernels.cpp
     src/backend/cpu/UpsampleKernels.cpp
     src/backend/cpu/MiscKernels.cpp
+    src/backend/cpu/QuantumKernels.cpp
     src/backend/cpu/SegmentReduce.cpp
     src/backend/cpu/SparseSoftMax.cpp
     src/backend/cpu/SparseBlasKernels.cpp
@@ -104,6 +105,7 @@ set(P10_SOURCES
     src/backend/cpu/SortingKernels.cpp
     src/backend/cpu/TensorCompareKernels.cpp
     src/backend/cpu/OpsKernels.cpp
+    src/backend/cpu/SnnKernels.cpp
     src/backend/cpu/BitwiseKernels.cpp
     src/backend/cpu/Blas.cpp
     src/backend/cpu/BatchLinearAlgebra.cpp
@@ -219,6 +221,10 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/SpdiagsKernels.cu
         src/backend/cuda/SemiStructuredKernels.cu
         src/backend/cuda/QuantKernels.cu
+        src/backend/cuda/QuantActivationKernels.cu
+        src/backend/cuda/QuantCatKernels.cu
+        src/backend/cuda/QuantPoolKernels.cu
+        src/backend/cuda/QuantConvKernels.cu
         src/backend/cuda/QuantBatchNormKernels.cu
         src/backend/cuda/QuantNormalizationKernels.cu
         src/backend/cuda/AffineQuantKernels.cu
@@ -254,6 +260,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/TensorFactories.cu
         src/backend/cuda/Itertools.cu
         src/backend/cuda/MiscKernels.cu
+        src/backend/cuda/QuantumKernels.cu
         src/backend/cuda/UpsampleNearest1dKernels.cu
         src/backend/cuda/UpsampleNearest2dKernels.cu
         src/backend/cuda/UpsampleNearest3dKernels.cu
@@ -430,6 +437,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/BinaryPointwiseKernels.cu
         src/backend/cuda/CompareLogicalKernels.cu
         src/backend/cuda/UnaryMathKernels.cu
+        src/backend/cuda/SnnKernels.cu
         src/backend/cuda/ClampKernels.cu
         src/backend/cuda/BitwiseKernels.cu
         src/backend/cuda/BincountKernels.cu

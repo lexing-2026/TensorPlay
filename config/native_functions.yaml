@@ -4535,6 +4535,59 @@
     CUDA: heaviside_cuda
   tags: pointwise
 
+# ---------------------------------------------------------------------------
+# Spiking neural network (SNN) primitives
+# ---------------------------------------------------------------------------
+#
+# One fused single-step neuron update:
+#
+#   h     = decay * v + input
+#   spike = heaviside(h - threshold)
+#   v_new = soft reset : h - threshold * spike
+#           hard reset : h * (1 - spike) + v_reset * spike
+#
+# `surrogate` selects the gradient that replaces the (almost everywhere zero)
+# step derivative during backward: 0 straight-through, 1 sigmoid, 2 fast
+# sigmoid, 3 piecewise-linear.  `alpha` scales the surrogate.  `detach_reset`
+# treats the spike in the voltage-update path as a constant during backward,
+# which is the standard stabilizing choice for surrogate-gradient training.
+
+- func: snn_lif_step(Tensor input, Tensor v, Tensor decay, Tensor threshold, Tensor? v_reset=None, int surrogate=0, float alpha=1.0, bool detach_reset=True) -> (Tensor spike, Tensor v_new)
+  variants: function
+  dispatch:
+    CPU: snn_lif_step_cpu
+    CUDA: snn_lif_step_cuda
+
+- func: snn_lif_step_backward(Tensor grad_spike, Tensor grad_v, Tensor input, Tensor v, Tensor decay, Tensor threshold, Tensor spike, Tensor v_new, Tensor? v_reset=None, int surrogate=0, float alpha=1.0, bool detach_reset=True) -> (Tensor grad_input, Tensor grad_v_init, Tensor grad_decay, Tensor grad_threshold)
+  variants: function
+  dispatch:
+    CPU: snn_lif_step_backward_cpu
+    CUDA: snn_lif_step_backward_cuda
+
+# Multi-step variant of ``snn_lif_step``: ``input`` has shape ``[T, B, ...]``
+# and the neuron dynamics iterate over time inside a single fused kernel,
+# returning the full ``[T, B, ...]`` spike train and the ``[B, ...]`` final
+# voltage.  The backward recomputes the membrane trajectory from the stored
+# spikes and back-propagates the voltage gradient across time (BPTT).
+- func: snn_lif_seq(Tensor input, Tensor v_init, Tensor decay, Tensor threshold, Tensor? v_reset=None, int surrogate=0, float alpha=1.0, bool detach_reset=True) -> (Tensor spikes, Tensor v_final)
+  variants: function
+  dispatch:
+    CPU: snn_lif_seq_cpu
+    CUDA: snn_lif_seq_cuda
+
+- func: snn_lif_seq_backward(Tensor grad_spikes, Tensor grad_v_final, Tensor input, Tensor v_init, Tensor decay, Tensor threshold, Tensor spikes, Tensor v_final, Tensor? v_reset=None, int surrogate=0, float alpha=1.0, bool detach_reset=True) -> (Tensor grad_input, Tensor grad_v_init, Tensor grad_decay, Tensor grad_threshold)
+  variants: function
+  dispatch:
+    CPU: snn_lif_seq_backward_cpu
+    CUDA: snn_lif_seq_backward_cuda
+
+# Surrogate gradient of the spike step, evaluated at x = h - threshold.
+- func: snn_surrogate_grad(Tensor x, int surrogate=0, float alpha=1.0) -> Tensor
+  variants: function
+  dispatch:
+    CPU: snn_surrogate_grad_cpu
+    CUDA: snn_surrogate_grad_cuda
+
 - func: hypot(Tensor self, Tensor other) -> Tensor
   device_check: NoCheck
   variants: function, method
@@ -5202,6 +5255,36 @@
     CPU: quantize_per_channel_cpu
     CUDA: quantize_per_channel_cuda
 
+- func: quantize_affine(Tensor self, int[] block_size, Tensor scales, Tensor? zero_points, ScalarType dtype, int quant_min, int quant_max) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantize_affine_cpu
+    CUDA: quantize_affine_cuda
+
+- func: dequantize_affine(Tensor self, int[] block_size, Tensor scales, Tensor? zero_points=None) -> Tensor
+  variants: function
+  dispatch:
+    CPU: dequantize_affine_cpu
+    CUDA: dequantize_affine_cuda
+
+- func: quantize_affine_float8(Tensor self, Tensor scale, ScalarType dtype) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantize_affine_float8_cpu
+    CUDA: quantize_affine_float8_cuda
+
+- func: dequantize_affine_float8(Tensor self, Tensor scale, ScalarType output_dtype) -> Tensor
+  variants: function
+  dispatch:
+    CPU: dequantize_affine_float8_cpu
+    CUDA: dequantize_affine_float8_cuda
+
+- func: choose_scale_float8(Tensor self, int[] block_size, ScalarType float8_dtype, float? hp_value_lb=None, float? hp_value_ub=None) -> Tensor
+  variants: function
+  dispatch:
+    CPU: choose_scale_float8_cpu
+    CUDA: choose_scale_float8_cuda
+
 - func: dequantize.self(Tensor self) -> Tensor
   variants: function, method
   dispatch:
@@ -5292,11 +5375,13 @@
   variants: function
   dispatch:
     CPU: quantized_conv2d_prepack_cpu
+    CUDA: quantized_conv2d_prepack_cuda
 
 - func: quantized_conv2d_unpack(Tensor weight_packed, Tensor bias_packed, SymInt[] weight_sizes, bool transposed=False, bool depthwise=False) -> (Tensor weight, Tensor bias)
   variants: function
   dispatch:
     CPU: quantized_conv2d_unpack_cpu
+    CUDA: quantized_conv2d_unpack_cuda
 
 - func: quantized_conv2d_run(Tensor input, Tensor weight_packed, Tensor bias_packed, SymInt[] weight_sizes, float input_scale, int input_zero_point, float out_scale, int out_zero_point, int[] stride=1, int[] padding=0, int[] dilation=1, int[] output_padding=0, int groups=1, bool transposed=False, Scalar? output_min=None, Scalar? output_max=None) -> Tensor
   variants: function
@@ -5373,21 +5458,25 @@
   variants: function
   dispatch:
     CPU: quantized_cat_cpu
+    CUDA: quantized_cat_cuda
 
 - func: quantized_cat_relu(Tensor[] tensors, int dim=0, float? scale=None, int? zero_point=None) -> Tensor
   variants: function
   dispatch:
     CPU: quantized_cat_relu_cpu
+    CUDA: quantized_cat_relu_cuda
 
 - func: quantized_conv1d(Tensor input, Tensor weight, Tensor? bias, float input_scale, int input_zero_point, float weight_scale, int weight_zero_point, float out_scale, int out_zero_point, int[] stride=1, int[] padding=0, int[] dilation=1, int groups=1) -> Tensor
   variants: function
   dispatch:
     CPU: quantized_conv1d_cpu
+    CUDA: quantized_conv1d_cuda
 
 - func: quantized_conv3d(Tensor input, Tensor weight, Tensor? bias, float input_scale, int input_zero_point, float weight_scale, int weight_zero_point, float out_scale, int out_zero_point, int[] stride=1, int[] padding=0, int[] dilation=1, int groups=1) -> Tensor
   variants: function
   dispatch:
     CPU: quantized_conv3d_cpu
+    CUDA: quantized_conv3d_cuda
 
 # ---------------------------------------------------------------------------
 # Native forward-mode AD (JVP) kernels: each op evaluates the primal and its
@@ -6979,6 +7068,9 @@
   cpp_no_default_args: ['dtype', 'layout', 'device', 'pin_memory']
 - func: quantized_batch_norm(Tensor input, Tensor? weight, Tensor? bias, Tensor mean, Tensor var, float eps, float output_scale, int output_zero_point) -> Tensor
   variants: function
+  dispatch:
+    CPU: quantized_batch_norm_cpu
+    CUDA: quantized_batch_norm_cuda
 - func: quantized_layer_norm(Tensor input, int[] normalized_shape, Tensor? weight, Tensor? bias, float eps, float output_scale, int output_zero_point) -> Tensor
   variants: function
   dispatch:
@@ -7733,11 +7825,13 @@
   variants: function
   dispatch:
     CPU: quantized_max_pool1d_cpu
+    CUDA: quantized_max_pool1d_cuda
 
 - func: quantized_max_pool3d(Tensor self, int[3] kernel_size, int[3] stride=[], int[3] padding=0, int[3] dilation=1, bool ceil_mode=False) -> Tensor
   variants: function
   dispatch:
     CPU: quantized_max_pool3d_cpu
+    CUDA: quantized_max_pool3d_cuda
 
 - func: mean.dtype_out(Tensor self, *, ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)
   device_check: NoCheck
@@ -11750,12 +11844,39 @@
 
 - func: _quantized_wrapped_linear(Tensor input, Tensor input_scale, Tensor input_zero_point, Tensor weight, Tensor weight_scale, Tensor weight_zero_point, Tensor bias, Tensor output_scale, Tensor output_zero_point, int out_channels) -> Tensor
   variants: function
-
 - func: _quantized_wrapped_half_prepack(Tensor weight) -> Tensor
   variants: function
-
 - func: _quantized_wrapped_half_linear(Tensor input, Tensor weight, Tensor bias, int out_channels) -> Tensor
   variants: function
 
 - func: _quantized_recurrent_step(Tensor input_gates, Tensor hidden_gates, Tensor hidden, Tensor? cell, int mode) -> (Tensor, Tensor)
   variants: function
+
+# State simulation primitives.  Both read the flat computational-basis layout
+# [batch, 2**n], where qubit w owns bit n-1-w of the amplitude index, so qubit 0
+# is the most significant bit.  The frontend keeps states as [batch, 2, 2, ...]
+# and folds the qubit dimensions into this single axis, which lets one output
+# amplitude gather the 2**k inputs that differ only inside the targeted bits --
+# a gate costs one pass over the amplitudes with no intermediate permuted copy.
+#
+# `mat` is 2**k by 2**k, or a per-batch [batch, 2**k, 2**k] stack when the gate
+# parameters differ across the batch; `wires` names the qubits in ascending
+# order, and a gate may span at most 8 of them -- anything wider is expressed
+# as a sequence of narrower gates.  The output takes the wider of the two input
+# dtypes and keeps the state's shape.
+- func: _quantum_apply_gate(Tensor state, Tensor mat, SymInt[] wires) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantum_apply_gate_cpu
+    CUDA: quantum_apply_gate_cuda
+  tags: core
+
+# |amplitude|**2 per basis entry: the measurement distribution of the state,
+# in the real dtype matching its complex one.  Fusing the square into a single
+# pass keeps the distribution from materializing the real and imaginary halves.
+- func: _quantum_state_probs(Tensor state) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantum_state_probs_cpu
+    CUDA: quantum_state_probs_cuda
+  tags: core
