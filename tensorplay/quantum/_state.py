@@ -369,10 +369,40 @@ def density_to_state(density: tp.Tensor, n_qubits: Optional[int] = None) -> tp.T
     return normalize(unflatten(flat, n_qubits))
 
 
+def _density_width(density: tp.Tensor) -> int:
+    """How many qubits a density matrix describes, read off its side.
+
+    A density matrix is flat -- ``[batch, 2**n, 2**n]`` -- so the width is the
+    side's base-two logarithm.  Reading it any other way makes a two-qubit matrix
+    indistinguishable from a one-qubit one, which is the one thing the flat form
+    cannot say by itself.
+    """
+    if density.dim() != 3 or density.shape[-1] != density.shape[-2]:
+        raise ValueError(
+            f"a density matrix is [batch, 2**n, 2**n], got {tuple(density.shape)}"
+        )
+    side = density.shape[-1]
+    if side < 1 or side & (side - 1):
+        raise ValueError(f"a density matrix's side is a power of two, got {side}")
+    return side.bit_length() - 1
+
+
 def partial_trace(density: tp.Tensor, keep: Sequence[int], n_qubits: Optional[int] = None) -> tp.Tensor:
-    """Trace ``density`` down to the qubits in ``keep``, in the given order."""
+    """Trace ``density`` down to the qubits in ``keep``, in the given order.
+
+    Args:
+        density: shaped ``[batch, 2**n, 2**n]`` -- the flat form every other
+            function here reads a density matrix in, so the width is read off the
+            side.
+        keep: which qubits survive, in the order they come out.  Anything not
+            named is traced out.
+        n_qubits: the register width, when the side cannot say it.
+
+    Returns:
+        The reduced density matrix, ``[batch, 2**len(keep), 2**len(keep)]``.
+    """
     if n_qubits is None:
-        n_qubits = (density.dim() - 1) // 2
+        n_qubits = _density_width(density)
     kept = [w for w in keep]
     for wire in kept:
         if wire < 0 or wire >= n_qubits:

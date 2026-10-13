@@ -14,7 +14,7 @@ from ._circuit import expand_to_register
 from ._gates import pauli_matrix, pauli_rotation_matrix
 from ._helpers import DEFAULT_C_DTYPE, check_pauli_string, n_qubits_of, pauli_wires
 from ._measurement import expectation, expectation_from_density
-from ._state import flatten
+from ._state import _density_width, flatten
 
 __all__ = [
     "Hamiltonian",
@@ -144,18 +144,6 @@ def energy_from_density(density: tp.Tensor, hamiltonian: Hamiltonian) -> tp.Tens
         part = coeff * expectation_from_density(density, word.ljust(n_qubits, "I"))
         total = part if total is None else total + part
     return total
-
-
-def _density_width(density: tp.Tensor) -> int:
-    """How many qubits a density matrix describes, and whether it is one."""
-    if density.dim() != 3 or density.shape[-1] != density.shape[-2]:
-        raise ValueError(
-            f"a density matrix is [batch, 2**n, 2**n], got {tuple(density.shape)}"
-        )
-    side = density.shape[-1]
-    if side < 1 or side & (side - 1):
-        raise ValueError(f"a density matrix's side is a power of two, got {side}")
-    return side.bit_length() - 1
 
 
 def _trotter_stages(order: int) -> List[Tuple[float, int]]:
