@@ -77,12 +77,13 @@ take the parameter as the last argument: `apply_rx`, `apply_ry`, `apply_rz`,
 angle on a list of wires), `apply_global_phase` (scales the whole state).
 Two-qubit gates: `apply_cx`/`apply_cnot`, `apply_cy`, `apply_cz`, `apply_swap`,
 `apply_iswap`, `apply_dcx` (the same controlled X with the target written
-first), `apply_ecr` (echoed cross resonance), and the controlled parameter
-gates `apply_cp`, `apply_crx`, `apply_cry`, `apply_crz`. Wider gates:
-`apply_toffoli`/`apply_ccx` (three wires), `apply_rccx` (the relative-phase
-Toffoli), `apply_rc3x` (its four-wire version), `apply_cswap` (control plus two
-targets), and `apply_mcx`, which takes a control list and flips the remaining
-wire.
+first), `apply_ecr` (echoed cross resonance), the controlled square roots
+`apply_cs`, `apply_csdg` and `apply_csx`, and the controlled parameter gates
+`apply_cp`, `apply_crx`, `apply_cry`, `apply_crz`. Wider gates:
+`apply_toffoli`/`apply_ccx` (three wires), `apply_ccz` (two controls and a phase),
+`apply_rccx` (the relative-phase Toffoli), `apply_rc3x` (its four-wire version),
+`apply_cswap` (control plus two targets), and `apply_mcx`, which takes a control
+list and flips the remaining wire.
 
 The chemistry pair gates mix two wires while leaving the register's excitation
 count alone, which is what a particle-number-preserving ansatz needs:

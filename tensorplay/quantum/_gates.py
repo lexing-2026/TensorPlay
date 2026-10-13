@@ -28,13 +28,17 @@ from ._helpers import (
 
 __all__ = [
     "apply_ccx",
+    "apply_ccz",
     "apply_cnot",
     "apply_controlled",
     "apply_cp",
     "apply_crx",
     "apply_cry",
     "apply_crz",
+    "apply_cs",
+    "apply_csdg",
     "apply_cswap",
+    "apply_csx",
     "apply_cx",
     "apply_cy",
     "apply_cz",
@@ -1227,6 +1231,43 @@ def _apply_controlled_rotation(state, wires, angle, builder):
             builder(angle).to(device=state.device), len(wires) - 1
         ),
         wires,
+    )
+
+
+def _apply_controlled_unitary(state, control, target, builder):
+    """Apply a fixed single-qubit unitary, guarded by one control wire."""
+    return apply_gate(
+        state,
+        controlled_matrix(builder(device=state.device, c_dtype=state.dtype)),
+        [control, target],
+    )
+
+
+def apply_cs(state, control, target):
+    """Apply ``S`` on ``target``, controlled by ``control``."""
+    return _apply_controlled_unitary(state, control, target, s_matrix)
+
+
+def apply_csdg(state, control, target):
+    """Apply ``S^dagger`` on ``target``, controlled by ``control``."""
+    return _apply_controlled_unitary(state, control, target, sdg_matrix)
+
+
+def apply_csx(state, control, target):
+    """Apply the square root of ``X`` on ``target``, controlled by ``control``."""
+    return _apply_controlled_unitary(state, control, target, sx_matrix)
+
+
+def apply_ccz(state, control_a, control_b, target):
+    """Turn the one state with all three wires set over by a sign.
+
+    Two controls and a phase: nothing moves, but ``|...1 1 1>`` picks up a
+    minus, which is the gate a phase-preserving ansatz reaches for.
+    """
+    return apply_controlled(
+        state,
+        z_matrix(device=state.device, c_dtype=state.dtype),
+        [control_a, control_b, target],
     )
 
 

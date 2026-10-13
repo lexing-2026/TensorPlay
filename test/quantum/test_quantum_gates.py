@@ -826,3 +826,69 @@ def test_a_pair_mixer_takes_a_batched_angle():
         for index in range(3):
             single = mixer(tq.plus_state(2), [0, 1], theta[index:index + 1])
             tp.testing.assert_close(out[index:index + 1], single, atol=1e-6, rtol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# The controlled square roots and the doubly-controlled phase
+# ---------------------------------------------------------------------------
+
+
+def test_the_controlled_square_root_of_z_only_fires_on_a_set_control():
+    start = tq.basis_state(3, 2)  # |11>
+    tp.testing.assert_close(
+        _flat(tq.apply_cs(start, 0, 1)), _flat(1j * start), atol=1e-6, rtol=1e-6
+    )
+    for index in (0, 1, 2):
+        clear = tq.basis_state(index, 2)
+        tp.testing.assert_close(
+            _flat(tq.apply_cs(clear, 0, 1)), _flat(clear), atol=1e-6, rtol=1e-6
+        )
+
+
+def test_the_controlled_square_root_of_z_undoes_itself():
+    start = tq.basis_state(3, 2)
+    there = tq.apply_cs(start, 0, 1)
+    back = tq.apply_csdg(there, 0, 1)
+    tp.testing.assert_close(_flat(back), _flat(start), atol=1e-6, rtol=1e-6)
+
+
+def test_the_controlled_square_root_of_x_twice_is_the_controlled_x():
+    start = tq.basis_state(3, 2)
+    twice = tq.apply_csx(tq.apply_csx(start, 0, 1), 0, 1)
+    tp.testing.assert_close(
+        _flat(twice), _flat(tq.apply_cx(start, 0, 1)), atol=1e-6, rtol=1e-6
+    )
+
+
+def test_the_controlled_square_root_of_x_moves_the_wire_a_quarter_turn():
+    # Half the weight each way, and a quarter turn of relative phase: the
+    # amplitudes are the ones the matrix spells out.
+    start = tq.basis_state(3, 2)
+    out = tq.apply_csx(start, 0, 1)
+    tp.testing.assert_close(
+        _flat(out),
+        _flat(tq.basis_state(2, 2) * (0.5 - 0.5j)
+              + tq.basis_state(3, 2) * (0.5 + 0.5j)),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    probs = tq.probs(out).reshape(-1)
+    tp.testing.assert_close(probs, tp.tensor([0.0, 0.0, 0.5, 0.5]), atol=1e-6, rtol=1e-6)
+
+
+def test_the_doubly_controlled_phase_turns_one_state_over():
+    for index in range(8):
+        start = tq.basis_state(index, 3)
+        out = tq.apply_ccz(start, 0, 1, 2)
+        expected = -1 if index == 7 else 1
+        tp.testing.assert_close(
+            _flat(out), _flat(expected * start), atol=1e-6, rtol=1e-6
+        )
+
+
+def test_the_doubly_controlled_phase_moves_nothing():
+    state = tq.apply_h(tq.zeros_state(3), 0)
+    probs = tq.probs(state)
+    tp.testing.assert_close(
+        tq.probs(tq.apply_ccz(state, 0, 1, 2)), probs, atol=1e-6, rtol=1e-6
+    )
