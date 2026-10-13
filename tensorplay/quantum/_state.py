@@ -257,17 +257,21 @@ def sv2bloch(state: tp.Tensor) -> tp.Tensor:
     A normalized state is on the surface of the ball, so its vector is of unit
     length; the reading is unique up to a global phase, which the ball cannot
     see.  Batched, and real whatever the state's precision.
+
+    The three components are the readings of the three Pauli operators --
+    ``x = Tr(rho X)`` and so on -- so a state and its density matrix agree here
+    exactly, and a rotation of ``pi/2`` about z takes ``x`` to ``y``.
     """
     amplitudes = _one_qubit(state, "a state")
     top = amplitudes[:, 0]
     bottom = amplitudes[:, 1]
-    coherence = top.conj() * bottom
-    polar = tp.real(coherence)
-    imaginary = tp.imag(coherence)
-    return tp.stack(
-        [2.0 * polar, -2.0 * imaginary, tp.real(top.conj() * top - bottom.conj() * bottom)],
-        dim=-1,
-    ).to(dtype=_real_dtype(state))
+    overlap = top.conj() * bottom
+    components = [
+        2.0 * tp.real(overlap),
+        2.0 * tp.imag(overlap),
+        tp.real(top.conj() * top - bottom.conj() * bottom),
+    ]
+    return tp.stack(components, dim=-1).to(dtype=_real_dtype(state))
 
 
 def dens2bloch(density: tp.Tensor) -> tp.Tensor:
@@ -305,10 +309,11 @@ def bloch2sv(vector: tp.Tensor) -> tp.Tensor:
     c_dtype = _complex_dtype(_real_dtype(vector))
     real = parts.to(dtype=_real_dtype(vector))
     top = tp.sqrt(tp.clamp((1.0 + real[:, 2]) / 2.0, min=0.0)).reshape(-1, 1)
-    # At the south pole the formula divides by a length that has gone to zero;
-    # there the state is |1>, whose first amplitude is that zero and whose
-    # second is the whole of it.
-    coherence = _as_complex(real[:, 0], real[:, 1], c_dtype).reshape(-1, 1)
+    # rho_01 = (x - i y) / 2 is the state overlapped with itself one qubit over,
+    # so the second amplitude is that overlap divided by the first.  At the south
+    # pole the first is zero and the formula divides by it: there the state is
+    # |1>, whose second amplitude is the whole of it.
+    coherence = _as_complex(real[:, 0], -real[:, 1], c_dtype).reshape(-1, 1)
     bottom = tp.where(
         top > 1e-12, coherence / (2.0 * top + 1e-12), tp.ones_like(top)
     )

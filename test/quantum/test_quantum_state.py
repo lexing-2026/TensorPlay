@@ -270,37 +270,61 @@ def test_the_ball_reads_the_four_states_that_fix_the_axes():
         atol=1e-12,
         rtol=0,
     )
-    quarter = tq.apply_rx(tq.zeros_state(1, dtype=tp.complex128), 0, math.pi / 2)
+    # A quarter turn about x is a pi/2 rotation about x, which walks |+> round to
+    # -y; S is the same rotation about z by a quarter, and walks it to +y.
+    quarter_x = tq.apply_rx(tq.zeros_state(1, dtype=tp.complex128), 0, math.pi / 2)
     tp.testing.assert_close(
-        tq.sv2bloch(quarter),
+        tq.sv2bloch(quarter_x),
+        tp.tensor([[0.0, -1.0, 0.0]], dtype=tp.float64),
+        atol=1e-12,
+        rtol=0,
+    )
+    quarter_z = tq.apply_s(tq.plus_state(1, dtype=tp.complex128), 0)
+    tp.testing.assert_close(
+        tq.sv2bloch(quarter_z),
         tp.tensor([[0.0, 1.0, 0.0]], dtype=tp.float64),
         atol=1e-12,
         rtol=0,
     )
 
 
-def test_the_ball_reads_a_general_state_by_its_coherence():
-    # x and y are the real and imaginary parts of the amplitude overlap taken
-    # twice over, and z is the population difference -- worked out here from the
-    # amplitudes themselves, so the reading is held to the definition.
-    state = tq.apply_ry(tq.apply_h(tq.zeros_state(1, dtype=tp.complex128), 0), 0, 0.7)
-    top = complex(state[0, 0])
-    bottom = complex(state[0, 1])
-    overlap = top.conjugate() * bottom
-    tp.testing.assert_close(
-        tq.sv2bloch(state),
-        tp.tensor(
-            [[2 * overlap.real, -2 * overlap.imag, abs(top) ** 2 - abs(bottom) ** 2]],
-            dtype=tp.float64,
-        ),
-        atol=1e-12,
-        rtol=0,
-    )
-    # The density matrix of a state reads the same way: the ball cannot tell the
-    # two routes apart, which is the point of putting them in it.
-    tp.testing.assert_close(
-        tq.dens2bloch(tq.to_density(state)), tq.sv2bloch(state), atol=1e-12, rtol=0
-    )
+def test_the_ball_reads_a_state_by_what_each_pauli_operator_says_about_it():
+    # The three components are the readings of the three Pauli operators: the
+    # vector is the one the ball's axes are named after.  A reading that put y's
+    # sign the other way would be the same for every state with real amplitudes
+    # -- where y is zero either way -- and wrong for every state with a phase on
+    # it, so the states below all carry one.
+    paulis = {
+        "X": tp.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=tp.complex128),
+        "Y": tq.y_matrix(c_dtype=tp.complex128),
+        "Z": tp.tensor([[1.0, 0.0], [0.0, -1.0]], dtype=tp.complex128),
+    }
+    states = [
+        tq.zeros_state(1, dtype=tp.complex128),
+        tq.plus_state(1, dtype=tp.complex128),
+        tq.apply_s(tq.plus_state(1, dtype=tp.complex128), 0),
+        tq.apply_s(tq.plus_state(1, dtype=tp.complex128), 0, True),
+        tq.apply_p(tq.plus_state(1, dtype=tp.complex128), 0, math.pi / 3),
+        tq.apply_ry(tq.apply_h(tq.zeros_state(1, dtype=tp.complex128), 0), 0, 0.7),
+        tq.apply_ry(tq.apply_s(tq.plus_state(1, dtype=tp.complex128), 0), 0, 0.7),
+    ]
+    for state in states:
+        density = tq.to_density(state)[0]
+        want = [float(tp.real(tp.trace(density @ matrix))) for matrix in paulis.values()]
+        tp.testing.assert_close(
+            tq.sv2bloch(state)[0],
+            tp.tensor(want, dtype=tp.float64),
+            atol=1e-12,
+            rtol=1e-12,
+        )
+        # The density matrix of a state reads the same way: the ball cannot tell
+        # the two routes apart, which is the point of putting them in it.
+        tp.testing.assert_close(
+            tq.dens2bloch(tq.to_density(state)),
+            tq.sv2bloch(state),
+            atol=1e-12,
+            rtol=1e-12,
+        )
 
 
 def test_a_mixed_state_sits_inside_the_ball_and_says_by_how_much():
@@ -321,7 +345,9 @@ def test_a_mixed_state_sits_inside_the_ball_and_says_by_how_much():
 
 def test_a_vector_round_trips_through_what_it_names():
     angles = tp.tensor([0.0, 0.3, 1.1, 2.4], dtype=tp.float64)
-    states = tq.apply_ry(tq.zeros_state(1, batch=4, dtype=tp.complex128), 0, angles)
+    states = tq.apply_ry(
+        tq.apply_s(tq.zeros_state(1, batch=4, dtype=tp.complex128), 0), 0, angles
+    )
     vectors = tq.sv2bloch(states)
     tp.testing.assert_close(
         tq.sv2bloch(tq.bloch2sv(vectors)), vectors, atol=1e-11, rtol=1e-11
