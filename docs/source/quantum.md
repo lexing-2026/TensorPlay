@@ -497,6 +497,44 @@ generator reads zero — so the value carries half the frequency as well as the
 whole one, and no single displacement reaches both. Those angles want the
 differentiated gradient, which covers them.
 
+### One run, three ways
+
+The three routes are the same run to a variational search: the same circuit, the
+same Hamiltonian, the same optimizer, and a different way of getting the
+direction to walk in.
+
+```python
+h2 = tq.Hamiltonian([(-1.0523732, "II"), (0.3979374, "IZ"),
+                     (-0.3979374, "ZI"), (-0.1809312, "XX")])
+exact = float(tp.linalg.eigvalsh(h2.matrix())[0])        # -1.868555
+
+def circuit(angles):                                     # 3 layers, 12 angles
+    state = tq.zeros_state(2)
+    for layer in range(3):
+        for qubit in range(2):
+            state = tq.apply_ry(state, qubit, angles[0, 4 * layer + qubit])
+            state = tq.apply_rz(state, qubit, angles[0, 4 * layer + qubit + 1])
+        state = tq.apply_cnot(state, 0, 1)
+    return state
+
+energy = lambda a: tq.energy(circuit(a), h2)
+theta = nn.Parameter(tp.full((1, 12), 0.4))
+optimizer = tp.optim.Adam([theta], lr=0.1)
+for step in range(80):
+    optimizer.zero_grad()
+    energy(theta).backward()                             # through the circuit
+    # theta.backward(tq.param_shift(energy, theta.detach()))          # by displacing
+    # theta.backward(tq.param_shift(
+    #     lambda a: tq.sample_energy(circuit(a), h2, 4000),
+    #     theta.detach()))                                              # and in shots
+    optimizer.step()
+```
+
+Backpropagating lands about two thousandths above the exact ground energy, the
+displaced rule about three millionths — it is exact, so what is left is the
+optimizer's own step size — and four thousand shots per evaluation about a
+hundred-thousandth, which is where the shot noise puts it.
+
 ### Precision
 
 A register's own dtype is what a whole circuit runs at: a double-precision state
