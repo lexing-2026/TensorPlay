@@ -147,6 +147,9 @@ from ._gates import (
     z_matrix,
 )
 
+from ._gradients import (
+    param_shift,
+)
 from ._hamiltonian import (
     Hamiltonian,
     energy,
@@ -168,6 +171,7 @@ from ._measurement import (
     measure,
     probs,
     readout_error_matrix,
+    sample_energy,
     sample_indices,
 )
 from ._noise import (
@@ -303,6 +307,7 @@ __all__ = [
     "norm",
     "normalize",
     "p_matrix",
+    "param_shift",
     "partial_trace",
     "pauli_matrix",
     "pauli_rotation_matrix",
@@ -329,6 +334,7 @@ __all__ = [
     "rzx_matrix",
     "rzz_matrix",
     "s_matrix",
+    "sample_energy",
     "sample_indices",
     "sdg_matrix",
     "sesolve",

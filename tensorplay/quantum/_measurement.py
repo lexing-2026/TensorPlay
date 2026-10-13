@@ -40,6 +40,7 @@ __all__ = [
     "measure",
     "probs",
     "readout_error_matrix",
+    "sample_energy",
     "sample_indices",
 ]
 
@@ -421,7 +422,7 @@ def group_product(words: Sequence[str]) -> str:
 
 
 def joint_expectation(
-    state: tp.Tensor, words: Sequence[str], shots: int
+    state: tp.Tensor, words: Sequence[str], shots: int, *, readout=None
 ) -> tp.Tensor:
     """Estimates several Pauli words from as few measurement settings as possible.
 
@@ -434,6 +435,9 @@ def joint_expectation(
         state: amplitudes shaped ``[batch, 2, 2, ...]``.
         words: the Pauli words to estimate, spelled over the whole register.
         shots: how many measurements to draw per group.
+        readout: an optional readout matrix, as :func:`measure` takes it: each
+            shot's outcome is then reported as the hardware would report it, so
+            the estimate carries the error a device would add.
 
     Returns:
         One estimate per word, shaped ``[batch, len(words)]``, in the order the
@@ -452,13 +456,52 @@ def joint_expectation(
         product = group_product(group)
         wires = [w for w, letter in enumerate(product) if letter != "I"]
         rotated = apply_measurement_basis(state, product)
-        counts = measure(rotated, shots, wires)
+        counts = measure(rotated, shots, wires, readout=readout)
         for word in group:
             estimates[words.index(word)] = expectation_from_counts(counts, word, wires)
 
     filled = [item for item in estimates if item is not None]
     dtype = filled[0].dtype if filled else tp.float32
     return tp.stack([item.to(dtype) for item in estimates], dim=-1)
+
+
+def sample_energy(
+    state: tp.Tensor,
+    hamiltonian,
+    shots: int,
+    *,
+    readout=None,
+) -> tp.Tensor:
+    """``<H>`` estimated from a finite number of measurements.
+
+    What a device would report, and what a variational routine has to optimise
+    against: the terms are grouped so that one rotation and one histogram read
+    as many of them as commute, each term keeps its own sign in the sum, and a
+    readout matrix can be folded in so the estimate carries the error the
+    hardware would add.
+
+    The result is a sample, not a number: it is exact in expectation and carries
+    the noise of ``shots`` draws.  :func:`~tensorplay.quantum.param_shift` is the
+    way to differentiate it.
+
+    Args:
+        state: amplitudes shaped ``[batch, 2, 2, ...]``.
+        hamiltonian: the :class:`~tensorplay.quantum.Hamiltonian` to read off.
+        shots: how many measurements to draw per measurement setting.
+        readout: an optional readout matrix, as :func:`measure` takes it.
+
+    Returns:
+        One estimate per state, shaped ``[batch]``, real.
+    """
+    terms = hamiltonian.terms
+    estimates = joint_expectation(
+        state, [word for _, word in terms], shots, readout=readout
+    )
+    total = None
+    for index, (coeff, _) in enumerate(terms):
+        piece = coeff * estimates[:, index]
+        total = piece if total is None else total + piece
+    return total
 
 
 def sample_indices(distribution: tp.Tensor, shots: int) -> tp.Tensor:
