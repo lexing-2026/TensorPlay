@@ -651,6 +651,95 @@ Tensor to_sparse_coo_cpu_sparse_dim(const Tensor& self, int64_t sparse_dim) {
     return dense_to_sparse_coo_cpu(self, sparse_dim);
 }
 
+// Converts a 2-D compressed sparse tensor (CSC/BSR/BSC) into canonical CSR
+// by expanding blocked entries into individual coordinates and re-sorting
+// the entries row-major.  CSR input is returned unchanged.
+Tensor compressed_to_csr_cpu(const Tensor& self) {
+    if (self.is_sparse_csr()) return self;
+    if (self.dim() != 2 || !self.is_sparse_compressed()) {
+        TP_THROW(RuntimeError,
+                 "compressed_to_csr: expected a 2-D compressed sparse tensor");
+    }
+    const bool blocked = self.is_sparse_bsr() || self.is_sparse_bsc();
+    const bool row_compressed = self.is_sparse_bsr();
+    const std::array<int64_t, 2> bs = self.sparse_blocksize();
+    const int64_t b0 = blocked ? bs[0] : 1;
+    const int64_t b1 = blocked ? bs[1] : 1;
+    const int64_t rows = self.size(0);
+    const int64_t cols = self.size(1);
+    const int64_t comp_units = row_compressed ? rows / b0 : cols / b1;
+    const int64_t block_numel = b0 * b1;
+
+    Tensor comp = self._crow_indices().contiguous();
+    Tensor plain = self._col_indices().contiguous();
+    Tensor values = self._values().contiguous();
+    const int64_t* comp_ptr = comp.data_ptr<int64_t>();
+    const int64_t* plain_ptr = plain.data_ptr<int64_t>();
+
+    // Pass 1: count entries per output row.
+    std::vector<int64_t> row_counts(rows, 0);
+    for (int64_t cu = 0; cu < comp_units; ++cu) {
+        for (int64_t e = comp_ptr[cu]; e < comp_ptr[cu + 1]; ++e) {
+            const int64_t pu = plain_ptr[e];
+            if (blocked) {
+                const int64_t base_row = row_compressed ? cu * b0 : pu * b0;
+                for (int64_t i = 0; i < b0; ++i) {
+                    row_counts[base_row + i] += b1;
+                }
+            } else {
+                const int64_t r = row_compressed ? cu : pu;
+                row_counts[r] += 1;
+            }
+        }
+    }
+    Tensor crow = Tensor::empty({rows + 1}, DType::Int64, self.device());
+    int64_t* crow_ptr = crow.data_ptr<int64_t>();
+    crow_ptr[0] = 0;
+    int64_t total = 0;
+    for (int64_t r = 0; r < rows; ++r) {
+        total += row_counts[r];
+        crow_ptr[r + 1] = total;
+    }
+    Tensor col = Tensor::empty({total}, DType::Int64, self.device());
+    Tensor out_values = Tensor::empty({total}, self.dtype(), self.device());
+    int64_t* col_ptr = col.data_ptr<int64_t>();
+    std::vector<int64_t> pos(crow_ptr, crow_ptr + rows);
+
+    dispatch_dtype(self.dtype(), [&](auto tag) {
+        using scalar_t = typename decltype(tag)::type;
+        const scalar_t* val_ptr = values.data_ptr<scalar_t>();
+        scalar_t* out_val_ptr = out_values.data_ptr<scalar_t>();
+        for (int64_t cu = 0; cu < comp_units; ++cu) {
+            for (int64_t e = comp_ptr[cu]; e < comp_ptr[cu + 1]; ++e) {
+                const int64_t pu = plain_ptr[e];
+                if (blocked) {
+                    const int64_t base_row = row_compressed ? cu * b0 : pu * b0;
+                    const int64_t base_col =
+                        row_compressed ? pu * b1 : cu * b1;
+                    for (int64_t i = 0; i < b0; ++i) {
+                        const int64_t r = base_row + i;
+                        for (int64_t j = 0; j < b1; ++j) {
+                            const int64_t slot = pos[r]++;
+                            col_ptr[slot] = base_col + j;
+                            out_val_ptr[slot] =
+                                val_ptr[e * block_numel + i * b1 + j];
+                        }
+                    }
+                } else {
+                    const int64_t r = row_compressed ? cu : pu;
+                    const int64_t c = row_compressed ? pu : cu;
+                    const int64_t slot = pos[r]++;
+                    col_ptr[slot] = c;
+                    out_val_ptr[slot] = val_ptr[e];
+                }
+            }
+        }
+    });
+    return Tensor::make_sparse_csr_tensor(
+        crow, col, out_values,
+        static_cast<std::vector<int64_t>>(self.shape()));
+}
+
 Tensor to_sparse_csr_cpu(const Tensor& self) {
     if (self.dim() != 2) {
         TP_THROW(RuntimeError,
@@ -659,6 +748,10 @@ Tensor to_sparse_csr_cpu(const Tensor& self) {
     }
     if (self.is_sparse_csr()) return self;
     if (self.is_sparse()) {
+        if (self.is_sparse_csc() || self.is_sparse_bsr() ||
+            self.is_sparse_bsc()) {
+            return compressed_to_csr_cpu(self);
+        }
         return coo_to_csr_cpu(self.coalesce(), self.size(0));
     }
     Tensor contiguous_self = self.contiguous();
@@ -1305,7 +1398,10 @@ Tensor _sparse_addmm_cpu(const Tensor& self, const Tensor& mat1,
                  "_sparse_addmm(): matrices expected, got ", mat1.dim(),
                  "-D tensor");
     }
-    if (mat1.sparse_dim() != 2 || mat1._values().dim() != 1) {
+    const bool blocked_input =
+        mat1.is_sparse_bsr() || mat1.is_sparse_bsc();
+    if (mat1.sparse_dim() != 2 ||
+        (mat1._values().dim() != 1 && !blocked_input)) {
         TP_THROW(RuntimeError,
                  "_sparse_addmm(): hybrid sparse tensors are not supported");
     }
@@ -1341,6 +1437,12 @@ Tensor _sparse_addmm_cpu(const Tensor& self, const Tensor& mat1,
         crow = mat1._crow_indices().contiguous();
         col = mat1._col_indices().contiguous();
         values = mat1._values().contiguous();
+    } else if (mat1.is_sparse_csc() || mat1.is_sparse_bsr() ||
+               mat1.is_sparse_bsc()) {
+        Tensor csr = compressed_to_csr_cpu(mat1);
+        crow = csr._crow_indices().contiguous();
+        col = csr._col_indices().contiguous();
+        values = csr._values().contiguous();
     } else {
         Tensor canonical = mat1.is_coalesced() ? mat1 : mat1.coalesce();
         Tensor csr = coo_to_csr_cpu(canonical, rows);

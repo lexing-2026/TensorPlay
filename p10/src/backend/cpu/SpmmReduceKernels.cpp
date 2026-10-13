@@ -107,19 +107,26 @@ void check_spmm_reduce_backward_inputs(const Tensor& self,
 
 std::tuple<Tensor, Tensor> _sparse_mm_reduce_impl_sparse_csr_cpu(
     const Tensor& self, const Tensor& other, const std::string& reduce) {
-    check_spmm_reduce_inputs(self, other, reduce);
+    // The fused evaluation works on CSR; other 2-D compressed layouts are
+    // expanded to CSR first (blocked layouts unrolled to scalar entries).
+    Tensor self_csr = self;
+    if (!self.is_sparse_csr() && self.is_sparse_compressed() &&
+        self.dim() == 2) {
+        self_csr = compressed_to_csr_cpu(self);
+    }
+    check_spmm_reduce_inputs(self_csr, other, reduce);
     const int op = get_reduction_enum(reduce);
 
-    Tensor crow = self._crow_indices().contiguous();
-    Tensor col = self._col_indices().contiguous();
-    Tensor val = self._values().contiguous();
+    Tensor crow = self_csr._crow_indices().contiguous();
+    Tensor col = self_csr._col_indices().contiguous();
+    Tensor val = self_csr._values().contiguous();
     Tensor other_c = other.is_contiguous() ? other : other.contiguous();
 
-    Tensor out = Tensor::zeros({self.size(0), other.size(1)}, other.dtype(),
-                               other.device());
+    Tensor out = Tensor::zeros({self_csr.size(0), other.size(1)},
+                               other.dtype(), other.device());
     Tensor arg_out = Tensor::empty({0}, col.dtype(), col.device());
 
-    const int64_t nnz = self._nnz();
+    const int64_t nnz = self_csr._nnz();
     if (nnz == 0) {
         return std::make_tuple(std::move(out), std::move(arg_out));
     }

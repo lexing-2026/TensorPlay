@@ -31,6 +31,9 @@ int64_t sparse_nnz_cpu(const Tensor& self);
 Tensor to_sparse_coo_cpu(const Tensor& self);
 Tensor to_sparse_coo_cpu_sparse_dim(const Tensor& self, int64_t sparse_dim);
 Tensor to_sparse_csr_cpu(const Tensor& self);
+// Expands a 2-D CSC/BSR/BSC tensor into canonical CSR (blocked layouts are
+// unrolled to scalar entries and re-sorted row-major).
+Tensor compressed_to_csr_cpu(const Tensor& self);
 // sparse @ dense for 2-D COO/CSR `self` (SpMM / SpMM-dense).
 Tensor sparse_mm_cpu(const Tensor& self, const Tensor& dense);
 // Dense-seeded sparse @ dense: out = beta * self + alpha * (mat1 @ mat2)
@@ -144,6 +147,8 @@ Tensor spdiags_cuda(const Tensor& diagonals, const Tensor& offsets,
                     std::optional<int64_t> layout);
 
 Tensor sparse_mul_cuda(const Tensor& self, const Tensor& other);
+// Expands a 2-D CSC/BSR/BSC tensor into canonical CSR on device.
+Tensor compressed_to_csr_cuda(const Tensor& self);
 // Sparse scalar product: keeps the sparsity pattern and scales the values.
 Tensor sparse_mul_scalar_cuda(const Tensor& self, const Scalar& other);
 Tensor sparse_add_cuda(const Tensor& self, const Tensor& other);

@@ -225,21 +225,29 @@ __global__ void spmm_reduce_backward_other_arg_kernel(
 
 std::tuple<Tensor, Tensor> _sparse_mm_reduce_impl_sparse_csr_cuda(
     const Tensor& self, const Tensor& other, const std::string& reduce) {
-    if (!self.is_sparse_csr() || self.dense_dim() != 0 || self.dim() != 2) {
+    // The fused evaluation works on CSR; other 2-D compressed layouts are
+    // expanded to CSR first (blocked layouts unrolled to scalar entries).
+    Tensor self_csr = self;
+    if (!self.is_sparse_csr() && self.is_sparse_compressed() &&
+        self.dim() == 2) {
+        self_csr = compressed_to_csr_cuda(self);
+    }
+    if (!self_csr.is_sparse_csr() || self_csr.dense_dim() != 0 ||
+        self_csr.dim() != 2) {
         TP_THROW(RuntimeError,
                  "sparse_mm_reduce: expected a non-hybrid 2-D sparse CSR "
                  "self tensor");
     }
-    if (other.is_sparse() || other.dtype() != self.dtype()) {
+    if (other.is_sparse() || other.dtype() != self_csr.dtype()) {
         TP_THROW(TypeError,
                  "sparse_mm_reduce: other must be a strided tensor sharing "
                  "self's dtype");
     }
-    if (other.dim() != 2 || other.size(0) != self.size(1)) {
+    if (other.dim() != 2 || other.size(0) != self_csr.size(1)) {
         TP_THROW(RuntimeError,
                  "sparse_mm_reduce: other shape mismatch");
     }
-    if (self.device() != other.device()) {
+    if (self_csr.device() != other.device()) {
         TP_THROW(DeviceMismatchError,
                  "sparse_mm_reduce: self and other must be on the same "
                  "device");
@@ -254,17 +262,17 @@ std::tuple<Tensor, Tensor> _sparse_mm_reduce_impl_sparse_csr_cuda(
                  reduce, "\"");
     }
 
-    Tensor crow = self._crow_indices().contiguous();
-    Tensor col = self._col_indices().contiguous();
-    Tensor val = self._values().contiguous();
+    Tensor crow = self_csr._crow_indices().contiguous();
+    Tensor col = self_csr._col_indices().contiguous();
+    Tensor val = self_csr._values().contiguous();
     if (crow.dtype() != DType::Int64) crow = crow.to(DType::Int64);
     if (col.dtype() != DType::Int64) col = col.to(DType::Int64);
-    const int64_t M = self.size(0);
+    const int64_t M = self_csr.size(0);
     const int64_t K = other.size(1);
     Tensor out = Tensor::zeros({M, K}, other.dtype(), other.device());
     Tensor arg_out = Tensor::empty({0}, col.dtype(), col.device());
 
-    const int64_t nnz = self._nnz();
+    const int64_t nnz = self_csr._nnz();
     if (nnz == 0 || M == 0 || K == 0) {
         return std::make_tuple(std::move(out), std::move(arg_out));
     }
@@ -281,7 +289,7 @@ std::tuple<Tensor, Tensor> _sparse_mm_reduce_impl_sparse_csr_cuda(
         arg_out.resize_({M, K});
         arg_out.fill_(nnz);
         Tensor arg_i64 = arg_out.to(DType::Int64);
-        dispatch_coalesce_dtype(self.dtype(), [&](auto tag) {
+        dispatch_coalesce_dtype(self_csr.dtype(), [&](auto tag) {
             using scalar_t = typename decltype(tag)::type;
             if constexpr (is_complex_type_v<scalar_t>) {
                 // Complex amax/amin is not supported; treat as unsupported.
@@ -303,7 +311,7 @@ std::tuple<Tensor, Tensor> _sparse_mm_reduce_impl_sparse_csr_cuda(
             arg_out.copy_(arg_i64);
         }
     } else {
-        dispatch_coalesce_dtype(self.dtype(), [&](auto tag) {
+        dispatch_coalesce_dtype(self_csr.dtype(), [&](auto tag) {
             using scalar_t = typename decltype(tag)::type;
             if constexpr (is_complex_type_v<scalar_t>) {
                 using real_t = typename is_complex_type<scalar_t>::value_type;

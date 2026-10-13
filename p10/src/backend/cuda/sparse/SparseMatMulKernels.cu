@@ -291,7 +291,10 @@ Tensor _sparse_addmm_cuda(const Tensor& self, const Tensor& mat1,
                  "_sparse_addmm(): matrices expected, got ", mat1.dim(),
                  "-D tensor");
     }
-    if (mat1.sparse_dim() != 2 || mat1._values().dim() != 1) {
+    const bool blocked_input =
+        mat1.is_sparse_bsr() || mat1.is_sparse_bsc();
+    if (mat1.sparse_dim() != 2 ||
+        (mat1._values().dim() != 1 && !blocked_input)) {
         TP_THROW(RuntimeError,
                  "_sparse_addmm(): hybrid sparse tensors are not supported");
     }
@@ -319,7 +322,10 @@ Tensor _sparse_addmm_cuda(const Tensor& self, const Tensor& mat1,
 
     Tensor self_b = broadcast_addmm_seed_cuda(self, rows, cols);
     Tensor source = mat1;
-    if (!mat1.is_sparse_csr()) {
+    if (mat1.is_sparse_csc() || mat1.is_sparse_bsr() ||
+        mat1.is_sparse_bsc()) {
+        source = compressed_to_csr_cuda(mat1);
+    } else if (!mat1.is_sparse_csr()) {
         Tensor canonical = mat1.is_coalesced() ? mat1 : mat1.coalesce();
         source = coo_to_csr_native(canonical);
     }
