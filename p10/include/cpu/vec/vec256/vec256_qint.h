@@ -421,7 +421,7 @@ struct Vectorized<tensorplay::qint32> : public Vectorizedqi {
 
   Vectorized<tensorplay::qint32> relu6(
       Vectorized<tensorplay::qint32> zero_point,
-      Vectorized<tensorplay::qint32> q_six) {
+      Vectorized<tensorplay::qint32> q_six) const {
     return _mm256_min_epi32(
         _mm256_max_epi32(vals, zero_point.vals), q_six.vals);
   }
@@ -658,7 +658,7 @@ struct Vectorized<tensorplay::qint8> : public Vectorizedqi {
 
   Vectorized<tensorplay::qint8> relu6(
       Vectorized<tensorplay::qint8> zero_point,
-      Vectorized<tensorplay::qint8> q_six) {
+      Vectorized<tensorplay::qint8> q_six) const {
     return _mm256_min_epi8(_mm256_max_epi8(vals, zero_point.vals), q_six.vals);
   }
 
@@ -858,7 +858,7 @@ struct Vectorized<tensorplay::quint8> : public Vectorizedqi {
 
   Vectorized<tensorplay::quint8> relu6(
       Vectorized<tensorplay::quint8> zero_point,
-      Vectorized<tensorplay::quint8> q_six) {
+      Vectorized<tensorplay::quint8> q_six) const {
     return _mm256_min_epu8(_mm256_max_epu8(vals, zero_point.vals), q_six.vals);
   }
 
@@ -1063,7 +1063,7 @@ struct Vectorized<tensorplay::qint32> : public VectorizedQuantizedConverter<
 
   Vectorized<tensorplay::qint32> relu6(
       Vectorized<tensorplay::qint32> zero_point,
-      Vectorized<tensorplay::qint32> q_six) {
+      Vectorized<tensorplay::qint32> q_six) const {
     Vectorized<tensorplay::qint32> retval;
     for (const auto i : tensorplay::irange(size())) {
       retval.vals[i] = std::min<value_type>(
@@ -1192,7 +1192,7 @@ struct Vectorized<tensorplay::qint8> : public VectorizedQuantizedConverter<
 
   Vectorized<tensorplay::qint8> relu6(
       Vectorized<tensorplay::qint8> zero_point,
-      Vectorized<tensorplay::qint8> q_six) {
+      Vectorized<tensorplay::qint8> q_six) const {
     Vectorized<tensorplay::qint8> retval;
     for (const auto i : tensorplay::irange(size())) {
       retval.vals[i] = std::min<value_type>(
@@ -1310,7 +1310,7 @@ struct Vectorized<tensorplay::quint8> : public VectorizedQuantizedConverter<
 
   Vectorized<tensorplay::quint8> relu6(
       Vectorized<tensorplay::quint8> zero_point,
-      Vectorized<tensorplay::quint8> q_six) {
+      Vectorized<tensorplay::quint8> q_six) const {
     Vectorized<tensorplay::quint8> retval;
     for (const auto i : tensorplay::irange(size())) {
       retval.vals[i] = std::min<value_type>(
