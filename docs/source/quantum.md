@@ -572,6 +572,7 @@ tq.apply_ry(tq.zeros_state(2), 0, 0.3)          # single, whatever the angle say
     tensorplay.quantum.density_probs
     tensorplay.quantum.marginal_probs
     tensorplay.quantum.expectation
+    tensorplay.quantum.expectation_from_density
     tensorplay.quantum.apply_pauli_word
     tensorplay.quantum.apply_measurement_basis
     tensorplay.quantum.expectation_from_counts

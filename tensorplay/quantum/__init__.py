@@ -158,6 +158,7 @@ from ._hamiltonian import (
     trotter_evolve,
 )
 from ._measurement import (
+    expectation_from_density,
     apply_measurement_basis,
     apply_pauli_word,
     apply_readout_error,
@@ -286,6 +287,7 @@ __all__ = [
     "expand_to_register",
     "expectation",
     "expectation_from_counts",
+    "expectation_from_density",
     "fidelity",
     "flatten",
     "global_phase",

@@ -522,3 +522,75 @@ def test_a_marginal_may_span_more_wires_than_a_gate():
     assert counts.shape == (1, 1 << n_qubits)
     tp.testing.assert_close(counts.sum(), tp.tensor(128.0), atol=1e-4, rtol=1e-6)
     tp.testing.assert_close(counts[0, 1], tp.tensor(128.0), atol=1e-4, rtol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Observables of a mixed state
+# ---------------------------------------------------------------------------
+
+
+def test_a_mixed_state_answers_the_same_way_as_the_mixture_it_is():
+    # An open-system run hands back a density matrix, and the observable is a
+    # trace there rather than an overlap.  The two routes have to agree entry by
+    # entry: the weights of a mixture add, so the expectation of the mixture is
+    # the weighted sum of the parts.
+    rho = tq.to_density(tq.basis_state(0, 1)) * 0.5 + tq.to_density(tq.basis_state(1, 1)) * 0.5
+    for word in ("I", "X", "Y", "Z"):
+        mixture = tq.expectation(tq.basis_state(0, 1), word) * 0.5 + tq.expectation(
+            tq.basis_state(1, 1), word
+        ) * 0.5
+        tp.testing.assert_close(
+            tq.expectation_from_density(rho, word), mixture, atol=1e-6, rtol=1e-6
+        )
+    tp.testing.assert_close(
+        tq.expectation_from_density(rho, "Z"), tp.tensor([0.0]), atol=1e-6, rtol=0
+    )
+
+
+def test_a_pure_state_read_as_a_density_matches_the_state_route():
+    state = tq.apply_cnot(tq.apply_h(tq.zeros_state(2), 0), 0, 1)
+    rho = tq.to_density(state)
+    for word in ("ZZ", "XX", "ZI", "IZ"):
+        tp.testing.assert_close(
+            tq.expectation_from_density(rho, word),
+            tq.expectation(state, word),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+    # And the whole Hamiltonian, summed over its terms, lands where the state's
+    # own energy does.
+    h2 = tq.Hamiltonian(
+        [(-1.0523732, "II"), (0.3979374, "IZ"), (-0.3979374, "ZI"), (-0.1809312, "XX")]
+    )
+    from_density = sum(
+        coeff * tp.reshape(tq.expectation_from_density(rho, word), [-1])[0]
+        for coeff, word in h2.terms
+    )
+    tp.testing.assert_close(
+        tp.tensor(from_density).reshape(()),
+        tp.reshape(tq.energy(state, h2), [-1])[0].reshape(()),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_a_density_observable_is_real_and_wide():
+    # The trace of a Hermitian word against a density is real, and it is as wide
+    # as the density was -- a single-precision register answers in single
+    # precision rather than being quietly widened.
+    wide = tq.to_density(tq.plus_state(2, dtype=tp.complex128))
+    assert tq.expectation_from_density(wide, "II").dtype == tp.float64
+    narrow = tq.to_density(tq.plus_state(2))
+    assert tq.expectation_from_density(narrow, "II").dtype == tp.float32
+
+
+def test_a_density_observable_wants_a_density_and_a_pauli_word():
+    state = tq.plus_state(3)
+    with pytest.raises(ValueError):
+        tq.expectation_from_density(state, "ZZZ")
+    with pytest.raises(ValueError):
+        tq.expectation_from_density(tq.to_density(tq.plus_state(1)), "XX")
+    with pytest.raises(ValueError):
+        tq.expectation_from_density(tq.to_density(tq.plus_state(1)), "Q")
+    with pytest.raises(ValueError):
+        tq.expectation_from_density(tp.ones(1, 3, 3, dtype=tp.complex128), "Z")

@@ -272,6 +272,29 @@ def expectation(state: tp.Tensor, word: str) -> tp.Tensor:
     return _expectation_by_rotation(state, checked)
 
 
+def expectation_from_density(density: tp.Tensor, word: str) -> tp.Tensor:
+    """``tr(P rho)`` for the Pauli word ``word``, real and per batch entry.
+
+    The companion of :func:`expectation` for a mixed state: an open-system run
+    hands back a density matrix rather than amplitudes, and the observable is
+    read off the trace rather than an overlap.  A Pauli matrix holds one entry
+    per row, so the trace is one pass over the entries -- no rotated copy of the
+    state, and nothing that grows with anything but the matrix itself.
+    """
+    if density.dim() != 3 or density.shape[-1] != density.shape[-2]:
+        raise ValueError(
+            f"a density matrix is [batch, 2**n, 2**n], got {tuple(density.shape)}"
+        )
+    side = density.shape[-1]
+    if side < 1 or side & (side - 1):
+        raise ValueError(f"a density matrix's side is a power of two, got {side}")
+    checked = check_pauli_string(word, side.bit_length() - 1)
+    matrix = _PAULI_BUILDERS[checked[0]](c_dtype=density.dtype, device=density.device)
+    for letter in checked[1:]:
+        matrix = tp.kron(matrix, _PAULI_BUILDERS[letter](c_dtype=density.dtype))
+    return (matrix.conj() * density).sum(dim=(-2, -1)).real
+
+
 def _expectation_by_rotation(state: tp.Tensor, word: str) -> tp.Tensor:
     """The overlap of a state with its Pauli-rotated self, by rotation.
 
