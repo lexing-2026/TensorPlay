@@ -665,6 +665,7 @@ vector.
     tensorplay.quantum.zeros_state
     tensorplay.quantum.plus_state
     tensorplay.quantum.basis_state
+    tensorplay.quantum.encode_state
     tensorplay.quantum.global_phase
     tensorplay.quantum.Lindbladian
     tensorplay.quantum.lindbladian

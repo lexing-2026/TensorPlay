@@ -28,6 +28,7 @@ __all__ = [
     "dens2bloch",
     "density_mixture",
     "density_to_state",
+    "encode_state",
     "fidelity",
     "flatten",
     "global_phase",
@@ -82,6 +83,62 @@ def state_from_bases(indices: Sequence[int], n_qubits: int, *, device=None,
             raise IndexError(f"basis index {index} is out of range for {n_qubits} qubit(s)")
         wanted = wanted + (entries == index).to(dtype)
     return normalize(wanted.reshape((1, *([2] * n_qubits))))
+
+
+def encode_state(data, n_qubits: Optional[int] = None, *, device=None,
+                 dtype=DEFAULT_C_DTYPE) -> tp.Tensor:
+    """Amplitude-encode classical feature vectors into quantum states.
+
+    Each row of ``data`` is rescaled to unit length, padded with zeros out to
+    ``2**n_qubits`` entries, and reshaped into the register layout -- the
+    ``[batch, 2, 2, ...]`` form every gate expects.  This is how a classical
+    vector becomes the amplitudes of a state: the feature values themselves
+    are the coefficients, so ``n_qubits`` must hold at least as many amplitudes
+    as there are features.
+
+    Args:
+        data: a vector or a ``[batch, n_features]`` matrix of amplitudes, real
+            or complex.
+        n_qubits: the register width; the smallest one that fits the features
+            when omitted.
+        device: where to build the state.
+        dtype: the complex type of the state.
+
+    Returns:
+        The encoded states, shaped ``[batch, 2, 2, ...]``, each of unit norm.
+
+    Raises:
+        ValueError: if ``data`` is not a vector or a matrix, or if the features
+            do not fit in ``n_qubits``.
+    """
+    if not isinstance(data, tp.Tensor):
+        data = tp.as_tensor(data)
+    data = data.to(dtype=dtype, device=device)
+    if data.dim() == 1:
+        data = data.unsqueeze(0)
+    if data.dim() != 2:
+        raise ValueError(
+            f"a feature matrix is [batch, n_features], got {tuple(data.shape)}"
+        )
+    batch, features = data.shape
+    if n_qubits is None:
+        n_qubits = max(1, (features - 1).bit_length())
+    dim = 1 << n_qubits
+    if features > dim:
+        raise ValueError(
+            f"{features} features do not fit in {n_qubits} qubits (capacity {dim})"
+        )
+    lengths = data.abs().pow(2).sum(dim=-1).sqrt()
+    normalized = data / lengths.unsqueeze(-1)
+    if features < dim:
+        normalized = tp.cat(
+            [
+                normalized,
+                tp.zeros((batch, dim - features), dtype=dtype, device=device),
+            ],
+            dim=-1,
+        )
+    return normalized.reshape((batch, *([2] * n_qubits)))
 
 
 def random_state(

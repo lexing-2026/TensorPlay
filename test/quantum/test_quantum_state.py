@@ -466,3 +466,44 @@ def test_density_mixture_rejects_a_malformed_density():
         tq.density_mixture(tp.ones((2, 2)))
     with pytest.raises(ValueError):
         tq.density_mixture(tp.ones((1, 3, 3)))
+
+
+def test_encode_state_prepares_the_named_amplitudes():
+    half = 2.0**-0.5
+    encoded = tq.encode_state([1.0, 1.0], 1, dtype=tp.complex128)
+    tp.testing.assert_close(encoded, tp.tensor([[half, half]], dtype=tp.complex128),
+                            atol=1e-12, rtol=1e-12)
+    encoded = tq.encode_state([0.0, 1.0], 1, dtype=tp.complex128)
+    tp.testing.assert_close(encoded, tq.basis_state(1, 1, dtype=tp.complex128),
+                            atol=1e-12, rtol=1e-12)
+
+
+def test_encode_state_normalizes_and_pads():
+    # a single feature is padded with zeros and stays the |0> state
+    encoded = tq.encode_state([3.0], dtype=tp.complex128)
+    tp.testing.assert_close(encoded, tq.basis_state(0, 1, dtype=tp.complex128),
+                            atol=1e-12, rtol=1e-12)
+    # three features need two qubits and are normalized to unit length
+    encoded = tq.encode_state([1.0, 2.0, 3.0], dtype=tp.complex128)
+    assert encoded.dim() - 1 == 2
+    tp.testing.assert_close(tq.norm(encoded), tp.tensor([1.0], dtype=tp.float64),
+                            atol=1e-12, rtol=1e-12)
+
+
+def test_encode_state_handles_a_batch_and_complex_data():
+    data = tp.tensor([[1.0, 0.0], [0.0, 2.0]], dtype=tp.complex128)
+    encoded = tq.encode_state(data, 1, dtype=tp.complex128)
+    assert tuple(encoded.shape) == (2, 2)
+    for index in range(2):
+        tp.testing.assert_close(tq.norm(encoded[index : index + 1]),
+                                tp.tensor([1.0], dtype=tp.float64), atol=1e-12, rtol=1e-12)
+    complex_encoded = tq.encode_state([1j, 1.0], 1, dtype=tp.complex128)
+    tp.testing.assert_close(tq.norm(complex_encoded), tp.tensor([1.0], dtype=tp.float64),
+                            atol=1e-12, rtol=1e-12)
+
+
+def test_encode_state_rejects_overflow_and_high_rank():
+    with pytest.raises(ValueError):
+        tq.encode_state([1.0, 2.0, 3.0, 4.0, 5.0], 2)
+    with pytest.raises(ValueError):
+        tq.encode_state(tp.ones((1, 2, 2)))
