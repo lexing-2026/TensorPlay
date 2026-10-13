@@ -2140,6 +2140,20 @@
     CPU: mean_dim_kernel
   tags: [core, reduction]
 
+- func: sum_squared_error(Tensor self, Tensor other, int[] dim=[], bool keepdim=false) -> Tensor
+  device_check: NoCheck
+  variants: function
+  dispatch:
+    CPU: sum_squared_error_kernel
+  tags: reduction
+
+- func: sum_abs_error(Tensor self, Tensor other, int[] dim=[], bool keepdim=false) -> Tensor
+  device_check: NoCheck
+  variants: function
+  dispatch:
+    CPU: sum_abs_error_kernel
+  tags: reduction
+
 - func: _sum_dim_backward(Tensor grad_output, Tensor self, int[] dim, bool keepdim=false) -> Tensor
   variants: function
   dispatch:

@@ -15,6 +15,8 @@ namespace cpu {
 
 DEFINE_DISPATCH(sum_stub);
 DEFINE_DISPATCH(sum_dim_stub);
+DEFINE_DISPATCH(sum_squared_error_stub);
+DEFINE_DISPATCH(sum_abs_error_stub);
 DEFINE_DISPATCH(extrema_dim_stub);
 DEFINE_DISPATCH(max_stub);
 DEFINE_DISPATCH(max_dim_stub);
@@ -39,6 +41,16 @@ Tensor sum_kernel(const Tensor& self, DType dtype) {
 
 Tensor sum_dim_kernel(const Tensor& self, const std::vector<int64_t>& dims, bool keepdim, DType dtype) {
     return sum_dim_stub(DeviceType::CPU, self, std::move(dims), keepdim, dtype);
+}
+
+Tensor sum_squared_error_kernel(const Tensor& self, const Tensor& other,
+                                 const std::vector<int64_t>& dims, bool keepdim) {
+    return sum_squared_error_stub(DeviceType::CPU, self, other, dims, keepdim);
+}
+
+Tensor sum_abs_error_kernel(const Tensor& self, const Tensor& other,
+                            const std::vector<int64_t>& dims, bool keepdim) {
+    return sum_abs_error_stub(DeviceType::CPU, self, other, dims, keepdim);
 }
 
 namespace {
@@ -259,6 +271,8 @@ Tensor median_kernel(const Tensor& self) {
 TENSORPLAY_LIBRARY_IMPL(CPU, ReductionKernels) {
     m.impl("sum", sum_kernel);
     m.impl("sum.dim_IntList", sum_dim_kernel);
+    m.impl("sum_squared_error", sum_squared_error_kernel);
+    m.impl("sum_abs_error", sum_abs_error_kernel);
     m.impl("mean", mean_kernel);
     m.impl("mean.dim", mean_dim_kernel);
     m.impl("mean_dim_backward", mean_dim_backward_kernel);

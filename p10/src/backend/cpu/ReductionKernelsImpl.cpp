@@ -3121,6 +3121,149 @@ T extrema_identity(bool maximum_value) {
     }
 }
 
+// ---- Fused dual-input reductions -------------------------------------------
+// A single pass over both inputs accumulates sum((a-b)^2) or sum(|a-b|), so
+// regression metrics never materialise the difference/power tensors and their
+// separate kernels.
+
+template <typename scalar_t>
+void run_squared_error_sum(TensorIterator& iter) {
+    binary_kernel_reduce2_vec(
+        iter,
+        [](scalar_t acc, scalar_t a, scalar_t b) -> scalar_t {
+            const scalar_t d = a - b;
+            return acc + d * d;
+        },
+        [](Vectorized<scalar_t> acc, Vectorized<scalar_t> a, Vectorized<scalar_t> b) -> Vectorized<scalar_t> {
+            const Vectorized<scalar_t> d = a - b;
+            return acc + d * d;
+        },
+        [](scalar_t x, scalar_t y) -> scalar_t { return x + y; },
+        [](Vectorized<scalar_t> x, Vectorized<scalar_t> y) -> Vectorized<scalar_t> { return x + y; },
+        0);
+}
+
+template <typename scalar_t>
+void run_abs_error_sum(TensorIterator& iter) {
+    binary_kernel_reduce2_vec(
+        iter,
+        [](scalar_t acc, scalar_t a, scalar_t b) -> scalar_t {
+            return acc + std::abs(a - b);
+        },
+        [](Vectorized<scalar_t> acc, Vectorized<scalar_t> a, Vectorized<scalar_t> b) -> Vectorized<scalar_t> {
+            return acc + (a - b).abs();
+        },
+        [](scalar_t x, scalar_t y) -> scalar_t { return x + y; },
+        [](Vectorized<scalar_t> x, Vectorized<scalar_t> y) -> Vectorized<scalar_t> { return x + y; },
+        0);
+}
+
+Tensor fused_dual_reduce_impl(const Tensor& self, const Tensor& other,
+                              const std::vector<int64_t>& dims, bool keepdim,
+                              bool squared) {
+    const int64_t ndim = self.dim();
+    bool same_shape = self.dim() == other.dim();
+    if (same_shape) {
+        for (int64_t i = 0; i < ndim; ++i) {
+            if (self.size(i) != other.size(i)) {
+                same_shape = false;
+                break;
+            }
+        }
+    }
+    if (!same_shape) {
+        TP_THROW(RuntimeError, "fused reduce: inputs must have the same shape");
+    }
+    const bool self_float = isFloatingType(self.dtype());
+    const bool other_float = isFloatingType(other.dtype());
+    DType out_dtype = (self_float || other_float)
+        ? (self_float ? self.dtype() : other.dtype())
+        : (isIntegralType(self.dtype(), true) ? DType::Int64 : self.dtype());
+    if (out_dtype == DType::Float16 || out_dtype == DType::BFloat16) {
+        // Narrow floats accumulate in single precision (opmath rule).
+        out_dtype = DType::Float32;
+    }
+
+    if (ndim == 0) {
+        Tensor a = self.dtype() == out_dtype ? self : self.to(out_dtype);
+        Tensor b = other.dtype() == out_dtype ? other : other.to(out_dtype);
+        Tensor diff = a - b;
+        Tensor val = squared ? diff * diff : diff.abs();
+        return keepdim ? val.reshape({1}) : val;
+    }
+
+    std::vector<int64_t> red_dims = dims;
+    std::vector<bool> mask(static_cast<size_t>(ndim), false);
+    if (red_dims.empty()) {
+        red_dims.reserve(static_cast<size_t>(ndim));
+        for (int64_t d = 0; d < ndim; ++d) {
+            red_dims.push_back(d);
+            mask[static_cast<size_t>(d)] = true;
+        }
+    } else {
+        for (int64_t d : red_dims) {
+            if (d < 0) d += ndim;
+            if (d < 0 || d >= ndim) {
+                TP_THROW(IndexError, "fused reduce: dimension out of range");
+            }
+            mask[static_cast<size_t>(d)] = true;
+        }
+    }
+
+    std::vector<int64_t> out_shape = compute_reduction_shape(self, red_dims, keepdim);
+    Tensor out = Tensor::zeros(out_shape, out_dtype, self.device());
+    if (self.numel() == 0 || out.numel() == 0) return out;
+
+    Tensor a = self.dtype() == out_dtype ? self : self.to(out_dtype);
+    Tensor b = other.dtype() == out_dtype ? other : other.to(out_dtype);
+    Tensor viewed = review_reduce_result(out, ndim, mask, keepdim);
+    if (red_dims.size() == static_cast<size_t>(ndim)) {
+        // Full reduction: flatten both inputs to one dimension so the fused
+        // kernel sees exactly one reduce dimension (its fast path assumes a
+        // single reduce dim plus an outer dim).
+        a = a.reshape({-1});
+        b = b.reshape({-1});
+    }
+    TensorIterator iter = TensorIterator::reduce_op2(viewed, a, b);
+
+    switch (out_dtype) {
+        case DType::Float32:
+            if (squared) {
+                run_squared_error_sum<float>(iter);
+            } else {
+                run_abs_error_sum<float>(iter);
+            }
+            break;
+        case DType::Float64:
+            if (squared) {
+                run_squared_error_sum<double>(iter);
+            } else {
+                run_abs_error_sum<double>(iter);
+            }
+            break;
+        case DType::Int64:
+            if (squared) {
+                run_squared_error_sum<int64_t>(iter);
+            } else {
+                run_abs_error_sum<int64_t>(iter);
+            }
+            break;
+        default:
+            TP_THROW(NotImplementedError, "fused reduce not implemented for this dtype");
+    }
+    return out;
+}
+
+Tensor sum_squared_error_kernel_impl(const Tensor& self, const Tensor& other,
+                                     const std::vector<int64_t>& dims, bool keepdim) {
+    return fused_dual_reduce_impl(self, other, dims, keepdim, /*squared=*/true);
+}
+
+Tensor sum_abs_error_kernel_impl(const Tensor& self, const Tensor& other,
+                                const std::vector<int64_t>& dims, bool keepdim) {
+    return fused_dual_reduce_impl(self, other, dims, keepdim, /*squared=*/false);
+}
+
 Tensor extrema_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
                               bool keepdim, bool maximum_value) {
     const int64_t ndim = self.dim();
@@ -4324,6 +4467,8 @@ Tensor median_kernel_impl(const Tensor& self) {
 #endif
 REGISTER_SUM_DISPATCH(sum_stub, &sum_kernel_impl);
 REGISTER_SUM_DISPATCH(sum_dim_stub, &sum_dim_kernel_impl);
+REGISTER_DISPATCH(sum_squared_error_stub, &sum_squared_error_kernel_impl);
+REGISTER_DISPATCH(sum_abs_error_stub, &sum_abs_error_kernel_impl);
 REGISTER_SUM_DISPATCH(extrema_dim_stub, &extrema_dim_kernel_impl);
 #undef REGISTER_SUM_DISPATCH
 REGISTER_DISPATCH(max_stub, &max_kernel_impl);

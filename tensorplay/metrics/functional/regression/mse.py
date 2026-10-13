@@ -14,8 +14,15 @@ def _mean_squared_error_update(preds: Tensor, target: Tensor, num_outputs: int) 
     if num_outputs == 1:
         preds = preds.view(-1)
         target = target.view(-1)
-    diff = preds - target
-    sum_squared_error = tensorplay.sum(diff * diff, dim=0)
+    if preds.device.type == "cuda":
+        # The fused dual-input reduction currently ships for CPU only; CUDA
+        # inputs fall back to the composed kernels.
+        diff = preds - target
+        sum_squared_error = tensorplay.sum(diff * diff, dim=0)
+    else:
+        # A single fused pass computes sum((preds - target)^2) without
+        # materialising the difference/power tensors.
+        sum_squared_error = tensorplay.sum_squared_error(preds, target, dim=[0])
     return sum_squared_error, target.shape[0]
 
 

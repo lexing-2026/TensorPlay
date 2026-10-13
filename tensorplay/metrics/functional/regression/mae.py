@@ -16,7 +16,14 @@ def _mean_absolute_error_update(preds: Tensor, target: Tensor, num_outputs: int)
         target = target.view(-1)
     preds = preds if tensorplay.is_floating_point(preds) else preds.float()
     target = target if tensorplay.is_floating_point(target) else target.float()
-    sum_abs_error = tensorplay.sum(tensorplay.abs(preds - target), dim=0)
+    if preds.device.type == "cuda":
+        # The fused dual-input reduction currently ships for CPU only; CUDA
+        # inputs fall back to the composed kernels.
+        sum_abs_error = tensorplay.sum(tensorplay.abs(preds - target), dim=0)
+    else:
+        # A single fused pass computes sum(|preds - target|) without
+        # materialising the difference tensor.
+        sum_abs_error = tensorplay.sum_abs_error(preds, target, dim=[0])
     return sum_abs_error, target.shape[0]
 
 

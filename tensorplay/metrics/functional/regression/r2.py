@@ -20,8 +20,14 @@ def _r2_score_update(preds: Tensor, target: Tensor) -> tuple[Tensor, Tensor, Ten
 
     sum_obs = tensorplay.sum(target, dim=0)
     sum_squared_obs = tensorplay.sum(target * target, dim=0)
-    residual = target - preds
-    rss = tensorplay.sum(residual * residual, dim=0)
+    if preds.device.type == "cuda":
+        # The fused dual-input reduction currently ships for CPU only; CUDA
+        # inputs fall back to the composed kernels.
+        residual = target - preds
+        rss = tensorplay.sum(residual * residual, dim=0)
+    else:
+        # One fused pass computes sum((target - preds)^2) directly.
+        rss = tensorplay.sum_squared_error(preds, target, dim=[0])
     return sum_squared_obs, sum_obs, rss, target.size(0)
 
 

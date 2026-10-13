@@ -2639,6 +2639,24 @@ def mean(input, dim=None, keepdim=False, *, dtype=DType.undefined):
         return _C.mean(input, dtype=dtype)
     return _C.mean(input, dim, keepdim, dtype=dtype)
 
+def sum_squared_error(input, other, dim=[], keepdim=False):
+    if _capturing():
+        _captured = _capture_call(sum_squared_error, (input, other, dim, keepdim), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(dim, int) and not isinstance(dim, bool):
+        dim = [dim]
+    return _C.sum_squared_error(input, other, dim, keepdim)
+
+def sum_abs_error(input, other, dim=[], keepdim=False):
+    if _capturing():
+        _captured = _capture_call(sum_abs_error, (input, other, dim, keepdim), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(dim, int) and not isinstance(dim, bool):
+        dim = [dim]
+    return _C.sum_abs_error(input, other, dim, keepdim)
+
 def _sum_dim_backward(grad_output, input, dim, keepdim=False):
     if _capturing():
         _captured = _capture_call(_sum_dim_backward, (grad_output, input, dim, keepdim), {})
