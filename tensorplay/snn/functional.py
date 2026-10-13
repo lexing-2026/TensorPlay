@@ -30,9 +30,27 @@ def heaviside(x: Tensor) -> Tensor:
     return tp.heaviside(x, one)
 
 
-def surrogate_grad(x: Tensor, surrogate: int = 0, alpha: float = 1.0) -> Tensor:
+def surrogate_grad(
+    x: Tensor,
+    surrogate: int = 0,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+    w: float = 1.0,
+    c: float = 0.0,
+    n: int = 1,
+    T_period: float = 1.0,
+) -> Tensor:
     """Evaluate the surrogate gradient of the spike step at ``x``."""
-    return _C.snn_surrogate_grad(x, surrogate=surrogate, alpha=alpha)
+    return _C.snn_surrogate_grad(
+        x,
+        surrogate=surrogate,
+        alpha=alpha,
+        beta=beta,
+        w=w,
+        c=c,
+        n=n,
+        T_period=T_period,
+    )
 
 
 class _SpikeFunction(Function):
@@ -94,7 +112,7 @@ class _LIFStepFunction(Function):
     @staticmethod
     def backward(ctx, grad_spike, grad_v_new):
         input, v, decay, threshold, spike, v_new = ctx.saved_tensors
-        grad_input, grad_v_init, grad_decay, grad_threshold = (
+        grad_input, grad_v_init, grad_decay, grad_threshold, grad_v_reset_out = (
             _C.snn_lif_step_backward(
                 grad_spike=grad_spike,
                 grad_v=grad_v_new,
@@ -115,10 +133,23 @@ class _LIFStepFunction(Function):
             grad_v_init,
             grad_decay,
             grad_threshold,
+            grad_v_reset_out,
             None,
             None,
             None,
-            None,
+        )
+
+
+def _check_lif_surrogate(surrogate) -> None:
+    """The fused LIF kernels support the single-parameter surrogate family
+    (ids 0-9); the multi-parameter surrogates are available through
+    ``spike``/``surrogate_grad`` instead."""
+    if surrogate.id > 9:
+        raise ValueError(
+            f"{type(surrogate).__name__} (id={surrogate.id}) is not supported "
+            "inside the fused LIF kernels; use one of the single-parameter "
+            "surrogates (ids 0-9) with lif_step/lif_seq, or call "
+            "snn.spike()/snn.surrogate_grad() directly."
         )
 
 
@@ -140,6 +171,7 @@ def lif_step(
     """
     if surrogate is None:
         surrogate = StraightThroughSurrogate()
+    _check_lif_surrogate(surrogate)
     decay_t = _as_tensor(decay, input, "decay")
     threshold_t = _as_tensor(threshold, input, "threshold")
     v_reset_t = None if v_reset is None else _as_tensor(v_reset, input, "v_reset")
@@ -177,12 +209,13 @@ class _LIFSeqFunction(Function):
         return spikes, v_final, v_seq
 
     @staticmethod
-    def backward(ctx, grad_spikes, grad_v_final):
+    def backward(ctx, grad_spikes, grad_v_final, grad_v_seq):
         input, v_init, decay, threshold, spikes, v_final = ctx.saved_tensors
-        grad_input, grad_v_init, grad_decay, grad_threshold = (
+        grad_input, grad_v_init, grad_decay, grad_threshold, grad_v_reset_out = (
             _C.snn_lif_seq_backward(
                 grad_spikes=grad_spikes,
                 grad_v_final=grad_v_final,
+                grad_v_seq=grad_v_seq,
                 input=input,
                 v_init=v_init,
                 decay=decay,
@@ -200,7 +233,7 @@ class _LIFSeqFunction(Function):
             grad_v_init,
             grad_decay,
             grad_threshold,
-            None,
+            grad_v_reset_out,
             None,
             None,
             None,
@@ -229,6 +262,7 @@ def lif_seq(
     """
     if surrogate is None:
         surrogate = StraightThroughSurrogate()
+    _check_lif_surrogate(surrogate)
     if input.dim() < 2:
         raise ValueError("lif_seq: input must have shape [T, B, ...]")
     if v_init is None:

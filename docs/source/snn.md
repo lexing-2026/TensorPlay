@@ -70,6 +70,19 @@ smooth approximation during backward:
 | `PiecewiseLinearSurrogate(alpha)` | `1` inside `(-alpha, alpha)`, else `0` |
 | `ATanSurrogate(alpha)` | `alpha / (1 + (pi*alpha*x)^2)` |
 | `ErfSurrogate(alpha)` | `alpha / sqrt(pi) * exp(-(alpha*x)^2)` |
+| `PiecewiseQuadraticSurrogate(alpha)` | `-alpha^2*|x| + alpha` inside `|x| <= 1/alpha`, else `0` |
+| `PiecewiseExpSurrogate(alpha)` | `alpha/2 * exp(-alpha*|x|)` |
+| `SuperSpikeSurrogate(alpha)` | `alpha / (1 + |x|)^2` |
+| `NonzeroSignLogAbsSurrogate(alpha)` | `alpha / (1 + alpha*|x|)` |
+| `PiecewiseLeakyRELUSurrogate(w, c)` | `1/(2w)` inside `|x| < w`, else `c` |
+| `LeakyKRELUSurrogate(leak, k)` | `k` for `x >= 0`, `leak` for `x < 0` |
+| `S2NNSurrogate(alpha, beta)` | sigmoid gradient for `x < 0`, `beta/(x+1)` else |
+| `QPseudoSpikeSurrogate(alpha)` | `(1 + 2/(alpha-1)*|x|)^(-alpha)` |
+| `SquarewaveFourierSeriesSurrogate(n, T)` | `4/T * sum_i cos((2i-1)*2*pi/T*x)` |
+
+The fused LIF kernels support the single-parameter families (ids 0-9); the
+multi-parameter surrogates (ids 10-14) are available through
+``snn.spike()`` and ``snn.surrogate_grad()``.
 
 `detach_reset=True` treats the spike in the voltage-update path as a constant
 during backward, which is the standard stabilizing choice.
@@ -78,7 +91,8 @@ during backward, which is the standard stabilizing choice.
 
 * `snn.heaviside(x)` -- the spike step.
 * `snn.spike(x, surrogate)` -- Heaviside forward, surrogate backward.
-* `snn.surrogate_grad(x, surrogate, alpha)` -- evaluate a surrogate gradient.
+* `snn.surrogate_grad(x, surrogate, alpha, beta, w, c, n, T_period)` --
+  evaluate a surrogate gradient (all 15 surrogate ids).
 * `snn.lif_step(x, v, decay, threshold, v_reset, surrogate, detach_reset)` --
   one fused neuron update, returns `(spike, v_new)`.
 * `snn.lif_seq(x, v_init, decay, threshold, v_reset, surrogate,
@@ -86,7 +100,8 @@ during backward, which is the standard stabilizing choice.
   `[T, B, ...]` input, returns `(spikes, v_final)` (or
   `(spikes, v_seq, v_final)` with `return_v_seq=True`).  The time loop runs
   inside one native kernel, so multi-step training (BPTT) does not pay a
-  per-step launch overhead.
+  per-step launch overhead.  The returned ``v_seq`` is differentiable: its
+  gradient is injected into the per-step voltage back-propagation.
 * `snn.spike_rate(spikes, dim)` -- average firing rate along the time axis.
 * `snn.spike_rate_loss(spikes, target_rate, reduction)` -- mean-squared-error
   between the firing rate and a target rate.
@@ -124,6 +139,20 @@ compares the fused multi-step operator with a Python time loop over
 * `snn.PeriodicEncoder(encoding)` -- repeats a fixed periodic spike pattern.
 * `snn.GaussianTuningCurveEncoder(mu, sigma)` -- population encoding where
   each input feature drives a bank of Gaussian-tuned Bernoulli neurons.
+* `snn.LatencyEncoder(T, enc_function)` -- one-hot time-to-first-spike
+  encoder with linear or logarithmic firing-time map.
+* `snn.WeightedPhaseEncoder(T)` -- binary-decomposition weighted-phase
+  encoding.
+
+## Deep spiking layers
+
+* `snn.SeqToANNContainer(module)` -- apply any ANN layer to every time step
+  of a `[T, B, ...]` input.
+* `snn.SpikingConv2d(...)` -- `Conv2d` (applied per time step) followed by a
+  multi-step `LIFNode`, for `[T, B, C, H, W]` spike trains.
+* `snn.SpikingBatchNorm1d` / `snn.SpikingBatchNorm2d` -- batch normalization
+  with the time axis folded into the batch dimension, the standard
+  stabilizer for deep SNN training.
 
 ## Monitoring
 

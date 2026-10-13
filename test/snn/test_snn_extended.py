@@ -52,6 +52,8 @@ def test_erf_surrogate_object_backward():
 # ---------------------------------------------------------------------------
 
 def test_lif_step_v_reset_per_neuron_broadcast():
+    # lif_step processes elements in parallel: each row is an independent
+    # neuron with the same initial ``v``, not a time step.
     x = tp.tensor([[0.8, 0.8], [1.2, 1.2]])
     v = tp.zeros_like(x)
     v_reset = tp.tensor([0.0, 0.5])
@@ -59,7 +61,7 @@ def test_lif_step_v_reset_per_neuron_broadcast():
         x, v, decay=0.5, threshold=1.0, v_reset=v_reset
     )
     tp.testing.assert_close(spike, tp.tensor([[0.0, 0.0], [1.0, 1.0]]))
-    tp.testing.assert_close(v_new, tp.tensor([[0.4, 0.4], [0.0, 0.5]]))
+    tp.testing.assert_close(v_new, tp.tensor([[0.8, 0.8], [0.0, 0.5]]))
 
 
 def test_lif_seq_v_reset_per_neuron():
@@ -74,12 +76,15 @@ def test_lif_seq_v_reset_per_neuron():
 def test_lif_step_v_reset_gradient_flow():
     # The spike path depends on v_reset through the hard-reset voltage; make
     # sure autograd flows through the returned v_new when v_reset is a tensor.
-    x = tp.tensor([[1.2]])
+    # Use a strong input so the neuron fires and v_new = v_reset exactly.
+    x = tp.tensor([[2.5]])
     v = tp.zeros_like(x)
     v_reset = tp.tensor([0.3], requires_grad=True)
     spike, v_new = snn.lif_step(x, v, decay=0.5, threshold=1.0, v_reset=v_reset)
+    tp.testing.assert_close(v_new, tp.tensor([[0.3]]))
     v_new.sum().backward()
     assert v_reset.grad is not None
+    tp.testing.assert_close(v_reset.grad, tp.tensor([1.0]))
 
 
 # ---------------------------------------------------------------------------
@@ -278,3 +283,78 @@ def test_spike_rate_loss_reductions():
     assert none.shape == (2,)
     with pytest.raises(ValueError):
         snn.spike_rate_loss(spikes, target, reduction="bad")
+
+
+# ---------------------------------------------------------------------------
+# LatencyEncoder / WeightedPhaseEncoder
+# ---------------------------------------------------------------------------
+
+def test_latency_encoder_linear():
+    enc = snn.LatencyEncoder(T=5, enc_function="linear")
+    x = tp.tensor([0.0, 1.0, 0.5])
+    out = enc(x)  # [5, 3]
+    assert out.shape == (5, 3)
+    # x=1.0 fires at t=0, x=0.0 fires at t=4, x=0.5 fires at t=2 (round(2)).
+    tp.testing.assert_close(out[:, 0], tp.tensor([0.0, 0.0, 0.0, 0.0, 1.0]))
+    tp.testing.assert_close(out[:, 1], tp.tensor([1.0, 0.0, 0.0, 0.0, 0.0]))
+    tp.testing.assert_close(out[:, 2], tp.tensor([0.0, 0.0, 1.0, 0.0, 0.0]))
+    # exactly one spike per element
+    assert tp.all(out.sum(dim=0) == 1.0)
+
+
+def test_latency_encoder_log():
+    enc = snn.LatencyEncoder(T=4, enc_function="log")
+    out = enc(tp.tensor([0.0, 1.0]))
+    assert out.shape == (4, 2)
+    assert tp.all(out.sum(dim=0) == 1.0)
+    # x=1.0 fires at the first step
+    tp.testing.assert_close(out[0], tp.tensor([0.0, 1.0]))
+
+
+def test_weighted_phase_encoder_binary_decomposition():
+    enc = snn.WeightedPhaseEncoder(T=4)
+    # weights: 0.5, 0.25, 0.125, 0.0625
+    # 0.5 -> 1000; 0.75 -> 1100; 0.125 -> 0010
+    out = enc(tp.tensor([0.5, 0.75, 0.125]))
+    assert out.shape == (4, 3)
+    tp.testing.assert_close(out[:, 0], tp.tensor([1.0, 0.0, 0.0, 0.0]))
+    tp.testing.assert_close(out[:, 1], tp.tensor([1.0, 1.0, 0.0, 0.0]))
+    tp.testing.assert_close(out[:, 2], tp.tensor([0.0, 0.0, 1.0, 0.0]))
+
+
+# ---------------------------------------------------------------------------
+# Deep-SNN layers
+# ---------------------------------------------------------------------------
+
+def test_seq_to_ann_container_linear():
+    container = snn.SeqToANNContainer(tp.nn.Linear(4, 8))
+    x = tp.rand(3, 5, 4)
+    out = container(x)
+    assert out.shape == (3, 5, 8)
+    # equals stacking per-step Linear applications
+    manual = tp.stack([container.module(x[t]) for t in range(3)])
+    tp.testing.assert_close(out, manual)
+
+
+def test_spiking_conv2d_output_shape_and_binary():
+    conv = snn.SpikingConv2d(1, 4, kernel_size=3, padding=1)
+    x = tp.rand(4, 2, 1, 8, 8)
+    out = conv(x)
+    assert out.shape == (4, 2, 4, 8, 8)
+    assert set(tp.unique(out).tolist()) <= {0.0, 1.0}
+
+
+def test_spiking_batchnorm2d_folds_time():
+    bn = snn.SpikingBatchNorm2d(4)
+    x = tp.rand(4, 3, 4, 8, 8)
+    out = bn(x)
+    assert out.shape == (4, 3, 4, 8, 8)
+    # running stats accumulate over T*B
+    assert bn.bn.num_batches_tracked == 1
+
+
+def test_spiking_batchnorm1d():
+    bn = snn.SpikingBatchNorm1d(4)
+    x = tp.rand(4, 3, 4)
+    out = bn(x)
+    assert out.shape == (4, 3, 4)

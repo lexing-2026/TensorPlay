@@ -4565,7 +4565,7 @@
     CPU: snn_lif_step_cpu
     CUDA: snn_lif_step_cuda
 
-- func: snn_lif_step_backward(Tensor grad_spike, Tensor grad_v, Tensor input, Tensor v, Tensor decay, Tensor threshold, Tensor spike, Tensor v_new, Tensor? v_reset=None, int surrogate=0, float alpha=1.0, bool detach_reset=True) -> (Tensor grad_input, Tensor grad_v_init, Tensor grad_decay, Tensor grad_threshold)
+- func: snn_lif_step_backward(Tensor grad_spike, Tensor grad_v, Tensor input, Tensor v, Tensor decay, Tensor threshold, Tensor spike, Tensor v_new, Tensor? v_reset=None, int surrogate=0, float alpha=1.0, bool detach_reset=True) -> (Tensor grad_input, Tensor grad_v_init, Tensor grad_decay, Tensor grad_threshold, Tensor grad_v_reset)
   variants: function
   dispatch:
     CPU: snn_lif_step_backward_cpu
@@ -4583,7 +4583,7 @@
     CPU: snn_lif_seq_cpu
     CUDA: snn_lif_seq_cuda
 
-- func: snn_lif_seq_backward(Tensor grad_spikes, Tensor grad_v_final, Tensor? grad_v_seq, Tensor input, Tensor v_init, Tensor decay, Tensor threshold, Tensor spikes, Tensor v_final, Tensor? v_reset=None, int surrogate=0, float alpha=1.0, bool detach_reset=True) -> (Tensor grad_input, Tensor grad_v_init, Tensor grad_decay, Tensor grad_threshold)
+- func: snn_lif_seq_backward(Tensor grad_spikes, Tensor grad_v_final, Tensor? grad_v_seq, Tensor input, Tensor v_init, Tensor decay, Tensor threshold, Tensor spikes, Tensor v_final, Tensor? v_reset=None, int surrogate=0, float alpha=1.0, bool detach_reset=True) -> (Tensor grad_input, Tensor grad_v_init, Tensor grad_decay, Tensor grad_threshold, Tensor grad_v_reset)
   variants: function
   dispatch:
     CPU: snn_lif_seq_backward_cpu

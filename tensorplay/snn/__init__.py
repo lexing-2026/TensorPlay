@@ -19,11 +19,14 @@ Example:
 
 from . import encoding as encoding
 from . import functional as functional
+from . import layer as layer
 from . import monitor as monitor
 from . import surrogate as surrogate
 from .encoding import (
     GaussianTuningCurveEncoder,
+    LatencyEncoder,
     PeriodicEncoder,
+    WeightedPhaseEncoder,
     poisson_encode,
     rate_encode,
     temporal_encode,
@@ -37,15 +40,30 @@ from .functional import (
     spike_rate_loss,
     surrogate_grad,
 )
+from .layer import (
+    SeqToANNContainer,
+    SpikingBatchNorm1d,
+    SpikingBatchNorm2d,
+    SpikingConv2d,
+)
 from .monitor import SpikeMonitor
 from .neuron import ALIFNode, IFNode, LIFNode, ParametricLIFNode, SpikeLinear
 from .surrogate import (
     ATanSurrogate,
     ErfSurrogate,
     FastSigmoidSurrogate,
+    LeakyKRELUSurrogate,
+    NonzeroSignLogAbsSurrogate,
+    PiecewiseExpSurrogate,
+    PiecewiseLeakyRELUSurrogate,
     PiecewiseLinearSurrogate,
+    PiecewiseQuadraticSurrogate,
+    QPseudoSpikeSurrogate,
+    S2NNSurrogate,
     SigmoidSurrogate,
+    SquarewaveFourierSeriesSurrogate,
     StraightThroughSurrogate,
+    SuperSpikeSurrogate,
 )
 
 __all__ = [
@@ -70,17 +88,34 @@ __all__ = [
     "PiecewiseLinearSurrogate",
     "ATanSurrogate",
     "ErfSurrogate",
+    "PiecewiseQuadraticSurrogate",
+    "PiecewiseExpSurrogate",
+    "SuperSpikeSurrogate",
+    "NonzeroSignLogAbsSurrogate",
+    "PiecewiseLeakyRELUSurrogate",
+    "LeakyKRELUSurrogate",
+    "S2NNSurrogate",
+    "QPseudoSpikeSurrogate",
+    "SquarewaveFourierSeriesSurrogate",
     # encoders
     "rate_encode",
     "poisson_encode",
     "temporal_encode",
     "PeriodicEncoder",
     "GaussianTuningCurveEncoder",
+    "LatencyEncoder",
+    "WeightedPhaseEncoder",
+    # layers
+    "SeqToANNContainer",
+    "SpikingConv2d",
+    "SpikingBatchNorm1d",
+    "SpikingBatchNorm2d",
     # monitoring
     "SpikeMonitor",
     # submodules
     "encoding",
     "functional",
+    "layer",
     "monitor",
     "surrogate",
 ]

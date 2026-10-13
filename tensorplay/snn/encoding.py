@@ -12,6 +12,8 @@ Provided schemes:
   feature drives a bank of Gaussian-tuned Bernoulli neurons.
 """
 
+import math
+
 import tensorplay as tp
 from tensorplay import Tensor
 from tensorplay.nn import Module
@@ -22,6 +24,8 @@ __all__ = [
     "temporal_encode",
     "PeriodicEncoder",
     "GaussianTuningCurveEncoder",
+    "LatencyEncoder",
+    "WeightedPhaseEncoder",
 ]
 
 
@@ -128,3 +132,68 @@ class GaussianTuningCurveEncoder(Module):
         prob = tp.exp(-(diff * diff) / (2.0 * self.sigma**2))
         flat = prob.reshape(x.shape[:-1] + (n_features * n_neurons,))
         return rate_encode(flat, T, generator=generator)
+
+
+class LatencyEncoder(Module):
+    """Time-to-first-spike encoder with configurable firing-time map.
+
+    Converts values in ``[0, 1]`` into one-hot spike trains: a larger input
+    fires earlier.  With ``enc_function='linear'`` the firing time is
+    ``t_f = round((T - 1) * (1 - x))``; with ``'log'`` it is
+    ``t_f = round(T - 1 - ln(alpha * x + 1))`` with ``alpha`` chosen so that
+    ``t_f(1) = T - 1``.
+
+    ``forward(x)`` returns a ``[T, *x.shape]`` tensor with exactly one spike
+    per element.
+    """
+
+    def __init__(self, T: int, enc_function: str = "linear") -> None:
+        super().__init__()
+        if T <= 0:
+            raise ValueError(f"LatencyEncoder: T must be positive, got {T}")
+        if enc_function not in ("linear", "log"):
+            raise ValueError(
+                f"LatencyEncoder: enc_function must be 'linear' or 'log', "
+                f"got {enc_function!r}"
+            )
+        self.T = T
+        self.enc_function = enc_function
+        self.alpha = math.exp(T - 1.0) - 1.0
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = x.clamp(0, 1)
+        if self.enc_function == "log":
+            t_f = (self.T - 1.0 - tp.log(self.alpha * x + 1.0)).round()
+        else:
+            t_f = ((self.T - 1.0) * (1.0 - x)).round()
+        t_f = t_f.to(tp.int64).clamp(0, self.T - 1)
+        one = tp.nn.functional.one_hot(t_f, num_classes=self.T).to(x.dtype)
+        # Move the class (time) axis from the back to the front: [..., T] -> [T, ...]
+        d_seq = [one.dim() - 1] + list(range(one.dim() - 1))
+        return one.permute(d_seq)
+
+
+class WeightedPhaseEncoder(Module):
+    """Weighted-phase encoder based on binary decomposition.
+
+    Encodes ``x`` in ``[0, 1 - 2**-T]`` as a ``[T, *x.shape]`` spike train
+    by greedily decomposing the value into powers of two: the ``i``-th step
+    fires when the residual is at least ``2**-(i+1)``.
+    """
+
+    def __init__(self, T: int) -> None:
+        super().__init__()
+        if T <= 0:
+            raise ValueError(f"WeightedPhaseEncoder: T must be positive, got {T}")
+        self.T = T
+
+    def forward(self, x: Tensor) -> Tensor:
+        inputs = x.clone()
+        weight = 0.5
+        spikes = []
+        for _ in range(self.T):
+            s = (inputs >= weight).to(x.dtype)
+            spikes.append(s)
+            inputs = inputs - weight * s
+            weight = weight / 2.0
+        return tp.stack(spikes)
