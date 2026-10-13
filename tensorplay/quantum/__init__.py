@@ -35,6 +35,13 @@ Example:
     >>> tq.expectation(state, "ZZ")
     tensor([1.])
 """
+
+from ._dynamics import (
+    Lindbladian,
+    lindbladian,
+    mesolve,
+    sesolve,
+)
 from ._circuit import (
     GATE_TABLE,
     Circuit,
@@ -197,6 +204,7 @@ __all__ = [
     "Circuit",
     "GATE_TABLE",
     "Hamiltonian",
+    "Lindbladian",
     "amplitude_damping_kraus",
     "apply_amplitude_damping",
     "apply_bit_flip",
@@ -283,10 +291,12 @@ __all__ = [
     "inner",
     "iswap_matrix",
     "joint_expectation",
+    "lindbladian",
     "marginal_probs",
     "matrix_exp_evolve",
     "mcx_matrix",
     "measure",
+    "mesolve",
     "multirz_eigvals",
     "multirz_matrix",
     "nlocal_circuit",
@@ -321,6 +331,7 @@ __all__ = [
     "s_matrix",
     "sample_indices",
     "sdg_matrix",
+    "sesolve",
     "single_excitation_matrix",
     "state_from_bases",
     "swap_matrix",

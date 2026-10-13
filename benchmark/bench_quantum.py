@@ -76,6 +76,94 @@ def _dense_gate(state, matrix, wires):
     return tq.unflatten(rows @ full, n_qubits)
 
 
+def _superoperator(generator, n_qubits, dim):
+    """The Lindblad generator written out as a matrix on matrices.
+
+    One column per basis entry: ask the generator what it does to each matrix
+    unit in turn.  Only small registers can hold the result -- it is 2**n times
+    the size of the density matrix squared -- which is the whole reason the
+    generator is never built.
+    """
+    device = generator.device or 'cpu'
+    basis = tp.eye(dim * dim, dtype=generator.c_dtype, device=device)
+    basis = basis.reshape(dim, dim, dim, dim)
+    columns = []
+    for row in range(dim):
+        for column in range(dim):
+            columns.append(generator.apply(basis[:, :, row, column][None])[0].reshape(-1))
+    return tp.stack(columns, dim=-1)
+
+
+def benchmark_dynamics(device, n_qubits, repetitions):
+    """The master equation against the operator it never builds.
+
+    Three comparisons, each of which is the honest alternative: the explicit
+    superoperator, the pure-state path for a closed system, and the step-by-step
+    route against the series.
+    """
+    hamiltonian = tq.Hamiltonian(
+        [(0.9, 'X' + 'I' * (n_qubits - 1)), (0.6, 'I' * (n_qubits - 1) + 'Z')]
+    )
+    damping = tq.amplitude_damping_kraus(0.15, c_dtype=tp.complex64)[0]
+    generator = tq.Lindbladian(
+        hamiltonian, ['X' + 'I' * (n_qubits - 1), ([n_qubits - 1], damping)],
+        c_dtype=tp.complex64,
+    )
+    rho = tq.to_density(tq.plus_state(n_qubits, device=device))
+    state = tq.plus_state(n_qubits, device=device)
+    time = 1.0
+    cases = {
+        'master_equation_stepwise': (
+            lambda: generator.evolve(rho, time, method='rk4'),
+            lambda: generator.evolve(rho, time, method='taylor'),
+        ),
+        'closed_system_state_path': (
+            lambda: tq.sesolve(state, hamiltonian, time, order=2),
+            lambda: tq.mesolve(rho, hamiltonian, None, time),
+        ),
+    }
+    # The explicit generator holds 4**(2n) entries and its exponential costs its
+    # cube, so it is only reachable at the widths where it fits at all -- which is
+    # the whole point of the comparison.
+    if n_qubits <= 4:
+        dim = 1 << n_qubits
+        operator = _superoperator(generator, n_qubits, dim)
+        rows = tq.flatten(rho).to(operator.dtype)
+
+        def exponentiated():
+            flat = (tp.matrix_exp(time * operator) @ rows.transpose(-1, -2)).transpose(-1, -2)
+            return unflatten_like(rho, flat)
+
+        cases['master_equation_dense_generator'] = (
+            lambda: generator.evolve(rho, time, method='rk4'),
+            exponentiated,
+        )
+
+    timings = {}
+    for name, (fast, slow) in cases.items():
+        # The state path answers with amplitudes and the matrix path with a
+        # density matrix, so the state is squared before the two are compared.
+        answer, other = fast(), slow()
+        if answer.shape != other.shape:
+            answer = tq.to_density(answer)
+        difference = float((tq.flatten(answer) - tq.flatten(other)).abs().max())
+        if difference > 1e-3:
+            raise AssertionError(f'{name} on {device}: the two paths differ by {difference}')
+        fused = measure(fast, device, repetitions)
+        baseline = measure(slow, device, repetitions)
+        timings[name] = {
+            'fused_microseconds': fused,
+            'baseline_microseconds': baseline,
+            'speedup': baseline / fused,
+        }
+    return {'device': device, 'n_qubits': n_qubits, 'timings': timings}
+
+
+def unflatten_like(reference, flat):
+    """Put a flat amplitude block back into the layout of ``reference``."""
+    return flat.reshape(reference.shape)
+
+
 def benchmark(device, n_qubits, repetitions):
     state = tq.plus_state(n_qubits, device=device)
     word = 'I' * (n_qubits - 1) + 'Z'
@@ -131,6 +219,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', choices=['cpu', 'cuda', 'all'], default='all')
     parser.add_argument('--qubits', type=int, nargs='+', default=[12, 16, 20])
+    parser.add_argument(
+        '--dynamics-qubits', type=int, nargs='+', default=[4, 6, 8],
+        help='register widths for the master equation, which costs its square',
+    )
     parser.add_argument('--threads', type=int, default=4)
     parser.add_argument('--repetitions', type=int, default=5)
     args = parser.parse_args()
@@ -141,8 +233,10 @@ def main():
         devices = [args.device]
     records = [benchmark(device, n_qubits, args.repetitions)
                for device in devices for n_qubits in args.qubits]
+    dynamics = [benchmark_dynamics(device, n_qubits, args.repetitions)
+                for device in devices for n_qubits in args.dynamics_qubits]
     print(json.dumps({'threads': args.threads, 'repetitions': args.repetitions,
-                      'results': records}, indent=2))
+                      'results': records, 'dynamics': dynamics}, indent=2))
 
 
 if __name__ == '__main__':

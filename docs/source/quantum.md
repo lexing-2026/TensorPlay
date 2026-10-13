@@ -308,6 +308,68 @@ rho = tq.apply_channel(rho, both, [0, 1])
 Because every Kraus operator is local, the cost stays linear in the register
 size: no channel superoperator is ever built.
 
+### A system that does not close
+
+A channel applies all at once. Noise that acts over time is the generator
+`d rho / dt = -i [H, rho] + sum_r (L_r rho L_r^dagger - 1/2 {L_r^dagger L_r, rho})`,
+and `Lindbladian` is that generator, held as an object and applied as often as an
+integration needs.
+
+```python
+generator = tq.Lindbladian(h2, jump_ops=["XI", ("IZ", 0.05)])
+final = generator.evolve(rho, time=2.0)
+```
+
+The generator itself is never built. Written out densely it is `2**n` times the
+size of `rho` squared -- on ten qubits, a matrix of a trillion entries -- so
+each term is applied on its own and the integral is formed by composition alone.
+
+A jump operator is a Pauli word, a `(wires, matrix)` pair, or a full-register
+matrix, and a bare Pauli word means a rate of one. A rate can be written next to
+it, which is the short way to say how fast the error happens:
+
+```python
+tq.Lindbladian(h2, [("XI", 0.02), ("ZI", 0.01)])        # Pauli errors at rates
+tq.Lindbladian(h2, [([0], tq.amplitude_damping_kraus(0.05)[0]), n_qubits=4])
+```
+
+A word of identities and `Z`s is a sign pattern rather than a general matrix, so
+its whole dissipator is one factor per entry of `rho` and costs a single pass.
+A channel's Kraus operators can be handed in directly as a stack; they generate
+the channel once the piece of the identity they leave unused is added to them,
+which `_read_jumps` does without being asked.
+
+Two routes integrate the generator, and both keep the trace:
+
+```python
+generator.evolve(rho, 2.0, method="rk4")     # fixed fourth-order steps
+generator.evolve(rho, 2.0, method="taylor")  # a truncated series of the span
+```
+
+`"rk4"` is the default: it takes small steps, and it is the one that can follow a
+Hamiltonian that moves with time, given as a callable of `t`. `"taylor"` sums one
+series of the whole span, which costs several times less per unit of time
+covered; it is refused past the span double precision can sum, rather than
+returning rounding.
+
+What an experiment wants is the observables along the way:
+
+```python
+states, values = generator.trajectory(
+    rho, 2.0, n_sample=101, observables=[h2, "IZ"]
+)
+```
+
+`values` is `[time, observable, batch]`, real. Without a sample count,
+`mesolve` answers with the final matrix on its own; `sesolve` is the closed-system
+counterpart, which advances a state rather than its square and so costs `2**n`
+per step instead of `4**n`.
+
+```python
+tq.sesolve(state, h2, time=2.0, order=2, n_sample=51, observables=[h2])
+tq.mesolve(rho, h2, None, time=2.0, n_sample=51, observables=[h2])   # same answer
+```
+
 ## Hamiltonians and time evolution
 
 A `Hamiltonian` is a weighted sum of Pauli words.
@@ -332,9 +394,13 @@ term in sequence:
 evolved = tq.trotter_evolve(state, h2, time=1.5, order=4)
 ```
 
-The split is exact for commuting terms; otherwise the error shrinks as the
-order grows, at a proportional cost. For small registers, `matrix_exp_evolve`
-gives the exact propagator from the dense matrix instead.
+The split is exact for commuting terms. Otherwise the order is what decides how
+carefully the non-commuting pieces are dropped, and each step is `order` times
+the work: a first-order product has an error that falls with the step, the
+palindromic second-order one with the square of it, and the fourth-order one --
+that scheme composed three times with uneven weights -- with the fourth power.
+For small registers, `matrix_exp_evolve` gives the exact propagator from the
+dense matrix instead, and `sesolve` picks between the routes.
 
 ## Gradients
 
@@ -414,6 +480,10 @@ and threading a graph through it.
     tensorplay.quantum.plus_state
     tensorplay.quantum.basis_state
     tensorplay.quantum.global_phase
+    tensorplay.quantum.Lindbladian
+    tensorplay.quantum.lindbladian
+    tensorplay.quantum.mesolve
+    tensorplay.quantum.sesolve
     tensorplay.quantum.random_state
     tensorplay.quantum.random_unitary
     tensorplay.quantum.state_from_bases

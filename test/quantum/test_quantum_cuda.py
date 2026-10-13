@@ -270,3 +270,35 @@ def test_gate_rejects_more_wires_than_either_backend_allows():
     mat = tp.eye(1 << 8, dtype=tp.complex64, device=tp.device("cuda"))
     with pytest.raises(ValueError):
         _C._quantum_apply_gate(flat, mat, list(range(9)))
+
+def test_the_master_equation_matches_the_host_on_the_device():
+    # Every pass of the generator is a gate application on the device, so the
+    # whole evolution runs there; the answer has to be the host's answer.
+    hamiltonian = tq.Hamiltonian([(0.7, "XII"), (-0.4, "IZZ"), (0.3, "IIY")])
+    damping = tq.amplitude_damping_kraus(0.2, c_dtype=tp.complex64)[0]
+    generator = tq.Lindbladian(hamiltonian, [("XII", 0.5), ([2], damping)], c_dtype=tp.complex64)
+
+    def evolve(device):
+        state = tq.plus_state(3, device=device)
+        rho = tq.to_density(state)
+        return _on_device(generator.evolve(rho, 1.0, n_step=100))
+
+    tp.testing.assert_close(
+        evolve(tp.device("cuda")), evolve(tp.device("cpu")), atol=1e-5, rtol=1e-5
+    )
+
+
+def test_the_state_path_matches_the_host_on_the_device():
+    hamiltonian = tq.Hamiltonian([(0.6, "XIZ"), (0.35, "IZI")])
+    state = tq.apply_h(tq.zeros_state(3, device=tp.device("cuda")), 0)
+    on_device = tq.sesolve(state, hamiltonian, 1.0, order=2, n_step=8)
+    on_host = tq.sesolve(
+        tq.apply_h(tq.zeros_state(3, device=tp.device("cpu")), 0),
+        hamiltonian,
+        1.0,
+        order=2,
+        n_step=8,
+    )
+    tp.testing.assert_close(
+        _on_device(on_device), _on_device(on_host), atol=1e-5, rtol=1e-5
+    )
