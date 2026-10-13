@@ -346,11 +346,19 @@ generator.evolve(rho, 2.0, method="rk4")     # fixed fourth-order steps
 generator.evolve(rho, 2.0, method="taylor")  # a truncated series of the span
 ```
 
-`"rk4"` is the default: it takes small steps, and it is the one that can follow a
-Hamiltonian that moves with time, given as a callable of `t`. `"taylor"` sums one
+`"rk4"` is the one that can follow a Hamiltonian that moves with time, given as a
+callable of `t`, and the one that reports intermediate times. `"taylor"` sums a
 series of the whole span, which costs several times less per unit of time
-covered; it is refused past the span double precision can sum, rather than
-returning rounding.
+covered and lands closer to the exact answer — the default wherever it applies,
+short spans and long ones alike.
+
+No span is out of reach for the series. Its terms climb to about `exp(span)`
+while the sum they add to stays the size of the state, so one sum can only carry
+so far before it cancels itself away in the rounding; past that point the span
+is covered by several sums of a size one can carry, in a row. Advancing by `a`
+then by `b` is advancing by `a + b`, each half applied to the matrix the one
+before left, and the propagator is still never built — a propagator can only be
+squared as an operator, and this generator is never built to square.
 
 What an experiment wants is the observables along the way:
 

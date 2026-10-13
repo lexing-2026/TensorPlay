@@ -539,22 +539,21 @@ def test_an_unknown_method_is_refused():
         tq.mesolve(rho, tq.Hamiltonian([(0.5, "XI")]), None, 0.1, method="euler")
 
 
-def test_the_default_method_takes_the_series_where_it_fits():
-    # On a span the series can sum it costs less than stepping and lands closer
-    # to the exact answer, so the default takes it; past that ceiling the steps
-    # are the only route left and the default follows.
+def test_the_default_method_takes_the_series():
+    # On a generator that does not move with time the series costs less than
+    # stepping and lands closer to the exact answer, so the default takes it --
+    # on a short span and on a long one alike.
     n_qubits = 2
     hamiltonian = tq.Hamiltonian([(0.7, "XI"), (-0.4, "ZZ")])
     rho = tq.to_density(tq.plus_state(n_qubits, dtype=tp.complex128))
     generator = Lindbladian(hamiltonian, **WIDE)
-    short = generator.evolve(rho, 0.5)
-    tp.testing.assert_close(
-        short, generator.evolve(rho, 0.5, method="taylor"), atol=1e-12, rtol=1e-12
-    )
-    long = generator.evolve(rho, 12.0)
-    tp.testing.assert_close(
-        long, generator.evolve(rho, 12.0, method="rk4"), atol=1e-6, rtol=1e-6
-    )
+    for span in (0.5, 12.0, 200.0):
+        tp.testing.assert_close(
+            generator.evolve(rho, span),
+            generator.evolve(rho, span, method="taylor"),
+            atol=1e-11,
+            rtol=1e-11,
+        )
     with pytest.raises(ValueError):
         tq.sesolve(tq.plus_state(2), tq.Hamiltonian([(0.5, "XI")]), 0.1, method="euler")
 
@@ -633,15 +632,78 @@ def test_sesolve_sends_a_density_matrix_to_mesolve():
         tq.sesolve(rho, tq.Hamiltonian([(0.5, "XI")]), 0.1)
 
 
-def test_a_series_is_refused_past_the_span_precision_carries():
-    rho = tq.to_density(tq.plus_state(2))
-    with pytest.raises(ValueError):
-        tq.mesolve(
-            rho, tq.Hamiltonian([(5.0, "XI")]), None, 40.0, method="taylor"
+def test_a_span_past_one_sum_is_covered_by_several():
+    # The terms of a single series of exp climb to exp(span), so one sum can
+    # only carry so far before it cancels itself away.  Advancing in several
+    # pieces in a row is advancing by the total, each piece applied to the
+    # matrix the one before left, so the route keeps working and stays exact --
+    # which the explicit superoperator's own exponential confirms here.
+    n_qubits = 2
+    hamiltonian = tq.Hamiltonian([(5.0, "XI"), (0.4, "ZZ")])
+    rho = tq.to_density(tq.plus_state(n_qubits, dtype=tp.complex128))
+    generator = Lindbladian(hamiltonian, **WIDE)
+    for span in (40.0, 300.0, 2500.0):
+        tp.testing.assert_close(
+            generator.evolve(rho, span, method="taylor"),
+            _exponential(generator, rho, n_qubits, span),
+            atol=1e-9,
+            rtol=1e-9,
         )
-    # The same run is fine on the step-by-step route, which never sums terms that
-    # large in one go.
-    assert tq.mesolve(rho, tq.Hamiltonian([(5.0, "XI")]), None, 40.0, n_step=400).shape == rho.shape
+    # And the step-by-step route still answers the same span.
+    assert tq.mesolve(rho, hamiltonian, None, 40.0, n_step=400).shape == rho.shape
+
+
+def test_the_rate_bounds_what_the_generator_actually_does():
+    # The step count and the series' span are both read off the rate, so a rate
+    # that is too small is not merely loose: it tells a series its span is half
+    # what it is, and the terms then cancel away the precision the sum needs.
+    # The explicit superoperator's own norm is what the rate has to cover.
+    for hamiltonian, jumps in (
+        (tq.Hamiltonian([(5.0, "XI"), (0.4, "ZZ")]), None),
+        (tq.Hamiltonian([(1.0, "Z"), (0.7, "X")]), [("Z", 0.3)]),
+        (tq.Hamiltonian([(0.6, "II")]), [("XX", 0.4), ("Z", 0.2)]),
+    ):
+        generator = Lindbladian(hamiltonian, jumps, **WIDE)
+        n_qubits = generator.n_qubits
+        operator = _superoperator(generator, n_qubits, tp.complex128)
+        norm = float(tp.linalg.matrix_norm(operator, 1).reshape(-1)[0])
+        assert generator.rate >= norm * (1.0 - 1e-12), (generator.rate, norm)
+
+
+def test_a_shorter_word_says_nothing_about_the_qubits_after_it():
+    # A damping written as "Z" acts on the first qubit and says nothing of the
+    # rest, so it belongs beside a two-qubit Hamiltonian rather than being
+    # refused for disagreeing with it.
+    generator = Lindbladian(
+        tq.Hamiltonian([(2.0, "XI"), (1.0, "ZZ")]), [("Z", 0.4), ("XI", 0.2)], **WIDE
+    )
+    assert generator.n_qubits == 2
+    rho = tq.to_density(tq.plus_state(2, dtype=tp.complex128))
+    assert abs(complex(tp.trace(generator.evolve(rho, 1.0)[0])).real - 1.0) < 1e-12
+    # Declaring a register narrower than the terms is still a mistake worth
+    # naming: the terms would run off the end of it.
+    with pytest.raises(ValueError):
+        Lindbladian(tq.Hamiltonian([(2.0, "XI")]), [("Z", 0.4)], n_qubits=1, **WIDE)
+
+
+def test_a_long_evolution_settles_and_stays_settled():
+    # Nothing here is out of reach: a span far past what one sum of a series can
+    # carry is covered by several sums in a row, and the damping has long since
+    # done its work by the end of it.
+    generator = Lindbladian(
+        tq.Hamiltonian([(2.0, "XI"), (1.0, "ZZ"), (0.5, "IY")]),
+        [("Z", 0.4), ("XI", 0.2)],
+        **WIDE,
+    )
+    rho = tq.to_density(tq.plus_state(2, dtype=tp.complex128))
+    settled = generator.evolve(rho, 200.0)
+    further = generator.evolve(rho, 400.0)
+    tp.testing.assert_close(settled, further, atol=1e-9, rtol=1e-9)
+    assert abs(complex(tp.trace(settled[0])).real - 1.0) < 1e-12
+    # And the steady state is the same one whichever way it was taken.
+    tp.testing.assert_close(
+        settled, generator.evolve(rho, 400.0, method="rk4"), atol=1e-4, rtol=1e-4
+    )
 
 
 def test_a_time_dependent_generator_needs_the_step_route():

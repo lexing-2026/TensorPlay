@@ -380,15 +380,17 @@ def _checked_rate(value, name) -> float:
 
 
 def _series_span_limit(dtype) -> float:
-    """The largest span a truncated series can carry in one dtype.
+    """The largest span one sum of a truncated series can carry.
 
     The terms of the series climb to about ``exp(span)`` while the sum they add
     up to stays of the order of the state, so a span far past the point where
     the arithmetic can tell the terms apart gives an answer made entirely of
     rounding.  Six tenths of the range the precision covers leaves a few digits
-    of headroom for that cancellation, which is where the two integrators part
-    company: the fourth-order route never sums terms this large, so it has no
-    such ceiling.
+    of headroom for that cancellation.
+
+    It is a limit on one *sum*, not on the evolution: a longer span is covered
+    by several sums of this size in a row (see :meth:`Lindbladian._compose`),
+    which is exact to the precision of each and never builds the propagator.
     """
     real = tp.float64 if dtype == tp.complex128 else tp.float32
     return 0.6 * math.log10(1.0 / float(tp.finfo(real).eps))
@@ -461,21 +463,19 @@ def _read_width(hamiltonian, jump_ops, given: Optional[int]) -> Optional[int]:
         ):
             widths.append(len(check_pauli_string(entry[0])))
     if given is not None:
-        if widths and any(width != given for width in widths):
+        widest = max(widths) if widths else 0
+        if widest > given:
             raise ValueError(
-                f"the terms span {max(widths)} qubit(s), the register is declared "
+                f"the terms span {widest} qubit(s), the register is declared "
                 f"as {given}"
             )
         return given
     if not widths:
         return None
-    widest = max(widths)
-    if any(width != widest for width in widths):
-        raise ValueError(
-            f"the terms span different widths, {sorted(set(widths))}: pass n_qubits "
-            "to say how wide the register is"
-        )
-    return widest
+    # Terms of different lengths are ordinary -- a damping written as "Z" says
+    # nothing about the qubits after it, and is read on the first -- so the
+    # register is as wide as the widest of them and no wider.
+    return max(widths)
 
 
 class Lindbladian:
@@ -662,13 +662,17 @@ class Lindbladian:
     def _measure_rate(self) -> float:
         """How fast the generator can move a state, per unit of time.
 
-        One unit is one radian of rotation or one unit of decay.  Only a step
-        count is chosen from it, so a loose estimate costs a little accuracy and
-        nothing else.
+        One unit is one radian of rotation or one unit of decay.  A step count
+        and a series' span are chosen from it, so a loose estimate costs a little
+        accuracy and nothing else -- but an estimate that is too *small* is not
+        merely loose: a series told its span is half what it is cancels away the
+        precision it needs.  The commutator reads a term from both sides of the
+        matrix, so a Hamiltonian turns twice as fast as its largest coefficient
+        says, and a dissipator likewise.
         """
-        rate = sum(abs(coeff) for coeff, _, _ in self._terms)
+        rate = 2.0 * sum(abs(coeff) for coeff, _, _ in self._terms)
         if self._dense is not None:
-            rate += float(self._dense.abs().max())
+            rate += 2.0 * float(self._dense.abs().max())
         # Each dissipator moves a matrix by at most its rate doubled, whether it
         # is written as a matrix or as the scaling it reduces to.
         rate += 2.0 * (self._n_scaling + sum(spec[0] for spec in self._words))
@@ -798,24 +802,19 @@ class Lindbladian:
     ):
         """Settle on the method and the step count for one run.
 
-        ``"auto"`` takes the series where the series can be summed and the
-        step-by-step route where it cannot: on the spans it accepts, the series
-        costs several times less per unit of time covered *and* comes out closer
-        to the exact answer, so reaching for the stepping first would be paying
-        seven times as much for the same result.
+        ``"auto"`` takes the series wherever it can be composed and the
+        step-by-step route where it cannot: on a generator that does not move
+        with time the series costs several times less per unit of time covered
+        *and* comes out closer to the exact answer, so reaching for the stepping
+        first would be paying seven times as much for a worse result.
 
         A run that has to report times in between takes the steps as well.  The
         series is one composition, so it has no interior to report from -- the
         only points it can answer for are the ends.
         """
         if method == "auto":
-            span = abs(float(time)) * max(self.rate, 1e-12)
             method = (
-                "taylor"
-                if not self._time_dependent
-                and not report_interior
-                and span <= _series_span_limit(tp.complex128)
-                else "rk4"
+                "rk4" if self._time_dependent or report_interior else "taylor"
             )
         if method not in ("rk4", "taylor"):
             raise ValueError(
@@ -886,6 +885,13 @@ class Lindbladian:
         nothing.  The cost per unit of span is therefore several times better
         than a fourth-order step of the same accuracy, and it grows the same way.
 
+        A span past what one sum can carry is covered by several sums of a size
+        one can carry, in a row: advancing by ``a`` then by ``b`` is advancing by
+        ``a + b``, and each half is applied to the matrix the other half left.
+        So there is no span this route cannot take, and it is still the cheap one
+        -- what a longer span buys is more applications of the generator, at the
+        same cost per application as a short span's.
+
         The sum is done in double precision whatever the generator was built in.
         The terms of a series climb to about ``exp(span)`` while the answer they
         add up to stays the size of the state, so the summation cancels; in
@@ -899,29 +905,29 @@ class Lindbladian:
 
         Returns:
             The evolved density matrix.
-
-        Raises:
-            ValueError: if the span is past what double precision can sum.
-                ``"rk4"`` has no such ceiling.
         """
+        wider = self._in_wider_precision()
+        dtype = density.dtype
+        limit = _series_span_limit(tp.complex128)
+        # Each piece is a span the sum can carry, so no single sum ever cancels
+        # away the precision it needs; the pieces are exact in composition.
+        pieces = max(1, int(math.ceil(abs(float(time)) * max(self.rate, 1e-12) / limit)))
+        piece = float(time) / pieces
+        current = density.to(dtype=wider.c_dtype)
+        for _ in range(pieces):
+            current = self._sum(current, piece)
+        return current.to(dtype=dtype)
+
+    def _sum(self, density: tp.Tensor, time: float) -> tp.Tensor:
+        """One composition of a span small enough to sum in a single series."""
         span = abs(float(time)) * max(self.rate, 1e-12)
         wider = self._in_wider_precision()
-        limit = _series_span_limit(tp.complex128)
-        if span > limit:
-            raise ValueError(
-                f"the series route carries a span of at most {limit:.1f}, and this "
-                f"evolution asks for {span:.1f}: past that the terms are larger "
-                "than any precision can tell apart. Use method='rk4', which takes "
-                "small steps and never sums terms that large."
-            )
-        dtype = density.dtype
-        current = density if tp.is_complex(density) and density.dtype == wider.c_dtype else density.to(dtype=wider.c_dtype)
-        result = current
-        term = current
+        result = density
+        term = density
         for order in range(1, _series_degree(span) + 1):
             term = wider.apply(term) * (time / order)
             result = result + term
-        return result.to(dtype=dtype)
+        return result
 
     def _in_wider_precision(self) -> "Lindbladian":
         """The same generator, in the widest precision it can be summed in."""

@@ -129,14 +129,17 @@ def test_the_rule_reaches_a_value_that_cannot_be_differentiated():
 
 
 def test_the_shot_noise_shrinks_as_the_shots_grow():
-    # A wrong rule would not converge; noise does.
+    # A wrong rule would not converge; noise does.  Twenty times the shots is
+    # four and a half times less noise, and the margin asks for half of that --
+    # loose enough to hold on a bad day, tight enough that noise which did not
+    # shrink would still fail.
     state = _ansatz(tp.tensor([[0.2, -0.4]]))
     exact = float(tq.energy(state, H2)[0])
     errors = []
     for shots in (200, 4000):
-        estimates = [float(tq.sample_energy(state, H2, shots)[0]) for _ in range(40)]
+        estimates = [float(tq.sample_energy(state, H2, shots)[0]) for _ in range(120)]
         errors.append(statistics.fmean(abs(value - exact) for value in estimates))
-    assert errors[1] < errors[0] / 3.0
+    assert errors[1] < errors[0] / 2.0, errors
 
 
 def test_the_sampled_value_falls_on_the_exact_one():
