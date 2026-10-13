@@ -330,14 +330,25 @@ it, which is the short way to say how fast the error happens:
 
 ```python
 tq.Lindbladian(h2, [("XI", 0.02), ("ZI", 0.01)])        # Pauli errors at rates
-tq.Lindbladian(h2, [([0], tq.amplitude_damping_kraus(0.05)[0]), n_qubits=4])
+tq.Lindbladian(h2, [([0], 0.05 ** 0.5 * excitation), n_qubits=4])
 ```
 
 A word of identities and `Z`s is a sign pattern rather than a general matrix, so
-its whole dissipator is one factor per entry of `rho` and costs a single pass.
-A channel's Kraus operators can be handed in directly as a stack; they generate
-the channel once the piece of the identity they leave unused is added to them,
-which `_read_jumps` does without being asked.
+its whole dissipator is one factor per entry of `rho` and costs a single pass. A
+stack of jump operators is read one at a time, the same way.
+
+A jump carries its rate in its own size — `sqrt(gamma) * L` is an error happening
+at rate `gamma`, which is the master equation's own form of the statement — so
+`amplitude_damping_kraus(gamma)[1]` is the `sqrt(gamma) |0><1|` this wants.
+
+A *channel* is not a generator, and handing one in as if it were is the one way
+to get a plausible answer that is quietly wrong. A channel is the exponential of
+a generator: summing dissipators over its Kraus operators applies the channel
+once and subtracts the state once per operator, which is not the exponential of
+anything. The population decay comes out right and the coherence decay does not,
+by a few percent, and nothing looks amiss. So a stack handed in here is read as a
+list of jumps, and a channel is applied to a density matrix with `apply_channel`
+instead — which is where a channel belongs.
 
 Two routes integrate the generator, and both keep the trace:
 

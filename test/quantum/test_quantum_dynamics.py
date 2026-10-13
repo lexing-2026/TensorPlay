@@ -227,51 +227,96 @@ def test_a_rate_can_go_with_the_operator_it_belongs_to():
     tp.testing.assert_close(by_word, half_operator, atol=1e-12, rtol=1e-12)
 
 
-def test_a_channel_can_be_handed_in_as_the_kraus_operators_it_is():
-    # A channel is the exponent of a dissipator, and the two do not use the same
-    # operators -- which is what the Kraus set is for.  Handed in as it stands,
-    # the set must relax the excited population at the rate it damps at.
-    rho = tq.to_density(tq.basis_state(1, 1, dtype=tp.complex128))
-    gamma = 0.3
+def _lowering(**WIDE) -> tp.Tensor:
+    """``|0><1|``, the operator that takes an excitation down a step."""
+    return tp.tensor([[0.0, 1.0], [0.0, 0.0]], dtype=tp.complex128)
+
+
+def test_a_sized_jump_is_the_generator_of_the_error_it_names():
+    # A jump carries its rate in its own size: ``sqrt(gamma) |0><1|`` is an
+    # excitation decaying at rate ``gamma``, which is the master equation's own
+    # form of the statement.  Populations then fall at the rate named and
+    # coherences at half of it -- the half the two terms of the dissipator work
+    # out to between them -- and a generator that lost track of that would still
+    # look entirely reasonable.
+    gamma = 0.4
     generator = Lindbladian(
-        None, [([0], tq.amplitude_damping_kraus(gamma, **WIDE))], n_qubits=1, **WIDE
+        None, [([0], gamma ** 0.5 * _lowering())], n_qubits=1, **WIDE
     )
-    for time in (0.5, 2.0, 4.0):
-        out = generator.evolve(rho, time, method="rk4", n_step=2000)
-        assert abs(complex(out[0, 1, 1]) - math.exp(-gamma * time)) < 1e-7
-    # The ground state is a fixed point of the channel.
-    settled = tq.to_density(tq.zeros_state(1, dtype=tp.complex128))
-    tp.testing.assert_close(
-        generator.evolve(settled, 3.0, n_step=200), settled, atol=1e-12, rtol=1e-12
-    )
-
-
-def test_a_channel_generator_matches_the_channel_it_was_given():
-    # One step of the generator, taken small, is the channel's own action: the
-    # two routes have to agree on the physics, not only on where they end up.
     rho = tq.to_density(tq.plus_state(1, dtype=tp.complex128))
-    gamma = 0.3
-    kraus = tq.amplitude_damping_kraus(gamma, **WIDE)
-    channel_step = tq.apply_channel(rho, kraus, [0])
-    generator = Lindbladian(None, [([0], kraus)], n_qubits=1, **WIDE)
-    action = generator.apply(rho)
+    flat = rho[0]
+    # d rho_11 / dt = -gamma rho_11 with the population moving to rho_00, and
+    # d rho_01 / dt = -gamma rho_01 / 2 on each coherence.
+    expected = gamma * tp.tensor(
+        [
+            [flat[1, 1], -0.5 * flat[0, 1]],
+            [-0.5 * flat[1, 0], -flat[1, 1]],
+        ],
+        dtype=tp.complex128,
+    ).unsqueeze(0)
+    tp.testing.assert_close(generator.apply(rho), expected, atol=1e-12, rtol=1e-12)
+
+    for time in (0.5, 2.0, 4.0):
+        out = generator.evolve(rho, time)[0]
+        excited = 0.5 * math.exp(-gamma * time)
+        exact = tp.tensor(
+            [[1 - excited, 0.5 * math.exp(-gamma * time / 2)],
+             [0.5 * math.exp(-gamma * time / 2), excited]],
+            dtype=tp.complex128,
+        )
+        tp.testing.assert_close(out, exact, atol=1e-12, rtol=1e-12)
+
+
+def test_a_stack_of_jumps_is_read_one_at_a_time():
+    # A stack is a list of jumps, which is how a noise model is usually written:
+    # every operator carries its own rate in its size, and the dissipators add.
+    # The two halves are worked out here with plain matrix algebra so that the
+    # generator is held to something written a different way round.
+    gamma, flip = 0.4, 0.3
+    lowering = _lowering()
+    z = tq.z_matrix(**WIDE)
+    stack = tp.stack([gamma ** 0.5 * lowering, flip ** 0.5 * z], dim=0)
+    generator = Lindbladian(None, [([0], stack)], n_qubits=1, **WIDE)
+
+    rho = tq.to_density(tq.plus_state(1, dtype=tp.complex128))
+    flat = rho[0]
+    jump = gamma ** 0.5 * lowering
+    damped = jump @ flat @ tq.dagger(jump) - 0.5 * (
+        tq.dagger(jump) @ jump @ flat + flat @ tq.dagger(jump) @ jump
+    )
+    # A Pauli jump at rate flip, which is what its dissipator works out to.
+    dephased = flip * (z @ flat @ z - flat)
     tp.testing.assert_close(
-        action / gamma, (channel_step - rho) / gamma, atol=1e-6, rtol=1e-6
+        generator.apply(rho),
+        (damped + dephased).unsqueeze(0),
+        atol=1e-12,
+        rtol=1e-12,
     )
 
 
-def test_a_single_dissipative_operator_gives_the_same_channel():
-    # The same channel written the other way round, as one jump operator plus the
-    # identity it leaves over.
-    rho = tq.to_density(tq.basis_state(1, 1, dtype=tp.complex128))
-    gamma = 0.3
-    kraus = tq.amplitude_damping_kraus(gamma, **WIDE)
-    residual = tp.eye(2, dtype=tp.complex128) - tq.dagger(kraus[1]) @ kraus[1]
-    jumps = [kraus[1], tp.linalg.matrix_sqrth(residual)]
-    from_stack = Lindbladian(None, [([0], kraus)], n_qubits=1, **WIDE).apply(rho)
-    from_jumps = Lindbladian(None, [([0], j) for j in jumps], n_qubits=1, **WIDE).apply(rho)
-    tp.testing.assert_close(from_jumps, from_stack, atol=1e-6, rtol=1e-6)
-
+def test_a_wider_jump_damps_the_wire_it_names_and_no_other():
+    # The same operator spread over two wires is one jump on both, so the
+    # excited population falls at the rate it names and the untouched wire keeps
+    # its own.
+    gamma = 0.25
+    pair = tp.kron(_lowering(), tp.eye(2, dtype=tp.complex128))
+    generator = Lindbladian(
+        None, [([0, 1], gamma ** 0.5 * pair)], n_qubits=2, **WIDE
+    )
+    rho = tq.to_density(tq.apply_h(tq.zeros_state(2, dtype=tp.complex128), 0))
+    time = 2.0
+    out = generator.evolve(rho, time)[0]
+    excited = 0.5 * math.exp(-gamma * time)
+    exact = tp.tensor(
+        [[1 - excited, 0, 0, 0],
+         [0, 0, 0, 0],
+         [0, 0, excited, 0],
+         [0, 0, 0, 0]],
+        dtype=tp.complex128,
+    ) + 0.5 * math.exp(-gamma * time / 2) * tp.tensor(
+        [[0, 0, 1, 0], [0, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]], dtype=tp.complex128
+    )
+    tp.testing.assert_close(out, exact, atol=1e-12, rtol=1e-12)
 
 
 def test_a_hamiltonian_oscillates_at_the_rate_it_should():
