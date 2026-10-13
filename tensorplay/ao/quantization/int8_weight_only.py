@@ -255,7 +255,7 @@ class _Int8WeightOnlyLinear(Function):
         int_data, scale = _quantize_int8_rowwise(data)
         ctx.save_for_backward(input, weight)
         ctx.bias = bias is not None
-        out = (input @ int_data.T.to(input.dtype)) * scale
+        out = (input @ int_data.T.contiguous().to(input.dtype)) * scale
         out = out + bias if bias is not None else out
         return out
 
