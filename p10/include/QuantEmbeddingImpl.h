@@ -1,5 +1,10 @@
 #pragma once
 #include "QuantRowwise.h"
+#ifndef TP_QUANT_CUDA
+#include "cpu/vec/vec.h"
+#include <cfenv>
+#include <cstring>
+#endif
 
 namespace tensorplay::quant::TP_QN_DETAIL {
 
@@ -20,9 +25,36 @@ struct RowPack {
     const float *x, *ranges; uint8_t* y; int64_t columns, width, bins; int bits; bool optimized; float ratio;
     TP_QN_DEVICE void operator()(int64_t row) const {
         const float* src = x + row * columns; uint8_t* dst = y + row * width;
-        float lo = src[0], hi = src[0];
-        for (int64_t j = 1; j < columns; ++j) { lo = ::fminf(lo, src[j]); hi = ::fmaxf(hi, src[j]); }
-        if (ranges && !optimized) { lo = ranges[2 * row]; hi = ranges[2 * row + 1]; }
+        float lo, hi;
+        if (ranges && !optimized) {
+            lo = ranges[2 * row]; hi = ranges[2 * row + 1];
+        } else {
+#ifndef TP_QUANT_CUDA
+            using V = vec::Vectorized<float>;
+            constexpr int lanes = V::size();
+            if (std::fegetround() == FE_TONEAREST && columns >= lanes) {
+                V minimum(std::numeric_limits<float>::infinity());
+                V maximum(-std::numeric_limits<float>::infinity());
+                int64_t j = 0;
+                for (; j + lanes <= columns; j += lanes) {
+                    const V values = V::loadu(src + j);
+                    minimum = vec::minimum(minimum, values);
+                    maximum = vec::maximum(maximum, values);
+                }
+                alignas(64) float minima[lanes], maxima[lanes];
+                minimum.store(minima); maximum.store(maxima);
+                lo = minima[0]; hi = maxima[0];
+                for (int lane = 1; lane < lanes; ++lane) {
+                    lo = std::min(lo, minima[lane]); hi = std::max(hi, maxima[lane]);
+                }
+                for (; j < columns; ++j) { lo = std::min(lo, src[j]); hi = std::max(hi, src[j]); }
+            } else
+#endif
+            {
+                lo = src[0]; hi = src[0];
+                for (int64_t j = 1; j < columns; ++j) { lo = ::fminf(lo, src[j]); hi = ::fmaxf(hi, src[j]); }
+            }
+        }
         if (optimized && bits != 8 && hi > lo) {
             const float step = (hi - lo) / static_cast<float>(bins);
             const float threshold = static_cast<float>(bins) * (1.f - ratio) * step;
@@ -44,14 +76,35 @@ struct RowPack {
             if (scale == 0 || (inverse == std::numeric_limits<float>::infinity() || inverse == -std::numeric_limits<float>::infinity())) { scale = inverse = 1.f; }
         }
         const int values_per_byte = 8 / bits;
-        for (int64_t j = 0; j < columns / values_per_byte; ++j) {
+#ifndef TP_QUANT_CUDA
+        using V = vec::Vectorized<float>;
+        constexpr int lanes = V::size();
+        int64_t j = 0;
+        if (std::fegetround() == FE_TONEAREST && lanes >= values_per_byte && lanes % values_per_byte == 0) {
+            alignas(64) float quantized[lanes];
+            for (; j + lanes <= columns; j += lanes) {
+                V values = ((V::loadu(src + j) - V(lo)) * V(inverse)).round();
+                values = vec::minimum(V(static_cast<float>((1 << bits) - 1)), vec::maximum(V(0.f), values));
+                values.store(quantized);
+                for (int lane = 0; lane < lanes; lane += values_per_byte) {
+                    uint8_t packed = 0;
+                    for (int v = 0; v < values_per_byte; ++v)
+                        packed |= static_cast<uint8_t>(quantized[lane + v]) << (v * bits);
+                    dst[(j + lane) / values_per_byte] = packed;
+                }
+            }
+        }
+#else
+        int64_t j = 0;
+#endif
+        for (; j < columns; j += values_per_byte) {
             uint8_t packed = 0;
             for (int v = 0; v < values_per_byte; ++v) {
-                const float code = ::nearbyintf((src[j * values_per_byte + v] - lo) * inverse);
+                const float code = ::nearbyintf((src[j + v] - lo) * inverse);
                 const uint8_t q = static_cast<uint8_t>(::fmaxf(0.f, ::fminf((1 << bits) - 1, code)));
                 packed |= q << (v * bits);
             }
-            dst[j] = packed;
+            dst[j / values_per_byte] = packed;
         }
         if (bits == 8) { put_float(dst + width - 8, scale); put_float(dst + width - 4, lo); }
         else { put_half(dst + width - 4, scale); put_half(dst + width - 2, lo); }
@@ -74,14 +127,15 @@ Tensor rowwise_pack(const Tensor& weight, int64_t bits, bool optimized, int64_t 
         ranges = min_max->to(DType::Float32).contiguous();
     }
     Tensor y = Tensor::empty(shape, DType::UInt8, weight.device());
+#ifdef TP_QUANT_CUDA
     const RowPack pack{x.data_ptr<float>(), min_max ? ranges.data_ptr<float>() : nullptr,
         y.data_ptr<uint8_t>(), columns, width, bins, static_cast<int>(bits), optimized, static_cast<float>(ratio)};
-#ifdef TP_QUANT_CUDA
     apply(rows, pack);
 #else
-    parallel::parallel_for(0, rows, 1, [&](int64_t first, int64_t last) {
-        for (int64_t row = first; row < last; ++row) pack(row);
-    });
+    tensorplay::cpu::quantized_rowwise_pack_stub(DeviceType::CPU,
+        x.data_ptr<float>(), min_max ? ranges.data_ptr<float>() : nullptr,
+        y.data_ptr<uint8_t>(), rows, columns, width, bins, static_cast<int>(bits),
+        optimized, static_cast<float>(ratio));
 #endif
     return y;
 }
@@ -99,6 +153,7 @@ Tensor embedding_weight_pack(const Tensor& weight) {
     Tensor y = Tensor::empty({weight.size(0), width}, DType::UInt8, weight.device());
     const uint8_t* src = x.data_ptr<uint8_t>(); uint8_t* dst = y.data_ptr<uint8_t>();
     const float *ss = scales.data_ptr<float>(), *zz = zps.data_ptr<float>();
+#ifdef TP_QUANT_CUDA
     apply(weight.size(0), [=] TP_QN_DEVICE (int64_t row) {
         for (int64_t j = 0; j < columns; ++j) dst[row * width + j] = src[row * columns + j];
         if (bits==8) {
@@ -109,6 +164,23 @@ Tensor embedding_weight_pack(const Tensor& weight) {
             put_half(dst + row * width + columns + 2, -zz[row] * ss[row]);
         }
     });
+#else
+    const int64_t row_grain = std::max<int64_t>(
+        1, weight.size(0) / (parallel::get_num_threads() * 4));
+    parallel::parallel_for(0, weight.size(0), row_grain, [&](int64_t first, int64_t last) {
+        for (int64_t row = first; row < last; ++row) {
+            uint8_t* output = dst + row * width;
+            std::memcpy(output, src + row * columns, static_cast<size_t>(columns));
+            if (bits == 8) {
+                put_float(output + columns, ss[row]);
+                put_float(output + columns + 4, -zz[row] * ss[row]);
+            } else {
+                put_half(output + columns, ss[row]);
+                put_half(output + columns + 2, -zz[row] * ss[row]);
+            }
+        }
+    });
+#endif
     return y;
 }
 
