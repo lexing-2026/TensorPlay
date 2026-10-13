@@ -553,7 +553,7 @@ def test_batch_norm_all_grids_ranks_and_empty(device, dtype, zp, rank, relu, emp
 @pytest.mark.parametrize('dtype', ['float32', 'float16', 'bfloat16'])
 @pytest.mark.parametrize('channels', [16, 32, 48, 64, 80])
 @pytest.mark.parametrize('group', [32, 64, 128, 256])
-@pytest.mark.parametrize('rows', [1, 5, 8, 33])
+@pytest.mark.parametrize('rows', [1, 5, 8, 16, 32, 33])
 def test_native_int4_packed_layout_and_multiply(dtype, channels, group, rows):
     rng = np.random.default_rng(124)
     features = group*2

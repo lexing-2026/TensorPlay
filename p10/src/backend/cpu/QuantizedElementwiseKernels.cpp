@@ -443,6 +443,63 @@ void int4_mm_codes(const X* __restrict__ x, const uint8_t* __restrict__ packed,
     });
 }
 
+#ifdef CPU_CAPABILITY_AVX512
+template<int Rows, int Columns>
+void int4_bfloat16_rows(const BFloat16* __restrict__ x, const uint8_t* __restrict__ packed,
+        const BFloat16* __restrict__ params, BFloat16* __restrict__ output,
+        int64_t m, int64_t n, int64_t k, int64_t group) {
+    using V = vec::Vectorized<float>;
+    using B = vec::Vectorized<BFloat16>;
+    constexpr int vectors = Columns / 16;
+    const __m512 lookup = _mm512_setr_ps(-8.f, -7.f, -6.f, -5.f, -4.f, -3.f, -2.f, -1.f,
+                                        0.f, 1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f);
+    parallel::parallel_for(0, m / Rows * (n / Columns), 1, [&](int64_t begin, int64_t end) {
+        for (int64_t task = begin; task < end; ++task) {
+            const int64_t row = task / (n / Columns) * Rows, col = task % (n / Columns) * Columns;
+            const int shift = col % 64 < 32 ? 0 : 4;
+            const uint8_t* weight = packed + col / 64 * 32 * k + col % 32;
+            V totals[Rows][vectors];
+            #pragma GCC unroll 16
+            for (int r = 0; r < Rows; ++r) {
+                #pragma GCC unroll 2
+                for (int c = 0; c < vectors; ++c) totals[r][c] = V(0.f);
+            }
+            V scales[vectors], zeros[vectors];
+            int64_t next_group = 0;
+            for (int64_t feature = 0; feature < k; ++feature) {
+                if (feature == next_group) {
+                    #pragma GCC unroll 2
+                    for (int c = 0; c < vectors; ++c) {
+                        const auto values = vec::convert<float, 2>(vec::VectorizedN<BFloat16, 1>(
+                            B::loadu(params + (feature / group * n + col + c * 16) * 2)));
+                        std::tie(scales[c], zeros[c]) = vec::deinterleave2(values[0], values[1]);
+                    }
+                    next_group += group;
+                }
+                V decoded[vectors];
+                #pragma GCC unroll 2
+                for (int c = 0; c < vectors; ++c) {
+                    const auto raw = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(weight + feature * 32 + c * 16)));
+                    decoded[c] = vec::fmadd(V(_mm512_permutexvar_ps(_mm512_srli_epi32(raw, shift), lookup)), scales[c], zeros[c]);
+                }
+                #pragma GCC unroll 16
+                for (int r = 0; r < Rows; ++r) {
+                    const V activation(static_cast<float>(x[(row + r) * k + feature]));
+                    #pragma GCC unroll 2
+                    for (int c = 0; c < vectors; ++c) totals[r][c] = vec::fmadd(activation, decoded[c], totals[r][c]);
+                }
+            }
+            #pragma GCC unroll 16
+            for (int r = 0; r < Rows; ++r) {
+                if constexpr (vectors == 2)
+                    vec::convert<BFloat16, 1>(vec::VectorizedN<float, 2>(totals[r][0], totals[r][1])).store(output + (row + r) * n + col);
+                else vec::convert<BFloat16>(totals[r][0]).store(output + (row + r) * n + col, Columns);
+            }
+        }
+    });
+}
+#endif
+
 void int4_mm_impl(const void* x, const uint8_t* packed, const void* params, void* output,
         DType dtype, int64_t m, int64_t n, int64_t k, int64_t group) {
     switch (dtype) {
@@ -450,6 +507,14 @@ void int4_mm_impl(const void* x, const uint8_t* packed, const void* params, void
         case DType::Float16: int4_mm_codes(static_cast<const Half*>(x),packed,static_cast<const Half*>(params),static_cast<Half*>(output),m,n,k,group); break;
         case DType::BFloat16: {
             const auto* input = static_cast<const BFloat16*>(x);
+#ifdef CPU_CAPABILITY_AVX512
+            if (m >= 8 && m % 8 == 0 && n % 64 == 0) {
+                if (m % 16 == 0)
+                    int4_bfloat16_rows<16, 16>(input, packed, static_cast<const BFloat16*>(params), static_cast<BFloat16*>(output), m, n, k, group);
+                else int4_bfloat16_rows<8, 32>(input, packed, static_cast<const BFloat16*>(params), static_cast<BFloat16*>(output), m, n, k, group);
+                break;
+            }
+#endif
             if (m < 8) {
                 int4_mm_codes(input,packed,static_cast<const BFloat16*>(params),static_cast<BFloat16*>(output),m,n,k,group);
                 break;
@@ -986,15 +1051,20 @@ void prelu_codes(const void* input, const void* weight, void* output, int64_t si
     auto* y = static_cast<T*>(output);
     const V input_zero(Q(static_cast<T>(xz))), weight_zero(Q(static_cast<T>(wz)));
     const IV unit(qint32(static_cast<int32_t>(one)));
+    const IV scalar_slope(qint32(scalar_weight ? static_cast<int32_t>(static_cast<int64_t>(w[0]) - wz) : 0));
     int64_t i = 0;
     for (; i + V::size() <= size; i += V::size()) {
         const V a = V::loadu(x + i);
-        const V b = scalar_weight ? V(Q(w[0])) : V::loadu(w + i);
         auto positive = a.maximum(input_zero).widening_subtract(input_zero);
         const auto negative = a.minimum(input_zero).widening_subtract(input_zero);
-        const auto slope = b.widening_subtract(weight_zero);
-        for (size_t j = 0; j < positive.size(); ++j)
-            positive[j] = positive[j] * unit + negative[j] * slope[j];
+        if (scalar_weight) {
+            for (size_t j = 0; j < positive.size(); ++j)
+                positive[j] = positive[j] * unit + negative[j] * scalar_slope;
+        } else {
+            const auto slope = V::loadu(w + i).widening_subtract(weight_zero);
+            for (size_t j = 0; j < positive.size(); ++j)
+                positive[j] = positive[j] * unit + negative[j] * slope[j];
+        }
         V::requantize_from_int(positive, multiplier, yz).store(y + i);
     }
     for (; i < size; ++i) {
