@@ -148,6 +148,8 @@ std::pair<int64_t, int64_t> quantized_bounds(DType dtype) {
             return {0, 3};
         case DType::QUInt4x2:
             return {0, 15};
+        case DType::QUInt1x8:
+            return {0, 1};
         default:
             TP_THROW(TypeError,
                      "per-channel quantization requires a quantized dtype");
@@ -302,7 +304,953 @@ Tensor dequantize_per_channel_cpu_impl(const Tensor& self,
     return out;
 }
 
+// ---- Block-wise affine quantization (quantize_affine/dequantize_affine) ----
+//
+// Granularity is expressed by `block_size`, one entry per input dimension.
+// An entry equal to the dimension size collapses to a single block along
+// that axis (per-tensor), an entry of 1 keeps per-element slicing along that
+// axis, and any smaller entry tiles the axis into groups of that size
+// (per-group).  A linear index maps to its block through the row-major
+// block grid.
+struct AffineGroupParams {
+    int64_t dim;
+    std::vector<int64_t> sizes;
+    std::vector<int64_t> blocks;
+    std::vector<int64_t> blocks_per_dim;
+    std::vector<int64_t> block_stride;
+    std::vector<int64_t> size_stride;
+    int64_t num_blocks;
+
+    int64_t block_of(int64_t linear) const {
+        int64_t b = 0;
+        for (int64_t d = 0; d < dim; ++d) {
+            const int64_t coord = (linear / size_stride[d]) % sizes[d];
+            b += (coord / blocks[d]) * block_stride[d];
+        }
+        return b;
+    }
+};
+
+AffineGroupParams make_affine_group_params(
+    const std::vector<int64_t>& sizes,
+    const std::vector<int64_t>& block_size) {
+    AffineGroupParams p;
+    p.dim = static_cast<int64_t>(sizes.size());
+    p.sizes = sizes;
+    p.blocks.resize(p.dim);
+    p.blocks_per_dim.resize(p.dim);
+    p.block_stride.resize(p.dim);
+    p.size_stride.resize(p.dim);
+    int64_t stride = 1;
+    for (int64_t d = p.dim - 1; d >= 0; --d) {
+        p.size_stride[d] = stride;
+        stride *= sizes[d];
+    }
+    int64_t blocks_after = 1;
+    p.num_blocks = 1;
+    for (int64_t d = p.dim - 1; d >= 0; --d) {
+        const int64_t b = std::min<int64_t>(block_size[d], sizes[d]);
+        p.blocks[d] = b > 0 ? b : 1;
+        p.blocks_per_dim[d] = (sizes[d] + p.blocks[d] - 1) / p.blocks[d];
+        p.block_stride[d] = blocks_after;
+        blocks_after *= p.blocks_per_dim[d];
+        p.num_blocks *= p.blocks_per_dim[d];
+    }
+    return p;
+}
+
+// Affine quantization keeps the integer-domain convention: the zero point is
+// added after rounding `x * (1 / scale)`, mirroring the per-tensor path.
+template <typename Storage, bool HasZero>
+void quantize_affine_kernel(const float* input, Storage* output,
+                            int64_t numel, const AffineGroupParams& p,
+                            const float* scales, const float* zeros,
+                            int64_t quant_min, int64_t quant_max) {
+    parallel::parallel_for(0, numel, 16384, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            const int64_t b = p.block_of(i);
+            const float inv = scales[b] == 0.f ? 1.f : 1.f / scales[b];
+            // Rounding happens on the float product, matching the per-tensor
+            // path; the zero point is added after rounding (integer
+            // zero-point domain).
+            const double position = HasZero
+                ? std::nearbyint(input[i] * inv) + zeros[b]
+                : std::nearbyint(input[i] * inv);
+            const int64_t wide = position >= -0x1p63 && position < 0x1p63
+                ? static_cast<int64_t>(position)
+                : std::numeric_limits<int64_t>::min();
+            output[i] = static_cast<Storage>(std::min<int64_t>(
+                quant_max, std::max<int64_t>(quant_min, wide)));
+        }
+    });
+}
+
+template <typename Storage, bool HasZero>
+void dequantize_affine_kernel(const Storage* input, float* output,
+                              int64_t numel, const AffineGroupParams& p,
+                              const float* scales, const float* zeros) {
+    parallel::parallel_for(0, numel, 16384, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            const int64_t b = p.block_of(i);
+            output[i] = (static_cast<float>(input[i]) -
+                         (HasZero ? zeros[b] : 0.f)) * scales[b];
+        }
+    });
+}
+
+template <int Bits, bool HasZero>
+void quantize_affine_subbyte_kernel(const float* input, uint8_t* output,
+                                    int64_t numel, const AffineGroupParams& p,
+                                    const float* scales, const float* zeros,
+                                    int64_t quant_min, int64_t quant_max) {
+    constexpr int pack = 8 / Bits;
+    const int64_t bytes = (numel + pack - 1) / pack;
+    parallel::parallel_for(0, bytes, 8192, [&](int64_t begin, int64_t end) {
+        for (int64_t byte = begin; byte < end; ++byte) {
+            uint8_t value = 0;
+            for (int lane = 0; lane < pack && byte * pack + lane < numel;
+                 ++lane) {
+                const int64_t i = byte * pack + lane;
+                const int64_t b = p.block_of(i);
+                const float inv = scales[b] == 0.f ? 1.f : 1.f / scales[b];
+                const float position = HasZero
+                    ? static_cast<float>(std::nearbyint(input[i] * inv) + zeros[b])
+                    : static_cast<float>(std::nearbyint(input[i] * inv));
+                const int64_t wide =
+                    position >= -0x1p63f && position < 0x1p63f
+                    ? static_cast<int64_t>(position)
+                    : std::numeric_limits<int64_t>::min();
+                const int32_t q = static_cast<int32_t>(static_cast<uint32_t>(wide));
+                value |= static_cast<uint8_t>(std::clamp(
+                    q, static_cast<int32_t>(quant_min),
+                    static_cast<int32_t>(quant_max)))
+                    << (lane * Bits);
+            }
+            output[byte] = value;
+        }
+    });
+}
+
+template <int Bits, bool HasZero>
+void dequantize_affine_subbyte_kernel(const uint8_t* input, float* output,
+                                      int64_t numel,
+                                      const AffineGroupParams& p,
+                                      const float* scales, const float* zeros) {
+    constexpr int pack = 8 / Bits;
+    constexpr int mask = (1 << Bits) - 1;
+    const int64_t bytes = (numel + pack - 1) / pack;
+    parallel::parallel_for(0, bytes, 8192, [&](int64_t begin, int64_t end) {
+        for (int64_t byte = begin; byte < end; ++byte) {
+            for (int lane = 0; lane < pack && byte * pack + lane < numel;
+                 ++lane) {
+                const int64_t i = byte * pack + lane;
+                const int64_t b = p.block_of(i);
+                output[i] = (static_cast<float>(
+                                 (input[byte] >> (lane * Bits)) & mask) -
+                             (HasZero ? zeros[b] : 0.f)) * scales[b];
+            }
+        }
+    });
+}
+
+// Specialized path for the dominant [M, K] weight-only layout with group size g
+// along the last dimension: one scale/zero point is loaded per group.
+template <typename Storage, bool HasZero>
+void quantize_affine_2d_group_kernel(const float* input, Storage* output,
+                                     int64_t M, int64_t K, int64_t g,
+                                     int64_t G, const float* scales,
+                                     const float* zeros, int64_t quant_min,
+                                     int64_t quant_max) {
+    const int64_t num_groups = M * G;
+    parallel::parallel_for(0, num_groups, 1024, [&](int64_t begin, int64_t end) {
+        for (int64_t grp = begin; grp < end; ++grp) {
+            const int64_t m = grp / G;
+            const int64_t gid = grp % G;
+            const int64_t base = m * K + gid * g;
+            const int64_t count = std::min<int64_t>(g, K - gid * g);
+            const float inv = scales[grp] == 0.f ? 1.f : 1.f / scales[grp];
+            const float z = HasZero ? zeros[grp] : 0.f;
+            for (int64_t t = 0; t < count; ++t) {
+                const double position = std::nearbyint(input[base + t] * inv) + z;
+                const int64_t wide =
+                    position >= -0x1p63 && position < 0x1p63
+                    ? static_cast<int64_t>(position)
+                    : std::numeric_limits<int64_t>::min();
+                output[base + t] = static_cast<Storage>(std::min<int64_t>(
+                    quant_max, std::max<int64_t>(quant_min, wide)));
+            }
+        }
+    });
+}
+
+template <typename Storage, bool HasZero>
+void dequantize_affine_2d_group_kernel(const Storage* input, float* output,
+                                     int64_t M, int64_t K, int64_t g,
+                                     int64_t G, const float* scales,
+                                     const float* zeros) {
+    const int64_t num_groups = M * G;
+    parallel::parallel_for(0, num_groups, 1024, [&](int64_t begin, int64_t end) {
+        for (int64_t grp = begin; grp < end; ++grp) {
+            const int64_t m = grp / G;
+            const int64_t gid = grp % G;
+            const int64_t base = m * K + gid * g;
+            const int64_t count = std::min<int64_t>(g, K - gid * g);
+            const float z = HasZero ? zeros[grp] : 0.f;
+            for (int64_t t = 0; t < count; ++t) {
+                output[base + t] =
+                    (static_cast<float>(input[base + t]) - z) * scales[grp];
+            }
+        }
+    });
+}
+
+// The [M, K] sub-byte fast path is only safe when group boundaries fall on
+// byte boundaries; otherwise a byte would straddle two groups and the
+// group-parallel loop would race.  The generic kernel is race-free.
+template <int Bits, bool HasZero>
+void quantize_affine_2d_subbyte_kernel(const float* input, uint8_t* output,
+                                       int64_t M, int64_t K, int64_t g,
+                                       int64_t G, const float* scales,
+                                       const float* zeros, int64_t quant_min,
+                                       int64_t quant_max) {
+    constexpr int pack = 8 / Bits;
+    const int64_t num_groups = M * G;
+    parallel::parallel_for(0, num_groups, 1024, [&](int64_t begin, int64_t end) {
+        for (int64_t grp = begin; grp < end; ++grp) {
+            const int64_t m = grp / G;
+            const int64_t gid = grp % G;
+            const int64_t base = m * K + gid * g;
+            const int64_t count = std::min<int64_t>(g, K - gid * g);
+            const float inv = scales[grp] == 0.f ? 1.f : 1.f / scales[grp];
+            const float z = HasZero ? zeros[grp] : 0.f;
+            for (int64_t t = 0; t < count; ++t) {
+                const int64_t i = base + t;
+                const float position = static_cast<float>(
+                    std::nearbyint(input[i] * inv) + z);
+                const int64_t wide =
+                    position >= -0x1p63f && position < 0x1p63f
+                    ? static_cast<int64_t>(position)
+                    : std::numeric_limits<int64_t>::min();
+                const int32_t q = static_cast<int32_t>(static_cast<uint32_t>(wide));
+                const int64_t lane = i % pack;
+                if (lane == 0) output[i / pack] = 0;
+                output[i / pack] |= static_cast<uint8_t>(std::clamp(
+                    q, static_cast<int32_t>(quant_min),
+                    static_cast<int32_t>(quant_max)))
+                    << (lane * Bits);
+            }
+        }
+    });
+}
+
+template <int Bits, bool HasZero>
+void dequantize_affine_2d_subbyte_kernel(const uint8_t* input, float* output,
+                                         int64_t M, int64_t K, int64_t g,
+                                         int64_t G, const float* scales,
+                                         const float* zeros) {
+    constexpr int pack = 8 / Bits;
+    constexpr int mask = (1 << Bits) - 1;
+    const int64_t num_groups = M * G;
+    parallel::parallel_for(0, num_groups, 1024, [&](int64_t begin, int64_t end) {
+        for (int64_t grp = begin; grp < end; ++grp) {
+            const int64_t m = grp / G;
+            const int64_t gid = grp % G;
+            const int64_t base = m * K + gid * g;
+            const int64_t count = std::min<int64_t>(g, K - gid * g);
+            const float z = HasZero ? zeros[grp] : 0.f;
+            for (int64_t t = 0; t < count; ++t) {
+                const int64_t i = base + t;
+                output[i] = (static_cast<float>(
+                                 (input[i / pack] >> ((i % pack) * Bits)) &
+                                 mask) -
+                             z) * scales[grp];
+            }
+        }
+    });
+}
+
+bool is_affine_2d_group(const AffineGroupParams& p) {
+    return p.dim == 2 && p.blocks[0] == 1;
+}
+
 } // namespace
+
+Tensor quantize_affine_cpu(const Tensor& self,
+                           const std::vector<int64_t>& block_size,
+                           const Tensor& scales,
+                           const std::optional<Tensor>& zero_points,
+                           DType dtype, int64_t quant_min, int64_t quant_max) {
+    if (!isQuantizedType(dtype)) {
+        TP_THROW(TypeError, "quantize_affine(): expected a quantized dtype, got ",
+                 toString(dtype));
+    }
+    const Tensor input = promote_to_compute_dtype(self);
+    const int64_t dim = input.dim();
+    if (static_cast<int64_t>(block_size.size()) != dim) {
+        TP_THROW(ValueError,
+                 "quantize_affine(): block_size rank must match the input rank");
+    }
+    for (int64_t d = 0; d < dim; ++d) {
+        if (block_size[d] <= 0) {
+            TP_THROW(ValueError,
+                     "quantize_affine(): block_size entries must be positive");
+        }
+    }
+    const AffineGroupParams p =
+        make_affine_group_params(input.shape(), block_size);
+    if (scales.numel() != p.num_blocks && scales.numel() != 1) {
+        TP_THROW(ValueError,
+                 "quantize_affine(): scales must have one entry per block");
+    }
+    if (zero_points.has_value() && zero_points->numel() > 0 &&
+        zero_points->numel() != p.num_blocks && zero_points->numel() != 1) {
+        TP_THROW(ValueError,
+                 "quantize_affine(): zero_points must have one entry per "
+                 "block, or be a scalar");
+    }
+    if (scales.device() != self.device() ||
+        (zero_points.has_value() && zero_points->numel() > 0 &&
+         zero_points->device() != self.device())) {
+        TP_THROW(RuntimeError,
+                 "quantize_affine(): scales and zero_points must be on the "
+                 "input device");
+    }
+    const auto bounds = quantized_bounds(dtype);
+    const int64_t qmin = quant_min < quant_max ? quant_min : bounds.first;
+    const int64_t qmax = quant_max > quant_min ? quant_max : bounds.second;
+    check_storage_range(qmin, qmax, bounds.first, bounds.second);
+
+    Tensor out = Tensor::empty(input.shape(), dtype, self.device());
+    if (input.numel() == 0) return out;
+
+    const Tensor input_f =
+        (input.dtype() == DType::Float32) ? input : input.to(DType::Float32).contiguous();
+    const float* in = input_f.data_ptr<float>();
+
+    const Tensor sc = scales.to(DType::Float32).contiguous();
+    std::vector<float> scale_buf(p.num_blocks);
+    if (sc.numel() == 1) {
+        std::fill(scale_buf.begin(), scale_buf.end(), *sc.data_ptr<float>());
+    } else {
+        std::memcpy(scale_buf.data(), sc.data_ptr<float>(),
+                     sizeof(float) * p.num_blocks);
+    }
+    const float* sp = scale_buf.data();
+
+    std::vector<float> zero_buf;
+    const float* zp = nullptr;
+    bool has_zero = false;
+    if (zero_points.has_value() && zero_points->numel() > 0) {
+        has_zero = true;
+        const Tensor z = zero_points->to(DType::Float32).contiguous();
+        zero_buf.resize(p.num_blocks);
+        if (z.numel() == 1) {
+            std::fill(zero_buf.begin(), zero_buf.end(), *z.data_ptr<float>());
+        } else {
+            std::memcpy(zero_buf.data(), z.data_ptr<float>(),
+                         sizeof(float) * p.num_blocks);
+        }
+        zp = zero_buf.data();
+    }
+
+    const int64_t numel = input.numel();
+    const bool fast2d =
+        is_affine_2d_group(p) && p.blocks_per_dim[0] == input.size(0) &&
+        p.blocks_per_dim[1] >= 1;
+    const int64_t M = fast2d ? input.size(0) : 0;
+    const int64_t K = fast2d ? input.size(1) : 0;
+    const int64_t g = fast2d ? p.blocks[1] : 0;
+    const int64_t G = fast2d ? p.blocks_per_dim[1] : 0;
+
+    switch (dtype) {
+        case DType::QInt8: {
+            auto* outp = out.data_ptr<int8_t>();
+            if (fast2d) {
+                if (has_zero)
+                    quantize_affine_2d_group_kernel<int8_t, true>(
+                        in, outp, M, K, g, G, sp, zp, qmin, qmax);
+                else
+                    quantize_affine_2d_group_kernel<int8_t, false>(
+                        in, outp, M, K, g, G, sp, zp, qmin, qmax);
+            } else if (has_zero)
+                quantize_affine_kernel<int8_t, true>(in, outp, numel, p, sp,
+                                                     zp, qmin, qmax);
+            else
+                quantize_affine_kernel<int8_t, false>(in, outp, numel, p, sp,
+                                                        zp, qmin, qmax);
+            break;
+        }
+        case DType::QUInt8: {
+            auto* outp = out.data_ptr<uint8_t>();
+            if (fast2d) {
+                if (has_zero)
+                    quantize_affine_2d_group_kernel<uint8_t, true>(
+                        in, outp, M, K, g, G, sp, zp, qmin, qmax);
+                else
+                    quantize_affine_2d_group_kernel<uint8_t, false>(
+                        in, outp, M, K, g, G, sp, zp, qmin, qmax);
+            } else if (has_zero)
+                quantize_affine_kernel<uint8_t, true>(in, outp, numel, p, sp,
+                                                      zp, qmin, qmax);
+            else
+                quantize_affine_kernel<uint8_t, false>(in, outp, numel, p, sp,
+                                                        zp, qmin, qmax);
+            break;
+        }
+        case DType::QInt32: {
+            auto* outp = out.data_ptr<int32_t>();
+            if (fast2d) {
+                if (has_zero)
+                    quantize_affine_2d_group_kernel<int32_t, true>(
+                        in, outp, M, K, g, G, sp, zp, qmin, qmax);
+                else
+                    quantize_affine_2d_group_kernel<int32_t, false>(
+                        in, outp, M, K, g, G, sp, zp, qmin, qmax);
+            } else if (has_zero)
+                quantize_affine_kernel<int32_t, true>(in, outp, numel, p, sp,
+                                                     zp, qmin, qmax);
+            else
+                quantize_affine_kernel<int32_t, false>(in, outp, numel, p, sp,
+                                                        zp, qmin, qmax);
+            break;
+        }
+        case DType::QUInt2x4:
+        case DType::QUInt4x2:
+        case DType::QUInt1x8: {
+            const int bits = dtype == DType::QUInt4x2 ? 4
+                            : dtype == DType::QUInt2x4 ? 2 : 1;
+            const int pack = 8 / bits;
+            auto* outp = static_cast<uint8_t*>(out.data_ptr());
+            const bool aligned = (K % pack == 0) && (g % pack == 0);
+            if (fast2d && aligned) {
+                if (bits == 4) {
+                    if (has_zero)
+                        quantize_affine_2d_subbyte_kernel<4, true>(
+                            in, outp, M, K, g, G, sp, zp, qmin, qmax);
+                    else
+                        quantize_affine_2d_subbyte_kernel<4, false>(
+                            in, outp, M, K, g, G, sp, zp, qmin, qmax);
+                } else if (bits == 2) {
+                    if (has_zero)
+                        quantize_affine_2d_subbyte_kernel<2, true>(
+                            in, outp, M, K, g, G, sp, zp, qmin, qmax);
+                    else
+                        quantize_affine_2d_subbyte_kernel<2, false>(
+                            in, outp, M, K, g, G, sp, zp, qmin, qmax);
+                } else if (has_zero)
+                    quantize_affine_2d_subbyte_kernel<1, true>(
+                        in, outp, M, K, g, G, sp, zp, qmin, qmax);
+                else
+                    quantize_affine_2d_subbyte_kernel<1, false>(
+                        in, outp, M, K, g, G, sp, zp, qmin, qmax);
+            } else if (bits == 4) {
+                if (has_zero)
+                    quantize_affine_subbyte_kernel<4, true>(
+                        in, outp, numel, p, sp, zp, qmin, qmax);
+                else
+                    quantize_affine_subbyte_kernel<4, false>(
+                        in, outp, numel, p, sp, zp, qmin, qmax);
+            } else if (bits == 2) {
+                if (has_zero)
+                    quantize_affine_subbyte_kernel<2, true>(
+                        in, outp, numel, p, sp, zp, qmin, qmax);
+                else
+                    quantize_affine_subbyte_kernel<2, false>(
+                        in, outp, numel, p, sp, zp, qmin, qmax);
+            } else if (has_zero)
+                quantize_affine_subbyte_kernel<1, true>(
+                    in, outp, numel, p, sp, zp, qmin, qmax);
+            else
+                quantize_affine_subbyte_kernel<1, false>(
+                    in, outp, numel, p, sp, zp, qmin, qmax);
+            break;
+        }
+        default:
+            TP_THROW(TypeError, "quantize_affine(): unsupported dtype ",
+                     toString(dtype));
+    }
+    return out;
+}
+
+Tensor dequantize_affine_cpu(const Tensor& self,
+                             const std::vector<int64_t>& block_size,
+                             const Tensor& scales,
+                             const std::optional<Tensor>& zero_points) {
+    const DType dtype = self.dtype();
+    if (!isQuantizedType(dtype)) {
+        TP_THROW(TypeError,
+                 "dequantize_affine(): expected a quantized tensor, got ",
+                 toString(dtype));
+    }
+    const int64_t dim = self.dim();
+    if (static_cast<int64_t>(block_size.size()) != dim) {
+        TP_THROW(ValueError,
+                 "dequantize_affine(): block_size rank must match the input "
+                 "rank");
+    }
+    for (int64_t d = 0; d < dim; ++d) {
+        if (block_size[d] <= 0) {
+            TP_THROW(ValueError,
+                     "dequantize_affine(): block_size entries must be "
+                     "positive");
+        }
+    }
+    const Tensor input = self.is_contiguous() ? self : self.contiguous();
+    const AffineGroupParams p =
+        make_affine_group_params(input.shape(), block_size);
+    if (scales.numel() != p.num_blocks && scales.numel() != 1) {
+        TP_THROW(ValueError,
+                 "dequantize_affine(): scales must have one entry per block");
+    }
+    if (zero_points.has_value() && zero_points->numel() > 0 &&
+        zero_points->numel() != p.num_blocks && zero_points->numel() != 1) {
+        TP_THROW(ValueError,
+                 "dequantize_affine(): zero_points must have one entry per "
+                 "block, or be a scalar");
+    }
+    if (scales.device() != self.device() ||
+        (zero_points.has_value() && zero_points->numel() > 0 &&
+         zero_points->device() != self.device())) {
+        TP_THROW(RuntimeError,
+                 "dequantize_affine(): scales and zero_points must be on the "
+                 "input device");
+    }
+
+    Tensor out = Tensor::empty(input.shape(), DType::Float32, self.device());
+    if (input.numel() == 0) return out;
+
+    const Tensor sc = scales.to(DType::Float32).contiguous();
+    std::vector<float> scale_buf(p.num_blocks);
+    if (sc.numel() == 1) {
+        std::fill(scale_buf.begin(), scale_buf.end(), *sc.data_ptr<float>());
+    } else {
+        std::memcpy(scale_buf.data(), sc.data_ptr<float>(),
+                     sizeof(float) * p.num_blocks);
+    }
+    const float* sp = scale_buf.data();
+
+    std::vector<float> zero_buf;
+    const float* zp = nullptr;
+    bool has_zero = false;
+    if (zero_points.has_value() && zero_points->numel() > 0) {
+        has_zero = true;
+        const Tensor z = zero_points->to(DType::Float32).contiguous();
+        zero_buf.resize(p.num_blocks);
+        if (z.numel() == 1) {
+            std::fill(zero_buf.begin(), zero_buf.end(), *z.data_ptr<float>());
+        } else {
+            std::memcpy(zero_buf.data(), z.data_ptr<float>(),
+                         sizeof(float) * p.num_blocks);
+        }
+        zp = zero_buf.data();
+    }
+
+    const int64_t numel = input.numel();
+    const bool fast2d = is_affine_2d_group(p);
+    const int64_t M = fast2d ? input.size(0) : 0;
+    const int64_t K = fast2d ? input.size(1) : 0;
+    const int64_t g = fast2d ? p.blocks[1] : 0;
+    const int64_t G = fast2d ? p.blocks_per_dim[1] : 0;
+
+    switch (dtype) {
+        case DType::QInt8: {
+            const auto* inp = input.data_ptr<int8_t>();
+            auto* outp = out.data_ptr<float>();
+            if (fast2d) {
+                if (has_zero)
+                    dequantize_affine_2d_group_kernel<int8_t, true>(
+                        inp, outp, M, K, g, G, sp, zp);
+                else
+                    dequantize_affine_2d_group_kernel<int8_t, false>(
+                        inp, outp, M, K, g, G, sp, zp);
+            } else if (has_zero)
+                dequantize_affine_kernel<int8_t, true>(inp, outp, numel, p, sp,
+                                                       zp);
+            else
+                dequantize_affine_kernel<int8_t, false>(inp, outp, numel, p, sp,
+                                                       zp);
+            break;
+        }
+        case DType::QUInt8: {
+            const auto* inp = input.data_ptr<uint8_t>();
+            auto* outp = out.data_ptr<float>();
+            if (fast2d) {
+                if (has_zero)
+                    dequantize_affine_2d_group_kernel<uint8_t, true>(
+                        inp, outp, M, K, g, G, sp, zp);
+                else
+                    dequantize_affine_2d_group_kernel<uint8_t, false>(
+                        inp, outp, M, K, g, G, sp, zp);
+            } else if (has_zero)
+                dequantize_affine_kernel<uint8_t, true>(inp, outp, numel, p, sp,
+                                                        zp);
+            else
+                dequantize_affine_kernel<uint8_t, false>(inp, outp, numel, p,
+                                                         sp, zp);
+            break;
+        }
+        case DType::QInt32: {
+            const auto* inp = input.data_ptr<int32_t>();
+            auto* outp = out.data_ptr<float>();
+            if (fast2d) {
+                if (has_zero)
+                    dequantize_affine_2d_group_kernel<int32_t, true>(
+                        inp, outp, M, K, g, G, sp, zp);
+                else
+                    dequantize_affine_2d_group_kernel<int32_t, false>(
+                        inp, outp, M, K, g, G, sp, zp);
+            } else if (has_zero)
+                dequantize_affine_kernel<int32_t, true>(inp, outp, numel, p, sp,
+                                                       zp);
+            else
+                dequantize_affine_kernel<int32_t, false>(inp, outp, numel, p,
+                                                         sp, zp);
+            break;
+        }
+        case DType::QUInt2x4:
+        case DType::QUInt4x2:
+        case DType::QUInt1x8: {
+            const int bits = dtype == DType::QUInt4x2 ? 4
+                            : dtype == DType::QUInt2x4 ? 2 : 1;
+            const int pack = 8 / bits;
+            const auto* inp = static_cast<const uint8_t*>(input.data_ptr());
+            auto* outp = out.data_ptr<float>();
+            const bool aligned = (K % pack == 0) && (g % pack == 0);
+            if (fast2d && aligned) {
+                if (bits == 4) {
+                    if (has_zero)
+                        dequantize_affine_2d_subbyte_kernel<4, true>(
+                            inp, outp, M, K, g, G, sp, zp);
+                    else
+                        dequantize_affine_2d_subbyte_kernel<4, false>(
+                            inp, outp, M, K, g, G, sp, zp);
+                } else if (bits == 2) {
+                    if (has_zero)
+                        dequantize_affine_2d_subbyte_kernel<2, true>(
+                            inp, outp, M, K, g, G, sp, zp);
+                    else
+                        dequantize_affine_2d_subbyte_kernel<2, false>(
+                            inp, outp, M, K, g, G, sp, zp);
+                } else if (has_zero)
+                    dequantize_affine_2d_subbyte_kernel<1, true>(
+                        inp, outp, M, K, g, G, sp, zp);
+                else
+                    dequantize_affine_2d_subbyte_kernel<1, false>(
+                        inp, outp, M, K, g, G, sp, zp);
+            } else if (bits == 4) {
+                if (has_zero)
+                    dequantize_affine_subbyte_kernel<4, true>(
+                        inp, outp, numel, p, sp, zp);
+                else
+                    dequantize_affine_subbyte_kernel<4, false>(
+                        inp, outp, numel, p, sp, zp);
+            } else if (bits == 2) {
+                if (has_zero)
+                    dequantize_affine_subbyte_kernel<2, true>(
+                        inp, outp, numel, p, sp, zp);
+                else
+                    dequantize_affine_subbyte_kernel<2, false>(
+                        inp, outp, numel, p, sp, zp);
+            } else if (has_zero)
+                dequantize_affine_subbyte_kernel<1, true>(
+                    inp, outp, numel, p, sp, zp);
+            else
+                dequantize_affine_subbyte_kernel<1, false>(
+                    inp, outp, numel, p, sp, zp);
+            break;
+        }
+        default:
+            TP_THROW(TypeError, "dequantize_affine(): unsupported dtype ",
+                     toString(dtype));
+    }
+    return out;
+}
+
+// ---- FP8 affine quantization (quantize_affine_float8 family) ----
+//
+// The scale tensor carries the block structure: a shape equal to the input
+// means per-element scales, a scalar means per-tensor, a singleton broadcast
+// dimension means per-channel/per-row, and a shape `input / block_size`
+// means per-group.  The element-to-scale mapping is expressed with the same
+// block grid used by the integer path: each input dimension is tiled by
+// `input_size / scale_size` (or the whole dimension when the scale has
+// size 1 along it), so `block_of` indexes the scale tensor directly.
+
+double float8_max_value(DType dtype) {
+    switch (dtype) {
+        case DType::Float8_e4m3fn:
+            return 448.0;
+        case DType::Float8_e4m3fnuz:
+            return 240.0;
+        case DType::Float8_e5m2:
+            return 57344.0;
+        case DType::Float8_e5m2fnuz:
+            return 57344.0;
+        default:
+            TP_THROW(TypeError, "float8 quantization requires a float8 dtype, got ",
+                     toString(dtype));
+    }
+}
+
+std::vector<int64_t> scale_block_size(const std::vector<int64_t>& sizes,
+                                      const std::vector<int64_t>& scale_sizes,
+                                      const char* op) {
+    std::vector<int64_t> block_size(sizes.size());
+    for (size_t d = 0; d < sizes.size(); ++d) {
+        if (scale_sizes[d] == 1) {
+            block_size[d] = sizes[d];
+        } else {
+            if (sizes[d] % scale_sizes[d] != 0) {
+                TP_THROW(ValueError, op,
+                         ": input size must be divisible by the scale size "
+                         "along every non-broadcast dimension");
+            }
+            block_size[d] = sizes[d] / scale_sizes[d];
+        }
+    }
+    return block_size;
+}
+
+template <typename Float8T>
+void quantize_affine_float8_kernel(const float* input, Float8T* output,
+                                   int64_t numel, const AffineGroupParams& p,
+                                   const float* scales, float max_value) {
+    parallel::parallel_for(0, numel, 16384, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            const int64_t b = p.block_of(i);
+            const float scaled = input[i] / scales[b];
+            const float clamped =
+                std::max(-max_value, std::min(max_value, scaled));
+            output[i] = Float8T(clamped);
+        }
+    });
+}
+
+template <typename Float8T, typename OutputT>
+void dequantize_affine_float8_kernel(const Float8T* input, OutputT* output,
+                                     int64_t numel, const AffineGroupParams& p,
+                                     const float* scales) {
+    parallel::parallel_for(0, numel, 16384, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            const int64_t b = p.block_of(i);
+            output[i] = static_cast<OutputT>(
+                static_cast<float>(input[i]) * scales[b]);
+        }
+    });
+}
+
+// Per-block max-abs reduction for float8 dynamic quantization.  Each block
+// is scanned independently (block-coordinate decode + intra-block walk), so
+// the parallelization unit is the block and no atomics are needed.
+template <typename F>
+void for_each_block_element(const AffineGroupParams& p, int64_t b, F&& fn) {
+    int64_t base = 0;
+    for (int64_t d = 0; d < p.dim; ++d) {
+        const int64_t bc = (b / p.block_stride[d]) % p.blocks_per_dim[d];
+        base += (bc * p.blocks[d]) * p.size_stride[d];
+    }
+    int64_t block_numel = 1;
+    for (int64_t d = 0; d < p.dim; ++d) block_numel *= p.blocks[d];
+    for (int64_t t = 0; t < block_numel; ++t) {
+        int64_t local = t;
+        int64_t idx = base;
+        for (int64_t d = p.dim - 1; d >= 0; --d) {
+            const int64_t td = local % p.blocks[d];
+            local /= p.blocks[d];
+            idx += td * p.size_stride[d];
+        }
+        fn(idx);
+    }
+}
+
+Tensor quantize_affine_float8_cpu(const Tensor& self, const Tensor& scale,
+                                  DType dtype) {
+    if (!isFloat8Type(dtype)) {
+        TP_THROW(TypeError,
+                 "quantize_affine_float8(): expected a float8 dtype, got ",
+                 toString(dtype));
+    }
+    const Tensor input = promote_to_compute_dtype(self);
+    const int64_t dim = input.dim();
+    if (scale.dim() != dim && scale.numel() != 1) {
+        TP_THROW(ValueError,
+                 "quantize_affine_float8(): scale rank must match the input "
+                 "rank unless it is a scalar");
+    }
+    if (scale.device() != self.device()) {
+        TP_THROW(RuntimeError,
+                 "quantize_affine_float8(): scale must be on the input "
+                 "device");
+    }
+    const float max_value = static_cast<float>(float8_max_value(dtype));
+    Tensor out = Tensor::empty(input.shape(), dtype, self.device());
+    if (input.numel() == 0) return out;
+
+    const Tensor sc = scale.to(DType::Float32).contiguous();
+    std::vector<int64_t> scale_sizes(dim, 1);
+    if (sc.numel() != 1) {
+        for (int64_t d = 0; d < dim; ++d) scale_sizes[d] = sc.size(d);
+    }
+    const std::vector<int64_t> block_size =
+        scale_block_size(input.shape(), scale_sizes,
+                         "quantize_affine_float8");
+    const AffineGroupParams p = make_affine_group_params(input.shape(), block_size);
+    std::vector<float> scale_buf(p.num_blocks);
+    if (sc.numel() == 1) {
+        std::fill(scale_buf.begin(), scale_buf.end(), *sc.data_ptr<float>());
+    } else {
+        std::memcpy(scale_buf.data(), sc.data_ptr<float>(),
+                    sizeof(float) * p.num_blocks);
+    }
+    const Tensor input_f =
+        (input.dtype() == DType::Float32) ? input : input.to(DType::Float32).contiguous();
+    const float* in = input_f.data_ptr<float>();
+    const float* sp = scale_buf.data();
+    const int64_t numel = input.numel();
+    switch (dtype) {
+        case DType::Float8_e4m3fn:
+            quantize_affine_float8_kernel<Float8_e4m3fn>(
+                in, out.data_ptr<Float8_e4m3fn>(), numel, p, sp, max_value);
+            break;
+        case DType::Float8_e4m3fnuz:
+            quantize_affine_float8_kernel<Float8_e4m3fnuz>(
+                in, out.data_ptr<Float8_e4m3fnuz>(), numel, p, sp, max_value);
+            break;
+        case DType::Float8_e5m2:
+            quantize_affine_float8_kernel<Float8_e5m2>(
+                in, out.data_ptr<Float8_e5m2>(), numel, p, sp, max_value);
+            break;
+        case DType::Float8_e5m2fnuz:
+            quantize_affine_float8_kernel<Float8_e5m2fnuz>(
+                in, out.data_ptr<Float8_e5m2fnuz>(), numel, p, sp, max_value);
+            break;
+        default:
+            break;
+    }
+    return out;
+}
+
+Tensor dequantize_affine_float8_cpu(const Tensor& self, const Tensor& scale,
+                                    DType output_dtype) {
+    if (!isFloat8Type(self.dtype())) {
+        TP_THROW(TypeError,
+                 "dequantize_affine_float8(): expected a float8 tensor, got ",
+                 toString(self.dtype()));
+    }
+    const int64_t dim = self.dim();
+    if (scale.dim() != dim && scale.numel() != 1) {
+        TP_THROW(ValueError,
+                 "dequantize_affine_float8(): scale rank must match the input "
+                 "rank unless it is a scalar");
+    }
+    if (scale.device() != self.device()) {
+        TP_THROW(RuntimeError,
+                 "dequantize_affine_float8(): scale must be on the input "
+                 "device");
+    }
+    const Tensor input = self.is_contiguous() ? self : self.contiguous();
+    Tensor out = Tensor::empty(input.shape(), DType::Float32, self.device());
+    if (input.numel() == 0) return out;
+
+    const Tensor sc = scale.to(DType::Float32).contiguous();
+    std::vector<int64_t> scale_sizes(dim, 1);
+    if (sc.numel() != 1) {
+        for (int64_t d = 0; d < dim; ++d) scale_sizes[d] = sc.size(d);
+    }
+    const std::vector<int64_t> block_size =
+        scale_block_size(input.shape(), scale_sizes,
+                         "dequantize_affine_float8");
+    const AffineGroupParams p = make_affine_group_params(input.shape(), block_size);
+    std::vector<float> scale_buf(p.num_blocks);
+    if (sc.numel() == 1) {
+        std::fill(scale_buf.begin(), scale_buf.end(), *sc.data_ptr<float>());
+    } else {
+        std::memcpy(scale_buf.data(), sc.data_ptr<float>(),
+                    sizeof(float) * p.num_blocks);
+    }
+    const float* sp = scale_buf.data();
+    const int64_t numel = input.numel();
+    switch (self.dtype()) {
+        case DType::Float8_e4m3fn:
+            dequantize_affine_float8_kernel<Float8_e4m3fn, float>(
+                input.data_ptr<Float8_e4m3fn>(), out.data_ptr<float>(), numel,
+                p, sp);
+            break;
+        case DType::Float8_e4m3fnuz:
+            dequantize_affine_float8_kernel<Float8_e4m3fnuz, float>(
+                input.data_ptr<Float8_e4m3fnuz>(), out.data_ptr<float>(), numel,
+                p, sp);
+            break;
+        case DType::Float8_e5m2:
+            dequantize_affine_float8_kernel<Float8_e5m2, float>(
+                input.data_ptr<Float8_e5m2>(), out.data_ptr<float>(), numel, p,
+                sp);
+            break;
+        case DType::Float8_e5m2fnuz:
+            dequantize_affine_float8_kernel<Float8_e5m2fnuz, float>(
+                input.data_ptr<Float8_e5m2fnuz>(), out.data_ptr<float>(), numel,
+                p, sp);
+            break;
+        default:
+            break;
+    }
+    if (output_dtype != DType::Float32) {
+        out = out.to(output_dtype);
+    }
+    return out;
+}
+
+Tensor choose_scale_float8_cpu(const Tensor& self,
+                               const std::vector<int64_t>& block_size,
+                               DType float8_dtype,
+                               std::optional<double> hp_value_lb,
+                               std::optional<double> hp_value_ub) {
+    if (!isFloat8Type(float8_dtype)) {
+        TP_THROW(TypeError,
+                 "choose_scale_float8(): expected a float8 dtype, got ",
+                 toString(float8_dtype));
+    }
+    const Tensor input = promote_to_compute_dtype(self);
+    const int64_t dim = input.dim();
+    if (static_cast<int64_t>(block_size.size()) != dim) {
+        TP_THROW(ValueError,
+                 "choose_scale_float8(): block_size rank must match the "
+                 "input rank");
+    }
+    for (int64_t d = 0; d < dim; ++d) {
+        if (block_size[d] <= 0 || input.size(d) % block_size[d] != 0) {
+            TP_THROW(ValueError,
+                     "choose_scale_float8(): input size must be divisible by "
+                     "block_size along every dimension");
+        }
+    }
+    const float max_value = static_cast<float>(float8_max_value(float8_dtype));
+    const AffineGroupParams p = make_affine_group_params(input.shape(), block_size);
+    Tensor out = Tensor::empty(p.blocks_per_dim, DType::Float32, self.device());
+    if (input.numel() == 0) return out;
+
+    const float lb = hp_value_lb.has_value()
+        ? static_cast<float>(*hp_value_lb)
+        : -std::numeric_limits<float>::infinity();
+    const float ub = hp_value_ub.has_value()
+        ? static_cast<float>(*hp_value_ub)
+        : std::numeric_limits<float>::infinity();
+    const float* in = input.data_ptr<float>();
+    float* outp = out.data_ptr<float>();
+    parallel::parallel_for(0, p.num_blocks, 1024, [&](int64_t begin,
+                                                       int64_t end) {
+        for (int64_t b = begin; b < end; ++b) {
+            float max_abs = 0.f;
+            for_each_block_element(p, b, [&](int64_t i) {
+                max_abs = std::max(max_abs, std::abs(in[i]));
+            });
+            max_abs = std::max(max_abs, lb);
+            max_abs = std::min(max_abs, ub);
+            outp[b] = max_abs / max_value;
+        }
+    });
+    return out;
+}
 
 Tensor quantize_per_tensor_quint8_cpu(const Tensor& self, double scale,
                                        int64_t zero_point, int64_t quant_min,
@@ -439,7 +1387,7 @@ Tensor quantize_per_tensor_subbyte_cpu(const Tensor& self,double scale,int64_t z
     const Tensor input=channels_last ? self : promote_to_compute_dtype(self);
     Tensor out=Tensor::empty(self.shape(),dtype,self.device());
     if (channels_last) out=out.as_strided(self.shape(),get_channels_last_strides(self.shape()),0);
-    const int bits=dtype==DType::QUInt4x2 ? 4 : 2,pack=8/bits;
+    const int bits=dtype==DType::QUInt4x2 ? 4 : (dtype==DType::QUInt2x4 ? 2 : 1),pack=8/bits;
     const int64_t bytes=(input.numel()+pack-1)/pack;
     const auto* src=input.const_data_ptr<float>();
     auto* dst=static_cast<uint8_t*>(out.data_ptr());
@@ -461,7 +1409,7 @@ Tensor dequantize_per_tensor_subbyte_cpu(const Tensor& self,double scale,int64_t
     const Tensor input=channels_last ? self : self.contiguous();
     Tensor out=Tensor::empty(self.shape(),DType::Float32,self.device());
     if (channels_last) out=out.as_strided(self.shape(),get_channels_last_strides(self.shape()),0);
-    const int bits=self.dtype()==DType::QUInt4x2 ? 4 : 2,pack=8/bits;
+    const int bits=self.dtype()==DType::QUInt4x2 ? 4 : (self.dtype()==DType::QUInt2x4 ? 2 : 1),pack=8/bits;
     const int64_t bytes=(input.numel()+pack-1)/pack;
     const auto* src=static_cast<const uint8_t*>(input.const_data_ptr());
     auto* dst=out.data_ptr<float>();
@@ -483,7 +1431,7 @@ Tensor per_channel_subbyte_cpu(const Tensor& self,const Tensor& scales,const Ten
     const auto* scale=sc.data_ptr<float>();
     const auto* zero=zp.data_ptr<float>();
     Tensor out=Tensor::empty(self.shape(),quantize ? dtype : DType::Float32,self.device());
-    const int bits=dtype==DType::QUInt4x2 ? 4 : 2,pack=8/bits,mask=(1<<bits)-1;
+    const int bits=dtype==DType::QUInt4x2 ? 4 : (dtype==DType::QUInt2x4 ? 2 : 1),pack=8/bits,mask=(1<<bits)-1;
     int64_t stride=1;
     for (int64_t d=axis+1;d<self.dim();++d) stride*=self.size(d);
     const int64_t channels=sc.numel(),bytes=(self.numel()+pack-1)/pack;
@@ -531,6 +1479,7 @@ Tensor quantize_per_tensor_dtype_cpu(const Tensor& self, double scale,
             return quantize_per_tensor_qint32_cpu(self, scale, zero_point);
         case DType::QUInt2x4:
         case DType::QUInt4x2:
+        case DType::QUInt1x8:
             return quantize_per_tensor_subbyte_cpu(self,scale,zero_point,dtype);
         default:
             TP_THROW(TypeError, "quantize(): unsupported quantized dtype ",
@@ -554,6 +1503,7 @@ Tensor dequantize_per_tensor_dtype_cpu(const Tensor& self, double scale,
             return dequantize_per_tensor_qint32_cpu(self, scale, zero_point);
         case DType::QUInt2x4:
         case DType::QUInt4x2:
+        case DType::QUInt1x8:
             return dequantize_per_tensor_subbyte_cpu(self,scale,zero_point);
         default:
             TP_THROW(TypeError, "dequantize(): unsupported quantized dtype ",
@@ -579,6 +1529,7 @@ Tensor quantize_per_channel_dtype_cpu(const Tensor& self,
     switch (dtype) {
         case DType::QUInt2x4:
         case DType::QUInt4x2:
+        case DType::QUInt1x8:
             return per_channel_subbyte_cpu(self,scales,zero_points,axis,dtype,true);
         case DType::QInt8:
             return quantize_per_channel_cpu_impl<int8_t>(
@@ -602,6 +1553,7 @@ Tensor dequantize_per_channel_dtype_cpu(const Tensor& self,
     switch (dtype) {
         case DType::QUInt2x4:
         case DType::QUInt4x2:
+        case DType::QUInt1x8:
             return per_channel_subbyte_cpu(self,scales,zero_points,axis,dtype,false);
         case DType::QInt8:
             return dequantize_per_channel_cpu_impl<int8_t>(
@@ -2706,6 +3658,11 @@ Tensor quantized_conv3d_cpu(
 TENSORPLAY_LIBRARY_IMPL(CPU, QuantKernels) {
     m.impl("quantize_per_tensor", quantize_per_tensor_cpu);
     m.impl("quantize_per_channel", quantize_per_channel_cpu);
+    m.impl("quantize_affine", quantize_affine_cpu);
+    m.impl("dequantize_affine", dequantize_affine_cpu);
+    m.impl("quantize_affine_float8", quantize_affine_float8_cpu);
+    m.impl("dequantize_affine_float8", dequantize_affine_float8_cpu);
+    m.impl("choose_scale_float8", choose_scale_float8_cpu);
     m.impl("quantized_linear", quantized_linear_cpu);
     m.impl("quantized_linear_dynamic", quantized_linear_dynamic_cpu);
     m.impl("quantized_add", quantized_add_cpu);
