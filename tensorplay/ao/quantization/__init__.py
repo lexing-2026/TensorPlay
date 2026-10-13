@@ -140,6 +140,12 @@ from .bitnet import (
     precompute_bitnet_scale_for_fsdp as precompute_bitnet_scale_for_fsdp,
     quantize_ as quantize_,
 )
+from .int8_mixed_precision import (
+    Int8MixedPrecisionTrainingConfig as Int8MixedPrecisionTrainingConfig,
+    Int8MixedPrecisionTrainingLinear as Int8MixedPrecisionTrainingLinear,
+    Int8MixedPrecisionTrainingLinearWeight as Int8MixedPrecisionTrainingLinearWeight,
+    int8_mixed_precision_training as int8_mixed_precision_training,
+)
 __all__ += [
     "BitNetLinear",
     "BitNetPacked2bitLinearWeight",
@@ -150,4 +156,8 @@ __all__ += [
     "bitnet_training",
     "precompute_bitnet_scale_for_fsdp",
     "quantize_",
+    "Int8MixedPrecisionTrainingConfig",
+    "Int8MixedPrecisionTrainingLinear",
+    "Int8MixedPrecisionTrainingLinearWeight",
+    "int8_mixed_precision_training",
 ]

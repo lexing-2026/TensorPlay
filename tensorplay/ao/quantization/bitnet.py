@@ -20,6 +20,10 @@ from typing import Optional, Tuple
 import tensorplay as tp
 from tensorplay import Tensor, nn, _C
 from tensorplay.ao.nn.quantized.packed import PackedWeight
+from tensorplay.ao.quantization.quantize_api import (
+    quantize_,
+    register_quantize_module_handler,
+)
 from tensorplay.autograd import Function
 from tensorplay.overrides import redispatch_function
 
@@ -550,41 +554,12 @@ class BitNetTrainingConfig:
 bitnet_training = BitNetTrainingConfig
 
 
-def _is_linear(module, name) -> bool:
-    return isinstance(module, nn.Linear)
-
-
-def quantize_(
-    model: nn.Module,
-    config: BitNetTrainingConfig,
-    filter_fn=None,
-    device=None,
-) -> nn.Module:
-    """Convert Linear weights in ``model`` to BitNet b1.58 in-place.
-
-    Each matching ``nn.Linear`` keeps its module structure and bias, while
-    ``weight`` is replaced by a :class:`BitNetTrainingLinearWeight` parameter
-    whose ``linear`` forward runs the straight-through-estimator BitNet matmul.
-
-    Args:
-        model: the module tree to convert.
-        config: a :class:`BitNetTrainingConfig` (``bitnet_training()``).
-        filter_fn: optional ``(module, fqn) -> bool`` predicate; defaults to
-            matching ``nn.Linear`` modules.
-        device: optional device to move the model to before conversion.
-    """
-    if not isinstance(config, BitNetTrainingConfig):
-        raise TypeError(
-            "quantize_ expects a BitNetTrainingConfig, e.g. "
-            "quantize_(model, bitnet_training())"
-        )
-    filter_fn = _is_linear if filter_fn is None else filter_fn
-    if device is not None:
-        model = model.to(device)
-    for name, module in list(model.named_modules()):
-        if filter_fn(module, name) and isinstance(module, nn.Linear):
-            module.weight = BitNetTrainingLinearWeight(module.weight.detach())
-    return model
+@register_quantize_module_handler(BitNetTrainingConfig)
+def _bitnet_training_transform(module, config):
+    """Replace an ``nn.Linear`` weight with a BitNet training parameter."""
+    del config  # BitNetTrainingConfig is a marker without fields.
+    module.weight = BitNetTrainingLinearWeight(module.weight.detach())
+    return module
 
 
 def precompute_bitnet_scale_for_fsdp(module: nn.Module) -> None:
