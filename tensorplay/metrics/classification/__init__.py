@@ -4,6 +4,23 @@ from tensorplay.metrics.classification.accuracy import (
     MulticlassAccuracy,
     MultilabelAccuracy,
 )
+from tensorplay.metrics.classification.auroc import (
+    AUROC,
+    BinaryAUROC,
+    MulticlassAUROC,
+    MultilabelAUROC,
+)
+from tensorplay.metrics.classification.average_precision import (
+    AveragePrecision,
+    BinaryAveragePrecision,
+    MulticlassAveragePrecision,
+    MultilabelAveragePrecision,
+)
+from tensorplay.metrics.classification.cohen_kappa import (
+    BinaryCohenKappa,
+    CohenKappa,
+    MulticlassCohenKappa,
+)
 from tensorplay.metrics.classification.confusion_matrix import (
     BinaryConfusionMatrix,
     ConfusionMatrix,
@@ -20,6 +37,18 @@ from tensorplay.metrics.classification.f_beta import (
     MultilabelF1Score,
     MultilabelFBetaScore,
 )
+from tensorplay.metrics.classification.hamming import (
+    BinaryHammingDistance,
+    HammingDistance,
+    MulticlassHammingDistance,
+    MultilabelHammingDistance,
+)
+from tensorplay.metrics.classification.matthews_corrcoef import (
+    BinaryMatthewsCorrCoef,
+    MatthewsCorrCoef,
+    MulticlassMatthewsCorrCoef,
+    MultilabelMatthewsCorrCoef,
+)
 from tensorplay.metrics.classification.precision_recall import (
     BinaryPrecision,
     BinaryRecall,
@@ -30,6 +59,18 @@ from tensorplay.metrics.classification.precision_recall import (
     Precision,
     Recall,
 )
+from tensorplay.metrics.classification.precision_recall_curve import (
+    BinaryPrecisionRecallCurve,
+    MulticlassPrecisionRecallCurve,
+    MultilabelPrecisionRecallCurve,
+    PrecisionRecallCurve,
+)
+from tensorplay.metrics.classification.roc import (
+    BinaryROC,
+    MulticlassROC,
+    MultilabelROC,
+    ROC,
+)
 from tensorplay.metrics.classification.stat_scores import (
     BinaryStatScores,
     MulticlassStatScores,
@@ -39,31 +80,58 @@ from tensorplay.metrics.classification.stat_scores import (
 
 __all__ = [
     "Accuracy",
+    "AUROC",
+    "AveragePrecision",
     "BinaryAccuracy",
-    "MulticlassAccuracy",
-    "MultilabelAccuracy",
+    "BinaryAUROC",
+    "BinaryAveragePrecision",
+    "BinaryCohenKappa",
     "BinaryConfusionMatrix",
-    "ConfusionMatrix",
-    "MulticlassConfusionMatrix",
-    "MultilabelConfusionMatrix",
     "BinaryF1Score",
     "BinaryFBetaScore",
+    "BinaryHammingDistance",
+    "BinaryMatthewsCorrCoef",
+    "BinaryPrecision",
+    "BinaryPrecisionRecallCurve",
+    "BinaryRecall",
+    "BinaryROC",
+    "BinaryStatScores",
+    "CohenKappa",
+    "ConfusionMatrix",
     "F1Score",
     "FBetaScore",
+    "HammingDistance",
+    "MatthewsCorrCoef",
+    "MulticlassAccuracy",
+    "MulticlassAUROC",
+    "MulticlassAveragePrecision",
+    "MulticlassCohenKappa",
+    "MulticlassConfusionMatrix",
     "MulticlassF1Score",
     "MulticlassFBetaScore",
+    "MulticlassHammingDistance",
+    "MulticlassMatthewsCorrCoef",
+    "MulticlassPrecision",
+    "MulticlassPrecisionRecallCurve",
+    "MulticlassRecall",
+    "MulticlassROC",
+    "MulticlassStatScores",
+    "MultilabelAccuracy",
+    "MultilabelAUROC",
+    "MultilabelAveragePrecision",
+    "MultilabelConfusionMatrix",
     "MultilabelF1Score",
     "MultilabelFBetaScore",
-    "BinaryPrecision",
-    "BinaryRecall",
-    "MulticlassPrecision",
-    "MulticlassRecall",
+    "MultilabelHammingDistance",
+    "MultilabelMatthewsCorrCoef",
     "MultilabelPrecision",
+    "MultilabelPrecisionRecallCurve",
     "MultilabelRecall",
-    "Precision",
-    "Recall",
-    "BinaryStatScores",
-    "MulticlassStatScores",
+    "MultilabelROC",
     "MultilabelStatScores",
+    "Precision",
+    "PrecisionRecallCurve",
+    "Recall",
+    "ROC",
     "StatScores",
 ]

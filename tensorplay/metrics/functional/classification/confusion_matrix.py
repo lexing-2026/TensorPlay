@@ -51,6 +51,7 @@ def _confusion_matrix_reduce(
 def _binary_confusion_matrix_arg_validation(
     threshold: float = 0.5,
     ignore_index: Optional[int] = None,
+    normalize: Optional[str] = None,
 ) -> None:
     if not (isinstance(threshold, float) and (0 <= threshold <= 1)):
         raise ValueError(f"Expected argument `threshold` to be a float in the [0,1] range, but got {threshold}.")
@@ -167,6 +168,7 @@ def binary_confusion_matrix(
 def _multiclass_confusion_matrix_arg_validation(
     num_classes: Optional[int],
     ignore_index: Optional[int] = None,
+    normalize: Optional[str] = None,
 ) -> None:
     if num_classes is not None and (not isinstance(num_classes, int) or num_classes < 2):
         raise ValueError(f"Expected argument `num_classes` to be an integer larger than 1, but got {num_classes}")
@@ -294,6 +296,7 @@ def _multilabel_confusion_matrix_arg_validation(
     num_labels: int,
     threshold: float = 0.5,
     ignore_index: Optional[int] = None,
+    normalize: Optional[str] = None,
 ) -> None:
     if not isinstance(num_labels, int) or num_labels < 2:
         raise ValueError(f"Expected argument `num_labels` to be an integer larger than 1, but got {num_labels}")
