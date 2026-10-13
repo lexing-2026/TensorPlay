@@ -136,13 +136,15 @@ def test_trotter_order_improves_a_non_commuting_split():
     hamiltonian = tq.Hamiltonian([(1.0, "XI"), (1.0, "ZI")])
     time = 0.4
     exact = _flat(tq.matrix_exp_evolve(state, hamiltonian, time))
-    errors = []
-    for order in (1, 2, 8, 32):
+    errors = {}
+    for order in (1, 2, 4):
         stepped = _flat(tq.trotter_evolve(state, hamiltonian, time, order=order))
-        errors.append(float((stepped - exact).abs().max()))
-    # The error of a product rule falls like the inverse square of the order.
-    assert errors[-1] < errors[0] / 20.0
-    assert errors[-1] < 0.01
+        errors[order] = float((stepped - exact).abs().max())
+    # Each order buys a power of the step: the first falls like the step, the
+    # second like its square and the fourth like its fourth power.
+    assert errors[2] < errors[1] / 5.0
+    assert errors[4] < errors[2] / 5.0
+    assert errors[4] < 0.01
 
 
 def test_trotter_keeps_the_norm():
@@ -158,7 +160,7 @@ def test_trotter_preserves_the_energy_of_a_fixed_hamiltonian():
     # phase every Pauli rotation adds.
     state = tq.state_from_bases([5, 7], 3)  # ZXZ swaps |101> and |111>
     hamiltonian = tq.Hamiltonian([(0.6, "ZXZ"), (0.3, "III")])
-    evolved = tq.trotter_evolve(state, hamiltonian, 0.25, order=8)
+    evolved = tq.trotter_evolve(state, hamiltonian, 0.25, order=4)
     before = tq.energy(state, hamiltonian)
     after = tq.energy(evolved, hamiltonian)
     tp.testing.assert_close(before, tp.tensor([0.9]), atol=1e-5, rtol=1e-5)

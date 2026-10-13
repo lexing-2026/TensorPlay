@@ -125,25 +125,59 @@ def energy(state: tp.Tensor, hamiltonian: Hamiltonian) -> tp.Tensor:
     return total
 
 
+def _trotter_stages(order: int) -> List[Tuple[float, int]]:
+    """The products that make up a Trotter product, as weights and repeats.
+
+    Each entry is a weight on the time and how many times each term is applied
+    -- once for a product run forwards only, twice for one run backwards after
+    being run forwards.  The weight is on the angle, so a term applied twice
+    carries half its time in each pass.
+
+    Running a split forwards only is first-order however many times it is
+    repeated, because the product it forms is not symmetric -- so a second-order
+    scheme has to be built by undoing the first one, and a fourth-order one by
+    composing that with uneven weights, which cancel the leading error rather
+    than merely making the steps smaller.
+    """
+    if order == 1:
+        return [(1.0, 1)]
+    if order == 2:
+        # Forwards then backwards: the palindromic product, and the second-order
+        # scheme every other one is built from.
+        return [(0.5, 2)]
+    if order == 4:
+        # That same symmetric product three times, the middle one with a weight
+        # that is negative and larger than the others.  The weights are the
+        # usual ones halved, because a term applied twice carries half its time
+        # in each pass; they are chosen so the leading error terms of the three
+        # cancel, which is what lifts the scheme from second order to fourth.
+        first = 0.5 / (2.0 - 2.0 ** (1.0 / 3.0))
+        middle = 0.5 - 2.0 * first
+        return [(first, 2), (middle, 2), (first, 2)]
+    raise ValueError(f"a Trotter order of 1, 2 or 4 is available, got {order}")
+
+
 def trotter_evolve(state: tp.Tensor, hamiltonian: Hamiltonian, time: float, order: int = 1) -> tp.Tensor:
     """Advance the state by ``exp(-i * time * H)`` with a Trotter product.
 
     Each term's evolution is exact -- a Pauli word squares to the identity, so
     ``exp(-i tau P)`` is the rotation ``cos(tau) I - i sin(tau) P``.  The
-    approximation is only in dropping non-commuting terms of the product, which
-    a larger ``order`` shrinks at a proportional cost.
+    approximation is only in dropping the pieces of the terms that do not
+    commute, and the order says how carefully that is done: a first-order
+    product has an error that falls with the step, a second-order one has an
+    error that falls with the square of it, and a fourth-order one with the
+    fourth power, at a cost that grows the same way.
 
     Args:
         state: amplitudes shaped ``[batch, 2, 2, ...]``.
         hamiltonian: the generator.
         time: the evolution time.
-        order: how many times the exponential factors are split.
+        order: ``1``, ``2`` or ``4``; see :func:`_trotter_stages`.
 
     Returns:
         The evolved state.
     """
-    if order < 1:
-        raise ValueError(f"a Trotter order is at least 1, got {order}")
+    stages = _trotter_stages(order)
     n_qubits = n_qubits_of(state)
     for coeff, word in hamiltonian.terms:
         if len(word) > n_qubits:
@@ -152,11 +186,17 @@ def trotter_evolve(state: tp.Tensor, hamiltonian: Hamiltonian, time: float, orde
     from ._gates import apply_gate
 
     evolved = state
-    for _ in range(order):
-        for coeff, word in hamiltonian.terms:
+    for weight, repeats in stages:
+        terms = list(hamiltonian.terms)
+        if repeats > 1:
+            # The same split run backwards after running forwards, which is what
+            # makes the product symmetric; the time each term is given is split
+            # with it, so the span is still the one asked for.
+            terms = terms + terms[::-1]
+        for coeff, word in terms:
             wires = pauli_wires(word)
             padded = word.ljust(n_qubits, "I")
-            angle = 2.0 * time * coeff / order
+            angle = 2.0 * time * coeff * weight
             rotation = pauli_rotation_matrix(padded, angle, c_dtype=state.dtype)
             # An identity word owns no wires; routing its 1x1 rotation through
             # wire 0 keeps the global phase it carries.
