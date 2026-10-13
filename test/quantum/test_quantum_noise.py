@@ -1,5 +1,6 @@
 """Channels on density matrices: semantics, invariants, and composition."""
 
+import numpy as np
 import pytest
 
 import tensorplay as tp
@@ -300,3 +301,105 @@ def test_a_named_error_set_is_read_for_what_it_is():
         tq.pauli_kraus({"XX": "loud"})            # not a chance
     with pytest.raises(ValueError):
         tq.pauli_kraus([("XX", 0.1), ("YY",)])   # a pair without a chance
+
+
+# ---------------------------------------------------------------------------
+# The same channels over more than one wire
+# ---------------------------------------------------------------------------
+
+
+def test_two_qubit_kraus_sets_have_the_stated_width():
+    assert tuple(tq.bit_flip_kraus(0.1, 2).shape) == (2, 4, 4)
+    assert tuple(tq.phase_flip_kraus(0.1, 2).shape) == (2, 4, 4)
+    assert tuple(tq.amplitude_damping_kraus(0.2, 2).shape) == (4, 4, 4)
+    assert tuple(tq.depolarizing_kraus(0.3, 2).shape) == (16, 4, 4)
+    assert tuple(tq.depolarizing_kraus(0.3, 3).shape) == (64, 8, 8)
+    assert tuple(tq.depolarizing_kraus(0.3, 4).shape) == (256, 16, 16)
+
+
+def test_two_qubit_kraus_sets_are_complete():
+    # sum_r K_r^dagger K_r == I on four wires, for every trace-preserving channel
+    identity = tp.eye(4, dtype=tp.complex128)
+    for kraus in (
+        tq.bit_flip_kraus(0.3, 2, c_dtype=tp.complex128),
+        tq.phase_flip_kraus(0.7, 2, c_dtype=tp.complex128),
+        tq.amplitude_damping_kraus(0.25, 2, c_dtype=tp.complex128),
+        tq.depolarizing_kraus(0.45, 2, c_dtype=tp.complex128),
+    ):
+        total = None
+        for operator in kraus:
+            piece = tq.dagger(operator) @ operator
+            total = piece if total is None else total + piece
+        tp.testing.assert_close(total, identity, atol=1e-9, rtol=1e-9)
+
+
+def test_depolarizing_on_two_qubits_spreads_evenly():
+    # With chance p the channel applies a uniformly drawn non-identity Pauli
+    # word.  The sum of every word's conjugation (identity included) takes a
+    # trace-one two-qubit matrix to 4 I, so the non-identity share is 4 I - rho
+    # and the map comes out closed form.
+    p = 0.4
+    stack = tq.depolarizing_kraus(p, 2, c_dtype=tp.complex128)
+    # a diagonal two-qubit density, which is what a product of populations reads
+    rho = tp.tensor(
+        [[[0.42, 0.0, 0.0, 0.0],
+          [0.0, 0.28, 0.0, 0.0],
+          [0.0, 0.0, 0.18, 0.0],
+          [0.0, 0.0, 0.0, 0.12]]],
+        dtype=tp.complex128,
+    )
+    applied = tq.apply_channel(rho, stack, [0, 1])
+    rho_np = np.array(rho[0].tolist(), dtype=complex)
+    want = (1 - p) * rho_np + (p / 15) * (4 * np.eye(4) - rho_np)
+    tp.testing.assert_close(applied, tp.tensor(want.reshape(1, 4, 4), dtype=tp.complex128),
+                            atol=1e-12, rtol=1e-12)
+
+
+def test_correlated_bit_flip_flips_both_wires_together():
+    # One error on the whole register: either both wires flip or neither does,
+    # so the channel is (1-p) rho + p (X X) rho (X X) and no single-wire flip
+    # ever appears in the sum.
+    p = 0.25
+    stack = tq.bit_flip_kraus(p, 2, c_dtype=tp.complex128)
+    rho = tp.tensor(
+        [[[0.5, 0.0, 0.0, 0.0],
+          [0.0, 0.0, 0.0, 0.0],
+          [0.0, 0.0, 0.0, 0.0],
+          [0.0, 0.0, 0.0, 0.5]]],
+        dtype=tp.complex128,
+    )
+    applied = tq.apply_channel(rho, stack, [0, 1])
+    xx = np.kron(np.array([[0.0, 1.0], [1.0, 0.0]]), np.array([[0.0, 1.0], [1.0, 0.0]]))
+    rho_np = np.array(rho[0].tolist(), dtype=complex)
+    want = (1 - p) * rho_np + p * (xx @ rho_np @ xx)
+    tp.testing.assert_close(applied, tp.tensor(want.reshape(1, 4, 4), dtype=tp.complex128),
+                            atol=1e-12, rtol=1e-12)
+
+
+def test_independent_amplitude_damping_equals_sequential_wires():
+    # The two-qubit damping channel is the tensor product of one single-qubit
+    # damping per wire, and channels on different wires commute, so applying it
+    # as one 4-operator stack has to agree with damping wire by wire.
+    gamma = 0.3
+    stack = tq.amplitude_damping_kraus(gamma, 2, c_dtype=tp.complex128)
+    rho = tp.tensor(
+        [[[0.7, 0.0, 0.0, 0.0],
+          [0.0, 0.0, 0.0, 0.0],
+          [0.0, 0.0, 0.0, 0.0],
+          [0.0, 0.0, 0.0, 0.3]]],
+        dtype=tp.complex128,
+    )
+    applied = tq.apply_channel(rho, stack, [0, 1])
+    sequential = tq.apply_amplitude_damping(tq.apply_amplitude_damping(rho, gamma, 0), gamma, 1)
+    tp.testing.assert_close(applied, sequential, atol=1e-12, rtol=1e-12)
+
+
+def test_multi_qubit_channels_reject_a_bad_width():
+    with pytest.raises(ValueError):
+        tq.bit_flip_kraus(0.3, 0)
+    with pytest.raises(ValueError):
+        tq.phase_flip_kraus(0.3, -1)
+    with pytest.raises(ValueError):
+        tq.depolarizing_kraus(0.3, 5)
+    with pytest.raises(ValueError):
+        tq.amplitude_damping_kraus(0.3, 2.5)

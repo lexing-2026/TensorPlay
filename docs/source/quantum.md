@@ -315,17 +315,23 @@ rho = tq.apply_depolarizing(rho, 0.01, wire=0)
 
 `bit_flip_kraus`, `phase_flip_kraus`, `amplitude_damping_kraus` and
 `depolarizing_kraus` return the operator sets, and `apply_channel` takes any set
-you build yourself, on any list of wires. A single-qubit set acts on one wire;
-a set that covers several wires is the register-wide product of the individual
-operators:
+you build yourself, on any list of wires. Every builder takes `n_qubits=`: one
+wire by default, and more wires as the kind of error the name says. `bit_flip`
+and `phase_flip` are then *correlated* — every named wire flips together or none
+does — `depolarizing` draws a uniform non-identity Pauli word over the whole
+register, and `amplitude_damping` damps every wire independently:
 
 ```python
-kraus = tq.bit_flip_kraus(0.1)
-rho = tq.apply_channel(rho, kraus, [0])
-
-both = tp.stack([tp.kron(operator, tp.eye(2, dtype=operator.dtype)) for operator in kraus])
+kraus = tq.bit_flip_kraus(0.1)              # one wire: X with chance 0.1
+both = tq.bit_flip_kraus(0.1, 2)            # two wires: X X together, or nothing
+spread = tq.depolarizing_kraus(0.1, 2)       # 15 errors, each with chance 0.1/15
+relax = tq.amplitude_damping_kraus(0.05, 2)  # 4 operators, one per way to decay
 rho = tq.apply_channel(rho, both, [0, 1])
 ```
+
+A chance can be a differentiable tensor, so a noise rate is a learned parameter:
+`pauli_kraus({"XX": p, "ZI": 0.05})` keeps the gradient on `p` the way the
+single-wire builders always have.
 
 Because every Kraus operator is local, the cost stays linear in the register
 size: no channel superoperator is ever built.
