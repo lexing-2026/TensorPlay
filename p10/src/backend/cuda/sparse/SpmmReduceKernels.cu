@@ -354,6 +354,12 @@ std::tuple<Tensor, Tensor> _sparse_mm_reduce_impl_backward_sparse_csr_cuda(
     else {
         TP_THROW(RuntimeError, "sparse_mm_reduce_backward: unsupported reduce");
     }
+    // The mask names the backward's own two inputs (self, other).  A longer
+    // mask is the full forward-input mask of a multi-input op (e.g. sparse
+    // addmm), whose matmul operands sit at positions 1 and 2.
+    const std::array<bool, 2> mask = {
+        output_mask.size() > 2 ? output_mask[1] : output_mask[0],
+        output_mask.size() > 2 ? output_mask[2] : output_mask[1]};
 
     Tensor crow = self._crow_indices().contiguous();
     Tensor col = self._col_indices().contiguous();
@@ -369,7 +375,7 @@ std::tuple<Tensor, Tensor> _sparse_mm_reduce_impl_backward_sparse_csr_cuda(
     constexpr int threads = 128;
 
     Tensor grad_self;
-    if (output_mask[0]) {
+    if (mask[0]) {
         grad_self = Tensor::make_sparse_csr_tensor(
             self._crow_indices().clone(), self._col_indices().clone(),
             Tensor::zeros_like(self._values()),
@@ -414,7 +420,7 @@ std::tuple<Tensor, Tensor> _sparse_mm_reduce_impl_backward_sparse_csr_cuda(
     }
 
     Tensor grad_other;
-    if (output_mask[1]) {
+    if (mask[1]) {
         grad_other = Tensor::zeros({other.size(0), other.size(1)},
                                    other.dtype(), other.device());
         if (op == 2 || op == 3) {

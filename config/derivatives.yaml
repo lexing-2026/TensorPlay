@@ -2463,6 +2463,36 @@
   self: "grad.defined() ? std::get<0>(_sparse_mm_reduce_impl_backward(self, grad, other, reduce, ret1, grad_input_mask)) : Tensor()"
   other: "grad.defined() ? std::get<1>(_sparse_mm_reduce_impl_backward(self, grad, other, reduce, ret1, grad_input_mask)) : Tensor()"
 
+# The sparse addmm forward is ``beta * self + alpha * (mat1 @ mat2)``; the
+# sparse-side and dense-side gradients of the matmul term match the reduce
+# (sum) matmul backward, while the seed receives ``beta * grad``.  The reduce
+# backward evaluates on CSR, so a COO ``mat1`` is converted for the backward
+# and its sparse gradient is converted back to the original layout.
+- name: _sparse_addmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta, Scalar alpha) -> Tensor
+  self: maybe_multiply(grad, beta)
+  mat1: 'mat1.is_sparse_csr() ? std::get<0>(_sparse_mm_reduce_impl_backward(mat1, maybe_multiply(grad, alpha), mat2, "sum", Tensor(), grad_input_mask)) : std::get<0>(_sparse_mm_reduce_impl_backward(mat1.to_sparse_csr(), maybe_multiply(grad, alpha), mat2, "sum", Tensor(), grad_input_mask)).to_sparse()'
+  mat2: 'maybe_multiply(std::get<1>(_sparse_mm_reduce_impl_backward(mat1.is_sparse_csr() ? mat1 : mat1.to_sparse_csr(), grad, mat2, "sum", Tensor(), grad_input_mask)), alpha)'
+
+# sampled_addmm evaluates the dense product only on the stored coordinates;
+# the dense mat2 gradient therefore uses the densified output gradient and the
+# sparse pattern only shapes the seed (``self``) and mat1 row masks.
+- name: sparse_sampled_addmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta, Scalar alpha) -> Tensor
+  self: maybe_multiply(grad, beta)
+  mat1: maybe_multiply(grad.to_dense().mm(mat2.t()), alpha)
+  mat2: maybe_multiply(mat1.t().mm(grad.to_dense()), alpha)
+
+# Layout conversions are linear: a dense source receives the densified
+# gradient, a CSR source's gradient is converted back to CSR and a COO
+# source's gradient already has the target layout.
+- name: to_sparse_csr(Tensor self) -> Tensor
+  self: 'self.is_sparse() ? grad.to_sparse() : grad.to_dense()'
+
+- name: to_sparse(Tensor self) -> Tensor
+  self: 'self.is_sparse() ? (self.is_sparse_csr() ? grad.to_sparse_csr() : grad) : grad.to_dense()'
+
+- name: to_sparse.sparse_dim(Tensor self, int sparse_dim) -> Tensor
+  self: 'self.is_sparse() ? (self.is_sparse_csr() ? grad.to_sparse_csr() : grad) : grad.to_dense()'
+
 - name: _spdiags(Tensor diagonals, Tensor offsets, int[] shape, int? layout=None) -> Tensor
   output_differentiability: [False]
 

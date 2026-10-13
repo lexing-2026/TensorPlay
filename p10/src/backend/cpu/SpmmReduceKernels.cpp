@@ -144,7 +144,12 @@ std::tuple<Tensor, Tensor> _sparse_mm_reduce_impl_backward_sparse_csr_cpu(
     const std::vector<bool>& output_mask) {
     check_spmm_reduce_backward_inputs(self, grad_out, other);
     const int op = get_reduction_enum(reduce);
-    const std::array<bool, 2> mask = {output_mask[0], output_mask[1]};
+    // The mask names the backward's own two inputs (self, other).  A longer
+    // mask is the full forward-input mask of a multi-input op (e.g. sparse
+    // addmm), whose matmul operands sit at positions 1 and 2.
+    const std::array<bool, 2> mask = {
+        output_mask.size() > 2 ? output_mask[1] : output_mask[0],
+        output_mask.size() > 2 ? output_mask[2] : output_mask[1]};
 
 Tensor crow = self._crow_indices().contiguous();
     Tensor col = self._col_indices().contiguous();
