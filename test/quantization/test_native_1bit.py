@@ -267,3 +267,50 @@ def test_bitnet_linear_module():
     x = tp.tensor(rng.normal(size=(2, 3, 8)).astype('float32'))
     y = module(x)
     assert tuple(y.shape) == (2, 3, 6)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_bitnet_linear_ste_gradients(device):
+    """Straight-through estimator: gradients match the BitNet training recipe."""
+    from tensorplay.ao.quantization.bitnet import (
+        bitnet_linear, quantize_bitnet_weight, quantize_int8_rowwise)
+    rng = np.random.default_rng(714)
+    x = tp.tensor(rng.normal(size=(5, 6)).astype('float32'), device=device, requires_grad=True)
+    weight = tp.tensor(rng.normal(size=(4, 6)).astype('float32'), device=device, requires_grad=True)
+    bias = tp.tensor(rng.normal(size=(4,)).astype('float32'), device=device, requires_grad=True)
+    y = bitnet_linear(x, weight, bias)
+    (y * y).sum().backward()
+    grad_out = (2.0 * y.detach()).reshape(-1, 4)
+    x_i8, row_scale = quantize_int8_rowwise(x.detach().reshape(-1, 6))
+    codes, scale = quantize_bitnet_weight(weight.detach())
+    expected_grad_w = grad_out.T @ (x_i8 * row_scale)
+    expected_grad_x = (grad_out @ codes.float()) * scale
+    expected_grad_b = grad_out.sum(0)
+    np.testing.assert_allclose(weight.grad.cpu().numpy(), expected_grad_w.cpu().numpy(),
+                               rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(x.grad.cpu().numpy(), expected_grad_x.cpu().numpy(),
+                               rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(bias.grad.cpu().numpy(), expected_grad_b.cpu().numpy(),
+                               rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_bitnet_linear_module_trains(device):
+    """BitNetLinear learns a linear map with Adam under the STE."""
+    from tensorplay.ao.quantization.bitnet import BitNetLinear
+    rng = np.random.default_rng(715)
+    module = BitNetLinear(16, 8).to(device)
+    optimizer = tp.optim.Adam(module.parameters(), lr=0.05)
+    x = tp.tensor(rng.normal(size=(128, 16)).astype('float32'), device=device)
+    true_w = rng.normal(size=(16, 8)).astype('float32')
+    target = tp.tensor((x.detach().cpu().numpy() @ true_w).astype('float32'), device=device)
+    first = None
+    for _ in range(60):
+        optimizer.zero_grad()
+        loss = ((module(x) - target) ** 2).mean()
+        loss.backward()
+        optimizer.step()
+        if first is None:
+            first = float(loss.detach())
+    last = float(loss.detach())
+    assert last < first * 0.6

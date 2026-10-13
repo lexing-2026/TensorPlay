@@ -53,8 +53,8 @@ def run(device, repetitions):
             torch.cuda.synchronize()
 
     def record(name, shape, native, reference, tolerance=1e-4):
-        a = native()
-        b = reference()
+        a = native().detach()
+        b = reference().detach()
         synchronize()
         if tuple(a.shape) != tuple(b.shape):
             raise AssertionError(f'{name} output shapes differ')
@@ -73,8 +73,8 @@ def run(device, repetitions):
         a = native_fn()
         b = reference_fn()
         synchronize()
-        an = native_decode(a).float().cpu().numpy()
-        bn = reference_decode(b).float().cpu().numpy()
+        an = native_decode(a).detach().float().cpu().numpy()
+        bn = reference_decode(b).detach().float().cpu().numpy()
         if an.shape != bn.shape:
             raise AssertionError(f'{name} decoded shapes differ')
         error = float(np.max(np.abs(an - bn), initial=0))
@@ -119,6 +119,7 @@ def run(device, repetitions):
     try:
         from torchao.prototype.quantized_training.bitnet import (
             _BitNetPacked2bitLinear, BitNetPacked2bitLinearWeight,
+            _BitNetTrainingLinear, BitNetTrainingLinearWeight,
             _pack_i2_in_i8, _unpack_i2_in_i8, get_bitnet_scale, quantize_bitnet_weight,
         )
     except Exception as exc:  # pragma: no cover - depends on vendored torchao
@@ -126,7 +127,8 @@ def run(device, repetitions):
         return records
 
     from tensorplay.ao.quantization.bitnet import (
-        bitnet_linear_packed, pack_ternary, quantize_bitnet_weight as tp_quantize_weight,
+        bitnet_linear, bitnet_linear_packed, pack_ternary,
+        quantize_bitnet_weight as tp_quantize_weight,
     )
     from tensorplay.ao.nn.quantized.packed import PackedWeight
     for m, n, k in ((2, 512, 1024), (32, 256, 512), (256, 512, 1024)):
@@ -169,6 +171,27 @@ def run(device, repetitions):
             input_i8, row_scale = _ref_rowwise_int8(r)
             return torch.mm(input_i8.float(), _unpack_i2_in_i8(rpacked).float().T) * row_scale * rscale
         record('bitnet_linear_cached', (m, n, k), native_infer, reference_full_cached, tolerance=1e-3)
+
+        # Training: forward + backward with straight-through estimator (CUDA only;
+        # the upstream reference requires the Triton int8 path).
+        if device == 'cuda':
+            tx = tp.tensor(x_values, device=device, requires_grad=True)
+            tw = tp.tensor(w_values, device=device, requires_grad=True)
+            rr = torch.tensor(x_values, device=device, requires_grad=True)
+            rw_data = torch.tensor(w_values, device=device, requires_grad=True)
+            rw = BitNetTrainingLinearWeight(rw_data)
+
+            def native_train():
+                y = bitnet_linear(tx, tw)
+                y.sum().backward()
+                return y
+
+            def reference_train():
+                y = _BitNetTrainingLinear.apply(rr, rw, None)
+                y.sum().backward()
+                return y
+
+            record('bitnet_train', (m, n, k), native_train, reference_train, tolerance=1e-3)
     return records
 
 

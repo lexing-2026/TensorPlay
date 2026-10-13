@@ -6,6 +6,12 @@ the same bit layout as the reference BitNet packer, so the packed buffers are
 interchangeable. Activations are quantized row-wise to signed 8-bit codes. The
 matmul runs through the native signed integer linear path (int8 tensor cores on
 accelerators) and is rescaled by the row and tensor scales.
+
+Training uses a straight-through estimator: the forward executes the quantized
+recipe exactly, while the backward passes gradients to the float weight and
+activation as if the round/clamp steps were the identity (scaled so the
+gradient magnitudes match the integer matmul, following the reference BitNet
+training recipe). This makes ``BitNetLinear`` trainable with any optimizer.
 """
 
 import math
@@ -14,6 +20,7 @@ from typing import Optional, Tuple
 import tensorplay as tp
 from tensorplay import nn, _C
 from tensorplay.ao.nn.quantized.packed import PackedWeight
+from tensorplay.autograd import Function
 
 __all__ = [
     "get_bitnet_scale",
@@ -104,6 +111,60 @@ def quantize_int8_rowwise(
     return codes, row_scale
 
 
+class _BitNetLinearFunction(Function):
+    """Straight-through estimator for the BitNet b1.58 linear.
+
+    The forward follows :func:`bitnet_linear` exactly: row-wise int8
+    activation codes, ternary weight codes, a native signed integer matmul,
+    and rescaling by the row and tensor scales. The backward treats the
+    quantizers as the identity:
+
+        d loss / d input  = (grad_output @ codes) * tensor_scale
+        d loss / d weight = grad_output.T @ (codes_x * row_scale)
+        d loss / d bias   = grad_output.sum(0)
+
+    The row and tensor scales cancel with the quantizer derivatives so the
+    gradients have the same magnitude as the integer matmul, matching the
+    reference BitNet training recipe.
+    """
+
+    @staticmethod
+    def forward(ctx, input, weight, bias, scale, eps):
+        batch_dims = input.shape[:-1]
+        x = input.reshape(-1, weight.shape[1])
+        x_i8, row_scale = quantize_int8_rowwise(x, eps)
+        codes, tensor_scale = quantize_bitnet_weight(weight, scale, eps)
+        ctx.save_for_backward(x_i8, row_scale, codes, tensor_scale)
+        if x.device.type == 'cuda':
+            # Native int8 tensor-core path: no re-packing needed per step.
+            out = tp.ops.tp._int_mm(x_i8, codes.t().contiguous())
+        else:
+            # Native SIMD quantized linear path for CPU.
+            x_q = _C._make_per_tensor_quantized_tensor(x_i8, 1.0, 0)
+            w_q = _C._make_per_tensor_quantized_tensor(codes.contiguous(), 1.0, 0)
+            packed_weight = PackedWeight(w_q, None)
+            out = packed_weight.run(x_q, 1.0, 0, output_float=True)
+        out = out * row_scale * tensor_scale
+        if bias is not None:
+            out = out + bias
+        return out.reshape(*batch_dims, weight.shape[0])
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x_i8, row_scale, codes, tensor_scale = ctx.saved_tensors
+        batch_dims = grad_output.shape[:-1]
+        grad_output = grad_output.reshape(-1, codes.shape[0])
+        grad_input = grad_weight = grad_bias = None
+        if ctx.needs_input_grad[0]:
+            grad_input = (grad_output @ codes.to(grad_output.dtype)) * tensor_scale
+            grad_input = grad_input.reshape(*batch_dims, codes.shape[1])
+        if ctx.needs_input_grad[1]:
+            grad_weight = grad_output.T @ (x_i8 * row_scale)
+        if ctx.needs_input_grad[2]:
+            grad_bias = grad_output.sum(0)
+        return grad_input, grad_weight, grad_bias, None, None
+
+
 def bitnet_linear(
     input: tp.Tensor,
     weight: tp.Tensor,
@@ -118,12 +179,11 @@ def bitnet_linear(
         y = round_clip(x / row_absmax * 127) @ round_clip(W / mean(|W|))
             * row_scale * weight_scale + bias
 
-    using the native signed integer linear path for the matmul. The returned
+    using the native signed integer linear path for the matmul, and the
+    straight-through estimator provides gradients for training. The returned
     tensor has the float dtype of ``input``.
     """
-    codes, tensor_scale = quantize_bitnet_weight(weight, scale, eps)
-    packed = pack_ternary(codes)
-    return bitnet_linear_packed(input, packed, tensor_scale, weight.shape[1], bias, eps)
+    return _BitNetLinearFunction.apply(input, weight, bias, scale, eps)
 
 
 def bitnet_linear_packed(
