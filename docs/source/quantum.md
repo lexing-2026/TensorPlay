@@ -58,6 +58,15 @@ conjugate overlap between two states. `to_density` and `density_to_state` cross
 between the ket and density views, and `partial_trace` drops qubits from a
 density matrix.
 
+`global_phase` answers the question that comes up whenever two operators are
+computed two different ways: do they differ by a phase and nothing else? It
+reads that one factor off the whole overlap, so no single entry decides it, and
+raises if the two are not the same operator up to a phase.
+
+```python
+phase = tq.global_phase(fused_gate, dense_product)   # 1.0 if they are the same
+```
+
 ## Gates
 
 `apply_gate` is the primitive: a matrix applied to a list of wires. Everything
@@ -398,6 +407,7 @@ and threading a graph through it.
     tensorplay.quantum.zeros_state
     tensorplay.quantum.plus_state
     tensorplay.quantum.basis_state
+    tensorplay.quantum.global_phase
     tensorplay.quantum.state_from_bases
     tensorplay.quantum.product_state
     tensorplay.quantum.flatten

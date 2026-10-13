@@ -11,13 +11,14 @@ from typing import Optional, Sequence
 
 import tensorplay as tp
 
-from ._helpers import DEFAULT_C_DTYPE, state_shape
+from ._helpers import DEFAULT_C_DTYPE, promoted_c_dtype, state_shape
 
 __all__ = [
     "basis_state",
     "density_to_state",
     "fidelity",
     "flatten",
+    "global_phase",
     "inner",
     "norm",
     "normalize",
@@ -118,6 +119,65 @@ def inner(state_a: tp.Tensor, state_b: tp.Tensor) -> tp.Tensor:
 def fidelity(state_a: tp.Tensor, state_b: tp.Tensor) -> tp.Tensor:
     """``|<a|b>|**2`` for each pair of states in the batch."""
     return inner(state_a, state_b).abs().pow(2)
+
+
+def global_phase(
+    first: tp.Tensor, second: tp.Tensor, *, atol: float = 1e-6
+) -> complex:
+    """The single unit factor that turns one state or gate into the other.
+
+    Two operators that agree up to a phase are the same operator as far as any
+    measurement is concerned, which is the usual answer when a fused kernel is
+    checked against a dense product: the two differ in exactly one factor and
+    nothing else.
+
+    The factor is read off the whole overlap rather than off the first entry big
+    enough to divide, so one small entry cannot decide it and rounding noise
+    averages out instead of picking the answer.
+
+    Args:
+        first: the reference, a state or a gate matrix.
+        second: the operator to compare against it; same shape and dtype.  The
+            whole tensor is compared as one operator, so a batch of states is
+            read as a single one -- compare them one at a time.
+        atol: how far the largest entry may sit from the phase times its
+            counterpart, relative to the largest entry in ``first``.
+
+    Returns:
+        The complex factor ``p`` with ``second == p * first``.
+
+    Raises:
+        ValueError: if the shapes differ, if ``first`` is all zeros -- which has
+            no phase -- or if the two are not the same operator up to a phase.
+    """
+    if tuple(first.shape) != tuple(second.shape):
+        raise ValueError(
+            f"comparing {tuple(first.shape)} against {tuple(second.shape)}: "
+            "the two have to have the same shape"
+        )
+    c_dtype = promoted_c_dtype(tp.promote_types(first.dtype, second.dtype))
+    left = first.to(dtype=c_dtype)
+    right = second.to(dtype=c_dtype)
+    if not tp.is_complex(left):
+        left = tp.complex(left, tp.zeros_like(left))
+    if not tp.is_complex(right):
+        right = tp.complex(right, tp.zeros_like(right))
+
+    reference = left.abs().max()
+    if float(reference) == 0.0:
+        raise ValueError("the zero operator carries no phase")
+    overlap = (left.conj() * right).sum()
+    if abs(complex(overlap)) == 0.0:
+        raise ValueError("the two are orthogonal, so no phase turns one into the other")
+    phase = complex(overlap) / (left.conj() * left).sum().real.item()
+
+    residual = float((right - phase * left).abs().max()) / float(reference)
+    if residual > atol:
+        raise ValueError(
+            f"the two differ by more than {atol} in their largest entry, which is "
+            "more than a global phase"
+        )
+    return phase
 
 
 def to_density(state: tp.Tensor) -> tp.Tensor:

@@ -1,5 +1,7 @@
 """State layout, normalization, density matrices, and partial trace."""
 
+import math
+
 import pytest
 
 import tensorplay as tp
@@ -149,3 +151,93 @@ def test_state_keeps_its_norm_under_a_batch():
     states = tq.plus_state(2, batch=3)
     assert states.shape == (3, 2, 2)
     tp.testing.assert_close(tq.norm(states), tp.ones(3), atol=1e-6, rtol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Global phase
+# ---------------------------------------------------------------------------
+
+
+def test_the_phase_between_two_equal_operators_is_one():
+    state = tq.plus_state(3)
+    assert abs(tq.global_phase(state, state) - 1) < 1e-9
+    matrix = tq.pauli_string_matrix("XYZ")
+    assert abs(tq.global_phase(matrix, matrix) - 1) < 1e-9
+
+
+def test_the_phase_reads_the_factor_that_was_applied():
+    for angle in (0.3, math.pi / 2, -2.1, math.pi):
+        state = tq.apply_h(tq.zeros_state(3), 0)
+        turned = tq.apply_global_phase(state, angle)
+        tp.testing.assert_close(
+            tp.tensor(tq.global_phase(state, turned)),
+            tp.tensor(complex(math.cos(angle), math.sin(angle))),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+
+def test_the_phase_sees_a_half_turn_as_minus_one():
+    gate = tq.h_matrix()
+    assert abs(tq.global_phase(gate, -gate) + 1) < 1e-9
+
+
+def test_the_phase_is_read_off_the_whole_operator():
+    # One tiny entry cannot decide it: the reference answer here is four, and
+    # the first entry big enough to divide on is nowhere near the largest.
+    reference = tp.tensor([[1e-6, 0.0], [0.0, 4.0]], dtype=tp.complex64)
+    tp.testing.assert_close(
+        tp.tensor(tq.global_phase(reference, 4 * reference)),
+        tp.tensor(4.0 + 0.0j),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_the_phase_survives_a_real_operator():
+    real = tp.tensor([[1.0, 0.0], [0.0, 2.0]])
+    tp.testing.assert_close(
+        tp.tensor(tq.global_phase(real, -real)), tp.tensor(-1.0 + 0.0j),
+        atol=1e-6, rtol=1e-6,
+    )
+
+
+def test_a_state_that_differs_by_more_than_a_phase_is_rejected():
+    state = tq.apply_h(tq.zeros_state(2), 0)
+    with pytest.raises(ValueError):
+        tq.global_phase(state, tq.zeros_state(2))
+    with pytest.raises(ValueError):
+        tq.global_phase(state, tq.apply_h(state, 0))
+
+
+def test_the_zero_operator_carries_no_phase():
+    zero = tp.zeros(2, 2, dtype=tp.complex64)
+    with pytest.raises(ValueError):
+        tq.global_phase(zero, zero)
+
+
+def test_two_operators_of_different_shapes_are_rejected():
+    state = tq.plus_state(2)
+    with pytest.raises(ValueError):
+        tq.global_phase(state, tq.h_matrix())
+
+
+def test_a_gate_built_two_ways_agrees_up_to_a_phase():
+    # The fused two-wire path and one dense product over the whole register are
+    # two implementations of the same operator.  Comparing them through a phase
+    # says they differ in that one factor and in nothing else, which an element
+    # by element comparison would report as a list of mismatches instead.
+    n_qubits = 3
+    wires = [0, 2]
+    matrix = tq.controlled_matrix(tq.rot_y_matrix(0.4))
+    state = tq.plus_state(n_qubits)
+    fused = tq.flatten(tq.apply_gate(state, matrix, wires)).reshape(-1)
+    wide = tq.expand_to_register(matrix, wires, n_qubits) @ tq.flatten(
+        state
+    ).reshape(-1, 1)
+    tp.testing.assert_close(
+        tp.tensor(tq.global_phase(fused, wide.reshape(-1))),
+        tp.tensor(1.0 + 0.0j),
+        atol=1e-6,
+        rtol=1e-6,
+    )
