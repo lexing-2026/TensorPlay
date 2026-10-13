@@ -15,6 +15,7 @@ import tensorplay as tp
 
 __all__ = [
     "DEFAULT_C_DTYPE",
+    "MAX_GATE_WIRES",
     "check_pauli_string",
     "check_wires",
     "n_qubits_of",
@@ -25,6 +26,12 @@ __all__ = [
 ]
 
 DEFAULT_C_DTYPE = tp.complex64
+
+# A gate matrix is 2**k by 2**k, so the width of a gate is bounded by what the
+# matrix costs rather than by the register: past this the matrix alone outweighs
+# the state it would be applied to.  Both backends refuse a wider gate, so this
+# is the width anything that builds a matrix for a gate should stay within.
+MAX_GATE_WIRES = 8
 
 
 def promoted_c_dtype(dtype):

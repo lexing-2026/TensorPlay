@@ -25,6 +25,7 @@ __all__ = [
     "partial_trace",
     "plus_state",
     "product_state",
+    "random_state",
     "state_from_bases",
     "to_density",
     "unflatten",
@@ -68,6 +69,37 @@ def state_from_bases(indices: Sequence[int], n_qubits: int, *, device=None,
             raise IndexError(f"basis index {index} is out of range for {n_qubits} qubit(s)")
         wanted = wanted + (entries == index).to(dtype)
     return normalize(wanted.reshape((1, *([2] * n_qubits))))
+
+
+def random_state(
+    n_qubits: int, batch: int = 1, *, device=None, dtype=DEFAULT_C_DTYPE
+) -> tp.Tensor:
+    """A state drawn uniformly from the unit sphere of an ``n_qubits`` register.
+
+    A complex normal rescaled to unit length is exactly uniform on the sphere,
+    which is the same distribution the last column of a Haar-random unitary
+    follows, so a state drawn this way is what a uniformly random operator would
+    have prepared.
+
+    Args:
+        n_qubits: register width.
+        batch: how many independent states to draw.
+        device: where to draw and where to put the result.
+        dtype: the states' complex type.
+
+    Returns:
+        Amplitudes shaped ``[batch, 2, 2, ...]``, unit norm each.
+    """
+    if n_qubits < 1:
+        raise ValueError(f"a register is at least one qubit wide, got {n_qubits}")
+    real_dtype = tp.float64 if dtype == tp.complex128 else tp.float32
+    side = 1 << n_qubits
+    gauss = tp.complex(
+        tp.randn(batch, side, device=device, dtype=real_dtype),
+        tp.randn(batch, side, device=device, dtype=real_dtype),
+    ) * (0.5 ** 0.5)
+    flat = gauss / gauss.abs().pow(2).sum(dim=-1, keepdim=True).sqrt()
+    return unflatten(flat.to(dtype), n_qubits)
 
 
 def product_state(states: Sequence[tp.Tensor], *, device=None, dtype=DEFAULT_C_DTYPE) -> tp.Tensor:

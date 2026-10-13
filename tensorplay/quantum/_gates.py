@@ -18,6 +18,8 @@ import tensorplay as tp
 
 from . import _native
 from ._helpers import (
+    DEFAULT_C_DTYPE,
+    MAX_GATE_WIRES,
     check_pauli_string,
     check_wires,
     n_qubits_of,
@@ -92,6 +94,7 @@ __all__ = [
     "pauli_rotation_matrix",
     "phase_matrix",
     "qft_matrix",
+    "random_unitary",
     "rc3x_matrix",
     "rccx_matrix",
     "rot_matrix",
@@ -232,6 +235,46 @@ def apply_gate(state: tp.Tensor, mat: tp.Tensor, wires) -> tp.Tensor:
 def dagger(mat: tp.Tensor) -> tp.Tensor:
     """The conjugate transpose of a gate matrix, batched over leading dims."""
     return mat.conj().transpose(-1, -2)
+
+
+def random_unitary(
+    n_qubits: int, *, device=None, c_dtype=DEFAULT_C_DTYPE
+) -> tp.Tensor:
+    """A unitary drawn from the Haar measure on an ``n_qubits`` register.
+
+    The distribution is uniform over the unitaries rather than over their
+    entries, which is what a random operator has to be for an average over it to
+    mean anything.  It comes from a factorization of a matrix of complex
+    normals, with each column turned to line up with that factor's diagonal --
+    without the turn the factorization is uniform only up to a phase per column,
+    which leaves the entries biased even though the matrix is unitary.
+
+    Args:
+        n_qubits: register width; the matrix is ``2**n_qubits`` square.
+        device: where to draw and where to put the result.
+        c_dtype: the matrix's complex type.
+
+    Returns:
+        A ``[2**n, 2**n]`` unitary.
+    """
+    if n_qubits < 1:
+        raise ValueError(f"a register is at least one qubit wide, got {n_qubits}")
+    if n_qubits > MAX_GATE_WIRES:
+        raise ValueError(
+            f"a gate may span at most {MAX_GATE_WIRES} wires, got {n_qubits}; "
+            f"the unitary would be {1 << n_qubits} square"
+        )
+    side = 1 << n_qubits
+    real_dtype = tp.float64 if c_dtype == tp.complex128 else tp.float32
+    # Two real normals make one complex normal; the square root keeps the two
+    # halves from each carrying a whole variance.
+    gauss = tp.complex(
+        tp.randn(side, side, device=device, dtype=real_dtype),
+        tp.randn(side, side, device=device, dtype=real_dtype),
+    ) * (0.5 ** 0.5)
+    unitary, upper = tp.linalg.qr(gauss)
+    turns = tp.diagonal(upper)
+    return unitary * (turns / tp.abs(turns)).to(c_dtype)
 
 
 # ---------------------------------------------------------------------------

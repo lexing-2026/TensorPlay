@@ -51,6 +51,7 @@ tq.plus_state(2)             # (|00> + |01> + |10> + |11>) / 2
 tq.basis_state(5, 3)         # |101> on 3 qubits
 tq.state_from_bases([0, 3], 2)  # (|00> + |11>) / sqrt(2)
 tq.product_state([a, b])     # the tensor product of per-qubit vectors
+tq.random_state(3)           # uniform on the sphere of the register
 ```
 
 `normalize` rescales to unit norm, `norm` reports it, and `inner` is the
@@ -98,6 +99,11 @@ The chemistry pair gates mix two wires while leaving the register's excitation
 count alone, which is what a particle-number-preserving ansatz needs:
 `apply_xx_plus_yy`, `apply_xx_minus_yy` and `apply_single_excitation`, each
 taking the pair of wires and an angle.
+
+`random_unitary` draws a gate uniformly from all the unitaries on a register,
+which is what a test or a baseline average wants rather than a matrix of random
+entries: the distribution is uniform over the operators themselves, phase and
+all.
 
 Two-body rotations take a pair of wires and an angle the same way:
 `apply_rxx`, `apply_ryy`, `apply_rzz` and `apply_rzx`. Each is
@@ -408,6 +414,8 @@ and threading a graph through it.
     tensorplay.quantum.plus_state
     tensorplay.quantum.basis_state
     tensorplay.quantum.global_phase
+    tensorplay.quantum.random_state
+    tensorplay.quantum.random_unitary
     tensorplay.quantum.state_from_bases
     tensorplay.quantum.product_state
     tensorplay.quantum.flatten

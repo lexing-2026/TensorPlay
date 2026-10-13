@@ -892,3 +892,75 @@ def test_the_doubly_controlled_phase_moves_nothing():
     tp.testing.assert_close(
         tq.probs(tq.apply_ccz(state, 0, 1, 2)), probs, atol=1e-6, rtol=1e-6
     )
+
+
+# ---------------------------------------------------------------------------
+# Random unitaries
+# ---------------------------------------------------------------------------
+
+
+def test_a_random_unitary_is_a_unitary():
+    for n_qubits in (1, 2, 3, 4):
+        mat = tq.random_unitary(n_qubits)
+        side = 1 << n_qubits
+        assert tuple(mat.shape) == (side, side)
+        tp.testing.assert_close(
+            mat @ mat.conj().t(), tp.eye(side, dtype=mat.dtype), atol=1e-5, rtol=1e-5
+        )
+
+
+def test_a_random_unitary_comes_in_both_precisions():
+    assert tq.random_unitary(2).dtype == tp.complex64
+    assert tq.random_unitary(2, c_dtype=tp.complex128).dtype == tp.complex128
+
+
+def test_a_random_unitary_is_wider_than_the_gate_it_is_drawn_for():
+    # The full width the gate path accepts, which is where the matrix starts to
+    # cost more than the state it is applied to.
+    mat = tq.random_unitary(8)
+    assert tuple(mat.shape) == (256, 256)
+
+
+def test_a_random_unitary_has_a_flat_phase():
+    # The phase of an entry is uniform over the circle, which is what a
+    # factorization without the column turns gets wrong: it leaves every phase
+    # on one side of the real axis, so no entry ever has a negative real part.
+    negative = sum(
+        1 for _ in range(200) if complex(tq.random_unitary(3)[0, 0]).real < 0
+    )
+    assert 70 < negative < 130
+
+
+def test_a_random_unitary_has_the_right_entry_size():
+    # A uniformly random unitary spreads its entries over the sphere: the mean
+    # squared magnitude of one entry is 1/d, not 1.
+    side = 4
+    sizes = [
+        abs(complex(tq.random_unitary(2)[0, 0])) ** 2 for _ in range(300)
+    ]
+    mean = sum(sizes) / len(sizes)
+    assert 0.2 < mean < 0.3, mean
+
+
+def test_two_random_unitaries_differ():
+    # Two draws have to be two operators; the one just built is not the one
+    # before it, and applying each is enough to see it.
+    first = tq.flatten(tq.apply_gate(tq.plus_state(2), tq.random_unitary(2), [0, 1]))
+    second = tq.flatten(tq.apply_gate(tq.plus_state(2), tq.random_unitary(2), [0, 1]))
+    assert float((first - second).abs().max()) > 1e-3
+
+
+def test_a_random_unitary_applies_like_any_other_gate():
+    mat = tq.random_unitary(2)
+    state = tq.plus_state(2)
+    out = tq.apply_gate(state, mat, [0, 1])
+    wide = mat @ tq.flatten(state).reshape(-1, 1)
+    tp.testing.assert_close(
+        tq.flatten(out).reshape(-1), wide.reshape(-1), atol=1e-5, rtol=1e-5
+    )
+
+
+def test_a_random_register_wider_than_a_gate_is_rejected():
+    for n_qubits in (0, 9, 12):
+        with pytest.raises(ValueError):
+            tq.random_unitary(n_qubits)
