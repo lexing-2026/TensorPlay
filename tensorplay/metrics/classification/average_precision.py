@@ -22,6 +22,7 @@ from tensorplay.metrics.functional.classification.average_precision import (
 from tensorplay.metrics.metric import Metric
 from tensorplay.metrics.utilities.data import dim_zero_cat
 from tensorplay.metrics.utilities.enums import ClassificationTask
+from tensorplay.metrics.utilities.plot import _AX_TYPE, _PLOT_OUT_TYPE
 
 
 class BinaryAveragePrecision(BinaryPrecisionRecallCurve):
@@ -48,6 +49,22 @@ class BinaryAveragePrecision(BinaryPrecisionRecallCurve):
         """Compute metric."""
         state = (dim_zero_cat(self.preds), dim_zero_cat(self.target)) if self.thresholds is None else self.confmat
         return _binary_average_precision_compute(state, self.thresholds)
+
+    def plot(  # type: ignore[override]
+        self, val: Optional[Union[Tensor, list[Tensor]]] = None, ax: Optional[_AX_TYPE] = None
+    ) -> _PLOT_OUT_TYPE:
+        """Plot a single or multiple values from the metric.
+
+        Args:
+            val: either a single result from calling ``metric.forward`` or ``metric.compute`` or a list of these results.
+                If no value is provided, will automatically call ``metric.compute`` and plot that result.
+            ax: a matplotlib axis object. If provided will add plot to that axis
+
+        Returns:
+            Figure and Axes object
+
+        """
+        return self._plot(val, ax)
 
 
 class MulticlassAveragePrecision(MulticlassPrecisionRecallCurve):
@@ -99,6 +116,22 @@ class MulticlassAveragePrecision(MulticlassPrecisionRecallCurve):
             self.thresholds,
         )
 
+    def plot(  # type: ignore[override]
+        self, val: Optional[Union[Tensor, list[Tensor]]] = None, ax: Optional[_AX_TYPE] = None
+    ) -> _PLOT_OUT_TYPE:
+        """Plot a single or multiple values from the metric.
+
+        Args:
+            val: either a single result from calling ``metric.forward`` or ``metric.compute`` or a list of these results.
+                If no value is provided, will automatically call ``metric.compute`` and plot that result.
+            ax: a matplotlib axis object. If provided will add plot to that axis
+
+        Returns:
+            Figure and Axes object
+
+        """
+        return self._plot(val, ax)
+
 
 class MultilabelAveragePrecision(MultilabelPrecisionRecallCurve):
     """Compute the average precision (AP) score for multilabel tasks.
@@ -143,6 +176,22 @@ class MultilabelAveragePrecision(MultilabelPrecisionRecallCurve):
         """Compute metric."""
         state = (dim_zero_cat(self.preds), dim_zero_cat(self.target)) if self.thresholds is None else self.confmat
         return _multilabel_average_precision_compute(state, self.num_labels, self.average, self.thresholds, self.ignore_index)
+
+    def plot(  # type: ignore[override]
+        self, val: Optional[Union[Tensor, list[Tensor]]] = None, ax: Optional[_AX_TYPE] = None
+    ) -> _PLOT_OUT_TYPE:
+        """Plot a single or multiple values from the metric.
+
+        Args:
+            val: either a single result from calling ``metric.forward`` or ``metric.compute`` or a list of these results.
+                If no value is provided, will automatically call ``metric.compute`` and plot that result.
+            ax: a matplotlib axis object. If provided will add plot to that axis
+
+        Returns:
+            Figure and Axes object
+
+        """
+        return self._plot(val, ax)
 
 
 class AveragePrecision(_ClassificationTaskWrapper):

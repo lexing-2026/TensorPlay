@@ -219,3 +219,43 @@ def test_metric_collection_curves():
     assert out["hd"].item() == pytest.approx(0.6, abs=1e-4)
     out = collection.compute()
     assert out["auroc"].item() == pytest.approx(0.5, abs=1e-4)
+
+
+@pytest.mark.skipif(
+    not metrics.utilities.imports._MATPLOTLIB_AVAILABLE, reason="matplotlib not available"
+)
+def test_curve_plot():
+    import matplotlib
+
+    matplotlib.use("Agg")
+
+    preds = tp.tensor([0.13, 0.26, 0.08, 0.19, 0.34])
+    target = tp.tensor([0, 0, 1, 1, 1])
+
+    # curve metrics return (fig, ax) from plot
+    for metric_cls in [
+        metrics.classification.BinaryPrecisionRecallCurve,
+        metrics.classification.BinaryROC,
+    ]:
+        metric = metric_cls()
+        metric.update(preds, target)
+        fig, ax = metric.plot(score=True)
+        assert fig is not None and ax is not None
+
+    # scalar metrics also plot
+    for metric_cls in [
+        metrics.classification.BinaryAUROC,
+        metrics.classification.BinaryAveragePrecision,
+    ]:
+        metric = metric_cls()
+        metric.update(preds, target)
+        fig, ax = metric.plot()
+        assert fig is not None and ax is not None
+
+    # multiclass curve with labels
+    metric = metrics.classification.MulticlassROC(num_classes=3)
+    preds3 = tp.tensor([[0.75, 0.05, 0.05], [0.05, 0.75, 0.05], [0.05, 0.05, 0.75]])
+    target3 = tp.tensor([0, 1, 2])
+    metric.update(preds3, target3)
+    fig, ax = metric.plot(score=True, labels=["a", "b", "c"])
+    assert fig is not None and ax is not None

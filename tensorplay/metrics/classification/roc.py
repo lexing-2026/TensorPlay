@@ -11,14 +11,17 @@ from tensorplay.metrics.classification.precision_recall_curve import (
     MulticlassPrecisionRecallCurve,
     MultilabelPrecisionRecallCurve,
 )
+from tensorplay.metrics.functional.classification.auroc import _reduce_auroc
 from tensorplay.metrics.functional.classification.roc import (
     _binary_roc_compute,
     _multiclass_roc_compute,
     _multilabel_roc_compute,
 )
 from tensorplay.metrics.metric import Metric
+from tensorplay.metrics.utilities.compute import _auc_compute_without_check
 from tensorplay.metrics.utilities.data import dim_zero_cat
 from tensorplay.metrics.utilities.enums import ClassificationTask
+from tensorplay.metrics.utilities.plot import _AX_TYPE, _PLOT_OUT_TYPE, plot_curve
 
 
 class BinaryROC(BinaryPrecisionRecallCurve):
@@ -49,6 +52,40 @@ class BinaryROC(BinaryPrecisionRecallCurve):
         """Compute metric."""
         state = [dim_zero_cat(self.preds), dim_zero_cat(self.target)] if self.thresholds is None else self.confmat
         return _binary_roc_compute(state, self.thresholds)  # type: ignore[arg-type]
+
+    def plot(
+        self,
+        curve: Optional[tuple[Tensor, Tensor, Tensor]] = None,
+        score: Optional[Union[Tensor, bool]] = None,
+        ax: Optional[_AX_TYPE] = None,
+    ) -> _PLOT_OUT_TYPE:
+        """Plot a single or multiple values from the metric.
+
+        Args:
+            curve: the output of either ``metric.compute`` or ``metric.forward``. If no value is provided, will
+                automatically call ``metric.compute`` and plot that result.
+            score: provide an area-under-the-curve score to be displayed on the plot. If ``True`` and no curve is
+                provided, will automatically compute the score. The score is computed by using the trapezoidal rule to
+                compute the area under the curve.
+            ax: a matplotlib axis object. If provided will add plot to that axis
+
+        Returns:
+            Figure and Axes object
+
+        """
+        curve_computed = curve or self.compute()
+        score = (
+            _auc_compute_without_check(curve_computed[0], curve_computed[1], 1.0)
+            if not curve and score is True
+            else None
+        )
+        return plot_curve(
+            curve_computed,
+            score=score,
+            ax=ax,
+            label_names=("False positive rate", "True positive rate"),
+            name=self.__class__.__name__,
+        )
 
 
 class MulticlassROC(MulticlassPrecisionRecallCurve):
@@ -87,6 +124,41 @@ class MulticlassROC(MulticlassPrecisionRecallCurve):
         state = [dim_zero_cat(self.preds), dim_zero_cat(self.target)] if self.thresholds is None else self.confmat
         return _multiclass_roc_compute(state, self.num_classes, self.thresholds, self.average)  # type: ignore[arg-type]
 
+    def plot(
+        self,
+        curve: Optional[Union[tuple[Tensor, Tensor, Tensor], tuple[List[Tensor], List[Tensor], List[Tensor]]]] = None,
+        score: Optional[Union[Tensor, bool]] = None,
+        ax: Optional[_AX_TYPE] = None,
+        labels: Optional[list[str]] = None,
+    ) -> _PLOT_OUT_TYPE:
+        """Plot a single or multiple values from the metric.
+
+        Args:
+            curve: the output of either ``metric.compute`` or ``metric.forward``. If no value is provided, will
+                automatically call ``metric.compute`` and plot that result.
+            score: provide an area-under-the-curve score to be displayed on the plot. If ``True`` and no curve is
+                provided, will automatically compute the score. The score is computed by using the trapezoidal rule to
+                compute the area under the curve.
+            ax: a matplotlib axis object. If provided will add plot to that axis
+            labels: a list of strings, if provided will be added to the plot to indicate the different classes
+
+        Returns:
+            Figure and Axes object
+
+        """
+        curve_computed = curve or self.compute()
+        score = (
+            _reduce_auroc(curve_computed[0], curve_computed[1], average=None) if not curve and score is True else None
+        )
+        return plot_curve(
+            curve_computed,
+            score=score,
+            ax=ax,
+            label_names=("False positive rate", "True positive rate"),
+            name=self.__class__.__name__,
+            labels=labels,
+        )
+
 
 class MultilabelROC(MultilabelPrecisionRecallCurve):
     """Compute the receiver operating characteristic (ROC) for multilabel tasks.
@@ -123,6 +195,41 @@ class MultilabelROC(MultilabelPrecisionRecallCurve):
         """Compute metric."""
         state = [dim_zero_cat(self.preds), dim_zero_cat(self.target)] if self.thresholds is None else self.confmat
         return _multilabel_roc_compute(state, self.num_labels, self.thresholds, self.ignore_index)  # type: ignore[arg-type]
+
+    def plot(
+        self,
+        curve: Optional[Union[tuple[Tensor, Tensor, Tensor], tuple[List[Tensor], List[Tensor], List[Tensor]]]] = None,
+        score: Optional[Union[Tensor, bool]] = None,
+        ax: Optional[_AX_TYPE] = None,
+        labels: Optional[list[str]] = None,
+    ) -> _PLOT_OUT_TYPE:
+        """Plot a single or multiple values from the metric.
+
+        Args:
+            curve: the output of either ``metric.compute`` or ``metric.forward``. If no value is provided, will
+                automatically call ``metric.compute`` and plot that result.
+            score: provide an area-under-the-curve score to be displayed on the plot. If ``True`` and no curve is
+                provided, will automatically compute the score. The score is computed by using the trapezoidal rule to
+                compute the area under the curve.
+            ax: a matplotlib axis object. If provided will add plot to that axis
+            labels: a list of strings, if provided will be added to the plot to indicate the different classes
+
+        Returns:
+            Figure and Axes object
+
+        """
+        curve_computed = curve or self.compute()
+        score = (
+            _reduce_auroc(curve_computed[0], curve_computed[1], average=None) if not curve and score is True else None
+        )
+        return plot_curve(
+            curve_computed,
+            score=score,
+            ax=ax,
+            label_names=("False positive rate", "True positive rate"),
+            name=self.__class__.__name__,
+            labels=labels,
+        )
 
 
 class ROC(_ClassificationTaskWrapper):

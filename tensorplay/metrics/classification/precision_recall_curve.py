@@ -7,6 +7,7 @@ from tensorplay import Tensor
 from typing import Literal
 
 from tensorplay.metrics.classification.base import _ClassificationTaskWrapper
+from tensorplay.metrics.functional.classification.auroc import _reduce_auroc
 from tensorplay.metrics.functional.classification.precision_recall_curve import (
     _adjust_threshold_arg,
     _binary_precision_recall_curve_arg_validation,
@@ -26,8 +27,10 @@ from tensorplay.metrics.functional.classification.precision_recall_curve import 
     _multilabel_precision_recall_curve_update,
 )
 from tensorplay.metrics.metric import Metric
+from tensorplay.metrics.utilities.compute import _auc_compute_without_check
 from tensorplay.metrics.utilities.data import dim_zero_cat
 from tensorplay.metrics.utilities.enums import ClassificationTask
+from tensorplay.metrics.utilities.plot import _AX_TYPE, _PLOT_OUT_TYPE, plot_curve
 
 
 class BinaryPrecisionRecallCurve(Metric):
@@ -107,6 +110,39 @@ class BinaryPrecisionRecallCurve(Metric):
         """Compute metric."""
         state = (dim_zero_cat(self.preds), dim_zero_cat(self.target)) if self.thresholds is None else self.confmat
         return _binary_precision_recall_curve_compute(state, self.thresholds)
+
+    def plot(
+        self,
+        curve: Optional[tuple[Tensor, Tensor, Tensor]] = None,
+        score: Optional[Union[Tensor, bool]] = None,
+        ax: Optional[_AX_TYPE] = None,
+    ) -> _PLOT_OUT_TYPE:
+        """Plot a single curve from the metric.
+
+        Args:
+            curve: the output of either ``metric.compute`` or ``metric.forward``. If no value is provided, will
+                automatically call ``metric.compute`` and plot that result.
+            score: provide an area-under-the-curve score to be displayed on the plot. If ``True`` and no curve is
+                provided, will automatically compute the score. The score is computed by using the trapezoidal rule to
+                compute the area under the curve.
+            ax: a matplotlib axis object. If provided will add plot to that axis
+
+        Returns:
+            Figure and Axes object
+
+        """
+        curve_computed = curve or self.compute()
+        # switch order as the standard way is recall along x-axis and precision along y-axis
+        curve_computed = (curve_computed[1], curve_computed[0], curve_computed[2])
+
+        score = (
+            _auc_compute_without_check(curve_computed[0], curve_computed[1], direction=-1.0)
+            if not curve and score is True
+            else None
+        )
+        return plot_curve(
+            curve_computed, score=score, ax=ax, label_names=("Recall", "Precision"), name=self.__class__.__name__
+        )
 
 
 class MulticlassPrecisionRecallCurve(Metric):
@@ -194,6 +230,38 @@ class MulticlassPrecisionRecallCurve(Metric):
         state = (dim_zero_cat(self.preds), dim_zero_cat(self.target)) if self.thresholds is None else self.confmat
         return _multiclass_precision_recall_curve_compute(state, self.num_classes, self.thresholds, self.average)
 
+    def plot(
+        self,
+        curve: Optional[Union[tuple[Tensor, Tensor, Tensor], tuple[List[Tensor], List[Tensor], List[Tensor]]]] = None,
+        score: Optional[Union[Tensor, bool]] = None,
+        ax: Optional[_AX_TYPE] = None,
+    ) -> _PLOT_OUT_TYPE:
+        """Plot a single or multiple curves from the metric.
+
+        Args:
+            curve: the output of either ``metric.compute`` or ``metric.forward``. If no value is provided, will
+                automatically call ``metric.compute`` and plot that result.
+            score: provide an area-under-the-curve score to be displayed on the plot. If ``True`` and no curve is
+                provided, will automatically compute the score. The score is computed by using the trapezoidal rule to
+                compute the area under the curve.
+            ax: a matplotlib axis object. If provided will add plot to that axis
+
+        Returns:
+            Figure and Axes object
+
+        """
+        curve_computed = curve or self.compute()
+        # switch order as the standard way is recall along x-axis and precision along y-axis
+        curve_computed = (curve_computed[1], curve_computed[0], curve_computed[2])
+        score = (
+            _reduce_auroc(curve_computed[0], curve_computed[1], average=None, direction=-1.0)
+            if not curve and score is True
+            else None
+        )
+        return plot_curve(
+            curve_computed, score=score, ax=ax, label_names=("Recall", "Precision"), name=self.__class__.__name__
+        )
+
 
 class MultilabelPrecisionRecallCurve(Metric):
     """Compute the precision-recall curve for multilabel tasks.
@@ -275,6 +343,38 @@ class MultilabelPrecisionRecallCurve(Metric):
         """Compute metric."""
         state = (dim_zero_cat(self.preds), dim_zero_cat(self.target)) if self.thresholds is None else self.confmat
         return _multilabel_precision_recall_curve_compute(state, self.num_labels, self.thresholds, self.ignore_index)
+
+    def plot(
+        self,
+        curve: Optional[Union[tuple[Tensor, Tensor, Tensor], tuple[List[Tensor], List[Tensor], List[Tensor]]]] = None,
+        score: Optional[Union[Tensor, bool]] = None,
+        ax: Optional[_AX_TYPE] = None,
+    ) -> _PLOT_OUT_TYPE:
+        """Plot a single or multiple curves from the metric.
+
+        Args:
+            curve: the output of either ``metric.compute`` or ``metric.forward``. If no value is provided, will
+                automatically call ``metric.compute`` and plot that result.
+            score: provide an area-under-the-curve score to be displayed on the plot. If ``True`` and no curve is
+                provided, will automatically compute the score. The score is computed by using the trapezoidal rule to
+                compute the area under the curve.
+            ax: a matplotlib axis object. If provided will add plot to that axis
+
+        Returns:
+            Figure and Axes object
+
+        """
+        curve_computed = curve or self.compute()
+        # switch order as the standard way is recall along x-axis and precision along y-axis
+        curve_computed = (curve_computed[1], curve_computed[0], curve_computed[2])
+        score = (
+            _reduce_auroc(curve_computed[0], curve_computed[1], average=None, direction=-1.0)
+            if not curve and score is True
+            else None
+        )
+        return plot_curve(
+            curve_computed, score=score, ax=ax, label_names=("Recall", "Precision"), name=self.__class__.__name__
+        )
 
 
 class PrecisionRecallCurve(_ClassificationTaskWrapper):
