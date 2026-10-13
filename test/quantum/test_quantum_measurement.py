@@ -302,3 +302,164 @@ def test_joint_estimation_needs_a_word():
 def test_joint_estimation_rejects_a_word_that_does_not_fit():
     with pytest.raises(ValueError):
         tq.joint_expectation(tq.zeros_state(1), ["XX"], shots=16)
+
+
+# ---------------------------------------------------------------------------
+# Readout error
+# ---------------------------------------------------------------------------
+
+
+def test_a_clean_readout_changes_nothing():
+    clean = tq.readout_error_matrix(0.0)
+    tp.testing.assert_close(clean, tp.eye(2), atol=1e-6, rtol=1e-6)
+    state = _bell()
+    tp.testing.assert_close(
+        tq.apply_readout_error(tq.probs(state), clean),
+        tq.probs(state),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_the_readout_matrix_separates_the_two_directions():
+    matrix = tq.readout_error_matrix(0.1, 0.3)
+    expected = tp.tensor([[0.7, 0.3], [0.1, 0.9]])
+    tp.testing.assert_close(matrix, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_one_readout_rate_covers_both_directions():
+    matrix = tq.readout_error_matrix(0.2)
+    tp.testing.assert_close(matrix, tp.tensor([[0.8, 0.2], [0.2, 0.8]]), atol=1e-6, rtol=1e-6)
+
+
+def test_a_readout_rate_outside_the_unit_interval_is_rejected():
+    for bad in (-0.1, 1.4):
+        with pytest.raises(ValueError):
+            tq.readout_error_matrix(bad)
+        with pytest.raises(ValueError):
+            tq.readout_error_matrix(0.1, bad)
+
+
+def test_a_prepared_one_is_misread_at_the_rate_it_was_given():
+    matrix = tq.readout_error_matrix(0.25)
+    prepared_one = tp.tensor([[0.0, 1.0]])
+    reported = tq.apply_readout_error(prepared_one, matrix)
+    tp.testing.assert_close(reported, tp.tensor([[0.25, 0.75]]), atol=1e-6, rtol=1e-6)
+
+
+def test_a_prepared_zero_is_misread_at_its_own_rate():
+    matrix = tq.readout_error_matrix(0.25, 0.5)
+    prepared_zero = tp.tensor([[1.0, 0.0]])
+    reported = tq.apply_readout_error(prepared_zero, matrix)
+    tp.testing.assert_close(reported, tp.tensor([[0.5, 0.5]]), atol=1e-6, rtol=1e-6)
+
+
+def test_the_two_wires_of_a_register_are_read_independently():
+    # Wire 0 set out of two: each wire turns over with chance p, so the four
+    # outcomes take the four products.  |10> is index 2, qubit 0 leading.
+    p = 0.1
+    matrix = tq.readout_error_matrix(p)
+    state = tq.basis_state(2, 2)
+    reported = tq.apply_readout_error(tq.probs(state), matrix)
+    expected = tp.tensor([[
+        p * (1 - p),    # |00>: wire 0 turned over, wire 1 did not
+        p * p,          # |01>: both turned over
+        (1 - p) * (1 - p),  # |10>: neither turned over
+        (1 - p) * p,    # |11>: wire 1 turned over
+    ]])
+    tp.testing.assert_close(reported, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_readout_error_keeps_the_weight():
+    state = tq.plus_state(3)
+    reported = tq.apply_readout_error(tq.probs(state), tq.readout_error_matrix(0.3))
+    tp.testing.assert_close(reported.sum(), tp.tensor(1.0), atol=1e-6, rtol=1e-6)
+
+
+def test_readout_error_keeps_the_shot_count():
+    counts = tq.measure(_bell(), 512)
+    reported = tq.apply_readout_error(counts, tq.readout_error_matrix(0.2))
+    tp.testing.assert_close(reported.sum(), tp.tensor(512.0), atol=1e-4, rtol=1e-6)
+
+
+def test_a_matrix_can_be_given_for_each_wire():
+    per_wire = tp.stack([
+        tq.readout_error_matrix(0.0),
+        tq.readout_error_matrix(1.0),   # this one is always wrong
+        tq.readout_error_matrix(0.0),
+    ])
+    reported = tq.apply_readout_error(tq.probs(tq.zeros_state(3)), per_wire)
+    assert abs(float(reported.reshape(-1)[2]) - 1.0) < 1e-6
+
+
+def test_the_wires_keep_the_order_the_matrix_list_is_given_in():
+    per_wire = tp.stack([tq.readout_error_matrix(1.0), tq.readout_error_matrix(0.0)])
+    reported = tq.apply_readout_error(tq.probs(tq.zeros_state(2)), per_wire)
+    # The leading wire is the one that turns over, so |00> reads as |10>.
+    assert abs(float(reported.reshape(-1)[2]) - 1.0) < 1e-6
+
+
+def test_readout_error_scales_the_shots_the_way_the_exact_map_does():
+    state = tq.basis_state(1, 2)
+    matrix = tq.readout_error_matrix(0.15)
+    exact = tq.apply_readout_error(tq.probs(state), matrix)
+    shots = tq.measure(state, 20000, readout=matrix)
+    tp.testing.assert_close(shots / shots.sum(), exact, atol=0.02, rtol=0)
+
+
+def test_a_measured_value_shrinks_by_the_readout_fidelity():
+    # A value that sits on the axis being read survives a readout with
+    # probability 1 - p on each side, so it comes back scaled by 1 - 2p.
+    rotated = tq.apply_measurement_basis(tq.plus_state(1), "X")
+    for p in (0.0, 0.2, 0.35):
+        counts = tq.measure(rotated, 20000, readout=tq.readout_error_matrix(p))
+        estimate = tq.expectation_from_counts(counts, "X")
+        tp.testing.assert_close(
+            estimate, tp.tensor([1.0 - 2 * p]), atol=0.05, rtol=0
+        )
+
+
+def test_a_clean_readout_leaves_the_shots_where_they_were():
+    state = tq.plus_state(2)
+    counts = tq.measure(state, 4000, readout=tq.readout_error_matrix(0.0))
+    tp.testing.assert_close(
+        counts, 4000 * tq.probs(state), atol=250.0, rtol=0
+    )
+
+
+def test_the_readout_only_covers_the_wires_that_were_measured():
+    state = tq.apply_x(tq.zeros_state(3), 2)
+    # A matrix per wire for a two-wire readout is a shape error; a single one
+    # covers both.
+    with pytest.raises(ValueError):
+        tq.measure(state, 16, wires=[0, 1], readout=tp.stack([
+            tq.readout_error_matrix(0.1),
+            tq.readout_error_matrix(0.1),
+            tq.readout_error_matrix(0.1),
+        ]))
+    counts = tq.measure(state, 4096, wires=[0, 1], readout=tq.readout_error_matrix(0.05))
+    assert counts.shape == (1, 4)
+    tp.testing.assert_close(counts.sum(), tp.tensor(4096.0), atol=1e-4, rtol=1e-6)
+
+
+def test_a_readout_matrix_of_the_wrong_shape_is_rejected():
+    state = tq.zeros_state(2)
+    with pytest.raises(ValueError):
+        tq.measure(state, 16, readout=tp.rand(2, 2, 2)[:, 0])
+    with pytest.raises(ValueError):
+        tq.apply_readout_error(tq.probs(state), tp.rand(3, 2, 2))
+
+
+def test_a_readout_row_that_does_not_sum_to_one_is_rejected():
+    with pytest.raises(ValueError):
+        tq.apply_readout_error(tq.probs(tq.zeros_state(1)), tp.tensor([[0.4, 0.4], [0.5, 0.5]]))
+
+
+def test_a_readout_entry_outside_the_unit_interval_is_rejected():
+    with pytest.raises(ValueError):
+        tq.apply_readout_error(tq.probs(tq.zeros_state(1)), tp.tensor([[1.4, -0.4], [0.1, 0.9]]))
+
+
+def test_a_column_count_that_is_not_a_whole_register_is_rejected():
+    with pytest.raises(ValueError):
+        tq.apply_readout_error(tp.zeros(1, 3), tq.readout_error_matrix(0.1))

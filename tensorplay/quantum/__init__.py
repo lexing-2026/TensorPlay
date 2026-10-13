@@ -137,6 +137,7 @@ from ._hamiltonian import (
 from ._measurement import (
     apply_measurement_basis,
     apply_pauli_word,
+    apply_readout_error,
     commuting_groups,
     counts_from_indices,
     density_probs,
@@ -146,6 +147,7 @@ from ._measurement import (
     marginal_probs,
     measure,
     probs,
+    readout_error_matrix,
     sample_indices,
 )
 from ._noise import (
@@ -212,6 +214,7 @@ __all__ = [
     "apply_phase_flip",
     "apply_rc3x",
     "apply_rccx",
+    "apply_readout_error",
     "apply_rot",
     "apply_rx",
     "apply_ry",
@@ -279,6 +282,7 @@ __all__ = [
     "qft_matrix",
     "rc3x_matrix",
     "rccx_matrix",
+    "readout_error_matrix",
     "real_amplitudes",
     "rot_matrix",
     "rot_x_matrix",

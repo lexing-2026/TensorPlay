@@ -110,6 +110,36 @@ def test_sampling_stays_on_the_device():
     tp.testing.assert_close(counts[0, 2], tp.tensor(2048.0), atol=200.0, rtol=0)
 
 
+def test_readout_error_matches_the_host():
+    state = tq.basis_state(2, 3)
+    matrix = tq.readout_error_matrix(0.1, 0.2)
+    tp.testing.assert_close(
+        _on_device(
+            tq.apply_readout_error(
+                tq.probs(state.to(tp.device("cuda"))),
+                matrix.to(tp.device("cuda")),
+            )
+        ),
+        tq.apply_readout_error(tq.probs(state), matrix),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_sampled_readout_error_matches_the_exact_map():
+    # Every wire is turned over with chance p, so a prepared |00> stays put with
+    # probability (1 - p) squared.
+    state = tq.zeros_state(2)
+    matrix = tq.readout_error_matrix(0.15)
+    device = tp.device("cuda")
+    counts = tq.measure(state.to(device), 20000, readout=matrix.to(device))
+    assert counts.device.type == "cuda"
+    exact = tq.apply_readout_error(tq.probs(state), matrix)
+    counts = counts.to(tp.device("cpu"))
+    tp.testing.assert_close(counts.sum(), tp.tensor(20000.0), atol=1e-4, rtol=1e-6)
+    tp.testing.assert_close(counts / counts.sum(), exact, atol=0.02, rtol=0)
+
+
 def test_channel_matches_the_host():
     density = tq.to_density(tq.apply_h(tq.zeros_state(2), 0))
     tp.testing.assert_close(

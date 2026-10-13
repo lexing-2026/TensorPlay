@@ -228,6 +228,29 @@ tq.commuting_groups(["XZ", "XI", "ZZ"])   # [['XZ', 'XI'], ['ZZ']]
 tq.joint_expectation(state, ["XZ", "XI", "ZZ"], shots=4096)   # [batch, 3]
 ```
 
+### A readout that lies
+
+A device reports a bit that was prepared wrong now and then, and the two
+directions usually differ. A readout matrix records that: row `p` is what gets
+reported for a prepared `p`, so it is a distribution over the reported bit.
+
+```python
+noisy = tq.readout_error_matrix(0.02)               # 2% in both directions
+worse = tq.readout_error_matrix(0.02, 0.05)         # 2% of 1s, 5% of 0s
+```
+
+`measure` takes one and decides every shot's reading on its own, which is how a
+real readout behaves:
+
+```python
+counts = tq.measure(state, shots=4096, readout=noisy)
+```
+
+Give one matrix per wire as `[n, 2, 2]` when the wires were calibrated apart.
+`apply_readout_error` applies the same map to a histogram or an exact
+distribution, so an offline histogram can be corrected — or biased, which is
+what it is usually wanted for.
+
 ## Noise
 
 Channels act on density matrices, given as Kraus operators. Each one is a set
@@ -373,6 +396,8 @@ in a single pass over the amplitudes.
     tensorplay.quantum.sample_indices
     tensorplay.quantum.counts_from_indices
     tensorplay.quantum.measure
+    tensorplay.quantum.readout_error_matrix
+    tensorplay.quantum.apply_readout_error
     tensorplay.quantum.apply_channel
     tensorplay.quantum.apply_bit_flip
     tensorplay.quantum.apply_phase_flip

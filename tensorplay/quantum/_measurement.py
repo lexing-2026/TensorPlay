@@ -25,6 +25,7 @@ from ._state import unflatten
 __all__ = [
     "apply_measurement_basis",
     "apply_pauli_word",
+    "apply_readout_error",
     "commuting_groups",
     "counts_from_indices",
     "density_probs",
@@ -34,6 +35,7 @@ __all__ = [
     "marginal_probs",
     "measure",
     "probs",
+    "readout_error_matrix",
     "sample_indices",
 ]
 
@@ -322,6 +324,107 @@ def sample_indices(distribution: tp.Tensor, shots: int) -> tp.Tensor:
     return indices.clamp(max=dim - 1)
 
 
+def _readout_matrices(matrix, n_wires: int, device, dtype) -> tp.Tensor:
+    """Normalize a readout spec into one ``[2, 2]`` matrix per measured wire.
+
+    The spec is either a single matrix, used for every wire, or one matrix per
+    wire in the order the wires were measured.  Rows are what a prepared bit
+    reads back as, so every row is a distribution over the reported bit.
+    """
+    tensor = matrix if isinstance(matrix, tp.Tensor) else tp.as_tensor(matrix)
+    tensor = tensor.to(device=device, dtype=tp.float32)
+    if tensor.dim() == 2:
+        tensor = tensor.reshape(1, 2, 2)
+    if tensor.dim() != 3 or tensor.shape[1] != 2 or tensor.shape[2] != 2:
+        raise ValueError(
+            f"a readout matrix is [2, 2], or one per wire as [k, 2, 2], got "
+            f"{tuple(tensor.shape)}"
+        )
+    if tensor.shape[0] == 1:
+        tensor = tensor.expand(n_wires, 2, 2)
+    if tensor.shape[0] != n_wires:
+        raise ValueError(
+            f"got {tensor.shape[0]} readout matrix(es) for {n_wires} measured wire(s)"
+        )
+    if bool(((tensor < -1e-6) | (tensor > 1.0 + 1e-6)).any()):
+        raise ValueError("readout probabilities lie in [0, 1]")
+    if not bool(tp.allclose(tensor.sum(dim=-1), tp.ones_like(tensor[:, :, 0]), atol=1e-5, rtol=1e-5)):
+        raise ValueError("every row of a readout matrix sums to one")
+    return tensor
+
+
+def readout_error_matrix(
+    p_one_as_zero: float,
+    p_zero_as_one: Optional[float] = None,
+    *,
+    device=None,
+    dtype=tp.float32,
+) -> tp.Tensor:
+    """The two outcomes one wire reports for each bit it was handed.
+
+    Row ``p`` is the distribution over the reported bit for a prepared ``p``, so
+    the entry at ``[1][0]`` is the chance a 1 is read as a 0 and the entry at
+    ``[0][1]`` the chance a 0 is read as a 1 -- the two numbers a calibration
+    reports separately, since they differ on a real device.  One rate covers both
+    directions when the error is symmetric.
+
+    Args:
+        p_one_as_zero: chance a prepared 1 is reported as 0.
+        p_zero_as_one: chance a prepared 0 is reported as 1; the same as
+            ``p_one_as_zero`` when omitted.
+        device: where to place the matrix.
+        dtype: its floating point type.
+
+    Returns:
+        A ``[2, 2]`` matrix, row prepared and column reported.
+    """
+    for name, value in (("misfire chance", p_one_as_zero), ("misfire chance", p_zero_as_one)):
+        if value is not None and not 0.0 <= float(value) <= 1.0:
+            raise ValueError(f"a readout {name} lies in [0, 1], got {value}")
+    reverse = p_one_as_zero if p_zero_as_one is None else p_zero_as_one
+    return tp.tensor(
+        [[1.0 - reverse, reverse], [p_one_as_zero, 1.0 - p_one_as_zero]],
+        dtype=dtype,
+        device=device,
+    )
+
+
+def apply_readout_error(counts: tp.Tensor, matrix) -> tp.Tensor:
+    """Reports a histogram the way a noisy readout would have.
+
+    The map is linear, so it applies just as well to exact probabilities as to
+    tallied shots, and it keeps the total weight: each row of a readout matrix is
+    a distribution, so nothing is created or lost.  Errors on different wires are
+    taken to be independent, which is what a per-wire calibration measures.
+
+    Args:
+        counts: a distribution over outcomes, shaped ``[..., 2**n]``; the
+            leading column is the highest bit.
+        matrix: a ``[2, 2]`` readout matrix applied to every wire, or one per
+            wire as ``[n, 2, 2]``, from :func:`readout_error_matrix`.
+
+    Returns:
+        The reported distribution, in the same shape.
+    """
+    n_columns = counts.shape[-1]
+    n_wires = n_columns.bit_length() - 1
+    if n_columns <= 0 or 1 << n_wires != n_columns:
+        raise ValueError(f"{n_columns} columns do not describe a whole number of qubits")
+    matrices = _readout_matrices(matrix, n_wires, counts.device, counts.dtype)
+
+    # One wire at a time: the bit axis is pulled to the end, contracted against
+    # its matrix, and put back where it came from, so the caller's column order
+    # and every leading dimension survive untouched.
+    leading = counts.dim() - 1
+    folded = counts.reshape(*counts.shape[:-1], *([2] * n_wires))
+    for position in range(n_wires):
+        axis = leading + position
+        moved = tp.movedim(folded, axis, -1)
+        moved = moved @ matrices[position]
+        folded = tp.movedim(moved, -1, axis)
+    return folded.reshape(counts.shape)
+
+
 def counts_from_indices(indices: tp.Tensor, n_qubits: int) -> tp.Tensor:
     """Tally sampled basis indices into counts, shaped ``[batch, 2**n_qubits]``."""
     dim = 1 << n_qubits
@@ -332,7 +435,43 @@ def counts_from_indices(indices: tp.Tensor, n_qubits: int) -> tp.Tensor:
     return counts.scatter_add_(1, rows, weights)
 
 
-def measure(state: tp.Tensor, shots: int, wires: Optional[Sequence[int]] = None) -> tp.Tensor:
+def _read_out(indices: tp.Tensor, matrices: tp.Tensor) -> tp.Tensor:
+    """Draw the bit each wire reports for a batch of sampled outcomes.
+
+    Every shot is decided on its own, the way a real readout decides each shot on
+    its own: the outcome is sampled first and the reported bit is then a fresh
+    draw from that wire's matrix, so a shot that is misread is lost rather than
+    averaged into its neighbours.
+    """
+    n_wires = matrices.shape[0]
+    if n_wires == 0:
+        return indices
+    # One draw per wire: sharing a single draw would tie the wires together and
+    # make the errors on different wires perfectly correlated.
+    draws = tp.rand((n_wires, *indices.shape), dtype=matrices.dtype, device=indices.device)
+    flips = tp.zeros_like(indices)
+    for position in range(n_wires):
+        # The leading column of an outcome is the highest bit, so the wire listed
+        # first owns the shift that leaves it.
+        bit = n_wires - 1 - position
+        prepared = tp.bitwise_and(tp.bitwise_right_shift(indices, bit), 1)
+        # The entry at column zero is the chance of being told 0; comparing the
+        # draw against it settles the reported bit in one step.
+        stay_zero = matrices[position][:, 0][prepared]
+        reported = tp.where(draws[position] < stay_zero, 0, 1).to(indices.dtype)
+        # A wire moves only where the two readings disagree, so the mask carries
+        # the difference rather than the reading itself.
+        moved = tp.bitwise_xor(reported, prepared)
+        flips = tp.bitwise_or(flips, tp.bitwise_left_shift(moved, bit))
+    return tp.bitwise_xor(indices, flips)
+
+
+def measure(
+    state: tp.Tensor,
+    shots: int,
+    wires: Optional[Sequence[int]] = None,
+    readout=None,
+) -> tp.Tensor:
     """Sample ``shots`` measurements per state and tally them.
 
     Args:
@@ -340,6 +479,9 @@ def measure(state: tp.Tensor, shots: int, wires: Optional[Sequence[int]] = None)
         shots: how many independent measurements to draw per state.
         wires: qubits to read out; all of them when omitted.  The result has
             one column per distinct outcome of the listed qubits.
+        readout: an optional readout matrix, shaped ``[2, 2]`` for every wire or
+            ``[len(wires), 2, 2]`` for one per wire; each shot's outcome is
+            reported through it.
 
     Returns:
         Counts shaped ``[batch, 2**len(wires)]``, real.
@@ -347,4 +489,10 @@ def measure(state: tp.Tensor, shots: int, wires: Optional[Sequence[int]] = None)
     n_qubits = n_qubits_of(state)
     target = list(range(n_qubits)) if wires is None else ordered_wires(wires, n_qubits)
     marginal = marginal_probs(state, target)
-    return counts_from_indices(sample_indices(marginal, shots), len(target))
+    indices = sample_indices(marginal, shots)
+    if readout is not None:
+        indices = _read_out(
+            indices,
+            _readout_matrices(readout, len(target), indices.device, marginal.dtype),
+        )
+    return counts_from_indices(indices, len(target))
