@@ -407,7 +407,21 @@ Tensor pool(const Tensor& input, const std::vector<int64_t>& kernel,
     Tensor source = input;
 #ifndef TP_QUANT_CUDA
     if (mode == 0 && rank == 3 && input.dim() == 5 && input.itemsize() == 1) {
-        source = input.contiguous(static_cast<int64_t>(MemoryFormat::ChannelsLast3d));
+        if (input.impl()->is_contiguous_in(MemoryFormat::Contiguous) &&
+            !input.impl()->is_contiguous_in(MemoryFormat::ChannelsLast3d) && g.channels * g.in_size >= 3600) {
+            const auto source_shape = input.sizes().vec();
+            Tensor storage = Tensor::empty(source_shape, input.dtype(), input.device());
+            source = Tensor(storage.impl()->storage(), source_shape, get_channels_last_strides(source_shape), input.dtype(), 0);
+            source.impl()->set_quantizer(input.impl()->quantizer());
+            const DType storage_type = underlying_storage_type(input.dtype());
+            for (int64_t b = 0; b < input.size(0); ++b) {
+                Tensor from(input.impl()->storage(), {g.in_size, g.channels}, {1, g.in_size},
+                    storage_type, input.storage_offset() + b * g.batch_stride);
+                Tensor to(source.impl()->storage(), {g.in_size, g.channels}, {g.channels, 1},
+                    storage_type, b * g.in_size * g.channels);
+                to.copy_(from);
+            }
+        } else source = input.contiguous(static_cast<int64_t>(MemoryFormat::ChannelsLast3d));
         g.channel_stride = source.stride(channel_dim);
         g.batch_stride = source.stride(0);
         for (int d = 0; d < rank; ++d) g.spatial_strides[d] = source.stride(source.dim() - rank + d);

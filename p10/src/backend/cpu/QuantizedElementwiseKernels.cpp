@@ -613,12 +613,39 @@ int64_t byte_sum(const T* values, int64_t count) {
     return sum;
 }
 
+template<class T>
+int64_t byte_square_sum(const T* values, int64_t count) {
+    int64_t sum = 0, i = 0;
+#if defined(CPU_CAPABILITY_AVX2) || defined(CPU_CAPABILITY_AVX512)
+    using V = vec::Vectorized<int32_t>;
+    constexpr int bytes = V::size() * 2;
+    while (i + bytes <= count) {
+        const int64_t end = std::min<int64_t>(i + 65536, count - count % bytes);
+        V total(0);
+        for (; i < end; i += bytes) {
+#ifdef CPU_CAPABILITY_AVX512
+            const auto raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(values + i));
+            const auto wide = std::is_signed_v<T> ? _mm512_cvtepi8_epi16(raw) : _mm512_cvtepu8_epi16(raw);
+            total = total + V(_mm512_madd_epi16(wide, wide));
+#else
+            const auto raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(values + i));
+            const auto wide = std::is_signed_v<T> ? _mm256_cvtepi8_epi16(raw) : _mm256_cvtepu8_epi16(raw);
+            total = total + V(_mm256_madd_epi16(wide, wide));
+#endif
+        }
+        alignas(64) int32_t lanes[V::size()];
+        total.store(lanes);
+        for (auto value : lanes) sum += value;
+    }
+#endif
+    for (; i < count; ++i) sum += static_cast<int64_t>(values[i]) * values[i];
+    return sum;
+}
+
 template<class Q>
 void moment_codes(const void* input, void* output, int64_t count, int64_t rows,
                   double scale, int64_t zp, bool deviation, double correction) {
     using T = typename Q::underlying;
-    using QV = vec::Vectorized<Q>;
-    using IV = vec::Vectorized<qint32>;
     using FV = vec::Vectorized<float>;
     const auto* x = static_cast<const T*>(input);
     auto* y = static_cast<T*>(output);
@@ -634,29 +661,8 @@ void moment_codes(const void* input, void* output, int64_t count, int64_t rows,
         double square_sum = 0.;
         int64_t i = 0;
         if constexpr (sizeof(T) == 1) {
-            const QV zero(Q(static_cast<T>(0)));
-            while (i + QV::size() <= count) {
-                const int64_t stop = std::min<int64_t>(i + 32768, count - count % QV::size());
-                typename QV::int_vec_return_type totals, squares;
-                for (size_t j = 0; j < totals.size(); ++j) { totals[j] = IV(qint32(0)); squares[j] = IV(qint32(0)); }
-                for (; i < stop; i += QV::size()) {
-                    const auto codes = QV::loadu(values + i).widening_subtract(zero);
-                    for (size_t j = 0; j < totals.size(); ++j) {
-                        totals[j] = totals[j] + codes[j];
-                        if (deviation) squares[j] = squares[j] + codes[j] * codes[j];
-                    }
-                }
-                alignas(64) int32_t lanes[IV::size()];
-                for (size_t j = 0; j < totals.size(); ++j) {
-                    totals[j].store(lanes);
-                    for (const auto value : lanes) sum += value;
-                    if (deviation) {
-                        squares[j].store(lanes);
-                        for (const auto value : lanes) integer_square_sum += value;
-                    }
-                }
-            }
-            for (; i < count; ++i) { sum += values[i]; integer_square_sum += static_cast<int64_t>(values[i]) * values[i]; }
+            sum = byte_sum(values, count);
+            integer_square_sum = byte_square_sum(values, count);
             square_sum = static_cast<double>(integer_square_sum);
         } else {
             for (int64_t j = 0; j < count; ++j) sum += values[j];
