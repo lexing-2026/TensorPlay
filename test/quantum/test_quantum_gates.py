@@ -682,3 +682,147 @@ def test_the_pair_gates_run_on_named_wires_in_either_order():
     # operator, since the gate treats them alike.
     backward = tq.apply_xx_plus_yy(state, [1, 0], 0.5, 0.0)
     tp.testing.assert_close(forward, backward, atol=1e-6, rtol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Two-body rotations
+# ---------------------------------------------------------------------------
+
+
+_ROTATION_NAMES = ("rxx", "ryy", "rzz", "rzx")
+
+
+def test_every_two_body_rotation_is_a_unitary():
+    for name in _ROTATION_NAMES:
+        mat = getattr(tq, name + "_matrix")(0.7)
+        identity = tp.eye(4, dtype=mat.dtype)
+        tp.testing.assert_close(
+            mat @ mat.conj().t(), identity, atol=1e-6, rtol=1e-6
+        )
+
+
+def test_a_negative_angle_undoes_a_two_body_rotation():
+    for name in _ROTATION_NAMES:
+        builder = getattr(tq, name + "_matrix")
+        mat = builder(0.7)
+        tp.testing.assert_close(
+            mat @ builder(-0.7), tp.eye(4, dtype=mat.dtype), atol=1e-6, rtol=1e-6
+        )
+
+
+def test_a_zero_angle_is_the_identity():
+    for name in _ROTATION_NAMES:
+        builder = getattr(tq, name + "_matrix")
+        tp.testing.assert_close(
+            builder(0.0), tp.eye(4, dtype=tp.complex64), atol=1e-6, rtol=1e-6
+        )
+
+
+def test_the_rotation_about_two_z_wires_only_adds_a_phase():
+    mat = tq.rzz_matrix(math.pi)
+    # Every basis state picks up e^{-i pi (z0 z1)/2}, so |00> and |11> -- whose
+    # product is +1 -- turn by a quarter turn the other way from the middle two.
+    assert abs(complex(mat[0, 0]) + 1j) < 1e-6
+    assert abs(complex(mat[1, 1]) - 1j) < 1e-6
+    assert abs(complex(mat[3, 3]) + 1j) < 1e-6
+
+
+def test_a_half_turn_about_two_x_wires_swaps_the_middle_pair():
+    # cos(pi/2) is zero, so |01> and |10> trade outright.
+    out = tq.apply_rxx(tq.basis_state(1, 2), [0, 1], math.pi)
+    tp.testing.assert_close(
+        _flat(out), _flat(-1j * tq.basis_state(2, 2)), atol=1e-6, rtol=1e-6
+    )
+
+
+def test_a_half_turn_about_two_y_wires_sends_the_outer_pair_the_other_way():
+    # Y on both wires is a real matrix, so the turn lands with the opposite sign.
+    out = tq.apply_ryy(tq.basis_state(0, 2), [0, 1], math.pi)
+    tp.testing.assert_close(
+        _flat(out), _flat(1j * tq.basis_state(3, 2)), atol=1e-6, rtol=1e-6
+    )
+
+
+def test_a_two_body_rotation_is_the_exponential_of_its_pauli_product():
+    # exp(-i theta P / 2) for the two-wire Pauli product, built from the
+    # single-qubit matrices rather than from the table the gate uses.
+    builders = {"X": tq.x_matrix, "Y": tq.y_matrix, "Z": tq.z_matrix}
+    products = {"rxx": "XX", "ryy": "YY", "rzz": "ZZ", "rzx": "ZX"}
+    theta = 0.7
+    for name, product in products.items():
+        pauli = tp.kron(builders[product[0]](), builders[product[1]]())
+        identity = tp.eye(4, dtype=pauli.dtype)
+        want = math.cos(theta / 2) * identity - 1j * math.sin(theta / 2) * pauli
+        tp.testing.assert_close(
+            getattr(tq, name + "_matrix")(theta).to(want.dtype),
+            want,
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+
+def test_the_rotation_about_z_and_x_cares_which_wire_is_named_first():
+    first = tq.apply_rzx(tq.plus_state(2), [0, 1], 0.5)
+    second = tq.apply_rzx(tq.plus_state(2), [1, 0], 0.5)
+    assert not bool(tp.allclose(first, second, atol=1e-3, rtol=0))
+    # The leading wire of the pair carries the Z: on |++> that turns the first
+    # wire over and leaves the second alone.
+    state = tq.state_from_bases([0, 0], 2)
+    state = tq.apply_x(state, 0)
+    state = tq.apply_x(state, 1)
+    rotated = tq.apply_rzx(state, [0, 1], math.pi / 2)
+    probs = tq.probs(rotated).reshape(-1)
+    assert probs[2] > 0.49 and probs[1] < 0.02 and probs[0] < 0.02
+
+
+def test_a_two_body_rotation_is_the_same_operator_on_either_pair_of_wires():
+    # XX, YY and ZZ are symmetric in the pair, so naming them the other way
+    # round changes nothing.
+    for apply, wires in ((tq.apply_rxx, [0, 1]), (tq.apply_ryy, [0, 1]),
+                         (tq.apply_rzz, [0, 1])):
+        forward = apply(tq.plus_state(2), wires, 0.5)
+        backward = apply(tq.plus_state(2), [1, 0], 0.5)
+        tp.testing.assert_close(forward, backward, atol=1e-6, rtol=1e-6)
+
+
+def test_a_two_body_rotation_reaches_the_wires_it_was_given():
+    # On a three-wire register the middle wire must be left alone.
+    state = tq.apply_h(tq.apply_h(tq.zeros_state(3), 0), 1)
+    start = tq.probs(state).reshape(-1)
+    after = tq.probs(tq.apply_rzz(state, [0, 2], 0.9)).reshape(-1)
+    tp.testing.assert_close(after, start, atol=1e-6, rtol=1e-6)
+
+
+def test_a_two_body_rotation_carries_its_angle_as_a_gradient():
+    for name in _ROTATION_NAMES:
+        theta = tp.tensor(0.4, requires_grad=True)
+        state = tq.plus_state(2)
+        getattr(tq, "apply_" + name)(state, [0, 1], theta).real.sum().backward()
+        assert theta.grad is not None
+
+
+def test_a_two_body_rotation_takes_a_batched_angle():
+    batch = 3
+    theta = tp.linspace(0.0, 1.0, batch)
+    state = tq.zeros_state(2, batch=batch)
+    out = tq.apply_rzz(state, [0, 1], theta)
+    assert out.shape[0] == batch
+    for index in range(batch):
+        single = tq.apply_rzz(tq.zeros_state(2), [0, 1], theta[index:index + 1])
+        tp.testing.assert_close(
+            out[index:index + 1], single, atol=1e-6, rtol=1e-6
+        )
+
+
+def test_a_pair_mixer_takes_a_batched_angle():
+    # One angle per state is what a trained layer has, so the whole batch has
+    # to turn at once rather than one state at a time.
+    theta = tp.linspace(0.0, 1.0, 3)
+    for mixer in (tq.apply_xx_plus_yy, tq.apply_xx_minus_yy,
+                  tq.apply_single_excitation):
+        states = tq.plus_state(2, batch=3)
+        out = mixer(states, [0, 1], theta)
+        assert out.shape[0] == 3
+        for index in range(3):
+            single = mixer(tq.plus_state(2), [0, 1], theta[index:index + 1])
+            tp.testing.assert_close(out[index:index + 1], single, atol=1e-6, rtol=1e-6)

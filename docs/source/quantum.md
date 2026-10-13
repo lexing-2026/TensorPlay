@@ -89,6 +89,17 @@ count alone, which is what a particle-number-preserving ansatz needs:
 `apply_xx_plus_yy`, `apply_xx_minus_yy` and `apply_single_excitation`, each
 taking the pair of wires and an angle.
 
+Two-body rotations take a pair of wires and an angle the same way:
+`apply_rxx`, `apply_ryy`, `apply_rzz` and `apply_rzx`. Each is
+`exp(-i * angle * P / 2)` for a two-wire Pauli product `P` — `ZZ` is diagonal, so
+it only adds a phase, which is the gate an Ising Hamiltonian is written with. The
+first three treat the pair alike; `apply_rzx` puts `Z` on the wire named first.
+
+```python
+state = tq.apply_rzz(state, [0, 1], 0.4)   # a phase on each basis state
+state = tq.apply_rxx(state, [0, 1], 0.4)   # mixes |01> and |10>
+```
+
 The matching matrix builders are available on their own — `h_matrix`,
 `rot_x_matrix`, `swap_matrix`, `mcx_matrix` and the rest — so a gate can be
 built, inspected, or composed without applying it. `controlled_matrix` wraps any
@@ -360,6 +371,10 @@ in a single pass over the amplitudes.
     tensorplay.quantum.rot_matrix
     tensorplay.quantum.multirz_matrix
     tensorplay.quantum.multirz_eigvals
+    tensorplay.quantum.rxx_matrix
+    tensorplay.quantum.ryy_matrix
+    tensorplay.quantum.rzz_matrix
+    tensorplay.quantum.rzx_matrix
     tensorplay.quantum.globalphase_matrix
     tensorplay.quantum.rccx_matrix
     tensorplay.quantum.dcx_matrix
