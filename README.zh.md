@@ -162,6 +162,7 @@ TensorPlay 是一个面向学习者的深度学习框架：它融合了类 NumPy
 | **stax** | JIT 编译器试验场：静态图捕获与算子融合实验，支持自定义算子的原生下沉 |
 | **tensorplay.nn** | 神经网络构件：`Module`、`Linear`、`Conv2d`、激活函数、损失函数与容器抽象——以及现代 LLM 全家桶：旋转位置编码、分组查询/潜在/压缩稀疏注意力、delta 规则线性注意力、KV 缓存、自回归生成 |
 | **tensorplay.snn** | 原生脉冲神经网络：融合 CPU/CUDA 的 LIF/IF 神经元、15 种 surrogate 梯度、多步 BPTT、脉冲编码器与深度 SNN 层 |
+| **tensorplay.quantum** | 量子模拟：态矢量与密度矩阵、门表电路与变分拟设、测量与采样、噪声信道、Lindblad 主方程与 parameter-shift 梯度 |
 | **tensorplay.optim** | 优化器（SGD、Adam、AdamW），支持学习率调度与权重衰减 |
 | **tensorplay.utils.data** | `Dataset` / `DataLoader`：多 worker 批处理、预取 (prefetch) 与自动打乱 |
 | **tensorplay.library** | 一等公民的自定义算子：注册算子、挂接 fake/meta 与自动微分公式、接入自有 Triton kernel |
@@ -224,6 +225,28 @@ from tensorplay import snn
 
 lif = snn.LIFNode(threshold=1.0, decay=0.5, step_mode="m")
 out = lif(tp.rand(8, 4, 16))   # [8, 4, 16] 脉冲序列，融合 BPTT
+```
+
+### 量子模拟
+
+`tensorplay.quantum` 是面向科研规模寄存器的纯 Python 量子模拟器，底层复用同一套透明、支持自动微分的张量：
+
+- **电路与变分拟设** —— 门表驱动的 `Circuit` 覆盖标准门与多控门，另有 `qft_circuit`、`real_amplitudes`、`efficient_su2` 与 `nlocal_circuit` 可训练变分模板。
+- **态制备与数据装载** —— `zeros_state` / `plus_state` / `basis_state` / `random_state`、经典特征的幅度编码 `encode_state`、`product_state`、`density_mixture` 谱分解、`partial_trace`。
+- **测量** —— 概率、采样、Pauli 期望值、按 qubit-wise commuting 分组的联合估计、读出误差校正，以及 `gen_bitstrings` 计算基标签。
+- **噪声** —— 单比特与多比特 Kraus 信道（`bit_flip`、`phase_flip`、`amplitude_damping`、`depolarizing`，以及任意 `pauli_kraus` 噪声模型），以局部算子方式作用——从不构造信道超算符，噪声率本身可作为可学习参数。
+- **开放系统动力学** —— `Lindbladian`、`mesolve`、`sesolve`、`trotter_evolve`、`matrix_exp_evolve`，以及独立使用的 `dissipator`，用于读取衰减率与稳态。
+- **梯度** —— 变分电路用 `param_shift`；从门角度到噪声率的整条链路都流过自动微分引擎。
+
+```python
+import tensorplay as tp
+from tensorplay import quantum as tq
+
+circuit = tq.nlocal_circuit(4, ["ry", "rz"], reps=2)
+state = circuit(tq.zeros_state(4))                       # 参数化拟设
+hamiltonian = tq.Hamiltonian([(1.0, "ZZII"), (0.5, "XIZI")])
+energy = tq.energy(state, hamiltonian)
+energy.backward()                                        # 一次 VQE 迭代
 ```
 
 ## 安装

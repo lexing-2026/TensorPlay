@@ -163,6 +163,7 @@ At a granular level, TensorPlay consists of the following components:
 | **stax** | JIT compiler playground: static graph capture and operator fusion experiments, including native lowering of custom ops |
 | **tensorplay.nn** | Neural network building blocks: `Module`, `Linear`, `Conv2d`, activations, losses, containers — plus the modern LLM stack: rotary embeddings, grouped-query / latent / compressed-sparse attention, delta-rule linear attention, KV caches, autoregressive generation |
 | **tensorplay.snn** | Native spiking neural networks: fused CPU/CUDA LIF/IF neurons, 15 surrogate gradients, multi-step BPTT, spike encoders and deep-SNN layers |
+| **tensorplay.quantum** | Quantum simulation: statevectors and density matrices, gate-table circuits and variational ansätze, measurements and sampling, noise channels, Lindblad master equations and parameter-shift gradients |
 | **tensorplay.optim** | Optimizers (SGD, Adam, AdamW) with learning-rate scheduling and weight decay |
 | **tensorplay.utils.data** | `Dataset` / `DataLoader` with multi-worker batching, prefetching and shuffling |
 | **tensorplay.library** | First-class custom operators: register ops, attach fake/meta and autograd formulas, bring your own Triton kernels |
@@ -225,6 +226,28 @@ from tensorplay import snn
 
 lif = snn.LIFNode(threshold=1.0, decay=0.5, step_mode="m")
 out = lif(tp.rand(8, 4, 16))   # [8, 4, 16] spike train with fused BPTT
+```
+
+### Quantum Simulation
+
+`tensorplay.quantum` is a pure-Python quantum simulator for research-sized registers, with the same transparent, autograd-compatible tensors underneath:
+
+- **Circuits & ansätze** — a gate-table `Circuit` covering standard and multi-controlled gates, plus `qft_circuit`, `real_amplitudes`, `efficient_su2` and `nlocal_circuit` variational templates with trainable angles.
+- **States & data loading** — `zeros_state` / `plus_state` / `basis_state` / `random_state`, `encode_state` amplitude encoding of classical features, `product_state`, `density_mixture` eigendecomposition, `partial_trace`.
+- **Measurements** — probabilities, shot sampling, Pauli expectation values, qubit-wise-commuting grouped joint estimation, readout-error correction, and `gen_bitstrings` basis labels.
+- **Noise** — single- and multi-qubit Kraus channels (`bit_flip`, `phase_flip`, `amplitude_damping`, `depolarizing`, arbitrary `pauli_kraus` models) applied as local operators — no channel superoperator is ever built, and noise rates can be learned parameters.
+- **Open-system dynamics** — `Lindbladian`, `mesolve`, `sesolve`, `trotter_evolve`, `matrix_exp_evolve`, and a standalone `dissipator` for reading decay rates and steady states.
+- **Gradients** — `param_shift` for variational circuits; everything from gate angles to noise rates flows through the autograd engine.
+
+```python
+import tensorplay as tp
+from tensorplay import quantum as tq
+
+circuit = tq.nlocal_circuit(4, ["ry", "rz"], reps=2)
+state = circuit(tq.zeros_state(4))                       # parameterized ansatz
+hamiltonian = tq.Hamiltonian([(1.0, "ZZII"), (0.5, "XIZI")])
+energy = tq.energy(state, hamiltonian)
+energy.backward()                                        # one VQE step
 ```
 
 ## Installation
