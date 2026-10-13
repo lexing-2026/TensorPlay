@@ -443,6 +443,69 @@ computed. A trained circuit therefore pays for one pass forward and one pass per
 non-identity factor backward, rather than rebuilding a rotated copy of the state
 and threading a graph through it.
 
+### Gradients without a graph
+
+Two situations call for something else. One is a value that is not built out of
+differentiable primitives at all: an energy estimated from a finite number of
+measurements has nothing to backpropagate through. The other is a circuit deep
+enough that backpropagating through every rotation costs more than evaluating
+the whole thing twice.
+
+`sample_energy` answers the first — the Hamiltonian measured with as few
+measurement settings as its terms allow, optionally through a readout matrix so
+the estimate carries the error a device would add:
+
+```python
+value = tq.sample_energy(state, h2, shots=4000)
+```
+
+`param_shift` answers the second, and answers the first too. For a value that
+depends on one angle through `exp(-i θ G)`, the derivative is a difference of
+the value at two displaced angles, and it is exact — independent of how deep the
+circuit is and of what sits in the middle of it, a sampler included:
+
+```python
+def energy(angles):
+    return tq.energy(tq.apply_cnot(
+        tq.apply_ry(tq.apply_ry(tq.zeros_state(2, batch=angles.shape[0]),
+                                0, angles[:, 0]),
+                    1, angles[:, 1]), 0, 1), h2)
+
+angles = tp.tensor([[0.2, -0.4]])
+gradients = tq.param_shift(energy, angles)          # no graph anywhere
+sampled = lambda a: tq.sample_energy(build(a), h2, 2000)
+noisy = tq.param_shift(sampled, angles)             # a value with no graph either
+```
+
+Every angle gate here is a rotation about half a Pauli word, whose eigenvalues
+are `±1/2`, so the default displacement of `π/2` and weight of one half are the
+rule for all of them. A generator whose eigenvalues differ by `ω` instead wants
+`π / (2 ω)` and a weight of `ω / (2 sin(ω shift))`; both are arguments, so the
+rule follows the gate rather than assuming it.
+
+The rule reaches an angle that enters through one rotation and stops there. A
+controlled rotation is not one exponential — where the control is unset its
+generator reads zero — so the value carries half the frequency as well as the
+whole one, and no single displacement reaches both. Those angles want the
+differentiated gradient, which covers them.
+
+### Precision
+
+A register's own dtype is what a whole circuit runs at: a double-precision state
+stays double through every gate, and a single-precision one stays single even
+when a matrix arrives wider. The amplitude a gate produces is only as precise as
+the register holding it, so the place to decide is where the state is built. An
+angle written as a plain number is read in double precision on the way to the
+matrix, which costs nothing and keeps a double-precision register from being fed
+a single-precision matrix.
+
+```python
+wide = tq.zeros_state(2, dtype=tp.complex128)   # this is what decides
+tq.apply_ry(wide, 0, 0.3)                        # double-precision amplitudes
+tq.apply_ry(tq.zeros_state(2), 0, 0.3)          # single, whatever the angle says
+```
+
+
 ## Reference
 
 ```{eval-rst}
@@ -525,6 +588,8 @@ and threading a graph through it.
     tensorplay.quantum.energy
     tensorplay.quantum.trotter_evolve
     tensorplay.quantum.matrix_exp_evolve
+    tensorplay.quantum.param_shift
+    tensorplay.quantum.sample_energy
 ```
 
 ## Where to go next
