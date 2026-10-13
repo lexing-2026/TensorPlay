@@ -976,6 +976,29 @@ Tensor sparse_mul_cpu(const Tensor& self, const Tensor& other) {
     return result_storage;
 }
 
+// Elementwise multiplication of a sparse tensor by a scalar keeps the
+// sparsity pattern and scales the stored values.
+Tensor sparse_mul_scalar_cpu(const Tensor& self, const Scalar& other) {
+    if (!self.is_sparse()) {
+        return self.mul(other);
+    }
+    if (self.is_sparse_csr()) {
+        return Tensor::make_sparse_csr_tensor(
+            self._crow_indices().clone(), self._col_indices().clone(),
+            self._values().mul(other),
+            static_cast<std::vector<int64_t>>(self.shape()));
+    }
+    if (self.is_sparse_csc() || self.is_sparse_bsr() ||
+        self.is_sparse_bsc()) {
+        TP_THROW(NotImplementedError,
+                 "mul.Scalar: this sparse layout is not supported yet");
+    }
+    return Tensor::make_sparse_coo_tensor(
+        self._indices().clone(), self._values().mul(other),
+        static_cast<std::vector<int64_t>>(self.shape()),
+        self.is_coalesced());
+}
+
 // stores ``min(d+M, L)`` entries when ``d <= 0`` and ``min(N, L) - d``
 // otherwise, placed starting at cell ``(max(d,0)-d, max(d,0))``; values are
 // read from row ``j`` of ``diagonals`` beginning at column ``max(d, 0)``.

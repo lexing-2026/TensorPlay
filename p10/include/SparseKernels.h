@@ -41,6 +41,8 @@ Tensor _sparse_addmm_cpu(const Tensor& self, const Tensor& mat1,
 // COO @ COO elementwise product on matching coordinates and coordinate-union
 // addition; both require same dtype/shape and non-hybrid values.
 Tensor sparse_mul_cpu(const Tensor& self, const Tensor& other);
+// Sparse scalar product: keeps the sparsity pattern and scales the values.
+Tensor sparse_mul_scalar_cpu(const Tensor& self, const Scalar& other);
 Tensor sparse_add_cpu(const Tensor& self, const Tensor& other);
 // coalesced COO over the kept dims (duplicates folded); all sparse dims ->
 // dense tensor.  ``dtype`` converts the input first (accumulation dtype).
@@ -142,6 +144,8 @@ Tensor spdiags_cuda(const Tensor& diagonals, const Tensor& offsets,
                     std::optional<int64_t> layout);
 
 Tensor sparse_mul_cuda(const Tensor& self, const Tensor& other);
+// Sparse scalar product: keeps the sparsity pattern and scales the values.
+Tensor sparse_mul_scalar_cuda(const Tensor& self, const Scalar& other);
 Tensor sparse_add_cuda(const Tensor& self, const Tensor& other);
 
 // Sparse COO softmax family.  The sparse-dim variant reduces over pools of

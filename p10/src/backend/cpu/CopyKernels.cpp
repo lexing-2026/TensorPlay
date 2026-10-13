@@ -981,12 +981,14 @@ TENSORPLAY_LIBRARY_IMPL(SparseCPU, CopySparseKernels) {
     // registers under both backends and re-coalesces when given a layout
     // that is already sparse.
     m.impl("to_sparse", to_sparse_coo_cpu);
+    m.impl("to_sparse_csr", to_sparse_csr_cpu);
     m.impl("sparse_mm", sparse_mm_cpu);
     m.impl("_sparse_addmm", _sparse_addmm_cpu);
     m.impl("smm", smm_cpu);
     m.impl("sparse_sum", sparse_sum_cpu);
     m.impl("sparse_add", sparse_add_cpu);
     m.impl("sparse_mul", sparse_mul_cpu);
+    m.impl("mul.Scalar", sparse_mul_scalar_cpu);
     m.impl("_sparse_sum", _sparse_sum_cpu);
     m.impl("_sparse_sum.dtype", _sparse_sum_dtype_cpu);
     m.impl("_sparse_sum.dim", _sparse_sum_dim_cpu_2);
