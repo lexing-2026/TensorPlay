@@ -40,6 +40,9 @@ DECLARE_DISPATCH(quantized_bilinear_fn, quantized_bilinear_stub)
 using quantized_moment_fn = void (*)(const void*, void*, int64_t, int64_t, DType,
     double, int64_t, bool, double);
 DECLARE_DISPATCH(quantized_moment_fn, quantized_moment_stub)
+using quantized_spatial_mean_fn = void (*)(const void*, void*, int64_t, int64_t,
+    int64_t, int64_t, DType, float, int64_t);
+DECLARE_DISPATCH(quantized_spatial_mean_fn, quantized_spatial_mean_stub)
 using quantized_pool_fn = void (*)(const void*, void*, int64_t, int64_t, DType,
     const quant::PoolGeometry&, const quant::PoolWindow*);
 DECLARE_DISPATCH(quantized_pool_fn, quantized_pool_stub)

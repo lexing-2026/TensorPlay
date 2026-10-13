@@ -2,6 +2,8 @@
 
 #include "QuantTensorOperators.h"
 #include "QuantNative.h"
+#include "cpu/QuantizedElementwiseKernels.h"
+#include "Parallel.h"
 #include <algorithm>
 #include <numeric>
 
@@ -162,6 +164,38 @@ Tensor moment(const Tensor& self, const std::vector<int64_t>& dimensions, bool k
 #endif
     }
     if (!standard_deviation) {
+        const auto format = self.dim() == 4 ? MemoryFormat::ChannelsLast : MemoryFormat::ChannelsLast3d;
+        if (self.device().is_cpu() && self.itemsize() == 1 && (self.dim() == 4 || self.dim() == 5) &&
+            dims.size() == static_cast<size_t>(self.dim() - 2) && dims.front() == 2 &&
+            dims.back() == self.dim() - 1 && count > 0 && self.size(0) * self.size(1) > 1 &&
+            self.impl()->is_contiguous_in(format)) {
+            const int64_t batch = self.size(0), channels = self.size(1);
+            std::vector<int64_t> shape{batch, channels};
+            if (keepdim) shape.resize(self.dim(), 1);
+            Tensor result = Tensor::empty(shape, self.dtype(), self.device());
+            result.impl()->set_quantizer(quantizer_of(self));
+            const auto* input = static_cast<const uint8_t*>(self.data_ptr());
+            auto* output = static_cast<uint8_t*>(result.data_ptr());
+            auto run = [&](int64_t b, int64_t begin, int64_t end) {
+                cpu::quantized_spatial_mean_stub(DeviceType::CPU, input + b * count * channels,
+                    output + b * channels, count, channels, begin, end, self.dtype(), static_cast<float>(scale), zp);
+            };
+            const int threads = parallel::get_num_threads();
+            if (self.numel() < 32768 || threads == 1 || parallel::in_parallel_region()) {
+                for (int64_t b = 0; b < batch; ++b) run(b, 0, channels);
+            } else if (batch >= threads || (channels < threads && batch > channels)) {
+                parallel::parallel_for(0, batch, 1, [&](int64_t begin, int64_t end) {
+                    for (int64_t b = begin; b < end; ++b) run(b, 0, channels);
+                });
+            } else {
+                parallel::parallel_for(0, channels, 1, [&](int64_t begin, int64_t end) {
+                    begin -= begin % 32;
+                    if (end != channels) end -= end % 32;
+                    if (begin != end) for (int64_t b = 0; b < batch; ++b) run(b, begin, end);
+                });
+            }
+            return result;
+        }
         const Tensor real = self.dequantize();
         return Tensor::quantize_per_tensor(real.mean(dims, keepdim, dtype), scale, zp, self.dtype());
     }

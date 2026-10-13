@@ -377,6 +377,52 @@ def test_channels_last_activation_prelu_and_moments(device, dtype, zp, rank):
           torch.ops.aten.std.correction(r, [-1], correction=.5, keepdim=True))
 
 
+@pytest.mark.parametrize('dtype,zp', TYPES[:2])
+@pytest.mark.parametrize('threads', [1, 4])
+@pytest.mark.parametrize('scale', [.005, .07, .5, 2.])
+@pytest.mark.parametrize('shape', [(2, 7, 5, 7), (2, 33, 16, 17), (4, 64, 16, 17),
+                                  (2, 129, 17, 19), (2, 64, 4, 16, 17), (2, 7, 257, 257),
+                                  (1, 33, 33, 33, 33)])
+def test_channels_last_spatial_mean_cascade_and_thread_partitions(dtype, zp, threads, scale, shape):
+    rng = np.random.default_rng(914)
+    limits = np.iinfo(dtype)
+    codes = rng.integers(limits.min, limits.max + 1, size=shape, dtype=dtype)
+    fmt = tp.channels_last if len(shape) == 4 else tp.channels_last_3d
+    rfmt = torch.channels_last if len(shape) == 4 else torch.channels_last_3d
+    x = tp._C._make_per_tensor_quantized_tensor(tp.tensor(codes), scale, zp).contiguous(memory_format=fmt)
+    r = torch._make_per_tensor_quantized_tensor(torch.tensor(codes), scale, zp).contiguous(memory_format=rfmt)
+    old, reference_old = tp.get_num_threads(), torch.get_num_threads()
+    try:
+        tp.set_num_threads(threads)
+        torch.set_num_threads(threads)
+        dims = list(range(2, len(shape)))
+        for keepdim in (False, True):
+            actual = tp.ops.tp.mean.dim(x, dims, keepdim)
+            expected = torch.ops.aten.mean.dim(r, dims, keepdim)
+            equal(actual, expected)
+            assert actual.stride() == expected.stride()
+    finally:
+        tp.set_num_threads(old)
+        torch.set_num_threads(reference_old)
+
+
+@pytest.mark.parametrize('threads', [1, 4])
+@pytest.mark.parametrize('channels', [7, 33, 65, 129])
+@pytest.mark.parametrize('dtype,zp', TYPES[:2])
+def test_channels_last_spatial_mean_half_grid_rounding(threads, channels, dtype, zp):
+    codes = np.broadcast_to(np.arange(4096) % 2 + zp - 4, (2, channels, 4096)).astype(dtype).reshape(2, channels, 16, 16, 16)
+    x = tp._C._make_per_tensor_quantized_tensor(tp.tensor(codes), .07, zp).contiguous(memory_format=tp.channels_last_3d)
+    r = torch._make_per_tensor_quantized_tensor(torch.tensor(codes), .07, zp).contiguous(memory_format=torch.channels_last_3d)
+    old, reference_old = tp.get_num_threads(), torch.get_num_threads()
+    try:
+        tp.set_num_threads(threads)
+        torch.set_num_threads(threads)
+        equal(tp.ops.tp.mean.dim(x, [2, 3, 4], False), torch.ops.aten.mean.dim(r, [2, 3, 4], False))
+    finally:
+        tp.set_num_threads(old)
+        torch.set_num_threads(reference_old)
+
+
 @pytest.mark.parametrize('device', DEVICES)
 @pytest.mark.parametrize('dtype,zp', TYPES)
 @pytest.mark.parametrize('rank', [2, 3])

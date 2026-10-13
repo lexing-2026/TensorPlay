@@ -327,10 +327,15 @@ void int4_pack_impl(const int32_t* src, uint8_t* dst, int64_t n, int64_t k) {
 }
 
 template<class T, class X = T, class P = T>
-void int4_mm_codes(const X* x, const uint8_t* packed, const P* params, T* output,
+void int4_mm_codes(const X* __restrict__ x, const uint8_t* __restrict__ packed,
+        const P* __restrict__ params, T* __restrict__ output,
         int64_t m, int64_t n, int64_t k, int64_t group) {
     using FV = vec::Vectorized<float>;
     constexpr int lanes = FV::size(), columns = int4_columns;
+#ifdef CPU_CAPABILITY_AVX512
+    const __m512 lookup = _mm512_setr_ps(-8.f, -7.f, -6.f, -5.f, -4.f, -3.f, -2.f, -1.f,
+                                        0.f, 1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f);
+#endif
     const int64_t nb = (n+columns-1)/columns, mb = (m+3)/4;
     parallel::parallel_for(0, mb*nb, 1, [&](int64_t begin, int64_t end) {
         for (int64_t task = begin; task < end; ++task) {
@@ -381,8 +386,7 @@ void int4_mm_codes(const X* x, const uint8_t* packed, const P* params, T* output
                         const auto* src=packed+first*k/2+feature*width/2+offset;
 #ifdef CPU_CAPABILITY_AVX512
                         auto values=_mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(src)));
-                        values=_mm512_and_si512(_mm512_srli_epi32(values,shift),_mm512_set1_epi32(15));
-                        code_vector=FV(_mm512_cvtepi32_ps(_mm512_sub_epi32(values,_mm512_set1_epi32(8))));
+                        code_vector=FV(_mm512_permutexvar_ps(_mm512_srli_epi32(values,shift),lookup));
 #else
                         auto values=_mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(src)));
                         values=_mm256_and_si256(_mm256_srli_epi32(values,shift),_mm256_set1_epi32(15));
@@ -766,6 +770,108 @@ void pool_channels_last_codes(const void* input, void* output, int64_t first, in
 #pragma GCC push_options
 #pragma GCC optimize ("fp-contract=off")
 #endif
+template<class A, class Load>
+std::array<A, 4> spatial_cascade(int64_t count, Load load) {
+    int power = 0;
+    for (uint64_t n = count > 1 ? static_cast<uint64_t>(count - 1) : 0; n; n >>= 1) ++power;
+    power = std::max(4, power / 4);
+    const int64_t step = int64_t{1} << power;
+    std::array<std::array<A, 4>, 4> sums;
+    for (auto& level : sums) level.fill(A(0.f));
+    int64_t i = 0;
+    for (; i + step <= count;) {
+        for (int64_t j = 0; j < step; ++j, ++i) {
+            #pragma GCC unroll 4
+            for (int row = 0; row < 4; ++row) sums[0][row] = sums[0][row] + load(i, row);
+        }
+        for (int level = 1; level < 4; ++level) {
+            #pragma GCC unroll 4
+            for (int row = 0; row < 4; ++row) {
+                sums[level][row] = sums[level][row] + sums[level - 1][row];
+                sums[level - 1][row] = A(0.f);
+            }
+            if (static_cast<uint64_t>(i) & (static_cast<uint64_t>(step - 1) << (level * power))) break;
+        }
+    }
+    for (; i < count; ++i) {
+        #pragma GCC unroll 4
+        for (int row = 0; row < 4; ++row) sums[0][row] = sums[0][row] + load(i, row);
+    }
+    for (int level = 1; level < 4; ++level) {
+        #pragma GCC unroll 4
+        for (int row = 0; row < 4; ++row) sums[0][row] = sums[0][row] + sums[level][row];
+    }
+    return sums[0];
+}
+
+template<class T>
+void spatial_mean_codes(const void* input, void* output, int64_t count, int64_t channels,
+                        int64_t begin, int64_t end, float scale, int64_t zp) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    using V = vec::Vectorized<float>;
+    using IV = vec::Vectorized<int32_t>;
+    constexpr int lanes = V::size();
+    const auto* x = static_cast<const T*>(input);
+    auto* y = static_cast<T*>(output);
+    const V grid_scale(scale), zero(static_cast<float>(zp)), divisor(static_cast<float>(count)), inverse(1.f / scale);
+    const V lower(static_cast<float>(std::numeric_limits<T>::lowest())), upper(static_cast<float>(std::numeric_limits<T>::max()));
+    auto load = [&](int64_t spatial, int64_t channel) {
+        const T* src = x + spatial * channels + channel;
+#if defined(CPU_CAPABILITY_AVX2) || defined(CPU_CAPABILITY_AVX512)
+        const IV codes = vec::convert_to_int32<T>(src);
+#else
+        alignas(64) int32_t values[IV::size()];
+        for (int lane = 0; lane < lanes; ++lane) values[lane] = src[lane];
+        const IV codes = IV::loadu(values);
+#endif
+        return (vec::convert<float>(codes) - zero) * grid_scale;
+    };
+    auto store = [&](int64_t channel, V total) {
+        alignas(64) float values[lanes];
+        vec::maximum(lower, vec::minimum(upper, ((total / divisor) * inverse + zero).round())).store(values);
+        for (int lane = 0; lane < lanes; ++lane) y[channel + lane] = static_cast<T>(values[lane]);
+    };
+    auto scalar_load = [&](int64_t spatial, int64_t channel) {
+        return (static_cast<float>(x[spatial * channels + channel]) - static_cast<float>(zp)) * scale;
+    };
+    auto scalar_store = [&](int64_t channel, float total) {
+        const float code = std::nearbyint((total / static_cast<float>(count)) * (1.f / scale) + static_cast<float>(zp));
+        y[channel] = static_cast<T>(std::fmax(static_cast<float>(std::numeric_limits<T>::lowest()),
+            std::fmin(static_cast<float>(std::numeric_limits<T>::max()), code)));
+    };
+    int64_t channel = begin;
+    if (end - begin < lanes) {
+        for (; channel + 4 <= end; channel += 4) {
+            const auto totals = spatial_cascade<float>(count, [&](int64_t i, int row) { return scalar_load(i, channel + row); });
+            for (int row = 0; row < 4; ++row) scalar_store(channel + row, totals[row]);
+        }
+    }
+    for (; channel + 4 * lanes <= end; channel += 4 * lanes) {
+        const auto totals = spatial_cascade<V>(count, [&](int64_t i, int row) { return load(i, channel + row * lanes); });
+        for (int row = 0; row < 4; ++row) store(channel + row * lanes, totals[row]);
+    }
+    for (; channel + lanes <= end; channel += lanes) {
+        auto totals = spatial_cascade<V>(count / 4, [&](int64_t i, int row) { return load(i * 4 + row, channel); });
+        for (int64_t i = count / 4 * 4; i < count; ++i) totals[0] = totals[0] + load(i, channel);
+        for (int row = 1; row < 4; ++row) totals[0] = totals[0] + totals[row];
+        store(channel, totals[0]);
+    }
+    for (; channel < end; ++channel) {
+        auto totals = spatial_cascade<float>(count / 4, [&](int64_t i, int row) { return scalar_load(i * 4 + row, channel); });
+        for (int64_t i = count / 4 * 4; i < count; ++i) totals[0] += scalar_load(i, channel);
+        for (int row = 1; row < 4; ++row) totals[0] += totals[row];
+        scalar_store(channel, totals[0]);
+    }
+}
+
+void spatial_mean_impl(const void* input, void* output, int64_t count, int64_t channels,
+                       int64_t begin, int64_t end, DType dtype, float scale, int64_t zp) {
+    if (dtype == DType::QInt8) spatial_mean_codes<int8_t>(input, output, count, channels, begin, end, scale, zp);
+    else spatial_mean_codes<uint8_t>(input, output, count, channels, begin, end, scale, zp);
+}
+
 template<class T>
 void pool_spatial_codes(const void* input, void* output, int64_t first, int64_t last,
                         const quant::PoolGeometry& g, const quant::PoolWindow* windows) {
@@ -1073,6 +1179,7 @@ REGISTER_DISPATCH(quantized_float_prelu_stub, &float_prelu_impl);
 REGISTER_DISPATCH(quantized_sigmoid_stub, &word_activation_codes<false>);
 REGISTER_DISPATCH(quantized_tanh_stub, &word_activation_codes<true>);
 REGISTER_DISPATCH(quantized_moment_stub, &moment_impl);
+REGISTER_DISPATCH(quantized_spatial_mean_stub, &spatial_mean_impl);
 REGISTER_DISPATCH(quantized_pool_stub, &pool_impl);
 REGISTER_DISPATCH(quantized_lookup_stub, &lookup_impl);
 REGISTER_DISPATCH(quantized_binary_stub, &binary_impl);
@@ -1096,6 +1203,7 @@ ALSO_REGISTER_AVX512_DISPATCH(quantized_float_prelu_stub, &float_prelu_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_sigmoid_stub, &word_activation_codes<false>);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_tanh_stub, &word_activation_codes<true>);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_moment_stub, &moment_impl);
+ALSO_REGISTER_AVX512_DISPATCH(quantized_spatial_mean_stub, &spatial_mean_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_pool_stub, &pool_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_lookup_stub, &lookup_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_binary_stub, &binary_impl);

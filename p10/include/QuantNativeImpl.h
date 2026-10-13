@@ -404,6 +404,15 @@ Tensor pool(const Tensor& input, const std::vector<int64_t>& kernel,
     g.channels = input.size(channel_dim);
     g.channel_stride = input.stride(channel_dim);
     g.batch_stride = channel_dim ? input.stride(0) : 0;
+    Tensor source = input;
+#ifndef TP_QUANT_CUDA
+    if (mode == 0 && rank == 3 && input.dim() == 5 && input.itemsize() == 1) {
+        source = input.contiguous(static_cast<int64_t>(MemoryFormat::ChannelsLast3d));
+        g.channel_stride = source.stride(channel_dim);
+        g.batch_stride = source.stride(0);
+        for (int d = 0; d < rank; ++d) g.spatial_strides[d] = source.stride(source.dim() - rank + d);
+    }
+#endif
     Tensor y = output(input, shape, quantized::q_scale(input), g.zp);
     if (g.channels_last) {
         Tensor formatted(y.impl()->storage(), shape, get_channels_last_strides(shape), input.dtype(), 0);
@@ -416,7 +425,7 @@ Tensor pool(const Tensor& input, const std::vector<int64_t>& kernel,
             : g.kernel[0] * g.kernel[1] * g.kernel[2];
         parallel::parallel_for(0, y.numel() / g.channels, std::max<int64_t>(1, 32768 / g.channels / window_work),
             [&](int64_t first, int64_t last) {
-                cpu::quantized_pool_stub(DeviceType::CPU, input.data_ptr(), y.data_ptr(),
+                cpu::quantized_pool_stub(DeviceType::CPU, source.data_ptr(), y.data_ptr(),
                     first, last, input.dtype(), g, nullptr);
             });
     } else if (g.mode != 2 && g.out_size && g.channels) {
@@ -446,7 +455,7 @@ Tensor pool(const Tensor& input, const std::vector<int64_t>& kernel,
             window.inverse = g.mode == 1 && !g.channels_last ? adaptive_inverse : (divisor ? 1.f / divisor : 0.f);
         }
         parallel::parallel_for(0, y.numel() / g.out_size, 1, [&](int64_t first, int64_t last) {
-            cpu::quantized_pool_stub(DeviceType::CPU, input.data_ptr(), y.data_ptr(), first, last,
+            cpu::quantized_pool_stub(DeviceType::CPU, source.data_ptr(), y.data_ptr(), first, last,
                 input.dtype(), g, windows.data());
         });
     } else
