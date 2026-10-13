@@ -688,6 +688,7 @@ vector.
     tensorplay.quantum.dens2bloch
     tensorplay.quantum.sv2bloch
     tensorplay.quantum.density_to_state
+    tensorplay.quantum.density_mixture
     tensorplay.quantum.state_from_counts
     tensorplay.quantum.partial_trace
     tensorplay.quantum.probs

@@ -415,3 +415,54 @@ def test_reset_keeps_the_state_normalized_and_is_idempotent():
 def test_reset_rejects_an_out_of_range_wire():
     with pytest.raises(IndexError):
         tq.apply_reset(tq.zeros_state(1), 5)
+
+
+def test_density_mixture_of_a_pure_state_is_a_single_pair():
+    pure = tq.to_density(tq.apply_h(tq.zeros_state(1, dtype=tp.complex128), 0))
+    mixture = tq.density_mixture(pure)
+    assert len(mixture) == 1 and len(mixture[0]) == 1
+    weight, state = mixture[0][0]
+    tp.testing.assert_close(tp.tensor([weight], dtype=tp.float64), tp.tensor([1.0], dtype=tp.float64),
+                              atol=1e-12, rtol=1e-12)
+    tp.testing.assert_close(state, tq.apply_h(tq.zeros_state(1, dtype=tp.complex128), 0),
+                            atol=1e-12, rtol=1e-12)
+
+
+def test_density_mixture_reconstructs_the_density_matrix():
+    rho = 0.6 * tq.to_density(tq.zeros_state(1, dtype=tp.complex128)) + \
+        0.4 * tq.to_density(tq.basis_state(1, 1, dtype=tp.complex128))
+    mixture = tq.density_mixture(rho)[0]
+    rebuilt = None
+    for weight, state in mixture:
+        term = weight * tq.to_density(state)
+        rebuilt = term if rebuilt is None else rebuilt + term
+    tp.testing.assert_close(rebuilt, rho, atol=1e-12, rtol=1e-12)
+
+
+def test_density_mixture_orders_by_descending_weight():
+    rho = 0.3 * tq.to_density(tq.zeros_state(1, dtype=tp.complex128)) + \
+        0.7 * tq.to_density(tq.basis_state(1, 1, dtype=tp.complex128))
+    mixture = tq.density_mixture(rho)[0]
+    weights = [weight for weight, _ in mixture]
+    assert weights == sorted(weights, reverse=True)
+    assert len(weights) == 2
+
+
+def test_density_mixture_handles_a_batch_and_filters_by_atol():
+    pure = tq.to_density(tq.zeros_state(1, dtype=tp.complex128))
+    mixed = 0.5 * tq.to_density(tq.zeros_state(1, dtype=tp.complex128)) + \
+        0.5 * tq.to_density(tq.basis_state(1, 1, dtype=tp.complex128))
+    mixtures = tq.density_mixture(tp.stack([pure[0], mixed[0]]))
+    assert len(mixtures) == 2
+    assert [len(entry) for entry in mixtures] == [1, 2]
+    noisy = 0.999 * tq.to_density(tq.zeros_state(1, dtype=tp.complex128)) + \
+        0.001 * tq.to_density(tq.basis_state(1, 1, dtype=tp.complex128))
+    assert len(tq.density_mixture(noisy, atol=0.01)[0]) == 1
+    assert len(tq.density_mixture(noisy, atol=1e-12)[0]) == 2
+
+
+def test_density_mixture_rejects_a_malformed_density():
+    with pytest.raises(ValueError):
+        tq.density_mixture(tp.ones((2, 2)))
+    with pytest.raises(ValueError):
+        tq.density_mixture(tp.ones((1, 3, 3)))

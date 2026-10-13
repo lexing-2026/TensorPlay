@@ -26,6 +26,7 @@ __all__ = [
     "bloch2dens",
     "bloch2sv",
     "dens2bloch",
+    "density_mixture",
     "density_to_state",
     "fidelity",
     "flatten",
@@ -392,6 +393,48 @@ def density_to_state(density: tp.Tensor, n_qubits: Optional[int] = None) -> tp.T
     selector = (position == index).to(eigenvectors.dtype)
     flat = (selector * eigenvectors).sum(dim=-1)
     return normalize(unflatten(flat, n_qubits))
+
+
+def density_mixture(density: tp.Tensor, atol: float = 1e-10):
+    """The eigenstates of each density matrix, as ``(weight, state)`` pairs.
+
+    A mixed state is a probability mixture of pure states, and its eigenstates
+    are one such mixture -- the one a measurement in the eigenbasis would
+    prepare.  Each pair carries the probability (the eigenvalue) and the
+    normalized state, ordered from the most to the least probable; pairs whose
+    weight is no more than ``atol`` are left out.
+
+    Args:
+        density: shaped ``[batch, 2**n, 2**n]``.
+        atol: the smallest weight a pair may carry.
+
+    Returns:
+        A list per batch entry of ``(weight, state)`` pairs; each state is
+        shaped ``[1, 2, 2, ...]``.
+    """
+    if density.dim() != 3 or density.shape[-1] != density.shape[-2]:
+        raise ValueError(
+            f"a density matrix is [batch, 2**n, 2**n], got {tuple(density.shape)}"
+        )
+    batch, dim, _ = density.shape
+    if dim <= 0 or (dim & (dim - 1)) != 0:
+        raise ValueError(f"{dim} does not describe a whole number of qubits")
+    n_qubits = dim.bit_length() - 1
+    eigenvalues, eigenvectors = tp.linalg.eigh(density)
+    # eigh sorts ascending, so the dominant eigenpair is the last column; the
+    # flip puts it first without gathering.
+    eigenvalues = eigenvalues.flip(-1)
+    eigenvectors = eigenvectors.flip(-1)
+    mixtures = []
+    for entry in range(batch):
+        pairs = []
+        for index in range(dim):
+            weight = float(eigenvalues[entry, index].real)
+            if weight > atol:
+                vector = eigenvectors[entry, :, index].reshape(1, dim)
+                pairs.append((weight, unflatten(vector, n_qubits)))
+        mixtures.append(pairs)
+    return mixtures
 
 
 def _density_width(density: tp.Tensor) -> int:
