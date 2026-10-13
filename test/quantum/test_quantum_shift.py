@@ -299,3 +299,55 @@ def test_a_parameter_block_of_one_column_reads_as_one_angle():
         angles.grad.reshape(-1).tolist(),
     ):
         assert abs(got - want) < 1e-5
+
+
+# ---------------------------------------------------------------------------
+# The same experiment, read every way the module offers it
+# ---------------------------------------------------------------------------
+
+
+def _bell_like():
+    bell = tq.apply_cnot(tq.apply_h(tq.zeros_state(2, dtype=tp.complex128), 0), 0, 1)
+    return tq.apply_ry(bell, 1, 0.6)
+
+
+def test_the_sampled_energy_is_the_exact_one_at_every_shot_count():
+    # The value comes from sampling a distribution whose mean is the energy, so
+    # the distance to the exact answer has to shrink as the square root of the
+    # shots -- and a wrong grouping would leave it flat.
+    state = _bell_like()
+    exact = float(tq.energy(state, H2)[0])
+    errors = []
+    for shots in (2_000, 32_000):
+        estimates = [float(tq.sample_energy(state, H2, shots)[0]) for _ in range(120)]
+        errors.append(statistics.fmean(abs(value - exact) for value in estimates))
+    # Four times the shots is half the noise; the margin asks for three quarters
+    # of that, which holds on a bad day and still fails if the noise did not move.
+    assert errors[1] < errors[0] * 0.75, errors
+
+
+def test_a_readout_that_lies_moves_the_estimate_the_way_it_lies():
+    # A readout matrix biases each reported bit, so the estimate of the energy
+    # moves by the bias times what the state contributes -- which is not zero,
+    # and not the same amount for every term.
+    state = _bell_like()
+    exact = float(tq.energy(state, H2)[0])
+    shots = 200_000
+    honest = float(tq.sample_energy(state, H2, shots)[0])
+    readout = tp.tensor([[0.97, 0.03], [0.06, 0.94]], dtype=tp.float64)
+    biased = float(tq.sample_energy(state, H2, shots, readout=readout)[0])
+    assert abs(honest - exact) < 1e-3, honest
+    assert abs(biased - exact) > 1e-3, (biased, exact)
+    # The two disagree by much more than the shot noise, and in the direction the
+    # readout pushes: it reports a zero more often than there is one.
+    assert biased > honest, (biased, honest)
+
+
+def test_the_sampled_energy_and_the_density_route_agree():
+    # One answer, two routes: from amplitudes and from the matrix an
+    # open-system run works with.
+    state = _bell_like()
+    density = tq.to_density(state)
+    tp.testing.assert_close(
+        tq.energy_from_density(density, H2), tq.energy(state, H2), atol=1e-12, rtol=1e-12
+    )

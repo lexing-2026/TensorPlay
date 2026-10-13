@@ -319,6 +319,47 @@ def test_a_wider_jump_damps_the_wire_it_names_and_no_other():
     tp.testing.assert_close(out, exact, atol=1e-12, rtol=1e-12)
 
 
+def test_the_reported_observables_are_the_ones_the_reported_matrices_carry():
+    # A trajectory hands back a matrix at each time and a reading at each time.
+    # The two have to be the same reading: reporting a value from somewhere else,
+    # or from a neighbouring time, would be a plausible-looking number that no
+    # measurement could reproduce.
+    generator = Lindbladian(
+        tq.Hamiltonian([(1.0, "ZI"), (0.7, "XX")]),
+        [("ZI", 0.4)],
+        **WIDE,
+    )
+    rho = tq.to_density(tq.plus_state(2, dtype=tp.complex128))
+    words = ["ZZ", "IZ", "IX"]
+    states, values = generator.trajectory(rho, 2.0, n_sample=4, observables=words)
+    assert len(states) == len(values) == 4
+    for index, reported in enumerate(values):
+        for row, word in enumerate(words):
+            tp.testing.assert_close(
+                reported[row],
+                tq.expectation_from_density(states[index], word),
+                atol=1e-12,
+                rtol=1e-12,
+            )
+        assert abs(complex(tp.trace(states[index][0])).real - 1.0) < 1e-12
+
+
+def test_both_integrators_answer_the_same_noisy_run():
+    # Two routes over the same span, on a generator that damps as it turns: a
+    # route that lost track of the rate would drift off the other one, and the
+    # trace would be the first place it showed.
+    generator = Lindbladian(
+        tq.Hamiltonian([(1.0, "XI"), (-0.6, "ZZ")]),
+        [("ZI", 0.5), ("XI", 0.2)],
+        **WIDE,
+    )
+    rho = tq.to_density(tq.plus_state(2, dtype=tp.complex128))
+    by_series = generator.evolve(rho, 2.0, method="taylor")
+    by_steps = generator.evolve(rho, 2.0, method="rk4", n_step=600)
+    tp.testing.assert_close(by_series, by_steps, atol=1e-9, rtol=1e-9)
+    assert abs(complex(tp.trace(by_series[0])).real - 1.0) < 1e-12
+
+
 def test_a_hamiltonian_oscillates_at_the_rate_it_should():
     # Under -i [w X, rho] the expectation of Z of |0> swings as cos(2 w t).
     n_qubits = 1
