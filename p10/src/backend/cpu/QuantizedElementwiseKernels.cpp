@@ -751,6 +751,43 @@ void prelu_impl(const void* x, const void* w, void* y, int64_t size, bool scalar
     }
 }
 
+template<class T>
+void float_prelu_codes(const void* input, const float* weight, uint8_t* y, int64_t size,
+                      bool scalar_weight, int64_t zp, float scale, float inverse, int64_t output_zp) {
+    using V = vec::Vectorized<float>;
+    const auto* x = static_cast<const T*>(input);
+    const V multiplier(scale), inv(inverse), zero(0.f), offset(static_cast<float>(output_zp));
+    int64_t i = 0;
+    for (; i + V::size() <= size; i += V::size()) {
+        alignas(64) float values[V::size()], result[V::size()];
+        for (int lane = 0; lane < V::size(); ++lane)
+            values[lane] = static_cast<float>(static_cast<int64_t>(x[i + lane]) - zp);
+        const V input_value = V::loadu(values) * multiplier;
+        const V slope = scalar_weight ? V(weight[0]) : V::loadu(weight + i);
+        const V value = V::blendv(input_value * slope, input_value, input_value > zero);
+        const V rounded = (value * inv + offset).round();
+        V::blendv(vec::minimum(V(255.f), vec::maximum(zero, rounded)), V(255.f),
+                  rounded != rounded).store(result);
+        for (int lane = 0; lane < V::size(); ++lane) y[i + lane] = static_cast<uint8_t>(result[lane]);
+    }
+    for (; i < size; ++i) {
+        const float real = static_cast<float>(static_cast<int64_t>(x[i]) - zp) * scale;
+        const float value = real > 0.f ? real : real * weight[scalar_weight ? 0 : i];
+        y[i] = static_cast<uint8_t>(std::fmax(0.f, std::fmin(255.f,
+            std::nearbyint(value * inverse + static_cast<float>(output_zp)))));
+    }
+}
+
+void float_prelu_impl(const void* x, const float* w, uint8_t* y, int64_t size,
+                      bool scalar_weight, DType dtype, int64_t zp, float scale, float inverse, int64_t output_zp) {
+    switch (dtype) {
+        case DType::QInt8: float_prelu_codes<int8_t>(x,w,y,size,scalar_weight,zp,scale,inverse,output_zp); break;
+        case DType::QUInt8: float_prelu_codes<uint8_t>(x,w,y,size,scalar_weight,zp,scale,inverse,output_zp); break;
+        case DType::QInt32: float_prelu_codes<int32_t>(x,w,y,size,scalar_weight,zp,scale,inverse,output_zp); break;
+        default: break;
+    }
+}
+
 void clip_impl(const void* x, void* y, int64_t size, DType dtype, int64_t lo, int64_t hi) {
     switch (dtype) {
         case DType::QInt8: clip<qint8>(x, y, size, lo, hi); break;
@@ -879,6 +916,7 @@ REGISTER_DISPATCH(quantized_batch_norm_stub, &batch_norm_impl);
 REGISTER_DISPATCH(quantized_bilinear_stub, &bilinear_impl);
 REGISTER_DISPATCH(quantized_clip_stub, &clip_impl);
 REGISTER_DISPATCH(quantized_prelu_stub, &prelu_impl);
+REGISTER_DISPATCH(quantized_float_prelu_stub, &float_prelu_impl);
 REGISTER_DISPATCH(quantized_sigmoid_stub, &word_activation_codes<false>);
 REGISTER_DISPATCH(quantized_tanh_stub, &word_activation_codes<true>);
 REGISTER_DISPATCH(quantized_moment_stub, &moment_impl);
@@ -900,6 +938,7 @@ ALSO_REGISTER_AVX512_DISPATCH(quantized_batch_norm_stub, &batch_norm_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_bilinear_stub, &bilinear_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_clip_stub, &clip_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_prelu_stub, &prelu_impl);
+ALSO_REGISTER_AVX512_DISPATCH(quantized_float_prelu_stub, &float_prelu_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_sigmoid_stub, &word_activation_codes<false>);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_tanh_stub, &word_activation_codes<true>);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_moment_stub, &moment_impl);

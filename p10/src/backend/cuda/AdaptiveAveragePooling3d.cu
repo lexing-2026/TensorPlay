@@ -267,6 +267,10 @@ namespace {
 Tensor& adaptive_avg_pool3d_out_cuda(const Tensor& self,
                                      const std::vector<int64_t>& output_size,
                                      Tensor& out) {
+    if (isQuantizedType(self.dtype())) {
+        out = adaptive_avg_pool3d_native_cuda(self, output_size);
+        return out;
+    }
     write_out(out, adaptive_avg_pool3d_native_cuda(self, output_size));
     return out;
 }

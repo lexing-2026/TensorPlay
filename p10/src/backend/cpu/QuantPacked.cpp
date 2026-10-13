@@ -153,6 +153,7 @@ DEFINE_DISPATCH(quantized_batch_norm_stub);
 DEFINE_DISPATCH(quantized_bilinear_stub);
 DEFINE_DISPATCH(quantized_clip_stub);
 DEFINE_DISPATCH(quantized_prelu_stub);
+DEFINE_DISPATCH(quantized_float_prelu_stub);
 DEFINE_DISPATCH(quantized_sigmoid_stub);
 DEFINE_DISPATCH(quantized_tanh_stub);
 DEFINE_DISPATCH(quantized_moment_stub);

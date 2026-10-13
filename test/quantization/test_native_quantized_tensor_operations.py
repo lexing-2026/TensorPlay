@@ -389,9 +389,10 @@ def test_channels_last_pool_output_layout(device, dtype, zp, rank, strided):
 
 
 @pytest.mark.parametrize('device', DEVICES)
-@pytest.mark.parametrize('shape', [(), (2, 4, 2, 2, 2, 2)])
-def test_prelu_scalar_and_high_rank_float_weights(device, shape):
-    x, r = pair(device, shape=shape)
+@pytest.mark.parametrize('shape', [(), (2, 4, 2, 2, 2, 2), (1, 4, 1, 1, 1, 33)])
+@pytest.mark.parametrize('dtype,zp', [('int8', 11), ('uint8', 119), ('int32', 11)])
+def test_prelu_scalar_and_high_rank_float_weights(device, shape, dtype, zp):
+    x, r = pair(device, dtype, zp, shape=shape)
     for count in ([1] if not shape else [1, 4]):
         values = np.linspace(.1, .4, count, dtype='float32')
         w, rw = tp.tensor(values, device=device), torch.tensor(values)

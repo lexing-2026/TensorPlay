@@ -518,10 +518,62 @@ struct PreluCodes {
     }
 };
 
+template<class T>
+struct FloatPreluCodes {
+    const T* x; const float* w; uint8_t* y;
+    int64_t inner, channels, input_zp, output_zp;
+    float scale, inverse; bool scalar_weight;
+    TP_QN_DEVICE void operator()(int64_t i) const {
+        const float real = static_cast<float>(static_cast<int64_t>(x[i]) - input_zp) * scale;
+        const float value = real > 0.f ? real : real * w[scalar_weight ? 0 : i / inner % channels];
+#ifdef TP_QUANT_CUDA
+        const float code = ::nearbyintf(__fadd_rn(__fmul_rn(value, inverse), static_cast<float>(output_zp)));
+#else
+        const float code = ::nearbyintf(value * inverse + static_cast<float>(output_zp));
+#endif
+        y[i] = static_cast<uint8_t>(::fmaxf(0.f, ::fminf(255.f, code)));
+    }
+};
+
 Tensor prelu(const Tensor& input, const Tensor& weight, double scale, int64_t zp) {
     Guard guard(input); validate(input);
-    if (input.dim() < 1 || input.dim() > 5)
-        return Tensor::quantize_per_tensor(input.dequantize().prelu(weight), scale, zp, DType::QUInt8);
+    if (input.dim() < 1 || input.dim() > 5) {
+        TP_CHECK(weight.dtype() == DType::Float32 && input.device() == weight.device(),
+                 "Floating slopes must have Float32 dtype and share the input device");
+        TP_CHECK(weight.dim() <= 1, "Floating slopes must be scalar or one dimensional");
+        const int64_t channels = input.dim() > 1 ? input.size(1) : 1;
+        TP_CHECK(weight.numel() == 1 || (input.dim() > 0 && weight.numel() == channels),
+                 "Slope count must be one or match the input channels");
+        Tensor x = input.contiguous(), w = weight.contiguous();
+        Tensor y = Tensor::empty(input.sizes().vec(), DType::QUInt8, input.device());
+        y.impl()->set_quantizer(make_per_tensor_affine_quantizer(scale, zp, DType::QUInt8));
+        int64_t inner = 1;
+        for (int d = 2; d < input.dim(); ++d) inner *= input.size(d);
+        const float input_scale = quantized::q_scale(input), inverse = 1.f / static_cast<float>(scale);
+        const int64_t input_zp = quantized::q_zero_point(input);
+        codes(input.dtype(), [&]<class T>() {
+#ifndef TP_QUANT_CUDA
+            if (weight.numel() == 1) {
+                parallel::parallel_for(0, y.numel(), 32768, [&](int64_t first, int64_t last) {
+                    cpu::quantized_float_prelu_stub(DeviceType::CPU, x.data_ptr<T>() + first,
+                        w.data_ptr<float>(), y.data_ptr<uint8_t>() + first, last - first, true,
+                        input.dtype(), input_zp, input_scale, inverse, zp);
+                });
+            } else if (inner) {
+                parallel::parallel_for(0, y.numel() / inner, 1, [&](int64_t first, int64_t last) {
+                    for (int64_t row = first; row < last; ++row)
+                        cpu::quantized_float_prelu_stub(DeviceType::CPU, x.data_ptr<T>() + row * inner,
+                            w.data_ptr<float>() + row % channels, y.data_ptr<uint8_t>() + row * inner,
+                            inner, true, input.dtype(), input_zp, input_scale, inverse, zp);
+                });
+            }
+#else
+            apply(y.numel(), FloatPreluCodes<T>{x.data_ptr<T>(), w.data_ptr<float>(), y.data_ptr<uint8_t>(),
+                inner, channels, input_zp, zp, input_scale, inverse, weight.numel() == 1});
+#endif
+        });
+        return y;
+    }
     validate(weight);
     TP_CHECK(input.dim() > 0, "Parametric rectification requires nonscalar input");
     TP_CHECK(input.dtype() == weight.dtype() && input.device() == weight.device(), "Input and slope must share dtype and device");
