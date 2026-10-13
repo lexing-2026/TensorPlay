@@ -577,6 +577,25 @@ tq.apply_ry(tq.zeros_state(2), 0, 0.3)          # single, whatever the angle say
 ```
 
 
+### One qubit as a point in the ball
+
+A single qubit is a point of the unit ball, and reading a simulation off in
+those coordinates is what makes a comparison readable: the distance between two
+states is the angle between their vectors, a mixed state is inside rather than
+on, and a fit lands somewhere you can look at.
+
+```python
+vector = tq.sv2bloch(state)          # (x, y, z), real, per batch entry
+tq.dens2bloch(density)               # the same reading off a mixed state
+tq.bloch2dens(vector)                # back to the matrix it names
+tq.bloch2sv(vector)                  # and the state, when there is one
+```
+
+A normalized state is on the surface; how far inside a mixed one sits says how
+mixed it is, being twice the larger eigenvalue less one. The reading is real
+whatever the state's own precision, and the reverse is exact for a mixed
+vector.
+
 ## Reference
 
 ```{eval-rst}
@@ -629,6 +648,10 @@ tq.apply_ry(tq.zeros_state(2), 0, 0.3)          # single, whatever the angle say
     tensorplay.quantum.inner
     tensorplay.quantum.fidelity
     tensorplay.quantum.to_density
+    tensorplay.quantum.bloch2dens
+    tensorplay.quantum.bloch2sv
+    tensorplay.quantum.dens2bloch
+    tensorplay.quantum.sv2bloch
     tensorplay.quantum.density_to_state
     tensorplay.quantum.partial_trace
     tensorplay.quantum.probs

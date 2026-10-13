@@ -11,10 +11,14 @@ from typing import Optional, Sequence
 
 import tensorplay as tp
 
+from ._gates import _as_complex, pauli_matrix
 from ._helpers import DEFAULT_C_DTYPE, promoted_c_dtype, state_shape
 
 __all__ = [
     "basis_state",
+    "bloch2dens",
+    "bloch2sv",
+    "dens2bloch",
     "density_to_state",
     "fidelity",
     "flatten",
@@ -27,6 +31,7 @@ __all__ = [
     "product_state",
     "random_state",
     "state_from_bases",
+    "sv2bloch",
     "to_density",
     "unflatten",
     "zeros_state",
@@ -216,6 +221,130 @@ def to_density(state: tp.Tensor) -> tp.Tensor:
     """The density matrix ``|psi><psi|`` of each state in the batch."""
     flat = flatten(state)
     return flat.unsqueeze(-1) * flat.conj().unsqueeze(-2)
+
+
+# ---------------------------------------------------------------------------
+# One qubit as a point in the ball
+#
+# A single qubit is a point of the unit ball, and reading a simulation off in
+# those coordinates is what makes a comparison readable: the distance between
+# two states is the angle between their vectors, a mixed state is inside rather
+# than on, and a tomography fit lands somewhere you can look at.
+# ---------------------------------------------------------------------------
+
+
+def _one_qubit(state: tp.Tensor, what: str) -> tp.Tensor:
+    """The two amplitudes of a one-qubit state, or say why there are not two."""
+    if state.dim() != 2 or state.shape[1] != 2:
+        raise ValueError(
+            f"{what} is one qubit, [batch, 2], got {tuple(state.shape)}"
+        )
+    return state
+
+
+def _three(vector: tp.Tensor, what: str) -> tp.Tensor:
+    """Three components on the last axis, or say why there are not three."""
+    if vector.dim() < 1 or vector.shape[-1] != 3:
+        raise ValueError(
+            f"{what} is [batch, 3], got {tuple(vector.shape)}"
+        )
+    return vector
+
+
+def sv2bloch(state: tp.Tensor) -> tp.Tensor:
+    """The Bloch vector ``(x, y, z)`` of a one-qubit state.
+
+    A normalized state is on the surface of the ball, so its vector is of unit
+    length; the reading is unique up to a global phase, which the ball cannot
+    see.  Batched, and real whatever the state's precision.
+    """
+    amplitudes = _one_qubit(state, "a state")
+    top = amplitudes[:, 0]
+    bottom = amplitudes[:, 1]
+    coherence = top.conj() * bottom
+    polar = tp.real(coherence)
+    imaginary = tp.imag(coherence)
+    return tp.stack(
+        [2.0 * polar, -2.0 * imaginary, tp.real(top.conj() * top - bottom.conj() * bottom)],
+        dim=-1,
+    ).to(dtype=_real_dtype(state))
+
+
+def dens2bloch(density: tp.Tensor) -> tp.Tensor:
+    """The Bloch vector of a one-qubit density matrix.
+
+    A state that is not pure reads as a point inside the ball, and where it sits
+    says how mixed it is: the length is twice the larger eigenvalue less one, so
+    a fully mixed qubit is the origin, a pure one is on the surface, and a state
+    that is three-quarters ``|0><0|`` is a quarter of the way along z.
+    """
+    if density.dim() != 3 or density.shape[-1] != 2 or density.shape[-2] != 2:
+        raise ValueError(
+            f"a density matrix is [batch, 2, 2] for one qubit, got {tuple(density.shape)}"
+        )
+    coherence = density[:, 0, 1]
+    return tp.stack(
+        [
+            2.0 * tp.real(coherence),
+            -2.0 * tp.imag(coherence),
+            tp.real(density[:, 0, 0] - density[:, 1, 1]),
+        ],
+        dim=-1,
+    ).to(dtype=_real_dtype(density))
+
+
+def bloch2sv(vector: tp.Tensor) -> tp.Tensor:
+    """The state a Bloch vector names, the way ``sv2bloch`` reads one.
+
+    The state is the one with a non-negative real amplitude on ``|0>``, which
+    fixes the global phase the ball cannot see.  A vector pointing at
+    ``-z`` lands on ``|1>``, since the formula divides by a length that has
+    gone to zero there.
+    """
+    parts = _three(vector, "a Bloch vector")
+    c_dtype = _complex_dtype(_real_dtype(vector))
+    real = parts.to(dtype=_real_dtype(vector))
+    top = tp.sqrt(tp.clamp((1.0 + real[:, 2]) / 2.0, min=0.0)).reshape(-1, 1)
+    # At the south pole the formula divides by a length that has gone to zero;
+    # there the state is |1>, whose first amplitude is that zero and whose
+    # second is the whole of it.
+    coherence = _as_complex(real[:, 0], real[:, 1], c_dtype).reshape(-1, 1)
+    bottom = tp.where(
+        top > 1e-12, coherence / (2.0 * top + 1e-12), tp.ones_like(top)
+    )
+    amplitudes = tp.stack([top.to(c_dtype), bottom], dim=-1)
+    return amplitudes.squeeze(-2)
+
+
+def bloch2dens(vector: tp.Tensor) -> tp.Tensor:
+    """The density matrix a Bloch vector names, ``(I + r.sigma)/2``.
+
+    Inside the ball this is a mixed state of its own; on the surface it is the
+    pure state ``sv2bloch`` reads back, and the round trip is exact there.
+    """
+    parts = _three(vector, "a Bloch vector")
+    c_dtype = _complex_dtype(_real_dtype(vector))
+    real = parts.to(dtype=_real_dtype(parts))
+    identity = tp.eye(2, dtype=c_dtype, device=parts.device)
+    paulis = [
+        pauli_matrix(letter, device=parts.device, c_dtype=c_dtype)
+        for letter in "XYZ"
+    ]
+    weighted = [
+        real[:, index].to(c_dtype).reshape(-1, 1, 1) * matrix
+        for index, matrix in enumerate(paulis)
+    ]
+    return 0.5 * (identity.unsqueeze(0) + weighted[0] + weighted[1] + weighted[2])
+
+
+def _real_dtype(tensor: tp.Tensor):
+    """The real precision beside a tensor's own."""
+    return tp.float64 if tensor.dtype in (tp.complex128, tp.float64) else tp.float32
+
+
+def _complex_dtype(real: tp.Tensor):
+    """The complex precision that goes with a real one."""
+    return tp.complex128 if real == tp.float64 else tp.complex64
 
 
 def density_to_state(density: tp.Tensor, n_qubits: Optional[int] = None) -> tp.Tensor:

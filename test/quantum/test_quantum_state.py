@@ -241,3 +241,131 @@ def test_a_gate_built_two_ways_agrees_up_to_a_phase():
         atol=1e-6,
         rtol=1e-6,
     )
+
+
+# ---------------------------------------------------------------------------
+# One qubit as a point in the ball
+# ---------------------------------------------------------------------------
+
+
+def test_the_ball_reads_the_four_states_that_fix_the_axes():
+    # |0> and |1> are the poles, |+> the equator along x, and a rotation about X
+    # by a quarter turn is the equator along y -- which is the point where the
+    # imaginary part of the coherence is the whole answer.
+    tp.testing.assert_close(
+        tq.sv2bloch(tq.zeros_state(1, dtype=tp.complex128)),
+        tp.tensor([[0.0, 0.0, 1.0]], dtype=tp.float64),
+        atol=1e-12,
+        rtol=0,
+    )
+    tp.testing.assert_close(
+        tq.sv2bloch(tq.basis_state(1, 1, dtype=tp.complex128)),
+        tp.tensor([[0.0, 0.0, -1.0]], dtype=tp.float64),
+        atol=1e-12,
+        rtol=0,
+    )
+    tp.testing.assert_close(
+        tq.sv2bloch(tq.plus_state(1, dtype=tp.complex128)),
+        tp.tensor([[1.0, 0.0, 0.0]], dtype=tp.float64),
+        atol=1e-12,
+        rtol=0,
+    )
+    quarter = tq.apply_rx(tq.zeros_state(1, dtype=tp.complex128), 0, math.pi / 2)
+    tp.testing.assert_close(
+        tq.sv2bloch(quarter),
+        tp.tensor([[0.0, 1.0, 0.0]], dtype=tp.float64),
+        atol=1e-12,
+        rtol=0,
+    )
+
+
+def test_the_ball_reads_a_general_state_by_its_coherence():
+    # x and y are the real and imaginary parts of the amplitude overlap taken
+    # twice over, and z is the population difference -- worked out here from the
+    # amplitudes themselves, so the reading is held to the definition.
+    state = tq.apply_ry(tq.apply_h(tq.zeros_state(1, dtype=tp.complex128), 0), 0, 0.7)
+    top = complex(state[0, 0])
+    bottom = complex(state[0, 1])
+    overlap = top.conjugate() * bottom
+    tp.testing.assert_close(
+        tq.sv2bloch(state),
+        tp.tensor(
+            [[2 * overlap.real, -2 * overlap.imag, abs(top) ** 2 - abs(bottom) ** 2]],
+            dtype=tp.float64,
+        ),
+        atol=1e-12,
+        rtol=0,
+    )
+    # The density matrix of a state reads the same way: the ball cannot tell the
+    # two routes apart, which is the point of putting them in it.
+    tp.testing.assert_close(
+        tq.dens2bloch(tq.to_density(state)), tq.sv2bloch(state), atol=1e-12, rtol=0
+    )
+
+
+def test_a_mixed_state_sits_inside_the_ball_and_says_by_how_much():
+    # The length of the vector is twice the larger eigenvalue less one, so the
+    # mixture of three-quarters ground and a quarter excited is a quarter of the
+    # way along z and reads back as exactly the mixture it was.
+    density = 0.75 * tq.to_density(tq.zeros_state(1, dtype=tp.complex128)) + 0.25 * (
+        tq.to_density(tq.basis_state(1, 1, dtype=tp.complex128))
+    )
+    vector = tq.dens2bloch(density)
+    tp.testing.assert_close(
+        vector, tp.tensor([[0.0, 0.0, 0.5]], dtype=tp.float64), atol=1e-12, rtol=0
+    )
+    assert abs(float(tp.linalg.vector_norm(vector)) - 0.5) < 1e-12
+    rebuilt = tq.bloch2dens(vector)
+    tp.testing.assert_close(rebuilt, density, atol=1e-12, rtol=1e-12)
+
+
+def test_a_vector_round_trips_through_what_it_names():
+    angles = tp.tensor([0.0, 0.3, 1.1, 2.4], dtype=tp.float64)
+    states = tq.apply_ry(tq.zeros_state(1, batch=4, dtype=tp.complex128), 0, angles)
+    vectors = tq.sv2bloch(states)
+    tp.testing.assert_close(
+        tq.sv2bloch(tq.bloch2sv(vectors)), vectors, atol=1e-11, rtol=1e-11
+    )
+    # And a batch of vectors reads back as a batch of density matrices, which
+    # agree with the density matrices of the states they came from.
+    tp.testing.assert_close(
+        tq.dens2bloch(tq.bloch2dens(vectors)),
+        tq.sv2bloch(states),
+        atol=1e-11,
+        rtol=1e-11,
+    )
+    tp.testing.assert_close(
+        tq.bloch2dens(vectors), tq.to_density(states), atol=1e-11, rtol=1e-11
+    )
+    for length in tp.linalg.vector_norm(vectors, dim=-1).tolist():
+        assert abs(length - 1.0) < 1e-11
+
+
+def test_the_south_pole_is_the_state_the_formula_cannot_reach():
+    # The formula divides by the length of the vector's z component, which is
+    # zero at -z.  There the state is |1>, and saying so is the whole job.
+    south = tp.tensor([[0.0, 0.0, -1.0]], dtype=tp.float64)
+    tp.testing.assert_close(
+        tq.bloch2sv(south)[0],
+        tp.tensor([0.0, 1.0 + 0j], dtype=tp.complex128),
+        atol=1e-12,
+        rtol=0,
+    )
+    tp.testing.assert_close(
+        tq.sv2bloch(tq.bloch2sv(south)), south, atol=1e-12, rtol=0
+    )
+
+
+def test_the_ball_is_a_qubit_and_three_components():
+    with pytest.raises(ValueError):
+        tq.sv2bloch(tq.zeros_state(2))                    # two qubits
+    with pytest.raises(ValueError):
+        tq.sv2bloch(tq.to_density(tq.zeros_state(1)))      # a density, not a state
+    with pytest.raises(ValueError):
+        tq.dens2bloch(tq.to_density(tq.zeros_state(2)))    # two qubits
+    with pytest.raises(ValueError):
+        tq.dens2bloch(tq.zeros_state(1, batch=1))          # a state, not a density
+    with pytest.raises(ValueError):
+        tq.bloch2sv(tp.tensor([[1.0, 0.0]]))              # two components
+    with pytest.raises(ValueError):
+        tq.bloch2dens(tp.tensor([[1.0, 0.0, 0.0, 0.0]]))  # four
