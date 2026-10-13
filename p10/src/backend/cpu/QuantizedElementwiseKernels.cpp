@@ -417,7 +417,7 @@ void int4_mm_codes(const X* x, const uint8_t* packed, const P* params, T* output
                     } else {
                         for (int c=0;c<vectors;c+=2) {
                             const auto values=vec::convert<T,1>(vec::VectorizedN<float,2>(acc[r][c],acc[r][c+1]));
-                            values[0].store(output+(row+r)*n+first+c*lanes);
+                            values.store(output+(row+r)*n+first+c*lanes);
                         }
                     }
                 } else for (int c=0;c<vectors;++c) {
@@ -565,7 +565,7 @@ void clip(const void* input, void* output, int64_t size, int64_t lo, int64_t hi)
     int64_t i = 0;
     if (hi == std::numeric_limits<T>::max()) {
         for (; i + 2 * V::size() <= size; i += 2 * V::size()) {
-            const V first = V::loadu(x + i), second = V::loadu(x + i + V::size());
+            V first = V::loadu(x + i), second = V::loadu(x + i + V::size());
             first.relu(lower).store(y + i);
             second.relu(lower).store(y + i + V::size());
         }
@@ -573,7 +573,7 @@ void clip(const void* input, void* output, int64_t size, int64_t lo, int64_t hi)
         if (i < size) V::loadu(x + i, size - i).relu(lower).store(y + i, size - i);
     } else {
         for (; i + 2 * V::size() <= size; i += 2 * V::size()) {
-            const V first = V::loadu(x + i), second = V::loadu(x + i + V::size());
+            V first = V::loadu(x + i), second = V::loadu(x + i + V::size());
             first.relu6(lower, upper).store(y + i);
             second.relu6(lower, upper).store(y + i + V::size());
         }
@@ -762,9 +762,16 @@ void pool_channels_last_codes(const void* input, void* output, int64_t first, in
     }
 }
 
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC push_options
+#pragma GCC optimize ("fp-contract=off")
+#endif
 template<class T>
 void pool_spatial_codes(const void* input, void* output, int64_t first, int64_t last,
                         const quant::PoolGeometry& g, const quant::PoolWindow* windows) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
     using V = vec::Vectorized<float>;
     const auto* x = static_cast<const T*>(input);
     auto* y = static_cast<T*>(output);
@@ -808,6 +815,9 @@ void pool_spatial_codes(const void* input, void* output, int64_t first, int64_t 
         }
     }
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC pop_options
+#endif
 
 void pool_impl(const void* input, void* output, int64_t first, int64_t last, DType dtype,
                const quant::PoolGeometry& g, const quant::PoolWindow* windows) {
