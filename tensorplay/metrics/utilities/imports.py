@@ -26,7 +26,7 @@ _MATPLOTLIB_AVAILABLE = _module_available("matplotlib")
 _SCIENCEPLOT_AVAILABLE = _module_available("scienceplots")
 _XLA_AVAILABLE = _module_available("torch_xla")
 _TORCHVISION_AVAILABLE = True
-_TORCHAUDIO_AVAILABLE = _module_available("torchaudio")
+_TORCHAUDIO_AVAILABLE = True  # tensorplay.audio is built-in
 _TRANSFORMERS_AVAILABLE = _module_available("transformers")
 _NLTK_AVAILABLE = _module_available("nltk")
 _ROUGE_SCORE_AVAILABLE = _module_available("rouge_score")
@@ -49,3 +49,18 @@ _MECAB_KO_AVAILABLE = _module_available("mecab_ko")
 _MECAB_KO_DIC_AVAILABLE = _module_available("mecab_ko_dic")
 _IPADIC_AVAILABLE = _module_available("ipadic")
 _SENTENCEPIECE_AVAILABLE = _module_available("sentencepiece")
+
+_MULTIPROCESSING_AVAILABLE = True
+_GAMMATONE_AVAILABLE = _module_available("gammatone")
+def _transformers_version_ge(version: str) -> bool:
+    """Check whether the installed transformers package is at least ``version``."""
+    try:
+        import importlib.metadata
+
+        return importlib.metadata.version("transformers") >= version
+    except Exception:
+        return False
+
+
+_TRANSFORMERS_GREATER_EQUAL_5_x = _transformers_version_ge("5.0.0")
+_PIQ_GREATER_EQUAL_0_8 = _module_available("piq")

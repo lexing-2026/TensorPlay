@@ -216,3 +216,26 @@ def _check_retrieval_inputs(
     if not ignore_index:
         return indexes.long(), preds.float(), target.long()
     return indexes.long(), preds.float(), target.long()
+
+
+def _try_proceed_with_timeout(fn: Callable, timeout: int = _DOCTEST_DOWNLOAD_TIMEOUT) -> bool:
+    """Check whether a certain function finishes within a timeout.
+
+    The function is only executed when running inside a doctest context.
+
+    Returns:
+        whether the function finished within the specified timeout.
+    """
+    if multiprocessing.current_process().daemon:
+        # Skip timeout check in daemon processes as they cannot spawn child processes.
+        return True
+
+    proc = multiprocessing.Process(target=fn)
+
+    print(f"Trying to run `{fn.__name__}` for {timeout}s...", file=sys.stderr)
+    proc.start()
+    proc.join(timeout)
+    if not proc.is_alive():
+        return False
+    proc.terminate()
+    return True

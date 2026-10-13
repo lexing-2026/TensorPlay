@@ -36,6 +36,17 @@ from tensorplay.metrics import wrappers
 from tensorplay.metrics import image
 from tensorplay.metrics import text
 from tensorplay.metrics import audio
+from tensorplay.metrics import multimodal
+from tensorplay.metrics import detection
+from tensorplay.metrics.multimodal import (
+    CLIPImageQualityAssessment,
+    CLIPScore,
+    LipVertexError,
+)
+from tensorplay.metrics.detection import (
+    ModifiedPanopticQuality,
+    PanopticQuality,
+)
 from tensorplay.metrics.wrappers import (
     BootStrapper,
     ClasswiseWrapper,
@@ -170,7 +181,12 @@ from tensorplay.metrics.retrieval import (
     RetrievalRecallAtFixedPrecision,
 )
 from tensorplay.metrics.audio import (
+    DeepNoiseSuppressionMeanOpinionScore,
+    NonIntrusiveSpeechQualityAssessment,
+    PerceptualEvaluationSpeechQuality,
     PermutationInvariantTraining,
+    ShortTimeObjectiveIntelligibility,
+    SpeechReverberationModulationEnergyRatio,
     ScaleInvariantSignalDistortionRatio,
     ScaleInvariantSignalNoiseRatio,
     SignalDistortionRatio,
@@ -208,6 +224,9 @@ from tensorplay.metrics.text import (
     WordErrorRate,
     WordInfoLost,
     WordInfoPreserved,
+    BERTScore,
+    InfoLM,
+    SQuAD,
 )
 
 __all__ = [
@@ -564,4 +583,17 @@ __all__ = [
     "Running",
     "RunningMean",
     "RunningSum",
+    "BERTScore",
+    "CLIPImageQualityAssessment",
+    "CLIPScore",
+    "DeepNoiseSuppressionMeanOpinionScore",
+    "InfoLM",
+    "LipVertexError",
+    "ModifiedPanopticQuality",
+    "NonIntrusiveSpeechQualityAssessment",
+    "PanopticQuality",
+    "PerceptualEvaluationSpeechQuality",
+    "ShortTimeObjectiveIntelligibility",
+    "SpeechReverberationModulationEnergyRatio",
+    "SQuAD",
 ]
