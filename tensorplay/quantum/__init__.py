@@ -35,7 +35,16 @@ Example:
     >>> tq.expectation(state, "ZZ")
     tensor([1.])
 """
-from ._circuit import GATE_TABLE, Circuit, expand_to_register, qft_circuit
+from ._circuit import (
+    GATE_TABLE,
+    Circuit,
+    efficient_su2,
+    entanglement_pairs,
+    expand_to_register,
+    nlocal_circuit,
+    qft_circuit,
+    real_amplitudes,
+)
 from ._gates import (
     apply_ccx,
     apply_controlled,
@@ -113,10 +122,14 @@ from ._hamiltonian import (
     trotter_evolve,
 )
 from ._measurement import (
+    apply_measurement_basis,
     apply_pauli_word,
+    commuting_groups,
     counts_from_indices,
     density_probs,
     expectation,
+    expectation_from_counts,
+    joint_expectation,
     marginal_probs,
     measure,
     probs,
@@ -155,7 +168,11 @@ __all__ = [
     "Circuit",
     "GATE_TABLE",
     "expand_to_register",
+    "efficient_su2",
+    "entanglement_pairs",
+    "nlocal_circuit",
     "qft_circuit",
+    "real_amplitudes",
     # state
     "basis_state",
     "density_to_state",
@@ -242,10 +259,14 @@ __all__ = [
     "apply_y",
     "apply_z",
     # measurement
+    "apply_measurement_basis",
     "apply_pauli_word",
+    "commuting_groups",
     "counts_from_indices",
     "density_probs",
     "expectation",
+    "expectation_from_counts",
+    "joint_expectation",
     "marginal_probs",
     "measure",
     "probs",

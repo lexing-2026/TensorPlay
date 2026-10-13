@@ -391,3 +391,100 @@ def test_global_phase_matrix_is_a_scalar_operator():
         atol=1e-6,
         rtol=1e-6,
     )
+
+
+# ---------------------------------------------------------------------------
+# Which wire plays which role
+# ---------------------------------------------------------------------------
+
+
+def _index_of(state):
+    return int(tp.argmax(tq.probs(state).reshape(-1)).reshape(()))
+
+
+def test_a_cnot_names_its_control_where_the_caller_put_it():
+    # |01>: wire 1 holds the one, so a CNOT from wire 1 lands on wire 0.
+    state = tq.apply_x(tq.zeros_state(2), 1)
+    assert _index_of(tq.apply_cnot(state, 1, 0)) == 3
+    assert _index_of(tq.apply_cnot(state, 0, 1)) == 1
+
+
+def test_the_two_directions_of_a_cnot_differ():
+    # |10> is the mirror of |01>, so each direction fires on a different one.
+    state = tq.apply_x(tq.zeros_state(2), 0)
+    assert _index_of(tq.apply_cnot(state, 1, 0)) == 2
+    assert _index_of(tq.apply_cnot(state, 0, 1)) == 3
+
+
+def test_the_control_of_a_controlled_phase_is_where_it_was_named():
+    state = tq.apply_x(tq.zeros_state(2), 0)
+    angle = 0.5
+    # Control wire 1 is clear, so the phase never lands.
+    assert _index_of(tq.apply_cp(state, 1, 0, angle)) == 2
+    # Control wire 0 is set, so |10> picks up the phase and |11> does not.
+    phased = tq.apply_cp(state, 0, 1, angle)
+    probs = tq.probs(phased).reshape(-1)
+    assert probs[2] > 0.99
+    assert probs[3] < 1e-6
+
+
+def test_a_controlled_rotation_turns_the_wire_it_was_named_on():
+    state = tq.apply_x(tq.zeros_state(2), 1)
+    turned = tq.probs(tq.apply_crx(state, 0, 1, math.pi / 2)).reshape(-1)
+    # The control wire is clear, so the target stays put.
+    assert turned[1] > 0.99
+
+
+def test_a_multi_controlled_x_takes_its_target_last():
+    state = tq.basis_state(5, 3)  # |101>: wires 0 and 2 are set, wire 1 is not
+    assert _index_of(tq.apply_mcx(state, [0, 2, 1])) == 7
+    assert _index_of(tq.apply_mcx(state, [0, 1, 2])) == 5
+
+
+def test_a_toffoli_names_its_target_last():
+    # |011>: wires 1 and 2 are set, wire 0 is clear.
+    state = tq.apply_x(tq.apply_x(tq.zeros_state(3), 2), 1)
+    assert _index_of(tq.apply_toffoli(state, 1, 2, 0)) == 7
+    assert _index_of(tq.apply_toffoli(state, 0, 1, 2)) == 3
+    # The two controls are interchangeable -- a gate over the same pair of wires
+    # is the same gate whichever way round they were named.
+    assert _index_of(tq.apply_toffoli(state, 2, 1, 0)) == 7
+
+
+def test_a_fredkin_names_its_control():
+    # |101>: wires 0 and 2 are set, so either naming of the control fires.
+    state = tq.apply_x(tq.apply_x(tq.zeros_state(3), 2), 0)
+    assert _index_of(tq.apply_cswap(state, 2, 0, 1)) == 3  # swaps wires 0 and 1
+    assert _index_of(tq.apply_cswap(state, 0, 1, 2)) == 6  # swaps wires 1 and 2
+
+
+def test_a_gate_matrix_reads_its_bits_in_the_named_order():
+    # A plain controlled-X on (wire 1, wire 0) is the same operator as the
+    # controlled-X on (wire 0, wire 1) with its bits swapped -- which the matrix
+    # path must reproduce.
+    control_high = tq.controlled_matrix(tq.x_matrix())
+    state = tq.apply_x(tq.zeros_state(2), 0)  # |10>
+    # Wire 1 named first means wire 1 is the control, and it is clear here.
+    assert _index_of(tq.apply_gate(state, control_high, [1, 0])) == 2
+    assert _index_of(tq.apply_gate(state, control_high, [0, 1])) == 3
+
+
+def test_an_ascending_wire_list_behaves_as_before():
+    state = tq.apply_x(tq.apply_x(tq.zeros_state(3), 2), 1)  # |011>
+    tp.testing.assert_close(
+        tq.flatten(tq.apply_mcx(state, [0, 1, 2])),
+        tq.flatten(tq.basis_state(3, 3)),  # wire 0 is clear, so nothing happens
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    tp.testing.assert_close(
+        tq.flatten(tq.apply_mcx(state, [1, 2, 0])),
+        tq.flatten(tq.basis_state(7, 3)),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_a_repeated_wire_is_still_refused():
+    with pytest.raises(ValueError):
+        tq.apply_cnot(tq.zeros_state(2), 1, 1)

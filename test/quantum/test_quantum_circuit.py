@@ -201,3 +201,106 @@ def test_circuit_repr_lists_the_gates():
     circuit.cx(0, 1)
     assert "h[0]" in repr(circuit)
     assert "cx[0, 1]" in repr(circuit)
+
+
+# ---------------------------------------------------------------------------
+# Layer templates
+# ---------------------------------------------------------------------------
+
+
+def _names(circuit):
+    return [(name, wires) for name, wires, _ in circuit.gates()]
+
+
+def test_entanglement_pairs_walk_the_register():
+    assert tq.entanglement_pairs(3, "linear") == [(0, 1), (1, 2)]
+    assert tq.entanglement_pairs(3, "reverse_linear") == [(1, 0), (2, 1)]
+
+
+def test_the_circular_pattern_closes_the_ring():
+    assert tq.entanglement_pairs(3, "circular") == [(0, 1), (1, 2), (2, 0)]
+    # A single wire has no edge to close, and a two-wire ring has two directions
+    # through the one edge it has.
+    assert tq.entanglement_pairs(1, "circular") == []
+    assert tq.entanglement_pairs(2, "circular") == [(0, 1), (1, 0)]
+
+
+def test_the_full_pattern_takes_every_pair():
+    assert tq.entanglement_pairs(3, "full") == [(0, 1), (0, 2), (1, 2)]
+
+
+def test_an_unknown_entanglement_pattern_is_rejected():
+    with pytest.raises(ValueError):
+        tq.entanglement_pairs(3, "spiral")
+
+
+def test_real_amplitudes_repeats_rotations_and_pairs():
+    names = _names(tq.real_amplitudes(3, reps=2))
+    assert names == [
+        ("ry", (0,)), ("ry", (1,)), ("ry", (2,)),
+        ("cx", (1, 0)), ("cx", (2, 1)),
+        ("ry", (0,)), ("ry", (1,)), ("ry", (2,)),
+        ("cx", (1, 0)), ("cx", (2, 1)),
+        ("ry", (0,)), ("ry", (1,)), ("ry", (2,)),
+    ]
+
+
+def test_the_closing_rotation_layer_can_be_skipped():
+    names = _names(tq.real_amplitudes(2, reps=1, skip_final_rotation_layer=True))
+    assert names == [("ry", (0,)), ("ry", (1,)), ("cx", (1, 0))]
+
+
+def test_efficient_su2_rotates_about_both_axes():
+    names = _names(tq.efficient_su2(2, reps=1))
+    assert names == [
+        ("ry", (0,)), ("ry", (1,)),
+        ("rz", (0,)), ("rz", (1,)),
+        ("cx", (1, 0)),
+        ("ry", (0,)), ("ry", (1,)),
+        ("rz", (0,)), ("rz", (1,)),
+    ]
+
+
+def test_every_rotation_gets_its_own_angle():
+    circuit = tq.real_amplitudes(3, reps=2)
+    angles = list(circuit.parameters())
+    assert len(angles) == 9  # three wires, two blocks, one closing layer
+    assert all(angle.shape == (1,) for angle in angles)
+
+
+def test_the_angles_arrive_within_a_turn_of_each_other():
+    for angle in tq.real_amplitudes(4, reps=1).parameters():
+        assert float(angle.reshape(())) <= 3.1415927
+        assert float(angle.reshape(())) >= -3.1415927
+
+
+def test_zero_angles_leave_the_start_state_alone():
+    circuit = tq.real_amplitudes(3, reps=2)
+    for angle in circuit.parameters():
+        angle.data = tp.zeros_like(angle)
+    probs = tq.probs(circuit.state()).reshape(-1)
+    tp.testing.assert_close(probs, tp.tensor([1.0] + [0.0] * 7), atol=1e-6, rtol=1e-6)
+
+
+def test_a_real_ansatz_keeps_the_state_real():
+    state = tq.real_amplitudes(3, reps=2).state()
+    assert float(state.imag.abs().max()) == 0.0
+
+
+def test_the_angles_are_trainable():
+    circuit = tq.real_amplitudes(2, reps=1)
+    tq.expectation(circuit.state(), "ZI").backward()
+    for angle in circuit.parameters():
+        assert angle.grad is not None
+
+
+def test_an_ansatz_repeats_at_least_once():
+    with pytest.raises(ValueError):
+        tq.real_amplitudes(2, reps=0)
+
+
+def test_a_custom_rotation_set_drives_the_same_layout():
+    names = _names(tq.nlocal_circuit(2, ("ry", "rz", "p"), reps=1, entanglement="linear"))
+    # Two rotation layers, two wires each.
+    assert [name for name, _ in names].count("p") == 4
+    assert ("cx", (0, 1)) in names  # the linear pattern names the lower wire first

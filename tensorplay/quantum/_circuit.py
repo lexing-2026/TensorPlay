@@ -12,17 +12,29 @@ from typing import Callable, Iterator, List, Optional, Sequence, Tuple
 import tensorplay as tp
 
 from . import _gates as _g
-from ._helpers import DEFAULT_C_DTYPE, check_wires
+from ._helpers import DEFAULT_C_DTYPE, ordered_wires
 from ._state import zeros_state
 
-__all__ = ["Circuit", "GATE_TABLE", "expand_to_register", "qft_circuit"]
+__all__ = [
+    "Circuit",
+    "GATE_TABLE",
+    "efficient_su2",
+    "entanglement_pairs",
+    "expand_to_register",
+    "nlocal_circuit",
+    "qft_circuit",
+    "real_amplitudes",
+]
 
 
 def expand_to_register(mat: tp.Tensor, wires: Sequence[int], n_qubits: int) -> tp.Tensor:
     """Embed a gate matrix into a register-wide unitary on ``n_qubits`` qubits.
 
     The gate is lifted by Kronecker product onto the leading qubits and then
-    permuted onto ``wires``, so the result acts on the whole register.
+    permuted onto ``wires``, so the result acts on the whole register.  The
+    matrix spells its index bits in the order the wires were named, so those
+    bits are first permuted onto ascending order to match where the lifted
+    gate lands.
     """
     target = list(wires)
     if len(target) > n_qubits:
@@ -32,6 +44,18 @@ def expand_to_register(mat: tp.Tensor, wires: Sequence[int], n_qubits: int) -> t
         raise ValueError(
             f"a {side}x{side} matrix does not act on {len(target)} qubit(s)"
         )
+
+    order = [target.index(wire) for wire in sorted(target)]
+    if any(position != source for position, source in enumerate(order)):
+        leading = mat.dim() - 2
+        k = len(target)
+        axes = list(range(leading))
+        axes += [leading + order[bit] for bit in range(k)]
+        axes += [leading + k + order[bit] for bit in range(k)]
+        shape = mat.shape
+        mat = mat.reshape(*([1] * leading), *([2] * (2 * k))).permute(axes).reshape(shape)
+    target = sorted(target)
+
     if len(target) == n_qubits:
         return mat
 
@@ -212,7 +236,7 @@ class Circuit(tp.nn.Module):
                 f"unknown gate {gate!r}; available: {sorted(GATE_TABLE)}"
             )
         entry = GATE_TABLE[key]
-        wires_tuple = tuple(check_wires(wires, self.n_qubits))
+        wires_tuple = tuple(ordered_wires(wires, self.n_qubits))
         if entry.n_wires is not None and len(wires_tuple) != entry.n_wires:
             raise ValueError(
                 f"gate {key!r} acts on {entry.n_wires} qubit(s), got {len(wires_tuple)}"
@@ -443,7 +467,159 @@ def qft_circuit(n_qubits: int, inverse: bool = False) -> Circuit:
     for wire in range(n_qubits):
         circuit.h(wire)
         for partner in range(wire + 1, n_qubits):
-            circuit.add("cp", (partner, wire), 2.0 * math.pi / (1 << (partner - wire + 1)))
+            circuit.add("cp", (wire, partner), 2.0 * math.pi / (1 << (partner - wire + 1)))
     for wire in range(n_qubits // 2):
         circuit.add("swap", (wire, n_qubits - 1 - wire))
     return circuit.inverse() if inverse else circuit
+
+
+_ENTANGLEMENT_PATTERNS = ("linear", "reverse_linear", "circular", "full")
+
+
+def entanglement_pairs(n_qubits: int, pattern: str = "reverse_linear") -> List[Tuple[int, int]]:
+    """The ordered ``(control, target)`` pairs of an entanglement pattern.
+
+    Args:
+        n_qubits: register width.
+        pattern: ``"linear"`` walks up the register, ``"reverse_linear"`` walks
+            down, ``"circular"`` adds the closing pair, and ``"full"`` takes
+            every unordered pair.
+
+    Returns:
+        One pair per two-qubit gate the pattern applies.
+    """
+    if pattern not in _ENTANGLEMENT_PATTERNS:
+        raise ValueError(
+            f"unknown entanglement pattern {pattern!r}; "
+            f"available: {list(_ENTANGLEMENT_PATTERNS)}"
+        )
+    if pattern == "linear":
+        return [(wire, wire + 1) for wire in range(n_qubits - 1)]
+    if pattern == "reverse_linear":
+        return [(wire + 1, wire) for wire in range(n_qubits - 1)]
+    if pattern == "circular":
+        pairs = [(wire, wire + 1) for wire in range(n_qubits - 1)]
+        # The closing pair is only a second direction through an existing edge,
+        # so a single-wire register has nothing to close.
+        return pairs + ([(n_qubits - 1, 0)] if n_qubits > 1 else [])
+    return [(low, high) for low in range(n_qubits) for high in range(low + 1, n_qubits)]
+
+
+def _angle(device) -> tp.Tensor:
+    """One trainable rotation angle, drawn from the half-open range (-pi, pi)."""
+    return tp.nn.Parameter(tp.uniform_(tp.empty(1, device=device), -math.pi, math.pi))
+
+
+def nlocal_circuit(
+    n_qubits: int,
+    rotations: Sequence[str],
+    reps: int = 3,
+    entanglement: str = "reverse_linear",
+    skip_final_rotation_layer: bool = False,
+    *,
+    device=None,
+) -> Circuit:
+    """Repeats a rotation layer and an entanglement layer over a register.
+
+    The layout is the hardware-efficient one: ``reps`` blocks of "rotate every
+    wire, then entangle", followed by one more rotation layer unless it is
+    skipped.  Each rotation gate gets its own trainable angle, so the result is
+    ready to hand to an optimizer.
+
+    Args:
+        n_qubits: register width.
+        rotations: the rotation gates of one layer, in the order they run.
+        reps: how many rotation/entanglement blocks to repeat; at least one.
+        entanglement: the pair pattern from :func:`entanglement_pairs`.
+        skip_final_rotation_layer: leave off the closing rotation layer.
+        device: where the angles are created.
+
+    Returns:
+        The assembled circuit, whose ``parameters()`` are the rotation angles.
+    """
+    circuit = Circuit(n_qubits, device=device)
+    if reps < 1:
+        raise ValueError(f"an ansatz repeats at least once, got {reps}")
+    pairs = entanglement_pairs(n_qubits, entanglement)
+
+    def rotate() -> None:
+        for gate in rotations:
+            for wire in range(n_qubits):
+                circuit.add(gate, wire, _angle(device))
+
+    for _ in range(reps):
+        rotate()
+        for control, target in pairs:
+            circuit.cx(control, target)
+    if not skip_final_rotation_layer:
+        rotate()
+    return circuit
+
+
+def real_amplitudes(
+    n_qubits: int,
+    reps: int = 3,
+    entanglement: str = "reverse_linear",
+    skip_final_rotation_layer: bool = False,
+    *,
+    device=None,
+) -> Circuit:
+    """Y rotations interleaved with CNOT pairs, the variational starting point.
+
+    The state it prepares stays real for real angles, which is why the template
+    uses ``RY`` alone: half the parameters of a general rotation layer would be
+    dead weight.
+
+    Args:
+        n_qubits: register width.
+        reps: how many rotation/entanglement blocks to repeat.
+        entanglement: the pair pattern from :func:`entanglement_pairs`.
+        skip_final_rotation_layer: leave off the closing rotation layer.
+        device: where the angles are created.
+
+    Returns:
+        The assembled circuit, whose ``parameters()`` are the rotation angles.
+    """
+    return nlocal_circuit(
+        n_qubits,
+        ("ry",),
+        reps,
+        entanglement,
+        skip_final_rotation_layer,
+        device=device,
+    )
+
+
+def efficient_su2(
+    n_qubits: int,
+    reps: int = 3,
+    entanglement: str = "reverse_linear",
+    skip_final_rotation_layer: bool = False,
+    *,
+    device=None,
+) -> Circuit:
+    """Y and Z rotations interleaved with CNOT pairs.
+
+    A layer here is every ``RY`` followed by every ``RZ``, so the two rotation
+    types stay in blocks rather than alternating wire by wire.  That gives a
+    state complex enough to reach the ground states the real-only ansatz cannot
+    see, at twice the parameters per layer.
+
+    Args:
+        n_qubits: register width.
+        reps: how many rotation/entanglement blocks to repeat.
+        entanglement: the pair pattern from :func:`entanglement_pairs`.
+        skip_final_rotation_layer: leave off the closing rotation layer.
+        device: where the angles are created.
+
+    Returns:
+        The assembled circuit, whose ``parameters()`` are the rotation angles.
+    """
+    return nlocal_circuit(
+        n_qubits,
+        ("ry", "rz"),
+        reps,
+        entanglement,
+        skip_final_rotation_layer,
+        device=device,
+    )

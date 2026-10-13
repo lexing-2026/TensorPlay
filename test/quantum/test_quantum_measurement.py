@@ -143,3 +143,162 @@ def test_measure_handles_a_batch():
     counts = tq.measure(states, shots=32)
     assert counts.shape == (4, 4)
     tp.testing.assert_close(counts[:, 0], tp.full((4,), 32.0))
+
+
+# ---------------------------------------------------------------------------
+# Reading expectation values back out of a histogram
+# ---------------------------------------------------------------------------
+
+
+def _exact_counts(state, word, shots=1.0):
+    """A histogram carrying the exact distribution of the measurement basis."""
+    rotated = tq.apply_measurement_basis(state, word)
+    wires = [w for w, letter in enumerate(word) if letter != "I"]
+    if not wires:
+        return tq.probs(rotated) * shots
+    return tq.marginal_probs(rotated, wires) * shots
+
+
+def test_expectation_from_counts_reads_back_the_exact_value():
+    state = tq.apply_cnot(tq.apply_h(tq.zeros_state(2), 0), 0, 1)
+    state = tq.apply_ry(state, 1, 0.7)
+    for word in ("ZZ", "XI", "IX", "IZ", "XY", "II"):
+        wires = [w for w, letter in enumerate(word) if letter != "I"]
+        counts = _exact_counts(state, word)
+        tp.testing.assert_close(
+            tq.expectation_from_counts(counts, word, wires or None),
+            tq.expectation(state, word),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+
+def test_a_word_of_one_sign_reads_the_population_odds():
+    # Outcomes 00, 01 and 11: the first wire never came up, the second did half
+    # the time.
+    counts = tp.tensor([[3.0, 1.0, 0.0, 0.0]])
+    tp.testing.assert_close(
+        tq.expectation_from_counts(counts, "ZI"), tp.tensor([1.0]), atol=1e-6, rtol=1e-6
+    )
+    tp.testing.assert_close(
+        tq.expectation_from_counts(counts, "IZ"), tp.tensor([0.5]), atol=1e-6, rtol=1e-6
+    )
+
+
+def test_a_word_reading_two_wires_counts_them_jointly():
+    # Outcomes 00 and 11 only: each wire is up half the time but never alone, so
+    # the pair reads 1 where the single-wire readings multiply to a quarter.
+    counts = tp.tensor([[3.0, 0.0, 0.0, 1.0]])
+    tp.testing.assert_close(
+        tq.expectation_from_counts(counts, "ZI"), tp.tensor([0.5]), atol=1e-6, rtol=1e-6
+    )
+    tp.testing.assert_close(
+        tq.expectation_from_counts(counts, "IZ"), tp.tensor([0.5]), atol=1e-6, rtol=1e-6
+    )
+    tp.testing.assert_close(
+        tq.expectation_from_counts(counts, "ZZ"), tp.tensor([1.0]), atol=1e-6, rtol=1e-6
+    )
+    tp.testing.assert_close(
+        tq.expectation_from_counts(counts, "XI"), tp.tensor([0.5]), atol=1e-6, rtol=1e-6
+    )
+    tp.testing.assert_close(
+        tq.expectation_from_counts(counts, "IX"), tp.tensor([0.5]), atol=1e-6, rtol=1e-6
+    )
+    tp.testing.assert_close(
+        tq.expectation_from_counts(counts, "XX"), tp.tensor([1.0]), atol=1e-6, rtol=1e-6
+    )
+
+
+def test_expectation_from_counts_reads_the_whole_register_by_default():
+    counts = tp.tensor([[2.0, 0.0, 0.0, 0.0]])
+    tp.testing.assert_close(
+        tq.expectation_from_counts(counts, "ZI"), tp.tensor([1.0]), atol=1e-6, rtol=1e-6
+    )
+
+
+def test_expectation_from_counts_needs_one_column_per_wire():
+    counts = tp.tensor([[1.0, 1.0, 1.0, 1.0]])
+    with pytest.raises(ValueError):
+        tq.expectation_from_counts(counts, "ZI", [0])
+
+
+def test_words_that_fit_together_come_out_in_one_group():
+    # Every word here is a sub-word of X on the first wire crossed with X on the
+    # second, so one rotation reads all of them.
+    words = ["XI", "IX", "XX", "II"]
+    groups = tq.commuting_groups(words)
+    assert len(groups) == 1
+    assert sorted(groups[0]) == sorted(words)
+
+
+def test_words_that_disagree_on_a_wire_need_their_own_setting():
+    # X and Z on the same wire cannot come off one histogram.
+    groups = tq.commuting_groups(["XI", "ZI"])
+    assert len(groups) == 2
+
+
+def test_grouping_is_deterministic():
+    words = ["ZI", "XI", "ZZ", "IX", "IZ"]
+    assert tq.commuting_groups(words) == tq.commuting_groups(words)
+
+
+def test_every_member_of_a_group_is_a_sub_word_of_its_product():
+    from tensorplay.quantum._measurement import group_product
+
+    words = ["XI", "IX", "ZI", "ZZ", "IZ", "ZI", "IX"]
+    for group in tq.commuting_groups(words):
+        product = group_product(group)
+        for member in group:
+            for letter, product_letter in zip(member, product):
+                assert letter == "I" or letter == product_letter
+
+
+def test_group_product_of_one_word_is_that_word():
+    from tensorplay.quantum._measurement import group_product
+
+    assert group_product(["XYZ"]) == "XYZ"
+    assert group_product(["XI"]) == "XI"
+
+
+def test_joint_estimation_lands_on_the_exact_values():
+    state = _bell()
+    state = tq.apply_ry(state, 0, 0.6)
+    words = ["ZZ", "XI", "IX", "IZ", "ZI"]
+    estimated = tq.joint_expectation(state, words, shots=100000)
+    assert estimated.shape == (1, len(words))
+    for column, word in enumerate(words):
+        tp.testing.assert_close(
+            estimated[0, column].reshape(()),
+            tq.expectation(state, word).reshape(()),
+            atol=0.05,
+            rtol=0.05,
+        )
+
+
+def test_joint_estimation_of_a_word_reads_it_back():
+    state = tq.apply_ry(tq.zeros_state(2), 1, 0.8)
+    estimated = tq.joint_expectation(state, ["IZ"], shots=20000)
+    tp.testing.assert_close(
+        estimated[0, 0].reshape(()),
+        tq.expectation(state, "IZ").reshape(()),
+        atol=0.05,
+        rtol=0.05,
+    )
+
+
+def test_joint_estimation_over_a_batch():
+    states = tq.apply_cnot(tq.apply_h(tq.zeros_state(2, batch=3), 0), 0, 1)
+    estimated = tq.joint_expectation(states, ["ZZ", "XX"], shots=4096)
+    assert estimated.shape == (3, 2)
+    tp.testing.assert_close(estimated[:, 0], tp.ones(3), atol=0.1, rtol=0)
+    tp.testing.assert_close(estimated[:, 1], tp.ones(3), atol=0.1, rtol=0)
+
+
+def test_joint_estimation_needs_a_word():
+    with pytest.raises(ValueError):
+        tq.joint_expectation(_bell(), [], shots=16)
+
+
+def test_joint_estimation_rejects_a_word_that_does_not_fit():
+    with pytest.raises(ValueError):
+        tq.joint_expectation(tq.zeros_state(1), ["XX"], shots=16)

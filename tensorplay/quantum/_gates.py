@@ -17,7 +17,14 @@ from typing import List, Sequence
 import tensorplay as tp
 
 from . import _native
-from ._helpers import check_pauli_string, check_wires, n_qubits_of, pauli_wires, promoted_c_dtype
+from ._helpers import (
+    check_pauli_string,
+    check_wires,
+    n_qubits_of,
+    ordered_wires,
+    pauli_wires,
+    promoted_c_dtype,
+)
 
 __all__ = [
     "apply_ccx",
@@ -107,13 +114,16 @@ def apply_gate(state: tp.Tensor, mat: tp.Tensor, wires) -> tp.Tensor:
             size 2 per qubit, qubit 0 leading.
         mat: the unitary, shaped ``[2**k, 2**k]``, or ``[batch, 2**k, 2**k]``
             when it carries one matrix per batch entry.
-        wires: the target qubits, ascending; ``k = len(wires)``.
+        wires: the target qubits, in the order the matrix names them: the first
+            index bit of ``mat`` belongs to the first wire listed.  Any order
+            works; ``k = len(wires)``.
 
     Returns:
         The new state, in the layout of the input.
     """
     n_qubits = n_qubits_of(state)
-    target = check_wires(wires, n_qubits)
+    named = ordered_wires(wires, n_qubits)
+    target = sorted(named)
     k = len(target)
 
     if mat.dim() not in (2, 3):
@@ -150,6 +160,20 @@ def apply_gate(state: tp.Tensor, mat: tp.Tensor, wires) -> tp.Tensor:
     mat = mat.to(device=state.device, dtype=c_dtype)
     if state.dtype != c_dtype:
         state = state.to(c_dtype)
+
+    # The matrix spells its index bits in the order the wires were named, while
+    # the gather below walks the targeted dimensions in ascending order.  The
+    # two agree only when the wires already came in ascending, so the matrix
+    # axes are permuted onto that order whenever they differ -- otherwise a
+    # control named on a higher wire would land on the lower one.
+    order = [named.index(wire) for wire in target]
+    if any(position != source for position, source in enumerate(order)):
+        leading = mat.dim() - 2
+        axes = list(range(leading))
+        axes += [leading + order[bit] for bit in range(k)]
+        axes += [leading + k + order[bit] for bit in range(k)]
+        shape = mat.shape
+        mat = mat.reshape(*([1] * leading), *([2] * (2 * k))).permute(axes).reshape(shape)
 
     # Outside a recorded graph the compiled gather does the whole gate in one
     # pass; inside one, the decomposition below carries the gradient.
@@ -856,7 +880,7 @@ def apply_mcx(state, wires, control_values=None):
 
     Every control reads 1 unless ``control_values`` asks for another reading.
     """
-    wires = check_wires(wires, n_qubits_of(state))
+    wires = ordered_wires(wires, n_qubits_of(state))
     return apply_gate(
         state,
         mcx_matrix(

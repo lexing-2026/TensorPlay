@@ -38,6 +38,11 @@ present, so a single state is a valid batch of one.
 Qubit 0 is the most significant bit throughout — in `marginal_probs`, in
 `measure` with a `wires` list, and in the argument index of a Pauli word.
 
+Two-qubit and wider gates read their arguments in the order given: the first
+wire named is the first index bit of the gate matrix, which is what makes the
+control the control. `apply_cnot(state, 1, 0)` drives wire 0 from wire 1, and
+`apply_mcx(state, [0, 2, 1])` uses wires 0 and 2 as controls and flips wire 1.
+
 ## States
 
 ```python
@@ -142,6 +147,30 @@ qc.unitary().shape       # (8, 8) on 3 qubits
 qc.inverse()(qc())       # back to |000>
 ```
 
+### Ansatz templates
+
+Layer templates lay out a trainable circuit instead of hand by hand.
+`nlocal_circuit` is the general form: `reps` blocks of "rotate every wire, then
+entangle", a closing rotation layer, and one trainable angle per rotation gate.
+
+```python
+tq.real_amplitudes(3, reps=2)          # RY rotations and CNOT pairs
+tq.efficient_su2(3, reps=2)            # RY and RZ rotations, CNOT pairs
+tq.nlocal_circuit(3, ("ry", "p"), reps=1, entanglement="circular")
+```
+
+The entanglement pattern is one of `"linear"`, `"reverse_linear"`,
+`"circular"` or `"full"`; `entanglement_pairs(n, pattern)` returns the pairs
+directly. Angles arrive as module parameters in `(-pi, pi)`, so the template
+can go straight to an optimizer:
+
+```python
+qc = tq.real_amplitudes(3, reps=2)
+loss = tq.expectation(qc.state(), "ZI")
+loss.backward()
+len(list(qc.parameters()))            # 9: three wires, two blocks, one closing layer
+```
+
 ## Measurement
 
 `probs` is the squared amplitude of every basis entry — the exact measurement
@@ -167,6 +196,30 @@ counts = tq.measure(state, shots=1024, wires=[0])  # [batch, 2]
 Sampling walks the cumulative distribution with one uniform per shot, so a
 sampled batch never leaves the device. `sample_indices` returns the raw draws
 and `counts_from_indices` tallies them if you want the two steps separately.
+
+### Reading values back out of shots
+
+A Pauli word that touches an `X` or a `Y` wire cannot be read off a plain
+histogram until the wires are turned: `apply_measurement_basis` puts the state
+into the frame where measuring in Z reports each factor's eigenvalue. The
+histogram then averages those signs, which is `expectation_from_counts`.
+
+```python
+readable = tq.apply_measurement_basis(state, "XZ")
+counts = tq.measure(readable, shots=4096, wires=[0, 2])
+tq.expectation_from_counts(counts, "XZ", wires=[0, 2])   # [batch]
+```
+
+Words that agree on every wire where both of them act can share one such
+rotation: each is a sub-word of the group's product, so a single histogram
+reads all of them. `commuting_groups` finds the groups, `joint_expectation`
+runs them and returns one estimate per word — fewer settings means fewer shots
+for the same noise.
+
+```python
+tq.commuting_groups(["XZ", "XI", "ZZ"])   # [['XZ', 'XI'], ['ZZ']]
+tq.joint_expectation(state, ["XZ", "XI", "ZZ"], shots=4096)   # [batch, 3]
+```
 
 ## Noise
 
@@ -267,6 +320,10 @@ in a single pass over the amplitudes.
     tensorplay.quantum.Circuit
     tensorplay.quantum.GATE_TABLE
     tensorplay.quantum.qft_circuit
+    tensorplay.quantum.real_amplitudes
+    tensorplay.quantum.efficient_su2
+    tensorplay.quantum.nlocal_circuit
+    tensorplay.quantum.entanglement_pairs
     tensorplay.quantum.apply_gate
     tensorplay.quantum.controlled_matrix
     tensorplay.quantum.apply_controlled
@@ -296,6 +353,10 @@ in a single pass over the amplitudes.
     tensorplay.quantum.marginal_probs
     tensorplay.quantum.expectation
     tensorplay.quantum.apply_pauli_word
+    tensorplay.quantum.apply_measurement_basis
+    tensorplay.quantum.expectation_from_counts
+    tensorplay.quantum.commuting_groups
+    tensorplay.quantum.joint_expectation
     tensorplay.quantum.sample_indices
     tensorplay.quantum.counts_from_indices
     tensorplay.quantum.measure
