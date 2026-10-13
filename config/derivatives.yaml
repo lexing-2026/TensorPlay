@@ -242,7 +242,7 @@
   result: self_t / other
 
 - name: embedding(Tensor weight, Tensor indices, int padding_idx=-1, bool scale_grad_by_freq=false, bool sparse=false) -> Tensor
-  weight: tensorplay::tpx::ops::embedding_dense_backward(grad, indices, weight.size(0), padding_idx, scale_grad_by_freq)
+  weight: 'sparse ? tensorplay::tpx::ops::embedding_sparse_backward(grad, indices, weight.size(0), padding_idx, scale_grad_by_freq) : tensorplay::tpx::ops::embedding_dense_backward(grad, indices, weight.size(0), padding_idx, scale_grad_by_freq)'
 
 - name: embedding_dense_backward(Tensor grad_output, Tensor indices, SymInt num_weights, SymInt padding_idx, bool scale_grad_by_freq) -> Tensor
   grad_output: embedding_dense_double_backward(grad, indices, num_weights, padding_idx, scale_grad_by_freq)
