@@ -218,6 +218,12 @@ def test_graph_trace_and_gradient_func() -> None:
     eager = Saliency(model).attribute(x, target=1, abs=False)
     assert tensorplay.allclose(grads[0], eager, atol=1e-5)
 
+    # works on plain tensors without requires_grad, and restores state
+    x2 = tensorplay.randn(2, 4)
+    grads2 = graph_gradient_func(model, x2, target_ind=1)
+    assert grads2[0].shape == x2.shape
+    assert not x2.requires_grad
+
 
 def test_convergence_delta_reported() -> None:
     ig = IntegratedGradients(LinearModel())

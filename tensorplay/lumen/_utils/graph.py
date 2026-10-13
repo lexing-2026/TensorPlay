@@ -63,13 +63,28 @@ def graph_gradient_func(
     The forward function is traced into a :class:`GraphModule` on the first
     call; later calls reuse the traced module, skipping re-tracing and making
     the computation introspectable by the graph stack.
-    """
-    from tensorplay.lumen._utils.gradient import compute_gradients
 
-    traced_forward = trace(forward_fn)
-    return compute_gradients(
-        traced_forward,
-        inputs,
-        target_ind=target_ind,
-        additional_forward_args=additional_forward_args,
+    Unlike the low-level ``compute_gradients``, ``requires_grad`` is enabled on
+    the inputs automatically when needed and restored afterwards, so this
+    helper can be used directly on plain tensors.
+    """
+    from tensorplay.lumen._utils.common import _format_tensor_into_tuples
+    from tensorplay.lumen._utils.gradient import (
+        apply_gradient_requirements,
+        compute_gradients,
     )
+
+    inputs_tuple = _format_tensor_into_tuples(inputs)
+    grad_required = apply_gradient_requirements(inputs_tuple)
+    try:
+        traced_forward = trace(forward_fn)
+        grads = compute_gradients(
+            traced_forward,
+            inputs_tuple,
+            target_ind=target_ind,
+            additional_forward_args=additional_forward_args,
+        )
+    finally:
+        for input, required in zip(inputs_tuple, grad_required):
+            input.requires_grad_(required)
+    return grads
