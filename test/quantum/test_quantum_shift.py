@@ -351,3 +351,33 @@ def test_the_sampled_energy_and_the_density_route_agree():
     tp.testing.assert_close(
         tq.energy_from_density(density, H2), tq.energy(state, H2), atol=1e-12, rtol=1e-12
     )
+
+
+def test_the_rule_agrees_on_a_state_that_carries_a_phase():
+    # Every other circuit here starts from |0> and stays real, where an angle is
+    # its own sign and a missing conjugate on the way through would not show.
+    # These start with a phase gate or a rotation about Y, so the amplitudes the
+    # rule displaces are genuinely complex.
+    phases = tq.Hamiltonian(
+        [(-1.0, "II"), (0.4, "ZZ"), (0.25, "YY"), (-0.3, "YX")]
+    )
+
+    def energy(angles):
+        state = tq.zeros_state(2, batch=angles.shape[0], dtype=tp.complex128)
+        state = tq.apply_h(state, 0)
+        state = tq.apply_s(state, 0)
+        state = tq.apply_cnot(state, 0, 1)
+        state = tq.apply_ry(state, 1, angles[:, 0])
+        state = tq.apply_pauli_rotation(state, "YX", angles[:, 1])
+        return tq.energy(state, phases)
+
+    angles = tp.tensor([[0.63, -0.41]], requires_grad=True)
+    energy(angles).sum().backward()
+    differentiated = angles.grad.reshape(-1).tolist()
+    shifted = tq.param_shift(energy, angles).reshape(-1).tolist()
+    for got, want in zip(shifted, differentiated):
+        assert abs(got - want) < 1e-7, (got, want)
+    # The amplitudes really do carry a phase: a state whose y components are zero
+    # would make this test hold for the wrong reason.
+    state = tq.apply_s(tq.apply_h(tq.zeros_state(1, dtype=tp.complex128), 0), 0)
+    assert abs(float(tq.expectation(state, "Y")[0])) > 0.5
