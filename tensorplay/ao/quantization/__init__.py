@@ -128,3 +128,26 @@ from .qconfig import float_qparams_weight_only_qconfig_4bit
 __all__ += ['default_float_qparams_observer_4bit', 'float_qparams_weight_only_qconfig_4bit']
 
 from .qconfig import float16_dynamic_qconfig as float16_dynamic_qconfig
+
+from .bitnet import (
+    BitNetLinear as BitNetLinear,
+    BitNetPacked2bitLinearWeight as BitNetPacked2bitLinearWeight,
+    BitNetTrainingConfig as BitNetTrainingConfig,
+    BitNetTrainingLinearWeight as BitNetTrainingLinearWeight,
+    bitnet_linear as bitnet_linear,
+    bitnet_linear_packed as bitnet_linear_packed,
+    bitnet_training as bitnet_training,
+    precompute_bitnet_scale_for_fsdp as precompute_bitnet_scale_for_fsdp,
+    quantize_ as quantize_,
+)
+__all__ += [
+    "BitNetLinear",
+    "BitNetPacked2bitLinearWeight",
+    "BitNetTrainingConfig",
+    "BitNetTrainingLinearWeight",
+    "bitnet_linear",
+    "bitnet_linear_packed",
+    "bitnet_training",
+    "precompute_bitnet_scale_for_fsdp",
+    "quantize_",
+]
