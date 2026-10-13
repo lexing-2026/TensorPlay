@@ -143,6 +143,7 @@ Tensor relu6_cpu(const Tensor& input) { return rectify_cpu(input, true); }
 namespace tensorplay::cpu {
 DEFINE_DISPATCH(quantized_subbyte_pack_stub);
 DEFINE_DISPATCH(quantized_subbyte_unpack_stub);
+DEFINE_DISPATCH(quantized_unsigned_pack_stub);
 DEFINE_DISPATCH(quantized_dynamic_dot_stub);
 DEFINE_DISPATCH(quantized_dynamic_block_stub);
 DEFINE_DISPATCH(quantized_linear_epilogue_stub);

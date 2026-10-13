@@ -412,11 +412,43 @@ Tensor pool(const Tensor& input, const std::vector<int64_t>& kernel,
 #ifndef TP_QUANT_CUDA
     if (g.channels_last && g.channel_stride == 1 && g.mode != 2 && g.channels > 0 &&
         input.itemsize() == 1 && g.in_size <= INT32_MAX / 255) {
-        parallel::parallel_for(0, y.numel() / g.channels, std::max<int64_t>(1, 32768 / g.channels),
+        const int64_t window_work = g.mode == 1 ? std::max<int64_t>(1, g.in_size / std::max<int64_t>(g.out_size, 1))
+            : g.kernel[0] * g.kernel[1] * g.kernel[2];
+        parallel::parallel_for(0, y.numel() / g.channels, std::max<int64_t>(1, 32768 / g.channels / window_work),
             [&](int64_t first, int64_t last) {
                 cpu::quantized_pool_stub(DeviceType::CPU, input.data_ptr(), y.data_ptr(),
-                    first, last, input.dtype(), g);
+                    first, last, input.dtype(), g, nullptr);
             });
+    } else if (g.mode != 2 && g.out_size && g.channels) {
+        std::vector<PoolWindow> windows(g.out_size);
+        for (int64_t location = 0; location < g.out_size; ++location) {
+            auto& window = windows[location];
+            int64_t p = location, count = 1, valid = 1;
+            float adaptive_inverse = 1.f;
+            for (int d = 2; d >= 0; --d) {
+                const int64_t o = p % g.out[d]; p /= g.out[d];
+                if (g.mode == 1) {
+                    window.start[d] = o * g.in[d] / g.out[d];
+                    window.end[d] = ((o + 1) * g.in[d] + g.out[d] - 1) / g.out[d];
+                } else {
+                    window.start[d] = o * g.stride[d] - g.pad[d];
+                    window.end[d] = window.start[d] + g.kernel[d];
+                    count *= std::min(window.end[d], g.in[d] + g.pad[d]) - window.start[d];
+                    window.start[d] = std::max<int64_t>(window.start[d], 0);
+                    window.end[d] = std::min(window.end[d], g.in[d]);
+                }
+                valid *= window.end[d] - window.start[d];
+            }
+            for (int d = 0; d < 3; ++d)
+                adaptive_inverse /= static_cast<float>(window.end[d] - window.start[d]);
+            window.initial = uint32_t(0) - static_cast<uint32_t>(g.zp) * static_cast<uint32_t>(valid);
+            const int64_t divisor = g.divisor ? g.divisor : (g.mode == 1 || !g.include_pad ? valid : count);
+            window.inverse = g.mode == 1 && !g.channels_last ? adaptive_inverse : (divisor ? 1.f / divisor : 0.f);
+        }
+        parallel::parallel_for(0, y.numel() / g.out_size, 1, [&](int64_t first, int64_t last) {
+            cpu::quantized_pool_stub(DeviceType::CPU, input.data_ptr(), y.data_ptr(), first, last,
+                input.dtype(), g, windows.data());
+        });
     } else
 #endif
         codes(input.dtype(), [&]<class T>() { apply(y.numel(), PoolCodes<T>{input.data_ptr<T>(), y.data_ptr<T>(), g}); });

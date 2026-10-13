@@ -125,6 +125,15 @@ def test_index_sort_flip_and_shuffle_packets(device, dtype, zp):
     a = tp.ops.tp.sort.stable(x, stable=True, dim=-1, descending=True)
     b = torch.ops.aten.sort.stable(r, stable=True, dim=-1, descending=True)
     equal(a[0], b[0]); equal(a[1], b[1])
+    for largest in (False, True):
+        a = tp.ops.tp.topk.default(x, 2, -1, largest, True)
+        b = torch.ops.aten.topk.default(r, 2, -1, largest, True)
+        equal(a[0], b[0]); equal(a[1], b[1])
+    assert tp.ops.tp.equal.default(x, x) == torch.ops.aten.equal.default(r, r)
+    raw = tp.ops.tp.int_repr.default(x)
+    equal(raw, r.int_repr())
+    raw.fill_(0)
+    equal(x, r)
 
 
 @pytest.mark.parametrize('device', DEVICES)

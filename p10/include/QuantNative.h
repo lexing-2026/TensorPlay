@@ -11,6 +11,11 @@ struct PoolGeometry {
     int64_t channels = 1, batch_stride = 0, channel_stride = 0, spatial_strides[3]{};
     bool channels_last = false;
 };
+struct PoolWindow {
+    int64_t start[3]{}, end[3]{};
+    uint32_t initial = 0;
+    float inverse = 0.f;
+};
 
 #define TP_DECLARE_PACKED_RECURRENCE(backend) \
 std::tuple<Tensor,Tensor,Tensor> recurrent_packed_##backend(const Tensor&,const Tensor&, \

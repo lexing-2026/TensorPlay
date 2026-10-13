@@ -16,6 +16,28 @@ inline namespace CPU_CAPABILITY {
 namespace {
 constexpr int int4_columns = vec::Vectorized<float>::size() * 4;
 
+void unsigned_pack_impl(const float* input, uint8_t* output, int64_t size, float scale, int64_t zp) {
+    using V = vec::Vectorized<float>;
+    using QV = vec::Vectorized<quint8>;
+    const float inverse = 1.f / scale;
+    int64_t i = 0;
+#if defined(CPU_CAPABILITY_AVX2) || defined(CPU_CAPABILITY_AVX512)
+    for (; i + QV::size() <= size; i += QV::size()) {
+        typename QV::float_vec_return_type values;
+        for (size_t j = 0; j < values.size(); ++j) values[j] = V::loadu(input + i + j * V::size());
+        QV::quantize(values, scale, static_cast<int32_t>(zp), inverse).store(output + i);
+    }
+#else
+    for (; i + V::size() <= size; i += V::size()) {
+        alignas(64) float values[V::size()];
+        (V::loadu(input + i) * V(inverse)).round().store(values);
+        for (int lane = 0; lane < V::size(); ++lane)
+            output[i + lane] = static_cast<uint8_t>(std::clamp<int64_t>(static_cast<int64_t>(values[lane]) + zp, 0, 255));
+    }
+#endif
+    for (; i < size; ++i) output[i] = quant::encode<uint8_t>(input[i], inverse, zp);
+}
+
 template<int Bits>
 void subbyte_pack(const float* input,uint8_t* output,int64_t size,float inverse,float zp) {
     using V=vec::Vectorized<float>;
@@ -304,8 +326,8 @@ void int4_pack_impl(const int32_t* src, uint8_t* dst, int64_t n, int64_t k) {
     });
 }
 
-template<class T, class X = T>
-void int4_mm_codes(const X* x, const uint8_t* packed, const T* params, T* output,
+template<class T, class X = T, class P = T>
+void int4_mm_codes(const X* x, const uint8_t* packed, const P* params, T* output,
         int64_t m, int64_t n, int64_t k, int64_t group) {
     using FV = vec::Vectorized<float>;
     constexpr int lanes = FV::size(), columns = int4_columns;
@@ -328,11 +350,11 @@ void int4_mm_codes(const X* x, const uint8_t* packed, const T* params, T* output
                         if (c*lanes+lanes<=width) {
                             const int64_t index=(group_index*n+first+c*lanes)*2;
                             FV a,b;
-                            if constexpr (std::is_same_v<T,float>) {
+                            if constexpr (std::is_same_v<P,float>) {
                                 a=FV::loadu(params+index); b=FV::loadu(params+index+lanes);
                             } else {
-                                using TV=vec::Vectorized<T>;
-                                const auto values=vec::convert<float,2>(vec::VectorizedN<T,1>(TV::loadu(params+index)));
+                                using TV=vec::Vectorized<P>;
+                                const auto values=vec::convert<float,2>(vec::VectorizedN<P,1>(TV::loadu(params+index)));
                                 a=values[0]; b=values[1];
                             }
                             std::tie(scales[c],zeros[c])=vec::deinterleave2(a,b);
@@ -388,10 +410,21 @@ void int4_mm_codes(const X* x, const uint8_t* packed, const T* params, T* output
                         acc[r][c]=vec::fmadd(activation[r],weight,acc[r][c]);
                 }
             }
-            for (int r=0;r<rows;++r) for (int c=0;c<vectors;++c) {
-                alignas(64) float values[lanes]; acc[r][c].store(values);
-                for (int lane=0;lane<lanes && c*lanes+lane<width;++lane)
-                    output[(row+r)*n+first+c*lanes+lane]=static_cast<T>(values[lane]);
+            for (int r=0;r<rows;++r) {
+                if constexpr (Full) {
+                    if constexpr (std::is_same_v<T,float>) {
+                        for (int c=0;c<vectors;++c) acc[r][c].store(output+(row+r)*n+first+c*lanes);
+                    } else {
+                        for (int c=0;c<vectors;c+=2) {
+                            const auto values=vec::convert<T,1>(vec::VectorizedN<float,2>(acc[r][c],acc[r][c+1]));
+                            values[0].store(output+(row+r)*n+first+c*lanes);
+                        }
+                    }
+                } else for (int c=0;c<vectors;++c) {
+                    alignas(64) float values[lanes]; acc[r][c].store(values);
+                    for (int lane=0;lane<lanes && c*lanes+lane<width;++lane)
+                        output[(row+r)*n+first+c*lanes+lane]=static_cast<T>(values[lane]);
+                }
             }
             };
             if (active_width==columns) {
@@ -419,7 +452,7 @@ void int4_mm_impl(const void* x, const uint8_t* packed, const void* params, void
             }
             // Convert each activation once, then reuse the full-precision
             // values across output tiles without changing accumulation order.
-            thread_local std::vector<float> real;
+            thread_local std::vector<float> real, coefficients;
             real.resize(m * k);
             using V = vec::Vectorized<BFloat16>;
             int64_t i = 0;
@@ -429,7 +462,17 @@ void int4_mm_impl(const void* x, const uint8_t* packed, const void* params, void
                 values[1].store(real.data() + i + vec::Vectorized<float>::size());
             }
             for (; i < m * k; ++i) real[i] = static_cast<float>(input[i]);
-            int4_mm_codes<BFloat16,float>(real.data(),packed,static_cast<const BFloat16*>(params),
+            const auto* source=static_cast<const BFloat16*>(params);
+            const int64_t coefficient_count=k/group*n*2;
+            coefficients.resize(coefficient_count);
+            i=0;
+            for (;i+V::size()<=coefficient_count;i+=V::size()) {
+                const auto values=vec::convert<float,2>(vec::VectorizedN<BFloat16,1>(V::loadu(source+i)));
+                values[0].store(coefficients.data()+i);
+                values[1].store(coefficients.data()+i+vec::Vectorized<float>::size());
+            }
+            for (;i<coefficient_count;++i) coefficients[i]=static_cast<float>(source[i]);
+            int4_mm_codes<BFloat16,float,float>(real.data(),packed,coefficients.data(),
                 static_cast<BFloat16*>(output),m,n,k,group);
             break;
         }
@@ -521,12 +564,49 @@ void clip(const void* input, void* output, int64_t size, int64_t lo, int64_t hi)
     auto* y = static_cast<T*>(output);
     int64_t i = 0;
     if (hi == std::numeric_limits<T>::max()) {
+        for (; i + 2 * V::size() <= size; i += 2 * V::size()) {
+            const V first = V::loadu(x + i), second = V::loadu(x + i + V::size());
+            first.relu(lower).store(y + i);
+            second.relu(lower).store(y + i + V::size());
+        }
         for (; i + V::size() <= size; i += V::size()) V::loadu(x + i).relu(lower).store(y + i);
         if (i < size) V::loadu(x + i, size - i).relu(lower).store(y + i, size - i);
     } else {
+        for (; i + 2 * V::size() <= size; i += 2 * V::size()) {
+            const V first = V::loadu(x + i), second = V::loadu(x + i + V::size());
+            first.relu6(lower, upper).store(y + i);
+            second.relu6(lower, upper).store(y + i + V::size());
+        }
         for (; i + V::size() <= size; i += V::size()) V::loadu(x + i).relu6(lower, upper).store(y + i);
         if (i < size) V::loadu(x + i, size - i).relu6(lower, upper).store(y + i, size - i);
     }
+}
+
+template<class T>
+int64_t byte_sum(const T* values, int64_t count) {
+    int64_t sum = 0, i = 0;
+#if defined(CPU_CAPABILITY_AVX2) || defined(CPU_CAPABILITY_AVX512)
+    using V = vec::Vectorized<int64_t>;
+    constexpr int bytes = V::size() * 8;
+    V total(0);
+    for (; i + bytes <= count; i += bytes) {
+#ifdef CPU_CAPABILITY_AVX512
+        auto raw = _mm512_loadu_si512(values + i);
+        if constexpr (std::is_signed_v<T>) raw = _mm512_xor_si512(raw, _mm512_set1_epi8(-128));
+        total = total + V(_mm512_sad_epu8(raw, _mm512_setzero_si512()));
+#else
+        auto raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(values + i));
+        if constexpr (std::is_signed_v<T>) raw = _mm256_xor_si256(raw, _mm256_set1_epi8(-128));
+        total = total + V(_mm256_sad_epu8(raw, _mm256_setzero_si256()));
+#endif
+    }
+    alignas(64) int64_t lanes[V::size()];
+    total.store(lanes);
+    for (auto value : lanes) sum += value;
+    if constexpr (std::is_signed_v<T>) sum -= i * 128;
+#endif
+    for (; i < count; ++i) sum += values[i];
+    return sum;
 }
 
 template<class Q>
@@ -540,6 +620,12 @@ void moment_codes(const void* input, void* output, int64_t count, int64_t rows,
     auto* y = static_cast<T*>(output);
     for (int64_t row = 0; row < rows; ++row) {
         const auto* values = x + row * count;
+        if constexpr (sizeof(T) == 1) {
+            if (!deviation) {
+                y[row] = static_cast<T>(std::nearbyint(static_cast<float>(byte_sum(values, count)) / count));
+                continue;
+            }
+        }
         int64_t sum = 0, integer_square_sum = 0;
         double square_sum = 0.;
         int64_t i = 0;
@@ -676,8 +762,64 @@ void pool_channels_last_codes(const void* input, void* output, int64_t first, in
     }
 }
 
+template<class T>
+void pool_spatial_codes(const void* input, void* output, int64_t first, int64_t last,
+                        const quant::PoolGeometry& g, const quant::PoolWindow* windows) {
+    using V = vec::Vectorized<float>;
+    const auto* x = static_cast<const T*>(input);
+    auto* y = static_cast<T*>(output);
+    const bool raw_adaptive = g.mode == 1 && !g.channels_last;
+    const V zero(raw_adaptive ? 0.f : static_cast<float>(g.zp));
+    for (int64_t outer = first; outer < last; ++outer) {
+        const int64_t batch = outer / g.channels, channel = outer % g.channels;
+        const T* row = x + batch * g.batch_stride + channel * g.channel_stride;
+        for (int64_t location = 0; location < g.out_size; location += V::size()) {
+            const int lanes = static_cast<int>(std::min<int64_t>(V::size(), g.out_size - location));
+            alignas(64) float sums[V::size()]{}, inverses[V::size()]{}, result[V::size()];
+            for (int lane = 0; lane < lanes; ++lane) {
+                const auto& window = windows[location + lane];
+                int64_t raw_sum = 0;
+                uint32_t wrapped_sum = window.initial;
+                for (int64_t d = window.start[0]; d < window.end[0]; ++d)
+                    for (int64_t h = window.start[1]; h < window.end[1]; ++h) {
+                        const T* src = row + d * g.spatial_strides[0] + h * g.spatial_strides[1];
+                        for (int64_t w = window.start[2]; w < window.end[2]; ++w) {
+                            const T code = src[w * g.spatial_strides[2]];
+                            if (raw_adaptive) raw_sum += code;
+                            else wrapped_sum += static_cast<uint32_t>(code);
+                        }
+                    }
+                sums[lane] = raw_adaptive ? static_cast<float>(raw_sum)
+                                         : static_cast<float>(static_cast<int32_t>(wrapped_sum));
+                inverses[lane] = window.inverse;
+            }
+            (V::loadu(sums) * V::loadu(inverses) + zero).round().store(result);
+            for (int lane = 0; lane < lanes; ++lane) {
+                const int64_t index = g.channels_last ? (batch * g.out_size + location + lane) * g.channels + channel
+                                                     : outer * g.out_size + location + lane;
+                if (raw_adaptive) {
+                    if constexpr (sizeof(T) == 4)
+                        y[index] = result[lane] >= 0x1p31f || result[lane] < -0x1p31f
+                            ? std::numeric_limits<T>::lowest() : static_cast<T>(result[lane]);
+                    else y[index] = static_cast<T>(result[lane]);
+                } else y[index] = static_cast<T>(std::clamp(static_cast<double>(result[lane]),
+                    static_cast<double>(std::numeric_limits<T>::lowest()), static_cast<double>(std::numeric_limits<T>::max())));
+            }
+        }
+    }
+}
+
 void pool_impl(const void* input, void* output, int64_t first, int64_t last, DType dtype,
-               const quant::PoolGeometry& g) {
+               const quant::PoolGeometry& g, const quant::PoolWindow* windows) {
+    if (windows) {
+        switch (dtype) {
+            case DType::QInt8: pool_spatial_codes<int8_t>(input,output,first,last,g,windows); break;
+            case DType::QUInt8: pool_spatial_codes<uint8_t>(input,output,first,last,g,windows); break;
+            case DType::QInt32: pool_spatial_codes<int32_t>(input,output,first,last,g,windows); break;
+            default: break;
+        }
+        return;
+    }
     if (dtype == DType::QInt8) pool_channels_last_codes<int8_t>(input, output, first, last, g);
     else pool_channels_last_codes<uint8_t>(input, output, first, last, g);
 }
@@ -906,6 +1048,7 @@ void embedding_impl(const uint8_t* w, const int64_t* indices, const int64_t* off
 #ifndef CPU_CAPABILITY_AVX512
 REGISTER_DISPATCH(quantized_subbyte_pack_stub, &subbyte_pack_impl);
 REGISTER_DISPATCH(quantized_subbyte_unpack_stub, &subbyte_unpack_impl);
+REGISTER_DISPATCH(quantized_unsigned_pack_stub, &unsigned_pack_impl);
 REGISTER_DISPATCH(quantized_recurrent_step_stub, &recurrent_step_impl);
 REGISTER_DISPATCH(quantized_dynamic_dot_stub, &dynamic_dot_impl);
 REGISTER_DISPATCH(quantized_dynamic_block_stub, &dynamic_block_impl);
@@ -928,6 +1071,7 @@ REGISTER_DISPATCH(quantized_fp16_linear_stub, &fp16_linear_impl);
 #else
 ALSO_REGISTER_AVX512_DISPATCH(quantized_subbyte_pack_stub, &subbyte_pack_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_subbyte_unpack_stub, &subbyte_unpack_impl);
+ALSO_REGISTER_AVX512_DISPATCH(quantized_unsigned_pack_stub, &unsigned_pack_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_recurrent_step_stub, &recurrent_step_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_dynamic_dot_stub, &dynamic_dot_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_dynamic_block_stub, &dynamic_block_impl);

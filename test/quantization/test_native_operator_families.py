@@ -553,14 +553,15 @@ def test_batch_norm_all_grids_ranks_and_empty(device, dtype, zp, rank, relu, emp
 @pytest.mark.parametrize('dtype', ['float32', 'float16', 'bfloat16'])
 @pytest.mark.parametrize('channels', [16, 32, 48, 64, 80])
 @pytest.mark.parametrize('group', [32, 64, 128, 256])
-def test_native_int4_packed_layout_and_multiply(dtype, channels, group):
+@pytest.mark.parametrize('rows', [1, 5, 8, 33])
+def test_native_int4_packed_layout_and_multiply(dtype, channels, group, rows):
     rng = np.random.default_rng(124)
     features = group*2
     codes = rng.integers(0, 16, size=(channels, features), dtype='int32')
     packed = tp._C._convert_weight_to_int4pack_for_cpu(tp.tensor(codes), 2)
     expected_packed = torch._convert_weight_to_int4pack_for_cpu(torch.tensor(codes), 2)
     np.testing.assert_array_equal(packed.numpy(), expected_packed.numpy())
-    data = rng.normal(0, .2, size=(5, features)).astype('float32')
+    data = rng.normal(0, .2, size=(rows, features)).astype('float32')
     params = rng.uniform(-.05, .05, size=(2, channels, 2)).astype('float32')
     x = tp.tensor(data, dtype=getattr(tp, dtype))
     r = torch.tensor(data, dtype=getattr(torch, dtype))
@@ -677,9 +678,10 @@ def test_recurrent_inference_weights_remain_live_after_mutation(device):
 @pytest.mark.parametrize('half', [False,True])
 @pytest.mark.parametrize('packed', [False,True])
 @pytest.mark.parametrize('bidirectional', [False,True])
-def test_native_sequence_accepts_persistent_cell_params(device,mode,name,gates,half,packed,bidirectional):
+@pytest.mark.parametrize('features', [7,37])
+def test_native_sequence_accepts_persistent_cell_params(device,mode,name,gates,half,packed,bidirectional,features):
     rng=np.random.default_rng(130)
-    layers,width,batch,features=2,5,3,7
+    layers,width,batch=2,5,3
     directions=2 if bidirectional else 1
     data=rng.normal(0,.2,size=(9,features) if packed else (batch,4,features)).astype('float32')
     hidden=rng.normal(0,.2,size=(layers*directions,batch,width)).astype('float32')

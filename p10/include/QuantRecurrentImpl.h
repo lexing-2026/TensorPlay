@@ -12,6 +12,7 @@ namespace tensorplay::quant::TP_QN_DETAIL {
 
 struct RecurrentLinear {
     Tensor weight, packed, offsets, scales, zps;
+    mutable Tensor activation_buffer;
     std::optional<Tensor> bias;
     explicit RecurrentLinear(const Tensor& w, const Tensor& b, const Tensor* storage=nullptr) : weight(w), bias(b.defined() ? std::optional<Tensor>(b) : std::nullopt) {
         TP_CHECK(w.dim() == 2, "Recurrent weights must be matrices");
@@ -53,8 +54,24 @@ struct RecurrentLinear {
     }
     Tensor operator()(const Tensor& x, bool reduce_range) const {
         if (weight.dtype() == DType::Float16) return fp16_linear(x, weight, bias, false);
-        Tensor qx = x.numel() ? TP_QR_FN(quantize_per_tensor_dynamic)(x, DType::QUInt8, reduce_range)
+        Tensor qx;
+#ifndef TP_QUANT_CUDA
+        if (x.numel()) {
+            const auto [scale, zp] = cpu::_choose_qparams_per_tensor_cpu(x, reduce_range);
+            if (!activation_buffer.defined() || activation_buffer.sizes().vec() != x.sizes().vec())
+                activation_buffer = Tensor::empty(x.sizes().vec(), DType::QUInt8, x.device());
+            qx = activation_buffer;
+            qx.impl()->set_quantizer(make_per_tensor_affine_quantizer(scale, zp, DType::QUInt8));
+            const Tensor source = x.contiguous();
+            parallel::parallel_for(0, x.numel(), 16384, [&](int64_t first, int64_t last) {
+                cpu::quantized_unsigned_pack_stub(DeviceType::CPU, source.data_ptr<float>() + first,
+                    qx.data_ptr<uint8_t>() + first, last - first, static_cast<float>(scale), zp);
+            });
+        } else qx = cpu::quantize_per_tensor_cpu(x, .1, 0, DType::QUInt8);
+#else
+        qx = x.numel() ? TP_QR_FN(quantize_per_tensor_dynamic)(x, DType::QUInt8, reduce_range)
             : TP_QR_FN(quantize_per_tensor)(x, .1, 0, DType::QUInt8);
+#endif
         return TP_QR_FN(_quantized_packed_run)(qx, packed, offsets, scales, zps, bias,
             weight.shape(), 1., 0, {}, {}, {}, 1, false, true, 0, 0., std::nullopt);
     }
