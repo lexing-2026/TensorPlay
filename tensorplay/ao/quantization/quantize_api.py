@@ -2,8 +2,8 @@
 
 ``quantize_(model, config)`` converts matching modules in-place according to
 the config type. Config types register a ``(module, config) -> module``
-transform handler with :func:`register_quantize_module_handler`, mirroring
-the upstream config workflow while keeping every transform native.
+transform handler with :func:`register_quantize_module_handler`, keeping
+every transform built on native modules and parameters.
 """
 
 from typing import Callable, Optional
@@ -29,6 +29,18 @@ def _is_linear(module, name) -> bool:
     return isinstance(module, tp.nn.Linear)
 
 
+def _set_module_at(model, fqn, replacement):
+    """Assign ``replacement`` to the module at dotted ``fqn`` in ``model``."""
+    if "." in fqn:
+        parent_name, child_name = fqn.rsplit(".", 1)
+        parent = model
+        for part in parent_name.split("."):
+            parent = getattr(parent, part)
+        setattr(parent, child_name, replacement)
+    else:
+        setattr(model, fqn, replacement)
+
+
 def quantize_(
     model: "tp.nn.Module",
     config,
@@ -36,6 +48,10 @@ def quantize_(
     device=None,
 ) -> "tp.nn.Module":
     """Convert matching module weights in ``model`` in-place.
+
+    Handlers registered through :func:`register_quantize_module_handler` may
+    mutate the module in place (returning the same object) or return a
+    replacement module, which is then re-attached at the module's location.
 
     Args:
         model: the module tree to convert.
@@ -57,5 +73,7 @@ def quantize_(
         model = model.to(device)
     for name, module in list(model.named_modules()):
         if filter_fn(module, name):
-            handler(module, config)
+            replacement = handler(module, config)
+            if replacement is not None and replacement is not module:
+                _set_module_at(model, name, replacement)
     return model

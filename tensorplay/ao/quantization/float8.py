@@ -11,9 +11,9 @@ on CPU and CUDA.  This module wraps them into trainable linear modules:
   activation per-token on every forward, giving FP8 mixed-precision training
   semantics while the optimizer keeps a full-precision parameter.
 
-Both mirror the ``float8_weight_only()`` and
-``float8_dynamic_activation_float8_weight()`` configs from the reference
-workflow, but are built entirely on native TensorPlay quantization ops.
+Both expose the same ``float8_weight_only()`` and
+``float8_dynamic_activation_float8_weight()`` config entry points, built
+entirely on native quantization ops.
 """
 
 from dataclasses import dataclass
@@ -58,7 +58,7 @@ class Float8DynamicActivationFloat8WeightConfig:
     dtype: str = "float8_e4m3fn"
 
 
-# Backwards-compatible aliases matching the reference config names.
+# Backwards-compatible aliases matching the workflow config names.
 float8_weight_only = Float8WeightOnlyConfig
 float8_dynamic_activation_float8_weight = Float8DynamicActivationFloat8WeightConfig
 

@@ -160,6 +160,24 @@ from .float8 import (
     float8_dynamic_activation_float8_weight as float8_dynamic_activation_float8_weight,
     float8_weight_only as float8_weight_only,
 )
+from .int4_weight_only import (
+    Int4WeightOnlyConfig as Int4WeightOnlyConfig,
+    Int4WeightOnlyQuantizedTrainingConfig as Int4WeightOnlyQuantizedTrainingConfig,
+    Int4WeightOnlyQuantizedTrainingLinear as Int4WeightOnlyQuantizedTrainingLinear,
+    WeightOnlyInt4Linear as WeightOnlyInt4Linear,
+    int4_weight_only as int4_weight_only,
+)
+from .int8_dyn_act_int4_weight import (
+    Int8DynActInt4WeightLinear as Int8DynActInt4WeightLinear,
+    Int8DynamicActivationInt4WeightConfig as Int8DynamicActivationInt4WeightConfig,
+    int8_dynamic_activation_int4_weight as int8_dynamic_activation_int4_weight,
+)
+from .awq import (
+    AWQConfig as AWQConfig,
+    AWQObservedLinear as AWQObservedLinear,
+    AWQObserver as AWQObserver,
+    awq as awq,
+)
 from .bitnet import quantize_int8_rowwise as quantize_int8_rowwise
 __all__ += [
     "BitNetLinear",
@@ -184,6 +202,18 @@ __all__ += [
     "Float8MixedPrecisionTrainingLinear",
     "float8_weight_only",
     "float8_dynamic_activation_float8_weight",
+    "Int4WeightOnlyConfig",
+    "Int4WeightOnlyQuantizedTrainingConfig",
+    "WeightOnlyInt4Linear",
+    "Int4WeightOnlyQuantizedTrainingLinear",
+    "int4_weight_only",
+    "Int8DynActInt4WeightLinear",
+    "Int8DynamicActivationInt4WeightConfig",
+    "int8_dynamic_activation_int4_weight",
+    "AWQConfig",
+    "AWQObserver",
+    "AWQObservedLinear",
+    "awq",
     "quantize_int8_rowwise",
     "scaled_int8_mm",
 ]

@@ -1145,6 +1145,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, QuantNative) {
     m.impl("_quantized_wrapped_half_prepack", TP_QN_DETAIL::wrapped_half_prepack);
     m.impl("_quantized_wrapped_half_linear", TP_QN_DETAIL::wrapped_half_linear);
     m.impl("_convert_weight_to_int4pack_for_cpu", TP_QN_DETAIL::int4_prepack);
+    m.impl("_convert_weight_to_int4pack", TP_QN_DETAIL::int4_prepack);
     m.impl("_weight_int4pack_mm_for_cpu", TP_QN_DETAIL::int4_mm);
     m.impl("_quantized_int4_mm", TP_QN_DETAIL::int4_mm_tensor_group);
 #endif
