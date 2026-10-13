@@ -114,7 +114,7 @@ class ExecutionAudit:
         for name in list(vars(tp._C)):
             function = getattr(tp._C, name)
             qualified = 'aten::' + name
-            if callable(function) and (qualified in self.entries or 'quantiz' in name or name.startswith('fbgemm_') or name == '_call_overload'):
+            if callable(function) and (qualified in self.entries or 'quantiz' in name or name.startswith('fbgemm_') or name in ('_call_overload', '_wrapped_linear_prepack')):
                 self.native_names[id(function)] = name
                 replacement = self.wrap(function, qualified, native=name)
                 replacements[id(function)] = replacement
