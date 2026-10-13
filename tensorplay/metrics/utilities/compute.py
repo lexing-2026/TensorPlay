@@ -47,13 +47,6 @@ def _safe_divide(
     return tensorplay.true_divide(num, denom)
 
 
-def _safe_sum_dim(x: Tensor, dim: int) -> Tensor:
-    """Sum along ``dim``; scalar inputs are returned unchanged."""
-    if x.ndim == 0:
-        return x
-    return tensorplay.sum(x, dim=dim)
-
-
 def _adjust_weights_safe_divide(
     score: Tensor,
     average: Optional[str],

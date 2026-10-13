@@ -151,6 +151,26 @@ class Metric(Module, ABC):
         self._is_synced = False
         self._cache: Optional[dict[str, Union[List[Tensor], Tensor]]] = None
 
+    def _filter_kwargs(self, **kwargs: Any) -> dict[str, Any]:
+        """Filter kwargs such that they match the update signature of the metric."""
+        # filter all parameters based on update signature except those of
+        # types `VAR_POSITIONAL` for `* args` and `VAR_KEYWORD` for `** kwargs`
+        _params = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        _sign_params = self._update_signature.parameters
+        filtered_kwargs = {
+            k: v for k, v in kwargs.items() if (k in _sign_params and _sign_params[k].kind not in _params)
+        }
+
+        exists_var_keyword = any(v.kind == inspect.Parameter.VAR_KEYWORD for v in _sign_params.values())
+        if not filtered_kwargs and not exists_var_keyword:
+            # no kwargs in update signature -> don't return any kwargs
+            return {}
+        if exists_var_keyword:
+            # kwargs found in update signature -> return all kwargs to be sure to not omit any.
+            # filtering logic is likely implemented within the update call.
+            return kwargs
+        return filtered_kwargs
+
     @property
     def _update_called(self) -> bool:
         rank_zero_warn(

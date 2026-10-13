@@ -19,7 +19,7 @@ from tensorplay.metrics.functional.classification.stat_scores import (
     _multilabel_stat_scores_tensor_validation,
     _multilabel_stat_scores_update,
 )
-from tensorplay.metrics.utilities.compute import _adjust_weights_safe_divide, _safe_divide, _safe_sum_dim
+from tensorplay.metrics.utilities.compute import _adjust_weights_safe_divide, _safe_divide
 from tensorplay.metrics.utilities.enums import ClassificationTask
 
 
@@ -60,11 +60,11 @@ def _hamming_distance_reduce(
     if average == "binary":
         return 1 - _safe_divide(tp + tn, tp + fp + tn + fn)
     if average == "micro":
-        tp = _safe_sum_dim(tp, 0 if multidim_average == "global" else 1)
-        fn = _safe_sum_dim(fn, 0 if multidim_average == "global" else 1)
+        tp = tp.sum(dim=0 if multidim_average == "global" else 1)
+        fn = fn.sum(dim=0 if multidim_average == "global" else 1)
         if multilabel:
-            fp = _safe_sum_dim(fp, 0 if multidim_average == "global" else 1)
-            tn = _safe_sum_dim(tn, 0 if multidim_average == "global" else 1)
+            fp = fp.sum(dim=0 if multidim_average == "global" else 1)
+            tn = tn.sum(dim=0 if multidim_average == "global" else 1)
             return 1 - _safe_divide(tp + tn, tp + tn + fp + fn)
         return 1 - _safe_divide(tp, tp + fn)
 

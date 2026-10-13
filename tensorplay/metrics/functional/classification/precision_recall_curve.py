@@ -51,7 +51,7 @@ def _binary_clf_curve(
         # pred typically has many tied values. Here we extract
         # the indices associated with the distinct values. We also
         # concatenate a value for the end of the curve.
-        distinct_value_indices = tensorplay.nonzero(preds[1:] - preds[:-1]).flatten()
+        distinct_value_indices = tensorplay.where(preds[1:] - preds[:-1])[0]
         threshold_idxs = tensorplay.nn.functional.pad(distinct_value_indices, [0, 1], value=target.size(0) - 1)
         target = (target == pos_label).to(tensorplay.long)
         tps = tensorplay.cumsum(target * weight, dim=0)[threshold_idxs]

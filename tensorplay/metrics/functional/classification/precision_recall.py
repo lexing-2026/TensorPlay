@@ -19,7 +19,7 @@ from tensorplay.metrics.functional.classification.stat_scores import (
     _multilabel_stat_scores_tensor_validation,
     _multilabel_stat_scores_update,
 )
-from tensorplay.metrics.utilities.compute import _adjust_weights_safe_divide, _safe_divide, _safe_sum_dim
+from tensorplay.metrics.utilities.compute import _adjust_weights_safe_divide, _safe_divide
 from tensorplay.metrics.utilities.enums import ClassificationTask
 
 
@@ -40,9 +40,9 @@ def _precision_recall_reduce(
     if average == "binary":
         return _safe_divide(tp, tp + different_stat, zero_division)
     if average == "micro":
-        tp = _safe_sum_dim(tp, 0 if multidim_average == "global" else 1)
-        fn = _safe_sum_dim(fn, 0 if multidim_average == "global" else 1)
-        different_stat = _safe_sum_dim(different_stat, 0 if multidim_average == "global" else 1)
+        tp = tp.sum(dim=0 if multidim_average == "global" else 1)
+        fn = fn.sum(dim=0 if multidim_average == "global" else 1)
+        different_stat = different_stat.sum(dim=0 if multidim_average == "global" else 1)
         return _safe_divide(tp, tp + different_stat, zero_division)
 
     score = _safe_divide(tp, tp + different_stat, zero_division)
