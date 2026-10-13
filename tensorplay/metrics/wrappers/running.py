@@ -101,3 +101,44 @@ class Running(WrapperMetric):
 
         """
         return self._plot(val, ax)
+
+class RunningMean(Running):
+    """Aggregate a stream of values into their mean over a running window.
+
+    Args:
+        window: the size of the running window.
+        nan_strategy: options are ``'error'``, ``'warn'``, ``'ignore'``,
+            ``'disable'`` or a float used to impute nan values.
+        kwargs: additional keyword arguments for :class:`MeanMetric`.
+    """
+
+    def __init__(
+        self,
+        window: int = 5,
+        nan_strategy: Union[str, float] = "warn",
+        **kwargs: Any,
+    ) -> None:
+        from tensorplay.metrics.aggregation import MeanMetric
+
+        super().__init__(base_metric=MeanMetric(nan_strategy=nan_strategy, **kwargs), window=window)
+
+
+class RunningSum(Running):
+    """Aggregate a stream of values into their sum over a running window.
+
+    Args:
+        window: the size of the running window.
+        nan_strategy: options are ``'error'``, ``'warn'``, ``'ignore'``,
+            ``'disable'`` or a float used to impute nan values.
+        kwargs: additional keyword arguments for :class:`SumMetric`.
+    """
+
+    def __init__(
+        self,
+        window: int = 5,
+        nan_strategy: Union[str, float] = "warn",
+        **kwargs: Any,
+    ) -> None:
+        from tensorplay.metrics.aggregation import SumMetric
+
+        super().__init__(base_metric=SumMetric(nan_strategy=nan_strategy, **kwargs), window=window)

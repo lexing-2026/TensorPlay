@@ -296,3 +296,79 @@ def _edit_distance(prediction_tokens: list[str], reference_tokens: list[str]) ->
             else:
                 dp[i][j] = min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]) + 1
     return dp[-1][-1]
+
+
+def _flip_trace(trace: tuple[_EditOperations, ...]) -> tuple[_EditOperations, ...]:
+    """Flip the trace of edit operations.
+
+    Instead of rewriting a->b, get a recipe for rewriting b->a. Simply flips insertions and deletions.
+
+    Args:
+        trace: A tuple of edit operations.
+
+    Return:
+        inverted_trace:
+            A tuple of inverted edit operations.
+
+    """
+    _flip_operations: dict[_EditOperations, _EditOperations] = {
+        _EditOperations.OP_INSERT: _EditOperations.OP_DELETE,
+        _EditOperations.OP_DELETE: _EditOperations.OP_INSERT,
+    }
+
+    def _replace_operation_or_retain(
+        operation: _EditOperations, _flip_operations: dict[_EditOperations, _EditOperations]
+    ) -> _EditOperations:
+        if operation in _flip_operations:
+            return _flip_operations.get(operation)  # type: ignore
+        return operation
+
+    return tuple(_replace_operation_or_retain(operation, _flip_operations) for operation in trace)
+
+
+def _trace_to_alignment(trace: tuple[_EditOperations, ...]) -> tuple[dict[int, int], list[int], list[int]]:
+    """Transform trace of edit operations into an alignment of the sequences.
+
+    Args:
+        trace: A trace of edit operations as a tuple of `_EDIT_OPERATIONS` enumerates.
+
+    Return:
+        alignments: A dictionary mapping aligned positions between a reference and a hypothesis.
+        reference_errors: A list of error positions in a reference.
+        hypothesis_errors: A list of error positions in a hypothesis.
+
+    Raises:
+        ValueError:
+            If an unknown operation is
+
+    """
+    reference_position = hypothesis_position = -1
+    reference_errors: list[int] = []
+    hypothesis_errors: list[int] = []
+    alignments: dict[int, int] = {}
+
+    # we are rewriting a into b
+    for operation in trace:
+        if operation == _EditOperations.OP_NOTHING:
+            hypothesis_position += 1
+            reference_position += 1
+            alignments[reference_position] = hypothesis_position
+            reference_errors.append(0)
+            hypothesis_errors.append(0)
+        elif operation == _EditOperations.OP_SUBSTITUTE:
+            hypothesis_position += 1
+            reference_position += 1
+            alignments[reference_position] = hypothesis_position
+            reference_errors.append(1)
+            hypothesis_errors.append(1)
+        elif operation == _EditOperations.OP_INSERT:
+            hypothesis_position += 1
+            hypothesis_errors.append(1)
+        elif operation == _EditOperations.OP_DELETE:
+            reference_position += 1
+            alignments[reference_position] = hypothesis_position
+            reference_errors.append(1)
+        else:
+            raise ValueError(f"Unknown operation {operation!r}.")
+
+    return alignments, reference_errors, hypothesis_errors

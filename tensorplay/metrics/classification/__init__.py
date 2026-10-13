@@ -99,6 +99,13 @@ from tensorplay.metrics.classification.stat_scores import (
     MultilabelStatScores,
     StatScores,
 )
+from tensorplay.metrics.classification.exact_match import ExactMatch
+from tensorplay.metrics.classification.logauc import LogAUC
+from tensorplay.metrics.classification.negative_predictive_value import NegativePredictiveValue
+from tensorplay.metrics.classification.precision_fixed_recall import PrecisionAtFixedRecall
+from tensorplay.metrics.classification.recall_fixed_precision import RecallAtFixedPrecision
+from tensorplay.metrics.classification.sensitivity_specificity import SensitivityAtSpecificity
+from tensorplay.metrics.classification.specificity_sensitivity import SpecificityAtSensitivity
 
 __all__ = [
     "Accuracy",
@@ -170,4 +177,11 @@ __all__ = [
     "ROC",
     "Specificity",
     "StatScores",
+    "ExactMatch",
+    "LogAUC",
+    "NegativePredictiveValue",
+    "PrecisionAtFixedRecall",
+    "RecallAtFixedPrecision",
+    "SensitivityAtSpecificity",
+    "SpecificityAtSensitivity",
 ]

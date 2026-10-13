@@ -93,6 +93,49 @@ from tensorplay.metrics.functional.classification.specificity import (
     multilabel_specificity,
     specificity,
 )
+
+from tensorplay.metrics.functional.classification.exact_match import (
+    exact_match,
+    multiclass_exact_match,
+    multilabel_exact_match,
+)
+from tensorplay.metrics.functional.classification.logauc import (
+    binary_logauc,
+    logauc,
+    multiclass_logauc,
+    multilabel_logauc,
+)
+from tensorplay.metrics.functional.classification.negative_predictive_value import (
+    binary_negative_predictive_value,
+    multiclass_negative_predictive_value,
+    multilabel_negative_predictive_value,
+    negative_predictive_value,
+)
+from tensorplay.metrics.functional.classification.precision_fixed_recall import (
+    binary_precision_at_fixed_recall,
+    multiclass_precision_at_fixed_recall,
+    multilabel_precision_at_fixed_recall,
+    precision_at_fixed_recall,
+)
+from tensorplay.metrics.functional.classification.recall_fixed_precision import (
+    binary_recall_at_fixed_precision,
+    multiclass_recall_at_fixed_precision,
+    multilabel_recall_at_fixed_precision,
+    recall_at_fixed_precision,
+)
+from tensorplay.metrics.functional.classification.sensitivity_specificity import (
+    binary_sensitivity_at_specificity,
+    multiclass_sensitivity_at_specificity,
+    multilabel_sensitivity_at_specificity,
+    sensitivity_at_specificity,
+)
+from tensorplay.metrics.functional.classification.specificity_sensitivity import (
+    binary_specificity_at_sensitivity,
+    multiclass_specificity_at_sensitivity,
+    multilabel_specificity_at_sensitivity,
+    specificity_at_sensitivity,
+)
+
 from tensorplay.metrics.functional.classification.stat_scores import (
     binary_stat_scores,
     multiclass_stat_scores,
@@ -170,4 +213,31 @@ __all__ = [
     "roc",
     "specificity",
     "stat_scores",
+    "binary_logauc",
+    "binary_negative_predictive_value",
+    "binary_precision_at_fixed_recall",
+    "binary_recall_at_fixed_precision",
+    "binary_sensitivity_at_specificity",
+    "binary_specificity_at_sensitivity",
+    "exact_match",
+    "logauc",
+    "multiclass_exact_match",
+    "multiclass_logauc",
+    "multiclass_negative_predictive_value",
+    "multiclass_precision_at_fixed_recall",
+    "multiclass_recall_at_fixed_precision",
+    "multiclass_sensitivity_at_specificity",
+    "multiclass_specificity_at_sensitivity",
+    "multilabel_exact_match",
+    "multilabel_logauc",
+    "multilabel_negative_predictive_value",
+    "multilabel_precision_at_fixed_recall",
+    "multilabel_recall_at_fixed_precision",
+    "multilabel_sensitivity_at_specificity",
+    "multilabel_specificity_at_sensitivity",
+    "negative_predictive_value",
+    "precision_at_fixed_recall",
+    "recall_at_fixed_precision",
+    "sensitivity_at_specificity",
+    "specificity_at_sensitivity",
 ]
