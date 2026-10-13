@@ -18,6 +18,7 @@
 #define TP_QN_NAME(x) x##_cuda
 #else
 #include "cpu/QuantizedElementwiseKernels.h"
+#include "cpu/vec/vec.h"
 #define TP_QN_DEVICE
 #define TP_QN_DETAIL cpu_native
 #define TP_QN_NAME(x) x##_cpu
@@ -513,8 +514,17 @@ Tensor softmax(const Tensor& input, int64_t dim, double scale, int64_t zp) {
     int64_t inner = 1;
     for (int d = dim + 1; d < input.dim(); ++d) inner *= input.size(d);
     codes(input.dtype(), [&]<class T>() {
-        if (width) apply(input.numel() / width, SoftmaxCodes<T>{x.data_ptr<T>(), y.data_ptr<T>(), width, inner, zp,
-            static_cast<float>(quantized::q_scale(input)), 1.f / static_cast<float>(scale)});
+        if (width) {
+#ifdef TP_QUANT_CUDA
+            const auto fn = SoftmaxCodes<T>{x.data_ptr<T>(), y.data_ptr<T>(), width, inner, zp,
+                static_cast<float>(quantized::q_scale(input)), 1.f / static_cast<float>(scale)};
+            apply(input.numel() / width, fn);
+#else
+            cpu::quantized_softmax_stub(DeviceType::CPU, x.data_ptr(), y.data_ptr(), input.dtype(),
+                width, inner, input.numel() / width, zp,
+                static_cast<float>(quantized::q_scale(input)), 1.f / static_cast<float>(scale));
+#endif
+        }
     });
     return y;
 }

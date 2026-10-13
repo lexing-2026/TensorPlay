@@ -74,8 +74,15 @@ Tensor rowwise_pack(const Tensor& weight, int64_t bits, bool optimized, int64_t 
         ranges = min_max->to(DType::Float32).contiguous();
     }
     Tensor y = Tensor::empty(shape, DType::UInt8, weight.device());
-    apply(rows, RowPack{x.data_ptr<float>(), min_max ? ranges.data_ptr<float>() : nullptr,
-        y.data_ptr<uint8_t>(), columns, width, bins, static_cast<int>(bits), optimized, static_cast<float>(ratio)});
+    const RowPack pack{x.data_ptr<float>(), min_max ? ranges.data_ptr<float>() : nullptr,
+        y.data_ptr<uint8_t>(), columns, width, bins, static_cast<int>(bits), optimized, static_cast<float>(ratio)};
+#ifdef TP_QUANT_CUDA
+    apply(rows, pack);
+#else
+    parallel::parallel_for(0, rows, 1, [&](int64_t first, int64_t last) {
+        for (int64_t row = first; row < last; ++row) pack(row);
+    });
+#endif
     return y;
 }
 
@@ -197,7 +204,7 @@ Tensor embedding_lookup(const Tensor& packed, const Tensor& indices, int64_t bit
     apply(y.numel(), EmbeddingLookup{w.data_ptr<uint8_t>(), ind.data_ptr<int64_t>(), po, pm, pp,
         y.data_ptr<float>(), columns, width, bags, count, fixed, static_cast<int>(bits), embedding});
 #else
-    parallel::parallel_for(0, bags, std::max<int64_t>(1, 32768 / std::max<int64_t>(columns, 1)), [&](int64_t first, int64_t last) {
+    parallel::parallel_for(0, bags, 1, [&](int64_t first, int64_t last) {
         tensorplay::cpu::quantized_embedding_stub(DeviceType::CPU, w.data_ptr<uint8_t>(), ind.data_ptr<int64_t>(),
             po, pm, pp, y.data_ptr<float>(), first, last, bags, count, fixed, columns, width, bits, embedding);
     });

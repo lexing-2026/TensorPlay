@@ -1186,6 +1186,77 @@ void binary_impl(const void* a, const void* b, void* y, int64_t size, DType dtyp
     else if (dtype == DType::QUInt8) binary_codes<quint8>(a,b,y,size,as,az,bs,bz,ys,yz,op,relu);
 }
 
+template<class T>
+void softmax_rows(const T* x, T* y, int64_t width, int64_t inner, int64_t first, int64_t last,
+        int64_t zp, float scale, float inverse) {
+    using V = vec::Vectorized<float>;
+    constexpr int lanes = V::size();
+    std::vector<float> exponentials;
+    if (inner == 1) exponentials.resize(width);
+    for (int64_t row = first; row < last; ++row) {
+        const int64_t base = row / inner * width * inner + row % inner;
+        int64_t maximum = std::numeric_limits<T>::lowest();
+        for (int64_t c = 0; c < width; ++c) maximum = std::max<int64_t>(maximum, x[base + c * inner]);
+        if (inner == 1) {
+            V partial(0.f);
+            alignas(64) float values[lanes];
+            int64_t c = 0;
+            for (; c + lanes <= width; c += lanes) {
+                for (int lane = 0; lane < lanes; ++lane) values[lane] = static_cast<float>(x[base + c + lane]);
+                const V exp = ((V::loadu(values) - V(static_cast<float>(maximum))) * V(scale)).exp();
+                exp.store(exponentials.data() + c);
+                partial += exp;
+            }
+            float sum = 0.f;
+            partial.store(values);
+            for (float value : values) sum += value;
+            for (; c < width; ++c) {
+                const float exp = ::expf(static_cast<float>(static_cast<int64_t>(x[base + c]) - maximum) * scale);
+                exponentials[c] = exp;
+                sum += exp;
+            }
+            const float normalization = 1.f / sum;
+            int64_t output_end = 0;
+#if defined(CPU_CAPABILITY_AVX2) || defined(CPU_CAPABILITY_AVX512)
+            if constexpr (std::is_same_v<T, int8_t> || std::is_same_v<T, uint8_t>) {
+                using Q = std::conditional_t<std::is_same_v<T, int8_t>, qint8, quint8>;
+                using QV = vec::Vectorized<Q>;
+                c = 0;
+                for (; c + QV::size() <= width; c += QV::size()) {
+                    typename QV::float_vec_return_type normalized;
+                    for (size_t part = 0; part < normalized.size(); ++part)
+                        normalized[part] = V::loadu(exponentials.data() + c + part * lanes) * V(normalization);
+                    QV::quantize(normalized, 1.f, static_cast<int32_t>(zp), inverse).store(y + base + c);
+                }
+                output_end = c;
+            }
+#endif
+            for (c = output_end; c < width; ++c)
+                y[base + c] = quant::encode<T>(exponentials[c] * normalization, inverse, zp);
+        } else {
+            float sum = 0.f;
+            for (int64_t c = 0; c < width; ++c)
+                sum += ::expf(static_cast<float>(static_cast<int64_t>(x[base + c * inner]) - maximum) * scale);
+            for (int64_t c = 0; c < width; ++c) {
+                const float value = ::expf(static_cast<float>(static_cast<int64_t>(x[base + c * inner]) - maximum) * scale) / sum;
+                y[base + c * inner] = quant::encode<T>(value, inverse, zp);
+            }
+        }
+    }
+}
+
+void softmax_impl(const void* x, void* y, DType dtype, int64_t width, int64_t inner,
+        int64_t rows, int64_t zp, float scale, float inverse) {
+    parallel::parallel_for(0, rows, 1, [&](int64_t first, int64_t last) {
+        switch (dtype) {
+            case DType::QInt8: softmax_rows(static_cast<const int8_t*>(x), static_cast<int8_t*>(y), width, inner, first, last, zp, scale, inverse); break;
+            case DType::QUInt8: softmax_rows(static_cast<const uint8_t*>(x), static_cast<uint8_t*>(y), width, inner, first, last, zp, scale, inverse); break;
+            case DType::QInt32: softmax_rows(static_cast<const int32_t*>(x), static_cast<int32_t*>(y), width, inner, first, last, zp, scale, inverse); break;
+            default: break;
+        }
+    });
+}
+
 void fp16_linear_impl(const float* x, const Half* w, const float* bias, float* y,
         int64_t first, int64_t last, int64_t n, int64_t k, bool relu) {
     using FV = vec::Vectorized<float>;
@@ -1258,6 +1329,7 @@ REGISTER_DISPATCH(quantized_moment_stub, &moment_impl);
 REGISTER_DISPATCH(quantized_spatial_mean_stub, &spatial_mean_impl);
 REGISTER_DISPATCH(quantized_pool_stub, &pool_impl);
 REGISTER_DISPATCH(quantized_lookup_stub, &lookup_impl);
+REGISTER_DISPATCH(quantized_softmax_stub, &softmax_impl);
 REGISTER_DISPATCH(quantized_binary_stub, &binary_impl);
 REGISTER_DISPATCH(quantized_embedding_stub, &embedding_impl);
 REGISTER_DISPATCH(quantized_fp16_linear_stub, &fp16_linear_impl);
@@ -1282,6 +1354,7 @@ ALSO_REGISTER_AVX512_DISPATCH(quantized_moment_stub, &moment_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_spatial_mean_stub, &spatial_mean_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_pool_stub, &pool_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_lookup_stub, &lookup_impl);
+ALSO_REGISTER_AVX512_DISPATCH(quantized_softmax_stub, &softmax_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_binary_stub, &binary_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_embedding_stub, &embedding_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_fp16_linear_stub, &fp16_linear_impl);

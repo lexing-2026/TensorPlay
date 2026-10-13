@@ -57,6 +57,9 @@ DECLARE_DISPATCH(quantized_word_activation_fn, quantized_sigmoid_stub)
 DECLARE_DISPATCH(quantized_word_activation_fn, quantized_tanh_stub)
 using quantized_clip_fn = void (*)(const void*, void*, int64_t, DType, int64_t, int64_t);
 using quantized_lookup_fn = void (*)(const uint8_t*, uint8_t*, int64_t, const float*);
+using quantized_softmax_fn = void (*)(const void*, void*, DType, int64_t, int64_t,
+    int64_t, int64_t, float, float);
+DECLARE_DISPATCH(quantized_softmax_fn, quantized_softmax_stub)
 using quantized_binary_fn = void (*)(const void*, const void*, void*, int64_t, DType,
     double, int64_t, double, int64_t, double, int64_t, int, bool);
 using quantized_fp16_linear_fn = void (*)(const float*, const Half*, const float*, float*,

@@ -161,6 +161,7 @@ DEFINE_DISPATCH(quantized_tanh_stub);
 DEFINE_DISPATCH(quantized_moment_stub);
 DEFINE_DISPATCH(quantized_pool_stub);
 DEFINE_DISPATCH(quantized_lookup_stub);
+DEFINE_DISPATCH(quantized_softmax_stub);
 DEFINE_DISPATCH(quantized_binary_stub);
 DEFINE_DISPATCH(quantized_embedding_stub);
 DEFINE_DISPATCH(quantized_fp16_linear_stub);
