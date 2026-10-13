@@ -190,3 +190,204 @@ def test_pauli_rotation_matches_its_own_exponential():
     from_exp = tp.matrix_exp(-1j * time * pauli)
     from_rotation = tq.pauli_rotation_matrix("XZ", 2.0 * time)
     tp.testing.assert_close(from_rotation, from_exp, atol=1e-6, rtol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Control readings, arbitrary axes, multi-wire rotations
+# ---------------------------------------------------------------------------
+
+
+def test_a_control_can_ask_for_a_zero_reading():
+    # Both controls ask for 0, so a clear pair flips the target ...
+    flipped = tq.apply_mcx(tq.basis_state(0, 3), [0, 1, 2], control_values=[0, 0])
+    tp.testing.assert_close(
+        tq.flatten(flipped), tq.flatten(tq.basis_state(1, 3)), atol=1e-6, rtol=1e-6
+    )
+    # ... and a pair that is already set does not.
+    held = tq.apply_mcx(tq.basis_state(3, 3), [0, 1, 2], control_values=[0, 0])
+    tp.testing.assert_close(tq.flatten(held), tq.flatten(tq.basis_state(3, 3)),
+                            atol=1e-6, rtol=1e-6)
+
+
+def test_the_first_control_leads_the_pattern():
+    # control_values reads the controls in wire order, and wire 0 is the leading
+    # bit of the index, so a lone 1 on wire 0 points at index 4 of 8.
+    mat = tq.mcx_matrix(2, control_values=[1, 0])
+    swapped = [
+        (i, j)
+        for i in range(8)
+        for j in range(8)
+        if abs(float(mat[i, j].real) - 1.0) < 1e-6 and i != j
+    ]
+    assert swapped == [(4, 5), (5, 4)]
+
+
+def test_a_scalar_control_value_asks_for_it_on_every_control():
+    one = tq.mcx_matrix(2, control_values=1)
+    tp.testing.assert_close(one, tq.mcx_matrix(2), atol=1e-6, rtol=1e-6)
+
+
+def test_control_values_need_one_entry_per_control():
+    with pytest.raises(ValueError):
+        tq.mcx_matrix(2, control_values=[1])
+    with pytest.raises(ValueError):
+        tq.mcx_matrix(2, control_values=[1, 0, 1])
+    with pytest.raises(ValueError):
+        tq.mcx_matrix(2, control_values=[2, 1])
+
+
+def test_controlled_matrix_places_the_operator_on_the_matching_pattern():
+    mat = tq.controlled_matrix(tq.x_matrix(), 2, control_values=[0, 1])
+    # controls read 0 then 1: the guarded basis pair is |010> and |011>.
+    flipped = [
+        (i, j)
+        for i in range(8)
+        for j in range(8)
+        if abs(float(mat[i, j].real) - 1.0) < 1e-6 and i != j
+    ]
+    assert flipped == [(2, 3), (3, 2)]
+
+
+def test_the_generic_controlled_helper_matches_the_named_gates():
+    state = tq.zeros_state(3)
+    named = tq.apply_cx(state, 0, 2)
+    generic = tq.apply_controlled(state, tq.x_matrix(device=state.device), [0, 2])
+    tp.testing.assert_close(named, generic, atol=1e-6, rtol=1e-6)
+
+
+def test_new_named_applications_match_their_own_matrices():
+    state = tq.zeros_state(3)
+    pairs = [
+        (tq.apply_cp(state, 0, 2, 0.4), tq.controlled_matrix(tq.phase_matrix(0.4)), [0, 2]),
+        (tq.apply_crx(state, 0, 2, 0.4), tq.controlled_matrix(tq.rot_x_matrix(0.4)), [0, 2]),
+        (tq.apply_cry(state, 1, 2, 0.4), tq.controlled_matrix(tq.rot_y_matrix(0.4)), [1, 2]),
+        (tq.apply_crz(state, 1, 2, 0.4), tq.controlled_matrix(tq.rot_z_matrix(0.4)), [1, 2]),
+        (tq.apply_cy(state, 0, 1), tq.controlled_matrix(tq.y_matrix()), [0, 1]),
+        (tq.apply_ccx(state, 0, 1, 2), tq.mcx_matrix(2), [0, 1, 2]),
+        (tq.apply_u2(state, 2, 0.4, 0.5), tq.u2_matrix(0.4, 0.5), [2]),
+        (tq.apply_i(state, 2), tq.i_matrix(), [2]),
+        (tq.apply_sdg(state, 2), tq.sdg_matrix(), [2]),
+        (tq.apply_tdg(state, 2), tq.tdg_matrix(), [2]),
+        (tq.apply_rot(state, 2, [0, 1, 0], 0.4), tq.rot_matrix([0, 1, 0], 0.4), [2]),
+        (tq.apply_multirz(state, 0.4), tq.multirz_matrix(0.4, 3), [0, 1, 2]),
+    ]
+    for out, mat, wires in pairs:
+        expected = tq.apply_gate(state, mat.to(state.dtype), wires)
+        tp.testing.assert_close(out, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_a_rotation_about_an_axis_reduces_to_the_coordinate_rotations():
+    theta = 0.73
+    for axis, coordinate in (
+        ([1, 0, 0], tq.rot_x_matrix(theta)),
+        ([0, 1, 0], tq.rot_y_matrix(theta)),
+        ([0, 0, 1], tq.rot_z_matrix(theta)),
+    ):
+        tp.testing.assert_close(
+            tq.rot_matrix(axis, theta), coordinate, atol=1e-6, rtol=1e-6
+        )
+
+
+def test_a_rotation_ignores_the_length_of_its_axis():
+    theta = 0.73
+    tp.testing.assert_close(
+        tq.rot_matrix([0, 3, 4], theta),
+        tq.rot_matrix([0, 3 / 5, 4 / 5], theta),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_a_rotation_about_no_direction_is_refused():
+    with pytest.raises(ValueError):
+        tq.rot_matrix([0, 0, 0], 0.5)
+
+
+def test_an_axis_needs_three_components():
+    with pytest.raises(ValueError):
+        tq.rot_matrix([0, 1], 0.5)
+
+
+def test_the_multi_wire_rotation_is_one_angle_on_every_wire():
+    angle = 0.3
+    per_wire = tp.eye(8, dtype=tp.complex64)
+    for wire in range(3):
+        per_wire = tq.expand_to_register(
+            tq.rot_z_matrix(angle), [wire], 3
+        ) @ per_wire
+    tp.testing.assert_close(
+        tq.multirz_matrix(angle, 3), per_wire, atol=1e-6, rtol=1e-6
+    )
+
+
+def test_multi_wire_eigenvalues_are_the_diagonal_of_the_matrix():
+    # Each basis state carries e^{-i angle (n - 2k) / 2} with k ones in its index,
+    # which for three wires walks the counts 3, 1, 1, -1, 1, -1, -1, -3.
+    angle = 0.4
+    counts = [3, 1, 1, -1, 1, -1, -1, -3]
+    expected = tp.tensor(
+        [complex(math.cos(-angle * k / 2), math.sin(-angle * k / 2)) for k in counts],
+        dtype=tp.complex64,
+    )
+    tp.testing.assert_close(tq.multirz_eigvals(angle, 3), expected, atol=1e-6, rtol=1e-6)
+
+
+def test_a_multi_wire_rotation_needs_at_least_one_wire():
+    with pytest.raises(ValueError):
+        tq.multirz_matrix(0.3, 0)
+
+
+def test_global_phase_scales_the_state_without_touching_the_relations():
+    state = tq.apply_h(tq.zeros_state(1), 0)
+    out = tq.apply_global_phase(state, 0.7)
+    expected = tq.flatten(state) * tp.tensor([0.76484219 + 0.64421769j])
+    tp.testing.assert_close(tq.flatten(out), expected.to(state.dtype), atol=1e-6, rtol=1e-6)
+    # The relative phase of the two amplitudes is untouched.
+    ratio = out.reshape(2)[1] / out.reshape(2)[0]
+    tp.testing.assert_close(ratio, tp.tensor(1.0 + 0j), atol=1e-6, rtol=1e-6)
+
+
+def _basis_index_of(state):
+    """The one basis entry a single-basis state sits on."""
+    weights = tq.flatten(state).abs().reshape(-1)
+    return int(weights.argmax())
+
+
+def test_relative_phase_toffoli_flips_where_the_plain_one_flips():
+    plain = tq.mcx_matrix(2)
+    for index in range(8):
+        start = tq.basis_state(index, 3)
+        relative = _basis_index_of(tq.apply_rccx(start, 0, 1, 2))
+        ordinary = _basis_index_of(tq.apply_gate(start, plain, [0, 1, 2]))
+        if index >> 2:
+            # control a at 1: the wire flip is the plain one.
+            assert relative == ordinary
+        else:
+            # control a at 0: the target is left alone.
+            assert relative == index
+
+
+def test_relative_phase_toffoli_adds_a_sign_and_is_its_own_inverse():
+    relative = tq.rccx_matrix()
+    tp.testing.assert_close(relative @ relative, tp.eye(8, dtype=relative.dtype), atol=1e-6, rtol=1e-6)
+    out = tq.apply_rccx(tq.basis_state(2, 3), 0, 1, 2)
+    tp.testing.assert_close(
+        tq.flatten(out),
+        -tq.flatten(tq.basis_state(2, 3)),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    # The flip of the plain gate still happens on the two-control branch.
+    flipped = tq.apply_rccx(tq.basis_state(6, 3), 0, 1, 2)
+    tp.testing.assert_close(
+        tq.flatten(flipped), tq.flatten(tq.basis_state(7, 3)), atol=1e-6, rtol=1e-6
+    )
+
+
+def test_global_phase_matrix_is_a_scalar_operator():
+    tp.testing.assert_close(
+        tq.globalphase_matrix(0.0).reshape(()),
+        tp.tensor(1.0 + 0j),
+        atol=1e-6,
+        rtol=1e-6,
+    )

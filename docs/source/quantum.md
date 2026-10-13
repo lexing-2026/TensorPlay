@@ -65,18 +65,36 @@ state = tq.apply_cnot(state, 0, 1)    # control wire 0, target wire 1
 state = tq.apply_gate(state, tq.rot_y_matrix(0.3), [1])
 ```
 
-Parameter-free gates: `apply_x`, `apply_y`, `apply_z`, `apply_h`, `apply_s`,
-`apply_sx`, `apply_t`. Parameterized gates take the parameter as the last
-argument: `apply_rx`, `apply_ry`, `apply_rz`, `apply_p`, `apply_u3`. Two-qubit
-gates: `apply_cx`/`apply_cnot`, `apply_cz`, `apply_swap`, `apply_iswap`. Wider
-gates: `apply_toffoli` (three wires), `apply_cswap` (control plus two targets),
-and `apply_mcx`, which takes a control list and flips the remaining wire.
+Parameter-free gates: `apply_x`, `apply_y`, `apply_z`, `apply_i`, `apply_h`,
+`apply_s`, `apply_sdg`, `apply_sx`, `apply_t`, `apply_tdg`. Parameterized gates
+take the parameter as the last argument: `apply_rx`, `apply_ry`, `apply_rz`,
+`apply_p`, `apply_u2`, `apply_u3`, `apply_rot` (any axis), `apply_multirz` (one
+angle on a list of wires), `apply_global_phase` (scales the whole state).
+Two-qubit gates: `apply_cx`/`apply_cnot`, `apply_cy`, `apply_cz`, `apply_swap`,
+`apply_iswap`, and the controlled parameter gates `apply_cp`, `apply_crx`,
+`apply_cry`, `apply_crz`. Wider gates: `apply_toffoli`/`apply_ccx` (three wires),
+`apply_rccx` (the relative-phase Toffoli), `apply_cswap` (control plus two
+targets), and `apply_mcx`, which takes a control list and flips the remaining
+wire.
 
 The matching matrix builders are available on their own — `h_matrix`,
 `rot_x_matrix`, `swap_matrix`, `mcx_matrix` and the rest — so a gate can be
 built, inspected, or composed without applying it. `controlled_matrix` wraps any
 single-qubit unitary as a control, `pauli_matrix` builds a Pauli word, and
 `dagger` is the conjugate transpose.
+
+### Control readings
+
+A control decides whether the gate fires by what it reads, and all ones is only
+the default. `control_values` says what each control has to hold, in wire order:
+
+```python
+tq.apply_mcx(tq.zeros_state(3), [0, 1, 2])                      # fires on |11.>
+tq.apply_mcx(tq.zeros_state(3), [0, 1, 2], control_values=[0, 0])  # fires when both are 0
+```
+
+`apply_controlled(state, mat, wires, control_values=...)` is the same idea for
+an arbitrary operator, with the controls leading the wire list.
 
 ### Batched parameters
 
@@ -251,6 +269,12 @@ in a single pass over the amplitudes.
     tensorplay.quantum.qft_circuit
     tensorplay.quantum.apply_gate
     tensorplay.quantum.controlled_matrix
+    tensorplay.quantum.apply_controlled
+    tensorplay.quantum.rot_matrix
+    tensorplay.quantum.multirz_matrix
+    tensorplay.quantum.multirz_eigvals
+    tensorplay.quantum.globalphase_matrix
+    tensorplay.quantum.rccx_matrix
     tensorplay.quantum.dagger
     tensorplay.quantum.expand_to_register
     tensorplay.quantum.zeros_state

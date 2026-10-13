@@ -20,37 +20,57 @@ from . import _native
 from ._helpers import check_pauli_string, check_wires, n_qubits_of, pauli_wires, promoted_c_dtype
 
 __all__ = [
+    "apply_ccx",
+    "apply_controlled",
     "apply_cnot",
+    "apply_cp",
+    "apply_crx",
+    "apply_cry",
+    "apply_crz",
     "apply_cswap",
     "apply_cx",
+    "apply_cy",
     "apply_cz",
     "apply_gate",
+    "apply_global_phase",
     "apply_h",
+    "apply_i",
     "apply_iswap",
     "apply_mcx",
+    "apply_multirz",
     "apply_p",
+    "apply_rccx",
+    "apply_rot",
     "apply_rx",
     "apply_ry",
     "apply_rz",
     "apply_s",
+    "apply_sdg",
     "apply_swap",
     "apply_sx",
     "apply_t",
+    "apply_tdg",
     "apply_toffoli",
+    "apply_u2",
     "apply_u3",
     "apply_x",
     "apply_y",
     "apply_z",
     "controlled_matrix",
     "dagger",
+    "globalphase_matrix",
     "h_matrix",
     "i_matrix",
     "iswap_matrix",
     "mcx_matrix",
+    "multirz_eigvals",
+    "multirz_matrix",
     "p_matrix",
     "pauli_rotation_matrix",
     "phase_matrix",
     "qft_matrix",
+    "rccx_matrix",
+    "rot_matrix",
     "rot_x_matrix",
     "rot_y_matrix",
     "rot_z_matrix",
@@ -375,46 +395,214 @@ def u3_matrix(theta, phi, lam, *, device=None, c_dtype=None) -> tp.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def controlled_matrix(mat: tp.Tensor, n_controls: int = 1) -> tp.Tensor:
-    """``mat`` applied only when every control qubit is 1.
+def _control_values(control_values, n_controls: int) -> tuple:
+    """Normalize a control pattern to ``n_controls`` entries of 0 or 1.
+
+    A bare integer asks for the same reading on every control.
+    """
+    if control_values is None:
+        return (1,) * n_controls
+    if isinstance(control_values, int):
+        return (control_values,) * n_controls
+    try:
+        values = tuple(int(value) for value in control_values)
+    except TypeError:
+        raise TypeError(
+            f"control_values must be an int or a sequence of ints, got {control_values!r}"
+        ) from None
+    if len(values) != n_controls:
+        raise ValueError(
+            f"{n_controls} control(s) need {n_controls} control values, got {len(values)}"
+        )
+    for value in values:
+        if value not in (0, 1):
+            raise ValueError(f"a control reads 0 or 1, got {value}")
+    return values
+
+
+def controlled_matrix(
+    mat: tp.Tensor, n_controls: int = 1, *, control_values=None
+) -> tp.Tensor:
+    """``mat`` applied only when the control qubits read ``control_values``.
 
     Controls are the leading qubits of the result, so the matrix is block
-    diagonal in the control index: identity blocks for every control pattern
-    except the all-ones one, which carries ``mat``.  Built by concatenation, so
-    a gradient carried by ``mat`` survives.
+    diagonal in the control index: every control pattern but the one asked for
+    carries the identity on the target, and the matching one carries ``mat``.
+    Built by concatenation, so a gradient carried by ``mat`` survives.
+
+    Args:
+        mat: the operator the controls guard, ``[d, d]``.
+        n_controls: how many control qubits lead the result.
+        control_values: what the controls have to read, one entry each and
+            either 0 or 1; all ones when omitted.
     """
     if n_controls < 1:
         raise ValueError(f"a controlled gate needs at least one control, got {n_controls}")
+    wanted = _control_values(control_values, n_controls)
     block = 1 << n_controls
     d = mat.shape[-1]
-    side = block * d
-    top = side - d
-    identity = tp.eye(top, dtype=mat.dtype, device=mat.device)
-    zeros_right = tp.zeros((top, d), dtype=mat.dtype, device=mat.device)
-    zeros_left = tp.zeros((d, top), dtype=mat.dtype, device=mat.device)
-    return tp.cat(
-        [tp.cat([identity, zeros_right], dim=-1), tp.cat([zeros_left, mat], dim=-1)],
-        dim=-2,
-    )
+    eye = tp.eye(d, dtype=mat.dtype, device=mat.device)
+    zero = tp.zeros((d, d), dtype=mat.dtype, device=mat.device)
+    rows = []
+    for pattern in range(block):
+        matched = all(
+            ((pattern >> (n_controls - 1 - i)) & 1) == wanted[i]
+            for i in range(n_controls)
+        )
+        columns = [
+            mat if q == pattern and matched else (eye if q == pattern else zero)
+            for q in range(block)
+        ]
+        rows.append(tp.cat(columns, dim=-1))
+    return tp.cat(rows, dim=-2)
 
 
-def mcx_matrix(n_controls: int, *, device=None, c_dtype=tp.complex64) -> tp.Tensor:
+def mcx_matrix(
+    n_controls: int, *, control_values=None, device=None, c_dtype=tp.complex64
+) -> tp.Tensor:
     """The multi-controlled X gate: X on the last wire, identity elsewhere.
 
-    Controls come first, so the only basis pair that swaps is the one where
-    every control bit is 1.
+    Controls come first, so the only basis pair that swaps is the one whose
+    control bits read ``control_values`` -- all ones unless the caller asks for
+    another reading.  ``n_controls`` counts the controls, so the matrix covers
+    ``n_controls + 1`` qubits.
     """
     if n_controls < 1:
         raise ValueError(f"a controlled X needs at least one control, got {n_controls}")
+    wanted = _control_values(control_values, n_controls)
     dim = 1 << (n_controls + 1)
     mat = tp.eye(dim, dtype=c_dtype, device=device)
-    low = dim - 2  # controls all 1, target 0
-    high = dim - 1  # controls all 1, target 1
+    # The target owns bit 0 of the index; control i sits at wire position i, so
+    # it owns bit n_controls - i and the first control is the leading one.
+    low = sum((1 << (n_controls - i)) for i, value in enumerate(wanted) if value)
+    high = low | 1
     mat[low, low] = 0
     mat[high, high] = 0
     mat[low, high] = 1
     mat[high, low] = 1
     return mat
+
+
+def rccx_matrix(*, device=None, c_dtype=tp.complex64) -> tp.Tensor:
+    """The relative-phase Toffoli, on ``[control a, control b, target]``.
+
+    The wire flip is the plain one: control a at 1 turns the target.  When
+    control a reads 0 the gate leaves the target alone and instead puts a sign
+    on the one basis state that has control b at 1 and the target at 0, which is
+    the phase a decomposed Toffoli would have picked up.  It is its own inverse.
+    """
+    identity = tp.eye(8, dtype=c_dtype, device=device)
+    toffoli = mcx_matrix(2, device=device, c_dtype=c_dtype)
+    sign = tp.eye(8, dtype=c_dtype, device=device)
+    # Index 2 is control a = 0, control b = 1, target = 0.
+    sign[2, 2] = -1
+    return toffoli @ sign
+
+
+def globalphase_matrix(angle, *, device=None, c_dtype=None) -> tp.Tensor:
+    """The scalar ``e^{i angle}`` as a 1 by 1 operator.
+
+    Applying it to one qubit multiplies the whole state by the phase, so a
+    circuit can carry a tracked phase without it touching the amplitudes'
+    relative phases.
+    """
+    angle = tp.as_tensor(angle)
+    c_dtype = _param_c_dtype(angle, given=c_dtype)
+    value = _polar(tp.cos(angle), tp.sin(angle), c_dtype)
+    return value.reshape((1, 1))
+
+
+def _sum_axis_counts(n_qubits: int, *, device=None):
+    """``n_qubits - 2 * popcount`` for every basis index, as a real tensor.
+
+    The quantity is the eigenvalue of ``Z`` on every wire summed over the
+    register, which is what the multi-wire rotation turns into a phase.
+    """
+    idx = tp.arange(1 << n_qubits, dtype=tp.int64, device=device)
+    bits = tp.arange(n_qubits, dtype=tp.int64, device=device)
+    ones = ((idx.unsqueeze(-1) >> bits) & 1).sum(-1)
+    return (n_qubits - 2 * ones).to(tp.float32)
+
+
+def multirz_matrix(angle, n_qubits: int, *, device=None, c_dtype=None) -> tp.Tensor:
+    """A rotation of ``angle`` radians about ``Z`` on every one of ``n_qubits``.
+
+    The same angle on ``n`` wires is ``exp(-i * angle * Z^{tensor n} / 2)``, which
+    is diagonal: each basis state picks up ``e^{-i angle (n - 2k) / 2}`` with
+    ``k`` the number of ones in its index.
+    """
+    if n_qubits < 1:
+        raise ValueError(f"a multi-wire rotation covers 1 or more qubits, got {n_qubits}")
+    angle = tp.as_tensor(angle)
+    c_dtype = _param_c_dtype(angle, given=c_dtype)
+    return tp.diag(_polar(*_multirz_phase(angle, n_qubits), c_dtype))
+
+
+def multirz_eigvals(angle, n_qubits: int, *, device=None, c_dtype=None) -> tp.Tensor:
+    """The eigenvalues :func:`multirz_matrix` is built from, as a vector.
+
+    Measuring the rotation needs only its readings, not the matrix: they are the
+    phase of each basis state.
+    """
+    if n_qubits < 1:
+        raise ValueError(f"a multi-wire rotation covers 1 or more qubits, got {n_qubits}")
+    angle = tp.as_tensor(angle)
+    c_dtype = _param_c_dtype(angle, given=c_dtype)
+    return _polar(*_multirz_phase(angle, n_qubits), c_dtype)
+
+
+def _multirz_phase(angle, n_qubits: int):
+    """The cosine and sine halves of each basis state's phase.
+
+    A rotation by ``angle`` about Z on every wire turns into the factor
+    ``e^{-i angle (n_qubits - 2 k) / 2}`` on the basis state with ``k`` ones, so
+    the sine half carries the minus.
+    """
+    counts = _sum_axis_counts(n_qubits, device=angle.device).to(angle.dtype)
+    half = angle * counts / 2
+    return tp.cos(half), -tp.sin(half)
+
+
+def rot_matrix(axis, phi, *, device=None, c_dtype=None) -> tp.Tensor:
+    """A rotation of ``phi`` radians about any axis.
+
+    ``cos(phi/2) I - i sin(phi/2) (n_x X + n_y Y + n_z Z)`` for the unit vector
+    ``axis``, so the three coordinate rotations are the three basis cases of
+    this one expression.
+
+    Args:
+        axis: direction to turn about, three real components; it is normalized,
+            and a zero vector is rejected.
+        phi: how far to turn.
+    """
+    direction = tp.as_tensor(axis)
+    if direction.dim() != 1 or direction.shape[0] != 3:
+        raise ValueError(f"an axis is three components, got {tuple(direction.shape)}")
+    phi = tp.as_tensor(phi)
+    c_dtype = _param_c_dtype(direction, phi, given=c_dtype)
+    dtype = tp.promote_types(direction.dtype, phi.dtype)
+    direction = direction.to(dtype)
+    phi = phi.to(dtype)
+    norm = tp.sqrt((direction * direction).sum())
+    if float(norm) == 0.0:
+        raise ValueError("a rotation axis has to point somewhere")
+    unit = direction / norm
+    nx, ny, nz = unit[0], unit[1], unit[2]
+    half = phi / 2
+    cosine = tp.cos(half)
+    sine = tp.sin(half)
+    # The real and imaginary halves are kept apart so a gradient carried by phi
+    # runs through real arithmetic alone.
+    entries = (
+        (cosine, -sine * nz),
+        (-sine * ny, -sine * nx),
+        (sine * ny, -sine * nx),
+        (cosine, sine * nz),
+    )
+    cells = [_as_complex(real, imag, c_dtype) for real, imag in entries]
+    return tp.stack(
+        [tp.stack(cells[0:2], dim=-1), tp.stack(cells[2:4], dim=-1)], dim=-2
+    )
 
 
 def pauli_rotation_matrix(word: str, angle, *, device=None, c_dtype=None) -> tp.Tensor:
@@ -468,6 +656,11 @@ def _const(state, builder, *args):
     return apply_gate(state, builder(device=state.device, c_dtype=state.dtype), *args)
 
 
+def apply_i(state, wire):
+    """Apply the identity on ``wire``."""
+    return _const(state, i_matrix, wire)
+
+
 def apply_x(state, wire):
     """Apply X on ``wire``."""
     return _const(state, x_matrix, wire)
@@ -498,6 +691,16 @@ def apply_t(state, wire, inverse: bool = False):
     return _const(state, tdg_matrix if inverse else t_matrix, wire)
 
 
+def apply_sdg(state, wire):
+    """Apply the inverse of S on ``wire``."""
+    return _const(state, sdg_matrix, wire)
+
+
+def apply_tdg(state, wire):
+    """Apply the inverse of T on ``wire``."""
+    return _const(state, tdg_matrix, wire)
+
+
 def apply_sx(state, wire):
     """Apply sqrt(X) on ``wire``."""
     return _const(state, sx_matrix, wire)
@@ -523,9 +726,39 @@ def apply_p(state, wire, theta):
     return _on(state, phase_matrix(theta), wire)
 
 
+def apply_u2(state, wire, phi, lam):
+    """Apply ``U2(phi, lam)`` on ``wire``."""
+    return _on(state, u2_matrix(phi, lam), wire)
+
+
 def apply_u3(state, wire, theta, phi, lam):
     """Apply ``U3(theta, phi, lam)`` on ``wire``."""
     return _on(state, u3_matrix(theta, phi, lam), wire)
+
+
+def apply_rot(state, wire, axis, phi):
+    """Apply a rotation of ``phi`` about ``axis`` on ``wire``."""
+    return _on(state, rot_matrix(axis, phi), wire)
+
+
+def apply_global_phase(state, angle, wire: int = 0):
+    """Multiply the whole state by ``e^{i angle}``.
+
+    The phase is carried by a 1 by 1 operator, which one wire scales the state
+    by; any wire does, so the argument is only there to name one.
+    """
+    return _on(state, globalphase_matrix(angle), wire)
+
+
+def apply_multirz(state, angle, wires=None):
+    """Apply the same ``angle`` rotation about Z on every listed wire."""
+    n_qubits = n_qubits_of(state)
+    target = list(range(n_qubits)) if wires is None else check_wires(wires, n_qubits)
+    return apply_gate(
+        state,
+        multirz_matrix(angle, len(target)).to(device=state.device, dtype=state.dtype),
+        target,
+    )
 
 
 def apply_cnot(state, control, target):
@@ -551,6 +784,30 @@ def apply_cz(state, control, target):
     )
 
 
+def apply_controlled(state, mat, wires, control_values=None):
+    """Apply ``mat`` on the last wires, guarded by the leading ones.
+
+    ``wires`` reads controls first and the target last, and ``control_values``
+    says what those controls have to hold -- all ones when omitted.
+    """
+    return apply_gate(
+        state,
+        controlled_matrix(
+            mat.to(device=state.device), len(wires) - 1, control_values=control_values
+        ),
+        wires,
+    )
+
+
+def apply_cy(state, control, target):
+    """Apply Y on ``target``, controlled by ``control``."""
+    return apply_gate(
+        state,
+        controlled_matrix(y_matrix(device=state.device, c_dtype=state.dtype)),
+        [control, target],
+    )
+
+
 def apply_swap(state, wire_a, wire_b):
     """Apply a plain swap between two qubits."""
     return _const(state, swap_matrix, [wire_a, wire_b])
@@ -570,23 +827,77 @@ def apply_cswap(state, control, wire_a, wire_b):
     )
 
 
-def apply_toffoli(state, control_a, control_b, target):
+def apply_toffoli(state, control_a, control_b, target, control_values=None):
     """Apply CCX with two controls."""
     return apply_gate(
         state,
-        mcx_matrix(2, device=state.device, c_dtype=state.dtype),
+        mcx_matrix(
+            2,
+            control_values=control_values,
+            device=state.device,
+            c_dtype=state.dtype,
+        ),
         [control_a, control_b, target],
     )
 
 
-def apply_mcx(state, wires):
-    """Apply a multi-controlled X; the last wire is the target."""
+def apply_ccx(state, control_a, control_b, target):
+    """Apply CCX with two controls; a shorter spelling of :func:`apply_toffoli`."""
+    return apply_toffoli(state, control_a, control_b, target)
+
+
+def apply_rccx(state, control_a, control_b, target):
+    """Apply the relative-phase Toffoli on ``(control_a, control_b, target)``."""
+    return _const(state, rccx_matrix, [control_a, control_b, target])
+
+
+def apply_mcx(state, wires, control_values=None):
+    """Apply a multi-controlled X; the last wire is the target.
+
+    Every control reads 1 unless ``control_values`` asks for another reading.
+    """
     wires = check_wires(wires, n_qubits_of(state))
     return apply_gate(
         state,
-        mcx_matrix(len(wires) - 1, device=state.device, c_dtype=state.dtype),
+        mcx_matrix(
+            len(wires) - 1,
+            control_values=control_values,
+            device=state.device,
+            c_dtype=state.dtype,
+        ),
         wires,
     )
+
+
+def _apply_controlled_rotation(state, wires, angle, builder):
+    """Apply ``exp(-i angle P / 2)`` on ``target``, guarded by the controls."""
+    return apply_gate(
+        state,
+        controlled_matrix(
+            builder(angle).to(device=state.device), len(wires) - 1
+        ),
+        wires,
+    )
+
+
+def apply_cp(state, control, target, theta):
+    """Apply ``P(theta)`` on ``target``, controlled by ``control``."""
+    return _apply_controlled_rotation(state, [control, target], theta, phase_matrix)
+
+
+def apply_crx(state, control, target, theta):
+    """Apply ``RX(theta)`` on ``target``, controlled by ``control``."""
+    return _apply_controlled_rotation(state, [control, target], theta, rot_x_matrix)
+
+
+def apply_cry(state, control, target, theta):
+    """Apply ``RY(theta)`` on ``target``, controlled by ``control``."""
+    return _apply_controlled_rotation(state, [control, target], theta, rot_y_matrix)
+
+
+def apply_crz(state, control, target, theta):
+    """Apply ``RZ(theta)`` on ``target``, controlled by ``control``."""
+    return _apply_controlled_rotation(state, [control, target], theta, rot_z_matrix)
 
 
 def apply_pauli_rotation(state, word: str, angle):
