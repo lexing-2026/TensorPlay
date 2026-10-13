@@ -86,16 +86,20 @@ def test_fast_path_keeps_the_state_shape():
     assert out.shape == state.shape
 
 
-def test_fast_path_takes_the_wider_dtype():
+def test_the_register_settles_the_precision():
+    # The register carries the precision of the whole circuit, so a matrix
+    # handed in at another precision is read at the register's -- otherwise a
+    # circuit written in single precision would be pulled into double by every
+    # gate matrix, and pay for it in memory and time.
     state = tq.plus_state(2, dtype=tp.complex64)
     out = tq.apply_gate(state, tq.h_matrix(c_dtype=tp.complex128), [0])
-    assert out.dtype == tp.complex128
+    assert out.dtype == tp.complex64
     tp.testing.assert_close(
-        out.reshape(1, -1).to(tp.complex64),
-        _flat(tq.apply_gate(state, tq.h_matrix(), [0])),
-        atol=1e-6,
-        rtol=1e-6,
+        _flat(out), _flat(tq.apply_gate(state, tq.h_matrix(), [0])), atol=1e-6, rtol=1e-6
     )
+
+    wide = tq.plus_state(2, dtype=tp.complex128)
+    assert tq.apply_gate(wide, tq.h_matrix(), [0]).dtype == tp.complex128
 
 
 def test_state_probs_squares_the_amplitudes():

@@ -156,7 +156,7 @@ def apply_gate(state: tp.Tensor, mat: tp.Tensor, wires) -> tp.Tensor:
     if mat.dim() not in (2, 3):
         raise ValueError(f"a gate matrix is 2-D or batched 3-D, got {mat.dim()}-D")
 
-    c_dtype = promoted_c_dtype(tp.promote_types(state.dtype, mat.dtype))
+    c_dtype = state.dtype
     if state.dtype not in (tp.complex64, tp.complex128) or mat.dtype not in (
         tp.complex64,
         tp.complex128,
@@ -180,13 +180,12 @@ def apply_gate(state: tp.Tensor, mat: tp.Tensor, wires) -> tp.Tensor:
     rest = [d for d in range(1, state.dim()) if d not in dims]
     perm = [0, *dims, *rest]
 
-    # The gate follows the state: a matrix built for another device or without
-    # an imaginary half is finished off here.  The compiled path reads both
-    # operands as the result dtype, so the narrower one is converted rather
-    # than reinterpreted.
+    # The gate follows the state: a matrix built for another device or in a
+    # different precision is finished off here.  The register sets the precision
+    # rather than meeting the matrix's -- a circuit written in single precision
+    # should stay in single precision, and one written in double should not be
+    # pulled down by a matrix built from a plain number.
     mat = mat.to(device=state.device, dtype=c_dtype)
-    if state.dtype != c_dtype:
-        state = state.to(c_dtype)
 
     # The matrix spells its index bits in the order the wires were named, while
     # the gather below walks the targeted dimensions in ascending order.  The
@@ -219,7 +218,13 @@ def apply_gate(state: tp.Tensor, mat: tp.Tensor, wires) -> tp.Tensor:
     else:
         mat = mat.unsqueeze(0).expand(batch, side, side)
 
-    out = mat.bmm(moved)
+    # The contraction is spelled as the operator rather than as the batched
+    # product: the operator's backward takes the adjoint of the other operand,
+    # which for a complex state is the conjugate transpose -- a plain batched
+    # product differentiates against a plain transpose and loses the phase a
+    # state carries, so every angle downstream of a second gate would come out
+    # wrong.
+    out = tp.matmul(mat, moved)
     # The contracted block goes back to one dimension per targeted qubit; the
     # untouched ones already sit where they belong.
     back = [0]
@@ -388,9 +393,35 @@ def _param_c_dtype(*params, given=None):
     return promoted_c_dtype(dtype)
 
 
+def _angle(value, name: str = "angle") -> tp.Tensor:
+    """A parameter read as an angle, with a trailing entry of one dropped.
+
+    A parameter block for a circuit of ``k`` angles is naturally
+    ``[batch, k]``, and a one-angle block is ``[batch, 1]``.  Left as it is, the
+    trailing axis would be built into the gate matrix as an axis of the matrix
+    itself -- giving a matrix the gate path cannot use, or, where the matrix is
+    assembled by arithmetic, one that is quietly wrong.  So a trailing axis of
+    length one is dropped, which puts every parameter block in the shape the gate
+    path already reads: one angle per batch entry.
+
+    A plain number is read in double precision.  An angle written as a literal
+    carries no precision of its own to preserve, and reading it in single
+    precision would quietly put the whole gate -- and with it the state, since
+    the amplitudes are only as good as the matrix that made them -- one digit
+    short of what a double-precision state is asking for.
+    """
+    if isinstance(value, tp.Tensor):
+        tensor = value
+    else:
+        tensor = tp.as_tensor(value, dtype=tp.float64)
+    while tensor.dim() > 1 and tensor.shape[-1] == 1:
+        tensor = tensor.reshape(tensor.shape[:-1])
+    return tensor
+
+
 def rot_x_matrix(theta, *, device=None, c_dtype=None) -> tp.Tensor:
     """A rotation of ``theta`` radians around the X axis."""
-    theta = tp.as_tensor(theta)
+    theta = _angle(theta, "theta")
     c_dtype = _param_c_dtype(theta, given=c_dtype)
     half = theta / 2
     cos_half = tp.cos(half)
@@ -404,7 +435,7 @@ def rot_x_matrix(theta, *, device=None, c_dtype=None) -> tp.Tensor:
 
 def rot_y_matrix(theta, *, device=None, c_dtype=None) -> tp.Tensor:
     """A rotation of ``theta`` radians around the Y axis."""
-    theta = tp.as_tensor(theta)
+    theta = _angle(theta, "theta")
     c_dtype = _param_c_dtype(theta, given=c_dtype)
     half = theta / 2
     cos_c = tp.cos(half).to(c_dtype)
@@ -418,7 +449,7 @@ def rot_y_matrix(theta, *, device=None, c_dtype=None) -> tp.Tensor:
 
 def rot_z_matrix(theta, *, device=None, c_dtype=None) -> tp.Tensor:
     """A rotation of ``theta`` radians around the Z axis."""
-    theta = tp.as_tensor(theta)
+    theta = _angle(theta, "theta")
     c_dtype = _param_c_dtype(theta, given=c_dtype)
     half = theta / 2
     lower = _polar(tp.cos(half), tp.sin(half), c_dtype)
@@ -432,7 +463,7 @@ def rot_z_matrix(theta, *, device=None, c_dtype=None) -> tp.Tensor:
 
 def phase_matrix(theta, *, device=None, c_dtype=None) -> tp.Tensor:
     """The phase gate family: ``diag(1, e^{i theta})``."""
-    theta = tp.as_tensor(theta)
+    theta = _angle(theta, "theta")
     c_dtype = _param_c_dtype(theta, given=c_dtype)
     one = tp.ones_like(theta).to(c_dtype)
     lower = _polar(tp.cos(theta), tp.sin(theta), c_dtype)
@@ -450,8 +481,8 @@ def p_matrix(theta, *, device=None, c_dtype=None) -> tp.Tensor:
 
 def u2_matrix(phi, lam, *, device=None, c_dtype=None) -> tp.Tensor:
     """The two-axis gate ``U2(phi, lam)``."""
-    phi = tp.as_tensor(phi)
-    lam = tp.as_tensor(lam)
+    phi = _angle(phi, "phi")
+    lam = _angle(lam, "lam")
     c_dtype = _param_c_dtype(phi, lam, given=c_dtype)
     top_left = _polar(tp.ones_like(tp.cos(phi)), tp.zeros_like(tp.sin(lam)), c_dtype)
     top_right = _polar(tp.zeros_like(tp.sin(lam)), -tp.sin(lam), c_dtype)
@@ -465,9 +496,9 @@ def u2_matrix(phi, lam, *, device=None, c_dtype=None) -> tp.Tensor:
 
 def u3_matrix(theta, phi, lam, *, device=None, c_dtype=None) -> tp.Tensor:
     """The three-parameter gate ``U3(theta, phi, lam)`` -- every one-qubit unitary."""
-    theta = tp.as_tensor(theta)
-    phi = tp.as_tensor(phi)
-    lam = tp.as_tensor(lam)
+    theta = _angle(theta, "theta")
+    phi = _angle(phi, "phi")
+    lam = _angle(lam, "lam")
     c_dtype = _param_c_dtype(theta, phi, lam, given=c_dtype)
     half = theta / 2
     cos_half = tp.cos(half)
@@ -522,7 +553,8 @@ def controlled_matrix(
     Built by concatenation, so a gradient carried by ``mat`` survives.
 
     Args:
-        mat: the operator the controls guard, ``[d, d]``.
+        mat: the operator the controls guard, ``[d, d]``, or ``[batch, d, d]``
+            when it carries one operator per batch entry.
         n_controls: how many control qubits lead the result.
         control_values: what the controls have to read, one entry each and
             either 0 or 1; all ones when omitted.
@@ -532,8 +564,14 @@ def controlled_matrix(
     wanted = _control_values(control_values, n_controls)
     block = 1 << n_controls
     d = mat.shape[-1]
+    # A guarded operator with an angle per batch entry keeps that entry
+    # throughout, so the blocks either side of it are laid out the same way.
+    batch = tuple(mat.shape[:-2])
     eye = tp.eye(d, dtype=mat.dtype, device=mat.device)
     zero = tp.zeros((d, d), dtype=mat.dtype, device=mat.device)
+    if batch:
+        eye = eye.expand(*batch, d, d)
+        zero = tp.zeros((*batch, d, d), dtype=mat.dtype, device=mat.device)
     rows = []
     for pattern in range(block):
         matched = all(
@@ -658,7 +696,7 @@ def globalphase_matrix(angle, *, device=None, c_dtype=None) -> tp.Tensor:
     circuit can carry a tracked phase without it touching the amplitudes'
     relative phases.
     """
-    angle = tp.as_tensor(angle)
+    angle = _angle(angle, "angle")
     c_dtype = _param_c_dtype(angle, given=c_dtype)
     value = _polar(tp.cos(angle), tp.sin(angle), c_dtype)
     return value.reshape((1, 1))
@@ -694,8 +732,8 @@ def _pair_mixer(theta, beta, *, on_odd, device, c_dtype):
     difference gate.  Either way the two wires start and end on the same value,
     so the excitation count is untouched.
     """
-    theta = tp.as_tensor(theta)
-    beta = tp.as_tensor(beta)
+    theta = _angle(theta, "theta")
+    beta = _angle(beta, "beta")
     c_dtype = _param_c_dtype(theta, beta, given=c_dtype)
     cos_half = tp.cos(theta / 2)
     sin_half = tp.sin(theta / 2)
@@ -758,7 +796,7 @@ def single_excitation_matrix(theta, *, device=None, c_dtype=None) -> tp.Tensor:
     It starts and ends inside that pair, so no phases are needed at all -- the
     cheapest way to mix two states -- and ``-theta`` undoes it.
     """
-    theta = tp.as_tensor(theta)
+    theta = _angle(theta, "theta")
     c_dtype = _param_c_dtype(theta, given=c_dtype)
     cos_half = tp.cos(theta / 2)
     sin_half = tp.sin(theta / 2)
@@ -789,7 +827,7 @@ def _two_body_rotation(theta, product: str, *, c_dtype) -> tp.Tensor:
     real for every product in the table, so the angle only ever goes through
     real arithmetic before the imaginary halves are attached.
     """
-    theta = tp.as_tensor(theta)
+    theta = _angle(theta, "theta")
     c_dtype = _param_c_dtype(theta, given=c_dtype)
     cos_half = tp.cos(theta / 2)
     sin_half = tp.sin(theta / 2)
@@ -834,7 +872,7 @@ def multirz_matrix(angle, n_qubits: int, *, device=None, c_dtype=None) -> tp.Ten
     """
     if n_qubits < 1:
         raise ValueError(f"a multi-wire rotation covers 1 or more qubits, got {n_qubits}")
-    angle = tp.as_tensor(angle)
+    angle = _angle(angle, "angle")
     c_dtype = _param_c_dtype(angle, given=c_dtype)
     return tp.diag(_polar(*_multirz_phase(angle, n_qubits), c_dtype))
 
@@ -847,7 +885,7 @@ def multirz_eigvals(angle, n_qubits: int, *, device=None, c_dtype=None) -> tp.Te
     """
     if n_qubits < 1:
         raise ValueError(f"a multi-wire rotation covers 1 or more qubits, got {n_qubits}")
-    angle = tp.as_tensor(angle)
+    angle = _angle(angle, "angle")
     c_dtype = _param_c_dtype(angle, given=c_dtype)
     return _polar(*_multirz_phase(angle, n_qubits), c_dtype)
 
@@ -879,7 +917,7 @@ def rot_matrix(axis, phi, *, device=None, c_dtype=None) -> tp.Tensor:
     direction = tp.as_tensor(axis)
     if direction.dim() != 1 or direction.shape[0] != 3:
         raise ValueError(f"an axis is three components, got {tuple(direction.shape)}")
-    phi = tp.as_tensor(phi)
+    phi = _angle(phi, "phi")
     c_dtype = _param_c_dtype(direction, phi, given=c_dtype)
     dtype = tp.promote_types(direction.dtype, phi.dtype)
     direction = direction.to(dtype)
@@ -914,17 +952,25 @@ def pauli_rotation_matrix(word: str, angle, *, device=None, c_dtype=None) -> tp.
     its last non-identity factor -- apply the result to the wires it touches.
     """
     word = check_pauli_string(word)
-    c_dtype = c_dtype or tp.complex64
+    # The angle decides the precision unless the caller asked for one: the
+    # matrix is no wider than the parameter it was built from.
+    angle = _angle(angle, "angle")
+    c_dtype = _param_c_dtype(angle, given=c_dtype)
     pauli = _pauli_product(word, c_dtype=c_dtype)
 
-    angle = tp.as_tensor(angle)
-    c_dtype = _param_c_dtype(angle, given=c_dtype)
     half = angle / 2
     cosine = tp.cos(half).to(c_dtype)
     # -i * sin(angle/2) as a complex scalar, so the rotation is assembled from
     # a real angle alone and a parameter gradient stays in real arithmetic.
     neg_i_sine = _as_complex(tp.zeros_like(tp.sin(half)), -tp.sin(half), c_dtype)
     identity = tp.eye(pauli.shape[-1], dtype=c_dtype, device=pauli.device)
+    if angle.dim():
+        # One angle per batch entry is one matrix per entry, so each half is
+        # given an axis pair of its own to broadcast along rather than being
+        # multiplied across the matrix.
+        shape = [-1] + [1] * pauli.dim()
+        cosine = cosine.reshape(shape)
+        neg_i_sine = neg_i_sine.reshape(shape)
     return cosine * identity + neg_i_sine * pauli
 
 

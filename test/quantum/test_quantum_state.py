@@ -229,7 +229,7 @@ def test_a_gate_built_two_ways_agrees_up_to_a_phase():
     # by element comparison would report as a list of mismatches instead.
     n_qubits = 3
     wires = [0, 2]
-    matrix = tq.controlled_matrix(tq.rot_y_matrix(0.4))
+    matrix = tq.controlled_matrix(tq.rot_y_matrix(0.4)).to(tq.plus_state(n_qubits).dtype)
     state = tq.plus_state(n_qubits)
     fused = tq.flatten(tq.apply_gate(state, matrix, wires)).reshape(-1)
     wide = tq.expand_to_register(matrix, wires, n_qubits) @ tq.flatten(

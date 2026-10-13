@@ -185,7 +185,8 @@ def test_pauli_rotation_is_a_unitary():
 
 
 def test_pauli_rotation_matches_its_own_exponential():
-    pauli = tq.pauli_matrix("XZ")
+    # A plain number is read in double precision, so both sides are built there.
+    pauli = tq.pauli_matrix("XZ", c_dtype=tp.complex128)
     time = 0.35
     from_exp = tp.matrix_exp(-1j * time * pauli)
     from_rotation = tq.pauli_rotation_matrix("XZ", 2.0 * time)
@@ -310,7 +311,7 @@ def test_an_axis_needs_three_components():
 
 def test_the_multi_wire_rotation_is_one_angle_on_every_wire():
     angle = 0.3
-    per_wire = tp.eye(8, dtype=tp.complex64)
+    per_wire = tp.eye(8, dtype=tp.complex128)
     for wire in range(3):
         per_wire = tq.expand_to_register(
             tq.rot_z_matrix(angle), [wire], 3
@@ -327,7 +328,7 @@ def test_multi_wire_eigenvalues_are_the_diagonal_of_the_matrix():
     counts = [3, 1, 1, -1, 1, -1, -1, -3]
     expected = tp.tensor(
         [complex(math.cos(-angle * k / 2), math.sin(-angle * k / 2)) for k in counts],
-        dtype=tp.complex64,
+        dtype=tp.complex128,
     )
     tp.testing.assert_close(tq.multirz_eigvals(angle, 3), expected, atol=1e-6, rtol=1e-6)
 
@@ -370,7 +371,7 @@ def test_relative_phase_toffoli_flips_where_the_plain_one_flips():
 def test_global_phase_matrix_is_a_scalar_operator():
     tp.testing.assert_close(
         tq.globalphase_matrix(0.0).reshape(()),
-        tp.tensor(1.0 + 0j),
+        tp.tensor(1.0 + 0j, dtype=tp.complex128),
         atol=1e-6,
         rtol=1e-6,
     )
@@ -714,7 +715,7 @@ def test_a_zero_angle_is_the_identity():
     for name in _ROTATION_NAMES:
         builder = getattr(tq, name + "_matrix")
         tp.testing.assert_close(
-            builder(0.0), tp.eye(4, dtype=tp.complex64), atol=1e-6, rtol=1e-6
+            builder(0.0), tp.eye(4, dtype=tp.complex128), atol=1e-6, rtol=1e-6
         )
 
 
