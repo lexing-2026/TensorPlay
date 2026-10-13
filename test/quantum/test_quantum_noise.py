@@ -204,3 +204,99 @@ def test_two_qubit_channel_is_applied_to_the_listed_wires():
     tp.testing.assert_close(
         tq.density_probs(out), tp.tensor([[0.5, 0.0, 0.0, 0.5]]), atol=1e-6, rtol=1e-6
     )
+
+
+# ---------------------------------------------------------------------------
+# A Pauli channel written the way a noise model is written
+# ---------------------------------------------------------------------------
+
+
+def _pauli(word):
+    """The dense matrix of a Pauli word, for the reference side of a check."""
+    piece = {
+        "I": tp.eye(2, dtype=tp.complex128),
+        "X": tq.x_matrix(c_dtype=tp.complex128),
+        "Y": tq.y_matrix(c_dtype=tp.complex128),
+        "Z": tq.z_matrix(c_dtype=tp.complex128),
+    }
+    out = None
+    for letter in word:
+        out = piece[letter] if out is None else tp.kron(out, piece[letter])
+    return out
+
+
+def _bell_density():
+    state = tq.apply_cnot(tq.apply_h(tq.zeros_state(2, dtype=tp.complex128), 0), 0, 1)
+    return tq.to_density(state)
+
+
+def test_named_errors_give_the_mixture_they_describe():
+    # A noise model says which errors happen with what chance and leaves the rest
+    # to the identity.  The state afterwards is the mixture those chances name,
+    # each error applied to the state in front of the sum -- which is worked out
+    # here with plain matrix algebra so the two sides are not the same code.
+    density = _bell_density()
+    out = tq.apply_channel(
+        density, tq.pauli_kraus({"XX": 0.02, "ZI": 0.01}, c_dtype=tp.complex128), [0, 1]
+    )
+    longhand = (
+        0.97 * density[0]
+        + 0.02 * (_pauli("XX") @ density[0] @ _pauli("XX"))
+        + 0.01 * (_pauli("ZI") @ density[0] @ _pauli("ZI"))
+    )
+    tp.testing.assert_close(out[0], longhand, atol=1e-12, rtol=1e-12)
+    assert abs(complex(tp.trace(out[0])).real - 1.0) < 1e-12
+
+
+def test_an_error_named_on_one_wire_arrives_on_the_whole_register():
+    # The operator of "ZI" acts on the first wire only, but it has to reach
+    # apply_channel as an operator on both -- otherwise it lands on the wrong
+    # one, or on neither.
+    density = _bell_density()
+    out = tq.apply_channel(
+        density, tq.pauli_kraus({"ZI": 0.3}, c_dtype=tp.complex128), [0, 1]
+    )
+    longhand = 0.7 * density[0] + 0.3 * (_pauli("ZI") @ density[0] @ _pauli("ZI"))
+    tp.testing.assert_close(out[0], longhand, atol=1e-12, rtol=1e-12)
+
+
+def test_an_error_set_can_be_given_as_pairs():
+    # A list reads the same as a mapping, which is what a table of chances off a
+    # measurement looks like.
+    density = _bell_density()
+    pairs = [("XX", 0.02), ("ZI", 0.01)]
+    tp.testing.assert_close(
+        tq.apply_channel(density, tq.pauli_kraus(pairs, c_dtype=tp.complex128), [0, 1]),
+        tq.apply_channel(
+            density, tq.pauli_kraus(dict(pairs), c_dtype=tp.complex128), [0, 1]
+        ),
+        atol=1e-12,
+        rtol=1e-12,
+    )
+
+
+def test_a_channel_strength_is_read_in_double_precision():
+    # An operator built from a written-down chance is only as good as the way that
+    # chance was read: in single precision the channel's trace drifts off one by
+    # a few parts in ten million, which is a few parts in ten million too many on
+    # an expectation.
+    density = _bell_density()
+    kraus = tq.pauli_kraus({"XX": 0.02, "ZI": 0.01}, c_dtype=tp.complex128)
+    out = tq.apply_channel(density, kraus, [0, 1])
+    assert abs(complex(tp.trace(out[0])).real - 1.0) < 1e-14
+
+
+def test_a_named_error_set_is_read_for_what_it_is():
+    density = _bell_density()
+    with pytest.raises(ValueError):
+        tq.pauli_kraus({})                       # no error and no chance
+    with pytest.raises(ValueError):
+        tq.pauli_kraus({"XX": 0.7, "X": 0.4})    # words of different lengths
+    with pytest.raises(ValueError):
+        tq.pauli_kraus({"XX": 0.6, "ZI": 0.6})    # more chance than there is
+    with pytest.raises(ValueError):
+        tq.pauli_kraus({"QQ": 0.1})               # not a Pauli word
+    with pytest.raises(ValueError):
+        tq.pauli_kraus({"XX": "loud"})            # not a chance
+    with pytest.raises(ValueError):
+        tq.pauli_kraus([("XX", 0.1), ("YY",)])   # a pair without a chance

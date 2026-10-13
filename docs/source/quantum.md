@@ -308,6 +308,20 @@ rho = tq.apply_channel(rho, both, [0, 1])
 Because every Kraus operator is local, the cost stays linear in the register
 size: no channel superoperator is ever built.
 
+`pauli_kraus` builds the set from a noise model written down the way noise
+models are: which errors happen with what chance, with the rest of the chance
+left to nothing happening.
+
+```python
+kraus = tq.pauli_kraus({"XX": 0.02, "ZI": 0.01, "IX": 0.005})
+rho = tq.apply_channel(rho, kraus, [0, 1])     # 96.5% of nothing happening
+```
+
+Every named word must span the same number of wires, and one named on a single
+wire of a wider register still arrives as an operator on the whole of it. A set
+of uniform chances over every word is the depolarizing channel; a named set is
+the general one, and this is the way to write a two-qubit noise model at all.
+
 ### A system that does not close
 
 A channel applies all at once. Noise that acts over time is the generator
@@ -641,6 +655,7 @@ tq.apply_ry(tq.zeros_state(2), 0, 0.3)          # single, whatever the angle say
     tensorplay.quantum.phase_flip_kraus
     tensorplay.quantum.amplitude_damping_kraus
     tensorplay.quantum.depolarizing_kraus
+    tensorplay.quantum.pauli_kraus
     tensorplay.quantum.Hamiltonian
     tensorplay.quantum.pauli_string_matrix
     tensorplay.quantum.energy

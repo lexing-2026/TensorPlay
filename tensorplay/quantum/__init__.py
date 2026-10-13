@@ -177,6 +177,7 @@ from ._measurement import (
     sample_indices,
 )
 from ._noise import (
+    pauli_kraus,
     amplitude_damping_kraus,
     apply_amplitude_damping,
     apply_bit_flip,
@@ -313,6 +314,7 @@ __all__ = [
     "p_matrix",
     "param_shift",
     "partial_trace",
+    "pauli_kraus",
     "pauli_matrix",
     "pauli_rotation_matrix",
     "pauli_string_matrix",
