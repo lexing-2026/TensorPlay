@@ -36,8 +36,10 @@ __all__ = [
     "apply_crz",
     "apply_cswap",
     "apply_cx",
+    "apply_dcx",
     "apply_cy",
     "apply_cz",
+    "apply_ecr",
     "apply_gate",
     "apply_global_phase",
     "apply_h",
@@ -47,17 +49,21 @@ __all__ = [
     "apply_multirz",
     "apply_p",
     "apply_rccx",
+    "apply_rc3x",
     "apply_rot",
     "apply_rx",
     "apply_ry",
     "apply_rz",
     "apply_s",
     "apply_sdg",
+    "apply_single_excitation",
     "apply_swap",
     "apply_sx",
     "apply_t",
     "apply_tdg",
     "apply_toffoli",
+    "apply_xx_minus_yy",
+    "apply_xx_plus_yy",
     "apply_u2",
     "apply_u3",
     "apply_x",
@@ -65,6 +71,12 @@ __all__ = [
     "apply_z",
     "controlled_matrix",
     "dagger",
+    "dcx_matrix",
+    "ecr_matrix",
+    "rc3x_matrix",
+    "single_excitation_matrix",
+    "xx_minus_yy_matrix",
+    "xx_plus_yy_matrix",
     "globalphase_matrix",
     "h_matrix",
     "i_matrix",
@@ -510,17 +522,78 @@ def mcx_matrix(
 def rccx_matrix(*, device=None, c_dtype=tp.complex64) -> tp.Tensor:
     """The relative-phase Toffoli, on ``[control a, control b, target]``.
 
-    The wire flip is the plain one: control a at 1 turns the target.  When
-    control a reads 0 the gate leaves the target alone and instead puts a sign
-    on the one basis state that has control b at 1 and the target at 0, which is
-    the phase a decomposed Toffoli would have picked up.  It is its own inverse.
+    The wire flip is the plain one: two controls at 1 turn the target, and the
+    branch is entered through the phases ``i`` and ``-i`` rather than the whole
+    space a decomposed Toffoli would walk.  Off that branch exactly one state
+    changes -- control a at 1 with control b clear and the target set -- and it
+    picks up a sign.  It is its own inverse.
     """
-    identity = tp.eye(8, dtype=c_dtype, device=device)
-    toffoli = mcx_matrix(2, device=device, c_dtype=c_dtype)
-    sign = tp.eye(8, dtype=c_dtype, device=device)
-    # Index 2 is control a = 0, control b = 1, target = 0.
-    sign[2, 2] = -1
-    return toffoli @ sign
+    mat = tp.eye(8, dtype=c_dtype, device=device)
+    # Two controls at 1: |110> and |111> trade places through those phases.
+    mat[6, 6] = 0
+    mat[7, 7] = 0
+    mat[6, 7] = -1j
+    mat[7, 6] = 1j
+    # Index 5 is control a = 1, control b = 0, target = 1.
+    mat[5, 5] = -1
+    return mat
+
+
+def dcx_matrix(*, device=None, c_dtype=tp.complex64) -> tp.Tensor:
+    """The two-wire controlled X written the way its matrix spells it.
+
+    The leading index bit of this matrix is the *target*: it flips when the
+    other wire reads 1, so the second wire named drives the first.  That is the
+    mirror of :func:`controlled_matrix` over :func:`x_matrix`, which reads its
+    control off the leading bit -- same operator, opposite convention, which is
+    why the gate is worth carrying under a name of its own.
+    """
+    return _constant(
+        [[1, 0, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0], [0, 1, 0, 0]],
+        device=device,
+        c_dtype=c_dtype,
+    )
+
+
+def ecr_matrix(*, device=None, c_dtype=tp.complex64) -> tp.Tensor:
+    """The echoed cross-resonance gate, the entangling native of one family.
+
+    It swaps the single-excitation subspace with a quarter turn of phase on each
+    leg, which is what makes it entangle from a product state where a plain
+    controlled rotation would not.
+    """
+    scale = 1.0 / math.sqrt(2.0)
+    return _polar(
+        tp.tensor(
+            [[0, 0, 1, 0], [0, 0, 0, 1], [1, 0, 0, 0], [0, 1, 0, 0]],
+            dtype=tp.float64,
+            device=device,
+        )
+        * scale,
+        tp.tensor(
+            [[0, 0, 0, 1], [0, 0, 1, 0], [0, -1, 0, 0], [-1, 0, 0, 0]],
+            dtype=tp.float64,
+            device=device,
+        )
+        * scale,
+        c_dtype,
+    )
+
+
+def rc3x_matrix(*, device=None, c_dtype=tp.complex64) -> tp.Tensor:
+    """The four-wire relative-phase gate on ``[a, b, c, target]``.
+
+    It is diagonal: the identity everywhere except on the states where all three
+    controls read 1, where it puts ``i``, ``-i``, ``1`` and ``-1`` on ``|1100>``,
+    ``|1101>``, ``|1110>`` and ``|1111>`` in turn.  Two of those are the sign a
+    decomposed gate would have paid, which is what makes it cheaper; the target
+    itself is never flipped.
+    """
+    mat = tp.eye(16, dtype=c_dtype, device=device)
+    for offset, phase in enumerate((1j, -1j, 1.0, -1.0)):
+        row = 12 + offset
+        mat[row, row] = phase
+    return mat
 
 
 def globalphase_matrix(angle, *, device=None, c_dtype=None) -> tp.Tensor:
@@ -546,6 +619,96 @@ def _sum_axis_counts(n_qubits: int, *, device=None):
     bits = tp.arange(n_qubits, dtype=tp.int64, device=device)
     ones = ((idx.unsqueeze(-1) >> bits) & 1).sum(-1)
     return (n_qubits - 2 * ones).to(tp.float32)
+
+
+def _assemble(rows):
+    """A 2-D tensor from a list of rows of scalars, keeping any gradients."""
+    return tp.stack([tp.stack(list(row)) for row in rows])
+
+
+def _pair_mixer(theta, beta, *, on_odd, device, c_dtype):
+    """The four-by-four matrix behind the number-conserving pair gates.
+
+    ``on_odd`` picks the subspace the gate turns: the states carrying exactly
+    one excitation for the sum gate, the states carrying an even number for the
+    difference gate.  Either way the two wires start and end on the same value,
+    so the excitation count is untouched.
+    """
+    theta = tp.as_tensor(theta)
+    beta = tp.as_tensor(beta)
+    c_dtype = _param_c_dtype(theta, beta, given=c_dtype)
+    cos_half = tp.cos(theta / 2)
+    sin_half = tp.sin(theta / 2)
+    # -i sin(theta/2) e^{+i beta} carries sin*sin(beta) real and -sin*cos(beta)
+    # imaginary; the conjugate turning is the other sign of the real part.
+    beta_sin = sin_half * tp.sin(beta)
+    beta_cos = sin_half * tp.cos(beta)
+    zero = tp.zeros_like(cos_half)
+    one = tp.ones_like(cos_half)
+
+    if on_odd:
+        real = [[one, zero, zero, zero],
+                [zero, cos_half, beta_sin, zero],
+                [zero, -beta_sin, cos_half, zero],
+                [zero, zero, zero, one]]
+        imag = [[zero, zero, zero, zero],
+                [zero, zero, -beta_cos, zero],
+                [zero, -beta_cos, zero, zero],
+                [zero, zero, zero, zero]]
+    else:
+        real = [[cos_half, zero, zero, -beta_sin],
+                [zero, one, zero, zero],
+                [zero, zero, one, zero],
+                [beta_sin, zero, zero, cos_half]]
+        imag = [[zero, zero, zero, -beta_cos],
+                [zero, zero, zero, zero],
+                [zero, zero, zero, zero],
+                [-beta_cos, zero, zero, zero]]
+    return _as_complex(_assemble(real), _assemble(imag), c_dtype)
+
+
+def xx_plus_yy_matrix(theta, beta=0.0, *, device=None, c_dtype=None) -> tp.Tensor:
+    """The pair mixer that trades one excitation for the other.
+
+    The states that already carry an even number of excitations are left alone
+    and the pair with exactly one is turned, so the register's excitation count
+    never changes -- what chemistry ansätze need from an entangler.  ``beta``
+    tilts the turning towards ``X`` at 0 and towards ``Y`` at pi/2.
+
+    Args:
+        theta: how far to turn the pair.
+        beta: where the turning starts from; 0 for ``XX``, pi/2 for ``YY``.
+    """
+    return _pair_mixer(theta, beta, on_odd=True, device=device, c_dtype=c_dtype)
+
+
+def xx_minus_yy_matrix(theta, beta=0.0, *, device=None, c_dtype=None) -> tp.Tensor:
+    """The pair mixer that does not touch a state of one excitation.
+
+    The mirror image of :func:`xx_plus_yy_matrix`: same turning, opposite
+    subspace, so together the two cover the ``XX`` and ``YY`` generators over the
+    same two wires.
+    """
+    return _pair_mixer(theta, beta, on_odd=False, device=device, c_dtype=c_dtype)
+
+
+def single_excitation_matrix(theta, *, device=None, c_dtype=None) -> tp.Tensor:
+    """A real rotation of the pair that carries exactly one excitation.
+
+    It starts and ends inside that pair, so no phases are needed at all -- the
+    cheapest way to mix two states -- and ``-theta`` undoes it.
+    """
+    theta = tp.as_tensor(theta)
+    c_dtype = _param_c_dtype(theta, given=c_dtype)
+    cos_half = tp.cos(theta / 2)
+    sin_half = tp.sin(theta / 2)
+    zero = tp.zeros_like(cos_half)
+    one = tp.ones_like(cos_half)
+    rows = [[one, zero, zero, zero],
+            [zero, cos_half, -sin_half, zero],
+            [zero, sin_half, cos_half, zero],
+            [zero, zero, zero, one]]
+    return _as_complex(_assemble(rows), _assemble([[zero] * 4 for _ in range(4)]), c_dtype)
 
 
 def multirz_matrix(angle, n_qubits: int, *, device=None, c_dtype=None) -> tp.Tensor:
@@ -772,6 +935,70 @@ def apply_global_phase(state, angle, wire: int = 0):
     by; any wire does, so the argument is only there to name one.
     """
     return _on(state, globalphase_matrix(angle), wire)
+
+
+def apply_rccx(state, control_a, control_b, target):
+    """Apply the relative-phase Toffoli on ``(control_a, control_b, target)``."""
+    return _const(state, rccx_matrix, [control_a, control_b, target])
+
+
+def apply_dcx(state, wire_a, wire_b):
+    """Apply :func:`dcx_matrix` on ``(wire_a, wire_b)``, in that order.
+
+    The matrix drives its first wire from its second, so this is
+    ``apply_cnot(state, wire_b, wire_a)``.  The separate name is here because
+    the gate is usually reached for as a block whose wires are written the
+    other way round.
+    """
+    return _const(state, dcx_matrix, [wire_a, wire_b])
+
+
+def apply_ecr(state, wire_a, wire_b):
+    """Apply the echoed cross-resonance gate on ``(wire_a, wire_b)``."""
+    return _const(state, ecr_matrix, [wire_a, wire_b])
+
+
+def apply_rc3x(state, control_a, control_b, control_c, target):
+    """Apply the four-wire relative-phase gate; the wires are given in order."""
+    return _const(state, rc3x_matrix, [control_a, control_b, control_c, target])
+
+
+def apply_xx_plus_yy(state, wires, theta, beta=0.0):
+    """Mix the pair of states that carries exactly one excitation.
+
+    Args:
+        state: amplitudes shaped ``[batch, 2, 2, ...]``.
+        wires: the two wires to mix.
+        theta: how far to turn the pair.
+        beta: where the turning starts from; 0 for ``XX``, pi/2 for ``YY``.
+    """
+    return apply_gate(
+        state,
+        xx_plus_yy_matrix(theta, beta, device=state.device),
+        list(wires),
+    )
+
+
+def apply_xx_minus_yy(state, wires, theta, beta=0.0):
+    """Mix the pair of states that carries an even number of excitations.
+
+    The mirror of :func:`apply_xx_plus_yy`: the same turning, landing on the
+    other subspace.
+    """
+    return apply_gate(
+        state,
+        xx_minus_yy_matrix(theta, beta, device=state.device),
+        list(wires),
+    )
+
+
+def apply_single_excitation(state, wires, theta):
+    """Rotate the pair that carries exactly one excitation, with no phases."""
+    return apply_gate(
+        state,
+        single_excitation_matrix(theta, device=state.device),
+        list(wires),
+    )
 
 
 def apply_multirz(state, angle, wires=None):

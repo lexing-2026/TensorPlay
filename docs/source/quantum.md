@@ -76,11 +76,18 @@ take the parameter as the last argument: `apply_rx`, `apply_ry`, `apply_rz`,
 `apply_p`, `apply_u2`, `apply_u3`, `apply_rot` (any axis), `apply_multirz` (one
 angle on a list of wires), `apply_global_phase` (scales the whole state).
 Two-qubit gates: `apply_cx`/`apply_cnot`, `apply_cy`, `apply_cz`, `apply_swap`,
-`apply_iswap`, and the controlled parameter gates `apply_cp`, `apply_crx`,
-`apply_cry`, `apply_crz`. Wider gates: `apply_toffoli`/`apply_ccx` (three wires),
-`apply_rccx` (the relative-phase Toffoli), `apply_cswap` (control plus two
+`apply_iswap`, `apply_dcx` (the same controlled X with the target written
+first), `apply_ecr` (echoed cross resonance), and the controlled parameter
+gates `apply_cp`, `apply_crx`, `apply_cry`, `apply_crz`. Wider gates:
+`apply_toffoli`/`apply_ccx` (three wires), `apply_rccx` (the relative-phase
+Toffoli), `apply_rc3x` (its four-wire version), `apply_cswap` (control plus two
 targets), and `apply_mcx`, which takes a control list and flips the remaining
 wire.
+
+The chemistry pair gates mix two wires while leaving the register's excitation
+count alone, which is what a particle-number-preserving ansatz needs:
+`apply_xx_plus_yy`, `apply_xx_minus_yy` and `apply_single_excitation`, each
+taking the pair of wires and an angle.
 
 The matching matrix builders are available on their own — `h_matrix`,
 `rot_x_matrix`, `swap_matrix`, `mcx_matrix` and the rest — so a gate can be
@@ -332,6 +339,12 @@ in a single pass over the amplitudes.
     tensorplay.quantum.multirz_eigvals
     tensorplay.quantum.globalphase_matrix
     tensorplay.quantum.rccx_matrix
+    tensorplay.quantum.dcx_matrix
+    tensorplay.quantum.ecr_matrix
+    tensorplay.quantum.rc3x_matrix
+    tensorplay.quantum.xx_plus_yy_matrix
+    tensorplay.quantum.xx_minus_yy_matrix
+    tensorplay.quantum.single_excitation_matrix
     tensorplay.quantum.dagger
     tensorplay.quantum.expand_to_register
     tensorplay.quantum.zeros_state

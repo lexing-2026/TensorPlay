@@ -367,23 +367,6 @@ def test_relative_phase_toffoli_flips_where_the_plain_one_flips():
             assert relative == index
 
 
-def test_relative_phase_toffoli_adds_a_sign_and_is_its_own_inverse():
-    relative = tq.rccx_matrix()
-    tp.testing.assert_close(relative @ relative, tp.eye(8, dtype=relative.dtype), atol=1e-6, rtol=1e-6)
-    out = tq.apply_rccx(tq.basis_state(2, 3), 0, 1, 2)
-    tp.testing.assert_close(
-        tq.flatten(out),
-        -tq.flatten(tq.basis_state(2, 3)),
-        atol=1e-6,
-        rtol=1e-6,
-    )
-    # The flip of the plain gate still happens on the two-control branch.
-    flipped = tq.apply_rccx(tq.basis_state(6, 3), 0, 1, 2)
-    tp.testing.assert_close(
-        tq.flatten(flipped), tq.flatten(tq.basis_state(7, 3)), atol=1e-6, rtol=1e-6
-    )
-
-
 def test_global_phase_matrix_is_a_scalar_operator():
     tp.testing.assert_close(
         tq.globalphase_matrix(0.0).reshape(()),
@@ -488,3 +471,214 @@ def test_an_ascending_wire_list_behaves_as_before():
 def test_a_repeated_wire_is_still_refused():
     with pytest.raises(ValueError):
         tq.apply_cnot(tq.zeros_state(2), 1, 1)
+
+
+# ---------------------------------------------------------------------------
+# The gates that come in families
+# ---------------------------------------------------------------------------
+
+
+def test_the_relative_phase_toffoli_picks_up_its_sign_on_one_state():
+    # Control a at 1 with control b clear and the target set: |101>.
+    out = tq.apply_rccx(tq.basis_state(5, 3), 0, 1, 2)
+    tp.testing.assert_close(
+        _flat(out), _flat(-1 * tq.basis_state(5, 3)), atol=1e-6, rtol=1e-6
+    )
+    # Every other state outside the two-control branch is left alone.
+    for index in (0, 1, 2, 3, 4):
+        tp.testing.assert_close(
+            _flat(tq.apply_rccx(tq.basis_state(index, 3), 0, 1, 2)),
+            _flat(tq.basis_state(index, 3)),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+
+def test_the_relative_phase_toffoli_flips_with_a_quarter_turn_of_phase():
+    # |110> and |111> trade places, each carrying half a turn of phase.
+    out = tq.apply_rccx(tq.basis_state(6, 3), 0, 1, 2)
+    tp.testing.assert_close(
+        _flat(out), _flat(1j * tq.basis_state(7, 3)), atol=1e-6, rtol=1e-6
+    )
+    out = tq.apply_rccx(tq.basis_state(7, 3), 0, 1, 2)
+    tp.testing.assert_close(
+        _flat(out), _flat(-1j * tq.basis_state(6, 3)), atol=1e-6, rtol=1e-6
+    )
+
+
+def test_the_relative_phase_toffoli_is_its_own_inverse():
+    mat = tq.rccx_matrix()
+    tp.testing.assert_close(
+        mat @ mat, tp.eye(8, dtype=mat.dtype), atol=1e-6, rtol=1e-6
+    )
+
+
+def test_the_double_controlled_x_drives_its_first_wire_from_its_second():
+    # The pair it swaps is |01> and |10>, so the wire named second is the
+    # control -- the opposite of what the matrix of a controlled X usually says.
+    mat = tq.dcx_matrix()
+    for index in range(4):
+        start = tq.basis_state(index, 2)
+        tp.testing.assert_close(
+            mat @ _flat(start).reshape(4, 1),
+            _flat(tq.apply_dcx(start, 0, 1)).reshape(4, 1),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+    tp.testing.assert_close(
+        _flat(tq.apply_dcx(tq.basis_state(1, 2), 0, 1)),
+        _flat(tq.apply_cnot(tq.basis_state(1, 2), 1, 0)),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_the_double_controlled_x_is_its_own_inverse():
+    mat = tq.dcx_matrix()
+    tp.testing.assert_close(
+        mat @ mat, tp.eye(4, dtype=mat.dtype), atol=1e-6, rtol=1e-6
+    )
+    for index in range(4):
+        start = tq.basis_state(index, 2)
+        tp.testing.assert_close(
+            _flat(tq.apply_dcx(tq.apply_dcx(start, 0, 1), 0, 1)),
+            _flat(start),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+
+def test_the_echoed_cross_resonance_gate_entangles_a_product_state():
+    start = tq.state_from_bases([0, 2], 2)  # (|00> + |10>) / sqrt(2)
+    out = tq.apply_ecr(start, 0, 1)
+    probs = tq.probs(out).reshape(-1)
+    # |00> feeds |10> and |10> feeds |00>, each with half the weight and a
+    # quarter turn of phase; the state is no longer a product of its wires.
+    assert probs[0] > 0.24 and probs[2] > 0.24
+    assert tq.expectation(out, "IZ").abs() < 0.7
+
+
+def test_the_echoed_cross_resonance_gate_is_its_own_inverse():
+    mat = tq.ecr_matrix()
+    tp.testing.assert_close(
+        mat @ mat, tp.eye(4, dtype=mat.dtype), atol=1e-6, rtol=1e-6
+    )
+
+
+def test_the_four_wire_relative_phase_gate_is_diagonal():
+    mat = tq.rc3x_matrix()
+    assert mat.shape == (16, 16)
+    for index in range(16):
+        column = mat[:, index]
+        nonzero = [row for row in range(16) if abs(complex(column[row])) > 1e-6]
+        assert len(nonzero) == 1  # diagonal
+    # Only the states with all three controls set carry a phase.
+    phases = {index: complex(mat[index, index]) for index in range(16)}
+    assert all(phases[index] == 1 for index in range(12))
+    assert phases[12] == 1j and phases[13] == -1j
+    assert phases[14] == 1 and phases[15] == -1
+
+
+def test_the_four_wire_relative_phase_gate_leaves_the_target_alone():
+    start = tq.basis_state(13, 4)  # |1101>
+    out = tq.apply_rc3x(start, 0, 1, 2, 3)
+    tp.testing.assert_close(
+        _flat(out), _flat(-1j * tq.basis_state(13, 4)), atol=1e-6, rtol=1e-6
+    )
+
+
+def test_the_pair_mixer_leaves_an_even_excitation_state_alone():
+    for index in (0, 3):
+        tp.testing.assert_close(
+            _flat(tq.apply_xx_plus_yy(tq.basis_state(index, 2), [0, 1], 0.7, 0.3)),
+            _flat(tq.basis_state(index, 2)),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+
+def test_the_pair_mixer_leaves_an_odd_excitation_state_alone():
+    for index in (1, 2):
+        tp.testing.assert_close(
+            _flat(tq.apply_xx_minus_yy(tq.basis_state(index, 2), [0, 1], 0.7, 0.3)),
+            _flat(tq.basis_state(index, 2)),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+
+def test_the_pair_mixers_never_change_the_excitation_count():
+    theta, beta = 0.7, 0.3
+    for mixer in (tq.xx_plus_yy_matrix, tq.xx_minus_yy_matrix):
+        mat = mixer(theta, beta)
+        for index in range(4):
+            column = mat[:, index]
+            row = max(range(4), key=lambda r: abs(complex(column[r])))
+            # The number of ones in the index is the same on both sides.
+            assert bin(index).count("1") == bin(row).count("1")
+
+
+def test_the_sum_and_difference_mixers_disagree():
+    theta, beta = 0.7, 0.3
+    state = tq.basis_state(1, 2)
+    summed = tq.apply_xx_plus_yy(state, [0, 1], theta, beta)
+    differenced = tq.apply_xx_minus_yy(state, [0, 1], theta, beta)
+    tp.testing.assert_close(_flat(differenced), _flat(state), atol=1e-6, rtol=1e-6)
+    assert abs(complex(_flat(summed)[0, 2])) > 1e-3
+
+
+def test_a_half_turn_of_the_sum_mixer_takes_its_pair_all_the_way():
+    # theta = pi leaves cos(pi/2) at 0, so the pair swaps outright.
+    state = tq.basis_state(1, 2)
+    out = tq.apply_xx_plus_yy(state, [0, 1], math.pi, 0.0)
+    tp.testing.assert_close(
+        _flat(out), _flat(-1j * tq.basis_state(2, 2)), atol=1e-6, rtol=1e-6
+    )
+
+
+def test_the_single_excitation_mixer_stays_real():
+    out = tq.apply_single_excitation(tq.basis_state(1, 2), [0, 1], 0.7)
+    assert float(out.imag.abs().max()) == 0.0
+    tp.testing.assert_close(
+        _flat(out),
+        tp.tensor([[0.0, 0.9393727, 0.3428978, 0.0]], dtype=tp.complex64),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_the_single_excitation_mixer_keeps_the_pair_odd():
+    out = tq.apply_single_excitation(tq.basis_state(1, 2), [0, 1], 0.7)
+    probs = tq.probs(out).reshape(-1)
+    assert probs[0] < 1e-6 and probs[3] < 1e-6
+
+
+def test_a_negative_angle_undoons_the_single_excitation_mixer():
+    state = tq.apply_single_excitation(tq.basis_state(1, 2), [0, 1], 0.7)
+    back = tq.apply_single_excitation(state, [0, 1], -0.7)
+    tp.testing.assert_close(
+        _flat(back), _flat(tq.basis_state(1, 2)), atol=1e-6, rtol=1e-6
+    )
+
+
+def test_the_pair_mixers_carry_their_angle_as_a_gradient():
+    for mixer, wires, index in (
+        (tq.xx_plus_yy_matrix, [0, 1], 1),
+        (tq.xx_minus_yy_matrix, [0, 1], 0),
+        (tq.single_excitation_matrix, [0, 1], 1),
+    ):
+        theta = tp.tensor(0.4, requires_grad=True)
+        beta = tp.tensor(0.0)
+        mat = mixer(theta, beta) if mixer is not tq.single_excitation_matrix else mixer(theta)
+        value = mat[index, index] if mixer is not tq.single_excitation_matrix else mat[index, index]
+        value.real.backward()
+        assert theta.grad is not None
+
+
+def test_the_pair_gates_run_on_named_wires_in_either_order():
+    state = tq.basis_state(1, 2)
+    forward = tq.apply_xx_plus_yy(state, [0, 1], 0.5, 0.0)
+    # The same operator with the wires named the other way round is the same
+    # operator, since the gate treats them alike.
+    backward = tq.apply_xx_plus_yy(state, [1, 0], 0.5, 0.0)
+    tp.testing.assert_close(forward, backward, atol=1e-6, rtol=1e-6)
