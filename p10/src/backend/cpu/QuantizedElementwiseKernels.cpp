@@ -5,7 +5,6 @@
 #include "QuantRowwise.h"
 #include "QuantPacked.h"
 #include "QuantNative.h"
-#include "QuantUtils.h"
 #include "Parallel.h"
 #include <cfenv>
 #ifndef CPU_CAPABILITY_AVX512
@@ -1335,8 +1334,10 @@ void cat_rows_impl(const int8_t* input, int8_t* output, int64_t rows,
             for (int64_t col = 0; col < chunk; ++col) {
                 const double value =
                     (static_cast<double>(src[col]) - input_zero_point) * input_scale;
-                int8_t code = quant::requantize_value(
-                    value, inverse_output_scale, output_zero_point);
+                const double rounded = std::nearbyint(
+                    value * inverse_output_scale) + output_zero_point;
+                int8_t code = static_cast<int8_t>(std::clamp(
+                    static_cast<int64_t>(rounded), int64_t(-128), int64_t(127)));
                 if (relu) code = std::max(code, zero);
                 dst[col] = code;
             }
