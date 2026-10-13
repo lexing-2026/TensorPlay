@@ -113,12 +113,17 @@ __device__ float tanh_vector_value(float x) {
 
 __global__ void word_activation_codes(const int32_t* input, int32_t* output, int64_t size,
         float scale, int64_t zp, float inverse_scale, int64_t output_zp, int64_t vector_end,
-        bool hyperbolic) {
+        bool hyperbolic, bool vector_math) {
     for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          i < size; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
         float value;
         if (i < vector_end) {
-            if (hyperbolic) {
+            if (!vector_math) {
+                const float real = static_cast<float>((static_cast<double>(input[i]) - zp) * scale);
+                if (hyperbolic) value = activation_math::tanh_scalar(real);
+                else value = __fdiv_rn(1.f, __fadd_rn(1.f,
+                    static_cast<float>(::exp(-static_cast<double>(real)))));
+            } else if (hyperbolic) {
                 const float real = __fmaf_rn(scale, __int2float_rn(input[i]), __fmul_rn(scale, -static_cast<float>(zp)));
                 value = tanh_vector_value(real);
             } else {
@@ -188,13 +193,16 @@ Tensor activation(const Tensor& input, double scale, int64_t zp, quant::Activati
             }
         } else if ((fn.op == 4 || fn.op == 5) && input.dtype() == DType::QInt32) {
             int lanes = 8;
+            bool vector_math = false;
 #if defined(__x86_64__) || defined(_M_X64)
-            if (cpu::get_cpu_capability() == cpu::CPUCapability::AVX512) lanes = 16;
+            const auto capability = cpu::get_cpu_capability();
+            vector_math = capability != cpu::CPUCapability::DEFAULT;
+            if (capability == cpu::CPUCapability::AVX512) lanes = 16;
 #endif
             const int64_t vector_end = input.impl()->is_contiguous_in(format)
                 ? input.numel() / (2 * lanes) * (2 * lanes) : 0;
             word_activation_codes<<<blocks,256,0,stream>>>(x.data_ptr<int32_t>(), out.data_ptr<int32_t>(),
-                input.numel(), xs, xz, inverse_scale, zp, vector_end, fn.op == 5);
+                input.numel(), xs, xz, inverse_scale, zp, vector_end, fn.op == 5, vector_math);
         } else switch (input.dtype()) {
             case DType::QInt8: activation_codes<<<blocks,256,0,stream>>>(x.data_ptr<int8_t>(),out.data_ptr<int8_t>(),input.numel(),xs,xz,inverse_scale,zp,fn); break;
             case DType::QUInt8: activation_codes<<<blocks,256,0,stream>>>(x.data_ptr<uint8_t>(),out.data_ptr<uint8_t>(),input.numel(),xs,xz,inverse_scale,zp,fn); break;
