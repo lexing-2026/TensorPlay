@@ -151,6 +151,7 @@ from ._gradients import (
     param_shift,
 )
 from ._hamiltonian import (
+    energy_from_density,
     Hamiltonian,
     energy,
     matrix_exp_evolve,
@@ -283,6 +284,7 @@ __all__ = [
     "ecr_matrix",
     "efficient_su2",
     "energy",
+    "energy_from_density",
     "entanglement_pairs",
     "expand_to_register",
     "expectation",

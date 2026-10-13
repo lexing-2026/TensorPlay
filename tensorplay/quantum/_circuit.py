@@ -397,11 +397,24 @@ class Circuit(tp.nn.Module):
     # -- execution ----------------------------------------------------------
 
     def apply(self, state: tp.Tensor) -> tp.Tensor:
-        """Thread ``state`` through the gate list and return the result."""
+        """Thread ``state`` through the gate list and return the result.
+
+        A parameter carrying a batch of its own makes the run a batch of runs:
+        the state starts as one entry and is widened to the first gate that asks
+        for more, so a circuit handed a ``[batch]`` angle answers with a
+        ``[batch]`` state without the caller having to size anything.
+        """
         for name, wires, params in self._entries:
             if name == "barrier":
                 continue
             gate = GATE_TABLE[name]
+            for value in params:
+                if isinstance(value, tp.Tensor) and value.dim() > 0:
+                    if state.shape[0] == 1 and value.shape[0] != 1:
+                        state = tp.broadcast_to(
+                            state, (value.shape[0], *state.shape[1:])
+                        )
+                    break
             state = gate.apply(state, wires, *params)
         return state
 
