@@ -72,4 +72,7 @@ DECLARE_DISPATCH(quantized_binary_fn, quantized_binary_stub)
 DECLARE_DISPATCH(quantized_fp16_linear_fn, quantized_fp16_linear_stub)
 DECLARE_DISPATCH(quantized_clip_fn, quantized_clip_stub)
 DECLARE_DISPATCH(quantized_lookup_fn, quantized_lookup_stub)
+using quantized_cat_rows_fn = void (*)(const int8_t*, int8_t*, int64_t, int64_t,
+    int64_t, int64_t, double, int64_t, double, int64_t, bool, bool);
+DECLARE_DISPATCH(quantized_cat_rows_fn, quantized_cat_rows_stub)
 }

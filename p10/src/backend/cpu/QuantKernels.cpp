@@ -3444,41 +3444,16 @@ Tensor quantized_cat_impl_cpu(const std::vector<Tensor>& tensors, int64_t dim,
         }
     }
 
-    const double inv_out = 1.0 / out_scale;
     int64_t offset = 0;
     for (const Tensor& t : tensors) {
         const Tensor tc = t.contiguous();
         const int8_t* pi = tc.data_ptr<int8_t>();
         const int64_t seg = t.size(dim);
-        if (same_qparams) {
-            // Grid-identical inputs: the codes concatenate verbatim.
-            for (int64_t o = 0; o < outer; ++o) {
-                std::memcpy(po + (o * concat_size + offset) * inner,
-                            pi + o * seg * inner,
-                            static_cast<size_t>(seg * inner) * sizeof(int8_t));
-            }
-        } else {
-            const double in_scale = quantized::q_scale(t);
-            const double in_zp = static_cast<double>(quantized::q_zero_point(t));
-            for (int64_t o = 0; o < outer; ++o) {
-                int8_t* dst =
-                    po + (o * concat_size + offset) * inner;
-                const int8_t* src = pi + o * seg * inner;
-                for (int64_t k = 0; k < seg * inner; ++k) {
-                    const double x =
-                        (static_cast<double>(src[k]) - in_zp) * in_scale;
-                    dst[k] = requantize_value(x, inv_out, out_zp);
-                }
-            }
-        }
+        quantized_cat_rows_stub(
+            DeviceType::CPU, pi, po, outer, seg * inner, concat_size * inner,
+            offset * inner, quantized::q_scale(t), quantized::q_zero_point(t),
+            out_scale, out_zp, same_qparams, relu_fused);
         offset += seg;
-    }
-    if (relu_fused) {
-        const int8_t q_zero = static_cast<int8_t>(out_zp);
-        const int64_t numel = out.numel();
-        for (int64_t i = 0; i < numel; ++i) {
-            po[i] = std::max(po[i], q_zero);
-        }
     }
     out.impl()->set_quantizer(make_per_tensor_affine_quantizer(
         out_scale, out_zp, DType::QInt8));

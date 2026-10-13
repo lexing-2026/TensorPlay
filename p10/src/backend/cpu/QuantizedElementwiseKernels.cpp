@@ -5,6 +5,7 @@
 #include "QuantRowwise.h"
 #include "QuantPacked.h"
 #include "QuantNative.h"
+#include "QuantUtils.h"
 #include "Parallel.h"
 #include <cfenv>
 #ifndef CPU_CAPABILITY_AVX512
@@ -1305,6 +1306,44 @@ void embedding_impl(const uint8_t* w, const int64_t* indices, const int64_t* off
     }
 }
 
+void cat_rows_impl(const int8_t* input, int8_t* output, int64_t rows,
+        int64_t chunk, int64_t width, int64_t offset, double input_scale,
+        int64_t input_zero_point, double output_scale, int64_t output_zero_point,
+        bool same_qparams, bool relu) {
+    using QV = vec::Vectorized<qint8>;
+    const int8_t zero = static_cast<int8_t>(output_zero_point);
+    const int64_t vector_end = chunk - chunk % QV::size();
+    parallel::parallel_for(0, rows, 1, [&](int64_t first, int64_t last) {
+        for (int64_t row = first; row < last; ++row) {
+            const int8_t* src = input + row * chunk;
+            int8_t* dst = output + row * width + offset;
+            if (same_qparams) {
+                int64_t col = 0;
+                if (relu) {
+                    const QV minimum{qint8(zero)};
+                    for (; col < vector_end; col += QV::size())
+                        QV::loadu(src + col).relu(minimum).store(dst + col);
+                }
+                if (!relu) {
+                    std::memcpy(dst, src, static_cast<size_t>(chunk));
+                } else {
+                    for (; col < chunk; ++col) dst[col] = std::max(src[col], zero);
+                }
+                continue;
+            }
+            const double inverse_output_scale = 1.0 / output_scale;
+            for (int64_t col = 0; col < chunk; ++col) {
+                const double value =
+                    (static_cast<double>(src[col]) - input_zero_point) * input_scale;
+                int8_t code = quant::requantize_value(
+                    value, inverse_output_scale, output_zero_point);
+                if (relu) code = std::max(code, zero);
+                dst[col] = code;
+            }
+        }
+    });
+}
+
 }
 }
 
@@ -1333,6 +1372,7 @@ REGISTER_DISPATCH(quantized_softmax_stub, &softmax_impl);
 REGISTER_DISPATCH(quantized_binary_stub, &binary_impl);
 REGISTER_DISPATCH(quantized_embedding_stub, &embedding_impl);
 REGISTER_DISPATCH(quantized_fp16_linear_stub, &fp16_linear_impl);
+REGISTER_DISPATCH(quantized_cat_rows_stub, &cat_rows_impl);
 #else
 ALSO_REGISTER_AVX512_DISPATCH(quantized_subbyte_pack_stub, &subbyte_pack_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_subbyte_unpack_stub, &subbyte_unpack_impl);
@@ -1358,5 +1398,6 @@ ALSO_REGISTER_AVX512_DISPATCH(quantized_softmax_stub, &softmax_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_binary_stub, &binary_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_embedding_stub, &embedding_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_fp16_linear_stub, &fp16_linear_impl);
+ALSO_REGISTER_AVX512_DISPATCH(quantized_cat_rows_stub, &cat_rows_impl);
 #endif
 }
