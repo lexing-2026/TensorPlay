@@ -858,8 +858,15 @@ Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
 
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
-    if (index.dim() != 1) TP_THROW(IndexError, "index_select(): index should be a vector");
-    Tensor idx = normalize_index_cpu(index, self.size(dim), "index_select");
+    // A 0-dim index is treated as a single-element vector, matching the
+    // behaviour of the reference implementation.
+    Tensor index_t = index;
+    if (index_t.dim() == 0) {
+        index_t = index_t.reshape({1});
+    } else if (index_t.dim() != 1) {
+        TP_THROW(IndexError, "index_select(): index should be a vector");
+    }
+    Tensor idx = normalize_index_cpu(index_t, self.size(dim), "index_select");
     int64_t n_idx = idx.numel();
     int64_t row = self.size(dim);
     const int64_t* ip = idx.data_ptr<int64_t>();
@@ -1717,10 +1724,10 @@ namespace {
 template <typename scalar_t>
 std::tuple<Tensor, Tensor, Tensor> unique_flat_cpu_template(
         const Tensor& self, bool return_inverse, bool return_counts) {
-    // A 0-dim input sorts as a single-element row; the inverse keeps the
-    // original (scalar) shape.
-    Tensor input = self.dim() == 0 ? self.reshape({1}).contiguous()
-                                   : self.contiguous();
+    // Flatten any input to one dimension (a 0-dim input sorts as a single
+    // element row); the inverse keeps the original (scalar) shape.
+    Tensor input = self.dim() == 0 ? self.reshape({1})
+                                   : self.reshape({-1}).contiguous();
     const int64_t numel = input.numel();
     Tensor values = Tensor::empty({0}, self.dtype(), self.device());
     Tensor inverse = Tensor::empty({0}, DType::Int64, self.device());
@@ -1773,8 +1780,8 @@ std::tuple<Tensor, Tensor, Tensor> unique_flat_cpu_template(
 template <typename scalar_t>
 std::tuple<Tensor, Tensor, Tensor> unique_consecutive_flat_cpu_template(
         const Tensor& self, bool return_inverse, bool return_counts) {
-    Tensor input = self.dim() == 0 ? self.reshape({1}).contiguous()
-                                   : self.contiguous();
+    Tensor input = self.dim() == 0 ? self.reshape({1})
+                                   : self.reshape({-1}).contiguous();
     const int64_t numel = input.numel();
     Tensor values = Tensor::empty({0}, self.dtype(), self.device());
     Tensor inverse = Tensor::empty({0}, DType::Int64, self.device());

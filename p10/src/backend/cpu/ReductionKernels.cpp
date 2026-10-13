@@ -73,7 +73,7 @@ Tensor mean_dim_kernel(const Tensor& self, const std::vector<int64_t>& dims, boo
     std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(self.shape());
     for (int64_t d : dims) {
         if (d < 0) d += shape.size();
-        count *= shape[d];
+        count *= shape.empty() ? 1 : shape[d];
     }
 
     if (mean_needs_opmath(out_dtype)) {

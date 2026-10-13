@@ -4548,7 +4548,13 @@
 #
 # `surrogate` selects the gradient that replaces the (almost everywhere zero)
 # step derivative during backward: 0 straight-through, 1 sigmoid, 2 fast
-# sigmoid, 3 piecewise-linear, 4 arctangent, 5 erf.  `alpha` scales the
+# sigmoid, 3 piecewise-linear, 4 arctangent, 5 erf, 6 piecewise-quadratic,
+# 7 piecewise-exponential, 8 super-spike, 9 nonzero-sign-log-abs (these are
+# the single-parameter families supported inside the fused LIF kernels),
+# 10 piecewise-leaky-relu (w, c), 11 leaky-k-relu (beta=leak, w=k),
+# 12 S2NN (alpha, beta), 13 q-pseudo-spike, 14 square-wave-fourier-series
+# (n, T_period); ids 10-14 are available through ``snn_surrogate_grad``.
+# `alpha` scales the surrogate.  `detach_reset` treats the
 # surrogate.  `detach_reset` treats the spike in the voltage-update path as a
 # constant during backward, which is the standard stabilizing choice for
 # surrogate-gradient training.
@@ -4577,14 +4583,14 @@
     CPU: snn_lif_seq_cpu
     CUDA: snn_lif_seq_cuda
 
-- func: snn_lif_seq_backward(Tensor grad_spikes, Tensor grad_v_final, Tensor input, Tensor v_init, Tensor decay, Tensor threshold, Tensor spikes, Tensor v_final, Tensor? v_reset=None, int surrogate=0, float alpha=1.0, bool detach_reset=True) -> (Tensor grad_input, Tensor grad_v_init, Tensor grad_decay, Tensor grad_threshold)
+- func: snn_lif_seq_backward(Tensor grad_spikes, Tensor grad_v_final, Tensor? grad_v_seq, Tensor input, Tensor v_init, Tensor decay, Tensor threshold, Tensor spikes, Tensor v_final, Tensor? v_reset=None, int surrogate=0, float alpha=1.0, bool detach_reset=True) -> (Tensor grad_input, Tensor grad_v_init, Tensor grad_decay, Tensor grad_threshold)
   variants: function
   dispatch:
     CPU: snn_lif_seq_backward_cpu
     CUDA: snn_lif_seq_backward_cuda
 
 # Surrogate gradient of the spike step, evaluated at x = h - threshold.
-- func: snn_surrogate_grad(Tensor x, int surrogate=0, float alpha=1.0) -> Tensor
+- func: snn_surrogate_grad(Tensor x, int surrogate=0, float alpha=1.0, float beta=1.0, float w=1.0, float c=0.0, int n=1, float T_period=1.0) -> Tensor
   variants: function
   dispatch:
     CPU: snn_surrogate_grad_cpu

@@ -78,22 +78,30 @@ Scalar to_scalar(T val) {
 std::vector<int64_t> compute_reduction_shape(const Tensor& self, const std::vector<int64_t>& dims, bool keepdim) {
     std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(self.shape());
     std::vector<bool> is_reduced(shape.size(), false);
-    
+
     for (int64_t d : dims) {
         int64_t dim = d;
+        if (shape.empty()) {
+            // A 0-d tensor accepts -1 and 0 as its single (virtual) dimension.
+            if (dim != 0 && dim != -1) {
+                TP_THROW(IndexError, format_dim_range(shape.size(), d));
+            }
+            is_reduced.push_back(true);
+            continue;
+        }
         if (dim < 0) dim += shape.size();
         if (dim < 0 || dim >= (int64_t)shape.size()) {
              TP_THROW(IndexError, format_dim_range(shape.size(), d));
         }
         is_reduced[dim] = true;
     }
-    
+
     std::vector<int64_t> out_shape;
-    for (size_t i = 0; i < shape.size(); ++i) {
+    for (size_t i = 0; i < is_reduced.size(); ++i) {
         if (is_reduced[i]) {
             if (keepdim) out_shape.push_back(1);
         } else {
-            out_shape.push_back(shape[i]);
+            out_shape.push_back(shape.empty() ? 0 : shape[i]);
         }
     }
     return out_shape;
@@ -2563,6 +2571,14 @@ Tensor sum_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
 
     if (dims.empty()) {
         return sum_kernel_impl(self, dtype);
+    }
+
+    if (self.dim() == 0) {
+        // A 0-dim tensor has a single element; reducing over its only
+        // (virtual) dimension returns the full reduction, optionally keeping
+        // a size-1 dimension.
+        Tensor out = sum_kernel_impl(self, dtype);
+        return keepdim ? out.reshape({1}) : out;
     }
 
     std::vector<int64_t> out_shape = compute_reduction_shape(self, dims, keepdim);
