@@ -85,13 +85,15 @@ def mul(self, other):
     return tensorplay.sparse_mul(self, other)
 
 
-def mm(sparse, dense):
+def mm(sparse, dense, *, reduce="sum"):
     """Matrix product of a supported sparse tensor with a dense matrix.
 
-    The result keeps ``sparse``'s layout: CSR in gives CSR out and COO in is
-    converted to CSR for the fused evaluation, then back to COO.  This routes
-    through the fused reduce (sum) kernel that evaluates only the stored
-    coordinates.
+    ``reduce`` selects how duplicated coordinates are combined during the
+    evaluation: ``"sum"``, ``"mean"``, ``"amax"`` or ``"amin"`` (default
+    ``"sum"``).  The result keeps ``sparse``'s layout for COO/CSR: CSR in
+    gives a dense result (matching the reference API) and COO in is converted
+    to CSR for the fused evaluation, then back to COO.  Other compressed
+    layouts (CSC/BSR/BSC) fall back to a dense product.
     """
     if (
         isinstance(sparse, tensorplay.Tensor)
@@ -112,15 +114,19 @@ def mm(sparse, dense):
     if sparse.dtype != dense.dtype:
         raise TypeError("sparse.mm(): operands must share one dtype")
     if sparse.layout == tensorplay.sparse_csr:
-        result, _ = tensorplay.functional._sparse_mm_reduce_impl(sparse, dense, "sum")
+        result, _ = tensorplay.functional._sparse_mm_reduce_impl(
+            sparse, dense, reduce
+        )
         return result
     if sparse.layout == tensorplay.sparse_coo:
         csr = sparse.to_sparse_csr()
-        result, _ = tensorplay.functional._sparse_mm_reduce_impl(csr, dense, "sum")
+        result, _ = tensorplay.functional._sparse_mm_reduce_impl(
+            csr, dense, reduce
+        )
         return result.to_sparse()
-    raise NotImplementedError(
-        f"sparse.mm(): layout {sparse.layout} is not supported yet"
-    )
+    # CSC/BSR/BSC: dense fallback, matching the reference API which also
+    # returns a dense result for these layouts.
+    return sparse.to_dense() @ dense
 
 
 def addmm(mat, mat1, mat2, *, beta=1.0, alpha=1.0):
@@ -145,10 +151,15 @@ def addmm(mat, mat1, mat2, *, beta=1.0, alpha=1.0):
     ):
         raise TypeError("sparse.addmm(): matrix operands must be Tensor objects")
     # A sparse ``mat1`` routes through the fused native sparse-addmm kernel
-    # (with registered autograd); a dense ``mat1`` takes the dense path.
+    # (with registered autograd) for COO/CSR; other compressed layouts fall
+    # back to a dense product, matching the reference API's dense output.
     if mat1.is_sparse:
-        return tensorplay.functional._sparse_addmm(
-            mat, mat1, mat2, beta=beta, alpha=alpha
+        if mat1.layout in (tensorplay.sparse_coo, tensorplay.sparse_csr):
+            return tensorplay.functional._sparse_addmm(
+                mat, mat1, mat2, beta=beta, alpha=alpha
+            )
+        return tensorplay.addmm(
+            mat, mat1.to_dense(), mat2, beta=beta, alpha=alpha
         )
     return tensorplay.addmm(mat, mat1, mat2, beta=beta, alpha=alpha)
 
