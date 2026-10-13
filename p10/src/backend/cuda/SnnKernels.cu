@@ -37,7 +37,7 @@ using snn_compute_t = std::conditional_t<std::is_same_v<T, double>, double, floa
 
 template <typename T>
 __host__ __device__ inline T snn_exp(T x) {
-    return static_cast<T>(::exp(static_cast<double>(x)));
+    return static_cast<T>(::exp(x));
 }
 
 // Surrogate gradient evaluated at x = h - threshold.
@@ -447,7 +447,7 @@ __global__ void lif_seq_backward_kernel(
     const T* __restrict__ threshold_p, int64_t threshold_n,
     const T* __restrict__ spike_p, int64_t T_steps, int64_t M, bool has_reset,
     double reset_val, int64_t surrogate, double alpha, bool detach_reset,
-    ComputeT* h_buf, ComputeT* v_buf, T* __restrict__ grad_input_p,
+    ComputeT* v_buf, T* __restrict__ grad_input_p,
     T* __restrict__ grad_v_init_p, T* __restrict__ grad_decay_p,
     T* __restrict__ grad_threshold_p) {
     const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
@@ -458,14 +458,14 @@ __global__ void lif_seq_backward_kernel(
             static_cast<ComputeT>(threshold_p[threshold_n == 1 ? 0 : m]);
 
         // Recompute the forward trajectory from the stored spikes so the
-        // backward sees exactly the voltages the forward used.
+        // backward sees exactly the voltages the forward used.  Only the
+        // pre-update voltage is stored; the membrane value ``h`` is
+        // recomputed in the backward pass from the same inputs.
         ComputeT vv = static_cast<ComputeT>(v_init_p[m]);
         for (int64_t t = 0; t < T_steps; ++t) {
             const int64_t idx = t * M + m;
-            const ComputeT x = static_cast<ComputeT>(input_p[idx]);
             const ComputeT s = static_cast<ComputeT>(spike_p[idx]);
-            const ComputeT h = dc * vv + x;
-            h_buf[idx] = h;
+            const ComputeT h = dc * vv + static_cast<ComputeT>(input_p[idx]);
             v_buf[idx] = vv;
             vv = has_reset
                      ? h * (ComputeT(1) - s) +
@@ -480,8 +480,9 @@ __global__ void lif_seq_backward_kernel(
         for (int64_t t = T_steps - 1; t >= 0; --t) {
             const int64_t idx = t * M + m;
             const ComputeT s = static_cast<ComputeT>(spike_p[idx]);
-            const ComputeT h = h_buf[idx];
             const ComputeT v_prev = v_buf[idx];
+            const ComputeT h =
+                dc * v_prev + static_cast<ComputeT>(input_p[idx]);
             const ComputeT sg = snn_surrogate_grad_value<ComputeT>(
                 h - th, surrogate, alpha);
             const ComputeT gs = static_cast<ComputeT>(grad_spike_p[idx]);
@@ -547,7 +548,7 @@ void launch_lif_seq_backward(const Tensor& grad_spikes_c,
                              const Tensor& spike_c, int64_t T_steps, int64_t M,
                              bool has_reset, double reset_val,
                              int64_t surrogate, double alpha,
-                             bool detach_reset, Tensor& h_buf, Tensor& v_buf,
+                             bool detach_reset, Tensor& v_buf,
                              Tensor& grad_input, Tensor& grad_v_init,
                              Tensor& grad_decay_full,
                              Tensor& grad_threshold_full) {
@@ -560,8 +561,8 @@ void launch_lif_seq_backward(const Tensor& grad_spikes_c,
             input_c.data_ptr<T>(), v_init_c.data_ptr<T>(),
             decay_c.data_ptr<T>(), decay_n, threshold_c.data_ptr<T>(),
             threshold_n, spike_c.data_ptr<T>(), T_steps, M, has_reset,
-            reset_val, surrogate, alpha, detach_reset, h_buf.data_ptr<ComputeT>(),
-            v_buf.data_ptr<ComputeT>(), grad_input.data_ptr<T>(),
+            reset_val, surrogate, alpha, detach_reset, v_buf.data_ptr<ComputeT>(),
+            grad_input.data_ptr<T>(),
             grad_v_init.data_ptr<T>(), grad_decay_full.data_ptr<T>(),
             grad_threshold_full.data_ptr<T>());
     CUDA_CHECK(cudaGetLastError());
@@ -682,7 +683,6 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> snn_lif_seq_backward_cuda(
     Tensor grad_threshold_full = Tensor::empty(v_target, dt, input.device());
     const DType buf_dt =
         (dt == DType::Float64) ? DType::Float64 : DType::Float32;
-    Tensor h_buf = Tensor::empty(input_sizes, buf_dt, input.device());
     Tensor v_buf = Tensor::empty(input_sizes, buf_dt, input.device());
     const int64_t M = grad_v_init.numel();
 
@@ -693,7 +693,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> snn_lif_seq_backward_cuda(
         launch_lif_seq_backward<ctype, snn_compute_t<ctype>>(                \
             grad_spikes_c, grad_v_final_c, input_c, v_init_c, decay_c,        \
             decay_n, threshold_c, threshold_n, spike_c, T, M, has_reset,     \
-            reset_val, surrogate, alpha, detach_reset, h_buf, v_buf,         \
+            reset_val, surrogate, alpha, detach_reset, v_buf,               \
             grad_input, grad_v_init, grad_decay_full, grad_threshold_full);  \
         break;
     switch (dt) {
