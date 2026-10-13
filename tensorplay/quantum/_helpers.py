@@ -18,6 +18,8 @@ __all__ = [
     "MAX_GATE_WIRES",
     "check_pauli_string",
     "check_wires",
+    "decode_w",
+    "encode_w",
     "n_qubits_of",
     "ordered_wires",
     "pauli_wires",
@@ -100,3 +102,26 @@ def check_pauli_string(pauli, n_qubits=None):
 def pauli_wires(word):
     """The qubit indices a Pauli word acts on, in ascending order."""
     return [i for i, letter in enumerate(word) if letter != "I"]
+
+
+def encode_w(wires):
+    """Join wire indices into a string key, ``"1.3.2"`` for ``[1, 3, 2]``.
+
+    A list is awkward as a dictionary key; the dotted string is not.  This is
+    the same keying a measurement routine uses when it groups a Hamiltonian's
+    terms by the wires they touch.
+    """
+    if isinstance(wires, int):
+        wires = [wires]
+    return ".".join(str(operator.index(w)) for w in wires)
+
+
+def decode_w(key):
+    """Split a dotted wire key back into a list of ints.
+
+    This is the inverse of :func:`encode_w`: ``decode_w("1.3.2")`` returns
+    ``[1, 3, 2]``.
+    """
+    if not key:
+        raise ValueError("a wire key must not be empty")
+    return [int(part) for part in str(key).split(".")]

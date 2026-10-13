@@ -640,6 +640,7 @@ vector.
     tensorplay.quantum.apply_gate
     tensorplay.quantum.controlled_matrix
     tensorplay.quantum.apply_controlled
+    tensorplay.quantum.apply_chadamard
     tensorplay.quantum.rot_matrix
     tensorplay.quantum.multirz_matrix
     tensorplay.quantum.multirz_eigvals
@@ -696,6 +697,9 @@ vector.
     tensorplay.quantum.joint_expectation
     tensorplay.quantum.sample_indices
     tensorplay.quantum.counts_from_indices
+    tensorplay.quantum.gen_bitstrings
+    tensorplay.quantum.encode_w
+    tensorplay.quantum.decode_w
     tensorplay.quantum.measure
     tensorplay.quantum.readout_error_matrix
     tensorplay.quantum.apply_readout_error

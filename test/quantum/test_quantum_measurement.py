@@ -696,3 +696,33 @@ def test_a_histogram_of_nothing_is_refused():
         tq.state_from_counts(tp.tensor([[1.0]]))                 # one outcome
     with pytest.raises(ValueError):
         tq.density_from_counts(tp.tensor([[1.0, 2.0]]), pseudocount=-1.0)
+
+
+def test_gen_bitstrings_lists_basis_labels_in_flat_order():
+    assert tq.gen_bitstrings(1) == ["0", "1"]
+    assert tq.gen_bitstrings(2) == ["00", "01", "10", "11"]
+    assert tq.gen_bitstrings(3) == ["000", "001", "010", "011", "100", "101", "110", "111"]
+    # entry i is the label of flat amplitude index i, so a counts histogram's
+    # columns line up with these strings one for one
+    state = tq.basis_state(3, 3, dtype=tp.complex128)
+    labels = tq.gen_bitstrings(3)
+    assert labels[int(tq.probs(state).argmax())] == "011"
+
+
+def test_gen_bitstrings_rejects_a_bad_register_width():
+    with pytest.raises(ValueError):
+        tq.gen_bitstrings(0)
+    with pytest.raises(ValueError):
+        tq.gen_bitstrings(-1)
+    with pytest.raises(ValueError):
+        tq.gen_bitstrings(2.5)
+
+
+def test_encode_w_and_decode_w_roundtrip():
+    for wires in ([0], [1, 3, 2], [0, 1, 2, 3], [7]):
+        assert tq.decode_w(tq.encode_w(wires)) == wires
+    assert tq.encode_w([1, 3, 2]) == "1.3.2"
+    assert tq.encode_w(4) == "4"
+    assert tq.decode_w("0.2") == [0, 2]
+    with pytest.raises(ValueError):
+        tq.decode_w("")

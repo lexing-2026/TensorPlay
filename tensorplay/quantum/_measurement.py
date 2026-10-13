@@ -41,6 +41,7 @@ __all__ = [
     "density_probs",
     "expectation",
     "expectation_from_counts",
+    "gen_bitstrings",
     "joint_expectation",
     "marginal_probs",
     "measure",
@@ -72,6 +73,19 @@ _PAULI_BUILDERS = {
 def _batch_scale(value: tp.Tensor, state: tp.Tensor) -> tp.Tensor:
     """``value`` per batch entry, spread back over a state's own dimensions."""
     return value.reshape(value.shape[0], *([1] * (state.dim() - 1)))
+
+
+def gen_bitstrings(n_qubits: int) -> List[str]:
+    """The computational basis labels of ``n_qubits``, in flat-index order.
+
+    Entry ``i`` of the returned list is the label flat amplitude index ``i``
+    reads, with qubit 0 the leading bit: ``gen_bitstrings(2)`` is
+    ``["00", "01", "10", "11"]``.  The strings are the column names of a counts
+    histogram, which is how ``measure`` and ``counts_from_indices`` tally.
+    """
+    if not isinstance(n_qubits, int) or n_qubits < 1:
+        raise ValueError(f"a register has a whole number of qubits, got {n_qubits!r}")
+    return ["{:0{}b}".format(index, n_qubits) for index in range(1 << n_qubits)]
 
 
 class _CompiledStatePros(Function):

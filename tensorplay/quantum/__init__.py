@@ -55,6 +55,7 @@ from ._circuit import (
 from ._gates import (
     apply_ccx,
     apply_ccz,
+    apply_chadamard,
     apply_cnot,
     apply_controlled,
     apply_cp,
@@ -158,6 +159,7 @@ from ._hamiltonian import (
     pauli_string_matrix,
     trotter_evolve,
 )
+from ._helpers import decode_w, encode_w
 from ._measurement import (
     density_from_counts,
     state_from_counts,
@@ -170,6 +172,7 @@ from ._measurement import (
     density_probs,
     expectation,
     expectation_from_counts,
+    gen_bitstrings,
     joint_expectation,
     marginal_probs,
     measure,
@@ -223,6 +226,7 @@ __all__ = [
     "apply_bit_flip",
     "apply_ccx",
     "apply_ccz",
+    "apply_chadamard",
     "apply_channel",
     "apply_cnot",
     "apply_controlled",
@@ -287,6 +291,7 @@ __all__ = [
     "counts_from_indices",
     "dagger",
     "dcx_matrix",
+    "decode_w",
     "dens2bloch",
     "density_from_counts",
     "density_probs",
@@ -294,6 +299,7 @@ __all__ = [
     "depolarizing_kraus",
     "ecr_matrix",
     "efficient_su2",
+    "encode_w",
     "energy",
     "energy_from_density",
     "entanglement_pairs",
@@ -303,6 +309,7 @@ __all__ = [
     "expectation_from_density",
     "fidelity",
     "flatten",
+    "gen_bitstrings",
     "global_phase",
     "globalphase_matrix",
     "h_matrix",

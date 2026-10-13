@@ -1029,3 +1029,27 @@ def test_a_rotation_about_the_identity_is_the_phase_it_names():
     rotated = tq.apply_pauli_rotation(state, "I", angle)
     expected = state * complex(math.cos(angle / 2), -math.sin(angle / 2))
     tp.testing.assert_close(rotated, expected, atol=1e-12, rtol=1e-12)
+
+
+def test_chadamard_applies_h_on_the_matching_control():
+    half = 2.0**-0.5
+    # control = 0 leaves both wires alone
+    for index in (0, 1):
+        out = tq.apply_chadamard(tq.basis_state(index, 2, dtype=tp.complex128), 0, 1)
+        tp.testing.assert_close(_flat(out), _flat(tq.basis_state(index, 2, dtype=tp.complex128)),
+                                atol=1e-12, rtol=1e-12)
+    # control = 1 and target = 0 spreads into (|10> + |11>)/sqrt2
+    out = tq.apply_chadamard(tq.basis_state(2, 2, dtype=tp.complex128), 0, 1)
+    want = tp.tensor([[0.0, 0.0, half, half]], dtype=tp.complex128)
+    tp.testing.assert_close(_flat(out), want, atol=1e-12, rtol=1e-12)
+    # control = 1 and target = 1 spreads into (|10> - |11>)/sqrt2
+    out = tq.apply_chadamard(tq.basis_state(3, 2, dtype=tp.complex128), 0, 1)
+    want = tp.tensor([[0.0, 0.0, half, -half]], dtype=tp.complex128)
+    tp.testing.assert_close(_flat(out), want, atol=1e-12, rtol=1e-12)
+
+
+def test_chadamard_matches_the_generic_controlled_helper():
+    state = tq.random_state(2, dtype=tp.complex128)
+    named = tq.apply_chadamard(state, 1, 0)
+    generic = tq.apply_controlled(state, tq.h_matrix(c_dtype=tp.complex128), [1, 0])
+    tp.testing.assert_close(named, generic, atol=1e-12, rtol=1e-12)

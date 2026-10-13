@@ -31,6 +31,7 @@ from ._helpers import (
 __all__ = [
     "apply_ccx",
     "apply_ccz",
+    "apply_chadamard",
     "apply_cnot",
     "apply_controlled",
     "apply_cp",
@@ -1201,6 +1202,15 @@ def apply_multirz(state, angle, wires=None):
         state,
         multirz_matrix(angle, len(target)).to(device=state.device, dtype=state.dtype),
         target,
+    )
+
+
+def apply_chadamard(state, control, target):
+    """Apply Hadamard on ``target``, controlled by ``control``."""
+    return apply_gate(
+        state,
+        controlled_matrix(h_matrix(device=state.device, c_dtype=state.dtype)),
+        [control, target],
     )
 
 
