@@ -52,12 +52,14 @@ tq.basis_state(5, 3)         # |101> on 3 qubits
 tq.state_from_bases([0, 3], 2)  # (|00> + |11>) / sqrt(2)
 tq.product_state([a, b])     # the tensor product of per-qubit vectors
 tq.random_state(3)           # uniform on the sphere of the register
+tq.encode_state([x, y, z])   # amplitude-encode a classical vector
 ```
 
 `normalize` rescales to unit norm, `norm` reports it, and `inner` is the
 conjugate overlap between two states. `to_density` and `density_to_state` cross
-between the ket and density views, and `partial_trace` drops qubits from a
-density matrix.
+between the ket and density views, `density_mixture` decomposes a density
+matrix into its eigenstates and their probabilities, and `partial_trace` drops
+qubits from a density matrix.
 
 `global_phase` answers the question that comes up whenever two operators are
 computed two different ways: do they differ by a phase and nothing else? It
