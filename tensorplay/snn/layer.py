@@ -83,6 +83,10 @@ class SpikingConv2d(Module):
     def forward(self, x: Tensor) -> Tensor:
         return self.neuron(self.conv(x))
 
+    def reset(self) -> None:
+        """Clear the membrane potential of the spiking neuron."""
+        self.neuron.reset()
+
 
 class _SpikingBatchNormBase(Module):
     """Shared implementation: fold ``[T, B, ...]`` into ``[T*B, ...]``."""

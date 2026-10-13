@@ -358,3 +358,51 @@ def test_spiking_batchnorm1d():
     x = tp.rand(4, 3, 4)
     out = bn(x)
     assert out.shape == (4, 3, 4)
+
+# ---------------------------------------------------------------------------
+# End-to-end: full convolutional SNN training loop (docs example)
+# ---------------------------------------------------------------------------
+
+def test_conv_snn_full_training_loop():
+    """The documented ConvSpikingNetwork must run forward/backward/reset."""
+    class ConvSpikingNetwork(tp.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv1 = snn.SpikingConv2d(1, 32, 3, padding=1)
+            self.bn1 = snn.SpikingBatchNorm2d(32)
+            self.pool1 = snn.SeqToANNContainer(tp.nn.MaxPool2d(2))
+            self.conv2 = snn.SpikingConv2d(32, 64, 3, padding=1)
+            self.bn2 = snn.SpikingBatchNorm2d(64)
+            self.pool2 = snn.SeqToANNContainer(tp.nn.MaxPool2d(2))
+            self.fc = snn.SpikeLinear(64 * 7 * 7, 10)
+            self.readout = snn.LIFNode(step_mode="m")
+
+        def forward(self, x):
+            x = self.pool1(self.bn1(self.conv1(x)))   # [T,B,32,14,14]
+            x = self.pool2(self.bn2(self.conv2(x)))   # [T,B,64,7,7]
+            x = x.reshape(x.shape[0], x.shape[1], -1)  # [T,B,64*7*7]
+            return self.readout(self.fc(x)).mean(0)    # [B,10]
+
+        def reset(self):
+            for m in self.modules():
+                if m is not self and hasattr(m, "reset"):
+                    m.reset()
+
+    model = ConvSpikingNetwork()
+    opt = tp.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+    for step in range(2):
+        x = (tp.rand(2, 1, 28, 28) > 0.5).to(tp.float32)
+        y = tp.tensor([3, 7])
+        spikes = snn.poisson_encode(x, T=4)
+        out = model(spikes)
+        target = tp.nn.functional.one_hot(y, 10).to(tp.float32)
+        loss = ((out - target) ** 2).mean()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        model.reset()
+        assert out.shape == (2, 10)
+    # membrane potentials must be cleared after reset
+    assert model.conv1.neuron.v is None
+    assert model.conv2.neuron.v is None
+    assert model.readout.v is None

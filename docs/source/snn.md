@@ -163,30 +163,49 @@ Call `reset()` to clear the records and `detach()` to remove the hook.
 
 ## Training example
 
-A complete MNIST training recipe (Poisson encoding, two-layer spiking
-network, surrogate-gradient BPTT) can be assembled from this package:
+A complete convolutional spiking network (``SpikingConv2d`` +
+``SpikingBatchNorm2d`` + max pooling + rate readout) with a full
+surrogate-gradient BPTT training loop:
 
 ```python
 import tensorplay as tp
 from tensorplay import snn
 
-class SpikingNetwork(tp.nn.Module):
-    def __init__(self, n_input=784, n_hidden=256, n_class=10):
+class ConvSpikingNetwork(tp.nn.Module):
+    def __init__(self):
         super().__init__()
-        self.fc1 = snn.SpikeLinear(n_input, n_hidden, bias=True)
-        self.lif1 = snn.LIFNode(threshold=1.0, decay=0.5, step_mode="m")
-        self.fc2 = snn.SpikeLinear(n_hidden, n_class, bias=True)
-        self.lif2 = snn.LIFNode(threshold=1.0, decay=0.5, step_mode="m")
+        self.conv1 = snn.SpikingConv2d(1, 32, 3, padding=1)
+        self.bn1 = snn.SpikingBatchNorm2d(32)
+        self.pool1 = snn.SeqToANNContainer(tp.nn.MaxPool2d(2))
+        self.conv2 = snn.SpikingConv2d(32, 64, 3, padding=1)
+        self.bn2 = snn.SpikingBatchNorm2d(64)
+        self.pool2 = snn.SeqToANNContainer(tp.nn.MaxPool2d(2))
+        self.fc = snn.SpikeLinear(64 * 7 * 7, 10)
+        self.readout = snn.LIFNode(step_mode="m")
 
-    def forward(self, x):        # x: [T, B, 784] Poisson spikes
-        return self.lif2(self.fc2(self.lif1(self.fc1(x)))).mean(0)
+    def forward(self, x):          # x: [T, B, 1, 28, 28] Poisson spikes
+        x = self.pool1(self.bn1(self.conv1(x)))   # [T, B, 32, 14, 14]
+        x = self.pool2(self.bn2(self.conv2(x)))   # [T, B, 64, 7, 7]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # [T, B, 64*7*7]
+        return self.readout(self.fc(x)).mean(0)    # [B, 10] firing rates
 
     def reset(self):
-        self.lif1.reset()
-        self.lif2.reset()
+        for m in self.modules():
+            if m is not self and hasattr(m, "reset"):
+                m.reset()
 
-# per batch: encode -> forward -> MSE loss -> surrogate-gradient BPTT
-# spikes = snn.poisson_encode(x_flat, T=8)   # [8, B, 784]
-# out = model(spikes)                        # [B, 10] firing rates
-# loss = ((out - y) ** 2).mean(); loss.backward(); optimizer.step()
+# Full training loop (MNIST):
+model = ConvSpikingNetwork()
+opt = tp.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+T = 8
+for epoch in range(epochs):
+    for x, y in dataloader:          # x: [B, 1, 28, 28] uint8, y: [B] labels
+        spikes = snn.poisson_encode(x.to(tp.float32) / 255.0, T=T)
+        out = model(spikes)                            # [B, 10]
+        target = tp.nn.functional.one_hot(y, 10).to(tp.float32)
+        loss = ((out - target) ** 2).mean()
+        opt.zero_grad()
+        loss.backward()            # surrogate-gradient BPTT
+        opt.step()
+        model.reset()              # clear membrane potentials per batch
 ```
