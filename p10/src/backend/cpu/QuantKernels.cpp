@@ -11,6 +11,7 @@
 #include "Scalar.h"
 #include "SizesAndStrides.h"
 #include "Utils.h"
+#include "cpu/vec/vec.h"
 
 #include <cmath>
 #include <cfenv>
@@ -2863,6 +2864,41 @@ _fake_quantize_learnable_per_channel_affine_backward_cpu(
 
 namespace {
 
+std::pair<float, float> minmax_float32(const Tensor& input) {
+    using V = vec::Vectorized<float>;
+    V minimum(std::numeric_limits<float>::infinity());
+    V maximum(-std::numeric_limits<float>::infinity());
+    int64_t i = 0;
+    for (; i + V::size() <= input.numel(); i += V::size()) {
+        const V values = V::loadu(input.data_ptr<float>() + i);
+        minimum = vec::minimum(minimum, values);
+        maximum = vec::maximum(maximum, values);
+    }
+    alignas(64) float min_lanes[V::size()], max_lanes[V::size()];
+    minimum.store(min_lanes);
+    maximum.store(max_lanes);
+    float lower = std::numeric_limits<float>::infinity();
+    float upper = -std::numeric_limits<float>::infinity();
+    for (int lane = 0; lane < V::size(); ++lane) {
+        if (std::isnan(min_lanes[lane]) || std::isnan(max_lanes[lane])) {
+            const float nan = std::numeric_limits<float>::quiet_NaN();
+            return {nan, nan};
+        }
+        lower = std::min(lower, min_lanes[lane]);
+        upper = std::max(upper, max_lanes[lane]);
+    }
+    for (; i < input.numel(); ++i) {
+        const float value = input.data_ptr<float>()[i];
+        if (std::isnan(value)) {
+            const float nan = std::numeric_limits<float>::quiet_NaN();
+            return {nan, nan};
+        }
+        lower = std::min(lower, value);
+        upper = std::max(upper, value);
+    }
+    return {lower, upper};
+}
+
 QParams dynamic_qparams_cpu(double x_min, double x_max, bool reduce_range,
                             int64_t qmin, int64_t qmax) {
     if (reduce_range) {
@@ -2918,9 +2954,16 @@ Tensor quantize_per_tensor_dynamic_cpu(const Tensor& self, DType dtype,
         return self.contiguous().to(DType::Float16);
     }
     const Tensor input = self.contiguous();
-    auto mm = Tensor::aminmax(input.reshape({input.numel()}), {}, false);
-    const double x_min = std::get<0>(mm).item().toDouble();
-    const double x_max = std::get<1>(mm).item().toDouble();
+    double x_min, x_max;
+    if (input.dtype() == DType::Float32 && input.numel() > 0) {
+        const auto [minimum, maximum] = minmax_float32(input);
+        x_min = minimum;
+        x_max = maximum;
+    } else {
+        auto mm = Tensor::aminmax(input.reshape({input.numel()}), {}, false);
+        x_min = std::get<0>(mm).item().toDouble();
+        x_max = std::get<1>(mm).item().toDouble();
+    }
     const int64_t qmin = (dtype == DType::QInt8) ? -128 : 0;
     const int64_t qmax = (dtype == DType::QInt8) ? 127 : 255;
     const QParams qp =
@@ -3080,9 +3123,16 @@ std::tuple<double, int64_t> _choose_qparams_per_tensor_cpu(
     const Tensor& self, bool reduce_range) {
     check_real_dtype(self, "_choose_qparams_per_tensor");
     const Tensor input = self.contiguous();
-    auto mm = Tensor::aminmax(input.reshape({input.numel()}), {}, false);
-    const double x_min = std::get<0>(mm).item().toDouble();
-    const double x_max = std::get<1>(mm).item().toDouble();
+    double x_min, x_max;
+    if (input.dtype() == DType::Float32 && input.numel() > 0) {
+        const auto [minimum, maximum] = minmax_float32(input);
+        x_min = minimum;
+        x_max = maximum;
+    } else {
+        auto mm = Tensor::aminmax(input.reshape({input.numel()}), {}, false);
+        x_min = std::get<0>(mm).item().toDouble();
+        x_max = std::get<1>(mm).item().toDouble();
+    }
     const QParams qp = dynamic_qparams_cpu(x_min, x_max, reduce_range,
                                            /*qmin=*/0, /*qmax=*/255);
     return {qp.scale, qp.zero_point};
