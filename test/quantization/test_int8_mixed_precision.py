@@ -214,3 +214,16 @@ def test_tensor_flatten_unflatten_roundtrip():
     rebuilt = Int8MixedPrecisionTrainingLinearWeight.__tensor_unflatten__(inner, ctx)
     tp.testing.assert_close(rebuilt._data, w, atol=0, rtol=0)
     assert rebuilt.config == weight.config
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_scaled_int8_mm(device):
+    from tensorplay.ao.quantization import scaled_int8_mm
+
+    A = tp.randint(-127, 128, (4, 8), dtype=tp.int8, device=device)
+    B = tp.randint(-127, 128, (8, 6), dtype=tp.int8, device=device)
+    row_scale = tp.rand(4, device=device)
+    col_scale = tp.rand(6, device=device)
+    out = scaled_int8_mm(A, B, row_scale, col_scale)
+    ref = (A.to(tp.float32) @ B.to(tp.float32)) * row_scale.view(-1, 1) * col_scale.view(1, -1)
+    tp.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)

@@ -30,6 +30,7 @@ __all__ = [
     "int8_mixed_precision_training",
     "Int8MixedPrecisionTrainingLinearWeight",
     "Int8MixedPrecisionTrainingLinear",
+    "scaled_int8_mm",
 ]
 
 
@@ -72,6 +73,17 @@ def _int8_mm(A_i8: tp.Tensor, B_t_i8: tp.Tensor, row_scale: tp.Tensor, col_scale
         packed_weight = PackedWeight(w_q, None)
         out = packed_weight.run(x_q, 1.0, 0, output_float=True)
     return out * col_scale.view(1, -1) * row_scale.view(-1, 1)
+
+
+def scaled_int8_mm(A: tp.Tensor, B: tp.Tensor, row_scale: tp.Tensor, col_scale: tp.Tensor) -> tp.Tensor:
+    """Native scaled int8 matmul: ``(A @ B) * row_scale * col_scale``.
+
+    ``A`` is ``(M, K)`` int8, ``B`` is ``(K, N)`` int8, ``row_scale`` is ``(M,)``
+    and ``col_scale`` is ``(N,)``. The integer product is computed through the
+    native signed integer linear path (int8 tensor cores on CUDA, the SIMD
+    quantized linear on CPU) and rescaled to float.
+    """
+    return _int8_mm(A, B.t(), row_scale, col_scale)
 
 
 def _dynamic_int8_mm(A: tp.Tensor, B: tp.Tensor) -> tp.Tensor:

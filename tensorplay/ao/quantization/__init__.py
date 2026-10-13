@@ -145,12 +145,14 @@ from .int8_mixed_precision import (
     Int8MixedPrecisionTrainingLinear as Int8MixedPrecisionTrainingLinear,
     Int8MixedPrecisionTrainingLinearWeight as Int8MixedPrecisionTrainingLinearWeight,
     int8_mixed_precision_training as int8_mixed_precision_training,
+    scaled_int8_mm as scaled_int8_mm,
 )
 from .int8_weight_only import (
     Int8QuantizedTrainingLinearWeight as Int8QuantizedTrainingLinearWeight,
     Int8WeightOnlyQuantizedTrainingConfig as Int8WeightOnlyQuantizedTrainingConfig,
     int8_weight_only_quantized_training as int8_weight_only_quantized_training,
 )
+from .bitnet import quantize_int8_rowwise as quantize_int8_rowwise
 __all__ += [
     "BitNetLinear",
     "BitNetPacked2bitLinearWeight",
@@ -168,4 +170,6 @@ __all__ += [
     "Int8QuantizedTrainingLinearWeight",
     "Int8WeightOnlyQuantizedTrainingConfig",
     "int8_weight_only_quantized_training",
+    "quantize_int8_rowwise",
+    "scaled_int8_mm",
 ]
