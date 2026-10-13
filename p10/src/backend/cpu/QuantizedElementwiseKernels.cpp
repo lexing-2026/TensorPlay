@@ -1,4 +1,5 @@
 #include "cpu/QuantizedElementwiseKernels.h"
+#include "cpu/vec/functional.h"
 #include "cpu/vec/vec.h"
 #include "cpu/vec/vec_convert.h"
 #include "QuantElementwise.h"
@@ -500,6 +501,115 @@ void int4_bfloat16_rows(const BFloat16* __restrict__ x, const uint8_t* __restric
 }
 #endif
 
+#if defined(CPU_CAPABILITY_AVX2) && !defined(CPU_CAPABILITY_AVX512)
+template<int Rows>
+void int4_bfloat16_avx2_tile(const BFloat16* __restrict__ input,
+        const uint8_t* __restrict__ packed, const BFloat16* __restrict__ params,
+        BFloat16* __restrict__ output, int64_t n, int64_t k, int64_t group) {
+    constexpr int columns = 32;
+    constexpr int vectors = columns / 8;
+    constexpr int prefetch_features = 16 * 4;
+    const int prefetch_groups = (prefetch_features + group - 1) / group;
+    const int groups = k / group;
+    __m256 activation, weights[vectors], accumulators[Rows * vectors];
+    __m256 scales[vectors], zeros[vectors];
+    const __m256i lane_order = _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7);
+    const __m256 offset = _mm256_set1_ps(-8.f);
+
+    auto load_scales = [&](int col, int group_index) {
+        const auto values = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
+            params + group_index * n * 2 + 16 * col));
+        if (group_index + prefetch_groups < groups)
+            _mm_prefetch(reinterpret_cast<const char*>(params +
+                (group_index + prefetch_groups) * n * 2 + 16 * col), _MM_HINT_T0);
+        __m256 a, b;
+        vec::cvtbf16_fp32(values, a, b);
+        a = _mm256_permutevar8x32_ps(a, lane_order);
+        b = _mm256_permutevar8x32_ps(b, lane_order);
+        scales[col] = _mm256_permute2f128_ps(a, b, 0b00100000);
+        zeros[col] = _mm256_permute2f128_ps(a, b, 0b00110001);
+        zeros[col] = _mm256_fmadd_ps(scales[col], offset, zeros[col]);
+    };
+
+    auto initialize = [&](auto i) { accumulators[i] = _mm256_setzero_ps(); };
+    tensorplay::ForcedUnroll<Rows * vectors>{}(initialize);
+
+    auto compute = [&](auto i, int feature) {
+        constexpr int row = i / vectors;
+        constexpr int col = i % vectors;
+        if constexpr (col == 0) {
+            const float value = static_cast<float>(input[row * k + feature]);
+            if (feature + prefetch_features < k)
+                _mm_prefetch(reinterpret_cast<const char*>(input + row * k + feature + prefetch_features), _MM_HINT_T0);
+            activation = _mm256_set1_ps(value);
+        }
+        if constexpr (row == 0) {
+            if constexpr (col == 0) {
+                const __m256i mask = _mm256_set1_epi32(0x0f);
+                const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(packed + feature * 16));
+                if (feature + prefetch_features < k)
+                    _mm_prefetch(reinterpret_cast<const char*>(packed +
+                        (feature + prefetch_features) * 16), _MM_HINT_T0);
+                __m256i codes = _mm256_cvtepu8_epi32(bytes);
+                weights[0] = _mm256_cvtepi32_ps(_mm256_and_si256(codes, mask));
+                weights[0] = _mm256_fmadd_ps(weights[0], scales[0], zeros[0]);
+                weights[2] = _mm256_cvtepi32_ps(_mm256_srli_epi32(codes, 4));
+                weights[2] = _mm256_fmadd_ps(weights[2], scales[2], zeros[2]);
+                codes = _mm256_cvtepu8_epi32(_mm_shuffle_epi32(bytes, _MM_SHUFFLE(3, 2, 3, 2)));
+                weights[1] = _mm256_cvtepi32_ps(_mm256_and_si256(codes, mask));
+                weights[1] = _mm256_fmadd_ps(weights[1], scales[1], zeros[1]);
+                weights[3] = _mm256_cvtepi32_ps(_mm256_srli_epi32(codes, 4));
+                weights[3] = _mm256_fmadd_ps(weights[3], scales[3], zeros[3]);
+            }
+        }
+        constexpr int index = row * vectors + col;
+        accumulators[index] = _mm256_fmadd_ps(activation, weights[col], accumulators[index]);
+    };
+
+    for (int feature = 0, group_index = 0; feature < k; ++feature) {
+        if (feature % group == 0) {
+            tensorplay::ForcedUnroll<vectors>{}(load_scales, group_index++);
+        }
+        tensorplay::ForcedUnroll<Rows * vectors>{}(compute, feature);
+    }
+
+    auto store = [&](auto i) {
+        constexpr int row = i / vectors;
+        constexpr int col = i % vectors;
+        if constexpr (col % 2 == 0) {
+            const __m256i result = vec::cvtfp32_bf16(
+                accumulators[row * vectors + col], accumulators[row * vectors + col + 1]);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(output + row * n + col * 8), result);
+        }
+    };
+    tensorplay::ForcedUnroll<Rows * vectors>{}(store);
+}
+
+void int4_bfloat16_avx2(const BFloat16* input, const uint8_t* packed,
+        const BFloat16* params, BFloat16* output, int64_t m, int64_t n,
+        int64_t k, int64_t group) {
+    const int64_t column_blocks = n / 32;
+    const int64_t row_blocks = (m + 3) / 4;
+    parallel::parallel_for(0, row_blocks * column_blocks, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t task = begin; task < end; ++task) {
+            const int64_t row = task / column_blocks * 4;
+            const int64_t column = task % column_blocks * 32;
+            const int rows = std::min<int64_t>(4, m - row);
+            const auto* a = input + row * k;
+            const auto* b = packed + column * k / 2;
+            const auto* s = params + column * 2;
+            auto* c = output + row * n + column;
+            switch (rows) {
+                case 1: int4_bfloat16_avx2_tile<1>(a, b, s, c, n, k, group); break;
+                case 2: int4_bfloat16_avx2_tile<2>(a, b, s, c, n, k, group); break;
+                case 3: int4_bfloat16_avx2_tile<3>(a, b, s, c, n, k, group); break;
+                default: int4_bfloat16_avx2_tile<4>(a, b, s, c, n, k, group); break;
+            }
+        }
+    });
+}
+#endif
+
 void int4_mm_impl(const void* x, const uint8_t* packed, const void* params, void* output,
         DType dtype, int64_t m, int64_t n, int64_t k, int64_t group) {
     switch (dtype) {
@@ -512,6 +622,13 @@ void int4_mm_impl(const void* x, const uint8_t* packed, const void* params, void
                 if (m % 16 == 0)
                     int4_bfloat16_rows<16, 16>(input, packed, static_cast<const BFloat16*>(params), static_cast<BFloat16*>(output), m, n, k, group);
                 else int4_bfloat16_rows<8, 32>(input, packed, static_cast<const BFloat16*>(params), static_cast<BFloat16*>(output), m, n, k, group);
+                break;
+            }
+#endif
+#if defined(CPU_CAPABILITY_AVX2) && !defined(CPU_CAPABILITY_AVX512)
+            if (n % 32 == 0) {
+                int4_bfloat16_avx2(input, packed, static_cast<const BFloat16*>(params),
+                    static_cast<BFloat16*>(output), m, n, k, group);
                 break;
             }
 #endif
