@@ -68,6 +68,31 @@ during backward, which is the standard stabilizing choice.
   `(spikes, v_final)`. The time loop runs inside one native kernel, so
   multi-step training (BPTT) does not pay a per-step launch overhead.
 
+## Native implementation
+
+The neuron dynamics are implemented as fused CPU/CUDA kernels.  The single-
+step operators (`snn_lif_step` / `snn_lif_step_backward`) process every
+element in one pass (CPU: OpenMP ``parallel_for``; CUDA: grid-stride threads)
+and support ``float32``, ``float64``, ``float16`` and ``bfloat16`` inputs,
+with per-neuron or scalar ``decay`` / ``threshold`` broadcasting.  The
+multi-step operators (`snn_lif_seq` / ``snn_lif_seq_backward``) iterate the
+membrane dynamics over ``T`` inside the same kernel, so the whole spike-train
+forward/backward is a single kernel launch per device.  The backward
+recomputes the membrane trajectory from the stored spikes (no full forward
+state is saved) and back-propagates the voltage gradient across time
+(BPTT), so ``decay``, ``threshold``, ``v_init`` and every input frame receive
+gradients.
+
+``v_reset`` selects the reset mode: ``None`` for the soft reset
+(subtract the threshold) and a scalar for the hard reset (reset to that
+voltage).  ``detach_reset`` controls whether the spike inside the
+voltage-update path is treated as a constant during backward; the default
+``True`` is the standard stabilizing choice.
+
+A throughput benchmark is provided in ``benchmark/snn_benchmark.py``; it
+compares the fused multi-step operator with a Python time loop over
+``snn.lif_step`` and reports spikes per second on both CPU and CUDA.
+
 ## Spike encoders
 
 * `snn.rate_encode(x, T)` -- Bernoulli spikes over `T` steps.

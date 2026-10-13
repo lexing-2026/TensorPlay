@@ -213,3 +213,164 @@ def test_lif_seq_explicit_v_init():
     # t1: h = 0.9 -> no spike
     tp.testing.assert_close(spikes, tp.tensor([[[1.0]], [[0.0]]]))
     tp.testing.assert_close(v_final, tp.tensor([[0.9]]))
+
+
+def test_spike_backward_straight_through_passes_gradient():
+    x = tp.tensor([0.3, -0.7], requires_grad=True)
+    out = snn.spike(x, snn.StraightThroughSurrogate())
+    out.sum().backward()
+    tp.testing.assert_close(x.grad, tp.ones_like(x))
+
+
+def test_surrogate_grad_half_dtypes_match_float():
+    for dtype in (tp.float16, tp.bfloat16):
+        x = tp.tensor([-2.0, 0.0, 1.5], dtype=dtype)
+        for surrogate_id in (0, 1, 2, 3):
+            got = snn.surrogate_grad(x, surrogate=surrogate_id, alpha=2.0)
+            ref = snn.surrogate_grad(
+                x.to(tp.float32), surrogate=surrogate_id, alpha=2.0
+            )
+            tp.testing.assert_close(
+                got.to(tp.float32), ref, atol=1e-2, rtol=1e-2
+            )
+
+
+def test_lif_step_half_dtypes_match_float_forward():
+    for dtype in (tp.float16, tp.bfloat16):
+        x = tp.tensor([0.8, 0.2], dtype=dtype)
+        v = tp.tensor([0.5, 0.0], dtype=dtype)
+        spike, v_new = snn.lif_step(
+            x, v, decay=0.5, threshold=1.0, v_reset=0.0
+        )
+        ref_spike, ref_v = snn.lif_step(
+            x.to(tp.float32), v.to(tp.float32),
+            decay=0.5, threshold=1.0, v_reset=0.0,
+        )
+        tp.testing.assert_close(
+            spike.to(tp.float32), ref_spike, atol=1e-2, rtol=1e-2
+        )
+        tp.testing.assert_close(
+            v_new.to(tp.float32), ref_v, atol=1e-2, rtol=1e-2
+        )
+
+
+def test_lif_seq_half_dtype_forward_matches_float():
+    tp.manual_seed(3)
+    for dtype in (tp.float16, tp.bfloat16):
+        x = tp.rand(4, 2, 3, dtype=dtype)
+        spikes, v_final = snn.lif_seq(
+            x, decay=tp.tensor(0.7, dtype=dtype),
+            threshold=tp.tensor(1.0, dtype=dtype), v_reset=0.0,
+        )
+        ref_spikes, ref_v = snn.lif_seq(
+            x.to(tp.float32), decay=tp.tensor(0.7),
+            threshold=tp.tensor(1.0), v_reset=0.0,
+        )
+        tp.testing.assert_close(
+            spikes.to(tp.float32), ref_spikes, atol=1e-2, rtol=1e-2
+        )
+        tp.testing.assert_close(
+            v_final.to(tp.float32), ref_v, atol=1e-2, rtol=1e-2
+        )
+
+
+def test_lif_seq_zero_dim_v_init_expands():
+    x = tp.tensor([[[1.0]], [[0.5]]])  # [T=2, B=1, N=1]
+    spikes, v_final = snn.lif_seq(
+        x, v_init=tp.tensor(0.0), decay=tp.tensor(1.0),
+        threshold=tp.tensor(1.0), v_reset=None,
+    )
+    # t0: h = 1.0 -> spike, soft reset -> v = 0.0
+    # t1: h = 0.5 -> no spike, v = 0.5
+    tp.testing.assert_close(spikes, tp.tensor([[[1.0]], [[0.0]]]))
+    tp.testing.assert_close(v_final, tp.tensor([[0.5]]))
+
+
+def test_lif_seq_broadcast_decay_and_threshold_gradients():
+    tp.manual_seed(4)
+    T, B, N = 4, 3, 5
+    x = tp.rand(T, B, N, requires_grad=True)
+    # Per-feature decay [1, N] and per-batch threshold [B, 1] broadcast over
+    # the [B, N] neuron grid; gradients must reduce to the broadcast shapes.
+    decay = tp.tensor([[0.8, 0.7, 0.9, 0.6, 0.5]], requires_grad=True)  # [1, N]
+    threshold = tp.tensor([[1.0], [0.9], [1.1]], requires_grad=True)    # [B, 1]
+    spikes, v_final = snn.lif_seq(
+        x, v_init=None, decay=decay, threshold=threshold, v_reset=None,
+        surrogate=snn.SigmoidSurrogate(alpha=2.0), detach_reset=False,
+    )
+    (spikes.sum() + v_final.sum()).backward()
+    assert decay.grad.shape == (1, N)
+    assert threshold.grad.shape == (B, 1)
+    assert x.grad.shape == (T, B, N)
+
+    # Check the decay gradient against a per-neuron loop reference.
+    decay_full = decay.expand(B, N)
+    threshold_full = threshold.expand(B, N)
+    ref_decay = tp.zeros_like(decay_full)
+    ref_threshold = tp.zeros_like(threshold_full)
+    for t in range(T):
+        spike, v = snn.lif_step(
+            x[t], tp.zeros(B, N), decay=decay_full, threshold=threshold_full,
+            v_reset=None, surrogate=snn.SigmoidSurrogate(alpha=2.0),
+            detach_reset=False,
+        )
+        ref_decay = ref_decay + v * spike  # placeholder, real check below
+    # The analytic check via autograd on the looped path:
+    x2 = x.detach().clone().requires_grad_(True)
+    decay2 = decay.detach().clone().requires_grad_(True)
+    threshold2 = threshold.detach().clone().requires_grad_(True)
+    v = tp.zeros(B, N)
+    refs = []
+    for t in range(T):
+        spike, v = snn.lif_step(
+            x2[t], v, decay=decay2, threshold=threshold2,
+            v_reset=None, surrogate=snn.SigmoidSurrogate(alpha=2.0),
+            detach_reset=False,
+        )
+        refs.append(spike)
+    refs = tp.stack(refs)
+    (refs.sum() + v.sum()).backward()
+    tp.testing.assert_close(x.grad, x2.grad, atol=1e-5, rtol=1e-4)
+    tp.testing.assert_close(decay.grad, decay2.grad, atol=1e-5, rtol=1e-4)
+    tp.testing.assert_close(
+        threshold.grad, threshold2.grad, atol=1e-5, rtol=1e-4
+    )
+
+
+def test_lif_seq_soft_reset_matches_loop_gradients():
+    """Soft-reset BPTT gradients flow to all four inputs."""
+    tp.manual_seed(5)
+    T, B, N = 3, 2, 2
+    surrogate = snn.PiecewiseLinearSurrogate(alpha=1.0)
+    x = tp.rand(T, B, N, requires_grad=True)
+    v_init = tp.rand(B, N, requires_grad=True)
+    decay = tp.tensor(0.7, requires_grad=True)
+    threshold = tp.tensor(1.0, requires_grad=True)
+    spikes, v_final = snn.lif_seq(
+        x, v_init=v_init, decay=decay, threshold=threshold, v_reset=None,
+        surrogate=surrogate, detach_reset=False,
+    )
+    (spikes.sum() + v_final.sum()).backward()
+
+    # Loop reference.
+    x2 = x.detach().clone().requires_grad_(True)
+    v_init2 = v_init.detach().clone().requires_grad_(True)
+    decay2 = decay.detach().clone().requires_grad_(True)
+    threshold2 = threshold.detach().clone().requires_grad_(True)
+    v = v_init2
+    refs = []
+    for t in range(T):
+        spike, v = snn.lif_step(
+            x2[t], v, decay=decay2, threshold=threshold2, v_reset=None,
+            surrogate=surrogate, detach_reset=False,
+        )
+        refs.append(spike)
+    refs = tp.stack(refs)
+    (refs.sum() + v.sum()).backward()
+    tp.testing.assert_close(x.grad, x2.grad, atol=1e-5, rtol=1e-4)
+    tp.testing.assert_close(v_init.grad, v_init2.grad, atol=1e-5, rtol=1e-4)
+    tp.testing.assert_close(decay.grad, decay2.grad, atol=1e-5, rtol=1e-4)
+    tp.testing.assert_close(
+        threshold.grad, threshold2.grad, atol=1e-5, rtol=1e-4
+    )
+
