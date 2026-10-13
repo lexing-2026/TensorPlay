@@ -61,6 +61,16 @@ __host__ __device__ inline T snn_surrogate_grad_value(T x, int64_t surrogate,
             return (x > -static_cast<T>(alpha) && x < static_cast<T>(alpha))
                        ? T(1)
                        : T(0);
+        case 4: {  // arctangent surrogate: d/dx (1/pi) atan(pi*alpha*x) + 1/2
+            const T ax = static_cast<T>(alpha) * x;
+            const T pi = static_cast<T>(3.14159265358979323846);
+            return static_cast<T>(alpha) / (T(1) + pi * pi * ax * ax);
+        }
+        case 5: {  // erf surrogate: d/dx 0.5 * erf(alpha*x) + 0.5
+            const T ax = static_cast<T>(alpha) * x;
+            return static_cast<T>(alpha) * snn_exp<T>(-(ax * ax)) /
+                   static_cast<T>(1.77245385090551602729);
+        }
         default:
             return T(1);
     }
@@ -72,8 +82,10 @@ __global__ void lif_step_kernel(const T* __restrict__ input_p,
                                 const T* __restrict__ decay_p,
                                 int64_t decay_n,
                                 const T* __restrict__ threshold_p,
-                                int64_t threshold_n, int64_t n,
-                                bool has_reset, double reset_val,
+                                int64_t threshold_n,
+                                const T* __restrict__ v_reset_p,
+                                int64_t v_reset_n, int64_t n,
+                                bool has_reset,
                                 T* __restrict__ spike_p,
                                 T* __restrict__ v_new_p) {
     const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
@@ -89,7 +101,9 @@ __global__ void lif_step_kernel(const T* __restrict__ input_p,
         const ComputeT s = diff >= ComputeT(0) ? ComputeT(1) : ComputeT(0);
         const ComputeT vn = has_reset
                                 ? h * (ComputeT(1) - s) +
-                                      static_cast<ComputeT>(reset_val) * s
+                                      static_cast<ComputeT>(
+                                          v_reset_p[v_reset_n == 1 ? 0 : i]) *
+                                          s
                                 : h - th * s;
         spike_p[i] = static_cast<T>(s);
         v_new_p[i] = static_cast<T>(vn);
@@ -102,8 +116,10 @@ __global__ void lif_step_backward_kernel(
     const T* __restrict__ input_p, const T* __restrict__ v_p,
     const T* __restrict__ decay_p, int64_t decay_n,
     const T* __restrict__ threshold_p, int64_t threshold_n,
-    const T* __restrict__ spike_p, int64_t n, bool has_reset,
-    double reset_val, int64_t surrogate, double alpha, bool detach_reset,
+    const T* __restrict__ spike_p,
+    const T* __restrict__ v_reset_p, int64_t v_reset_n,
+    int64_t n, bool has_reset,
+    int64_t surrogate, double alpha, bool detach_reset,
     T* __restrict__ grad_input_p, T* __restrict__ grad_v_init_p,
     T* __restrict__ grad_decay_p, T* __restrict__ grad_threshold_p) {
     const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
@@ -120,6 +136,10 @@ __global__ void lif_step_backward_kernel(
             snn_surrogate_grad_value<ComputeT>(h - th, surrogate, alpha);
         const ComputeT gs = static_cast<ComputeT>(grad_spike_p[i]);
         const ComputeT gv = static_cast<ComputeT>(grad_v_p[i]);
+        const ComputeT rv = has_reset
+                                   ? static_cast<ComputeT>(
+                                         v_reset_p[v_reset_n == 1 ? 0 : i])
+                                   : ComputeT(0);
 
         ComputeT grad_h;
         ComputeT grad_th;
@@ -133,12 +153,9 @@ __global__ void lif_step_backward_kernel(
             }
         } else {
             if (has_reset) {
-                grad_h = ((ComputeT(1) - s) +
-                          (static_cast<ComputeT>(reset_val) - h) * sg) *
-                             gv +
+                grad_h = ((ComputeT(1) - s) + (rv - h) * sg) * gv +
                          sg * gs;
-                grad_th =
-                    -sg * (gs + (static_cast<ComputeT>(reset_val) - h) * gv);
+                grad_th = -sg * (gs + (rv - h) * gv);
             } else {
                 grad_h = (ComputeT(1) - th * sg) * gv + sg * gs;
                 grad_th = -sg * gs + (-s + th * sg) * gv;
@@ -167,7 +184,8 @@ template <typename T, typename ComputeT>
 void launch_lif_step(const Tensor& input_c, const Tensor& v_c,
                      const Tensor& decay_c, int64_t decay_n,
                      const Tensor& threshold_c, int64_t threshold_n,
-                     bool has_reset, double reset_val, Tensor& spike,
+                     const Tensor& v_reset_c, int64_t v_reset_n,
+                     bool has_reset, Tensor& spike,
                      Tensor& v_new) {
     const int64_t n = input_c.numel();
     if (n == 0) return;
@@ -175,8 +193,9 @@ void launch_lif_step(const Tensor& input_c, const Tensor& v_c,
     dim3 grid(static_cast<unsigned>((n + kThreads - 1) / kThreads));
     lif_step_kernel<T, ComputeT><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
         input_c.data_ptr<T>(), v_c.data_ptr<T>(), decay_c.data_ptr<T>(),
-        decay_n, threshold_c.data_ptr<T>(), threshold_n, n, has_reset,
-        reset_val, spike.data_ptr<T>(), v_new.data_ptr<T>());
+        decay_n, threshold_c.data_ptr<T>(), threshold_n,
+        v_reset_c.data_ptr<T>(), v_reset_n, n, has_reset,
+        spike.data_ptr<T>(), v_new.data_ptr<T>());
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -186,7 +205,8 @@ void launch_lif_step_backward(const Tensor& grad_spike_c,
                               const Tensor& v_c, const Tensor& decay_c,
                               int64_t decay_n, const Tensor& threshold_c,
                               int64_t threshold_n, const Tensor& spike_c,
-                              bool has_reset, double reset_val,
+                              const Tensor& v_reset_c, int64_t v_reset_n,
+                              bool has_reset,
                               int64_t surrogate, double alpha,
                               bool detach_reset, Tensor& grad_input,
                               Tensor& grad_v_init, Tensor& grad_decay_full,
@@ -200,7 +220,8 @@ void launch_lif_step_backward(const Tensor& grad_spike_c,
             grad_spike_c.data_ptr<T>(), grad_v_c.data_ptr<T>(),
             input_c.data_ptr<T>(), v_c.data_ptr<T>(), decay_c.data_ptr<T>(),
             decay_n, threshold_c.data_ptr<T>(), threshold_n,
-            spike_c.data_ptr<T>(), n, has_reset, reset_val, surrogate, alpha,
+            spike_c.data_ptr<T>(), v_reset_c.data_ptr<T>(), v_reset_n,
+            n, has_reset, surrogate, alpha,
             detach_reset, grad_input.data_ptr<T>(),
             grad_v_init.data_ptr<T>(), grad_decay_full.data_ptr<T>(),
             grad_threshold_full.data_ptr<T>());
@@ -258,18 +279,16 @@ std::tuple<Tensor, Tensor> snn_lif_step_cuda(const Tensor& input,
     const DType dt = input.dtype();
     TP_CHECK(isFloatingType(dt),
              "snn_lif_step: input must be a floating point tensor");
-    TP_CHECK(surrogate >= 0 && surrogate <= 3,
-             "snn_lif_step: surrogate must be in [0, 3]");
-
-    const bool has_reset = v_reset.has_value();
-    double reset_val = 0.0;
-    if (has_reset) {
-        TP_CHECK(v_reset->numel() == 1,
-                 "snn_lif_step: v_reset must be a scalar tensor");
-        reset_val = v_reset->item().toDouble();
-    }
+    TP_CHECK(surrogate >= 0 && surrogate <= 5,
+             "snn_lif_step: surrogate must be in [0, 5]");
 
     const auto sizes = static_cast<std::vector<int64_t>>(input.shape());
+    const bool has_reset = v_reset.has_value();
+    Tensor v_reset_c;
+    if (has_reset) {
+        v_reset_c = v_reset->to(dt).expand(sizes).contiguous();
+    }
+
     Tensor input_c = input.contiguous();
     Tensor v_c = v.contiguous();
     const Tensor decay_c = decay.numel() == 1
@@ -283,11 +302,12 @@ std::tuple<Tensor, Tensor> snn_lif_step_cuda(const Tensor& input,
 
     const int64_t decay_n = decay_c.numel();
     const int64_t threshold_n = threshold_c.numel();
+    const int64_t v_reset_n = has_reset ? v_reset_c.numel() : 0;
 #define TP_SNN_CUDA_DISPATCH(ctype, name_)                                   \
     case DType::name_:                                                       \
         launch_lif_step<ctype, snn_compute_t<ctype>>(                        \
             input_c, v_c, decay_c, decay_n, threshold_c, threshold_n,        \
-            has_reset, reset_val, spike, v_new);                             \
+            v_reset_c, v_reset_n, has_reset, spike, v_new);                  \
         break;
     switch (dt) {
         TP_SNN_CUDA_DISPATCH(float, Float32)
@@ -325,18 +345,16 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> snn_lif_step_backward_cuda(
     const DType dt = input.dtype();
     TP_CHECK(isFloatingType(dt),
              "snn_lif_step_backward: input must be a floating point tensor");
-    TP_CHECK(surrogate >= 0 && surrogate <= 3,
-             "snn_lif_step_backward: surrogate must be in [0, 3]");
-
-    const bool has_reset = v_reset.has_value();
-    double reset_val = 0.0;
-    if (has_reset) {
-        TP_CHECK(v_reset->numel() == 1,
-                 "snn_lif_step_backward: v_reset must be a scalar tensor");
-        reset_val = v_reset->item().toDouble();
-    }
+    TP_CHECK(surrogate >= 0 && surrogate <= 5,
+             "snn_lif_step_backward: surrogate must be in [0, 5]");
 
     const auto sizes = static_cast<std::vector<int64_t>>(input.shape());
+    const bool has_reset = v_reset.has_value();
+    Tensor v_reset_c;
+    if (has_reset) {
+        v_reset_c = v_reset->to(dt).expand(sizes).contiguous();
+    }
+
     Tensor grad_spike_c = grad_spike.to(dt).contiguous();
     Tensor grad_v_c = grad_v.to(dt).contiguous();
     Tensor input_c = input.contiguous();
@@ -356,13 +374,14 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> snn_lif_step_backward_cuda(
 
     const int64_t decay_n = decay_c.numel();
     const int64_t threshold_n = threshold_c.numel();
+    const int64_t v_reset_n = has_reset ? v_reset_c.numel() : 0;
 #define TP_SNN_CUDA_BWD_DISPATCH(ctype, name_)                               \
     case DType::name_:                                                       \
         launch_lif_step_backward<ctype, snn_compute_t<ctype>>(               \
             grad_spike_c, grad_v_c, input_c, v_c, decay_c, decay_n,          \
-            threshold_c, threshold_n, spike_c, has_reset, reset_val,         \
-            surrogate, alpha, detach_reset, grad_input, grad_v_init,         \
-            grad_decay_full, grad_threshold_full);                           \
+            threshold_c, threshold_n, spike_c, v_reset_c, v_reset_n,         \
+            has_reset, surrogate, alpha, detach_reset, grad_input,           \
+            grad_v_init, grad_decay_full, grad_threshold_full);              \
         break;
     switch (dt) {
         TP_SNN_CUDA_BWD_DISPATCH(float, Float32)
@@ -385,8 +404,8 @@ Tensor snn_surrogate_grad_cuda(const Tensor& x, int64_t surrogate,
     const DType dt = x.dtype();
     TP_CHECK(isFloatingType(dt),
              "snn_surrogate_grad: x must be a floating point tensor");
-    TP_CHECK(surrogate >= 0 && surrogate <= 3,
-             "snn_surrogate_grad: surrogate must be in [0, 3]");
+    TP_CHECK(surrogate >= 0 && surrogate <= 5,
+             "snn_surrogate_grad: surrogate must be in [0, 5]");
     Tensor x_c = x.contiguous();
     Tensor out = Tensor::empty(static_cast<std::vector<int64_t>>(x.shape()),
                                dt, x.device());
@@ -412,16 +431,23 @@ __global__ void lif_seq_kernel(const T* __restrict__ input_p,
                                const T* __restrict__ v_init_p,
                                const T* __restrict__ decay_p, int64_t decay_n,
                                const T* __restrict__ threshold_p,
-                               int64_t threshold_n, int64_t T_steps, int64_t M,
-                               bool has_reset, double reset_val,
+                               int64_t threshold_n,
+                               const T* __restrict__ v_reset_p,
+                               int64_t v_reset_n, int64_t T_steps, int64_t M,
+                               bool has_reset,
                                T* __restrict__ spike_p,
-                               T* __restrict__ v_final_p) {
+                               T* __restrict__ v_final_p,
+                               T* __restrict__ v_seq_p) {
     const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
     for (int64_t m = blockIdx.x * blockDim.x + threadIdx.x; m < M;
          m += stride) {
         const ComputeT dc = static_cast<ComputeT>(decay_p[decay_n == 1 ? 0 : m]);
         const ComputeT th =
             static_cast<ComputeT>(threshold_p[threshold_n == 1 ? 0 : m]);
+        const ComputeT rv = has_reset
+                               ? static_cast<ComputeT>(
+                                     v_reset_p[v_reset_n == 1 ? 0 : m])
+                               : ComputeT(0);
         ComputeT vv = static_cast<ComputeT>(v_init_p[m]);
         for (int64_t t = 0; t < T_steps; ++t) {
             const int64_t idx = t * M + m;
@@ -429,11 +455,11 @@ __global__ void lif_seq_kernel(const T* __restrict__ input_p,
             const ComputeT h = dc * vv + x;
             const ComputeT diff = h - th;
             const ComputeT s = diff >= ComputeT(0) ? ComputeT(1) : ComputeT(0);
-            vv = has_reset
-                     ? h * (ComputeT(1) - s) +
-                           static_cast<ComputeT>(reset_val) * s
-                     : h - th * s;
+            vv = has_reset ? h * (ComputeT(1) - s) + rv * s : h - th * s;
             spike_p[idx] = static_cast<T>(s);
+            if (v_seq_p != nullptr) {
+                v_seq_p[idx] = static_cast<T>(vv);
+            }
         }
         v_final_p[m] = static_cast<T>(vv);
     }
@@ -445,8 +471,10 @@ __global__ void lif_seq_backward_kernel(
     const T* __restrict__ input_p, const T* __restrict__ v_init_p,
     const T* __restrict__ decay_p, int64_t decay_n,
     const T* __restrict__ threshold_p, int64_t threshold_n,
-    const T* __restrict__ spike_p, int64_t T_steps, int64_t M, bool has_reset,
-    double reset_val, int64_t surrogate, double alpha, bool detach_reset,
+    const T* __restrict__ spike_p,
+    const T* __restrict__ v_reset_p, int64_t v_reset_n,
+    int64_t T_steps, int64_t M, bool has_reset,
+    int64_t surrogate, double alpha, bool detach_reset,
     ComputeT* v_buf, T* __restrict__ grad_input_p,
     T* __restrict__ grad_v_init_p, T* __restrict__ grad_decay_p,
     T* __restrict__ grad_threshold_p) {
@@ -456,6 +484,10 @@ __global__ void lif_seq_backward_kernel(
         const ComputeT dc = static_cast<ComputeT>(decay_p[decay_n == 1 ? 0 : m]);
         const ComputeT th =
             static_cast<ComputeT>(threshold_p[threshold_n == 1 ? 0 : m]);
+        const ComputeT rv = has_reset
+                               ? static_cast<ComputeT>(
+                                     v_reset_p[v_reset_n == 1 ? 0 : m])
+                               : ComputeT(0);
 
         // Recompute the forward trajectory from the stored spikes so the
         // backward sees exactly the voltages the forward used.  Only the
@@ -467,10 +499,7 @@ __global__ void lif_seq_backward_kernel(
             const ComputeT s = static_cast<ComputeT>(spike_p[idx]);
             const ComputeT h = dc * vv + static_cast<ComputeT>(input_p[idx]);
             v_buf[idx] = vv;
-            vv = has_reset
-                     ? h * (ComputeT(1) - s) +
-                           static_cast<ComputeT>(reset_val) * s
-                     : h - th * s;
+            vv = has_reset ? h * (ComputeT(1) - s) + rv * s : h - th * s;
         }
 
         // Back-propagate the voltage gradient across time (BPTT).
@@ -498,12 +527,9 @@ __global__ void lif_seq_backward_kernel(
                 }
             } else {
                 if (has_reset) {
-                    grad_h = ((ComputeT(1) - s) +
-                              (static_cast<ComputeT>(reset_val) - h) * sg) *
-                                 gv +
+                    grad_h = ((ComputeT(1) - s) + (rv - h) * sg) * gv +
                              sg * gs;
-                    grad_th = -sg * (gs +
-                                     (static_cast<ComputeT>(reset_val) - h) * gv);
+                    grad_th = -sg * (gs + (rv - h) * gv);
                 } else {
                     grad_h = (ComputeT(1) - th * sg) * gv + sg * gs;
                     grad_th = -sg * gs + (-s + th * sg) * gv;
@@ -525,8 +551,9 @@ template <typename T, typename ComputeT>
 void launch_lif_seq(const Tensor& input_c, const Tensor& v_init_c,
                     const Tensor& decay_c, int64_t decay_n,
                     const Tensor& threshold_c, int64_t threshold_n,
-                    int64_t T_steps, int64_t M, bool has_reset, double reset_val,
-                    Tensor& spikes, Tensor& v_final) {
+                    const Tensor& v_reset_c, int64_t v_reset_n,
+                    int64_t T_steps, int64_t M, bool has_reset,
+                    Tensor& spikes, Tensor& v_final, Tensor& v_seq) {
     if (M == 0) return;
     dim3 block(kThreads);
     dim3 grid(static_cast<unsigned>((M + kThreads - 1) / kThreads));
@@ -534,8 +561,9 @@ void launch_lif_seq(const Tensor& input_c, const Tensor& v_init_c,
         <<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
             input_c.data_ptr<T>(), v_init_c.data_ptr<T>(),
             decay_c.data_ptr<T>(), decay_n, threshold_c.data_ptr<T>(),
-            threshold_n, T_steps, M, has_reset, reset_val, spikes.data_ptr<T>(),
-            v_final.data_ptr<T>());
+            threshold_n, v_reset_c.data_ptr<T>(), v_reset_n,
+            T_steps, M, has_reset, spikes.data_ptr<T>(),
+            v_final.data_ptr<T>(), v_seq.data_ptr<T>());
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -545,8 +573,9 @@ void launch_lif_seq_backward(const Tensor& grad_spikes_c,
                              const Tensor& input_c, const Tensor& v_init_c,
                              const Tensor& decay_c, int64_t decay_n,
                              const Tensor& threshold_c, int64_t threshold_n,
-                             const Tensor& spike_c, int64_t T_steps, int64_t M,
-                             bool has_reset, double reset_val,
+                             const Tensor& spike_c,
+                             const Tensor& v_reset_c, int64_t v_reset_n,
+                             int64_t T_steps, int64_t M, bool has_reset,
                              int64_t surrogate, double alpha,
                              bool detach_reset, Tensor& v_buf,
                              Tensor& grad_input, Tensor& grad_v_init,
@@ -560,15 +589,16 @@ void launch_lif_seq_backward(const Tensor& grad_spikes_c,
             grad_spikes_c.data_ptr<T>(), grad_v_final_c.data_ptr<T>(),
             input_c.data_ptr<T>(), v_init_c.data_ptr<T>(),
             decay_c.data_ptr<T>(), decay_n, threshold_c.data_ptr<T>(),
-            threshold_n, spike_c.data_ptr<T>(), T_steps, M, has_reset,
-            reset_val, surrogate, alpha, detach_reset, v_buf.data_ptr<ComputeT>(),
+            threshold_n, spike_c.data_ptr<T>(), v_reset_c.data_ptr<T>(),
+            v_reset_n, T_steps, M, has_reset,
+            surrogate, alpha, detach_reset, v_buf.data_ptr<ComputeT>(),
             grad_input.data_ptr<T>(),
             grad_v_init.data_ptr<T>(), grad_decay_full.data_ptr<T>(),
             grad_threshold_full.data_ptr<T>());
     CUDA_CHECK(cudaGetLastError());
 }
 
-std::tuple<Tensor, Tensor> snn_lif_seq_cuda(
+std::tuple<Tensor, Tensor, Tensor> snn_lif_seq_cuda(
     const Tensor& input, const Tensor& v_init, const Tensor& decay,
     const Tensor& threshold, const std::optional<Tensor>& v_reset,
     int64_t surrogate, double alpha, bool detach_reset) {
@@ -592,15 +622,13 @@ std::tuple<Tensor, Tensor> snn_lif_seq_cuda(
     const DType dt = input.dtype();
     TP_CHECK(isFloatingType(dt),
              "snn_lif_seq: input must be a floating point tensor");
-    TP_CHECK(surrogate >= 0 && surrogate <= 3,
-             "snn_lif_seq: surrogate must be in [0, 3]");
+    TP_CHECK(surrogate >= 0 && surrogate <= 5,
+             "snn_lif_seq: surrogate must be in [0, 5]");
 
     const bool has_reset = v_reset.has_value();
-    double reset_val = 0.0;
+    Tensor v_reset_c;
     if (has_reset) {
-        TP_CHECK(v_reset->numel() == 1,
-                 "snn_lif_seq: v_reset must be a scalar tensor");
-        reset_val = v_reset->item().toDouble();
+        v_reset_c = v_reset->to(dt).expand(v_target).contiguous();
     }
 
     Tensor input_c = input.contiguous();
@@ -613,15 +641,17 @@ std::tuple<Tensor, Tensor> snn_lif_seq_cuda(
                                     : threshold.to(dt).expand(v_target).contiguous();
     Tensor spikes = Tensor::empty(input_sizes, dt, input.device());
     Tensor v_final = Tensor::empty(v_target, dt, input.device());
+    Tensor v_seq = Tensor::empty(input_sizes, dt, input.device());
     const int64_t M = v_final.numel();
 
     const int64_t decay_n = decay_c.numel();
     const int64_t threshold_n = threshold_c.numel();
+    const int64_t v_reset_n = has_reset ? v_reset_c.numel() : 0;
 #define TP_SNN_CUDA_SEQ_DISPATCH(ctype, name_)                               \
     case DType::name_:                                                       \
         launch_lif_seq<ctype, snn_compute_t<ctype>>(                         \
             input_c, v_init_c, decay_c, decay_n, threshold_c, threshold_n,   \
-            T, M, has_reset, reset_val, spikes, v_final);                    \
+            v_reset_c, v_reset_n, T, M, has_reset, spikes, v_final, v_seq); \
         break;
     switch (dt) {
         TP_SNN_CUDA_SEQ_DISPATCH(float, Float32)
@@ -632,7 +662,7 @@ std::tuple<Tensor, Tensor> snn_lif_seq_cuda(
             TP_THROW(TypeError, "snn_lif_seq: unsupported dtype");
     }
 #undef TP_SNN_CUDA_SEQ_DISPATCH
-    return {spikes, v_final};
+    return {spikes, v_final, v_seq};
 }
 
 std::tuple<Tensor, Tensor, Tensor, Tensor> snn_lif_seq_backward_cuda(
@@ -654,15 +684,13 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> snn_lif_seq_backward_cuda(
     const DType dt = input.dtype();
     TP_CHECK(isFloatingType(dt),
              "snn_lif_seq_backward: input must be a floating point tensor");
-    TP_CHECK(surrogate >= 0 && surrogate <= 3,
-             "snn_lif_seq_backward: surrogate must be in [0, 3]");
+    TP_CHECK(surrogate >= 0 && surrogate <= 5,
+             "snn_lif_seq_backward: surrogate must be in [0, 5]");
 
     const bool has_reset = v_reset.has_value();
-    double reset_val = 0.0;
+    Tensor v_reset_c;
     if (has_reset) {
-        TP_CHECK(v_reset->numel() == 1,
-                 "snn_lif_seq_backward: v_reset must be a scalar tensor");
-        reset_val = v_reset->item().toDouble();
+        v_reset_c = v_reset->to(dt).expand(v_target).contiguous();
     }
 
     Tensor input_c = input.contiguous();
@@ -688,12 +716,13 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> snn_lif_seq_backward_cuda(
 
     const int64_t decay_n = decay_c.numel();
     const int64_t threshold_n = threshold_c.numel();
+    const int64_t v_reset_n = has_reset ? v_reset_c.numel() : 0;
 #define TP_SNN_CUDA_SEQ_BWD_DISPATCH(ctype, name_)                           \
     case DType::name_:                                                       \
         launch_lif_seq_backward<ctype, snn_compute_t<ctype>>(                \
             grad_spikes_c, grad_v_final_c, input_c, v_init_c, decay_c,        \
-            decay_n, threshold_c, threshold_n, spike_c, T, M, has_reset,     \
-            reset_val, surrogate, alpha, detach_reset, v_buf,               \
+            decay_n, threshold_c, threshold_n, spike_c, v_reset_c, v_reset_n,\
+            T, M, has_reset, surrogate, alpha, detach_reset, v_buf,         \
             grad_input, grad_v_init, grad_decay_full, grad_threshold_full);  \
         break;
     switch (dt) {

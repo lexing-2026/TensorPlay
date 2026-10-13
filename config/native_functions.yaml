@@ -4548,9 +4548,10 @@
 #
 # `surrogate` selects the gradient that replaces the (almost everywhere zero)
 # step derivative during backward: 0 straight-through, 1 sigmoid, 2 fast
-# sigmoid, 3 piecewise-linear.  `alpha` scales the surrogate.  `detach_reset`
-# treats the spike in the voltage-update path as a constant during backward,
-# which is the standard stabilizing choice for surrogate-gradient training.
+# sigmoid, 3 piecewise-linear, 4 arctangent, 5 erf.  `alpha` scales the
+# surrogate.  `detach_reset` treats the spike in the voltage-update path as a
+# constant during backward, which is the standard stabilizing choice for
+# surrogate-gradient training.
 
 - func: snn_lif_step(Tensor input, Tensor v, Tensor decay, Tensor threshold, Tensor? v_reset=None, int surrogate=0, float alpha=1.0, bool detach_reset=True) -> (Tensor spike, Tensor v_new)
   variants: function
@@ -4566,10 +4567,11 @@
 
 # Multi-step variant of ``snn_lif_step``: ``input`` has shape ``[T, B, ...]``
 # and the neuron dynamics iterate over time inside a single fused kernel,
-# returning the full ``[T, B, ...]`` spike train and the ``[B, ...]`` final
-# voltage.  The backward recomputes the membrane trajectory from the stored
+# returning the full ``[T, B, ...]`` spike train, the ``[B, ...]`` final
+# voltage, and the ``[T, B, ...]`` voltage trajectory (updated voltage per
+# step).  The backward recomputes the membrane trajectory from the stored
 # spikes and back-propagates the voltage gradient across time (BPTT).
-- func: snn_lif_seq(Tensor input, Tensor v_init, Tensor decay, Tensor threshold, Tensor? v_reset=None, int surrogate=0, float alpha=1.0, bool detach_reset=True) -> (Tensor spikes, Tensor v_final)
+- func: snn_lif_seq(Tensor input, Tensor v_init, Tensor decay, Tensor threshold, Tensor? v_reset=None, int surrogate=0, float alpha=1.0, bool detach_reset=True) -> (Tensor spikes, Tensor v_final, Tensor v_seq)
   variants: function
   dispatch:
     CPU: snn_lif_seq_cpu

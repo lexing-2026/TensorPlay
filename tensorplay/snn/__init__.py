@@ -1,8 +1,8 @@
 """Spiking neural network primitives.
 
 The module provides the neuron models, surrogate gradients, spike encoders,
-and the functional primitives needed to build and train spiking networks.
-The neuron dynamics run in fused native CPU/CUDA operators
+monitoring tools, and the functional primitives needed to build and train
+spiking networks.  The neuron dynamics run in fused native CPU/CUDA operators
 (``snn_lif_step`` / ``snn_lif_step_backward``); this package wires them into
 the autograd engine and the ``nn.Module`` API.
 
@@ -19,15 +19,29 @@ Example:
 
 from . import encoding as encoding
 from . import functional as functional
+from . import monitor as monitor
 from . import surrogate as surrogate
 from .encoding import (
+    GaussianTuningCurveEncoder,
+    PeriodicEncoder,
     poisson_encode,
     rate_encode,
     temporal_encode,
 )
-from .functional import heaviside, lif_seq, lif_step, spike, surrogate_grad
-from .neuron import IFNode, LIFNode, ParametricLIFNode
+from .functional import (
+    heaviside,
+    lif_seq,
+    lif_step,
+    spike,
+    spike_rate,
+    spike_rate_loss,
+    surrogate_grad,
+)
+from .monitor import SpikeMonitor
+from .neuron import ALIFNode, IFNode, LIFNode, ParametricLIFNode, SpikeLinear
 from .surrogate import (
+    ATanSurrogate,
+    ErfSurrogate,
     FastSigmoidSurrogate,
     PiecewiseLinearSurrogate,
     SigmoidSurrogate,
@@ -39,23 +53,34 @@ __all__ = [
     "IFNode",
     "LIFNode",
     "ParametricLIFNode",
+    "ALIFNode",
+    "SpikeLinear",
     # functional
     "heaviside",
     "spike",
     "surrogate_grad",
     "lif_step",
     "lif_seq",
+    "spike_rate",
+    "spike_rate_loss",
     # surrogates
     "StraightThroughSurrogate",
     "SigmoidSurrogate",
     "FastSigmoidSurrogate",
     "PiecewiseLinearSurrogate",
+    "ATanSurrogate",
+    "ErfSurrogate",
     # encoders
     "rate_encode",
     "poisson_encode",
     "temporal_encode",
+    "PeriodicEncoder",
+    "GaussianTuningCurveEncoder",
+    # monitoring
+    "SpikeMonitor",
     # submodules
     "encoding",
     "functional",
+    "monitor",
     "surrogate",
 ]

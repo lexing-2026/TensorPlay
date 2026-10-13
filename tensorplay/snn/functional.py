@@ -13,7 +13,15 @@ from tensorplay.autograd import Function
 
 from .surrogate import StraightThroughSurrogate
 
-__all__ = ["heaviside", "spike", "surrogate_grad", "lif_step", "lif_seq"]
+__all__ = [
+    "heaviside",
+    "spike",
+    "surrogate_grad",
+    "lif_step",
+    "lif_seq",
+    "spike_rate",
+    "spike_rate_loss",
+]
 
 
 def heaviside(x: Tensor) -> Tensor:
@@ -151,7 +159,7 @@ class _LIFSeqFunction(Function):
     @staticmethod
     def forward(ctx, input, v_init, decay, threshold, v_reset, surrogate_id,
                 alpha, detach_reset):
-        spikes, v_final = _C.snn_lif_seq(
+        spikes, v_final, v_seq = _C.snn_lif_seq(
             input=input,
             v_init=v_init,
             decay=decay,
@@ -166,7 +174,7 @@ class _LIFSeqFunction(Function):
         ctx.surrogate_id = surrogate_id
         ctx.alpha = alpha
         ctx.detach_reset = detach_reset
-        return spikes, v_final
+        return spikes, v_final, v_seq
 
     @staticmethod
     def backward(ctx, grad_spikes, grad_v_final):
@@ -207,14 +215,17 @@ def lif_seq(
     v_reset=0.0,
     surrogate=None,
     detach_reset: bool = True,
+    return_v_seq: bool = False,
 ):
     """Multi-step leaky integrate-and-fire update on ``[T, B, ...]`` input.
 
     Runs the single-step neuron dynamics ``T`` times inside one fused native
-    kernel (no Python-level time loop) and returns ``(spikes, v_final)`` with
-    shapes ``[T, B, ...]`` and ``[B, ...]``.  ``v_init`` defaults to zeros with
-    the shape of ``input.shape[1:]``; pass an explicit tensor to start from a
-    different membrane potential.  ``v_reset=None`` selects the soft reset.
+    kernel (no Python-level time loop).  Returns ``(spikes, v_final)`` with
+    shapes ``[T, B, ...]`` and ``[B, ...]``.  With ``return_v_seq=True`` also
+    returns the per-step updated voltage trajectory ``[T, B, ...]`` as
+    ``(spikes, v_seq, v_final)``.  ``v_init`` defaults to zeros with the shape
+    of ``input.shape[1:]``; pass an explicit tensor to start from a different
+    membrane potential.  ``v_reset=None`` selects the soft reset.
     """
     if surrogate is None:
         surrogate = StraightThroughSurrogate()
@@ -227,7 +238,7 @@ def lif_seq(
     decay_t = _as_tensor(decay, input, "decay")
     threshold_t = _as_tensor(threshold, input, "threshold")
     v_reset_t = None if v_reset is None else _as_tensor(v_reset, input, "v_reset")
-    return _LIFSeqFunction.apply(
+    spikes, v_final, v_seq = _LIFSeqFunction.apply(
         input,
         v_init,
         decay_t,
@@ -236,4 +247,40 @@ def lif_seq(
         surrogate.id,
         surrogate.alpha,
         detach_reset,
+    )
+    if return_v_seq:
+        return spikes, v_seq, v_final
+    return spikes, v_final
+
+def spike_rate(spikes: Tensor, dim: int = 0) -> Tensor:
+    """Average firing rate of a spike train along a time dimension.
+
+    ``spikes`` is a binary tensor with a leading time axis (``[T, ...]``).
+    Returns the mean over time, i.e. the fraction of steps each neuron fired.
+    """
+    if spikes.dim() == 0:
+        return spikes
+    return spikes.mean(dim=dim).to(spikes.dtype)
+
+def spike_rate_loss(
+    spikes: Tensor,
+    target_rate: Tensor,
+    dim: int = 0,
+    reduction: str = "mean",
+) -> Tensor:
+    """Mean-squared-error loss between the firing rate and a target rate.
+
+    ``spikes`` has shape ``[T, ...]`` and ``target_rate`` broadcasts against
+    ``spikes.mean(dim)``.  Useful for regularizing spiking activity.
+    """
+    rate = spike_rate(spikes, dim=dim)
+    loss = (rate - target_rate) ** 2
+    if reduction == "mean":
+        return loss.mean()
+    if reduction == "sum":
+        return loss.sum()
+    if reduction == "none":
+        return loss
+    raise ValueError(
+        f"spike_rate_loss reduction must be 'mean', 'sum' or 'none', got {reduction!r}"
     )

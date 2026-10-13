@@ -14,6 +14,8 @@ __all__ = [
     "SigmoidSurrogate",
     "FastSigmoidSurrogate",
     "PiecewiseLinearSurrogate",
+    "ATanSurrogate",
+    "ErfSurrogate",
 ]
 
 # Surrogate ids must match the native snn_surrogate_grad kernel dispatch.
@@ -21,6 +23,8 @@ _SURROGATE_STRAIGHT_THROUGH = 0
 _SURROGATE_SIGMOID = 1
 _SURROGATE_FAST_SIGMOID = 2
 _SURROGATE_PIECEWISE_LINEAR = 3
+_SURROGATE_ATAN = 4
+_SURROGATE_ERF = 5
 
 
 class _Surrogate:
@@ -86,4 +90,28 @@ class PiecewiseLinearSurrogate(_Surrogate):
     id = _SURROGATE_PIECEWISE_LINEAR
 
     def __init__(self, alpha: float = 1.0) -> None:
+        self.alpha = alpha
+
+
+class ATanSurrogate(_Surrogate):
+    """Arctangent surrogate.
+
+    Backward weight: ``alpha / (1 + (pi*alpha*x)^2)``.
+    """
+
+    id = _SURROGATE_ATAN
+
+    def __init__(self, alpha: float = 2.0) -> None:
+        self.alpha = alpha
+
+
+class ErfSurrogate(_Surrogate):
+    """Gaussian error-function surrogate.
+
+    Backward weight: ``alpha / sqrt(pi) * exp(-(alpha*x)^2)``.
+    """
+
+    id = _SURROGATE_ERF
+
+    def __init__(self, alpha: float = 2.0) -> None:
         self.alpha = alpha
