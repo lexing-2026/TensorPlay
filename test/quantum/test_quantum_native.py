@@ -526,3 +526,175 @@ def test_the_marginal_kernel_reads_more_wires_than_a_gate_may_span():
     out = _C._quantum_marginal_probs(flat, list(range(n_qubits)))
     assert out.shape == (1, 1 << n_qubits)
     assert abs(float(out.reshape(-1)[1]) - 1.0) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Gradients through the compiled reads
+#
+# The compiled reads hand back a number, so a state that is being trained has to
+# be given a backward by hand.  Every check here reads against the decomposition
+# the same quantity falls back to when no kernel is present -- two independent
+# implementations of the same derivative, not one implementation compared with
+# itself.
+# ---------------------------------------------------------------------------
+
+
+def _trained_state(n_qubits, dtype=tp.complex64, batch=None):
+    """A state whose amplitudes carry gradients, through one rotation per wire."""
+    angles = [
+        tp.tensor(0.37 + 0.2 * wire, dtype=tp.float64, requires_grad=True)
+        for wire in range(n_qubits)
+    ]
+    if batch is None:
+        state = tq.zeros_state(n_qubits, dtype=dtype)
+    else:
+        state = tq.zeros_state(n_qubits, batch=batch, dtype=dtype)
+    for wire in range(n_qubits):
+        state = tq.apply_ry(state, wire, angles[wire])
+    return state, angles
+
+
+def _weighted_sum(value, n_columns):
+    """A scalar that weighs every column differently.
+
+    The bare sum of a distribution is one whatever the state is, so its gradient
+    is zero and would check nothing.
+    """
+    weights = tp.tensor(
+        [0.2 + 0.05 * column for column in range(n_columns)], dtype=value.dtype
+    )
+    return (value * weights).sum()
+
+
+def _angle_gradients(read, n_qubits, n_columns):
+    """The per-angle gradients a read leaves behind on a trained state."""
+    state, angles = _trained_state(n_qubits)
+    _weighted_sum(read(state, n_columns), n_columns).backward()
+    return [float(angle.grad) for angle in angles]
+
+
+def test_the_compiled_probs_gradient_matches_the_decomposition():
+    from tensorplay.quantum._measurement import _probs_by_squaring
+
+    for n_qubits in (1, 2, 3):
+        columns = 1 << n_qubits
+        got = _angle_gradients(lambda state, k: tq.probs(state), n_qubits, columns)
+        want = _angle_gradients(
+            lambda state, k: _probs_by_squaring(state), n_qubits, columns
+        )
+        for one, other in zip(got, want):
+            tp.testing.assert_close(
+                tp.tensor(one), tp.tensor(other), atol=1e-6, rtol=1e-6
+            )
+
+
+def test_the_compiled_marginal_gradient_matches_the_decomposition():
+    from tensorplay.quantum._measurement import _marginal_probs_by_folding
+
+    for wires in ([0], [0, 1], [1, 0], [2, 0], [2, 1, 0]):
+        columns = 1 << len(wires)
+        got = _angle_gradients(lambda s, k: tq.marginal_probs(s, wires), 3, columns)
+        want = _angle_gradients(
+            lambda s, k: _marginal_probs_by_folding(s, wires), 3, columns
+        )
+        for one, other in zip(got, want):
+            tp.testing.assert_close(
+                tp.tensor(one), tp.tensor(other), atol=1e-6, rtol=1e-6
+            )
+
+
+def test_the_compiled_expectation_gradient_matches_the_decomposition():
+    from tensorplay.quantum._measurement import _expectation_by_rotation
+
+    for word in ("ZI", "IZ", "ZZ", "XX", "XY", "IX", "II"):
+        rows = []
+        for read in (tq.expectation, _expectation_by_rotation):
+            state, angles = _trained_state(2)
+            value = read(state, word)
+            (value * tp.tensor([0.5, 1.5], dtype=value.dtype)).sum().backward()
+            rows.append([float(angle.grad) for angle in angles])
+        for got, want in zip(*rows):
+            tp.testing.assert_close(
+                tp.tensor(got), tp.tensor(want), atol=1e-6, rtol=1e-6
+            )
+
+
+def _leaf_state(real, imag):
+    """A two-qubit state whose two real halves are the leaves themselves.
+
+    Reading the gradient off two real tensors makes the complex one entry by
+    entry, with no convention left to guess at.
+    """
+    real_leaf = tp.tensor(real, requires_grad=True)
+    imag_leaf = tp.tensor(imag, requires_grad=True)
+    state = tq.unflatten(tp.complex(real_leaf, imag_leaf).reshape(1, -1), 2)
+    return state, real_leaf, imag_leaf
+
+
+def test_the_expectation_gradient_is_the_word_applied_to_the_state():
+    # d/dpsi Re<psi|P|psi> is P|psi>, and a real output counts both halves of the
+    # conjugate derivative, so an unweighted sum hands back twice the rotated
+    # state.
+    real = [0.3, 0.5, -0.2, 0.7]
+    imag = [-0.2, 0.7, 0.4, -0.6]
+    for word in ("ZI", "YI", "XI", "ZZ", "XY", "IY"):
+        state, real_leaf, imag_leaf = _leaf_state(real, imag)
+        tq.expectation(state, word).sum().backward()
+        turned = tq.apply_pauli_word(state.detach(), word).reshape(-1)
+        tp.testing.assert_close(
+            real_leaf.grad,
+            tp.tensor([2 * complex(v).real for v in turned.tolist()]),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        tp.testing.assert_close(
+            imag_leaf.grad,
+            tp.tensor([2 * complex(v).imag for v in turned.tolist()]),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+
+def test_the_probs_gradient_is_twice_the_state():
+    real = [0.3, 0.5, -0.2, 0.7]
+    imag = [-0.2, 0.7, 0.4, -0.6]
+    state, real_leaf, imag_leaf = _leaf_state(real, imag)
+    tq.probs(state).sum().backward()
+    tp.testing.assert_close(
+        real_leaf.grad, tp.tensor([2 * v for v in real]), atol=1e-5, rtol=1e-5
+    )
+    tp.testing.assert_close(
+        imag_leaf.grad, tp.tensor([2 * v for v in imag]), atol=1e-5, rtol=1e-5
+    )
+
+
+def test_the_gradient_comes_back_twice_from_the_same_graph():
+    # The backward builds its own arithmetic detached; asking for it twice must
+    # not find a half-built graph hanging off the first one.
+    state, angles = _trained_state(2)
+    word = "ZX"
+    tq.expectation(state, word).backward(retain_graph=True)
+    once = [float(angle.grad) for angle in angles]
+    for angle in angles:
+        angle.grad = None
+    tq.expectation(state, word).backward()
+    twice = [float(angle.grad) for angle in angles]
+    assert once == twice
+
+
+def test_a_batched_state_gets_a_gradient_per_entry():
+    state, angles = _trained_state(2, batch=3)
+    value = tq.expectation(state, "ZX")
+    (value * tp.tensor([0.5, 1.0, 1.5], dtype=value.dtype)).sum().backward()
+    for angle in angles:
+        assert angle.grad is not None
+        assert abs(float(angle.grad)) > 1e-6
+
+
+def test_a_double_precision_state_gets_a_gradient():
+    state, angles = _trained_state(2, dtype=tp.complex128)
+    value = tq.expectation(state, "ZX")
+    value.sum().backward()
+    for angle in angles:
+        assert angle.grad is not None
+        assert abs(float(angle.grad)) > 1e-6

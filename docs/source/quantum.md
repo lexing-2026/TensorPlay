@@ -353,6 +353,15 @@ multiply, and the inverse permutation — all differentiable primitives, with th
 gradient carried through them. Outside one, the compiled kernel applies the gate
 in a single pass over the amplitudes.
 
+The measurement side stays compiled either way. `expectation`, `probs` and
+`marginal_probs` read the amplitudes in one pass and are linear in `|psi|²`, so
+inside a graph they hand the backward the arithmetic they would have done
+anyway: the gradient of a Pauli word is that word applied to the state, and the
+gradient of a distribution is the state times the weights the forward already
+computed. A trained circuit therefore pays for one pass forward and one pass per
+non-identity factor backward, rather than rebuilding a rotated copy of the state
+and threading a graph through it.
+
 ## Reference
 
 ```{eval-rst}

@@ -11,6 +11,8 @@ from typing import List, Optional, Sequence
 
 import tensorplay as tp
 
+from tensorplay.autograd import Function
+
 from . import _native
 from ._gates import (
     apply_gate,
@@ -49,11 +51,142 @@ _PAULI_BUILDERS = {
 }
 
 
+# The compiled reads below hand back a number and nothing else, so a graph that
+# is being recorded has to be given a backward by hand.  All three of them are
+# linear in |psi|**2, and that is what makes the backward short: the gradient of
+# a weight with respect to the amplitude it came from is the amplitude itself, so
+# the backward reuses whatever the forward already computed instead of walking
+# the state a second time.  Every one of them is a real output read against the
+# conjugate of the input, and that reading counts both halves -- d|psi|**2 comes
+# back as 2 psi here, not psi -- so each backward carries a factor of two.
+
+
+def _batch_scale(value: tp.Tensor, state: tp.Tensor) -> tp.Tensor:
+    """``value`` per batch entry, spread back over a state's own dimensions."""
+    return value.reshape(value.shape[0], *([1] * (state.dim() - 1)))
+
+
+class _CompiledStatePros(Function):
+    """``probs`` with a gradient: each weight's own amplitude comes back.
+
+    The weights line up with the amplitudes one for one, so the incoming
+    gradient needs no reshaping beyond the state layout it came from.
+    """
+
+    @staticmethod
+    def forward(ctx, state):
+        with tp.no_grad():
+            weights = _native.compiled_state_probs(state)
+        ctx.save_for_backward(state)
+        return weights
+
+    @staticmethod
+    def backward(ctx, grad_weights):
+        (state,) = ctx.saved_tensors
+        state, grad_weights = state.detach(), grad_weights.detach()
+        with tp.no_grad():
+            scale = grad_weights.reshape(state.shape)
+            grad = 2 * scale * state
+        return grad
+
+
+class _CompiledMarginalPros(Function):
+    """``marginal_probs`` with a gradient.
+
+    Every amplitude in a column shares that column's weight, so the backward is
+    the forward's own weights spread back over the unlisted wires and multiplied
+    into the state.  Nothing is walked a second time.
+    """
+
+    @staticmethod
+    def forward(ctx, state, wires):
+        # The wires arrive as a small tensor rather than a list: a list argument
+        # is read as one input per entry, and the backward answers one input per
+        # argument.
+        listed = [int(wire) for wire in wires]
+        with tp.no_grad():
+            weights = _native.compiled_marginal_probs(state, listed)
+        ctx.save_for_backward(state)
+        ctx.wires = listed
+        return weights
+
+    @staticmethod
+    def backward(ctx, grad_weights):
+        (state,) = ctx.saved_tensors
+        # Detached: the backward runs inside a traversal, and a graph built here
+        # would ask to be traversed again.
+        state, grad_weights = state.detach(), grad_weights.detach()
+        with tp.no_grad():
+            n_qubits = state.dim() - 1
+            batch = state.shape[0]
+            listed = ctx.wires
+            # The incoming gradient is paired with the forward's columns, so it
+            # is walked back the same way the columns were: each axis of the
+            # folded weight sits at its wire's own position in the amplitude
+            # index, which for wires named out of order means moving them first.
+            folded = unflatten(grad_weights.reshape(batch, -1), len(listed))
+            ascending = sorted(range(len(listed)), key=lambda j: listed[j])
+            if ascending != list(range(len(listed))):
+                folded = folded.permute([0, *(axis + 1 for axis in ascending)])
+            spread = folded.reshape(
+                batch,
+                *[
+                    2 if wire in listed else 1
+                    for wire in range(n_qubits)
+                ],
+            )
+            # The unfolded amplitude index has one bit per wire, so every axis of
+            # the spread weight is two long: the listed ones hold the column, the
+            # rest are stretched back over the amplitudes that share it.
+            full = tp.broadcast_to(spread, [batch, *([2] * n_qubits)])
+            grad = 2 * full.reshape(batch, -1) * state.reshape(batch, -1)
+        return grad, None
+
+
+class _CompiledPauliExpectation(Function):
+    """``expectation`` with a gradient: the word applied once, by hand.
+
+    ``d/dpsi Re<psi|P|psi>`` is ``P|psi>`` -- the word is Hermitian, so the two
+    halves of the conjugate derivative agree and the real part halves them into
+    exactly the operator itself.  That is one pass per non-identity factor, which
+    is what the forward was avoiding by not rotating the state at all.
+    """
+
+    @staticmethod
+    def forward(ctx, state, word):
+        with tp.no_grad():
+            codes = _native.pauli_codes(word, state.device)
+            value = _native.compiled_pauli_expectation(state, codes)
+        ctx.save_for_backward(state)
+        ctx.word = word
+        return value
+
+    @staticmethod
+    def backward(ctx, grad_value):
+        (state,) = ctx.saved_tensors
+        state, grad_value = state.detach(), grad_value.detach()
+        with tp.no_grad():
+            turned = apply_pauli_word(state, ctx.word)
+            grad = _batch_scale(2 * grad_value, state) * turned
+        return grad, None
+
+
 def probs(state: tp.Tensor) -> tp.Tensor:
     """The measurement distribution of each state, shaped ``[batch, 2**n]``."""
     direct = _native.native_state_probs(state)
     if direct is not None:
         return direct
+    if _native.has_state_probs() and _native.records_grad(state):
+        return _CompiledStatePros.apply(state)
+    return _probs_by_squaring(state)
+
+
+def _probs_by_squaring(state: tp.Tensor) -> tp.Tensor:
+    """The measurement distribution from the amplitudes themselves.
+
+    Square and add, which is the one step every other distribution here is built
+    out of; the state carries the gradient on this path.
+    """
     flat = state.reshape(state.shape[0], -1)
     real = flat.real
     imag = flat.imag
@@ -78,6 +211,17 @@ def marginal_probs(state: tp.Tensor, wires: Sequence[int]) -> tp.Tensor:
     direct = _native.native_marginal_probs(state, target)
     if direct is not None:
         return direct
+    if _native.has_marginal_probs() and _native.records_grad(state):
+        wire_tensor = tp.tensor(target, dtype=tp.int64, device=state.device)
+        return _CompiledMarginalPros.apply(state, wire_tensor)
+    return _marginal_probs_by_folding(state, target)
+
+
+def _marginal_probs_by_folding(
+    state: tp.Tensor, target: Sequence[int]
+) -> tp.Tensor:
+    """The marginal by moving the listed qubits to the front and summing."""
+    n_qubits = n_qubits_of(state)
     missing = [w for w in range(n_qubits) if w not in target]
     # The square is elementwise, so moving the weights after the square sums
     # the same entries as moving the amplitudes before it -- and the weights
@@ -122,7 +266,19 @@ def expectation(state: tp.Tensor, word: str) -> tp.Tensor:
     )
     if direct is not None:
         return direct
-    rotated = apply_pauli_word(state, checked)
+    if _native.has_pauli_expectation() and _native.records_grad(state):
+        return _CompiledPauliExpectation.apply(state, checked)
+    return _expectation_by_rotation(state, checked)
+
+
+def _expectation_by_rotation(state: tp.Tensor, word: str) -> tp.Tensor:
+    """The overlap of a state with its Pauli-rotated self, by rotation.
+
+    The state itself carries the gradient here, one single-qubit gate per
+    non-identity factor, and it stays in the loop rather than being turned into a
+    density matrix, so the cost grows with the state rather than with its square.
+    """
+    rotated = apply_pauli_word(state, word)
     overlap = (rotated.conj() * state)
     return overlap.sum(dim=tuple(range(1, state.dim()))).real
 

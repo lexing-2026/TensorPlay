@@ -21,10 +21,17 @@ import tensorplay as tp
 from tensorplay import _C
 
 __all__ = [
+    "compiled_marginal_probs",
+    "compiled_pauli_expectation",
+    "compiled_state_probs",
+    "has_marginal_probs",
+    "has_pauli_expectation",
+    "has_state_probs",
     "native_apply_gate",
     "native_marginal_probs",
     "native_pauli_expectation",
     "native_state_probs",
+    "pauli_codes",
     "records_grad",
 ]
 
@@ -43,6 +50,28 @@ def records_grad(*tensors: Optional[tp.Tensor]) -> bool:
     return any(
         isinstance(item, tp.Tensor) and item.requires_grad for item in tensors
     )
+
+
+def has_state_probs() -> bool:
+    """Whether the compiled measurement distribution exists in this build."""
+    return _STATE_PROBS is not None
+
+
+def has_marginal_probs() -> bool:
+    """Whether the compiled marginal distribution exists in this build."""
+    return _MARGINAL_PROBS is not None
+
+
+def has_pauli_expectation() -> bool:
+    """Whether the compiled Pauli overlap exists in this build."""
+    return _PAULI_EXPECTATION is not None
+
+
+# The three compiled reads below answer a question about the amplitudes rather
+# than carrying a gradient, so a caller with a graph in flight needs them
+# directly: a caller that differentiates wraps the read in a node whose backward
+# applies the operator by hand.  These take whichever grad mode is active, which
+# is why they sit beside -- not inside -- the wrappers above.
 
 
 def _flat(state: tp.Tensor) -> tp.Tensor:
@@ -73,6 +102,15 @@ def native_state_probs(state: tp.Tensor) -> Optional[tp.Tensor]:
     """Squares the amplitudes of a flat state, or returns ``None``."""
     if _STATE_PROBS is None or records_grad(state):
         return None
+    return compiled_state_probs(state)
+
+
+def compiled_state_probs(state: tp.Tensor) -> tp.Tensor:
+    """The compiled measurement distribution, whatever the grad mode.
+
+    Args:
+        state: amplitudes shaped ``[batch, 2**n]``.
+    """
     return _STATE_PROBS(_flat(state))
 
 
@@ -86,6 +124,16 @@ def native_marginal_probs(
     """
     if _MARGINAL_PROBS is None or records_grad(state):
         return None
+    return compiled_marginal_probs(state, wires)
+
+
+def compiled_marginal_probs(state: tp.Tensor, wires: Sequence[int]) -> tp.Tensor:
+    """The compiled marginal distribution, whatever the grad mode.
+
+    Args:
+        state: amplitudes shaped ``[batch, 2**n]``.
+        wires: the listed qubits, in the order their columns take.
+    """
     return _MARGINAL_PROBS(_flat(state), [int(wire) for wire in wires])
 
 
@@ -112,4 +160,15 @@ def native_pauli_expectation(
     """
     if _PAULI_EXPECTATION is None or records_grad(state):
         return None
+    return compiled_pauli_expectation(state, codes)
+
+
+def compiled_pauli_expectation(state: tp.Tensor, codes: tp.Tensor) -> tp.Tensor:
+    """The compiled Pauli overlap, whatever the grad mode.
+
+    Args:
+        state: amplitudes shaped ``[batch, 2**n]``.
+        codes: one entry per qubit, ``0`` for I, ``1`` for X, ``2`` for Y and
+            ``3`` for Z.
+    """
     return _PAULI_EXPECTATION(_flat(state), codes.contiguous())

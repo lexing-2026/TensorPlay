@@ -184,6 +184,42 @@ def test_the_marginal_covers_a_wide_register_on_the_device():
     tp.testing.assert_close(counts[0, 1], tp.tensor(512.0), atol=1e-4, rtol=1e-6)
 
 
+def test_the_expectation_gradient_matches_the_host_on_the_device():
+    # The gradient is worked out on the device and comes back from there, so the
+    # node has to travel as far as the forward does.
+    real = [0.3, 0.5, -0.2, 0.7]
+    imag = [-0.2, 0.7, 0.4, -0.6]
+
+    def grads(device):
+        real_leaf = tp.tensor(real, device=device, requires_grad=True)
+        imag_leaf = tp.tensor(imag, device=device, requires_grad=True)
+        state = tq.unflatten(tp.complex(real_leaf, imag_leaf).reshape(1, -1), 2)
+        tq.expectation(state, "XY").sum().backward()
+        return _on_device(real_leaf.grad), _on_device(imag_leaf.grad)
+
+    on_device = grads(tp.device("cuda"))
+    on_host = grads(tp.device("cpu"))
+    for got, want in zip(on_device, on_host):
+        tp.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)
+
+
+def test_the_marginal_gradient_matches_the_host_on_the_device():
+    angles = [
+        tp.tensor(0.37 + 0.2 * wire, requires_grad=True) for wire in range(3)
+    ]
+
+    def grads(device):
+        state = tq.zeros_state(3, device=device)
+        for wire in range(3):
+            state = tq.apply_ry(state, wire, angles[wire].to(device))
+        columns = tq.marginal_probs(state, [2, 0])
+        (columns * tp.tensor([0.3, 0.7, 1.1, 1.9], device=device)).sum().backward()
+        return [_on_device(angle.grad) for angle in angles]
+
+    for got, want in zip(grads(tp.device("cuda")), grads(tp.device("cpu"))):
+        tp.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)
+
+
 def test_channel_matches_the_host():
     density = tq.to_density(tq.apply_h(tq.zeros_state(2), 0))
     tp.testing.assert_close(
