@@ -22,6 +22,10 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, SparseConversionOps) {
     m.impl("to_sparse_csr", to_sparse_csr_cuda);
     m.impl("_nnz", sparse_nnz_cuda);
     m.impl("sparse_mm", sparse_mm_cuda);
+    m.impl("_sparse_addmm", _sparse_addmm_cuda);
+    m.impl("sparse_sampled_addmm", sparse_sampled_addmm_sparse_csr_cuda);
+    m.impl("sparse_sampled_addmm.out",
+           sparse_sampled_addmm_out_sparse_csr_cuda);
     m.impl("sparse_sum", sparse_sum_cuda);
     m.impl("sparse_add", sparse_add_cuda);
     m.impl("sparse_mul", sparse_mul_cuda);
@@ -36,9 +40,28 @@ TENSORPLAY_LIBRARY_IMPL(SparseCUDA, CopySparseKernels) {
     m.impl("to_sparse_csr", to_sparse_csr_cuda);
     m.impl("_nnz", sparse_nnz_cuda);
     m.impl("sparse_mm", sparse_mm_cuda);
+    m.impl("_sparse_addmm", _sparse_addmm_cuda);
+    m.impl("sparse_sampled_addmm", sparse_sampled_addmm_sparse_csr_cuda);
+    m.impl("sparse_sampled_addmm.out",
+           sparse_sampled_addmm_out_sparse_csr_cuda);
+    m.impl("_sparse_mm_reduce_impl",
+           [](const Tensor& self, const Tensor& other,
+              const std::string& reduce) {
+               return _sparse_mm_reduce_impl_sparse_csr_cuda(self, other,
+                                                          reduce);
+           });
+    m.impl("_sparse_mm_reduce_impl_backward",
+           [](const Tensor& self, const Tensor& grad_out, const Tensor& other,
+              const std::string& reduce, const Tensor& arg_out,
+              const std::vector<bool>& output_mask) {
+               return _sparse_mm_reduce_impl_backward_sparse_csr_cuda(
+                   self, grad_out, other, reduce, arg_out, output_mask);
+           });
+    m.impl("_spsolve", _spsolve_cuda);
     m.impl("sparse_sum", sparse_sum_cuda);
     m.impl("sparse_add", sparse_add_cuda);
     m.impl("sparse_mul", sparse_mul_cuda);
+    m.impl("mul.Scalar", sparse_mul_scalar_cuda);
     m.impl("_sparse_softmax", _sparse_softmax_cuda);
     m.impl("_sparse_softmax.int", _sparse_softmax_int_cuda);
     m.impl("_sparse_log_softmax", _sparse_log_softmax_cuda);

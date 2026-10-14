@@ -1,0 +1,473 @@
+{
+  "timestamp": "2026-10-13T03:55:25.250231+00:00",
+  "commit": "beb31ccb4e05d066bab45b9122c4b267b614f7c7",
+  "threads": 4,
+  "repetitions": 100,
+  "reference_version": "2.13.0+cu130",
+  "results": [
+    {
+      "operator": "mean",
+      "device": "cpu",
+      "shape": [
+        32,
+        256
+      ],
+      "strides": [
+        256,
+        1
+      ],
+      "native_us": 1.22309,
+      "reference_us": 2.3124100000000003,
+      "speedup": 1.8906294712572258,
+      "max_error": 0.0
+    },
+    {
+      "operator": "std",
+      "device": "cpu",
+      "shape": [
+        32,
+        256
+      ],
+      "strides": [
+        256,
+        1
+      ],
+      "native_us": 1.65482,
+      "reference_us": 2.74633,
+      "speedup": 1.659594396973689,
+      "max_error": 0.0
+    },
+    {
+      "operator": "max",
+      "device": "cpu",
+      "shape": [
+        32,
+        256
+      ],
+      "strides": [
+        256,
+        1
+      ],
+      "native_us": 1.81113,
+      "reference_us": 5.724959999999999,
+      "speedup": 3.1609878915373275,
+      "max_error": 0.0
+    },
+    {
+      "operator": "fill",
+      "device": "cpu",
+      "shape": [
+        32,
+        256
+      ],
+      "strides": [
+        256,
+        1
+      ],
+      "native_us": 0.7626000000000001,
+      "reference_us": 6.600700000000001,
+      "speedup": 8.65552058746394,
+      "max_error": 0.0
+    },
+    {
+      "operator": "mean",
+      "device": "cpu",
+      "shape": [
+        32,
+        8193
+      ],
+      "strides": [
+        8193,
+        1
+      ],
+      "native_us": 3.17012,
+      "reference_us": 3.69155,
+      "speedup": 1.1644827325148575,
+      "max_error": 0.0
+    },
+    {
+      "operator": "std",
+      "device": "cpu",
+      "shape": [
+        32,
+        8193
+      ],
+      "strides": [
+        8193,
+        1
+      ],
+      "native_us": 5.8901900000000005,
+      "reference_us": 8.948680000000001,
+      "speedup": 1.5192515012249181,
+      "max_error": 0.0
+    },
+    {
+      "operator": "max",
+      "device": "cpu",
+      "shape": [
+        32,
+        8193
+      ],
+      "strides": [
+        8193,
+        1
+      ],
+      "native_us": 5.315119999999999,
+      "reference_us": 102.81136000000001,
+      "speedup": 19.343186983548822,
+      "max_error": 0.0
+    },
+    {
+      "operator": "fill",
+      "device": "cpu",
+      "shape": [
+        32,
+        8193
+      ],
+      "strides": [
+        8193,
+        1
+      ],
+      "native_us": 2.28763,
+      "reference_us": 21.45928,
+      "speedup": 9.380572907332041,
+      "max_error": 0.0
+    },
+    {
+      "operator": "avg_pool2d",
+      "device": "cpu",
+      "shape": [
+        2,
+        32,
+        16,
+        16
+      ],
+      "strides": [
+        8192,
+        256,
+        16,
+        1
+      ],
+      "native_us": 11.736020000000002,
+      "reference_us": 11.490920000000001,
+      "speedup": 0.979115577512649,
+      "max_error": 0.0
+    },
+    {
+      "operator": "_adaptive_avg_pool2d",
+      "device": "cpu",
+      "shape": [
+        2,
+        32,
+        16,
+        16
+      ],
+      "strides": [
+        8192,
+        256,
+        16,
+        1
+      ],
+      "native_us": 4.89245,
+      "reference_us": 5.558809999999999,
+      "speedup": 1.1362016985354984,
+      "max_error": 0.0
+    },
+    {
+      "operator": "prelu",
+      "device": "cpu",
+      "shape": [
+        2,
+        32,
+        16,
+        16
+      ],
+      "strides": [
+        8192,
+        256,
+        16,
+        1
+      ],
+      "native_us": 4.7391000000000005,
+      "reference_us": 4.49094,
+      "speedup": 0.9476356270177881,
+      "max_error": 0.0
+    },
+    {
+      "operator": "mean_spatial",
+      "device": "cpu",
+      "shape": [
+        2,
+        32,
+        16,
+        16
+      ],
+      "strides": [
+        8192,
+        256,
+        16,
+        1
+      ],
+      "native_us": 1.43536,
+      "reference_us": 2.5462700000000003,
+      "speedup": 1.7739591461375546,
+      "max_error": 0.0
+    },
+    {
+      "operator": "avg_pool2d",
+      "device": "cpu",
+      "shape": [
+        2,
+        32,
+        16,
+        16
+      ],
+      "strides": [
+        8192,
+        1,
+        512,
+        32
+      ],
+      "native_us": 4.62255,
+      "reference_us": 4.12453,
+      "speedup": 0.8922629284702166,
+      "max_error": 1.0
+    },
+    {
+      "operator": "_adaptive_avg_pool2d",
+      "device": "cpu",
+      "shape": [
+        2,
+        32,
+        16,
+        16
+      ],
+      "strides": [
+        8192,
+        1,
+        512,
+        32
+      ],
+      "native_us": 2.6441399999999997,
+      "reference_us": 3.1190800000000003,
+      "speedup": 1.1796198385864594,
+      "max_error": 0.0
+    },
+    {
+      "operator": "prelu",
+      "device": "cpu",
+      "shape": [
+        2,
+        32,
+        16,
+        16
+      ],
+      "strides": [
+        8192,
+        1,
+        512,
+        32
+      ],
+      "native_us": 11.424570000000001,
+      "reference_us": 62.435370000000006,
+      "speedup": 5.465008311034901,
+      "max_error": 0.0
+    },
+    {
+      "operator": "mean_spatial",
+      "device": "cpu",
+      "shape": [
+        2,
+        32,
+        16,
+        16
+      ],
+      "strides": [
+        8192,
+        1,
+        512,
+        32
+      ],
+      "native_us": 1.8912,
+      "reference_us": 10.03083,
+      "speedup": 5.303949873096447,
+      "max_error": 0.0
+    },
+    {
+      "operator": "avg_pool3d",
+      "device": "cpu",
+      "shape": [
+        2,
+        32,
+        16,
+        16,
+        16
+      ],
+      "strides": [
+        131072,
+        4096,
+        256,
+        16,
+        1
+      ],
+      "native_us": 44.250069999999994,
+      "reference_us": 43.90943,
+      "speedup": 0.9923019330816879,
+      "max_error": 1.0
+    },
+    {
+      "operator": "_adaptive_avg_pool3d",
+      "device": "cpu",
+      "shape": [
+        2,
+        32,
+        16,
+        16,
+        16
+      ],
+      "strides": [
+        131072,
+        4096,
+        256,
+        16,
+        1
+      ],
+      "native_us": 27.907089999999997,
+      "reference_us": 38.70315,
+      "speedup": 1.3868572466710074,
+      "max_error": 0.0
+    },
+    {
+      "operator": "prelu",
+      "device": "cpu",
+      "shape": [
+        2,
+        32,
+        16,
+        16,
+        16
+      ],
+      "strides": [
+        131072,
+        4096,
+        256,
+        16,
+        1
+      ],
+      "native_us": 13.1335,
+      "reference_us": 13.67287,
+      "speedup": 1.0410682605550692,
+      "max_error": 0.0
+    },
+    {
+      "operator": "mean_spatial",
+      "device": "cpu",
+      "shape": [
+        2,
+        32,
+        16,
+        16,
+        16
+      ],
+      "strides": [
+        131072,
+        4096,
+        256,
+        16,
+        1
+      ],
+      "native_us": 2.95735,
+      "reference_us": 3.1487700000000003,
+      "speedup": 1.0647268669585948,
+      "max_error": 0.0
+    },
+    {
+      "operator": "avg_pool3d",
+      "device": "cpu",
+      "shape": [
+        2,
+        32,
+        16,
+        16,
+        16
+      ],
+      "strides": [
+        131072,
+        1,
+        8192,
+        512,
+        32
+      ],
+      "native_us": 14.81314,
+      "reference_us": 24.559099999999997,
+      "speedup": 1.6579266786110167,
+      "max_error": 1.0
+    },
+    {
+      "operator": "_adaptive_avg_pool3d",
+      "device": "cpu",
+      "shape": [
+        2,
+        32,
+        16,
+        16,
+        16
+      ],
+      "strides": [
+        131072,
+        1,
+        8192,
+        512,
+        32
+      ],
+      "native_us": 5.24427,
+      "reference_us": 11.16807,
+      "speedup": 2.129575708344536,
+      "max_error": 0.0
+    },
+    {
+      "operator": "prelu",
+      "device": "cpu",
+      "shape": [
+        2,
+        32,
+        16,
+        16,
+        16
+      ],
+      "strides": [
+        131072,
+        1,
+        8192,
+        512,
+        32
+      ],
+      "native_us": 220.21325000000002,
+      "reference_us": 278.20275000000004,
+      "speedup": 1.2633333825280724,
+      "max_error": 0.0
+    },
+    {
+      "operator": "mean_spatial",
+      "device": "cpu",
+      "shape": [
+        2,
+        32,
+        16,
+        16,
+        16
+      ],
+      "strides": [
+        131072,
+        1,
+        8192,
+        512,
+        32
+      ],
+      "native_us": 12.406400000000001,
+      "reference_us": 57.742470000000004,
+      "speedup": 4.654248613618777,
+      "max_error": 0.0
+    }
+  ]
+}

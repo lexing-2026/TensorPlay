@@ -493,18 +493,28 @@ std::vector<int64_t> reduce_out_shape(const Tensor& self,
     const int64_t nd = self.dim();
     std::vector<bool> reduced(static_cast<size_t>(nd), false);
     for (int64_t d : dims) {
-        if (d < 0) d += nd;
-        if (d < 0 || d >= nd) {
-            TP_THROW(IndexError, "reduction dimension ", d, " out of range for a rank-",
-                     nd, " tensor");
+        int64_t dim = d;
+        if (nd == 0) {
+            // A 0-d tensor accepts -1 and 0 as its single (virtual) dimension.
+            if (dim != 0 && dim != -1) {
+                TP_THROW(IndexError, "reduction dimension ", dim,
+                         " out of range for a rank-", nd, " tensor");
+            }
+            reduced.push_back(true);
+            continue;
         }
-        reduced[static_cast<size_t>(d)] = true;
+        if (dim < 0) dim += nd;
+        if (dim < 0 || dim >= nd) {
+            TP_THROW(IndexError, "reduction dimension ", dim,
+                     " out of range for a rank-", nd, " tensor");
+        }
+        reduced[static_cast<size_t>(dim)] = true;
     }
     std::vector<int64_t> out;
-    out.reserve(static_cast<size_t>(nd));
-    for (int64_t i = 0; i < nd; ++i) {
-        if (!reduced[static_cast<size_t>(i)]) {
-            out.push_back(self.size(i));
+    out.reserve(reduced.size());
+    for (size_t i = 0; i < reduced.size(); ++i) {
+        if (!reduced[i]) {
+            out.push_back(nd == 0 ? 0 : self.size(static_cast<int64_t>(i)));
         } else if (keepdim) {
             out.push_back(1);
         }

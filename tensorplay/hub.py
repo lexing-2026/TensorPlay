@@ -680,6 +680,11 @@ class _CompatFinder:
     through either name share one identity (isinstance and pickle included).
     """
 
+    def __init__(self) -> None:
+        # Native modules resolved through this finder during one compat
+        # window; used to undo parent-attribute shadowing on exit.
+        self.seen: set[str] = set()
+
     def find_spec(self, fullname, path=None, target=None):
         import importlib
 
@@ -692,6 +697,7 @@ class _CompatFinder:
             # Not a native module either: fall through so the interpreter
             # reports ModuleNotFoundError for the originally requested name.
             return None
+        self.seen.add(mapped)
         return importlib.util.spec_from_loader(fullname, _AliasLoader(module), origin=module.__file__)
 
 
@@ -720,6 +726,30 @@ def _foreign_framework_compat():
                 if name not in saved:
                     del sys.modules[name]
         sys.modules.update(saved)
+        _restore_native_exports(finder.seen)
+
+
+def _restore_native_exports(modules: set[str]) -> None:
+    """Restore native package exports shadowed by alias submodule imports.
+
+    Importing a foreign name such as ``torchvision.models.alexnet`` through the
+    compat finder aliases the native submodule; the interpreter then binds that
+    module onto its native parent package, replacing an exported callable of
+    the same name (``tensorplay.vision.models.alexnet``) with the module
+    object.  Re-binding the module's own exported value under its own name
+    restores the package surface to what its ``__init__`` star-imports set up.
+    """
+    for mapped in modules:
+        module = sys.modules.get(mapped)
+        if module is None:
+            continue
+        child = mapped.rpartition(".")[2]
+        parent = sys.modules.get(mapped.rpartition(".")[0])
+        if parent is None:
+            continue
+        value = getattr(module, child, None)
+        if value is not None and not isinstance(value, ModuleType):
+            setattr(parent, child, value)
 
 
 def _check_module_exists(name: str) -> bool:

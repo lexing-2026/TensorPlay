@@ -249,5 +249,151 @@ void binary_kernel_reduce_vec(TensorIteratorBase& iter, func_t op, vec_func_t vo
   });
 }
 
+// ==========================================================================
+// Dual-input fused reduction (one output, two inputs)
+// --------------------------------------------------------------------------
+// A single pass over both inputs computes out = op(acc, a, b) and accumulates
+// into the output, so fused metrics such as sum((a-b)^2) avoid materialising
+// the intermediate difference/power tensors and their extra kernels.
+//
+//   op   : (acc, a, b) -> acc    scalar reduction (ternary)
+//   vop  : (Vec, Vec, Vec) -> Vec vectorized reduction
+//   cop  : (acc, acc) -> acc      scalar combine of partial results
+//   vcop : (Vec, Vec) -> Vec      vectorized combine of partial results
+// ==========================================================================
+
+template <typename func_t, typename vec_func_t, typename combine_t, typename vec_combine_t>
+inline void vectorized_reduction2(
+    char** data, int64_t n, int64_t stride1, int64_t stride2,
+    func_t op, vec_func_t vop, combine_t cop, vec_combine_t vcop, bool reduce) {
+  using scalar_t = typename function_traits<func_t>::result_type;
+  using Vec = Vectorized<scalar_t>;
+  char* out_ptr = data[0];
+  const char* in1_ptr = data[1];
+  const char* in2_ptr = data[2];
+  constexpr int64_t vsize = Vec::size();
+  Vec acc[4];
+  for (const auto j : irange(4)) {
+    acc[j] = vop(
+        Vec(0),
+        Vec::loadu(in1_ptr + j * vsize * sizeof(scalar_t)),
+        Vec::loadu(in2_ptr + j * vsize * sizeof(scalar_t)));
+  }
+  for (const auto i : irange<int64_t>(1, n)) {
+    const char* p1 = in1_ptr + stride1 * i;
+    const char* p2 = in2_ptr + stride2 * i;
+    acc[0] = vop(acc[0],
+                Vec::loadu(p1 + 0 * vsize * sizeof(scalar_t)),
+                Vec::loadu(p2 + 0 * vsize * sizeof(scalar_t)));
+    acc[1] = vop(acc[1],
+                Vec::loadu(p1 + 1 * vsize * sizeof(scalar_t)),
+                Vec::loadu(p2 + 1 * vsize * sizeof(scalar_t)));
+    acc[2] = vop(acc[2],
+                Vec::loadu(p1 + 2 * vsize * sizeof(scalar_t)),
+                Vec::loadu(p2 + 2 * vsize * sizeof(scalar_t)));
+    acc[3] = vop(acc[3],
+                Vec::loadu(p1 + 3 * vsize * sizeof(scalar_t)),
+                Vec::loadu(p2 + 3 * vsize * sizeof(scalar_t)));
+  }
+  if (reduce) {
+    scalar_t buffer[vsize];
+    acc[0] = vcop(vcop(acc[0], acc[1]), vcop(acc[2], acc[3]));
+    acc[0].store(buffer);
+    for (const auto j : irange<int64_t>(1, vsize)) {
+      buffer[0] = cop(buffer[0], buffer[j]);
+    }
+    auto dst = (scalar_t*)out_ptr;
+    *dst = cop(*dst, buffer[0]);
+  } else {
+    for (const auto j : irange(4)) {
+      auto dst = out_ptr + j * vsize * sizeof(scalar_t);
+      acc[j] = vcop(acc[j], Vec::loadu(dst));
+      acc[j].store(dst);
+    }
+  }
+}
+
+template <typename func_t, typename vec_func_t, typename combine_t, typename vec_combine_t>
+inline void vectorized_inner_reduction2(
+    char** data, int64_t n,
+    func_t op, vec_func_t vop, combine_t cop, vec_combine_t vcop) {
+  using scalar_t = typename function_traits<func_t>::result_type;
+  using Vec = Vectorized<scalar_t>;
+  constexpr int64_t vector_stride = 4 * Vec::size() * sizeof(scalar_t);
+  int64_t count = n / (4 * Vec::size());
+  if (count > 0) {
+    vectorized_reduction2(
+        data, count, vector_stride, vector_stride, op, vop, cop, vcop, /*reduce=*/true);
+  }
+  char* ptrs[4] = { data[0], data[1], data[2], data[2] };
+  int64_t strides[4] = { 0, sizeof(scalar_t), sizeof(scalar_t), sizeof(scalar_t) };
+  basic_loop2(ptrs, strides, count * 4 * Vec::size(), n, op);
+}
+
+template <typename func_t, typename vec_func_t, typename combine_t, typename vec_combine_t>
+inline void vectorized_outer_reduction2(
+    char** data, int64_t inner_stride1, int64_t inner_stride2, int64_t size0, int64_t size1,
+    func_t op, vec_func_t vop, combine_t cop, vec_combine_t vcop) {
+  using scalar_t = typename function_traits<func_t>::result_type;
+  using Vec = Vectorized<scalar_t>;
+  constexpr int64_t vector_stride = 4 * Vec::size() * sizeof(scalar_t);
+  int64_t outer_count = size1 / (4 * Vec::size());
+  for (const auto k : irange(outer_count)) {
+    vectorized_reduction2(
+        data, size0, inner_stride1, inner_stride2, op, vop, cop, vcop, /*reduce=*/false);
+    data[0] += vector_stride;
+    data[1] += vector_stride;
+    data[2] += vector_stride;
+  }
+  int64_t remaining = size1 % (4 * Vec::size());
+  for (const auto k : irange(remaining)) {
+    char* ptrs[4] = { data[0], data[1], data[2], data[2] };
+    int64_t strides[4] = { 0, inner_stride1, inner_stride2, inner_stride2 };
+    basic_loop2(ptrs, strides, 0, size0, op);
+    data[0] += sizeof(scalar_t);
+    data[1] += sizeof(scalar_t);
+    data[2] += sizeof(scalar_t);
+  }
+}
+
+template <typename func_t, typename vec_func_t, typename combine_t, typename vec_combine_t>
+void binary_kernel_reduce2_vec(
+    TensorIteratorBase& iter,
+    func_t op, vec_func_t vop, combine_t cop, vec_combine_t vcop,
+    double ident = 0) {
+  using scalar_t = typename function_traits<func_t>::result_type;
+  iter.output_base().fill_(ident);
+  iter.for_each([&](char** data, const int64_t* strides, int64_t size0, int64_t size1) {
+    const int64_t out_red = strides[0];
+    const int64_t a_red = strides[1];
+    const int64_t b_red = strides[2];
+    const int64_t out_outer = strides[3];
+    const int64_t a_outer = strides[4];
+    const int64_t b_outer = strides[5];
+    if (out_red == 0 && a_red == sizeof(scalar_t) && b_red == sizeof(scalar_t)) {
+      for (const auto k : irange(size1)) {
+        vectorized_inner_reduction2(data, size0, op, vop, cop, vcop);
+        data[0] += out_outer;
+        data[1] += a_outer;
+        data[2] += b_outer;
+      }
+    } else if (out_red == 0 &&
+               out_outer == sizeof(scalar_t) &&
+               a_outer == sizeof(scalar_t) &&
+               b_outer == sizeof(scalar_t)) {
+      vectorized_outer_reduction2(data, a_red, b_red, size0, size1, op, vop, cop, vcop);
+    } else {
+      for (const auto k : irange(size1)) {
+        char* ptrs[4] = { data[0], data[1], data[2], data[2] };
+        int64_t inner_strides[4] = { 0, a_red, b_red, b_red };
+        basic_loop2(ptrs, inner_strides, 0, size0, op);
+        data[0] += out_outer;
+        data[1] += a_outer;
+        data[2] += b_outer;
+      }
+    }
+  });
+}
+
 } // namespace tensorplay::inline CPU_CAPABILITY
 } // namespace tensorplay

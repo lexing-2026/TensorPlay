@@ -1,3 +1,4 @@
+#include "QuantTensorOperators.h"
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
@@ -200,6 +201,8 @@ Tensor pad_mode_backward(const Tensor& grad_output, const Tensor& self,
 }  // namespace
 
 Tensor reflection_pad_nd_cuda(const Tensor& self, const std::vector<int64_t>& pad) {
+    if (isQuantizedType(self.dtype())) { quantized::q_scale(self); return quantized::with_quantizer(reflection_pad_nd_cuda(quantized::storage_view(self), pad), self); }
+
     pad_mode_check("reflection_pad_nd", self, pad, 0);
     return pad_mode_forward(self, pad, 0);
 }

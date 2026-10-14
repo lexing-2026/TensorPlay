@@ -1,3 +1,5 @@
+#include "QuantNative.h"
+#include "QuantTensorOperators.h"
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "CUDARuntime.h"
@@ -195,6 +197,8 @@ Tensor avg_pool2d_native_cuda(const Tensor& input,
                               const std::vector<int64_t>& padding_arg,
                               bool ceil_mode, bool count_include_pad,
                               std::optional<int64_t> divisor_override) {
+    if (isQuantizedType(input.dtype())) return quant::pool_cuda(input, kernel_size_arg.size() == 1 ? std::vector<int64_t>(2, kernel_size_arg[0]) : kernel_size_arg, stride_arg, padding_arg, {}, ceil_mode, count_include_pad, divisor_override, 0);
+
     if (input.dim() == 3) {
         return avg_pool2d_native_cuda(input.unsqueeze(0), kernel_size_arg,
                                       stride_arg, padding_arg, ceil_mode,
