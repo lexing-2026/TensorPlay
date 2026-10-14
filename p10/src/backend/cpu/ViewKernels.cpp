@@ -1,4 +1,5 @@
 #include "Tensor.h"
+#include "QuantizedViews.h"
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "TypePromotion.h"
@@ -237,7 +238,7 @@ Tensor squeeze_kernel(const Tensor& self) {
             new_strides.push_back(self.stride(i));
         }
     }
-    return self.as_strided(new_sizes, new_strides);
+    return quantized::squeeze_view(self, new_sizes, new_strides);
 }
 
 
@@ -258,7 +259,7 @@ Tensor squeeze_dim_kernel(const Tensor& self, int64_t dim) {
             new_strides.push_back(self.stride(i));
         }
     }
-    return self.as_strided(new_sizes, new_strides);
+    return quantized::squeeze_view(self, new_sizes, new_strides, std::vector<int64_t>{dim});
 }
 
 
@@ -287,7 +288,9 @@ Tensor squeeze_dims_kernel(const Tensor& self, const std::vector<int64_t>& dims)
             new_strides.push_back(self.stride(i));
         }
     }
-    return self.as_strided(new_sizes, new_strides);
+    std::vector<int64_t> selected;
+    for (int64_t d = 0; d < ndim; ++d) if (mask[d]) selected.push_back(d);
+    return quantized::squeeze_view(self, new_sizes, new_strides, selected);
 }
 
 
@@ -310,7 +313,7 @@ Tensor unsqueeze_kernel(const Tensor& self, int64_t dim) {
     new_sizes.insert(new_sizes.begin() + dim, 1);
     new_strides.insert(new_strides.begin() + dim, new_stride);
 
-    return self.as_strided(new_sizes, new_strides);
+    return quantized::unsqueeze_view(self, new_sizes, new_strides, dim);
 }
 
 
@@ -631,6 +634,7 @@ Tensor diagonal_kernel(const Tensor& self, int64_t offset, int64_t dim1, int64_t
 Tensor as_strided_cpu(const Tensor& self, const std::vector<int64_t>& size,
                       const std::vector<int64_t>& stride,
                       std::optional<int64_t> storage_offset) {
+    quantized::check_quantized_strides(self);
     return self.as_strided(size, stride, storage_offset);
 }
 

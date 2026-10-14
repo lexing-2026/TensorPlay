@@ -16,7 +16,7 @@ from tensorplay import nn
 
 from .fake_quantize import FakeQuantize
 
-__all__ = ["QuantStub", "DeQuantStub"]
+__all__ = ["QuantStub", "DeQuantStub", "QuantWrapper"]
 
 
 class QuantStub(nn.Module):
@@ -71,3 +71,25 @@ class DeQuantStub(nn.Module):
         zero_point = 0 if self.zero_point is None else int(self.zero_point)
         q = _make_per_tensor_quantized_tensor(x, scale, zero_point)
         return q.dequantize()
+
+
+class QuantWrapper(nn.Module):
+    """Wrap a module with quant/dequant stubs on either side.
+
+    Before conversion the stubs behave as observers/identity, so the wrapped
+    module can be calibrated in place; after conversion the stubs become the
+    native quantize/dequantize operators.
+    """
+
+    def __init__(self, module):
+        super().__init__()
+        qconfig = getattr(module, "qconfig", None)
+        self.add_module("quant", QuantStub(qconfig))
+        self.add_module("dequant", DeQuantStub())
+        self.add_module("module", module)
+        self.train(module.training)
+
+    def forward(self, x):
+        x = self.quant(x)
+        x = self.module(x)
+        return self.dequant(x)

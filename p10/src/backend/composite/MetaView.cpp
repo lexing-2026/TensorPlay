@@ -14,6 +14,7 @@
 // called the same-named member would recurse without bound.
 
 #include "Tensor.h"
+#include "QuantizedViews.h"
 #include "TensorImpl.h"
 #include "Dispatcher.h"
 #include "Exception.h"
@@ -42,6 +43,7 @@ Tensor as_strided_kernel(const Tensor& self,
     if (!self.defined()) {
         TP_THROW(RuntimeError, "Tensor not defined");
     }
+    quantized::check_quantized_strides(self);
     intrusive_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
     if (size.size() != stride.size()) {
         TP_THROW(ValueError,
@@ -132,6 +134,7 @@ Tensor view_kernel(const Tensor& self, const std::vector<int64_t>& shape) {
     Tensor out(impl->storage(), inferred, *stride, impl->dtype(),
                impl->storage_offset());
     out.unsafeGetTensorImpl()->share_version_counter(*impl);
+    if (impl->has_quantizer()) out.impl()->set_quantizer(impl->quantizer());
     return out;
 }
 

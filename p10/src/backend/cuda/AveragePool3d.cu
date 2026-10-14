@@ -1,3 +1,5 @@
+#include "QuantNative.h"
+#include "QuantTensorOperators.h"
 // Native CUDA average-pooling implementation. The two kernels keep the
 // window arithmetic: the divisor includes the padded part when
 // count_include_pad is true, and ceil_mode applies the last-window correction
@@ -339,6 +341,8 @@ Tensor avg_pool3d_native_cuda(const Tensor& input,
                               const std::vector<int64_t>& padding,
                               bool ceil_mode, bool count_include_pad,
                               std::optional<int64_t> divisor_override) {
+    if (isQuantizedType(input.dtype())) return quant::pool_cuda(input, kernel_size.size() == 1 ? std::vector<int64_t>(3, kernel_size[0]) : kernel_size, stride, padding, {}, ceil_mode, count_include_pad, divisor_override, 0);
+
     if (input.dim() == 4) {
         return avg_pool3d_native_cuda(input.unsqueeze(0), kernel_size, stride,
                                       padding, ceil_mode, count_include_pad,

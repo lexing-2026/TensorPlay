@@ -413,11 +413,12 @@ struct Vectorized<tensorplay::qint32> : public Vectorizedqi512 {
       float scale,
       int32_t zero_point,
       float inverse_scale [[maybe_unused]]) {
-    Vectorized<tensorplay::qint32> retval = {};
-    auto rhs_data = (__m512)rhs[0];
+    std::array<float, size()> values;
+    std::array<tensorplay::qint32, size()> codes;
+    rhs[0].store(values.data());
     tensorplay::quantize_vec<tensorplay::qint32, /*precision=*/32>(
-        scale, zero_point, (float*)&rhs_data, (tensorplay::qint32*)&retval.vals, 16);
-    return retval;
+        scale, zero_point, values.data(), codes.data(), size());
+    return loadu(codes.data());
   }
 
   Vectorized<tensorplay::qint32> maximum(Vectorized<tensorplay::qint32> b) const {

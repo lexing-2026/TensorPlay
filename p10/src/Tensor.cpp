@@ -534,7 +534,8 @@ Tensor Tensor::pin_memory() const {
 #ifdef USE_CUDA
     if (is_pinned()) return *this;
     const auto sizes = static_cast<std::vector<int64_t>>(shape());
-    const size_t nbytes = static_cast<size_t>(numel()) * itemsize();
+    const size_t nbytes =
+        static_cast<size_t>(subByteStorageSize(sizes, dtype()));
     Storage storage(nbytes, getPinnedMemoryAllocator(), Device(DeviceType::CPU));
     Tensor result(storage, sizes, dtype());
     result.copy_(*this);
@@ -681,6 +682,8 @@ Scalar Tensor::item() const {
     if (numel() != 1) {
         TP_THROW(ValueError, "item() only supported for 1-element tensors");
     }
+
+    if (isQuantizedType(dtype())) return dequantize().item();
 
     if (device().type() != DeviceType::CPU) {
         return to(Device(DeviceType::CPU)).item();
@@ -1378,8 +1381,9 @@ Tensor clone_impl(const Tensor& self, std::optional<MemoryFormat> memory_format)
     } else {
         strides = SizesAndStrides::compute_contiguous_strides(sizes_v);
     }
-    Storage storage(static_cast<size_t>(self.numel()) * self.itemsize(),
-                    getAllocator(self.device().type()), self.device());
+    Storage storage(
+        static_cast<size_t>(subByteStorageSize(sizes_v, self.dtype())),
+        getAllocator(self.device().type()), self.device());
     auto out_impl = make_intrusive<TensorImpl>(storage, sizes_v, strides, self.dtype(), 0);
     if (format == MemoryFormat::Preserve) {
         // Apply TensorImpl::set_sizes_and_strides layout tagging so a
@@ -1413,7 +1417,7 @@ Tensor clone_impl(const Tensor& self, std::optional<MemoryFormat> memory_format)
         static_cast<std::vector<int64_t>>(self.strides()) == rm_strides;
     if (self.device().is_cpu() && row_major) {
         std::memcpy(t.data_ptr(), self.data_ptr(),
-                    static_cast<size_t>(self.numel()) * self.itemsize());
+                    static_cast<size_t>(subByteStorageSize(sizes_v, self.dtype())));
     } else {
         t.copy_(self);
     }
@@ -1444,8 +1448,9 @@ Tensor contiguous_impl(const Tensor& self, int64_t memory_format_raw) {
     if (self.is_contiguous(format)) return self;
     const auto sizes_v = static_cast<std::vector<int64_t>>(self.shape());
     std::vector<int64_t> strides = get_strides_for(sizes_v, format);
-    Storage storage(static_cast<size_t>(self.numel()) * self.itemsize(),
-                    getAllocator(self.device().type()), self.device());
+    Storage storage(
+        static_cast<size_t>(subByteStorageSize(sizes_v, self.dtype())),
+        getAllocator(self.device().type()), self.device());
     auto out_impl = make_intrusive<TensorImpl>(storage, sizes_v, strides, self.dtype(), 0);
     out_impl->set_memory_format(format);
     // As in clone: the row-major flag follows the strides, so a result laid
@@ -1518,6 +1523,9 @@ Tensor Tensor::to(Device device, bool non_blocking, bool copy) const {
     }
     Tensor t = ops::empty(
         impl_->sizes(), dtype(), device, /*pin_memory=*/false);
+    if (subByteElementPerByte(dtype())>1) {
+        t=t.as_strided(shape(),strides(),0);
+    }
     t.copy_(*this, non_blocking);
     if (impl_->has_quantizer()) {
         t.unsafeGetTensorImpl()->set_quantizer(
@@ -1554,7 +1562,12 @@ Tensor Tensor::to(Device device, DType dtype, bool non_blocking, bool copy) cons
     }
     Tensor t = ops::empty(
         impl_->sizes(), dtype, device, /*pin_memory=*/false);
+    const bool packed=subByteElementPerByte(this->dtype())>1 && dtype==this->dtype();
+    if (packed) t=t.as_strided(shape(),strides(),0);
     t.copy_(*this, non_blocking);
+    if (packed && impl_->has_quantizer()) {
+        t.unsafeGetTensorImpl()->set_quantizer(quantizer_on_device(impl_->quantizer(),device));
+    }
     return t;
 }
 

@@ -1,3 +1,4 @@
+#include "QuantTensorOperators.h"
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
@@ -247,6 +248,8 @@ Tensor triangular_mask_entry(const Tensor& self, int64_t diagonal) {
 }
 
 Tensor masked_fill_cuda(const Tensor& self, const Tensor& mask, const Scalar& value) {
+    if (isQuantizedType(self.dtype())) { Tensor result = self.clone(); quantized::masked_fill(result, mask, value); return result; }
+
     if (mask.dtype() != DType::Bool) {
         TP_THROW(TypeError, "masked_fill only supports boolean masks");
     }
@@ -266,6 +269,8 @@ Tensor masked_fill_cuda(const Tensor& self, const Tensor& mask, const Scalar& va
 }
 
 Tensor& masked_fill__cuda(Tensor& self, const Tensor& mask, const Scalar& value) {
+    if (isQuantizedType(self.dtype())) return quantized::masked_fill(self, mask, value);
+
     if (mask.dtype() != DType::Bool) {
         TP_THROW(TypeError, "masked_fill only supports boolean masks");
     }

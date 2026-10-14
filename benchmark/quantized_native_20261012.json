@@ -1,0 +1,575 @@
+{
+  "timestamp": "2026-10-12T15:37:36.488078+00:00",
+  "commit": "fe6aeee852ed54131d578a40e60ef26f1225e7b1",
+  "processor": "x86_64",
+  "threads": 4,
+  "repetitions": 100,
+  "reference_version": "2.13.0+cu130",
+  "results": [
+    {
+      "operator": "relu",
+      "device": "cpu",
+      "shape": [
+        256
+      ],
+      "reference_backend": "integer",
+      "native_us": 0.45515,
+      "reference_us": 0.64168,
+      "speedup": 1.4098209381522575,
+      "max_error": 0.0
+    },
+    {
+      "operator": "tanh",
+      "device": "cpu",
+      "shape": [
+        256
+      ],
+      "reference_backend": "integer",
+      "native_us": 0.5443399999999999,
+      "reference_us": 1.02661,
+      "speedup": 1.8859720027923728,
+      "max_error": 0.0
+    },
+    {
+      "operator": "hardswish",
+      "device": "cpu",
+      "shape": [
+        256
+      ],
+      "reference_backend": "integer",
+      "native_us": 0.63162,
+      "reference_us": 1.43159,
+      "speedup": 2.2665368417719516,
+      "max_error": 1.0
+    },
+    {
+      "operator": "add_scalar",
+      "device": "cpu",
+      "shape": [
+        256
+      ],
+      "reference_backend": "integer",
+      "native_us": 0.52764,
+      "reference_us": 1.7045,
+      "speedup": 3.2304222575998787,
+      "max_error": 0.0
+    },
+    {
+      "operator": "relu",
+      "device": "cpu",
+      "shape": [
+        65536
+      ],
+      "reference_backend": "integer",
+      "native_us": 1.8496899999999998,
+      "reference_us": 2.09896,
+      "speedup": 1.1347631224691705,
+      "max_error": 0.0
+    },
+    {
+      "operator": "tanh",
+      "device": "cpu",
+      "shape": [
+        65536
+      ],
+      "reference_backend": "integer",
+      "native_us": 14.65461,
+      "reference_us": 47.44747,
+      "speedup": 3.2377163227134673,
+      "max_error": 0.0
+    },
+    {
+      "operator": "hardswish",
+      "device": "cpu",
+      "shape": [
+        65536
+      ],
+      "reference_backend": "integer",
+      "native_us": 5.67227,
+      "reference_us": 8.186209999999999,
+      "speedup": 1.4431982257544156,
+      "max_error": 1.0
+    },
+    {
+      "operator": "add_scalar",
+      "device": "cpu",
+      "shape": [
+        65536
+      ],
+      "reference_backend": "integer",
+      "native_us": 1.74518,
+      "reference_us": 2.91241,
+      "speedup": 1.6688307223323668,
+      "max_error": 0.0
+    },
+    {
+      "operator": "relu",
+      "device": "cpu",
+      "shape": [
+        1048576
+      ],
+      "reference_backend": "integer",
+      "native_us": 5.763450000000001,
+      "reference_us": 5.32182,
+      "speedup": 0.9233740207688103,
+      "max_error": 0.0
+    },
+    {
+      "operator": "tanh",
+      "device": "cpu",
+      "shape": [
+        1048576
+      ],
+      "reference_backend": "integer",
+      "native_us": 34.8681,
+      "reference_us": 367.51939,
+      "speedup": 10.540275782161919,
+      "max_error": 0.0
+    },
+    {
+      "operator": "hardswish",
+      "device": "cpu",
+      "shape": [
+        1048576
+      ],
+      "reference_backend": "integer",
+      "native_us": 35.168,
+      "reference_us": 49.64907,
+      "speedup": 1.4117683689717926,
+      "max_error": 1.0
+    },
+    {
+      "operator": "add_scalar",
+      "device": "cpu",
+      "shape": [
+        1048576
+      ],
+      "reference_backend": "integer",
+      "native_us": 5.05508,
+      "reference_us": 6.913920000000001,
+      "speedup": 1.3677172270270699,
+      "max_error": 0.0
+    },
+    {
+      "operator": "linear",
+      "device": "cpu",
+      "shape": [
+        1,
+        512,
+        1024
+      ],
+      "reference_backend": "integer",
+      "native_us": 10.4254,
+      "reference_us": 11.568589999999999,
+      "speedup": 1.109654305829992,
+      "max_error": 0.0
+    },
+    {
+      "operator": "linear",
+      "device": "cpu",
+      "shape": [
+        32,
+        256,
+        512
+      ],
+      "reference_backend": "integer",
+      "native_us": 17.74833,
+      "reference_us": 16.47194,
+      "speedup": 0.9280839380381141,
+      "max_error": 0.0
+    },
+    {
+      "operator": "linear",
+      "device": "cpu",
+      "shape": [
+        256,
+        512,
+        1024
+      ],
+      "reference_backend": "integer",
+      "native_us": 366.67822,
+      "reference_us": 236.56636999999998,
+      "speedup": 0.6451606806643709,
+      "max_error": 0.0
+    },
+    {
+      "operator": "quantize_2bit",
+      "device": "cpu",
+      "shape": [
+        65536
+      ],
+      "reference_backend": "integer",
+      "native_us": 15.2755,
+      "reference_us": 63.663059999999994,
+      "speedup": 4.167658014467611,
+      "max_error": 0.0
+    },
+    {
+      "operator": "dequantize_2bit",
+      "device": "cpu",
+      "shape": [
+        65536
+      ],
+      "reference_backend": "integer",
+      "native_us": 9.85092,
+      "reference_us": 31.02043,
+      "speedup": 3.148988114815672,
+      "max_error": 0.0
+    },
+    {
+      "operator": "quantize_2bit",
+      "device": "cpu",
+      "shape": [
+        1048577
+      ],
+      "reference_backend": "integer",
+      "native_us": 111.68863999999999,
+      "reference_us": 1010.74564,
+      "speedup": 9.049672733055036,
+      "max_error": 0.0
+    },
+    {
+      "operator": "dequantize_2bit",
+      "device": "cpu",
+      "shape": [
+        1048577
+      ],
+      "reference_backend": "integer",
+      "native_us": 69.24595000000001,
+      "reference_us": 485.63302000000004,
+      "speedup": 7.0131613473423355,
+      "max_error": 0.0
+    },
+    {
+      "operator": "quantize_4bit",
+      "device": "cpu",
+      "shape": [
+        65536
+      ],
+      "reference_backend": "integer",
+      "native_us": 8.47546,
+      "reference_us": 287.83419000000004,
+      "speedup": 33.96089297808025,
+      "max_error": 0.0
+    },
+    {
+      "operator": "dequantize_4bit",
+      "device": "cpu",
+      "shape": [
+        65536
+      ],
+      "reference_backend": "integer",
+      "native_us": 6.23516,
+      "reference_us": 29.90007,
+      "speedup": 4.795397391566536,
+      "max_error": 0.0
+    },
+    {
+      "operator": "quantize_4bit",
+      "device": "cpu",
+      "shape": [
+        1048577
+      ],
+      "reference_backend": "integer",
+      "native_us": 111.24023,
+      "reference_us": 4923.89954,
+      "speedup": 44.263658390494165,
+      "max_error": 0.0
+    },
+    {
+      "operator": "dequantize_4bit",
+      "device": "cpu",
+      "shape": [
+        1048577
+      ],
+      "reference_backend": "integer",
+      "native_us": 78.00220999999999,
+      "reference_us": 457.23796999999996,
+      "speedup": 5.861859170400429,
+      "max_error": 0.0
+    },
+    {
+      "operator": "batch_norm2d",
+      "device": "cpu",
+      "shape": [
+        4,
+        32,
+        16,
+        16
+      ],
+      "reference_backend": "integer",
+      "native_us": 4.16951,
+      "reference_us": 4.0738,
+      "speedup": 0.9770452643116339,
+      "max_error": 0.0
+    },
+    {
+      "operator": "batch_norm2d",
+      "device": "cpu",
+      "shape": [
+        4,
+        128,
+        56,
+        56
+      ],
+      "reference_backend": "integer",
+      "native_us": 33.82775,
+      "reference_us": 36.54563,
+      "speedup": 1.0803446874237868,
+      "max_error": 0.0
+    },
+    {
+      "operator": "int4_mm_float32",
+      "device": "cpu",
+      "shape": [
+        1,
+        256,
+        1024
+      ],
+      "reference_backend": "integer",
+      "native_us": 4.37302,
+      "reference_us": 81.09188,
+      "speedup": 18.543679196527798,
+      "max_error": 0.0
+    },
+    {
+      "operator": "int4_mm_float16",
+      "device": "cpu",
+      "shape": [
+        1,
+        256,
+        1024
+      ],
+      "reference_backend": "integer",
+      "native_us": 4.59264,
+      "reference_us": 82.25626,
+      "speedup": 17.91045237597547,
+      "max_error": 0.0
+    },
+    {
+      "operator": "int4_mm_bfloat16",
+      "device": "cpu",
+      "shape": [
+        1,
+        256,
+        1024
+      ],
+      "reference_backend": "integer",
+      "native_us": 4.51631,
+      "reference_us": 6.27305,
+      "speedup": 1.3889768417136998,
+      "max_error": 0.0
+    },
+    {
+      "operator": "int4_mm_float32",
+      "device": "cpu",
+      "shape": [
+        32,
+        256,
+        1024
+      ],
+      "reference_backend": "integer",
+      "native_us": 64.20615,
+      "reference_us": 2541.78932,
+      "speedup": 39.58794165356434,
+      "max_error": 0.0
+    },
+    {
+      "operator": "int4_mm_float16",
+      "device": "cpu",
+      "shape": [
+        32,
+        256,
+        1024
+      ],
+      "reference_backend": "integer",
+      "native_us": 109.62338,
+      "reference_us": 2630.86339,
+      "speedup": 23.999108493097,
+      "max_error": 0.0
+    },
+    {
+      "operator": "int4_mm_bfloat16",
+      "device": "cpu",
+      "shape": [
+        32,
+        256,
+        1024
+      ],
+      "reference_backend": "integer",
+      "native_us": 66.05516,
+      "reference_us": 57.58856,
+      "speedup": 0.8718253047907234,
+      "max_error": 0.0
+    },
+    {
+      "operator": "dynamic_lstm",
+      "device": "cpu",
+      "shape": [
+        16,
+        4,
+        256
+      ],
+      "reference_backend": "integer",
+      "native_us": 698.51864,
+      "reference_us": 495.40493000000004,
+      "speedup": 0.7092222048648552,
+      "max_error": 2.3283064365386963e-10
+    },
+    {
+      "operator": "dynamic_gru",
+      "device": "cpu",
+      "shape": [
+        16,
+        4,
+        256
+      ],
+      "reference_backend": "integer",
+      "native_us": 573.16256,
+      "reference_us": 375.82953999999995,
+      "speedup": 0.655711950201353,
+      "max_error": 4.656612873077393e-10
+    },
+    {
+      "operator": "relu",
+      "device": "cuda",
+      "shape": [
+        256
+      ],
+      "reference_backend": "integer",
+      "native_us": 2.5450299999999997,
+      "reference_us": 14.97085,
+      "speedup": 5.882386455169488,
+      "max_error": 0.0
+    },
+    {
+      "operator": "relu",
+      "device": "cuda",
+      "shape": [
+        65536
+      ],
+      "reference_backend": "integer",
+      "native_us": 2.50676,
+      "reference_us": 14.54334,
+      "speedup": 5.801648342880851,
+      "max_error": 0.0
+    },
+    {
+      "operator": "relu",
+      "device": "cuda",
+      "shape": [
+        1048576
+      ],
+      "reference_backend": "integer",
+      "native_us": 7.90198,
+      "reference_us": 16.75769,
+      "speedup": 2.120695066299839,
+      "max_error": 0.0
+    },
+    {
+      "operator": "linear",
+      "device": "cuda",
+      "shape": [
+        1,
+        512,
+        1024
+      ],
+      "reference_backend": "floating",
+      "native_us": 6.67458,
+      "reference_us": 18.43216,
+      "speedup": 2.7615460448447693,
+      "max_error": 0.0
+    },
+    {
+      "operator": "linear",
+      "device": "cuda",
+      "shape": [
+        32,
+        256,
+        512
+      ],
+      "reference_backend": "floating",
+      "native_us": 12.82818,
+      "reference_us": 14.634739999999999,
+      "speedup": 1.140827459546093,
+      "max_error": 0.0
+    },
+    {
+      "operator": "linear",
+      "device": "cuda",
+      "shape": [
+        256,
+        512,
+        1024
+      ],
+      "reference_backend": "floating",
+      "native_us": 27.82253,
+      "reference_us": 42.73397,
+      "speedup": 1.535948384277059,
+      "max_error": 1.0
+    },
+    {
+      "operator": "linear_signed",
+      "device": "cuda",
+      "shape": [
+        1,
+        512,
+        1024
+      ],
+      "reference_backend": "integer",
+      "native_us": 6.68467,
+      "reference_us": 16.62333,
+      "speedup": 2.4867839399701106,
+      "max_error": 1.0
+    },
+    {
+      "operator": "linear_signed",
+      "device": "cuda",
+      "shape": [
+        32,
+        256,
+        512
+      ],
+      "reference_backend": "integer",
+      "native_us": 9.96142,
+      "reference_us": 16.08307,
+      "speedup": 1.614535879422813,
+      "max_error": 1.0
+    },
+    {
+      "operator": "linear_signed",
+      "device": "cuda",
+      "shape": [
+        256,
+        512,
+        1024
+      ],
+      "reference_backend": "integer",
+      "native_us": 23.852240000000002,
+      "reference_us": 17.40785,
+      "speedup": 0.7298203439173846,
+      "max_error": 1.0
+    }
+  ],
+  "validation": {
+    "build_target": "_C",
+    "build_jobs": 2,
+    "fresh_libraries": true,
+    "quantization_and_ao": {
+      "passed": 1946,
+      "skipped": 4
+    },
+    "serialization": {
+      "passed": 55
+    },
+    "default_dispatch": {
+      "passed": 1375
+    },
+    "avx2_subbyte": {
+      "passed": 143
+    },
+    "linear_integer_edges": {
+      "passed": 148
+    }
+  }
+}

@@ -1042,7 +1042,7 @@ def _adapt_backend_to_region(
     # rather see as their parts; the trace writes those in their parts.
     backend_decompositions = getattr(compiler_fn, "trace_decompositions", None)
     adapted = aot_autograd(
-        dynamic_shapes=backend_kwargs.get("dynamic") is True,
+        dynamic_shapes=(backend_kwargs or {}).get("dynamic") is True,
         fw_compiler=forward_compiler,
         bw_compiler=forward_compiler,
         # Keep the cheapest cut of forward values and let the backward
@@ -1153,7 +1153,7 @@ def _compile_region(
             try:
                 with _compiler_context(), _preserve_module_state(model):
                     samples = _bind_sample_arguments(model, example_inputs, example_kwargs)
-                    if backend_kwargs.get("dynamic") is True and getattr(
+                    if (backend_kwargs or {}).get("dynamic") is True and getattr(
                         compiler_fn, "supports_symbolic_shapes", False
                     ):
                         from tensorplay.graph.experimental._symbolic_trace import SymbolicShapeTracer

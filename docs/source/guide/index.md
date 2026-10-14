@@ -14,6 +14,7 @@ models
 autograd
 training
 saveload
+lumen
 ```
 
 ## The path

@@ -8788,6 +8788,25 @@ def _is_complex(dtype: Any) -> bool:
     return dtype in (tp.complex64, tp.complex128, tp.complex32)
 
 
+@register_lowering(tp_ops.is_floating_point.default, type_promotion_kind=None)
+def _is_floating_point(a: Any) -> Any:
+    """Whether a value is held in a floating point element type.
+
+    The answer is a property of the value's type, which the compiler already
+    knows, so the question folds to a constant instead of becoming a read.
+    """
+
+    return a.get_dtype().is_floating_point
+
+
+@register_lowering(tp_ops.is_complex.default, type_promotion_kind=None)
+def _is_complex_op(a: Any) -> Any:
+    """Whether a value is held in a complex element type, folded like the
+    floating-point question above."""
+
+    return _is_complex(a.get_dtype())
+
+
 @register_lowering(tp_ops.sym_size.int)
 def sym_size(a: Any, dim: Any) -> Any:
     """How long an axis is, as a number rather than as a value.

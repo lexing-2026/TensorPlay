@@ -5,6 +5,7 @@
 #include "TypePromotion.h"
 #include "Utils.h"
 #include "SparseKernels.h"
+#include "Quantizer.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -333,6 +334,11 @@ void cast_contiguous(dst_t* dst, const src_t* src, int64_t len) {
 
 
 Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
+    if (self.impl()->quantizer() && src_in.impl()->quantizer()) {
+        TP_CHECK(self.dtype()==src_in.dtype() && self.impl()->quantizer()->qscheme()==src_in.impl()->quantizer()->qscheme(),
+            "Quantized copy requires matching dtype and quantization scheme");
+        self.impl()->set_quantizer(src_in.impl()->quantizer());
+    }
     if (!self.device().is_cpu()) {
         throw std::runtime_error("copy_kernel (CPU) called with non-CPU destination");
     }
@@ -344,6 +350,19 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
     // of empty tensors away from memcpy/cudaMemcpyAsync.
     if (self.numel() == 0) {
         return self;
+    }
+
+    if (subByteElementPerByte(self.dtype())>1 || subByteElementPerByte(src.dtype())>1) {
+        const auto strides=static_cast<std::vector<int64_t>>(self.strides());
+        TP_CHECK(self.dtype()==src.dtype() && src_in.shape()==self.shape()
+            && SizesAndStrides::is_non_overlapping_and_dense(self.shape(),strides)
+            && static_cast<std::vector<int64_t>>(src.strides())==strides,
+            "Packed quantized copy requires matching dtype, shape and dense layout");
+        if (src.device().is_cpu()) {
+            const int64_t pack=subByteElementPerByte(self.dtype());
+            std::memcpy(self.data_ptr(),src.data_ptr(),static_cast<size_t>((self.numel()+pack-1)/pack));
+            return self;
+        }
     }
 
     if (src.device().is_cuda()) {
@@ -359,15 +378,16 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
             static_cast<std::vector<int64_t>>(src.shape()));
         const bool src_row_major =
             static_cast<std::vector<int64_t>>(src.strides()) == cuda_rm_strides;
-        if (!src_row_major || src.dtype() != self.dtype()) {
+        if (subByteElementPerByte(self.dtype())==1 && (!src_row_major || src.dtype() != self.dtype())) {
             src_ready = Tensor(static_cast<std::vector<int64_t>>(src.shape()), self.dtype(), src.device());
             src_ready.copy_(src);
         }
 
-        const size_t nbytes = self.numel() * self.itemsize();
+        const int64_t pack=subByteElementPerByte(self.dtype());
+        const size_t nbytes = ((self.numel()+pack-1)/pack) * self.itemsize();
         const auto self_rm_strides = SizesAndStrides::compute_contiguous_strides(
             static_cast<std::vector<int64_t>>(self.shape()));
-        if (static_cast<std::vector<int64_t>>(self.strides()) == self_rm_strides) {
+        if (pack>1 || static_cast<std::vector<int64_t>>(self.strides()) == self_rm_strides) {
             cuda::checkCuda(cudaMemcpyAsync(self.data_ptr(), src_ready.data_ptr(), nbytes,
                                             cudaMemcpyDeviceToHost, stream.stream()),
                             "cudaMemcpyAsync (D2H)");
@@ -961,11 +981,14 @@ TENSORPLAY_LIBRARY_IMPL(SparseCPU, CopySparseKernels) {
     // registers under both backends and re-coalesces when given a layout
     // that is already sparse.
     m.impl("to_sparse", to_sparse_coo_cpu);
+    m.impl("to_sparse_csr", to_sparse_csr_cpu);
     m.impl("sparse_mm", sparse_mm_cpu);
+    m.impl("_sparse_addmm", _sparse_addmm_cpu);
     m.impl("smm", smm_cpu);
     m.impl("sparse_sum", sparse_sum_cpu);
     m.impl("sparse_add", sparse_add_cpu);
     m.impl("sparse_mul", sparse_mul_cpu);
+    m.impl("mul.Scalar", sparse_mul_scalar_cpu);
     m.impl("_sparse_sum", _sparse_sum_cpu);
     m.impl("_sparse_sum.dtype", _sparse_sum_dtype_cpu);
     m.impl("_sparse_sum.dim", _sparse_sum_dim_cpu_2);
