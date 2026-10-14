@@ -420,10 +420,22 @@ COMPILED = [
     ("fftshift", lambda a: tp.fft.ifftshift(tp.fft.fftshift(a, dim=1)), False),
 ]
 
+# The compiler's CUDA backend cannot yet code-generate complex element types;
+# the transforms below carry complex intermediate buffers in their compiled
+# backward graphs, so strict_native has nothing to build for them on CUDA.
+# CPU handles complex natively.  See the "complex operators" warning in the
+# stax lowering registrations.
+_CUDA_COMPLEX_CODEGEN_UNSUPPORTED = {
+    "fftn_real", "ifftn", "rfftn", "irfftn", "hfftn",
+    "ihfftn", "hfft", "ihfft", "ifft",
+}
+
 
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("case", COMPILED, ids=[c[0] for c in COMPILED])
 def test_compiled_transforms_match_eager(device, case):
+    if device == "cuda" and case[0] in _CUDA_COMPLEX_CODEGEN_UNSUPPORTED:
+        pytest.xfail("Triton backend lacks complex element code generation")
     _, fn, complex_input = case
     x = as_tensor(signal((3, 4, 5), complex_input, seed=10), device)
     expected = fn(x)
