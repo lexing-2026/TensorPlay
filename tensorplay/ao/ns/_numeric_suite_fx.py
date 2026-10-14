@@ -96,25 +96,35 @@ def extract_weights(
     unmatchable_types_map=None,
     op_to_type_to_weight_extraction_fn=None,
 ) -> NSResultsType:
-    """Extract and compare weights from two models."""
+    """Extract and compare weights from two models.
+
+    Subgraphs are matched with :func:`get_matching_subgraph_pairs`; weights are
+    extracted from the base op node of each matched pair.
+    """
+    from .fx.graph_matcher import get_matching_subgraph_pairs
+
     gm_a = _trace_model(model_a)
     gm_b = _trace_model(model_b)
+    if base_name_to_sets_of_related_ops is None:
+        from .fx.mappings import get_base_name_to_sets_of_related_ops as _get_sets
+
+        base_name_to_sets_of_related_ops = _get_sets()
+    matched_pairs = get_matching_subgraph_pairs(
+        gm_a, gm_b, base_name_to_sets_of_related_ops, unmatchable_types_map
+    )
     results = {
         model_name_a: {"weights": {}},
         model_name_b: {"weights": {}},
     }
-    modules_a = {name: mod for name, mod in gm_a.named_modules() if name}
-    modules_b = {name: mod for name, mod in gm_b.named_modules() if name}
-    for name, mod in modules_a.items():
-        if name in modules_b and type(mod) is type(modules_b[name]):
-            weight_a = extract_weight_from_node(next(
-                (n for n in gm_a.graph.nodes if n.op == "call_module" and n.target == name), None
-            ), gm_a) if any(n.op == "call_module" and n.target == name for n in gm_a.graph.nodes) else None
-            weight_b = extract_weight_from_node(next(
-                (n for n in gm_b.graph.nodes if n.op == "call_module" and n.target == name), None
-            ), gm_b) if any(n.op == "call_module" and n.target == name for n in gm_b.graph.nodes) else None
-            results[model_name_a]["weights"][name] = weight_a
-            results[model_name_b]["weights"][name] = weight_b
+    for ref_name, (subgraph_a, subgraph_b) in matched_pairs.items():
+        node_a = subgraph_a.base_op_node
+        node_b = subgraph_b.base_op_node
+        weight_a = extract_weight_from_node(node_a, gm_a)
+        weight_b = extract_weight_from_node(node_b, gm_b)
+        if weight_a is not None:
+            results[model_name_a]["weights"][ref_name] = weight_a
+        if weight_b is not None:
+            results[model_name_b]["weights"][ref_name] = weight_b
     return results
 
 

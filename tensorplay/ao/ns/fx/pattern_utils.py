@@ -92,8 +92,8 @@ def get_reversed_fusions() -> list[tuple[NSFusionType, int]]:
             new_pattern = (cls, *reversed_pattern)
             results.append((new_pattern, default_base_op_idx))
 
-    # fp16 emulation and BN fusion patterns that are not in the quantization
-    # backend config are defined here.
+    # fp16 emulation, BN fusion and quantized-module fusion patterns that are
+    # not in the quantization backend config are defined here.
     fp16_em_base_op_idx = 1
     patterns_to_add = [
         # linear-relu fp16 emulation: fp16_to_fp32 -> linear -> relu -> fp32_to_fp16
@@ -105,6 +105,24 @@ def get_reversed_fusions() -> list[tuple[NSFusionType, int]]:
         ((nn.ReLU, nn.BatchNorm2d, nn.Conv2d), default_base_op_idx),
         ((nn.ReLU, nn.BatchNorm3d, nn.Conv3d), default_base_op_idx),
     ]
+    # quantized modules keep their module structure in this framework (rather
+    # than being lowered to call_function ops), so fusion patterns must also
+    # recognize them to align subgraph boundaries between float and quantized
+    # graphs.
+    from tensorplay.ao.nn import quantized as nnq
+
+    quantized_fusions = [
+        ((nn.ReLU, nnq.QuantizedLinear), default_base_op_idx),
+        ((nn.ReLU, nnq.Conv1d), default_base_op_idx),
+        ((nn.ReLU, nnq.Conv2d), default_base_op_idx),
+        ((nn.ReLU, nnq.Conv3d), default_base_op_idx),
+        ((nn.ReLU, nnq.BatchNorm2d), default_base_op_idx),
+        ((nn.ReLU, nnq.BatchNorm3d), default_base_op_idx),
+    ]
+    for p in quantized_fusions:
+        patterns_to_add.append(p)
+        patterns_to_add.append(((ObserverBase, *p[0]), p[1]))
+        patterns_to_add.append(((FakeQuantizeBase, *p[0]), p[1]))
     for p in patterns_to_add:
         results.append(p)
         results.append(((ObserverBase, *p[0]), p[1]))

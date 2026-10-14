@@ -198,3 +198,73 @@ def test_create_shadow_wrapper_forward():
     a_out, b_out = wrapper(x, x)
     assert a_out.shape == (2, 4)
     assert b_out.shape == (2, 4)
+
+# ---------------------------------------------------------------------------
+# real subgraph matcher + weight extraction against quantized models
+# ---------------------------------------------------------------------------
+
+
+def _calibrate(model):
+    model(tp.rand(2, 4))
+
+
+def _quantized_pair():
+    from tensorplay.ao.quantization.auto import auto_quantize
+
+    model = _two_layer()
+    qmodel = auto_quantize(model, calibration_fn=_calibrate)
+    return model, qmodel
+
+
+def test_get_matching_subgraph_pairs():
+    from tensorplay.ao.quantization.fx.tracer import QuantizationTracer
+    from tensorplay.ao.ns.fx.graph_matcher import (
+        GraphMatchingException,
+        get_matching_subgraph_pairs,
+    )
+
+    model, qmodel = _quantized_pair()
+    gm_float = QuantizationTracer().trace(model)
+    gm_quant = QuantizationTracer().trace(qmodel)
+    pairs = get_matching_subgraph_pairs(gm_float, gm_quant)
+    assert len(pairs) == 1
+    name, (sub_a, sub_b) = next(iter(pairs.items()))
+    assert sub_a.base_op_node.target == sub_b.base_op_node.target == "linear"
+
+    # unrelated graphs raise
+    class SingleRelu(nn.Module):
+        def forward(self, x):
+            return nn.ReLU()(x)
+
+    gm_relu = QuantizationTracer().trace(SingleRelu())
+    with pytest.raises(GraphMatchingException):
+        get_matching_subgraph_pairs(gm_relu, gm_float)
+
+
+def test_extract_weights_quantized():
+    from tensorplay.ao.ns._numeric_suite_fx import extract_weights
+
+    model, qmodel = _quantized_pair()
+    res = extract_weights("float", model, "quant", qmodel)
+    float_weights = res["float"]["weights"]
+    quant_weights = res["quant"]["weights"]
+    assert len(float_weights) == 1
+    assert len(quant_weights) == 1
+    key = next(iter(float_weights))
+    assert float_weights[key].shape == (4, 4)
+    assert quant_weights[key].shape == (4, 4)
+    # weights are dequantized for numeric comparison
+    assert quant_weights[key].dtype == tp.float32
+    assert tp.allclose(quant_weights[key], float_weights[key], atol=0.1)
+
+
+def test_related_ops_include_quantized_modules():
+    from tensorplay.ao.ns.fx.mappings import get_base_name_to_sets_of_related_ops
+    from tensorplay.ao.nn import quantized as nnq
+
+    sets = get_base_name_to_sets_of_related_ops()
+    related = False
+    for s in sets.values():
+        if nn.Linear in s and nnq.QuantizedLinear in s:
+            related = True
+    assert related

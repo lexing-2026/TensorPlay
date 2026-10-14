@@ -22,11 +22,12 @@ class QuantizationTracer(Tracer):
         self.skipped_module_classes = skipped_module_classes or []
 
     def is_leaf_module(self, m, module_qualified_name: str) -> bool:
+        tp = __import__("tensorplay")
+        module_under_nn = m.__module__.startswith(
+            ("tensorplay.nn", "tensorplay.ao.nn")
+        ) and not isinstance(m, tp.nn.Sequential)
         return (
-            (
-                m.__module__.startswith("tensorplay.nn")
-                and not isinstance(m, __import__("tensorplay").nn.Sequential)
-            )
+            module_under_nn
             or isinstance(m, (QuantStub, DeQuantStub, ObserverBase, FakeQuantizeBase))
             or module_qualified_name in self.skipped_module_names
             or type(m) in self.skipped_module_classes

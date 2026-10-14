@@ -78,9 +78,19 @@ def extract_weight_from_node(node, gm):
     """Extract the weight tensor(s) of a node."""
     if node.op == "call_module":
         module = gm.get_submodule(node.target)
-        if hasattr(module, "weight"):
+        # quantized modules expose weight() as a method returning qweight
+        weight = None
+        if hasattr(module, "qweight"):
+            weight = module.qweight
+        elif isinstance(getattr(module, "weight", None), tp.nn.Parameter):
             weight = module.weight
-            if weight.is_quantized():
+        elif callable(getattr(module, "weight", None)):
+            try:
+                weight = module.weight()
+            except Exception:
+                weight = None
+        if weight is not None:
+            if getattr(weight, "is_quantized", lambda: False)():
                 return weight.dequantize()
             return weight.detach()
         if hasattr(module, "weight_ih_l0"):
