@@ -47,3 +47,4 @@ __all__ = [
     "SignalNoiseRatio",
     "SourceAggregatedSignalDistortionRatio",
 ]
+__all__ = list(dict.fromkeys(__all__))

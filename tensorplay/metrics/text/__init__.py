@@ -39,3 +39,4 @@ __all__ = [
     "WordInfoLost",
     "WordInfoPreserved",
 ]
+__all__ = list(dict.fromkeys(__all__))

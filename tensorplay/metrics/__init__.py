@@ -597,3 +597,6 @@ __all__ = [
     "SpeechReverberationModulationEnergyRatio",
     "SQuAD",
 ]
+# A few names are exported by more than one subpackage; the public export
+# list must stay unique while preserving declaration order.
+__all__ = list(dict.fromkeys(__all__))
