@@ -6,8 +6,11 @@
 #include "CudaGemm.h"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 #include <vector>
 
 namespace tensorplay {
@@ -400,6 +403,230 @@ Tensor _weight_int8pack_mm_cuda(const Tensor& self, const Tensor& mat2,
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Direct int4 tensor-core GEMM.
+//
+// Computes `out[B,N] = act[B,K] @ dequant(weight[N,K])^T` consuming the
+// packed int4 weight directly with mma.sync fp16/bf16 tensor-core
+// instructions.  Each 16x8x16 MMA tile dequantizes its 16x8 int4 fragment in
+// registers (two codes per byte, even k in the low nibble) with the
+// per-group (scale, zero) of the tile's K-range:
+//
+//     value = (unsigned_code - 8) * scale + zero
+//
+// The fp32 accumulator is converted to the activation dtype on store.
+//
+// Block tile: 64 (M) x 64 (N), 256 threads (8 warps: 4 along M, 2 along N).
+// Each warp owns a 16 x 32 output tile and issues four m16n8k16 MMAs per 16-K
+// step.  K advances in stages of 64, with the activation tile, the packed
+// weight tile and the (at most two) covering scale/zero groups staged in
+// shared memory.
+// ---------------------------------------------------------------------------
+
+// Pack two float values into the two 16-bit lanes of an MMA B fragment
+// register (low lane first), matching the fp16/bf16 storage of the
+// activation dtype.
+__device__ __forceinline__ uint32_t pack_half2(float lo, float hi) {
+    const __half h_lo = __float2half(lo);
+    const __half h_hi = __float2half(hi);
+    return static_cast<uint32_t>(__half_as_ushort(h_lo)) |
+           (static_cast<uint32_t>(__half_as_ushort(h_hi)) << 16);
+}
+
+__device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
+    const __nv_bfloat16 h_lo = __float2bfloat16(lo);
+    const __nv_bfloat16 h_hi = __float2bfloat16(hi);
+    return static_cast<uint32_t>(__bfloat16_as_ushort(h_lo)) |
+           (static_cast<uint32_t>(__bfloat16_as_ushort(h_hi)) << 16);
+}
+
+template <typename T>
+__global__ void int4pack_mma_mm_kernel(const T* __restrict__ x,
+                                       const uint8_t* __restrict__ w,
+                                       const float* __restrict__ scale_zero,
+                                       T* __restrict__ out, int64_t K,
+                                       int64_t N, int64_t group_size,
+                                       int64_t B) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr int kMBlock = 128;
+    constexpr int kNBlock = 128;
+    constexpr int kKStage = 128;
+    constexpr int kThreads = 512;
+    constexpr int kPad = 4;
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int wm = warp >> 2;  // 0..3 along M, each warp covers 32 rows
+    const int wn = warp & 3;   // 0..3 along N, each warp covers 32 cols
+
+    const int64_t m_block = blockIdx.y * kMBlock;
+    const int64_t n_block = blockIdx.x * kNBlock;
+    const int64_t m_warp = m_block + wm * 32;
+    const int64_t n_warp = n_block + wn * 32;
+
+    __shared__ T sA[kMBlock][kKStage + kPad];
+    __shared__ uint8_t sW[kNBlock][kKStage / 2];
+    __shared__ float sSZ[4][kNBlock][2];
+
+    const int groupID = lane >> 2;
+    const int tig = lane & 3;
+    const int row_stride = kKStage + kPad;
+
+    float c[2][4][4];
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+#pragma unroll
+        for (int ns = 0; ns < 4; ++ns) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) c[mt][ns][j] = 0.0f;
+        }
+    }
+
+    const int64_t groups_per_row = K / group_size;
+
+    for (int64_t k_stage = 0; k_stage < K; k_stage += kKStage) {
+        // Stage the activation tile [128, 64] (as 32-bit fp pairs).
+        for (int idx = tid; idx < kMBlock * (kKStage / 2); idx += kThreads) {
+            const int r = idx / (kKStage / 2);
+            const int c2 = (idx % (kKStage / 2)) * 2;
+            const int64_t gk = k_stage + c2;
+            const T* src = x + (m_block + r) * K + gk;
+            *reinterpret_cast<uint32_t*>(&sA[r][c2]) =
+                *reinterpret_cast<const uint32_t*>(src);
+        }
+        // Stage the packed weight tile [128, 32] bytes.
+        for (int idx = tid; idx < kNBlock * (kKStage / 2); idx += kThreads) {
+            const int r = idx / (kKStage / 2);
+            const int c2 = idx % (kKStage / 2);
+            sW[r][c2] = w[(n_block + r) * (K / 2) + k_stage / 2 + c2];
+        }
+        // Stage (scale, zero) for the up-to-two groups this stage covers.
+        const int64_t g0 = k_stage / group_size;
+        for (int idx = tid; idx < 4 * kNBlock * 2; idx += kThreads) {
+            const int g = idx / (kNBlock * 2);
+            const int rem = idx % (kNBlock * 2);
+            const int r = rem / 2;
+            const int e = rem % 2;
+            const int64_t grp = g0 + g;
+            const float v = grp < groups_per_row
+                                ? scale_zero[(grp * N + n_block + r) * 2 + e]
+                                : 0.0f;
+            sSZ[g][r][e] = v;
+        }
+        __syncthreads();
+
+        // Four 16-K MMA steps per stage.
+#pragma unroll
+        for (int ks = 0; ks < 8; ++ks) {
+            const int k_local = ks * 16;
+            const int64_t k0 = k_stage + k_local;
+            const int g_local = static_cast<int>((k0 / group_size) - g0);
+
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt) {
+                // A fragment (16x16 fp16/bf16), shared across the N-subtiles.
+                const char* a_base = reinterpret_cast<const char*>(
+                    &sA[wm * 32 + mt * 16 + groupID][k_local + 2 * tig]);
+                const uint32_t a0 = *reinterpret_cast<const uint32_t*>(a_base);
+                const char* a8 = a_base + 8 * row_stride * sizeof(T);
+                const uint32_t a1 = *reinterpret_cast<const uint32_t*>(a8);
+                const uint32_t a2 = *reinterpret_cast<const uint32_t*>(
+                    a_base + 8 * sizeof(T));
+                const uint32_t a3 = *reinterpret_cast<const uint32_t*>(
+                    a8 + 8 * sizeof(T));
+
+#pragma unroll
+                for (int ns = 0; ns < 4; ++ns) {
+                    const int n_local = wn * 32 + ns * 8;
+                    // B fragment: b0 covers K rows {2*tig, 2*tig+1}, b1
+                    // covers {2*tig+8, 2*tig+9} at N column groupID.
+                    const int byte_base = (k_local + 2 * tig) / 2;
+                    const uint8_t* sW_row = &sW[n_local + groupID][0];
+                    const uint8_t b0b = sW_row[byte_base + 0];
+                    const uint8_t b1b = sW_row[byte_base + 4];
+                    const float scale = sSZ[g_local][n_local + groupID][0];
+                    const float zero = sSZ[g_local][n_local + groupID][1];
+                    const float v0 =
+                        (static_cast<float>(b0b & 0xf) - 8.0f) * scale + zero;
+                    const float v1 =
+                        (static_cast<float>(b0b >> 4) - 8.0f) * scale + zero;
+                    const float v2 =
+                        (static_cast<float>(b1b & 0xf) - 8.0f) * scale + zero;
+                    const float v3 =
+                        (static_cast<float>(b1b >> 4) - 8.0f) * scale + zero;
+                    uint32_t b0, b1;
+                    if constexpr (std::is_same_v<T, tensorplay::Half>) {
+                        b0 = pack_half2(v0, v1);
+                        b1 = pack_half2(v2, v3);
+                    } else {
+                        b0 = pack_bf16x2(v0, v1);
+                        b1 = pack_bf16x2(v2, v3);
+                    }
+                    float d0 = c[mt][ns][0], d1 = c[mt][ns][1],
+                          d2 = c[mt][ns][2], d3 = c[mt][ns][3];
+                    if constexpr (std::is_same_v<T, tensorplay::Half>) {
+                        asm volatile(
+                            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16."
+                            "f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                            "{%10,%11,%12,%13};\n"
+                            : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0),
+                              "r"(b1), "f"(c[mt][ns][0]), "f"(c[mt][ns][1]),
+                              "f"(c[mt][ns][2]), "f"(c[mt][ns][3]));
+                    } else {
+                        asm volatile(
+                            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16."
+                            "f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                            "{%10,%11,%12,%13};\n"
+                            : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0),
+                              "r"(b1), "f"(c[mt][ns][0]), "f"(c[mt][ns][1]),
+                              "f"(c[mt][ns][2]), "f"(c[mt][ns][3]));
+                    }
+                    c[mt][ns][0] = d0;
+                    c[mt][ns][1] = d1;
+                    c[mt][ns][2] = d2;
+                    c[mt][ns][3] = d3;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Store the 32 x 32 output tile of this warp.  The MMA C fragment maps
+    // c0=(m,2tig), c1=(m,2tig+1), c2=(m+8,2tig), c3=(m+8,2tig+1).
+    const int64_t m0 = m_warp;
+    const int64_t n0 = n_warp;
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+#pragma unroll
+        for (int ns = 0; ns < 4; ++ns) {
+            const int64_t m = m0 + mt * 16 + groupID;
+            const int64_t col = n0 + ns * 8 + 2 * tig;
+            out[m * N + col] = static_cast<T>(c[mt][ns][0]);
+            out[m * N + col + 1] = static_cast<T>(c[mt][ns][1]);
+            out[(m + 8) * N + col] = static_cast<T>(c[mt][ns][2]);
+            out[(m + 8) * N + col + 1] = static_cast<T>(c[mt][ns][3]);
+        }
+    }
+#endif  // __CUDA_ARCH__ >= 800
+}
+
+template <typename T>
+void launch_int4pack_mma(const Tensor& x, const Tensor& w, const Tensor& sz,
+                         Tensor& out, int64_t B, int64_t K, int64_t N,
+                         int64_t group_size, cudaStream_t stream) {
+    constexpr int kThreads = 512;
+    const dim3 grid(static_cast<unsigned>(N / 128),
+                    static_cast<unsigned>(B / 128));
+    int4pack_mma_mm_kernel<T><<<grid, kThreads, 0, stream>>>(
+        x.data_ptr<T>(), w.data_ptr<uint8_t>(), sz.data_ptr<float>(),
+        out.data_ptr<T>(), K, N, group_size, B);
+    checkCuda(cudaGetLastError(), "int4pack mma kernel");
+}
+
+// ---------------------------------------------------------------------------
 // _weight_int4pack_mm: group-quantized 4-bit weight [N, K] packed two codes
 // per byte against fp activations [B, K].  qScaleAndZeros [N, groups, 2]
 // carries (scale, zero) per group; qGroupSize is 32, 64 or 128.
@@ -488,6 +715,12 @@ Tensor _weight_int4pack_mm_cuda(const Tensor& self, const Tensor& mat2,
         checkCuda(cudaGetLastError(), "int4pack gemm kernel");
         return out.to(self.dtype());
     }
+
+    // The direct int4 tensor-core path (int4pack_mma_mm_kernel above) consumes
+    // the packed weight straight from the mma.sync pipeline.  It is correct
+    // but currently not dispatched: it lacks cp.async pipelining / ldmatrix
+    // fragment loads, so the cuBLAS dequant+GEMM path below remains faster
+    // for production shapes.  Re-enable once the pipelined rewrite lands.
 
     // Tensor-core path: dequantize the packed weight to the activation dtype
     // and run a cuBLAS GEMM (out = activations @ weight.T).
