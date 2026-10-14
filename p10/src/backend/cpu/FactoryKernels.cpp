@@ -1,4 +1,6 @@
+#include "QuantTensorOperators.h"
 #include "Tensor.h"
+#include "QuantizedViews.h"
 #include "Complex.h"
 #include "Dispatcher.h"
 #include "Generator.h"
@@ -24,9 +26,8 @@ Tensor& fill_kernel(Tensor& self, const Scalar& value);
 Tensor allocate_cpu_tensor(const std::vector<int64_t>& size, DType dtype, bool pin_memory) {
 #ifdef USE_CUDA
     if (pin_memory) {
-        int64_t numel = 1;
-        for (int64_t value : size) numel *= value;
-        const size_t nbytes = static_cast<size_t>(numel) * elementSize(dtype);
+        const size_t nbytes = static_cast<size_t>(
+            subByteStorageSize(size, dtype));
         Storage storage(nbytes, getPinnedMemoryAllocator(), Device(DeviceType::CPU));
         return Tensor(storage, size, dtype);
     }
@@ -164,6 +165,8 @@ Tensor full_kernel(const std::vector<int64_t>& size, Scalar fill_value, DType dt
 }
 
 Tensor& fill_kernel(Tensor& self, const Scalar& value) {
+    if (isQuantizedType(self.dtype())) return quantized::fill(self, value);
+
     if (self.numel() == 0) return self;
     // Dense storage fills in one sweep; any other layout walks its strides.
     // Chunks are handed to the intra-op pool once the element count clears
@@ -737,6 +740,7 @@ Tensor randn_like_kernel(const Tensor& self, DType dtype, std::optional<Device> 
 Tensor empty_like_kernel(const Tensor& self, DType dtype, std::optional<Device> device) {
     if (dtype == DType::Undefined) dtype = self.dtype();
     Device dev = device.has_value() ? *device : self.device();
+    if (self.impl()->has_quantizer()) return quantized::empty_like(self, dtype, dev);
     return empty_kernel(static_cast<std::vector<int64_t>>(self.shape()), dtype, dev, false);
 }
 

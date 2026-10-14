@@ -1,3 +1,4 @@
+#include "QuantNative.h"
 #include "Tensor.h"
 #include "CUDARuntime.h"
 #include "Exception.h"
@@ -162,6 +163,8 @@ static inline bool avg_pool2d_prefers_native(const Tensor& input,
 }
 
 Tensor avg_pool2d_cuda(const Tensor& input, const std::vector<int64_t>& kernel_size_arg, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, bool ceil_mode, bool count_include_pad, std::optional<int64_t> divisor_override) {
+    if (isQuantizedType(input.dtype())) return avg_pool2d_native_cuda(input, kernel_size_arg, stride_arg, padding_arg, ceil_mode, count_include_pad, divisor_override);
+
     if (avg_pool2d_prefers_native(input, ceil_mode, count_include_pad, divisor_override)) {
         return avg_pool2d_native_cuda(input, kernel_size_arg, stride_arg, padding_arg,
                                       ceil_mode, count_include_pad, divisor_override);

@@ -43,13 +43,13 @@ from .sizevars import statically_known_true
 from .utils import generate_assert
 
 
-_ExprType = sympy.Expr | float | int | bool
+_ExprType = sympy.Expr | float | int | bool | complex
 
 
 def _is_constant(val: _ExprType):
     if isinstance(val, sympy.Basic):
         return val.is_number
-    return isinstance(val, (int, float, bool))
+    return isinstance(val, (int, float, bool, complex))
 
 
 def upper_bound(val: _ExprType):
@@ -321,10 +321,16 @@ class IndexPropagation(DefaultHandler):
             # An unbounded value asked to become a number raises, and there is
             # no expression to carry in that case.
             return self.fallback(name, args, kwargs)
+        expr = new_expr.expr
+        # A constant position is always worth carrying (including complex
+        # constants); a symbolic one is worth carrying when it is a whole
+        # number.  Complex values have no integrality attribute to ask.
+        if isinstance(expr, float):
+            expr_is_whole = expr.is_integer()
+        else:
+            expr_is_whole = getattr(expr, "is_integer", False) is True
         is_valid_expr = new_expr is not NotImplemented and (
-            # A position is not expected to be a floating point one, but a
-            # floating point constant is still worth carrying.
-            new_expr.is_constant() or new_expr.expr.is_integer
+            new_expr.is_constant() or expr_is_whole
         )
         if not is_valid_expr:
             return self.fallback(name, args, kwargs)

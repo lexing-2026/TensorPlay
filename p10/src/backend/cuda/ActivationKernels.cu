@@ -1,3 +1,4 @@
+#include "QuantTensorOperators.h"
 #include "OpsPointwiseCommon.cuh"
 #include "Tensor.h"
 #include "Dispatcher.h"
@@ -105,6 +106,8 @@ Tensor silu_kernel_cuda_native(const Tensor& self) {
 }
 
 Tensor relu_kernel_cudnn(const Tensor& self) {
+    if (isQuantizedType(self.dtype())) return quantized::activation(self, 10);
+
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
     if (self.numel() == 0) return result;
     TensorIterator iter = TensorIteratorConfig()
@@ -164,6 +167,8 @@ Tensor& cudnn_activation_inplace(Tensor& self_in, cudnnActivationMode_t mode, do
 }
 
 Tensor& relu_inplace_kernel_cudnn(Tensor& self) {
+    if (isQuantizedType(self.dtype())) return quantized::relu_inplace(self);
+
     cudnn_activation_inplace(self, CUDNN_ACTIVATION_RELU);
     return self;
 }
@@ -189,6 +194,8 @@ struct ActCxTanh {
 }  // namespace
 
 Tensor native_activation_dispatch(const Tensor& self, bool is_sigmoid) {
+    if (isQuantizedType(self.dtype())) return quantized::activation(self, is_sigmoid ? 4 : 5);
+
     if (isComplexType(self.dtype())) {
         if (self.dtype() != DType::ComplexFloat &&
             self.dtype() != DType::ComplexDouble) {
@@ -554,6 +561,8 @@ Tensor tanh_backward_cuda(const Tensor& grad_output, const Tensor& output) {
 // eps>=0 values outside [eps, 1-eps] (compared in the element dtype) are
 // masked to zero. Exact 0/1 fall through to the division (dy/0 -> inf).
 Tensor threshold_cuda(const Tensor& self, const Scalar& threshold, const Scalar& value) {
+    if (isQuantizedType(self.dtype())) return quantized::activation(self, 6, threshold.toDouble(), value.toDouble());
+
     double t = threshold.toDouble(), val = value.toDouble();
     return dtype_unary_cuda(self,
                             HFn61{t, val},
@@ -611,6 +620,8 @@ Tensor prelu_cuda(const Tensor& self, const Tensor& weight) {
     return prelu_forward_common(self, shaped_weight);
 }
 Tensor _prelu_kernel_cuda(const Tensor& self, const Tensor& weight) {
+    if (isQuantizedType(self.dtype())) return quantized::prelu(self, weight);
+
     return prelu_forward_common(self, weight);
 }
 std::tuple<Tensor, Tensor> _prelu_kernel_backward_cuda(const Tensor& grad_output,

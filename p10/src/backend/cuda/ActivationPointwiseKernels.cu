@@ -1,3 +1,4 @@
+#include "QuantTensorOperators.h"
 // Pointwise CUDA kernels: activation family.
 #include "PointwiseCommon.cuh"
 #include "OutWrite.h"
@@ -10,7 +11,9 @@ namespace cuda {
 Tensor sub_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha);
 Tensor mul_kernel(const Tensor& self, const Tensor& other);
 
-Tensor relu_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, ReluFunctor()); }
+Tensor relu_kernel_cuda(const Tensor& self) {
+    if (isQuantizedType(self.dtype())) return quantized::activation(self, 10);
+ return unary_float_op_kernel_v2(self, ReluFunctor()); }
 Tensor gelu_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, GeluFunctor()); }
 Tensor silu_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, SiluFunctor()); }
 template<typename Functor>
@@ -263,6 +266,8 @@ struct GeluBackwardTanhFunctor {
 };
 
 Tensor gelu_kernel_cuda_v2(const Tensor& self, const std::string& approximate) {
+    if (isQuantizedType(self.dtype())) { TP_CHECK(approximate == "none" || approximate == "tanh", "GELU approximation must be none or tanh"); return quantized::activation(self, approximate == "tanh" ? 9 : 8); }
+
     if (approximate == "tanh") return unary_float_op_kernel_v2(self, GeluTanhFunctor());
     else if (approximate != "none") TP_THROW(ValueError, "approximate argument must be either none or tanh, but got " + approximate);
     return unary_float_op_kernel_v2(self, GeluFunctor());
@@ -273,6 +278,8 @@ Tensor gelu_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, 
     return activation_backward_kernel_cuda(grad_output, self, GeluBackwardNoneFunctor());
 }
 Tensor hardtanh_kernel_cuda(const Tensor& self, const Scalar& min_val, const Scalar& max_val) {
+    if (isQuantizedType(self.dtype())) return quantized::activation(self, 7, min_val.toDouble(), max_val.toDouble());
+
     return unary_float_op_kernel_v2(self, HardtanhFunctor(min_val.toDouble(), max_val.toDouble()));
 }
 Tensor hardtanh_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, const Scalar& min_val, const Scalar& max_val) {
@@ -291,11 +298,15 @@ Tensor squared_difference_kernel_cuda(const Tensor& self, const Tensor& other) {
 Tensor hardswish_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self) {
     return activation_backward_kernel_cuda(grad_output, self, HardswishBackwardFunctor());
 }
-Tensor hardsigmoid_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, HardsigmoidFunctor()); }
+Tensor hardsigmoid_kernel_cuda(const Tensor& self) {
+    if (isQuantizedType(self.dtype())) return quantized::activation(self, 3);
+ return unary_float_op_kernel_v2(self, HardsigmoidFunctor()); }
 Tensor hardsigmoid_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self) {
     return activation_backward_kernel_cuda(grad_output, self, HardsigmoidBackwardFunctor());
 }
 Tensor leaky_relu_kernel_cuda(const Tensor& self, const Scalar& negative_slope) {
+    if (isQuantizedType(self.dtype())) return quantized::activation(self, 0, negative_slope.toDouble());
+
     return unary_float_op_kernel_v2(self, LeakyReluFunctor(negative_slope.toDouble()));
 }
 Tensor leaky_relu_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, const Scalar& negative_slope, bool self_is_result) {

@@ -1,3 +1,5 @@
+#include "QuantNative.h"
+#include "QuantTensorOperators.h"
 // Native CUDA adaptive average-pooling implementation. Forward assigns one
 // thread to each output element. Backward assigns one thread to each input
 // element and walks only the adaptive output interval that contains it.
@@ -192,6 +194,8 @@ void launch_adaptive_avg_pool3d_backward(const Tensor& grad_output, Tensor& grad
 
 Tensor adaptive_avg_pool3d_native_cuda(
     const Tensor& input, const std::vector<int64_t>& output_size) {
+    if (isQuantizedType(input.dtype())) return quant::pool_cuda(input, output_size, {}, {}, {}, false, false, {}, 1);
+
     if (input.dim() == 4) {
         return adaptive_avg_pool3d_native_cuda(input.unsqueeze(0), output_size).squeeze(0);
     }
@@ -263,6 +267,10 @@ namespace {
 Tensor& adaptive_avg_pool3d_out_cuda(const Tensor& self,
                                      const std::vector<int64_t>& output_size,
                                      Tensor& out) {
+    if (isQuantizedType(self.dtype())) {
+        out = adaptive_avg_pool3d_native_cuda(self, output_size);
+        return out;
+    }
     write_out(out, adaptive_avg_pool3d_native_cuda(self, output_size));
     return out;
 }

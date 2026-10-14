@@ -126,6 +126,10 @@ Tensor csr_to_coo_cuda(const Tensor& self) {
 Tensor to_sparse_csr_cuda(const Tensor& self) {
     if (self.is_sparse()) {
         if (self.is_sparse_csr()) return self;
+        if (self.is_sparse_csc() || self.is_sparse_bsr() ||
+            self.is_sparse_bsc()) {
+            return compressed_to_csr_cuda(self);
+        }
         return coo_to_csr_native(self.coalesce());
     }
     if (self.dim() != 2) {

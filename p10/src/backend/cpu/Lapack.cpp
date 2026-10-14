@@ -201,11 +201,17 @@ LibHandle find_library() {
         if (void* h = dlopen(env, RTLD_LAZY)) return h;
     }
     // Already mapped (e.g. numpy imported earlier in this process)?
+    // Only an ILP64 provider can satisfy the 64-bit integer ABI used here; the
+    // LP64 scipy wheel (libscipy_openblas-*.so) exports the same routine names
+    // with 32-bit integer arguments and would corrupt the ipiv buffers, so it
+    // must never be selected from the process map.
     std::ifstream maps("/proc/self/maps");
     std::string line;
     while (std::getline(maps, line)) {
-        const auto pos = line.find("libscipy_openblas");
-        if (pos == std::string::npos) continue;
+        const bool ilp64 =
+            line.find("libscipy_openblas64") != std::string::npos ||
+            line.find("openblas64") != std::string::npos;
+        if (!ilp64) continue;
         const auto start = line.find_first_of('/');
         if (start == std::string::npos) continue;
         auto end = line.size();
@@ -270,7 +276,9 @@ LibHandle find_library() {
         LibHandle found = nullptr;
         while (const dirent* ent = readdir(dir)) {
             const std::string name = ent->d_name;
-            if (name.find("scipy_openblas") == std::string::npos &&
+            // Only ILP64 providers are usable; the LP64 scipy openblas
+            // (libscipy_openblas-*.so) is deliberately skipped.
+            if (name.find("scipy_openblas64") == std::string::npos &&
                 name.find("openblas64") == std::string::npos) continue;
             const std::string path = dir_path + "/" + name;
             found = dlopen(path.c_str(), RTLD_LAZY | RTLD_LOCAL);

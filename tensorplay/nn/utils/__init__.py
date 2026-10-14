@@ -39,3 +39,9 @@ from .spectral_norm import (
     spectral_norm as spectral_norm,
     remove_spectral_norm as remove_spectral_norm,
 )
+from .fusion import (
+    fuse_conv_bn_eval as fuse_conv_bn_eval,
+    fuse_conv_bn_weights as fuse_conv_bn_weights,
+    fuse_linear_bn_eval as fuse_linear_bn_eval,
+    fuse_linear_bn_weights as fuse_linear_bn_weights,
+)

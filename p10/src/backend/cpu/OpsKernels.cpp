@@ -1,3 +1,4 @@
+#include "QuantTensorOperators.h"
 // Elementwise arithmetic, comparison, math, clamp, and activation CPU kernels.
 #include "Tensor.h"
 #include "Dispatcher.h"
@@ -1211,6 +1212,8 @@ Tensor logit_backward_cpu(const Tensor& grad_output, const Tensor& self, const s
     }, "logit_backward");
 }
 Tensor threshold_cpu(const Tensor& self, const Scalar& threshold, const Scalar& value) {
+    if (isQuantizedType(self.dtype())) return quantized::activation(self, 6, threshold.toDouble(), value.toDouble());
+
     double t = threshold.toDouble(), val = value.toDouble();
     return dtype_unary_kernel(self, [t, val](auto x) -> decltype(x) {
         using T = decltype(x);

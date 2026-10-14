@@ -7,6 +7,7 @@
 #include "CompositeCommon.h"
 #include "SpecialMath.h"
 #include "Tensor.h"
+#include "Quantizer.h"
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
@@ -199,6 +200,8 @@ Tensor empty_strided_native(const std::vector<int64_t>& size,
                             const std::vector<int64_t>& stride,
                             std::optional<DType> dtype,
                             std::optional<Device> device, bool pin_memory) {
+    TP_CHECK(!dtype || !isQuantizedType(*dtype),
+             "empty_strided is unsupported for quantized tensors");
     TP_CHECK(size.size() == stride.size(),
              "empty_strided: got ", size.size(), " sizes and ", stride.size(),
              " strides");
