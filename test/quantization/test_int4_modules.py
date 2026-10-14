@@ -37,12 +37,7 @@ def _dequant_int4_reference(x, w, groupsize=128):
 
 @pytest.mark.parametrize('device', DEVICES)
 def test_pack_and_mm_matches_reference(device):
-    # The CUDA int4 tensor-core kernel is under active development (nibble
-    # order is being changed together with a new direct-GEMM kernel); the
-    # packer and the kernel are temporarily out of sync.  Remove this xfail
-    # once the CUDA kernel settles.
-    if device == 'cuda':
-        pytest.xfail("CUDA int4pack kernel under development")
+
     tp.manual_seed(0)
     N, K, B, g = 32, 256, 4, 128
     w = tp.randn(N, K, device=device)
@@ -74,10 +69,7 @@ def test_pack_and_mm_matches_reference(device):
 
 @pytest.mark.parametrize('device', DEVICES)
 def test_weight_only_linear_forward(device):
-    # See test_pack_and_mm_matches_reference: the CUDA int4pack kernel is
-    # under active development and temporarily loses precision.
-    if device == 'cuda':
-        pytest.xfail("CUDA int4pack kernel under development")
+
     tp.manual_seed(1)
     lin = nn.Linear(256, 32, bias=True).to(device)
     x = tp.randn(4, 256, device=device)
@@ -103,10 +95,7 @@ def test_quantize_weight_only_converts_model(device):
 
 @pytest.mark.parametrize('device', DEVICES)
 def test_weight_only_training_loss_decreases(device):
-    # See test_pack_and_mm_matches_reference: the CUDA int4pack kernel is
-    # under active development and temporarily loses precision.
-    if device == 'cuda':
-        pytest.xfail("CUDA int4pack kernel under development")
+
     tp.manual_seed(3)
     lin = Int4WeightOnlyQuantizedTrainingLinear(64, 16, groupsize=32).to(device)
     opt = tp.optim.SGD(lin.parameters(), lr=0.1)
