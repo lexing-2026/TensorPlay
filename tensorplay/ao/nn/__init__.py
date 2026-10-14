@@ -19,12 +19,14 @@ if _TYPE_CHECKING:
         intrinsic as intrinsic,
         qat as qat,
         quantized as quantized,
+        sparse as sparse,
     )
 
 __all__ = [
     "intrinsic",
     "qat",
     "quantized",
+    "sparse",
 ]
 
 
