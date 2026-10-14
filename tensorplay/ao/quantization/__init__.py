@@ -386,6 +386,9 @@ __all__ += [
     "print_model_analysis",
     "model_quantization_summary",
     "quantization_ready",
+    "auto_prepare",
+    "auto_convert",
+    "auto_quantize",
 ]
 
 from . import analyze as analyze
@@ -394,4 +397,10 @@ from .analyze import (
     model_quantization_summary as model_quantization_summary,
     print_model_analysis as print_model_analysis,
     quantization_ready as quantization_ready,
+)
+from . import auto as auto
+from .auto import (
+    auto_convert as auto_convert,
+    auto_prepare as auto_prepare,
+    auto_quantize as auto_quantize,
 )
