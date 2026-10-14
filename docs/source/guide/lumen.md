@@ -205,6 +205,23 @@ prompt = "The capital of France is"
 ids = tokenizer.encode(prompt)
 ```
 
+### Attention heatmaps
+
+Extract per-head attention weights and render them with the visualization helper.
+Highlight important tokens (e.g. a subject) to make the attended-to pattern legible:
+
+```python
+from tensorplay.lumen.llm import extract_attention, visualize_attention_heads
+
+result = extract_attention(model, tokenizer, prompt, layers=[0, 1])
+fig, axes = visualize_attention_heads(
+    result,
+    layer=0,
+    title="Layer 0 attention heads",
+    highlight_tokens=["France"],
+)
+```
+
 ### Causal tracing: where is a fact stored?
 
 The causal-tracing protocol from knowledge-editing research corrupts a prompt,

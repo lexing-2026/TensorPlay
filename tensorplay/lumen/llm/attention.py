@@ -169,6 +169,10 @@ def visualize_attention_heads(
     heads: Optional[Union[int, Sequence[int]]] = None,
     cmap: str = "viridis",
     title: Optional[str] = None,
+    highlight_tokens: Optional[Sequence[str]] = None,
+    show_token_labels: bool = True,
+    tick_fontsize: int = 8,
+    vmax: float = 1.0,
     figsize: Optional[Sequence[float]] = None,
     use_pyplot: bool = False,
 ) -> Any:
@@ -183,6 +187,12 @@ def visualize_attention_heads(
         heads: Which heads to plot; ``None`` plots all.
         cmap: Matplotlib colormap name.
         title: Optional figure title.
+        highlight_tokens: Token strings to emphasize (bold, colored) on the
+            axes, e.g. a subject token in a causal-tracing study.
+        show_token_labels: If ``False``, hides token labels on the axes.
+        tick_fontsize: Font size of the token labels.
+        vmax: Maximum colorbar value (attention weights are normalized per row
+            and usually at most 1.0).
         figsize: Optional ``(width, height)`` figure size.
         use_pyplot: If ``True`` calls ``plt.show()`` (only useful in an
             interactive backend).
@@ -201,6 +211,7 @@ def visualize_attention_heads(
         layer = 0 if layer is None else layer
         attention = attention[layer]
 
+    layer = 0 if layer is None else layer
     arr = np.asarray(attention, dtype=float)
     if arr.ndim == 2:
         arr = arr[None]  # (1, seq, seq)
@@ -218,32 +229,73 @@ def visualize_attention_heads(
     cols = min(n, 4)
     rows = (n + cols - 1) // cols
     if figsize is None:
-        figsize = (cols * 3.5, rows * 3.5)
+        figsize = (cols * 3.6, rows * 3.6)
     fig, axes = plt.subplots(rows, cols, figsize=figsize)
     axes = np.atleast_1d(axes).ravel()
-    seq_len = arr.shape[1]
-    tick_step = max(1, seq_len // 20)
-    tick_positions = list(range(0, seq_len, tick_step))
-    tick_labels = None
-    if tokens is not None and len(tokens) >= seq_len:
-        tick_labels = [tokens[i] for i in tick_positions]
 
+    seq_len = arr.shape[1]
+    max_ticks = 12
+    tick_step = max(1, int(np.ceil(seq_len / max_ticks)))
+    tick_positions = list(range(0, seq_len, tick_step))
+    tick_labels = [
+        tokens[i] if tokens is not None and i < len(tokens) else str(i)
+        for i in tick_positions
+    ]
+    highlight = set(highlight_tokens or [])
+
+    # first subplot decides the shared colorbar
+    im = None
     for ax, hmap, hi in zip(axes, arr, head_indices):
-        im = ax.imshow(hmap, cmap=cmap, vmin=0.0, vmax=1.0, aspect="auto")
-        ax.set_title("head %d" % hi, fontsize=9)
-        ax.set_xticks(tick_positions)
-        ax.set_yticks(tick_positions)
-        if tick_labels is not None:
-            ax.set_xticklabels(tick_labels, rotation=90, fontsize=7)
-            ax.set_yticklabels(tick_labels, fontsize=7)
-        ax.tick_params(length=0)
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        im = ax.imshow(
+            hmap,
+            cmap=cmap,
+            vmin=0.0,
+            vmax=vmax,
+            aspect="auto",
+            interpolation="nearest",
+        )
+        ax.set_title("Layer %d \u00b7 Head %d" % (layer, hi), fontsize=10)
+        if show_token_labels:
+            ax.set_xticks(tick_positions)
+            ax.set_yticks(tick_positions)
+            xtick_labels = []
+            for label in tick_labels:
+                if label in highlight:
+                    xtick_labels.append(
+                        plt.Text(
+                            0, 0, label, fontsize=tick_fontsize + 1,
+                            fontweight="bold", color="#d62728",
+                        )
+                    )
+                else:
+                    xtick_labels.append(label)
+            ax.set_xticklabels(xtick_labels, rotation=45, ha="right")
+            ax.set_yticklabels(tick_labels, fontsize=tick_fontsize)
+        else:
+            ax.set_xticks([])
+            ax.set_yticks([])
+        ax.tick_params(length=0, labelsize=tick_fontsize)
+
+        # light grid lines between cells for readability
+        ax.set_xticks(np.arange(-0.5, seq_len, 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, seq_len, 1), minor=True)
+        ax.grid(which="minor", color="white", linewidth=0.4, alpha=0.25)
 
     for ax in axes[n:]:
         ax.axis("off")
+
+    if im is not None:
+        if n == 1:
+            fig.colorbar(im, ax=axes[0], fraction=0.046, pad=0.04)
+        else:
+            fig.colorbar(im, ax=axes.tolist(), fraction=0.03, pad=0.02)
+
     if title:
-        fig.suptitle(title)
-    fig.tight_layout()
+        fig.suptitle(title, y=1.02, fontsize=12)
+    if n == 1:
+        fig.tight_layout()
+    else:
+        fig.tight_layout(rect=[0, 0, 0.96, 1])
     if use_pyplot:
         plt.show()
     return fig, axes
