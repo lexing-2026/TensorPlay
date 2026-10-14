@@ -162,3 +162,62 @@ class LinearBn1d(_FusedModule):
     pass
 
 __all__.append("LinearBn1d")
+
+
+class LinearLeakyReLU(_FusedModule):
+    """A linear transformation followed by a leaky rectifier."""
+
+    def __init__(self, linear, leaky_relu):
+        if not (type(linear) is nn.Linear and type(leaky_relu) is nn.LeakyReLU):
+            raise AssertionError(
+                f"Incorrect types for input modules: "
+                f"{type(linear).__name__} and {type(leaky_relu).__name__}"
+            )
+        super().__init__(linear, leaky_relu)
+
+
+__all__.append("LinearLeakyReLU")
+
+
+class LinearTanh(_FusedModule):
+    """A linear transformation followed by a hyperbolic tangent."""
+
+    def __init__(self, linear, tanh):
+        if not (type(linear) is nn.Linear and type(tanh) is nn.Tanh):
+            raise AssertionError(
+                f"Incorrect types for input modules: "
+                f"{type(linear).__name__} and {type(tanh).__name__}"
+            )
+        super().__init__(linear, tanh)
+
+
+__all__.append("LinearTanh")
+
+
+class ConvAdd2d(_FusedModule):
+    """A 2d convolution with a residual add."""
+
+    def __init__(self, conv, add):
+        super().__init__(conv)
+        self.add = add
+
+    def forward(self, x1, x2):
+        return self.add(self[0](x1), x2)
+
+
+__all__.append("ConvAdd2d")
+
+
+class ConvAddReLU2d(_FusedModule):
+    """A 2d convolution with a residual add and a rectifier."""
+
+    def __init__(self, conv, add, relu):
+        super().__init__(conv)
+        self.add = add
+        self.relu = relu
+
+    def forward(self, x1, x2):
+        return self.relu(self.add(self[0](x1), x2))
+
+
+__all__.append("ConvAddReLU2d")
