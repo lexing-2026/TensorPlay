@@ -110,12 +110,18 @@ def _quantize_intx_groupwise(
 def _dequantize_intx(
     packed: tp.Tensor, scale: tp.Tensor, zero: tp.Tensor, bits: int, columns: int
 ) -> tp.Tensor:
-    """Dequantize packed n-bit codes back to float32."""
+    """Dequantize packed n-bit codes back to float32.
+
+    The group scale/zero are broadcast against a 3-D view of the unpacked
+    codes instead of being repeated to the full matrix, which avoids two
+    large intermediate copies per forward.
+    """
     groupsize = columns // scale.shape[-1]
     codes = unpack_intx(packed, bits, columns).to(tp.float32)
-    z = zero.repeat_interleave(groupsize, dim=-1)
-    s = scale.repeat_interleave(groupsize, dim=-1)
-    return (codes - z) * s
+    codes = codes.reshape(*codes.shape[:-1], scale.shape[-1], groupsize)
+    return ((codes - zero.unsqueeze(-1)) * scale.unsqueeze(-1)).reshape(
+        *codes.shape[:-2], -1
+    )
 
 
 def _intx_mm(
@@ -198,10 +204,12 @@ class _IntxWeightOnlyLinear(Function):
     @staticmethod
     def forward(ctx, input, weight, groupsize, bits):
         codes, scale, zero = _quantize_intx_groupwise(weight, groupsize, bits)
-        groupsize_k = weight.shape[1] // scale.shape[-1]
-        z = zero.repeat_interleave(groupsize_k, dim=-1)
-        s = scale.repeat_interleave(groupsize_k, dim=-1)
-        dq = (codes.to(tp.float32) - z) * s
+        codes_f = codes.to(tp.float32).reshape(
+            *codes.shape[:-1], scale.shape[-1], groupsize
+        )
+        dq = ((codes_f - zero.unsqueeze(-1)) * scale.unsqueeze(-1)).reshape(
+            *codes.shape
+        )
         ctx.save_for_backward(input, weight)
         out = input @ dq.T.contiguous()
         return out
