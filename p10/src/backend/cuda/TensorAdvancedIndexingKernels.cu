@@ -1,3 +1,4 @@
+#include "QuantTensorOperators.h"
 // Advanced index selection operators - CUDA kernels.
 #include "Tensor.h"
 #include "Dispatcher.h"
@@ -177,6 +178,8 @@ void dispatch_advanced_index_kernel(const indexing::native::AdvancedIndex& info,
 
 Tensor index_cuda(const Tensor& self,
                   const std::vector<std::optional<Tensor>>& indices) {
+    if (isQuantizedType(self.dtype())) { quantized::q_scale(self); return quantized::with_quantizer(index_cuda(quantized::storage_view(self), indices), self); }
+
     if (indices.empty()) {
         TP_THROW(IndexError, "index: at least one index must be provided");
     }
@@ -506,6 +509,8 @@ void index_put_with_sort(Tensor& self,
 Tensor& index_put_impl_cuda(Tensor& self,
                             const std::vector<std::optional<Tensor>>& indices,
                             const Tensor& values, bool accumulate, bool unsafe) {
+    if (isQuantizedType(self.dtype())) return quantized::index_put(self, indices, values, accumulate, unsafe);
+
     TP_CHECK_INDEX(indices.size() <= static_cast<size_t>(self.dim()),
                    "too many indices for tensor of dimension ", self.dim(),
                    " (got ", indices.size(), ")");

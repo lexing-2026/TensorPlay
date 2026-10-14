@@ -1,3 +1,5 @@
+#include "QuantNative.h"
+#include "QuantTensorOperators.h"
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
@@ -157,6 +159,8 @@ Tensor avg_pool3d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
                       const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                       bool ceil_mode, bool count_include_pad,
                       std::optional<int64_t> divisor_override) {
+    if (isQuantizedType(input.dtype())) return quant::pool_cpu(input, kernel_size.size() == 1 ? std::vector<int64_t>(3, kernel_size[0]) : kernel_size, stride, padding, {}, ceil_mode, count_include_pad, divisor_override, 0);
+
     if (divisor_override.has_value() && *divisor_override == 0)
         TP_THROW(RuntimeError, "divisor must be not zero");
     if (input.dim() == 4) {
@@ -329,6 +333,8 @@ Tensor max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
 }
 
 Tensor avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, bool ceil_mode, bool count_include_pad, std::optional<int64_t> divisor_override) {
+    if (isQuantizedType(input.dtype())) return quant::pool_cpu(input, kernel_size.size() == 1 ? std::vector<int64_t>(2, kernel_size[0]) : kernel_size, stride, padding, {}, ceil_mode, count_include_pad, divisor_override, 0);
+
     if (divisor_override.has_value() && *divisor_override == 0)
         TP_THROW(RuntimeError, "divisor must be not zero");
     if (input.dim() == 3) {
@@ -431,6 +437,8 @@ Tensor avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
 }
 
 Tensor adaptive_avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& output_size) {
+    if (isQuantizedType(input.dtype())) return quant::pool_cpu(input, output_size, {}, {}, {}, false, false, {}, 1);
+
     if (input.dim() == 3) {
         return adaptive_avg_pool2d_cpu(input.unsqueeze(0), output_size).squeeze(0);
     }
@@ -1067,6 +1075,8 @@ Tensor avg_pool3d_backward_cpu(const Tensor& grad_output, const Tensor& input,
 
 // start = floor(i * in / out), end = ceil((i+1) * in / out).
 Tensor adaptive_avg_pool3d_cpu(const Tensor& input, const std::vector<int64_t>& output_size) {
+    if (isQuantizedType(input.dtype())) return quant::pool_cpu(input, output_size, {}, {}, {}, false, false, {}, 1);
+
     if (input.dim() == 4)
         return adaptive_avg_pool3d_cpu(input.unsqueeze(0), output_size).squeeze(0);
     if (input.dim() != 5) TP_THROW(RuntimeError, "adaptive_avg_pool3d: Expected 5D input");

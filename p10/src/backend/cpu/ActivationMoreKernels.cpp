@@ -1,3 +1,4 @@
+#include "QuantTensorOperators.h"
 // CPU kernels for the extended activation family:
 //   - _softmax / _log_softmax (thin wrappers over the row-wise softmax
 //     kernels in PointwiseKernels.cpp) and their *_backward_data kernels,
@@ -347,6 +348,8 @@ Tensor& _log_softmax_backward_data_out_cpu(const Tensor& grad_output,
 // ---------------------------------------------------------------------------
 
 Tensor _prelu_kernel_cpu(const Tensor& self, const Tensor& weight_in) {
+    if (isQuantizedType(self.dtype())) return quantized::prelu(self, weight_in);
+
     // The caller pre-shapes the weight (rank equal to self, channel dim at
     // position 1); broadcasting handles the trailing singleton dims.
     Tensor weight =

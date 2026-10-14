@@ -1,10 +1,26 @@
 #pragma once
 
 namespace tensorplay::quant::TP_QN_DETAIL {
+template<class T>
+struct BatchNormCodes {
+    const T* src;
+    T* dst;
+    const float *alpha, *beta;
+    int64_t channels, input_zero_point, output_zero_point;
+    bool relu;
+    TP_QN_DEVICE void operator()(int64_t i) const {
+        const int64_t c = i % channels;
+        float value = alpha[c] * static_cast<float>(static_cast<int64_t>(src[i]) - input_zero_point) + beta[c];
+        if (relu) value = ::fmaxf(value, 0.f);
+        dst[i] = encode<T>(value, 1.f, output_zero_point);
+    }
+};
+
 Tensor batch_norm(const Tensor& input, const std::optional<Tensor>& weight,
         const std::optional<Tensor>& bias, const Tensor& mean, const Tensor& var,
         double eps, double scale, int64_t zp, bool relu) {
     Guard guard(input);
+    if (!quantized::is_quantized(input)) TP_THROW(TypeError,"Normalization requires quantized input");
     TP_CHECK(weight && bias, "Normalization requires weight and bias");
     validate(input);
     if (!input.numel()) return input.clone();
@@ -16,38 +32,62 @@ Tensor batch_norm(const Tensor& input, const std::optional<Tensor>& weight,
     Tensor logical = input;
     while (logical.dim() < 4) logical = logical.unsqueeze(-1);
     const auto format = logical.dim() == 4 ? MemoryFormat::ChannelsLast : MemoryFormat::ChannelsLast3d;
-    const Tensor x = logical.contiguous(format), w = weight->contiguous(), b = bias->contiguous(),
+    const Tensor x = logical.contiguous(static_cast<int64_t>(format)), w = weight->contiguous(), b = bias->contiguous(),
         m = mean.contiguous(), v = var.contiguous();
     Tensor y = output(input, logical.shape(), scale, zp);
     y = y.as_strided(logical.shape(), get_channels_last_strides(logical.shape()), 0);
-    y.impl()->set_quantizer(make_per_tensor_affine_quantizer(scale, zp, input.dtype()));
-    Tensor alpha = Tensor::empty({channels}, DType::Float32, input.device());
-    Tensor beta = Tensor::empty({channels}, DType::Float32, input.device());
+    Tensor alpha, beta;
+#ifndef TP_QUANT_CUDA
+    struct Coefficients {
+        std::array<Tensor,4> parameters;
+        std::array<uint32_t,4> versions{};
+        double input_scale = 0., output_scale = 0., epsilon = 0.;
+        Tensor alpha, beta;
+    };
+    thread_local std::array<Coefficients,16> cache;
+    thread_local size_t next = 0;
+    const std::array<Tensor,4> parameters{*weight, *bias, mean, var};
+    std::array<uint32_t,4> versions{};
+    bool cacheable = channels <= 65536;
+    for (int i = 0; i < 4; ++i) {
+        cacheable = cacheable && parameters[i].impl()->version_counter().is_enabled();
+        if (parameters[i].impl()->version_counter().is_enabled()) versions[i] = parameters[i]._version();
+    }
+    if (cacheable) for (const auto& entry : cache) {
+        bool match = entry.alpha.defined() && entry.versions == versions &&
+            entry.input_scale == quantized::q_scale(input) && entry.output_scale == scale && entry.epsilon == eps;
+        for (int i = 0; i < 4; ++i) match = match && entry.parameters[i].impl() == parameters[i].impl();
+        if (match) { alpha = entry.alpha; beta = entry.beta; break; }
+    }
+#endif
+    const bool compute_coefficients = !alpha.defined();
+    if (compute_coefficients) {
+        alpha = Tensor::empty({channels}, DType::Float32, input.device());
+        beta = Tensor::empty({channels}, DType::Float32, input.device());
+    }
     auto* ap = alpha.data_ptr<float>(); auto* bp = beta.data_ptr<float>();
     const auto *wp = w.data_ptr<float>(), *biasp = b.data_ptr<float>(),
         *mp = m.data_ptr<float>(), *vp = v.data_ptr<float>();
     const double xs = quantized::q_scale(input);
     const int64_t xz = quantized::q_zero_point(input);
-    apply(channels, [=] TP_QN_DEVICE (int64_t c) {
+    if (compute_coefficients) apply(channels, [=] TP_QN_DEVICE (int64_t c) {
         const float inv = 1. / ::sqrt(vp[c] + static_cast<float>(eps));
         ap[c] = inv * wp[c] * (xs / scale);
         bp[c] = (biasp[c] - mp[c] * inv * wp[c]) / scale;
     });
+#ifndef TP_QUANT_CUDA
+    if (compute_coefficients && cacheable) cache[next++ % cache.size()] =
+        {parameters, versions, xs, scale, eps, alpha, beta};
+#endif
     codes(input.dtype(), [&]<class T>() {
         const auto* src = x.data_ptr<T>(); auto* dst = y.data_ptr<T>();
 #ifdef TP_QUANT_CUDA
-        apply(y.numel(), [=] TP_QN_DEVICE (int64_t i) {
-            const int64_t c = i % channels;
-            float value = ap[c] * static_cast<float>(static_cast<int64_t>(src[i]) - xz) + bp[c];
-            if (relu) value = ::fmaxf(value, 0.f);
-            dst[i] = encode<T>(value, 1.f, zp);
-        });
+        apply(y.numel(), BatchNormCodes<T>{src,dst,ap,bp,channels,xz,zp,relu});
 #else
         const int64_t rows = y.numel() / channels;
         parallel::parallel_for(0, rows, std::max<int64_t>(1, 32768 / channels), [&](int64_t first, int64_t last) {
-            for (int64_t row = first; row < last; ++row)
-                cpu::quantized_batch_norm_stub(DeviceType::CPU, src+row*channels, dst+row*channels,
-                    channels, input.dtype(), ap, bp, xz, zp, relu);
+            cpu::quantized_batch_norm_stub(DeviceType::CPU, src+first*channels, dst+first*channels,
+                channels, input.dtype(), ap, bp, xz, zp, relu,last-first);
         });
 #endif
     });

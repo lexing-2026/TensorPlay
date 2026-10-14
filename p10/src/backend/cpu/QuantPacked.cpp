@@ -64,9 +64,27 @@ Tensor activation_cpu(const Tensor& input, double scale, int64_t zp, Activation 
     const float input_scale = static_cast<float>(quantized::q_scale(input));
     const int64_t input_zp = quantized::q_zero_point(input);
     const float inverse_scale = 1.f / static_cast<float>(scale);
-    const Tensor x = input.contiguous();
-    Tensor out = Tensor::empty(input.shape(), input.dtype(), input.device());
-    if (input.dtype() == DType::QInt8 || input.dtype() == DType::QUInt8) {
+    const auto format = quant::activation_format(input);
+    const Tensor x = input.contiguous(static_cast<int64_t>(format));
+    Tensor out = quant::activation_output(input, format);
+    if (fn.op == 7 && scale == quantized::q_scale(input) && zp == input_zp) {
+        auto clip = [&]<class T>() {
+            const int64_t lo = encode<T>(fn.slope, inverse_scale, zp);
+            const int64_t hi = encode<T>(fn.alpha, inverse_scale, zp);
+            const auto* src = x.data_ptr<T>();
+            auto* dst = out.data_ptr<T>();
+            parallel::parallel_for(0, input.numel(), 32768, [&](int64_t begin, int64_t end) {
+                cpu::quantized_clip_stub(DeviceType::CPU, src + begin, dst + begin,
+                                         end - begin, input.dtype(), lo, hi);
+            });
+        };
+        switch (input.dtype()) {
+            case DType::QInt8: clip.template operator()<int8_t>(); break;
+            case DType::QUInt8: clip.template operator()<uint8_t>(); break;
+            case DType::QInt32: clip.template operator()<int32_t>(); break;
+            default: TP_THROW(TypeError, "Clipping requires quantized integer input");
+        }
+    } else if (input.dtype() == DType::QInt8 || input.dtype() == DType::QUInt8) {
         const auto& cached = activation_table(input, inverse_scale, zp, fn);
         const auto* src = static_cast<const uint8_t*>(x.data_ptr());
         auto* dst = static_cast<uint8_t*>(out.data_ptr());
@@ -78,6 +96,15 @@ Tensor activation_cpu(const Tensor& input, double scale, int64_t zp, Activation 
         const auto* src = x.data_ptr<int32_t>();
         auto* dst = out.data_ptr<int32_t>();
         parallel::parallel_for(0, input.numel(), 32768, [&](int64_t begin, int64_t end) {
+            if (fn.op == 4 || fn.op == 5) {
+                if (fn.op == 4)
+                    cpu::quantized_sigmoid_stub(DeviceType::CPU, src + begin, dst + begin,
+                        end - begin, input_scale, input_zp, scale, zp, input.impl()->is_contiguous_in(format));
+                else
+                    cpu::quantized_tanh_stub(DeviceType::CPU, src + begin, dst + begin,
+                        end - begin, input_scale, input_zp, scale, zp, input.impl()->is_contiguous_in(format));
+                return;
+            }
             for (int64_t i = begin; i < end; ++i)
                 dst[i] = encode<int32_t>(fn(static_cast<float>(static_cast<int64_t>(src[i]) - input_zp) * input_scale), inverse_scale, zp);
         });
@@ -89,8 +116,9 @@ Tensor activation_cpu(const Tensor& input, double scale, int64_t zp, Activation 
 Tensor rectify_cpu(const Tensor& input, bool clamp_six) {
     const double scale = quantized::q_scale(input);
     const int64_t zp = quantized::q_zero_point(input);
-    const Tensor x = input.contiguous();
-    Tensor out = Tensor::empty(input.shape(), input.dtype(), input.device());
+    const auto format = quant::activation_format(input);
+    const Tensor x = input.contiguous(static_cast<int64_t>(format));
+    Tensor out = quant::activation_output(input, format);
     auto apply = [&]<class T>() {
         const T hi = clamp_six ? encode<T>(6.f, 1.f / static_cast<float>(scale), zp) : std::numeric_limits<T>::max();
         const auto* src = x.data_ptr<T>(); auto* dst = out.data_ptr<T>();
@@ -113,10 +141,29 @@ Tensor relu6_cpu(const Tensor& input) { return rectify_cpu(input, true); }
 } // namespace tensorplay::quant
 
 namespace tensorplay::cpu {
+DEFINE_DISPATCH(quantized_subbyte_pack_stub);
+DEFINE_DISPATCH(quantized_subbyte_unpack_stub);
+DEFINE_DISPATCH(quantized_unsigned_pack_stub);
+DEFINE_DISPATCH(quantized_spatial_mean_stub);
+DEFINE_DISPATCH(quantized_dynamic_dot_stub);
+DEFINE_DISPATCH(quantized_dynamic_block_stub);
+DEFINE_DISPATCH(quantized_linear_epilogue_stub);
+DEFINE_DISPATCH(quantized_recurrent_step_stub);
+DEFINE_DISPATCH(quantized_int4_pack_stub);
+DEFINE_DISPATCH(quantized_int4_mm_stub);
 DEFINE_DISPATCH(quantized_batch_norm_stub);
 DEFINE_DISPATCH(quantized_bilinear_stub);
 DEFINE_DISPATCH(quantized_clip_stub);
+DEFINE_DISPATCH(quantized_prelu_stub);
+DEFINE_DISPATCH(quantized_float_prelu_stub);
+DEFINE_DISPATCH(quantized_sigmoid_stub);
+DEFINE_DISPATCH(quantized_tanh_stub);
+DEFINE_DISPATCH(quantized_moment_stub);
+DEFINE_DISPATCH(quantized_pool_stub);
 DEFINE_DISPATCH(quantized_lookup_stub);
+DEFINE_DISPATCH(quantized_softmax_stub);
+DEFINE_DISPATCH(quantized_rowwise_pack_stub);
+DEFINE_DISPATCH(quantized_cat_rows_stub);
 DEFINE_DISPATCH(quantized_binary_stub);
 DEFINE_DISPATCH(quantized_embedding_stub);
 DEFINE_DISPATCH(quantized_fp16_linear_stub);
@@ -131,26 +178,32 @@ int64_t dot_scalar(const X* x, const int8_t* w, int64_t K) {
 
 #ifdef USE_ONEDNN
 struct IntegerProduct {
-    dnnl::memory::desc src, weight, dst;
+    dnnl::memory::desc src, weight, dst,logical_weight;
     dnnl::matmul product;
+    dnnl::memory weight_memory;
+    Tensor weight_source;
+    uint32_t weight_version=0;
     dnnl::memory::desc scratch_desc;
     std::vector<uint8_t> scratch;
     IntegerProduct(const std::array<int64_t, 6>& key) {
         using DT = dnnl::memory::data_type;
         src = dnnl::memory::desc({key[0], key[2]}, key[4] ? DT::u8 : DT::s8, {key[2], 1});
-        weight = dnnl::memory::desc({key[2], key[1]}, DT::s8, {1, key[3]});
+        logical_weight = dnnl::memory::desc({key[2], key[1]}, DT::s8, {1, key[3]});
+        weight = dnnl::memory::desc({key[2], key[1]}, DT::s8,dnnl::memory::format_tag::any);
         dst = dnnl::memory::desc({key[0], key[1]}, DT::s32, {key[1], 1});
         dnnl::primitive_attr attr;
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
         const auto desc = dnnl::matmul::primitive_desc(OneDNNContext::get_engine(), src, weight, dst, attr);
         product = dnnl::matmul(desc);
+        weight=desc.weights_desc();
+        weight_memory=dnnl::memory(weight,OneDNNContext::get_engine());
         scratch_desc = desc.scratchpad_desc();
         scratch.resize(scratch_desc.get_size());
     }
 };
 
 template<class X>
-bool linear_integer_product(const X* x, const int8_t* w, const int64_t* offsets,
+bool linear_integer_product(const X* x, const Tensor& packed, const int64_t* offsets,
         const float* scales, const int64_t* zps, const float* bias,
         const quant::PackedGeometry& g, Tensor& out, double xs, int64_t xz,
         double ys, int64_t yz, bool relu, bool output_float) {
@@ -174,9 +227,18 @@ bool linear_integer_product(const X* x, const int8_t* w, const int64_t* offsets,
     Tensor acc = Tensor::empty({g.rows, g.outputs}, DType::Int32, out.device());
     auto& engine = OneDNNContext::get_engine();
     auto& stream = OneDNNContext::get_stream();
+    const bool cacheable=packed.impl()->version_counter().is_enabled();
+    const uint32_t version=cacheable ? packed._version() : 0;
+    if (!cacheable || !kernel.weight_source.defined() || kernel.weight_source.impl()!=packed.impl()
+        || kernel.weight_version!=version) {
+        auto original=dnnl::memory(kernel.logical_weight,engine,const_cast<int8_t*>(packed.data_ptr<int8_t>()));
+        dnnl::reorder(original,kernel.weight_memory).execute(stream,original,kernel.weight_memory);
+        kernel.weight_source=packed;
+        kernel.weight_version=version;
+    }
     kernel.product.execute(stream, {
         {DNNL_ARG_SRC, dnnl::memory(kernel.src, engine, const_cast<X*>(x))},
-        {DNNL_ARG_WEIGHTS, dnnl::memory(kernel.weight, engine, const_cast<int8_t*>(w))},
+        {DNNL_ARG_WEIGHTS, kernel.weight_memory},
         {DNNL_ARG_DST, dnnl::memory(kernel.dst, engine, acc.data_ptr())},
         {DNNL_ARG_SCRATCHPAD, dnnl::memory(kernel.scratch_desc, engine, kernel.scratch.data())}});
     stream.wait();
@@ -185,18 +247,14 @@ bool linear_integer_product(const X* x, const int8_t* w, const int64_t* offsets,
         for (int64_t row = begin; row < end; ++row) {
             int64_t sum = 0;
             for (int64_t k = 0; k < g.K; ++k) sum += x[row * g.K + k];
-            for (int64_t n = 0; n < g.outputs; ++n) {
-                const int64_t index = row * g.outputs + n;
-                const int64_t value_i = static_cast<int64_t>(raw[index]) - xz * offsets[n] - zps[n] * sum + g.K * xz * zps[n];
-                double value = static_cast<double>(value_i) * xs * scales[n] + (bias ? bias[n] : 0.);
-                value = quant::packed_activation(value, index, g);
-                if (relu) value = std::max(value, 0.);
-                if (output_float) out.data_ptr<float>()[index] = static_cast<float>(value);
-                else {
-                    constexpr int64_t lo = std::is_same_v<X, uint8_t> ? 0 : -128;
-                    out.data_ptr<X>()[index] = static_cast<X>(std::clamp(std::nearbyint(value / ys) + yz, static_cast<double>(lo), static_cast<double>(lo + 255)));
-                }
-            }
+            const int64_t index = row * g.outputs;
+            void* destination = output_float
+                ? static_cast<void*>(out.data_ptr<float>() + index)
+                : static_cast<void*>(out.data_ptr<X>() + index);
+            quantized_linear_epilogue_stub(DeviceType::CPU, raw + index, offsets, scales, zps,
+                bias, destination, std::is_same_v<X, uint8_t> ? DType::QUInt8 : DType::QInt8,
+                g.outputs, sum, g.K, xz, xs, ys, yz, relu, output_float,
+                g.activation, g.negative_slope);
         }
     });
     return true;
@@ -266,23 +324,26 @@ template<class X>
 void linear_vnni(const X* x, const int8_t* w, const int64_t* offsets,
         const float* scales, const int64_t* zps, const float* bias,
         const quant::PackedGeometry& g, Tensor& out, double xs, int64_t xz,
-        double ys, int64_t yz, bool relu, bool output_float) {
+        double ys, int64_t yz, bool relu, bool output_float,bool saturating) {
     const int64_t row_tiles = (g.rows + 1) / 2, column_tiles = (g.outputs + 63) / 64;
+    auto* dst_float=output_float ? out.data_ptr<float>() : nullptr;
+    auto* dst_codes=output_float ? nullptr : out.data_ptr<X>();
     auto store = [&](int64_t row, int64_t n, int64_t dot, int64_t sum) {
         const int64_t shift = std::is_same_v<X, int8_t> ? 128 : 0;
         const int64_t acc = dot - (xz + shift) * offsets[n] - zps[n] * sum + g.K * xz * zps[n];
-        double value = static_cast<double>(acc) * xs * scales[n] + (bias ? bias[n] : 0.);
+        double value = quant::packed_real_value(acc,xs,scales[n],bias ? bias[n] : 0.f,output_float);
         const int64_t index = row * g.outputs + n;
         value = quant::packed_activation(value, index, g);
         if (relu) value = std::max(value, 0.);
-        if (output_float) out.data_ptr<float>()[index] = static_cast<float>(value);
+        if (output_float) dst_float[index] = static_cast<float>(value);
         else {
             constexpr int64_t lo = std::is_same_v<X, uint8_t> ? 0 : -128;
-            out.data_ptr<X>()[index] = static_cast<X>(std::clamp(std::nearbyint(value / ys) + yz, static_cast<double>(lo), static_cast<double>(lo + 255)));
+            dst_codes[index] = static_cast<X>(std::clamp(std::nearbyint(value / ys) + yz, static_cast<double>(lo), static_cast<double>(lo + 255)));
         }
     };
     const int64_t tasks = row_tiles * column_tiles;
-    const int64_t grain = g.rows * g.outputs * g.K < 1048576 ? tasks : 1;
+    const int64_t parallel_work = output_float ? 131072 : 1048576;
+    const int64_t grain = g.rows * g.outputs * g.K < parallel_work ? tasks : 1;
     parallel::parallel_for(0, tasks, grain, [&](int64_t begin, int64_t end) {
         for (int64_t task = begin; task < end; ++task) {
             const int64_t row = (task / column_tiles) * 2;
@@ -292,7 +353,13 @@ void linear_vnni(const X* x, const int8_t* w, const int64_t* offsets,
             for (int r = 0; r < rows; ++r) for (int64_t k = 0; k < g.K; ++k) sums[r] += x[(row + r) * g.K + k];
             for (int64_t n = n0; n < n1; n += 4) {
                 const int64_t columns = std::min<int64_t>(4, n1 - n);
-                if (rows == 2) {
+                if (saturating) {
+                    int64_t totals[2][4];
+                    quantized_dynamic_block_stub(DeviceType::CPU,reinterpret_cast<const uint8_t*>(x+row*g.K),
+                        w+n*g.padded_K,&totals[0][0],g.K,g.padded_K,rows,columns);
+                    for (int r=0;r<rows;++r) for (int c=0;c<columns;++c)
+                        store(row+r,n+c,totals[r][c],sums[r]);
+                } else if (rows == 2) {
                     int64_t totals[2][4];
                     block_vnni<X,2>(x + row * g.K, w + n * g.padded_K, g.K, g.padded_K, columns, totals);
                     for (int r = 0; r < 2; ++r) for (int c = 0; c < columns; ++c) store(row + r, n + c, totals[r][c], sums[r]);
@@ -331,17 +398,24 @@ void run(const Tensor& input, const Tensor& packed, const Tensor& offsets,
     const float* bp = bias ? bias->data_ptr<float>() : nullptr;
     const int64_t xz = quantized::q_zero_point(input);
     const double xs = quantized::q_scale(input);
+    bool saturating=false;
+    if constexpr (std::is_same_v<X,uint8_t>) {
+        if (g.linear && output_float)
+            for (int64_t i=0;i<input.numel();++i) if (xp[i]>127) { saturating=true; break; }
+    }
 #ifdef USE_ONEDNN
-    if (linear_integer_product(xp, wp, col, sc, wz, bp, g, out, xs, xz, ys, yz, relu, output_float)) return;
+    if (!saturating && linear_integer_product(xp, packed, col, sc, wz, bp, g, out, xs, xz, ys, yz, relu, output_float)) return;
 #endif
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
     static const bool vnni = __builtin_cpu_supports("avxvnni");
-    if (g.linear && vnni) {
-        linear_vnni(xp, wp, col, sc, wz, bp, g, out, xs, xz, ys, yz, relu, output_float);
+    if (g.linear && (vnni || saturating)) {
+        linear_vnni(xp, wp, col, sc, wz, bp, g, out, xs, xz, ys, yz, relu, output_float,saturating);
         return;
     }
 #endif
     const int64_t n_per_group = g.outputs / g.groups;
+    auto* dst_float=output_float ? out.data_ptr<float>() : nullptr;
+    auto* dst_codes=output_float ? nullptr : out.data_ptr<X>();
     const int64_t workers = std::max<int64_t>(1, parallel::get_num_threads());
     const int64_t tile_rows = g.linear
         ? std::max<int64_t>(1, std::min<int64_t>(32, (g.rows + workers - 1) / workers))
@@ -375,16 +449,19 @@ void run(const Tensor& input, const Tensor& packed, const Tensor& offsets,
                 int64_t row_sum = 0;
                 for (int64_t k = 0; k < g.K; ++k) row_sum += xr[k];
                 for (int64_t n = group * n_per_group; n < (group + 1) * n_per_group; ++n) {
-                    const int64_t acc = dot(xr, wp + n * g.padded_K, g.K) - xz * col[n] - wz[n] * row_sum + g.K * xz * wz[n];
-                    double value = static_cast<double>(acc) * xs * sc[n] + (bp ? bp[n] : 0.);
+                    const int64_t raw = saturating
+                        ? quantized_dynamic_dot_stub(DeviceType::CPU,reinterpret_cast<const uint8_t*>(xr),wp+n*g.padded_K,g.K)
+                        : dot(xr,wp+n*g.padded_K,g.K);
+                    const int64_t acc = raw - xz * col[n] - wz[n] * row_sum + g.K * xz * wz[n];
+                    double value = quant::packed_real_value(acc,xs,sc[n],bp ? bp[n] : 0.f,output_float);
                     const int64_t index = g.linear ? row * g.outputs + n : ((row / g.spatial) * g.outputs + n) * g.spatial + row % g.spatial;
                     value = quant::packed_activation(value, index, g);
                     if (relu) value = std::max(value, 0.);
-                    if (output_float) out.data_ptr<float>()[index] = static_cast<float>(value);
+                    if (output_float) dst_float[index] = static_cast<float>(value);
                     else {
                         constexpr int64_t lo = std::is_same_v<X, uint8_t> ? 0 : -128;
                         const double code = std::nearbyint(value / ys) + yz;
-                        out.data_ptr<X>()[index] = static_cast<X>(std::clamp(code, static_cast<double>(lo), static_cast<double>(lo + 255)));
+                        dst_codes[index] = static_cast<X>(std::clamp(code, static_cast<double>(lo), static_cast<double>(lo + 255)));
                     }
                 }
             }
@@ -440,7 +517,7 @@ Tensor _quantized_packed_run_cpu(
     if (output_float) return out;
     Tensor result = quantized::make_qtensor(out, make_per_tensor_affine_quantizer(output_scale, output_zero_point, input.dtype()), input.dtype());
     if (residual && result.numel()) {
-        Tensor destination = residual->contiguous(MemoryFormat::ChannelsLast);
+        Tensor destination = residual->contiguous(static_cast<int64_t>(MemoryFormat::ChannelsLast));
         destination.impl()->set_quantizer(result.impl()->quantizer());
         destination.copy_(result);
         return destination;

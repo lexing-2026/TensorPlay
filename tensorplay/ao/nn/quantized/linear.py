@@ -70,6 +70,16 @@ class QuantizedLinear(QuantizedState, nn.Module):
             raise TypeError('Quantized linear requires signed or unsigned 8-bit quantized input')
         return self._packed_params.run(x, self.out_scale, self.out_zero_point, relu=self._FUSED_RELU)
 
+    @classmethod
+    def from_reference(cls, ref_qlinear, output_scale, output_zero_point):
+        """Build a native quantized linear from a reference quantized module."""
+        qlinear = cls(ref_qlinear.in_features, ref_qlinear.out_features)
+        qweight = ref_qlinear.get_quantized_weight()
+        qlinear.set_weight_bias(qweight, ref_qlinear.bias)
+        qlinear.out_scale = float(output_scale)
+        qlinear.out_zero_point = int(output_zero_point)
+        return qlinear
+
     def extra_repr(self):
         return f'in_features={self.in_features}, out_features={self.out_features}, scale={self.out_scale}, zero_point={self.out_zero_point}'
 

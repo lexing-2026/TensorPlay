@@ -132,7 +132,7 @@ class TestSparseLegacyMatmuls(unittest.TestCase):
     def test_spmm(self):
         s, a = self._ab()
         b = tp.randn(3, 3)
-        self.assertTrue(_same(tp.spmm(s, b).numpy(), (a @ b).numpy()))
+        self.assertTrue(_same(tp.spmm(s, b).to_dense().numpy(), (a @ b).numpy()))
 
     def test_dsmm(self):
         s, a = self._ab()
@@ -149,7 +149,7 @@ class TestSparseLegacyMatmuls(unittest.TestCase):
         b = tp.randn(3, 3)
         want = 0.5 * a + 2.0 * (a @ b)
         self.assertTrue(_same(tp.saddmm(s, s, b, beta=0.5, alpha=2.0).numpy(), want.numpy()))
-        self.assertTrue(_same(tp.saddmm(s, s, b, beta=0).numpy(), (a @ b).numpy()))
+        self.assertTrue(_same(tp.saddmm(s, s, b, beta=0).to_dense().numpy(), (a @ b).numpy()))
 
 
 class TestAutocastState(unittest.TestCase):
