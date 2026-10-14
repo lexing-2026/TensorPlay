@@ -5313,6 +5313,12 @@
 - func: _quantize_int4_rowwise(Tensor self, float eps) -> (Tensor, Tensor)
   variants: function
 
+- func: _quantize_int2_rowwise(Tensor self, float eps) -> (Tensor, Tensor)
+  variants: function
+
+- func: _quantize_binary_rowwise(Tensor self, float eps) -> (Tensor, Tensor)
+  variants: function
+
 - func: _int8_mm_rescale(Tensor out, Tensor row_scale, Tensor col_scale) -> Tensor
   variants: function
 

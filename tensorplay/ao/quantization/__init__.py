@@ -173,6 +173,17 @@ from .int8_dyn_act_int4_weight import (
     int8_dynamic_activation_int4_weight as int8_dynamic_activation_int4_weight,
 )
 
+from .int8_dyn_act_int2_weight import (
+    Int8DynActInt2WeightLinear as Int8DynActInt2WeightLinear,
+    Int8DynamicActivationInt2WeightConfig as Int8DynamicActivationInt2WeightConfig,
+    int8_dynamic_activation_int2_weight as int8_dynamic_activation_int2_weight,
+)
+from .int8_dyn_act_int1_weight import (
+    Int8DynActBinaryWeightLinear as Int8DynActBinaryWeightLinear,
+    Int8DynamicActivationBinaryWeightConfig as Int8DynamicActivationBinaryWeightConfig,
+    int8_dynamic_activation_binary_weight as int8_dynamic_activation_binary_weight,
+)
+
 from .float8 import (
     Float8DynamicActivationFloat8WeightInferenceConfig as Float8DynamicActivationFloat8WeightInferenceConfig,
     Float8DynamicActivationInferenceLinear as Float8DynamicActivationInferenceLinear,
@@ -284,6 +295,12 @@ __all__ += [
     "Int8DynActInt4WeightLinear",
     "Int8DynamicActivationInt4WeightConfig",
     "int8_dynamic_activation_int4_weight",
+    "Int8DynActInt2WeightLinear",
+    "Int8DynamicActivationInt2WeightConfig",
+    "int8_dynamic_activation_int2_weight",
+    "Int8DynActBinaryWeightLinear",
+    "Int8DynamicActivationBinaryWeightConfig",
+    "int8_dynamic_activation_binary_weight",
     "AWQConfig",
     "AWQObserver",
     "AWQObservedLinear",
