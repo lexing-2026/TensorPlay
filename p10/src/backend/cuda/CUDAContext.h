@@ -8,6 +8,7 @@
 #include <cublas_v2.h>
 #include <cublasLt.h>
 #include <cusolverDn.h>
+#include <cusolverSp.h>
 #include <cuda_runtime.h>
 
 namespace tensorplay {
@@ -21,6 +22,7 @@ public:
     static cublasHandle_t getCublasHandle();
     static cublasLtHandle_t getCublasLtHandle();
     static cusolverDnHandle_t getCusolverDnHandle();
+    static cusolverSpHandle_t getCusolverSpHandle();
     // Creates every lazy library handle for the current device up front.
     // Handle creation performs internal allocations, which are illegal once
     // CUDAGraph::capture_begin calls this before cudaStreamBeginCapture.

@@ -1,3 +1,4 @@
+#include "QuantTensorOperators.h"
 // High-throughput indexing kernels.
 #include "Tensor.h"
 #include "Dispatcher.h"
@@ -335,6 +336,8 @@ __global__ void nonzero_write_indices(int64_t count, int64_t ndim,
 // ---------------------------------------------------------------------------
 
 Tensor index_select_cuda(const Tensor& self, int64_t dim, const Tensor& index) {
+    if (isQuantizedType(self.dtype())) { quantized::q_scale(self); return quantized::with_quantizer(index_select_cuda(quantized::storage_view(self), dim, index), self); }
+
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
     if (index.dim() != 1) TP_THROW(IndexError, "index_select(): index should be a vector");

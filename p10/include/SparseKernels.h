@@ -31,11 +31,21 @@ int64_t sparse_nnz_cpu(const Tensor& self);
 Tensor to_sparse_coo_cpu(const Tensor& self);
 Tensor to_sparse_coo_cpu_sparse_dim(const Tensor& self, int64_t sparse_dim);
 Tensor to_sparse_csr_cpu(const Tensor& self);
+// Expands a 2-D CSC/BSR/BSC tensor into canonical CSR (blocked layouts are
+// unrolled to scalar entries and re-sorted row-major).
+Tensor compressed_to_csr_cpu(const Tensor& self);
 // sparse @ dense for 2-D COO/CSR `self` (SpMM / SpMM-dense).
 Tensor sparse_mm_cpu(const Tensor& self, const Tensor& dense);
+// Dense-seeded sparse @ dense: out = beta * self + alpha * (mat1 @ mat2)
+// with a 2-D sparse COO/CSR `mat1` and dense `self`/`mat2`.
+Tensor _sparse_addmm_cpu(const Tensor& self, const Tensor& mat1,
+                         const Tensor& mat2, const Scalar& beta,
+                         const Scalar& alpha);
 // COO @ COO elementwise product on matching coordinates and coordinate-union
 // addition; both require same dtype/shape and non-hybrid values.
 Tensor sparse_mul_cpu(const Tensor& self, const Tensor& other);
+// Sparse scalar product: keeps the sparsity pattern and scales the values.
+Tensor sparse_mul_scalar_cpu(const Tensor& self, const Scalar& other);
 Tensor sparse_add_cpu(const Tensor& self, const Tensor& other);
 // coalesced COO over the kept dims (duplicates folded); all sparse dims ->
 // dense tensor.  ``dtype`` converts the input first (accumulation dtype).
@@ -80,6 +90,10 @@ Tensor native_norm_cpu(const Tensor& self, const Scalar& p);
 Tensor native_norm_dim_cpu(const Tensor& self, const std::optional<Scalar>& p,
                            const std::vector<int64_t>& dims, bool keepdim,
                            std::optional<DType> dtype);
+// Sparse CSR linear solve on CPU: left=True solves A X = B, left=False
+// solves X A = B (B dense, 1-D or 2-D).  Native sparse LU with partial
+// pivoting; the matrix is never densified.
+Tensor _spsolve_cpu(const Tensor& A, const Tensor& B, bool left);
 
 } // namespace cpu
 
@@ -103,6 +117,29 @@ Tensor to_sparse_coo_cuda(const Tensor& self);
 Tensor to_sparse_coo_cuda_sparse_dim(const Tensor& self, int64_t sparse_dim);
 Tensor to_sparse_csr_cuda(const Tensor& self);
 Tensor sparse_mm_cuda(const Tensor& self, const Tensor& dense);
+// Dense-seeded sparse @ dense on CUDA (see _sparse_addmm_cpu for semantics).
+Tensor _sparse_addmm_cuda(const Tensor& self, const Tensor& mat1,
+                          const Tensor& mat2, const Scalar& beta,
+                          const Scalar& alpha);
+// Sparse CSR sampled SpMM on CUDA: out = alpha * (mat1 @ mat2)[pattern] +
+// beta * out, evaluated only on the stored entries of `self`/`out`.
+Tensor& sparse_sampled_addmm_out_sparse_csr_cuda(
+    const Tensor& self, const Tensor& mat1, const Tensor& mat2,
+    const Scalar& beta, const Scalar& alpha, Tensor& result);
+Tensor sparse_sampled_addmm_sparse_csr_cuda(
+    const Tensor& self, const Tensor& mat1, const Tensor& mat2,
+    const Scalar& beta, const Scalar& alpha);
+// Sparse CSR SpMM with row reduction (sum/mean/amax/amin) on CUDA and its
+// backward; see the CPU entry points for semantics.
+std::tuple<Tensor, Tensor> _sparse_mm_reduce_impl_sparse_csr_cuda(
+    const Tensor& self, const Tensor& other, const std::string& reduce);
+std::tuple<Tensor, Tensor> _sparse_mm_reduce_impl_backward_sparse_csr_cuda(
+    const Tensor& self, const Tensor& grad_out, const Tensor& other,
+    const std::string& reduce, const Tensor& arg_out,
+    const std::vector<bool>& output_mask);
+// Sparse CSR linear solve on CUDA: left=True solves A X = B, left=False
+// solves X A = B (B dense, 1-D or 2-D).
+Tensor _spsolve_cuda(const Tensor& A, const Tensor& B, bool left);
 Tensor sparse_sum_cuda(const Tensor& self, const std::optional<std::vector<int64_t>>& dim,
                        std::optional<DType> dtype);
 Tensor spdiags_cuda(const Tensor& diagonals, const Tensor& offsets,
@@ -110,6 +147,10 @@ Tensor spdiags_cuda(const Tensor& diagonals, const Tensor& offsets,
                     std::optional<int64_t> layout);
 
 Tensor sparse_mul_cuda(const Tensor& self, const Tensor& other);
+// Expands a 2-D CSC/BSR/BSC tensor into canonical CSR on device.
+Tensor compressed_to_csr_cuda(const Tensor& self);
+// Sparse scalar product: keeps the sparsity pattern and scales the values.
+Tensor sparse_mul_scalar_cuda(const Tensor& self, const Scalar& other);
 Tensor sparse_add_cuda(const Tensor& self, const Tensor& other);
 
 // Sparse COO softmax family.  The sparse-dim variant reduces over pools of

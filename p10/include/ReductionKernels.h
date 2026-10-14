@@ -43,6 +43,14 @@ DECLARE_DISPATCH(sum_fn, sum_stub)
 using sum_dim_fn = Tensor (*)(const Tensor&, const std::vector<int64_t>&, bool, DType);
 DECLARE_DISPATCH(sum_dim_fn, sum_dim_stub)
 
+// Fused dual-input reductions: sum((a-b)^2) and sum(|a-b|) in one pass over
+// both inputs, avoiding the intermediate difference/power tensors.
+using sum_squared_error_fn = Tensor (*)(const Tensor&, const Tensor&, const std::vector<int64_t>&, bool);
+DECLARE_DISPATCH(sum_squared_error_fn, sum_squared_error_stub)
+
+using sum_abs_error_fn = Tensor (*)(const Tensor&, const Tensor&, const std::vector<int64_t>&, bool);
+DECLARE_DISPATCH(sum_abs_error_fn, sum_abs_error_stub)
+
 using max_fn = Tensor (*)(const Tensor&);
 DECLARE_DISPATCH(max_fn, max_stub)
 

@@ -30,6 +30,8 @@ size
 deterministic
 dlpack
 complex_numbers
+quantum
+snn
 autograd
 nn
 nn.functional

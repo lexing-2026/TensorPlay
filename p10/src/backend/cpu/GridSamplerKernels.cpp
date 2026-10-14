@@ -1,3 +1,4 @@
+#include "QuantTensorOperators.h"
 // grid_sampler_2d / grid_sampler_3d CPU kernels.
 //
 //   interpolation_mode: 0=Bilinear 1=Nearest 2=Bicubic(2d only)
@@ -530,6 +531,8 @@ static std::tuple<Tensor, Tensor> grid_sampler_3d_backward_cpu_impl(
 Tensor grid_sampler_2d_cpu(const Tensor& input, const Tensor& grid,
                            int64_t interpolation_mode, int64_t padding_mode,
                            bool align_corners) {
+    if (isQuantizedType(input.dtype())) return quantized::grid_sample(input, grid, interpolation_mode, padding_mode, align_corners);
+
     if (input.dim() != 4 || grid.dim() != 4)
         TP_THROW(RuntimeError, "grid_sampler_2d: expected 4D input and grid");
     if (input.size(0) != grid.size(0) || grid.size(3) != 2)
