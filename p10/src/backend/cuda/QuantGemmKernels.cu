@@ -316,15 +316,16 @@ __global__ void int4_dequantize_kernel(
 }
 
 // Pack an int32 code tensor [N, K] (values 0..15) into [N, K/2] uint8 with
-// the even-k code in the low nibble and the odd-k code in the high nibble,
-// matching the CPU packing layout used by the dequant+cuBLAS path.
+// the odd-k code in the low nibble and the even-k code in the high nibble,
+// matching the nibble order expected by the m16n8k16 B-layout repacking
+// kernel (and the direct tensor-core GEMM that consumes it).
 __global__ void int4_pack_kernel(const int32_t* __restrict__ codes,
                                  uint8_t* __restrict__ out,
                                  int64_t num_bytes) {
     const int64_t e = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (e >= num_bytes) return;
-    const int32_t low = codes[2 * e] & 0x0f;
-    const int32_t high = codes[2 * e + 1] & 0x0f;
+    const int32_t low = codes[2 * e + 1] & 0x0f;
+    const int32_t high = codes[2 * e] & 0x0f;
     out[e] = static_cast<uint8_t>(low | (high << 4));
 }
 
@@ -866,6 +867,328 @@ __global__ void matrix_to_m16n8k16_Bint4_layout(
 }
 
 // ---------------------------------------------------------------------------
+// Large-tile direct int4 tensor-core GEMM.
+//
+// Consumes the m16n8k16-packed int4 weight (one int32 word per lane per 32-k
+// chunk) and fp16/bf16 activations directly with mma.sync.  Each block
+// computes a 64 x 128 output tile: A is staged in shared memory in an
+// ldmatrix-friendly 16x16-subtile layout, B stays in the packed int32
+// fragment layout, and per-group (scale, zero) dequantization happens in
+// registers right before the MMA.  No dense weight matrix is ever built.
+// ---------------------------------------------------------------------------
+
+struct __align__(16) fp16x2x4_u32 { uint32_t vals[4]; };
+
+__device__ inline fp16x2x4_u32 convert_i4x8_to_fp16x2x4(uint32_t source) {
+  fp16x2x4_u32 result;
+  constexpr int kElements = 8;
+  uint32_t* h = result.vals;
+  uint32_t const source_i4s = source;
+  static constexpr uint32_t immLut = (0xf0 & 0xcc) | 0xaa;
+  static constexpr uint32_t MASK = 0x000f000f;
+  static constexpr uint32_t I4s_TO_FP16s_MAGIC_NUM = 0x64006400;
+
+  uint32_t i4s = source_i4s;
+  asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+               : "=r"(h[0])
+               : "r"(i4s), "n"(MASK), "n"(I4s_TO_FP16s_MAGIC_NUM), "n"(immLut));
+#pragma unroll
+  for (int ii = 1; ii < kElements / 2; ++ii) {
+    i4s >>= 4;
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                 : "=r"(h[ii])
+                 : "r"(i4s), "n"(MASK), "n"(I4s_TO_FP16s_MAGIC_NUM), "n"(immLut));
+  }
+  static constexpr uint32_t FP16_BIAS = 0xC808C808;
+  static constexpr uint32_t FP16_ONE = 0x3C003C00;
+  const __half2 one = __half2half2(__float2half(1.0f));
+  const __half2 bias = __half2half2(__float2half(-1032.0f));
+#pragma unroll
+  for (int ii = 0; ii < kElements / 2; ++ii) {
+    __half2 vv = *reinterpret_cast<__half2*>(&h[ii]);
+    vv = __hfma2(vv, one, bias);
+    h[ii] = *reinterpret_cast<uint32_t*>(&vv);
+  }
+  return result;
+}
+
+// Dequantizes one packed int4 word in registers: the eight nibbles become
+// eight T values (two B fragments for two consecutive m16n8k16 MMAs over a
+// 32-k chunk), scaled and zero-shifted with the per-group quantization info.
+template <typename T>
+struct Int4Convert {
+  static __device__ void convert(uint32_t word, T scale, T zero,
+                                 uint32_t out[4]);
+};
+
+template <>
+struct Int4Convert<tensorplay::BFloat16> {
+  static __device__ void convert(uint32_t word, tensorplay::BFloat16 scale,
+                                 tensorplay::BFloat16 zero, uint32_t out[4]) {
+    bf16x2x4 v = convert_i4x8_to_bf16x2x4(word);
+    __nv_bfloat162 s =
+        __bfloat162bfloat162(*reinterpret_cast<__nv_bfloat16*>(&scale));
+    __nv_bfloat162 z =
+        __bfloat162bfloat162(*reinterpret_cast<__nv_bfloat16*>(&zero));
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      v.vals[i] = __hfma2(v.vals[i], s, z);
+      out[i] = *reinterpret_cast<uint32_t*>(&v.vals[i]);
+    }
+  }
+};
+
+template <>
+struct Int4Convert<tensorplay::Half> {
+  static __device__ void convert(uint32_t word, tensorplay::Half scale,
+                                 tensorplay::Half zero, uint32_t out[4]) {
+    fp16x2x4_u32 v = convert_i4x8_to_fp16x2x4(word);
+    __half2 s = __half2half2(*reinterpret_cast<__half*>(&scale));
+    __half2 z = __half2half2(*reinterpret_cast<__half*>(&zero));
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      __half2 vv = *reinterpret_cast<__half2*>(&v.vals[i]);
+      vv = __hfma2(vv, s, z);
+      v.vals[i] = *reinterpret_cast<uint32_t*>(&vv);
+    }
+    out[0] = v.vals[0];
+    out[1] = v.vals[1];
+    out[2] = v.vals[2];
+    out[3] = v.vals[3];
+  }
+};
+
+template <typename T>
+__device__ __forceinline__ void mma16n8k16(float acc[4], const uint32_t a[4],
+                                           uint32_t b0, uint32_t b1) {
+  // The A fragment is supplied already in mma order (a0: row g, col 2t;
+  // a1: row g+8, col 2t; a2: row g, col 2t+8; a3: row g+8, col 2t+8).
+  if constexpr (std::is_same_v<T, tensorplay::BFloat16>) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+  } else {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+  }
+}
+
+// One threadblock computes a BM x BN = 64 x 128 output tile with 8 warps,
+// each warp handling 32 x 32.  K advances in 32-element chunks.  A and B
+// tiles are fetched with cp.async into triple-buffered shared memory (one
+// sync per iteration), A fragments are loaded manually in the exact
+// m16n8k16 register layout (padded stride -> conflict-free reads), and B
+// stays packed as int32 words, dequantized in registers before each MMA.
+__device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
+  const uint32_t s = __cvta_generic_to_shared(smem);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem));
+}
+
+template <int N>
+__device__ __forceinline__ void cp_async_wait_group() {
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+}
+
+template <typename T>
+__global__ __launch_bounds__(256) void int4pack_tc_mm_kernel(
+    const T* __restrict__ A, const int32_t* __restrict__ B,
+    const T* __restrict__ QSZ, T* __restrict__ C, int M, int N, int K,
+    int group_size) {
+  constexpr int BM = 64;
+  constexpr int BN = 128;
+  constexpr int BK = 32;
+  constexpr int kAStride = 40;  // 32 + 8 padding: conflict-free fragment reads
+
+  __shared__ T a_smem[3][BM][kAStride];
+  __shared__ int32_t b_smem[3][BN / 8][32];
+  __shared__ T s_smem[3][BN][2];
+
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int mBlock = blockIdx.y * BM;
+  const int nBlock = blockIdx.x * BN;
+  const int kTiles = K / BK;
+  const int kSuper = K / BK;  // InnerKTiles == 2 -> kSuperTiles = K / 32
+
+  const int warpRow = warp >> 2;  // 0..1
+  const int warpCol = warp & 3;   // 0..3
+
+  float acc[2][4][4];
+#pragma unroll
+  for (int i = 0; i < 2; ++i)
+    for (int j = 0; j < 4; ++j)
+      for (int k = 0; k < 4; ++k) acc[i][j][k] = 0.0f;
+
+  auto prefetch = [&](int buf, int kTile) {
+    {
+      const int r = tid >> 2;
+      const int cblk = (tid & 3) * 8;
+      const int gm = mBlock + r;
+      if (gm < M) {
+        cp_async16(&a_smem[buf][r][cblk],
+                  &A[(int64_t)gm * K + kTile * BK + cblk]);
+      } else {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) a_smem[buf][r][cblk + i] = T(0);
+      }
+    }
+    // B: 512 int32 = 128 threads x 16 bytes (4 words each)
+    if (tid < 128) {
+      const int ln = tid >> 3;
+      const int ld = (tid & 7) * 4;
+      const int gn = nBlock / 8 + ln;
+      if (gn < N / 8) {
+        cp_async16(&b_smem[buf][ln][ld], &B[((gn * kSuper + kTile) * 32) + ld]);
+      } else {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) b_smem[buf][ln][ld + i] = 0;
+      }
+    }
+    if (tid < BN) {
+      const int ncol = nBlock + tid;
+      const int group = (kTile * BK) / group_size;
+      if (ncol < N) {
+        s_smem[buf][tid][0] = QSZ[((int64_t)group * N + ncol) * 2 + 0];
+        s_smem[buf][tid][1] = QSZ[((int64_t)group * N + ncol) * 2 + 1];
+      } else {
+        s_smem[buf][tid][0] = T(0);
+        s_smem[buf][tid][1] = T(0);
+      }
+    }
+  };
+
+  // Prefetch the first two K-chunks (buffers 0 and 1).
+  if (kTiles > 0) prefetch(0, 0);
+  if (kTiles > 1) prefetch(1, 1);
+
+  for (int kTile = 0; kTile < kTiles; ++kTile) {
+    const int cur = kTile % 3;
+    const int pf = (kTile + 2) % 3;
+
+    if (kTile + 2 < kTiles) prefetch(pf, kTile + 2);
+
+    if (kTile < 2) {
+      cp_async_wait_group<0>();
+    } else {
+      cp_async_wait_group<1>();
+    }
+    __syncthreads();
+
+    // ---- load A fragments (2 m-subtiles x 2 k-subtiles), manual layout ----
+    const int gid = lane >> 2;
+    const int t4 = lane & 3;
+    uint32_t a_reg[2][2][4];
+#pragma unroll
+    for (int ms = 0; ms < 2; ++ms) {
+      const int baseM = warpRow * 32 + ms * 16;
+      const T* row0 = &a_smem[cur][baseM + gid][0];
+      const T* row1 = &a_smem[cur][baseM + gid + 8][0];
+#pragma unroll
+      for (int ks = 0; ks < 2; ++ks) {
+        const int koff = ks * 16 + 2 * t4;
+        a_reg[ms][ks][0] = *reinterpret_cast<const uint32_t*>(row0 + koff);
+        a_reg[ms][ks][1] = *reinterpret_cast<const uint32_t*>(row1 + koff);
+        a_reg[ms][ks][2] =
+            *reinterpret_cast<const uint32_t*>(row0 + koff + 8);
+        a_reg[ms][ks][3] =
+            *reinterpret_cast<const uint32_t*>(row1 + koff + 8);
+      }
+    }
+
+    // ---- load B fragments and dequantize in registers ----
+    uint32_t b_reg[4][4];
+#pragma unroll
+    for (int ns = 0; ns < 4; ++ns) {
+      const int ln = warpCol * 4 + ns;
+      const int32_t word = b_smem[cur][ln][lane];
+      const int ncol = nBlock + ln * 8 + (lane >> 2);
+      const T scale = s_smem[cur][ncol - nBlock][0];
+      const T zero = s_smem[cur][ncol - nBlock][1];
+      Int4Convert<T>::convert(static_cast<uint32_t>(word), scale, zero,
+                              b_reg[ns]);
+    }
+
+    // ---- MMA accumulate ----
+#pragma unroll
+    for (int ms = 0; ms < 2; ++ms) {
+#pragma unroll
+      for (int ns = 0; ns < 4; ++ns) {
+#pragma unroll
+        for (int kh = 0; kh < 2; ++kh) {
+          mma16n8k16<T>(acc[ms][ns], a_reg[ms][kh], b_reg[ns][kh * 2],
+                        b_reg[ns][kh * 2 + 1]);
+        }
+      }
+    }
+  }
+
+  // ---- store C ----
+  const int outM = mBlock + warpRow * 32;
+  const int outN = nBlock + warpCol * 32;
+#pragma unroll
+  for (int ms = 0; ms < 2; ++ms) {
+#pragma unroll
+    for (int ns = 0; ns < 4; ++ns) {
+      const int row = outM + ms * 16 + (lane >> 2);
+      const int col = outN + ns * 8 + (lane & 3) * 2;
+      if (row < M && col < N) {
+        C[(int64_t)row * N + col] = static_cast<T>(acc[ms][ns][0]);
+        if (col + 1 < N)
+          C[(int64_t)row * N + col + 1] = static_cast<T>(acc[ms][ns][1]);
+      }
+      if (row + 8 < M && col < N) {
+        C[(int64_t)(row + 8) * N + col] = static_cast<T>(acc[ms][ns][2]);
+        if (col + 1 < N)
+          C[(int64_t)(row + 8) * N + col + 1] = static_cast<T>(acc[ms][ns][3]);
+      }
+    }
+  }
+}
+
+// Dequantizes the m16n8k16-packed weight back to a dense [N, K] matrix.
+// One thread per packed int32 word; each word expands to eight output
+// elements along K for one row.
+template <typename T>
+__global__ void int4_tc_dequantize_kernel(const int32_t* __restrict__ B,
+                                          const T* __restrict__ QSZ,
+                                          T* __restrict__ W, int N, int K,
+                                          int group_size, int kSuper) {
+  const int total = (N / 8) * kSuper * 32;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  const int lane = idx % 32;
+  const int kTile = (idx / 32) % kSuper;
+  const int nTile = idx / (32 * kSuper);
+  const int n = nTile * 8 + (lane >> 2);
+  const int t4 = lane & 3;
+  const int kBase = kTile * 32 + 2 * t4;
+  const int group = (kTile * 32) / group_size;
+  const T* sz = QSZ + ((int64_t)group * N + n) * 2;
+  const T scale = sz[0];
+  const T zero = sz[1];
+  const int32_t word = B[idx];
+  // With even-k codes stored in the high nibble of each packed byte, the
+  // int32 word's bits hold: odd k at {16,20,24,28} and even k at {0,4,8,12}.
+  int v[8] = {(word >> 16) & 0xF, word & 0xF, (word >> 20) & 0xF,
+              (word >> 4) & 0xF, (word >> 24) & 0xF, (word >> 8) & 0xF,
+              (word >> 28) & 0xF, (word >> 12) & 0xF};
+  int kk[8] = {kBase + 1, kBase, kBase + 9, kBase + 8,
+               kBase + 17, kBase + 16, kBase + 25, kBase + 24};
+  T* row = W + (int64_t)n * K;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int kc = kk[i];
+    if (kc < K) row[kc] = static_cast<T>(v[i] - 8) * scale + zero;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // _weight_int4pack_mm: group-quantized 4-bit weight [N, K] packed two codes
 // per byte against fp activations [B, K].  qScaleAndZeros [N, groups, 2]
 // carries (scale, zero) per group; qGroupSize is 32, 64 or 128.
@@ -874,17 +1197,17 @@ __global__ void matrix_to_m16n8k16_Bint4_layout(
 Tensor _weight_int4pack_mm_cuda(const Tensor& self, const Tensor& mat2,
                                 int64_t q_group_size,
                                 const Tensor& q_scale_and_zeros) {
-    // `self` is the activation matrix [B, K] and `mat2` is the packed int4
-    // weight [N, K/2] (matching the op schema), so the result is
-    // `self @ weight.T` with per-group (scale, zero) dequantization.
-    if (mat2.dtype() != DType::UInt8 && mat2.dtype() != DType::QInt8) {
+    // `self` is the activation matrix [m, k] and `mat2` is the int4 weight
+    // packed into the m16n8k16 B-fragment layout (4-D int32), so the result
+    // is `self @ weight.T` with per-group (scale, zero) dequantization.
+    if (mat2.dtype() != DType::Int32 || mat2.dim() != 4) {
         TP_THROW(TypeError,
-                 "_weight_int4pack_mm(): packed weight must be Byte/QInt8");
+                 "_weight_int4pack_mm(): packed weight must be 4-D int32 in "
+                 "the tensor-core B layout");
     }
-    if (self.dim() != 2 || mat2.dim() != 2) {
+    if (self.dim() != 2) {
         TP_THROW(ValueError,
-                 "_weight_int4pack_mm(): expected 2-D activations [B,K] and "
-                 "2-D packed weight [N,K/2]");
+                 "_weight_int4pack_mm(): expected 2-D activations [m,k]");
     }
     if (!isFloatingType(self.dtype())) {
         TP_THROW(TypeError,
@@ -894,98 +1217,103 @@ Tensor _weight_int4pack_mm_cuda(const Tensor& self, const Tensor& mat2,
         TP_THROW(ValueError,
                  "_weight_int4pack_mm(): qGroupSize must be 32, 64 or 128");
     }
-    const int64_t B = self.size(0);
-    const int64_t K = self.size(1);
-    const int64_t N = mat2.size(0);
-    if (mat2.size(1) * 2 != K) {
-        TP_THROW(ValueError, "_weight_int4pack_mm(): K dimension mismatch");
+    const int64_t m = self.size(0);
+    const int64_t k = self.size(1);
+    const int64_t nTiles = mat2.size(0);
+    const int64_t kSuper = mat2.size(1);
+    const int64_t inner = mat2.size(3) * 2;
+    const int64_t n = nTiles * 8;
+    if (mat2.size(2) != 32 || (inner != 2 && inner != 4 && inner != 8)) {
+        TP_THROW(ValueError,
+                 "_weight_int4pack_mm(): packed weight layout is invalid");
     }
-    const int64_t groups = (K + q_group_size - 1) / q_group_size;
+    if (kSuper != divUp(k, inner * 16)) {
+        TP_THROW(ValueError,
+                 "_weight_int4pack_mm(): K dimension does not match packed B");
+    }
+    const int64_t groups = divUp(k, q_group_size);
     if (q_scale_and_zeros.dim() != 3 ||
         q_scale_and_zeros.size(0) != groups ||
-        q_scale_and_zeros.size(1) != N || q_scale_and_zeros.size(2) != 2) {
+        q_scale_and_zeros.size(1) != n || q_scale_and_zeros.size(2) != 2) {
         TP_THROW(ValueError,
-                 "_weight_int4pack_mm(): qScaleAndZeros must be [K/group, N, 2]");
+                 "_weight_int4pack_mm(): qScaleAndZeros must be "
+                 "[K/group, N, 2]");
     }
-    if (N == 0 || B == 0 || K == 0) {
-        return Tensor::empty({B, N}, self.dtype(), self.device());
+    if (m == 0 || n == 0 || k == 0) {
+        return Tensor::empty({m, n}, self.dtype(), self.device());
     }
 
-    Tensor w = mat2.contiguous();
-    Tensor sz = q_scale_and_zeros.to(DType::Float32).contiguous();
-    auto stream = getCurrentCUDAStream().stream();
-
-    const uint8_t* w_ptr = static_cast<const uint8_t*>(w.data_ptr());
-    const float* s_ptr = static_cast<const float*>(sz.data_ptr());
-
-    // Custom GEMV/scalar kernels cover the memory-bound skinny shapes and
-    // shapes the tensor-core GEMM path cannot express (unaligned K).  The
-    // tensor-core path dequantizes the weight once per call and runs a
-    // fp16/bf16/fp32 GEMM.
-    const bool aligned = gemv_k_aligned16(w_ptr, self.data_ptr()) &&
-                         (K % 32 == 0) && (q_group_size % 32 == 0);
-    const bool use_gemv = B == 1 && aligned;
-    const bool use_scalar =
-        !use_gemv && !(B >= 4 && K % q_group_size == 0 && K >= 64);
-    if (use_gemv || use_scalar) {
-        Tensor out = Tensor::empty({B, N}, DType::Float32, self.device());
-        Tensor xf = self.to(DType::Float32).contiguous();
-        const float* x_ptr = static_cast<const float*>(xf.data_ptr());
-        float* o_ptr = static_cast<float*>(out.data_ptr());
-        const unsigned grid = static_cast<unsigned>(N);
-        const int wave = gemv_wave_size();
-        if (use_gemv) {
-            const int rpb = kGemvThreads / wave;
-            const unsigned blocks =
-                static_cast<unsigned>((N + rpb - 1) / rpb);
-            if (wave == 64) {
-                int4pack_gemv_rows_kernel<64><<<blocks, kGemvThreads, 0, stream>>>(
-                    o_ptr, w_ptr, x_ptr, s_ptr, K, q_group_size, N);
-            } else {
-                int4pack_gemv_rows_kernel<32><<<blocks, kGemvThreads, 0, stream>>>(
-                    o_ptr, w_ptr, x_ptr, s_ptr, K, q_group_size, N);
-            }
+    // Direct tensor-core path: consume the packed int4 weight with mma.sync
+    // (no dense dequantized matrix).  Used for fp16/bf16 activations on the
+    // aligned shapes the kernel targets.
+    const bool direct_ok =
+        (self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16) &&
+        inner == 2 && (k % 32 == 0) && m >= 4 && k >= 64;
+    if (direct_ok) {
+        Tensor A = self.contiguous();
+        Tensor QSZ = q_scale_and_zeros.to(self.dtype()).contiguous();
+        Tensor C = Tensor::empty({m, n}, self.dtype(), self.device());
+        auto stream = getCurrentCUDAStream().stream();
+        const unsigned nBlocks = static_cast<unsigned>((n + 127) / 128);
+        const unsigned mBlocks = static_cast<unsigned>((m + 63) / 64);
+        const dim3 grid(nBlocks, mBlocks);
+        if (self.dtype() == DType::Float16) {
+            int4pack_tc_mm_kernel<tensorplay::Half><<<grid, 256, 0, stream>>>(
+                static_cast<const tensorplay::Half*>(A.data_ptr()),
+                static_cast<const int32_t*>(mat2.data_ptr()),
+                static_cast<const tensorplay::Half*>(QSZ.data_ptr()),
+                static_cast<tensorplay::Half*>(C.data_ptr()),
+                static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+                static_cast<int>(q_group_size));
         } else {
-            const int64_t total = N * B;
-            int4pack_scalar_kernel<<<static_cast<unsigned>((total + 255) / 256),
-                                     256, 0, stream>>>(o_ptr, w_ptr, x_ptr, s_ptr,
-                                                       K, N, B, q_group_size);
+            int4pack_tc_mm_kernel<tensorplay::BFloat16>
+                <<<grid, 256, 0, stream>>>(
+                    static_cast<const tensorplay::BFloat16*>(A.data_ptr()),
+                    static_cast<const int32_t*>(mat2.data_ptr()),
+                    static_cast<const tensorplay::BFloat16*>(QSZ.data_ptr()),
+                    static_cast<tensorplay::BFloat16*>(C.data_ptr()),
+                    static_cast<int>(m), static_cast<int>(n),
+                    static_cast<int>(k), static_cast<int>(q_group_size));
         }
-        checkCuda(cudaGetLastError(), "int4pack gemm kernel");
-        return out.to(self.dtype());
+        checkCuda(cudaGetLastError(), "int4pack tc mm kernel");
+        return C;
     }
 
-    // The direct int4 tensor-core path (int4pack_mma_mm_kernel above) consumes
-    // the packed weight straight from the mma.sync pipeline.  It is correct
-    // but currently not dispatched: it lacks cp.async pipelining / ldmatrix
-    // fragment loads, so the cuBLAS dequant+GEMM path below remains faster
-    // for production shapes.  Re-enable once the pipelined rewrite lands.
-
-    // Tensor-core path: dequantize the packed weight to the activation dtype
+    // Fallback: dequantize the packed weight (from the tensor-core layout)
     // and run a cuBLAS GEMM (out = activations @ weight.T).
     Tensor xf = self.to(self.dtype()).contiguous();
-    Tensor wf = Tensor::empty({N, K}, self.dtype(), self.device());
-    Tensor out = Tensor::empty({B, N}, self.dtype(), self.device());
-    const int64_t numel = N * K;
+    Tensor wf = Tensor::empty({n, k}, self.dtype(), self.device());
+    Tensor out = Tensor::empty({m, n}, self.dtype(), self.device());
+    Tensor qsz_t = q_scale_and_zeros.to(self.dtype()).contiguous();
+    const int64_t numel = (n / 8) * kSuper * 32;
     constexpr int kThreads = 256;
     const unsigned blocks =
         static_cast<unsigned>((numel + kThreads - 1) / kThreads);
-    const int64_t groups_per_row = K / q_group_size;
+    auto stream = getCurrentCUDAStream().stream();
     switch (self.dtype()) {
         case DType::Float16:
-            int4_dequantize_kernel<tensorplay::Half><<<blocks, kThreads, 0, stream>>>(
-                w_ptr, s_ptr, static_cast<tensorplay::Half*>(wf.data_ptr()), N,
-                K, groups_per_row, q_group_size);
+            int4_tc_dequantize_kernel<tensorplay::Half><<<blocks, kThreads, 0, stream>>>(
+                static_cast<const int32_t*>(mat2.data_ptr()),
+                static_cast<const tensorplay::Half*>(qsz_t.data_ptr()),
+                static_cast<tensorplay::Half*>(wf.data_ptr()),
+                static_cast<int>(n), static_cast<int>(k),
+                static_cast<int>(q_group_size), static_cast<int>(kSuper));
             break;
         case DType::BFloat16:
-            int4_dequantize_kernel<tensorplay::BFloat16><<<blocks, kThreads, 0, stream>>>(
-                w_ptr, s_ptr, static_cast<tensorplay::BFloat16*>(wf.data_ptr()),
-                N, K, groups_per_row, q_group_size);
+            int4_tc_dequantize_kernel<tensorplay::BFloat16><<<blocks, kThreads, 0, stream>>>(
+                static_cast<const int32_t*>(mat2.data_ptr()),
+                static_cast<const tensorplay::BFloat16*>(qsz_t.data_ptr()),
+                static_cast<tensorplay::BFloat16*>(wf.data_ptr()),
+                static_cast<int>(n), static_cast<int>(k),
+                static_cast<int>(q_group_size), static_cast<int>(kSuper));
             break;
         case DType::Float32:
-            int4_dequantize_kernel<float><<<blocks, kThreads, 0, stream>>>(
-                w_ptr, s_ptr, static_cast<float*>(wf.data_ptr()), N, K,
-                groups_per_row, q_group_size);
+            int4_tc_dequantize_kernel<float><<<blocks, kThreads, 0, stream>>>(
+                static_cast<const int32_t*>(mat2.data_ptr()),
+                static_cast<const float*>(qsz_t.data_ptr()),
+                static_cast<float*>(wf.data_ptr()),
+                static_cast<int>(n), static_cast<int>(k),
+                static_cast<int>(q_group_size), static_cast<int>(kSuper));
             break;
         default:
             TP_THROW(TypeError,
@@ -1004,29 +1332,62 @@ Tensor _weight_int4pack_mm_cuda(const Tensor& self, const Tensor& mat2,
 
 Tensor _convert_weight_to_int4pack_cuda(const Tensor& self,
                                         int64_t inner_tiles) {
-    (void)inner_tiles;
+    // Input: int32 code tensor [N, K] (values 0..15).  The codes are packed
+    // two per byte into [N, K/2] uint8 and then repacked into the m16n8k16
+    // B-fragment layout [n/8][k/(InnerKTiles*16)][32][InnerKTiles/2] int32
+    // consumed by the direct tensor-core GEMM.
     if (self.dim() != 2) {
         TP_THROW(ValueError,
                  "_convert_weight_to_int4pack(): expected 2-D codes [N,K]");
+    }
+    if (inner_tiles != 2 && inner_tiles != 4 && inner_tiles != 8) {
+        TP_THROW(ValueError,
+                 "_convert_weight_to_int4pack(): innerKTiles must be 2, 4 or 8");
     }
     const int64_t N = self.size(0);
     const int64_t K = self.size(1);
     if (K % 2 != 0) {
         TP_THROW(ValueError, "_convert_weight_to_int4pack(): K must be even");
     }
+    const int64_t nTiles = divUp(N, 8);
+    const int64_t kSuper = divUp(K, inner_tiles * 16);
     if (N == 0 || K == 0) {
-        return Tensor::empty({N, K / 2}, DType::UInt8, self.device());
+        return Tensor::empty({nTiles, kSuper, 32, inner_tiles / 2},
+                             DType::Int32, self.device());
     }
+
     Tensor codes = self.to(DType::Int32).contiguous();
-    Tensor out = Tensor::empty({N, K / 2}, DType::UInt8, self.device());
+    Tensor packed_u8 = Tensor::empty({N, K / 2}, DType::UInt8, self.device());
     const int64_t num_bytes = N * (K / 2);
     constexpr int kThreads = 256;
     const unsigned blocks =
         static_cast<unsigned>((num_bytes + kThreads - 1) / kThreads);
-    int4_pack_kernel<<<blocks, kThreads, 0, getCurrentCUDAStream().stream()>>>(
+    auto stream = getCurrentCUDAStream().stream();
+    int4_pack_kernel<<<blocks, kThreads, 0, stream>>>(
         static_cast<const int32_t*>(codes.data_ptr()),
-        static_cast<uint8_t*>(out.data_ptr()), num_bytes);
+        static_cast<uint8_t*>(packed_u8.data_ptr()), num_bytes);
     checkCuda(cudaGetLastError(), "int4 pack kernel");
+
+    Tensor out = Tensor::empty({nTiles, kSuper, 32, inner_tiles / 2},
+                               DType::Int32, self.device());
+    const dim3 grid(static_cast<unsigned>(kSuper),
+                    static_cast<unsigned>(nTiles));
+    const uint8_t* u8_ptr = static_cast<const uint8_t*>(packed_u8.data_ptr());
+    int32_t* out_ptr = static_cast<int32_t*>(out.data_ptr());
+    if (inner_tiles == 2) {
+        matrix_to_m16n8k16_Bint4_layout<2>
+            <<<grid, kWarpSize, 0, stream>>>(u8_ptr, N, K / 2, out_ptr,
+                                             kSuper);
+    } else if (inner_tiles == 4) {
+        matrix_to_m16n8k16_Bint4_layout<4>
+            <<<grid, kWarpSize, 0, stream>>>(u8_ptr, N, K / 2, out_ptr,
+                                             kSuper);
+    } else {
+        matrix_to_m16n8k16_Bint4_layout<8>
+            <<<grid, kWarpSize, 0, stream>>>(u8_ptr, N, K / 2, out_ptr,
+                                             kSuper);
+    }
+    checkCuda(cudaGetLastError(), "int4pack layout kernel");
     return out;
 }
 
