@@ -6974,6 +6974,41 @@ def choose_scale_float8(input, block_size, float8_dtype, hp_value_lb=None, hp_va
         block_size = [block_size]
     return _C.choose_scale_float8(input, block_size, float8_dtype, hp_value_lb, hp_value_ub)
 
+def _quantize_int8_rowwise(input, eps):
+    if _capturing():
+        _captured = _capture_call(_quantize_int8_rowwise, (input, eps), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantize_int8_rowwise(input, eps)
+
+def _quantize_int4_rowwise(input, eps):
+    if _capturing():
+        _captured = _capture_call(_quantize_int4_rowwise, (input, eps), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantize_int4_rowwise(input, eps)
+
+def _quantize_int2_rowwise(input, eps):
+    if _capturing():
+        _captured = _capture_call(_quantize_int2_rowwise, (input, eps), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantize_int2_rowwise(input, eps)
+
+def _quantize_binary_rowwise(input, eps):
+    if _capturing():
+        _captured = _capture_call(_quantize_binary_rowwise, (input, eps), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantize_binary_rowwise(input, eps)
+
+def _int8_mm_rescale(out, row_scale, col_scale):
+    if _capturing():
+        _captured = _capture_call(_int8_mm_rescale, (out, row_scale, col_scale), {})
+        if _captured is not None:
+            return _captured
+    return _C._int8_mm_rescale(out, row_scale, col_scale)
+
 def dequantize(*args):
     if _capturing():
         _captured = _capture_call(dequantize, (*args,), {})
