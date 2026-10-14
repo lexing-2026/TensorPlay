@@ -27,10 +27,13 @@ from tensorplay.ao.quantization.quantize_api import register_quantize_module_han
 
 __all__ = [
     "Float8WeightOnlyConfig",
+    "Float8WeightOnlyInferenceConfig",
     "Float8DynamicActivationFloat8WeightConfig",
     "float8_weight_only",
+    "float8_weight_only_inference",
     "float8_dynamic_activation_float8_weight",
     "Float8WeightOnlyQuantizedTrainingLinear",
+    "Float8WeightOnlyInferenceLinear",
     "Float8MixedPrecisionTrainingLinear",
 ]
 
@@ -42,6 +45,21 @@ class Float8WeightOnlyConfig:
     Attributes:
         dtype: one of ``tp.float8_e4m3fn`` / ``tp.float8_e4m3fnuz`` /
             ``tp.float8_e5m2`` / ``tp.float8_e5m2fnuz``.
+    """
+
+    dtype: str = "float8_e4m3fn"
+
+
+@dataclass
+class Float8WeightOnlyInferenceConfig:
+    """Configuration for FP8 weight-only inference.
+
+    The weight is quantized once at conversion time and stored as FP8 codes
+    plus per-row scales, saving memory; the forward dequantizes and runs a
+    float GEMM.
+
+    Attributes:
+        dtype: FP8 format used for the stored weight.
     """
 
     dtype: str = "float8_e4m3fn"
@@ -60,6 +78,7 @@ class Float8DynamicActivationFloat8WeightConfig:
 
 # Backwards-compatible aliases matching the workflow config names.
 float8_weight_only = Float8WeightOnlyConfig
+float8_weight_only_inference = Float8WeightOnlyInferenceConfig
 float8_dynamic_activation_float8_weight = Float8DynamicActivationFloat8WeightConfig
 
 
@@ -196,3 +215,63 @@ def _float8_mixed_precision_transform(module, config):
     module.__class__ = Float8MixedPrecisionTrainingLinear
     module.fp8_dtype = config.dtype
     return module
+
+
+class Float8WeightOnlyInferenceLinear(nn.Module):
+    """Inference linear with a stored FP8 weight and per-row scales."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        dtype: str = "float8_e4m3fn",
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.fp8_dtype = dtype
+        self.register_buffer(
+            "weight", tp.zeros((out_features, in_features), dtype=_fp8_dtype(dtype))
+        )
+        self.register_buffer(
+            "scale", tp.zeros((out_features, 1), dtype=tp.float32)
+        )
+        if bias:
+            self.register_buffer("bias", tp.zeros(out_features, dtype=tp.float32))
+        else:
+            self.bias = None
+
+    def forward(self, input: tp.Tensor) -> tp.Tensor:
+        dq = _dequantize_fp8(self.weight, self.scale, input.dtype)
+        out = input @ dq.T.contiguous()
+        if self.bias is not None:
+            out = out + self.bias
+        return out
+
+    @classmethod
+    def from_float(
+        cls, linear: nn.Linear, dtype: str = "float8_e4m3fn"
+    ) -> "Float8WeightOnlyInferenceLinear":
+        """Build an FP8 weight-only inference linear from a float linear."""
+        if linear.bias is not None and linear.bias.dim() != 1:
+            raise ValueError("float8 weight-only requires a 1-D bias or no bias")
+        codes, scale = _quantize_fp8_rowwise(linear.weight.detach(), _fp8_dtype(dtype))
+        mod = cls(
+            linear.in_features,
+            linear.out_features,
+            dtype=dtype,
+            bias=linear.bias is not None,
+        )
+        mod.weight = codes
+        mod.scale = scale
+        if linear.bias is not None:
+            mod.bias = linear.bias.detach()
+        return mod
+
+
+@register_quantize_module_handler(Float8WeightOnlyInferenceConfig)
+def _float8_weight_only_inference_transform(module, config):
+    """Replace matching ``nn.Linear`` modules with FP8 weight-only inference."""
+    return Float8WeightOnlyInferenceLinear.from_float(module, config.dtype)
+

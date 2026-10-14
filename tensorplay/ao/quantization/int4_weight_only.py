@@ -26,7 +26,9 @@ __all__ = [
     "Int4WeightOnlyConfig",
     "Int4WeightOnlyQuantizedTrainingConfig",
     "int4_weight_only",
+    "quantize_int4_weight_only",
     "WeightOnlyInt4Linear",
+    "Int4WeightOnlyQuantizedLinear",
     "Int4WeightOnlyQuantizedTrainingLinear",
 ]
 
@@ -205,3 +207,17 @@ def _int4_training_transform(module, config):
     module.__class__ = Int4WeightOnlyQuantizedTrainingLinear
     module.groupsize = config.groupsize
     return module
+
+
+# Compatibility alias: the inference module is the packed linear.
+Int4WeightOnlyQuantizedLinear = WeightOnlyInt4Linear
+
+
+def quantize_int4_weight_only(
+    model: "tp.nn.Module", groupsize: int = 128
+) -> "tp.nn.Module":
+    """Convert every ``nn.Linear`` in ``model`` to INT4 weight-only."""
+    from tensorplay.ao.quantization.quantize_api import quantize_
+
+    return quantize_(model, int4_weight_only(groupsize=groupsize))
+

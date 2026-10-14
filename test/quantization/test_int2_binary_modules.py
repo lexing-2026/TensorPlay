@@ -1,0 +1,251 @@
+"""INT2 / 1-bit / FP8 weight-only module tests.
+
+Covers the new low-bit weight-only operators:
+
+* ``int2_weight_only()``: packed 2-bit codes (four per byte) with per-group
+  scales and zeros, inference and straight-through-estimator training.
+* ``binary_weight_only()``: packed 1-bit sign codes (eight per byte) with
+  per-row absmean scales, inference and training.
+* ``float8_weight_only_inference()``: pre-quantized FP8 weight plus per-row
+  scales.
+* INT4 additions: ``Int4WeightOnlyQuantizedLinear`` alias and the
+  ``quantize_int4_weight_only()`` convenience entry point.
+"""
+
+import pytest
+
+import tensorplay as tp
+from tensorplay import nn
+
+from tensorplay.ao.quantization import (
+    BinaryWeightOnlyQuantizedTrainingLinear,
+    Float8WeightOnlyInferenceLinear,
+    Int2WeightOnlyQuantizedTrainingLinear,
+    Int4WeightOnlyQuantizedLinear,
+    WeightOnlyBinaryLinear,
+    WeightOnlyInt2Linear,
+    binary_weight_only,
+    float8_weight_only_inference,
+    int2_weight_only,
+    int4_weight_only,
+    pack_binary,
+    pack_int2,
+    quantize_,
+    quantize_binary_weight_only,
+    quantize_int2_weight_only,
+    quantize_int4_weight_only,
+    unpack_binary,
+    unpack_int2,
+)
+
+DEVICES = ['cpu'] + (['cuda'] if tp.cuda.is_available() else [])
+
+
+def _pair(K=16, N=32, B=3):
+    tp.manual_seed(0)
+    x = tp.randn(B, K)
+    lin = nn.Linear(K, N, bias=False)
+    return x, lin
+
+
+# ---------------------------------------------------------------------------
+# int2 weight-only
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_int2_pack_unpack_roundtrip(device):
+    codes = tp.randint(0, 4, (5, 10), device=device).to(tp.int8)
+    packed = pack_int2(codes)
+    assert packed.dtype == tp.uint8
+    assert packed.shape == (5, 3)  # 10 codes -> ceil(10/4)=3 bytes
+    back = unpack_int2(packed, 10)
+    assert bool((back == codes).all())
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_int2_from_float_and_forward(device):
+    x, lin = _pair()
+    x = x.to(device)
+    lin = lin.to(device)
+    mod = WeightOnlyInt2Linear.from_float(lin, groupsize=8)
+    assert mod.weight.dtype == tp.uint8
+    assert mod.weight.shape == (mod.out_features, (mod.in_features + 3) // 4)
+    assert mod.scales_and_zeros.shape == (2, mod.out_features, 2)
+    out = mod(x)
+    assert out.shape == (x.shape[0], mod.out_features)
+    # dequantized weight matches manual groupwise int2
+    scale = mod.scales_and_zeros[..., 0].t().contiguous()
+    zero = mod.scales_and_zeros[..., 1].t().contiguous()
+    codes = unpack_int2(mod.weight, mod.in_features).to(tp.float32)
+    groupsize = 8
+    z = zero.repeat_interleave(groupsize, dim=-1)
+    s = scale.repeat_interleave(groupsize, dim=-1)
+    dq = (codes - z) * s
+    ref = x @ dq.T
+    tp.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_int2_quantize_model(device):
+    x, _ = _pair()
+    x = x.to(device)
+    model = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 8)).to(device)
+    qmodel = quantize_(model, int2_weight_only(groupsize=8))
+    assert isinstance(qmodel[0], WeightOnlyInt2Linear)
+    assert isinstance(qmodel[2], WeightOnlyInt2Linear)
+    out = qmodel(x)
+    assert out.shape == (x.shape[0], 8)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_int2_convenience_entry(device):
+    model = nn.Sequential(nn.Linear(16, 16)).to(device)
+    qmodel = quantize_int2_weight_only(model, groupsize=8)
+    assert isinstance(qmodel[0], WeightOnlyInt2Linear)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_int2_training_ste_gradients(device):
+    x = tp.randn(3, 8, device=device, requires_grad=True)
+    mod = Int2WeightOnlyQuantizedTrainingLinear(8, 5, groupsize=4).to(device)
+    out = mod(x)
+    assert out.shape == (3, 5)
+    out.sum().backward()
+    assert mod.weight.grad is not None
+    assert mod.weight.grad.shape == (5, 8)
+    # grad_input flows through the full-precision weight (STE)
+    assert x.grad is not None
+    expected = tp.ones_like(out) @ mod.weight.detach()
+    tp.testing.assert_close(x.grad, expected, atol=1e-4, rtol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# binary (1-bit) weight-only
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_binary_pack_unpack_roundtrip(device):
+    codes = tp.randint(0, 2, (4, 10), device=device).to(tp.uint8)
+    packed = pack_binary(codes)
+    assert packed.dtype == tp.uint8
+    assert packed.shape == (4, 2)  # 10 codes -> ceil(10/8)=2 bytes
+    back = unpack_binary(packed, 10)
+    assert bool((back == codes).all())
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_binary_from_float_and_forward(device):
+    x, lin = _pair()
+    x = x.to(device)
+    lin = lin.to(device)
+    mod = WeightOnlyBinaryLinear.from_float(lin)
+    assert mod.weight.shape == (mod.out_features, (mod.in_features + 7) // 8)
+    assert mod.scale.shape == (mod.out_features, 1)
+    out = mod(x)
+    assert out.shape == (x.shape[0], mod.out_features)
+    # dequantized weight = sign * absmean scale
+    codes = unpack_binary(mod.weight, mod.in_features).to(tp.float32) * 2.0 - 1.0
+    dq = codes * mod.scale
+    ref = x @ dq.T
+    tp.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
+    # weight magnitudes all equal to the row scale
+    assert bool((dq.abs() - mod.scale).abs().max() < 1e-5)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_binary_quantize_model(device):
+    x, _ = _pair()
+    x = x.to(device)
+    model = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 8)).to(device)
+    qmodel = quantize_(model, binary_weight_only())
+    assert isinstance(qmodel[0], WeightOnlyBinaryLinear)
+    assert isinstance(qmodel[2], WeightOnlyBinaryLinear)
+    out = qmodel(x)
+    assert out.shape == (x.shape[0], 8)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_binary_convenience_entry(device):
+    model = nn.Sequential(nn.Linear(16, 16)).to(device)
+    qmodel = quantize_binary_weight_only(model)
+    assert isinstance(qmodel[0], WeightOnlyBinaryLinear)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_binary_training_ste_gradients(device):
+    x = tp.randn(3, 8, device=device, requires_grad=True)
+    mod = BinaryWeightOnlyQuantizedTrainingLinear(8, 5).to(device)
+    out = mod(x)
+    assert out.shape == (3, 5)
+    out.sum().backward()
+    assert mod.weight.grad is not None
+    assert mod.weight.grad.shape == (5, 8)
+    assert x.grad is not None
+    expected = tp.ones_like(out) @ mod.weight.detach()
+    tp.testing.assert_close(x.grad, expected, atol=1e-4, rtol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# float8 weight-only inference
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_float8_inference_from_float_and_forward(device):
+    x, lin = _pair()
+    x = x.to(device)
+    lin = lin.to(device)
+    mod = Float8WeightOnlyInferenceLinear.from_float(lin)
+    assert mod.weight.dtype == tp.float8_e4m3fn
+    assert mod.scale.shape == (mod.out_features, 1)
+    out = mod(x)
+    assert out.shape == (x.shape[0], mod.out_features)
+    # dequantized weight times scale reproduces the output
+    dq = tp._C.dequantize_affine_float8(mod.weight, mod.scale, tp.float32)
+    ref = x @ dq.T
+    tp.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_float8_inference_quantize_model(device):
+    x, _ = _pair()
+    x = x.to(device)
+    model = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 8)).to(device)
+    qmodel = quantize_(model, float8_weight_only_inference())
+    assert isinstance(qmodel[0], Float8WeightOnlyInferenceLinear)
+    out = qmodel(x)
+    assert out.shape == (x.shape[0], 8)
+    # quantized weight is ~half the float weight's memory (1 byte vs 4)
+    assert qmodel[0].weight.element_size() == 1
+
+
+# ---------------------------------------------------------------------------
+# int4 additions
+# ---------------------------------------------------------------------------
+
+
+def test_int4_quantized_linear_alias():
+    from tensorplay.ao.quantization import WeightOnlyInt4Linear
+
+    assert Int4WeightOnlyQuantizedLinear is WeightOnlyInt4Linear
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_int4_convenience_entry(device):
+    model = nn.Sequential(nn.Linear(64, 16)).to(device)
+    qmodel = quantize_int4_weight_only(model, groupsize=32)
+    from tensorplay.ao.quantization import WeightOnlyInt4Linear
+
+    assert isinstance(qmodel[0], WeightOnlyInt4Linear)
+    x = tp.randn(2, 64, device=device)
+    out = qmodel(x)
+    assert out.shape == (2, 16)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_int2_rejects_bad_groupsize(device):
+    lin = nn.Linear(16, 8).to(device)
+    with pytest.raises(ValueError):
+        WeightOnlyInt2Linear.from_float(lin, groupsize=3)

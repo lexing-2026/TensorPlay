@@ -58,8 +58,11 @@ def test_pack_and_mm_matches_reference(device):
     else:
         out = tp._C._weight_int4pack_mm_for_cpu(x, packed, g, scale_zero)
     ref = _dequant_int4_reference(x, w, g)
+    # The CUDA tensor-core path accumulates in reduced precision, so it
+    # carries slightly larger rounding than the exact SIMD CPU path.
+    tol = 5e-2 if device == 'cuda' else 1e-2
     np.testing.assert_allclose(
-        out.detach().cpu().numpy(), ref.detach().cpu().numpy(), rtol=1e-2, atol=1e-2
+        out.detach().cpu().numpy(), ref.detach().cpu().numpy(), rtol=tol, atol=tol
     )
 
 
