@@ -211,15 +211,21 @@ Extract per-head attention weights and render them with the visualization helper
 Highlight important tokens (e.g. a subject) to make the attended-to pattern legible:
 
 ```python
-from tensorplay.lumen.llm import extract_attention, visualize_attention_heads
+from tensorplay.lumen.llm import (
+    extract_attention,
+    visualize_attention_multi_layer,
+    token_attention,
+    visualize_token_attention,
+)
 
 result = extract_attention(model, tokenizer, prompt, layers=[0, 1])
-fig, axes = visualize_attention_heads(
-    result,
-    layer=0,
-    title="Layer 0 attention heads",
-    highlight_tokens=["France"],
-)
+
+# paper-style grid: layers x heads, what "France" attends to outlined
+fig, axes = visualize_attention_multi_layer(result, query_token="France")
+
+# single-token view: France's attention at every (layer, head)
+ta = token_attention(result, query_token="France")
+fig, ax = visualize_token_attention(ta)
 ```
 
 ### Causal tracing: where is a fact stored?

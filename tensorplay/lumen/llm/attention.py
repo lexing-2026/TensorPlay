@@ -347,18 +347,18 @@ def visualize_attention_multi_layer(
     query_token: Optional[str] = None,
     layers: Optional[Sequence[int]] = None,
     heads: Optional[Sequence[int]] = None,
-    cmap: str = "viridis",
+    cmap: str = "Blues",
     title: Optional[str] = None,
     figsize: Optional[Sequence[float]] = None,
     use_pyplot: bool = False,
 ) -> Any:
-    """Plot attention for many layers at once, one subplot per head.
+    """Paper-style multi-layer attention grid.
 
-    This is the multi-layer "head view" familiar from interpretability papers:
-    rows are layers, columns are heads. When ``query_token`` is given, the
-    corresponding row and column of every attention matrix are outlined in red,
-    making it easy to see what that token attends to (and which tokens attend to
-    it) across the whole stack.
+    Rows are layers, columns are heads. Each cell is a plain heatmap with
+    token labels only on the outer edges (rotated 90 degrees on the bottom),
+    a shared colorbar, and no per-cell clutter. When ``query_token`` is given,
+    that token's row -- the attention it pays to every other token -- is
+    outlined in blue in every cell.
 
     Returns:
         ``(fig, axes)`` matplotlib objects.
@@ -366,7 +366,7 @@ def visualize_attention_multi_layer(
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
 
-    maps, tokens, all_layers, all_heads = _normalize_attention_maps(attention, tokens)
+    maps, tokens, _, _ = _normalize_attention_maps(attention, tokens)
     if layers is None:
         layers = list(range(len(maps)))[:8]
     if heads is None:
@@ -379,71 +379,71 @@ def visualize_attention_multi_layer(
         query_pos = tokens.index(query_token)
 
     rows, cols = len(layers), len(heads)
+    cell = 2.3
     if figsize is None:
-        figsize = (cols * 2.8, rows * 2.8)
-    fig, axes = plt.subplots(rows, cols, figsize=figsize, squeeze=False)
-
+        figsize = (cols * cell + 1.2, rows * cell + 0.8)
+    fig, axes = plt.subplots(
+        rows, cols, figsize=figsize, squeeze=False,
+        gridspec_kw={"wspace": 0.05, "hspace": 0.05},
+    )
     seq_len = maps[0].shape[1]
-    max_ticks = 8
-    tick_step = max(1, int(np.ceil(seq_len / max_ticks)))
-    tick_positions = list(range(0, seq_len, tick_step))
-    tick_labels = [
+    max_ticks = 10
+    step = max(1, int(np.ceil(seq_len / max_ticks)))
+    positions = list(range(0, seq_len, step))
+    labels = [
         tokens[i] if tokens is not None and i < len(tokens) else str(i)
-        for i in tick_positions
+        for i in positions
     ]
 
     im = None
     for r, li in enumerate(layers):
-        layer_map = maps[li]
         for c, hi in enumerate(heads):
             ax = axes[r][c]
-            hmap = layer_map[hi]
+            hmap = maps[li][hi]
             im = ax.imshow(
-                hmap, cmap=cmap, vmin=0.0, vmax=1.0, aspect="auto",
-                interpolation="nearest",
+                hmap, cmap=cmap, vmin=0.0, vmax=1.0,
+                aspect="equal", interpolation="nearest",
             )
+            ax.set_xticks(positions)
+            ax.set_yticks(positions)
+            if r == rows - 1:
+                ax.set_xticklabels(labels, rotation=90, fontsize=8, ha="center")
+            else:
+                ax.set_xticklabels([])
+            if c == 0:
+                ax.set_yticklabels(labels, fontsize=8)
+            else:
+                ax.set_yticklabels([])
+            ax.tick_params(length=0)
+            # faint cell grid, as in print
+            ax.set_xticks(np.arange(-0.5, seq_len, 1), minor=True)
+            ax.set_yticks(np.arange(-0.5, seq_len, 1), minor=True)
+            ax.grid(which="minor", color="white", linewidth=0.4, alpha=0.12)
+            # what the query token attends to = its row
             if query_pos is not None:
                 ax.add_patch(
                     Rectangle(
-                        (query_pos - 0.5, -0.5), 1, seq_len,
-                        fill=False, edgecolor="#d62728", linewidth=1.2,
-                    )
-                )
-                ax.add_patch(
-                    Rectangle(
                         (-0.5, query_pos - 0.5), seq_len, 1,
-                        fill=False, edgecolor="#d62728", linewidth=1.2,
+                        fill=False, edgecolor="#1f77b4", linewidth=1.1,
                     )
                 )
-            if r == rows - 1:
-                ax.set_xticks(tick_positions)
-                ax.set_xticklabels(
-                    tick_labels, rotation=45, ha="right", fontsize=7
-                )
-            else:
-                ax.set_xticks([])
-            if c == 0:
-                ax.set_yticks(tick_positions)
-                ax.set_yticklabels(tick_labels, fontsize=7)
-            else:
-                ax.set_yticks([])
-            ax.tick_params(length=0)
-            if r == 0:
-                ax.set_title("Head %d" % hi, fontsize=9)
-            if c == 0:
-                ax.set_ylabel("Layer %d" % li, fontsize=9)
-            ax.set_xticks(np.arange(-0.5, seq_len, 1), minor=True)
-            ax.set_yticks(np.arange(-0.5, seq_len, 1), minor=True)
-            ax.grid(which="minor", color="white", linewidth=0.3, alpha=0.2)
+
+    for c, hi in enumerate(heads):
+        axes[0][c].set_title("Head %d" % hi, fontsize=9, pad=3)
+    for r, li in enumerate(layers):
+        axes[r][0].set_ylabel("Layer %d" % li, fontsize=9, labelpad=3)
 
     if im is not None:
-        fig.colorbar(im, ax=list(axes.ravel()), fraction=0.025, pad=0.02)
+        cbar = fig.colorbar(im, ax=list(axes.ravel()), fraction=0.02, pad=0.02)
+        cbar.set_label("weight", fontsize=8)
+        cbar.ax.tick_params(labelsize=7)
     if title:
-        fig.suptitle(title, y=1.02, fontsize=12)
-    fig.tight_layout(rect=[0, 0, 0.96, 1])
+        fig.suptitle(title, fontsize=12)
+    fig.tight_layout(rect=[0, 0, 0.94, 1])
     if use_pyplot:
         plt.show()
     return fig, axes
+
 
 
 def token_attention(
@@ -480,22 +480,20 @@ def token_attention(
 
 def visualize_token_attention(
     token_attn: Dict[str, Any],
-    cmap: str = "viridis",
+    cmap: str = "Blues",
     title: Optional[str] = None,
     figsize: Optional[Sequence[float]] = None,
     use_pyplot: bool = False,
 ) -> Any:
-    """Plot what a single token attends to across every layer and head.
+    """Paper-style view of what one token attends to.
 
-    The heatmap has one row per ``(layer, head)`` and one column per token; the
-    cell value is the attention weight from the query token to that column's
-    token. The query token's own column is outlined in red.
+    One row per ``(layer, head)``, one column per token; the query token's own
+    column is outlined in blue.
 
     Returns:
         ``(fig, ax)`` matplotlib objects.
     """
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Rectangle
 
     matrix = np.asarray(token_attn["matrix"], dtype=float)
     tokens = token_attn["tokens"]
@@ -509,26 +507,24 @@ def visualize_token_attention(
     ]
 
     if figsize is None:
-        figsize = (max(6.0, 0.5 * seq + 3.0), max(3.0, 0.35 * n_layers * n_heads + 1.5))
+        figsize = (max(6.0, 0.5 * seq + 3.0), max(3.0, 0.32 * n_layers * n_heads + 1.2))
     fig, ax = plt.subplots(figsize=figsize)
     im = ax.imshow(
         flat, cmap=cmap, vmin=0.0, vmax=1.0, aspect="auto", interpolation="nearest"
     )
     ax.set_yticks(range(len(y_labels)))
     ax.set_yticklabels(y_labels, fontsize=7)
-    tick_step = max(1, int(np.ceil(seq / 12)))
-    tick_positions = list(range(0, seq, tick_step))
-    tick_labels = [tokens[i] for i in tick_positions]
-    ax.set_xticks(tick_positions)
-    ax.set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=8)
+    step = max(1, int(np.ceil(seq / 12)))
+    positions = list(range(0, seq, step))
+    labels = [tokens[i] for i in positions]
+    ax.set_xticks(positions)
+    ax.set_xticklabels(labels, rotation=90, fontsize=8, ha="center")
     ax.tick_params(length=0)
-    ax.add_patch(
-        Rectangle(
-            (query_pos - 0.5, -0.5), 1, n_layers * n_heads,
-            fill=False, edgecolor="#d62728", linewidth=1.4,
-        )
-    )
-    fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+    ax.axvline(query_pos - 0.5, color="#1f77b4", linewidth=1.2)
+    ax.axvline(query_pos + 0.5, color="#1f77b4", linewidth=1.2)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+    cbar.set_label("weight", fontsize=8)
+    cbar.ax.tick_params(labelsize=7)
     if title:
         ax.set_title(title, fontsize=12)
     fig.tight_layout()
