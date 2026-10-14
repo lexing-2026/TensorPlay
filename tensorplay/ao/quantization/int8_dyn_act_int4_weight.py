@@ -80,12 +80,7 @@ class _Int8DynActInt4WeightLinear(Function):
         x_i8, x_scale = quantize_int8_rowwise(flat)
         w_codes, w_scale = _quantize_int4_weight_signed(weight)
         ctx.save_for_backward(input, weight)
-        out = _int8_mm(
-            x_i8.contiguous(),
-            w_codes.contiguous(),
-            x_scale.contiguous(),
-            w_scale.contiguous(),
-        )
+        out = _int8_mm(x_i8, w_codes, x_scale, w_scale)
         return out.reshape(*input.shape[:-1], out.shape[-1])
 
     @staticmethod

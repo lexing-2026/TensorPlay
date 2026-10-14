@@ -1059,6 +1059,110 @@ Tensor int4_mm_tensor_group(const Tensor& input,const Tensor& weight,const Tenso
     TP_CHECK(group.numel()==1 && group.dtype()==DType::Int64, "Int4 group size must be one signed sixty four bit integer");
     return int4_mm(input,weight,group.item<int64_t>(),parameters);
 }
+
+template <typename scalar_t>
+void rowwise_quantize_cpu_impl(const Tensor& x, Tensor& codes, Tensor& scales,
+                               float eps, int quant_min, int quant_max) {
+    const int64_t M = x.size(0);
+    const int64_t K = x.size(1);
+    const scalar_t* x_ptr = x.data_ptr<scalar_t>();
+    int8_t* codes_ptr = codes.data_ptr<int8_t>();
+    float* scales_ptr = scales.data_ptr<float>();
+    tensorplay::parallel::parallel_for(0, M, 1, [&](int64_t r0, int64_t r1) {
+        for (int64_t r = r0; r < r1; ++r) {
+            float absmax = 0.0f;
+            for (int64_t k = 0; k < K; ++k) {
+                absmax =
+                    std::max(absmax, std::fabs(static_cast<float>(x_ptr[r * K + k])));
+            }
+            const float scale = std::max(absmax, eps) / quant_max;
+            scales_ptr[r] = scale;
+            for (int64_t k = 0; k < K; ++k) {
+                int c = static_cast<int>(
+                    std::nearbyint(static_cast<float>(x_ptr[r * K + k]) / scale));
+                c = c < quant_min ? quant_min : (c > quant_max ? quant_max : c);
+                codes_ptr[r * K + k] = static_cast<int8_t>(c);
+            }
+        }
+    });
+}
+
+void launch_rowwise_quantize_cpu(const Tensor& x, Tensor& codes, Tensor& scales,
+                                 float eps, int quant_min, int quant_max) {
+    switch (x.dtype()) {
+        case DType::Float16:
+            rowwise_quantize_cpu_impl<tensorplay::Half>(x, codes, scales, eps,
+                                                         quant_min, quant_max);
+            break;
+        case DType::BFloat16:
+            rowwise_quantize_cpu_impl<tensorplay::BFloat16>(
+                x, codes, scales, eps, quant_min, quant_max);
+            break;
+        case DType::Float32:
+            rowwise_quantize_cpu_impl<float>(x, codes, scales, eps, quant_min,
+                                       quant_max);
+            break;
+        default:
+            TP_THROW(TypeError, "rowwise quantize: unsupported input dtype");
+    }
+}
+
+std::tuple<Tensor, Tensor> _quantize_int8_rowwise_cpu(const Tensor& self,
+                                                       double eps) {
+    TP_CHECK(self.dim() == 2, "_quantize_int8_rowwise(): expected a 2-D tensor");
+    const int64_t M = self.size(0);
+    const int64_t K = self.size(1);
+    const Tensor x = self.contiguous();
+    Tensor codes = Tensor::empty({M, K}, DType::Int8, self.device());
+    Tensor scales = Tensor::empty({M}, DType::Float32, self.device());
+    if (M == 0 || K == 0) {
+        return {codes, scales};
+    }
+    launch_rowwise_quantize_cpu(x, codes, scales, static_cast<float>(eps), -127,
+                                127);
+    return {codes, scales};
+}
+
+std::tuple<Tensor, Tensor> _quantize_int4_rowwise_cpu(const Tensor& self,
+                                                     double eps) {
+    TP_CHECK(self.dim() == 2, "_quantize_int4_rowwise(): expected a 2-D tensor");
+    const int64_t M = self.size(0);
+    const int64_t K = self.size(1);
+    const Tensor x = self.contiguous();
+    Tensor codes = Tensor::empty({M, K}, DType::Int8, self.device());
+    Tensor scales = Tensor::empty({M}, DType::Float32, self.device());
+    if (M == 0 || K == 0) {
+        return {codes, scales};
+    }
+    launch_rowwise_quantize_cpu(x, codes, scales, static_cast<float>(eps), -8, 7);
+    return {codes, scales};
+}
+
+Tensor _int8_mm_rescale_cpu(const Tensor& out, const Tensor& row_scale,
+                             const Tensor& col_scale) {
+    TP_CHECK(out.dim() == 2 && out.dtype() == DType::Int32,
+             "_int8_mm_rescale(): expected a 2-D int32 output");
+    const int64_t M = out.size(0);
+    const int64_t N = out.size(1);
+    Tensor result = Tensor::empty({M, N}, DType::Float32, out.device());
+    if (M == 0 || N == 0) {
+        return result;
+    }
+    const int32_t* out_ptr = out.data_ptr<int32_t>();
+    const float* rs = row_scale.data_ptr<float>();
+    const float* cs = col_scale.data_ptr<float>();
+    float* res = result.data_ptr<float>();
+    tensorplay::parallel::parallel_for(0, M, 1, [&](int64_t r0, int64_t r1) {
+        for (int64_t r = r0; r < r1; ++r) {
+            const float sr = rs[r];
+            for (int64_t c = 0; c < N; ++c) {
+                res[r * N + c] =
+                    static_cast<float>(out_ptr[r * N + c]) * sr * cs[c];
+            }
+        }
+    });
+    return result;
+}
 #endif
 
 } // namespace TP_QN_DETAIL
@@ -1148,6 +1252,9 @@ TENSORPLAY_LIBRARY_IMPL(CPU, QuantNative) {
     m.impl("_convert_weight_to_int4pack", TP_QN_DETAIL::int4_prepack);
     m.impl("_weight_int4pack_mm_for_cpu", TP_QN_DETAIL::int4_mm);
     m.impl("_quantized_int4_mm", TP_QN_DETAIL::int4_mm_tensor_group);
+    m.impl("_quantize_int8_rowwise", TP_QN_DETAIL::_quantize_int8_rowwise_cpu);
+    m.impl("_quantize_int4_rowwise", TP_QN_DETAIL::_quantize_int4_rowwise_cpu);
+    m.impl("_int8_mm_rescale", TP_QN_DETAIL::_int8_mm_rescale_cpu);
 #endif
     m.impl("_quantized_recurrent_step", TP_QN_DETAIL::recurrent_step_checked);
     m.impl("_quantized_recurrent_cell", TP_QN_DETAIL::recurrent_cell);

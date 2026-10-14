@@ -96,12 +96,7 @@ def _dynamic_int8_mm(A: tp.Tensor, B: tp.Tensor) -> tp.Tensor:
     """
     A_i8, A_scale = quantize_int8_rowwise(A.reshape(-1, A.shape[-1]))
     B_t_i8, B_scale = quantize_int8_rowwise(B.T)
-    out = _int8_mm(
-        A_i8.contiguous(),
-        B_t_i8.contiguous(),
-        A_scale.contiguous(),
-        B_scale.contiguous(),
-    )
+    out = _int8_mm(A_i8, B_t_i8, A_scale, B_scale)
     return out.view(*A.shape[:-1], out.shape[-1])
 
 
