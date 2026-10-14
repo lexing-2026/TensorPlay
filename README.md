@@ -162,6 +162,8 @@ At a granular level, TensorPlay consists of the following components:
 | **tpx** | Autograd layer: explicit computation-graph construction and backward execution, fully decoupled from the core |
 | **stax** | JIT compiler playground: static graph capture and operator fusion experiments, including native lowering of custom ops |
 | **tensorplay.nn** | Neural network building blocks: `Module`, `Linear`, `Conv2d`, activations, losses, containers — plus the modern LLM stack: rotary embeddings, grouped-query / latent / compressed-sparse attention, delta-rule linear attention, KV caches, autoregressive generation |
+| **tensorplay.snn** | Native spiking neural networks: fused CPU/CUDA LIF/IF neurons, 15 surrogate gradients, multi-step BPTT, spike encoders and deep-SNN layers |
+| **tensorplay.quantum** | Quantum simulation: statevectors and density matrices, gate-table circuits and variational ansätze, measurements and sampling, noise channels, Lindblad master equations and parameter-shift gradients |
 | **tensorplay.optim** | Optimizers (SGD, Adam, AdamW) with learning-rate scheduling and weight decay |
 | **tensorplay.utils.data** | `Dataset` / `DataLoader` with multi-worker batching, prefetching and shuffling |
 | **tensorplay.library** | First-class custom operators: register ops, attach fake/meta and autograd formulas, bring your own Triton kernels |
@@ -206,6 +208,47 @@ The autograd engine (TPX) is a standalone library, fully decoupled from the core
 #### Extensions Without Pain
 
 First-class custom operators: register an op with `tensorplay.library`, attach fake/meta formulas for shape inference and an autograd formula for backward, and it composes with the whole stack — including native lowering into the Stax compiler or your own Triton kernels.
+
+### Spiking Neural Networks (SNN)
+
+`tensorplay.snn` provides performance-first, native spiking neural network support:
+
+- **Fused neuron kernels** — LIF / IF / PLIF / ALIF single-step and multi-step operators are fused CPU/CUDA kernels. Multi-step BPTT runs in a single kernel launch per device; the membrane trajectory is recomputed in backward, so no full forward state is stored.
+- **15 native surrogate gradients** — straight-through, sigmoid, fast-sigmoid, piecewise-linear, ATan, Erf, piecewise-quadratic, piecewise-exp, SuperSpike, nonzero-sign-log-abs, piecewise-leaky-ReLU, leaky-K-ReLU, S2NN, q-pseudo-spike and Fourier-series surrogates, evaluated inside the neuron kernels (ids 0-9 in the fused LIF kernels, 0-14 through `surrogate_grad`).
+- **Research-grade controls** — per-neuron `v_reset` broadcasting with gradients, learnable threshold and decay, differentiable `v_seq` voltage trajectories, soft/hard reset, `detach_reset`.
+- **Deep SNN building blocks** — `SpikingConv2d`, time-folded `SpikingBatchNorm1d/2d`, `SeqToANNContainer`, `SpikeLinear`.
+- **Encoders & monitoring** — Poisson / latency / weighted-phase / periodic / Gaussian-tuning-curve encoders, `SpikeMonitor`, spike-rate losses.
+- **Performance** — the fused multi-step operator reaches **~31 Gspikes/s on CUDA** and **~250 Mspikes/s on CPU** (114x over a Python time loop).
+
+```python
+import tensorplay as tp
+from tensorplay import snn
+
+lif = snn.LIFNode(threshold=1.0, decay=0.5, step_mode="m")
+out = lif(tp.rand(8, 4, 16))   # [8, 4, 16] spike train with fused BPTT
+```
+
+### Quantum Simulation
+
+`tensorplay.quantum` is a pure-Python quantum simulator for research-sized registers, with the same transparent, autograd-compatible tensors underneath:
+
+- **Circuits & ansätze** — a gate-table `Circuit` covering standard and multi-controlled gates, plus `qft_circuit`, `real_amplitudes`, `efficient_su2` and `nlocal_circuit` variational templates with trainable angles.
+- **States & data loading** — `zeros_state` / `plus_state` / `basis_state` / `random_state`, `encode_state` amplitude encoding of classical features, `product_state`, `density_mixture` eigendecomposition, `partial_trace`.
+- **Measurements** — probabilities, shot sampling, Pauli expectation values, qubit-wise-commuting grouped joint estimation, readout-error correction, and `gen_bitstrings` basis labels.
+- **Noise** — single- and multi-qubit Kraus channels (`bit_flip`, `phase_flip`, `amplitude_damping`, `depolarizing`, arbitrary `pauli_kraus` models) applied as local operators — no channel superoperator is ever built, and noise rates can be learned parameters.
+- **Open-system dynamics** — `Lindbladian`, `mesolve`, `sesolve`, `trotter_evolve`, `matrix_exp_evolve`, and a standalone `dissipator` for reading decay rates and steady states.
+- **Gradients** — `param_shift` for variational circuits; everything from gate angles to noise rates flows through the autograd engine.
+
+```python
+import tensorplay as tp
+from tensorplay import quantum as tq
+
+circuit = tq.nlocal_circuit(4, ["ry", "rz"], reps=2)
+state = circuit(tq.zeros_state(4))                       # parameterized ansatz
+hamiltonian = tq.Hamiltonian([(1.0, "ZZII"), (0.5, "XIZI")])
+energy = tq.energy(state, hamiltonian)
+energy.backward()                                        # one VQE step
+```
 
 ## Installation
 
@@ -457,6 +500,41 @@ Beyond GQA, you can swap in `MultiheadLatentAttention` (low-rank latent KV compr
 
 Structured tutorials — linear regression from scratch, MNIST CNN classification, custom datasets, model saving/loading with `.mega` + `state_dict` — live at [tensorplay.cn](https://www.tensorplay.cn/en/guide/tutorials). Deep dives, one pillar per post — dispatch, autograd engine, tensor storage, compiler — live in the [blog series](docs/blogs/00-index.md).
 
+### Interpretability with lumen
+
+`tensorplay.lumen` is the framework-native explainability suite: classic attribution (integrated gradients, DeepLIFT, LRP, SHAP, TCAV), layer and neuron attribution, and a set of research-grade LLM tools — sparse autoencoders, cross-layer transcoders, attribution graphs, feature circuits, logit lens, and causal tracing. Everything runs on tensorplay primitives; no third-party runtime is required.
+
+```python
+from tensorplay.lumen import IntegratedGradients
+from tensorplay.lumen.llm import ActivationPatching, SparseAutoencoder
+
+# feature attribution on any nn.Module
+attr = IntegratedGradients(model).attribute(prompt, target=1, n_steps=50)
+
+# causal tracing: which layer and position stores the fact?
+trace = ActivationPatching(model).causal_trace(clean_ids, corrupted_ids, target_position=-1)
+```
+
+A step-by-step guide reproducing methods from the interpretability literature (causal tracing, logit lens, SAE features, cross-layer transcoders, attribution graphs, feature circuits) is in [the lumen guide](docs/source/guide/lumen.md).
+
+## Metrics
+
+`tensorplay.metrics` is a ready-to-use evaluation suite covering the common machine-learning domains, split into stateful `Metric` classes and stateless `functional` functions:
+
+- **Classification**: accuracy, precision/recall/F1, ROC/AUC, precision-recall curve, Matthews correlation coefficient, Cohen's kappa, calibration error, hinge, Jaccard, specificity, LogAUC, threshold-based recall/precision curves
+- **Regression**: MSE/RMSE, MAE, R², Pearson/Spearman/Kendall correlations, KL/JS divergence, concordance correlation, Tweedie deviance, critical success index, and more
+- **Image**: PSNR, SSIM, total variation, and AIGC metrics (FID, KID, Inception Score, LPIPS)
+- **Audio**: SNR/SI-SNR, SDR/SI-SDR/SA-SDR with permutation-invariant training, PESQ, STOI, DNSMOS, NISQA, SRMR
+- **Text**: BLEU, ROUGE, WER/CER, CHRF, TER, SacreBLEU, BERTScore, SQuAD, InfoLM, perplexity
+- **Retrieval**: AUROC, MAP, MRR, NDCG, precision/recall, R-precision, fall-out, hit-rate, recall-at-fixed-precision
+- **Nominal**: Cramér's V, Fleiss' kappa, Pearson's contingency coefficient, Theil's U, Tschuprow's T
+- **Remote sensing**: ERGAS, RASE, SAM, UIQI, sliding-window RMSE, spectral distortion indices
+- **Wrappers**: `MetricCollection`, `MetricTracker`, running metrics, classwise/multioutput/min-max wrappers, bootstrapping and multitask wrappers
+
+Metrics mirror the reference API, so existing workflows port with minimal changes: instantiate a metric, call `update(preds, target)` repeatedly, then `compute()`, or use the functional form directly. Metrics that need optional third-party packages (transformers, pesq, pystoi, onnxruntime, ...) are importable out of the box and raise a clear `ModuleNotFoundError` until the dependency is installed.
+
+A fused dual-input reduction (`sum_squared_error` / `sum_abs_error`) powers the regression metrics: one vectorized pass computes `sum((a-b)^2)` / `sum(|a-b|)` without materialising intermediate tensors, making MSE and MAE several times faster than the reference implementation on CPU (see [Benchmarks](#benchmarks)).
+
 ## Benchmarks
 
 <p align="center">
@@ -469,6 +547,14 @@ The [benchmark/](benchmark/) suite measures what a readable framework costs — 
 - **Micro and subsystem**: GEMM, optimizer steps, dataloader, serialization, autograd Function overhead, custom-op call overhead, LLaMA end-to-end
 - **Reports**: every script emits a JSON report (`--json-out`) — throughput, latency percentiles, compile cost — ready for plotting and for the [white paper](docs/whitepaper/main.pdf) evaluation
 
+Metric kernels use fused reductions where possible. On CPU (AVX2, 8 threads), selected regression metrics beat the reference implementation by a wide margin:
+
+| Metric | TensorPlay | Reference | Speedup |
+|--------|-----------|-----------|---------|
+| MSE (10k×64) | 0.01 ms | 0.04 ms | 3.3× |
+| MAE (10k×64) | 0.01 ms | 0.04 ms | 2.8× |
+| Kendall tau-b (n=200) | 4.8 ms | 124 ms | 26× |
+
 Measured highlights from the [white paper](docs/whitepaper/main.pdf), §9 — a snapshot of current `main`: the dispatcher adds the same sub-1% sliver on CPU, CUDA and Vulkan paths; the CUDA backend covers 1,262 unique ops (97% of the CPU surface, 1,233 ops); the Vulkan teaching backend ships 224 ops backed by 6.8k lines of GLSL shaders across 102 files. The pytest suite defines <!-- tp-stats:tests-collected:begin -->3,660<!-- tp-stats:tests-collected:end --> test functions.
 
 Scripts and methodology: [benchmark/README.md](benchmark/README.md).
@@ -480,6 +566,8 @@ The Python test suite runs with pytest against an installed (or built in-place) 
 ```bash
 pytest test/
 ```
+
+The metrics suite adds about 184 tests across `test/test_metrics*.py` — stateful metrics, functional forms, curves and plots, AIGC, audio, retrieval, nominal, remote sensing, wrappers and lazy-loaded external-dependency metrics.
 
 CI builds the full wheel matrix (Python 3.10–3.13; CPU on Linux x86_64/aarch64, macOS arm64, and Windows x86_64; CUDA on Linux and Windows x86_64) and validates every wheel on every pull request and push to `main`; see [.github/workflows/](.github/workflows/) (`pull`, `trunk`, `publish`, `lint`). Lint rules live under `[tool.ruff]` in `pyproject.toml`.
 

@@ -415,5 +415,28 @@ Tensor sparse_mul_cuda(const Tensor& self, const Tensor& other) {
         static_cast<std::vector<int64_t>>(a.shape()), true);
 }
 
+// Elementwise multiplication of a sparse tensor by a scalar keeps the
+// sparsity pattern and scales the stored values.
+Tensor sparse_mul_scalar_cuda(const Tensor& self, const Scalar& other) {
+    if (!self.is_sparse()) {
+        return self.mul(other);
+    }
+    if (self.is_sparse_csr()) {
+        return Tensor::make_sparse_csr_tensor(
+            self._crow_indices().clone(), self._col_indices().clone(),
+            self._values().mul(other),
+            static_cast<std::vector<int64_t>>(self.shape()));
+    }
+    if (self.is_sparse_csc() || self.is_sparse_bsr() ||
+        self.is_sparse_bsc()) {
+        TP_THROW(NotImplementedError,
+                 "mul.Scalar: this sparse layout is not supported yet");
+    }
+    return Tensor::make_sparse_coo_tensor(
+        self._indices().clone(), self._values().mul(other),
+        static_cast<std::vector<int64_t>>(self.shape()),
+        self.is_coalesced());
+}
+
 } // namespace cuda
 } // namespace tensorplay
