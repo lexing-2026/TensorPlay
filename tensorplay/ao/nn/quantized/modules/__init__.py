@@ -26,6 +26,7 @@ from tensorplay.ao.nn.quantized import (  # noqa: F401
     LayerNorm,
     LeakyReLU,
     Linear,
+    LSTM,
     MaxPool1d,
     MaxPool2d,
     MaxPool3d,
@@ -38,6 +39,12 @@ from tensorplay.ao.nn.quantized import (  # noqa: F401
     Sigmoid,
     Softmax,
     Tanh,
+    MultiheadAttention,
+    GRU,
+    GRUCell,
+    LSTMCell,
+    RNN,
+    RNNCell,
 )
 
 from tensorplay.ao.nn.quantized import ConvTranspose1d, ConvTranspose2d, ConvTranspose3d, Embedding, EmbeddingBag, EmbeddingPackedParams

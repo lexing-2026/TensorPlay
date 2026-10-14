@@ -69,8 +69,12 @@ def propagate_qconfig_(module, qconfig_dict=None):
 
 
 def _observer_forward_hook(module, input, output):
-    module.activation_post_process.to(output.device)
-    return module.activation_post_process(output)
+    target = output[0] if isinstance(output, tuple) else output
+    module.activation_post_process.to(target.device)
+    result = module.activation_post_process(target)
+    if isinstance(output, tuple):
+        return (result,) + output[1:]
+    return result
 
 
 def _observer_forward_pre_hook(module, input):

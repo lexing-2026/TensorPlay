@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import tensorplay
 from tensorplay import nn
+from tensorplay import _C
 from tensorplay._C import (
     quantized_elu as _quantized_elu,
     quantized_hardswish as _quantized_hardswish,
@@ -351,4 +352,99 @@ class PReLU(nn.Module):
         wt_scale, wt_zp = observer.calculate_qparams()
         qweight = tensorplay.quantize_per_tensor(float_wt, float(wt_scale), int(wt_zp), tensorplay.quint8)
         result.set_weight(qweight)
+        return result
+
+
+class MultiheadAttention(nn.Module):
+    """Quantized multihead attention converted from an observed module.
+
+    The projection layers are native quantized linear modules; the attention
+    output is requantized with the module's declared output qparams.
+    """
+
+    _FLOAT_MODULE = None
+
+    def __init__(self, linear_Q, linear_K, linear_V, out_proj, scale, zero_point,
+                 batch_first=False):
+        super().__init__()
+        self.linear_Q = linear_Q
+        self.linear_K = linear_K
+        self.linear_V = linear_V
+        self.out_proj = out_proj
+        self.scale = scale
+        self.zero_point = zero_point
+        self.embed_dim = linear_Q.out_features
+        self.num_heads = getattr(linear_Q, "_num_heads", 1)
+        self.batch_first = batch_first
+
+    def _get_name(self):
+        return "QuantizedMultiheadAttention"
+
+    def forward(self, query, key, value, key_padding_mask=None, need_weights=True,
+                attn_mask=None, average_attn_weights=True, is_causal=False):
+        if is_causal:
+            raise AssertionError("causal mask not supported by AO MHA module")
+        if self.training:
+            raise AssertionError("quantized MHA can only be used in eval mode")
+
+        def run_linear(linear, x):
+            if not x.is_quantized():
+                x = _C.quantize_per_tensor(x, 1.0, 0, tensorplay.qint8)
+            return linear(x).dequantize()
+
+        q = run_linear(self.linear_Q, query)
+        k = run_linear(self.linear_K, key)
+        v = run_linear(self.linear_V, value)
+        # Normalize to (N, L, E).
+        if not self.batch_first:
+            q = q.transpose(0, 1)
+            k = k.transpose(0, 1)
+            v = v.transpose(0, 1)
+        head_dim = self.embed_dim // self.num_heads
+        scaling = float(head_dim) ** -0.5
+        # Reshape to (N, H, L, D).
+        q = q.reshape(q.size(0), q.size(1), self.num_heads, head_dim).transpose(1, 2)
+        k = k.reshape(k.size(0), k.size(1), self.num_heads, head_dim).transpose(1, 2)
+        v = v.reshape(v.size(0), v.size(1), self.num_heads, head_dim).transpose(1, 2)
+        attn = tensorplay.matmul(q, k.transpose(-2, -1)) * scaling
+        if attn_mask is not None:
+            if attn_mask.dim() == 2:
+                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
+            attn = attn + attn_mask
+        if key_padding_mask is not None:
+            attn = attn.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf"))
+        attn = tensorplay.softmax(attn, dim=-1)
+        attn_output = tensorplay.matmul(attn, v).transpose(1, 2).reshape(q.size(0), q.size(2), self.embed_dim)
+        from tensorplay.nn import functional as F
+        out_w = self.out_proj.weight().dequantize() if self.out_proj.weight().is_quantized() else self.out_proj.weight()
+        attn_output = F.linear(attn_output, out_w, self.out_proj.bias)
+        attn_output = _C.quantize_per_tensor(attn_output, self.scale, self.zero_point, tensorplay.qint8)
+        if need_weights:
+            attn_weights = attn.mean(dim=1) if average_attn_weights else attn
+            return attn_output, attn_weights
+        return attn_output, None
+
+    @classmethod
+    def from_float(cls, mod, use_precomputed_fake_quant=False):
+        raise NotImplementedError(
+            "It looks like you are trying to convert a non-observed MHA module. "
+            "Please use the quantizable MHA with the eager quantization workflow."
+        )
+
+    @classmethod
+    def from_observed(cls, other):
+        from tensorplay.ao.quantization import convert
+
+        converted = convert(other, inplace=False, remove_qconfig=True)
+        post = getattr(other, "activation_post_process", None)
+        if post is None:
+            post = getattr(other.out_proj, "activation_post_process", None)
+        if post is None:
+            scale, zero_point = 1.0, 0
+        else:
+            scale, zero_point = post.calculate_qparams()
+        result = cls(converted.linear_Q, converted.linear_K, converted.linear_V,
+                     converted.out_proj, float(scale), int(zero_point),
+                     batch_first=getattr(other, "batch_first", False))
+        result.eval()
         return result
