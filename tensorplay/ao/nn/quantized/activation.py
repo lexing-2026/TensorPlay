@@ -14,9 +14,11 @@ from tensorplay._C import (
     quantized_hardswish as _quantized_hardswish,
     quantized_hardsigmoid as _quantized_hardsigmoid,
     quantized_leaky_relu as _quantized_leaky_relu,
+    quantized_prelu as _quantized_prelu,
     quantized_relu as _quantized_relu,
     quantized_relu6 as _quantized_relu6,
     quantized_sigmoid as _quantized_sigmoid,
+    quantized_softmax as _quantized_softmax,
     quantized_tanh as _quantized_tanh,
 )
 
@@ -29,6 +31,8 @@ __all__ = [
     "Hardsigmoid",
     "Sigmoid",
     "Tanh",
+    "Softmax",
+    "PReLU",
 ]
 
 
@@ -276,3 +280,75 @@ class Tanh(nn.Tanh):
     @classmethod
     def from_reference(cls, mod, scale, zero_point):
         return cls(float(scale), int(zero_point))
+
+
+class Softmax(nn.Softmax):
+    """Softmax on a quantized tensor, requantized to declared qparams."""
+
+    def __init__(self, dim=None, scale=1.0, zero_point=0):
+        super().__init__(dim=dim)
+        self.scale = scale
+        self.zero_point = zero_point
+
+    def forward(self, input):
+        dim = self.dim
+        if dim is None:
+            dim = input.dim() - 1
+        return _quantized_softmax(input, dim, self.scale, self.zero_point)
+
+    def _get_name(self):
+        return "QuantizedSoftmax"
+
+    @classmethod
+    def from_float(cls, mod, use_precomputed_fake_quant=False):
+        scale, zero_point = _activation_qparams(mod, None, None)
+        return cls(mod.dim, scale, zero_point)
+
+    @classmethod
+    def from_reference(cls, mod, scale, zero_point):
+        return cls(mod.dim, float(scale), int(zero_point))
+
+
+class PReLU(nn.Module):
+    """Parametric rectifier on a quantized tensor with a quantized slope."""
+
+    def __init__(self, output_scale, output_zero_point, num_parameters=1):
+        super().__init__()
+        self.num_parameters = num_parameters
+        self.scale = output_scale
+        self.zero_point = output_zero_point
+        w = tensorplay.randn(num_parameters, dtype=tensorplay.float32)
+        qw = tensorplay.quantize_per_tensor(w, 1.0, 0, tensorplay.quint8)
+        self.set_weight(qw)
+
+    def set_weight(self, w):
+        self.weight = w
+
+    def forward(self, input):
+        return _quantized_prelu(input, self.weight, self.scale, self.zero_point)
+
+    def _get_name(self):
+        return "QuantizedPReLU"
+
+    @classmethod
+    def from_float(cls, mod, use_precomputed_fake_quant=False):
+        scale, zero_point = _activation_qparams(mod, None, None)
+        result = cls(float(scale), int(zero_point), mod.num_parameters)
+        float_wt = mod.weight.float()
+        observer = mod.qconfig.weight()
+        observer(float_wt)
+        wt_scale, wt_zp = observer.calculate_qparams()
+        qweight = tensorplay.quantize_per_tensor(float_wt, float(wt_scale), int(wt_zp), tensorplay.quint8)
+        result.set_weight(qweight)
+        return result
+
+    @classmethod
+    def from_reference(cls, mod, scale, zero_point):
+        result = cls(float(scale), int(zero_point), mod.num_parameters)
+        float_wt = mod.weight.float()
+        observer = mod.qconfig.weight()
+        observer(float_wt)
+        wt_scale, wt_zp = observer.calculate_qparams()
+        qweight = tensorplay.quantize_per_tensor(float_wt, float(wt_scale), int(wt_zp), tensorplay.quint8)
+        result.set_weight(qweight)
+        return result

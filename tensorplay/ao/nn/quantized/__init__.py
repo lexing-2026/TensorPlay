@@ -12,13 +12,16 @@ from .activation import (
     Hardswish,
     Hardsigmoid,
     LeakyReLU,
+    PReLU,
     ReLU,
     ReLU6,
     Sigmoid,
+    Softmax,
     Tanh,
 )
 from .batchnorm import BatchNorm2d, BatchNorm3d
 from .conv import Conv1d, Conv2d, Conv3d
+from .dropout import Dropout
 from .functional_modules import FXFloatFunctional, FloatFunctional, QFunctional
 from .linear import QuantizedLinear as Linear
 from .linear import QuantizedLinear as QuantizedLinear
@@ -47,6 +50,9 @@ __all__ = [
     "Hardsigmoid",
     "Sigmoid",
     "Tanh",
+    "Softmax",
+    "PReLU",
+    "Dropout",
     "MaxPool1d",
     "MaxPool2d",
     "MaxPool3d",

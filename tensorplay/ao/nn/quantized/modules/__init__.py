@@ -13,6 +13,7 @@ from tensorplay.ao.nn.quantized import (  # noqa: F401
     Conv2d,
     Conv3d,
     DeQuantize,
+    Dropout,
     ELU,
     FloatFunctional,
     FXFloatFunctional,
@@ -28,12 +29,14 @@ from tensorplay.ao.nn.quantized import (  # noqa: F401
     MaxPool1d,
     MaxPool2d,
     MaxPool3d,
+    PReLU,
     QFunctional,
     Quantize,
     QuantizedLinear,
     ReLU,
     ReLU6,
     Sigmoid,
+    Softmax,
     Tanh,
 )
 
