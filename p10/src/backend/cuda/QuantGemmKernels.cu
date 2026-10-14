@@ -316,7 +316,8 @@ __global__ void int4_dequantize_kernel(
 }
 
 // Pack an int32 code tensor [N, K] (values 0..15) into [N, K/2] uint8 with
-// the even-k code in the low nibble and the odd-k code in the high nibble.
+// the even-k code in the low nibble and the odd-k code in the high nibble,
+// matching the CPU packing layout used by the dequant+cuBLAS path.
 __global__ void int4_pack_kernel(const int32_t* __restrict__ codes,
                                  uint8_t* __restrict__ out,
                                  int64_t num_bytes) {
@@ -402,228 +403,466 @@ Tensor _weight_int8pack_mm_cuda(const Tensor& self, const Tensor& mat2,
     return out.to(self.dtype());
 }
 
-// ---------------------------------------------------------------------------
+
 // ---------------------------------------------------------------------------
 // Direct int4 tensor-core GEMM.
 //
-// Computes `out[B,N] = act[B,K] @ dequant(weight[N,K])^T` consuming the
-// packed int4 weight directly with mma.sync fp16/bf16 tensor-core
-// instructions.  Each 16x8x16 MMA tile dequantizes its 16x8 int4 fragment in
-// registers (two codes per byte, even k in the low nibble) with the
-// per-group (scale, zero) of the tile's K-range:
-//
-//     value = (unsigned_code - 8) * scale + zero
-//
-// The fp32 accumulator is converted to the activation dtype on store.
-//
-// Block tile: 64 (M) x 64 (N), 256 threads (8 warps: 4 along M, 2 along N).
-// Each warp owns a 16 x 32 output tile and issues four m16n8k16 MMAs per 16-K
-// step.  K advances in stages of 64, with the activation tile, the packed
-// weight tile and the (at most two) covering scale/zero groups staged in
-// shared memory.
+// The packed weight is first repacked into the m16n8k16 B-fragment layout
+// (matrix_to_m16n8k16_Bint4_layout): shape [n/8][k/(InnerKTiles*16)][32]
+// [InnerKTiles/2], int32.  The main kernel then consumes that layout
+// directly with mma.sync, loading each lane's exact fragment words straight
+// from global memory and dequantizing eight int4 values per register with
+// bit-twiddling + bf16 FMA.  No shared-memory staging is needed between the
+// fragment loads and the MMA pipeline.
 // ---------------------------------------------------------------------------
 
-// Pack two float values into the two 16-bit lanes of an MMA B fragment
-// register (low lane first), matching the fp16/bf16 storage of the
-// activation dtype.
-__device__ __forceinline__ uint32_t pack_half2(float lo, float hi) {
-    const __half h_lo = __float2half(lo);
-    const __half h_hi = __float2half(hi);
-    return static_cast<uint32_t>(__half_as_ushort(h_lo)) |
-           (static_cast<uint32_t>(__half_as_ushort(h_hi)) << 16);
+constexpr int32_t kWarpSize = 32;
+
+// bf16 vector types used by the fragment layouts.
+struct __align__(4) bf16x2x1 {
+  __nv_bfloat162 vals[1];
+};
+
+struct __align__(8) bf16x2x2 {
+  __nv_bfloat162 vals[2];
+};
+
+struct __align__(16) bf16x2x4 {
+  __nv_bfloat162 vals[4];
+};
+
+struct __align__(16) bf16x2x4_u32 {
+  uint32_t vals[4];
+};
+
+struct __align__(8) bf16x2x2_u32 {
+  uint32_t vals[2];
+};
+
+struct __align__(4) bf16x2x1_u32 {
+  uint32_t vals[1];
+};
+
+template <typename U, typename V>
+constexpr __host__ __device__ auto divDown(U a, V b) -> decltype(a + b) {
+  static_assert(std::is_integral_v<U> && std::is_integral_v<V>);
+  return (a / b);
 }
 
-__device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
-    const __nv_bfloat16 h_lo = __float2bfloat16(lo);
-    const __nv_bfloat16 h_hi = __float2bfloat16(hi);
-    return static_cast<uint32_t>(__bfloat16_as_ushort(h_lo)) |
-           (static_cast<uint32_t>(__bfloat16_as_ushort(h_hi)) << 16);
+template <typename U, typename V>
+constexpr __host__ __device__ auto divUp(U a, V b) -> decltype(a + b) {
+  static_assert(std::is_integral_v<U> && std::is_integral_v<V>);
+  const uint64_t blocks = a / b + (a % b != 0);
+  return blocks;
 }
 
-template <typename T>
-__global__ void int4pack_mma_mm_kernel(const T* __restrict__ x,
-                                       const uint8_t* __restrict__ w,
-                                       const float* __restrict__ scale_zero,
-                                       T* __restrict__ out, int64_t K,
-                                       int64_t N, int64_t group_size,
-                                       int64_t B) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    constexpr int kMBlock = 128;
-    constexpr int kNBlock = 128;
-    constexpr int kKStage = 128;
-    constexpr int kThreads = 512;
-    constexpr int kPad = 4;
+template <typename U, typename V>
+constexpr __host__ __device__ auto roundDown(U a, V b) -> decltype(a + b) {
+  static_assert(std::is_integral_v<U> && std::is_integral_v<V>);
+  return divDown(a, b) * b;
+}
 
-    const int tid = threadIdx.x;
-    const int lane = tid & 31;
-    const int warp = tid >> 5;
-    const int wm = warp >> 2;  // 0..3 along M, each warp covers 32 rows
-    const int wn = warp & 3;   // 0..3 along N, each warp covers 32 cols
+template <typename U, typename V>
+constexpr __host__ __device__ auto roundUp(U a, V b) -> decltype(a + b) {
+  static_assert(std::is_integral_v<U> && std::is_integral_v<V>);
+  return divUp(a, b) * b;
+}
 
-    const int64_t m_block = blockIdx.y * kMBlock;
-    const int64_t n_block = blockIdx.x * kNBlock;
-    const int64_t m_warp = m_block + wm * 32;
-    const int64_t n_warp = n_block + wn * 32;
-
-    __shared__ T sA[kMBlock][kKStage + kPad];
-    __shared__ uint8_t sW[kNBlock][kKStage / 2];
-    __shared__ float sSZ[4][kNBlock][2];
-
-    const int groupID = lane >> 2;
-    const int tig = lane & 3;
-    const int row_stride = kKStage + kPad;
-
-    float c[2][4][4];
-#pragma unroll
-    for (int mt = 0; mt < 2; ++mt) {
-#pragma unroll
-        for (int ns = 0; ns < 4; ++ns) {
-#pragma unroll
-            for (int j = 0; j < 4; ++j) c[mt][ns][j] = 0.0f;
-        }
-    }
-
-    const int64_t groups_per_row = K / group_size;
-
-    for (int64_t k_stage = 0; k_stage < K; k_stage += kKStage) {
-        // Stage the activation tile [128, 64] (as 32-bit fp pairs).
-        for (int idx = tid; idx < kMBlock * (kKStage / 2); idx += kThreads) {
-            const int r = idx / (kKStage / 2);
-            const int c2 = (idx % (kKStage / 2)) * 2;
-            const int64_t gk = k_stage + c2;
-            const T* src = x + (m_block + r) * K + gk;
-            *reinterpret_cast<uint32_t*>(&sA[r][c2]) =
-                *reinterpret_cast<const uint32_t*>(src);
-        }
-        // Stage the packed weight tile [128, 32] bytes.
-        for (int idx = tid; idx < kNBlock * (kKStage / 2); idx += kThreads) {
-            const int r = idx / (kKStage / 2);
-            const int c2 = idx % (kKStage / 2);
-            sW[r][c2] = w[(n_block + r) * (K / 2) + k_stage / 2 + c2];
-        }
-        // Stage (scale, zero) for the up-to-two groups this stage covers.
-        const int64_t g0 = k_stage / group_size;
-        for (int idx = tid; idx < 4 * kNBlock * 2; idx += kThreads) {
-            const int g = idx / (kNBlock * 2);
-            const int rem = idx % (kNBlock * 2);
-            const int r = rem / 2;
-            const int e = rem % 2;
-            const int64_t grp = g0 + g;
-            const float v = grp < groups_per_row
-                                ? scale_zero[(grp * N + n_block + r) * 2 + e]
-                                : 0.0f;
-            sSZ[g][r][e] = v;
-        }
-        __syncthreads();
-
-        // Four 16-K MMA steps per stage.
-#pragma unroll
-        for (int ks = 0; ks < 8; ++ks) {
-            const int k_local = ks * 16;
-            const int64_t k0 = k_stage + k_local;
-            const int g_local = static_cast<int>((k0 / group_size) - g0);
-
-#pragma unroll
-            for (int mt = 0; mt < 2; ++mt) {
-                // A fragment (16x16 fp16/bf16), shared across the N-subtiles.
-                const char* a_base = reinterpret_cast<const char*>(
-                    &sA[wm * 32 + mt * 16 + groupID][k_local + 2 * tig]);
-                const uint32_t a0 = *reinterpret_cast<const uint32_t*>(a_base);
-                const char* a8 = a_base + 8 * row_stride * sizeof(T);
-                const uint32_t a1 = *reinterpret_cast<const uint32_t*>(a8);
-                const uint32_t a2 = *reinterpret_cast<const uint32_t*>(
-                    a_base + 8 * sizeof(T));
-                const uint32_t a3 = *reinterpret_cast<const uint32_t*>(
-                    a8 + 8 * sizeof(T));
-
-#pragma unroll
-                for (int ns = 0; ns < 4; ++ns) {
-                    const int n_local = wn * 32 + ns * 8;
-                    // B fragment: b0 covers K rows {2*tig, 2*tig+1}, b1
-                    // covers {2*tig+8, 2*tig+9} at N column groupID.
-                    const int byte_base = (k_local + 2 * tig) / 2;
-                    const uint8_t* sW_row = &sW[n_local + groupID][0];
-                    const uint8_t b0b = sW_row[byte_base + 0];
-                    const uint8_t b1b = sW_row[byte_base + 4];
-                    const float scale = sSZ[g_local][n_local + groupID][0];
-                    const float zero = sSZ[g_local][n_local + groupID][1];
-                    const float v0 =
-                        (static_cast<float>(b0b & 0xf) - 8.0f) * scale + zero;
-                    const float v1 =
-                        (static_cast<float>(b0b >> 4) - 8.0f) * scale + zero;
-                    const float v2 =
-                        (static_cast<float>(b1b & 0xf) - 8.0f) * scale + zero;
-                    const float v3 =
-                        (static_cast<float>(b1b >> 4) - 8.0f) * scale + zero;
-                    uint32_t b0, b1;
-                    if constexpr (std::is_same_v<T, tensorplay::Half>) {
-                        b0 = pack_half2(v0, v1);
-                        b1 = pack_half2(v2, v3);
-                    } else {
-                        b0 = pack_bf16x2(v0, v1);
-                        b1 = pack_bf16x2(v2, v3);
-                    }
-                    float d0 = c[mt][ns][0], d1 = c[mt][ns][1],
-                          d2 = c[mt][ns][2], d3 = c[mt][ns][3];
-                    if constexpr (std::is_same_v<T, tensorplay::Half>) {
-                        asm volatile(
-                            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16."
-                            "f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-                            "{%10,%11,%12,%13};\n"
-                            : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
-                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0),
-                              "r"(b1), "f"(c[mt][ns][0]), "f"(c[mt][ns][1]),
-                              "f"(c[mt][ns][2]), "f"(c[mt][ns][3]));
-                    } else {
-                        asm volatile(
-                            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16."
-                            "f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-                            "{%10,%11,%12,%13};\n"
-                            : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
-                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0),
-                              "r"(b1), "f"(c[mt][ns][0]), "f"(c[mt][ns][1]),
-                              "f"(c[mt][ns][2]), "f"(c[mt][ns][3]));
-                    }
-                    c[mt][ns][0] = d0;
-                    c[mt][ns][1] = d1;
-                    c[mt][ns][2] = d2;
-                    c[mt][ns][3] = d3;
-                }
-            }
-        }
-        __syncthreads();
-    }
-
-    // Store the 32 x 32 output tile of this warp.  The MMA C fragment maps
-    // c0=(m,2tig), c1=(m,2tig+1), c2=(m+8,2tig), c3=(m+8,2tig+1).
-    const int64_t m0 = m_warp;
-    const int64_t n0 = n_warp;
-#pragma unroll
-    for (int mt = 0; mt < 2; ++mt) {
-#pragma unroll
-        for (int ns = 0; ns < 4; ++ns) {
-            const int64_t m = m0 + mt * 16 + groupID;
-            const int64_t col = n0 + ns * 8 + 2 * tig;
-            out[m * N + col] = static_cast<T>(c[mt][ns][0]);
-            out[m * N + col + 1] = static_cast<T>(c[mt][ns][1]);
-            out[(m + 8) * N + col] = static_cast<T>(c[mt][ns][2]);
-            out[(m + 8) * N + col + 1] = static_cast<T>(c[mt][ns][3]);
-        }
-    }
-#endif  // __CUDA_ARCH__ >= 800
+template <typename U, typename V>
+constexpr __host__ __device__ bool isEvenDivisor(U a, V b) {
+  static_assert(std::is_integral_v<U> && std::is_integral_v<V>);
+  return (a % V(b) == 0) && ((a / V(b)) >= 1);
 }
 
 template <typename T>
-void launch_int4pack_mma(const Tensor& x, const Tensor& w, const Tensor& sz,
-                         Tensor& out, int64_t B, int64_t K, int64_t N,
-                         int64_t group_size, cudaStream_t stream) {
-    constexpr int kThreads = 512;
-    const dim3 grid(static_cast<unsigned>(N / 128),
-                    static_cast<unsigned>(B / 128));
-    int4pack_mma_mm_kernel<T><<<grid, kThreads, 0, stream>>>(
-        x.data_ptr<T>(), w.data_ptr<uint8_t>(), sz.data_ptr<float>(),
-        out.data_ptr<T>(), K, N, group_size, B);
-    checkCuda(cudaGetLastError(), "int4pack mma kernel");
+constexpr __host__ __device__ bool isPowerOf2(T v) {
+  static_assert(std::is_integral_v<T>);
+  return (v && !(v & (v - 1)));
+}
+
+// Converts eight int4 nibbles held in one uint32 into four bf16x2 values
+// representing the signed int4 range [-8, 7], then applies the per-group
+// (scale, zero):  reconstructed = bf16(int4) * scale + zero.
+__device__ inline bf16x2x4 convert_i4x8_to_bf16x2x4(uint32_t source) {
+  bf16x2x4 result;
+  constexpr int kElements = 8;
+  uint32_t* h = reinterpret_cast<uint32_t*>(&result);
+  uint32_t const source_i4s = source;
+  static constexpr uint32_t immLut = (0xf0 & 0xcc) | 0xaa;
+  static constexpr uint32_t MASK = 0x000f000f;
+  static constexpr uint32_t I4s_TO_BF16s_MAGIC_NUM = 0x43004300;
+
+  uint32_t i4s = source_i4s;
+  asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+               : "=r"(h[0])
+               : "r"(i4s), "n"(MASK), "n"(I4s_TO_BF16s_MAGIC_NUM), "n"(immLut));
+#pragma unroll
+  for (int ii = 1; ii < kElements / 2; ++ii) {
+    i4s >>= 4;
+    asm volatile(
+        "lop3.b32 %0, %1, %2, %3, %4;\n"
+        : "=r"(h[ii])
+        : "r"(i4s), "n"(MASK), "n"(I4s_TO_BF16s_MAGIC_NUM), "n"(immLut));
+  }
+  static constexpr uint32_t BF16_BIAS = 0xC308C308;
+  static constexpr uint32_t BF16_ONE = 0x3F803F80;
+#pragma unroll
+  for (int ii = 0; ii < kElements / 2; ++ii) {
+    asm("fma.rn.bf16x2 %0, %1, %2, %3;\n"
+        : "=r"(h[ii])
+        : "r"(h[ii]), "r"(BF16_ONE), "r"(BF16_BIAS));
+  }
+  return result;
+}
+
+enum class KReductionType {
+  None,
+};
+
+// Loads the A matrix in 16-bit standard m x k row-major layout and stores
+// the C matrix in 16-bit standard m x n row-major layout.
+template <KReductionType ReduceType>
+struct ALayout_RM {
+  static constexpr int32_t kMTileSize = 16;
+  static constexpr int32_t kNTileSize = 8;
+  static constexpr int32_t kKTileSize = 16;
+
+  template <int KTilesToLoad>
+  static __device__ void load(const void* A, int32_t m, int32_t k,
+                              int32_t mTiles, int32_t mTile, int32_t kTiles,
+                              int32_t kTileStart, int32_t laneId,
+                              bf16x2x4_u32 out[KTilesToLoad]) {
+    const auto mLane = mTile * kMTileSize + (laneId / 4);
+    const auto kLane = kTileStart * kKTileSize + (laneId % 4) * 2;
+    auto aPtr = reinterpret_cast<const __nv_bfloat16*>(A) + mLane * k + kLane;
+    bool m0InBounds = mLane < m;
+    auto aPtrPlus8Rows = aPtr + 8 * k;
+    bool m1InBounds = (mLane + 8) < m;
+#pragma unroll
+    for (int i = 0; i < KTilesToLoad; ++i) {
+      out[i].vals[0] =
+          m0InBounds ? *reinterpret_cast<const uint32_t*>(aPtr + i * kKTileSize)
+                     : uint32_t(0);
+      out[i].vals[1] = m1InBounds
+                           ? *reinterpret_cast<const uint32_t*>(aPtrPlus8Rows +
+                                                                i * kKTileSize)
+                           : uint32_t(0);
+      out[i].vals[2] = m0InBounds
+                           ? *reinterpret_cast<const uint32_t*>(aPtr +
+                                                                i * kKTileSize +
+                                                                8)
+                           : uint32_t(0);
+      out[i].vals[3] =
+          m1InBounds ? *reinterpret_cast<const uint32_t*>(aPtrPlus8Rows +
+                                                          i * kKTileSize + 8)
+                     : uint32_t(0);
+    }
+  }
+
+  static __device__ void store(void* C, int32_t m, int32_t n, int32_t mOutTiles,
+                               int32_t mTile, int32_t nOutTiles, int32_t nTile,
+                               int32_t laneId, const float4& out) {
+    static_assert(ReduceType == KReductionType::None);
+    const int outRow = mTile * kMTileSize + (laneId / 4);
+    const int outCol = nTile * kNTileSize + (laneId % 4) * 2;
+    auto cPtr = reinterpret_cast<__nv_bfloat16*>(C) + outRow * n + outCol;
+    auto v01 = __float22bfloat162_rn(float2{out.x, out.y});
+    auto v23 = __float22bfloat162_rn(float2{out.z, out.w});
+    if (outRow < m) {
+      *reinterpret_cast<__nv_bfloat162*>(cPtr) = v01;
+    }
+    if (outRow + 8 < m) {
+      *reinterpret_cast<__nv_bfloat162*>(cPtr + 8 * n) = v23;
+    }
+  }
+};
+
+template <int InnerKTiles, int QGroupSize>
+struct BLayout_TC_int4 {
+  static constexpr int32_t kInnerKTiles = InnerKTiles;
+  static constexpr int32_t kMTileSize = 16;
+  static constexpr int32_t kNTileSize = 8;
+  static constexpr int32_t kKTileSize = 16;
+
+  template <int KTilesToLoad>
+  static __device__ void load(const void* __restrict__ B,
+                              const void* __restrict__ quantizationInfo,
+                              int32_t n, int32_t k, int32_t nTiles,
+                              int32_t nTile, int32_t kTiles,
+                              int32_t kTileStart, int32_t laneId,
+                              bf16x2x4_u32 out[KTilesToLoad / InnerKTiles]
+                                              [InnerKTiles / 2]) {
+    auto bPtr = reinterpret_cast<const int32_t*>(B) +
+        (((nTile * (kTiles / InnerKTiles) + (kTileStart / InnerKTiles)) *
+          kWarpSize) +
+         laneId) *
+            (InnerKTiles / 2);
+
+    int32_t b_int4[KTilesToLoad / InnerKTiles][InnerKTiles / 2];
+#pragma unroll
+    for (int i = 0; i < KTilesToLoad / InnerKTiles; ++i) {
+      auto bPtrCur = bPtr + i * kWarpSize * (InnerKTiles / 2);
+      if constexpr (InnerKTiles == 2) {
+        b_int4[i][0] = bPtrCur[0];
+      }
+      if constexpr (InnerKTiles == 4) {
+        int2 load8 = reinterpret_cast<const int2*>(bPtrCur)[0];
+        b_int4[i][0] = load8.x;
+        b_int4[i][1] = load8.y;
+      }
+      if constexpr (InnerKTiles == 8) {
+        int4 load16 = reinterpret_cast<const int4*>(bPtrCur)[0];
+        b_int4[i][0] = load16.x;
+        b_int4[i][1] = load16.y;
+        b_int4[i][2] = load16.z;
+        b_int4[i][3] = load16.w;
+      }
+    }
+
+    static_assert(isPowerOf2(QGroupSize));
+    static_assert(isEvenDivisor(QGroupSize, kKTileSize));
+    static_assert(QGroupSize >= kKTileSize * 2);
+    constexpr int kKTilesPerQGroup = (QGroupSize / kKTileSize);
+    constexpr int kNumQGroups = (KTilesToLoad / kKTilesPerQGroup) < 1
+                                    ? 1
+                                    : (KTilesToLoad / kKTilesPerQGroup);
+
+    __nv_bfloat162 qScaleAndZero[kNumQGroups];
+    {
+      int32_t laneN = nTile * kNTileSize + (laneId / 4);
+      int32_t groupStart = (kTileStart * kKTileSize) / QGroupSize;
+      int32_t nFull = nTiles * kNTileSize;
+      auto qInfoPtr = reinterpret_cast<const __nv_bfloat16*>(quantizationInfo) +
+          (groupStart * nFull + laneN) * 2;
+#pragma unroll
+      for (int i = 0; i < kNumQGroups; ++i) {
+        qScaleAndZero[i] =
+            *reinterpret_cast<const __nv_bfloat162*>(qInfoPtr + i * nFull * 2);
+      }
+    }
+
+    __nv_bfloat162 qScale[kNumQGroups];
+    __nv_bfloat162 qZero[kNumQGroups];
+#pragma unroll
+    for (int i = 0; i < kNumQGroups; ++i) {
+      qScale[i] = __bfloat162bfloat162(qScaleAndZero[i].x);
+      qZero[i] = __bfloat162bfloat162(qScaleAndZero[i].y);
+    }
+
+#pragma unroll
+    for (int i = 0; i < KTilesToLoad / InnerKTiles; ++i) {
+#pragma unroll
+      for (int j = 0; j < InnerKTiles / 2; ++j) {
+        bf16x2x4 v = convert_i4x8_to_bf16x2x4(b_int4[i][j]);
+        int curKTile = i * InnerKTiles + j * 2;
+        int curQGroup = (curKTile * kKTileSize) / QGroupSize;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+          v.vals[k] = __hfma2(v.vals[k], qScale[curQGroup], qZero[curQGroup]);
+        }
+        static_assert(sizeof(bf16x2x4) == sizeof(out[0][0]));
+        memcpy(&out[i][j], &v, sizeof(bf16x2x4_u32));
+      }
+    }
+  }
+};
+
+template <typename ALayout, typename BLayout, typename CLayout, int Warps,
+          int KTilesPerIteration>
+__global__ __launch_bounds__(Warps* kWarpSize)
+    void tinygemm_m16n8k16_chunk_kernel(
+        const void* const __restrict__ A, const void* const __restrict__ B,
+        const void* const __restrict__ B_quantizationInfo,
+        void* __restrict__ C, int32_t m, int32_t n, int32_t k, int32_t mTiles,
+        int32_t nTiles, int32_t kTiles) {
+  constexpr int32_t kMTileSize = 16;
+  constexpr int32_t kNTileSize = 8;
+  constexpr int32_t kKTileSize = 16;
+  static_assert(ALayout::kMTileSize == kMTileSize &&
+                ALayout::kNTileSize == kNTileSize &&
+                ALayout::kKTileSize == kKTileSize);
+  static_assert(BLayout::kMTileSize == kMTileSize &&
+                BLayout::kNTileSize == kNTileSize &&
+                BLayout::kKTileSize == kKTileSize);
+  static_assert(CLayout::kMTileSize == kMTileSize &&
+                CLayout::kNTileSize == kNTileSize &&
+                CLayout::kKTileSize == kKTileSize);
+
+  constexpr int kInnerKTiles = BLayout::kInnerKTiles;
+  static_assert(kInnerKTiles == 2 || kInnerKTiles == 4 || kInnerKTiles == 8);
+  static_assert(KTilesPerIteration >= kInnerKTiles &&
+                  isEvenDivisor(KTilesPerIteration, kInnerKTiles));
+
+  auto warpId = threadIdx.y;
+  auto laneId = threadIdx.x;
+  int32_t mTile = blockIdx.z;
+  int32_t nTile = blockIdx.y;
+  float4 c{0.0f, 0.0f, 0.0f, 0.0f};
+
+  auto kTilesLimit = roundDown(kTiles, KTilesPerIteration);
+  for (int32_t kTileBase = (blockIdx.x * Warps + warpId) * KTilesPerIteration;
+       kTileBase < kTilesLimit; kTileBase += Warps * KTilesPerIteration) {
+    bf16x2x4_u32 a[KTilesPerIteration];
+    ALayout::template load<KTilesPerIteration>(
+        A, m, k, mTiles, mTile, kTiles, kTileBase, laneId, a);
+
+    bf16x2x4_u32 b[KTilesPerIteration / kInnerKTiles][kInnerKTiles / 2];
+    BLayout::template load<KTilesPerIteration>(
+        B, B_quantizationInfo, n, k, nTiles, nTile, kTiles, kTileBase, laneId,
+        b);
+
+#pragma unroll
+    for (int i = 0; i < KTilesPerIteration / kInnerKTiles; ++i) {
+#pragma unroll
+      for (int j = 0; j < kInnerKTiles / 2; ++j) {
+        float4 cTmp[2];
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+          cTmp[k] = float4{0.0f, 0.0f, 0.0f, 0.0f};
+        }
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+          asm volatile(
+              "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+              "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+              : "=f"(cTmp[k].x), "=f"(cTmp[k].y), "=f"(cTmp[k].z),
+                "=f"(cTmp[k].w)
+              : "r"(a[i * kInnerKTiles + j * 2 + k].vals[0]),
+                "r"(a[i * kInnerKTiles + j * 2 + k].vals[1]),
+                "r"(a[i * kInnerKTiles + j * 2 + k].vals[2]),
+                "r"(a[i * kInnerKTiles + j * 2 + k].vals[3]),
+                "r"(b[i][(j * 2 + k) / 2].vals[((j * 2 + k) % 2) * 2 + 0]),
+                "r"(b[i][(j * 2 + k) / 2].vals[((j * 2 + k) % 2) * 2 + 1]),
+                "f"(cTmp[k].x), "f"(cTmp[k].y), "f"(cTmp[k].z),
+                "f"(cTmp[k].w));
+        }
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+          c.x += cTmp[k].x;
+          c.y += cTmp[k].y;
+          c.z += cTmp[k].z;
+          c.w += cTmp[k].w;
+        }
+      }
+    }
+  }
+
+  static_assert(Warps >= KTilesPerIteration / kInnerKTiles);
+  auto kTileBaseRemaining = kTilesLimit + warpId * kInnerKTiles;
+  if (kTileBaseRemaining < kTiles) {
+    bf16x2x4_u32 a[kInnerKTiles];
+    ALayout::template load<kInnerKTiles>(
+        A, m, k, mTiles, mTile, kTiles, kTileBaseRemaining, laneId, a);
+    bf16x2x4_u32 b[1][kInnerKTiles / 2];
+    BLayout::template load<kInnerKTiles>(
+        B, B_quantizationInfo, n, k, nTiles, nTile, kTiles,
+        kTileBaseRemaining, laneId, b);
+#pragma unroll
+    for (int j = 0; j < kInnerKTiles / 2; ++j) {
+      float4 cTmp[2];
+#pragma unroll
+      for (int k = 0; k < 2; ++k) {
+        cTmp[k] = float4{0.0f, 0.0f, 0.0f, 0.0f};
+      }
+#pragma unroll
+      for (int k = 0; k < 2; ++k) {
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+            : "=f"(cTmp[k].x), "=f"(cTmp[k].y), "=f"(cTmp[k].z),
+              "=f"(cTmp[k].w)
+            : "r"(a[j * 2 + k].vals[0]), "r"(a[j * 2 + k].vals[1]),
+              "r"(a[j * 2 + k].vals[2]), "r"(a[j * 2 + k].vals[3]),
+              "r"(b[0][(j * 2 + k) / 2].vals[((j * 2 + k) % 2) * 2 + 0]),
+              "r"(b[0][(j * 2 + k) / 2].vals[((j * 2 + k) % 2) * 2 + 1]),
+              "f"(cTmp[k].x), "f"(cTmp[k].y), "f"(cTmp[k].z),
+              "f"(cTmp[k].w));
+      }
+#pragma unroll
+      for (int k = 0; k < 2; ++k) {
+        c.x += cTmp[k].x;
+        c.y += cTmp[k].y;
+        c.z += cTmp[k].z;
+        c.w += cTmp[k].w;
+      }
+    }
+  }
+
+  __shared__ float4 smem_sum[Warps][kWarpSize];
+  smem_sum[warpId][laneId] = c;
+  __syncthreads();
+  if (warpId == 0) {
+    float4 sum_f32{0.0f, 0.0f, 0.0f, 0.0f};
+    for (int i = 0; i < Warps; ++i) {
+      float4 v = smem_sum[i][laneId];
+      sum_f32.x += v.x;
+      sum_f32.y += v.y;
+      sum_f32.z += v.z;
+      sum_f32.w += v.w;
+    }
+    CLayout::store(C, m, n, mTiles, mTile, nTiles / 2, nTile, laneId, sum_f32);
+  }
+}
+
+template <typename ALayout, typename BLayout, typename CLayout, int Warps,
+          int KTilesPerWarp>
+void launch_tinygemm_kernel(const Tensor& A, const Tensor& B,
+                            const Tensor& qScaleAndZeros, Tensor& C_final,
+                            int32_t mTiles, int32_t nTiles, int32_t kTiles,
+                            int32_t m, int32_t n, int32_t k,
+                            cudaStream_t stream) {
+  int32_t postKernelKTiles = 1;
+  auto grid = dim3(postKernelKTiles, nTiles, mTiles);
+  auto block = dim3(kWarpSize, Warps);
+  auto func = tinygemm_m16n8k16_chunk_kernel<ALayout, BLayout, CLayout, Warps,
+                                             KTilesPerWarp>;
+  func<<<grid, block, 0, stream>>>(
+      A.data_ptr(), B.data_ptr(), qScaleAndZeros.data_ptr(), C_final.data_ptr(),
+      m, n, k, mTiles, nTiles, kTiles);
+  checkCuda(cudaGetLastError(), "int4 tinygemm kernel");
+}
+
+// Repacks the packed nibble tensor [n][k/2] (uint8) into the m16n8k16
+// B-fragment layout [n/8][k/(InnerKTiles*16)][32][InnerKTiles/2] (int32).
+template <int InnerKTiles>
+__global__ void matrix_to_m16n8k16_Bint4_layout(
+    const uint8_t* __restrict__ in, int64_t in_rows, int64_t in_cols,
+    int32_t* __restrict__ out, int64_t out_k_super) {
+  static_assert(InnerKTiles >= 2 && isPowerOf2(InnerKTiles));
+  constexpr int32_t kNTileSize = 8;
+  constexpr int32_t kKTileSize = 16;
+
+  auto kOuterTile = blockIdx.x;
+  auto nTile = blockIdx.y;
+  auto t = threadIdx.x;
+
+#pragma unroll
+  for (int innerKTile = 0; innerKTile < InnerKTiles; innerKTile += 2) {
+    auto n0 = nTile * kNTileSize + (t / 4);
+    bool n0Valid = n0 < in_rows;
+    int32_t ks[4];
+    auto kBase0 = (kOuterTile * InnerKTiles + innerKTile) * kKTileSize / 2;
+    ks[0] = kBase0 + t % 4;
+    ks[1] = ks[0] + 4;
+    auto kBase1 = kBase0 + kKTileSize / 2;
+    ks[2] = kBase1 + t % 4;
+    ks[3] = ks[2] + 4;
+
+    const uint8_t* pIn = in + n0 * in_cols;
+    uint8_t v[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      v[i] = (n0Valid && ks[i] < in_cols) ? pIn[ks[i]] : uint8_t(0);
+    }
+    int32_t pack = ((uint32_t)(v[3] & 0xF) << 28) |
+        ((uint32_t)(v[2] & 0xF) << 24) | ((uint32_t)(v[1] & 0xF) << 20) |
+        ((uint32_t)(v[0] & 0xF) << 16) | ((uint32_t)(v[3] & 0xF0) << 8) |
+        ((uint32_t)(v[2] & 0xF0) << 4) | ((uint32_t)(v[1] & 0xF0)) |
+        ((uint32_t)(v[0] & 0xF0) >> 4);
+
+    out[(((nTile * out_k_super + kOuterTile) * 32) + t) * (InnerKTiles / 2) +
+        (innerKTile / 2)] = pack;
+  }
 }
 
 // ---------------------------------------------------------------------------
