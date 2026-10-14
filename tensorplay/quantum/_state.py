@@ -48,7 +48,7 @@ __all__ = [
 
 
 def zeros_state(n_qubits: int, batch: int = 1, *, device=None, dtype=DEFAULT_C_DTYPE) -> tp.Tensor:
-    """The all-zero state ``|0...0>``: amplitude 1 on the first basis entry."""
+    """The all-zero computational basis state: amplitude 1 on the first entry."""
     dim = 1 << n_qubits
     lead = tp.ones((batch, 1), dtype=dtype, device=device)
     tail = tp.zeros((batch, dim - 1), dtype=dtype, device=device)
@@ -64,7 +64,7 @@ def plus_state(n_qubits: int, batch: int = 1, *, device=None, dtype=DEFAULT_C_DT
 
 def basis_state(index: int, n_qubits: int, *, device=None,
                 dtype=DEFAULT_C_DTYPE) -> tp.Tensor:
-    """The computational basis state ``|index>``, shaped ``[1, 2, 2, ...]``."""
+    """The computational basis state named by ``index``, shaped ``[1, 2, 2, ...]``."""
     dim = 1 << n_qubits
     if index < 0 or index >= dim:
         raise IndexError(f"basis index {index} is out of range for {n_qubits} qubit(s)")
@@ -185,13 +185,13 @@ def product_state(states: Sequence[tp.Tensor], *, device=None, dtype=DEFAULT_C_D
 
 
 def flatten(state: tp.Tensor) -> tp.Tensor:
-    """``[batch, 2, 2, ...]`` to ``[batch, 2**n]``."""
+    """Reshape a register-shaped state ``[batch, 2, 2, ...]`` into one flat row per state."""
     batch = state.shape[0]
     return state.reshape(batch, -1)
 
 
 def unflatten(state: tp.Tensor, n_qubits: Optional[int] = None) -> tp.Tensor:
-    """``[batch, 2**n]`` to ``[batch, 2, 2, ...]``; ``n`` is read off the length if unset."""
+    """Reshape a flat state back into the register layout ``[batch, 2, 2, ...]``; the qubit count is read off the length if unset."""
     batch, dim = state.shape
     if n_qubits is None:
         n_qubits = round(math.log2(dim)) if dim > 0 else 0
@@ -214,7 +214,7 @@ def normalize(state: tp.Tensor, eps: float = 0.0) -> tp.Tensor:
 
 
 def apply_reset(state: tp.Tensor, wire: int) -> tp.Tensor:
-    """Project ``wire`` onto |0> and renormalize the register.
+    """Project ``wire`` onto the zero state and renormalize the register.
 
     Resetting a qubit is the non-unitary cousin of measuring it: every branch
     where the wire reads 1 is discarded, and the rest is scaled back up.  The
@@ -232,12 +232,12 @@ def apply_reset(state: tp.Tensor, wire: int) -> tp.Tensor:
 
 
 def inner(state_a: tp.Tensor, state_b: tp.Tensor) -> tp.Tensor:
-    """``<a|b>`` for each pair of states in the batch."""
+    """The bra-ket overlap for each pair of states in the batch."""
     return (flatten(state_a).conj() * flatten(state_b)).sum(dim=-1)
 
 
 def fidelity(state_a: tp.Tensor, state_b: tp.Tensor) -> tp.Tensor:
-    """``|<a|b>|**2`` for each pair of states in the batch."""
+    """The squared bra-ket overlap magnitude for each pair of states in the batch."""
     return inner(state_a, state_b).abs().pow(2)
 
 
@@ -301,7 +301,7 @@ def global_phase(
 
 
 def to_density(state: tp.Tensor) -> tp.Tensor:
-    """The density matrix ``|psi><psi|`` of each state in the batch."""
+    """The density matrix of each pure state in the batch."""
     flat = flatten(state)
     return flat.unsqueeze(-1) * flat.conj().unsqueeze(-2)
 

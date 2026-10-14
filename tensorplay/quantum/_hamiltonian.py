@@ -108,7 +108,7 @@ class Hamiltonian:
 
 
 def energy(state: tp.Tensor, hamiltonian: Hamiltonian) -> tp.Tensor:
-    """``<psi|H|psi>``, real and per batch entry.
+    """The Hamiltonian expectation value for each state in the batch, real.
 
     Each word is applied to the state one factor at a time, so the cost grows
     with the state rather than with its square.

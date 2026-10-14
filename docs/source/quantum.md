@@ -633,7 +633,6 @@ vector.
     :nosignatures:
 
     tensorplay.quantum.Circuit
-    tensorplay.quantum.GATE_TABLE
     tensorplay.quantum.qft_circuit
     tensorplay.quantum.real_amplitudes
     tensorplay.quantum.efficient_su2

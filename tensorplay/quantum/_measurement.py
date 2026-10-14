@@ -194,7 +194,7 @@ class _CompiledPauliExpectation(Function):
 
 
 def probs(state: tp.Tensor) -> tp.Tensor:
-    """The measurement distribution of each state, shaped ``[batch, 2**n]``."""
+    """The measurement distribution of each state, one probability per basis entry."""
     direct = _native.native_state_probs(state)
     if direct is not None:
         return direct
@@ -259,7 +259,7 @@ def _marginal_probs_by_folding(
 
 
 def apply_pauli_word(state: tp.Tensor, word: str) -> tp.Tensor:
-    """``P|psi>`` for the Pauli word ``word``, applied one factor at a time.
+    """Apply the Pauli word ``word`` to each state, one factor at a time.
 
     Each factor is a single-qubit gate, so the product costs one pass over the
     amplitudes per factor instead of the dense ``2**n`` by ``2**n`` matrix.
@@ -275,7 +275,7 @@ def apply_pauli_word(state: tp.Tensor, word: str) -> tp.Tensor:
 
 
 def expectation(state: tp.Tensor, word: str) -> tp.Tensor:
-    """``<psi|P|psi>`` for the Pauli word ``word``, real and per batch entry.
+    """The expectation value of the Pauli word ``word`` for each state, real and per batch entry.
 
     The state stays in the loop instead of being turned into a density matrix,
     so the cost grows with the state rather than with its square.  Every row of a
@@ -671,7 +671,7 @@ def apply_readout_error(counts: tp.Tensor, matrix) -> tp.Tensor:
 
 
 def counts_from_indices(indices: tp.Tensor, n_qubits: int) -> tp.Tensor:
-    """Tally sampled basis indices into counts, shaped ``[batch, 2**n_qubits]``."""
+    """Tally sampled basis indices into per-basis counts for each state in the batch."""
     dim = 1 << n_qubits
     batch = indices.shape[0]
     rows = indices.reshape(batch, -1)
