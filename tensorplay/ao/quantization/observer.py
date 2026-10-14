@@ -1,7 +1,10 @@
 """Calibration statistics and uniform quantization parameter selection."""
 import math
 import warnings
+from abc import ABC, abstractmethod
 from collections import OrderedDict
+from dataclasses import dataclass
+from enum import Enum, auto
 from functools import partial
 import tensorplay
 from tensorplay import nn
@@ -633,6 +636,171 @@ class ReuseInputObserver(ObserverBase):
         raise Exception('calculate_qparams should not be called for ReuseInputObserver')
 
 
+class MappingType(Enum):
+    """How a floating point range is mapped onto the integer grid.
+
+    SYMMETRIC maps the symmetric float range around zero onto the full
+    integer range.  SYMMETRIC_NO_CLIPPING_ERR derives the scale from the
+    per-side min/max separately so negative values round with less error.
+    ASYMMETRIC maps the observed float range directly onto the integer range.
+    """
+
+    SYMMETRIC = auto()
+    SYMMETRIC_NO_CLIPPING_ERR = auto()
+    ASYMMETRIC = auto()
+
+
+class ZeroPointDomain(Enum):
+    """Whether the zero point lives in the integer or floating point domain.
+
+    INT: quantized = round(float / scale) + zero_point (integer)
+    FLOAT: quantized = round((float - (zero_point - scale * mid)) / scale)
+    NONE: quantized = round(float / scale)
+    """
+
+    INT = auto()
+    FLOAT = auto()
+    NONE = auto()
+
+
+class TorchAODType(Enum):
+    """Placeholder for narrow integer dtypes without a native representation."""
+
+    INT1 = auto()
+    INT2 = auto()
+    INT3 = auto()
+    INT4 = auto()
+    INT5 = auto()
+    INT6 = auto()
+    INT7 = auto()
+
+
+@dataclass(frozen=True)
+class Granularity:
+    """Base class for quantization granularity descriptors."""
+
+
+@dataclass(frozen=True)
+class PerBlock(Granularity):
+    """Per-block granularity with an explicit block size."""
+
+    block_size: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class PerTensor(Granularity):
+    """A single set of quantization parameters for the whole tensor."""
+
+
+@dataclass(frozen=True)
+class PerAxis(Granularity):
+    """One set of quantization parameters per slice along ``axis``."""
+
+    axis: int
+
+
+@dataclass(frozen=True)
+class PerGroup(Granularity):
+    """One set of quantization parameters per group of ``group_size`` elements."""
+
+    group_size: int
+
+
+class PerRow(Granularity):
+    """Row-wise granularity, a per-axis special case used by float8 matmuls."""
+
+
+class PerToken(Granularity):
+    """One set of quantization parameters per token (last dimension slice)."""
+
+
+def get_block_size(
+    input_shape: tuple[int, ...], granularity: Granularity
+) -> tuple[int, ...]:
+    """Derive the block size from an input shape and a granularity type."""
+    if not isinstance(granularity, Granularity):
+        raise AssertionError(
+            "Please provide an instance of Granularity, not subclass of it"
+        )
+    if isinstance(granularity, PerTensor):
+        return input_shape
+    elif isinstance(granularity, PerAxis):
+        block_size = list(input_shape)
+        block_size[granularity.axis] = 1
+        return tuple(block_size)
+    elif isinstance(granularity, PerRow):
+        return (1,) * (len(input_shape) - 1) + (input_shape[-1],)
+    elif isinstance(granularity, PerGroup):
+        if len(input_shape) != 2:
+            raise AssertionError(
+                f"Expecting input shape dim to be 2 for per group quantization, gotinput shape: {input_shape}"
+            )
+        return (1, granularity.group_size)
+    elif isinstance(granularity, PerToken):
+        block_size = [1] * len(input_shape)
+        block_size[-1] = input_shape[-1]
+        return tuple(block_size)
+    raise ValueError(f"Unsupported Granularity: {granularity}")
+
+
+class AffineQuantizedObserverBase(ABC, nn.Module):
+    """Observer for affine quantization with an explicit granularity.
+
+    Stores the mapping configuration plus the scale/zero-point dtypes and
+    zero-point domain used by affine quantized tensors.
+    """
+
+    with_args = classmethod(_with_args)
+
+    def __init__(
+        self,
+        mapping_type: MappingType,
+        target_dtype: tensorplay.dtype,
+        granularity: Granularity,
+        quant_min: int | None = None,
+        quant_max: int | None = None,
+        eps: float | None = None,
+        scale_dtype: tensorplay.dtype | None = None,
+        zero_point_dtype: tensorplay.dtype | None = None,
+        preserve_zero: bool = True,
+        zero_point_domain: ZeroPointDomain | None = ZeroPointDomain.INT,
+        **kwargs,
+    ):
+        super().__init__()
+        if granularity is None:
+            raise AssertionError("granularity is None")
+        self.mapping_type = mapping_type
+        self.target_dtype = target_dtype
+        self.granularity = granularity
+        self.quant_min = quant_min
+        self.quant_max = quant_max
+        self.eps = eps
+        self.scale_dtype = scale_dtype
+        self.zero_point_dtype = zero_point_dtype
+        self.preserve_zero = preserve_zero
+        self.zero_point_domain = zero_point_domain
+        self.block_size = None
+        self.original_dtype = None
+
+    @abstractmethod
+    def forward(self, input):
+        """Record statistics and return the original input tensor."""
+
+    @abstractmethod
+    def calculate_qparams(self) -> tuple:
+        """Return the (scale, zero_point) tuple for this observer."""
+
+    def convert(self, model, observer_node):
+        """Rewrite the observer node into its quantized representation.
+
+        Requires the graph-mode lowering hooks for affine quantized tensors,
+        which are not part of this package yet.
+        """
+        raise NotImplementedError(
+            "AffineQuantizedObserverBase.convert requires graph-mode affine lowering"
+        )
+
+
 def with_args(**kwargs):
     return lambda cls: _with_args(cls, **kwargs)
 
@@ -681,6 +849,24 @@ default_float_qparams_observer_4bit = PerChannelMinMaxObserver.with_args(dtype=t
 default_fixed_qparams_range_neg1to1_observer = FixedQParamsObserver.with_args(scale=2./256, zero_point=128)
 default_fixed_qparams_range_0to1_observer = FixedQParamsObserver.with_args(scale=1./256, zero_point=0)
 default_placeholder_observer = PlaceholderObserver
+weight_observer_range_neg_127_to_127 = MinMaxObserver.with_args(
+    dtype=tensorplay.qint8,
+    qscheme=tensorplay.per_tensor_symmetric,
+    quant_min=-127,
+    quant_max=127,
+    eps=2**-12,
+)
+per_channel_weight_observer_range_neg_127_to_127 = PerChannelMinMaxObserver.with_args(
+    dtype=tensorplay.qint8,
+    qscheme=tensorplay.per_channel_symmetric,
+    quant_min=-127,
+    quant_max=127,
+    eps=2**-12,
+)
+default_debug_observer = RecordingObserver
+default_reuse_input_observer = ReuseInputObserver
+default_symmetric_fixed_qparams_observer = default_fixed_qparams_range_neg1to1_observer
+default_affine_fixed_qparams_observer = default_fixed_qparams_range_0to1_observer
 
 
 def get_observer_state_dict(model):
