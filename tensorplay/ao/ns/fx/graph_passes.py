@@ -45,7 +45,7 @@ def remove_quant_dequant_pairs(gm: GraphModule) -> GraphModule:
     """
     graph = gm.graph
     nodes = list(graph.nodes)
-    to_erase: set[Node] = set()
+    to_erase: list[Node] = []
     for node in nodes:
         if node.op == "output" or node in to_erase:
             continue
@@ -64,8 +64,10 @@ def remove_quant_dequant_pairs(gm: GraphModule) -> GraphModule:
         if source is None:
             continue
         node.replace_all_uses_with(source)
-        to_erase.add(node)
-        to_erase.add(input_node)
+        # erase the consumer before its producer so the producer's user
+        # count drops to zero first
+        to_erase.append(node)
+        to_erase.append(input_node)
     for n in to_erase:
         graph.erase_node(n)
     graph.lint()

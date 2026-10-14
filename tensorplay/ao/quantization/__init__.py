@@ -389,6 +389,14 @@ __all__ += [
     "auto_prepare",
     "auto_convert",
     "auto_quantize",
+    "prepare_fx",
+    "convert_fx",
+    "fuse_fx",
+    "model_size_bytes",
+    "benchmark_latency",
+    "benchmark_quantized",
+    "compare_outputs",
+    "quantize_input_for_model",
 ]
 
 from . import analyze as analyze
@@ -403,4 +411,17 @@ from .auto import (
     auto_convert as auto_convert,
     auto_prepare as auto_prepare,
     auto_quantize as auto_quantize,
+)
+from .quantize_fx import (
+    convert_fx as convert_fx,
+    fuse_fx as fuse_fx,
+    prepare_fx as prepare_fx,
+)
+from . import benchmark as benchmark
+from .benchmark import (
+    benchmark_latency as benchmark_latency,
+    benchmark_quantized as benchmark_quantized,
+    compare_outputs as compare_outputs,
+    model_size_bytes as model_size_bytes,
+    quantize_input_for_model as quantize_input_for_model,
 )

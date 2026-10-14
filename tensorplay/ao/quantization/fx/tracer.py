@@ -4,6 +4,8 @@ from collections.abc import Callable
 
 from tensorplay.graph import Tracer
 from tensorplay.ao.nn.intrinsic import _FusedModule
+from tensorplay.ao.quantization import FakeQuantizeBase, ObserverBase
+from tensorplay.ao.quantization.stubs import DeQuantStub, QuantStub
 
 __all__ = ["QuantizationTracer"]
 
@@ -25,6 +27,7 @@ class QuantizationTracer(Tracer):
                 m.__module__.startswith("tensorplay.nn")
                 and not isinstance(m, __import__("tensorplay").nn.Sequential)
             )
+            or isinstance(m, (QuantStub, DeQuantStub, ObserverBase, FakeQuantizeBase))
             or module_qualified_name in self.skipped_module_names
             or type(m) in self.skipped_module_classes
             or isinstance(m, _FusedModule)
