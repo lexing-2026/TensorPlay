@@ -98,6 +98,20 @@ class Embedding(nn.Module):
             result = cls(mod.num_embeddings, mod.embedding_dim, _weight=weight,dtype=observer.dtype)
         return result
 
+    @classmethod
+    def from_reference(cls, ref_embedding):
+        return cls(
+            ref_embedding.num_embeddings,
+            ref_embedding.embedding_dim,
+            ref_embedding.padding_idx,
+            ref_embedding.max_norm,
+            ref_embedding.norm_type,
+            ref_embedding.scale_grad_by_freq,
+            ref_embedding.sparse,
+            ref_embedding.get_quantized_weight(),
+            ref_embedding.weight_dtype,
+        )
+
     def extra_repr(self):
         return f'num_embeddings={self.num_embeddings}, embedding_dim={self.embedding_dim}, dtype={self.dtype}'
 
@@ -112,6 +126,22 @@ class EmbeddingBag(Embedding):
         self.include_last_offset = bool(include_last_offset)
         self.pruned_weights = False
         self.register_buffer('compressed_indices_mapping', None)
+
+    @classmethod
+    def from_reference(cls, ref_embedding_bag):
+        return cls(
+            ref_embedding_bag.num_embeddings,
+            ref_embedding_bag.embedding_dim,
+            ref_embedding_bag.max_norm,
+            ref_embedding_bag.norm_type,
+            ref_embedding_bag.scale_grad_by_freq,
+            ref_embedding_bag.mode,
+            ref_embedding_bag.sparse,
+            ref_embedding_bag.get_quantized_weight(),
+            ref_embedding_bag.include_last_offset,
+            ref_embedding_bag.weight_dtype,
+            ref_embedding_bag.padding_idx,
+        )
 
     def forward(self, indices, offsets=None, per_sample_weights=None, compressed_indices_mapping=None):
         mapping = self.compressed_indices_mapping if compressed_indices_mapping is None else compressed_indices_mapping

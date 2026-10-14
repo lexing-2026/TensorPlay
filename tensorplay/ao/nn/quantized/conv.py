@@ -130,6 +130,56 @@ class _ConvNd(QuantizedState, nn.Module):
         result.set_weight_bias(weight, source.bias.detach() if source.bias is not None else None)
         return result
 
+    @classmethod
+    def from_reference(cls, ref_qconv, output_scale, output_zero_point):
+        """Build a native quantized convolution from a reference module."""
+        result = cls(
+            ref_qconv.in_channels,
+            ref_qconv.out_channels,
+            ref_qconv.kernel_size,
+            ref_qconv.stride,
+            ref_qconv.padding,
+            ref_qconv.dilation,
+            ref_qconv.groups,
+            ref_qconv.bias is not None,
+            padding_mode=ref_qconv.padding_mode,
+        )
+        result.set_weight_bias(ref_qconv.get_quantized_weight(), ref_qconv.bias)
+        result.out_scale = float(output_scale)
+        result.out_zero_point = int(output_zero_point)
+        return result
+
+    @classmethod
+    def get_qconv(cls, mod, activation_post_process, weight_post_process=None):
+        """Build a quantized convolution directly from a float module."""
+        if weight_post_process is None:
+            weight_post_process = mod.qconfig.weight()
+        weight_post_process(mod.weight)
+        if weight_post_process.dtype != tp.qint8:
+            raise AssertionError(
+                f"Weight observer must have a dtype of qint8, got {weight_post_process.dtype}"
+            )
+        from .packed import quantize_module_weight
+        qweight = quantize_module_weight(mod, use_precomputed_fake_quant=False)
+        qconv = cls(
+            mod.in_channels,
+            mod.out_channels,
+            mod.kernel_size,
+            mod.stride,
+            mod.padding,
+            mod.dilation,
+            mod.groups,
+            mod.bias is not None,
+            padding_mode=mod.padding_mode,
+        )
+        qconv.set_weight_bias(qweight, mod.bias)
+        if activation_post_process is None or activation_post_process.dtype == tp.float32:
+            return qconv
+        act_scale, act_zp = activation_post_process.calculate_qparams()
+        qconv.out_scale = float(act_scale)
+        qconv.out_zero_point = int(act_zp)
+        return qconv
+
     def extra_repr(self):
         return f'{self.in_channels}, {self.out_channels}, kernel_size={self.kernel_size}, stride={self.stride}, padding={self.padding}, groups={self.groups}, scale={self.out_scale}, zero_point={self.out_zero_point}'
 
