@@ -365,7 +365,7 @@ def test_qfunctional_add():
     qconfig = QConfig(activation=MinMaxObserver, weight=PerChannelMinMaxObserver)
     mapping = QConfigMapping().set_global(default_qconfig).set_module_name("fc1", qconfig)
     resolved = mapping.to_dict()
-    assert resolved["module_name"]["fc1"] is qconfig
+    assert dict(resolved["module_name"])["fc1"] is qconfig
     assert resolved[""] is default_qconfig
 
 

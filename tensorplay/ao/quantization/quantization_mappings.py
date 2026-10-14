@@ -183,7 +183,9 @@ DEFAULT_DYNAMIC_SPARSE_QUANT_MODULE_MAPPINGS: dict[Callable, object] = {
 
 def no_observer_set() -> set:
     """Module types that must not have observers inserted by default."""
-    return set()
+    from tensorplay.ao.nn import quantizable as nn_quantizable
+
+    return {nn_quantizable.LSTM, nn_quantizable.MultiheadAttention}
 
 
 def get_default_static_quant_module_mappings() -> dict:

@@ -7,7 +7,8 @@ never instances; the preparation step instantiates fresh observers per layer.
 
 from __future__ import annotations
 
-from collections import namedtuple
+from collections import namedtuple, OrderedDict
+import re
 
 import tensorplay
 from tensorplay import nn
@@ -52,17 +53,29 @@ class QConfig(namedtuple("QConfig", ["activation", "weight"])):
         return super().__new__(cls, activation, weight)
 
 
+_QCONFIG_STYLE_ORDER = [
+    "global_qconfig",
+    "object_type_qconfigs",
+    "module_name_regex_qconfigs",
+    "module_name_qconfigs",
+    "module_name_object_type_order_qconfigs",
+]
+
+
 class QConfigMapping:
     """Pattern-based assignment of qconfigs to modules.
 
-    Resolution order for a module: exact fully-qualified name, then module
-    type, then the global qconfig.
+    Resolution order for a module (increasing match priority): global qconfig,
+    object type, module-name regex, exact fully-qualified name, then the
+    ``(module name, object type, occurrence index)`` triple.
     """
 
     def __init__(self):
         self.global_qconfig = None
-        self.object_type_qconfigs: dict = {}
-        self.module_name_qconfigs: dict = {}
+        self.object_type_qconfigs: OrderedDict = OrderedDict()
+        self.module_name_regex_qconfigs: OrderedDict = OrderedDict()
+        self.module_name_qconfigs: OrderedDict = OrderedDict()
+        self.module_name_object_type_order_qconfigs: OrderedDict = OrderedDict()
 
     def set_global(self, qconfig):
         self.global_qconfig = qconfig
@@ -72,15 +85,61 @@ class QConfigMapping:
         self.object_type_qconfigs[object_type] = qconfig
         return self
 
+    def set_module_name_regex(self, module_name_regex, qconfig):
+        self.module_name_regex_qconfigs[module_name_regex] = qconfig
+        return self
+
     def set_module_name(self, module_name, qconfig):
         self.module_name_qconfigs[module_name] = qconfig
         return self
 
+    def set_module_name_object_type_order(self, module_name, object_type, index, qconfig):
+        self.module_name_object_type_order_qconfigs[(module_name, object_type, index)] = qconfig
+        return self
+
+    def get_global_qconfig(self):
+        return self.global_qconfig
+
+    def get_object_type_qconfig(self, object_type):
+        return self.object_type_qconfigs.get(object_type)
+
+    def get_module_name_regex_qconfig(self, module_name):
+        for regex, qconfig in self.module_name_regex_qconfigs.items():
+            if re.fullmatch(regex, module_name):
+                return qconfig
+        return None
+
+    def get_module_name_qconfig(self, module_name):
+        return self.module_name_qconfigs.get(module_name)
+
+    def get_module_name_object_type_order_qconfig(self, module_name, object_type, index):
+        return self.module_name_object_type_order_qconfigs.get((module_name, object_type, index))
+
+    def _get_qconfig_for_module(self, module, prefix):
+        """Resolve the qconfig for a module following match priority order."""
+        qconfig = self.module_name_object_type_order_qconfigs.get((prefix, type(module), -1))
+        if qconfig is not None:
+            return qconfig
+        qconfig = self.module_name_qconfigs.get(prefix)
+        if qconfig is not None:
+            return qconfig
+        qconfig = self.get_module_name_regex_qconfig(prefix)
+        if qconfig is not None:
+            return qconfig
+        qconfig = self.object_type_qconfigs.get(type(module))
+        if qconfig is not None:
+            return qconfig
+        return self.global_qconfig
+
     def to_dict(self) -> dict:
         return {
             "": self.global_qconfig,
-            "object_type": dict(self.object_type_qconfigs),
-            "module_name": dict(self.module_name_qconfigs),
+            "object_type": list(self.object_type_qconfigs.items()),
+            "module_name_regex": list(self.module_name_regex_qconfigs.items()),
+            "module_name": list(self.module_name_qconfigs.items()),
+            "module_name_object_type_order": [
+                (*k, v) for k, v in self.module_name_object_type_order_qconfigs.items()
+            ],
         }
 
     @classmethod
@@ -88,11 +147,29 @@ class QConfigMapping:
         mapping = cls()
         if qconfig_dict.get(""):
             mapping.set_global(qconfig_dict[""])
-        for object_type, qconfig in qconfig_dict.get("object_type", {}).items():
+        for object_type, qconfig in qconfig_dict.get("object_type", []):
             mapping.set_object_type(object_type, qconfig)
-        for module_name, qconfig in qconfig_dict.get("module_name", {}).items():
+        for regex, qconfig in qconfig_dict.get("module_name_regex", []):
+            mapping.set_module_name_regex(regex, qconfig)
+        for module_name, qconfig in qconfig_dict.get("module_name", []):
             mapping.set_module_name(module_name, qconfig)
+        for module_name, object_type, index, qconfig in qconfig_dict.get(
+            "module_name_object_type_order", []
+        ):
+            mapping.set_module_name_object_type_order(module_name, object_type, index, qconfig)
         return mapping
+
+    def __repr__(self):
+        output = self.__class__.__name__ + " ("
+        for style_name in _QCONFIG_STYLE_ORDER:
+            output += f"\n {style_name}"
+            qconfigs = getattr(self, style_name)
+            if isinstance(qconfigs, OrderedDict) and len(qconfigs) > 0:
+                for key, qconfig in qconfigs.items():
+                    output += f"\n  {key}: {qconfig}"
+            else:
+                output += f"\n  {qconfigs}"
+        return output + "\n)"
 
 
 default_qconfig = QConfig(activation=default_observer, weight=default_weight_observer)

@@ -382,4 +382,16 @@ __all__ += [
     "get_qconfig_dtypes",
     "determine_qparams",
     "to_underlying_dtype",
+    "analyze_model",
+    "print_model_analysis",
+    "model_quantization_summary",
+    "quantization_ready",
 ]
+
+from . import analyze as analyze
+from .analyze import (
+    analyze_model as analyze_model,
+    model_quantization_summary as model_quantization_summary,
+    print_model_analysis as print_model_analysis,
+    quantization_ready as quantization_ready,
+)
