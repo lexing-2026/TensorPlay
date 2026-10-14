@@ -170,6 +170,7 @@ __all__ = [
     "GraphGuidedBackprop",
     "GraphDeconvolution",
     "ImageMaskInput",
+    "InterpretableInput",
     "InterpretableEmbeddingBase",
     "TextTemplateInput",
     "TextTokenInput",
