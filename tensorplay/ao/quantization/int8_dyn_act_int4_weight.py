@@ -51,6 +51,12 @@ def _quantize_int4_weight_signed(weight: tp.Tensor):
     group-wise scales would need a per-group split of the integer GEMM.
     """
     N, K = weight.shape
+    if weight.is_cuda:
+        # Fused native kernel: one pass computes the row absmax, the scale
+        # and the clamped rounded codes.
+        codes, scale = tp._C._quantize_int4_rowwise(weight, 1e-8)
+        return codes, scale
+
     scale = weight.abs().amax(dim=-1) / 7.0
     scale = scale.clamp(min=1e-8)
     if weight.numel() >= (1 << 21):
@@ -61,7 +67,6 @@ def _quantize_int4_weight_signed(weight: tp.Tensor):
     else:
         codes = (weight / scale.unsqueeze(-1)).round().clamp(-8, 7)
         codes = codes.to(tp.int8).reshape(N, K)
-    return codes, scale
     return codes, scale
 
 

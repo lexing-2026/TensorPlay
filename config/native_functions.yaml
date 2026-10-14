@@ -5307,6 +5307,15 @@
     CPU: choose_scale_float8_cpu
     CUDA: choose_scale_float8_cuda
 
+- func: _quantize_int8_rowwise(Tensor self, float eps) -> (Tensor, Tensor)
+  variants: function
+
+- func: _quantize_int4_rowwise(Tensor self, float eps) -> (Tensor, Tensor)
+  variants: function
+
+- func: _int8_mm_rescale(Tensor out, Tensor row_scale, Tensor col_scale) -> Tensor
+  variants: function
+
 - func: dequantize.self(Tensor self) -> Tensor
   variants: function, method
   dispatch:

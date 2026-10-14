@@ -116,6 +116,12 @@ def quantize_int8_rowwise(
     ``round(x / scale)`` clamped to [-127, 127]. Returns ``(codes, scales)``
     with ``codes`` int8 and ``scales`` the per-row float32 scale.
     """
+    if input.is_cuda:
+        # Fused native kernel: one pass computes the row absmax, the scale
+        # and the clamped rounded codes.
+        codes, scales = _C._quantize_int8_rowwise(input, eps)
+        return codes, scales.unsqueeze(-1)
+
     absmax = input.abs().amax(dim=-1, keepdim=True).clamp(min=eps)
     row_scale = absmax / 127.0
     if input.numel() >= (1 << 21):

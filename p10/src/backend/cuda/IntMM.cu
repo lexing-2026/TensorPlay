@@ -406,6 +406,19 @@ void int_mm_impl(const Tensor& self, const Tensor& mat2, Tensor& out) {
         return;
     }
 
+    // A contiguous [K,N] right operand cannot be reinterpreted as the
+    // [N,K] row-major weight the tensor-core path expects, so transpose-copy
+    // it and feed the copy's view through the same fast path.  The copy is a
+    // small fraction of the cost of the generic cuBLASLt fallback for this
+    // orientation.
+    if (self.dtype() == DType::Int8 && mat2.dim() == 2 &&
+        mat2.is_contiguous() && use_int8_tensor_cores(M, K, N)) {
+        const Tensor rhs_t = mat2.t().contiguous();
+        if (int8_gemm_transposed_ex(lhs, rhs_t.t(), out)) {
+            return;
+        }
+    }
+
     const Tensor rhs = mat2.contiguous();
     if (self.dtype() == DType::Int8 && use_int8_tensor_cores(M, K, N) &&
         int8_gemm_cublaslt(lhs, rhs, out)) {

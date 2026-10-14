@@ -558,10 +558,180 @@ Tensor _convert_weight_to_int4pack_cuda(const Tensor& self,
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Fused row-wise signed quantization.
+//
+// One block per row: the block first reduces the row's absolute maximum,
+// derives the per-row scale (absmax clamped to `eps`, divided by the largest
+// positive code), then writes `round(x / scale)` clamped to the code range.
+// A single kernel (row read twice, codes written once) replaces the eager
+// abs/amax/div/round/clamp/cast chain used for large activation and weight
+// matrices.
+// ---------------------------------------------------------------------------
+
+template <typename scalar_t>
+__global__ void rowwise_quantize_kernel(const scalar_t* __restrict__ x,
+                                        int8_t* __restrict__ codes,
+                                        float* __restrict__ scales, int K,
+                                        float eps, int quant_min,
+                                        int quant_max) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const scalar_t* row_ptr = x + static_cast<int64_t>(row) * K;
+
+    float absmax = 0.0f;
+    for (int i = tid; i < K; i += nthreads) {
+        absmax = fmaxf(absmax, fabsf(static_cast<float>(row_ptr[i])));
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        absmax = fmaxf(absmax, __shfl_down_sync(0xffffffffu, absmax, offset));
+    }
+    __shared__ float s_max[32];
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (lane == 0) s_max[warp] = absmax;
+    __syncthreads();
+    if (warp == 0) {
+        absmax = (lane < (nthreads >> 5)) ? s_max[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            absmax = fmaxf(absmax, __shfl_down_sync(0xffffffffu, absmax, offset));
+        }
+        if (lane == 0) s_max[0] = absmax;
+    }
+    __syncthreads();
+
+    const float scale = fmaxf(s_max[0], eps) / quant_max;
+    if (tid == 0) scales[row] = scale;
+
+    int8_t* codes_row = codes + static_cast<int64_t>(row) * K;
+    for (int i = tid; i < K; i += nthreads) {
+        int c = static_cast<int>(
+            rintf(static_cast<float>(row_ptr[i]) / scale));
+        c = c < quant_min ? quant_min : (c > quant_max ? quant_max : c);
+        codes_row[i] = static_cast<int8_t>(c);
+    }
+}
+
+void launch_rowwise_quantize(const Tensor& x, Tensor& codes, Tensor& scales,
+                             float eps, int quant_min, int quant_max,
+                             cudaStream_t stream) {
+    const int64_t K = x.size(1);
+    constexpr int kThreads = 256;
+    const unsigned blocks = static_cast<unsigned>(x.size(0));
+    switch (x.dtype()) {
+        case DType::Float16:
+            rowwise_quantize_kernel<tensorplay::Half>
+                <<<blocks, kThreads, 0, stream>>>(
+                    static_cast<const tensorplay::Half*>(x.data_ptr()),
+                    codes.data_ptr<int8_t>(), scales.data_ptr<float>(),
+                    static_cast<int>(K), eps, quant_min, quant_max);
+            break;
+        case DType::BFloat16:
+            rowwise_quantize_kernel<tensorplay::BFloat16>
+                <<<blocks, kThreads, 0, stream>>>(
+                    static_cast<const tensorplay::BFloat16*>(x.data_ptr()),
+                    codes.data_ptr<int8_t>(), scales.data_ptr<float>(),
+                    static_cast<int>(K), eps, quant_min, quant_max);
+            break;
+        case DType::Float32:
+            rowwise_quantize_kernel<float>
+                <<<blocks, kThreads, 0, stream>>>(
+                    static_cast<const float*>(x.data_ptr()),
+                    codes.data_ptr<int8_t>(), scales.data_ptr<float>(),
+                    static_cast<int>(K), eps, quant_min, quant_max);
+            break;
+        default:
+            TP_THROW(TypeError, "rowwise quantize: unsupported input dtype");
+    }
+}
+
+std::tuple<Tensor, Tensor> _quantize_int8_rowwise_cuda(const Tensor& self,
+                                                       double eps) {
+    if (self.dim() != 2) {
+        TP_THROW(ValueError, "_quantize_int8_rowwise(): expected a 2-D tensor");
+    }
+    const int64_t M = self.size(0);
+    const int64_t K = self.size(1);
+    const Tensor x = self.contiguous();
+    Tensor codes = Tensor::empty({M, K}, DType::Int8, self.device());
+    Tensor scales = Tensor::empty({M}, DType::Float32, self.device());
+    if (M == 0 || K == 0) {
+        return {codes, scales};
+    }
+    launch_rowwise_quantize(x, codes, scales, static_cast<float>(eps), -127,
+                            127, getCurrentCUDAStream().stream());
+    checkCuda(cudaGetLastError(), "rowwise int8 quantize kernel");
+    return {codes, scales};
+}
+
+std::tuple<Tensor, Tensor> _quantize_int4_rowwise_cuda(const Tensor& self,
+                                                       double eps) {
+    if (self.dim() != 2) {
+        TP_THROW(ValueError, "_quantize_int4_rowwise(): expected a 2-D tensor");
+    }
+    const int64_t M = self.size(0);
+    const int64_t K = self.size(1);
+    const Tensor x = self.contiguous();
+    Tensor codes = Tensor::empty({M, K}, DType::Int8, self.device());
+    Tensor scales = Tensor::empty({M}, DType::Float32, self.device());
+    if (M == 0 || K == 0) {
+        return {codes, scales};
+    }
+    launch_rowwise_quantize(x, codes, scales, static_cast<float>(eps), -8, 7,
+                            getCurrentCUDAStream().stream());
+    checkCuda(cudaGetLastError(), "rowwise int4 quantize kernel");
+    return {codes, scales};
+}
+
+__global__ void int8_mm_rescale_kernel(const int32_t* __restrict__ out,
+                                       const float* __restrict__ row_scale,
+                                       const float* __restrict__ col_scale,
+                                       float* __restrict__ result, int M,
+                                       int N) {
+    const int row = blockIdx.x;
+    const int col = blockIdx.y * blockDim.x + threadIdx.x;
+    if (col < N) {
+        const int64_t idx = static_cast<int64_t>(row) * N + col;
+        result[idx] = static_cast<float>(out[idx]) * row_scale[row] *
+                      col_scale[col];
+    }
+}
+
+Tensor _int8_mm_rescale_cuda(const Tensor& out, const Tensor& row_scale,
+                              const Tensor& col_scale) {
+    if (out.dim() != 2 || out.dtype() != DType::Int32) {
+        TP_THROW(ValueError,
+                 "_int8_mm_rescale(): expected a 2-D int32 output");
+    }
+    const int64_t M = out.size(0);
+    const int64_t N = out.size(1);
+    Tensor result = Tensor::empty({M, N}, DType::Float32, out.device());
+    if (M == 0 || N == 0) {
+        return result;
+    }
+    const Tensor rs = row_scale.contiguous();
+    const Tensor cs = col_scale.contiguous();
+    constexpr int kThreads = 256;
+    const dim3 grid(static_cast<unsigned>(M),
+                    static_cast<unsigned>((N + kThreads - 1) / kThreads));
+    int8_mm_rescale_kernel<<<grid, kThreads, 0, getCurrentCUDAStream().stream()>>>(
+        static_cast<const int32_t*>(out.data_ptr()),
+        static_cast<const float*>(rs.data_ptr()),
+        static_cast<const float*>(cs.data_ptr()),
+        static_cast<float*>(result.data_ptr()), static_cast<int>(M),
+        static_cast<int>(N));
+    checkCuda(cudaGetLastError(), "int8 mm rescale kernel");
+    return result;
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, QuantGemmKernels) {
     m.impl("_weight_int8pack_mm", _weight_int8pack_mm_cuda);
     m.impl("_weight_int4pack_mm", _weight_int4pack_mm_cuda);
     m.impl("_convert_weight_to_int4pack", _convert_weight_to_int4pack_cuda);
+    m.impl("_quantize_int8_rowwise", _quantize_int8_rowwise_cuda);
+    m.impl("_quantize_int4_rowwise", _quantize_int4_rowwise_cuda);
+    m.impl("_int8_mm_rescale", _int8_mm_rescale_cuda);
 }
 
 }  // namespace cuda

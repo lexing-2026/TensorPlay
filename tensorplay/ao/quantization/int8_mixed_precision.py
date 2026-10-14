@@ -64,8 +64,10 @@ def _int8_mm(A_i8: tp.Tensor, B_t_i8: tp.Tensor, row_scale: tp.Tensor, col_scale
     transposed weight in output-major layout), so the product is ``(M, N)``.
     """
     if A_i8.device.type == "cuda":
-        # Native int8 tensor-core path.
+        # Native int8 tensor-core path; the rescale (int32 -> float and both
+        # scale broadcasts) runs in a single fused kernel.
         out = tp.ops.tp._int_mm(A_i8, B_t_i8.t())
+        return _C._int8_mm_rescale(out, row_scale, col_scale)
     else:
         # Native SIMD quantized linear path for CPU.
         x_q = _C._make_per_tensor_quantized_tensor(A_i8, 1.0, 0)
