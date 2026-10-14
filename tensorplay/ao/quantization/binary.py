@@ -64,12 +64,11 @@ def pack_binary(codes: tp.Tensor) -> tp.Tensor:
             [x, tp.zeros((*x.shape[:-1], pad), dtype=tp.uint8, device=x.device)],
             dim=-1,
         )
-    packed = tp.zeros(
-        (*x.shape[:-1], padded // 8), dtype=tp.uint8, device=x.device
+    fields = tp.stack(
+        [((x[..., i::8] & 1) << i) for i in range(8)], dim=-1
     )
-    for i in range(8):
-        packed = packed | ((x[..., i::8] & 1) << i)
-    return packed
+    # the eight 1-bit fields do not overlap within a byte, so OR == sum
+    return fields.sum(dim=-1).to(tp.uint8)
 
 
 def unpack_binary(packed: tp.Tensor, columns: int) -> tp.Tensor:
@@ -79,11 +78,8 @@ def unpack_binary(packed: tp.Tensor, columns: int) -> tp.Tensor:
     dimension; trailing padded columns are dropped.
     """
     x = packed.to(tp.uint8)
-    codes = tp.zeros(
-        (*packed.shape[:-1], packed.shape[-1] * 8), dtype=tp.uint8, device=packed.device
-    )
-    for i in range(8):
-        codes[..., i::8] = (x >> i) & 1
+    fields = tp.stack([(x >> i) & 1 for i in range(8)], dim=-1)
+    codes = fields.reshape(*packed.shape[:-1], -1)
     if codes.shape[-1] > columns:
         codes = codes[..., :columns]
     return codes

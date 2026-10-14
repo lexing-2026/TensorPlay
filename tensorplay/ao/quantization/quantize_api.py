@@ -71,9 +71,15 @@ def quantize_(
     filter_fn = _is_linear if filter_fn is None else filter_fn
     if device is not None:
         model = model.to(device)
+    result = model
     for name, module in list(model.named_modules()):
         if filter_fn(module, name):
             replacement = handler(module, config)
             if replacement is not None and replacement is not module:
-                _set_module_at(model, name, replacement)
-    return model
+                if name == "":
+                    # The whole model is being quantized; return the
+                    # replacement module itself.
+                    result = replacement
+                else:
+                    _set_module_at(model, name, replacement)
+    return result

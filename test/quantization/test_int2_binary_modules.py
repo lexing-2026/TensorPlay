@@ -386,3 +386,32 @@ def test_intx_config_validation():
         IntxWeightOnlyConfig(groupsize=0)
     # int2_weight_only is equivalent to IntxWeightOnlyConfig(bits=2)
     assert intx_weight_only(bits=2).bits == 2
+
+
+# ---------------------------------------------------------------------------
+# quantize_ top-level module regression
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_quantize_top_level_module(device):
+    m = nn.Linear(16, 8).to(device)
+    qm = quantize_(m, int2_weight_only(groupsize=8))
+    assert isinstance(qm, WeightOnlyInt2Linear)
+    assert qm is not m
+    x = tp.randn(2, 16, device=device)
+    out = qm(x)
+    assert out.shape == (2, 8)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_quantize_top_level_training_module(device):
+    from tensorplay.ao.quantization import int8_weight_only_quantized_training
+
+    m = nn.Linear(16, 8).to(device)
+    qm = quantize_(m, int8_weight_only_quantized_training())
+    # training transform mutates in place and returns the same module
+    assert qm is m
+    from tensorplay.ao.quantization import Int8QuantizedTrainingLinearWeight
+
+    assert isinstance(qm.weight, Int8QuantizedTrainingLinearWeight)
