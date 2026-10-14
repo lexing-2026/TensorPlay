@@ -1364,6 +1364,230 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
     }
 }
 
+bool conv2d_onednn_qint8(
+    const Tensor& input, const Tensor& weight, const Tensor& bias_f,
+    double input_scale, int64_t input_zero_point, double weight_scale,
+    int64_t weight_zero_point, double out_scale, int64_t out_zero_point,
+    const std::vector<int64_t>& stride, int64_t pH_top, int64_t pH_bottom,
+    int64_t pW_left, int64_t pW_right, const std::vector<int64_t>& dilation,
+    int64_t groups, Tensor& output) {
+    if (!OneDNNContext::is_enabled()) return false;
+    if (input.dtype() != DType::QInt8 || weight.dtype() != DType::QInt8) {
+        return false;
+    }
+    try {
+        auto& eng = OneDNNContext::get_engine();
+        auto& s = OneDNNContext::get_stream();
+        const dnnl::memory::data_type dt = dnnl::memory::data_type::s8;
+
+        const int64_t N = input.size(0), IC = input.size(1);
+        const int64_t IH = input.size(2), IW = input.size(3);
+        const int64_t OC = output.size(1);
+        const int64_t OH = output.size(2), OW = output.size(3);
+        const int64_t KH = weight.size(2), KW = weight.size(3);
+        memory::dims src_dims = {N, IC, IH, IW};
+        memory::dims dst_dims = {N, OC, OH, OW};
+        memory::dims weights_dims =
+            (groups > 1)
+                ? memory::dims{groups, weight.size(0) / groups, weight.size(1),
+                               KH, KW}
+                : memory::dims{weight.size(0), weight.size(1), KH, KW};
+
+        ConvKey key;
+        key.n = N;
+        key.ic = IC;
+        key.ih = IH;
+        key.iw = IW;
+        key.oc = OC;
+        key.kh = KH;
+        key.kw = KW;
+        key.oh = OH;
+        key.ow = OW;
+        key.sh = stride[0];
+        key.sw = stride[1];
+        key.ph_t = pH_top;
+        key.ph_b = pH_bottom;
+        key.pw_l = pW_left;
+        key.pw_r = pW_right;
+        key.dh = dilation[0];
+        key.dw = dilation[1];
+        key.groups = groups;
+        key.has_bias = (bias_f.defined() && bias_f.numel() > 0);
+        key.dt = static_cast<int>(dt);
+        key.type = 0;
+
+        dnnl::primitive_attr attr;
+        attr.set_scales_mask(DNNL_ARG_SRC, 0);
+        attr.set_scales_mask(DNNL_ARG_WEIGHTS, 0);
+        attr.set_scales_mask(DNNL_ARG_DST, 0);
+        attr.set_zero_points_mask(DNNL_ARG_SRC, 0);
+        attr.set_zero_points_mask(DNNL_ARG_WEIGHTS, 0);
+        attr.set_zero_points_mask(DNNL_ARG_DST, 0);
+
+        struct CachedQConv {
+            convolution_forward::primitive_desc pd;
+            convolution_forward prim;
+            memory::desc expected_src_md;
+            memory::desc expected_weights_md;
+            memory::desc expected_dst_md;
+            dnnl::memory scratchpad;
+            bool has_scratchpad = false;
+        };
+        static std::unordered_map<ConvKey, CachedQConv> cache;
+        static std::mutex mtx;
+
+        CachedQConv entry;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            auto it = cache.find(key);
+            if (it != cache.end()) {
+                entry = it->second;
+                found = true;
+            }
+        }
+
+        if (!found) {
+            memory::desc src_md(src_dims, dt, memory::format_tag::any);
+            memory::desc weights_md(weights_dims, dt, memory::format_tag::any);
+            memory::desc dst_md(dst_dims, dt, memory::format_tag::any);
+            memory::desc bias_md;
+            if (key.has_bias) {
+                bias_md = memory::desc({bias_f.size(0)},
+                                    memory::data_type::f32,
+                                    memory::format_tag::any);
+            }
+            memory::dims strides_dims = {stride[0], stride[1]};
+            memory::dims padding_l_dims = {pH_top, pW_left};
+            memory::dims padding_r_dims = {pH_bottom, pW_right};
+            memory::dims dilates_dims = {dilation[0] - 1, dilation[1] - 1};
+            auto conv_pd = convolution_forward::primitive_desc(
+                eng, prop_kind::forward_inference,
+                algorithm::convolution_auto, src_md, weights_md, bias_md,
+                dst_md, strides_dims, dilates_dims, padding_l_dims,
+                padding_r_dims, attr);
+            auto conv = convolution_forward(conv_pd);
+            entry = CachedQConv{conv_pd,
+                                 conv,
+                                 conv_pd.src_desc(),
+                                 conv_pd.weights_desc(),
+                                 conv_pd.dst_desc(),
+                                 dnnl::memory(),
+                                 false};
+            if (conv_pd.scratchpad_desc().get_size() > 0) {
+                entry.scratchpad = dnnl::memory(conv_pd.scratchpad_desc(), eng);
+                entry.has_scratchpad = true;
+            }
+            std::lock_guard<std::mutex> lock(mtx);
+            cache.insert({key, entry});
+        }
+
+        memory src_mem;
+        Storage reordered_input_storage;
+        const auto user_src_md =
+            memory::desc(src_dims, dt, memory::format_tag::nchw);
+        auto user_src_mem = memory(user_src_md, eng, input.data_ptr());
+        if (entry.expected_src_md != user_src_md) {
+            const size_t req_size = entry.expected_src_md.get_size();
+            Allocator* allocator = getAllocator(input.device().type());
+            reordered_input_storage = Storage(req_size, allocator);
+            src_mem = memory(entry.expected_src_md, eng,
+                             reordered_input_storage.data());
+            reorder(user_src_mem, src_mem).execute(s, user_src_mem, src_mem);
+        } else {
+            src_mem = user_src_mem;
+        }
+
+        memory weights_mem;
+        Storage reordered_weight_storage;
+        const auto user_w_md =
+            memory::desc(weights_dims, dt, memory::format_tag::nchw);
+        auto user_w_mem = memory(user_w_md, eng, weight.data_ptr());
+        if (entry.expected_weights_md != user_w_md) {
+            const size_t req_size = entry.expected_weights_md.get_size();
+            Allocator* allocator = getAllocator(weight.device().type());
+            reordered_weight_storage = Storage(req_size, allocator);
+            weights_mem = memory(entry.expected_weights_md, eng,
+                              reordered_weight_storage.data());
+            reorder(user_w_mem, weights_mem).execute(s, user_w_mem, weights_mem);
+        } else {
+            weights_mem = user_w_mem;
+        }
+
+        std::unordered_map<int, memory> args;
+        args.insert({DNNL_ARG_SRC, src_mem});
+        args.insert({DNNL_ARG_WEIGHTS, weights_mem});
+
+        if (key.has_bias) {
+            const auto user_bias_md =
+                memory::desc({bias_f.size(0)}, memory::data_type::f32,
+                             memory::format_tag::x);
+            const auto expected_bias_md = entry.pd.bias_desc();
+            memory bias_mem;
+            if (expected_bias_md != user_bias_md) {
+                auto user_bias_mem =
+                    memory(user_bias_md, eng, bias_f.data_ptr());
+                bias_mem = memory(expected_bias_md, eng);
+                reorder(user_bias_mem, bias_mem)
+                    .execute(s, user_bias_mem, bias_mem);
+            } else {
+                bias_mem = memory(user_bias_md, eng, bias_f.data_ptr());
+            }
+            args.insert({DNNL_ARG_BIAS, bias_mem});
+        }
+
+        memory dst_mem;
+        Storage blocked_output_storage;
+        const auto user_dst_md =
+            memory::desc(dst_dims, dt, memory::format_tag::nchw);
+        const bool need_reorder_dst =
+            (entry.expected_dst_md != user_dst_md);
+        if (need_reorder_dst) {
+            const size_t req_size = entry.expected_dst_md.get_size();
+            Allocator* allocator = getAllocator(output.device().type());
+            blocked_output_storage = Storage(req_size, allocator);
+            dst_mem = memory(entry.expected_dst_md, eng,
+                         blocked_output_storage.data());
+        } else {
+            dst_mem = memory(entry.expected_dst_md, eng, output.data_ptr());
+        }
+        args.insert({DNNL_ARG_DST, dst_mem});
+
+        float sc_src = static_cast<float>(input_scale);
+        float sc_wei = static_cast<float>(weight_scale);
+        float sc_dst = static_cast<float>(1.0 / out_scale);
+        int32_t zp_src = static_cast<int32_t>(input_zero_point);
+        int32_t zp_wei = static_cast<int32_t>(weight_zero_point);
+        int32_t zp_dst = static_cast<int32_t>(out_zero_point);
+        memory sc_src_mem({{1}, memory::data_type::f32, {1}}, eng, &sc_src);
+        memory sc_wei_mem({{1}, memory::data_type::f32, {1}}, eng, &sc_wei);
+        memory sc_dst_mem({{1}, memory::data_type::f32, {1}}, eng, &sc_dst);
+        memory zp_src_mem({{1}, memory::data_type::s32, {1}}, eng, &zp_src);
+        memory zp_wei_mem({{1}, memory::data_type::s32, {1}}, eng, &zp_wei);
+        memory zp_dst_mem({{1}, memory::data_type::s32, {1}}, eng, &zp_dst);
+        args.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, sc_src_mem});
+        args.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, sc_wei_mem});
+        args.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST, sc_dst_mem});
+        args.insert({DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_SRC, zp_src_mem});
+        args.insert({DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS, zp_wei_mem});
+        args.insert({DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_DST, zp_dst_mem});
+
+        if (entry.has_scratchpad) {
+            args.insert({DNNL_ARG_SCRATCHPAD, entry.scratchpad});
+        }
+
+        entry.prim.execute(s, args);
+        if (need_reorder_dst) {
+            auto user_dst_mem = memory(user_dst_md, eng, output.data_ptr());
+            reorder(dst_mem, user_dst_mem).execute(s, dst_mem, user_dst_mem);
+        }
+        s.wait();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tensor& bias,
                          const std::vector<int64_t>& stride, 
                          int64_t pD_front, int64_t pD_back,
