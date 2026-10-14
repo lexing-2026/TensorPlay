@@ -500,6 +500,23 @@ Beyond GQA, you can swap in `MultiheadLatentAttention` (low-rank latent KV compr
 
 Structured tutorials — linear regression from scratch, MNIST CNN classification, custom datasets, model saving/loading with `.mega` + `state_dict` — live at [tensorplay.cn](https://www.tensorplay.cn/en/guide/tutorials). Deep dives, one pillar per post — dispatch, autograd engine, tensor storage, compiler — live in the [blog series](docs/blogs/00-index.md).
 
+### Interpretability with lumen
+
+`tensorplay.lumen` is the framework-native explainability suite: classic attribution (integrated gradients, DeepLIFT, LRP, SHAP, TCAV), layer and neuron attribution, and a set of research-grade LLM tools — sparse autoencoders, cross-layer transcoders, attribution graphs, feature circuits, logit lens, and causal tracing. Everything runs on tensorplay primitives; no third-party runtime is required.
+
+```python
+from tensorplay.lumen import IntegratedGradients
+from tensorplay.lumen.llm import ActivationPatching, SparseAutoencoder
+
+# feature attribution on any nn.Module
+attr = IntegratedGradients(model).attribute(prompt, target=1, n_steps=50)
+
+# causal tracing: which layer and position stores the fact?
+trace = ActivationPatching(model).causal_trace(clean_ids, corrupted_ids, target_position=-1)
+```
+
+A step-by-step guide reproducing methods from the interpretability literature (causal tracing, logit lens, SAE features, cross-layer transcoders, attribution graphs, feature circuits) is in [the lumen guide](docs/source/guide/lumen.md).
+
 ## Metrics
 
 `tensorplay.metrics` is a ready-to-use evaluation suite covering the common machine-learning domains, split into stateful `Metric` classes and stateless `functional` functions:

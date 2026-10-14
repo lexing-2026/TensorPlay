@@ -498,6 +498,23 @@ print(out[0].tolist())   # 提示词及其续写
 
 体系化教程——从零开始的线性回归、MNIST CNN 图像分类、自定义数据集、`.mega` + `state_dict` 模型保存与加载——见 [tensorplay.cn](https://www.tensorplay.cn/zh/guide/tutorials)。深度长文，一篇一个支柱——dispatch、autograd 引擎、张量存储、编译器——见[博客系列](docs/blogs/00-index.md)。
 
+### 可解释性：lumen
+
+`tensorplay.lumen` 是框架原生的可解释性套件：经典归因（积分梯度、DeepLIFT、LRP、SHAP、TCAV）、层/神经元归因，以及一组研究级 LLM 工具——稀疏自编码器、跨层转码器、归因图、特征电路、logit lens、因果追踪。全部基于 tensorplay 原语，无需第三方运行时。
+
+```python
+from tensorplay.lumen import IntegratedGradients
+from tensorplay.lumen.llm import ActivationPatching, SparseAutoencoder
+
+# 对任意 nn.Module 做特征归因
+attr = IntegratedGradients(model).attribute(prompt, target=1, n_steps=50)
+
+# 因果追踪：模型把事实存在哪一层、哪个位置？
+trace = ActivationPatching(model).causal_trace(clean_ids, corrupted_ids, target_position=-1)
+```
+
+以复现最新可解释性论文为示例的逐步教程（因果追踪、logit lens、SAE 特征、跨层转码器、归因图、特征电路）见 [lumen 指南](docs/source/guide/lumen.md)。
+
 ## 指标库（Metrics）
 
 `tensorplay.metrics` 是一套开箱即用的评估指标库，覆盖常见机器学习领域，分为有状态的 `Metric` 类与无状态的 `functional` 函数两种形式：
