@@ -27,6 +27,7 @@ from tensorplay.lumen._utils.attr_common import (
     get_total_features_from_mask,
 )
 from tensorplay.lumen._utils.attribution import PerturbationAttribution
+from tensorplay.lumen._utils.graph_compile import compile_forward
 from tensorplay.lumen._utils.typing import BaselineType, TargetType, TensorOrTupleOfTensorsGeneric
 
 
@@ -267,6 +268,7 @@ class FeatureAblation(PerturbationAttribution):
         feature_mask: Union[None, Tensor, Tuple[Tensor, ...]] = None,
         perturbations_per_eval: int = 1,
         show_progress: bool = False,
+        use_compiled_graph: bool = False,
         **kwargs: Any,
     ) -> TensorOrTupleOfTensorsGeneric:
         r"""Compute feature ablation attributions.
@@ -410,9 +412,6 @@ class FeatureAblation(PerturbationAttribution):
                         returned. If a tuple of tensors is provided for inputs, a
                         tuple of corresponding sized tensors is returned.
         """
-        # Keeps track whether original input is a tuple or not before
-        # converting it into a tuple. We return the attribution as tuple in the
-        # end if the inputs were a tuple.
         is_inputs_tuple = _is_tuple(inputs)
 
         formatted_inputs, baselines = _format_input_baseline(inputs, baselines)
@@ -424,6 +423,41 @@ class FeatureAblation(PerturbationAttribution):
         assert (
             isinstance(perturbations_per_eval, int) and perturbations_per_eval >= 1
         ), "Perturbations per evaluation must be an integer and at least 1."
+
+        # Optionally compile the forward function once so every ablation forward
+        # runs on the compiled graph instead of eager execution.
+        saved_forward_func = self.forward_func
+        if use_compiled_graph:
+            self.forward_func = compile_forward(self.forward_func)
+        try:
+            return self._attribute(
+                formatted_inputs,
+                baselines,
+                target,
+                formatted_additional_forward_args,
+                formatted_feature_mask,
+                perturbations_per_eval,
+                show_progress,
+                is_inputs_tuple,
+                kwargs,
+            )
+        finally:
+            if use_compiled_graph:
+                self.forward_func = saved_forward_func
+
+    def _attribute(
+        self,
+        formatted_inputs: Tuple[Tensor, ...],
+        baselines: Tuple[Union[Tensor, int, float], ...],
+        target: TargetType,
+        formatted_additional_forward_args: Tuple[Any, ...],
+        formatted_feature_mask: Tuple[Tensor, ...],
+        perturbations_per_eval: int,
+        show_progress: bool,
+        is_inputs_tuple: bool,
+        kwargs: Dict[str, Any],
+    ) -> TensorOrTupleOfTensorsGeneric:
+        """Run the ablation loop over the already-formatted inputs."""
         with tensorplay.no_grad():
             attr_progress: Progress
             if show_progress:
