@@ -48,3 +48,35 @@ __all__ = [
     "validate_pruning_amount",
     "compute_nparams_to_prune",
 ]
+
+# Sparsifier framework (upstream torch.ao.pruning API)
+from ._mappings import (
+    get_dynamic_sparse_quantized_mapping as get_dynamic_sparse_quantized_mapping,
+    get_static_sparse_quantized_mapping as get_static_sparse_quantized_mapping,
+)
+from .scheduler import BaseScheduler as BaseScheduler
+from .scheduler import CubicSL as CubicSL
+from .scheduler import LambdaSL as LambdaSL
+from .sparsifier import BaseSparsifier as BaseSparsifier
+from .sparsifier import FakeSparsity as FakeSparsity
+from .sparsifier import NearlyDiagonalSparsifier as NearlyDiagonalSparsifier
+from .sparsifier import WeightNormSparsifier as WeightNormSparsifier
+from .sparsifier import (
+    fqn_to_module as fqn_to_module,
+    get_arg_info_from_tensor_fqn as get_arg_info_from_tensor_fqn,
+    module_to_fqn as module_to_fqn,
+)
+__all__ += [
+    "BaseScheduler",
+    "CubicSL",
+    "LambdaSL",
+    "BaseSparsifier",
+    "NearlyDiagonalSparsifier",
+    "WeightNormSparsifier",
+    "FakeSparsity",
+    "fqn_to_module",
+    "get_arg_info_from_tensor_fqn",
+    "module_to_fqn",
+    "get_dynamic_sparse_quantized_mapping",
+    "get_static_sparse_quantized_mapping",
+]
