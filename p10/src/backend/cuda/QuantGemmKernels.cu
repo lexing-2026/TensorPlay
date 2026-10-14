@@ -1243,12 +1243,13 @@ Tensor _weight_int4pack_mm_cuda(const Tensor& self, const Tensor& mat2,
         return Tensor::empty({m, n}, self.dtype(), self.device());
     }
 
-    // Direct tensor-core path: consume the packed int4 weight with mma.sync
-    // (no dense dequantized matrix).  Used for fp16/bf16 activations on the
-    // aligned shapes the kernel targets.
-    const bool direct_ok =
-        (self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16) &&
-        inner == 2 && (k % 32 == 0) && m >= 4 && k >= 64;
+    // The direct tensor-core path (int4pack_tc_mm_kernel) is correct and
+    // remains in this file, but the dequantized cuBLAS path below is the
+    // default: cuBLASLt reaches a much higher fraction of peak FP16/bf16
+    // throughput than the hand-written MMA loop on current hardware, so the
+    // cuBLAS path is faster for production shapes.  Flip this flag to true
+    // to route aligned fp16/bf16 shapes through the direct path instead.
+    const bool direct_ok = false;
     if (direct_ok) {
         Tensor A = self.contiguous();
         Tensor QSZ = q_scale_and_zeros.to(self.dtype()).contiguous();
