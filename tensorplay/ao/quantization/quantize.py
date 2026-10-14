@@ -303,3 +303,72 @@ def quantize_qat(model, run_fn, run_args, inplace=False):
 
 
 __all__ += ['prepare_qat', 'quantize_qat']
+
+__all__ += ['get_default_custom_config_dict', 'swap_module', 'get_qparam_dict', 'has_no_children_ignoring_parametrizations']
+
+
+def get_default_custom_config_dict():
+    """Return the default empty custom configuration dictionary."""
+    return {}
+
+
+def _get_unique_devices_(module):
+    return {p.device for p in module.parameters()} | {
+        p.device for p in module.buffers()
+    }
+
+
+def swap_module(mod, mapping, custom_module_class_mapping, use_precomputed_fake_quant=False):
+    """Swap ``mod`` for its quantized counterpart when one exists.
+
+    ``mapping`` maps float module types to quantized module classes;
+    ``custom_module_class_mapping`` maps float module types to classes with a
+    ``from_observed`` factory.  Forward hooks are preserved across the swap.
+    """
+    from tensorplay.nn.utils.parametrize import type_before_parametrizations
+    from .utils import get_qparam_dict
+
+    new_mod = mod
+    if hasattr(mod, "qconfig") and mod.qconfig is not None:
+        swapped = False
+        if type_before_parametrizations(mod) in custom_module_class_mapping:
+            new_mod = custom_module_class_mapping[
+                type_before_parametrizations(mod)
+            ].from_observed(mod)
+            swapped = True
+        elif type_before_parametrizations(mod) in mapping:
+            qmod = mapping[type_before_parametrizations(mod)]
+            if getattr(qmod, "_IS_REFERENCE", False):
+                if mod.qconfig is None:
+                    raise AssertionError(
+                        "module qconfig must not be None when swapping to reference module"
+                    )
+                weight_post_process = mod.qconfig.weight()
+                weight_post_process(mod.weight)
+                weight_qparams = get_qparam_dict(weight_post_process)
+                new_mod = qmod.from_float(mod, weight_qparams)
+            else:
+                sig = inspect.signature(qmod.from_float)
+                if "use_precomputed_fake_quant" in sig.parameters:
+                    new_mod = qmod.from_float(
+                        mod, use_precomputed_fake_quant=use_precomputed_fake_quant
+                    )
+                else:
+                    new_mod = qmod.from_float(mod)
+            swapped = True
+
+        if swapped:
+            for pre_hook_fn in mod._forward_pre_hooks.values():
+                new_mod.register_forward_pre_hook(pre_hook_fn)
+            for hook_fn in mod._forward_hooks.values():
+                if hook_fn is not _observer_forward_hook:
+                    new_mod.register_forward_hook(hook_fn)
+            devices = _get_unique_devices_(mod)
+            if len(devices) > 1:
+                raise AssertionError(
+                    f"swap_module only works with cpu or single-device CUDA modules, but got devices {devices}"
+                )
+            device = next(iter(devices)) if len(devices) > 0 else None
+            if device:
+                new_mod.to(device)
+    return new_mod
