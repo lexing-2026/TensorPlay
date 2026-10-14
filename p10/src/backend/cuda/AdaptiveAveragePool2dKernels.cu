@@ -1,3 +1,5 @@
+#include "QuantNative.h"
+#include "QuantTensorOperators.h"
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "CUDARuntime.h"
@@ -123,6 +125,8 @@ __global__ void adaptive_avg_pool2d_backward_kernel(
 
 Tensor adaptive_avg_pool2d_cuda(const Tensor& input,
                                  const std::vector<int64_t>& output_size) {
+    if (isQuantizedType(input.dtype())) return quant::pool_cuda(input, output_size, {}, {}, {}, false, false, {}, 1);
+
     if (input.dim() == 3) {
         return adaptive_avg_pool2d_cuda(input.unsqueeze(0), output_size).squeeze(0);
     }

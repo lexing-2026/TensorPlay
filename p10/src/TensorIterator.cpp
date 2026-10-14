@@ -819,6 +819,25 @@ TensorIterator TensorIterator::reduce_op(Tensor& out, const Tensor& a) {
     .build();
 }
 
+TensorIterator TensorIterator::reduce_op2(Tensor& out, const Tensor& a, const Tensor& b) {
+  TP_CHECK(out.defined(), "output must be defined");
+  TP_CHECK(a.defined() && b.defined(), "inputs must be defined");
+  TP_CHECK(
+      a.device() == out.device() && b.device() == out.device(),
+      "reduce_op2(): expected both inputs and output to be on same device");
+  TP_CHECK(same_sizes(a, b), "reduce_op2(): expected both inputs to have same sizes");
+  return TensorIteratorConfig()
+    .set_check_mem_overlap(false)
+    .add_owned_output(out)
+    .add_owned_const_input(a)
+    .add_owned_const_input(b)
+    .resize_outputs(false)
+    .is_reduction(true)
+    .promote_inputs_to_common_dtype(true)
+    .check_all_same_dtype(false)
+    .build();
+}
+
 TensorIterator TensorIterator::reduce_op(Tensor& out1, Tensor& out2, const Tensor& a) {
   TP_CHECK(out1.defined(), "output1 must be defined");
   TP_CHECK(out2.defined(), "output2 must be defined");

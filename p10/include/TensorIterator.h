@@ -458,6 +458,7 @@ struct TensorIterator final : public TensorIteratorBase {
   static TensorIterator binary_op(Tensor& out, const Tensor& a, const Tensor& b);
 
   static TensorIterator reduce_op(Tensor& out, const Tensor& a);
+  static TensorIterator reduce_op2(Tensor& out, const Tensor& a, const Tensor& b);
   static TensorIterator reduce_op(
       Tensor& out1,
       Tensor& out2,

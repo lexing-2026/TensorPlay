@@ -467,6 +467,11 @@ PYBIND11_MODULE(_C, m) {
         const auto* row = it->second;
         const Py_ssize_t nargs = static_cast<Py_ssize_t>(args.size());
         const Py_ssize_t nkw = static_cast<Py_ssize_t>(kwargs.size());
+        const bool output_value_handle =
+            (name == "mean.out" || name == "std.correction_out" || name == "hardtanh.out" ||
+             name == "adaptive_avg_pool3d.out") && nargs > 0 && py::isinstance<Tensor>(args[0]) &&
+            tensorplay::isQuantizedType(args[0].cast<const Tensor&>().dtype());
+        py::object output_handle;
         std::vector<PyObject*> stack;
         stack.reserve(static_cast<size_t>(nargs + nkw));
         for (auto item : args) stack.push_back(item.ptr());
@@ -474,7 +479,10 @@ PYBIND11_MODULE(_C, m) {
         Py_ssize_t k = 0;
         for (auto item : kwargs) {
             kwnames[k++] = item.first;
-            stack.push_back(item.second.ptr());
+            if (output_value_handle && py::cast<std::string>(item.first) == "out") {
+                output_handle = py::cast(Tensor(item.second.cast<const Tensor&>()));
+                stack.push_back(output_handle.ptr());
+            } else stack.push_back(item.second.ptr());
         }
         PyObject* kw = nkw ? kwnames.ptr() : nullptr;
         using Fast = PyObject* (*)(PyObject*, PyObject* const*, Py_ssize_t, PyObject*);

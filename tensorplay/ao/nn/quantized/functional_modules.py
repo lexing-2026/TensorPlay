@@ -35,6 +35,17 @@ class FloatFunctional(nn.Module):
     def add_relu(self, x, y):
         return (x + y).relu()
 
+    def add_scalar(self, x, scalar):
+        return x + scalar
+
+    def mul_scalar(self, x, scalar):
+        return x * scalar
+
+    def matmul(self, x, y):
+        import tensorplay
+
+        return tensorplay.matmul(x, y)
+
     def forward(self, x, y):
         return self.add(x, y)
 
@@ -57,6 +68,16 @@ class QFunctional(nn.Module):
         super().__init__()
         self.scale = 1.0
         self.zero_point = 0
+
+    @classmethod
+    def from_float(cls, mod, use_precomputed_fake_quant=False):
+        from tensorplay.ao.quantization.stubs import QuantStub, DeQuantStub  # noqa: F401
+
+        scale, zero_point = mod.activation_post_process.calculate_qparams()
+        result = cls()
+        result.scale = float(scale)
+        result.zero_point = int(zero_point)
+        return result
 
     def _fixed(self):
         return float(self.scale), int(self.zero_point)

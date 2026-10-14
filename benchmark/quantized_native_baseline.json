@@ -1,0 +1,459 @@
+{
+  "timestamp": "2026-10-12T11:43:27.541803+00:00",
+  "commit": "eb309abeb9100ac97d1f0159d90a3232c64a86de",
+  "processor": "x86_64",
+  "threads": 4,
+  "repetitions": 100,
+  "reference_version": "2.13.0+cu130",
+  "results": [
+    {
+      "operator": "relu",
+      "device": "cpu",
+      "shape": [
+        256
+      ],
+      "reference_backend": "integer",
+      "native_us": 0.45145,
+      "reference_us": 0.6202799999999999,
+      "speedup": 1.373972754457858,
+      "max_error": 0.0
+    },
+    {
+      "operator": "tanh",
+      "device": "cpu",
+      "shape": [
+        256
+      ],
+      "reference_backend": "integer",
+      "native_us": 0.52692,
+      "reference_us": 1.01288,
+      "speedup": 1.922265239505048,
+      "max_error": 0.0
+    },
+    {
+      "operator": "hardswish",
+      "device": "cpu",
+      "shape": [
+        256
+      ],
+      "reference_backend": "integer",
+      "native_us": 0.53457,
+      "reference_us": 1.42372,
+      "speedup": 2.6632994743438654,
+      "max_error": 1.0
+    },
+    {
+      "operator": "add_scalar",
+      "device": "cpu",
+      "shape": [
+        256
+      ],
+      "reference_backend": "integer",
+      "native_us": 0.62025,
+      "reference_us": 1.56644,
+      "speedup": 2.525497783151955,
+      "max_error": 0.0
+    },
+    {
+      "operator": "relu",
+      "device": "cpu",
+      "shape": [
+        65536
+      ],
+      "reference_backend": "integer",
+      "native_us": 1.8527099999999999,
+      "reference_us": 2.14267,
+      "speedup": 1.1565058751774429,
+      "max_error": 0.0
+    },
+    {
+      "operator": "tanh",
+      "device": "cpu",
+      "shape": [
+        65536
+      ],
+      "reference_backend": "integer",
+      "native_us": 14.79635,
+      "reference_us": 47.58257,
+      "speedup": 3.215831607119323,
+      "max_error": 0.0
+    },
+    {
+      "operator": "hardswish",
+      "device": "cpu",
+      "shape": [
+        65536
+      ],
+      "reference_backend": "integer",
+      "native_us": 5.54395,
+      "reference_us": 8.22318,
+      "speedup": 1.4832709530208605,
+      "max_error": 1.0
+    },
+    {
+      "operator": "add_scalar",
+      "device": "cpu",
+      "shape": [
+        65536
+      ],
+      "reference_backend": "integer",
+      "native_us": 5.86285,
+      "reference_us": 2.89764,
+      "speedup": 0.4942374442463989,
+      "max_error": 0.0
+    },
+    {
+      "operator": "relu",
+      "device": "cpu",
+      "shape": [
+        1048576
+      ],
+      "reference_backend": "integer",
+      "native_us": 5.90415,
+      "reference_us": 5.365410000000001,
+      "speedup": 0.9087523182845966,
+      "max_error": 0.0
+    },
+    {
+      "operator": "tanh",
+      "device": "cpu",
+      "shape": [
+        1048576
+      ],
+      "reference_backend": "integer",
+      "native_us": 35.07521,
+      "reference_us": 366.25813999999997,
+      "speedup": 10.44207974806138,
+      "max_error": 0.0
+    },
+    {
+      "operator": "hardswish",
+      "device": "cpu",
+      "shape": [
+        1048576
+      ],
+      "reference_backend": "integer",
+      "native_us": 34.7701,
+      "reference_us": 49.053900000000006,
+      "speedup": 1.4108069864625068,
+      "max_error": 1.0
+    },
+    {
+      "operator": "add_scalar",
+      "device": "cpu",
+      "shape": [
+        1048576
+      ],
+      "reference_backend": "integer",
+      "native_us": 35.31935,
+      "reference_us": 6.762519999999999,
+      "speedup": 0.19146784977639733,
+      "max_error": 0.0
+    },
+    {
+      "operator": "linear",
+      "device": "cpu",
+      "shape": [
+        1,
+        512,
+        1024
+      ],
+      "reference_backend": "integer",
+      "native_us": 10.92154,
+      "reference_us": 11.40268,
+      "speedup": 1.0440542267848674,
+      "max_error": 0.0
+    },
+    {
+      "operator": "linear",
+      "device": "cpu",
+      "shape": [
+        32,
+        256,
+        512
+      ],
+      "reference_backend": "integer",
+      "native_us": 20.97292,
+      "reference_us": 16.20038,
+      "speedup": 0.7724427499842654,
+      "max_error": 0.0
+    },
+    {
+      "operator": "linear",
+      "device": "cpu",
+      "shape": [
+        256,
+        512,
+        1024
+      ],
+      "reference_backend": "integer",
+      "native_us": 401.54244,
+      "reference_us": 235.92655,
+      "speedup": 0.5875507206660396,
+      "max_error": 0.0
+    },
+    {
+      "operator": "batch_norm2d",
+      "device": "cpu",
+      "shape": [
+        4,
+        32,
+        16,
+        16
+      ],
+      "reference_backend": "integer",
+      "native_us": 16.70009,
+      "reference_us": 4.0031,
+      "speedup": 0.2397052950014042,
+      "max_error": 0.0
+    },
+    {
+      "operator": "batch_norm2d",
+      "device": "cpu",
+      "shape": [
+        4,
+        128,
+        56,
+        56
+      ],
+      "reference_backend": "integer",
+      "native_us": 319.85299,
+      "reference_us": 34.84809,
+      "speedup": 0.10895033371424792,
+      "max_error": 0.0
+    },
+    {
+      "operator": "int4_mm_float32",
+      "device": "cpu",
+      "shape": [
+        1,
+        256,
+        1024
+      ],
+      "reference_backend": "integer",
+      "native_us": 65.42303,
+      "reference_us": 81.03671,
+      "speedup": 1.2386572434813856,
+      "max_error": 0.0
+    },
+    {
+      "operator": "int4_mm_float16",
+      "device": "cpu",
+      "shape": [
+        1,
+        256,
+        1024
+      ],
+      "reference_backend": "integer",
+      "native_us": 67.67435,
+      "reference_us": 82.33056,
+      "speedup": 1.2165696456633865,
+      "max_error": 0.0
+    },
+    {
+      "operator": "int4_mm_bfloat16",
+      "device": "cpu",
+      "shape": [
+        1,
+        256,
+        1024
+      ],
+      "reference_backend": "integer",
+      "native_us": 65.48284,
+      "reference_us": 6.27295,
+      "speedup": 0.0957953259205007,
+      "max_error": 0.0
+    },
+    {
+      "operator": "int4_mm_float32",
+      "device": "cpu",
+      "shape": [
+        32,
+        256,
+        1024
+      ],
+      "reference_backend": "integer",
+      "native_us": 555.86401,
+      "reference_us": 2537.3408799999997,
+      "speedup": 4.564679191948405,
+      "max_error": 0.0
+    },
+    {
+      "operator": "int4_mm_float16",
+      "device": "cpu",
+      "shape": [
+        32,
+        256,
+        1024
+      ],
+      "reference_backend": "integer",
+      "native_us": 611.10157,
+      "reference_us": 2629.0889399999996,
+      "speedup": 4.302212707455488,
+      "max_error": 0.0
+    },
+    {
+      "operator": "int4_mm_bfloat16",
+      "device": "cpu",
+      "shape": [
+        32,
+        256,
+        1024
+      ],
+      "reference_backend": "integer",
+      "native_us": 560.95461,
+      "reference_us": 56.53744,
+      "speedup": 0.10078790510340933,
+      "max_error": 0.0
+    },
+    {
+      "operator": "dynamic_lstm",
+      "device": "cpu",
+      "shape": [
+        16,
+        4,
+        256
+      ],
+      "reference_backend": "integer",
+      "native_us": 3940.38143,
+      "reference_us": 476.25711,
+      "speedup": 0.12086573811713452,
+      "max_error": 2.3283064365386963e-10
+    },
+    {
+      "operator": "dynamic_gru",
+      "device": "cpu",
+      "shape": [
+        16,
+        4,
+        256
+      ],
+      "reference_backend": "integer",
+      "native_us": 2990.52835,
+      "reference_us": 362.68291,
+      "speedup": 0.12127720173594074,
+      "max_error": 9.313225746154785e-10
+    },
+    {
+      "operator": "relu",
+      "device": "cuda",
+      "shape": [
+        256
+      ],
+      "reference_backend": "integer",
+      "native_us": 2.5875,
+      "reference_us": 14.8566,
+      "speedup": 5.74168115942029,
+      "max_error": 0.0
+    },
+    {
+      "operator": "relu",
+      "device": "cuda",
+      "shape": [
+        65536
+      ],
+      "reference_backend": "integer",
+      "native_us": 2.59675,
+      "reference_us": 14.901980000000002,
+      "speedup": 5.738704149417542,
+      "max_error": 0.0
+    },
+    {
+      "operator": "relu",
+      "device": "cuda",
+      "shape": [
+        1048576
+      ],
+      "reference_backend": "integer",
+      "native_us": 7.87316,
+      "reference_us": 16.81074,
+      "speedup": 2.1351960331048776,
+      "max_error": 0.0
+    },
+    {
+      "operator": "linear",
+      "device": "cuda",
+      "shape": [
+        1,
+        512,
+        1024
+      ],
+      "reference_backend": "floating",
+      "native_us": 21.388840000000002,
+      "reference_us": 18.47738,
+      "speedup": 0.8638794810751774,
+      "max_error": 0.0
+    },
+    {
+      "operator": "linear",
+      "device": "cuda",
+      "shape": [
+        32,
+        256,
+        512
+      ],
+      "reference_backend": "floating",
+      "native_us": 13.86647,
+      "reference_us": 14.64582,
+      "speedup": 1.056203922122934,
+      "max_error": 0.0
+    },
+    {
+      "operator": "linear",
+      "device": "cuda",
+      "shape": [
+        256,
+        512,
+        1024
+      ],
+      "reference_backend": "floating",
+      "native_us": 68.77596,
+      "reference_us": 42.80464,
+      "speedup": 0.6223779355460832,
+      "max_error": 1.0
+    },
+    {
+      "operator": "linear_signed",
+      "device": "cuda",
+      "shape": [
+        1,
+        512,
+        1024
+      ],
+      "reference_backend": "integer",
+      "native_us": 19.28756,
+      "reference_us": 16.10645,
+      "speedup": 0.8350693400305689,
+      "max_error": 1.0
+    },
+    {
+      "operator": "linear_signed",
+      "device": "cuda",
+      "shape": [
+        32,
+        256,
+        512
+      ],
+      "reference_backend": "integer",
+      "native_us": 12.50333,
+      "reference_us": 15.881780000000001,
+      "speedup": 1.2702040176496983,
+      "max_error": 1.0
+    },
+    {
+      "operator": "linear_signed",
+      "device": "cuda",
+      "shape": [
+        256,
+        512,
+        1024
+      ],
+      "reference_backend": "integer",
+      "native_us": 61.8008,
+      "reference_us": 16.00287,
+      "speedup": 0.258942764494958,
+      "max_error": 1.0
+    }
+  ],
+  "working_tree_dirty": true
+}

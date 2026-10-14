@@ -1,4 +1,6 @@
 #include "SparseKernels.h"
+#include "cpu/SparseBlasKernels.h"
+#include "Parallel.h"
 #include "Utils.h"
 
 #include <algorithm>
@@ -649,6 +651,95 @@ Tensor to_sparse_coo_cpu_sparse_dim(const Tensor& self, int64_t sparse_dim) {
     return dense_to_sparse_coo_cpu(self, sparse_dim);
 }
 
+// Converts a 2-D compressed sparse tensor (CSC/BSR/BSC) into canonical CSR
+// by expanding blocked entries into individual coordinates and re-sorting
+// the entries row-major.  CSR input is returned unchanged.
+Tensor compressed_to_csr_cpu(const Tensor& self) {
+    if (self.is_sparse_csr()) return self;
+    if (self.dim() != 2 || !self.is_sparse_compressed()) {
+        TP_THROW(RuntimeError,
+                 "compressed_to_csr: expected a 2-D compressed sparse tensor");
+    }
+    const bool blocked = self.is_sparse_bsr() || self.is_sparse_bsc();
+    const bool row_compressed = self.is_sparse_bsr();
+    const std::array<int64_t, 2> bs = self.sparse_blocksize();
+    const int64_t b0 = blocked ? bs[0] : 1;
+    const int64_t b1 = blocked ? bs[1] : 1;
+    const int64_t rows = self.size(0);
+    const int64_t cols = self.size(1);
+    const int64_t comp_units = row_compressed ? rows / b0 : cols / b1;
+    const int64_t block_numel = b0 * b1;
+
+    Tensor comp = self._crow_indices().contiguous();
+    Tensor plain = self._col_indices().contiguous();
+    Tensor values = self._values().contiguous();
+    const int64_t* comp_ptr = comp.data_ptr<int64_t>();
+    const int64_t* plain_ptr = plain.data_ptr<int64_t>();
+
+    // Pass 1: count entries per output row.
+    std::vector<int64_t> row_counts(rows, 0);
+    for (int64_t cu = 0; cu < comp_units; ++cu) {
+        for (int64_t e = comp_ptr[cu]; e < comp_ptr[cu + 1]; ++e) {
+            const int64_t pu = plain_ptr[e];
+            if (blocked) {
+                const int64_t base_row = row_compressed ? cu * b0 : pu * b0;
+                for (int64_t i = 0; i < b0; ++i) {
+                    row_counts[base_row + i] += b1;
+                }
+            } else {
+                const int64_t r = row_compressed ? cu : pu;
+                row_counts[r] += 1;
+            }
+        }
+    }
+    Tensor crow = Tensor::empty({rows + 1}, DType::Int64, self.device());
+    int64_t* crow_ptr = crow.data_ptr<int64_t>();
+    crow_ptr[0] = 0;
+    int64_t total = 0;
+    for (int64_t r = 0; r < rows; ++r) {
+        total += row_counts[r];
+        crow_ptr[r + 1] = total;
+    }
+    Tensor col = Tensor::empty({total}, DType::Int64, self.device());
+    Tensor out_values = Tensor::empty({total}, self.dtype(), self.device());
+    int64_t* col_ptr = col.data_ptr<int64_t>();
+    std::vector<int64_t> pos(crow_ptr, crow_ptr + rows);
+
+    dispatch_dtype(self.dtype(), [&](auto tag) {
+        using scalar_t = typename decltype(tag)::type;
+        const scalar_t* val_ptr = values.data_ptr<scalar_t>();
+        scalar_t* out_val_ptr = out_values.data_ptr<scalar_t>();
+        for (int64_t cu = 0; cu < comp_units; ++cu) {
+            for (int64_t e = comp_ptr[cu]; e < comp_ptr[cu + 1]; ++e) {
+                const int64_t pu = plain_ptr[e];
+                if (blocked) {
+                    const int64_t base_row = row_compressed ? cu * b0 : pu * b0;
+                    const int64_t base_col =
+                        row_compressed ? pu * b1 : cu * b1;
+                    for (int64_t i = 0; i < b0; ++i) {
+                        const int64_t r = base_row + i;
+                        for (int64_t j = 0; j < b1; ++j) {
+                            const int64_t slot = pos[r]++;
+                            col_ptr[slot] = base_col + j;
+                            out_val_ptr[slot] =
+                                val_ptr[e * block_numel + i * b1 + j];
+                        }
+                    }
+                } else {
+                    const int64_t r = row_compressed ? cu : pu;
+                    const int64_t c = row_compressed ? pu : cu;
+                    const int64_t slot = pos[r]++;
+                    col_ptr[slot] = c;
+                    out_val_ptr[slot] = val_ptr[e];
+                }
+            }
+        }
+    });
+    return Tensor::make_sparse_csr_tensor(
+        crow, col, out_values,
+        static_cast<std::vector<int64_t>>(self.shape()));
+}
+
 Tensor to_sparse_csr_cpu(const Tensor& self) {
     if (self.dim() != 2) {
         TP_THROW(RuntimeError,
@@ -657,6 +748,10 @@ Tensor to_sparse_csr_cpu(const Tensor& self) {
     }
     if (self.is_sparse_csr()) return self;
     if (self.is_sparse()) {
+        if (self.is_sparse_csc() || self.is_sparse_bsr() ||
+            self.is_sparse_bsc()) {
+            return compressed_to_csr_cpu(self);
+        }
         return coo_to_csr_cpu(self.coalesce(), self.size(0));
     }
     Tensor contiguous_self = self.contiguous();
@@ -974,6 +1069,29 @@ Tensor sparse_mul_cpu(const Tensor& self, const Tensor& other) {
     return result_storage;
 }
 
+// Elementwise multiplication of a sparse tensor by a scalar keeps the
+// sparsity pattern and scales the stored values.
+Tensor sparse_mul_scalar_cpu(const Tensor& self, const Scalar& other) {
+    if (!self.is_sparse()) {
+        return self.mul(other);
+    }
+    if (self.is_sparse_csr()) {
+        return Tensor::make_sparse_csr_tensor(
+            self._crow_indices().clone(), self._col_indices().clone(),
+            self._values().mul(other),
+            static_cast<std::vector<int64_t>>(self.shape()));
+    }
+    if (self.is_sparse_csc() || self.is_sparse_bsr() ||
+        self.is_sparse_bsc()) {
+        TP_THROW(NotImplementedError,
+                 "mul.Scalar: this sparse layout is not supported yet");
+    }
+    return Tensor::make_sparse_coo_tensor(
+        self._indices().clone(), self._values().mul(other),
+        static_cast<std::vector<int64_t>>(self.shape()),
+        self.is_coalesced());
+}
+
 // stores ``min(d+M, L)`` entries when ``d <= 0`` and ``min(N, L) - d``
 // otherwise, placed starting at cell ``(max(d,0)-d, max(d,0))``; values are
 // read from row ``j`` of ``diagonals`` beginning at column ``max(d, 0)``.
@@ -1220,6 +1338,123 @@ Tensor smm_cpu(const Tensor& self, const Tensor& mat2) {
     }
     Tensor result = Tensor::empty({0}, self.dtype(), self.device());
     return sparse_sspaddmm_cpu(result, self, mat2, Scalar(0.0), Scalar(1.0));
+}
+
+namespace {
+
+// addmm-style broadcast of the dense seed `input` onto (rows, cols): 0-D/1-D
+// seeds expand along trailing dims and singleton axes get stride 0, so the
+// kernel reads one physical element per broadcast dimension.
+Tensor broadcast_addmm_seed_cpu(const Tensor& input, int64_t rows,
+                                int64_t cols) {
+    if (input.dim() == 2 && input.size(0) == rows && input.size(1) == cols) {
+        return input;
+    }
+    if (input.dim() > 2) {
+        TP_THROW(RuntimeError, "_sparse_addmm: self must be at most 2-D, got ",
+                 input.dim(), "-D");
+    }
+    std::vector<int64_t> sizes = {rows, cols};
+    std::vector<int64_t> strides = {0, 0};
+    if (input.dim() == 2) {
+        if (input.size(0) != 1 && input.size(0) != rows) {
+            TP_THROW(RuntimeError,
+                     "_sparse_addmm: self is not broadcastable to ",
+                     rows, "x", cols);
+        }
+        if (input.size(1) != 1 && input.size(1) != cols) {
+            TP_THROW(RuntimeError,
+                     "_sparse_addmm: self is not broadcastable to ",
+                     rows, "x", cols);
+        }
+        strides[0] = input.size(0) == 1 ? 0 : input.stride(0);
+        strides[1] = input.size(1) == 1 ? 0 : input.stride(1);
+    } else if (input.dim() == 1) {
+        if (input.size(0) != 1 && input.size(0) != cols) {
+            TP_THROW(RuntimeError,
+                     "_sparse_addmm: self is not broadcastable to ",
+                     rows, "x", cols);
+        }
+        strides[1] = input.size(0) == 1 ? 0 : input.stride(0);
+    }
+    return input.as_strided(sizes, strides);
+}
+
+} // namespace
+
+// Dense-seeded sparse @ dense: out = beta * self + alpha * (mat1 @ mat2),
+// where mat1 is a 2-D sparse COO/CSR matrix and self/mat2 are dense.  The
+// row-parallel CSR accumulation fuses the seed scaling and the product term
+// into a single pass over the output.
+Tensor _sparse_addmm_cpu(const Tensor& self, const Tensor& mat1,
+                         const Tensor& mat2, const Scalar& beta,
+                         const Scalar& alpha) {
+    if (!mat1.is_sparse()) {
+        TP_THROW(RuntimeError,
+                 "_sparse_addmm(): expected 'mat1' to be a sparse tensor");
+    }
+    if (mat1.dim() != 2) {
+        TP_THROW(RuntimeError,
+                 "_sparse_addmm(): matrices expected, got ", mat1.dim(),
+                 "-D tensor");
+    }
+    const bool blocked_input =
+        mat1.is_sparse_bsr() || mat1.is_sparse_bsc();
+    if (mat1.sparse_dim() != 2 ||
+        (mat1._values().dim() != 1 && !blocked_input)) {
+        TP_THROW(RuntimeError,
+                 "_sparse_addmm(): hybrid sparse tensors are not supported");
+    }
+    if (mat2.dim() != 2) {
+        TP_THROW(RuntimeError,
+                 "_sparse_addmm(): matrices expected, got ", mat2.dim(),
+                 "-D tensor");
+    }
+    if (mat1.device() != mat2.device() || mat1.device() != self.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "_sparse_addmm(): all operands must be on the same device");
+    }
+    if (mat2.dtype() != mat1.dtype() || self.dtype() != mat1.dtype()) {
+        TP_THROW(TypeError,
+                 "_sparse_addmm(): all operands must share one dtype");
+    }
+    const int64_t rows = mat1.size(0);
+    const int64_t inner = mat1.size(1);
+    const int64_t cols = mat2.size(1);
+    if (mat2.size(0) != inner) {
+        TP_THROW(RuntimeError,
+                 "_sparse_addmm(): mat1 and mat2 shapes cannot be multiplied (",
+                 rows, "x", inner, " and ", mat2.size(0), "x", cols, ")");
+    }
+
+    Tensor self_b = broadcast_addmm_seed_cpu(self, rows, cols).contiguous();
+    Tensor out = Tensor::empty({rows, cols}, mat1.dtype(), mat1.device());
+
+    Tensor crow;
+    Tensor col;
+    Tensor values;
+    if (mat1.is_sparse_csr()) {
+        crow = mat1._crow_indices().contiguous();
+        col = mat1._col_indices().contiguous();
+        values = mat1._values().contiguous();
+    } else if (mat1.is_sparse_csc() || mat1.is_sparse_bsr() ||
+               mat1.is_sparse_bsc()) {
+        Tensor csr = compressed_to_csr_cpu(mat1);
+        crow = csr._crow_indices().contiguous();
+        col = csr._col_indices().contiguous();
+        values = csr._values().contiguous();
+    } else {
+        Tensor canonical = mat1.is_coalesced() ? mat1 : mat1.coalesce();
+        Tensor csr = coo_to_csr_cpu(canonical, rows);
+        crow = csr._crow_indices().contiguous();
+        col = csr._col_indices().contiguous();
+        values = csr._values().contiguous();
+    }
+    Tensor dense_c = mat2.contiguous();
+
+    sparse_addmm_stub(DeviceType::CPU, out, self_b, crow, col, values,
+                      dense_c, beta, alpha);
+    return out;
 }
 
 // ---------------------------------------------------------------------------
