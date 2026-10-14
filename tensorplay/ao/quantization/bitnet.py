@@ -118,7 +118,15 @@ def quantize_int8_rowwise(
     """
     absmax = input.abs().amax(dim=-1, keepdim=True).clamp(min=eps)
     row_scale = absmax / 127.0
-    codes = (input.float() / row_scale).round().clamp(-127, 127).to(tp.int8)
+    if input.numel() >= (1 << 21):
+        # Large matrices: the fused affine-quantization kernel does the
+        # round/clamp/cast in one pass and is measurably faster than the
+        # eager chain; small shapes keep the eager chain to avoid the
+        # kernel's fixed launch cost.
+        codes = _C.quantize_affine(input, [1, input.shape[-1]], row_scale,
+                                   None, tp.qint8, -127, 127).to(tp.int8)
+    else:
+        codes = (input.float() / row_scale).round().clamp(-127, 127).to(tp.int8)
     return codes, row_scale
 
 
@@ -324,7 +332,7 @@ class BitNetTrainingLinearWeight(nn.Parameter):
         # it), while ``_data`` tracks the same storage for quantization and
         # FSDP packing.  Device/dtype transfers arrive as a re-wrapped
         # BitNetTrainingLinearWeight (``Module._apply`` assigns ``param.data``),
-        # so unwrap it before mirroring.
+        # so unwrap it before repeating the wrap.
         Tensor.data.__set__(self, value)
         self._data = value._data if isinstance(value, BitNetTrainingLinearWeight) else value
 
@@ -550,7 +558,7 @@ class BitNetTrainingConfig:
     """Configuration marker for :func:`quantize_` BitNet b1.58 conversion."""
 
 
-# Backwards-compatible alias matching the upstream ``bitnet_training`` name.
+# Backwards-compatible alias matching the workflow ``bitnet_training`` name.
 bitnet_training = BitNetTrainingConfig
 
 

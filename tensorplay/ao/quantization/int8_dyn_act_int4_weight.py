@@ -53,8 +53,15 @@ def _quantize_int4_weight_signed(weight: tp.Tensor):
     N, K = weight.shape
     scale = weight.abs().amax(dim=-1) / 7.0
     scale = scale.clamp(min=1e-8)
-    codes = (weight / scale.unsqueeze(-1)).round().clamp(-8, 7)
-    codes = codes.to(tp.int8).reshape(N, K)
+    if weight.numel() >= (1 << 21):
+        # Large matrices: fused affine quantization (round/clamp/cast in one
+        # pass); small shapes keep the eager chain.
+        codes = tp._C.quantize_affine(weight, [1, K], scale.unsqueeze(-1),
+                                      None, tp.qint8, -8, 7).to(tp.int8).reshape(N, K)
+    else:
+        codes = (weight / scale.unsqueeze(-1)).round().clamp(-8, 7)
+        codes = codes.to(tp.int8).reshape(N, K)
+    return codes, scale
     return codes, scale
 
 

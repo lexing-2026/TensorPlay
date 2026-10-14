@@ -53,7 +53,7 @@ class Int8MixedPrecisionTrainingConfig:
     module_swap: bool = False
 
 
-# Backwards-compatible alias matching the upstream config name.
+# Backwards-compatible alias matching the workflow config name.
 int8_mixed_precision_training = Int8MixedPrecisionTrainingConfig
 
 
@@ -65,7 +65,7 @@ def _int8_mm(A_i8: tp.Tensor, B_t_i8: tp.Tensor, row_scale: tp.Tensor, col_scale
     """
     if A_i8.device.type == "cuda":
         # Native int8 tensor-core path.
-        out = tp.ops.tp._int_mm(A_i8, B_t_i8.t().contiguous())
+        out = tp.ops.tp._int_mm(A_i8, B_t_i8.t())
     else:
         # Native SIMD quantized linear path for CPU.
         x_q = _C._make_per_tensor_quantized_tensor(A_i8, 1.0, 0)

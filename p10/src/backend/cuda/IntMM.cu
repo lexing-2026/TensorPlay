@@ -17,6 +17,7 @@
 #include <cublas_v2.h>
 #include <cublasLt.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -128,8 +129,20 @@ struct Int8GemmPlan {
     cublasLtMatrixLayout_t a_desc = nullptr;
     cublasLtMatrixLayout_t b_desc = nullptr;
     cublasLtMatrixLayout_t c_desc = nullptr;
+    cublasLtMatmulPreference_t pref = nullptr;
+    // Candidate algorithms returned by the heuristic query.  The first call
+    // times them back-to-back and caches the measured winner in `algo`, so
+    // every later matmul on this shape reuses the same algorithm.
+    static constexpr int kMaxCandidates = 8;
+    cublasLtMatmulHeuristicResult_t candidates[kMaxCandidates];
+    int candidate_count = 0;
+    bool autotuned = false;
+    cublasLtMatmulAlgo_t algo{};
+    size_t workspace_size = 0;
+    size_t workspace_limit = 32 * 1024 * 1024;
 
     ~Int8GemmPlan() {
+        if (pref) cublasLtMatmulPreferenceDestroy(pref);
         if (c_desc) cublasLtMatrixLayoutDestroy(c_desc);
         if (b_desc) cublasLtMatrixLayoutDestroy(b_desc);
         if (a_desc) cublasLtMatrixLayoutDestroy(a_desc);
@@ -174,11 +187,44 @@ std::shared_ptr<Int8GemmPlan> get_int8_gemm_plan(int64_t M, int64_t N,
     CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(
         plan->matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_n, sizeof(op_n)));
 
-    // Row-major trick layouts: a_desc is B_r^T (N,K), b_desc is A_r^T (K,M),
-    // c_desc is C_r^T (N,M).
-    CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&plan->a_desc, ab_type, N, K, N));
-    CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&plan->b_desc, ab_type, K, M, K));
-    CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&plan->c_desc, c_type, N, M, N));
+    // Natural row-major layouts: C(M,N) = A(M,K) @ B(K,N), with every matrix
+    // described in row-major order so the library sees the same access
+    // pattern the caller has and can pick its fastest int8 algorithm.
+    constexpr cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
+    CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&plan->a_desc, ab_type, M, K, K));
+    CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+        plan->a_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)));
+    CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&plan->b_desc, ab_type, K, N, N));
+    CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+        plan->b_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)));
+    CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&plan->c_desc, c_type, M, N, N));
+    CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+        plan->c_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)));
+
+    // Reserve a scratch budget and ask the library for the best tensor-core
+    // algorithms for this exact shape.  Without a heuristic pick the library
+    // falls back to a generic algorithm that leaves a large fraction of the
+    // int8 tensor-core throughput unused.
+    CUBLASLT_CHECK(cublasLtMatmulPreferenceCreate(&plan->pref));
+    size_t workspace_size = plan->workspace_limit;
+    CUBLASLT_CHECK(cublasLtMatmulPreferenceSetAttribute(
+        plan->pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &workspace_size, sizeof(workspace_size)));
+
+    constexpr int kMaxCandidates = Int8GemmPlan::kMaxCandidates;
+    int returned = 0;
+    CUBLASLT_CHECK(cublasLtMatmulAlgoGetHeuristic(
+        CUDAContext::getCublasLtHandle(), plan->matmul_desc, plan->a_desc,
+        plan->b_desc, plan->c_desc, plan->c_desc, plan->pref, kMaxCandidates,
+        plan->candidates, &returned));
+    if (returned == 0) {
+        TP_THROW(RuntimeError, "cuBLASLt: no int8 heuristic algorithm found");
+    }
+    plan->candidate_count = returned;
+    for (int i = 0; i < plan->candidate_count; ++i) {
+        plan->workspace_size =
+            std::max(plan->workspace_size, plan->candidates[i].workspaceSize);
+    }
 
     cache.emplace(key, plan);
     return plan;
@@ -187,6 +233,61 @@ std::shared_ptr<Int8GemmPlan> get_int8_gemm_plan(int64_t M, int64_t N,
 // Runs the signed product through cuBLASLt.  Returns false when the library
 // rejects the shape or the operand alignment, in which case the caller falls
 // back to the tile kernel.
+// One shared scratch buffer per (device, stream).  cuBLASLt treats the
+// workspace as scratch for a single enqueued matmul and operations on one
+// stream serialize, so every int8 plan on a stream can share that stream's
+// buffer.
+void* shared_int8_workspace(int device, size_t bytes) {
+    struct Entry {
+        void* ptr = nullptr;
+        size_t size = 0;
+    };
+    static std::mutex ws_mutex;
+    static auto* table =
+        new std::unordered_map<uint64_t, Entry>();
+    void* stream = getCurrentCUDAStream().stream();
+    const uint64_t key = (static_cast<uint64_t>(device) << 32) ^
+                         reinterpret_cast<uintptr_t>(stream);
+    std::lock_guard<std::mutex> lock(ws_mutex);
+    Entry& entry = (*table)[key];
+    if (entry.size < bytes) {
+        if (entry.ptr) {
+            checkCuda(cudaFree(entry.ptr), "int8 workspace free");
+        }
+        checkCuda(cudaMalloc(&entry.ptr, bytes), "int8 workspace alloc");
+        entry.size = bytes;
+    }
+    return entry.ptr;
+}
+
+// Times `samples` back-to-back executions of one candidate after a single
+// untimed warm-up that doubles as the support probe.  Returns the average
+// milliseconds per execution, or a negative value when the candidate failed
+// to run at all.
+template <typename Exec>
+double time_int8_candidate(const Exec& exec, const cublasLtMatmulAlgo_t& algo,
+                           int samples, cudaStream_t stream) {
+    cudaEvent_t ev_start = nullptr, ev_end = nullptr;
+    cudaEventCreate(&ev_start);
+    cudaEventCreate(&ev_end);
+    if (exec(algo) != CUBLAS_STATUS_SUCCESS) {
+        cudaEventDestroy(ev_start);
+        cudaEventDestroy(ev_end);
+        return -1.0;
+    }
+    cudaEventRecord(ev_start, stream);
+    for (int t = 0; t < samples; ++t) {
+        exec(algo);
+    }
+    cudaEventRecord(ev_end, stream);
+    cudaEventSynchronize(ev_end);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, ev_start, ev_end);
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_end);
+    return static_cast<double>(ms) / samples;
+}
+
 bool int8_gemm_cublaslt(const Tensor& self, const Tensor& mat2,
                         Tensor& result) {
     const int64_t M = self.size(0);
@@ -196,13 +297,47 @@ bool int8_gemm_cublaslt(const Tensor& self, const Tensor& mat2,
     std::lock_guard<std::mutex> execution_lock(plan->execution_mutex);
     int32_t alpha = 1;
     int32_t beta = 0;
+    void* workspace = shared_int8_workspace(plan->device, plan->workspace_size);
+    cudaStream_t stream = getCurrentCUDAStream().stream();
+
+    if (!plan->autotuned) {
+        // Time each heuristic candidate with beta = 0 and keep the measured
+        // winner for all later calls on this shape.  The timing runs write
+        // into `result`, which the final matmul (also beta = 0) overwrites.
+        constexpr int kSamples = 10;
+        int best = -1;
+        double best_ms = 1e300;
+        for (int i = 0; i < plan->candidate_count; ++i) {
+            const double ms = time_int8_candidate(
+                [&](const cublasLtMatmulAlgo_t& algo) {
+                    return cublasLtMatmul(
+                        CUDAContext::getCublasLtHandle(), plan->matmul_desc,
+                        &alpha, self.const_data_ptr<int8_t>(), plan->a_desc,
+                        mat2.const_data_ptr<int8_t>(), plan->b_desc, &beta,
+                        result.data_ptr<int32_t>(), plan->c_desc,
+                        result.data_ptr<int32_t>(), plan->c_desc, &algo,
+                        workspace, plan->workspace_size, stream);
+                },
+                plan->candidates[i].algo, kSamples, stream);
+            if (ms >= 0 && ms < best_ms) {
+                best_ms = ms;
+                best = i;
+            }
+        }
+        if (best < 0) {
+            return false;
+        }
+        plan->algo = plan->candidates[best].algo;
+        plan->autotuned = true;
+    }
+
     const cublasStatus_t status = cublasLtMatmul(
         CUDAContext::getCublasLtHandle(), plan->matmul_desc, &alpha,
-        mat2.const_data_ptr<int8_t>(), plan->a_desc,
-        self.const_data_ptr<int8_t>(), plan->b_desc, &beta,
+        self.const_data_ptr<int8_t>(), plan->a_desc,
+        mat2.const_data_ptr<int8_t>(), plan->b_desc, &beta,
         result.data_ptr<int32_t>(), plan->c_desc,
-        result.data_ptr<int32_t>(), plan->c_desc, nullptr, nullptr, 0,
-        getCurrentCUDAStream().stream());
+        result.data_ptr<int32_t>(), plan->c_desc, &plan->algo, workspace,
+        plan->workspace_size, stream);
     return status == CUBLAS_STATUS_SUCCESS;
 }
 
@@ -223,6 +358,28 @@ void check_int_mm_operands(const Tensor& self, const Tensor& mat2) {
              "_int_mm: expected the right operand to be int8");
 }
 
+// Fast path for a live transposed weight view.  `mat2` is the non-contiguous
+// [K,N] view of a contiguous [N,K] int8 weight (strides [1,K]); the GEMM
+// `self(M,K) @ mat2(K,N)` is fed to cuBLAS as `weight^T @ activation` in the
+// column-major space the int8 tensor-core kernels are tuned for, without
+// materializing a [K,N] copy.
+bool int8_gemm_transposed_ex(const Tensor& self, const Tensor& mat2,
+                             Tensor& result) {
+    const int64_t M = self.size(0);
+    const int64_t K = self.size(1);
+    const int64_t N = mat2.size(1);
+    int32_t alpha = 1;
+    int32_t beta = 0;
+    const cublasStatus_t status = cublasGemmEx(
+        CUDAContext::getCublasHandle(), CUBLAS_OP_T, CUBLAS_OP_N,
+        static_cast<int>(N), static_cast<int>(M), static_cast<int>(K),
+        &alpha, mat2.data_ptr(), CUDA_R_8I, static_cast<int>(K),
+        self.data_ptr(), CUDA_R_8I, static_cast<int>(K), &beta,
+        result.data_ptr(), CUDA_R_32I, static_cast<int>(N),
+        CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return status == CUBLAS_STATUS_SUCCESS;
+}
+
 void int_mm_impl(const Tensor& self, const Tensor& mat2, Tensor& out) {
     const int64_t M = self.size(0);
     const int64_t K = self.size(1);
@@ -237,6 +394,18 @@ void int_mm_impl(const Tensor& self, const Tensor& mat2, Tensor& out) {
     }
 
     const Tensor lhs = self.contiguous();
+
+    // The fast tensor-core path accepts a live transposed weight view
+    // directly, avoiding the [K,N] copy the generic path would make.
+    const bool mat2_is_transposed_view =
+        !mat2.is_contiguous() && mat2.dim() == 2 &&
+        mat2.stride(0) == 1 && mat2.stride(1) == K;
+    if (self.dtype() == DType::Int8 && mat2_is_transposed_view &&
+        use_int8_tensor_cores(M, K, N) &&
+        int8_gemm_transposed_ex(lhs, mat2, out)) {
+        return;
+    }
+
     const Tensor rhs = mat2.contiguous();
     if (self.dtype() == DType::Int8 && use_int8_tensor_cores(M, K, N) &&
         int8_gemm_cublaslt(lhs, rhs, out)) {
