@@ -500,6 +500,24 @@ Beyond GQA, you can swap in `MultiheadLatentAttention` (low-rank latent KV compr
 
 Structured tutorials — linear regression from scratch, MNIST CNN classification, custom datasets, model saving/loading with `.mega` + `state_dict` — live at [tensorplay.cn](https://www.tensorplay.cn/en/guide/tutorials). Deep dives, one pillar per post — dispatch, autograd engine, tensor storage, compiler — live in the [blog series](docs/blogs/00-index.md).
 
+## Metrics
+
+`tensorplay.metrics` is a ready-to-use evaluation suite covering the common machine-learning domains, split into stateful `Metric` classes and stateless `functional` functions:
+
+- **Classification**: accuracy, precision/recall/F1, ROC/AUC, precision-recall curve, Matthews correlation coefficient, Cohen's kappa, calibration error, hinge, Jaccard, specificity, LogAUC, threshold-based recall/precision curves
+- **Regression**: MSE/RMSE, MAE, R², Pearson/Spearman/Kendall correlations, KL/JS divergence, concordance correlation, Tweedie deviance, critical success index, and more
+- **Image**: PSNR, SSIM, total variation, and AIGC metrics (FID, KID, Inception Score, LPIPS)
+- **Audio**: SNR/SI-SNR, SDR/SI-SDR/SA-SDR with permutation-invariant training, PESQ, STOI, DNSMOS, NISQA, SRMR
+- **Text**: BLEU, ROUGE, WER/CER, CHRF, TER, SacreBLEU, BERTScore, SQuAD, InfoLM, perplexity
+- **Retrieval**: AUROC, MAP, MRR, NDCG, precision/recall, R-precision, fall-out, hit-rate, recall-at-fixed-precision
+- **Nominal**: Cramér's V, Fleiss' kappa, Pearson's contingency coefficient, Theil's U, Tschuprow's T
+- **Remote sensing**: ERGAS, RASE, SAM, UIQI, sliding-window RMSE, spectral distortion indices
+- **Wrappers**: `MetricCollection`, `MetricTracker`, running metrics, classwise/multioutput/min-max wrappers, bootstrapping and multitask wrappers
+
+Metrics mirror the reference API, so existing workflows port with minimal changes: instantiate a metric, call `update(preds, target)` repeatedly, then `compute()`, or use the functional form directly. Metrics that need optional third-party packages (transformers, pesq, pystoi, onnxruntime, ...) are importable out of the box and raise a clear `ModuleNotFoundError` until the dependency is installed.
+
+A fused dual-input reduction (`sum_squared_error` / `sum_abs_error`) powers the regression metrics: one vectorized pass computes `sum((a-b)^2)` / `sum(|a-b|)` without materialising intermediate tensors, making MSE and MAE several times faster than the reference implementation on CPU (see [Benchmarks](#benchmarks)).
+
 ## Benchmarks
 
 <p align="center">
@@ -512,6 +530,14 @@ The [benchmark/](benchmark/) suite measures what a readable framework costs — 
 - **Micro and subsystem**: GEMM, optimizer steps, dataloader, serialization, autograd Function overhead, custom-op call overhead, LLaMA end-to-end
 - **Reports**: every script emits a JSON report (`--json-out`) — throughput, latency percentiles, compile cost — ready for plotting and for the [white paper](docs/whitepaper/main.pdf) evaluation
 
+Metric kernels use fused reductions where possible. On CPU (AVX2, 8 threads), selected regression metrics beat the reference implementation by a wide margin:
+
+| Metric | TensorPlay | Reference | Speedup |
+|--------|-----------|-----------|---------|
+| MSE (10k×64) | 0.01 ms | 0.04 ms | 3.3× |
+| MAE (10k×64) | 0.01 ms | 0.04 ms | 2.8× |
+| Kendall tau-b (n=200) | 4.8 ms | 124 ms | 26× |
+
 Measured highlights from the [white paper](docs/whitepaper/main.pdf), §9 — a snapshot of current `main`: the dispatcher adds the same sub-1% sliver on CPU, CUDA and Vulkan paths; the CUDA backend covers 1,262 unique ops (97% of the CPU surface, 1,233 ops); the Vulkan teaching backend ships 224 ops backed by 6.8k lines of GLSL shaders across 102 files. The pytest suite defines <!-- tp-stats:tests-collected:begin -->3,660<!-- tp-stats:tests-collected:end --> test functions.
 
 Scripts and methodology: [benchmark/README.md](benchmark/README.md).
@@ -523,6 +549,8 @@ The Python test suite runs with pytest against an installed (or built in-place) 
 ```bash
 pytest test/
 ```
+
+The metrics suite adds about 184 tests across `test/test_metrics*.py` — stateful metrics, functional forms, curves and plots, AIGC, audio, retrieval, nominal, remote sensing, wrappers and lazy-loaded external-dependency metrics.
 
 CI builds the full wheel matrix (Python 3.10–3.13; CPU on Linux x86_64/aarch64, macOS arm64, and Windows x86_64; CUDA on Linux and Windows x86_64) and validates every wheel on every pull request and push to `main`; see [.github/workflows/](.github/workflows/) (`pull`, `trunk`, `publish`, `lint`). Lint rules live under `[tool.ruff]` in `pyproject.toml`.
 

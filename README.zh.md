@@ -498,6 +498,24 @@ print(out[0].tolist())   # 提示词及其续写
 
 体系化教程——从零开始的线性回归、MNIST CNN 图像分类、自定义数据集、`.mega` + `state_dict` 模型保存与加载——见 [tensorplay.cn](https://www.tensorplay.cn/zh/guide/tutorials)。深度长文，一篇一个支柱——dispatch、autograd 引擎、张量存储、编译器——见[博客系列](docs/blogs/00-index.md)。
 
+## 指标库（Metrics）
+
+`tensorplay.metrics` 是一套开箱即用的评估指标库，覆盖常见机器学习领域，分为有状态的 `Metric` 类与无状态的 `functional` 函数两种形式：
+
+- **分类**：accuracy、precision/recall/F1、ROC/AUC、PR 曲线、Matthews 相关系数、Cohen's kappa、校准误差、hinge、Jaccard、specificity、LogAUC、固定阈值下的召回/精度曲线
+- **回归**：MSE/RMSE、MAE、R²、Pearson/Spearman/Kendall 相关系数、KL/JS 散度、一致性相关系数、Tweedie 偏差、临界成功指数等
+- **图像**：PSNR、SSIM、全变差，以及 AIGC 指标（FID、KID、Inception Score、LPIPS）
+- **音频**：SNR/SI-SNR、SDR/SI-SDR/SA-SDR（含排列不变训练）、PESQ、STOI、DNSMOS、NISQA、SRMR
+- **文本**：BLEU、ROUGE、WER/CER、CHRF、TER、SacreBLEU、BERTScore、SQuAD、InfoLM、困惑度
+- **检索**：AUROC、MAP、MRR、NDCG、precision/recall、R-precision、fall-out、hit-rate、固定精度下的召回
+- **名义**：Cramér's V、Fleiss' kappa、Pearson 列联系数、Theil's U、Tschuprow's T
+- **遥感**：ERGAS、RASE、SAM、UIQI、滑动窗口 RMSE、光谱失真指数
+- **包装器**：`MetricCollection`、`MetricTracker`、running 指标、classwise/multioutput/min-max 包装器、bootstrap 与多任务包装器
+
+指标 API 与参考实现保持一致，既有工作流只需极小改动即可迁移：实例化指标，反复调用 `update(preds, target)`，最后 `compute()`；也可以直接使用 functional 形式。依赖可选第三方包（transformers、pesq、pystoi、onnxruntime 等）的指标开箱即可导入，在依赖安装前会抛出明确的 `ModuleNotFoundError`。
+
+融合双输入归约（`sum_squared_error` / `sum_abs_error`）支撑回归指标：一次向量化遍历直接算出 `sum((a-b)^2)` / `sum(|a-b|)`，不再物化中间张量，使 MSE 与 MAE 在 CPU 上比参考实现快数倍（见[基准测试](#基准测试)）。
+
 ## 基准测试
 
 <p align="center">
@@ -510,6 +528,14 @@ print(out[0].tolist())   # 提示词及其续写
 - **微观与子系统**：GEMM、优化器 step、dataloader、序列化、autograd Function 开销、自定义算子调用开销、LLaMA 端到端
 - **报告**：每个脚本输出 JSON 报告（`--json-out`）——吞吐、延迟分位数、编译开销——可直接绘图并用于[白皮书](docs/whitepaper/main.pdf)评估
 
+指标内核在可能处使用融合归约。在 CPU（AVX2，8 线程）上，部分回归指标以明显优势超过参考实现：
+
+| 指标 | TensorPlay | 参考实现 | 加速比 |
+|------|-----------|----------|--------|
+| MSE（10k×64） | 0.01 ms | 0.04 ms | 3.3× |
+| MAE（10k×64） | 0.01 ms | 0.04 ms | 2.8× |
+| Kendall tau-b（n=200） | 4.8 ms | 124 ms | 26× |
+
 实测亮点（见[白皮书](docs/whitepaper/main.pdf) §9，对应当前 `main` 的快照）：dispatcher 在 CPU、CUDA 与 Vulkan 路径上都只增加不到 1% 的开销；CUDA 后端覆盖 1,262 个独立算子（CPU 面 1,233 个的 97%）；Vulkan 教学后端交付 224 个算子，背后是 102 个文件、6.8k 行 GLSL shader。pytest 套件共定义 <!-- tp-stats:tests-collected:begin -->3,660<!-- tp-stats:tests-collected:end --> 个测试函数。
 
 脚本与方法论：[benchmark/README.md](benchmark/README.md)。
@@ -521,6 +547,8 @@ Python 测试套件使用 pytest 针对已安装（或原地构建）的包运�
 ```bash
 pytest test/
 ```
+
+指标套件在 `test/test_metrics*.py` 中新增约 184 个测试——覆盖有状态指标、functional 形式、曲线与绘图、AIGC、音频、检索、名义、遥感、包装器以及懒加载的外部依赖指标。
 
 CI 会在每个 PR 和 main 推送上构建完整 wheel 矩阵（Python 3.10–3.13；CPU 覆盖 Linux x86_64/aarch64、macOS arm64、Windows x86_64；CUDA 覆盖 Linux 和 Windows x86_64）并验证每个 wheel；参见 [.github/workflows/](.github/workflows/)（`pull`、`trunk`、`publish`、`lint`）。Lint 规则位于 `pyproject.toml` 的 `[tool.ruff]` 段。
 
