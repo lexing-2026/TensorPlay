@@ -229,3 +229,50 @@ def test_llm_gradient_attribution_native(
     assert result.seq_attr.shape == (5,)
     assert tensorplay.isfinite(result.seq_attr).all()
     assert result.token_attr.shape == (1, 5)
+
+def test_visualize_attention_multi_layer(
+    model: NativeGPT, tokenizer: NativeTokenizer
+) -> None:
+    import matplotlib.pyplot as plt
+
+    from tensorplay.lumen.llm import (
+        extract_attention,
+        visualize_attention_multi_layer,
+    )
+
+    result = extract_attention(model, tokenizer, "The capital of France is")
+    fig, axes = visualize_attention_multi_layer(
+        result,
+        query_token="France",
+        title="All layers",
+        use_pyplot=False,
+    )
+    plt.close(fig)
+    # 2 layers x 4 heads grid
+    assert np.asarray(axes).size == 8
+
+
+def test_token_attention_and_visualize(
+    model: NativeGPT, tokenizer: NativeTokenizer
+) -> None:
+    import matplotlib.pyplot as plt
+
+    from tensorplay.lumen.llm import (
+        extract_attention,
+        token_attention,
+        visualize_token_attention,
+    )
+
+    result = extract_attention(model, tokenizer, "The capital of France is")
+    ta = token_attention(result, query_token="France")
+    assert ta["matrix"].shape == (2, 4, 5)
+    assert ta["query_position"] == 3
+    assert ta["query_token"] == "France"
+    # attention from France sums to ~1 per layer/head
+    assert abs(ta["matrix"].sum(axis=-1) - 1.0).max() < 1e-4
+
+    fig, ax = visualize_token_attention(
+        ta, title="What France attends to", use_pyplot=False
+    )
+    plt.close(fig)
+    assert ax is not None

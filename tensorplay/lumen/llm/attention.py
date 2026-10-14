@@ -299,3 +299,239 @@ def visualize_attention_heads(
     if use_pyplot:
         plt.show()
     return fig, axes
+
+def _normalize_attention_maps(
+    attention: Union[Dict[str, Any], List[np.ndarray], np.ndarray],
+    tokens: Optional[List[str]] = None,
+    layer: Optional[int] = None,
+) -> Any:
+    """Normalize attention input to ``(maps, tokens, layers, heads)``.
+
+    ``maps`` is a list of ``(heads, seq, seq)`` arrays; ``layers`` and ``heads``
+    are the corresponding index lists (or ``None`` when unknown).
+    """
+    if isinstance(attention, dict):
+        maps = attention["attention"]
+        tokens = attention.get("tokens", tokens)
+        layers = attention.get("layers")
+        heads = attention.get("heads")
+        if layer is not None:
+            maps = [maps[layer]]
+            layers = [layers[layer]]
+    elif isinstance(attention, (list, tuple)):
+        maps = attention
+        layers = list(range(len(maps)))
+        heads = None
+        if layer is not None:
+            maps = [maps[layer]]
+            layers = [layer]
+    else:
+        maps = [attention]
+        layers = [0]
+        heads = None
+
+    normalized = []
+    for m in maps:
+        arr = np.asarray(m, dtype=float)
+        if arr.ndim == 2:
+            arr = arr[None]  # (1, seq, seq)
+        elif arr.ndim == 4:
+            arr = arr[0]  # (batch, heads, seq, seq) -> (heads, seq, seq)
+        normalized.append(arr)
+    return normalized, tokens, layers, heads
+
+
+def visualize_attention_multi_layer(
+    attention: Union[Dict[str, Any], List[np.ndarray], np.ndarray],
+    tokens: Optional[List[str]] = None,
+    query_token: Optional[str] = None,
+    layers: Optional[Sequence[int]] = None,
+    heads: Optional[Sequence[int]] = None,
+    cmap: str = "viridis",
+    title: Optional[str] = None,
+    figsize: Optional[Sequence[float]] = None,
+    use_pyplot: bool = False,
+) -> Any:
+    """Plot attention for many layers at once, one subplot per head.
+
+    This is the multi-layer "head view" familiar from interpretability papers:
+    rows are layers, columns are heads. When ``query_token`` is given, the
+    corresponding row and column of every attention matrix are outlined in red,
+    making it easy to see what that token attends to (and which tokens attend to
+    it) across the whole stack.
+
+    Returns:
+        ``(fig, axes)`` matplotlib objects.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    maps, tokens, all_layers, all_heads = _normalize_attention_maps(attention, tokens)
+    if layers is None:
+        layers = list(range(len(maps)))[:8]
+    if heads is None:
+        heads = list(range(maps[0].shape[0]))[:8]
+    layers = list(layers)
+    heads = list(heads)
+
+    query_pos = None
+    if query_token is not None and tokens is not None and query_token in tokens:
+        query_pos = tokens.index(query_token)
+
+    rows, cols = len(layers), len(heads)
+    if figsize is None:
+        figsize = (cols * 2.8, rows * 2.8)
+    fig, axes = plt.subplots(rows, cols, figsize=figsize, squeeze=False)
+
+    seq_len = maps[0].shape[1]
+    max_ticks = 8
+    tick_step = max(1, int(np.ceil(seq_len / max_ticks)))
+    tick_positions = list(range(0, seq_len, tick_step))
+    tick_labels = [
+        tokens[i] if tokens is not None and i < len(tokens) else str(i)
+        for i in tick_positions
+    ]
+
+    im = None
+    for r, li in enumerate(layers):
+        layer_map = maps[li]
+        for c, hi in enumerate(heads):
+            ax = axes[r][c]
+            hmap = layer_map[hi]
+            im = ax.imshow(
+                hmap, cmap=cmap, vmin=0.0, vmax=1.0, aspect="auto",
+                interpolation="nearest",
+            )
+            if query_pos is not None:
+                ax.add_patch(
+                    Rectangle(
+                        (query_pos - 0.5, -0.5), 1, seq_len,
+                        fill=False, edgecolor="#d62728", linewidth=1.2,
+                    )
+                )
+                ax.add_patch(
+                    Rectangle(
+                        (-0.5, query_pos - 0.5), seq_len, 1,
+                        fill=False, edgecolor="#d62728", linewidth=1.2,
+                    )
+                )
+            if r == rows - 1:
+                ax.set_xticks(tick_positions)
+                ax.set_xticklabels(
+                    tick_labels, rotation=45, ha="right", fontsize=7
+                )
+            else:
+                ax.set_xticks([])
+            if c == 0:
+                ax.set_yticks(tick_positions)
+                ax.set_yticklabels(tick_labels, fontsize=7)
+            else:
+                ax.set_yticks([])
+            ax.tick_params(length=0)
+            if r == 0:
+                ax.set_title("Head %d" % hi, fontsize=9)
+            if c == 0:
+                ax.set_ylabel("Layer %d" % li, fontsize=9)
+            ax.set_xticks(np.arange(-0.5, seq_len, 1), minor=True)
+            ax.set_yticks(np.arange(-0.5, seq_len, 1), minor=True)
+            ax.grid(which="minor", color="white", linewidth=0.3, alpha=0.2)
+
+    if im is not None:
+        fig.colorbar(im, ax=list(axes.ravel()), fraction=0.025, pad=0.02)
+    if title:
+        fig.suptitle(title, y=1.02, fontsize=12)
+    fig.tight_layout(rect=[0, 0, 0.96, 1])
+    if use_pyplot:
+        plt.show()
+    return fig, axes
+
+
+def token_attention(
+    attention: Union[Dict[str, Any], List[np.ndarray], np.ndarray],
+    query_token: str,
+    tokens: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Extract what ``query_token`` attends to across layers and heads.
+
+    Returns a dict with ``matrix`` of shape ``(num_layers, num_heads, seq)``
+    (attention distribution of the query token at every layer/head), plus
+    ``tokens``, ``layers``, ``heads``, ``query_token`` and ``query_position``.
+    """
+    maps, tokens, layers, heads = _normalize_attention_maps(attention, tokens)
+    if tokens is None or query_token not in tokens:
+        raise ValueError(
+            "query_token %r not found in tokens %r" % (query_token, tokens)
+        )
+    query_pos = tokens.index(query_token)
+    seq = maps[0].shape[1]
+    matrix = np.zeros((len(maps), maps[0].shape[0], seq), dtype=float)
+    for li, m in enumerate(maps):
+        for h in range(m.shape[0]):
+            matrix[li, h] = m[h, query_pos, :]
+    return {
+        "matrix": matrix,
+        "tokens": tokens,
+        "layers": layers if layers is not None else list(range(len(maps))),
+        "heads": heads if heads is not None else list(range(maps[0].shape[0])),
+        "query_token": query_token,
+        "query_position": query_pos,
+    }
+
+
+def visualize_token_attention(
+    token_attn: Dict[str, Any],
+    cmap: str = "viridis",
+    title: Optional[str] = None,
+    figsize: Optional[Sequence[float]] = None,
+    use_pyplot: bool = False,
+) -> Any:
+    """Plot what a single token attends to across every layer and head.
+
+    The heatmap has one row per ``(layer, head)`` and one column per token; the
+    cell value is the attention weight from the query token to that column's
+    token. The query token's own column is outlined in red.
+
+    Returns:
+        ``(fig, ax)`` matplotlib objects.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    matrix = np.asarray(token_attn["matrix"], dtype=float)
+    tokens = token_attn["tokens"]
+    query_pos = token_attn["query_position"]
+    n_layers, n_heads, seq = matrix.shape
+    flat = matrix.reshape(n_layers * n_heads, seq)
+    y_labels = [
+        "L%d\u00b7H%d" % (li, hi)
+        for li in range(n_layers)
+        for hi in range(n_heads)
+    ]
+
+    if figsize is None:
+        figsize = (max(6.0, 0.5 * seq + 3.0), max(3.0, 0.35 * n_layers * n_heads + 1.5))
+    fig, ax = plt.subplots(figsize=figsize)
+    im = ax.imshow(
+        flat, cmap=cmap, vmin=0.0, vmax=1.0, aspect="auto", interpolation="nearest"
+    )
+    ax.set_yticks(range(len(y_labels)))
+    ax.set_yticklabels(y_labels, fontsize=7)
+    tick_step = max(1, int(np.ceil(seq / 12)))
+    tick_positions = list(range(0, seq, tick_step))
+    tick_labels = [tokens[i] for i in tick_positions]
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=8)
+    ax.tick_params(length=0)
+    ax.add_patch(
+        Rectangle(
+            (query_pos - 0.5, -0.5), 1, n_layers * n_heads,
+            fill=False, edgecolor="#d62728", linewidth=1.4,
+        )
+    )
+    fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+    if title:
+        ax.set_title(title, fontsize=12)
+    fig.tight_layout()
+    if use_pyplot:
+        plt.show()
+    return fig, ax

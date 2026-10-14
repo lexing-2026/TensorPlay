@@ -21,7 +21,10 @@ third-party runtime. Capabilities:
 
 from tensorplay.lumen.llm.attention import (
     extract_attention,
+    token_attention,
     visualize_attention_heads,
+    visualize_attention_multi_layer,
+    visualize_token_attention,
 )
 from tensorplay.lumen.llm.attribution_graph import (
     AttributionGraph,
@@ -56,6 +59,9 @@ from tensorplay.lumen.llm.sae import (
 __all__ = [
     "extract_attention",
     "visualize_attention_heads",
+    "visualize_attention_multi_layer",
+    "token_attention",
+    "visualize_token_attention",
     "ActivationPatching",
     "SparseAutoencoder",
     "train_sae",
