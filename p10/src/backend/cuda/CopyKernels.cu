@@ -6,6 +6,7 @@
 #include "TensorIterator.h"
 #include "CUDALoops.cuh"
 #include "Complex.h"
+#include "Quantizer.h"
 #include <cuda_runtime.h>
 #include <vector>
 #include <algorithm>
@@ -453,6 +454,11 @@ bool transpose_layout_is_strided_outer_4d(const Tensor& self, const Tensor& src)
 }  // namespace
 
 Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
+    if (self.impl()->quantizer() && src_in.impl()->quantizer()) {
+        TP_CHECK(self.dtype()==src_in.dtype() && self.impl()->quantizer()->qscheme()==src_in.impl()->quantizer()->qscheme(),
+            "Quantized copy requires matching dtype and quantization scheme");
+        self.impl()->set_quantizer(src_in.impl()->quantizer());
+    }
     // The source broadcasts to the destination's shape; a source that does
     // not is refused rather than copied in some flattened order.
     const Tensor src = src_in.shape() == self.shape()
@@ -468,9 +474,18 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
     bool src_cuda = src_dev.is_cuda();
     auto stream = getCurrentCUDAStream(static_cast<int>(dst_dev.index()));
 
+    if (subByteElementPerByte(self.dtype())>1 || subByteElementPerByte(src.dtype())>1) {
+        const auto strides=static_cast<std::vector<int64_t>>(self.strides());
+        TP_CHECK(self.dtype()==src.dtype() && src_in.shape()==self.shape()
+            && SizesAndStrides::is_non_overlapping_and_dense(self.shape(),strides)
+            && static_cast<std::vector<int64_t>>(src.strides())==strides,
+            "Packed quantized copy requires matching dtype, shape and dense layout");
+    }
+
     // Optimize: Contiguous copy (both src and dst must be contiguous AND same dtype)
-    if (self.dtype() == src.dtype() && self.is_contiguous() && src.is_contiguous()) {
-        size_t nbytes = self.numel() * self.itemsize();
+    if (self.dtype() == src.dtype() && ((self.is_contiguous() && src.is_contiguous()) || subByteElementPerByte(self.dtype())>1)) {
+        const int64_t pack=subByteElementPerByte(self.dtype());
+        size_t nbytes = ((self.numel()+pack-1)/pack) * self.itemsize();
         if (src_cuda && src_dev.index() != dst_dev.index()) {
             // Establish both directions of the lifetime/order relationship:
             // destination work waits for prior source work, and the source

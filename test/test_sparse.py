@@ -83,13 +83,16 @@ class TestSparseMM(unittest.TestCase):
         d = tp.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
         out = sparse.mm(s, d)
         expect = tp.tensor([[1.0, 2.0], [10.0, 12.0]])
-        self.assertTrue(tp.allclose(out, expect))
+        self.assertTrue(out.is_sparse)
+        self.assertTrue(tp.allclose(out.to_dense(), expect))
 
     def test_csr_mm(self):
         d0 = tp.tensor([[1.0, 0.0, 2.0], [0.0, 1.0, 0.0]])
         s = sparse.to_sparse_csr(d0)
         d = tp.arange(6, dtype=tp.float32).reshape(3, 2)
         out = sparse.mm(s, d)
+        # CSR x dense returns a dense result, matching the reference API.
+        self.assertFalse(out.is_sparse)
         self.assertTrue(tp.allclose(out, tp.matmul(d0, d)))
 
 

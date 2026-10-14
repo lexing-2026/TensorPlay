@@ -38,8 +38,10 @@ TensorImpl::TensorImpl(const std::vector<int64_t>& sizes, DType dtype,
         }
     }
     int64_t num_elements = sizes_and_strides_.numel();
+    (void)num_elements;
     if (allocate_storage) {
-        size_t total_bytes = static_cast<size_t>(num_elements) * elementSize(dtype);
+        size_t total_bytes = static_cast<size_t>(
+            subByteStorageSize(sizes, dtype));
         Allocator* allocator = getAllocator(device.type());
         storage_ = Storage(total_bytes, allocator, device);
         device_ = storage_.device();
@@ -58,7 +60,9 @@ TensorImpl::TensorImpl(const std::vector<int64_t>& sizes, const std::vector<int6
         }
     }
     int64_t num_elements = sizes_and_strides_.numel();
-    size_t total_bytes = static_cast<size_t>(num_elements) * elementSize(dtype);
+    (void)num_elements;
+    size_t total_bytes = static_cast<size_t>(
+        subByteStorageSize(sizes, dtype));
     Allocator* allocator = getAllocator(device.type());
     storage_ = Storage(total_bytes, allocator, device);
     device_ = storage_.device();

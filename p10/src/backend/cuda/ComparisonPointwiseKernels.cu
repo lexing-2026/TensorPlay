@@ -1,5 +1,6 @@
 // Pointwise CUDA kernels: comparison/where family.
 #include "PointwiseCommon.cuh"
+#include "Quantizer.h"
 
 namespace tensorplay {
 namespace cuda {
@@ -13,6 +14,11 @@ inline void check_orderable(DType dtype) {
 
 template <bool AllowFloat8, typename Functor>
 Tensor comparison_op_kernel(const Tensor& self, const Tensor& other, Functor functor) {
+    if (isQuantizedType(self.dtype()) || isQuantizedType(other.dtype())) {
+        Tensor a = isQuantizedType(self.dtype()) ? quantized::quantizer_of(self)->dequantize(self) : self;
+        Tensor b = isQuantizedType(other.dtype()) ? quantized::quantizer_of(other)->dequantize(other) : other;
+        return comparison_op_kernel<AllowFloat8>(a, b, functor);
+    }
     std::vector<int64_t> out_shape = broadcast_shapes(
         static_cast<std::vector<int64_t>>(self.shape()),
         static_cast<std::vector<int64_t>>(other.shape()));
@@ -53,6 +59,10 @@ Tensor comparison_op_kernel(const Tensor& self, const Tensor& other, Functor fun
 
 template <bool AllowFloat8, typename Functor>
 Tensor comparison_scalar_op_kernel(const Tensor& self, Scalar other, Functor functor) {
+    if (isQuantizedType(self.dtype())) {
+        Tensor input = quantized::quantizer_of(self)->dequantize(self);
+        return comparison_scalar_op_kernel<AllowFloat8>(input, other, functor);
+    }
     DType common = result_type_with_scalar_cuda(self, other);
     check_orderable(common);
     Tensor in = (self.dtype() == common) ? self : self.to(common);
@@ -145,11 +155,21 @@ Tensor complex_comparison_kernel(const Tensor& self, const Tensor& other,
 }
 
 Tensor eq_kernel_cuda(const Tensor& self, const Tensor& other) {
+    if (isQuantizedType(self.dtype()) || isQuantizedType(other.dtype())) {
+        Tensor a = isQuantizedType(self.dtype()) ? quantized::quantizer_of(self)->dequantize(self) : self;
+        Tensor b = isQuantizedType(other.dtype()) ? quantized::quantizer_of(other)->dequantize(other) : other;
+        return eq_kernel_cuda(a, b);
+    }
     if (isComplexType(promoteTypes(self.dtype(), other.dtype())))
         return complex_comparison_kernel(self, other, EqFunctor{});
     return comparison_op_kernel<true>(self, other, EqFunctor());
 }
 Tensor ne_kernel_cuda(const Tensor& self, const Tensor& other) {
+    if (isQuantizedType(self.dtype()) || isQuantizedType(other.dtype())) {
+        Tensor a = isQuantizedType(self.dtype()) ? quantized::quantizer_of(self)->dequantize(self) : self;
+        Tensor b = isQuantizedType(other.dtype()) ? quantized::quantizer_of(other)->dequantize(other) : other;
+        return ne_kernel_cuda(a, b);
+    }
     if (isComplexType(promoteTypes(self.dtype(), other.dtype())))
         return complex_comparison_kernel(self, other, NeFunctor{});
     return comparison_op_kernel<true>(self, other, NeFunctor());
@@ -160,6 +180,9 @@ Tensor gt_kernel_cuda(const Tensor& self, const Tensor& other) { return comparis
 Tensor ge_kernel_cuda(const Tensor& self, const Tensor& other) { return comparison_op_kernel<false>(self, other, GeFunctor()); }
 
 Tensor eq_scalar_kernel_cuda(const Tensor& self, const Scalar& other) {
+    if (isQuantizedType(self.dtype())) {
+        return eq_scalar_kernel_cuda(quantized::quantizer_of(self)->dequantize(self), other);
+    }
     if (other.isComplex() || isComplexType(self.dtype())) {
         DType rd = isComplexType(self.dtype())
             ? self.dtype()
@@ -172,6 +195,9 @@ Tensor eq_scalar_kernel_cuda(const Tensor& self, const Scalar& other) {
     return comparison_scalar_op_kernel<true>(self, other, EqFunctor());
 }
 Tensor ne_scalar_kernel_cuda(const Tensor& self, const Scalar& other) {
+    if (isQuantizedType(self.dtype())) {
+        return ne_scalar_kernel_cuda(quantized::quantizer_of(self)->dequantize(self), other);
+    }
     if (other.isComplex() || isComplexType(self.dtype())) {
         DType rd = isComplexType(self.dtype())
             ? self.dtype()

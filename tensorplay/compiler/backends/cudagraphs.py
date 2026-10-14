@@ -274,7 +274,22 @@ class CudaGraphManager:
             graph.capture_begin()
             restore_stream = _pin_launch_stream_to_capture()
             try:
-                outputs = fn(*static_inputs)
+                try:
+                    outputs = fn(*static_inputs)
+                except BaseException:
+                    # A function that raises inside the capture window (e.g. a
+                    # cuBLAS workspace allocation failure) must still close the
+                    # window: otherwise the stream stays in an active capture
+                    # state and every later CUDA operation on the device fails
+                    # with "operation failed due to a previous error during
+                    # capture".  capture_end tears down pool/rng state and
+                    # clears the sticky driver error; its own error is
+                    # secondary to the original one.
+                    try:
+                        graph.capture_end()
+                    except Exception:
+                        pass
+                    raise
             finally:
                 if restore_stream is not None:
                     restore_stream()

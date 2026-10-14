@@ -99,10 +99,20 @@ inline Tensor& set_storage_and_metadata(
                  "cannot set tensor storage from a different device");
     }
 
-    const size_t required = stride.empty()
-        ? checked_storage_bytes_contiguous(size, impl->itemsize(), storage_offset)
-        : checked_storage_bytes_strided(
-              size, stride, impl->itemsize(), storage_offset);
+    const uint64_t pack=static_cast<uint64_t>(subByteElementPerByte(result.dtype()));
+    size_t required;
+    if (pack>1) {
+        const uint64_t offset=checked_nonnegative(storage_offset,"storage offset");
+        const uint64_t span=stride.empty()
+            ? checked_storage_bytes_contiguous(size,1,0)
+            : checked_storage_bytes_strided(size,stride,1,0);
+        const uint64_t packed_span=checked_add(span,pack-1)/pack;
+        required=span==0 ? 0 : static_cast<size_t>(checked_add(offset,packed_span));
+    } else {
+        required=stride.empty()
+            ? checked_storage_bytes_contiguous(size,impl->itemsize(),storage_offset)
+            : checked_storage_bytes_strided(size,stride,impl->itemsize(),storage_offset);
+    }
     const bool same_size =
         static_cast<std::vector<int64_t>>(impl->sizes()) == size;
     const bool same_stride = stride.empty() ||

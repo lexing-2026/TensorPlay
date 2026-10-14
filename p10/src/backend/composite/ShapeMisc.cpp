@@ -97,6 +97,12 @@ std::vector<Tensor> nonzero_numpy_native(const Tensor& self) {
     return ops::unbind(ops::nonzero(self), 1);
 }
 
+// One-argument `where`: return the indices of all non-zero elements as a
+// tuple of per-dimension index tensors (the native `nonzero` semantics).
+std::vector<Tensor> where_native(const Tensor& condition) {
+    return nonzero_numpy_native(condition);
+}
+
 Tensor type_as_native(const Tensor& self, const Tensor& other) {
     return ops::to(self, other, false, false, std::nullopt);
 }
@@ -392,7 +398,7 @@ TENSORPLAY_LIBRARY_IMPL(Composite, ShapeMiscComposite) {
     m.impl("_stack", composite::_stack_native);
     m.impl("_stack.out", composite::_stack_out_native);
     m.impl("nonzero_numpy", composite::nonzero_numpy_native);
-    m.impl("where", composite::nonzero_numpy_native);
+    m.impl("where", composite::where_native);
     m.impl("type_as", composite::type_as_native);
     m.impl("_unsafe_view", composite::_unsafe_view_native);
     m.impl("_reshape_copy", composite::_reshape_copy_native);

@@ -41,6 +41,13 @@ class Parameter(Tensor):
     def __repr__(self):
         return 'Parameter containing:\n' + super().__repr__()
 
+    def __deepcopy__(self, memo):
+        if id(self) in memo:
+            return memo[id(self)]
+        result = type(self)(self.data.clone(), self.requires_grad)
+        memo[id(self)] = result
+        return result
+
     def __reduce_ex__(self, proto):
         # Support for pickling
         return (
@@ -133,6 +140,14 @@ class UninitializedParameter(UninitializedTensorMixin, Parameter):
         data = tp.empty(0, **factory_kwargs)
         super().__init__(data, requires_grad)
 
+    def __deepcopy__(self, memo):
+        if id(self) in memo:
+            return memo[id(self)]
+        result = type(self)(self.requires_grad, self.data.device,
+                            self.data.dtype)
+        memo[id(self)] = result
+        return result
+
 
 class Buffer(Tensor):
     r"""A kind of Tensor that should not be considered a model
@@ -158,6 +173,13 @@ class Buffer(Tensor):
         self.requires_grad = data.requires_grad
         self.persistent = persistent
         self._is_buffer = True
+
+    def __deepcopy__(self, memo):
+        if id(self) in memo:
+            return memo[id(self)]
+        result = Buffer(self.data.clone(), self.persistent)
+        memo[id(self)] = result
+        return result
 
     def __reduce_ex__(self, proto):
         return (
@@ -198,3 +220,11 @@ class UninitializedBuffer(UninitializedTensorMixin, Tensor):
         self.requires_grad = requires_grad
         self.persistent = persistent
         self._is_buffer = True
+
+    def __deepcopy__(self, memo):
+        if id(self) in memo:
+            return memo[id(self)]
+        result = type(self)(self.requires_grad, self.data.device,
+                            self.data.dtype, self.persistent)
+        memo[id(self)] = result
+        return result

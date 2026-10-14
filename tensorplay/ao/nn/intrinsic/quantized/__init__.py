@@ -14,5 +14,9 @@ __all__ = [
     "ConvReLU1d",
     "ConvReLU2d",
     "ConvReLU3d",
+    "LinearLeakyReLU",
     "LinearReLU",
+    "LinearTanh",
+    "ConvAdd2d",
+    "ConvAddReLU2d",
 ]

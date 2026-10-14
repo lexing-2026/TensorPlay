@@ -1,3 +1,4 @@
+#include "QuantTensorOperators.h"
 #include <iostream>
 #include "Tensor.h"
 #include "Complex.h"
@@ -727,6 +728,8 @@ Tensor nansum_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim,
 
 // Mean
 Tensor mean_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim, DType dtype) {
+    if (isQuantizedType(self.dtype())) return quantized::moment(self, dim, keepdim, false, 1., dtype);
+
     DType out_dtype = dtype;
     if (out_dtype == DType::Undefined) {
         out_dtype = isFloatingOrComplexType(self.dtype()) ? self.dtype() : DType::Float32;
@@ -786,6 +789,8 @@ Tensor mean_dim_backward_kernel_cuda(const Tensor& grad_output, const Tensor& se
 }
 
 Tensor mean_kernel(const Tensor& self, DType dtype) {
+    if (isQuantizedType(self.dtype())) return quantized::moment(self, {}, false, false, 1., dtype);
+
     return mean_dim_kernel(self, {}, false, dtype);
 }
 
@@ -851,6 +856,8 @@ Tensor prod_kernel(const Tensor& self, DType dtype) {
 
 // Max
 std::tuple<Tensor, Tensor> max_dim_kernel(const Tensor& self, int64_t dim0, bool keepdim) {
+    if (isQuantizedType(self.dtype())) return quantized::extrema_dim(self, dim0, keepdim, true);
+
     const int64_t nd = self.dim();
     TP_CHECK(nd > 0, "max(): Expected input to have at least one dimension");
     const int64_t dim = dim0 < 0 ? dim0 + nd : dim0;
@@ -870,6 +877,8 @@ std::tuple<Tensor, Tensor> max_dim_kernel(const Tensor& self, int64_t dim0, bool
 }
 
 Tensor max_kernel(const Tensor& self) {
+    if (isQuantizedType(self.dtype())) return quantized::extrema(self, true);
+
     if (self.numel() == 0) {
         TP_THROW(RuntimeError, "max(): Expected reduction dim to be specified for input.numel() == 0. "
                  "Specify the reduction dim with the 'dim' argument.");
@@ -884,6 +893,8 @@ Tensor max_kernel(const Tensor& self) {
 
 // Min
 std::tuple<Tensor, Tensor> min_dim_kernel(const Tensor& self, int64_t dim0, bool keepdim) {
+    if (isQuantizedType(self.dtype())) return quantized::extrema_dim(self, dim0, keepdim, false);
+
     const int64_t nd = self.dim();
     TP_CHECK(nd > 0, "min(): Expected input to have at least one dimension");
     const int64_t dim = dim0 < 0 ? dim0 + nd : dim0;
@@ -901,6 +912,8 @@ std::tuple<Tensor, Tensor> min_dim_kernel(const Tensor& self, int64_t dim0, bool
 }
 
 Tensor min_kernel(const Tensor& self) {
+    if (isQuantizedType(self.dtype())) return quantized::extrema(self, false);
+
     if (self.numel() == 0) {
         TP_THROW(RuntimeError, "min(): Expected reduction dim to be specified for input.numel() == 0. "
                  "Specify the reduction dim with the 'dim' argument.");
@@ -1239,6 +1252,8 @@ Tensor var_kernel(const Tensor& self, int64_t correction) {
 }
 
 Tensor std_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, int64_t correction, bool keepdim) {
+    if (isQuantizedType(self.dtype())) return quantized::moment(self, dim, keepdim, true, correction);
+
     if (isComplexType(self.dtype())) {
         return var_dim_kernel(self, dim, correction, keepdim).sqrt();
     }
@@ -1248,6 +1263,8 @@ Tensor std_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, int64
 }
 
 Tensor std_kernel(const Tensor& self, int64_t correction) {
+    if (isQuantizedType(self.dtype())) return quantized::moment(self, {}, false, true, correction);
+
     if (isComplexType(self.dtype())) {
         return var_kernel(self, correction).sqrt();
     }

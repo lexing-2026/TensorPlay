@@ -1,0 +1,2639 @@
+{
+  "commit": "c264bbfb229eafcbac8344eeee60fb83a0de97b2",
+  "total": 329,
+  "callable": 329,
+  "operators": [
+    {
+      "operator": "_quantized::_wrapped_linear_prepack",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::_wrapped_quantized_linear_prepacked",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::add",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::conv2d",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::conv2d_prepack",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::conv2d_relu",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::conv3d",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::conv3d_prepack",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::conv3d_relu",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::conv_transpose1d",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::conv_transpose1d_prepack",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::conv_transpose2d",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::conv_transpose2d_prepack",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::conv_transpose3d_prepack",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::linear",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::linear_dynamic",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::linear_prepack",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::linear_prepack_fp16",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::linear_prepack_fp16_legacy",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::linear_prepack_legacy",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::wrapped_fbgemm_linear_fp16_weight",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::wrapped_fbgemm_pack_gemm_matrix_fp16",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "_quantized::wrapped_quantized_linear",
+      "public_namespace": "_quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::_adaptive_avg_pool2d",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::_adaptive_avg_pool3d",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::_empty_affine_quantized",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::_empty_per_channel_affine_quantized",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::_index_put_impl_",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::_prelu_kernel",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::_reshape_alias",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::_upsample_nearest_exact2d",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::_upsample_nearest_exact3d",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::adaptive_avg_pool3d.out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::as_strided",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::avg_pool2d",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::avg_pool3d",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::cat",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::cat.out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::channel_shuffle",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::clamp",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::clone",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::dequantize.self",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::dequantize.tensors",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::empty.memory_format",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::empty_like",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::empty_quantized",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::empty_strided",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::eq.Scalar",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::eq.Scalar_out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::eq.Tensor",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::eq.Tensor_out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::equal",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::fbgemm_linear_fp16_weight",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::fbgemm_linear_fp16_weight.out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::fbgemm_linear_fp16_weight_fp32_activation",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::fbgemm_linear_fp16_weight_fp32_activation.out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::fbgemm_linear_int8_weight",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::fbgemm_linear_int8_weight_fp32_activation",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::fbgemm_linear_quantize_weight",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::fbgemm_pack_gemm_matrix_fp16",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::fbgemm_pack_quantized_matrix",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::fbgemm_pack_quantized_matrix.KN",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::fill_.Scalar",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::fill_.Tensor",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::flip",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::ge.Scalar",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::ge.Scalar_out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::ge.Tensor",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::ge.Tensor_out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::gelu",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::gelu_",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::grid_sampler_2d",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::gt.Scalar",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::gt.Scalar_out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::gt.Tensor",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::gt.Tensor_out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::hardsigmoid",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::hardsigmoid.out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::hardtanh",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::hardtanh.out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::hardtanh_",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::index.Tensor",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::index_select",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::index_select.out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::int_repr",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::le.Scalar",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::le.Scalar_out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::le.Tensor",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::le.Tensor_out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::leaky_relu",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::leaky_relu.out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::leaky_relu_",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::lt.Scalar",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::lt.Scalar_out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::lt.Tensor",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::lt.Tensor_out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::masked_fill_.Scalar",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::masked_fill_.Tensor",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::max",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::max.dim",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::max.unary_out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::mean.dim",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::mean.out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::min",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::min.dim",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::min.unary_out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::ne.Scalar",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::ne.Scalar_out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::ne.Tensor",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::ne.Tensor_out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::q_per_channel_axis",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::q_per_channel_scales",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::q_per_channel_zero_points",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::q_scale",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::q_zero_point",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::qscheme",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::quantized_batch_norm",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::quantized_gru.data",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::quantized_gru.data_legacy",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::quantized_gru.input",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::quantized_gru.input_legacy",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::quantized_gru_cell",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::quantized_lstm.data",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::quantized_lstm.data_legacy",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::quantized_lstm.input",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::quantized_lstm.input_legacy",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::quantized_lstm_cell",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::quantized_max_pool1d",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::quantized_max_pool2d",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::quantized_max_pool3d",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::quantized_rnn_relu_cell",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::quantized_rnn_tanh_cell",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::reflection_pad1d.out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::reflection_pad2d",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::reflection_pad2d.out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::relu",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::relu_",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::resize_",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::set_.source_Storage_storage_offset",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::sigmoid",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::sort.stable",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::squeeze",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::squeeze.dim",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::squeeze.dims",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::std.correction",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::std.correction_out",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::tanh",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::threshold",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::topk",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::unfold",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::unsqueeze",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::upsample_bilinear2d",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::upsample_nearest2d",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::upsample_nearest3d",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "aten::view",
+      "public_namespace": "tp",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::add",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::add.Scalar",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::add.Scalar2",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::add.Scalar_out",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::add.out",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::add_out",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::add_relu",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::add_relu.Scalar",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::add_relu.Scalar2",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::add_relu.Scalar_out",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::add_relu.out",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::add_relu_out",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::add_scalar",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::add_scalar.Tensor",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::add_scalar_out",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::add_scalar_out.Tensor",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::add_scalar_relu",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::add_scalar_relu.Tensor",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::add_scalar_relu_out",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::add_scalar_relu_out.Tensor",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::batch_norm",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::batch_norm1d",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::batch_norm1d_relu",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::batch_norm2d",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::batch_norm2d_relu",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::batch_norm3d",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::batch_norm3d_relu",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::batch_norm_relu",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::cat",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::cat_out",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::cat_relu",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::cat_relu_out",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::celu",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::clamp",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv1d",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv1d_dynamic",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv1d_prepack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv1d_relu",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv1d_unpack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv2d",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv2d.new",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv2d_add",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv2d_add_relu",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv2d_dilation",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv2d_dynamic",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv2d_groups",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv2d_output_padding",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv2d_padding",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv2d_prepack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv2d_relu",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv2d_relu.new",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv2d_stride",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv2d_transpose",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv2d_unpack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv2d_unpack_sizes",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv3d",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv3d.new",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv3d_dilation",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv3d_dynamic",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv3d_groups",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv3d_output_padding",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv3d_padding",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv3d_prepack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv3d_relu",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv3d_relu.new",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv3d_stride",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv3d_transpose",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv3d_unpack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_prepack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose1d",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose1d_dynamic",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose1d_prepack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose1d_unpack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose2d",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose2d_dilation",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose2d_dynamic",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose2d_groups",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose2d_output_padding",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose2d_padding",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose2d_prepack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose2d_stride",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose2d_transpose",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose2d_unpack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose3d",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose3d_dilation",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose3d_dynamic",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose3d_groups",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose3d_output_padding",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose3d_padding",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose3d_prepack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose3d_stride",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose3d_transpose",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_transpose3d_unpack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::conv_unpack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::dropout",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::elu",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::embedding_4bit",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::embedding_bag_2bit_prepack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::embedding_bag_2bit_prepack_with_rowwise_min_max",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::embedding_bag_2bit_rowwise_offsets",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::embedding_bag_2bit_unpack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::embedding_bag_4bit",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::embedding_bag_4bit_prepack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::embedding_bag_4bit_prepack_with_rowwise_min_max",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::embedding_bag_4bit_rowwise_offsets",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::embedding_bag_4bit_unpack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::embedding_bag_byte",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::embedding_bag_byte_prepack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::embedding_bag_byte_prepack_with_rowwise_min_max",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::embedding_bag_byte_rowwise_offsets",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::embedding_bag_byte_unpack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::embedding_bag_prepack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::embedding_bag_unpack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::embedding_byte",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::group_norm",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::hardswish",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::instance_norm",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::int4mm_packed_weight_cpu",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::layer_norm",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::leaky_relu",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::linear",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::linear_dynamic",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::linear_dynamic_fp16",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::linear_dynamic_fp16_unpacked_weight",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::linear_leaky_relu",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::linear_prepack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::linear_prepack_fp16",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::linear_prepack_fp16_legacy",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::linear_prepack_legacy",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::linear_relu",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::linear_relu_dynamic",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::linear_relu_dynamic_fp16",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::linear_tanh",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::linear_unpack",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::linear_unpack.legacy",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::linear_unpack_fp16",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::linear_unpack_fp16.legacy",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::linear_with_input_q_dq_qweight_dq_output_fp32",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::linear_with_input_q_dq_qweight_dq_relu_output_fp32",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::make_quantized_cell_params",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::make_quantized_cell_params_dynamic",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::make_quantized_cell_params_fp16",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::matmul",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::max_pool1d",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::max_pool2d",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::mul",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::mul.Scalar",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::mul.Scalar2",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::mul.Scalar_out",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::mul.out",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::mul_out",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::mul_relu",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::mul_relu.Scalar",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::mul_relu.Scalar2",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::mul_relu.Scalar_out",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::mul_relu.out",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::mul_relu_out",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::mul_scalar",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::mul_scalar.Tensor",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::mul_scalar_out",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::mul_scalar_out.Tensor",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::mul_scalar_relu",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::mul_scalar_relu.Tensor",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::mul_scalar_relu_out",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::mul_scalar_relu_out.Tensor",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::prelu",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::quantized_gru_cell_dynamic",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::quantized_lstm_cell_dynamic",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::quantized_rnn_relu_cell_dynamic",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::quantized_rnn_tanh_cell_dynamic",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::relu6",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::sigmoid",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::softmax",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    },
+    {
+      "operator": "quantized::threshold",
+      "public_namespace": "quantized",
+      "callable": true,
+      "validation": "pending",
+      "performance": "pending",
+      "reason": null
+    }
+  ]
+}

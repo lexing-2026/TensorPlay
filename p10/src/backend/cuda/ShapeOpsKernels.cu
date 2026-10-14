@@ -1,3 +1,4 @@
+#include "QuantTensorOperators.h"
 // Tensor shape and layout operators - CUDA kernels.
 #include "Tensor.h"
 #include "Dispatcher.h"
@@ -189,14 +190,14 @@ struct FlipShape {
 };
 
 // The thread index walks the output and the mirrored index reaches into the
-// input, so the stores stay contiguous.  Mirroring the other way round would
+// input, so the stores stay contiguous.  Reversing the destination coordinates would
 // scatter the stores instead, and a partial-sector write costs far more than a
 // scattered read.
 // Every axis costs one integer division, and a 64-bit division is a software
 // routine, so a tensor that fits in 32 bits walks its axes in 32-bit
 // arithmetic.  The template rank keeps the axis table in registers and the
 // traversal unrolled.  The thread index walks the output and the mirrored index
-// reaches into the input, so the stores stay contiguous: mirroring the other
+// reaches into the input, so the stores stay contiguous: reversing the destination in the other
 // way round scatters the stores instead, and a partial-sector write costs far
 // more than a scattered read.
 template <typename T, int kMaxDims, int kRank, typename index_t>
@@ -436,6 +437,8 @@ std::vector<Tensor> tensor_split_cuda(const Tensor& self, int64_t sections, int6
 }
 
 Tensor flip_cuda(const Tensor& self, const std::vector<int64_t>& dims) {
+    if (isQuantizedType(self.dtype())) return quantized::with_quantizer(flip_cuda(quantized::storage_view(self), dims), self);
+
     // Normalize dimensions with scalar wrapping and reject duplicates.
     int64_t nd = self.dim();
     std::vector<bool> seen(nd > 0 ? nd : 1, false);
@@ -831,6 +834,8 @@ Tensor pixel_unshuffle_cuda(const Tensor& self, int64_t downscale_factor) {
 }
 
 Tensor channel_shuffle_cuda(const Tensor& self, int64_t groups) {
+    if (isQuantizedType(self.dtype())) return quantized::with_quantizer(channel_shuffle_cuda(quantized::storage_view(self), groups), self);
+
     if (self.dim() <= 2) {
         TP_THROW(RuntimeError, "channel_shuffle expects input with more than 2 dimensions");
     }
