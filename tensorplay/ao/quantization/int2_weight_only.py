@@ -102,6 +102,17 @@ def unpack_int2(packed: tp.Tensor, columns: int) -> tp.Tensor:
     return codes
 
 
+def _pack_int2_weight(
+    weight: tp.Tensor, groupsize: int
+) -> Tuple[tp.Tensor, tp.Tensor]:
+    """Quantize and pack a float weight into ``(packed_uint8, scale_zero)``."""
+    codes, scale, zero = _quantize_int2_groupwise(weight, groupsize)
+    packed = pack_int2(codes)
+    # (groups, N, 2) layout matching the int4 packed module.
+    scale_zero = tp.stack([scale.t(), zero.t()], dim=-1)
+    return packed, scale_zero
+
+
 def _dequantize_int2(
     packed: tp.Tensor, scale: tp.Tensor, zero: tp.Tensor, columns: int
 ) -> tp.Tensor:
@@ -164,17 +175,15 @@ class WeightOnlyInt2Linear(nn.Module):
         """Build an INT2 weight-only linear from a float ``nn.Linear``."""
         if linear.bias is not None and linear.bias.dim() != 1:
             raise ValueError("int2 weight-only requires a 1-D bias or no bias")
-        codes, scale, zero = _quantize_int2_groupwise(
-            linear.weight.detach(), groupsize
-        )
+        packed, scale_zero = _pack_int2_weight(linear.weight.detach(), groupsize)
         mod = cls(
             linear.in_features,
             linear.out_features,
             groupsize=groupsize,
             bias=linear.bias is not None,
         )
-        mod.weight = pack_int2(codes)
-        mod.scales_and_zeros = tp.stack([scale.t(), zero.t()], dim=-1)
+        mod.weight = packed
+        mod.scales_and_zeros = scale_zero
         if linear.bias is not None:
             mod.bias = linear.bias.detach()
         return mod

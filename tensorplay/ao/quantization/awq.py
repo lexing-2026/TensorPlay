@@ -20,6 +20,12 @@ import tensorplay as tp
 from tensorplay import Tensor, nn
 from tensorplay.nn import functional as F
 
+from tensorplay.ao.quantization.int2_weight_only import (
+    Int2WeightOnlyConfig,
+    WeightOnlyInt2Linear,
+    _pack_int2_weight,
+    _quantize_int2_groupwise,
+)
 from tensorplay.ao.quantization.int4_weight_only import (
     WeightOnlyInt4Linear,
     _pack_int4_weight,
@@ -44,13 +50,23 @@ def _get_act_scale(x: tp.Tensor) -> tp.Tensor:
 class AWQObserver(nn.Module):
     """Collects calibration activations and searches the equalization scale."""
 
-    def __init__(self, weight, bias, scale_search_space_size: int = 20, groupsize: int = 128):
+    def __init__(
+        self,
+        weight,
+        bias,
+        scale_search_space_size: int = 20,
+        groupsize: int = 128,
+        quantize_fn=None,
+    ):
         super().__init__()
         self.weight = weight.detach()
         self.bias = bias
         self.inputs = []
         self.scale_options = scale_search_space_size
         self.groupsize = groupsize
+        self.quantize_fn = (
+            quantize_fn if quantize_fn is not None else _quantize_dequant_int4
+        )
 
     def forward(self, input: tp.Tensor, output: tp.Tensor):
         del output
@@ -71,7 +87,7 @@ class AWQObserver(nn.Module):
             scales = scales / (scales.max() * scales.min()).sqrt()
 
             # Quantized weight for this candidate scale.
-            wq = _quantize_dequant_int4(self.weight * scales, self.groupsize)
+            wq = self.quantize_fn(self.weight * scales, self.groupsize)
             orig_out = F.linear(acc, self.weight, self.bias)
             q_out = F.linear(acc / scales, wq, self.bias)
             loss = ((orig_out - q_out) ** 2).mean().item()
@@ -117,6 +133,15 @@ def _quantize_dequant_int4(weight: tp.Tensor, groupsize: int = 128) -> tp.Tensor
     wq = wq * scale.unsqueeze(-1)
     return wq.reshape(N, K)
 
+def _quantize_dequant_int2(weight: tp.Tensor, groupsize: int = 128) -> tp.Tensor:
+    """Symmetric int2 quantize + dequantize back to float (zero point 2)."""
+    codes, scale, zero = _quantize_int2_groupwise(weight, groupsize)
+    N, K = weight.shape
+    groups = K // groupsize
+    wq = (codes.reshape(N, groups, groupsize).to(scale.dtype) - zero.unsqueeze(-1))
+    wq = wq * scale.unsqueeze(-1)
+    return wq.reshape(N, K)
+
 
 @dataclass
 class AWQConfig:
@@ -139,9 +164,17 @@ class AWQConfig:
 awq = AWQConfig
 
 
+def _awq_paths(base_config):
+    """Return ``(quantize_fn, pack_fn, module_class)`` for the base config."""
+    if isinstance(base_config, Int2WeightOnlyConfig):
+        return _quantize_dequant_int2, _pack_int2_weight, WeightOnlyInt2Linear
+    return _quantize_dequant_int4, _pack_int4_weight, WeightOnlyInt4Linear
+
+
 @register_quantize_module_handler(AWQConfig)
 def _awq_transform(module, config):
     step = config.step
+    quantize_fn, pack_fn, module_class = _awq_paths(config.base_config)
     if step == "prepare" or step == "prepare_for_loading":
         groupsize = getattr(config.base_config, "groupsize", 128)
         observer = AWQObserver(
@@ -149,6 +182,7 @@ def _awq_transform(module, config):
             module.bias,
             config.scale_search_space_size,
             groupsize,
+            quantize_fn,
         )
         observed = AWQObservedLinear.from_float(module, observer)
         if step == "prepare_for_loading":
@@ -164,8 +198,8 @@ def _awq_transform(module, config):
             return module
         groupsize = getattr(config.base_config, "groupsize", 128)
         eq_scale = module.act_obs.calculate_qparams()
-        packed, scale_zero = _pack_int4_weight(module.weight * eq_scale, groupsize)
-        linear = WeightOnlyInt4Linear(
+        packed, scale_zero = pack_fn(module.weight * eq_scale, groupsize)
+        linear = module_class(
             module.in_features,
             module.out_features,
             groupsize=groupsize,

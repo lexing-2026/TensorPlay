@@ -25,6 +25,7 @@ from tensorplay.ao.quantization import (
     WeightOnlyBinaryLinear,
     WeightOnlyInt2Linear,
     binary_weight_only,
+    float8_dynamic_activation_float8_weight_inference,
     float8_weight_only_inference,
     int2_weight_only,
     int4_weight_only,
@@ -249,3 +250,60 @@ def test_int2_rejects_bad_groupsize(device):
     lin = nn.Linear(16, 8).to(device)
     with pytest.raises(ValueError):
         WeightOnlyInt2Linear.from_float(lin, groupsize=3)
+
+# ---------------------------------------------------------------------------
+# fp8 dynamic-activation inference
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_float8_dynamic_inference_from_float_and_forward(device):
+    x, lin = _pair()
+    x = x.to(device)
+    lin = lin.to(device)
+    mod = Float8WeightOnlyInferenceLinear  # imported above
+    from tensorplay.ao.quantization import Float8DynamicActivationInferenceLinear as FDAL
+
+    mod = FDAL.from_float(lin)
+    assert mod.weight.dtype == tp.float8_e4m3fn
+    out = mod(x)
+    assert out.shape == (x.shape[0], mod.out_features)
+    assert bool(tp.isfinite(out).all())
+    # output stays close to the float linear (fp8 has ~1e-2 relative error)
+    ref = lin(x)
+    scale = (out.abs().max() + 1e-8)
+    assert ((out - ref).abs() / scale).max() < 0.1
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_float8_dynamic_inference_quantize_model(device):
+    x, _ = _pair()
+    x = x.to(device)
+    model = nn.Sequential(nn.Linear(16, 32, bias=False), nn.ReLU(), nn.Linear(32, 8, bias=False)).to(device)
+    qmodel = quantize_(model, float8_dynamic_activation_float8_weight_inference())
+    from tensorplay.ao.quantization import Float8DynamicActivationInferenceLinear
+
+    assert isinstance(qmodel[0], Float8DynamicActivationInferenceLinear)
+    out = qmodel(x)
+    assert out.shape == (x.shape[0], 8)
+
+
+# ---------------------------------------------------------------------------
+# AWQ with int2 weight-only
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_awq_int2_workflow(device):
+    from tensorplay.ao.quantization import awq
+
+    model = nn.Sequential(nn.Linear(32, 32, bias=False), nn.ReLU(), nn.Linear(32, 16, bias=False)).to(device)
+    x = tp.randn(4, 32, device=device)
+    config = awq(int2_weight_only(groupsize=8), step='prepare')
+    observed = quantize_(model, config)
+    observed(x)
+    converted = quantize_(observed, awq(int2_weight_only(groupsize=8), step='convert'))
+    assert isinstance(converted[0], WeightOnlyInt2Linear)
+    out = converted(x)
+    assert out.shape == (4, 16)
+    assert bool(tp.isfinite(out).all())

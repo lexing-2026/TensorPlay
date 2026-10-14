@@ -174,8 +174,11 @@ from .int8_dyn_act_int4_weight import (
 )
 
 from .float8 import (
+    Float8DynamicActivationFloat8WeightInferenceConfig as Float8DynamicActivationFloat8WeightInferenceConfig,
+    Float8DynamicActivationInferenceLinear as Float8DynamicActivationInferenceLinear,
     Float8WeightOnlyInferenceConfig as Float8WeightOnlyInferenceConfig,
     Float8WeightOnlyInferenceLinear as Float8WeightOnlyInferenceLinear,
+    float8_dynamic_activation_float8_weight_inference as float8_dynamic_activation_float8_weight_inference,
     float8_weight_only_inference as float8_weight_only_inference,
 )
 from .int4_weight_only import (
@@ -229,12 +232,15 @@ __all__ += [
     "Float8WeightOnlyConfig",
     "Float8WeightOnlyInferenceConfig",
     "Float8DynamicActivationFloat8WeightConfig",
+    "Float8DynamicActivationFloat8WeightInferenceConfig",
     "Float8WeightOnlyQuantizedTrainingLinear",
     "Float8WeightOnlyInferenceLinear",
+    "Float8DynamicActivationInferenceLinear",
     "Float8MixedPrecisionTrainingLinear",
     "float8_weight_only",
     "float8_weight_only_inference",
     "float8_dynamic_activation_float8_weight",
+    "float8_dynamic_activation_float8_weight_inference",
     "Int4WeightOnlyConfig",
     "Int4WeightOnlyQuantizedTrainingConfig",
     "WeightOnlyInt4Linear",

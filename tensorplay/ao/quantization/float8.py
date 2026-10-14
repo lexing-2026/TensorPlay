@@ -29,11 +29,14 @@ __all__ = [
     "Float8WeightOnlyConfig",
     "Float8WeightOnlyInferenceConfig",
     "Float8DynamicActivationFloat8WeightConfig",
+    "Float8DynamicActivationFloat8WeightInferenceConfig",
     "float8_weight_only",
     "float8_weight_only_inference",
     "float8_dynamic_activation_float8_weight",
+    "float8_dynamic_activation_float8_weight_inference",
     "Float8WeightOnlyQuantizedTrainingLinear",
     "Float8WeightOnlyInferenceLinear",
+    "Float8DynamicActivationInferenceLinear",
     "Float8MixedPrecisionTrainingLinear",
 ]
 
@@ -76,10 +79,26 @@ class Float8DynamicActivationFloat8WeightConfig:
     dtype: str = "float8_e4m3fn"
 
 
+@dataclass
+class Float8DynamicActivationFloat8WeightInferenceConfig:
+    """Configuration for FP8 dynamic-activation / FP8-weight inference.
+
+    The weight is quantized once at conversion time and stored as FP8 codes
+    plus per-row scales; activations are quantized per token on every forward
+    and dequantized before the GEMM.
+
+    Attributes:
+        dtype: FP8 format used for both activations and the stored weight.
+    """
+
+    dtype: str = "float8_e4m3fn"
+
+
 # Backwards-compatible aliases matching the workflow config names.
 float8_weight_only = Float8WeightOnlyConfig
 float8_weight_only_inference = Float8WeightOnlyInferenceConfig
 float8_dynamic_activation_float8_weight = Float8DynamicActivationFloat8WeightConfig
+float8_dynamic_activation_float8_weight_inference = Float8DynamicActivationFloat8WeightInferenceConfig
 
 
 def _fp8_dtype(config_or_str) -> "tp.DType":
@@ -274,4 +293,67 @@ class Float8WeightOnlyInferenceLinear(nn.Module):
 def _float8_weight_only_inference_transform(module, config):
     """Replace matching ``nn.Linear`` modules with FP8 weight-only inference."""
     return Float8WeightOnlyInferenceLinear.from_float(module, config.dtype)
+
+
+class Float8DynamicActivationInferenceLinear(nn.Module):
+    """Inference linear with FP8 dynamic activations and stored FP8 weight."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        dtype: str = "float8_e4m3fn",
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.fp8_dtype = dtype
+        self.register_buffer(
+            "weight", tp.zeros((out_features, in_features), dtype=_fp8_dtype(dtype))
+        )
+        self.register_buffer(
+            "scale", tp.zeros((out_features, 1), dtype=tp.float32)
+        )
+        if bias:
+            self.register_buffer("bias", tp.zeros(out_features, dtype=tp.float32))
+        else:
+            self.bias = None
+
+    def forward(self, input: tp.Tensor) -> tp.Tensor:
+        batch_dims = input.shape[:-1]
+        flat = input.reshape(-1, input.shape[-1])
+        q_a, s_a = _quantize_fp8_rowwise(flat, _fp8_dtype(self.fp8_dtype))
+        dq_a = _dequantize_fp8(q_a, s_a, input.dtype).reshape(input.shape)
+        dq_w = _dequantize_fp8(self.weight, self.scale, input.dtype)
+        out = dq_a @ dq_w.T.contiguous()
+        if self.bias is not None:
+            out = out + self.bias
+        return out.reshape(*batch_dims, self.out_features)
+
+    @classmethod
+    def from_float(
+        cls, linear: nn.Linear, dtype: str = "float8_e4m3fn"
+    ) -> "Float8DynamicActivationInferenceLinear":
+        """Build an FP8 dynamic-activation inference linear from a float linear."""
+        if linear.bias is not None and linear.bias.dim() != 1:
+            raise ValueError("float8 dynamic activation requires a 1-D bias or no bias")
+        codes, scale = _quantize_fp8_rowwise(linear.weight.detach(), _fp8_dtype(dtype))
+        mod = cls(
+            linear.in_features,
+            linear.out_features,
+            dtype=dtype,
+            bias=linear.bias is not None,
+        )
+        mod.weight = codes
+        mod.scale = scale
+        if linear.bias is not None:
+            mod.bias = linear.bias.detach()
+        return mod
+
+
+@register_quantize_module_handler(Float8DynamicActivationFloat8WeightInferenceConfig)
+def _float8_dynamic_inference_transform(module, config):
+    """Replace matching ``nn.Linear`` modules with FP8 dynamic inference."""
+    return Float8DynamicActivationInferenceLinear.from_float(module, config.dtype)
 
