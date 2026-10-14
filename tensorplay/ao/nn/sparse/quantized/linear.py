@@ -19,9 +19,9 @@ class LinearPackedParams(PackedWeight):
     def __init__(self, row_block_size=1, col_block_size=4, dtype=tp.qint8):
         if dtype != tp.qint8:
             raise NotImplementedError("Linear prepacking only supports QINT8")
-        self.dtype = dtype
         self.row_block_size = int(row_block_size)
         self.col_block_size = int(col_block_size)
+        self.dtype = dtype
         wq = tp._C.quantize_per_tensor(tp.zeros(1, 1), 1.0, 0, dtype)
         super().__init__(wq, None)
 
@@ -29,13 +29,10 @@ class LinearPackedParams(PackedWeight):
         return "SparseQuantizedLinearPackedParams"
 
     def set_weight_bias(self, weight, bias, row_block_size=None, col_block_size=None):
-        if row_block_size is None or col_block_size is None:
-            raise AssertionError(
-                "row_block_size and col_block_size must not be None, got "
-                f"row_block_size={row_block_size}, col_block_size={col_block_size}"
-            )
-        self.row_block_size = int(row_block_size)
-        self.col_block_size = int(col_block_size)
+        if row_block_size is not None:
+            self.row_block_size = int(row_block_size)
+        if col_block_size is not None:
+            self.col_block_size = int(col_block_size)
         super().set_weight_bias(weight, bias)
 
 

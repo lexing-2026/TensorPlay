@@ -36,16 +36,16 @@ _all_supported_types = _supported_types.union(_supported_intrinsic_types)
 
 def set_module_weight(module, weight) -> None:
     if type(module) in _supported_types:
-        module.weight = nn.Parameter(weight)
+        module.weight = nn.Parameter(weight.detach().clone())
     else:
-        module[0].weight = nn.Parameter(weight)
+        module[0].weight = nn.Parameter(weight.detach().clone())
 
 
 def set_module_bias(module, bias) -> None:
     if type(module) in _supported_types:
-        module.bias = nn.Parameter(bias)
+        module.bias = nn.Parameter(bias.detach().clone())
     else:
-        module[0].bias = nn.Parameter(bias)
+        module[0].bias = nn.Parameter(bias.detach().clone())
 
 
 def has_bias(module) -> bool:

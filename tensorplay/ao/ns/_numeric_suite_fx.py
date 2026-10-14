@@ -81,10 +81,10 @@ class OutputComparisonLogger(OutputLogger):
 
 
 def _trace_model(model):
-    from .fx.tracer import QuantizationTracer
+    from tensorplay.ao.quantization.fx.tracer import QuantizationTracer
 
     tracer = QuantizationTracer()
-    return GraphModule(model, tracer.trace(model))
+    return tracer.trace(model)
 
 
 def extract_weights(
