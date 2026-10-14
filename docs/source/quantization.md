@@ -388,9 +388,6 @@ had two or three layers.
     tensorplay.ao.nn.qat.Conv1d
     tensorplay.ao.nn.qat.Conv2d
     tensorplay.ao.nn.qat.Conv3d
-    tensorplay.ao.nn.qat.Embedding
-    tensorplay.ao.nn.qat.EmbeddingBag
-    tensorplay.ao.nn.qat.dynamic.Linear
 ```
 
 For QAT, `tensorplay.ao.nn.qat` provides the float modules with fake
