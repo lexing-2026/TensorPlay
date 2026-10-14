@@ -119,21 +119,21 @@ def get_fusion_pattern_to_extra_inputs_getter(backend_config: BackendConfig) -> 
 
 def remove_boolean_dispatch_from_name(p):
     if p is F.fractional_max_pool2d:
-        return "torch.nn.functional.fractional_max_pool2d"
+        return "tensorplay.nn.functional.fractional_max_pool2d"
     elif p is F.fractional_max_pool3d:
-        return "torch.nn.functional.fractional_max_pool3d"
+        return "tensorplay.nn.functional.fractional_max_pool3d"
     elif p is F.max_pool1d:
-        return "torch.nn.functional.max_pool1d"
+        return "tensorplay.nn.functional.max_pool1d"
     elif p is F.max_pool2d:
-        return "torch.nn.functional.max_pool2d"
+        return "tensorplay.nn.functional.max_pool2d"
     elif p is F.max_pool3d:
-        return "torch.nn.functional.max_pool3d"
+        return "tensorplay.nn.functional.max_pool3d"
     elif p is F.adaptive_max_pool1d:
-        return "torch.nn.functional.adaptive_max_pool1d"
+        return "tensorplay.nn.functional.adaptive_max_pool1d"
     elif p is F.adaptive_max_pool2d:
-        return "torch.nn.functional.adaptive_max_pool2d"
+        return "tensorplay.nn.functional.adaptive_max_pool2d"
     elif p is F.adaptive_max_pool3d:
-        return "torch.nn.functional.adaptive_max_pool3d"
+        return "tensorplay.nn.functional.adaptive_max_pool3d"
     return p
 
 

@@ -49,7 +49,7 @@ __all__ = [
     "compute_nparams_to_prune",
 ]
 
-# Sparsifier framework (upstream torch.ao.pruning API)
+# Sparsifier framework
 from ._mappings import (
     get_dynamic_sparse_quantized_mapping as get_dynamic_sparse_quantized_mapping,
     get_static_sparse_quantized_mapping as get_static_sparse_quantized_mapping,

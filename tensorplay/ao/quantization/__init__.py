@@ -218,7 +218,7 @@ __all__ += [
     "scaled_int8_mm",
 ]
 
-# ---- eager workflow completeness (upstream torch.ao.quantization API) ----
+# ---- eager workflow completeness ----
 from .quant_type import QuantType as QuantType
 from .stubs import QuantWrapper as QuantWrapper
 from .qconfig import (
