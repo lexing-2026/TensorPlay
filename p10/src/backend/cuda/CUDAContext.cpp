@@ -56,6 +56,7 @@ void checkCudnn(cudnnStatus_t error, const char* operation) {
 
 struct DeviceHandles {
     cusolverDnHandle_t cusolver_dn = nullptr;
+    cusolverSpHandle_t cusolver_sp = nullptr;
     cublasHandle_t cublas = nullptr;
     cublasLtHandle_t cublas_lt = nullptr;
 #ifdef USE_CUDNN
@@ -74,6 +75,7 @@ DeviceHandles& handlesForCurrentDevice() {
 
     auto* created = new DeviceHandles();
     checkCusolver(cusolverDnCreate(&created->cusolver_dn), "cusolverDnCreate");
+    checkCusolver(cusolverSpCreate(&created->cusolver_sp), "cusolverSpCreate");
     checkCublas(cublasCreate(&created->cublas), "cublasCreate");
     checkCublas(cublasLtCreate(&created->cublas_lt), "cublasLtCreate");
 #ifdef USE_CUDNN
@@ -110,6 +112,13 @@ cusolverDnHandle_t CUDAContext::getCusolverDnHandle() {
     checkCusolver(cusolverDnSetStream(handles.cusolver_dn, getCurrentCUDAStream().stream()),
                   "cusolverDnSetStream");
     return handles.cusolver_dn;
+}
+
+cusolverSpHandle_t CUDAContext::getCusolverSpHandle() {
+    auto& handles = handlesForCurrentDevice();
+    checkCusolver(cusolverSpSetStream(handles.cusolver_sp, getCurrentCUDAStream().stream()),
+                  "cusolverSpSetStream");
+    return handles.cusolver_sp;
 }
 
 void CUDAContext::warmupHandles() {

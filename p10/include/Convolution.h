@@ -29,6 +29,19 @@ Tensor conv3d_cpu(const Tensor& input, const Tensor& weight, const Tensor& bias,
                   const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                   const std::vector<int64_t>& dilation, int64_t groups);
 
+// oneDNN-accelerated native quantized 2d convolution.  The operands are Int8
+// quantized tensors; the primitive consumes them in the integer domain with
+// the affine grid applied through runtime scales/zero points.  Returns false
+// when the engine is unavailable or the shape is not supported, leaving the
+// caller to fall back to the scalar integer kernel.
+bool conv2d_onednn_qint8(
+    const Tensor& input, const Tensor& weight, const Tensor& bias_f,
+    double input_scale, int64_t input_zero_point, double weight_scale,
+    int64_t weight_zero_point, double out_scale, int64_t out_zero_point,
+    const std::vector<int64_t>& stride, int64_t pH_top, int64_t pH_bottom,
+    int64_t pW_left, int64_t pW_right, const std::vector<int64_t>& dilation,
+    int64_t groups, Tensor& output);
+
 Tensor conv_transpose1d_cpu(const Tensor& input, const Tensor& weight, const Tensor& bias,
                             const std::vector<int64_t>& stride,
                             const std::vector<int64_t>& padding,

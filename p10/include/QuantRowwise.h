@@ -22,7 +22,20 @@ TP_QR_HD inline void put_float(uint8_t* p, float value) {
     for (int i = 0; i < 4; ++i) p[i] = static_cast<uint8_t>(v.bits >> (i * 8));
 }
 TP_QR_HD inline void put_half(uint8_t* p, float value) {
-    const Half v(value); p[0] = static_cast<uint8_t>(v.x); p[1] = static_cast<uint8_t>(v.x >> 8);
+#ifdef __CUDA_ARCH__
+    const uint32_t original=__float_as_uint(value),doubled=original+original;
+    float base=__fmul_rn(__fmul_rn(::fabsf(value),__uint_as_float(239u<<23)),__uint_as_float(17u<<23));
+    uint32_t bias=doubled & 0xff000000u;
+    if (bias<0x71000000u) bias=0x71000000u;
+    base=__fadd_rn(__uint_as_float((bias>>1)+0x07800000u),base);
+    const uint32_t rounded=__float_as_uint(base);
+    const uint32_t bits=(original>>16 & 0x8000u) | (doubled>0xff000000u ? 0x7e00u
+        : ((rounded>>13 & 0x7c00u)+(rounded & 0xfffu)));
+#else
+    const uint32_t bits=Half(value).x;
+#endif
+    p[0]=static_cast<uint8_t>(bits & 255u);
+    p[1]=static_cast<uint8_t>(bits >> 8);
 }
 TP_QR_HD inline void row_grid(const uint8_t* row, int64_t width, int bits, float& scale, float& bias) {
     const uint8_t* tail = row + width - (bits == 8 ? 8 : 4);

@@ -4,6 +4,7 @@
 #include "Dispatcher.h"
 #include "Graph.h"
 #include "Context.h"
+#include "QuantNative.h"
 #include "PythonUtils.h"
 #include <filesystem>
 #include <cctype>
@@ -23,7 +24,7 @@ namespace {
 
 // ---------------------------------------------------------------------------
 //
-// Kernels registered from Python via ``tensorplay.library`` are mirrored into
+// Kernels registered from Python via ``tensorplay.library`` are installed in
 // the p10 Dispatcher under their qualified ``"ns::op"`` name so native code
 // (and the bindings below) can resolve and invoke them through the real
 // dispatch path -- DispatchTable lookup plus the autocast choke point --
@@ -306,6 +307,25 @@ PyMethodDef tensor_def = {
 }  // namespace
 
 void init_ops(py::module_& m) {
+    m.def("_quantized_recurrent_packed", [](const Tensor& input,const Tensor& hidden,
+            const std::optional<Tensor>& cell,const std::vector<Tensor>& weights,
+            const std::vector<std::optional<Tensor>>& optional_biases,const std::vector<Tensor>& storage,
+            const std::vector<bool>& ranges,int64_t layers,double dropout,bool training,
+            bool bidirectional,bool batch_first,int64_t mode,const std::optional<Tensor>& batch_sizes) {
+        std::vector<Tensor> biases;
+        biases.reserve(optional_biases.size());
+        for (const auto& bias:optional_biases) biases.push_back(bias.value_or(Tensor()));
+        py::gil_scoped_release release;
+        if (input.device().is_cpu())
+            return tensorplay::quant::recurrent_packed_cpu(input,hidden,cell,weights,biases,storage,ranges,
+                layers,dropout,training,bidirectional,batch_first,mode,batch_sizes);
+#ifdef USE_CUDA
+        if (input.device().is_cuda())
+            return tensorplay::quant::recurrent_packed_cuda(input,hidden,cell,weights,biases,storage,ranges,
+                layers,dropout,training,bidirectional,batch_first,mode,batch_sizes);
+#endif
+        TP_THROW(NotImplementedError, "Packed recurrence requires a host or CUDA device");
+    });
     // Module functions
     static PyObject* module_name = PyUnicode_InternFromString("tensorplay._C");
     m.add_object("tensor", py::reinterpret_steal<py::object>(

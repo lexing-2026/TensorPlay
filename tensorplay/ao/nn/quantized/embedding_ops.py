@@ -46,16 +46,18 @@ class Embedding(nn.Module):
     def __init__(self, num_embeddings, embedding_dim, padding_idx=None, max_norm=None,
                  norm_type=2., scale_grad_by_freq=False, sparse=False, _weight=None, dtype=tp.quint8):
         super().__init__()
-        if dtype != tp.quint8:
-            raise ValueError('Embedding logical weights require unsigned byte storage')
+        if dtype not in (tp.quint8,tp.quint4x2):
+            raise ValueError('Embedding logical weights require unsigned 8-bit or 4-bit storage')
         self.num_embeddings, self.embedding_dim = int(num_embeddings), int(embedding_dim)
         self.dtype = dtype
         if _weight is None:
-            _weight = _C._make_per_channel_quantized_tensor(
-                tp.zeros((self.num_embeddings, self.embedding_dim), dtype=tp.uint8),
-                tp.ones(self.num_embeddings), tp.zeros(self.num_embeddings), 0)
+            _weight = _C.quantize_per_channel(
+                tp.zeros((self.num_embeddings, self.embedding_dim)),
+                tp.ones(self.num_embeddings), tp.zeros(self.num_embeddings), 0,dtype)
         if tuple(_weight.shape) != (self.num_embeddings, self.embedding_dim):
             raise ValueError('Embedding weight dimensions do not match the module')
+        if _weight.dtype!=dtype:
+            raise ValueError('Embedding weight dtype must match the module dtype')
         self._packed_params = EmbeddingPackedParams(_weight)
 
     def weight(self):
@@ -65,9 +67,11 @@ class Embedding(nn.Module):
         if tuple(weight.shape) != (self.num_embeddings, self.embedding_dim):
             raise ValueError('Embedding weight dimensions do not match the module')
         self._packed_params.set_weight(weight)
+        self.dtype=weight.dtype
 
     def forward(self, indices):
-        return _C._quantized_embedding(self._packed_params.packed, indices)
+        return _C._quantized_embedding(self._packed_params.packed, indices,
+                                      4 if self.weight().dtype==tp.quint4x2 else 8)
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
@@ -77,7 +81,7 @@ class Embedding(nn.Module):
         if observer is None:
             config = getattr(mod, 'qconfig', None) or float_qparams_weight_only_qconfig
             observer = config.weight()
-        if observer.dtype != tp.quint8 or observer.qscheme != tp.per_channel_affine_float_qparams or observer.ch_axis != 0:
+        if observer.dtype not in (tp.quint8,tp.quint4x2) or observer.qscheme != tp.per_channel_affine_float_qparams or observer.ch_axis != 0:
             raise ValueError('Embedding conversion requires unsigned row weights with floating affine parameters on axis zero')
         observer.to(mod.weight.device)
         if not use_precomputed_fake_quant:
@@ -86,13 +90,27 @@ class Embedding(nn.Module):
             scales, zps = observer.scale, observer.zero_point
         else:
             scales, zps = observer.calculate_qparams()
-        weight = _C.quantize_per_channel(mod.weight.detach().float(), scales.float(), zps.float(), 0, tp.quint8)
+        weight = _C.quantize_per_channel(mod.weight.detach().float(), scales.float(), zps.float(), 0, observer.dtype)
         if issubclass(cls, EmbeddingBag):
             result = cls(mod.num_embeddings, mod.embedding_dim, mode=mod.mode,
-                         include_last_offset=mod.include_last_offset, _weight=weight)
+                         include_last_offset=mod.include_last_offset, _weight=weight,dtype=observer.dtype)
         else:
-            result = cls(mod.num_embeddings, mod.embedding_dim, _weight=weight)
+            result = cls(mod.num_embeddings, mod.embedding_dim, _weight=weight,dtype=observer.dtype)
         return result
+
+    @classmethod
+    def from_reference(cls, ref_embedding):
+        return cls(
+            ref_embedding.num_embeddings,
+            ref_embedding.embedding_dim,
+            ref_embedding.padding_idx,
+            ref_embedding.max_norm,
+            ref_embedding.norm_type,
+            ref_embedding.scale_grad_by_freq,
+            ref_embedding.sparse,
+            ref_embedding.get_quantized_weight(),
+            ref_embedding.weight_dtype,
+        )
 
     def extra_repr(self):
         return f'num_embeddings={self.num_embeddings}, embedding_dim={self.embedding_dim}, dtype={self.dtype}'
@@ -109,7 +127,24 @@ class EmbeddingBag(Embedding):
         self.pruned_weights = False
         self.register_buffer('compressed_indices_mapping', None)
 
+    @classmethod
+    def from_reference(cls, ref_embedding_bag):
+        return cls(
+            ref_embedding_bag.num_embeddings,
+            ref_embedding_bag.embedding_dim,
+            ref_embedding_bag.max_norm,
+            ref_embedding_bag.norm_type,
+            ref_embedding_bag.scale_grad_by_freq,
+            ref_embedding_bag.mode,
+            ref_embedding_bag.sparse,
+            ref_embedding_bag.get_quantized_weight(),
+            ref_embedding_bag.include_last_offset,
+            ref_embedding_bag.weight_dtype,
+            ref_embedding_bag.padding_idx,
+        )
+
     def forward(self, indices, offsets=None, per_sample_weights=None, compressed_indices_mapping=None):
         mapping = self.compressed_indices_mapping if compressed_indices_mapping is None else compressed_indices_mapping
-        return _C._quantized_embedding_bag(self._packed_params.packed, indices, 8, offsets,
+        return _C._quantized_embedding_bag(self._packed_params.packed, indices,
+            4 if self.weight().dtype==tp.quint4x2 else 8, offsets,
             per_sample_weights, mapping, self.include_last_offset, self.pruned_weights)

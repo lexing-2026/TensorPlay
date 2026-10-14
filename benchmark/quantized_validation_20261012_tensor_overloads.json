@@ -1,0 +1,162 @@
+{
+  "timestamp": "2026-10-12T18:45:25.583955+00:00",
+  "commit": "ccb1b071286eb7b9c99109599dd0a205ac67dc36",
+  "build": {
+    "target": "_C",
+    "jobs": 2,
+    "compiler_cache_enabled": false,
+    "exit_code": 0,
+    "source_mtimes_ns": {
+      "p10/include/QuantNormalization.h": 1791830417164506131,
+      "p10/include/QuantWrappedImpl.h": 1791826921415547123,
+      "p10/include/QuantizedViews.h": 1791824970205116271,
+      "p10/src/backend/composite/CompositeViewCopyKernels.cpp": 1791824970382484878,
+      "p10/src/backend/composite/MetaView.cpp": 1791824970382163002,
+      "p10/src/backend/composite/TensorFactories.cpp": 1791824994411179928,
+      "p10/src/backend/cpu/FactoryKernels.cpp": 1791824970383059397,
+      "p10/src/backend/cpu/FactoryToolsKernels.cpp": 1791824994411179928,
+      "p10/src/backend/cpu/ViewKernels.cpp": 1791824970381077360,
+      "p10/src/backend/cuda/ComparisonPointwiseKernels.cu": 1791825853509486718,
+      "p10/src/backend/cuda/FactoryKernels.cu": 1791824994411179928,
+      "p10/src/backend/cuda/ViewKernels.cu": 1791824970381718222
+    },
+    "artifact_mtimes_ns": {
+      "tensorplay/lib/libp10.so": 1791830446185652651,
+      "tensorplay/_C/__init__.cpython-313-x86_64-linux-gnu.so": 1791830460757722459
+    },
+    "artifacts_fresh": true
+  },
+  "tests": {
+    "quantization_and_ao": {
+      "passed": 2507,
+      "skipped": 4
+    },
+    "new_tensor_and_legacy_overloads": {
+      "passed": 169
+    },
+    "vec_default": {
+      "passed": 191
+    },
+    "vec_avx2": {
+      "passed": 191
+    }
+  },
+  "coverage": {
+    "total": 329,
+    "callable": 329,
+    "exercised": 270,
+    "rejection_tested": 11,
+    "device_evidence": {
+      "cpu": {
+        "returned": 269,
+        "native_returned": 235,
+        "rejection_tested": 22
+      },
+      "cuda": {
+        "returned": 242,
+        "native_returned": 209,
+        "rejection_tested": 15
+      },
+      "metadata": {
+        "returned": 1,
+        "native_returned": 0,
+        "rejection_tested": 1
+      }
+    },
+    "pending": 48
+  },
+  "performance": {
+    "cpu_measurements": 33,
+    "faster_measurements": 28,
+    "slower_measurements": [
+      {
+        "operator": "relu",
+        "device": "cpu",
+        "shape": [
+          1048576
+        ],
+        "reference_backend": "integer",
+        "native_us": 5.8707899999999995,
+        "reference_us": 5.34933,
+        "speedup": 0.9111772010240531,
+        "max_error": 0.0
+      },
+      {
+        "operator": "batch_norm2d",
+        "device": "cpu",
+        "shape": [
+          4,
+          32,
+          16,
+          16
+        ],
+        "reference_backend": "integer",
+        "native_us": 4.24941,
+        "reference_us": 3.9467700000000003,
+        "speedup": 0.9287807013208893,
+        "max_error": 0.0
+      },
+      {
+        "operator": "int4_mm_bfloat16",
+        "device": "cpu",
+        "shape": [
+          32,
+          256,
+          1024
+        ],
+        "reference_backend": "integer",
+        "native_us": 66.45236,
+        "reference_us": 57.08393,
+        "speedup": 0.8590203568390951,
+        "max_error": 0.0
+      },
+      {
+        "operator": "dynamic_lstm",
+        "device": "cpu",
+        "shape": [
+          16,
+          4,
+          256
+        ],
+        "reference_backend": "integer",
+        "native_us": 676.9310300000001,
+        "reference_us": 463.13335,
+        "speedup": 0.6841662288697269,
+        "max_error": 2.3283064365386963e-10
+      },
+      {
+        "operator": "dynamic_gru",
+        "device": "cpu",
+        "shape": [
+          16,
+          4,
+          256
+        ],
+        "reference_backend": "integer",
+        "native_us": 548.34098,
+        "reference_us": 355.25417999999996,
+        "speedup": 0.6478709287786588,
+        "max_error": 4.656612873077393e-10
+      }
+    ]
+  },
+  "memory": {
+    "temporary_swap_removed": true,
+    "original_swap_recycled": true,
+    "original_swap_bytes": 8589930496,
+    "used_swap_bytes_at_report": 73723904
+  },
+  "other_modified_files": [
+    "config/native_functions.yaml",
+    "p10/CMakeLists.txt",
+    "p10/include/Convolution.h",
+    "p10/include/QuantKernels.h",
+    "p10/src/backend/cpu/ConvKernels.cpp",
+    "p10/src/backend/cpu/QuantKernels.cpp",
+    "p10/src/backend/cpu/SparseBlasKernelsImpl.cpp",
+    "p10/src/backend/cuda/AffineQuantKernels.cu",
+    "p10/src/backend/cuda/QuantKernels.cu",
+    "tensorplay/functional.py",
+    "tensorplay/nn/parameter.py"
+  ]
+}

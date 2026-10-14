@@ -45,6 +45,16 @@ inline double packed_activation(double value, int64_t index, const PackedDeviceG
     return value;
 }
 
+#if defined(__CUDACC__)
+__host__ __device__
+#endif
+inline double packed_real_value(int64_t accumulator,double input_scale,float weight_scale,
+        float bias,bool output_float) {
+    if (output_float)
+        return ::fmaf(static_cast<float>(accumulator),static_cast<float>(input_scale)*weight_scale,bias);
+    return static_cast<double>(accumulator)*input_scale*weight_scale+bias;
+}
+
 struct PackedGeometry : PackedDeviceGeometry {
     std::vector<int64_t> shape;
 };

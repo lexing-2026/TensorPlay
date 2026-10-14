@@ -282,6 +282,7 @@ Tensor _reshape_alias_native(const Tensor& self,
     Tensor out(impl->storage(), size, stride, impl->dtype(),
                impl->storage_offset());
     out.unsafeGetTensorImpl()->share_version_counter(*impl);
+    if (impl->has_quantizer()) out.impl()->set_quantizer(impl->quantizer());
     return out;
 }
 

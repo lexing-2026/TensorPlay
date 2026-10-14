@@ -1065,11 +1065,15 @@ def addcdiv(input, tensor1, tensor2, *, value=1, out=None):
 def addcdiv_(input, tensor1, tensor2, value=1):
     return input.addcdiv_(tensor1=tensor1, tensor2=tensor2, value=value)
 
-def where(condition, input, other):
+def where(condition, input=None, other=None):
     if _capturing():
         _captured = _capture_call(where, (condition, input, other), {})
         if _captured is not None:
             return _captured
+    if input is None and other is None:
+        # One-argument form: return a tuple of index tensors,
+        # one per dimension, for the non-zero elements.
+        return tuple(_C.where(condition))
     _input_is_tensor = isinstance(input, tensorplay.Tensor)
     _other_is_tensor = isinstance(other, tensorplay.Tensor)
     if not _input_is_tensor:
@@ -2634,6 +2638,24 @@ def mean(input, dim=None, keepdim=False, *, dtype=DType.undefined):
     if dim is None:
         return _C.mean(input, dtype=dtype)
     return _C.mean(input, dim, keepdim, dtype=dtype)
+
+def sum_squared_error(input, other, dim=[], keepdim=False):
+    if _capturing():
+        _captured = _capture_call(sum_squared_error, (input, other, dim, keepdim), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(dim, int) and not isinstance(dim, bool):
+        dim = [dim]
+    return _C.sum_squared_error(input, other, dim, keepdim)
+
+def sum_abs_error(input, other, dim=[], keepdim=False):
+    if _capturing():
+        _captured = _capture_call(sum_abs_error, (input, other, dim, keepdim), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(dim, int) and not isinstance(dim, bool):
+        dim = [dim]
+    return _C.sum_abs_error(input, other, dim, keepdim)
 
 def _sum_dim_backward(grad_output, input, dim, keepdim=False):
     if _capturing():
@@ -5937,6 +5959,41 @@ def heaviside(input, values, *, out=None):
             return _captured
     return _C.heaviside(self=input, values=values)
 
+def snn_lif_step(input, v, decay, threshold, v_reset=None, surrogate=0, alpha=1.0, detach_reset=True):
+    if _capturing():
+        _captured = _capture_call(snn_lif_step, (input, v, decay, threshold, v_reset, surrogate, alpha, detach_reset), {})
+        if _captured is not None:
+            return _captured
+    return _C.snn_lif_step(input, v, decay, threshold, v_reset, surrogate, alpha, detach_reset)
+
+def snn_lif_step_backward(grad_spike, grad_v, input, v, decay, threshold, spike, v_new, v_reset=None, surrogate=0, alpha=1.0, detach_reset=True):
+    if _capturing():
+        _captured = _capture_call(snn_lif_step_backward, (grad_spike, grad_v, input, v, decay, threshold, spike, v_new, v_reset, surrogate, alpha, detach_reset), {})
+        if _captured is not None:
+            return _captured
+    return _C.snn_lif_step_backward(grad_spike, grad_v, input, v, decay, threshold, spike, v_new, v_reset, surrogate, alpha, detach_reset)
+
+def snn_lif_seq(input, v_init, decay, threshold, v_reset=None, surrogate=0, alpha=1.0, detach_reset=True):
+    if _capturing():
+        _captured = _capture_call(snn_lif_seq, (input, v_init, decay, threshold, v_reset, surrogate, alpha, detach_reset), {})
+        if _captured is not None:
+            return _captured
+    return _C.snn_lif_seq(input, v_init, decay, threshold, v_reset, surrogate, alpha, detach_reset)
+
+def snn_lif_seq_backward(grad_spikes, grad_v_final, grad_v_seq, input, v_init, decay, threshold, spikes, v_final, v_reset=None, surrogate=0, alpha=1.0, detach_reset=True):
+    if _capturing():
+        _captured = _capture_call(snn_lif_seq_backward, (grad_spikes, grad_v_final, grad_v_seq, input, v_init, decay, threshold, spikes, v_final, v_reset, surrogate, alpha, detach_reset), {})
+        if _captured is not None:
+            return _captured
+    return _C.snn_lif_seq_backward(grad_spikes, grad_v_final, grad_v_seq, input, v_init, decay, threshold, spikes, v_final, v_reset, surrogate, alpha, detach_reset)
+
+def snn_surrogate_grad(x, surrogate=0, alpha=1.0, beta=1.0, w=1.0, c=0.0, n=1, T_period=1.0):
+    if _capturing():
+        _captured = _capture_call(snn_surrogate_grad, (x, surrogate, alpha, beta, w, c, n, T_period), {})
+        if _captured is not None:
+            return _captured
+    return _C.snn_surrogate_grad(x, surrogate, alpha, beta, w, c, n, T_period)
+
 def hypot(input, other, *, out=None):
     if out is not None:
         if _capturing():
@@ -6875,6 +6932,82 @@ def quantize_per_channel(input, scales, zero_points, axis, dtype):
         if _captured is not None:
             return _captured
     return _C.quantize_per_channel(input, scales, zero_points, axis, dtype)
+
+def quantize_affine(input, block_size, scales, zero_points, dtype, quant_min, quant_max):
+    if _capturing():
+        _captured = _capture_call(quantize_affine, (input, block_size, scales, zero_points, dtype, quant_min, quant_max), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(block_size, int) and not isinstance(block_size, bool):
+        block_size = [block_size]
+    return _C.quantize_affine(input, block_size, scales, zero_points, dtype, quant_min, quant_max)
+
+def dequantize_affine(input, block_size, scales, zero_points=None):
+    if _capturing():
+        _captured = _capture_call(dequantize_affine, (input, block_size, scales, zero_points), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(block_size, int) and not isinstance(block_size, bool):
+        block_size = [block_size]
+    return _C.dequantize_affine(input, block_size, scales, zero_points)
+
+def quantize_affine_float8(input, scale, dtype):
+    if _capturing():
+        _captured = _capture_call(quantize_affine_float8, (input, scale, dtype), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantize_affine_float8(input, scale, dtype)
+
+def dequantize_affine_float8(input, scale, output_dtype):
+    if _capturing():
+        _captured = _capture_call(dequantize_affine_float8, (input, scale, output_dtype), {})
+        if _captured is not None:
+            return _captured
+    return _C.dequantize_affine_float8(input, scale, output_dtype)
+
+def choose_scale_float8(input, block_size, float8_dtype, hp_value_lb=None, hp_value_ub=None):
+    if _capturing():
+        _captured = _capture_call(choose_scale_float8, (input, block_size, float8_dtype, hp_value_lb, hp_value_ub), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(block_size, int) and not isinstance(block_size, bool):
+        block_size = [block_size]
+    return _C.choose_scale_float8(input, block_size, float8_dtype, hp_value_lb, hp_value_ub)
+
+def _quantize_int8_rowwise(input, eps):
+    if _capturing():
+        _captured = _capture_call(_quantize_int8_rowwise, (input, eps), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantize_int8_rowwise(input, eps)
+
+def _quantize_int4_rowwise(input, eps):
+    if _capturing():
+        _captured = _capture_call(_quantize_int4_rowwise, (input, eps), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantize_int4_rowwise(input, eps)
+
+def _quantize_int2_rowwise(input, eps):
+    if _capturing():
+        _captured = _capture_call(_quantize_int2_rowwise, (input, eps), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantize_int2_rowwise(input, eps)
+
+def _quantize_binary_rowwise(input, eps):
+    if _capturing():
+        _captured = _capture_call(_quantize_binary_rowwise, (input, eps), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantize_binary_rowwise(input, eps)
+
+def _int8_mm_rescale(out, row_scale, col_scale):
+    if _capturing():
+        _captured = _capture_call(_int8_mm_rescale, (out, row_scale, col_scale), {})
+        if _captured is not None:
+            return _captured
+    return _C._int8_mm_rescale(out, row_scale, col_scale)
 
 def dequantize(*args):
     if _capturing():
@@ -15900,9 +16033,9 @@ def _quantized_weight_prepack(weight):
             return _captured
     return _C._quantized_weight_prepack(weight)
 
-def _quantized_packed_run(input, packed, offsets, scales, zero_points, bias, weight_sizes, output_scale, output_zero_point, stride=[], padding=[], dilation=[], groups=1, relu=False, output_float=False):
+def _quantized_packed_run(input, packed, offsets, scales, zero_points, bias, weight_sizes, output_scale, output_zero_point, stride=[], padding=[], dilation=[], groups=1, relu=False, output_float=False, activation=0, negative_slope=0, residual=None):
     if _capturing():
-        _captured = _capture_call(_quantized_packed_run, (input, packed, offsets, scales, zero_points, bias, weight_sizes, output_scale, output_zero_point, stride, padding, dilation, groups, relu, output_float), {})
+        _captured = _capture_call(_quantized_packed_run, (input, packed, offsets, scales, zero_points, bias, weight_sizes, output_scale, output_zero_point, stride, padding, dilation, groups, relu, output_float, activation, negative_slope, residual), {})
         if _captured is not None:
             return _captured
     if isinstance(weight_sizes, int) and not isinstance(weight_sizes, bool):
@@ -15913,7 +16046,7 @@ def _quantized_packed_run(input, packed, offsets, scales, zero_points, bias, wei
         padding = [padding]
     if isinstance(dilation, int) and not isinstance(dilation, bool):
         dilation = [dilation]
-    return _C._quantized_packed_run(input, packed, offsets, scales, zero_points, bias, weight_sizes, output_scale, output_zero_point, stride, padding, dilation, groups, relu, output_float)
+    return _C._quantized_packed_run(input, packed, offsets, scales, zero_points, bias, weight_sizes, output_scale, output_zero_point, stride, padding, dilation, groups, relu, output_float, activation, negative_slope, residual)
 
 def quantized_batch_norm_relu(input, weight, bias, mean, var, eps, output_scale, output_zero_point):
     if _capturing():
@@ -15921,6 +16054,229 @@ def quantized_batch_norm_relu(input, weight, bias, mean, var, eps, output_scale,
         if _captured is not None:
             return _captured
     return _C.quantized_batch_norm_relu(input, weight, bias, mean, var, eps, output_scale, output_zero_point)
+
+def quantized_binary(a, b, scale, zero_point, operation, relu=False):
+    if _capturing():
+        _captured = _capture_call(quantized_binary, (a, b, scale, zero_point, operation, relu), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_binary(a, b, scale, zero_point, operation, relu)
+
+def quantized_scalar(input, value, operation, relu=False):
+    if _capturing():
+        _captured = _capture_call(quantized_scalar, (input, value, operation, relu), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_scalar(input, value, operation, relu)
+
+def quantized_scalar_out(input, value, operation, out, relu=False):
+    if _capturing():
+        _captured = _capture_call(quantized_scalar_out, (input, value, operation, out, relu), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_scalar_out(input, value, operation, out, relu)
+
+def quantized_softmax(input, dim, scale, zero_point):
+    if _capturing():
+        _captured = _capture_call(quantized_softmax, (input, dim, scale, zero_point), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_softmax(input, dim, scale, zero_point)
+
+def quantized_matmul(a, b, scale, zero_point):
+    if _capturing():
+        _captured = _capture_call(quantized_matmul, (a, b, scale, zero_point), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_matmul(a, b, scale, zero_point)
+
+def quantized_prelu(input, weight, scale, zero_point):
+    if _capturing():
+        _captured = _capture_call(quantized_prelu, (input, weight, scale, zero_point), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_prelu(input, weight, scale, zero_point)
+
+def quantized_avg_pool(input, kernel_size, stride=[], padding=[], ceil_mode=False, count_include_pad=True, divisor_override=None):
+    if _capturing():
+        _captured = _capture_call(quantized_avg_pool, (input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
+        kernel_size = [kernel_size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    return _C.quantized_avg_pool(input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override)
+
+def quantized_adaptive_avg_pool(input, output_size):
+    if _capturing():
+        _captured = _capture_call(quantized_adaptive_avg_pool, (input, output_size), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(output_size, int) and not isinstance(output_size, bool):
+        output_size = [output_size]
+    return _C.quantized_adaptive_avg_pool(input, output_size)
+
+def quantized_dropout(input, scale, zero_point, p=0.5, training=False):
+    if _capturing():
+        _captured = _capture_call(quantized_dropout, (input, scale, zero_point, p, training), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_dropout(input, scale, zero_point, p, training)
+
+def _quantized_fp16_prepack(weight):
+    if _capturing():
+        _captured = _capture_call(_quantized_fp16_prepack, (weight,), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantized_fp16_prepack(weight)
+
+def _quantized_fp16_linear(input, weight, bias=None, relu=False):
+    if _capturing():
+        _captured = _capture_call(_quantized_fp16_linear, (input, weight, bias, relu), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantized_fp16_linear(input, weight, bias, relu)
+
+def quantized_unary(input, scale, zero_point, operation, a=0.0, b=1.0):
+    if _capturing():
+        _captured = _capture_call(quantized_unary, (input, scale, zero_point, operation, a, b), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_unary(input, scale, zero_point, operation, a, b)
+
+def _quantized_rowwise_pack(weight, bit_width=8, optimized_qparams=False, nbins=200, ratio=0.16, rowwise_min_max=None):
+    if _capturing():
+        _captured = _capture_call(_quantized_rowwise_pack, (weight, bit_width, optimized_qparams, nbins, ratio, rowwise_min_max), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantized_rowwise_pack(weight, bit_width, optimized_qparams, nbins, ratio, rowwise_min_max)
+
+def _quantized_rowwise_unpack(weight, bit_width=8):
+    if _capturing():
+        _captured = _capture_call(_quantized_rowwise_unpack, (weight, bit_width), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantized_rowwise_unpack(weight, bit_width)
+
+def _quantized_embedding_weight_pack(weight):
+    if _capturing():
+        _captured = _capture_call(_quantized_embedding_weight_pack, (weight,), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantized_embedding_weight_pack(weight)
+
+def _quantized_embedding(weight, indices, bit_width=8):
+    if _capturing():
+        _captured = _capture_call(_quantized_embedding, (weight, indices, bit_width), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantized_embedding(weight, indices, bit_width)
+
+def _quantized_embedding_bag(weight, indices, bit_width=8, offsets=None, per_sample_weights=None, compressed_indices_mapping=None, include_last_offset=False, pruned_weights=False):
+    if _capturing():
+        _captured = _capture_call(_quantized_embedding_bag, (weight, indices, bit_width, offsets, per_sample_weights, compressed_indices_mapping, include_last_offset, pruned_weights), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantized_embedding_bag(weight, indices, bit_width, offsets, per_sample_weights, compressed_indices_mapping, include_last_offset, pruned_weights)
+
+def quantized_convolution(input, weight, bias, scale, zero_point, stride=[], padding=[], dilation=[], groups=1, transposed=False, output_padding=[], relu=False, output_float=False):
+    if _capturing():
+        _captured = _capture_call(quantized_convolution, (input, weight, bias, scale, zero_point, stride, padding, dilation, groups, transposed, output_padding, relu, output_float), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    if isinstance(output_padding, int) and not isinstance(output_padding, bool):
+        output_padding = [output_padding]
+    return _C.quantized_convolution(input, weight, bias, scale, zero_point, stride, padding, dilation, groups, transposed, output_padding, relu, output_float)
+
+def _quantized_recurrent_cell(input, hidden, cell, weight_ih, weight_hh, bias_ih, bias_hh, mode, reduce_range=True):
+    if _capturing():
+        _captured = _capture_call(_quantized_recurrent_cell, (input, hidden, cell, weight_ih, weight_hh, bias_ih, bias_hh, mode, reduce_range), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantized_recurrent_cell(input, hidden, cell, weight_ih, weight_hh, bias_ih, bias_hh, mode, reduce_range)
+
+def _quantized_recurrent(input, hidden, cell, weights, biases, num_layers, dropout, training, bidirectional, batch_first, mode, reduce_range=True, batch_sizes=None):
+    if _capturing():
+        _captured = _capture_call(_quantized_recurrent, (input, hidden, cell, weights, biases, num_layers, dropout, training, bidirectional, batch_first, mode, reduce_range, batch_sizes), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantized_recurrent(input, hidden, cell, weights, biases, num_layers, dropout, training, bidirectional, batch_first, mode, reduce_range, batch_sizes)
+
+def _quantized_int4_mm(input, weight, group_size, scale_and_zero):
+    if _capturing():
+        _captured = _capture_call(_quantized_int4_mm, (input, weight, group_size, scale_and_zero), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantized_int4_mm(input, weight, group_size, scale_and_zero)
+
+def _quantized_wrapped_linear(input, input_scale, input_zero_point, weight, weight_scale, weight_zero_point, bias, output_scale, output_zero_point, out_channels):
+    if _capturing():
+        _captured = _capture_call(_quantized_wrapped_linear, (input, input_scale, input_zero_point, weight, weight_scale, weight_zero_point, bias, output_scale, output_zero_point, out_channels), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantized_wrapped_linear(input, input_scale, input_zero_point, weight, weight_scale, weight_zero_point, bias, output_scale, output_zero_point, out_channels)
+
+def _quantized_wrapped_half_prepack(weight):
+    if _capturing():
+        _captured = _capture_call(_quantized_wrapped_half_prepack, (weight,), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantized_wrapped_half_prepack(weight)
+
+def _quantized_wrapped_half_linear(input, weight, bias, out_channels):
+    if _capturing():
+        _captured = _capture_call(_quantized_wrapped_half_linear, (input, weight, bias, out_channels), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantized_wrapped_half_linear(input, weight, bias, out_channels)
+
+def _quantized_recurrent_step(input_gates, hidden_gates, hidden, cell, mode):
+    if _capturing():
+        _captured = _capture_call(_quantized_recurrent_step, (input_gates, hidden_gates, hidden, cell, mode), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantized_recurrent_step(input_gates, hidden_gates, hidden, cell, mode)
+
+def _quantum_apply_gate(state, mat, wires):
+    if _capturing():
+        _captured = _capture_call(_quantum_apply_gate, (state, mat, wires), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(wires, int) and not isinstance(wires, bool):
+        wires = [wires]
+    return _C._quantum_apply_gate(state, mat, wires)
+
+def _quantum_state_probs(state):
+    if _capturing():
+        _captured = _capture_call(_quantum_state_probs, (state,), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantum_state_probs(state)
+
+def _quantum_marginal_probs(state, wires):
+    if _capturing():
+        _captured = _capture_call(_quantum_marginal_probs, (state, wires), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(wires, int) and not isinstance(wires, bool):
+        wires = [wires]
+    return _C._quantum_marginal_probs(state, wires)
+
+def _quantum_pauli_expectation(state, word):
+    if _capturing():
+        _captured = _capture_call(_quantum_pauli_expectation, (state, word), {})
+        if _captured is not None:
+            return _captured
+    return _C._quantum_pauli_expectation(state, word)
 
 try:
     _C.install_factory_fast_paths(_C, {

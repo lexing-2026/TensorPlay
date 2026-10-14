@@ -1,6 +1,7 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
+#include "QuantTensorOperators.h"
 #include "CUDAContext.h"
 #include "CUDARuntime.h"
 #include <cuda_runtime.h>
@@ -897,6 +898,11 @@ void launch_topk_cuda(const Tensor& input, Tensor& values, Tensor& indices,
 
 std::tuple<Tensor, Tensor> topk_kernel_cuda(const Tensor& self, int64_t k, int64_t dim,
                                              bool largest, bool sorted, int64_t impl) {
+  if (isQuantizedType(self.dtype())) {
+    quantized::q_scale(self);
+    auto result = topk_kernel_cuda(quantized::storage_view(self), k, dim, largest, sorted, impl);
+    return {quantized::with_quantizer(std::get<0>(result), self), std::get<1>(result)};
+  }
   Tensor input = self.contiguous();
   const int64_t ndim = input.dim();
   if (ndim == 0) {
