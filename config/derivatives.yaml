@@ -242,7 +242,7 @@
   result: self_t / other
 
 - name: embedding(Tensor weight, Tensor indices, int padding_idx=-1, bool scale_grad_by_freq=false, bool sparse=false) -> Tensor
-  weight: tensorplay::tpx::ops::embedding_dense_backward(grad, indices, weight.size(0), padding_idx, scale_grad_by_freq)
+  weight: 'sparse ? tensorplay::tpx::ops::embedding_sparse_backward(grad, indices, weight.size(0), padding_idx, scale_grad_by_freq) : tensorplay::tpx::ops::embedding_dense_backward(grad, indices, weight.size(0), padding_idx, scale_grad_by_freq)'
 
 - name: embedding_dense_backward(Tensor grad_output, Tensor indices, SymInt num_weights, SymInt padding_idx, bool scale_grad_by_freq) -> Tensor
   grad_output: embedding_dense_double_backward(grad, indices, num_weights, padding_idx, scale_grad_by_freq)
@@ -316,8 +316,8 @@
 
 - name: addmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1) -> Tensor
   self: maybe_multiply(grad, beta)
-  mat1: maybe_multiply(grad.mm(mat2.t()), alpha)
-  mat2: maybe_multiply(mat1.t().mm(grad), alpha)
+  mat1: maybe_multiply(grad.mm(adjoint(mat2)), alpha)
+  mat2: maybe_multiply(adjoint(mat1).mm(grad), alpha)
 
 - name: _to_sparse_semi_structured(Tensor dense) -> (Tensor packed, Tensor meta)
   dense: _sparse_semi_structured_to_dense(grad, meta)
@@ -343,24 +343,32 @@
   mat1: _sparse_semi_structured_gather_grad(maybe_multiply(grad.to(mat2.dtype()).mm(mat2.t()), alpha), mat1, mat1_meta)
   mat2: maybe_multiply(_sparse_semi_structured_mm_right(grad.t().to(mat1.dtype()), mat1, mat1_meta).t(), alpha)
 
+# A product is differentiated against the adjoint of the other operand.  For a
+# real operand the adjoint is a plain transpose, so `adjoint` costs nothing
+# there; for a complex one the conjugate is what the derivative is defined with,
+# and a plain transpose leaves the phase the operand carries in the gradient.
 - name: bmm(Tensor self, Tensor mat2) -> Tensor
-  self: grad.matmul(mat2.transpose(-2, -1))
-  mat2: self.transpose(-2, -1).matmul(grad)
+  self: grad.matmul(adjoint(mat2))
+  mat2: adjoint(self).matmul(grad)
   result: bmm(self_t, mat2_p) + bmm(self_p, mat2_t)
 
 - name: baddbmm(Tensor self, Tensor batch1, Tensor batch2, *, Scalar beta=1, Scalar alpha=1) -> Tensor
   self: maybe_multiply(grad, beta)
-  batch1: maybe_multiply(grad.matmul(batch2.transpose(-2, -1)), alpha)
-  batch2: maybe_multiply(batch1.transpose(-2, -1).matmul(grad), alpha)
+  batch1: maybe_multiply(grad.matmul(adjoint(batch2)), alpha)
+  batch2: maybe_multiply(adjoint(batch1).matmul(grad), alpha)
 
 - name: mv(Tensor self, Tensor vec) -> Tensor
   self: grad.outer(vec)
   vec: self.t().mv(grad)
   result: mv(self_t, vec_p) + mv(self_p, vec_t)
 
+# dot is a plain sum of products, with no conjugation in the value.  A product
+# is differentiated against the adjoint of the other operand -- the same rule
+# every matrix product in this family follows -- and for a one-dimensional
+# operand the adjoint is its conjugate.
 - name: dot(Tensor self, Tensor tensor) -> Tensor
-  self: grad * tensor
-  tensor: grad * self
+  self: grad * adjoint(tensor)
+  tensor: grad * adjoint(self)
 
 - name: outer(Tensor self, Tensor vec2) -> Tensor
   self: grad.mv(vec2)
@@ -2458,6 +2466,40 @@
 - name: _sparse_sum_backward(Tensor grad_output, Tensor self, int[] dim) -> Tensor
   grad_output: sparse_sum_backward_double_backward(grad, self, dim)
   self: sparse_sum_backward_double_backward_self(self)
+
+- name: _sparse_mm_reduce_impl(Tensor self, Tensor other, str reduce) -> (Tensor, Tensor)
+  self: "grad.defined() ? std::get<0>(_sparse_mm_reduce_impl_backward(self, grad, other, reduce, ret1, grad_input_mask)) : Tensor()"
+  other: "grad.defined() ? std::get<1>(_sparse_mm_reduce_impl_backward(self, grad, other, reduce, ret1, grad_input_mask)) : Tensor()"
+
+# The sparse addmm forward is ``beta * self + alpha * (mat1 @ mat2)``; the
+# sparse-side and dense-side gradients of the matmul term match the reduce
+# (sum) matmul backward, while the seed receives ``beta * grad``.  The reduce
+# backward evaluates on CSR, so a COO ``mat1`` is converted for the backward
+# and its sparse gradient is converted back to the original layout.
+- name: _sparse_addmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta, Scalar alpha) -> Tensor
+  self: maybe_multiply(grad, beta)
+  mat1: 'mat1.is_sparse_csr() ? std::get<0>(_sparse_mm_reduce_impl_backward(mat1, maybe_multiply(grad, alpha), mat2, "sum", Tensor(), grad_input_mask)) : std::get<0>(_sparse_mm_reduce_impl_backward(mat1.to_sparse_csr(), maybe_multiply(grad, alpha), mat2, "sum", Tensor(), grad_input_mask)).to_sparse()'
+  mat2: 'maybe_multiply(std::get<1>(_sparse_mm_reduce_impl_backward(mat1.is_sparse_csr() ? mat1 : mat1.to_sparse_csr(), grad, mat2, "sum", Tensor(), grad_input_mask)), alpha)'
+
+# sampled_addmm evaluates the dense product only on the stored coordinates;
+# the dense mat2 gradient therefore uses the densified output gradient and the
+# sparse pattern only shapes the seed (``self``) and mat1 row masks.
+- name: sparse_sampled_addmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta, Scalar alpha) -> Tensor
+  self: maybe_multiply(grad, beta)
+  mat1: maybe_multiply(grad.to_dense().mm(mat2.t()), alpha)
+  mat2: maybe_multiply(mat1.t().mm(grad.to_dense()), alpha)
+
+# Layout conversions are linear: a dense source receives the densified
+# gradient, a CSR source's gradient is converted back to CSR and a COO
+# source's gradient already has the target layout.
+- name: to_sparse_csr(Tensor self) -> Tensor
+  self: 'self.is_sparse() ? grad.to_sparse() : grad.to_dense()'
+
+- name: to_sparse(Tensor self) -> Tensor
+  self: 'self.is_sparse() ? (self.is_sparse_csr() ? grad.to_sparse_csr() : grad) : grad.to_dense()'
+
+- name: to_sparse.sparse_dim(Tensor self, int sparse_dim) -> Tensor
+  self: 'self.is_sparse() ? (self.is_sparse_csr() ? grad.to_sparse_csr() : grad) : grad.to_dense()'
 
 - name: _spdiags(Tensor diagonals, Tensor offsets, int[] shape, int? layout=None) -> Tensor
   output_differentiability: [False]

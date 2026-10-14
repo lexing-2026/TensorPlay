@@ -1,3 +1,4 @@
+#include "QuantTensorOperators.h"
 // Pointwise CUDA kernels: core unary family.
 #include "PointwiseCommon.cuh"
 
@@ -134,10 +135,14 @@ Tensor cos_kernel_cuda(const Tensor& self) {
     return unary_float_op_kernel_v2(self, CosFunctor());
 }
 Tensor tanh_kernel_cuda(const Tensor& self) {
+    if (isQuantizedType(self.dtype())) return quantized::activation(self, 5);
+
     if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxTanh{});
     return unary_float_op_kernel_v2(self, TanhFunctor());
 }
 Tensor sigmoid_kernel_cuda(const Tensor& self) {
+    if (isQuantizedType(self.dtype())) return quantized::activation(self, 4);
+
     if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxSigmoid{});
     return unary_float_op_kernel_v2(self, SigmoidFunctor());
 }

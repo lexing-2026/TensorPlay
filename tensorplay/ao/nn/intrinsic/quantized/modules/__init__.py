@@ -1,6 +1,7 @@
 from .bn_relu import BNReLU2d, BNReLU3d
+from .conv_add import ConvAdd2d, ConvAddReLU2d
 from .conv_relu import ConvReLU1d, ConvReLU2d, ConvReLU3d
-from .linear_relu import LinearReLU
+from .linear_relu import LinearLeakyReLU, LinearReLU, LinearTanh
 
 __all__ = [
     "BNReLU2d",
@@ -8,5 +9,9 @@ __all__ = [
     "ConvReLU1d",
     "ConvReLU2d",
     "ConvReLU3d",
+    "LinearLeakyReLU",
     "LinearReLU",
+    "LinearTanh",
+    "ConvAdd2d",
+    "ConvAddReLU2d",
 ]

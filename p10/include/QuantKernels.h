@@ -26,6 +26,36 @@ Tensor quantize_per_channel_dtype_cpu(const Tensor& self, const Tensor& scales,
 Tensor dequantize_per_channel_dtype_cpu(
     const Tensor& self, const Tensor& scales, const Tensor& zero_points,
     int64_t axis, DType dtype);
+// Block-wise affine quantization:
+// elements sharing a scale/zero_point form blocks of `block_size` per
+// dimension; per-tensor and per-channel granularities are the special cases
+// where block_size covers every dimension or all but one.  The result is a
+// plain tensor of quantized codes (no quantizer is attached).
+Tensor quantize_affine_cpu(const Tensor& self,
+                           const std::vector<int64_t>& block_size,
+                           const Tensor& scales,
+                           const std::optional<Tensor>& zero_points,
+                           DType dtype, int64_t quant_min, int64_t quant_max);
+Tensor dequantize_affine_cpu(const Tensor& self,
+                             const std::vector<int64_t>& block_size,
+                             const Tensor& scales,
+                             const std::optional<Tensor>& zero_points);
+// FP8 affine quantization: divide by the (block-wise) scale, clamp to the
+// float8 dynamic range, and store the rounded float8 value.  The scale
+// tensor follows the block structure of `quantize_affine` (per-tensor,
+// per-channel, or per-group); the expansion is implied by the element-to-
+// block mapping rather than materialized.
+Tensor quantize_affine_float8_cpu(const Tensor& self, const Tensor& scale,
+                                  DType dtype);
+Tensor dequantize_affine_float8_cpu(const Tensor& self, const Tensor& scale,
+                                    DType output_dtype);
+// Computes per-block `max_abs / float8_max` scales, optionally clamped to
+// [hp_value_lb, hp_value_ub], matching the float8 dynamic-quantization flow.
+Tensor choose_scale_float8_cpu(const Tensor& self,
+                               const std::vector<int64_t>& block_size,
+                               DType float8_dtype,
+                               std::optional<double> hp_value_lb,
+                               std::optional<double> hp_value_ub);
 // Fused Int8 GEMM with per-channel weight requantization; the result is
 // requantized into QInt8 under (out_scale, out_zero_point).
 Tensor quantized_linear_cpu(const Tensor& input, const Tensor& weight,
@@ -178,6 +208,13 @@ Tensor _make_per_channel_quantized_tensor_cpu(const Tensor& self,
                                               const Tensor& zero_point,
                                               int64_t axis);
 
+// Native quantized batch norm: fused per-channel alpha/beta computed on the
+// host, then a single pass over the code storage in the integer domain.
+Tensor quantized_batch_norm_cpu(
+    const Tensor& input, const std::optional<Tensor>& weight,
+    const std::optional<Tensor>& bias, const Tensor& mean, const Tensor& var,
+    double eps, double output_scale, int64_t output_zero_point);
+
 } // namespace cpu
 
 namespace vulkan {
@@ -229,6 +266,24 @@ Tensor quantize_per_channel_dtype_cuda(
 Tensor dequantize_per_channel_dtype_cuda(
     const Tensor& self, const Tensor& scales, const Tensor& zero_points,
     int64_t axis, DType dtype);
+Tensor quantize_affine_cuda(const Tensor& self,
+                            const std::vector<int64_t>& block_size,
+                            const Tensor& scales,
+                            const std::optional<Tensor>& zero_points,
+                            DType dtype, int64_t quant_min, int64_t quant_max);
+Tensor dequantize_affine_cuda(const Tensor& self,
+                              const std::vector<int64_t>& block_size,
+                              const Tensor& scales,
+                              const std::optional<Tensor>& zero_points);
+Tensor quantize_affine_float8_cuda(const Tensor& self, const Tensor& scale,
+                                   DType dtype);
+Tensor dequantize_affine_float8_cuda(const Tensor& self, const Tensor& scale,
+                                     DType output_dtype);
+Tensor choose_scale_float8_cuda(const Tensor& self,
+                                const std::vector<int64_t>& block_size,
+                                DType float8_dtype,
+                                std::optional<double> hp_value_lb,
+                                std::optional<double> hp_value_ub);
 Tensor quantized_linear_cuda(const Tensor& input, const Tensor& weight,
                               double input_scale, int64_t input_zero_point,
                               const Tensor& weight_scales,
