@@ -10,6 +10,10 @@ submodule gets its own branch (``deps/bump-<name>``) and pull request titled
 Only the superproject gitlink is committed; the submodule working tree stays
 detached at the target commit and never contains local commits.
 
+A submodule whose upstream default branch does not match the version lineage
+vendored here can be excluded from the bot with ``pin = true`` in .gitmodules;
+the updater reports it as pinned and never bumps it.
+
 Usage:
     python tools/submodule_updater.py
     python tools/submodule_updater.py --submodule third_party/cutlass
@@ -34,7 +38,7 @@ PR_LABEL = "release notes: build"
 GIT_USER_NAME = "TensorPlay CI"
 GIT_USER_EMAIL = "actions@users.noreply.github.com"
 GITMODULES_ENTRY_RE = re.compile(
-    r"^submodule\.(?P<name>.+)\.(?P<key>path|url|branch)\s+(?P<value>\S.*)$"
+    r"^submodule\.(?P<name>.+)\.(?P<key>path|url|branch|pin)\s+(?P<value>\S.*)$"
 )
 LS_TREE_RE = re.compile(r"^160000 commit (?P<sha>[0-9a-f]+)\s", re.MULTILINE)
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -91,6 +95,7 @@ class Submodule:
     path: str
     url: str
     branch: str | None = None
+    pin: bool = False
     pinned: str | None = None
     target: str | None = None
 
@@ -111,7 +116,7 @@ def git(*args: str, cwd: str | None = None) -> str:
 
 def list_submodules() -> list[Submodule]:
     proc = run(["git", "config", "-f", ".gitmodules", "--get-regexp",
-                r"^submodule\..*\.(path|url|branch)$"])
+                r"^submodule\..*\.(path|url|branch|pin)$"])
     if proc.returncode != 0:
         return []
     entries: dict[str, Submodule] = {}
@@ -124,8 +129,10 @@ def list_submodules() -> list[Submodule]:
             entry.path = match["value"]
         elif match["key"] == "url":
             entry.url = match["value"]
-        else:
+        elif match["key"] == "branch":
             entry.branch = match["value"]
+        elif match["key"] == "pin":
+            entry.pin = match["value"].lower() in ("1", "true", "yes", "on")
     return [entry for entry in entries.values() if entry.path and entry.url]
 
 
@@ -285,6 +292,9 @@ def main() -> int:
     errors = 0
     pr_blocked = False
     for sm in submodules:
+        if sm.pin:
+            print(f"[pinned]  {sm.path}: pinned by configuration; not bumping")
+            continue
         sm.pinned = pinned_sha(sm.path)
         try:
             sm.target = upstream_sha(sm.url, sm.branch)
@@ -298,6 +308,8 @@ def main() -> int:
           f"({detected} with a resolvable upstream).")
     if args.dry_run:
         for sm in submodules:
+            if sm.pin:
+                continue
             if sm.pinned is None or sm.target is None:
                 print(f"[skip]    {sm.path}: no resolvable upstream/pinned sha")
             elif sm.pinned == sm.target:
@@ -307,6 +319,8 @@ def main() -> int:
         return 1 if errors else 0
 
     for sm in submodules:
+        if sm.pin:
+            continue
         if sm.pinned is None or sm.target is None:
             print(f"[skip]    {sm.path}: no resolvable upstream/pinned sha")
             continue
