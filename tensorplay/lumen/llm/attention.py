@@ -1,15 +1,17 @@
 """LLM attention-map extraction and visualization.
 
-These helpers read attention weights directly from a transformer model, so
-they work with any model that exposes per-layer attention tensors (load the
-model with ``attn_implementation="eager"`` when using the SDPA/flash path,
-which does not materialize attention maps). No attribution passes are needed;
-the model's own forward pass supplies the maps.
+Framework-native helpers: they operate directly on models built with
+tensorplay primitives and need no third-party runtime. Attention maps are read
+either from a model forward that returns ``outputs.attentions`` or, failing
+that, by capturing the per-head weights returned by ``nn.MultiheadAttention``
+modules during a forward pass.
 """
 
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
+import tensorplay as tensorplay
+from tensorplay import nn
 
 
 def _resolve_indices(
@@ -22,28 +24,90 @@ def _resolve_indices(
     return list(selection)
 
 
+def _encode(text: str, tokenizer: Any) -> List[int]:
+    """Tokenize a single string into a list of integer ids."""
+    if hasattr(tokenizer, "encode"):
+        ids = tokenizer.encode(text)
+        if isinstance(ids, tensorplay.Tensor):
+            return [int(i) for i in ids.reshape(-1).tolist()]
+        if isinstance(ids, int):
+            return [ids]
+        return [int(i) for i in ids]
+    if callable(tokenizer):
+        ids = tokenizer(text)
+        if isinstance(ids, tensorplay.Tensor):
+            return [int(i) for i in ids.reshape(-1).tolist()]
+        if isinstance(ids, int):
+            return [ids]
+        return [int(i) for i in ids]
+    raise TypeError(
+        "tokenizer must provide `encode(text)` or be callable, got %r" % type(tokenizer)
+    )
+
+
+def _decode_ids(input_ids: tensorplay.Tensor, tokenizer: Any) -> List[str]:
+    ids = input_ids[0].tolist()
+    if hasattr(tokenizer, "convert_ids_to_tokens"):
+        return list(tokenizer.convert_ids_to_tokens(ids))
+    if hasattr(tokenizer, "decode"):
+        return [str(tokenizer.decode([i])) for i in ids]
+    return [str(i) for i in ids]
+
+
+def _run_with_attention_outputs(model: Any, input_ids: tensorplay.Tensor) -> Any:
+    """Try a forward that returns attentions; ``None`` if unsupported."""
+    try:
+        outputs = model(input_ids=input_ids, output_attentions=True)
+    except (TypeError, ValueError):
+        return None
+    return outputs
+
+
+def _capture_mha_attentions(model: Any, input_ids: tensorplay.Tensor) -> List[tensorplay.Tensor]:
+    """Capture per-head attention weights from MultiheadAttention modules."""
+    captured: List[tensorplay.Tensor] = []
+    handles: List[Any] = []
+
+    def make_hook(index: int) -> Any:
+        def hook(module: Any, args: Any, output: Any) -> None:
+            if isinstance(output, tuple) and len(output) >= 2:
+                captured.append(output[1].detach())
+
+        return hook
+
+    for module in model.modules():
+        if isinstance(module, nn.MultiheadAttention):
+            handles.append(module.register_forward_hook(make_hook(len(captured))))
+    try:
+        with tensorplay.no_grad():
+            model(input_ids=input_ids)
+    finally:
+        for handle in handles:
+            handle.remove()
+    return captured
+
+
 def extract_attention(
     model: Any,
     tokenizer: Any,
     text: Union[str, List[str]],
     layers: Optional[Union[int, Sequence[int]]] = None,
     heads: Optional[Union[int, Sequence[int]]] = None,
-    use_decoder_attention: bool = True,
 ) -> Dict[str, Any]:
     """Extract self-attention maps for one or more texts.
 
     Args:
-        model: A transformer model whose forward accepts ``input_ids`` and
-            returns an object with an ``attentions`` attribute (a tuple of
-            per-layer tensors of shape ``(batch, heads, seq, seq)``).
-        tokenizer: Tokenizer used to encode ``text``.
+        model: A tensorplay module whose forward accepts ``input_ids`` (and
+            optionally ``output_attentions``) and returns an object with an
+            ``attentions`` attribute. If the forward does not expose
+            attentions, per-head weights are captured from every
+            ``nn.MultiheadAttention`` module instead.
+        tokenizer: Object with ``encode(text) -> list[int]`` and
+            ``convert_ids_to_tokens(ids) -> list[str]`` (or ``decode``), or a
+            callable returning a list of token ids.
         text: A string or a list of strings.
         layers: Which layer indices to keep; ``None`` keeps all.
         heads: Which head indices to keep; ``None`` keeps all.
-        use_decoder_attention: If ``True``, uses ``outputs.attentions``
-            (self-attention); if ``False``, falls back to
-            ``outputs.encoder_attentions`` when present (cross-attention in
-            encoder-decoder models).
 
     Returns:
         A dict with keys:
@@ -51,61 +115,48 @@ def extract_attention(
         arrays, one per selected layer;
         ``tokens``: list of decoded tokens;
         ``input_ids``: numpy ``(batch, seq)`` token ids;
-        ``attention_mask``: numpy mask or ``None``;
         ``layers`` / ``heads``: selected indices.
     """
-    # Imported lazily so this module stays importable without a framework.
-    import torch
-
     if isinstance(text, str):
         text = [text]
-
-    tokenizer_kwargs: Dict[str, Any] = {"truncation": True}
-    # Padding requires a pad token; single sequences do not need it.
-    if len(text) > 1 and getattr(tokenizer, "pad_token", None) is not None:
-        tokenizer_kwargs["padding"] = True
     device = next(model.parameters()).device
-    inputs = tokenizer(text, return_tensors="pt", **tokenizer_kwargs)
-    input_ids = inputs["input_ids"].to(device)
-    attention_mask = inputs.get("attention_mask")
-    if attention_mask is not None:
-        attention_mask = attention_mask.to(device)
+    input_ids = tensorplay.as_tensor(
+        [_encode(t, tokenizer) for t in text], dtype=tensorplay.int64, device=device
+    )
 
     model.eval()
-    with torch.no_grad():
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_attentions=True,
+    outputs = _run_with_attention_outputs(model, input_ids)
+    attentions: Optional[List[tensorplay.Tensor]] = None
+    if outputs is not None:
+        attentions = getattr(outputs, "attentions", None)
+    if not attentions:
+        attentions = _capture_mha_attentions(model, input_ids)
+    if not attentions:
+        raise ValueError(
+            "The model did not expose attention maps. Use nn.MultiheadAttention "
+            "in the model or return outputs.attentions from forward."
         )
 
-    attentions = getattr(outputs, "attentions", None)
-    if attentions is None or len(attentions) == 0:
-        if not use_decoder_attention:
-            attentions = getattr(outputs, "encoder_attentions", None)
-        if attentions is None or len(attentions) == 0:
-            raise ValueError(
-                "The model did not return attention maps. Reload it with "
-                "attn_implementation='eager' because fused attention kernels "
-                "hide the maps."
-            )
-
     layer_indices = _resolve_indices(len(attentions), layers)
-    n_heads = attentions[0].shape[1]
+    if attentions[0].ndim == 4:
+        n_heads = attentions[0].shape[1]
+    else:
+        n_heads = 1
     head_indices = _resolve_indices(n_heads, heads)
 
-    maps = [
-        attentions[li].detach().cpu().numpy()[:, head_indices]
-        for li in layer_indices
-    ]
-    tokens = tokenizer.convert_ids_to_tokens(input_ids[0].cpu().tolist())
+    maps = []
+    for li in layer_indices:
+        att = attentions[li].detach().cpu().numpy()
+        if att.ndim == 4:
+            maps.append(att[:, head_indices])
+        else:
+            # averaged attention weights with shape (batch, seq, seq)
+            maps.append(att[:, None, :, :])
+
     return {
         "attention": maps,
-        "tokens": tokens,
+        "tokens": _decode_ids(input_ids, tokenizer),
         "input_ids": input_ids.cpu().numpy(),
-        "attention_mask": (
-            attention_mask.cpu().numpy() if attention_mask is not None else None
-        ),
         "layers": layer_indices,
         "heads": head_indices,
     }

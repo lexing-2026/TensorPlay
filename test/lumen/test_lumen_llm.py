@@ -1,17 +1,17 @@
 """Tests for the LLM research helpers (attention maps + activation patching).
 
-The tests use small synthetic models so they run offline without downloading
-any pretrained checkpoint.
+All tests run natively on a small transformer built with tensorplay primitives;
+no third-party runtime or pretrained checkpoint is involved.
 """
 
 from types import SimpleNamespace
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pytest
 
-torch = pytest.importorskip("torch")
-from torch import nn  # noqa: E402
+import tensorplay as tensorplay
+from tensorplay import nn
 
 from tensorplay.lumen.llm import (
     ActivationPatching,
@@ -20,75 +20,131 @@ from tensorplay.lumen.llm import (
 )
 
 
-class SyntheticTransformer(nn.Module):
-    """A tiny causal-LM-like module: embedding -> residual MLP blocks -> head.
+def _causal_mask(seq: int) -> tensorplay.Tensor:
+    return tensorplay.zeros(seq, seq, dtype=tensorplay.float32).masked_fill(
+        tensorplay.triu(tensorplay.ones(seq, seq, dtype=tensorplay.bool), diagonal=1),
+        float("-inf"),
+    )
 
-    Layer outputs are plain tensors (not tuples), which exercises the
-    non-tuple branch of the patching hooks.
-    """
 
-    def __init__(self, vocab: int = 20, hidden: int = 8, layers: int = 3) -> None:
+class Block(nn.Module):
+    def __init__(self, d: int = 16, heads: int = 4, ff: int = 32) -> None:
         super().__init__()
-        self.embed = nn.Embedding(vocab, hidden)
+        self.ln1 = nn.LayerNorm(d)
+        self.attn = nn.MultiheadAttention(d, heads, batch_first=True)
+        self.ln2 = nn.LayerNorm(d)
+        self.mlp = nn.Sequential(nn.Linear(d, ff), nn.GELU(), nn.Linear(ff, d))
+
+    def forward(
+        self, x: tensorplay.Tensor, mask: tensorplay.Tensor
+    ) -> Tuple[tensorplay.Tensor, tensorplay.Tensor]:
+        h = self.ln1(x)
+        o, w = self.attn(
+            h, h, h, attn_mask=mask, need_weights=True, average_attn_weights=False
+        )
+        x = x + o
+        h = self.ln2(x)
+        x = x + self.mlp(h)
+        return x, w
+
+
+class NativeGPT(nn.Module):
+    def __init__(
+        self, vocab: int = 16, d: int = 16, heads: int = 4, layers: int = 2, ff: int = 32
+    ) -> None:
+        super().__init__()
         self.transformer = nn.Module()
-        self.transformer.h = nn.ModuleList(
-            [nn.Linear(hidden, hidden) for _ in range(layers)]
+        self.transformer.wte = nn.Embedding(vocab, d)
+        self.transformer.wpe = nn.Embedding(16, d)
+        self.transformer.h = nn.ModuleList([Block(d, heads, ff) for _ in range(layers)])
+        self.transformer.ln_f = nn.LayerNorm(d)
+        self.lm_head = nn.Linear(d, vocab, bias=False)
+
+    def forward(
+        self, input_ids: tensorplay.Tensor, output_attentions: bool = False
+    ) -> Any:
+        seq = input_ids.shape[1]
+        pos = tensorplay.arange(0, seq, dtype=tensorplay.int64).unsqueeze(0)
+        x = self.transformer.wte(input_ids) + self.transformer.wpe(pos)
+        mask = _causal_mask(seq)
+        attentions = []
+        for blk in self.transformer.h:
+            x, w = blk(x, mask)
+            attentions.append(w)
+        x = self.transformer.ln_f(x)
+        return SimpleNamespace(
+            logits=self.lm_head(x),
+            attentions=tuple(attentions) if output_attentions else None,
         )
-        self.lm_head = nn.Linear(hidden, vocab)
 
-    def forward(self, input_ids: torch.Tensor) -> Any:
-        h = self.embed(input_ids)
-        for layer in self.transformer.h:
-            h = layer(h)
-        return SimpleNamespace(logits=self.lm_head(h))
-
-
-class FakeOutput:
-    def __init__(self, attentions: Tuple[torch.Tensor, ...]) -> None:
-        self.attentions = attentions
+    def generate(
+        self, input_ids: tensorplay.Tensor, max_new_tokens: int = 5, **kwargs: Any
+    ) -> tensorplay.Tensor:
+        ids = input_ids.clone()
+        for _ in range(max_new_tokens):
+            next_id = self.forward(ids).logits[:, -1].argmax(dim=-1, keepdim=True)
+            ids = tensorplay.cat([ids, next_id], dim=1)
+        return ids
 
 
-class FakeAttentionModel:
-    def __init__(self, layers: int = 2, heads: int = 2, seq: int = 5) -> None:
-        self._attentions = tuple(
-            torch.rand(1, heads, seq, seq) for _ in range(layers)
-        )
-        self._param = nn.Parameter(torch.zeros(1))
-
-    def parameters(self) -> Any:
-        return iter([self._param])
-
-    def eval(self) -> "FakeAttentionModel":
-        return self
-
-    def __call__(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        output_attentions: bool = False,
-    ) -> FakeOutput:
-        return FakeOutput(self._attentions)
+VOCAB = ["<pad>", "<unk>", "The", "capital", "of", "France", "England", "is", "Paris", "London", "<eos>"]
 
 
-class FakeTokenizer:
-    def __init__(self, vocab: int = 20, seq: int = 5) -> None:
-        self.vocab = vocab
-        self.seq = seq
+class NativeTokenizer:
+    def __init__(self) -> None:
+        self.id2tok = {i: t for i, t in enumerate(VOCAB)}
+        self.tok2id = {t: i for i, t in enumerate(VOCAB)}
 
     def __call__(
         self,
         text,
-        return_tensors: str = "pt",
-        padding: bool = False,
-        truncation: bool = False,
-    ) -> Dict[str, torch.Tensor]:
+        return_offsets_mapping: bool = False,
+        add_special_tokens: bool = True,
+        **kwargs: Any,
+    ) -> Any:
         if isinstance(text, str):
-            text = [text]
-        ids = torch.randint(0, self.vocab, (len(text), self.seq))
-        return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+            words = text.split()
+            ids = [self.tok2id.get(w, 1) for w in words]
+            res: Dict[str, Any] = {"input_ids": ids}
+            if return_offsets_mapping:
+                offsets, pos = [], 0
+                for w in words:
+                    start = text.index(w, pos)
+                    offsets.append((start, start + len(w)))
+                    pos = start + len(w)
+                res["offset_mapping"] = offsets
+            return res
+        return [
+            self.__call__(t, return_offsets_mapping, add_special_tokens, **kwargs)
+            for t in text
+        ]
 
-    def convert_ids_to_tokens(self, ids: List[int]) -> List[str]:
-        return ["t%d" % i for i in ids]
+    def encode(
+        self, text: str, return_tensors: str = "pt", add_special_tokens: bool = False
+    ) -> Any:
+        ids = [self.tok2id.get(w, 1) for w in text.split()]
+        if return_tensors == "pt":
+            return tensorplay.tensor([ids], dtype=tensorplay.int64)
+        return ids
+
+    def convert_ids_to_tokens(self, ids: Sequence[int]) -> List[str]:
+        return [self.id2tok[int(i)] for i in ids]
+
+    def convert_tokens_to_ids(self, toks: Sequence[str]) -> List[int]:
+        return [self.tok2id[t] for t in toks]
+
+    def decode(self, ids: Sequence[int]) -> str:
+        return " ".join(self.convert_ids_to_tokens(ids))
+
+
+@pytest.fixture(scope="module")
+def model() -> NativeGPT:
+    return NativeGPT()
+
+
+@pytest.fixture(scope="module")
+def tokenizer() -> NativeTokenizer:
+    return NativeTokenizer()
 
 
 def test_visualize_attention_heads() -> None:
@@ -97,67 +153,79 @@ def test_visualize_attention_heads() -> None:
     rng = np.random.default_rng(0)
     attn = rng.dirichlet(np.ones(6), size=(3, 6))
     fig, axes = visualize_attention_heads(
-        attn,
-        tokens=[f"w{i}" for i in range(6)],
-        heads=[0, 2],
-        use_pyplot=False,
+        attn, tokens=[f"w{i}" for i in range(6)], heads=[0, 2], use_pyplot=False
     )
     plt.close(fig)
     assert len(np.atleast_1d(axes)) == 2
 
 
-def test_extract_attention_synthetic() -> None:
-    model = FakeAttentionModel(layers=2, heads=3, seq=4)
-    tokenizer = FakeTokenizer(seq=4)
-    result = extract_attention(model, tokenizer, "hello")
+def test_extract_attention_native(model: NativeGPT, tokenizer: NativeTokenizer) -> None:
+    result = extract_attention(
+        model, tokenizer, "The capital of France is", layers=[0, 1]
+    )
     assert len(result["attention"]) == 2
-    assert result["attention"][0].shape == (1, 3, 4, 4)
-    assert len(result["tokens"]) == 4
+    assert result["attention"][0].shape == (1, 4, 5, 5)
+    assert result["tokens"] == ["The", "capital", "of", "France", "is"]
     assert result["layers"] == [0, 1]
-    assert result["heads"] == [0, 1, 2]
 
 
-def test_hidden_states_shapes() -> None:
-    model = SyntheticTransformer()
+def test_hidden_states_shapes(model: NativeGPT) -> None:
     patcher = ActivationPatching(model)
-    states = patcher.hidden_states(torch.tensor([[1, 2, 3, 4]]))
-    assert sorted(states) == [0, 1, 2]
-    assert states[0].shape == (1, 4, 8)
+    states = patcher.hidden_states(tensorplay.tensor([[2, 3, 4, 5]]))
+    assert sorted(states) == [0, 1]
+    assert states[0].shape == (1, 4, 16)
 
 
-def test_intervene_reproduces_clean() -> None:
-    model = SyntheticTransformer()
-    ids = torch.tensor([[1, 2, 3, 4]])
+def test_intervene_reproduces_clean(model: NativeGPT) -> None:
+    ids = tensorplay.tensor([[2, 3, 4, 5]])
     patcher = ActivationPatching(model)
     states = patcher.hidden_states(ids)
-    # replacing the whole layer-0 hidden state with the clean one must
-    # reproduce the clean logits exactly.
     out = patcher.intervene(ids, layer=0, replacement=states[0])
-    with torch.no_grad():
+    with tensorplay.no_grad():
         expected = model(input_ids=ids).logits
-    assert torch.allclose(out.logits, expected, atol=1e-6)
+    assert tensorplay.allclose(out.logits, expected, atol=1e-6)
 
 
-def test_ablate_changes_logits() -> None:
-    model = SyntheticTransformer()
-    ids = torch.tensor([[1, 2, 3, 4]])
+def test_ablate_changes_logits(model: NativeGPT) -> None:
+    ids = tensorplay.tensor([[2, 3, 4, 5]])
     patcher = ActivationPatching(model)
     out = patcher.ablate(ids, layer=1, positions=[2])
-    with torch.no_grad():
+    with tensorplay.no_grad():
         expected = model(input_ids=ids).logits
-    assert not torch.allclose(out.logits, expected, atol=1e-6)
+    assert not tensorplay.allclose(out.logits, expected, atol=1e-6)
 
 
-def test_causal_trace_recovery() -> None:
-    model = SyntheticTransformer()
-    clean = torch.tensor([[1, 2, 3, 4]])
-    corrupted = torch.tensor([[5, 6, 7, 8]])
+def test_causal_trace_recovery(model: NativeGPT, tokenizer: NativeTokenizer) -> None:
+    clean = tensorplay.tensor(
+        [tokenizer.tok2id[w] for w in "The capital of France is".split()]
+    )
+    corrupted = tensorplay.tensor(
+        [tokenizer.tok2id[w] for w in "The capital of England is".split()]
+    )
     patcher = ActivationPatching(model)
     trace = patcher.causal_trace(clean, corrupted, target_position=-1)
-    scores = trace["scores"]
-    assert scores.shape == (3, 4)
-    assert trace["layers"] == [0, 1, 2]
-    assert trace["positions"] == [0, 1, 2, 3]
+    assert trace["scores"].shape == (2, 5)
+    assert trace["layers"] == [0, 1]
+    assert trace["positions"] == [0, 1, 2, 3, 4]
     # restoring the clean hidden state at the final layer and the target
-    # position fully recovers the clean logit (score ~ 1).
-    assert abs(scores[2, 3] - 1.0) < 1e-5
+    # position fully recovers the clean logit.
+    assert abs(trace["scores"][1, 4] - 1.0) < 1e-5
+
+
+def test_llm_gradient_attribution_native(
+    model: NativeGPT, tokenizer: NativeTokenizer
+) -> None:
+    from tensorplay.lumen import LayerIntegratedGradients, LLMGradientAttribution, TextTokenInput
+
+    ig = LayerIntegratedGradients(model, model.transformer.wte)
+    llm_attr = LLMGradientAttribution(ig, tokenizer)
+    result = llm_attr.attribute(
+        TextTokenInput("The capital of France is", tokenizer),
+        target="Paris",
+        n_steps=5,
+    )
+    assert result.input_tokens == ["The", "capital", "of", "France", "is"]
+    assert result.output_tokens == ["Paris"]
+    assert result.seq_attr.shape == (5,)
+    assert tensorplay.isfinite(result.seq_attr).all()
+    assert result.token_attr.shape == (1, 5)

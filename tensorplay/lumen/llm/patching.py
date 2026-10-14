@@ -7,14 +7,17 @@ value taken from another run (a clean run, a corrupted run, or a zero ablation),
 and the effect on the target output is measured. This is the diagnostic step
 that knowledge-editing pipelines use to decide which weights to modify.
 
-The helpers operate directly on the model's own tensors and only require the
-model to be a transformer with a list of layer modules (``transformer.h`` for
+Everything here is framework-native: it operates on models built with
+tensorplay primitives, uses tensorplay tensors and hooks, and requires no
+third-party runtime. The only structural assumption is that the model exposes
+its per-layer modules through a list-like container (``transformer.h`` for
 GPT-family, ``model.layers`` for Llama-family, ``encoder.layer`` for BERT).
 """
 
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
+import tensorplay as tensorplay
 
 
 def _resolve_indices(
@@ -27,16 +30,15 @@ def _resolve_indices(
     return list(selection)
 
 
-def _as_input_ids(model: Any, input_ids: Any) -> Any:
-    """Convert a python list / numpy array of token ids to the model's tensor
-    type and device."""
-    import torch
-
-    if not torch.is_tensor(input_ids):
-        input_ids = torch.as_tensor(input_ids, dtype=torch.long)
-    if input_ids.ndim == 1:
-        input_ids = input_ids.unsqueeze(0)
-    return input_ids.to(next(model.parameters()).device)
+def _as_input_ids(model: Any, input_ids: Any) -> tensorplay.Tensor:
+    """Convert python lists / numpy arrays to a tensorplay int64 tensor."""
+    if isinstance(input_ids, tensorplay.Tensor):
+        ids = input_ids
+    else:
+        ids = tensorplay.as_tensor(input_ids, dtype=tensorplay.int64)
+    if ids.ndim == 1:
+        ids = ids.unsqueeze(0)
+    return ids.to(next(model.parameters()).device)
 
 
 def resolve_layer_modules(
@@ -80,7 +82,7 @@ class ActivationPatching:
         patcher = ActivationPatching(model)
         states = patcher.hidden_states(input_ids)
         logits = patcher.intervene(
-            input_ids, layer=6, replacement=states[6], positions=[3]
+            input_ids, layer=2, replacement=states[2], positions=[3]
         )
         trace = patcher.causal_trace(
             clean_input_ids, corrupted_input_ids, target_position=-1
@@ -95,11 +97,9 @@ class ActivationPatching:
 
     def _record_hidden(
         self, input_ids: Any, **model_kwargs: Any
-    ) -> Dict[int, Any]:
-        import torch
-
+    ) -> Dict[int, tensorplay.Tensor]:
         input_ids = _as_input_ids(self.model, input_ids)
-        recorded: Dict[int, Any] = {}
+        recorded: Dict[int, tensorplay.Tensor] = {}
         handles: List[Any] = []
 
         def make_hook(layer_idx: int) -> Callable:
@@ -112,7 +112,7 @@ class ActivationPatching:
         for layer_idx, module in self.layers.items():
             handles.append(module.register_forward_hook(make_hook(layer_idx)))
         try:
-            with torch.no_grad():
+            with tensorplay.no_grad():
                 self.model(input_ids=input_ids, **model_kwargs)
         finally:
             for handle in handles:
@@ -127,7 +127,7 @@ class ActivationPatching:
         """Run a forward pass and return the hidden state of each selected
         layer as numpy arrays with shape ``(batch, seq, hidden)``."""
         recorded = self._record_hidden(input_ids, **model_kwargs)
-        return {idx: h.numpy() for idx, h in recorded.items()}
+        return {idx: h.cpu().numpy() for idx, h in recorded.items()}
 
     def intervene(
         self,
@@ -157,8 +157,6 @@ class ActivationPatching:
         Returns:
             The model output object (``.logits`` on causal LMs).
         """
-        import torch
-
         input_ids = _as_input_ids(self.model, input_ids)
         if layer not in self.layers:
             raise KeyError(
@@ -169,13 +167,9 @@ class ActivationPatching:
             raise ValueError("mode must be 'replace' or 'ablate', got %r" % mode)
 
         if mode == "replace":
-            if torch.is_tensor(replacement):
-                replacement = replacement.detach().to(
-                    next(self.model.parameters()).device
-                )
-            else:
-                replacement = torch.from_numpy(np.asarray(replacement)).to(
-                    next(self.model.parameters()).device
+            if not isinstance(replacement, tensorplay.Tensor):
+                replacement = tensorplay.as_tensor(
+                    np.asarray(replacement), device=next(self.model.parameters()).device
                 )
             if replacement.ndim == 2:
                 replacement = replacement.unsqueeze(0)
@@ -203,7 +197,7 @@ class ActivationPatching:
 
         handle = self.layers[layer].register_forward_hook(hook)
         try:
-            with torch.no_grad():
+            with tensorplay.no_grad():
                 return self.model(input_ids=input_ids, **model_kwargs)
         finally:
             handle.remove()
@@ -263,8 +257,6 @@ class ActivationPatching:
             numpy array), ``layers``, ``positions``, ``target_token_id``,
             ``clean_score`` and ``corrupted_score``.
         """
-        import torch
-
         clean = _as_input_ids(self.model, clean_input_ids)
         corrupted = _as_input_ids(self.model, corrupted_input_ids)
         seq_len = min(clean.shape[1], corrupted.shape[1])
@@ -283,7 +275,7 @@ class ActivationPatching:
         if not layer_dict:
             raise ValueError("No matching layers to trace")
 
-        with torch.no_grad():
+        with tensorplay.no_grad():
             clean_out = self.model(input_ids=clean)
             corrupted_out = self.model(input_ids=corrupted)
         if target is None:
@@ -301,7 +293,7 @@ class ActivationPatching:
             module = layer_dict[layer_idx]
             clean_h = clean_states[layer_idx]
 
-            def make_hook(clean_h: Any, pos: int) -> Callable:
+            def make_hook(clean_h: tensorplay.Tensor, pos: int) -> Callable:
                 def hook(module_: Any, args: Tuple[Any, ...], output: Any) -> Any:
                     h = output[0] if isinstance(output, tuple) else output
                     h = h.clone()
@@ -315,7 +307,7 @@ class ActivationPatching:
             for c, pos in enumerate(pos_list):
                 handle = module.register_forward_hook(make_hook(clean_h, pos))
                 try:
-                    with torch.no_grad():
+                    with tensorplay.no_grad():
                         patched = self.model(input_ids=corrupted)
                 finally:
                     handle.remove()
