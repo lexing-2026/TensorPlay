@@ -1,3 +1,4 @@
+#include "QuantTensorOperators.h"
 // Tensor shape and layout operators - CPU kernels.
 #include "Tensor.h"
 #include "Dispatcher.h"
@@ -268,6 +269,8 @@ std::vector<Tensor> tensor_split_cpu(const Tensor& self, int64_t sections, int64
 }
 
 Tensor flip_cpu(const Tensor& self, const std::vector<int64_t>& dims) {
+    if (isQuantizedType(self.dtype())) return quantized::with_quantizer(flip_cpu(quantized::storage_view(self), dims), self);
+
     // flip: negative dims wrap; repeated dims are rejected.
     // wraps with wrap_scalar=true and rejects duplicate dims, then reverses
     // each listed dim.
@@ -656,6 +659,8 @@ Tensor pixel_unshuffle_cpu(const Tensor& self, int64_t downscale_factor) {
 }
 
 Tensor channel_shuffle_cpu(const Tensor& self, int64_t groups) {
+    if (isQuantizedType(self.dtype())) return quantized::with_quantizer(channel_shuffle_cpu(quantized::storage_view(self), groups), self);
+
     if (self.dim() <= 2) {
         TP_THROW(RuntimeError, "channel_shuffle expects input with more than 2 dimensions");
     }

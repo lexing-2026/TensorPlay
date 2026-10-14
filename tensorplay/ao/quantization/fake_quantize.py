@@ -6,7 +6,7 @@ from tensorplay.autograd.function import Function
 from tensorplay import _C
 from .observer import (
     ObserverBase, MovingAverageMinMaxObserver, MovingAveragePerChannelMinMaxObserver,
-    FixedQParamsObserver, _with_args, is_per_channel, QUANT_MIN, QUANT_MAX,
+    FixedQParamsObserver, HistogramObserver, _with_args, is_per_channel, QUANT_MIN, QUANT_MAX,
     default_fixed_qparams_range_neg1to1_observer,
     default_fixed_qparams_range_0to1_observer,
 )
@@ -240,7 +240,11 @@ default_per_channel_weight_fake_quant = FakeQuantize.with_args(observer=MovingAv
 default_dynamic_fake_quant = FakeQuantize.with_args(dtype=tp.quint8, quant_min=0, quant_max=255, is_dynamic=True, averaging_constant=1)
 default_fixed_qparams_range_neg1to1_fake_quant = FixedQParamsFakeQuantize.with_args(observer=default_fixed_qparams_range_neg1to1_observer)
 default_fixed_qparams_range_0to1_fake_quant = FixedQParamsFakeQuantize.with_args(observer=default_fixed_qparams_range_0to1_observer)
+default_symmetric_fixed_qparams_fake_quant = default_fixed_qparams_range_neg1to1_fake_quant
+default_affine_fixed_qparams_fake_quant = default_fixed_qparams_range_0to1_fake_quant
 default_embedding_fake_quant = FakeQuantize.with_args(observer=MovingAveragePerChannelMinMaxObserver, dtype=tp.quint8, qscheme=tp.per_channel_affine_float_qparams, ch_axis=0, averaging_constant=1)
+default_embedding_fake_quant_4bit = FakeQuantize.with_args(observer=MovingAveragePerChannelMinMaxObserver, dtype=tp.quint4x2, qscheme=tp.per_channel_affine_float_qparams, ch_axis=0, averaging_constant=1)
+default_histogram_fake_quant = FakeQuantize.with_args(observer=HistogramObserver, quant_min=0, quant_max=255, dtype=tp.quint8, qscheme=tp.per_tensor_affine, reduce_range=True)
 
 __all__ = [name for name in globals() if name.startswith('default_')] + [
     'FakeQuantizeBase', 'FakeQuantize', 'PerChannelFakeQuantize',
@@ -252,4 +256,20 @@ __all__ = [name for name in globals() if name.startswith('default_')] + [
 default_fused_act_fake_quant = FusedMovingAvgObsFakeQuantize.with_args(quant_min=0, quant_max=255, reduce_range=True)
 default_fused_wt_fake_quant = FusedMovingAvgObsFakeQuantize.with_args(dtype=tp.qint8, qscheme=tp.per_tensor_symmetric, quant_min=-128, quant_max=127)
 default_fused_per_channel_wt_fake_quant = FusedMovingAvgObsFakeQuantize.with_args(observer=MovingAveragePerChannelMinMaxObserver, dtype=tp.qint8, qscheme=tp.per_channel_symmetric, quant_min=-128, quant_max=127, ch_axis=0)
-__all__ += ['default_fused_act_fake_quant', 'default_fused_wt_fake_quant', 'default_fused_per_channel_wt_fake_quant']
+fused_wt_fake_quant_range_neg_127_to_127 = FusedMovingAvgObsFakeQuantize.with_args(
+    observer=MovingAverageMinMaxObserver,
+    quant_min=-127,
+    quant_max=127,
+    dtype=tp.qint8,
+    qscheme=tp.per_tensor_symmetric,
+    eps=2**-12,
+)
+fused_per_channel_wt_fake_quant_range_neg_127_to_127 = FusedMovingAvgObsFakeQuantize.with_args(
+    observer=MovingAveragePerChannelMinMaxObserver,
+    quant_min=-127,
+    quant_max=127,
+    dtype=tp.qint8,
+    qscheme=tp.per_channel_symmetric,
+    eps=2**-12,
+)
+__all__ += ['default_fused_act_fake_quant', 'default_fused_wt_fake_quant', 'default_fused_per_channel_wt_fake_quant', 'fused_wt_fake_quant_range_neg_127_to_127', 'fused_per_channel_wt_fake_quant_range_neg_127_to_127']

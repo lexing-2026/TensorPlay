@@ -704,6 +704,31 @@ def test_int_mm_out_writes_into_the_buffer():
     assert out.tolist() == tp.matmul(a.to(tp.int32), b.to(tp.int32)).tolist()
 
 
+@pytest.mark.skipif(not tp.cuda.is_available(), reason="CUDA not available")
+def test_int_mm_tensor_core_path_matches_widened_product():
+    # int32 matmul has no CUDA kernel, so the reference is widened on the host.
+    def reference(a, b):
+        return tp.matmul(a.to(tp.int32).cpu(), b.to(tp.int32).cpu()).tolist()
+
+    # Shapes inside the tensor-core envelope (rows > 16, K/N multiples of 8).
+    a = tp.randint(-8, 8, (64, 128), device="cuda").to(tp.int8)
+    b = tp.randint(-8, 8, (128, 32), device="cuda").to(tp.int8)
+    got = tp._C._int_mm(a, b)
+    assert got.dtype == tp.int32
+    assert got.cpu().tolist() == reference(a, b)
+
+    # A reduction axis that is not a multiple of 8 still falls back safely.
+    a2 = tp.randint(-8, 8, (64, 12), device="cuda").to(tp.int8)
+    b2 = tp.randint(-8, 8, (12, 32), device="cuda").to(tp.int8)
+    got2 = tp._C._int_mm(a2, b2)
+    assert got2.cpu().tolist() == reference(a2, b2)
+
+    # The out variant writes directly into a contiguous int32 buffer.
+    out = tp.zeros(64, 32, dtype=tp.int32, device="cuda")
+    assert tp._C._int_mm(a, b, out=out) is out
+    assert out.cpu().tolist() == reference(a, b)
+
+
 def test_int_mm_rejects_mismatched_dtypes():
     with pytest.raises(Exception):
         tp._C._int_mm(tp.zeros(2, 2), tp.zeros(2, 2, dtype=tp.int8))

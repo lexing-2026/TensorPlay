@@ -8,6 +8,7 @@
 #include "Dispatcher.h"
 #include "MemoryFormat.h"
 #include "Tensor.h"
+#include "Quantizer.h"
 
 #include <optional>
 #include <vector>
@@ -104,10 +105,18 @@ Tensor to_copy_composite(
         strides = get_strides_for(sizes, format);
     }
 
-    Storage storage(static_cast<size_t>(self.numel()) * elementSize(target_dtype),
+    Storage storage(static_cast<size_t>(subByteStorageSize(sizes,target_dtype)),
                     getAllocator(target_device.type()), target_device);
     Tensor result(std::move(storage), sizes, strides, target_dtype);
     result.copy_(self, non_blocking);
+    if (subByteElementPerByte(self.dtype())>1 && target_dtype==self.dtype() && self.impl()->has_quantizer()) {
+        auto grid=self.impl()->quantizer();
+        if (grid->qscheme()==kPerChannelAffineFloatQParams || grid->qscheme()==kPerChannelAffine) {
+            grid=make_per_channel_affine_quantizer(grid->scales().to(target_device),
+                grid->zero_points().to(target_device),grid->axis(),target_dtype);
+        }
+        result.impl()->set_quantizer(std::move(grid));
+    }
     if (pin_memory.has_value() && *pin_memory) {
         result = result.pin_memory();
     }

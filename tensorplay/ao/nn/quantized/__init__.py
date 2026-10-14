@@ -12,19 +12,24 @@ from .activation import (
     Hardswish,
     Hardsigmoid,
     LeakyReLU,
+    MultiheadAttention,
+    PReLU,
     ReLU,
     ReLU6,
     Sigmoid,
+    Softmax,
     Tanh,
 )
 from .batchnorm import BatchNorm2d, BatchNorm3d
 from .conv import Conv1d, Conv2d, Conv3d
+from .dropout import Dropout
 from .functional_modules import FXFloatFunctional, FloatFunctional, QFunctional
 from .linear import QuantizedLinear as Linear
 from .linear import QuantizedLinear as QuantizedLinear
 from .normalization import GroupNorm, InstanceNorm1d, InstanceNorm2d, InstanceNorm3d, LayerNorm
 from .pooling import MaxPool1d, MaxPool2d, MaxPool3d
 from .quantize import DeQuantize, Quantize
+from .rnn import GRU, GRUCell, LSTM, LSTMCell, RNN, RNNCell
 
 __all__ = [
     "Linear",
@@ -47,6 +52,9 @@ __all__ = [
     "Hardsigmoid",
     "Sigmoid",
     "Tanh",
+    "Softmax",
+    "PReLU",
+    "Dropout",
     "MaxPool1d",
     "MaxPool2d",
     "MaxPool3d",
@@ -55,6 +63,12 @@ __all__ = [
     "FloatFunctional",
     "QFunctional",
     "FXFloatFunctional",
+    "LSTM",
+    "GRU",
+    "RNN",
+    "LSTMCell",
+    "GRUCell",
+    "RNNCell",
 ]
 
 from .conv import ConvTranspose1d, ConvTranspose2d, ConvTranspose3d

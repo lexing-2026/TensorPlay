@@ -334,7 +334,8 @@ class _OpNamespace(types.ModuleType):
             native = getattr(_C, opname, None)
             if native is not None:
                 return native
-        if self.ns in ('quantized', '_quantized'):
+        if self.ns in ('quantized', '_quantized') or (
+                self.ns == NATIVE_NAMESPACE and opname in ('quantized_lstm', 'quantized_gru')):
             from tensorplay.ao.nn.quantized._ops import get_packet
             packet = get_packet(opname)
             if packet is not None:

@@ -70,4 +70,25 @@ inline void basic_loop(
   }
 }
 
+// basic_loop2 applies a scalar ternary op (acc, a, b) -> acc elementwise over
+// two inputs, accumulating into the output (data[0] = out, data[1] = a,
+// data[2] = b). Used by the fused dual-input reduction kernels.
+template <typename func_t>
+inline void basic_loop2(
+    char* data[4],
+    const int64_t strides[4],
+    int64_t size0,
+    int64_t size1,
+    const func_t& op) {
+  using traits = function_traits<func_t>;
+  using scalar_t = typename traits::result_type;
+  static_assert(traits::arity == 3, "basic_loop2 expects a ternary op");
+  for (int64_t i = size0; i < size1; i++) {
+    scalar_t* out_ptr = (scalar_t*)(data[0] + i * strides[0]);
+    const scalar_t* a_ptr = (const scalar_t*)(data[1] + i * strides[1]);
+    const scalar_t* b_ptr = (const scalar_t*)(data[2] + i * strides[2]);
+    *out_ptr = op(*out_ptr, *a_ptr, *b_ptr);
+  }
+}
+
 } // namespace tensorplay

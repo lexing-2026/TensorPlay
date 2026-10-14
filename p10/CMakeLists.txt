@@ -53,6 +53,7 @@ set(P10_SOURCES
     src/backend/cpu/QuantNormalizationKernels.cpp
     src/backend/cpu/QuantConvPacking.cpp
     src/backend/cpu/QuantPacked.cpp
+    src/backend/cpu/LowBitGemmKernels.cpp
     src/backend/cpu/QuantNative.cpp
     src/quantized/QTensorImpl.cpp
     src/backend/cpu/ForwardKernels.cpp
@@ -70,8 +71,12 @@ set(P10_SOURCES
     src/backend/cpu/MarginLossKernels.cpp
     src/backend/cpu/UpsampleKernels.cpp
     src/backend/cpu/MiscKernels.cpp
+    src/backend/cpu/QuantumKernels.cpp
     src/backend/cpu/SegmentReduce.cpp
     src/backend/cpu/SparseSoftMax.cpp
+    src/backend/cpu/SparseBlasKernels.cpp
+    src/backend/cpu/SpmmReduceKernels.cpp
+    src/backend/cpu/SparseSolveKernels.cpp
     # TensorShape.cpp, LinearAlgebra.cpp, TensorFactories.cpp, Itertools.cpp.
     src/backend/cpu/UnaryOps.cpp
     src/backend/cpu/Pooling.cpp
@@ -101,6 +106,7 @@ set(P10_SOURCES
     src/backend/cpu/SortingKernels.cpp
     src/backend/cpu/TensorCompareKernels.cpp
     src/backend/cpu/OpsKernels.cpp
+    src/backend/cpu/SnnKernels.cpp
     src/backend/cpu/BitwiseKernels.cpp
     src/backend/cpu/Blas.cpp
     src/backend/cpu/BatchLinearAlgebra.cpp
@@ -208,11 +214,18 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/sparse/SparseCsrTensorMathKernels.cu
         src/backend/cuda/sparse/SparseBinaryOpIntersectionKernels.cu
         src/backend/cuda/sparse/SparseMatMulKernels.cu
+        src/backend/cuda/sparse/SparseBlasKernels.cu
+        src/backend/cuda/sparse/SpmmReduceKernels.cu
+        src/backend/cuda/sparse/SparseSolveKernels.cu
         src/backend/cuda/sparse/SparseSoftMaxKernels.cu
         src/backend/cuda/EmbeddingSparseBackwardKernels.cu
         src/backend/cuda/SpdiagsKernels.cu
         src/backend/cuda/SemiStructuredKernels.cu
         src/backend/cuda/QuantKernels.cu
+        src/backend/cuda/QuantActivationKernels.cu
+        src/backend/cuda/QuantCatKernels.cu
+        src/backend/cuda/QuantPoolKernels.cu
+        src/backend/cuda/QuantConvKernels.cu
         src/backend/cuda/QuantBatchNormKernels.cu
         src/backend/cuda/QuantNormalizationKernels.cu
         src/backend/cuda/AffineQuantKernels.cu
@@ -221,6 +234,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/QuantizedTensorKernels.cu
         src/backend/cuda/QuantIntComputeKernels.cu
         src/backend/cuda/QuantGemmKernels.cu
+        src/backend/cuda/LowBitGemmKernels.cu
         src/backend/cuda/QuantPacked.cu
         src/backend/cuda/QuantNative.cu
         src/backend/cuda/ForwardKernels.cu
@@ -248,6 +262,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/TensorFactories.cu
         src/backend/cuda/Itertools.cu
         src/backend/cuda/MiscKernels.cu
+        src/backend/cuda/QuantumKernels.cu
         src/backend/cuda/UpsampleNearest1dKernels.cu
         src/backend/cuda/UpsampleNearest2dKernels.cu
         src/backend/cuda/UpsampleNearest3dKernels.cu
@@ -424,6 +439,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/BinaryPointwiseKernels.cu
         src/backend/cuda/CompareLogicalKernels.cu
         src/backend/cuda/UnaryMathKernels.cu
+        src/backend/cuda/SnnKernels.cu
         src/backend/cuda/ClampKernels.cu
         src/backend/cuda/BitwiseKernels.cu
         src/backend/cuda/BincountKernels.cu
@@ -643,6 +659,8 @@ set(TP_CPU_KERNEL_SRCS
     src/backend/cpu/PoolingKernelsImpl.cpp
     src/backend/cpu/UpsampleKernelsImpl.cpp
     src/backend/cpu/GridSamplerKernelsImpl.cpp
+    src/backend/cpu/SparseBlasKernelsImpl.cpp
+    src/backend/cpu/SpmmReduceKernelsImpl.cpp
 )
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
     # (TP_CXX_AVX512_FOUND): only build the tier when the compiler accepts
@@ -981,7 +999,7 @@ if(USE_VULKAN)
     add_dependencies(p10 vulkan_spv_gen)
 endif()
 if(USE_CUDA)
-    target_link_libraries(p10 PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cufft CUDA::cusolver CUDA::nvrtc)
+    target_link_libraries(p10 PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cufft CUDA::cusolver CUDA::cusparse CUDA::nvrtc)
     # CUPTI headers live in the toolkit's extras/CUPTI/include, which the
     # plain toolkit include dirs do not cover; the imported target does.
     if(TARGET CUDA::cupti)

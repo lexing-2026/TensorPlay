@@ -1,5 +1,7 @@
 """Public operator packets forwarding to native quantized execution."""
 from functools import partial
+import struct
+import warnings
 import tensorplay as tp
 from tensorplay import _C
 from . import functional as F
@@ -48,7 +50,16 @@ class PackedConvolution:
             self.weight, self.bias = self.storage._weight_bias()
 
     def unpack(self):
-        return self.weight, self.bias
+        weight=_unpack_integer_weight(self.weight)
+        rank=weight.dim()-2
+        if not self.transposed:
+            weight=(weight.unsqueeze(2).contiguous(memory_format=tp.channels_last).squeeze(2)
+                    if rank==1 else weight.contiguous(memory_format=tp.channels_last
+                    if rank==2 else tp.channels_last_3d))
+        else:
+            weight=weight.permute(list(range(1,weight.dim()))+[0]).contiguous().permute(
+                [weight.dim()-1]+list(range(weight.dim()-1)))
+        return weight, self.bias
 
     def run(self, input, scale, zero_point, relu=False):
         if self.storage is not None:
@@ -67,6 +78,20 @@ class PackedConvolution:
 
 def _linear(input, packed_weight, output_scale, output_zero_point, relu=False):
     return packed_weight.run(input,output_scale,output_zero_point,relu=relu)
+
+
+def _unpack_integer_weight(weight):
+    if weight.qscheme()==tp.per_tensor_affine:
+        scale=struct.unpack('f',struct.pack('f',weight.q_scale()))[0]
+        return _C._make_per_tensor_quantized_tensor(weight.int_repr(),scale,weight.q_zero_point())
+    return _C._make_per_channel_quantized_tensor(weight.int_repr(),
+        weight.q_per_channel_scales().float().double(),weight.q_per_channel_zero_points().clone(),
+        weight.q_per_channel_axis())
+
+
+def _linear_unpack(packed):
+    weight,bias=packed._weight_bias()
+    return (_unpack_integer_weight(weight) if isinstance(packed,PackedWeight) else weight.float()),bias
 
 
 def _linear_dynamic(input, packed_weight, reduce_range=False, relu=False):
@@ -90,6 +115,16 @@ def _conv(input, packed_weight, *parameters, relu=False):
     else:
         raise TypeError('Convolution expects a packed weight and output scale and zero point')
     return packed_weight.run(input,scale,zero_point,relu)
+
+
+def _legacy(*args,**kwargs):
+    raise RuntimeError('Legacy packed tensors require regeneration with the current packing interface')
+
+
+def _conv_unpack_sizes(packed):
+    weight,bias=packed.unpack()
+    return (list(weight.shape),None if bias is None else list(bias.shape),
+        packed.stride,packed.padding,packed.dilation,packed.groups)
 
 
 def _conv_add(input,accum,packed,scale,zero_point,relu=False):
@@ -124,6 +159,10 @@ def _binary_out(name,a,b,out):
 def _scalar(name,a,b,out=None):
     if isinstance(b,tp.Tensor):
         b=b.item()
+    if name=='mul_scalar_relu' and out is not None and b>0:
+        if a.dtype!=out.dtype or a.qscheme()!=out.qscheme():
+            raise ValueError('Scalar operands and output must share dtype and quantization scheme')
+        return F.mul_scalar_relu(a,b)
     return getattr(F,name)(a,b,out=out)
 
 
@@ -134,9 +173,9 @@ def _inplace(result,input,inplace):
 
 
 def _leaky(input,negative_slope,inplace,output_scale,output_zero_point):
-    if inplace and (input.q_scale()!=output_scale or input.q_zero_point()!=output_zero_point):
-        raise ValueError('Inplace activation requires the input affine grid')
-    return _inplace(F.leaky_relu(input,negative_slope,output_scale,output_zero_point),input,inplace)
+    if inplace:
+        warnings.warn('Inplace execution is unavailable for quantized leaky rectifiers', stacklevel=2)
+    return F.leaky_relu(input,negative_slope,output_scale,output_zero_point)
 
 
 def _cat_out(inputs,dim,out,relu=False):
@@ -165,10 +204,78 @@ def _embedding(bits,weight,indices,pruned_weights=False):
     return _C._quantized_embedding(packed,indices,bits)
 
 
+class CellParams:
+    def __init__(self,wi,wh,bi=None,bh=None,reduce_range=False):
+        self.wi,self.wh,self.bi,self.bh=wi,wh,bi,bh
+        self.reduce_range=bool(reduce_range)
+
+    def linear_ih(self,input):
+        return _linear_dynamic(input,self.wi,self.reduce_range)
+
+    def linear_hh(self,input):
+        return _linear_dynamic(input,self.wh,self.reduce_range)
+
+    def b_ih(self):
+        return self.bi
+
+    def b_hh(self):
+        return self.bh
+
+
 def _recurrent_cell(mode,input,hx,wi,wh,bi,bh):
     h,c=hx if mode==2 else (hx,None)
-    result=_C._quantized_recurrent_cell(input,h,c,wi.weight,wh.weight,bi,bh,mode,False)
+    result=_C._quantized_recurrent_step(_linear_dynamic(input,wi,True),
+        _linear_dynamic(h,wh,True),h,c,mode)
     return result if mode==2 else result[0]
+
+
+def _cell_params_float(wi,wh,bi,bh):
+    return CellParams(PackedWeight(_C.quantize_per_tensor_dynamic(wi,tp.qint8,False),bi),
+        PackedWeight(_C.quantize_per_tensor_dynamic(wh,tp.qint8,False),bh),bi,bh,False)
+
+
+def _recurrent_sequence(mode,input,hx,params,has_biases,num_layers,dropout,train,
+                        bidirectional,batch_first=False,batch_sizes=None,dtype=None,use_dynamic=False):
+    h,c=hx if mode==2 else (hx,None)
+    if mode==2 and batch_sizes is None:
+        if not has_biases:
+            raise ValueError('Long-memory quantized sequences require biases')
+        if dtype not in (None,tp.int8,tp.qint8,tp.float16):
+            raise ValueError('Unsupported recurrent weight dtype')
+    weights,biases,storage,ranges=[],[],[],[]
+    for param in params:
+        if not isinstance(param,CellParams):
+            raise TypeError('Quantized sequences require packed cell parameters')
+        ranges.append(param.reduce_range)
+        for linear in (param.wi,param.wh):
+            weight,bias=linear._weight_bias()
+            weights.append(weight)
+            biases.append(bias)
+            if isinstance(linear,PackedWeight):
+                storage.extend((linear.packed,linear.offsets,linear.scales,linear.zero_points))
+            else:
+                storage.extend((weight,weight,weight,weight))
+    output,hy,cy=_C._quantized_recurrent_packed(input,h,c,weights,biases,storage,ranges,
+        num_layers,dropout,train,bidirectional,batch_first,mode,batch_sizes)
+    return (output,hy,cy) if mode==2 else (output,hy)
+
+
+def _recurrent_sequence_data(mode,data,batch_sizes,hx,params,has_biases,num_layers,
+                             dropout,train,bidirectional,**kwargs):
+    return _recurrent_sequence(mode,data,hx,params,has_biases,num_layers,dropout,train,
+        bidirectional,batch_sizes=batch_sizes,**kwargs)
+
+
+def quantized_lstm(input,*args,**kwargs):
+    if args and isinstance(args[0],tp.Tensor):
+        return _recurrent_sequence_data(2,input,*args,**kwargs)
+    return _recurrent_sequence(2,input,*args,**kwargs)
+
+
+def quantized_gru(input,*args,**kwargs):
+    if args and isinstance(args[0],tp.Tensor) and args[0].dtype==tp.int64:
+        return _recurrent_sequence_data(3,input,*args,**kwargs)
+    return _recurrent_sequence(3,input,*args,**kwargs)
 
 
 _packets = None
@@ -184,8 +291,9 @@ def _build_packets():
         add(name,partial(_binary,name),out=partial(_binary_out,name),Scalar=scalar,
             Scalar2=lambda b,a,fn=scalar:fn(a,b),Scalar_out=scalar)
         add(name+'_out',partial(_binary_out,name))
-        add(scalar_name,scalar,Tensor=scalar)
-        add(scalar_name+'_out',scalar,Tensor=scalar)
+        tensor_scalar=partial(_scalar,'add_scalar') if name=='add_relu' else scalar
+        add(scalar_name,scalar,Tensor=tensor_scalar)
+        add(scalar_name+'_out',scalar,Tensor=tensor_scalar)
     for name in ('sub','div'):
         add(name,getattr(F,name))
     for name in ('matmul','softmax','prelu','threshold','celu','dropout','sigmoid','tanh','hardswish'):
@@ -218,9 +326,19 @@ def _build_packets():
                 add(prefix+'_'+field,lambda packed,attr=attr:getattr(packed,attr))
     add('conv2d_add',_conv_add)
     add('conv2d_add_relu',partial(_conv_add,relu=True))
+    add('conv_prepack',partial(_conv_prepack,2))
+    add('conv_unpack',lambda packed:packed.unpack())
+    add('conv2d_unpack_sizes',_conv_unpack_sizes)
+    add('linear_prepack_legacy',_legacy);add('linear_prepack_fp16_legacy',_legacy)
+    add('_wrapped_linear_prepack',_C._wrapped_linear_prepack)
+    add('_wrapped_quantized_linear_prepacked',_C._wrapped_quantized_linear_prepacked)
+    add('wrapped_quantized_linear',_C._quantized_wrapped_linear)
+    add('wrapped_fbgemm_pack_gemm_matrix_fp16',_C._quantized_wrapped_half_prepack)
+    add('wrapped_fbgemm_linear_fp16_weight',_C._quantized_wrapped_half_linear)
+    add('int4mm_packed_weight_cpu',_C._quantized_int4_mm)
     add('linear_prepack',PackedWeight);add('linear_prepack_fp16',PackedHalfWeight)
     for suffix in ('','_fp16'):
-        add('linear_unpack'+suffix,lambda packed:packed._weight_bias())
+        add('linear_unpack'+suffix,_linear_unpack,legacy=_legacy)
     add('linear',_linear);add('linear_relu',partial(_linear,relu=True))
     add('linear_leaky_relu',lambda input,packed,scale,zp,negative_slope:packed.run(
         input,scale,zp,activation=1,negative_slope=negative_slope))
@@ -243,8 +361,15 @@ def _build_packets():
         if bits!=2:
             add(prefix,partial(_embedding_bag,bits))
             add('embedding_'+name,partial(_embedding,bits))
+    add('make_quantized_cell_params_dynamic',CellParams)
+    add('make_quantized_cell_params_fp16',lambda wi,wh:CellParams(wi,wh))
+    add('make_quantized_cell_params',_cell_params_float)
     for mode,name in ((0,'rnn_relu'),(1,'rnn_tanh'),(2,'lstm'),(3,'gru')):
         add('quantized_'+name+'_cell_dynamic',partial(_recurrent_cell,mode))
+    for mode,name in ((2,'lstm'),(3,'gru')):
+        full=partial(_recurrent_sequence,mode)
+        add('quantized_'+name,full,input=full,data=partial(_recurrent_sequence_data,mode),
+            input_legacy=_legacy,data_legacy=_legacy)
     return entries
 
 

@@ -1,3 +1,4 @@
+#include "QuantTensorOperators.h"
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Scalar.h"
@@ -283,6 +284,9 @@ Tensor pad_mode_forward(const Tensor& self, const std::vector<int64_t>& pad, Pad
         case DType::UInt8:
             pad_gather_dispatch<uint8_t>(src.data_ptr<uint8_t>(), out.data_ptr<uint8_t>(), p, mode);
             break;
+        case DType::Int32:
+            pad_gather_dispatch<int32_t>(src.data_ptr<int32_t>(), out.data_ptr<int32_t>(), p, mode);
+            break;
         case DType::Float32:
             pad_gather_dispatch<float>(src.data_ptr<float>(), out.data_ptr<float>(), p, mode);
             break;
@@ -297,7 +301,7 @@ Tensor pad_mode_forward(const Tensor& self, const std::vector<int64_t>& pad, Pad
                                           mode);
             break;
         default:
-            TP_THROW(NotImplementedError, "non-constant padding requires floating or 8-bit integer storage");
+            TP_THROW(NotImplementedError, "non-constant padding does not support this dtype");
     }
     return out;
 }
@@ -330,6 +334,8 @@ Tensor pad_mode_backward(const Tensor& grad_output, const Tensor& self,
 } // namespace
 
 Tensor reflection_pad_nd_cpu(const Tensor& self, const std::vector<int64_t>& pad) {
+    if (isQuantizedType(self.dtype())) { quantized::q_scale(self); return quantized::with_quantizer(reflection_pad_nd_cpu(quantized::storage_view(self), pad), self); }
+
     pad_mode_check("reflection_pad_nd", self, pad, PadIndexMode::Reflect);
     return pad_mode_forward(self, pad, PadIndexMode::Reflect);
 }

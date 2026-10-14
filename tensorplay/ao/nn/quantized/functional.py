@@ -6,6 +6,8 @@ that the tensor carries and taking the output qparams explicitly.
 
 from __future__ import annotations
 
+import tensorplay
+
 from tensorplay._C import (
     q_scale as _q_scale,
     q_zero_point as _q_zero_point,
@@ -339,3 +341,76 @@ def embedding_bag(weight, indices, offsets=None, bit_width=8, scale_grad_by_freq
 
 
 __all__ += ['rowwise_prepack', 'rowwise_unpack', 'embedding', 'embedding_bag']
+
+
+def linear(input, weight, bias=None, scale=1.0, zero_point=0):
+    """Quantized linear transformation.
+
+    ``input`` is a quantized tensor; ``weight`` is a quantized weight tensor
+    (tensor or output-channel affine).  The output uses ``scale`` and
+    ``zero_point``.
+    """
+    from tensorplay import _C
+    input_scale, input_zero_point = _qparams(input)
+    if weight.qscheme() == tensorplay.per_tensor_affine or weight.qscheme() == tensorplay.per_tensor_symmetric:
+        weight_scales = weight.q_scale()
+        weight_zero_points = weight.q_zero_point()
+    else:
+        weight_scales = weight.q_per_channel_scales()
+        weight_zero_points = weight.q_per_channel_zero_points()
+    return _C.quantized_linear(input, weight, input_scale, input_zero_point,
+                               weight_scales, weight_zero_points, bias,
+                               float(scale), int(zero_point))
+
+
+def _conv(input, weight, bias, scale, zero_point, rank, stride, padding, dilation, groups):
+    from tensorplay import _C
+    input_scale, input_zero_point = _qparams(input)
+    weight_scale = weight.q_scale()
+    weight_zero_point = weight.q_zero_point()
+    fn = getattr(_C, f"quantized_conv{rank}d")
+    return fn(input, weight, bias, input_scale, input_zero_point, weight_scale,
+              weight_zero_point, float(scale), int(zero_point), stride, padding,
+              dilation, groups)
+
+
+def conv1d(input, weight, bias=None, scale=1.0, zero_point=0, stride=1, padding=0,
+           dilation=1, groups=1):
+    """Quantized 1d convolution."""
+    return _conv(input, weight, bias, scale, zero_point, 1, stride, padding, dilation, groups)
+
+
+def conv2d(input, weight, bias=None, scale=1.0, zero_point=0, stride=1, padding=0,
+           dilation=1, groups=1):
+    """Quantized 2d convolution."""
+    return _conv(input, weight, bias, scale, zero_point, 2, stride, padding, dilation, groups)
+
+
+def conv3d(input, weight, bias=None, scale=1.0, zero_point=0, stride=1, padding=0,
+           dilation=1, groups=1):
+    """Quantized 3d convolution."""
+    return _conv(input, weight, bias, scale, zero_point, 3, stride, padding, dilation, groups)
+
+
+def max_pool1d(input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False):
+    """Quantized 1d max pooling preserving the input affine grid."""
+    from tensorplay import _C
+    return _C.quantized_max_pool1d(input, _spatial(kernel_size, 1),
+        [] if stride is None else _spatial(stride, 1), _spatial(padding, 1),
+        int(dilation), bool(ceil_mode))
+
+
+def max_pool2d(input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False):
+    """Quantized 2d max pooling preserving the input affine grid."""
+    from tensorplay import _C
+    return _C.quantized_max_pool2d(input, _spatial(kernel_size, 2),
+        [] if stride is None else _spatial(stride, 2), _spatial(padding, 2),
+        int(dilation), bool(ceil_mode))
+
+
+def hardtanh(x, scale, zero_point, min_val=-1.0, max_val=1.0):
+    """Quantized hardtanh, implemented as a clamp on the dequantized domain."""
+    return clamp(x, scale, zero_point, min=min_val, max=max_val)
+
+
+__all__ += ['linear', 'conv1d', 'conv2d', 'conv3d', 'max_pool1d', 'max_pool2d', 'hardtanh']

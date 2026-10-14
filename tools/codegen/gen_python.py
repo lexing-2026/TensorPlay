@@ -469,11 +469,15 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
         if name == 'where' and 'function' in f.variants:
             seen.add(name)
             lines += [
-                'def where(condition, input, other):',
+                'def where(condition, input=None, other=None):',
                 '    if _capturing():',
                 '        _captured = _capture_call(where, (condition, input, other), {})',
                 '        if _captured is not None:',
                 '            return _captured',
+                '    if input is None and other is None:',
+                '        # One-argument form: return a tuple of index tensors,',
+                '        # one per dimension, for the non-zero elements.',
+                '        return tuple(_C.where(condition))',
                 '    _input_is_tensor = isinstance(input, tensorplay.Tensor)',
                 '    _other_is_tensor = isinstance(other, tensorplay.Tensor)',
                 '    if not _input_is_tensor:',
