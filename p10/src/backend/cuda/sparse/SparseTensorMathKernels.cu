@@ -709,5 +709,147 @@ Tensor sparse_sum_cuda(const Tensor& self,
 #undef TP_SPARSE_SUM_CASE
 }
 
+namespace {
+
+__global__ void compressed_count_rows_kernel(
+    int64_t comp_units, const int64_t* comp_ptr, const int64_t* plain_ptr,
+    bool blocked, int64_t b0, int64_t b1, bool row_compressed,
+    int64_t* counts) {
+    const int64_t cu = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+    if (cu >= comp_units) return;
+    for (int64_t e = comp_ptr[cu]; e < comp_ptr[cu + 1]; ++e) {
+        const int64_t pu = plain_ptr[e];
+        if (blocked) {
+            const int64_t base_row = row_compressed ? cu * b0 : pu * b0;
+            for (int64_t i = 0; i < b0; ++i) {
+                atomicAdd(
+                    reinterpret_cast<unsigned long long*>(counts + base_row +
+                                                         i),
+                    static_cast<unsigned long long>(b1));
+            }
+        } else {
+            const int64_t r = row_compressed ? cu : pu;
+            atomicAdd(reinterpret_cast<unsigned long long*>(counts + r), 1ull);
+        }
+    }
+}
+
+template <typename scalar_t>
+__global__ void compressed_fill_kernel(
+    int64_t comp_units, const int64_t* comp_ptr, const int64_t* plain_ptr,
+    const scalar_t* values, int64_t* pos, int64_t* col_out,
+    scalar_t* val_out, bool blocked, int64_t b0, int64_t b1,
+    bool row_compressed) {
+    const int64_t cu = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+    if (cu >= comp_units) return;
+    for (int64_t e = comp_ptr[cu]; e < comp_ptr[cu + 1]; ++e) {
+        const int64_t pu = plain_ptr[e];
+        if (blocked) {
+            const int64_t base_row = row_compressed ? cu * b0 : pu * b0;
+            const int64_t base_col = row_compressed ? pu * b1 : cu * b1;
+            for (int64_t i = 0; i < b0; ++i) {
+                const int64_t r = base_row + i;
+                for (int64_t j = 0; j < b1; ++j) {
+                    const int64_t slot =
+                        static_cast<int64_t>(atomicAdd(
+                            reinterpret_cast<unsigned long long*>(pos + r),
+                            1ull));
+                    col_out[slot] = base_col + j;
+                    val_out[slot] = values[e * (b0 * b1) + i * b1 + j];
+                }
+            }
+        } else {
+            const int64_t r = row_compressed ? cu : pu;
+            const int64_t c = row_compressed ? pu : cu;
+            const int64_t slot =
+                static_cast<int64_t>(atomicAdd(
+                    reinterpret_cast<unsigned long long*>(pos + r), 1ull));
+            col_out[slot] = c;
+            val_out[slot] = values[e];
+        }
+    }
+}
+
+} // namespace
+
+// Expands a 2-D CSC/BSR/BSC tensor into canonical CSR on device.  Blocked
+// layouts are unrolled to scalar entries and the row counts are re-bucketed
+// with a device scan so the output is a canonical row-major CSR.
+Tensor compressed_to_csr_cuda(const Tensor& self) {
+    if (self.is_sparse_csr()) return self;
+    if (self.dim() != 2 || !self.is_sparse_compressed()) {
+        TP_THROW(RuntimeError,
+                 "compressed_to_csr: expected a 2-D compressed sparse tensor");
+    }
+    const bool blocked = self.is_sparse_bsr() || self.is_sparse_bsc();
+    const bool row_compressed = self.is_sparse_bsr();
+    const std::array<int64_t, 2> bs = self.sparse_blocksize();
+    const int64_t b0 = blocked ? bs[0] : 1;
+    const int64_t b1 = blocked ? bs[1] : 1;
+    const int64_t rows = self.size(0);
+    const int64_t cols = self.size(1);
+    const int64_t comp_units = row_compressed ? rows / b0 : cols / b1;
+
+    Tensor comp = self._crow_indices().contiguous();
+    Tensor plain = self._col_indices().contiguous();
+    Tensor values = self._values().contiguous();
+    if (comp.dtype() != DType::Int64) comp = comp.to(DType::Int64);
+    if (plain.dtype() != DType::Int64) plain = plain.to(DType::Int64);
+
+    const cudaStream_t stream = getCurrentCUDAStream().stream();
+    constexpr int threads = 128;
+    const int blocks = static_cast<int>((comp_units + threads - 1) / threads);
+
+    Tensor counts = Tensor::zeros({rows}, DType::Int64, self.device());
+    compressed_count_rows_kernel<<<blocks, threads, 0, stream>>>(
+        comp_units, comp.data_ptr<int64_t>(), plain.data_ptr<int64_t>(),
+        blocked, b0, b1, row_compressed, counts.data_ptr<int64_t>());
+    checkCuda(cudaGetLastError(), "CUDA compressed_to_csr count kernel");
+
+    Tensor crow = Tensor::empty({rows + 1}, DType::Int64, self.device());
+    size_t scan_bytes = 0;
+    checkCuda(cub::DeviceScan::InclusiveSum(
+                  nullptr, scan_bytes, counts.data_ptr<int64_t>(),
+                  crow.data_ptr<int64_t>() + 1, rows, stream),
+              "CUDA compressed_to_csr scan size");
+    Tensor scan_temporary = Tensor::empty(
+        {static_cast<int64_t>(scan_bytes == 0 ? 1 : scan_bytes)},
+        DType::UInt8, self.device());
+    checkCuda(cub::DeviceScan::InclusiveSum(
+                  scan_temporary.data_ptr(), scan_bytes,
+                  counts.data_ptr<int64_t>(),
+                  crow.data_ptr<int64_t>() + 1, rows, stream),
+              "CUDA compressed_to_csr scan");
+    checkCuda(cudaMemsetAsync(crow.data_ptr(), 0, sizeof(int64_t), stream),
+              "CUDA compressed_to_csr crow head");
+
+    Tensor pos = crow.narrow(0, 0, rows).clone();
+    int64_t nnz_out = 0;
+    checkCuda(cudaMemcpyAsync(&nnz_out, crow.data_ptr<int64_t>() + rows,
+                              sizeof(int64_t), cudaMemcpyDeviceToHost, stream),
+              "CUDA compressed_to_csr nnz readback");
+    checkCuda(cudaStreamSynchronize(stream),
+              "CUDA compressed_to_csr nnz sync");
+    Tensor col = Tensor::empty({nnz_out}, DType::Int64, self.device());
+    Tensor out_values = Tensor::empty({nnz_out}, self.dtype(), self.device());
+
+    dispatch_coalesce_dtype(self.dtype(), [&](auto tag) {
+        using scalar_t = typename decltype(tag)::type;
+        compressed_fill_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+            comp_units, comp.data_ptr<int64_t>(),
+            plain.data_ptr<int64_t>(), values.data_ptr<scalar_t>(),
+            pos.data_ptr<int64_t>(), col.data_ptr<int64_t>(),
+            out_values.data_ptr<scalar_t>(), blocked, b0, b1,
+            row_compressed);
+    });
+    checkCuda(cudaGetLastError(), "CUDA compressed_to_csr fill kernel");
+
+    return Tensor::make_sparse_csr_tensor(
+        crow, col, out_values,
+        static_cast<std::vector<int64_t>>(self.shape()));
+}
+
 } // namespace cuda
 } // namespace tensorplay

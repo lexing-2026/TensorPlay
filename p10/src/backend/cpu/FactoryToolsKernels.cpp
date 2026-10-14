@@ -721,7 +721,9 @@ Tensor empty_memory_format_kernel(const std::vector<int64_t>& size,
                                   std::optional<int64_t> memory_format) {
     require_strided_layout("empty", layout);
     const DType dt = resolve_dtype_or_default(dtype, globalContext().defaultDType());
-    return empty_raw(size, dt, device, pin_memory.value_or(false), memory_format);
+    Tensor out = empty_raw(size, dt, device, pin_memory.value_or(false), memory_format);
+    if (isQuantizedType(dt)) out.impl()->set_quantizer(make_unknown_quantizer(dt));
+    return out;
 }
 
 // ---------------------------------------------------------------------------

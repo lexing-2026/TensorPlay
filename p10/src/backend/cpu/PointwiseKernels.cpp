@@ -1,3 +1,4 @@
+#include "QuantTensorOperators.h"
 #include "Tensor.h"
 #include "Complex.h"
 #include "Dispatcher.h"
@@ -810,6 +811,8 @@ Tensor tan_kernel(const Tensor& self) {
     return unary_float_op_kernel(self, [](auto x) { return std::tan(x); }, vecunary::VOp::Tan);
 }
 Tensor tanh_kernel(const Tensor& self) {
+    if (isQuantizedType(self.dtype())) return quantized::activation(self, 5);
+
     if (isComplexType(self.dtype()))
         return cplx_unary_vec(self, veccomplex::Op::Tanh,
                               [](auto x) { return tensorplay::tanh(x);  });
@@ -900,6 +903,8 @@ Tensor rsqrt_kernel(const Tensor& self) {
     return unary_float_op_kernel(self, [](auto x) { using T = decltype(x); return static_cast<T>(1) / std::sqrt(x); }, vecunary::VOp::Rsqrt);
 }
 Tensor sigmoid_kernel(const Tensor& self) {
+    if (isQuantizedType(self.dtype())) return quantized::activation(self, 4);
+
     if (isComplexType(self.dtype()))
         return cplx_unary_vec(self, veccomplex::Op::Sigmoid,
                               [](auto x) { return cx_sigmoid(x);  });
@@ -943,6 +948,8 @@ Tensor trunc_kernel(const Tensor& self) {
 }
 
 Tensor relu_kernel(const Tensor& self) {
+    if (isQuantizedType(self.dtype())) return quantized::activation(self, 10);
+
     // oneDNN eltwise rejected here (was: numel >= 4096): primitive
     // construction costs ~5us per call and measured *slower* than the native
     // kernels rather than oneDNN for ReLU.
@@ -978,6 +985,8 @@ Tensor relu_kernel(const Tensor& self) {
 }
 
 Tensor& relu_inplace_kernel(Tensor& self) {
+    if (isQuantizedType(self.dtype())) return quantized::relu_inplace(self);
+
     // Keep OneDNN for out-of-place ReLU, but use the SIMD/scalar path here.
     // Vectorized path for contiguous Float32 (see cpu/VecUnary.h); the old
     // __AVX512F__/__AVX2__ blocks were dead code in this TU and the #else arm
@@ -1030,6 +1039,8 @@ Tensor gelu_tanh_impl(const Tensor& self);
 Tensor gelu_backward_impl(const Tensor& grad_output, const Tensor& self, const std::string& approximate);
 
 Tensor gelu_kernel(const Tensor& self, const std::string& approximate) {
+    if (isQuantizedType(self.dtype())) { TP_CHECK(approximate == "none" || approximate == "tanh", "GELU approximation must be none or tanh"); return quantized::activation(self, approximate == "tanh" ? 9 : 8); }
+
     // GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2))); tanh approximation from
     if (approximate == "tanh") {
         return gelu_tanh_impl(self);
@@ -1327,6 +1338,8 @@ Tensor gelu_backward_impl(const Tensor& grad_output, const Tensor& self, const s
 }
 
 Tensor hardtanh_kernel_impl(const Tensor& self, const Scalar& min_val, const Scalar& max_val) {
+    if (isQuantizedType(self.dtype())) return quantized::activation(self, 7, min_val.toDouble(), max_val.toDouble());
+
     vecunary::VParams prm;
     prm.p0 = min_val.toDouble();
     prm.p1 = max_val.toDouble();
@@ -1381,6 +1394,8 @@ Tensor silu_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) 
 }
 
 Tensor hardsigmoid_kernel_impl(const Tensor& self) {
+    if (isQuantizedType(self.dtype())) return quantized::activation(self, 3);
+
     return unary_float_op_kernel(self, [](auto x) {
         using T = decltype(x);
         T xf = static_cast<T>(static_cast<activation_math_t<T>>(x));
@@ -1401,6 +1416,8 @@ Tensor hardsigmoid_backward_kernel_impl(const Tensor& grad_output, const Tensor&
 }
 
 Tensor leaky_relu_kernel_impl(const Tensor& self, const Scalar& negative_slope) {
+    if (isQuantizedType(self.dtype())) return quantized::activation(self, 0, negative_slope.toDouble());
+
     double slope = negative_slope.toDouble();
     vecunary::VParams prm;
     prm.p0 = slope;

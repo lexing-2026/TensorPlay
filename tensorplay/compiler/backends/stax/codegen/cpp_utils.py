@@ -273,6 +273,8 @@ def value_to_cpp(value, cpp_type):
         return f"std::numeric_limits<{cpp_type}>::infinity()"
     elif isinstance(value, bool):
         return f"static_cast<{cpp_type}>({str(value).lower()})"
+    elif isinstance(value, complex):
+        return f"{cpp_type}({value.real!r}, {value.imag!r})"
     elif math.isnan(value):
         return f"std::numeric_limits<{cpp_type}>::quiet_NaN()"
     else:

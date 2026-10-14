@@ -3,7 +3,18 @@ import tensorplay
 
 from ._construction import _as_index
 
-__all__ = ["add", "addmm", "log_softmax", "mm", "mul", "softmax", "solve", "sum"]
+__all__ = [
+    "add",
+    "addmm",
+    "log_softmax",
+    "mm",
+    "mul",
+    "sampled_addmm",
+    "solve",
+    "spsolve",
+    "softmax",
+    "sum",
+]
 
 
 def _normalize_dims(dim, ndim):
@@ -74,8 +85,16 @@ def mul(self, other):
     return tensorplay.sparse_mul(self, other)
 
 
-def mm(sparse, dense):
-    """Matrix product of a supported sparse tensor with a dense matrix."""
+def mm(sparse, dense, *, reduce="sum"):
+    """Matrix product of a supported sparse tensor with a dense matrix.
+
+    ``reduce`` selects how duplicated coordinates are combined during the
+    evaluation: ``"sum"``, ``"mean"``, ``"amax"`` or ``"amin"`` (default
+    ``"sum"``).  The result keeps ``sparse``'s layout for COO/CSR: CSR in
+    gives a dense result (matching the reference API) and COO in is converted
+    to CSR for the fused evaluation, then back to COO.  Other compressed
+    layouts (CSC/BSR/BSC) fall back to a dense product.
+    """
     if (
         isinstance(sparse, tensorplay.Tensor)
         and type(sparse) is not tensorplay.Tensor
@@ -94,7 +113,24 @@ def mm(sparse, dense):
         raise RuntimeError("sparse.mm(): operands must share one device")
     if sparse.dtype != dense.dtype:
         raise TypeError("sparse.mm(): operands must share one dtype")
-    return tensorplay.sparse_mm(sparse, dense)
+    if sparse.layout == tensorplay.sparse_csr:
+        result, _ = tensorplay.functional._sparse_mm_reduce_impl(
+            sparse, dense, reduce
+        )
+        return result
+    if sparse.layout == tensorplay.sparse_coo:
+        csr = sparse.to_sparse_csr()
+        result, _ = tensorplay.functional._sparse_mm_reduce_impl(
+            csr, dense, reduce
+        )
+        return result.to_sparse()
+    # CSC/BSR/BSC: the fused reduce evaluates these layouts natively (they
+    # are expanded to CSR internally) and returns a dense result, matching
+    # the reference API.
+    result, _ = tensorplay.functional._sparse_mm_reduce_impl(
+        sparse, dense, reduce
+    )
+    return result
 
 
 def addmm(mat, mat1, mat2, *, beta=1.0, alpha=1.0):
@@ -118,12 +154,41 @@ def addmm(mat, mat1, mat2, *, beta=1.0, alpha=1.0):
         mat2, tensorplay.Tensor
     ):
         raise TypeError("sparse.addmm(): matrix operands must be Tensor objects")
-    product = mm(mat1, mat2) if mat1.is_sparse else tensorplay.mm(mat1, mat2)
-    if alpha != 1.0:
-        product = product * alpha
-    if beta == 0.0:
-        return product
-    return (mat * beta if beta != 1.0 else mat) + product
+    # A sparse ``mat1`` routes through the fused native sparse-addmm kernel
+    # (with registered autograd) for every sparse layout.
+    if mat1.is_sparse:
+        return tensorplay.functional._sparse_addmm(
+            mat, mat1, mat2, beta=beta, alpha=alpha
+        )
+    return tensorplay.addmm(mat, mat1, mat2, beta=beta, alpha=alpha)
+
+
+def sampled_addmm(input, mat1, mat2, *, beta=1.0, alpha=1.0, out=None):
+    """Computes ``beta * input + alpha * (mat1 @ mat2)`` on ``input``'s
+    coordinates.
+
+    ``input`` is a sparse COO/CSR matrix; ``mat1`` and ``mat2`` are dense
+    matrices whose product is evaluated only at the positions stored in
+    ``input``.  The result is a sparse tensor with ``input``'s sparsity
+    pattern.  ``out``, when given, receives the result in place.
+    """
+    if not isinstance(input, tensorplay.Tensor) or not input.is_sparse:
+        raise RuntimeError("sparse.sampled_addmm(): first operand must be sparse")
+    if not isinstance(mat1, tensorplay.Tensor) or not isinstance(
+        mat2, tensorplay.Tensor
+    ):
+        raise TypeError("sparse.sampled_addmm(): matrix operands must be Tensor objects")
+    # The fused sampled-addmm kernel evaluates on CSR patterns; a COO input
+    # is converted for the evaluation and converted back so the result keeps
+    # the input's layout.
+    if input.layout == tensorplay.sparse_coo:
+        result = tensorplay.sparse_sampled_addmm(
+            input.to_sparse_csr(), mat1, mat2, beta=beta, alpha=alpha
+        )
+        return result.to_sparse()
+    return tensorplay.sparse_sampled_addmm(
+        input, mat1, mat2, beta=beta, alpha=alpha, out=out
+    )
 
 
 def sum(input, dim=None, dtype=None):
@@ -181,8 +246,9 @@ def solve(input, other, *, left=True):
         other (Tensor): dense right-hand side, ``(n,)`` or ``(n, k)``.
         left (bool): when ``False``, solves ``X @ input = other`` instead.
 
-    The factorization runs on the materialized matrix, so the peak memory is
-    that of the dense ``(n, n)`` operand rather than of ``nnz``.
+    The solve runs on the sparse CSR form of ``input`` directly: a native
+    sparse LU factorization (CPU) or cuSOLVER sparse QR (CUDA), so neither the
+    matrix nor the factorization materializes a dense ``(n, n)`` operand.
     """
     input = _require_sparse_matrix(input, "input")
     if input.dim() != 2 or input.size(0) != input.size(1):
@@ -196,15 +262,25 @@ def solve(input, other, *, left=True):
         raise RuntimeError("sparse.solve(): operands must share one device")
     if other.dtype != input.dtype:
         raise TypeError("sparse.solve(): operands must share one dtype")
-    dense = tensorplay.to_dense(input)
+    if not input.is_sparse_csr:
+        input = tensorplay.to_sparse_csr(input)
     if left:
         if other.size(0) != n:
             raise RuntimeError("sparse.solve(): other has an incompatible leading dimension")
-        return tensorplay.linalg.solve(dense, other)
+        return tensorplay.functional._spsolve(input, other, left=True)
+    if other.dim() == 1:
+        if other.size(0) != n:
+            raise RuntimeError("sparse.solve(): other has an incompatible trailing dimension")
+        return tensorplay.functional._spsolve(input, other, left=False)
     if other.size(-1) != n:
         raise RuntimeError("sparse.solve(): other has an incompatible trailing dimension")
-    if other.dim() == 1:
-        return tensorplay.linalg.solve(dense.transpose(-2, -1), other)
-    return tensorplay.linalg.solve(
-        dense.transpose(-2, -1), other.transpose(-2, -1)
-    ).transpose(-2, -1)
+    return tensorplay.functional._spsolve(input, other, left=False)
+
+
+def spsolve(input, other):
+    """Solves ``input @ X = other`` for a sparse square ``input``.
+
+    This is the same operation as :func:`solve` with ``left=True``, exposed
+    under the name used by the reference sparse API.
+    """
+    return solve(input, other, left=True)

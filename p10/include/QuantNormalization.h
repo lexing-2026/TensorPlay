@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Quantizer.h"
+#include "MemoryFormat.h"
 
 #include <algorithm>
 #include <cmath>
@@ -103,9 +104,11 @@ inline Tensor normalization_output(const Tensor& input,
                                    const NormalizationGeometry& geometry,
                                    double scale, int64_t zero_point) {
     auto quantizer = make_per_tensor_affine_quantizer(scale, zero_point, input.dtype());
-    Tensor out = geometry.channels_last
-        ? Tensor::empty_strided(input.shape(), input.strides(), input.dtype(), input.device())
-        : Tensor::empty(input.shape(), input.dtype(), input.device());
+    Tensor out = Tensor::empty(input.shape(), input.dtype(), input.device());
+    if (geometry.channels_last) {
+        const auto sizes = input.sizes().vec();
+        out = out.as_strided(sizes, get_channels_last_strides(sizes));
+    }
     out.impl()->set_quantizer(std::move(quantizer));
     return out;
 }

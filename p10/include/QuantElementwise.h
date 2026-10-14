@@ -14,6 +14,29 @@
 
 namespace tensorplay::quant {
 
+inline MemoryFormat activation_format(const Tensor& input) {
+    if (input.dim() != 4 && input.dim() != 5) return MemoryFormat::Contiguous;
+    if (input.stride(1) == 0) return MemoryFormat::Contiguous;
+    int64_t minimum = 0;
+    const int order4[4]{1, 3, 2, 0}, order5[5]{1, 4, 3, 2, 0};
+    const int* order = input.dim() == 4 ? order4 : order5;
+    for (int i = 0; i < input.dim(); ++i) {
+        const int d = order[i];
+        if (input.size(d) == 0 || input.stride(d) < minimum ||
+            (d == 0 && minimum == input.stride(1))) return MemoryFormat::Contiguous;
+        minimum = input.stride(d);
+        if (input.size(d) > 1) minimum *= input.size(d);
+    }
+    return input.dim() == 4 ? MemoryFormat::ChannelsLast : MemoryFormat::ChannelsLast3d;
+}
+
+inline Tensor activation_output(const Tensor& input, MemoryFormat format) {
+    Tensor out = Tensor::empty(input.sizes().vec(), input.dtype(), input.device());
+    if (format != MemoryFormat::Contiguous)
+        out = Tensor(out.impl()->storage(), input.sizes().vec(), get_channels_last_strides(input.sizes().vec()), input.dtype(), 0);
+    return out;
+}
+
 struct Activation {
     int op;
     float slope = 0, alpha = 1, coefficient = 1, input_coefficient = 1;
