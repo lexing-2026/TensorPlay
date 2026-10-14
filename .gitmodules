@@ -28,6 +28,7 @@
 [submodule "third_party/python-peachpy"]
 	path = third_party/python-peachpy
 	url = https://github.com/malfet/PeachPy
+	branch = pre-generated
 [submodule "third_party/gloo"]
 	path = third_party/gloo
 	url = https://github.com/pytorch/gloo
@@ -46,3 +47,4 @@
 [submodule "third_party/flash-attention"]
 	path = third_party/flash-attention
 	url = https://github.com/Dao-AILab/flash-attention.git
+	pin = true
