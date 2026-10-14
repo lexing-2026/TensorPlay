@@ -205,6 +205,16 @@ from .binary import (
     quantize_binary_weight_only as quantize_binary_weight_only,
     unpack_binary as unpack_binary,
 )
+
+from .intx_weight_only import (
+    IntxWeightOnlyConfig as IntxWeightOnlyConfig,
+    IntxWeightOnlyQuantizedTrainingLinear as IntxWeightOnlyQuantizedTrainingLinear,
+    WeightOnlyIntxLinear as WeightOnlyIntxLinear,
+    intx_weight_only as intx_weight_only,
+    pack_intx as pack_intx,
+    quantize_intx_weight_only as quantize_intx_weight_only,
+    unpack_intx as unpack_intx,
+)
 from .awq import (
     AWQConfig as AWQConfig,
     AWQObservedLinear as AWQObservedLinear,
@@ -264,6 +274,13 @@ __all__ += [
     "pack_binary",
     "quantize_binary_weight_only",
     "unpack_binary",
+    "IntxWeightOnlyConfig",
+    "IntxWeightOnlyQuantizedTrainingLinear",
+    "WeightOnlyIntxLinear",
+    "intx_weight_only",
+    "pack_intx",
+    "quantize_intx_weight_only",
+    "unpack_intx",
     "Int8DynActInt4WeightLinear",
     "Int8DynamicActivationInt4WeightConfig",
     "int8_dynamic_activation_int4_weight",

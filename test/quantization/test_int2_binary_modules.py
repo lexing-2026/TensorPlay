@@ -307,3 +307,82 @@ def test_awq_int2_workflow(device):
     out = converted(x)
     assert out.shape == (4, 16)
     assert bool(tp.isfinite(out).all())
+
+
+# ---------------------------------------------------------------------------
+# generic n-bit weight-only (IntxWeightOnlyConfig)
+# ---------------------------------------------------------------------------
+from tensorplay.ao.quantization import (
+    IntxWeightOnlyConfig,
+    IntxWeightOnlyQuantizedTrainingLinear,
+    WeightOnlyIntxLinear,
+    intx_weight_only,
+    pack_intx,
+    quantize_intx_weight_only,
+    unpack_intx,
+)
+
+
+@pytest.mark.parametrize('bits', [1, 2, 3, 4, 5, 6, 7, 8])
+def test_intx_pack_unpack_roundtrip(bits):
+    codes = tp.randint(0, 1 << bits, (3, 10)).to(tp.int8)
+    packed = pack_intx(codes, bits)
+    assert packed.dtype == tp.uint8
+    back = unpack_intx(packed, bits, 10)
+    assert bool((back == codes).all())
+
+
+@pytest.mark.parametrize('bits', [1, 2, 4])
+@pytest.mark.parametrize('device', DEVICES)
+def test_intx_from_float_and_forward(bits, device):
+    x, lin = _pair()
+    x = x.to(device)
+    lin = lin.to(device)
+    mod = WeightOnlyIntxLinear.from_float(lin, bits=bits, groupsize=8)
+    assert mod.weight.dtype == tp.uint8
+    out = mod(x)
+    assert out.shape == (x.shape[0], mod.out_features)
+    # manual dequantized reference
+    scale = mod.scales_and_zeros[..., 0].t().contiguous()
+    zero = mod.scales_and_zeros[..., 1].t().contiguous()
+    codes = unpack_intx(mod.weight, bits, mod.in_features).to(tp.float32)
+    groupsize = 8
+    z = zero.repeat_interleave(groupsize, dim=-1)
+    s = scale.repeat_interleave(groupsize, dim=-1)
+    dq = (codes - z) * s
+    ref = x @ dq.T
+    tp.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize('bits', [1, 2, 3])
+def test_intx_quantize_model(bits):
+    model = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 8))
+    qmodel = quantize_intx_weight_only(model, bits=bits, groupsize=8)
+    assert isinstance(qmodel[0], WeightOnlyIntxLinear)
+    assert qmodel[0].bits == bits
+    out = qmodel(tp.randn(2, 16))
+    assert out.shape == (2, 8)
+
+
+def test_intx_training_ste_gradients():
+    x = tp.randn(3, 8, requires_grad=True)
+    mod = IntxWeightOnlyQuantizedTrainingLinear(8, 5, bits=2, groupsize=4)
+    out = mod(x)
+    assert out.shape == (3, 5)
+    out.sum().backward()
+    assert mod.weight.grad is not None
+    assert mod.weight.grad.shape == (5, 8)
+    assert x.grad is not None
+    expected = tp.ones_like(out) @ mod.weight.detach()
+    tp.testing.assert_close(x.grad, expected, atol=1e-4, rtol=1e-4)
+
+
+def test_intx_config_validation():
+    with pytest.raises(ValueError):
+        IntxWeightOnlyConfig(bits=0)
+    with pytest.raises(ValueError):
+        IntxWeightOnlyConfig(bits=9)
+    with pytest.raises(ValueError):
+        IntxWeightOnlyConfig(groupsize=0)
+    # int2_weight_only is equivalent to IntxWeightOnlyConfig(bits=2)
+    assert intx_weight_only(bits=2).bits == 2
