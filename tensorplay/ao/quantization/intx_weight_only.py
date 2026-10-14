@@ -134,7 +134,13 @@ def _intx_mm(
 
 
 class WeightOnlyIntxLinear(nn.Module):
-    """Inference linear with a packed n-bit weight and per-group scales."""
+    """Inference linear with a packed n-bit weight and per-group scales.
+
+    Set ``cache_unpacked=True`` to keep the unpacked n-bit codes in a
+    non-persistent buffer; this removes the per-forward unpacking cost at the
+    price of a larger resident weight (one byte per element instead of
+    ``bits`` bits), which is a good trade for latency-sensitive inference.
+    """
 
     def __init__(
         self,
@@ -143,12 +149,14 @@ class WeightOnlyIntxLinear(nn.Module):
         bits: int = 2,
         groupsize: int = 128,
         bias: bool = False,
+        cache_unpacked: bool = False,
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.bits = bits
         self.groupsize = groupsize
+        self.cache_unpacked = cache_unpacked
         per_byte = 8 // bits
         self.register_buffer(
             "weight",
@@ -158,6 +166,7 @@ class WeightOnlyIntxLinear(nn.Module):
             "scales_and_zeros",
             tp.zeros((in_features // groupsize, out_features, 2), dtype=tp.float32),
         )
+        self.register_buffer("_unpacked_codes", None, persistent=False)
         if bias:
             self.register_buffer("bias", tp.zeros(out_features, dtype=tp.float32))
         else:
@@ -169,14 +178,27 @@ class WeightOnlyIntxLinear(nn.Module):
             input = input * act_pre_scale
         scale = self.scales_and_zeros[..., 0].t().contiguous()
         zero = self.scales_and_zeros[..., 1].t().contiguous()
-        out = _intx_mm(input, self.weight, scale, zero, self.bits, self.in_features)
+        if self._unpacked_codes is not None:
+            codes = self._unpacked_codes.to(tp.float32)
+            groupsize = self.in_features // scale.shape[-1]
+            codes = codes.reshape(*codes.shape[:-1], scale.shape[-1], groupsize)
+            dq = ((codes - zero.unsqueeze(-1)) * scale.unsqueeze(-1)).reshape(
+                *codes.shape[:-2], -1
+            )
+            out = input @ dq.T.contiguous()
+        else:
+            out = _intx_mm(input, self.weight, scale, zero, self.bits, self.in_features)
         if self.bias is not None:
             out = out + self.bias
         return out
 
     @classmethod
     def from_float(
-        cls, linear: nn.Linear, bits: int = 2, groupsize: int = 128
+        cls,
+        linear: nn.Linear,
+        bits: int = 2,
+        groupsize: int = 128,
+        cache_unpacked: bool = False,
     ) -> "WeightOnlyIntxLinear":
         """Build an n-bit weight-only linear from a float ``nn.Linear``."""
         if linear.bias is not None and linear.bias.dim() != 1:
@@ -190,9 +212,12 @@ class WeightOnlyIntxLinear(nn.Module):
             bits=bits,
             groupsize=groupsize,
             bias=linear.bias is not None,
+            cache_unpacked=cache_unpacked,
         )
         mod.weight = pack_intx(codes, bits)
         mod.scales_and_zeros = tp.stack([scale.t(), zero.t()], dim=-1)
+        if cache_unpacked:
+            mod._unpacked_codes = codes
         if linear.bias is not None:
             mod.bias = linear.bias.detach()
         return mod
@@ -262,7 +287,10 @@ intx_weight_only = IntxWeightOnlyConfig
 @register_quantize_module_handler(IntxWeightOnlyConfig)
 def _intx_weight_only_transform(module, config):
     """Replace an ``nn.Linear`` module with a packed n-bit weight-only linear."""
-    return WeightOnlyIntxLinear.from_float(module, config.bits, config.groupsize)
+    cache = getattr(module, "_intx_cache_unpacked", False)
+    return WeightOnlyIntxLinear.from_float(
+        module, config.bits, config.groupsize, cache_unpacked=cache
+    )
 
 
 def quantize_intx_weight_only(

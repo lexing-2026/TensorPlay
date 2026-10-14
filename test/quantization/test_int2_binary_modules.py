@@ -415,3 +415,43 @@ def test_quantize_top_level_training_module(device):
     from tensorplay.ao.quantization import Int8QuantizedTrainingLinearWeight
 
     assert isinstance(qm.weight, Int8QuantizedTrainingLinearWeight)
+
+
+# ---------------------------------------------------------------------------
+# cache_unpacked inference mode
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_lowbit_cache_unpacked_matches(device):
+    tp.manual_seed(0)
+    lin = nn.Linear(32, 16, bias=False).to(device)
+    x = tp.randn(3, 32, device=device)
+
+    for factory in (
+        lambda cache=False: WeightOnlyBinaryLinear.from_float(lin, cache_unpacked=cache),
+        lambda cache=False: WeightOnlyInt2Linear.from_float(lin, groupsize=8, cache_unpacked=cache),
+        lambda cache=False: WeightOnlyIntxLinear.from_float(lin, bits=2, groupsize=8, cache_unpacked=cache),
+    ):
+        cached = factory(cache=True)
+        plain = factory(cache=False)
+        assert cached._unpacked_codes is not None
+        assert plain._unpacked_codes is None
+        out_c = cached(x)
+        out_p = plain(x)
+        tp.testing.assert_close(out_c, out_p, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_quantize_with_cache_unpacked_flag(device):
+    for setter, config in (
+        ('_binary_cache_unpacked', binary_weight_only()),
+        ('_int2_cache_unpacked', int2_weight_only(groupsize=8)),
+        ('_intx_cache_unpacked', intx_weight_only(bits=2, groupsize=8)),
+    ):
+        m = nn.Linear(16, 8).to(device)
+        setattr(m, setter, True)
+        qm = quantize_(m, config)
+        assert qm._unpacked_codes is not None
+        x = tp.randn(2, 16, device=device)
+        assert qm(x).shape == (2, 8)

@@ -96,18 +96,32 @@ def _binary_mm(
 
 
 class WeightOnlyBinaryLinear(nn.Module):
-    """Inference linear with a packed 1-bit weight and per-row scales."""
+    """Inference linear with a packed 1-bit weight and per-row scales.
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+    Set ``cache_unpacked=True`` to keep the unpacked sign codes in a
+    non-persistent buffer; this removes the per-forward unpacking cost at the
+    price of a larger resident weight (one byte per element instead of one
+    bit), which is a good trade for latency-sensitive inference.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        cache_unpacked: bool = False,
+    ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.cache_unpacked = cache_unpacked
         self.register_buffer(
             "weight", tp.zeros((out_features, (in_features + 7) // 8), dtype=tp.uint8)
         )
         self.register_buffer(
             "scale", tp.zeros((out_features, 1), dtype=tp.float32)
         )
+        self.register_buffer("_unpacked_codes", None, persistent=False)
         if bias:
             self.register_buffer("bias", tp.zeros(out_features, dtype=tp.float32))
         else:
@@ -117,20 +131,34 @@ class WeightOnlyBinaryLinear(nn.Module):
         act_pre_scale = getattr(self, "act_pre_scale", None)
         if act_pre_scale is not None:
             input = input * act_pre_scale
-        out = _binary_mm(input, self.weight, self.scale, self.in_features)
+        if self._unpacked_codes is not None:
+            codes = self._unpacked_codes.to(input.dtype) * 2.0 - 1.0
+            dq = codes * self.scale
+            out = input @ dq.T.contiguous()
+        else:
+            out = _binary_mm(input, self.weight, self.scale, self.in_features)
         if self.bias is not None:
             out = out + self.bias
         return out
 
     @classmethod
-    def from_float(cls, linear: nn.Linear) -> "WeightOnlyBinaryLinear":
+    def from_float(
+        cls, linear: nn.Linear, cache_unpacked: bool = False
+    ) -> "WeightOnlyBinaryLinear":
         """Build a 1-bit weight-only linear from a float ``nn.Linear``."""
         if linear.bias is not None and linear.bias.dim() != 1:
             raise ValueError("binary weight-only requires a 1-D bias or no bias")
         sign_bits, scale = _quantize_binary_weight(linear.weight.detach())
-        mod = cls(linear.in_features, linear.out_features, bias=linear.bias is not None)
+        mod = cls(
+            linear.in_features,
+            linear.out_features,
+            bias=linear.bias is not None,
+            cache_unpacked=cache_unpacked,
+        )
         mod.weight = pack_binary(sign_bits)
         mod.scale = scale
+        if cache_unpacked:
+            mod._unpacked_codes = sign_bits
         if linear.bias is not None:
             mod.bias = linear.bias.detach()
         return mod
@@ -187,7 +215,8 @@ binary_weight_only = BinaryWeightOnlyConfig
 @register_quantize_module_handler(BinaryWeightOnlyConfig)
 def _binary_weight_only_transform(module, config):
     """Replace an ``nn.Linear`` module with a packed 1-bit weight-only linear."""
-    return WeightOnlyBinaryLinear.from_float(module)
+    cache = getattr(module, "_binary_cache_unpacked", False)
+    return WeightOnlyBinaryLinear.from_float(module, cache_unpacked=cache)
 
 
 @register_quantize_module_handler(BinaryWeightOnlyQuantizedTrainingConfig)

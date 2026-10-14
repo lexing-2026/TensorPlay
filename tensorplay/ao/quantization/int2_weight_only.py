@@ -140,7 +140,13 @@ def _int2_mm(
 
 
 class WeightOnlyInt2Linear(nn.Module):
-    """Inference linear with a packed INT2 weight and per-group scales."""
+    """Inference linear with a packed INT2 weight and per-group scales.
+
+    Set ``cache_unpacked=True`` to keep the unpacked 2-bit codes in a
+    non-persistent buffer; this removes the per-forward unpacking cost at the
+    price of a larger resident weight (one byte per element instead of two
+    bits), which is a good trade for latency-sensitive inference.
+    """
 
     def __init__(
         self,
@@ -148,11 +154,13 @@ class WeightOnlyInt2Linear(nn.Module):
         out_features: int,
         groupsize: int = 128,
         bias: bool = False,
+        cache_unpacked: bool = False,
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.groupsize = groupsize
+        self.cache_unpacked = cache_unpacked
         self.register_buffer(
             "weight", tp.zeros((out_features, (in_features + 3) // 4), dtype=tp.uint8)
         )
@@ -160,6 +168,7 @@ class WeightOnlyInt2Linear(nn.Module):
             "scales_and_zeros",
             tp.zeros((in_features // groupsize, out_features, 2), dtype=tp.float32),
         )
+        self.register_buffer("_unpacked_codes", None, persistent=False)
         if bias:
             self.register_buffer("bias", tp.zeros(out_features, dtype=tp.float32))
         else:
@@ -171,25 +180,44 @@ class WeightOnlyInt2Linear(nn.Module):
             input = input * act_pre_scale
         scale = self.scales_and_zeros[..., 0].t().contiguous()
         zero = self.scales_and_zeros[..., 1].t().contiguous()
-        out = _int2_mm(input, self.weight, scale, zero, self.in_features)
+        if self._unpacked_codes is not None:
+            codes = self._unpacked_codes.to(tp.float32)
+            groupsize = self.in_features // scale.shape[-1]
+            codes = codes.reshape(*codes.shape[:-1], scale.shape[-1], groupsize)
+            dq = ((codes - zero.unsqueeze(-1)) * scale.unsqueeze(-1)).reshape(
+                *codes.shape[:-2], -1
+            )
+            out = input @ dq.T.contiguous()
+        else:
+            out = _int2_mm(input, self.weight, scale, zero, self.in_features)
         if self.bias is not None:
             out = out + self.bias
         return out
 
     @classmethod
-    def from_float(cls, linear: nn.Linear, groupsize: int = 128) -> "WeightOnlyInt2Linear":
+    def from_float(
+        cls,
+        linear: nn.Linear,
+        groupsize: int = 128,
+        cache_unpacked: bool = False,
+    ) -> "WeightOnlyInt2Linear":
         """Build an INT2 weight-only linear from a float ``nn.Linear``."""
         if linear.bias is not None and linear.bias.dim() != 1:
             raise ValueError("int2 weight-only requires a 1-D bias or no bias")
-        packed, scale_zero = _pack_int2_weight(linear.weight.detach(), groupsize)
+        codes, scale, zero = _quantize_int2_groupwise(linear.weight.detach(), groupsize)
+        packed = pack_int2(codes)
+        scale_zero = tp.stack([scale.t(), zero.t()], dim=-1)
         mod = cls(
             linear.in_features,
             linear.out_features,
             groupsize=groupsize,
             bias=linear.bias is not None,
+            cache_unpacked=cache_unpacked,
         )
         mod.weight = packed
         mod.scales_and_zeros = scale_zero
+        if cache_unpacked:
+            mod._unpacked_codes = codes
         if linear.bias is not None:
             mod.bias = linear.bias.detach()
         return mod
@@ -262,7 +290,10 @@ int2_weight_only = Int2WeightOnlyConfig
 @register_quantize_module_handler(Int2WeightOnlyConfig)
 def _int2_weight_only_transform(module, config):
     """Replace an ``nn.Linear`` module with a packed INT2 weight-only linear."""
-    return WeightOnlyInt2Linear.from_float(module, config.groupsize)
+    cache = getattr(module, "_int2_cache_unpacked", False)
+    return WeightOnlyInt2Linear.from_float(
+        module, config.groupsize, cache_unpacked=cache
+    )
 
 
 @register_quantize_module_handler(Int2WeightOnlyQuantizedTrainingConfig)
