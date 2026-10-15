@@ -2062,6 +2062,7 @@ Tensor quantized_conv2d_cpu(
     const int64_t OH = (H + 2 * pH - dH * (kH - 1) - 1) / sH + 1;
     const int64_t OW = (W + 2 * pW - dW * (kW - 1) - 1) / sW + 1;
     if (OH > 0 && OW > 0) {
+#ifdef USE_ONEDNN
         Tensor out = Tensor::empty({input.size(0), M, OH, OW}, DType::QInt8,
                                    input.device());
         if (conv2d_onednn_qint8(
@@ -2072,6 +2073,7 @@ Tensor quantized_conv2d_cpu(
                 out_scale, out_zero_point, DType::QInt8));
             return out;
         }
+#endif
     }
     // The accumulation runs in the integer domain over the quantized codes;
     // no intermediate dequantization to the float domain happens.
