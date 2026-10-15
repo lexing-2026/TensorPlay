@@ -486,7 +486,8 @@ Tensor arange_start_step_kernel(Scalar start, Scalar end, Scalar step,
           MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
               "arange_" + suffix);
       [computeEncoder setComputePipelineState:PSO];
-      mtl_setArgs(computeEncoder, t, s, st, static_cast<uint32_t>(len));
+      mtl_setArgs(computeEncoder, t, static_cast<float>(s),
+                  static_cast<float>(st), static_cast<uint32_t>(len));
       mtl_dispatch1DJob(computeEncoder, PSO, static_cast<NSUInteger>(len));
       mpsStream->endKernelCoalescing();
     }
@@ -534,7 +535,8 @@ Tensor linspace_kernel(Scalar start, Scalar end, int64_t steps, DType dtype,
           MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
               "linspace_" + suffix);
       [computeEncoder setComputePipelineState:PSO];
-      mtl_setArgs(computeEncoder, t, s, step, static_cast<uint32_t>(steps));
+      mtl_setArgs(computeEncoder, t, static_cast<float>(s),
+                  static_cast<float>(step), static_cast<uint32_t>(steps));
       mtl_dispatch1DJob(computeEncoder, PSO, static_cast<NSUInteger>(steps));
       mpsStream->endKernelCoalescing();
     }
@@ -577,7 +579,8 @@ Tensor logspace_kernel(Scalar start, Scalar end, int64_t steps, double base,
           MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
               "logspace_" + suffix);
       [computeEncoder setComputePipelineState:PSO];
-      mtl_setArgs(computeEncoder, t, base, s, step,
+      mtl_setArgs(computeEncoder, t, static_cast<float>(base),
+                  static_cast<float>(s), static_cast<float>(step),
                   static_cast<uint32_t>(steps));
       mtl_dispatch1DJob(computeEncoder, PSO, static_cast<NSUInteger>(steps));
       mpsStream->endKernelCoalescing();
