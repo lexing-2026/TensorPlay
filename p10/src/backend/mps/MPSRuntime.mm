@@ -69,7 +69,7 @@ MPSStreamGuard::~MPSStreamGuard() noexcept {
 
 OptionalMPSGuard::OptionalMPSGuard(const Device& device) {
   if (device.is_mps()) {
-    guard_.emplace(device);
+    guard_ = std::make_unique<MPSGuard>(device);
   }
 }
 
