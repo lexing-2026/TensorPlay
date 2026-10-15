@@ -174,12 +174,18 @@ if __name__ == "__main__":
     # tolerate the missing value instead of erroring out mid-build.
     parser.add_argument("--cuda-version", "--cuda_version", type=str,
                         nargs='?', const='', default=None)
+    parser.add_argument("--hip-version", "--hip_version", type=str,
+                        nargs='?', const='', default=None)
+    parser.add_argument("--rocm-version", "--rocm_version", type=str,
+                        nargs='?', const='', default=None)
 
     args = parser.parse_args()
 
     if args.is_debug is None:
         raise AssertionError("is_debug argument must be provided")
     args.cuda_version = None if args.cuda_version == "" else args.cuda_version
+    args.hip_version = None if args.hip_version == "" else args.hip_version
+    args.rocm_version = None if args.rocm_version == "" else args.rocm_version
 
     tensorplay_root = Path(__file__).parent.parent
     version_path = tensorplay_root / "tensorplay" / "version.py"
@@ -201,8 +207,9 @@ if __name__ == "__main__":
         f.write(f"debug = {repr(bool(args.is_debug))}\n")
         f.write(f"cuda: Optional[str] = {repr(args.cuda_version)}\n")
         f.write(f"git_version = {repr(sha)}\n")
-        # Only CUDA builds are produced; the other accelerator fields exist
-        # so callers can probe them uniformly and read None as absent.
-        f.write("hip: Optional[str] = None\n")
-        f.write("rocm: Optional[str] = None\n")
+        # Accelerator toolkit versions are only populated by the build lane
+        # that links them; every other field stays None so callers can probe
+        # uniformly and treat None as absent.
+        f.write(f"hip: Optional[str] = {repr(args.hip_version)}\n")
+        f.write(f"rocm: Optional[str] = {repr(args.rocm_version)}\n")
         f.write("xpu: Optional[str] = None\n")

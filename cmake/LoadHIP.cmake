@@ -118,6 +118,28 @@ if(NOT WIN32)
   list(APPEND TP_HIP_LIBRARIES dl)
 endif()
 
+# HIP runtime and ROCm release versions for the generated version module.
+# The HIP runtime reports through hipconfig; the ROCm release is read from
+# the install's own version stamp. Both stay empty when the tooling is
+# absent so the version module keeps None on incomplete installs.
+set(TP_HIP_VERSION "" CACHE INTERNAL "HIP runtime version")
+set(TP_ROCM_VERSION "" CACHE INTERNAL "ROCm release version")
+find_program(TP_HIPCONFIG hipconfig HINTS ${ROCM_PATH}/bin)
+if(TP_HIPCONFIG)
+  execute_process(
+    COMMAND "${TP_HIPCONFIG}" --version
+    RESULT_VARIABLE _tp_hipconfig_result
+    OUTPUT_VARIABLE TP_HIP_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(NOT _tp_hipconfig_result EQUAL 0)
+    set(TP_HIP_VERSION "")
+  endif()
+endif()
+if(EXISTS ${ROCM_PATH}/.info/version)
+  file(READ "${ROCM_PATH}/.info/version" _tp_rocm_version)
+  string(STRIP "${_tp_rocm_version}" TP_ROCM_VERSION)
+endif()
+
 set(TP_HIP_INCLUDE_DIRS ${ROCM_PATH}/include CACHE INTERNAL "HIP include dirs")
 set(TP_ROCM_PATH ${ROCM_PATH} CACHE INTERNAL "ROCm root")
 set(TP_FOUND_HIP TRUE)

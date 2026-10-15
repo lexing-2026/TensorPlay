@@ -521,6 +521,8 @@ add_custom_command(
             ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_tensorplay_version.py
             --is-debug $<IF:$<CONFIG:Debug>,1,0>
             --cuda-version $<IF:$<BOOL:${CUDAToolkit_VERSION}>,${CUDAToolkit_VERSION},>
+            --hip-version $<IF:$<BOOL:${TP_HIP_VERSION}>,${TP_HIP_VERSION},>
+            --rocm-version $<IF:$<BOOL:${TP_ROCM_VERSION}>,${TP_ROCM_VERSION},>
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_tensorplay_version.py
             ${CMAKE_CURRENT_SOURCE_DIR}/version.txt
     COMMENT "Generating tensorplay/version.py"
