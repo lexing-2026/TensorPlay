@@ -30,7 +30,12 @@ Tensor& arctan__native_cpu(Tensor& self) { return ops::atan_(self); }
 Tensor arctanh_native_cpu(const Tensor& self) { return ops::atanh(self); }
 Tensor& arctanh__native_cpu(Tensor& self) { return ops::atanh_(self); }
 
+Tensor resolve_conj_native_cpu(const Tensor& self) { return self; }
+Tensor resolve_neg_native_cpu(const Tensor& self) { return self; }
+
 TENSORPLAY_LIBRARY_IMPL(CPU, NativeUnaryOps) {
+    m.impl("resolve_conj", resolve_conj_native_cpu);
+    m.impl("resolve_neg", resolve_neg_native_cpu);
     m.impl("absolute", absolute_native_cpu);
     m.impl("absolute_", absolute__native_cpu);
     m.impl("arccos", arccos_native_cpu);

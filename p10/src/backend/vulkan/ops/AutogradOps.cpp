@@ -12,6 +12,7 @@ namespace ops {
 
 // Elementwise kernels defined in sibling translation units.
 Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha);
+Tensor sub_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha);
 Tensor mul_kernel(const Tensor& self, const Tensor& other);
 Tensor div_scalar_kernel(const Tensor& self, const Scalar& other);
 Tensor add_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& alpha);
@@ -23,6 +24,7 @@ Tensor log1p_kernel(const Tensor& self);
 Tensor erf_kernel(const Tensor& self);
 Tensor sigmoid_kernel(const Tensor& self);
 Tensor tanh_kernel(const Tensor& self);
+Tensor neg_kernel(const Tensor& self);
 Tensor gt_scalar_kernel(const Tensor& self, const Scalar& other);
 Tensor ge_scalar_kernel(const Tensor& self, const Scalar& other);
 Tensor lt_scalar_kernel(const Tensor& self, const Scalar& other);
@@ -32,6 +34,13 @@ Tensor where_scalar_other_kernel(
     const Tensor& condition,
     const Tensor& self,
     const Scalar& other);
+Tensor sum_dim_kernel(
+    const Tensor& self,
+    const std::vector<int64_t>& dims,
+    bool keepdim,
+    DType dtype);
+Tensor reshape_kernel(const Tensor& self, const std::vector<int64_t>& shape);
+Tensor expand_kernel(const Tensor& self, const std::vector<int64_t>& size, bool implicit);
 std::vector<Tensor> chunk_kernel(const Tensor& self, int64_t chunks, int64_t dim);
 Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim);
 
@@ -265,6 +274,127 @@ Tensor selu_kernel(const Tensor& self) {
   return elu_kernel(self, Scalar(kAlpha), Scalar(kScale), Scalar(1.0));
 }
 
+// Layer-norm backward. The mean/rstd tensors are per-row [M] vectors; rows
+// span the outer (batch) dims, columns span the normalized axes. The
+// per-row reduction follows the same algebra as the forward shader.
+std::tuple<Tensor, Tensor, Tensor> native_layer_norm_backward_kernel(
+    const Tensor& grad_out,
+    const Tensor& input,
+    const std::vector<int64_t>& normalized_shape,
+    const Tensor& mean,
+    const Tensor& rstd,
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& bias_opt,
+    const std::vector<bool>& output_mask) {
+  (void)bias_opt;
+  TP_CHECK(
+      grad_out.dtype() == DType::Float32 && input.dtype() == DType::Float32,
+      "Vulkan native_layer_norm_backward supports Float32 tensors only");
+
+  const int64_t ndim = input.dim();
+  const int64_t norm_ndim = static_cast<int64_t>(normalized_shape.size());
+  const int64_t axis = ndim - norm_ndim;
+
+  std::vector<int64_t> batch_dims;
+  std::vector<int64_t> norm_dims;
+  std::vector<int64_t> broadcast_shape;
+  for (int64_t i = 0; i < ndim; ++i) {
+    if (i < axis) {
+      batch_dims.push_back(i);
+      broadcast_shape.push_back(input.size(i));
+    } else {
+      norm_dims.push_back(i);
+      broadcast_shape.push_back(1);
+    }
+  }
+
+  int64_t N = 1;
+  for (const int64_t s : normalized_shape) {
+    N *= s;
+  }
+  const double inv_n = 1.0 / static_cast<double>(N);
+
+  const std::vector<int64_t> full_shape =
+      static_cast<std::vector<int64_t>>(input.shape());
+  // Materialize broadcasts with expand so every elementwise multiply below
+  // operates on equal-shaped tensors.
+  const Tensor mean_b = expand_kernel(
+      reshape_kernel(mean, broadcast_shape), full_shape, false);
+  const Tensor rstd_b = expand_kernel(
+      reshape_kernel(rstd, broadcast_shape), full_shape, false);
+  const Tensor dy = grad_out;
+
+  Tensor weight_b;
+  if (weight_opt.has_value()) {
+    std::vector<int64_t> wshape(axis, 1);
+    wshape.insert(wshape.end(), normalized_shape.begin(), normalized_shape.end());
+    weight_b = reshape_kernel(*weight_opt, wshape);
+  }
+  // Expand weight to the full input shape so every multiply below is
+  // equal-shaped (texture storage does not support mid-axis broadcasting).
+  const Tensor dy_gamma = weight_opt.has_value()
+      ? mul_kernel(dy, expand_kernel(weight_b, full_shape, false))
+      : dy;
+
+  // Row-wise sums over the normalized axes (kept) for the dx correction
+  // terms; ds = sum(dy*gamma*x), db = sum(dy*gamma).
+  const Tensor ds = expand_kernel(
+      sum_dim_kernel(
+          mul_kernel(dy_gamma, input), norm_dims, true, DType::Float32),
+      full_shape,
+      false);
+  const Tensor db = expand_kernel(
+      sum_dim_kernel(dy_gamma, norm_dims, true, DType::Float32),
+      full_shape,
+      false);
+
+  const Tensor rstd_cubed = mul_kernel(mul_kernel(rstd_b, rstd_b), rstd_b);
+  const Tensor b_coef = mul_scalar_kernel(
+      mul_kernel(sub_kernel(mul_kernel(db, mean_b), ds, Scalar(1.0)), rstd_cubed),
+      inv_n);
+  const Tensor c_coef = sub_kernel(
+      neg_kernel(mul_kernel(b_coef, mean_b)),
+      mul_scalar_kernel(mul_kernel(db, rstd_b), inv_n),
+      Scalar(1.0));
+
+  Tensor dx;
+  if (output_mask[0]) {
+    dx = add_kernel(
+        add_kernel(
+            mul_kernel(rstd_b, dy_gamma),
+            mul_kernel(b_coef, input),
+            Scalar(1.0)),
+        c_coef,
+        Scalar(1.0));
+  }
+
+  Tensor dgamma;
+  if (output_mask[1] && weight_opt.has_value()) {
+    const Tensor x_hat =
+        mul_kernel(sub_kernel(input, mean_b, Scalar(1.0)), rstd_b);
+    if (batch_dims.empty()) {
+      // Whole tensor is one row: the per-element weight gradient is just
+      // dy * x_hat with no cross-row reduction.
+      dgamma = mul_kernel(dy, x_hat);
+    } else {
+      dgamma = sum_dim_kernel(
+          mul_kernel(dy, x_hat), batch_dims, false, DType::Float32);
+    }
+  }
+
+  Tensor dbeta;
+  if (output_mask[2]) {
+    if (batch_dims.empty()) {
+      dbeta = dy;
+    } else {
+      dbeta =
+          sum_dim_kernel(dy, batch_dims, false, DType::Float32);
+    }
+  }
+
+  return std::make_tuple(dx, dgamma, dbeta);
+}
+
 // Softplus forward: x*beta > threshold ? x : log1p(exp(x*beta))/beta.
 Tensor softplus_kernel(
     const Tensor& self,
@@ -317,6 +447,8 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, AutogradKernels) {
   m.impl("softplus", &tensorplay::vulkan::ops::softplus_kernel);
   m.impl("softplus_backward",
          &tensorplay::vulkan::ops::softplus_backward_kernel);
+  m.impl("native_layer_norm_backward",
+         &tensorplay::vulkan::ops::native_layer_norm_backward_kernel);
 }
 
 #endif /* USE_VULKAN */

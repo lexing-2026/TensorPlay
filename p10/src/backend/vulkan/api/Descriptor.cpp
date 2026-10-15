@@ -7,7 +7,7 @@
 #include <utility>
 
 #ifndef VULKAN_DESCRIPTOR_POOL_SIZE
-#define VULKAN_DESCRIPTOR_POOL_SIZE 1024u
+#define VULKAN_DESCRIPTOR_POOL_SIZE 8192u
 #endif
 
 namespace tensorplay {

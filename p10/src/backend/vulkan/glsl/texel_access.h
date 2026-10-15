@@ -27,7 +27,11 @@ vec4 load_texel(
     ivec4 output_sizes,
     ivec4 input_sizes,
     sampler3D uInput) {
-  return (output_sizes.z != input_sizes.z)
+  // A single logical channel occupies only the .x lane of its texel; the
+  // remaining lanes are zero padding and must not participate in arithmetic.
+  // Replicate the .x lane whenever the input has one channel, or when the
+  // channel counts differ between input and output.
+  return (input_sizes.z == 1 || output_sizes.z != input_sizes.z)
       ? texelFetch(uInput, mapped_pos, 0).xxxx
       : texelFetch(uInput, mapped_pos, 0);
 }

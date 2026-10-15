@@ -5,6 +5,7 @@
 #include "Convert.h"
 #include "Factory.h"
 #include "Utils.h"
+#include "../../../../include/Utils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -17,6 +18,8 @@
 namespace tensorplay {
 namespace vulkan {
 namespace ops {
+
+Tensor sub_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha);
 
 namespace {
 
@@ -1000,40 +1003,13 @@ namespace {
 // broadcast, and out = a * a elementwise.
 //
 Tensor broadcast_sub(const Tensor& a, const Tensor& b) {
-  api::Context* const context = api::context();
-
-  api::vTensor v_a = convert(a);
-  api::vTensor v_b = convert(b);
-  api::vTensor v_out{context, v_a.sizes(), a.dtype()};
-
-  const struct Block final {
-    ivec4 output_sizes;
-    ivec4 input_sizes;
-    ivec4 other_sizes;
-    float alpha;
-  } block{
-      make_whcn_ivec4(v_out.sizes()),
-      make_whcn_ivec4(v_a.sizes()),
-      make_whcn_ivec4(v_b.sizes()),
-      1.0f,
-  };
-
-  api::UniformParamsBuffer params(context, block);
-  api::PipelineBarrier pipeline_barrier{};
-
-  context->submit_compute_job(
-      VK_KERNEL(sub), pipeline_barrier, v_out.extents(),
-      adaptive_work_group_size(v_out.extents()), VK_NULL_HANDLE,
-      v_out.image(
-          pipeline_barrier,
-          api::PipelineStage::COMPUTE,
-          api::MemoryAccessType::WRITE),
-      v_a.image(pipeline_barrier, api::PipelineStage::COMPUTE),
-      v_b.image(pipeline_barrier, api::PipelineStage::COMPUTE),
-      params.buffer());
-
-  return convert(v_out);
+  // Delegate to the binary op path: it infers the broadcasted output shape
+  // and maps both operands through the texel access utilities, which is
+  // required for a keepdim mean (e.g. a [2,1,1,1] tensor) to be expanded
+  // to the full reduced span before the elementwise subtraction.
+  return sub_kernel(a, b, Scalar(1.0));
 }
+
 
 Tensor square(const Tensor& a) {
   api::Context* const context = api::context();

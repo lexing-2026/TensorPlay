@@ -469,7 +469,13 @@ Tensor conj_kernel(const Tensor& self) {
   return self;
 }
 
+Tensor resolve_conj_identity(const Tensor& self) { return self; }
+Tensor resolve_neg_identity(const Tensor& self) { return self; }
+
 TENSORPLAY_LIBRARY_IMPL(Vulkan, UnaryOpKernels) {
+  m.impl("resolve_conj", &tensorplay::vulkan::ops::resolve_conj_identity);
+  m.impl("resolve_neg", &tensorplay::vulkan::ops::resolve_neg_identity);
+
   m.impl("exp", &tensorplay::vulkan::ops::exp_kernel);
   m.impl("exp_", &tensorplay::vulkan::ops::exp_inplace_kernel);
   m.impl("sqrt", &tensorplay::vulkan::ops::sqrt_kernel);

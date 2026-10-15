@@ -5,6 +5,7 @@
 #include "../api/Context.h"
 #include "../api/ShaderRegistry.h"
 #include "../impl/Common.h"
+#include "../../../../include/Utils.h"
 
 namespace tensorplay {
 namespace vulkan {
@@ -90,13 +91,27 @@ Tensor binary_op_tensor(
   api::vTensor v_self = convert(self_arg);
   api::vTensor v_other = convert(other_arg);
 
+  // Infer the broadcasted output shape. Texture storage supports arbitrary
+  // leading-singleton broadcasts through the texel mapping; buffer storage
+  // has no per-element index remapping, so it requires matching shapes.
+  const std::vector<int64_t> out_sizes = tensorplay::broadcast_shapes(
+      static_cast<std::vector<int64_t>>(self_arg.shape()),
+      static_cast<std::vector<int64_t>>(other_arg.shape()));
+  const bool needs_broadcast =
+      out_sizes != static_cast<std::vector<int64_t>>(self_arg.shape());
+
   api::vTensor v_output{
       context,
-      v_self.sizes(),
+      out_sizes,
       v_self.dtype(),
   };
 
   if (v_output.storage_type() == api::StorageType::BUFFER) {
+    if (needs_broadcast) {
+      TP_THROW(
+          NotImplementedError,
+          "Vulkan buffer-storage binary ops do not support broadcasting yet");
+    }
     const uint32_t n =
         safe_downcast_to_u32(static_cast<int64_t>(v_output.numel()));
     api::UniformParamsBuffer params = (vocab == BinaryVocab::kInt)
@@ -282,12 +297,21 @@ Tensor binary_op_scalar(
 
   const bool is_buffer = v_output.storage_type() == api::StorageType::BUFFER;
 
+  // The shader bounds-checks against extents.xyz, so the block must carry
+  // the actual three-dimensional image extents (width, height,
+  // batch * ceil(channels / 4)); the logical WHCN shape is not a valid
+  // depth for images whose batch exceeds the channel planes.
+  const uvec3 out_extents = v_output.extents();
   const struct Block final {
     ivec4 extents;
     // scalar argument
     float other;
   } block{
-      make_whcn_ivec4(v_output.sizes()),
+      ivec4(
+          static_cast<int32_t>(out_extents[0u]),
+          static_cast<int32_t>(out_extents[1u]),
+          static_cast<int32_t>(out_extents[2u]),
+          0),
       other.to<float>() * alpha.to<float>(),
   };
 
@@ -296,7 +320,11 @@ Tensor binary_op_scalar(
     // scalar argument
     int32_t other;
   } blocki{
-      make_whcn_ivec4(v_output.sizes()),
+      ivec4(
+          static_cast<int32_t>(out_extents[0u]),
+          static_cast<int32_t>(out_extents[1u]),
+          static_cast<int32_t>(out_extents[2u]),
+          0),
       static_cast<int32_t>(other.to<int64_t>() * alpha.to<int64_t>()),
   };
 
@@ -386,12 +414,17 @@ Tensor& binary_op_scalar_inplace(
     return self_arg;
   }
 
+  const uvec3 self_extents = v_self.extents();
   const struct Block final {
     ivec4 extents;
     // scalar argument
     float other;
   } block{
-      make_whcn_ivec4(v_self.sizes()),
+      ivec4(
+          static_cast<int32_t>(self_extents[0u]),
+          static_cast<int32_t>(self_extents[1u]),
+          static_cast<int32_t>(self_extents[2u]),
+          0),
       other.to<float>() * alpha.to<float>(),
   };
 
@@ -400,7 +433,11 @@ Tensor& binary_op_scalar_inplace(
     // scalar argument
     int32_t other;
   } blocki{
-      make_whcn_ivec4(v_self.sizes()),
+      ivec4(
+          static_cast<int32_t>(self_extents[0u]),
+          static_cast<int32_t>(self_extents[1u]),
+          static_cast<int32_t>(self_extents[2u]),
+          0),
       static_cast<int32_t>(other.to<int64_t>() * alpha.to<int64_t>()),
   };
 

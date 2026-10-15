@@ -37,7 +37,11 @@ Tensor clamp(
     // clamp range
     vec2 clamp;
   } block{
-      make_whcn_ivec4(v_output.sizes()),
+      ivec4(
+          v_output.extents()[0u],
+          v_output.extents()[1u],
+          v_output.extents()[2u],
+          0),
       {min_arg ? min_arg->to<float>() : -std::numeric_limits<float>::infinity(),
        max_arg ? max_arg->to<float>() : std::numeric_limits<float>::infinity()},
   };
@@ -47,7 +51,11 @@ Tensor clamp(
     // clamp range in int words
     ivec2 clamp;
   } blocki{
-      make_whcn_ivec4(v_output.sizes()),
+      ivec4(
+          v_output.extents()[0u],
+          v_output.extents()[1u],
+          v_output.extents()[2u],
+          0),
       {min_arg ? static_cast<int32_t>(min_arg->to<int64_t>())
                : std::numeric_limits<int32_t>::min(),
        max_arg ? static_cast<int32_t>(max_arg->to<int64_t>())
@@ -100,7 +108,11 @@ Tensor& clamp_(
     // clamp range
     vec2 clamp;
   } block{
-      make_whcn_ivec4(v_self.sizes()),
+      ivec4(
+          v_self.extents()[0u],
+          v_self.extents()[1u],
+          v_self.extents()[2u],
+          0),
       {min_arg ? min_arg->to<float>() : -std::numeric_limits<float>::infinity(),
        max_arg ? max_arg->to<float>() : std::numeric_limits<float>::infinity()},
   };
@@ -110,7 +122,11 @@ Tensor& clamp_(
     // clamp range in int words
     ivec2 clamp;
   } blocki{
-      make_whcn_ivec4(v_self.sizes()),
+      ivec4(
+          v_self.extents()[0u],
+          v_self.extents()[1u],
+          v_self.extents()[2u],
+          0),
       {min_arg ? static_cast<int32_t>(min_arg->to<int64_t>())
                : std::numeric_limits<int32_t>::min(),
        max_arg ? static_cast<int32_t>(max_arg->to<int64_t>())

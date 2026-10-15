@@ -8,7 +8,7 @@
 #include <sstream>
 
 #ifndef VULKAN_DESCRIPTOR_POOL_SIZE
-#define VULKAN_DESCRIPTOR_POOL_SIZE 1024u
+#define VULKAN_DESCRIPTOR_POOL_SIZE 8192u
 #endif
 
 // Combined byte budget of the staging / parameter buffer recycle pools.
@@ -16,6 +16,11 @@
 // small budget captures virtually all reuse; larger transfers simply
 // allocate fresh and are destroyed at flush.
 constexpr size_t kHostVisiblePoolByteBudget = 256u * 1024u * 1024u;
+// The descriptor pool is finite, so recycling cannot wait for the byte
+// budget alone: long device-side chains (e.g. backward passes) accumulate
+// many small tensor resources whose descriptor sets would exhaust the pool
+// long before the host-visible bytes reach the budget above.
+constexpr size_t kMaxPendingResourceCount = 1024u;
 
 namespace tensorplay {
 namespace vulkan {
@@ -117,25 +122,30 @@ std::pair<VkQueryPool, uint32_t> Context::write_timestamp() {
 
 void Context::recycle_pending_resources() {
   size_t pending_bytes = 0u;
+  size_t pending_count = 0u;
   {
     std::lock_guard<std::mutex> lock(staging_pool_mutex_);
+    pending_count += staging_pending_.size();
     for (const VulkanBuffer& buffer : staging_pending_) {
       pending_bytes += static_cast<size_t>(buffer.mem_size());
     }
   }
   {
     std::lock_guard<std::mutex> lock(buffer_clearlist_mutex_);
+    pending_count += buffers_to_clear_.size();
     for (const VulkanBuffer& buffer : buffers_to_clear_) {
       pending_bytes += static_cast<size_t>(buffer.mem_size());
     }
   }
   {
     std::lock_guard<std::mutex> lock(image_clearlist_mutex_);
+    pending_count += images_to_clear_.size();
     for (const VulkanImage& image : images_to_clear_) {
       pending_bytes += static_cast<size_t>(image.mem_size());
     }
   }
-  if (pending_bytes <= kHostVisiblePoolByteBudget) {
+  if (pending_bytes <= kHostVisiblePoolByteBudget &&
+      pending_count <= kMaxPendingResourceCount) {
     return;
   }
 

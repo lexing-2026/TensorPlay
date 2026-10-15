@@ -728,6 +728,13 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ShapeAlign) {
     // single-pass gather below); its CUDA twin overrides it in
     // cuda/ShapeAlignKernels.cu.
     m.impl("repeat", shapeops::tpsa_repeat_cpu);
+    // expand was historically served only from the Vulkan backend; CPU
+    // callers (e.g. layer-norm backward broadcasting) need it too.
+    m.impl("expand", [](const Tensor& self,
+                         const std::vector<int64_t>& size,
+                         bool /*implicit*/) {
+      return shapeops::expand_impl(self, size);
+    });
     // Everything else in this batch maps to CompositeExplicitAutograd or the
     // default composite dispatch key and is registered once under the
     // backend-neutral Composite key from

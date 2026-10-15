@@ -69,7 +69,11 @@ Tensor& fill_impl(Tensor& self, Scalar value) {
       ivec4 extents;
       float other;
     } block{
-        make_whcn_ivec4(v_self.gpu_sizes()),
+        ivec4(
+            v_self.extents()[0u],
+            v_self.extents()[1u],
+            v_self.extents()[2u],
+            0),
         value.to<float>(),
     };
 
