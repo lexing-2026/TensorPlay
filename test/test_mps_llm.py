@@ -218,5 +218,90 @@ class TestMPSFactoryShaders(unittest.TestCase):
         self.assertTrue(tp.all(x < 100).item())
 
 
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSFusedSGD(unittest.TestCase):
+    def _step(self, device, momentum, nesterov=False):
+        p = tp.randn(6, device=device)
+        g = tp.randn(6, device=device)
+        bufs = [tp.zeros(6, device=device)] if momentum != 0 else []
+        tp._fused_sgd_([p], [g], bufs, weight_decay=0.01, momentum=momentum,
+                       lr=0.01, dampening=0.0, nesterov=nesterov,
+                       maximize=False, is_first_step=False)
+        return p.cpu()
+
+    def test_sgd_no_momentum(self):
+        self.assertTrue(
+            close(self._step("mps", 0.0), self._step("cpu", 0.0), 1e-4))
+
+    def test_sgd_momentum(self):
+        self.assertTrue(
+            close(self._step("mps", 0.9), self._step("cpu", 0.9), 1e-4))
+
+    def test_sgd_nesterov(self):
+        self.assertTrue(close(self._step("mps", 0.9, True),
+                              self._step("cpu", 0.9, True), 1e-4))
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSAmp(unittest.TestCase):
+    def test_non_finite_check_and_unscale(self):
+        grads = [tp.tensor([1.0, 2.0, 3.0], device="mps"),
+                 tp.tensor([4.0, float("inf"), 6.0], device="mps")]
+        found = tp.zeros((), dtype=tp.float32, device="mps")
+        inv_scale = tp.tensor(0.5, dtype=tp.float32, device="mps")
+        tp._amp_foreach_non_finite_check_and_unscale_(grads, found, inv_scale)
+        self.assertEqual(found.item(), 1.0)
+        self.assertTrue(close(grads[0].cpu(), tp.tensor([2.0, 4.0, 6.0]), 1e-5))
+
+    def test_non_finite_clean(self):
+        grads = [tp.tensor([1.0, 2.0], device="mps")]
+        found = tp.zeros((), dtype=tp.float32, device="mps")
+        inv_scale = tp.tensor(0.5, dtype=tp.float32, device="mps")
+        tp._amp_foreach_non_finite_check_and_unscale_(grads, found, inv_scale)
+        self.assertEqual(found.item(), 0.0)
+        self.assertTrue(close(grads[0].cpu(), tp.tensor([2.0, 4.0]), 1e-5))
+
+    def test_update_scale_growth(self):
+        scale = tp.tensor(1.0, dtype=tp.float32, device="mps")
+        gt = tp.tensor(0, dtype=tp.int32, device="mps")
+        found = tp.tensor(0.0, dtype=tp.float32, device="mps")
+        tp._amp_update_scale_(scale, gt, found, 2.0, 0.5, 10)
+        self.assertEqual(gt.item(), 1)
+        self.assertTrue(close(scale.cpu(), tp.tensor(1.0), 1e-5))
+
+    def test_update_scale_backoff(self):
+        scale = tp.tensor(1.0, dtype=tp.float32, device="mps")
+        gt = tp.tensor(5, dtype=tp.int32, device="mps")
+        found = tp.tensor(1.0, dtype=tp.float32, device="mps")
+        tp._amp_update_scale_(scale, gt, found, 2.0, 0.5, 10)
+        self.assertEqual(gt.item(), 0)
+        self.assertTrue(close(scale.cpu(), tp.tensor(0.5), 1e-5))
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSSampling(unittest.TestCase):
+    def test_multinomial_replacement(self):
+        probs = tp.tensor([[0.1, 0.2, 0.7], [0.5, 0.3, 0.2]], device="mps")
+        samples = tp.multinomial(probs, 1000, replacement=True)
+        self.assertEqual(list(samples.shape), [2, 1000])
+        counts = (samples == 2).sum(dim=1).float() / 1000
+        self.assertTrue((counts[0] - 0.7).abs().item() < 0.1)
+
+    def test_multinomial_no_replacement(self):
+        probs = tp.tensor([0.1, 0.2, 0.7], device="mps")
+        samples = tp.multinomial(probs, 2, replacement=False)
+        self.assertEqual(list(samples.shape), [2])
+        self.assertEqual(len(set(samples.tolist())), 2)
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSEqual(unittest.TestCase):
+    def test_equal(self):
+        a = tp.randn(4, 4, device="mps")
+        self.assertTrue(tp.equal(a, a.clone()))
+        self.assertFalse(tp.equal(a, a + 1))
+        self.assertFalse(tp.equal(a, tp.randn(3, 3, device="mps")))
+
+
 if __name__ == "__main__":
     unittest.main()
