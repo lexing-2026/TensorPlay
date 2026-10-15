@@ -8,7 +8,11 @@
 #include "DistributionDispatch.h"
 #include "Quantizer.h"
 
+#include "backend/mps/MPSAllocator.h"
 #include "backend/mps/MPSDevice.h"
+#include "backend/mps/MetalShaderLibrary.h"
+#include "backend/mps/MetalUtils.h"
+#include "backend/mps/MPSStream.h"
 
 #include <algorithm>
 #include <cmath>
@@ -16,6 +20,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <string>
 #include <vector>
 
 namespace tensorplay {
@@ -494,44 +499,45 @@ Tensor logspace_kernel(Scalar start, Scalar end, int64_t steps, double base,
 // the same generator and distributions as the CPU backend.
 // ---------------------------------------------------------------------------
 
+// Random factories.  The uniforms / normals are generated on the GPU by the
+// Distributions.metal shaders; the host only draws a single 32-bit seed per
+// call from the default generator.  Float64 keeps the host path because the
+// MPS shaders do not target double precision.
 Tensor rand_kernel(const std::vector<int64_t>& size, DType dtype,
                    Device device) {
   Tensor t = Tensor(size, dtype, device);
   const int64_t n = t.numel();
-  auto& gen = default_generator();
-  switch (dtype) {
-    case DType::Float32: {
-      float* data = t.data_ptr<float>();
-      uniform_real_distribution<float> dist(0.0f, 1.0f);
-      for (int64_t i = 0; i < n; ++i) data[i] = dist(&gen);
-      break;
-    }
-    case DType::Float64: {
-      double* data = t.data_ptr<double>();
-      uniform_real_distribution<double> dist(0.0, 1.0);
-      for (int64_t i = 0; i < n; ++i) data[i] = dist(&gen);
-      break;
-    }
-    case DType::Float16: {
-      Half* data = t.data_ptr<Half>();
-      uniform_real_distribution<float> dist(0.0f, 1.0f);
-      for (int64_t i = 0; i < n; ++i) {
-        data[i] = Half(dist(&gen));
-      }
-      break;
-    }
-    case DType::BFloat16: {
-      BFloat16* data = t.data_ptr<BFloat16>();
-      uniform_real_distribution<float> dist(0.0f, 1.0f);
-      for (int64_t i = 0; i < n; ++i) {
-        data[i] = BFloat16(dist(&gen));
-      }
-      break;
-    }
-    default:
-      TP_THROW(NotImplementedError,
-               "rand does not support this dtype on MPS");
+  if (n == 0) {
+    return t;
   }
+  if (dtype == DType::Float64) {
+    double* data = t.data_ptr<double>();
+    auto& gen = default_generator();
+    uniform_real_distribution<double> dist(0.0, 1.0);
+    for (int64_t i = 0; i < n; ++i) {
+      data[i] = dist(&gen);
+    }
+    return t;
+  }
+  const std::string suffix = scalarToMetalTypeString(dtype);
+  if (suffix != "float" && suffix != "half" && suffix != "bfloat") {
+    TP_THROW(NotImplementedError, "rand does not support this dtype on MPS");
+  }
+  auto& gen = default_generator();
+  const uint32_t seed = gen.random();
+  MPSStream* mpsStream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+      id<MTLComputePipelineState> PSO =
+          MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
+              "rand_uniform_" + suffix);
+      [computeEncoder setComputePipelineState:PSO];
+      mtl_setArgs(computeEncoder, t, seed, static_cast<uint32_t>(n));
+      mtl_dispatch1DJob(computeEncoder, PSO, static_cast<NSUInteger>(n));
+      mpsStream->endKernelCoalescing();
+    }
+  });
   return t;
 }
 
@@ -539,42 +545,37 @@ Tensor randn_kernel(const std::vector<int64_t>& size, DType dtype,
                     Device device) {
   Tensor t = Tensor(size, dtype, device);
   const int64_t n = t.numel();
-  auto& gen = default_generator();
-  switch (dtype) {
-    case DType::Float32: {
-      float* data = t.data_ptr<float>();
-      normal_distribution<double> dist(0.0, 1.0);
-      for (int64_t i = 0; i < n; ++i) {
-        data[i] = static_cast<float>(dist(&gen));
-      }
-      break;
-    }
-    case DType::Float64: {
-      double* data = t.data_ptr<double>();
-      normal_distribution<double> dist(0.0, 1.0);
-      for (int64_t i = 0; i < n; ++i) data[i] = dist(&gen);
-      break;
-    }
-    case DType::Float16: {
-      Half* data = t.data_ptr<Half>();
-      normal_distribution<double> dist(0.0, 1.0);
-      for (int64_t i = 0; i < n; ++i) {
-        data[i] = Half(static_cast<float>(dist(&gen)));
-      }
-      break;
-    }
-    case DType::BFloat16: {
-      BFloat16* data = t.data_ptr<BFloat16>();
-      normal_distribution<double> dist(0.0, 1.0);
-      for (int64_t i = 0; i < n; ++i) {
-        data[i] = BFloat16(static_cast<float>(dist(&gen)));
-      }
-      break;
-    }
-    default:
-      TP_THROW(NotImplementedError,
-               "randn does not support this dtype on MPS");
+  if (n == 0) {
+    return t;
   }
+  if (dtype == DType::Float64) {
+    double* data = t.data_ptr<double>();
+    auto& gen = default_generator();
+    normal_distribution<double> dist(0.0, 1.0);
+    for (int64_t i = 0; i < n; ++i) {
+      data[i] = dist(&gen);
+    }
+    return t;
+  }
+  const std::string suffix = scalarToMetalTypeString(dtype);
+  if (suffix != "float" && suffix != "half" && suffix != "bfloat") {
+    TP_THROW(NotImplementedError, "randn does not support this dtype on MPS");
+  }
+  auto& gen = default_generator();
+  const uint32_t seed = gen.random();
+  MPSStream* mpsStream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+      id<MTLComputePipelineState> PSO =
+          MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
+              "rand_normal_" + suffix);
+      [computeEncoder setComputePipelineState:PSO];
+      mtl_setArgs(computeEncoder, t, seed, static_cast<uint32_t>(n));
+      mtl_dispatch1DJob(computeEncoder, PSO, static_cast<NSUInteger>(n));
+      mpsStream->endKernelCoalescing();
+    }
+  });
   return t;
 }
 
