@@ -397,17 +397,37 @@ void fill_host_sequence(ctype* data, int64_t len,
 Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device) {
   if (m < 0) m = n;
   Tensor t = Tensor({n, m}, dtype, device);
-  if (n * m > 0) {
-    std::memset(t.data_ptr(), 0, static_cast<size_t>(n) * m * t.itemsize());
+  if (n * m == 0) return t;
+
+  const std::string suffix = scalarToMetalTypeString(dtype);
+  const bool use_shader =
+      suffix == "float" || suffix == "half" || suffix == "bfloat" ||
+      suffix == "long" || suffix == "int" || suffix == "short" ||
+      suffix == "char" || suffix == "uchar";
+  if (use_shader) {
+    const uint32_t rows = static_cast<uint32_t>(n);
+    const uint32_t cols = static_cast<uint32_t>(m);
+    MPSStream* mpsStream = getCurrentMPSStream();
+    dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+      @autoreleasepool {
+        id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+        id<MTLComputePipelineState> PSO =
+            MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
+                "eye_" + suffix);
+        [computeEncoder setComputePipelineState:PSO];
+        mtl_setArgs(computeEncoder, t, rows, cols);
+        mtl_dispatch1DJob(computeEncoder, PSO,
+                          static_cast<NSUInteger>(n * m));
+        mpsStream->endKernelCoalescing();
+      }
+    });
+    return t;
   }
+
+  // Host fallback for dtypes without a shader (double, bool, complex).
   const int64_t min_dim = std::min(n, m);
-  if (min_dim == 0) return t;
-#define EYE_CASE(ctype, name)                                          \
-  case DType::name: {                                                  \
-    ctype* data = t.data_ptr<ctype>();                                 \
-    for (int64_t i = 0; i < min_dim; ++i) data[i * m + i] = ctype(1);  \
-    break;                                                             \
-  }
+  std::memset(t.data_ptr(), 0, static_cast<size_t>(n) * m * t.itemsize());
+#define EYE_CASE(ctype, name)                                            case DType::name: {                                                      ctype* data = t.data_ptr<ctype>();                                     for (int64_t i = 0; i < min_dim; ++i) data[i * m + i] = ctype(1);      break;                                                               }
   switch (dtype) {
     TENSORPLAY_FORALL_SCALAR_TYPES(EYE_CASE)
     default:
@@ -652,10 +672,38 @@ Tensor randint_kernel(int64_t low, int64_t high,
   distribution::check_random_from_to_bounds(low, high, dtype);
   Tensor t = Tensor(size, dtype, device);
   const int64_t n = t.numel();
-  auto& gen = default_generator();
+  if (n == 0) {
+    return t;
+  }
   const uint64_t range =
       static_cast<uint64_t>(high) - static_cast<uint64_t>(low);
+  const std::string suffix = scalarToMetalTypeString(dtype);
+  const bool use_shader =
+      (suffix == "long" || suffix == "int" || suffix == "short" ||
+       suffix == "char" || suffix == "uchar") &&
+      range <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
   const int64_t base = low;
+  if (use_shader) {
+    auto& gen = default_generator();
+    const uint32_t seed = gen.random();
+    MPSStream* mpsStream = getCurrentMPSStream();
+    dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+      @autoreleasepool {
+        id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+        id<MTLComputePipelineState> PSO =
+            MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
+                "randint_" + suffix);
+        [computeEncoder setComputePipelineState:PSO];
+        mtl_setArgs(computeEncoder, t, base, range, seed,
+                    static_cast<uint32_t>(n));
+        mtl_dispatch1DJob(computeEncoder, PSO, static_cast<NSUInteger>(n));
+        mpsStream->endKernelCoalescing();
+      }
+    });
+    return t;
+  }
+  // Host fallback (large int64 ranges or unsupported dtypes).
+  auto& gen = default_generator();
   distribution::dispatch_dtype(dtype, [&](auto tag) {
     using scalar_t = typename decltype(tag)::type;
     scalar_t* data = t.data_ptr<scalar_t>();
