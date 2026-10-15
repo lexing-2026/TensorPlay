@@ -599,6 +599,7 @@ if(USE_VULKAN)
         src/backend/vulkan/ops/Cumsum.cpp
         src/backend/vulkan/ops/Factory.cpp
         src/backend/vulkan/ops/Glu.cpp
+        src/backend/vulkan/ops/Gru.cpp
         src/backend/vulkan/ops/MaskedFill.cpp
         src/backend/vulkan/ops/Matmul.cpp
         src/backend/vulkan/ops/Misc.cpp

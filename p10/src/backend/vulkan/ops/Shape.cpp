@@ -666,6 +666,12 @@ Tensor movedim_kernel(
   return permute_kernel(self, permutation);
 }
 
+// narrow is slice over a fixed-length window starting at `start`.
+Tensor narrow_kernel(const Tensor& self, int64_t dim, int64_t start,
+                     int64_t length) {
+  return slice_kernel(self, dim, start, start + length, 1);
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -677,6 +683,7 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ShapeKernels) {
   m.impl("squeeze.dim", &tensorplay::vulkan::ops::squeeze_dim_kernel);
   m.impl("unsqueeze", &tensorplay::vulkan::ops::unsqueeze_kernel);
   m.impl("slice.Tensor", &tensorplay::vulkan::ops::slice_kernel);
+  m.impl("narrow", &tensorplay::vulkan::ops::narrow_kernel);
   m.impl("select.int", &tensorplay::vulkan::ops::select_kernel);
   m.impl("cat", &tensorplay::vulkan::ops::cat_kernel);
   m.impl("stack", &tensorplay::vulkan::ops::stack_kernel);
