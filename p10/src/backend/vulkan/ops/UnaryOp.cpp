@@ -454,6 +454,15 @@ Tensor& reciprocal_inplace_kernel(Tensor& self) {
       "unary reciprocal");
 }
 
+Tensor erf_kernel(const Tensor& self) {
+  return unary_op_typed(self, "erf", "buffer_erf", false, "unary erf");
+}
+
+Tensor& erf_inplace_kernel(Tensor& self) {
+  return unary_op_typed_inplace(
+      self, "erfinplace", "buffer_erfinplace", "unary erf");
+}
+
 TENSORPLAY_LIBRARY_IMPL(Vulkan, UnaryOpKernels) {
   m.impl("exp", &tensorplay::vulkan::ops::exp_kernel);
   m.impl("exp_", &tensorplay::vulkan::ops::exp_inplace_kernel);
@@ -511,6 +520,8 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, UnaryOpKernels) {
   m.impl("square_", &tensorplay::vulkan::ops::square_inplace_kernel);
   m.impl("reciprocal", &tensorplay::vulkan::ops::reciprocal_kernel);
   m.impl("reciprocal_", &tensorplay::vulkan::ops::reciprocal_inplace_kernel);
+  m.impl("erf", &tensorplay::vulkan::ops::erf_kernel);
+  m.impl("erf_", &tensorplay::vulkan::ops::erf_inplace_kernel);
 }
 
 } // namespace ops
