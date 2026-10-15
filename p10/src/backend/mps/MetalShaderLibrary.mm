@@ -70,6 +70,16 @@ MTLFunction_t MetalShaderLibrary::getFunction(const std::string& fname) {
   return func;
 }
 
+bool MetalShaderLibrary::hasFunction(const std::string& fname) {
+  MTLFunction_t func = [library_ newFunctionWithName:
+      [NSString stringWithUTF8String:fname.c_str()]];
+  if (func) {
+    [func release];
+    return true;
+  }
+  return false;
+}
+
 MetalShaderLibrary& MetalShaderLibrary::getBundledLibrary() {
   static MetalShaderLibrary lib(kQuantizedMetallib, kQuantizedMetallibSize);
   return lib;

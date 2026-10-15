@@ -525,6 +525,7 @@ if(USE_MPS)
         src/backend/mps/FactoryKernels.mm
         src/backend/mps/CopyKernels.mm
         src/backend/mps/ArithmeticKernels.mm
+        src/backend/mps/AmpKernels.mm
         src/backend/mps/ElementwiseKernels.mm
         src/backend/mps/ReductionKernels.mm
         src/backend/mps/ShapeKernels.mm
@@ -559,19 +560,42 @@ if(USE_MPS)
     if(APPLE)
         set(MPS_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/mps/kernels)
         set(MPS_SHADER_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+        # Cooperative-tensor shaders (M5+) need Metal 4.0; older toolchains
+        # compile the cooperative file with 3.1 so its guarded kernels are
+        # excluded.  Probe the toolchain once and keep every other shader on
+        # metal3.1 so existing kernels build unchanged on older SDKs.
+        set(MPS_COOP_METAL_STD metal3.1)
+        if(NOT CMAKE_CROSSCOMPILING)
+            set(_mps_metal_probe ${CMAKE_CURRENT_BINARY_DIR}/metal_probe.metal)
+            set(_mps_metal_probe_air ${CMAKE_CURRENT_BINARY_DIR}/metal_probe.air)
+            file(WRITE ${_mps_metal_probe} "kernel void metal_std_probe() {}\n")
+            execute_process(
+                COMMAND xcrun metal -std=metal4.0 -c ${_mps_metal_probe}
+                        -o ${_mps_metal_probe_air}
+                RESULT_VARIABLE _mps_metal4_result
+                OUTPUT_QUIET ERROR_QUIET)
+            if(_mps_metal4_result EQUAL 0)
+                set(MPS_COOP_METAL_STD metal4.0)
+                message(STATUS "MPS cooperative-tensor shaders enabled (metal4.0)")
+            endif()
+        endif()
         file(GLOB MPS_METAL_SOURCES CONFIGURE_DEPENDS
              "${MPS_SHADER_DIR}/*.metal")
         set(MPS_AIR_OBJECTS "")
         foreach(metal_src ${MPS_METAL_SOURCES})
             get_filename_component(metal_stem ${metal_src} NAME_WE)
             set(air_obj ${CMAKE_CURRENT_BINARY_DIR}/${metal_stem}.air)
+            set(_metal_std metal3.1)
+            if(metal_stem STREQUAL "CooperativeOps")
+                set(_metal_std ${MPS_COOP_METAL_STD})
+            endif()
             add_custom_command(
                 OUTPUT ${air_obj}
-                COMMAND xcrun metal -std=metal3.1 -c ${metal_src}
+                COMMAND xcrun metal -std=${_metal_std} -c ${metal_src}
                         -I ${MPS_SHADER_DIR}
                         -o ${air_obj}
                 DEPENDS ${metal_src}
-                COMMENT "Compiling Metal shader ${metal_stem}.metal"
+                COMMENT "Compiling Metal shader ${metal_stem}.metal (${_metal_std})"
                 VERBATIM)
             list(APPEND MPS_AIR_OBJECTS ${air_obj})
         endforeach()

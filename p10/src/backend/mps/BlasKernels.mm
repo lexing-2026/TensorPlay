@@ -7,9 +7,16 @@
 #include "OperationUtils.h"
 
 #include "backend/mps/MPSDevice.h"
+#include "backend/mps/MetalShaderLibrary.h"
+#include "backend/mps/MetalUtils.h"
+#include "backend/mps/MPSStream.h"
 
+#include <Metal/Metal.h>
 #include <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 
+#include <array>
+#include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace tensorplay {
@@ -35,6 +42,58 @@ MPSBinaryOpBlock addBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
                                                MPSGraphTensor* b) {
   return [g additionWithPrimaryTensor:a secondaryTensor:b name:nil];
 };
+
+// Attempts a cooperative-tensor GEMM (M5+, macOS 26.2+).  `a`/`b`/`output`
+// must be contiguous row-major tensors; `m/k/n` are the 2-D GEMM dimensions
+// (the batch dimension, if any, is carried by `batch`).  Returns false when
+// the hardware or the bundled shader does not support the MPP path, leaving
+// the caller to fall back to the MPSGraph implementation.
+bool try_mpp_gemm(const Tensor& a, const Tensor& b, Tensor& output,
+                  int64_t m, int64_t k, int64_t n, int64_t batch) {
+  if (!has_mpp()) {
+    return false;
+  }
+  if (a.dtype() != DType::Float32 || m <= 0 || k <= 0 || n <= 0 ||
+      batch <= 0) {
+    return false;
+  }
+  constexpr int64_t kInt32Max = std::numeric_limits<int32_t>::max();
+  if (m > kInt32Max || k > kInt32Max || n > kInt32Max ||
+      batch > kInt32Max) {
+    return false;
+  }
+  const std::string kernel = "gemm_mpp_float_64_64_4";
+  auto& lib = MetalShaderLibrary::getBundledLibrary();
+  if (!lib.hasFunction(kernel)) {
+    return false;
+  }
+  auto pso = lib.getPipelineStateForFunc(kernel);
+  constexpr uint32_t kTile = 64;
+  const auto grid_x = (static_cast<uint64_t>(n) + kTile - 1) / kTile;
+  const auto grid_y = (static_cast<uint64_t>(m) + kTile - 1) / kTile;
+  const std::array<uint32_t, 3> sizes = {
+      static_cast<uint32_t>(m), static_cast<uint32_t>(k),
+      static_cast<uint32_t>(n)};
+  // Row-major within-batch strides: A is M x K, B is K x N, C is M x N.
+  const std::array<uint64_t, 6> strides = {
+      static_cast<uint64_t>(k), 1,
+      static_cast<uint64_t>(n), 1,
+      static_cast<uint64_t>(n), 1};
+  const uint32_t batch_u = static_cast<uint32_t>(batch);
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      stream->endKernelCoalescing();
+      auto encoder = stream->commandEncoder();
+      [encoder setComputePipelineState:pso];
+      mtl_setArgs(encoder, a, b, output, strides, sizes, batch_u);
+      [encoder dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, batch_u)
+              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+    }
+  });
+  return true;
+}
 
 // Runs an MPSGraph matrix multiplication. `a_shape`/`b_shape` describe the
 // graph inputs (1-D operands are lifted to 2-D), `out_data_shape` describes
@@ -118,6 +177,10 @@ Tensor mm_kernel(const Tensor& self, const Tensor& mat2) {
   }
   Tensor a = materializeForGraph(self);
   Tensor b = materializeForGraph(mat2);
+  if (try_mpp_gemm(a, b, output, self.size(0), self.size(1),
+                   mat2.size(1), 1)) {
+    return output;
+  }
   runMatMul(a, b, static_cast<std::vector<int64_t>>(a.shape()),
             static_cast<std::vector<int64_t>>(b.shape()),
             static_cast<std::vector<int64_t>>(output.shape()), output);
@@ -147,6 +210,10 @@ Tensor bmm_kernel(const Tensor& self, const Tensor& batch2) {
   }
   Tensor a = materializeForGraph(self);
   Tensor b = materializeForGraph(batch2);
+  if (try_mpp_gemm(a, b, output, self.size(1), self.size(2),
+                   batch2.size(2), self.size(0))) {
+    return output;
+  }
   runMatMul(a, b, static_cast<std::vector<int64_t>>(a.shape()),
             static_cast<std::vector<int64_t>>(b.shape()),
             static_cast<std::vector<int64_t>>(output.shape()), output);

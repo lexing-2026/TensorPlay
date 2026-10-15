@@ -4,10 +4,17 @@
 #include "OperationUtils.h"
 
 #include "backend/mps/MPSDevice.h"
+#include "backend/mps/MetalShaderLibrary.h"
+#include "backend/mps/MetalUtils.h"
+#include "backend/mps/MPSStream.h"
 
+#include <Metal/Metal.h>
 #include <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 
+#include <array>
 #include <cmath>
+#include <cstdint>
+#include <string>
 #include <vector>
 
 namespace tensorplay {
@@ -21,6 +28,145 @@ int64_t conv_output_size(int64_t input, int64_t kernel, int64_t stride,
       input + 2 * padding - dilation * (kernel - 1) - 1;
   if (d < 0) return 0;
   return d / stride + 1;
+}
+
+// Mirrors the Conv2DParams struct in CooperativeOps.metal.
+struct MpsConv2DParams {
+  int32_t N;
+  int32_t C_in;
+  int32_t C_out;
+  int32_t H;
+  int32_t W;
+  int32_t outH;
+  int32_t outW;
+  int32_t kH;
+  int32_t kW;
+  int32_t sH;
+  int32_t sW;
+  int32_t padH;
+  int32_t padW;
+  int32_t dH;
+  int32_t dW;
+  int32_t C_in_per_group;
+  int32_t C_out_per_group;
+  bool has_bias;
+};
+
+// Mirrors the ConvWeightPermuteParams struct in CooperativeOps.metal.
+struct MpsConvWeightPermuteParams {
+  uint32_t output_channels;
+  uint32_t input_channels_per_group;
+  uint32_t kernel_height;
+  uint32_t kernel_width;
+  uint32_t output_channel_stride;
+  uint32_t input_channel_stride;
+  uint32_t height_stride;
+  uint32_t width_stride;
+};
+
+// Attempts a cooperative-tensor convolution (M5+, macOS 26.2+).  Only the
+// instantiated configurations (kernel 1x1/2x2/3x3, stride 1, dilation 1,
+// groups 1, float/half) run here; anything else falls back to MPSGraph.
+bool try_mpp_conv2d(const Tensor& input, const Tensor& weight,
+                    const Tensor& bias, Tensor& output,
+                    const MpsConv2DParams& params) {
+  if (!has_mpp()) {
+    return false;
+  }
+  const DType dt = input.dtype();
+  if (dt != DType::Float32 && dt != DType::Float16) {
+    return false;
+  }
+  const int32_t kH = params.kH;
+  const int32_t kW = params.kW;
+  if (params.sH != 1 || params.sW != 1 || params.dH != 1 ||
+      params.dW != 1 || params.C_in_per_group != params.C_in) {
+    return false;
+  }
+  if (kH != kW || (kH != 1 && kH != 2 && kH != 3)) {
+    return false;
+  }
+  const char* cname = nullptr;
+  int32_t src_channels = 0;
+  switch (params.C_in) {
+    case 1: cname = "c1"; src_channels = 1; break;
+    case 3: cname = "c3"; src_channels = 3; break;
+    case 16: cname = "c16"; src_channels = 16; break;
+    case 32: cname = "c32"; src_channels = 32; break;
+    case 64: cname = "c64"; src_channels = 64; break;
+    default: return false;
+  }
+  const std::string dtype_str = scalarToMetalTypeString(dt);
+  const std::string kernel =
+      "conv2d_mpp_" + dtype_str + "_b32_w8_h8_s2_k" +
+      std::to_string(kH) + std::to_string(kW) + "_s11_d11_c" + cname +
+      (params.has_bias ? "_bias" : "_nobias");
+  auto& lib = MetalShaderLibrary::getBundledLibrary();
+  if (!lib.hasFunction(kernel)) {
+    return false;
+  }
+  auto pso = lib.getPipelineStateForFunc(kernel);
+
+  // NCHW -> NHWC activation copy.
+  const int64_t spatial = static_cast<int64_t>(params.H) * params.W;
+  Tensor nhwc = Tensor({params.N, params.H, params.W, params.C_in}, dt,
+                       input.device());
+  const std::string nchw_kernel = "nchw_to_nhwc_" + dtype_str;
+  auto nchw_pso = lib.getPipelineStateForFunc(nchw_kernel);
+  const uint32_t channels_u = static_cast<uint32_t>(params.C_in);
+  const uint32_t spatial_u = static_cast<uint32_t>(spatial);
+
+  // OIHW -> HWIO weight copy.
+  Tensor hwio = Tensor({kH, kW, params.C_in, params.C_out}, dt,
+                       weight.device());
+  const std::string hwio_kernel = "conv_weight_to_hwio_" + dtype_str;
+  auto hwio_pso = lib.getPipelineStateForFunc(hwio_kernel);
+  MpsConvWeightPermuteParams wparams;
+  wparams.output_channels = static_cast<uint32_t>(params.C_out);
+  wparams.input_channels_per_group =
+      static_cast<uint32_t>(params.C_in_per_group);
+  wparams.kernel_height = static_cast<uint32_t>(kH);
+  wparams.kernel_width = static_cast<uint32_t>(kW);
+  wparams.output_channel_stride =
+      static_cast<uint32_t>(weight.stride(0));
+  wparams.input_channel_stride =
+      static_cast<uint32_t>(weight.stride(1));
+  wparams.height_stride = static_cast<uint32_t>(weight.stride(2));
+  wparams.width_stride = static_cast<uint32_t>(weight.stride(3));
+
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      stream->endKernelCoalescing();
+      auto encoder = stream->commandEncoder();
+      [encoder setComputePipelineState:nchw_pso];
+      mtl_setArgs(encoder, input, nhwc, channels_u, spatial_u);
+      [encoder dispatchThreads:MTLSizeMake(spatial_u, channels_u,
+                                          static_cast<NSUInteger>(params.N))
+          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      [encoder setComputePipelineState:hwio_pso];
+      mtl_setArgs(encoder, weight, hwio, wparams);
+      [encoder dispatchThreads:MTLSizeMake(
+                                   static_cast<NSUInteger>(params.C_out),
+                                   static_cast<NSUInteger>(params.C_in),
+                                   static_cast<NSUInteger>(kH))
+          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      [encoder setComputePipelineState:pso];
+      mtl_setArgs(encoder, nhwc, hwio, output, params,
+                  params.has_bias ? bias_c : input_c);
+      const uint32_t o_tiles =
+          (static_cast<uint32_t>(params.C_out) + 31) / 32;
+      const uint32_t w_tiles =
+          (static_cast<uint32_t>(params.outW) + 7) / 8;
+      const uint32_t h_tiles =
+          (static_cast<uint32_t>(params.outH) + 7) / 8;
+      [encoder dispatchThreadgroups:MTLSizeMake(o_tiles, w_tiles,
+                                              h_tiles * params.N)
+          threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+    }
+  });
+  return true;
 }
 
 } // namespace
@@ -82,6 +228,29 @@ Tensor conv2d_kernel(const Tensor& input, const Tensor& weight,
                "conv2d(): bias must have one element per output channel");
     }
     bias_c = materializeForGraph(bias);
+  }
+
+  MpsConv2DParams params;
+  params.N = static_cast<int32_t>(N);
+  params.C_in = static_cast<int32_t>(C);
+  params.C_out = static_cast<int32_t>(O);
+  params.H = static_cast<int32_t>(H);
+  params.W = static_cast<int32_t>(W);
+  params.outH = static_cast<int32_t>(outH);
+  params.outW = static_cast<int32_t>(outW);
+  params.kH = static_cast<int32_t>(kH);
+  params.kW = static_cast<int32_t>(kW);
+  params.sH = static_cast<int32_t>(sH);
+  params.sW = static_cast<int32_t>(sW);
+  params.padH = static_cast<int32_t>(pH);
+  params.padW = static_cast<int32_t>(pW);
+  params.dH = static_cast<int32_t>(dH);
+  params.dW = static_cast<int32_t>(dW);
+  params.C_in_per_group = static_cast<int32_t>(C / groups);
+  params.C_out_per_group = static_cast<int32_t>(O / groups);
+  params.has_bias = has_bias;
+  if (try_mpp_conv2d(input_c, weight_c, bias_c, output, params)) {
+    return output;
   }
 
   @autoreleasepool {
