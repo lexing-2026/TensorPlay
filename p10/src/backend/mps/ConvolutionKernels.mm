@@ -30,7 +30,7 @@ int64_t conv_output_size(int64_t input, int64_t kernel, int64_t stride,
   return d / stride + 1;
 }
 
-// Mirrors the Conv2DParams struct in CooperativeOps.metal.
+// Same layout as the Conv2DParams struct in CooperativeOps.metal.
 struct MpsConv2DParams {
   int32_t N;
   int32_t C_in;
@@ -52,7 +52,7 @@ struct MpsConv2DParams {
   bool has_bias;
 };
 
-// Mirrors the ConvWeightPermuteParams struct in CooperativeOps.metal.
+// Same layout as the ConvWeightPermuteParams struct in CooperativeOps.metal.
 struct MpsConvWeightPermuteParams {
   uint32_t output_channels;
   uint32_t input_channels_per_group;
