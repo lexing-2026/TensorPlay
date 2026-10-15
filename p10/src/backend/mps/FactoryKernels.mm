@@ -23,6 +23,8 @@
 #include <string>
 #include <vector>
 
+#include "tensorplay/ops/TPXOpsGenerated.h"
+
 namespace tensorplay {
 namespace mps {
 
@@ -510,31 +512,33 @@ Tensor linspace_kernel(Scalar start, Scalar end, int64_t steps, DType dtype,
   const double s = start.toDouble();
   const double e = end.toDouble();
   const double step = (e - s) / static_cast<double>(steps - 1);
-  switch (dtype) {
-    MPS_RANGE_CASE(float, Float32, t.data_ptr(), steps,
-                   [&](int64_t i) { return static_cast<float>(s + i * step); })
-    MPS_RANGE_CASE(double, Float64, t.data_ptr(), steps,
-                   [&](int64_t i) { return s + i * step; })
-    MPS_RANGE_CASE(int64_t, Int64, t.data_ptr(), steps,
-                   [&](int64_t i) {
-                     return static_cast<int64_t>(s + i * step);
-                   })
-    MPS_RANGE_CASE(int32_t, Int32, t.data_ptr(), steps,
-                   [&](int64_t i) {
-                     return static_cast<int32_t>(s + i * step);
-                   })
-    MPS_RANGE_CASE(Half, Float16, t.data_ptr(), steps,
-                   [&](int64_t i) {
-                     return Half(static_cast<float>(s + i * step));
-                   })
-    MPS_RANGE_CASE(BFloat16, BFloat16, t.data_ptr(), steps,
-                   [&](int64_t i) {
-                     return BFloat16(static_cast<float>(s + i * step));
-                   })
-    default:
-      TP_THROW(NotImplementedError,
-               "linspace does not support this dtype on MPS");
+
+  // Float64 keeps the host path (the shaders do not target double).
+  if (dtype == DType::Float64) {
+    double* data = t.data_ptr<double>();
+    for (int64_t i = 0; i < steps; ++i) {
+      data[i] = s + i * step;
+    }
+    return t;
   }
+  const std::string suffix = scalarToMetalTypeString(dtype);
+  if (suffix != "float" && suffix != "half" && suffix != "bfloat" &&
+      suffix != "long" && suffix != "int") {
+    TP_THROW(NotImplementedError, "linspace does not support this dtype on MPS");
+  }
+  MPSStream* mpsStream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+      id<MTLComputePipelineState> PSO =
+          MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
+              "linspace_" + suffix);
+      [computeEncoder setComputePipelineState:PSO];
+      mtl_setArgs(computeEncoder, t, s, step, static_cast<uint32_t>(steps));
+      mtl_dispatch1DJob(computeEncoder, PSO, static_cast<NSUInteger>(steps));
+      mpsStream->endKernelCoalescing();
+    }
+  });
   return t;
 }
 
@@ -552,32 +556,36 @@ Tensor logspace_kernel(Scalar start, Scalar end, int64_t steps, double base,
   const double s = start.toDouble();
   const double e = end.toDouble();
   const double step = (e - s) / static_cast<double>(steps - 1);
-  switch (dtype) {
-    MPS_RANGE_CASE(float, Float32, t.data_ptr(), steps,
-                   [&](int64_t i) {
-                     return static_cast<float>(
-                         std::pow(base, s + i * step));
-                   })
-    MPS_RANGE_CASE(double, Float64, t.data_ptr(), steps,
-                   [&](int64_t i) { return std::pow(base, s + i * step); })
-    MPS_RANGE_CASE(Half, Float16, t.data_ptr(), steps,
-                   [&](int64_t i) {
-                     return Half(static_cast<float>(
-                         std::pow(base, s + i * step)));
-                   })
-    MPS_RANGE_CASE(BFloat16, BFloat16, t.data_ptr(), steps,
-                   [&](int64_t i) {
-                     return BFloat16(static_cast<float>(
-                         std::pow(base, s + i * step)));
-                   })
-    default:
-      TP_THROW(NotImplementedError,
-               "logspace does not support this dtype on MPS");
+
+  // Float64 keeps the host path (the shaders do not target double).
+  if (dtype == DType::Float64) {
+    double* data = t.data_ptr<double>();
+    for (int64_t i = 0; i < steps; ++i) {
+      data[i] = std::pow(base, s + i * step);
+    }
+    return t;
   }
+  const std::string suffix = scalarToMetalTypeString(dtype);
+  if (suffix != "float" && suffix != "half" && suffix != "bfloat") {
+    TP_THROW(NotImplementedError, "logspace does not support this dtype on MPS");
+  }
+  MPSStream* mpsStream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+      id<MTLComputePipelineState> PSO =
+          MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
+              "logspace_" + suffix);
+      [computeEncoder setComputePipelineState:PSO];
+      mtl_setArgs(computeEncoder, t, base, s, step,
+                  static_cast<uint32_t>(steps));
+      mtl_dispatch1DJob(computeEncoder, PSO, static_cast<NSUInteger>(steps));
+      mpsStream->endKernelCoalescing();
+    }
+  });
   return t;
 }
 
-// ---------------------------------------------------------------------------
 // Random factories.  Samples are drawn on the host through the shared-memory
 // mapping of the MPS buffers (valid on unified-memory Apple silicon), using
 // the same generator and distributions as the CPU backend.
@@ -719,27 +727,15 @@ Tensor randperm_kernel(int64_t n, DType dtype, Device device) {
   if (n < 0) {
     TP_THROW(RuntimeError, "randperm(): n must be non-negative, got ", n);
   }
-  Tensor t = Tensor({n}, dtype, device);
-  if (n == 0) return t;
-  auto& gen = default_generator();
-  distribution::dispatch_dtype(dtype, [&](auto tag) {
-    using scalar_t = typename decltype(tag)::type;
-    scalar_t* data = t.data_ptr<scalar_t>();
-    for (int64_t i = 0; i < n; ++i) {
-      data[i] = static_cast<scalar_t>(i);
-    }
-    for (int64_t i = 0; i < n - 1; ++i) {
-      const uint64_t tail = static_cast<uint64_t>(n - i);
-      const uint64_t draw = tail >= (1ULL << 32)
-          ? gen.random64()
-          : static_cast<uint64_t>(gen.random());
-      const int64_t z = static_cast<int64_t>(draw % tail);
-      scalar_t save = data[i];
-      data[i] = data[z + i];
-      data[z + i] = save;
-    }
-  });
-  return t;
+  if (n == 0) {
+    return Tensor({0}, dtype, device);
+  }
+  // GPU path: draw n random keys with the rand shader, then argsort them to
+  // obtain a uniform random permutation.
+  namespace ops = tpx::ops;
+  Tensor keys = rand_kernel({n}, DType::Float32, device);
+  Tensor perm = ops::argsort(keys, 0, /*descending=*/false);
+  return dtype == DType::Int64 ? perm : perm.to(dtype);
 }
 
 Tensor rand_like_kernel(const Tensor& self, DType dtype,
